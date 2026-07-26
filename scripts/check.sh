@@ -1,5 +1,16 @@
 #!/bin/sh
 # AGNOS project check — run all validations
+#
+# ⛔ EVERY GATE MUST END `&& rc=0 || rc=$?` AND PASS $rc TO check(). NEVER a bare command followed by
+# `check "..." $?`. `set -e` is on, and a bare failing command aborts the whole script — so the gate
+# never reports its FAIL, every gate after it is skipped, and the "N passed, M failed" summary never
+# prints. The run just stops mid-line. That is strictly worse than no gate: a red result renders as a
+# truncated log that reads like a crash, not a failure.
+#
+# ⚠ FOUND 2026-07-26, and only because a mutation test forced a gate red on purpose. Eight of the nine
+# gates had the bare form and had simply never failed. A failing command inside an `&&`/`||` list is
+# exempt from `set -e`, which is why the kprint gate below — the one gate written that way — was the
+# only one that could ever report a failure and let the run continue to its summary.
 set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -21,8 +32,8 @@ echo ""
 
 # Build
 echo "--- Build ---"
-sh "$ROOT/scripts/build.sh" > /dev/null 2>&1
-check "x86_64 build" $?
+sh "$ROOT/scripts/build.sh" > /dev/null 2>&1 && rc=0 || rc=$?
+check "x86_64 build" $rc
 
 # Source hygiene
 # kprint/kprintln take (string, length) and the compiler does NOT verify the two agree — short truncates the
@@ -47,12 +58,12 @@ check "kprint literal lengths" $rc
 # knowledge of each slot's extent, so it cannot rot.
 DUPS=$(grep -oE "_SUBOFF *= *0x[0-9A-Fa-f]+" "$ROOT/kernel/core/gpu_regs.cyr" \
        | awk -F'0x' '{print toupper($2)}' | sort | uniq -d)
-test -z "$DUPS"
-check "gpu arena slots unaliased" $?
+test -z "$DUPS" && rc=0 || rc=$?
+check "gpu arena slots unaliased" $rc
 # The Cyrius var X[N] units trap: function-local is N BYTES, module-scope is N x u64. Cost the
 # rung-10 burn its exit code (a 40-byte stack smash that left every printed number correct).
-sh "$ROOT/scripts/check-array-sizing.sh" >/dev/null 2>&1
-check "no function-local array overruns" $?
+sh "$ROOT/scripts/check-array-sizing.sh" >/dev/null 2>&1 && rc=0 || rc=$?
+check "no function-local array overruns" $rc
 [ -z "$DUPS" ] || { echo "  duplicated arena offsets:"; for d in $DUPS; do
     echo "    0x$d:"; grep -nE "_SUBOFF *= *0[xX]0*$d\b" "$ROOT/kernel/core/gpu_regs.cyr" | sed 's/^/      /'; done; }
 
@@ -65,23 +76,23 @@ check "no function-local array overruns" $?
 # the function's first statement into a wild kernel store32. It had been warning in every build since the
 # glyph refactor. This promotes that warning to a build failure.
 ARITY=$(sh "$ROOT/scripts/build.sh" 2>&1 | grep -E "expects [0-9]+ arguments, got [0-9]+" || true)
-test -z "$ARITY"
-check "call arity (no cycc argument-count warnings)" $?
+test -z "$ARITY" && rc=0 || rc=$?
+check "call arity (no cycc argument-count warnings)" $rc
 [ -z "$ARITY" ] || echo "$ARITY" | sed 's/^/    /'
 
 
 # Tests
 echo ""
 echo "--- Tests ---"
-sh "$ROOT/scripts/test.sh" > /dev/null 2>&1
-check "test suite" $?
+sh "$ROOT/scripts/test.sh" > /dev/null 2>&1 && rc=0 || rc=$?
+check "test suite" $rc
 
 # Required docs
 echo ""
 echo "--- Documentation ---"
 for doc in README.md CHANGELOG.md VERSION CONTRIBUTING.md SECURITY.md LICENSE; do
-    test -f "$ROOT/$doc"
-    check "doc: $doc" $?
+    test -f "$ROOT/$doc" && rc=0 || rc=$?
+    check "doc: $doc" $rc
 done
 
 # Version consistency
@@ -115,11 +126,11 @@ for v in $(grep -vE '^[[:space:]]*#' "$ROOT/kernel/version.cyr" 2>/dev/null \
            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?' || true); do
     [ "$v" = "$VERSION" ] || VDRIFT="$VDRIFT    kernel/version.cyr: stale version token $v\n"
 done
-test -z "$VDRIFT"
-check "version in kernel" $?
+test -z "$VDRIFT" && rc=0 || rc=$?
+check "version in kernel" $rc
 [ -z "$VDRIFT" ] || { echo "  VERSION is $VERSION — regenerate with: sh scripts/version-bump.sh --regen"; printf "$VDRIFT"; }
-grep -q "$VERSION" "$ROOT/CHANGELOG.md" 2>/dev/null
-check "version in changelog" $?
+grep -q "$VERSION" "$ROOT/CHANGELOG.md" 2>/dev/null && rc=0 || rc=$?
+check "version in changelog" $rc
 
 # Binary size sanity. The 350KB bound dated to the v1.22.0 / ~250KB era and
 # went stale across the storage (1.31.x), networking (1.32.x), ext2/4-write
@@ -146,8 +157,8 @@ check "version in changelog" $?
 echo ""
 echo "--- Binary ---"
 SZ=$(wc -c < "$ROOT/build/agnos")
-test "$SZ" -gt 50000 && test "$SZ" -lt 1800000
-check "binary size ($SZ bytes)" $?
+test "$SZ" -gt 50000 && test "$SZ" -lt 1800000 && rc=0 || rc=$?
+check "binary size ($SZ bytes)" $rc
 
 echo ""
 echo "=========================="

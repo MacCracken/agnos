@@ -11,6 +11,60 @@ four flashes and **rung 10's kill gate measured and passed** — crossover 1751 
 loose end that burn left: `--bench` exiting 142 where its code path returns 95. Bumped on cycle
 open; the user tags on close.
 
+### ⛔⭐ `check.sh` COULD NOT REPORT A FAILURE — 8 of 9 gates aborted the run instead
+
+Found by mutation-testing the new version gate below, and it invalidates how every green `check.sh`
+in this cycle should be read. `check.sh` runs under `set -e`, and 8 of its 9 gates were written as a
+**bare command followed by `check "..." $?`**. Under `set -e` a bare failing command **terminates the
+script** — so the gate never printed its `FAIL`, every gate after it was skipped, and the
+`N passed, M failed` summary never printed. The run simply stopped mid-line.
+
+That is strictly worse than having no gate: a red result rendered as a **truncated log that reads
+like a crash**, not like a failure. Forcing the version gate red produced output ending at
+`VERSION file: 1.56.19` — no verdict, no summary, nothing naming the problem.
+
+Only the `kprint literal lengths` gate was written `… && rc=0 || rc=$?`, which is why it is the one
+gate ever observed to report a failure and let the run continue (it caught two off-by-one lengths in
+the GPU bite above and still printed `14 passed, 1 failed`). A failing command inside an `&&`/`||`
+list is exempt from `set -e`; a bare one is not.
+
+**All 9 gates converted** to `… && rc=0 || rc=$?` + `check "…" $rc`, and the rule written into the
+file header so the next gate is not added in the aborting form. Verified by mutation in two distinct
+shapes: a straight-line gate (version drift → `FAIL: version in kernel`, detail dump, run continues
+to `14 passed, 1 failed`) and a **loop-scoped** gate (missing doc → `FAIL: doc: NOSUCHDOC.md` with
+subsequent iterations still `PASS`, confirming no stale `rc` carries between iterations).
+
+⚠ **This does not retroactively invalidate any green run.** A failing gate aborted, so a run that
+printed its summary genuinely had every gate pass. What was broken was *failure reporting*, not
+pass reporting.
+
+### Fixed — `kernel/version.cyr` stale at 1.56.17, and the documented way to fix it was a no-op
+
+`VERSION` and the three banners read 1.56.19 while `agnos_version_str()` (`version.cyr:49`) and
+`_AGNOS_VERSION` (`:55`) still read **1.56.17** — through two patch releases. Not cosmetic: both are
+compiled in and consumed. `core/syscall.cyr:4050` feeds `_AGNOS_VERSION` into `uname#34`'s release
+field, so **every ring-3 reader** — `mihi` → `iam`'s `Kernel:` line — reported 1.56.17 on a 1.56.19
+kernel, and `core/selftests.cyr:657` served `AGNOS 1.56.17 tcp_listen smoke`.
+
+⛔ **The file's own header documented an escape hatch that could not work.** `version.cyr:1-6` says
+to regenerate without bumping via `sh scripts/version-bump.sh "$(cat VERSION)"` — but that script
+opened with `[ "$NEW" = "$OLD" ] && exit 0`, so the documented command printed `Already at 1.56.19`
+and regenerated nothing. A hand-edited or half-generated `version.cyr` had **no supported route back
+into sync**. Fixed with an explicit `--regen` mode that skips release metadata (regenerating derived
+files is not a release event); verified idempotent.
+
+**And the gate that should have caught it did not exist.** `check.sh`'s "version in kernel" gate only
+grepped `kernel/agnos.cyr`'s banner comment and never opened `version.cyr`. It now asserts
+`agnos_version_str()` and `_AGNOS_VERSION` explicitly *and* scans **every** version token on a
+non-comment line, so a newly-added site is gated the day it lands. Comment lines are skipped because
+the header legitimately cites historical versions — confirmed by mutation that a version in a comment
+does **not** false-positive. (`version-bump.sh`'s own STALE grep could never have caught this: it
+searches only for the immediately-preceding version, so after 1.56.18 → 1.56.19 a residual 1.56.17
+is invisible to it.)
+
+⚠ This has happened before — the 1.56.12 cut bumped `VERSION` and missed `version.cyr` the same way.
+`VERSION` itself was **not** touched here; only generated sites were re-derived from it.
+
 ### ⭐⭐ GPU TIMING NOW USES THE MEASURED CLOCK — `GPU_TSC_PER_US` 3000 → calibrated
 
 Every GPU timeout and delay multiplied by a hardcoded **3000** cycles/µs while `tsc_calibrate()`
