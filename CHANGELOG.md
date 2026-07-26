@@ -11,6 +11,61 @@ four flashes and **rung 10's kill gate measured and passed** — crossover 1751 
 loose end that burn left: `--bench` exiting 142 where its code path returns 95. Bumped on cycle
 open; the user tags on close.
 
+### ⛔⭐ GPU ARENA: a shipped slot COLLISION, and the gate that structurally could not see it
+
+`GPU_EDGE_PREP_SUBOFF` was allocated at `0xD0000`. The batched-frame snapshot sits at `0xC0000` and
+is `256*128*4 = 0x20000` bytes, spanning **[0xC0000, 0xE0000)** — so the rung-9 prep table lived
+**wholly inside another slot**, and shipped that way. `VM_CONTEXT0` is disabled on this part: no page
+tables, so an out-of-bounds GPU store lands somewhere **real** (the console FB at arena offset 0, or
+the PSP TMR). Latent only because the snapshot is `#ifdef SHADER_BATCH` while op `0x08` is the live
+ring-3 path.
+
+**The gate could not have caught it.** It compared offset *values* for equality (`sort | uniq -d`),
+and its own comment defended that as *"value-only by design: it needs no knowledge of each slot's
+extent, so it cannot rot."* It could not rot because it was never checking the thing that matters —
+two slots don't need the same **start** to collide, only a shared **byte**.
+
+- Prep table moved `0xD0000` → **`0xA8000`** (the free window immediately above the coherence tiles,
+  which end `0xA7FFF`; 8 KB ends at `0xAA000`).
+- New [`scripts/check-arena.sh`](scripts/check-arena.sh) is **extent-aware**. Mutation-tested against
+  the real bug — it reproduces it exactly:
+  `GPU_EDGE_PREP_SUBOFF [0xD0000,0xD2000) overlaps GPU_BATCH_SNAP_SUBOFF [0xC0000,0xE0000)`
+- **All 47 slots now declare an extent** (`-> ends 0x…`), each derived from its *widest legal use* —
+  cap constants where a caller can demand one, hardware-encoded sizes where the HW declares them
+  (the PM4 ring's `QUEUE_SIZE=0xD` ⇒ 64 KB; the EOP's `EOP_SIZE=0x9` ⇒ 4 KB). Zero overlaps remain.
+- An **undeclared extent is now a hard failure**, so this class cannot recur silently. Both failure
+  modes mutation-tested to exit 1; clean exits 0.
+
+⚠ **Two traps the survey caught that a careless annotation pass would have walked into.** The C2e
+sentinel is **4 bytes**, not the 4 KB its comment implies — that comment describes the free *gap*
+around the slot, and declaring 4 KB would have fired a **false** overlap against the breadcrumb at
+`0x12400`. And `GPU_SHADER_SUBOFF`'s blob writers take the destination as a **parameter**, so the
+bound is the largest blob in the tree (`edge_cov_write`, 540 B), not the 240 B one that happens to be
+pointed there today; declared to `0x14800` accordingly.
+
+**Also fixed:** `gpu.cyr` read the rptr-report page through a hardcoded `0x11000` instead of
+`GPU_VM_RPTR_SUBOFF` — the same bug with the names removed, and a slot move would have missed it.
+
+⚠ **Found and deliberately NOT fixed:** `gpu_fence` appends its 5-dword packet at
+`gpu_arena_phys + (gpu_ring_wptr << 2)` with no `& GPU_RING_DW_MASK`, where `gpu_ring_put` masks
+every store. Unreachable today (the cursor starts at 8 and advances 5 per call, so it needs ~3275
+fences in one boot). **Masking `base` would be wrong** — five dwords from one base still run off the
+end within five dwords of the wrap, so it would look corrected and fail only at the boundary. The
+real fix is per-dword masking or an explicit wrap check, i.e. a change to that function's cursor
+accounting. Recorded at the site.
+
+### Changed — plan-step codenames removed from the GPU constant namespace
+
+`GPU_S12_*` → **`GPU_BATCH_SNAP_*`**, `GPU_S3_*` → **`GPU_COHERE_*`**, `GPU_BR2_*` →
+**`GPU_GUARDRECT_*`** (22 constants, kernel and docs). A constant named after a planning bullet is
+unreadable to anyone not holding the plan, and these outlived the plans that named them. Section
+headers now key off the **release** (`1.56.x`) rather than an invented step tag.
+
+⚠ And the stale-comment pattern that hid the collision is gone with them: the snapshot's comment used
+to *enumerate its neighbours* (`"well clear of every other slot (highest is BR2_SRC ending 0x79600)"`)
+— true when written, silently false the moment anything was allocated above it. Slots now state their
+**own** extent, which is the one fact they own and the only one that stays true.
+
 ### ⛔⭐ `check.sh` COULD NOT REPORT A FAILURE — 8 of 9 gates aborted the run instead
 
 Found by mutation-testing the new version gate below, and it invalidates how every green `check.sh`

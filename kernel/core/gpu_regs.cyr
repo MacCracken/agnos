@@ -125,11 +125,11 @@ var GPU_SDMA0_IB_ENABLE  = 0x1;         # IB_CNTL IB_ENABLE bit0
 var GPU_SDMA0_AUTO_CTXSW = 0x40000;     # SDMA0_CNTL AUTO_CTXSW_ENABLE bit18 — microcode schedules the GFX queue
 var GPU_SDMA0_UTC_L1_EN  = 0x2;         # SDMA0_CNTL UTC_L1_ENABLE bit1 — ring-VA xlate (UNUSED: agnos flat/no-pt)
 var GPU_SDMA0_CAPTURED   = 0x40000000;  # GFX_DOORBELL CAPTURED bit30 (RO) — set when a doorbell latches at engine
-var GPU_SDMA_RING_SUBOFF  = 0x20000;    # 64 KB SDMA GFX ring in the arena (past all compute buffers ~0x1A000)
-var GPU_SDMA_RPTR_SUBOFF  = 0x30000;    # rptr-report writeback page
-var GPU_SDMA_SRC_SUBOFF   = 0x38000;    # P9.2 copy-test SOURCE slot (4 KB, clear of ring/rptr)
-var GPU_SDMA_DST_SUBOFF   = 0x39000;    # P9.2 copy-test DEST slot (4 KB)
-var GPU_SDMA_FENCE_SUBOFF = 0x3A000;    # P9.2 FENCE sentinel slot (completion gate — coherence-honest)
+var GPU_SDMA_RING_SUBOFF  = 0x20000;    # 64 KB SDMA GFX ring in the arena (past all compute buffers ~0x1A000)  -> ends 0x30000
+var GPU_SDMA_RPTR_SUBOFF  = 0x30000;    # rptr-report writeback page  -> ends 0x31000
+var GPU_SDMA_SRC_SUBOFF   = 0x38000;    # P9.2 copy-test SOURCE slot (4 KB, clear of ring/rptr)  -> ends 0x39000
+var GPU_SDMA_DST_SUBOFF   = 0x39000;    # P9.2 copy-test DEST slot (4 KB)  -> ends 0x3A000
+var GPU_SDMA_FENCE_SUBOFF = 0x3A000;    # P9.2 FENCE sentinel slot (completion gate — coherence-honest)  -> ends 0x3A004
 
 # --- Register offsets within their IP (DWORD) ---
 # NBIO/RCC — always-on bus interface; the safest reads on the GPU.
@@ -898,7 +898,7 @@ var GPU_VM_INVALIDATE_REQ_ALL = 0x7C0001;   # vmid0 flush: bit0 PER_VMID | L2_PT
 # dropped L2_PTES + spuriously set CLEAR_FAULT_STATUS(23);
 # caught by the C2b adversarial re-verify vs gc_9_0_sh_mask.h.)
 var GPU_VM_ARENA_OFF     = 0x80000000;      # arena 2 GB into the 3 GB carveout (clears TMR @0x60000000)
-var GPU_VM_DUMMY_SUBOFF  = 0x15000;         # dummy fault-sink page offset within the arena
+var GPU_VM_DUMMY_SUBOFF  = 0x15000;         # dummy fault-sink page offset within the arena  -> ends 0x16000
 
 # --- C2c: compute-queue MQD/HQD (GC seg0; gfx9 gc_9_0_offset.h, ALL base_idx 0) ---
 # Offsets fetched from the full gc_9_0_offset.h + ANCHOR-VALIDATED against the iron-confirmed
@@ -943,7 +943,7 @@ var GPU_R_GRBM_STATUS2               = 0x0002;
 # ⚠ Placed in the C2e sentinel's free 4 KB gap, 0x400 clear of GPU_VM_SENT_SUBOFF, so it collides
 # with no published arena slot. It must NOT share a cache line with the done fence, or a write-back
 # of one would make the other look fresher than it is.
-var GPU_BREADCRUMB_SUBOFF            = 0x12400;
+var GPU_BREADCRUMB_SUBOFF = 0x12400;            # -> ends 0x12540
 var GPU_BREADCRUMB_BASE              = 0xBC000000;  # base | seq — the tag makes a stale 0 unmistakable
 # ── RUNG 6 (arena-audit) + rung 5 arm E ──────────────────────────────────────────────────────
 # The arena is one 2 MB UC region (gpu.cyr:27). The highest PUBLISHED slot offset in this file is
@@ -961,7 +961,7 @@ var GPU_HIGHEST_PUBLISHED_SLOT       = 0xD0000;    # the top of the slot map, au
 # catastrophic to hit: the console framebuffer at offset 0 and the PSP TMR.
 # ⚠ With VM_CONTEXT0 disabled there are NO page tables — an out-of-bounds store lands somewhere
 # REAL. That is why rung 6 must PROVE this region unclaimed before arm E is allowed to fire.
-var GPU_SACRIFICIAL_SUBOFF           = 0x1F0000;
+var GPU_SACRIFICIAL_SUBOFF = 0x1F0000;          # -> ends 0x1F1000
 var GPU_SACRIFICIAL_SENTINEL         = 0x5AC91F1C;
 # C2c values
 var GPU_GRBM_SEL_MEC1_P0_Q0    = 0x4;         # MEID=1<<2 (MEC1, pipe0, queue0, vmid0); 1-based MEID
@@ -974,11 +974,11 @@ var GPU_CP_HQD_EOP_CONTROL_VAL = 0x9;         # EOP_SIZE 9 => 2^10 dwords = 4 KB
 var GPU_CP_HQD_PERSISTENT_VAL  = 0x5301;      # PRELOAD_REQ | PRELOAD_SIZE (inert on empty ring)
 var GPU_CP_MQD_CONTROL_VAL     = 0x100;       # PRIV_STATE, VMID 0
 # arena sub-offsets (siblings of GPU_VM_DUMMY_SUBOFF)
-var GPU_VM_RING_SUBOFF = 0x00000;   # PM4 ring (64 KB)
-var GPU_VM_MQD_SUBOFF  = 0x10000;   # MQD save-area (4 KB)
-var GPU_VM_RPTR_SUBOFF = 0x11000;   # rptr-report page
-var GPU_VM_SENT_SUBOFF = 0x12000;   # C2e sentinel slot (free 4 KB gap, rptr 0x11000..EOP 0x13000)
-var GPU_VM_EOP_SUBOFF  = 0x13000;   # EOP buffer (4 KB, 4 KB-aligned)
+var GPU_VM_RING_SUBOFF = 0x00000;   # PM4 ring (64 KB)  -> ends 0x10000
+var GPU_VM_MQD_SUBOFF  = 0x10000;   # MQD save-area (4 KB)  -> ends 0x11000
+var GPU_VM_RPTR_SUBOFF = 0x11000;   # rptr-report page  -> ends 0x12000
+var GPU_VM_SENT_SUBOFF = 0x12000;   # C2e sentinel slot (free 4 KB gap, rptr 0x11000..EOP 0x13000)  -> ends 0x12004
+var GPU_VM_EOP_SUBOFF  = 0x13000;   # EOP buffer (4 KB, 4 KB-aligned)  -> ends 0x14000
 
 # --- C2d: first PM4 packet + doorbell (the VM-fetch gate) ---
 # CP_MEC_DOORBELL_RANGE gates which doorbell byte-offsets the MEC honors (GC seg0).
@@ -1024,9 +1024,9 @@ var GPU_CP_COHER_CNTL_INV   = 0x28C40000;
 # --- C2f: first hand-assembled gfx90c compute shader (DISPATCH_DIRECT) ---
 # All raw ISA/PM4 bytes CONFIRMED by 2 independent adversarial re-derivations (incl. reconstructing
 # LLVM D40493's global_store_dwordx2=0xDC748000 to the bit). 12-agent derive, 0 encoding refuted.
-var GPU_SHADER_SUBOFF      = 0x14000;    # shader blob (256-aligned: COMPUTE_PGM_LO = mc>>8 is exact)
-var GPU_SHADER_OUT_SUBOFF  = 0x14800;    # shader output slot
-var GPU_SHADER_DONE_SUBOFF = 0x14C00;    # dispatch done-marker slot
+var GPU_SHADER_SUBOFF      = 0x14000;    # shader blob (256-aligned: COMPUTE_PGM_LO = mc>>8 is exact)  -> ends 0x14800
+var GPU_SHADER_OUT_SUBOFF  = 0x14800;    # shader output slot  -> ends 0x14804
+var GPU_SHADER_DONE_SUBOFF = 0x14C00;    # dispatch done-marker slot  -> ends 0x14C04
 var GPU_C2F_CONST          = 0xC2F0C2F0; # the value the shader writes (the RAN witness)
 var GPU_C2F_DONE           = 0xC2F0D02E; # done-marker value (dispatch retired + L2 flushed)
 # PM4 headers (rule: 0xC0000000 | (count<<16) | (op<<8); SET_SH count = num_values)
@@ -1073,7 +1073,7 @@ var GPU_ACQUIRE_POLL          = 0x0000000A;
 # --- C2g-1: first MULTI-THREAD dispatch (1 workgroup, 64 threads; out[tid]=tid) ---
 # All 11 shader dwords are iron-proven gfx90c ground-truth (committed hex is authoritative). Only ONE compute-reg differs
 # from C2f: NUM_THREAD_X 1->64 (DISPATCH_DIRECT DIM stays 1x1x1 => 64 threads in ONE workgroup).
-var GPU_SHADER_OUT2_SUBOFF = 0x16000;    # 64-dword (256 B) per-thread output array. FRESH slot past the
+var GPU_SHADER_OUT2_SUBOFF = 0x16000;    # 64-dword (256 B) per-thread output array. FRESH slot past the  -> ends 0x16100
 # dummy page (0x15000..0x16000) that C2f NEVER touched — so no
 # stale-L2 ghost resurrects over the CPU pre-seed (C2g-1 burn 2:
 # reusing the C2f +0x14800 slot flushed C2f's cached 0xC2F0C2F0
@@ -1089,8 +1089,8 @@ var GPU_MT_NOTYET          = 0xDEADBEEF;  # pre-seed marker: != any tid 0..63 (i
 var GPU_COMPUTE_RSRC2_KERNARG = 0x00000008;  # RSRC2 USER_SGPR=4 -> preload s0..s3 from USER_DATA_0..3
 var GPU_SH_COMPUTE_USER_DATA_0 = 0x240;      # + _1 0x241, _2 0x242, _3 0x243 (COMPUTE_USER_DATA_0..3)
 var GPU_PM4_SET_SH_REG_N4     = 0xC0047600;  # SET_SH_REG, 4 values (in_lo, in_hi, out_lo, out_hi)
-var GPU_KERNARG_IN_SUBOFF     = 0x18000;     # input buffer, 64 dwords (in[i]=i*7+1)
-var GPU_KERNARG_OUT_SUBOFF    = 0x18400;     # output buffer, 64 dwords (out[i] must == in[i])
+var GPU_KERNARG_IN_SUBOFF     = 0x18000;     # input buffer, 64 dwords (in[i]=i*7+1)  -> ends 0x18100
+var GPU_KERNARG_OUT_SUBOFF    = 0x18400;     # output buffer, 64 dwords (out[i] must == in[i])  -> ends 0x18500
 
 # C2g-3 — ALU + REDUCTION LOOP (matmul's inner loop): each of 64 lanes computes an integer dot product
 # out[tid] = sum_{k=0..K-1} a[tid*K+k] * b[tid*K+k] via a real branch loop (s_cbranch) + v_mul_lo_u32 /
@@ -1112,8 +1112,8 @@ var GPU_PM4_SET_SH_REG_N8      = 0xC0087600;  # SET_SH_REG, 8 values (blend_cov 
 # --- coverage blend (blend_cov.s): AA text / shape primitive ---
 var GPU_COMPUTE_PGM_RSRC1_COV  = 0x002C00C3; # 16 VGPRs, 32 SGPRs (computed at authoring; the committed value is authoritative)
 var GPU_COMPUTE_RSRC2_COV      = 0x00000190; # USER_SGPR=8 | TGID_X_EN | TGID_Y_EN (computed at authoring; the committed value is authoritative)
-var GPU_COV_SHADER_SUBOFF      = 0x51000;    # slot 1 — blend_cov blob (67 dwords). Was 0x16000 == SHADER_OUT2.
-var GPU_COV_MASK_SUBOFF        = 0x40000;    # 256x256 8bpp coverage mask = 64 KB, clear of 0x30000's rect-2 src
+var GPU_COV_SHADER_SUBOFF      = 0x51000;    # slot 1 — blend_cov blob (67 dwords). Was 0x16000 == SHADER_OUT2.  -> ends 0x52000
+var GPU_COV_MASK_SUBOFF        = 0x40000;    # 256x256 8bpp coverage mask = 64 KB, clear of 0x30000's rect-2 src  -> ends 0x50000
 var GPU_COV_N     = 256;                     # mask is NxN; N is a multiple of 64 here, the guard is proven elsewhere
 var GPU_COV_X     = 420;                     # where the shape lands in the back buffer
 var GPU_COV_Y     = 300;
@@ -1125,8 +1125,8 @@ var GPU_COV_DST_R = 0xFFE8E8E8;
 # Shares RSRC2 with blend_cov (USER_SGPR=8 | TGID_X | TGID_Y) — only the VGPR count differs, which is why
 # the 8-kernarg dispatcher takes rsrc1 as a parameter instead of being duplicated.
 var GPU_COMPUTE_PGM_RSRC1_GLYPH = 0x002C00C2; # 12 VGPRs, 32 SGPRs (computed at authoring; the committed value is authoritative)
-var GPU_GLYPH_SHADER_SUBOFF     = 0x52000;    # slot 2 — glyph_1bpp blob (36 dwords)
-var GPU_GLYPH_BMP_SUBOFF        = 0x17800;    # composed 1bpp text bitmap (16 rows x 16 B = 256 B)
+var GPU_GLYPH_SHADER_SUBOFF     = 0x52000;    # slot 2 — glyph_1bpp blob (36 dwords)  -> ends 0x53000
+var GPU_GLYPH_BMP_SUBOFF        = 0x17800;    # composed 1bpp text bitmap (16 rows x 16 B = 256 B)  -> ends 0x17900
 var GPU_GLY_CHARS  = 16;                      # "AGNOS SHADER GPU" — exactly 16, so 4 store32s per row
 var GPU_GLY_STRIDE = 16;                      # 1 byte per 8x16 char per scanline
 var GPU_GLY_W      = 128;                     # 16 chars x 8 px
@@ -1139,17 +1139,17 @@ var GPU_GLY_FG     = 0xFFFFE060;
 # Shares RSRC2 with blend_rect (USER_SGPR=7 | TGID_X | TGID_Y) but with a completely different kernarg
 # MEANING — one pointer plus five scalars, no source buffer at all.
 var GPU_COMPUTE_PGM_RSRC1_GRAD = 0x002C00C3; # 16 VGPRs, 32 SGPRs (computed at authoring; the committed value is authoritative)
-var GPU_GRAD_SHADER_SUBOFF     = 0x53000;    # slot 3 — grad_linear blob (70 dwords). Was 0x18000 == KERNARG_IN.
+var GPU_GRAD_SHADER_SUBOFF     = 0x53000;    # slot 3 — grad_linear blob (70 dwords). Was 0x18000 == KERNARG_IN.  -> ends 0x54000
 
 # --- plan-S4: v_perm_b32 byte crossbar + the VOP3P packed blend ----------------------------------------
-var GPU_PERM_SHADER_SUBOFF     = 0x54000;    # slot 4 — perm blob (34 dwords / 136 B)
-var GPU_PK_SHADER_SUBOFF       = 0x55000;    # slot 5 — blend_pk blob (61 dwords / 244 B)
+var GPU_PERM_SHADER_SUBOFF     = 0x54000;    # slot 4 — perm blob (34 dwords / 136 B)  -> ends 0x55000
+var GPU_PK_SHADER_SUBOFF       = 0x55000;    # slot 5 — blend_pk blob (61 dwords / 244 B)  -> ends 0x56000
 # --- 3D arc rung 9: the edge rasteriser (edge_cov.s) ---
 # ⚠ RESERVED AT 9a, WRITTEN AT 9b. The slot is claimed here and not one line later so that the arena
 # audit (rung 6) and check.sh's unaliased-slot gate cover it from the moment the ABI exists — a slot
 # that appears at the same commit as the blob that fills it has never once been audited empty.
-var GPU_EDGE_SHADER_SUBOFF     = 0x56000;    # slot 6 — edge_cov blob   (133 dwords / 532 B)
-var GPU_EDGE_SETUP_SUBOFF      = 0x57000;    # slot 7 — edge_setup blob (58 dwords / 232 B)
+var GPU_EDGE_SHADER_SUBOFF     = 0x56000;    # slot 6 — edge_cov blob   (133 dwords / 532 B)  -> ends 0x57000
+var GPU_EDGE_SETUP_SUBOFF      = 0x57000;    # slot 7 — edge_setup blob (58 dwords / 232 B)  -> ends 0x58000
 # ⭐ RSRC1 EXTRACTED MECHANICALLY from each kernel descriptor (llvm-objcopy --only-section=.rodata,
 # byte 48), NEVER hand-counted. ⛔ A hand-derivation of the edge_cov value gave 0x002C008D — an
 # SGPR field of 2 (24 granted) where the assembler grants 3 (32). Under-allocating the SGPR file
@@ -1181,13 +1181,13 @@ var GPU_EDGE_PREP_SUBOFF       = 0xA8000;    # per-edge prep records, 32 B each 
 # the two kernels sit side by side. Harvested from blend_pk.s's own .amdhsa_kernel descriptor, never
 # hand-counted (gpu_regs.cyr's own warning: a miscounted RSRC word is *wrong*, not slow).
 var GPU_COMPUTE_PGM_RSRC1_PK   = 0x002C0082; # blend_pk: 12 VGPRs, 24 SGPRs (computed at authoring; the committed value is authoritative)
-var GPU_PERM_SRC_SUBOFF        = 0x1C000;    # 64 source pixels (256 B)
+var GPU_PERM_SRC_SUBOFF        = 0x1C000;    # 64 source pixels (256 B)  -> ends 0x1C100
 # ⚠ perm writes FOUR dwords per lane (identity / involution / unpack-repack / swap), unlike every other
 # kernel in this arena, so this slot is 1 KB and not 256 B. A short buffer would run into PK_OUT below and,
 # in any later scale-up, into the SDMA ring at 0x20000 — a write into a live ring would be spectacular and
 # would not look like a shader bug. The 1 KB gap before PK_OUT is deliberate slack, not rounding.
 var GPU_PERM_OUT_SUBOFF        = 0x1C400;    # 64 x 4 dwords (1024 B) -> ends 0x1C800
-var GPU_PK_OUT_SUBOFF          = 0x1CC00;    # packed-blend output (256 B), 1 KB clear of PERM_OUT
+var GPU_PK_OUT_SUBOFF          = 0x1CC00;    # packed-blend output (256 B), 1 KB clear of PERM_OUT  -> ends 0x1CD00
 
 # --- BATCHED-FRAME SNAPSHOT: the one-submission frame oracle (1.56.x) ---------------------------------
 # The op-by-op frame is snapshotted here so the batched frame can be compared against it pixel-for-pixel.
@@ -1244,10 +1244,10 @@ var GPU_BR_DST_R  = 0xFFA00000;              # underlay, right half (red)      w
 # the build on any duplicate _SUBOFF value so this class cannot come back.
 var GPU_SHADER_SLOT_BASE   = 0x50000;        # 8 slots x 4 KB = 0x50000..0x57FFF (past COV_MASK's 64 KB)
 var GPU_SHADER_SLOT_STRIDE = 0x1000;
-var GPU_BLEND_SHADER_SUBOFF = 0x50000;       # slot 0 — blend_rect resident for #92 (60 dwords)
+var GPU_BLEND_SHADER_SUBOFF = 0x50000;       # slot 0 — blend_rect resident for #92 (60 dwords)  -> ends 0x51000
 var GPU_OP_DONE_BASE        = 0x58000;       # done-marker table, 64 slots x 0x40 (one cache line each)
 var GPU_OP_DONE_STRIDE      = 0x40;
-var GPU_BLEND_DONE_SUBOFF   = 0x58000;       # done slot 0 — shared by the five kernels while unbatched
+var GPU_BLEND_DONE_SUBOFF   = 0x58000;       # done slot 0 — shared by the five kernels while unbatched  -> ends 0x59000
 var GPU_GUARDRECT_SRC_SUBOFF = 0x70000;            # src for the guard rect (200x48x4 = 37.5 KB) -> ends 0x79600
 
 # --- plan-S3: GL2 / scanout / CP-DMA coherence characterisation -----------------------------------------
@@ -1273,18 +1273,18 @@ var GPU_GUARDRECT_X = 128;
 var GPU_GUARDRECT_Y = 220;  # SET_SH_REG, 6 values (a_lo,a_hi,b_lo,b_hi,out_lo,out_hi)
 var GPU_DOT_K                 = 4;           # reduction length per lane (dot-product size)
 var GPU_DOT_N                 = 256;         # input element count = 64 lanes * K
-var GPU_DOT_A_SUBOFF          = 0x19000;     # input a[256] (a[i]=i+1)
-var GPU_DOT_B_SUBOFF          = 0x19400;     # input b[256] (b[i]=i+2)
-var GPU_DOT_OUT_SUBOFF        = 0x19800;     # output[64] (out[tid] = dot product)
+var GPU_DOT_A_SUBOFF          = 0x19000;     # input a[256] (a[i]=i+1)  -> ends 0x19400
+var GPU_DOT_B_SUBOFF          = 0x19400;     # input b[256] (b[i]=i+2)  -> ends 0x19800
+var GPU_DOT_OUT_SUBOFF        = 0x19800;     # output[64] (out[tid] = dot product)  -> ends 0x19900
 
 # C2g-4 — THE CROWN: real integer tiled matmul C[8x8] = A[8x8] * B[8x8]. Each of 64 lanes computes one
 # output element C[i][j] = sum_{k=0..7} A[i*8+k] * B[k*8+j] (tid -> i=tid>>3, j=tid&7; A walks a row +4/step,
 # B walks a column +32/step = N*4). Bit-correct vs the CPU reference. Same kernarg ABI as C2g-3 (RSRC2=0x0C,
 # 12 VGPRs, USER_DATA_0..5 = A,B,C). The matmul structure that attn11/tentib ML layers ride onto the GPU.
 var GPU_MM_DIM               = 8;           # 8x8 (M=N=K=8 => 64 output elements = 64 lanes)
-var GPU_MM_A_SUBOFF          = 0x1A000;     # A[64] (row-major, A[i]=i+1)
-var GPU_MM_B_SUBOFF          = 0x1A400;     # B[64] (row-major, B[i]=i+1)
-var GPU_MM_C_SUBOFF          = 0x1A800;     # C[64] output (C[tid] = matmul element)
+var GPU_MM_A_SUBOFF          = 0x1A000;     # A[64] (row-major, A[i]=i+1)  -> ends 0x1A100
+var GPU_MM_B_SUBOFF          = 0x1A400;     # B[64] (row-major, B[i]=i+1)  -> ends 0x1A500
+var GPU_MM_C_SUBOFF          = 0x1A800;     # C[64] output (C[tid] = matmul element)  -> ends 0x1A900
 
 # f64 — full-precision 8x8 matmul C[8x8] = A[8x8] * B[8x8] on the shader cores (attn11's full-precision
 # path). Same tiled structure as the integer crown, but f64 (8-byte) elements: global_load/store_dwordx2
@@ -1296,9 +1296,9 @@ var GPU_COMPUTE_PGM_RSRC1_F64  = 0x002C0043; # RSRC1 VGPRS=3 (16 VGPRs): the f64
 # which rounds up to 16 at granularity-4. The 2->3 bump is
 # MANDATORY — field=2 (12 VGPRs) would under-allocate + corrupt
 # the v[12:13] f64 accumulator. FLOAT_MODE=0xC0 (f64 denorms + RNE).
-var GPU_MMF_A_SUBOFF         = 0x1B000;     # f64 A[64] (row-major, A[i]=(i+1).0) — 512 bytes
-var GPU_MMF_B_SUBOFF         = 0x1B400;     # f64 B[64] (row-major, B[i]=(i+1).0) — 512 bytes
-var GPU_MMF_C_SUBOFF         = 0x1B800;     # f64 C[64] output (C[tid] = matmul element) — 512 bytes
+var GPU_MMF_A_SUBOFF         = 0x1B000;     # f64 A[64] (row-major, A[i]=(i+1).0) — 512 bytes  -> ends 0x1B200
+var GPU_MMF_B_SUBOFF         = 0x1B400;     # f64 B[64] (row-major, B[i]=(i+1).0) — 512 bytes  -> ends 0x1B600
+var GPU_MMF_C_SUBOFF         = 0x1B800;     # f64 C[64] output (C[tid] = matmul element) — 512 bytes  -> ends 0x1BA00
 
 # =========================================================================================================
 # === H7 — THE 3-WAY-ANCHORED DCN REGISTER TABLE (modeset arc, 1.56.x) ====================================

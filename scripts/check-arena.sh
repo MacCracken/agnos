@@ -80,10 +80,16 @@ if [ -n "$DUPS" ]; then
 fi
 
 # --- 3. slots with no declared extent ---------------------------------------------------------------
-# ⚠ Reported, not yet fatal. Extents for the remaining slots are being derived from their actual uses;
-# a GUESSED extent is worse than a missing one, because it produces either a false overlap or a missed
-# real one and both read as authoritative. Flip BARE_IS_FATAL=1 once every slot is annotated.
-BARE_IS_FATAL="${BARE_IS_FATAL:-0}"
+# ⛔ FATAL. All 47 slots were derived from their actual uses (widest legal write, cap constants where a
+# caller can demand one, hardware-declared sizes where the HW encodes them) and annotated, so a slot
+# with no extent now means a NEW slot was added without declaring one — and an unmeasurable slot is
+# exactly how the 0xD0000-inside-0xC0000 collision shipped. There is no longer a legitimate bare slot.
+# ⚠ If you are adding one: derive the extent from the WIDEST legal use, not the typical one. Two
+# specific traps are already recorded in gpu_regs.cyr — a comment describing the free GAP around a
+# slot rather than the slot itself (the sentinel is 4 BYTES, not the 4 KB its comment implies), and a
+# slot whose writers take the destination as a PARAMETER, so the biggest blob in the tree sets the
+# bound, not the one that happens to be pointed there today.
+BARE_IS_FATAL="${BARE_IS_FATAL:-1}"
 nbare=$(printf '%s\n' "$BARE" | grep -c . || true)
 if [ "$nbare" -gt 0 ]; then
     echo "  $nbare arena slot(s) declare no extent (\`-> ends 0x…\`) and are therefore UNCHECKED:"

@@ -1519,7 +1519,11 @@ fn gpu_ring_kick() {
     var ok = 0;
     var rmem = 0;
     while (i < 1000) {
-        rmem = load32(gpu_arena_phys + 0x11000) & 0xFFFFFFFF;
+        # ⚠ GPU_VM_RPTR_SUBOFF, not a literal 0x11000. This read is the rptr-report page, and it was
+        # hardcoded — so moving that slot would have left this pointing at whatever landed there next,
+        # silently. Exactly the failure the 1.56.19 arena work was about: the collision that shipped was
+        # a slot overlap, and a hardcoded copy of an address is the same bug with the names removed.
+        rmem = load32(gpu_arena_phys + GPU_VM_RPTR_SUBOFF) & 0xFFFFFFFF;
         if (rmem == 8) { ok = 1; i = 1000; }
         else { gpu_udelay(100); i = i + 1; }
     }
@@ -1606,6 +1610,18 @@ fn gpu_fence() {
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0);
 
     # Append the 5-dword WRITE_DATA packet at the tracked cursor (cursor is DWORDS -> *4).
+    #
+    # ⚠ UNMASKED, AND KNOWINGLY SO PENDING A REAL FIX. gpu_ring_put masks every store with
+    # `& GPU_RING_DW_MASK` (the ring is 16384 dwords; the cursor deliberately does NOT wrap, the STORE
+    # does). This path does not, so if gpu_ring_wptr ever reached 16384 these five dwords would land
+    # past the ring's 0x10000 end — directly on the MQD save area, with no page tables to stop it.
+    # ⛔ DO NOT "FIX" THIS BY MASKING `base`. The packet is five dwords from one base, so a masked base
+    # still runs off the end when the cursor sits within five dwords of the wrap — it would look
+    # corrected and fail only at the boundary, which is the worst of both. The correct fix is either
+    # per-dword masking (gpu_ring_put's shape) or an explicit wrap check before the append, and that is
+    # a change to this function's cursor accounting rather than a one-line edit.
+    # Not reachable today: the cursor starts at 8 and advances 5 per call, so it needs ~3275 fences in
+    # one boot. Recorded 2026-07-26 by the arena-extent survey; unreachable is not the same as correct.
     var base = gpu_arena_phys + (gpu_ring_wptr << 2);
     store32(base + 0x00, GPU_PM4_WRITE_DATA_HDR);        # PACKET3(WRITE_DATA, count=3)
     store32(base + 0x04, GPU_PM4_WRITE_DATA_CTL);        # DST_SEL=5 (memory) | WR_CONFIRM
