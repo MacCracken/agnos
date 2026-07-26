@@ -87,7 +87,7 @@ gpu_edge_cov(edge_mc, dst_mc, w, h, n_edges, rule):
 |---|---|---|
 | `GPU_EDGE_SHADER_SUBOFF` | `0x56000` | **already reserved at 9a** (`gpu_regs.cyr:1150`); 8 KB clear before the done marker at `0x58000` |
 | `GPU_EDGE_SETUP_SUBOFF` | `0x57000` | slot 7 of the same 0x1000-strided residency table; currently unoccupied |
-| `GPU_EDGE_PREP_SUBOFF` | `0xD0000` | 256 edges × 32 B = **8 KB**. Arena is `0x200000`; highest live `_SUBOFF` below the sacrificial page is `GPU_S12_SNAP` at `0xC0000`. |
+| `GPU_EDGE_PREP_SUBOFF` | `0xD0000` | 256 edges × 32 B = **8 KB**. Arena is `0x200000`; highest live `_SUBOFF` below the sacrificial page is `GPU_BATCH_SNAP_SNAP` at `0xC0000`. |
 
 `scripts/check.sh:40-53` gates `_SUBOFF` uniqueness automatically. The rung-6 arena audit must be told about `0xD0000`.
 

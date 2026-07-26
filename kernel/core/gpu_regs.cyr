@@ -951,7 +951,7 @@ var GPU_BREADCRUMB_BASE              = 0xBC000000;  # base | seq — the tag mak
 var GPU_ARENA_SIZE                   = 0x200000;   # 2 MB — the whole carveout arena
 # ⚠ NOT named *_SUBOFF: check.sh's "gpu arena slots unaliased" gate treats every _SUBOFF as a
 # REAL arena slot, and this is a BOUND describing the slot map, not a slot itself. Named that way
-# it aliased GPU_S12_SNAP_SUBOFF (the genuine slot at 0xC0000) and failed the gate — correctly.
+# it aliased GPU_BATCH_SNAP_SUBOFF (the genuine slot at 0xC0000) and failed the gate — correctly.
 var GPU_HIGHEST_PUBLISHED_SLOT       = 0xD0000;    # the top of the slot map, audited at runtime
 # (raised from 0xC0000 at 9b B7 for the edge prep table)
 # ⛔ THE SACRIFICIAL SLOT. Arm E fires an UNGUARDED write at this offset to measure whether the
@@ -1160,8 +1160,19 @@ var GPU_COMPUTE_PGM_RSRC1_EDGE = 0x002C00CD; # edge_cov:   56 VGPRs, 32 SGPRs (f
 # ⭐ BOTH kernels' RSRC2 is 0x190 — IDENTICAL to GPU_COMPUTE_RSRC2_COV. That is what lets
 # gpu_blend_cov_run dispatch both UNMODIFIED: no dispatcher change, no new PM4, no RSRC2 edit.
 # The prep table the two dispatches hand between them: 32 B per edge. Sized for the ABI cap of
-# 256 edges (8 KB) even though EDGE_CAP ships at 64, so raising the cap needs no slot move.
-var GPU_EDGE_PREP_SUBOFF       = 0xD0000;    # per-edge prep records, 32 B each
+# 256 edges (8 KB), which is also what GPU_EDGE_CAP now ships at, so raising the cap needs no move.
+#
+# ⛔ MOVED 0xD0000 -> 0xA8000 (1.56.19). At 0xD0000 this table sat INSIDE the batched-frame snapshot:
+# that slot is at 0xC0000 and is 256*128*4 = 0x20000 bytes, so it spans [0xC0000, 0xE0000) and
+# swallowed this one whole. Latent only because the snapshot is #ifdef SHADER_BATCH while op 0x08 is
+# the live ring-3 path — but VM_CONTEXT0 is DISABLED, so there are no page tables and an
+# out-of-bounds GPU store lands somewhere REAL (the console FB at offset 0, or the PSP TMR).
+# ⚠ THE ARENA GATE DID NOT CATCH IT AND COULD NOT: scripts/check.sh compared offset VALUES for
+# equality (`sort | uniq -d`), which finds two constants holding the same number and is structurally
+# blind to two RANGES that overlap. Fixed in the same bite — the gate is now extent-aware.
+# 0xA8000 is the free window immediately above the coherence tiles, which end 0xA7FFF; 8 KB here
+# ends at 0xAA000, leaving [0xAA000, 0xC0000) still free below the snapshot.
+var GPU_EDGE_PREP_SUBOFF       = 0xA8000;    # per-edge prep records, 32 B each -> ends 0xAA000
 # ⚠ blend_pk needs its OWN RSRC1 — 12 VGPRs but 24 SGPRs, where perm and blend_premul want the 16-SGPR
 # _V12. Reusing _V12 here UNDER-ALLOCATES the SGPR file, and the first casualty is the vcc carry chain in
 # the address arithmetic: lanes then read and write the WRONG PIXELS, or run off the end of the arena into
@@ -1178,16 +1189,24 @@ var GPU_PERM_SRC_SUBOFF        = 0x1C000;    # 64 source pixels (256 B)
 var GPU_PERM_OUT_SUBOFF        = 0x1C400;    # 64 x 4 dwords (1024 B) -> ends 0x1C800
 var GPU_PK_OUT_SUBOFF          = 0x1CC00;    # packed-blend output (256 B), 1 KB clear of PERM_OUT
 
-# --- plan-S12: the batched mock-frame oracle ----------------------------------------------------------
+# --- BATCHED-FRAME SNAPSHOT: the one-submission frame oracle (1.56.x) ---------------------------------
 # The op-by-op frame is snapshotted here so the batched frame can be compared against it pixel-for-pixel.
-# 256x128x4 = 128 KB at 0xC0000, well clear of every other slot (highest is BR2_SRC ending 0x79600) and of
-# the shader residency table at 0x50000-0x58FFF.
-var GPU_S12_SNAP_SUBOFF = 0xC0000;
-var GPU_S12_W  = 256;                        # frame region, deliberately a multiple of 64 (the EXEC guard
-var GPU_S12_H  = 128;                        # is proven at S6; this bite is about the SUBMISSION, not lanes)
-var GPU_S12_X  = 320;                        # where the mock frame lands in the back buffer
-var GPU_S12_Y  = 96;
-var GPU_S12_BG = 0xFF202830;                 # underlay both passes start from — identical, or the compare lies
+#
+# ⛔ EXTENT IS 0x20000, NOT "128 KB somewhere". 256*128*4 spans [0xC0000, 0xE0000) — and the per-edge
+# prep table was allocated at 0xD0000, INSIDE THIS SLOT, and shipped that way. The comment here used to
+# read "well clear of every other slot (highest is BR2_SRC ending 0x79600)", which was true when it was
+# written and silently false the moment the rung-9 prep table landed above it.
+# ⚠ A SLOT COMMENT THAT ENUMERATES ITS NEIGHBOURS GOES STALE THE NEXT TIME ANYONE ALLOCATES. State your
+# OWN extent — that is the fact this slot owns and the only one that stays true — and let the
+# extent-aware gate in scripts/check.sh do the comparing. It could not before: it compared offset
+# VALUES for equality, so it saw two constants holding the same number and never saw two ranges
+# overlapping. Prep table moved to 0xA8000 in 1.56.19; the gate learned extents in the same bite.
+var GPU_BATCH_SNAP_SUBOFF = 0xC0000;                # 256*128*4 = 0x20000 -> ends 0xE0000
+var GPU_BATCH_SNAP_W  = 256;                        # frame region, deliberately a multiple of 64 (the EXEC
+var GPU_BATCH_SNAP_H  = 128;                        # guard is already proven; this is about SUBMISSION, not lanes)
+var GPU_BATCH_SNAP_X  = 320;                        # where the mock frame lands in the back buffer
+var GPU_BATCH_SNAP_Y  = 96;
+var GPU_BATCH_SNAP_BG = 0xFF202830;                 # underlay both passes start from — identical, or the compare lies
 var GPU_GRD_W  = 320;
 var GPU_GRD_H  = 200;
 var GPU_GRD_X  = 200;
@@ -1229,7 +1248,7 @@ var GPU_BLEND_SHADER_SUBOFF = 0x50000;       # slot 0 — blend_rect resident fo
 var GPU_OP_DONE_BASE        = 0x58000;       # done-marker table, 64 slots x 0x40 (one cache line each)
 var GPU_OP_DONE_STRIDE      = 0x40;
 var GPU_BLEND_DONE_SUBOFF   = 0x58000;       # done slot 0 — shared by the five kernels while unbatched
-var GPU_BR2_SRC_SUBOFF = 0x70000;            # src for the guard rect (200x48x4 = 37.5 KB) -> ends 0x79600
+var GPU_GUARDRECT_SRC_SUBOFF = 0x70000;            # src for the guard rect (200x48x4 = 37.5 KB) -> ends 0x79600
 
 # --- plan-S3: GL2 / scanout / CP-DMA coherence characterisation -----------------------------------------
 # Ten 16 KB tiles (64x64x4) at a 0x4000 stride, past BR2_SRC's 0x79600. Each arm gets its OWN never-
@@ -1237,21 +1256,21 @@ var GPU_BR2_SRC_SUBOFF = 0x70000;            # src for the guard rect (200x48x4 
 # distinct from both 0 and every expected value, because re-using a slot let a stale GL2 line false-PASS a
 # burn at C2g-1. Sharing tiles between arms here would defeat the entire experiment.
 # Tiles 8/9 are arm D's POSITIVE CONTROL, added after the first S3 burn returned an unfalsifiable result.
-var GPU_S3_BASE_SUBOFF = 0x80000;            # tile 0 .. tile 9 = 0x80000 .. 0xA7FFF
-var GPU_S3_STRIDE      = 0x4000;             # 64 * 64 * 4 = 16 KB per tile
-var GPU_S3_N           = 64;                 # tile is NxN pixels; 64 is exactly one wave, no EXEC guard needed
-var GPU_S3_SENTINEL    = 0xDEADC0DE;         # distinct from 0 and from every expected pixel value
-var GPU_S3_PAT1        = 0xFF404040;         # arm-D "old" pattern (premultiplied: c <= a)
-var GPU_S3_PAT2        = 0xFF808080;         # arm-D "new" pattern written MC-direct by CP-DMA
-var GPU_S3_AX          = 96;                 # arm A tile origin in the back buffer
-var GPU_S3_AY          = 380;
-var GPU_S3_BX          = 240;                # arm B tile origin — side by side with A, one photo shows both
-var GPU_S3_BY          = 380;
-var GPU_S3_UNDER       = 0xFF101010;         # underlay both tiles blend over (near-black, CP-DMA-painted)
-var GPU_BR2_W = 200;
-var GPU_BR2_H = 48;
-var GPU_BR2_X = 128;
-var GPU_BR2_Y = 220;  # SET_SH_REG, 6 values (a_lo,a_hi,b_lo,b_hi,out_lo,out_hi)
+var GPU_COHERE_TILE_SUBOFF = 0x80000;            # 10 tiles, 0x80000 .. 0xA7FFF -> ends 0xA8000
+var GPU_COHERE_STRIDE      = 0x4000;             # 64 * 64 * 4 = 16 KB per tile
+var GPU_COHERE_N           = 64;                 # tile is NxN pixels; 64 is exactly one wave, no EXEC guard needed
+var GPU_COHERE_SENTINEL    = 0xDEADC0DE;         # distinct from 0 and from every expected pixel value
+var GPU_COHERE_PAT1        = 0xFF404040;         # arm-D "old" pattern (premultiplied: c <= a)
+var GPU_COHERE_PAT2        = 0xFF808080;         # arm-D "new" pattern written MC-direct by CP-DMA
+var GPU_COHERE_AX          = 96;                 # arm A tile origin in the back buffer
+var GPU_COHERE_AY          = 380;
+var GPU_COHERE_BX          = 240;                # arm B tile origin — side by side with A, one photo shows both
+var GPU_COHERE_BY          = 380;
+var GPU_COHERE_UNDER       = 0xFF101010;         # underlay both tiles blend over (near-black, CP-DMA-painted)
+var GPU_GUARDRECT_W = 200;
+var GPU_GUARDRECT_H = 48;
+var GPU_GUARDRECT_X = 128;
+var GPU_GUARDRECT_Y = 220;  # SET_SH_REG, 6 values (a_lo,a_hi,b_lo,b_hi,out_lo,out_hi)
 var GPU_DOT_K                 = 4;           # reduction length per lane (dot-product size)
 var GPU_DOT_N                 = 256;         # input element count = 64 lanes * K
 var GPU_DOT_A_SUBOFF          = 0x19000;     # input a[256] (a[i]=i+1)

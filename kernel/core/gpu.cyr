@@ -3685,12 +3685,12 @@ fn gpu_s12_frame(batched, src_mc, mask_mc, bmp_mc) {
     }
 
     var ok = 1;
-    if (gpu_blend_surface(src_mc, 64, 48, GPU_S12_X + 8,   GPU_S12_Y + 16) != 1) { ok = 0; }
-    if (gpu_blend_surface(src_mc, 64, 48, GPU_S12_X + 88,  GPU_S12_Y + 32) != 1) { ok = 0; }
-    if (gpu_blend_surface(src_mc, 64, 48, GPU_S12_X + 168, GPU_S12_Y + 48) != 1) { ok = 0; }
-    if (gpu_cov_surface(mask_mc, 64, 64, GPU_S12_X + 32, GPU_S12_Y + 56, 0xFF00C8FF) != 1) { ok = 0; }
-    if (gpu_glyph_surface(bmp_mc, 128, 16, GPU_S12_X + 16, GPU_S12_Y + 4, 0xFFFFE060) != 1) { ok = 0; }
-    if (gpu_grad_surface(192, 24, GPU_S12_X + 32, GPU_S12_Y + 100, 0xFFC000C0, 0x00000000) != 1) { ok = 0; }
+    if (gpu_blend_surface(src_mc, 64, 48, GPU_BATCH_SNAP_X + 8,   GPU_BATCH_SNAP_Y + 16) != 1) { ok = 0; }
+    if (gpu_blend_surface(src_mc, 64, 48, GPU_BATCH_SNAP_X + 88,  GPU_BATCH_SNAP_Y + 32) != 1) { ok = 0; }
+    if (gpu_blend_surface(src_mc, 64, 48, GPU_BATCH_SNAP_X + 168, GPU_BATCH_SNAP_Y + 48) != 1) { ok = 0; }
+    if (gpu_cov_surface(mask_mc, 64, 64, GPU_BATCH_SNAP_X + 32, GPU_BATCH_SNAP_Y + 56, 0xFF00C8FF) != 1) { ok = 0; }
+    if (gpu_glyph_surface(bmp_mc, 128, 16, GPU_BATCH_SNAP_X + 16, GPU_BATCH_SNAP_Y + 4, 0xFFFFE060) != 1) { ok = 0; }
+    if (gpu_grad_surface(192, 24, GPU_BATCH_SNAP_X + 32, GPU_BATCH_SNAP_Y + 100, 0xFFC000C0, 0x00000000) != 1) { ok = 0; }
 
     if (batched != 1) { return ok; }
     gpu_batch_active = 0;                      # restored before any early return below
@@ -3708,16 +3708,16 @@ fn gpu_shader_batch_test() {
     if (gpu_blit_arm() != 1) { kprintln("gpu: skipping batch (no back buffer)", 36); return 0; }
 
     var pitch = gpu_bb_pitch;
-    if (pitch < (GPU_S12_X + GPU_S12_W) * 4) { kprintln("gpu: skipping batch (surface too narrow)", 40); return 0; }
+    if (pitch < (GPU_BATCH_SNAP_X + GPU_BATCH_SNAP_W) * 4) { kprintln("gpu: skipping batch (surface too narrow)", 40); return 0; }
 
     var bb_phys = gpu_bb_a_phys;
     var bb_mc   = gpu_bb_a_mc;
     if (gpu_bb_back != 0) { bb_phys = gpu_bb_b_phys; bb_mc = gpu_bb_b_mc; }
-    var reg_mc   = bb_mc   + GPU_S12_Y * pitch + GPU_S12_X * 4;
-    var reg_phys = bb_phys + GPU_S12_Y * pitch + GPU_S12_X * 4;
-    var snap_phys = gpu_arena_phys + GPU_S12_SNAP_SUBOFF;
-    var snap_mc   = gpu_arena_mc   + GPU_S12_SNAP_SUBOFF;
-    var rowb = GPU_S12_W * 4;
+    var reg_mc   = bb_mc   + GPU_BATCH_SNAP_Y * pitch + GPU_BATCH_SNAP_X * 4;
+    var reg_phys = bb_phys + GPU_BATCH_SNAP_Y * pitch + GPU_BATCH_SNAP_X * 4;
+    var snap_phys = gpu_arena_phys + GPU_BATCH_SNAP_SUBOFF;
+    var snap_mc   = gpu_arena_mc   + GPU_BATCH_SNAP_SUBOFF;
+    var rowb = GPU_BATCH_SNAP_W * 4;
 
     # Sources: a premultiplied translucent grey window, a round coverage mask, a 1bpp text run.
     var src_phys = gpu_arena_phys + GPU_BR_SRC_SUBOFF;
@@ -3745,7 +3745,7 @@ fn gpu_shader_batch_test() {
     gpu_mfence();
 
     # ---- pass 1: OP-BY-OP, six submissions ----
-    if (gpu_cp_dma_fill_rect(reg_mc, pitch, GPU_S12_BG, rowb, GPU_S12_H) != 1) {
+    if (gpu_cp_dma_fill_rect(reg_mc, pitch, GPU_BATCH_SNAP_BG, rowb, GPU_BATCH_SNAP_H) != 1) {
         kprintln("gpu: batch underlay fill failed", 31); return 0;
     }
     var t0 = rdtsc();
@@ -3756,12 +3756,12 @@ fn gpu_shader_batch_test() {
 
     # Snapshot it. CP-DMA is MC-direct and the frame's shader stores have each been written back by their
     # own tail, so this read is coherent — plan-S3 arm C is exactly what licenses it.
-    if (gpu_cp_dma_blit(snap_mc, rowb, reg_mc, pitch, rowb, GPU_S12_H) != 1) {
+    if (gpu_cp_dma_blit(snap_mc, rowb, reg_mc, pitch, rowb, GPU_BATCH_SNAP_H) != 1) {
         kprintln("gpu: batch snapshot blit failed", 31); return 0;
     }
 
     # ---- pass 2: BATCHED, one submission, from an identical underlay ----
-    if (gpu_cp_dma_fill_rect(reg_mc, pitch, GPU_S12_BG, rowb, GPU_S12_H) != 1) {
+    if (gpu_cp_dma_fill_rect(reg_mc, pitch, GPU_BATCH_SNAP_BG, rowb, GPU_BATCH_SNAP_H) != 1) {
         kprintln("gpu: batch underlay refill failed", 33); return 0;
     }
     var t1 = rdtsc();
@@ -3773,9 +3773,9 @@ fn gpu_shader_batch_test() {
     # ---- the gate: PIXEL-IDENTICAL ----
     var bad = 0;
     var y = 0;
-    while (y < GPU_S12_H) {
+    while (y < GPU_BATCH_SNAP_H) {
         var x = 0;
-        while (x < GPU_S12_W) {
+        while (x < GPU_BATCH_SNAP_W) {
             var a = load32(reg_phys + y * pitch + (x << 2)) & 0xFFFFFFFF;
             var c2 = load32(snap_phys + y * rowb + (x << 2)) & 0xFFFFFFFF;
             if (a != c2) { bad = bad + 1; }
@@ -3962,7 +3962,7 @@ fn gpu_blend_surface(src_mc, w, h, dx, dy) {
 # CPU readback happens IMMEDIATELY after the done marker retires (the marker rides a WRITE_DATA through the
 # CP, not through GL2, so its arrival says nothing about the shader's stores).
 
-fn gpu_s3_tile(i) { return GPU_S3_BASE_SUBOFF + i * GPU_S3_STRIDE; }
+fn gpu_s3_tile(i) { return GPU_COHERE_TILE_SUBOFF + i * GPU_COHERE_STRIDE; }
 
 # gpu_cohere_run — THE ONLY place gpu_cohere_wb / gpu_cohere_inv are ever written. Sets them, runs one
 # blend_rect dispatch, and restores BOTH on every exit path. A leaked 0 would re-create the C2g-1
@@ -4021,10 +4021,10 @@ fn gpu_shader_cohere_test() {
     if (gpu_blend_arm() != 1) { kprintln("gpu: skipping coherence (blend shader not resident)", 51); return 0; }
     if (gpu_blit_arm() != 1) { kprintln("gpu: skipping coherence (no back buffer)", 40); return 0; }
 
-    var n     = GPU_S3_N;
+    var n     = GPU_COHERE_N;
     var tilep = n * n * 4;
     var pitch = gpu_bb_pitch;
-    if (pitch < (GPU_S3_BX + n) * 4) { kprintln("gpu: skipping coherence (surface too narrow)", 44); return 0; }
+    if (pitch < (GPU_COHERE_BX + n) * 4) { kprintln("gpu: skipping coherence (surface too narrow)", 44); return 0; }
 
     var bb_phys = gpu_bb_a_phys;
     var bb_mc   = gpu_bb_a_mc;
@@ -4042,15 +4042,15 @@ fn gpu_shader_cohere_test() {
     # ---- ARMS A and B: shader -> SCANOUT BACK BUFFER, with and without the write-back ----
     # Two tiles side by side so ONE photo scores both. The underlay is CP-DMA-painted near-black, so a tile
     # that did not reach the display stays visibly dark against a tile that did.
-    if (gpu_cp_dma_fill_rect(bb_mc + GPU_S3_AY * pitch + GPU_S3_AX * 4, pitch, GPU_S3_UNDER, n * 4, n) != 1) {
+    if (gpu_cp_dma_fill_rect(bb_mc + GPU_COHERE_AY * pitch + GPU_COHERE_AX * 4, pitch, GPU_COHERE_UNDER, n * 4, n) != 1) {
         kprintln("gpu: coherence underlay A failed", 32); return 0;
     }
-    if (gpu_cp_dma_fill_rect(bb_mc + GPU_S3_BY * pitch + GPU_S3_BX * 4, pitch, GPU_S3_UNDER, n * 4, n) != 1) {
+    if (gpu_cp_dma_fill_rect(bb_mc + GPU_COHERE_BY * pitch + GPU_COHERE_BX * 4, pitch, GPU_COHERE_UNDER, n * 4, n) != 1) {
         kprintln("gpu: coherence underlay B failed", 32); return 0;
     }
 
-    var a_dst_mc   = bb_mc   + GPU_S3_AY * pitch + GPU_S3_AX * 4;
-    var a_dst_phys = bb_phys + GPU_S3_AY * pitch + GPU_S3_AX * 4;
+    var a_dst_mc   = bb_mc   + GPU_COHERE_AY * pitch + GPU_COHERE_AX * 4;
+    var a_dst_phys = bb_phys + GPU_COHERE_AY * pitch + GPU_COHERE_AX * 4;
     gpu_cohere_wb = 1; gpu_cohere_inv = 1;
     var ra = gpu_blend_rect_run(gpu_arena_mc + GPU_BLEND_SHADER_SUBOFF, src_mc, a_dst_mc,
     n * 4, pitch, n, 1, n,
@@ -4068,8 +4068,8 @@ fn gpu_shader_cohere_test() {
         }
     }
 
-    var b_dst_mc   = bb_mc   + GPU_S3_BY * pitch + GPU_S3_BX * 4;
-    var b_dst_phys = bb_phys + GPU_S3_BY * pitch + GPU_S3_BX * 4;
+    var b_dst_mc   = bb_mc   + GPU_COHERE_BY * pitch + GPU_COHERE_BX * 4;
+    var b_dst_phys = bb_phys + GPU_COHERE_BY * pitch + GPU_COHERE_BX * 4;
     gpu_cohere_wb = 0; gpu_cohere_inv = 1;
     var rb = gpu_blend_rect_run(gpu_arena_mc + GPU_BLEND_SHADER_SUBOFF, src_mc, b_dst_mc,
     n * 4, pitch, n, 1, n,
@@ -4111,7 +4111,7 @@ fn gpu_shader_cohere_test() {
     var c1_cpy_phys = gpu_arena_phys + gpu_s3_tile(2);
     var c1_cpy_mc   = gpu_arena_mc   + gpu_s3_tile(2);
     gpu_s3_seed(c1_dst_phys, 0, n);                       # dst zeroed => opaque blend is an exact copy
-    gpu_s3_seed(c1_cpy_phys, GPU_S3_SENTINEL, n);         # fresh, sentinel-seeded target
+    gpu_s3_seed(c1_cpy_phys, GPU_COHERE_SENTINEL, n);         # fresh, sentinel-seeded target
     var c1_ok = gpu_cohere_run(1, 1, src_mc, c1_dst_mc, n);
     if (c1_ok == 1) { gpu_cp_dma(c1_cpy_mc, c1_dst_mc, tilep); }
     var c1 = gpu_s3_count_eq(c1_cpy_phys, 0xFFFFFFFF, n);
@@ -4121,7 +4121,7 @@ fn gpu_shader_cohere_test() {
     var c2_cpy_phys = gpu_arena_phys + gpu_s3_tile(4);
     var c2_cpy_mc   = gpu_arena_mc   + gpu_s3_tile(4);
     gpu_s3_seed(c2_dst_phys, 0, n);
-    gpu_s3_seed(c2_cpy_phys, GPU_S3_SENTINEL, n);
+    gpu_s3_seed(c2_cpy_phys, GPU_COHERE_SENTINEL, n);
     var c2_ok = gpu_cohere_run(0, 1, src_mc, c2_dst_mc, n);   # NO write-back
     if (c2_ok == 1) { gpu_cp_dma(c2_cpy_mc, c2_dst_mc, tilep); }
     var c2 = gpu_s3_count_eq(c2_cpy_phys, 0xFFFFFFFF, n);
@@ -4151,22 +4151,22 @@ fn gpu_shader_cohere_test() {
     # dispatch then takes a compulsory miss and reports "coherent" for both sub-arms, for any hardware.
     # Prime with wb=0. inv=1 on the prime is harmless: it fires BEFORE the loads that populate L2.
     var dp1 = gpu_cohere_run(0, 1, d_src_mc, d_p_mc, n);       # prime GL2 with PAT1 lines for tile 5
-    gpu_cp_dma_fill(d_src_mc, GPU_S3_PAT2, tilep);             # MC-direct overwrite, bypassing GL2
+    gpu_cp_dma_fill(d_src_mc, GPU_COHERE_PAT2, tilep);             # MC-direct overwrite, bypassing GL2
     gpu_s3_seed(d1_phys, 0, n);
     gpu_cohere_run(1, 1, d_src_mc, d1_mc, n);                  # WITH the pre-dispatch invalidate
-    var d1_new = gpu_s3_count_eq(d1_phys, GPU_S3_PAT2, n);
-    var d1_old = gpu_s3_count_eq(d1_phys, GPU_S3_PAT1, n);
+    var d1_new = gpu_s3_count_eq(d1_phys, GPU_COHERE_PAT2, n);
+    var d1_old = gpu_s3_count_eq(d1_phys, GPU_COHERE_PAT1, n);
 
     # Same experiment with the invalidate suppressed. Re-prime first — the MEASURED dispatch above ran with
     # wb=1, so its own trailing packet invalidated L2 on the way out.
-    gpu_s3_seed(d_src_phys, GPU_S3_PAT1, n);
+    gpu_s3_seed(d_src_phys, GPU_COHERE_PAT1, n);
     gpu_s3_seed(d_p_phys, 0, n);
     var dp2 = gpu_cohere_run(0, 1, d_src_mc, d_p_mc, n);
-    gpu_cp_dma_fill(d_src_mc, GPU_S3_PAT2, tilep);
+    gpu_cp_dma_fill(d_src_mc, GPU_COHERE_PAT2, tilep);
     gpu_s3_seed(c1_dst_phys, 0, n);                            # tile 1 reused as a scratch destination here
     gpu_cohere_run(1, 0, d_src_mc, c1_dst_mc, n);              # NO pre-dispatch invalidate
-    var d2_new = gpu_s3_count_eq(c1_dst_phys, GPU_S3_PAT2, n);
-    var d2_old = gpu_s3_count_eq(c1_dst_phys, GPU_S3_PAT1, n);
+    var d2_new = gpu_s3_count_eq(c1_dst_phys, GPU_COHERE_PAT2, n);
+    var d2_old = gpu_s3_count_eq(c1_dst_phys, GPU_COHERE_PAT1, n);
 
     # POSITIVE CONTROL — can this harness observe load-side staleness AT ALL? Identical to the sub-arm above
     # except the overwrite is a CPU store through the UC mapping instead of a CP-DMA fill. Both writers are
@@ -4182,14 +4182,14 @@ fn gpu_shader_cohere_test() {
     var d3_src_mc   = gpu_arena_mc   + gpu_s3_tile(8);
     var d3_dst_phys = gpu_arena_phys + gpu_s3_tile(9);
     var d3_dst_mc   = gpu_arena_mc   + gpu_s3_tile(9);
-    gpu_s3_seed(d3_src_phys, GPU_S3_PAT1, n);
+    gpu_s3_seed(d3_src_phys, GPU_COHERE_PAT1, n);
     gpu_s3_seed(d_p_phys, 0, n);
     var dp3 = gpu_cohere_run(0, 1, d3_src_mc, d_p_mc, n);      # prime GL2 with PAT1 lines for tile 8
-    gpu_s3_seed(d3_src_phys, GPU_S3_PAT2, n);                  # CPU UC overwrite, NOT CP-DMA
+    gpu_s3_seed(d3_src_phys, GPU_COHERE_PAT2, n);                  # CPU UC overwrite, NOT CP-DMA
     gpu_s3_seed(d3_dst_phys, 0, n);
     gpu_cohere_run(1, 0, d3_src_mc, d3_dst_mc, n);             # NO pre-dispatch invalidate
-    var d3_new = gpu_s3_count_eq(d3_dst_phys, GPU_S3_PAT2, n);
-    var d3_old = gpu_s3_count_eq(d3_dst_phys, GPU_S3_PAT1, n);
+    var d3_new = gpu_s3_count_eq(d3_dst_phys, GPU_COHERE_PAT2, n);
+    var d3_old = gpu_s3_count_eq(d3_dst_phys, GPU_COHERE_PAT1, n);
 
     # PRIME WITNESSES. The first burn discarded these returns, so a silently timed-out prime produced the
     # same printed row as a successful one — a second, independent reason those rows could not be trusted.
@@ -4320,44 +4320,44 @@ fn gpu_shader_rect_test() {
     # claims: that the 200 blended px are bit-exact (the guard did not corrupt the lanes it kept), and that
     # x = 200..255 still hold the untouched underlay (the guard actually stopped the lanes it dropped).
     # Only the second one can fail if s_and_saveexec_b64 is wrong, so it is the load-bearing check.
-    var s2_phys = gpu_arena_phys + GPU_BR2_SRC_SUBOFF;
-    var s2_mc   = gpu_arena_mc   + GPU_BR2_SRC_SUBOFF;
-    var s2_pitch = GPU_BR2_W * 4;
+    var s2_phys = gpu_arena_phys + GPU_GUARDRECT_SRC_SUBOFF;
+    var s2_mc   = gpu_arena_mc   + GPU_GUARDRECT_SRC_SUBOFF;
+    var s2_pitch = GPU_GUARDRECT_W * 4;
     var gy2 = 0;
-    while (gy2 < GPU_BR2_H) {
+    while (gy2 < GPU_GUARDRECT_H) {
         var sa2 = gy2 * 5;
         if (sa2 > 255) { sa2 = 255; }
         var sc2 = sa2 / 2;
         var px2 = (sa2 << 24) | (sc2 << 16) | (sc2 << 8) | sc2;
         var gx2 = 0;
-        while (gx2 < GPU_BR2_W) { store32(s2_phys + gy2 * s2_pitch + (gx2 << 2), px2); gx2 = gx2 + 1; }
+        while (gx2 < GPU_GUARDRECT_W) { store32(s2_phys + gy2 * s2_pitch + (gx2 << 2), px2); gx2 = gx2 + 1; }
         gy2 = gy2 + 1;
     }
     gpu_mfence();
 
     # Underlay is painted 256 px wide but only 200 px are blended — so the 56 px tail is a control strip
     # that MUST come back untouched.
-    var r2_mc   = bb_mc   + GPU_BR2_Y * pitch + GPU_BR2_X * 4;
-    var r2_phys = bb_phys + GPU_BR2_Y * pitch + GPU_BR2_X * 4;
-    if (gpu_cp_dma_fill_rect(r2_mc, pitch, GPU_BR_DST_L, 256 * 4, GPU_BR2_H) != 1) {
+    var r2_mc   = bb_mc   + GPU_GUARDRECT_Y * pitch + GPU_GUARDRECT_X * 4;
+    var r2_phys = bb_phys + GPU_GUARDRECT_Y * pitch + GPU_GUARDRECT_X * 4;
+    if (gpu_cp_dma_fill_rect(r2_mc, pitch, GPU_BR_DST_L, 256 * 4, GPU_GUARDRECT_H) != 1) {
         kprintln("gpu: guard underlay fill failed", 31); return 0;
     }
-    var g2x = (GPU_BR2_W + 63) / 64;
-    if (gpu_blend_rect_run(shader_mc, s2_mc, r2_mc, s2_pitch, pitch, GPU_BR2_W, g2x, GPU_BR2_H, done_mc, done_phys) != 1) {
+    var g2x = (GPU_GUARDRECT_W + 63) / 64;
+    if (gpu_blend_rect_run(shader_mc, s2_mc, r2_mc, s2_pitch, pitch, GPU_GUARDRECT_W, g2x, GPU_GUARDRECT_H, done_mc, done_phys) != 1) {
         kprintln("gpu: guard blend dispatch did not complete", 42);
         return 0;
     }
     var gbad = 0; var gspill = 0; var sx = 0; var sy = 0;
     var wy = 0;
-    while (wy < GPU_BR2_H) {
+    while (wy < GPU_GUARDRECT_H) {
         var wx = 0;
         while (wx < 256) {
             var gv = load32(r2_phys + wy * pitch + (wx << 2)) & 0xFFFFFFFF;
-            if (wx < GPU_BR2_W) {
+            if (wx < GPU_GUARDRECT_W) {
                 var gref = blend_ref_px(load32(s2_phys + wy * s2_pitch + (wx << 2)) & 0xFFFFFFFF, GPU_BR_DST_L) & 0xFFFFFFFF;
                 if (gv != gref) { gbad = gbad + 1; }
             }
-            if (wx >= GPU_BR2_W) {
+            if (wx >= GPU_GUARDRECT_W) {
                 if (gv != GPU_BR_DST_L) {
                     if (gspill == 0) { sx = wx; sy = wy; }
                     gspill = gspill + 1;
