@@ -554,3 +554,43 @@ fn tc_run(): i64 {
     return bad;
 }
 
+# ============================================================================================
+# tr_prep_dump — print the prep record in the SAME field order the kernel prints it
+# ============================================================================================
+# ⭐ THE OTHER HALF OF A CROSS-IMPLEMENTATION DIFF. The kernel computes this record with its own
+# copy of the integer-divide primitives (it cannot include a host file, and Cyrius shadows duplicate
+# fns silently, so the two can drift with nothing complaining). Printing both from the same inputs
+# and diffing field by field is the only thing watching that seam.
+fn tr_prep_dump(): i64 {
+    ps("tri-prep:");
+    var order[32];
+    store64(&order +  0 * 8, 0);        # cov_lo placeholder -- the host has no cov address
+    var f = 0;
+    # Field order mirrors gpu_tri_prep_dump: cov_lo cov_hi t t32 | Dh V L - | A2lo A2hi D255lo D255hi
+    #                                        | kxB kyB k0Blo k0Bhi | kxC kyC k0Clo k0Chi | cA cB cC
+    ps(" 19087360");                    # cov_lo = 0x1234000, the literal the kernel is handed
+    ps(" 0");
+    ps(" "); pn(tp_get(TP_T));
+    ps(" "); pn(32 - tp_get(TP_T));
+    ps(" "); pn(tp_get(TP_DH));
+    ps(" "); pn(tp_get(TP_V));
+    ps(" "); pn(tp_get(TP_L));
+    ps(" 0");
+    ps(" "); pn(tp_get(TP_A2) & 0xFFFFFFFF);
+    ps(" "); pn((tp_get(TP_A2) >> 32) & 0xFFFFFFFF);
+    ps(" "); pn(tp_get(TP_D255) & 0xFFFFFFFF);
+    ps(" "); pn((tp_get(TP_D255) >> 32) & 0xFFFFFFFF);
+    ps(" "); pn(tp_get(TP_KXB) & 0xFFFFFFFF);
+    ps(" "); pn(tp_get(TP_KYB) & 0xFFFFFFFF);
+    ps(" "); pn(tp_get(TP_K0B) & 0xFFFFFFFF);
+    ps(" "); pn((tp_get(TP_K0B) >> 32) & 0xFFFFFFFF);
+    ps(" "); pn(tp_get(TP_KXC) & 0xFFFFFFFF);
+    ps(" "); pn(tp_get(TP_KYC) & 0xFFFFFFFF);
+    ps(" "); pn(tp_get(TP_K0C) & 0xFFFFFFFF);
+    ps(" "); pn((tp_get(TP_K0C) >> 32) & 0xFFFFFFFF);
+    ps(" "); pn(tp_get(TP_CA) & 0xFFFFFFFF);
+    ps(" "); pn(tp_get(TP_CB) & 0xFFFFFFFF);
+    ps(" "); pn(tp_get(TP_CC) & 0xFFFFFFFF);
+    nl();
+    return 0;
+}

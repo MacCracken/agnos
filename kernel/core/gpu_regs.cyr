@@ -1155,6 +1155,15 @@ var GPU_PK_SHADER_SUBOFF       = 0x55000;    # slot 5 — blend_pk blob (61 dwor
 # audit (rung 6) and check.sh's unaliased-slot gate cover it from the moment the ABI exists — a slot
 # that appears at the same commit as the blob that fills it has never once been audited empty.
 var GPU_EDGE_SHADER_SUBOFF     = 0x56000;    # slot 6 — edge_cov blob   (133 dwords / 532 B)  -> ends 0x57000
+# --- attribute interpolation (3D arc rung 11) -------------------------------------------------
+# ⚠ Extents are declared and gate-checked. GPU_TRI_COV_SUBOFF is 1 MB and ends at 0x1E4000, leaving
+# 48 KB clear of the sacrificial slot at 0x1F0000 -- verified by scripts/check-arena.sh, not by eye.
+var GPU_TRI_SHADER_SUBOFF      = 0x59000;    # residency slot 9, 269 dwords  -> ends 0x5A000
+var GPU_TRI_PREP_SUBOFF        = 0xE0000;    # 64 records x 128 B  -> ends 0xE2000
+var GPU_TRI_EDGE_SUBOFF        = 0xE2000;    # synthesised frame edges when DERIVE is set -> ends 0xE3000
+var GPU_TRI_COV_SUBOFF         = 0xE4000;    # 8bpp coverage scratch, 1 MB  -> ends 0x1E4000
+var GPU_COMPUTE_PGM_RSRC1_TRI  = 0x002C0187; # tri_rgba: 32 VGPRs, 56 SGPRs (HARVESTED from the
+                                             # assembled descriptor, never counted)
 var GPU_EDGE_SETUP_SUBOFF      = 0x57000;    # slot 7 — edge_setup blob (58 dwords / 232 B)  -> ends 0x58000
 # ⭐ RSRC1 EXTRACTED MECHANICALLY from each kernel descriptor (llvm-objcopy --only-section=.rodata,
 # byte 48), NEVER hand-counted. ⛔ A hand-derivation of the edge_cov value gave 0x002C008D — an
@@ -1247,8 +1256,15 @@ var GPU_BR_DST_R  = 0xFFA00000;              # underlay, right half (red)      w
 #   0x16000 blend_cov   ==  GPU_SHADER_OUT2_SUBOFF (:1013)
 #   0x18000 grad_linear ==  GPU_KERNARG_IN_SUBOFF  (:1029)
 # Only build-flag disjointness kept these apart, and nothing enforced that. scripts/check.sh now fails
-# the build on any duplicate _SUBOFF value so this class cannot come back.
-var GPU_SHADER_SLOT_BASE   = 0x50000;        # 8 slots x 4 KB = 0x50000..0x57FFF (past COV_MASK's 64 KB)
+# the build on any OVERLAPPING slot range -- extent-aware since 1.56.19, not merely duplicate-valued.
+#
+# ⚠ NINE SLOTS NOW, NOT EIGHT, AND THE TABLE IS NO LONGER CONTIGUOUS. Slot 8 (0x58000) is the
+# done-marker table (GPU_BLEND_DONE_SUBOFF), so the attribute-interpolation blob takes slot 9 at
+# 0x59000. The old "8 slots x 4 KB = 0x50000..0x57FFF" comment described a map that stopped being
+# true when the done table landed, and a stale range comment is exactly what let the batched-frame
+# snapshot swallow the edge prep table.
+var GPU_SHADER_SLOT_BASE   = 0x50000;        # slot i at 0x50000 + i*0x1000; slots 0-7 shaders,
+                                             # slot 8 = done table, slot 9 = tri_rgba
 var GPU_SHADER_SLOT_STRIDE = 0x1000;
 var GPU_BLEND_SHADER_SUBOFF = 0x50000;       # slot 0 — blend_rect resident for #92 (60 dwords)  -> ends 0x51000
 var GPU_OP_DONE_BASE        = 0x58000;       # done-marker table, 64 slots x 0x40 (one cache line each)

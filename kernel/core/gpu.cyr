@@ -3578,6 +3578,150 @@ fn gpu_shader_glyph_test() {
 
 # gpu_cov_arm — make blend_cov resident for the RUNTIME (#93) path. Idempotent; own arena slot, so #93
 # works in a kernel built without SHADER_COV and depends on no boot-time ordering. Peer of gpu_blend_arm.
+
+# ============================================================================================
+# ATTRIBUTE INTERPOLATION — the CPU prologue and residency (3D arc rung 11)
+# ============================================================================================
+var gpu_tri_armed = 0;
+
+fn gpu_tri_arm() {
+    if (gpu_tri_armed == 1) { return 1; }
+    if (gpu_present == 0) { return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+    if (gpu_matmul_ok != 1) { return 0; }
+    tri_rgba_write(gpu_arena_phys + GPU_TRI_SHADER_SUBOFF);
+    gpu_mfence();
+    gpu_tri_armed = 1;
+    return 1;
+}
+
+# tri_u32 / tri_clz32 / tri_recip32 — the integer-divide primitives the prologue needs.
+#
+# ⛔ THESE ARE A SECOND COPY, AND THAT IS A KNOWN, WATCHED SEAM. The identical routines live in
+# gpu-test/refraster.cyr, shared by the reference and the shader model. The kernel cannot include a
+# host tool, so the code exists twice — and Cyrius shadows duplicate `fn`s SILENTLY, so nothing here
+# would complain if the two drifted.
+# ⚠ WHAT WATCHES IT: the prep-record diff. The kernel prints the 128-byte record it computed and
+# /bin/gputri prints the record IT computed from the same inputs in the same boot; a divergence in
+# either copy shows up as a differing field. That diff is the ONLY thing standing between these two
+# implementations, so it must never be weakened into a kernel read-back of its own write — that is
+# echo, not answer.
+fn tri_u32(x) { return x & 0xFFFFFFFF; }
+
+fn tri_clz32(x) {
+    if (x == 0) { return 32; }
+    var v = tri_u32(x);
+    var n = 0;
+    while ((v & 0x80000000) == 0) { v = tri_u32(v << 1); n = n + 1; }
+    return n;
+}
+
+# V = floor((2^63 - 1) / dp) by a 32-iteration integer RESTORING division. Exact BY CONSTRUCTION.
+# ⛔ NO v_rcp_f32 ANYWHERE. The float reciprocal is an APPROXIMATION the ISA is allowed to perturb by
+# an ULP, and op 0x04 already demonstrates the consequence: its own self-test tolerates a deviation
+# of 2. Hoisted once per record, this loop costs nothing amortised.
+fn tri_recip32(dp) {
+    var r = 0x7FFFFFFF;
+    var v = 0;
+    var k = 0;
+    while (k < 32) {
+        var top = (r >> 31) & 1;
+        r = tri_u32(tri_u32(r << 1) | 1);
+        var ge = 0;
+        if (top == 1) { ge = 1; }
+        if (top != 1) { if (r >= dp) { ge = 1; } }
+        if (ge == 1) { r = tri_u32(r - dp); }
+        v = tri_u32(tri_u32(v << 1) | ge);
+        k = k + 1;
+    }
+    return v;
+}
+
+fn tri_bitlen64(x) {
+    var n = 0;
+    var v = x;
+    while (v != 0) { v = v >> 1; n = n + 1; }
+    return n;
+}
+
+# gpu_tri_prep — build the 128-byte TRI-PREP record the shader reads.
+#
+# Vertices arrive in 16.16 (the #92 record's units). ⚠ THE CROSS PRODUCT IS TAKEN IN PIXELS and only
+# 2A and the constant terms carry the << 16, because kx/ky already multiply a 16.16 sample point.
+# Cross-multiplying two 16.16 values would put 2A at cross << 32 and every derived bound off by 2^16.
+# Returns 1, or 0 if the frame is degenerate (the validator should already have refused it).
+fn gpu_tri_prep(rec_phys, cov_mc, vx0, vy0, vx1, vy1, vx2, vy2, ca, cb, cc) {
+    var ax = vx0 >>> 16;  var ay = vy0 >>> 16;
+    var bx = vx1 >>> 16;  var by = vy1 >>> 16;
+    var cx = vx2 >>> 16;  var cy = vy2 >>> 16;
+
+    var cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    if (cross == 0) { return 0; }
+    var sgn = 1;
+    if (cross < 0) { sgn = 0 - 1; cross = 0 - cross; }
+    var a2 = cross << 16;
+
+    var kxb = sgn * (cy - ay);
+    var kyb = sgn * (ax - cx);
+    var k0b = sgn * ((ay * cx - ax * cy) << 16);
+    var kxc = sgn * (ay - by);
+    var kyc = sgn * (bx - ax);
+    var k0c = sgn * ((ax * by - ay * bx) << 16);
+
+    var d255 = 255 * a2;
+    var t = tri_bitlen64(d255) - 30;
+    if (t < 0) { t = 0; }                        # d255 already fits 30 bits: nothing to normalise
+    var dh = (d255 >> t) + 1;                    # +1 makes the shader's correction ONE-SIDED
+    var l = tri_clz32(dh);
+    var dn = tri_u32(dh << l);
+    if (dn < 2147483648) { return 0; }           # outside recip32's domain -- refuse, never guess
+    var v = tri_recip32(dn);
+
+    var q = 0;
+    while (q < 32) { store32(rec_phys + q * 4, 0); q = q + 1; }   # Q6/Q7 stay ZERO: the extension point
+
+    store32(rec_phys +  0, cov_mc & 0xFFFFFFFF);
+    store32(rec_phys +  4, (cov_mc >> 32) & 0xFFFFFFFF);
+    store32(rec_phys +  8, t);
+    store32(rec_phys + 12, 32 - t);
+    store32(rec_phys + 16, dh);
+    store32(rec_phys + 20, v);
+    store32(rec_phys + 24, l);
+    store32(rec_phys + 32, a2 & 0xFFFFFFFF);
+    store32(rec_phys + 36, (a2 >> 32) & 0xFFFFFFFF);
+    store32(rec_phys + 40, d255 & 0xFFFFFFFF);
+    store32(rec_phys + 44, (d255 >> 32) & 0xFFFFFFFF);
+    store32(rec_phys + 48, kxb & 0xFFFFFFFF);
+    store32(rec_phys + 52, kyb & 0xFFFFFFFF);
+    store32(rec_phys + 56, k0b & 0xFFFFFFFF);
+    store32(rec_phys + 60, (k0b >> 32) & 0xFFFFFFFF);
+    store32(rec_phys + 64, kxc & 0xFFFFFFFF);
+    store32(rec_phys + 68, kyc & 0xFFFFFFFF);
+    store32(rec_phys + 72, k0c & 0xFFFFFFFF);
+    store32(rec_phys + 76, (k0c >> 32) & 0xFFFFFFFF);
+    store32(rec_phys + 80, ca & 0xFFFFFFFF);
+    store32(rec_phys + 84, cb & 0xFFFFFFFF);
+    store32(rec_phys + 88, cc & 0xFFFFFFFF);
+    gpu_mfence();
+    return 1;
+}
+
+# Print the record so it can be diffed against the ring-3 tool's own computation of the same thing.
+# ⚠ NOT A READ-BACK ORACLE. This prints what the kernel COMPUTED so an independently-computed record
+# can contradict it. A kernel that read back its own store and declared agreement would be echoing.
+fn gpu_tri_prep_dump(rec_phys) {
+    kprint("tri-prep:", 9);
+    var i = 0;
+    while (i < 23) {
+        kprint(" ", 1);
+        kprint_num(load32(rec_phys + i * 4) & 0xFFFFFFFF);
+        i = i + 1;
+    }
+    kprintln("", 0);
+    return 0;
+}
+
 fn gpu_cov_arm() {
     if (gpu_cov_armed == 1) { return 1; }
     if (gpu_present == 0) { return 0; }

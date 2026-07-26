@@ -1698,6 +1698,25 @@ fn edge_abi_selftest() {
     # takes the cross product in pixels before lifting 2A.
     kprint("edge-abi: ---- #92 op 0x09 TRI_RGBA ABI battery ----\n", 53);
 
+    # ⭐ THE PREP-RECORD ORACLE, AT ZERO BURNS. The kernel computes the 128-byte TRI-PREP record
+    # from corpus case 0's frame and prints it; gpu-test/triref computes the SAME record from the
+    # SAME inputs on the host. A field that differs indicts whichever copy of the integer-divide
+    # primitives drifted — and those primitives exist twice (kernel + host tool) because the kernel
+    # cannot include a host file, with Cyrius shadowing duplicate fns silently.
+    # ⚠ THIS IS NOT A READ-BACK. Printing what was computed lets an independent computation
+    # CONTRADICT it. A kernel reading back its own store and declaring agreement proves nothing.
+    var trec = &eabi_edges;                       # borrow the battery's scratch page
+    if (gpu_tri_prep(trec, 0x1234000,
+                     0, 0, 256 * 65536, 0, 0, 256 * 65536,
+                     0xFFFF0000, 0xFF00FF00, 0xFF0000FF) == 1) {
+        gpu_tri_prep_dump(trec);
+    }
+    if (gpu_tri_prep(trec, 0, 0, 0, 100 * 65536, 100 * 65536, 200 * 65536, 200 * 65536,
+                     0xFFFF0000, 0xFF00FF00, 0xFF0000FF) != 0) {
+        kprint("tri-prep: FAIL -- a COLLINEAR frame was accepted\n", 49);
+    }
+
+
     # well-formed, DERIVE (no edge slot at all) -> VALID
     var t1 = 0; while (t1 < 16) { store32(&d + t1 * 4, 0); t1 = t1 + 1; }
     store32(&d +  0, GPU_OP_TRI_RGBA);

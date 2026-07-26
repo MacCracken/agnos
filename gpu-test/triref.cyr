@@ -13,6 +13,10 @@ fn main(): i64 {
     var abad = tc_audit();
     if (abad != 0) { ps("triref: corpus AUDIT failed, "); pn(abad); ps(" problem(s)"); nl(); }
     fail = fail + abad;
+    # The kernel prints its own copy of this record during the QEMU ABI battery; the two are
+    # diffed field by field. Corpus case 0's frame, so both sides use identical inputs.
+    tri_prep(0, 0, 256, 0, 0, 256, 0xFFFF0000, 0xFF00FF00, 0xFF0000FF);
+    tr_prep_dump();
     ps("corpus:"); nl();
     fail = fail + tc_run();
     if (fail != 0) {
