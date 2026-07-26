@@ -80,6 +80,7 @@ var ea_fault = 0;               # sticky: any refusal latches, so a caller that 
 fn ea_fail(msg): i64 { ea_fault = 1; ps("  ** edgeasm: "); puts(msg); return 0; }
 
 var VCC = 106;
+var EXEC_LO = 126;              # the EXEC mask as a scalar operand (s_mov_b64 exec, -1)
 var LIT = 255;
 var F1  = 242;                  # the f32 inline constant 1.0
 
@@ -113,6 +114,18 @@ fn e_sop1(p, op, sdst, s0): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sop1(op, 
 fn e_sop2(p, op, sdst, s0, s1): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sop2(op, sdst, s0, s1)); }
 fn e_sopc(p, op, s0, s1): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sopc(op, s0, s1)); }
 fn e_sopp(p, op, imm): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sopp(op, imm)); }
+# ⚠ VOP1/VOP2 with src0 == 255 carry a TRAILING LITERAL DWORD. Missing that is a two-dword
+# instruction counted as one, which shifts every position after it — and it is precisely what
+# broke the first B6 run: `v_mov_b32 v14, 0x7FFFFFFF` made every branch target land 4 bytes
+# early and the fixup pass correctly reported "branch to an UNDEFINED label".
+fn e_vop1_lit(p, op, vdst, lit): i64 {
+    var q = gfx9_emit32(&isa, p, gfx9_enc_vop1(op, vdst, GFX9_SRC_LITERAL));
+    return gfx9_emit32(&isa, q, lit);
+}
+fn e_vop2_lit(p, op, vdst, lit, vs1): i64 {
+    var q = gfx9_emit32(&isa, p, gfx9_enc_vop2(op, vdst, GFX9_SRC_LITERAL, vs1));
+    return gfx9_emit32(&isa, q, lit);
+}
 fn e_sop1_lit(p, op, sdst, lit): i64 {
     var q = gfx9_emit32(&isa, p, gfx9_enc_sop1(op, sdst, GFX9_SRC_LITERAL));
     return gfx9_emit32(&isa, q, lit);
@@ -363,6 +376,437 @@ fn bc_emit(): i64 {
     return p;
 }
 
+
+# ============================================================================================
+# B6 — THE TWO RUNG-9b BLOBS, byte-verified against an INDEPENDENT ASSEMBLER
+# ============================================================================================
+# ⭐ THE ORACLE IS TWO ASSEMBLERS ON THE SAME SOURCE. `kernel/shaders/edge_setup.s` and
+# `edge_cov.s` are assembled by `llvm-mc -mcpu=gfx90c`; the identical instruction stream is
+# emitted here through mabda's encoder and this file's label pass, and the two are byte-diffed.
+# Neither side can be wrong alone without the diff saying so.
+#
+# ⛔ THE BRANCHES ARE THE POINT. llvm-mc RESOLVES the labels; edgeasm resolves them through
+# ea_label/ea_branch/ea_fixup. So this diff verifies the fixup arithmetic against an
+# independent implementation on SEVEN real branches (two backward loops in setup, three
+# backward and two forward in cov) — not on the synthetic pair gate 2 uses. A blob with three
+# backward branches and hand-counted offsets is exactly the silent-corruption case B4 exists
+# to eliminate, and this is where that claim is actually tested.
+#
+# ⚠ The emit list was DERIVED from llvm-mc's own output through the encoder's field formulas,
+# not transcribed from the .s by eye. [[feedback_audit_re_derive_dont_validate_comments]]
+var want[256];
+
+fn setup_want(): i64 {
+    store64(&want +   0 * 8, 0xBEFE01C1);
+    store64(&want +   1 * 8, 0x8E0A8608);
+    store64(&want +   2 * 8, 0x6802000A);
+    store64(&want +   3 * 8, 0x7D980204);
+    store64(&want +   4 * 8, 0xBE94206A);
+    store64(&want +   5 * 8, 0xBF880033);
+    store64(&want +   6 * 8, 0x24280284);
+    store64(&want +   7 * 8, 0x7E040200);
+    store64(&want +   8 * 8, 0x7E060201);
+    store64(&want +   9 * 8, 0x32042902);
+    store64(&want +  10 * 8, 0x38060680);
+    store64(&want +  11 * 8, 0xDC5C8000);
+    store64(&want +  12 * 8, 0x047F0002);
+    store64(&want +  13 * 8, 0xBF8C0F70);
+    store64(&want +  14 * 8, 0x18100F05);
+    store64(&want +  15 * 8, 0x1A120F05);
+    store64(&want +  16 * 8, 0x6A141109);
+    store64(&want +  17 * 8, 0x1E141481);
+    store64(&want +  18 * 8, 0x6A160906);
+    store64(&want +  19 * 8, 0x7E185B0A);
+    store64(&want +  20 * 8, 0x241A150C);
+    store64(&want +  21 * 8, 0x7E1C02FF);
+    store64(&want +  22 * 8, 0x7FFFFFFF);
+    store64(&want +  23 * 8, 0x7E1E0280);
+    store64(&want +  24 * 8, 0xBE9600A0);
+    store64(&want +  25 * 8, 0x20201C9F);
+    store64(&want +  26 * 8, 0x241C1C81);
+    store64(&want +  27 * 8, 0x281C1C81);
+    store64(&want +  28 * 8, 0x7D9C1B0E);
+    store64(&want +  29 * 8, 0xD0CD0018);
+    store64(&want +  30 * 8, 0x00022080);
+    store64(&want +  31 * 8, 0x87EA186A);
+    store64(&want +  32 * 8, 0x6A221B0E);
+    store64(&want +  33 * 8, 0x001C230E);
+    store64(&want +  34 * 8, 0x241E1E81);
+    store64(&want +  35 * 8, 0x381E1E80);
+    store64(&want +  36 * 8, 0x81968116);
+    store64(&want +  37 * 8, 0xBF018016);
+    store64(&want +  38 * 8, 0xBF85FFF2);
+    store64(&want +  39 * 8, 0x242A0285);
+    store64(&want +  40 * 8, 0x7E240202);
+    store64(&want +  41 * 8, 0x7E260203);
+    store64(&want +  42 * 8, 0x32242B12);
+    store64(&want +  43 * 8, 0x38262680);
+    store64(&want +  44 * 8, 0x7E300304);
+    store64(&want +  45 * 8, 0x7E320305);
+    store64(&want +  46 * 8, 0x7E340308);
+    store64(&want +  47 * 8, 0x7E360309);
+    store64(&want +  48 * 8, 0x7E38030B);
+    store64(&want +  49 * 8, 0x7E3A030A);
+    store64(&want +  50 * 8, 0x7E3C030F);
+    store64(&want +  51 * 8, 0x7E3E030C);
+    store64(&want +  52 * 8, 0xDC7D8000);
+    store64(&want +  53 * 8, 0x007F1812);
+    store64(&want +  54 * 8, 0xDC7D8010);
+    store64(&want +  55 * 8, 0x007F1C12);
+    store64(&want +  56 * 8, 0xBF8C0F70);
+    store64(&want +  57 * 8, 0xBF810000);
+    return 58;
+}
+fn setup_emit(): i64 {
+    ea_labels_reset();
+    var p = 0;
+    p = e_sop1(p, 0x01, 126, K(-1));
+    p = e_sop2(p, 0x1C, 10, S(8), K(6));
+    p = e_vop2(p, 0x34, 1, S(10), 0);
+    p = e_vopc(p, 0xCC, S(4), 1);
+    p = e_sop1(p, 0x20, 20, VCC);
+    p = ea_branch(p, 0x08, 0);   # s_cbranch_execz
+    p = e_vop2(p, 0x12, 20, K(4), 1);
+    p = e_vop1(p, 0x01, 2, S(0));
+    p = e_vop1(p, 0x01, 3, S(1));
+    p = e_vop2(p, 0x19, 2, V(2), 20);
+    p = e_vop2(p, 0x1C, 3, K(0), 3);
+    p = e_flat(p, 0x17, 0, 4, 0, 2, 0);
+    p = e_sopp(p, 0x0C, 3952);
+    p = e_vop2(p, 0x0C, 8, V(5), 7);
+    p = e_vop2(p, 0x0D, 9, V(5), 7);
+    p = e_vop2(p, 0x35, 10, V(9), 8);
+    p = e_vop2(p, 0x0F, 10, K(1), 10);
+    p = e_vop2(p, 0x35, 11, V(6), 4);
+    p = e_vop1(p, 0x2D, 12, V(10));
+    p = e_vop2(p, 0x12, 13, V(12), 10);
+    p = e_vop1_lit(p, 0x01, 14, 0x7FFFFFFF);
+    p = e_vop1(p, 0x01, 15, K(0));
+    p = e_sop1(p, 0x00, 22, K(32));
+    p = ea_label(p, 1);
+    p = e_vop2(p, 0x10, 16, K(31), 14);
+    p = e_vop2(p, 0x12, 14, K(1), 14);
+    p = e_vop2(p, 0x14, 14, K(1), 14);
+    p = e_vopc(p, 0xCE, V(14), 13);
+    p = e_vop3(p, 0x0CD, 24, K(0), V(16), S(0));
+    p = e_sop2(p, 0x0F, 106, VCC, S(24));
+    p = e_vop2(p, 0x35, 17, V(14), 13);
+    p = e_vop2(p, 0x00, 14, V(14), 17);
+    p = e_vop2(p, 0x12, 15, K(1), 15);
+    p = e_vop2(p, 0x1C, 15, K(0), 15);
+    p = e_sop2(p, 0x03, 22, S(22), K(1));
+    p = e_sopc(p, 0x01, S(22), K(0));
+    p = ea_branch(p, 0x05, 1);   # s_cbranch_scc1
+    p = e_vop2(p, 0x12, 21, K(5), 1);
+    p = e_vop1(p, 0x01, 18, S(2));
+    p = e_vop1(p, 0x01, 19, S(3));
+    p = e_vop2(p, 0x19, 18, V(18), 21);
+    p = e_vop2(p, 0x1C, 19, K(0), 19);
+    p = e_vop1(p, 0x01, 24, V(4));
+    p = e_vop1(p, 0x01, 25, V(5));
+    p = e_vop1(p, 0x01, 26, V(8));
+    p = e_vop1(p, 0x01, 27, V(9));
+    p = e_vop1(p, 0x01, 28, V(11));
+    p = e_vop1(p, 0x01, 29, V(10));
+    p = e_vop1(p, 0x01, 30, V(15));
+    p = e_vop1(p, 0x01, 31, V(12));
+    p = e_flat(p, 0x1F, 1, 0, 24, 18, 0);
+    p = e_flat(p, 0x1F, 1, 0, 28, 18, 16);
+    p = e_sopp(p, 0x0C, 3952);
+    p = ea_label(p, 0);
+    p = e_sopp(p, 0x01, 0);
+    if (ea_fixup() != 1) { return 0 - 1; }
+    return p;
+}
+fn cov_want(): i64 {
+    store64(&want +   0 * 8, 0xBEFE01C1);
+    store64(&want +   1 * 8, 0x8E0A8608);
+    store64(&want +   2 * 8, 0x6802000A);
+    store64(&want +   3 * 8, 0x7D980206);
+    store64(&want +   4 * 8, 0xBE94206A);
+    store64(&want +   5 * 8, 0xBF88007E);
+    store64(&want +   6 * 8, 0x24040290);
+    store64(&want +   7 * 8, 0x7E0602FF);
+    store64(&want +   8 * 8, 0x00010000);
+    store64(&want +   9 * 8, 0x68060702);
+    store64(&want +  10 * 8, 0x7E080280);
+    store64(&want +  11 * 8, 0x8E0B9009);
+    store64(&want +  12 * 8, 0xBE8C0080);
+    store64(&want +  13 * 8, 0x8E0D8E0C);
+    store64(&want +  14 * 8, 0x800DFF0D);
+    store64(&want +  15 * 8, 0x00002000);
+    store64(&want +  16 * 8, 0x800D0B0D);
+    store64(&want +  17 * 8, 0x7E0A0302);
+    store64(&want +  18 * 8, 0x7E0C0280);
+    store64(&want +  19 * 8, 0x7E0E02FF);
+    store64(&want +  20 * 8, 0x7FFFFFFF);
+    store64(&want +  21 * 8, 0x7E100280);
+    store64(&want +  22 * 8, 0xBE8E0080);
+    store64(&want +  23 * 8, 0x8E0F850E);
+    store64(&want +  24 * 8, 0x7E120200);
+    store64(&want +  25 * 8, 0x7E140201);
+    store64(&want +  26 * 8, 0xD1196A09);
+    store64(&want +  27 * 8, 0x00001F09);
+    store64(&want +  28 * 8, 0x38141480);
+    store64(&want +  29 * 8, 0xDC5C8000);
+    store64(&want +  30 * 8, 0x0C7F0009);
+    store64(&want +  31 * 8, 0xDC5C8010);
+    store64(&want +  32 * 8, 0x107F0009);
+    store64(&want +  33 * 8, 0xBF8C0F70);
+    store64(&want +  34 * 8, 0x7E28020D);
+    store64(&want +  35 * 8, 0x7D86290E);
+    store64(&want +  36 * 8, 0xD1000015);
+    store64(&want +  37 * 8, 0x01A90280);
+    store64(&want +  38 * 8, 0x7D88290F);
+    store64(&want +  39 * 8, 0xD1000016);
+    store64(&want +  40 * 8, 0x01A90280);
+    store64(&want +  41 * 8, 0x262A2D15);
+    store64(&want +  42 * 8, 0x6A2E1B14);
+    store64(&want +  43 * 8, 0x22302E9F);
+    store64(&want +  44 * 8, 0x68323117);
+    store64(&want +  45 * 8, 0x2A323119);
+    store64(&want +  46 * 8, 0x7D9A2A80);
+    store64(&want +  47 * 8, 0x00323280);
+    store64(&want +  48 * 8, 0x2234209F);
+    store64(&want +  49 * 8, 0x68363510);
+    store64(&want +  50 * 8, 0x2A36351B);
+    store64(&want +  51 * 8, 0xD285001C);
+    store64(&want +  52 * 8, 0x0002331B);
+    store64(&want +  53 * 8, 0xD286001D);
+    store64(&want +  54 * 8, 0x0002331B);
+    store64(&want +  55 * 8, 0x6A3C26A0);
+    store64(&want +  56 * 8, 0x243E3913);
+    store64(&want +  57 * 8, 0x24403B13);
+    store64(&want +  58 * 8, 0x2042391E);
+    store64(&want +  59 * 8, 0x28404320);
+    store64(&want +  60 * 8, 0xD2860022);
+    store64(&want +  61 * 8, 0x0002251F);
+    store64(&want +  62 * 8, 0xD2850023);
+    store64(&want +  63 * 8, 0x00022520);
+    store64(&want +  64 * 8, 0xD2860024);
+    store64(&want +  65 * 8, 0x00022520);
+    store64(&want +  66 * 8, 0x324A4722);
+    store64(&want +  67 * 8, 0x384C4880);
+    store64(&want +  68 * 8, 0x244E4C81);
+    store64(&want +  69 * 8, 0x20504A9F);
+    store64(&want +  70 * 8, 0x284E5127);
+    store64(&want +  71 * 8, 0xD2850029);
+    store64(&want +  72 * 8, 0x00022327);
+    store64(&want +  73 * 8, 0x6A54531C);
+    store64(&want +  74 * 8, 0x7D9C232A);
+    store64(&want +  75 * 8, 0x384E4E80);
+    store64(&want +  76 * 8, 0x6A564F0C);
+    store64(&want +  77 * 8, 0x68584F0C);
+    store64(&want +  78 * 8, 0x7D882080);
+    store64(&want +  79 * 8, 0x005A572C);
+    store64(&want +  80 * 8, 0x7D841F0D);
+    store64(&want +  81 * 8, 0xD100002E);
+    store64(&want +  82 * 8, 0x01A98281);
+    store64(&want +  83 * 8, 0x7D860B2D);
+    store64(&want +  84 * 8, 0x005E5C80);
+    store64(&want +  85 * 8, 0x7D9A2A80);
+    store64(&want +  86 * 8, 0x005E5E80);
+    store64(&want +  87 * 8, 0x680C5F06);
+    store64(&want +  88 * 8, 0x7D880B2D);
+    store64(&want +  89 * 8, 0xD1000030);
+    store64(&want +  90 * 8, 0x01A90280);
+    store64(&want +  91 * 8, 0x26602B30);
+    store64(&want +  92 * 8, 0x18625B07);
+    store64(&want +  93 * 8, 0x7D9A6080);
+    store64(&want +  94 * 8, 0x000E6307);
+    store64(&want +  95 * 8, 0x28106108);
+    store64(&want +  96 * 8, 0x800E810E);
+    store64(&want +  97 * 8, 0xBF0A040E);
+    store64(&want +  98 * 8, 0xBF85FFB4);
+    store64(&want +  99 * 8, 0x7D9A1080);
+    store64(&want + 100 * 8, 0x86EA7E6A);
+    store64(&want + 101 * 8, 0xBF86000A);
+    store64(&want + 102 * 8, 0x18640707);
+    store64(&want + 103 * 8, 0x6A660B32);
+    store64(&want + 104 * 8, 0x20666682);
+    store64(&want + 105 * 8, 0x7D9A0C80);
+    store64(&want + 106 * 8, 0x00666680);
+    store64(&want + 107 * 8, 0x68086704);
+    store64(&want + 108 * 8, 0x7E0A0332);
+    store64(&want + 109 * 8, 0x7D820705);
+    store64(&want + 110 * 8, 0x86EA7E6A);
+    store64(&want + 111 * 8, 0xBF87FFA2);
+    store64(&want + 112 * 8, 0x800C810C);
+    store64(&want + 113 * 8, 0xBF0A840C);
+    store64(&want + 114 * 8, 0xBF85FF9A);
+    store64(&want + 115 * 8, 0x7E6802FF);
+    store64(&want + 116 * 8, 0x00010000);
+    store64(&want + 117 * 8, 0x1C086904);
+    store64(&want + 118 * 8, 0x246A0888);
+    store64(&want + 119 * 8, 0x6A6A0935);
+    store64(&want + 120 * 8, 0x206A6A90);
+    store64(&want + 121 * 8, 0x92100609);
+    store64(&want + 122 * 8, 0x7E6C0202);
+    store64(&want + 123 * 8, 0x7E6E0203);
+    store64(&want + 124 * 8, 0xD1196A36);
+    store64(&want + 125 * 8, 0x00002136);
+    store64(&want + 126 * 8, 0x386E6E80);
+    store64(&want + 127 * 8, 0x326C0336);
+    store64(&want + 128 * 8, 0x386E6E80);
+    store64(&want + 129 * 8, 0xDC618000);
+    store64(&want + 130 * 8, 0x007F3536);
+    store64(&want + 131 * 8, 0xBF8C0F70);
+    store64(&want + 132 * 8, 0xBF810000);
+    return 133;
+}
+fn cov_emit(): i64 {
+    ea_labels_reset();
+    var p = 0;
+    p = e_sop1(p, 0x01, 126, K(-1));
+    p = e_sop2(p, 0x1C, 10, S(8), K(6));
+    p = e_vop2(p, 0x34, 1, S(10), 0);
+    p = e_vopc(p, 0xCC, S(6), 1);
+    p = e_sop1(p, 0x20, 20, VCC);
+    p = ea_branch(p, 0x08, 0);   # s_cbranch_execz
+    p = e_vop2(p, 0x12, 2, K(16), 1);
+    p = e_vop1_lit(p, 0x01, 3, 0x00010000);
+    p = e_vop2(p, 0x34, 3, V(2), 3);
+    p = e_vop1(p, 0x01, 4, K(0));
+    p = e_sop2(p, 0x1C, 11, S(9), K(16));
+    p = e_sop1(p, 0x00, 12, K(0));
+    p = ea_label(p, 4);
+    p = e_sop2(p, 0x1C, 13, S(12), K(14));
+    p = e_sop2(p, 0x00, 13, S(13), LIT);
+    p = e_vop2(p, 0x00, 0, S(0), 16);
+    p = e_sop2(p, 0x00, 13, S(13), S(11));
+    p = e_vop1(p, 0x01, 5, V(2));
+    p = ea_label(p, 3);
+    p = e_vop1(p, 0x01, 6, K(0));
+    p = e_vop1_lit(p, 0x01, 7, 0x7FFFFFFF);
+    p = e_vop1(p, 0x01, 8, K(0));
+    p = e_sop1(p, 0x00, 14, K(0));
+    p = ea_label(p, 1);
+    p = e_sop2(p, 0x1C, 15, S(14), K(5));
+    p = e_vop1(p, 0x01, 9, S(0));
+    p = e_vop1(p, 0x01, 10, S(1));
+    p = e_vop3b(p, 0x119, 106, 9, V(9), S(15), S(0));
+    p = e_vop2(p, 0x1C, 10, K(0), 10);
+    p = e_flat(p, 0x17, 0, 12, 0, 9, 0);
+    p = e_flat(p, 0x17, 0, 16, 0, 9, 16);
+    p = e_sopp(p, 0x0C, 3952);
+    p = e_vop1(p, 0x01, 20, S(13));
+    p = e_vopc(p, 0xC3, V(14), 20);
+    p = e_vop3(p, 0x100, 21, K(0), K(1), VCC);
+    p = e_vopc(p, 0xC4, V(15), 20);
+    p = e_vop3(p, 0x100, 22, K(0), K(1), VCC);
+    p = e_vop2(p, 0x13, 21, V(21), 22);
+    p = e_vop2(p, 0x35, 23, V(20), 13);
+    p = e_vop2(p, 0x11, 24, K(31), 23);
+    p = e_vop2(p, 0x34, 25, V(23), 24);
+    p = e_vop2(p, 0x15, 25, V(25), 24);
+    p = e_vopc(p, 0xCD, K(0), 21);
+    p = e_vop2(p, 0x00, 25, K(0), 25);
+    p = e_vop2(p, 0x11, 26, K(31), 16);
+    p = e_vop2(p, 0x34, 27, V(16), 26);
+    p = e_vop2(p, 0x15, 27, V(27), 26);
+    p = e_vop3(p, 0x285, 28, V(27), V(25), S(0));
+    p = e_vop3(p, 0x286, 29, V(27), V(25), S(0));
+    p = e_vop2(p, 0x35, 30, K(32), 19);
+    p = e_vop2(p, 0x12, 31, V(19), 28);
+    p = e_vop2(p, 0x12, 32, V(19), 29);
+    p = e_vop2(p, 0x10, 33, V(30), 28);
+    p = e_vop2(p, 0x14, 32, V(32), 33);
+    p = e_vop3(p, 0x286, 34, V(31), V(18), S(0));
+    p = e_vop3(p, 0x285, 35, V(32), V(18), S(0));
+    p = e_vop3(p, 0x286, 36, V(32), V(18), S(0));
+    p = e_vop2(p, 0x19, 37, V(34), 35);
+    p = e_vop2(p, 0x1C, 38, K(0), 36);
+    p = e_vop2(p, 0x12, 39, K(1), 38);
+    p = e_vop2(p, 0x10, 40, K(31), 37);
+    p = e_vop2(p, 0x14, 39, V(39), 40);
+    p = e_vop3(p, 0x285, 41, V(39), V(17), S(0));
+    p = e_vop2(p, 0x35, 42, V(28), 41);
+    p = e_vopc(p, 0xCE, V(42), 17);
+    p = e_vop2(p, 0x1C, 39, K(0), 39);
+    p = e_vop2(p, 0x35, 43, V(12), 39);
+    p = e_vop2(p, 0x34, 44, V(12), 39);
+    p = e_vopc(p, 0xC4, K(0), 16);
+    p = e_vop2(p, 0x00, 45, V(44), 43);
+    p = e_vopc(p, 0xC2, V(13), 15);
+    p = e_vop3(p, 0x100, 46, K(1), K(-1), VCC);
+    p = e_vopc(p, 0xC3, V(45), 5);
+    p = e_vop2(p, 0x00, 47, K(0), 46);
+    p = e_vopc(p, 0xCD, K(0), 21);
+    p = e_vop2(p, 0x00, 47, K(0), 47);
+    p = e_vop2(p, 0x34, 6, V(6), 47);
+    p = e_vopc(p, 0xC4, V(45), 5);
+    p = e_vop3(p, 0x100, 48, K(0), K(1), VCC);
+    p = e_vop2(p, 0x13, 48, V(48), 21);
+    p = e_vop2(p, 0x0C, 49, V(7), 45);
+    p = e_vopc(p, 0xCD, K(0), 48);
+    p = e_vop2(p, 0x00, 7, V(7), 49);
+    p = e_vop2(p, 0x14, 8, V(8), 48);
+    p = e_sop2(p, 0x00, 14, S(14), K(1));
+    p = e_sopc(p, 0x0A, S(14), S(4));
+    p = ea_branch(p, 0x05, 1);   # s_cbranch_scc1
+    p = e_vopc(p, 0xCD, K(0), 8);
+    p = e_sop2(p, 0x0D, 106, VCC, EXEC_LO);
+    p = ea_branch(p, 0x06, 2);   # s_cbranch_vccz
+    p = e_vop2(p, 0x0C, 50, V(7), 3);
+    p = e_vop2(p, 0x35, 51, V(50), 5);
+    p = e_vop2(p, 0x10, 51, K(2), 51);
+    p = e_vopc(p, 0xCD, K(0), 6);
+    p = e_vop2(p, 0x00, 51, K(0), 51);
+    p = e_vop2(p, 0x34, 4, V(4), 51);
+    p = e_vop1(p, 0x01, 5, V(50));
+    p = e_vopc(p, 0xC1, V(5), 3);
+    p = e_sop2(p, 0x0D, 106, VCC, EXEC_LO);
+    p = ea_branch(p, 0x07, 3);   # s_cbranch_vccnz
+    p = ea_label(p, 2);
+    p = e_sop2(p, 0x00, 12, S(12), K(1));
+    p = e_sopc(p, 0x0A, S(12), K(4));
+    p = ea_branch(p, 0x05, 4);   # s_cbranch_scc1
+    p = e_vop1_lit(p, 0x01, 52, 0x00010000);
+    p = e_vop2(p, 0x0E, 4, V(4), 52);
+    p = e_vop2(p, 0x12, 53, K(8), 4);
+    p = e_vop2(p, 0x35, 53, V(53), 4);
+    p = e_vop2(p, 0x10, 53, K(16), 53);
+    p = e_sop2(p, 0x24, 16, S(9), S(6));
+    p = e_vop1(p, 0x01, 54, S(2));
+    p = e_vop1(p, 0x01, 55, S(3));
+    p = e_vop3b(p, 0x119, 106, 54, V(54), S(16), S(0));
+    p = e_vop2(p, 0x1C, 55, K(0), 55);
+    p = e_vop2(p, 0x19, 54, V(54), 1);
+    p = e_vop2(p, 0x1C, 55, K(0), 55);
+    p = e_flat(p, 0x18, 1, 0, 53, 54, 0);
+    p = e_sopp(p, 0x0C, 3952);
+    p = ea_label(p, 0);
+    p = e_sopp(p, 0x01, 0);
+    if (ea_fixup() != 1) { return 0 - 1; }
+    return p;
+}
+
+fn blob_check(name, nlen, n, emitted): i64 {
+    if (emitted < 0) { ps("  ** "); print(name, nlen); puts("  FIXUP FAILED"); return 0; }
+    if (emitted / 4 != n) {
+        ps("  ** "); print(name, nlen); ps("  emitted "); pnum(emitted / 4);
+        ps(" dwords, llvm-mc says "); pnum(n); nl();
+        return 0;
+    }
+    var bad = 0;
+    var i = 0;
+    while (i < n) {
+        var got = load32(&isa + i * 4) & 0xFFFFFFFF;
+        var wnt = load64(&want + i * 8);
+        if (got != wnt) {
+            bad = bad + 1;
+            if (bad < 6) {
+                ps("  ** "); print(name, nlen); ps(" dword "); pnum(i);
+                ps("  llvm-mc "); phex(wnt); ps("  edgeasm "); phex(got); nl();
+            }
+        }
+        i = i + 1;
+    }
+    ps("  "); print(name, nlen); ps("  "); pnum(n - bad); ps(" of "); pnum(n);
+    if (bad == 0) { puts(" byte-identical"); return 1; }
+    puts(" MATCH -- DISAGREEMENT"); return 0;
+}
+
 fn main(): i64 {
     puts("edgeasm -- RUNG 9b BITE B4: the authoring tool, calibrated on a shipped shader");
     puts("=============================================================================");
@@ -459,6 +903,15 @@ fn main(): i64 {
         puts("  ** a wrapper that does not refuse is decoration -- mabda's packer ships instead.");
         ok = 0;
     }
+
+    # ---- GATE 4 (B6): the two rung-9b blobs vs llvm-mc ------------------------------------
+    puts("[gate 4] the two 9b blobs, edgeasm vs llvm-mc on the SAME source");
+    ea_fault = 0;
+    setup_want();
+    if (blob_check("edge_setup", 10, 58, setup_emit()) == 0) { ok = 0; }
+    cov_want();
+    if (blob_check("edge_cov  ", 10, 133, cov_emit()) == 0) { ok = 0; }
+    if (ea_fault != 0) { puts("  ** an asserting wrapper REFUSED while emitting a 9b blob"); ok = 0; }
 
     puts("");
     if (ok == 0) { puts("** B4 FAILED. The tool is not trustworthy; do not author with it."); return 90; }

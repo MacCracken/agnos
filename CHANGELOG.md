@@ -44,6 +44,69 @@ byte-identically** — 50/50 cases (8 corpus + 2 shared-edge quads + 40 random m
 accumulation is associative, so summation order genuinely does not matter. This is the structural
 premise the whole one-lane-per-pixel design rests on, and it is now measured rather than assumed.
 
+### Added — bite **B6**: both rung-9b shaders, byte-verified against an independent assembler
+
+`kernel/shaders/edge_setup.s` (53 instructions) and `kernel/shaders/edge_cov.s` (114) — **167
+instructions across two blobs, both assembling clean on the first try.** For scale, the largest
+blob agnos has ever shipped is `grad_linear` at 70 dwords.
+
+⭐ **The oracle is two independent assemblers on the same source.** `llvm-mc -mcpu=gfx90c`
+assembles the `.s`; the identical instruction stream is emitted through mabda's encoder and B4's
+label pass; the two are byte-diffed. **Result: `edge_setup` 58/58 and `edge_cov` 133/133
+byte-identical.** Neither side can be wrong alone without the diff saying so.
+
+⛔ **The branches are the point.** llvm-mc resolves the labels; edgeasm resolves them through
+`ea_label`/`ea_branch`/`ea_fixup`. So this verifies the fixup arithmetic against an independent
+implementation on **seven real branches** — two in `edge_setup`, five in `edge_cov` — not on the
+synthetic pair B4's own gate uses. Three backward branches with hand-counted offsets in a
+140-dword blob is exactly the silent-corruption case the tool exists to eliminate, and this is
+where that claim is actually tested.
+
+**The shaders themselves:**
+
+- `edge_setup` hoists the reciprocal **per edge**, because the divisor `by−ay` is constant per
+  edge while `sy` varies per sub-scanline and the crossing is evaluated by every lane of every
+  workgroup. The rasteriser then gets its quotient from 25 branch-free ops with **no division
+  anywhere**.
+- ⛔ **No `v_rcp_f32`.** The 32-iteration integer restoring loop is exact *by construction*; the
+  f32-reciprocal macro is exact only empirically. [[feedback_sovereignty_over_slip_at_base]]
+- `edge_cov` is **64×1, one lane per pixel, no sort, no LDS, no cross-lane op** — gfx9 has no
+  per-lane runtime-indexed VGPR access, so a resident crossing list would require LDS, whose
+  allocation has **no readable oracle** (the SH registers are not readable).
+- ⚠ Horizontal edges reach the shader — `#92`'s `ne ≥ 3` counts *submitted* edges and the
+  reference filters `y0 == y1` internally, so the half-open guard must reject them here too.
+  Five of the twenty corpus cases contain one.
+
+### Fixed — three defects in the emit path, each found by the byte-diff
+
+1. **VOP1/VOP2 with a literal operand are TWO dwords.** `v_mov_b32 v14, 0x7FFFFFFF` has
+   `src0 == 255`, so a literal dword follows. Counting it as one shifted every position after it
+   — and the fixup pass correctly reported *"branch to an UNDEFINED label"* rather than silently
+   patching the wrong site.
+2. ⭐ **`llvm-mc -show-encoding` does NOT resolve label references.** Every branch printed
+   `simm16 = 0x0A0A`, a placeholder. Had that gone unnoticed the diff would have "passed" against
+   seven identical placeholders and proved nothing about the fixup pass at all. The dwords now
+   come from `-filetype=obj` + `llvm-objcopy -O binary --only-section=.text`, where same-section
+   labels are resolved.
+3. **VOP3b vs VOP3a.** llvm-mc promotes `v_add_co_u32 v9, vcc, v9, s15` to **VOP3b** because
+   VOP2's `vsrc1` cannot take an SGPR, and the promoted form carries a scalar carry-out in bits
+   14:8. Decoding it as VOP3a dropped that field on two instructions.
+
+### Fixed — a hand-derived RSRC1 was wrong, exactly as the plan warned
+
+**RSRC1/RSRC2 are now extracted mechanically** from the kernel descriptor
+(`llvm-objcopy --only-section=.rodata`, byte 48), never counted:
+`edge_setup` **0x002C00C7**, `edge_cov` **0x002C00CD**.
+
+⛔ A hand-derivation of `edge_cov`'s value gave **0x002C008D** — an SGPR field of 2 (24 granted)
+where the assembler grants 3 (32). `gpu_regs.cyr:1151-1157` spells out the consequence:
+under-allocating the SGPR file corrupts the **vcc carry chain in the address arithmetic**, and the
+first casualty is lanes writing the **wrong pixels**. Recorded in both `.s` headers.
+
+⭐ **Both kernels' RSRC2 is `0x00000190` — identical to the shipped `GPU_COMPUTE_RSRC2_COV`.** That
+is what lets `gpu_blend_cov_run` dispatch both **unmodified**: no dispatcher change, no new PM4,
+no RSRC2 edit, exactly as the plan predicted.
+
 ### Added — bite **B5**: `asmagree.cyr` extended to the classes rung 9b introduces
 
 Rung 7 proved VOP1 ×2, VOP2 ×3, SOP1+literal, SOPP, and one VOP3a *lo* dword — **9 classes**, and
