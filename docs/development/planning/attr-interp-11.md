@@ -186,6 +186,18 @@ TOTAL ~ 540 VALU/px.  The four exact quotients + their accumulate = ~408 of that
 
 ### 1.8 Registers and RSRC
 
+> ⭐ **MEASURED 2026-07-26 from the assembled object, not estimated.** The prologue assembles and
+> its descriptor harvests to **`RSRC1 = 0x002C018F`** (64 VGPRs, 56 SGPRs) and
+> **`RSRC2 = 0x00000190`** — which is **byte-identical to the shipped `GPU_COMPUTE_RSRC2_COV`**.
+> That is the property the dispatch claim rests on: the existing `gpu_blend_cov_run` can issue this
+> blob with no PM4 change, no RSRC2 edit and no dispatcher change. It is now harvested rather than
+> assumed.
+> ⚠ The `next_free_vgpr 64` in the source is a CEILING, not a measurement — the prologue alone uses
+> only up to v6. It must be re-derived from the finished emit list via the high-water gate before
+> the blob ships, or it over-declares and silently costs occupancy (the one direction that gate
+> cannot see).
+
+
 Estimated **~56 VGPRs** with the channel loop rolled and colour bytes re-extracted per iteration rather than held live. gfx9 grants in blocks of 4; 56 and 64 both give `floor(256/n) = 4` waves/SIMD, so there is real slack, but **64 is the hard ceiling** — 65 drops occupancy to 3.
 
 ⛔ **`RSRC1` IS HARVESTED MECHANICALLY** — `llvm-objcopy -O binary --only-section=.rodata`, byte 48 — **never counted**. A hand-derivation of `edge_cov`'s value gave `0x002C008D` against the real `0x002C00CD`: an SGPR field of 2 (24 granted) where the assembler grants 3 (32). Under-allocating the SGPR file corrupts the vcc carry chain in the address arithmetic and lanes write the **WRONG PIXELS** — a plausible wrong picture, not a fault. Warned in three places in the tree, one from a demonstrated defect. ⚠ Per `gpu.md:1017` there is no oracle for **over**-declaration either. Bite 6 lands the high-water gate, which catches under-declaration only.
