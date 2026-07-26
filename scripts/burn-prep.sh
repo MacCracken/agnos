@@ -242,6 +242,34 @@ elif [ -n "${BURN_EDGE_COV:-}" ]; then
     # ⚠ NOT MEASURED: n_edges above the shipped EDGE_CAP of 64, and masks above 256x256. Raising
     # the cap needs those points and is its own bite — the cap moves on MEASUREMENT, never on the
     # arithmetic model that set it.
+    #
+    # ============================================================================================
+    # BURN 4 (1.56.18) — RUNG 10 RETRY. The kill gate still has NO NUMBER.
+    # ============================================================================================
+    # Burn 3 froze at the FIRST bench point. Two separate faults, both now fixed:
+    #
+    #   1. ⭐⭐ THE KERNEL ONE, and it is not about the GPU at all. Vector 0 (#DE) was in idt.cyr's
+    #      "deliberately NOT installed" list, so a ring-3 divide by zero returned to the faulting
+    #      idiv forever — ANY userland program that divided by zero froze agnos. Vector 0 now
+    #      joins the curated set AND the {6,13,14} ring-3 kill set. Proven in QEMU by
+    #      scripts/de-smoke.sh (3/3) and mutation-calibrated: reverting it reproduces the freeze
+    #      exactly. ⇒ Even an unguarded division in ANY tool can no longer take the box down.
+    #
+    #   2. `gputri --bench` FABRICATED a timing instead of refusing: it assigned el = TARGET and
+    #      divided by an already-quadrupled reps, yielding 0 us, and the next line divided by it.
+    #      It now returns a negative sentinel on refusal, prints raw ms/reps evidence beside every
+    #      derived figure, guards all four divisions with named NO VERDICT paths, sanity-checks
+    #      the clock first, and runs its CPU half with no GPU so the harness is QEMU-testable.
+    #
+    # RUN ORDER IS UNCHANGED and still matters:
+    #   1. run /bin/gputri --cov     must still be 20/20. Timing a wrong rasteriser means nothing.
+    #   2. run /bin/gputri --bench   the kill gate. Expect a [cpu-only] block FIRST -- that is the
+    #      harness validating itself before any GPU number is printed.
+    #   3. run /bin/klug > /bench.txt
+    #
+    # ⚠ A "NO VERDICT" line is a legitimate, honest outcome for a point that could not be timed.
+    # It is NOT a failure of the burn. A crossover derived from a partial sweep is simply not the
+    # pre-registered number, and the tool says so rather than quietly averaging over the gap.
     echo "[2/2] Building the 3D-arc RUNG 9b kernel (edge rasteriser; no compile flag needed)."
     echo "      Run: gputri --cov (must be 20/20) THEN gputri --bench (RUNG 10 KILL GATE) THEN klug > /bench.txt"
     BUILD_ENV=""
