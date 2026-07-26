@@ -270,6 +270,34 @@ elif [ -n "${BURN_EDGE_COV:-}" ]; then
     # ⚠ A "NO VERDICT" line is a legitimate, honest outcome for a point that could not be timed.
     # It is NOT a failure of the burn. A crossover derived from a partial sweep is simply not the
     # pre-registered number, and the tool says so rather than quietly averaging over the gap.
+    #
+    # ============================================================================================
+    # BURN 5 (1.56.18) — RUNG 10, THIRD ATTEMPT. THE INSTRUMENT IS NOW PROVEN.
+    # ============================================================================================
+    # ⛔ ROOT CAUSE OF BOTH PREVIOUS FAILURES, and it was ONE thing: `uptime_ms`#40 reads
+    # timer_ticks, and a FOREGROUND `run` program starts with IF CLEARED (ring3.cyr: "a
+    # foreground program is not meant to be preempted" — only /bin/agnsh gets IF=1). The timer
+    # ISR never fires, so #40 is FROZEN for the program's whole duration and anything timing
+    # itself with it measures zero.
+    #   burn 3: el always 0 -> reps exploded -> the bench FABRICATED a timing -> divide by zero.
+    #   burn 4: bench_clock_ok spun waiting for a clock that could not advance.
+    # Both read as bench bugs. The bench had bugs, but the INSTRUMENT was wrong.
+    #
+    # ⭐ FIXED AND PROVEN AT ZERO BURNS: `uptime_us`#95 — rdtsc-backed (needs no interrupts),
+    # calibrated at boot against 50 ms of live ticks, returns -1 rather than a plausible 0 when
+    # calibration is refused. scripts/tsc-smoke.sh is a DIFFERENTIAL proof: a ring-3 probe samples
+    # #95 around a busy loop with interrupts off and it ADVANCES (3/3, `run: exit 1`) — exactly
+    # where #40 cannot. Calibration on archaemenid measured 3194 cycles/us, so the long-assumed
+    # GPU_TSC_PER_US = 3000 is 6.5% low (not retuned here — that is its own bite).
+    #
+    # Also live since burn 3: a ring-3 divide by zero now KILLS THE PROC instead of freezing the
+    # machine (vector 0 installed + routed to the ring3-kill path; de-smoke 3/3).
+    #
+    # ⇒ THE BAR FOR THIS BURN IS A NUMBER. `--bench` must print a measured crossover, or an
+    # explicit NO VERDICT naming which points could not be timed. Both are readable results.
+    # A hang is not, and is the one outcome the last two burns produced.
+    #
+    # RUN ORDER: gputri --cov (must be 20/20) THEN gputri --bench THEN klug > /bench.txt
     echo "[2/2] Building the 3D-arc RUNG 9b kernel (edge rasteriser; no compile flag needed)."
     echo "      Run: gputri --cov (must be 20/20) THEN gputri --bench (RUNG 10 KILL GATE) THEN klug > /bench.txt"
     BUILD_ENV=""
