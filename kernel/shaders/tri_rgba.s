@@ -20,11 +20,10 @@
 // cross products are evaluated per pixel. This also removes "do the three sum to 2A at 64 bits?"
 // as a question the shader could get wrong.
 //
-// ⚠ REGISTER BUDGET IS MEASURED, NOT ESTIMATED. This kernel's highest register is v55, so it
-// declares 56 — the same budget the shipped edge_cov uses. 64 is the hard occupancy cliff (65
-// drops from 4 waves per SIMD to 3), so there are 8 registers of real headroom. The declaration is
-// checked mechanically against the emit list because RSRC1 is NOT GRBM-readable and nothing on the
-// machine can contradict a wrong one.
+// ⚠ REGISTER BUDGET IS MEASURED BY THE ASSEMBLER, NOT BY EYE. This kernel's highest register is
+// v31, so it declares 32 — 8 waves per SIMD. The declaration is checked mechanically against the
+// emit list because RSRC1 is NOT GRBM-readable and nothing on the machine can contradict a wrong
+// one. Two earlier numbers (64, then 56) were a reserved ceiling and a mis-measurement.
 //
 // ⛔ RSRC1/RSRC2 ARE HARVESTED FROM THE ASSEMBLED OBJECT, NEVER HAND-COUNTED. A hand-derivation of
 // edge_cov's value gave 0x002C008D against the real 0x002C00CD — an SGPR field of 2 where the
@@ -384,12 +383,15 @@ L_END:
     .amdhsa_system_sgpr_workgroup_id_x 1
     .amdhsa_system_sgpr_workgroup_id_y 1
     .amdhsa_system_vgpr_workitem_id 0
-    // ⭐ 56, NOT 64, AND IT IS MEASURED. The emit list's highest register is v55, so 56 is the
-    // exact requirement — the same budget the shipped coverage kernel uses. 64 was the ceiling
-    // reserved while the body was being written; leaving it there would have over-declared by 8
-    // registers, which the high-water gate CANNOT see (it catches under-declaration only) and
-    // which costs occupancy for nothing.
-    .amdhsa_next_free_vgpr 56
+    // ⭐ 32, AND THE ROUTE TO THAT NUMBER IS THE POINT. The emit list's highest register is v31.
+    // It was declared 64 (a working ceiling) and then 56 (from a WRONG measurement — a grep over
+    // the .s that included COMMENT text, and the comment above happens to mention edge_cov's v55).
+    // The sovereign assembler's high-water gate, which counts operands it actually encoded and
+    // cannot read a comment, reported v31 and settled it.
+    // ⚠ THIS IS AN OCCUPANCY WIN, NOT A TIDY-UP: 256/32 = 8 waves per SIMD against 256/56 = 4.
+    // Over-declaration is the one direction the gate cannot catch, so it is worth measuring rather
+    // than rounding up "to be safe" — being safe here halves the machine.
+    .amdhsa_next_free_vgpr 32
     .amdhsa_next_free_sgpr 48
     .amdhsa_reserve_vcc 1
     .amdhsa_float_round_mode_32 0

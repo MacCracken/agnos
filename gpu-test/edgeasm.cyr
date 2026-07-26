@@ -187,6 +187,18 @@ fn e_vop3b(p, op, sdst, vdst, s0, s1, s2): i64 {
     return gfx9_emit32(&isa, q, gfx9_enc_vop3a_hi(s0, s1, s2));
 }
 # FLAT is likewise two dwords and likewise silent if half-emitted.
+# SMEM — scalar memory load, two dwords. ⚠ THE SBASE FIELD IS THE SGPR PAIR INDEX SHIFTED RIGHT BY
+# ONE, not the SGPR number. Passing s[0:1] as 0 works by accident; passing s[4:5] as 4 instead of 2
+# silently loads from the wrong base, which is a plausible wrong picture rather than a fault. This
+# wrapper takes the SGPR NUMBER and does the shift itself, and refuses an odd one.
+fn e_smem(p, op, sdata, sbase_sgpr, off): i64 {
+    if ((sbase_sgpr & 1) != 0) { ea_fail("SMEM base SGPR is odd -- SMEM bases are aligned PAIRS"); }
+    if (sdata < 0)   { ea_fail("SMEM sdata negative"); }
+    if (sdata > 101) { ea_fail("SMEM sdata is not an SGPR"); }
+    var q = gfx9_emit32(&isa, p, gfx9_enc_smem_lo(op, sdata, sbase_sgpr >> 1, 0));
+    return gfx9_emit32(&isa, q, off);
+}
+
 fn e_flat(p, op, glc, vdst, data, vaddr, off): i64 {
     # ⚠ ALL THREE of vdst/data/vaddr are raw VGPR indices here, and vaddr is a 64-bit address so it
     # occupies vaddr AND vaddr+1. Tracking only vaddr would under-count by one on the very
@@ -1124,12 +1136,221 @@ fn tri_emit(): i64 {
     var p = 0;
 
     # ---- prologue: bounds guard, coverage fetch, per-lane zero-coverage exit ---------------
-    p = e_sop1(p, 0x01, 126, K(0 - 1));          # s_mov_b64 exec, -1
-    p = e_sop2(p, 0x1C, 10, S(8), K(6));         # s_lshl_b32 s10, s8, 6
-    p = e_vop2(p, 0x34, 1, S(10), 0);            # v_add_u32 v1, s10, v0
-    p = e_vopc(p, 0xCC, S(6), 1);                # v_cmp_gt_u32 vcc, s6, v1
-    p = e_sop1(p, 0x20, 20, VCC);                # s_and_saveexec_b64 s[20:21], vcc
-    p = ea_branch(p, 0x08, 0);                   # s_cbranch_execz L_END
+    p = e_sop1(p, 0x01, 126, K(0 - 1));          # [  0] s_mov_b64 exec, -1
+    p = e_sop2(p, 0x1C, 10, S(8), K(6));         # [  1] s_lshl_b32 s10, s8, 6
+    p = e_vop2(p, 0x34, 1, S(10), 0);            # [  2] v_add_u32 v1, s10, v0
+    p = e_vopc(p, 0xCC, S(6), 1);                # [  3] v_cmp_gt_u32 vcc, s6, v1
+    p = e_sop1(p, 0x20, 20, VCC);                # [  4] s_and_saveexec_b64 s[20:21], vcc
+    p = ea_branch(p, 0x08, 0);                   # [  5] s_cbranch_execz L_END
+    p = e_smem(p, 0x02, 12, 0, 0x0);             # [  6] s_load_dwordx4 s[12:15], s[0:1], 0x0
+    p = e_sopp(p, 0x0C, 0xC07F);                 # [  8] s_waitcnt lgkmcnt(0)
+    p = e_sop2(p, 0x24, 11, S(9), S(6));         # [  9] s_mul_i32 s11, s9, s6
+    p = e_vop2(p, 0x34, 2, S(11), 1);            # [ 10] v_add_u32_e32 v2, s11, v1
+    p = e_vop2(p, 0x19, 2, S(12), 2);            # [ 11] v_add_co_u32_e32 v2, vcc, s12, v2
+    p = e_vop1(p, 0x01, 3, S(13));               # [ 12] v_mov_b32_e32 v3, s13
+    p = e_vop2(p, 0x1C, 3, K(0), 3);             # [ 13] v_addc_co_u32_e32 v3, vcc, 0, v3, vcc
+    p = e_flat(p, 0x10, 0, 4, 0, 2, 0);          # [ 14] global_load_ubyte v4, v[2:3], off
+    p = e_sopp(p, 0x0C, 0x0F70);                 # [ 16] s_waitcnt vmcnt(0)
+    p = e_vopc(p, 0xCD, K(0), 4);                # [ 17] v_cmp_ne_u32_e32 vcc, 0, v4
+    p = e_sop1(p, 0x20, 22, VCC);                # [ 18] s_and_saveexec_b64 s[22:23], vcc
+    p = ea_branch(p, 0x08, 0);                   # [ 19] s_cbranch_execz L_END
+    p = e_smem(p, 0x02, 24, 0, 0x10);            # [ 20] s_load_dwordx4 s[24:27], s[0:1], 0x10
+    p = e_smem(p, 0x02, 28, 0, 0x20);            # [ 22] s_load_dwordx4 s[28:31], s[0:1], 0x20
+    p = e_smem(p, 0x02, 32, 0, 0x30);            # [ 24] s_load_dwordx4 s[32:35], s[0:1], 0x30
+    p = e_smem(p, 0x02, 36, 0, 0x40);            # [ 26] s_load_dwordx4 s[36:39], s[0:1], 0x40
+    p = e_smem(p, 0x02, 40, 0, 0x50);            # [ 28] s_load_dwordx4 s[40:43], s[0:1], 0x50
+    p = e_sopp(p, 0x0C, 0xC07F);                 # [ 30] s_waitcnt lgkmcnt(0)
+    p = e_vop2(p, 0x12, 5, K(16), 1);            # [ 31] v_lshlrev_b32_e32 v5, 16, v1
+    p = e_vop2_lit(p, 0x34, 5, 0x8000, 5);       # [ 32] v_add_u32_e32 v5, 0x8000, v5
+    p = e_vop1(p, 0x01, 6, S(9));                # [ 34] v_mov_b32_e32 v6, s9
+    p = e_vop2(p, 0x12, 6, K(16), 6);            # [ 35] v_lshlrev_b32_e32 v6, 16, v6
+    p = e_vop2_lit(p, 0x34, 6, 0x8000, 6);       # [ 36] v_add_u32_e32 v6, 0x8000, v6
+    p = e_vop3(p, 0x285, 8, S(32), V(5), 0);     # [ 38] v_mul_lo_u32 v8, s32, v5
+    p = e_vop3(p, 0x286, 9, S(32), V(5), 0);     # [ 40] v_mul_hi_u32 v9, s32, v5
+    p = e_sop2(p, 0x20, 44, S(32), K(31));       # [ 42] s_ashr_i32 s44, s32, 31
+    p = e_vop2(p, 0x13, 14, S(44), 5);           # [ 43] v_and_b32_e32 v14, s44, v5
+    p = e_vop2(p, 0x35, 9, V(9), 14);            # [ 44] v_sub_u32_e32 v9, v9, v14
+    p = e_vop2(p, 0x11, 14, K(31), 5);           # [ 45] v_ashrrev_i32_e32 v14, 31, v5
+    p = e_vop2(p, 0x13, 14, S(32), 14);          # [ 46] v_and_b32_e32 v14, s32, v14
+    p = e_vop2(p, 0x35, 9, V(9), 14);            # [ 47] v_sub_u32_e32 v9, v9, v14
+    p = e_vop3(p, 0x285, 10, S(33), V(6), S(0)); # [ 48] v_mul_lo_u32 v10, s33, v6
+    p = e_vop3(p, 0x286, 11, S(33), V(6), S(0)); # [ 50] v_mul_hi_u32 v11, s33, v6
+    p = e_sop2(p, 0x20, 44, S(33), K(31));       # [ 52] s_ashr_i32 s44, s33, 31
+    p = e_vop2(p, 0x13, 14, S(44), 6);           # [ 53] v_and_b32_e32 v14, s44, v6
+    p = e_vop2(p, 0x35, 11, V(11), 14);          # [ 54] v_sub_u32_e32 v11, v11, v14
+    p = e_vop2(p, 0x11, 14, K(31), 6);           # [ 55] v_ashrrev_i32_e32 v14, 31, v6
+    p = e_vop2(p, 0x13, 14, S(33), 14);          # [ 56] v_and_b32_e32 v14, s33, v14
+    p = e_vop2(p, 0x35, 11, V(11), 14);          # [ 57] v_sub_u32_e32 v11, v11, v14
+    p = e_vop2(p, 0x19, 8, V(8), 10);            # [ 58] v_add_co_u32_e32 v8, vcc, v8, v10
+    p = e_vop2(p, 0x1C, 9, V(9), 11);            # [ 59] v_addc_co_u32_e32 v9, vcc, v9, v11, vcc
+    p = e_vop1(p, 0x01, 14, S(34));              # [ 60] v_mov_b32_e32 v14, s34
+    p = e_vop1(p, 0x01, 15, S(35));              # [ 61] v_mov_b32_e32 v15, s35
+    p = e_vop2(p, 0x19, 8, V(8), 14);            # [ 62] v_add_co_u32_e32 v8, vcc, v8, v14
+    p = e_vop2(p, 0x1C, 9, V(9), 15);            # [ 63] v_addc_co_u32_e32 v9, vcc, v9, v15, vcc
+    p = e_vop3(p, 0x285, 10, S(36), V(5), S(0)); # [ 64] v_mul_lo_u32 v10, s36, v5
+    p = e_vop3(p, 0x286, 11, S(36), V(5), S(0)); # [ 66] v_mul_hi_u32 v11, s36, v5
+    p = e_sop2(p, 0x20, 44, S(36), K(31));       # [ 68] s_ashr_i32 s44, s36, 31
+    p = e_vop2(p, 0x13, 14, S(44), 5);           # [ 69] v_and_b32_e32 v14, s44, v5
+    p = e_vop2(p, 0x35, 11, V(11), 14);          # [ 70] v_sub_u32_e32 v11, v11, v14
+    p = e_vop2(p, 0x11, 14, K(31), 5);           # [ 71] v_ashrrev_i32_e32 v14, 31, v5
+    p = e_vop2(p, 0x13, 14, S(36), 14);          # [ 72] v_and_b32_e32 v14, s36, v14
+    p = e_vop2(p, 0x35, 11, V(11), 14);          # [ 73] v_sub_u32_e32 v11, v11, v14
+    p = e_vop3(p, 0x285, 12, S(37), V(6), S(0)); # [ 74] v_mul_lo_u32 v12, s37, v6
+    p = e_vop3(p, 0x286, 13, S(37), V(6), S(0)); # [ 76] v_mul_hi_u32 v13, s37, v6
+    p = e_sop2(p, 0x20, 44, S(37), K(31));       # [ 78] s_ashr_i32 s44, s37, 31
+    p = e_vop2(p, 0x13, 14, S(44), 6);           # [ 79] v_and_b32_e32 v14, s44, v6
+    p = e_vop2(p, 0x35, 13, V(13), 14);          # [ 80] v_sub_u32_e32 v13, v13, v14
+    p = e_vop2(p, 0x11, 14, K(31), 6);           # [ 81] v_ashrrev_i32_e32 v14, 31, v6
+    p = e_vop2(p, 0x13, 14, S(37), 14);          # [ 82] v_and_b32_e32 v14, s37, v14
+    p = e_vop2(p, 0x35, 13, V(13), 14);          # [ 83] v_sub_u32_e32 v13, v13, v14
+    p = e_vop2(p, 0x19, 10, V(10), 12);          # [ 84] v_add_co_u32_e32 v10, vcc, v10, v12
+    p = e_vop2(p, 0x1C, 11, V(11), 13);          # [ 85] v_addc_co_u32_e32 v11, vcc, v11, v13, vcc
+    p = e_vop1(p, 0x01, 14, S(38));              # [ 86] v_mov_b32_e32 v14, s38
+    p = e_vop1(p, 0x01, 15, S(39));              # [ 87] v_mov_b32_e32 v15, s39
+    p = e_vop2(p, 0x19, 10, V(10), 14);          # [ 88] v_add_co_u32_e32 v10, vcc, v10, v14
+    p = e_vop2(p, 0x1C, 11, V(11), 15);          # [ 89] v_addc_co_u32_e32 v11, vcc, v11, v15, vcc
+    p = e_vop1(p, 0x01, 12, S(28));              # [ 90] v_mov_b32_e32 v12, s28
+    p = e_vop1(p, 0x01, 13, S(29));              # [ 91] v_mov_b32_e32 v13, s29
+    p = e_vop2(p, 0x1A, 12, V(12), 8);           # [ 92] v_sub_co_u32_e32 v12, vcc, v12, v8
+    p = e_vop2(p, 0x1D, 13, V(13), 9);           # [ 93] v_subb_co_u32_e32 v13, vcc, v13, v9, vcc
+    p = e_vop2(p, 0x1A, 12, V(12), 10);          # [ 94] v_sub_co_u32_e32 v12, vcc, v12, v10
+    p = e_vop2(p, 0x1D, 13, V(13), 11);          # [ 95] v_subb_co_u32_e32 v13, vcc, v13, v11, vcc
+    p = e_vop1(p, 0x01, 20, K(0));               # [ 96] v_mov_b32_e32 v20, 0
+    p = e_vop1_lit(p, 0x01, 21, 0xFF);           # [ 97] v_mov_b32_e32 v21, 0xff
+    p = e_sop1(p, 0x00, 45, K(24));              # [ 99] s_mov_b32 s45, 24
+    p = ea_label(p, 1);               # L_CH
+    p = e_vop1(p, 0x01, 14, S(40));              # [100] v_mov_b32_e32 v14, s40
+    p = e_vop2(p, 0x10, 14, S(45), 14);          # [101] v_lshrrev_b32_e32 v14, s45, v14
+    p = e_vop2_lit(p, 0x13, 14, 0xFF, 14);       # [102] v_and_b32_e32 v14, 0xff, v14
+    p = e_vop3(p, 0x285, 14, V(14), V(4), S(0)); # [104] v_mul_lo_u32 v14, v14, v4
+    p = e_vop1(p, 0x01, 15, S(41));              # [106] v_mov_b32_e32 v15, s41
+    p = e_vop2(p, 0x10, 15, S(45), 15);          # [107] v_lshrrev_b32_e32 v15, s45, v15
+    p = e_vop2_lit(p, 0x13, 15, 0xFF, 15);       # [108] v_and_b32_e32 v15, 0xff, v15
+    p = e_vop3(p, 0x285, 15, V(15), V(4), S(0)); # [110] v_mul_lo_u32 v15, v15, v4
+    p = e_vop1(p, 0x01, 16, S(42));              # [112] v_mov_b32_e32 v16, s42
+    p = e_vop2(p, 0x10, 16, S(45), 16);          # [113] v_lshrrev_b32_e32 v16, s45, v16
+    p = e_vop2_lit(p, 0x13, 16, 0xFF, 16);       # [114] v_and_b32_e32 v16, 0xff, v16
+    p = e_vop3(p, 0x285, 16, V(16), V(4), S(0)); # [116] v_mul_lo_u32 v16, v16, v4
+    p = e_vop1(p, 0x01, 24, K(0));               # [118] v_mov_b32_e32 v24, 0
+    p = e_vop1(p, 0x01, 25, K(0));               # [119] v_mov_b32_e32 v25, 0
+    p = e_vop1(p, 0x01, 26, K(0));               # [120] v_mov_b32_e32 v26, 0
+    p = e_vop3(p, 0x285, 17, V(12), V(14), S(0)); # [121] v_mul_lo_u32 v17, v12, v14
+    p = e_vop3(p, 0x286, 18, V(12), V(14), S(0)); # [123] v_mul_hi_u32 v18, v12, v14
+    p = e_vop2(p, 0x19, 24, V(24), 17);          # [125] v_add_co_u32_e32 v24, vcc, v24, v17
+    p = e_vop2(p, 0x1C, 25, V(25), 18);          # [126] v_addc_co_u32_e32 v25, vcc, v25, v18, vcc
+    p = e_vop1(p, 0x01, 19, K(0));               # [127] v_mov_b32_e32 v19, 0
+    p = e_vop2(p, 0x1C, 26, V(26), 19);          # [128] v_addc_co_u32_e32 v26, vcc, v26, v19, vcc
+    p = e_vop3(p, 0x285, 17, V(13), V(14), S(0)); # [129] v_mul_lo_u32 v17, v13, v14
+    p = e_vop3(p, 0x286, 18, V(13), V(14), S(0)); # [131] v_mul_hi_u32 v18, v13, v14
+    p = e_vop2(p, 0x19, 25, V(25), 17);          # [133] v_add_co_u32_e32 v25, vcc, v25, v17
+    p = e_vop2(p, 0x1C, 26, V(26), 18);          # [134] v_addc_co_u32_e32 v26, vcc, v26, v18, vcc
+    p = e_vop3(p, 0x285, 17, V(8), V(15), S(0)); # [135] v_mul_lo_u32 v17, v8, v15
+    p = e_vop3(p, 0x286, 18, V(8), V(15), S(0)); # [137] v_mul_hi_u32 v18, v8, v15
+    p = e_vop2(p, 0x19, 24, V(24), 17);          # [139] v_add_co_u32_e32 v24, vcc, v24, v17
+    p = e_vop2(p, 0x1C, 25, V(25), 18);          # [140] v_addc_co_u32_e32 v25, vcc, v25, v18, vcc
+    p = e_vop1(p, 0x01, 19, K(0));               # [141] v_mov_b32_e32 v19, 0
+    p = e_vop2(p, 0x1C, 26, V(26), 19);          # [142] v_addc_co_u32_e32 v26, vcc, v26, v19, vcc
+    p = e_vop3(p, 0x285, 17, V(9), V(15), S(0)); # [143] v_mul_lo_u32 v17, v9, v15
+    p = e_vop3(p, 0x286, 18, V(9), V(15), S(0)); # [145] v_mul_hi_u32 v18, v9, v15
+    p = e_vop2(p, 0x19, 25, V(25), 17);          # [147] v_add_co_u32_e32 v25, vcc, v25, v17
+    p = e_vop2(p, 0x1C, 26, V(26), 18);          # [148] v_addc_co_u32_e32 v26, vcc, v26, v18, vcc
+    p = e_vop3(p, 0x285, 17, V(10), V(16), S(0)); # [149] v_mul_lo_u32 v17, v10, v16
+    p = e_vop3(p, 0x286, 18, V(10), V(16), S(0)); # [151] v_mul_hi_u32 v18, v10, v16
+    p = e_vop2(p, 0x19, 24, V(24), 17);          # [153] v_add_co_u32_e32 v24, vcc, v24, v17
+    p = e_vop2(p, 0x1C, 25, V(25), 18);          # [154] v_addc_co_u32_e32 v25, vcc, v25, v18, vcc
+    p = e_vop1(p, 0x01, 19, K(0));               # [155] v_mov_b32_e32 v19, 0
+    p = e_vop2(p, 0x1C, 26, V(26), 19);          # [156] v_addc_co_u32_e32 v26, vcc, v26, v19, vcc
+    p = e_vop3(p, 0x285, 17, V(11), V(16), S(0)); # [157] v_mul_lo_u32 v17, v11, v16
+    p = e_vop3(p, 0x286, 18, V(11), V(16), S(0)); # [159] v_mul_hi_u32 v18, v11, v16
+    p = e_vop2(p, 0x19, 25, V(25), 17);          # [161] v_add_co_u32_e32 v25, vcc, v25, v17
+    p = e_vop2(p, 0x1C, 26, V(26), 18);          # [162] v_addc_co_u32_e32 v26, vcc, v26, v18, vcc
+    p = e_vop2(p, 0x11, 19, K(31), 26);          # [163] v_ashrrev_i32_e32 v19, 31, v26
+    p = e_vop1(p, 0x2B, 19, V(19));              # [164] v_not_b32_e32 v19, v19
+    p = e_vop2(p, 0x13, 24, V(24), 19);          # [165] v_and_b32_e32 v24, v24, v19
+    p = e_vop2(p, 0x13, 25, V(25), 19);          # [166] v_and_b32_e32 v25, v25, v19
+    p = e_vop2(p, 0x13, 26, V(26), 19);          # [167] v_and_b32_e32 v26, v26, v19
+    p = e_vop1(p, 0x01, 17, S(30));              # [168] v_mov_b32_e32 v17, s30
+    p = e_vop1(p, 0x01, 18, S(31));              # [169] v_mov_b32_e32 v18, s31
+    p = e_vop3(p, 0x290, 17, K(1), V(17), S(0)); # [170] v_lshrrev_b64 v[17:18], 1, v[17:18]
+    p = e_vop2(p, 0x19, 24, V(24), 17);          # [172] v_add_co_u32_e32 v24, vcc, v24, v17
+    p = e_vop2(p, 0x1C, 25, V(25), 18);          # [173] v_addc_co_u32_e32 v25, vcc, v25, v18, vcc
+    p = e_vop1(p, 0x01, 19, K(0));               # [174] v_mov_b32_e32 v19, 0
+    p = e_vop2(p, 0x1C, 26, V(26), 19);          # [175] v_addc_co_u32_e32 v26, vcc, v26, v19, vcc
+    p = e_vop3(p, 0x290, 17, S(14), V(24), S(0)); # [176] v_lshrrev_b64 v[17:18], s14, v[24:25]
+    p = e_vop2(p, 0x12, 19, S(15), 26);          # [178] v_lshlrev_b32_e32 v19, s15, v26
+    p = e_vop2(p, 0x14, 18, V(18), 19);          # [179] v_or_b32_e32 v18, v18, v19
+    p = e_vop2(p, 0x12, 27, S(26), 17);          # [180] v_lshlrev_b32_e32 v27, s26, v17
+    p = e_vop3(p, 0x135, 28, K(32), S(26), S(0)); # [181] v_sub_u32_e64 v28, 32, s26
+    p = e_vop2(p, 0x10, 28, V(28), 17);          # [183] v_lshrrev_b32_e32 v28, v28, v17
+    p = e_vop2(p, 0x12, 29, S(26), 18);          # [184] v_lshlrev_b32_e32 v29, s26, v18
+    p = e_vop2(p, 0x14, 28, V(29), 28);          # [185] v_or_b32_e32 v28, v29, v28
+    p = e_vop3(p, 0x286, 29, V(27), S(25), S(0)); # [186] v_mul_hi_u32 v29, v27, s25
+    p = e_vop3(p, 0x285, 30, V(28), S(25), S(0)); # [188] v_mul_lo_u32 v30, v28, s25
+    p = e_vop3(p, 0x286, 31, V(28), S(25), S(0)); # [190] v_mul_hi_u32 v31, v28, s25
+    p = e_vop2(p, 0x19, 29, V(29), 30);          # [192] v_add_co_u32_e32 v29, vcc, v29, v30
+    p = e_vop1(p, 0x01, 30, K(0));               # [193] v_mov_b32_e32 v30, 0
+    p = e_vop2(p, 0x1C, 31, V(31), 30);          # [194] v_addc_co_u32_e32 v31, vcc, v31, v30, vcc
+    p = e_vop2(p, 0x12, 31, K(1), 31);           # [195] v_lshlrev_b32_e32 v31, 1, v31
+    p = e_vop2(p, 0x10, 30, K(31), 29);          # [196] v_lshrrev_b32_e32 v30, 31, v29
+    p = e_vop2(p, 0x14, 22, V(31), 30);          # [197] v_or_b32_e32 v22, v31, v30
+    p = e_vop2(p, 0x34, 27, K(1), 22);           # [198] v_add_u32_e32 v27, 1, v22
+    p = e_vop3(p, 0x285, 28, V(27), S(30), S(0)); # [199] v_mul_lo_u32 v28, v27, s30
+    p = e_vop3(p, 0x286, 29, V(27), S(30), S(0)); # [201] v_mul_hi_u32 v29, v27, s30
+    p = e_vop3(p, 0x285, 30, V(27), S(31), S(0)); # [203] v_mul_lo_u32 v30, v27, s31
+    p = e_vop2(p, 0x34, 29, V(29), 30);          # [205] v_add_u32_e32 v29, v29, v30
+    p = e_vopc(p, 0xC9, V(24), 28);              # [206] v_cmp_lt_u32_e32 vcc, v24, v28
+    p = e_vop2(p, 0x1D, 30, V(25), 29);          # [207] v_subb_co_u32_e32 v30, vcc, v25, v29, vcc
+    p = e_vopc(p, 0xCD, K(0), 26);               # [208] v_cmp_ne_u32_e32 vcc, 0, v26
+    p = e_vop3(p, 0x100, 30, V(30), K(0), VCC);  # [209] v_cndmask_b32_e64 v30, v30, 0, vcc
+    p = e_vopc(p, 0xCA, K(0), 30);               # [211] v_cmp_eq_u32_e32 vcc, 0, v30
+    p = e_vop3b(p, 0x11C, VCC, 22, V(22), K(0), VCC); # [212] v_addc_co_u32_e64 v22, vcc, v22, 0, vcc
+    p = e_vop2_lit(p, 0x0E, 22, 0xFF, 22);       # [214] v_min_u32_e32 v22, 0xff, v22
+    p = e_vop2(p, 0x0E, 22, V(22), 21);          # [216] v_min_u32_e32 v22, v22, v21
+    p = e_sopc(p, 0x06, S(45), K(24));           # [217] s_cmp_eq_u32 s45, 24
+    p = e_sop2(p, 0x0B, 46, K(0 - 1), K(0));     # [218] s_cselect_b64 s[46:47], -1, 0
+    p = e_vop3(p, 0x100, 21, V(21), V(22), S(46)); # [219] v_cndmask_b32_e64 v21, v21, v22, s[46:47]
+    p = e_vop2(p, 0x12, 23, S(45), 22);          # [221] v_lshlrev_b32_e32 v23, s45, v22
+    p = e_vop2(p, 0x14, 20, V(20), 23);          # [222] v_or_b32_e32 v20, v20, v23
+    p = e_sop2(p, 0x03, 45, S(45), K(8));        # [223] s_sub_i32 s45, s45, 8
+    p = e_sopc(p, 0x03, S(45), K(0));            # [224] s_cmp_ge_i32 s45, 0
+    p = ea_branch(p, 0x05, 1);                   # [225] s_cbranch_scc1 L_CH   (label id 1 = L_CH, defined at dword 100 in the preceding section)
+    p = e_vop2(p, 0x12, 2, K(2), 1);             # [226] v_lshlrev_b32_e32 v2, 2, v1
+    p = e_vop1(p, 0x01, 3, S(9));                # [227] v_mov_b32_e32 v3, s9
+    p = e_vop3(p, 0x285, 3, V(3), S(4), S(0));   # [228] v_mul_lo_u32 v3, v3, s4
+    p = e_vop2(p, 0x34, 2, V(2), 3);             # [230] v_add_u32_e32 v2, v2, v3
+    p = e_vop1(p, 0x01, 3, K(0));                # [231] v_mov_b32_e32 v3, 0
+    p = e_vop2(p, 0x19, 2, S(2), 2);             # [232] v_add_co_u32_e32 v2, vcc, s2, v2
+    p = e_vop1(p, 0x01, 3, S(3));                # [233] v_mov_b32_e32 v3, s3
+    p = e_vop2(p, 0x1C, 3, K(0), 3);             # [234] v_addc_co_u32_e32 v3, vcc, 0, v3, vcc
+    p = e_flat(p, 0x14, 0, 27, 0, 2, 0);         # [235] global_load_dword v27, v[2:3], off
+    p = e_sopp(p, 0x0C, 3952);                   # [237] s_waitcnt vmcnt(0)
+    p = e_vop2(p, 0x10, 28, K(24), 20);          # [238] v_lshrrev_b32_e32 v28, 24, v20
+    p = e_vop2_lit(p, 0x35, 28, 0xFF, 28);       # [239] v_sub_u32_e32 v28, 0xff, v28
+    p = e_vop1(p, 0x01, 31, K(0));               # [241] v_mov_b32_e32 v31, 0
+    p = e_sop1(p, 0x00, 45, K(24));              # [242] s_mov_b32 s45, 24
+    p = ea_label(p, 2);               # L_OVER
+    p = e_vop2(p, 0x10, 29, S(45), 27);          # [243] v_lshrrev_b32_e32 v29, s45, v27
+    p = e_vop2_lit(p, 0x13, 29, 0xFF, 29);       # [244] v_and_b32_e32 v29, 0xff, v29
+    p = e_vop3(p, 0x285, 29, V(29), V(28), S(0)); # [246] v_mul_lo_u32 v29, v29, v28
+    p = e_vop2_lit(p, 0x34, 29, 0x7F, 29);       # [248] v_add_u32_e32 v29, 0x7f, v29
+    p = e_vop2(p, 0x10, 30, K(8), 29);           # [250] v_lshrrev_b32_e32 v30, 8, v29
+    p = e_vop2(p, 0x34, 30, V(29), 30);          # [251] v_add_u32_e32 v30, v29, v30
+    p = e_vop2(p, 0x34, 30, K(1), 30);           # [252] v_add_u32_e32 v30, 1, v30
+    p = e_vop2(p, 0x10, 30, K(8), 30);           # [253] v_lshrrev_b32_e32 v30, 8, v30
+    p = e_vop2(p, 0x10, 29, S(45), 20);          # [254] v_lshrrev_b32_e32 v29, s45, v20
+    p = e_vop2_lit(p, 0x13, 29, 0xFF, 29);       # [255] v_and_b32_e32 v29, 0xff, v29
+    p = e_vop2(p, 0x34, 30, V(29), 30);          # [257] v_add_u32_e32 v30, v29, v30
+    p = e_vop2_lit(p, 0x0E, 30, 0xFF, 30);       # [258] v_min_u32_e32 v30, 0xff, v30
+    p = e_vop2(p, 0x12, 30, S(45), 30);          # [260] v_lshlrev_b32_e32 v30, s45, v30
+    p = e_vop2(p, 0x14, 31, V(31), 30);          # [261] v_or_b32_e32 v31, v31, v30
+    p = e_sop2(p, 0x03, 45, S(45), K(8));        # [262] s_sub_i32 s45, s45, 8
+    p = e_sopc(p, 0x03, S(45), K(0));            # [263] s_cmp_ge_i32 s45, 0
+    p = ea_branch(p, 0x05, 2);                   # [264] s_cbranch_scc1 L_OVER
+    p = e_flat(p, 0x1C, 0, 0, 31, 2, 0);         # [265] global_store_dword v[2:3], v31, off
+    p = e_sopp(p, 0x0C, 3952);                   # [267] s_waitcnt vmcnt(0)
+    p = ea_label(p, 0);                          # L_END
+    p = e_sopp(p, 0x01, 0);                      # [268] s_endpgm
+    ea_fixup();
     return p;
 }
 
@@ -1313,12 +1534,18 @@ fn main(): i64 {
     ea_vgpr_reset();
     if (blob_check("edge_cov  ", 10, 135, cov_emit()) == 0) { ok = 0; }
     if (ea_vgpr_check(56, "edge_cov") == 0) { ok = 0; }
+    var cov_hi = ea_vgpr_max;
     if (ea_fault != 0) { puts("  ** an asserting wrapper REFUSED while emitting a 9b blob"); ok = 0; }
 
     # ---- GATE 4b: the sovereign re-emission of tri_rgba ------------------------------------
-    puts("[gate 4b] tri_rgba, edgeasm vs llvm-mc on the SAME source (in progress)");
+    puts("[gate 4b] tri_rgba, edgeasm vs llvm-mc on the SAME source");
     ea_fault = 0;
+    ea_vgpr_reset();
     if (tri_check() == 0) { ok = 0; }
+    # ⭐ The blob declares 56 VGPRs (RSRC1 = 0x002C018D, harvested from the assembled descriptor).
+    # Now that the whole emit list exists, that declaration can be checked against it mechanically.
+    if (ea_vgpr_check(32, "tri_rgba") == 0) { ok = 0; }
+    ps("  tri_rgba high-water: v"); pnum(ea_vgpr_max); ps(" against a declared 32 (8 waves/SIMD)"); nl();
     if (ea_fault != 0) { puts("  ** an asserting wrapper REFUSED while emitting tri_rgba"); ok = 0; }
 
     # ---- GATE 5: the VGPR high-water gate itself ------------------------------------------
@@ -1326,8 +1553,12 @@ fn main(): i64 {
     # oracle: RSRC1 is not GRBM-readable, so nothing on the machine can contradict a wrong
     # declaration. Prove it fires by asking it to accept a deliberately impossible budget.
     puts("[gate 5] the VGPR high-water gate must REFUSE an under-declaration");
+    # ⚠ setup_hi/cov_hi are CAPTURED at emit time. Printing ea_vgpr_max here read whatever blob ran
+    # LAST -- after gate 4b was added that was tri_rgba, so this line silently reported the wrong
+    # kernel's number. A shared mutable tracker must be sampled where it is written, not where it is
+    # reported.
     ps("  edge_setup uses up to v"); pnum(setup_hi);
-    ps(", edge_cov up to v"); pnum(ea_vgpr_max);
+    ps(", edge_cov up to v"); pnum(cov_hi);
     puts(" (both declare 56)");
     var saved = ea_fault;
     ea_fault = 0;

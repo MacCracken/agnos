@@ -2541,7 +2541,7 @@ fn edge_setup_write(dst_phys) {
 # never drift from the source. Editing a dword here by hand is how a table and its .s file diverge
 # silently: the kernel still builds and the failure surfaces on iron as a wedged queue or a wrong
 # picture with nothing pointing back at the cause.
-# ⚠ RSRC1 = 0x002C018D (56 VGPRs, 56 SGPRs), RSRC2 = 0x00000190 — both HARVESTED from the assembled
+# ⚠ RSRC1 = 0x002C0187 (32 VGPRs, 56 SGPRs), RSRC2 = 0x00000190 — both HARVESTED from the assembled
 # descriptor, never counted. RSRC2 is byte-identical to the coverage kernel's, which is what lets
 # the shipped dispatcher issue this blob with no PM4 change.
 # ⚠ ONE ASSEMBLER SO FAR. The standing bar is two independent ones (see the note above
