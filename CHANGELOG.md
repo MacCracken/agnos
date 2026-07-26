@@ -11,6 +11,48 @@ four flashes and **rung 10's kill gate measured and passed** — crossover 1751 
 loose end that burn left: `--bench` exiting 142 where its code path returns 95. Bumped on cycle
 open; the user tags on close.
 
+### ⭐⭐⭐ EDGE_CAP RAISED ON MEASUREMENT — and replaced by a measured WORK-PRODUCT bound
+
+The probe burn (`gpu: edge rasteriser cap 256 edges`, `--cov` 20/20 on a fifth flash) produced the
+term burn 5 never had:
+
+| ne | 4 | 8 | 16 | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|---|---|---|
+| gpu µs @128² | 66 | 105 | 186 | 342 | 655 | 1278 | 2525 |
+| **marginal µs/edge** | 9.50 | 9.62 | 9.87 | 9.81 | 9.79 | 9.76 | **9.75** |
+
+⭐⭐ **FLAT to ~2.6 % across a 64× range in E ⇒ cost is LINEAR in E.** Least-squares:
+**`cost_µs = 28.8 + 0.0005953 · (w·h) · n_edges`** — and that 28.8 µs intercept **independently
+agrees with burn 5's ~28 µs**, derived from a completely different sweep (mask size at fixed E=3).
+Two independent measurements, one constant.
+
+**⛔ So the edge cap was the wrong knob, and the numbers say so plainly.** It *permitted*
+4096² × E=64 (**~639 ms**, six times over the watchdog) and *forbade* 64² × E=256 (**~0.65 ms**).
+
+- `GPU_EDGE_CAP` 64 → **256** (the ABI maximum; no longer the real gate).
+- **`GPU_EDGE_WORK_MAX = 2^26`** on `w·h·n_edges`, with `GPO_E_WORK` (21) — its own code, because
+  "too many edges" and "too much total work" have different fixes (halve the edges, or halve the
+  mask) and a shared code cannot tell the caller which.
+
+**Derivation, not a guess:** the watchdog is nominally 100 ms but `GPU_TSC_PER_US` assumes 3000
+cycles/µs where calibration **measures 3194**, so the real timeout is **~93.9 ms**. 2^26 predicts
+**~40.0 ms = 42.6 %** of it — >2× headroom for boost, shape variation and the fit's own error. It
+accepts 4096² with a triangle (~30 ms) and 256² with 256 edges (~10 ms); it rejects 4096² × E=64.
+
+Battery **22 → 24 cases, smoke 16/16**, gating **both directions**: the ~639 ms envelope is
+refused, and the ~0.65 ms envelope the old cap wrongly forbade is accepted. ⚠ A bound that only
+ever rejects is a bound nobody can use, so the accept side is asserted too.
+
+### Fixed — three fixture faults in the new battery cases, each masquerading as a bound failure
+
+All three reported "the bound is too tight" when the bound was correct:
+1. **`EDGEBUF`** — the seeded edge slot was 256 B; 256 edges need 4096. Added a large slot used
+   only by the accept case, so the "edge slot too small" case keeps its meaning.
+2. **`DSTSLOT`** — 128² needs a 16384 B mask against a 4096 B seeded slot.
+3. ⭐ **`COORD`** — the new cases sit *before* the B3 block's own `eabi_edges` tidy-up, so offset 0
+   still held the `−2^28−1` value the last out-of-domain reject wrote. **The guard was right; the
+   fixture was dirty.** *A test that inherits state from the test before it is not a test.*
+
 ### ⛔ EDGE_CAP NOT RAISED — burn 5 has no edge-count data, and the cap moves on measurement
 
 **The measured points do not support raising it.** Burn 5 swept **mask size at a fixed 3-edge

@@ -71,24 +71,35 @@ var gpu_cov_armed     = 0;   # 1 = blend_cov resident in its own arena slot for 
 var gpu_glyph_ok      = 0;   # plan-S9: 1 = 1bpp glyph expansion proven on iron
 var gpu_glyph_armed   = 0;   # 1 = glyph_1bpp resident for #92 op GPU_OP_GLYPH_1BPP
 var gpu_grad_ok       = 0;   # plan-S11: 1 = linear gradient proven on iron
-# ⛔ THE SHIPPED ENVELOPE EQUALS THE PROVEN ENVELOPE, and the cap moves on MEASUREMENT only.
+# ============================================================================================
+# THE EDGE ENVELOPE — MOVED ON MEASUREMENT, 1.56.19
+# ============================================================================================
+# ⭐ MEASURED on archaemenid (probe burn, `gputri --bench` edge sweep, 128x128 fixed):
 #
-# ⚠ AND EDGE_CAP ALONE IS THE WRONG KNOB — burn 5's measured curve says so. Cost is
-# ~28 us fixed + ~0.00045 us per pixel per edge, so the constraint is the WORK PRODUCT
-# w*h*n_edges, not the edge count:
-#     4096^2 x E=64  -> ~480 ms  ⛔ blows the 100 ms watchdog, yet EDGE_CAP PERMITS it
-#       64^2 x E=256 -> ~0.5 ms  trivially safe, yet EDGE_CAP FORBIDS it
-# Replacing this with a work-product bound is the right shape, but the per-edge term is
-# EXTRAPOLATED from a fixed 3-edge sweep — `gputri --bench`'s edge sweep measures it, and
-# EDGE_CAP_PROBE raises the cap so a burn can reach the points beyond it.
-#ifdef EDGE_CAP_PROBE
-# ⚠ MEASUREMENT KERNEL ONLY. Never ship this: it permits envelopes the watchdog has not been
-# shown to survive, which is the whole reason the shipped cap is 64.
-var GPU_EDGE_CAP      = 256;
-#endif
-#ifndef EDGE_CAP_PROBE
-var GPU_EDGE_CAP      = 64;
-#endif
+#   ne     4      8     16     32     64    128    256
+#   us    66    105    186    342    655   1278   2525
+#   marginal us/edge (fixed cost removed): 9.50 9.62 9.87 9.81 9.79 9.76 9.75
+#
+# ⭐⭐ FLAT to ~2.6% across a 64x range in E, so COST IS LINEAR IN E. Least-squares:
+#     cost_us = 28.8 + 0.0005953 * (w*h) * n_edges
+# and that 28.8 us intercept independently agrees with burn 5's ~28 us derived from a completely
+# different sweep (mask size at fixed E=3). Two independent measurements, one constant.
+#
+# ⛔ SO EDGE_CAP ALONE WAS THE WRONG KNOB, and the numbers say so plainly. It PERMITTED
+# 4096^2 x E=64 (~639 ms — six times over the watchdog) and FORBADE 64^2 x E=256 (~0.65 ms).
+# The real constraint is the WORK PRODUCT w*h*n_edges. The edge count is now bounded only by the
+# ABI's 256, and the work product is the gate that actually protects the watchdog.
+#
+# GPU_EDGE_WORK_MAX = 2^26. Derivation, not a guess:
+#   * the dispatch watchdog is nominally 100 ms, but GPU_TSC_PER_US assumes 3000 cycles/us where
+#     the TSC calibration measures 3194 -> the REAL timeout is ~93.9 ms;
+#   * 2^26 work units predict ~40.0 ms = 42.6% of that, leaving >2x headroom for clock boost,
+#     shape variation, and the fit's own error;
+#   * it ACCEPTS 4096^2 with a triangle (~30 ms) and 256^2 with 256 edges (~10 ms), and REJECTS
+#     4096^2 x E=64. Those are the envelopes that matter.
+# ⚠ Raise it only from a fresh sweep, the same way this one was set.
+var GPU_EDGE_CAP      = 256;         # the ABI maximum; the work product below is the real gate
+var GPU_EDGE_WORK_MAX = 67108864;    # 2^26 w*h*n_edges  ~= 40 ms of the ~94 ms watchdog
 var gpu_edge_armed    = 0;   # 3D rung 9: 1 = edge_cov blob resident (written at 9b; 0 through all of 9a)
 var gpu_grad_armed    = 0;   # 1 = grad_linear resident in its own arena slot for the #92 op path
 var gpu_perm_ok       = 0;   # plan-S4: 1 = v_perm_b32 byte crossbar + channel swap proven on iron

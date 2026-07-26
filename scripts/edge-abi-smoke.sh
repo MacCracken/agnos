@@ -77,9 +77,9 @@ pass=0; fail=0
 chk() { if grep -q "$1" "$LOG"; then echo "PASS: $2"; pass=$((pass+1)); else echo "FAIL: '$1' — $3"; fail=$((fail+1)); fi; }
 nchk() { if grep -q "$1" "$LOG"; then echo "FAIL: '$1' present — $3"; fail=$((fail+1)); else echo "PASS: $2"; pass=$((pass+1)); fi; }
 
-chk "edge-abi: 22 of 22 cases correct" \
-    "every one of the 22 ABI cases returned the reason the ABI specifies" \
-    "not 22/22 - read the named FAIL line(s) above; each names its case, want and got"
+chk "edge-abi: 24 of 24 cases correct" \
+    "every one of the 24 ABI cases returned the reason the ABI specifies" \
+    "not 24/24 - read the named FAIL line(s) above; each names its case, want and got"
 chk "edge-abi: PASS -- the op 0x08 ABI rejects every malformed record" \
     "the battery's own verdict line is PASS" \
     "verdict line absent or FAIL"
@@ -124,9 +124,17 @@ chk "edge-abi: PASS coord at -2^28 exactly is IN range" \
 chk "edge-abi: PASS rule EVENODD is refused" \
     "an unimplemented winding rule is REFUSED at the ABI, not accepted then silently failed" \
     "rule 1 was accepted - the ABI now promises behaviour no oracle covers"
-chk "edge-abi: PASS n_edges over the shipped EDGE_CAP" \
-    "the SHIPPED envelope is enforced where a test can see it, not deep in the dispatch worker" \
-    "the shipped cap is not enforced at the validator"
+chk "edge-abi: PASS n_edges over the ABI max of 256" \
+    "the ABI edge maximum is enforced at the validator" \
+    "the edge maximum is not enforced"
+# ⭐ THE MEASURED WORK BOUND (1.56.19). The old edge-only cap PERMITTED 4096^2 x E=64 at ~639 ms
+# against a ~94 ms watchdog, and FORBADE 64^2 x E=256 at ~0.65 ms. Both directions are gated.
+chk "edge-abi: PASS 4096x4096 x 64 edges exceeds the work budget" \
+    "the envelope that would blow the dispatch watchdog is REFUSED (GPO_E_WORK, its own code)" \
+    "a ~639 ms envelope was accepted -- the work bound is not enforced"
+chk "edge-abi: PASS 64x64 x 16 edges is INSIDE the budget" \
+    "the envelope the OLD edge-cap wrongly FORBADE (~0.65 ms) is now ACCEPTED" \
+    "a measured-fast envelope was rejected; the bound is too tight to use"
 chk "AGNOS shell" \
     "boot completed past the battery (no fault)" \
     "boot did not reach shell"

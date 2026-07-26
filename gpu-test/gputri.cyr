@@ -72,7 +72,9 @@ var SENTINEL = 0xA5;
 # luck; case 10 has 10 and case 20 has 64 — both would have written straight past the end into
 # the mask buffer declared next to it. A corrupted edge array produces a plausible WRONG
 # TRIANGLE, the single hardest symptom in this rung's failure table to attribute.
-var tri_edges[128];             # 1024 B = 64 edges x 16 B, the shipped EDGE_CAP
+var tri_edges[512];             # 4096 B = 256 edges x 16 B — the EDGE_CAP_PROBE ceiling,
+                                # not the shipped cap (still 64). The tool must be able to SUBMIT
+                                # what the probe kernel will accept, or the sweep cannot reach it.
 #
 # ⛔ And ONE buffer served as BOTH the sentinel prefill and the readback. That makes the
 # comparison read the GPU's own output as the "expected" value for any byte the GPU did not
@@ -464,16 +466,287 @@ fn bench_shape(w, h): i64 {
 # regular 64-gon (precomputed, no runtime trig). Taking every (64/ne)-th vertex gives an exact
 # regular ne-gon for ne in {4,8,16,32,64} — divisors of 64 — so the edge sweep reuses geometry
 # already proven byte-exact by corpus case 20 rather than inventing shapes to measure with.
+# ⭐ 256 EXACT 16.16 VERTICES, same centre/radius/family as corpus case 20's 64-gon. Subsampling
+# by 256/ne yields an exact regular ne-gon for every divisor of 256 — so ONE shape family spans
+# the whole sweep from 4 to 256 edges.
+#
+# ⛔ THAT MATTERS FOR THE MEASUREMENT, not for tidiness. Switching shape families partway (an
+# n-gon below 64, a zigzag above it) would confound the per-edge cost with a change in covered
+# pixels and crossing pattern — and the ONE number this sweep exists to produce is us-per-edge.
+# A confounded slope is worse than no slope, because it looks like data.
+var bg[512];
+var bg_ready = 0;
+fn bench_gon_init(): i64 {
+    if (bg_ready == 1) { return 0; }
+    store64(&bg +   0 * 16,   7864320); store64(&bg +   0 * 16 + 8,   4194304);
+    store64(&bg +   1 * 16,   7863215); store64(&bg +   1 * 16 + 8,   4284371);
+    store64(&bg +   2 * 16,   7859899); store64(&bg +   2 * 16 + 8,   4374383);
+    store64(&bg +   3 * 16,   7854376); store64(&bg +   3 * 16 + 8,   4464287);
+    store64(&bg +   4 * 16,   7846648); store64(&bg +   4 * 16 + 8,   4554028);
+    store64(&bg +   5 * 16,   7836720); store64(&bg +   5 * 16 + 8,   4643553);
+    store64(&bg +   6 * 16,   7824598); store64(&bg +   6 * 16 + 8,   4732807);
+    store64(&bg +   7 * 16,   7810289); store64(&bg +   7 * 16 + 8,   4821737);
+    store64(&bg +   8 * 16,   7793802); store64(&bg +   8 * 16 + 8,   4910289);
+    store64(&bg +   9 * 16,   7775146); store64(&bg +   9 * 16 + 8,   4998409);
+    store64(&bg +  10 * 16,   7754334); store64(&bg +  10 * 16 + 8,   5086045);
+    store64(&bg +  11 * 16,   7731378); store64(&bg +  11 * 16 + 8,   5173144);
+    store64(&bg +  12 * 16,   7706290); store64(&bg +  12 * 16 + 8,   5259653);
+    store64(&bg +  13 * 16,   7679088); store64(&bg +  13 * 16 + 8,   5345521);
+    store64(&bg +  14 * 16,   7649786); store64(&bg +  14 * 16 + 8,   5430695);
+    store64(&bg +  15 * 16,   7618402); store64(&bg +  15 * 16 + 8,   5515125);
+    store64(&bg +  16 * 16,   7584957); store64(&bg +  16 * 16 + 8,   5598758);
+    store64(&bg +  17 * 16,   7549468); store64(&bg +  17 * 16 + 8,   5681546);
+    store64(&bg +  18 * 16,   7511959); store64(&bg +  18 * 16 + 8,   5763438);
+    store64(&bg +  19 * 16,   7472451); store64(&bg +  19 * 16 + 8,   5844385);
+    store64(&bg +  20 * 16,   7430969); store64(&bg +  20 * 16 + 8,   5924338);
+    store64(&bg +  21 * 16,   7387537); store64(&bg +  21 * 16 + 8,   6003248);
+    store64(&bg +  22 * 16,   7342182); store64(&bg +  22 * 16 + 8,   6081069);
+    store64(&bg +  23 * 16,   7294930); store64(&bg +  23 * 16 + 8,   6157754);
+    store64(&bg +  24 * 16,   7245811); store64(&bg +  24 * 16 + 8,   6233256);
+    store64(&bg +  25 * 16,   7194853); store64(&bg +  25 * 16 + 8,   6307529);
+    store64(&bg +  26 * 16,   7142088); store64(&bg +  26 * 16 + 8,   6380530);
+    store64(&bg +  27 * 16,   7087548); store64(&bg +  27 * 16 + 8,   6452214);
+    store64(&bg +  28 * 16,   7031265); store64(&bg +  28 * 16 + 8,   6522538);
+    store64(&bg +  29 * 16,   6973273); store64(&bg +  29 * 16 + 8,   6591459);
+    store64(&bg +  30 * 16,   6913606); store64(&bg +  30 * 16 + 8,   6658936);
+    store64(&bg +  31 * 16,   6852302); store64(&bg +  31 * 16 + 8,   6724929);
+    store64(&bg +  32 * 16,   6789397); store64(&bg +  32 * 16 + 8,   6789397);
+    store64(&bg +  33 * 16,   6724929); store64(&bg +  33 * 16 + 8,   6852302);
+    store64(&bg +  34 * 16,   6658936); store64(&bg +  34 * 16 + 8,   6913606);
+    store64(&bg +  35 * 16,   6591459); store64(&bg +  35 * 16 + 8,   6973273);
+    store64(&bg +  36 * 16,   6522538); store64(&bg +  36 * 16 + 8,   7031265);
+    store64(&bg +  37 * 16,   6452214); store64(&bg +  37 * 16 + 8,   7087548);
+    store64(&bg +  38 * 16,   6380530); store64(&bg +  38 * 16 + 8,   7142088);
+    store64(&bg +  39 * 16,   6307529); store64(&bg +  39 * 16 + 8,   7194853);
+    store64(&bg +  40 * 16,   6233256); store64(&bg +  40 * 16 + 8,   7245811);
+    store64(&bg +  41 * 16,   6157754); store64(&bg +  41 * 16 + 8,   7294930);
+    store64(&bg +  42 * 16,   6081069); store64(&bg +  42 * 16 + 8,   7342182);
+    store64(&bg +  43 * 16,   6003248); store64(&bg +  43 * 16 + 8,   7387537);
+    store64(&bg +  44 * 16,   5924338); store64(&bg +  44 * 16 + 8,   7430969);
+    store64(&bg +  45 * 16,   5844385); store64(&bg +  45 * 16 + 8,   7472451);
+    store64(&bg +  46 * 16,   5763438); store64(&bg +  46 * 16 + 8,   7511959);
+    store64(&bg +  47 * 16,   5681546); store64(&bg +  47 * 16 + 8,   7549468);
+    store64(&bg +  48 * 16,   5598758); store64(&bg +  48 * 16 + 8,   7584957);
+    store64(&bg +  49 * 16,   5515125); store64(&bg +  49 * 16 + 8,   7618402);
+    store64(&bg +  50 * 16,   5430695); store64(&bg +  50 * 16 + 8,   7649786);
+    store64(&bg +  51 * 16,   5345521); store64(&bg +  51 * 16 + 8,   7679088);
+    store64(&bg +  52 * 16,   5259653); store64(&bg +  52 * 16 + 8,   7706290);
+    store64(&bg +  53 * 16,   5173144); store64(&bg +  53 * 16 + 8,   7731378);
+    store64(&bg +  54 * 16,   5086045); store64(&bg +  54 * 16 + 8,   7754334);
+    store64(&bg +  55 * 16,   4998409); store64(&bg +  55 * 16 + 8,   7775146);
+    store64(&bg +  56 * 16,   4910289); store64(&bg +  56 * 16 + 8,   7793802);
+    store64(&bg +  57 * 16,   4821737); store64(&bg +  57 * 16 + 8,   7810289);
+    store64(&bg +  58 * 16,   4732807); store64(&bg +  58 * 16 + 8,   7824598);
+    store64(&bg +  59 * 16,   4643553); store64(&bg +  59 * 16 + 8,   7836720);
+    store64(&bg +  60 * 16,   4554028); store64(&bg +  60 * 16 + 8,   7846648);
+    store64(&bg +  61 * 16,   4464287); store64(&bg +  61 * 16 + 8,   7854376);
+    store64(&bg +  62 * 16,   4374383); store64(&bg +  62 * 16 + 8,   7859899);
+    store64(&bg +  63 * 16,   4284371); store64(&bg +  63 * 16 + 8,   7863215);
+    store64(&bg +  64 * 16,   4194304); store64(&bg +  64 * 16 + 8,   7864320);
+    store64(&bg +  65 * 16,   4104237); store64(&bg +  65 * 16 + 8,   7863215);
+    store64(&bg +  66 * 16,   4014225); store64(&bg +  66 * 16 + 8,   7859899);
+    store64(&bg +  67 * 16,   3924321); store64(&bg +  67 * 16 + 8,   7854376);
+    store64(&bg +  68 * 16,   3834580); store64(&bg +  68 * 16 + 8,   7846648);
+    store64(&bg +  69 * 16,   3745055); store64(&bg +  69 * 16 + 8,   7836720);
+    store64(&bg +  70 * 16,   3655801); store64(&bg +  70 * 16 + 8,   7824598);
+    store64(&bg +  71 * 16,   3566871); store64(&bg +  71 * 16 + 8,   7810289);
+    store64(&bg +  72 * 16,   3478319); store64(&bg +  72 * 16 + 8,   7793802);
+    store64(&bg +  73 * 16,   3390199); store64(&bg +  73 * 16 + 8,   7775146);
+    store64(&bg +  74 * 16,   3302563); store64(&bg +  74 * 16 + 8,   7754334);
+    store64(&bg +  75 * 16,   3215464); store64(&bg +  75 * 16 + 8,   7731378);
+    store64(&bg +  76 * 16,   3128955); store64(&bg +  76 * 16 + 8,   7706290);
+    store64(&bg +  77 * 16,   3043087); store64(&bg +  77 * 16 + 8,   7679088);
+    store64(&bg +  78 * 16,   2957913); store64(&bg +  78 * 16 + 8,   7649786);
+    store64(&bg +  79 * 16,   2873483); store64(&bg +  79 * 16 + 8,   7618402);
+    store64(&bg +  80 * 16,   2789850); store64(&bg +  80 * 16 + 8,   7584957);
+    store64(&bg +  81 * 16,   2707062); store64(&bg +  81 * 16 + 8,   7549468);
+    store64(&bg +  82 * 16,   2625170); store64(&bg +  82 * 16 + 8,   7511959);
+    store64(&bg +  83 * 16,   2544223); store64(&bg +  83 * 16 + 8,   7472451);
+    store64(&bg +  84 * 16,   2464270); store64(&bg +  84 * 16 + 8,   7430969);
+    store64(&bg +  85 * 16,   2385360); store64(&bg +  85 * 16 + 8,   7387537);
+    store64(&bg +  86 * 16,   2307539); store64(&bg +  86 * 16 + 8,   7342182);
+    store64(&bg +  87 * 16,   2230854); store64(&bg +  87 * 16 + 8,   7294930);
+    store64(&bg +  88 * 16,   2155352); store64(&bg +  88 * 16 + 8,   7245811);
+    store64(&bg +  89 * 16,   2081079); store64(&bg +  89 * 16 + 8,   7194853);
+    store64(&bg +  90 * 16,   2008078); store64(&bg +  90 * 16 + 8,   7142088);
+    store64(&bg +  91 * 16,   1936394); store64(&bg +  91 * 16 + 8,   7087548);
+    store64(&bg +  92 * 16,   1866070); store64(&bg +  92 * 16 + 8,   7031265);
+    store64(&bg +  93 * 16,   1797149); store64(&bg +  93 * 16 + 8,   6973273);
+    store64(&bg +  94 * 16,   1729672); store64(&bg +  94 * 16 + 8,   6913606);
+    store64(&bg +  95 * 16,   1663679); store64(&bg +  95 * 16 + 8,   6852302);
+    store64(&bg +  96 * 16,   1599211); store64(&bg +  96 * 16 + 8,   6789397);
+    store64(&bg +  97 * 16,   1536306); store64(&bg +  97 * 16 + 8,   6724929);
+    store64(&bg +  98 * 16,   1475002); store64(&bg +  98 * 16 + 8,   6658936);
+    store64(&bg +  99 * 16,   1415335); store64(&bg +  99 * 16 + 8,   6591459);
+    store64(&bg + 100 * 16,   1357343); store64(&bg + 100 * 16 + 8,   6522538);
+    store64(&bg + 101 * 16,   1301060); store64(&bg + 101 * 16 + 8,   6452214);
+    store64(&bg + 102 * 16,   1246520); store64(&bg + 102 * 16 + 8,   6380530);
+    store64(&bg + 103 * 16,   1193755); store64(&bg + 103 * 16 + 8,   6307529);
+    store64(&bg + 104 * 16,   1142797); store64(&bg + 104 * 16 + 8,   6233256);
+    store64(&bg + 105 * 16,   1093678); store64(&bg + 105 * 16 + 8,   6157754);
+    store64(&bg + 106 * 16,   1046426); store64(&bg + 106 * 16 + 8,   6081069);
+    store64(&bg + 107 * 16,   1001071); store64(&bg + 107 * 16 + 8,   6003248);
+    store64(&bg + 108 * 16,    957639); store64(&bg + 108 * 16 + 8,   5924338);
+    store64(&bg + 109 * 16,    916157); store64(&bg + 109 * 16 + 8,   5844385);
+    store64(&bg + 110 * 16,    876649); store64(&bg + 110 * 16 + 8,   5763438);
+    store64(&bg + 111 * 16,    839140); store64(&bg + 111 * 16 + 8,   5681546);
+    store64(&bg + 112 * 16,    803651); store64(&bg + 112 * 16 + 8,   5598758);
+    store64(&bg + 113 * 16,    770206); store64(&bg + 113 * 16 + 8,   5515125);
+    store64(&bg + 114 * 16,    738822); store64(&bg + 114 * 16 + 8,   5430695);
+    store64(&bg + 115 * 16,    709520); store64(&bg + 115 * 16 + 8,   5345521);
+    store64(&bg + 116 * 16,    682318); store64(&bg + 116 * 16 + 8,   5259653);
+    store64(&bg + 117 * 16,    657230); store64(&bg + 117 * 16 + 8,   5173144);
+    store64(&bg + 118 * 16,    634274); store64(&bg + 118 * 16 + 8,   5086045);
+    store64(&bg + 119 * 16,    613462); store64(&bg + 119 * 16 + 8,   4998409);
+    store64(&bg + 120 * 16,    594806); store64(&bg + 120 * 16 + 8,   4910289);
+    store64(&bg + 121 * 16,    578319); store64(&bg + 121 * 16 + 8,   4821737);
+    store64(&bg + 122 * 16,    564010); store64(&bg + 122 * 16 + 8,   4732807);
+    store64(&bg + 123 * 16,    551888); store64(&bg + 123 * 16 + 8,   4643553);
+    store64(&bg + 124 * 16,    541960); store64(&bg + 124 * 16 + 8,   4554028);
+    store64(&bg + 125 * 16,    534232); store64(&bg + 125 * 16 + 8,   4464287);
+    store64(&bg + 126 * 16,    528709); store64(&bg + 126 * 16 + 8,   4374383);
+    store64(&bg + 127 * 16,    525393); store64(&bg + 127 * 16 + 8,   4284371);
+    store64(&bg + 128 * 16,    524288); store64(&bg + 128 * 16 + 8,   4194304);
+    store64(&bg + 129 * 16,    525393); store64(&bg + 129 * 16 + 8,   4104237);
+    store64(&bg + 130 * 16,    528709); store64(&bg + 130 * 16 + 8,   4014225);
+    store64(&bg + 131 * 16,    534232); store64(&bg + 131 * 16 + 8,   3924321);
+    store64(&bg + 132 * 16,    541960); store64(&bg + 132 * 16 + 8,   3834580);
+    store64(&bg + 133 * 16,    551888); store64(&bg + 133 * 16 + 8,   3745055);
+    store64(&bg + 134 * 16,    564010); store64(&bg + 134 * 16 + 8,   3655801);
+    store64(&bg + 135 * 16,    578319); store64(&bg + 135 * 16 + 8,   3566871);
+    store64(&bg + 136 * 16,    594806); store64(&bg + 136 * 16 + 8,   3478319);
+    store64(&bg + 137 * 16,    613462); store64(&bg + 137 * 16 + 8,   3390199);
+    store64(&bg + 138 * 16,    634274); store64(&bg + 138 * 16 + 8,   3302563);
+    store64(&bg + 139 * 16,    657230); store64(&bg + 139 * 16 + 8,   3215464);
+    store64(&bg + 140 * 16,    682318); store64(&bg + 140 * 16 + 8,   3128955);
+    store64(&bg + 141 * 16,    709520); store64(&bg + 141 * 16 + 8,   3043087);
+    store64(&bg + 142 * 16,    738822); store64(&bg + 142 * 16 + 8,   2957913);
+    store64(&bg + 143 * 16,    770206); store64(&bg + 143 * 16 + 8,   2873483);
+    store64(&bg + 144 * 16,    803651); store64(&bg + 144 * 16 + 8,   2789850);
+    store64(&bg + 145 * 16,    839140); store64(&bg + 145 * 16 + 8,   2707062);
+    store64(&bg + 146 * 16,    876649); store64(&bg + 146 * 16 + 8,   2625170);
+    store64(&bg + 147 * 16,    916157); store64(&bg + 147 * 16 + 8,   2544223);
+    store64(&bg + 148 * 16,    957639); store64(&bg + 148 * 16 + 8,   2464270);
+    store64(&bg + 149 * 16,   1001071); store64(&bg + 149 * 16 + 8,   2385360);
+    store64(&bg + 150 * 16,   1046426); store64(&bg + 150 * 16 + 8,   2307539);
+    store64(&bg + 151 * 16,   1093678); store64(&bg + 151 * 16 + 8,   2230854);
+    store64(&bg + 152 * 16,   1142797); store64(&bg + 152 * 16 + 8,   2155352);
+    store64(&bg + 153 * 16,   1193755); store64(&bg + 153 * 16 + 8,   2081079);
+    store64(&bg + 154 * 16,   1246520); store64(&bg + 154 * 16 + 8,   2008078);
+    store64(&bg + 155 * 16,   1301060); store64(&bg + 155 * 16 + 8,   1936394);
+    store64(&bg + 156 * 16,   1357343); store64(&bg + 156 * 16 + 8,   1866070);
+    store64(&bg + 157 * 16,   1415335); store64(&bg + 157 * 16 + 8,   1797149);
+    store64(&bg + 158 * 16,   1475002); store64(&bg + 158 * 16 + 8,   1729672);
+    store64(&bg + 159 * 16,   1536306); store64(&bg + 159 * 16 + 8,   1663679);
+    store64(&bg + 160 * 16,   1599211); store64(&bg + 160 * 16 + 8,   1599211);
+    store64(&bg + 161 * 16,   1663679); store64(&bg + 161 * 16 + 8,   1536306);
+    store64(&bg + 162 * 16,   1729672); store64(&bg + 162 * 16 + 8,   1475002);
+    store64(&bg + 163 * 16,   1797149); store64(&bg + 163 * 16 + 8,   1415335);
+    store64(&bg + 164 * 16,   1866070); store64(&bg + 164 * 16 + 8,   1357343);
+    store64(&bg + 165 * 16,   1936394); store64(&bg + 165 * 16 + 8,   1301060);
+    store64(&bg + 166 * 16,   2008078); store64(&bg + 166 * 16 + 8,   1246520);
+    store64(&bg + 167 * 16,   2081079); store64(&bg + 167 * 16 + 8,   1193755);
+    store64(&bg + 168 * 16,   2155352); store64(&bg + 168 * 16 + 8,   1142797);
+    store64(&bg + 169 * 16,   2230854); store64(&bg + 169 * 16 + 8,   1093678);
+    store64(&bg + 170 * 16,   2307539); store64(&bg + 170 * 16 + 8,   1046426);
+    store64(&bg + 171 * 16,   2385360); store64(&bg + 171 * 16 + 8,   1001071);
+    store64(&bg + 172 * 16,   2464270); store64(&bg + 172 * 16 + 8,    957639);
+    store64(&bg + 173 * 16,   2544223); store64(&bg + 173 * 16 + 8,    916157);
+    store64(&bg + 174 * 16,   2625170); store64(&bg + 174 * 16 + 8,    876649);
+    store64(&bg + 175 * 16,   2707062); store64(&bg + 175 * 16 + 8,    839140);
+    store64(&bg + 176 * 16,   2789850); store64(&bg + 176 * 16 + 8,    803651);
+    store64(&bg + 177 * 16,   2873483); store64(&bg + 177 * 16 + 8,    770206);
+    store64(&bg + 178 * 16,   2957913); store64(&bg + 178 * 16 + 8,    738822);
+    store64(&bg + 179 * 16,   3043087); store64(&bg + 179 * 16 + 8,    709520);
+    store64(&bg + 180 * 16,   3128955); store64(&bg + 180 * 16 + 8,    682318);
+    store64(&bg + 181 * 16,   3215464); store64(&bg + 181 * 16 + 8,    657230);
+    store64(&bg + 182 * 16,   3302563); store64(&bg + 182 * 16 + 8,    634274);
+    store64(&bg + 183 * 16,   3390199); store64(&bg + 183 * 16 + 8,    613462);
+    store64(&bg + 184 * 16,   3478319); store64(&bg + 184 * 16 + 8,    594806);
+    store64(&bg + 185 * 16,   3566871); store64(&bg + 185 * 16 + 8,    578319);
+    store64(&bg + 186 * 16,   3655801); store64(&bg + 186 * 16 + 8,    564010);
+    store64(&bg + 187 * 16,   3745055); store64(&bg + 187 * 16 + 8,    551888);
+    store64(&bg + 188 * 16,   3834580); store64(&bg + 188 * 16 + 8,    541960);
+    store64(&bg + 189 * 16,   3924321); store64(&bg + 189 * 16 + 8,    534232);
+    store64(&bg + 190 * 16,   4014225); store64(&bg + 190 * 16 + 8,    528709);
+    store64(&bg + 191 * 16,   4104237); store64(&bg + 191 * 16 + 8,    525393);
+    store64(&bg + 192 * 16,   4194304); store64(&bg + 192 * 16 + 8,    524288);
+    store64(&bg + 193 * 16,   4284371); store64(&bg + 193 * 16 + 8,    525393);
+    store64(&bg + 194 * 16,   4374383); store64(&bg + 194 * 16 + 8,    528709);
+    store64(&bg + 195 * 16,   4464287); store64(&bg + 195 * 16 + 8,    534232);
+    store64(&bg + 196 * 16,   4554028); store64(&bg + 196 * 16 + 8,    541960);
+    store64(&bg + 197 * 16,   4643553); store64(&bg + 197 * 16 + 8,    551888);
+    store64(&bg + 198 * 16,   4732807); store64(&bg + 198 * 16 + 8,    564010);
+    store64(&bg + 199 * 16,   4821737); store64(&bg + 199 * 16 + 8,    578319);
+    store64(&bg + 200 * 16,   4910289); store64(&bg + 200 * 16 + 8,    594806);
+    store64(&bg + 201 * 16,   4998409); store64(&bg + 201 * 16 + 8,    613462);
+    store64(&bg + 202 * 16,   5086045); store64(&bg + 202 * 16 + 8,    634274);
+    store64(&bg + 203 * 16,   5173144); store64(&bg + 203 * 16 + 8,    657230);
+    store64(&bg + 204 * 16,   5259653); store64(&bg + 204 * 16 + 8,    682318);
+    store64(&bg + 205 * 16,   5345521); store64(&bg + 205 * 16 + 8,    709520);
+    store64(&bg + 206 * 16,   5430695); store64(&bg + 206 * 16 + 8,    738822);
+    store64(&bg + 207 * 16,   5515125); store64(&bg + 207 * 16 + 8,    770206);
+    store64(&bg + 208 * 16,   5598758); store64(&bg + 208 * 16 + 8,    803651);
+    store64(&bg + 209 * 16,   5681546); store64(&bg + 209 * 16 + 8,    839140);
+    store64(&bg + 210 * 16,   5763438); store64(&bg + 210 * 16 + 8,    876649);
+    store64(&bg + 211 * 16,   5844385); store64(&bg + 211 * 16 + 8,    916157);
+    store64(&bg + 212 * 16,   5924338); store64(&bg + 212 * 16 + 8,    957639);
+    store64(&bg + 213 * 16,   6003248); store64(&bg + 213 * 16 + 8,   1001071);
+    store64(&bg + 214 * 16,   6081069); store64(&bg + 214 * 16 + 8,   1046426);
+    store64(&bg + 215 * 16,   6157754); store64(&bg + 215 * 16 + 8,   1093678);
+    store64(&bg + 216 * 16,   6233256); store64(&bg + 216 * 16 + 8,   1142797);
+    store64(&bg + 217 * 16,   6307529); store64(&bg + 217 * 16 + 8,   1193755);
+    store64(&bg + 218 * 16,   6380530); store64(&bg + 218 * 16 + 8,   1246520);
+    store64(&bg + 219 * 16,   6452214); store64(&bg + 219 * 16 + 8,   1301060);
+    store64(&bg + 220 * 16,   6522538); store64(&bg + 220 * 16 + 8,   1357343);
+    store64(&bg + 221 * 16,   6591459); store64(&bg + 221 * 16 + 8,   1415335);
+    store64(&bg + 222 * 16,   6658936); store64(&bg + 222 * 16 + 8,   1475002);
+    store64(&bg + 223 * 16,   6724929); store64(&bg + 223 * 16 + 8,   1536306);
+    store64(&bg + 224 * 16,   6789397); store64(&bg + 224 * 16 + 8,   1599211);
+    store64(&bg + 225 * 16,   6852302); store64(&bg + 225 * 16 + 8,   1663679);
+    store64(&bg + 226 * 16,   6913606); store64(&bg + 226 * 16 + 8,   1729672);
+    store64(&bg + 227 * 16,   6973273); store64(&bg + 227 * 16 + 8,   1797149);
+    store64(&bg + 228 * 16,   7031265); store64(&bg + 228 * 16 + 8,   1866070);
+    store64(&bg + 229 * 16,   7087548); store64(&bg + 229 * 16 + 8,   1936394);
+    store64(&bg + 230 * 16,   7142088); store64(&bg + 230 * 16 + 8,   2008078);
+    store64(&bg + 231 * 16,   7194853); store64(&bg + 231 * 16 + 8,   2081079);
+    store64(&bg + 232 * 16,   7245811); store64(&bg + 232 * 16 + 8,   2155352);
+    store64(&bg + 233 * 16,   7294930); store64(&bg + 233 * 16 + 8,   2230854);
+    store64(&bg + 234 * 16,   7342182); store64(&bg + 234 * 16 + 8,   2307539);
+    store64(&bg + 235 * 16,   7387537); store64(&bg + 235 * 16 + 8,   2385360);
+    store64(&bg + 236 * 16,   7430969); store64(&bg + 236 * 16 + 8,   2464270);
+    store64(&bg + 237 * 16,   7472451); store64(&bg + 237 * 16 + 8,   2544223);
+    store64(&bg + 238 * 16,   7511959); store64(&bg + 238 * 16 + 8,   2625170);
+    store64(&bg + 239 * 16,   7549468); store64(&bg + 239 * 16 + 8,   2707062);
+    store64(&bg + 240 * 16,   7584957); store64(&bg + 240 * 16 + 8,   2789850);
+    store64(&bg + 241 * 16,   7618402); store64(&bg + 241 * 16 + 8,   2873483);
+    store64(&bg + 242 * 16,   7649786); store64(&bg + 242 * 16 + 8,   2957913);
+    store64(&bg + 243 * 16,   7679088); store64(&bg + 243 * 16 + 8,   3043087);
+    store64(&bg + 244 * 16,   7706290); store64(&bg + 244 * 16 + 8,   3128955);
+    store64(&bg + 245 * 16,   7731378); store64(&bg + 245 * 16 + 8,   3215464);
+    store64(&bg + 246 * 16,   7754334); store64(&bg + 246 * 16 + 8,   3302563);
+    store64(&bg + 247 * 16,   7775146); store64(&bg + 247 * 16 + 8,   3390199);
+    store64(&bg + 248 * 16,   7793802); store64(&bg + 248 * 16 + 8,   3478319);
+    store64(&bg + 249 * 16,   7810289); store64(&bg + 249 * 16 + 8,   3566871);
+    store64(&bg + 250 * 16,   7824598); store64(&bg + 250 * 16 + 8,   3655801);
+    store64(&bg + 251 * 16,   7836720); store64(&bg + 251 * 16 + 8,   3745055);
+    store64(&bg + 252 * 16,   7846648); store64(&bg + 252 * 16 + 8,   3834580);
+    store64(&bg + 253 * 16,   7854376); store64(&bg + 253 * 16 + 8,   3924321);
+    store64(&bg + 254 * 16,   7859899); store64(&bg + 254 * 16 + 8,   4014225);
+    store64(&bg + 255 * 16,   7863215); store64(&bg + 255 * 16 + 8,   4104237);
+    bg_ready = 1;
+    return 0;
+}
 fn bench_ngon(ne): i64 {
-    rr_gon_init();
+    bench_gon_init();
     edges_reset();
-    var step = 64 / ne;
+    var step = 256 / ne;
     var k = 0;
     while (k < ne) {
-        var ga = (k * step) % 64;
-        var gb = ((k + 1) * step) % 64;
-        edge_add(load64(&rr_gon + ga * 16), load64(&rr_gon + ga * 16 + 8),
-                 load64(&rr_gon + gb * 16), load64(&rr_gon + gb * 16 + 8));
+        var ga = (k * step) % 256;
+        var gb = ((k + 1) * step) % 256;
+        edge_add(load64(&bg + ga * 16), load64(&bg + ga * 16 + 8),
+                 load64(&bg + gb * 16), load64(&bg + gb * 16 + 8));
         k = k + 1;
     }
     return n_edges;
@@ -629,16 +902,20 @@ fn tri_bench(): i64 {
     # ⭐ THE NUMBER THAT MATTERS is us-per-edge: flat => cost is linear in E and extrapolating to
     # 128/256 is trustworthy; curved => it is not, and those points must be measured directly.
     puts("[edge sweep] 128x128 fixed, n_edges varied -- the term burn 5 never measured");
-    var es[40];
+    # ⚠ 4..256. Points above 64 are REJECTED by a shipped kernel (GPU_EDGE_CAP=64) and reported
+    # as such — they only produce numbers on an EDGE_CAP_PROBE build, which is the whole reason
+    # that build exists. A shipped kernel still yields the 4..64 slope for free.
+    var es[64];
     store64(&es + 0, 4); store64(&es + 8, 8); store64(&es + 16, 16);
     store64(&es + 24, 32); store64(&es + 32, 64);
+    store64(&es + 40, 128); store64(&es + 48, 256);
     var ei2 = 0;
-    while (ei2 < 5) {
+    while (ei2 < 7) {
         var ne2 = load64(&es + ei2 * 8);
         if (rr_set_dims(128, 128) == 1) {
             bench_ngon(ne2);
             var cov2 = bench_covered();
-            var eid2 = syscall(86, 64 * 16);
+            var eid2 = syscall(86, 256 * 16);
             var did2 = syscall(86, 128 * 128);
             if (eid2 >= 1) {
                 if (did2 >= 1) {
@@ -662,7 +939,10 @@ fn tri_bench(): i64 {
                             ps("   ("); pnum((marg * 100) / n_edges); puts(" x0.01us per edge)");
                         }
                     }
-                    if (syscall(92, &bench_recs, 64) != 0) { puts("  ** dispatch refused"); }
+                    if (syscall(92, &bench_recs, 64) != 0) {
+                        ps("  ne "); pnum(n_edges);
+                        puts("  REJECTED by the kernel -- above GPU_EDGE_CAP (expected on a shipped build)");
+                    }
                     syscall(74, did2);
                 }
                 syscall(74, eid2);

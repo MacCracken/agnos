@@ -50,8 +50,13 @@ var RR_MAXX = 512;            # crossing list: 2 per edge worst case, but MAXE b
 
 var W = 64;
 var H = 64;
-var MAXE = 64;
-var ex0[64]; var ey0[64]; var ex1[64]; var ey1[64];
+# ⚠ 256, raised from 64 at the EDGE_CAP probe bite. The corpus needs only 64 (case 20's 64-gon),
+# but `gputri --bench`'s edge sweep must reach the points ABOVE the shipped cap to measure the
+# per-edge cost the cap is supposed to move on. ⛔ This is the ORACLE's capacity, not the ABI's:
+# GPU_EDGE_CAP still ships at 64 and the kernel still rejects more. Raising it here changes no
+# corpus geometry — verified by the 20 digests being byte-identical across the change.
+var MAXE = 256;
+var ex0[256]; var ey0[256]; var ex1[256]; var ey1[256];
 var n_edges = 0;
 # ⚠ 512 slots, NOT 64. See the header. `span_add` indexes this by pixel x up to W.
 var accrow[512];

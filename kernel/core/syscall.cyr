@@ -1029,6 +1029,10 @@ var GPO_E_ALIAS    = 19;             # op    — edge slot and destination mask 
 # "your geometry is out of range" separately from "your mask is out of range", because the fixes
 # are different and rung 9b's whole debugging story is attribution.
 var GPO_E_COORD    = 20;             # op    — an edge endpoint is outside +-2^28 (16.16)
+# ⭐ 1.56.19. Its own code, not a reused GPO_E_EDGEBUF: "too many edges" and "too much total
+# work" are different mistakes with different fixes — halve the mask, or halve the edges — and
+# the caller cannot tell which from a shared code.
+var GPO_E_WORK     = 21;             # op    — w*h*n_edges exceeds the measured watchdog budget
 var GPU_COV_MAX_DIM = 4096;          # per-side mask cap — a REJECT, never a clamp
 # ⭐ THE COORDINATE DOMAIN (B3). 2^28 = 4096 px in 16.16 — the same 4096 as GPU_COV_MAX_DIM, so
 # geometry and mask are bounded consistently.
@@ -1129,6 +1133,11 @@ fn gpo_validate_edge(rec) {
     # PROVEN surface, and it must be enforced where a test can see it. GPU_EDGE_CAP rises at B10
     # from the measured cost curve, never from the arithmetic model.
     if (ne > GPU_EDGE_CAP) { return GPO_E_EDGEBUF; }
+    # ⭐ THE REAL ENVELOPE, MEASURED. Cost is 28.8 us + 0.0005953*(w*h)*ne (probe burn, linear in
+    # E to ~2.6% across 4..256 edges), so the work product is what must be bounded — an edge cap
+    # alone permitted 4096^2 x E=64 at ~639 ms against a ~94 ms watchdog while forbidding
+    # 64^2 x E=256 at ~0.65 ms. See GPU_EDGE_WORK_MAX in gpu.cyr for the derivation.
+    if (w * h * ne > GPU_EDGE_WORK_MAX) { return GPO_E_WORK; }
     if (ne > GPU_EDGE_MAX) { return GPO_E_EDGEBUF; }
 
     # Edge slot (input).
@@ -1206,8 +1215,10 @@ fn gpo_validate_edge(rec) {
 # function was testing a path no caller can take.
 # ⚠ REAL BACKING MEMORY. B3's guard walks the edge array through shm_kva, so the seeded slots
 # can no longer be pure table entries — a null kva would fault the kernel inside the validator.
-# 64 slots x u64 = 512 bytes = 32 edges of 16 B, ample for the 17-edge worst case below.
-var eabi_edges[64];
+# ⚠ 512 slots x u64 = 4096 bytes = 256 edges. Sized from the WORK-BOUND case, not the 17-edge
+# one: the coordinate guard walks `ne` edges out of this buffer, so a 256-edge record read past
+# a 512-byte array and tripped GPO_E_COORD on garbage — a real reject for an unreal reason.
+var eabi_edges[512];
 
 # ⭐ ea_expect_valid — the well-formed record's expectation is ENVIRONMENT-DEPENDENT, and the
 # plan got this wrong. It said to flip the expectation from GPO_E_ARM to 0 in the bite that arms
@@ -1251,7 +1262,7 @@ fn edge_abi_selftest() {
     # Refuse rather than corrupt: if anything already owns these slots, seeding them would clobber a
     # live buffer. Nothing allocates shm this early, so a non-free slot means an ordering change and
     # the selftest must say so instead of proceeding.
-    var g = 11;
+    var g = 10;
     while (g < 16) {
         if (load64(&shm_phys + g * 8) != 0) {
             kprint("edge-abi: REFUSED -- shm slot already in use, cannot seed\n", 58);
@@ -1260,11 +1271,16 @@ fn edge_abi_selftest() {
         g = g + 1;
     }
     # id 12 (idx 11) stays FREE -- the invalid-slot cases point at it.
+    # idx 10 (id 11) -- a LARGE edge slot, 4096 B = 256 edges. Only the work-bound ACCEPT case
+    # uses it: id 14 stays at 256 B so the "edge slot too small" case keeps working, and a single
+    # slot cannot serve both without one of the two tests silently losing its meaning.
+    store64(&shm_phys + 10 * 8, 1); store64(&shm_mc + 10 * 8, 0x4000); store64(&shm_size + 10 * 8, 4096);
+    store64(&shm_kva  + 10 * 8, &eabi_edges);
     store64(&shm_phys + 12 * 8, 1); store64(&shm_mc + 12 * 8, 0);      store64(&shm_size + 12 * 8, 256);
     store64(&shm_phys + 13 * 8, 1); store64(&shm_mc + 13 * 8, 0x1000); store64(&shm_size + 13 * 8, 256);
     store64(&shm_kva  + 13 * 8, &eabi_edges);       # the edge slot needs READABLE bytes now
     var ez = 0;
-    while (ez < 64) { store64(&eabi_edges + ez * 8, 0); ez = ez + 1; }   # 0 is in range
+    while (ez < 512) { store64(&eabi_edges + ez * 8, 0); ez = ez + 1; }  # 0 is in range
     store64(&shm_phys + 14 * 8, 1); store64(&shm_mc + 14 * 8, 0x2000); store64(&shm_size + 14 * 8, 4096);
     store64(&shm_phys + 15 * 8, 1); store64(&shm_mc + 15 * 8, 0x3000); store64(&shm_size + 15 * 8, 16);
 
@@ -1474,21 +1490,48 @@ fn edge_abi_selftest() {
     store32(&d + 36, (1 * 65536) + 3);               # rule = EVENODD, unimplemented
     pass = pass + ea_expect(&d, GPO_E_RULE, "rule EVENODD is refused, not silently failed", 44);
 
-    store32(&d + 36, 65);                            # n_edges over the SHIPPED cap of 64
-    pass = pass + ea_expect(&d, GPO_E_EDGEBUF, "n_edges over the shipped EDGE_CAP", 33);
+    store32(&d + 36, 257);                           # n_edges over the ABI maximum of 256
+    pass = pass + ea_expect(&d, GPO_E_EDGEBUF, "n_edges over the ABI max of 256", 31);
+
+    # ⭐ THE WORK BOUND (1.56.19), measured. 4096x4096 with 64 edges is ~639 ms against a ~94 ms
+    # watchdog — the envelope the old edge-only cap PERMITTED. It must now be refused, and with
+    # its OWN code so "too much total work" is distinguishable from "too many edges".
+    # ⛔ CLEAN THE EDGE ARRAY FIRST. These cases sit BEFORE the B3 block's own
+    # `store32(&eabi_edges + 0, 0)` tidy-up, so offset 0 still holds the -2^28-1 value the last
+    # out-of-domain reject wrote. The coordinate guard then correctly returned GPO_E_COORD and
+    # the work-bound ACCEPT case looked like a work-bound failure. The guard was right; the
+    # fixture was dirty — a test that inherits state from the test before it is not a test.
+    store32(&eabi_edges + 0, 0);
+    var wz = 0;
+    while (wz < 16) { store32(&d + wz * 4, 0); wz = wz + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15); store32(&d + 12, 14);
+    store32(&d + 16, (4096 * 65536) + 4096);
+    store32(&d + 36, 64);
+    pass = pass + ea_expect(&d, GPO_E_WORK, "4096x4096 x 64 edges exceeds the work budget", 44);
+
+    # ⛔ AND THE ENVELOPES THAT MUST STILL BE ACCEPTED. A bound that only ever rejects is a bound
+    # nobody can use: 64 edges on a 128x128 mask was MEASURED at 655 us and must pass.
+    # ⭐ 64x64 x 256 edges is EXACTLY the envelope the old edge-only cap wrongly FORBADE, at a
+    # modelled ~0.65 ms. Asserting it is ACCEPTED is what proves the new bound fixed the right
+    # thing, rather than merely tightening a different one.
+    store32(&d + 12, 14);                            # 256 B edge slot -- exactly 16 edges
+    store32(&d + 16, (64 * 65536) + 64);             # 4096 B mask -- fits the seeded dst slot
+    store32(&d + 36, 16);
+    pass = pass + ea_expect_valid(&d, "64x64 x 16 edges is INSIDE the budget", 37);
 
     store32(&eabi_edges + 0, 0);                    # leave the array clean
 
     # Restore. A selftest that leaves the shm table dirty would hand the next allocation a slot that
     # LOOKS taken, and the symptom would surface far from here as "shm_create returns -1 under load".
-    var r = 11;
+    var r = 10;
     while (r < 16) {
         store64(&shm_phys + r * 8, 0); store64(&shm_mc + r * 8, 0); store64(&shm_size + r * 8, 0);
         store64(&shm_kva + r * 8, 0);
         r = r + 1;
     }
-    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 22 cases correct\n", 21);
-    if (pass == 22) {
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 24 cases correct\n", 21);
+    if (pass == 24) {
         kprint("edge-abi: PASS -- the op 0x08 ABI rejects every malformed record, and a\n", 72);
         kprint("edge-abi: well-formed one is either accepted or correctly reports no-GPU.\n", 74);
         return 1;

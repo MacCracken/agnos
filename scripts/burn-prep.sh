@@ -180,6 +180,20 @@ elif [ -n "${BURN_EDGE_PROBE:-}" ]; then
     # CHECK THAT LINE IN THE LOG BEFORE TRUSTING ANY ABOVE-CAP NUMBER.
     #
     # Run: gputri --cov (must still be 20/20) THEN gputri --bench THEN klug > /cap.txt
+    # WHAT THIS BURN MUST PRODUCE: the us-per-edge column of the edge sweep, at ne = 4, 8, 16,
+    # 32, 64, 128, 256 on a fixed 128x128 mask. That is the term burn 5 never measured — it swept
+    # mask size at a CONSTANT 3-edge triangle, so it produced zero edge-count data.
+    #
+    # ⭐ THE QUESTION: is us-per-edge FLAT?
+    #   FLAT   => cost is linear in E, the work-product model (~28 us + ~0.00045 us/px/edge)
+    #             holds, and EDGE_CAP can be replaced by a w*h*n_edges bound derived from it.
+    #   CURVED => it does not hold, and the bound must be fitted to these points directly.
+    # Either answer moves the cap on MEASUREMENT. Neither is a failure.
+    #
+    # ⛔ AND WATCH THE WATCHDOG. Extrapolation puts 4096^2 x E=64 at ~480 ms against a 100 ms
+    # dispatch timeout. Nothing in this sweep goes near that (128x128 x E=256 extrapolates to
+    # ~1.9 ms), but a GPO_E_DISPATCH at the high end IS the watchdog talking and is itself a
+    # datum — record it rather than retrying.
     echo "[2/2] Building the EDGE-CAP PROBE kernel (GPU_EDGE_CAP=256; MEASUREMENT ONLY)."
     echo "      ⚠ VERIFY 'gpu: edge rasteriser cap 256 edges' in the boot log."
     BUILD_ENV="EDGE_CAP_PROBE=1"
