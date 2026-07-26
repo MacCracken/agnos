@@ -2147,6 +2147,77 @@ ext2_multichunk_selftest();
 # scratch buffer, writes it to ext2 as /prog, then `run /prog` — exercising
 # elf_load_from_file (streaming load) + exec_and_wait end-to-end. Gated by
 # exec-smoke.sh on the "EXEC-DISK-OK" marker + "run: exit 42".
+#ifdef DE_SELFTEST
+# ============================================================================================
+# 1.56.18 — #DE (DIVIDE ERROR) FROM RING 3 MUST KILL THE PROC, NOT THE MACHINE
+# ============================================================================================
+# ⭐ FOUND BY A BURN, NOT BY REVIEW. On the rung-10 flash (2026-07-25) `/bin/gputri --bench`
+# computed `(gpu * 100) / cpu` with a cpu timing of 0. The box FROZE mid-line — no fault
+# message, no CMOS stamp, no prompt. Cause: vector 0 was in idt.cyr's "deliberately NOT
+# installed" list, so the bare-iretq default returned straight to the faulting `idiv`, which
+# divided by zero again, forever.
+#
+# ⛔ A userland arithmetic mistake must never be able to halt the kernel. This selftest builds a
+# ring-3 ELF whose entire body is `xor ecx,ecx ; div ecx` and runs it. PASS = the fault is
+# reported, the proc dies, and BOOT CONTINUES to the shell. A regression here is a hang, which
+# is exactly why it is a compile-gated QEMU test and not something anyone checks by hand.
+fn de_selftest() {
+    if (ext2_active == 0) { return 0; }
+    syscall_init();
+    var eb = &vfs_scratch_buf;
+    var ez = 0;
+    while (ez < 256) { store8(eb + ez, 0); ez = ez + 1; }
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
+    store8(eb + 16, 2);
+    store8(eb + 18, 0x3E);
+    store8(eb + 20, 1);
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64);
+    store8(eb + 52, 64);
+    store8(eb + 54, 56);
+    store8(eb + 56, 1);
+    store8(eb + 64, 1);
+    store8(eb + 68, 5);
+    store8(eb + 82, 0x40);
+    store8(eb + 90, 0x40);
+    store8(eb + 96, 130);
+    store8(eb + 104, 130);
+    store8(eb + 113, 0x10);
+    # Code @120: divide by zero, then spin if it somehow returns.
+    var c = 120;
+    store8(eb + c, 0x31); store8(eb + c + 1, 0xC0); c = c + 2;   # xor eax,eax
+    store8(eb + c, 0x31); store8(eb + c + 1, 0xD2); c = c + 2;   # xor edx,edx
+    store8(eb + c, 0x31); store8(eb + c + 1, 0xC9); c = c + 2;   # xor ecx,ecx
+    store8(eb + c, 0xF7); store8(eb + c + 1, 0xF1); c = c + 2;   # div ecx  -> #DE
+    store8(eb + c, 0xEB); store8(eb + c + 1, 0xFE);              # jmp $ (must never be reached)
+    ext2_mkdir(2, "bin", 3);
+    var bino = ext2_path_lookup("/bin", 4);
+    var dz = 0;
+    if (bino > 0) { dz = ext2_create(bino, "divz", 4); }
+    if (dz > 0) { ext2_write_at(dz, 0, eb, 130); }
+    ext2_sync();
+
+    kprintln("de: ring-3 divide by zero -- the proc must die, the kernel must NOT", 67);
+    var pc0 = proc_count;
+    sh_exec("run /bin/divz", 13);
+    # ⭐ REACHING THIS LINE AT ALL IS THE RESULT. Before vector 0 was installed, control never
+    # came back: the CPU looped on the faulting instruction with interrupts enabled.
+    kprintln("de: SURVIVED -- the kernel is still running after a ring-3 #DE", 62);
+    if (proc_count == pc0) {
+        kprintln("de: PASS proc slot reclaimed, no leak", 37);
+    }
+    if (proc_count != pc0) {
+        kprintln("de: WARN proc slot NOT reclaimed", 32);
+    }
+    return 0;
+}
+# ⚠ THE CALL IS NOT HERE. It sits next to exec_disk_selftest()'s call site ~450 lines below,
+# because at THIS point in boot `ext2_active` is still 0 and the selftest returns silently —
+# the string would be in the binary and the code would never run. That is exactly the
+# "string present is not code called" trap, and the first run of scripts/de-smoke.sh caught it.
+#endif
+
 #ifdef EXEC_SELFTEST
 # 1.40.5: the exec selftest is a real FUNCTION (not inline main-body code), so
 # exec_and_wait returns into a normal stack frame and multiple sequential runs
@@ -2596,6 +2667,11 @@ fn exec_disk_selftest() {
     return 0;
 }
 exec_disk_selftest();
+#endif
+#ifdef DE_SELFTEST
+# ⭐ Runs HERE, alongside the exec selftest, because both need a mounted ext2 and a working
+# exec path. A ring-3 divide by zero must kill the proc and let boot continue.
+de_selftest();
 #endif
 
 #ifdef SYMLINK_SELFTEST

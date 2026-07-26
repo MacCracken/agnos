@@ -72,7 +72,23 @@ fn idt_init() {
 #   12 #SS  stack-segment fault (bad SS / RSP)
 #   13 #GP  general protection (bad CS/SS descriptor type at iretq/sysret)
 #   14 #PF  page fault (unmapped entry/stack VA — CR2 holds the address)
-# Deliberately NOT installed: 0-5,7,9,15-31 stay at the bare-iretq default.
+# Deliberately NOT installed: 1-5,7,9,15-31 stay at the bare-iretq default.
+#
+# ⭐⭐ VECTOR 0 (#DE, DIVIDE ERROR) WAS IN THAT LIST UNTIL 1.56.18, AND IT HARD-LOCKED THE BOX.
+# The bare default `iretq`s straight back to the faulting `idiv`, which divides by zero again:
+# an infinite exception loop with interrupts still enabled. **Any ring-3 program that divides by
+# zero froze agnos** — no fault message, no CMOS stamp, no shell, nothing to bisect from. It
+# took a hard power cycle.
+#
+# Found on the rung-10 burn (2026-07-25): `gputri --bench` computed `(gpu * 100) / cpu` with a
+# cpu timing of 0 and the machine stopped mid-line. The tool's own bug is fixed separately, but
+# ⛔ THE KERNEL BUG IS THE SERIOUS ONE — a userland arithmetic mistake must kill the PROCESS,
+# never the machine, and every other OS treats #DE exactly that way.
+#
+# ⚠ The "installing ALL 32 halts boot" caveat below is real but does NOT apply to #DE: nothing
+# legitimately divides by zero at boot, unlike #NM/7 (fires on first SSE use) or the reserved
+# and NMI slots. So vector 0 joins the CURATED set, and joins the {6,13,14} ring3-kill set so a
+# faulting proc dies and agnsh returns — the same routing #UD/#GP/#PF already had.
 # Installing ALL 32 halts normal boot because a benign vector (e.g. #NM/7 from
 # SSE use, or a reserved/NMI slot) legitimately fires early; this curated set
 # never does. Timer (32) + keyboard (33) gates are installed later in main.
@@ -88,7 +104,7 @@ var exc_ring3_kill_fn = 0;
 
 fn exc_handlers_init() {
     var base = &exc_stub;
-    var nvec = 8;   # 1.53.x B3: +v=19 (#XM, SSE numeric exception) — was 7
+    var nvec = 9;   # 1.56.18: +v=0 (#DE) — was 8; 1.53.x B3 added v=19 (#XM)
     var off = 0;
     for (var k = 0; k < nvec; k = k + 1) {
         var v = 6;
@@ -98,6 +114,7 @@ fn exc_handlers_init() {
         if (k == 4) { v = 12; }
         if (k == 5) { v = 13; }
         if (k == 6) { v = 14; }
+        if (k == 8) { v = 0; }    # ⭐ 1.56.18: #DE. No error code, so it takes csoff = 8 like #UD.
         if (k == 7) { v = 19; }   # 1.53.x B3: #XM (SSE numeric exception). B1 set CR4.OSXMMEXCPT
         # but left vector 19 on the bare-iretq default (silently swallowed
         # a real SSE fault); now it takes the CMOS-stamp + canary + halt like
@@ -463,9 +480,13 @@ fn exc_handlers_init() {
         # scheduler instead of halting), so the canary+halt below is now reached ONLY by a
         # CPL0 (kernel) fault — exactly its intent. Emitted at the current `tail`, then
         # `tail += 34` so the canary block + `off` below shift past it unchanged.
-        if (v == 6 || v == 13 || v == 14) {
+        # ⭐ 1.56.18: #DE (v == 0) joins the ring3-kill set. A ring-3 divide by zero now kills
+        # the PROCESS and returns to the agnsh prompt, where before it froze the machine in an
+        # infinite #DE loop (the bare-iretq default retries the faulting idiv forever).
+        if (v == 0 || v == 6 || v == 13 || v == 14) {
             var csoff = 16;                 # #GP/#PF push an errcode → saved CS at [rsp+16]
             if (v == 6) { csoff = 8; }      # #UD: no errcode → saved CS at [rsp+8]
+            if (v == 0) { csoff = 8; }      # #DE: no errcode either → saved CS at [rsp+8]
             var fk = &exc_ring3_kill_fn;    # indirect hook (resolved in core/main.cyr; see above)
             # mov rax,[rsp+csoff]           48 8B 44 24 <csoff>
             store8(stub + tail + 0, 0x48); store8(stub + tail + 1, 0x8B);

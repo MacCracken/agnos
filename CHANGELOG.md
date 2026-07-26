@@ -5,6 +5,71 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.56.18] - 2026-07-25
 
+### ⭐⭐ Fixed — A RING-3 DIVIDE BY ZERO HARD-LOCKED THE KERNEL. #DE was never installed.
+
+**Any userland program that divided by zero froze agnos.** No fault message, no CMOS stamp, no
+prompt — a hard power cycle. `kernel/arch/x86_64/idt.cyr` listed vector 0 among *"deliberately
+NOT installed: 0-5, 7, 9, 15-31"*, so the bare-`iretq` default returned straight to the faulting
+`idiv`, which divided by zero again, forever, with interrupts still enabled.
+
+⭐ **Found by a burn, not by review.** The rung-10 flash ran `/bin/gputri --bench`, which computed
+`(gpu * 100) / cpu` with a cpu timing of `0`. The machine stopped mid-line. The tool's own bug is
+fixed below, but ⛔ **the kernel bug is the serious one** — a userland arithmetic mistake must kill
+the *process*, never the machine, and every other OS treats `#DE` exactly that way.
+
+Vector 0 now joins the curated installed set **and** the `{6,13,14}` ring-3 kill set, so a faulting
+proc dies and `agnsh` returns — the same routing `#UD`/`#GP`/`#PF` already had. `#DE` pushes no
+error code, so it takes `csoff = 8` like `#UD`.
+
+⚠ The *"installing all 32 halts boot"* caveat in that file is real but does **not** apply here:
+nothing legitimately divides by zero at boot, unlike `#NM`/7 (fires on first SSE use) or the
+reserved/NMI slots.
+
+### Added — `scripts/de-smoke.sh`: an automated QEMU gate for it
+
+A `DE_SELFTEST` hook builds a ring-3 ELF whose whole body is `xor ecx,ecx ; div ecx`, execs it, and
+asserts the kernel survives. **3/3.** `run: exit 128`, proc slot reclaimed, boot reaches a prompt.
+
+**Mutation-calibrated: putting vector 0 back on the bare default reproduces the freeze exactly** —
+the hook prints its opening line and then nothing, and boot never reaches a prompt. That is what
+the operator saw on iron.
+
+⚠ **Two process failures worth recording, both caught by the smoke's own gates:**
+1. The hook was first called ~450 lines too early in boot, where `ext2_active` is still 0, so it
+   returned silently. Its strings were in the binary and the code never ran — *string present is
+   not code called*, again. [[feedback_ifdef_bites_name_their_build_flags]]
+2. The harness was first cloned from an **ESP-only** QEMU image, which has no ext2 for the hook's
+   `/bin/divz` to live on. Rebuilt on `ark-run-smoke`'s ext2 image builder.
+
+### Fixed — `gputri --bench` invented a number instead of refusing, and that is what hung the box
+
+The adaptive timing loop bailed out by **assigning** `el = BENCH_TARGET_MS` — a fabricated value —
+then divided it by a `reps` that had already been quadrupled. At 32×32 that produced
+`200000 / 262144` = **0 µs**, and the caller's `(gpu * 100) / cpu` then divided by zero.
+
+⚠ **The clock was never the problem.** `uptime_ms`#40 advances fine. The fault was a measurement
+routine whose failure mode was to produce a *plausible number* rather than admit it could not
+measure — in the one tool whose entire job is to produce a number that decides whether rungs 11–12
+open. Rules it now obeys, and every future bench arm should:
+
+1. The returned figure comes from the **same iteration** that met the target — never a forced
+   value, never a different rep count.
+2. Exhausting the cap returns a **negative sentinel** the caller must handle, not something that
+   looks like a timing.
+3. `bench_reps` / `bench_ms` carry the **raw evidence** so the operator sees what was measured,
+   not only what was derived.
+4. **Every division is guarded**; four explicit `NO VERDICT` paths replace the one that faulted.
+5. A **clock-sanity check runs first** — if `uptime_ms` does not advance, the tool refuses instead
+   of printing zeros.
+6. The CPU half now runs **without a GPU**, so the harness that hung real hardware is exercisable
+   in QEMU.
+
+### Rung 9b — re-confirmed on 1.56.18
+
+`gputri --cov`: **20 of 20 byte-identical, all controls fired, exit 95.**
+
+
+
 **Rung 10 — the kill gate (open cycle).** 1.56.17 closed with rung 9b complete and iron-validated:
 `gputri --cov` **20 of 20 byte-identical**, agnos's first GPU triangle rasteriser. This cycle fires
 rung 10, which is a **pre-registered KILL GATE** — it can retire the tier-1 coverage justification
