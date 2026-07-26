@@ -1,8 +1,9 @@
 # kernel/version.cyr — AUTO-GENERATED from `VERSION` by
 # `scripts/version-bump.sh`. Do NOT edit by hand; the next bump
-# will overwrite. To regenerate without bumping, run:
+# will overwrite. To regenerate without bumping, run either of:
 #
 #   sh scripts/version-bump.sh "$(cat VERSION)"
+#   sh scripts/version-bump.sh --regen
 #
 # Why this file exists: pre-v1.30.2, each boot banner had its own
 # hardcoded `"AGNOS … vX.Y.Z …"` literal + a hardcoded byte length
@@ -45,10 +46,10 @@ fn print_agnos_shell_banner() {
 # from the kernel program body — unlike the _AGNOS_VERSION gvar below. Callers
 # strlen() the result. Used by e.g. the TCP_LISTEN_SMOKE HTTP banner.
 fn agnos_version_str() {
-    return "1.56.17";
+    return "1.56.19";
 }
 
 # Bare version string — safe to use from any consumer that runs AFTER
 # gvar init has completed (kybernet, userspace, etc.). NOT safe to use
 # from the kernel program body (same kmode init-order constraint above).
-var _AGNOS_VERSION = "1.56.17";
+var _AGNOS_VERSION = "1.56.19";

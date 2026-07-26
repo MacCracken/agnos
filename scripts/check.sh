@@ -89,8 +89,35 @@ echo ""
 echo "--- Version Consistency ---"
 VERSION=$(cat "$ROOT/VERSION" | tr -d '[:space:]')
 echo "  VERSION file: $VERSION"
-grep -q "$VERSION" "$ROOT/kernel/agnos.cyr" 2>/dev/null
+# Version drift in the kernel. Pre-2026-07-26 this gate grepped kernel/agnos.cyr
+# alone — a COMMENT on line 1 — and never read kernel/version.cyr, where every
+# string the running kernel actually emits lives. So the two non-banner sites in
+# that generated file sat at 1.56.17 on a 1.56.19 kernel across two releases with
+# check.sh green, and both are user-visible, not cosmetic: _AGNOS_VERSION fills
+# uname#34's release field (syscall.cyr), so mihi -> iam printed "Kernel: 1.56.17"
+# to every ring-3 reader, and agnos_version_str() feeds the TCP_LISTEN_SMOKE HTTP
+# banner, which served "AGNOS 1.56.17 tcp_listen smoke" over the wire. The banner
+# literals are covered too — the scan asserts EVERY version token on a non-comment
+# line of version.cyr equals VERSION, so a new site added to that file is gated
+# the day it lands rather than the day someone notices. Comment lines are skipped
+# because version.cyr's header legitimately cites historical versions (v1.30.2).
+# Kept as ONE check with a detail dump, matching the arena/arity gates above.
+VDRIFT=""
+grep -q "AGNOS kernel v$VERSION" "$ROOT/kernel/agnos.cyr" 2>/dev/null \
+    || VDRIFT="$VDRIFT    kernel/agnos.cyr: banner comment is not v$VERSION\n"
+VFN=$(sed -n 's/^ *return "\([0-9][^"]*\)";$/\1/p' "$ROOT/kernel/version.cyr" 2>/dev/null)
+[ "$VFN" = "$VERSION" ] \
+    || VDRIFT="$VDRIFT    kernel/version.cyr: agnos_version_str() returns '$VFN' (feeds the tcp_listen HTTP banner)\n"
+VGV=$(sed -n 's/^var _AGNOS_VERSION = "\([^"]*\)";$/\1/p' "$ROOT/kernel/version.cyr" 2>/dev/null)
+[ "$VGV" = "$VERSION" ] \
+    || VDRIFT="$VDRIFT    kernel/version.cyr: _AGNOS_VERSION is '$VGV' (feeds uname#34 release -> iam's Kernel: line)\n"
+for v in $(grep -vE '^[[:space:]]*#' "$ROOT/kernel/version.cyr" 2>/dev/null \
+           | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?' || true); do
+    [ "$v" = "$VERSION" ] || VDRIFT="$VDRIFT    kernel/version.cyr: stale version token $v\n"
+done
+test -z "$VDRIFT"
 check "version in kernel" $?
+[ -z "$VDRIFT" ] || { echo "  VERSION is $VERSION — regenerate with: sh scripts/version-bump.sh --regen"; printf "$VDRIFT"; }
 grep -q "$VERSION" "$ROOT/CHANGELOG.md" 2>/dev/null
 check "version in changelog" $?
 

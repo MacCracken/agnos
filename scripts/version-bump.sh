@@ -6,13 +6,31 @@ set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 if [ -z "$1" ]; then
-    echo "Usage: $0 <version>"
+    echo "Usage: $0 <version>      # bump to <version>"
+    echo "       $0 --regen        # re-derive generated sites from VERSION, no bump"
     echo "Current: $(cat "$ROOT/VERSION")"
     exit 1
 fi
 
-NEW="$1"
 OLD=$(cat "$ROOT/VERSION" | tr -d '[:space:]')
+
+# REGEN mode — re-derive every generated version site from VERSION *without*
+# bumping. `--regen` is shorthand for passing the current version, which is the
+# form kernel/version.cyr's own header documents. Pre-2026-07-26 that documented
+# command hit an `[ "$NEW" = "$OLD" ] && exit 0` guard and did nothing, so a
+# hand-edited or half-generated version.cyr had no supported way back into sync:
+# agnos_version_str() and _AGNOS_VERSION sat at 1.56.17 on a 1.56.19 kernel for
+# two patch releases, and uname#34 handed that stale string to every ring-3
+# reader (mihi -> iam's "Kernel:" line). A no-op bump now regenerates instead of
+# exiting. Release metadata (state.md date stamps, CHANGELOG section) is skipped
+# in REGEN mode — regenerating derived files is not a release event.
+REGEN=0
+if [ "$1" = "--regen" ]; then
+    REGEN=1
+    NEW="$OLD"
+else
+    NEW="$1"
+fi
 
 # Validate semver
 echo "$NEW" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$' || {
@@ -21,11 +39,14 @@ echo "$NEW" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$' || {
 }
 
 if [ "$NEW" = "$OLD" ]; then
-    echo "Already at $OLD"
-    exit 0
+    REGEN=1
 fi
 
-echo "Bumping $OLD -> $NEW"
+if [ "$REGEN" = "1" ]; then
+    echo "Regenerating version sites at $NEW (no bump)"
+else
+    echo "Bumping $OLD -> $NEW"
+fi
 updated=""
 
 # 1. VERSION file (source of truth — cyrius.cyml reads this via ${file:VERSION})
@@ -41,16 +62,23 @@ updated="$updated  VERSION\n"
 #    AND get parsed as ERE alternation operators after delimiter
 #    unescaping (causing every line to match the empty-alternative).
 if [ -f "$ROOT/docs/development/state.md" ]; then
-    TODAY=$(date +%Y-%m-%d)
     sed -i -E "s#^(\\| \\*\\*Kernel\\*\\* \\| )\\*\\*[0-9]+\\.[0-9]+\\.[0-9]+\\*\\*( \\|.*)#\\1**$NEW**\\2#" "$ROOT/docs/development/state.md"
-    sed -i -E "s#^(> \\*\\*Last refresh\\*\\*: )[0-9]{4}-[0-9]{2}-[0-9]{2}#\\1$TODAY#" "$ROOT/docs/development/state.md"
-    sed -i -E "s#^(\\| \\*\\*Released\\*\\* \\| )[0-9]{4}-[0-9]{2}-[0-9]{2}( \\|.*)#\\1$TODAY\\2#" "$ROOT/docs/development/state.md"
+    # Date stamps are release metadata, not version-derived — a REGEN must not
+    # move them (it would date-stamp a release that did not happen).
+    if [ "$REGEN" = "0" ]; then
+        TODAY=$(date +%Y-%m-%d)
+        sed -i -E "s#^(> \\*\\*Last refresh\\*\\*: )[0-9]{4}-[0-9]{2}-[0-9]{2}#\\1$TODAY#" "$ROOT/docs/development/state.md"
+        sed -i -E "s#^(\\| \\*\\*Released\\*\\* \\| )[0-9]{4}-[0-9]{2}-[0-9]{2}( \\|.*)#\\1$TODAY\\2#" "$ROOT/docs/development/state.md"
+    fi
     updated="$updated  docs/development/state.md\n"
 fi
 
-# 3. kernel/agnos.cyr (comment)
+# 3. kernel/agnos.cyr (comment). Matched by PATTERN, not by the literal OLD:
+#    an OLD-anchored sed is a silent no-op the moment the site has drifted to
+#    some third value (or when OLD == NEW in a REGEN), which is exactly the
+#    class of staleness this script is supposed to clear.
 if [ -f "$ROOT/kernel/agnos.cyr" ]; then
-    sed -i "s/AGNOS kernel v$OLD/AGNOS kernel v$NEW/" "$ROOT/kernel/agnos.cyr"
+    sed -i -E "s/AGNOS kernel v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?/AGNOS kernel v$NEW/" "$ROOT/kernel/agnos.cyr"
     updated="$updated  kernel/agnos.cyr\n"
 fi
 
@@ -71,9 +99,10 @@ if [ -f "$ROOT/kernel/version.cyr" ] || [ -f "$ROOT/kernel/agnos.cyr" ]; then
     cat > "$ROOT/kernel/version.cyr" <<EOF
 # kernel/version.cyr — AUTO-GENERATED from \`VERSION\` by
 # \`scripts/version-bump.sh\`. Do NOT edit by hand; the next bump
-# will overwrite. To regenerate without bumping, run:
+# will overwrite. To regenerate without bumping, run either of:
 #
 #   sh scripts/version-bump.sh "\$(cat VERSION)"
+#   sh scripts/version-bump.sh --regen
 #
 # Why this file exists: pre-v1.30.2, each boot banner had its own
 # hardcoded \`"AGNOS … vX.Y.Z …"\` literal + a hardcoded byte length
@@ -127,8 +156,10 @@ EOF
     updated="$updated  kernel/version.cyr (regenerated)\n"
 fi
 
-# 7. CHANGELOG.md — add new version section after [Unreleased]
-if [ -f "$ROOT/CHANGELOG.md" ]; then
+# 7. CHANGELOG.md — add new version section after [Unreleased]. Skipped in
+#    REGEN mode: opening a dated release section is a release act, and a
+#    regeneration must not manufacture one.
+if [ "$REGEN" = "0" ] && [ -f "$ROOT/CHANGELOG.md" ]; then
     if ! grep -q "## \[$NEW\]" "$ROOT/CHANGELOG.md"; then
         sed -i "/## \[Unreleased\]/a\\
 \\
@@ -155,14 +186,31 @@ echo ""
 echo "Updated:"
 printf "$updated"
 
-# Verify — check for any remaining OLD version references (excluding CHANGELOG history)
+# Verify — assert every version token in the source files now EQUALS NEW.
+# Pre-2026-07-26 this searched for the immediately-preceding OLD only, so a
+# residual from any earlier version passed clean: version.cyr's two non-banner
+# sites sat at 1.56.17 while OLD was 1.56.18, and the check reported "no stale
+# references". Grepping for what should be gone can only catch one value;
+# asserting what should be there catches all of them. (It also has to work when
+# OLD == NEW in a REGEN, where the old form flagged every correct line.)
+# kernel/version.cyr's header comment cites historical versions (v1.30.2), so
+# only non-comment lines are scanned there.
 echo ""
-STALE=$(grep -rn "$OLD" "$ROOT/VERSION" "$ROOT/kernel/agnos.cyr" "$ROOT/kernel/version.cyr" 2>/dev/null || true)
+SEMVER='[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?'
+STALE=""
+CUR=$(tr -d '[:space:]' < "$ROOT/VERSION")
+[ "$CUR" = "$NEW" ] || STALE="$STALE  VERSION: $CUR\n"
+for v in $(grep -oE "AGNOS kernel v$SEMVER" "$ROOT/kernel/agnos.cyr" 2>/dev/null | sed 's/.*v//' || true); do
+    [ "$v" = "$NEW" ] || STALE="$STALE  kernel/agnos.cyr: $v\n"
+done
+for v in $(grep -vE '^[[:space:]]*#' "$ROOT/kernel/version.cyr" 2>/dev/null | grep -oE "$SEMVER" || true); do
+    [ "$v" = "$NEW" ] || STALE="$STALE  kernel/version.cyr: $v\n"
+done
 if [ -n "$STALE" ]; then
-    echo "WARNING: stale $OLD references found:"
-    echo "$STALE"
+    echo "WARNING: version sites not at $NEW:"
+    printf "$STALE"
 else
-    echo "Verified: no stale $OLD references in source files"
+    echo "Verified: every version site reads $NEW"
 fi
 
 echo ""

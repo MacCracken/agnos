@@ -15,7 +15,7 @@
   some point and that sed did nothing for months; restored 2026-07-14.)
 -->
 
-> **Current**: v1.56.5 — live state (kernel head, cyrius pin, active burn, sweeps, sizes) lives in [`state.md`](state.md).
+> **Current**: v1.56.19 — live state (kernel head, cyrius pin, active burn, sweeps, sizes) lives in [`state.md`](state.md).
 
 > **This file is forward-facing.** Completed arcs are not re-narrated here — each gets one line in the
 > [Completed arcs ledger](#completed-arcs-ledger), and the history is the CHANGELOG's job. Per-arc reasoning
@@ -491,7 +491,7 @@ support a claim the previous version of this file made.
 
 ---
 
-*Built with cyrius 6.4.2 · The `VERSION` file is the single source of truth for the kernel version; this
+*Built with cyrius 6.4.78 · The `VERSION` file is the single source of truth for the kernel version; this
 file's Current line is maintained by `scripts/version-bump.sh`. Sweep this file at each arc close: collapse
 the closed arc to one ledger row, delete its forward-facing prose, and let the CHANGELOG carry the history.
 Per-cut prose does not belong in this file — that is what made the last one 46,000 tokens.*
