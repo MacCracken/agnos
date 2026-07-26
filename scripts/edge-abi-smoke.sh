@@ -77,10 +77,10 @@ pass=0; fail=0
 chk() { if grep -q "$1" "$LOG"; then echo "PASS: $2"; pass=$((pass+1)); else echo "FAIL: '$1' — $3"; fail=$((fail+1)); fi; }
 nchk() { if grep -q "$1" "$LOG"; then echo "FAIL: '$1' present — $3"; fail=$((fail+1)); else echo "PASS: $2"; pass=$((pass+1)); fi; }
 
-chk "edge-abi: 24 of 24 cases correct" \
+chk "edge-abi: 33 of 33 cases correct" \
     "every one of the 24 ABI cases returned the reason the ABI specifies" \
-    "not 24/24 - read the named FAIL line(s) above; each names its case, want and got"
-chk "edge-abi: PASS -- the op 0x08 ABI rejects every malformed record" \
+    "not 33/33 - read the named FAIL line(s) above; each names its case, want and got"
+chk "edge-abi: PASS -- the 0x08 and 0x09 ABIs reject every malformed record" \
     "the battery's own verdict line is PASS" \
     "verdict line absent or FAIL"
 # THE 9a ORACLE. The single WELL-FORMED record must reach residency and be told NOT YET. If this case

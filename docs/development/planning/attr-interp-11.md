@@ -509,6 +509,17 @@ dword  byte  field
 
 **Per-op flags:** introduce `gpo_flags_known(op)` returning `0x00` for every existing op and `0x01` for `0x09`, so *"a flag that is accepted and ignored"* stays impossible per-op. `GPU_OP_FLAGS_KNOWN` becomes its default.
 
+> ⛔ **CORRECTION, 2026-07-26, from implementing the validator.** `GPU_TRI_AREA_MIN` and
+> `GPU_TRI_AREA_MAX` below are wrong by exactly 2^16, from the same lifted-vertex assumption
+> corrected in §2. Only the constant term and `2A` carry the `<< 16`; `kx`/`ky` already multiply a
+> 16.16 sample point. So `2A = cross << 16`, and:
+> * **`AREA_MIN` is 2^16, not 2^32.** A 0.5 px² frame is `cross = 1`, i.e. `2A = 2^16`. The stated
+>   2^32 demands `cross ≥ 2^16`, an area of 32768 px² — it would have **rejected every triangle
+>   smaller than about 256×256**, which is most of them. The battery carries a 16×16 frame as an
+>   ACCEPT case specifically to pin this.
+> * **`AREA_MAX` is 2^42, not 2^53.** Coordinates cap at ±2^28 in 16.16 (±4096 px), so `cross ≤ 2^26`
+>   and `2A ≤ 2^42`. The stated 2^53 sits above anything constructible and could never have fired.
+
 **New constants and codes:**
 ```
 GPU_TRI_AREA_MIN   = 2^32     frame area >= 0.5 px^2       -> GPO_E_AREA  (22)

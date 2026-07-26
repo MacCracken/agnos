@@ -985,18 +985,51 @@ var GPU_OP_GRAD_LINEAR = 0x04;       # two-stop vertical gradient, NO source buf
 # ⚠ Record layout (dwords): 0 op · 1 flags · 3 edge_id · 4 wh · 5 dstxy · 9 n_edges|rule
 # ⛔ Vertex transform stays on the CPU in ring 3 (TD-4) — the kernel receives SCREEN-SPACE edges.
 var GPU_OP_EDGE_COV    = 0x08;       # edge array -> 8bpp coverage mask                   (3D arc rung 9)
+# ⭐ RUNG 11 (3D arc) — ATTRIBUTE INTERPOLATION. Per-vertex premultiplied RGBA interpolated
+# barycentrically across a frame and src-over'd into the back buffer. Generalises op 0x04's
+# two-stop vertical gradient: that is this op with a degenerate frame and two equal colours.
+# ⚠ The attribute FRAME (3 vertices + 3 colours) is independent of the coverage SHAPE (an edge
+# array). Barycentric interpolation is affine over the whole plane, so the frame need not
+# coincide with the shape — which is what lets a two-triangle quad be ONE record, making a seam
+# structurally unrepresentable rather than merely tested-for.
+# ⚠ Record: 0 op · 1 flags · 2 RESERVED · 3 edge_id · 4 wh · 5 dstxy · 6-11 verts · 12-14 colours
+#           · 15 n_edges|rule
+var GPU_OP_TRI_RGBA    = 0x09;       # barycentric per-vertex RGBA + src-over  (3D arc rung 11)
+var GPU_TRI_FLAG_DERIVE = 0x01;      # synthesise the frame's 3 edges; edge_id and n_edges MUST be 0
+
+# ⛔ THE AREA BOUNDS ARE 2^16 AND 2^42, NOT THE 2^32 / 2^53 THE PLAN SPECIFIED. Both of the plan's
+# numbers assumed the vertices were lifted to 16.16, which would put 2A at cross << 32. They are
+# not: only the CONSTANT term and 2A carry the << 16, because kx/ky already multiply a 16.16
+# sample point. So 2A = cross << 16, and the real range is:
+#   * MIN — a 0.5 px^2 frame is cross = 1, i.e. 2A = 2^16. The plan's 2^32 would have demanded
+#     cross >= 2^16, i.e. an area of 32768 px^2 — REJECTING EVERY TRIANGLE SMALLER THAN ~256x256,
+#     which is most of them.
+#   * MAX — edge coordinates cap at +-2^28 in 16.16 (+-4096 px), so cross <= 2^26 and 2A <= 2^42.
+#     The plan's 2^53 sits above anything constructible and could never have fired.
+var GPU_TRI_AREA_MIN   = 65536;              # 2^16 — frame area >= 0.5 px^2
+var GPU_TRI_AREA_MAX   = 4398046511104;      # 2^42 — the largest area the coordinate bound allows
+var GPU_TRI_E_RATIO    = 1024;               # max |E| / 2A over the mask-rect corners
+var GPU_TRI_MAX_PIXELS = 1048576;            # w*h. ⚠ AN ARENA SIZE WEARING A CONSTANT'S CLOTHES.
+
 var GPU_RULE_NONZERO   = 0;
 var GPU_RULE_EVENODD   = 1;
 var GPU_EDGE_BYTES     = 16;         # one edge = x0,y0,x1,y1 as 4x i32 in 16.16
 var GPU_EDGE_MAX       = 256;        # per-op cap; a reject, never a clamp
 # 0x05 channel swap (plan S4) · 0x06 cov-modulated source · 0x07 packed VOP3P blend ·
 # 0x10-0x17 CP-DMA-domain ops (fill/blit/readback, plan S12) · 0x18-0x1F control (barrier/present).
-var GPU_OP_SUPPORTED   = 0x11F;      # bits 0..4 + bit 8 (EDGE_COV) — MUST equal the set gpo_validate accepts
+var GPU_OP_SUPPORTED   = 0x31F;      # bits 0..4 + 8 (EDGE_COV) + 9 (TRI_RGBA) — MUST equal what gpo_validate accepts
 
 # Flags word (+4). NOTHING is accepted here yet, on purpose: a flag that is accepted and ignored is how
 # a caller silently gets behaviour it did not ask for. bit0 SERIALIZE and bit1 CHECK_PREMUL are reserved
 # for S12, where they will mean something; until then a non-zero flags word is rejected.
 var GPU_OP_FLAGS_KNOWN = 0x00;
+
+# Per-op flag vocabulary. ⛔ A flag accepted by one op must not be silently accepted by another —
+# that is how a caller gets behaviour it did not ask for. Default is "no flags at all".
+fn gpo_flags_known(op) {
+    if (op == GPU_OP_TRI_RGBA) { return GPU_TRI_FLAG_DERIVE; }
+    return GPU_OP_FLAGS_KNOWN;
+}
 
 # --- Failure reasons. The syscall returns 0, or a PACKED negative naming WHICH op failed and why:
 #       e = 0 - rc ;  idx = e >> 8 ;  reason = e & 0xFF
@@ -1033,6 +1066,12 @@ var GPO_E_COORD    = 20;             # op    — an edge endpoint is outside +-2
 # work" are different mistakes with different fixes — halve the mask, or halve the edges — and
 # the caller cannot tell which from a shared code.
 var GPO_E_WORK     = 21;             # op    — w*h*n_edges exceeds the measured watchdog budget
+# ⭐ 1.56.19 rung 11. Two distinct codes because the two failures have different fixes: an AREA
+# reject means the frame is degenerate or absurd (move a vertex); a FRAME reject means the frame is
+# legal but so skewed relative to the mask rect that the numerator would overflow (re-fit the frame
+# to the geometry). A shared code cannot tell the caller which.
+var GPO_E_AREA     = 22;             # op    — frame area outside [GPU_TRI_AREA_MIN, _MAX]
+var GPO_E_FRAME    = 23;             # op    — frame skew vs the mask rect exceeds GPU_TRI_E_RATIO
 var GPU_COV_MAX_DIM = 4096;          # per-side mask cap — a REJECT, never a clamp
 # ⭐ THE COORDINATE DOMAIN (B3). 2^28 = 4096 px in 16.16 — the same 4096 as GPU_COV_MAX_DIM, so
 # geometry and mask are bounded consistently.
@@ -1063,6 +1102,12 @@ fn gpo_field_mask(op) {
     if (op == GPU_OP_BLEND_COV)   { return 0x023B; }   # op flags mask_id wh dstxy color0
     if (op == GPU_OP_GLYPH_1BPP)  { return 0x023B; }   # op flags mask_id wh dstxy color0
     if (op == GPU_OP_GRAD_LINEAR) { return 0x0633; }   # op flags wh dstxy color0 color1
+    # rung 11: op(0) flags(1) edge_id(3) wh(4) dstxy(5) verts(6-11) colours(12-14) n_edges|rule(15)
+    # ⚠ dword 2 stays RESERVED and MUST be zero — the one forward-compat dword, kept so a future
+    # render-target handle is a non-breaking extension by construction rather than by hope.
+    # ⭐ dstxy IS defined here, unlike op 0x08. This op writes the back buffer; 0x08 rasterises into
+    # a mask slot whose origin is (0,0) and therefore refuses dstxy. Consistent, not contradictory.
+    if (op == GPU_OP_TRI_RGBA)    { return 0xFFFB; }   # everything except the reserved dword 2
     # rung 9: op(0) flags(1) dst_id(2) edge_id(3) wh(4) n_edges|rule(9)
     # ⛔ dstxy (dword 5) is NOT defined by this op and must be zero. EDGE_COV does not touch the
     # framebuffer at all -- it rasterises into a mask slot whose origin IS (0,0). Accepting a dstxy
@@ -1093,6 +1138,120 @@ fn gpo_slot_field(op) {
     if (op == GPU_OP_BLEND_RECT) { return 8; }         # src_id
     if (op == GPU_OP_BLEND_COV)  { return 12; }        # mask_id
     if (op == GPU_OP_GLYPH_1BPP) { return 12; }        # mask_id
+    return 0;
+}
+
+
+# gpo_i32(addr) — read a dword and SIGN-EXTEND it to i64.
+# ⛔ load32 ZERO-extends in Cyrius. Reading a negative 16.16 coordinate without this returns a huge
+# positive number, so every "is it in range" test below would pass on exactly the values that are
+# out of range in the negative direction. [[reference_cyrius_shift_right_is_logical]] is the same
+# class of trap one operator over.
+fn gpo_i32(addr) {
+    var v = load32(addr) & 0xFFFFFFFF;
+    if (v >= 2147483648) { v = v - 4294967296; }
+    return v;
+}
+
+# gpo_coord_bad(c) — 1 if a 16.16 coordinate is outside the ABI's +-2^28 window.
+fn gpo_coord_bad(c) {
+    if (c > GPU_EDGE_COORD_MAX) { return 1; }
+    if (c < 0 - GPU_EDGE_COORD_MAX) { return 1; }
+    return 0;
+}
+
+# ============================================================================================
+# gpo_validate_tri(rec, fbw, fbh) -> 0 or a GPO_E_* reason. RUNG 11's validator.
+# ============================================================================================
+# ⚠ PURE READS on the KERNEL-RESIDENT copy. Validating the copy rather than user memory is a
+# security property: ring 3 cannot change a field between the check and the use.
+fn gpo_validate_tri(rec, fbw, fbh) {
+    var flags = load32(rec + 4) & 0xFFFFFFFF;
+    var derive = 0;
+    if ((flags & GPU_TRI_FLAG_DERIVE) != 0) { derive = 1; }
+
+    # Geometry: the mask rect, placed on the back buffer. REJECT, never clip.
+    var wh  = load32(rec + 16) & 0xFFFFFFFF;
+    var dxy = load32(rec + 20) & 0xFFFFFFFF;
+    var w = wh & 0xFFFF;
+    var h = (wh >> 16) & 0xFFFF;
+    if (w < 1) { return GPO_E_DIM; }
+    if (h < 1) { return GPO_E_DIM; }
+    if (w * h > GPU_TRI_MAX_PIXELS) { return GPO_E_WORK; }
+    var dx = dxy & 0xFFFF;
+    var dy = (dxy >> 16) & 0xFFFF;
+    if (dx + w > fbw) { return GPO_E_DIM; }
+    if (dy + h > fbh) { return GPO_E_DIM; }
+
+    # Edge source. With DERIVE the kernel synthesises the frame's three edges, so both the slot id
+    # and the edge count MUST be zero -- a caller supplying either alongside DERIVE is confused
+    # about which one wins, and guessing on their behalf is how silent wrong output happens.
+    var edge_id = load32(rec + 12) & 0xFFFFFFFF;
+    var nr = load32(rec + 60) & 0xFFFFFFFF;
+    var ne = nr & 0xFFFF;
+    var rule = (nr >> 16) & 0xFFFF;
+    if (derive == 1) {
+        if (edge_id != 0) { return GPO_E_EDGEBUF; }
+        if (nr != 0) { return GPO_E_EDGEBUF; }
+    }
+    if (derive == 0) {
+        if (ne < 3) { return GPO_E_EDGEBUF; }
+        if (ne > GPU_EDGE_MAX) { return GPO_E_EDGEBUF; }
+        if (rule != GPU_RULE_NONZERO) {
+            if (rule != GPU_RULE_EVENODD) { return GPO_E_RULE; }
+        }
+        if (w * h * ne > GPU_EDGE_WORK_MAX) { return GPO_E_WORK; }
+    }
+
+    # The attribute frame: three 16.16 screen-space vertices, dwords 6..11.
+    var vx0 = gpo_i32(rec + 24);  var vy0 = gpo_i32(rec + 28);
+    var vx1 = gpo_i32(rec + 32);  var vy1 = gpo_i32(rec + 36);
+    var vx2 = gpo_i32(rec + 40);  var vy2 = gpo_i32(rec + 44);
+    if (gpo_coord_bad(vx0) == 1) { return GPO_E_COORD; }
+    if (gpo_coord_bad(vy0) == 1) { return GPO_E_COORD; }
+    if (gpo_coord_bad(vx1) == 1) { return GPO_E_COORD; }
+    if (gpo_coord_bad(vy1) == 1) { return GPO_E_COORD; }
+    if (gpo_coord_bad(vx2) == 1) { return GPO_E_COORD; }
+    if (gpo_coord_bad(vy2) == 1) { return GPO_E_COORD; }
+
+    # ⚠ VERTICES ARRIVE IN 16.16 BUT THE CROSS PRODUCT IS TAKEN IN PIXELS, then lifted by << 16.
+    # Only the constant term and 2A carry that lift, because kx/ky already multiply a 16.16 sample
+    # point. Cross-multiplying two 16.16 values instead would put 2A at cross << 32 and every area
+    # bound below would be wrong by 2^16 -- which is exactly the error the plan's 2^32 / 2^53
+    # constants encoded.
+    var ax = vx0 >>> 16;  var ay = vy0 >>> 16;
+    var bx = vx1 >>> 16;  var by = vy1 >>> 16;
+    var cx = vx2 >>> 16;  var cy = vy2 >>> 16;
+    var cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    if (cross < 0) { cross = 0 - cross; }
+    var a2 = cross << 16;
+    if (a2 < GPU_TRI_AREA_MIN) { return GPO_E_AREA; }
+    if (a2 > GPU_TRI_AREA_MAX) { return GPO_E_AREA; }
+
+    # ⭐ FRAME SKEW. The numerator is bounded by the largest |E| over the mask rect's corners, and
+    # E leaves [0, 2A] whenever a corner lies outside the frame -- which is legal and common. What
+    # is NOT legal is a frame so small relative to the rect that |E| runs away and the 96-bit
+    # numerator overflows. Bound the ratio rather than clamping E: clamping changes the interpolant
+    # (it breaks gradient reproduction at the far corner) instead of merely bounding it.
+    var lim = a2 * GPU_TRI_E_RATIO;
+    var kxb = cy - ay;  var kyb = ax - cx;  var k0b = (ay * cx - ax * cy) << 16;
+    var kxc = ay - by;  var kyc = bx - ax;  var k0c = (ax * by - ay * bx) << 16;
+    var ci = 0;
+    while (ci < 4) {
+        var qx = dx;  var qy = dy;
+        if (ci == 1) { qx = dx + w - 1; }
+        if (ci == 2) { qy = dy + h - 1; }
+        if (ci == 3) { qx = dx + w - 1; qy = dy + h - 1; }
+        var pcx = (qx << 16) + 32768;
+        var pcy = (qy << 16) + 32768;
+        var eb = kxb * pcx + kyb * pcy + k0b;
+        var ec = kxc * pcx + kyc * pcy + k0c;
+        if (eb < 0) { eb = 0 - eb; }
+        if (ec < 0) { ec = 0 - ec; }
+        if (eb > lim) { return GPO_E_FRAME; }
+        if (ec > lim) { return GPO_E_FRAME; }
+        ci = ci + 1;
+    }
     return 0;
 }
 
@@ -1530,10 +1689,84 @@ fn edge_abi_selftest() {
         store64(&shm_kva + r * 8, 0);
         r = r + 1;
     }
-    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 24 cases correct\n", 21);
-    if (pass == 24) {
-        kprint("edge-abi: PASS -- the op 0x08 ABI rejects every malformed record, and a\n", 72);
-        kprint("edge-abi: well-formed one is either accepted or correctly reports no-GPU.\n", 74);
+
+    # ======================================================================================
+    # op 0x09 TRI_RGBA — rung 11's ABI
+    # ======================================================================================
+    # ⚠ Vertices are 16.16, so a pixel coordinate P is written P * 65536. The frames below are
+    # sized in PIXELS and lifted here, which is the same discipline the validator applies when it
+    # takes the cross product in pixels before lifting 2A.
+    kprint("edge-abi: ---- #92 op 0x09 TRI_RGBA ABI battery ----\n", 53);
+
+    # well-formed, DERIVE (no edge slot at all) -> VALID
+    var t1 = 0; while (t1 < 16) { store32(&d + t1 * 4, 0); t1 = t1 + 1; }
+    store32(&d +  0, GPU_OP_TRI_RGBA);
+    store32(&d +  4, GPU_TRI_FLAG_DERIVE);
+    store32(&d + 16, (64 * 65536) + 64);        # wh = 64x64
+    store32(&d + 20, 0);                        # dstxy = (0,0)
+    store32(&d + 28, 0);       store32(&d + 24, 0);
+    store32(&d + 32, 256 * 65536); store32(&d + 36, 0);
+    store32(&d + 40, 0);       store32(&d + 44, 256 * 65536);
+    store32(&d + 48, 0xFFFF0000); store32(&d + 52, 0xFF00FF00); store32(&d + 56, 0xFF0000FF);
+    pass = pass + ea_expect_valid(&d, "tri: well-formed DERIVE", 23);
+
+    # the RESERVED dword 2 must be zero -- the one forward-compat slot
+    store32(&d +  8, 1);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "tri: reserved dword 2 non-zero", 30);
+    store32(&d +  8, 0);
+
+    # an unknown flag bit -- per-op vocabulary, so bit1 is NOT known to this op
+    store32(&d +  4, GPU_TRI_FLAG_DERIVE | 0x02);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "tri: unknown flag bit", 21);
+    store32(&d +  4, GPU_TRI_FLAG_DERIVE);
+
+    # DERIVE with an edge slot -- ambiguous, so refuse rather than pick a winner
+    store32(&d + 12, 14);
+    pass = pass + ea_expect(&d, GPO_E_EDGEBUF, "tri: DERIVE with an edge slot", 29);
+    store32(&d + 12, 0);
+
+    # ⭐ AREA floor: a degenerate (collinear) frame has zero area
+    store32(&d + 32, 128 * 65536); store32(&d + 36, 128 * 65536);
+    store32(&d + 40, 256 * 65536); store32(&d + 44, 256 * 65536);
+    pass = pass + ea_expect(&d, GPO_E_AREA, "tri: collinear frame (zero area)", 32);
+
+    # a legal SMALL frame -- 16x16 is 128 px^2, far below the plan's 2^32 floor and it must be
+    # ACCEPTED. This case exists because that floor would have rejected most real triangles.
+    store32(&d + 32, 16 * 65536); store32(&d + 36, 0);
+    store32(&d + 40, 0);          store32(&d + 44, 16 * 65536);
+    pass = pass + ea_expect_valid(&d, "tri: small frame is legal", 25);
+
+    # coordinate outside the +-2^28 window
+    store32(&d + 32, 0x20000000);
+    pass = pass + ea_expect(&d, GPO_E_COORD, "tri: vertex beyond +-2^28", 25);
+    store32(&d + 32, 256 * 65536);
+    store32(&d + 40, 0); store32(&d + 44, 256 * 65536);
+
+    # ⭐ FRAME SKEW: a 1 px frame at the origin under a rect placed far away drives |E| past the
+    # ratio bound. ⚠ THE RECT MUST STAY UNDER GPU_TRI_MAX_PIXELS or the pixel cap fires FIRST and
+    # this case tests GPO_E_WORK instead -- which is what a 2048x2048 rect did on the first run.
+    # 512x512 = 262144 is well under 2^20; the skew comes from the DISTANCE, not the size.
+    store32(&d + 16, (512 * 65536) + 512);      # 512x512
+    store32(&d + 20, (900 * 65536) + 1024);     # placed at (1024, 900), far from the frame
+    store32(&d + 32, 1 * 65536); store32(&d + 36, 0);
+    store32(&d + 40, 0);         store32(&d + 44, 1 * 65536);
+    pass = pass + ea_expect(&d, GPO_E_FRAME, "tri: frame skew beyond the ratio", 32);
+    store32(&d + 20, 0);
+
+    # destination off the right edge of the framebuffer -- REJECT, never clip
+    var t9 = 0; while (t9 < 16) { store32(&d + t9 * 4, 0); t9 = t9 + 1; }
+    store32(&d +  0, GPU_OP_TRI_RGBA);
+    store32(&d +  4, GPU_TRI_FLAG_DERIVE);
+    store32(&d + 16, (64 * 65536) + 64);
+    store32(&d + 20, 2540);                     # dx = 2540, +64 > 2560
+    store32(&d + 32, 256 * 65536); store32(&d + 44, 256 * 65536);
+    store32(&d + 48, 0xFFFF0000); store32(&d + 52, 0xFF00FF00); store32(&d + 56, 0xFF0000FF);
+    pass = pass + ea_expect(&d, GPO_E_DIM, "tri: dst runs off the framebuffer", 33);
+
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 33 cases correct\n", 21);
+    if (pass == 33) {
+        kprint("edge-abi: PASS -- the 0x08 and 0x09 ABIs reject every malformed record, and\n", 76);
+        kprint("edge-abi: a well-formed one is accepted or correctly reports no-GPU.\n", 69);
         return 1;
     }
     kprint("edge-abi: FAIL -- see the named case(s) above\n", 46);
@@ -1555,13 +1788,14 @@ fn gpo_validate(rec, fbw, fbh) {
         }
         i = i + 1;
     }
-    if (((load32(rec + 4) & 0xFFFFFFFF) & ~GPU_OP_FLAGS_KNOWN) != 0) { return GPO_E_RESERVED; }
+    if (((load32(rec + 4) & 0xFFFFFFFF) & ~gpo_flags_known(op)) != 0) { return GPO_E_RESERVED; }
     if (op == GPU_OP_NOP) { return 0; }                # no geometry, no slot, no arm
     # EDGE_COV validates on its OWN terms. The generic block below assumes "one source slot sized by
     # w*h, one framebuffer destination at dstxy" -- EDGE_COV has none of those three properties, and
     # running it through anyway would size the edge array by pixel count and bounds-check a mask that
     # never reaches the screen.
     if (op == GPU_OP_EDGE_COV) { return gpo_validate_edge(rec); }
+    if (op == GPU_OP_TRI_RGBA) { return gpo_validate_tri(rec, fbw, fbh); }
 
     var wh  = load32(rec + 16) & 0xFFFFFFFF;
     var dxy = load32(rec + 20) & 0xFFFFFFFF;
