@@ -71,7 +71,24 @@ var gpu_cov_armed     = 0;   # 1 = blend_cov resident in its own arena slot for 
 var gpu_glyph_ok      = 0;   # plan-S9: 1 = 1bpp glyph expansion proven on iron
 var gpu_glyph_armed   = 0;   # 1 = glyph_1bpp resident for #92 op GPU_OP_GLYPH_1BPP
 var gpu_grad_ok       = 0;   # plan-S11: 1 = linear gradient proven on iron
-var GPU_EDGE_CAP      = 64;  # shipped envelope == proven envelope; raised at B10 from measurement
+# ⛔ THE SHIPPED ENVELOPE EQUALS THE PROVEN ENVELOPE, and the cap moves on MEASUREMENT only.
+#
+# ⚠ AND EDGE_CAP ALONE IS THE WRONG KNOB — burn 5's measured curve says so. Cost is
+# ~28 us fixed + ~0.00045 us per pixel per edge, so the constraint is the WORK PRODUCT
+# w*h*n_edges, not the edge count:
+#     4096^2 x E=64  -> ~480 ms  ⛔ blows the 100 ms watchdog, yet EDGE_CAP PERMITS it
+#       64^2 x E=256 -> ~0.5 ms  trivially safe, yet EDGE_CAP FORBIDS it
+# Replacing this with a work-product bound is the right shape, but the per-edge term is
+# EXTRAPOLATED from a fixed 3-edge sweep — `gputri --bench`'s edge sweep measures it, and
+# EDGE_CAP_PROBE raises the cap so a burn can reach the points beyond it.
+#ifdef EDGE_CAP_PROBE
+# ⚠ MEASUREMENT KERNEL ONLY. Never ship this: it permits envelopes the watchdog has not been
+# shown to survive, which is the whole reason the shipped cap is 64.
+var GPU_EDGE_CAP      = 256;
+#endif
+#ifndef EDGE_CAP_PROBE
+var GPU_EDGE_CAP      = 64;
+#endif
 var gpu_edge_armed    = 0;   # 3D rung 9: 1 = edge_cov blob resident (written at 9b; 0 through all of 9a)
 var gpu_grad_armed    = 0;   # 1 = grad_linear resident in its own arena slot for the #92 op path
 var gpu_perm_ok       = 0;   # plan-S4: 1 = v_perm_b32 byte crossbar + channel swap proven on iron
@@ -1436,6 +1453,13 @@ fn gpu_ring_kick() {
         gpu_ring_fetched = 1;
         gpu_ring_wptr = 8;   # canonical ring cursor after the 8-dword NOP kick; C2e appends here
         kprintln("gpu: command ring active", 24);
+        # ⭐ THE EDGE CAP, REPORTED BY THE KERNEL ITSELF. EDGE_CAP_PROBE swaps ONE CONSTANT, so
+        # the probe kernel is byte-identical in size to the shipped one and `strings` cannot tell
+        # them apart — the ATOM_DRY shape exactly. This line is the OBSERVABLE: the kernel states
+        # the cap it is actually running with, so burn-prep and the operator can both check the
+        # flag LANDED rather than assuming it did. An answer, not an echo.
+        kprint("gpu: edge rasteriser cap ", 25); kprint_num(GPU_EDGE_CAP);
+        kprintln(" edges", 6);
         return 1;
     }
     kprintln("gpu: command ring not responding", 32);

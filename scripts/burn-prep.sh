@@ -163,6 +163,27 @@ elif [ -n "${BURN_SHADER_GLYPH:-}" ]; then
     echo "[2/2] Building the plan-S9 SHADER-GLYPH kernel (1bpp glyph expand; capture klug > shader_glyph.txt)."
     BUILD_ENV="SHADER_GLYPH=1"
     BUILD_TAG="SHADER_GLYPH"
+elif [ -n "${BURN_EDGE_PROBE:-}" ]; then
+    # ============================================================================================
+    # 3D ARC — THE EDGE-CAP MEASUREMENT KERNEL. ⚠ NOT A SHIPPING BUILD.
+    # ============================================================================================
+    # ⛔ Raises GPU_EDGE_CAP 64 -> 256 so `gputri --bench` can reach the points ABOVE the shipped
+    # cap. It exists because the cap must move on MEASUREMENT and the cap itself rejects the
+    # measurements. NEVER flash this as a normal kernel: it permits envelopes the 100 ms dispatch
+    # watchdog has NOT been shown to survive — extrapolation puts 4096^2 x E=64 at ~480 ms.
+    #
+    # ⚠ EDGE_CAP_PROBE SWAPS ONE CONSTANT, so this kernel is byte-identical in SIZE to the
+    # shipped one and `strings` cannot distinguish them — the ATOM_DRY shape. The observable is
+    # the boot line the kernel prints about itself:
+    #     gpu: edge rasteriser cap 256 edges      <- probe
+    #     gpu: edge rasteriser cap 64 edges       <- shipped
+    # CHECK THAT LINE IN THE LOG BEFORE TRUSTING ANY ABOVE-CAP NUMBER.
+    #
+    # Run: gputri --cov (must still be 20/20) THEN gputri --bench THEN klug > /cap.txt
+    echo "[2/2] Building the EDGE-CAP PROBE kernel (GPU_EDGE_CAP=256; MEASUREMENT ONLY)."
+    echo "      ⚠ VERIFY 'gpu: edge rasteriser cap 256 edges' in the boot log."
+    BUILD_ENV="EDGE_CAP_PROBE=1"
+    BUILD_TAG="EDGE_CAP_PROBE"
 elif [ -n "${BURN_EDGE_COV:-}" ]; then
     # ============================================================================================
     # 3D ARC RUNG 9b — BURN 1. THE EDGE RASTERISER'S FIRST CONTACT WITH SILICON.

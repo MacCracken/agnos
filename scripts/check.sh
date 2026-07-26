@@ -49,6 +49,10 @@ DUPS=$(grep -oE "_SUBOFF *= *0x[0-9A-Fa-f]+" "$ROOT/kernel/core/gpu_regs.cyr" \
        | awk -F'0x' '{print toupper($2)}' | sort | uniq -d)
 test -z "$DUPS"
 check "gpu arena slots unaliased" $?
+# The Cyrius var X[N] units trap: function-local is N BYTES, module-scope is N x u64. Cost the
+# rung-10 burn its exit code (a 40-byte stack smash that left every printed number correct).
+sh "$ROOT/scripts/check-array-sizing.sh" >/dev/null 2>&1
+check "no function-local array overruns" $?
 [ -z "$DUPS" ] || { echo "  duplicated arena offsets:"; for d in $DUPS; do
     echo "    0x$d:"; grep -nE "_SUBOFF *= *0[xX]0*$d\b" "$ROOT/kernel/core/gpu_regs.cyr" | sed 's/^/      /'; done; }
 

@@ -460,6 +460,25 @@ fn bench_shape(w, h): i64 {
     return n_edges;
 }
 
+# ⭐ AN n-EDGE SHAPE WITH NO NEW MATH. refraster's `rr_gon` holds 64 EXACT 16.16 vertices of a
+# regular 64-gon (precomputed, no runtime trig). Taking every (64/ne)-th vertex gives an exact
+# regular ne-gon for ne in {4,8,16,32,64} — divisors of 64 — so the edge sweep reuses geometry
+# already proven byte-exact by corpus case 20 rather than inventing shapes to measure with.
+fn bench_ngon(ne): i64 {
+    rr_gon_init();
+    edges_reset();
+    var step = 64 / ne;
+    var k = 0;
+    while (k < ne) {
+        var ga = (k * step) % 64;
+        var gb = ((k + 1) * step) % 64;
+        edge_add(load64(&rr_gon + ga * 16), load64(&rr_gon + ga * 16 + 8),
+                 load64(&rr_gon + gb * 16), load64(&rr_gon + gb * 16 + 8));
+        k = k + 1;
+    }
+    return n_edges;
+}
+
 fn bench_covered(): i64 {
     cov_clear(&bench_buf); raster(&bench_buf);
     var lit = 0; var i = 0;
@@ -476,7 +495,13 @@ var bench_refusals = 0;
 # when the first version hung real hardware.
 fn bench_cpu_only(): i64 {
     puts("[cpu-only] the timing harness itself -- runs with no GPU, so it is QEMU-testable");
-    var sizes[8];
+    # ⛔⛔ 48, NOT 6. FUNCTION-LOCAL `var X[N]` IS N **BYTES** IN CYRIUS — module-scope is N x u64.
+    # This was `var sizes[8]` holding six u64s at offsets 0..40: **48 bytes written into 8**, a
+    # 40-byte smash straight over the saved registers and return address. It is what turned a
+    # clean `return 95` into `run: exit 142` on the rung-10 burn — the numbers printed fine
+    # because the corruption only bit on the way OUT.
+    # [[cyrius-var-array-u64-units]] — and scripts/check-array-sizing.sh now gates the class.
+    var sizes[48];
     store64(&sizes + 0, 32);  store64(&sizes + 8, 64);   store64(&sizes + 16, 96);
     store64(&sizes + 24, 128); store64(&sizes + 32, 192); store64(&sizes + 40, 256);
     var i = 0;
@@ -593,6 +618,59 @@ fn tri_bench(): i64 {
     bench_point(256, 256, 16);
     puts("");
 
+    # ============================================================================================
+    # EDGE SWEEP — the points EDGE_CAP must move on, and which burn 5 did not have
+    # ============================================================================================
+    # ⛔ Burn 5 varied MASK SIZE at a fixed 3-edge triangle, so it produced ZERO edge-count
+    # scaling data. Raising EDGE_CAP from it would be raising the cap on the arithmetic model the
+    # cap is explicitly forbidden to move on.
+    #
+    # Fixed 128x128, ne = 4/8/16/32/64 — isolating the edge term, all INSIDE the shipped cap.
+    # ⭐ THE NUMBER THAT MATTERS is us-per-edge: flat => cost is linear in E and extrapolating to
+    # 128/256 is trustworthy; curved => it is not, and those points must be measured directly.
+    puts("[edge sweep] 128x128 fixed, n_edges varied -- the term burn 5 never measured");
+    var es[40];
+    store64(&es + 0, 4); store64(&es + 8, 8); store64(&es + 16, 16);
+    store64(&es + 24, 32); store64(&es + 32, 64);
+    var ei2 = 0;
+    while (ei2 < 5) {
+        var ne2 = load64(&es + ei2 * 8);
+        if (rr_set_dims(128, 128) == 1) {
+            bench_ngon(ne2);
+            var cov2 = bench_covered();
+            var eid2 = syscall(86, 64 * 16);
+            var did2 = syscall(86, 128 * 128);
+            if (eid2 >= 1) {
+                if (did2 >= 1) {
+                    tri_pack_edges();
+                    syscall(72, eid2, &tri_edges, n_edges * 16);
+                    var z2 = 0;
+                    while (z2 < 512) { store64(&bench_recs + z2 * 8, 0); z2 = z2 + 1; }
+                    store32(&bench_recs +  0, 8);
+                    store32(&bench_recs +  8, did2);
+                    store32(&bench_recs + 12, eid2);
+                    store32(&bench_recs + 16, (128 * 65536) + 128);
+                    store32(&bench_recs + 36, n_edges);
+                    if (syscall(92, &bench_recs, 64) == 0) {
+                        var g2 = bench_time_gpu(1);
+                        ps("  ne "); pnum(n_edges); ps("  covered "); pnum(cov2); ps("  gpu ");
+                        if (g2 < 0) { puts("REFUSED -- too fast to time"); }
+                        if (g2 >= 0) {
+                            pnum(g2); ps("us");
+                            var marg = g2 - 28;
+                            if (marg < 0) { marg = 0; }
+                            ps("   ("); pnum((marg * 100) / n_edges); puts(" x0.01us per edge)");
+                        }
+                    }
+                    if (syscall(92, &bench_recs, 64) != 0) { puts("  ** dispatch refused"); }
+                    syscall(74, did2);
+                }
+                syscall(74, eid2);
+            }
+        }
+        ei2 = ei2 + 1;
+    }
+    puts("");
     ps("MEASURED unbatched crossover: ");
     if (bench_cross1 == 0)  { puts("NONE at any size measured"); }
     if (bench_cross1 != 0)  { pnum(bench_cross1); puts(" covered px"); }
@@ -608,7 +686,10 @@ fn tri_bench(): i64 {
     puts("   A crossover ABOVE a real frame's coverage KILLS the tier-1 coverage justification");
     puts("   for rungs 11-12. That is a RESULT, not a failure, and is reported immediately.");
     puts("");
-    puts("⚠ NOT MEASURED: n_edges above the shipped EDGE_CAP of 64, and masks above 256x256.");
+    puts("⚠ STILL NOT MEASURED: n_edges ABOVE the shipped EDGE_CAP of 64. The sweep covers");
+    puts("   4..64 only. If us-per-edge is FLAT across it, cost is linear in E and extrapolating");
+    puts("   to 128/256 holds; a kernel built EDGE_CAP_PROBE=1 measures those points directly.");
+    puts("   ⛔ The cap moves on THOSE numbers, never on an extrapolation.");
     puts("   Raising the cap needs those points and is a separate bite -- the cap must move on");
     puts("   MEASUREMENT, never on the arithmetic model that set it.");
     return 95;

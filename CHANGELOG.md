@@ -3,6 +3,90 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.19] - 2026-07-25
+
+**Post-rung-10 cleanup (open cycle).** 1.56.18 closed with rung 9b iron-validated at 20/20 across
+four flashes and **rung 10's kill gate measured and passed** — crossover 1751 covered px against a
+~12000 pre-registration, so tier-1 is confirmed and rungs 11-12 open. This cycle chases the one
+loose end that burn left: `--bench` exiting 142 where its code path returns 95. Bumped on cycle
+open; the user tags on close.
+
+### ⛔ EDGE_CAP NOT RAISED — burn 5 has no edge-count data, and the cap moves on measurement
+
+**The measured points do not support raising it.** Burn 5 swept **mask size at a fixed 3-edge
+triangle**, so `n_edges` was constant at 3 in every point — **zero edge-count scaling data**.
+Raising the cap from it would be raising it on the arithmetic model the cap is explicitly
+forbidden to move on.
+
+### ⭐⭐ Found — EDGE_CAP alone is the WRONG KNOB, and the measured curve says so
+
+From burn 5's two largest points (least fixed-cost contamination): **~28 µs fixed +
+~0.00045 µs per pixel per edge**. The constraint is therefore the **work product `w·h·n_edges`**,
+not the edge count:
+
+| envelope | extrapolated cost | `EDGE_CAP = 64` says |
+|---|---|---|
+| 4096² × E=64 | **~480 ms** ⛔ blows the 100 ms watchdog | **PERMITTED** |
+| 64² × E=256 | ~0.5 ms, trivially safe | **FORBIDDEN** |
+
+A work-product bound is the right shape. ⚠ But the per-edge term is **extrapolated** from a
+fixed-3-edge sweep, and replacing an ABI bound on an extrapolation is exactly the move this arc
+keeps refusing. So the instrument lands now and the ABI changes when the numbers exist.
+
+### Added — the edge sweep, and `EDGE_CAP_PROBE` to reach past the cap
+
+- **`gputri --bench` edge sweep**: 128×128 fixed, `ne` = 4/8/16/32/64, printing **µs per edge**.
+  Flat ⇒ cost is linear in E and the extrapolation holds; curved ⇒ it does not. All inside the
+  shipped cap, so it needs no probe.
+- ⭐ **The shapes are exact and already proven.** `bench_ngon()` subsamples `refraster`'s
+  precomputed 64-gon vertex table — every 64/ne-th vertex is an exact regular ne-gon — so the
+  sweep reuses geometry corpus case 20 already proved byte-exact, rather than inventing shapes to
+  measure with. No runtime trig.
+- **`EDGE_CAP_PROBE=1`** raises the cap 64 → 256 for a measurement kernel only, with
+  `BURN_EDGE_PROBE` in burn-prep. It exists because the cap must move on measurement and the cap
+  itself rejects the measurements.
+
+### Added — the cap is now SELF-REPORTING, because the probe flag is otherwise invisible
+
+⚠ `EDGE_CAP_PROBE` swaps **one constant**, so the probe kernel is **byte-identical in size** to
+the shipped one and `strings` cannot tell them apart — the `ATOM_DRY` shape that has already cost
+this project two burns. The kernel now states the cap it is actually running with:
+
+```
+gpu: edge rasteriser cap 64 edges      <- shipped
+gpu: edge rasteriser cap 256 edges     <- probe
+```
+
+**An answer, not an echo** — the flag can be checked to have *landed* rather than assumed.
+
+### ⭐⭐ Fixed — `--bench` exit 142 was a 40-BYTE STACK SMASH. Every printed number was correct.
+
+`gputri.cyr`'s `bench_cpu_only()` declared **`var sizes[8]`** and stored six `u64`s into it at
+offsets 0…40. ⛔ **Function-local `var X[N]` in Cyrius allocates N BYTES** — module-scope
+allocates N × u64. So that is **48 bytes written into 8**, a 40-byte overrun straight across the
+saved registers and return address.
+
+⚠ **The scary part is what it did NOT break.** Every measurement the tool printed was correct and
+the whole sweep completed — the corruption only bit on the way *out*, turning a clean `return 95`
+into `run: exit 142`. **A quieter instance of the same bug corrupts a neighbouring buffer instead
+and reads as a hardware fault**, which on this arc would have been chased across burns.
+
+⇒ The rung-10 numbers stand unchanged; only the exit code was ever wrong.
+
+### Added — `scripts/check-array-sizing.sh`, wired into `check.sh` (now 15 gates)
+
+Flags any function-local `var X[N]` with a literal store reaching past N bytes. **Calibrated
+against the real bug**: reverting `sizes[48]` → `sizes[8]` produces
+`LOCAL var sizes[8] = 8 BYTES but a store64 reaches byte 48`.
+
+⚠ **The first version cried wolf and I fixed it before shipping it.** It assumed every store was
+8 bytes and reported **13 false positives** across the kernel — `store8(&candidates + 4, …)` into
+`var candidates[5]` is perfectly correct. It is width-aware now (`store8/16/32/64`). **A gate that
+cries wolf gets muted, which is worse than no gate.**
+
+⚠ Honest limit: only literal offsets are visible to it, so a clean run is not proof of absence —
+but every hit is real.
+
 ## [1.56.18] - 2026-07-25
 
 ### ⭐⭐⭐ RUNG 10 — THE KILL GATE HAS ITS NUMBER, AND IT DOES NOT FIRE
