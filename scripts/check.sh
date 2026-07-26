@@ -66,6 +66,21 @@ check "gpu arena slots unaliased (extent-aware)" $rc
 sh "$ROOT/scripts/check-array-sizing.sh" >/dev/null 2>&1 && rc=0 || rc=$?
 check "no function-local array overruns" $rc
 
+# Shader blobs vs their sources. Each shipped shader is a store32 table in gpu.cyr that is supposed
+# to be exactly what the assembler produced from kernel/shaders/*.s -- and until 1.56.19 nothing
+# enforced it. A hand-edited dword, a paste that dropped one, or a .s edited after the table was
+# generated all ship green and fail on iron with no pointer back to the cause. Calibrated: it agrees
+# with the shipped, iron-proven edge_cov blob, and mutation-tested both ways (a corrupted dword and
+# a deleted one both go red).
+BLOBDRIFT=""
+for sb in edge_setup edge_cov tri_rgba; do
+    sh "$ROOT/scripts/shader-blob.sh" check "$ROOT/kernel/shaders/$sb.s" "$sb" >/tmp/shader-blob-$sb.log 2>&1 \
+        || BLOBDRIFT="$BLOBDRIFT$sb "
+done
+test -z "$BLOBDRIFT" && rc=0 || rc=$?
+check "shader blobs match their .s sources" $rc
+[ -z "$BLOBDRIFT" ] || { for sb in $BLOBDRIFT; do cat /tmp/shader-blob-$sb.log; done; }
+
 # Call arity. cycc WARNS on an argument-count mismatch and builds anyway, so a wrong call ships green.
 # Wired in 2026-07-22 after the 1.56.x audit found gpu_blend_cov_run declared with 12 parameters and
 # called with 11 at BOTH coverage sites — including gpu_cov_surface. (⚠ That worker was described here as

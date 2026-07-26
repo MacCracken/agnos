@@ -589,6 +589,19 @@ reused verbatim: GPO_E_DIM 6, GPO_E_ARM 7, GPO_E_RESERVED 12, GPO_E_EDGEBUF 16, 
 
 ---
 
+> ⚠ **BITE 7 WAS SPLIT, DELIBERATELY AND ON THE RECORD.** It specified the blob authored through
+> `edgeasm` AND byte-diffed against `llvm-mc` in one step. The shader came in at **269 dwords**, and
+> re-emitting 269 instructions by hand through `edgeasm` is a bite-sized task in its own right —
+> folding it in here is exactly the big-bang this plan forbids elsewhere.
+> * **Landed now:** the `.s` source, the assembled blob, `RSRC1`/`RSRC2` harvested from the
+>   descriptor, the generated `tri_rgba_write` table, and `scripts/shader-blob.sh` — which closes
+>   the *"kernel table ≠ assembled source"* gap mechanically. Calibrated on the shipped, iron-proven
+>   `edge_cov` blob (135 dwords match) and mutation-tested both ways (a corrupted dword and a
+>   deleted one both go red). Wired into `check.sh` for all three blobs.
+> * **Deferred to its own bite:** the sovereign `edgeasm` re-emit. ⛔ The tree's standing bar
+>   (`gpu.cyr:2468`) is **two independent assemblers**, and only one has run. **This blob must not
+>   reach a hardware run until that lands**, and the note above `tri_rgba_write` says so at the site.
+
 ### Bite 8 🆓 QEMU — the kernel seam *(governs: Decision 5, Decision 9, Decision 10)*
 **Lands:** the three arena constants of §1.5 with `# EXTENT:` annotations; `GPU_COMPUTE_PGM_RSRC1_TRI` harvested; `tri_rgba_write()` beside `edge_cov_write`; `gpu_tri_arm()` as the 5-gate peer body (`gpu_cov_arm`, `gpu.cyr:2935-2945`) writing the blob then `gpu_mfence()`; the **CPU prologue** of §2.2 inside `gpu_tri_rgba(rec…)`, sharing `recip32` with the host model; `gpu_tri_rgba()` issuing the three dispatches of §1.4; `GPU_SHADER_SLOT_BASE`'s stale *"8 slots"* comment updated.
 ⭐ **The prep-record oracle lands HERE, at zero burns, not on the flash.** The kernel prints its 128-byte record; `/bin/gputri` prints its own host-computed record from the same inputs in the same boot; they are diffed field by field. ⚠ **NOT a kernel read-back of what it just wrote — that is echo, not answer.** Rung 9b spent a whole iron oracle on the equivalent; this design gets it free because the prologue is CPU-side Cyrius.
