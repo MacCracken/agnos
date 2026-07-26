@@ -198,13 +198,6 @@ var hda_force_digi_ord = 0 - 1;
 var hda_mmio_base[2];         # [per-instance] controller MMIO base — steers every hda_read*/write*
 var hda_codec_mask[2];        # [per-instance] STATESTS codec-present bitmask (set by hda_reset, B1)
 
-# rdtsc cycles per microsecond. The TSC is invariant (fixed base rate, not the
-# boost frequency), so this is ~constant per box; 3000 = 3 GHz matches the
-# xhci_port spin baseline (xhci_port.cyr:558). The reset settle budgets below
-# are ~2x the spec floor to absorb per-box TSC-rate variance. QEMU/KVM: rdtsc
-# reads the host TSC.
-var HDA_TSC_MHZ = 3000;
-
 # --- B2 verb-ring state ---
 var hda_corb_phys[2];         # [per-instance] CORB ring phys
 var hda_rirb_phys[2];         # [per-instance] RIRB ring phys
@@ -297,15 +290,146 @@ fn hda_write32(off, val) {
     return 0;
 }
 
+# === CYCLES-PER-MICROSECOND: MEASURED WHEN POSSIBLE, ESTIMATED WHEN NOT =======
+#
+# This was `var HDA_TSC_MHZ = 3000;` — a round 3 GHz, justified in its comment by the TSC being
+# invariant and by xhci_port.cyr:558 already spinning on the same number. The premise was right
+# (invariant TSC = ~constant per box) and the VALUE was never measured. tsc_calibrate() (main.cyr,
+# right after `sti`) times rdtsc against 50 ms of live 100 Hz ticks, and archaemenid reports
+# 3193-3194. So every hda_udelay() was ~6.5% SHORTER than the microseconds it named: the
+# codec-discovery settle asking for 1500 us really waited ~1409 us.
+#
+# So the number is a QUERY, not a constant — the same move gpu.cyr made at 1.56.19, for the same
+# reason. hda_tsc_per_us() returns the calibrated value once one exists and the estimate before
+# that, and the split falls on the `sti` boundary for free.
+#
+# ⚠ FOR HDA, ALMOST EVERYTHING IS ON THE EARLY SIDE, which is the opposite of gpu.cyr's split and
+# the reason the estimate matters more here. hda_probe / hda_reset / hda_codec_probe /
+# hda_codec_enum / hda_codec_route / hda_stream_arm all run at main.cyr:657-701, ~2900 lines
+# before `sti`, so they read tsc_per_us == 0 and take the fallback — correctly, exactly as GPU
+# init does. The post-sti callers are the teardown paths: hda_quiesce_all() from
+# power_quiesce_devices(), and hda_hdmi_feed_stop() from gpu_hdmi_audio_disable(). Those get
+# the measured number.
+#
+# ⚠ THE ESTIMATE IS STILL AN ESTIMATE. It is set to the archaemenid measurement for the same
+# reason gpu.cyr's is — a measured number from the one box we boot on beats a round one — and it
+# only has to be close enough that the reset settles clear their spec floors. At 3194 the 200 us
+# and 1500 us budgets stay ~2x over the 100 us PLL and 521 us codec-discovery floors, which is
+# what those budgets were sized for. QEMU/KVM: rdtsc reads the host TSC, and tsc_calibrate()
+# measures that host TSC the same way, so both branches stay self-consistent under emulation.
+#
+# ⚠ DELIBERATELY A SECOND CONSTANT rather than a reference to gpu.cyr's. hda.cyr is included
+# BEFORE gpu.cyr (agnos.cyr), and an audio driver reaching into the GPU driver for a clock
+# constant would be a layering inversion bought for nothing. They describe the same silicon and
+# should be re-measured together.
+#
+# ⭐ WHY THIS IS SAFE TO CHANGE ON AN IRON-PROVEN TIMING PATH (the closed 1.52.x audio arc): every
+# one of the 14 hda_udelay() call sites is a MULTIPLY into a delay, and nothing in this file
+# DIVIDES by this value — no duration is ever reported from it. A larger cycles-per-us therefore
+# makes every settle longer and every bounded poll loop's total budget longer, never shorter:
+#   * hda_reset 200 us / 1500 us — fixed settle floors; longer clears the spec floor by more.
+#   * hda_reset / hda_ring_init / hda_verb / hda_stream_arm poll loops — fixed iteration counts,
+#     so a longer per-iteration delay widens the timeout window. More patience, never less.
+#   * hda_quiesce / hda_hdmi_feed_stop 2000 us — "let the link go quiet" after clearing SD_RUN;
+#     more quiet time is strictly the safer side of that wait.
+#   * hda_dma_report / hda_stream_arm 2000 us — the two NON-timeout uses, LPIB measurement
+#     windows. A longer window only makes the observed LPIB delta BIGGER, so it can turn a
+#     reported STALLED into running but never the reverse.
+# And no hot path moves at all: neither the 100 Hz refill ISR (hda_stream_service /
+# hda_refill_half) nor the ring-3 snd_* band (#64-69) calls hda_udelay. That asymmetry is what
+# makes this one bite instead of an iron burn.
+var HDA_TSC_PER_US_FALLBACK = 3194;   # pre-calibration estimate ONLY — call hda_tsc_per_us(), never this
+
+fn hda_tsc_per_us() {
+    # tsc_per_us is declared in arch/x86_64/boot_data.cyr (parsed at agnos.cyr:8, long before this
+    # file) and set by tsc_calibrate() in main.cyr right after `sti`. 0 = never calibrated, or
+    # calibration refused the measurement as nonsense.
+    if (tsc_per_us != 0) { return tsc_per_us; }
+    return HDA_TSC_PER_US_FALLBACK;
+}
+
 # hda_udelay(us) — busy-spin >= us microseconds via an rdtsc cycle count
 # (GAP-1: agnos has no udelay/usleep). The xhci_port.cyr:562 idiom. Used for
 # the HDA reset settle floors (PLL 100us, codec-discovery 521us).
 fn hda_udelay(us) {
     var t0 = rdtsc();
-    var target = us * HDA_TSC_MHZ;
+    var target = us * hda_tsc_per_us();
     while ((rdtsc() - t0) < target) { }
     return 0;
 }
+
+#ifdef TSC_SELFTEST
+# hda_tsc_selftest — does the retune actually reach the HDA delay path? The gpu_tsc_selftest twin,
+# arm for arm, and deliberately so: the two accessors are the same shape and a divergence between
+# these two reports localises the bug to whichever file did NOT follow the pattern.
+#
+# ⚠ ARMS A AND C ARE ECHO TESTS and are scored as such: they write a value and read it back through
+# the accessor, which proves the branch selects but proves nothing about the delay it feeds. Arm D
+# is the answer register — it measures a real hda_udelay() against timer_ticks, a clock with no
+# shared mechanism with the TSC at all. ([[feedback_echo_vs_answer_registers]])
+#
+# ⭐ NEEDS NO HDA CONTROLLER. hda_udelay is pure rdtsc spinning — it touches no MMIO and no codec —
+# so all four arms run on a QEMU boot with no `-device intel-hda`, which is exactly what
+# scripts/tsc-smoke.sh boots. A gate that only ran when audio hardware happened to be present
+# would be a gate nobody could trust to have run.
+fn hda_tsc_selftest() {
+    var pass = 0;
+    var save = tsc_per_us;
+
+    # A: the pre-calibration branch — and for HDA this is the branch that carries real boot traffic,
+    # since every bring-up call site runs ~2900 lines before `sti`. Forced, because by here the real
+    # one can never be taken again.
+    tsc_per_us = 0;
+    if (hda_tsc_per_us() == HDA_TSC_PER_US_FALLBACK) { pass = pass + 1; }
+    tsc_per_us = save;
+
+    # B: the fallback is sane. A zero here makes every settle instantaneous — the codec-discovery
+    # wait would return before the codecs have answered and hda_reset would report "codecs=0x0000
+    # (none - timing?)" on working silicon. A garbage-large one turns the hda_verb poll into a hang.
+    # Both failures are silent and one typo away, which is why the bound is asserted and not assumed.
+    if (HDA_TSC_PER_US_FALLBACK > 100) {
+        if (HDA_TSC_PER_US_FALLBACK < 10000) { pass = pass + 1; }
+    }
+
+    # C: the calibrated branch — the point of the retune.
+    #
+    # ⭐ TESTED WITH AN INJECTED SENTINEL, NOT THE LIVE VALUE. Mutation-testing the GPU twin (accessor
+    # forced back to the constant) showed the live-value form only caught it because this box
+    # calibrates to 3193 against a 3194 fallback — a margin of ONE. On a box calibrating to exactly
+    # the fallback, both sides would read the same number and the mutant would pass. A sentinel no
+    # real clock can produce takes the hardware out of the test.
+    tsc_per_us = 4242;
+    if (hda_tsc_per_us() == 4242) { pass = pass + 1; }
+    tsc_per_us = save;
+
+    # D: ⭐ independent oracle. Ask for 50 ms through the same hda_udelay() the reset settles use and
+    # time it on the 100 Hz tick. The band is wide on purpose — this arm is not measuring the clock's
+    # accuracy (tsc_calibrate already did, and 100 Hz cannot resolve 6.5% over 50 ms anyway). It asks
+    # whether a delay built from hda_tsc_per_us() lands in the right ORDER OF MAGNITUDE, which is
+    # what catches a unit slip, a zero, or an accessor returning cycles-per-second.
+    var t0 = timer_ticks;
+    hda_udelay(50000);
+    var dt = timer_ticks - t0;
+    if (dt > 2) {
+        if (dt < 10) { pass = pass + 1; }
+    }
+
+    kprint("hda-tsc: ", 9); kprint_num(pass); kprint("/4 arms; per_us ", 16);
+    kprint_num(hda_tsc_per_us());
+    kprint(" (fallback ", 11); kprint_num(HDA_TSC_PER_US_FALLBACK);
+    kprint("), 50 ms udelay measured ", 25); kprint_num(dt); kprintln(" ticks", 6);
+    # ⛔ A BARE "0 ticks" READS AS "the delay did not happen", and that is the wrong diagnosis: it
+    # means the ORACLE stopped, not the delay. Say so, because the first instinct on seeing this line
+    # will be to go and read hda_udelay, which is the one thing it says nothing about.
+    if (dt == 0) {
+        kprintln("hda-tsc: arm D oracle is FROZEN -- timer_ticks did not advance at all, so this says", 83);
+        kprintln("hda-tsc:   nothing about hda_udelay. Check IF, and check what ran before this point.", 84);
+    }
+    if (pass == 4) { kprintln("hda-tsc: PASS", 13); }
+    if (pass != 4) { kprintln("hda-tsc: FAIL", 13); }
+    return pass;
+}
+#endif
 
 # Find an HD-Audio-class controller (0x04/0x03/0x00) whose PCI index != skip_idx.
 # Instance 0 binds one HDA controller by exact ID; this finds the NEXT same-class

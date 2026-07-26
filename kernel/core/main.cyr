@@ -3612,10 +3612,15 @@ kprintln("Interrupts enabled", 18);
 # time source. HERE there is — the 100 Hz tick is live — so we measure real cycles per
 # microsecond instead of assuming 3.0 GHz on a part that boosts.
 #
-# ⚠ SCOPE, deliberately narrow: this calibrates the clock the NEW syscall reports. It does NOT
-# retune GPU_TSC_PER_US, which the dispatch watchdog uses — perturbing a proven timing path is
-# its own bite with its own burn. The consequence gpu.cyr already documents (its "100 ms"
-# watchdog is really 79-150 ms) stands unchanged until then.
+# ⚠ SCOPE — this note used to read "deliberately narrow: it does NOT retune GPU_TSC_PER_US", and
+# that is no longer true. What this function measures is now THE cycles-per-microsecond for the
+# whole kernel, reached through two accessors that both read tsc_per_us and fall back to a
+# per-file estimate before calibration has run: gpu_tsc_per_us() (gpu.cyr, retuned 1.56.19 — the
+# "100 ms" dispatch watchdog really was expiring at ~93.9 ms) and hda_tsc_per_us() (hda.cyr, the
+# same 3000-vs-3194 drift making every HDA settle ~6.5% short of the microseconds it named).
+# Neither needed an iron burn, because in both files every use of the value is a multiply into a
+# delay or timeout and none is a divide — a larger number only ever buys more patience. That
+# asymmetry is the thing to re-check before any third caller adopts the pattern.
 # tsc_per_us / tsc_base are declared in arch/x86_64/boot_data.cyr — syscall.cyr needs them and
 # is parsed first. See the note there.
 fn tsc_calibrate() {
@@ -3652,6 +3657,12 @@ tsc_calibrate();
 # ⛔ This is the frozen-clock trap that cost two iron burns in a different disguise: the bug was never in
 # the thing being timed, it was in choosing a clock that does not run in that context.
 gpu_tsc_selftest();
+# The HDA twin, immediately after, and BEFORE tsc_selftest() for the identical reason: its arm D
+# times a real hda_udelay against timer_ticks, and tsc_selftest's ring-3 excursion runs with IF
+# cleared, so on the far side of it the 100 Hz tick is not advancing and arm D would measure 0.
+# ⚠ It does NOT need an HDA controller — hda_udelay is pure rdtsc spinning — so it gates on a
+# QEMU boot with no `-device intel-hda`, which is what scripts/tsc-smoke.sh boots.
+hda_tsc_selftest();
 tsc_selftest();
 #endif
 

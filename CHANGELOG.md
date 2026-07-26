@@ -67,6 +67,71 @@ a `gpu_udelay` fault.
 Shipped kernel is **byte-identical in size** to pre-bite (1,772,728) — the selftest is `#ifdef`-
 guarded at the function, not just the call site.
 
+### ⭐⭐ HDA TIMING NOW USES THE MEASURED CLOCK TOO — `HDA_TSC_MHZ` 3000 → calibrated
+
+The same drift, in the other driver that hardcoded it. `kernel/core/hda.cyr` declared
+`var HDA_TSC_MHZ = 3000;` and `hda_udelay()` multiplied by it, so **every HDA delay was ~6.5 %
+shorter than the microseconds it named** — the codec-discovery settle asking for 1500 µs really
+waited **~1409 µs**. Its comment's premise was right (invariant TSC ⇒ ~constant per box) and its
+*value* was simply never measured.
+
+- `HDA_TSC_MHZ` (a constant) → **`hda_tsc_per_us()`** (a query), the `gpu_tsc_per_us()` twin arm
+  for arm: calibrated `tsc_per_us` when nonzero, else `HDA_TSC_PER_US_FALLBACK` = **3194**.
+- Renamed rather than edited in place, so the **compiler** found the references, not review.
+- ⚠ **The split falls the other way from the GPU's, and that is the point.** For GPU, init is
+  pre-`sti` and the ring-3 dispatch path is post. For HDA, *almost everything is pre-`sti`*:
+  `hda_probe` / `hda_reset` / `hda_codec_probe` / `hda_codec_enum` / `hda_codec_route` /
+  `hda_stream_arm` all run at `main.cyr:657-701`, ~2900 lines before `sti`, so they read
+  `tsc_per_us == 0` and correctly take the fallback — which is why the fallback being a *measured*
+  3194 rather than a round 3000 is the part that carries real boot traffic here. The post-`sti`
+  callers are the teardown paths: `hda_quiesce_all()` from `power_quiesce_devices()`, and
+  `hda_hdmi_feed_stop()` from `gpu_hdmi_audio_disable()`. Those get the truth.
+- A **second constant**, deliberately, not a reference to gpu.cyr's: `hda.cyr` is included *before*
+  `gpu.cyr`, and an audio driver reaching into the GPU driver for a clock constant is a layering
+  inversion bought for nothing.
+
+**One-directional, so no burn — verified site by site, not assumed by analogy.** All 14
+`hda_udelay()` call sites are a multiply into a delay and **nothing in the file divides by the
+value**, so no reported duration can shrink. Fixed settles (200 µs / 1500 µs) only clear their
+100 µs / 521 µs spec floors by more; the fixed-iteration poll loops in `hda_reset` /
+`hda_ring_init` / `hda_verb` / `hda_stream_arm` only widen their timeout windows; the 2000 µs
+"let the link go quiet" waits in `hda_quiesce` / `hda_hdmi_feed_stop` only get quieter. The two
+**non-timeout** uses are the LPIB measurement windows in `hda_dma_report()` and `hda_stream_arm()`
+— a longer window makes the observed delta *bigger*, so it can turn a reported `STALLED` into
+`running` but never the reverse. And **no hot path moves at all**: neither the 100 Hz refill ISR
+(`hda_stream_service` / `hda_refill_half`) nor the ring-3 `snd_*` band (#64-69) calls `hda_udelay`.
+
+#### `hda_tsc_selftest()` — the same 4 arms, and it needs no audio hardware
+
+Under `TSC_SELFTEST`, called from `main.cyr` immediately after `gpu_tsc_selftest()` and — for the
+identical frozen-oracle reason — **before** `tsc_selftest()`'s ring-3 excursion. Arms A/B/C/D
+mirror the GPU twin, including the injected **sentinel 4242** in arm C (adopted, not re-derived:
+this box now calibrates to *exactly* the 3194 fallback, which is precisely the case the live-value
+form would have passed a mutant on).
+
+⭐ `hda_udelay` is **pure rdtsc spinning** — no MMIO, no codec — so all four arms run on a QEMU boot
+with **no `-device intel-hda`**, which is what `tsc-smoke.sh` boots. A gate that only ran when audio
+hardware happened to be present would be a gate nobody could trust to have run.
+
+`tsc-smoke.sh`: **5 → 7 gates**. Measured `hda-tsc: 4/4 arms; per_us 3194 (fallback 3194), 50 ms
+udelay measured 5 ticks`.
+
+⚠ **Fixed a latent order-dependence in the harness while adding to it.** The existing GPU
+differential extracted `grep -oE "per_us [0-9]+" | head -1`, which was only correct while exactly
+one line in the boot log carried that token. Adding `hda-tsc:` would have silently turned
+"first match" into "whichever selftest `main.cyr` calls first". Both differentials now anchor to
+their own line prefix.
+
+**Regression evidence (QEMU, not iron):** `hda-smoke` PASS — the full B0→B3 bring-up chain runs on
+the retuned delays (probe / `codecs=0x0001` / verb round-trip / AFG walk / route / stream armed with
+LPIB advancing). `snd-smoke` PASS — `snd: selftest PASS` plus captured audio **RMS 7345** (non-
+silent), i.e. ring bytes still reach the DAC. Shipped kernel **1,772,728 → 1,772,808** (+80 B, the
+accessor function); the selftest itself is `#ifdef`-guarded at the function.
+
+⚠ The 1.52.x audio arc is closed and **iron-validated**; this changes a live proven timing path on
+the one-directional argument above and QEMU regression only. It has **not** been re-validated on
+archaemenid.
+
 ### ⭐⭐⭐ EDGE_CAP RAISED ON MEASUREMENT — and replaced by a measured WORK-PRODUCT bound
 
 The probe burn (`gpu: edge rasteriser cap 256 edges`, `--cov` 20/20 on a fifth flash) produced the
