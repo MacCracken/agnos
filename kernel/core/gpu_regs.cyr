@@ -1162,8 +1162,8 @@ var GPU_TRI_SHADER_SUBOFF      = 0x59000;    # residency slot 9, 269 dwords  -> 
 var GPU_TRI_PREP_SUBOFF        = 0xE0000;    # 64 records x 128 B  -> ends 0xE2000
 var GPU_TRI_EDGE_SUBOFF        = 0xE2000;    # synthesised frame edges when DERIVE is set -> ends 0xE3000
 var GPU_TRI_COV_SUBOFF         = 0xE4000;    # 8bpp coverage scratch, 1 MB  -> ends 0x1E4000
-var GPU_COMPUTE_PGM_RSRC1_TRI  = 0x002C0187; # tri_rgba: 32 VGPRs, 56 SGPRs (HARVESTED from the
-                                             # assembled descriptor, never counted)
+# tri_rgba: 32 VGPRs, 56 SGPRs. HARVESTED from the assembled descriptor, never counted.
+var GPU_COMPUTE_PGM_RSRC1_TRI  = 0x002C0187;
 var GPU_EDGE_SETUP_SUBOFF      = 0x57000;    # slot 7 — edge_setup blob (58 dwords / 232 B)  -> ends 0x58000
 # ⭐ RSRC1 EXTRACTED MECHANICALLY from each kernel descriptor (llvm-objcopy --only-section=.rodata,
 # byte 48), NEVER hand-counted. ⛔ A hand-derivation of the edge_cov value gave 0x002C008D — an
@@ -1263,8 +1263,9 @@ var GPU_BR_DST_R  = 0xFFA00000;              # underlay, right half (red)      w
 # 0x59000. The old "8 slots x 4 KB = 0x50000..0x57FFF" comment described a map that stopped being
 # true when the done table landed, and a stale range comment is exactly what let the batched-frame
 # snapshot swallow the edge prep table.
-var GPU_SHADER_SLOT_BASE   = 0x50000;        # slot i at 0x50000 + i*0x1000; slots 0-7 shaders,
-                                             # slot 8 = done table, slot 9 = tri_rgba
+# Slot i lives at 0x50000 + i*0x1000. Slots 0-7 are shader blobs, slot 8 is the done-marker table,
+# slot 9 is tri_rgba.
+var GPU_SHADER_SLOT_BASE   = 0x50000;
 var GPU_SHADER_SLOT_STRIDE = 0x1000;
 var GPU_BLEND_SHADER_SUBOFF = 0x50000;       # slot 0 — blend_rect resident for #92 (60 dwords)  -> ends 0x51000
 var GPU_OP_DONE_BASE        = 0x58000;       # done-marker table, 64 slots x 0x40 (one cache line each)

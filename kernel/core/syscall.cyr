@@ -1706,13 +1706,13 @@ fn edge_abi_selftest() {
     # ⚠ THIS IS NOT A READ-BACK. Printing what was computed lets an independent computation
     # CONTRADICT it. A kernel reading back its own store and declaring agreement proves nothing.
     var trec = &eabi_edges;                       # borrow the battery's scratch page
-    if (gpu_tri_prep(trec, 0x1234000,
-                     0, 0, 256 * 65536, 0, 0, 256 * 65536,
-                     0xFFFF0000, 0xFF00FF00, 0xFF0000FF) == 1) {
+    var tv1 = 256 * 65536;
+    var tc0 = 0xFFFF0000; var tc1 = 0xFF00FF00; var tc2 = 0xFF0000FF;
+    if (gpu_tri_prep(trec, 0x1234000, 0, 0, tv1, 0, 0, tv1, tc0, tc1, tc2) == 1) {
         gpu_tri_prep_dump(trec);
     }
-    if (gpu_tri_prep(trec, 0, 0, 0, 100 * 65536, 100 * 65536, 200 * 65536, 200 * 65536,
-                     0xFFFF0000, 0xFF00FF00, 0xFF0000FF) != 0) {
+    var tk1 = 100 * 65536; var tk2 = 200 * 65536;
+    if (gpu_tri_prep(trec, 0, 0, 0, tk1, tk1, tk2, tk2, tc0, tc1, tc2) != 0) {
         kprint("tri-prep: FAIL -- a COLLINEAR frame was accepted\n", 49);
     }
 
