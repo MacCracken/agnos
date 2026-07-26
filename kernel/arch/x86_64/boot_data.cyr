@@ -39,6 +39,14 @@ var exc_stub[160];
 var gdtr_scratch[2];
 var fb_dbg_phys = 0;  # 1.45.16: FB base captured at fb_console_init for the idt.cyr fault-bar (0 = console not up → fault paint skipped)
 var timer_ticks = 0;
+
+# ⚠ DECLARED HERE, NOT NEXT TO tsc_calibrate() IN main.cyr. Cyrius resolves variable references
+# in PARSE ORDER — forward CALLS resolve, forward variable references do NOT — and syscall.cyr
+# (agnos.cyr:107) is parsed long before main.cyr. Declaring these beside their initialiser made
+# the #95 handler fail to compile with "undefined variable 'tsc_per_us'".
+# [[reference_cyrius_module_scope_var_expr_init_zero]]
+var tsc_per_us = 0;    # measured cycles per microsecond; 0 = calibration refused
+var tsc_base   = 0;    # rdtsc at the end of calibration; #95 reports microseconds since
 var timer_isr[64];
 var kb_isr[96];    # keyboard ISR machine code (~83 bytes)
 var nic_rx_isr[64];  # NIC RX MSI-X ISR machine code (~62 bytes) — 1.51.5

@@ -4544,6 +4544,25 @@ fn ksyscall(num, arg1, arg2, arg3) {
         stack_canary_check(canary);
         return mo;
     }
+    if (num == 95) {
+        # uptime_us() -- MICROSECOND monotonic clock, readable with INTERRUPTS DISABLED.
+        #
+        # ⛔ THE POINT OF THIS SYSCALL. `uptime_ms`#40 reads timer_ticks, and a FOREGROUND `run`
+        # program executes with IF cleared, so the timer never fires and #40 is FROZEN for its
+        # whole run. Any `run`-launched program timing itself with #40 measures zero. rdtsc needs
+        # no interrupts, so it is the only correct clock on that path.
+        #
+        # ⚠ LINUX COLLISION: #95 = umask(mask). Non-destructive (it changes the caller's own
+        # file-creation mask and returns the old one), but the file-level #ifdef
+        # CYRIUS_TARGET_AGNOS gate in cyrius/lib/syscalls.cyr is the barrier off-agnos.
+        #
+        # Returns microseconds since calibration, or -1 if calibration was REFUSED — never a
+        # plausible-looking zero, because a tool that cannot tell "no clock" from "0 us elapsed"
+        # is exactly what burned two flashes on the rung-10 gate.
+        stack_canary_check(canary);
+        if (tsc_per_us == 0) { return 0 - 1; }
+        return (rdtsc() - tsc_base) / tsc_per_us;
+    }
     if (num == 94) {
         # gpu_recover_op(arm) — 3D arc RUNG 5. The five-arm hang/recovery battery.
         # ⛔ ARMS THAT WEDGE THE GPU ARE COMPILED OUT WITHOUT GPU_RECOVER, so a production

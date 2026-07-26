@@ -368,7 +368,12 @@ fn tri_digest(): i64 {
 # ⚠ BOTH SIDES ARE TIMED THE SAME WAY, on the same boot, on the same geometry, from the same
 # source of truth. A crossover measured against a CPU path timed on a different machine or a
 # different shape would be worthless.
-var BENCH_TARGET_MS = 100;      # per-point wall time before we trust the division
+# ⭐ MICROSECONDS, via uptime_us#95 — NOT uptime_ms#40.
+# ⛔ #40 reads timer_ticks, and a FOREGROUND `run` program executes with IF CLEARED, so the timer
+# never fires and #40 is FROZEN for the program's entire duration. Two iron burns were lost to
+# that before it was understood: the first fabricated a 0 us timing and divided by it, the second
+# spun waiting for a clock that could not advance. #95 is rdtsc-backed and needs no interrupts.
+var BENCH_TARGET_US = 100000;   # 100 ms of wall time before we trust the division
 var BENCH_REP_CAP   = 4000000;  # refuse past this rather than invent a number
 var bench_buf[8192];            # 65536 B = 256x256, the largest bench size
 var bench_recs[512];            # 4096 B = 64 records of 64 B -- the #92 batch ceiling
@@ -398,13 +403,13 @@ var bench_ms   = 0;             # wall ms the last measurement actually spent
 fn bench_time_cpu(): i64 {
     var reps = 1;
     while (reps <= BENCH_REP_CAP) {
-        var t0 = syscall(40);
+        var t0 = syscall(95);
         var r = 0;
         while (r < reps) { cov_clear(&bench_buf); raster(&bench_buf); r = r + 1; }
-        var el = syscall(40) - t0;
-        if (el >= BENCH_TARGET_MS) {
+        var el = syscall(95) - t0;
+        if (el >= BENCH_TARGET_US) {
             bench_reps = reps; bench_ms = el;
-            return (el * 1000) / reps;
+            return el / reps;
         }
         reps = reps * 4;
     }
@@ -414,16 +419,16 @@ fn bench_time_cpu(): i64 {
 fn bench_time_gpu(batch): i64 {
     var reps = 1;
     while (reps <= BENCH_REP_CAP) {
-        var t0 = syscall(40);
+        var t0 = syscall(95);
         var r = 0;
         while (r < reps) {
             if (syscall(92, &bench_recs, batch * 64) != 0) { return 0 - 2; }   # dispatch refused
             r = r + 1;
         }
-        var el = syscall(40) - t0;
-        if (el >= BENCH_TARGET_MS) {
+        var el = syscall(95) - t0;
+        if (el >= BENCH_TARGET_US) {
             bench_reps = reps; bench_ms = el;
-            return (el * 1000) / (reps * batch);
+            return el / (reps * batch);
         }
         reps = reps * 4;
     }
@@ -433,14 +438,19 @@ fn bench_time_gpu(batch): i64 {
 # ⭐ CLOCK SANITY, RUN FIRST. If uptime_ms does not advance, every number below is fiction and
 # the tool must say so instead of printing zeros. Costs ~150 ms and removes an entire class of
 # silent-garbage result.
+# ⛔ BOUNDED BY ITERATIONS, NOT BY THE CLOCK IT IS TESTING. The first version spun until the
+# clock advanced, with a 200,000,000-syscall escape hatch — which is not an escape hatch. When
+# the clock genuinely could not advance it hung the machine. A guard whose exit condition is the
+# thing under test is not a guard.
 fn bench_clock_ok(): i64 {
-    var t0 = syscall(40);
-    var spins = 0;
-    while (syscall(40) - t0 < 3) {
-        spins = spins + 1;
-        if (spins > 200000000) { return 0; }
+    var t0 = syscall(95);
+    if (t0 < 0) { return 0; }                       # #95 reports -1 when calibration was refused
+    var i = 0;
+    while (i < 2000000) {
+        if (syscall(95) - t0 > 0) { return 1; }
+        i = i + 1;
     }
-    return 1;
+    return 0;
 }
 
 # One equilateral-ish triangle covering roughly half of a wxh mask, so covered_px ~ w*h/2.
@@ -482,7 +492,7 @@ fn bench_cpu_only(): i64 {
             bench_refusals = bench_refusals + 1;
         }
         if (c >= 0) {
-            pnum(c); ps("us   [evidence: "); pnum(bench_ms); ps(" ms over ");
+            pnum(c); ps("us   [evidence: "); pnum(bench_ms); ps(" us over ");
             pnum(bench_reps); puts(" reps]");
         }
         i = i + 1;
@@ -529,7 +539,7 @@ fn bench_point(w, h, batch): i64 {
     ps("  gpu ");
     if (g < 0) { ps("REFUSED"); }
     if (g >= 0) { pnum(g); ps("us"); }
-    ps("   [gpu "); pnum(g_ms); ps("ms/"); pnum(g_reps); ps("reps]  ");
+    ps("   [gpu "); pnum(g_ms); ps("us/"); pnum(g_reps); ps("reps]  ");
     # ⛔ EVERY division guarded. A zero here is what took the machine down at burn 3.
     if (c < 0)  { puts("NO VERDICT -- cpu timing refused"); bench_refusals = bench_refusals + 1; return cov; }
     if (g < 0)  { puts("NO VERDICT -- gpu timing refused"); bench_refusals = bench_refusals + 1; return cov; }
@@ -549,16 +559,16 @@ fn tri_bench(): i64 {
     puts("");
     puts("PRE-REGISTERED (gpu.md, published before the flash):");
     puts("  unbatched crossover ~ 12000 covered px   batched ~ 50000 covered px/frame");
-    puts("⚠ timed via uptime_ms#40 (100 Hz); each point repeats to >= 100 ms and divides.");
+    puts("⚠ timed via uptime_us#95 (rdtsc); each point repeats to >= 100 ms and divides.");
     puts("  BOTH sides measured the same way, same boot, same geometry, same edge list.");
     puts("⛔ This tool REFUSES rather than inventing a figure it could not measure.");
     puts("");
     if (bench_clock_ok() != 1) {
-        puts("gputri: ⛔ uptime_ms#40 DID NOT ADVANCE. Every timing would be fiction.");
+        puts("gputri: ⛔ uptime_us#95 DID NOT ADVANCE. Every timing would be fiction.");
         puts("gputri: refusing to print numbers. (exit 86)");
         return 86;
     }
-    puts("[clock] uptime_ms advances -- timings are meaningful");
+    puts("[clock] uptime_us#95 advances -- timings are meaningful");
     bench_cross1 = 0; bench_cross16 = 0; bench_refusals = 0;
 
     bench_cpu_only();

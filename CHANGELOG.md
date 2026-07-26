@@ -5,6 +5,61 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.56.18] - 2026-07-25
 
+### ⭐⭐ Added — `uptime_us`#95: the clock a foreground program can actually read
+
+⛔ **`uptime_ms`#40 is frozen inside a `run`.** It reads `timer_ticks`, and a foreground exec
+starts with `IF` **cleared** — `ring3.cyr` says so outright: *"a foreground program is not meant to
+be preempted"*, and only `/bin/agnsh` gets `IF=1`. So the timer ISR never fires for the program's
+entire duration and **anything timing itself with #40 measures zero, forever**.
+
+**That single fact cost two iron burns on the rung-10 kill gate**: the first fabricated a 0 µs
+timing and divided by it (freezing the box), the second spun waiting for a clock that could not
+advance. Both were read as bench bugs. The bench *had* bugs — but the instrument was wrong.
+
+`#95` is rdtsc-backed, needs no interrupts, and returns **−1** when calibration was refused —
+never a plausible-looking 0, because a tool that cannot distinguish "no clock" from "0 µs elapsed"
+is precisely what burned those flashes.
+
+**⭐ And it is CALIBRATED, which `GPU_TSC_PER_US` could never be.** `gpu.cyr` documents why it
+assumes 3000 cycles/µs: *"GPU init runs BEFORE `sti`… there is no second time source to calibrate
+against."* After `sti` there is one. Measured against 50 ms of live ticks on archaemenid:
+**3194 cycles/µs — the assumed 3000 is 6.5% low.**
+
+⚠ **Deliberate scope limit:** this calibrates the new syscall only. It does **not** retune
+`GPU_TSC_PER_US`, which the dispatch watchdog uses — perturbing a proven timing path is its own
+bite. The consequence `gpu.cyr` already documents (its "100 ms" watchdog is really 79–150 ms)
+stands until then, though it is now *measurably* ~94 ms rather than unknown.
+
+### Added — `scripts/tsc-smoke.sh`: a differential proof, at zero burns
+
+A `TSC_SELFTEST` hook execs a ring-3 ELF that samples `#95` around a busy loop **with interrupts
+off** and returns whether it advanced. **3/3** — `run: exit 1`. That is the negative control the
+two lost burns did not have: it proves `#95` works exactly where `#40` cannot.
+
+### Fixed — three of my own errors on the way, each caught by a gate rather than a burn
+
+1. **Variable forward-reference.** `tsc_per_us` was declared beside its initialiser in `main.cyr`,
+   which is parsed *after* `syscall.cyr` — the `#95` handler would not compile. Cyrius resolves
+   forward *calls* but not forward *variable* references; the declarations moved to
+   `boot_data.cyr` beside `timer_ticks`.
+2. **The exit code is 8 bits.** The probe first returned elapsed **microseconds** directly and
+   reported `exit 0` — not because the clock was frozen, but because ~42000 µs & 0xFF landed on
+   zero. **A measurement whose channel cannot carry its value reads as a failure of the thing
+   under test.** It returns a boolean now.
+3. ⭐ **Call-site ordering, again.** `tsc_selftest()` sat ~850 lines before `tsc_calibrate()`, so
+   it ran pre-`sti`, read `tsc_per_us == 0`, got −1 from `#95` twice, and reported "the clock does
+   not advance" — indicting the clock for a pure ordering mistake. **The boot log said so
+   outright:** `run: exit 0` printed *before* `tsc: 3194 cycles per microsecond`. Same class as the
+   `DE_SELFTEST` hook two bites earlier.
+
+### Changed — `gputri --bench` retimed onto `#95`
+
+Every `syscall(40)` gone (verified: zero remain). Targets are microseconds directly. And the
+clock-sanity check is now **bounded by iterations, not by the clock it is testing** — the first
+version spun until the clock advanced with a 200,000,000-syscall "escape hatch", which is not an
+escape hatch and is what hung burn 4. **A guard whose exit condition is the thing under test is
+not a guard.**
+
 ### ⭐⭐ Fixed — A RING-3 DIVIDE BY ZERO HARD-LOCKED THE KERNEL. #DE was never installed.
 
 **Any userland program that divided by zero froze agnos.** No fault message, no CMOS stamp, no

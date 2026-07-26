@@ -2147,6 +2147,65 @@ ext2_multichunk_selftest();
 # scratch buffer, writes it to ext2 as /prog, then `run /prog` — exercising
 # elf_load_from_file (streaming load) + exec_and_wait end-to-end. Gated by
 # exec-smoke.sh on the "EXEC-DISK-OK" marker + "run: exit 42".
+#ifdef TSC_SELFTEST
+# ============================================================================================
+# 1.56.18 — DOES uptime_us#95 ADVANCE WHERE uptime_ms#40 CANNOT?
+# ============================================================================================
+# ⭐ A DIFFERENTIAL TEST, and that is the point. A foreground `run` program executes with IF
+# CLEARED, so the timer ISR never fires and `uptime_ms`#40 is frozen for its whole duration.
+# This builds a ring-3 ELF that samples #95 around a busy loop and returns the elapsed
+# microseconds AS ITS EXIT CODE.
+#
+# PASS = a NONZERO exit. That single number proves the clock advances with interrupts off —
+# which is exactly what #40 cannot do here, and exactly the negative control the two lost iron
+# burns on the rung-10 gate did not have.
+fn tsc_selftest() {
+    if (ext2_active == 0) { return 0; }
+    syscall_init();
+    var eb = &vfs_scratch_buf;
+    var ez = 0;
+    while (ez < 256) { store8(eb + ez, 0); ez = ez + 1; }
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
+    store8(eb + 16, 2); store8(eb + 18, 0x3E); store8(eb + 20, 1);
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);
+    store8(eb + 32, 64); store8(eb + 52, 64); store8(eb + 54, 56); store8(eb + 56, 1);
+    store8(eb + 64, 1); store8(eb + 68, 5);
+    store8(eb + 82, 0x40); store8(eb + 90, 0x40);
+    store8(eb + 96, 200); store8(eb + 104, 200); store8(eb + 113, 0x10);
+    var c = 120;
+    store8(eb + c, 0x48); store8(eb + c+1, 0xC7); store8(eb + c+2, 0xC0); store8(eb + c+3, 0x5F); c = c + 7;
+    store8(eb + c, 0x0F); store8(eb + c+1, 0x05); c = c + 2;
+    store8(eb + c, 0x49); store8(eb + c+1, 0x89); store8(eb + c+2, 0xC4); c = c + 3;
+    store8(eb + c, 0xB9); store8(eb + c+1, 0x00); store8(eb + c+2, 0x00); store8(eb + c+3, 0x00); store8(eb + c+4, 0x08); c = c + 5;
+    store8(eb + c, 0xFF); store8(eb + c+1, 0xC9); c = c + 2;
+    store8(eb + c, 0x75); store8(eb + c+1, 0xFC); c = c + 2;
+    store8(eb + c, 0x48); store8(eb + c+1, 0xC7); store8(eb + c+2, 0xC0); store8(eb + c+3, 0x5F); c = c + 7;
+    store8(eb + c, 0x0F); store8(eb + c+1, 0x05); c = c + 2;
+    store8(eb + c, 0x4C); store8(eb + c+1, 0x29); store8(eb + c+2, 0xE0); c = c + 3;   # sub rax,r12
+    # ⛔ EXIT CODES ARE 8 BITS. The first version returned the elapsed MICROSECONDS directly and
+    # reported `exit 0` — not because the clock was frozen, but because ~42000 us & 0xFF happened
+    # to land on zero. That is a measurement whose CHANNEL cannot carry its value, and it read as
+    # a failure of the thing under test. Return a BOOLEAN instead: 1 = the clock advanced.
+    store8(eb + c, 0x31); store8(eb + c+1, 0xFF); c = c + 2;                            # xor edi,edi
+    store8(eb + c, 0x48); store8(eb + c+1, 0x85); store8(eb + c+2, 0xC0); c = c + 3;    # test rax,rax
+    store8(eb + c, 0x40); store8(eb + c+1, 0x0F); store8(eb + c+2, 0x95); store8(eb + c+3, 0xC7); c = c + 4;  # setnz dil
+    store8(eb + c, 0x48); store8(eb + c+1, 0xC7); store8(eb + c+2, 0xC0); store8(eb + c+3, 0x00); c = c + 7;
+    store8(eb + c, 0x0F); store8(eb + c+1, 0x05); c = c + 2;
+    store8(eb + c, 0xEB); store8(eb + c+1, 0xFE);
+    ext2_mkdir(2, "bin", 3);
+    var bino = ext2_path_lookup("/bin", 4);
+    var tz = 0;
+    if (bino > 0) { tz = ext2_create(bino, "tscp", 4); }
+    if (tz > 0) { ext2_write_at(tz, 0, eb, 200); }
+    ext2_sync();
+    kprintln("tsc: ring-3 probe -- exit 1 = uptime_us#95 ADVANCED, 0 = frozen", 63);
+    kprintln("tsc: this is the clock uptime_ms#40 CANNOT be on a foreground run", 65);
+    sh_exec("run /bin/tscp", 13);
+    return 0;
+}
+#endif
+
 #ifdef DE_SELFTEST
 # ============================================================================================
 # 1.56.18 — #DE (DIVIDE ERROR) FROM RING 3 MUST KILL THE PROC, NOT THE MACHINE
@@ -2672,6 +2731,12 @@ exec_disk_selftest();
 # ⭐ Runs HERE, alongside the exec selftest, because both need a mounted ext2 and a working
 # exec path. A ring-3 divide by zero must kill the proc and let boot continue.
 de_selftest();
+#endif
+# ⚠ tsc_selftest() is NOT called here. It needs a CALIBRATED clock, and calibration needs LIVE
+# TIMER TICKS — which means it cannot run until after `sti`, ~850 lines below. Called here it
+# ran first, read tsc_per_us == 0, got -1 from #95 twice, and reported "the clock does not
+# advance" — indicting the clock for what was purely a call-ordering mistake. The boot log said
+# so outright: `run: exit 0` printed BEFORE `tsc: 3193 cycles per microsecond`.
 #endif
 
 #ifdef SYMLINK_SELFTEST
@@ -3527,6 +3592,60 @@ asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0E; 0xE6; 0x71; }
 # Enable interrupts and activate scheduler
 asm { sti; }
 kprintln("Interrupts enabled", 18);
+
+# ============================================================================================
+# TSC CALIBRATION — the clock ring 3 can actually use. 1.56.18.
+# ============================================================================================
+# ⛔ WHY THIS EXISTS. `uptime_ms`#40 reads `timer_ticks`, which the timer ISR increments. But a
+# FOREGROUND `run` program starts with IF CLEARED (ring3.cyr: "a foreground program is not meant
+# to be preempted" — only /bin/agnsh gets IF=1). So the timer never fires while a `run` program
+# executes, and **uptime_ms is FROZEN for its entire duration**. Anything timing itself with it
+# measures zero, forever.
+#
+# ⭐ That cost two iron burns on the rung-10 kill gate before it was understood: the first
+# fabricated a 0 us timing and divided by it, the second spun waiting for a clock that could not
+# advance. The instrument was wrong, not the guards around it.
+#
+# rdtsc does NOT need interrupts, so it is the correct clock for a foreground program — and
+# gpu.cyr already reaches for it for exactly this reason ("rdtsc, not timer_ticks: these tests
+# run BEFORE sti"). What gpu.cyr could NOT do is calibrate: at GPU-init time there is no second
+# time source. HERE there is — the 100 Hz tick is live — so we measure real cycles per
+# microsecond instead of assuming 3.0 GHz on a part that boosts.
+#
+# ⚠ SCOPE, deliberately narrow: this calibrates the clock the NEW syscall reports. It does NOT
+# retune GPU_TSC_PER_US, which the dispatch watchdog uses — perturbing a proven timing path is
+# its own bite with its own burn. The consequence gpu.cyr already documents (its "100 ms"
+# watchdog is really 79-150 ms) stands unchanged until then.
+# tsc_per_us / tsc_base are declared in arch/x86_64/boot_data.cyr — syscall.cyr needs them and
+# is parsed first. See the note there.
+fn tsc_calibrate() {
+    var t0 = timer_ticks;
+    while (timer_ticks == t0) { }            # align to a tick edge so the window is a whole one
+    var c0 = rdtsc();
+    var t1 = timer_ticks;
+    while (timer_ticks < t1 + 5) { }         # 5 ticks @ 100 Hz = 50 ms = 50000 us
+    var c1 = rdtsc();
+    var cyc = c1 - c0;
+    tsc_per_us = cyc / 50000;
+    tsc_base = c1;
+    # ⛔ REFUSE a nonsense calibration rather than shipping a divisor that silently skews every
+    # timing built on it. Below 100 MHz or above 10 GHz means the tick did not behave.
+    if (tsc_per_us < 100) { tsc_per_us = 0; }
+    if (tsc_per_us > 10000) { tsc_per_us = 0; }
+    if (tsc_per_us == 0) {
+        kprintln("tsc: calibration REFUSED -- uptime_us will report 0", 51);
+        return 0;
+    }
+    kprint("tsc: ", 5); kprint_num(tsc_per_us);
+    kprintln(" cycles per microsecond (measured over 50 ms of live ticks)", 59);
+    return 0;
+}
+tsc_calibrate();
+#ifdef TSC_SELFTEST
+# ⭐ HERE, immediately after calibration and well after `sti` — the earliest point where the
+# clock this probe measures actually exists.
+tsc_selftest();
+#endif
 
 # The r8169's receiver has been live since r8169_init_tx ran near the top of this
 # function, with nothing draining it: its overflow recovery is the 100 Hz timer-tick
