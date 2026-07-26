@@ -163,6 +163,52 @@ elif [ -n "${BURN_SHADER_GLYPH:-}" ]; then
     echo "[2/2] Building the plan-S9 SHADER-GLYPH kernel (1bpp glyph expand; capture klug > shader_glyph.txt)."
     BUILD_ENV="SHADER_GLYPH=1"
     BUILD_TAG="SHADER_GLYPH"
+elif [ -n "${BURN_EDGE_COV:-}" ]; then
+    # ============================================================================================
+    # 3D ARC RUNG 9b — BURN 1. THE EDGE RASTERISER'S FIRST CONTACT WITH SILICON.
+    # ============================================================================================
+    # ⚠ NO COMPILE FLAG. gpu_edge_arm/gpu_edge_cov are UNCONDITIONAL — a default kernel already
+    # carries them. This mode exists to carry the BRIEF, not a #define: what to run, in what
+    # order, and what each outcome indicts. A burn whose instructions live only in a chat log is
+    # a burn that gets run wrong once and wasted.
+    #
+    # RUN IN THIS ORDER. The order is the whole point — it makes a red localise.
+    #   1. run /bin/gputri --digest > /tmp/d.txt   then compare against the HOST `cpuref` output.
+    #      ⛔ DO THIS FIRST. If the digests differ, this build's reference is not the host's, and
+    #      every byte-comparison below is against the wrong answer. Nothing else on the flash
+    #      means anything until they match.
+    #   2. run /bin/gputri --cov                   the 20-case corpus + negative controls N1-N8.
+    #   3. run /bin/klug > /edge.txt               capture, then mount the FS from Linux to copy out.
+    #
+    # PRE-REGISTERED OUTCOME TABLE — written before the flash, per the arc's own discipline:
+    #   95  every case byte-identical AND every control fired. Rung 9b is DONE, and because B2
+    #       already proved the algorithm exhaustively at zero burns, this also retires
+    #       v_mul_hi_u32 and global_store_byte as suspects in one shot.
+    #  100  no GPU carveout — wrong machine, or the GPU never came up. Not a 9b result.
+    #   96  the shader is not resident: gpu_edge_arm's gates refused. Check the boot log for the
+    #       arena/ring/matmul lines; this is an ARMING fault, not a rasteriser fault.
+    #   88  UNTOUCHED — the dispatch retired and wrote NOTHING. Missing post-dispatch coherence,
+    #       or the EXEC guard rejected every lane. ⛔ NOT an edge-setup bug; do not look there.
+    #   87  wrote but covered nothing — write-back works, the winding evaluated to zero: FILL RULE.
+    #   92  shape right, edge pixels differ by <= 2 — rounding / sub-scanline placement.
+    #   91  wrong shape, large deltas — edge setup or the crossing solve.
+    #   89  PARTIAL, some bytes still sentinel — TGID MAPPING; whole workgroups never dispatched.
+    #   86  a negative control did not fire. The run proves nothing either way; fix and re-burn.
+    #   85  digest mismatch (see step 1).
+    #
+    # ⚠⚠ KNOWN GAP, STATED BEFORE THE FLASH RATHER THAN DISCOVERED AFTER IT.
+    # The plan's B9 specifies a THIRD oracle, `gputri --valu`: a ~15-instruction kernel that
+    # writes known v_mul_hi_u32 results to a readback slot. IT IS NOT BUILT. v_mul_hi_u32 appears
+    # in NO shipped agnos shader and the entire divider rests on it, so if this burn comes back
+    # 91 or 92, that instruction is an UNELIMINATED SUSPECT alongside the divider composition.
+    #
+    # Cutting anyway is a deliberate ordering call: B2 proved the algorithm exhaustively on the
+    # host, so a GREEN result retires v_mul_hi_u32 for free and --valu would have been wasted
+    # work. --valu only pays if this burn is red, and then it is the FIRST thing built.
+    echo "[2/2] Building the 3D-arc RUNG 9b kernel (edge rasteriser; no compile flag needed)."
+    echo "      Run: gputri --digest (compare vs host cpuref) THEN gputri --cov THEN klug > /edge.txt"
+    BUILD_ENV=""
+    BUILD_TAG="EDGE_COV"
 elif [ -n "${BURN_SHADER_COV:-}" ]; then
     # plan-S10 — coverage (anti-aliased) blend: uniform colour x 8bpp mask. ⚠ Re-proof required at 1.56.4:
     # both coverage call sites passed 11 args to a 12-parameter dispatcher until this cut, so the RSRC1 the
