@@ -5,6 +5,52 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.56.18] - 2026-07-25
 
+### ⭐⭐⭐ RUNG 10 — THE KILL GATE HAS ITS NUMBER, AND IT DOES NOT FIRE
+
+```
+MEASURED unbatched crossover:  1751 covered px
+MEASURED batched-16 crossover: 1751 covered px
+PRE-REGISTERED (published before burn 3): unbatched ~12000, batched ~50000
+```
+
+⭐ **The GPU wins ~7× earlier than predicted** — from **1751 covered px**, a 42×42 region, roughly
+**two glyphs**. At 256×256 it is **12.0× faster unbatched, 12.7× batched**.
+
+| mask | covered | CPU | GPU b1 | GPU b16 |
+|---|---|---|---|---|
+| 32² | 423 | 27 µs | 33 µs (CPU wins) | 28 µs (CPU wins) |
+| 64² | **1751** | 100 µs | **35 µs** | **31 µs** |
+| 128² | 7156 | 384 µs | 58 µs | 54 µs |
+| 256² | 28851 | 1485 µs | **124 µs** | **117 µs** |
+
+**★ Against the outcome table published before burn 3: TIER-1 CONFIRMED. Rungs 11–12 open on the
+coverage justification, and the arc does not re-base on rung 14.**
+
+`gputri --cov` was **20/20 on the same boot** — the fourth consecutive flash confirming rung 9b,
+and the precondition for the timing to mean anything.
+
+### ⚠ Changed — a pre-registered MODEL correction, from the same measurement
+
+The ~12000/~50000 predictions rested on S12's *"~60 µs fixed cost per submission at ~87 %
+overhead"*. Decomposing the 32×32 point (per-mask = work + fence/batch):
+
+```
+batch 1 = 33 µs, batch 16 = 28 µs  ⇒  fence ≈ 5.3 µs, fixed per-dispatch ≈ 27.7 µs
+```
+
+⛔ **The fence is ~5 µs, not ~60 µs, and the fixed cost is ~28 µs.** Batching 16-to-1 buys only
+**6 %** at 256×256. The submission overhead that motivated rung 0b's batching path is real but **an
+order of magnitude smaller than modelled at these sizes** — the cost here is raster work, not
+submission. This strengthens the verdict rather than weakening it, but any future rung citing
+"87 % overhead" should cite **this measurement** instead of the model.
+
+### ⚠ Open — `--bench` exits 142 where its code path returns 95
+
+Every line printed, through the closing note, so the tool ran to completion and the numbers are
+readable. The exit code is unexplained. **Recorded rather than hand-waved:** it must be chased
+before `--bench` is used as an automated gate, since a wrong exit code is exactly what makes a
+gate unreliable.
+
 ### ⭐⭐ Added — `uptime_us`#95: the clock a foreground program can actually read
 
 ⛔ **`uptime_ms`#40 is frozen inside a `run`.** It reads `timer_ticks`, and a foreground exec
