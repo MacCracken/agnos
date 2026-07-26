@@ -3644,6 +3644,14 @@ tsc_calibrate();
 #ifdef TSC_SELFTEST
 # ⭐ HERE, immediately after calibration and well after `sti` — the earliest point where the
 # clock this probe measures actually exists.
+# ⚠ BEFORE tsc_selftest(), NOT AFTER, and the ordering is load-bearing. gpu_tsc_selftest's arm D times a
+# real gpu_udelay against timer_ticks, and tsc_selftest makes a RING-3 EXCURSION to run /bin/divz — a
+# foreground `run` executes with IF cleared, so on the far side of it the 100 Hz tick is not advancing and
+# arm D measured 0 ticks for a 50 ms delay. Here, one line after calibration succeeded "over 50 ms of live
+# ticks", the oracle is known-good by the immediately preceding measurement.
+# ⛔ This is the frozen-clock trap that cost two iron burns in a different disguise: the bug was never in
+# the thing being timed, it was in choosing a clock that does not run in that context.
+gpu_tsc_selftest();
 tsc_selftest();
 #endif
 

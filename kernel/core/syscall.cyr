@@ -2295,7 +2295,7 @@ fn mdo_vtotal() {
 
     # PHASE A — baseline: MEASURE the inherited refresh, no write (avoids the identity-modeset trap).
     var ra = gpu_refresh_measure(pipe);
-    kprint("modeset: [T+", 12); kprint_num((rdtsc() - t0) / GPU_TSC_PER_US / 1000); kprint("ms] A v_total 1481 refresh ", 27);
+    kprint("modeset: [T+", 12); kprint_num((rdtsc() - t0) / gpu_tsc_per_us() / 1000); kprint("ms] A v_total 1481 refresh ", 27);
     kprint_num(ra); kprint(" mHz predicted ", 15); kprint_num(pred_a); kprintln(" mHz", 4);
     # Fail early if the baseline itself is unmeasurable — do NOT modeset a pipe we cannot oracle.
     if (ra == 0) { kprintln("modeset: VTOTAL unmeasurable at A -- pipe not counting, no modeset attempted", 76); return MDO_E_UNMEAS; }
@@ -2306,14 +2306,14 @@ fn mdo_vtotal() {
     var rb2  = mdo_vtotal_phase(pipe, vt_b, vt_orig);
     var ackb = gpu_otg_lock_acked;
     var unfb = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 1;
-    kprint("modeset: [T+", 12); kprint_num((rdtsc() - t0) / GPU_TSC_PER_US / 1000); kprint("ms] B v_total 1501 refresh ", 27);
+    kprint("modeset: [T+", 12); kprint_num((rdtsc() - t0) / gpu_tsc_per_us() / 1000); kprint("ms] B v_total 1501 refresh ", 27);
     kprint_num(rb2); kprint(" mHz predicted ", 15); kprint_num(pred_b); kprint(" lock ack ", 10); kprint_num(ackb); kprintln("", 0);
     if (mdo_wedged != 0) { kprintln("modeset: VTOTAL WEDGED at B -- restored, see WATCHDOG line", 58); return MDO_E_WEDGED; }
 
     # PHASE C — restore the INHERITED value (D4: vt_orig, not a literal), watchdog-guarded.
     var rc   = mdo_vtotal_phase(pipe, vt_orig, vt_orig);
     var unfc = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 1;
-    kprint("modeset: [T+", 12); kprint_num((rdtsc() - t0) / GPU_TSC_PER_US / 1000); kprint("ms] C v_total 1481 refresh ", 27);
+    kprint("modeset: [T+", 12); kprint_num((rdtsc() - t0) / gpu_tsc_per_us() / 1000); kprint("ms] C v_total 1481 refresh ", 27);
     kprint_num(rc); kprint(" mHz predicted ", 15); kprint_num(pred_a); kprintln(" mHz", 4);
     if (mdo_wedged != 0) { kprintln("modeset: VTOTAL WEDGED at C -- restored, see WATCHDOG line", 58); return MDO_E_WEDGED; }
     kprint("modeset: underflow bit10 ", 25); kprint_num(unf0); kprint(" -> ", 4); kprint_num(unfb); kprint(" -> ", 4); kprint_num(unfc); kprintln("", 0);
@@ -2468,8 +2468,8 @@ fn mdo_recommit() {
     var refr = gpu_refresh_measure(pipe);
     var unf1 = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 1;
     var fc1  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_FRAME_COUNT) & GPU_OTG_FRAME_COUNT_MASK;
-    # D2: gpu_display_wait_vblank bounds at ~50ms; a healthy-but-slow PLL relock (or a hot TSC vs the
-    # approximate GPU_TSC_PER_US) can exceed it and read resumed=0 on a pipe that IS coming back. Re-confirm
+    # D2: gpu_display_wait_vblank bounds at ~50ms; a healthy-but-slow PLL relock (or a boosted TSC vs the
+    # calibrated gpu_tsc_per_us()) can exceed it and read resumed=0 on a pipe that IS coming back. Re-confirm
     # across the 120ms settle: if the counter advanced past its disabled value, the pipe resumed regardless.
     if (resumed == 0) { if (fc1 != fc_dis) { resumed = 1; } }
 

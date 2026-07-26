@@ -11,6 +11,62 @@ four flashes and **rung 10's kill gate measured and passed** — crossover 1751 
 loose end that burn left: `--bench` exiting 142 where its code path returns 95. Bumped on cycle
 open; the user tags on close.
 
+### ⭐⭐ GPU TIMING NOW USES THE MEASURED CLOCK — `GPU_TSC_PER_US` 3000 → calibrated
+
+Every GPU timeout and delay multiplied by a hardcoded **3000** cycles/µs while `tsc_calibrate()`
+measures **3193–3194** on this box. The "100 ms" dispatch watchdog was really **~93.9 ms**, and the
+constant's own comment said it *could not* be calibrated. That was true of **GPU init**, which runs
+before `sti`; it was never true of the **ring-3 dispatch path**, which runs long after calibration.
+
+- `GPU_TSC_PER_US` (a constant) → **`gpu_tsc_per_us()`** (a query): returns the calibrated
+  `tsc_per_us` once one exists, else `GPU_TSC_PER_US_FALLBACK`. The split lands on the `sti`
+  boundary for free — GPU-init callers read 0 and get the estimate, syscall callers get the truth.
+- The fallback is **3194**, not 3000: it is only reachable before calibration, and a measured
+  number from the one box we boot on beats a round one.
+- All **18** references converted. The constant was *renamed*, so the compiler — not review —
+  found every site. That caught `gpu_udelay()` sitting three lines below the constant and using a
+  **bare literal `3000`** instead of it.
+
+**Safe on a proven timing path because the change is one-directional:** every use is a multiply
+into a timeout/delay or a divide into a report, so a *larger* value makes every delay longer, every
+timeout longer, and every reported duration smaller (more accurate). **No site anywhere shortens.**
+That asymmetry is why this was one bite and no burn.
+
+**`GPU_EDGE_WORK_MAX` does not move.** It was derived against the real ~93.9 ms; a true 100 ms only
+widens its margin (**42.6 % → 40.0 %** of the window).
+
+#### The aarch64 build this would have broken
+
+`core/gpu.cyr` is included **unconditionally** (`agnos.cyr:99`) and `aarch64/stubs.cyr:231` supplies
+an `rdtsc()` over `CNTVCT_EL0` — so gpu.cyr's timing code compiles for aarch64, where `tsc_per_us`
+did not exist. `check.sh` does not build aarch64, so the break would have surfaced on whoever next
+picked the port up. `tsc_per_us` / `tsc_base` now declared in `arch/aarch64/boot_data.cyr` as 0;
+nothing calibrates them there, so consumers correctly fall back.
+
+#### `gpu_tsc_selftest()` — 4 arms, and the sentinel that makes arm C real
+
+New, under `TSC_SELFTEST`, wired into `tsc-smoke.sh` (3 → **5 gates**). Arms: **A** pre-calibration
+branch (forced), **B** fallback within 100–10000 (a zero would expire every dispatch instantly),
+**C** calibrated branch, **D** a real `gpu_udelay(50 ms)` timed against `timer_ticks` — an
+**independent oracle**, since A and C only read back values they wrote.
+
+⭐ **Mutation-tested**, and the mutation changed the design. Forcing the accessor back to
+"always the constant" was initially caught only because this box calibrated to **3193** against a
+fallback of **3194** — a margin of **one**. Arm C was rewritten to inject a **sentinel `4242`** no
+real clock produces, removing the hardware from the test; the very next boot calibrated to
+**exactly 3194**, where the original form would have passed the mutant. Confirmed: mutant scores
+**3/4**, clean scores **4/4**.
+
+⚠ **Arm D failed first, and correctly.** Placed after `tsc_selftest()`, it read *0 ticks for a
+50 ms delay* — not a short delay, a **frozen oracle**: `tsc_selftest()` makes a ring-3 excursion and
+a foreground `run` executes with `IF` clear. Moved ahead of it, where calibration has just proven
+ticks live, arm D reads **5 ticks / 50 ms**. The same frozen-clock trap that cost two iron burns,
+in a new disguise. A `dt == 0` now prints that the oracle stopped, so the line cannot be misread as
+a `gpu_udelay` fault.
+
+Shipped kernel is **byte-identical in size** to pre-bite (1,772,728) — the selftest is `#ifdef`-
+guarded at the function, not just the call site.
+
 ### ⭐⭐⭐ EDGE_CAP RAISED ON MEASUREMENT — and replaced by a measured WORK-PRODUCT bound
 
 The probe burn (`gpu: edge rasteriser cap 256 edges`, `--cov` 20/20 on a fifth flash) produced the
@@ -38,6 +94,10 @@ Two independent measurements, one constant.
 cycles/µs where calibration **measures 3194**, so the real timeout is **~93.9 ms**. 2^26 predicts
 **~40.0 ms = 42.6 %** of it — >2× headroom for boost, shape variation and the fit's own error. It
 accepts 4096² with a triangle (~30 ms) and 256² with 256 edges (~10 ms); it rejects 4096² × E=64.
+
+> ⓘ **Superseded later in this same cycle** by the timing retune above: the watchdog is now a true
+> 100 ms, so the margin is **40.0 %**, not 42.6 %. The bound itself does not move — the retune only
+> widened it.
 
 Battery **22 → 24 cases, smoke 16/16**, gating **both directions**: the ~639 ms envelope is
 refused, and the ~0.65 ms envelope the old cap wrongly forbade is accepted. ⚠ A bound that only

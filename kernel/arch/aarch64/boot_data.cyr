@@ -2,3 +2,15 @@
 # Stack and basic state are set up by the ELF patcher (scripts/patch_aarch64.py)
 # which inserts SP initialization before the Cyrius entry point.
 # QEMU virt: RAM at 0x40000000, PL011 UART at 0x09000000
+
+# tsc_per_us / tsc_base — the x86_64 peers of these live in arch/x86_64/boot_data.cyr and are measured by
+# tsc_calibrate() against live timer ticks. Nothing calibrates them on aarch64 yet, so they stay 0 and
+# every consumer falls back to its compile-time estimate — which is the correct behaviour, not a stub.
+#
+# ⚠ THEY ARE DECLARED HERE ANYWAY, and that is the whole point. core/gpu.cyr is included UNCONDITIONALLY
+# (agnos.cyr:99, outside the arch #ifdefs) and aarch64/stubs.cyr supplies an rdtsc() over CNTVCT_EL0, so
+# gpu.cyr's timing code is compiled for aarch64 too. gpu_tsc_per_us() reads tsc_per_us; without these two
+# lines the aarch64 build breaks on an undefined variable. check.sh does not build aarch64, so that
+# breakage would not surface here — it would surface on whoever next picks the port up.
+var tsc_per_us = 0;    # measured cycles per microsecond; 0 = never calibrated (always, on this arch)
+var tsc_base   = 0;    # rdtsc at end of calibration; unused while tsc_per_us is 0

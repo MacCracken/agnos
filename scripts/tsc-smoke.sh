@@ -128,6 +128,29 @@ else
     fail=$((fail+1))
 fi
 
+chk "gpu-tsc: PASS" \
+    "gpu_tsc_per_us() -- all 4 arms (fallback branch, sane bound, calibrated branch, real udelay)" \
+    "gpu_tsc_per_us() selftest FAILED -- see the gpu-tsc: lines above for which arm"
+
+# ⭐ THE DIFFERENTIAL THAT PROVES THE RETUNE IS LIVE. Before this change every GPU timing path
+# multiplied by a hardcoded 3000 no matter what calibration measured. So compare the two numbers
+# ACROSS LINES, in the harness, independently of the kernel's own arm C: the per_us the GPU
+# accessor reports must equal the per_us tsc_calibrate measured. If the accessor ever regresses to
+# a constant, these two diverge on any box whose TSC is not exactly the fallback -- which is every
+# box, since the fallback is one specific machine's measurement.
+CAL=$(strings "$LOG" | grep -oE "^tsc: [0-9]+ cycles" | grep -oE "[0-9]+" | head -1)
+GPU=$(strings "$LOG" | grep -oE "per_us [0-9]+" | grep -oE "[0-9]+" | head -1)
+if [ -n "$CAL" ] && [ -n "$GPU" ] && [ "$CAL" = "$GPU" ]; then
+    echo "PASS: ⭐ GPU timing uses the CALIBRATED clock (accessor $GPU == calibrated $CAL)"
+    pass=$((pass+1))
+else
+    echo "FAIL: GPU accessor reports '$GPU' but calibration measured '$CAL' -- the GPU timing"
+    echo "      paths are NOT tracking the measured clock. That is the whole point of the"
+    echo "      gpu_tsc_per_us() indirection; a constant here silently mis-scales every"
+    echo "      dispatch watchdog and every PSP settle."
+    fail=$((fail+1))
+fi
+
 echo ""
 [ "$fail" -eq 0 ] && { echo "=== tsc-smoke: $pass passed, 0 failed ==="; exit 0; }
 echo "=== tsc-smoke: $pass passed, $fail failed ==="; exit 1

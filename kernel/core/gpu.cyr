@@ -91,15 +91,17 @@ var gpu_grad_ok       = 0;   # plan-S11: 1 = linear gradient proven on iron
 # ABI's 256, and the work product is the gate that actually protects the watchdog.
 #
 # GPU_EDGE_WORK_MAX = 2^26. Derivation, not a guess:
-#   * the dispatch watchdog is nominally 100 ms, but GPU_TSC_PER_US assumes 3000 cycles/us where
-#     the TSC calibration measures 3194 -> the REAL timeout is ~93.9 ms;
-#   * 2^26 work units predict ~40.0 ms = 42.6% of that, leaving >2x headroom for clock boost,
+#   * the dispatch watchdog is 100 ms of REAL time. It was ~93.9 ms when this bound was first derived,
+#     because the cycles-per-us figure was hardcoded at 3000 against a calibrated 3194; gpu_tsc_per_us()
+#     now returns the measured value, so the nominal and the real number finally agree;
+#   * 2^26 work units predict ~40.0 ms = 40.0% of that, leaving >2x headroom for clock boost,
 #     shape variation, and the fit's own error;
 #   * it ACCEPTS 4096^2 with a triangle (~30 ms) and 256^2 with 256 edges (~10 ms), and REJECTS
 #     4096^2 x E=64. Those are the envelopes that matter.
-# ⚠ Raise it only from a fresh sweep, the same way this one was set.
+# ⚠ The clock retune only WIDENED this margin (42.6% -> 40.0% of the window), so the bound did not move.
+#   Raise it only from a fresh sweep, the same way this one was set.
 var GPU_EDGE_CAP      = 256;         # the ABI maximum; the work product below is the real gate
-var GPU_EDGE_WORK_MAX = 67108864;    # 2^26 w*h*n_edges  ~= 40 ms of the ~94 ms watchdog
+var GPU_EDGE_WORK_MAX = 67108864;    # 2^26 w*h*n_edges  ~= 40 ms of the 100 ms watchdog
 var gpu_edge_armed    = 0;   # 3D rung 9: 1 = edge_cov blob resident (written at 9b; 0 through all of 9a)
 var gpu_grad_armed    = 0;   # 1 = grad_linear resident in its own arena slot for the #92 op path
 var gpu_perm_ok       = 0;   # plan-S4: 1 = v_perm_b32 byte crossbar + channel swap proven on iron
@@ -114,7 +116,7 @@ var gpu_ts_base = 0;
 fn gpu_ts_reset() { gpu_ts_base = rdtsc(); return 0; }
 fn gpu_ts_mark(label, len) {
     var us = 0;
-    if (gpu_ts_base != 0) { us = (rdtsc() - gpu_ts_base) / GPU_TSC_PER_US; }
+    if (gpu_ts_base != 0) { us = (rdtsc() - gpu_ts_base) / gpu_tsc_per_us(); }
     kprint("gpu: [T+", 8);
     kprint_num(us / 1000);
     kprint("ms] ", 4);
@@ -195,13 +197,105 @@ fn gpu_reg32_write(base_seg, off, val) {
 }
 
 # Busy-spin >= us microseconds via rdtsc (the hda_udelay idiom; agnos has no
-# udelay). The PSP handshake needs ~20 ms settles between ring ops. HDA_TSC_MHZ=3000
-# (~3 GHz archaemenid TSC); invariant-TSC, ~constant per box.
-# GPU_TSC_PER_US — cycles per microsecond, assumed 3.0 GHz. ⚠ APPROXIMATE, deliberately: Cezanne boosts, so
-# every time this file reports is +/- the real clock. It cannot be calibrated here — GPU init runs BEFORE
-# `sti`, so timer_ticks does not advance yet and there is no second time source to calibrate against. The
-# consequence to remember: the "100 ms" dispatch watchdog is really 79-150 ms depending on the live clock.
-var GPU_TSC_PER_US = 3000;
+# udelay). The PSP handshake needs ~20 ms settles between ring ops.
+#
+# === CYCLES-PER-MICROSECOND: MEASURED WHEN POSSIBLE, ESTIMATED WHEN NOT ===================================
+#
+# This file used to hardcode `gpu_tsc_per_us() = 3000` with a comment explaining that it could not be
+# calibrated, because GPU init runs BEFORE `sti` and the 100 Hz tick is the only other time source. That
+# was true of GPU INIT. It was never true of the ring-3 dispatch path, which runs long after
+# tsc_calibrate() has measured the real number against live ticks — and on archaemenid the real number is
+# 3194, not 3000. The consequence was a "100 ms" dispatch watchdog that actually expired at ~93.9 ms.
+#
+# So the number is no longer a constant, it is a QUERY. gpu_tsc_per_us() returns the calibrated value once
+# one exists and the estimate before that. The split falls exactly on the sti boundary for free: callers
+# during GPU init see tsc_per_us == 0 and get the estimate; every syscall-driven caller gets the truth.
+#
+# ⚠ THE ESTIMATE IS STILL AN ESTIMATE. It is only reachable before calibration, where nothing measures
+# anything — it just has to be close enough that the PSP settles are long enough. It is set to the
+# archaemenid measurement because a measured number from the one box we boot on beats a round one.
+#
+# ⭐ WHY THIS IS SAFE TO CHANGE ON A PROVEN TIMING PATH: every use of this value is a multiply into a
+# timeout/delay or a divide into a report. A LARGER value makes every delay longer, every timeout longer,
+# and every reported duration smaller (more accurate). There is no site anywhere in this file where a
+# larger cycles-per-us shortens something. 3000 -> 3194 therefore moves every timing path in the direction
+# of more patience, never less. That asymmetry is why this could be one bite instead of a burn.
+var GPU_TSC_PER_US_FALLBACK = 3194;   # pre-calibration estimate ONLY — call gpu_tsc_per_us(), never this
+
+fn gpu_tsc_per_us() {
+    # tsc_per_us is declared in arch/x86_64/boot_data.cyr (parsed at agnos.cyr:8, long before this file)
+    # and set by tsc_calibrate() in main.cyr right after `sti`. 0 means calibration has not run or refused.
+    if (tsc_per_us != 0) { return tsc_per_us; }
+    return GPU_TSC_PER_US_FALLBACK;
+}
+
+#ifdef TSC_SELFTEST
+# gpu_tsc_selftest — does the retune actually reach the timing paths? Called from main.cyr under
+# TSC_SELFTEST, immediately after tsc_calibrate(), because arm C has no meaning before then.
+#
+# ⚠ ARMS A AND C ARE ECHO TESTS and are scored as such: they write a value and read it back through the
+# accessor, which proves the branch selects but proves nothing about the delay it feeds. Arm D is the
+# answer register — it measures a real gpu_udelay() against timer_ticks, a clock with no shared mechanism
+# with the TSC at all. A pass on A+C with a fail on D would mean the accessor is correct and the delay
+# path still is not. ([[feedback_echo_vs_answer_registers]])
+fn gpu_tsc_selftest() {
+    var pass = 0;
+    var save = tsc_per_us;
+
+    # A: the pre-calibration branch. Forced, because by here the real one can never be taken again.
+    tsc_per_us = 0;
+    if (gpu_tsc_per_us() == GPU_TSC_PER_US_FALLBACK) { pass = pass + 1; }
+    tsc_per_us = save;
+
+    # B: the fallback is sane. A zero here would multiply every timeout to zero and every dispatch would
+    # "time out" instantly on the first read; a garbage-large one would hang the box past any watchdog.
+    # This arm exists because that failure is silent, catastrophic, and one typo away.
+    if (GPU_TSC_PER_US_FALLBACK > 100) {
+        if (GPU_TSC_PER_US_FALLBACK < 10000) { pass = pass + 1; }
+    }
+
+    # C: the calibrated branch — THE POINT OF THE RETUNE. Before this change the timing paths used a
+    # hardcoded 3000 no matter what calibration found.
+    #
+    # ⭐ TESTED WITH AN INJECTED SENTINEL, NOT THE LIVE VALUE, and that choice is the difference between a
+    # gate and a coincidence. Mutation-testing this bite (accessor forced back to "always the constant")
+    # showed the live-value form only caught it because this box calibrates to 3193 while the fallback is
+    # 3194 — a margin of ONE. On a box that happened to calibrate to exactly the fallback, comparing the
+    # accessor against the live value would have passed the mutant, because both sides would read 3194.
+    # A sentinel no real clock can produce removes the hardware from the test entirely.
+    tsc_per_us = 4242;
+    if (gpu_tsc_per_us() == 4242) { pass = pass + 1; }
+    tsc_per_us = save;
+
+    # D: ⭐ independent oracle. Ask for 50 ms through the same gpu_udelay() the PSP settles use, and time it
+    # on the 100 Hz tick. The band is wide on purpose — this arm is not measuring the clock's accuracy
+    # (tsc_calibrate already did, and 100 Hz cannot resolve 6.5% over 50 ms anyway). It is asking whether a
+    # delay built from gpu_tsc_per_us() lands in the right ORDER OF MAGNITUDE, which is what catches a unit
+    # slip, a zero, or an accessor that silently returns cycles-per-second.
+    var t0 = timer_ticks;
+    gpu_udelay(50000);
+    var dt = timer_ticks - t0;
+    if (dt > 2) {
+        if (dt < 10) { pass = pass + 1; }
+    }
+
+    kprint("gpu-tsc: ", 9); kprint_num(pass); kprint("/4 arms; per_us ", 16);
+    kprint_num(gpu_tsc_per_us());
+    kprint(" (fallback ", 11); kprint_num(GPU_TSC_PER_US_FALLBACK);
+    kprint("), 50 ms udelay measured ", 25); kprint_num(dt); kprintln(" ticks", 6);
+    # ⛔ A BARE "0 ticks" READS AS "the delay did not happen", and that is the wrong diagnosis: it means the
+    # ORACLE stopped, not the delay. Say so, because the two failures have nothing in common and the first
+    # instinct on seeing this line will be to go and read gpu_udelay.
+    if (dt == 0) {
+        kprintln("gpu-tsc: arm D oracle is FROZEN -- timer_ticks did not advance at all, so this says", 83);
+        kprintln("gpu-tsc:   nothing about gpu_udelay. Check IF, and check what ran before this point.", 84);
+    }
+    if (pass == 4) { kprintln("gpu-tsc: PASS", 13); }
+    if (pass != 4) { kprintln("gpu-tsc: FAIL", 13); }
+    return pass;
+}
+#endif
+
 var gpu_last_wait_us = 0;    # wall time the most recent gpu_wait_done actually spent, for the S12 measurement
 
 # gpu_wait_done — spin until `done_phys` reads `expect`, bounded by timeout_us of wall time. Returns 1/0.
@@ -361,7 +455,7 @@ fn gpu_recover_dequeue() {
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_DEQUEUE_REQUEST, GPU_CP_HQD_DEQUEUE_DRAIN);
     var t0 = rdtsc();
-    var limit = 100000 * GPU_TSC_PER_US;      # 100 ms — generous; the CP normally drains in µs
+    var limit = 100000 * gpu_tsc_per_us();      # 100 ms — generous; the CP normally drains in µs
     var cleared = 0;
     while ((rdtsc() - t0) < limit) {
         if ((gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_ACTIVE) & 1) == 0) { cleared = 1; }
@@ -533,16 +627,16 @@ fn gpu_arena_audit() {
 
 fn gpu_wait_done(done_phys, expect, timeout_us) {
     var t0 = rdtsc();
-    var limit = timeout_us * GPU_TSC_PER_US;
+    var limit = timeout_us * gpu_tsc_per_us();
     var el = 0;
     while (el < limit) {
         if ((load32(done_phys) & 0xFFFFFFFF) == expect) {
-            gpu_last_wait_us = el / GPU_TSC_PER_US;
+            gpu_last_wait_us = el / gpu_tsc_per_us();
             return 1;
         }
         el = rdtsc() - t0;
     }
-    gpu_last_wait_us = el / GPU_TSC_PER_US;
+    gpu_last_wait_us = el / gpu_tsc_per_us();
     if ((load32(done_phys) & 0xFFFFFFFF) == expect) { return 1; }
     # ⛔ RUNG 4: A TIMEOUT NOW CAPTURES INSTEAD OF GUESSING.
     # Every caller of this function has, until now, learned exactly one bit — "it did not
@@ -557,7 +651,7 @@ fn gpu_wait_done(done_phys, expect, timeout_us) {
 
 fn gpu_udelay(us) {
     var t0 = rdtsc();
-    var target = us * 3000;
+    var target = us * gpu_tsc_per_us();
     while ((rdtsc() - t0) < target) { }
     return 0;
 }
@@ -3658,7 +3752,7 @@ fn gpu_shader_batch_test() {
     if (gpu_s12_frame(0, src_mc, mask_mc, bmp_mc) != 1) {
         kprintln("gpu: op-by-op frame failed", 26); return 0;
     }
-    var seq_us = (rdtsc() - t0) / GPU_TSC_PER_US;
+    var seq_us = (rdtsc() - t0) / gpu_tsc_per_us();
 
     # Snapshot it. CP-DMA is MC-direct and the frame's shader stores have each been written back by their
     # own tail, so this read is coherent — plan-S3 arm C is exactly what licenses it.
@@ -3674,7 +3768,7 @@ fn gpu_shader_batch_test() {
     if (gpu_s12_frame(1, src_mc, mask_mc, bmp_mc) != 1) {
         kprintln("gpu: batched frame failed", 25); return 0;
     }
-    var bat_us = (rdtsc() - t1) / GPU_TSC_PER_US;
+    var bat_us = (rdtsc() - t1) / gpu_tsc_per_us();
 
     # ---- the gate: PIXEL-IDENTICAL ----
     var bad = 0;
@@ -5656,7 +5750,7 @@ fn gpu_otg_lock(pipe) {
     # notice. Matters more than it looks, because a lock left held freezes the pipe on its last frame —
     # which looks exactly like a successful hold.
     var t0 = rdtsc();
-    var lim = 20 * 1000 * GPU_TSC_PER_US;
+    var lim = 20 * 1000 * gpu_tsc_per_us();
     var acked = 0;
     while ((rdtsc() - t0) < lim) {
         if ((gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_MASTER_UPDATE_LOCK + o) & GPU_OTG_UPDATE_LOCK_STATUS) != 0) {
@@ -5738,9 +5832,9 @@ fn gpu_dcn_hold(frames) {
 # Reports the ACTUAL elapsed time, because a hold that claims 8 s and delivers 0.05 s is worse than no hold.
 fn gpu_dcn_hold_ms(ms) {
     var t0 = rdtsc();
-    var limit = ms * 1000 * GPU_TSC_PER_US;
+    var limit = ms * 1000 * gpu_tsc_per_us();
     while ((rdtsc() - t0) < limit) { }
-    return (rdtsc() - t0) / GPU_TSC_PER_US / 1000;
+    return (rdtsc() - t0) / gpu_tsc_per_us() / 1000;
 }
 
 # === 1.56.x D LANE — RETIRED 2026-07-23, code and flag ===================================================
