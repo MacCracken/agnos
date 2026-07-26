@@ -35,13 +35,21 @@ That asymmetry is why this was one bite and no burn.
 **`GPU_EDGE_WORK_MAX` does not move.** It was derived against the real ~93.9 ms; a true 100 ms only
 widens its margin (**42.6 % → 40.0 %** of the window).
 
-#### The aarch64 build this would have broken
+#### ⛔ Correction: the aarch64 break this claimed to avert does not exist
 
-`core/gpu.cyr` is included **unconditionally** (`agnos.cyr:99`) and `aarch64/stubs.cyr:231` supplies
-an `rdtsc()` over `CNTVCT_EL0` — so gpu.cyr's timing code compiles for aarch64, where `tsc_per_us`
-did not exist. `check.sh` does not build aarch64, so the break would have surfaced on whoever next
-picked the port up. `tsc_per_us` / `tsc_base` now declared in `arch/aarch64/boot_data.cyr` as 0;
-nothing calibrates them there, so consumers correctly fall back.
+This entry originally reported that `core/gpu.cyr` is included **unconditionally** and so compiles
+for aarch64, where `tsc_per_us` did not exist — and added `tsc_per_us` / `tsc_base` to
+`arch/aarch64/boot_data.cyr` to "fix" it. **That was wrong.** `agnos.cyr` has **two** separate
+`#ifdef ARCH_X86_64` blocks — lines **7–24** and lines **73–127** — and `core/gpu.cyr` (:99),
+`core/hda.cyr` (:97) and `core/main.cyr` (:124) all sit inside the **second** one. The aarch64 build
+includes exactly one file, `arch/aarch64/main.cyr` (:130). The misreading was seeing the `#endif` at
+line 24 and assuming everything below was unguarded.
+
+`aarch64/stubs.cyr:231` does supply an `rdtsc()` over `CNTVCT_EL0`, which made "the timing code
+compiles on this arch" look plausible — but that stub serves the aarch64 tree's own callers and is
+not evidence about `core/`. The two declarations were dead on arrival: nothing on the aarch64 path
+ever referenced them. **Removed**, with the include-graph fact recorded in that file so the next
+person checks which block a consumer lives in before adding a symbol to satisfy it.
 
 #### `gpu_tsc_selftest()` — 4 arms, and the sentinel that makes arm C real
 
@@ -121,6 +129,26 @@ differential extracted `grep -oE "per_us [0-9]+" | head -1`, which was only corr
 one line in the boot log carried that token. Adding `hda-tsc:` would have silently turned
 "first match" into "whichever selftest `main.cyr` calls first". Both differentials now anchor to
 their own line prefix.
+
+⭐ **Confirmed load-bearing, not cosmetic.** The HDA mutation run put two different values in one
+boot log — `gpu-tsc: … per_us 3193` and `hda-tsc: … per_us 3194` — and each gate read its own. Under
+the old extraction both would have read 3193 and the HDA mutant would have **passed** the
+differential.
+
+#### ⛔ And a second harness bug, found by audit: the FAIL messages pointed at filtered-out lines
+
+`tsc-smoke.sh:104` dumped the boot log through `grep -E "^tsc:|…"`. That anchor cannot match
+`gpu-tsc:` or `hda-tsc:` — they begin with a letter before the `t`. But both accessor gates tell the
+operator to *"see the gpu-tsc:/hda-tsc: lines above for which arm"*, and those were exactly the
+lines being filtered out of the dump they point at. A red gate therefore arrived with **no arm
+score, no `per_us`, no tick count**, and with the `arm D oracle is FROZEN` line — added in this same
+cycle *specifically* to stop a stopped clock being misdiagnosed as a broken `udelay` — suppressed.
+Diagnosing it cost a fresh 2-minute boot.
+
+Now `^[a-z-]*tsc:`, which covers a third adopter of the pattern for free. Verified against the
+retained mutant log: the old filter showed the operator nothing about the arms; the new one shows
+`hda-tsc: 3/4 arms; per_us 3194 (fallback 3194)` and `hda-tsc: FAIL`. Introduced by the GPU bite
+above and duplicated, not caught, by the HDA one.
 
 **Regression evidence (QEMU, not iron):** `hda-smoke` PASS — the full B0→B3 bring-up chain runs on
 the retuned delays (probe / `codecs=0x0001` / verb round-trip / AFG walk / route / stream armed with

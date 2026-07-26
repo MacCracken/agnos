@@ -101,7 +101,16 @@ timeout "${QEMU_TIMEOUT:-120}" qemu-system-x86_64 \
 
 echo ""
 echo "  --- tsc lines from the boot log ---"
-strings "$LOG" | grep -E "^tsc:|^run: exit|AGNOS shell|agnos>" | sed 's/^/  /'
+# ⛔ `^[a-z-]*tsc:`, NOT `^tsc:`. The anchored form matched the calibration and ring-3-probe lines
+# only — it could not match `gpu-tsc:` or `hda-tsc:`, because those start with a letter before the
+# 't'. Meanwhile the two accessor gates below tell the operator to "see the gpu-tsc:/hda-tsc: lines
+# above for which arm", and those lines were being filtered out of the very dump they point at. A
+# red gate therefore arrived with NO arm score, NO per_us value, NO tick count, and — worst — with
+# the "arm D oracle is FROZEN" explanation suppressed, which is the one line that exists to stop a
+# reader misdiagnosing a stopped clock as a broken udelay. Diagnosing it cost a fresh 2-minute boot.
+# ⚠ The character class covers a THIRD adopter of the pattern for free; `^tsc:|^gpu-tsc:|^hda-tsc:`
+# would have to be edited again, and this bug is precisely what "edit it again" failed to do once.
+strings "$LOG" | grep -E "^[a-z-]*tsc:|^run: exit|AGNOS shell|agnos>" | sed 's/^/  /'
 echo ""
 
 pass=0; fail=0
