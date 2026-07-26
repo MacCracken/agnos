@@ -84,9 +84,43 @@ var EXEC_LO = 126;              # the EXEC mask as a scalar operand (s_mov_b64 e
 var LIT = 255;
 var F1  = 242;                  # the f32 inline constant 1.0
 
+# ============================================================================================
+# VGPR HIGH-WATER TRACKING — the gate for a value the hardware will not tell you
+# ============================================================================================
+# ⛔ RSRC1 DECLARES THE VGPR COUNT AND IS NOT GRBM-READABLE. Nothing on the machine can be asked
+# "how many registers did you actually allocate?" — so an UNDER-declaration has no hardware oracle
+# at all. It does not run slow; the shader's high registers alias another wave's, or spill to a
+# scratch buffer agnos has never configured, and the result is corruption or a fault at a distance
+# from the cause.
+# ⭐ THE ASSEMBLER ALREADY KNOWS. It encoded every operand, so the maximum VGPR index in an emit
+# list is a mechanical fact, not an estimate. This converts the largest unmeasured assumption in
+# the shader ABI into a host-side check that costs nothing and runs before any flash.
+# ⚠ IT CATCHES UNDER-DECLARATION ONLY. Declaring MORE registers than are used is invisible here
+# and costs occupancy rather than correctness; that remains unmeasured.
+var ea_vgpr_max = 0 - 1;
+
+fn ea_vtrack(n): i64 {
+    if (n > ea_vgpr_max) { ea_vgpr_max = n; }
+    return n;
+}
+
+fn ea_vgpr_reset(): i64 { ea_vgpr_max = 0 - 1; return 0; }
+
+# declared = the .amdhsa_next_free_vgpr the blob ships with. Highest legal index is declared-1.
+fn ea_vgpr_check(declared, name): i64 {
+    if (ea_vgpr_max < declared) { return 1; }
+    ps("  ** edgeasm: "); ps(name);
+    ps(" declares "); pnum(declared); ps(" VGPRs but uses v");
+    pnum(ea_vgpr_max); ps(" -- UNDER-DECLARED, needs at least ");
+    pnum(ea_vgpr_max + 1); nl();
+    ea_fault = 1;
+    return 0;
+}
+
 fn V(n): i64 {
     if (n < 0)   { ea_fail("VGPR index negative"); return 0; }
     if (n > 255) { ea_fail("VGPR index > 255 -- mabda would silently mask it to 8 bits"); return 0; }
+    ea_vtrack(n);
     return gfx9_vgpr(n);
 }
 fn S(n): i64 {
@@ -107,9 +141,9 @@ fn K(k): i64 {
 var EA_ISA_BYTES = 8192;        # module-scope var[N] = N x u64, so isa[1024] is 8192 BYTES
 var isa[1024];
 
-fn e_vop1(p, op, vdst, s0): i64 { return gfx9_emit32(&isa, p, gfx9_enc_vop1(op, vdst, s0)); }
-fn e_vop2(p, op, vdst, s0, vs1): i64 { return gfx9_emit32(&isa, p, gfx9_enc_vop2(op, vdst, s0, vs1)); }
-fn e_vopc(p, op, s0, vs1): i64 { return gfx9_emit32(&isa, p, gfx9_enc_vopc(op, s0, vs1)); }
+fn e_vop1(p, op, vdst, s0): i64 { ea_vtrack(vdst); return gfx9_emit32(&isa, p, gfx9_enc_vop1(op, vdst, s0)); }
+fn e_vop2(p, op, vdst, s0, vs1): i64 { ea_vtrack(vdst); ea_vtrack(vs1); return gfx9_emit32(&isa, p, gfx9_enc_vop2(op, vdst, s0, vs1)); }
+fn e_vopc(p, op, s0, vs1): i64 { ea_vtrack(vs1); return gfx9_emit32(&isa, p, gfx9_enc_vopc(op, s0, vs1)); }
 fn e_sop1(p, op, sdst, s0): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sop1(op, sdst, s0)); }
 fn e_sop2(p, op, sdst, s0, s1): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sop2(op, sdst, s0, s1)); }
 fn e_sopc(p, op, s0, s1): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sopc(op, s0, s1)); }
@@ -139,6 +173,7 @@ fn e_sop1_lit(p, op, sdst, lit): i64 {
 # ⛔ REFUSES src == 255. VOP3 has NO literal form — mabda's own compiler treats this as
 # CMP_ERR_VOP3_LITERAL. Silently encoding it names an operand that does not exist.
 fn e_vop3(p, op, vdst, s0, s1, s2): i64 {
+    ea_vtrack(vdst);
     if (s0 == GFX9_SRC_LITERAL) { ea_fail("VOP3 src0 is a LITERAL -- VOP3 has no literal form"); }
     if (s1 == GFX9_SRC_LITERAL) { ea_fail("VOP3 src1 is a LITERAL -- VOP3 has no literal form"); }
     if (s2 == GFX9_SRC_LITERAL) { ea_fail("VOP3 src2 is a LITERAL -- VOP3 has no literal form"); }
@@ -146,12 +181,17 @@ fn e_vop3(p, op, vdst, s0, s1, s2): i64 {
     return gfx9_emit32(&isa, q, gfx9_enc_vop3a_hi(s0, s1, s2));
 }
 fn e_vop3b(p, op, sdst, vdst, s0, s1, s2): i64 {
+    ea_vtrack(vdst);
     if (s0 == GFX9_SRC_LITERAL) { ea_fail("VOP3b src0 is a LITERAL"); }
     var q = gfx9_emit32(&isa, p, gfx9_enc_vop3b_lo(op, sdst, vdst));
     return gfx9_emit32(&isa, q, gfx9_enc_vop3a_hi(s0, s1, s2));
 }
 # FLAT is likewise two dwords and likewise silent if half-emitted.
 fn e_flat(p, op, glc, vdst, data, vaddr, off): i64 {
+    # ⚠ ALL THREE of vdst/data/vaddr are raw VGPR indices here, and vaddr is a 64-bit address so it
+    # occupies vaddr AND vaddr+1. Tracking only vaddr would under-count by one on the very
+    # instruction most likely to sit at the top of the register file.
+    ea_vtrack(vdst); ea_vtrack(data); ea_vtrack(vaddr); ea_vtrack(vaddr + 1);
     var q = gfx9_emit32(&isa, p, gfx9_enc_flat_lo(op, GFX9_FLAT_SEG_GLOBAL, off, glc, 0));
     return gfx9_emit32(&isa, q, gfx9_enc_flat_hi(vdst, GFX9_SADDR_OFF, data, vaddr));
 }
@@ -912,10 +952,37 @@ fn main(): i64 {
     puts("[gate 4] the two 9b blobs, edgeasm vs llvm-mc on the SAME source");
     ea_fault = 0;
     setup_want();
+    ea_vgpr_reset();
     if (blob_check("edge_setup", 10, 58, setup_emit()) == 0) { ok = 0; }
+    # ⚠ edge_setup and edge_cov SHARE RSRC1 (0x002C00CD, 56 VGPRs) -- that shared descriptor is what
+    # lets the shipped dispatcher run both unmodified. So both are checked against 56.
+    if (ea_vgpr_check(56, "edge_setup") == 0) { ok = 0; }
+    var setup_hi = ea_vgpr_max;
     cov_want();
+    ea_vgpr_reset();
     if (blob_check("edge_cov  ", 10, 135, cov_emit()) == 0) { ok = 0; }
+    if (ea_vgpr_check(56, "edge_cov") == 0) { ok = 0; }
     if (ea_fault != 0) { puts("  ** an asserting wrapper REFUSED while emitting a 9b blob"); ok = 0; }
+
+    # ---- GATE 5: the VGPR high-water gate itself ------------------------------------------
+    # ⭐ A gate that cannot fail is not a gate, and this one guards a value with NO hardware
+    # oracle: RSRC1 is not GRBM-readable, so nothing on the machine can contradict a wrong
+    # declaration. Prove it fires by asking it to accept a deliberately impossible budget.
+    puts("[gate 5] the VGPR high-water gate must REFUSE an under-declaration");
+    ps("  edge_setup uses up to v"); pnum(setup_hi);
+    ps(", edge_cov up to v"); pnum(ea_vgpr_max);
+    puts(" (both declare 56)");
+    var saved = ea_fault;
+    ea_fault = 0;
+    var fired = 0;
+    if (ea_vgpr_check(1, "MUTANT") == 0) { fired = 1; }
+    ea_fault = saved;
+    if (fired == 0) {
+        puts("  ** the gate ACCEPTED a 1-VGPR declaration for a blob using dozens --");
+        puts("  ** it is decoration and no later bite may cite it");
+        ok = 0;
+    }
+    if (fired == 1) { puts("  the gate refuses a 1-VGPR declaration, as it must"); }
 
     puts("");
     if (ok == 0) { puts("** B4 FAILED. The tool is not trustworthy; do not author with it."); return 90; }
