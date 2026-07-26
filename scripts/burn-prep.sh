@@ -196,15 +196,24 @@ elif [ -n "${BURN_EDGE_COV:-}" ]; then
     #   86  a negative control did not fire. The run proves nothing either way; fix and re-burn.
     #   85  digest mismatch (see step 1).
     #
-    # ⚠⚠ KNOWN GAP, STATED BEFORE THE FLASH RATHER THAN DISCOVERED AFTER IT.
-    # The plan's B9 specifies a THIRD oracle, `gputri --valu`: a ~15-instruction kernel that
-    # writes known v_mul_hi_u32 results to a readback slot. IT IS NOT BUILT. v_mul_hi_u32 appears
-    # in NO shipped agnos shader and the entire divider rests on it, so if this burn comes back
-    # 91 or 92, that instruction is an UNELIMINATED SUSPECT alongside the divider composition.
+    # ⭐ BURN 2. Burn 1 (2026-07-25) returned 14 of 20 byte-exact with all 20 digests matching.
+    # That RETIRED v_mul_hi_u32 and global_store_byte as suspects — a 64-gon at the edge cap
+    # cannot be byte-exact if either were wrong — so the `--valu` oracle named as a gap before
+    # burn 1 is no longer needed. It was never built, and the ordering call that skipped it paid.
     #
-    # Cutting anyway is a deliberate ordering call: B2 proved the algorithm exhaustively on the
-    # host, so a GREEN result retires v_mul_hi_u32 for free and --valu would have been wasted
-    # work. --valu only pays if this burn is red, and then it is the FIRST thing built.
+    # Two faults fixed since:
+    #   1. Five GPO_E_EDGEBUF rejects were MINE: refraster dropped horizontal edges at ingest, so
+    #      a flat-topped triangle submitted 2 edges against an ABI minimum of 3 — and the CPU and
+    #      GPU were not being given the same geometry. Horizontals are kept now; all 20 digests
+    #      are UNCHANGED, which is the proof the oracle did not move.
+    #   2. ⭐ Case 14 (the OPEN path) was a REAL shader bug: a per-lane `break` rendered as a
+    #      WAVE-level s_cbranch_vccz, so a lane with no crossing to its right filled to the end
+    #      of its pixel. Reproduced exactly in edgemodel.cyr (631 bytes, delta 255, case 14
+    #      alone) before being fixed, and re-verified 135/135 byte-identical after.
+    #
+    # ⇒ THE BAR FOR THIS BURN IS 20 of 20 AND exit 95. Anything less is a NEW fault: burn 1
+    # already demonstrated that 14 specific cases pass, so a regression among them is a
+    # regression, not a mystery.
     echo "[2/2] Building the 3D-arc RUNG 9b kernel (edge rasteriser; no compile flag needed)."
     echo "      Run: gputri --digest (compare vs host cpuref) THEN gputri --cov THEN klug > /edge.txt"
     BUILD_ENV=""

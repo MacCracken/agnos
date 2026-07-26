@@ -524,7 +524,7 @@ fn cov_want(): i64 {
     store64(&want +   2 * 8, 0x6802000A);
     store64(&want +   3 * 8, 0x7D980206);
     store64(&want +   4 * 8, 0xBE94206A);
-    store64(&want +   5 * 8, 0xBF88007E);
+    store64(&want +   5 * 8, 0xBF880080);
     store64(&want +   6 * 8, 0x24040290);
     store64(&want +   7 * 8, 0x7E0602FF);
     store64(&want +   8 * 8, 0x00010000);
@@ -620,39 +620,41 @@ fn cov_want(): i64 {
     store64(&want +  98 * 8, 0xBF85FFB4);
     store64(&want +  99 * 8, 0x7D9A1080);
     store64(&want + 100 * 8, 0x86EA7E6A);
-    store64(&want + 101 * 8, 0xBF86000A);
+    store64(&want + 101 * 8, 0xBF86000C);
     store64(&want + 102 * 8, 0x18640707);
     store64(&want + 103 * 8, 0x6A660B32);
     store64(&want + 104 * 8, 0x20666682);
     store64(&want + 105 * 8, 0x7D9A0C80);
     store64(&want + 106 * 8, 0x00666680);
-    store64(&want + 107 * 8, 0x68086704);
-    store64(&want + 108 * 8, 0x7E0A0332);
-    store64(&want + 109 * 8, 0x7D820705);
-    store64(&want + 110 * 8, 0x86EA7E6A);
-    store64(&want + 111 * 8, 0xBF87FFA2);
-    store64(&want + 112 * 8, 0x800C810C);
-    store64(&want + 113 * 8, 0xBF0A840C);
-    store64(&want + 114 * 8, 0xBF85FF9A);
-    store64(&want + 115 * 8, 0x7E6802FF);
-    store64(&want + 116 * 8, 0x00010000);
-    store64(&want + 117 * 8, 0x1C086904);
-    store64(&want + 118 * 8, 0x246A0888);
-    store64(&want + 119 * 8, 0x6A6A0935);
-    store64(&want + 120 * 8, 0x206A6A90);
-    store64(&want + 121 * 8, 0x92100609);
-    store64(&want + 122 * 8, 0x7E6C0202);
-    store64(&want + 123 * 8, 0x7E6E0203);
-    store64(&want + 124 * 8, 0xD1196A36);
-    store64(&want + 125 * 8, 0x00002136);
-    store64(&want + 126 * 8, 0x386E6E80);
-    store64(&want + 127 * 8, 0x326C0336);
+    store64(&want + 107 * 8, 0x7D9A1080);
+    store64(&want + 108 * 8, 0x00666680);
+    store64(&want + 109 * 8, 0x68086704);
+    store64(&want + 110 * 8, 0x7E0A0332);
+    store64(&want + 111 * 8, 0x7D820705);
+    store64(&want + 112 * 8, 0x86EA7E6A);
+    store64(&want + 113 * 8, 0xBF87FFA0);
+    store64(&want + 114 * 8, 0x800C810C);
+    store64(&want + 115 * 8, 0xBF0A840C);
+    store64(&want + 116 * 8, 0xBF85FF98);
+    store64(&want + 117 * 8, 0x7E6802FF);
+    store64(&want + 118 * 8, 0x00010000);
+    store64(&want + 119 * 8, 0x1C086904);
+    store64(&want + 120 * 8, 0x246A0888);
+    store64(&want + 121 * 8, 0x6A6A0935);
+    store64(&want + 122 * 8, 0x206A6A90);
+    store64(&want + 123 * 8, 0x92100609);
+    store64(&want + 124 * 8, 0x7E6C0202);
+    store64(&want + 125 * 8, 0x7E6E0203);
+    store64(&want + 126 * 8, 0xD1196A36);
+    store64(&want + 127 * 8, 0x00002136);
     store64(&want + 128 * 8, 0x386E6E80);
-    store64(&want + 129 * 8, 0xDC618000);
-    store64(&want + 130 * 8, 0x007F3536);
-    store64(&want + 131 * 8, 0xBF8C0F70);
-    store64(&want + 132 * 8, 0xBF810000);
-    return 133;
+    store64(&want + 129 * 8, 0x326C0336);
+    store64(&want + 130 * 8, 0x386E6E80);
+    store64(&want + 131 * 8, 0xDC618000);
+    store64(&want + 132 * 8, 0x007F3536);
+    store64(&want + 133 * 8, 0xBF8C0F70);
+    store64(&want + 134 * 8, 0xBF810000);
+    return 135;
 }
 fn cov_emit(): i64 {
     ea_labels_reset();
@@ -751,6 +753,8 @@ fn cov_emit(): i64 {
     p = e_vop2(p, 0x35, 51, V(50), 5);
     p = e_vop2(p, 0x10, 51, K(2), 51);
     p = e_vopc(p, 0xCD, K(0), 6);
+    p = e_vop2(p, 0x00, 51, K(0), 51);
+    p = e_vopc(p, 0xCD, K(0), 8);
     p = e_vop2(p, 0x00, 51, K(0), 51);
     p = e_vop2(p, 0x34, 4, V(4), 51);
     p = e_vop1(p, 0x01, 5, V(50));
@@ -910,7 +914,7 @@ fn main(): i64 {
     setup_want();
     if (blob_check("edge_setup", 10, 58, setup_emit()) == 0) { ok = 0; }
     cov_want();
-    if (blob_check("edge_cov  ", 10, 133, cov_emit()) == 0) { ok = 0; }
+    if (blob_check("edge_cov  ", 10, 135, cov_emit()) == 0) { ok = 0; }
     if (ea_fault != 0) { puts("  ** an asserting wrapper REFUSED while emitting a 9b blob"); ok = 0; }
 
     puts("");

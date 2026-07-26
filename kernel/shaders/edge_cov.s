@@ -94,6 +94,14 @@ L_EDGE:
     v_mul_lo_u32    v28, v27, v25           // P.lo
     v_mul_hi_u32    v29, v27, v25           // P.hi  ⭐ NEVER RUN ON AGNOS SILICON -- burn 1's
                                             // first oracle exists for exactly this instruction
+    // ⚠ L == 0 WOULD DIVERGE FROM THE MODEL, AND ONLY THE B3 GUARD MAKES IT UNREACHABLE.
+    // gfx9 masks a shift count to 5 bits, so at L == 0 the `v_lshrrev_b32 v33, v30, v28` below
+    // shifts by 32&31 = 0 and yields P.lo, where edgemodel.cyr's `if (l32 < 32)` forces 0 —
+    // giving a1 = P.hi | P.lo instead of P.hi. L = clz32(d) with d clamped to >= 1, so L == 0
+    // requires d >= 2^31, and the coordinate guard (|x|,|y| <= 2^28 => d <= 2^29) forbids it.
+    // ⛔ THAT IS A DEPENDENCY, NOT A COINCIDENCE. If GPU_EDGE_COORD_MAX is ever widened past
+    // 2^30, add the explicit `L == 0 -> tw = 0` cndmask here IN THE SAME BITE. Three independent
+    // adversarial reviewers raised this and each refuted it only via the guard.
     v_sub_u32       v30, 32, v19            // L32 = 32 - L
     v_lshlrev_b32   v31, v19, v28           // P' = P << L, built from four 32-bit ops
     v_lshlrev_b32   v32, v19, v29
@@ -151,6 +159,26 @@ L_EDGE:
     v_sub_u32       v51, v50, v5            // v - u
     v_lshrrev_b32   v51, 2, v51             // ONE fragment, truncated ONCE
     v_cmp_ne_u32    vcc, 0, v6              // w_acc != 0 ?
+    v_cndmask_b32   v51, 0, v51, vcc
+    // ⛔⛔ AND THE LANE MUST HAVE HAD A CROSSING TO THE RIGHT. THE FIRST IRON BURN FOUND THIS.
+    //
+    // The `s_cbranch_vccz L_SUBNEXT` above is a WAVE-level branch: it only skips when NO lane in
+    // the wave has work. A lane whose `any == 0` therefore FALLS THROUGH with vmin still INF, so
+    // v = min(INF, pr) = pr and it fills from u to the END OF ITS PIXEL -- the exact "fill past
+    // the last crossing" this rung forbids.
+    //
+    // ⚠ It hid on 19 of 20 corpus cases because a CLOSED path has winding 0 once its crossings
+    // are exhausted, so the `w_acc != 0` mask above suppressed the spurious fragment. Only the
+    // OPEN path (case 14) has non-zero winding there, and it failed by 631 of 4096 bytes at
+    // worst delta 255 -- reproduced EXACTLY in edgemodel.cyr by emulating this fall-through.
+    //
+    // ⭐ The algorithm was never wrong. B2's model breaks per-lane and is byte-exact; what was
+    // wrong is this file's translation of a per-lane `break` into wave-level control flow. That
+    // is precisely the emission-vs-algorithm split B2 exists to give, working as designed.
+    //
+    // `u = v` stays UNCONDITIONAL below: with vmin = INF the lane sets u = pr and leaves the
+    // loop, which is what keeps a work-less lane from spinning while the wave continues.
+    v_cmp_ne_u32    vcc, 0, v8              // any != 0 ?
     v_cndmask_b32   v51, 0, v51, vcc
     v_add_u32       v4, v4, v51             // acc += fragment
     v_mov_b32       v5, v50                 // u = v

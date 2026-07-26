@@ -44,6 +44,71 @@ byte-identically** — 50/50 cases (8 corpus + 2 shared-edge quads + 40 random m
 accumulation is associative, so summation order genuinely does not matter. This is the structural
 premise the whole one-lane-per-pixel design rests on, and it is now measured rather than assumed.
 
+### ⭐ BURN 1 (rung 9b, B9) — the divider works on silicon. Two faults, both localised.
+
+`gputri --digest` **95** · `gputri --cov` **90** (14 of 20 byte-exact).
+
+**All 20 reference digests matched the host line for line**, so the one check that could catch both
+sides being wrong together came back clean and every byte-comparison is against the right answer.
+
+⭐⭐ **`v_mul_hi_u32` and `global_store_byte` are RETIRED as suspects.** Neither had ever executed on
+agnos silicon and the entire divider rested on `v_mul_hi_u32`. Fourteen byte-exact masks — including
+the **64-gon at the edge cap** (64 reciprocals, every crossing through the 25-op divider), the
+**200×64 wide mask** (`tgid_x` wrapping 3×), the bowtie, the 10-edge overlap+gap pair, negative
+coordinates, and a 37×29 mask narrower than one workgroup — are impossible if either were wrong.
+**The `--valu` oracle flagged as a known gap before the flash is no longer needed, exactly as the
+ordering call predicted.**
+
+### Fixed — five `GPO_E_EDGEBUF` rejects: mine, in the reference, not the shader
+
+Cases 4, 7, 8, 11, 18 — **precisely the five with a horizontal edge**, the set B1 identified and
+then failed to act on. `edge_add` dropped `y0 == y1` at ingest, so a flat-topped triangle held only
+**two** edges and the ABI requires `ne ≥ 3`.
+
+⛔ The deeper error: those arrays are the *one source of truth* the tool submits to `#92`, so the CPU
+and the GPU **were not being given the same geometry** — the exact failure "one source of truth" was
+introduced to prevent. Horizontal edges are now **kept**; `raster()`'s half-open test already filters
+them, and **all 20 digests are unchanged**, which is the proof the oracle did not move.
+`rr_corpus_audit` now checks for a horizontal edge *directly* rather than inferring one from a
+dropped-count mismatch.
+
+### Fixed — ⭐ case 14: a real shader bug, and B2 localised it exactly as designed
+
+`631 of 4096 bytes, worst delta 255, 0 untouched → WRONG SHAPE`, on the **open path** alone.
+
+The model breaks **per lane** when a pixel has no crossing to its right. The shader rendered that as
+a **wave-level** `s_cbranch_vccz`, which branches only when *no* lane has work — so a lane with
+`any == 0` fell through with `vmin` still `INF`, computed `v = min(INF, pr) = pr`, and **filled to
+the end of its pixel**. Precisely the "fill past the last crossing" the design forbids.
+
+⚠ It hid on 19 of 20 cases because a **closed** path has winding 0 once its crossings are exhausted,
+so the `w_acc != 0` mask suppressed the spurious fragment. Only the **open** path has non-zero
+winding there — which is why case 14 is in the corpus at all.
+
+**Confirmed by reproduction, not inference:** emulating the wave-level fall-through inside
+`edgemodel.cyr` produced **631 bytes, worst delta 255, on case 14 alone** — identical to iron.
+
+⭐ **The algorithm was never wrong.** B2's model is byte-exact; what was wrong was the shader's
+translation of a per-lane `break` into wave-level control flow. **That is the emission-vs-algorithm
+split B2 was built to give, working on its first real test.** Fix: mask the fragment by the lane's
+own `any` as well as by `w_acc` (+2 instructions, 133 → 135 dwords). Re-verified **135/135**
+byte-identical between `llvm-mc` and agnos's emitter.
+
+### Added — an adversarial audit for the same CLASS of bug, and one latent dependency it surfaced
+
+Having made a per-lane→wave-level mistake once, an 11-agent audit swept both shaders through four
+lenses (branch divergence · semantic diff vs the model · VCC/VGPR hazards · boundary behaviour),
+each finding then handed to an independent agent instructed to **refute** it. **7 candidates, 7
+refuted — no second divergence-class bug.**
+
+⚠ **One refutation is worth keeping as a dependency, not discarding as a non-issue.** Three
+reviewers independently raised that `edge_cov.s`'s normalising shift omits the model's
+`L == 0 → tw = 0` guard: gfx9 masks shift counts to 5 bits, so at `L == 0` it would compute
+`P.hi | P.lo` instead of `P.hi`. Each refuted it the same way — `L = clz32(d)` makes `L == 0`
+require `d ≥ 2^31`, which **B3's `±2^28` coordinate guard forbids**. So it is unreachable *because
+of that guard*. Recorded at **both** ends (`edge_cov.s` and `GPU_EDGE_COORD_MAX`): widening the
+bound past `2^30` requires adding that cndmask **in the same bite**.
+
 ### Added — bite **B8**: `/bin/gputri` rebuilt against the live seam, and WIRED INTO THE BURN
 
 `gputri` appeared in **neither** `stage-tools.sh` nor `burn-prep.sh` (`grep -rn gputri scripts/`

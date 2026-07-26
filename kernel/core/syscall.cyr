@@ -1042,6 +1042,10 @@ var GPU_COV_MAX_DIM = 4096;          # per-side mask cap — a REJECT, never a c
 #     gate 3 FALSIFIES this on purpose (15 of 4000 cases differ above 2^31), which is what makes
 #     the bound a measured domain rather than decoration.
 # At +-2^28: M, d <= 2^29, so the divider keeps two bits of margin and the reference five.
+# ⛔ WIDENING THIS PAST 2^30 HAS A SHADER CONSEQUENCE. `edge_cov.s`'s normalising shift omits the
+# model's `L == 0 -> tw = 0` guard, and gfx9 masks shift counts to 5 bits, so at L == 0 it would
+# compute P.hi | P.lo instead of P.hi. L = clz32(d) makes L == 0 require d >= 2^31, which THIS
+# BOUND forbids. Raise it and you must add that cndmask in the same bite.
 var GPU_EDGE_COORD_MAX = 268435456;  # 2^28
 
 # gpo_field_mask(op) — bit i set <=> this op DEFINES record dword i (byte offset i*4).

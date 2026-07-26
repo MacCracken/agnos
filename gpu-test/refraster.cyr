@@ -75,11 +75,22 @@ fn rr_set_dims(w, h): i64 {
 
 fn edges_reset(): i64 { n_edges = 0; return 0; }
 fn edge_add(x0, y0, x1, y1): i64 {
-    # ⚠ Degenerate horizontal edges contribute no crossings under the half-open rule and are
-    # dropped here, exactly as sadish's y-range test drops them (ylo == yhi can never satisfy
-    # both sy >= ylo and sy < yhi). Dropping them explicitly makes the corpus's zero-area and
-    # sliver cases behave identically in both implementations rather than by accident.
-    if (y0 == y1) { return 0; }
+    # ⛔⛔ HORIZONTAL EDGES ARE **KEPT**, and the first iron burn is why.
+    #
+    # This used to drop `y0 == y1` at ingest. That is harmless for `raster()` — the half-open
+    # test below can never satisfy both `sy >= ylo` and `sy < yhi` when ylo == yhi, so a
+    # horizontal edge contributes no crossing either way and the reference output is
+    # BYTE-IDENTICAL with or without the drop (verified: all 20 digests unchanged).
+    #
+    # ⚠ But these arrays are ALSO the "one source of truth" the ring-3 tool submits to `#92`,
+    # and the ABI requires `n_edges >= 3`. Dropping the horizontal edge left a flat-topped
+    # triangle holding only TWO, so the kernel correctly rejected it with GPO_E_EDGEBUF — on
+    # exactly the five corpus cases that contain one (4, 7, 8, 11, 18), which is precisely the
+    # set B1 identified and then failed to act on.
+    #
+    # ⭐ Keeping them is also the more faithful model: the SHADER receives every submitted edge
+    # including the horizontals and filters them with its own half-open guard. Filtering at
+    # ingest meant the CPU and the GPU were not being given the same geometry.
     if (n_edges >= MAXE) { return 0; }
     store64(&ex0 + n_edges * 8, x0); store64(&ey0 + n_edges * 8, y0);
     store64(&ex1 + n_edges * 8, x1); store64(&ey1 + n_edges * 8, y1);
@@ -500,16 +511,12 @@ fn rr_case_load(i): i64 {
     return 1;
 }
 
-# rr_case_edges_submitted(i) -> how many edges the CASE DEFINES, before the horizontal drop.
-# This is what a `#92` caller puts in `n_edges`, and it is NOT always what `raster()` iterates.
-fn rr_case_edges_submitted(i): i64 {
-    if (i == 4)  { return 3; }
-    if (i == 7)  { return 3; }
-    if (i == 8)  { return 3; }
-    if (i == 11) { return 4; }
-    if (i == 18) { return 3; }
-    return n_edges;
-}
+# rr_case_edges_submitted(i) -> what a `#92` caller puts in `n_edges`.
+# ⭐ Since the first iron burn this is simply `n_edges`: horizontal edges are no longer dropped
+# at ingest, so the submitted count and the stored count are the same number, and the CPU and
+# the GPU are finally given the SAME geometry. Kept as a named function because consumers ask
+# the question and the answer should have one place to change.
+fn rr_case_edges_submitted(i): i64 { return n_edges; }
 
 # rr_case_expect_lit(i) -> 1 if this case MUST produce at least one non-zero coverage byte.
 # ⭐ Cases 2 and 6 are all-zero BY DESIGN, so a dead shader reproduces them perfectly. Any
@@ -553,8 +560,15 @@ fn rr_corpus_audit(): i64 {
             if (n_edges > 3)  { n_multishape = n_multishape + 1; }
             if (i == 10)      { case10_edges = n_edges; }
             if (rr_case_expect_lit(i) == 0) { n_empty = n_empty + 1; }
-            # a horizontal edge was dropped <=> submitted count exceeds the retained count
-            if (rr_case_edges_submitted(i) > n_edges) { n_horiz = n_horiz + 1; }
+            # ⭐ A horizontal edge is now KEPT, so the property is checked DIRECTLY rather than
+            # inferred from a count mismatch. What matters is that the corpus still hands the
+            # shader at least one `y0 == y1` edge to filter with its own half-open guard — an
+            # unfiltered GPU disagrees on five of the twenty cases.
+            var hz = 0;
+            while (hz < n_edges) {
+                if (load64(&ey0 + hz * 8) == load64(&ey1 + hz * 8)) { n_horiz = n_horiz + 1; }
+                hz = hz + 1;
+            }
             var k = 0;
             while (k < n_edges) {
                 if (load64(&ex0 + k * 8) < 0) { n_negcoord = n_negcoord + 1; }
