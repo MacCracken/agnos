@@ -36,8 +36,8 @@ two slots don't need the same **start** to collide, only a shared **byte**.
 - An **undeclared extent is now a hard failure**, so this class cannot recur silently. Both failure
   modes mutation-tested to exit 1; clean exits 0.
 
-⚠ **Two traps the survey caught that a careless annotation pass would have walked into.** The C2e
-sentinel is **4 bytes**, not the 4 KB its comment implies — that comment describes the free *gap*
+⚠ **Two traps the survey caught that a careless annotation pass would have walked into.** The ring
+fence sentinel is **4 bytes**, not the 4 KB its comment implies — that comment describes the free *gap*
 around the slot, and declaring 4 KB would have fired a **false** overlap against the breadcrumb at
 `0x12400`. And `GPU_SHADER_SUBOFF`'s blob writers take the destination as a **parameter**, so the
 bound is the largest blob in the tree (`edge_cov_write`, 540 B), not the 240 B one that happens to be

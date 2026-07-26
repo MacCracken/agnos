@@ -127,9 +127,9 @@ var GPU_SDMA0_UTC_L1_EN  = 0x2;         # SDMA0_CNTL UTC_L1_ENABLE bit1 — ring
 var GPU_SDMA0_CAPTURED   = 0x40000000;  # GFX_DOORBELL CAPTURED bit30 (RO) — set when a doorbell latches at engine
 var GPU_SDMA_RING_SUBOFF  = 0x20000;    # 64 KB SDMA GFX ring in the arena (past all compute buffers ~0x1A000)  -> ends 0x30000
 var GPU_SDMA_RPTR_SUBOFF  = 0x30000;    # rptr-report writeback page  -> ends 0x31000
-var GPU_SDMA_SRC_SUBOFF   = 0x38000;    # P9.2 copy-test SOURCE slot (4 KB, clear of ring/rptr)  -> ends 0x39000
-var GPU_SDMA_DST_SUBOFF   = 0x39000;    # P9.2 copy-test DEST slot (4 KB)  -> ends 0x3A000
-var GPU_SDMA_FENCE_SUBOFF = 0x3A000;    # P9.2 FENCE sentinel slot (completion gate — coherence-honest)  -> ends 0x3A004
+var GPU_SDMA_SRC_SUBOFF   = 0x38000;    # SDMA copy-test SOURCE slot (4 KB, clear of ring/rptr)  -> ends 0x39000
+var GPU_SDMA_DST_SUBOFF   = 0x39000;    # SDMA copy-test DEST slot (4 KB)  -> ends 0x3A000
+var GPU_SDMA_FENCE_SUBOFF = 0x3A000;    # SDMA copy-test completion fence (coherence-honest gate)  -> ends 0x3A004
 
 # --- Register offsets within their IP (DWORD) ---
 # NBIO/RCC — always-on bus interface; the safest reads on the GPU.
@@ -940,7 +940,7 @@ var GPU_CP_HQD_DEQUEUE_DRAIN         = 0x1;    # DEQUEUE_REQ = 1 (drain and unma
 # is 0x04 above; STATUS2 is 0x02 in the same seg-0 GRBM window.
 var GPU_R_GRBM_STATUS2               = 0x0002;
 # Breadcrumb slot: one dword the CP writes between packet blocks so a hang can be BRACKETED.
-# ⚠ Placed in the C2e sentinel's free 4 KB gap, 0x400 clear of GPU_VM_SENT_SUBOFF, so it collides
+# ⚠ Placed in the ring fence sentinel's free 4 KB gap, 0x400 clear of GPU_VM_SENT_SUBOFF, so it collides
 # with no published arena slot. It must NOT share a cache line with the done fence, or a write-back
 # of one would make the other look fresher than it is.
 var GPU_BREADCRUMB_SUBOFF = 0x12400;            # -> ends 0x12540
@@ -977,7 +977,13 @@ var GPU_CP_MQD_CONTROL_VAL     = 0x100;       # PRIV_STATE, VMID 0
 var GPU_VM_RING_SUBOFF = 0x00000;   # PM4 ring (64 KB)  -> ends 0x10000
 var GPU_VM_MQD_SUBOFF  = 0x10000;   # MQD save-area (4 KB)  -> ends 0x11000
 var GPU_VM_RPTR_SUBOFF = 0x11000;   # rptr-report page  -> ends 0x12000
-var GPU_VM_SENT_SUBOFF = 0x12000;   # C2e sentinel slot (free 4 KB gap, rptr 0x11000..EOP 0x13000)  -> ends 0x12004
+# Ring fence sentinel: ONE dword the CP writes via PM4 WRITE_DATA to prove it reached this point.
+# ⚠ THE SLOT IS 4 BYTES. The "free 4 KB gap" it sits in (rptr 0x11000 .. EOP 0x13000) is the GAP, not
+# the slot. Declaring 4 KB here fires a FALSE overlap against the breadcrumb at 0x12400, which is
+# 0x400 away and genuinely disjoint.
+# ⚠ The `-> ends` annotation must stay on the `var` line — the extent gate reads it there, and moving
+# it onto a continuation comment silently drops this slot out of the overlap check.
+var GPU_VM_SENT_SUBOFF = 0x12000;   # 1 dword  -> ends 0x12004
 var GPU_VM_EOP_SUBOFF  = 0x13000;   # EOP buffer (4 KB, 4 KB-aligned)  -> ends 0x14000
 
 # --- C2d: first PM4 packet + doorbell (the VM-fetch gate) ---

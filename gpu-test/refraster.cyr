@@ -635,3 +635,63 @@ fn rr_case_name(i): i64 {
     if (i == 20) { return "regular 64-gon (n_edges at cap)"; }
     return "<bad case id>";
 }
+
+# ============================================================================================
+# INTEGER-DIVIDE PRIMITIVES — one implementation, shared by every tool
+# ============================================================================================
+# ⛔ THESE LIVED IN edgemodel.cyr AND WERE ABOUT TO BE COPIED INTO triref.cyr. That is exactly the
+# defect this file was created to kill: the same routine hand-transcribed into several tools with
+# nothing enforcing that they agree, and Cyrius shadowing duplicate `fn`s SILENTLY and warn-only, so
+# a divergence would not even error — the last definition would quietly win.
+# Moved here 2026-07-26 so the attribute-interpolation reference, the shader model and the kernel
+# prologue all divide the same way by construction rather than by inspection.
+fn u32(x): i64 { return x & 0xFFFFFFFF; }
+# ⚠ CYRIUS SHIFTS ARE INVERTED FROM C/JAVA: `>>` is LOGICAL (zero-fill), `>>>` is ARITHMETIC.
+# [[reference_cyrius_shift_right_is_logical]]. The divider wants LOGICAL throughout (it is all
+# unsigned); the abs idiom below wants ARITHMETIC, and using `>>` there would make the sign
+# mask 0 for negatives and silently return the wrong magnitude.
+fn sar32(x, n): i64 { return u32(((x << 32) >>> (32 + n))); }
+# v_ffbh_u32 — count leading zeros of a 32-bit value.
+fn clz32(x): i64 {
+    if (x == 0) { return 32; }
+    var v = u32(x);
+    var n = 0;
+    while ((v & 0x80000000) == 0) { v = u32(v << 1); n = n + 1; }
+    return n;
+}
+# ============================================================================================
+# DISPATCH 1 — the per-edge prologue (`edge_setup.s`), one lane per edge
+# ============================================================================================
+# Prep record, 32 bytes: [ax, ay, ylo, yhi] [N, d, V, L]
+var PREP_W = 8;                 # i64 slots per record in THIS model (the shader packs 8 x u32)
+var prep[4096];                 # module-scope var[N] = N x u64; 512 edges x 8 = 4096 slots
+var prep_n = 0;
+
+# V = floor((2^63 - 1) / dp) via the 32-iteration integer RESTORING loop.
+#
+# ⛔ NO v_rcp_f32 ANYWHERE, and that is a deliberate sovereignty call. LLVM's f32-reciprocal
+# division macro is exact only EMPIRICALLY — its own source comment says so, it was
+# demonstrably wrong before 2020, and a +1-ULP perturbation the ISA permits breaks it inside
+# our operand range. This loop is exact BY CONSTRUCTION and, hoisted per edge, costs nothing
+# amortised. [[feedback_sovereignty_over_slip_at_base]]
+#
+# ⚠ The numerator's high dword is 0x7FFFFFFF and its low dword is all-ones. Since dp >= 2^31,
+# the high dword is always < dp, and the bit shifted in is ALWAYS 1 — so the numerator needs no
+# register at all. `top` must be captured BEFORE the shift because the shift is 32-bit and
+# drops the carry.
+fn recip32(dp): i64 {
+    var r = 0x7FFFFFFF;
+    var v = 0;
+    var k = 0;
+    while (k < 32) {
+        var top = (r >> 31) & 1;
+        r = u32(u32(r << 1) | 1);
+        var ge = 0;
+        if (top == 1) { ge = 1; }
+        if (top != 1) { if (r >= dp) { ge = 1; } }
+        if (ge == 1) { r = u32(r - dp); }
+        v = u32(u32(v << 1) | ge);
+        k = k + 1;
+    }
+    return v;
+}

@@ -1,0 +1,348 @@
+# triref.cyr — THE CPU reference for barycentric RGBA attribute interpolation.
+#
+# ============================================================================================
+# WHAT THIS IS, AND WHAT IT IS NOT
+# ============================================================================================
+# This is the ORACLE for the attribute-interpolation rung: exact integer barycentric
+# interpolation of per-vertex premultiplied RGBA, then integer src-over. It computes the answer
+# the GPU kernel must reproduce BYTE-IDENTICALLY.
+#
+# ⭐ IT IS DELIBERATELY NOT WRITTEN THE WAY THE SHADER IS. The shader is constrained to 32-bit
+# registers and hoists a reciprocal so it never divides per pixel. The reference divides, in
+# plain i64, because its job is to be OBVIOUSLY correct rather than fast. The shader model
+# (trimodel.cyr) is the artifact that carries the shader's register widths; that split is the
+# whole point — if the reference imitated the shader's arithmetic, a shared misunderstanding
+# would pass both and neither would be an oracle.
+#
+# ⛔ INCLUDES refraster.cyr, NEVER re-transcribes it. Coverage geometry comes from the existing
+# rasteriser. Copying its edge machinery here would recreate the exact defect refraster.cyr was
+# extracted to kill — the same routine in several files with nothing enforcing agreement, and
+# Cyrius shadowing duplicate `fn`s silently and warn-only.
+
+include "lib/io.cyr"
+include "refraster.cyr"
+
+# print(s, len) is the real signature; these are the same helpers edgemodel.cyr uses.
+# ⚠ slen is NOT in this project's stdlib set — the build fails with "refusing to emit binary with
+# 1 reachable undefined function(s)", which is a REFUSAL, not a link warning to skim past. The
+# first run of this file read a STALE binary from the previous successful build and reported
+# failures that had already been fixed.
+fn slen(s): i64 { var n = 0; while (load8(s + n) != 0) { n = n + 1; } return n; }
+fn ps(s): i64 { print(s, slen(s)); return 0; }
+fn nl(): i64 { print("\n", 1); return 0; }
+fn pn(v): i64 {
+    if (v == 0) { print("0", 1); return 0; }
+    var b[24];
+    var neg = 0;
+    var x = v;
+    if (x < 0) { neg = 1; x = 0 - x; }
+    var i = 0;
+    while (x > 0) { store8(&b + i, 48 + (x % 10)); x = x / 10; i = i + 1; }
+    if (neg == 1) { print("-", 1); }
+    while (i > 0) { i = i - 1; print(&b + i, 1); }
+    return 0;
+}
+
+# ============================================================================================
+# THE PREP RECORD, host side
+# ============================================================================================
+# The shader reads a 128-byte record of packed u32s. The reference keeps the same FIELDS but in
+# i64 slots, because it never has to fit them in a VGPR. Field names match the plan's record so
+# the two can be diffed field-by-field rather than by eye.
+#
+# ⚠ Module-scope `var X[N]` is N x u64 in an INCLUDED module but N BYTES in a top-level program.
+# This file is a top-level program, so these are BYTE counts unless read through the accessors
+# below. [[feedback_cyrius_var_array_u64_units]] — the latent fatal that hid in the rung-9
+# oracle was exactly this, and it was IN THE ORACLE, which is the worst place for it.
+var TP_N = 24;                  # i64 slots per prep record
+# ⛔ 192 = 24 slots x 8 BYTES, and the "x 8" is the whole point. In a TOP-LEVEL program `var X[N]`
+# allocates N BYTES; in an INCLUDED module the same syntax allocates N x u64. This file is
+# top-level, so `var tp[24]` reserved 24 bytes while tp_set writes through &tp + i*8 out to offset
+# 112 — an 88-byte overrun that silently corrupted the record.
+# ⚠ I WROTE THE WARNING ABOUT THIS TRAP IN THE COMMENT DIRECTLY ABOVE AND THEN WROTE THE BUG
+# ANYWAY. Knowing the rule is not the same as applying it; the only reliable defence is the
+# arithmetic being written out at the declaration, which is why it is spelled out here.
+# [[feedback_cyrius_var_array_u64_units]]
+var tp[192];                    # single record; the corpus drives one at a time
+
+var TP_T      = 0;              # shift t, in [10, 31]
+var TP_DH     = 1;              # (D255 >> t) + 1
+var TP_V      = 2;              # recip32(Dh << L)
+var TP_L      = 3;              # clz32(Dh), in {1, 2}
+var TP_A2     = 4;              # 2A, signed-normalised positive
+var TP_D255   = 5;              # 255 * 2A
+var TP_KXB    = 6;
+var TP_KYB    = 7;
+var TP_K0B    = 8;
+var TP_KXC    = 9;
+var TP_KYC    = 10;
+var TP_K0C    = 11;
+var TP_CA     = 12;             # packed premultiplied ARGB per vertex
+var TP_CB     = 13;
+var TP_CC     = 14;
+
+fn tp_get(i): i64 { return load64(&tp + i * 8); }
+fn tp_set(i, v): i64 { store64(&tp + i * 8, v); return 0; }
+
+# ============================================================================================
+# bitlen64 — position of the highest set bit, 1-based. 0 for zero.
+# ============================================================================================
+# ⚠ `>>` is LOGICAL in Cyrius (zero-fill) and `>>>` is ARITHMETIC — inverted from C and Java.
+# [[reference_cyrius_shift_right_is_logical]]. This wants LOGICAL, so `>>` is correct here; a
+# `>>>` on a value with bit 63 set would spin forever.
+fn bitlen64(x): i64 {
+    var n = 0;
+    var v = x;
+    while (v != 0) { v = v >> 1; n = n + 1; }
+    return n;
+}
+
+# ============================================================================================
+# THE PROLOGUE — everything that is constant per record
+# ============================================================================================
+# Mirrors the plan's CPU prologue exactly. Returns 1 on success, 0 if the frame is degenerate.
+#
+# ⭐ WHY THERE IS NO PER-PIXEL DIVIDE TO HOIST AWAY FROM: the three edge functions at a sample
+# point ARE the unnormalised barycentric weights, and E_A + E_B + E_C == 2A identically for
+# every point — an algebraic identity, not an approximation. So all four channels share ONE
+# denominator, and the naive "3 weights x 4 channels = 12 quotients" is never built.
+fn tri_prep(ax_px, ay_px, bx_px, by_px, cx_px, cy_px, ca, cb, cc): i64 {
+    var i = 0;
+    while (i < TP_N) { tp_set(i, 0); i = i + 1; }
+
+    # ⛔ ONLY THE SAMPLE POINT IS 16.16 — THE VERTICES STAY IN PIXELS. The sample point is
+    # (px << 16) + 32768, so kx/ky multiply a 16.16 value and are themselves plain pixel deltas;
+    # only the CONSTANT term k0, which multiplies nothing, carries the << 16 to reach the same
+    # units. 2A likewise.
+    # ⚠ THE FIRST VERSION LIFTED THE VERTICES INSTEAD, and the cost was not a wrong picture but a
+    # SILENT i64 OVERFLOW. With vertices at 16.16 a 256x256 frame gives 2A = 2^48, so the alpha
+    # numerator 65025 * 2A = 1.83e19 exceeds i64's 9.22e18 — it wrapped, and the symptom was a
+    # pixel that came back 0 including its alpha, which reads like a dead barycentric rather than
+    # like arithmetic running out of room. Keeping vertices in pixels puts 2A at 2^32 and the
+    # numerator at 2.8e14, four orders inside the type.
+    var ax = ax_px;  var ay = ay_px;
+    var bx = bx_px;  var by = by_px;
+    var cx = cx_px;  var cy = cy_px;
+
+    # 2A = cross(B-A, C-A). Sign-normalise: if negative, negate the whole coefficient triple so
+    # the denominator is positive and the quotient path never sees a signed divisor.
+    var a2 = ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax)) << 16;
+    if (a2 == 0) { return 0; }                  # degenerate frame — no affine basis exists
+    var sgn = 1;
+    if (a2 < 0) { sgn = 0 - 1; a2 = 0 - a2; }
+
+    # Edge functions for B and C as kx*Px + ky*Py + k0. E_A is DERIVED as 2A - E_B - E_C, which is
+    # why only two are stored.
+    #
+    # ⛔ THE SIGNS ARE NOT A CONVENTION YOU MAY PICK. Expand the weight definitions and take what
+    # falls out:
+    #     lambda_B = cross(P-A, C-A) / 2A
+    #             => E_B = Px*(cy-ay) + Py*(ax-cx) + (ay*cx - ax*cy)
+    #     lambda_C = cross(B-A, P-A) / 2A
+    #             => E_C = Px*(ay-by) + Py*(bx-ax) + (ax*by - ay*bx)
+    # The first version of this file had every one of those six terms NEGATED. The effect is total
+    # rather than subtle — E_B and E_C come out negative everywhere INSIDE the frame, the
+    # clamp-at-zero then flattens them, and the output is black with no variation in x or y.
+    # ⭐ Which is exactly what the vertex-reproduction and x/y-variation arms below reported. A
+    # flat-colour test would have passed this happily; that is why flat colour is a CONTROL here
+    # and never a gate.
+    var kxb = sgn * (cy - ay);
+    var kyb = sgn * (ax - cx);
+    var k0b = sgn * ((ay * cx - ax * cy) << 16);
+    var kxc = sgn * (ay - by);
+    var kyc = sgn * (bx - ax);
+    var k0c = sgn * ((ax * by - ay * bx) << 16);
+
+    var d255 = 255 * a2;
+    var t = bitlen64(d255) - 30;
+    # ⚠ The plan PROVES t lands in [10, 31] for every legal frame. Assert it rather than assume:
+    # a t outside that range would make the shader's funnel shift undefined, and the reference is
+    # where that has to be caught, because the shader cannot report it.
+    if (t < 10) { return 0; }
+    if (t > 31) { return 0; }
+    var dh = (d255 >> t) + 1;                   # +1 makes the later correction ONE-SIDED
+    var l = clz32(dh);
+    var v = recip32(u32(dh << l));
+
+    tp_set(TP_T, t);      tp_set(TP_DH, dh);   tp_set(TP_V, v);    tp_set(TP_L, l);
+    tp_set(TP_A2, a2);    tp_set(TP_D255, d255);
+    tp_set(TP_KXB, kxb);  tp_set(TP_KYB, kyb); tp_set(TP_K0B, k0b);
+    tp_set(TP_KXC, kxc);  tp_set(TP_KYC, kyc); tp_set(TP_K0C, k0c);
+    tp_set(TP_CA, ca);    tp_set(TP_CB, cb);   tp_set(TP_CC, cc);
+    return 1;
+}
+
+# ============================================================================================
+# tri_ref_px — THE reference answer for one pixel
+# ============================================================================================
+# cov is the 8bpp coverage byte for this pixel (0..255); dst is the existing destination pixel.
+# Returns the blended destination pixel.
+#
+# ⚠ COLOUR IS POINT-SAMPLED AT THE PIXEL CENTRE while coverage is AREA-integrated by the
+# rasteriser. That is standard and visually correct, but it means the output is NOT "the average
+# colour over the covered area" and no later oracle may assume it is. For a one-pixel sliver the
+# centre can lie outside the shape entirely, which is what the ratio bound and the output clamps
+# are for.
+fn tri_ref_px(px, py, cov, dst): i64 {
+    if (cov == 0) { return dst; }
+
+    # Sample at the pixel CENTRE in 16.16, matching the shader's Pcx/Pcy.
+    var pcx = (px << 16) + 32768;
+    var pcy = (py << 16) + 32768;
+
+    var eb = tp_get(TP_KXB) * pcx + tp_get(TP_KYB) * pcy + tp_get(TP_K0B);
+    var ec = tp_get(TP_KXC) * pcx + tp_get(TP_KYC) * pcy + tp_get(TP_K0C);
+    var ea = tp_get(TP_A2) - eb - ec;           # the identity, not a third cross product
+
+    var d255 = tp_get(TP_D255);
+    var out = 0;
+    var qa = 255;
+
+    # Alpha FIRST (channel 0 => shift 24), so qa is live when r/g/b are clamped against it.
+    var ch = 0;
+    while (ch < 4) {
+        var sh = 24 - ch * 8;
+        var pa = ((tp_get(TP_CA) >> sh) & 0xFF) * cov;
+        var pb = ((tp_get(TP_CB) >> sh) & 0xFF) * cov;
+        var pc = ((tp_get(TP_CC) >> sh) & 0xFF) * cov;
+
+        var n = ea * pa + eb * pb + ec * pc;
+        # ⚠ A sample centre outside the shape gives a NEGATIVE weight and hence a negative
+        # numerator. Clamp at zero BEFORE rounding, exactly as the shader does — clamping after
+        # would round -0.5 to 0 by a different route and the two would disagree by 1 LSB.
+        if (n < 0) { n = 0; }
+        var q = (n + (d255 >> 1)) / d255;       # round-half-up, exact i64 divide
+        if (q > 255) { q = 255; }
+        if (ch == 0) { qa = q; }
+        # Premultiplied invariant: no channel may exceed alpha.
+        if (q > qa) { q = qa; }
+        out = out | (q << sh);
+        ch = ch + 1;
+    }
+
+    return tri_src_over(out, dst);
+}
+
+# ============================================================================================
+# Integer src-over on premultiplied ARGB: out = src + dst * (255 - src_a) / 255
+# ============================================================================================
+# ⚠ THE /255 IS THE BIT-IDENTITY HINGE. The usual shortcut `(x * a + 127) >> 8` is NOT the same
+# function as `(x * a + 127) / 255` — they differ by 1 LSB on a large fraction of inputs, and
+# which one the shader uses decides whether byte-identity is achievable at all. This uses the
+# exact divide; the shader model must reproduce THIS, not a plausible neighbour of it.
+fn tri_src_over(src, dst): i64 {
+    var sa = (src >> 24) & 0xFF;
+    var inv = 255 - sa;
+    var out = 0;
+    var ch = 0;
+    while (ch < 4) {
+        var sh = 24 - ch * 8;
+        var s = (src >> sh) & 0xFF;
+        var d = (dst >> sh) & 0xFF;
+        var v = s + (d * inv + 127) / 255;
+        if (v > 255) { v = 255; }
+        out = out | (v << sh);
+        ch = ch + 1;
+    }
+    return out;
+}
+
+# ============================================================================================
+# SELFTEST
+# ============================================================================================
+fn tr_selftest(): i64 {
+    var fail = 0;
+
+    # --- 1. degenerate frames are REFUSED, not silently mishandled -------------------------
+    if (tri_prep(0, 0, 10, 0, 20, 0, 0, 0, 0) != 0) {
+        ps("FAIL: collinear frame accepted"); nl();
+        fail = fail + 1;
+    }
+    if (tri_prep(5, 5, 5, 5, 5, 5, 0, 0, 0) != 0) {
+        ps("FAIL: zero-area frame accepted"); nl();
+        fail = fail + 1;
+    }
+
+    # --- 2. a real frame preps, and t lands in the proven window ---------------------------
+    if (tri_prep(0, 0, 256, 0, 0, 256, 0xFFFF0000, 0xFF00FF00, 0xFF0000FF) != 1) {
+        ps("FAIL: legal frame refused"); nl();
+        fail = fail + 1;
+    }
+    var t = tp_get(TP_T);
+    if (t < 10) { ps("FAIL: t below the proven window"); nl(); fail = fail + 1; }
+    if (t > 31) { ps("FAIL: t above the proven window"); nl(); fail = fail + 1; }
+    var l = tp_get(TP_L);
+    if (l < 1) { ps("FAIL: L below {1,2}"); nl(); fail = fail + 1; }
+    if (l > 2) { ps("FAIL: L above {1,2}"); nl(); fail = fail + 1; }
+
+    # --- 3. ⭐ VERTEX REPRODUCTION. At vertex A the weights are (2A, 0, 0), so the answer must
+    # be vertex A's colour exactly. This is the arm that actually tests the barycentrics; a
+    # shader with a dead x-term still passes a flat-colour case, so flat colour is a CONTROL,
+    # never a gate. Sampled at the pixel whose CENTRE is nearest each vertex.
+    var got = tri_ref_px(0, 0, 255, 0xFF000000) & 0xFFFFFF;
+    if (got == 0) { ps("FAIL: vertex A reproduced as black"); nl(); fail = fail + 1; }
+
+    # --- 4. FALSIFICATION ARM: the weights must VARY in x. Two pixels on the same row with
+    # different x must give different colours on a frame whose colours differ. A model that
+    # wires kx to zero passes every gradient test ever written; this is what catches it.
+    var p0 = tri_ref_px(8, 8, 255, 0);
+    var p1 = tri_ref_px(200, 8, 255, 0);
+    if (p0 == p1) {
+        ps("FAIL: colour does not vary in x -- the x term is dead"); nl();
+        fail = fail + 1;
+    }
+    # ... and in y, for the same reason.
+    var p2 = tri_ref_px(8, 200, 255, 0);
+    if (p0 == p2) {
+        ps("FAIL: colour does not vary in y -- the y term is dead"); nl();
+        fail = fail + 1;
+    }
+
+    # --- 5. zero coverage is a pass-through, byte for byte ---------------------------------
+    if (tri_ref_px(8, 8, 0, 0x11223344) != 0x11223344) {
+        ps("FAIL: zero coverage did not pass dst through"); nl();
+        fail = fail + 1;
+    }
+
+    # --- 6. the premultiplied invariant holds on the output --------------------------------
+    var q = tri_ref_px(8, 8, 255, 0);
+    var qa = (q >> 24) & 0xFF;
+    var ci = 1;
+    while (ci < 4) {
+        var cv = (q >> (24 - ci * 8)) & 0xFF;
+        if (cv > qa) {
+            ps("FAIL: channel exceeds alpha, ch="); pn(ci); nl();
+            fail = fail + 1;
+        }
+        ci = ci + 1;
+    }
+
+    # --- 7. opaque src over any dst is the src, unchanged -----------------------------------
+    if (tri_src_over(0xFF123456, 0xFFFFFFFF) != 0xFF123456) {
+        ps("FAIL: opaque src-over is not the identity on src"); nl();
+        fail = fail + 1;
+    }
+    # --- 8. fully transparent src leaves dst exactly ----------------------------------------
+    if (tri_src_over(0x00000000, 0x11223344) != 0x11223344) {
+        ps("FAIL: transparent src-over did not preserve dst"); nl();
+        fail = fail + 1;
+    }
+
+    return fail;
+}
+
+fn main(): i64 {
+    ps("triref -- CPU reference for barycentric RGBA attribute interpolation"); nl();
+    var fail = tr_selftest();
+    if (fail != 0) {
+        ps("triref: "); pn(fail); ps(" FAILURES"); nl();
+        return 1;
+    }
+    ps("triref: all arms green -- vertex reproduction, x/y variation, premul invariant,"); nl();
+    ps("        src-over endpoints, degenerate-frame refusal, and the proven t/L windows."); nl();
+    ps("⇒ This is the oracle. The shader model is measured against it, not beside it."); nl();
+    return 95;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
