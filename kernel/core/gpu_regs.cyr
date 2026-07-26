@@ -953,7 +953,7 @@ var GPU_ARENA_SIZE                   = 0x200000;   # 2 MB — the whole carveout
 # REAL arena slot, and this is a BOUND describing the slot map, not a slot itself. Named that way
 # it aliased GPU_S12_SNAP_SUBOFF (the genuine slot at 0xC0000) and failed the gate — correctly.
 var GPU_HIGHEST_PUBLISHED_SLOT       = 0xD0000;    # the top of the slot map, audited at runtime
-                                                   # (raised from 0xC0000 at 9b B7 for the edge prep table)
+# (raised from 0xC0000 at 9b B7 for the edge prep table)
 # ⛔ THE SACRIFICIAL SLOT. Arm E fires an UNGUARDED write at this offset to measure whether the
 # EXEC guard actually stops an overrun — S6 shipped that guard with no unguarded arm, so
 # "the guard worked" is INFERRED, not measured. Placed at the very top of the arena, 0x130000

@@ -3691,8 +3691,8 @@ fn gpu_edge_cov(edge_mc, dst_mc, w, h, n_edges, rule) {
     # s7=arg7 (gpu_blend_cov_run's SET_SH_REG_N8 staging). edge_setup reads s[0:1]=edges,
     # s[2:3]=prep, s4=n_edges.
     if (gpu_blend_cov_run(gpu_arena_mc + GPU_EDGE_SETUP_SUBOFF, edge_mc, prep_mc,
-        n_edges, 0, 0, 0, GPU_COMPUTE_PGM_RSRC1_ESET,
-        (n_edges + 63) / 64, 1, done_mc, done_phys) != 1) { return 0; }
+    n_edges, 0, 0, 0, GPU_COMPUTE_PGM_RSRC1_ESET,
+    (n_edges + 63) / 64, 1, done_mc, done_phys) != 1) { return 0; }
 
     # ---- dispatch 2: the rasteriser. ONE LANE PER PIXEL, 64x1 -> gx spans the row, gy IS py. ----
     # ⚠ THE LANE SHAPE IS 64x1, NOT AN 8x8 TILE. Every shipped 2-D consumer uses
@@ -3705,8 +3705,8 @@ fn gpu_edge_cov(edge_mc, dst_mc, w, h, n_edges, rule) {
     # which IS the S3-proven producer->consumer pattern. Chaining would save ~60 us and require
     # new PM4 agnos has never run. [[feedback_sovereignty_over_slip_at_base]]
     return gpu_blend_cov_run(gpu_arena_mc + GPU_EDGE_SHADER_SUBOFF, prep_mc, dst_mc,
-        n_edges, 0, w, 0, GPU_COMPUTE_PGM_RSRC1_EDGE,
-        (w + 63) / 64, h, done_mc, done_phys);
+    n_edges, 0, w, 0, GPU_COMPUTE_PGM_RSRC1_EDGE,
+    (w + 63) / 64, h, done_mc, done_phys);
 }
 
 # gpu_edge_arm — RUNG 9a: the edge rasteriser's residency hook.
