@@ -3,6 +3,14 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.18] - 2026-07-25
+
+**Rung 10 — the kill gate (open cycle).** 1.56.17 closed with rung 9b complete and iron-validated:
+`gputri --cov` **20 of 20 byte-identical**, agnos's first GPU triangle rasteriser. This cycle fires
+rung 10, which is a **pre-registered KILL GATE** — it can retire the tier-1 coverage justification
+for rungs 11–12 outright, and that is a legitimate outcome, not a failure. Bumped on cycle open;
+the user tags on close.
+
 ## [1.56.17] - 2026-07-25
 
 **Rung 5 burned; the forensic instrument's race fixed (open cycle).** 1.56.16 was released before
@@ -43,6 +51,41 @@ Also measured before committing: **a per-pixel lane reproduces the row-serial re
 byte-identically** — 50/50 cases (8 corpus + 2 shared-edge quads + 40 random meshes). Integer
 accumulation is associative, so summation order genuinely does not matter. This is the structural
 premise the whole one-lane-per-pixel design rests on, and it is now measured rather than assumed.
+
+### ⭐⭐⭐ BURN 2 — **20 of 20. RUNG 9b IS COMPLETE. agnos has a GPU triangle rasteriser.**
+
+`gputri --digest` **95** · `gputri --cov` **95** — every case byte-identical to `refraster.cyr`,
+every negative control fired.
+
+167 hand-authored gfx90c instructions across two dispatches, byte-exact on the plain triangle, the
+bowtie, the open path, four shared-edge quads, a 200×64 wide mask, a 37×29 mask narrower than one
+workgroup, two all-zero degenerates, a 14-edge multi-shape, and a **regular 64-gon at the edge cap**.
+**No sort, no LDS, no cross-lane operation, and no division anywhere** in the raster kernel.
+
+Both burn-1 faults confirmed fixed, visibly, in the log: cases 4/7/8/11/18 now report `edges 3`
+(were `edges 2` → `GPO_E_EDGEBUF`), case 10 reports `edges 14` (was 10), case 14 is **exact** — and
+**all 20 digests are byte-for-byte what burn 1 printed**, proving the horizontal-edge fix did not
+move the oracle underneath the comparison.
+
+**Settled by this burn:** the divider is exact on silicon · `v_mul_hi_u32` behaves as documented
+(retired; `--valu` never needed) · `global_store_byte` does not clobber neighbouring lanes · the
+two-dispatch producer→consumer coherence holds · `tgid` mapping survives a 3×-wrapping wide mask ·
+the EXEC guard is correct below one workgroup · the 32-iteration integer reciprocal works with no
+`v_rcp_f32` anywhere.
+
+### The methodology result — the part that generalises beyond this rung
+
+**Two burns, two faults, both localised before the second flash and neither by guesswork.**
+
+B2 put the entire algorithm in Cyrius at 32-bit register widths and byte-diffed it against the
+oracle at zero burns. So when iron came back red on exactly one case, the model could be *asked*
+rather than theorised about: emulating the shader's wave-level fall-through inside the model
+reproduced **631 bytes, worst delta 255, case 14 alone** — identical to iron. That turned "the
+rasteriser is wrong somewhere" into "one line renders a per-lane break as wave-level control flow",
+in a single measurement.
+
+⇒ **The algorithm was never wrong; the emission was.** Eight of eleven bites cost zero burns, and
+the two that needed iron cost exactly two flashes.
 
 ### ⭐ BURN 1 (rung 9b, B9) — the divider works on silicon. Two faults, both localised.
 

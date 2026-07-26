@@ -344,6 +344,170 @@ fn tri_digest(): i64 {
     return 95;
 }
 
+
+# ============================================================================================
+# RUNG 10 — THE KILL GATE. `--bench`
+# ============================================================================================
+# ⛔ THIS MEASUREMENT CAN KILL RUNGS 11-12, AND THAT IS A LEGITIMATE OUTCOME. The arc's tier-1
+# justification is that GPU coverage beats CPU coverage on a real frame's workload. If the
+# crossover sits ABOVE what a real frame covers, the coverage justification is DEAD, rungs 11-12
+# do not open on it, and the arc re-bases on rung 14 (DOOM) which does not depend on this at all.
+# That is a RESULT, not a failure, and it must be reported immediately.
+#
+# ⭐ PRE-REGISTERED BEFORE THE FLASH (gpu.md rung 10, published in the tracker):
+#     unbatched crossover ~ 12,000 covered px (~110x110)
+#     batched   crossover ~ 50,000 covered px/frame (~80 glyphs)
+# Printed as a NUMBER so the prediction is falsifiable rather than decorative.
+#
+# ⚠ HOW IT IS TIMED, AND WHY THAT IS HONEST. `uptime_ms`#40 is 100 Hz — 10 ms granularity, three
+# orders of magnitude coarser than one dispatch. So each point REPEATS until at least 200 ms of
+# wall time has elapsed and divides. That measures the full ring-3 round trip (submit + fence +
+# wait), which IS the cost a compositor actually pays — not a kernel-internal timer that would
+# flatter the GPU by hiding the wait.
+#
+# ⚠ BOTH SIDES ARE TIMED THE SAME WAY, on the same boot, on the same geometry, from the same
+# source of truth. A crossover measured against a CPU path timed on a different machine or a
+# different shape would be worthless.
+var BENCH_TARGET_MS = 200;
+var bench_buf[8192];            # 65536 B = 256x256, the largest bench size
+var bench_recs[512];            # 4096 B = 64 records of 64 B -- the #92 batch ceiling
+
+# One equilateral-ish triangle covering roughly half of a wxh mask, so covered_px ~ w*h/2.
+fn bench_shape(w, h): i64 {
+    edges_reset();
+    tri_add(fx(1), fx(1), fx(w - 2), fx(h / 3), fx(w / 3), fx(h - 2));
+    return n_edges;
+}
+
+fn bench_covered(): i64 {
+    cov_clear(&bench_buf); raster(&bench_buf);
+    var lit = 0; var i = 0;
+    while (i < W * H) { if ((load8(&bench_buf + i) & 0xFF) != 0) { lit = lit + 1; } i = i + 1; }
+    return lit;
+}
+
+# us per RASTERISED MASK, CPU side. Adaptive reps so a 10 ms clock can time a sub-ms operation.
+fn bench_cpu_us(): i64 {
+    var reps = 1;
+    var el = 0;
+    while (el < BENCH_TARGET_MS) {
+        var t0 = syscall(40, 0, 0, 0);
+        var r = 0;
+        while (r < reps) { cov_clear(&bench_buf); raster(&bench_buf); r = r + 1; }
+        el = syscall(40, 0, 0, 0) - t0;
+        if (el < BENCH_TARGET_MS) { reps = reps * 4; }
+        if (reps > 100000) { el = BENCH_TARGET_MS; }
+    }
+    return (el * 1000) / reps;
+}
+
+# us per RASTERISED MASK, GPU side. `batch` records per #92 call: 1 = unbatched, N = one fence
+# amortised over N dispatches, which is the whole question rung 10 asks.
+fn bench_gpu_us(eid, did, w, h, ne, batch): i64 {
+    var z = 0;
+    while (z < 512) { store64(&bench_recs + z * 8, 0); z = z + 1; }
+    var b = 0;
+    while (b < batch) {
+        var d = &bench_recs + b * 64;
+        store32(d +  0, 8);
+        store32(d +  8, did);
+        store32(d + 12, eid);
+        store32(d + 16, (h * 65536) + w);
+        store32(d + 36, ne);
+        b = b + 1;
+    }
+    # one warm-up so residency and the first-touch page walk are not in the sample
+    if (syscall(92, &bench_recs, batch * 64) != 0) { return 0 - 1; }
+    var reps = 1;
+    var el = 0;
+    while (el < BENCH_TARGET_MS) {
+        var t0 = syscall(40, 0, 0, 0);
+        var r = 0;
+        while (r < reps) {
+            if (syscall(92, &bench_recs, batch * 64) != 0) { return 0 - 1; }
+            r = r + 1;
+        }
+        el = syscall(40, 0, 0, 0) - t0;
+        if (el < BENCH_TARGET_MS) { reps = reps * 4; }
+        if (reps > 100000) { el = BENCH_TARGET_MS; }
+    }
+    return (el * 1000) / (reps * batch);
+}
+
+var bench_cross1 = 0;           # unbatched crossover, in covered px (0 = GPU never won)
+var bench_cross16 = 0;          # batched-16 crossover
+
+fn bench_point(w, h, batch): i64 {
+    if (rr_set_dims(w, h) != 1) { puts("  ** dims refused"); return 0; }
+    var ne = bench_shape(w, h);
+    var cov = bench_covered();
+    var eid = syscall(86, 64 * 16);
+    if (eid < 1) { return 0 - 1; }
+    var did = syscall(86, w * h);
+    if (did < 1) { syscall(74, eid); return 0 - 1; }
+    tri_pack_edges();
+    syscall(72, eid, &tri_edges, ne * 16);
+    var g = bench_gpu_us(eid, did, w, h, ne, batch);
+    syscall(74, eid); syscall(74, did);
+    if (g < 0) { puts("  ** GPU dispatch refused"); return 0 - 1; }
+    var c = bench_cpu_us();
+    ps("  "); pnum(w); ps("x"); pnum(h);
+    ps("  batch "); pnum(batch);
+    ps("  covered "); pnum(cov);
+    ps("  cpu "); pnum(c); ps("us  gpu "); pnum(g); ps("us  ");
+    if (g < c) {
+        ps("GPU wins ("); pnum((c * 100) / g); puts("% of CPU time)");
+        if (batch == 1)  { if (bench_cross1 == 0)  { bench_cross1 = cov; } }
+        if (batch != 1)  { if (bench_cross16 == 0) { bench_cross16 = cov; } }
+    }
+    if (g >= c) { ps("CPU wins ("); pnum((g * 100) / c); puts("% of CPU time)"); }
+    return cov;
+}
+
+fn tri_bench(): i64 {
+    puts("gputri: RUNG 10 -- THE KILL GATE. GPU vs CPU coverage cost.");
+    puts("");
+    puts("PRE-REGISTERED (gpu.md, published before the flash):");
+    puts("  unbatched crossover ~ 12000 covered px   batched ~ 50000 covered px/frame");
+    puts("⚠ timed via uptime_ms#40 (100 Hz), so each point repeats to >= 200 ms and divides.");
+    puts("  BOTH sides measured the same way, same boot, same geometry, same edge list.");
+    puts("");
+    bench_cross1 = 0; bench_cross16 = 0;
+
+    puts("[unbatched] one #92 record per call -- one fence per mask");
+    if (bench_point(32,  32,  1) < 0) { return 100; }
+    bench_point(64,  64,  1);
+    bench_point(96,  96,  1);
+    bench_point(128, 128, 1);
+    bench_point(192, 192, 1);
+    bench_point(256, 256, 1);
+    puts("");
+    puts("[batched 16] sixteen records per call -- ONE fence amortised over sixteen masks");
+    bench_point(32,  32,  16);
+    bench_point(64,  64,  16);
+    bench_point(96,  96,  16);
+    bench_point(128, 128, 16);
+    bench_point(192, 192, 16);
+    bench_point(256, 256, 16);
+    puts("");
+
+    ps("MEASURED unbatched crossover: ");
+    if (bench_cross1 == 0)  { puts("NONE -- the CPU won at every size measured"); }
+    if (bench_cross1 != 0)  { pnum(bench_cross1); puts(" covered px"); }
+    ps("MEASURED batched-16 crossover: ");
+    if (bench_cross16 == 0) { puts("NONE -- the CPU won at every size measured"); }
+    if (bench_cross16 != 0) { pnum(bench_cross16); puts(" covered px"); }
+    puts("");
+    puts("⛔ READ THE PRE-REGISTERED OUTCOME TABLE IN THE TRACKER BEFORE INTERPRETING THIS.");
+    puts("   A crossover ABOVE a real frame's coverage KILLS the tier-1 coverage justification");
+    puts("   for rungs 11-12. That is a RESULT, not a failure, and it is reported immediately.");
+    puts("");
+    puts("⚠ NOT MEASURED HERE: n_edges above the shipped EDGE_CAP of 64, and masks above 256x256");
+    puts("   (this tool's host reference buffer is 65536 B). Raising the cap needs those points");
+    puts("   and is a separate bite -- the cap must move on measurement, never on the model.");
+    return 95;
+}
+
 fn main(): i64 {
     args_init();
     if (argc() >= 2) {
@@ -353,16 +517,18 @@ fn main(): i64 {
             return tri_cov();
         }
         if (streq(a, "--digest") == 1) { return tri_digest(); }
+        if (streq(a, "--bench") == 1) { return tri_bench(); }
         # An unknown argument is an ERROR, never a default action -- the typo that cost the M9
         # arc a flash on 2026-07-24 is exactly this failure mode.
         puts("gputri: UNKNOWN ARGUMENT -- nothing was done.");
-        puts("gputri: --cov --digest");
+        puts("gputri: --cov --digest --bench");
         return 84;
     }
     puts("gputri -- RUNG 9b, the edge rasteriser's instrument");
     puts("");
     puts("  run /bin/gputri --digest    reference digests, diff against host cpuref FIRST");
     puts("  run /bin/gputri --cov       the 20-case corpus + negative controls N1-N8");
+    puts("  run /bin/gputri --bench     RUNG 10's KILL GATE: GPU vs CPU coverage crossover");
     puts("");
     puts("Exits: 95 all exact + all controls fired · 100 no GPU here · 96 shader not resident");
     puts("       92 fill-rule · 91 shape · 89 tgid · 88 UNTOUCHED · 87 covered nothing");

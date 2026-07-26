@@ -25,18 +25,18 @@
 
 #ifdef ARCH_X86_64
 fn print_agnos_kernel_banner() {
-    kprintln("AGNOS kernel v1.56.17", 21);
+    kprintln("AGNOS kernel v1.56.18", 21);
 }
 #endif
 
 #ifdef ARCH_AARCH64
 fn print_agnos_kernel_banner() {
-    serial_println("AGNOS kernel v1.56.17 [aarch64]", 31);
+    serial_println("AGNOS kernel v1.56.18 [aarch64]", 31);
 }
 #endif
 
 fn print_agnos_shell_banner() {
-    kprintln("AGNOS shell v1.56.17 (type 'help')", 34);
+    kprintln("AGNOS shell v1.56.18 (type 'help')", 34);
 }
 
 # Program-body-safe version accessor. Returns a pointer to the NUL-terminated

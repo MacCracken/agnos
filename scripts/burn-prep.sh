@@ -211,11 +211,39 @@ elif [ -n "${BURN_EDGE_COV:-}" ]; then
     #      of its pixel. Reproduced exactly in edgemodel.cyr (631 bytes, delta 255, case 14
     #      alone) before being fixed, and re-verified 135/135 byte-identical after.
     #
-    # ⇒ THE BAR FOR THIS BURN IS 20 of 20 AND exit 95. Anything less is a NEW fault: burn 1
-    # already demonstrated that 14 specific cases pass, so a regression among them is a
-    # regression, not a mystery.
+    # ⇒ Burn 2 returned **20 of 20, exit 95**. RUNG 9b IS COMPLETE — agnos has a GPU triangle
+    # rasteriser, byte-identical to the CPU reference across the whole corpus.
+    #
+    # ============================================================================================
+    # BURN 3 (1.56.18) — RUNG 10, THE KILL GATE. `run /bin/gputri --bench`
+    # ============================================================================================
+    # ⛔ THIS MEASUREMENT CAN KILL RUNGS 11-12, AND THAT IS A LEGITIMATE OUTCOME.
+    #
+    # PRE-REGISTERED, published in the tracker BEFORE this flash (gpu.md rung 10):
+    #     unbatched crossover ~ 12,000 covered px (~110x110)
+    #     batched   crossover ~ 50,000 covered px/frame (~80 glyphs)
+    #
+    # OUTCOME TABLE, also pre-registered:
+    #   · batched crossover WELL BELOW a real frame's coverage ⇒ ★ tier-1 confirmed, rungs 11-12 open
+    #   · batched crossover NEAR a real frame's coverage       ⇒ ship opt-in per surface, not default
+    #   · batched crossover ABOVE a real frame's coverage      ⇒ ⛔ TIER-1 COVERAGE IS DEAD. Rungs
+    #     11-12 do NOT open on it; the arc re-bases on rung 14 (DOOM), which does not depend on
+    #     this measurement at all. REPORT IMMEDIATELY. **This is a result, not a null.**
+    #   · GPU faster but the desktop looks worse ⇒ latency/pacing, not throughput.
+    #
+    # RUN ORDER: `gputri --cov` FIRST (it must still be 20/20 — a regression there invalidates the
+    # bench, since a wrong rasteriser's timing means nothing), THEN `gputri --bench`, THEN klug.
+    #
+    # ⚠ Timed with uptime_ms#40 at 100 Hz, so each point repeats to >= 200 ms and divides. That
+    # measures the FULL ring-3 round trip (submit + fence + wait) — the cost a compositor actually
+    # pays — rather than a kernel-internal timer that would flatter the GPU by hiding the wait.
+    # Both sides are timed the same way, same boot, same geometry, same edge list.
+    #
+    # ⚠ NOT MEASURED: n_edges above the shipped EDGE_CAP of 64, and masks above 256x256. Raising
+    # the cap needs those points and is its own bite — the cap moves on MEASUREMENT, never on the
+    # arithmetic model that set it.
     echo "[2/2] Building the 3D-arc RUNG 9b kernel (edge rasteriser; no compile flag needed)."
-    echo "      Run: gputri --digest (compare vs host cpuref) THEN gputri --cov THEN klug > /edge.txt"
+    echo "      Run: gputri --cov (must be 20/20) THEN gputri --bench (RUNG 10 KILL GATE) THEN klug > /bench.txt"
     BUILD_ENV=""
     BUILD_TAG="EDGE_COV"
 elif [ -n "${BURN_SHADER_COV:-}" ]; then
@@ -688,7 +716,7 @@ esac
 # as GPU_RECOVER above and for the same reason -- on 2026-07-24 a burn shipped a correct kernel
 # with a tool six hours old that lacked the arm under test; both arms fell through to a probe
 # that returns 95, and two runs of the experiment produced no data at all.
-for _m in "--cov" "--digest"; do
+for _m in "--cov" "--digest" "--bench"; do
     if ! grep -qa -- "$_m" build/rootfs/bin/gputri 2>/dev/null; then
         echo "burn-prep: STAGED /bin/gputri LACKS '$_m' -- rung 9b's oracle cannot be invoked."
         echo "  Fix:  sh scripts/stage-tools.sh"
@@ -703,7 +731,7 @@ if ! grep -qa -- "NEGATIVE CONTROL N" build/rootfs/bin/gputri 2>/dev/null; then
     echo "  satisfiable by a shader that writes nothing. Rebuild and re-stage."
     exit 1
 fi
-echo "  staged /bin/gputri carries --cov, --digest and the N1-N8 controls"
+echo "  staged /bin/gputri carries --cov, --digest, --bench and the N1-N8 controls"
 case "$BUILD_TAG" in
     *MODESET_AUDIO*)
         # The flags the operator is told to type MUST exist in the binary that gets flashed.
