@@ -198,6 +198,50 @@ elif [ -n "${BURN_EDGE_PROBE:-}" ]; then
     echo "      ⚠ VERIFY 'gpu: edge rasteriser cap 256 edges' in the boot log."
     BUILD_ENV="EDGE_CAP_PROBE=1"
     BUILD_TAG="EDGE_CAP_PROBE"
+elif [ -n "${BURN_TEX_RGBA:-}" ]; then
+    # ============================================================================================
+    # 3D ARC RUNG 13 — TEXTURING'S FIRST CONTACT WITH SILICON.
+    # ============================================================================================
+    # ⚠ NO COMPILE FLAG. gpu_tex_arm / gpu_tri_tex are UNCONDITIONAL. This mode carries the BRIEF.
+    #
+    # ⭐ WHAT IS ALREADY PROVEN AT ZERO BURNS, so a red does NOT re-open it:
+    #   * the ABI — 57 of 57 cases in QEMU, both formats, the bidirectional LUT rule, every reject
+    #   * the algorithm — texmodel byte-diffs it against texcore at register widths: 0 differing
+    #     bytes over 7 frames x 32x32 px x 3 coverages, in BOTH formats, with four falsification
+    #     gates including the signed-high-dword slip that cost rung 11 four burns
+    #   * the blob — shader-blob.sh reports 426 dwords matching the assembled source
+    #   * the arena — 53 slots with declared extents, 0 overlaps
+    #   * RSRC2 = 0x00000190, byte-identical to the coverage kernel's, so the shipped dispatcher
+    #     issues this blob with no PM4 change
+    #
+    # ⛔ WHAT IS *NOT* PROVEN AND IS THE POINT OF THIS FLASH: that the EMISSION does what the model
+    # does. Two assemblers agree on rung 11's blob; here only llvm-mc has been run, so a red is
+    # genuinely open between encoding and the instruction sequence.
+    # ⛔ THE INSTRUMENT IS NOT ABOVE SUSPICION. Four of this arc's reds were gputri's own defects.
+    #
+    # RUN IN THIS ORDER:
+    #   1. run /bin/gputri --cov     rung 9b regression: the rasteriser must STILL be 20/20.
+    #   2. run /bin/gputex           rung 13. Its FIRST case is the absolute test.
+    #   3. run /bin/klug > /tex1.txt
+    #
+    # PRE-REGISTERED OUTCOME TABLE:
+    #   95  every rendered pixel byte-identical to texcore in BOTH formats. Rung 13 closes.
+    #   85  pixels differ. ⭐ READ THE LOCATED `diff case ... x= y= cov= want= got=` LINES.
+    #         case 0 (1:1) differing        -> addressing or the texel-centre convention; the
+    #                                          absolute test failing means the fetch is wrong, not
+    #                                          the interpolation
+    #         case 0 exact, case 1 differing-> the fractional path: texel-centre +0.5, or the
+    #                                          quotient/correction
+    #         RGBA8 exact, IDX8 differing   -> the LUT indirection only; the UV path is fine
+    #         cov=0 but got != 0xFF101010   -> the shader wrote OUTSIDE the coverage mask
+    #   87  the comparison could not be made honestly (capture, allocation or #90 refused).
+    #   96  gpu_tex_arm refused -- an ARMING fault, not a shader fault. Check the boot log.
+    #   Any GPO_E_* reason: the ABI refused that record; 25/26/27 are tex slot / tex dim / LUT.
+    echo "[2/2] Building the 3D-arc RUNG 13 kernel (texturing; no compile flag needed)."
+    echo "      Run: gputri --cov (must STILL be 20/20) THEN gputex THEN klug > /tex1.txt"
+    BUILD_ENV=""
+    BUILD_TAG="TEX_RGBA"
+
 elif [ -n "${BURN_TRI_RGBA:-}" ]; then
     # ============================================================================================
     # 3D ARC RUNG 11 — BURN 1. ATTRIBUTE INTERPOLATION'S FIRST CONTACT WITH SILICON.

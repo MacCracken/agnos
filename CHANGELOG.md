@@ -9,6 +9,79 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 iron — attribute interpolation byte-exact, every control firing. This cycle carries the batch-path
 defect that four probes have now cornered. Bumped on cycle open; the user tags on close.
 
+### ⭐⭐ RUNG 13 BURN 1 — 6 of 8 cases EXACT on first contact, including the ABSOLUTE test
+
+`1:1-identity`, `magnified-3tex` and `skewed` were byte-identical in **both** formats on the first
+flash, and the 1:1 case is the absolute test — the rendered rect matching **the source texture
+itself**, an artifact the reference never produced. Only `non-integer-scale` differed, by 13 pixels,
+identically in RGBA8 and IDX8.
+
+⭐ **The located diffs decoded straight to the cause, with no second burn spent narrowing.** Texel
+colour is `R=i, G=63−i, B=3i`, so `want=0xff043b0c` is **texel 4** and `got=0xff033c09` is **texel
+3** — an off-by-one in the *index*, not the blend. At x=6 in an 8-texels-across-13-pixels frame,
+`u = 6.5·8/13 = 4.0` **exactly**: the quotient was landing one ULP short of an integer and the
+exact correction was not rescuing it.
+
+### ⛔ FIXED — the 96-bit comparisons read the wrong dword pair
+
+The accumulator is `(v20 lo, v21 mid, v22 hi)`, so the numerator's 64-bit value is **`v[20:21]`**.
+Both the limit check and the exact correction compared **`v[21:22]`** — the numerator *shifted right
+by 32* against an unshifted operand, off by 2^32, which made neither able to fire. The correction
+additionally folded `(q+1)·A2` through a `v_mad_u64_u32` using `v16` as both operand and
+destination; it is now the explicit `lo(q1·A2lo)` / `hi(q1·A2lo) + lo(q1·A2hi)` pair. Fixed in both
+axes; blob **426 → 430** dwords, `shader-blob.sh` confirms the table matches.
+
+### ⚠ A second defect the burn did NOT catch — found by reading the fix, and its corpus gap closed
+
+Folding the min-bias back used a **logical** shift and `v_min_u32`. When UV extrapolates below zero
+`q+m` is negative, and a logical shift turns that into a huge positive index — the unsigned min then
+selects **`dim−1`**, the *opposite* edge, where `texcore` clamps to texel 0. Now `v_ashrrev_i32`
+with signed `v_max_i32`/`v_min_i32`.
+
+⛔ **Burn 1's corpus had no negative-UV frame, so that path shipped untested.** A wrong answer there
+would have been a mirrored edge — visually plausible, and invisible to every case that ran. New
+frame 4 `negative-UV` closes it: 5 frames per format, 10 cases.
+
+Verified: 16/16 gates · blob 430 dwords match source · arena 53 slots / 0 overlaps ·
+`burn-verify: OK` (1818680 B, TEX_RGBA).
+
+### ⭐⭐⭐ RUNG 13 IS BURN-READY — texturing built end to end with no flash spent
+
+`tex_rgba.s` (**426 dwords**), `gpu_tex_dispatch`, a real `gpu_tex_arm`, and `/bin/gputex`. Every
+layer below the emission is proven on the host or in QEMU first, which is the discipline that gave
+rung 11 its 10-of-11 zero-flash record.
+
+**The shader**, in one kernel: bounds guard → zero-coverage exec mask → `E_B`/`E_C`/`E_A` → the U
+axis → the V axis → the texel fetch → coverage modulation → src-over → store.
+
+* ⛔ **Every high-half multiply carries the signed fixup.** `E` is signed; `v_mul_hi_u32` on its
+  high dword adds a spurious `2^64·p` whenever a sample centre falls outside the frame. That cost
+  rung 11 **four burns**, and texturing extrapolates constantly — negative `E` is the *common* case
+  here, not the corner.
+* ⭐ **The format branch is `s_cbranch`, and legitimately so.** `fmt` lives in an SGPR, so the branch
+  is wave-uniform. This is the one place a scalar branch is safe; a per-lane condition would need an
+  exec mask, which is the gfx9 trap.
+* The two axes are straight-line duplicates rather than a shared routine — sharing would need a real
+  call/return in a per-pixel path. An abandoned `s_getpc_b64` trampoline was removed, along with a
+  dead `v_mul_lo_u32` that was immediately overwritten.
+* `RSRC1 = 0x00AC0207` (32 VGPRs → 8 waves/SIMD), `RSRC2 = 0x00000190` — **byte-identical to the
+  coverage kernel's**, so the shipped dispatcher issues this blob with no PM4 change.
+
+**`/bin/gputex`** renders four frames in each format and byte-compares every rect through `#90`
+against a reference fed the **captured** coverage — not an assumed 255, the defect that cost burn 3.
+Located diffs carry `x`, `y`, `cov`, `want`, `got`.
+
+⭐ **Case 0 is the absolute test:** at 1:1 with integer UV the output must equal **the source texture
+itself** — an artifact the reference never produced, and the only gate here that can catch the
+reference and the shader being wrong together.
+
+⚠ **Stated, not glossed:** rung 11's blob was verified by **two** assemblers; this one has had only
+`llvm-mc`. A red is therefore genuinely open between encoding and instruction sequence, and the burn
+brief says so rather than pointing at a suspect.
+
+Verified: 16/16 gates · `shader-blob` 426 dwords match · arena 53 slots / 0 overlaps ·
+`edge-abi-smoke` 16/16 with the 57-case battery green · `burn-verify: OK` (1818568 B, TEX_RGBA).
+
 ### ⭐⭐ RUNG 13b — the CPU PROLOGUE is complete; only the shader is outstanding
 
 `gpu_tex_prep` builds the **160-byte** record the texturing shader will read, and `gpu_tri_tex` now

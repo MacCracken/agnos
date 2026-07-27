@@ -214,9 +214,13 @@ tex_rgba:
 
 L_U_HI:
     // -- N >= limU => the last texel. Guards the u32 quotient against wrapping. --
+    // ⛔ v[20:21], NOT v[21:22]. The 96-bit numerator is (v20 lo, v21 mid, v22 hi); its 64-bit
+    // VALUE is v[20:21]. Comparing v[21:22] compares the numerator SHIFTED RIGHT BY 32 against an
+    // unshifted limit — off by 2^32. The limit check already fired when v22 != 0, so v[20:21] is
+    // the whole value here.
     v_mov_b32       v16, s18
     v_mov_b32       v17, s19
-    v_cmp_lt_u64    vcc, v[21:22], v[16:17]
+    v_cmp_lt_u64    vcc, v[20:21], v[16:17]
     s_cbranch_vccnz L_U_DIV
     s_sub_i32       s61, s60, 1
     v_mov_b32       v23, s61
@@ -246,20 +250,264 @@ L_U_DIV:
     v_or_b32        v23, v29, v30           // q
 
     // -- the single exact correction, against the ORIGINAL 96-bit numerator --
-    v_add_u32       v16, 1, v23
-    v_mul_lo_u32    v17, v16, s32
-    v_mul_hi_u32    v18, v16, s32
-    v_mad_u64_u32   v[16:17], vcc, v16, s33, v[17:18]
-    v_cmp_le_u64    vcc, v[16:17], v[21:22]
+    // ⛔ (q+1)*A2 AS A PROPER 64x32 PRODUCT. A2 is 64-bit (s32 lo, s33 hi), so
+    //     lo = lo(q1*A2lo)   hi = hi(q1*A2lo) + lo(q1*A2hi)
+    // The first version folded this through v_mad_u64_u32 with v16 as both an operand and part of
+    // the destination, and compared against v[21:22] — the numerator shifted right by 32. The
+    // result was a correction that could never fire, so a quotient landing one ULP short of an
+    // exact integer stayed short. Iron found it at u = 6.5*8/13 = 4.0 exactly: texel 3 for texel 4.
+    v_add_u32       v18, 1, v23
+    v_mul_lo_u32    v16, v18, s32
+    v_mul_hi_u32    v17, v18, s32
+    v_mul_lo_u32    v19, v18, s33
+    v_add_u32       v17, v17, v19
+    v_cmp_le_u64    vcc, v[16:17], v[20:21]
     v_addc_co_u32   v23, vcc, v23, 0, vcc
 
     v_add_u32       v23, s17, v23           // fold the bias back in
-    v_lshrrev_b32   v23, 16, v23
+    // ⚠ ARITHMETIC shift and SIGNED clamps. q+m can be negative when the UV frame extrapolates
+    // below zero; a logical shift would turn that into a huge positive index and v_min_u32 would
+    // then select dim-1 — the OPPOSITE edge. texcore clamps such samples to texel 0.
+    v_ashrrev_i32   v23, 16, v23
     s_sub_i32       s61, s60, 1
-    v_min_u32       v23, s61, v23
+    v_max_i32       v23, 0, v23
+    v_min_i32       v23, s61, v23
 
 L_U_DONE:
-    s_nop           0
+    v_mov_b32       v19, v23                // stash tu; v23 is reused by the V axis
+
+    // ======================================================================================
+    // V AXIS — the same block against Q7/Q8's second half. Straight-line duplicate, on purpose:
+    // sharing one routine would need a real call/return, and two copies of proven arithmetic beat
+    // a trampoline in a per-pixel path.
+    // ======================================================================================
+    s_mov_b32       s14, s52                // dv0
+    s_mov_b32       s15, s53                // dv1
+    s_mov_b32       s16, s54                // dv2
+    s_mov_b32       s17, s55                // mv
+    s_mov_b32       s18, s58                // limV_lo
+    s_mov_b32       s19, s59                // limV_hi
+    s_mov_b32       s60, s35                // th
+    v_mov_b32       v20, 0
+    v_mov_b32       v21, 0
+    v_mov_b32       v22, 0
+
+    v_mul_lo_u32    v16, v12, s14
+    v_mul_hi_u32    v17, v12, s14
+    v_add_co_u32    v20, vcc, v20, v16
+    v_addc_co_u32   v21, vcc, v21, v17, vcc
+    v_mov_b32       v18, 0
+    v_addc_co_u32   v22, vcc, v22, v18, vcc
+    v_mul_lo_u32    v16, v13, s14
+    v_mul_hi_u32    v17, v13, s14
+    v_ashrrev_i32   v18, 31, v13
+    v_and_b32       v18, s14, v18
+    v_sub_u32       v17, v17, v18
+    v_add_co_u32    v21, vcc, v21, v16
+    v_addc_co_u32   v22, vcc, v22, v17, vcc
+
+    v_mul_lo_u32    v16, v8, s15
+    v_mul_hi_u32    v17, v8, s15
+    v_add_co_u32    v20, vcc, v20, v16
+    v_addc_co_u32   v21, vcc, v21, v17, vcc
+    v_mov_b32       v18, 0
+    v_addc_co_u32   v22, vcc, v22, v18, vcc
+    v_mul_lo_u32    v16, v9, s15
+    v_mul_hi_u32    v17, v9, s15
+    v_ashrrev_i32   v18, 31, v9
+    v_and_b32       v18, s15, v18
+    v_sub_u32       v17, v17, v18
+    v_add_co_u32    v21, vcc, v21, v16
+    v_addc_co_u32   v22, vcc, v22, v17, vcc
+
+    v_mul_lo_u32    v16, v10, s16
+    v_mul_hi_u32    v17, v10, s16
+    v_add_co_u32    v20, vcc, v20, v16
+    v_addc_co_u32   v21, vcc, v21, v17, vcc
+    v_mov_b32       v18, 0
+    v_addc_co_u32   v22, vcc, v22, v18, vcc
+    v_mul_lo_u32    v16, v11, s16
+    v_mul_hi_u32    v17, v11, s16
+    v_ashrrev_i32   v18, 31, v11
+    v_and_b32       v18, s16, v18
+    v_sub_u32       v17, v17, v18
+    v_add_co_u32    v21, vcc, v21, v16
+    v_addc_co_u32   v22, vcc, v22, v17, vcc
+
+    v_mov_b32       v23, 0
+    v_cmp_lt_i32    vcc, v22, 0
+    s_cbranch_vccnz L_V_DONE
+
+    // ⛔ v[20:21], NOT v[21:22]. The 96-bit numerator is (v20 lo, v21 mid, v22 hi); its 64-bit
+    // VALUE is v[20:21]. Comparing v[21:22] compares the numerator SHIFTED RIGHT BY 32 against an
+    // unshifted limit — off by 2^32. The limit check already fired when v22 != 0, so v[20:21] is
+    // the whole value here.
+    v_mov_b32       v16, s18
+    v_mov_b32       v17, s19
+    v_cmp_lt_u64    vcc, v[20:21], v[16:17]
+    s_cbranch_vccnz L_V_DIV
+    s_sub_i32       s61, s60, 1
+    v_mov_b32       v23, s61
+    s_branch        L_V_DONE
+
+L_V_DIV:
+    v_lshrrev_b32   v16, s26, v20
+    v_lshlrev_b32   v17, s27, v21
+    v_or_b32        v16, v16, v17
+    v_lshrrev_b32   v17, s26, v21
+    v_lshlrev_b32   v18, s27, v22
+    v_or_b32        v17, v17, v18
+
+    v_lshlrev_b32   v28, s30, v16
+    s_sub_i32       s61, 32, s30
+    v_lshrrev_b32   v29, s61, v16
+    v_lshlrev_b32   v30, s30, v17
+    v_or_b32        v29, v30, v29
+    v_mul_hi_u32    v30, v28, s29
+    v_mul_lo_u32    v31, v29, s29
+    v_mul_hi_u32    v28, v29, s29
+    v_add_co_u32    v30, vcc, v30, v31
+    v_addc_co_u32   v28, vcc, 0, v28, vcc
+    v_lshlrev_b32   v29, 1, v28
+    v_lshrrev_b32   v30, 31, v30
+    v_or_b32        v23, v29, v30
+
+    // ⛔ (q+1)*A2 AS A PROPER 64x32 PRODUCT. A2 is 64-bit (s32 lo, s33 hi), so
+    //     lo = lo(q1*A2lo)   hi = hi(q1*A2lo) + lo(q1*A2hi)
+    // The first version folded this through v_mad_u64_u32 with v16 as both an operand and part of
+    // the destination, and compared against v[21:22] — the numerator shifted right by 32. The
+    // result was a correction that could never fire, so a quotient landing one ULP short of an
+    // exact integer stayed short. Iron found it at u = 6.5*8/13 = 4.0 exactly: texel 3 for texel 4.
+    v_add_u32       v18, 1, v23
+    v_mul_lo_u32    v16, v18, s32
+    v_mul_hi_u32    v17, v18, s32
+    v_mul_lo_u32    v19, v18, s33
+    v_add_u32       v17, v17, v19
+    v_cmp_le_u64    vcc, v[16:17], v[20:21]
+    v_addc_co_u32   v23, vcc, v23, 0, vcc
+
+    v_add_u32       v23, s17, v23
+    // ⚠ ARITHMETIC shift and SIGNED clamps. q+m can be negative when the UV frame extrapolates
+    // below zero; a logical shift would turn that into a huge positive index and v_min_u32 would
+    // then select dim-1 — the OPPOSITE edge. texcore clamps such samples to texel 0.
+    v_ashrrev_i32   v23, 16, v23
+    s_sub_i32       s61, s60, 1
+    v_max_i32       v23, 0, v23
+    v_min_i32       v23, s61, v23
+
+L_V_DONE:
+    // v19 = tu, v23 = tv, both already clamped into range.
+
+    // ======================================================================================
+    // THE TEXEL FETCH
+    // ======================================================================================
+    // ⭐ s_cbranch ON THE FORMAT IS SAFE, AND THAT IS NOT AN ACCIDENT. `fmt` lives in an SGPR, so
+    // the branch is WAVE-UNIFORM — every lane takes the same side. This is the one place a scalar
+    // branch is legitimate; a per-lane condition here would need an exec mask, which is the trap
+    // [[reference_gfx9_per_lane_control_flow]] records.
+    v_mul_lo_u32    v7, v23, s34            // tv * tw
+    v_add_u32       v7, v7, v19             // + tu   => linear texel index
+    s_cmp_eq_u32    s31, 0
+    s_cbranch_scc0  L_FETCH_IDX8
+
+    v_lshlrev_b32   v7, 2, v7               // RGBA8: 4 bytes per texel
+    v_mov_b32       v14, s44
+    v_mov_b32       v15, s45
+    v_add_co_u32    v14, vcc, v14, v7
+    v_addc_co_u32   v15, vcc, v15, 0, vcc
+    global_load_dword v25, v[14:15], off
+    s_waitcnt       vmcnt(0)
+    s_branch        L_HAVE_TEXEL
+
+L_FETCH_IDX8:
+    // ⚠ TWO DEPENDENT FETCHES. The index load must complete before the LUT address exists, so the
+    // s_waitcnt between them is load-bearing, not defensive.
+    v_mov_b32       v14, s44
+    v_mov_b32       v15, s45
+    v_add_co_u32    v14, vcc, v14, v7
+    v_addc_co_u32   v15, vcc, v15, 0, vcc
+    global_load_ubyte v25, v[14:15], off
+    s_waitcnt       vmcnt(0)
+    v_lshlrev_b32   v7, 2, v25              // index * 4 into the 256-entry LUT
+    v_mov_b32       v14, s46
+    v_mov_b32       v15, s47
+    v_add_co_u32    v14, vcc, v14, v7
+    v_addc_co_u32   v15, vcc, v15, 0, vcc
+    global_load_dword v25, v[14:15], off
+    s_waitcnt       vmcnt(0)
+
+L_HAVE_TEXEL:
+    // ======================================================================================
+    // COVERAGE MODULATION, then SRC-OVER — the destination address is formed only now
+    // ======================================================================================
+    v_mov_b32       v7, s9                  // py
+    v_mul_lo_u32    v7, v7, s4              // py * pitch (BYTES)
+    v_lshlrev_b32   v14, 2, v1
+    v_add_u32       v7, v7, v14
+    v_mov_b32       v2, s2
+    v_mov_b32       v3, s3
+    v_add_co_u32    v2, vcc, v2, v7
+    v_addc_co_u32   v3, vcc, v3, 0, vcc
+    global_load_dword v15, v[2:3], off
+    s_waitcnt       vmcnt(0)
+
+    // ⛔ THE /255 IS THE BIT-IDENTITY HINGE. `(x*a + 127) >> 8` is NOT the same function as
+    // `(x*a + 127) / 255`; rung 11 established that the exact divide decides whether byte-identity
+    // is achievable at all. Both loops below use the reciprocal identity
+    //     floor(x/255) = (x + (x>>8) + 1) >> 8   for x < 2^24
+    // and the inputs here peak at 255*255 + 127 = 65152, four orders inside that bound.
+    v_mov_b32       v26, 0                  // src accumulator
+    v_mov_b32       v27, 0xFF               // qa, alpha's quotient (255 until alpha is computed)
+    s_mov_b32       s45, 24                 // ALPHA FIRST, so qa is live to clamp r/g/b against
+
+L_MOD:
+    v_lshrrev_b32   v14, s45, v25
+    v_and_b32       v14, 0xFF, v14
+    v_mul_lo_u32    v14, v14, v4            // * coverage
+    v_add_u32       v14, 0x7F, v14
+    v_lshrrev_b32   v16, 8, v14
+    v_add_u32       v14, v14, v16
+    v_add_u32       v14, 1, v14
+    v_lshrrev_b32   v14, 8, v14
+    v_min_u32       v14, 0xFF, v14
+    s_cmp_eq_u32    s45, 24
+    s_cselect_b64   s[62:63], -1, 0
+    v_cndmask_b32   v27, v27, v14, s[62:63] // on the alpha pass, qa := q
+    v_min_u32       v14, v14, v27           // premultiplied invariant: no channel exceeds alpha
+    v_lshlrev_b32   v14, s45, v14
+    v_or_b32        v26, v26, v14
+    s_sub_i32       s45, s45, 8
+    s_cmp_ge_i32    s45, 0
+    s_cbranch_scc1  L_MOD
+
+    // ---- out = src + dst * (255 - src_a) / 255, per channel ----
+    v_lshrrev_b32   v28, 24, v26
+    v_and_b32       v28, 0xFF, v28
+    v_sub_u32       v28, 0xFF, v28          // inv = 255 - src_a
+    v_mov_b32       v31, 0
+    s_mov_b32       s45, 24
+
+L_OVER:
+    v_lshrrev_b32   v29, s45, v15
+    v_and_b32       v29, 0xFF, v29          // dst channel
+    v_mul_lo_u32    v29, v29, v28
+    v_add_u32       v29, 0x7F, v29
+    v_lshrrev_b32   v30, 8, v29
+    v_add_u32       v30, v29, v30
+    v_add_u32       v30, 1, v30
+    v_lshrrev_b32   v30, 8, v30
+    v_lshrrev_b32   v29, s45, v26
+    v_and_b32       v29, 0xFF, v29          // src channel
+    v_add_u32       v30, v29, v30
+    v_min_u32       v30, 0xFF, v30
+    v_lshlrev_b32   v30, s45, v30
+    v_or_b32        v31, v31, v30
+    s_sub_i32       s45, s45, 8
+    s_cmp_ge_i32    s45, 0
+    s_cbranch_scc1  L_OVER
+
+    global_store_dword v[2:3], v31, off
+    s_waitcnt       vmcnt(0)
 
 L_END:
     s_endpgm

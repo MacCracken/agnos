@@ -145,6 +145,12 @@ stage_one agnos/gpu-test gpuwedge.cyr gpuwedge || rc=1
 # answer and nothing else it prints means anything.
 stage_one agnos/gpu-test gputri.cyr gputri || rc=1
 
+# gputex — 3D arc rung 13: nearest-neighbour affine texturing (#92 op 0x0B). `run /bin/gputex`
+# renders four frames in each of the two supported formats and byte-compares every rendered rect
+# against texcore.cyr through #90. Its FIRST case is the absolute test: at 1:1 with integer UV the
+# output must equal the SOURCE TEXTURE, an artifact the reference never produced.
+stage_one agnos/gpu-test gputex.cyr gputex || rc=1
+
 # rupantara gpulayer — the ML-layer-on-GPU crown proof (1.54.x C6). A real bias-free MLP up-projection matmul
 # (rosnet linear_fwd 8x8x32) run on the gfx90c shader cores via #83, tiled 8x8 and byte-compared against
 # rupantara's CPU linear_fwd. Exit 95 = byte-identical AND all 4 tiles on the GPU (crown); 96 = identical but

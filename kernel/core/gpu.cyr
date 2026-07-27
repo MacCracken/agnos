@@ -141,6 +141,7 @@ var gpu_otg_lock_acked = 0;  # last gpu_otg_lock result — 0 means the lock TIM
 # ambient flag only because pass 1 has already validated every op, so pass 2 cannot fail mid-emit and leave
 # a partial program in the ring with no fence behind it.
 var gpu_batch_active  = 0;
+var gpu_tex_armed     = 0;      # rung 13: the texturing blob is resident
 var gpu_cohere_wb     = 1;   # 1 = emit the post-dispatch TC write-back (7 dwords)
 var gpu_cohere_inv    = 1;   # 1 = emit the pre-dispatch ACQUIRE_MEM invalidate (7 dwords)
 var gpu_bb_pitch      = 0;   # framebuffer row pitch in BYTES — the dst stride for gpu_blit_shm_sys
@@ -3786,6 +3787,446 @@ fn gpu_tri_dispatch(rec_phys, w, h, dx, dy) {
 # ⛔ THE WHOLE BATCH IS VALIDATED BEFORE THIS RUNS. gpo_validate_trilist checks every triangle, so a
 # mid-batch refusal is impossible and the framebuffer can never be left half-drawn by a reject.
 # ⚠ Caller owns bounds checking. Returns 1 / 0.
+# tex_rgba_write — the RUNG 13 texturing blob, 430 dwords, emitted by scripts/shader-blob.sh from
+# kernel/shaders/tex_rgba.s. ⚠ NEVER hand-edit: `sh scripts/shader-blob.sh check kernel/shaders/
+# tex_rgba.s tex_rgba` diffs this table against the assembled source and is the gate that stops the
+# table and the .s drifting apart silently.
+# RSRC1 = 0x00AC0207 (32 VGPRs, 72 SGPRs) · RSRC2 = 0x00000190 — byte-identical to the coverage
+# kernel's, which is what lets the shipped dispatcher issue this blob with no PM4 change.
+fn tex_rgba_write(dst_phys) {
+    store32(dst_phys + 0,    0xbefe01c1);
+    store32(dst_phys + 4,    0xc00a0600);
+    store32(dst_phys + 8,    0x00000000);
+    store32(dst_phys + 12,   0xc00a0700);
+    store32(dst_phys + 16,   0x00000010);
+    store32(dst_phys + 20,   0xc00a0800);
+    store32(dst_phys + 24,   0x00000020);
+    store32(dst_phys + 28,   0xc00a0900);
+    store32(dst_phys + 32,   0x00000030);
+    store32(dst_phys + 36,   0xc00a0a00);
+    store32(dst_phys + 40,   0x00000040);
+    store32(dst_phys + 44,   0xc00a0b00);
+    store32(dst_phys + 48,   0x00000050);
+    store32(dst_phys + 52,   0xc00a0c00);
+    store32(dst_phys + 56,   0x00000060);
+    store32(dst_phys + 60,   0xc00a0d00);
+    store32(dst_phys + 64,   0x00000070);
+    store32(dst_phys + 68,   0xc00a0e00);
+    store32(dst_phys + 72,   0x00000080);
+    store32(dst_phys + 76,   0xbf8cc07f);
+    store32(dst_phys + 80,   0x8e0a8608);
+    store32(dst_phys + 84,   0x6802000a);
+    store32(dst_phys + 88,   0x7d980206);
+    store32(dst_phys + 92,   0xbe94206a);
+    store32(dst_phys + 96,   0xbf880194);
+    store32(dst_phys + 100,  0x920b0609);
+    store32(dst_phys + 104,  0x680e020b);
+    store32(dst_phys + 108,  0x7e1c0218);
+    store32(dst_phys + 112,  0x7e1e0219);
+    store32(dst_phys + 116,  0x321c0f0e);
+    store32(dst_phys + 120,  0xd11c6a0f);
+    store32(dst_phys + 124,  0x01a9010f);
+    store32(dst_phys + 128,  0xdc408000);
+    store32(dst_phys + 132,  0x047f000e);
+    store32(dst_phys + 136,  0xbf8c0f70);
+    store32(dst_phys + 140,  0x7d9a0880);
+    store32(dst_phys + 144,  0xbe96206a);
+    store32(dst_phys + 148,  0xbf880187);
+    store32(dst_phys + 152,  0x240a0290);
+    store32(dst_phys + 156,  0x680a0aff);
+    store32(dst_phys + 160,  0x00008000);
+    store32(dst_phys + 164,  0x8e0c9009);
+    store32(dst_phys + 168,  0x810cff0c);
+    store32(dst_phys + 172,  0x00008000);
+    store32(dst_phys + 176,  0x7e0c020c);
+    store32(dst_phys + 180,  0xd2850008);
+    store32(dst_phys + 184,  0x00020a24);
+    store32(dst_phys + 188,  0xd2860009);
+    store32(dst_phys + 192,  0x00020a24);
+    store32(dst_phys + 196,  0x900d9f24);
+    store32(dst_phys + 200,  0x261c0a0d);
+    store32(dst_phys + 204,  0x6a121d09);
+    store32(dst_phys + 208,  0x221c0a9f);
+    store32(dst_phys + 212,  0x261c1c24);
+    store32(dst_phys + 216,  0x6a121d09);
+    store32(dst_phys + 220,  0xd285000a);
+    store32(dst_phys + 224,  0x00020c25);
+    store32(dst_phys + 228,  0xd286000b);
+    store32(dst_phys + 232,  0x00020c25);
+    store32(dst_phys + 236,  0x900d9f25);
+    store32(dst_phys + 240,  0x261c0c0d);
+    store32(dst_phys + 244,  0x6a161d0b);
+    store32(dst_phys + 248,  0x221c0c9f);
+    store32(dst_phys + 252,  0x261c1c25);
+    store32(dst_phys + 256,  0x6a161d0b);
+    store32(dst_phys + 260,  0x32101508);
+    store32(dst_phys + 264,  0x38121709);
+    store32(dst_phys + 268,  0x7e1c0226);
+    store32(dst_phys + 272,  0x7e1e0227);
+    store32(dst_phys + 276,  0x32101d08);
+    store32(dst_phys + 280,  0x38121f09);
+    store32(dst_phys + 284,  0xd285000a);
+    store32(dst_phys + 288,  0x00020a28);
+    store32(dst_phys + 292,  0xd286000b);
+    store32(dst_phys + 296,  0x00020a28);
+    store32(dst_phys + 300,  0x900d9f28);
+    store32(dst_phys + 304,  0x261c0a0d);
+    store32(dst_phys + 308,  0x6a161d0b);
+    store32(dst_phys + 312,  0x221c0a9f);
+    store32(dst_phys + 316,  0x261c1c28);
+    store32(dst_phys + 320,  0x6a161d0b);
+    store32(dst_phys + 324,  0xd285000c);
+    store32(dst_phys + 328,  0x00020c29);
+    store32(dst_phys + 332,  0xd286000d);
+    store32(dst_phys + 336,  0x00020c29);
+    store32(dst_phys + 340,  0x900d9f29);
+    store32(dst_phys + 344,  0x261c0c0d);
+    store32(dst_phys + 348,  0x6a1a1d0d);
+    store32(dst_phys + 352,  0x221c0c9f);
+    store32(dst_phys + 356,  0x261c1c29);
+    store32(dst_phys + 360,  0x6a1a1d0d);
+    store32(dst_phys + 364,  0x3214190a);
+    store32(dst_phys + 368,  0x38161b0b);
+    store32(dst_phys + 372,  0x7e1c022a);
+    store32(dst_phys + 376,  0x7e1e022b);
+    store32(dst_phys + 380,  0x32141d0a);
+    store32(dst_phys + 384,  0x38161f0b);
+    store32(dst_phys + 388,  0x7e180220);
+    store32(dst_phys + 392,  0x7e1a0221);
+    store32(dst_phys + 396,  0x3418110c);
+    store32(dst_phys + 400,  0x3a1a130d);
+    store32(dst_phys + 404,  0x3418150c);
+    store32(dst_phys + 408,  0x3a1a170d);
+    store32(dst_phys + 412,  0xbe8e0030);
+    store32(dst_phys + 416,  0xbe8f0031);
+    store32(dst_phys + 420,  0xbe900032);
+    store32(dst_phys + 424,  0xbe910033);
+    store32(dst_phys + 428,  0xbe920038);
+    store32(dst_phys + 432,  0xbe930039);
+    store32(dst_phys + 436,  0xbebc0022);
+    store32(dst_phys + 440,  0x7e280280);
+    store32(dst_phys + 444,  0x7e2a0280);
+    store32(dst_phys + 448,  0x7e2c0280);
+    store32(dst_phys + 452,  0xd2850010);
+    store32(dst_phys + 456,  0x00001d0c);
+    store32(dst_phys + 460,  0xd2860011);
+    store32(dst_phys + 464,  0x00001d0c);
+    store32(dst_phys + 468,  0x32282114);
+    store32(dst_phys + 472,  0x382a2315);
+    store32(dst_phys + 476,  0x7e240280);
+    store32(dst_phys + 480,  0x382c2516);
+    store32(dst_phys + 484,  0xd2850010);
+    store32(dst_phys + 488,  0x00001d0d);
+    store32(dst_phys + 492,  0xd2860011);
+    store32(dst_phys + 496,  0x00001d0d);
+    store32(dst_phys + 500,  0x22241a9f);
+    store32(dst_phys + 504,  0x2624240e);
+    store32(dst_phys + 508,  0x6a222511);
+    store32(dst_phys + 512,  0x322a2115);
+    store32(dst_phys + 516,  0x382c2316);
+    store32(dst_phys + 520,  0xd2850010);
+    store32(dst_phys + 524,  0x00001f08);
+    store32(dst_phys + 528,  0xd2860011);
+    store32(dst_phys + 532,  0x00001f08);
+    store32(dst_phys + 536,  0x32282114);
+    store32(dst_phys + 540,  0x382a2315);
+    store32(dst_phys + 544,  0x7e240280);
+    store32(dst_phys + 548,  0x382c2516);
+    store32(dst_phys + 552,  0xd2850010);
+    store32(dst_phys + 556,  0x00001f09);
+    store32(dst_phys + 560,  0xd2860011);
+    store32(dst_phys + 564,  0x00001f09);
+    store32(dst_phys + 568,  0x2224129f);
+    store32(dst_phys + 572,  0x2624240f);
+    store32(dst_phys + 576,  0x6a222511);
+    store32(dst_phys + 580,  0x322a2115);
+    store32(dst_phys + 584,  0x382c2316);
+    store32(dst_phys + 588,  0xd2850010);
+    store32(dst_phys + 592,  0x0000210a);
+    store32(dst_phys + 596,  0xd2860011);
+    store32(dst_phys + 600,  0x0000210a);
+    store32(dst_phys + 604,  0x32282114);
+    store32(dst_phys + 608,  0x382a2315);
+    store32(dst_phys + 612,  0x7e240280);
+    store32(dst_phys + 616,  0x382c2516);
+    store32(dst_phys + 620,  0xd2850010);
+    store32(dst_phys + 624,  0x0000210b);
+    store32(dst_phys + 628,  0xd2860011);
+    store32(dst_phys + 632,  0x0000210b);
+    store32(dst_phys + 636,  0x2224169f);
+    store32(dst_phys + 640,  0x26242410);
+    store32(dst_phys + 644,  0x6a222511);
+    store32(dst_phys + 648,  0x322a2115);
+    store32(dst_phys + 652,  0x382c2316);
+    store32(dst_phys + 656,  0x7e2e0280);
+    store32(dst_phys + 660,  0xd0c1006a);
+    store32(dst_phys + 664,  0x00010116);
+    store32(dst_phys + 668,  0xbf860001);
+    store32(dst_phys + 672,  0xbf82002d);
+    store32(dst_phys + 676,  0x7e200212);
+    store32(dst_phys + 680,  0x7e220213);
+    store32(dst_phys + 684,  0x7dd22114);
+    store32(dst_phys + 688,  0xbf870003);
+    store32(dst_phys + 692,  0x81bd813c);
+    store32(dst_phys + 696,  0x7e2e023d);
+    store32(dst_phys + 700,  0xbf820026);
+    store32(dst_phys + 704,  0x2020281a);
+    store32(dst_phys + 708,  0x24222a1b);
+    store32(dst_phys + 712,  0x28202310);
+    store32(dst_phys + 716,  0x20222a1a);
+    store32(dst_phys + 720,  0x24242c1b);
+    store32(dst_phys + 724,  0x28222511);
+    store32(dst_phys + 728,  0x2438201e);
+    store32(dst_phys + 732,  0x81bd1ea0);
+    store32(dst_phys + 736,  0x203a203d);
+    store32(dst_phys + 740,  0x243c221e);
+    store32(dst_phys + 744,  0x283a3b1e);
+    store32(dst_phys + 748,  0xd286001e);
+    store32(dst_phys + 752,  0x00003b1c);
+    store32(dst_phys + 756,  0xd285001f);
+    store32(dst_phys + 760,  0x00003b1d);
+    store32(dst_phys + 764,  0xd286001c);
+    store32(dst_phys + 768,  0x00003b1d);
+    store32(dst_phys + 772,  0x323c3f1e);
+    store32(dst_phys + 776,  0x38383880);
+    store32(dst_phys + 780,  0x243a3881);
+    store32(dst_phys + 784,  0x203c3c9f);
+    store32(dst_phys + 788,  0x282e3d1d);
+    store32(dst_phys + 792,  0x68242e81);
+    store32(dst_phys + 796,  0xd2850010);
+    store32(dst_phys + 800,  0x00004112);
+    store32(dst_phys + 804,  0xd2860011);
+    store32(dst_phys + 808,  0x00004112);
+    store32(dst_phys + 812,  0xd2850013);
+    store32(dst_phys + 816,  0x00004312);
+    store32(dst_phys + 820,  0x68222711);
+    store32(dst_phys + 824,  0x7dd62910);
+    store32(dst_phys + 828,  0xd11c6a17);
+    store32(dst_phys + 832,  0x01a90117);
+    store32(dst_phys + 836,  0x682e2e11);
+    store32(dst_phys + 840,  0x222e2e90);
+    store32(dst_phys + 844,  0x81bd813c);
+    store32(dst_phys + 848,  0x1a2e2e80);
+    store32(dst_phys + 852,  0x182e2e3d);
+    store32(dst_phys + 856,  0x7e260317);
+    store32(dst_phys + 860,  0xbe8e0034);
+    store32(dst_phys + 864,  0xbe8f0035);
+    store32(dst_phys + 868,  0xbe900036);
+    store32(dst_phys + 872,  0xbe910037);
+    store32(dst_phys + 876,  0xbe92003a);
+    store32(dst_phys + 880,  0xbe93003b);
+    store32(dst_phys + 884,  0xbebc0023);
+    store32(dst_phys + 888,  0x7e280280);
+    store32(dst_phys + 892,  0x7e2a0280);
+    store32(dst_phys + 896,  0x7e2c0280);
+    store32(dst_phys + 900,  0xd2850010);
+    store32(dst_phys + 904,  0x00001d0c);
+    store32(dst_phys + 908,  0xd2860011);
+    store32(dst_phys + 912,  0x00001d0c);
+    store32(dst_phys + 916,  0x32282114);
+    store32(dst_phys + 920,  0x382a2315);
+    store32(dst_phys + 924,  0x7e240280);
+    store32(dst_phys + 928,  0x382c2516);
+    store32(dst_phys + 932,  0xd2850010);
+    store32(dst_phys + 936,  0x00001d0d);
+    store32(dst_phys + 940,  0xd2860011);
+    store32(dst_phys + 944,  0x00001d0d);
+    store32(dst_phys + 948,  0x22241a9f);
+    store32(dst_phys + 952,  0x2624240e);
+    store32(dst_phys + 956,  0x6a222511);
+    store32(dst_phys + 960,  0x322a2115);
+    store32(dst_phys + 964,  0x382c2316);
+    store32(dst_phys + 968,  0xd2850010);
+    store32(dst_phys + 972,  0x00001f08);
+    store32(dst_phys + 976,  0xd2860011);
+    store32(dst_phys + 980,  0x00001f08);
+    store32(dst_phys + 984,  0x32282114);
+    store32(dst_phys + 988,  0x382a2315);
+    store32(dst_phys + 992,  0x7e240280);
+    store32(dst_phys + 996,  0x382c2516);
+    store32(dst_phys + 1000, 0xd2850010);
+    store32(dst_phys + 1004, 0x00001f09);
+    store32(dst_phys + 1008, 0xd2860011);
+    store32(dst_phys + 1012, 0x00001f09);
+    store32(dst_phys + 1016, 0x2224129f);
+    store32(dst_phys + 1020, 0x2624240f);
+    store32(dst_phys + 1024, 0x6a222511);
+    store32(dst_phys + 1028, 0x322a2115);
+    store32(dst_phys + 1032, 0x382c2316);
+    store32(dst_phys + 1036, 0xd2850010);
+    store32(dst_phys + 1040, 0x0000210a);
+    store32(dst_phys + 1044, 0xd2860011);
+    store32(dst_phys + 1048, 0x0000210a);
+    store32(dst_phys + 1052, 0x32282114);
+    store32(dst_phys + 1056, 0x382a2315);
+    store32(dst_phys + 1060, 0x7e240280);
+    store32(dst_phys + 1064, 0x382c2516);
+    store32(dst_phys + 1068, 0xd2850010);
+    store32(dst_phys + 1072, 0x0000210b);
+    store32(dst_phys + 1076, 0xd2860011);
+    store32(dst_phys + 1080, 0x0000210b);
+    store32(dst_phys + 1084, 0x2224169f);
+    store32(dst_phys + 1088, 0x26242410);
+    store32(dst_phys + 1092, 0x6a222511);
+    store32(dst_phys + 1096, 0x322a2115);
+    store32(dst_phys + 1100, 0x382c2316);
+    store32(dst_phys + 1104, 0x7e2e0280);
+    store32(dst_phys + 1108, 0xd0c1006a);
+    store32(dst_phys + 1112, 0x00010116);
+    store32(dst_phys + 1116, 0xbf87002d);
+    store32(dst_phys + 1120, 0x7e200212);
+    store32(dst_phys + 1124, 0x7e220213);
+    store32(dst_phys + 1128, 0x7dd22114);
+    store32(dst_phys + 1132, 0xbf870003);
+    store32(dst_phys + 1136, 0x81bd813c);
+    store32(dst_phys + 1140, 0x7e2e023d);
+    store32(dst_phys + 1144, 0xbf820026);
+    store32(dst_phys + 1148, 0x2020281a);
+    store32(dst_phys + 1152, 0x24222a1b);
+    store32(dst_phys + 1156, 0x28202310);
+    store32(dst_phys + 1160, 0x20222a1a);
+    store32(dst_phys + 1164, 0x24242c1b);
+    store32(dst_phys + 1168, 0x28222511);
+    store32(dst_phys + 1172, 0x2438201e);
+    store32(dst_phys + 1176, 0x81bd1ea0);
+    store32(dst_phys + 1180, 0x203a203d);
+    store32(dst_phys + 1184, 0x243c221e);
+    store32(dst_phys + 1188, 0x283a3b1e);
+    store32(dst_phys + 1192, 0xd286001e);
+    store32(dst_phys + 1196, 0x00003b1c);
+    store32(dst_phys + 1200, 0xd285001f);
+    store32(dst_phys + 1204, 0x00003b1d);
+    store32(dst_phys + 1208, 0xd286001c);
+    store32(dst_phys + 1212, 0x00003b1d);
+    store32(dst_phys + 1216, 0x323c3f1e);
+    store32(dst_phys + 1220, 0x38383880);
+    store32(dst_phys + 1224, 0x243a3881);
+    store32(dst_phys + 1228, 0x203c3c9f);
+    store32(dst_phys + 1232, 0x282e3d1d);
+    store32(dst_phys + 1236, 0x68242e81);
+    store32(dst_phys + 1240, 0xd2850010);
+    store32(dst_phys + 1244, 0x00004112);
+    store32(dst_phys + 1248, 0xd2860011);
+    store32(dst_phys + 1252, 0x00004112);
+    store32(dst_phys + 1256, 0xd2850013);
+    store32(dst_phys + 1260, 0x00004312);
+    store32(dst_phys + 1264, 0x68222711);
+    store32(dst_phys + 1268, 0x7dd62910);
+    store32(dst_phys + 1272, 0xd11c6a17);
+    store32(dst_phys + 1276, 0x01a90117);
+    store32(dst_phys + 1280, 0x682e2e11);
+    store32(dst_phys + 1284, 0x222e2e90);
+    store32(dst_phys + 1288, 0x81bd813c);
+    store32(dst_phys + 1292, 0x1a2e2e80);
+    store32(dst_phys + 1296, 0x182e2e3d);
+    store32(dst_phys + 1300, 0xd2850007);
+    store32(dst_phys + 1304, 0x00004517);
+    store32(dst_phys + 1308, 0x680e2707);
+    store32(dst_phys + 1312, 0xbf06801f);
+    store32(dst_phys + 1316, 0xbf84000a);
+    store32(dst_phys + 1320, 0x240e0e82);
+    store32(dst_phys + 1324, 0x7e1c022c);
+    store32(dst_phys + 1328, 0x7e1e022d);
+    store32(dst_phys + 1332, 0x321c0f0e);
+    store32(dst_phys + 1336, 0xd11c6a0f);
+    store32(dst_phys + 1340, 0x01a9010f);
+    store32(dst_phys + 1344, 0xdc508000);
+    store32(dst_phys + 1348, 0x197f000e);
+    store32(dst_phys + 1352, 0xbf8c0f70);
+    store32(dst_phys + 1356, 0xbf820011);
+    store32(dst_phys + 1360, 0x7e1c022c);
+    store32(dst_phys + 1364, 0x7e1e022d);
+    store32(dst_phys + 1368, 0x321c0f0e);
+    store32(dst_phys + 1372, 0xd11c6a0f);
+    store32(dst_phys + 1376, 0x01a9010f);
+    store32(dst_phys + 1380, 0xdc408000);
+    store32(dst_phys + 1384, 0x197f000e);
+    store32(dst_phys + 1388, 0xbf8c0f70);
+    store32(dst_phys + 1392, 0x240e3282);
+    store32(dst_phys + 1396, 0x7e1c022e);
+    store32(dst_phys + 1400, 0x7e1e022f);
+    store32(dst_phys + 1404, 0x321c0f0e);
+    store32(dst_phys + 1408, 0xd11c6a0f);
+    store32(dst_phys + 1412, 0x01a9010f);
+    store32(dst_phys + 1416, 0xdc508000);
+    store32(dst_phys + 1420, 0x197f000e);
+    store32(dst_phys + 1424, 0xbf8c0f70);
+    store32(dst_phys + 1428, 0x7e0e0209);
+    store32(dst_phys + 1432, 0xd2850007);
+    store32(dst_phys + 1436, 0x00000907);
+    store32(dst_phys + 1440, 0x241c0282);
+    store32(dst_phys + 1444, 0x680e1d07);
+    store32(dst_phys + 1448, 0x7e040202);
+    store32(dst_phys + 1452, 0x7e060203);
+    store32(dst_phys + 1456, 0x32040f02);
+    store32(dst_phys + 1460, 0xd11c6a03);
+    store32(dst_phys + 1464, 0x01a90103);
+    store32(dst_phys + 1468, 0xdc508000);
+    store32(dst_phys + 1472, 0x0f7f0002);
+    store32(dst_phys + 1476, 0xbf8c0f70);
+    store32(dst_phys + 1480, 0x7e340280);
+    store32(dst_phys + 1484, 0x7e3602ff);
+    store32(dst_phys + 1488, 0x000000ff);
+    store32(dst_phys + 1492, 0xbead0098);
+    store32(dst_phys + 1496, 0x201c322d);
+    store32(dst_phys + 1500, 0x261c1cff);
+    store32(dst_phys + 1504, 0x000000ff);
+    store32(dst_phys + 1508, 0xd285000e);
+    store32(dst_phys + 1512, 0x0002090e);
+    store32(dst_phys + 1516, 0x681c1cff);
+    store32(dst_phys + 1520, 0x0000007f);
+    store32(dst_phys + 1524, 0x20201c88);
+    store32(dst_phys + 1528, 0x681c210e);
+    store32(dst_phys + 1532, 0x681c1c81);
+    store32(dst_phys + 1536, 0x201c1c88);
+    store32(dst_phys + 1540, 0x1c1c1cff);
+    store32(dst_phys + 1544, 0x000000ff);
+    store32(dst_phys + 1548, 0xbf06982d);
+    store32(dst_phys + 1552, 0x85be80c1);
+    store32(dst_phys + 1556, 0xd100001b);
+    store32(dst_phys + 1560, 0x00fa1d1b);
+    store32(dst_phys + 1564, 0x1c1c370e);
+    store32(dst_phys + 1568, 0x241c1c2d);
+    store32(dst_phys + 1572, 0x28341d1a);
+    store32(dst_phys + 1576, 0x81ad882d);
+    store32(dst_phys + 1580, 0xbf03802d);
+    store32(dst_phys + 1584, 0xbf85ffe9);
+    store32(dst_phys + 1588, 0x20383498);
+    store32(dst_phys + 1592, 0x263838ff);
+    store32(dst_phys + 1596, 0x000000ff);
+    store32(dst_phys + 1600, 0x6a3838ff);
+    store32(dst_phys + 1604, 0x000000ff);
+    store32(dst_phys + 1608, 0x7e3e0280);
+    store32(dst_phys + 1612, 0xbead0098);
+    store32(dst_phys + 1616, 0x203a1e2d);
+    store32(dst_phys + 1620, 0x263a3aff);
+    store32(dst_phys + 1624, 0x000000ff);
+    store32(dst_phys + 1628, 0xd285001d);
+    store32(dst_phys + 1632, 0x0002391d);
+    store32(dst_phys + 1636, 0x683a3aff);
+    store32(dst_phys + 1640, 0x0000007f);
+    store32(dst_phys + 1644, 0x203c3a88);
+    store32(dst_phys + 1648, 0x683c3d1d);
+    store32(dst_phys + 1652, 0x683c3c81);
+    store32(dst_phys + 1656, 0x203c3c88);
+    store32(dst_phys + 1660, 0x203a342d);
+    store32(dst_phys + 1664, 0x263a3aff);
+    store32(dst_phys + 1668, 0x000000ff);
+    store32(dst_phys + 1672, 0x683c3d1d);
+    store32(dst_phys + 1676, 0x1c3c3cff);
+    store32(dst_phys + 1680, 0x000000ff);
+    store32(dst_phys + 1684, 0x243c3c2d);
+    store32(dst_phys + 1688, 0x283e3d1f);
+    store32(dst_phys + 1692, 0x81ad882d);
+    store32(dst_phys + 1696, 0xbf03802d);
+    store32(dst_phys + 1700, 0xbf85ffea);
+    store32(dst_phys + 1704, 0xdc708000);
+    store32(dst_phys + 1708, 0x007f1f02);
+    store32(dst_phys + 1712, 0xbf8c0f70);
+    store32(dst_phys + 1716, 0xbf810000);
+    return 1720;
+}
+
 # gpu_tex_prep — RUNG 13's CPU prologue. Builds the 160-byte record the texturing shader reads.
 #
 # ⭐ THE MIN-BIAS AND BOTH LIMITS ARE COMPUTED HERE, NOT IN THE SHADER, and that is the whole design.
@@ -3917,7 +4358,15 @@ fn gpu_tex_prep_dump(rec_phys) {
 # resident and the failure would surface on iron as a wedged queue with no pointer back to here.
 # 13b replaces this body with the real residency check and nothing else in the tree changes.
 fn gpu_tex_arm() {
-    return 0;
+    if (gpu_tex_armed == 1) { return 1; }
+    if (gpu_present == 0) { return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+    if (gpu_matmul_ok != 1) { return 0; }
+    tex_rgba_write(gpu_arena_phys + GPU_TEX_SHADER_SUBOFF);
+    gpu_mfence();
+    gpu_tex_armed = 1;
+    return 1;
 }
 
 # gpu_tri_tex — RUNG 13's worker. Coverage first through the UNMODIFIED edge rasteriser, then a
@@ -3955,8 +4404,30 @@ fn gpu_tri_tex(edge_mc, vtx_kva, tex_mc, lut_mc, texwh, flags, w, h, dx, dy, n_e
     # zero burns. 13c replaces gpu_tex_arm's body and this function needs no further edit.
     if (gpu_tex_arm() != 1) { return 0; }
 
-    # 3. the texturing pass  (13c)
-    return 0;
+    # 3. the texturing pass
+    return gpu_tex_dispatch(rec_phys, w, h, dx, dy);
+}
+
+# gpu_tex_dispatch — issue the texturing kernel over the destination rect.
+# ⚠ Mirrors gpu_tri_dispatch exactly, including the back-buffer choice: writing gpu_bb_a_mc
+# unconditionally would draw into the FRONT buffer half the time and read as a raster bug.
+fn gpu_tex_dispatch(rec_phys, w, h, dx, dy) {
+    var rec_mc    = gpu_arena_mc + GPU_TEX_PREP_SUBOFF;
+    var shader_mc = gpu_arena_mc + GPU_TEX_SHADER_SUBOFF;
+    var done_mc   = gpu_arena_mc   + GPU_BLEND_DONE_SUBOFF;
+    var done_phys = gpu_arena_phys + GPU_BLEND_DONE_SUBOFF;
+
+    if (gpu_blit_arm() != 1) { return 0; }
+    var bb_mc = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { bb_mc = gpu_bb_b_mc; }
+    var pitch = gpu_bb_pitch;
+    if (pitch == 0) { return 0; }
+    var dst_mc = bb_mc + dy * pitch + dx * 4;
+
+    var gx = (w + 63) / 64;
+    var gy = h;
+    return gpu_blend_cov_run(shader_mc, rec_mc, dst_mc, pitch, 0, w, h,
+    GPU_COMPUTE_PGM_RSRC1_TEX, gx, gy, done_mc, done_phys);
 }
 
 fn gpu_tri_list(vtx_kva, n_tris, w, h, dx, dy) {

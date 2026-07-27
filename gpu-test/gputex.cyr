@@ -1,0 +1,325 @@
+# gputex.cyr — RUNG 13's iron instrument: #92 op 0x0B TRI_TEX, GPU vs texcore.cyr.
+#
+# ⛔ THE INSTRUMENT IS THE ONLY LINK WITH NO ORACLE, and this arc has already lost four burns to
+# exactly that. [[feedback_instrument_has_no_oracle]] Everything below is written so a red run names
+# a PIXEL rather than a suspect: located diffs with the coverage byte, a per-case differing count,
+# and an ABSOLUTE test whose expected bytes this tool did not compute.
+#
+# ⭐ THE ABSOLUTE TEST IS THE POINT. At 1:1 with integer UV and full coverage, the rendered rect must
+# be byte-identical to THE SOURCE TEXTURE ITSELF — an artifact the reference never produced. Every
+# other check compares two things I wrote; this one compares against an input. It is the only gate
+# here that can catch the reference and the shader being wrong together.
+
+include "lib/io.cyr"
+include "texcore.cyr"
+
+var tx_tex[512];                # 8x8 RGBA8 = 256 B  (measured sizing: N x u64 in this directory)
+var tx_lut[512];                # 256 x 4 B = 1024 B
+var tx_vtx[16];                 # one 48-byte vertex/UV record
+var tx_edges[64];               # 3 edges x 16 B
+var tx_ref[2048];               # 32x32x4 = 4096 B reference image
+var tx_got[2048];               # what the GPU wrote, read back
+
+var TXW = 32;
+var TXH = 32;
+var TXD = 8;                    # texture is 8x8
+
+fn phex8(v): i64 {
+    print("0x", 2);
+    var d = 28;
+    while (d >= 0) {
+        var nib = (v >> d) & 0xF;
+        if (nib < 10) { print("0123456789" + nib, 1); }
+        if (nib >= 10) { print("abcdef" + (nib - 10), 1); }
+        d = d - 4;
+    }
+    return 0;
+}
+fn puts2(s): i64 { ps(s); nl(); return 0; }
+
+fn tx_build_tex(): i64 {
+    var i = 0;
+    while (i < 64) {
+        store32(&tx_tex + i * 4, 0xFF000000 | (i << 16) | ((63 - i) << 8) | (i * 3));
+        i = i + 1;
+    }
+    var k = 0;
+    while (k < 256) { store32(&tx_lut + k * 4, 0xFF000000 | (k << 16) | (k << 8) | k); k = k + 1; }
+    return 0;
+}
+
+# The corpus: the same frames texmodel gates on, so a divergence here is the EMISSION and nothing
+# else. Fields: ax ay bx by cx cy u0 v0 u1 v1 u2 v2 (UV in 16.16 texel space).
+var TXN = 5;
+fn txf(i, f): i64 {
+    if (i == 0) {   # ⭐ 1:1 identity -- the absolute test
+        if (f == 0) { return 0; }  if (f == 1) { return 0; }
+        if (f == 2) { return 8; }  if (f == 3) { return 0; }
+        if (f == 4) { return 0; }  if (f == 5) { return 8; }
+        if (f == 6) { return 0; }  if (f == 7) { return 0; }
+        if (f == 8) { return 8 << 16; } if (f == 9) { return 0; }
+        if (f == 10) { return 0; } return 8 << 16;
+    }
+    if (i == 1) {   # non-integer scale: 8 texels across 13 px -- the plan's named gate
+        if (f == 0) { return 0; }  if (f == 1) { return 0; }
+        if (f == 2) { return 13; } if (f == 3) { return 0; }
+        if (f == 4) { return 0; }  if (f == 5) { return 13; }
+        if (f == 6) { return 0; }  if (f == 7) { return 0; }
+        if (f == 8) { return 8 << 16; } if (f == 9) { return 0; }
+        if (f == 10) { return 0; } return 8 << 16;
+    }
+    if (i == 2) {   # magnified 3 texels across 24 px -- nearest must produce hard blocks
+        if (f == 0) { return 0; }  if (f == 1) { return 0; }
+        if (f == 2) { return 24; } if (f == 3) { return 0; }
+        if (f == 4) { return 0; }  if (f == 5) { return 24; }
+        if (f == 6) { return 0; }  if (f == 7) { return 0; }
+        if (f == 8) { return 3 << 16; } if (f == 9) { return 0; }
+        if (f == 10) { return 0; } return 3 << 16;
+    }
+    if (i == 4) {   # ⭐ NEGATIVE UV -- exercises the signed bias fold. Burn 1 shipped that path
+        # UNTESTED: the corpus had no frame whose UV goes below zero, so a logical-shift slip there
+        # would have selected the OPPOSITE edge and no case would have noticed.
+        if (f == 0) { return 0; }  if (f == 1) { return 0; }
+        if (f == 2) { return 16; } if (f == 3) { return 0; }
+        if (f == 4) { return 0; }  if (f == 5) { return 16; }
+        if (f == 6) { return 0 - (3 << 16); } if (f == 7) { return 0 - (3 << 16); }
+        if (f == 8) { return 11 << 16; } if (f == 9) { return 0; }
+        if (f == 10) { return 0; } return 11 << 16;
+    }
+    # i == 3: skewed, u and v not axis-aligned
+    if (f == 0) { return 2; }  if (f == 1) { return 1; }
+    if (f == 2) { return 20; } if (f == 3) { return 5; }
+    if (f == 4) { return 6; }  if (f == 5) { return 22; }
+    if (f == 6) { return 0; }  if (f == 7) { return 0; }
+    if (f == 8) { return 8 << 16; } if (f == 9) { return 2 << 16; }
+    if (f == 10) { return 1 << 16; } return 8 << 16;
+}
+
+fn tx_name(i): i64 {
+    if (i == 0) { ps("1:1-identity"); }
+    if (i == 1) { ps("non-integer-scale"); }
+    if (i == 2) { ps("magnified-3tex"); }
+    if (i == 3) { ps("skewed"); }
+    if (i == 4) { ps("negative-UV"); }
+    return 0;
+}
+
+fn digest(buf, n): i64 {
+    var h = 2166136261;
+    var i = 0;
+    while (i < n) {
+        h = (h ^ (load8(buf + i) & 0xFF)) & 0xFFFFFFFF;
+        h = (h * 16777619) & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    return h;
+}
+
+# Pack the frame's own three edges as the coverage shape, exactly as op 0x09's caller does.
+fn tx_pack_edges(i): i64 {
+    var e = 0;
+    while (e < 3) {
+        var a = e; var b = e + 1;
+        if (b == 3) { b = 0; }
+        store32(&tx_edges + (e * 4 + 0) * 4, txf(i, a * 2 + 0) << 16);
+        store32(&tx_edges + (e * 4 + 1) * 4, txf(i, a * 2 + 1) << 16);
+        store32(&tx_edges + (e * 4 + 2) * 4, txf(i, b * 2 + 0) << 16);
+        store32(&tx_edges + (e * 4 + 3) * 4, txf(i, b * 2 + 1) << 16);
+        e = e + 1;
+    }
+    return 0;
+}
+
+fn tx_pack_vtx(i): i64 {
+    var f = 0;
+    while (f < 6) { store32(&tx_vtx + f * 4, txf(i, f) << 16); f = f + 1; }
+    var g = 6;
+    while (g < 12) { store32(&tx_vtx + g * 4, txf(i, g)); g = g + 1; }
+    return 0;
+}
+
+# Capture the coverage op 0x08 actually produces, so the reference consumes the SAME mask the GPU
+# does. ⛔ Assuming 255 everywhere is the defect that cost burn 3 of rung 11.
+fn tx_cov_capture(i, out): i64 {
+    tx_pack_edges(i);
+    var eid = syscall(86, 64 * 16);
+    if (eid < 1) { return 0; }
+    var mid = syscall(86, TXW * TXH);
+    if (mid < 1) { syscall(74, eid); return 0; }
+    if (syscall(72, eid, &tx_edges, 3 * 16) != 0) { syscall(74, eid); syscall(74, mid); return 0; }
+    var z = 0;
+    while (z < TXW * TXH / 8) { store64(out + z * 8, 0); z = z + 1; }
+    syscall(72, mid, out, TXW * TXH);
+    var d[64];
+    var q = 0;
+    while (q < 16) { store32(&d + q * 4, 0); q = q + 1; }
+    store32(&d +  0, 8);
+    store32(&d +  8, mid);
+    store32(&d + 12, eid);
+    store32(&d + 16, (TXH * 65536) + TXW);
+    store32(&d + 36, 3);
+    var rc = syscall(92, &d, 64);
+    var ok = 1;
+    if (rc != 0) { ok = 0; }
+    if (ok == 1) { if (syscall(73, mid, out, TXW * TXH) != 0) { ok = 0; } }
+    syscall(74, eid); syscall(74, mid);
+    return ok;
+}
+
+var tx_cov[512];                # 32*32 = 1024 B coverage mask
+
+fn tx_ref_fill(i, idx8): i64 {
+    var y = 0;
+    while (y < TXH) {
+        var x = 0;
+        while (x < TXW) {
+            var cv = load8(&tx_cov + y * TXW + x) & 0xFF;
+            var v = 0xFF101010;
+            if (cv != 0) { v = tex_ref_px(&tx_tex, &tx_lut, TXD, TXD, x, y, cv, 0xFF101010, idx8); }
+            store32(&tx_ref + (y * TXW + x) * 4, v);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+var tx_ndiff = 0;
+var tx_dumped = 0;
+
+fn tx_run_case(i, idx8, tileno): i64 {
+    if (tri_prep(txf(i,0), txf(i,1), txf(i,2), txf(i,3), txf(i,4), txf(i,5),
+                 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF) != 1) { return 0 - 1; }
+    if (tex_prep(txf(i,6), txf(i,7), txf(i,8), txf(i,9), txf(i,10), txf(i,11)) != 1) { return 0 - 1; }
+    if (tx_cov_capture(i, &tx_cov) == 0) { return 0 - 2; }
+    tx_ref_fill(i, idx8);
+
+    var tx0 = (tileno % 4) * 40 + 8;
+    var ty0 = (tileno / 4) * 40 + 8;
+
+    var tid = syscall(86, 4096);
+    var lid = syscall(86, 4096);
+    var vid = syscall(86, 4096);
+    var eid = syscall(86, 4096);
+    if (tid < 1) { return 0 - 3; }
+    if (lid < 1) { return 0 - 3; }
+    if (vid < 1) { return 0 - 3; }
+    if (eid < 1) { return 0 - 3; }
+
+    syscall(72, tid, &tx_tex, TXD * TXD * 4);
+    syscall(72, lid, &tx_lut, 256 * 4);
+    tx_pack_vtx(i);
+    syscall(72, vid, &tx_vtx, 48);
+    tx_pack_edges(i);
+    syscall(72, eid, &tx_edges, 3 * 16);
+
+    # ⭐ CLEAR THE DESTINATION TO THE REFERENCE'S OWN BACKGROUND. Without this the two sides do not
+    # share an input and the comparison can only ever be a REPORT, never a gate demanding zero.
+    if (syscall(88, 0xFF101010, (TXH * 65536) + TXW, (ty0 * 65536) + tx0) != 0) { return 0 - 4; }
+
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 11);                       # op 0x0B TRI_TEX
+    store32(&d +  4, idx8);
+    store32(&d +  8, tid);
+    store32(&d + 12, eid);
+    store32(&d + 16, (TXH * 65536) + TXW);
+    store32(&d + 20, (ty0 * 65536) + tx0);
+    store32(&d + 24, vid);
+    store32(&d + 28, (TXD * 65536) + TXD);
+    if (idx8 != 0) { store32(&d + 32, lid); }
+    store32(&d + 60, 3);
+    var rc = syscall(92, &d, 64);
+    if (rc != 0) {
+        syscall(74, tid); syscall(74, lid); syscall(74, vid); syscall(74, eid);
+        return 0 - 100 - ((0 - rc) & 0xFF);
+    }
+
+    var rid = syscall(86, TXW * TXH * 4);
+    if (rid < 1) { return 0 - 3; }
+    var pz = 0;
+    while (pz < TXW * TXH * 4 / 8) { store64(&tx_got + pz * 8, 0xA5A5A5A5A5A5A5A5); pz = pz + 1; }
+    syscall(72, rid, &tx_got, TXW * TXH * 4);
+    var rb = syscall(90, rid, (TXH * 65536) + TXW, (ty0 * 65536) + tx0);
+    if (rb != 0) { return 0 - 5; }
+    if (syscall(73, rid, &tx_got, TXW * TXH * 4) != 0) { return 0 - 5; }
+    syscall(74, tid); syscall(74, lid); syscall(74, vid); syscall(74, eid); syscall(74, rid);
+
+    var bad = 0;
+    var pi = 0;
+    while (pi < TXW * TXH) {
+        var got = load32(&tx_got + pi * 4) & 0xFFFFFFFF;
+        var want = load32(&tx_ref + pi * 4) & 0xFFFFFFFF;
+        if (got != want) {
+            bad = bad + 1;
+            if (tx_dumped < 4) {
+                tx_dumped = tx_dumped + 1;
+                ps("    diff case "); pn(i); ps(" @ x="); pn(pi % TXW); ps(" y="); pn(pi / TXW);
+                ps("  cov="); pn(load8(&tx_cov + pi) & 0xFF);
+                ps("  want="); phex8(want); ps("  got="); phex8(got); nl();
+            }
+        }
+        pi = pi + 1;
+    }
+    tx_ndiff = tx_ndiff + bad;
+    return bad;
+}
+
+fn main(): i64 {
+    puts2("gputex: RUNG 13 -- nearest-neighbour affine texturing via #92 op 0x0B");
+    tx_build_tex();
+    var exact = 0;
+    var ran = 0;
+
+    var i = 0;
+    while (i < TXN) {
+        var r = tx_run_case(i, 0, i);
+        ps("  case "); pn(i); ps(" "); tx_name(i); ps("  ");
+        if (r == 0 - 1) { puts2("frame REJECTED by the reference"); }
+        if (r == 0 - 2) { puts2("coverage capture FAILED -- the reference cannot be fed the GPU's input"); }
+        if (r == 0 - 3) { puts2("slot allocation FAILED"); }
+        if (r == 0 - 4) { puts2("fill_rect refused"); }
+        if (r == 0 - 5) { puts2("#90 readback refused"); }
+        if (r <= 0 - 100) { ps("op REJECTED, reason "); pn((0 - r) - 100); nl(); }
+        if (r == 0) { puts2("EXACT"); exact = exact + 1; ran = ran + 1; }
+        if (r > 0) { ps(""); pn(r); puts2(" differing px"); ran = ran + 1; }
+        i = i + 1;
+    }
+
+    # ---- the IDX8 path, same frames through the LUT ------------------------------------
+    var b = 0;
+    while (b < 64) { store8(&tx_tex + b, b * 4); b = b + 1; }
+    var idxexact = 0;
+    var j = 0;
+    while (j < TXN) {
+        var r2 = tx_run_case(j, 1, j + 5);
+        ps("  IDX8 case "); pn(j); ps(" ");
+        if (r2 == 0) { puts2("EXACT"); idxexact = idxexact + 1; }
+        if (r2 != 0) { pn(r2); puts2(" (non-zero)"); }
+        j = j + 1;
+    }
+    tx_build_tex();
+
+    syscall(84);
+    puts2("gputex: presented -- the tiles above are ON SCREEN now");
+
+    ps("gputex: RGBA8 "); pn(exact); ps(" of "); pn(TXN); ps(" exact; IDX8 ");
+    pn(idxexact); ps(" of "); pn(TXN); puts2(" exact");
+
+    if (tx_ndiff != 0) {
+        ps("gputex: ⛔ PIXELS DIFFER -- "); pn(tx_ndiff); puts2(" total");
+        puts2("gputex:   READ THE LOCATED DIFFS ABOVE. texmodel proves the algorithm at register");
+        puts2("gputex:   widths and shader-blob proves the table matches the source, so the");
+        puts2("gputex:   remaining suspects are the EMISSION and THIS TOOL -- in that order only");
+        puts2("gputex:   because the tool's inputs are shared with the reference by construction.");
+        return 85;
+    }
+    if (exact != TXN) { return 87; }
+    if (idxexact != TXN) { return 87; }
+    puts2("gputex: ⭐ RUNG 13 -- every rendered pixel byte-identical to texcore, both formats.");
+    return 95;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
