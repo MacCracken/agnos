@@ -1119,18 +1119,18 @@ var GPU_TEX_LIST_MAX   = 512;        # per-record primitive cap; a reject, never
 # measurement saying it is needed.
 var GPU_TEXL_MAX_WAVES = 262144;     # launched wavefronts per op 0x0C dispatch
 var GPU_TEX_PRIM_BYTES = 96;         # per-primitive input record, ring-3 supplied:
-                                     #   +0  wh        h<<16 | w      (rect size)
-                                     #   +4  dstxy     y<<16 | x      (rect origin, screen)
-                                     #   +8  tex_id    #86 slot
-                                     #   +12 lut_id    #86 slot (IDX8 only, else 0)
-                                     #   +16 texwh     th<<16 | tw
-                                     #   +20 flags     per-primitive: IDX8 | WRAP
-                                     #   +24 vx0 vy0 vx1 vy1 vx2 vy2  (i32 16.16)
-                                     #   +48 u0 v0 u1 v1 u2 v2        (i32 16.16)
-                                     # ⚠ 96 B: a 24-byte header + 48 bytes of coords = 72, rounded
-                                     # UP to 96 so the record is 32-byte aligned and the shader can
-                                     # index it with a shift instead of a multiply. +72..95 reserved,
-                                     # MUST be zero — the extension point, as on every other record.
+#   +0  wh        h<<16 | w      (rect size)
+#   +4  dstxy     y<<16 | x      (rect origin, screen)
+#   +8  tex_id    #86 slot
+#   +12 lut_id    #86 slot (IDX8 only, else 0)
+#   +16 texwh     th<<16 | tw
+#   +20 flags     per-primitive: IDX8 | WRAP
+#   +24 vx0 vy0 vx1 vy1 vx2 vy2  (i32 16.16)
+#   +48 u0 v0 u1 v1 u2 v2        (i32 16.16)
+# ⚠ 96 B: a 24-byte header + 48 bytes of coords = 72, rounded
+# UP to 96 so the record is 32-byte aligned and the shader can
+# index it with a shift instead of a multiply. +72..95 reserved,
+# MUST be zero — the extension point, as on every other record.
 
 var GPU_RULE_NONZERO   = 0;
 var GPU_RULE_EVENODD   = 1;
