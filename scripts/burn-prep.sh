@@ -198,6 +198,60 @@ elif [ -n "${BURN_EDGE_PROBE:-}" ]; then
     echo "      ⚠ VERIFY 'gpu: edge rasteriser cap 256 edges' in the boot log."
     BUILD_ENV="EDGE_CAP_PROBE=1"
     BUILD_TAG="EDGE_CAP_PROBE"
+elif [ -n "${BURN_TRI_RGBA:-}" ]; then
+    # ============================================================================================
+    # 3D ARC RUNG 11 — BURN 1. ATTRIBUTE INTERPOLATION'S FIRST CONTACT WITH SILICON.
+    # ============================================================================================
+    # ⚠ NO COMPILE FLAG. gpu_tri_arm / gpu_tri_rgba are UNCONDITIONAL — a default kernel already
+    # carries them. This mode carries the BRIEF, not a #define. A burn whose instructions live only
+    # in a chat log gets run wrong once and wasted.
+    #
+    # ⛔ WHAT THIS BURN CAN AND CANNOT SETTLE, STATED BEFORE IT RUNS. The shader writes the BACK
+    # BUFFER, which ring 3 cannot read back, so there is no byte-comparison on this flash. It
+    # settles: the ABI accepts every corpus record, the dispatch retires, and the screen shows
+    # smoothly-varying colour. It does NOT settle per-pixel correctness — that needs the read-back
+    # path, which is the next bite. Do not report 95 here as "the pixels are right".
+    #
+    # RUN IN THIS ORDER. The order makes a red localise.
+    #   1. run /bin/triref                    (host build) -- note its N16 corpus digest FIRST.
+    #      ⛔ Actually run the HOST triref before the flash and write the digest down; step 3
+    #      compares against it. If they differ, this build's reference is not the host's and
+    #      nothing else on the flash means anything.
+    #   2. run /bin/gputri --cov              rung 9b regression: the rasteriser must STILL be
+    #      20/20. Attribute interpolation dispatches the coverage kernel unmodified, so a red here
+    #      indicts the arena move (the prep table went 0xD0000 -> 0xA8000), not the new shader.
+    #   3. run /bin/gputri --tri              the corpus + all eight controls N9-N16.
+    #   4. run /bin/klug > /tri.txt           capture, then mount the FS from Linux to copy out.
+    #
+    # PRE-REGISTERED OUTCOME TABLE — written before the flash:
+    #   95  every record accepted, every dispatch retired, all eight controls fired. The ABI and
+    #       the dispatch are proven. ⚠ Pixels are NOT proven; look at the screen and say what you
+    #       see, then the read-back bite settles it.
+    #  100  no GPU carveout — wrong machine, or the GPU never came up. Not a rung-11 result.
+    #   96  the shader is not resident: gpu_tri_arm's gates refused. An ARMING fault, not a shader
+    #       fault. Check the boot log's arena/ring/matmul lines.
+    #   86  a negative control did not fire. The run proves NOTHING either way — fix and re-burn.
+    #       ⭐ N12 is the one that matters most: it is the only thing standing between an
+    #       x-term-wired-to-zero shader and a green run, because every gradient case is a function
+    #       of y alone and reproduces perfectly with a dead x coefficient.
+    #   90  a slot write/read syscall failed — infrastructure, not the shader.
+    #   Any GPO_E_* reason printed per case: the ABI refused that record. The reason code names the
+    #       field; 22 = frame area, 23 = frame skew, 20 = coordinate out of range.
+    #
+    # ⭐ WHAT IS ALREADY PROVEN AT ZERO BURNS, so a red here does NOT re-open it:
+    #   * the algorithm — trimodel byte-diffs the whole thing against the exact reference at
+    #     register widths, with four falsification gates including the x-term kill.
+    #   * the machine code — two independent assemblers (llvm-mc and the sovereign edgeasm) agree
+    #     on all 269 dwords.
+    #   * the CPU prologue — the kernel's 128-byte prep record is field-identical to the host's.
+    #   * the register budget — the emit list's high-water is v31 against a declared 32.
+    #   So a red burn indicts DISPATCH or COHERENCE, not arithmetic. That is the whole point of the
+    #   nine zero-burn bites that preceded it.
+    echo "[2/2] Building the 3D-arc RUNG 11 kernel (attribute interpolation; no compile flag needed)."
+    echo "      Run: gputri --cov (must STILL be 20/20) THEN gputri --tri THEN klug > /tri.txt"
+    BUILD_ENV=""
+    BUILD_TAG="TRI_RGBA"
+
 elif [ -n "${BURN_EDGE_COV:-}" ]; then
     # ============================================================================================
     # 3D ARC RUNG 9b — BURN 1. THE EDGE RASTERISER'S FIRST CONTACT WITH SILICON.

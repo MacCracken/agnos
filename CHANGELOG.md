@@ -11,6 +11,56 @@ four flashes and **rung 10's kill gate measured and passed** — crossover 1751 
 loose end that burn left: `--bench` exiting 142 where its code path returns 95. Bumped on cycle
 open; the user tags on close.
 
+### ⭐⭐⭐ RUNG 11 — ATTRIBUTE INTERPOLATION, BURN-READY AT **ZERO FLASHES**
+
+Op **`0x09 GPU_OP_TRI_RGBA`**: per-vertex premultiplied RGBA interpolated barycentrically across a
+frame and src-over'd into the back buffer. Ten of eleven bites landed without touching hardware; the
+eleventh is the burn.
+
+⭐ **Coverage geometry and the attribute frame are DECOUPLED.** The shape is an edge array; the
+attribute basis is 3 vertices + 3 colours. Barycentric interpolation is affine over the whole plane,
+so the frame need not coincide with the shape — which makes a two-triangle quad **one record**, one
+coverage pass, one blend, and a seam **structurally unrepresentable** rather than merely tested-for.
+
+**The shader** — `kernel/shaders/tri_rgba.s`, 269 dwords. `RSRC1 = 0x002C0187` (32 VGPRs, 8 waves per
+SIMD), `RSRC2 = 0x00000190` — **byte-identical to the shipped coverage kernel's**, which is why the
+existing dispatcher issues it with **no PM4 change, no descriptor edit, no dispatcher change**. Both
+harvested from the assembled object, never counted.
+
+**Proven before any flash:**
+- **The algorithm** — `trimodel.cyr` runs the whole thing at 32-bit register widths and byte-diffs it
+  against the exact reference: **0 differing bytes**, with four falsification gates.
+- **The machine code** — **two independent assemblers agree on all 269 dwords** (llvm-mc and the
+  sovereign `edgeasm`). ⛔ One assembler is not the bar; a blob verified once may not be flashed.
+- **The CPU prologue** — the kernel's 128-byte prep record is **field-identical (23/23)** to the
+  host's, computed independently. Not a read-back: printing what was computed lets an independent
+  computation contradict it.
+- **The register budget** — the emit list's high-water is v31 against a declared 32, measured by the
+  assembler rather than by eye.
+
+**⭐ The two gates that carry the burn.** A green corpus proves nothing on its own: a **flat-colour**
+shader reproduces a single-colour case byte-exactly, and an **x-term wired to zero** reproduces every
+gradient case perfectly, because a vertical gradient is a function of y alone. Measured here — the
+gradient cases have **row span 0**. N11 (6 cases ≥64 distinct values) and N12 (4 cases varying ≥32
+along a row) are what stand between those shaders and a green run.
+
+**N14 failed first, and that was the control working.** `min(q_ch, q_a)` never fired anywhere in the
+corpus, so a shader omitting the premultiplied restore would have passed everything. The cause is
+structural: inside a frame, interpolation is a convex combination, so `c ≤ a` is preserved and the
+clamp *cannot* fire — only extrapolation outside can. Fixed the **corpus**, not the gate: a small
+frame in a large sample grid with alpha running 32→255 while the colours run 32→0. Now 6,048 firings.
+
+**Three plan numbers were wrong and are corrected in place**, each caught by building rather than
+reading: `t ∈ [10,31]` (measured **[2,18]**; the upper end is unconstructible and the lower end
+excluded most triangles), the odd-denominator parity gate (`D255` carries a `<<16` and **can never be
+odd**), and `AREA_MIN = 2^32` (really **2^16** — the stated floor would have **rejected every triangle
+smaller than ~256×256**).
+
+⚠ **What the burn can and cannot settle, pre-registered.** The shader writes the back buffer, which
+ring 3 cannot read back, so there is **no byte-comparison on this flash**. It settles the ABI, the
+dispatch, and smoothly-varying colour on screen. Per-pixel correctness needs the read-back path.
+`BURN_TRI_RGBA=1` carries the brief and the outcome table.
+
 ### ⛔⭐ GPU ARENA: a shipped slot COLLISION, and the gate that structurally could not see it
 
 `GPU_EDGE_PREP_SUBOFF` was allocated at `0xD0000`. The batched-frame snapshot sits at `0xC0000` and
