@@ -3,6 +3,54 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.23] - 2026-07-27
+
+**Rung 14's oracle (open cycle).** 1.56.22 closed rung 13 and met rung 14's addressing requirements
+on iron. This cycle answers the question the whole rung rests on. Bumped on cycle open; the user
+tags on close.
+
+### ⭐⭐⭐ A DOOM WALL COLUMN *IS* AN op 0x0B QUAD, BIT FOR BIT — proven on the host, zero burns
+
+`tests/gpu/doomcol.cyr` transcribes `render_draw_tex_column`'s inner loop as the reference and
+expresses the same column as a textured quad. **All seven cases EXACT**: 1:1, magnified 4×,
+minified 3×, wrapping, fractional step, negative start, and the darkest light level.
+
+⭐ **This was the right thing to answer first.** If a column were not bit-exactly expressible, no
+amount of batching or dispatch tuning would save rung 14 — the backend would render a wall that
+merely *looked* like DOOM's, and the byte-comparison gate the plan specifies could never pass.
+
+**The mapping, derived from `cyrius-doom/src/render.cyr` and `framebuf.cyr` rather than from the
+plan's summary:**
+
+| DOOM | op 0x0B |
+|---|---|
+| `wty % (th << 16)`, corrected positive | `GPU_TEX_FLAG_WRAP` |
+| `colormap[light*256 + texcol[tyq]]` → `pal_xrgb[…]` | **one composed LUT**: `LUT[i] = pal_xrgb[colormap[light][i]]` |
+| 8bpp column, height `th` | IDX8 texture, `tw = 1`, `th = th` |
+
+The two indirections **compose into a single 256-entry ARGB table per light level**, built once on
+the CPU — which is exactly the shape `IDX8 + LUT` was specified for at TD-7, before DOOM was looked
+at in detail.
+
+⛔ **THE HALF-PIXEL IS THE TRAP, and it is why this file exists.** DOOM steps `wty` per **row**, so
+screen row *k* samples `tex_y_start + k*step`. op 0x0B samples the pixel **centre**, `k + 0.5`. A
+frame built naively samples half a step too far down on *every* row — and a wall sampled half a step
+off is still a wall. It would have looked right. The frame must place `v = tex_y_start` at
+`y = 0.5`, extrapolating back by half a step at the vertex.
+
+### ⭐ Falsified, not just green — three mutations, all firing
+
+Seven green cases on a first run prove nothing until the arms are seen to fail:
+
+| mutation | rows broken |
+|---|---|
+| drop the half-step back-off | **49** |
+| clamp instead of wrap | **66** |
+| compose the LUT backwards (`colormap[palette[i]]`) | **63** |
+
+The LUT-transposition mutation is the one worth keeping: it still produces *a picture*, just the
+wrong one — the exact failure shape a visual check would pass.
+
 ## [1.56.22] - 2026-07-27
 
 **Closing rung 13's carry-forward (open cycle).** 1.56.21 shipped texturing green on iron with three

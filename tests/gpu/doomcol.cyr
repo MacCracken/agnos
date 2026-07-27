@@ -1,0 +1,246 @@
+# doomcol.cyr — RUNG 14's FIRST ORACLE: is a DOOM wall column exactly expressible as an op 0x0B
+# textured quad?
+#
+# ⭐ THIS IS THE QUESTION THE WHOLE RUNG RESTS ON, and it is answerable on the HOST for free. If a
+# column is NOT bit-exactly expressible, no amount of batching or dispatch tuning saves rung 14 —
+# the GPU backend would render a wall that merely looks like DOOM's. Rungs 11-13 were cheap because
+# the oracle came first; this is rung 14's.
+#
+# ⛔ THE MAPPING, DERIVED FROM cyrius-doom/src/render.cyr AND framebuf.cyr, NOT FROM THE PLAN.
+# DOOM's inner loop (`render_draw_tex_column`) is:
+#     wty  = tex_y % (th << 16), corrected positive     <- TRUE MODULO, hence GPU_TEX_FLAG_WRAP
+#     tyq  = wty >> 16
+#     out8 = colormap[light*256 + texcol[tyq]]          <- render_shade
+#     argb = pal_xrgb[out8]                             <- framebuf's 8bpp -> ARGB blit
+# so the two indirections COMPOSE into one 256-entry table:
+#     LUT[i] = pal_xrgb[ colormap[light*256 + i] ]
+# which is exactly what IDX8 + LUT takes. One LUT per light level, built once on the CPU.
+#
+# ⛔ THE HALF-PIXEL IS THE TRAP, AND IT IS WHY THIS FILE EXISTS. DOOM steps `wty` by `tex_y_step`
+# per ROW, so screen row k samples v = tex_y_start + k*step. op 0x0B samples at the pixel CENTRE,
+# i.e. at k + 0.5. A frame built naively (v = tex_y_start at y = 0) samples half a step too far down
+# EVERY row — a wall that is subtly, uniformly wrong and looks entirely plausible. The frame must
+# place v = tex_y_start at y = 0.5, which means extrapolating v BACK by half a step at y = 0.
+
+include "lib/io.cyr"
+include "texcore.cyr"
+
+var dc_col[512];                # the texture column, 8bpp indices (th <= 256 for DOOM textures)
+var dc_lut[512];                # 256 ARGB entries = the composed colormap+palette table
+var dc_pal[512];                # pal_xrgb: the 256-entry ARGB palette
+var dc_cmap[4096];              # colormap: 34 light levels x 256 = 8704 B
+var dc_out[512];                # what the quad path produced, one column of ARGB
+
+fn ph8(v): i64 {
+    var d = 28;
+    while (d >= 0) {
+        var nib = (v >> d) & 0xF;
+        if (nib < 10) { print("0123456789" + nib, 1); }
+        if (nib >= 10) { print("abcdef" + (nib - 10), 1); }
+        d = d - 4;
+    }
+    return 0;
+}
+
+# Stand-ins with DOOM's SHAPE, not DOOM's data — the question is whether the mapping is exact, and
+# that does not depend on the particular bytes. Deliberately non-trivial so a wrong index shows.
+fn dc_build(): i64 {
+    var i = 0;
+    while (i < 256) {
+        # a palette with all three channels distinct and non-monotonic
+        store32(&dc_pal + i * 4, 0xFF000000 | (((i * 7) & 0xFF) << 16)
+                                            | (((255 - i) & 0xFF) << 8)
+                                            | ((i * 3) & 0xFF));
+        i = i + 1;
+    }
+    # colormap: light L darkens by folding the index toward 0, as DOOM's does
+    var l = 0;
+    while (l < 34) {
+        var k = 0;
+        while (k < 256) {
+            store8(&dc_cmap + l * 256 + k, (k * (32 - l) / 32) & 0xFF);
+            k = k + 1;
+        }
+        l = l + 1;
+    }
+    return 0;
+}
+
+# LUT[i] = pal_xrgb[colormap[light][i]] — the two indirections composed into one table.
+fn dc_build_lut(light): i64 {
+    var i = 0;
+    while (i < 256) {
+        var shaded = load8(&dc_cmap + light * 256 + i) & 0xFF;
+        if (dcm_lutswap == 1) {
+            # mutation: shade the PALETTE INDEX's colour instead of the index — the plausible
+            # transposition, and one that still produces a picture.
+            var pv = load32(&dc_pal + i * 4) & 0xFF;
+            shaded = load8(&dc_cmap + light * 256 + pv) & 0xFF;
+        }
+        store32(&dc_lut + i * 4, load32(&dc_pal + shaded * 4) & 0xFFFFFFFF);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ============================================================================================
+# DOOM's OWN INNER LOOP, transcribed
+# ============================================================================================
+# ⚠ This is the REFERENCE. It is render_draw_tex_column's hoisted fast path with the framebuffer
+# write replaced by a palette lookup, so both sides end in ARGB and can be compared at all.
+fn doom_column(th, rows, tex_y_start, tex_y_step, light, out): i64 {
+    var thf = th << 16;
+    var wty = tex_y_start % thf;
+    if (wty < 0) { wty = wty + thf; }
+    var y = 0;
+    while (y < rows) {
+        var tyq = wty >>> 16;
+        var idx = load8(&dc_col + tyq) & 0xFF;
+        var shaded = load8(&dc_cmap + light * 256 + idx) & 0xFF;
+        store32(out + y * 4, load32(&dc_pal + shaded * 4) & 0xFFFFFFFF);
+        wty = wty + tex_y_step;
+        if (wty >= thf) { wty = wty - thf; }
+        y = y + 1;
+    }
+    return 0;
+}
+
+# ============================================================================================
+# THE SAME COLUMN AS AN op 0x0B QUAD
+# ============================================================================================
+# ⭐ THE FRAME. A 1-wide, `rows`-tall rect. u is constant (the column IS the texture, tw = 1), and v
+# is affine in y with slope `tex_y_step` per row.
+# ⛔ v MUST EQUAL tex_y_start AT y = 0.5, NOT AT y = 0 — op 0x0B samples pixel centres. So the
+# vertex at y = 0 carries v = tex_y_start - step/2, extrapolated back by half a step.
+# ---- mutations: each MUST break the cases, or the case proves nothing --------------------
+var dcm_nohalf = 0;             # drop the half-step back-off (sample at y, not y+0.5)
+var dcm_noclamp = 0;            # use CLAMP instead of WRAP
+var dcm_lutswap = 0;            # compose the LUT the other way round: colormap[palette[i]]
+
+fn quad_column(th, rows, tex_y_start, tex_y_step, light, out): i64 {
+    # frame: (0,0) (1,0) (0,rows) — a degenerate-width triangle pair is not needed for the proof;
+    # one triangle spanning the rect is enough because we only sample x = 0.
+    if (tri_prep(0, 0, 1, 0, 0, rows, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF) != 1) { return 0; }
+
+    var v_at_0 = tex_y_start - (tex_y_step / 2);      # back off half a step to hit centres
+    if (dcm_nohalf == 1) { v_at_0 = tex_y_start; }    # mutation: sample at row tops, not centres
+    var v_at_rows = v_at_0 + tex_y_step * rows;
+    if (tex_prep(0, v_at_0, 0, v_at_0, 0, v_at_rows) != 1) { return 0; }
+
+    tx_wrap = 1;                                      # DOOM tiles; so must we
+    if (dcm_noclamp == 1) { tx_wrap = 0; }            # mutation: clamp, which smears instead
+    var y = 0;
+    while (y < rows) {
+        # cov 255, over an opaque black destination: src-over of an opaque source IS the source,
+        # so the comparison is against the texel colour itself.
+        store32(out + y * 4, tex_ref_px(&dc_col, &dc_lut, 1, th, 0, y, 255, 0xFF000000, 1));
+        y = y + 1;
+    }
+    tx_wrap = 0;
+    return 1;
+}
+
+fn dc_case(name, nlen, th, rows, tex_y_start, tex_y_step, light): i64 {
+    var i = 0;
+    while (i < th) { store8(&dc_col + i, (i * 11 + 3) & 0xFF); i = i + 1; }
+    dc_build_lut(light);
+
+    var want[512];
+    doom_column(th, rows, tex_y_start, tex_y_step, light, &want);
+    if (quad_column(th, rows, tex_y_start, tex_y_step, light, &dc_out) != 1) {
+        ps("  "); print(name, nlen); ps("  REFUSED by tri_prep/tex_prep"); nl();
+        return 1;
+    }
+    var bad = 0;
+    var shown = 0;
+    var y = 0;
+    while (y < rows) {
+        var w = load32(&want + y * 4) & 0xFFFFFFFF;
+        var g = load32(&dc_out + y * 4) & 0xFFFFFFFF;
+        if (w != g) {
+            bad = bad + 1;
+            if (shown < 3) {
+                shown = shown + 1;
+                ps("      row "); pn(y); ps("  doom=0x"); ph8(w); ps("  quad=0x"); ph8(g); nl();
+            }
+        }
+        y = y + 1;
+    }
+    ps("  "); print(name, nlen); ps("  ");
+    if (bad == 0) { ps("EXACT"); }
+    if (bad != 0) { pn(bad); ps(" of "); pn(rows); ps(" rows differ"); }
+    nl();
+    return bad;
+}
+
+fn main(): i64 {
+    ps("doomcol -- is a DOOM wall column exactly an op 0x0B textured quad?"); nl();
+    dc_build();
+    var fail = 0;
+
+    # 1:1 — one texel per row, the simplest possible wall
+    fail = fail + dc_case("1:1 step, th=64, 64 rows      ", 30, 64, 64, 0, 65536, 0);
+    # magnified — a near wall, texels stretched over many rows
+    fail = fail + dc_case("magnified 4x, th=64, 96 rows  ", 30, 64, 96, 0, 16384, 4);
+    # minified — a far wall, several texels per row
+    fail = fail + dc_case("minified 3x, th=64, 40 rows   ", 30, 64, 40, 0, 196608, 12);
+    # ⭐ WRAPPING — v runs past the texture, which is the common case for a tall wall
+    fail = fail + dc_case("wrapping, th=32, 100 rows     ", 30, 32, 100, 0, 65536, 8);
+    # non-integer step — the fractional case that catches a rounding slip
+    fail = fail + dc_case("fractional step, th=64        ", 30, 64, 70, 0, 93622, 16);
+    # ⭐ NEGATIVE start — DOOM's y1-clamp can leave tex_y negative before the modulo
+    fail = fail + dc_case("negative start, th=64         ", 30, 64, 50, 0 - 200000, 65536, 2);
+    # dark light level — proves the colormap fold, not just the palette
+    fail = fail + dc_case("light 31 (darkest), th=64     ", 30, 64, 64, 0, 65536, 31);
+
+    # ============================================================================================
+    # FALSIFICATION — every mutation must break the cases
+    # ============================================================================================
+    # ⛔ SEVEN GREEN CASES ON THE FIRST RUN PROVE NOTHING UNTIL THE ARMS ARE SEEN TO FAIL. The
+    # half-step back-off in particular is the one claim that would fail SILENTLY and plausibly: a
+    # wall sampled half a step off is still a wall.
+    ps("falsification -- each mutation MUST break the cases:"); nl();
+    var dead = 0;
+
+    dcm_nohalf = 1;
+    var m1 = dc_case("  [no half-step]                ", 32, 64, 64, 0, 65536, 0)
+           + dc_case("  [no half-step, fractional]    ", 32, 64, 70, 0, 93622, 16);
+    dcm_nohalf = 0;
+    ps("  dropping the half-step back-off breaks "); pn(m1); ps(" row(s)");
+    if (m1 == 0) { ps("   <== DID NOT FIRE: the centres claim is untested"); dead = dead + 1; }
+    nl();
+
+    dcm_noclamp = 1;
+    var m2 = dc_case("  [clamp not wrap]              ", 32, 32, 100, 0, 65536, 8);
+    dcm_noclamp = 0;
+    ps("  clamping instead of wrapping breaks "); pn(m2); ps(" row(s)");
+    if (m2 == 0) { ps("   <== DID NOT FIRE: no case runs past the texture"); dead = dead + 1; }
+    nl();
+
+    dcm_lutswap = 1;
+    var m3 = dc_case("  [LUT composed backwards]      ", 32, 64, 64, 0, 65536, 12);
+    dcm_lutswap = 0;
+    ps("  composing the LUT backwards breaks "); pn(m3); ps(" row(s)");
+    if (m3 == 0) { ps("   <== DID NOT FIRE: the colormap fold is untested"); dead = dead + 1; }
+    nl();
+
+    if (dead != 0) {
+        ps("doomcol: "); pn(dead); ps(" mutation(s) did NOT fire -- the cases above prove less"); nl();
+        ps("  than they appear to."); nl();
+        return 86;
+    }
+
+    if (fail != 0) {
+        ps("doomcol: "); pn(fail); ps(" differing row(s) — a DOOM column is NOT expressible"); nl();
+        ps("  as an op 0x0B quad under the current mapping. Rung 14 cannot proceed on this"); nl();
+        ps("  path until the mapping is exact: a wall that merely LOOKS right is not the gate."); nl();
+        return 86;
+    }
+    ps("doomcol: ⭐ every case EXACT — a DOOM wall column IS an op 0x0B quad, bit for bit."); nl();
+    ps("  The colormap and palette compose into one IDX8 LUT; WRAP supplies the tiling;"); nl();
+    ps("  the half-step back-off puts DOOM's per-row samples on op 0x0B's pixel centres."); nl();
+    return 95;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
