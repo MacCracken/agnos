@@ -998,7 +998,7 @@ fn fb_println(buf, len) {
 # through fb_ansi_feed() and asserts the resulting colour / cursor STATE — a
 # deterministic parser gate that needs no pixel inspection. Emits one
 # `fb-ansi: PASS/FAIL <case>` line per check to serial (captured by
-# scripts/fb-ansi-smoke.sh). Uses fb_ansi_feed directly (not fb_putc) so the SGR
+# scripts/smoke/fb-ansi-smoke.sh). Uses fb_ansi_feed directly (not fb_putc) so the SGR
 # checks don't depend on fb_console_ready; the CUP check uses the live FB geometry
 # (present under QEMU OVMF GOP). Resets colour state at the end so the boot
 # console continues clean.
@@ -1076,7 +1076,7 @@ fn fb_ansi_selftest() {
 # 1.43.1 — VISUAL render of the ANSI console for a QEMU screendump (compile-gated,
 # separate from the headless parser selftest). Paints colour swatches through the
 # REAL render path (fb_putc → fb_ansi_feed → coloured glyphs) then cli/hlt-loops so
-# the framebuffer stays static for capture. Run via scripts/fb-ansi-screendump.sh.
+# the framebuffer stays static for capture. Run via scripts/tool/fb-ansi-screendump.sh.
 fn fb_puts0(s) {
     var i = 0;
     while (load8(s + i) != 0) { fb_putc(load8(s + i)); i = i + 1; }

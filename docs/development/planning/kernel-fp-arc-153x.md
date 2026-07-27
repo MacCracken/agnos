@@ -154,7 +154,7 @@ a matching `scripts/fp-*-smoke.sh`, and registers the flag in `build.sh`'s
 `fninit`, no xmm) on the BSP (`main.cyr` after `pt_init()`, `+ "SSE enabled"`) and
 every AP (`smp.cyr` `ap_entry()`). Production `objdump -Ec 'xmm|fxsave|fxrstor'`
 == 0. `FP_SELFTEST` build adds the raw `movsd` probe + a cyrius `f64` `3.0*2.0==6.0`
-ring-0 proof; `scripts/fp-selftest-smoke.sh` greps `SSE enabled` + `fp: movsd OK`
+ring-0 proof; `scripts/smoke/fp-selftest-smoke.sh` greps `SSE enabled` + `fp: movsd OK`
 + `fp: ring0 OK` + boot-to-shell — **4/4 green**; registered in `sweep.sh` +
 `build.sh`. Adversarially re-verified (see Status). *Original plan (B1a/B1b) below,
 kept as the record:*
@@ -167,7 +167,7 @@ kept as the record:*
   **and** `objdump -d build/agnos | grep -c xmm` == 0 on the production build.
 - **B1b (arithmetic proof):** a ring-0 `f64_mul(3.0, 2.0)` inside the
   `FP_SELFTEST`-only build (never the default), asserting `fp: ring0 OK` (no
-  `#UD`). `scripts/fp-selftest-smoke.sh` (QEMU + KVM) greps `SSE enabled` +
+  `#UD`). `scripts/smoke/fp-selftest-smoke.sh` (QEMU + KVM) greps `SSE enabled` +
   `fp: ring0 OK`.
 - **Repo:** agnos kernel.
 
@@ -313,10 +313,10 @@ CRITERION: the migration-race fix is UNVALIDATABLE on single-core QEMU — B3 si
 iron migration soak (an FP proc observed moving CPU0→CPU1 preserving XMM), folded into B5.**
 
 ### B4 — Ring-3 `f64` selftest (first-touch restore, end to end) — ✅ SHIPPED 1.53.3 (2026-07-05)
-*As shipped:* `fp-test/fpex.cyr` (built `--agnos`, staged `/bin/fpex`) — a **compiled
+*As shipped:* `tests/fp/fpex.cyr` (built `--agnos`, staged `/bin/fpex`) — a **compiled
 cyrius** program (not hand-asm, per the refinement) that computes `7*3=21`, `+1=22`,
 `/2=11` with native f64 codegen (mulsd/addsd/divsd/comisd) and exits 84 iff all correct.
-`FP_RING3_SELFTEST` kernel block exec's it from disk; `scripts/fp-ring3-smoke.sh` asserts
+`FP_RING3_SELFTEST` kernel block exec's it from disk; `scripts/smoke/fp-ring3-smoke.sh` asserts
 `run: exit 84` — **PASS**. Proves B1→B3 end to end (enable → area → `#NM` restore →
 ring-3 f64) AND that the B2 hand-built default image is FXRSTOR-legal (no `#GP` on the
 first restore → the boot-captured-image fallback was not needed). Single-owner first-touch
@@ -454,7 +454,7 @@ intricate hand-asm bite (two-proc payloads + handshake) — its own focused pass
   (`osc_next_sample` → `f64_sin`/`f64_mul`/…), asserting every one `naad_is_finite`; exits **88**
   (0x58, via the `SYS_EXIT` bare-call form — NOT naad main's `syscall(60,r)`, a no-op on agnos)
   iff all 256 finite. Kernel `#ifdef NAAD_RING3_SELFTEST` block (`main.cyr`, beside FP_RING3)
-  `sh_exec`s `/bin/naadex`; `scripts/naad-ring3-smoke.sh` (fp-ring3-shaped) builds naadex from
+  `sh_exec`s `/bin/naadex`; `scripts/smoke/naad-ring3-smoke.sh` (fp-ring3-shaped) builds naadex from
   the naad repo, seeds ext2, boots NVMe, asserts **`run: exit 88`** + no `#PF/#GP/#UD/PANIC`.
   **PASS** — a real shipping-library XMM-heavy DSP workload runs correctly in agnos ring 3, the
   arc's foundational wall gone end to end (B1 enable → B2 area → B3 #NM restore → B4 first-touch
@@ -476,7 +476,7 @@ intricate hand-asm bite (two-proc payloads + handshake) — its own focused pass
   resolved). Add a STANDING `objdump -d build/naad-agnos | grep -c '%ymm' == 0`
   guard in `naad-smoke.sh` (a future auto-vectorizer / `f64v4` would make FXSAVE
   silently truncate YMM = finite-but-wrong samples). The exerciser is a **net-new
-  `audio-test/naadex.cyr`** (tonegen-form; naad's own `main.cyr` uses the forbidden
+  `tests/audio/naadex.cyr`** (tonegen-form; naad's own `main.cyr` uses the forbidden
   `var r=main();syscall(60)` entry) — oscillator + one filter + one envelope,
   `naad_is_finite` on every sample, heap-alloc the buffer (~12 KB ring-3 stack).
   The cyrius issue-doc is **already filed** (`cyrius/…/issues/2026-07-04-…`): §2

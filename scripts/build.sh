@@ -120,16 +120,16 @@ else
     #   FATFS_SELFTEST=1 — boot-time FAT read self-test (1.34.x): mount the
     #                     FAT, list root, read the seeded multi-cluster
     #                     FATTEST.BIN back via the cluster chain + byte-
-    #                     verify. Gated by scripts/fat-smoke.sh.
+    #                     verify. Gated by scripts/smoke/fat-smoke.sh.
     #   EXFAT_SELFTEST=1 — boot-time exFAT read self-test (1.34.1): mount,
     #                     locate the bitmap/upcase system files, and read
     #                     the upcase table back over its FAT chain to
     #                     reproduce its TableChecksum (independent oracle,
-    #                     no file seeding). Gated by scripts/exfat-smoke.sh.
+    #                     no file seeding). Gated by scripts/smoke/exfat-smoke.sh.
     #   EXFAT_WRITE_SELFTEST=1 — boot-time exFAT write self-test (1.34.1
     #                     bite 3): create a file by writing its dir-set
     #                     (0x85/0xC0/0xC1 + SetChecksum + NameHash). Gated
-    #                     by scripts/exfat-write-smoke.sh (fsck.exfat -n).
+    #                     by scripts/smoke/exfat-write-smoke.sh (fsck.exfat -n).
     #   FAT_ALLOW_ESP_WRITE=1 — override the ESP-write safety guard (1.34.x):
     #                     FAT/exFAT writes are refused on an ESP-type GPT
     #                     partition by default (the boot ESP is read-only).
@@ -140,26 +140,26 @@ else
     #                     DHCP-captured resolver (option 6), runs a hermetic
     #                     RFC 1035 parse test (compression-pointer answer ->
     #                     93.184.216.34), and attempts a live lookup. Gated
-    #                     by scripts/dns-smoke.sh.
+    #                     by scripts/smoke/dns-smoke.sh.
     #   ICMP_SELFTEST=1  — boot-time ICMP echo self-test (1.35.x): hermetic
     #                     checksum self-verify (a valid ICMP message sums to
     #                     0) + a best-effort gateway ping. Gated by
-    #                     scripts/icmp-smoke.sh.
+    #                     scripts/smoke/icmp-smoke.sh.
     #   TCP_SELFTEST=1   — boot-time TCP receive-ring self-test (1.35.1 B1):
     #                     hermetic FIFO-order + buffer-wrap reassembly check on
-    #                     the in-order ring. Gated by scripts/tcp-smoke.sh.
+    #                     the in-order ring. Gated by scripts/smoke/tcp-smoke.sh.
     #   NTP_SELFTEST=1   — boot-time SNTP parse self-test (1.35.x): hermetic
     #                     transmit-timestamp → Unix epoch conversion + UTC
-    #                     breakdown. Gated by scripts/ntp-smoke.sh.
+    #                     breakdown. Gated by scripts/smoke/ntp-smoke.sh.
     #   MMAP_SELFTEST=1  — boot-time anonymous-mmap allocator self-test
     #                     (1.35.3): hermetic 2 MB-contiguous alloc/free/count +
-    #                     mmap length-rounding. Gated by scripts/mmap-smoke.sh.
+    #                     mmap length-rounding. Gated by scripts/smoke/mmap-smoke.sh.
     #   RTC_SELFTEST=1   — boot-time RTC boot-clock self-test (1.35.5): hermetic
     #                     civil_to_unix anchors + BCD decode + a live-bounded
-    #                     CMOS read sanity. Gated by scripts/rtc-smoke.sh.
+    #                     CMOS read sanity. Gated by scripts/smoke/rtc-smoke.sh.
     #   HARDENING_SELFTEST=1 — arc-close hardening self-test (1.35.7): hermetic
     #                     ip_safe_payload_len ingress-clamp table. Gated by
-    #                     scripts/hardening-smoke.sh.
+    #                     scripts/smoke/hardening-smoke.sh.
     # --- Selftest flag DEPENDENCIES (fail loud; a silent no-op costs an iron burn) -------------------
     # Some selftests refuse to run unless an EARLIER selftest set its proof flag. gpu_shader_cov_test and
     # gpu_shader_rect_test both open with
@@ -277,17 +277,17 @@ else
         [ -n "$FBSCALE_SELFTEST" ]   && echo '#define FBSCALE_SELFTEST'
         # HDA_TONE=1 — B4 first-tone: hda_stream_arm fills the PCM ring with a
         # ~375 Hz triangle instead of silence. Gated so production boots stay
-        # silent. Drives scripts/hda-tone-smoke.sh (QEMU -audiodev wav RMS) and
+        # silent. Drives scripts/smoke/hda-tone-smoke.sh (QEMU -audiodev wav RMS) and
         # the archaemenid front-jack audible test.
         [ -n "$HDA_TONE" ]           && echo '#define HDA_TONE'
         # SND_SELFTEST=1 — Gate 2 (B6): hermetic snd_* band self-test (hda_snd_selftest
         # in hda.cyr) — drives the #64-69 handlers + fills the ring with a tone the DMA
-        # loops. Drives scripts/snd-smoke.sh (QEMU -audiodev wav + serial PASS marker).
+        # loops. Drives scripts/smoke/snd-smoke.sh (QEMU -audiodev wav + serial PASS marker).
         [ -n "$SND_SELFTEST" ]       && echo '#define SND_SELFTEST'
         # HDA_HDMI=1 — HDMI-audio arc bite 2b: probe + enumerate a SECOND HD-Audio
         # controller as instance 1 (archaemenid 04:00.1 HDMI/DP, or a 2nd QEMU
         # -device intel-hda). Instance 0 (analog) stays the default sink. Gated so the
-        # production/MVP kernel stays single-controller. Drives scripts/hda-dual-smoke.sh.
+        # production/MVP kernel stays single-controller. Drives scripts/smoke/hda-dual-smoke.sh.
         [ -n "$HDA_HDMI" ]           && echo '#define HDA_HDMI'
         # HDMI_AUDIO_DUMP=1 — dump the display-audio register block AFTER the enable path
         # has run, in the exact order + naming of agnosticos/scripts/dump-dcn-audio.py, so

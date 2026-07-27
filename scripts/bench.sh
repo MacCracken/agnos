@@ -106,7 +106,7 @@ echo "Booting bench kernel via gnoboot + OVMF..."
 # rootfs is needed. We still build a minimal GPT image (ESP with gnoboot +
 # /boot/agnos) because gnoboot is the only ELF64 entry path (QEMU rejects the
 # ELF64 kernel on its Linux `-kernel` protocol — no PVH note). Mirrors
-# scripts/agnsh-smoke.sh's OVMF plumbing, minus the ext2 data partition.
+# scripts/smoke/agnsh-smoke.sh's OVMF plumbing, minus the ext2 data partition.
 GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
 GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"
 OVMF_CODE_CANDIDATES="/usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd"

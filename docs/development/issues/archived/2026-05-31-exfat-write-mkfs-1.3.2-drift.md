@@ -47,7 +47,7 @@ NOT affect exec / ext2 / FAT32 / the iron exec re-burn).
 
 ## Symptom
 
-`scripts/exfat-write-smoke.sh` → **FAIL**, every row red, including tests that
+`scripts/smoke/exfat-write-smoke.sh` → **FAIL**, every row red, including tests that
 predate any recent kernel work (1.34.4 rootext readback, 1.34.5 non-ASCII
 create/find) through the 1.39.x shell verbs and 1.40.1 vfs_read_file. Final line:
 `FAIL: fsck clean but no file counted (set not recognized)`.
@@ -70,7 +70,7 @@ so no write test can run.
 ## Repro
 
 ```sh
-cd ~/Repos/agnos && sh scripts/exfat-write-smoke.sh   # FAIL on any current build
+cd ~/Repos/agnos && sh scripts/smoke/exfat-write-smoke.sh   # FAIL on any current build
 ```
 
 ## Next steps (when picked up)

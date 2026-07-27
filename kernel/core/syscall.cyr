@@ -1155,7 +1155,7 @@ var GPU_COV_MAX_DIM = 4096;          # per-side mask cap — a REJECT, never a c
 #
 # ⛔ THIS IS NOT A STYLE CHECK. It is the domain on which "byte-identical to the CPU reference"
 # MEANS anything at all, and BOTH ends need it:
-#   * the REFERENCE (`gpu-test/refraster.cyr:154`) computes `(bx-ax)*(sy-ay)` in i64. With
+#   * the REFERENCE (`tests/gpu/refraster.cyr:154`) computes `(bx-ax)*(sy-ay)` in i64. With
 #     ABI-legal i32 coordinates that product OVERFLOWS i64, so above roughly M*d ~ 2^63 the
 #     oracle itself has no defined value and "identical" is meaningless.
 #   * the SHADER's divider is exact iff |bx-ax| < 2^31 and 2*|by-ay| < 2^32. `edgemodel.cyr`'s
@@ -1941,7 +1941,7 @@ fn edge_abi_selftest() {
     kprint("edge-abi: ---- #92 op 0x09 TRI_RGBA ABI battery ----\n", 53);
 
     # ⭐ THE PREP-RECORD ORACLE, AT ZERO BURNS. The kernel computes the 128-byte TRI-PREP record
-    # from corpus case 0's frame and prints it; gpu-test/triref computes the SAME record from the
+    # from corpus case 0's frame and prints it; tests/gpu/triref computes the SAME record from the
     # SAME inputs on the host. A field that differs indicts whichever copy of the integer-divide
     # primitives drifted — and those primitives exist twice (kernel + host tool) because the kernel
     # cannot include a host file, with Cyrius shadowing duplicate fns silently.

@@ -16,7 +16,7 @@ and read it back after #37 returns (save/swap/restore of the global `vfs_table` 
 run-to-completion child run — no per-proc fd layer). `argv`+`envp` on `execwait`#37 already shipped
 (1.43.7 / 1.44.19). The remaining §1 items (`fork`, `chdir`, `dup2` for the *non-blocking* spawn#3)
 stay out-of-scope by the cooperative-single-CR3 design as recommended below. Validated:
-`EXEC_REDIRECT_SELFTEST` + `scripts/exec-redirect-smoke.sh` (`redir: capture OK`).
+`EXEC_REDIRECT_SELFTEST` + `scripts/smoke/exec-redirect-smoke.sh` (`redir: capture OK`).
 **Date**: 2026-06-15
 **From**: cyrius 6.2.7 (the stdlib agnos-completeness pass that resolved sandhi's
 filed cascade — see cyrius `docs/development/issues/2026-06-15-cyrius-thread-agnos-clone-dispatch.md`).

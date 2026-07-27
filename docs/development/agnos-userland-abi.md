@@ -266,7 +266,7 @@ closed path; nothing about the kernel is triangle-specific.
   CPU reference is defined at all**, and both ends need it: the reference computes
   `(bx−ax)·(sy−ay)` in i64, which **overflows** for ABI-legal i32 coordinates, so above roughly
   `M·d ≈ 2^63` the oracle has no defined value; and the shader's divider is exact iff
-  `|bx−ax| < 2^31`. The bound is *measured*, not asserted — `gpu-test/edgemodel.cyr`'s gate 3
+  `|bx−ax| < 2^31`. The bound is *measured*, not asserted — `tests/gpu/edgemodel.cyr`'s gate 3
   falsifies it on purpose (15 of 4000 cases differ above `2^31`). At `±2^28` the divider keeps two
   bits of margin and the reference five. **The bound is INCLUSIVE.**
 - `n_edges` ∈ `[3, 256]`. **2 edges is a REJECT, not an empty result**: two edges cannot enclose area, so

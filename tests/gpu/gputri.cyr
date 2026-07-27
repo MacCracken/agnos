@@ -1,0 +1,2016 @@
+# gputri.cyr — RUNG 9 of the 3D arc. The rasteriser's ring-3 instrument. Bite B8.
+#
+# ============================================================================================
+# THE ORACLE: the GPU's mask must be BYTE-IDENTICAL to refraster.cyr over the 20-case corpus
+# ============================================================================================
+# ⛔ AND THAT ALONE IS NOT ENOUGH, which is why N1-N8 exist. Two of the twenty cases have an
+# ALL-ZERO correct answer ("zero-area" and "fully outside"), so a shader that writes nothing
+# reproduces them byte-exactly. A comparison with no negative controls is satisfiable by a dead
+# dispatch, and it would report 20/20.
+#
+# Every control below is a gate that must FIRE. If any does not, the tool exits 86 and can never
+# reach 95 — a control that silently fails to run is worse than no control, because it turns a
+# green result from evidence into decoration.
+#
+# ============================================================================================
+# ⭐ THE DIGEST GATE — the one check that catches BOTH SIDES BEING WRONG TOGETHER
+# ============================================================================================
+# `cpuref` (host) and `gputri` (--agnos) include the SAME refraster.cyr, but they are compiled
+# through different code paths. A `--agnos` codegen divergence would make this tool's reference
+# AND its comparison agree with each other while both differ from the host's. Byte-comparing the
+# GPU against a locally-wrong reference would then report a clean pass.
+#
+# So each case's reference mask is FNV-1a digested and printed by BOTH tools, and the burn is
+# only readable if they match. `gpu.md:1019` names this failure class explicitly.
+#
+# Build:  cd gpu-test && cyrius build --agnos gputri.cyr build/gputri_agnos
+# Iron:   run /bin/gputri --digest   reference digests, to diff against host cpuref FIRST
+#         run /bin/gputri --cov      the 20-case corpus + N1-N8
+#
+# Exits: 95 every case exact AND every control fired · 100 no GPU / no carveout (QEMU)
+#        96 seam live, shader not resident · 92 fill-rule · 91 shape · 89 tgid-mapping
+#        88 UNTOUCHED · 87 wrote but covered nothing · 86 a negative control FAILED
+#        85 in-tool reference digest != host cpuref digest · 90 named #92 fault · 84 bad arg
+
+include "lib/io.cyr"
+# ⛔ tricore, NOT refraster — tricore INCLUDES refraster, and including both would define every
+# rasteriser fn twice. Cyrius shadows duplicate `fn`s SILENTLY (last definition wins, warn only), so
+# a double include does not error; it quietly picks one and the two could drift unnoticed.
+# slen/ps/nl come from tricore for the same reason and are NOT redefined here.
+include "tricore.cyr"
+fn puts(s): i64 { ps(s); nl(); return 0; }
+fn pnum(v): i64 {
+    if (v == 0) { print("0", 1); return 0; }
+    var neg = 0; var x = v;
+    if (x < 0) { neg = 1; x = 0 - x; }
+    var b[24]; var i = 0;
+    while (x > 0) { store8(&b + i, 48 + (x % 10)); x = x / 10; i = i + 1; }
+    if (neg == 1) { print("-", 1); }
+    while (i > 0) { i = i - 1; print(&b + i, 1); }
+    return 0;
+}
+fn phex8(v): i64 {
+    ps("0x");
+    var i = 7;
+    while (i >= 0) {
+        var nib = (v >> (i * 4)) & 0xF;
+        var ch = 48 + nib; if (nib > 9) { ch = 87 + nib; }
+        var c[2]; store8(&c, ch); print(&c, 1);
+        i = i - 1;
+    }
+    return 0;
+}
+
+var SENTINEL = 0xA5;
+
+# ============================================================================================
+# BUFFERS — ⚠ SIZED FROM THE CORPUS, and the two previous sizes were BOTH WRONG
+# ============================================================================================
+# Module-scope `var X[N]` is N x u64 = 8N BYTES ([[cyrius-var-array-u64-units]]).
+#
+# ⛔ `tri_edges[8]` was 64 bytes = EXACTLY 4 EDGES. Corpus case 9 (bowtie) has 4 and fit by
+# luck; case 10 has 10 and case 20 has 64 — both would have written straight past the end into
+# the mask buffer declared next to it. A corrupted edge array produces a plausible WRONG
+# TRIANGLE, the single hardest symptom in this rung's failure table to attribute.
+var tri_edges[512];             # 4096 B = 256 edges x 16 B — the EDGE_CAP_PROBE ceiling,
+                                # not the shipped cap (still 64). The tool must be able to SUBMIT
+                                # what the probe kernel will accept, or the sweep cannot reach it.
+#
+# ⛔ And ONE buffer served as BOTH the sentinel prefill and the readback. That makes the
+# comparison read the GPU's own output as the "expected" value for any byte the GPU did not
+# write — the exact aliasing that turns a dead shader into a pass. They are separate now.
+var tri_ref[2048];              # 16384 B — the CPU reference mask (128x128 is the corpus max)
+var tri_gpu[2048];              # 16384 B — what the GPU actually wrote, read back
+var tri_poison[2048];           # 16384 B — N1's deliberately corrupted copy
+
+var ctl_fired[16];              # N1..N8 — each must be 1 by the end or the tool exits 86
+
+# FNV-1a 32, masked to 32 bits. A digest, not a hash: it exists so two tools can agree on a byte
+# array without shipping the array between them.
+fn digest(buf, n): i64 {
+    var h = 2166136261;
+    var i = 0;
+    while (i < n) {
+        h = (h ^ (load8(buf + i) & 0xFF)) & 0xFFFFFFFF;
+        h = (h * 16777619) & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn tri_report(reason): i64 {
+    if (reason == 1)  { puts("gputri: GPO_E_NOGPU -- no GPU/display here. (exit 100)"); return 100; }
+    if (reason == 7) {
+        puts("gputri: GPO_E_ARM -- the edge shader is not resident.");
+        puts("gputri: the ABI seam validates but no blob is armed. On a kernel built before");
+        puts("gputri: 9b's B7 that is EXPECTED; on a current one it means gpu_edge_arm's own");
+        puts("gputri: gates refused (no arena, no ring, matmul unproven). (exit 96)");
+        return 96;
+    }
+    if (reason == 2)  { puts("gputri: GPO_E_BADOP -- this kernel predates op 0x08."); return 90; }
+    if (reason == 3)  { puts("gputri: GPO_E_BADSLOT -- edge slot invalid or not GPU-visible."); return 90; }
+    if (reason == 6)  { puts("gputri: GPO_E_DIM -- mask dimensions rejected."); return 90; }
+    if (reason == 8)  { puts("gputri: GPO_E_DISPATCH -- the watchdog expired. Run gpuwedge."); return 90; }
+    if (reason == 12) { puts("gputri: GPO_E_RESERVED -- a field this op does not define was non-zero."); return 90; }
+    if (reason == 13) { puts("gputri: GPO_E_UNPROVEN -- the dispatch envelope is unproven this boot."); return 90; }
+    if (reason == 16) { puts("gputri: GPO_E_EDGEBUF -- edge count or edge slot size rejected."); return 90; }
+    if (reason == 17) { puts("gputri: GPO_E_DSTSLOT -- destination mask slot rejected."); return 90; }
+    if (reason == 18) { puts("gputri: GPO_E_RULE -- winding rule rejected (NONZERO only)."); return 90; }
+    if (reason == 19) { puts("gputri: GPO_E_ALIAS -- edge and destination are the same slot."); return 90; }
+    if (reason == 20) { puts("gputri: GPO_E_COORD -- an endpoint is outside +-2^28."); return 90; }
+    ps("gputri: unexpected reason "); pnum(reason); nl();
+    return 90;
+}
+
+# Pack the edge list refraster currently holds into the 16-byte-per-edge #92 array.
+# ⭐ ONE SOURCE OF TRUTH: these are the SAME ex0/ey0/ex1/ey1 the reference rasterised. Two
+# hand-kept geometry lists is how a "mismatch" turns out to be two different triangles.
+fn tri_pack_edges(): i64 {
+    var i = 0;
+    while (i < n_edges) {
+        var b = &tri_edges + i * 16;
+        store32(b +  0, load64(&ex0 + i * 8));
+        store32(b +  4, load64(&ey0 + i * 8));
+        store32(b +  8, load64(&ex1 + i * 8));
+        store32(b + 12, load64(&ey1 + i * 8));
+        i = i + 1;
+    }
+    return n_edges;
+}
+
+# Classify a mismatch into the plan's four outcomes. A bare "differs" would send the next burn
+# down whichever path was guessed first.
+fn tri_classify(w, h): i64 {
+    var untouched = 0; var covered = 0; var diff = 0; var worst = 0;
+    var i = 0;
+    while (i < w * h) {
+        var g = load8(&tri_gpu + i) & 0xFF;
+        var r = load8(&tri_ref + i) & 0xFF;
+        if (g == SENTINEL) { untouched = untouched + 1; }
+        if (g != 0) { if (g != SENTINEL) { covered = covered + 1; } }
+        if (g != r) {
+            diff = diff + 1;
+            var d = g - r; if (d < 0) { d = 0 - d; }
+            if (d > worst) { worst = d; }
+        }
+        i = i + 1;
+    }
+    if (diff == 0) { return 0; }
+    ps("    differing "); pnum(diff); ps(" of "); pnum(w * h);
+    ps("   worst delta "); pnum(worst);
+    ps("   untouched "); pnum(untouched); nl();
+    if (untouched == w * h) {
+        puts("    UNTOUCHED -- every byte still reads 0xA5. The dispatch retired but wrote");
+        puts("    NOTHING. Two causes, and rung 5 arm E separates them: the post-dispatch");
+        puts("    coherence packet is missing, or the EXEC guard rejected every lane.");
+        puts("    ⛔ This is NOT an edge-setup bug. Do not go looking there.");
+        return 88;
+    }
+    if (untouched != 0) {
+        puts("    PARTIAL -- some bytes written, others still sentinel. That is a TGID MAPPING");
+        puts("    fault: whole workgroups never dispatched.");
+        return 89;
+    }
+    if (covered == 0) {
+        puts("    WROTE, COVERED NOTHING -- the shader ran and cleared the mask. Write-back");
+        puts("    demonstrably works, so the winding evaluated to zero: a FILL RULE fault.");
+        return 87;
+    }
+    if (worst <= 2) {
+        puts("    SHAPE RIGHT, EDGE PIXELS DIFFER by <= 2 -- a FILL RULE / rounding fault, not");
+        puts("    a geometry one. Check the sub-scanline placement and the >> 2 truncation.");
+        return 92;
+    }
+    puts("    WRONG SHAPE -- large deltas. Edge setup or the crossing solve.");
+    return 91;
+}
+
+# ---- one corpus case, end to end ----------------------------------------------------------
+fn tri_case(ci): i64 {
+    if (rr_case_load(ci) != 1) { puts("  ** case refused to load"); return 86; }
+    var w = W; var h = H;
+    var ne = tri_pack_edges();
+
+    cov_clear(&tri_ref);
+    raster(&tri_ref);
+
+    # ⛔ FRESH SLOTS PER CASE, and the prefill is MANDATORY. A #86 slot is a FIXED 2 MB window
+    # per index, so a freed-then-reallocated slot hands back the SAME memory with the previous
+    # case's pixels still in it. Without the sentinel a stale ghost reads as a pass — the
+    # C2g-1 path gpucopy already hit on iron.
+    var eid = syscall(86, 64 * 16);
+    if (eid < 1) { return 100; }
+    var did = syscall(86, w * h);
+    if (did < 1) { syscall(74, eid); return 100; }
+
+    if (syscall(72, eid, &tri_edges, ne * 16) != 0) { syscall(74, eid); syscall(74, did); return 90; }
+    var i = 0;
+    while (i < w * h / 8) { store64(&tri_gpu + i * 8, 0xA5A5A5A5A5A5A5A5); i = i + 1; }
+    if (syscall(72, did, &tri_gpu, w * h) != 0) { syscall(74, eid); syscall(74, did); return 90; }
+
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 8);
+    store32(&d +  8, did);
+    store32(&d + 12, eid);
+    store32(&d + 16, (h * 65536) + w);
+    store32(&d + 36, ne);
+    var rc = syscall(92, &d, 64);
+    if (rc != 0) {
+        syscall(74, eid); syscall(74, did);
+        return tri_report((0 - rc) & 0xFF);
+    }
+    if (syscall(73, did, &tri_gpu, w * h) != 0) { syscall(74, eid); syscall(74, did); return 90; }
+    syscall(74, eid); syscall(74, did);
+    return tri_classify(w, h);
+}
+
+fn tri_cov(): i64 {
+    if (rr_selftest() != 1) { puts("gputri: refraster selftest FAILED -- the oracle is unsound."); return 86; }
+    var ci = 0;
+    while (ci < 16) { store64(&ctl_fired + ci * 8, 0); ci = ci + 1; }
+
+    puts("gputri: the 20-case corpus, GPU vs refraster.cyr");
+    var fails = 0; var worst_code = 0; var lit_big = 0;
+    ci = 1;
+    while (ci <= RR_NCASES) {
+        var r = tri_case(ci);
+        if (r == 100) { puts("gputri: no GPU carveout here -- this tool needs iron. (exit 100)"); return 100; }
+        if (r == 96)  { return 96; }
+        ps("  "); pnum(ci); ps(" "); ps(rr_case_name(ci));
+        ps("  "); pnum(W); ps("x"); pnum(H); ps("  edges "); pnum(n_edges);
+        ps("  ref-digest "); phex8(digest(&tri_ref, W * H));
+        if (r == 0) { puts("   exact"); }
+        if (r != 0) { puts("   ** MISMATCH **"); fails = fails + 1; worst_code = r; }
+        # N3 / N4 evidence, gathered from the REFERENCE itself
+        var lit = 0; var mid = 0;
+        var q = 0;
+        while (q < W * H) {
+            var v = load8(&tri_ref + q) & 0xFF;
+            if (v != 0) { lit = lit + 1; }
+            if (v != 0) { if (v != 255) { mid = mid + 1; } }
+            q = q + 1;
+        }
+        if (lit >= 1000) { lit_big = lit_big + 1; }
+        if (mid >= 1) { store64(&ctl_fired + 4 * 8, 1); }        # N4
+        ci = ci + 1;
+    }
+    # N3 — at least three cases with real coverage. Two corpus cases are correctly ALL-ZERO, so
+    # a dead shader reproduces them byte-exactly; without this the pass is satisfiable by one.
+    if (lit_big >= 3) { store64(&ctl_fired + 3 * 8, 1); }
+
+    # ---- N1: comparator calibration. A deliberately poisoned copy MUST compare unequal. -----
+    # ⛔ Without this, a comparator that always says "equal" reports 20/20 and nothing notices.
+    rr_case_load(1); cov_clear(&tri_ref); raster(&tri_ref);
+    var pi = 0;
+    while (pi < W * H) { store8(&tri_poison + pi, load8(&tri_ref + pi)); pi = pi + 1; }
+    store8(&tri_poison + (W * H / 2), (load8(&tri_ref + (W * H / 2)) ^ 0xFF) & 0xFF);
+    if (digest(&tri_poison, W * H) != digest(&tri_ref, W * H)) { store64(&ctl_fired + 1 * 8, 1); }
+
+    # ---- N2: the sentinel itself must be observable. Prefill, read back WITHOUT dispatching. -
+    # If this comes back as anything but all-sentinel, the prefill/readback path is lying and
+    # every "UNTOUCHED" verdict above it is unreliable.
+    var ns = syscall(86, 4096);
+    if (ns >= 1) {
+        var j = 0;
+        while (j < 512) { store64(&tri_gpu + j * 8, 0xA5A5A5A5A5A5A5A5); j = j + 1; }
+        syscall(72, ns, &tri_gpu, 4096);
+        var k2 = 0;
+        while (k2 < 512) { store64(&tri_gpu + k2 * 8, 0); k2 = k2 + 1; }
+        syscall(73, ns, &tri_gpu, 4096);
+        var allsent = 1;
+        var m = 0;
+        while (m < 4096) { if ((load8(&tri_gpu + m) & 0xFF) != SENTINEL) { allsent = 0; } m = m + 1; }
+        if (allsent == 1) { store64(&ctl_fired + 2 * 8, 1); }
+        syscall(74, ns);
+    }
+
+    # ---- N5 / N6: the corpus must still CONTAIN the discriminating shapes -------------------
+    rr_case_load(3);  if (n_edges >= 3) { store64(&ctl_fired + 5 * 8, 1); }   # backfacing CW
+    rr_case_load(16); if (W % 64 != 0)  { store64(&ctl_fired + 6 * 8, 1); }   # non-mult-of-64
+
+    # ---- N7: the same case twice in one boot must be byte-identical -------------------------
+    var a1 = 0; var a2 = 0;
+    if (tri_case(1) == 0) { a1 = digest(&tri_gpu, W * H); }
+    if (tri_case(1) == 0) { a2 = digest(&tri_gpu, W * H); }
+    if (a1 != 0) { if (a1 == a2) { store64(&ctl_fired + 7 * 8, 1); } }
+
+    # ---- N8: free-then-realloc must hand back a usable slot ---------------------------------
+    var s1 = syscall(86, 4096);
+    if (s1 >= 1) {
+        syscall(74, s1);
+        var s2 = syscall(86, 4096);
+        if (s2 >= 1) { syscall(74, s2); store64(&ctl_fired + 8 * 8, 1); }
+    }
+
+    var missing = 0;
+    var k = 1;
+    while (k <= 8) {
+        if (load64(&ctl_fired + k * 8) != 1) {
+            ps("  ** NEGATIVE CONTROL N"); pnum(k); puts(" DID NOT FIRE");
+            missing = missing + 1;
+        }
+        k = k + 1;
+    }
+    if (missing != 0) {
+        puts("gputri: a control that does not fire makes a green result decoration, not");
+        puts("gputri: evidence. Refusing to report success. (exit 86)");
+        return 86;
+    }
+    puts("gputri: negative controls N1-N8 all fired");
+    if (fails != 0) {
+        ps("gputri: "); pnum(fails); puts(" case(s) mismatched -- see the classification above");
+        return worst_code;
+    }
+    puts("gputri: 20 of 20 byte-identical to refraster.cyr, every control fired. (exit 95)");
+    return 95;
+}
+
+
+# ============================================================================================
+# --tri : the attribute-interpolation corpus, with its negative controls
+# ============================================================================================
+# ⛔ THE CONTROLS ARE NOT DECORATION. The row's own first-named failure mode is "flat colour =>
+# barycentrics not varying", and a flat shader reproduces a SINGLE-COLOUR case byte-exactly. Worse,
+# an x-term wired to zero reproduces every GRADIENT case perfectly, because a vertical gradient is a
+# function of y alone. So a green corpus run proves nothing on its own — the floors below are what
+# make it mean something, and any of them failing to fire exits 86 rather than 95.
+
+var tri_ndistinct = 0;
+var tri_rowspan = 0;
+var tri_dumped = 0;             # located-difference lines emitted this run (capped)
+var tri_ndiff = 0;              # differing pixels across every compared case
+
+# Fill a buffer with the REFERENCE answer for one corpus case, and measure the two properties the
+# controls gate on: how many distinct values it contains, and how far it varies along one row.
+# ⛔ THE COVERAGE MUST COME FROM THE RASTERISER, NOT BE ASSUMED. The first version passed 255 for
+# every pixel, so the reference painted the whole rect while the GPU painted only inside the shape
+# and left the fill colour outside. That is not a shader disagreement, it is two different questions
+# — and it cost a burn. `covbuf` is the mask op 0x08 actually produced, read back from its slot, so
+# both sides now consume the SAME coverage as well as the same destination.
+fn tri_ref_fill(buf, covbuf, w, h): i64 {
+    var seen[256];
+    var z = 0;
+    while (z < 256) { store8(&seen + z, 0); z = z + 1; }
+    tri_ndistinct = 0;
+    tri_rowspan = 0;
+
+    var midy = h / 2;
+    var rowmin = 256;
+    var rowmax = 0 - 1;
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) {
+            var cvv = load8(covbuf + y * w + x) & 0xFF;
+            var v = 0xFF101010;
+            if (cvv != 0) { v = tri_ref_px(x, y, cvv, 0xFF101010); }
+            store32(buf + (y * w + x) * 4, v);
+            var g = (v >> 8) & 0xFF;                    # sample ONE channel for the floors
+            if (load8(&seen + g) == 0) {
+                store8(&seen + g, 1);
+                tri_ndistinct = tri_ndistinct + 1;
+            }
+            if (y == midy) {
+                if (g < rowmin) { rowmin = g; }
+                if (g > rowmax) { rowmax = g; }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    if (rowmax >= rowmin) { tri_rowspan = rowmax - rowmin; }
+    return 0;
+}
+
+# ⛔ THE COVERAGE SHAPE IS NOT ALWAYS THE FRAME, AND N14 IS WHY.
+#
+# Burn 6 closed rung 11's pixels (0 differing) and then N14 failed honestly: `min(q_ch, q_a)` — the
+# premultiplied restore — NEVER fired across the whole corpus. The reason is structural, not a
+# tuning problem. The restore only fires where a channel's quotient exceeds alpha's, which happens
+# only OUTSIDE the attribute frame, where the barycentric weights leave [0, 2A] and the interpolant
+# extrapolates. But every case dispatched coverage built from the frame's OWN three edges, so a
+# pixel outside the frame always had coverage 0 and was skipped before the restore could be reached.
+# The case named `extrapolation-premul` could not extrapolate.
+#
+# ⭐ This also leaves op 0x09's headline capability untested. DECOUPLING coverage from the attribute
+# frame is the whole point of the op — one record, shape and colour independent — and shipping it
+# with shape == frame in every single case tested none of it.
+#
+# So: the extrapolation case dispatches a coverage triangle that COVERS THE WHOLE WINDOW while its
+# frame stays small. Both the reference capture and the GPU dispatch read the shape from here, so
+# they cannot drift apart.
+fn tc_cov(i, k): i64 {
+    if (i == 15) {
+        # A right triangle with legs of 200 px: strictly contains the 64x64 window, so every pixel
+        # is covered and the frame's extrapolated region is actually evaluated.
+        if (k == 0) { return 0; }    if (k == 1) { return 0; }
+        if (k == 2) { return 200; }  if (k == 3) { return 0; }
+        if (k == 4) { return 0; }    return 200;
+    }
+    return tc_get(i, k);
+}
+
+# tri_cov_capture — run op 0x08 over a triangle's own three edges and read the mask back.
+# ⭐ This is the SAME rasteriser op 0x09 runs internally; capturing it here is what lets the
+# reference be fed the identical input rather than a guess at it.
+fn tri_cov_capture(ax, ay, bx, by, cx, cy, w, h, out): i64 {
+    store32(&tri_edges +  0, ax << 16); store32(&tri_edges +  4, ay << 16);
+    store32(&tri_edges +  8, bx << 16); store32(&tri_edges + 12, by << 16);
+    store32(&tri_edges + 16, bx << 16); store32(&tri_edges + 20, by << 16);
+    store32(&tri_edges + 24, cx << 16); store32(&tri_edges + 28, cy << 16);
+    store32(&tri_edges + 32, cx << 16); store32(&tri_edges + 36, cy << 16);
+    store32(&tri_edges + 40, ax << 16); store32(&tri_edges + 44, ay << 16);
+
+    var eid = syscall(86, 64 * 16);
+    if (eid < 1) { return 0; }
+    var mid = syscall(86, w * h);
+    if (mid < 1) { syscall(74, eid); return 0; }
+    if (syscall(72, eid, &tri_edges, 3 * 16) != 0) { syscall(74, eid); syscall(74, mid); return 0; }
+    var pz = 0;
+    while (pz < w * h / 8) { store64(out + pz * 8, 0); pz = pz + 1; }
+    syscall(72, mid, out, w * h);
+
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 8);                    # op 0x08 EDGE_COV
+    store32(&d +  8, mid);
+    store32(&d + 12, eid);
+    store32(&d + 16, (h * 65536) + w);
+    store32(&d + 36, 3);
+    var rc = syscall(92, &d, 64);
+    if (rc != 0) { syscall(74, eid); syscall(74, mid); return 0; }
+    var ok = 1;
+    if (syscall(73, mid, out, w * h) != 0) { ok = 0; }
+    syscall(74, eid); syscall(74, mid);
+    return ok;
+}
+
+fn tri_attr(): i64 {
+    tc_init();
+    # ⚠ 64x64x4 = 16384 B = exactly the 2048 u64 slots tri_ref/tri_gpu hold. Sized to fit rather
+    # than assumed to: a module-scope var X[N] here allocates N x u64, MEASURED in this directory.
+    var w = 64;
+    var h = 64;
+    var bytes = w * h * 4;
+
+    var exact = 0;
+    var cases = 0;
+    var n_multi = 0;                 # cases carrying >= 64 distinct values  (N11)
+    var n_xvary = 0;                 # cases varying >= 32 levels along a row (N12)
+    var dg_all = 0;
+
+    var i = 0;
+    while (i < TC_N) {
+        if (tc_get(i, 9) == TCF_REJECT) { i = i + 1; continue; }
+        if (tri_prep(tc_get(i,0), tc_get(i,1), tc_get(i,2), tc_get(i,3),
+                     tc_get(i,4), tc_get(i,5), tc_get(i,6), tc_get(i,7), tc_get(i,8)) != 1) {
+            i = i + 1; continue;
+        }
+        cases = cases + 1;
+        if (tri_cov_capture(tc_cov(i,0), tc_cov(i,1), tc_cov(i,2), tc_cov(i,3),
+                            tc_cov(i,4), tc_cov(i,5), w, h, &bg) == 0) {
+            puts("  ** coverage capture failed -- the reference cannot be fed the GPU's input");
+            return 87;
+        }
+        tri_ref_fill(&tri_ref, &bg, w, h);
+        if (tri_ndistinct >= 64) { n_multi = n_multi + 1; }
+        if (tri_rowspan >= 32) { n_xvary = n_xvary + 1; }
+
+        var d = digest(&tri_ref, bytes);
+        dg_all = ((dg_all * 31) + d) & 0xFFFFFFFF;
+        ps("  case "); pnum(i); ps(" "); tc_name(i);
+        ps("  distinct="); pnum(tri_ndistinct);
+        ps("  rowspan="); pnum(tri_rowspan);
+        ps("  refdigest="); phex8(d); nl();
+        i = i + 1;
+    }
+
+    ps("gputri: corpus digest "); phex8(dg_all);
+    ps(" over "); pnum(cases); ps(" cases"); nl();
+
+    # ======================================================================================
+    # THE GPU COMPARISON
+    # ======================================================================================
+    # ⚠ EXPLICIT EDGES, NOT THE DERIVE FLAG. DERIVE asks the kernel to synthesise the frame's three
+    # edges and that path is not implemented yet; sending the flag would dispatch coverage from a
+    # null edge pointer. The frame's edges are packed here instead, which is the shape a real
+    # caller uses anyway.
+    var gpu_exact = 0;
+    var gpu_ran = 0;
+    var gpu_cmp = 0;                 # cases actually read back and compared
+    var gpu_diff_worst = 0;
+    var gi = 0;
+    while (gi < TC_N) {
+        if (tc_get(gi, 9) == TCF_REJECT) { gi = gi + 1; continue; }
+        if (tri_prep(tc_get(gi,0), tc_get(gi,1), tc_get(gi,2), tc_get(gi,3),
+                     tc_get(gi,4), tc_get(gi,5), tc_get(gi,6), tc_get(gi,7), tc_get(gi,8)) != 1) {
+            gi = gi + 1; continue;
+        }
+        # ⛔ gi, NOT i. `i` is the PRINTING loop's variable and it is still in scope here, parked at
+        # TC_N — so an `i` typo captured coverage for one row PAST the end of the corpus table, the
+        # same garbage triangle for every case, while the digests printed above (which do use `i`
+        # correctly) stayed perfectly plausible. Two burns reported a shader disagreement that was
+        # entirely this line. Cyrius has no unused-variable or scope warning to catch it.
+        if (tri_cov_capture(tc_cov(gi,0), tc_cov(gi,1), tc_cov(gi,2), tc_cov(gi,3),
+                            tc_cov(gi,4), tc_cov(gi,5), w, h, &bg) == 0) {
+            puts("  ** coverage capture failed -- the reference cannot be fed the GPU's input");
+            return 87;
+        }
+        tri_ref_fill(&tri_ref, &bg, w, h);
+
+        # the frame's three edges, 16.16, as the coverage shape
+        var e = 0;
+        while (e < 3) {
+            var a = e; var b = e + 1;
+            if (b == 3) { b = 0; }
+            store32(&tri_edges + (e * 4 + 0) * 4, tc_cov(gi, a * 2 + 0) << 16);
+            store32(&tri_edges + (e * 4 + 1) * 4, tc_cov(gi, a * 2 + 1) << 16);
+            store32(&tri_edges + (e * 4 + 2) * 4, tc_cov(gi, b * 2 + 0) << 16);
+            store32(&tri_edges + (e * 4 + 3) * 4, tc_cov(gi, b * 2 + 1) << 16);
+            e = e + 1;
+        }
+
+        # ⭐ TILE THE CASES so the eye can judge several at once. All at (0,0) would leave only the
+        # LAST one visible -- that is how burn 1 produced nothing useful to look at.
+        var tx = (gpu_ran % 5) * 72 + 16;
+        var ty = (gpu_ran / 5) * 72 + 16;
+
+        var eid = syscall(86, 64 * 16);
+        if (eid < 1) { puts("gputri: no GPU here"); return 100; }
+        if (syscall(72, eid, &tri_edges, 3 * 16) != 0) { syscall(74, eid); return 90; }
+
+        # ⛔ THE 0xA5 PREFILL IS MANDATORY. A #86 slot is a FIXED window per index, so a freed and
+        # reallocated slot hands back the SAME memory with the previous case's pixels in it. Without
+        # the sentinel a stale ghost reads as a pass.
+        var pz = 0;
+        while (pz < bytes / 8) { store64(&tri_gpu + pz * 8, 0xA5A5A5A5A5A5A5A5); pz = pz + 1; }
+
+        # ⭐ CLEAR THE DESTINATION TO THE REFERENCE'S OWN BACKGROUND FIRST. The reference composites
+        # over 0xFF101010; the real back buffer holds whatever was on screen. Without this the two
+        # sides do not share an input and the comparison can only ever be a REPORT. Filling the rect
+        # with the same colour makes them share it, which is what lets the gate demand ZERO.
+        # #88 = gpu_fill_rect(color, wh, dstxy) -- the rect peer of the whole-surface clear.
+        if (syscall(88, 0xFF101010, (h * 65536) + w, (ty * 65536) + tx) != 0) {
+            puts("  ** fill_rect refused -- destination not cleared, comparison would be invalid");
+            gi = gi + 1; continue;
+        }
+
+        var d[64];
+        var z = 0;
+        while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+        store32(&d +  0, 9);                          # op 0x09 TRI_RGBA
+        store32(&d + 12, eid);
+        store32(&d + 16, (h * 65536) + w);
+        store32(&d + 20, (ty * 65536) + tx);
+        store32(&d + 24, tc_get(gi, 0) << 16); store32(&d + 28, tc_get(gi, 1) << 16);
+        store32(&d + 32, tc_get(gi, 2) << 16); store32(&d + 36, tc_get(gi, 3) << 16);
+        store32(&d + 40, tc_get(gi, 4) << 16); store32(&d + 44, tc_get(gi, 5) << 16);
+        store32(&d + 48, tc_get(gi, 6)); store32(&d + 52, tc_get(gi, 7)); store32(&d + 56, tc_get(gi, 8));
+        store32(&d + 60, 3);                          # n_edges 3, rule NONZERO
+        var rc = syscall(92, &d, 64);
+        syscall(74, eid);
+        if (rc != 0) {
+            ps("  case "); pnum(gi); ps(" REJECTED, reason "); pnum((0 - rc) & 0xFF); nl();
+            gi = gi + 1; continue;
+        }
+        gpu_ran = gpu_ran + 1;
+
+        # ---- ⭐ READ THE RENDERED RECT BACK AND COMPARE, BYTE FOR BYTE -------------------
+        # #90 captures the blit back buffer -- the SAME surface the shader just wrote -- before
+        # #84 flips it. That is what turns the eye oracle into a byte oracle.
+        # ⚠ The reference was computed over a black-ish 0xFF101010 destination; the real back
+        # buffer holds whatever was there before. So the comparison is only meaningful where the
+        # shader wrote OPAQUE pixels. Rather than pretend otherwise, this reports the worst
+        # per-channel delta over the OPAQUE pixels and does not gate on zero yet.
+        var rid = syscall(86, bytes);
+        if (rid >= 1) {
+            var qz = 0;
+            while (qz < bytes / 8) { store64(&tri_poison + qz * 8, 0xA5A5A5A5A5A5A5A5); qz = qz + 1; }
+            syscall(72, rid, &tri_poison, bytes);
+            var rb = syscall(90, rid, (h * 65536) + w, (ty * 65536) + tx);
+            if (rb == 0) {
+                if (syscall(73, rid, &tri_poison, bytes) == 0) {
+                    gpu_cmp = gpu_cmp + 1;
+                    var case_diff = 0;
+                    var pi = 0;
+                    while (pi < w * h) {
+                        var got = load32(&tri_poison + pi * 4) & 0xFFFFFFFF;
+                        var want = load32(&tri_ref + pi * 4) & 0xFFFFFFFF;
+                        # ⭐ EVERY pixel is comparable now: the destination was cleared to the same
+                        # 0xFF101010 the reference composites over, so both sides share their input.
+                        var ch2 = 0;
+                        while (ch2 < 3) {
+                            var sh2 = ch2 * 8;
+                            var dg = ((got >> sh2) & 0xFF) - ((want >> sh2) & 0xFF);
+                            if (dg < 0) { dg = 0 - dg; }
+                            if (dg > gpu_diff_worst) { gpu_diff_worst = dg; }
+                            ch2 = ch2 + 1;
+                        }
+                        # ⭐ THE BISECT. A bare "worst delta 239" names no pixel and indicts nothing;
+                        # four located samples separate the failure modes on sight. Coverage byte
+                        # included because it is the one input both sides are supposed to share:
+                        #   cov=0 but got!=background   => the shader wrote OUTSIDE the shape
+                        #   want/got agree in A, differ in RGB => the interpolator, not the blend
+                        #   whole pixel shifted one row/col => addressing, not arithmetic
+                        #   every covered pixel off by a smooth ramp => the PREP record's scale
+                        # ⚠ Capped at 4 lines per RUN, not per case: an unbounded dump over 15 cases
+                        # is 60k lines of scrollback and the operator photographs a screen.
+                        if (got != want) {
+                            if (tri_dumped < 4) {
+                                tri_dumped = tri_dumped + 1;
+                                ps("    diff case "); pnum(gi);
+                                ps(" @ x="); pnum(pi % w); ps(" y="); pnum(pi / w);
+                                ps("  cov="); pnum(load8(&bg + pi) & 0xFF);
+                                ps("  want="); phex8(want); ps("  got="); phex8(got); nl();
+                            }
+                            tri_ndiff = tri_ndiff + 1;
+                            case_diff = case_diff + 1;
+                        }
+                        pi = pi + 1;
+                    }
+                    # ⭐ PER-CASE, because "all 15 wrong" and "1 of 15 wrong" are different faults.
+                    # A uniform failure is systematic (prep scale, channel order, addressing); a
+                    # single failing case points at that case's GEOMETRY, and the case name says
+                    # which property it was built to exercise.
+                    if (case_diff != 0) {
+                        ps("    case "); pnum(gi); ps(" "); tc_name(gi);
+                        ps("  DIFFERS in "); pnum(case_diff); ps(" of "); pnum(w * h);
+                        ps(" px"); nl();
+                    }
+                }
+            }
+            syscall(74, rid);
+        }
+        gi = gi + 1;
+    }
+    ps("gputri: "); pnum(gpu_ran); ps(" of "); pnum(cases); puts(" cases dispatched to the GPU");
+
+    # ⛔ PRESENT, OR NOTHING IS EVER SEEN. The shader writes the BACK buffer; #84 flips it to
+    # scanout. Without this the pixels are computed correctly and thrown away, which is
+    # indistinguishable from a dead shader by eye — the first burn looked at a blank screen for
+    # exactly this reason.
+    ps("gputri: read back "); pnum(gpu_cmp); ps(" of "); pnum(gpu_ran);
+    ps(" rendered rects; differing px "); pnum(tri_ndiff);
+    ps(", worst per-channel delta "); pnum(gpu_diff_worst); nl();
+    if (gpu_cmp == 0) {
+        puts("gputri: ⛔ NOTHING was read back -- #90 refused every capture. The byte oracle is");
+        puts("gputri:   unavailable, so this run CANNOT claim pixel correctness.");
+        return 87;
+    }
+    if (gpu_cmp != gpu_ran) {
+        puts("gputri: ⛔ some rects were dispatched but never read back -- partial evidence only.");
+        return 87;
+    }
+    # ⛔ THE GATE. Both sides now composite over the same cleared background, so anything but zero
+    # is a real disagreement between the shader and the reference.
+    if (gpu_diff_worst != 0) {
+        ps("gputri: ⛔ PIXELS DIFFER -- worst per-channel delta "); pnum(gpu_diff_worst); nl();
+        puts("gputri:   READ THE LOCATED DIFFS ABOVE. This line used to say 'suspect the EMISSION'");
+        puts("gputri:   and it was wrong both times it was believed -- the defect was this TOOL");
+        puts("gputri:   feeding the reference the wrong coverage. trimodel proves the algorithm and");
+        puts("gputri:   two assemblers agree on the code; the instrument is NOT above suspicion.");
+        return 85;
+    }
+    puts("  ⭐ BYTE ORACLE: every rendered pixel matches the reference exactly.");
+
+    var pr = syscall(84);
+    if (pr == 1) { puts("gputri: presented -- the tiles above are ON SCREEN now"); }
+    if (pr != 1) {
+        puts("gputri: ⚠ present returned 0 -- double-buffer not armed, so the render went to a");
+        puts("gputri:   back buffer that is never shown. The dispatch still ran; the EYE oracle");
+        puts("gputri:   is unavailable on this boot.");
+    }
+    # ⚠ The dispatch writes the BACK BUFFER, not a readable slot, so there is nothing to compare
+    # byte-for-byte from ring 3 yet. What this proves is that every corpus record is ACCEPTED and
+    # dispatches without error -- not that the pixels are right. The eye and the next bite's
+    # read-back path settle correctness.
+    if (gpu_ran != cases) {
+        ps("gputri: "); pnum(cases - gpu_ran); puts(" case(s) were refused -- see the reasons above");
+        return 86;
+    }
+
+    # ---- N9: comparator calibration -------------------------------------------------------
+    # ⛔ A comparator that never reports a difference would make every case above "exact".
+    var kref = &tri_ref;
+    var kgpu = &tri_gpu;
+    var c = 0;
+    while (c < bytes) { store8(kgpu + c, load8(kref + c)); c = c + 1; }
+    if (digest(kref, bytes) != digest(kgpu, bytes)) {
+        puts("gputri: N9 FAILED -- identical buffers compared UNEQUAL"); return 86;
+    }
+    store8(kgpu + (bytes / 2), (load8(kgpu + (bytes / 2)) ^ 0xFF) & 0xFF);
+    if (digest(kref, bytes) == digest(kgpu, bytes)) {
+        puts("gputri: N9 FAILED -- a POISONED buffer compared EQUAL; the comparator is blind");
+        return 86;
+    }
+    puts("  N9  comparator distinguishes a one-byte poison            FIRED");
+
+    # ---- N10: the prefill sentinel is observable ------------------------------------------
+    var z2 = 0;
+    while (z2 < bytes) { store8(kgpu + z2, 0xA5); z2 = z2 + 1; }
+    if ((load8(kgpu) & 0xFF) != 0xA5) {
+        puts("gputri: N10 FAILED -- the 0xA5 prefill is not observable on read-back"); return 86;
+    }
+    puts("  N10 prefill sentinel survives to read-back                FIRED");
+
+    # ---- N11: colour-variation floor ------------------------------------------------------
+    # ⭐ Without this a FLAT-COLOUR shader passes every single-colour case byte-exactly.
+    if (n_multi < 3) {
+        ps("gputri: N11 FAILED -- only "); pnum(n_multi);
+        puts(" case(s) carry >= 64 distinct values; a flat shader would pass");
+        return 86;
+    }
+    ps("  N11 "); pnum(n_multi); puts(" cases carry >= 64 distinct values          FIRED");
+
+    # ---- N12: x-variation floor -----------------------------------------------------------
+    # ⭐⭐ THE ONE CONTROL STANDING BETWEEN A DEAD X TERM AND A GREEN RUN. A vertical gradient is a
+    # function of y alone, so every gradient case is reproduced perfectly by a shader whose x
+    # coefficient is zero. Only a case that varies ALONG A ROW can see it.
+    if (n_xvary < 1) {
+        puts("gputri: N12 FAILED -- no case varies >= 32 levels along a row;");
+        puts("        an x-term wired to zero would pass this corpus unnoticed");
+        return 86;
+    }
+    ps("  N12 "); pnum(n_xvary); puts(" case(s) vary >= 32 levels along a row      FIRED");
+
+    # ---- N13: the exact rounding correction actually fires ---------------------------------
+    # ⛔ The shader's estimate-and-correct step exists for the quotients where the rounding bias
+    # carries into the next level. A corpus that never produces one leaves that step ENTIRELY
+    # untested while every case still compares exact.
+    if (tr_corr_hits == 0) {
+        puts("gputri: N13 FAILED -- the rounding correction never fired across the corpus;");
+        puts("        the shader's correct-by-one step would be untested by this run");
+        return 86;
+    }
+    ps("  N13 rounding correction fired "); pnum(tr_corr_hits); puts(" times                FIRED");
+
+    # ---- N14: the premultiplication restore fires ------------------------------------------
+    if (tr_premul_hits == 0) {
+        puts("gputri: N14 FAILED -- min(q_ch, q_a) never fired; the premultiplied restore");
+        puts("        is untested and a shader omitting it would pass");
+        return 86;
+    }
+    ps("  N14 premultiplied restore fired "); pnum(tr_premul_hits); puts(" times              FIRED");
+
+    # ---- N15: determinism -- the same case twice in one boot must be byte-identical --------
+    # ⚠ A run that is not reproducible cannot be compared to anything, and a stale-buffer ghost
+    # reads as a pass. This is cheap and it is the only thing that catches it in-tool.
+    # ⛔ FOUR ARGUMENTS. These two calls passed THREE — `w` landed in `covbuf`, `h` in `w`, and `h`
+    # read whatever was on the stack. Cyrius warns rather than errors on arity, and because N15
+    # compares the reference against ITSELF both halves were equally wrong, so the control passed
+    # vacuously through every burn. Coverage here is a synthetic all-255 mask on purpose: N15 asks
+    # whether the reference is REPRODUCIBLE, which must not depend on a GPU being present.
+    var cz = 0;
+    while (cz < w * h) { store8(&bg + cz, 255); cz = cz + 1; }
+    tri_prep(tc_get(0,0), tc_get(0,1), tc_get(0,2), tc_get(0,3),
+             tc_get(0,4), tc_get(0,5), tc_get(0,6), tc_get(0,7), tc_get(0,8));
+    tri_ref_fill(&tri_ref, &bg, w, h);
+    var d1 = digest(&tri_ref, bytes);
+    var zz = 0;
+    while (zz < bytes) { store8(&tri_ref + zz, 0xA5); zz = zz + 1; }
+    tri_ref_fill(&tri_ref, &bg, w, h);
+    var d2 = digest(&tri_ref, bytes);
+    if (d1 != d2) {
+        puts("gputri: N15 FAILED -- the same case computed twice gave DIFFERENT bytes");
+        return 86;
+    }
+    puts("  N15 same case twice in one boot is byte-identical         FIRED");
+
+    # ---- N16: this tool's reference agrees with the HOST triref ----------------------------
+    # ⭐ THE ONLY CHECK THAT CATCHES BOTH SIDES BEING WRONG TOGETHER. Everything above compares
+    # this binary against itself; an --agnos codegen divergence would move the reference and the
+    # comparison in lockstep and stay green. A mismatch here means the COMPILER, not the shader.
+    #
+    # ⛔ THIS PRINTED THE WRONG NUMBER THROUGH SEVEN BURNS. It printed `dg_all` — the fold of the
+    # per-case digests computed over the DISPATCHED coverage — and told the operator to diff it
+    # against host triref's, which prints `tc_corpus_digest()` computed at coverage 255. The two
+    # are different functions of different inputs and could never be equal, so the "check" was
+    # decorative: iron said 0x3b53f44d, the host said 0x8aed72de, and nothing was learned. Worse,
+    # `dg_all` MOVES whenever a coverage shape changes (it did when case 15 was decoupled), so it
+    # reads as a regression signal while being nothing of the kind.
+    #
+    # ⭐ Now it calls the SAME function triref does. Comparable by construction, and independent of
+    # the dispatched coverage — which is exactly the property a compiler-divergence check needs.
+    # ⚠ tri_gpu is reused as scratch here: its last write is inside the comparison loop above, and
+    # nothing reads it after. 64x64x4 = 16384 B = exactly its 2048 u64 slots.
+    ps("gputri: N16 corpus digest "); phex8(tc_corpus_digest(&tri_gpu, 64, 64));
+    puts("  -- MUST equal host triref's N16 digest");
+    ps("gputri:     (dispatched-coverage fold, NOT comparable to the host: ");
+    phex8(dg_all); puts(")");
+
+    puts("");
+    puts("");
+    puts("gputri: every corpus record ACCEPTED and dispatched; all eight controls fired.");
+    puts("⭐ PIXELS PROVEN PROGRAMMATICALLY -- every rendered rect read back via #90 and compared");
+    puts("  byte for byte against the reference, over a destination both sides cleared to the same");
+    puts("  colour. The screen is now a convenience, not the oracle.");
+    return 95;
+}
+
+
+# ============================================================================================
+# --list : RUNG 12, N triangles from ONE #86 vertex slot in ONE record
+# ============================================================================================
+# ⛔ THE POINT IS THAT OVERLAP IS ORDERED. A triangle list is composited in submission order, each
+# src-over'd onto the last. A mesh whose triangles do not overlap would pass even if the kernel
+# drew them in reverse, so the corpus below DELIBERATELY overlaps them — that is the only way the
+# ordering is under test at all.
+var tl_tbl[288];                # 32 triangles x 9 slots x 8 B
+var tl_vtx[288];                # the packed 48-byte-per-triangle slot image
+# 6 triangles x 64*64 coverage bytes = 24576 B. ⚠ Module-scope var X[N] here is N x u64 (measured),
+# so 3072 slots = 24576 bytes exactly.
+var tl_covs[3072];
+
+fn tl_build(): i64 {
+    # 6 overlapping triangles, deliberately stacked so later ones cover earlier ones.
+    tl_set(&tl_tbl, 0,0,  2); tl_set(&tl_tbl, 0,1,  2); tl_set(&tl_tbl, 0,2, 60);
+    tl_set(&tl_tbl, 0,3,  2); tl_set(&tl_tbl, 0,4,  2); tl_set(&tl_tbl, 0,5, 60);
+    tl_set(&tl_tbl, 0,6, 0xFFFF0000); tl_set(&tl_tbl, 0,7, 0xFF00FF00); tl_set(&tl_tbl, 0,8, 0xFF0000FF);
+
+    tl_set(&tl_tbl, 1,0, 60); tl_set(&tl_tbl, 1,1,  2); tl_set(&tl_tbl, 1,2, 60);
+    tl_set(&tl_tbl, 1,3, 60); tl_set(&tl_tbl, 1,4,  2); tl_set(&tl_tbl, 1,5, 60);
+    tl_set(&tl_tbl, 1,6, 0xFF00FFFF); tl_set(&tl_tbl, 1,7, 0xFFFFFF00); tl_set(&tl_tbl, 1,8, 0xFFFF00FF);
+
+    tl_set(&tl_tbl, 2,0, 16); tl_set(&tl_tbl, 2,1, 16); tl_set(&tl_tbl, 2,2, 48);
+    tl_set(&tl_tbl, 2,3, 16); tl_set(&tl_tbl, 2,4, 32); tl_set(&tl_tbl, 2,5, 48);
+    tl_set(&tl_tbl, 2,6, 0xFFFFFFFF); tl_set(&tl_tbl, 2,7, 0xFF808080); tl_set(&tl_tbl, 2,8, 0xFF404040);
+
+    tl_set(&tl_tbl, 3,0,  8); tl_set(&tl_tbl, 3,1, 40); tl_set(&tl_tbl, 3,2, 40);
+    tl_set(&tl_tbl, 3,3, 40); tl_set(&tl_tbl, 3,4,  8); tl_set(&tl_tbl, 3,5, 56);
+    tl_set(&tl_tbl, 3,6, 0xFF804020); tl_set(&tl_tbl, 3,7, 0xFF208040); tl_set(&tl_tbl, 3,8, 0xFF402080);
+
+    tl_set(&tl_tbl, 4,0, 24); tl_set(&tl_tbl, 4,1,  4); tl_set(&tl_tbl, 4,2, 56);
+    tl_set(&tl_tbl, 4,3, 24); tl_set(&tl_tbl, 4,4, 24); tl_set(&tl_tbl, 4,5, 40);
+    tl_set(&tl_tbl, 4,6, 0xFF00FF80); tl_set(&tl_tbl, 4,7, 0xFF8000FF); tl_set(&tl_tbl, 4,8, 0xFFFF8000);
+
+    tl_set(&tl_tbl, 5,0,  4); tl_set(&tl_tbl, 5,1, 48); tl_set(&tl_tbl, 5,2, 36);
+    tl_set(&tl_tbl, 5,3, 48); tl_set(&tl_tbl, 5,4,  4); tl_set(&tl_tbl, 5,5, 60);
+    tl_set(&tl_tbl, 5,6, 0xFF102030); tl_set(&tl_tbl, 5,7, 0xFF304010); tl_set(&tl_tbl, 5,8, 0xFF203040);
+    return 6;
+}
+
+# Pack the table into the 48-byte-per-triangle slot image the kernel indexes.
+fn tl_pack(n): i64 {
+    var i = 0;
+    while (i < n) {
+        var b = &tl_vtx + i * 48;
+        var f = 0;
+        while (f < 6) { store32(b + f * 4, tl_get(&tl_tbl, i, f) << 16); f = f + 1; }
+        store32(b + 24, tl_get(&tl_tbl, i, 6));
+        store32(b + 28, tl_get(&tl_tbl, i, 7));
+        store32(b + 32, tl_get(&tl_tbl, i, 8));
+        store32(b + 36, 0); store32(b + 40, 0); store32(b + 44, 0);   # reserved tail MUST be zero
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ⭐ THE INCREMENTAL BISECT. Rung 12's red survived the op 0x09 fix in the offline reproduction:
+# trimodel replays this exact batch on the host (its clean digest matches iron's reference bit for
+# bit) and NO combination of the signed-multiply defect with order / stale-mask / no-read-modify-
+# write hypotheses lands on iron's GPU digest. So op 0x0A has an independent defect that is not
+# worth guessing at.
+#
+# Dispatching the SAME batch at n = 1, 2, ... 6 and comparing each against the reference for that
+# prefix turns "3188 pixels differ" into "triangle K is the first one that breaks it". A batch is
+# composited in submission order, so the prefix result is well-defined at every n — which is what
+# makes this a legitimate bisect rather than six unrelated runs.
+fn tl_run_prefix(nn, w, h, bytes): i64 {
+    tl_render_cov(&tl_tbl, nn, &tri_ref, &tl_covs, w, h, 0xFF101010);
+    var refd = digest(&tri_ref, bytes);
+
+    var vid = syscall(86, 48 * 32);
+    if (vid < 1) { return 0 - 100; }
+    if (syscall(72, vid, &tl_vtx, nn * 48) != 0) { syscall(74, vid); return 0 - 90; }
+    if (syscall(88, 0xFF101010, (h * 65536) + w, 16 * 65536 + 16) != 0) {
+        syscall(74, vid); return 0 - 90;
+    }
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 10);
+    store32(&d + 12, vid);
+    store32(&d + 16, (h * 65536) + w);
+    store32(&d + 20, (16 * 65536) + 16);
+    store32(&d + 24, nn);
+    var rc = syscall(92, &d, 64);
+    if (rc != 0) { syscall(74, vid); return 0 - 80; }
+
+    var rid = syscall(86, bytes);
+    if (rid < 1) { syscall(74, vid); return 0 - 90; }
+    var qz = 0;
+    while (qz < bytes / 8) { store64(&tri_poison + qz * 8, 0xA5A5A5A5A5A5A5A5); qz = qz + 1; }
+    syscall(72, rid, &tri_poison, bytes);
+    var rb = syscall(90, rid, (h * 65536) + w, (16 * 65536) + 16);
+    if (rb != 0) { syscall(74, vid); syscall(74, rid); return 0 - 87; }
+    if (syscall(73, rid, &tri_poison, bytes) != 0) { syscall(74, vid); syscall(74, rid); return 0 - 90; }
+    syscall(74, vid); syscall(74, rid);
+
+    var bad = 0;
+    var pi = 0;
+    while (pi < w * h) {
+        if ((load32(&tri_poison + pi * 4) & 0xFFFFFFFF) != (load32(&tri_ref + pi * 4) & 0xFFFFFFFF)) {
+            bad = bad + 1;
+        }
+        pi = pi + 1;
+    }
+    ps("  n="); pnum(nn); ps("  ref "); phex8(refd);      # phex8 emits its OWN 0x prefix
+    ps("  gpu "); phex8(digest(&tri_poison, bytes));
+    ps("  differing "); pnum(bad); nl();
+    return bad;
+}
+
+# Reference for ONE triangle drawn alone over the background, using its captured mask.
+fn tl_render_one(tbl, i, buf, cov, w, h, bg): i64 {
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) { store32(buf + (y * w + x) * 4, bg); x = x + 1; }
+        y = y + 1;
+    }
+    if (tri_prep(tl_get(tbl,i,0), tl_get(tbl,i,1), tl_get(tbl,i,2), tl_get(tbl,i,3),
+                 tl_get(tbl,i,4), tl_get(tbl,i,5),
+                 tl_get(tbl,i,6), tl_get(tbl,i,7), tl_get(tbl,i,8)) != 1) { return 0; }
+    var yy = 0;
+    while (yy < h) {
+        var xx = 0;
+        while (xx < w) {
+            var cvv = load8(cov + yy * w + xx) & 0xFF;
+            if (cvv != 0) {
+                var cur = load32(buf + (yy * w + xx) * 4) & 0xFFFFFFFF;
+                store32(buf + (yy * w + xx) * 4, tri_ref_px(xx, yy, cvv, cur));
+            }
+            xx = xx + 1;
+        }
+        yy = yy + 1;
+    }
+    return 0;
+}
+
+# Dispatch whatever single triangle is currently packed at tl_vtx[0], compare, return differing px.
+fn tl_run_one(w, h, bytes): i64 {
+    var vid = syscall(86, 48 * 32);
+    if (vid < 1) { return 0 - 100; }
+    if (syscall(72, vid, &tl_vtx, 48) != 0) { syscall(74, vid); return 0 - 90; }
+    if (syscall(88, 0xFF101010, (h * 65536) + w, 16 * 65536 + 16) != 0) {
+        syscall(74, vid); return 0 - 90;
+    }
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 10);
+    store32(&d + 12, vid);
+    store32(&d + 16, (h * 65536) + w);
+    store32(&d + 20, (16 * 65536) + 16);
+    store32(&d + 24, 1);
+    if (syscall(92, &d, 64) != 0) { syscall(74, vid); return 0 - 80; }
+
+    var rid = syscall(86, bytes);
+    if (rid < 1) { syscall(74, vid); return 0 - 90; }
+    var qz = 0;
+    while (qz < bytes / 8) { store64(&tri_poison + qz * 8, 0xA5A5A5A5A5A5A5A5); qz = qz + 1; }
+    syscall(72, rid, &tri_poison, bytes);
+    if (syscall(90, rid, (h * 65536) + w, (16 * 65536) + 16) != 0) {
+        syscall(74, vid); syscall(74, rid); return 0 - 87;
+    }
+    if (syscall(73, rid, &tri_poison, bytes) != 0) { syscall(74, vid); syscall(74, rid); return 0 - 90; }
+    syscall(74, vid); syscall(74, rid);
+
+    var bad = 0;
+    var pi = 0;
+    while (pi < w * h) {
+        if ((load32(&tri_poison + pi * 4) & 0xFFFFFFFF) != (load32(&tri_ref + pi * 4) & 0xFFFFFFFF)) {
+            bad = bad + 1;
+        }
+        pi = pi + 1;
+    }
+    return bad;
+}
+
+# Dispatch the currently-packed batch of `nn` WITHOUT filling the destination first, so successive
+# calls accumulate into whatever is already there. Returns 0 on success.
+fn tl_dispatch_only(w, h): i64 {
+    var vid = syscall(86, 48 * 32);
+    if (vid < 1) { return 1; }
+    if (syscall(72, vid, &tl_vtx, 48) != 0) { syscall(74, vid); return 1; }
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 10);
+    store32(&d + 12, vid);
+    store32(&d + 16, (h * 65536) + w);
+    store32(&d + 20, (16 * 65536) + 16);
+    store32(&d + 24, 1);
+    var rc = syscall(92, &d, 64);
+    syscall(74, vid);
+    if (rc != 0) { return 1; }
+    return 0;
+}
+
+# Capture the destination rect and count pixels differing from tri_ref.
+fn tl_capture_cmp(w, h, bytes): i64 {
+    var rid = syscall(86, bytes);
+    if (rid < 1) { return 0 - 90; }
+    var qz = 0;
+    while (qz < bytes / 8) { store64(&tri_poison + qz * 8, 0xA5A5A5A5A5A5A5A5); qz = qz + 1; }
+    syscall(72, rid, &tri_poison, bytes);
+    if (syscall(90, rid, (h * 65536) + w, (16 * 65536) + 16) != 0) { syscall(74, rid); return 0 - 87; }
+    if (syscall(73, rid, &tri_poison, bytes) != 0) { syscall(74, rid); return 0 - 90; }
+    syscall(74, rid);
+    var bad = 0;
+    var pi = 0;
+    while (pi < w * h) {
+        if ((load32(&tri_poison + pi * 4) & 0xFFFFFFFF) != (load32(&tri_ref + pi * 4) & 0xFFFFFFFF)) {
+            bad = bad + 1;
+        }
+        pi = pi + 1;
+    }
+    return bad;
+}
+
+# One filled dispatch of the packed batch at `nn`, compared against whatever tri_ref holds.
+fn tl_run_prefix_quiet(nn, w, h, bytes): i64 {
+    var vid = syscall(86, 48 * 32);
+    if (vid < 1) { return 0 - 100; }
+    if (syscall(72, vid, &tl_vtx, nn * 48) != 0) { syscall(74, vid); return 0 - 90; }
+    if (syscall(88, 0xFF101010, (h * 65536) + w, 16 * 65536 + 16) != 0) {
+        syscall(74, vid); return 0 - 90;
+    }
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 10);
+    store32(&d + 12, vid);
+    store32(&d + 16, (h * 65536) + w);
+    store32(&d + 20, (16 * 65536) + 16);
+    store32(&d + 24, nn);
+    var rc = syscall(92, &d, 64);
+    syscall(74, vid);
+    if (rc != 0) { return 0 - 80; }
+    return tl_capture_cmp(w, h, bytes);
+}
+
+fn tri_list(): i64 {
+    var w = 64;
+    var h = 64;
+    var bytes = w * h * 4;
+    var n = tl_build();
+    tl_pack(n);
+
+    ps("gputri: RUNG 12 -- "); pnum(n); puts(" OVERLAPPING triangles from ONE vertex slot, ONE record");
+
+    # Capture EVERY triangle's coverage first, into one packed w*h-per-triangle buffer, so the
+    # reference composites the same masks the GPU will.
+    var ci = 0;
+    while (ci < n) {
+        if (tri_cov_capture(tl_get(&tl_tbl,ci,0), tl_get(&tl_tbl,ci,1), tl_get(&tl_tbl,ci,2),
+                            tl_get(&tl_tbl,ci,3), tl_get(&tl_tbl,ci,4), tl_get(&tl_tbl,ci,5),
+                            w, h, &tl_covs + ci * w * h) == 0) {
+            puts("gputri: coverage capture failed -- the reference cannot be fed the GPU's input");
+            return 87;
+        }
+        ci = ci + 1;
+    }
+    # ⭐ SINGLETONS FIRST. The prefix bisect says the batch breaks when triangle 1 JOINS triangle 0,
+    # but that is two different claims: triangle 1 renders wrongly on its own, or it renders fine
+    # and the COMPOSITION loses what came before. Dispatching each triangle ALONE separates them,
+    # and the offline harness cannot: six hypothesis variants reproduce iron's n=1 exactly and none
+    # reproduces n>=2, so the defect is not in the hypothesis set and must be measured, not guessed.
+    puts("gputri: singleton sweep -- each triangle dispatched ALONE (n=1)");
+    var sbad = 0;
+    var si = 0;
+    while (si < n) {
+        # Pack triangle si as the ONLY element of the batch, then restore the full pack after.
+        var b = &tl_vtx;
+        var f = 0;
+        while (f < 6) { store32(b + f * 4, tl_get(&tl_tbl, si, f) << 16); f = f + 1; }
+        store32(b + 24, tl_get(&tl_tbl, si, 6));
+        store32(b + 28, tl_get(&tl_tbl, si, 7));
+        store32(b + 32, tl_get(&tl_tbl, si, 8));
+        store32(b + 36, 0); store32(b + 40, 0); store32(b + 44, 0);
+
+        # The reference for a lone triangle: its own mask over the background.
+        tl_render_one(&tl_tbl, si, &tri_ref, &tl_covs + si * w * h, w, h, 0xFF101010);
+        var r = tl_run_one(w, h, bytes);
+        ps("  triangle "); pnum(si);
+        if (r == 0) { puts("  alone: EXACT"); }
+        if (r != 0) { ps("  alone: "); pnum(r); puts(" differing px"); sbad = sbad + 1; }
+        si = si + 1;
+    }
+    tl_pack(n);
+    if (sbad == 0) {
+        puts("gputri: ⭐ EVERY triangle is EXACT on its own => the defect is in the COMPOSITION,");
+        puts("gputri:   not in any triangle's geometry or attribute frame.");
+    }
+    if (sbad != 0) {
+        ps("gputri: ⭐ "); pnum(sbad); puts(" triangle(s) are wrong ALONE => not a composition bug;");
+        puts("gputri:   fix the singleton first, the batch result is downstream of it.");
+    }
+
+    # ⭐⭐ TWO PROBES THAT SPLIT "COMPOSITION" INTO ITS TWO HALVES.
+    #
+    # Burn 8 proved every triangle is exact ALONE, so the defect is in compositing. That is still
+    # two different things, and these separate them without guessing:
+    #
+    #   P1 — SIX SEPARATE op 0x0A CALLS, n=1 each, no refill between. The identical six dispatches
+    #        the kernel's own loop performs, but crossing the syscall boundary each time. If P1
+    #        composites correctly while n=6 does not, the difference lives INSIDE gpu_tri_list —
+    #        something done once per CALL that must be done once per TRIANGLE. If P1 fails too, the
+    #        syscall boundary is irrelevant and the fault is in how consecutive dispatches interact
+    #        with the destination.
+    #
+    #   P2 — n=2 where the SECOND triangle covers nothing in the window. If triangle 0's pixels
+    #        vanish even when triangle 1 writes nothing, then merely DISPATCHING again destroys the
+    #        previous output, and blending/overlap is exonerated entirely.
+    puts("gputri: P1 -- six SEPARATE n=1 calls, no refill between (vs one n=6 call)");
+    if (syscall(88, 0xFF101010, (h * 65536) + w, 16 * 65536 + 16) != 0) {
+        puts("gputri:   fill refused"); return 87;
+    }
+    var p1 = 0;
+    while (p1 < n) {
+        var pb = &tl_vtx;
+        var pf = 0;
+        while (pf < 6) { store32(pb + pf * 4, tl_get(&tl_tbl, p1, pf) << 16); pf = pf + 1; }
+        store32(pb + 24, tl_get(&tl_tbl, p1, 6));
+        store32(pb + 28, tl_get(&tl_tbl, p1, 7));
+        store32(pb + 32, tl_get(&tl_tbl, p1, 8));
+        store32(pb + 36, 0); store32(pb + 40, 0); store32(pb + 44, 0);
+        if (tl_dispatch_only(w, h) != 0) { puts("gputri:   P1 dispatch refused"); return 87; }
+        p1 = p1 + 1;
+    }
+    tl_pack(n);
+    tl_render_cov(&tl_tbl, n, &tri_ref, &tl_covs, w, h, 0xFF101010);
+    var p1bad = tl_capture_cmp(w, h, bytes);
+    ps("gputri:   P1 result: ");
+    if (p1bad == 0) {
+        puts("EXACT -- six separate calls DO composite correctly.");
+        puts("gputri:   ⭐ So the defect is INSIDE gpu_tri_list's loop, not in consecutive");
+        puts("gputri:     dispatches per se. Look for work done once per CALL that must be");
+        puts("gputri:     done once per TRIANGLE.");
+    }
+    if (p1bad != 0) {
+        pnum(p1bad); puts(" differing px -- separate calls fail TOO.");
+        puts("gputri:   ⭐ So the syscall boundary is irrelevant: consecutive dispatches into one");
+        puts("gputri:     rect lose earlier output. That is a DESTINATION/coherence question.");
+    }
+
+    # ⭐⭐⭐ P3 — WHICH DISPATCH DESTROYS THE DESTINATION?
+    #
+    # P1+P2 said: inside ONE gpu_tri_list call, a second triangle wipes the first even when it draws
+    # nothing; across syscall boundaries it does not. Each triangle costs THREE dispatches —
+    # edge_setup, the coverage rasteriser, and the interpolation pass — and the loop runs all three
+    # again for the second triangle. Only one of them needs to be the destroyer.
+    #
+    # op 0x08 is reachable directly from ring 3, so the coverage pair can be issued ALONE, with no
+    # interpolation pass anywhere near it. Render triangle 0, then fire a bare coverage dispatch at
+    # an unrelated mask slot, then look at the destination again. Nothing in that op addresses the
+    # back buffer, so if triangle 0 vanishes the coverage pass is the destroyer — and that is a
+    # cache/coherence fault, not a shader one.
+    puts("gputri: P3 -- does a BARE op 0x08 coverage dispatch destroy an already-rendered rect?");
+    if (syscall(88, 0xFF101010, (h * 65536) + w, 16 * 65536 + 16) != 0) {
+        puts("gputri:   fill refused"); return 87;
+    }
+    var p3b = &tl_vtx;
+    var p3f = 0;
+    while (p3f < 6) { store32(p3b + p3f * 4, tl_get(&tl_tbl, 0, p3f) << 16); p3f = p3f + 1; }
+    store32(p3b + 24, tl_get(&tl_tbl, 0, 6));
+    store32(p3b + 28, tl_get(&tl_tbl, 0, 7));
+    store32(p3b + 32, tl_get(&tl_tbl, 0, 8));
+    store32(p3b + 36, 0); store32(p3b + 40, 0); store32(p3b + 44, 0);
+    if (tl_dispatch_only(w, h) != 0) { puts("gputri:   P3 dispatch refused"); return 87; }
+    tl_render_one(&tl_tbl, 0, &tri_ref, &tl_covs, w, h, 0xFF101010);
+    var p3pre = tl_capture_cmp(w, h, bytes);
+    ps("gputri:   P3 baseline (triangle 0 alone, no refill): ");
+    if (p3pre == 0) { puts("EXACT"); }
+    if (p3pre != 0) { pnum(p3pre); puts(" differing -- baseline already bad, P3 is inconclusive"); }
+    if (tri_cov_capture(8, 8, 40, 8, 8, 40, w, h, &bg) == 0) {
+        puts("gputri:   P3 coverage dispatch refused"); return 87;
+    }
+    var p3post = tl_capture_cmp(w, h, bytes);
+    ps("gputri:   P3 after a bare op 0x08: ");
+    if (p3post == 0) {
+        puts("STILL EXACT -- the coverage pass is INNOCENT.");
+        puts("gputri:   ⭐ So the destroyer is the INTERPOLATION dispatch (or the prep record it");
+        puts("gputri:     reads), re-issued for the next triangle.");
+    }
+    if (p3post != 0) {
+        pnum(p3post); puts(" differing px -- a bare coverage dispatch WIPED the rendered rect.");
+        puts("gputri:   ⭐ The coverage pass destroys destination content it never addresses.");
+        puts("gputri:     That is a CACHE/COHERENCE fault in the dispatch sequence, not a shader");
+        puts("gputri:     one -- and it explains why a syscall boundary hides it.");
+    }
+
+    puts("gputri: P2 -- n=2 whose SECOND triangle covers nothing in the window");
+    tl_pack(n);
+    var qb = &tl_vtx + 48;
+    store32(qb +  0, 500 << 16); store32(qb +  4, 500 << 16);
+    store32(qb +  8, 560 << 16); store32(qb + 12, 500 << 16);
+    store32(qb + 16, 500 << 16); store32(qb + 20, 560 << 16);
+    store32(qb + 24, 0xFFFFFFFF); store32(qb + 28, 0xFFFFFFFF); store32(qb + 32, 0xFFFFFFFF);
+    store32(qb + 36, 0); store32(qb + 40, 0); store32(qb + 44, 0);
+    tl_render_one(&tl_tbl, 0, &tri_ref, &tl_covs, w, h, 0xFF101010);
+    var p2bad = tl_run_prefix_quiet(2, w, h, bytes);
+    ps("gputri:   P2 result: ");
+    if (p2bad == 0) {
+        puts("EXACT -- triangle 0 SURVIVES a second, non-drawing dispatch.");
+        puts("gputri:   ⭐ So the loss depends on the second triangle actually WRITING.");
+    }
+    if (p2bad != 0) {
+        pnum(p2bad); puts(" differing px -- triangle 0 is LOST to a dispatch that draws NOTHING.");
+        puts("gputri:   ⭐ Blending and overlap are exonerated: the dispatch itself destroys it.");
+    }
+    tl_pack(n);
+
+    # ⭐ BISECT NEXT, then the full batch. The first n whose differing count jumps from 0 names the
+    # triangle that breaks it, and its geometry is then a fact rather than a suspect.
+    puts("gputri: incremental prefix bisect -- the first n that differs names the triangle");
+    var firstbad = 0 - 1;
+    var nn = 1;
+    while (nn <= n) {
+        var r = tl_run_prefix(nn, w, h, bytes);
+        if (r < 0) {
+            ps("gputri: prefix n="); pnum(nn); ps(" could not run (code "); pnum(0 - r); puts(")");
+            return 87;
+        }
+        if (r != 0) { if (firstbad < 0) { firstbad = nn; } }
+        nn = nn + 1;
+    }
+    if (firstbad > 0) {
+        ps("gputri: ⭐ FIRST DIVERGENCE AT n="); pnum(firstbad);
+        ps("  => triangle "); pnum(firstbad - 1); puts(" is the one that breaks the batch");
+        ps("gputri:   its vertices: ("); pnum(tl_get(&tl_tbl, firstbad-1, 0)); ps(",");
+        pnum(tl_get(&tl_tbl, firstbad-1, 1)); ps(") (");
+        pnum(tl_get(&tl_tbl, firstbad-1, 2)); ps(","); pnum(tl_get(&tl_tbl, firstbad-1, 3)); ps(") (");
+        pnum(tl_get(&tl_tbl, firstbad-1, 4)); ps(","); pnum(tl_get(&tl_tbl, firstbad-1, 5)); puts(")");
+    }
+    if (firstbad < 0) { puts("gputri: ⭐ every prefix n=1..N matches -- the batch path is clean"); }
+
+    tl_render_cov(&tl_tbl, n, &tri_ref, &tl_covs, w, h, 0xFF101010);
+    ps("gputri: reference digest "); phex8(digest(&tri_ref, bytes));
+    ps("  ref drew "); pnum(tl_drawn); ps(" of "); pnum(n); puts(" triangles");
+    if (tl_drawn != n) {
+        puts("gputri: ⛔ THE REFERENCE SKIPPED TRIANGLES the kernel accepted -- the op returned 0,");
+        puts("gputri:   so the GPU drew all of them. This is a VALIDATOR disagreement (area bounds");
+        puts("gputri:   or winding), not a shader fault, and no pixel comparison below is meaningful.");
+        return 87;
+    }
+
+    var vid = syscall(86, 48 * 32);
+    if (vid < 1) { puts("gputri: no GPU here"); return 100; }
+    if (syscall(72, vid, &tl_vtx, n * 48) != 0) { syscall(74, vid); return 90; }
+
+    if (syscall(88, 0xFF101010, (h * 65536) + w, 16 * 65536 + 16) != 0) {
+        syscall(74, vid); puts("gputri: fill_rect refused"); return 90;
+    }
+
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 10);                         # op 0x0A TRI_LIST
+    store32(&d + 12, vid);
+    store32(&d + 16, (h * 65536) + w);
+    store32(&d + 20, (16 * 65536) + 16);
+    store32(&d + 24, n);
+    var rc = syscall(92, &d, 64);
+    if (rc != 0) {
+        syscall(74, vid);
+        ps("gputri: op 0x0A REJECTED, reason "); pnum((0 - rc) & 0xFF); nl();
+        return tri_report((0 - rc) & 0xFF);
+    }
+
+    var rid = syscall(86, bytes);
+    if (rid < 1) { syscall(74, vid); return 90; }
+    var qz = 0;
+    while (qz < bytes / 8) { store64(&tri_poison + qz * 8, 0xA5A5A5A5A5A5A5A5); qz = qz + 1; }
+    syscall(72, rid, &tri_poison, bytes);
+    var rb = syscall(90, rid, (h * 65536) + w, (16 * 65536) + 16);
+    if (rb != 0) { syscall(74, vid); syscall(74, rid); puts("gputri: #90 capture refused"); return 87; }
+    if (syscall(73, rid, &tri_poison, bytes) != 0) { syscall(74, vid); syscall(74, rid); return 90; }
+    syscall(74, vid); syscall(74, rid);
+
+    var worst = 0;
+    var bad = 0;
+    var pi = 0;
+    while (pi < w * h) {
+        var got = load32(&tri_poison + pi * 4) & 0xFFFFFFFF;
+        var want = load32(&tri_ref + pi * 4) & 0xFFFFFFFF;
+        if (got != want) {
+            bad = bad + 1;
+            # ⭐ Same bisect as --tri. `cov` here is the LAST triangle's mask, which is the one the
+            # batch composited on top, so a pixel where cov=0 and the two sides still differ is a
+            # disagreement inherited from an EARLIER triangle in the list, not from this one.
+            if (bad <= 4) {
+                ps("    diff @ x="); pnum(pi % w); ps(" y="); pnum(pi / w);
+                ps("  cov[last]="); pnum(load8(&tl_covs + (n - 1) * w * h + pi) & 0xFF);
+                ps("  want="); phex8(want); ps("  got="); phex8(got); nl();
+            }
+        }
+        var c2 = 0;
+        while (c2 < 3) {
+            var dg = ((got >> (c2 * 8)) & 0xFF) - ((want >> (c2 * 8)) & 0xFF);
+            if (dg < 0) { dg = 0 - dg; }
+            if (dg > worst) { worst = dg; }
+            c2 = c2 + 1;
+        }
+        pi = pi + 1;
+    }
+    syscall(84);
+    ps("gputri: gpu digest "); phex8(digest(&tri_poison, bytes));
+    ps("  differing px "); pnum(bad); ps("  worst delta "); pnum(worst); nl();
+    if (bad != 0) {
+        puts("gputri: ⛔ the batch does NOT match the reference. READ THE LOCATED DIFFS ABOVE before");
+        puts("gputri:   theorising -- twice now this line named a suspect (overlap order, then the");
+        puts("gputri:   emission) while the actual defect was in THIS TOOL's reference. Overlap");
+        puts("gputri:   order is only indicted if the diffs cluster where triangles MEET.");
+        return 85;
+    }
+    puts("gputri: ⭐ RUNG 12 -- the batch is byte-identical to the reference, overlap order included.");
+    return 95;
+}
+
+# ---- --digest: print every case's reference digest, to diff against host cpuref -------------
+fn tri_digest(): i64 {
+    if (rr_selftest() != 1) { return 86; }
+    puts("gputri: reference digests -- diff against host `./build/cpuref` line for line");
+    var ci = 1;
+    while (ci <= RR_NCASES) {
+        if (rr_case_load(ci) == 1) {
+            cov_clear(&tri_ref); raster(&tri_ref);
+            ps("  digest "); pnum(ci); ps(" "); phex8(digest(&tri_ref, W * H));
+            ps("  "); puts(rr_case_name(ci));
+        }
+        ci = ci + 1;
+    }
+    puts("gputri: ⚠ ANY difference means this build's reference is not the host's, and every");
+    puts("gputri: byte-comparison is then against the wrong answer. That is exit 85, and it is");
+    puts("gputri: the only check that catches BOTH sides being wrong TOGETHER.");
+    return 95;
+}
+
+
+# ============================================================================================
+# RUNG 10 — THE KILL GATE. `--bench`
+# ============================================================================================
+# ⛔ THIS MEASUREMENT CAN KILL RUNGS 11-12, AND THAT IS A LEGITIMATE OUTCOME. The arc's tier-1
+# justification is that GPU coverage beats CPU coverage on a real frame's workload. If the
+# crossover sits ABOVE what a real frame covers, the coverage justification is DEAD, rungs 11-12
+# do not open on it, and the arc re-bases on rung 14 (DOOM) which does not depend on this at all.
+# That is a RESULT, not a failure, and it must be reported immediately.
+#
+# ⭐ PRE-REGISTERED BEFORE THE FLASH (gpu.md rung 10, published in the tracker):
+#     unbatched crossover ~ 12,000 covered px (~110x110)
+#     batched   crossover ~ 50,000 covered px/frame (~80 glyphs)
+# Printed as a NUMBER so the prediction is falsifiable rather than decorative.
+#
+# ⚠ HOW IT IS TIMED, AND WHY THAT IS HONEST. `uptime_ms`#40 is 100 Hz — 10 ms granularity, three
+# orders of magnitude coarser than one dispatch. So each point REPEATS until at least 200 ms of
+# wall time has elapsed and divides. That measures the full ring-3 round trip (submit + fence +
+# wait), which IS the cost a compositor actually pays — not a kernel-internal timer that would
+# flatter the GPU by hiding the wait.
+#
+# ⚠ BOTH SIDES ARE TIMED THE SAME WAY, on the same boot, on the same geometry, from the same
+# source of truth. A crossover measured against a CPU path timed on a different machine or a
+# different shape would be worthless.
+# ⭐ MICROSECONDS, via uptime_us#95 — NOT uptime_ms#40.
+# ⛔ #40 reads timer_ticks, and a FOREGROUND `run` program executes with IF CLEARED, so the timer
+# never fires and #40 is FROZEN for the program's entire duration. Two iron burns were lost to
+# that before it was understood: the first fabricated a 0 us timing and divided by it, the second
+# spun waiting for a clock that could not advance. #95 is rdtsc-backed and needs no interrupts.
+var BENCH_TARGET_US = 100000;   # 100 ms of wall time before we trust the division
+var BENCH_REP_CAP   = 4000000;  # refuse past this rather than invent a number
+var bench_buf[8192];            # 65536 B = 256x256, the largest bench size
+var bench_recs[512];            # 4096 B = 64 records of 64 B -- the #92 batch ceiling
+var bench_reps = 0;             # reps the last measurement actually used (evidence, not derived)
+var bench_ms   = 0;             # wall ms the last measurement actually spent
+
+# ============================================================================================
+# ⛔⛔ THIS LOOP REFUSES. IT DOES NOT INVENT A NUMBER. THE FIRST VERSION DID, AND IT HUNG THE BOX.
+# ============================================================================================
+# The 1.56.18 burn-3 lockup was caused here. The original bailed out of the adaptive loop by
+# ASSIGNING `el = BENCH_TARGET_MS` — a fabricated value — and then divided it by a `reps` that
+# had already been quadrupled. At 32x32 that produced `200000 / 262144` = **0 us**, and the
+# caller's `(gpu * 100) / cpu` then divided by zero and took the machine down.
+#
+# ⚠ THE CLOCK WAS NEVER THE PROBLEM. `uptime_ms`#40 advances fine (cyrius-doom depends on it).
+# The fault was a measurement routine whose failure mode was to produce a plausible number
+# instead of admitting it could not measure — in the one tool whose entire job is to produce a
+# number that decides whether rungs 11-12 open.
+#
+# Rules this obeys now, and every future bench arm should:
+#   1. The returned figure comes from the SAME iteration that met the target. Never from a
+#      forced value, never from a different rep count.
+#   2. Exhausting the cap returns a NEGATIVE sentinel — a refusal the caller must handle — not
+#      a number that looks like a timing.
+#   3. `bench_reps` / `bench_ms` carry the RAW evidence so the operator sees what was measured
+#      rather than only what was derived.
+fn bench_time_cpu(): i64 {
+    var reps = 1;
+    while (reps <= BENCH_REP_CAP) {
+        var t0 = syscall(95);
+        var r = 0;
+        while (r < reps) { cov_clear(&bench_buf); raster(&bench_buf); r = r + 1; }
+        var el = syscall(95) - t0;
+        if (el >= BENCH_TARGET_US) {
+            bench_reps = reps; bench_ms = el;
+            return el / reps;
+        }
+        reps = reps * 4;
+    }
+    return 0 - 1;                                   # REFUSAL: too fast to time at this cap
+}
+
+fn bench_time_gpu(batch): i64 {
+    var reps = 1;
+    while (reps <= BENCH_REP_CAP) {
+        var t0 = syscall(95);
+        var r = 0;
+        while (r < reps) {
+            if (syscall(92, &bench_recs, batch * 64) != 0) { return 0 - 2; }   # dispatch refused
+            r = r + 1;
+        }
+        var el = syscall(95) - t0;
+        if (el >= BENCH_TARGET_US) {
+            bench_reps = reps; bench_ms = el;
+            return el / (reps * batch);
+        }
+        reps = reps * 4;
+    }
+    return 0 - 1;
+}
+
+# ⭐ CLOCK SANITY, RUN FIRST. If uptime_ms does not advance, every number below is fiction and
+# the tool must say so instead of printing zeros. Costs ~150 ms and removes an entire class of
+# silent-garbage result.
+# ⛔ BOUNDED BY ITERATIONS, NOT BY THE CLOCK IT IS TESTING. The first version spun until the
+# clock advanced, with a 200,000,000-syscall escape hatch — which is not an escape hatch. When
+# the clock genuinely could not advance it hung the machine. A guard whose exit condition is the
+# thing under test is not a guard.
+fn bench_clock_ok(): i64 {
+    var t0 = syscall(95);
+    if (t0 < 0) { return 0; }                       # #95 reports -1 when calibration was refused
+    var i = 0;
+    while (i < 2000000) {
+        if (syscall(95) - t0 > 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# One equilateral-ish triangle covering roughly half of a wxh mask, so covered_px ~ w*h/2.
+fn bench_shape(w, h): i64 {
+    edges_reset();
+    tri_add(fx(1), fx(1), fx(w - 2), fx(h / 3), fx(w / 3), fx(h - 2));
+    return n_edges;
+}
+
+# ⭐ AN n-EDGE SHAPE WITH NO NEW MATH. refraster's `rr_gon` holds 64 EXACT 16.16 vertices of a
+# regular 64-gon (precomputed, no runtime trig). Taking every (64/ne)-th vertex gives an exact
+# regular ne-gon for ne in {4,8,16,32,64} — divisors of 64 — so the edge sweep reuses geometry
+# already proven byte-exact by corpus case 20 rather than inventing shapes to measure with.
+# ⭐ 256 EXACT 16.16 VERTICES, same centre/radius/family as corpus case 20's 64-gon. Subsampling
+# by 256/ne yields an exact regular ne-gon for every divisor of 256 — so ONE shape family spans
+# the whole sweep from 4 to 256 edges.
+#
+# ⛔ THAT MATTERS FOR THE MEASUREMENT, not for tidiness. Switching shape families partway (an
+# n-gon below 64, a zigzag above it) would confound the per-edge cost with a change in covered
+# pixels and crossing pattern — and the ONE number this sweep exists to produce is us-per-edge.
+# A confounded slope is worse than no slope, because it looks like data.
+var bg[512];
+var bg_ready = 0;
+fn bench_gon_init(): i64 {
+    if (bg_ready == 1) { return 0; }
+    store64(&bg +   0 * 16,   7864320); store64(&bg +   0 * 16 + 8,   4194304);
+    store64(&bg +   1 * 16,   7863215); store64(&bg +   1 * 16 + 8,   4284371);
+    store64(&bg +   2 * 16,   7859899); store64(&bg +   2 * 16 + 8,   4374383);
+    store64(&bg +   3 * 16,   7854376); store64(&bg +   3 * 16 + 8,   4464287);
+    store64(&bg +   4 * 16,   7846648); store64(&bg +   4 * 16 + 8,   4554028);
+    store64(&bg +   5 * 16,   7836720); store64(&bg +   5 * 16 + 8,   4643553);
+    store64(&bg +   6 * 16,   7824598); store64(&bg +   6 * 16 + 8,   4732807);
+    store64(&bg +   7 * 16,   7810289); store64(&bg +   7 * 16 + 8,   4821737);
+    store64(&bg +   8 * 16,   7793802); store64(&bg +   8 * 16 + 8,   4910289);
+    store64(&bg +   9 * 16,   7775146); store64(&bg +   9 * 16 + 8,   4998409);
+    store64(&bg +  10 * 16,   7754334); store64(&bg +  10 * 16 + 8,   5086045);
+    store64(&bg +  11 * 16,   7731378); store64(&bg +  11 * 16 + 8,   5173144);
+    store64(&bg +  12 * 16,   7706290); store64(&bg +  12 * 16 + 8,   5259653);
+    store64(&bg +  13 * 16,   7679088); store64(&bg +  13 * 16 + 8,   5345521);
+    store64(&bg +  14 * 16,   7649786); store64(&bg +  14 * 16 + 8,   5430695);
+    store64(&bg +  15 * 16,   7618402); store64(&bg +  15 * 16 + 8,   5515125);
+    store64(&bg +  16 * 16,   7584957); store64(&bg +  16 * 16 + 8,   5598758);
+    store64(&bg +  17 * 16,   7549468); store64(&bg +  17 * 16 + 8,   5681546);
+    store64(&bg +  18 * 16,   7511959); store64(&bg +  18 * 16 + 8,   5763438);
+    store64(&bg +  19 * 16,   7472451); store64(&bg +  19 * 16 + 8,   5844385);
+    store64(&bg +  20 * 16,   7430969); store64(&bg +  20 * 16 + 8,   5924338);
+    store64(&bg +  21 * 16,   7387537); store64(&bg +  21 * 16 + 8,   6003248);
+    store64(&bg +  22 * 16,   7342182); store64(&bg +  22 * 16 + 8,   6081069);
+    store64(&bg +  23 * 16,   7294930); store64(&bg +  23 * 16 + 8,   6157754);
+    store64(&bg +  24 * 16,   7245811); store64(&bg +  24 * 16 + 8,   6233256);
+    store64(&bg +  25 * 16,   7194853); store64(&bg +  25 * 16 + 8,   6307529);
+    store64(&bg +  26 * 16,   7142088); store64(&bg +  26 * 16 + 8,   6380530);
+    store64(&bg +  27 * 16,   7087548); store64(&bg +  27 * 16 + 8,   6452214);
+    store64(&bg +  28 * 16,   7031265); store64(&bg +  28 * 16 + 8,   6522538);
+    store64(&bg +  29 * 16,   6973273); store64(&bg +  29 * 16 + 8,   6591459);
+    store64(&bg +  30 * 16,   6913606); store64(&bg +  30 * 16 + 8,   6658936);
+    store64(&bg +  31 * 16,   6852302); store64(&bg +  31 * 16 + 8,   6724929);
+    store64(&bg +  32 * 16,   6789397); store64(&bg +  32 * 16 + 8,   6789397);
+    store64(&bg +  33 * 16,   6724929); store64(&bg +  33 * 16 + 8,   6852302);
+    store64(&bg +  34 * 16,   6658936); store64(&bg +  34 * 16 + 8,   6913606);
+    store64(&bg +  35 * 16,   6591459); store64(&bg +  35 * 16 + 8,   6973273);
+    store64(&bg +  36 * 16,   6522538); store64(&bg +  36 * 16 + 8,   7031265);
+    store64(&bg +  37 * 16,   6452214); store64(&bg +  37 * 16 + 8,   7087548);
+    store64(&bg +  38 * 16,   6380530); store64(&bg +  38 * 16 + 8,   7142088);
+    store64(&bg +  39 * 16,   6307529); store64(&bg +  39 * 16 + 8,   7194853);
+    store64(&bg +  40 * 16,   6233256); store64(&bg +  40 * 16 + 8,   7245811);
+    store64(&bg +  41 * 16,   6157754); store64(&bg +  41 * 16 + 8,   7294930);
+    store64(&bg +  42 * 16,   6081069); store64(&bg +  42 * 16 + 8,   7342182);
+    store64(&bg +  43 * 16,   6003248); store64(&bg +  43 * 16 + 8,   7387537);
+    store64(&bg +  44 * 16,   5924338); store64(&bg +  44 * 16 + 8,   7430969);
+    store64(&bg +  45 * 16,   5844385); store64(&bg +  45 * 16 + 8,   7472451);
+    store64(&bg +  46 * 16,   5763438); store64(&bg +  46 * 16 + 8,   7511959);
+    store64(&bg +  47 * 16,   5681546); store64(&bg +  47 * 16 + 8,   7549468);
+    store64(&bg +  48 * 16,   5598758); store64(&bg +  48 * 16 + 8,   7584957);
+    store64(&bg +  49 * 16,   5515125); store64(&bg +  49 * 16 + 8,   7618402);
+    store64(&bg +  50 * 16,   5430695); store64(&bg +  50 * 16 + 8,   7649786);
+    store64(&bg +  51 * 16,   5345521); store64(&bg +  51 * 16 + 8,   7679088);
+    store64(&bg +  52 * 16,   5259653); store64(&bg +  52 * 16 + 8,   7706290);
+    store64(&bg +  53 * 16,   5173144); store64(&bg +  53 * 16 + 8,   7731378);
+    store64(&bg +  54 * 16,   5086045); store64(&bg +  54 * 16 + 8,   7754334);
+    store64(&bg +  55 * 16,   4998409); store64(&bg +  55 * 16 + 8,   7775146);
+    store64(&bg +  56 * 16,   4910289); store64(&bg +  56 * 16 + 8,   7793802);
+    store64(&bg +  57 * 16,   4821737); store64(&bg +  57 * 16 + 8,   7810289);
+    store64(&bg +  58 * 16,   4732807); store64(&bg +  58 * 16 + 8,   7824598);
+    store64(&bg +  59 * 16,   4643553); store64(&bg +  59 * 16 + 8,   7836720);
+    store64(&bg +  60 * 16,   4554028); store64(&bg +  60 * 16 + 8,   7846648);
+    store64(&bg +  61 * 16,   4464287); store64(&bg +  61 * 16 + 8,   7854376);
+    store64(&bg +  62 * 16,   4374383); store64(&bg +  62 * 16 + 8,   7859899);
+    store64(&bg +  63 * 16,   4284371); store64(&bg +  63 * 16 + 8,   7863215);
+    store64(&bg +  64 * 16,   4194304); store64(&bg +  64 * 16 + 8,   7864320);
+    store64(&bg +  65 * 16,   4104237); store64(&bg +  65 * 16 + 8,   7863215);
+    store64(&bg +  66 * 16,   4014225); store64(&bg +  66 * 16 + 8,   7859899);
+    store64(&bg +  67 * 16,   3924321); store64(&bg +  67 * 16 + 8,   7854376);
+    store64(&bg +  68 * 16,   3834580); store64(&bg +  68 * 16 + 8,   7846648);
+    store64(&bg +  69 * 16,   3745055); store64(&bg +  69 * 16 + 8,   7836720);
+    store64(&bg +  70 * 16,   3655801); store64(&bg +  70 * 16 + 8,   7824598);
+    store64(&bg +  71 * 16,   3566871); store64(&bg +  71 * 16 + 8,   7810289);
+    store64(&bg +  72 * 16,   3478319); store64(&bg +  72 * 16 + 8,   7793802);
+    store64(&bg +  73 * 16,   3390199); store64(&bg +  73 * 16 + 8,   7775146);
+    store64(&bg +  74 * 16,   3302563); store64(&bg +  74 * 16 + 8,   7754334);
+    store64(&bg +  75 * 16,   3215464); store64(&bg +  75 * 16 + 8,   7731378);
+    store64(&bg +  76 * 16,   3128955); store64(&bg +  76 * 16 + 8,   7706290);
+    store64(&bg +  77 * 16,   3043087); store64(&bg +  77 * 16 + 8,   7679088);
+    store64(&bg +  78 * 16,   2957913); store64(&bg +  78 * 16 + 8,   7649786);
+    store64(&bg +  79 * 16,   2873483); store64(&bg +  79 * 16 + 8,   7618402);
+    store64(&bg +  80 * 16,   2789850); store64(&bg +  80 * 16 + 8,   7584957);
+    store64(&bg +  81 * 16,   2707062); store64(&bg +  81 * 16 + 8,   7549468);
+    store64(&bg +  82 * 16,   2625170); store64(&bg +  82 * 16 + 8,   7511959);
+    store64(&bg +  83 * 16,   2544223); store64(&bg +  83 * 16 + 8,   7472451);
+    store64(&bg +  84 * 16,   2464270); store64(&bg +  84 * 16 + 8,   7430969);
+    store64(&bg +  85 * 16,   2385360); store64(&bg +  85 * 16 + 8,   7387537);
+    store64(&bg +  86 * 16,   2307539); store64(&bg +  86 * 16 + 8,   7342182);
+    store64(&bg +  87 * 16,   2230854); store64(&bg +  87 * 16 + 8,   7294930);
+    store64(&bg +  88 * 16,   2155352); store64(&bg +  88 * 16 + 8,   7245811);
+    store64(&bg +  89 * 16,   2081079); store64(&bg +  89 * 16 + 8,   7194853);
+    store64(&bg +  90 * 16,   2008078); store64(&bg +  90 * 16 + 8,   7142088);
+    store64(&bg +  91 * 16,   1936394); store64(&bg +  91 * 16 + 8,   7087548);
+    store64(&bg +  92 * 16,   1866070); store64(&bg +  92 * 16 + 8,   7031265);
+    store64(&bg +  93 * 16,   1797149); store64(&bg +  93 * 16 + 8,   6973273);
+    store64(&bg +  94 * 16,   1729672); store64(&bg +  94 * 16 + 8,   6913606);
+    store64(&bg +  95 * 16,   1663679); store64(&bg +  95 * 16 + 8,   6852302);
+    store64(&bg +  96 * 16,   1599211); store64(&bg +  96 * 16 + 8,   6789397);
+    store64(&bg +  97 * 16,   1536306); store64(&bg +  97 * 16 + 8,   6724929);
+    store64(&bg +  98 * 16,   1475002); store64(&bg +  98 * 16 + 8,   6658936);
+    store64(&bg +  99 * 16,   1415335); store64(&bg +  99 * 16 + 8,   6591459);
+    store64(&bg + 100 * 16,   1357343); store64(&bg + 100 * 16 + 8,   6522538);
+    store64(&bg + 101 * 16,   1301060); store64(&bg + 101 * 16 + 8,   6452214);
+    store64(&bg + 102 * 16,   1246520); store64(&bg + 102 * 16 + 8,   6380530);
+    store64(&bg + 103 * 16,   1193755); store64(&bg + 103 * 16 + 8,   6307529);
+    store64(&bg + 104 * 16,   1142797); store64(&bg + 104 * 16 + 8,   6233256);
+    store64(&bg + 105 * 16,   1093678); store64(&bg + 105 * 16 + 8,   6157754);
+    store64(&bg + 106 * 16,   1046426); store64(&bg + 106 * 16 + 8,   6081069);
+    store64(&bg + 107 * 16,   1001071); store64(&bg + 107 * 16 + 8,   6003248);
+    store64(&bg + 108 * 16,    957639); store64(&bg + 108 * 16 + 8,   5924338);
+    store64(&bg + 109 * 16,    916157); store64(&bg + 109 * 16 + 8,   5844385);
+    store64(&bg + 110 * 16,    876649); store64(&bg + 110 * 16 + 8,   5763438);
+    store64(&bg + 111 * 16,    839140); store64(&bg + 111 * 16 + 8,   5681546);
+    store64(&bg + 112 * 16,    803651); store64(&bg + 112 * 16 + 8,   5598758);
+    store64(&bg + 113 * 16,    770206); store64(&bg + 113 * 16 + 8,   5515125);
+    store64(&bg + 114 * 16,    738822); store64(&bg + 114 * 16 + 8,   5430695);
+    store64(&bg + 115 * 16,    709520); store64(&bg + 115 * 16 + 8,   5345521);
+    store64(&bg + 116 * 16,    682318); store64(&bg + 116 * 16 + 8,   5259653);
+    store64(&bg + 117 * 16,    657230); store64(&bg + 117 * 16 + 8,   5173144);
+    store64(&bg + 118 * 16,    634274); store64(&bg + 118 * 16 + 8,   5086045);
+    store64(&bg + 119 * 16,    613462); store64(&bg + 119 * 16 + 8,   4998409);
+    store64(&bg + 120 * 16,    594806); store64(&bg + 120 * 16 + 8,   4910289);
+    store64(&bg + 121 * 16,    578319); store64(&bg + 121 * 16 + 8,   4821737);
+    store64(&bg + 122 * 16,    564010); store64(&bg + 122 * 16 + 8,   4732807);
+    store64(&bg + 123 * 16,    551888); store64(&bg + 123 * 16 + 8,   4643553);
+    store64(&bg + 124 * 16,    541960); store64(&bg + 124 * 16 + 8,   4554028);
+    store64(&bg + 125 * 16,    534232); store64(&bg + 125 * 16 + 8,   4464287);
+    store64(&bg + 126 * 16,    528709); store64(&bg + 126 * 16 + 8,   4374383);
+    store64(&bg + 127 * 16,    525393); store64(&bg + 127 * 16 + 8,   4284371);
+    store64(&bg + 128 * 16,    524288); store64(&bg + 128 * 16 + 8,   4194304);
+    store64(&bg + 129 * 16,    525393); store64(&bg + 129 * 16 + 8,   4104237);
+    store64(&bg + 130 * 16,    528709); store64(&bg + 130 * 16 + 8,   4014225);
+    store64(&bg + 131 * 16,    534232); store64(&bg + 131 * 16 + 8,   3924321);
+    store64(&bg + 132 * 16,    541960); store64(&bg + 132 * 16 + 8,   3834580);
+    store64(&bg + 133 * 16,    551888); store64(&bg + 133 * 16 + 8,   3745055);
+    store64(&bg + 134 * 16,    564010); store64(&bg + 134 * 16 + 8,   3655801);
+    store64(&bg + 135 * 16,    578319); store64(&bg + 135 * 16 + 8,   3566871);
+    store64(&bg + 136 * 16,    594806); store64(&bg + 136 * 16 + 8,   3478319);
+    store64(&bg + 137 * 16,    613462); store64(&bg + 137 * 16 + 8,   3390199);
+    store64(&bg + 138 * 16,    634274); store64(&bg + 138 * 16 + 8,   3302563);
+    store64(&bg + 139 * 16,    657230); store64(&bg + 139 * 16 + 8,   3215464);
+    store64(&bg + 140 * 16,    682318); store64(&bg + 140 * 16 + 8,   3128955);
+    store64(&bg + 141 * 16,    709520); store64(&bg + 141 * 16 + 8,   3043087);
+    store64(&bg + 142 * 16,    738822); store64(&bg + 142 * 16 + 8,   2957913);
+    store64(&bg + 143 * 16,    770206); store64(&bg + 143 * 16 + 8,   2873483);
+    store64(&bg + 144 * 16,    803651); store64(&bg + 144 * 16 + 8,   2789850);
+    store64(&bg + 145 * 16,    839140); store64(&bg + 145 * 16 + 8,   2707062);
+    store64(&bg + 146 * 16,    876649); store64(&bg + 146 * 16 + 8,   2625170);
+    store64(&bg + 147 * 16,    916157); store64(&bg + 147 * 16 + 8,   2544223);
+    store64(&bg + 148 * 16,    957639); store64(&bg + 148 * 16 + 8,   2464270);
+    store64(&bg + 149 * 16,   1001071); store64(&bg + 149 * 16 + 8,   2385360);
+    store64(&bg + 150 * 16,   1046426); store64(&bg + 150 * 16 + 8,   2307539);
+    store64(&bg + 151 * 16,   1093678); store64(&bg + 151 * 16 + 8,   2230854);
+    store64(&bg + 152 * 16,   1142797); store64(&bg + 152 * 16 + 8,   2155352);
+    store64(&bg + 153 * 16,   1193755); store64(&bg + 153 * 16 + 8,   2081079);
+    store64(&bg + 154 * 16,   1246520); store64(&bg + 154 * 16 + 8,   2008078);
+    store64(&bg + 155 * 16,   1301060); store64(&bg + 155 * 16 + 8,   1936394);
+    store64(&bg + 156 * 16,   1357343); store64(&bg + 156 * 16 + 8,   1866070);
+    store64(&bg + 157 * 16,   1415335); store64(&bg + 157 * 16 + 8,   1797149);
+    store64(&bg + 158 * 16,   1475002); store64(&bg + 158 * 16 + 8,   1729672);
+    store64(&bg + 159 * 16,   1536306); store64(&bg + 159 * 16 + 8,   1663679);
+    store64(&bg + 160 * 16,   1599211); store64(&bg + 160 * 16 + 8,   1599211);
+    store64(&bg + 161 * 16,   1663679); store64(&bg + 161 * 16 + 8,   1536306);
+    store64(&bg + 162 * 16,   1729672); store64(&bg + 162 * 16 + 8,   1475002);
+    store64(&bg + 163 * 16,   1797149); store64(&bg + 163 * 16 + 8,   1415335);
+    store64(&bg + 164 * 16,   1866070); store64(&bg + 164 * 16 + 8,   1357343);
+    store64(&bg + 165 * 16,   1936394); store64(&bg + 165 * 16 + 8,   1301060);
+    store64(&bg + 166 * 16,   2008078); store64(&bg + 166 * 16 + 8,   1246520);
+    store64(&bg + 167 * 16,   2081079); store64(&bg + 167 * 16 + 8,   1193755);
+    store64(&bg + 168 * 16,   2155352); store64(&bg + 168 * 16 + 8,   1142797);
+    store64(&bg + 169 * 16,   2230854); store64(&bg + 169 * 16 + 8,   1093678);
+    store64(&bg + 170 * 16,   2307539); store64(&bg + 170 * 16 + 8,   1046426);
+    store64(&bg + 171 * 16,   2385360); store64(&bg + 171 * 16 + 8,   1001071);
+    store64(&bg + 172 * 16,   2464270); store64(&bg + 172 * 16 + 8,    957639);
+    store64(&bg + 173 * 16,   2544223); store64(&bg + 173 * 16 + 8,    916157);
+    store64(&bg + 174 * 16,   2625170); store64(&bg + 174 * 16 + 8,    876649);
+    store64(&bg + 175 * 16,   2707062); store64(&bg + 175 * 16 + 8,    839140);
+    store64(&bg + 176 * 16,   2789850); store64(&bg + 176 * 16 + 8,    803651);
+    store64(&bg + 177 * 16,   2873483); store64(&bg + 177 * 16 + 8,    770206);
+    store64(&bg + 178 * 16,   2957913); store64(&bg + 178 * 16 + 8,    738822);
+    store64(&bg + 179 * 16,   3043087); store64(&bg + 179 * 16 + 8,    709520);
+    store64(&bg + 180 * 16,   3128955); store64(&bg + 180 * 16 + 8,    682318);
+    store64(&bg + 181 * 16,   3215464); store64(&bg + 181 * 16 + 8,    657230);
+    store64(&bg + 182 * 16,   3302563); store64(&bg + 182 * 16 + 8,    634274);
+    store64(&bg + 183 * 16,   3390199); store64(&bg + 183 * 16 + 8,    613462);
+    store64(&bg + 184 * 16,   3478319); store64(&bg + 184 * 16 + 8,    594806);
+    store64(&bg + 185 * 16,   3566871); store64(&bg + 185 * 16 + 8,    578319);
+    store64(&bg + 186 * 16,   3655801); store64(&bg + 186 * 16 + 8,    564010);
+    store64(&bg + 187 * 16,   3745055); store64(&bg + 187 * 16 + 8,    551888);
+    store64(&bg + 188 * 16,   3834580); store64(&bg + 188 * 16 + 8,    541960);
+    store64(&bg + 189 * 16,   3924321); store64(&bg + 189 * 16 + 8,    534232);
+    store64(&bg + 190 * 16,   4014225); store64(&bg + 190 * 16 + 8,    528709);
+    store64(&bg + 191 * 16,   4104237); store64(&bg + 191 * 16 + 8,    525393);
+    store64(&bg + 192 * 16,   4194304); store64(&bg + 192 * 16 + 8,    524288);
+    store64(&bg + 193 * 16,   4284371); store64(&bg + 193 * 16 + 8,    525393);
+    store64(&bg + 194 * 16,   4374383); store64(&bg + 194 * 16 + 8,    528709);
+    store64(&bg + 195 * 16,   4464287); store64(&bg + 195 * 16 + 8,    534232);
+    store64(&bg + 196 * 16,   4554028); store64(&bg + 196 * 16 + 8,    541960);
+    store64(&bg + 197 * 16,   4643553); store64(&bg + 197 * 16 + 8,    551888);
+    store64(&bg + 198 * 16,   4732807); store64(&bg + 198 * 16 + 8,    564010);
+    store64(&bg + 199 * 16,   4821737); store64(&bg + 199 * 16 + 8,    578319);
+    store64(&bg + 200 * 16,   4910289); store64(&bg + 200 * 16 + 8,    594806);
+    store64(&bg + 201 * 16,   4998409); store64(&bg + 201 * 16 + 8,    613462);
+    store64(&bg + 202 * 16,   5086045); store64(&bg + 202 * 16 + 8,    634274);
+    store64(&bg + 203 * 16,   5173144); store64(&bg + 203 * 16 + 8,    657230);
+    store64(&bg + 204 * 16,   5259653); store64(&bg + 204 * 16 + 8,    682318);
+    store64(&bg + 205 * 16,   5345521); store64(&bg + 205 * 16 + 8,    709520);
+    store64(&bg + 206 * 16,   5430695); store64(&bg + 206 * 16 + 8,    738822);
+    store64(&bg + 207 * 16,   5515125); store64(&bg + 207 * 16 + 8,    770206);
+    store64(&bg + 208 * 16,   5598758); store64(&bg + 208 * 16 + 8,    803651);
+    store64(&bg + 209 * 16,   5681546); store64(&bg + 209 * 16 + 8,    839140);
+    store64(&bg + 210 * 16,   5763438); store64(&bg + 210 * 16 + 8,    876649);
+    store64(&bg + 211 * 16,   5844385); store64(&bg + 211 * 16 + 8,    916157);
+    store64(&bg + 212 * 16,   5924338); store64(&bg + 212 * 16 + 8,    957639);
+    store64(&bg + 213 * 16,   6003248); store64(&bg + 213 * 16 + 8,   1001071);
+    store64(&bg + 214 * 16,   6081069); store64(&bg + 214 * 16 + 8,   1046426);
+    store64(&bg + 215 * 16,   6157754); store64(&bg + 215 * 16 + 8,   1093678);
+    store64(&bg + 216 * 16,   6233256); store64(&bg + 216 * 16 + 8,   1142797);
+    store64(&bg + 217 * 16,   6307529); store64(&bg + 217 * 16 + 8,   1193755);
+    store64(&bg + 218 * 16,   6380530); store64(&bg + 218 * 16 + 8,   1246520);
+    store64(&bg + 219 * 16,   6452214); store64(&bg + 219 * 16 + 8,   1301060);
+    store64(&bg + 220 * 16,   6522538); store64(&bg + 220 * 16 + 8,   1357343);
+    store64(&bg + 221 * 16,   6591459); store64(&bg + 221 * 16 + 8,   1415335);
+    store64(&bg + 222 * 16,   6658936); store64(&bg + 222 * 16 + 8,   1475002);
+    store64(&bg + 223 * 16,   6724929); store64(&bg + 223 * 16 + 8,   1536306);
+    store64(&bg + 224 * 16,   6789397); store64(&bg + 224 * 16 + 8,   1599211);
+    store64(&bg + 225 * 16,   6852302); store64(&bg + 225 * 16 + 8,   1663679);
+    store64(&bg + 226 * 16,   6913606); store64(&bg + 226 * 16 + 8,   1729672);
+    store64(&bg + 227 * 16,   6973273); store64(&bg + 227 * 16 + 8,   1797149);
+    store64(&bg + 228 * 16,   7031265); store64(&bg + 228 * 16 + 8,   1866070);
+    store64(&bg + 229 * 16,   7087548); store64(&bg + 229 * 16 + 8,   1936394);
+    store64(&bg + 230 * 16,   7142088); store64(&bg + 230 * 16 + 8,   2008078);
+    store64(&bg + 231 * 16,   7194853); store64(&bg + 231 * 16 + 8,   2081079);
+    store64(&bg + 232 * 16,   7245811); store64(&bg + 232 * 16 + 8,   2155352);
+    store64(&bg + 233 * 16,   7294930); store64(&bg + 233 * 16 + 8,   2230854);
+    store64(&bg + 234 * 16,   7342182); store64(&bg + 234 * 16 + 8,   2307539);
+    store64(&bg + 235 * 16,   7387537); store64(&bg + 235 * 16 + 8,   2385360);
+    store64(&bg + 236 * 16,   7430969); store64(&bg + 236 * 16 + 8,   2464270);
+    store64(&bg + 237 * 16,   7472451); store64(&bg + 237 * 16 + 8,   2544223);
+    store64(&bg + 238 * 16,   7511959); store64(&bg + 238 * 16 + 8,   2625170);
+    store64(&bg + 239 * 16,   7549468); store64(&bg + 239 * 16 + 8,   2707062);
+    store64(&bg + 240 * 16,   7584957); store64(&bg + 240 * 16 + 8,   2789850);
+    store64(&bg + 241 * 16,   7618402); store64(&bg + 241 * 16 + 8,   2873483);
+    store64(&bg + 242 * 16,   7649786); store64(&bg + 242 * 16 + 8,   2957913);
+    store64(&bg + 243 * 16,   7679088); store64(&bg + 243 * 16 + 8,   3043087);
+    store64(&bg + 244 * 16,   7706290); store64(&bg + 244 * 16 + 8,   3128955);
+    store64(&bg + 245 * 16,   7731378); store64(&bg + 245 * 16 + 8,   3215464);
+    store64(&bg + 246 * 16,   7754334); store64(&bg + 246 * 16 + 8,   3302563);
+    store64(&bg + 247 * 16,   7775146); store64(&bg + 247 * 16 + 8,   3390199);
+    store64(&bg + 248 * 16,   7793802); store64(&bg + 248 * 16 + 8,   3478319);
+    store64(&bg + 249 * 16,   7810289); store64(&bg + 249 * 16 + 8,   3566871);
+    store64(&bg + 250 * 16,   7824598); store64(&bg + 250 * 16 + 8,   3655801);
+    store64(&bg + 251 * 16,   7836720); store64(&bg + 251 * 16 + 8,   3745055);
+    store64(&bg + 252 * 16,   7846648); store64(&bg + 252 * 16 + 8,   3834580);
+    store64(&bg + 253 * 16,   7854376); store64(&bg + 253 * 16 + 8,   3924321);
+    store64(&bg + 254 * 16,   7859899); store64(&bg + 254 * 16 + 8,   4014225);
+    store64(&bg + 255 * 16,   7863215); store64(&bg + 255 * 16 + 8,   4104237);
+    bg_ready = 1;
+    return 0;
+}
+fn bench_ngon(ne): i64 {
+    bench_gon_init();
+    edges_reset();
+    var step = 256 / ne;
+    var k = 0;
+    while (k < ne) {
+        var ga = (k * step) % 256;
+        var gb = ((k + 1) * step) % 256;
+        edge_add(load64(&bg + ga * 16), load64(&bg + ga * 16 + 8),
+                 load64(&bg + gb * 16), load64(&bg + gb * 16 + 8));
+        k = k + 1;
+    }
+    return n_edges;
+}
+
+fn bench_covered(): i64 {
+    cov_clear(&bench_buf); raster(&bench_buf);
+    var lit = 0; var i = 0;
+    while (i < W * H) { if ((load8(&bench_buf + i) & 0xFF) != 0) { lit = lit + 1; } i = i + 1; }
+    return lit;
+}
+
+var bench_cross1 = 0;
+var bench_cross16 = 0;
+var bench_refusals = 0;
+
+# ⭐ THE CPU HALF RUNS WITHOUT A GPU, ON PURPOSE. It exercises the adaptive loop, the refusal
+# path and every division guard in QEMU at zero burns — which is exactly what was NOT testable
+# when the first version hung real hardware.
+fn bench_cpu_only(): i64 {
+    puts("[cpu-only] the timing harness itself -- runs with no GPU, so it is QEMU-testable");
+    # ⛔⛔ 48, NOT 6. FUNCTION-LOCAL `var X[N]` IS N **BYTES** IN CYRIUS — module-scope is N x u64.
+    # This was `var sizes[8]` holding six u64s at offsets 0..40: **48 bytes written into 8**, a
+    # 40-byte smash straight over the saved registers and return address. It is what turned a
+    # clean `return 95` into `run: exit 142` on the rung-10 burn — the numbers printed fine
+    # because the corruption only bit on the way OUT.
+    # [[cyrius-var-array-u64-units]] — and scripts/check/check-array-sizing.sh now gates the class.
+    var sizes[48];
+    store64(&sizes + 0, 32);  store64(&sizes + 8, 64);   store64(&sizes + 16, 96);
+    store64(&sizes + 24, 128); store64(&sizes + 32, 192); store64(&sizes + 40, 256);
+    var i = 0;
+    while (i < 6) {
+        var n = load64(&sizes + i * 8);
+        if (rr_set_dims(n, n) != 1) { puts("  ** dims refused"); return 0; }
+        bench_shape(n, n);
+        var cov = bench_covered();
+        var c = bench_time_cpu();
+        ps("  "); pnum(n); ps("x"); pnum(n); ps("  covered "); pnum(cov); ps("  cpu ");
+        if (c < 0) {
+            ps("REFUSED (too fast to time in "); pnum(BENCH_REP_CAP); puts(" reps)");
+            bench_refusals = bench_refusals + 1;
+        }
+        if (c >= 0) {
+            pnum(c); ps("us   [evidence: "); pnum(bench_ms); ps(" us over ");
+            pnum(bench_reps); puts(" reps]");
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn bench_point(w, h, batch): i64 {
+    if (rr_set_dims(w, h) != 1) { puts("  ** dims refused"); return 0; }
+    var ne = bench_shape(w, h);
+    var cov = bench_covered();
+    var eid = syscall(86, 64 * 16);
+    if (eid < 1) { return 0 - 1; }
+    var did = syscall(86, w * h);
+    if (did < 1) { syscall(74, eid); return 0 - 1; }
+    tri_pack_edges();
+    syscall(72, eid, &tri_edges, ne * 16);
+
+    var z = 0;
+    while (z < 512) { store64(&bench_recs + z * 8, 0); z = z + 1; }
+    var b = 0;
+    while (b < batch) {
+        var d = &bench_recs + b * 64;
+        store32(d +  0, 8);
+        store32(d +  8, did);
+        store32(d + 12, eid);
+        store32(d + 16, (h * 65536) + w);
+        store32(d + 36, ne);
+        b = b + 1;
+    }
+    if (syscall(92, &bench_recs, batch * 64) != 0) {     # warm-up, outside the sample
+        syscall(74, eid); syscall(74, did);
+        puts("  ** GPU dispatch refused"); return 0 - 1;
+    }
+    var g = bench_time_gpu(batch);
+    var g_reps = bench_reps; var g_ms = bench_ms;
+    syscall(74, eid); syscall(74, did);
+    var c = bench_time_cpu();
+
+    ps("  "); pnum(w); ps("x"); pnum(h); ps("  batch "); pnum(batch);
+    ps("  covered "); pnum(cov); ps("  cpu ");
+    if (c < 0) { ps("REFUSED"); }
+    if (c >= 0) { pnum(c); ps("us"); }
+    ps("  gpu ");
+    if (g < 0) { ps("REFUSED"); }
+    if (g >= 0) { pnum(g); ps("us"); }
+    ps("   [gpu "); pnum(g_ms); ps("us/"); pnum(g_reps); ps("reps]  ");
+    # ⛔ EVERY division guarded. A zero here is what took the machine down at burn 3.
+    if (c < 0)  { puts("NO VERDICT -- cpu timing refused"); bench_refusals = bench_refusals + 1; return cov; }
+    if (g < 0)  { puts("NO VERDICT -- gpu timing refused"); bench_refusals = bench_refusals + 1; return cov; }
+    if (c == 0) { puts("NO VERDICT -- cpu measured 0 us"); bench_refusals = bench_refusals + 1; return cov; }
+    if (g == 0) { puts("NO VERDICT -- gpu measured 0 us"); bench_refusals = bench_refusals + 1; return cov; }
+    if (g < c) {
+        ps("GPU wins ("); pnum((c * 100) / g); puts("% speedup factor x100)");
+        if (batch == 1) { if (bench_cross1 == 0)  { bench_cross1 = cov; } }
+        if (batch != 1) { if (bench_cross16 == 0) { bench_cross16 = cov; } }
+    }
+    if (g >= c) { ps("CPU wins (gpu is "); pnum((g * 100) / c); puts("% of cpu time)"); }
+    return cov;
+}
+
+fn tri_bench(): i64 {
+    puts("gputri: RUNG 10 -- THE KILL GATE. GPU vs CPU coverage cost.");
+    puts("");
+    puts("PRE-REGISTERED (gpu.md, published before the flash):");
+    puts("  unbatched crossover ~ 12000 covered px   batched ~ 50000 covered px/frame");
+    puts("⚠ timed via uptime_us#95 (rdtsc); each point repeats to >= 100 ms and divides.");
+    puts("  BOTH sides measured the same way, same boot, same geometry, same edge list.");
+    puts("⛔ This tool REFUSES rather than inventing a figure it could not measure.");
+    puts("");
+    if (bench_clock_ok() != 1) {
+        puts("gputri: ⛔ uptime_us#95 DID NOT ADVANCE. Every timing would be fiction.");
+        puts("gputri: refusing to print numbers. (exit 86)");
+        return 86;
+    }
+    puts("[clock] uptime_us#95 advances -- timings are meaningful");
+    bench_cross1 = 0; bench_cross16 = 0; bench_refusals = 0;
+
+    bench_cpu_only();
+    puts("");
+    puts("[unbatched] one #92 record per call -- one fence per mask");
+    if (bench_point(32, 32, 1) < 0) {
+        puts("gputri: no GPU carveout -- the CPU half above still validated the harness. (exit 100)");
+        return 100;
+    }
+    bench_point(64,  64,  1);
+    bench_point(96,  96,  1);
+    bench_point(128, 128, 1);
+    bench_point(192, 192, 1);
+    bench_point(256, 256, 1);
+    puts("");
+    puts("[batched 16] sixteen records per call -- ONE fence amortised over sixteen masks");
+    bench_point(32,  32,  16);
+    bench_point(64,  64,  16);
+    bench_point(96,  96,  16);
+    bench_point(128, 128, 16);
+    bench_point(192, 192, 16);
+    bench_point(256, 256, 16);
+    puts("");
+
+    # ============================================================================================
+    # EDGE SWEEP — the points EDGE_CAP must move on, and which burn 5 did not have
+    # ============================================================================================
+    # ⛔ Burn 5 varied MASK SIZE at a fixed 3-edge triangle, so it produced ZERO edge-count
+    # scaling data. Raising EDGE_CAP from it would be raising the cap on the arithmetic model the
+    # cap is explicitly forbidden to move on.
+    #
+    # Fixed 128x128, ne = 4/8/16/32/64 — isolating the edge term, all INSIDE the shipped cap.
+    # ⭐ THE NUMBER THAT MATTERS is us-per-edge: flat => cost is linear in E and extrapolating to
+    # 128/256 is trustworthy; curved => it is not, and those points must be measured directly.
+    puts("[edge sweep] 128x128 fixed, n_edges varied -- the term burn 5 never measured");
+    # ⚠ 4..256. Points above 64 are REJECTED by a shipped kernel (GPU_EDGE_CAP=64) and reported
+    # as such — they only produce numbers on an EDGE_CAP_PROBE build, which is the whole reason
+    # that build exists. A shipped kernel still yields the 4..64 slope for free.
+    var es[64];
+    store64(&es + 0, 4); store64(&es + 8, 8); store64(&es + 16, 16);
+    store64(&es + 24, 32); store64(&es + 32, 64);
+    store64(&es + 40, 128); store64(&es + 48, 256);
+    var ei2 = 0;
+    while (ei2 < 7) {
+        var ne2 = load64(&es + ei2 * 8);
+        if (rr_set_dims(128, 128) == 1) {
+            bench_ngon(ne2);
+            var cov2 = bench_covered();
+            var eid2 = syscall(86, 256 * 16);
+            var did2 = syscall(86, 128 * 128);
+            if (eid2 >= 1) {
+                if (did2 >= 1) {
+                    tri_pack_edges();
+                    syscall(72, eid2, &tri_edges, n_edges * 16);
+                    var z2 = 0;
+                    while (z2 < 512) { store64(&bench_recs + z2 * 8, 0); z2 = z2 + 1; }
+                    store32(&bench_recs +  0, 8);
+                    store32(&bench_recs +  8, did2);
+                    store32(&bench_recs + 12, eid2);
+                    store32(&bench_recs + 16, (128 * 65536) + 128);
+                    store32(&bench_recs + 36, n_edges);
+                    if (syscall(92, &bench_recs, 64) == 0) {
+                        var g2 = bench_time_gpu(1);
+                        ps("  ne "); pnum(n_edges); ps("  covered "); pnum(cov2); ps("  gpu ");
+                        if (g2 < 0) { puts("REFUSED -- too fast to time"); }
+                        if (g2 >= 0) {
+                            pnum(g2); ps("us");
+                            var marg = g2 - 28;
+                            if (marg < 0) { marg = 0; }
+                            ps("   ("); pnum((marg * 100) / n_edges); puts(" x0.01us per edge)");
+                        }
+                    }
+                    if (syscall(92, &bench_recs, 64) != 0) {
+                        ps("  ne "); pnum(n_edges);
+                        puts("  REJECTED by the kernel -- above GPU_EDGE_CAP (expected on a shipped build)");
+                    }
+                    syscall(74, did2);
+                }
+                syscall(74, eid2);
+            }
+        }
+        ei2 = ei2 + 1;
+    }
+    puts("");
+    ps("MEASURED unbatched crossover: ");
+    if (bench_cross1 == 0)  { puts("NONE at any size measured"); }
+    if (bench_cross1 != 0)  { pnum(bench_cross1); puts(" covered px"); }
+    ps("MEASURED batched-16 crossover: ");
+    if (bench_cross16 == 0) { puts("NONE at any size measured"); }
+    if (bench_cross16 != 0) { pnum(bench_cross16); puts(" covered px"); }
+    puts("");
+    if (bench_refusals != 0) {
+        ps("⚠ "); pnum(bench_refusals); puts(" point(s) gave NO VERDICT -- read them above.");
+        puts("  A crossover derived from a partial sweep is not the pre-registered number.");
+    }
+    puts("⛔ READ THE PRE-REGISTERED OUTCOME TABLE IN THE TRACKER BEFORE INTERPRETING THIS.");
+    puts("   A crossover ABOVE a real frame's coverage KILLS the tier-1 coverage justification");
+    puts("   for rungs 11-12. That is a RESULT, not a failure, and is reported immediately.");
+    puts("");
+    puts("⚠ STILL NOT MEASURED: n_edges ABOVE the shipped EDGE_CAP of 64. The sweep covers");
+    puts("   4..64 only. If us-per-edge is FLAT across it, cost is linear in E and extrapolating");
+    puts("   to 128/256 holds; a kernel built EDGE_CAP_PROBE=1 measures those points directly.");
+    puts("   ⛔ The cap moves on THOSE numbers, never on an extrapolation.");
+    puts("   Raising the cap needs those points and is a separate bite -- the cap must move on");
+    puts("   MEASUREMENT, never on the arithmetic model that set it.");
+    return 95;
+}
+
+fn main(): i64 {
+    args_init();
+    if (argc() >= 2) {
+        var a = argv(1);
+        if (streq(a, "--cov") == 1) {
+            puts("gputri: RUNG 9b -- edge array -> 8bpp coverage mask via #92 op 0x08");
+            return tri_cov();
+        }
+        if (streq(a, "--tri") == 1) {
+            puts("gputri: RUNG 11 -- barycentric RGBA via #92 op 0x09");
+            return tri_attr();
+        }
+        if (streq(a, "--list") == 1) { return tri_list(); }
+        if (streq(a, "--digest") == 1) { return tri_digest(); }
+        if (streq(a, "--bench") == 1) { return tri_bench(); }
+        # An unknown argument is an ERROR, never a default action -- the typo that cost the M9
+        # arc a flash on 2026-07-24 is exactly this failure mode.
+        puts("gputri: UNKNOWN ARGUMENT -- nothing was done.");
+        puts("gputri: --cov --tri --list --digest --bench");
+        return 84;
+    }
+    puts("gputri -- RUNG 9b, the edge rasteriser's instrument");
+    puts("");
+    puts("  run /bin/gputri --digest    reference digests, diff against host cpuref FIRST");
+    puts("  run /bin/gputri --cov       the 20-case corpus + negative controls N1-N8");
+    puts("  run /bin/gputri --bench     RUNG 10's KILL GATE: GPU vs CPU coverage crossover");
+    puts("");
+    puts("Exits: 95 all exact + all controls fired · 100 no GPU here · 96 shader not resident");
+    puts("       92 fill-rule · 91 shape · 89 tgid · 88 UNTOUCHED · 87 covered nothing");
+    puts("       86 a control failed · 85 digest mismatch · 90 named fault · 84 bad arg");
+    return 96;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

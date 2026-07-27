@@ -68,7 +68,7 @@ fn sys_readlink(path, pathlen, buf, buflen): i64 {
 
 - **Kernel (agnos)** — `readlink`#70 handler + the `ext2_path_lookup_ex(path, len, follow_last)`
   no-follow refactor (public `ext2_path_lookup` = the `follow_last=1` wrapper, every prior caller
-  byte-identical). **QEMU-proven**: `SYMLINK_SELFTEST=1 ./scripts/build.sh && scripts/symlink-smoke.sh`
+  byte-identical). **QEMU-proven**: `SYMLINK_SELFTEST=1 ./scripts/build.sh && scripts/smoke/symlink-smoke.sh`
   now asserts `READLINK-OK` — the same `/hn_link` returns `archaemenid` via `open()` (follow) and
   `/etc/hostname` via `readlink`#70 (no-follow); e2fsck-clean. (CHANGELOG `[Unreleased]`.)
 - **Consumer (hapi)** — `link_probe` flipped to readlink-first (`hapi_readlink` shim,

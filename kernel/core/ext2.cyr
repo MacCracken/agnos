@@ -5329,7 +5329,7 @@ fn ext2_jbd2_integration_selftest() {
 # === 1.38.7 crash-stress selftest (JBD2_CRASH_SELFTEST=1) ===
 # Runs a loop of `commit_count` real commits of the root inode, with a
 # busy-wait between each so the total stress window stretches to ~3 s.
-# The companion smoke (scripts/jbd2-crash-smoke.sh) SIGKILLs QEMU at
+# The companion smoke (scripts/smoke/jbd2-crash-smoke.sh) SIGKILLs QEMU at
 # varied points within that window and then re-boots — AGNOS's replay
 # on the second boot is the test: regardless of where the kill landed
 # (pre-descriptor, mid-descriptor, between-data, pre-commit, post-commit
@@ -5745,7 +5745,7 @@ fn ext2_jbd2_replay() {
 # Appends a known pattern past EOF of a SEED extent-mapped file (`/extseed.dat`,
 # created by `mkfs.ext4 -d` so it carries EXTENTS_FL with a depth-0 inline root),
 # exercising ext2_extent_append_block via ext2_write_at. The smoke
-# (scripts/ext-extent-smoke.sh) then host-verifies: e2fsck -fn clean + the file
+# (scripts/smoke/ext-extent-smoke.sh) then host-verifies: e2fsck -fn clean + the file
 # grew + the appended bytes are 0xAB. Gate string: "ext-ext: append PASS".
 # Self-seed: create /extseed.dat as an EMPTY depth-0 extent file under root (ino
 # 2) when it's absent — so the iron burn is flash-and-test (no host-side mount /

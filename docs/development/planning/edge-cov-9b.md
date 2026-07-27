@@ -352,7 +352,7 @@ For contrast, judge 1 measured A1's 30-iteration divider at **6,859 wrong per 12
 ---
 
 ### B0 🆓 HOST — `refraster.cyr` extraction + the `accrow` fatal
-**Lands:** `gpu-test/refraster.cyr`, include-only (no `main`, no `_entry` — `cpuref.cyr:301,342-343` make it a *program*, so including it today gives duplicate `main`/`_entry` and Cyrius shadows duplicates silently). Contains `R_*`, `edges_reset`, `edge_add`, `span_add`, `raster`, with `W`/`H`/`MAXE` as module vars and **`accrow` sized by a declared `MAXW` plus a RUN-TIME `if (W > MAXW) fail loudly`** — a check, not a comment. Re-point `cpuref.cyr`, `refagree.cyr`, `tileown.cyr` at it.
+**Lands:** `tests/gpu/refraster.cyr`, include-only (no `main`, no `_entry` — `cpuref.cyr:301,342-343` make it a *program*, so including it today gives duplicate `main`/`_entry` and Cyrius shadows duplicates silently). Contains `R_*`, `edges_reset`, `edge_add`, `span_add`, `raster`, with `W`/`H`/`MAXE` as module vars and **`accrow` sized by a declared `MAXW` plus a RUN-TIME `if (W > MAXW) fail loudly`** — a check, not a comment. Re-point `cpuref.cyr`, `refagree.cyr`, `tileown.cyr` at it.
 **Verified by:** all three still exit **95/95/95, unchanged**.
 **Why first:** `var accrow[64]` is exactly 64 i64 slots and `span_add` indexes it to `W`; at any `W > 64` it writes into `crx`/`crd` — corrupting the **ORACLE**, presenting as a plausible wrong triangle. Every later bite cites this file.
 
@@ -386,7 +386,7 @@ Record "20 cases, itemised" in the `gpu.md` row.
 
 ---
 
-### B2 🆓 HOST — **THE CORRECTNESS GATE.** `gpu-test/edgemodel.cyr`
+### B2 🆓 HOST — **THE CORRECTNESS GATE.** `tests/gpu/edgemodel.cyr`
 **Lands:** the *entire* shader algorithm, in Cyrius, at shader register widths: the §1.4 setup (`clz`, restoring-loop `V`), the §2.4 25-op divider with **every intermediate explicitly masked to 32 bits**, and the §1.5 sort-free breakpoint walk. Diffed byte-for-byte against `refraster.cyr`'s `raster()`.
 
 **Gates (all four required):**
@@ -403,12 +403,12 @@ Record "20 cases, itemised" in the `gpu.md` row.
 
 ### B3 🆓 QEMU — the coordinate guard
 **Lands:** `|x0|,|y0|,|x1|,|y1| ≤ 268435456` in `gpo_validate_edge`, with a **NEW reason code** (`GPO_E_COORD`, not a reused `GPO_E_DIM` — the failure table must distinguish it). Documented in `docs/development/agnos-userland-abi.md` §3.4 as *the domain on which byte-identity to the reference is DEFINED*, citing surveyor 2's executed i64-overflow counterexample. `edge_abi_selftest` gains in-range and out-of-range cases; count extends from 16.
-**Verified by:** `scripts/edge-abi-smoke.sh` green at the new count, **plus a mutation check** that deleting the bound fails the new case (the 9a discipline: calibrate the null).
+**Verified by:** `scripts/smoke/edge-abi-smoke.sh` green at the new count, **plus a mutation check** that deleting the bound fails the new case (the 9a discipline: calibrate the null).
 **No shader involved. Independently landable.**
 
 ---
 
-### B4 🆓 HOST — the authoring tool `gpu-test/edgeasm.cyr`
+### B4 🆓 HOST — the authoring tool `tests/gpu/edgeasm.cyr`
 **Lands:** includes mabda's **LIVE** `gfx9_encode.cyr` by relative path (`asmagree.cyr:44`'s shape; needs `CYRIUS_ALLOW_PARENT_INCLUDES=1` — a vendored copy would drift and defeat the comparison). Adds, **locally, never in mabda** ([[feedback_cyrius_hands_off]] applies to mabda by the same logic — it is a sibling repo):
 - the **label/fixup pass** lifted from `mabda/src/gfx9_compile.cyr:827-884` (`laboff[]`, `patch_off[]`/`patch_tgt[]`, resolve as `simm = (tgt - (br+4))/4`, rewrite the low 16 bits in place). `gfx9_enc_sopp`'s negative-offset handling is already verified (`0xbf85ffef` reproduced), so only the bookkeeping is new. ⚠ **Re-derive the array sizing** — `gfx9_compile` declares `var patch_off[2048]` FUNCTION-LOCAL (2048 *bytes*); at module scope in a top-level program the same declaration means 8× that.
 - **asserting wrappers**: a `vop3()` that emits **both** dwords in one call and **refuses `src == 255`** (VOP3 has no literal form; mabda's own compiler treats this as `CMP_ERR_VOP3_LITERAL`); range-checked `v()`/`s()`; a `k()` that **fails loud** instead of silently returning 255.
@@ -451,11 +451,11 @@ Rung 7 proved VOP1 ×2, VOP2 ×3, SOP1+literal, SOPP, and one VOP3a *lo* dword �
 ### B7 🆓 QEMU — the kernel seam
 **Lands:** `GPU_EDGE_SETUP_SUBOFF = 0x57000`, `GPU_EDGE_PREP_SUBOFF = 0xD0000`, both RSRC1 constants; `edge_setup_write()` and `edge_cov_write()` next to `blend_cov_write`; `gpu_edge_arm()` replaced with the 5-gate peer body (`gpu_cov_arm`, `gpu.cyr:2935-2945`) writing **both** blobs then `gpu_mfence()`; `gpu_edge_cov()` per §1.1 with `gx = (w+63)/64, gy = h`, a **comment naming the lane shape**, the `rule != 0` and `n_edges > 64` rejects, and a **passed-through timeout**.
 
-⛔ **In the SAME bite:** flip `edge_abi_selftest`'s hardcoded `GPO_E_ARM` expectation (`syscall.cyr:1185`) to `0`. Arming the shader turns `scripts/edge-abi-smoke.sh` red *for a correct reason*, and a known-red gate carried into a burn is how a real regression gets waved through.
+⛔ **In the SAME bite:** flip `edge_abi_selftest`'s hardcoded `GPO_E_ARM` expectation (`syscall.cyr:1185`) to `0`. Arming the shader turns `scripts/smoke/edge-abi-smoke.sh` red *for a correct reason*, and a known-red gate carried into a burn is how a real regression gets waved through.
 
 ⛔ **Do NOT touch** `gpu_blend_cov_run`'s duplicated `TCWB` packets (`gpu.cyr:2334, 2351` vs `gpu_batch_tail:2209`) and **do not touch** the mis-attributed comment at `gpu.cyr:2192-2193` inside this bite. Removing a coherence packet is the class that cost eight burns at C2g-1. See §6.
 
-**Verified by:** `check.sh` unaliased-slot gate; `scripts/edge-abi-smoke.sh` **16/16 + 8/8 green** in QEMU.
+**Verified by:** `check.sh` unaliased-slot gate; `scripts/smoke/edge-abi-smoke.sh` **16/16 + 8/8 green** in QEMU.
 
 ---
 
@@ -467,7 +467,7 @@ Rung 7 proved VOP1 ×2, VOP2 ×3, SOP1+literal, SOPP, and one VOP3a *lo* dword �
 - A per-case **FNV-64 digest of the reference mask, printed by BOTH `cpuref` and `gputri`, gated on equality** — the only check that catches a `--agnos` codegen divergence making both sides wrong together, which `gpu.md:1019` names by name.
 - **Negative controls N1–N8, each a gate that must FIRE or the tool exits 86 and never 95:** N1 poisoned-copy comparator calibration · N2 no-dispatch arm reports UNTOUCHED · N3 coverage floor (≥3 cases with ≥1000 nonzero reference bytes — *"fully outside"* and *"zero-area"* both have all-zero correct answers, so a dead shader that writes zeroes passes them byte-exactly) · N4 ≥1 reference byte strictly between 0 and 255 (else a binary non-antialiased rasteriser passes the whole axis-aligned subset) · N5 backfacing · N6 non-multiple-of-64 width · N7 same case twice in one boot, byte-identical · N8 slot free-then-realloc (the C2g-1 stale-ghost path `gpucopy` already hit on iron).
 - **Exit-code contract**, splitting today's overloaded 96: **95** all cases exact AND all controls fired · **100** no GPU / no carveout (QEMU) — split out of 96 per `gpucopy`'s precedent · **96** seam live, shader not resident · **92/91/89** mismatch classified fill-rule / shape / tgid-mapping · **88** UNTOUCHED · **87** wrote, covered nothing · **86** a negative control failed · **85** in-tool reference digest ≠ host `cpuref` digest · **90** named `#92` fault · **84** unknown arg.
-- **Wiring:** `stage_one agnos/gpu-test gputri.cyr gputri` in `scripts/stage-tools.sh` and a `gputri) _src="gpu-test/build/gputri_agnos"` arm in `burn-prep.sh`'s tool map. **`gputri` appears in NEITHER today** (`grep -rn gputri scripts/` → no matches), so a burn would run an absent or hand-staged binary against a fresh kernel.
+- **Wiring:** `stage_one agnos/gpu-test gputri.cyr gputri` in `scripts/burn/stage-tools.sh` and a `gputri) _src="tests/gpu/build/gputri_agnos"` arm in `burn-prep.sh`'s tool map. **`gputri` appears in NEITHER today** (`grep -rn gputri scripts/` → no matches), so a burn would run an absent or hand-staged binary against a fresh kernel.
 
 ---
 
@@ -684,7 +684,7 @@ the CPU re…",
       "queuedAt": 1785010996169,
       "attempt": 1,
       "lastToolName": "StructuredOutput",
-      "lastToolSummary": "3D arc rung 9b — what the ring-3 tool (`gpu-test/gputri.cyr…",
+      "lastToolSummary": "3D arc rung 9b — what the ring-3 tool (`tests/gpu/gputri.cyr…",
       "promptPreview": "You are working on AGNOS, a sovereign OS written in Cyrius (a systems language, NOT C/Rust).
 Repo: /home/macro/Repos/agnos. Sibling repo with a gfx9 instruction ENCODER: /home/macro/Repos/mabda.
 
@@ -695,7 +695,7 @@ the CPU re…",
       "tokens": 124873,
       "toolCalls": 34,
       "durationMs": 551839,
-      "resultPreview": "{"area":"3D arc rung 9b — what the ring-3 tool (`gpu-test/gputri.cyr`) must do to close its oracle: the corpus gap, reference sharing across host/agnos, mask-size reuse + Cyrius array sizing, non-vacuous negative controls, and the exit-code contract.","findings":[{"claim":"Q1 — THE 20-CASE CORPUS DOES NOT EXIST ANYWHERE. \\"20 cases\\" appears exactly twice in gpu.md and both are SPECIFICATION, neve…"
+      "resultPreview": "{"area":"3D arc rung 9b — what the ring-3 tool (`tests/gpu/gputri.cyr`) must do to close its oracle: the corpus gap, reference sharing across host/agnos, mask-size reuse + Cyrius array sizing, non-vacuous negative controls, and the exit-code contract.","findings":[{"claim":"Q1 — THE 20-CASE CORPUS DOES NOT EXIST ANYWHERE. \\"20 cases\\" appears exactly twice in gpu.md and both are SPECIFICATION, neve…"
     },
     {
       "type": "workflow_agent",

@@ -44,7 +44,7 @@ check "x86_64 build" $rc
 # be actionable.
 echo ""
 echo "--- Source Hygiene ---"
-sh "$ROOT/scripts/kprint-len-check.sh" > /tmp/kprint-len-check.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/kprint-len-check.sh" > /tmp/kprint-len-check.log 2>&1 && rc=0 || rc=$?
 check "kprint literal lengths" $rc
 [ "$rc" = "0" ] || cat /tmp/kprint-len-check.log
 
@@ -57,13 +57,13 @@ check "kprint literal lengths" $rc
 # thing that matters: two slots do not need the same START to collide, only a shared BYTE. It missed a
 # live one — the batched-frame snapshot at 0xC0000 spans 0x20000 bytes to 0xE0000, and the rung-9
 # per-edge prep table was allocated at 0xD0000, wholly inside it, and shipped. Different values, so
-# `uniq -d` saw nothing. Now extent-aware; see scripts/check-arena.sh. Detail prints on failure.
-sh "$ROOT/scripts/check-arena.sh" > /tmp/check-arena.log 2>&1 && rc=0 || rc=$?
+# `uniq -d` saw nothing. Now extent-aware; see scripts/check/check-arena.sh. Detail prints on failure.
+sh "$ROOT/scripts/check/check-arena.sh" > /tmp/check-arena.log 2>&1 && rc=0 || rc=$?
 check "gpu arena slots unaliased (extent-aware)" $rc
 [ "$rc" = "0" ] || cat /tmp/check-arena.log
 # The Cyrius var X[N] units trap: function-local is N BYTES, module-scope is N x u64. Cost the
 # rung-10 burn its exit code (a 40-byte stack smash that left every printed number correct).
-sh "$ROOT/scripts/check-array-sizing.sh" >/dev/null 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/check-array-sizing.sh" >/dev/null 2>&1 && rc=0 || rc=$?
 check "no function-local array overruns" $rc
 
 # Shader blobs vs their sources. Each shipped shader is a store32 table in gpu.cyr that is supposed
@@ -74,7 +74,7 @@ check "no function-local array overruns" $rc
 # a deleted one both go red).
 BLOBDRIFT=""
 for sb in edge_setup edge_cov tri_rgba; do
-    sh "$ROOT/scripts/shader-blob.sh" check "$ROOT/kernel/shaders/$sb.s" "$sb" >/tmp/shader-blob-$sb.log 2>&1 \
+    sh "$ROOT/scripts/check/shader-blob.sh" check "$ROOT/kernel/shaders/$sb.s" "$sb" >/tmp/shader-blob-$sb.log 2>&1 \
         || BLOBDRIFT="$BLOBDRIFT$sb "
 done
 test -z "$BLOBDRIFT" && rc=0 || rc=$?

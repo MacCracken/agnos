@@ -78,7 +78,7 @@ exactly like a normal SysV `_start`, **not** via `/proc`.
 
 ```
 cd agnoshi && cyrius update && cyrius build --agnos src/agnsh.cyr build/agnsh_agnos
-cd ../agnos && sh scripts/build.sh && bash scripts/agnsh-smoke.sh
+cd ../agnos && sh scripts/build.sh && bash scripts/smoke/agnsh-smoke.sh
 ```
 
 Expected: the boot reaches an **agnsh prompt** instead of `#UD` / the emergency-shell fallback.

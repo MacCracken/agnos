@@ -59,4 +59,4 @@ No new kernel work is requested — the kernel ABI is complete. The only kernel-
 
 ## Verification once wired
 
-Build a trivial Cyrius echo-server `--agnos`, stage to `/bin`, boot under QEMU+OVMF+gnoboot with SLIRP hostfwd (reuse `agnos/scripts/tcp-listen-smoke.sh` scaffolding), and confirm a host `netcat`/`curl` round-trips through `sock_listen#56` → `sock_accept#57` → `sock_send#48`/`sock_recv#49` → `sock_close#50`. The kernel half already passes `tcp-listen-smoke` 2/2; this proves the cyrius peer end-to-end.
+Build a trivial Cyrius echo-server `--agnos`, stage to `/bin`, boot under QEMU+OVMF+gnoboot with SLIRP hostfwd (reuse `agnos/scripts/smoke/tcp-listen-smoke.sh` scaffolding), and confirm a host `netcat`/`curl` round-trips through `sock_listen#56` → `sock_accept#57` → `sock_send#48`/`sock_recv#49` → `sock_close#50`. The kernel half already passes `tcp-listen-smoke` 2/2; this proves the cyrius peer end-to-end.

@@ -413,7 +413,7 @@ The src-over tail closes the chain: `grad_ref`'s `(sc·255 + dc·ia + 127)/255 =
 | **Decision 9** | **No rung-11 arena slot below `0xE0000`.** And `GPU_EDGE_PREP_SUBOFF` moves out of the S12 snapshot in Bite 0 regardless. |
 | **Decision 10** | **No new work constant is minted.** `GPU_EDGE_WORK_MAX = 2^26` (measured) governs D1/D2 unchanged because they are literally the same code. `GPU_TRI_MAX_PIXELS = 2^20` is an **ARENA SIZE** and is labelled as such, not dressed as a design bound. |
 | **Decision 11** | `edge_id = 0` does **not** silently mean "derive". An explicit flags bit does. Reject, never guess. |
-| **Decision 12** | **ONE reference**, host-side, shared: `gpu-test/triref.cyr`, which **INCLUDES** `refraster.cyr` and does not re-transcribe it. |
+| **Decision 12** | **ONE reference**, host-side, shared: `tests/gpu/triref.cyr`, which **INCLUDES** `refraster.cyr` and does not re-transcribe it. |
 | **Decision 13** | The 3-colour triangle is the **SOLE** gate on the x term. The gradient rect provably cannot detect an x error. The corpus says which is which, and the mutation proves it. |
 | **Decision 14** | The two-record seam is **REPORTED, not gated at zero**, and `gpu.md:818`'s third failure mode is corrected before the flash. |
 | **Decision 15** | Every gate names its mutation, and **the mutation is run**. A gate that cannot fail is not a gate. |
@@ -443,7 +443,7 @@ The src-over tail closes the chain: `grad_ref`'s `(sc·255 + dc·ia + 127)/255 =
 
 ---
 
-### Bite 2 🆓 HOST — `gpu-test/triref.cyr`, THE reference *(governs: Decision 12)*
+### Bite 2 🆓 HOST — `tests/gpu/triref.cyr`, THE reference *(governs: Decision 12)*
 **Lands:** `tri_ref_px(prep, px, py, cov, dst)` implementing §2 exactly — `E = kx·Px + ky·Py + k0` in i64, `N = Σ E_i·c_i·cov` in exact Cyrius i64 (the reference may use i64 freely; only the *model* is register-width-constrained), `floor((N + D255/2)/D255)`, `min(q,255)`, `min(q_ch,q_a)`, then the integer src-over. **INCLUDES `refraster.cyr`** and reuses its edge machinery for coverage — it does not re-transcribe it.
 **Verified by:** `cpuref`/`refagree`/`tileown` all still exit 95, unchanged; plus a direct check that `tri_ref_px` on the gradient frame reproduces `grad_ref_px`'s formula for `den ∈ {2..256}` **and both parities**, exhaustively over `y` and over 64 random `(c0,c1,dst)` triples.
 ⚠ Cyrius traps this bite must respect, every one of which has cost this arc real time: `>>` is **LOGICAL** and `>>>` is arithmetic (inverted from C) — `sar32` exists at `edgemodel.cyr:66` for exactly this; module-scope `var X[N]` is `N×u64` in an INCLUDED module but **N BYTES** in a top-level program (the `accrow[64]` latent fatal was this, **IN THE ORACLE**); `load32` **zero-extends**, so every coordinate read back needs an explicit sign-extend; no chained `else if`.
@@ -477,7 +477,7 @@ The src-over tail closes the chain: `grad_ref`'s `(sc·255 + dc·ia + 127)/255 =
 
 ---
 
-### Bite 4 🆓 HOST — **THE CORRECTNESS GATE.** `gpu-test/trimodel.cyr` *(governs: Decision 4, Decision 8, Decision 15)*
+### Bite 4 🆓 HOST — **THE CORRECTNESS GATE.** `tests/gpu/trimodel.cyr` *(governs: Decision 4, Decision 8, Decision 15)*
 **Lands:** the *entire* `tri_rgba` algorithm, in Cyrius, **at shader register widths** — every intermediate explicitly masked through `u32()`/`sar32()`/`clz32()`, the 96-bit accumulate as three explicit dwords, the funnel as explicit shift/or, the `edge_cov.s:105-121` divider verbatim, the correction as the 96-bit add-and-compare. Byte-diffed against `triref.cyr`.
 
 **Gates (all seven required):**
@@ -492,7 +492,7 @@ The src-over tail closes the chain: `grad_ref`'s `(sc·255 + dc·ia + 127)/255 =
 | 6 | **the E-CLAMP refutation, recorded as a test.** Adding TRIPREP's `Ê = clamp(E, 0, 2A)` **MUST** turn T5/T6 red | this is a mutation that *documents a rejected design*; without it §1.3's counterexample is prose, and all three judges recommended the clamp |
 | 7 | the **`min(q_ch, q_a)` premultiplication restore NEVER fires on the frame interior**, and the seam measured **at the accumulator** over T7 | break the frame (move a vertex inside the mask) → the `min` must start firing |
 
-⚠ ⭐ **`trimodel.cyr` is a TOP-LEVEL PROGRAM and `refraster.cyr`/`triref.cyr` are INCLUDED modules — `var X[N]` means N BYTES in one and `N×u64` in the other.** Rung 9b shipped a real instance of this (`var accrow[64]`, correct at W=64, corrupting `crx`/`crd` at any W>64, **fatal in the ORACLE**). `scripts/check-array-sizing.sh` covers function-local overruns only; this one is on the author.
+⚠ ⭐ **`trimodel.cyr` is a TOP-LEVEL PROGRAM and `refraster.cyr`/`triref.cyr` are INCLUDED modules — `var X[N]` means N BYTES in one and `N×u64` in the other.** Rung 9b shipped a real instance of this (`var accrow[64]`, correct at W=64, corrupting `crx`/`crd` at any W>64, **fatal in the ORACLE**). `scripts/check/check-array-sizing.sh` covers function-local overruns only; this one is on the author.
 
 **Why this bite is the keystone:** it converts *"the algorithm is exact"* from three designs' prose into a Cyrius artifact diffed against the artifact that **is** the oracle, **at zero burns, before one instruction is assembled**. If Bite 4 is green and iron is red, the fault is in the **emission**, not the **algorithm**. That split is why 8 of 11 rung-9b bites cost zero burns.
 
@@ -594,7 +594,7 @@ reused verbatim: GPO_E_DIM 6, GPO_E_ARM 7, GPO_E_RESERVED 12, GPO_E_EDGEBUF 16, 
 > re-emitting 269 instructions by hand through `edgeasm` is a bite-sized task in its own right —
 > folding it in here is exactly the big-bang this plan forbids elsewhere.
 > * **Landed now:** the `.s` source, the assembled blob, `RSRC1`/`RSRC2` harvested from the
->   descriptor, the generated `tri_rgba_write` table, and `scripts/shader-blob.sh` — which closes
+>   descriptor, the generated `tri_rgba_write` table, and `scripts/check/shader-blob.sh` — which closes
 >   the *"kernel table ≠ assembled source"* gap mechanically. Calibrated on the shipped, iron-proven
 >   `edge_cov` blob (135 dwords match) and mutation-tested both ways (a corrupted dword and a
 >   deleted one both go red). Wired into `check.sh` for all three blobs.
@@ -626,7 +626,7 @@ reused verbatim: GPO_E_DIM 6, GPO_E_ARM 7, GPO_E_RESERVED 12, GPO_E_EDGEBUF 16, 
 | **N16** | the in-tool reference digest equals the host `triref` digest |
 
 **Exit-code contract**, mirroring `gputri --cov`'s: **95** all exact and all controls fired · **100** no GPU / no carveout (QEMU) · **96** seam live, shader not resident · **93/92/91** mismatch classified colour / coverage / tgid-mapping · **88** UNTOUCHED · **86** a control failed · **85** digest mismatch · **90** named `#92` fault · **84** unknown arg.
-⚠ **Wiring is part of the bite**: `stage_one agnos/gpu-test gputri.cyr gputri` in `scripts/stage-tools.sh` and the `gputri)` arm in `burn-prep.sh`'s tool map must already cover the rebuilt binary, or the burn runs a stale one against a fresh kernel. [[feedback_ifdef_bites_name_their_build_flags]] — this bite names `TRI_ABI_SELFTEST` and any `BURN_*` flag it needs, and builds through `burn-prep.sh`, never a hand-rolled script.
+⚠ **Wiring is part of the bite**: `stage_one agnos/gpu-test gputri.cyr gputri` in `scripts/burn/stage-tools.sh` and the `gputri)` arm in `burn-prep.sh`'s tool map must already cover the rebuilt binary, or the burn runs a stale one against a fresh kernel. [[feedback_ifdef_bites_name_their_build_flags]] — this bite names `TRI_ABI_SELFTEST` and any `BURN_*` flag it needs, and builds through `burn-prep.sh`, never a hand-rolled script.
 
 ---
 

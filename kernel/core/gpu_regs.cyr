@@ -1157,7 +1157,7 @@ var GPU_PK_SHADER_SUBOFF       = 0x55000;    # slot 5 — blend_pk blob (61 dwor
 var GPU_EDGE_SHADER_SUBOFF     = 0x56000;    # slot 6 — edge_cov blob   (133 dwords / 532 B)  -> ends 0x57000
 # --- attribute interpolation (3D arc rung 11) -------------------------------------------------
 # ⚠ Extents are declared and gate-checked. GPU_TRI_COV_SUBOFF is 1 MB and ends at 0x1E4000, leaving
-# 48 KB clear of the sacrificial slot at 0x1F0000 -- verified by scripts/check-arena.sh, not by eye.
+# 48 KB clear of the sacrificial slot at 0x1F0000 -- verified by scripts/check/check-arena.sh, not by eye.
 var GPU_TRI_SHADER_SUBOFF      = 0x59000;    # residency slot 9, 278 dwords  -> ends 0x5A000
 var GPU_COMPUTE_PGM_RSRC1_TEX  = 0x00AC0207;  # 32 VGPRs, 72 SGPRs — harvested from tex_rgba.s
 var GPU_TEX_SHADER_SUBOFF      = 0x5A000;    # residency slot 10, rung 13 texturing  -> ends 0x5B000

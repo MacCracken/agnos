@@ -36,6 +36,118 @@ marking its own homework. And the dwords are iron-proven — rung 13 closed at 1
 encoding CLASS, not instruction-for-instruction across every shader. That needs a real `.s` parser,
 which remains a separate sized bite.
 
+### Changed — repo tidy: top-level test trees moved under `tests/`, `boot/grub` removed
+
+⭐ **THIS ENTRY IS THE MOVEMENT RECORD.** Old CHANGELOG entries and iron-log burn records keep the
+paths they were written with — they are dated statements of what was true then, and repointing them
+would make the log assert something that was not the case. Anyone tracing an old path forward lands
+here.
+
+| was | now |
+|---|---|
+| `fp-test/` | `tests/fp/` |
+| `blk-test/` | `tests/blk/` |
+| `audio-test/` | `tests/audio/` |
+| `symlink-test/` | `tests/symlink/` |
+| `boot/grub/` | **deleted** — GRUB's multiboot2 path is dead under W^X; gnoboot replaced it |
+
+⛔ **The move broke six smokes, and the burn gate caught it — not a reviewer.** `burn-prep` refused
+to stamp because the arc sweep went red on `1.53.x FP-ring3`: `fp-ring3-smoke.sh` still pointed at
+`$ROOT/fp-test`. Repointed with it: `blk-ring3-smoke.sh`, `blk-write-smoke.sh`, `gpt-boot-smoke.sh`,
+`gpt-write-smoke.sh`, `tonegen-smoke.sh`. This is the sweep gate doing exactly its job — refusing a
+flash onto a tree that could not build its own tests.
+
+⛔ **AND THE SWEEP MISSED A REPO. `agnosticos/scripts/install-media.sh` — the one command the
+operator runs — still pointed at `../agnos/fp-test/` and `../agnos/audio-test/`.** It failed soft:
+`fpex: skipped (no --agnos build at …/fp-test/build/fpex)`, so the flash would have quietly shipped
+**without** `/bin/fpex` and `/bin/tonegen` while reporting success. Four references repointed; both
+binaries existed all along, only the path was wrong.
+
+⚠ **The lesson is the scope, not the paths.** A directory move in one repo breaks *consumers in
+other repos*, and the first sweep was scoped to `agnos/` alone. Anything moved here must be grepped
+across `agnosticos/` too — `install-media.sh`, the smokes, and the trackers all reach in.
+[[feedback_cross_repo_issues_both_repos]]
+
+⚠ **NOT swept, deliberately:** `agnosticos/scripts/archive-pre-cyrius/` (Rust-era reference material,
+frozen by definition) and `docs/development/path-c-sovereign-uefi.md` (it documents the migration
+*away* from GRUB and correctly states "No `/boot/grub/`").
+
+⚠ **`::boot/agnos` in the smokes was NOT touched** — those are paths *inside* the FAT ESP image that
+`mcopy` writes, which is the layout gnoboot expects. Only the deleted repo directory moved.
+
+### Removed — `scripts/iso.sh` retired, and its dead CI step with it
+
+`iso.sh` read `$ROOT/boot/grub/grub.cfg`, deleted in the same tidy — so it would have failed at that
+`cp` regardless. It was also obsolete twice over: GRUB's multiboot2 path cannot load the kernel
+under W^X, and the AGNOS medium is a GPT disk with a FAT ESP carrying gnoboot, not ISO9660.
+
+**CI was still calling it** (`ci.yml:235`, under `continue-on-error`), so it had become a step that
+logged a failure every run. The step is removed with its reason recorded inline; the script is kept
+as a refusal that explains both, rather than deleted, so anyone following an old CHANGELOG reference
+gets the reason instead of a missing file.
+
+### Changed — `scripts/` split into groups, `gpu-test/` → `tests/gpu/`
+
+⭐ **MOVEMENT RECORD** — as with the `tests/` move above, old CHANGELOG and iron-log entries keep the
+paths they were written with. This table is where an old path resolves forward.
+
+| was | now |
+|---|---|
+| `gpu-test/` | `tests/gpu/` |
+| `scripts/burn-prep.sh`, `burn-verify.sh`, `stage-tools.sh`, `stage-agnsh.sh`, `install-hooks.sh` | `scripts/burn/` |
+| `scripts/*-smoke.sh` (86) | `scripts/smoke/` |
+| `scripts/check-arena.sh`, `check-array-sizing.sh`, `fmt-check.sh`, `fmt-fix.sh`, `kprint-len-check.sh`, `shader-blob.sh` | `scripts/check/` |
+| `scripts/*-repro.*`, `*-diag.py`, `*-probe.py`, `lockup-driver.py` | `scripts/probe/` |
+| `scripts/*-test.py` (16) | `scripts/harness/` |
+| `scripts/elf-fixup.py`, `patch_aarch64.py`, `mk-dirty-journal-img.py`, and other one-shots | `scripts/tool/` |
+
+**Unmoved on purpose:** `build.sh check.sh test.sh sweep.sh bench.sh version-bump.sh ktest.sh` —
+the constantly-typed entry points. Moving them buys nothing and breaks the most-used paths.
+
+⛔ **THE MOVE BROKE 123 SCRIPTS SILENTLY, VIA A MECHANISM THE PATH REWRITE COULD NOT SEE.**
+Nearly every script computes `ROOT="$(cd "$(dirname "$0")/.." && pwd)"`. One directory deeper, that
+resolves to `scripts/` instead of the repo root — so paths *inside* the scripts pointed at
+`scripts/kernel/`, `scripts/build/` and so on. `check.sh` caught it immediately (arena and
+shader-blob gates red); a rewrite that only fixed *references to* scripts would have shipped it.
+All 123 repaired to `/../..` with a note at each site saying why.
+
+⛔ **And `stage-tools.sh` used the bare form `agnos/gpu-test`, which the `gpu-test/` pattern missed.**
+It would have soft-skipped every GPU tool — the same failure shape as `install-media.sh` earlier this
+cycle: no error, just an absent binary discovered on iron. Both now verified by *running* the tool,
+not by grepping it.
+
+**Verified after the move:** `check.sh` 16/16 · `fp-ring3-smoke` PASS through its new path ·
+`tests/gpu/gputex.cyr` builds · `stage-tools.sh --build` stages gputri and gputex · every CI path
+resolves · every `../agnos/…` reach-in from `agnosticos/scripts/install-media.sh` resolves · full
+`sweep.sh` green.
+
+### Superseded — the `scripts/` split plan
+
+137 scripts (86 of them `*-smoke.sh`) get subfoldered into `burn/ smoke/ check/ probe/ harness/
+tool/`, with the constantly-typed core (`build check test sweep bench version-bump`) staying put.
+Deferred deliberately: the split changes the paths in the burn instructions the operator is
+currently holding, and today already demonstrated what a mid-flash path change costs. Shape, the
+measured ~80 live reference sites, and the verification plan are in
+`docs/development/planning/scripts-reorg.md`. `gpu-test/` moves at the same time.
+
+### ⭐⭐⭐ WRAP IS CORRECT ON IRON — 2 of 2 exact, and rung 14's addressing requirement is met
+
+All **17 cases green, exit 95**: RGBA8 5/5, IDX8 5/5, FULLCOV 5/5, WRAP 2/2, with `gputri --cov`
+holding at 20/20. `wrap-3x-tile` tiles instead of smearing; `wrap-negative-UV` lands on the far edge
+rather than saturating to texel 0. Both also set FULLCOV, so the two flags are proven **together**.
+
+⛔ **The previous burn's failure was my edit placement, and the located diffs named it in one read.**
+Iron returned `got=0xff073815` — texel 7, *constant* across a tile where the reference tiled
+0,1,2,3. Constant last-texel is saturation, not tiling: the WRAP branch sat **after**
+`v_max_i32`/`v_min_i32`, so it AND-ed an index already clamped into `[0, dim-1]` — a no-op. Moving
+the branch ahead of the saturation in both axes fixed it.
+
+⚠ The clamp corpus ran in the same invocation as a canary and stayed exact, so the WRAP tail did not
+leak into the clamp path.
+
+**Measured again this burn** (three independent runs now agree): fixed **~53 µs/dispatch**, slope
+**1.58 ns/px**, FULLCOV saving **49 %**, budget **1022 dispatches/frame** at 35 Hz.
+
 ### ⭐⭐ RUNG 14 GROUNDING — WRAP addressing, because DOOM tiles and op 0x0B clamped
 
 Reading `cyrius-doom/src/render.cyr` rather than the plan's summary of it surfaced two hard

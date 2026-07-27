@@ -1,6 +1,6 @@
 # Large-binary exec → kernel stack overflow → triple fault
 
-**Status**: ✅ **RESOLVED 2026-06-30.** Root cause was NOT binary size — it was a **VA-space collision**: the per-process kernel stacks lived in the low identity window where large user segments map. Fixed by relocating them onto the direct-map (8 GB+). The 15.9 MB ark binary now loads + runs in ring 3 (`scripts/ark-run-smoke.sh` PASS), with ring3-smoke / exec-smoke / check.sh 11/11 / agnsh-smoke all green (no regression). NOTE: ark was NOT shrunk — with the >256 MB RAM work a 16 MB binary is fine; the bug was the kernel parking its stacks in the user-segment range. See the **Fix** section.
+**Status**: ✅ **RESOLVED 2026-06-30.** Root cause was NOT binary size — it was a **VA-space collision**: the per-process kernel stacks lived in the low identity window where large user segments map. Fixed by relocating them onto the direct-map (8 GB+). The 15.9 MB ark binary now loads + runs in ring 3 (`scripts/smoke/ark-run-smoke.sh` PASS), with ring3-smoke / exec-smoke / check.sh 11/11 / agnsh-smoke all green (no regression). NOTE: ark was NOT shrunk — with the >256 MB RAM work a 16 MB binary is fine; the bug was the kernel parking its stacks in the user-segment range. See the **Fix** section.
 **Severity (was)**: High for the server stage (no binary whose segment reached 14 MB could run); zero for base/MVP (binaries were ≤ ~1.2 MB, below the kstack pool).
 **Found by**: the ark v2 M3 attempt — running the real **ark binary (15.9 MB, segment to ~20 MB)** on agnos.
 
@@ -50,16 +50,16 @@ ark is by far the largest binary attempted on agnos — the prior ceiling is kri
 # in agnos/
 ARK_SELFTEST=1 ./scripts/build.sh                 # kernel runs `run /bin/ark` deterministically at boot
 cp ../ark/build/ark_agnos build/ark-rootfs/bin/ark   # 15.9 MB agnos ark (cyrius build --agnos)
-./scripts/ark-run-smoke.sh                         # FAILs: no command list, wedges at exec
+./scripts/smoke/ark-run-smoke.sh                         # FAILs: no command list, wedges at exec
 # fault data:
 qemu ... -d int,cpu_reset -D build/ark-int.log     # shows the #PF(SP-8) -> #DF -> Triple fault
 ```
 
-`scripts/ark-run-smoke.sh` (deterministic `run /bin/ark` via the `ARK_SELFTEST` gate) is the standing regression: it will go green once the exec path stops overflowing the kernel stack on large binaries.
+`scripts/smoke/ark-run-smoke.sh` (deterministic `run /bin/ark` via the `ARK_SELFTEST` gate) is the standing regression: it will go green once the exec path stops overflowing the kernel stack on large binaries.
 
 ## NOT blocked by this
 
-The **symlink syscall** the ark v2 item (a) needed is fully proven on agnos, independently: `scripts/symlink-smoke.sh` round-trips a `--agnos` `sys_symlink` create + `open()` traversal + `e2fsck -fn` clean (kernel `symlink`#63 1.51.0 + cyrius `sys_symlink` peer 6.3.6). ark's install path is wired to it (`ark/src/portable.cyr`, `ark_symlink` → the 4-arg agnos peer; `ark` agnos cross-build compiles at 15.9 MB). The *only* thing standing between here and the M3 on-agnos `.ark`-with-symlinks install is **this large-binary exec blocker** — fix it and the ark M3 round-trip should be reachable (a smaller focused install exerciser is the fallback if the full 16 MB CLI stays heavy).
+The **symlink syscall** the ark v2 item (a) needed is fully proven on agnos, independently: `scripts/smoke/symlink-smoke.sh` round-trips a `--agnos` `sys_symlink` create + `open()` traversal + `e2fsck -fn` clean (kernel `symlink`#63 1.51.0 + cyrius `sys_symlink` peer 6.3.6). ark's install path is wired to it (`ark/src/portable.cyr`, `ark_symlink` → the 4-arg agnos peer; `ark` agnos cross-build compiles at 15.9 MB). The *only* thing standing between here and the M3 on-agnos `.ark`-with-symlinks install is **this large-binary exec blocker** — fix it and the ark M3 round-trip should be reachable (a smaller focused install exerciser is the fallback if the full 16 MB CLI stays heavy).
 
 ## Related
 

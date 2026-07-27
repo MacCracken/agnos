@@ -17,7 +17,7 @@
 **Status:** ✅ **RESOLVED — both legs (2026-07-22).** **Kernel:** done + **iron-proven** on archaemenid —
 `#84` cut with the P7 blit/present split (**1.55.x**), `#85` cut **1.55.30** (CP-DMA fill). **cyrius:** landed
 in **[6.4.70]** — `SYS_GPU_PRESENT = 84` / `SYS_GPU_FILL = 85` + `sys_gpu_present()` (nullary) /
-`sys_gpu_fill(color)`. **Consumer:** `/bin/gpufill` (agnos `gpu-test/`) **migrated off the raw numbers** onto
+`sys_gpu_fill(color)`. **Consumer:** `/bin/gpufill` (agnos `tests/gpu/`) **migrated off the raw numbers** onto
 the named wrappers and re-pinned to `cyrius = "6.4.70"`.
 
 **How cyrius gated it — stronger than this ask requested.** Rather than per-function guards, the *entire*
@@ -119,6 +119,6 @@ fn sys_gpu_fill(color): i64 { return syscall(SYS_GPU_FILL, color); }
 
 ## Consumers
 
-- **`/bin/gpufill`** (agnos `gpu-test/`, 0.1.0) — the reference ring-3 consumer: fills red/green/blue via
+- **`/bin/gpufill`** (agnos `tests/gpu/`, 0.1.0) — the reference ring-3 consumer: fills red/green/blue via
   `#85` and flips each in via `#84`; exits `95` iff every fill+present succeeded.
 - **aethersafha** — the real target: compositor back-buffer clears (`#85`) + frame present (`#84`).

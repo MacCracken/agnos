@@ -370,7 +370,7 @@ fn hda_udelay(us) {
 #
 # ⭐ NEEDS NO HDA CONTROLLER. hda_udelay is pure rdtsc spinning — it touches no MMIO and no codec —
 # so all four arms run on a QEMU boot with no `-device intel-hda`, which is exactly what
-# scripts/tsc-smoke.sh boots. A gate that only ran when audio hardware happened to be present
+# scripts/smoke/tsc-smoke.sh boots. A gate that only ran when audio hardware happened to be present
 # would be a gate nobody could trust to have run.
 fn hda_tsc_selftest() {
     var pass = 0;

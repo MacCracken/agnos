@@ -5,7 +5,7 @@ the title screen under AGNOS: the 584 KB ELF exec's from disk in ring 3, slurps
 the 4.2 MB `DOOM1.WAD` into memory, parses it, builds the palette, and blits a
 240-colour frame to the framebuffer via `fbinfo`#38 / `blit`#39. The "agnsh
 launches DOOM" milestone — the first real userland app on AGNOS. Validated by
-`scripts/doom-smoke.sh` (`doom-smoke: PASS — DOOM renders on AGNOS`).
+`scripts/smoke/doom-smoke.sh` (`doom-smoke: PASS — DOOM renders on AGNOS`).
 
 ## The two kernel fixes that unblocked it
 
@@ -82,7 +82,7 @@ gap gets serviced into `kb_buf`, and `hid_poll` drains the xHCI ring under QEMU.
 
 cyrius-doom `input.cyr` decodes make/break into a **persistent** `key_state`
 (held up/down, unlike the Linux press-then-clear path). Validated end-to-end in
-QEMU by `scripts/doom-input-test.py` (USB-xHCI kbd + HMP `sendkey`): `w` advances
+QEMU by `scripts/harness/doom-input-test.py` (USB-xHCI kbd + HMP `sendkey`): `w` advances
 title→main menu (framebuffer changes), `q` quits (`menu_run`→`doom_exit`). The
 QEMU usb-kbd path emits the *same* Set-1 make/break via `hid_poll`→`kb_buf` that
 iron's IRQ1/`kb_isr` produces, so the decode + held-state are fully exercised;
@@ -95,7 +95,7 @@ but fast; edge-triggered menu nav is a refinement, not a blocker.
 ## Validation harness (kept)
 
 - `main.cyr` `#ifdef DOOM_SELFTEST` gate (`sh_exec("run /bin/doom")`),
-  `build.sh` `DOOM_SELFTEST=1` flag, `scripts/doom-smoke.sh` (the full
+  `build.sh` `DOOM_SELFTEST=1` flag, `scripts/smoke/doom-smoke.sh` (the full
   exec→WAD→render gate). Re-validate any change with `doom-smoke.sh`; gate kernel
-  regressions with `sweep.sh` (7/7). Input: `scripts/doom-input-test.py` (sendkey
+  regressions with `sweep.sh` (7/7). Input: `scripts/harness/doom-input-test.py` (sendkey
   → title-advance + quit).

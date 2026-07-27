@@ -257,7 +257,7 @@ belong to the **alpha/translucency arc** and will ride a compositing shader, not
   clip correctly, #90 for screen capture, #91 for damage/scroll.
 - **bhumi** — `src/scanout.cyr` is the only target-specific file; the present path lands here.
 - **setu** — client surfaces migrate from #71 to #86 so they are GPU-blittable.
-- **`/bin/gpufill`, `/bin/gpublit`** (agnos `gpu-test/`) — the ring-3 proof programs.
+- **`/bin/gpufill`, `/bin/gpublit`** (agnos `tests/gpu/`) — the ring-3 proof programs.
 
 ```cyrius
 SYS_GPU_FILL_RECT = 88;   # gpu_fill_rect(color,wh,dstxy) → 0/-1; rect fill (SYMLINK on Linux)

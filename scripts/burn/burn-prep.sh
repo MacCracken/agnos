@@ -1,0 +1,1083 @@
+#!/bin/bash
+# burn-prep.sh — one command to stage the CURRENT kernel for an archaemenid
+# iron burn (version-agnostic; the live burn target is whatever's open in
+# state.md + the iron-nuc-zen-log tracker — read the NEWEST #tracker-*-cycle
+# for the hypothesis + rubric, never a cycle name hardcoded here). It:
+#   1. runs the full arc sweep (scripts/sweep.sh) — ALL gates must be green;
+#      a red sweep aborts the prep (don't burn a broken tree);
+#   2. builds build/agnos — the artifact you flash. DEFAULT is a BARE production
+#      kernel (no compile-gated selftests). Set BURN_SELFTESTS=1 to bake the
+#      EXEC_SELFTEST + EXT2_WRITE_SELFTEST validation suites back in;
+#   3. prints freshness (size + mtime) and the flash command, pointing at the
+#      OPEN cycle's tracker in agnosticos/docs/development/iron-nuc-zen-log.md
+#      for the watch rubric (kept OUT of this script so it can't rot).
+#
+# Track B (FAT/exFAT verb burn) uses SEPARATE selftest kernels — this script
+# prints the build lines for them but leaves build/agnos as the track-A kernel
+# (the dispositive burn). Build freshness is Claude's ([[feedback_build_freshness_is_mine]]).
+#
+# Usage:  sh scripts/burn/burn-prep.sh           (sweep + build iron kernel)
+#         SKIP_SWEEP=1 sh scripts/burn/burn-prep.sh   (skip the sweep — build only)
+#
+# Exit 0 iff the sweep is green (or skipped) AND the iron kernel built.
+cd "$(dirname "$0")/.." || exit 1
+ROOT="$(pwd)"
+
+set -u
+
+echo ""
+echo "=== AGNOS burn-prep — stage the current kernel for an archaemenid iron burn ==="
+echo ""
+
+# --- 1. Sweep gate -----------------------------------------------------------
+if [ -z "${SKIP_SWEEP:-}" ]; then
+    echo "[1/2] Running the arc sweep (must be all-green before a burn)..."
+    if ! sh scripts/sweep.sh; then
+        echo ""
+        echo "burn-prep: ABORT — the sweep is RED. Fix it before flashing iron."
+        echo "           (per [[feedback_iron_burns_block_other_work]] a burn is expensive — don't waste it on a known-broken tree)"
+        exit 1
+    fi
+    echo ""
+else
+    echo "[1/2] Sweep SKIPPED (SKIP_SWEEP set)."
+    echo ""
+fi
+
+# --- 2. Build the kernel -----------------------------------------------------
+# Default is a BARE production kernel — no compile-gated selftests baked in. The
+# selftest code stays in-tree (still #ifdef-gated in build.sh); it's just not
+# ENABLED for the burn artifact now that the exec/EXT2 arc is iron-validated.
+# Opt back in for a validation burn with BURN_SELFTESTS=1 (EXEC + EXT2 write).
+# --- 1.56.x SHADER arc arms ---------------------------------------------------
+# ⚠ These were MISSING until 1.56.4. Every 1.56.x shader burn (S1/D0, S2, grid, guard, coverage, glyph,
+# gradient) was reproduced by hand-exporting a define straight to build.sh, which bypasses this script's
+# banner + BUILD_TAG stamp — so the burn artifact carried no record of which arm produced it. That is
+# exactly the failure the standing rule ("every #ifdef bite names its BURN_* flag in burn-prep.sh, and you
+# verify by `cmp`-ing the two binaries, not by the burn tag") exists to prevent. Arms added retroactively.
+if [ -n "${BURN_SHADER_OPS:-}" ]; then
+    # 1.56.4 — FOUR proofs in ONE boot. Burns block the operator's machine, so this arm deliberately
+    # bundles everything the realignment owes rather than spending four boots:
+    #   A1  #92 gpu_shader_op descriptor seam (plan S8 / D-3)  -> run /bin/gpublend, /bin/gpucov
+    #   A2  coverage RE-PROOF — mandatory: both cov call sites passed 11 args to a 12-parameter
+    #       dispatcher until 1.56.4, so the RSRC1 the kernel ran with was whatever `gx` happened to be,
+    #       and done_phys was undefined (a wild kernel store). The 1.56.3 proof is void.
+    #   A3  glyph first iron        A4  gradient first iron  (both built at 1.56.3, never burned)
+    # Boot selftests print and continue on failure, and every dispatch is watchdog-bounded, so one bad
+    # arm should not cost the others.
+    #
+    # ⚠ WHAT THIS BOOT DOES *NOT* PROVE: the lazy-arm path for cov/glyph/grad. Their selftests write the
+    # SAME arena slot their gpu_*_arm() uses, so a slot is already populated by the time #92 runs. It is
+    # NOT a false pass — gpu_*_armed is never set by a selftest, so the arm still executes its own upload
+    # and its own gates — but the bare-kernel case is untested here. blend_rect IS clean: its selftest
+    # uses 0x14000 while #92 uses 0x50000, so /bin/gpublend exercises the real lazy arm.
+    # Follow-up (cheap, no new code): one production-shape boot — BUILD_ENV="" — running the same two
+    # binaries. Do it only after this burn is green.
+    #
+    # ⚠ NEEDS the gpu-test binaries on the agnos-fs: scripts/burn/stage-tools.sh --build (wired 1.56.4).
+    # Oracle: `run /bin/gpublend` and `run /bin/gpucov` -> `run: exit 95`. A #92 failure decodes as
+    # 110 + reason (111 no-GPU · 113 bad-slot · 115 off-screen · 117 not-resident · 118 dispatch-timeout ·
+    # 121 bad-descriptor · 122 reserved-field · 123 envelope-unproven). CAPTURE: klug > shader_ops.txt.
+    # ⚠ SHADER_BLEND=1 IS LOAD-BEARING HERE, NOT DECORATION. gpu_shader_cov_test and gpu_shader_rect_test
+    # both open with `if (gpu_blend_ok != 1) { "skipping ... (blend math unproven)"; return 0; }`, and
+    # gpu_blend_ok is set ONLY by gpu_shader_blend_test under #ifdef SHADER_BLEND. So SHADER_COV=1 without
+    # SHADER_BLEND=1 is a SILENT NO-OP — it prints "gpu: skipping coverage" and burns a boot. That is
+    # exactly what happened on the first 1.56.4 burn (2026-07-22): glyph and gradient passed, coverage
+    # never ran. The flag pair is a dependency; do not split it.
+    echo "[2/2] Building the 1.56.4 SHADER-OPS kernel (#92 descriptor seam + cov re-proof + glyph/grad first iron; run /bin/gpublend + /bin/gpucov; capture klug > shader_ops.txt)."
+    BUILD_ENV="SHADER_BLEND=1 SHADER_COV=1 SHADER_GLYPH=1 SHADER_GRAD=1"
+    BUILD_TAG="SHADER_OPS"
+elif [ -n "${BURN_SHADER_BATCH:-}" ]; then
+    # plan-S12 — the ONE-SUBMISSION batched frame. The arc's stated CLOSING CONDITION, and the payoff
+    # decision D-3 was made for: because #92 was specified as an ARRAY of ops from day one, batching is an
+    # implementation change rather than an ABI break.
+    #
+    # Composites the same six-op mock frame twice from an identical underlay — op-by-op (six submissions)
+    # then batched (one) — and compares the two PIXEL FOR PIXEL:
+    #   'gpu: batch frame seq <N> us  batched <M> us'
+    #   'gpu: batched frame pixel-identical to op-by-op (6 ops, 1 submission)'
+    #
+    # ⚠ READ THE RESULT THE WAY THE PLAN WROTE IT: "a batched frame that is NOT faster means the fence was
+    # never the wall, and that finding is the deliverable." This path is MEMORY-bound by the arc's own
+    # calibration (12 B/pixel, ~25 MB for a full-screen 1080p blend), so a large speedup is NOT the expected
+    # outcome and would be worth distrusting. PIXEL-IDENTITY is the gate; the two timings are a measurement.
+    # ⚠ The timings only mean anything because plan-S12a tightened the completion poll first — before that,
+    # every dispatch was quantised to a 100 us sleep and a batch would have looked ~5x better for free.
+    # CAPTURE: klug > shader_batch.txt. No photo needed; the oracle is a pixel count.
+    echo "[2/2] Building the plan-S12 SHADER-BATCH kernel (one-submission frame vs op-by-op; capture klug > shader_batch.txt)."
+    BUILD_ENV="SHADER_BATCH=1"
+    BUILD_TAG="SHADER_BATCH"
+elif [ -n "${BURN_SHADER_PERM:-}" ]; then
+    # plan-S4 — the v_perm_b32 BYTE CROSSBAR + the VOP3P PACKED blend. The last un-started ladder item: the
+    # tree had zero v_perm_b32 and zero v_pk_* through eleven bites while the arc's own scope list called
+    # the RGBX<->BGRX channel swap "an unhandled case, not just a slow one".
+    # Carries SHADER_BLEND because the f32 kernel is the packed blend's ORACLE, not merely its gate.
+    #
+    # Three sub-proofs, all bit-exact, all in one boot:
+    #   perm control run (identity selector)  -> 'gpu: perm lanes stored 64 of 64'
+    #   perm swap run    (0x03000102)         -> 'gpu: perm byte crossbar online (identity and channel swap, 64 px)'
+    #   packed blend vs f32, SAME data        -> 'gpu: packed blend bit-identical to float blend (64 px)'
+    #                                            + 'gpu: packed blend valu per pixel 27 float 31'
+    #
+    # ⚠ Two silent-wrong-VALUE failure modes to read for, neither of which faults:
+    #   'green or alpha wrong, check the packed shift lane select' = the op_sel_hi:[0,1] modifier was lost;
+    #      it corrupts 98.2% of pixels but ONLY the high u16 lane (G and A), and renders as a plausible
+    #      image with a colour cast.
+    #   'perm unpack repack wrong' on the CONTROL run = v_perm_b32's byte pool is reversed from the written
+    #      operand order (S1 is the LOW dword); a swapped pair permutes a stale VGPR and reads as "the
+    #      shader is broken" rather than "the operands are backwards".
+    # The bit-identity claim is exhaustively established off-iron (0 mismatches over all 8,421,376
+    # premultiplied triples), so ANY deviation here is a real hardware or encoding fault, not rounding.
+    # CAPTURE: klug > shader_perm.txt. No photo needed — every oracle is numeric.
+    echo "[2/2] Building the plan-S4 SHADER-PERM kernel (v_perm_b32 crossbar + VOP3P packed blend; capture klug > shader_perm.txt)."
+    BUILD_ENV="SHADER_BLEND=1 SHADER_PERM=1"
+    BUILD_TAG="SHADER_PERM"
+elif [ -n "${BURN_SHADER_COHERE:-}" ]; then
+    # plan-S3 — the four-arm GL2/scanout/CP-DMA coherence characterisation, in ONE boot. The bite the arc
+    # plan made a gate and execution never ran. Needs NO other shader flag: it drives the RUNTIME arm
+    # (gpu_blend_arm), not a boot selftest, so it is unaffected by the SHADER_BLEND dependency.
+    #
+    # Reads as a table in klug, six rows:
+    #   S3-A shader->fb  WB=on   S3-B shader->fb  WB=off      (CPU readback; PANEL scored from the photo)
+    #   S3-C shader->cpdma WB=on / WB=off                     (does an MC-direct read see GL2 stores?)
+    #   S3-D cpdma->shader INV=on / INV=off                   (does a GL2 read see MC-direct writes?)
+    # Plan's expectation: A pass · B FAIL · C needs the write-back · D needs the invalidate. ⚠ ANY deviation
+    # is a hardware fact worth more than the bite — do not "fix" a surprising row, record it.
+    # ⚠ A passing B does NOT prove the write-back is useless; it proves GL2 drained inside the measurement
+    # window. Absence of a flush is not a guarantee of staleness.
+    # PHOTO IS DISPOSITIVE for the panel half: two 64x64 tiles side by side at (96,380) and (240,380) over a
+    # near-black underlay — left = write-back ON, right = OFF. A dark right tile beside a white left tile is
+    # the display-visibility answer the CPU readback cannot give.
+    # CAPTURE: klug > shader_cohere.txt, and one photo of the two tiles.
+    echo "[2/2] Building the plan-S3 SHADER-COHERE kernel (four-arm GL2/scanout/CP-DMA coherence; capture klug > shader_cohere.txt + ONE photo of the two tiles)."
+    BUILD_ENV="SHADER_COHERE=1"
+    BUILD_TAG="SHADER_COHERE"
+elif [ -n "${BURN_SHADER_GRAD:-}" ]; then
+    # plan-S11 — vertical linear gradient, no source buffer. Oracle: 'gpu: shader gradient online'.
+    echo "[2/2] Building the plan-S11 SHADER-GRAD kernel (linear gradient; capture klug > shader_grad.txt)."
+    BUILD_ENV="SHADER_GRAD=1"
+    BUILD_TAG="SHADER_GRAD"
+elif [ -n "${BURN_SHADER_GLYPH:-}" ]; then
+    # plan-S9 — 1bpp -> 32bpp glyph expansion, transparent background. Highest call-count site in the
+    # desktop tree. Oracle: 'gpu: shader glyph expand online'. CAPTURE: klug > shader_glyph.txt.
+    echo "[2/2] Building the plan-S9 SHADER-GLYPH kernel (1bpp glyph expand; capture klug > shader_glyph.txt)."
+    BUILD_ENV="SHADER_GLYPH=1"
+    BUILD_TAG="SHADER_GLYPH"
+elif [ -n "${BURN_EDGE_PROBE:-}" ]; then
+    # ============================================================================================
+    # 3D ARC — THE EDGE-CAP MEASUREMENT KERNEL. ⚠ NOT A SHIPPING BUILD.
+    # ============================================================================================
+    # ⛔ Raises GPU_EDGE_CAP 64 -> 256 so `gputri --bench` can reach the points ABOVE the shipped
+    # cap. It exists because the cap must move on MEASUREMENT and the cap itself rejects the
+    # measurements. NEVER flash this as a normal kernel: it permits envelopes the 100 ms dispatch
+    # watchdog has NOT been shown to survive — extrapolation puts 4096^2 x E=64 at ~480 ms.
+    #
+    # ⚠ EDGE_CAP_PROBE SWAPS ONE CONSTANT, so this kernel is byte-identical in SIZE to the
+    # shipped one and `strings` cannot distinguish them — the ATOM_DRY shape. The observable is
+    # the boot line the kernel prints about itself:
+    #     gpu: edge rasteriser cap 256 edges      <- probe
+    #     gpu: edge rasteriser cap 64 edges       <- shipped
+    # CHECK THAT LINE IN THE LOG BEFORE TRUSTING ANY ABOVE-CAP NUMBER.
+    #
+    # Run: gputri --cov (must still be 20/20) THEN gputri --bench THEN klug > /cap.txt
+    # WHAT THIS BURN MUST PRODUCE: the us-per-edge column of the edge sweep, at ne = 4, 8, 16,
+    # 32, 64, 128, 256 on a fixed 128x128 mask. That is the term burn 5 never measured — it swept
+    # mask size at a CONSTANT 3-edge triangle, so it produced zero edge-count data.
+    #
+    # ⭐ THE QUESTION: is us-per-edge FLAT?
+    #   FLAT   => cost is linear in E, the work-product model (~28 us + ~0.00045 us/px/edge)
+    #             holds, and EDGE_CAP can be replaced by a w*h*n_edges bound derived from it.
+    #   CURVED => it does not hold, and the bound must be fitted to these points directly.
+    # Either answer moves the cap on MEASUREMENT. Neither is a failure.
+    #
+    # ⛔ AND WATCH THE WATCHDOG. Extrapolation puts 4096^2 x E=64 at ~480 ms against a 100 ms
+    # dispatch timeout. Nothing in this sweep goes near that (128x128 x E=256 extrapolates to
+    # ~1.9 ms), but a GPO_E_DISPATCH at the high end IS the watchdog talking and is itself a
+    # datum — record it rather than retrying.
+    echo "[2/2] Building the EDGE-CAP PROBE kernel (GPU_EDGE_CAP=256; MEASUREMENT ONLY)."
+    echo "      ⚠ VERIFY 'gpu: edge rasteriser cap 256 edges' in the boot log."
+    BUILD_ENV="EDGE_CAP_PROBE=1"
+    BUILD_TAG="EDGE_CAP_PROBE"
+elif [ -n "${BURN_TEX_RGBA:-}" ]; then
+    # ============================================================================================
+    # 3D ARC RUNG 13 — TEXTURING'S FIRST CONTACT WITH SILICON.
+    # ============================================================================================
+    # ⚠ NO COMPILE FLAG. gpu_tex_arm / gpu_tri_tex are UNCONDITIONAL. This mode carries the BRIEF.
+    #
+    # ⭐ WHAT IS ALREADY PROVEN AT ZERO BURNS, so a red does NOT re-open it:
+    #   * the ABI — 57 of 57 cases in QEMU, both formats, the bidirectional LUT rule, every reject
+    #   * the algorithm — texmodel byte-diffs it against texcore at register widths: 0 differing
+    #     bytes over 7 frames x 32x32 px x 3 coverages, in BOTH formats, with four falsification
+    #     gates including the signed-high-dword slip that cost rung 11 four burns
+    #   * the blob — shader-blob.sh reports 426 dwords matching the assembled source
+    #   * the arena — 53 slots with declared extents, 0 overlaps
+    #   * RSRC2 = 0x00000190, byte-identical to the coverage kernel's, so the shipped dispatcher
+    #     issues this blob with no PM4 change
+    #
+    # ⛔ WHAT IS *NOT* PROVEN AND IS THE POINT OF THIS FLASH: that the EMISSION does what the model
+    # does. Two assemblers agree on rung 11's blob; here only llvm-mc has been run, so a red is
+    # genuinely open between encoding and the instruction sequence.
+    # ⛔ THE INSTRUMENT IS NOT ABOVE SUSPICION. Four of this arc's reds were gputri's own defects.
+    #
+    # RUN IN THIS ORDER:
+    #   1. run /bin/gputri --cov     rung 9b regression: the rasteriser must STILL be 20/20.
+    #   2. run /bin/gputex           rung 13. Its FIRST case is the absolute test.
+    #   3. run /bin/klug > /tex1.txt
+    #
+    # PRE-REGISTERED OUTCOME TABLE:
+    #   95  every rendered pixel byte-identical to texcore in BOTH formats. Rung 13 closes.
+    #   85  pixels differ. ⭐ READ THE LOCATED `diff case ... x= y= cov= want= got=` LINES.
+    #         case 0 (1:1) differing        -> addressing or the texel-centre convention; the
+    #                                          absolute test failing means the fetch is wrong, not
+    #                                          the interpolation
+    #         case 0 exact, case 1 differing-> the fractional path: texel-centre +0.5, or the
+    #                                          quotient/correction
+    #         RGBA8 exact, IDX8 differing   -> the LUT indirection only; the UV path is fine
+    #         cov=0 but got != 0xFF101010   -> the shader wrote OUTSIDE the coverage mask
+    #   87  the comparison could not be made honestly (capture, allocation or #90 refused).
+    #   96  gpu_tex_arm refused -- an ARMING fault, not a shader fault. Check the boot log.
+    #   Any GPO_E_* reason: the ABI refused that record; 25/26/27 are tex slot / tex dim / LUT.
+    echo "[2/2] Building the 3D-arc RUNG 13 kernel (texturing; no compile flag needed)."
+    echo "      Run: gputri --cov (must STILL be 20/20) THEN gputex THEN klug > /tex1.txt"
+    BUILD_ENV=""
+    BUILD_TAG="TEX_RGBA"
+
+elif [ -n "${BURN_TRI_RGBA:-}" ]; then
+    # ============================================================================================
+    # 3D ARC RUNG 11 — BURN 1. ATTRIBUTE INTERPOLATION'S FIRST CONTACT WITH SILICON.
+    # ============================================================================================
+    # ⚠ NO COMPILE FLAG. gpu_tri_arm / gpu_tri_rgba are UNCONDITIONAL — a default kernel already
+    # carries them. This mode carries the BRIEF, not a #define. A burn whose instructions live only
+    # in a chat log gets run wrong once and wasted.
+    #
+    # ⛔ WHAT THIS BURN CAN AND CANNOT SETTLE, STATED BEFORE IT RUNS. #90 reads the back buffer
+    # back, so this IS a byte comparison: every rendered rect is diffed against the CPU reference
+    # pixel for pixel. It settles per-pixel correctness of op 0x09 and op 0x0A. What it does NOT
+    # settle is anything about a case the ABI refused — a REJECTED line is not a pass.
+    #
+    # ⛔ BURNS 3 AND 4 BOTH EXITED 85 AND BOTH WERE THIS TOOL'S FAULT, NOT THE SHADER'S. Burn 3:
+    # the reference assumed full coverage while the GPU applied the real antialiased mask. Burn 4:
+    # the fix captured coverage for `tc_get(i,...)` where `i` was the PREVIOUS loop's variable,
+    # parked one row past the end of the corpus — the same garbage triangle for all 15 cases, while
+    # the digests printed above it used `i` correctly and looked entirely plausible. Both times the
+    # verdict text named the emission and both times that was wrong. THE INSTRUMENT IS NOT ABOVE
+    # SUSPICION; the located per-pixel diffs added for this burn exist so the next red names a
+    # pixel instead of a suspect.
+    #
+    # RUN IN THIS ORDER. The order makes a red localise.
+    #   1. run /bin/triref                    (host build) -- note its N16 corpus digest FIRST.
+    #      ⛔ Actually run the HOST triref before the flash and write the digest down; step 3
+    #      compares against it. If they differ, this build's reference is not the host's and
+    #      nothing else on the flash means anything. Current host value: 0x8aed72de.
+    #   2. run /bin/gputri --cov              rung 9b regression: the rasteriser must STILL be
+    #      20/20. Attribute interpolation dispatches the coverage kernel unmodified, so a red here
+    #      indicts the arena move (the prep table went 0xD0000 -> 0xA8000), not the new shader.
+    #   3. run /bin/gputri --tri              the corpus + all eight controls N9-N16.
+    #   4. run /bin/gputri --list             rung 12: 6 overlapping triangles, ONE record.
+    #   5. run /bin/klug > /tri.txt           capture, then mount the FS from Linux to copy out.
+    #
+    # PRE-REGISTERED OUTCOME TABLE — written before the flash:
+    #   95  every record accepted, every dispatch retired, all controls fired, AND every rendered
+    #       rect is byte-identical to the reference. Rung 11 and rung 12 are both settled.
+    #   85  pixels differ. ⭐ READ THE `diff ... x= y= cov= want= got=` LINES — up to four are
+    #       printed per run and they are the whole point of this flash. How to read them:
+    #         cov=0 but got != 0xFF101010      -> the shader wrote OUTSIDE the coverage mask
+    #         alpha agrees, RGB does not       -> the interpolator, not the src-over blend
+    #         want/got equal a NEIGHBOURING px -> addressing (row or column offset), not arithmetic
+    #         every covered px off by a ramp   -> the prep record's scale (2A or the reciprocal)
+    #       ⛔ Do NOT conclude "the emission" from the exit code alone. That was written into this
+    #       table for burns 3 and 4 and it was wrong both times.
+    #   87  the comparison could not be made honestly — #90 refused, or (new this burn) the
+    #       reference SKIPPED a triangle the kernel accepted, which is a validator disagreement
+    #       and makes every pixel number below it meaningless.
+    #  100  no GPU carveout — wrong machine, or the GPU never came up. Not a rung-11 result.
+    #   96  the shader is not resident: gpu_tri_arm's gates refused. An ARMING fault, not a shader
+    #       fault. Check the boot log's arena/ring/matmul lines.
+    #   86  a negative control did not fire. The run proves NOTHING either way — fix and re-burn.
+    #       ⭐ N12 is the one that matters most: it is the only thing standing between an
+    #       x-term-wired-to-zero shader and a green run, because every gradient case is a function
+    #       of y alone and reproduces perfectly with a dead x coefficient.
+    #   90  a slot write/read syscall failed — infrastructure, not the shader.
+    #   Any GPO_E_* reason printed per case: the ABI refused that record. The reason code names the
+    #       field; 22 = frame area, 23 = frame skew, 20 = coordinate out of range.
+    #
+    # ⭐ WHAT IS ALREADY PROVEN AT ZERO BURNS, so a red here does NOT re-open it:
+    #   * the algorithm — trimodel byte-diffs the whole thing against the exact reference at
+    #     register widths, with four falsification gates including the x-term kill.
+    #   * the machine code — two independent assemblers (llvm-mc and the sovereign edgeasm) agree
+    #     on all 269 dwords.
+    #   * the CPU prologue — the kernel's 128-byte prep record is field-identical to the host's.
+    #   * the register budget — the emit list's high-water is v31 against a declared 32.
+    #   ⚠ THIS LIST NARROWS THE SEARCH, IT DOES NOT EMPTY IT — and reading it as "so the fault must
+    #   be dispatch or coherence" is exactly what wasted burns 3 and 4. Nothing above covers THE
+    #   INSTRUMENT: the corpus loop, the coverage capture, the reference's inputs. Two reds in a row
+    #   lived there. Suspect the tool first; it is the only part of the chain with no oracle.
+    echo "[2/2] Building the 3D-arc RUNG 11 kernel (attribute interpolation; no compile flag needed)."
+    echo "      Run: gputri --cov (must STILL be 20/20) THEN gputri --tri THEN klug > /tri.txt"
+    BUILD_ENV=""
+    BUILD_TAG="TRI_RGBA"
+
+elif [ -n "${BURN_EDGE_COV:-}" ]; then
+    # ============================================================================================
+    # 3D ARC RUNG 9b — BURN 1. THE EDGE RASTERISER'S FIRST CONTACT WITH SILICON.
+    # ============================================================================================
+    # ⚠ NO COMPILE FLAG. gpu_edge_arm/gpu_edge_cov are UNCONDITIONAL — a default kernel already
+    # carries them. This mode exists to carry the BRIEF, not a #define: what to run, in what
+    # order, and what each outcome indicts. A burn whose instructions live only in a chat log is
+    # a burn that gets run wrong once and wasted.
+    #
+    # RUN IN THIS ORDER. The order is the whole point — it makes a red localise.
+    #   1. run /bin/gputri --digest > /tmp/d.txt   then compare against the HOST `cpuref` output.
+    #      ⛔ DO THIS FIRST. If the digests differ, this build's reference is not the host's, and
+    #      every byte-comparison below is against the wrong answer. Nothing else on the flash
+    #      means anything until they match.
+    #   2. run /bin/gputri --cov                   the 20-case corpus + negative controls N1-N8.
+    #   3. run /bin/klug > /edge.txt               capture, then mount the FS from Linux to copy out.
+    #
+    # PRE-REGISTERED OUTCOME TABLE — written before the flash, per the arc's own discipline:
+    #   95  every case byte-identical AND every control fired. Rung 9b is DONE, and because B2
+    #       already proved the algorithm exhaustively at zero burns, this also retires
+    #       v_mul_hi_u32 and global_store_byte as suspects in one shot.
+    #  100  no GPU carveout — wrong machine, or the GPU never came up. Not a 9b result.
+    #   96  the shader is not resident: gpu_edge_arm's gates refused. Check the boot log for the
+    #       arena/ring/matmul lines; this is an ARMING fault, not a rasteriser fault.
+    #   88  UNTOUCHED — the dispatch retired and wrote NOTHING. Missing post-dispatch coherence,
+    #       or the EXEC guard rejected every lane. ⛔ NOT an edge-setup bug; do not look there.
+    #   87  wrote but covered nothing — write-back works, the winding evaluated to zero: FILL RULE.
+    #   92  shape right, edge pixels differ by <= 2 — rounding / sub-scanline placement.
+    #   91  wrong shape, large deltas — edge setup or the crossing solve.
+    #   89  PARTIAL, some bytes still sentinel — TGID MAPPING; whole workgroups never dispatched.
+    #   86  a negative control did not fire. The run proves nothing either way; fix and re-burn.
+    #   85  digest mismatch (see step 1).
+    #
+    # ⭐ BURN 2. Burn 1 (2026-07-25) returned 14 of 20 byte-exact with all 20 digests matching.
+    # That RETIRED v_mul_hi_u32 and global_store_byte as suspects — a 64-gon at the edge cap
+    # cannot be byte-exact if either were wrong — so the `--valu` oracle named as a gap before
+    # burn 1 is no longer needed. It was never built, and the ordering call that skipped it paid.
+    #
+    # Two faults fixed since:
+    #   1. Five GPO_E_EDGEBUF rejects were MINE: refraster dropped horizontal edges at ingest, so
+    #      a flat-topped triangle submitted 2 edges against an ABI minimum of 3 — and the CPU and
+    #      GPU were not being given the same geometry. Horizontals are kept now; all 20 digests
+    #      are UNCHANGED, which is the proof the oracle did not move.
+    #   2. ⭐ Case 14 (the OPEN path) was a REAL shader bug: a per-lane `break` rendered as a
+    #      WAVE-level s_cbranch_vccz, so a lane with no crossing to its right filled to the end
+    #      of its pixel. Reproduced exactly in edgemodel.cyr (631 bytes, delta 255, case 14
+    #      alone) before being fixed, and re-verified 135/135 byte-identical after.
+    #
+    # ⇒ Burn 2 returned **20 of 20, exit 95**. RUNG 9b IS COMPLETE — agnos has a GPU triangle
+    # rasteriser, byte-identical to the CPU reference across the whole corpus.
+    #
+    # ============================================================================================
+    # BURN 3 (1.56.18) — RUNG 10, THE KILL GATE. `run /bin/gputri --bench`
+    # ============================================================================================
+    # ⛔ THIS MEASUREMENT CAN KILL RUNGS 11-12, AND THAT IS A LEGITIMATE OUTCOME.
+    #
+    # PRE-REGISTERED, published in the tracker BEFORE this flash (gpu.md rung 10):
+    #     unbatched crossover ~ 12,000 covered px (~110x110)
+    #     batched   crossover ~ 50,000 covered px/frame (~80 glyphs)
+    #
+    # OUTCOME TABLE, also pre-registered:
+    #   · batched crossover WELL BELOW a real frame's coverage ⇒ ★ tier-1 confirmed, rungs 11-12 open
+    #   · batched crossover NEAR a real frame's coverage       ⇒ ship opt-in per surface, not default
+    #   · batched crossover ABOVE a real frame's coverage      ⇒ ⛔ TIER-1 COVERAGE IS DEAD. Rungs
+    #     11-12 do NOT open on it; the arc re-bases on rung 14 (DOOM), which does not depend on
+    #     this measurement at all. REPORT IMMEDIATELY. **This is a result, not a null.**
+    #   · GPU faster but the desktop looks worse ⇒ latency/pacing, not throughput.
+    #
+    # RUN ORDER: `gputri --cov` FIRST (it must still be 20/20 — a regression there invalidates the
+    # bench, since a wrong rasteriser's timing means nothing), THEN `gputri --bench`, THEN klug.
+    #
+    # ⚠ Timed with uptime_ms#40 at 100 Hz, so each point repeats to >= 200 ms and divides. That
+    # measures the FULL ring-3 round trip (submit + fence + wait) — the cost a compositor actually
+    # pays — rather than a kernel-internal timer that would flatter the GPU by hiding the wait.
+    # Both sides are timed the same way, same boot, same geometry, same edge list.
+    #
+    # ⚠ NOT MEASURED: n_edges above the shipped EDGE_CAP of 64, and masks above 256x256. Raising
+    # the cap needs those points and is its own bite — the cap moves on MEASUREMENT, never on the
+    # arithmetic model that set it.
+    #
+    # ============================================================================================
+    # BURN 4 (1.56.18) — RUNG 10 RETRY. The kill gate still has NO NUMBER.
+    # ============================================================================================
+    # Burn 3 froze at the FIRST bench point. Two separate faults, both now fixed:
+    #
+    #   1. ⭐⭐ THE KERNEL ONE, and it is not about the GPU at all. Vector 0 (#DE) was in idt.cyr's
+    #      "deliberately NOT installed" list, so a ring-3 divide by zero returned to the faulting
+    #      idiv forever — ANY userland program that divided by zero froze agnos. Vector 0 now
+    #      joins the curated set AND the {6,13,14} ring-3 kill set. Proven in QEMU by
+    #      scripts/smoke/de-smoke.sh (3/3) and mutation-calibrated: reverting it reproduces the freeze
+    #      exactly. ⇒ Even an unguarded division in ANY tool can no longer take the box down.
+    #
+    #   2. `gputri --bench` FABRICATED a timing instead of refusing: it assigned el = TARGET and
+    #      divided by an already-quadrupled reps, yielding 0 us, and the next line divided by it.
+    #      It now returns a negative sentinel on refusal, prints raw ms/reps evidence beside every
+    #      derived figure, guards all four divisions with named NO VERDICT paths, sanity-checks
+    #      the clock first, and runs its CPU half with no GPU so the harness is QEMU-testable.
+    #
+    # RUN ORDER IS UNCHANGED and still matters:
+    #   1. run /bin/gputri --cov     must still be 20/20. Timing a wrong rasteriser means nothing.
+    #   2. run /bin/gputri --bench   the kill gate. Expect a [cpu-only] block FIRST -- that is the
+    #      harness validating itself before any GPU number is printed.
+    #   3. run /bin/klug > /bench.txt
+    #
+    # ⚠ A "NO VERDICT" line is a legitimate, honest outcome for a point that could not be timed.
+    # It is NOT a failure of the burn. A crossover derived from a partial sweep is simply not the
+    # pre-registered number, and the tool says so rather than quietly averaging over the gap.
+    #
+    # ============================================================================================
+    # BURN 5 (1.56.18) — RUNG 10, THIRD ATTEMPT. THE INSTRUMENT IS NOW PROVEN.
+    # ============================================================================================
+    # ⛔ ROOT CAUSE OF BOTH PREVIOUS FAILURES, and it was ONE thing: `uptime_ms`#40 reads
+    # timer_ticks, and a FOREGROUND `run` program starts with IF CLEARED (ring3.cyr: "a
+    # foreground program is not meant to be preempted" — only /bin/agnsh gets IF=1). The timer
+    # ISR never fires, so #40 is FROZEN for the program's whole duration and anything timing
+    # itself with it measures zero.
+    #   burn 3: el always 0 -> reps exploded -> the bench FABRICATED a timing -> divide by zero.
+    #   burn 4: bench_clock_ok spun waiting for a clock that could not advance.
+    # Both read as bench bugs. The bench had bugs, but the INSTRUMENT was wrong.
+    #
+    # ⭐ FIXED AND PROVEN AT ZERO BURNS: `uptime_us`#95 — rdtsc-backed (needs no interrupts),
+    # calibrated at boot against 50 ms of live ticks, returns -1 rather than a plausible 0 when
+    # calibration is refused. scripts/smoke/tsc-smoke.sh is a DIFFERENTIAL proof: a ring-3 probe samples
+    # #95 around a busy loop with interrupts off and it ADVANCES (3/3, `run: exit 1`) — exactly
+    # where #40 cannot. Calibration on archaemenid measured 3194 cycles/us, so the long-assumed
+    # GPU_TSC_PER_US = 3000 is 6.5% low (not retuned here — that is its own bite).
+    #
+    # Also live since burn 3: a ring-3 divide by zero now KILLS THE PROC instead of freezing the
+    # machine (vector 0 installed + routed to the ring3-kill path; de-smoke 3/3).
+    #
+    # ⇒ THE BAR FOR THIS BURN IS A NUMBER. `--bench` must print a measured crossover, or an
+    # explicit NO VERDICT naming which points could not be timed. Both are readable results.
+    # A hang is not, and is the one outcome the last two burns produced.
+    #
+    # RUN ORDER: gputri --cov (must be 20/20) THEN gputri --bench THEN klug > /bench.txt
+    echo "[2/2] Building the 3D-arc RUNG 9b kernel (edge rasteriser; no compile flag needed)."
+    echo "      Run: gputri --cov (must be 20/20) THEN gputri --bench (RUNG 10 KILL GATE) THEN klug > /bench.txt"
+    BUILD_ENV=""
+    BUILD_TAG="EDGE_COV"
+elif [ -n "${BURN_SHADER_COV:-}" ]; then
+    # plan-S10 — coverage (anti-aliased) blend: uniform colour x 8bpp mask. ⚠ Re-proof required at 1.56.4:
+    # both coverage call sites passed 11 args to a 12-parameter dispatcher until this cut, so the RSRC1 the
+    # kernel ran with was whatever `gx` happened to be. Oracle: 'gpu: shader coverage blend online'.
+    echo "[2/2] Building the plan-S10 SHADER-COV kernel (coverage blend, RSRC1 arity FIXED; capture klug > shader_cov.txt)."
+    BUILD_ENV="SHADER_COV=1"
+    BUILD_TAG="SHADER_COV"
+elif [ -n "${BURN_SHADER_RECT:-}" ]; then
+    # plan-S5 + first half of plan-S7 — the blend over a 2-D grid, into the scanout back buffer, presented.
+    # Builds SHADER_BLEND alongside on purpose: S2 stays the regression net, so if the grid arm fails while
+    # the 64-px arm passes, the fault is isolated to grid/addressing/scanout and cannot be the blend math.
+    echo "[2/2] Building the plan-S5 SHADER-RECT kernel (grid blend to back buffer + S2 net; capture klug > shader_rect.txt)."
+    BUILD_ENV="SHADER_BLEND=1 SHADER_RECT=1"
+    BUILD_TAG="SHADER_RECT"
+elif [ -n "${BURN_SHADER_BLEND:-}" ]; then
+    # plan-S2 — the FIRST per-pixel alpha blend on the CUs (premultiplied f32), 64 px into a fresh arena
+    # slot. Oracle: 'gpu: shader blend lanes stored 64 of 64' THEN 'gpu: shader alpha blend online'. The
+    # lane count is separate on purpose — a dispatch can retire having written nothing if every lane is
+    # EXEC-masked, which is exactly what happened at 1.54.17-19.
+    echo "[2/2] Building the plan-S2 SHADER-BLEND kernel (first alpha blend on the CUs; capture klug > shader_blend.txt)."
+    BUILD_ENV="SHADER_BLEND=1"
+    BUILD_TAG="SHADER_BLEND"
+elif [ -n "${BURN_SHADER_PROBE:-}" ]; then
+    # plan-S1 + D0 — read-only compute-state + DCN MPC probes. No writes, no ring traffic.
+    echo "[2/2] Building the plan-S1+D0 SHADER-PROBE kernel (read-only probes; capture klug > shader_probe.txt)."
+    BUILD_ENV="SHADER_PROBE=1"
+    BUILD_TAG="SHADER_PROBE"
+elif [ -n "${BURN_SDMA_COPY:-}" ]; then
+    # P9.2 — FIRST SDMA PACKET (first hardware 2D on agnos). Rings up SDMA (P9.1) then submits ONE COPY_LINEAR
+    # (4KB carveout→carveout) + a FENCE, kicks via RB_WPTR (register, wptr in BYTES), gates completion on the
+    # FENCE SENTINEL (coherence-honest — rptr alone could false-GREEN on the GL2 strand), and verifies dst==src.
+    # Builds SDMA_RING + SDMA_COPY together. ⚠ NEEDS /fw/sdma.bin on the agnos-fs → flash --update-all. Oracle:
+    # 'gpu: sdma HARDWARE COPY verified'. CAPTURE: klug > sdma_copy.txt.
+    echo "[2/2] Building the P9.2 SDMA-COPY kernel (first hardware copy; FLASH WITH --update-all; capture klug > sdma_copy.txt)."
+    BUILD_ENV="SDMA_RING=1 SDMA_COPY=1"
+    BUILD_TAG="SDMA_COPY"
+elif [ -n "${BURN_SDMA_RING:-}" ]; then
+    # P9.1 — SDMA0 GFX-ring bring-up. PSP-loads the SDMA ucode (F32 halted at boot; agnos loads only CP/MEC),
+    # un-halts the F32, and programs the ring registers (regdump-anchored). NO packet/kick — verifies the engine
+    # un-halts + goes idle (the analogue of the MEC 'queue ready'). ⚠ NEEDS /fw/sdma.bin ON THE agnos-fs → flash
+    # with --update-all (not --update). Oracle: 'gpu: sdma ring ready' in klug. CAPTURE: klug > sdma_ring.txt.
+    echo "[2/2] Building the P9.1 SDMA-ring kernel (SDMA_RING: PSP-load + un-halt + ring config; FLASH WITH --update-all; capture klug > sdma_ring.txt)."
+    BUILD_ENV="SDMA_RING=1"
+    BUILD_TAG="SDMA_RING"
+elif [ -n "${BURN_SDMA_PROBE:-}" ]; then
+    # P9.0 — READ-ONLY SDMA0 register-discovery dump. SDMA is the engine P9 rings up for hardware 2D. Only its
+    # IP base (0x1260) is known; this dumps the SDMA0 block to klug so the real ring/status/ucode offsets can be
+    # anchored against known values (ucode version, idle bit) BEFORE any SDMA write — and reports whether SDMA
+    # ucode is resident. Read-only. ⚠ small hang risk if SDMA's clock is gated (reboot recovers; that's the
+    # finding). CAPTURE: klug > sdma.txt from the shell, send the file.
+    echo "[2/2] Building the P9.0 SDMA-probe kernel (SDMA_PROBE: read-only SDMA0 register dump; capture klug > sdma.txt)."
+    BUILD_ENV="SDMA_PROBE=1"
+    BUILD_TAG="SDMA_PROBE"
+elif [ -n "${BURN_SCANOUT_MATCHGEOM:-}" ]; then
+    # P4 — THE FIX (regdump-confirmed). The firmware scans an 800x600 surface upscaled to 2560x1440; boot_info
+    # reports the 2560x1440 output, so fb_console writes 2560-wide and bands. This reads the REAL viewport+pitch
+    # (0x5EA/0x607) and overrides fb_console to render 800x600, then redraws. NO register writes — pure reads +
+    # a software geometry switch — cannot hang/black. ⚠ ORACLE = the CONSOLE: legible (blocky but CLEAN, no
+    # bands)? Yes ⟹ P4 closed. Needs BIOS quiet-boot ON (the banded/scaled condition).
+    echo "[2/2] Building the P4 MATCHGEOM kernel (SCANOUT_MATCHGEOM: render at the real 800x600 surface; LOOK at legibility; quiet-boot ON)."
+    BUILD_ENV="SCANOUT_MATCHGEOM=1"
+    BUILD_TAG="SCANOUT_MATCHGEOM"
+elif [ -n "${BURN_SCANOUT_REGDUMP:-}" ]; then
+    # P4 — READ-ONLY HUBP register dump. The surface is scaled (~800x600 → 2560x1440); the derived HUBP offsets
+    # are unreliable, so dump the live-pipe HUBP block to klug to re-anchor the real pitch/viewport offsets.
+    # Pure reads — cannot hang, cannot black. ⚠ CAPTURE: klug > regdump.txt from the shell, send the file.
+    echo "[2/2] Building the P4 HUBP REGDUMP kernel (SCANOUT_REGDUMP: read-only register dump to klug; capture klug > regdump.txt)."
+    BUILD_ENV="SCANOUT_REGDUMP=1"
+    BUILD_TAG="SCANOUT_REGDUMP"
+elif [ -n "${BURN_SCANOUT_REDIRECT:-}" ]; then
+    # P4 — THE FIX. The pattern burn proved an agnos-owned buffer scans BAND-FREE while the GOP console surface
+    # bands (surface-specific, not scan-geometry). This redirects fb_console onto that buffer via the P0-verified
+    # address flip ONLY (zero hang risk). ⚠ ORACLE = the CONSOLE ITSELF: is the boot log + shell prompt LEGIBLE
+    # (bands gone)? Yes ⟹ P4 closed. Needs BIOS quiet-boot ON (the banded condition).
+    echo "[2/2] Building the P4 console-REDIRECT kernel (SCANOUT_REDIRECT: fb_console onto the clean agnos buffer; LOOK at first-paint legibility; quiet-boot ON)."
+    BUILD_ENV="SCANOUT_REDIRECT=1"
+    BUILD_TAG="SCANOUT_REDIRECT"
+elif [ -n "${BURN_SCANOUT_PATTERN:-}" ]; then
+    # P4 — SCANOUT BISECTOR (register-truth 2026-07-20). Flips scanout to an agnos-owned buffer painted with
+    # a bars/stripes/checker pattern via the P0-verified address flip ONLY (byte-identical to gpu_blit_present
+    # → ZERO hang risk; the retired SCANOUT_LINEAR path blacked the box by writing the WRONG register 0x607).
+    # ⚠ ORACLE = A PHOTO of the panel: crisp full-width bars + clean fine stripes + clean checker ⟹ the HUBP
+    # scans an agnos linear buffer perfectly ⟹ banding is surface-content (redirect is the fix). Sheared /
+    # garbled fine detail ⟹ a real scan-geometry fault (fix the VERIFIED 0x603). Also reads the corrected
+    # 0x603 pitch to klug during boot (before the flip). Needs BIOS quiet-boot ON to match the banded case.
+    echo "[2/2] Building the P4 scanout-PATTERN kernel (SCANOUT_PATTERN: address-flip bisector; PHOTO the bars/stripes/checker; quiet-boot ON)."
+    BUILD_ENV="SCANOUT_PATTERN=1"
+    BUILD_TAG="SCANOUT_PATTERN"
+elif [ -n "${BURN_HDMI_ACR_CTS:-}" ]; then
+    # THE ACR CTS BURN — the one real register-value delta left after the whole register class was exhausted
+    # (PHY included, 2026-07-20). agnos left HDMI_ACR_CTS_48/44/32_0 at 0; the amdgpu-playing capture writes
+    # 0x3AF5C000 (241500) to all three. The CTS/N ratio is what the sink uses to regenerate its audio clock —
+    # the exact mechanism between "amp armed + receiving our stream" and "decodes as CLEAN silence". agnos was
+    # deliberately NOT writing them ("inert under SOURCE=0"); but amdgpu writes them WITH SOURCE=0, and this
+    # register was never tested on this silicon. Display-safe (audio only, no PHY/PLL/OTG). Single variable.
+    echo "[2/2] Building the ACR-CTS kernel (HDA_HDMI + HDA_TONE + HDMI_ACR_CTS + HDMI_AUDIO_DUMP: program the ACR CTS registers to amdgpu's 241500; LISTEN for the tone)."
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ACR_CTS=1 HDMI_AUDIO_DUMP=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_ACR_CTS+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_HDMI_SYMCLK_AB:-}" ]; then
+    # THE ATTRIBUTION CONTROL BURN. 1.55.24 wrote the five DCCG symbol-clock stores blind and the burn was
+    # written up as "SYMCLKA ARMED THE SINK". The re-audit killed that read: the symbol clock is ALREADY ON in
+    # every silent burn (DIG_SYMCLK_FE_ON/BE_ON both ack SET, identical across all eight logs), the shutdown
+    # pop predates the write by five burns, the operator reports the noise floor recurred on several burns in
+    # the cycle, and not one dumped register differs between the silent burn 8 and the "armed" burn 10.
+    # Cross-boot comparison cannot settle it — sink amp/mute/mode state is SINK-latched and every agnos
+    # instrument is source-side. So do the A/B INSIDE one boot: two labelled ~6 s listening windows, symclk
+    # off then on, twice, each bracketed by a five-register readout, then the ACR N-scale discriminator.
+    # NOTE: deliberately does NOT set HDMI_DCCG — that would apply the write at boot and leave window A
+    # already-on. PASS IS THE OPERATOR'S EARS, and the question is whether A and B DIFFER.
+    echo "[2/2] Building the SYMCLK A/B kernel (HDA_HDMI + HDA_TONE + HDMI_SYMCLK_AB + HDMI_AUDIO_DUMP: two labelled listening windows in ONE boot, symclk OFF then ON; LISTEN for a difference)."
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_SYMCLK_AB=1 HDMI_AUDIO_DUMP=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_SYMCLK_AB+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_HDMI_DCCG:-}" ]; then
+    # THE DCCG SYMCLK BURN — the de-risked candidate. The amdgpu modeset capture proved agnos omits the DCCG
+    # symbol-clock writes amdgpu makes for HDMI (abs 0x159 SYMCLKA-on for DIG1/UNIPHYA, confirmed by DIG1's AVI
+    # landing at 0x564d + phyid=0). This applies exactly those writes in gpu_hdmi_audio_enable. NO ATOM
+    # interpreter, NO transmitter, NO PHY power-cycle — host-visible DCCG only, so display-safe (worst case a
+    # clock glitch, recoverable; not the transmitter's non-recoverable blank). If audio plays, the missing
+    # symbol clock was the whole thing and we never touch the transmitter. PASS IS THE OPERATOR'S EARS.
+    echo "[2/2] Building the DCCG-symclk kernel (HDA_HDMI + HDA_TONE + HDMI_DCCG + HDMI_AUDIO_DUMP: apply the DCCG symbol-clock re-prime amdgpu does for HDMI; host-visible, display-safe; LISTEN for the tone)."
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_DCCG=1 HDMI_AUDIO_DUMP=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_DCCG+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_HDMI_ATOM_HALT:-}" ]; then
+    # THE A4 ISOLATION BURN. Both the live and dry ATOM kernels blacked the iron display before the shell,
+    # with no log — and DRY writes NOTHING to the PHY, so the interpreter's HW writes are not the cause. This
+    # kernel runs the full ATOM DRY path (gpu_vbios_acquire + the interpreter, zero PHY writes), prints its
+    # step markers, then HALTS — freezing the framebuffer BEFORE gpu_hdmi_audio_enable()'s DIG_MODE flip. The
+    # operator photographs the FB (13NN_*.jpg). READ:
+    #   * clean 'gpu: vbios ... acquired OK' + 'atom: ... bringup OK' summary, screen intact
+    #       => the ATOM path is display-safe; the black screen is gpu_hdmi_audio_enable's DIG flip (investigate
+    #          there — prior HDA_HDMI burns kept video, so something in the new path changed its behaviour).
+    #   * black or garbled FB at the halt, or the markers stop partway
+    #       => the ATOM path itself broke the display (gpu_vbios_acquire's pmm_alloc_2mb landing in the APU UMA
+    #          carveout + the 1 MB VBIOS copy is the prime suspect); the last visible marker localizes it.
+    # No ATOM_TRACE (keep the summary on one screen). No PHY drive. No audio.
+    echo "[2/2] Building the A4 ISOLATION kernel (HDA_HDMI + HDMI_ATOM + ATOM_DRY + ATOM_HALT: run the ATOM path with zero PHY writes, then FREEZE the framebuffer before the DIG flip; photograph the FB to isolate ATOM-path vs DIG-flip)."
+    BUILD_ENV="HDA_HDMI=1 HDMI_ATOM=1 ATOM_DRY=1 ATOM_HALT=1"
+    BUILD_TAG="HDA_HDMI+HDMI_ATOM+ATOM_DRY+ATOM_HALT"
+elif [ -n "${BURN_HDMI_ATOM_DRY:-}" ]; then
+    # THE A4 DRY-VALIDATION BURN (safe fallback). Same as BURN_HDMI_ATOM but ATOM_DRY suppresses every MMIO
+    # write and forces reads to 0 — the interpreter runs its full control flow WITHOUT touching the PHY, so
+    # the console is guaranteed to survive and `run /bin/klug > /f/dump.txt` always works. The ATOM_TRACE
+    # output is the deliverable: the exact write sequence agnos's interpreter produces, to diff against the
+    # atom-interp.py oracle (transmitter: 21 reads / 17 writes / 5 delays, writes to UNIPHYA 0x55xx + RDPCS
+    # 0x5Dxx-0x5Exx). Use this if a live BURN_HDMI_ATOM blacks/hangs the console before the shell.
+    echo "[2/2] Building the A4 DRY-VALIDATION kernel (HDA_HDMI + HDMI_ATOM + ATOM_DRY + ATOM_TRACE: run the ATOM interpreter with writes SUPPRESSED; capture the trace and diff vs the oracle. No PHY drive, console safe, no audio)."
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ATOM=1 ATOM_DRY=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_ATOM+ATOM_DRY+ATOM_TRACE+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_HDMI_ATOM_FULL:-}" ]; then
+    # THE ENCODER+TRANSMITTER burn (ATOM_RUN_TRANSMITTER=1). ⚠ The transmitter ENABLE power-cycles the PHY and
+    # BLANKS THE LIVE CONSOLE PIPE NON-RECOVERABLY on iron (proven 1.55.23) unless a full modeset (SetPixelClock
+    # + OTG recommit) is also in place. DO NOT flash this until that modeset exists. Kept for that future work.
+    echo "[2/2] Building the A4 FULL kernel (HDA_HDMI + HDA_TONE + HDMI_ATOM + ATOM_RUN_TRANSMITTER + ATOM_TRACE + HDMI_AUDIO_DUMP: encoder + transmitter. ⚠ BLANKS THE CONSOLE without a full modeset — do not flash yet)."
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ATOM=1 ATOM_RUN_TRANSMITTER=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_ATOM+ATOM_RUN_TRANSMITTER+ATOM_TRACE+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_GPU_RECOVER:-}" ]; then
+    # ⛔⛔ 3D ARC RUNG 5 — THE GPU HANG/RECOVERY BATTERY. One boot, five arms.
+    #
+    # WHY IT EARNS ITSELF EVEN IF 3D NEVER SHIPS: agnos has NO GPU hang detection today, and that
+    # is already true for #82, #83 and #92, which SHIP. A runaway tentib matmul or a malformed
+    # #92 batch kills the box with no log. Every safety property agnos has bounds how long the
+    # CPU WAITS, never what the GPU DOES.
+    #
+    # ⛔ ARM A DELIBERATELY HANGS THE GPU. The panel may go dark. That IS the experiment.
+    # ⭐ Arm A's ORACLE IS THE FORENSIC BRACKET IN THE LOG, not whether recovery then works:
+    # "we can SEE the hang" and "we can CLEAR the hang" are different claims, and collapsing them
+    # would let a failed recovery hide a working instrument every later rung depends on.
+    #
+    # ⛔ NO GRBM_SOFT_RESET anywhere in the ladder — gpu.cyr's own note says it would wipe
+    # PSP-loaded ucode, which agnos re-loads only at boot: a recoverable hang would become a dead
+    # GPU until reboot.
+    #
+    # ⚠ The RECOVERY LADDER is in EVERY build; only the deliberate WEDGE is behind GPU_RECOVER.
+    echo "[2/2] Building the RUNG 5 kernel (GPU_RECOVER: hang forensics + the R-2/R-3/R-4 recovery ladder + the controlled-wedge arm. ⛔ ARM A HANGS THE GPU ON PURPOSE and the panel may go dark; the log's forensic bracket is the oracle, not the screen)."
+    BUILD_ENV="GPU_RECOVER=1"
+    BUILD_TAG="GPU_RECOVER"
+elif [ -n "${BURN_MODESET_AUDIO:-}" ]; then
+    # ⛔⛔ M9 — THE SEQUENCING BURN. The whole arc's A4 question, reduced to ONE variable.
+    #
+    # THE EXPERIMENT: /bin/modeset --audio-pre and --audio-post run the SAME kernel code path
+    # (mdo_transmit_run(arm)) with provably IDENTICAL staging. The ONLY difference is where the
+    # unmute lands relative to the ATOM #76 transmitter edge:
+    #     --audio-pre   unmute BEFORE the edge   = what agnos has always done   = CONTROL
+    #     --audio-post  unmute AFTER  the edge   = what amdgpu does (+22.2 ms)  = TREATMENT
+    #
+    # ⛔ RUN BOTH IN ONE BOOT. A cross-boot comparison cannot control the sink's latched state
+    # ([[feedback_ear_oracle_needs_negative_control]]). One sink state, one cable, one volume.
+    #
+    # ⛔ HDA_TONE IS DELIBERATELY OFF. A fixed kernel sine is exactly guessable and would void the
+    # ear oracle. The tone comes from the ring-3 feed, not from the kernel.
+    # ⛔ BURN_AUDIO_TEARDOWN STAYS OFF. The shutdown release pop is the arc's only sink-side
+    # instrument; tearing down on exit destroys it.
+    #
+    # ⚠ L1 (the zero-burn Linux discriminator) could NOT pre-answer this: its positive control
+    # was silent because agnos's bracket is not replayable from userspace — both OTG_MASTER_EN=0
+    # and the FE_SOURCE_SELECT teardown hard-wedge the APU there. See prior-art/l1-verdict-0724.md.
+    # So this burn carries the question undiminished; L1 neither supports nor refutes it.
+    #
+    # ⚠ PREREQUISITE, and it is not optional: the M9d-fix (gpu_hdmi_audio_enable takes the
+    # caller's phy). Without it gpu_phy_discover() re-runs AFTER the BE<->FE disconnect has
+    # cleared FE_SOURCE_SELECT, staging REFUSES, and BOTH arms unmute over a register file that
+    # was never programmed — two identical non-experiments wearing the names of a control and a
+    # treatment. Landed 1.56.14; the H8 arm below proves it is in the artifact.
+    echo "[2/2] Building the M9 SEQUENCING kernel (HDA_HDMI + HDMI_ATOM + ATOM_TX_CYCLE + MODESET_AUDIO + ATOM_TRACE + HDMI_AUDIO_DUMP: staged-muted audio around a REAL #76 PHY edge; two arms differing ONLY in unmute position. ⛔ THE PANEL GOES DARK MID-SEQUENCE and must relight. EAR-CHECK the sink, EYE-CHECK the screen)."
+    BUILD_ENV="HDA_HDMI=1 HDMI_ATOM=1 ATOM_TX_CYCLE=1 MODESET_AUDIO=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1"
+    BUILD_TAG="HDA_HDMI+HDMI_ATOM+ATOM_TX_CYCLE+MODESET_AUDIO+ATOM_TRACE+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_MODESET_TX_CYCLE:-}" ]; then
+    # ⛔⛔ M8e (re-scoped 1.56.14) — THE REAL TRANSMITTER EDGE. #76 DISABLE then ENABLE, inside M6's
+    # iron-proven OTG envelope, aimed by gpu_phy_discover() at the LIVE transmitter (phyid=1, measured).
+    #
+    # WHY A CYCLE AND NOT JUST ENABLE: on an already-enabled transmitter, #76 ENABLE is a proven NO-OP
+    # (snapshot DRY: 4 reads / 2 writes / 0 delays, zero PHY registers written). The only way to produce a
+    # genuine edge is DISABLE -> ENABLE. Predicted from the seeded DRY: DISABLE = 4 writes (clears
+    # DIG_ENABLE, drives RDPCSTX1); ENABLE = 20 writes across DIG1 / UNIPHYB / RDPCSTX1 — the full bring-up.
+    #
+    # ⛔ THE PANEL GOES DARK between the two halves, BY DESIGN. That is the edge, not a failure. It must
+    # relight when the ENABLE's bring-up completes. If it does not: the in-kernel watchdog re-runs the
+    # inherited-mode program, then power_reset(); and H2's latch makes that reboot clean and self-disabling.
+    # Worst case is ONE bad boot plus `rm /.modeset-armed` — never a reflash.
+    #
+    # Burn the NEGATIVE CONTROL first if in any doubt: BURN_MODESET_TRANSMITTER_LIVE runs the same code
+    # path with ENABLE-only (no edge), so anything it changes did NOT come from the transmitter.
+    echo "[2/2] Building the M8e TRANSMITTER-CYCLE kernel (HDMI_ATOM + ATOM_TX_CYCLE + ATOM_TRACE: #76 DISABLE then ENABLE — a REAL PHY edge on the live link. ⛔ THE PANEL WILL GO DARK MID-SEQUENCE and must relight; H2 recovers in one boot. EYE-CHECK the screen)."
+    BUILD_ENV="HDMI_ATOM=1 ATOM_TX_CYCLE=1 ATOM_TRACE=1"
+    BUILD_TAG="HDMI_ATOM+ATOM_TX_CYCLE+ATOM_TRACE"
+elif [ -n "${BURN_MODESET_TRANSMITTER_LIVE:-}" ]; then
+    # ⛔⛔ M8e — THE DANGEROUS RUNG. ATOM #76 DIG1TransmitterControl(ENABLE) runs LIVE, inside M6's
+    # iron-proven OTG envelope, driven from ring 3 by `run /bin/modeset --transmitter`. #76 power-cycles the
+    # PHY (556F power + 5E03 lane reset + 5DF0/5DE9 RDPCS among 17 writes) and has blanked this display
+    # TWICE. The envelope makes it SURVIVABLE, not safe.
+    # Do NOT flash this until M8d (the #76-off rung below) has burned green, because M8d retires every other
+    # risk in the sequence and leaves this one edge as the only variable.
+    # Recovery, in order: the in-kernel watchdog re-runs the inherited-mode program; if that fails it calls
+    # power_reset(); and H2's latch makes that reboot clean and self-disabling (next boot SKIPS the modeset).
+    # Worst case is ONE bad boot and `rm /.modeset-armed` — never a reflash.
+    echo "[2/2] Building the M8e LIVE-TRANSMITTER kernel (HDMI_ATOM + ATOM_RUN_TRANSMITTER + ATOM_TRACE: ATOM #4 AND the LIVE #76 PHY edge inside the OTG envelope. ⛔ THE PANEL MAY GO DARK — H2 recovers in one boot. EYE-CHECK the screen)."
+    BUILD_ENV="HDMI_ATOM=1 ATOM_RUN_TRANSMITTER=1 ATOM_TRACE=1"
+    BUILD_TAG="HDMI_ATOM+ATOM_RUN_TRANSMITTER+ATOM_TRACE"
+elif [ -n "${BURN_MODESET_TRANSMITTER:-}" ]; then
+    # M8d — the SAFE transmitter rung, and the one to burn FIRST. `run /bin/modeset --transmitter` runs the
+    # whole sequence inside M6's envelope — BE<->FE disconnect, ATOM #4 DIGxEncoderControl (the DIG digital
+    # front end at 0x56xx, DISJOINT from the PHY at 0x5Dxx), the infoframe programming, BE<->FE reconnect,
+    # OTG re-commit — with ATOM #76 COMPILED OUT. It therefore CANNOT blank the panel the way #76 does, and
+    # it retires every risk in the sequence except that one edge.
+    # H8 proves the artifact matches this claim in BOTH directions before you flash (verify_marker on the
+    # SKIPPED string, verify_absent on the live-edge string).
+    echo "[2/2] Building the M8d SAFE-TRANSMITTER kernel (HDMI_ATOM + ATOM_TRACE: ATOM #4 encoder + the full enveloped sequence, #76 COMPILED OUT — cannot blank via the PHY edge)."
+    BUILD_ENV="HDMI_ATOM=1 ATOM_TRACE=1"
+    BUILD_TAG="HDMI_ATOM+ATOM_TRACE"
+elif [ -n "${BURN_HDMI_ATOM:-}" ]; then
+    # THE A4 ENCODER-ONLY BURN (the audio attempt). Iron 1.55.23 proved: the interpreter is bit-correct, but
+    # DIG1TransmitterControl(ENABLE) power-cycles the PHY and blanks the live pipe. So this runs
+    # DIGxEncoderControl(#4, STREAM_SETUP, HDMI) ONLY — 5 writes in the DIG1 digital front-end (0x56xx),
+    # DISJOINT from the PHY (0x5Dxx) — putting DIG1 in true HDMI mode with proper data-island setup, which the
+    # raw DIG_MODE bit-flip only half-does. The transmitter (#76) is gated OFF (ATOM_RUN_TRANSMITTER unset).
+    # Display risk: at worst a transient, self-recovering front-end flicker (the DIG_START strobe) — the same
+    # survivable class as the DIG_MODE flip, NOT the transmitter's non-recoverable blank. Then the proven audio
+    # path (gpu_hdmi_audio_enable) runs. LIVE (no ATOM_DRY): the encoder writes are actually applied, RMW'd
+    # against the real running registers. ATOM_TRACE logs the 5 writes; HDMI_AUDIO_DUMP keeps the read-back.
+    # Recovery if it misbehaves: flash without HDMI_ATOM. PASS IS THE OPERATOR'S EARS: a tone from the XB323U.
+    echo "[2/2] Building the A4 ENCODER-ONLY kernel (HDA_HDMI + HDA_TONE + HDMI_ATOM + ATOM_TRACE + HDMI_AUDIO_DUMP: run DIGxEncoderControl(HDMI) LIVE — PHY-safe front-end setup, transmitter SKIPPED — then the audio path. Recoverable flicker at worst; LISTEN for the tone)."
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ATOM=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_ATOM+ATOM_TRACE+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_HDMI_SWEEP:-}" ]; then
+    # THE MATRIX BURN. The register-value class is exhausted (every DCN reg matches amdgpu, still silent),
+    # so stop testing one hypothesis per reflash. This kernel, post-sti with the HDA tone already streaming
+    # to the HDMI sink, cycles gpu_hdmi_audio_profile(0..N): each applies a candidate structural/sequencing/
+    # clock fix to the LIVE encoder, prints "hdmi-sweep: profile N = <name>", and holds ~3s. The operator
+    # WATCHES serial + LISTENS — one boot tests the whole matrix. Adds HDMI_AUDIO_DUMP so the register state
+    # of the LAST-applied profile is on record. PASS IS STILL THE OPERATOR'S EARS.
+    echo "[2/2] Building the HDMI-audio MATRIX kernel (HDA_HDMI + HDA_TONE + HDMI_AUDIO_SWEEP + HDMI_AUDIO_DUMP: cycle every candidate fix in one boot; watch serial + listen for which profile makes sound)."
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_AUDIO_SWEEP=1 HDMI_AUDIO_DUMP=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_AUDIO_SWEEP+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_HDMI_DUMP:-}" ]; then
+    # THE MEASUREMENT BURN. Use this one for the display-audio arc until the silence is explained.
+    #
+    # Adds HDMI_AUDIO_DUMP on top of BURN_HDMI: reads the whole display-audio block back AFTER every write
+    # has landed, in the same register order and naming as agnosticos/scripts/dump-dcn-audio.py, so agnos
+    # can be diffed against the known-good MECHANICALLY instead of by argument.
+    #
+    # Capture the result with `run /bin/klug > /f/dump.txt` at the agnsh prompt, then mount agnos-fs from
+    # Linux to copy it out. The line that matters most is NOT in the dump: gpu_hdmi_audio_crc_probe prints
+    # whether samples PHYSICALLY traverse the encoder, which is the one question the register block cannot
+    # answer about itself.
+    #
+    # PASS IS STILL THE OPERATOR'S EARS. Twelve burns read green while mute; the log line is not the oracle.
+    echo "[2/2] Building the HDMI-audio MEASUREMENT kernel (HDA_HDMI + HDA_TONE + HDMI_AUDIO_DUMP: sovereign DCN audio path + audible sweep + the full register read-back for diffing against amdgpu's known-good)."
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_AUDIO_DUMP=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_HDMI:-}" ]; then
+    # HDA_HDMI: probe/route/stream instance 1 (04:00.1, the HDMI/DP digital sink) + the sovereign DCN
+    # display-audio path (DIG mode, Azalia endpoint, AVI InfoFrame, audio DTO, PME wake). HDA_TONE: audible
+    # sweep. Analog instance 0 keeps playing out the front jack.
+    #
+    # Gated because this path writes the encoder carrying the operator's only console and NO register on it
+    # reports sink health — an HDMI source is transmit-only. The default/MVP kernel therefore never touches
+    # DIG_MODE and cannot black-screen loop.
+    #
+    # For the display-audio arc prefer BURN_HDMI_DUMP above — it adds the register read-back.
+    echo "[2/2] Building the HDMI-audio kernel (HDA_HDMI: sovereign DCN display-audio path on 04:00.1; HDA_TONE: audible sweep). Analog instance 0 still plays out the front jack."
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE"
+elif [ -n "${BURN_HDA_TONE:-}" ]; then
+    echo "[2/2] Building the HDA_TONE first-tone kernel (hda_stream_arm fills a ~375 Hz triangle -> audible out the codec)..."
+    BUILD_ENV="HDA_TONE=1"
+    BUILD_TAG="HDA_TONE"
+elif [ -n "${BURN_SELFTESTS:-}" ]; then
+    echo "[2/2] Building the iron EXEC selftest kernel (BURN_SELFTESTS: EXEC_SELFTEST + EXT2_WRITE_SELFTEST)..."
+    BUILD_ENV="EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1"
+    BUILD_TAG="EXEC_SELFTEST"
+else
+    echo "[2/2] Building the BARE production kernel (no selftests — set BURN_SELFTESTS=1 to re-enable)..."
+    BUILD_ENV=""
+    BUILD_TAG="bare"
+fi
+# AMBIENT-ENV LEAK, closed 2026-07-19. `env $BUILD_ENV` ADDS to the inherited environment — it does not
+# replace it. So an exported HDMI_ATOM=1 (or any other flag) lingering in the operator's shell from an earlier
+# experiment reaches build.sh and gets #define'd REGARDLESS of the profile selected above, silently producing
+# an artifact that is not the one the burn tag names. Same family as the ATOM_DRY no-op: the tag stops
+# describing the binary. Clear every known build flag first, then apply only the profile's own.
+if ! env -u HDA_HDMI -u HDA_TONE -u HDMI_DCCG -u HDMI_ATOM -u HDMI_AUDIO_DUMP -u HDMI_AUDIO_SWEEP \
+        -u ATOM_DRY -u ATOM_TRACE -u ATOM_HALT -u ATOM_RUN_TRANSMITTER \
+        -u EXT2_WRITE_SELFTEST -u EXEC_SELFTEST -u THREAD_SELFTEST \
+        $BUILD_ENV sh scripts/build.sh >/tmp/burn-prep-build.log 2>&1; then
+    echo "burn-prep: BUILD-FAIL (see /tmp/burn-prep-build.log)"
+    exit 1
+fi
+
+# --- PROVE THE FLAGS ACTUALLY LANDED IN THE ARTIFACT -------------------------
+# A burn was wasted on 2026-07-15 because build/agnos was silently rebuilt WITHOUT these flags between
+# burn-prep and the flash (scripts/check.sh line 24 runs build.sh with no BUILD_ENV, so ANY check.sh run
+# after this point clobbers the burn artifact with a bare production kernel). The boot log looked normal —
+# the HDMI-audio block simply was not there, and the tone went out the analog jack nobody has plugged in.
+#
+# So verify rather than trust. Each marker below is a string that exists ONLY inside the matching #ifdef
+# block in main.cyr, so its presence proves the code is COMPILED AND REACHED.
+#
+# Do NOT verify with a string from an #ifdef'd FUNCTION BODY: gpu_hdmi_audio_crc_probe's own text is
+# present in a bare production kernel too, because the function compiles and is simply never called. That
+# is the exact trap this check exists to close — "a plain build compiles the code and never calls it".
+verify_marker() {
+    if ! grep -qa "$1" build/agnos; then
+        echo ""
+        echo "burn-prep: ARTIFACT-MISMATCH -- build/agnos does NOT contain '$1'"
+        echo "  Expected it for BUILD_TAG=$BUILD_TAG. The flags did not land, or something rebuilt"
+        echo "  build/agnos after the build (check.sh and test.sh both call build.sh with no BUILD_ENV)."
+        echo "  DO NOT FLASH THIS. Re-run burn-prep and flash immediately, running nothing in between."
+        exit 1
+    fi
+}
+# verify_absent — THE OTHER HALF OF THE GATE, and M8 is why it exists.
+#
+# verify_marker proves a flag's code IS in the artifact. For a DESTRUCTIVE flag you need the opposite proof
+# just as badly: that the build you are about to flash does NOT carry the dangerous path. ATOM #76
+# (DIG1TransmitterControl) power-cycles the PHY and has blanked this display twice — once because ATOM_DRY
+# was a flag build.sh never emitted, so "dry" and "live" compiled BYTE-IDENTICAL and nothing could tell them
+# apart. A presence-only check cannot catch that class: it fails open in the destructive direction.
+#
+# So for the transmitter burns the marker pair is checked BOTH ways — the live-edge string must be present
+# in the live build and ABSENT in the safe one — which makes the two builds provably distinguishable before
+# the flash rather than after the panel goes dark.
+verify_absent() {
+    if grep -qa "$1" build/agnos; then
+        echo ""
+        echo "burn-prep: ARTIFACT-MISMATCH -- build/agnos DOES contain '$1' and must not"
+        echo "  BUILD_TAG=$BUILD_TAG is the SAFE variant, but the artifact carries the destructive path."
+        echo "  Flashing this could drive the PHY when you expected it not to. DO NOT FLASH THIS."
+        exit 1
+    fi
+}
+case "$BUILD_TAG" in *HDA_HDMI*)         verify_marker "ctl1 probing 2nd controller" ;; esac
+case "$BUILD_TAG" in *HDA_TONE*)         verify_marker "sweep streaming" ;; esac
+case "$BUILD_TAG" in *HDMI_AUDIO_DUMP*)  verify_marker "== agnos display-audio dump ==" ;; esac
+case "$BUILD_TAG" in *HDMI_AUDIO_SWEEP*) verify_marker "hdmi-sweep: cycling" ;; esac
+# MARKER-COVERAGE GAP, closed 2026-07-19. The four arms above covered only the HDA_* / HDMI_AUDIO_* flags,
+# yet the "markers verified" line below claims the WHOLE $BUILD_TAG is compiled AND reached. So every
+# HDMI_DCCG and ATOM_* burn shipped unverified for the very flag under test — the 1.55.24 DCCG burn included
+# (it happened to carry its kprintln, but that was luck, not process). This is the ATOM_DRY defect's family:
+# a flag whose presence in the tag was never proven in the artifact. Each marker below is a kprintln inside
+# the flag's own #ifdef, in a function called unconditionally, so it satisfies verify_marker's own rule.
+# ── M9 (MODESET_AUDIO). FOUR arms, and they are bidirectional: the audio arms must be PRESENT in
+# ── RUNG 5. Bidirectional: the wedge arm must be PRESENT in a GPU_RECOVER build and ABSENT from
+# every other one. The first GPU_RECOVER build DID silently lose the flag (build.sh had no such
+# flag yet) and compiled byte-identical to bare — the ATOM_DRY class, caught by comparing sizes.
+# This arm makes that impossible to ship.
+case "$BUILD_TAG" in
+    *GPU_RECOVER*)
+        verify_marker "ARM A -- controlled wedge"
+        verify_marker "submitting a WAIT_REG_MEM that can never be satisfied"
+        # The ladder is compiled into EVERY build, so it must be here too — without it arm A
+        # would hang the box with no way back.
+        verify_marker "RECOVERY LADDER"
+        ;;
+    *)
+        verify_absent "submitting a WAIT_REG_MEM that can never be satisfied"
+        ;;
+esac
+# an M9 build and ABSENT from every other one. Without the negative half, a build that silently
+# lost the flag would still pass — which is the ATOM_DRY defect exactly (two artifacts that differ
+# in name and not in behaviour).
+case "$BUILD_TAG" in
+    *MODESET_AUDIO*)
+        verify_marker "ARM 1 CONTROL: unmute BEFORE the edge"
+        verify_marker "ARM 2 TREATMENT: unmute AFTER the edge"
+        # The DIG_MODE fold — proves the audio arms flip signalling to HDMI. Arm 0 must not.
+        verify_marker "DIG_MODE 2 -> 3 (HDMI signalling live; audio arm)"
+        # M9c: boot must NOT perform the bring-up, or a boot-time unmute latches the sink before
+        # the op ever runs and both arms measure the same pre-latched state.
+        verify_marker "boot-time hdmi audio SUPPRESSED"
+        # ⚠ HONEST CAVEAT on the *HDMI_AUDIO_DUMP* arm above: under MODESET_AUDIO the BOOT call to
+        # gpu_audio_dump() is suppressed (M9c), so that marker proves the string is COMPILED but no
+        # longer that it is REACHED at boot. It is still reached via `run /bin/dump`. Do not read
+        # that one as a reachability proof in an M9 build.
+        ;;
+    *)
+        # ⛔ NEGATIVE HALF: no other build may carry the audio arms.
+        verify_absent "ARM 1 CONTROL: unmute BEFORE the edge"
+        verify_absent "ARM 2 TREATMENT: unmute AFTER the edge"
+        ;;
+esac
+# ⛔⛔ THE STAGED TOOL MUST MATCH THE ONE JUST BUILT.
+# install-media.sh flashes /bin/* from build/rootfs/bin/, NOT from each tool's own build dir.
+# On 2026-07-24 the M9 burn shipped a correct kernel (opmask=511, both arms advertised) paired
+# with a modeset tool from SIX HOURS EARLIER that had no --audio-pre at all. Both arms fell
+# through to the caps probe, which returns 95 on a lit panel — indistinguishable from success.
+# The operator ran the experiment twice, heard silence twice, and none of it was data.
+# burn-prep verified the KERNEL artifact and never looked at the tools it would be flashed with.
+for _t in modeset gpuwedge gputri klug; do
+    _src=""
+    case "$_t" in
+        modeset)  _src="tests/gpu/build/modeset_agnos" ;;
+        gpuwedge) _src="tests/gpu/build/gpuwedge_agnos" ;;
+        gputri)   _src="tests/gpu/build/gputri_agnos" ;;
+        klug)    _src="" ;;   # klug is staged from its own repo; size-compare only
+    esac
+    _staged="build/rootfs/bin/$_t"
+    if [ ! -f "$_staged" ]; then
+        echo "burn-prep: STAGING GAP -- $_staged is MISSING. install-media would flash no $_t."
+        echo "  Fix:  sh scripts/burn/stage-tools.sh"
+        exit 1
+    fi
+    if [ -n "$_src" ] && [ -f "$_src" ]; then
+        if ! cmp -s "$_src" "$_staged"; then
+            echo "burn-prep: STALE STAGED TOOL -- build/rootfs/bin/$_t differs from $_src"
+            echo "  staged: $(stat -c%s "$_staged") bytes, $(stat -c%y "$_staged" | cut -d. -f1)"
+            echo "  built:  $(stat -c%s "$_src") bytes, $(stat -c%y "$_src" | cut -d. -f1)"
+            echo "  install-media.sh flashes the STAGED one, so the burn would carry the old tool."
+            echo "  Fix:  sh scripts/burn/stage-tools.sh"
+            exit 1
+        fi
+    fi
+done
+echo "  staged tools match their builds (modeset, gpuwedge, gputri, klug)"
+case "$BUILD_TAG" in
+    *GPU_RECOVER*)
+        # ⛔ The staged tool must be able to invoke the arms, or the burn's own oracle is
+        # unreachable — exactly what wasted the first M9 flash.
+        for _m in "--wedge" "--recover" "--baseline" "--verify" "--console"; do
+            if ! grep -qa -- "$_m" build/rootfs/bin/gpuwedge 2>/dev/null; then
+                echo "burn-prep: STAGED /bin/gpuwedge LACKS '$_m' -- the burn's oracle cannot be invoked."
+                exit 1
+            fi
+        done
+        echo "  staged /bin/gpuwedge carries all five arms"
+        ;;
+esac
+# ⛔ RUNG 9b: the oracle must be INVOKABLE from the staged binary, not merely present. Same gate
+# as GPU_RECOVER above and for the same reason -- on 2026-07-24 a burn shipped a correct kernel
+# with a tool six hours old that lacked the arm under test; both arms fell through to a probe
+# that returns 95, and two runs of the experiment produced no data at all.
+for _m in "--cov" "--digest" "--bench"; do
+    if ! grep -qa -- "$_m" build/rootfs/bin/gputri 2>/dev/null; then
+        echo "burn-prep: STAGED /bin/gputri LACKS '$_m' -- rung 9b's oracle cannot be invoked."
+        echo "  Fix:  sh scripts/burn/stage-tools.sh"
+        exit 1
+    fi
+done
+# ⭐ And it must carry the NEGATIVE CONTROLS. A gputri without N1-N8 can still print "20 of 20",
+# and TWO of the twenty corpus cases have an ALL-ZERO correct answer -- so a shader that writes
+# nothing reproduces them byte-exactly. Staging a control-less build makes the burn unfalsifiable.
+if ! grep -qa -- "NEGATIVE CONTROL N" build/rootfs/bin/gputri 2>/dev/null; then
+    echo "burn-prep: STAGED /bin/gputri has NO negative controls -- its 20/20 would be"
+    echo "  satisfiable by a shader that writes nothing. Rebuild and re-stage."
+    exit 1
+fi
+echo "  staged /bin/gputri carries --cov, --digest, --bench and the N1-N8 controls"
+case "$BUILD_TAG" in
+    *MODESET_AUDIO*)
+        # The flags the operator is told to type MUST exist in the binary that gets flashed.
+        for _m in "--audio-pre" "--audio-post" "ARM 1 CONTROL" "ARM 2 TREATMENT"; do
+            if ! grep -qa -- "$_m" build/rootfs/bin/modeset; then
+                echo "burn-prep: STAGED TOOL LACKS '$_m' -- the burn's own oracle cannot be invoked."
+                exit 1
+            fi
+        done
+        echo "  staged /bin/modeset carries both M9 arms"
+        ;;
+esac
+case "$BUILD_TAG" in *HDMI_DCCG*)        verify_marker "hdmi DCCG symclk re-prime" ;; esac
+case "$BUILD_TAG" in *HDMI_SYMCLK_AB*)   verify_marker "symclk-ab: in-boot A/B" ;; esac
+case "$BUILD_TAG" in *HDMI_ACR_CTS*)     verify_marker "hdmi acr cts programmed" ;; esac
+case "$BUILD_TAG" in *SCANOUT_PATTERN*)  verify_marker "scanout pattern probe armed" ;; esac
+case "$BUILD_TAG" in *SCANOUT_REDIRECT*) verify_marker "console redirected to agnos scanout buffer" ;; esac
+# ⚠ NOT "HUBP regdump begin" — that string lives INSIDE gpu_scanout_regdump(), an always-compiled function,
+# and this tree does not run DCE by default, so it is present in EVERY binary and verified nothing. The
+# marker must be a kprintln inside the flag's own #ifdef; this one is the boot call site's banner.
+case "$BUILD_TAG" in *SCANOUT_REGDUMP*)  verify_marker "hubp regdump build armed" ;; esac
+# --- H8, the M8 transmitter gate: the marker pair, checked in BOTH directions ---------------------------
+# HDMI_ATOM alone is the SAFE transmitter build (envelope + ATOM #4 encoder; #76 compiled OUT). It must
+# carry the SKIPPED marker and must NOT carry the live-edge string.
+case "$BUILD_TAG" in
+    *ATOM_RUN_TRANSMITTER*) ;;                                   # enable-only rung — its own arm below
+    *ATOM_TX_CYCLE*) ;;                                          # the real-edge rung — its own arm below
+    *HDMI_ATOM*)
+        # Plain HDMI_ATOM = the SAFE transmitter build: #4 runs, no form of #76 does.
+        verify_marker "ATOM #76 SKIPPED"
+        verify_absent "ENABLE only (negative control"
+        verify_absent "CYCLE: DISABLE then ENABLE"
+        ;;
+esac
+# ATOM_RUN_TRANSMITTER is the DESTRUCTIVE build: the live-edge string must be present and the SKIPPED
+# string absent. Both halves matter — a build carrying neither would mean mdo_transmit did not compile at all.
+case "$BUILD_TAG" in *ATOM_RUN_TRANSMITTER*)
+        verify_marker "ATOM #76 ENABLE only (negative control"
+        verify_absent "ATOM #76 SKIPPED"
+        verify_absent "CYCLE: DISABLE then ENABLE"
+        ;;
+esac
+# ⛔ M8e — the REAL transmitter edge (DISABLE then ENABLE). The most destructive build in the arc, so the
+# marker pair is checked BOTH ways, exactly like the enable-only rung.
+# ⚠ KEY ON THE mdo_transmit STRINGS, NEVER on atom.cyr's "76 DISABLE phyid": that text lives in
+# atom_run_transmitter_disable_hdmi(), which COMPILES under plain HDMI_ATOM whether or not anything calls
+# it — so it is present in all three transmitter builds and discriminates nothing. Same false-assuring
+# trap as the old "atom: running DIGxEncoderControl" marker.
+case "$BUILD_TAG" in *ATOM_TX_CYCLE*)
+        verify_marker "CYCLE: DISABLE then ENABLE"
+        verify_absent "ATOM #76 SKIPPED"
+        verify_absent "ENABLE only (negative control"
+        ;;
+esac
+case "$BUILD_TAG" in *SCANOUT_MATCHGEOM*) verify_marker "scanout matchgeom armed" ;; esac
+case "$BUILD_TAG" in *SDMA_PROBE*)       verify_marker "sdma probe armed" ;; esac
+case "$BUILD_TAG" in *SDMA_RING*)        verify_marker "sdma ring bringup armed" ;; esac
+case "$BUILD_TAG" in *SDMA_COPY*)        verify_marker "sdma ring bringup armed" ;; esac
+case "$BUILD_TAG" in *ATOM_DRY*)         verify_marker "atom: DRY build (no MMIO)" ;; esac
+# ⚠ FALSE-ASSURING MARKER, FIXED. This used to verify "atom: running DIGxEncoderControl", which lives in
+# atom_hdmi_transmitter_bringup() — whose ONLY caller is main.cyr's #ifdef HDA_HDMI block. In an
+# HDMI_ATOM-without-HDA_HDMI build (exactly the M8d/M8e transmitter burns) that string is present in the
+# artifact and NEVER EXECUTES, while the summary below claims "compiled AND reached". That is the same
+# class of defect verify_marker's own header warns about. The M-lane transmitter burns are driven from
+# mdo_transmit, so verify a string from THERE; keep the old marker only for the HDA_HDMI audio builds.
+case "$BUILD_TAG" in
+    *HDMI_ATOM*)
+        case "$BUILD_TAG" in
+            *HDA_HDMI*) verify_marker "atom: running DIGxEncoderControl" ;;
+            *)          verify_marker "modeset: transmit -- ATOM #4 DIGxEncoderControl" ;;
+        esac
+        ;;
+esac
+# ATOM_TRACE is the transmitter burns' ONLY non-eye instrument (it logs each ATOM MMIO write), and it had
+# no marker at all — a silently-dropped ATOM_TRACE would cost the burn its write list.
+case "$BUILD_TAG" in *ATOM_TRACE*)       verify_marker "atom w=" ;; esac
+
+SZ="$(stat -c %s build/agnos 2>/dev/null)"
+MT="$(stat -c %y build/agnos 2>/dev/null | cut -d. -f1)"
+VER="$(cat VERSION 2>/dev/null)"
+SUM="$(sha256sum build/agnos 2>/dev/null | cut -c1-16)"
+echo "  build/agnos: $SZ bytes, built $MT  (AGNOS $VER, $BUILD_TAG)"
+if [ "$BUILD_TAG" != "bare" ]; then
+    echo "  markers verified: the $BUILD_TAG code is compiled AND reached (not merely present)."
+fi
+
+# Stamp the artifact so staleness is DETECTABLE rather than silent. `sh scripts/burn/burn-verify.sh` re-checks
+# this before a flash; a mismatch means something rebuilt build/agnos since burn-prep ran.
+printf '%s\n%s\n%s\n%s\n' "$BUILD_TAG" "$SZ" "$VER" "$(sha256sum build/agnos | cut -d" " -f1)" > build/agnos.burn-tag
+echo "  stamped build/agnos.burn-tag ($SUM...) -- re-check with: sh scripts/burn/burn-verify.sh"
+echo ""
+echo "  !! Run NOTHING between here and the flash. check.sh / test.sh rebuild build/agnos"
+echo "     WITHOUT these flags and will silently replace the burn artifact."
+echo ""
+
+# --- Flash + watch instructions ---------------------------------------------
+echo "=========================================="
+echo "  IRON KERNEL READY — AGNOS $VER ($BUILD_TAG)"
+echo "=========================================="
+echo ""
+# ⚠ WHICH FLASH COMMAND depends on whether the burn is driven by a RING-3 TOOL. `--update` is ESP-only
+# (kernel + gnoboot); it never touches the agnos-fs partition where /bin/* lives. A burn whose oracle is
+# `run /bin/<tool>` therefore needs `--update-all`, or the operator flashes a new kernel against a STALE
+# tool — and a stale /bin/modeset simply falls through to its default arg and exits 96, which is
+# indistinguishable from "no GPU". That is a wasted flash on a rig whose burns block the operator's work.
+# ⚠ THE DEFAULT IS `--update-all`, DELIBERATELY, BECAUSE THE ERROR COSTS ARE ASYMMETRIC.
+# `--update` is ESP-only (kernel + gnoboot) and never touches the agnos-fs where /bin/* lives. Most burns
+# in this tree are now driven by a RING-3 TOOL (`run /bin/modeset ...`), and flashing `--update` for one of
+# those ships a new kernel against a STALE tool — which fails SILENTLY: an old /bin/modeset just falls
+# through to its default arg and exits 96, indistinguishable from "no GPU". That is a wasted flash on a rig
+# whose burns block the operator's work.
+# Flashing `--update-all` when `--update` would have done costs nothing but a few seconds of copying.
+# A first cut of this gated on BUILD_TAG, which missed exactly the case that surfaced it: a BARE production
+# kernel whose oracle is still `run /bin/modeset --dump`. The tag cannot tell you what drives the burn, so
+# do not ask it — recommend the safe one and let the tracker say when ESP-only is enough.
+if [ -x "$ROOT/build/rootfs/bin/modeset" ] || [ -d "$ROOT/build/rootfs/bin" ]; then
+    echo "  Flash (from agnosticos):  sudo ./scripts/install-media.sh --update-all"
+    echo "    (--update-all refreshes the ESP *and* the agnos-fs. Use it whenever the burn's oracle is"
+    echo "     'run /bin/<tool>' — an ESP-only --update would pair a new kernel with a STALE tool, which"
+    echo "     fails silently. For a kernel-only burn, --update is enough and leaves agnos-fs untouched.)"
+    if [ ! -x "$ROOT/build/rootfs/bin/modeset" ]; then
+        echo "  ⚠ /bin/modeset is NOT staged — if this burn uses it, run:  sh scripts/burn/stage-tools.sh --build"
+    fi
+else
+    echo "  Flash (from agnosticos):  sudo ./scripts/install-media.sh --update"
+    echo "    (--update is ESP-only — the agnos-fs partition survives, per"
+    echo "     feedback_prefer_mount_modify_over_reflash; no staged tools present)"
+fi
+echo ""
+echo "  The live burn rubric (hypothesis + falsification + watch-steps) lives in the"
+echo "  OPEN cycle's tracker — read it before flashing, NOT a hardcoded list here (it"
+echo "  would rot, per feedback_script_preambles_are_forward_looking). Source of truth:"
+echo "    agnosticos/docs/development/iron-nuc-zen-log.md  (newest #tracker-*-cycle)"
+echo ""
+echo "  Baseline (cycle-agnostic): a clean boot to the agnsh '[ASSIST] >' prompt on real"
+echo "  Zen, keyboard live, no hang / reset / canary bar. The OPEN cycle's tracker adds"
+echo "  the dispositive FB line + falsification branches for THIS burn — read it (above)."
+echo "=========================================="
+exit 0

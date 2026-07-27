@@ -32,7 +32,12 @@ run_gate() {
     else
         env $buildenv sh "$ROOT/scripts/build.sh" >/dev/null 2>&1 || { echo "  BUILD FAILED"; }
         for attempt in 1 2; do
-            sh "$ROOT/scripts/$smoke" > "/tmp/sweep-gate.log" 2>&1
+            # ⚠ smokes live in scripts/smoke/ since the 1.56.22 split. The gate table below still
+            # names them bare (that is the readable form), so resolve here rather than editing 30
+            # table rows — and fall back to the old flat location so a not-yet-moved smoke still runs.
+            SMOKE_PATH="$ROOT/scripts/smoke/$smoke"
+            [ -f "$SMOKE_PATH" ] || SMOKE_PATH="$ROOT/scripts/$smoke"
+            sh "$SMOKE_PATH" > "/tmp/sweep-gate.log" 2>&1
             if grep -qiE "smoke.*PASS|smoke \(.*\): PASS" "/tmp/sweep-gate.log"; then ok=1; break; fi
         done
         grep -iE "PASS:|FAIL:|smoke:" "/tmp/sweep-gate.log" | sed 's/^/  /' || true

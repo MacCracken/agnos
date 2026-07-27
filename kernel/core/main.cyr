@@ -2274,7 +2274,7 @@ fn de_selftest() {
 # ⚠ THE CALL IS NOT HERE. It sits next to exec_disk_selftest()'s call site ~450 lines below,
 # because at THIS point in boot `ext2_active` is still 0 and the selftest returns silently —
 # the string would be in the binary and the code would never run. That is exactly the
-# "string present is not code called" trap, and the first run of scripts/de-smoke.sh caught it.
+# "string present is not code called" trap, and the first run of scripts/smoke/de-smoke.sh caught it.
 #endif
 
 #ifdef EXEC_SELFTEST
@@ -2749,7 +2749,7 @@ de_selftest();
 # the symlink and reads it back (ext2_path_lookup follows the link to the seeded
 # hostname file), printing SYMLINK-CREATE-OK / SYMLINK-TRAVERSE-OK and exiting 0.
 # Proves the cyrius peer + kernel symlink#63 (ext2_symlink, 1.51.0) end-to-end.
-# Gated by scripts/symlink-smoke.sh on the markers + "run: exit 0" + a host-side
+# Gated by scripts/smoke/symlink-smoke.sh on the markers + "run: exit 0" + a host-side
 # readlink/e2fsck pass ([[feedback_qemu_test_agnos_userland]]).
 fn symlink_disk_selftest() {
     if (ext2_active == 0) { return 0; }
@@ -2770,7 +2770,7 @@ symlink_disk_selftest();
 # Server-stage probe (compile-gated, ARK_SELFTEST=1): does the real ~16 MB ark
 # binary LOAD + RUN in ring 3 on agnos? ark is by far the largest binary attempted
 # (kriya 934 KB / doom 589 KB are the prior ceiling) and the ark v2 M3 on-agnos
-# `.ark` install rides on it. Staged at /bin/ark by scripts/ark-run-smoke.sh; run
+# `.ark` install rides on it. Staged at /bin/ark by scripts/smoke/ark-run-smoke.sh; run
 # with NO args here, so ark prints its "Unknown command. Available: ..." command
 # list and exits — `run: exit N` proves exec-from-disk streamed + elf_load mapped
 # the 16 MB image (incl. its ~14 MB static .bss) and ring-3 code reached write(1).
@@ -2789,7 +2789,7 @@ ark_run_selftest();
 #ifdef ARK_INSTALL_SELFTEST
 # The ark v2 M3 milestone: an on-agnos install of a prebuilt `.ark` that CARRIES
 # a symlink entry, end to end. ark runs `install --root /arkroot /symlink-test.ark`
-# (both staged by scripts/ark-install-smoke.sh): it reads + verifies the unsigned
+# (both staged by scripts/smoke/ark-install-smoke.sh): it reads + verifies the unsigned
 # `.ark` (takumi-built, a regular file `/lib/libfoo.so.1` + a symlink
 # `/lib/libfoo.so` -> `libfoo.so.1`), lays the file down (pass 1), then in pass 2
 # calls `ark_symlink` -> the cyrius `sys_symlink`#63 agnos peer -> kernel
@@ -2814,7 +2814,7 @@ ark_install_selftest();
 # Base-security-stack agnos-RUNTIME probe (compile-gated, BASESTACK_SELFTEST=1):
 # does a base-stack binary (aegis/bote/phylax/hoosh/thoth), cross-built --agnos,
 # actually LOAD + RUN in ring 3 on agnos — not merely compile `--agnos`? Staged at
-# /bin/probe by scripts/basestack-run-smoke.sh and run with `--version`, so it
+# /bin/probe by scripts/smoke/basestack-run-smoke.sh and run with `--version`, so it
 # prints its version string and exits (`run: exit N`) — proving exec-from-disk
 # streamed the multi-MB ELF, elf_load mapped it, and ring-3 code reached write(1).
 # Deterministic (no agnsh keystrokes — sendkey drops chars on 10 MB+ targets),
@@ -2843,7 +2843,7 @@ basestack_run_selftest();
 # and fd1 <- stdout-pipe-write (direct fd-table entry copy — same 32-B entry the
 # execwait#37 redirect swaps), run it to EOF (empty stdin pipe -> read 0), then
 # read the stdout pipe and paint bote's JSON responses to serial. PASS (checked by
-# scripts/bote-mcp-smoke.sh) = serial shows bote's `serverInfo` + the echoed
+# scripts/smoke/bote-mcp-smoke.sh) = serial shows bote's `serverInfo` + the echoed
 # `agnos-kernel` argument. Staged at /bin/bote by the smoke. Mirrors
 # ark_run_selftest (exec-from-disk) + exec_redirect_selftest (pipe fd plumbing).
 var _bote_req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"k\",\"version\":\"1\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"bote_echo\",\"arguments\":{\"on\":\"agnos-kernel\"}}}\n";
@@ -2909,7 +2909,7 @@ bote_mcp_selftest();
 # Connect-latency benchmark probe (compile-gated): run hoosh's `bench` connect loop
 # against the SLIRP host gateway (10.0.2.2) so agnos connect latency (post-1.51.3
 # busy-poll) is measurable vs Linux native. Needs QEMU virtio-net + a host listener
-# on :18085 (scripts/bench-connect-smoke.sh); DHCP is up by here (net init runs
+# on :18085 (scripts/smoke/bench-connect-smoke.sh); DHCP is up by here (net init runs
 # earlier in boot). Prints "bench: … avg=Nus/connect" to serial.
 fn bench_connect_selftest() {
     if (ext2_active == 0) { return 0; }
@@ -2940,7 +2940,7 @@ bench_connect_selftest();
 # canary bar + halting. PASS = the box SURVIVES: "run: exit 142" (128+14 = the #PF kill code)
 # prints, AND "fault: SURVIVED back in kernel" prints after — i.e. exec_and_wait resumed the
 # kernel after a ring-3 fault. FAIL = a blue canary bar + halt (no "fault: SURVIVED").
-# Gated by scripts/fault-kill-smoke.sh. Mirrors exec_disk_selftest's ELF-build shape.
+# Gated by scripts/smoke/fault-kill-smoke.sh. Mirrors exec_disk_selftest's ELF-build shape.
 fn fault_disk_selftest() {
     if (ext2_active == 0) { return 0; }
     syscall_init();
@@ -3007,7 +3007,7 @@ pipe_rc_selftest();
 
 #ifdef DOOM_SELFTEST
 # 1.43.x — cyrius-doom render bring-up (the first real userland APP). /bin/doom
-# + /DOOM1.WAD are seeded onto the ext2 root by scripts/doom-smoke.sh; run the
+# + /DOOM1.WAD are seeded onto the ext2 root by scripts/smoke/doom-smoke.sh; run the
 # 584 KB ELF from disk in ring 3. doom loops forever (the 35 Hz game loop),
 # rendering to the framebuffer via fbinfo#38 + blit#39 and pacing via uptime_ms
 # #40 / sleep_ms#41 — so the boot intentionally "parks" here while doom renders;
@@ -3017,7 +3017,7 @@ kprintln("exec: running /bin/doom", 23);
 #ifdef DOOM_DIRECTMAP
 # Direct-map render smoke (DOOM_DIRECTMAP=1): pass an explicit WAD + map so doom's
 # direct_map path skips menu_run() and renders E1M1 at spawn — the in-game 3D
-# renderer is verified WITHOUT any keyboard input (scripts/doom-directmap-smoke.sh).
+# renderer is verified WITHOUT any keyboard input (scripts/smoke/doom-directmap-smoke.sh).
 sh_exec("run /bin/doom /DOOM1.WAD E1M1", 29);
 #endif
 #ifndef DOOM_DIRECTMAP
@@ -3029,7 +3029,7 @@ kprintln("exec: doom returned", 19);
 #ifdef AETHERSAFHA_SELFTEST
 # desktop bring-up — the sovereign compositor (the first real graphical userland
 # beyond doom). /bin/aethersafha (aethersafha built --agnos) is seeded onto the
-# ext2 root by scripts/aethersafha-smoke.sh; run the ELF from disk in ring 3. It
+# ext2 root by scripts/smoke/aethersafha-smoke.sh; run the ELF from disk in ring 3. It
 # opens the bhumi backend, renders its desktop (backdrop + windows + shell panel)
 # to the framebuffer via fbinfo#38 + blit#39, and loops (the real compositor
 # loop) — so the boot intentionally "parks" here while it renders;
@@ -3047,7 +3047,7 @@ kprintln("exec: aethersafha returned", 26);
 # --audio-test opens sys_snd_open#64 / config#65, then plays 6 real WAD SFX + an
 # L/R pan over ~8s via sys_snd_write_nb#66, then closes (#67). The wad path is
 # passed EXPLICITLY as argv[1] so --audio-test lands at argv[2] (doom's flag loop
-# starts at ai=2); scripts/doom-audio-smoke.sh captures the HDA output to a wav
+# starts at ai=2); scripts/smoke/doom-audio-smoke.sh captures the HDA output to a wav
 # and asserts it's non-silent. doom exits when the ~8s test finishes, so the boot
 # does NOT park here (unlike DOOM_SELFTEST's forever game loop).
 kprintln("exec: running /bin/doom --audio-test", 36);
@@ -3060,7 +3060,7 @@ kprintln("exec: doom audio-test returned", 30);
 # BLOCKING-streams clean generated waveforms (sine/square/saw/triangle + a sweep)
 # through the snd_* band. Blocking writes are kernel-paced, so this tests the ring/
 # DAC PATH itself, decoupled from any producer's timing (unlike doom's non-blocking
-# game-loop path). scripts/tonegen-smoke.sh captures the HDA output + checks the
+# game-loop path). scripts/smoke/tonegen-smoke.sh captures the HDA output + checks the
 # waveforms are clean. tonegen exits when the tones finish, so the boot doesn't park.
 kprintln("exec: running /bin/tonegen", 26);
 sh_exec("run /bin/tonegen", 16);
@@ -3143,7 +3143,7 @@ kprintln("exec: naadex returned", 21);
 # cyrius `vani` audio lib's agnos backend (audio_open_playback/set_params/write/
 # drain/close → sys_snd_* #64-69), as opposed to doom/tonegen's hand-rolled direct
 # syscalls. vanitone blocking-streams a 1.5s 440 Hz square through the shim, then
-# drains + closes. scripts/vani-tone-smoke.sh captures the HDA output + asserts a
+# drains + closes. scripts/smoke/vani-tone-smoke.sh captures the HDA output + asserts a
 # non-silent wav (continuous tone → strong RMS). Exits when the tone finishes.
 kprintln("exec: running /bin/vanitone", 27);
 sh_exec("run /bin/vanitone", 17);
@@ -3156,7 +3156,7 @@ kprintln("exec: vanitone returned", 23);
 # streams at different Q8 gains, feeds each an integer square wave, and mixes them
 # down with msh_router_pump → vani (audio_* → sys_snd_* #64-69). Unlike vanitone
 # (vani direct), this proves the whole mixer fan-in + gain + sink write on agnos.
-# scripts/mishran-audio-smoke.sh captures the HDA output + asserts a non-silent
+# scripts/smoke/mishran-audio-smoke.sh captures the HDA output + asserts a non-silent
 # wav (sustained mixed tone → strong RMS). Exits when the tone finishes.
 kprintln("exec: running /bin/mishtone", 27);
 sh_exec("run /bin/mishtone", 17);
@@ -3171,7 +3171,7 @@ kprintln("exec: mishtone returned", 23);
 # daemon itself, waits for it to listen, then decodes a seeded /tone.wav and streams
 # its PCM to mishran (msh_client_*), which mixes it down to vani (audio_* ->
 # sys_snd_* #64-69). Two ring-3 procs concurrent over loopback — the desktop
-# primary+client model applied to audio. scripts/mishran-jalwa-audio-smoke.sh
+# primary+client model applied to audio. scripts/smoke/mishran-jalwa-audio-smoke.sh
 # captures the HDA output + asserts a non-silent wav.
 kprintln("exec: running /bin/jalwa", 24);
 sh_exec("run /bin/jalwa", 14);
@@ -3491,7 +3491,7 @@ syscall_harden_selftest();
 
 # 1.37.0 — ext4 extent-ALLOCATION self-test (compile-gated). Appends past EOF
 # of a seed EXTENTS_FL file to exercise ext2_extent_append_block. Gated by
-# scripts/ext-extent-smoke.sh (host e2fsck -fn clean + grow/byte verify).
+# scripts/smoke/ext-extent-smoke.sh (host e2fsck -fn clean + grow/byte verify).
 #ifdef EXT2_EXTENT_WRITE_SELFTEST
 ext2_extent_write_selftest();
 #endif
@@ -3661,7 +3661,7 @@ gpu_tsc_selftest();
 # times a real hda_udelay against timer_ticks, and tsc_selftest's ring-3 excursion runs with IF
 # cleared, so on the far side of it the 100 Hz tick is not advancing and arm D would measure 0.
 # ⚠ It does NOT need an HDA controller — hda_udelay is pure rdtsc spinning — so it gates on a
-# QEMU boot with no `-device intel-hda`, which is what scripts/tsc-smoke.sh boots.
+# QEMU boot with no `-device intel-hda`, which is what scripts/smoke/tsc-smoke.sh boots.
 hda_tsc_selftest();
 tsc_selftest();
 #endif
@@ -3763,7 +3763,7 @@ kprintln("", 0);
 # GATED OFF (iron multi-verb keyboard-death bisect). The "keyboard dies after the
 # first command" regression is IRON-ONLY — it does NOT reproduce in QEMU even over
 # the exact IRQ1/kb_isr keystroke path with -smp 4 + a 30 s dwell (see
-# scripts/agnsh-irq1-repro.py) — and bisects to THIS wake: multi-verb typing worked
+# scripts/probe/agnsh-irq1-repro.py) — and bisects to THIS wake: multi-verb typing worked
 # on archaemenid at 14115 (1.41.15) and 1439 (DOOM, 1.43.8), both PRE-1.44.18, the
 # only sessions where AGNOS never woke the other Zen cores. Hypothesis: a woken-but-
 # parked AP (LAPIC enabled in ap_entry, but its LVT LINT0/timer left at the INIT
@@ -4847,7 +4847,7 @@ if (sh_abspath(ae_p, 16) >= 0) {
 # per-CPU syscall kstack forbids the kernel preempting a blocking syscall (the
 # serial-kstack invariant; agnos-blocking-syscall-yield-fix). A foreground
 # exec_and_wait would PIN kmain and starve the client, so we load it as background.
-# scripts/mishran-duplex-audio-smoke.sh captures the HDA output + asserts a non-silent
+# scripts/smoke/mishran-duplex-audio-smoke.sh captures the HDA output + asserts a non-silent
 # wav = both procs interleaved, no deadlock, no starvation.
 #
 # net_ip = 127.0.0.1 (same as setu): no NIC in this QEMU (r8169 absent), so a loopback
@@ -5000,7 +5000,7 @@ asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x14; 0xE6; 0x71; }
 # TCP listen-accept smoke (1.32.0 bite A). Build-flag-gated so production
 # boots don't bind a port. With TCP_LISTEN_SMOKE=1: listen on 8080, poll
 # briefly for one incoming connection, on accept send a banner + close.
-# Pairs with scripts/tcp-listen-smoke.sh's host-side TCP probe.
+# Pairs with scripts/smoke/tcp-listen-smoke.sh's host-side TCP probe.
 # Placed post-interrupt-enable so arch_wait() (= HLT) actually waits for
 # a timer tick rather than hanging on no-IRQ. Pre-kybernet so the test
 # completes before the shell loop swallows the boot serial.

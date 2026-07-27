@@ -413,7 +413,7 @@ fn gpu_forensic_dump(done_phys, expect) {
     }
 
     # The 16 ring dwords at rptr — the packets the CP was fetching when it stopped. Decoded
-    # host-side by name (gpu-test/pm4lint.cyr knows the framing).
+    # host-side by name (tests/gpu/pm4lint.cyr knows the framing).
     kprintln("gpu: ring dwords at rptr:", 25);
     var i = 0;
     while (i < 16) {
@@ -2467,7 +2467,7 @@ fn blend_cov_write(dst_phys) {
 # ============================================================================================
 # Source of record: kernel/shaders/edge_setup.s and kernel/shaders/edge_cov.s.
 # ⭐ Every dword below is byte-verified by TWO INDEPENDENT ASSEMBLERS — llvm-mc -mcpu=gfx90c and
-# mabda's encoder driven through gpu-test/edgeasm.cyr's label/fixup pass (58/58 and 133/133).
+# mabda's encoder driven through tests/gpu/edgeasm.cyr's label/fixup pass (58/58 and 133/133).
 # That diff covers all SEVEN resolved branches, which is the part hand-assembly cannot check:
 # a dropped VOP3 or FLAT hi dword shifts everything after it and yields a wrong PICTURE, not a
 # fault. Regenerate with edgeasm, never by hand.
@@ -2537,8 +2537,8 @@ fn edge_setup_write(dst_phys) {
 # ============================================================================================
 # tri_rgba — barycentric attribute interpolation (3D arc rung 11)
 # ============================================================================================
-# ⛔ GENERATED, NOT HAND-WRITTEN. Produced by `scripts/shader-blob.sh emit kernel/shaders/tri_rgba.s
-# tri_rgba` from the assembler's own output, and gated by `scripts/shader-blob.sh check` so it can
+# ⛔ GENERATED, NOT HAND-WRITTEN. Produced by `scripts/check/shader-blob.sh emit kernel/shaders/tri_rgba.s
+# tri_rgba` from the assembler's own output, and gated by `scripts/check/shader-blob.sh check` so it can
 # never drift from the source. Editing a dword here by hand is how a table and its .s file diverge
 # silently: the kernel still builds and the failure surfaces on iron as a wedged queue or a wrong
 # picture with nothing pointing back at the cause.
@@ -3609,7 +3609,7 @@ fn gpu_tri_arm() {
 # tri_u32 / tri_clz32 / tri_recip32 — the integer-divide primitives the prologue needs.
 #
 # ⛔ THESE ARE A SECOND COPY, AND THAT IS A KNOWN, WATCHED SEAM. The identical routines live in
-# gpu-test/refraster.cyr, shared by the reference and the shader model. The kernel cannot include a
+# tests/gpu/refraster.cyr, shared by the reference and the shader model. The kernel cannot include a
 # host tool, so the code exists twice — and Cyrius shadows duplicate `fn`s SILENTLY, so nothing here
 # would complain if the two drifted.
 # ⚠ WHAT WATCHES IT: the prep-record diff. The kernel prints the 128-byte record it computed and
@@ -3787,8 +3787,8 @@ fn gpu_tri_dispatch(rec_phys, w, h, dx, dy) {
 # ⛔ THE WHOLE BATCH IS VALIDATED BEFORE THIS RUNS. gpo_validate_trilist checks every triangle, so a
 # mid-batch refusal is impossible and the framebuffer can never be left half-drawn by a reject.
 # ⚠ Caller owns bounds checking. Returns 1 / 0.
-# tex_rgba_write — the RUNG 13 texturing blob, 442 dwords, emitted by scripts/shader-blob.sh from
-# kernel/shaders/tex_rgba.s. ⚠ NEVER hand-edit: `sh scripts/shader-blob.sh check kernel/shaders/
+# tex_rgba_write — the RUNG 13 texturing blob, 442 dwords, emitted by scripts/check/shader-blob.sh from
+# kernel/shaders/tex_rgba.s. ⚠ NEVER hand-edit: `sh scripts/check/shader-blob.sh check kernel/shaders/
 # tex_rgba.s tex_rgba` diffs this table against the assembled source and is the gate that stops the
 # table and the .s drifting apart silently.
 # RSRC1 = 0x00AC0207 (32 VGPRs, 72 SGPRs) · RSRC2 = 0x00000190 — byte-identical to the coverage
