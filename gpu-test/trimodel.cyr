@@ -530,6 +530,16 @@ fn main(): i64 {
     if (dd == 0) {
         ps("  gate 1b GREEN: 0 differing samples over ALL 4096 px x 6 coverages per case"); nl();
     }
+    # ⭐ Does the premultiplied restore fire when coverage is NOT clipped to the frame? Burn 6's N14
+    # failed because every dispatched case used the frame's own edges as the coverage shape, so no
+    # pixel outside the frame was ever evaluated. The dense sweep above ignores coverage geometry
+    # entirely, so this number answers -- on the host -- whether decoupling the shape will fix it.
+    ps("  premul restore fired "); pn(tr_premul_hits);
+    ps(" times over the shape-independent sweep"); nl();
+    if (tr_premul_hits == 0) {
+        ps("  ⚠ ZERO -- decoupling the coverage shape will NOT make N14 fire; the corpus"); nl();
+        ps("    itself cannot reach the restore and needs a case that extrapolates."); nl();
+    }
 
     # ⚠ A correction that NEVER fires is untested code. Report it as a gate, not a statistic.
     if (tm_corr_count == 0) {

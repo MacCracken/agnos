@@ -384,6 +384,34 @@ fn tri_ref_fill(buf, covbuf, w, h): i64 {
     return 0;
 }
 
+# ⛔ THE COVERAGE SHAPE IS NOT ALWAYS THE FRAME, AND N14 IS WHY.
+#
+# Burn 6 closed rung 11's pixels (0 differing) and then N14 failed honestly: `min(q_ch, q_a)` — the
+# premultiplied restore — NEVER fired across the whole corpus. The reason is structural, not a
+# tuning problem. The restore only fires where a channel's quotient exceeds alpha's, which happens
+# only OUTSIDE the attribute frame, where the barycentric weights leave [0, 2A] and the interpolant
+# extrapolates. But every case dispatched coverage built from the frame's OWN three edges, so a
+# pixel outside the frame always had coverage 0 and was skipped before the restore could be reached.
+# The case named `extrapolation-premul` could not extrapolate.
+#
+# ⭐ This also leaves op 0x09's headline capability untested. DECOUPLING coverage from the attribute
+# frame is the whole point of the op — one record, shape and colour independent — and shipping it
+# with shape == frame in every single case tested none of it.
+#
+# So: the extrapolation case dispatches a coverage triangle that COVERS THE WHOLE WINDOW while its
+# frame stays small. Both the reference capture and the GPU dispatch read the shape from here, so
+# they cannot drift apart.
+fn tc_cov(i, k): i64 {
+    if (i == 15) {
+        # A right triangle with legs of 200 px: strictly contains the 64x64 window, so every pixel
+        # is covered and the frame's extrapolated region is actually evaluated.
+        if (k == 0) { return 0; }    if (k == 1) { return 0; }
+        if (k == 2) { return 200; }  if (k == 3) { return 0; }
+        if (k == 4) { return 0; }    return 200;
+    }
+    return tc_get(i, k);
+}
+
 # tri_cov_capture — run op 0x08 over a triangle's own three edges and read the mask back.
 # ⭐ This is the SAME rasteriser op 0x09 runs internally; capturing it here is what lets the
 # reference be fed the identical input rather than a guess at it.
@@ -442,8 +470,8 @@ fn tri_attr(): i64 {
             i = i + 1; continue;
         }
         cases = cases + 1;
-        if (tri_cov_capture(tc_get(i,0), tc_get(i,1), tc_get(i,2), tc_get(i,3),
-                            tc_get(i,4), tc_get(i,5), w, h, &bg) == 0) {
+        if (tri_cov_capture(tc_cov(i,0), tc_cov(i,1), tc_cov(i,2), tc_cov(i,3),
+                            tc_cov(i,4), tc_cov(i,5), w, h, &bg) == 0) {
             puts("  ** coverage capture failed -- the reference cannot be fed the GPU's input");
             return 87;
         }
@@ -486,8 +514,8 @@ fn tri_attr(): i64 {
         # same garbage triangle for every case, while the digests printed above (which do use `i`
         # correctly) stayed perfectly plausible. Two burns reported a shader disagreement that was
         # entirely this line. Cyrius has no unused-variable or scope warning to catch it.
-        if (tri_cov_capture(tc_get(gi,0), tc_get(gi,1), tc_get(gi,2), tc_get(gi,3),
-                            tc_get(gi,4), tc_get(gi,5), w, h, &bg) == 0) {
+        if (tri_cov_capture(tc_cov(gi,0), tc_cov(gi,1), tc_cov(gi,2), tc_cov(gi,3),
+                            tc_cov(gi,4), tc_cov(gi,5), w, h, &bg) == 0) {
             puts("  ** coverage capture failed -- the reference cannot be fed the GPU's input");
             return 87;
         }
@@ -498,10 +526,10 @@ fn tri_attr(): i64 {
         while (e < 3) {
             var a = e; var b = e + 1;
             if (b == 3) { b = 0; }
-            store32(&tri_edges + (e * 4 + 0) * 4, tc_get(gi, a * 2 + 0) << 16);
-            store32(&tri_edges + (e * 4 + 1) * 4, tc_get(gi, a * 2 + 1) << 16);
-            store32(&tri_edges + (e * 4 + 2) * 4, tc_get(gi, b * 2 + 0) << 16);
-            store32(&tri_edges + (e * 4 + 3) * 4, tc_get(gi, b * 2 + 1) << 16);
+            store32(&tri_edges + (e * 4 + 0) * 4, tc_cov(gi, a * 2 + 0) << 16);
+            store32(&tri_edges + (e * 4 + 1) * 4, tc_cov(gi, a * 2 + 1) << 16);
+            store32(&tri_edges + (e * 4 + 2) * 4, tc_cov(gi, b * 2 + 0) << 16);
+            store32(&tri_edges + (e * 4 + 3) * 4, tc_cov(gi, b * 2 + 1) << 16);
             e = e + 1;
         }
 
@@ -875,8 +903,8 @@ fn tl_run_prefix(nn, w, h, bytes): i64 {
         }
         pi = pi + 1;
     }
-    ps("  n="); pnum(nn); ps("  ref 0x"); phex8(refd);
-    ps("  gpu 0x"); phex8(digest(&tri_poison, bytes));
+    ps("  n="); pnum(nn); ps("  ref "); phex8(refd);      # phex8 emits its OWN 0x prefix
+    ps("  gpu "); phex8(digest(&tri_poison, bytes));
     ps("  differing "); pnum(bad); nl();
     return bad;
 }

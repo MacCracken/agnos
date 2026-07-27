@@ -87,6 +87,40 @@ warns rather than errors on arity mismatch. Because N15 compares the reference a
 halves were equally wrong and it passed vacuously through every burn to date. It now takes a synthetic
 all-255 mask, so reproducibility does not depend on a GPU being present.
 
+### ⭐⭐⭐ RUNG 11 VALIDATED BYTE-EXACT ON IRON — the fix below is confirmed on silicon
+
+Burn 6: **`differing px 0, worst per-channel delta 0`** across all 15 corpus cases. AGNOS
+interpolates colour bit-exactly on a GPU it drives with no AMD driver, no ROCm, no LLVM at runtime.
+
+### ⛔ N14 exposed a structural hole: the corpus could not extrapolate
+
+With the pixels green the controls finally ran, and the premultiplied restore (`min(q_ch, q_a)`)
+had **never fired**. Not a tuning problem — the restore only fires *outside* the attribute frame,
+where the interpolant extrapolates, but every case dispatched coverage built from **the frame's own
+three edges**, so any pixel outside the frame had coverage 0 and was skipped first. The case named
+`extrapolation-premul` could not extrapolate.
+
+⚠ This also meant **op 0x09's headline capability was untested**: decoupling the coverage shape from
+the attribute frame is the whole point of the op, and every case shipped with shape == frame.
+
+Case 15 now dispatches a coverage triangle containing the entire window while its frame stays small.
+Confirmed on the host before the flash — with coverage unclipped the restore fires **80152** times.
+
+### ⭐ Rung 12 localised by the incremental bisect, on its first outing
+
+```
+n=1 differing 0 · n=2 differing 1711 · n=3..6  2884 / 3124 / 2824 / 3188
+FIRST DIVERGENCE AT n=2 => triangle 1, vertices (60,2) (60,60) (2,60)
+```
+
+So op 0x0A's **per-triangle path is correct**, and compositing a second triangle loses the first
+one's pixels — at (2,2), inside triangle 0 and outside triangle 1, the GPU shows background.
+
+⚠ **Cause not yet established, and no suspect is named.** Ruled out: the arena (51 slots, 0
+overlaps), the shader storing outside its mask (`v_cmp_ne_u32 vcc, 0, v4` masks zero-coverage lanes
+off before any store), the reference skipping triangles (6 of 6), and all 12 offline variants swept
+in `trimodel`.
+
 ### ⭐⭐⭐ ROOT CAUSE FOUND — `tri_rgba.s` multiplied a SIGNED edge weight as UNSIGNED
 
 Burn 5 (with the instrument defects above fixed) narrowed rung 11 from "all 15 cases, delta 239" to
