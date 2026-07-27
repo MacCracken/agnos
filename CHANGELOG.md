@@ -87,6 +87,23 @@ warns rather than errors on arity mismatch. Because N15 compares the reference a
 halves were equally wrong and it passed vacuously through every burn to date. It now takes a synthetic
 all-255 mask, so reproducibility does not depend on a GPU being present.
 
+### ⭐ RUNG 12 NARROWED TO COMPOSITION — every triangle is byte-exact ALONE
+
+The singleton sweep dispatched each of the six triangles on its own: **all six EXACT**. So no
+triangle's geometry, attribute frame, coverage or blending is at fault, and the failure is confined
+to compositing several into one rect. `N16` also read `0x8aed72de` on iron — matching the host — so
+the compiler-divergence check now genuinely holds.
+
+Two probes added to split what "composition" means, because the offline hypothesis set is exhausted
+(every variant reproduces iron's `n=1` exactly, none reproduces `n≥2`):
+
+* **P1** issues the same six dispatches as six **separate** `op 0x0A` calls with no refill between.
+  Correct ⇒ the defect is inside `gpu_tri_list`'s loop — work done once per *call* that must happen
+  once per *triangle*. Incorrect ⇒ the syscall boundary is irrelevant and consecutive dispatches
+  into one rect lose earlier output.
+* **P2** runs `n=2` whose second triangle covers nothing in the window. If triangle 0 vanishes
+  anyway, blending and overlap are exonerated outright — dispatching alone destroys prior output.
+
 ### ⭐⭐⭐ RUNG 11 CLOSED ON IRON — exit 95, pixels exact AND every control fired
 
 Burn 7: `differing px 0, worst per-channel delta 0` across all 15 cases, **and** every negative

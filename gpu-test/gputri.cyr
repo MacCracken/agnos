@@ -990,6 +990,69 @@ fn tl_run_one(w, h, bytes): i64 {
     return bad;
 }
 
+# Dispatch the currently-packed batch of `nn` WITHOUT filling the destination first, so successive
+# calls accumulate into whatever is already there. Returns 0 on success.
+fn tl_dispatch_only(w, h): i64 {
+    var vid = syscall(86, 48 * 32);
+    if (vid < 1) { return 1; }
+    if (syscall(72, vid, &tl_vtx, 48) != 0) { syscall(74, vid); return 1; }
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 10);
+    store32(&d + 12, vid);
+    store32(&d + 16, (h * 65536) + w);
+    store32(&d + 20, (16 * 65536) + 16);
+    store32(&d + 24, 1);
+    var rc = syscall(92, &d, 64);
+    syscall(74, vid);
+    if (rc != 0) { return 1; }
+    return 0;
+}
+
+# Capture the destination rect and count pixels differing from tri_ref.
+fn tl_capture_cmp(w, h, bytes): i64 {
+    var rid = syscall(86, bytes);
+    if (rid < 1) { return 0 - 90; }
+    var qz = 0;
+    while (qz < bytes / 8) { store64(&tri_poison + qz * 8, 0xA5A5A5A5A5A5A5A5); qz = qz + 1; }
+    syscall(72, rid, &tri_poison, bytes);
+    if (syscall(90, rid, (h * 65536) + w, (16 * 65536) + 16) != 0) { syscall(74, rid); return 0 - 87; }
+    if (syscall(73, rid, &tri_poison, bytes) != 0) { syscall(74, rid); return 0 - 90; }
+    syscall(74, rid);
+    var bad = 0;
+    var pi = 0;
+    while (pi < w * h) {
+        if ((load32(&tri_poison + pi * 4) & 0xFFFFFFFF) != (load32(&tri_ref + pi * 4) & 0xFFFFFFFF)) {
+            bad = bad + 1;
+        }
+        pi = pi + 1;
+    }
+    return bad;
+}
+
+# One filled dispatch of the packed batch at `nn`, compared against whatever tri_ref holds.
+fn tl_run_prefix_quiet(nn, w, h, bytes): i64 {
+    var vid = syscall(86, 48 * 32);
+    if (vid < 1) { return 0 - 100; }
+    if (syscall(72, vid, &tl_vtx, nn * 48) != 0) { syscall(74, vid); return 0 - 90; }
+    if (syscall(88, 0xFF101010, (h * 65536) + w, 16 * 65536 + 16) != 0) {
+        syscall(74, vid); return 0 - 90;
+    }
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 10);
+    store32(&d + 12, vid);
+    store32(&d + 16, (h * 65536) + w);
+    store32(&d + 20, (16 * 65536) + 16);
+    store32(&d + 24, nn);
+    var rc = syscall(92, &d, 64);
+    syscall(74, vid);
+    if (rc != 0) { return 0 - 80; }
+    return tl_capture_cmp(w, h, bytes);
+}
+
 fn tri_list(): i64 {
     var w = 64;
     var h = 64;
@@ -1046,6 +1109,74 @@ fn tri_list(): i64 {
         ps("gputri: ⭐ "); pnum(sbad); puts(" triangle(s) are wrong ALONE => not a composition bug;");
         puts("gputri:   fix the singleton first, the batch result is downstream of it.");
     }
+
+    # ⭐⭐ TWO PROBES THAT SPLIT "COMPOSITION" INTO ITS TWO HALVES.
+    #
+    # Burn 8 proved every triangle is exact ALONE, so the defect is in compositing. That is still
+    # two different things, and these separate them without guessing:
+    #
+    #   P1 — SIX SEPARATE op 0x0A CALLS, n=1 each, no refill between. The identical six dispatches
+    #        the kernel's own loop performs, but crossing the syscall boundary each time. If P1
+    #        composites correctly while n=6 does not, the difference lives INSIDE gpu_tri_list —
+    #        something done once per CALL that must be done once per TRIANGLE. If P1 fails too, the
+    #        syscall boundary is irrelevant and the fault is in how consecutive dispatches interact
+    #        with the destination.
+    #
+    #   P2 — n=2 where the SECOND triangle covers nothing in the window. If triangle 0's pixels
+    #        vanish even when triangle 1 writes nothing, then merely DISPATCHING again destroys the
+    #        previous output, and blending/overlap is exonerated entirely.
+    puts("gputri: P1 -- six SEPARATE n=1 calls, no refill between (vs one n=6 call)");
+    if (syscall(88, 0xFF101010, (h * 65536) + w, 16 * 65536 + 16) != 0) {
+        puts("gputri:   fill refused"); return 87;
+    }
+    var p1 = 0;
+    while (p1 < n) {
+        var pb = &tl_vtx;
+        var pf = 0;
+        while (pf < 6) { store32(pb + pf * 4, tl_get(&tl_tbl, p1, pf) << 16); pf = pf + 1; }
+        store32(pb + 24, tl_get(&tl_tbl, p1, 6));
+        store32(pb + 28, tl_get(&tl_tbl, p1, 7));
+        store32(pb + 32, tl_get(&tl_tbl, p1, 8));
+        store32(pb + 36, 0); store32(pb + 40, 0); store32(pb + 44, 0);
+        if (tl_dispatch_only(w, h) != 0) { puts("gputri:   P1 dispatch refused"); return 87; }
+        p1 = p1 + 1;
+    }
+    tl_pack(n);
+    tl_render_cov(&tl_tbl, n, &tri_ref, &tl_covs, w, h, 0xFF101010);
+    var p1bad = tl_capture_cmp(w, h, bytes);
+    ps("gputri:   P1 result: ");
+    if (p1bad == 0) {
+        puts("EXACT -- six separate calls DO composite correctly.");
+        puts("gputri:   ⭐ So the defect is INSIDE gpu_tri_list's loop, not in consecutive");
+        puts("gputri:     dispatches per se. Look for work done once per CALL that must be");
+        puts("gputri:     done once per TRIANGLE.");
+    }
+    if (p1bad != 0) {
+        pnum(p1bad); puts(" differing px -- separate calls fail TOO.");
+        puts("gputri:   ⭐ So the syscall boundary is irrelevant: consecutive dispatches into one");
+        puts("gputri:     rect lose earlier output. That is a DESTINATION/coherence question.");
+    }
+
+    puts("gputri: P2 -- n=2 whose SECOND triangle covers nothing in the window");
+    tl_pack(n);
+    var qb = &tl_vtx + 48;
+    store32(qb +  0, 500 << 16); store32(qb +  4, 500 << 16);
+    store32(qb +  8, 560 << 16); store32(qb + 12, 500 << 16);
+    store32(qb + 16, 500 << 16); store32(qb + 20, 560 << 16);
+    store32(qb + 24, 0xFFFFFFFF); store32(qb + 28, 0xFFFFFFFF); store32(qb + 32, 0xFFFFFFFF);
+    store32(qb + 36, 0); store32(qb + 40, 0); store32(qb + 44, 0);
+    tl_render_one(&tl_tbl, 0, &tri_ref, &tl_covs, w, h, 0xFF101010);
+    var p2bad = tl_run_prefix_quiet(2, w, h, bytes);
+    ps("gputri:   P2 result: ");
+    if (p2bad == 0) {
+        puts("EXACT -- triangle 0 SURVIVES a second, non-drawing dispatch.");
+        puts("gputri:   ⭐ So the loss depends on the second triangle actually WRITING.");
+    }
+    if (p2bad != 0) {
+        pnum(p2bad); puts(" differing px -- triangle 0 is LOST to a dispatch that draws NOTHING.");
+        puts("gputri:   ⭐ Blending and overlap are exonerated: the dispatch itself destroys it.");
+    }
+    tl_pack(n);
 
     # ⭐ BISECT NEXT, then the full batch. The first n whose differing count jumps from 0 names the
     # triangle that breaks it, and its geometry is then a fact rather than a suspect.
