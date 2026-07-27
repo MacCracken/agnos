@@ -782,10 +782,24 @@ fn tri_attr(): i64 {
     # ---- N16: this tool's reference agrees with the HOST triref ----------------------------
     # ⭐ THE ONLY CHECK THAT CATCHES BOTH SIDES BEING WRONG TOGETHER. Everything above compares
     # this binary against itself; an --agnos codegen divergence would move the reference and the
-    # comparison in lockstep and stay green. The corpus digest is printed for a human to diff
-    # against the host triref's, and a mismatch means the COMPILER, not the shader.
-    ps("gputri: N16 corpus digest "); phex8(dg_all);
-    puts("  -- must equal host triref's printed digest");
+    # comparison in lockstep and stay green. A mismatch here means the COMPILER, not the shader.
+    #
+    # ⛔ THIS PRINTED THE WRONG NUMBER THROUGH SEVEN BURNS. It printed `dg_all` — the fold of the
+    # per-case digests computed over the DISPATCHED coverage — and told the operator to diff it
+    # against host triref's, which prints `tc_corpus_digest()` computed at coverage 255. The two
+    # are different functions of different inputs and could never be equal, so the "check" was
+    # decorative: iron said 0x3b53f44d, the host said 0x8aed72de, and nothing was learned. Worse,
+    # `dg_all` MOVES whenever a coverage shape changes (it did when case 15 was decoupled), so it
+    # reads as a regression signal while being nothing of the kind.
+    #
+    # ⭐ Now it calls the SAME function triref does. Comparable by construction, and independent of
+    # the dispatched coverage — which is exactly the property a compiler-divergence check needs.
+    # ⚠ tri_gpu is reused as scratch here: its last write is inside the comparison loop above, and
+    # nothing reads it after. 64x64x4 = 16384 B = exactly its 2048 u64 slots.
+    ps("gputri: N16 corpus digest "); phex8(tc_corpus_digest(&tri_gpu, 64, 64));
+    puts("  -- MUST equal host triref's N16 digest");
+    ps("gputri:     (dispatched-coverage fold, NOT comparable to the host: ");
+    phex8(dg_all); puts(")");
 
     puts("");
     puts("");
@@ -909,6 +923,73 @@ fn tl_run_prefix(nn, w, h, bytes): i64 {
     return bad;
 }
 
+# Reference for ONE triangle drawn alone over the background, using its captured mask.
+fn tl_render_one(tbl, i, buf, cov, w, h, bg): i64 {
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) { store32(buf + (y * w + x) * 4, bg); x = x + 1; }
+        y = y + 1;
+    }
+    if (tri_prep(tl_get(tbl,i,0), tl_get(tbl,i,1), tl_get(tbl,i,2), tl_get(tbl,i,3),
+                 tl_get(tbl,i,4), tl_get(tbl,i,5),
+                 tl_get(tbl,i,6), tl_get(tbl,i,7), tl_get(tbl,i,8)) != 1) { return 0; }
+    var yy = 0;
+    while (yy < h) {
+        var xx = 0;
+        while (xx < w) {
+            var cvv = load8(cov + yy * w + xx) & 0xFF;
+            if (cvv != 0) {
+                var cur = load32(buf + (yy * w + xx) * 4) & 0xFFFFFFFF;
+                store32(buf + (yy * w + xx) * 4, tri_ref_px(xx, yy, cvv, cur));
+            }
+            xx = xx + 1;
+        }
+        yy = yy + 1;
+    }
+    return 0;
+}
+
+# Dispatch whatever single triangle is currently packed at tl_vtx[0], compare, return differing px.
+fn tl_run_one(w, h, bytes): i64 {
+    var vid = syscall(86, 48 * 32);
+    if (vid < 1) { return 0 - 100; }
+    if (syscall(72, vid, &tl_vtx, 48) != 0) { syscall(74, vid); return 0 - 90; }
+    if (syscall(88, 0xFF101010, (h * 65536) + w, 16 * 65536 + 16) != 0) {
+        syscall(74, vid); return 0 - 90;
+    }
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 10);
+    store32(&d + 12, vid);
+    store32(&d + 16, (h * 65536) + w);
+    store32(&d + 20, (16 * 65536) + 16);
+    store32(&d + 24, 1);
+    if (syscall(92, &d, 64) != 0) { syscall(74, vid); return 0 - 80; }
+
+    var rid = syscall(86, bytes);
+    if (rid < 1) { syscall(74, vid); return 0 - 90; }
+    var qz = 0;
+    while (qz < bytes / 8) { store64(&tri_poison + qz * 8, 0xA5A5A5A5A5A5A5A5); qz = qz + 1; }
+    syscall(72, rid, &tri_poison, bytes);
+    if (syscall(90, rid, (h * 65536) + w, (16 * 65536) + 16) != 0) {
+        syscall(74, vid); syscall(74, rid); return 0 - 87;
+    }
+    if (syscall(73, rid, &tri_poison, bytes) != 0) { syscall(74, vid); syscall(74, rid); return 0 - 90; }
+    syscall(74, vid); syscall(74, rid);
+
+    var bad = 0;
+    var pi = 0;
+    while (pi < w * h) {
+        if ((load32(&tri_poison + pi * 4) & 0xFFFFFFFF) != (load32(&tri_ref + pi * 4) & 0xFFFFFFFF)) {
+            bad = bad + 1;
+        }
+        pi = pi + 1;
+    }
+    return bad;
+}
+
 fn tri_list(): i64 {
     var w = 64;
     var h = 64;
@@ -930,7 +1011,43 @@ fn tri_list(): i64 {
         }
         ci = ci + 1;
     }
-    # ⭐ BISECT FIRST, then the full batch. The first n whose differing count jumps from 0 names the
+    # ⭐ SINGLETONS FIRST. The prefix bisect says the batch breaks when triangle 1 JOINS triangle 0,
+    # but that is two different claims: triangle 1 renders wrongly on its own, or it renders fine
+    # and the COMPOSITION loses what came before. Dispatching each triangle ALONE separates them,
+    # and the offline harness cannot: six hypothesis variants reproduce iron's n=1 exactly and none
+    # reproduces n>=2, so the defect is not in the hypothesis set and must be measured, not guessed.
+    puts("gputri: singleton sweep -- each triangle dispatched ALONE (n=1)");
+    var sbad = 0;
+    var si = 0;
+    while (si < n) {
+        # Pack triangle si as the ONLY element of the batch, then restore the full pack after.
+        var b = &tl_vtx;
+        var f = 0;
+        while (f < 6) { store32(b + f * 4, tl_get(&tl_tbl, si, f) << 16); f = f + 1; }
+        store32(b + 24, tl_get(&tl_tbl, si, 6));
+        store32(b + 28, tl_get(&tl_tbl, si, 7));
+        store32(b + 32, tl_get(&tl_tbl, si, 8));
+        store32(b + 36, 0); store32(b + 40, 0); store32(b + 44, 0);
+
+        # The reference for a lone triangle: its own mask over the background.
+        tl_render_one(&tl_tbl, si, &tri_ref, &tl_covs + si * w * h, w, h, 0xFF101010);
+        var r = tl_run_one(w, h, bytes);
+        ps("  triangle "); pnum(si);
+        if (r == 0) { puts("  alone: EXACT"); }
+        if (r != 0) { ps("  alone: "); pnum(r); puts(" differing px"); sbad = sbad + 1; }
+        si = si + 1;
+    }
+    tl_pack(n);
+    if (sbad == 0) {
+        puts("gputri: ⭐ EVERY triangle is EXACT on its own => the defect is in the COMPOSITION,");
+        puts("gputri:   not in any triangle's geometry or attribute frame.");
+    }
+    if (sbad != 0) {
+        ps("gputri: ⭐ "); pnum(sbad); puts(" triangle(s) are wrong ALONE => not a composition bug;");
+        puts("gputri:   fix the singleton first, the batch result is downstream of it.");
+    }
+
+    # ⭐ BISECT NEXT, then the full batch. The first n whose differing count jumps from 0 names the
     # triangle that breaks it, and its geometry is then a fact rather than a suspect.
     puts("gputri: incremental prefix bisect -- the first n that differs names the triangle");
     var firstbad = 0 - 1;

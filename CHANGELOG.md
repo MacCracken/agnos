@@ -87,6 +87,27 @@ warns rather than errors on arity mismatch. Because N15 compares the reference a
 halves were equally wrong and it passed vacuously through every burn to date. It now takes a synthetic
 all-255 mask, so reproducibility does not depend on a GPU being present.
 
+### ⭐⭐⭐ RUNG 11 CLOSED ON IRON — exit 95, pixels exact AND every control fired
+
+Burn 7: `differing px 0, worst per-channel delta 0` across all 15 cases, **and** every negative
+control fired — including N14 (12096 restore hits) and N15. Case 15's decoupled coverage did what
+the host predicted: `distinct` 9 → 11 and `rowspan` 34 → 46, so it genuinely extrapolates now.
+Attribute interpolation on a sovereign GPU driver is proven programmatically, not by eye.
+
+### ⛔ N16 printed a number that could never match — decorative through seven burns
+
+N16 is documented as *"the only check that catches both sides being wrong together"* — an `--agnos`
+codegen divergence that moves the reference and the comparison in lockstep. It printed `dg_all`, the
+fold of per-case digests computed over the **dispatched coverage**, and told the operator to diff it
+against host `triref`, which prints `tc_corpus_digest()` computed at **coverage 255**. Different
+functions of different inputs: iron said `0x3b53f44d`, the host `0x8aed72de`, and nothing was
+learned. Worse, `dg_all` moves whenever a coverage shape changes — it did when case 15 was decoupled
+— so it reads as a regression signal while being nothing of the kind.
+
+It now calls the same function `triref` does, making it comparable by construction and independent
+of the dispatched coverage, which is exactly the property a compiler-divergence check needs. The
+dispatched-coverage fold is still printed, explicitly labelled as not comparable.
+
 ### ⭐⭐⭐ RUNG 11 VALIDATED BYTE-EXACT ON IRON — the fix below is confirmed on silicon
 
 Burn 6: **`differing px 0, worst per-channel delta 0`** across all 15 corpus cases. AGNOS

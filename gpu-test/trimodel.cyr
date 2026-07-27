@@ -466,28 +466,43 @@ fn tm_batch_convict(): i64 {
         i = i + 1;
     }
 
-    # Sweep every (variant, mutation) pair against iron's two digests. A hit names the defect.
+    # ⭐ SIX CONSTRAINTS, NOT ONE. Burn 7's prefix bisect published the GPU digest at every n from
+    # 1 to 6. A hypothesis now has to reproduce the WHOLE SEQUENCE, which is a far harder bar than
+    # matching one number by luck — and n=1 is a free calibration point, since iron's GPU and
+    # reference agree there exactly.
     var hit = 0;
     var v = 0;
     while (v < 6) {
-        var m = 0;
-        while (m < 2) {
+        ps("    variant "); pn(v); ps(":");
+        var nn = 1;
+        var allmatch = 1;
+        while (nn <= n) {
+            var iron = 0x7dfa3797;
+            if (nn == 2) { iron = 0xa70d44e9; }
+            if (nn == 3) { iron = 0xb2854731; }
+            if (nn == 4) { iron = 0xef01eb26; }
+            if (nn == 5) { iron = 0x4742417e; }
+            if (nn == 6) { iron = 0xefd67dae; }
             bt_variant = v;
-            tm_ehi_unsigned = m;
-            bt_render(n, w, h);
+            tm_ehi_unsigned = 0;
+            bt_render(nn, w, h);
             var d = bt_digest(&bt_buf, w * h * 4);
-            ps("    variant "); pn(v); ps(" mut="); pn(m); ps("  digest 0x"); ph8(d);
-            if (d == 0xfc6f8c42) { ps("   == iron REFERENCE (harness calibrated)"); }
-            if (d == 0xda27e77a) { ps("   ⭐ == iron GPU -- THIS IS WHAT op 0x0A DOES"); hit = 1; }
-            nl();
-            m = m + 1;
+            ps("  n"); pn(nn);
+            if (d == iron) { ps("=HIT"); }
+            if (d != iron) { ps("=.."); allmatch = 0; }
+            nn = nn + 1;
         }
+        if (allmatch == 1) {
+            ps("   ⭐⭐ REPRODUCES EVERY PREFIX -- THIS IS WHAT op 0x0A DOES");
+            hit = 1;
+        }
+        nl();
         v = v + 1;
     }
     bt_variant = 0;
     tm_ehi_unsigned = 0;
     if (hit == 0) {
-        ps("    ⚠ no variant reproduces iron's GPU digest -- op 0x0A's defect is not in"); nl();
+        ps("    ⚠ no variant reproduces iron's prefix sequence -- op 0x0A's defect is not in"); nl();
         ps("      this hypothesis set. Do NOT name a suspect on the strength of a guess."); nl();
     }
     return hit;
