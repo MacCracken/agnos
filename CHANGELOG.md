@@ -54,6 +54,56 @@ whatever was on screen, so only opaque reference pixels are comparable. Gating a
 agreement the two inputs cannot have. Deciding the destination contract is the next bite; this
 lands the mechanism and the measurement.
 
+### ⛔⭐ TWO IRON BURNS SPENT ON A DEFECT IN THE INSTRUMENT, NOT THE SHADER
+
+Burns 3 and 4 both exited 85 on `--tri` and `--list`. Both were `gputri`'s fault. No kernel code was
+implicated by either, and the verdict text named the shader both times.
+
+**What settled it was arithmetic on digests, not a photograph.** The GPU digest was **byte-identical
+across the two burns** (`0xda27e77a`) while the reference digest moved (`0x9697fa43` → `0xfc6f8c42`)
+— only the tool had changed. Computing the digests of the degenerate buffers on the host then killed
+the entire "the shader never wrote anything" family in one step:
+
+| buffer | digest |
+|---|---|
+| untouched `0xFF101010` fill | `0x29c31dc5` |
+| `0xA5` prefill, never written | `0x1969ddc5` |
+| all zero | `0x38699dc5` |
+| **observed from the GPU** | **`0xda27e77a`** |
+
+None match, so the shader was writing real, varied, deterministic content throughout. (Corroboration
+that the digest arithmetic itself was sound: case 7 `quad-other-frame` has no coverage in-window and
+reported exactly `0x29c31dc5`, the all-background value.)
+
+⛔ **Defect 1 — the comparison loop captured coverage for the wrong triangle.** `tri_cov_capture`
+was called with `tc_get(i, …)` inside a loop indexed by `gi`. `i` belongs to the *printing* loop
+above it and is still in scope, parked at `TC_N` — so all fifteen cases were rasterised against one
+row **past the end of the corpus table**. The digests printed above use `i` correctly, so they stayed
+plausible while every comparison below them was against a garbage mask.
+
+⛔ **Defect 2 — a negative control that had never actually run.** N15 (determinism) called the
+four-argument `tri_ref_fill` with **three** arguments; `w` landed in `covbuf` and `h` in `w`. Cyrius
+warns rather than errors on arity mismatch. Because N15 compares the reference against *itself*, both
+halves were equally wrong and it passed vacuously through every burn to date. It now takes a synthetic
+all-255 mask, so reproducibility does not depend on a GPU being present.
+
+### Added — located pixel diffs, so the next red names a pixel instead of a suspect
+
+Both `--tri` and `--list` now print up to four failing pixels as `x`, `y`, **coverage**, `want`,
+`got`. Coverage is included because it is the one input both sides are contractually sharing, and it
+separates the failure modes on sight: `cov=0` with a written pixel means the shader escaped the mask;
+alpha agreeing while RGB does not means the interpolator rather than the blend; `got` equal to a
+neighbour means addressing; a smooth ramp of error means the prep record's scale.
+
+`--list` additionally refuses to report at all (exit 87) if the reference drew fewer triangles than
+the kernel accepted — a validator disagreement produces a huge systematic difference that reads
+exactly like a broken shader.
+
+⚠ **The verdict strings were rewritten.** They said 85 ⇒ "suspect the EMISSION", and that was wrong
+both times it was believed. The algorithm is proven by `trimodel` at register widths and the machine
+code by two independent assemblers; **the instrument is the only part of the chain with no oracle**,
+so it is now named as the first suspect in the tool, the burn brief, and the tracker.
+
 ## [1.56.19] - 2026-07-25
 
 **Post-rung-10 cleanup (open cycle).** 1.56.18 closed with rung 9b iron-validated at 20/20 across

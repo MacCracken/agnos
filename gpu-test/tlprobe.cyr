@@ -1,0 +1,112 @@
+# tlprobe.cyr — host-side probe for the RUNG 12 batch reference.
+#
+# ⭐ WHY THIS EXISTS. `--list` can only run where there is a GPU, so its reference had never been
+# executed anywhere it could be inspected. Two of the three red burns on rungs 11/12 were defects in
+# the instrument rather than the shader, and the question "does the reference draw all 6 triangles,
+# or does tri_prep silently reject some the kernel accepts?" is answerable on the HOST for free.
+# Answering it here removes it from the burn. [[feedback_instrument_has_no_oracle]]
+#
+# ⚠ The triangle table is duplicated from gputri.cyr's tl_build() ON PURPOSE — gputri is a GPU
+# program and cannot be linked here. A divergence between the two tables would make this probe lie,
+# so the digest it prints is cross-checked against the one the GPU box prints for the same masks.
+
+include "lib/io.cyr"
+include "tricore.cyr"
+
+var tp_buf[2048];               # 64*64*4 = 16384 B
+var tp_cov[3072];               # 6 masks x 64*64 = 24576 B
+var tl_t[288];                  # 32 triangles x 9 slots x 8 B
+
+fn ph8(v): i64 {
+    var d = 28;
+    while (d >= 0) {
+        var nib = (v >> d) & 0xF;
+        if (nib < 10) { print("0123456789" + nib, 1); }
+        if (nib >= 10) { print("abcdef" + (nib - 10), 1); }
+        d = d - 4;
+    }
+    return 0;
+}
+
+fn dg(buf, n): i64 {
+    var hsh = 2166136261;
+    var i = 0;
+    while (i < n) {
+        hsh = (hsh ^ (load8(buf + i) & 0xFF)) & 0xFFFFFFFF;
+        hsh = (hsh * 16777619) & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    return hsh;
+}
+
+fn build(): i64 {
+    tl_set(&tl_t, 0,0,  2); tl_set(&tl_t, 0,1,  2); tl_set(&tl_t, 0,2, 60);
+    tl_set(&tl_t, 0,3,  2); tl_set(&tl_t, 0,4,  2); tl_set(&tl_t, 0,5, 60);
+    tl_set(&tl_t, 0,6, 0xFFFF0000); tl_set(&tl_t, 0,7, 0xFF00FF00); tl_set(&tl_t, 0,8, 0xFF0000FF);
+
+    tl_set(&tl_t, 1,0, 60); tl_set(&tl_t, 1,1,  2); tl_set(&tl_t, 1,2, 60);
+    tl_set(&tl_t, 1,3, 60); tl_set(&tl_t, 1,4,  2); tl_set(&tl_t, 1,5, 60);
+    tl_set(&tl_t, 1,6, 0xFF00FFFF); tl_set(&tl_t, 1,7, 0xFFFFFF00); tl_set(&tl_t, 1,8, 0xFFFF00FF);
+
+    tl_set(&tl_t, 2,0, 16); tl_set(&tl_t, 2,1, 16); tl_set(&tl_t, 2,2, 48);
+    tl_set(&tl_t, 2,3, 16); tl_set(&tl_t, 2,4, 32); tl_set(&tl_t, 2,5, 48);
+    tl_set(&tl_t, 2,6, 0xFFFFFFFF); tl_set(&tl_t, 2,7, 0xFF808080); tl_set(&tl_t, 2,8, 0xFF404040);
+
+    tl_set(&tl_t, 3,0,  8); tl_set(&tl_t, 3,1, 40); tl_set(&tl_t, 3,2, 40);
+    tl_set(&tl_t, 3,3, 40); tl_set(&tl_t, 3,4,  8); tl_set(&tl_t, 3,5, 56);
+    tl_set(&tl_t, 3,6, 0xFF804020); tl_set(&tl_t, 3,7, 0xFF208040); tl_set(&tl_t, 3,8, 0xFF402080);
+
+    tl_set(&tl_t, 4,0, 24); tl_set(&tl_t, 4,1,  4); tl_set(&tl_t, 4,2, 56);
+    tl_set(&tl_t, 4,3, 24); tl_set(&tl_t, 4,4, 24); tl_set(&tl_t, 4,5, 40);
+    tl_set(&tl_t, 4,6, 0xFF00FF80); tl_set(&tl_t, 4,7, 0xFF8000FF); tl_set(&tl_t, 4,8, 0xFFFF8000);
+
+    tl_set(&tl_t, 5,0,  4); tl_set(&tl_t, 5,1, 48); tl_set(&tl_t, 5,2, 36);
+    tl_set(&tl_t, 5,3, 48); tl_set(&tl_t, 5,4,  4); tl_set(&tl_t, 5,5, 60);
+    tl_set(&tl_t, 5,6, 0xFF102030); tl_set(&tl_t, 5,7, 0xFF304010); tl_set(&tl_t, 5,8, 0xFF203040);
+    return 6;
+}
+
+fn main(): i64 {
+    var w = 64;
+    var h = 64;
+    var n = build();
+
+    # Per-triangle acceptance, stated one line each. A triangle the reference rejects but the kernel
+    # draws is a systematic whole-region difference that reads exactly like a broken shader.
+    var bad = 0;
+    var i = 0;
+    while (i < n) {
+        var ok = tri_prep(tl_get(&tl_t,i,0), tl_get(&tl_t,i,1), tl_get(&tl_t,i,2),
+                          tl_get(&tl_t,i,3), tl_get(&tl_t,i,4), tl_get(&tl_t,i,5),
+                          tl_get(&tl_t,i,6), tl_get(&tl_t,i,7), tl_get(&tl_t,i,8));
+        ps("  tri "); pn(i); ps("  tri_prep -> "); pn(ok);
+        if (ok != 1) { ps("   <== REJECTED by the reference"); bad = bad + 1; }
+        nl();
+        i = i + 1;
+    }
+
+    # Synthetic FULL coverage. The real masks come from the rasteriser and cannot be had here; what
+    # this pins down is the loop structure and the accept count, not the antialiased edges.
+    var z = 0;
+    while (z < n * w * h) { store8(&tp_cov + z, 255); z = z + 1; }
+    tl_render_cov(&tl_t, n, &tp_buf, &tp_cov, w, h, 0xFF101010);
+
+    ps("tlprobe: reference drew "); pn(tl_drawn); ps(" of "); pn(n); ps(" triangles"); nl();
+    ps("tlprobe: full-coverage digest 0x"); ph8(dg(&tp_buf, w * h * 4)); nl();
+
+    if (bad != 0) {
+        ps("tlprobe: ⛔ the reference REJECTS a triangle the kernel accepts -- the batch"); nl();
+        ps("         comparison cannot be meaningful until the two validators agree."); nl();
+        return 1;
+    }
+    if (tl_drawn != n) {
+        ps("tlprobe: ⛔ tl_render_cov drew fewer triangles than it was given."); nl();
+        return 1;
+    }
+    ps("tlprobe: ⭐ all triangles accepted and drawn -- a red --list is NOT a validator"); nl();
+    ps("         disagreement, so look at the located per-pixel diffs instead."); nl();
+    return 95;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

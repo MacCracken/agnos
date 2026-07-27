@@ -339,6 +339,8 @@ fn tri_cov(): i64 {
 
 var tri_ndistinct = 0;
 var tri_rowspan = 0;
+var tri_dumped = 0;             # located-difference lines emitted this run (capped)
+var tri_ndiff = 0;              # differing pixels across every compared case
 
 # Fill a buffer with the REFERENCE answer for one corpus case, and measure the two properties the
 # controls gate on: how many distinct values it contains, and how far it varies along one row.
@@ -479,8 +481,13 @@ fn tri_attr(): i64 {
                      tc_get(gi,4), tc_get(gi,5), tc_get(gi,6), tc_get(gi,7), tc_get(gi,8)) != 1) {
             gi = gi + 1; continue;
         }
-        if (tri_cov_capture(tc_get(i,0), tc_get(i,1), tc_get(i,2), tc_get(i,3),
-                            tc_get(i,4), tc_get(i,5), w, h, &bg) == 0) {
+        # ⛔ gi, NOT i. `i` is the PRINTING loop's variable and it is still in scope here, parked at
+        # TC_N — so an `i` typo captured coverage for one row PAST the end of the corpus table, the
+        # same garbage triangle for every case, while the digests printed above (which do use `i`
+        # correctly) stayed perfectly plausible. Two burns reported a shader disagreement that was
+        # entirely this line. Cyrius has no unused-variable or scope warning to catch it.
+        if (tri_cov_capture(tc_get(gi,0), tc_get(gi,1), tc_get(gi,2), tc_get(gi,3),
+                            tc_get(gi,4), tc_get(gi,5), w, h, &bg) == 0) {
             puts("  ** coverage capture failed -- the reference cannot be fed the GPU's input");
             return 87;
         }
@@ -559,6 +566,7 @@ fn tri_attr(): i64 {
             if (rb == 0) {
                 if (syscall(73, rid, &tri_poison, bytes) == 0) {
                     gpu_cmp = gpu_cmp + 1;
+                    var case_diff = 0;
                     var pi = 0;
                     while (pi < w * h) {
                         var got = load32(&tri_poison + pi * 4) & 0xFFFFFFFF;
@@ -573,7 +581,36 @@ fn tri_attr(): i64 {
                             if (dg > gpu_diff_worst) { gpu_diff_worst = dg; }
                             ch2 = ch2 + 1;
                         }
+                        # ⭐ THE BISECT. A bare "worst delta 239" names no pixel and indicts nothing;
+                        # four located samples separate the failure modes on sight. Coverage byte
+                        # included because it is the one input both sides are supposed to share:
+                        #   cov=0 but got!=background   => the shader wrote OUTSIDE the shape
+                        #   want/got agree in A, differ in RGB => the interpolator, not the blend
+                        #   whole pixel shifted one row/col => addressing, not arithmetic
+                        #   every covered pixel off by a smooth ramp => the PREP record's scale
+                        # ⚠ Capped at 4 lines per RUN, not per case: an unbounded dump over 15 cases
+                        # is 60k lines of scrollback and the operator photographs a screen.
+                        if (got != want) {
+                            if (tri_dumped < 4) {
+                                tri_dumped = tri_dumped + 1;
+                                ps("    diff case "); pnum(gi);
+                                ps(" @ x="); pnum(pi % w); ps(" y="); pnum(pi / w);
+                                ps("  cov="); pnum(load8(&bg + pi) & 0xFF);
+                                ps("  want="); phex8(want); ps("  got="); phex8(got); nl();
+                            }
+                            tri_ndiff = tri_ndiff + 1;
+                            case_diff = case_diff + 1;
+                        }
                         pi = pi + 1;
+                    }
+                    # ⭐ PER-CASE, because "all 15 wrong" and "1 of 15 wrong" are different faults.
+                    # A uniform failure is systematic (prep scale, channel order, addressing); a
+                    # single failing case points at that case's GEOMETRY, and the case name says
+                    # which property it was built to exercise.
+                    if (case_diff != 0) {
+                        ps("    case "); pnum(gi); ps(" "); tc_name(gi);
+                        ps("  DIFFERS in "); pnum(case_diff); ps(" of "); pnum(w * h);
+                        ps(" px"); nl();
                     }
                 }
             }
@@ -588,7 +625,8 @@ fn tri_attr(): i64 {
     # indistinguishable from a dead shader by eye — the first burn looked at a blank screen for
     # exactly this reason.
     ps("gputri: read back "); pnum(gpu_cmp); ps(" of "); pnum(gpu_ran);
-    ps(" rendered rects; worst per-channel delta vs the reference = "); pnum(gpu_diff_worst); nl();
+    ps(" rendered rects; differing px "); pnum(tri_ndiff);
+    ps(", worst per-channel delta "); pnum(gpu_diff_worst); nl();
     if (gpu_cmp == 0) {
         puts("gputri: ⛔ NOTHING was read back -- #90 refused every capture. The byte oracle is");
         puts("gputri:   unavailable, so this run CANNOT claim pixel correctness.");
@@ -602,8 +640,10 @@ fn tri_attr(): i64 {
     # is a real disagreement between the shader and the reference.
     if (gpu_diff_worst != 0) {
         ps("gputri: ⛔ PIXELS DIFFER -- worst per-channel delta "); pnum(gpu_diff_worst); nl();
-        puts("gputri:   The ABI and dispatch are fine; the SHADER's arithmetic disagrees with the");
-        puts("gputri:   reference. trimodel proved the algorithm, so suspect the EMISSION.");
+        puts("gputri:   READ THE LOCATED DIFFS ABOVE. This line used to say 'suspect the EMISSION'");
+        puts("gputri:   and it was wrong both times it was believed -- the defect was this TOOL");
+        puts("gputri:   feeding the reference the wrong coverage. trimodel proves the algorithm and");
+        puts("gputri:   two assemblers agree on the code; the instrument is NOT above suspicion.");
         return 85;
     }
     puts("  ⭐ BYTE ORACLE: every rendered pixel matches the reference exactly.");
@@ -690,13 +730,20 @@ fn tri_attr(): i64 {
     # ---- N15: determinism -- the same case twice in one boot must be byte-identical --------
     # ⚠ A run that is not reproducible cannot be compared to anything, and a stale-buffer ghost
     # reads as a pass. This is cheap and it is the only thing that catches it in-tool.
+    # ⛔ FOUR ARGUMENTS. These two calls passed THREE — `w` landed in `covbuf`, `h` in `w`, and `h`
+    # read whatever was on the stack. Cyrius warns rather than errors on arity, and because N15
+    # compares the reference against ITSELF both halves were equally wrong, so the control passed
+    # vacuously through every burn. Coverage here is a synthetic all-255 mask on purpose: N15 asks
+    # whether the reference is REPRODUCIBLE, which must not depend on a GPU being present.
+    var cz = 0;
+    while (cz < w * h) { store8(&bg + cz, 255); cz = cz + 1; }
     tri_prep(tc_get(0,0), tc_get(0,1), tc_get(0,2), tc_get(0,3),
              tc_get(0,4), tc_get(0,5), tc_get(0,6), tc_get(0,7), tc_get(0,8));
-    tri_ref_fill(&tri_ref, w, h);
+    tri_ref_fill(&tri_ref, &bg, w, h);
     var d1 = digest(&tri_ref, bytes);
     var zz = 0;
     while (zz < bytes) { store8(&tri_ref + zz, 0xA5); zz = zz + 1; }
-    tri_ref_fill(&tri_ref, w, h);
+    tri_ref_fill(&tri_ref, &bg, w, h);
     var d2 = digest(&tri_ref, bytes);
     if (d1 != d2) {
         puts("gputri: N15 FAILED -- the same case computed twice gave DIFFERENT bytes");
@@ -801,7 +848,14 @@ fn tri_list(): i64 {
         ci = ci + 1;
     }
     tl_render_cov(&tl_tbl, n, &tri_ref, &tl_covs, w, h, 0xFF101010);
-    ps("gputri: reference digest "); phex8(digest(&tri_ref, bytes)); nl();
+    ps("gputri: reference digest "); phex8(digest(&tri_ref, bytes));
+    ps("  ref drew "); pnum(tl_drawn); ps(" of "); pnum(n); puts(" triangles");
+    if (tl_drawn != n) {
+        puts("gputri: ⛔ THE REFERENCE SKIPPED TRIANGLES the kernel accepted -- the op returned 0,");
+        puts("gputri:   so the GPU drew all of them. This is a VALIDATOR disagreement (area bounds");
+        puts("gputri:   or winding), not a shader fault, and no pixel comparison below is meaningful.");
+        return 87;
+    }
 
     var vid = syscall(86, 48 * 32);
     if (vid < 1) { puts("gputri: no GPU here"); return 100; }
@@ -842,7 +896,17 @@ fn tri_list(): i64 {
     while (pi < w * h) {
         var got = load32(&tri_poison + pi * 4) & 0xFFFFFFFF;
         var want = load32(&tri_ref + pi * 4) & 0xFFFFFFFF;
-        if (got != want) { bad = bad + 1; }
+        if (got != want) {
+            bad = bad + 1;
+            # ⭐ Same bisect as --tri. `cov` here is the LAST triangle's mask, which is the one the
+            # batch composited on top, so a pixel where cov=0 and the two sides still differ is a
+            # disagreement inherited from an EARLIER triangle in the list, not from this one.
+            if (bad <= 4) {
+                ps("    diff @ x="); pnum(pi % w); ps(" y="); pnum(pi / w);
+                ps("  cov[last]="); pnum(load8(&tl_covs + (n - 1) * w * h + pi) & 0xFF);
+                ps("  want="); phex8(want); ps("  got="); phex8(got); nl();
+            }
+        }
         var c2 = 0;
         while (c2 < 3) {
             var dg = ((got >> (c2 * 8)) & 0xFF) - ((want >> (c2 * 8)) & 0xFF);
@@ -856,9 +920,10 @@ fn tri_list(): i64 {
     ps("gputri: gpu digest "); phex8(digest(&tri_poison, bytes));
     ps("  differing px "); pnum(bad); ps("  worst delta "); pnum(worst); nl();
     if (bad != 0) {
-        puts("gputri: ⛔ the batch does NOT match the reference. Overlap ORDER is the first suspect:");
-        puts("gputri:   a list is composited in submission order, so drawing it in any other order");
-        puts("gputri:   changes every pixel where two triangles meet.");
+        puts("gputri: ⛔ the batch does NOT match the reference. READ THE LOCATED DIFFS ABOVE before");
+        puts("gputri:   theorising -- twice now this line named a suspect (overlap order, then the");
+        puts("gputri:   emission) while the actual defect was in THIS TOOL's reference. Overlap");
+        puts("gputri:   order is only indicted if the diffs cluster where triangles MEET.");
         return 85;
     }
     puts("gputri: ⭐ RUNG 12 -- the batch is byte-identical to the reference, overlap order included.");

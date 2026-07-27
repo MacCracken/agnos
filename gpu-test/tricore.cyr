@@ -699,6 +699,8 @@ fn tl_set(tbl, i, f, v): i64 { store64(tbl + (i * TL_STRIDE + f) * 8, v); return
 # would disagree with the GPU on every ANTIALIASED EDGE PIXEL, which is most of a small triangle's
 # perimeter. That mismatch — reference assuming full coverage, GPU applying partial — is what made
 # the first batched burn report 3186 differing pixels with a correct shader.
+var tl_drawn = 0;               # triangles the REFERENCE actually rendered (tri_prep accepted)
+
 fn tl_render_cov(tbl, n, buf, covs, w, h, bg): i64 {
     var y = 0;
     while (y < h) {
@@ -706,11 +708,16 @@ fn tl_render_cov(tbl, n, buf, covs, w, h, bg): i64 {
         while (x < w) { store32(buf + (y * w + x) * 4, bg); x = x + 1; }
         y = y + 1;
     }
+    tl_drawn = 0;
     var i = 0;
     while (i < n) {
+        # ⭐ COUNT THE ACCEPTS. If this reference silently skips a triangle the kernel drew — the two
+        # validators disagreeing on area or winding — the result is a huge systematic difference that
+        # reads exactly like a broken shader. Counting is three lines; guessing cost two burns.
         if (tri_prep(tl_get(tbl,i,0), tl_get(tbl,i,1), tl_get(tbl,i,2), tl_get(tbl,i,3),
                      tl_get(tbl,i,4), tl_get(tbl,i,5),
                      tl_get(tbl,i,6), tl_get(tbl,i,7), tl_get(tbl,i,8)) == 1) {
+            tl_drawn = tl_drawn + 1;
             var yy = 0;
             while (yy < h) {
                 var xx = 0;

@@ -206,27 +206,46 @@ elif [ -n "${BURN_TRI_RGBA:-}" ]; then
     # carries them. This mode carries the BRIEF, not a #define. A burn whose instructions live only
     # in a chat log gets run wrong once and wasted.
     #
-    # ⛔ WHAT THIS BURN CAN AND CANNOT SETTLE, STATED BEFORE IT RUNS. The shader writes the BACK
-    # BUFFER, which ring 3 cannot read back, so there is no byte-comparison on this flash. It
-    # settles: the ABI accepts every corpus record, the dispatch retires, and the screen shows
-    # smoothly-varying colour. It does NOT settle per-pixel correctness — that needs the read-back
-    # path, which is the next bite. Do not report 95 here as "the pixels are right".
+    # ⛔ WHAT THIS BURN CAN AND CANNOT SETTLE, STATED BEFORE IT RUNS. #90 reads the back buffer
+    # back, so this IS a byte comparison: every rendered rect is diffed against the CPU reference
+    # pixel for pixel. It settles per-pixel correctness of op 0x09 and op 0x0A. What it does NOT
+    # settle is anything about a case the ABI refused — a REJECTED line is not a pass.
+    #
+    # ⛔ BURNS 3 AND 4 BOTH EXITED 85 AND BOTH WERE THIS TOOL'S FAULT, NOT THE SHADER'S. Burn 3:
+    # the reference assumed full coverage while the GPU applied the real antialiased mask. Burn 4:
+    # the fix captured coverage for `tc_get(i,...)` where `i` was the PREVIOUS loop's variable,
+    # parked one row past the end of the corpus — the same garbage triangle for all 15 cases, while
+    # the digests printed above it used `i` correctly and looked entirely plausible. Both times the
+    # verdict text named the emission and both times that was wrong. THE INSTRUMENT IS NOT ABOVE
+    # SUSPICION; the located per-pixel diffs added for this burn exist so the next red names a
+    # pixel instead of a suspect.
     #
     # RUN IN THIS ORDER. The order makes a red localise.
     #   1. run /bin/triref                    (host build) -- note its N16 corpus digest FIRST.
     #      ⛔ Actually run the HOST triref before the flash and write the digest down; step 3
     #      compares against it. If they differ, this build's reference is not the host's and
-    #      nothing else on the flash means anything.
+    #      nothing else on the flash means anything. Current host value: 0x8aed72de.
     #   2. run /bin/gputri --cov              rung 9b regression: the rasteriser must STILL be
     #      20/20. Attribute interpolation dispatches the coverage kernel unmodified, so a red here
     #      indicts the arena move (the prep table went 0xD0000 -> 0xA8000), not the new shader.
     #   3. run /bin/gputri --tri              the corpus + all eight controls N9-N16.
-    #   4. run /bin/klug > /tri.txt           capture, then mount the FS from Linux to copy out.
+    #   4. run /bin/gputri --list             rung 12: 6 overlapping triangles, ONE record.
+    #   5. run /bin/klug > /tri.txt           capture, then mount the FS from Linux to copy out.
     #
     # PRE-REGISTERED OUTCOME TABLE — written before the flash:
-    #   95  every record accepted, every dispatch retired, all eight controls fired. The ABI and
-    #       the dispatch are proven. ⚠ Pixels are NOT proven; look at the screen and say what you
-    #       see, then the read-back bite settles it.
+    #   95  every record accepted, every dispatch retired, all controls fired, AND every rendered
+    #       rect is byte-identical to the reference. Rung 11 and rung 12 are both settled.
+    #   85  pixels differ. ⭐ READ THE `diff ... x= y= cov= want= got=` LINES — up to four are
+    #       printed per run and they are the whole point of this flash. How to read them:
+    #         cov=0 but got != 0xFF101010      -> the shader wrote OUTSIDE the coverage mask
+    #         alpha agrees, RGB does not       -> the interpolator, not the src-over blend
+    #         want/got equal a NEIGHBOURING px -> addressing (row or column offset), not arithmetic
+    #         every covered px off by a ramp   -> the prep record's scale (2A or the reciprocal)
+    #       ⛔ Do NOT conclude "the emission" from the exit code alone. That was written into this
+    #       table for burns 3 and 4 and it was wrong both times.
+    #   87  the comparison could not be made honestly — #90 refused, or (new this burn) the
+    #       reference SKIPPED a triangle the kernel accepted, which is a validator disagreement
+    #       and makes every pixel number below it meaningless.
     #  100  no GPU carveout — wrong machine, or the GPU never came up. Not a rung-11 result.
     #   96  the shader is not resident: gpu_tri_arm's gates refused. An ARMING fault, not a shader
     #       fault. Check the boot log's arena/ring/matmul lines.
@@ -245,8 +264,10 @@ elif [ -n "${BURN_TRI_RGBA:-}" ]; then
     #     on all 269 dwords.
     #   * the CPU prologue — the kernel's 128-byte prep record is field-identical to the host's.
     #   * the register budget — the emit list's high-water is v31 against a declared 32.
-    #   So a red burn indicts DISPATCH or COHERENCE, not arithmetic. That is the whole point of the
-    #   nine zero-burn bites that preceded it.
+    #   ⚠ THIS LIST NARROWS THE SEARCH, IT DOES NOT EMPTY IT — and reading it as "so the fault must
+    #   be dispatch or coherence" is exactly what wasted burns 3 and 4. Nothing above covers THE
+    #   INSTRUMENT: the corpus loop, the coverage capture, the reference's inputs. Two reds in a row
+    #   lived there. Suspect the tool first; it is the only part of the chain with no oracle.
     echo "[2/2] Building the 3D-arc RUNG 11 kernel (attribute interpolation; no compile flag needed)."
     echo "      Run: gputri --cov (must STILL be 20/20) THEN gputri --tri THEN klug > /tri.txt"
     BUILD_ENV=""
