@@ -1157,6 +1157,52 @@ fn tri_list(): i64 {
         puts("gputri:     rect lose earlier output. That is a DESTINATION/coherence question.");
     }
 
+    # ⭐⭐⭐ P3 — WHICH DISPATCH DESTROYS THE DESTINATION?
+    #
+    # P1+P2 said: inside ONE gpu_tri_list call, a second triangle wipes the first even when it draws
+    # nothing; across syscall boundaries it does not. Each triangle costs THREE dispatches —
+    # edge_setup, the coverage rasteriser, and the interpolation pass — and the loop runs all three
+    # again for the second triangle. Only one of them needs to be the destroyer.
+    #
+    # op 0x08 is reachable directly from ring 3, so the coverage pair can be issued ALONE, with no
+    # interpolation pass anywhere near it. Render triangle 0, then fire a bare coverage dispatch at
+    # an unrelated mask slot, then look at the destination again. Nothing in that op addresses the
+    # back buffer, so if triangle 0 vanishes the coverage pass is the destroyer — and that is a
+    # cache/coherence fault, not a shader one.
+    puts("gputri: P3 -- does a BARE op 0x08 coverage dispatch destroy an already-rendered rect?");
+    if (syscall(88, 0xFF101010, (h * 65536) + w, 16 * 65536 + 16) != 0) {
+        puts("gputri:   fill refused"); return 87;
+    }
+    var p3b = &tl_vtx;
+    var p3f = 0;
+    while (p3f < 6) { store32(p3b + p3f * 4, tl_get(&tl_tbl, 0, p3f) << 16); p3f = p3f + 1; }
+    store32(p3b + 24, tl_get(&tl_tbl, 0, 6));
+    store32(p3b + 28, tl_get(&tl_tbl, 0, 7));
+    store32(p3b + 32, tl_get(&tl_tbl, 0, 8));
+    store32(p3b + 36, 0); store32(p3b + 40, 0); store32(p3b + 44, 0);
+    if (tl_dispatch_only(w, h) != 0) { puts("gputri:   P3 dispatch refused"); return 87; }
+    tl_render_one(&tl_tbl, 0, &tri_ref, &tl_covs, w, h, 0xFF101010);
+    var p3pre = tl_capture_cmp(w, h, bytes);
+    ps("gputri:   P3 baseline (triangle 0 alone, no refill): ");
+    if (p3pre == 0) { puts("EXACT"); }
+    if (p3pre != 0) { pnum(p3pre); puts(" differing -- baseline already bad, P3 is inconclusive"); }
+    if (tri_cov_capture(8, 8, 40, 8, 8, 40, w, h, &bg) == 0) {
+        puts("gputri:   P3 coverage dispatch refused"); return 87;
+    }
+    var p3post = tl_capture_cmp(w, h, bytes);
+    ps("gputri:   P3 after a bare op 0x08: ");
+    if (p3post == 0) {
+        puts("STILL EXACT -- the coverage pass is INNOCENT.");
+        puts("gputri:   ⭐ So the destroyer is the INTERPOLATION dispatch (or the prep record it");
+        puts("gputri:     reads), re-issued for the next triangle.");
+    }
+    if (p3post != 0) {
+        pnum(p3post); puts(" differing px -- a bare coverage dispatch WIPED the rendered rect.");
+        puts("gputri:   ⭐ The coverage pass destroys destination content it never addresses.");
+        puts("gputri:     That is a CACHE/COHERENCE fault in the dispatch sequence, not a shader");
+        puts("gputri:     one -- and it explains why a syscall boundary hides it.");
+    }
+
     puts("gputri: P2 -- n=2 whose SECOND triangle covers nothing in the window");
     tl_pack(n);
     var qb = &tl_vtx + 48;

@@ -87,6 +87,32 @@ warns rather than errors on arity mismatch. Because N15 compares the reference a
 halves were equally wrong and it passed vacuously through every burn to date. It now takes a synthetic
 all-255 mask, so reproducibility does not depend on a GPU being present.
 
+### ⭐⭐ RUNG 12: a dispatch that draws NOTHING destroys the previous triangle
+
+The P1/P2 pair settled what "composition" meant, and the answer eliminates most of the space:
+
+* **P1 — EXACT.** The same six dispatches issued as six **separate** `op 0x0A` calls composite
+  perfectly. So consecutive dispatches into one rect are fine in general.
+* **P2 — 1711 differing.** Inside **one** call, a second triangle covering nothing in the window
+  still destroys triangle 0.
+
+Together with the singleton sweep this rules out blending, overlap, submission order, and every
+triangle's geometry and attribute frame — a triangle that writes **zero pixels** still wipes its
+predecessor, and the identical work composites correctly when each step crosses a syscall boundary.
+The destroyer is inside `gpu_tri_list`'s loop, and the syscall boundary papers over it.
+
+**P3** identifies which of the three per-triangle dispatches is responsible without needing a kernel
+flag: `op 0x08` is reachable from ring 3, so the coverage pair is fired alone, with no interpolation
+pass involved and nothing addressing the back buffer. If the rendered rect survives, the coverage
+pass is innocent and the interpolation dispatch is the destroyer; if it does not, a dispatch that
+never touches the destination is wiping it, which is a cache/coherence fault rather than a shader
+one — and would explain why the syscall boundary hides it.
+
+⚠ The PM4 already emits `ACQUIRE_MEM(INV) → DISPATCH → CS_PARTIAL_FLUSH → ACQUIRE_MEM(TCWB) →
+fence` per dispatch, which is correct on paper. **The fence sequence is deliberately left alone
+until P3 says which dispatch is at fault** — three earlier reds in this arc came from acting on a
+plausible mechanism instead of a measured one.
+
 ### ⭐ RUNG 12 NARROWED TO COMPOSITION — every triangle is byte-exact ALONE
 
 The singleton sweep dispatched each of the six triangles on its own: **all six EXACT**. So no
