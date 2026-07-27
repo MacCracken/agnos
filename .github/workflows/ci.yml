@@ -229,14 +229,11 @@ jobs:
       - name: Build kernel
         run: sh scripts/build.sh
 
-      - name: Build ISO (if grub available)
-        run: |
-          if command -v grub-mkrescue >/dev/null 2>&1; then
-            sh scripts/iso.sh
-          else
-            echo "grub-mkrescue not available, skipping ISO"
-          fi
-        continue-on-error: true
+      # ⛔ The "Build ISO" step was REMOVED at 1.56.22. GRUB's multiboot2 path cannot load the
+      # kernel under W^X and gnoboot replaced it; the medium is GPT + FAT ESP, not ISO9660. The
+      # step also read boot/grub/grub.cfg, a tree deleted in the same tidy, so it had become a
+      # continue-on-error no-op that logged a failure every run. scripts/iso.sh now refuses with
+      # the reason rather than failing on a missing file.
 
       - name: Install boot toolchain (OVMF + disk-image tools)
         # gnoboot+OVMF replaces the pre-1.30.0 `-kernel` boot path
