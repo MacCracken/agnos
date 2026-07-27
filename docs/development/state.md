@@ -21,16 +21,24 @@ requirement → DCN second plane stays a live deferred item. **REMAINING (iron-g
 harness half is zero-burn; L1 discriminator runs first, free) · **HDMI audio** (zero-burn Linux discriminator
 first; ⛔ the DCCG symbol-clock lead is FALSIFIED, in-boot A/B burn 11) · **3D — the rung ladder is at 14.** Rungs 9–13 are IRON-CLOSED
 (edge coverage · attribute interpolation · tri-list · **texturing 17/17 byte-identical, both formats, WRAP,
-FULLCOV**). **Rung 14 (DOOM affine) is BUILT BUT UNBURNED as of 1.56.23:** op `0x0C GPU_OP_TEX_LIST` fuses N
+FULLCOV**). **Rung 14 (DOOM affine) — op 0x0C CORRECTNESS CLOSED ON IRON 2026-07-27 (burn 1, exit 95; all
+three cases byte-identical to 32 individual op 0x0B dispatches, rung 13 unregressed 17/17). The
+TIMING refuted the pre-registered speedup: 851→306 µs = 2.78x, not >10x, because fusion removes
+SUBMISSION cost and not SHADING cost — both paths launch the same 1536 wavefronts. A two-point fit
+against the ragged case gives 177 ns per LAUNCHED wave vs 22 ns per additional WORKING wave (launch
+dominates 8:1), so a 640-column DOOM frame is 24.5 ms of a 28.6 ms budget row-major and 0.51 ms
+column-major (50x fewer waves). ⇒ THE DEFERRED COLUMN-MAJOR FLAG IS NOW REQUIRED and is the next
+rung-14 bite — a shader-prologue change plus a per-primitive flag, with the record array,
+per-primitive origin, grid decomposition and ABI carrying over unchanged.** As built at 1.56.23: op `0x0C GPU_OP_TEX_LIST` fuses N
 textured primitives into ONE dispatch — ABI 83/83, validator, record array, dispatch, shader (458 dwords =
 a 16-instruction prologue on rung 13's character-identical body, gated by `texl-body-identity.sh`), host
 grid-mapping oracle 6/6 + 3/3 mutations, and a `gputex` case demanding byte-identity against 32 individual
 op 0x0B dispatches. ⛔ **Two plan premises were overturned by measurement this cycle** — rung 14 is
 DISPATCH-bound not bandwidth-bound (52.7 µs fixed vs ≥3680 MB/s), and "walls batch as textured quads" is
 REFUTED (`doomwall`: a 1.5× depth ratio makes 4096/4096 px wrong, because `ty_step = 1/depth` is a hyperbola
-in screen x). Batch by DISPATCH, never by geometry. ⚠ Open question for the next burn: op 0x0C uses ONE of
-64 lanes on a 1-px DOOM column; the fix if measured too slow is a column-major flag, deliberately unbuilt
-until there is a number. (the
+in screen x). Batch by DISPATCH, never by geometry. ⭐ The lane-efficiency question is ANSWERED, not open: 3.1% occupancy at 2 px wide, 99.6 ns per
+USEFUL pixel against rung 13's 1.6 ns/px slope. The deferral worked as designed — the flag was
+named, left unbuilt pending a measurement, and the measurement says build it. (the
 consumer stack — soorat/kiran/joshua + cyrius-mine-cart/cyrius-block-game — is cataloged and waits on the
 kernel; kernel → engine, so port soorat/kiran to learn the seam) · a minor invalidate-hoist perf item · the ML full-forward wiring follow-on (per-repo consumer task). ⚠ **Every GPU-pixel arm is IRON-ONLY** — QEMU has no AMD GPU, and `#92`'s failure mode is SILENT
 (straight-alpha renders washed out, never an error), so nothing GPU-composited is proven without a burn.

@@ -327,14 +327,69 @@ will hit it — **when a cycle's oracle is a new or changed tool, add it to that
 bite.** Checking the kernel artifact is not enough; the gate must cover whatever produces the
 evidence.
 
+### ⭐⭐⭐ IRON, FIRST BURN: op 0x0C IS BYTE-IDENTICAL — and the timing REFUTES the pre-registered speedup
+
+**Correctness: green, first contact, exit 95.** All three rung-14 cases byte-identical to 32
+individual op 0x0B dispatches — RGBA8, IDX8, and the ragged-height case that fires the `py>=ph` row
+guard. Rung 13 unregressed at 17/17, which is what the 417-bit-identical-dword gate predicted.
+
+⛔ **THE PRE-REGISTERED SPEEDUP WAS WRONG, AND WRONG ABOUT THE MECHANISM.** The tracker said "32 ×
+~27.9 µs ≈ 890 µs against one dispatch, so a speedup well above 10/10x". Measured: **851 µs → 306 µs,
+2.78×**, reproduced across two runs and three configurations (2.7–3.0×).
+
+The 32-dispatch side matched prediction (851 vs ~890). The *fused* side did not: predicted ~28 µs,
+measured 306 µs. **Fusion removes SUBMISSION cost, not SHADING cost** — and both paths launch the
+*same* 1536 wavefronts, because `gx = n_prims, gy = max(ph)` is exactly what 32 separate
+`gx=1, gy=48` dispatches launch between them. The saving is precisely the 31 removed dispatches:
+`(851 − 306) / 31 = 17.6 µs each`. The op does what it was built to do; the prediction confused the
+cost of *asking* with the cost of *doing*.
+
+### ⭐⭐ THE RAGGED CASE ANSWERED A QUESTION IT WAS NOT ASKED
+
+It was added to exercise the row guard on hardware. It also became the second point of a two-point
+fit — the same technique that rescued the bandwidth measurement in 1.56.22 — because it launches
+almost as many waves (1504) while doing far less work (940 of them):
+
+| case | launched waves | working waves | measured |
+|---|---|---|---|
+| uniform | 1536 | 1536 | 306 µs |
+| ragged | 1504 | 940 | 287 µs |
+
+Solving both: **177 ns per LAUNCHED wave, 22 ns per additional WORKING wave — launch dominates 8:1**
+(fit reproduces both points exactly). ⇒ **The `py>=ph` guard makes a wave EXIT; it does not make it
+FREE.** Cost is driven by the grid you launch, not the pixels you shade.
+
+### ⛔ AND THAT MAKES THE DEFERRED COLUMN-MAJOR FLAG *REQUIRED*, NOT OPTIONAL
+
+A 1-px DOOM column uses **one of 64 lanes** — 3.1 % occupancy at the 2-px width benchmarked, and the
+cost per *useful* pixel is 99.6 ns against rung 13's 1.6 ns/px slope. Projecting a 640-column frame
+at 200 rows with the measured coefficients:
+
+| mapping | launched waves | frame cost | verdict |
+|---|---|---|---|
+| row-major (as built) | 128,000 | **24.5 ms** of 28.6 ms | ⛔ not viable |
+| column-major (lanes walk Y) | 2,560 | **0.51 ms** | ⭐ viable, 50× fewer waves |
+
+⭐ **This is the deferral working exactly as designed.** The column-major flag was named and
+deliberately *not built* — "unbuilt until this burn produces the number". The number arrived, and it
+says build it. Had it been built on the guess it would have been the right call for the wrong
+reason; had the question never been posed, rung 14 would have shipped a fused path that is correct,
+2.8× faster, and still unable to draw a DOOM frame.
+
+⚠ **Honest statement of what op 0x0C is worth as it stands:** a real 2.78× on batched small
+primitives, byte-exact, and the necessary substrate for the column-major variant — the record array,
+the per-primitive origin, the grid decomposition and the ABI all carry over unchanged. It is not, by
+itself, the DOOM backend.
+
 ### Status
 
 CPU side, ABI, validator, record builder, dispatch, shader, blob and both host oracles are **done
 and green at zero burns**: `check.sh` 17/17, `edge-abi-smoke` 16/16 (83/83 cases), `texlist` 6/6
 cases + 3/3 mutations, blob tables matching source for all five shaders, 417 shipped body dwords
 bit-identical. `burn-prep` **ARC SWEEP: PASS**, bare kernel 1,840,760 B stamped, `burn-verify: OK —
-safe to flash`, all nine staged GPU tools md5-matching their builds. **op 0x0C has never run on
-hardware** — the next burn is what decides it.
+safe to flash`, all nine staged GPU tools md5-matching their builds. **op 0x0C ran on hardware and is byte-identical**
+(exit 95, first burn). What remains is not correctness but the lane-efficiency work the burn's
+timing made mandatory — see the two-point fit above.
 
 ## [1.56.22] - 2026-07-27
 
