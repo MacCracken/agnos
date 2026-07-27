@@ -1,0 +1,287 @@
+# texmodel.cyr — THE CORRECTNESS GATE for rung 13's nearest-neighbour affine texturing.
+#
+# ============================================================================================
+# WHY THIS FILE IS THE KEYSTONE (again)
+# ============================================================================================
+# The shader's UV path — a hoisted reciprocal, a 96-bit numerator, a funnel shift, an
+# estimate-and-correct quotient — written in Cyrius at the GPU's register widths and byte-diffed
+# against texcore.cyr, which divides exactly and is the oracle.
+#
+# ⭐ THE POINT IS ATTRIBUTION. Green here and red on iron ⇒ the fault is the EMISSION, not the
+# algorithm. Rung 11 earned that split: when its burn came back red, this same discipline let a
+# host mutation reproduce the failing pixels BIT-EXACTLY and convict the shader in one pass.
+#
+# ⛔ THE SIGNED-HIGH-DWORD LESSON APPLIES DIRECTLY HERE, AND HARDER. E is signed and its high dword
+# must be multiplied as SIGNED; multiplying it unsigned adds a spurious 2^64·p. On rung 11 that cost
+# four burns. Texturing makes it MORE likely to bite, because UV legitimately extrapolates outside
+# the frame — negative E is the common case here, not the edge case. `n_madd` in tricore.cyr carries
+# the fix and keeps `tm_ehi_unsigned` as a live mutation; gate 3 below requires it to break things.
+
+include "lib/io.cyr"
+include "texcore.cyr"
+
+# ---- the hoisted reciprocal for 2A ---------------------------------------------------------
+# ⚠ RUNG 11 HOISTED A RECIPROCAL FOR D255 = 255·2A. Texturing divides the UV numerator by 2A
+# ITSELF, so it needs its OWN constants — reusing rung 11's would divide by 255× too much. The
+# arithmetic is deliberately identical in shape so the two can be read against each other.
+var TXM_T = 0;
+var TXM_DH = 0;
+var TXM_V = 0;
+var TXM_L = 0;
+var TXM_A2 = 0;
+var TXM_READY = 0;
+
+fn txm_prep(): i64 {
+    TXM_READY = 0;
+    var a2 = tp_get(TP_A2);
+    if (a2 <= 0) { return 0; }
+    var t = bitlen64(a2) - 30;
+    if (t < 0) { t = 0; }
+    var dh = (a2 >> t) + 1;                     # +1 makes the correction ONE-SIDED, as in tri_prep
+    var l = clz32(dh);
+    var dn = u32(dh << l);
+    if (dn < 2147483648) { return 0; }          # recip32's precondition, asserted not assumed
+    TXM_T = t; TXM_DH = dh; TXM_V = recip32(dn); TXM_L = l; TXM_A2 = a2;
+    TXM_READY = 1;
+    return 1;
+}
+
+# ---- mutations, each required to break the gate ---------------------------------------------
+var txm_skip_corr = 0;          # skip the exact correction
+var txm_no_negclamp = 0;        # do not short-circuit a negative numerator
+var txm_no_hiclamp = 0;         # do not short-circuit a numerator past the last texel
+
+# txm_axis — one texture axis at register widths. Returns the TEXEL INDEX, already clamped.
+#
+# ⭐ THE NEGATIVE SHORT-CIRCUIT IS AN OPTIMISATION THE ORACLE LICENSED, NOT A SHORTCUT. texcore
+# proved that floor and truncate are indistinguishable under clamp-to-edge, because every negative
+# index clamps to 0. So a negative numerator can be answered as texel 0 WITHOUT dividing at all —
+# which is what lets this path reuse rung 11's unsigned divider unchanged instead of growing a
+# signed one. The proof lives in texcore's tx_floordiv; if WRAP addressing is ever added it lapses.
+fn txm_axis(ea, eb, ec, c0, c1, c2, dim): i64 {
+    # ⛔⛔ THE MIN-BIAS IS LOAD-BEARING, AND THE FIRST VERSION WITHOUT IT WAS WRONG.
+    #
+    # `n_madd(e, p)` is rung 11's primitive and it assumes **p >= 0** — rung 11's p was a colour byte
+    # times coverage, never negative. A UV operand CAN be negative, and passing one in makes the
+    # low-half product `e_lo * p` meaningless (e_lo is an unsigned dword and the `lo >> 32` that
+    # follows is a LOGICAL shift). The gate caught it immediately: the negative-UV frame differed in
+    # 959 samples, and the "no negative short-circuit" mutation broke it by exactly the same 959 —
+    # the tell that the short-circuit was not doing anything at all.
+    #
+    # ⭐ THE FIX USES THE IDENTITY RATHER THAN A NEW PRIMITIVE. E_A + E_B + E_C == 2A, so for any
+    # constant m:
+    #     N = E_A·u0 + E_B·u1 + E_C·u2  =  2A·m + E_A·(u0−m) + E_B·(u1−m) + E_C·(u2−m)
+    # Choosing m = min(u0,u1,u2) makes every multiplicand NON-NEGATIVE, so n_madd is used exactly
+    # within its contract and stays untouched. Growing a signed n_msub would have meant editing
+    # arithmetic that four burns and two rungs already proved.
+    var m = c0;
+    if (c1 < m) { m = c1; }
+    if (c2 < m) { m = c2; }
+    var a2 = TXM_A2;
+
+    n_zero();
+    # ⚠ p reaches 2^29 after the bias, not rung 11's 2^16. n_madd's low product is e_lo·p
+    # <= 2^32·2^29 = 2^61, inside i64 — headroom of 2 bits, so this is checked, not assumed.
+    n_madd(ea, c0 - m);
+    n_madd(eb, c1 - m);
+    n_madd(ec, c2 - m);
+
+    # The real value is  u = m + N/2A.  Everything below works on N, with m folded back in via the
+    # comparison bounds, so the divider still only ever sees a NON-NEGATIVE numerator.
+    if (txm_no_negclamp == 0) {
+        # u < 0  <=>  N < −m·2A. Compare in the accumulator's own width rather than materialising u.
+        var negl = (0 - m) * a2;
+        var nl_hi = negl >>> 32;
+        var nl_lo = u32(negl);
+        var lt = 0;
+        if (n_hi < nl_hi) { lt = 1; }
+        if (n_hi == nl_hi) { if (n_lo < nl_lo) { lt = 1; } }
+        if (lt == 1) { return 0; }              # every negative index clamps to texel 0
+    }
+    # ⚠ THE SUBSET GUARD, AND IT IS PART OF THE SAME MUTATION. The bound above is the general
+    # condition (u < 0); this one protects the UNSIGNED divider from a negative numerator, which is
+    # a strict subset of it. Leaving it outside the mutation made gate 4 unfalsifiable — disabling
+    # the general check changed nothing because this one still caught every case the corpus reached.
+    # A guard that silently covers for the guard under test makes the test meaningless.
+    if (txm_no_negclamp == 0) {
+        if (n_is_neg() == 1) { return 0; }
+    }
+
+    # ⛔ THE HIGH SHORT-CIRCUIT EXISTS SO THE QUOTIENT CANNOT WRAP. tm_quot returns a u32; a UV that
+    # extrapolates far outside the texture would produce a quotient past 2^32 and WRAP into a
+    # plausible-looking small index. Comparing the 96-bit numerator against dim·2^16·2A first makes
+    # that unrepresentable — the same shape as rung 11's exact-correction compare.
+    if (txm_no_hiclamp == 0) {
+        # u >= dim  <=>  N >= (dim·65536 − m)·2A, the bias folded back in.
+        var lim = (dim * 65536 - m) * a2;
+        if (lim < 0) { return dim - 1; }
+        var lim_hi = lim >>> 32;
+        var lim_lo = u32(lim);
+        var ge = 0;
+        if (n_hi > lim_hi) { ge = 1; }
+        if (n_hi == lim_hi) { if (n_lo >= lim_lo) { ge = 1; } }
+        if (ge == 1) { return dim - 1; }
+    }
+
+    var nh = n_shr(TXM_T);
+    var q = tm_quot(nh, TXM_DH, TXM_V, TXM_L);
+    if (txm_skip_corr == 0) {
+        var need = (q + 1) * TXM_A2;
+        var need_hi = need >>> 32;
+        var need_lo = u32(need);
+        var ge2 = 0;
+        if (n_hi > need_hi) { ge2 = 1; }
+        if (n_hi == need_hi) { if (n_lo >= need_lo) { ge2 = 1; } }
+        if (ge2 == 1) { q = q + 1; }
+    }
+
+    var texel = (q + m) >>> 16;               # fold the bias back in before selecting the texel
+    if (texel < 0) { texel = 0; }
+    if (texel > dim - 1) { texel = dim - 1; }
+    return texel;
+}
+
+# txm_px — the shader's answer for one pixel, at register widths.
+fn txm_px(tex, lut, tw, th, px, py, cov, dst, idx8): i64 {
+    if (cov == 0) { return dst; }
+    var pcx = (px << 16) + 32768;
+    var pcy = (py << 16) + 32768;
+    var eb = tp_get(TP_KXB) * pcx + tp_get(TP_KYB) * pcy + tp_get(TP_K0B);
+    var ec = tp_get(TP_KXC) * pcx + tp_get(TP_KYC) * pcy + tp_get(TP_K0C);
+    var ea = tp_get(TP_A2) - eb - ec;
+
+    var tu = txm_axis(ea, eb, ec, tx_get(TX_U0), tx_get(TX_U1), tx_get(TX_U2), tw);
+    var tv = txm_axis(ea, eb, ec, tx_get(TX_V0), tx_get(TX_V1), tx_get(TX_V2), th);
+    var texel = tx_fetch_at(tex, lut, tw, tv * tw + tu, idx8);
+
+    var out = 0;
+    var qa = 255;
+    var ch = 0;
+    while (ch < 4) {
+        var sh = 24 - ch * 8;
+        var c = (texel >> sh) & 0xFF;
+        var q = (c * cov + 127) / 255;
+        if (q > 255) { q = 255; }
+        if (ch == 0) { qa = q; }
+        if (q > qa) { q = qa; }
+        out = out | (q << sh);
+        ch = ch + 1;
+    }
+    return tri_src_over(out, dst);
+}
+
+# ============================================================================================
+# THE BYTE DIFF — every pixel of the window, against a corpus of frames
+# ============================================================================================
+# ⛔ DENSE FROM THE START. Rung 11's gate sampled a sparse lattice that could not reach x=62, which
+# is exactly where iron disagreed, and it was reported as if it proved the surface. This one sweeps
+# every pixel of the render window and does not pretend otherwise. [[feedback_instrument_has_no_oracle]]
+var txm_first_px = 0 - 1;
+var txm_first_py = 0;
+var txm_first_want = 0;
+var txm_first_got = 0;
+
+# The corpus: frames chosen so UV lands inside, straddles, and extrapolates OFF the texture, plus
+# a non-integer scale (the plan's own gate) and a 1:1 case (its absolute test).
+var TXC_N = 6;
+fn txc_frame(i, f): i64 {
+    # ax ay bx by cx cy  u0 v0 u1 v1 u2 v2   (UVs in 16.16 texel space)
+    if (i == 0) {  # 1:1 identity -- the absolute test
+        if (f == 0) { return 0; }  if (f == 1) { return 0; }
+        if (f == 2) { return 8; }  if (f == 3) { return 0; }
+        if (f == 4) { return 0; }  if (f == 5) { return 8; }
+        if (f == 6) { return 0; }  if (f == 7) { return 0; }
+        if (f == 8) { return 8 << 16; } if (f == 9) { return 0; }
+        if (f == 10) { return 0; } return 8 << 16;
+    }
+    if (i == 1) {  # non-integer scale: 8 texels across 13 pixels
+        if (f == 0) { return 0; }  if (f == 1) { return 0; }
+        if (f == 2) { return 13; } if (f == 3) { return 0; }
+        if (f == 4) { return 0; }  if (f == 5) { return 13; }
+        if (f == 6) { return 0; }  if (f == 7) { return 0; }
+        if (f == 8) { return 8 << 16; } if (f == 9) { return 0; }
+        if (f == 10) { return 0; } return 8 << 16;
+    }
+    if (i == 2) {  # magnified: 3 texels across 32 pixels
+        if (f == 0) { return 0; }  if (f == 1) { return 0; }
+        if (f == 2) { return 32; } if (f == 3) { return 0; }
+        if (f == 4) { return 0; }  if (f == 5) { return 32; }
+        if (f == 6) { return 0; }  if (f == 7) { return 0; }
+        if (f == 8) { return 3 << 16; } if (f == 9) { return 0; }
+        if (f == 10) { return 0; } return 3 << 16;
+    }
+    if (i == 3) {  # NEGATIVE UV at one vertex -- forces the negative short-circuit
+        if (f == 0) { return 0; }  if (f == 1) { return 0; }
+        if (f == 2) { return 16; } if (f == 3) { return 0; }
+        if (f == 4) { return 0; }  if (f == 5) { return 16; }
+        if (f == 6) { return 0 - (4 << 16); } if (f == 7) { return 0 - (4 << 16); }
+        if (f == 8) { return 12 << 16; } if (f == 9) { return 0; }
+        if (f == 10) { return 0; } return 12 << 16;
+    }
+    if (i == 4) {  # UV far PAST the texture -- forces the high short-circuit
+        if (f == 0) { return 0; }  if (f == 1) { return 0; }
+        if (f == 2) { return 16; } if (f == 3) { return 0; }
+        if (f == 4) { return 0; }  if (f == 5) { return 16; }
+        if (f == 6) { return 0; }  if (f == 7) { return 0; }
+        if (f == 8) { return 200 << 16; } if (f == 9) { return 0; }
+        if (f == 10) { return 0; } return 200 << 16;
+    }
+    # i == 5: skewed frame, u and v not axis-aligned
+    if (f == 0) { return 2; }  if (f == 1) { return 1; }
+    if (f == 2) { return 20; } if (f == 3) { return 5; }
+    if (f == 4) { return 6; }  if (f == 5) { return 22; }
+    if (f == 6) { return 0; }  if (f == 7) { return 0; }
+    if (f == 8) { return 8 << 16; } if (f == 9) { return 2 << 16; }
+    if (f == 10) { return 1 << 16; } return 8 << 16;
+}
+
+fn txm_diff_case(tex, lut, i, idx8): i64 {
+    if (tri_prep(txc_frame(i,0), txc_frame(i,1), txc_frame(i,2), txc_frame(i,3),
+                 txc_frame(i,4), txc_frame(i,5),
+                 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF) != 1) { return 0 - 1; }
+    if (tex_prep(txc_frame(i,6), txc_frame(i,7), txc_frame(i,8),
+                 txc_frame(i,9), txc_frame(i,10), txc_frame(i,11)) != 1) { return 0 - 1; }
+    if (txm_prep() != 1) { return 0 - 1; }
+
+    var bad = 0;
+    var py = 0;
+    while (py < 32) {
+        var px = 0;
+        while (px < 32) {
+            var ci = 0;
+            while (ci < 3) {
+                var cv = 255;
+                if (ci == 1) { cv = 128; }
+                if (ci == 2) { cv = 37; }
+                var want = tex_ref_px(tex, lut, 8, 8, px, py, cv, 0xFF101010, idx8);
+                var got  = txm_px(tex, lut, 8, 8, px, py, cv, 0xFF101010, idx8);
+                if (want != got) {
+                    if (txm_first_px < 0) {
+                        txm_first_px = px; txm_first_py = py;
+                        txm_first_want = want; txm_first_got = got;
+                    }
+                    bad = bad + 1;
+                }
+                ci = ci + 1;
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return bad;
+}
+
+fn txm_sweep(tex, lut, label, idx8): i64 {
+    var total = 0;
+    var i = 0;
+    while (i < TXC_N) {
+        var b = txm_diff_case(tex, lut, i, idx8);
+        if (b > 0) {
+            ps("    "); ps(label); ps(": frame "); pn(i); ps(" -- "); pn(b);
+            ps(" differing samples"); nl();
+            total = total + b;
+        }
+        i = i + 1;
+    }
+    return total;
+}
