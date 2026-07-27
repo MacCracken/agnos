@@ -1894,13 +1894,16 @@ fn gpo_execute(rec) {
         var tnr = load32(rec + 60) & 0xFFFFFFFF;
         var tne = tnr & 0xFFFF;
         var trule = (tnr >> 16) & 0xFFFF;
-        if (gpu_tri_rgba(tedge, w, h, dx, dy, tne, trule,
-                         gpo_i32(rec + 24), gpo_i32(rec + 28),
-                         gpo_i32(rec + 32), gpo_i32(rec + 36),
-                         gpo_i32(rec + 40), gpo_i32(rec + 44),
-                         load32(rec + 48) & 0xFFFFFFFF,
-                         load32(rec + 52) & 0xFFFFFFFF,
-                         load32(rec + 56) & 0xFFFFFFFF) != 1) { return GPO_E_DISPATCH; }
+        # Hoisted so the call fits one line: the formatter de-indents wrapped arguments to column 0,
+        # where they read as top-level statements rather than as this call's operands.
+        var ax0 = gpo_i32(rec + 24); var ay0 = gpo_i32(rec + 28);
+        var ax1 = gpo_i32(rec + 32); var ay1 = gpo_i32(rec + 36);
+        var ax2 = gpo_i32(rec + 40); var ay2 = gpo_i32(rec + 44);
+        var qa = load32(rec + 48) & 0xFFFFFFFF;
+        var qb = load32(rec + 52) & 0xFFFFFFFF;
+        var qc = load32(rec + 56) & 0xFFFFFFFF;
+        var trc = gpu_tri_rgba(tedge, w, h, dx, dy, tne, trule, ax0, ay0, ax1, ay1, ax2, ay2, qa, qb, qc);
+        if (trc != 1) { return GPO_E_DISPATCH; }
         return 0;
     }
     if (op == GPU_OP_EDGE_COV) {

@@ -3761,8 +3761,8 @@ fn gpu_tri_dispatch(rec_phys, w, h, dx, dy) {
     var gx = (w + 63) / 64;
     var gy = h;
 
-    return gpu_blend_cov_run(shader_mc, rec_mc, dst_mc, pitch, 0, w, h,
-                             GPU_COMPUTE_PGM_RSRC1_TRI, gx, gy, done_mc, done_phys);
+    var r1 = GPU_COMPUTE_PGM_RSRC1_TRI;
+    return gpu_blend_cov_run(shader_mc, rec_mc, dst_mc, pitch, 0, w, h, r1, gx, gy, done_mc, done_phys);
 }
 
 # gpu_tri_rgba — the attribute-interpolation worker. Coverage first (the shipped edge rasteriser,
@@ -3775,8 +3775,7 @@ fn gpu_tri_dispatch(rec_phys, w, h, dx, dy) {
 #
 # ⚠ Caller owns all bounds checking; gpo_validate_tri has already refused anything out of range.
 # Returns 1 / 0.
-fn gpu_tri_rgba(edge_mc, w, h, dx, dy, n_edges, rule,
-                vx0, vy0, vx1, vy1, vx2, vy2, ca, cb, cc) {
+fn gpu_tri_rgba(edge_mc, w, h, dx, dy, n_edges, rule, vx0, vy0, vx1, vy1, vx2, vy2, ca, cb, cc) {
     if (gpu_tri_arm() != 1) { return 0; }
     if (gpu_cov_arm() != 1) { return 0; }
 
