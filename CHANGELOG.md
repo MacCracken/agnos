@@ -9,6 +9,56 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 iron — attribute interpolation byte-exact, every control firing. This cycle carries the batch-path
 defect that four probes have now cornered. Bumped on cycle open; the user tags on close.
 
+### ⭐⭐ RUNG 13a — `op 0x0B TRI_TEX` ABI, proven in QEMU at ZERO BURNS
+
+Texture mapping's ABI lands before one instruction of its shader exists — the same discipline that
+gave rung 9a its zero-flash record. **57 of 57 ABI cases correct**, `edge-abi-smoke` 16/16.
+
+**Record layout** (64 B): `op · flags · tex_id · edge_id · wh · dstxy · vtx_id · texwh · lut_id`
+with `n_edges|rule` at +60; field mask `0x81FF`. The per-triangle record in the vertex slot is
+**48 B of pure 16.16**: 6 screen-space coords then 6 texel-space UVs — no reserved tail, because
+12 × 4 is exactly 48 and a future extension deserves its own stride constant rather than space that
+never existed.
+
+**Two formats, and the paletted one is deliberately general.** `IDX8` is *8bpp index + a
+caller-supplied 256-entry LUT slot*, not a DOOM-shaped op, so rung 16's tile-owner will not need its
+own bespoke fetch. `GPU_TEX_MAX_DIM` 4096 per axis; clamp-to-edge; linear surfaces only.
+
+⛔ **No MIMG, no T#, no S#, no sampler descriptor, no new instruction class** — the texture address
+is computed in the shader and fetched with plain `global_load_dword`, keeping rung 13 inside the
+repertoire already iron-proven across rungs 9–12.
+
+New rejects, each its own code: `GPO_E_TEXSLOT` (25), `GPO_E_TEXDIM` (26), `GPO_E_LUTSLOT` (27).
+⚠ **The LUT rule is bidirectional on purpose** — `IDX8` without a LUT is refused, and a LUT supplied
+*without* `IDX8` is refused too, because accepting it would silently ignore a slot the caller
+believed was in use. Same doctrine as the flags word. Bytes-per-texel is format-dependent, so the
+slot-size gate is too; an undersized RGBA8 slot that would satisfy the IDX8 bound is caught.
+
+`gpu_tex_arm()` returns 0 exactly as `gpu_edge_arm` did through rung 9a, so a well-formed record
+reaches the dispatch and is refused with `GPO_E_ARM` rather than `GPO_E_BADOP`. 13b is a
+one-function change with no edit to `syscall.cyr`.
+
+### ⛔ Two instrument defects, both caught before they could mislead
+
+* **`edge-abi-smoke.sh` clipped its own evidence.** The display cap sat at `head -40` while the
+  battery grew past it, truncating the entire 0x0B block *and* the verdict line — the run looked
+  exactly like the kernel halting mid-battery. Raised to 80, with a note that it must lead the case
+  count. An instrument that hides its own output is indistinguishable from the thing under test
+  failing, which is this arc's recurring lesson.
+* **The two accept-cases asked the wrong question.** They expected `GPO_E_ARM`, but `ea_expect`
+  exercises the **validator**, where a well-formed record correctly returns 0 — arming belongs to
+  the executor. The ABI was doing its job and the test called it broken.
+
+### ⭐⭐⭐ RUNG 12 CLOSED ON IRON — batched triangles composite byte-exactly
+
+Burn 11, exit **95**. Every prefix `n=1…6` reports `differing 0` with `ref == gpu`, the full batch
+digest is `0xfc6f8c42` against the reference's `0xfc6f8c42`, and **P2 flipped from 1711 differing to
+EXACT** — the single most direct confirmation that the diagnosis was right, since P2 is the probe
+that isolated the failure.
+
+**Rungs 11 and 12 are both closed.** AGNOS interpolates colour and composites batched triangles
+byte-exactly on a GPU it drives with no AMD driver, no ROCm and no LLVM at runtime.
+
 ### ⭐⭐⭐ FIXED — `gpu_tri_list` looped inside the outer BATCH while reusing fixed arena slots
 
 **Root cause.** `gpo_execute_all` sets `gpu_batch_active` for the whole `#92` op array, so

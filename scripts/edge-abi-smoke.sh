@@ -70,17 +70,21 @@ timeout "${QEMU_TIMEOUT:-40}" qemu-system-x86_64 \
     -serial stdio -display none -no-reboot 2>/dev/null > "$LOG"
 
 echo "--- edge-abi lines ---"
-strings "$LOG" | grep -E "edge-abi:" | head -40
+# ⚠ THE DISPLAY CAP MUST EXCEED THE BATTERY. It sat at head -40 while the battery grew to 58,
+# which silently truncated the 0x0B block AND the verdict line — the run looked like the kernel had
+# stopped printing mid-battery. An instrument that clips its own evidence reads exactly like the
+# thing under test failing. Keep this comfortably ahead of the case count.
+strings "$LOG" | grep -E "edge-abi:" | head -80
 echo "----------------"
 
 pass=0; fail=0
 chk() { if grep -q "$1" "$LOG"; then echo "PASS: $2"; pass=$((pass+1)); else echo "FAIL: '$1' — $3"; fail=$((fail+1)); fi; }
 nchk() { if grep -q "$1" "$LOG"; then echo "FAIL: '$1' present — $3"; fail=$((fail+1)); else echo "PASS: $2"; pass=$((pass+1)); fi; }
 
-chk "edge-abi: 40 of 40 cases correct" \
-    "every one of the 24 ABI cases returned the reason the ABI specifies" \
-    "not 40/40 - read the named FAIL line(s) above; each names its case, want and got"
-chk "edge-abi: PASS -- the 0x08 and 0x09 ABIs reject every malformed record" \
+chk "edge-abi: 57 of 57 cases correct" \
+    "every one of the 57 ABI cases returned the reason the ABI specifies" \
+    "not 57/57 - read the named FAIL line(s) above; each names its case, want and got"
+chk "edge-abi: PASS -- the 0x08/0x09/0x0A/0x0B ABIs reject every malformed record" \
     "the battery's own verdict line is PASS" \
     "verdict line absent or FAIL"
 # THE 9a ORACLE. The single WELL-FORMED record must reach residency and be told NOT YET. If this case

@@ -1022,13 +1022,40 @@ var GPU_TRI_AREA_MAX   = 4398046511104;      # 2^42 — the largest area the coo
 var GPU_TRI_E_RATIO    = 1024;               # max |E| / 2A over the mask-rect corners
 var GPU_TRI_MAX_PIXELS = 1048576;            # w*h. ⚠ AN ARENA SIZE WEARING A CONSTANT'S CLOTHES.
 
+# ⭐ RUNG 13 — TEXTURE MAPPING. Nearest-neighbour, affine UV, texture read out of a #86 slot with
+# plain `global_load_dword`.
+#
+# ⛔ NO MIMG, NO T#, NO S#, NO SAMPLER DESCRIPTOR, NO NEW INSTRUCTION CLASS. The texture address is
+# computed in the shader and fetched as an ordinary dword load. That keeps rung 13 inside the
+# instruction repertoire already proven on this silicon across rungs 9-12; an image-op path would
+# introduce a descriptor format, a sampler state and a fetch class all at once, none of them
+# covered by an existing oracle. Linear surfaces only — no tiling, no swizzle.
+#
+# ⚠ The per-triangle record in the vertex slot is 48 BYTES and is NOT the same shape as op 0x0A's,
+# which packs colours. Here every field is a 16.16 signed coordinate:
+#   +0  vx0 vy0 vx1 vy1 vx2 vy2      (i32, 16.16 screen space)
+#   +24 u0  v0  u1  v1  u2  v2       (i32, 16.16 TEXEL space)
+# There is no reserved tail: 12 x 4 = 48 exactly. A future extension takes a new stride constant
+# rather than stealing space that never existed.
+var GPU_OP_TRI_TEX     = 0x0B;       # affine nearest-neighbour texturing      (3D arc rung 13)
+var GPU_TEX_VTX_BYTES  = 48;         # 6 vertex coords + 6 UV coords, all i32 16.16
+var GPU_TEX_MAX_DIM    = 4096;       # per-axis texture cap; a reject, never a clamp
+
+# ⭐ TWO FORMATS, AND THE PALETTED ONE IS DELIBERATELY GENERAL. IDX8 is "8bpp index + a slot-resident
+# 256-entry ARGB lookup", not a DOOM-shaped op: the LUT is a caller-supplied slot, so any paletted
+# source works. Choosing the general form here is what stops rung 16's tile-owner from needing its
+# own bespoke fetch.
+var GPU_TEX_FLAG_IDX8  = 0x01;       # texture is 8bpp indices + a LUT slot; else RGBA8 linear
+var GPU_TEX_FLAGS_KNOWN = 0x01;      # anything outside this is REJECTED, never accepted-and-ignored
+var GPU_TEX_LUT_ENTRIES = 256;       # a full byte of index; a short LUT is a reject, not a clamp
+
 var GPU_RULE_NONZERO   = 0;
 var GPU_RULE_EVENODD   = 1;
 var GPU_EDGE_BYTES     = 16;         # one edge = x0,y0,x1,y1 as 4x i32 in 16.16
 var GPU_EDGE_MAX       = 256;        # per-op cap; a reject, never a clamp
 # 0x05 channel swap (plan S4) · 0x06 cov-modulated source · 0x07 packed VOP3P blend ·
 # 0x10-0x17 CP-DMA-domain ops (fill/blit/readback, plan S12) · 0x18-0x1F control (barrier/present).
-var GPU_OP_SUPPORTED   = 0x71F;      # bits 0..4 + 8 (EDGE_COV) + 9 (TRI_RGBA) + 10 (TRI_LIST) — MUST equal what gpo_validate accepts
+var GPU_OP_SUPPORTED   = 0xF1F;      # bits 0..4 + 8 (EDGE_COV) + 9 (TRI_RGBA) + 10 (TRI_LIST) + 11 (TRI_TEX) — MUST equal what gpo_validate accepts
 
 # Flags word (+4). NOTHING is accepted here yet, on purpose: a flag that is accepted and ignored is how
 # a caller silently gets behaviour it did not ask for. bit0 SERIALIZE and bit1 CHECK_PREMUL are reserved
@@ -1039,6 +1066,7 @@ var GPU_OP_FLAGS_KNOWN = 0x00;
 # that is how a caller gets behaviour it did not ask for. Default is "no flags at all".
 fn gpo_flags_known(op) {
     if (op == GPU_OP_TRI_RGBA) { return GPU_TRI_FLAG_DERIVE; }
+    if (op == GPU_OP_TRI_TEX)  { return GPU_TEX_FLAGS_KNOWN; }
     return GPU_OP_FLAGS_KNOWN;
 }
 
@@ -1085,6 +1113,10 @@ var GPO_E_AREA     = 22;             # op    — frame area outside [GPU_TRI_ARE
 var GPO_E_FRAME    = 23;             # op    — frame skew vs the mask rect exceeds GPU_TRI_E_RATIO
 # ⭐ 1.56.20 rung 12. Its own code because "the batch is malformed" and "one triangle in it is
 # malformed" have different fixes, and the caller cannot tell which from a shared reason.
+var GPO_E_TEXSLOT  = 25;             # op    — texture slot invalid/free/too small for its declared dims
+var GPO_E_TEXDIM   = 26;             # op    — texture w/h is zero or exceeds GPU_TEX_MAX_DIM
+var GPO_E_LUTSLOT  = 27;             # op    — IDX8 without a valid 256-entry LUT slot, or a LUT slot
+                                     #         supplied WITHOUT IDX8 (accepting it would silently ignore it)
 var GPO_E_TRILIST  = 24;             # op    — triangle count/slot invalid, or a per-triangle record is
 var GPU_COV_MAX_DIM = 4096;          # per-side mask cap — a REJECT, never a clamp
 # ⭐ THE COORDINATE DOMAIN (B3). 2^28 = 4096 px in 16.16 — the same 4096 as GPU_COV_MAX_DIM, so
@@ -1125,6 +1157,8 @@ fn gpo_field_mask(op) {
     # rung 12: op(0) flags(1) vtx_id(3) wh(4) dstxy(5) n_tris(6). ⚠ The per-triangle geometry lives
     # in the SLOT, not the record, which is the whole point -- one record, N triangles.
     if (op == GPU_OP_TRI_LIST)    { return 0x007B; }   # op flags vtx_id wh dstxy n_tris
+    # op flags tex_id edge_id wh dstxy vtx_id texwh lut_id  +  n_edges|rule at +60
+    if (op == GPU_OP_TRI_TEX)     { return 0x81FF; }
     # rung 9: op(0) flags(1) dst_id(2) edge_id(3) wh(4) n_edges|rule(9)
     # ⛔ dstxy (dword 5) is NOT defined by this op and must be zero. EDGE_COV does not touch the
     # framebuffer at all -- it rasterises into a mask slot whose origin IS (0,0). Accepting a dstxy
@@ -1186,6 +1220,91 @@ fn gpo_coord_bad(c) {
 # kernel can describe. Reject-don't-clip is only enforceable if the whole batch is checked first.
 # ⚠ PURE READS on the KERNEL-RESIDENT record and on the slot's kernel VA. Ring 3 cannot change a
 # field between the check and the use.
+# gpo_validate_tritex — rung 13's ABI gate. Returns 0 or a GPO_E_*.
+#
+# ⛔ EVERY REJECT HERE IS A REJECT, NEVER A CLAMP. A silently clamped texture dimension reads back as
+# a correct run that sampled the wrong texels, which is precisely the failure the byte oracle cannot
+# distinguish from a shader bug — and this arc has already spent burns on exactly that confusion.
+#
+# ⚠ The LUT rule is bidirectional ON PURPOSE. IDX8 without a LUT is obviously invalid; a LUT slot
+# supplied WITHOUT IDX8 is rejected too, because accepting it would mean silently ignoring a slot
+# the caller believed was in use. Same doctrine as the flags word.
+fn gpo_validate_tritex(rec, fbw, fbh) {
+    var flags = load32(rec + 4) & 0xFFFFFFFF;
+    if ((flags & (0 - 1 - GPU_TEX_FLAGS_KNOWN)) != 0) { return GPO_E_RESERVED; }
+
+    var wh  = load32(rec + 16) & 0xFFFFFFFF;
+    var dxy = load32(rec + 20) & 0xFFFFFFFF;
+    var w = wh & 0xFFFF;
+    var h = (wh >> 16) & 0xFFFF;
+    if (w < 1) { return GPO_E_DIM; }
+    if (h < 1) { return GPO_E_DIM; }
+    if (w * h > GPU_TRI_MAX_PIXELS) { return GPO_E_WORK; }
+    var dx = dxy & 0xFFFF;
+    var dy = (dxy >> 16) & 0xFFFF;
+    if (dx + w > fbw) { return GPO_E_DIM; }
+    if (dy + h > fbh) { return GPO_E_DIM; }
+
+    # ---- the texture itself -------------------------------------------------------------
+    var twh = load32(rec + 28) & 0xFFFFFFFF;
+    var tw = twh & 0xFFFF;
+    var th = (twh >> 16) & 0xFFFF;
+    if (tw < 1) { return GPO_E_TEXDIM; }
+    if (th < 1) { return GPO_E_TEXDIM; }
+    if (tw > GPU_TEX_MAX_DIM) { return GPO_E_TEXDIM; }
+    if (th > GPU_TEX_MAX_DIM) { return GPO_E_TEXDIM; }
+
+    var tid = load32(rec + 8) & 0xFFFFFFFF;
+    if (shm_slot_valid(tid) == 0) { return GPO_E_TEXSLOT; }
+    var tslot = tid - 1;
+    if (load64(&shm_kva + tslot * 8) == 0) { return GPO_E_TEXSLOT; }
+    # ⚠ BYTES-PER-TEXEL IS SET BY THE FORMAT, so the size check must be too. A 4x undersized RGBA8
+    # slot that happens to satisfy the IDX8 bound would otherwise read off the end of the slot.
+    var bpt = 4;
+    if ((flags & GPU_TEX_FLAG_IDX8) != 0) { bpt = 1; }
+    if (load64(&shm_size + tslot * 8) < tw * th * bpt) { return GPO_E_TEXSLOT; }
+
+    # ---- the palette --------------------------------------------------------------------
+    var lid = load32(rec + 32) & 0xFFFFFFFF;
+    if ((flags & GPU_TEX_FLAG_IDX8) != 0) {
+        if (shm_slot_valid(lid) == 0) { return GPO_E_LUTSLOT; }
+        var lslot = lid - 1;
+        if (load64(&shm_kva + lslot * 8) == 0) { return GPO_E_LUTSLOT; }
+        if (load64(&shm_size + lslot * 8) < GPU_TEX_LUT_ENTRIES * 4) { return GPO_E_LUTSLOT; }
+        if (lid == tid) { return GPO_E_ALIAS; }
+    }
+    if ((flags & GPU_TEX_FLAG_IDX8) == 0) {
+        if (lid != 0) { return GPO_E_LUTSLOT; }     # supplied but unusable — refuse, do not ignore
+    }
+
+    # ---- the vertex/UV record -----------------------------------------------------------
+    var vid = load32(rec + 24) & 0xFFFFFFFF;
+    if (shm_slot_valid(vid) == 0) { return GPO_E_TRILIST; }
+    var vslot = vid - 1;
+    if (load64(&shm_kva + vslot * 8) == 0) { return GPO_E_TRILIST; }
+    if (load64(&shm_size + vslot * 8) < GPU_TEX_VTX_BYTES) { return GPO_E_TRILIST; }
+    if (vid == tid) { return GPO_E_ALIAS; }
+
+    # ---- the coverage edges, same contract as op 0x09 -----------------------------------
+    var ner = load32(rec + 60) & 0xFFFFFFFF;
+    var ne = ner & 0xFFFF;
+    var rule = (ner >> 16) & 0xFFFF;
+    if (rule != GPU_RULE_NONZERO) { return GPO_E_RULE; }
+    if (ne < 3) { return GPO_E_EDGEBUF; }
+    if (ne > GPU_EDGE_MAX) { return GPO_E_EDGEBUF; }
+
+    var eid = load32(rec + 12) & 0xFFFFFFFF;
+    if (shm_slot_valid(eid) == 0) { return GPO_E_EDGEBUF; }
+    var eslot = eid - 1;
+    if (load64(&shm_kva + eslot * 8) == 0) { return GPO_E_EDGEBUF; }
+    if (load64(&shm_size + eslot * 8) < ne * GPU_EDGE_BYTES) { return GPO_E_EDGEBUF; }
+    if (eid == tid) { return GPO_E_ALIAS; }
+    if (eid == vid) { return GPO_E_ALIAS; }
+
+    if (w * h * ne > GPU_EDGE_WORK_MAX) { return GPO_E_WORK; }
+    return 0;
+}
+
 fn gpo_validate_trilist(rec, fbw, fbh) {
     var flags = load32(rec + 4) & 0xFFFFFFFF;
     if (flags != 0) { return GPO_E_RESERVED; }        # no flags defined for this op yet
@@ -1911,6 +2030,95 @@ fn edge_abi_selftest() {
     pass = pass + ea_expect(&d, GPO_E_RESERVED, "list: flags must be zero", 24);
     store32(&d +  4, 0);
 
+    # ============================================================================================
+    # op 0x0B TRI_TEX — rung 13a's ABI, proven here at ZERO BURNS
+    # ============================================================================================
+    # ⛔ SHM_MAX IS 16, so this battery REUSES the fixtures above rather than adding slots. The
+    # assignment is written out because an alias between two of them would turn a real reject into
+    # an accident:
+    #   tex  = id 14 — 256 B, kva set. Exactly an 8x8 RGBA8 texture, so the size gate is EXACT.
+    #   vtx  = id 11 — 4096 B, kva set.
+    #   lut  = id 15 — 4096 B, kva set below (>= the 1024 a 256-entry LUT needs).
+    #   edge = id 13 — 256 B, kva set below (>= the 48 that 3 edges need).
+    #   id 16 — 16 B, kva set below: the TOO-SMALL slot, used for both tex and lut undersize cases.
+    #   id 12 — deliberately FREE: the invalid-slot cases point at it.
+    kprint("edge-abi: ---- #92 op 0x0B TRI_TEX ABI battery ----\n", 52);
+    store64(&shm_kva + 14 * 8, &eabi_edges);
+    store64(&shm_kva + 12 * 8, &eabi_edges);
+    store64(&shm_kva + 15 * 8, &eabi_edges);
+
+    var tz = 0;
+    while (tz < 16) { store32(&d + tz * 4, 0); tz = tz + 1; }
+    store32(&d +  0, GPU_OP_TRI_TEX);
+    store32(&d +  4, 0);                          # RGBA8
+    store32(&d +  8, 14);                         # tex_id
+    store32(&d + 12, 13);                         # edge_id
+    store32(&d + 16, (16 * 65536) + 16);          # 16x16 destination rect
+    store32(&d + 20, 0);                          # dstxy
+    store32(&d + 24, 11);                         # vtx_id
+    store32(&d + 28, (8 * 65536) + 8);            # 8x8 texture
+    store32(&d + 32, 0);                          # no LUT in RGBA8
+    store32(&d + 60, 3);                          # 3 edges, NONZERO
+
+    # ⚠ THE ACCEPT CASES EXPECT 0, NOT GPO_E_ARM. ea_expect exercises the VALIDATOR ONLY; arming is
+    # the executor's business and never reaches this battery. Expecting GPO_E_ARM here read as "the
+    # ABI is broken" when in fact the ABI was doing exactly its job — the instrument was asking the
+    # wrong question. 13a's arming claim is proven by the executor branch, not by this line.
+    pass = pass + ea_expect(&d, 0, "tex: well-formed RGBA8 is accepted", 34);
+
+    store32(&d +  4, GPU_TEX_FLAG_IDX8);
+    store32(&d + 32, 15);                         # LUT slot
+    pass = pass + ea_expect(&d, 0, "tex: well-formed IDX8+LUT is accepted", 37);
+
+    store32(&d + 32, 0);
+    pass = pass + ea_expect(&d, GPO_E_LUTSLOT, "tex: IDX8 without a LUT slot", 28);
+    store32(&d + 32, 16);                         # 16 B — far short of 256 x 4
+    pass = pass + ea_expect(&d, GPO_E_LUTSLOT, "tex: IDX8 LUT slot too small", 28);
+    store32(&d + 32, 12);                         # free slot
+    pass = pass + ea_expect(&d, GPO_E_LUTSLOT, "tex: IDX8 LUT slot is free", 26);
+
+    # ⚠ THE BIDIRECTIONAL HALF. A LUT supplied WITHOUT IDX8 is refused rather than ignored: the
+    # caller believes that slot is in use, and silently disregarding it is how a wrong picture gets
+    # blamed on the shader.
+    store32(&d +  4, 0);
+    store32(&d + 32, 15);
+    pass = pass + ea_expect(&d, GPO_E_LUTSLOT, "tex: LUT supplied without IDX8", 30);
+    store32(&d + 32, 0);
+
+    store32(&d +  4, 0x02);                       # outside GPU_TEX_FLAGS_KNOWN
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "tex: unknown flag bit", 21);
+    store32(&d +  4, 0);
+
+    store32(&d + 28, (8 * 65536) + 0);
+    pass = pass + ea_expect(&d, GPO_E_TEXDIM, "tex: texture width zero", 23);
+    store32(&d + 28, (0 * 65536) + 8);
+    pass = pass + ea_expect(&d, GPO_E_TEXDIM, "tex: texture height zero", 24);
+    store32(&d + 28, (8 * 65536) + 4097);
+    pass = pass + ea_expect(&d, GPO_E_TEXDIM, "tex: texture width over cap", 27);
+    store32(&d + 28, (8 * 65536) + 8);
+
+    store32(&d +  8, 12);
+    pass = pass + ea_expect(&d, GPO_E_TEXSLOT, "tex: texture slot is free", 25);
+    store32(&d +  8, 16);                         # 16 B cannot hold 8x8 RGBA8 (256 B)
+    pass = pass + ea_expect(&d, GPO_E_TEXSLOT, "tex: texture slot too small for RGBA8", 37);
+    store32(&d +  8, 14);
+
+    store32(&d + 24, 12);
+    pass = pass + ea_expect(&d, GPO_E_TRILIST, "tex: vertex slot is free", 24);
+    store32(&d + 24, 14);                         # same slot as the texture
+    pass = pass + ea_expect(&d, GPO_E_ALIAS, "tex: vertex slot aliases the texture", 36);
+    store32(&d + 24, 11);
+
+    store32(&d + 60, 2);
+    pass = pass + ea_expect(&d, GPO_E_EDGEBUF, "tex: fewer than 3 edges", 23);
+    store32(&d + 60, (GPU_RULE_EVENODD * 65536) + 3);
+    pass = pass + ea_expect(&d, GPO_E_RULE, "tex: winding rule must be NONZERO", 33);
+    store32(&d + 60, 3);
+
+    store32(&d + 36, 1);                          # outside the 0x81FF field mask
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "tex: reserved dword must be zero", 32);
+    store32(&d + 36, 0);
+
     # ⛔ TEARDOWN GOES LAST, AFTER EVERY BATTERY. It used to sit between the 0x08 and 0x0A blocks,
     # so the 0x0A cases ran against slots that had already been zeroed and a well-formed batch was
     # rejected with GPO_E_TRILIST -- a REAL reject for an UNREAL reason, which is the worst kind of
@@ -1924,10 +2132,10 @@ fn edge_abi_selftest() {
         r = r + 1;
     }
 
-    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 40 cases correct\n", 21);
-    if (pass == 40) {
-        kprint("edge-abi: PASS -- the 0x08 and 0x09 ABIs reject every malformed record, and\n", 76);
-        kprint("edge-abi: a well-formed one is accepted or correctly reports no-GPU.\n", 69);
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 57 cases correct\n", 21);
+    if (pass == 57) {
+        kprint("edge-abi: PASS -- the 0x08/0x09/0x0A/0x0B ABIs reject every malformed record,\n", 78);
+        kprint("edge-abi: and a well-formed one is accepted or correctly reports no-GPU.\n", 73);
         return 1;
     }
     kprint("edge-abi: FAIL -- see the named case(s) above\n", 46);
@@ -1958,6 +2166,7 @@ fn gpo_validate(rec, fbw, fbh) {
     if (op == GPU_OP_EDGE_COV) { return gpo_validate_edge(rec); }
     if (op == GPU_OP_TRI_RGBA) { return gpo_validate_tri(rec, fbw, fbh); }
     if (op == GPU_OP_TRI_LIST) { return gpo_validate_trilist(rec, fbw, fbh); }
+    if (op == GPU_OP_TRI_TEX)  { return gpo_validate_tritex(rec, fbw, fbh); }
 
     var wh  = load32(rec + 16) & 0xFFFFFFFF;
     var dxy = load32(rec + 20) & 0xFFFFFFFF;
@@ -2033,6 +2242,26 @@ fn gpo_execute(rec) {
         var lkva = load64(&shm_kva + (lv - 1) * 8);
         var lnt = load32(rec + 24) & 0xFFFFFFFF;
         if (gpu_tri_list(lkva, lnt, w, h, dx, dy) != 1) { return GPO_E_DISPATCH; }
+        return 0;
+    }
+    # ⭐ RUNG 13a. Like rung 9a before it, this branch exists BEFORE the shader does: gpu_tex_arm()
+    # returns 0, so a well-formed record reaches here and is refused with GPO_E_ARM rather than
+    # GPO_E_BADOP. That keeps the ABI provable in QEMU at zero flashes while making 13b a
+    # one-function change with no edit to this file — and it means the supported-op mask never
+    # advertises an op whose execution path does not exist.
+    if (op == GPU_OP_TRI_TEX) {
+        var xflags = load32(rec + 4) & 0xFFFFFFFF;
+        var xtex = load64(&shm_kva + ((load32(rec + 8) & 0xFFFFFFFF) - 1) * 8);
+        var xedge = load64(&shm_mc + ((load32(rec + 12) & 0xFFFFFFFF) - 1) * 8);
+        var xvtx = load64(&shm_kva + ((load32(rec + 24) & 0xFFFFFFFF) - 1) * 8);
+        var xtwh = load32(rec + 28) & 0xFFFFFFFF;
+        var xlut = 0;
+        if ((xflags & GPU_TEX_FLAG_IDX8) != 0) {
+            xlut = load64(&shm_kva + ((load32(rec + 32) & 0xFFFFFFFF) - 1) * 8);
+        }
+        var xne = load32(rec + 60) & 0xFFFF;
+        if (gpu_tri_tex(xedge, xvtx, xtex, xlut, xtwh, xflags,
+        w, h, dx, dy, xne, GPU_RULE_NONZERO) != 1) { return GPO_E_ARM; }
         return 0;
     }
     if (op == GPU_OP_TRI_RGBA) {
