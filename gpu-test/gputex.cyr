@@ -95,6 +95,35 @@ fn txf(i, f): i64 {
     if (f == 10) { return 1 << 16; } return 8 << 16;
 }
 
+# ⭐ WRAP FRAMES, SEPARATE FROM THE CLAMP CORPUS. The clamp frames keep UV inside the texture, so
+# running them under WRAP would prove only that the two modes agree where neither does anything.
+# These deliberately leave it: one tiles 3x, one goes NEGATIVE.
+var TXWN = 2;
+fn txwf(i, f): i64 {
+    if (i == 0) {   # 3x tiling in both axes -- the texture must repeat, not smear its last row
+        if (f == 0) { return 0; }  if (f == 1) { return 0; }
+        if (f == 2) { return 24; } if (f == 3) { return 0; }
+        if (f == 4) { return 0; }  if (f == 5) { return 24; }
+        if (f == 6) { return 0; }  if (f == 7) { return 0; }
+        if (f == 8) { return 24 << 16; } if (f == 9) { return 0; }
+        if (f == 10) { return 0; } return 24 << 16;
+    }
+    # i == 1: NEGATIVE UV under wrap -- the far-edge case. Clamp sends these to texel 0; wrap sends
+    # them to tw-1, and the shader's `AND (dim-1)` must agree with the reference's floor-then-mod.
+    if (f == 0) { return 0; }  if (f == 1) { return 0; }
+    if (f == 2) { return 16; } if (f == 3) { return 0; }
+    if (f == 4) { return 0; }  if (f == 5) { return 16; }
+    if (f == 6) { return 0 - (5 << 16); } if (f == 7) { return 0 - (5 << 16); }
+    if (f == 8) { return 11 << 16; } if (f == 9) { return 0; }
+    if (f == 10) { return 0; } return 11 << 16;
+}
+
+fn txw_name(i): i64 {
+    if (i == 0) { ps("wrap-3x-tile"); }
+    if (i == 1) { ps("wrap-negative-UV"); }
+    return 0;
+}
+
 fn tx_name(i): i64 {
     if (i == 0) { ps("1:1-identity"); }
     if (i == 1) { ps("non-integer-scale"); }
@@ -443,6 +472,80 @@ fn tx_bench(): i64 {
     return 1;
 }
 
+# tx_run_wrap — one WRAP case. FULLCOV is set too: these frames fill their rects, so this also
+# exercises the two flags TOGETHER, which no other case does.
+fn tx_run_wrap(i, tileno): i64 {
+    if (tri_prep(txwf(i,0), txwf(i,1), txwf(i,2), txwf(i,3), txwf(i,4), txwf(i,5),
+                 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF) != 1) { return 0 - 1; }
+    if (tex_prep(txwf(i,6), txwf(i,7), txwf(i,8), txwf(i,9), txwf(i,10), txwf(i,11)) != 1) { return 0 - 1; }
+
+    # ⛔ THE REFERENCE MUST BE PUT IN WRAP MODE TOO, or this compares tiling against clamping and
+    # reports a difference that is the TEST's fault. Restored before returning so the clamp cases
+    # that follow are unaffected.
+    tx_wrap = 1;
+    var cz = 0;
+    while (cz < TXW * TXH) { store8(&tx_cov + cz, 255); cz = cz + 1; }
+    tx_ref_fill(i, 0);
+
+    var tx0 = (tileno % 4) * 40 + 8;
+    var ty0 = (tileno / 4) * 40 + 8;
+    var tid = syscall(86, 4096);
+    var vid = syscall(86, 4096);
+    if (tid < 1) { tx_wrap = 0; return 0 - 3; }
+    if (vid < 1) { tx_wrap = 0; return 0 - 3; }
+    syscall(72, tid, &tx_tex, TXD * TXD * 4);
+    var f = 0;
+    while (f < 6) { store32(&tx_vtx + f * 4, txwf(i, f) << 16); f = f + 1; }
+    var g = 6;
+    while (g < 12) { store32(&tx_vtx + g * 4, txwf(i, g)); g = g + 1; }
+    syscall(72, vid, &tx_vtx, 48);
+
+    if (syscall(88, 0xFF101010, (TXH * 65536) + TXW, (ty0 * 65536) + tx0) != 0) {
+        tx_wrap = 0; return 0 - 4;
+    }
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 11);
+    store32(&d +  4, 2 + 4);                     # FULLCOV | WRAP
+    store32(&d +  8, tid);
+    store32(&d + 16, (TXH * 65536) + TXW);
+    store32(&d + 20, (ty0 * 65536) + tx0);
+    store32(&d + 24, vid);
+    store32(&d + 28, (TXD * 65536) + TXD);
+    var rc = syscall(92, &d, 64);
+    if (rc != 0) {
+        syscall(74, tid); syscall(74, vid); tx_wrap = 0;
+        return 0 - 100 - ((0 - rc) & 0xFF);
+    }
+    var rid = syscall(86, TXW * TXH * 4);
+    if (rid < 1) { tx_wrap = 0; return 0 - 3; }
+    var pz = 0;
+    while (pz < TXW * TXH * 4 / 8) { store64(&tx_got + pz * 8, 0xA5A5A5A5A5A5A5A5); pz = pz + 1; }
+    syscall(72, rid, &tx_got, TXW * TXH * 4);
+    if (syscall(90, rid, (TXH * 65536) + TXW, (ty0 * 65536) + tx0) != 0) { tx_wrap = 0; return 0 - 5; }
+    if (syscall(73, rid, &tx_got, TXW * TXH * 4) != 0) { tx_wrap = 0; return 0 - 5; }
+    syscall(74, tid); syscall(74, vid); syscall(74, rid);
+    tx_wrap = 0;
+
+    var bad = 0;
+    var pi = 0;
+    while (pi < TXW * TXH) {
+        var got = load32(&tx_got + pi * 4) & 0xFFFFFFFF;
+        var want = load32(&tx_ref + pi * 4) & 0xFFFFFFFF;
+        if (got != want) {
+            bad = bad + 1;
+            if (tx_dumped < 4) {
+                tx_dumped = tx_dumped + 1;
+                ps("    diff WRAP case "); pn(i); ps(" @ x="); pn(pi % TXW); ps(" y="); pn(pi / TXW);
+                ps("  want="); phex8(want); ps("  got="); phex8(got); nl();
+            }
+        }
+        pi = pi + 1;
+    }
+    return bad;
+}
+
 fn main(): i64 {
     puts2("gputex: RUNG 13 -- nearest-neighbour affine texturing via #92 op 0x0B");
     tx_build_tex();
@@ -497,6 +600,20 @@ fn main(): i64 {
     }
     ps("gputex: FULLCOV "); pn(fcexact); ps(" of "); pn(TXN); puts2(" exact");
 
+    # ---- WRAP: tiling, not saturation ---------------------------------------------------
+    puts2("gputex: WRAP -- the texture must TILE; clamp would smear its last row");
+    var wexact = 0;
+    var wi = 0;
+    while (wi < TXWN) {
+        var rw = tx_run_wrap(wi, wi + 10);
+        ps("  WRAP case "); pn(wi); ps(" "); txw_name(wi); ps("  ");
+        if (rw == 0) { puts2("EXACT"); wexact = wexact + 1; }
+        if (rw > 0) { pn(rw); puts2(" differing px"); }
+        if (rw < 0) { ps("refused, code "); pn(0 - rw); nl(); }
+        wi = wi + 1;
+    }
+    ps("gputex: WRAP "); pn(wexact); ps(" of "); pn(TXWN); puts2(" exact");
+
     syscall(84);
     puts2("gputex: presented -- the tiles above are ON SCREEN now");
     tx_bench();
@@ -514,6 +631,12 @@ fn main(): i64 {
     }
     if (exact != TXN) { return 87; }
     if (idxexact != TXN) { return 87; }
+    if (wexact != TXWN) {
+        puts2("gputex: ⛔ WRAP did not match the reference. If `got` sits at texel 0 where `want`");
+        puts2("gputex:   is at the FAR edge, the negative index is being clamped rather than");
+        puts2("gputex:   AND-ed -- the shader took the clamp tail with the WRAP flag set.");
+        return 87;
+    }
     if (fcexact != TXN) {
         puts2("gputex: ⛔ FULLCOV did not reproduce the shaped path byte for byte -- the saving");
         puts2("gputex:   would be bought with a wrong picture. Refusing to report rung 13 green.");
