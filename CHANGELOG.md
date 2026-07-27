@@ -9,6 +9,50 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 iron — attribute interpolation byte-exact, every control firing. This cycle carries the batch-path
 defect that four probes have now cornered. Bumped on cycle open; the user tags on close.
 
+### ⭐⭐⭐ RUNG 13 CLOSED ON IRON — AGNOS TEXTURE-MAPS ON A GPU IT DRIVES ITSELF
+
+Burn 3, exit **95**: **5 of 5 RGBA8 and 5 of 5 IDX8 byte-identical to `texcore`** — 1:1 identity,
+non-integer scale, magnification, skew, and negative UV, in both formats.
+
+⭐ **Case 0 is the absolute test and it passed.** At 1:1 with integer UV the rendered rect is
+byte-identical to **the source texture itself** — an artifact the reference never produced. It is
+the only gate in the suite that can catch the reference and the shader being wrong *together*, and
+it is what makes the other nine mean something.
+
+Nearest-neighbour affine texture mapping, both formats, with **no MIMG, no T#, no S#, no sampler
+descriptor and no new instruction class** — the texel address computed in the shader and fetched
+with a plain `global_load`. `gputri --cov` held at 20/20 throughout, so the coverage rasteriser is
+untouched by any of it.
+
+**Rungs 11, 12 and 13 are now all closed on silicon.**
+
+### ⛔ BURN 2 REGRESSED to 0 of 10 — my fix clobbered a live register
+
+The burn-1 arithmetic fixes were right; a register clobber landed on top of them and masked them
+entirely. Two independent defects in one edit, and the located diffs separated them immediately:
+case 0 (previously exact) returned **texel 0 on every pixel** — `want` texels 1, 2, 3, 4 at x=1..4,
+`got` texel 0 four times.
+
+⭐ **Cause, pinned without a second burn.** The V axis's correction used
+`v_mul_lo_u32 v19, v18, s33`, and **v19 holds the stashed U index**. `s33` is `A2_hi`, which is
+**0** for any frame whose area fits 32 bits — so that multiply wrote zero over `tu`, and at y=0 the
+index `tv·tw + tu` is 0. `v18` now takes the scratch: `q+1` is dead after the product, so it is free.
+
+### ⛔ Also fixed — two per-lane conditions driving SCALAR branches
+
+Both axes short-circuited with `s_cbranch_vccz` / `s_cbranch_vccnz` on a `v_cmp_lt_i32`. `vccz`
+tests whether **all** lanes matched and `vccnz` whether **any** did, so a single lane with a negative
+numerator dragged **every** lane down the same path. That is the gfx9 trap this tree already
+records — a per-lane condition is a **predicate, never a branch**.
+
+The quotient is now computed unconditionally for every lane and both short-circuits are applied as
+`v_cndmask` selects, ordered so the negative case wins over the limit case. Blob 430 → **425**
+dwords; `grep s_cbranch_vcc` over the source now finds only a comment. The two surviving
+`s_cbranch_execz` are legitimate — each pairs with an `s_and_saveexec_b64`.
+
+Verified: 16/16 gates · blob 425 dwords match source · arena 53 slots / 0 overlaps ·
+`burn-verify: OK` (1818488 B, TEX_RGBA).
+
 ### ⭐⭐ RUNG 13 BURN 1 — 6 of 8 cases EXACT on first contact, including the ABSOLUTE test
 
 `1:1-identity`, `magnified-3tex` and `skewed` were byte-identical in **both** formats on the first

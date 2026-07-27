@@ -206,28 +206,12 @@ tex_rgba:
     v_add_co_u32    v21, vcc, v21, v16
     v_addc_co_u32   v22, vcc, v22, v17, vcc
 
-    // -- clamp: N < 0 => texel 0. The divider below is UNSIGNED. --
-    v_mov_b32       v23, 0
-    v_cmp_lt_i32    vcc, v22, 0
-    s_cbranch_vccz  L_U_HI
-    s_branch        L_U_DONE
-
-L_U_HI:
-    // -- N >= limU => the last texel. Guards the u32 quotient against wrapping. --
-    // ⛔ v[20:21], NOT v[21:22]. The 96-bit numerator is (v20 lo, v21 mid, v22 hi); its 64-bit
-    // VALUE is v[20:21]. Comparing v[21:22] compares the numerator SHIFTED RIGHT BY 32 against an
-    // unshifted limit — off by 2^32. The limit check already fired when v22 != 0, so v[20:21] is
-    // the whole value here.
-    v_mov_b32       v16, s18
-    v_mov_b32       v17, s19
-    v_cmp_lt_u64    vcc, v[20:21], v[16:17]
-    s_cbranch_vccnz L_U_DIV
-    s_sub_i32       s61, s60, 1
-    v_mov_b32       v23, s61
-    s_branch        L_U_DONE
-
-L_U_DIV:
-    // -- funnel right by t, then the shipped estimate-and-correct quotient --
+    // ⛔ NO SCALAR BRANCH ON A PER-LANE CONDITION, AND THE FIRST VERSION HAD TWO.
+    // s_cbranch_vccz tests whether ALL lanes matched and s_cbranch_vccnz whether ANY did, so a
+    // single lane with a negative numerator dragged EVERY lane down the same path. That is the
+    // gfx9 trap this tree already records: a per-lane condition is a PREDICATE, never a branch.
+    // [[reference_gfx9_per_lane_control_flow]] The quotient is now computed for every lane and
+    // the two short-circuits are applied as v_cndmask selects afterwards.
     v_lshrrev_b32   v16, s26, v20
     v_lshlrev_b32   v17, s27, v21
     v_or_b32        v16, v16, v17
@@ -247,34 +231,42 @@ L_U_DIV:
     v_addc_co_u32   v28, vcc, 0, v28, vcc
     v_lshlrev_b32   v29, 1, v28
     v_lshrrev_b32   v30, 31, v30
-    v_or_b32        v23, v29, v30           // q
+    v_or_b32        v23, v29, v30
 
-    // -- the single exact correction, against the ORIGINAL 96-bit numerator --
-    // ⛔ (q+1)*A2 AS A PROPER 64x32 PRODUCT. A2 is 64-bit (s32 lo, s33 hi), so
-    //     lo = lo(q1*A2lo)   hi = hi(q1*A2lo) + lo(q1*A2hi)
-    // The first version folded this through v_mad_u64_u32 with v16 as both an operand and part of
-    // the destination, and compared against v[21:22] — the numerator shifted right by 32. The
-    // result was a correction that could never fire, so a quotient landing one ULP short of an
-    // exact integer stayed short. Iron found it at u = 6.5*8/13 = 4.0 exactly: texel 3 for texel 4.
+    // ⛔ v18 IS REUSED HERE, NOT v19. The first version used v19 as scratch for lo(q1*A2hi) — and
+    // v19 HOLDS THE STASHED U INDEX across the V axis. Because A2_hi is 0 for any frame whose area
+    // fits 32 bits, that multiply wrote ZERO over tu, and iron came back with texel 0 on every
+    // pixel of the 1:1 case. q+1 is dead after this product, so v18 is free to take it.
     v_add_u32       v18, 1, v23
     v_mul_lo_u32    v16, v18, s32
     v_mul_hi_u32    v17, v18, s32
-    v_mul_lo_u32    v19, v18, s33
-    v_add_u32       v17, v17, v19
+    v_mul_lo_u32    v18, v18, s33
+    v_add_u32       v17, v17, v18
     v_cmp_le_u64    vcc, v[16:17], v[20:21]
     v_addc_co_u32   v23, vcc, v23, 0, vcc
 
-    v_add_u32       v23, s17, v23           // fold the bias back in
-    // ⚠ ARITHMETIC shift and SIGNED clamps. q+m can be negative when the UV frame extrapolates
-    // below zero; a logical shift would turn that into a huge positive index and v_min_u32 would
-    // then select dim-1 — the OPPOSITE edge. texcore clamps such samples to texel 0.
+    // ⚠ ARITHMETIC shift and SIGNED clamps: q+m goes negative where the UV frame extrapolates
+    // below zero, and a logical shift would make that a huge positive index selecting the OPPOSITE
+    // edge. texcore clamps such samples to texel 0.
+    v_add_u32       v23, s17, v23
     v_ashrrev_i32   v23, 16, v23
     s_sub_i32       s61, s60, 1
     v_max_i32       v23, 0, v23
     v_min_i32       v23, s61, v23
 
-L_U_DONE:
-    v_mov_b32       v19, v23                // stash tu; v23 is reused by the V axis
+    // -- predicate: N >= limit => the last texel (guards the u32 quotient against wrapping) --
+    v_mov_b32       v16, s18
+    v_mov_b32       v17, s19
+    v_cmp_le_u64    vcc, v[16:17], v[20:21]
+    v_mov_b32       v18, s61
+    v_cndmask_b32   v23, v23, v18, vcc
+
+    // -- predicate: N < 0 => texel 0. Applied LAST so it wins over the limit select. --
+    v_mov_b32       v18, 0
+    v_cmp_lt_i32    vcc, v22, 0
+    v_cndmask_b32   v23, v23, v18, vcc
+    v_mov_b32       v19, v23                // stash tu; the V axis must not touch v19
+
 
     // ======================================================================================
     // V AXIS — the same block against Q7/Q8's second half. Straight-line duplicate, on purpose:
@@ -334,23 +326,6 @@ L_U_DONE:
     v_add_co_u32    v21, vcc, v21, v16
     v_addc_co_u32   v22, vcc, v22, v17, vcc
 
-    v_mov_b32       v23, 0
-    v_cmp_lt_i32    vcc, v22, 0
-    s_cbranch_vccnz L_V_DONE
-
-    // ⛔ v[20:21], NOT v[21:22]. The 96-bit numerator is (v20 lo, v21 mid, v22 hi); its 64-bit
-    // VALUE is v[20:21]. Comparing v[21:22] compares the numerator SHIFTED RIGHT BY 32 against an
-    // unshifted limit — off by 2^32. The limit check already fired when v22 != 0, so v[20:21] is
-    // the whole value here.
-    v_mov_b32       v16, s18
-    v_mov_b32       v17, s19
-    v_cmp_lt_u64    vcc, v[20:21], v[16:17]
-    s_cbranch_vccnz L_V_DIV
-    s_sub_i32       s61, s60, 1
-    v_mov_b32       v23, s61
-    s_branch        L_V_DONE
-
-L_V_DIV:
     v_lshrrev_b32   v16, s26, v20
     v_lshlrev_b32   v17, s27, v21
     v_or_b32        v16, v16, v17
@@ -372,30 +347,38 @@ L_V_DIV:
     v_lshrrev_b32   v30, 31, v30
     v_or_b32        v23, v29, v30
 
-    // ⛔ (q+1)*A2 AS A PROPER 64x32 PRODUCT. A2 is 64-bit (s32 lo, s33 hi), so
-    //     lo = lo(q1*A2lo)   hi = hi(q1*A2lo) + lo(q1*A2hi)
-    // The first version folded this through v_mad_u64_u32 with v16 as both an operand and part of
-    // the destination, and compared against v[21:22] — the numerator shifted right by 32. The
-    // result was a correction that could never fire, so a quotient landing one ULP short of an
-    // exact integer stayed short. Iron found it at u = 6.5*8/13 = 4.0 exactly: texel 3 for texel 4.
+    // ⛔ v18 IS REUSED HERE, NOT v19. The first version used v19 as scratch for lo(q1*A2hi) — and
+    // v19 HOLDS THE STASHED U INDEX across the V axis. Because A2_hi is 0 for any frame whose area
+    // fits 32 bits, that multiply wrote ZERO over tu, and iron came back with texel 0 on every
+    // pixel of the 1:1 case. q+1 is dead after this product, so v18 is free to take it.
     v_add_u32       v18, 1, v23
     v_mul_lo_u32    v16, v18, s32
     v_mul_hi_u32    v17, v18, s32
-    v_mul_lo_u32    v19, v18, s33
-    v_add_u32       v17, v17, v19
+    v_mul_lo_u32    v18, v18, s33
+    v_add_u32       v17, v17, v18
     v_cmp_le_u64    vcc, v[16:17], v[20:21]
     v_addc_co_u32   v23, vcc, v23, 0, vcc
 
+    // ⚠ ARITHMETIC shift and SIGNED clamps: q+m goes negative where the UV frame extrapolates
+    // below zero, and a logical shift would make that a huge positive index selecting the OPPOSITE
+    // edge. texcore clamps such samples to texel 0.
     v_add_u32       v23, s17, v23
-    // ⚠ ARITHMETIC shift and SIGNED clamps. q+m can be negative when the UV frame extrapolates
-    // below zero; a logical shift would turn that into a huge positive index and v_min_u32 would
-    // then select dim-1 — the OPPOSITE edge. texcore clamps such samples to texel 0.
     v_ashrrev_i32   v23, 16, v23
     s_sub_i32       s61, s60, 1
     v_max_i32       v23, 0, v23
     v_min_i32       v23, s61, v23
 
-L_V_DONE:
+    // -- predicate: N >= limit => the last texel (guards the u32 quotient against wrapping) --
+    v_mov_b32       v16, s18
+    v_mov_b32       v17, s19
+    v_cmp_le_u64    vcc, v[16:17], v[20:21]
+    v_mov_b32       v18, s61
+    v_cndmask_b32   v23, v23, v18, vcc
+
+    // -- predicate: N < 0 => texel 0. Applied LAST so it wins over the limit select. --
+    v_mov_b32       v18, 0
+    v_cmp_lt_i32    vcc, v22, 0
+    v_cndmask_b32   v23, v23, v18, vcc
     // v19 = tu, v23 = tv, both already clamped into range.
 
     // ======================================================================================
