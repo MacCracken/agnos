@@ -95,6 +95,30 @@ source. Re-run the installers.
 trailing slash (so a `gpu-test/` pattern skips it), and consumers in a **different repo**
 (`agnosticos/scripts/install-media.sh`). Both fail SOFT — a skipped stage, not an error.
 
+## ⛔ RE-RUN THE SWEEP PER MOVE — 1.56.23 found TWO more survivors
+
+This document was written after the `tests/` move and its lessons were treated as *learned*. They
+were not *applied again* when `scripts/` and `gpu-test/` moved, and two live paths survived into
+1.56.23:
+
+| survivor | category | how it failed | why grep missed it |
+|---|---|---|---|
+| `scripts/burn/burn-prep.sh` | **2** — path computed inside | `cd "$(dirname "$0")/.."` landed in `scripts/`, so `scripts/sweep.sh` did not resolve; the gate reported **"the sweep is RED"** and aborted **every burn** on a green tree | grepping for the script's own name finds nothing; the bug is in how it locates *itself* |
+| `scripts/smoke/modeset-tool-smoke.sh` | **1** — reference to a moved dir | `cd "$ROOT/gpu-test"` fails, smoke aborts with **"ERROR: tool build failed"** | the message names the *tool*, not the *path*, so it reads as an unrelated breakage |
+
+⭐ **Both failed in the safe direction** (loud abort, not silent wrong output), which is the only
+reason they cost minutes rather than a flash. That is luck about *these two*, not a property of the
+class — the 1.56.22 `install-media.sh` survivor failed **soft** and would have shipped a burn
+missing two binaries while reporting success.
+
+**Rule, stated as an action rather than a lesson:** after *any* path move, run the both-tree grep
+below **and** run `burn-prep` once end-to-end. A category-2 bug in the burn path cannot be found by
+reading; only by executing the thing that computes the path.
+
+⚠ And note what a category-1 survivor sounds like: **the error message names the wrong subject.**
+"tool build failed", "fpex: skipped", "the sweep is RED" — none of them say *path*. When a gate
+fails for a reason that does not match the change you just made, suspect the path before the code.
+
 ## Verification
 
 `sh scripts/sweep.sh` must be green afterwards — it exercises the moved smokes through their new

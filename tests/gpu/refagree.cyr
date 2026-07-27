@@ -24,7 +24,7 @@
 # to ±1 coverage step — that must be reported to the operator BEFORE rung 9 opens, not
 # discovered at the close." This tool prints the worst delta whether or not it is zero.
 #
-# Build:  cd gpu-test && CYRIUS_ALLOW_PARENT_INCLUDES=1 cyrius build refagree.cyr build/refagree
+# Build:  cd tests/gpu && CYRIUS_ALLOW_PARENT_INCLUDES=1 cyrius build refagree.cyr build/refagree
 # Run:    ./build/refagree   -> 95 byte-identical · 94 agrees within +/-1 (DEGRADED) · 90 diverges
 
 # ⚠ dist/sadish.cyr is a STRIP-INCLUDE bundle — it deliberately carries no stdlib includes

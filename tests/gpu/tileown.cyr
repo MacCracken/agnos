@@ -29,7 +29,7 @@
 #   * DUPE  — the same tile is enqueued twice                   -> that tile has 2 owners
 # Both are checked against the rasteriser's own coverage, over the corpus and 200 random meshes.
 #
-# Build:  cd gpu-test && cyrius build tileown.cyr build/tileown
+# Build:  cd tests/gpu && cyrius build tileown.cyr build/tileown
 # Run:    ./build/tileown    -> 95 every pixel owned exactly once · 90 a miss or a dupe (named)
 
 include "lib/io.cyr"

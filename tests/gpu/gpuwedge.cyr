@@ -40,7 +40,7 @@
 # ⛔ RUN ORDER MATTERS: C first (establish the baseline), then A, then B, then C again (the
 # after-reading), then D. Running C only once proves nothing about recovery.
 #
-# Build:  cd gpu-test && cyrius build --agnos gpuwedge.cyr build/gpuwedge_agnos
+# Build:  cd tests/gpu && cyrius build --agnos gpuwedge.cyr build/gpuwedge_agnos
 # Iron:   run /bin/gpuwedge --baseline   (C, before)
 #         run /bin/gpuwedge --wedge      (A)  <- panel may go dark; that is the experiment
 #         run /bin/gpuwedge --recover    (B)

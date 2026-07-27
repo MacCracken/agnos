@@ -29,7 +29,7 @@
 # plausible-looking stream I wrote — it is the stream agnos actually submits and that has been
 # proven bit-correct on iron (the f64 matmul rosnet-bit-correct tracker).
 #
-# Build:  cd gpu-test && cyrius build pm4lint.cyr build/pm4lint
+# Build:  cd tests/gpu && cyrius build pm4lint.cyr build/pm4lint
 # Run:    ./build/pm4lint          -> exit 95 = calibrated (all good pass, all mutants fail)
 #                                     exit 90 = NOT calibrated; do not cite this tool
 

@@ -9,6 +9,45 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 on iron. This cycle answers the question the whole rung rests on. Bumped on cycle open; the user
 tags on close.
 
+### ⛔⛔ THE PLAN'S "WALLS AS TEXTURED QUADS" PREMISE IS REFUTED — measured, not argued
+
+Row 14 says DOOM "batches walls as textured quads" because "DOOM's texturing is affine per
+primitive". The second clause is true; **the first does not follow from it.** `doomcol` proved a
+single column is affine DOWN y. A multi-column quad additionally needs affine ACROSS x, and a DOOM
+wall is not.
+
+`tests/gpu/doomwall.cyr` measures it:
+
+| depth ratio across the seg | pixels wrong from ONE affine quad |
+|---|---|
+| 1.0× (square to the eye) | **0 of 4096** — the calibration case |
+| 1.5× (gentle oblique) | **4096 of 4096** |
+| 2.0× (ordinary corridor) | 4096 of 4096 |
+| 4.0× (sharp oblique) | 4057 of 4096 |
+
+⭐ **The 1.0× row is what makes the others trustworthy** — the frame and reference agree exactly
+where no perspective exists, so the failures measure perspective rather than a bug in the test.
+
+**Cause, from the source rather than the summary:** `render.cyr:1354` computes
+`ty_step = fixed_div(FIXED_ONE, col_scale)` — the vertical step is **1/depth**, a hyperbola in
+screen x. An affine quad interpolates it linearly, which is precisely vanilla's
+`rw_scale += rw_scalestep`.
+
+⭐ **cyrius-doom already refuted that, in its own words** (`render.cyr:1275`): the incremental scale
+was replaced by a per-column world-space ray-cast *"because interpolating between near-clip-corrupted
+endpoints is what made textures swim (48 texels on walls, 53 on grates)"*. Batching a seg into one
+quad would re-introduce the defect the engine spent that work removing.
+
+### ⇒ Batch by DISPATCH, not by GEOMETRY
+
+One quad per column stays bit-exact — `doomcol` proves it. The cost is the dispatch chain, which
+FULLCOV already cut from three to one (52.7 → ~28 µs). 320 columns ≈ **9 ms of a 28.6 ms frame**:
+feasible, but leaving little for visplanes.
+
+So rung 12's carry-forward — **fusing N primitives into ONE dispatch** — stops being an optimisation
+and becomes the rung's remaining structural work. Merging primitives is off the table; merging
+*submissions* is the whole game.
+
 ### ⭐⭐⭐ A DOOM WALL COLUMN *IS* AN op 0x0B QUAD, BIT FOR BIT — proven on the host, zero burns
 
 `tests/gpu/doomcol.cyr` transcribes `render_draw_tex_column`'s inner loop as the reference and
@@ -50,6 +89,252 @@ Seven green cases on a first run prove nothing until the arms are seen to fail:
 
 The LUT-transposition mutation is the one worth keeping: it still produces *a picture*, just the
 wrong one — the exact failure shape a visual check would pass.
+
+### ⭐⭐⭐ op 0x0C `GPU_OP_TEX_LIST` — N textured primitives in ONE dispatch, CPU side proven at zero burns
+
+The structural work the refutation above created. Rung 13 measured the dispatch chain at a **fixed
+52.7 µs** regardless of rect size, cut to ~27.9 µs by FULLCOV. A DOOM frame is ~640 wall columns; at
+one dispatch each that is **17.9 ms of pure overhead inside a 28.6 ms frame**, before a pixel is
+shaded. Fusing pays the fixed cost once.
+
+**The ABI.** One header record naming a slot that holds an array of 96-byte primitives:
+
+| header (64 B) | field | per primitive (96 B) | field |
+|---|---|---|---|
+| +0 | op = 0x0C | +0 | `wh` = ph<<16 \| pw |
+| +12 | `prim_id` (#86 slot) | +4 | `dstxy` = py<<16 \| px |
+| +16 | union rect `wh` | +8 | `tex_id` |
+| +20 | union rect `dstxy` | +12 | `lut_id` (IDX8 only) |
+| +24 | `n_prims` ≤ 512 | +16 | `texwh` |
+| | | +20 | flags: FULLCOV (**required**) \| IDX8 \| WRAP |
+| | | +24 | 6 × i32 16.16 screen coords, **rect-local** |
+| | | +48 | 6 × i32 16.16 texel coords |
+| | | +72 | reserved, must be zero |
+
+**The grid mapping** — `gx = n_prims << tile_shift`, `gy = max(ph)`:
+
+```
+prim = tgid_x >> tile_shift        tile = tgid_x - (prim << tile_shift)
+px   = tile*64 + lane              py   = tgid_y
+rec  = rec_base + prim*160         dst  = bb + dst_off[prim] + py*pitch + px*4
+```
+
+`tile_shift = ceil(log2(ceil(max_pw/64)))` is computed CPU-side, so the split is a **shift, never a
+divide**. For DOOM columns (pw = 1) it is 0 and `gx` is exactly the primitive count. Per-pixel cost
+is O(1): no search, and no requirement that primitives be adjacent, uniform or sorted.
+
+### ⛔ FULLCOV IS *REQUIRED*, AND THAT IS WHAT MAKES THE FUSION SAFE
+
+Rung 12's tri-list corrupted every triangle but the last because N primitives **shared three fixed
+arena slots** inside an open batch, so every dispatch read the last one's data. Op 0x0C gives each
+primitive **its own 160-byte record** in an 81920-byte array, and having no coverage stage means
+there is no shared mask to race over. The bug class is not guarded against — it is **unrepresentable**.
+
+`gpo_validate_texlist` therefore rejects a primitive without FULLCOV rather than accepting it and
+producing a mask nobody wrote. `gpu_texl_build` passes `cov_mc = 0` deliberately: a live pointer to
+a buffer this path never writes is a stale-mask bug waiting for someone to relax the rule.
+
+### ⛔ EVERY PRIMITIVE IS VALIDATED, NOT SAMPLED — 83 of 83 ABI cases
+
+A validator that checked only the first entry would pass every reject test anyone would think to
+write and still let one malformed primitive in 512 reach a shader that cannot refuse. **Every new
+reject case below mutates primitive [1], not [0].** The ABI battery grew 57 → **83**, all green in
+QEMU: LUT rules in both directions, missing FULLCOV, unknown flag bits, free/undersized/aliased
+texture slots, zero and over-cap texture dims, WRAP on a non-power-of-two, zero-width primitives,
+primitives off the framebuffer, the reserved tail, zero primitives, over-cap counts, and an array
+too small for `n_prims` (**rejected, never clamped** — a clamp would shade 42 of 43 and report
+success).
+
+### ⛔ THE WORK BOUND HAD TO BE THE LAUNCHED GRID — the union rect bounds nothing
+
+The generic `w*h > GPU_TRI_MAX_PIXELS` check bounds the caller's **damage declaration**, which says
+nothing about the work: primitives may sit outside the union, and 512 of them each the size of the
+screen would sail through it. What the hardware spends is
+`(n_prims << tile_shift) * max(ph)` wavefronts — and that is **not** proportional to the useful
+pixels. One 4096-wide primitive among 511 one-pixel columns forces `tile_shift = 6`, making the grid
+64× wider than 511 of the 512 primitives can use (47,185,920 waves). Bounding `sum(pw*ph)` would
+miss it entirely.
+
+⚠ **The first cap tried was `GPU_TRI_MAX_PIXELS`, and it would have rejected the workload this op
+exists for.** That constant is "an arena size wearing a constant's clothes" by its own admission — it
+bounds the *coverage mask*, which op 0x0C does not use. A 640-column DOOM frame at 200 rows launches
+128,000 wavefronts against its effective 16,384. New constant `GPU_TEXL_MAX_WAVES = 262144`, ~2×
+above a full DOOM frame and far below anything that could wedge the queue. **Exercised both ways** — nine
+2048×1024 primitives are refused with `GPO_E_WORK`, nine 1-px columns 1024 rows tall are accepted.
+
+⚠ **Those numbers were derived, not guessed, and the first cut was wrong.** Two primitives of
+2048×1024 is 65,536 waves — *accepted*. At a 2560×1440 framebuffer the cap is unreachable at
+`n_prims = 2` at all (even 2560×1440 is only 184,320). The case would have gone red for the test's
+fault, and the tempting "fix" is to weaken the validator. Nine is the smallest count that trips it:
+`(9 << 5) * 1024 = 294,912`.
+
+⛔ **Honest limit, recorded for the burn to measure rather than assumed:** a 1-px-wide primitive uses
+**one of its wavefront's 64 lanes**. DOOM columns are 1 px wide, so the fused path trades 27.9 µs of
+per-dispatch fixed cost for ~1/64 lane efficiency. The trade is still overwhelmingly favourable
+(640 × 27.9 µs = 17.9 ms of pure overhead versus one dispatch), but the residual pixel cost is the
+number the burn must produce. If it is too high the fix is a per-primitive **column-major** flag
+letting lanes walk Y instead of X — **deliberately not built ahead of a measurement saying so.**
+
+⭐ **And one case that tests the EXECUTOR, not the validator.** Every other case calls
+`gpo_validate`, so a missing or mistyped branch in `gpo_execute` would have shipped completely
+unremarked: the record validates, execute falls through, and `#92` answers `GPO_E_BADOP` for an op
+the ABI advertises as supported. The new case runs a well-formed record through `gpo_execute` and
+demands `GPO_E_ARM` — proving the branch exists and is reached. (Safe in QEMU: `gpu_texl_arm`
+checks `gpu_present` first, so nothing is dispatched.)
+
+### ⭐⭐ THE SHADER IS RUNG 13's BODY, CHARACTER-FOR-CHARACTER, AND A GATE PROVES IT
+
+`kernel/shaders/tex_list.s` is a **16-instruction prologue** on rung 13's 442-dword body — 458 dwords
+total, same RSRC1/RSRC2. That body is the expensive artifact: signed 64-bit edge multiplies, the
+min-bias, both formats, WRAP, the exact `/255`, iron-proven at 17/17 across nine burns.
+
+A copy is only as good as the guarantee that it *is* one. `scripts/check/texl-body-identity.sh`
+extracts both bodies and **fails the build if they differ by a single character**, comments included —
+a comment that drifts is a lie told to the next reader about code they are about to trust.
+Mutation-tested: a one-character edit goes red.
+
+⭐⭐ **And a second stage that compares the SHIPPED DWORDS, not just the source text.** Identical
+source assembled by the same tool *should* produce identical code — but "should" is exactly why the
+blob-drift gate exists. Tail-aligning the two `.text` sections (both bodies are a contiguous suffix
+ending at `s_endpgm`) shows every differing dword confined to the prologue:
+
+> **417 shipped dwords bit-identical** — `tex_rgba` prologue 25, `tex_list` prologue 41.
+
+So rung 14 ships rung 13's iron-proven **machine code**, branch offsets included, not merely its
+source. The stage's own failure branch was exercised separately against a mid-body mutation (26
+differing dwords running to tail index 43 *with gaps* — correctly refused rather than mistaken for
+a longer prologue), because stage 1 catches a text edit first and would otherwise leave stage 2
+unproven.
+
+⚠ **`tex_rgba` and `tex_list` were not in `check.sh`'s blob-drift list** until this cycle — the two
+largest and most intricate blobs in the tree were the two nobody was diffing. Both pass; the gap was
+in the gate, not the tables. `check.sh` is now 17 gates.
+
+⚠ **Register safety was derived, not assumed.** The prologue writes `s0–s3, s6, s7, s10, s14, s15,
+s[16:19]`, all of which the shared body also touches. Safe because the body's **first** touch of
+`s14–s19` is a write (the U-axis constants) and the prologue needs none of them afterwards —
+verified by extracting the body and reading every occurrence. Rung 13 lost a burn to exactly this
+class when a "fix" wrote over a still-live `v19`.
+
+### ⭐ `tests/gpu/texlist.cyr` — the grid mapping proven on the host, 3 of 3 mutations red
+
+The body is already proven, so the only new surface is the prologue's integer decomposition. Six
+cases — 64 ragged DOOM columns, 7 columns, 16 uniform sprites, mixed widths 1/17/64/63, widths
+65/128/129 straddling the wavefront boundary (`tile_shift = 2`), and a single 1×1 — all **EXACT**:
+every local pixel written exactly once, every screen pixel matching the rects.
+
+Two maps, because either alone is blind: the **local** map would stay perfect if every primitive
+drew its shape in the wrong place, and the **screen** map catches that.
+
+Three falsifications, each removing one guard the shader actually emits:
+
+| mutation | result |
+|---|---|
+| drop the `py >= ph` exit | 4032 writes vs 3280 wanted; 752 screen px wrong |
+| drop the `px >= pw` exec mask | 209920 writes vs 3280 — 64 lanes on 1-px columns |
+| force `tile_shift = 0` on a list needing 2 | 1617 local + 1617 screen px wrong — **rung 12's bug exactly** |
+
+⚠ **The array unit was measured, not assumed.** The first cut guarded at 32768 while the array held
+262144 bytes, silently dropping 56 of 64 primitives and reporting them as coverage holes. A byte-16
+spill probe settled it: module-scope `var X[N]` here is **N × u64**. The local map now packs by
+prefix sum, which is also the only way to represent a primitive wider than the stride — the
+`129`-wide case would have aliased row *y* into row *y+2*.
+
+⚠ **The arena slot was derived, not spotted.** Two "obvious" gaps read off the declaration list by
+eye were both wrong — `0xF0000` landed inside the 1 MB coverage scratch, `0x1E4000` collided with
+`GPU_SACRIFICIAL`. `check-arena` caught both. The record array now sits at `[0xAA000,0xBE000)`, the
+largest genuinely-free run, found by walking the sorted extents.
+
+### The iron instrument: `gputex` draws the same 32 columns BOTH ways
+
+`tl_run` renders 32 two-pixel columns as **32 individual op 0x0B FULLCOV dispatches**, reads the
+rect back, clears, renders the identical geometry as **one op 0x0C dispatch**, reads back, and
+demands **zero differing bytes** — RGBA8 and IDX8. It times both windows and prints the speedup.
+
+⭐ **The oracle is self-referential, and that is its strength.** Op 0x0B is already proven against
+`texcore`; a fresh reference model for 0x0C would be a fresh thing to get wrong. "Same picture as
+the proven op" is the stronger and cheaper question.
+
+⛔ **With a vacuity guard**, because an all-background rect would compare equal and prove nothing:
+if the 0x0B side did not actually paint, the case fails rather than reporting a match. Rung 13's N14
+was structurally unreachable for four burns for exactly this kind of reason.
+
+⚠ **The guard's threshold is derived from the geometry, not a fixed fraction of the rect.** A flat
+"half the rect" bar clears the ragged list by only 344 px (1880 against 1536), so a different
+skyline could false-fire it — and a guard that fires for the wrong reason gets deleted rather than
+understood. It now demands three quarters of `sum(pw*ph)`.
+
+⭐ **A third case runs the same comparison with RAGGED column heights (12–47, 32 distinct), and it
+is not decoration.** With every column the same height the grid is exactly the union rect and the
+shader's `s_cmp_ge_u32 s9, s7 / s_cbranch_scc1 L_END` row guard never fires — it would ship
+**unexercised on hardware**, which is exactly the residual rung 13 carried. Ragged heights force it
+for 31 of 32 columns: the grid is sized by the tallest, so every shorter column's workgroups *are*
+launched for rows it does not own. The op 0x0B side dispatches each column at its own height, so a
+missing guard shows up as extra pixels below each short column — and the verdict says so, because a
+diff that only appears on the ragged case isolates the guard from the texturing and the record
+indexing.
+
+⚠ Both blobs are armed **outside** the timed windows. Timing an unarmed 0x0C against an armed 0x0B
+would charge the fused op for its own residency write and could invert the comparison.
+
+### ⚠ `burn-prep` had been broken by the 1.56.22 `scripts/` split — found here, blocking every burn
+
+`scripts/burn/burn-prep.sh` computed `ROOT` one level short (`cd "$(dirname "$0")/.."` lands in
+`scripts/`, not the repo root), so `scripts/sweep.sh` did not resolve. The gate reported
+**"the sweep is RED"** and aborted — on a tree whose sweep was green.
+
+This is **category 2** from [`scripts-reorg.md`](docs/development/planning/scripts-reorg.md) —
+"paths computed INSIDE a script" — the class that document explicitly warns is *invisible to a grep
+for the script's own name*. The 123-script fix pass caught the rest; it missed the one script a burn
+cannot proceed without. A sweep of all grouped scripts confirms it was the **only** remaining case.
+
+⭐ It failed **loudly and in the safe direction** — refusing to stamp rather than stamping a tree it
+had not actually checked. That is the difference between minutes lost and a wasted flash.
+
+### ⚠ And the cross-repo path sweep the reorg doc mandates found a second survivor
+
+[`scripts-reorg.md`](docs/development/planning/scripts-reorg.md) requires grepping **both** trees
+after a move, because the 1.56.22 `tests/` move left `agnosticos/scripts/install-media.sh` pointing
+at `../agnos/fp-test/` and it failed *soft*. Running that sweep again for `gpu-test/` turned up
+`scripts/smoke/modeset-tool-smoke.sh`, which still did `cd "$ROOT/gpu-test"` to build its ring-3
+tool. It aborts with **"ERROR: tool build failed"** — a message that reads as *the tool* being
+broken rather than *the path* being stale, which is why nobody chased it. Repointed at
+`tests/gpu` and the tool builds (35,848 B). The `# Build:` header comments in six `tests/gpu/*.cyr`
+files carried the same stale `cd gpu-test` and were swept too — those are live instructions an
+agent follows, not dated records.
+
+⇒ **Two path survivors in one cycle, both invisible to the obvious grep.** The doc's three-category
+lesson holds; what it should also say is that the sweep must be **re-run per move**, not once.
+
+### ⛔⛔ THE BURN NEARLY SHIPPED A STALE ORACLE — M9's failure, one gate short
+
+`burn-prep` has a staged-tool freshness gate, written after the M9 burn paired a correct kernel with
+a **six-hour-old** `modeset` and turned two arms of an audio experiment into silence that was not
+data. That gate verified `modeset gpuwedge gputri klug`.
+
+It did not verify **`gputex`** — the only tool that exercises op 0x0C, and the entire reason for this
+burn. The staged copy was 90 minutes stale: **213,672 B against the fresh 255,424 B**, different
+md5, with **no rung-14 code in it at all**.
+
+⛔ **A stale oracle does not fail. It agrees.** That binary would have run, printed rung 13's 17
+cases, exited **95**, and produced zero rung-14 evidence while reading as a clean success. The
+staleness is invisible by construction — the old tool still runs and simply never asks the new
+question.
+
+Fixed three ways: the fresh tools staged and md5-verified (all **nine** GPU tools now match their
+`--agnos` builds), the gate widened from 4 tools to 10, and the rule written where the next reader
+will hit it — **when a cycle's oracle is a new or changed tool, add it to that loop in the same
+bite.** Checking the kernel artifact is not enough; the gate must cover whatever produces the
+evidence.
+
+### Status
+
+CPU side, ABI, validator, record builder, dispatch, shader, blob and both host oracles are **done
+and green at zero burns**: `check.sh` 17/17, `edge-abi-smoke` 16/16 (83/83 cases), `texlist` 6/6
+cases + 3/3 mutations, blob tables matching source for all five shaders, 417 shipped body dwords
+bit-identical. `burn-prep` **ARC SWEEP: PASS**, bare kernel 1,840,760 B stamped, `burn-verify: OK —
+safe to flash`, all nine staged GPU tools md5-matching their builds. **op 0x0C has never run on
+hardware** — the next burn is what decides it.
 
 ## [1.56.22] - 2026-07-27
 

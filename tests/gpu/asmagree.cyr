@@ -37,7 +37,7 @@
 # sequences — the bytes agnos uploads to the GPU and that are iron-proven on archaemenid (the
 # perm / blend / matmul trackers). They are not from LLVM, not from a manual, not from me.
 #
-# Build:  cd gpu-test && cyrius build asmagree.cyr build/asmagree
+# Build:  cd tests/gpu && cyrius build asmagree.cyr build/asmagree
 # Run:    ./build/asmagree     -> 95 = every class agrees · 90 = a disagreement (named)
 
 include "lib/io.cyr"

@@ -6,7 +6,7 @@ type: state
 
 # AGNOS — Live State
 
-> **Last refresh**: 2026-07-26 · kernel head **1.56.8** · **▶ ACTIVE — 1.56.x GPU (the one open GPU release; there is no 1.57/1.58/1.59).** Full plan + reference:
+> **Last refresh**: 2026-07-27 · kernel head **1.56.23** · **▶ ACTIVE — 1.56.x GPU (the one open GPU release; there is no 1.57/1.58/1.59).** Full plan + reference:
 [`docs/development/planning/gpu.md`](planning/gpu.md) — the single GPU document. **DONE and shipped:**
 (1) **the ring-3 GPU band has consumers** — aethersafha composites on the GPU (opaque via `#87`, translucent
 via `#92` op 0x01 premultiplied src-over), unblocked by setu 0.6.0/0.7.0 asking `shm_create_gpu` #86 (the
@@ -19,7 +19,18 @@ toolchain (sovereign assembler = mabda's Cyrius `gfx9_encode.cyr`). (3) **D-1/D-
 llvm-mc rejected; `#92` blend = premultiplied f32, frozen; whole-surface translucency IS a real MUDRA/SHANTA
 requirement → DCN second plane stays a live deferred item. **REMAINING (iron-gated unless noted; ⇒ next-agent handoff: [`planning/gpu.md`](planning/gpu.md) § 🤝 Handoff):** **MODESET** (own the pipe from cold — **recommended next**;
 harness half is zero-burn; L1 discriminator runs first, free) · **HDMI audio** (zero-burn Linux discriminator
-first; ⛔ the DCCG symbol-clock lead is FALSIFIED, in-boot A/B burn 11) · **3D** (a rendering primitive; the
+first; ⛔ the DCCG symbol-clock lead is FALSIFIED, in-boot A/B burn 11) · **3D — the rung ladder is at 14.** Rungs 9–13 are IRON-CLOSED
+(edge coverage · attribute interpolation · tri-list · **texturing 17/17 byte-identical, both formats, WRAP,
+FULLCOV**). **Rung 14 (DOOM affine) is BUILT BUT UNBURNED as of 1.56.23:** op `0x0C GPU_OP_TEX_LIST` fuses N
+textured primitives into ONE dispatch — ABI 83/83, validator, record array, dispatch, shader (458 dwords =
+a 16-instruction prologue on rung 13's character-identical body, gated by `texl-body-identity.sh`), host
+grid-mapping oracle 6/6 + 3/3 mutations, and a `gputex` case demanding byte-identity against 32 individual
+op 0x0B dispatches. ⛔ **Two plan premises were overturned by measurement this cycle** — rung 14 is
+DISPATCH-bound not bandwidth-bound (52.7 µs fixed vs ≥3680 MB/s), and "walls batch as textured quads" is
+REFUTED (`doomwall`: a 1.5× depth ratio makes 4096/4096 px wrong, because `ty_step = 1/depth` is a hyperbola
+in screen x). Batch by DISPATCH, never by geometry. ⚠ Open question for the next burn: op 0x0C uses ONE of
+64 lanes on a 1-px DOOM column; the fix if measured too slow is a column-major flag, deliberately unbuilt
+until there is a number. (the
 consumer stack — soorat/kiran/joshua + cyrius-mine-cart/cyrius-block-game — is cataloged and waits on the
 kernel; kernel → engine, so port soorat/kiran to learn the seam) · a minor invalidate-hoist perf item · the ML full-forward wiring follow-on (per-repo consumer task). ⚠ **Every GPU-pixel arm is IRON-ONLY** — QEMU has no AMD GPU, and `#92`'s failure mode is SILENT
 (straight-alpha renders washed out, never an error), so nothing GPU-composited is proven without a burn.

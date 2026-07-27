@@ -1,0 +1,369 @@
+# texlist.cyr — RUNG 14's ORACLE: does the fused-dispatch grid mapping hit every pixel of every
+# primitive EXACTLY ONCE, and nothing else?
+#
+# ⭐ WHY THIS IS THE ONLY NEW THING WORTH TESTING. op 0x0C's shader (kernel/shaders/tex_list.s) is
+# rung 13's texturing body — signed edge multiplies, min-bias, both formats, WRAP, the exact /255 —
+# under a new 16-instruction prologue, and scripts/check/texl-body-identity.sh fails the build if
+# those two bodies ever differ by a character. The texturing arithmetic is therefore ALREADY proven:
+# iron 17/17, and byte-diffed on the host by texmodel/texgate against texcore.
+#
+# What is NEW is the prologue's integer decomposition of the dispatch grid:
+#     prim = tgid_x >> tile_shift
+#     tile = tgid_x - (prim << tile_shift)
+#     px   = tile*64 + lane          skipped when px >= pw
+#     py   = tgid_y                  skipped when py >= ph
+#     rec  = rec_base + prim*160
+#     dst  = bb + dst_off[prim] + py*pitch + px*4
+# That is the whole of rung 14's new surface, and every way it can be wrong is a way pixels get
+# written twice, not at all, or into a neighbour's rect. So this file models exactly that and
+# nothing else.
+#
+# ⛔ THE FAILURE THIS GUARDS IS RUNG 12's, IN A NEW COSTUME. Rung 12 fused N triangles into one
+# batch while they SHARED three fixed arena slots, so every dispatch read the last triangle's data
+# and only the final primitive drew correctly. Op 0x0C gives each primitive its own 160-byte record
+# — but only if `prim` indexes that array correctly. A tile_shift one too small makes two
+# primitives resolve to the SAME record, which is rung 12's bug reproduced exactly.
+
+include "lib/io.cyr"
+include "tricore.cyr"   # ps/pn/nl — the shared print helpers, same as texcore pulls them in
+
+var TL_MAXP = 64;                  # primitives per case
+var TL_LOCAL = 4096;               # max local pixels per primitive (64x64)
+
+var tl_pw[64];
+var tl_ph[64];
+var tl_px[64];
+var tl_py[64];
+var tl_off[64];
+# ⚠ MEASURED, NOT ASSUMED: module-scope `var X[N]` in THIS file allocates N x u64 (probed with a
+# byte-16 spill test before sizing anything). The sizing rule is non-uniform across the tree, and
+# the first cut of this file guarded at 32768 while the array held 262144 bytes — the guard, not
+# the array, silently dropped 56 of 64 primitives and reported them as coverage holes.
+var tl_hit[32768];                 # 262144 B — one counter per local pixel, packed by prefix sum
+var tl_scr[65536];                 # 524288 B — one counter per screen pixel
+var tl_base[64];                   # prefix sum: where primitive i's local map starts
+var tl_total = 0;                  # sum(pw*ph) over the list
+
+var TL_SCRW = 320;
+var TL_SCRH = 200;
+var TL_PITCH = 1280;               # TL_SCRW * 4
+
+var tl_n = 0;
+var tl_shift = 0;
+var tl_maxh = 0;
+var tl_maxw = 0;
+
+# ---- mutation switches: each disables one guard the prologue actually emits ----
+var tlm_noph = 0;                  # drop the `py >= ph` early exit
+var tlm_nopw = 0;                  # drop the `px >= pw` exec mask
+var tlm_shift0 = 0;                # force tile_shift = 0 regardless of width
+
+fn tl_reset(): i64 {
+    var i = 0;
+    while (i < 262144) { store8(&tl_hit + i, 0); i = i + 1; }
+    i = 0;
+    while (i < 65536) { store8(&tl_scr + i, 0); i = i + 1; }
+    return 0;
+}
+
+# tl_prep — compute tile_shift exactly as gpu_tex_list does, from the WIDEST primitive.
+fn tl_prep(): i64 {
+    tl_maxh = 0;
+    tl_maxw = 0;
+    var i = 0;
+    while (i < tl_n) {
+        if (load64(&tl_ph + i * 8) > tl_maxh) { tl_maxh = load64(&tl_ph + i * 8); }
+        if (load64(&tl_pw + i * 8) > tl_maxw) { tl_maxw = load64(&tl_pw + i * 8); }
+        store64(&tl_off + i * 8,
+                load64(&tl_py + i * 8) * TL_PITCH + load64(&tl_px + i * 8) * 4);
+        i = i + 1;
+    }
+    # ⭐ PACK THE LOCAL MAP BY PREFIX SUM rather than by a fixed 64x64 stride. A fixed stride cannot
+    # represent a primitive wider than the stride — the `wide` case below has pw = 129, and row y
+    # would have silently aliased into row y+2. Packing is exact for any shape.
+    tl_total = 0;
+    i = 0;
+    while (i < tl_n) {
+        store64(&tl_base + i * 8, tl_total);
+        tl_total = tl_total + load64(&tl_pw + i * 8) * load64(&tl_ph + i * 8);
+        i = i + 1;
+    }
+
+    var tiles = (tl_maxw + 63) / 64;
+    tl_shift = 0;
+    while ((1 << tl_shift) < tiles) { tl_shift = tl_shift + 1; }
+    if (tlm_shift0 != 0) { tl_shift = 0; }
+    return 0;
+}
+
+# tl_run — walk the dispatch grid the way the hardware will, and record every write.
+# Returns the number of stores issued.
+fn tl_run(): i64 {
+    var writes = 0;
+    var gx = tl_n << tl_shift;
+    var tgx = 0;
+    while (tgx < gx) {
+        var prim = tgx >> tl_shift;
+        var tile = tgx - (prim << tl_shift);
+        # ⚠ A shift too small makes `prim` collide. The model must NOT clamp here — clamping would
+        # hide exactly the defect this file exists to catch.
+        if (prim >= tl_n) { prim = tl_n - 1; }
+        var pw = load64(&tl_pw + prim * 8);
+        var ph = load64(&tl_ph + prim * 8);
+        var off = load64(&tl_off + prim * 8);
+
+        var tgy = 0;
+        while (tgy < tl_maxh) {
+            var run_row = 1;
+            if (tlm_noph == 0) { if (tgy >= ph) { run_row = 0; } }
+            if (run_row != 0) {
+                var lane = 0;
+                while (lane < 64) {
+                    var px = tile * 64 + lane;
+                    var live = 1;
+                    if (tlm_nopw == 0) { if (px >= pw) { live = 0; } }
+                    if (live != 0) {
+                        # local hit counter — proves per-primitive coverage.
+                        # ⚠ Only pixels INSIDE the primitive get a local slot; a mutation that
+                        # writes outside is caught by the screen map instead, which is why both
+                        # maps exist.
+                        if (px < pw) {
+                            if (tgy < ph) {
+                                var li = load64(&tl_base + prim * 8) + tgy * pw + px;
+                                if (li >= 0) {
+                                    if (li < 262144) {
+                                        store8(&tl_hit + li, (load8(&tl_hit + li) & 0xFF) + 1);
+                                    }
+                                }
+                            }
+                        }
+                        # screen hit counter — proves the address arithmetic lands in the rect
+                        var byteoff = off + tgy * TL_PITCH + px * 4;
+                        var si = byteoff / 4;
+                        if (si >= 0) {
+                            if (si < 65536) {
+                                store8(&tl_scr + si, (load8(&tl_scr + si) & 0xFF) + 1);
+                            }
+                        }
+                        writes = writes + 1;
+                    }
+                    lane = lane + 1;
+                }
+            }
+            tgy = tgy + 1;
+        }
+        tgx = tgx + 1;
+    }
+    return writes;
+}
+
+# tl_verify — every local pixel of every primitive written EXACTLY once, and no more.
+# Returns 0 on success, else a count of offending local pixels.
+fn tl_verify(): i64 {
+    var bad = 0;
+    var i = 0;
+    while (i < tl_total) {
+        if ((load8(&tl_hit + i) & 0xFF) != 1) { bad = bad + 1; }
+        i = i + 1;
+    }
+    return bad;
+}
+
+# tl_screen_bad — count screen pixels written a different number of times than the rects demand.
+# ⭐ THIS IS THE HALF THAT CATCHES A WRONG dst_off. The local map above would stay perfect if every
+# primitive wrote its shape into the WRONG PLACE, because it indexes by (prim, local x, local y).
+fn tl_screen_bad(): i64 {
+    var bad = 0;
+    var y = 0;
+    while (y < TL_SCRH) {
+        var x = 0;
+        while (x < TL_SCRW) {
+            var want = 0;
+            var i = 0;
+            while (i < tl_n) {
+                var qx = load64(&tl_px + i * 8);
+                var qy = load64(&tl_py + i * 8);
+                if (x >= qx) {
+                    if (x < qx + load64(&tl_pw + i * 8)) {
+                        if (y >= qy) {
+                            if (y < qy + load64(&tl_ph + i * 8)) { want = want + 1; }
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+            var si = y * TL_SCRW + x;
+            var got = 0;
+            if (si < 65536) { got = load8(&tl_scr + si) & 0xFF; }
+            if (got != want) { bad = bad + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return bad;
+}
+
+fn tl_case(label, llen): i64 {
+    tl_reset();
+    tl_prep();
+    var writes = tl_run();
+    var lbad = tl_verify();
+    var sbad = tl_screen_bad();
+    var want = 0;
+    var i = 0;
+    while (i < tl_n) {
+        want = want + load64(&tl_pw + i * 8) * load64(&tl_ph + i * 8);
+        i = i + 1;
+    }
+    ps("  "); print(label, llen);
+    ps("  n="); pn(tl_n);
+    ps(" shift="); pn(tl_shift);
+    ps(" gx="); pn(tl_n << tl_shift);
+    ps(" gy="); pn(tl_maxh);
+    ps("  writes="); pn(writes); ps("/"); pn(want);
+    if (lbad == 0) {
+        if (sbad == 0) {
+            if (writes == want) { ps("  EXACT"); nl(); return 0; }
+        }
+    }
+    ps("  local_bad="); pn(lbad); ps(" screen_bad="); pn(sbad);
+    nl();
+    return 1;
+}
+
+# ---- case builders ----------------------------------------------------------------------------
+
+# THE DOOM SHAPE: N one-pixel-wide columns of differing heights, side by side. This is what rung 14
+# is FOR, and it is the case where tile_shift is 0 and gx is exactly the primitive count.
+fn tl_doom(n): i64 {
+    tl_n = n;
+    var i = 0;
+    while (i < n) {
+        store64(&tl_pw + i * 8, 1);
+        store64(&tl_ph + i * 8, 40 + (i * 7) % 24);       # ragged skyline, as a real seg gives
+        store64(&tl_px + i * 8, i);
+        store64(&tl_py + i * 8, 20 + (i * 3) % 11);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Uniform square sprites, all 16x16 — the simplest fused case.
+fn tl_sprites(n): i64 {
+    tl_n = n;
+    var i = 0;
+    while (i < n) {
+        store64(&tl_pw + i * 8, 16);
+        store64(&tl_ph + i * 8, 16);
+        store64(&tl_px + i * 8, (i % 16) * 16);
+        store64(&tl_py + i * 8, (i / 16) * 16);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ⭐ MIXED WIDTHS, one of them past a wavefront. This is the ONLY shape that exercises tile_shift > 0,
+# and therefore the only one where the prim/tile split can be wrong.
+fn tl_mixed(n): i64 {
+    tl_n = n;
+    var i = 0;
+    while (i < n) {
+        var w = 1;
+        if (i % 4 == 1) { w = 17; }
+        if (i % 4 == 2) { w = 64; }
+        if (i % 4 == 3) { w = 63; }
+        store64(&tl_pw + i * 8, w);
+        store64(&tl_ph + i * 8, 8 + (i % 5) * 4);
+        store64(&tl_px + i * 8, (i % 4) * 70);
+        store64(&tl_py + i * 8, (i / 4) * 30);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Widths straddling the 64-lane boundary — 65 needs two tiles, 128 exactly two, 129 three.
+fn tl_wide(): i64 {
+    tl_n = 4;
+    store64(&tl_pw + 0 * 8, 65);  store64(&tl_ph + 0 * 8, 12);
+    store64(&tl_px + 0 * 8, 0);   store64(&tl_py + 0 * 8, 0);
+    store64(&tl_pw + 1 * 8, 128); store64(&tl_ph + 1 * 8, 20);
+    store64(&tl_px + 1 * 8, 0);   store64(&tl_py + 1 * 8, 20);
+    store64(&tl_pw + 2 * 8, 129); store64(&tl_ph + 2 * 8, 5);
+    store64(&tl_px + 2 * 8, 0);   store64(&tl_py + 2 * 8, 50);
+    store64(&tl_pw + 3 * 8, 1);   store64(&tl_ph + 3 * 8, 60);
+    store64(&tl_px + 3 * 8, 200); store64(&tl_py + 3 * 8, 60);
+    return 0;
+}
+
+fn main(): i64 {
+    ps("texlist -- does op 0x0C's fused grid hit every pixel of every primitive exactly once?"); nl();
+    nl();
+    var fails = 0;
+
+    ps("GRID MAPPING (prim = tgid_x >> shift, tile = tgid_x - (prim << shift)):"); nl();
+    tl_doom(64);    fails = fails + tl_case("DOOM: 64 columns, 1 px wide, ragged heights", 44);
+    tl_doom(7);     fails = fails + tl_case("DOOM: 7 columns (odd count, shift 0)       ", 44);
+    tl_sprites(16); fails = fails + tl_case("sprites: 16 uniform 16x16                  ", 44);
+    tl_mixed(16);   fails = fails + tl_case("mixed widths 1/17/64/63 (shift 0)          ", 44);
+    tl_wide();      fails = fails + tl_case("wide: 65 / 128 / 129 / 1 px (shift > 0)    ", 44);
+    tl_n = 1; store64(&tl_pw, 1); store64(&tl_ph, 1); store64(&tl_px, 0); store64(&tl_py, 0);
+    fails = fails + tl_case("degenerate: a single 1x1 primitive         ", 44);
+    nl();
+
+    if (fails != 0) {
+        ps("texlist: FAIL -- the grid mapping is wrong; do NOT burn op 0x0C."); nl();
+        return 86;
+    }
+    ps("⭐ All cases EXACT: every local pixel written once, every screen pixel matching the rects."); nl();
+    nl();
+
+    # ---- FALSIFICATION ------------------------------------------------------------------------
+    # ⛔ A GATE THAT CANNOT GO RED PROVES NOTHING. Each mutation removes ONE guard the prologue in
+    # kernel/shaders/tex_list.s actually emits, and each must break the very case above that it
+    # would break on iron. Rung 13 shipped a guard that no test could exercise; this is the answer
+    # to that.
+    ps("FALSIFICATION -- each removes one guard the shader emits:"); nl();
+    var mut = 0;
+
+    # 1. drop `s_cmp_ge_u32 s9, s7 / s_cbranch_scc1 L_END` -- short primitives scribble past their rect
+    tlm_noph = 1;
+    tl_doom(64);
+    var m1 = tl_case("MUT no ph guard  (expect RED on ragged heights)", 47);
+    tlm_noph = 0;
+    if (m1 == 0) {
+        ps("  ⛔ the ph guard is UNEXERCISED -- every primitive in the case is the same height"); nl();
+    }
+    mut = mut + m1;
+
+    # 2. drop the `v_cmp_gt_u32 vcc, s6, v1` exec mask -- lanes past pw write into the neighbour
+    tlm_nopw = 1;
+    tl_doom(64);
+    var m2 = tl_case("MUT no pw guard  (expect RED: 64 lanes, 1 px wide)", 50);
+    tlm_nopw = 0;
+    mut = mut + m2;
+
+    # 3. force tile_shift = 0 on a list that needs 3 -- TWO PRIMITIVES SHARE ONE RECORD.
+    # ⭐ THIS IS RUNG 12'S BUG, EXACTLY. Its tri-list fused N triangles that shared three fixed arena
+    # slots, so every dispatch read the last one's data. Here the sharing would be of records.
+    tlm_shift0 = 1;
+    tl_wide();
+    var m3 = tl_case("MUT tile_shift 0 (expect RED: wide prims truncated)", 51);
+    tlm_shift0 = 0;
+    mut = mut + m3;
+
+    nl();
+    if (mut != 3) {
+        ps("texlist: FAIL -- only "); pn(mut);
+        ps(" of 3 mutations went red. A guard is unexercised, so this file"); nl();
+        ps("  is reporting confidence it has not earned. Fix the CASES, not the mutations."); nl();
+        return 86;
+    }
+    ps("⭐ All 3 mutations RED: the ph guard, the pw exec mask and the tile shift are each"); nl();
+    ps("  load-bearing, and this file would have caught any of them going missing."); nl();
+    nl();
+    ps("texlist: PASS -- op 0x0C's grid mapping is exact and its guards are proven necessary."); nl();
+    return 95;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

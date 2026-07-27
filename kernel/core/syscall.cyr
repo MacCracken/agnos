@@ -1078,13 +1078,67 @@ var GPU_TEX_FLAG_WRAP  = 0x04;       # tile the texture instead of clamping; dim
 var GPU_TEX_FLAGS_KNOWN = 0x07;      # anything outside this is REJECTED, never accepted-and-ignored
 var GPU_TEX_LUT_ENTRIES = 256;       # a full byte of index; a short LUT is a reject, not a clamp
 
+# ⭐ RUNG 14 — N TEXTURED PRIMITIVES IN ONE DISPATCH. The rung's structural blocker, measured.
+#
+# ⛔ WHY THIS OP EXISTS, AND WHY MERGING GEOMETRY WOULD NOT HAVE WORKED. `doomwall.cyr` measured a
+# multi-column affine quad: a 1.5x depth ratio across a seg makes 4096 of 4096 pixels wrong, because
+# DOOM's `ty_step = 1/depth` is a hyperbola in screen x while an affine quad interpolates it
+# linearly. cyrius-doom itself refuted that approach (render.cyr:1275 — it "made textures swim").
+# So primitives CANNOT merge. Submissions must.
+#
+# ⭐ ONE WORKGROUP PER PRIMITIVE. The dispatch grid is gx = n_prims, and the shader reads
+# `tgid_x` to index the record array — O(1) per pixel, no per-pixel search over the list, and no
+# constraint that primitives be adjacent, uniform or sorted. That is what makes this general rather
+# than DOOM-shaped: "N independent textured rects, one dispatch" is a statement about SUBMISSION.
+#
+# ⛔ FULLCOV IS WHAT MAKES IT TRACTABLE. Rung 12's batch failed because N primitives shared three
+# fixed arena slots; with no coverage pass there is no shared mask at all, and each primitive gets
+# its own 160-byte record in an ARRAY the shader indexes. The bug class is designed out, not fenced
+# around. FULLCOV is therefore REQUIRED here, not optional.
+var GPU_OP_TEX_LIST    = 0x0C;       # N textured primitives, ONE dispatch     (3D arc rung 14)
+var GPU_TEX_LIST_MAX   = 512;        # per-record primitive cap; a reject, never a clamp
+# GPU_TEXL_MAX_WAVES — the launched-WAVEFRONT ceiling for op 0x0C.
+#
+# ⚠ NOT GPU_TRI_MAX_PIXELS. That constant is "an arena size wearing a constant's clothes" by its own
+# admission — it bounds the coverage mask, which this op does not use at all. Reusing it here was
+# tried and would have REJECTED THE VERY WORKLOAD THIS OP EXISTS FOR: a 640-column DOOM frame at
+# 200 rows launches 128000 wavefronts, against that constant's 1048576/64 = 16384.
+#
+# ⭐ WAVEFRONTS ARE THE COST UNIT, and one workgroup here is one wavefront: gy = max(ph) rows by
+# gx = n_prims << tile_shift. 262144 sits ~2x above a full DOOM frame and far below anything that
+# could wedge the queue. Bounding waves rather than lanes is also what catches the pathological
+# case — ONE 4096-wide primitive among 511 one-pixel columns forces tile_shift = 6 and a grid 64x
+# wider than 511 of the 512 primitives can use (47185920 waves; rejected).
+#
+# ⛔ HONEST LIMIT, to be MEASURED on the first burn rather than assumed: a 1-px-wide primitive uses
+# ONE of its wavefront's 64 lanes. DOOM columns are 1 px wide, so the fused path trades a 27.9 us
+# per-dispatch fixed cost for ~1/64 lane efficiency. The trade is still overwhelmingly favourable
+# (640 dispatches x 27.9 us = 17.9 ms of pure overhead, versus one dispatch), but the residual pixel
+# cost is the number the burn must produce. If it is too high the fix is a per-primitive
+# COLUMN-MAJOR flag letting lanes walk Y instead of X — deliberately NOT built ahead of a
+# measurement saying it is needed.
+var GPU_TEXL_MAX_WAVES = 262144;     # launched wavefronts per op 0x0C dispatch
+var GPU_TEX_PRIM_BYTES = 96;         # per-primitive input record, ring-3 supplied:
+                                     #   +0  wh        h<<16 | w      (rect size)
+                                     #   +4  dstxy     y<<16 | x      (rect origin, screen)
+                                     #   +8  tex_id    #86 slot
+                                     #   +12 lut_id    #86 slot (IDX8 only, else 0)
+                                     #   +16 texwh     th<<16 | tw
+                                     #   +20 flags     per-primitive: IDX8 | WRAP
+                                     #   +24 vx0 vy0 vx1 vy1 vx2 vy2  (i32 16.16)
+                                     #   +48 u0 v0 u1 v1 u2 v2        (i32 16.16)
+                                     # ⚠ 96 B: a 24-byte header + 48 bytes of coords = 72, rounded
+                                     # UP to 96 so the record is 32-byte aligned and the shader can
+                                     # index it with a shift instead of a multiply. +72..95 reserved,
+                                     # MUST be zero — the extension point, as on every other record.
+
 var GPU_RULE_NONZERO   = 0;
 var GPU_RULE_EVENODD   = 1;
 var GPU_EDGE_BYTES     = 16;         # one edge = x0,y0,x1,y1 as 4x i32 in 16.16
 var GPU_EDGE_MAX       = 256;        # per-op cap; a reject, never a clamp
 # 0x05 channel swap (plan S4) · 0x06 cov-modulated source · 0x07 packed VOP3P blend ·
 # 0x10-0x17 CP-DMA-domain ops (fill/blit/readback, plan S12) · 0x18-0x1F control (barrier/present).
-var GPU_OP_SUPPORTED   = 0xF1F;      # bits 0..4 + 8 (EDGE_COV) + 9 (TRI_RGBA) + 10 (TRI_LIST) + 11 (TRI_TEX) — MUST equal what gpo_validate accepts
+var GPU_OP_SUPPORTED   = 0x1F1F;     # bits 0..4 + 8 EDGE_COV + 9 TRI_RGBA + 10 TRI_LIST + 11 TRI_TEX + 12 TEX_LIST — MUST equal what gpo_validate accepts
 
 # Flags word (+4). NOTHING is accepted here yet, on purpose: a flag that is accepted and ignored is how
 # a caller silently gets behaviour it did not ask for. bit0 SERIALIZE and bit1 CHECK_PREMUL are reserved
@@ -1096,6 +1150,7 @@ var GPU_OP_FLAGS_KNOWN = 0x00;
 fn gpo_flags_known(op) {
     if (op == GPU_OP_TRI_RGBA) { return GPU_TRI_FLAG_DERIVE; }
     if (op == GPU_OP_TRI_TEX)  { return GPU_TEX_FLAGS_KNOWN; }
+    if (op == GPU_OP_TEX_LIST) { return 0; }   # per-PRIMITIVE flags live in the array, not here
     return GPU_OP_FLAGS_KNOWN;
 }
 
@@ -1190,6 +1245,8 @@ fn gpo_field_mask(op) {
     if (op == GPU_OP_TRI_LIST)    { return 0x007B; }   # op flags vtx_id wh dstxy n_tris
     # op flags tex_id edge_id wh dstxy vtx_id texwh lut_id  +  n_edges|rule at +60
     if (op == GPU_OP_TRI_TEX)     { return 0x81FF; }
+    # op flags prim_id wh dstxy n_prims  — the union rect + the primitive array
+    if (op == GPU_OP_TEX_LIST)    { return 0x007B; }
     # rung 9: op(0) flags(1) dst_id(2) edge_id(3) wh(4) n_edges|rule(9)
     # ⛔ dstxy (dword 5) is NOT defined by this op and must be zero. EDGE_COV does not touch the
     # framebuffer at all -- it rasterises into a mask slot whose origin IS (0,0). Accepting a dstxy
@@ -1229,6 +1286,14 @@ fn gpo_slot_field(op) {
 # positive number, so every "is it in range" test below would pass on exactly the values that are
 # out of range in the negative direction. [[reference_cyrius_shift_right_is_logical]] is the same
 # class of trap one operator over.
+# gpu_shm_mc — resolve a validated #86 slot id to its GPU-visible MC address, or 0.
+# ⚠ Callers must have validated the slot already; this returns 0 for an out-of-range id rather than
+# reading past the table, but 0 is also a legitimate "unmapped" answer, so it is a backstop, not a check.
+fn gpu_shm_mc(id) {
+    if (shm_slot_valid(id) == 0) { return 0; }
+    return load64(&shm_mc + (id - 1) * 8);
+}
+
 fn gpo_i32(addr) {
     var v = load32(addr) & 0xFFFFFFFF;
     if (v >= 2147483648) { v = v - 4294967296; }
@@ -1260,6 +1325,121 @@ fn gpo_coord_bad(c) {
 # ⚠ The LUT rule is bidirectional ON PURPOSE. IDX8 without a LUT is obviously invalid; a LUT slot
 # supplied WITHOUT IDX8 is rejected too, because accepting it would mean silently ignoring a slot
 # the caller believed was in use. Same doctrine as the flags word.
+# gpo_validate_texlist — rung 14's ABI gate. Returns 0 or a GPO_E_*.
+#
+# ⛔ EVERY PRIMITIVE IS VALIDATED, NOT SAMPLED. A list op that checked only the header would let one
+# malformed entry out of 512 reach the shader, and the shader has no way to refuse — it would fetch
+# from a bad slot address at dispatch time, which on this silicon is a wedged queue with no pointer
+# back to the caller. The cost is a bounded pass over the array before anything is dispatched.
+fn gpo_validate_texlist(rec, fbw, fbh) {
+    if ((load32(rec + 4) & 0xFFFFFFFF) != 0) { return GPO_E_RESERVED; }   # header flags: none defined
+
+    var wh  = load32(rec + 16) & 0xFFFFFFFF;
+    var dxy = load32(rec + 20) & 0xFFFFFFFF;
+    var w = wh & 0xFFFF;
+    var h = (wh >> 16) & 0xFFFF;
+    if (w < 1) { return GPO_E_DIM; }
+    if (h < 1) { return GPO_E_DIM; }
+    if (w * h > GPU_TRI_MAX_PIXELS) { return GPO_E_WORK; }
+    var dx = dxy & 0xFFFF;
+    var dy = (dxy >> 16) & 0xFFFF;
+    if (dx + w > fbw) { return GPO_E_DIM; }
+    if (dy + h > fbh) { return GPO_E_DIM; }
+
+    var np = load32(rec + 24) & 0xFFFFFFFF;
+    if (np < 1) { return GPO_E_TRILIST; }
+    if (np > GPU_TEX_LIST_MAX) { return GPO_E_TRILIST; }
+    var lmaxw = 0;
+    var lmaxh = 0;
+
+    var pid = load32(rec + 12) & 0xFFFFFFFF;
+    if (shm_slot_valid(pid) == 0) { return GPO_E_TRILIST; }
+    var pslot = pid - 1;
+    var pkva = load64(&shm_kva + pslot * 8);
+    if (pkva == 0) { return GPO_E_TRILIST; }
+    if (load64(&shm_size + pslot * 8) < np * GPU_TEX_PRIM_BYTES) { return GPO_E_TRILIST; }
+
+    # ---- every primitive, in bounds and resolvable -------------------------------------
+    var i = 0;
+    while (i < np) {
+        var b = pkva + i * GPU_TEX_PRIM_BYTES;
+
+        var pwh = load32(b + 0) & 0xFFFFFFFF;
+        var pw = pwh & 0xFFFF;
+        var ph = (pwh >> 16) & 0xFFFF;
+        if (pw < 1) { return GPO_E_DIM; }
+        if (ph < 1) { return GPO_E_DIM; }
+        var pxy = load32(b + 4) & 0xFFFFFFFF;
+        var px = pxy & 0xFFFF;
+        var py = (pxy >> 16) & 0xFFFF;
+        # ⚠ Bounded by the FRAMEBUFFER, not by the union rect. A primitive outside the union is a
+        # caller error, but it is not a SAFETY error, and rejecting it here would make the union a
+        # second thing to compute correctly. The shader clips to the union anyway.
+        if (px + pw > fbw) { return GPO_E_DIM; }
+        if (py + ph > fbh) { return GPO_E_DIM; }
+        if (pw > lmaxw) { lmaxw = pw; }
+        if (ph > lmaxh) { lmaxh = ph; }
+
+        var pflags = load32(b + 20) & 0xFFFFFFFF;
+        if ((pflags & (0 - 1 - GPU_TEX_FLAGS_KNOWN)) != 0) { return GPO_E_RESERVED; }
+        # ⛔ FULLCOV IS REQUIRED, not merely permitted. This op has no coverage pass at all — that
+        # absence is what removes rung 12's shared-slot failure mode. A primitive without it would
+        # be asking for a mask that is never produced.
+        if ((pflags & GPU_TEX_FLAG_FULLCOV) == 0) { return GPO_E_RESERVED; }
+
+        var twh = load32(b + 16) & 0xFFFFFFFF;
+        var tw = twh & 0xFFFF;
+        var th = (twh >> 16) & 0xFFFF;
+        if (tw < 1) { return GPO_E_TEXDIM; }
+        if (th < 1) { return GPO_E_TEXDIM; }
+        if (tw > GPU_TEX_MAX_DIM) { return GPO_E_TEXDIM; }
+        if (th > GPU_TEX_MAX_DIM) { return GPO_E_TEXDIM; }
+        if ((pflags & GPU_TEX_FLAG_WRAP) != 0) {
+            if ((tw & (tw - 1)) != 0) { return GPO_E_TEXDIM; }
+            if ((th & (th - 1)) != 0) { return GPO_E_TEXDIM; }
+        }
+
+        var tid = load32(b + 8) & 0xFFFFFFFF;
+        if (shm_slot_valid(tid) == 0) { return GPO_E_TEXSLOT; }
+        if (load64(&shm_kva + (tid - 1) * 8) == 0) { return GPO_E_TEXSLOT; }
+        var bpt = 4;
+        if ((pflags & GPU_TEX_FLAG_IDX8) != 0) { bpt = 1; }
+        if (load64(&shm_size + (tid - 1) * 8) < tw * th * bpt) { return GPO_E_TEXSLOT; }
+        if (tid == pid) { return GPO_E_ALIAS; }
+
+        var lid = load32(b + 12) & 0xFFFFFFFF;
+        if ((pflags & GPU_TEX_FLAG_IDX8) != 0) {
+            if (shm_slot_valid(lid) == 0) { return GPO_E_LUTSLOT; }
+            if (load64(&shm_kva + (lid - 1) * 8) == 0) { return GPO_E_LUTSLOT; }
+            if (load64(&shm_size + (lid - 1) * 8) < GPU_TEX_LUT_ENTRIES * 4) { return GPO_E_LUTSLOT; }
+            if (lid == tid) { return GPO_E_ALIAS; }
+        }
+        if ((pflags & GPU_TEX_FLAG_IDX8) == 0) {
+            if (lid != 0) { return GPO_E_LUTSLOT; }
+        }
+
+        # reserved tail
+        if ((load32(b + 72) & 0xFFFFFFFF) != 0) { return GPO_E_RESERVED; }
+        i = i + 1;
+    }
+
+    # ⛔ BOUND THE LAUNCHED GRID, NOT THE UNION RECT. The generic w*h check above bounds the
+    # caller's DAMAGE DECLARATION, which bounds nothing about the work: primitives may sit outside
+    # the union, and 512 of them each the size of the screen would pass it untouched.
+    #
+    # What the hardware actually spends is the grid this op launches:
+    #     lanes = (n_prims << tile_shift) * max(ph) * 64,   tile_shift = ceil(log2(ceil(max_pw/64)))
+    # and that quantity is not proportional to the useful pixels. A list mixing ONE 4096-wide
+    # primitive with 511 one-pixel columns forces tile_shift = 6, so the grid is 64x wider than 511
+    # of the 512 primitives can use. Bounding the launched lanes catches that; bounding sum(pw*ph)
+    # would not. On this silicon an unbounded dispatch is a wedged queue with no pointer back here.
+    var lt = 0;
+    var ltiles = (lmaxw + 63) / 64;
+    while ((1 << lt) < ltiles) { lt = lt + 1; }
+    if ((np << lt) * lmaxh > GPU_TEXL_MAX_WAVES) { return GPO_E_WORK; }
+    return 0;
+}
+
 fn gpo_validate_tritex(rec, fbw, fbh) {
     var flags = load32(rec + 4) & 0xFFFFFFFF;
     if ((flags & (0 - 1 - GPU_TEX_FLAGS_KNOWN)) != 0) { return GPO_E_RESERVED; }
@@ -1652,6 +1832,29 @@ fn ea_expect_valid(rec, name, nlen) {
     }
     kprint("edge-abi: FAIL ", 15); kprint(name, nlen);
     kprint(" want 0 or ARM, got ", 20); kprint_num(got); kprint("\n", 1);
+    return 0;
+}
+
+# ea_seed_prim — write one well-formed 96-byte TEX_LIST primitive. Vertices are RECT-LOCAL (the
+# shader shades in rect space and the record carries the screen origin separately), UVs span the
+# whole texture. ⚠ Writes all 24 dwords including the reserved tail, so a case that dirtied the tail
+# is cleaned by the next reseed rather than leaking into an unrelated case.
+fn ea_seed_prim(base, i, tex, lut, tw, th, fl, pw, ph, px, py) {
+    var b = base + i * GPU_TEX_PRIM_BYTES;
+    var z = 0;
+    while (z < 24) { store32(b + z * 4, 0); z = z + 1; }
+    store32(b +  0, ((ph << 16) | pw) & 0xFFFFFFFF);
+    store32(b +  4, ((py << 16) | px) & 0xFFFFFFFF);
+    store32(b +  8, tex);
+    store32(b + 12, lut);
+    store32(b + 16, ((th << 16) | tw) & 0xFFFFFFFF);
+    store32(b + 20, fl);
+    store32(b + 24, 0);              store32(b + 28, 0);
+    store32(b + 32, pw * 65536);     store32(b + 36, 0);
+    store32(b + 40, 0);              store32(b + 44, ph * 65536);
+    store32(b + 48, 0);              store32(b + 52, 0);
+    store32(b + 56, tw * 65536);     store32(b + 60, 0);
+    store32(b + 64, 0);              store32(b + 68, th * 65536);
     return 0;
 }
 
@@ -2165,6 +2368,150 @@ fn edge_abi_selftest() {
     pass = pass + ea_expect(&d, GPO_E_RESERVED, "tex: reserved dword must be zero", 32);
     store32(&d + 36, 0);
 
+    # ---- #92 op 0x0C TEX_LIST -------------------------------------------------------------------
+    # Slots: prim array = id 11 (4096 B, kva) — 42 primitives' worth. tex = id 14 (256 B = 8x8
+    # RGBA8, EXACT so the size gate bites). lut = id 15 (4096 B). id 16 = 16 B undersize. id 12 free.
+    kprint("edge-abi: ---- #92 op 0x0C TEX_LIST ABI battery ----\n", 53);
+    var pb = &eabi_edges;
+    ea_seed_prim(pb, 0, 14, 0, 8, 8, GPU_TEX_FLAG_FULLCOV, 16, 16, 0, 0);
+    ea_seed_prim(pb, 1, 14, 0, 8, 8, GPU_TEX_FLAG_FULLCOV, 16, 16, 16, 0);
+
+    var lz = 0;
+    while (lz < 16) { store32(&d + lz * 4, 0); lz = lz + 1; }
+    store32(&d +  0, GPU_OP_TEX_LIST);
+    store32(&d + 12, 11);                         # primitive array slot
+    store32(&d + 16, (16 * 65536) + 32);          # union rect 32x16
+    store32(&d + 20, 0);
+    store32(&d + 24, 2);                          # n_prims
+
+    pass = pass + ea_expect(&d, 0, "texl: well-formed 2-primitive list is accepted", 46);
+
+    ea_seed_prim(pb, 1, 14, 15, 8, 8, GPU_TEX_FLAG_FULLCOV | GPU_TEX_FLAG_IDX8, 16, 16, 16, 0);
+    pass = pass + ea_expect(&d, 0, "texl: IDX8 primitive with a LUT is accepted", 43);
+
+    # ⛔ THE EXECUTOR BRANCH, NOT JUST THE VALIDATOR. Every other case here calls gpo_validate, so a
+    # missing or mistyped branch in gpo_execute would ship completely unremarked: the record would
+    # validate, execute would fall through, and #92 would answer GPO_E_BADOP for an op the ABI
+    # advertises as supported. Running the record through gpo_execute proves the branch EXISTS and
+    # is REACHED — the answer must be GPO_E_ARM (no GPU in this environment), never GPO_E_BADOP.
+    # ⚠ Safe to call here: gpu_texl_arm() checks gpu_present FIRST and returns 0, so nothing is
+    # dispatched and no hardware is touched.
+    var xr = gpo_execute(&d);
+    if (xr == GPO_E_ARM) {
+        kprint("edge-abi: PASS texl: the EXECUTOR branch is reached (GPO_E_ARM)\n", 64);
+        pass = pass + 1;
+    }
+    if (xr != GPO_E_ARM) {
+        kprint("edge-abi: FAIL texl: gpo_execute want ARM got ", 46);
+        kprint_num(xr);
+        kprint(" -- BADOP here means the branch is missing\n", 43);
+    }
+
+    # ⭐ THE CASE THIS OP EXISTS TO GET RIGHT. Every previous reject below mutates primitive [1], not
+    # [0] — a validator that checked only the first entry would pass all of them and ship a list op
+    # that lets one bad primitive in 512 reach a shader with no way to refuse.
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 12, 0);
+    pass = pass + ea_expect(&d, GPO_E_LUTSLOT, "texl: IDX8 without LUT in the SECOND primitive", 46);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 12, 16);
+    pass = pass + ea_expect(&d, GPO_E_LUTSLOT, "texl: LUT slot too small (primitive 1)", 38);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 12, 12);
+    pass = pass + ea_expect(&d, GPO_E_LUTSLOT, "texl: LUT slot is free (primitive 1)", 36);
+    ea_seed_prim(pb, 1, 14, 0, 8, 8, GPU_TEX_FLAG_FULLCOV, 16, 16, 16, 0);
+
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 12, 15);
+    pass = pass + ea_expect(&d, GPO_E_LUTSLOT, "texl: LUT supplied without IDX8 (primitive 1)", 45);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 12, 0);
+
+    # ⛔ FULLCOV IS MANDATORY. There is no coverage stage in this op, so a primitive without the flag
+    # is asking for a mask that is never produced.
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 20, 0);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "texl: primitive without FULLCOV", 31);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 20, GPU_TEX_FLAG_FULLCOV | 0x08);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "texl: primitive unknown flag bit", 32);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 20, GPU_TEX_FLAG_FULLCOV);
+
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 8, 12);
+    pass = pass + ea_expect(&d, GPO_E_TEXSLOT, "texl: texture slot is free (primitive 1)", 40);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 8, 16);
+    pass = pass + ea_expect(&d, GPO_E_TEXSLOT, "texl: texture slot too small (primitive 1)", 42);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 8, 11);
+    pass = pass + ea_expect(&d, GPO_E_ALIAS, "texl: texture aliases the primitive array", 41);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 8, 14);
+
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 16, (8 * 65536) + 0);
+    pass = pass + ea_expect(&d, GPO_E_TEXDIM, "texl: texture width zero (primitive 1)", 38);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 16, (4097 * 65536) + 8);
+    pass = pass + ea_expect(&d, GPO_E_TEXDIM, "texl: texture height over cap (primitive 1)", 43);
+    # WRAP needs a power-of-two texture; the shader tiles with an AND, which silently lies otherwise.
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 16, (8 * 65536) + 6);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 20, GPU_TEX_FLAG_FULLCOV | GPU_TEX_FLAG_WRAP);
+    pass = pass + ea_expect(&d, GPO_E_TEXDIM, "texl: WRAP with a non-power-of-two width", 40);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 20, GPU_TEX_FLAG_FULLCOV);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 16, (8 * 65536) + 8);
+
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 0, (16 * 65536) + 0);
+    pass = pass + ea_expect(&d, GPO_E_DIM, "texl: primitive width zero", 26);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 0, (16 * 65536) + 16);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 4, (0 * 65536) + 2550);
+    pass = pass + ea_expect(&d, GPO_E_DIM, "texl: primitive runs off the framebuffer", 40);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 4, (0 * 65536) + 16);
+
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 72, 1);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "texl: primitive reserved tail must be zero", 42);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 72, 0);
+
+    # ---- header rejects ----
+    store32(&d + 24, 0);
+    pass = pass + ea_expect(&d, GPO_E_TRILIST, "texl: zero primitives", 21);
+    store32(&d + 24, GPU_TEX_LIST_MAX + 1);
+    pass = pass + ea_expect(&d, GPO_E_TRILIST, "texl: more primitives than the cap", 34);
+    # ⚠ 43 x 96 = 4128 > the 4096 the slot holds. REJECT, never clamp: a clamp would shade 42 of the
+    # caller's 43 primitives and report success.
+    store32(&d + 24, 43);
+    pass = pass + ea_expect(&d, GPO_E_TRILIST, "texl: primitive array too small for n_prims", 43);
+    store32(&d + 24, 2);
+
+    store32(&d + 12, 12);
+    pass = pass + ea_expect(&d, GPO_E_TRILIST, "texl: primitive array slot is free", 34);
+    store32(&d + 12, 11);
+
+    # ⭐ THE LAUNCHED-GRID BOUND, exercised BOTH ways. A 4096-wide primitive forces tile_shift = 6,
+    # so a 2-primitive list launches (2<<6) * ph wavefronts — 64x wider than the 1-px primitive
+    # beside it can use. That is the pathological mix the wave cap exists to refuse, and it is
+    # invisible to any bound on the union rect or on sum(pw*ph).
+    # ⚠ The ACCEPT half matters as much: a DOOM frame (640 columns x 200 rows = 128000 waves) must
+    # still pass, or the cap would have killed the workload the op was built for.
+    # ⚠ THE NUMBERS WERE DERIVED, NOT GUESSED. A first cut used 2 primitives of 2048x1024 and would
+    # have been ACCEPTED (65536 waves) — the case would have gone red for the test's fault, and the
+    # tempting "fix" is to weaken the validator. With the framebuffer at 2560x1440 the cap is simply
+    # unreachable at n_prims = 2: even 2560x1440 is only 184320 waves. Nine is the smallest count
+    # that trips it: (9 << 5) * 1024 = 294912 > 262144.
+    var lw = 0;
+    while (lw < 9) {
+        ea_seed_prim(pb, lw, 14, 0, 8, 8, GPU_TEX_FLAG_FULLCOV, 2048, 1024, 0, 0);
+        lw = lw + 1;
+    }
+    store32(&d + 24, 9);
+    pass = pass + ea_expect(&d, GPO_E_WORK, "texl: launched grid exceeds the wave cap", 40);
+    # ⭐ THE ACCEPT HALF MATTERS AS MUCH. A cap that also refused DOOM's own shape would have killed
+    # the workload this op exists for — 640 columns x 200 rows is 128000 waves and must pass.
+    lw = 0;
+    while (lw < 9) {
+        ea_seed_prim(pb, lw, 14, 0, 8, 8, GPU_TEX_FLAG_FULLCOV, 1, 1024, 0, 0);
+        lw = lw + 1;
+    }
+    pass = pass + ea_expect(&d, 0, "texl: nine 1-px columns 1024 rows tall are accepted", 51);
+    store32(&d + 24, 2);
+    ea_seed_prim(pb, 0, 14, 0, 8, 8, GPU_TEX_FLAG_FULLCOV, 16, 16, 0, 0);
+    ea_seed_prim(pb, 1, 14, 0, 8, 8, GPU_TEX_FLAG_FULLCOV, 16, 16, 16, 0);
+
+    store32(&d +  4, 1);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "texl: header flags must be zero", 31);
+    store32(&d +  4, 0);
+    store32(&d +  8, 1);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "texl: reserved dword must be zero", 33);
+    store32(&d +  8, 0);
+
     # ⛔ TEARDOWN GOES LAST, AFTER EVERY BATTERY. It used to sit between the 0x08 and 0x0A blocks,
     # so the 0x0A cases ran against slots that had already been zeroed and a well-formed batch was
     # rejected with GPO_E_TRILIST -- a REAL reject for an UNREAL reason, which is the worst kind of
@@ -2178,9 +2525,9 @@ fn edge_abi_selftest() {
         r = r + 1;
     }
 
-    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 57 cases correct\n", 21);
-    if (pass == 57) {
-        kprint("edge-abi: PASS -- the 0x08/0x09/0x0A/0x0B ABIs reject every malformed record,\n", 78);
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 83 cases correct\n", 21);
+    if (pass == 83) {
+        kprint("edge-abi: PASS -- the 0x08/0x09/0x0A/0x0B/0x0C ABIs reject every malformed record,\n", 83);
         kprint("edge-abi: and a well-formed one is accepted or correctly reports no-GPU.\n", 73);
         return 1;
     }
@@ -2213,6 +2560,7 @@ fn gpo_validate(rec, fbw, fbh) {
     if (op == GPU_OP_TRI_RGBA) { return gpo_validate_tri(rec, fbw, fbh); }
     if (op == GPU_OP_TRI_LIST) { return gpo_validate_trilist(rec, fbw, fbh); }
     if (op == GPU_OP_TRI_TEX)  { return gpo_validate_tritex(rec, fbw, fbh); }
+    if (op == GPU_OP_TEX_LIST) { return gpo_validate_texlist(rec, fbw, fbh); }
 
     var wh  = load32(rec + 16) & 0xFFFFFFFF;
     var dxy = load32(rec + 20) & 0xFFFFFFFF;
@@ -2308,6 +2656,16 @@ fn gpo_execute(rec) {
         var xne = load32(rec + 60) & 0xFFFF;
         if (gpu_tri_tex(xedge, xvtx, xtex, xlut, xtwh, xflags,
         w, h, dx, dy, xne, GPU_RULE_NONZERO) != 1) { return GPO_E_ARM; }
+        return 0;
+    }
+    # ⭐ RUNG 14. Same staging doctrine as 9a and 13a: the branch lands before the shader does, so a
+    # well-formed record is refused with GPO_E_ARM (not GPO_E_BADOP) and the whole ABI — 512-primitive
+    # array, per-primitive flags, the mandatory FULLCOV rule, both texture formats — is provable in
+    # QEMU at zero flashes. Arming is a one-function change that touches nothing here.
+    if (op == GPU_OP_TEX_LIST) {
+        var Lp = load64(&shm_kva + ((load32(rec + 12) & 0xFFFFFFFF) - 1) * 8);
+        var Ln = load32(rec + 24) & 0xFFFFFFFF;
+        if (gpu_tex_list(Lp, Ln, w, h, dx, dy) != 1) { return GPO_E_ARM; }
         return 0;
     }
     if (op == GPU_OP_TRI_RGBA) {

@@ -546,6 +546,249 @@ fn tx_run_wrap(i, tileno): i64 {
     return bad;
 }
 
+# ==================================================================================================
+# RUNG 14 — op 0x0C TEX_LIST: N textured primitives in ONE dispatch.
+# ==================================================================================================
+# ⭐ THE ORACLE IS SELF-REFERENTIAL AND THAT IS ITS STRENGTH. Rung 13's op 0x0B is proven correct —
+# iron 17/17, and byte-diffed against texcore.cyr on the host. So the question for op 0x0C is not
+# "is this the right picture" (that needs a fresh reference model, and a fresh model is a fresh
+# thing to get wrong) but "is this the SAME picture op 0x0B draws". Draw the identical N primitives
+# both ways into the identical cleared rect, read both back, and demand ZERO differing bytes.
+#
+# ⛔ A REPORT IS NOT A GATE. This demands 0 of TLW*TLH*4 bytes, not "close". Rung 13 learned that
+# from the /255 hinge: `(x*a+127)>>8` and `(x*a+127)/255` differ on a handful of pixels out of
+# thousands, look identical in a photo, and are different functions.
+
+var TLW = 64;                   # the shared destination rect
+var TLH = 48;
+var TL_NP = 32;                 # primitives per list — 32 two-px columns spanning TLW
+
+var tl_prims[384];              # 32 x 96 B = 3072 B   (measured sizing: N x u64 in this directory)
+var tl_a[1536];                 # 64*48*4 = 12288 B — the op 0x0B rendering
+var tl_b[1536];                 # the op 0x0C rendering
+var tl_v[16];                   # one 48-byte vtx record, reused per individual dispatch
+
+# tl_col_frame — column c's affine frame, RECT-LOCAL to its own (pw x TLH) strip.
+# Each column samples a different slice of the texture so a mis-indexed record shows as a WRONG
+# COLUMN rather than as a subtle shade — the failure mode is made loud on purpose.
+fn tl_uv0(c): i64 { return (c % TXD) * 65536; }
+fn tl_pw(): i64 { return TLW / TL_NP; }
+
+# tl_ph — column c's height. ⭐ THE RAGGED VARIANT IS NOT DECORATION: it is the only thing that
+# exercises the shader's `s_cmp_ge_u32 s9, s7 / s_cbranch_scc1 L_END` guard ON IRON. With every
+# column the same height the grid is exactly the union and that branch never fires, so it would
+# ship unexercised — precisely the residual rung 13 carried. A ragged skyline is also what a real
+# DOOM seg looks like.
+fn tl_ph(c, ragged): i64 {
+    if (ragged == 0) { return TLH; }
+    return 12 + (c * 7) % (TLH - 12);
+}
+
+# tl_pack_vtx — the 48-byte screen/UV record for column c, rect-local.
+fn tl_pack_vtx(c, ragged): i64 {
+    var w = tl_pw();
+    var TLHc = tl_ph(c, ragged);
+    store32(&tl_v +  0, 0);              store32(&tl_v +  4, 0);
+    store32(&tl_v +  8, w * 65536);      store32(&tl_v + 12, 0);
+    store32(&tl_v + 16, 0);              store32(&tl_v + 20, TLHc * 65536);
+    store32(&tl_v + 24, tl_uv0(c));      store32(&tl_v + 28, 0);
+    store32(&tl_v + 32, tl_uv0(c) + 65536); store32(&tl_v + 36, 0);
+    store32(&tl_v + 40, tl_uv0(c));      store32(&tl_v + 44, TXD * 65536);
+    return 0;
+}
+
+# tl_pack_prims — the same N frames as 96-byte TEX_LIST primitive records.
+# ⚠ Byte-for-byte the same geometry tl_pack_vtx produces; if these two ever disagree the test is
+# comparing two different pictures and its zero-diff demand becomes meaningless.
+fn tl_pack_prims(tid, lid, idx8, x0, y0, ragged): i64 {
+    var w = tl_pw();
+    var c = 0;
+    while (c < TL_NP) {
+        var b = &tl_prims + c * 96;
+        var TLHc = tl_ph(c, ragged);
+        var z = 0;
+        while (z < 24) { store32(b + z * 4, 0); z = z + 1; }
+        store32(b +  0, (TLHc * 65536) + w);
+        store32(b +  4, ((y0 + 0) * 65536) + (x0 + c * w));
+        store32(b +  8, tid);
+        if (idx8 != 0) { store32(b + 12, lid); }
+        store32(b + 16, (TXD * 65536) + TXD);
+        var fl = 2;                                  # FULLCOV — mandatory for this op
+        if (idx8 != 0) { fl = fl + 1; }
+        store32(b + 20, fl);
+        store32(b + 24, 0);                    store32(b + 28, 0);
+        store32(b + 32, w * 65536);            store32(b + 36, 0);
+        store32(b + 40, 0);                    store32(b + 44, TLHc * 65536);
+        store32(b + 48, tl_uv0(c));            store32(b + 52, 0);
+        store32(b + 56, tl_uv0(c) + 65536);    store32(b + 60, 0);
+        store32(b + 64, tl_uv0(c));            store32(b + 68, TXD * 65536);
+        c = c + 1;
+    }
+    return 0;
+}
+
+fn tl_readback(dst, x0, y0): i64 {
+    var rid = syscall(86, TLW * TLH * 4);
+    if (rid < 1) { return 0 - 3; }
+    var pz = 0;
+    while (pz < TLW * TLH * 4 / 8) { store64(dst + pz * 8, 0xA5A5A5A5A5A5A5A5); pz = pz + 1; }
+    syscall(72, rid, dst, TLW * TLH * 4);
+    var rb = syscall(90, rid, (TLH * 65536) + TLW, (y0 * 65536) + x0);
+    if (rb != 0) { syscall(74, rid); return 0 - 5; }
+    if (syscall(73, rid, dst, TLW * TLH * 4) != 0) { syscall(74, rid); return 0 - 5; }
+    syscall(74, rid);
+    return 0;
+}
+
+# tl_run — draw both ways, compare, and time each. Returns differing BYTE count, or a negative code.
+fn tl_run(idx8, ragged): i64 {
+    var x0 = 8;
+    var y0 = 8;
+    var w = tl_pw();
+
+    var tid = syscall(86, 4096);
+    var lid = syscall(86, 4096);
+    var vid = syscall(86, 4096);
+    var pid = syscall(86, 4096);
+    if (tid < 1) { return 0 - 3; }
+    if (lid < 1) { return 0 - 3; }
+    if (vid < 1) { return 0 - 3; }
+    if (pid < 1) { return 0 - 3; }
+    syscall(72, tid, &tx_tex, TXD * TXD * 4);
+    syscall(72, lid, &tx_lut, 256 * 4);
+
+    # ⛔ ARM BOTH BLOBS BEFORE EITHER TIMED WINDOW. The first dispatch of an op pays the residency
+    # write; tx_bench_at learned this and says so. Timing an unarmed 0x0C against an armed 0x0B
+    # would report the arming cost as the fused op's cost and could invert the entire comparison.
+    tl_pack_vtx(0, ragged);
+    syscall(72, vid, &tl_v, 48);
+    var wu[64];
+    var wz = 0;
+    while (wz < 16) { store32(&wu + wz * 4, 0); wz = wz + 1; }
+    store32(&wu +  0, 11);
+    var wf = 2;
+    if (idx8 != 0) { wf = wf + 1; }
+    store32(&wu +  4, wf);
+    store32(&wu +  8, tid);
+    store32(&wu + 16, (tl_ph(0, ragged) * 65536) + w);
+    store32(&wu + 20, (y0 * 65536) + x0);
+    store32(&wu + 24, vid);
+    store32(&wu + 28, (TXD * 65536) + TXD);
+    if (idx8 != 0) { store32(&wu + 32, lid); }
+    if (syscall(92, &wu, 64) != 0) { return 0 - 101; }
+    tl_pack_prims(tid, lid, idx8, x0, y0, ragged);
+    syscall(72, pid, &tl_prims, TL_NP * 96);
+    var wl[64];
+    var wq = 0;
+    while (wq < 16) { store32(&wl + wq * 4, 0); wq = wq + 1; }
+    store32(&wl +  0, 12);
+    store32(&wl + 12, pid);
+    store32(&wl + 16, (TLH * 65536) + TLW);
+    store32(&wl + 20, (y0 * 65536) + x0);
+    store32(&wl + 24, TL_NP);
+    var wrc = syscall(92, &wl, 64);
+    if (wrc != 0) {
+        syscall(74, tid); syscall(74, lid); syscall(74, vid); syscall(74, pid);
+        return 0 - 200 - ((0 - wrc) & 0xFF);
+    }
+
+    # ---- A: N individual op 0x0B FULLCOV dispatches ----
+    if (syscall(88, 0xFF101010, (TLH * 65536) + TLW, (y0 * 65536) + x0) != 0) { return 0 - 4; }
+    var ta = syscall(95);
+    var c = 0;
+    while (c < TL_NP) {
+        tl_pack_vtx(c, ragged);
+        syscall(72, vid, &tl_v, 48);
+        var d[64];
+        var z = 0;
+        while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+        store32(&d +  0, 11);                        # op 0x0B
+        var f1 = 2;
+        if (idx8 != 0) { f1 = f1 + 1; }
+        store32(&d +  4, f1);
+        store32(&d +  8, tid);
+        store32(&d + 16, (tl_ph(c, ragged) * 65536) + w);
+        store32(&d + 20, (y0 * 65536) + (x0 + c * w));
+        store32(&d + 24, vid);
+        store32(&d + 28, (TXD * 65536) + TXD);
+        if (idx8 != 0) { store32(&d + 32, lid); }
+        var rc = syscall(92, &d, 64);
+        if (rc != 0) { return 0 - 100 - ((0 - rc) & 0xFF); }
+        c = c + 1;
+    }
+    var tb = syscall(95);
+    if (tl_readback(&tl_a, x0, y0) != 0) { return 0 - 5; }
+
+    # ---- B: ONE op 0x0C fused dispatch, same geometry ----
+    if (syscall(88, 0xFF101010, (TLH * 65536) + TLW, (y0 * 65536) + x0) != 0) { return 0 - 4; }
+    var tc = syscall(95);
+    var e[64];
+    var q = 0;
+    while (q < 16) { store32(&e + q * 4, 0); q = q + 1; }
+    store32(&e +  0, 12);                            # op 0x0C TEX_LIST
+    store32(&e + 12, pid);
+    store32(&e + 16, (TLH * 65536) + TLW);
+    store32(&e + 20, (y0 * 65536) + x0);
+    store32(&e + 24, TL_NP);
+    var rl = syscall(92, &e, 64);
+    var td = syscall(95);
+    if (rl != 0) {
+        syscall(74, tid); syscall(74, lid); syscall(74, vid); syscall(74, pid);
+        return 0 - 200 - ((0 - rl) & 0xFF);
+    }
+    if (tl_readback(&tl_b, x0, y0) != 0) { return 0 - 5; }
+    syscall(74, tid); syscall(74, lid); syscall(74, vid); syscall(74, pid);
+
+    ps("    "); pn(TL_NP); ps(" x 0x0B = "); pn(tb - ta); ps(" us");
+    ps("    1 x 0x0C = "); pn(td - tc); ps(" us");
+    if (td > tc) {
+        if (tb > ta) { ps("    speedup "); pn((tb - ta) * 10 / (td - tc)); ps("/10x"); }
+    }
+    nl();
+
+    var bad = 0;
+    var pi = 0;
+    while (pi < TLW * TLH) {
+        var ga = load32(&tl_a + pi * 4) & 0xFFFFFFFF;
+        var gb = load32(&tl_b + pi * 4) & 0xFFFFFFFF;
+        if (ga != gb) {
+            bad = bad + 1;
+            if (tx_dumped < 8) {
+                tx_dumped = tx_dumped + 1;
+                ps("    texl diff @ x="); pn(pi % TLW); ps(" y="); pn(pi / TLW);
+                ps("  col="); pn((pi % TLW) / w);
+                ps("  0x0B="); phex8(ga); ps("  0x0C="); phex8(gb); nl();
+            }
+        }
+        pi = pi + 1;
+    }
+    # ⛔ AN ALL-BACKGROUND RECT WOULD COMPARE EQUAL AND PROVE NOTHING. If neither op drew anything,
+    # both readbacks are the clear colour and `bad` is 0 — a green that means "two dispatches both
+    # did nothing". Rung 13's N14 was structurally unreachable for four burns for exactly this kind
+    # of reason. Demand that the 0x0B side actually painted.
+    var painted = 0;
+    var pk = 0;
+    while (pk < TLW * TLH) {
+        if ((load32(&tl_a + pk * 4) & 0xFFFFFFFF) != 0xFF101010) { painted = painted + 1; }
+        pk = pk + 1;
+    }
+    # ⚠ THE THRESHOLD IS DERIVED FROM THE GEOMETRY, not a fixed fraction of the rect. A flat
+    # "half the rect" bar happens to pass the ragged list by only 344 px (1880 of a 1536 bar), so a
+    # different skyline could false-fire it — and a guard that fires for the wrong reason gets
+    # deleted rather than understood. Expected = sum(pw*ph); demand three quarters of it, leaving
+    # room for a texel that legitimately equals the clear colour without leaving room for "nothing
+    # was drawn".
+    var expect = 0;
+    var ek = 0;
+    while (ek < TL_NP) { expect = expect + w * tl_ph(ek, ragged); ek = ek + 1; }
+    if (painted < expect * 3 / 4) {
+        ps("    ⛔ the 0x0B side painted only "); pn(painted); ps(" px where the geometry demands ");
+        pn(expect); puts2(" -- the comparison is vacuous");
+        return 0 - 6;
+    }
+    return bad;
+}
+
 fn main(): i64 {
     puts2("gputex: RUNG 13 -- nearest-neighbour affine texturing via #92 op 0x0B");
     tx_build_tex();
@@ -614,6 +857,35 @@ fn main(): i64 {
     }
     ps("gputex: WRAP "); pn(wexact); ps(" of "); pn(TXWN); puts2(" exact");
 
+    # ---- RUNG 14: the SAME primitives, fused into ONE dispatch -------------------------------
+    puts2("gputex: RUNG 14 -- 32 columns as 32 x op 0x0B vs 1 x op 0x0C, demanded byte-identical");
+    var tlr = tl_run(0, 0);
+    ps("  texl RGBA8  ");
+    if (tlr == 0 - 3) { puts2("slot allocation FAILED"); }
+    if (tlr == 0 - 4) { puts2("fill_rect refused"); }
+    if (tlr == 0 - 5) { puts2("#90 readback refused"); }
+    if (tlr == 0 - 6) { puts2("VACUOUS -- the 0x0B side drew nothing"); }
+    if (tlr == 0 - 101) { puts2("the 0x0B warm-up was REJECTED"); }
+    if (tlr <= 0 - 200) { ps("op 0x0C REJECTED, reason "); pn((0 - tlr) - 200); nl(); }
+    if (tlr == 0) { puts2("IDENTICAL to 32 individual dispatches"); }
+    if (tlr > 0) { ps(""); pn(tlr); puts2(" differing px"); }
+
+    var tli = tl_run(1, 0);
+    ps("  texl IDX8   ");
+    if (tli == 0) { puts2("IDENTICAL to 32 individual dispatches"); }
+    if (tli > 0) { ps(""); pn(tli); puts2(" differing px"); }
+    if (tli < 0) { ps("failed, code "); pn(0 - tli); nl(); }
+
+    # ⭐ RAGGED HEIGHTS — the only case that fires the shader's `py >= ph` guard on hardware. The
+    # grid is sized by the TALLEST column, so every shorter column's workgroups ARE launched for
+    # rows it does not own. If the guard is missing they scribble down to the tallest column's
+    # height, and the 0x0B side (which dispatches each column at its own height) will not.
+    var tlg = tl_run(0, 1);
+    ps("  texl ragged ");
+    if (tlg == 0) { puts2("IDENTICAL — the py>=ph guard holds on iron"); }
+    if (tlg > 0) { ps(""); pn(tlg); puts2(" differing px — SUSPECT THE py>=ph GUARD"); }
+    if (tlg < 0) { ps("failed, code "); pn(0 - tlg); nl(); }
+
     syscall(84);
     puts2("gputex: presented -- the tiles above are ON SCREEN now");
     tx_bench();
@@ -642,7 +914,32 @@ fn main(): i64 {
         puts2("gputex:   would be bought with a wrong picture. Refusing to report rung 13 green.");
         return 87;
     }
+    # ⛔ RUNG 14's GATE. Zero differing bytes, both formats, or this does not ship. A fused op that
+    # is merely CLOSE to 32 individual dispatches is a fused op that draws a different picture.
+    if (tlr != 0) {
+        puts2("gputex: ⛔ op 0x0C did not reproduce op 0x0B byte for byte (RGBA8).");
+        puts2("gputex:   The texturing body is character-identical between the two shaders and");
+        puts2("gputex:   gated as such, and texlist.cyr proves the grid mapping on the host. So");
+        puts2("gputex:   the suspects are, in order: the record ARRAY build (gpu_texl_build), the");
+        puts2("gputex:   tile_shift, and the per-primitive dst_off — not the texturing maths.");
+        puts2("gputex:   A whole WRONG COLUMN points at the record index; scattered px do not.");
+        return 88;
+    }
+    if (tlg != 0) {
+        puts2("gputex: ⛔ op 0x0C diverged on RAGGED heights while matching uniform ones.");
+        puts2("gputex:   That isolates it: the texturing and the record indexing are fine, and the");
+        puts2("gputex:   `s_cmp_ge_u32 s9, s7 / s_cbranch_scc1 L_END` row guard is not holding.");
+        puts2("gputex:   Expect the extra pixels BELOW each short column, down to the tallest.");
+        return 88;
+    }
+    if (tli != 0) {
+        puts2("gputex: ⛔ op 0x0C did not reproduce op 0x0B byte for byte (IDX8).");
+        puts2("gputex:   RGBA8 matched, so the record build and grid are right and the LUT");
+        puts2("gputex:   pointer is the difference — check the per-primitive lut_id resolution.");
+        return 88;
+    }
     puts2("gputex: ⭐ RUNG 13 -- every rendered pixel byte-identical to texcore, both formats.");
+    puts2("gputex: ⭐ RUNG 14 -- op 0x0C byte-identical to 32 individual op 0x0B dispatches.");
     return 95;
 }
 

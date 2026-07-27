@@ -10,7 +10,7 @@
 # iron work added as new op codes to this SAME #93 behind the H2 arm-once latch — no new syscall number.
 #
 # Build first:  MODESET_TOOL_SELFTEST=1 sh scripts/build.sh
-#               ( and the tool: cd gpu-test && cyrius build --agnos modeset.cyr build/modeset_agnos )
+#               ( and the tool: cd tests/gpu && cyrius build --agnos modeset.cyr build/modeset_agnos )
 # Requires: qemu-system-x86_64, OVMF, parted, mtools, sgdisk, mkfs.ext2, dd, cyrius.
 
 set -u
@@ -39,7 +39,10 @@ fi
 # Build the ring-3 tool (agnos target). Uses sys_gpu_modeset_op (#93), which only exists on the agnos target.
 TOOL="$ROOT/tests/gpu/build/modeset_agnos"
 echo "Building /bin/modeset (agnos)..."
-( cd "$ROOT/gpu-test" && cyrius build --agnos modeset.cyr build/modeset_agnos ) >/dev/null 2>&1 \
+# ⚠ tests/gpu since the 1.56.22 move (was gpu-test/). This line still pointed at the old directory
+# and the `cd` failed, so the smoke aborted with "tool build failed" — a build error that reads like
+# the TOOL being broken rather than the path. Found by the cross-repo path sweep, not by a run.
+( cd "$ROOT/tests/gpu" && cyrius build --agnos modeset.cyr build/modeset_agnos ) >/dev/null 2>&1 \
     || { echo "ERROR: tool build failed" >&2; exit 1; }
 [ -f "$TOOL" ] || { echo "ERROR: tool binary not produced at $TOOL" >&2; exit 1; }
 

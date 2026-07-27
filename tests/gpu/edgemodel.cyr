@@ -29,7 +29,7 @@
 #      no failing arm is not a claim — it is a hope. This gate FAILS if nothing breaks.
 #   4  the breakpoint walk's maximum trip count, recorded and printed rather than assumed
 #
-# Build:  cd gpu-test && cyrius build edgemodel.cyr build/edgemodel
+# Build:  cd tests/gpu && cyrius build edgemodel.cyr build/edgemodel
 # Run:    ./build/edgemodel   -> 95 all four gates · 90 a gate failed (named)
 
 include "lib/io.cyr"

@@ -1162,6 +1162,16 @@ var GPU_TRI_SHADER_SUBOFF      = 0x59000;    # residency slot 9, 278 dwords  -> 
 var GPU_COMPUTE_PGM_RSRC1_TEX  = 0x00AC0207;  # 32 VGPRs, 72 SGPRs — harvested from tex_rgba.s
 var GPU_TEX_SHADER_SUBOFF      = 0x5A000;    # residency slot 10, rung 13 texturing  -> ends 0x5B000
 var GPU_TEX_PREP_SUBOFF        = 0xE3000;    # 160-byte texture prep record  -> ends 0xE3400
+# ⭐ RUNG 14: the prep-record ARRAY, one 160-byte record per primitive, indexed by the shader from
+# tgid_x. 512 x 160 = 81920 B. ⛔ This array is exactly what rung 12 lacked — its N triangles shared
+# ONE record slot, so the CPU overwrote each before the GPU read it. Per-primitive records make that
+# failure unrepresentable rather than merely guarded against.
+# ⚠ TWO bad placements preceded this one — 0xF0000 landed inside the 1 MB coverage scratch, 0x1E4000
+# collided with GPU_SACRIFICIAL. Both were "obvious" gaps read off the declaration list by eye.
+# [0xAA000,0xC0000) is the largest ACTUALLY-free run (0x16000), computed by walking the sorted slot
+# extents rather than eyeballing them. Lesson: derive the gap, don't spot it.
+var GPU_TEXL_PREP_SUBOFF       = 0xAA000;    # 512 records x 160 B  -> ends 0xBE000
+var GPU_TEXL_SHADER_SUBOFF     = 0x5B000;    # residency slot 11, rung 14 fused list  -> ends 0x5C000
 var GPU_TRI_PREP_SUBOFF        = 0xE0000;    # 64 records x 128 B  -> ends 0xE2000
 var GPU_TRI_EDGE_SUBOFF        = 0xE2000;    # synthesised frame edges when DERIVE is set -> ends 0xE3000
 var GPU_TRI_COV_SUBOFF         = 0xE4000;    # 8bpp coverage scratch, 1 MB  -> ends 0x1E4000

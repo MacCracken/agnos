@@ -39,7 +39,7 @@
 # Re-deriving and then diffing is a real check; hand-copying and then diffing marks its own
 # homework, because both sides would share the same mistake.
 #
-# Build:  cd gpu-test && CYRIUS_ALLOW_PARENT_INCLUDES=1 cyrius build edgeasm.cyr build/edgeasm
+# Build:  cd tests/gpu && CYRIUS_ALLOW_PARENT_INCLUDES=1 cyrius build edgeasm.cyr build/edgeasm
 # Run:    ./build/edgeasm   -> 95 calibration + label pass green · 90 a gate failed (named)
 
 include "lib/io.cyr"

@@ -23,7 +23,7 @@
 # So each case's reference mask is FNV-1a digested and printed by BOTH tools, and the burn is
 # only readable if they match. `gpu.md:1019` names this failure class explicitly.
 #
-# Build:  cd gpu-test && cyrius build --agnos gputri.cyr build/gputri_agnos
+# Build:  cd tests/gpu && cyrius build --agnos gputri.cyr build/gputri_agnos
 # Iron:   run /bin/gputri --digest   reference digests, to diff against host cpuref FIRST
 #         run /bin/gputri --cov      the 20-case corpus + N1-N8
 #

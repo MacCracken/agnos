@@ -40,7 +40,7 @@
 # oracle (ii) fails with double-coverage; change it to `>` and it fails with a crack. That is
 # precisely why oracle (ii) exists and why it is not redundant with (i).
 #
-# Build:  cd gpu-test && cyrius build cpuref.cyr build/cpuref
+# Build:  cd tests/gpu && cyrius build cpuref.cyr build/cpuref
 # Run:    ./build/cpuref     -> 95 = both oracles pass · 90 = a failure (named)
 
 include "lib/io.cyr"

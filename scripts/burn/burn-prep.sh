@@ -20,7 +20,13 @@
 #         SKIP_SWEEP=1 sh scripts/burn/burn-prep.sh   (skip the sweep — build only)
 #
 # Exit 0 iff the sweep is green (or skipped) AND the iron kernel built.
-cd "$(dirname "$0")/.." || exit 1
+# ⚠ TWO levels up: this script lives in scripts/burn/ since the 1.56.22 split. It was left at one
+# level and so cd'd into scripts/, where `scripts/sweep.sh` does not exist — the sweep gate reported
+# "the sweep is RED" and aborted every burn. This is category 2 from
+# docs/development/planning/scripts-reorg.md ("paths computed INSIDE a script"), which that document
+# warns is invisible to a grep for the script's own name; the 123-script fix pass missed this one,
+# and it is the single script a burn cannot proceed without.
+cd "$(dirname "$0")/../.." || exit 1
 ROOT="$(pwd)"
 
 set -u
@@ -74,7 +80,7 @@ if [ -n "${BURN_SHADER_OPS:-}" ]; then
     # Follow-up (cheap, no new code): one production-shape boot — BUILD_ENV="" — running the same two
     # binaries. Do it only after this burn is green.
     #
-    # ⚠ NEEDS the gpu-test binaries on the agnos-fs: scripts/burn/stage-tools.sh --build (wired 1.56.4).
+    # ⚠ NEEDS the tests/gpu binaries on the agnos-fs: scripts/burn/stage-tools.sh --build (wired 1.56.4).
     # Oracle: `run /bin/gpublend` and `run /bin/gpucov` -> `run: exit 95`. A #92 failure decodes as
     # 110 + reason (111 no-GPU · 113 bad-slot · 115 off-screen · 117 not-resident · 118 dispatch-timeout ·
     # 121 bad-descriptor · 122 reserved-field · 123 envelope-unproven). CAPTURE: klug > shader_ops.txt.
@@ -883,12 +889,26 @@ esac
 # through to the caps probe, which returns 95 on a lit panel — indistinguishable from success.
 # The operator ran the experiment twice, heard silence twice, and none of it was data.
 # burn-prep verified the KERNEL artifact and never looked at the tools it would be flashed with.
-for _t in modeset gpuwedge gputri klug; do
+# ⛔⛔ AND THE LIST MUST CONTAIN THE BURN'S ORACLE. 1.56.23 nearly repeated M9 exactly: the kernel
+# gained op 0x0C, but /bin/gputex — the ONLY tool that exercises it — was absent from this list, and
+# the staged copy was 90 minutes stale (213672 B vs 255424 B, different md5). It had no rung-14 code
+# at all. The run would have printed rung 13's 17 cases, exited 95, and produced ZERO rung-14 data
+# while reading as a clean success. The gate existed, verified four tools, and did not verify the
+# one the burn was for.
+# ⇒ WHEN A CYCLE'S ORACLE IS A NEW OR CHANGED TOOL, ADD IT HERE IN THE SAME BITE. A tool absent from
+# this loop is a tool that can be silently stale, and a stale oracle does not fail — it agrees.
+for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy klug; do
     _src=""
     case "$_t" in
         modeset)  _src="tests/gpu/build/modeset_agnos" ;;
         gpuwedge) _src="tests/gpu/build/gpuwedge_agnos" ;;
         gputri)   _src="tests/gpu/build/gputri_agnos" ;;
+        gputex)   _src="tests/gpu/build/gputex_agnos" ;;    # rungs 13 + 14 oracle
+        gpucov)   _src="tests/gpu/build/gpucov_agnos" ;;
+        gpublend) _src="tests/gpu/build/gpublend_agnos" ;;
+        gpublit)  _src="tests/gpu/build/gpublit_agnos" ;;
+        gpufill)  _src="tests/gpu/build/gpufill_agnos" ;;
+        gpucopy)  _src="tests/gpu/build/gpucopy_agnos" ;;
         klug)    _src="" ;;   # klug is staged from its own repo; size-compare only
     esac
     _staged="build/rootfs/bin/$_t"

@@ -1,0 +1,189 @@
+# doomwall.cyr — RUNG 14's SECOND ORACLE: can a RUN of DOOM columns batch into ONE affine quad?
+#
+# ⛔ THE PLAN SAYS YES. IT IS WRONG, AND THIS MEASURES BY HOW MUCH.
+#
+# Row 14 reads "batches walls as textured quads ... DOOM's texturing is affine per primitive". The
+# second clause is true and the first does not follow from it. `doomcol` proved a SINGLE column is
+# bit-exactly an op 0x0B quad — affine DOWN y. A multi-column quad additionally requires affine
+# ACROSS x, and a DOOM wall is not:
+#
+#     render.cyr:1354   ty_step = fixed_div(FIXED_ONE, col_scale)     <- vertical step is 1/depth
+#     render.cyr:1350   ceil_screen = HALF - fixed_to_int(fixed_div(pn_ceil, depth))
+#
+# depth varies per column along a seg, so ty_step varies as 1/depth — a HYPERBOLA in screen x, not a
+# line. An affine quad interpolates it linearly, which is precisely vanilla's
+# `rw_scale += rw_scalestep`.
+#
+# ⭐ AND cyrius-doom ALREADY REFUTED THAT, IN ITS OWN WORDS (render.cyr:1275):
+#     "That is now REFUTED for this engine: TX-1/TX-2/TX-MASKED replaced exactly that kind of
+#      screen-space interpolation with a per-column world-space ray-cast, because interpolating
+#      between near-clip-corrupted endpoints is what made textures swim (48 texels on walls,
+#      53 on grates)."
+# Batching a seg into one affine quad would re-introduce the defect the engine spent that work
+# removing. This file exists so that is a MEASUREMENT in the record, not an argument from a comment.
+
+include "lib/io.cyr"
+include "texcore.cyr"
+
+var dw_col[512];
+var dw_lut[512];
+var dw_out[8192];               # 64 cols x 64 rows of ARGB
+var dw_ref[8192];
+
+var DW_COLS = 64;
+var DW_ROWS = 64;
+
+fn ph8(v): i64 {
+    var d = 28;
+    while (d >= 0) {
+        var nib = (v >> d) & 0xF;
+        if (nib < 10) { print("0123456789" + nib, 1); }
+        if (nib >= 10) { print("abcdef" + (nib - 10), 1); }
+        d = d - 4;
+    }
+    return 0;
+}
+
+fn dw_build(): i64 {
+    var i = 0;
+    while (i < 64) { store8(&dw_col + i, (i * 11 + 3) & 0xFF); i = i + 1; }
+    var k = 0;
+    while (k < 256) {
+        store32(&dw_lut + k * 4, 0xFF000000 | (((k * 7) & 0xFF) << 16)
+                                            | (((255 - k) & 0xFF) << 8)
+                                            | ((k * 3) & 0xFF));
+        k = k + 1;
+    }
+    return 0;
+}
+
+# depth(x) for a seg running obliquely away from the eye: near at x=0, far at x=DW_COLS.
+# ⚠ The RATIO is what matters, not the units — a seg spanning 1x..4x depth is utterly ordinary in
+# a DOOM level (any corridor wall seen at an angle).
+fn dw_depth(x, near, far): i64 {
+    return near + (far - near) * x / DW_COLS;
+}
+
+# THE TRUTH: per-column, exactly as render.cyr does it — ty_step = 1/scale, scale ~ 1/depth.
+fn dw_reference(near, far): i64 {
+    tx_wrap = 1;
+    var x = 0;
+    while (x < DW_COLS) {
+        var depth = dw_depth(x, near, far);
+        var col_scale = (65536 * 65536) / depth;          # scale = PROJ/depth, fixed 16.16
+        if (col_scale <= 0) { col_scale = 1; }
+        var ty_step = (65536 * 65536) / col_scale;         # = depth/PROJ, the per-column V step
+        var wty = 0;
+        var thf = 64 << 16;
+        var y = 0;
+        while (y < DW_ROWS) {
+            var w = wty % thf;
+            if (w < 0) { w = w + thf; }
+            var idx = load8(&dw_col + (w >>> 16)) & 0xFF;
+            store32(&dw_ref + (y * DW_COLS + x) * 4, load32(&dw_lut + idx * 4) & 0xFFFFFFFF);
+            wty = wty + ty_step;
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+    tx_wrap = 0;
+    return 0;
+}
+
+# THE BATCH ATTEMPT: ONE affine quad across all DW_COLS columns. v is bilinear in (x,y), which is
+# the best an affine frame can do — it matches the per-column step exactly at the two ENDS and
+# interpolates linearly between them. That is `rw_scale += rw_scalestep`.
+fn dw_affine(near, far): i64 {
+    if (tri_prep(0, 0, DW_COLS, 0, 0, DW_ROWS, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF) != 1) { return 0; }
+
+    var step_near = near / 1;                              # ty_step at x=0  (depth/PROJ, PROJ=1)
+    var step_far  = far / 1;                               # ty_step at x=DW_COLS
+    # v(x,y) affine: v = (y - 0.5) * step(x), with step LINEAR in x — the only thing a quad can do.
+    var v00 = 0 - (step_near / 2);                         # x=0,      y=0
+    var v10 = 0 - (step_far / 2);                          # x=COLS,   y=0
+    var v01 = v00 + step_near * DW_ROWS;                   # x=0,      y=ROWS
+    if (tex_prep(0, v00, 0, v10, 0, v01) != 1) { return 0; }
+
+    tx_wrap = 1;
+    var y = 0;
+    while (y < DW_ROWS) {
+        var x = 0;
+        while (x < DW_COLS) {
+            store32(&dw_out + (y * DW_COLS + x) * 4,
+                    tex_ref_px(&dw_col, &dw_lut, 1, 64, x, y, 255, 0xFF000000, 1));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    tx_wrap = 0;
+    return 1;
+}
+
+fn dw_case(label, llen, near, far): i64 {
+    dw_reference(near, far);
+    if (dw_affine(near, far) != 1) {
+        ps("  "); print(label, llen); ps("  REFUSED"); nl(); return 0 - 1;
+    }
+    var bad = 0;
+    var worstcol = 0;
+    var worstn = 0;
+    var x = 0;
+    while (x < DW_COLS) {
+        var cn = 0;
+        var y = 0;
+        while (y < DW_ROWS) {
+            var i = (y * DW_COLS + x) * 4;
+            if ((load32(&dw_ref + i) & 0xFFFFFFFF) != (load32(&dw_out + i) & 0xFFFFFFFF)) {
+                cn = cn + 1; bad = bad + 1;
+            }
+            y = y + 1;
+        }
+        if (cn > worstn) { worstn = cn; worstcol = x; }
+        x = x + 1;
+    }
+    ps("  "); print(label, llen);
+    ps("  "); pn(bad); ps(" of "); pn(DW_COLS * DW_ROWS); ps(" px differ");
+    ps("  (worst column x="); pn(worstcol); ps(": "); pn(worstn); ps("/"); pn(DW_ROWS); ps(")");
+    nl();
+    return bad;
+}
+
+fn main(): i64 {
+    ps("doomwall -- can a RUN of DOOM columns batch into ONE affine quad?"); nl();
+    dw_build();
+
+    ps("depth ratio across the seg -> error from ONE affine quad:"); nl();
+    var e1 = dw_case("  1.0x (wall square to the eye)", 32, 65536, 65536);
+    var e2 = dw_case("  1.5x (gentle oblique)        ", 32, 65536, 98304);
+    var e3 = dw_case("  2.0x (ordinary corridor)     ", 32, 65536, 131072);
+    var e4 = dw_case("  4.0x (sharp oblique)         ", 32, 65536, 262144);
+
+    nl();
+    # ⛔ THE ONLY CASE AN AFFINE QUAD GETS RIGHT IS THE ONE WHERE THERE IS NO PERSPECTIVE.
+    if (e1 != 0) {
+        ps("doomwall: UNEXPECTED — even a constant-depth wall differs. The affine frame or the"); nl();
+        ps("  reference is wrong, not the premise. Fix this before reading the rows above."); nl();
+        return 86;
+    }
+    ps("⭐ A constant-depth wall batches EXACTLY (0 px) — the frame and reference agree, so the"); nl();
+    ps("  rows above measure PERSPECTIVE, not a bug in this test."); nl();
+    nl();
+    if (e2 == 0) {
+        ps("doomwall: a 1.5x depth ratio batched exactly. That contradicts ty_step = 1/depth"); nl();
+        ps("  and needs explaining before rung 14 relies on either result."); nl();
+        return 86;
+    }
+    ps("⛔ VERDICT: a DOOM seg spanning ANY depth range CANNOT be one affine quad."); nl();
+    ps("  ty_step = fixed_div(FIXED_ONE, col_scale) is 1/depth — a hyperbola in screen x. An"); nl();
+    ps("  affine quad interpolates it LINEARLY, which is vanilla's `rw_scale += rw_scalestep`,"); nl();
+    ps("  the very thing cyrius-doom REFUTED at render.cyr:1275 for making textures swim."); nl();
+    nl();
+    ps("⇒ RUNG 14 MUST BATCH BY DISPATCH, NOT BY GEOMETRY. One quad per column stays exact;"); nl();
+    ps("  the cost problem is the 3-dispatch chain per quad, and FULLCOV already cut that to 1."); nl();
+    ps("  The remaining win is FUSING N quads into ONE dispatch — rung 12's carry-forward — not"); nl();
+    ps("  merging them into one primitive."); nl();
+    return 95;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

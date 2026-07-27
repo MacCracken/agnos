@@ -73,13 +73,22 @@ check "no function-local array overruns" $rc
 # with the shipped, iron-proven edge_cov blob, and mutation-tested both ways (a corrupted dword and
 # a deleted one both go red).
 BLOBDRIFT=""
-for sb in edge_setup edge_cov tri_rgba; do
+# ⚠ tex_rgba and tex_list were NOT in this list until rung 14 — the two largest and most
+# intricate blobs in the tree were the two nobody was diffing. Both pass; the gap was in the gate,
+# not the tables.
+for sb in edge_setup edge_cov tri_rgba tex_rgba tex_list; do
     sh "$ROOT/scripts/check/shader-blob.sh" check "$ROOT/kernel/shaders/$sb.s" "$sb" >/tmp/shader-blob-$sb.log 2>&1 \
         || BLOBDRIFT="$BLOBDRIFT$sb "
 done
 test -z "$BLOBDRIFT" && rc=0 || rc=$?
 check "shader blobs match their .s sources" $rc
 [ -z "$BLOBDRIFT" ] || { for sb in $BLOBDRIFT; do cat /tmp/shader-blob-$sb.log; done; }
+
+# tex_list.s is tex_rgba.s's proven body under a new prologue. A copy is only as good as the proof
+# that it IS one: this gate fails the build the moment the two bodies diverge by a single character.
+sh "$ROOT/scripts/check/texl-body-identity.sh" >/tmp/texl-body.log 2>&1; rc=$?
+check "rung 14's shader carries rung 13's body verbatim" $rc
+[ $rc -eq 0 ] || cat /tmp/texl-body.log
 
 # Call arity. cycc WARNS on an argument-count mismatch and builds anyway, so a wrong call ships green.
 # Wired in 2026-07-22 after the 1.56.x audit found gpu_blend_cov_run declared with 12 parameters and
