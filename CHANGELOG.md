@@ -36,6 +36,76 @@ marking its own homework. And the dwords are iron-proven — rung 13 closed at 1
 encoding CLASS, not instruction-for-instruction across every shader. That needs a real `.s` parser,
 which remains a separate sized bite.
 
+### ⭐⭐ RUNG 14 GROUNDING — WRAP addressing, because DOOM tiles and op 0x0B clamped
+
+Reading `cyrius-doom/src/render.cyr` rather than the plan's summary of it surfaced two hard
+requirements. `render_draw_tex_column` holds V as `wty % (th << 16)` with a negative correction —
+**true modulo**. A wall column's V range routinely exceeds the texture height, so clamp-to-edge
+would smear the last row down the whole wall instead of tiling it. (The second requirement, the
+`palette[colormap[light][texel]]` double indirection into an 8bpp framebuffer, IDX8+LUT already
+covers: one LUT per light level.)
+
+`GPU_TEX_FLAG_WRAP` (bit 2) tiles instead of clamping.
+
+⛔ **WRAP requires power-of-two dimensions, and that is a reject rather than a clamp.** A general
+modulo is an integer divide *per pixel*; a power-of-two wrap is one `AND`. Restricting the accepted
+surface to what can be done in one instruction is the same discipline that rejects the even-odd fill
+rule — **the accepted surface stays equal to the proven surface.** DOOM's textures already qualify.
+
+### ⭐⭐⭐ THE DELETED FLOOR-DIVIDE CAME BACK, ON ITS OWN WRITTEN EXPIRY
+
+When the floor-divide was deleted at 1.56.22 the note carried a condition: *"if WRAP addressing is
+ever added, this reasoning EXPIRES."* Rung 14 added WRAP, so it expired, and the code was restored
+— but **only on the wrap path**, so rung 13's ten iron-green cases are byte-for-byte untouched.
+
+⛔ **Restoring it was not enough; it had to be shown load-bearing, and the first attempt failed.**
+A truncate-under-wrap mutation broke **nothing** — because arms W1–W4 call `tex_fetch` directly
+while `tx_floordiv` lives in `tex_uv_at`. The mutation was unfalsifiable by them and said so.
+
+⭐ **The window was then derived rather than guessed:** floor and truncate differ by one 1/65536th
+of a texel, so they select different texels only where `u` straddles a boundary from below — `u` in
+`(−1 ULP, 0)`. Truncate lands on texel 0; floor lands on `tw−1`, the **opposite edge**. New arm W5
+builds a frame placing `u(0,0)` at −1/16 ULP and goes through the interpolated path. With the floor
+in place W5 passes; with truncation it **fails**. The mutation now fires.
+
+⚠ **Not measure-zero in practice, which is why it matters:** in a DOOM wall column `u` is constant
+down the column, so a column landing in that window renders **entirely from the wrong texel**. Rare
+per column, catastrophic when hit.
+
+⚠ The shader's WRAP tail uses `AND (dim−1)`, which handles negative indices correctly on two's
+complement (`−1 & 7 = 7`) — the same far-edge result the CPU floor produces.
+
+Verified: 16/16 gates · blob 442 dwords match source · ABI 57/57 · `texgate` all gates green ·
+`texref` 95 with the truncate-under-wrap mutation firing.
+
+### ⭐⭐⭐ FULLCOV MEASURED — budget 521 → 1057 dispatches/frame, and the coverage pass is the expensive half
+
+```
+shaped   32x32 = 56.3 us    256x256 = 159.1 us
+FULLCOV  32x32 = 27.0 us    256x256 =  62.6 us
+saving 29 us (52%) at 32x32, 96.5 us (61%) at 256x256
+```
+
+**Rung 14's budget doubles: 521 → 1057 dispatches per 35 Hz frame**, with FULLCOV byte-identical to
+the shaped path on all five frames.
+
+⭐ **The decomposition inverts the intuition, and it is the more useful result.** Subtracting the two
+gives the cost of the coverage pair directly:
+
+| rect | texture pass | coverage pair | coverage share |
+|---|---|---|---|
+| 32×32 | 27.0 µs | **29.3 µs** | 52 % |
+| 256×256 | 62.6 µs | **96.5 µs** | 61 % |
+
+The coverage pair costs **more than the texture pass** at both sizes, and its share *grows* with
+rect size. So FULLCOV cuts the **per-pixel slope by 65 %** (1.59 → 0.55 ns/px), not just the
+intercept — the edge rasteriser is per-pixel work, not fixed overhead. That matters for rung 15
+(bilinear), which adds texture work but no coverage work.
+
+⚠ **The pre-registration did not contain the true answer, and that is recorded rather than
+reinterpreted.** It offered "≈2/3 if three equal chains" or "≈1/3 if only one dispatch was skipped".
+Reality: **both were skipped, and the three dispatches are not equal.** 52 % is neither bracket.
+
 ### ⭐⭐⭐ FULLCOV IS CORRECT ON IRON — 5 of 5 byte-identical, 15 of 15 cases green
 
 Skipping both coverage dispatches produces **exactly** what the shaped path produces. `gputri --cov`

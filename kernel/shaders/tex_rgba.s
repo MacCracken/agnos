@@ -270,6 +270,20 @@ L_HAVE_COV:
     v_max_i32       v23, 0, v23
     v_min_i32       v23, s61, v23
 
+    // ⭐ WRAP TAKES A DIFFERENT TAIL, AND SKIPS BOTH CLAMP PREDICATES. Under wrap there is no
+    // saturation: the index is (u >> 16) AND (dim-1), exact because the ABI REFUSES a
+    // non-power-of-two dimension under this flag — a general modulo would be an integer divide per
+    // pixel, so the accepted surface is restricted to what can be done in one instruction.
+    // ⚠ The AND also handles a NEGATIVE index correctly on two's complement: -1 & 7 = 7, the far
+    // edge — exactly what the CPU reference's restored floor-divide exists to produce.
+    s_and_b32       s62, s31, 4
+    s_cmp_eq_u32    s62, 4
+    s_cbranch_scc1  L_U_WRAP
+
+    s_and_b32       s62, s31, 4
+    s_cmp_eq_u32    s62, 4
+    s_cbranch_scc1  L_V_WRAP
+
     // -- predicate: N >= limit => the last texel (guards the u32 quotient against wrapping) --
     v_mov_b32       v16, s18
     v_mov_b32       v17, s19
@@ -281,6 +295,16 @@ L_HAVE_COV:
     v_mov_b32       v18, 0
     v_cmp_lt_i32    vcc, v22, 0
     v_cndmask_b32   v23, v23, v18, vcc
+    s_branch        L_V_TAIL
+
+L_V_WRAP:
+    v_and_b32       v23, s61, v23           // s61 = dim-1, computed just above
+L_V_TAIL:
+    s_branch        L_U_TAIL
+
+L_U_WRAP:
+    v_and_b32       v23, s61, v23           // s61 = dim-1, computed just above
+L_U_TAIL:
     v_mov_b32       v19, v23                // stash tu; the V axis must not touch v19
 
 

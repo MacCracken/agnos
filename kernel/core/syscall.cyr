@@ -1064,7 +1064,18 @@ var GPU_TEX_FLAG_IDX8  = 0x01;       # texture is 8bpp indices + a LUT slot; els
 # be zero; accepting them and ignoring them is how a caller silently gets geometry it did not ask
 # for — the same doctrine as the bidirectional LUT rule.
 var GPU_TEX_FLAG_FULLCOV = 0x02;     # every pixel of the rect is covered; skip both coverage passes
-var GPU_TEX_FLAGS_KNOWN = 0x03;      # anything outside this is REJECTED, never accepted-and-ignored
+
+# ⭐ WRAP — RUNG 14 REQUIRES IT, AND IT IS THE MODE DOOM ACTUALLY USES.
+# cyrius-doom's render_draw_tex_column holds V as `wty % (th << 16)` with a negative correction —
+# TRUE MODULO. A wall column's V range routinely exceeds the texture height, so clamp-to-edge would
+# smear the last row down the whole wall instead of tiling it.
+#
+# ⛔ WRAP REQUIRES POWER-OF-TWO DIMENSIONS, AND THAT IS A REJECT, NOT A CLAMP. A general modulo is
+# an integer divide PER PIXEL; a power-of-two wrap is one AND. Restricting the accepted surface to
+# what can be done cheaply is the same discipline as rejecting the even-odd fill rule: the ACCEPTED
+# surface stays equal to the PROVEN surface. DOOM's textures are power-of-two already.
+var GPU_TEX_FLAG_WRAP  = 0x04;       # tile the texture instead of clamping; dims must be 2^k
+var GPU_TEX_FLAGS_KNOWN = 0x07;      # anything outside this is REJECTED, never accepted-and-ignored
 var GPU_TEX_LUT_ENTRIES = 256;       # a full byte of index; a short LUT is a reject, not a clamp
 
 var GPU_RULE_NONZERO   = 0;
@@ -1273,6 +1284,12 @@ fn gpo_validate_tritex(rec, fbw, fbh) {
     if (th < 1) { return GPO_E_TEXDIM; }
     if (tw > GPU_TEX_MAX_DIM) { return GPO_E_TEXDIM; }
     if (th > GPU_TEX_MAX_DIM) { return GPO_E_TEXDIM; }
+
+    # ⛔ WRAP's power-of-two precondition, checked rather than assumed. `(n & (n-1)) == 0` with n >= 1.
+    if ((flags & GPU_TEX_FLAG_WRAP) != 0) {
+        if ((tw & (tw - 1)) != 0) { return GPO_E_TEXDIM; }
+        if ((th & (th - 1)) != 0) { return GPO_E_TEXDIM; }
+    }
 
     var tid = load32(rec + 8) & 0xFFFFFFFF;
     if (shm_slot_valid(tid) == 0) { return GPO_E_TEXSLOT; }
@@ -2114,7 +2131,7 @@ fn edge_abi_selftest() {
     pass = pass + ea_expect(&d, GPO_E_LUTSLOT, "tex: LUT supplied without IDX8", 30);
     store32(&d + 32, 0);
 
-    store32(&d +  4, 0x04);                       # outside GPU_TEX_FLAGS_KNOWN (0x02 is now FULLCOV)
+    store32(&d +  4, 0x08);                       # outside GPU_TEX_FLAGS_KNOWN (0x02 FULLCOV, 0x04 WRAP)
     pass = pass + ea_expect(&d, GPO_E_RESERVED, "tex: unknown flag bit", 21);
     store32(&d +  4, 0);
 

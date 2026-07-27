@@ -83,9 +83,9 @@ fn tex_uv_at(px, py): i64 {
     var ea = tp_get(TP_A2) - eb - ec;
     var a2 = tp_get(TP_A2);
 
-    # ⚠ The divide TRUNCATES toward zero, and that is deliberate — see tx_floordiv for the proof
-    # that flooring is unobservable under clamp-to-edge. The rounding direction here is therefore
-    # NOT load-bearing; the texel-centre convention in tex_fetch is the thing that is.
+    # ⚠ The rounding direction here is MODE-DEPENDENT — see tx_floordiv. Under clamp it is
+    # unobservable and the plain divide is used; under wrap it selects the opposite edge and the
+    # floor is restored. The texel-centre convention in tex_fetch is load-bearing in both.
     var un = ea * tx_get(TX_U0) + eb * tx_get(TX_U1) + ec * tx_get(TX_U2);
     var vn = ea * tx_get(TX_V0) + eb * tx_get(TX_V1) + ec * tx_get(TX_V2);
     tx_u_out = tx_floordiv(un, a2);
@@ -93,26 +93,40 @@ fn tex_uv_at(px, py): i64 {
     return 0;
 }
 
-# ⛔ PLAIN TRUNCATION, AND THE FLOOR-DIVIDE WAS DELETED ON PROOF, NOT ON TASTE.
+# ⭐ MODE-DEPENDENT ROUNDING, AND THE HISTORY IS THE POINT.
 #
-# This started as a floor-divide, on the reasoning that Cyrius `/` truncates toward zero and a
-# negative numerator would round the wrong way. The falsification pass then refused to let that
-# stand: a truncate-instead-of-floor mutation broke NOTHING, because under CLAMP-TO-EDGE the two
-# are indistinguishable at the output. Floor and truncate differ only for a negative value, they
-# differ by at most one 1/65536th of a texel, and EVERY negative texel index clamps to 0 — so no
-# input exists for which the rendered pixel differs.
+# This began as a floor-divide. The falsification pass killed it: a truncate-instead-of-floor
+# mutation broke NOTHING under clamp-to-edge, because floor and truncate differ only on a negative
+# value and every negative texel index clamps to 0. It was deleted on proof, with the deletion note
+# carrying an explicit expiry — "if WRAP is ever added, this reasoning EXPIRES."
 #
-# Keeping it would have put a branch in the shader's inner loop for behaviour no test could ever
-# reach, and left a permanently dead mutation in the gate. The arc's own rule is that an arm nobody
-# can imagine failing is documentation; the same applies to the code it guards.
-# ⚠ If WRAP addressing is ever added, this reasoning EXPIRES — wrapping makes negative indices
-# observable and the floor-divide becomes load-bearing. Re-derive here, do not assume.
+# ⛔ RUNG 14 ADDED WRAP, SO IT EXPIRED. Under wrap a negative index maps back INTO the texture, and
+# the two roundings then select DIFFERENT texels. The floor is restored, but ONLY on the wrap path:
+# the clamp path keeps the plain divide it was proven with, so rung 13's ten iron-green cases are
+# byte-for-byte untouched.
 fn tx_floordiv(n, d): i64 {
-    return n / d;
+    # ⛔ THE DELETION PROOF EXPIRED, EXACTLY AS THIS COMMENT SAID IT WOULD. Under CLAMP the floor
+    # was unobservable — every negative index clamps to 0 — so it was deleted on proof. Under WRAP a
+    # negative index maps INTO the texture, and floor vs truncate then select DIFFERENT texels:
+    # trunc(-0.5) = 0 wraps to 0, floor(-0.5) = -1 wraps to dim-1, the opposite edge.
+    # ⚠ The clamp path keeps the plain divide it was proven with, so rung 13's ten iron-green cases
+    # are byte-for-byte untouched by this change.
+    if (tx_wrap == 0) { return n / d; }
+    if (tmut_trunc == 1) { return n / d; }      # the mutation the wrap arms must catch
+    var q = n / d;
+    if (n < 0) { if (q * d != n) { q = q - 1; } }
+    return q;
 }
 
-# The addressed fetch, shared by the clamp path and the wrap mutation so both read texels the
-# same way and only the ADDRESSING differs between them.
+# floormod — the result is always in [0, m), matching DOOM's `wty % thf; if (wty < 0) wty += thf`.
+fn tx_floormod(v, m): i64 {
+    var r = v % m;
+    if (r < 0) { r = r + m; }
+    return r;
+}
+
+# The addressed fetch, shared by the clamp and wrap paths so both read texels the same way and only
+# the ADDRESSING differs between them.
 fn tx_fetch_at(tex, lut, tw, off, idx8): i64 {
     if (idx8 == 1) {
         var ix = load8(tex + off) & 0xFF;
@@ -131,8 +145,15 @@ fn tx_fetch_at(tex, lut, tw, off, idx8): i64 {
 # to fail is documentation. Each flag below is a plausible implementation slip — two of them are
 # named in the plan's own failure table — and tex_falsify() requires every one to BREAK the arms.
 var tmut_centre = 0;            # add the +0.5 texel centre the plan warns about
-var tmut_wrap   = 0;            # wrap instead of clamping to edge
 var tmut_lshift = 0;            # use `>>` (LOGICAL) instead of `>>>` on the texel shift
+var tmut_trunc  = 0;            # truncate instead of flooring -- DEAD under clamp, LIVE under wrap
+
+# ⭐ WRAP IS NOW A SHIPPED MODE, NOT A MUTATION — RUNG 14 REQUIRES IT.
+# cyrius-doom's `render_draw_tex_column` holds its V accumulator as `wty % (th << 16)` with a
+# negative correction, i.e. TRUE MODULO. A wall column's V range routinely exceeds the texture
+# height, so clamp-to-edge would smear the last row down the whole wall instead of tiling it.
+# `tx_wrap` selects it; 0 keeps the clamp-to-edge that rungs 13's ten cases are proven against.
+var tx_wrap = 0;
 
 fn tex_fetch(tex, lut, tw, th, u, v, idx8): i64 {
     if (tmut_centre == 1) { u = u + 32768; v = v + 32768; }
@@ -142,10 +163,8 @@ fn tex_fetch(tex, lut, tw, th, u, v, idx8): i64 {
     var tu = u >>> 16;
     var tv = v >>> 16;
     if (tmut_lshift == 1) { tu = u >> 16; tv = v >> 16; }
-    if (tmut_wrap == 1) {
-        tu = tu - (tx_floordiv(tu, tw) * tw);
-        tv = tv - (tx_floordiv(tv, th) * th);
-        return tx_fetch_at(tex, lut, tw, tv * tw + tu, idx8);
+    if (tx_wrap != 0) {
+        return tx_fetch_at(tex, lut, tw, tx_floormod(tv, th) * tw + tx_floormod(tu, tw), idx8);
     }
     if (tu < 0) { tu = 0; }
     if (tv < 0) { tv = 0; }
@@ -294,6 +313,77 @@ fn tex_selftest(tex, lut): i64 {
 }
 
 # ============================================================================================
+# THE WRAP ARMS — what WRAP asserts that CLAMP does not
+# ============================================================================================
+# ⭐ SEPARATE ARMS, NOT A FLAG ON THE CLAMP ONES. Clamp's arms assert saturation; wrap's assert
+# tiling. Running the clamp battery with tx_wrap set would only prove the two differ, which is the
+# falsification, not the specification. These say what wrap must DO.
+fn tex_wrap_selftest(tex, lut): i64 {
+    var fail = 0;
+    var i = 0;
+    while (i < 64) {
+        store32(tex + i * 4, 0xFF000000 | (i << 16) | ((63 - i) << 8) | (i * 3));
+        i = i + 1;
+    }
+
+    # ---- arm W1: one texture beyond the right edge is texel 0 again, not the last texel -----
+    if (tex_fetch(tex, lut, 8, 8, 8 << 16, 0, 0) != (load32(tex) & 0xFFFFFFFF)) {
+        ps("texcore: W1 FAILED -- u = tw did not wrap to texel 0"); nl(); fail = fail + 1;
+    }
+    if (tex_fetch(tex, lut, 8, 8, 9 << 16, 0, 0) != (load32(tex + 4) & 0xFFFFFFFF)) {
+        ps("texcore: W1 FAILED -- u = tw+1 did not wrap to texel 1"); nl(); fail = fail + 1;
+    }
+
+    # ---- arm W2: NEGATIVE u wraps to the FAR edge. This is the arm the restored floor exists
+    # for: truncation would land on texel 0 here, flooring lands on texel tw-1.
+    if (tex_fetch(tex, lut, 8, 8, 0 - 65536, 0, 0) != (load32(tex + 7 * 4) & 0xFFFFFFFF)) {
+        ps("texcore: W2 FAILED -- u = -1 did not wrap to the LAST texel"); nl(); fail = fail + 1;
+    }
+    # ⛔ THE FRACTIONAL NEGATIVE IS THE DISCRIMINATOR. u = -0.5 must floor to -1 and wrap to tw-1;
+    # truncating gives 0, which is the OPPOSITE edge and looks entirely plausible on screen.
+    if (tex_fetch(tex, lut, 8, 8, 0 - 32768, 0, 0) != (load32(tex + 7 * 4) & 0xFFFFFFFF)) {
+        ps("texcore: W2 FAILED -- u = -0.5 truncated instead of flooring"); nl(); fail = fail + 1;
+    }
+
+    # ---- arm W3: v wraps independently of u, and the row stride is honoured ----------------
+    if (tex_fetch(tex, lut, 8, 8, 3 << 16, 8 << 16, 0) != (load32(tex + 3 * 4) & 0xFFFFFFFF)) {
+        ps("texcore: W3 FAILED -- v = th did not wrap to row 0"); nl(); fail = fail + 1;
+    }
+
+    # ---- arm W4: many periods out still lands correctly (no single-subtract assumption) -----
+    if (tex_fetch(tex, lut, 8, 8, 43 << 16, 0, 0) != (load32(tex + 3 * 4) & 0xFFFFFFFF)) {
+        ps("texcore: W4 FAILED -- u = 43 (5 periods + 3) did not wrap to texel 3"); nl();
+        fail = fail + 1;
+    }
+
+    # ---- arm W5: THE INTERPOLATED PATH, in the window where floor and truncate diverge ------
+    # ⛔ W1-W4 call tex_fetch DIRECTLY, so none of them reaches tx_floordiv — which lives in
+    # tex_uv_at. The truncate mutation was therefore unfalsifiable by them, and said so.
+    #
+    # ⭐ THE WINDOW, DERIVED NOT GUESSED: floor and truncate differ by one 1/65536th of a texel, so
+    # they select different texels only when u straddles a texel boundary from below — i.e. u in
+    # (-1 ULP, 0). Truncate lands on texel 0; floor lands on tw-1, the OPPOSITE edge.
+    # ⚠ NOT measure-zero in practice: in a DOOM wall column u is CONSTANT down the column, so a
+    # column landing in this window renders entirely from the wrong texel. Rare per column,
+    # catastrophic when hit — which is exactly why the floor is load-bearing under wrap.
+    #
+    # The frame below puts u(0,0) at -1/16 of a ULP: u0 = -1 texel, u1 = 15 texels minus one ULP,
+    # so u(px=0) = -65536 + (u1 + 65536)/16 lands just below zero.
+    tri_prep(0, 0, 8, 0, 0, 8, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF);
+    if (tex_prep(0 - 65536, 0, (15 << 16) - 1, 0, 0 - 65536, 0) != 1) {
+        ps("texcore: W5 SETUP FAILED -- tex_prep refused the boundary frame"); nl();
+        fail = fail + 1;
+    }
+    var w5 = tex_ref_px(tex, lut, 8, 8, 0, 0, 255, 0xFF000000, 0);
+    var w5want = tri_src_over(load32(tex + 7 * 4) & 0xFFFFFFFF, 0xFF000000);
+    if (w5 != w5want) {
+        ps("texcore: W5 FAILED -- u just below 0 did not floor to the FAR edge (texel 7)"); nl();
+        fail = fail + 1;
+    }
+    return fail;
+}
+
+# ============================================================================================
 # THE FALSIFICATION PASS — every mutation MUST break the selftest
 # ============================================================================================
 # ⛔ WITHOUT THIS, A GREEN SELFTEST MEANS NOTHING. Rung 11's `trimodel` gate was reported as proving
@@ -310,11 +400,41 @@ fn tex_falsify(tex, lut): i64 {
     if (m1 == 0) { ps("   <== DID NOT FIRE"); bad = bad + 1; }
     nl();
 
-    tmut_wrap = 1;
+    # ⚠ WRAP IS NO LONGER A MUTATION, it is a shipped mode — so it is falsified the other way:
+    # selecting it MUST change the arms, because the arms assert clamp-to-edge behaviour.
+    tx_wrap = 1;
     var m2 = tex_selftest(tex, lut);
-    tmut_wrap = 0;
-    ps("  mutation wrap-instead-of-clamp breaks "); pn(m2); ps(" arm(s)");
-    if (m2 == 0) { ps("   <== DID NOT FIRE"); bad = bad + 1; }
+    tx_wrap = 0;
+    ps("  mode WRAP breaks "); pn(m2); ps(" clamp arm(s)");
+    if (m2 == 0) {
+        ps("   <== DID NOT FIRE: wrap and clamp are indistinguishable here, so neither is tested");
+        bad = bad + 1;
+    }
+    nl();
+
+    # ⭐ AND THE RESURRECTED FLOOR-DIVIDE MUST MATTER AGAIN. Under wrap, truncating instead of
+    # flooring selects the OPPOSITE edge for a negative UV. If this does not fire, the wrap arms
+    # never sample a negative coordinate and the restored floor is as untested as it was unneeded.
+    tx_wrap = 1;
+    var wf = tex_wrap_selftest(tex, lut);
+    tx_wrap = 0;
+    ps("  wrap arms: "); pn(wf); ps(" failure(s) with the floor-divide IN PLACE");
+    if (wf != 0) { ps("   <== WRAP IS BROKEN"); bad = bad + 1; }
+    nl();
+
+    # ⛔ AND NOW THE ONE THAT JUSTIFIES RESTORING IT AT ALL. Under clamp this mutation was PROVABLY
+    # dead and the code was deleted for it. If it is still dead under wrap, the floor is once again
+    # unreachable and restoring it was cargo — the arms would have to grow, or the code go back out.
+    tx_wrap = 1;
+    tmut_trunc = 1;
+    var wt = tex_wrap_selftest(tex, lut);
+    tmut_trunc = 0;
+    tx_wrap = 0;
+    ps("  mutation truncate-under-WRAP breaks "); pn(wt); ps(" wrap arm(s)");
+    if (wt == 0) {
+        ps("   <== DID NOT FIRE: the floor is STILL unreachable and should not have been restored");
+        bad = bad + 1;
+    }
     nl();
 
     # ⚠ THIS ONE REPLACED A DEAD MUTATION. It was originally truncate-instead-of-floor, which broke
