@@ -1115,8 +1115,10 @@ var GPO_E_FRAME    = 23;             # op    — frame skew vs the mask rect exc
 # malformed" have different fixes, and the caller cannot tell which from a shared reason.
 var GPO_E_TEXSLOT  = 25;             # op    — texture slot invalid/free/too small for its declared dims
 var GPO_E_TEXDIM   = 26;             # op    — texture w/h is zero or exceeds GPU_TEX_MAX_DIM
-var GPO_E_LUTSLOT  = 27;             # op    — IDX8 without a valid 256-entry LUT slot, or a LUT slot
-                                     #         supplied WITHOUT IDX8 (accepting it would silently ignore it)
+# ⚠ GPO_E_LUTSLOT covers BOTH directions: IDX8 without a valid 256-entry LUT, and a LUT supplied
+# WITHOUT IDX8 — the second because accepting it would silently ignore a slot the caller believes is
+# in use, which is the same failure mode the flags word exists to prevent.
+var GPO_E_LUTSLOT  = 27;             # op    — LUT slot missing, invalid, or supplied when unusable
 var GPO_E_TRILIST  = 24;             # op    — triangle count/slot invalid, or a per-triangle record is
 var GPU_COV_MAX_DIM = 4096;          # per-side mask cap — a REJECT, never a clamp
 # ⭐ THE COORDINATE DOMAIN (B3). 2^28 = 4096 px in 16.16 — the same 4096 as GPU_COV_MAX_DIM, so
