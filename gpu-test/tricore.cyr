@@ -676,3 +676,62 @@ fn tc_corpus_digest(buf, w, h): i64 {
     }
     return acc;
 }
+
+# ============================================================================================
+# RUNG 12 — the batched-triangle reference
+# ============================================================================================
+# ⭐ A TRIANGLE LIST IS COMPOSITED IN SUBMISSION ORDER, one triangle at a time, each src-over'd
+# onto the result of the last. That ordering IS the semantics: triangles overlap, and "all of them
+# at once" is not a defined operation. The reference therefore loops in exactly the order the
+# kernel does, and any divergence in order shows up as a byte difference rather than as a subtle
+# blend error nobody can attribute.
+# ⚠ Caller supplies the triangle table: 9 i64 slots per triangle (6 coords + 3 colours), pixel
+# coordinates, matching the layout the instrument packs into its #86 vertex slot.
+var TL_STRIDE = 9;
+
+fn tl_get(tbl, i, f): i64 { return load64(tbl + (i * TL_STRIDE + f) * 8); }
+
+fn tl_set(tbl, i, f, v): i64 { store64(tbl + (i * TL_STRIDE + f) * 8, v); return 0; }
+
+# Render n triangles from `tbl` into `buf` (w*h ARGB), starting from `bg`.
+fn tl_render(tbl, n, buf, w, h, bg): i64 {
+    var y = 0;
+    while (y < h) {
+        var x = 0;
+        while (x < w) { store32(buf + (y * w + x) * 4, bg); x = x + 1; }
+        y = y + 1;
+    }
+    var i = 0;
+    while (i < n) {
+        if (tri_prep(tl_get(tbl,i,0), tl_get(tbl,i,1), tl_get(tbl,i,2), tl_get(tbl,i,3),
+                     tl_get(tbl,i,4), tl_get(tbl,i,5),
+                     tl_get(tbl,i,6), tl_get(tbl,i,7), tl_get(tbl,i,8)) == 1) {
+            var yy = 0;
+            while (yy < h) {
+                var xx = 0;
+                while (xx < w) {
+                    # ⚠ Coverage here is the triangle's own shape, so a point outside it contributes
+                    # nothing. The reference asks the SAME question the rasteriser does — is this
+                    # pixel centre inside? — rather than trusting the interpolator to clamp it away.
+                    var pcx = (xx << 16) + 32768;
+                    var pcy = (yy << 16) + 32768;
+                    var eb = tp_get(TP_KXB) * pcx + tp_get(TP_KYB) * pcy + tp_get(TP_K0B);
+                    var ec = tp_get(TP_KXC) * pcx + tp_get(TP_KYC) * pcy + tp_get(TP_K0C);
+                    var ea = tp_get(TP_A2) - eb - ec;
+                    var inside = 1;
+                    if (ea < 0) { inside = 0; }
+                    if (eb < 0) { inside = 0; }
+                    if (ec < 0) { inside = 0; }
+                    if (inside == 1) {
+                        var cur = load32(buf + (yy * w + xx) * 4) & 0xFFFFFFFF;
+                        store32(buf + (yy * w + xx) * 4, tri_ref_px(xx, yy, 255, cur));
+                    }
+                    xx = xx + 1;
+                }
+                yy = yy + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}

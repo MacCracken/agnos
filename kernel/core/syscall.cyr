@@ -997,6 +997,17 @@ var GPU_OP_EDGE_COV    = 0x08;       # edge array -> 8bpp coverage mask         
 var GPU_OP_TRI_RGBA    = 0x09;       # barycentric per-vertex RGBA + src-over  (3D arc rung 11)
 var GPU_TRI_FLAG_DERIVE = 0x01;      # synthesise the frame's 3 edges; edge_id and n_edges MUST be 0
 
+# ⭐ RUNG 12 — BATCHED TRIANGLES. N triangles from ONE #86 vertex slot in ONE record, so a mesh is a
+# single syscall, a single validation pass and a single arming check instead of N of each.
+# ⚠ The per-triangle record in the vertex slot is 48 BYTES: 6 x i32 screen-space 16.16 vertices
+# followed by 3 x u32 premultiplied ARGB. Fixed stride so the kernel indexes rather than parses.
+#   +0  vx0 vy0 vx1 vy1 vx2 vy2      (i32, 16.16)
+#   +24 c0  c1  c2                   (u32, premultiplied ARGB)
+#   +36 reserved x3, MUST be zero    -- the extension point, mirroring the #92 record's own rule
+var GPU_OP_TRI_LIST    = 0x0A;       # N triangles from a vertex slot         (3D arc rung 12)
+var GPU_TRI_VTX_BYTES  = 48;         # per-triangle stride in the vertex slot
+var GPU_TRI_LIST_MAX   = 256;        # per-record triangle cap; a reject, never a clamp      # synthesise the frame's 3 edges; edge_id and n_edges MUST be 0
+
 # ⛔ THE AREA BOUNDS ARE 2^16 AND 2^42, NOT THE 2^32 / 2^53 THE PLAN SPECIFIED. Both of the plan's
 # numbers assumed the vertices were lifted to 16.16, which would put 2A at cross << 32. They are
 # not: only the CONSTANT term and 2A carry the << 16, because kx/ky already multiply a 16.16
@@ -1017,7 +1028,7 @@ var GPU_EDGE_BYTES     = 16;         # one edge = x0,y0,x1,y1 as 4x i32 in 16.16
 var GPU_EDGE_MAX       = 256;        # per-op cap; a reject, never a clamp
 # 0x05 channel swap (plan S4) · 0x06 cov-modulated source · 0x07 packed VOP3P blend ·
 # 0x10-0x17 CP-DMA-domain ops (fill/blit/readback, plan S12) · 0x18-0x1F control (barrier/present).
-var GPU_OP_SUPPORTED   = 0x31F;      # bits 0..4 + 8 (EDGE_COV) + 9 (TRI_RGBA) — MUST equal what gpo_validate accepts
+var GPU_OP_SUPPORTED   = 0x71F;      # bits 0..4 + 8 (EDGE_COV) + 9 (TRI_RGBA) + 10 (TRI_LIST) — MUST equal what gpo_validate accepts
 
 # Flags word (+4). NOTHING is accepted here yet, on purpose: a flag that is accepted and ignored is how
 # a caller silently gets behaviour it did not ask for. bit0 SERIALIZE and bit1 CHECK_PREMUL are reserved
@@ -1072,6 +1083,9 @@ var GPO_E_WORK     = 21;             # op    — w*h*n_edges exceeds the measure
 # to the geometry). A shared code cannot tell the caller which.
 var GPO_E_AREA     = 22;             # op    — frame area outside [GPU_TRI_AREA_MIN, _MAX]
 var GPO_E_FRAME    = 23;             # op    — frame skew vs the mask rect exceeds GPU_TRI_E_RATIO
+# ⭐ 1.56.20 rung 12. Its own code because "the batch is malformed" and "one triangle in it is
+# malformed" have different fixes, and the caller cannot tell which from a shared reason.
+var GPO_E_TRILIST  = 24;             # op    — triangle count/slot invalid, or a per-triangle record is
 var GPU_COV_MAX_DIM = 4096;          # per-side mask cap — a REJECT, never a clamp
 # ⭐ THE COORDINATE DOMAIN (B3). 2^28 = 4096 px in 16.16 — the same 4096 as GPU_COV_MAX_DIM, so
 # geometry and mask are bounded consistently.
@@ -1108,6 +1122,9 @@ fn gpo_field_mask(op) {
     # ⭐ dstxy IS defined here, unlike op 0x08. This op writes the back buffer; 0x08 rasterises into
     # a mask slot whose origin is (0,0) and therefore refuses dstxy. Consistent, not contradictory.
     if (op == GPU_OP_TRI_RGBA)    { return 0xFFFB; }   # everything except the reserved dword 2
+    # rung 12: op(0) flags(1) vtx_id(3) wh(4) dstxy(5) n_tris(6). ⚠ The per-triangle geometry lives
+    # in the SLOT, not the record, which is the whole point -- one record, N triangles.
+    if (op == GPU_OP_TRI_LIST)    { return 0x007B; }   # op flags vtx_id wh dstxy n_tris
     # rung 9: op(0) flags(1) dst_id(2) edge_id(3) wh(4) n_edges|rule(9)
     # ⛔ dstxy (dword 5) is NOT defined by this op and must be zero. EDGE_COV does not touch the
     # framebuffer at all -- it rasterises into a mask slot whose origin IS (0,0). Accepting a dstxy
@@ -1157,6 +1174,74 @@ fn gpo_i32(addr) {
 fn gpo_coord_bad(c) {
     if (c > GPU_EDGE_COORD_MAX) { return 1; }
     if (c < 0 - GPU_EDGE_COORD_MAX) { return 1; }
+    return 0;
+}
+
+
+# ============================================================================================
+# gpo_validate_trilist(rec, fbw, fbh) -> 0 or a GPO_E_* reason. RUNG 12's validator.
+# ============================================================================================
+# ⛔ EVERY TRIANGLE IS VALIDATED BEFORE ANY IS DRAWN. A batch that validates lazily would draw the
+# first k triangles and then refuse, leaving the framebuffer in a state neither the caller nor the
+# kernel can describe. Reject-don't-clip is only enforceable if the whole batch is checked first.
+# ⚠ PURE READS on the KERNEL-RESIDENT record and on the slot's kernel VA. Ring 3 cannot change a
+# field between the check and the use.
+fn gpo_validate_trilist(rec, fbw, fbh) {
+    var flags = load32(rec + 4) & 0xFFFFFFFF;
+    if (flags != 0) { return GPO_E_RESERVED; }        # no flags defined for this op yet
+
+    var wh  = load32(rec + 16) & 0xFFFFFFFF;
+    var dxy = load32(rec + 20) & 0xFFFFFFFF;
+    var w = wh & 0xFFFF;
+    var h = (wh >> 16) & 0xFFFF;
+    if (w < 1) { return GPO_E_DIM; }
+    if (h < 1) { return GPO_E_DIM; }
+    if (w * h > GPU_TRI_MAX_PIXELS) { return GPO_E_WORK; }
+    var dx = dxy & 0xFFFF;
+    var dy = (dxy >> 16) & 0xFFFF;
+    if (dx + w > fbw) { return GPO_E_DIM; }
+    if (dy + h > fbh) { return GPO_E_DIM; }
+
+    var nt = load32(rec + 24) & 0xFFFFFFFF;
+    if (nt < 1) { return GPO_E_TRILIST; }
+    if (nt > GPU_TRI_LIST_MAX) { return GPO_E_TRILIST; }
+
+    var vid = load32(rec + 12) & 0xFFFFFFFF;
+    if (shm_slot_valid(vid) == 0) { return GPO_E_TRILIST; }
+    var vslot = vid - 1;
+    if (load64(&shm_size + vslot * 8) < nt * GPU_TRI_VTX_BYTES) { return GPO_E_TRILIST; }
+    var vkva = load64(&shm_kva + vslot * 8);
+    if (vkva == 0) { return GPO_E_TRILIST; }
+
+    # ⚠ The WORK BOUND applies to the WHOLE BATCH, not per triangle. N triangles over the same rect
+    # cost N coverage passes; bounding each one separately would let a 256-triangle batch spend 256x
+    # the watchdog budget with every individual triangle "in range".
+    if (w * h * nt * 3 > GPU_EDGE_WORK_MAX) { return GPO_E_WORK; }
+
+    var i = 0;
+    while (i < nt) {
+        var b = vkva + i * GPU_TRI_VTX_BYTES;
+        # reserved tail MUST be zero -- the same rule the #92 record itself carries, so a future
+        # per-triangle field is a non-breaking extension by construction
+        if ((load32(b + 36) & 0xFFFFFFFF) != 0) { return GPO_E_TRILIST; }
+        if ((load32(b + 40) & 0xFFFFFFFF) != 0) { return GPO_E_TRILIST; }
+        if ((load32(b + 44) & 0xFFFFFFFF) != 0) { return GPO_E_TRILIST; }
+
+        var f = 0;
+        while (f < 6) {
+            if (gpo_coord_bad(gpo_i32(b + f * 4)) == 1) { return GPO_E_COORD; }
+            f = f + 1;
+        }
+        var ax = gpo_i32(b +  0) >>> 16;  var ay = gpo_i32(b +  4) >>> 16;
+        var bx = gpo_i32(b +  8) >>> 16;  var by = gpo_i32(b + 12) >>> 16;
+        var cx = gpo_i32(b + 16) >>> 16;  var cy = gpo_i32(b + 20) >>> 16;
+        var cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+        if (cross < 0) { cross = 0 - cross; }
+        var a2 = cross << 16;
+        if (a2 < GPU_TRI_AREA_MIN) { return GPO_E_AREA; }
+        if (a2 > GPU_TRI_AREA_MAX) { return GPO_E_AREA; }
+        i = i + 1;
+    }
     return 0;
 }
 
@@ -1681,14 +1766,6 @@ fn edge_abi_selftest() {
 
     store32(&eabi_edges + 0, 0);                    # leave the array clean
 
-    # Restore. A selftest that leaves the shm table dirty would hand the next allocation a slot that
-    # LOOKS taken, and the symptom would surface far from here as "shm_create returns -1 under load".
-    var r = 10;
-    while (r < 16) {
-        store64(&shm_phys + r * 8, 0); store64(&shm_mc + r * 8, 0); store64(&shm_size + r * 8, 0);
-        store64(&shm_kva + r * 8, 0);
-        r = r + 1;
-    }
 
     # ======================================================================================
     # op 0x09 TRI_RGBA — rung 11's ABI
@@ -1782,8 +1859,73 @@ fn edge_abi_selftest() {
     store32(&d + 48, 0xFFFF0000); store32(&d + 52, 0xFF00FF00); store32(&d + 56, 0xFF0000FF);
     pass = pass + ea_expect(&d, GPO_E_DIM, "tri: dst runs off the framebuffer", 33);
 
-    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 33 cases correct\n", 21);
-    if (pass == 33) {
+
+    # ======================================================================================
+    # op 0x0A TRI_LIST — rung 12's ABI
+    # ======================================================================================
+    kprint("edge-abi: ---- #92 op 0x0A TRI_LIST ABI battery ----\n", 53);
+
+    # A vertex slot with two well-formed triangles: 2 x 48 B = 96 B, inside id 14's 4096.
+    var vb = &eabi_edges;
+    var vz = 0;
+    while (vz < 24) { store32(vb + vz * 4, 0); vz = vz + 1; }
+    store32(vb +  0, 0);            store32(vb +  4, 0);
+    store32(vb +  8, 64 * 65536);   store32(vb + 12, 0);
+    store32(vb + 16, 0);            store32(vb + 20, 64 * 65536);
+    store32(vb + 24, 0xFFFF0000);   store32(vb + 28, 0xFF00FF00); store32(vb + 32, 0xFF0000FF);
+    store32(vb + 48, 0);            store32(vb + 52, 0);
+    store32(vb + 56, 64 * 65536);   store32(vb + 60, 0);
+    store32(vb + 64, 0);            store32(vb + 68, 64 * 65536);
+    store32(vb + 72, 0xFFFF0000);   store32(vb + 76, 0xFF00FF00); store32(vb + 80, 0xFF0000FF);
+
+    var L1 = 0; while (L1 < 16) { store32(&d + L1 * 4, 0); L1 = L1 + 1; }
+    store32(&d +  0, GPU_OP_TRI_LIST);
+    store32(&d + 12, 14);                       # vtx slot
+    store32(&d + 16, (64 * 65536) + 64);
+    store32(&d + 24, 2);                        # n_tris
+    pass = pass + ea_expect_valid(&d, "list: well-formed 2-triangle batch", 34);
+
+    store32(&d + 24, 0);
+    pass = pass + ea_expect(&d, GPO_E_TRILIST, "list: zero triangles", 20);
+    store32(&d + 24, GPU_TRI_LIST_MAX + 1);
+    pass = pass + ea_expect(&d, GPO_E_TRILIST, "list: triangle count above the cap", 34);
+    store32(&d + 24, 2);
+
+    # ⛔ THE SLOT MUST BE BIG ENOUGH FOR EVERY TRIANGLE. id 15 is 16 B -- room for none.
+    store32(&d + 12, 15);
+    pass = pass + ea_expect(&d, GPO_E_TRILIST, "list: vertex slot too small for n_tris", 38);
+    store32(&d + 12, 14);
+
+    # a reserved per-triangle dword must be zero -- the extension point
+    store32(vb + 36, 1);
+    pass = pass + ea_expect(&d, GPO_E_TRILIST, "list: per-triangle reserved dword non-zero", 42);
+    store32(vb + 36, 0);
+
+    # ⭐ EVERY triangle is checked, not just the first: corrupt the SECOND one only.
+    store32(vb + 56, 0);   store32(vb + 68, 0);        # triangle 1 becomes degenerate
+    pass = pass + ea_expect(&d, GPO_E_AREA, "list: the SECOND triangle is degenerate", 39);
+    store32(vb + 56, 64 * 65536); store32(vb + 68, 64 * 65536);
+
+    # flags are not defined for this op yet
+    store32(&d +  4, 1);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "list: flags must be zero", 24);
+    store32(&d +  4, 0);
+
+    # ⛔ TEARDOWN GOES LAST, AFTER EVERY BATTERY. It used to sit between the 0x08 and 0x0A blocks,
+    # so the 0x0A cases ran against slots that had already been zeroed and a well-formed batch was
+    # rejected with GPO_E_TRILIST -- a REAL reject for an UNREAL reason, which is the worst kind of
+    # red because the code under test was fine.
+    # Restore. A selftest that leaves the shm table dirty would hand the next allocation a slot that
+    # LOOKS taken, and the symptom would surface far from here as "shm_create returns -1 under load".
+    var r = 10;
+    while (r < 16) {
+        store64(&shm_phys + r * 8, 0); store64(&shm_mc + r * 8, 0); store64(&shm_size + r * 8, 0);
+        store64(&shm_kva + r * 8, 0);
+        r = r + 1;
+    }
+
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 40 cases correct\n", 21);
+    if (pass == 40) {
         kprint("edge-abi: PASS -- the 0x08 and 0x09 ABIs reject every malformed record, and\n", 76);
         kprint("edge-abi: a well-formed one is accepted or correctly reports no-GPU.\n", 69);
         return 1;
@@ -1815,6 +1957,7 @@ fn gpo_validate(rec, fbw, fbh) {
     # never reaches the screen.
     if (op == GPU_OP_EDGE_COV) { return gpo_validate_edge(rec); }
     if (op == GPU_OP_TRI_RGBA) { return gpo_validate_tri(rec, fbw, fbh); }
+    if (op == GPU_OP_TRI_LIST) { return gpo_validate_trilist(rec, fbw, fbh); }
 
     var wh  = load32(rec + 16) & 0xFFFFFFFF;
     var dxy = load32(rec + 20) & 0xFFFFFFFF;
@@ -1885,6 +2028,13 @@ fn gpo_execute(rec) {
     # interpolation pass over the mask it produced -- see gpu_tri_rgba.
     # ⚠ With DERIVE the frame's three edges are synthesised kernel-side, so there is no edge slot to
     # resolve; the validator has already refused a record that supplies one alongside the flag.
+    if (op == GPU_OP_TRI_LIST) {
+        var lv = load32(rec + 12) & 0xFFFFFFFF;
+        var lkva = load64(&shm_kva + (lv - 1) * 8);
+        var lnt = load32(rec + 24) & 0xFFFFFFFF;
+        if (gpu_tri_list(lkva, lnt, w, h, dx, dy) != 1) { return GPO_E_DISPATCH; }
+        return 0;
+    }
     if (op == GPU_OP_TRI_RGBA) {
         var tflags = load32(rec + 4) & 0xFFFFFFFF;
         var tedge = 0;

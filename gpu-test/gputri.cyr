@@ -422,6 +422,8 @@ fn tri_attr(): i64 {
     # caller uses anyway.
     var gpu_exact = 0;
     var gpu_ran = 0;
+    var gpu_cmp = 0;                 # cases actually read back and compared
+    var gpu_diff_worst = 0;
     var gi = 0;
     while (gi < TC_N) {
         if (tc_get(gi, 9) == TCF_REJECT) { gi = gi + 1; continue; }
@@ -443,6 +445,11 @@ fn tri_attr(): i64 {
             e = e + 1;
         }
 
+        # ⭐ TILE THE CASES so the eye can judge several at once. All at (0,0) would leave only the
+        # LAST one visible -- that is how burn 1 produced nothing useful to look at.
+        var tx = (gpu_ran % 5) * 72 + 16;
+        var ty = (gpu_ran / 5) * 72 + 16;
+
         var eid = syscall(86, 64 * 16);
         if (eid < 1) { puts("gputri: no GPU here"); return 100; }
         if (syscall(72, eid, &tri_edges, 3 * 16) != 0) { syscall(74, eid); return 90; }
@@ -453,12 +460,23 @@ fn tri_attr(): i64 {
         var pz = 0;
         while (pz < bytes / 8) { store64(&tri_gpu + pz * 8, 0xA5A5A5A5A5A5A5A5); pz = pz + 1; }
 
+        # ⭐ CLEAR THE DESTINATION TO THE REFERENCE'S OWN BACKGROUND FIRST. The reference composites
+        # over 0xFF101010; the real back buffer holds whatever was on screen. Without this the two
+        # sides do not share an input and the comparison can only ever be a REPORT. Filling the rect
+        # with the same colour makes them share it, which is what lets the gate demand ZERO.
+        # #88 = gpu_fill_rect(color, wh, dstxy) -- the rect peer of the whole-surface clear.
+        if (syscall(88, 0xFF101010, (h * 65536) + w, (ty * 65536) + tx) != 0) {
+            puts("  ** fill_rect refused -- destination not cleared, comparison would be invalid");
+            gi = gi + 1; continue;
+        }
+
         var d[64];
         var z = 0;
         while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
         store32(&d +  0, 9);                          # op 0x09 TRI_RGBA
         store32(&d + 12, eid);
         store32(&d + 16, (h * 65536) + w);
+        store32(&d + 20, (ty * 65536) + tx);
         store32(&d + 24, tc_get(gi, 0) << 16); store32(&d + 28, tc_get(gi, 1) << 16);
         store32(&d + 32, tc_get(gi, 2) << 16); store32(&d + 36, tc_get(gi, 3) << 16);
         store32(&d + 40, tc_get(gi, 4) << 16); store32(&d + 44, tc_get(gi, 5) << 16);
@@ -471,9 +489,79 @@ fn tri_attr(): i64 {
             gi = gi + 1; continue;
         }
         gpu_ran = gpu_ran + 1;
+
+        # ---- ⭐ READ THE RENDERED RECT BACK AND COMPARE, BYTE FOR BYTE -------------------
+        # #90 captures the blit back buffer -- the SAME surface the shader just wrote -- before
+        # #84 flips it. That is what turns the eye oracle into a byte oracle.
+        # ⚠ The reference was computed over a black-ish 0xFF101010 destination; the real back
+        # buffer holds whatever was there before. So the comparison is only meaningful where the
+        # shader wrote OPAQUE pixels. Rather than pretend otherwise, this reports the worst
+        # per-channel delta over the OPAQUE pixels and does not gate on zero yet.
+        var rid = syscall(86, bytes);
+        if (rid >= 1) {
+            var qz = 0;
+            while (qz < bytes / 8) { store64(&tri_poison + qz * 8, 0xA5A5A5A5A5A5A5A5); qz = qz + 1; }
+            syscall(72, rid, &tri_poison, bytes);
+            var rb = syscall(90, rid, (h * 65536) + w, (ty * 65536) + tx);
+            if (rb == 0) {
+                if (syscall(73, rid, &tri_poison, bytes) == 0) {
+                    gpu_cmp = gpu_cmp + 1;
+                    var pi = 0;
+                    while (pi < w * h) {
+                        var got = load32(&tri_poison + pi * 4) & 0xFFFFFFFF;
+                        var want = load32(&tri_ref + pi * 4) & 0xFFFFFFFF;
+                        # ⭐ EVERY pixel is comparable now: the destination was cleared to the same
+                        # 0xFF101010 the reference composites over, so both sides share their input.
+                        var ch2 = 0;
+                        while (ch2 < 3) {
+                            var sh2 = ch2 * 8;
+                            var dg = ((got >> sh2) & 0xFF) - ((want >> sh2) & 0xFF);
+                            if (dg < 0) { dg = 0 - dg; }
+                            if (dg > gpu_diff_worst) { gpu_diff_worst = dg; }
+                            ch2 = ch2 + 1;
+                        }
+                        pi = pi + 1;
+                    }
+                }
+            }
+            syscall(74, rid);
+        }
         gi = gi + 1;
     }
     ps("gputri: "); pnum(gpu_ran); ps(" of "); pnum(cases); puts(" cases dispatched to the GPU");
+
+    # ⛔ PRESENT, OR NOTHING IS EVER SEEN. The shader writes the BACK buffer; #84 flips it to
+    # scanout. Without this the pixels are computed correctly and thrown away, which is
+    # indistinguishable from a dead shader by eye — the first burn looked at a blank screen for
+    # exactly this reason.
+    ps("gputri: read back "); pnum(gpu_cmp); ps(" of "); pnum(gpu_ran);
+    ps(" rendered rects; worst per-channel delta vs the reference = "); pnum(gpu_diff_worst); nl();
+    if (gpu_cmp == 0) {
+        puts("gputri: ⛔ NOTHING was read back -- #90 refused every capture. The byte oracle is");
+        puts("gputri:   unavailable, so this run CANNOT claim pixel correctness.");
+        return 87;
+    }
+    if (gpu_cmp != gpu_ran) {
+        puts("gputri: ⛔ some rects were dispatched but never read back -- partial evidence only.");
+        return 87;
+    }
+    # ⛔ THE GATE. Both sides now composite over the same cleared background, so anything but zero
+    # is a real disagreement between the shader and the reference.
+    if (gpu_diff_worst != 0) {
+        ps("gputri: ⛔ PIXELS DIFFER -- worst per-channel delta "); pnum(gpu_diff_worst); nl();
+        puts("gputri:   The ABI and dispatch are fine; the SHADER's arithmetic disagrees with the");
+        puts("gputri:   reference. trimodel proved the algorithm, so suspect the EMISSION.");
+        return 85;
+    }
+    puts("  ⭐ BYTE ORACLE: every rendered pixel matches the reference exactly.");
+
+    var pr = syscall(84);
+    if (pr == 1) { puts("gputri: presented -- the tiles above are ON SCREEN now"); }
+    if (pr != 1) {
+        puts("gputri: ⚠ present returned 0 -- double-buffer not armed, so the render went to a");
+        puts("gputri:   back buffer that is never shown. The dispatch still ran; the EYE oracle");
+        puts("gputri:   is unavailable on this boot.");
+    }
     # ⚠ The dispatch writes the BACK BUFFER, not a readable slot, so there is nothing to compare
     # byte-for-byte from ring 3 yet. What this proves is that every corpus record is ACCEPTED and
     # dispatches without error -- not that the pixels are right. The eye and the next bite's
@@ -574,9 +662,138 @@ fn tri_attr(): i64 {
     puts("");
     puts("");
     puts("gputri: every corpus record ACCEPTED and dispatched; all eight controls fired.");
-    puts("⚠ This proves the ABI, the dispatch and the corpus -- NOT the pixels. The shader");
-    puts("  writes the back buffer, which ring 3 cannot read back, so correctness is settled by");
-    puts("  the eye on this burn and by a read-back path in the next bite.");
+    puts("⭐ PIXELS PROVEN PROGRAMMATICALLY -- every rendered rect read back via #90 and compared");
+    puts("  byte for byte against the reference, over a destination both sides cleared to the same");
+    puts("  colour. The screen is now a convenience, not the oracle.");
+    return 95;
+}
+
+
+# ============================================================================================
+# --list : RUNG 12, N triangles from ONE #86 vertex slot in ONE record
+# ============================================================================================
+# ⛔ THE POINT IS THAT OVERLAP IS ORDERED. A triangle list is composited in submission order, each
+# src-over'd onto the last. A mesh whose triangles do not overlap would pass even if the kernel
+# drew them in reverse, so the corpus below DELIBERATELY overlaps them — that is the only way the
+# ordering is under test at all.
+var tl_tbl[288];                # 32 triangles x 9 slots x 8 B
+var tl_vtx[288];                # the packed 48-byte-per-triangle slot image
+
+fn tl_build(): i64 {
+    # 6 overlapping triangles, deliberately stacked so later ones cover earlier ones.
+    tl_set(&tl_tbl, 0,0,  2); tl_set(&tl_tbl, 0,1,  2); tl_set(&tl_tbl, 0,2, 60);
+    tl_set(&tl_tbl, 0,3,  2); tl_set(&tl_tbl, 0,4,  2); tl_set(&tl_tbl, 0,5, 60);
+    tl_set(&tl_tbl, 0,6, 0xFFFF0000); tl_set(&tl_tbl, 0,7, 0xFF00FF00); tl_set(&tl_tbl, 0,8, 0xFF0000FF);
+
+    tl_set(&tl_tbl, 1,0, 60); tl_set(&tl_tbl, 1,1,  2); tl_set(&tl_tbl, 1,2, 60);
+    tl_set(&tl_tbl, 1,3, 60); tl_set(&tl_tbl, 1,4,  2); tl_set(&tl_tbl, 1,5, 60);
+    tl_set(&tl_tbl, 1,6, 0xFF00FFFF); tl_set(&tl_tbl, 1,7, 0xFFFFFF00); tl_set(&tl_tbl, 1,8, 0xFFFF00FF);
+
+    tl_set(&tl_tbl, 2,0, 16); tl_set(&tl_tbl, 2,1, 16); tl_set(&tl_tbl, 2,2, 48);
+    tl_set(&tl_tbl, 2,3, 16); tl_set(&tl_tbl, 2,4, 32); tl_set(&tl_tbl, 2,5, 48);
+    tl_set(&tl_tbl, 2,6, 0xFFFFFFFF); tl_set(&tl_tbl, 2,7, 0xFF808080); tl_set(&tl_tbl, 2,8, 0xFF404040);
+
+    tl_set(&tl_tbl, 3,0,  8); tl_set(&tl_tbl, 3,1, 40); tl_set(&tl_tbl, 3,2, 40);
+    tl_set(&tl_tbl, 3,3, 40); tl_set(&tl_tbl, 3,4,  8); tl_set(&tl_tbl, 3,5, 56);
+    tl_set(&tl_tbl, 3,6, 0xFF804020); tl_set(&tl_tbl, 3,7, 0xFF208040); tl_set(&tl_tbl, 3,8, 0xFF402080);
+
+    tl_set(&tl_tbl, 4,0, 24); tl_set(&tl_tbl, 4,1,  4); tl_set(&tl_tbl, 4,2, 56);
+    tl_set(&tl_tbl, 4,3, 24); tl_set(&tl_tbl, 4,4, 24); tl_set(&tl_tbl, 4,5, 40);
+    tl_set(&tl_tbl, 4,6, 0xFF00FF80); tl_set(&tl_tbl, 4,7, 0xFF8000FF); tl_set(&tl_tbl, 4,8, 0xFFFF8000);
+
+    tl_set(&tl_tbl, 5,0,  4); tl_set(&tl_tbl, 5,1, 48); tl_set(&tl_tbl, 5,2, 36);
+    tl_set(&tl_tbl, 5,3, 48); tl_set(&tl_tbl, 5,4,  4); tl_set(&tl_tbl, 5,5, 60);
+    tl_set(&tl_tbl, 5,6, 0xFF102030); tl_set(&tl_tbl, 5,7, 0xFF304010); tl_set(&tl_tbl, 5,8, 0xFF203040);
+    return 6;
+}
+
+# Pack the table into the 48-byte-per-triangle slot image the kernel indexes.
+fn tl_pack(n): i64 {
+    var i = 0;
+    while (i < n) {
+        var b = &tl_vtx + i * 48;
+        var f = 0;
+        while (f < 6) { store32(b + f * 4, tl_get(&tl_tbl, i, f) << 16); f = f + 1; }
+        store32(b + 24, tl_get(&tl_tbl, i, 6));
+        store32(b + 28, tl_get(&tl_tbl, i, 7));
+        store32(b + 32, tl_get(&tl_tbl, i, 8));
+        store32(b + 36, 0); store32(b + 40, 0); store32(b + 44, 0);   # reserved tail MUST be zero
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn tri_list(): i64 {
+    var w = 64;
+    var h = 64;
+    var bytes = w * h * 4;
+    var n = tl_build();
+    tl_pack(n);
+
+    ps("gputri: RUNG 12 -- "); pnum(n); puts(" OVERLAPPING triangles from ONE vertex slot, ONE record");
+
+    tl_render(&tl_tbl, n, &tri_ref, w, h, 0xFF101010);
+    ps("gputri: reference digest "); phex8(digest(&tri_ref, bytes)); nl();
+
+    var vid = syscall(86, 48 * 32);
+    if (vid < 1) { puts("gputri: no GPU here"); return 100; }
+    if (syscall(72, vid, &tl_vtx, n * 48) != 0) { syscall(74, vid); return 90; }
+
+    if (syscall(88, 0xFF101010, (h * 65536) + w, 16 * 65536 + 16) != 0) {
+        syscall(74, vid); puts("gputri: fill_rect refused"); return 90;
+    }
+
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 10);                         # op 0x0A TRI_LIST
+    store32(&d + 12, vid);
+    store32(&d + 16, (h * 65536) + w);
+    store32(&d + 20, (16 * 65536) + 16);
+    store32(&d + 24, n);
+    var rc = syscall(92, &d, 64);
+    if (rc != 0) {
+        syscall(74, vid);
+        ps("gputri: op 0x0A REJECTED, reason "); pnum((0 - rc) & 0xFF); nl();
+        return tri_report((0 - rc) & 0xFF);
+    }
+
+    var rid = syscall(86, bytes);
+    if (rid < 1) { syscall(74, vid); return 90; }
+    var qz = 0;
+    while (qz < bytes / 8) { store64(&tri_poison + qz * 8, 0xA5A5A5A5A5A5A5A5); qz = qz + 1; }
+    syscall(72, rid, &tri_poison, bytes);
+    var rb = syscall(90, rid, (h * 65536) + w, (16 * 65536) + 16);
+    if (rb != 0) { syscall(74, vid); syscall(74, rid); puts("gputri: #90 capture refused"); return 87; }
+    if (syscall(73, rid, &tri_poison, bytes) != 0) { syscall(74, vid); syscall(74, rid); return 90; }
+    syscall(74, vid); syscall(74, rid);
+
+    var worst = 0;
+    var bad = 0;
+    var pi = 0;
+    while (pi < w * h) {
+        var got = load32(&tri_poison + pi * 4) & 0xFFFFFFFF;
+        var want = load32(&tri_ref + pi * 4) & 0xFFFFFFFF;
+        if (got != want) { bad = bad + 1; }
+        var c2 = 0;
+        while (c2 < 3) {
+            var dg = ((got >> (c2 * 8)) & 0xFF) - ((want >> (c2 * 8)) & 0xFF);
+            if (dg < 0) { dg = 0 - dg; }
+            if (dg > worst) { worst = dg; }
+            c2 = c2 + 1;
+        }
+        pi = pi + 1;
+    }
+    syscall(84);
+    ps("gputri: gpu digest "); phex8(digest(&tri_poison, bytes));
+    ps("  differing px "); pnum(bad); ps("  worst delta "); pnum(worst); nl();
+    if (bad != 0) {
+        puts("gputri: ⛔ the batch does NOT match the reference. Overlap ORDER is the first suspect:");
+        puts("gputri:   a list is composited in submission order, so drawing it in any other order");
+        puts("gputri:   changes every pixel where two triangles meet.");
+        return 85;
+    }
+    puts("gputri: ⭐ RUNG 12 -- the batch is byte-identical to the reference, overlap order included.");
     return 95;
 }
 
@@ -1240,12 +1457,13 @@ fn main(): i64 {
             puts("gputri: RUNG 11 -- barycentric RGBA via #92 op 0x09");
             return tri_attr();
         }
+        if (streq(a, "--list") == 1) { return tri_list(); }
         if (streq(a, "--digest") == 1) { return tri_digest(); }
         if (streq(a, "--bench") == 1) { return tri_bench(); }
         # An unknown argument is an ERROR, never a default action -- the typo that cost the M9
         # arc a flash on 2026-07-24 is exactly this failure mode.
         puts("gputri: UNKNOWN ARGUMENT -- nothing was done.");
-        puts("gputri: --cov --tri --digest --bench");
+        puts("gputri: --cov --tri --list --digest --bench");
         return 84;
     }
     puts("gputri -- RUNG 9b, the edge rasteriser's instrument");

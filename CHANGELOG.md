@@ -3,6 +3,57 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.20] - 2026-07-26
+
+**Rung 11 closed on iron; the byte oracle opens (open cycle).** 1.56.19 shipped attribute
+interpolation and it was validated on archaemenid across two burns. This cycle turns the eye oracle
+into a programmatic one. Bumped on cycle open; the user tags on close.
+
+### ⭐⭐⭐ RUNG 11 VALIDATED ON IRON — AGNOS INTERPOLATES COLOUR ON A GPU IT DRIVES ITSELF
+
+**Burn 1** (`--cov` 20/20 + `--tri` exit 95). Every corpus record accepted, every dispatch retired,
+all eight controls fired, and ⭐ **`N16 = 0x8aed72de` on iron matched the host exactly** — the one
+check that catches an `--agnos` codegen divergence moving the reference and the comparison in
+lockstep. `--cov` staying 20/20 also cleared the real regression risk: the edge prep table moved
+`0xD0000 → 0xA8000` this cycle to escape the batched-frame snapshot it had shipped inside.
+
+⛔ **Burn 1's eye oracle did not exist, and that was a harness defect, not a shader result.** The
+operator was asked to watch the screen and nothing appeared. `gputri` called syscalls
+72/73/74/86/92/95 and **never 84 — present**. The shader writes the BACK buffer; `#84` flips it to
+scanout. The pixels were computed and discarded, which is indistinguishable from a dead shader by
+eye. **A blank screen was the expected output of a correct run.**
+⚠ **The general lesson:** an oracle that says "look at the screen" must itself be checked to be able
+to change the screen — the same calibration every negative control gets. This one never had it.
+
+**Burn 2** (instrument only, no kernel change): `syscall(84)` after the corpus loop, and the cases
+tiled 5-across at 72 px pitch instead of stacking on (0,0) where only the last would show.
+
+⭐ **RESULT: a triangle with red, green and blue corners blending smoothly across it**, rendered by
+a hand-authored gfx90c shader on hardware AGNOS drives with no AMD driver, no ROCm and no LLVM at
+runtime. Rotation invariance is visible to the eye — two cases render identically, matching their
+shared digest `0x4cdd2ec5`. The flat control renders solid, as a control must.
+
+⚠ **Most tiles look near-flat and that is the CORPUS, not the shader.** The frames are 256 units
+while the render window is 64×64, so only the top-left corner is sampled — vertex A still holds
+**51 %** of the weight at (63,63). The one case whose frame fits inside its window shows the full
+colour range. Derived, not eyeballed.
+
+**Ten of eleven bites cost zero flashes.** Two burns total, the second only because of the missing
+present.
+
+### Added — the byte oracle: `#90` capture wired into `--tri`
+
+`gputri --tri` now captures each rendered rect with `gpu_readback_shm#90` and compares it against
+the reference pixel by pixel, reporting the worst per-channel delta. `#90` reads the blit back
+buffer — the same surface the shader wrote — **before** `#84` flips it, which is exactly the
+property this needs.
+
+⚠ **It reports, it does not yet gate at zero, and the reason is stated rather than hidden:** the
+reference is computed over a synthetic `0xFF101010` destination while the real back buffer holds
+whatever was on screen, so only opaque reference pixels are comparable. Gating at zero would demand
+agreement the two inputs cannot have. Deciding the destination contract is the next bite; this
+lands the mechanism and the measurement.
+
 ## [1.56.19] - 2026-07-25
 
 **Post-rung-10 cleanup (open cycle).** 1.56.18 closed with rung 9b iron-validated at 20/20 across

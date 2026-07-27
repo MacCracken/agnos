@@ -6,7 +6,7 @@ type: state
 
 # AGNOS — Live State
 
-> **Last refresh**: 2026-07-23 · kernel head **1.56.8** · **▶ ACTIVE — 1.56.x GPU (the one open GPU release; there is no 1.57/1.58/1.59).** Full plan + reference:
+> **Last refresh**: 2026-07-26 · kernel head **1.56.8** · **▶ ACTIVE — 1.56.x GPU (the one open GPU release; there is no 1.57/1.58/1.59).** Full plan + reference:
 [`docs/development/planning/gpu.md`](planning/gpu.md) — the single GPU document. **DONE and shipped:**
 (1) **the ring-3 GPU band has consumers** — aethersafha composites on the GPU (opaque via `#87`, translucent
 via `#92` op 0x01 premultiplied src-over), unblocked by setu 0.6.0/0.7.0 asking `shm_create_gpu` #86 (the
@@ -38,9 +38,9 @@ five burns 2026-07-22, then code+flag DELETED — see [[feedback_dlane_five_burn
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.56.19** | [`VERSION`](../../VERSION) |
+| **Kernel** | **1.56.20** | [`VERSION`](../../VERSION) |
 | **Cyrius toolchain pin** | **6.2.36** | `cyrius.cyml [package].cyrius` |
-| **Released** | 2026-07-22 | [`CHANGELOG.md`](../../CHANGELOG.md) |
+| **Released** | 2026-07-26 | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | **Iron-validated** | 2026-05-25 (archaemenid NUC AMD — **MVP gate green since Attempt 68 / 1.30.9**; **1.32.x networking arc iron-COMPLETE**: r8169 unicast-RX solved at 1.32.7 + DHCP real lease `.142` iron-verified at 1.32.9; storage trio + GPT + ext4 + shell byte-clean). The 1.33.x ext2/4-WRITE + 1.34.x FAT-family arcs are QEMU/`fsck`-validated; their final-bite iron burns stay user-driven (pending). | NUC AMD Attempts 68 (MVP gate) + 71-77 (FB) + 80-91 (storage arc) + 92+ (networking arc — DHCP iron-verified 1.32.9) |
 
 ## Open investigations

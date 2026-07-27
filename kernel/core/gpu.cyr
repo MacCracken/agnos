@@ -3765,6 +3765,49 @@ fn gpu_tri_dispatch(rec_phys, w, h, dx, dy) {
     return gpu_blend_cov_run(shader_mc, rec_mc, dst_mc, pitch, 0, w, h, r1, gx, gy, done_mc, done_phys);
 }
 
+
+# gpu_tri_list — draw N triangles from one vertex slot into one destination rect.
+#
+# ⭐ THE BATCH WIN IS AT THE ABI AND THE VALIDATOR, NOT YET AT THE DISPATCH. One record, one
+# validation pass over the whole batch, one arming check, one present. The per-triangle loop below
+# still issues a coverage pass and an interpolation pass each, which is honest: fusing N triangles
+# into a single dispatch needs the shader to walk a triangle list, and that is a separate change.
+# Stated here rather than implied so nobody reads "batched" as "one dispatch" before it is.
+#
+# ⛔ THE WHOLE BATCH IS VALIDATED BEFORE THIS RUNS. gpo_validate_trilist checks every triangle, so a
+# mid-batch refusal is impossible and the framebuffer can never be left half-drawn by a reject.
+# ⚠ Caller owns bounds checking. Returns 1 / 0.
+fn gpu_tri_list(vtx_kva, n_tris, w, h, dx, dy) {
+    if (gpu_tri_arm() != 1) { return 0; }
+    if (gpu_cov_arm() != 1) { return 0; }
+
+    var i = 0;
+    while (i < n_tris) {
+        var b = vtx_kva + i * GPU_TRI_VTX_BYTES;
+        var vx0 = gpo_i32(b +  0); var vy0 = gpo_i32(b +  4);
+        var vx1 = gpo_i32(b +  8); var vy1 = gpo_i32(b + 12);
+        var vx2 = gpo_i32(b + 16); var vy2 = gpo_i32(b + 20);
+        var ca  = load32(b + 24) & 0xFFFFFFFF;
+        var cb  = load32(b + 28) & 0xFFFFFFFF;
+        var cc  = load32(b + 32) & 0xFFFFFFFF;
+
+        # ⚠ The frame's own three edges are the coverage shape here — a triangle list is a list of
+        # triangles, so shape and attribute frame coincide. That is a SPECIAL CASE of op 0x09's
+        # decoupling, not a contradiction of it.
+        var e = gpu_arena_phys + GPU_TRI_EDGE_SUBOFF;
+        store32(e +  0, vx0); store32(e +  4, vy0); store32(e +  8, vx1); store32(e + 12, vy1);
+        store32(e + 16, vx1); store32(e + 20, vy1); store32(e + 24, vx2); store32(e + 28, vy2);
+        store32(e + 32, vx2); store32(e + 36, vy2); store32(e + 40, vx0); store32(e + 44, vy0);
+        gpu_mfence();
+
+        var edge_mc = gpu_arena_mc + GPU_TRI_EDGE_SUBOFF;
+        if (gpu_tri_rgba(edge_mc, w, h, dx, dy, 3, GPU_RULE_NONZERO,
+        vx0, vy0, vx1, vy1, vx2, vy2, ca, cb, cc) != 1) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
 # gpu_tri_rgba — the attribute-interpolation worker. Coverage first (the shipped edge rasteriser,
 # UNCHANGED), then the interpolation pass over the mask it produced.
 #
