@@ -694,7 +694,12 @@ fn tl_get(tbl, i, f): i64 { return load64(tbl + (i * TL_STRIDE + f) * 8); }
 fn tl_set(tbl, i, f, v): i64 { store64(tbl + (i * TL_STRIDE + f) * 8, v); return 0; }
 
 # Render n triangles from `tbl` into `buf` (w*h ARGB), starting from `bg`.
-fn tl_render(tbl, n, buf, w, h, bg): i64 {
+# ⛔ covfn is a CALLBACK-BY-BUFFER, not an assumption. The caller captures each triangle's real
+# coverage mask from the rasteriser and hands it in; a binary inside/outside test at the pixel centre
+# would disagree with the GPU on every ANTIALIASED EDGE PIXEL, which is most of a small triangle's
+# perimeter. That mismatch — reference assuming full coverage, GPU applying partial — is what made
+# the first batched burn report 3186 differing pixels with a correct shader.
+fn tl_render_cov(tbl, n, buf, covs, w, h, bg): i64 {
     var y = 0;
     while (y < h) {
         var x = 0;
@@ -713,18 +718,11 @@ fn tl_render(tbl, n, buf, w, h, bg): i64 {
                     # ⚠ Coverage here is the triangle's own shape, so a point outside it contributes
                     # nothing. The reference asks the SAME question the rasteriser does — is this
                     # pixel centre inside? — rather than trusting the interpolator to clamp it away.
-                    var pcx = (xx << 16) + 32768;
-                    var pcy = (yy << 16) + 32768;
-                    var eb = tp_get(TP_KXB) * pcx + tp_get(TP_KYB) * pcy + tp_get(TP_K0B);
-                    var ec = tp_get(TP_KXC) * pcx + tp_get(TP_KYC) * pcy + tp_get(TP_K0C);
-                    var ea = tp_get(TP_A2) - eb - ec;
-                    var inside = 1;
-                    if (ea < 0) { inside = 0; }
-                    if (eb < 0) { inside = 0; }
-                    if (ec < 0) { inside = 0; }
-                    if (inside == 1) {
+                    # coverage for THIS triangle at THIS pixel, as the rasteriser computed it
+                    var cvv = load8(covs + i * w * h + yy * w + xx) & 0xFF;
+                    if (cvv != 0) {
                         var cur = load32(buf + (yy * w + xx) * 4) & 0xFFFFFFFF;
-                        store32(buf + (yy * w + xx) * 4, tri_ref_px(xx, yy, 255, cur));
+                        store32(buf + (yy * w + xx) * 4, tri_ref_px(xx, yy, cvv, cur));
                     }
                     xx = xx + 1;
                 }

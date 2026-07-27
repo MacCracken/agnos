@@ -342,7 +342,12 @@ var tri_rowspan = 0;
 
 # Fill a buffer with the REFERENCE answer for one corpus case, and measure the two properties the
 # controls gate on: how many distinct values it contains, and how far it varies along one row.
-fn tri_ref_fill(buf, w, h): i64 {
+# ⛔ THE COVERAGE MUST COME FROM THE RASTERISER, NOT BE ASSUMED. The first version passed 255 for
+# every pixel, so the reference painted the whole rect while the GPU painted only inside the shape
+# and left the fill colour outside. That is not a shader disagreement, it is two different questions
+# — and it cost a burn. `covbuf` is the mask op 0x08 actually produced, read back from its slot, so
+# both sides now consume the SAME coverage as well as the same destination.
+fn tri_ref_fill(buf, covbuf, w, h): i64 {
     var seen[256];
     var z = 0;
     while (z < 256) { store8(&seen + z, 0); z = z + 1; }
@@ -356,7 +361,9 @@ fn tri_ref_fill(buf, w, h): i64 {
     while (y < h) {
         var x = 0;
         while (x < w) {
-            var v = tri_ref_px(x, y, 255, 0xFF101010);
+            var cvv = load8(covbuf + y * w + x) & 0xFF;
+            var v = 0xFF101010;
+            if (cvv != 0) { v = tri_ref_px(x, y, cvv, 0xFF101010); }
             store32(buf + (y * w + x) * 4, v);
             var g = (v >> 8) & 0xFF;                    # sample ONE channel for the floors
             if (load8(&seen + g) == 0) {
@@ -373,6 +380,42 @@ fn tri_ref_fill(buf, w, h): i64 {
     }
     if (rowmax >= rowmin) { tri_rowspan = rowmax - rowmin; }
     return 0;
+}
+
+# tri_cov_capture — run op 0x08 over a triangle's own three edges and read the mask back.
+# ⭐ This is the SAME rasteriser op 0x09 runs internally; capturing it here is what lets the
+# reference be fed the identical input rather than a guess at it.
+fn tri_cov_capture(ax, ay, bx, by, cx, cy, w, h, out): i64 {
+    store32(&tri_edges +  0, ax << 16); store32(&tri_edges +  4, ay << 16);
+    store32(&tri_edges +  8, bx << 16); store32(&tri_edges + 12, by << 16);
+    store32(&tri_edges + 16, bx << 16); store32(&tri_edges + 20, by << 16);
+    store32(&tri_edges + 24, cx << 16); store32(&tri_edges + 28, cy << 16);
+    store32(&tri_edges + 32, cx << 16); store32(&tri_edges + 36, cy << 16);
+    store32(&tri_edges + 40, ax << 16); store32(&tri_edges + 44, ay << 16);
+
+    var eid = syscall(86, 64 * 16);
+    if (eid < 1) { return 0; }
+    var mid = syscall(86, w * h);
+    if (mid < 1) { syscall(74, eid); return 0; }
+    if (syscall(72, eid, &tri_edges, 3 * 16) != 0) { syscall(74, eid); syscall(74, mid); return 0; }
+    var pz = 0;
+    while (pz < w * h / 8) { store64(out + pz * 8, 0); pz = pz + 1; }
+    syscall(72, mid, out, w * h);
+
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 8);                    # op 0x08 EDGE_COV
+    store32(&d +  8, mid);
+    store32(&d + 12, eid);
+    store32(&d + 16, (h * 65536) + w);
+    store32(&d + 36, 3);
+    var rc = syscall(92, &d, 64);
+    if (rc != 0) { syscall(74, eid); syscall(74, mid); return 0; }
+    var ok = 1;
+    if (syscall(73, mid, out, w * h) != 0) { ok = 0; }
+    syscall(74, eid); syscall(74, mid);
+    return ok;
 }
 
 fn tri_attr(): i64 {
@@ -397,7 +440,12 @@ fn tri_attr(): i64 {
             i = i + 1; continue;
         }
         cases = cases + 1;
-        tri_ref_fill(&tri_ref, w, h);
+        if (tri_cov_capture(tc_get(i,0), tc_get(i,1), tc_get(i,2), tc_get(i,3),
+                            tc_get(i,4), tc_get(i,5), w, h, &bg) == 0) {
+            puts("  ** coverage capture failed -- the reference cannot be fed the GPU's input");
+            return 87;
+        }
+        tri_ref_fill(&tri_ref, &bg, w, h);
         if (tri_ndistinct >= 64) { n_multi = n_multi + 1; }
         if (tri_rowspan >= 32) { n_xvary = n_xvary + 1; }
 
@@ -431,7 +479,12 @@ fn tri_attr(): i64 {
                      tc_get(gi,4), tc_get(gi,5), tc_get(gi,6), tc_get(gi,7), tc_get(gi,8)) != 1) {
             gi = gi + 1; continue;
         }
-        tri_ref_fill(&tri_ref, w, h);
+        if (tri_cov_capture(tc_get(i,0), tc_get(i,1), tc_get(i,2), tc_get(i,3),
+                            tc_get(i,4), tc_get(i,5), w, h, &bg) == 0) {
+            puts("  ** coverage capture failed -- the reference cannot be fed the GPU's input");
+            return 87;
+        }
+        tri_ref_fill(&tri_ref, &bg, w, h);
 
         # the frame's three edges, 16.16, as the coverage shape
         var e = 0;
@@ -678,6 +731,9 @@ fn tri_attr(): i64 {
 # ordering is under test at all.
 var tl_tbl[288];                # 32 triangles x 9 slots x 8 B
 var tl_vtx[288];                # the packed 48-byte-per-triangle slot image
+# 6 triangles x 64*64 coverage bytes = 24576 B. ⚠ Module-scope var X[N] here is N x u64 (measured),
+# so 3072 slots = 24576 bytes exactly.
+var tl_covs[3072];
 
 fn tl_build(): i64 {
     # 6 overlapping triangles, deliberately stacked so later ones cover earlier ones.
@@ -732,7 +788,19 @@ fn tri_list(): i64 {
 
     ps("gputri: RUNG 12 -- "); pnum(n); puts(" OVERLAPPING triangles from ONE vertex slot, ONE record");
 
-    tl_render(&tl_tbl, n, &tri_ref, w, h, 0xFF101010);
+    # Capture EVERY triangle's coverage first, into one packed w*h-per-triangle buffer, so the
+    # reference composites the same masks the GPU will.
+    var ci = 0;
+    while (ci < n) {
+        if (tri_cov_capture(tl_get(&tl_tbl,ci,0), tl_get(&tl_tbl,ci,1), tl_get(&tl_tbl,ci,2),
+                            tl_get(&tl_tbl,ci,3), tl_get(&tl_tbl,ci,4), tl_get(&tl_tbl,ci,5),
+                            w, h, &tl_covs + ci * w * h) == 0) {
+            puts("gputri: coverage capture failed -- the reference cannot be fed the GPU's input");
+            return 87;
+        }
+        ci = ci + 1;
+    }
+    tl_render_cov(&tl_tbl, n, &tri_ref, &tl_covs, w, h, 0xFF101010);
     ps("gputri: reference digest "); phex8(digest(&tri_ref, bytes)); nl();
 
     var vid = syscall(86, 48 * 32);
