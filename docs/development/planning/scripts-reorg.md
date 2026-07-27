@@ -74,6 +74,27 @@ grep -rn --exclude-dir=.git -E "scripts/[a-z0-9-]+\.(sh|py)|tests/gpu/" \
 and check every hit that is a *path used at runtime*, not merely mentioned. `install-media.sh`
 reaches into `../agnos/` in several places and is the highest-consequence consumer.
 
+## The three categories a path move breaks — all three bit, in order
+
+Recorded because only the first is what "sweep the references" makes you think about:
+
+1. **References TO a script** — `sh scripts/foo.sh` in docs, CI, other scripts.
+   Found by grep. This is the easy one and it is the one everybody plans for.
+2. **Paths computed INSIDE a script** — `ROOT="$(cd "$(dirname "$0")/.." && pwd)"`. One directory
+   deeper and ROOT is now `scripts/`, so every path the script derives is wrong. **123 scripts.**
+   Invisible to a grep for the script's own name; caught only by `check.sh` going red.
+3. **Generated artifacts OUTSIDE the tree** — `.git/hooks/pre-push` execs `scripts/fmt-check.sh`,
+   and `.git/hooks/` is not version-controlled. No grep of the repo can find it. It surfaced as a
+   failed `git push`. The installer source was already correct; the *installed copy* was stale.
+
+⚠ Category 3 generalises: anything a script **writes elsewhere** — hooks, installed binaries, cached
+configs, staged rootfs entries — must be **regenerated** after a move, not merely rewritten in
+source. Re-run the installers.
+
+⚠ And two soft-failure traps in category 1 that a naive pattern misses: `agnos/gpu-test` without a
+trailing slash (so a `gpu-test/` pattern skips it), and consumers in a **different repo**
+(`agnosticos/scripts/install-media.sh`). Both fail SOFT — a skipped stage, not an error.
+
 ## Verification
 
 `sh scripts/sweep.sh` must be green afterwards — it exercises the moved smokes through their new

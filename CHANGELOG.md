@@ -111,6 +111,17 @@ resolves to `scripts/` instead of the repo root — so paths *inside* the script
 shader-blob gates red); a rewrite that only fixed *references to* scripts would have shipped it.
 All 123 repaired to `/../..` with a note at each site saying why.
 
+⛔ **And the installed git hook broke — a consumer that lives OUTSIDE the repo entirely.**
+`.git/hooks/pre-push` execs `scripts/fmt-check.sh`, and `.git/hooks/` is not version-controlled, so
+no grep of the tree could ever have found it. It surfaced as a failed push:
+`No such file or directory`. The *installer* had already been corrected by the sweep; the
+already-installed copy was a stale artifact of a previous run. Fixed by re-running
+`scripts/burn/install-hooks.sh`, and both repos' hook directories audited afterwards.
+
+⚠ **Generated artifacts outside the tree are a third category**, alongside "references to scripts"
+and "paths computed inside scripts". Anything a script *writes elsewhere* — hooks, installed
+binaries, cached configs — has to be regenerated after a move, not just rewritten in source.
+
 ⛔ **And `stage-tools.sh` used the bare form `agnos/gpu-test`, which the `gpu-test/` pattern missed.**
 It would have soft-skipped every GPU tool — the same failure shape as `install-media.sh` earlier this
 cycle: no error, just an absent binary discovered on iron. Both now verified by *running* the tool,
