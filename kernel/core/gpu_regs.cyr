@@ -1158,7 +1158,9 @@ var GPU_EDGE_SHADER_SUBOFF     = 0x56000;    # slot 6 — edge_cov blob   (133 d
 # --- attribute interpolation (3D arc rung 11) -------------------------------------------------
 # ⚠ Extents are declared and gate-checked. GPU_TRI_COV_SUBOFF is 1 MB and ends at 0x1E4000, leaving
 # 48 KB clear of the sacrificial slot at 0x1F0000 -- verified by scripts/check-arena.sh, not by eye.
-var GPU_TRI_SHADER_SUBOFF      = 0x59000;    # residency slot 9, 269 dwords  -> ends 0x5A000
+var GPU_TRI_SHADER_SUBOFF      = 0x59000;    # residency slot 9, 278 dwords  -> ends 0x5A000
+var GPU_TEX_SHADER_SUBOFF      = 0x5A000;    # residency slot 10, rung 13 texturing  -> ends 0x5B000
+var GPU_TEX_PREP_SUBOFF        = 0xE3000;    # 160-byte texture prep record  -> ends 0xE3400
 var GPU_TRI_PREP_SUBOFF        = 0xE0000;    # 64 records x 128 B  -> ends 0xE2000
 var GPU_TRI_EDGE_SUBOFF        = 0xE2000;    # synthesised frame edges when DERIVE is set -> ends 0xE3000
 var GPU_TRI_COV_SUBOFF         = 0xE4000;    # 8bpp coverage scratch, 1 MB  -> ends 0x1E4000

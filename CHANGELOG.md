@@ -9,6 +9,36 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 iron — attribute interpolation byte-exact, every control firing. This cycle carries the batch-path
 defect that four probes have now cornered. Bumped on cycle open; the user tags on close.
 
+### ⭐⭐ RUNG 13b — the CPU PROLOGUE is complete; only the shader is outstanding
+
+`gpu_tex_prep` builds the **160-byte** record the texturing shader will read, and `gpu_tri_tex` now
+runs the real coverage pass and the real prologue — everything on the CPU side is live.
+
+⭐ **The min-bias, both deltas and both limits are computed here, not per pixel.** `texmodel` proved
+`n_madd` needs non-negative multiplicands, which `m = min(u0,u1,u2)` guarantees via the
+`E_A + E_B + E_C == 2A` identity. Hoisting the bias, the three deltas and the two comparison limits
+onto the CPU means the per-pixel path never computes a minimum, never forms a 64-bit limit and never
+divides — it accumulates, compares twice, funnels and corrects.
+
+⛔ **The reciprocal is for 2A, not D255.** Rung 11 divides its colour numerator by `255·2A`; the UV
+numerator is divided by `2A` itself. Reusing rung 11's constants would divide by 255× too much and
+render the texture compressed into its first row — a plausible picture, wrongly.
+
+Record layout (ten quads, `Q9` reserved and zero as on every other record): cov pointer + shift
+constants · `Dh V L fmt` · `A2 tw th` · the two edge coefficient triples · texture and LUT pointers ·
+`du0 du1 du2 mu` · `dv0 dv1 dv2 mv` · `limU limV`. `gpu_tex_prep_dump` prints it so a ring-3 tool
+computing the same thing **independently** can contradict it field by field — not a read-back.
+
+⚠ **The prologue deliberately runs BEFORE the arming check**, so the record is built and diffable in
+QEMU while the shader is still absent. 13c replaces `gpu_tex_arm`'s body and needs no further edit
+to this path.
+
+New arena slots `GPU_TEX_SHADER_SUBOFF` (0x5A000) and `GPU_TEX_PREP_SUBOFF` (0xE3000), both with
+declared extents — `check-arena.sh` reports **53 slots, 0 overlaps**. Texture and LUT are passed as
+GPU-visible **MC** addresses rather than kernel VAs, since the shader dereferences them directly.
+
+Verified: 16/16 project gates, `edge-abi-smoke` 16/16 with the 57-case ABI battery still green.
+
 ### ⭐⭐ RUNG 13b — the texture MODEL at register widths (`texmodel.cyr` / `texgate.cyr`), exit 95
 
 The UV path written at the GPU's register widths and byte-diffed against `texcore`: **0 differing

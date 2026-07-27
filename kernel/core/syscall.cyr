@@ -2253,13 +2253,13 @@ fn gpo_execute(rec) {
     # advertises an op whose execution path does not exist.
     if (op == GPU_OP_TRI_TEX) {
         var xflags = load32(rec + 4) & 0xFFFFFFFF;
-        var xtex = load64(&shm_kva + ((load32(rec + 8) & 0xFFFFFFFF) - 1) * 8);
+        var xtex = load64(&shm_mc + ((load32(rec + 8) & 0xFFFFFFFF) - 1) * 8);
         var xedge = load64(&shm_mc + ((load32(rec + 12) & 0xFFFFFFFF) - 1) * 8);
         var xvtx = load64(&shm_kva + ((load32(rec + 24) & 0xFFFFFFFF) - 1) * 8);
         var xtwh = load32(rec + 28) & 0xFFFFFFFF;
         var xlut = 0;
         if ((xflags & GPU_TEX_FLAG_IDX8) != 0) {
-            xlut = load64(&shm_kva + ((load32(rec + 32) & 0xFFFFFFFF) - 1) * 8);
+            xlut = load64(&shm_mc + ((load32(rec + 32) & 0xFFFFFFFF) - 1) * 8);
         }
         var xne = load32(rec + 60) & 0xFFFF;
         if (gpu_tri_tex(xedge, xvtx, xtex, xlut, xtwh, xflags,

@@ -3786,6 +3786,128 @@ fn gpu_tri_dispatch(rec_phys, w, h, dx, dy) {
 # ⛔ THE WHOLE BATCH IS VALIDATED BEFORE THIS RUNS. gpo_validate_trilist checks every triangle, so a
 # mid-batch refusal is impossible and the framebuffer can never be left half-drawn by a reject.
 # ⚠ Caller owns bounds checking. Returns 1 / 0.
+# gpu_tex_prep — RUNG 13's CPU prologue. Builds the 160-byte record the texturing shader reads.
+#
+# ⭐ THE MIN-BIAS AND BOTH LIMITS ARE COMPUTED HERE, NOT IN THE SHADER, and that is the whole design.
+# texmodel proved that `n_madd` needs non-negative multiplicands, which the bias
+# `m = min(u0,u1,u2)` guarantees via the identity E_A + E_B + E_C == 2A. Hoisting the bias, the
+# three deltas and the two comparison limits onto the CPU means the per-pixel path never computes a
+# minimum, never forms a 64-bit limit, and never divides — it accumulates, compares twice, funnels
+# and corrects. Everything constant per triangle belongs here.
+#
+# ⚠ RECORD IS 160 B, TEN QUADS — larger than rung 11's 128 because UV needs two axes of deltas plus
+# their limits. The layout is fixed here and the shader indexes it; a mismatch is a wrong picture
+# with no pointer back, so the field offsets are written out beside the stores.
+#   Q0 +0    cov_lo cov_hi t 32-t
+#   Q1 +16   Dh V L fmt              (fmt: 0 = RGBA8, 1 = IDX8 + LUT)
+#   Q2 +32   A2_lo A2_hi tw th
+#   Q3 +48   kxB kyB k0B_lo k0B_hi
+#   Q4 +64   kxC kyC k0C_lo k0C_hi
+#   Q5 +80   tex_lo tex_hi lut_lo lut_hi
+#   Q6 +96   du0 du1 du2 mu          (deltas already biased by mu = min(u0,u1,u2))
+#   Q7 +112  dv0 dv1 dv2 mv
+#   Q8 +128  limU_lo limU_hi limV_lo limV_hi
+#   Q9 +144  reserved, MUST be zero  -- the extension point, as on every other record
+# Returns 1 / 0.
+fn gpu_tex_prep(rec_phys, cov_mc, tex_mc, lut_mc, tw, th, fmt,
+vx0, vy0, vx1, vy1, vx2, vy2, u0, v0, u1, v1, u2, v2) {
+    var ax = vx0 >>> 16;  var ay = vy0 >>> 16;
+    var bx = vx1 >>> 16;  var by = vy1 >>> 16;
+    var cx = vx2 >>> 16;  var cy = vy2 >>> 16;
+
+    var cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    if (cross == 0) { return 0; }
+    var sgn = 1;
+    if (cross < 0) { sgn = 0 - 1; cross = 0 - cross; }
+    var a2 = cross << 16;
+
+    var kxb = sgn * (cy - ay);
+    var kyb = sgn * (ax - cx);
+    var k0b = sgn * ((ay * cx - ax * cy) << 16);
+    var kxc = sgn * (ay - by);
+    var kyc = sgn * (bx - ax);
+    var k0c = sgn * ((ax * by - ay * bx) << 16);
+
+    # ⛔ THE RECIPROCAL IS FOR 2A, NOT D255. Rung 11 divides its colour numerator by 255*2A; the UV
+    # numerator is divided by 2A itself. Reusing rung 11's constants here would divide by 255x too
+    # much and produce a texture compressed into its first row — a plausible picture, wrongly.
+    var t = tri_bitlen64(a2) - 30;
+    if (t < 0) { t = 0; }
+    var dh = (a2 >> t) + 1;                      # +1 makes the shader's correction ONE-SIDED
+    var l = tri_clz32(dh);
+    var dn = tri_u32(dh << l);
+    if (dn < 2147483648) { return 0; }           # outside recip32's domain -- refuse, never guess
+    var rv = tri_recip32(dn);
+
+    var mu = u0;
+    if (u1 < mu) { mu = u1; }
+    if (u2 < mu) { mu = u2; }
+    var mv = v0;
+    if (v1 < mv) { mv = v1; }
+    if (v2 < mv) { mv = v2; }
+
+    # u >= tw  <=>  N >= (tw*65536 - mu) * 2A, the bias folded in. A negative limit means the whole
+    # axis is already past the last texel, which the shader answers directly.
+    var limu = (tw * 65536 - mu) * a2;
+    var limv = (th * 65536 - mv) * a2;
+
+    var q = 0;
+    while (q < 40) { store32(rec_phys + q * 4, 0); q = q + 1; }   # Q9 stays ZERO: the extension point
+
+    store32(rec_phys +   0, cov_mc & 0xFFFFFFFF);
+    store32(rec_phys +   4, (cov_mc >> 32) & 0xFFFFFFFF);
+    store32(rec_phys +   8, t);
+    store32(rec_phys +  12, 32 - t);
+    store32(rec_phys +  16, dh);
+    store32(rec_phys +  20, rv);
+    store32(rec_phys +  24, l);
+    store32(rec_phys +  28, fmt);
+    store32(rec_phys +  32, a2 & 0xFFFFFFFF);
+    store32(rec_phys +  36, (a2 >> 32) & 0xFFFFFFFF);
+    store32(rec_phys +  40, tw);
+    store32(rec_phys +  44, th);
+    store32(rec_phys +  48, kxb & 0xFFFFFFFF);
+    store32(rec_phys +  52, kyb & 0xFFFFFFFF);
+    store32(rec_phys +  56, k0b & 0xFFFFFFFF);
+    store32(rec_phys +  60, (k0b >> 32) & 0xFFFFFFFF);
+    store32(rec_phys +  64, kxc & 0xFFFFFFFF);
+    store32(rec_phys +  68, kyc & 0xFFFFFFFF);
+    store32(rec_phys +  72, k0c & 0xFFFFFFFF);
+    store32(rec_phys +  76, (k0c >> 32) & 0xFFFFFFFF);
+    store32(rec_phys +  80, tex_mc & 0xFFFFFFFF);
+    store32(rec_phys +  84, (tex_mc >> 32) & 0xFFFFFFFF);
+    store32(rec_phys +  88, lut_mc & 0xFFFFFFFF);
+    store32(rec_phys +  92, (lut_mc >> 32) & 0xFFFFFFFF);
+    store32(rec_phys +  96, (u0 - mu) & 0xFFFFFFFF);
+    store32(rec_phys + 100, (u1 - mu) & 0xFFFFFFFF);
+    store32(rec_phys + 104, (u2 - mu) & 0xFFFFFFFF);
+    store32(rec_phys + 108, mu & 0xFFFFFFFF);
+    store32(rec_phys + 112, (v0 - mv) & 0xFFFFFFFF);
+    store32(rec_phys + 116, (v1 - mv) & 0xFFFFFFFF);
+    store32(rec_phys + 120, (v2 - mv) & 0xFFFFFFFF);
+    store32(rec_phys + 124, mv & 0xFFFFFFFF);
+    store32(rec_phys + 128, limu & 0xFFFFFFFF);
+    store32(rec_phys + 132, (limu >> 32) & 0xFFFFFFFF);
+    store32(rec_phys + 136, limv & 0xFFFFFFFF);
+    store32(rec_phys + 140, (limv >> 32) & 0xFFFFFFFF);
+    gpu_mfence();
+    return 1;
+}
+
+# Print the texture prep record so a ring-3 tool computing the same thing INDEPENDENTLY can
+# contradict it, field by field. ⚠ Not a read-back: this prints what the kernel COMPUTED.
+fn gpu_tex_prep_dump(rec_phys) {
+    kprint("tex-prep:", 9);
+    var i = 0;
+    while (i < 36) {
+        kprint(" ", 1);
+        kprint_num(load32(rec_phys + i * 4) & 0xFFFFFFFF);
+        i = i + 1;
+    }
+    kprint("\n", 1);
+    return 0;
+}
+
 # gpu_tex_arm — RUNG 13a's residency hook.
 #
 # ⛔ RETURNS 0 ON PURPOSE, exactly as gpu_edge_arm did through rung 9a. 13a's whole claim is that
@@ -3804,9 +3926,36 @@ fn gpu_tex_arm() {
 #
 # ⚠ Caller owns all bounds checking; gpo_validate_tritex has already refused anything out of range.
 # Returns 1 / 0.
-fn gpu_tri_tex(edge_mc, vtx_kva, tex_kva, lut_kva, texwh, flags, w, h, dx, dy, n_edges, rule) {
-    if (gpu_tex_arm() != 1) { return 0; }
+fn gpu_tri_tex(edge_mc, vtx_kva, tex_mc, lut_mc, texwh, flags, w, h, dx, dy, n_edges, rule) {
     if (gpu_cov_arm() != 1) { return 0; }
+
+    # The 48-byte vertex/UV record: 6 screen coords then 6 texel coords, all i32 16.16.
+    var vx0 = gpo_i32(vtx_kva +  0); var vy0 = gpo_i32(vtx_kva +  4);
+    var vx1 = gpo_i32(vtx_kva +  8); var vy1 = gpo_i32(vtx_kva + 12);
+    var vx2 = gpo_i32(vtx_kva + 16); var vy2 = gpo_i32(vtx_kva + 20);
+    var u0  = gpo_i32(vtx_kva + 24); var v0  = gpo_i32(vtx_kva + 28);
+    var u1  = gpo_i32(vtx_kva + 32); var v1  = gpo_i32(vtx_kva + 36);
+    var u2  = gpo_i32(vtx_kva + 40); var v2  = gpo_i32(vtx_kva + 44);
+
+    var cov_mc   = gpu_arena_mc   + GPU_TRI_COV_SUBOFF;
+    var rec_phys = gpu_arena_phys + GPU_TEX_PREP_SUBOFF;
+
+    # 1. coverage into the scratch mask, via the UNMODIFIED edge rasteriser
+    if (gpu_edge_cov(edge_mc, cov_mc, w, h, n_edges, rule) != 1) { return 0; }
+
+    # 2. the CPU prologue — the bias, the deltas, both limits and one exact reciprocal, hoisted
+    var fmt = 0;
+    if ((flags & 1) != 0) { fmt = 1; }
+    if (gpu_tex_prep(rec_phys, cov_mc, tex_mc, lut_mc, texwh & 0xFFFF, (texwh >> 16) & 0xFFFF, fmt,
+    vx0, vy0, vx1, vy1, vx2, vy2, u0, v0, u1, v1, u2, v2) != 1) { return 0; }
+
+    # ⛔ THE PROLOGUE RUNS BEFORE THE ARMING CHECK, ON PURPOSE. 13b's claim is that the CPU side is
+    # complete and diffable against the host model while the shader is still absent; building the
+    # record and THEN refusing is what lets gpu_tex_prep_dump be compared field-by-field in QEMU at
+    # zero burns. 13c replaces gpu_tex_arm's body and this function needs no further edit.
+    if (gpu_tex_arm() != 1) { return 0; }
+
+    # 3. the texturing pass  (13c)
     return 0;
 }
 
