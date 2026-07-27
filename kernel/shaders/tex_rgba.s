@@ -267,22 +267,19 @@ L_HAVE_COV:
     v_add_u32       v23, s17, v23
     v_ashrrev_i32   v23, 16, v23
     s_sub_i32       s61, s60, 1
-    v_max_i32       v23, 0, v23
-    v_min_i32       v23, s61, v23
 
-    // ⭐ WRAP TAKES A DIFFERENT TAIL, AND SKIPS BOTH CLAMP PREDICATES. Under wrap there is no
-    // saturation: the index is (u >> 16) AND (dim-1), exact because the ABI REFUSES a
-    // non-power-of-two dimension under this flag — a general modulo would be an integer divide per
-    // pixel, so the accepted surface is restricted to what can be done in one instruction.
-    // ⚠ The AND also handles a NEGATIVE index correctly on two's complement: -1 & 7 = 7, the far
-    // edge — exactly what the CPU reference's restored floor-divide exists to produce.
+    // ⛔ THE WRAP BRANCH MUST PRECEDE THE SATURATION, AND THE FIRST VERSION DID NOT.
+    // It sat AFTER v_max_i32/v_min_i32, so wrap AND-ed an index already clamped into [0, dim-1] —
+    // a no-op. Iron reported a constant 0xff073815 (texel 7) across a tile where the reference
+    // tiled 0,1,2,3: saturation wearing wrap's flag. The located diffs named it in one read.
+    // ⚠ The AND handles a NEGATIVE index correctly on two's complement (-1 & 7 = 7, the far edge)
+    // — exactly what the reference's restored floor-divide produces.
     s_and_b32       s62, s31, 4
     s_cmp_eq_u32    s62, 4
     s_cbranch_scc1  L_U_WRAP
 
-    s_and_b32       s62, s31, 4
-    s_cmp_eq_u32    s62, 4
-    s_cbranch_scc1  L_V_WRAP
+    v_max_i32       v23, 0, v23
+    v_min_i32       v23, s61, v23
 
     // -- predicate: N >= limit => the last texel (guards the u32 quotient against wrapping) --
     v_mov_b32       v16, s18
@@ -295,15 +292,10 @@ L_HAVE_COV:
     v_mov_b32       v18, 0
     v_cmp_lt_i32    vcc, v22, 0
     v_cndmask_b32   v23, v23, v18, vcc
-    s_branch        L_V_TAIL
-
-L_V_WRAP:
-    v_and_b32       v23, s61, v23           // s61 = dim-1, computed just above
-L_V_TAIL:
     s_branch        L_U_TAIL
 
 L_U_WRAP:
-    v_and_b32       v23, s61, v23           // s61 = dim-1, computed just above
+    v_and_b32       v23, s61, v23           // dim-1; tiles instead of saturating
 L_U_TAIL:
     v_mov_b32       v19, v23                // stash tu; the V axis must not touch v19
 
@@ -405,6 +397,11 @@ L_U_TAIL:
     v_add_u32       v23, s17, v23
     v_ashrrev_i32   v23, 16, v23
     s_sub_i32       s61, s60, 1
+
+    s_and_b32       s62, s31, 4
+    s_cmp_eq_u32    s62, 4
+    s_cbranch_scc1  L_V_WRAP
+
     v_max_i32       v23, 0, v23
     v_min_i32       v23, s61, v23
 
@@ -419,7 +416,12 @@ L_U_TAIL:
     v_mov_b32       v18, 0
     v_cmp_lt_i32    vcc, v22, 0
     v_cndmask_b32   v23, v23, v18, vcc
-    // v19 = tu, v23 = tv, both already clamped into range.
+    s_branch        L_V_TAIL
+
+L_V_WRAP:
+    v_and_b32       v23, s61, v23           // dim-1; tiles instead of saturating
+L_V_TAIL:
+    // v19 = tu, v23 = tv, both in range: clamped or tiled per the WRAP flag.
 
     // ======================================================================================
     // THE TEXEL FETCH
