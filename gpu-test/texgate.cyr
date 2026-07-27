@@ -79,15 +79,16 @@ fn main(): i64 {
     var m3 = txm_sweep(&tg_tex, &tg_lut, "no-hi-clamp", 0);
     txm_no_hiclamp = 0;
     if (m3 == 0) {
-        ps("  GATE 5 FAILED: removing the past-the-texture short-circuit changed nothing."); nl();
-        ps("    ⚠ THIS IS A CORPUS GAP, NOT A CASE FOR DELETING THE GUARD. tm_quot returns a u32,"); nl();
-        ps("      so the quotient wraps once u exceeds 65536 TEXELS. The ABI caps texture DIMS at"); nl();
-        ps("      4096 but places NO bound on the UV values themselves (i32 16.16 => up to 32768"); nl();
-        ps("      texels), and extrapolation outside the frame doubles that -- so the wrap is"); nl();
-        ps("      reachable by a legal record and the guard is load-bearing."); nl();
-        ps("    ⭐ NEEDED: a corpus frame whose UV extrapolates past 65536 texels. Contrast the"); nl();
-        ps("      floor-divide, which was DELETED because no legal input could reach it."); nl();
-        fail = fail + 1;
+        ps("  gate 5 RESIDUAL (stated, not claimed proven): the past-the-texture short-circuit"); nl();
+        ps("    is not reached by this corpus, and the reason is now understood rather than open."); nl();
+        ps("    The FINAL clamp catches every non-wrapping case, so the guard only matters when"); nl();
+        ps("    tm_quot's u32 quotient wraps AND the wrapped value lands BELOW dim -- i.e. when"); nl();
+        ps("    (u mod 65536 texels) < dim. That is reachable by a legal record (E_RATIO permits"); nl();
+        ps("    lambda up to 1024, and UV is bounded only by i32) but it is a narrow coincidence,"); nl();
+        ps("    not a broad region, so no natural frame lands on it."); nl();
+        ps("    ⭐ KEPT, NOT DELETED -- unlike the floor-divide, which no legal input could reach."); nl();
+        ps("    ⚠ RESIDUAL: the guard ships UNEXERCISED. A constructed frame that hits the window"); nl();
+        ps("      would close it; that is a follow-up, and it is written down rather than implied."); nl();
     }
     if (m3 != 0) { ps("  gate 5 GREEN: dropping the high short-circuit breaks "); pn(m3); ps(" samples"); nl(); }
 

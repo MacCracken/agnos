@@ -9,6 +9,37 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 iron — attribute interpolation byte-exact, every control firing. This cycle carries the batch-path
 defect that four probes have now cornered. Bumped on cycle open; the user tags on close.
 
+### ⭐⭐ RUNG 13b — the texture MODEL at register widths (`texmodel.cyr` / `texgate.cyr`), exit 95
+
+The UV path written at the GPU's register widths and byte-diffed against `texcore`: **0 differing
+bytes over 7 frames × 32×32 px × 3 coverages**, in both the RGBA8 and the IDX8+LUT paths, with four
+live falsification gates. Frames span 1:1, non-integer scale, magnification, negative UV, UV far past
+the texture, an extreme-UV frame, and a skewed frame.
+
+⛔ **The gate caught a real defect in the model on its first run, and the tell was exact.**
+`n_madd` — rung 11's primitive — assumes `p ≥ 0`, because rung 11's `p` was a colour byte times
+coverage. A **UV operand can be negative**, which makes its low-half product meaningless (`e_lo` is
+an unsigned dword and the following `>> 32` is a logical shift). The negative-UV frame differed in
+959 samples *and* the "no negative short-circuit" mutation broke it by exactly the same 959 — the
+signature of a guard that was doing nothing.
+
+⭐ **Fixed with the identity, not a new primitive.** Since `E_A + E_B + E_C == 2A`, biasing by
+`m = min(u0,u1,u2)` makes every multiplicand non-negative:
+`N = 2A·m + E_A(u0−m) + E_B(u1−m) + E_C(u2−m)`. `n_madd` is then used strictly within its contract
+and the arithmetic two rungs and four burns already proved stays untouched. The bias is folded back
+through both comparison bounds and the final texel select.
+
+⚠ **A second instrument flaw, mine:** gate 4's mutation left an *unconditional* `n_is_neg` check
+outside itself, so disabling the guard under test changed nothing — a guard silently covering for
+the guard being tested. Both halves now sit inside the mutation, and it breaks 333 samples.
+
+**Residual, stated rather than implied:** the past-the-texture short-circuit ships **unexercised**.
+The final clamp catches every non-wrapping case, so the guard only matters when `tm_quot`'s u32
+quotient wraps *and* the wrapped value lands below `dim` — i.e. `(u mod 65536 texels) < dim`. That
+is reachable by a legal record (`E_RATIO` permits λ up to 1024 and UV is bounded only by i32) but is
+a narrow coincidence rather than a region, so no natural frame lands on it. **Kept, not deleted** —
+unlike the floor-divide, which no legal input could reach. Closing it needs a constructed frame.
+
 ### Changed — the 32-bit model primitives moved into `tricore.cyr`, shared not copied
 
 Rung 13's texture model needs the same 96-bit accumulate and the same estimate-and-correct quotient

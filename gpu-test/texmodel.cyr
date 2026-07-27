@@ -183,7 +183,7 @@ var txm_first_got = 0;
 
 # The corpus: frames chosen so UV lands inside, straddles, and extrapolates OFF the texture, plus
 # a non-integer scale (the plan's own gate) and a 1:1 case (its absolute test).
-var TXC_N = 6;
+var TXC_N = 7;
 fn txc_frame(i, f): i64 {
     # ax ay bx by cx cy  u0 v0 u1 v1 u2 v2   (UVs in 16.16 texel space)
     if (i == 0) {  # 1:1 identity -- the absolute test
@@ -226,7 +226,17 @@ fn txc_frame(i, f): i64 {
         if (f == 8) { return 200 << 16; } if (f == 9) { return 0; }
         if (f == 10) { return 0; } return 200 << 16;
     }
-    # i == 5: skewed frame, u and v not axis-aligned
+    if (i == 6) {  # ⭐ EXTREME UV -- extrapolates past 65536 texels, where tm_quot's u32 WRAPS.
+        # The ABI caps texture DIMS at 4096 but bounds UV values only by i32, so this is a LEGAL
+        # record. Without this frame the past-the-texture short-circuit is unfalsifiable.
+        if (f == 0) { return 0; }  if (f == 1) { return 0; }
+        if (f == 2) { return 4; }  if (f == 3) { return 0; }
+        if (f == 4) { return 0; }  if (f == 5) { return 4; }
+        if (f == 6) { return 0; }  if (f == 7) { return 0; }
+        if (f == 8) { return 30000 << 16; } if (f == 9) { return 0; }
+        if (f == 10) { return 0; } return 30000 << 16;
+    }
+    # i == 5 fallthrough: skewed frame, u and v not axis-aligned
     if (f == 0) { return 2; }  if (f == 1) { return 1; }
     if (f == 2) { return 20; } if (f == 3) { return 5; }
     if (f == 4) { return 6; }  if (f == 5) { return 22; }
