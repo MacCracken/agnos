@@ -218,6 +218,9 @@ L_CH:
     v_addc_co_u32   v26, vcc, v26, v19, vcc
     v_mul_lo_u32    v17, v13, v14           // E hi half * p, lands one dword up
     v_mul_hi_u32    v18, v13, v14
+    v_ashrrev_i32   v19, 31, v13            // ⛔ SIGNED. See the note below.
+    v_and_b32       v19, v19, v14
+    v_sub_u32       v18, v18, v19           // v18 = mul_hi_I32(E_hi, p)
     v_add_co_u32    v25, vcc, v25, v17
     v_addc_co_u32   v26, vcc, v26, v18, vcc
 
@@ -230,6 +233,9 @@ L_CH:
     v_addc_co_u32   v26, vcc, v26, v19, vcc
     v_mul_lo_u32    v17, v9, v15
     v_mul_hi_u32    v18, v9, v15
+    v_ashrrev_i32   v19, 31, v9             // ⛔ SIGNED. See the note below.
+    v_and_b32       v19, v19, v15
+    v_sub_u32       v18, v18, v19
     v_add_co_u32    v25, vcc, v25, v17
     v_addc_co_u32   v26, vcc, v26, v18, vcc
 
@@ -242,8 +248,27 @@ L_CH:
     v_addc_co_u32   v26, vcc, v26, v19, vcc
     v_mul_lo_u32    v17, v11, v16
     v_mul_hi_u32    v18, v11, v16
+    v_ashrrev_i32   v19, 31, v11            // ⛔ SIGNED. See the note below.
+    v_and_b32       v19, v19, v16
+    v_sub_u32       v18, v18, v19
     v_add_co_u32    v25, vcc, v25, v17
     v_addc_co_u32   v26, vcc, v26, v18, vcc
+
+    // ⛔ WHY THE THREE SIGN FIXUPS ABOVE EXIST — THIS COST AN IRON BURN (1.56.20, burn 5).
+    // E is a SIGNED 64-bit value in two dwords. The LOW dword is genuinely unsigned, so its
+    // v_mul_hi_u32 needs nothing. The HIGH dword is the sign-carrying half, and multiplying it
+    // with v_mul_hi_u32 treats -1 as 0xFFFFFFFF — which adds a spurious 2^64 * p to the numerator
+    // whenever a sample centre falls OUTSIDE the attribute frame (E < 0). That is not a corner
+    // case: it is every antialiased edge pixel whose centre sits just beyond the frame.
+    //   mul_hi_i32(a,b) = mul_hi_u32(a,b) - ((a>>31)&b) - ((b>>31)&a)
+    // The second correction term is omitted DELIBERATELY: p = channel_byte * cov <= 255*255 =
+    // 65025, so p is always non-negative and (b>>31)&a is identically zero. If p ever becomes a
+    // signed quantity, this omission becomes a bug.
+    // ⚠ The E COMPUTATION above already does this correctly (see the s_ashr_i32/v_and/v_sub
+    // triples building E_B and E_C). It was only the 96-bit ACCUMULATION that skipped it, which is
+    // why the values looked right everywhere the frame contained the sample.
+    // Convicted on the host, not guessed: trimodel's `tm_ehi_unsigned` mutation reproduces all
+    // four iron-reported pixels bit-exactly. [[project_agnos_gpu_host_model_localises_emission]]
 
     // ---- clamp at zero BEFORE the rounding bias ------------------------------------------
     // ⚠ ORDER MATTERS. Clamping after the bias would round a negative numerator toward zero by a

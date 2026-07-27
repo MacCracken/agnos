@@ -87,6 +87,62 @@ warns rather than errors on arity mismatch. Because N15 compares the reference a
 halves were equally wrong and it passed vacuously through every burn to date. It now takes a synthetic
 all-255 mask, so reproducibility does not depend on a GPU being present.
 
+### ⭐⭐⭐ ROOT CAUSE FOUND — `tri_rgba.s` multiplied a SIGNED edge weight as UNSIGNED
+
+Burn 5 (with the instrument defects above fixed) narrowed rung 11 from "all 15 cases, delta 239" to
+**one case, 32 of 4096 pixels, delta 16** — and the located diffs made it solvable on the host.
+
+Every failing pixel had a **negative** `E_A` (`-2097152`); the adjacent pixel that *agreed* had
+`E_A = +2097152`. `E` is a signed 64-bit value held in two dwords. The shader's 96-bit accumulator
+multiplied the **high** dword with `v_mul_hi_u32` — unsigned — so a negative weight contributed a
+spurious `2^64 · p`. The low dword is genuinely unsigned and needed nothing, which is why the
+comment beside it ("no sign fixup needed") was half right and read as wholly right.
+
+⚠ **The `E` computation itself was always correct** — it carries the `s_ashr_i32`/`v_and`/`v_sub`
+triples. Only the *accumulation* skipped them. So the values were right everywhere the sample centre
+fell inside the attribute frame, and wrong only on antialiased edge pixels whose centre sits just
+beyond it. That is why 14 of 15 corpus cases were byte-perfect.
+
+```
+mul_hi_i32(a,b) = mul_hi_u32(a,b) − ((a>>31)&b) − ((b>>31)&a)
+```
+
+The second correction term is omitted deliberately and the omission is documented in the source:
+`p = channel_byte * cov ≤ 65025`, always non-negative, so `(b>>31)&a` is identically zero.
+
+⭐ **Convicted on the host, not argued.** `trimodel` gained a `tm_ehi_unsigned` mutation that
+reproduces the shader's unsigned high-dword multiply. It regenerates **all four** iron-reported
+pixels bit-exactly (`0xff120012`, `0xff070007`, `0xff110011`, `0xff060006`). A mutation that
+reproduces the observed bytes is a demonstration of what the silicon did, not a theory about it.
+
+Blob regenerated: **269 → 278 dwords** (three instructions × three terms, exactly as predicted).
+`RSRC1` unchanged at `0x002C0187` — `v19` was already live, so the register budget did not move.
+`shader-blob.sh check` agrees, and the three fixups were confirmed by disassembly to encode as
+single-dword VOP2 forms already exercised elsewhere in the same verified blob.
+
+### ⛔ `trimodel`'s gate had a hole exactly where iron failed — now closed
+
+Gate 1 sampled `px = x*11 + 2`, `py = y*9 + 3`. **`x = 62` is not reachable on that lattice**
+(`62-2` is not a multiple of 11), and x=62 is where iron disagreed. The gate proved what it
+*sampled* while being reported as if it proved the surface.
+
+Added **gate 1b**: every pixel of the real 64×64 window against six coverage values including the
+95 and 31 the burn reported — ~2.4M evaluations across the corpus, seconds on the host. It is green,
+which is what licensed blaming the emission for the first time in this arc.
+
+### Added — offline reproduction of the batch path (`op 0x0A`), and an honest negative
+
+`refraster.cyr` is byte-identical to the GPU rasteriser (20/20 across five burns), so the real
+coverage masks can be produced on the host; composing them with `tm_px` reproduces the whole batch
+offline. The harness is **calibrated** — its clean digest is `0xfc6f8c42`, bit-identical to the
+reference iron computed.
+
+⚠ **No variant reproduces iron's `0xda27e77a`.** Twelve combinations were swept (the signed-multiply
+mutation × normal / reverse order / first-only / last-only / shared-mask / no-read-modify-write).
+So **rung 12 has an independent defect** that the rung 11 fix does not explain, and the tool says
+exactly that instead of naming a suspect. `--list` now runs an **incremental prefix bisect** at
+n = 1…6 so the next burn names which triangle first breaks the batch.
+
 ### Added — located pixel diffs, so the next red names a pixel instead of a suspect
 
 Both `--tri` and `--list` now print up to four failing pixels as `x`, `y`, **coverage**, `want`,

@@ -826,6 +826,61 @@ fn tl_pack(n): i64 {
     return 0;
 }
 
+# ⭐ THE INCREMENTAL BISECT. Rung 12's red survived the op 0x09 fix in the offline reproduction:
+# trimodel replays this exact batch on the host (its clean digest matches iron's reference bit for
+# bit) and NO combination of the signed-multiply defect with order / stale-mask / no-read-modify-
+# write hypotheses lands on iron's GPU digest. So op 0x0A has an independent defect that is not
+# worth guessing at.
+#
+# Dispatching the SAME batch at n = 1, 2, ... 6 and comparing each against the reference for that
+# prefix turns "3188 pixels differ" into "triangle K is the first one that breaks it". A batch is
+# composited in submission order, so the prefix result is well-defined at every n — which is what
+# makes this a legitimate bisect rather than six unrelated runs.
+fn tl_run_prefix(nn, w, h, bytes): i64 {
+    tl_render_cov(&tl_tbl, nn, &tri_ref, &tl_covs, w, h, 0xFF101010);
+    var refd = digest(&tri_ref, bytes);
+
+    var vid = syscall(86, 48 * 32);
+    if (vid < 1) { return 0 - 100; }
+    if (syscall(72, vid, &tl_vtx, nn * 48) != 0) { syscall(74, vid); return 0 - 90; }
+    if (syscall(88, 0xFF101010, (h * 65536) + w, 16 * 65536 + 16) != 0) {
+        syscall(74, vid); return 0 - 90;
+    }
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 10);
+    store32(&d + 12, vid);
+    store32(&d + 16, (h * 65536) + w);
+    store32(&d + 20, (16 * 65536) + 16);
+    store32(&d + 24, nn);
+    var rc = syscall(92, &d, 64);
+    if (rc != 0) { syscall(74, vid); return 0 - 80; }
+
+    var rid = syscall(86, bytes);
+    if (rid < 1) { syscall(74, vid); return 0 - 90; }
+    var qz = 0;
+    while (qz < bytes / 8) { store64(&tri_poison + qz * 8, 0xA5A5A5A5A5A5A5A5); qz = qz + 1; }
+    syscall(72, rid, &tri_poison, bytes);
+    var rb = syscall(90, rid, (h * 65536) + w, (16 * 65536) + 16);
+    if (rb != 0) { syscall(74, vid); syscall(74, rid); return 0 - 87; }
+    if (syscall(73, rid, &tri_poison, bytes) != 0) { syscall(74, vid); syscall(74, rid); return 0 - 90; }
+    syscall(74, vid); syscall(74, rid);
+
+    var bad = 0;
+    var pi = 0;
+    while (pi < w * h) {
+        if ((load32(&tri_poison + pi * 4) & 0xFFFFFFFF) != (load32(&tri_ref + pi * 4) & 0xFFFFFFFF)) {
+            bad = bad + 1;
+        }
+        pi = pi + 1;
+    }
+    ps("  n="); pnum(nn); ps("  ref 0x"); phex8(refd);
+    ps("  gpu 0x"); phex8(digest(&tri_poison, bytes));
+    ps("  differing "); pnum(bad); nl();
+    return bad;
+}
+
 fn tri_list(): i64 {
     var w = 64;
     var h = 64;
@@ -847,6 +902,30 @@ fn tri_list(): i64 {
         }
         ci = ci + 1;
     }
+    # ⭐ BISECT FIRST, then the full batch. The first n whose differing count jumps from 0 names the
+    # triangle that breaks it, and its geometry is then a fact rather than a suspect.
+    puts("gputri: incremental prefix bisect -- the first n that differs names the triangle");
+    var firstbad = 0 - 1;
+    var nn = 1;
+    while (nn <= n) {
+        var r = tl_run_prefix(nn, w, h, bytes);
+        if (r < 0) {
+            ps("gputri: prefix n="); pnum(nn); ps(" could not run (code "); pnum(0 - r); puts(")");
+            return 87;
+        }
+        if (r != 0) { if (firstbad < 0) { firstbad = nn; } }
+        nn = nn + 1;
+    }
+    if (firstbad > 0) {
+        ps("gputri: ⭐ FIRST DIVERGENCE AT n="); pnum(firstbad);
+        ps("  => triangle "); pnum(firstbad - 1); puts(" is the one that breaks the batch");
+        ps("gputri:   its vertices: ("); pnum(tl_get(&tl_tbl, firstbad-1, 0)); ps(",");
+        pnum(tl_get(&tl_tbl, firstbad-1, 1)); ps(") (");
+        pnum(tl_get(&tl_tbl, firstbad-1, 2)); ps(","); pnum(tl_get(&tl_tbl, firstbad-1, 3)); ps(") (");
+        pnum(tl_get(&tl_tbl, firstbad-1, 4)); ps(","); pnum(tl_get(&tl_tbl, firstbad-1, 5)); puts(")");
+    }
+    if (firstbad < 0) { puts("gputri: ⭐ every prefix n=1..N matches -- the batch path is clean"); }
+
     tl_render_cov(&tl_tbl, n, &tri_ref, &tl_covs, w, h, 0xFF101010);
     ps("gputri: reference digest "); phex8(digest(&tri_ref, bytes));
     ps("  ref drew "); pnum(tl_drawn); ps(" of "); pnum(n); puts(" triangles");

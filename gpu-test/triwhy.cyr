@@ -1,0 +1,103 @@
+# triwhy.cyr — dump the reference's INTERMEDIATES for the pixels iron disagreed on.
+#
+# ⭐ WHY. Burn 5 narrowed rung 11's disagreement to corpus case 4, 32 of 4096 pixels, all on PARTIAL
+# coverage, worst per-channel delta 16. `trimodel`'s dense gate then proved the ALGORITHM agrees with
+# the reference at exactly those pixels — so the divergence is between the model and the EMISSION,
+# which is the first time in this arc that suspicion legitimately lands on the shader's machine code.
+#
+# Two assemblers agreeing on 269 dwords proves the BYTES match the MNEMONICS. It does not prove the
+# instruction SEQUENCE computes tm_px. That gap is what this dump is for: it prints every value the
+# shader must reproduce, so the .s can be read against numbers instead of against intent.
+#
+# ⚠ Prints, does not gate. Its output is evidence for a human reading tri_rgba.s, not a pass/fail.
+
+include "lib/io.cyr"
+include "tricore.cyr"
+
+fn ph8(v): i64 {
+    var d = 28;
+    while (d >= 0) {
+        var nib = (v >> d) & 0xF;
+        if (nib < 10) { print("0123456789" + nib, 1); }
+        if (nib >= 10) { print("abcdef" + (nib - 10), 1); }
+        d = d - 4;
+    }
+    return 0;
+}
+
+# The reference's per-channel pipeline, opened up. Mirrors tri_ref_px exactly; any edit here that is
+# not also made there makes this dump a lie.
+fn dump_px(px, py, cov): i64 {
+    ps("---- px="); pn(px); ps(" py="); pn(py); ps(" cov="); pn(cov); nl();
+
+    var pcx = (px << 16) + 32768;
+    var pcy = (py << 16) + 32768;
+    var eb = tp_get(TP_KXB) * pcx + tp_get(TP_KYB) * pcy + tp_get(TP_K0B);
+    var ec = tp_get(TP_KXC) * pcx + tp_get(TP_KYC) * pcy + tp_get(TP_K0C);
+    var ea = tp_get(TP_A2) - eb - ec;
+    ps("  ea="); pn(ea); ps("  eb="); pn(eb); ps("  ec="); pn(ec); nl();
+
+    var d255 = tp_get(TP_D255);
+    var out = 0;
+    var qa = 255;
+    var ch = 0;
+    while (ch < 4) {
+        var sh = 24 - ch * 8;
+        var ca = (tp_get(TP_CA) >> sh) & 0xFF;
+        var cb = (tp_get(TP_CB) >> sh) & 0xFF;
+        var cc = (tp_get(TP_CC) >> sh) & 0xFF;
+        var n = ea * (ca * cov) + eb * (cb * cov) + ec * (cc * cov);
+        var neg = 0;
+        if (n < 0) { neg = 1; n = 0; }
+        var q = (n + (d255 >> 1)) / d255;
+        var clamped = 0;
+        if (q > 255) { q = 255; clamped = 1; }
+        if (ch == 0) { qa = q; }
+        var premul = 0;
+        if (q > qa) { q = qa; premul = 1; }
+        ps("  ch"); pn(ch); ps(" (c=");  pn(ca); ps(","); pn(cb); ps(","); pn(cc);
+        ps(")  q="); pn(q);
+        if (neg == 1) { ps("  [numerator was NEGATIVE -> clamped to 0]"); }
+        if (clamped == 1) { ps("  [q>255 clamped]"); }
+        if (premul == 1) { ps("  [premul restore fired]"); }
+        nl();
+        out = out | (q << sh);
+        ch = ch + 1;
+    }
+    ps("  premultiplied src = 0x"); ph8(out); nl();
+    ps("  after src-over on 0xFF101010 = 0x"); ph8(tri_src_over(out, 0xFF101010)); nl();
+    ps("  (src-over alone, over BLACK 0xFF000000) = 0x"); ph8(tri_src_over(out, 0xFF000000)); nl();
+    ps("  (no src-over at all, raw premul)        = 0x"); ph8(out); nl();
+    return 0;
+}
+
+fn main(): i64 {
+    tc_init();
+    ps("triwhy -- case 4 grad-even-h64, the four pixels burn 5 reported"); nl();
+    var ok = tri_prep(tc_get(4,0), tc_get(4,1), tc_get(4,2), tc_get(4,3),
+                      tc_get(4,4), tc_get(4,5), tc_get(4,6), tc_get(4,7), tc_get(4,8));
+    ps("tri_prep -> "); pn(ok); nl();
+    ps("frame A=("); pn(tc_get(4,0)); ps(","); pn(tc_get(4,1));
+    ps(")  B=("); pn(tc_get(4,2)); ps(","); pn(tc_get(4,3));
+    ps(")  C=("); pn(tc_get(4,4)); ps(","); pn(tc_get(4,5)); ps(")"); nl();
+    ps("colours 0x"); ph8(tc_get(4,6)); ps(" 0x"); ph8(tc_get(4,7));
+    ps(" 0x"); ph8(tc_get(4,8)); nl();
+    ps("2A="); pn(tp_get(TP_A2)); ps("  D255="); pn(tp_get(TP_D255));
+    ps("  t="); pn(tp_get(TP_T)); ps("  Dh="); pn(tp_get(TP_DH));
+    ps("  L="); pn(tp_get(TP_L)); ps("  V="); pn(tp_get(TP_V)); nl();
+
+    dump_px(62, 48, 95);
+    dump_px(63, 48, 31);
+    dump_px(58, 49, 95);
+    dump_px(59, 49, 31);
+
+    # ⭐ A NEIGHBOUR THAT AGREED. Burn 5 says only 32 pixels differ, so the pixel one to the LEFT of
+    # a failing one is byte-identical on iron. Printing it beside the failures is what separates
+    # "everything on this row is wrong" from "only the partial-coverage tail is wrong".
+    ps("---- the AGREEING neighbour, for contrast:"); nl();
+    dump_px(61, 48, 255);
+    return 0;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
