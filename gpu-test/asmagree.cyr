@@ -228,6 +228,44 @@ fn main(): i64 {
     agree("SOPP   s_cbranch_execnz 0   ", gfx9_enc_sopp(0x09, 0), 0xbf890000);
     agree("SOPP   s_cbranch_scc1 0     ", gfx9_enc_sopp(0x05, 0), 0xbf850000);
 
+    # ============================================================================================
+    # RUNG 13 — the encoding classes tex_rgba.s introduced
+    # ============================================================================================
+    # ⭐ THIS IS THE SOVEREIGNTY CHECK, NOT A FORMALITY. tex_rgba's 425 dwords shipped verified by
+    # llvm-mc ALONE, which is one assembler short of this tree's standing bar. llvm is a build-time
+    # cross-check and never enters the kernel — the blob is a plain `store32` table in gpu.cyr — but
+    # a table only ONE tool has ever agreed with is a table with a single point of failure.
+    #
+    # ⚠ EVERY EXPECTED DWORD BELOW WAS DECODED FROM THE SHIPPED BLOB, and the operand fields were
+    # extracted programmatically rather than typed. Hand-transcribing opcode numbers into a gate
+    # whose whole job is catching transcription error would be marking its own homework.
+    # ⚠ These dwords are iron-proven: rung 13 closed at exit 95 with 10 of 10 cases byte-identical,
+    # so what mabda's encoder is being asked to reproduce is machine code that has RUN.
+    agree("SOP2   s_lshl_b32            ", gfx9_enc_sop2(0x1C, 10, 8, 134), 0x8e0a8608);
+    agree("SOP2   s_mul_i32             ", gfx9_enc_sop2(0x24, 11, 9, 6), 0x920b0609);
+    agree("SOP2   s_sub_i32             ", gfx9_enc_sop2(0x03, 61, 160, 30), 0x81bd1ea0);
+    agree("SOP2   s_cselect_b64         ", gfx9_enc_sop2(0x0B, 62, 193, 128), 0x85be80c1);
+    agree("SOP2   s_ashr_i32            ", gfx9_enc_sop2(0x20, 13, 36, 159), 0x900d9f24);
+    agree("SOP1   s_and_saveexec_b64    ", gfx9_enc_sop1(0x20, 20, 106), 0xbe94206a);
+    agree("SOPP   s_cbranch_execz       ", gfx9_enc_sopp(0x08, 0x018F), 0xbf88018f);
+    agree("SOPP   s_branch              ", gfx9_enc_sopp(0x02, 0x0011), 0xbf820011);
+    agree("SOPP   s_endpgm              ", gfx9_enc_sopp(0x01, 0x0000), 0xbf810000);
+    agree("SOPP   s_cbranch_scc0        ", gfx9_enc_sopp(0x04, 0x000A), 0xbf84000a);
+    agree("SOPC   s_cmp_eq_u32          ", gfx9_enc_sopc(0x06, 31, 128), 0xbf06801f);
+    agree("SOPC   s_cmp_ge_i32          ", gfx9_enc_sopc(0x03, 45, 128), 0xbf03802d);
+    agree("SMEM   s_load_dwordx4        ", gfx9_enc_smem_lo(0x02, 24, 0, 0), 0xc00a0600);
+    agree("VOP2   v_add_u32             ", gfx9_enc_vop2(0x34, 1, 10, 0), 0x6802000a);
+    agree("VOP2   v_and_b32             ", gfx9_enc_vop2(0x13, 14, 13, 5), 0x261c0a0d);
+    agree("VOP2   v_sub_co_u32          ", gfx9_enc_vop2(0x1A, 12, 268, 8), 0x3418110c);
+    agree("VOP2   v_subb_co_u32         ", gfx9_enc_vop2(0x1D, 13, 269, 9), 0x3a1a130d);
+    agree("VOPC   v_cmp_gt_u32          ", gfx9_enc_vopc(0xCC, 6, 1), 0x7d980206);
+    agree("VOPC   v_cmp_ne_u32          ", gfx9_enc_vopc(0xCD, 128, 4), 0x7d9a0880);
+    agree("VOPC   v_cmp_le_u64          ", gfx9_enc_vopc(0xEB, 272, 20), 0x7dd62910);
+    agree("VOP3A  v_mul_lo_u32          ", gfx9_enc_vop3a_lo(0x285, 8), 0xd2850008);
+    agree("VOP3A  v_mul_hi_u32          ", gfx9_enc_vop3a_lo(0x286, 9), 0xd2860009);
+    agree("FLAT   global_load_ubyte     ", gfx9_enc_flat_lo(0x10, 2, 0x0, 0, 0), 0xdc408000);
+    agree("FLAT   global_load_dword     ", gfx9_enc_flat_lo(0x14, 2, 0x0, 0, 0), 0xdc508000);
+    agree("FLAT   global_store_dword    ", gfx9_enc_flat_lo(0x1C, 2, 0x0, 0, 0), 0xdc708000);
     puts("");
     ps("classes agreeing: "); pnum(pass_n);
     ps("   disagreeing: "); pnum(fail_n); puts("");

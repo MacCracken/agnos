@@ -266,6 +266,138 @@ fn tx_run_case(i, idx8, tileno): i64 {
     return bad;
 }
 
+# ============================================================================================
+# THE BANDWIDTH MEASUREMENT — the number rung 14 must not be surprised by
+# ============================================================================================
+# ⭐ THE PLAN ASKS RUNG 13 TO RECORD ACHIEVED GB/s BECAUSE RUNG 14 IS BANDWIDTH-BOUND. Shipping
+# rung 13 green without it would hand rung 14 a budget nobody had measured.
+#
+# ⛔ uptime_us #95, NOT uptime_ms #40. A foreground `run` program executes with IF CLEARED, so the
+# timer never fires and #40 is FROZEN for the program's whole duration. Two iron burns were lost to
+# that: one fabricated a 0 us timing and divided by it, the other spun on a clock that could not
+# advance. #95 is rdtsc-backed and needs no interrupts.
+#
+# ⚠ WHAT IS COUNTED, stated so the number is not over-read. Bytes moved per dispatch is the
+# DESTINATION rect written plus the coverage mask read plus the texels read. Texel traffic is
+# counted as one dword per covered pixel — the true figure is lower because the cache serves
+# repeats, so this is a LOWER bound on achieved bandwidth, not an upper one.
+var TX_BENCH_REPS = 200;
+
+# tx_bench_at — time REPS dispatches of a w x h rect covering the whole rect, and return elapsed us.
+# Returns 0 - 1 if anything refused, so the caller can decline to divide.
+fn tx_bench_at(w, h, reps): i64 {
+    # A frame spanning the rect, UV mapping the whole 8x8 texture across it.
+    var b = &tx_vtx;
+    store32(b +  0, 0);          store32(b +  4, 0);
+    store32(b +  8, w << 16);    store32(b + 12, 0);
+    store32(b + 16, 0);          store32(b + 20, h << 16);
+    store32(b + 24, 0);          store32(b + 28, 0);
+    store32(b + 32, TXD << 16);  store32(b + 36, 0);
+    store32(b + 40, 0);          store32(b + 44, TXD << 16);
+    var e = 0;
+    while (e < 3) {
+        var i0 = e; var i1 = e + 1;
+        if (i1 == 3) { i1 = 0; }
+        var xs = 0; var ys = 0; var xe = 0; var ye = 0;
+        if (i0 == 1) { xs = w; }
+        if (i0 == 2) { ys = h; }
+        if (i1 == 1) { xe = w; }
+        if (i1 == 2) { ye = h; }
+        store32(&tx_edges + (e * 4 + 0) * 4, xs << 16);
+        store32(&tx_edges + (e * 4 + 1) * 4, ys << 16);
+        store32(&tx_edges + (e * 4 + 2) * 4, xe << 16);
+        store32(&tx_edges + (e * 4 + 3) * 4, ye << 16);
+        e = e + 1;
+    }
+
+    var tid = syscall(86, 4096);
+    var vid = syscall(86, 4096);
+    var eid = syscall(86, 4096);
+    if (tid < 1) { return 0 - 1; }
+    if (vid < 1) { return 0 - 1; }
+    if (eid < 1) { return 0 - 1; }
+    syscall(72, tid, &tx_tex, TXD * TXD * 4);
+    syscall(72, vid, &tx_vtx, 48);
+    syscall(72, eid, &tx_edges, 3 * 16);
+
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 11);
+    store32(&d +  8, tid);
+    store32(&d + 12, eid);
+    store32(&d + 16, (h * 65536) + w);
+    store32(&d + 20, (8 * 65536) + 8);
+    store32(&d + 24, vid);
+    store32(&d + 28, (TXD * 65536) + TXD);
+    store32(&d + 60, 3);
+
+    if (syscall(92, &d, 64) != 0) {          # one warm-up: arming must not land in the timed window
+        syscall(74, tid); syscall(74, vid); syscall(74, eid);
+        return 0 - 1;
+    }
+    var t0 = syscall(95);
+    var r = 0;
+    var bad = 0;
+    while (r < reps) {
+        if (syscall(92, &d, 64) != 0) { bad = 1; r = reps; }
+        r = r + 1;
+    }
+    var el = syscall(95) - t0;
+    syscall(74, tid); syscall(74, vid); syscall(74, eid);
+    if (bad != 0) { return 0 - 1; }
+    return el;
+}
+
+# ⛔ TWO SIZES, BECAUSE ONE SIZE CANNOT SEPARATE OVERHEAD FROM BANDWIDTH — and the first version of
+# this bench got that wrong. A 32x32 rect is 1024 pixels; rung 11's MEASURED cost model puts fixed
+# dispatch overhead near 28.8 us, so a 56 us measurement there is almost entirely overhead and the
+# MB/s derived from it says nothing about a bandwidth-bound workload. Handing rung 14 that number
+# would have been handing it a surprise, which is the one thing the plan asks this bench to prevent.
+#
+# ⭐ Timing a SMALL and a LARGE rect and differencing gives both terms:
+#     fixed_us      = the intercept -- dispatch, arming, fence, ring
+#     us_per_pixel  = the slope -- the part that actually scales with work
+# Rung 14 sizes its frame budget from the SLOPE; the intercept tells it how many dispatches per
+# frame it can afford at all.
+fn tx_bench(): i64 {
+    var reps_s = TX_BENCH_REPS;
+    var reps_l = 20;                          # the large rect is ~64x the work; fewer reps suffice
+    var small = 32;
+    var large = 256;
+
+    var el_s = tx_bench_at(small, small, reps_s);
+    var el_l = tx_bench_at(large, large, reps_l);
+    if (el_s <= 0) { puts2("gputex: bench REFUSED -- small rect did not time; no rate reported"); return 0; }
+    if (el_l <= 0) { puts2("gputex: bench REFUSED -- large rect did not time; no rate reported"); return 0; }
+
+    var us_s = el_s * 1000 / reps_s;          # milli-microseconds, to keep a fraction in integers
+    var us_l = el_l * 1000 / reps_l;
+    var px_s = small * small;
+    var px_l = large * large;
+
+    ps("gputex: bench "); pn(small); ps("x"); pn(small); ps(" = ");
+    pn(us_s / 1000); ps("."); pn((us_s % 1000) / 100); ps(" us/dispatch   ");
+    pn(large); ps("x"); pn(large); ps(" = ");
+    pn(us_l / 1000); ps("."); pn((us_l % 1000) / 100); puts2(" us/dispatch");
+
+    # slope in pico-us per pixel, so integer division keeps resolution at these magnitudes
+    var slope_p = (us_l - us_s) * 1000 / (px_l - px_s);
+    var fixed_p = us_s * 1000 - slope_p * px_s;
+    ps("gputex:   fixed overhead ~"); pn(fixed_p / 1000000); ps(" us/dispatch; slope ~");
+    pn(slope_p); puts2(" pico-us/px");
+
+    # ⚠ LOWER BOUND. Texel traffic is one dword per covered pixel here; the cache serves repeats,
+    # so real achieved bandwidth is higher than this figure, never lower.
+    var bytes_l = px_l * 4 + px_l + px_l * 4;
+    var mbs = bytes_l * reps_l / el_l;
+    ps("gputex:   at "); pn(large); ps("x"); pn(large); ps(": >= "); pn(mbs);
+    puts2(" MB/s (lower bound -- texels counted uncached)");
+    ps("gputex:   ⭐ rung 14 sizes its budget from the SLOPE; the intercept caps dispatches/frame.");
+    nl();
+    return 1;
+}
+
 fn main(): i64 {
     puts2("gputex: RUNG 13 -- nearest-neighbour affine texturing via #92 op 0x0B");
     tx_build_tex();
@@ -303,6 +435,7 @@ fn main(): i64 {
 
     syscall(84);
     puts2("gputex: presented -- the tiles above are ON SCREEN now");
+    tx_bench();
 
     ps("gputex: RGBA8 "); pn(exact); ps(" of "); pn(TXN); ps(" exact; IDX8 ");
     pn(idxexact); ps(" of "); pn(TXN); puts2(" exact");

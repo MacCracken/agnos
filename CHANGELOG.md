@@ -3,6 +3,70 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.22] - 2026-07-27
+
+**Closing rung 13's carry-forward (open cycle).** 1.56.21 shipped texturing green on iron with three
+things written down as owed rather than done. This cycle pays two of them. Bumped on cycle open;
+the user tags on close.
+
+### ⭐⭐⭐ THE SOVEREIGN ENCODER NOW AGREES ON EVERY CLASS `tex_rgba` USES — 65 of 65
+
+`tex_rgba`'s 425 dwords shipped verified by **llvm-mc alone**, one assembler short of this tree's
+standing bar. `asmagree` gained the **25 encoding classes** the texture kernel introduced — SOP2
+(`s_lshl_b32`, `s_mul_i32`, `s_sub_i32`, `s_cselect_b64`, `s_ashr_i32`), SOP1
+(`s_and_saveexec_b64`), SOPP (`s_branch`, `s_cbranch_execz`, `s_cbranch_scc0`, `s_endpgm`), SOPC
+(`s_cmp_eq_u32`, `s_cmp_ge_i32`), SMEM (`s_load_dwordx4`), VOP2 (`v_add_u32`, `v_and_b32`,
+`v_sub_co_u32`, `v_subb_co_u32`), VOPC (`v_cmp_gt_u32`, `v_cmp_ne_u32`, `v_cmp_le_u64`), VOP3a
+(`v_mul_lo_u32`, `v_mul_hi_u32`) and FLAT (`global_load_ubyte`, `global_load_dword`,
+`global_store_dword`).
+
+**Result: 65 classes agreeing, 0 disagreeing.** mabda's sovereign encoder independently reproduces
+every class, so the shipped table no longer rests on a single tool.
+
+⚠ **To be exact about what LLVM is here:** a build-time cross-check that never enters the kernel.
+`grep llvm scripts/build.sh scripts/check.sh` returns nothing; the blob ships as a plain `store32`
+table in `gpu.cyr` compiled by `cycc`. Removing LLVM entirely would still build, boot and
+texture-map — it would only cost the ability to *regenerate* the table from the `.s`.
+
+⚠ **Every expected dword was decoded from the shipped blob programmatically, not typed.**
+Hand-transcribing opcode numbers into a gate whose purpose is catching transcription error would be
+marking its own homework. And the dwords are iron-proven — rung 13 closed at 10 of 10.
+
+⚠ **The honest limit is unchanged and still stated in the file:** this proves agreement per
+encoding CLASS, not instruction-for-instruction across every shader. That needs a real `.s` parser,
+which remains a separate sized bite.
+
+### ⛔ The first bandwidth measurement was overhead-dominated — replaced with a two-point fit
+
+Iron reported `200 dispatches of 32x32 in 11284 us → 56 us/dispatch, >= 163 MB/s`. **That number
+would have misled rung 14.** A 32×32 rect is 1024 pixels, and rung 11's *measured* cost model puts
+fixed dispatch overhead near **28.8 µs** — so 56 µs is almost entirely intercept, and the MB/s
+derived from it describes dispatch cost, not bandwidth. Handing rung 14 that figure would have been
+handing it exactly the surprise the plan asks this bench to prevent.
+
+The bench now times **32×32 and 256×256** and differences them:
+
+* **fixed overhead** — the intercept: dispatch, arming, fence, ring
+* **slope, per pixel** — the part that actually scales with work
+* **MB/s at the large rect**, where the intercept has amortised
+
+A warm-up dispatch runs before the timed window so arming never lands inside it. Rung 14 sizes its
+frame budget from the **slope**; the intercept caps how many dispatches per frame it can afford.
+
+### ⭐ Added — the achieved-bandwidth measurement rung 14 is owed
+
+The plan asks rung 13 to record achieved GB/s *because rung 14 is bandwidth-bound and that number
+must not be a surprise*. `gputex` now times 200 dispatches and reports µs-per-dispatch and a
+bandwidth floor.
+
+⛔ **`uptime_us` #95, never `uptime_ms` #40.** A foreground `run` program executes with IF cleared,
+so the timer never fires and #40 is frozen for the program's whole duration — two iron burns were
+lost to that, one fabricating a 0 µs timing and dividing by it. It also **refuses to divide** if the
+clock did not advance: a fabricated rate is worse than no rate.
+
+⚠ Reported as a **lower bound**: texel traffic is counted one dword per covered pixel, while the
+cache serves repeats, so real achieved bandwidth is higher than the printed figure.
+
 ## [1.56.21] - 2026-07-27
 
 **Rung 12: the destroyer is the interpolation dispatch (open cycle).** 1.56.20 closed rung 11 on
