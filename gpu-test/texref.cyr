@@ -1,0 +1,34 @@
+# texref.cyr — thin runner for RUNG 13's CPU reference. The substance lives in texcore.cyr, which
+# is an includable module; this file exists only to give it a main() and an exit code.
+# ⚠ Consumers (texmodel, gputex) must include TEXCORE, never this file — including a program that
+# carries its own main() shadows the includer's, and Cyrius only warns.
+
+include "lib/io.cyr"
+include "texcore.cyr"
+
+var tr_tex[512];                # 8x8 RGBA8 = 256 B; 512 u64 slots is ample (measured sizing)
+var tr_lut[512];                # 256 entries x 4 B = 1024 B
+
+fn main(): i64 {
+    ps("texref -- CPU reference for nearest-neighbour affine texture mapping"); nl();
+    var fail = tex_selftest(&tr_tex, &tr_lut);
+    if (fail != 0) {
+        ps("texref: "); pn(fail); ps(" FAILURES"); nl();
+        return 1;
+    }
+    ps("falsification -- each mutation MUST break an arm:"); nl();
+    var dead = tex_falsify(&tr_tex, &tr_lut);
+    if (dead != 0) {
+        ps("texref: "); pn(dead); ps(" mutation(s) did NOT fire -- the arms above prove less"); nl();
+        ps("        than they appear to. A gate proves what it SAMPLES."); nl();
+        return 86;
+    }
+    ps("texref: all arms green -- 1:1 identity, clamp-to-edge saturation, the nearest"); nl();
+    ps("        boundary at exactly 1.0, IDX8 through the LUT, the overflow gate firing,"); nl();
+    ps("        and coverage 0 as a no-op."); nl();
+    ps("⇒ This is the oracle. texmodel is measured against it, not beside it."); nl();
+    return 95;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

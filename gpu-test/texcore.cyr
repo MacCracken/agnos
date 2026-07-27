@@ -1,0 +1,334 @@
+# texcore.cyr — RUNG 13's CPU reference: nearest-neighbour, affine-UV texture mapping.
+#
+# ⭐ THIS IS THE ORACLE. The host model (texmodel) is measured against it and the shader is measured
+# against the model. It is deliberately written in the plainest arithmetic that is still exact —
+# no funnel shift, no reciprocal, no register-width simulation. Those belong in the model, whose
+# whole job is to reproduce THIS at 32-bit widths.
+#
+# ⚠ INCLUDABLE MODULE, NO main(). Cyrius shadows duplicate `fn` silently (last-def-wins, warn only),
+# so a consumer that includes a file carrying its own main() runs the WRONG one and still exits 0.
+# That cost a real debugging session on rung 11 — hence tricore/triref, and hence this split too.
+#
+# ⛔ THE FRAME MACHINERY IS REUSED, NOT REIMPLEMENTED. tri_prep already derives the exact edge
+# functions and the E_A = 2A - E_B - E_C identity, and it is iron-proven across rungs 11 and 12.
+# Texturing changes WHAT is interpolated, not HOW the barycentrics are found. A second copy here
+# would be a second thing to keep correct, and the two would drift.
+
+include "lib/io.cyr"
+include "tricore.cyr"
+
+# ---- the UV frame ---------------------------------------------------------------------------
+# Six 16.16 texel-space coordinates, one pair per vertex, in the same order tri_prep took them.
+var TX_N  = 8;
+var tx_uv[8];
+fn tx_set(i, v): i64 { store64(&tx_uv + i * 8, v); return 0; }
+fn tx_get(i): i64 { return load64(&tx_uv + i * 8); }
+
+var TX_U0 = 0;
+var TX_V0 = 1;
+var TX_U1 = 2;
+var TX_V1 = 3;
+var TX_U2 = 4;
+var TX_V2 = 5;
+
+# ⛔ THE OVERFLOW GATE IS NOT DECORATION. The UV numerator is E * u summed over three vertices.
+# |E| can reach 2A * GPU_TRI_E_RATIO and |u| reaches 4096 << 16 = 2^28 at the texture-dimension cap,
+# so the product CAN exceed i64 for an extreme frame. Rung 11 hit exactly this class of bug — a
+# silent wrap that surfaced as a plausible-looking wrong picture far from its cause. Rather than
+# assume the corpus stays small, the reference REFUSES to answer when the product would wrap.
+# tex_prep returns 0 in that case and every consumer must treat 0 as "no answer", never as "black".
+var TX_NUM_MAX = 2305843009213693952;   # 2^61 — headroom of 4x over the 3-term sum
+
+var tx_ready = 0;
+
+# tex_prep — bind the UV frame to the CURRENT tri_prep frame. Call tri_prep FIRST.
+# Returns 1 on success, 0 if the frame or the UVs put the numerator out of exact range.
+fn tex_prep(u0, v0, u1, v1, u2, v2): i64 {
+    tx_ready = 0;
+    tx_set(TX_U0, u0); tx_set(TX_V0, v0);
+    tx_set(TX_U1, u1); tx_set(TX_V1, v1);
+    tx_set(TX_U2, u2); tx_set(TX_V2, v2);
+
+    var a2 = tp_get(TP_A2);
+    if (a2 <= 0) { return 0; }                  # degenerate frame — tri_prep already refused
+
+    # Bound the worst-case |E| over the frame the same way the ABI does, then check the product.
+    var emax = a2 * 1024;                       # GPU_TRI_E_RATIO
+    var umax = 0;
+    var i = 0;
+    while (i < 6) {
+        var a = tx_get(i);
+        if (a < 0) { a = 0 - a; }
+        if (a > umax) { umax = a; }
+        i = i + 1;
+    }
+    if (umax != 0) {
+        if (emax > TX_NUM_MAX / umax) { return 0; }
+    }
+    tx_ready = 1;
+    return 1;
+}
+
+# tex_uv_at — the affine interpolant at a pixel centre. Writes u,v (16.16) through the two slots.
+# ⚠ Uses the SAME E_A = 2A - E_B - E_C identity as the colour path, so a divergence between the two
+# is a divergence in tri_prep, not in one of them.
+var tx_u_out = 0;
+var tx_v_out = 0;
+
+fn tex_uv_at(px, py): i64 {
+    var pcx = (px << 16) + 32768;
+    var pcy = (py << 16) + 32768;
+    var eb = tp_get(TP_KXB) * pcx + tp_get(TP_KYB) * pcy + tp_get(TP_K0B);
+    var ec = tp_get(TP_KXC) * pcx + tp_get(TP_KYC) * pcy + tp_get(TP_K0C);
+    var ea = tp_get(TP_A2) - eb - ec;
+    var a2 = tp_get(TP_A2);
+
+    # ⚠ The divide TRUNCATES toward zero, and that is deliberate — see tx_floordiv for the proof
+    # that flooring is unobservable under clamp-to-edge. The rounding direction here is therefore
+    # NOT load-bearing; the texel-centre convention in tex_fetch is the thing that is.
+    var un = ea * tx_get(TX_U0) + eb * tx_get(TX_U1) + ec * tx_get(TX_U2);
+    var vn = ea * tx_get(TX_V0) + eb * tx_get(TX_V1) + ec * tx_get(TX_V2);
+    tx_u_out = tx_floordiv(un, a2);
+    tx_v_out = tx_floordiv(vn, a2);
+    return 0;
+}
+
+# ⛔ PLAIN TRUNCATION, AND THE FLOOR-DIVIDE WAS DELETED ON PROOF, NOT ON TASTE.
+#
+# This started as a floor-divide, on the reasoning that Cyrius `/` truncates toward zero and a
+# negative numerator would round the wrong way. The falsification pass then refused to let that
+# stand: a truncate-instead-of-floor mutation broke NOTHING, because under CLAMP-TO-EDGE the two
+# are indistinguishable at the output. Floor and truncate differ only for a negative value, they
+# differ by at most one 1/65536th of a texel, and EVERY negative texel index clamps to 0 — so no
+# input exists for which the rendered pixel differs.
+#
+# Keeping it would have put a branch in the shader's inner loop for behaviour no test could ever
+# reach, and left a permanently dead mutation in the gate. The arc's own rule is that an arm nobody
+# can imagine failing is documentation; the same applies to the code it guards.
+# ⚠ If WRAP addressing is ever added, this reasoning EXPIRES — wrapping makes negative indices
+# observable and the floor-divide becomes load-bearing. Re-derive here, do not assume.
+fn tx_floordiv(n, d): i64 {
+    return n / d;
+}
+
+# The addressed fetch, shared by the clamp path and the wrap mutation so both read texels the
+# same way and only the ADDRESSING differs between them.
+fn tx_fetch_at(tex, lut, tw, off, idx8): i64 {
+    if (idx8 == 1) {
+        var ix = load8(tex + off) & 0xFF;
+        return load32(lut + ix * 4) & 0xFFFFFFFF;
+    }
+    return load32(tex + off * 4) & 0xFFFFFFFF;
+}
+
+# tex_fetch — nearest texel with CLAMP-TO-EDGE, in either supported format.
+# `u`,`v` are 16.16 texel space. Returns a premultiplied ARGB dword.
+#
+# ⛔ NEAREST IS `floor(u >> 16)`, WITH NO +0.5. The texel-centre convention is fixed here and the
+# shader must match it exactly: the plan's own failure table says "right at integer scale, wrong at
+# fractional => texel-centre +0.5", so this line is the one that test discriminates on.
+# ⭐ THE MUTATIONS ARE PART OF THE ORACLE, NOT DEBUG LEFTOVERS. A selftest that has never been seen
+# to fail is documentation. Each flag below is a plausible implementation slip — two of them are
+# named in the plan's own failure table — and tex_falsify() requires every one to BREAK the arms.
+var tmut_centre = 0;            # add the +0.5 texel centre the plan warns about
+var tmut_wrap   = 0;            # wrap instead of clamping to edge
+var tmut_lshift = 0;            # use `>>` (LOGICAL) instead of `>>>` on the texel shift
+
+fn tex_fetch(tex, lut, tw, th, u, v, idx8): i64 {
+    if (tmut_centre == 1) { u = u + 32768; v = v + 32768; }
+    # ⚠ `>>>` IS ARITHMETIC AND `>>` IS LOGICAL IN CYRIUS — inverted from C, and one of the traps
+    # this tree has already been bitten by. A logical shift turns a negative UV into a huge positive
+    # index, which clamps to the LAST texel instead of the first: a mirrored edge, not a crash.
+    var tu = u >>> 16;
+    var tv = v >>> 16;
+    if (tmut_lshift == 1) { tu = u >> 16; tv = v >> 16; }
+    if (tmut_wrap == 1) {
+        tu = tu - (tx_floordiv(tu, tw) * tw);
+        tv = tv - (tx_floordiv(tv, th) * th);
+        return tx_fetch_at(tex, lut, tw, tv * tw + tu, idx8);
+    }
+    if (tu < 0) { tu = 0; }
+    if (tv < 0) { tv = 0; }
+    if (tu > tw - 1) { tu = tw - 1; }
+    if (tv > th - 1) { tv = th - 1; }
+    var off = tv * tw + tu;
+    if (idx8 == 1) {
+        var ix = load8(tex + off) & 0xFF;
+        return load32(lut + ix * 4) & 0xFFFFFFFF;
+    }
+    return load32(tex + off * 4) & 0xFFFFFFFF;
+}
+
+# tex_ref_px — the whole reference for one pixel: interpolate UV, fetch, modulate by coverage,
+# composite src-over onto `dst`.
+#
+# ⚠ COVERAGE MODULATES THE PREMULTIPLIED SOURCE, with the SAME exact /255 the colour path uses.
+# `(x * a + 127) >> 8` is NOT the same function as `(x * a + 127) / 255`; rung 11 established that
+# the exact divide is the bit-identity hinge, and reusing the shortcut here would reintroduce the
+# very disagreement that took a burn to find.
+var tx_clamp_hits = 0;                          # instrumentation: did clamp-to-edge actually fire?
+var tx_premul_hits = 0;
+
+fn tex_ref_px(tex, lut, tw, th, px, py, cov, dst, idx8): i64 {
+    if (cov == 0) { return dst; }
+    tex_uv_at(px, py);
+
+    # Record whether this sample was outside the texture, so a corpus that never leaves the
+    # interior cannot claim to have tested clamp-to-edge.
+    var tu = tx_u_out >>> 16;
+    var tv = tx_v_out >>> 16;
+    if (tu < 0) { tx_clamp_hits = tx_clamp_hits + 1; }
+    if (tv < 0) { tx_clamp_hits = tx_clamp_hits + 1; }
+    if (tu > tw - 1) { tx_clamp_hits = tx_clamp_hits + 1; }
+    if (tv > th - 1) { tx_clamp_hits = tx_clamp_hits + 1; }
+
+    var texel = tex_fetch(tex, lut, tw, th, tx_u_out, tx_v_out, idx8);
+
+    var out = 0;
+    var qa = 255;
+    var ch = 0;
+    while (ch < 4) {
+        var sh = 24 - ch * 8;
+        var c = (texel >> sh) & 0xFF;
+        var q = (c * cov + 127) / 255;
+        if (q > 255) { q = 255; }
+        if (ch == 0) { qa = q; }
+        if (q > qa) { q = qa; tx_premul_hits = tx_premul_hits + 1; }
+        out = out | (q << sh);
+        ch = ch + 1;
+    }
+    return tri_src_over(out, dst);
+}
+
+# ============================================================================================
+# THE SELFTEST — what this reference asserts about ITSELF
+# ============================================================================================
+# ⭐ Every arm is a property that would be WRONG under a plausible implementation slip, not a
+# restatement of the code. An arm nobody can imagine failing is documentation, not a test.
+fn tex_selftest(tex, lut): i64 {
+    var fail = 0;
+
+    # Build an 8x8 RGBA8 texture whose every texel is DISTINCT, so a wrong address is visible
+    # rather than accidentally right.
+    var i = 0;
+    while (i < 64) {
+        store32(tex + i * 4, 0xFF000000 | (i << 16) | ((63 - i) << 8) | (i * 3));
+        i = i + 1;
+    }
+    var k = 0;
+    while (k < 256) { store32(lut + k * 4, 0xFF000000 | (k << 16) | (k << 8) | k); k = k + 1; }
+
+    # ---- arm 1: 1:1 identity. A frame the size of the texture with UV == position must return
+    # each texel EXACTLY. This is the absolute test the plan names -- an oracle against an artifact
+    # the reference did not produce.
+    tri_prep(0, 0, 8, 0, 0, 8, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF);
+    if (tex_prep(0, 0, 8 << 16, 0, 0, 8 << 16) != 1) {
+        ps("texcore: arm1 tex_prep REFUSED"); nl(); fail = fail + 1;
+    }
+    var bad1 = 0;
+    var y = 0;
+    while (y < 8) {
+        var x = 0;
+        while (x < 8) {
+            var got = tex_ref_px(tex, lut, 8, 8, x, y, 255, 0xFF000000, 0);
+            var want = load32(tex + (y * 8 + x) * 4) & 0xFFFFFFFF;
+            if (got != want) { bad1 = bad1 + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    if (bad1 != 0) {
+        ps("texcore: arm1 FAILED -- 1:1 identity differs in "); pn(bad1); ps(" texels"); nl();
+        fail = fail + 1;
+    }
+
+    # ---- arm 2: clamp-to-edge fires and SATURATES. Sampling far outside must return the corner
+    # texel, not wrap and not black.
+    var corner = tex_fetch(tex, lut, 8, 8, 0 - (99 << 16), 0 - (99 << 16), 0);
+    if (corner != (load32(tex) & 0xFFFFFFFF)) {
+        ps("texcore: arm2 FAILED -- negative UV did not clamp to texel 0"); nl(); fail = fail + 1;
+    }
+    var far = tex_fetch(tex, lut, 8, 8, 99 << 16, 99 << 16, 0);
+    if (far != (load32(tex + 63 * 4) & 0xFFFFFFFF)) {
+        ps("texcore: arm2 FAILED -- large UV did not clamp to the last texel"); nl(); fail = fail + 1;
+    }
+
+    # ---- arm 3: NEAREST truncates, and the boundary is where it is. u just under 1.0 must still
+    # be texel 0; u exactly 1.0 must be texel 1. A +0.5 texel-centre slip moves both.
+    if (tex_fetch(tex, lut, 8, 8, 65535, 0, 0) != (load32(tex) & 0xFFFFFFFF)) {
+        ps("texcore: arm3 FAILED -- u=0.99998 did not select texel 0"); nl(); fail = fail + 1;
+    }
+    if (tex_fetch(tex, lut, 8, 8, 65536, 0, 0) != (load32(tex + 4) & 0xFFFFFFFF)) {
+        ps("texcore: arm3 FAILED -- u=1.0 did not select texel 1"); nl(); fail = fail + 1;
+    }
+
+    # ---- arm 4: IDX8 goes through the LUT. Byte i of the texture must produce LUT entry i.
+    var b = 0;
+    while (b < 64) { store8(tex + b, b * 4); b = b + 1; }
+    var iv = tex_fetch(tex, lut, 8, 8, 3 << 16, 2 << 16, 1);
+    var wantlut = load32(lut + ((2 * 8 + 3) * 4) * 4) & 0xFFFFFFFF;
+    if (iv != wantlut) {
+        ps("texcore: arm4 FAILED -- IDX8 fetch did not go through the LUT"); nl(); fail = fail + 1;
+    }
+
+    # ---- arm 5: the overflow gate REFUSES rather than wrapping. A UV at the domain cap against a
+    # large frame must be rejected, or the reference would answer with a silently wrapped number.
+    tri_prep(0, 0, 4000, 0, 0, 4000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF);
+    if (tex_prep(0, 0, 4096 << 16, 0, 0, 4096 << 16) != 0) {
+        ps("texcore: arm5 FAILED -- the overflow gate did NOT fire; the reference would wrap"); nl();
+        fail = fail + 1;
+    }
+
+    # ---- arm 6: coverage 0 is a no-op, and coverage 255 is the unmodulated texel.
+    tri_prep(0, 0, 8, 0, 0, 8, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF);
+    tex_prep(0, 0, 8 << 16, 0, 0, 8 << 16);
+    var iz = 0;
+    while (iz < 64) {
+        store32(tex + iz * 4, 0xFF000000 | (iz << 16) | ((63 - iz) << 8) | (iz * 3));
+        iz = iz + 1;
+    }
+    if (tex_ref_px(tex, lut, 8, 8, 3, 3, 0, 0xFF123456, 0) != 0xFF123456) {
+        ps("texcore: arm6 FAILED -- coverage 0 changed the destination"); nl(); fail = fail + 1;
+    }
+    return fail;
+}
+
+# ============================================================================================
+# THE FALSIFICATION PASS — every mutation MUST break the selftest
+# ============================================================================================
+# ⛔ WITHOUT THIS, A GREEN SELFTEST MEANS NOTHING. Rung 11's `trimodel` gate was reported as proving
+# the algorithm while its sample lattice could not reach x=62 — precisely where iron disagreed. The
+# lesson is that a gate proves what it SAMPLES, so each arm has to be shown capable of failing
+# before its passing is worth anything. [[feedback_instrument_has_no_oracle]]
+fn tex_falsify(tex, lut): i64 {
+    var bad = 0;
+
+    tmut_centre = 1;
+    var m1 = tex_selftest(tex, lut);
+    tmut_centre = 0;
+    ps("  mutation texel-centre +0.5 breaks "); pn(m1); ps(" arm(s)");
+    if (m1 == 0) { ps("   <== DID NOT FIRE"); bad = bad + 1; }
+    nl();
+
+    tmut_wrap = 1;
+    var m2 = tex_selftest(tex, lut);
+    tmut_wrap = 0;
+    ps("  mutation wrap-instead-of-clamp breaks "); pn(m2); ps(" arm(s)");
+    if (m2 == 0) { ps("   <== DID NOT FIRE"); bad = bad + 1; }
+    nl();
+
+    # ⚠ THIS ONE REPLACED A DEAD MUTATION. It was originally truncate-instead-of-floor, which broke
+    # nothing — see tx_floordiv for why that was a proof rather than a gap. The logical-shift slip is
+    # a real Cyrius trap and it IS observable: a negative UV becomes a huge positive index and clamps
+    # to the opposite edge.
+    tmut_lshift = 1;
+    var m3 = tex_selftest(tex, lut);
+    tmut_lshift = 0;
+    ps("  mutation logical-shift on a negative UV breaks "); pn(m3); ps(" arm(s)");
+    if (m3 == 0) {
+        ps("   <== DID NOT FIRE: no arm samples a NEGATIVE UV, so the shift choice is untested");
+        bad = bad + 1;
+    }
+    nl();
+    return bad;
+}

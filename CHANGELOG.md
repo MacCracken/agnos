@@ -9,6 +9,41 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 iron — attribute interpolation byte-exact, every control firing. This cycle carries the batch-path
 defect that four probes have now cornered. Bumped on cycle open; the user tags on close.
 
+### ⭐⭐ RUNG 13b — the texturing ORACLE (`texcore.cyr` / `texref.cyr`), host, zero burns
+
+The CPU reference the shader will be measured against. Six arms, each a property that a plausible
+slip would break rather than a restatement of the code: **1:1 identity** (the plan's absolute test —
+a frame the size of the texture with UV == position must return each texel exactly), clamp-to-edge
+**saturating** in both directions, the nearest boundary sitting at exactly 1.0, IDX8 resolving
+through the LUT, the overflow gate firing, and coverage 0 as a no-op.
+
+**The frame machinery is reused, not reimplemented.** `tri_prep` already derives the exact edge
+functions and the `E_A = 2A − E_B − E_C` identity and is iron-proven across rungs 11–12. Texturing
+changes *what* is interpolated, not *how* the barycentrics are found; a second copy would be a
+second thing to keep correct and the two would drift.
+
+⛔ **An overflow gate that refuses rather than wraps.** The UV numerator is `E · u` over three
+vertices; `|E|` can reach `2A · E_RATIO` and `|u|` reaches `2^28` at the dimension cap, so the
+product *can* exceed i64. Rung 11 lost four burns to exactly this class — a silent wrap surfacing as
+a plausible wrong picture far from its cause. `tex_prep` returns 0 and consumers must treat that as
+"no answer", never as "black".
+
+### ⭐ The falsification pass deleted code on its first run
+
+Three mutations, each required to break an arm: texel-centre `+0.5` (breaks 2), wrap-instead-of-clamp
+(breaks 2), and logical-`>>`-instead-of-arithmetic-`>>>` (breaks 1 — a real Cyrius trap, where a
+negative UV becomes a huge positive index and clamps to the *opposite* edge).
+
+A fourth mutation — truncate-instead-of-floor — **broke nothing, and that turned out to be a proof
+rather than a gap.** Floor and truncate differ only on a negative value, by at most one 1/65536th of
+a texel, and every negative texel index clamps to 0: no input exists for which the rendered pixel
+differs. The floor-divide was therefore **deleted**, removing a branch from the shader's inner loop
+that guarded behaviour no test could ever reach.
+
+⚠ The reasoning is recorded at the call site with its expiry condition: **if WRAP addressing is ever
+added this proof lapses**, because wrapping makes negative indices observable and the floor-divide
+becomes load-bearing again.
+
 ### ⭐⭐ RUNG 13a — `op 0x0B TRI_TEX` ABI, proven in QEMU at ZERO BURNS
 
 Texture mapping's ABI lands before one instruction of its shader exists — the same discipline that
