@@ -3790,6 +3790,34 @@ fn gpu_tri_list(vtx_kva, n_tris, w, h, dx, dy) {
     if (gpu_tri_arm() != 1) { return 0; }
     if (gpu_cov_arm() != 1) { return 0; }
 
+    # ⛔⛔ THIS LOOP MUST NOT RUN INSIDE THE OUTER BATCH, AND THAT COST FOUR IRON BURNS.
+    #
+    # gpo_execute_all sets gpu_batch_active for the whole #92 op array, so gpu_blend_cov_run only
+    # QUEUES dwords and returns — no fence, no wait, one tail for everything. That is correct when
+    # each op writes its own buffers. It is fatal here, because every triangle in this loop reuses
+    # the SAME THREE FIXED ARENA SLOTS:
+    #     GPU_TRI_EDGE_SUBOFF   the CPU rewrites the edges below, per triangle
+    #     GPU_TRI_PREP_SUBOFF   gpu_tri_prep rewrites the 128-byte record, per triangle
+    #     GPU_TRI_COV_SUBOFF    gpu_edge_cov rewrites the coverage mask, per triangle
+    # Batched, all 3N dispatches are queued FIRST and the CPU overwrites those slots long before the
+    # GPU executes any of them — so every dispatch ends up reading the LAST triangle's edges, prep
+    # record and coverage mask. The earlier triangles are not "lost" to a cache fault; they were
+    # never drawn with their own data.
+    #
+    # ⭐ This is exactly what the burn-9/10 probes measured, before the cause was known:
+    #   * six SEPARATE op 0x0A calls composite perfectly — each call has its own tail and wait
+    #   * one call with n=2 destroys triangle 0 EVEN WHEN triangle 1 covers nothing — triangle 0's
+    #     dispatch reads triangle 1's EMPTY coverage mask and therefore draws nothing at all
+    #   * a bare op 0x08 after a rendered rect harms nothing — different syscall, already drained
+    #   * every triangle is byte-exact ALONE — one triangle never races itself
+    #
+    # Suspending the batch makes each gpu_blend_cov_run emit its own tail and WAIT, which is what
+    # makes reusing one slot per triangle safe. It gives back the batching win for this op only;
+    # fusing N triangles into one dispatch (so the slots stop being shared at all) is the real
+    # answer and is rung 12's own work, not a fence patch.
+    var saved_batch = gpu_batch_active;
+    gpu_batch_active = 0;
+
     var i = 0;
     while (i < n_tris) {
         var b = vtx_kva + i * GPU_TRI_VTX_BYTES;
@@ -3811,8 +3839,21 @@ fn gpu_tri_list(vtx_kva, n_tris, w, h, dx, dy) {
 
         var edge_mc = gpu_arena_mc + GPU_TRI_EDGE_SUBOFF;
         if (gpu_tri_rgba(edge_mc, w, h, dx, dy, 3, GPU_RULE_NONZERO,
-        vx0, vy0, vx1, vy1, vx2, vy2, ca, cb, cc) != 1) { return 0; }
+        vx0, vy0, vx1, vy1, vx2, vy2, ca, cb, cc) != 1) {
+            gpu_batch_active = saved_batch;    # ⚠ restore on the FAILURE path too
+            return 0;
+        }
         i = i + 1;
+    }
+
+    gpu_batch_active = saved_batch;
+    # ⚠ Every dispatch above already fenced and drained, so the work is complete — but the shared
+    # fence slot now reads DONE, and the outer batch tail would sail straight through its wait
+    # believing a program it has not yet emitted has finished. Re-arm it so the caller's tail waits
+    # on its own work rather than on ours.
+    if (saved_batch != 0) {
+        store32(gpu_arena_phys + GPU_BLEND_DONE_SUBOFF, GPU_MT_NOTYET);
+        gpu_mfence();
     }
     return 1;
 }

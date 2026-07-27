@@ -3,6 +3,67 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.21] - 2026-07-27
+
+**Rung 12: the destroyer is the interpolation dispatch (open cycle).** 1.56.20 closed rung 11 on
+iron — attribute interpolation byte-exact, every control firing. This cycle carries the batch-path
+defect that four probes have now cornered. Bumped on cycle open; the user tags on close.
+
+### ⭐⭐⭐ FIXED — `gpu_tri_list` looped inside the outer BATCH while reusing fixed arena slots
+
+**Root cause.** `gpo_execute_all` sets `gpu_batch_active` for the whole `#92` op array, so
+`gpu_blend_cov_run` only *queues* dwords and returns — no fence, no wait, one tail for everything.
+That is correct when each op writes its own buffers. It is fatal for `gpu_tri_list`, whose
+per-triangle loop reuses **three fixed arena slots**:
+
+| slot | rewritten per triangle by |
+|---|---|
+| `GPU_TRI_EDGE_SUBOFF` | the CPU, at the top of the loop |
+| `GPU_TRI_PREP_SUBOFF` | `gpu_tri_prep`'s 128-byte record |
+| `GPU_TRI_COV_SUBOFF` | `gpu_edge_cov`'s coverage mask |
+
+Batched, all 3N dispatches are queued **first** and the CPU overwrites those slots long before the
+GPU executes any of them. Every dispatch therefore reads the **last** triangle's edges, prep record
+and coverage mask. The earlier triangles were never lost to a cache fault — they were never drawn
+with their own data.
+
+⭐ **Every probe result falls out of this exactly**, including the one that looked most paradoxical:
+`n=2` with a second triangle covering **nothing** destroys triangle 0 precisely because triangle 0's
+dispatch reads triangle 1's *empty* coverage mask and so draws nothing at all. Six separate calls
+work because each carries its own tail and wait; a bare `op 0x08` is harmless because it is a
+different syscall that has already drained; every triangle is exact alone because one triangle never
+races itself.
+
+**Fix:** suspend the batch across the loop, so each dispatch emits its own tail and waits — which is
+what makes one-slot-per-triangle safe. Restored on the failure path too, and the shared fence slot is
+re-armed afterwards so the caller's tail waits on its own program rather than sailing through on
+ours.
+
+⚠ **This gives back the batching win for this op only, and that is deliberate.** Fusing N triangles
+into a single dispatch — so the slots stop being shared at all — is rung 12's actual remaining work,
+not a fence patch.
+
+### ⭐⭐⭐ RUNG 12 CORNERED — four probes, no guessing left
+
+`op 0x0A` composites wrongly, and burns 8–10 narrowed it by measurement rather than argument. Every
+one of these is a *ruling out*, which is what makes the remainder small:
+
+| probe | result | what it eliminates |
+|---|---|---|
+| **singleton sweep** | all 6 triangles EXACT alone | every triangle's geometry, attribute frame, coverage and blending |
+| **P1** six SEPARATE `op 0x0A` calls | **EXACT** | consecutive dispatches into one rect, in general |
+| **P2** `n=2`, second triangle draws NOTHING | **1711 differing** | blending, overlap, submission order — a triangle writing **zero pixels** still destroys its predecessor |
+| **P3** bare `op 0x08` after a rendered rect | **STILL EXACT** | the coverage pass, and with it the whole edge_setup + rasteriser pair |
+
+⭐ **What is left:** the **interpolation dispatch** (or the prep record it reads), re-issued for the
+next triangle *within one syscall*. The identical dispatch across a syscall boundary is fine — so
+`gpu_tri_list`'s loop is missing something the syscall boundary happens to supply.
+
+⚠ The per-dispatch PM4 is already `ACQUIRE_MEM(INV) → DISPATCH → CS_PARTIAL_FLUSH →
+ACQUIRE_MEM(TCWB) → fence`, which is correct on paper, and the arena gate reports 51 slots with 0
+overlaps. Both of the obvious mechanisms are therefore already excluded on inspection, which is
+precisely why the next step is another measurement and not a fix.
+
 ## [1.56.20] - 2026-07-26
 
 **Rung 11 closed on iron; the byte oracle opens (open cycle).** 1.56.19 shipped attribute
