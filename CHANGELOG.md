@@ -9,6 +9,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 iron — attribute interpolation byte-exact, every control firing. This cycle carries the batch-path
 defect that four probes have now cornered. Bumped on cycle open; the user tags on close.
 
+### Changed — the 32-bit model primitives moved into `tricore.cyr`, shared not copied
+
+Rung 13's texture model needs the same 96-bit accumulate and the same estimate-and-correct quotient
+that rung 11 proved on iron. `trimodel.cyr` carries its own `main()`, so including it would silently
+shadow the includer's — the duplicate-`fn` trap this tree has already been bitten by — and copying
+would leave two versions of iron-proven arithmetic to keep in step.
+
+The 85-line block (the explicit high/low numerator, `n_madd` with its signed-high-dword fixup and
+`tm_ehi_unsigned` mutation, the funnel shift, and `tm_quot`) now lives in `tricore.cyr`.
+
+⭐ **The move is proven by `trimodel` itself**, which still runs every gate against the relocated
+definitions: conviction 4/4, gate 1 and 1b green, and all three falsification gates still breaking
+the pixel counts they broke before. A faithless extraction shows up as a red gate, not as a silent
+divergence. All six consumers build; `triref`, `trimodel` and `texref` all exit 95.
+
 ### ⭐⭐ RUNG 13b — the texturing ORACLE (`texcore.cyr` / `texref.cyr`), host, zero burns
 
 The CPU reference the shader will be measured against. Six arms, each a property that a plausible
