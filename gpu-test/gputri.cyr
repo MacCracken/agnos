@@ -457,9 +457,55 @@ fn tri_attr(): i64 {
     }
     ps("  N12 "); pnum(n_xvary); puts(" case(s) vary >= 32 levels along a row      FIRED");
 
+    # ---- N13: the exact rounding correction actually fires ---------------------------------
+    # ⛔ The shader's estimate-and-correct step exists for the quotients where the rounding bias
+    # carries into the next level. A corpus that never produces one leaves that step ENTIRELY
+    # untested while every case still compares exact.
+    if (tr_corr_hits == 0) {
+        puts("gputri: N13 FAILED -- the rounding correction never fired across the corpus;");
+        puts("        the shader's correct-by-one step would be untested by this run");
+        return 86;
+    }
+    ps("  N13 rounding correction fired "); pnum(tr_corr_hits); puts(" times                FIRED");
+
+    # ---- N14: the premultiplication restore fires ------------------------------------------
+    if (tr_premul_hits == 0) {
+        puts("gputri: N14 FAILED -- min(q_ch, q_a) never fired; the premultiplied restore");
+        puts("        is untested and a shader omitting it would pass");
+        return 86;
+    }
+    ps("  N14 premultiplied restore fired "); pnum(tr_premul_hits); puts(" times              FIRED");
+
+    # ---- N15: determinism -- the same case twice in one boot must be byte-identical --------
+    # ⚠ A run that is not reproducible cannot be compared to anything, and a stale-buffer ghost
+    # reads as a pass. This is cheap and it is the only thing that catches it in-tool.
+    tri_prep(tc_get(0,0), tc_get(0,1), tc_get(0,2), tc_get(0,3),
+             tc_get(0,4), tc_get(0,5), tc_get(0,6), tc_get(0,7), tc_get(0,8));
+    tri_ref_fill(&tri_ref, w, h);
+    var d1 = digest(&tri_ref, bytes);
+    var zz = 0;
+    while (zz < bytes) { store8(&tri_ref + zz, 0xA5); zz = zz + 1; }
+    tri_ref_fill(&tri_ref, w, h);
+    var d2 = digest(&tri_ref, bytes);
+    if (d1 != d2) {
+        puts("gputri: N15 FAILED -- the same case computed twice gave DIFFERENT bytes");
+        return 86;
+    }
+    puts("  N15 same case twice in one boot is byte-identical         FIRED");
+
+    # ---- N16: this tool's reference agrees with the HOST triref ----------------------------
+    # ⭐ THE ONLY CHECK THAT CATCHES BOTH SIDES BEING WRONG TOGETHER. Everything above compares
+    # this binary against itself; an --agnos codegen divergence would move the reference and the
+    # comparison in lockstep and stay green. The corpus digest is printed for a human to diff
+    # against the host triref's, and a mismatch means the COMPILER, not the shader.
+    ps("gputri: N16 corpus digest "); phex8(dg_all);
+    puts("  -- must equal host triref's printed digest");
+
     puts("");
-    puts("gputri: reference side green. ⚠ The GPU comparison is NOT wired yet -- this run");
-    puts("gputri: proves the corpus and its controls, not the shader. Exit 94, never 95.");
+    puts("");
+    puts("gputri: reference side green, all controls fired. ⚠ The GPU comparison is NOT wired");
+    puts("gputri: yet -- this run proves the corpus and its controls, not the shader.");
+    puts("gputri: Exit 94, never 95, until a dispatched result is compared.");
     return 94;
 }
 

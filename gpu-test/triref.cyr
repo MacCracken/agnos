@@ -6,6 +6,18 @@
 include "lib/io.cyr"
 include "tricore.cyr"
 
+var tp_scratch[2048];           # 64*64*4 = 16384 B = 2048 u64 slots (measured sizing)
+fn ph8(v): i64 {
+    var d = 28;
+    while (d >= 0) {
+        var nib = (v >> d) & 0xF;
+        if (nib < 10) { print("0123456789" + nib, 1); }
+        if (nib >= 10) { print("abcdef" + (nib - 10), 1); }
+        d = d - 4;
+    }
+    return 0;
+}
+
 fn main(): i64 {
     ps("triref -- CPU reference for barycentric RGBA attribute interpolation"); nl();
     var fail = tr_selftest();
@@ -17,6 +29,10 @@ fn main(): i64 {
     # diffed field by field. Corpus case 0's frame, so both sides use identical inputs.
     tri_prep(0, 0, 256, 0, 0, 256, 0xFFFF0000, 0xFF00FF00, 0xFF0000FF);
     tr_prep_dump();
+    # ⭐ N16's host side. gputri prints the same number on the GPU box; they MUST match, and a
+    # mismatch indicts the COMPILER (an --agnos codegen divergence moving both the reference and
+    # the comparison together) rather than the shader.
+    ps("triref: N16 corpus digest 0x"); ph8(tc_corpus_digest(&tp_scratch, 64, 64)); nl();
     ps("corpus:"); nl();
     fail = fail + tc_run();
     if (fail != 0) {
