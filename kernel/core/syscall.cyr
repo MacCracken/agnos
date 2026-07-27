@@ -1046,7 +1046,25 @@ var GPU_TEX_MAX_DIM    = 4096;       # per-axis texture cap; a reject, never a c
 # source works. Choosing the general form here is what stops rung 16's tile-owner from needing its
 # own bespoke fetch.
 var GPU_TEX_FLAG_IDX8  = 0x01;       # texture is 8bpp indices + a LUT slot; else RGBA8 linear
-var GPU_TEX_FLAGS_KNOWN = 0x01;      # anything outside this is REJECTED, never accepted-and-ignored
+
+# ⭐ FULLCOV — RUNG 14's FEASIBILITY FLAG, AND IT IS GENERAL, NOT DOOM-SHAPED.
+#
+# op 0x0B costs THREE dispatches: edge_setup, the coverage rasteriser, then the texture pass. Rung
+# 13's MEASURED fit puts the chain at 52.7 us fixed, which caps a 35 Hz frame at ~542 submissions
+# before a single pixel is shaded. Two of those three dispatches exist only to build a coverage
+# mask — and for a primitive that fills its destination rect COMPLETELY that mask is uniformly 255,
+# so the work is pure waste.
+#
+# ⛔ THIS IS A COVERAGE-SHAPE STATEMENT, NOT A DOOM OP. "the primitive fills its rect" is a general
+# graphics fact — axis-aligned quads, full-screen blits, glyph cells. Same doctrine as TD-7's
+# IDX8+LUT: the kernel grows per native workload, never to chase a consumer's internals.
+# [[project_agnos_kernel_growth_rules]]
+#
+# ⚠ WITH FULLCOV THERE IS NO SHAPE, SO THERE MUST BE NO EDGES. edge_id, n_edges and rule must all
+# be zero; accepting them and ignoring them is how a caller silently gets geometry it did not ask
+# for — the same doctrine as the bidirectional LUT rule.
+var GPU_TEX_FLAG_FULLCOV = 0x02;     # every pixel of the rect is covered; skip both coverage passes
+var GPU_TEX_FLAGS_KNOWN = 0x03;      # anything outside this is REJECTED, never accepted-and-ignored
 var GPU_TEX_LUT_ENTRIES = 256;       # a full byte of index; a short LUT is a reject, not a clamp
 
 var GPU_RULE_NONZERO   = 0;
@@ -1291,6 +1309,15 @@ fn gpo_validate_tritex(rec, fbw, fbh) {
     var ner = load32(rec + 60) & 0xFFFFFFFF;
     var ne = ner & 0xFFFF;
     var rule = (ner >> 16) & 0xFFFF;
+
+    # ⭐ FULLCOV supplies no shape, so it must supply no edges. All three fields zero, or refuse.
+    if ((flags & GPU_TEX_FLAG_FULLCOV) != 0) {
+        if (ne != 0) { return GPO_E_EDGEBUF; }
+        if (rule != 0) { return GPO_E_RULE; }
+        if ((load32(rec + 12) & 0xFFFFFFFF) != 0) { return GPO_E_EDGEBUF; }
+        return 0;
+    }
+
     if (rule != GPU_RULE_NONZERO) { return GPO_E_RULE; }
     if (ne < 3) { return GPO_E_EDGEBUF; }
     if (ne > GPU_EDGE_MAX) { return GPO_E_EDGEBUF; }
@@ -2087,7 +2114,7 @@ fn edge_abi_selftest() {
     pass = pass + ea_expect(&d, GPO_E_LUTSLOT, "tex: LUT supplied without IDX8", 30);
     store32(&d + 32, 0);
 
-    store32(&d +  4, 0x02);                       # outside GPU_TEX_FLAGS_KNOWN
+    store32(&d +  4, 0x04);                       # outside GPU_TEX_FLAGS_KNOWN (0x02 is now FULLCOV)
     pass = pass + ea_expect(&d, GPO_E_RESERVED, "tex: unknown flag bit", 21);
     store32(&d +  4, 0);
 

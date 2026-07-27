@@ -36,6 +36,86 @@ marking its own homework. And the dwords are iron-proven — rung 13 closed at 1
 encoding CLASS, not instruction-for-instruction across every shader. That needs a real `.s` parser,
 which remains a separate sized bite.
 
+### ⭐⭐⭐ FULLCOV IS CORRECT ON IRON — 5 of 5 byte-identical, 15 of 15 cases green
+
+Skipping both coverage dispatches produces **exactly** what the shaped path produces. `gputri --cov`
+held at 20/20 and rung 13's ten cases stayed exact, so nothing regressed to buy it.
+
+### ⛔ …but the SAVING was unmeasured, and the burn brief misdiagnosed why
+
+The bench printed the same ~52 µs as before, and the tracker read that as "the flag did not reach
+the record". **Wrong.** `tx_bench_at` builds edges and leaves the flag clear — it timed the *shaped*
+path both times. The flag was working; the bench simply never exercised it, and the brief conflated
+*correctness proven* with *saving proven*.
+
+The bench now times **both paths at both sizes** and reports the measured delta, the percentage, and
+the resulting dispatches-per-frame budget. A saving that has not been timed is a claim, not a result
+— and this arc has already paid for treating one as the other.
+
+### ⭐⭐⭐ RUNG 14's BLOCKER ATTACKED — `GPU_TEX_FLAG_FULLCOV` drops op 0x0B from 3 dispatches to 1
+
+The measurement said rung 14 is dispatch-bound, so the next move is to remove dispatches. `op 0x0B`
+costs **three**: `edge_setup`, the coverage rasteriser, then the texture pass. For a primitive that
+fills its destination rect the mask those first two build is **uniformly 255** — pure waste. DOOM's
+wall quads and floor spans are exactly that shape.
+
+`GPU_TEX_FLAG_FULLCOV` (bit 1) skips both coverage dispatches. Expected effect: **52.7 µs → ~17.5 µs
+per primitive**, which turns 100 quads from 10.5 ms (37 % of a 35 Hz frame) into ~3.5 ms.
+
+⛔ **A coverage-shape statement, not a DOOM op.** "the primitive fills its rect" is a general
+graphics fact — axis-aligned quads, full-screen blits, glyph cells — and it keeps the pixel-identical
+oracle intact. Same doctrine as TD-7's IDX8+LUT: the kernel grows per native workload, never to chase
+a consumer's internals.
+
+⚠ **Bidirectional, like the LUT rule:** FULLCOV supplies no shape, so `edge_id`, `n_edges` and `rule`
+must all be **zero** or the record is refused. Accepting and ignoring them is how a caller silently
+gets geometry it did not ask for.
+
+⚠ **The shader reads 255 rather than the mask, and that is correctness, not an optimisation.** The
+kernel skipped the coverage dispatches, so the mask slot still holds a *previous* op's bytes —
+loading it would sample another primitive's shape.
+
+### ⛔ Two defects caught by reading the change, not by a burn
+
+* **The format branch aliased with the new flag.** `s31` became a flags word, so the old
+  `s_cmp_eq_u32 s31, 0` meant "RGBA8 **and** not fullcov" — an RGBA8 primitive with FULLCOV set
+  (`s31 = 2`) would have fallen into the IDX8 fetch and read one byte per texel through a palette
+  that was never supplied. Now tests bit 0 only.
+* **The ABI battery's "unknown flag" case used `0x02`**, which FULLCOV makes *valid*. Moved to
+  `0x04`, so the reject is still a reject. 57 of 57 still pass.
+
+**`gputex` gates FULLCOV on byte-identity**, not on "it drew something": all five frames must
+reproduce the shaped path exactly against an all-255 reference, or the run refuses to report green.
+A saving bought with a wrong picture is not a saving.
+
+### ⭐⭐⭐ MEASURED — and it overturns rung 14's stated premise
+
+Iron, two-point fit:
+
+```
+32x32 = 54.4 us/dispatch    256x256 = 160.2 us/dispatch
+fixed overhead ~52.7 us/dispatch · slope 1.64 ns/px · >= 3680 MB/s at 256x256
+```
+
+The fit reproduces its own inputs exactly (`52.7 + 0.00164 × 65536 = 160.2`, against iron's 160.2).
+
+⛔ **The plan says "rung 14 is bandwidth-bound". The measurement says it is DISPATCH-bound.**
+3680 MB/s is ample. 52.7 µs of fixed cost is not. At a 35 Hz DOOM tic (28571 µs) that affords
+**542 dispatches per frame before a single pixel is shaded**, and 316 at 60 Hz — while the pixel
+term allows 17.4 Mpx/frame against DOOM's 64000 px screen.
+
+⭐ **Consequence: rung 12's carry-forward moves onto rung 14's critical path.** `gpu_tri_list`
+suspends batching and fences per triangle (the 1.56.21 correctness fix), so N quads cost
+2N × 52.7 µs — 100 quads is **10.5 ms**, or 37 % of a 35 Hz frame and 63 % of a 60 Hz one, **in
+submission alone**. Fusing N triangles into one dispatch is no longer an optimisation; it is the
+feasibility condition. Both the plan's rung 13 and rung 14 rows now say so.
+
+⚠ **A units bug in my own label, caught before rung 14 could size a budget from it.** The slope was
+printed as `pico-us/px` when it is **picoseconds per pixel** — wrong by 10⁶. `us_s`/`us_l` are
+nanoseconds per dispatch, so differencing and scaling by 1000 yields ps/px. Corrected, with the
+derivation written at the call site, and the tool now prints the µs/dispatch and Mpx/frame ceilings
+directly so the next reader does not repeat the arithmetic.
+
 ### ⛔ The first bandwidth measurement was overhead-dominated — replaced with a two-point fit
 
 Iron reported `200 dispatches of 32x32 in 11284 us → 56 us/dispatch, >= 163 MB/s`. **That number

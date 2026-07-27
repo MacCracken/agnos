@@ -66,6 +66,12 @@ tex_rgba:
     s_and_saveexec_b64 s[20:21], vcc
     s_cbranch_execz L_END
 
+    // ⭐ WAVE-UNIFORM BRANCH ON THE FORMAT WORD. `flags` lives in an SGPR, so every lane takes the
+    // same side — the one place a scalar branch is legitimate. Bit 1 is FULLCOV.
+    s_and_b32       s13, s31, 2
+    s_cmp_eq_u32    s13, 2
+    s_cbranch_scc1  L_FULLCOV
+
     // ---- coverage byte at (px, py). The mask is w bytes per row, tightly packed. ----
     s_mul_i32       s11, s9, s6             // py * w
     v_add_u32       v7, s11, v1
@@ -82,6 +88,16 @@ tex_rgba:
     v_cmp_ne_u32    vcc, 0, v4
     s_and_saveexec_b64 s[22:23], vcc
     s_cbranch_execz L_END
+    s_branch        L_HAVE_COV
+
+L_FULLCOV:
+    // ⭐ FULLCOV: every pixel is covered, so there is no mask to read and no lane to mask off.
+    // The kernel skipped both coverage dispatches, so the mask slot holds STALE bytes from a
+    // previous op — loading it would be reading another primitive's shape. 255 is not an
+    // optimisation here, it is the only correct value.
+    v_mov_b32       v4, 0xFF
+
+L_HAVE_COV:
 
     // ---- sample point at the pixel CENTRE, 16.16 ----
     v_lshlrev_b32   v5, 16, v1
@@ -390,7 +406,12 @@ tex_rgba:
     // [[reference_gfx9_per_lane_control_flow]] records.
     v_mul_lo_u32    v7, v23, s34            // tv * tw
     v_add_u32       v7, v7, v19             // + tu   => linear texel index
-    s_cmp_eq_u32    s31, 0
+    // ⛔ TEST BIT 0, NOT THE WHOLE WORD. s31 became a FLAGS word when FULLCOV was added, so the
+    // old `s31 == 0` meant "RGBA8 and not fullcov" — an RGBA8 primitive with FULLCOV set (s31 = 2)
+    // would have fallen through to the IDX8 fetch and read one byte per texel through a palette
+    // that was never supplied. Caught by reading the change, not by a burn.
+    s_and_b32       s13, s31, 1
+    s_cmp_eq_u32    s13, 0
     s_cbranch_scc0  L_FETCH_IDX8
 
     v_lshlrev_b32   v7, 2, v7               // RGBA8: 4 bytes per texel

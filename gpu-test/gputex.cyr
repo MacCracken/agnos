@@ -187,11 +187,22 @@ fn tx_ref_fill(i, idx8): i64 {
 var tx_ndiff = 0;
 var tx_dumped = 0;
 
-fn tx_run_case(i, idx8, tileno): i64 {
+fn tx_run_case_f(i, idx8, tileno, fullcov): i64 {
+    var xflags = idx8;
+    if (fullcov != 0) { xflags = xflags + 2; }
     if (tri_prep(txf(i,0), txf(i,1), txf(i,2), txf(i,3), txf(i,4), txf(i,5),
                  0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF) != 1) { return 0 - 1; }
     if (tex_prep(txf(i,6), txf(i,7), txf(i,8), txf(i,9), txf(i,10), txf(i,11)) != 1) { return 0 - 1; }
-    if (tx_cov_capture(i, &tx_cov) == 0) { return 0 - 2; }
+    if (fullcov == 0) {
+        if (tx_cov_capture(i, &tx_cov) == 0) { return 0 - 2; }
+    }
+    if (fullcov != 0) {
+        # ⭐ THE REFERENCE MUST BE FED 255, NOT THE CAPTURED MASK. FULLCOV's whole claim is that
+        # every pixel is covered; feeding the reference a real mask here would compare the GPU's
+        # full rect against a shaped reference and report a difference that is the TEST's fault.
+        var cz = 0;
+        while (cz < TXW * TXH) { store8(&tx_cov + cz, 255); cz = cz + 1; }
+    }
     tx_ref_fill(i, idx8);
 
     var tx0 = (tileno % 4) * 40 + 8;
@@ -221,15 +232,15 @@ fn tx_run_case(i, idx8, tileno): i64 {
     var z = 0;
     while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
     store32(&d +  0, 11);                       # op 0x0B TRI_TEX
-    store32(&d +  4, idx8);
+    store32(&d +  4, xflags);
     store32(&d +  8, tid);
-    store32(&d + 12, eid);
+    if (fullcov == 0) { store32(&d + 12, eid); }
     store32(&d + 16, (TXH * 65536) + TXW);
     store32(&d + 20, (ty0 * 65536) + tx0);
     store32(&d + 24, vid);
     store32(&d + 28, (TXD * 65536) + TXD);
     if (idx8 != 0) { store32(&d + 32, lid); }
-    store32(&d + 60, 3);
+    if (fullcov == 0) { store32(&d + 60, 3); }
     var rc = syscall(92, &d, 64);
     if (rc != 0) {
         syscall(74, tid); syscall(74, lid); syscall(74, vid); syscall(74, eid);
@@ -285,7 +296,7 @@ var TX_BENCH_REPS = 200;
 
 # tx_bench_at — time REPS dispatches of a w x h rect covering the whole rect, and return elapsed us.
 # Returns 0 - 1 if anything refused, so the caller can decline to divide.
-fn tx_bench_at(w, h, reps): i64 {
+fn tx_bench_at(w, h, reps, fullcov): i64 {
     # A frame spanning the rect, UV mapping the whole 8x8 texture across it.
     var b = &tx_vtx;
     store32(b +  0, 0);          store32(b +  4, 0);
@@ -324,13 +335,14 @@ fn tx_bench_at(w, h, reps): i64 {
     var z = 0;
     while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
     store32(&d +  0, 11);
+    store32(&d +  4, fullcov * 2);            # bit 1 = FULLCOV
     store32(&d +  8, tid);
-    store32(&d + 12, eid);
     store32(&d + 16, (h * 65536) + w);
     store32(&d + 20, (8 * 65536) + 8);
     store32(&d + 24, vid);
     store32(&d + 28, (TXD * 65536) + TXD);
-    store32(&d + 60, 3);
+    # ⚠ FULLCOV supplies NO shape, so edge_id / n_edges / rule stay zero or the ABI refuses.
+    if (fullcov == 0) { store32(&d + 12, eid); store32(&d + 60, 3); }
 
     if (syscall(92, &d, 64) != 0) {          # one warm-up: arming must not land in the timed window
         syscall(74, tid); syscall(74, vid); syscall(74, eid);
@@ -366,8 +378,8 @@ fn tx_bench(): i64 {
     var small = 32;
     var large = 256;
 
-    var el_s = tx_bench_at(small, small, reps_s);
-    var el_l = tx_bench_at(large, large, reps_l);
+    var el_s = tx_bench_at(small, small, reps_s, 0);
+    var el_l = tx_bench_at(large, large, reps_l, 0);
     if (el_s <= 0) { puts2("gputex: bench REFUSED -- small rect did not time; no rate reported"); return 0; }
     if (el_l <= 0) { puts2("gputex: bench REFUSED -- large rect did not time; no rate reported"); return 0; }
 
@@ -381,11 +393,22 @@ fn tx_bench(): i64 {
     pn(large); ps("x"); pn(large); ps(" = ");
     pn(us_l / 1000); ps("."); pn((us_l % 1000) / 100); puts2(" us/dispatch");
 
-    # slope in pico-us per pixel, so integer division keeps resolution at these magnitudes
-    var slope_p = (us_l - us_s) * 1000 / (px_l - px_s);
-    var fixed_p = us_s * 1000 - slope_p * px_s;
-    ps("gputex:   fixed overhead ~"); pn(fixed_p / 1000000); ps(" us/dispatch; slope ~");
-    pn(slope_p); puts2(" pico-us/px");
+    # ⚠ UNITS, WRITTEN OUT, BECAUSE THE FIRST VERSION MISLABELLED THEM BY 10^6. us_s/us_l are
+    # NANOSECONDS per dispatch (elapsed us x 1000 / reps). Multiplying their difference by another
+    # 1000 before dividing by pixels gives PICOSECONDS PER PIXEL. The first label said "pico-us/px",
+    # which would have had rung 14 sizing a budget from a number a million times too large.
+    var slope_ps = (us_l - us_s) * 1000 / (px_l - px_s);        # picoseconds per pixel
+    var fixed_ns = us_s - (slope_ps * px_s / 1000);             # nanoseconds per dispatch
+    ps("gputex:   fixed overhead ~"); pn(fixed_ns / 1000); ps(" us/dispatch; slope ~");
+    pn(slope_ps); ps(" ps/px ("); pn(slope_ps / 1000); ps("."); pn((slope_ps % 1000) / 100);
+    puts2(" ns/px)");
+
+    # ⭐ THE BUDGET, DERIVED HERE SO RUNG 14 DOES NOT HAVE TO. Two ceilings, and which one binds is
+    # the whole point of measuring both terms.
+    var frame_us = 28571;                                        # DOOM's 35 Hz tic
+    ps("gputex:   rung-14 budget @35fps: "); pn(frame_us * 1000 / fixed_ns);
+    ps(" dispatches/frame before ANY pixels, or ");
+    pn(frame_us * 1000000 / slope_ps / 1000000); puts2(" Mpx/frame if fused into one");
 
     # ⚠ LOWER BOUND. Texel traffic is one dword per covered pixel here; the cache serves repeats,
     # so real achieved bandwidth is higher than this figure, never lower.
@@ -395,6 +418,28 @@ fn tx_bench(): i64 {
     puts2(" MB/s (lower bound -- texels counted uncached)");
     ps("gputex:   ⭐ rung 14 sizes its budget from the SLOPE; the intercept caps dispatches/frame.");
     nl();
+
+    # ⭐⭐ THE FULLCOV SAVING, MEASURED RATHER THAN ASSERTED.
+    # ⛔ The first version of this bench timed the SHAPED path twice and never set the flag, so the
+    # ~52 us it printed said nothing at all about FULLCOV — and the burn brief compounded it by
+    # reading "bench unchanged" as evidence the flag had not reached the record. It had; the bench
+    # simply was not exercising it. Correctness (5 of 5 byte-identical) was proven that burn; the
+    # SAVING was not, and the two were being conflated.
+    var el_fs = tx_bench_at(small, small, reps_s, 1);
+    var el_fl = tx_bench_at(large, large, reps_l, 1);
+    if (el_fs <= 0) { puts2("gputex:   FULLCOV bench REFUSED at 32x32 -- no saving reported"); return 1; }
+    if (el_fl <= 0) { puts2("gputex:   FULLCOV bench REFUSED at 256x256 -- no saving reported"); return 1; }
+    var fus = el_fs * 1000 / reps_s;
+    var ful = el_fl * 1000 / reps_l;
+    ps("gputex:   FULLCOV "); pn(small); ps("x"); pn(small); ps(" = ");
+    pn(fus / 1000); ps("."); pn((fus % 1000) / 100); ps(" us   ");
+    pn(large); ps("x"); pn(large); ps(" = ");
+    pn(ful / 1000); ps("."); pn((ful % 1000) / 100); puts2(" us");
+    ps("gputex:   ⭐ saving at "); pn(small); ps("x"); pn(small); ps(": ");
+    pn((us_s - fus) / 1000); ps(" us/dispatch (");
+    pn((us_s - fus) * 100 / us_s); puts2("%) -- two of three dispatches removed");
+    ps("gputex:   rung-14 budget WITH fullcov @35fps: ");
+    pn(28571 * 1000 / fus); puts2(" dispatches/frame");
     return 1;
 }
 
@@ -406,7 +451,7 @@ fn main(): i64 {
 
     var i = 0;
     while (i < TXN) {
-        var r = tx_run_case(i, 0, i);
+        var r = tx_run_case_f(i, 0, i, 0);
         ps("  case "); pn(i); ps(" "); tx_name(i); ps("  ");
         if (r == 0 - 1) { puts2("frame REJECTED by the reference"); }
         if (r == 0 - 2) { puts2("coverage capture FAILED -- the reference cannot be fed the GPU's input"); }
@@ -425,13 +470,32 @@ fn main(): i64 {
     var idxexact = 0;
     var j = 0;
     while (j < TXN) {
-        var r2 = tx_run_case(j, 1, j + 5);
+        var r2 = tx_run_case_f(j, 1, j + 5, 0);
         ps("  IDX8 case "); pn(j); ps(" ");
         if (r2 == 0) { puts2("EXACT"); idxexact = idxexact + 1; }
         if (r2 != 0) { pn(r2); puts2(" (non-zero)"); }
         j = j + 1;
     }
     tx_build_tex();
+
+    # ---- FULLCOV: identical pixels, one dispatch instead of three -------------------------
+    # ⭐ THE GATE IS BYTE-IDENTITY, NOT "IT DREW SOMETHING". A flag that skips the coverage passes
+    # must produce EXACTLY what the shaped path produces on a primitive that fills its rect;
+    # anything less and the saving is bought with a wrong picture.
+    # ⚠ Frame 0 is the 1:1 identity case, whose triangle covers only HALF the rect, so this is
+    # deliberately compared against an all-255 reference rather than against frame 0's own output.
+    puts2("gputex: FULLCOV -- coverage passes skipped; must be byte-identical to a 255 mask");
+    var fcexact = 0;
+    var fi = 0;
+    while (fi < TXN) {
+        var rf = tx_run_case_f(fi, 0, fi, 1);
+        ps("  FULLCOV case "); pn(fi); ps(" ");
+        if (rf == 0) { puts2("EXACT"); fcexact = fcexact + 1; }
+        if (rf > 0) { pn(rf); puts2(" differing px"); }
+        if (rf < 0) { ps("refused, code "); pn(0 - rf); nl(); }
+        fi = fi + 1;
+    }
+    ps("gputex: FULLCOV "); pn(fcexact); ps(" of "); pn(TXN); puts2(" exact");
 
     syscall(84);
     puts2("gputex: presented -- the tiles above are ON SCREEN now");
@@ -450,6 +514,11 @@ fn main(): i64 {
     }
     if (exact != TXN) { return 87; }
     if (idxexact != TXN) { return 87; }
+    if (fcexact != TXN) {
+        puts2("gputex: ⛔ FULLCOV did not reproduce the shaped path byte for byte -- the saving");
+        puts2("gputex:   would be bought with a wrong picture. Refusing to report rung 13 green.");
+        return 87;
+    }
     puts2("gputex: ⭐ RUNG 13 -- every rendered pixel byte-identical to texcore, both formats.");
     return 95;
 }
