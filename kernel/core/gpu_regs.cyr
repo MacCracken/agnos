@@ -1203,6 +1203,14 @@ var GPU_TEXL_SHADER_SUBOFF     = 0x5B000;    # residency slot 11, rung 14 fused 
 # blob that edits the body throws away rung 13's 17/17 proof. Two resident blobs cost 4 KB of an
 # arena that has 0x4000 free here; a shared blob with a runtime branch would cost the proof.
 var GPU_TEXL_CM_SHADER_SUBOFF  = 0x5C000;    # residency slot 11b, rung 14b col-major  -> ends 0x5D000
+# ⭐ RUNG 15. A FOURTH BLOB, same doctrine as 14b's third: tex_bilin.s carries tex_rgba.s's iron-proven
+# HEAD and TAIL character-identically (scripts/check/texbi-body-identity.sh, four stages, mutation-
+# tested four ways) and diverges only in the middle. A runtime branch inside tex_rgba would have cost
+# rung 13's 17/17 proof AND forced its 32-VGPR declaration up to 48 for every nearest-neighbour
+# primitive. 4 KB of arena is the cheaper currency. ⚠ [0x5D000,0x5E000) verified free by walking the
+# sorted slot extents — the next occupant is GPU_BR_SRC_SUBOFF at 0x60000 — not by eye; two earlier
+# placements in this file were "obvious" gaps read off the list that turned out to collide.
+var GPU_TEXBI_SHADER_SUBOFF    = 0x5D000;    # residency slot 12, rung 15 bilinear  -> ends 0x5E000
 var GPU_TRI_PREP_SUBOFF        = 0xE0000;    # 64 records x 128 B  -> ends 0xE2000
 var GPU_TRI_EDGE_SUBOFF        = 0xE2000;    # synthesised frame edges when DERIVE is set -> ends 0xE3000
 var GPU_TRI_COV_SUBOFF         = 0xE4000;    # 8bpp coverage scratch, 1 MB  -> ends 0x1E4000

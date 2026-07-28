@@ -39,10 +39,34 @@ drop is concentrated at high n (`wait @ n=32` +6%, `@ n=256` −43%), so `wait` 
 control, not a bonus**. ⚠ `build` and `wait` deltas came out *exactly* equal (557 µs); unexplained,
 needs a third primitive count, do not build on it. **⇒ `wait` is not a clean GPU-time measurement at
 high primitive counts and must not be cited as one until it has an independent control.**
-**▶ 1.56.29 OPEN — RUNG 15 `bilinear`. ABI + reference + model DONE; ⛔ THE BLOB IS BLOCKED ON A REGISTER-BUDGET DECISION: `tex_rgba.s` has ZERO VGPR headroom (high-water v31 vs 32 declared), bilinear needs ~+17, so RSRC1_TEX must go 0x00AC0207 → 0x00AC020B (48 VGPRs, 8→5 waves/SIMD — the cheap resource, since the GPU is not the bottleneck). Hand-allocating into the existing 32 is [[reference_handwritten_shader_regalloc]] exactly, which already cost a burn.** Zero-burn half first: the CPU reference with IDENTICAL
-rounding (⚠ `v_cvt_pk_u8_f32` clamps negatives to 0 — the reference must clamp the same or the diff is
-unfair) plus a host model of the shader arithmetic, the pattern that landed rungs 9b/11/13.
-Remaining after rung 15: **1.56.30** rungs 17/18/19 + the rung-closure debt, **1.56.31 MODESET's true residual — the COLD case only**, 1.56.32 HDMI audio, 1.56.33 the invalidate hoist. · **HDMI audio: (a) sequencing is ELIMINATED** by M9 (1.56.15 — both arms exit 95 in one boot, DIG_MODE 2→3 readback-verified, ATOM #4 rc 0, #76 DISABLE+ENABLE rc 0); ⛔ the DCCG symbol-clock lead is FALSIFIED (in-boot A/B, burn 11). Surviving candidates: **(b) a write that does not latch · (c) the bare-metal environment.** · **3D — the rung ladder is at 14b, and rung 16 `tile-own` is ALSO done (1.56.17, host, 0 burns).** Rungs 9–13 are IRON-CLOSED
+**▶ 1.56.29 OPEN — RUNG 15 `bilinear`. THE BLOB IS LANDED; ONE ITEM LEFT (the iron oracle).**
+✅ `kernel/shaders/tex_bilin.s`, **580 dwords**, resident at `GPU_TEXBI_SHADER_SUBOFF = 0x5D000`,
+dispatched under a **separate** `GPU_COMPUTE_PGM_RSRC1_TEXBI = 0x00AC020B` (48 VGPRs) — *not* a widened
+`RSRC1_TEX`, which is shared by two iron-proven paths. **INTEGER 4-tap, zero `v_cvt`**: the float plan
+was dropped because with 8-bit weights the filter is *exact* (weight sum exactly 65536 for all 65,536
+`(fx,fy)`; accumulator peaks at 16,711,680, inside a 32-bit lane), so the row's named rounding risk is
+**eliminated, not mitigated**. ⭐ The prep record is **unchanged** — the fraction was already in the
+16.16 coordinate rung 13 discarded — so this rung adds **zero** UC stores to the CPU cost 1.56.27/28
+just cut 4×. ✅ ABI flag flipped reserved→accepted **in the same change as the blob** (battery
+**94/94**); `check.sh` **20/20**; `bigate`/`bimodel` now actually RUN (they were cited but executed by
+nothing); `texbi-body-identity.sh` proves rung 13's head AND tail survive verbatim, mutation-tested
+four ways. ⚠ **NOT YET IRON-VALIDATED.**
+▶ **REMAINING for rung 15: a `gputex` arm demanding byte-identity on iron.** Deliberately a separate
+bite — `tex_ref_px` fuses the affine/divide pipeline with a nearest sample, so a bilinear reference
+needs that UV derivation factored out for `bicore` to consume; a sloppy reference would convict a
+correct shader, which is worse than no reference.
+⛔ **THE TRAP CLASS THIS RUNG KEEPS PRODUCING: correct under WRAP, wrong under CLAMP.** Three instances
+now — the M2 shift kind, the `+1` neighbour needing the **pre-clamp floor**, and the out-of-domain
+predicates needing to fire on **both** taps. A wrap-only suite sees none of them. Anyone adding a
+coordinate transform here must sweep CLAMP too.
+Remaining after rung 15 — ⚠ **this list was STALE by +2 until 2026-07-28** (it still carried the
+pre-renumbering mapping and collapsed rungs 17/18/19 into one cut); [`planning/gpu.md`](planning/gpu.md)
+§ release plan is authoritative and this now matches it: **1.56.30** rung 17 `depth` (⚠ op `0x0D` does
+not exist yet — `GPU_OP_SUPPORTED` is `0x1F1F`, so minting it means growing `gpu_caps` #89's support
+word first), **1.56.31** rung 18 `persp-correct`, **1.56.32** rung 19 `pilot` **+ the rung-closure
+debt** (the kernel is six rungs ahead of a shipped consumer; rule 2 says one — either the consumer
+ships there or the rule gets struck), **1.56.33** MODESET's true residual — the COLD case only,
+**1.56.34** HDMI audio (carries the imitation-edge removal), **1.56.35** the measured invalidate hoist. · **HDMI audio: (a) sequencing is ELIMINATED** by M9 (1.56.15 — both arms exit 95 in one boot, DIG_MODE 2→3 readback-verified, ATOM #4 rc 0, #76 DISABLE+ENABLE rc 0); ⛔ the DCCG symbol-clock lead is FALSIFIED (in-boot A/B, burn 11). Surviving candidates: **(b) a write that does not latch · (c) the bare-metal environment.** · **3D — the rung ladder is at 14b, and rung 16 `tile-own` is ALSO done (1.56.17, host, 0 burns).** Rungs 9–13 are IRON-CLOSED
 (edge coverage · attribute interpolation · tri-list · **texturing 17/17 byte-identical, both formats, WRAP,
 FULLCOV**). **⭐⭐⭐ RUNG 14 *AND* 14b ARE BOTH IRON-CLOSED 2026-07-27 (burn 2, exit 95, zero red
 lines).** op 0x0C `TEX_LIST` is byte-identical to 32 individual op 0x0B dispatches; the col-major

@@ -53,21 +53,41 @@ kind observable under WRAP, that line goes red and reports that the addressing m
 ⚠ Without this the shader would have been correct under WRAP — which is what DOOM uses — and wrong on
 every clamped sample, with a wrap-only suite showing all green.
 
-### Added — `GPU_TEX_FLAG_BILINEAR = 0x10`, RESERVED and REFUSED
+### Added — `GPU_TEX_FLAG_BILINEAR = 0x10`, minted RESERVED then **ACCEPTED with the blob**
 
-The bit is named and the ABI returns **`GPO_E_NOTIMPL`**, because the shader does not exist.
-⛔ Accepting it would recreate exactly the defect 1.56.24 fixed — an ABI blessing requests its worker
-cannot execute. **`GPO_E_NOTIMPL` was minted in that cut for op `0x09`'s `DERIVE`; this is its second
-user.**
+The bit was named and refused with **`GPO_E_NOTIMPL`** while the shader did not exist, then flipped to
+accepted **in the same change that landed `tex_bilin.s`** — never one commit earlier, never one later.
+⛔ Accepting it ahead of the blob would have recreated exactly the defect 1.56.24 fixed — an ABI
+blessing requests its worker cannot execute. **`GPO_E_NOTIMPL` was minted in that cut for op `0x09`'s
+`DERIVE`; this was its second user, and it did its job for the length of one cut.**
 
 ⚠ It required a two-level split to answer correctly. The first attempt returned `GPO_E_RESERVED`,
-because `gpo_validate`'s outer check calls any unlisted bit garbage. `BILINEAR` is now a **known name**
-at the outer level (`gpo_flags_known`) and **unbuilt** at the inner (`gpo_validate_tritex`) — "stop
+because `gpo_validate`'s outer check calls any unlisted bit garbage. `BILINEAR` is a **known name** at
+the outer level (`gpo_flags_known`) and was **unbuilt** at the inner (`gpo_validate_tritex`) — "stop
 setting that bit" and "that flag is real but this kernel cannot run it" are different problems with
-different fixes. Deliberately **not** widened into `GPU_TEX_FLAGS_KNOWN` itself, or a future op reusing
-that constant would silently inherit a flag it has no shader for.
+different fixes. Still deliberately **not** widened into `GPU_TEX_FLAGS_KNOWN` itself: op `0x0C` has no
+bilinear body, so the inner check now reads `gpo_flags_known(GPU_OP_TRI_TEX)` — the accessor that
+already encodes "0x0B accepts BILINEAR, 0x0C does not" in one place.
 
-ABI battery **91 → 93 of 93**; `edge-abi-smoke` **16 passed, 0 failed**.
+⚠ **Deleting the reject could not be a deletion.** The generic unknown-bit test used the *shared*
+`GPU_TEX_FLAGS_KNOWN` (`0x07`), which does not contain `BILINEAR` — so removing the `NOTIMPL` line
+alone would have turned every bilinear request into `GPO_E_RESERVED`, *"that bit is not a thing"*, on
+the exact commit that made it a thing.
+
+### Found — an early return hides every rule behind it from every test that trips it
+
+Flipping the `BILINEAR|FULLCOV` selftest case from `expect(NOTIMPL)` to `expect_valid` **failed** with
+`GPO_E_EDGEBUF`. The kernel was right and the test was wrong: `FULLCOV` requires the three edge fields
+zeroed (*"FULLCOV supplies no shape, so it must supply no edges"*), and the case had inherited
+`edge_id 13` / `n_edges 3` from the cases above it. That rule had been **unreachable from this case**
+for as long as the `NOTIMPL` reject stood in front of it. Recorded rather than quietly fixed, because
+the general form is the point: every early return added to a validator hides the rules behind it from
+every test that trips the early return first.
+
+Also added `BILINEAR|COLMAJOR` → `GPO_E_RESERVED` — widening op `0x0B`'s mask for bilinear must not
+drag in `COLMAJOR`, which is op `0x0C`'s alone. Nothing else in the battery would have caught that.
+
+ABI battery **91 → 93 → 94 of 94**; `edge-abi-smoke` **16 passed, 0 failed**.
 
 ### Scoped — ONE blob, op 0x0B only
 
@@ -77,7 +97,67 @@ doubling the shader surface for a filter with **no consumer at all** — DOOM sa
 section's rule 2 says the kernel is never more than one rung ahead of a shipped consumer, and it is
 already six ahead. The list variants wait for someone to ask.
 
-**Remaining for rung 15:** the blob itself, then a `gputex` arm demanding byte-identity on iron.
+### Added — `kernel/shaders/tex_bilin.s`, the rung 15 blob (580 dwords, resident, dispatchable)
+
+Derived from `tex_rgba.s`. Three changes: each axis captures the 8-bit fraction **before** it floors
+and emits **two** indices; the fetch pulls **four** texels with four addresses in flight and one
+`s_waitcnt`; a per-channel integer blend collapses them into the single texel rung 13's tail consumes.
+**Zero `v_cvt`**, matching rung 13.
+
+⭐ **The prep record is unchanged.** Bilinear's fraction was already present in the 16.16 coordinate
+rung 13 computed and discarded, so `gpu_tex_prep` is untouched and this rung adds **zero** uncached
+stores to the per-primitive CPU cost that 1.56.27/28 just cut 4×.
+
+**48 VGPRs via a SEPARATE `GPU_COMPUTE_PGM_RSRC1_TEXBI = 0x00AC020B`**, not a widened `RSRC1_TEX` —
+that constant is shared by `gpu_tex_list` (op `0x0C`) and `gpu_tri_tex` (op `0x0B`), both iron-proven,
+and widening it would cut their occupancy for nothing. `tex_rgba`'s high-water is `v31` against 32
+declared: **zero headroom**, so every added value would have been a write over a live register — which
+is [[reference_handwritten_shader_regalloc]] exactly, the burn where a clobber wrote ZERO over `v19`
+and read like a dead shader. ⚠ The occupancy trade (8 waves/SIMD → 5) is affordable **because it was
+measured**: 1.56.26/28 showed CPU prep dominates a DOOM frame, so waves-in-flight is the cheap
+resource. The value was hand-derived from the field encoding and then **independently confirmed** by
+the assembler's harvested descriptor.
+
+⛔ The slot and the descriptor are selected **together, in one block, from one flag** in
+`gpu_tex_dispatch`. A 48-VGPR kernel dispatched under a 32-VGPR declaration does not fault — it
+silently aliases high VGPRs across waves and paints a wrong picture, unattributable without a burn.
+
+### Found — two ordering traps in the SPECIFICATION, both invisible to a wrap-only suite
+
+1. **The `+1` neighbour must come from the pre-clamp floor**, never the clamped index:
+   `clamp(clamp(-1)+1) = 1` but `clamp(-1+1) = 0` — off by a whole texel, on exactly the extrapolated
+   coordinates a filter exists to smooth. Identical under mask-WRAP.
+2. **The out-of-domain predicates must fire on BOTH taps.** They exist because the u32 reciprocal
+   quotient is garbage outside its domain; applied only to `x0`, the filter would blend a correct edge
+   texel against an arbitrary one.
+
+Same shape as the M2 shift finding above — correct under WRAP, wrong under CLAMP — which is now three
+instances in one rung. ⚠ Trap 2 is also **the one thing `bimodel` does not cover**: the model takes a
+16.16 UV as given, so a red burn confined to extrapolated pixels is the one place the "green model ⇒
+blame the emission" inference does not hold. Named in the shader header rather than left to be
+rediscovered mid-burn.
+
+### Added — `scripts/check/texbi-body-identity.sh`, a four-stage drift gate
+
+`tex_bilin` is a harder case than `tex_list`: it shares rung 13's code at **both ends** and diverges in
+the middle, so the rung-14 gate (which assumes one contiguous shared suffix) does not apply.
+**S1** head source (99 lines) · **S2** tail source (75 lines) · **S3** tail dwords (73, tail-aligned) ·
+**S4** every head dword difference is a branch **offset** carrying the same SOPP opcode.
+
+⭐ **Mutation-tested four ways, and the fourth earns S4 its place**: an edit *before* the head marker
+sits outside both source spans and is caught by the dword stage **alone**. Without S4 a change to the
+bounds guard or the coverage read would have shipped green.
+
+### Added — `bigate` and `bimodel` now actually RUN in `check.sh`
+
+They were written this cut, run by hand, and cited in the blob's comments as proof the filter is exact
+— while **nothing executed them**. An oracle a shader leans on that no script runs is a citation, not a
+gate. `host-gpu-oracles.sh` now runs `texlist`, `bigate` and `bimodel`.
+
+**Remaining for rung 15:** a `gputex` arm demanding byte-identity on iron. ⚠ Deliberately a separate
+bite: `tex_ref_px` computes the affine/divide pipeline **and** samples nearest in one function, so a
+bilinear reference needs that UV derivation factored out for `bicore` to consume. A sloppy reference
+would convict a correct shader, which is worse than no reference at all.
 
 ## [1.56.28] - 2026-07-28
 

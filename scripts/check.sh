@@ -83,7 +83,7 @@ BLOBDRIFT=""
 # ⚠ tex_rgba and tex_list were NOT in this list until rung 14 — the two largest and most
 # intricate blobs in the tree were the two nobody was diffing. Both pass; the gap was in the gate,
 # not the tables.
-for sb in edge_setup edge_cov tri_rgba tex_rgba tex_list tex_list_cm; do
+for sb in edge_setup edge_cov tri_rgba tex_rgba tex_list tex_list_cm tex_bilin; do
     sh "$ROOT/scripts/check/shader-blob.sh" check "$ROOT/kernel/shaders/$sb.s" "$sb" >/tmp/shader-blob-$sb.log 2>&1 \
         || BLOBDRIFT="$BLOBDRIFT$sb "
 done
@@ -105,10 +105,20 @@ python3 "$ROOT/scripts/check/texl-cm-derive.py" check >/tmp/texl-cm.log 2>&1 && 
 check "rung 14b's col-major shader is the declared derivation" $rc
 [ $rc -eq 0 ] || cat /tmp/texl-cm.log
 
+# tex_bilin.s (rung 15) shares rung 13's code at BOTH ENDS and diverges in the middle, so it needs
+# its own gate rather than the rung-14 one: that gate assumes the shared region is a single
+# contiguous SUFFIX. Four stages — head source, tail source, tail dwords, and an assertion that the
+# head's only dword differences are branch OFFSETS. ⚠ Mutation-tested four ways; the fourth
+# (an edit BEFORE the head marker, outside both source spans) is caught by the dword stage ALONE,
+# which is what earns that stage its place.
+sh "$ROOT/scripts/check/texbi-body-identity.sh" >/tmp/texbi-body.log 2>&1 && rc=0 || rc=$?
+check "rung 15's shader carries rung 13's head and tail verbatim" $rc
+[ $rc -eq 0 ] || cat /tmp/texbi-body.log
+
 # The host oracle for the op 0x0C grid mapping. ⚠ Until now NOTHING ran tests/gpu/*.cyr — they were
 # scanned and cited but never executed, so a red oracle stayed invisible until someone remembered it.
 sh "$ROOT/scripts/check/host-gpu-oracles.sh" >/tmp/host-gpu.log 2>&1 && rc=0 || rc=$?
-check "host GPU oracles pass (op 0x0C grid mapping + its 5 mutations)" $rc
+check "host GPU oracles pass (0x0C grid map, rung 15 bilinear exactness + model)" $rc
 [ $rc -eq 0 ] || cat /tmp/host-gpu.log
 
 # Call arity. cycc WARNS on an argument-count mismatch and builds anyway, so a wrong call ships green.

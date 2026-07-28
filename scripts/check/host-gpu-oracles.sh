@@ -7,13 +7,22 @@
 # is the same class of defect as a gate wired with a bare `; rc=$?`: a check that exists on paper and
 # cannot fail in practice.
 #
-# ⚠ SCOPE, STATED HONESTLY: this runs texlist ONLY. It is the oracle for the op 0x0C grid mapping
-# (rungs 14 and 14b), which is live work with mutations that must keep firing. doomcol, doomwall,
-# texmodel/texgate, edgemodel, refraster and the rest are equally host-runnable and equally unwired;
-# adding them is a separate bite, not something to smuggle in beside a rung.
+# ⚠ SCOPE, STATED HONESTLY: this runs texlist, bigate and bimodel. It does NOT run doomcol, doomwall,
+# texmodel/texgate, edgemodel or refraster — those are equally host-runnable and equally unwired, and
+# adding them is a separate bite rather than something smuggled in beside a rung.
 #
-# What PASSES: exit 95. texlist returns 86 if any grid case is inexact OR if fewer than all of its
-# mutations go red — so this gate covers both the model and its own falsification.
+# ⭐ bigate + bimodel ADDED AT RUNG 15 (1.56.29), AND THE REASON IS THE SAME ONE IN THE HEADER ABOVE.
+# They were written this cut, run by hand, and cited in the blob's comments as the proof that the
+# bilinear filter is exact — while NOTHING executed them. An oracle a shader's comments lean on, that
+# no script runs, is a citation rather than a gate. bimodel in particular carries five mutations that
+# must keep firing; if it silently stopped compiling, the tree would stay green and rung 15's whole
+# attribution claim ("green model + red iron ⇒ blame the EMISSION") would be resting on a file nobody
+# had run since the day it was written.
+#
+# What PASSES: exit 95 from each. texlist returns 86 if any grid case is inexact OR if fewer than all
+# of its mutations go red; bigate returns 90 if any of its 7 exactness properties break; bimodel
+# returns 90 if the 32-bit-lane model diverges from the reference OR if a mutation fails to go red.
+# Every one of the three therefore covers both its model and its own falsification.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -30,7 +39,7 @@ export CYRIUS_ALLOW_PARENT_INCLUDES
 mkdir -p "$GPU/build"
 
 rc=0
-for t in texlist; do
+for t in texlist bigate bimodel; do
     out="$(cd "$GPU" && cyrius build "$t.cyr" "build/$t" 2>&1)" || {
         echo "host-gpu-oracles: FAIL -- $t.cyr does not BUILD"
         echo "$out" | tail -20

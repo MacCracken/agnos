@@ -82,9 +82,9 @@ pass=0; fail=0
 chk() { if grep -q "$1" "$LOG"; then echo "PASS: $2"; pass=$((pass+1)); else echo "FAIL: '$1' — $3"; fail=$((fail+1)); fi; }
 nchk() { if grep -q "$1" "$LOG"; then echo "FAIL: '$1' present — $3"; fail=$((fail+1)); else echo "PASS: $2"; pass=$((pass+1)); fi; }
 
-chk "edge-abi: 93 of 93 cases correct" \
-    "every one of the 93 ABI cases returned the reason the ABI specifies" \
-    "not 93/93 - read the named FAIL line(s) above; each names its case, want and got"
+chk "edge-abi: 94 of 94 cases correct" \
+    "every one of the 94 ABI cases returned the reason the ABI specifies" \
+    "not 94/94 - read the named FAIL line(s) above; each names its case, want and got"
 chk "edge-abi: PASS -- the 0x08/0x09/0x0A/0x0B/0x0C ABIs reject every malformed record" \
     "the battery's own verdict line is PASS" \
     "verdict line absent or FAIL"
