@@ -22,7 +22,7 @@ and `exit 2`s without them, and `scripts/check.sh:86-90` treats exit 2 as drift 
 a box with no LLVM**, quietly reversing ratified decision D-1. Also only **6 of the 17** blobs are gated at
 all (all 17 currently match; it is a coverage gap, not a break). Both are cut 1.56.24. (3) **D-1/D-2/D-4 ratified (1.56.8):**
 llvm-mc rejected; `#92` blend = premultiplied f32, frozen; whole-surface translucency IS a real MUDRA/SHANTA
-requirement → DCN second plane stays a live deferred item. **REMAINING — rebuilt 2026-07-28 as numbered cuts; see [`planning/gpu.md`](planning/gpu.md) § release plan. ⛔ The previous text here was materially false and three agents planned against it:** it called MODESET "recommended next, own the pipe from cold" when **the live-pipe modeset is DONE** (M1-M6 iron-closed 1.56.11/1.56.12; item 7's own criterion `OTG_MASTER_EN` 0→1 met at 1.56.12 — frame counter 2615→0→115, panel blanked and relit), and it twice promised an "L1 discriminator runs first, free" that **had already run and returned VOID** (2026-07-24/25; the positive control did not sound, so it carries zero information — never write it up as "sequencing exonerated"). **✅ 1.56.24 DONE** (zero burns: four real correctness defects + this ledger). **✅ 1.56.25 DONE** (zero burns: dead-code removal + the `EDGE_CAP_PROBE` burn-trap — a profile that built a kernel byte-identical to the default while telling the operator otherwise). **▶ 1.56.26 INSTRUMENT LANDED, BURN ARMED** — the kernel now times its own `#92` phases (copyin/validate/build/wait) and reports the grid it actually programmed; `run /bin/gpuprof` at n=32 vs n=256 reads the slope. ⚠ Needs **`--update-all`** (kernel change). Rubric: `agnosticos iron-nuc-zen-log.md#tracker-15626-decompose-f`. Then 1.56.27-30 rungs 15/17/18/19 + the consumer debt, **1.56.31 MODESET's true residual — the COLD case only**, 1.56.32 HDMI audio, 1.56.33 the invalidate hoist. · **HDMI audio: (a) sequencing is ELIMINATED** by M9 (1.56.15 — both arms exit 95 in one boot, DIG_MODE 2→3 readback-verified, ATOM #4 rc 0, #76 DISABLE+ENABLE rc 0); ⛔ the DCCG symbol-clock lead is FALSIFIED (in-boot A/B, burn 11). Surviving candidates: **(b) a write that does not latch · (c) the bare-metal environment.** · **3D — the rung ladder is at 14b, and rung 16 `tile-own` is ALSO done (1.56.17, host, 0 burns).** Rungs 9–13 are IRON-CLOSED
+requirement → DCN second plane stays a live deferred item. **REMAINING — rebuilt 2026-07-28 as numbered cuts; see [`planning/gpu.md`](planning/gpu.md) § release plan. ⛔ The previous text here was materially false and three agents planned against it:** it called MODESET "recommended next, own the pipe from cold" when **the live-pipe modeset is DONE** (M1-M6 iron-closed 1.56.11/1.56.12; item 7's own criterion `OTG_MASTER_EN` 0→1 met at 1.56.12 — frame counter 2615→0→115, panel blanked and relit), and it twice promised an "L1 discriminator runs first, free" that **had already run and returned VOID** (2026-07-24/25; the positive control did not sound, so it carries zero information — never write it up as "sequencing exonerated"). **✅ 1.56.24 DONE** (zero burns: four real correctness defects + this ledger). **✅ 1.56.25 DONE** (zero burns: dead-code removal + the `EDGE_CAP_PROBE` burn-trap — a profile that built a kernel byte-identical to the default while telling the operator otherwise). **✅✅ 1.56.26 CLOSED ON IRON 2026-07-28** — `F` is **PER-PRIMITIVE, 7.35 µs each**, all of it in `gpu_texl_build`/`gpu_tex_prep` (build is 117× the validate slope). A 640-column DOOM frame carries **4.71 ms of CPU** that no transpose removes; **the GPU is no longer the bottleneck, the CPU prep is, by 52×**. **▶ NEXT: `gpu_tex_prep`.** Then 1.56.27-30 rungs 15/17/18/19 + the consumer debt, **1.56.31 MODESET's true residual — the COLD case only**, 1.56.32 HDMI audio, 1.56.33 the invalidate hoist. · **HDMI audio: (a) sequencing is ELIMINATED** by M9 (1.56.15 — both arms exit 95 in one boot, DIG_MODE 2→3 readback-verified, ATOM #4 rc 0, #76 DISABLE+ENABLE rc 0); ⛔ the DCCG symbol-clock lead is FALSIFIED (in-boot A/B, burn 11). Surviving candidates: **(b) a write that does not latch · (c) the bare-metal environment.** · **3D — the rung ladder is at 14b, and rung 16 `tile-own` is ALSO done (1.56.17, host, 0 burns).** Rungs 9–13 are IRON-CLOSED
 (edge coverage · attribute interpolation · tri-list · **texturing 17/17 byte-identical, both formats, WRAP,
 FULLCOV**). **⭐⭐⭐ RUNG 14 *AND* 14b ARE BOTH IRON-CLOSED 2026-07-27 (burn 2, exit 95, zero red
 lines).** op 0x0C `TEX_LIST` is byte-identical to 32 individual op 0x0B dispatches; the col-major
@@ -40,15 +40,23 @@ cost had nowhere to go but the launched coefficient. A third point at 24× fewer
 exposed it. ⇒ **"row-major cannot draw a DOOM frame — 24.5 ms" is RETRACTED**; measured, that frame
 is **4.6 ms** and fits the budget. Col-major remains a **50× GPU reduction** (0.09 ms) and is worth
 keeping — because it is 50× cheaper, not because the alternative is impossible.
-⚠⚠ **THE OPEN QUESTION IS `F`, AND IT IS AN INFERENCE, NOT A MEASUREMENT.** 264 µs is fixed in wave
-count but was only ever measured at **32 primitives**. One FULLCOV op 0x0B dispatch benches at
-27.8 µs, so the remaining ~236 µs plausibly scales per-primitive (~7.4 µs: validation plus
-`gpu_tex_prep` in `gpu_texl_build`). If so a 640-column frame carries **~4.7 ms of CPU**, comparable
-to the entire row-major GPU cost and **not reducible by transposing anything**; if `F` is
-per-*dispatch* it is 0.27 ms and irrelevant. **The two answers differ by 17× and no burn has
-separated them.** ⇒ NEXT BITE: decompose `syscall(92)` into validate / build / dispatch-and-wait,
-and have the kernel report the grid it actually launched (today's wave counts are computed CPU-side
-by the instrument, so they predict rather than observe). As built at 1.56.23: op `0x0C GPU_OP_TEX_LIST` fuses N
+✅✅ **`F` IS ANSWERED — MEASURED ON IRON 2026-07-28 (1.56.26, exit 95). IT IS PER-PRIMITIVE: 7.35 µs
+EACH, AND IT IS ALL IN `gpu_texl_build` / `gpu_tex_prep`.** Two points, n=32 and n=256: CPU grew
+**7.59×** for 8× the primitives. Slopes — `validate` 0.0625 µs/prim · **`build` 7.29 µs/prim** ·
+`wait` 5.14 µs/prim. gpu.md's "~7.4 µs" guess was right to two figures, but its composition was wrong
+in the way that matters: **build is 117× the validate slope**, so optimising the validator buys 0.9%.
+⇒ **a 640-column DOOM frame carries 4.71 ms of CPU — 16.5% of a 28.6 ms budget — and NO TRANSPOSE
+REMOVES ANY OF IT.** ⛔⛔ **This re-ranks the 3D lane: the GPU is no longer the bottleneck, the CPU prep
+is, by 52×.** Frame totals: row-major 4.71 CPU + 4.60 GPU = **9.31 ms**; col-major 4.71 + 0.09 =
+**4.80 ms**, so rung 14b's 50× is real but GPU-only and reads **~1.9× at the frame level**. Col-major
+stays — it is simply no longer where the time is. **NEXT: `gpu_tex_prep`** (7.35 µs ≈ 22,000 cycles at
+3 GHz for one affine frame — defect-shaped, not irreducible). ✅ Both sanity gates passed: WAIT was
+substantial and scaled (drain-netting held), and the OBSERVED grid matched prediction exactly at both
+points (1024/8192) — the first actual check of a wave count in this arc rather than an assumption.
+⚠ WAIT fits `36 µs + 161 ns/wave`, 4.5× the 36 ns/working model — **deliberately NOT promoted**: a
+two-point fit is what produced the retracted 177 ns figure, and 1-px primitives run 1/64 occupancy, so
+occupancy is the likely missing variable. Needs a third point.
+As built at 1.56.23: op `0x0C GPU_OP_TEX_LIST` fuses N
 textured primitives into ONE dispatch — ABI 83/83, validator, record array, dispatch, shader (458 dwords =
 a **41**-dword prologue + the **417**-dword character-identical body, gated by `texl-body-identity.sh`;
 ⚠ corrected 1.56.24 — "a 16-instruction prologue on rung 13's 442" conflated tex_rgba's 442-dword TOTAL

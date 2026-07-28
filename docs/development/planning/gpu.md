@@ -82,7 +82,7 @@ come first deliberately, so the ledger gets true before anything else is built o
 |---|---|---|---|
 | **1.56.24** | **Truth-up + the correctness defects the review found.** Zero-risk, all verifiable on host. Op `0x09` accepts `GPU_RULE_EVENODD` and `GPU_TRI_FLAG_DERIVE` that its worker refuses (`syscall.cyr:1699` vs `gpu.cyr:6318`) — reject at the validator, matching what `gpo_validate_edge` already does for `0x08`. `gpu_fence`'s five-dword append is **not wrap-safe** (`gpu.cyr:1620`, unmasked `wptr << 2`) while the risk register claims it is. `atom_fb_read/write` guard is off by one (`>` should be `>=`, `atom.cyr:327`). `#82`/`#83` write-back never checks WRITABLE. Plus: mark M1/M2/M3 and rung 16 closed, fix the 442→**417** dword count in four places, correct 11→**17** shaders, and re-anchor the fn citations (they are ~3,300 lines stale, not ~60). | **0** | — |
 | **1.56.25** ✅ **DONE 2026-07-28** | **Boot hygiene — dead code and one burn-trap.** Removed with zero call sites: `gpu_scanout_clear_tiling_dead` (42 lines — the body that blacked the box on burn #3, kept as a "warning" for weeks), `gpu_sdma_route_doorbell`, and the D-lane phase clock (`gpu_ts_base/_reset/_mark`). `gpu_audio_probe`'s per-endpoint hex dump is now `#ifdef GPU_AUDIO_PROBE` — it had been printing on every production boot twelve cuts past its own stated removal trigger (P3b, 1.55.12), against [[feedback_kernel_logs_plain_no_codes]] and unlike both its already-gated neighbours. **Killed the `EDGE_CAP_PROBE` burn trap:** no kernel source ever carried `#ifdef EDGE_CAP_PROBE`, so the profile built a kernel **byte-identical to the default** while telling the operator otherwise — and it was obsolete anyway, since B10 ran and the shipped cap IS 256 with `GPU_EDGE_WORK_MAX` as the real bound. Also corrected the refuted `0x607` story in the retirement note (it is `DCSURF_SURFACE_PITCH`, regdump-verified at 832 — the offsets were never the bug, writing them under the update lock was). | **0** | — |
-| **1.56.26** ▶ **INSTRUMENT LANDED 2026-07-28, BURN ARMED** | **Decompose `F`** — the Handoff's own next bite, and it has no source-side anchor today. Time validate / build / dispatch-and-wait separately inside `syscall(92)` and report the launched grid. Settles whether the 264 µs fixed term is per-primitive (~4.7 ms of a DOOM frame) or per-dispatch (0.27 ms). **17× apart and unmeasured.** | 1 | 1.56.24 |
+| **1.56.26** ✅✅ **CLOSED ON IRON 2026-07-28, exit 95 — `F` IS PER-PRIMITIVE, 7.35 µs EACH** | **Decompose `F` — ANSWERED.** Measured 7.59× CPU growth for 8× the primitives (rubric called ≥4.0 per-primitive). Slopes: `validate` **0.0625 µs/prim** · `build` **7.29 µs/prim** · `wait` 5.14 µs/prim. ⭐ gpu.md predicted "~7.4 µs" and measured **7.35** — right to two figures — but the COMPOSITION was wrong and that is the actionable part: **BUILD is 117× the validate slope**, so `F` is all `gpu_texl_build`/`gpu_tex_prep` and none of the validator. **⇒ A 640-column DOOM frame carries 4.71 ms of CPU, 16.5% of a 28.6 ms budget, and no transpose removes any of it.** Both sanity gates passed (WAIT substantial and scaling ⇒ drain-netting held; observed grid == predicted at both points, 1024 and 8192 — the first actual check of a wave count in this arc). ⚠ WAIT fits `36 µs + 161 ns/wave`, 4.5× the 36 ns/working model — **NOT promoted to a coefficient**: two-point fit, exactly what produced the retracted 177 ns figure, and these 1-px primitives run 1/64 lane occupancy so occupancy is the likely missing variable. Needs a third point. Tracker: [`#tracker-15626-decompose-f`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md#tracker-15626-decompose-f). — original plan follows — **Decompose `F`** — the Handoff's own next bite, and it has no source-side anchor today. Time validate / build / dispatch-and-wait separately inside `syscall(92)` and report the launched grid. Settles whether the 264 µs fixed term is per-primitive (~4.7 ms of a DOOM frame) or per-dispatch (0.27 ms). **17× apart and unmeasured.** | 1 | 1.56.24 |
 | **1.56.27** | **Rung 15 `bilinear`** — 4-tap by hand, all four converts iron-proven at S4, still no MIMG. | 1 | 1.56.26 |
 | **1.56.28** | **Rung 17 `depth`** — op `0x0D GPU_OP_DEPTH_CLEAR`. ⚠ `0x0D` **does not exist yet**: `GPU_OP_SUPPORTED` is `0x1F1F` = ops 0x00-0x04 and 0x08-0x0C only. Minting it means growing `gpu_caps`#89's support word first — deliberately awkward so the mask stays authoritative. | 1 | 1.56.27 |
 | **1.56.29** | **Rung 18 `persp-correct`** — interpolate `1/w`, divide per pixel, interpolate `u/w`, `v/w`. | 1 | 1.56.28 |
@@ -114,10 +114,19 @@ come first deliberately, so the ledger gets true before anything else is built o
 > **4.6 ms row-major** (not 24.5) and **0.09 ms col-major**. Col-major is kept because it is 50×
 > cheaper, NOT because row-major is impossible.
 >
-> **NEXT BITE: decompose `F`.** 264 µs was measured only at 32 primitives; if it scales per-primitive
-> (~7.4 µs) a DOOM frame carries ~4.7 ms of CPU that no transpose reduces, and if it is per-dispatch
-> it is 0.27 ms. **17× apart, unmeasured.** Time validate / build / dispatch-and-wait separately
-> inside `syscall(92)`, and have the kernel report the grid it launched.
+> **✅ `F` IS ANSWERED (iron 2026-07-28): PER-PRIMITIVE, 7.35 µs each, and it is ALL in `gpu_texl_build`
+> / `gpu_tex_prep` — `build` is 117× the `validate` slope.** A 640-column DOOM frame carries **4.71 ms
+> of CPU**, 16.5% of a 28.6 ms budget, and no transpose removes any of it.
+>
+> ⛔⛔ **THIS RE-RANKS THE WHOLE 3D LANE. The GPU is no longer the bottleneck of a DOOM frame — the CPU
+> prep is, by 52×.** Frame totals: row-major 4.71 CPU + 4.60 GPU = **9.31 ms**; col-major 4.71 + 0.09 =
+> **4.80 ms**. Rung 14b's 50× is real but GPU-only, so at the frame level it is **~1.9×**. Col-major
+> stays; it is simply no longer where the time is.
+>
+> **NEXT BITE: `gpu_tex_prep`.** 7.35 µs per primitive is ~22,000 cycles at 3 GHz to prepare one affine
+> frame — far too many for the arithmetic involved, which makes it a defect-shaped cost (a division, a
+> loop, or a memory round-trip) rather than an irreducible one. Read it before optimising it, and
+> measure with the profile that now exists rather than re-deriving a model.
 >
 > ⛔ **Two things this cycle overturned that are easy to re-assume:**
 > 1. **Rung 14 is DISPATCH-bound, not bandwidth-bound** (52.7 µs fixed vs ≥3680 MB/s measured).

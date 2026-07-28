@@ -61,7 +61,50 @@ half the paths is worse than none, because it reads as agreement.
 ⚠ A comment written earlier in this cut said the contamination "is not a measurement bug, it is the
 shape of the code." That was wrong and it was the whole defect; it is replaced with the reasoning above.
 
-### Armed — the burn rubric is written BEFORE the flash
+### ⭐⭐⭐ RESULT — IRON 2026-07-28, exit 95: `F` IS PER-PRIMITIVE, 7.35 µs EACH
+
+```
+LO  n=32   validate=2us  build=248us  wait=200us   cpu=250us   waves=1024 (predicted 1024)
+HI  n=256  validate=16us build=1881us wait=1351us  cpu=1897us  waves=8192 (predicted 8192)
+CPU(hi)/CPU(lo) = 7.5x
+```
+
+CPU grew **7.59×** for 8× the primitives (the pre-registered rubric called ≥4.0 per-primitive).
+Slopes: `validate` **0.0625 µs/prim** · `build` **7.29 µs/prim** · `wait` 5.14 µs/prim.
+
+⭐⭐ **The hypothesis was right to two significant figures — and its composition was wrong in the way
+that matters.** gpu.md predicted *"~7.4 µs: validation plus `gpu_tex_prep` in `gpu_texl_build`"*;
+measured **7.35 µs**. But **BUILD is 117× the validate slope**, so `F` is essentially all
+`gpu_texl_build` / `gpu_tex_prep` and essentially none of the validator. Optimising validation buys
+0.9%.
+
+**⇒ A 640-COLUMN DOOM FRAME CARRIES 4.71 ms OF CPU — 16.5% of a 28.6 ms budget — AND NO TRANSPOSE
+REMOVES ANY OF IT.**
+
+⛔⛔ **This re-ranks the 3D lane. The GPU is no longer the bottleneck of a DOOM frame; the CPU prep is,
+by 52×.**
+
+| | CPU | GPU | frame |
+|---|---|---|---|
+| row-major | 4.71 ms | 4.60 ms | **9.31 ms** |
+| col-major | 4.71 ms | 0.09 ms | **4.80 ms** |
+
+Rung 14b's 50× is real but **GPU-only**, and reads **~1.9× at the frame level**. Col-major stays; it is
+simply no longer where the time is. ⚠ 7.35 µs ≈ **22,000 cycles at 3 GHz to prepare one affine frame**,
+which is far too many for the arithmetic involved — defect-shaped, not irreducible.
+
+**✅ Both pre-registered sanity gates passed**, so the measurement is trustworthy: WAIT was substantial
+and scaled (200 → 1351 µs), so the drain-netting held and the pre-burn confound did not return; and the
+**observed grid matched prediction exactly at both points** (1024, 8192) — the first time a wave count
+in this arc has been checked rather than assumed.
+
+⚠⚠ **One observation deliberately NOT promoted to a coefficient.** WAIT fits `36 µs + 161 ns/wave`,
+4.5× the arc's 36 ns/WORKING-wave model. It is a **two-point fit** — precisely what produced the
+177 ns/launched figure this arc spent a burn retracting — and these 1-px primitives run 1/64 lane
+occupancy, so occupancy is the likely missing variable. **It needs a third point at a different
+occupancy before anyone writes it down.**
+
+### Armed — the burn rubric was written BEFORE the flash
 
 `agnosticos/docs/development/iron-nuc-zen-log.md#tracker-15626-decompose-f` carries the CONFIRM /
 FALSIFY / VOID conditions: the verdict is a **slope, not a threshold** (ratio ≥ 4.0 per-primitive,
