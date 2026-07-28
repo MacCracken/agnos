@@ -51,10 +51,24 @@ just cut 4×. ✅ ABI flag flipped reserved→accepted **in the same change as t
 **94/94**); `check.sh` **20/20**; `bigate`/`bimodel` now actually RUN (they were cited but executed by
 nothing); `texbi-body-identity.sh` proves rung 13's head AND tail survive verbatim, mutation-tested
 four ways. ⚠ **NOT YET IRON-VALIDATED.**
-▶ **REMAINING for rung 15: a `gputex` arm demanding byte-identity on iron.** Deliberately a separate
-bite — `tex_ref_px` fuses the affine/divide pipeline with a nearest sample, so a bilinear reference
-needs that UV derivation factored out for `bicore` to consume; a sloppy reference would convict a
-correct shader, which is worse than no reference.
+✅ **THE `gputex` BILINEAR ARM IS LANDED TOO** — CLAMP path (where both ordering traps are
+observable, unlike WRAP), byte-identity vs `bicore`, plus a **discrimination gate**: the run FAILS if
+the GPU's output is identical to the *nearest* reference on every frame, because a kernel that
+silently dispatched the rung-13 blob would otherwise score a perfect green. Gated on the TOTAL, not
+per-frame — frame 0 is the 1:1 case where bilinear MUST equal nearest (bigate G2 on iron).
+⭐ **PRE-BURN FINDING THAT MAKES THE BURN INTERPRETABLE: bilinear reads 8 quotient bits nothing had
+ever compared.** Nearest consumes only `uv >>> 16`, so rungs 13/14's 17/17 record proves the shader's
+reciprocal agrees with an exact divide **in the high half only**. `texgate` **gate 7** compares the
+whole 16.16 word — **5140 quotients, ZERO differ** — and **gate 8** proves it connected: the exact
+correction moves **3151 quotients** where gate 6 measured only **186 texels**, i.e. **17× more error
+hidden by nearest than exposed by it**. ⇒ **A RED BILINEAR BURN IS THE BLEND, NOT THE DIVIDER.**
+Gates 9/10 give the new four-tap addressing its first oracle (2178 samples, WRAP+CLAMP, negative and
+multi-tile UV; corner-exact at all 64 texel centres). `burn-prep.sh` refuses to flash a `gputex`
+lacking the bilinear arm **or** its discrimination check — a pre-1.56.29 binary passes every
+col-major string and exits 95 with zero bilinear data.
+▶ **REMAINING for rung 15: THE BURN.** Everything host-provable is proven; the shader itself has no
+host oracle by construction. Run order on iron: `gputri --cov` (must still be 20/20) → `gputex` →
+`klug > /tex1.txt`.
 ⛔ **THE TRAP CLASS THIS RUNG KEEPS PRODUCING: correct under WRAP, wrong under CLAMP.** Three instances
 now — the M2 shift kind, the `+1` neighbour needing the **pre-clamp floor**, and the out-of-domain
 predicates needing to fire on **both** taps. A wrap-only suite sees none of them. Anyone adding a

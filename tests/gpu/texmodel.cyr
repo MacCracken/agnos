@@ -58,7 +58,13 @@ var txm_no_hiclamp = 0;         # do not short-circuit a numerator past the last
 # index clamps to 0. So a negative numerator can be answered as texel 0 WITHOUT dividing at all —
 # which is what lets this path reuse rung 11's unsigned divider unchanged instead of growing a
 # signed one. The proof lives in texcore's tx_floordiv; if WRAP addressing is ever added it lapses.
+# ⭐ RUNG 15: the full 16.16 coordinate the shader computes, published for texgate's fraction gate.
+# Valid ONLY when txm_uv16_valid is 1 — see the note at the assignment site in txm_axis.
+var txm_uv16 = 0;
+var txm_uv16_valid = 0;
+
 fn txm_axis(ea, eb, ec, c0, c1, c2, dim): i64 {
+    txm_uv16_valid = 0;
     # ⛔⛔ THE MIN-BIAS IS LOAD-BEARING, AND THE FIRST VERSION WITHOUT IT WAS WRONG.
     #
     # `n_madd(e, p)` is rung 11's primitive and it assumes **p >= 0** — rung 11's p was a colour byte
@@ -134,6 +140,21 @@ fn txm_axis(ea, eb, ec, c0, c1, c2, dim): i64 {
         if (n_hi == need_hi) { if (n_lo >= need_lo) { ge2 = 1; } }
         if (ge2 == 1) { q = q + 1; }
     }
+
+    # ⭐ RUNG 15 EXPOSES THE FULL 16.16, AND THE REASON IS A REAL CHANGE IN WHAT IS BEING TESTED.
+    # Nearest sampling consumes only the TOP 16 BITS of this value — everything below the texel index
+    # is discarded by the shift on the next line, so rungs 13/14's 17/17 iron record proves the
+    # reciprocal agrees with an exact divide **in the high half only**. Bilinear reads bits 15:8 as
+    # its blend weight, so it depends on **8 bits of this quotient that no test has ever looked at**.
+    # ⇒ txm_uv16 is published so texgate can compare the shader's reciprocal against texcore's exact
+    # 64-bit divide across the WHOLE 16.16 word, at zero burns. If they disagree only in the low bits,
+    # a red bilinear burn would be the DIVIDER, not the blend — and that is a conclusion worth having
+    # before the burn rather than after it.
+    # ⚠ Set ONLY on this path. The two short-circuits above return before reaching here, so a caller
+    # must treat txm_uv16 as valid only when txm_uv16_valid is 1; a stale value read after a clamped
+    # sample would manufacture a disagreement that is the instrument's fault.
+    txm_uv16 = q + m;
+    txm_uv16_valid = 1;
 
     var texel = (q + m) >>> 16;               # fold the bias back in before selecting the texel
     if (texel < 0) { texel = 0; }
@@ -279,6 +300,96 @@ fn txm_diff_case(tex, lut, i, idx8): i64 {
         py = py + 1;
     }
     return bad;
+}
+
+# ============================================================================================
+# ⭐ RUNG 15's PRE-BURN GATE: does the shader's RECIPROCAL agree with an exact divide in the
+#    8 BITS THAT ONLY BILINEAR READS?
+# ============================================================================================
+# ⛔ THIS QUESTION IS NEW AT RUNG 15 AND NOTHING ABOVE ANSWERS IT. Nearest sampling consumes only
+# `uv >>> 16`; every test in this file, and rungs 13/14's 17/17 iron record, therefore proves the
+# reciprocal path agrees with texcore's exact 64-bit divide **in the high half only**. Bilinear reads
+# bits 15:8 as its blend weight. Those 8 bits have never been compared against anything.
+#
+# ⭐ WHY THEY SHOULD AGREE, stated so a failure is interpretable rather than mysterious. texcore
+# computes `uv = trunc(un / a2)` on the UNBIASED numerator; the model computes `q = floor(N / a2)` on
+# the min-biased one and folds `m` back. Since `un = N + m*a2` and `m` is an integer,
+#     trunc(un/a2) = trunc(N/a2 + m) = trunc(N/a2) + m = floor(N/a2) + m   for N >= 0,
+# and the bias guarantees N >= 0. So the two are algebraically identical **provided the reciprocal
+# plus its correction step yields the exact floor** — which is exactly what this gate measures and
+# nothing else does.
+#
+# ⇒ IF THIS IS RED, A RED BILINEAR BURN IS THE DIVIDER, NOT THE BLEND. That is a conclusion worth
+# having before spending a burn rather than deducing it from one.
+#
+# ⚠ ONLY SAMPLES WHERE txm_uv16_valid == 1 ARE COMPARED — the two short-circuits return before the
+# quotient exists, and reading a stale value there would manufacture a disagreement that is the
+# instrument's fault. The SKIPPED count is returned alongside for exactly the reason rung 9b's
+# clamp-hit counter exists: a gate that silently compared nothing would report a confident zero.
+var txm_frac_cmp = 0;           # samples actually compared
+var txm_frac_skip = 0;          # samples short-circuited before a quotient existed
+var txm_frac_fu = 0 - 1;        # first disagreement: reference 16.16
+var txm_frac_fg = 0 - 1;        # first disagreement: model 16.16
+
+fn txm_frac_case(i): i64 {
+    if (tri_prep(txc_frame(i,0), txc_frame(i,1), txc_frame(i,2), txc_frame(i,3),
+                 txc_frame(i,4), txc_frame(i,5),
+                 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF) != 1) { return 0 - 1; }
+    if (tex_prep(txc_frame(i,6), txc_frame(i,7), txc_frame(i,8),
+                 txc_frame(i,9), txc_frame(i,10), txc_frame(i,11)) != 1) { return 0 - 1; }
+    if (txm_prep() != 1) { return 0 - 1; }
+
+    var bad = 0;
+    var py = 0;
+    while (py < 32) {
+        var px = 0;
+        while (px < 32) {
+            var pcx = (px << 16) + 32768;
+            var pcy = (py << 16) + 32768;
+            var eb = tp_get(TP_KXB) * pcx + tp_get(TP_KYB) * pcy + tp_get(TP_K0B);
+            var ec = tp_get(TP_KXC) * pcx + tp_get(TP_KYC) * pcy + tp_get(TP_K0C);
+            var ea = tp_get(TP_A2) - eb - ec;
+
+            tex_uv_at(px, py);
+            var refu = tx_u_out;
+            var refv = tx_v_out;
+
+            txm_axis(ea, eb, ec, tx_get(TX_U0), tx_get(TX_U1), tx_get(TX_U2), 8);
+            if (txm_uv16_valid == 1) {
+                txm_frac_cmp = txm_frac_cmp + 1;
+                if (txm_uv16 != refu) {
+                    if (txm_frac_fu < 0) { txm_frac_fu = refu; txm_frac_fg = txm_uv16; }
+                    bad = bad + 1;
+                }
+            }
+            if (txm_uv16_valid == 0) { txm_frac_skip = txm_frac_skip + 1; }
+
+            txm_axis(ea, eb, ec, tx_get(TX_V0), tx_get(TX_V1), tx_get(TX_V2), 8);
+            if (txm_uv16_valid == 1) {
+                txm_frac_cmp = txm_frac_cmp + 1;
+                if (txm_uv16 != refv) {
+                    if (txm_frac_fu < 0) { txm_frac_fu = refv; txm_frac_fg = txm_uv16; }
+                    bad = bad + 1;
+                }
+            }
+            if (txm_uv16_valid == 0) { txm_frac_skip = txm_frac_skip + 1; }
+
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return bad;
+}
+
+fn txm_frac_sweep(): i64 {
+    var total = 0;
+    var i = 0;
+    while (i < TXC_N) {
+        var b = txm_frac_case(i);
+        if (b > 0) { total = total + b; }
+        i = i + 1;
+    }
+    return total;
 }
 
 fn txm_sweep(tex, lut, label, idx8): i64 {

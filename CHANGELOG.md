@@ -154,10 +154,49 @@ They were written this cut, run by hand, and cited in the blob's comments as pro
 — while **nothing executed them**. An oracle a shader leans on that no script runs is a citation, not a
 gate. `host-gpu-oracles.sh` now runs `texlist`, `bigate` and `bimodel`.
 
-**Remaining for rung 15:** a `gputex` arm demanding byte-identity on iron. ⚠ Deliberately a separate
-bite: `tex_ref_px` computes the affine/divide pipeline **and** samples nearest in one function, so a
-bilinear reference needs that UV derivation factored out for `bicore` to consume. A sloppy reference
-would convict a correct shader, which is worse than no reference at all.
+### Added — the `gputex` BILINEAR arm, and the pre-burn gate that makes it interpretable
+
+⭐ **Found before writing the arm: bilinear reads 8 quotient bits that no test had ever compared.**
+Nearest sampling consumes only `uv >>> 16`, so rungs 13/14's 17/17 iron record proves the shader's
+reciprocal agrees with an exact divide **in the high half only**. Bilinear reads bits 15:8 as its
+blend weight. `texgate` **gate 7** now compares the full 16.16 word — **5140 quotients, zero
+differ** — and **gate 8** proves that gate is connected (the correction step moves **3151**
+quotients). ⇒ **A red bilinear burn is the blend, not the divider**, and that is settled at zero burns
+rather than deduced from a burn.
+
+⚠ The contrast is the finding: gate 6 already recorded that skipping the exact correction changes only
+**186 texels**, because nearest truncates one-ULP errors away. At the quotient level the same mutation
+moves **3151** — **17× more error hidden by nearest than exposed by it**, all of it visible to
+bilinear.
+
+- **`tex_fetch_bilin`** in `texcore.cyr` — composes bicore's proven **blend** with texcore's proven
+  **addressing** (`tx_fetch_at`, `tx_floormod`, the clamp ladder) rather than duplicating either.
+  ⚠ The addressing IS duplicated from `tex_fetch` line-for-line **including both mutation hooks**,
+  deliberately: sharing it would stop `tmut_centre`/`tmut_lshift` distinguishing which path they break.
+- **`texgate` gates 9/10** — texcore's four-tap addressing vs bicore's independently written path
+  (**2178 samples**, WRAP *and* CLAMP, negative and multi-tile UV), plus corner-exactness at all 64
+  texel centres and proof it actually filters at 63 of 64 half-texel offsets. Until these, the
+  addressing the two ordering traps live in had **no oracle at all**.
+- **One flag** (`tx_bilin`) drives both the reference filter and the op's BILINEAR bit. ⛔ Not two: a
+  reference computing nearest while the GPU computes bilinear reports a difference that is the
+  *test's* fault and looks exactly like a broken shader.
+- **The arm runs on the CLAMP path**, where both ordering traps are observable. A wrap-only arm was
+  the comfortable choice and proves the less interesting half.
+
+⛔ **The discrimination gate is the point of the arm, not an extra.** Byte-identity against the
+bilinear reference is necessary and **not sufficient**: if the kernel silently dispatched the NEAREST
+blob — wrong `bilin` flag, unarmed slot, `RSRC1_TEX` where `RSRC1_TEXBI` belongs — the arm would go
+green on any frame where the two filters agree. Every case also measures the GPU's distance from the
+**nearest** reference, and the run FAILS if that distance is zero everywhere. ⚠ Gated on the TOTAL,
+not per-frame: frame 0 is the 1:1 identity case where `fx=fy=0` and bilinear **must** equal nearest —
+bigate's G2 observed on iron.
+
+`burn-prep.sh` now refuses to flash a `gputex` lacking the bilinear arm **or its discrimination
+check** — a pre-1.56.29 binary passes every col-major string, runs rungs 13/14/14b and exits 95 with
+zero bilinear data, on a burn whose whole purpose is bilinear.
+
+**Remaining for rung 15: the burn.** Everything host-provable is proven; the shader itself has no
+host oracle by construction.
 
 ## [1.56.28] - 2026-07-28
 

@@ -7,9 +7,16 @@
 # is the same class of defect as a gate wired with a bare `; rc=$?`: a check that exists on paper and
 # cannot fail in practice.
 #
-# ⚠ SCOPE, STATED HONESTLY: this runs texlist, bigate and bimodel. It does NOT run doomcol, doomwall,
-# texmodel/texgate, edgemodel or refraster — those are equally host-runnable and equally unwired, and
-# adding them is a separate bite rather than something smuggled in beside a rung.
+# ⚠ SCOPE, STATED HONESTLY: this runs texlist, bigate, bimodel and texgate. It does NOT run doomcol,
+# doomwall, edgemodel or refraster — those are equally host-runnable and equally unwired, and adding
+# them is a separate bite rather than something smuggled in beside a rung.
+#
+# ⭐ texgate ADDED AT RUNG 15 because it stopped being only rung 13's gate. It now carries the four
+# checks that decide whether a bilinear iron burn is interpretable: **gate 7** (the reciprocal
+# reproduces an exact divide across the WHOLE 16.16 word — the 8 fraction bits ONLY bilinear reads,
+# which rungs 13/14's 17/17 record never looked at), **gate 8** (that gate is connected: the
+# correction step moves 3151 quotients), and **gates 9/10** (texcore's four-tap addressing vs
+# bicore's, plus corner-exactness and a proof it actually filters).
 #
 # ⭐ bigate + bimodel ADDED AT RUNG 15 (1.56.29), AND THE REASON IS THE SAME ONE IN THE HEADER ABOVE.
 # They were written this cut, run by hand, and cited in the blob's comments as the proof that the
@@ -39,7 +46,7 @@ export CYRIUS_ALLOW_PARENT_INCLUDES
 mkdir -p "$GPU/build"
 
 rc=0
-for t in texlist bigate bimodel; do
+for t in texlist bigate bimodel texgate; do
     out="$(cd "$GPU" && cyrius build "$t.cyr" "build/$t" 2>&1)" || {
         echo "host-gpu-oracles: FAIL -- $t.cyr does not BUILD"
         echo "$out" | tail -20

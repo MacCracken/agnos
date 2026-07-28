@@ -219,6 +219,11 @@ var tx_dumped = 0;
 fn tx_run_case_f(i, idx8, tileno, fullcov): i64 {
     var xflags = idx8;
     if (fullcov != 0) { xflags = xflags + 2; }
+    # ⭐ RUNG 15: the SAME flag that switches texcore's reference switches the op's BILINEAR bit.
+    # ⛔ Deliberately not a second variable. A reference computing NEAREST while the GPU computes
+    # BILINEAR would report a difference that is the TEST's fault, and it would look exactly like a
+    # broken shader — the most expensive possible red. One flag makes that unrepresentable.
+    if (tx_bilin != 0) { xflags = xflags + 16; }      # GPU_TEX_FLAG_BILINEAR
     if (tri_prep(txf(i,0), txf(i,1), txf(i,2), txf(i,3), txf(i,4), txf(i,5),
                  0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF) != 1) { return 0 - 1; }
     if (tex_prep(txf(i,6), txf(i,7), txf(i,8), txf(i,9), txf(i,10), txf(i,11)) != 1) { return 0 - 1; }
@@ -1149,6 +1154,57 @@ fn main(): i64 {
     }
     ps("gputex: WRAP "); pn(wexact); ps(" of "); pn(TXWN); puts2(" exact");
 
+    # ---- RUNG 15: BILINEAR — byte-identity against the exact integer 4-tap reference --------
+    # ⭐ RUN ON THE **CLAMP** PATH, DELIBERATELY. Both of rung 15's ordering traps — the `+1`
+    # neighbour needing the pre-clamp floor, and the out-of-domain predicates needing to fire on both
+    # taps — are INVISIBLE under mask-WRAP and total under CLAMP. A wrap-only arm would be the
+    # comfortable choice and would prove the less interesting half. (Same shape as bimodel's M2
+    # finding, which is now the third instance of this pattern in this rung.)
+    #
+    # ⛔⛔ THE DISCRIMINATION CHECK IS THE POINT OF THIS ARM, NOT AN EXTRA.
+    # Byte-identity against the bilinear reference is necessary and NOT sufficient: if the kernel
+    # silently dispatched the NEAREST blob — a wrong `bilin` flag, a slot that was never armed,
+    # RSRC1_TEX where RSRC1_TEXBI belongs — then on any frame where the two filters happen to agree,
+    # the arm would go green having proven nothing. So every case ALSO measures how far the GPU's
+    # output sits from the NEAREST reference, and the run FAILS if that distance is zero everywhere.
+    # ⚠ Frame 0 is the 1:1 identity case: fx = fy = 0, so bilinear MUST equal nearest there. That is
+    # bigate's G2 (corner exactness) observed on iron, and it is why the gate is on the TOTAL across
+    # frames rather than per-frame — a per-frame gate would fail on the one frame whose agreement is
+    # the correct answer.
+    puts2("gputex: BILINEAR -- 4-tap integer filter, CLAMP path; must match bicore byte for byte");
+    var bexact = 0;
+    var bdiscrim = 0;
+    tx_bilin = 1;
+    var bi = 0;
+    while (bi < TXN) {
+        var rb = tx_run_case_f(bi, 0, bi, 0);
+        ps("  BILINEAR case "); pn(bi); ps(" "); tx_name(bi); ps("  ");
+        if (rb == 0) { puts2("EXACT"); bexact = bexact + 1; }
+        if (rb > 0) { pn(rb); puts2(" differing px"); }
+        if (rb < 0) { ps("refused, code "); pn(0 - rb); nl(); }
+        if (rb >= 0) {
+            # Recompute the NEAREST reference over the SAME prep state and coverage mask that the
+            # run just used, then measure the GPU's distance from it. tx_got still holds the readback.
+            tx_bilin = 0;
+            tx_ref_fill(bi, 0);
+            tx_bilin = 1;
+            var nd = 0;
+            var p = 0;
+            while (p < TXW * TXH) {
+                var g = load32(&tx_got + p * 4) & 0xFFFFFFFF;
+                var n = load32(&tx_ref + p * 4) & 0xFFFFFFFF;
+                if (g != n) { nd = nd + 1; }
+                p = p + 1;
+            }
+            bdiscrim = bdiscrim + nd;
+            ps("      vs NEAREST: "); pn(nd); puts2(" px differ");
+        }
+        bi = bi + 1;
+    }
+    tx_bilin = 0;
+    ps("gputex: BILINEAR "); pn(bexact); ps(" of "); pn(TXN);
+    ps(" exact; "); pn(bdiscrim); puts2(" px separate it from nearest");
+
     # ---- RUNG 14: the SAME primitives, fused into ONE dispatch -------------------------------
     puts2("gputex: RUNG 14 -- 32 columns as 32 x op 0x0B vs 1 x op 0x0C, demanded byte-identical");
     var tlr = tl_run(0, 0);
@@ -1237,6 +1293,26 @@ fn main(): i64 {
         puts2("gputex: ⛔ FULLCOV did not reproduce the shaped path byte for byte -- the saving");
         puts2("gputex:   would be bought with a wrong picture. Refusing to report rung 13 green.");
         return 87;
+    }
+    if (bexact != TXN) {
+        puts2("gputex: ⛔ BILINEAR did not match bicore's exact integer reference. The divider is");
+        puts2("gputex:   NOT the suspect -- texgate gate 7 proves the reciprocal reproduces an exact");
+        puts2("gputex:   divide across the whole 16.16 word, fraction bits included. Suspect, in");
+        puts2("gputex:   order: (1) the +1 neighbour taken from the CLAMPED index instead of the");
+        puts2("gputex:   pre-clamp floor; (2) an out-of-domain predicate applied to x0 but not x1;");
+        puts2("gputex:   (3) a w10/w01 weight swap, which keeps the weight sum at 65536.");
+        return 86;
+    }
+    # ⛔ THE ARM MUST BE ABLE TO TELL BILINEAR FROM NEAREST. Zero separation means every frame agreed
+    # with the nearest reference, so a kernel that silently dispatched the rung-13 blob would have
+    # scored a perfect green. A gate that cannot fail is not a gate.
+    if (bdiscrim == 0) {
+        puts2("gputex: ⛔ BILINEAR output is IDENTICAL to nearest on every frame, so this arm cannot");
+        puts2("gputex:   distinguish a working filter from one that was never dispatched. Either the");
+        puts2("gputex:   corpus has no fractional sample (check txf's frames) or the kernel ran the");
+        puts2("gputex:   NEAREST blob -- check gpu_tex_dispatch's bilin flag, GPU_TEXBI_SHADER_SUBOFF");
+        puts2("gputex:   residency, and that RSRC1_TEXBI (not RSRC1_TEX) reached gpu_blend_cov_run.");
+        return 86;
     }
     # ⛔ RUNG 14b's GATE COMES FIRST, and it must. A col-major mismatch is packed BELOW -1000, which
     # is also `!= 0`, so the row-major gate below would otherwise swallow it and print a diagnosis

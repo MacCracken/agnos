@@ -16,6 +16,13 @@
 
 include "lib/io.cyr"
 include "tricore.cyr"
+# ⭐ RUNG 15. bicore supplies bi_lerp4 — the EXACT integer 4-tap blend, proven exhaustively by bigate
+# (weight sum exactly 65536 over all 65,536 fraction pairs; accumulator inside a 32-bit lane). The
+# bilinear reference below composes bicore's BLEND with this file's ADDRESSING (tx_fetch_at,
+# tx_floormod, the clamp ladder) rather than duplicating either. That is deliberate: a second copy of
+# the addressing would be free to drift from the nearest path it is supposed to match texel-for-texel
+# at fx=fy=0, and a second copy of the blend would not be the thing bigate proved.
+include "bicore.cyr"
 
 # ---- the UV frame ---------------------------------------------------------------------------
 # Six 16.16 texel-space coordinates, one pair per vertex, in the same order tri_prep took them.
@@ -188,6 +195,71 @@ fn tex_fetch(tex, lut, tw, th, u, v, idx8): i64 {
 var tx_clamp_hits = 0;                          # instrumentation: did clamp-to-edge actually fire?
 var tx_premul_hits = 0;
 
+# ============================================================================================
+# ⭐ RUNG 15 — THE BILINEAR FETCH. Same addressing as tex_fetch above, four taps instead of one.
+# ============================================================================================
+# ⛔ THE ADDRESSING IS DUPLICATED FROM tex_fetch ON PURPOSE, LINE FOR LINE, INCLUDING BOTH MUTATION
+# HOOKS. The alternative — factoring one shared addressing helper — would have been cleaner code and
+# WORSE evidence: the mutations `tmut_centre` and `tmut_lshift` exist to prove the nearest path's
+# texel-centre and shift-kind are load-bearing, and if bilinear shared that code the same mutation
+# could no longer distinguish which path it broke. Two copies, both mutated, is what keeps the
+# falsification per-path.
+#
+# ⚠ x1/y1 COME FROM THE PRE-CLAMP FLOOR (bx/by), NEVER FROM THE CLAMPED x0/y0. This is trap 1 from
+# tex_bilin.s's header, restated here because the reference must have it too or the two agree on a
+# shared bug: clamp(clamp(-1)+1) = 1 but clamp(-1+1) = 0. Under mask-WRAP the two orders are
+# identical, so a wrap-only corpus would never separate them.
+fn tex_fetch_bilin(tex, lut, tw, th, u, v, idx8): i64 {
+    if (tmut_centre == 1) { u = u + 32768; v = v + 32768; }
+    var bx = u >>> 16;
+    var by = v >>> 16;
+    if (tmut_lshift == 1) { bx = u >> 16; by = v >> 16; }
+    # ⚠ TRUNCATING, matching bi_frac and the shader's v_lshrrev_b32 + v_and_b32. A rounded fraction
+    # here against a truncated one there is bimodel's M5 mutation, and it reads on screen as a
+    # uniform half-texel drift rather than an obvious break.
+    var fx = (u >> 8) & 0xFF;
+    var fy = (v >> 8) & 0xFF;
+
+    var x0 = 0; var y0 = 0; var x1 = 0; var y1 = 0;
+    if (tx_wrap != 0) {
+        x0 = tx_floormod(bx, tw);      y0 = tx_floormod(by, th);
+        x1 = tx_floormod(bx + 1, tw);  y1 = tx_floormod(by + 1, th);
+    }
+    if (tx_wrap == 0) {
+        x0 = bx;     if (x0 < 0) { x0 = 0; } if (x0 > tw - 1) { x0 = tw - 1; }
+        y0 = by;     if (y0 < 0) { y0 = 0; } if (y0 > th - 1) { y0 = th - 1; }
+        x1 = bx + 1; if (x1 < 0) { x1 = 0; } if (x1 > tw - 1) { x1 = tw - 1; }
+        y1 = by + 1; if (y1 < 0) { y1 = 0; } if (y1 > th - 1) { y1 = th - 1; }
+    }
+
+    var p00 = tx_fetch_at(tex, lut, tw, y0 * tw + x0, idx8);
+    var p10 = tx_fetch_at(tex, lut, tw, y0 * tw + x1, idx8);
+    var p01 = tx_fetch_at(tex, lut, tw, y1 * tw + x0, idx8);
+    var p11 = tx_fetch_at(tex, lut, tw, y1 * tw + x1, idx8);
+
+    # ⚠ ALL FOUR BYTES, and the channel ORDER is irrelevant because a 4-tap blend is per-channel
+    # independent — the shader walks 24→0 and this walks 0→24, and they agree. What is NOT irrelevant
+    # is the weight-to-tap assignment: w10 pairs with (x1,y0), w01 with (x0,y1). Swapping them keeps
+    # the weight sum at 65536 and is caught only by bigate G6 and bimodel M1.
+    var out = 0;
+    var k = 0;
+    while (k < 4) {
+        var sh = k * 8;
+        var c = bi_lerp4((p00 >> sh) & 0xFF, (p10 >> sh) & 0xFF,
+                         (p01 >> sh) & 0xFF, (p11 >> sh) & 0xFF, fx, fy);
+        out = out | ((c & 0xFF) << sh);
+        k = k + 1;
+    }
+    return out & 0xFFFFFFFF;
+}
+
+# ⭐ ONE MODE FLAG, READ BY BOTH THE REFERENCE AND THE SYSCALL FLAGS IN gputex. Same idiom as
+# tx_wrap. ⛔ It must stay ONE variable: if the reference's filter and the op's BILINEAR bit came
+# from two different flags they could disagree, and a reference computing NEAREST while the GPU
+# computes BILINEAR reports a difference that is the TEST's fault — the single most expensive kind
+# of red, because it looks exactly like a broken shader.
+var tx_bilin = 0;
+
 fn tex_ref_px(tex, lut, tw, th, px, py, cov, dst, idx8): i64 {
     if (cov == 0) { return dst; }
     tex_uv_at(px, py);
@@ -201,7 +273,13 @@ fn tex_ref_px(tex, lut, tw, th, px, py, cov, dst, idx8): i64 {
     if (tu > tw - 1) { tx_clamp_hits = tx_clamp_hits + 1; }
     if (tv > th - 1) { tx_clamp_hits = tx_clamp_hits + 1; }
 
-    var texel = tex_fetch(tex, lut, tw, th, tx_u_out, tx_v_out, idx8);
+    # ⭐ THE FILTER IS THE ONLY THING THAT CHANGES. Everything below — the exact /255 coverage
+    # modulation, the premultiplied clamp, src-over — is shared verbatim between nearest and
+    # bilinear, because it is rung 11's bit-identity hinge and duplicating it for a new filter is how
+    # the two would silently drift.
+    var texel = 0;
+    if (tx_bilin == 0) { texel = tex_fetch(tex, lut, tw, th, tx_u_out, tx_v_out, idx8); }
+    if (tx_bilin != 0) { texel = tex_fetch_bilin(tex, lut, tw, th, tx_u_out, tx_v_out, idx8); }
 
     var out = 0;
     var qa = 255;

@@ -104,6 +104,136 @@ fn main(): i64 {
     }
     if (m4 != 0) { ps("  gate 6 GREEN: skipping the exact correction breaks "); pn(m4); ps(" samples"); nl(); }
 
+    # --- GATE 7: RUNG 15 — the 8 QUOTIENT BITS THAT ONLY BILINEAR READS -------------------
+    # ⭐ THIS EXISTS BECAUSE OF GATE 6's WARNING ABOVE, WHICH IS NOT A CURIOSITY BUT A MEASUREMENT:
+    # a one-ULP quotient error is invisible to nearest-neighbour, because the texel index truncates
+    # it away. Every gate above compares `uv >>> 16`. Bilinear reads bits 15:8 as its blend weight,
+    # so rung 15 depends on 8 bits of this quotient that rungs 13/14 — and their 17/17 iron record —
+    # never looked at. Comparing the FULL 16.16 word is the only thing that closes that.
+    var fd = txm_frac_sweep();
+    ps("  gate 7: compared "); pn(txm_frac_cmp); ps(" quotients ("); pn(txm_frac_skip);
+    ps(" short-circuited before a quotient existed)"); nl();
+    # ⛔ A GATE THAT COMPARED NOTHING WOULD REPORT A CONFIDENT ZERO. Same defect class as rung 9b's
+    # clamp-hit counter: the corpus must be shown to REACH the path under test.
+    if (txm_frac_cmp < 1000) {
+        ps("  GATE 7 FAILED: only "); pn(txm_frac_cmp); ps(" quotients reached the divider -- the"); nl();
+        ps("    corpus short-circuits almost everywhere, so this gate proves nothing"); nl();
+        fail = fail + 1;
+    }
+    if (fd != 0) {
+        ps("  GATE 7 FAILED: "); pn(fd); ps(" quotients differ from the exact divide."); nl();
+        ps("    first: reference 16.16 = "); pn(txm_frac_fu); ps("  model = "); pn(txm_frac_fg); nl();
+        ps("    ⇒ A RED BILINEAR BURN WOULD BE THE DIVIDER, NOT THE BLEND."); nl();
+        fail = fail + 1;
+    }
+    if (fd == 0) {
+        if (txm_frac_cmp >= 1000) {
+            ps("  gate 7 GREEN: the reciprocal reproduces the exact divide across the WHOLE 16.16"); nl();
+            ps("    word, not just the texel index -- bilinear's fraction bits are sound"); nl();
+        }
+    }
+
+    # --- GATE 8: FALSIFICATION — the correction step MUST matter at the fraction level ----
+    # ⭐ THE PAYOFF OF GATE 7, AND THE REASON GATE 6 GETS TO STOP BEING A WARNING. Gate 6 could only
+    # report that skipping the exact correction changes no TEXEL. If skipping it changes no QUOTIENT
+    # either, then gate 7 is not connected and its green means nothing. This is the mutation that
+    # proves gate 7 can fail.
+    txm_skip_corr = 1;
+    txm_frac_cmp = 0; txm_frac_skip = 0; txm_frac_fu = 0 - 1; txm_frac_fg = 0 - 1;
+    var m5 = txm_frac_sweep();
+    txm_skip_corr = 0;
+    if (m5 == 0) {
+        ps("  GATE 8 FAILED: skipping the exact correction changed NO quotient either, so gate 7"); nl();
+        ps("    is not connected -- its green proves nothing about the divider"); nl();
+        fail = fail + 1;
+    }
+    if (m5 != 0) {
+        ps("  gate 8 GREEN: the correction step moves "); pn(m5);
+        ps(" quotients -- gate 7 is connected"); nl();
+    }
+    txm_frac_cmp = 0; txm_frac_skip = 0; txm_frac_fu = 0 - 1; txm_frac_fg = 0 - 1;
+
+    # --- GATE 9: RUNG 15 — texcore's BILINEAR ADDRESSING vs bicore's, independently written ----
+    # ⭐ WHAT IS AND IS NOT INDEPENDENT HERE, STATED SO THE GATE IS NOT OVER-READ. Both sides call
+    # bi_lerp4, so this does NOT re-prove the blend (bigate does that, exhaustively). What it proves
+    # is the part written fresh for the gputex arm: texcore's four-tap ADDRESSING — the clamp ladder,
+    # tx_floormod, and the derivation of x1/y1 from the PRE-CLAMP floor — against bicore's separately
+    # written bi_clamp / bi_wrap path. That addressing is the code both of rung 15's ordering traps
+    # live in, and until this gate it had no oracle at all.
+    #
+    # ⚠ BOTH MODES ARE SWEPT, and CLAMP is the one that matters: under mask-WRAP the pre-clamp-floor
+    # trap is invisible, so a wrap-only sweep would pass over a reference that is wrong exactly where
+    # the shader it validates is most likely to be wrong.
+    var g9 = 0;
+    var g9n = 0;
+    var wm = 0;
+    while (wm < 2) {
+        tx_wrap = wm;
+        var uu = 0 - (65536 * 2);
+        while (uu < 65536 * 3) {
+            var vv = 0 - (65536 * 2);
+            while (vv < 65536 * 3) {
+                var a = tex_fetch_bilin(&tg_tex, &tg_lut, 8, 8, uu, vv, 0);
+                var bq = bi_sample(&tg_tex, 8, 8, uu, vv, wm);
+                g9n = g9n + 1;
+                if (a != bq) { g9 = g9 + 1; }
+                vv = vv + 9973;
+            }
+            uu = uu + 9973;
+        }
+        wm = wm + 1;
+    }
+    tx_wrap = 0;
+    if (g9 != 0) {
+        ps("  GATE 9 FAILED: "); pn(g9); ps(" of "); pn(g9n);
+        ps(" samples disagree between texcore's bilinear addressing and bicore's"); nl();
+        fail = fail + 1;
+    }
+    if (g9 == 0) {
+        ps("  gate 9 GREEN: texcore's 4-tap addressing matches bicore over "); pn(g9n);
+        ps(" samples, WRAP and CLAMP, negative and multi-tile UV"); nl();
+    }
+
+    # --- GATE 10: FALSIFICATION — bilinear MUST degenerate to nearest at exact texel coords ----
+    # ⭐ THE TWO-SIDED GATE. At fx = fy = 0 the filter must return the tapped texel UNTOUCHED (bigate
+    # G2), so tex_fetch_bilin and tex_fetch must agree EXACTLY there — otherwise every texel centre is
+    # slightly wrong and the image is uniformly soft, which reads as "blurry sampler" and gets blamed
+    # anywhere but here. And OFF the texel grid they must DISAGREE somewhere, or tex_fetch_bilin is
+    # secretly doing nearest and gate 9 above is comparing two nearest implementations.
+    var g10a = 0;
+    var g10b = 0;
+    var ty = 0;
+    while (ty < 8) {
+        var tx2 = 0;
+        while (tx2 < 8) {
+            var e1 = tex_fetch(&tg_tex, &tg_lut, 8, 8, tx2 * 65536, ty * 65536, 0);
+            var e2 = tex_fetch_bilin(&tg_tex, &tg_lut, 8, 8, tx2 * 65536, ty * 65536, 0);
+            if (e1 != e2) { g10a = g10a + 1; }
+            # half a texel along both axes -- the maximally-filtered point
+            var h1 = tex_fetch(&tg_tex, &tg_lut, 8, 8, tx2 * 65536 + 32768, ty * 65536 + 32768, 0);
+            var h2 = tex_fetch_bilin(&tg_tex, &tg_lut, 8, 8, tx2 * 65536 + 32768, ty * 65536 + 32768, 0);
+            if (h1 != h2) { g10b = g10b + 1; }
+            tx2 = tx2 + 1;
+        }
+        ty = ty + 1;
+    }
+    if (g10a != 0) {
+        ps("  GATE 10 FAILED: at EXACT texel coords bilinear differs from nearest in "); pn(g10a);
+        ps(" of 64 texels -- corner exactness is broken"); nl();
+        fail = fail + 1;
+    }
+    if (g10b == 0) {
+        ps("  GATE 10 FAILED: at HALF-texel offsets bilinear is still identical to nearest --"); nl();
+        ps("    tex_fetch_bilin is not filtering, and gate 9 is comparing two nearest paths"); nl();
+        fail = fail + 1;
+    }
+    if (g10a == 0) {
+        if (g10b != 0) {
+            ps("  gate 10 GREEN: exact at all 64 texel centres, and filters at "); pn(g10b);
+            ps(" of 64 half-texel offsets"); nl();
+        }
+    }
+
     if (fail != 0) {
         ps("texgate: "); pn(fail); ps(" GATE(S) FAILED"); nl();
         return 86;
