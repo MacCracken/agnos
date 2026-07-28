@@ -157,7 +157,11 @@ fn main(): i64 {
     w_puts("  run /bin/gpuwedge --console     D        -- did the console survive?", 69);
     w_puts("  run /bin/gpuwedge --audit       rung 6   -- READ-ONLY arena audit", 66);
     w_puts("  run /bin/klug > /wedge.txt", 27);
-    return 96;
+    w_puts("  exit 83 = NO ARGUMENT -- this help, nothing measured (NOT 'shader not resident')", 80);
+    # ⛔ 1.56.27 — was `return 96`, the same code as a real "shader not resident" failure. Twin of the
+    # gputri defect that cost a regression check on the 2026-07-28 burn: a burn log showing 96 could
+    # not distinguish "you forgot the flag" from "the GPU is broken", and those have different fixes.
+    return 83;
 }
 
 fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }

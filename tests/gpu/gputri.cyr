@@ -2009,7 +2009,16 @@ fn main(): i64 {
     puts("Exits: 95 all exact + all controls fired · 100 no GPU here · 96 shader not resident");
     puts("       92 fill-rule · 91 shape · 89 tgid · 88 UNTOUCHED · 87 covered nothing");
     puts("       86 a control failed · 85 digest mismatch · 90 named fault · 84 bad arg");
-    return 96;
+    puts("       83 NO ARGUMENT -- you are reading this help, nothing was measured");
+    # ⛔ 1.56.27 — THIS USED TO `return 96`, THE SAME CODE AS "shader not resident", AND IT COST A
+    # REGRESSION CHECK ON A REAL BURN (2026-07-28). The operator ran `gputri` with no argument, got
+    # the usage banner and exit 96, and 96 is indistinguishable from the genuine "the shader could
+    # not be made resident" failure — so a burn log shows a number that could mean either "you
+    # forgot --cov" or "the GPU is broken". ⭐ 83 is its own code for exactly the reason every other
+    # code in this list is: the two situations have DIFFERENT FIXES (retype the command vs debug
+    # shader residency) and the caller cannot tell which from a shared reason.
+    # ⚠ gpuwedge carries the identical defect at its own no-arg path.
+    return 83;
 }
 
 fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }

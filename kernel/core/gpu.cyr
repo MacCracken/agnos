@@ -5316,6 +5316,11 @@ fn tex_rgba_write(dst_phys) {
 #   Q8 +128  limU_lo limU_hi limV_lo limV_hi
 #   Q9 +144  reserved, MUST be zero  -- the extension point, as on every other record
 # Returns 1 / 0.
+# gpu_pack2(lo, hi) — two 32-bit record fields as ONE 64-bit store. Both halves are masked to 32 bits
+# BEFORE combining: a negative field (several of these are signed) would otherwise sign-extend across
+# the whole word and corrupt the neighbouring field. Used only by gpu_tex_prep's record write.
+fn gpu_pack2(lo, hi) { return (lo & 0xFFFFFFFF) | ((hi & 0xFFFFFFFF) << 32); }
+
 fn gpu_tex_prep(rec_phys, cov_mc, tex_mc, lut_mc, tw, th, fmt,
 vx0, vy0, vx1, vy1, vx2, vy2, u0, v0, u1, v1, u2, v2) {
     var ax = vx0 >>> 16;  var ay = vy0 >>> 16;
@@ -5376,45 +5381,46 @@ vx0, vy0, vx1, vy1, vx2, vy2, u0, v0, u1, v1, u2, v2) {
     # ⚠ Safe because nothing observes the record in between: there is no call, fence or dispatch between
     # this fill and the stores, and gpu_texl_build finishes every record before gpu_tex_list dispatches.
     # ⚠ If a future field lands in words 36..39, WIDEN THIS FILL — do not assume the tail is dead.
-    var q = 36;
-    while (q < 40) { store32(rec_phys + q * 4, 0); q = q + 1; }
-
-    store32(rec_phys +   0, cov_mc & 0xFFFFFFFF);
-    store32(rec_phys +   4, (cov_mc >> 32) & 0xFFFFFFFF);
-    store32(rec_phys +   8, t);
-    store32(rec_phys +  12, 32 - t);
-    store32(rec_phys +  16, dh);
-    store32(rec_phys +  20, rv);
-    store32(rec_phys +  24, l);
-    store32(rec_phys +  28, fmt);
-    store32(rec_phys +  32, a2 & 0xFFFFFFFF);
-    store32(rec_phys +  36, (a2 >> 32) & 0xFFFFFFFF);
-    store32(rec_phys +  40, tw);
-    store32(rec_phys +  44, th);
-    store32(rec_phys +  48, kxb & 0xFFFFFFFF);
-    store32(rec_phys +  52, kyb & 0xFFFFFFFF);
-    store32(rec_phys +  56, k0b & 0xFFFFFFFF);
-    store32(rec_phys +  60, (k0b >> 32) & 0xFFFFFFFF);
-    store32(rec_phys +  64, kxc & 0xFFFFFFFF);
-    store32(rec_phys +  68, kyc & 0xFFFFFFFF);
-    store32(rec_phys +  72, k0c & 0xFFFFFFFF);
-    store32(rec_phys +  76, (k0c >> 32) & 0xFFFFFFFF);
-    store32(rec_phys +  80, tex_mc & 0xFFFFFFFF);
-    store32(rec_phys +  84, (tex_mc >> 32) & 0xFFFFFFFF);
-    store32(rec_phys +  88, lut_mc & 0xFFFFFFFF);
-    store32(rec_phys +  92, (lut_mc >> 32) & 0xFFFFFFFF);
-    store32(rec_phys +  96, (u0 - mu) & 0xFFFFFFFF);
-    store32(rec_phys + 100, (u1 - mu) & 0xFFFFFFFF);
-    store32(rec_phys + 104, (u2 - mu) & 0xFFFFFFFF);
-    store32(rec_phys + 108, mu & 0xFFFFFFFF);
-    store32(rec_phys + 112, (v0 - mv) & 0xFFFFFFFF);
-    store32(rec_phys + 116, (v1 - mv) & 0xFFFFFFFF);
-    store32(rec_phys + 120, (v2 - mv) & 0xFFFFFFFF);
-    store32(rec_phys + 124, mv & 0xFFFFFFFF);
-    store32(rec_phys + 128, limu & 0xFFFFFFFF);
-    store32(rec_phys + 132, (limu >> 32) & 0xFFFFFFFF);
-    store32(rec_phys + 136, limv & 0xFFFFFFFF);
-    store32(rec_phys + 140, (limv >> 32) & 0xFFFFFFFF);
+    # ⭐⭐⭐ 1.56.28 — 64-BIT STORES: 40 UC TRANSACTIONS -> 20. The record is written with `store64`
+    # pairs instead of `store32` singles. Same 160 bytes, same values, HALF the bus transactions.
+    #
+    # ⛔ WHY NOT THE "CACHED SCRATCH + BULK COPY" THIS WAS ORIGINALLY SCOPED AS. Building the record in
+    # cached memory and `memcpy`ing it here buys NOTHING: `memcpy` (klib/kstring.cyr) copies its aligned
+    # bulk with `store64`, so the destination still sees exactly these 20 UC transactions — plus an extra
+    # build-and-read-back pass. **The bottleneck is the COUNT of uncached transactions, not where the
+    # bytes come from.** The only way past 20 would be 128-bit stores, and the production kernel is
+    # deliberately FP-free (two sanctioned XMM leaf sites), so that is not on the table. Pairing directly
+    # is therefore not a cheaper version of the scratch-buffer idea — it is strictly better than it.
+    #
+    # ⚠ EVERY PAIR IS 8-BYTE ALIGNED because the record is 160-byte aligned and the fields are laid out
+    # in 32-bit slots; pairs start at word indices 0,2,4,... If a field is ever inserted or reordered,
+    # RE-CHECK THE PAIRING — a mis-paired store writes the right bytes to the wrong offsets and the
+    # shader reads garbage that still looks structurally valid.
+    # ⚠ Seven pairs are a single 64-bit quantity split lo/hi in the old code (cov_mc, a2, k0b, k0c,
+    # tex_mc, lut_mc, limu, limv) and are now stored whole — that is exact, not an approximation.
+    # Measured basis: 85.6 ns per UC store + 0.79 µs of real arithmetic (iron, 1.56.26 + 1.56.27).
+    store64(rec_phys +   0, cov_mc);
+    store64(rec_phys +   8, gpu_pack2(t, 32 - t));
+    store64(rec_phys +  16, gpu_pack2(dh, rv));
+    store64(rec_phys +  24, gpu_pack2(l, fmt));
+    store64(rec_phys +  32, a2);
+    store64(rec_phys +  40, gpu_pack2(tw, th));
+    store64(rec_phys +  48, gpu_pack2(kxb, kyb));
+    store64(rec_phys +  56, k0b);
+    store64(rec_phys +  64, gpu_pack2(kxc, kyc));
+    store64(rec_phys +  72, k0c);
+    store64(rec_phys +  80, tex_mc);
+    store64(rec_phys +  88, lut_mc);
+    store64(rec_phys +  96, gpu_pack2(u0 - mu, u1 - mu));
+    store64(rec_phys + 104, gpu_pack2(u2 - mu, mu));
+    store64(rec_phys + 112, gpu_pack2(v0 - mv, v1 - mv));
+    store64(rec_phys + 120, gpu_pack2(v2 - mv, mv));
+    store64(rec_phys + 128, limu);
+    store64(rec_phys + 136, limv);
+    # The Q9 extension tail (words 36..39). Still zeroed for the same reason as before — the prep table
+    # is one fixed region reused across calls — now as two stores instead of four.
+    store64(rec_phys + 144, 0);
+    store64(rec_phys + 152, 0);
     # +144/+148 stay ZERO here and are filled ONLY by the list builder — see gpu_texl_build. Op 0x0B
     # takes its origin and size from the dispatch (user data + grid), op 0x0C from the record,
     # because a fused dispatch has one grid and N origins. The zeroing loop above already cleared

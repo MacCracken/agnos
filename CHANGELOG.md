@@ -3,6 +3,64 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.28] - 2026-07-28
+
+**`gpu_tex_prep`: 40 uncached stores → 20 (open cycle).** The record is written with `store64` pairs.
+Zero burns to build; prediction pre-registered. Bumped on cycle open; the user tags on close.
+
+### Changed — the prep record uses 64-bit stores
+
+1.56.27's confirmed burn refit the cost model with a constant term, across two store counts rather
+than one: **85.6 ns per uncached store + 0.79 µs of genuine per-primitive arithmetic.** At 40 stores
+that is 3.42 µs of bus latency against 0.79 µs of real work — **81% of what remained was still
+memory.**
+
+So the 160-byte record is now written as **20 `store64`s instead of 40 `store32`s**. Same bytes, same
+values, half the UC transactions. Every pair is 8-byte aligned, and seven pairs were already a single
+64-bit quantity split lo/hi in the old code (`cov_mc`, `a2`, `k0b`, `k0c`, `tex_mc`, `lut_mc`, `limu`,
+`limv`), so those are now stored whole — exact, not an approximation.
+
+### Removed from the plan — "cached scratch + bulk copy" does not work, and should not be attempted
+
+⛔ This cut was scoped as *"assemble the record in a cached scratch buffer and bulk-copy it to UC
+once."* **That buys nothing.** `memcpy` (`klib/kstring.cyr:35`) copies its aligned bulk with
+`store64`, so the destination would see **exactly the same 20 UC transactions** — plus an extra
+build-and-read-back pass. The bottleneck is the **count of uncached transactions**, not where the
+bytes come from. Getting below 20 would require 128-bit stores, and the production kernel is
+deliberately FP-free (two sanctioned XMM leaf sites). Direct pairing is therefore not a cheaper
+version of the scratch idea; it is strictly better than it, and the scratch version is struck from
+the plan rather than left as a future option.
+
+### Added — `tests/gpu/packcheck.cyr`, a host oracle for the one way this can be wrong
+
+A mis-paired store writes the right bytes to the **wrong offsets**, and the shader would then read
+structurally-valid garbage. So the packing arithmetic gets its own zero-burn proof: `packcheck` writes
+each pair both ways and byte-compares, over adversarial values — negatives (which sign-extend across
+the neighbouring field if unmasked), int32 min/max, both halves `0xFFFFFFFF`, and a full negative
+64-bit quantity split lo/hi. **PASS.** `texlist` unchanged: 6/6 exact, 5/5 mutations RED.
+
+### Fixed — `gputri` / `gpuwedge` no-arg exit was indistinguishable from a real failure
+
+Both returned **96** when run with no argument — the same code as *"shader not resident"*. On the
+1.56.27 burn the operator ran bare `gputri`, got 96, and the log could not distinguish *"you forgot
+`--cov`"* from *"the GPU is broken"*. Two situations, completely different fixes. Now **83**, its own
+code, in both tools. ⚠ The run list that omitted `--cov` was the primary error; the overloaded exit
+code is what made it unreadable afterwards. The defect had been flagged in the 1.56.25 source review
+and not acted on.
+
+### Pre-registered
+
+| | 1.56.26 | 1.56.27 | predicted 1.56.28 |
+|---|---|---|---|
+| UC stores / prim | 76 | 40 | **20** |
+| `build` slope | 7.29 µs | 4.21 µs | **~2.50 µs** (band 2.1–2.9) |
+| 640-col DOOM CPU | 4.71 ms | 2.71 ms | **~1.62 ms** |
+
+Falsification: **> 3.5 µs/prim refutes the linear-in-stores model** — per-store cost is not constant,
+or pairing did not reduce transactions the way the ISA implies; re-measure before optimising further.
+`wait` is the control and must stay ~5.1 µs/prim. Rubric:
+`agnosticos iron-nuc-zen-log.md#tracker-15628-texprep-store64`.
+
 ## [1.56.27] - 2026-07-28
 
 **`gpu_tex_prep`: stop paying for uncached stores nobody reads (open cycle).** One-line change, ~47%
