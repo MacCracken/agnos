@@ -1,0 +1,251 @@
+# gpuprof — 1.56.26's INSTRUMENT: decompose `F`, the 264 µs fixed term in a `#92` call.
+#
+# ⭐ THE QUESTION, AND WHY NOTHING SO FAR COULD ANSWER IT.
+# Rung 14b's refit put **264 µs of FIXED cost** in one `#92` call — fixed in WAVE COUNT, measured
+# only at **32 primitives**. Two readings survive and they differ by 17×:
+#     per-PRIMITIVE (~7.4 µs each) ⇒ a 640-column DOOM frame carries ~4.7 ms of CPU, comparable to
+#                                    the whole row-major GPU cost, and **no transpose can remove it**
+#     per-DISPATCH  (0.27 ms total) ⇒ irrelevant, and col-major already won the argument
+# Every prior number came from ring 3 timing the WHOLE syscall, which cannot separate the phases.
+# So 1.56.26 made the kernel time its own phases and report the grid it actually launched; this tool
+# reads them at two primitive counts and lets the scaling answer the question.
+#
+# ⛔⛔ THE CONFOUND THIS TOOL WAS BUILT WITH, AND WHY IT NO LONGER APPLIES — read this before trusting
+# any number below. `gpu_tex_list` suspends `gpu_batch_active` around its own dispatch (the 1.56.21
+# invariant), so an op 0x0C dispatch waits on its OWN fence from inside `gpo_execute`'s loop. The GPU
+# execution therefore happened inside the BUILD window. Summing copyin+validate+build as "CPU" would
+# then be measuring a wave-proportional GPU term — and waves scale with primitive count — so the slope
+# would come out per-primitive REGARDLESS of what the CPU does, i.e. the tool would return the same
+# answer for both hypotheses and could not falsify either. Found by an adversarial pass BEFORE the
+# burn, not after. FIXED at 1.56.26: both dispatch primitives accumulate their self-drain into
+# `gpu_prof_drain_us`, and `gpo_execute_all` subtracts it out of BUILD and adds it to WAIT. So here:
+#     BUILD = CPU prep + ring emission ONLY        (what the slope is read from)
+#     WAIT  = outer batch fence + every self-drain (all GPU execution + submission)
+# ⚠ If a future op stops suspending batching, or a third dispatch primitive appears, this accounting
+# must be re-checked. `cpu` is only CPU because two specific functions say so.
+#
+# ⛔ THE ORACLE IS A SLOPE, NOT A THRESHOLD. Do not pre-register "F is per-dispatch if X < N µs" —
+# there is no principled cut-off. Run N=32 and N=256 (8× the primitives, same per-primitive work) and
+# read CPU = copyin+validate+build:
+#     CPU(256) ≈ 8 × CPU(32)  ⇒ PER-PRIMITIVE. F scales. DOOM carries it. Transposing cannot help.
+#     CPU(256) ≈ CPU(32)      ⇒ PER-DISPATCH. F is a constant and the row-major frame is fine.
+#     anything between          ⇒ report the ratio; a partial slope is a real answer, not a failure.
+# ⚠ A ratio near 8 with a LARGE intercept is the interesting third case (setup cost + per-primitive
+# cost), which is exactly why both points print all four phases rather than one summary number.
+#
+# ⭐ AND IT CROSS-CHECKS THE GRID. `gpu_prof_gx/_gy/_waves` come from inside `gpu_blend_cov_run`, the
+# one primitive all ten dispatch sites funnel through — they are what the kernel PROGRAMMED, not what
+# an instrument predicted. Every wave count quoted in this arc so far was a CPU-side prediction. This
+# tool prints predicted vs observed; **a disagreement is itself a finding** and must be reported, not
+# reconciled away ([[feedback_instrument_has_no_oracle]] — the instrument is the link with no oracle,
+# so give it one).
+#
+# EXIT CODES
+#   95 — both points ran, phases are non-degenerate, verdict printed. THE RESULT IS THE PRINTED TABLE.
+#   96 — no GPU / no carveout: plumbing proved, nothing measured (QEMU's honest answer)
+#   90 — ran, but every phase read 0 µs ⇒ the TSC calibration or the profile wiring is broken, NOT a
+#        measurement of "instant". Distinct from 95 on purpose: a silent zero must never read as data.
+#   89 — a `#92` call failed; the printed rc is the kernel's
+#   88 — a `#86` slot allocation failed
+#   87 — `#89` refused the 64-byte profile read (kernel predates 1.56.26, or the buffer is not mapped)
+
+include "lib/io.cyr"
+include "tricore.cyr"          # ps / pn / nl
+
+var PF_TEXD  = 8;              # 8x8 texture
+var PF_PH    = 32;             # primitive height, px
+var PF_PW    = 1;              # 1 px wide — the DOOM column shape, and the worst lane occupancy
+var PF_X0    = 8;
+var PF_Y0    = 8;
+var PF_N_LO  = 32;             # the count rung 14b measured at
+var PF_N_HI  = 256;            # 8x, still under GPU_TEX_LIST_MAX (512) and the wave cap
+
+# ⚠ SIZING: in this directory a top-level `var X[N]` allocates N x u64 — measured, and stated in
+# gputex.cyr's own tl_prims comment. So [3072] = 24576 B = 256 x 96 B records.
+var pf_prims[3072];            # PF_N_HI x 96 B
+var pf_tex[32];                # 8x8x4 = 256 B
+var pf_d[8];                   # one 64-byte #92 record
+var pf_caps[8];                # 64-byte #89 probe (32 base + 32 profile tail)
+
+# The four phases plus the grid, latched from one #89 read so a later call cannot shift them.
+var pf_copyin = 0;
+var pf_valid  = 0;
+var pf_build  = 0;
+var pf_wait   = 0;
+var pf_gx     = 0;
+var pf_gy     = 0;
+var pf_waves  = 0;
+var pf_nops   = 0;
+
+fn pf_fill_tex(): i64 {
+    var i = 0;
+    while (i < PF_TEXD * PF_TEXD) {
+        # Content is irrelevant to timing; make it non-uniform so a shader that reads nothing still
+        # cannot accidentally produce the same frame as one that reads correctly.
+        store32(&pf_tex + i * 4, 0xFF000000 + (i * 0x00010203));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# One 96-byte op-0x0C primitive record. Layout mirrors gputex's tl_pack_prims_at exactly — this is
+# the SHIPPED record shape (gpu.md §7, mask-derived), not a plan shape.
+fn pf_pack(dst, n, tid): i64 {
+    var c = 0;
+    while (c < n) {
+        var b = dst + c * 96;
+        var z = 0;
+        while (z < 24) { store32(b + z * 4, 0); z = z + 1; }
+        store32(b +  0, (PF_PH * 65536) + PF_PW);                 # wh
+        store32(b +  4, (PF_Y0 * 65536) + (PF_X0 + c * PF_PW));   # dstxy — columns side by side
+        store32(b +  8, tid);                                     # tex_id
+        store32(b + 16, (PF_TEXD * 65536) + PF_TEXD);             # texwh
+        store32(b + 20, 2);                                       # FULLCOV — mandatory for this op
+        store32(b + 24, 0);                    store32(b + 28, 0);
+        store32(b + 32, PF_PW * 65536);        store32(b + 36, 0);
+        store32(b + 40, 0);                    store32(b + 44, PF_PH * 65536);
+        store32(b + 48, 0);                    store32(b + 52, 0);
+        store32(b + 56, 65536);                store32(b + 60, 0);
+        store32(b + 64, 0);                    store32(b + 68, PF_TEXD * 65536);
+        c = c + 1;
+    }
+    return 0;
+}
+
+# Read the 64-byte caps probe and latch the profile tail. Returns 0 ok, 87 if the tail is unavailable.
+fn pf_read_profile(): i64 {
+    var z = 0;
+    while (z < 16) { store32(&pf_caps + z * 4, 0); z = z + 1; }
+    if (syscall(89, &pf_caps, 64) != 0) { return 87; }
+    pf_copyin = load32(&pf_caps + 32) & 0xFFFFFFFF;
+    pf_valid  = load32(&pf_caps + 36) & 0xFFFFFFFF;
+    pf_build  = load32(&pf_caps + 40) & 0xFFFFFFFF;
+    pf_wait   = load32(&pf_caps + 44) & 0xFFFFFFFF;
+    pf_gx     = load32(&pf_caps + 48) & 0xFFFFFFFF;
+    pf_gy     = load32(&pf_caps + 52) & 0xFFFFFFFF;
+    pf_waves  = load32(&pf_caps + 56) & 0xFFFFFFFF;
+    pf_nops   = load32(&pf_caps + 60) & 0xFFFFFFFF;
+    # A kernel predating 1.56.26 leaves the tail as we zeroed it AND reports nops 0 for a call that
+    # definitely carried one record — that is the discriminator, not the timings (which may legitimately
+    # round to 0 on a fast path).
+    if (pf_nops == 0) { return 87; }
+    return 0;
+}
+
+fn pf_report(tag, n): i64 {
+    ps(tag); ps(" n="); pn(n);
+    ps("  copyin="); pn(pf_copyin);
+    ps("us validate="); pn(pf_valid);
+    ps("us build="); pn(pf_build);
+    ps("us wait="); pn(pf_wait);
+    ps("us  cpu="); pn(pf_copyin + pf_valid + pf_build);
+    ps("us  grid="); pn(pf_gx); ps("x"); pn(pf_gy);
+    ps(" waves="); pn(pf_waves);
+    ps(" (predicted "); pn(n * PF_PH); ps(")");
+    nl();
+    return 0;
+}
+
+# Run one point. Returns 0 ok, or a non-zero exit code.
+fn pf_point(n, tid, pid): i64 {
+    pf_pack(&pf_prims, n, tid);
+    if (syscall(72, pid, &pf_prims, n * 96) != 0) { return 88; }
+
+    var z = 0;
+    while (z < 16) { store32(&pf_d + z * 4, 0); z = z + 1; }
+    store32(&pf_d +  0, 12);                                   # op 0x0C GPU_OP_TEX_LIST
+    store32(&pf_d +  4, 0);                                    # flags — header flags must be zero
+    store32(&pf_d + 12, pid);                                  # prim_id
+    store32(&pf_d + 16, (PF_PH * 65536) + (n * PF_PW));        # union wh
+    store32(&pf_d + 20, (PF_Y0 * 65536) + PF_X0);              # union dstxy
+    store32(&pf_d + 24, n);                                    # n_prims
+
+    var rc = syscall(92, &pf_d, 64);
+    if (rc != 0) { ps("gpuprof: #92 failed rc="); pn(rc); nl(); return 89; }
+    return pf_read_profile();
+}
+
+fn gpuprof_main(): i64 {
+    ps("gpuprof: decompose F -- is the 264us fixed term per-PRIMITIVE or per-DISPATCH?"); nl();
+
+    var z = 0;
+    while (z < 16) { store32(&pf_caps + z * 4, 0); z = z + 1; }
+    if (syscall(89, &pf_caps, 32) != 0) { return 96; }
+    var flags = load32(&pf_caps + 0) & 0xFFFFFFFF;
+    if ((flags & 1) == 0) { ps("gpuprof: no GPU -- plumbing only"); nl(); return 96; }
+    if ((flags & 4) == 0) { ps("gpuprof: no carveout -- #86 cannot serve"); nl(); return 96; }
+    if ((flags & 8) == 0) { ps("gpuprof: shader compositing unavailable"); nl(); return 96; }
+
+    pf_fill_tex();
+    var tid = syscall(86, 4096);
+    var pid = syscall(86, PF_N_HI * 96);
+    if (tid < 1) { return 88; }
+    if (pid < 1) { return 88; }
+    syscall(72, tid, &pf_tex, PF_TEXD * PF_TEXD * 4);
+
+    # ⚠ WARM-UP FIRST, OUTSIDE EVERY REPORTED POINT. The first #92 of a boot arms shaders lazily
+    # (gpu_texl_arm), and that one-time residency cost would otherwise land entirely in the LOW point
+    # and manufacture exactly the flat-looking CPU curve that would falsely say "per-dispatch".
+    var wu = pf_point(PF_N_LO, tid, pid);
+    if (wu != 0) { return wu; }
+
+    var e1 = pf_point(PF_N_LO, tid, pid);
+    if (e1 != 0) { return e1; }
+    var lo_cpu = pf_copyin + pf_valid + pf_build;
+    var lo_wait = pf_wait;
+    pf_report("gpuprof: LO ", PF_N_LO);
+
+    var e2 = pf_point(PF_N_HI, tid, pid);
+    if (e2 != 0) { return e2; }
+    var hi_cpu = pf_copyin + pf_valid + pf_build;
+    var hi_wait = pf_wait;
+    pf_report("gpuprof: HI ", PF_N_HI);
+
+    if (lo_cpu == 0) {
+        if (hi_cpu == 0) {
+            ps("gpuprof: DEGENERATE -- every CPU phase read 0us. TSC calibration or profile wiring is");
+            nl();
+            ps("gpuprof: broken; this is NOT a measurement of 'instant'."); nl();
+            return 90;
+        }
+    }
+
+    # The slope, in tenths so an integer ratio still discriminates (8.0x prints as 80).
+    var ratio10 = 0;
+    if (lo_cpu > 0) { ratio10 = (hi_cpu * 10) / lo_cpu; }
+    ps("gpuprof: CPU(hi)/CPU(lo) = "); pn(ratio10 / 10); ps("."); pn(ratio10 % 10);
+    ps("x  against 8.0x if PER-PRIMITIVE, 1.0x if PER-DISPATCH"); nl();
+    ps("gpuprof: WAIT lo="); pn(lo_wait); ps("us hi="); pn(hi_wait); ps("us"); nl();
+
+    # ⛔ VERDICT PRINTED, NOT DECIDED. The exit code says the run was valid; the reader owns the
+    # interpretation, because a mid-range ratio is a real physical answer (fixed setup + per-primitive
+    # term) and collapsing it to a boolean here would throw away the shape that distinguishes them.
+    if (ratio10 >= 40) {
+        ps("gpuprof: VERDICT -- CPU scales with primitive count. F IS PER-PRIMITIVE."); nl();
+        ps("gpuprof: A 640-column frame carries this cost and NO transpose removes it."); nl();
+    }
+    if (ratio10 < 40) {
+        if (ratio10 >= 20) {
+            ps("gpuprof: VERDICT -- PARTIAL slope: a fixed setup cost PLUS a per-primitive term."); nl();
+            ps("gpuprof: Report both intercept and slope; neither reading alone is correct."); nl();
+        }
+        if (ratio10 < 20) {
+            ps("gpuprof: VERDICT -- CPU is flat in primitive count. F IS PER-DISPATCH."); nl();
+            ps("gpuprof: 0.27ms, not 4.7ms. Row-major stays viable on CPU cost."); nl();
+        }
+    }
+
+    if (pf_waves != PF_N_HI * PF_PH) {
+        ps("gpuprof: ** GRID DISAGREEMENT ** observed waves="); pn(pf_waves);
+        ps(" predicted="); pn(PF_N_HI * PF_PH); nl();
+        ps("gpuprof: the kernel launched a different grid than ring 3 predicted -- that is a FINDING,"); nl();
+        ps("gpuprof: and every wave-count in this arc before 1.56.26 was a prediction of this kind."); nl();
+    }
+
+    syscall(74, tid);
+    syscall(74, pid);
+    return 95;
+}
+
+fn _entry(): i64 { var r = gpuprof_main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

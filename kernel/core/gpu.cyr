@@ -133,6 +133,63 @@ var gpu_otg_lock_acked = 0;  # last gpu_otg_lock result — 0 means the lock TIM
 # ambient flag only because pass 1 has already validated every op, so pass 2 cannot fail mid-emit and leave
 # a partial program in the ring with no fence behind it.
 var gpu_batch_active  = 0;
+
+# ============================================================================================
+# 1.56.26 — `#92` PHASE PROFILE. The instrument that decomposes `F`.
+# ============================================================================================
+# THE QUESTION, stated so it cannot drift: rung 14b's refit put **264 µs of FIXED cost** in one
+# `#92` call, measured ONLY at 32 primitives. If that term scales PER PRIMITIVE (~7.4 µs each) a
+# 640-column DOOM frame carries ~4.7 ms of CPU that **no transpose can remove** — comparable to the
+# entire row-major GPU cost. If it is PER DISPATCH it is 0.27 ms and irrelevant. **The two answers
+# differ by 17× and nothing has separated them**, because every number so far came from timing the
+# whole syscall from ring 3, which cannot tell the three phases apart.
+#
+# So the kernel times its own phases and reports them, rather than ring 3 timing the total and
+# guessing. The phases are the three real stages of `gpu_shader_op_sys`:
+#   COPYIN   — proc_copy_from_user of the descriptor array (scales with the ARRAY, not the work)
+#   VALIDATE — the gpo_validate pass over n records (per-RECORD; the suspected ~7.4 µs lives here
+#              or in BUILD)
+#   BUILD    — the gpo_execute pass: per-op prep (gpu_texl_build / gpu_tex_prep) + ring emission
+#   WAIT     — gpu_batch_tail + gpu_ring_kick_wait: the actual GPU time plus submission
+# COPYIN+VALIDATE+BUILD is CPU work that a transpose cannot touch. WAIT is what col-major moved.
+# ⭐ Reading them separately at two primitive counts answers the question with no new hypothesis:
+# if VALIDATE+BUILD grows ~linearly in n_prims, F is per-primitive; if it is flat, F is per-dispatch.
+#
+# ⭐ AND THE GRID IS OBSERVED, NOT PREDICTED. Every wave count quoted in this arc so far was computed
+# CPU-side by the instrument from what it BELIEVED the kernel would launch. `gpu_prof_gx/_gy` are
+# captured inside `gpu_blend_cov_run` — the one primitive all ten dispatch sites funnel through — so
+# they are what was actually programmed. A disagreement between the two IS a finding.
+#
+# ⚠ Unconditional, deliberately NOT behind an `#ifdef`. Four `rdtsc` reads against a 264 µs call is
+# noise (~10 ns), and a build flag would mean the measuring kernel differs from the shipping one —
+# the ATOM_DRY shape that has already cost this project burns
+# ([[feedback_ifdef_bites_name_their_build_flags]]). One kernel, always measurable.
+# ⚠ LAST-CALL semantics, not cumulative: each `#92` overwrites these. A caller that wants a stable
+# read must not issue another `#92` between the call it cares about and its `#89` probe.
+var gpu_prof_copyin_us = 0;   # descriptor copy-in
+var gpu_prof_valid_us  = 0;   # gpo_validate over all n records
+var gpu_prof_build_us  = 0;   # gpo_execute over all n records (prep + ring emission)
+var gpu_prof_wait_us   = 0;   # gpu_batch_tail + gpu_ring_kick_wait
+var gpu_prof_gx        = 0;   # grid X actually programmed at the LAST dispatch
+var gpu_prof_gy        = 0;   # grid Y actually programmed at the LAST dispatch
+var gpu_prof_waves     = 0;   # gx*gy summed across EVERY dispatch in the last #92 call
+var gpu_prof_nops      = 0;   # records in the last #92 call
+# ⭐ Self-drain time: GPU execution that happens INSIDE the build loop because the op suspended
+# batching to wait on its own fence (gpu_tex_list / gpu_tri_list, the 1.56.21 invariant). Accumulated
+# by both dispatch primitives and then moved out of BUILD and into WAIT by gpo_execute_all, so BUILD
+# means CPU prep + ring emission and nothing else. Without this the whole measurement is confounded —
+# see the ⛔⛔ note at the self-drain site.
+var gpu_prof_drain_us  = 0;
+
+# gpu_prof_us(t0) — elapsed microseconds since a prior rdtsc().
+# ⚠ Returns 0 rather than a negative on a backwards delta. The TSC is invariant on this silicon and
+# these calls do not migrate mid-syscall, but a 0 is an obviously-absent datum whereas a negative
+# would propagate into a u32 field as a colossal positive and read as a real measurement.
+fn gpu_prof_us(t0) {
+    var now = rdtsc();
+    if (now <= t0) { return 0; }
+    return (now - t0) / gpu_tsc_per_us();
+}
 var gpu_tex_armed     = 0;      # rung 13: the texturing blob is resident
 var gpu_texl_armed    = 0;      # rung 14: the fused-list blob is resident
 var gpu_texl_cm_armed = 0;      # rung 14b: the COL-MAJOR blob is resident (a separate 4 KB slot)
@@ -2292,6 +2349,13 @@ fn blend_rect_write(dst_phys) {
 # five). Rather than a third near-identical copy of the ring program — the one place a typo is silent and
 # expensive — the emitter takes seven opaque dwords and the callers name them.
 fn gpu_grid7_run(shader_mc, k0, k1, k2, k3, k4, k5, k6, rsrc1, gx, gy, done_mc, done_phys) {
+    # 1.56.26 — OBSERVE the grid. Twin of the capture in gpu_blend_cov_run: these are the TWO dispatch
+    # primitives in the kernel, and instrumenting only one would silently under-report waves for every
+    # op that routes through the other — a grid cross-check that is blind on half the paths is worse
+    # than none, because it reads as agreement.
+    gpu_prof_gx = gx;
+    gpu_prof_gy = gy;
+    gpu_prof_waves = gpu_prof_waves + gx * gy;
     store32(done_phys, GPU_MT_NOTYET);
     gpu_mfence();
 
@@ -2322,9 +2386,22 @@ fn gpu_grid7_run(shader_mc, k0, k1, k2, k3, k4, k5, k6, rsrc1, gx, gy, done_mc, 
     gpu_ring_put(GPU_PM4_DISPATCH_DIRECT_HDR); gpu_ring_put(gx); gpu_ring_put(gy); gpu_ring_put(1); gpu_ring_put(GPU_DISPATCH_INITIATOR);
     gpu_ring_put(GPU_PM4_EVENT_WRITE_HDR); gpu_ring_put(GPU_EVENT_CS_PARTIAL_FLUSH);
     if (gpu_batch_active != 0) { return 1; }   # batched: the driver emits ONE tail for the whole array
+    # ⛔⛔ 1.56.26 — THIS SELF-DRAIN IS GPU TIME AND MUST NOT BE BILLED TO `BUILD`.
+    # An op that suspends gpu_batch_active around its own dispatch (gpu_tex_list, gpu_tri_list — the
+    # 1.56.21 invariant) reaches here from INSIDE gpo_execute's loop, so the fence and the spin below
+    # run inside gpo_execute_all's BUILD window. Left unattributed, BUILD reads as "CPU prep" while
+    # containing the entire GPU execution — and GPU cost is wave-proportional, waves scale with
+    # primitive count, so the CPU-vs-primitive slope that cut 1.56.26 exists to measure would be
+    # dominated by a term that is per-primitive BY CONSTRUCTION. The instrument would report "F scales
+    # with primitives" for a kernel where it does not, with a plausible number and a green exit code —
+    # [[feedback_instrument_has_no_oracle]] exactly. Caught by an adversarial pass BEFORE the burn.
+    # ⭐ Accumulate here; gpo_execute_all moves it out of BUILD and into WAIT.
+    var t_drain = rdtsc();
     gpu_batch_tail(done_mc);
     gpu_mfence();
-    return gpu_ring_kick_wait(done_phys, 100000);
+    var drain_rc = gpu_ring_kick_wait(done_phys, 100000);
+    gpu_prof_drain_us = gpu_prof_drain_us + gpu_prof_us(t_drain);
+    return drain_rc;
 }
 
 # ── plan-S12: the batch seam ───────────────────────────────────────────────────────────────────────────
@@ -2980,6 +3057,15 @@ fn edge_cov_write(dst_phys) {
 # RSRC1 differs — hence it is a parameter. One dispatcher rather than two near-identical copies means the
 # ring program has a single place to be wrong.
 fn gpu_blend_cov_run(shader_mc, mask_mc, dst_mc, mask_pitch, dst_pitch, width, color, rsrc1, gx, gy, done_mc, done_phys) {
+    # 1.56.26 — OBSERVE the grid rather than predict it. This is the single primitive all ten dispatch
+    # sites funnel through, so capturing here means gpu_prof_gx/_gy are what was actually programmed,
+    # not what an instrument computed CPU-side from its model of the kernel. gpu_prof_waves accumulates
+    # across every dispatch in a call (a multi-dispatch op like gpu_edge_cov contributes twice); it is
+    # zeroed per #92 in gpu_shader_op_sys, so a boot-path dispatch outside #92 simply adds to a counter
+    # nobody reads that cycle.
+    gpu_prof_gx = gx;
+    gpu_prof_gy = gy;
+    gpu_prof_waves = gpu_prof_waves + gx * gy;
     store32(done_phys, GPU_MT_NOTYET);
     gpu_mfence();
 
@@ -3010,9 +3096,22 @@ fn gpu_blend_cov_run(shader_mc, mask_mc, dst_mc, mask_pitch, dst_pitch, width, c
     gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
     gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
     if (gpu_batch_active != 0) { return 1; }   # batched: the driver emits ONE tail for the whole array
+    # ⛔⛔ 1.56.26 — THIS SELF-DRAIN IS GPU TIME AND MUST NOT BE BILLED TO `BUILD`.
+    # An op that suspends gpu_batch_active around its own dispatch (gpu_tex_list, gpu_tri_list — the
+    # 1.56.21 invariant) reaches here from INSIDE gpo_execute's loop, so the fence and the spin below
+    # run inside gpo_execute_all's BUILD window. Left unattributed, BUILD reads as "CPU prep" while
+    # containing the entire GPU execution — and GPU cost is wave-proportional, waves scale with
+    # primitive count, so the CPU-vs-primitive slope that cut 1.56.26 exists to measure would be
+    # dominated by a term that is per-primitive BY CONSTRUCTION. The instrument would report "F scales
+    # with primitives" for a kernel where it does not, with a plausible number and a green exit code —
+    # [[feedback_instrument_has_no_oracle]] exactly. Caught by an adversarial pass BEFORE the burn.
+    # ⭐ Accumulate here; gpo_execute_all moves it out of BUILD and into WAIT.
+    var t_drain = rdtsc();
     gpu_batch_tail(done_mc);
     gpu_mfence();
-    return gpu_ring_kick_wait(done_phys, 100000);
+    var drain_rc = gpu_ring_kick_wait(done_phys, 100000);
+    gpu_prof_drain_us = gpu_prof_drain_us + gpu_prof_us(t_drain);
+    return drain_rc;
 }
 
 # cov_ref_px — EXACT rational reference for the coverage blend, rounded once at the end:

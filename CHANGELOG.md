@@ -3,6 +3,72 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.26] - 2026-07-28
+
+**Decompose `F` — the instrument (open cycle).** The kernel now times its own `#92` phases and
+reports the grid it actually launched. Zero burns for the instrumentation; the measurement itself is
+armed and awaits one iron burn. Bumped on cycle open; the user tags on close.
+
+### Added — per-phase `#92` profiling, and an OBSERVED grid
+
+Rung 14b's refit left **264 µs fixed in wave count**, measured only at **32 primitives**. Per-primitive
+(~7.4 µs each) means a 640-column DOOM frame carries ~4.7 ms of CPU that no transpose can remove;
+per-dispatch means 0.27 ms and irrelevant. **17× apart**, and nothing could separate them because every
+prior number timed the whole syscall from ring 3.
+
+- `gpu_prof_copyin_us` / `_valid_us` / `_build_us` / `_wait_us` — the four real stages of
+  `gpu_shader_op_sys`, timed in the kernel.
+- `gpu_prof_gx` / `_gy` / `_waves` — captured inside **both** dispatch primitives
+  (`gpu_blend_cov_run` and `gpu_grid7_run`), so they are what the kernel **programmed**. Every wave
+  count quoted in this arc so far was a ring-3 *prediction*; the two are now comparable and a
+  disagreement is a finding.
+- `#89 gpu_caps` gains a **length-gated 64-byte tail**. Callers passing 32 are bit-identical to
+  before. ⛔ The `is_user_range` guard widens with the write — a 64-byte write behind a 32-byte check
+  would be the identical defect fixed in `#82`/`#83` at 1.56.24 — and a caller that asks for 64 bytes
+  it does not own gets `-1` rather than a silent 32-byte answer, because a half-write hands back a
+  buffer whose tail is the caller's own stale bytes, indistinguishable from a profile that read zero.
+- `tests/gpu/gpuprof.cyr` — runs op `0x0C` at n=32 and n=256 after a warm-up outside both windows
+  (so lazy shader arming cannot land entirely in the low point and manufacture a flat curve), and
+  prints the slope. Staged by `stage-tools.sh`.
+
+⚠ Deliberately **not** behind an `#ifdef`: four `rdtsc` reads against a 264 µs call is ~10 ns, and a
+build flag would mean the measuring kernel differs from the shipping one — the `ATOM_DRY` shape that
+has already cost this project burns.
+
+### Fixed — the self-drain was billed to `BUILD`, which would have made the measurement meaningless
+
+⛔⛔ Caught by an adversarial verification pass **before** the burn, not by the burn. `gpu_tex_list`
+suspends `gpu_batch_active` around its own dispatch (the 1.56.21 invariant), so `gpu_blend_cov_run`
+does not take its batched early-return — it runs `gpu_batch_tail` + `gpu_ring_kick_wait` itself,
+*inside* `gpo_execute`'s loop, inside the BUILD window. The outer WAIT then timed an empty program and
+read ≈0.
+
+**Why that was fatal rather than untidy:** GPU cost is wave-proportional and waves scale with primitive
+count, so summing `copyin+validate+build` as "CPU" would have produced a per-primitive slope
+**regardless of what the CPU actually does** — the same reading for both hypotheses, a plausible
+number, a green exit code, and one burned session on the operator's only dev machine. This is the
+[[feedback_instrument_has_no_oracle]] failure mode exactly: the instrument is the one link in the
+chain with no oracle.
+
+Both dispatch primitives now accumulate their self-drain into `gpu_prof_drain_us`, and
+`gpo_execute_all` nets it out of BUILD and into WAIT. So `BUILD` means CPU prep + ring emission only,
+which is what the slope is read from.
+
+⭐ Also found while fixing it: there are **two** dispatch primitives, not one — `gpu_grid7_run` as well
+as `gpu_blend_cov_run` — and only the second had been instrumented. A grid cross-check that is blind on
+half the paths is worse than none, because it reads as agreement.
+
+⚠ A comment written earlier in this cut said the contamination "is not a measurement bug, it is the
+shape of the code." That was wrong and it was the whole defect; it is replaced with the reasoning above.
+
+### Armed — the burn rubric is written BEFORE the flash
+
+`agnosticos/docs/development/iron-nuc-zen-log.md#tracker-15626-decompose-f` carries the CONFIRM /
+FALSIFY / VOID conditions: the verdict is a **slope, not a threshold** (ratio ≥ 4.0 per-primitive,
+< 2.0 per-dispatch, between = a real partial answer), plus what each non-95 exit means — including
+that **exit 87 means a stale kernel was flashed** (`--update-fs` instead of `--update-all`) and is not
+a result.
+
 ## [1.56.25] - 2026-07-28
 
 **Boot hygiene: dead code, one burn-trap, and a refuted register story (open cycle).** Zero burns.

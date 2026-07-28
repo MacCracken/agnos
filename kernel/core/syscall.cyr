@@ -2917,21 +2917,36 @@ fn gpu_shader_op_sys(desc_uva, len) {
 
     # Fault-proof copy-in: proc_copy_from_user page-walks the caller's CR3 and refuses a not-present or
     # non-user page instead of a blind deref that could #PF the kernel on a wild-but-in-range pointer.
+    # ⭐ 1.56.26 — PHASE PROFILE. Reset first so a call that returns early leaves zeros in the phases it
+    # never reached, rather than the previous call's numbers masquerading as this one's.
+    gpu_prof_copyin_us = 0;
+    gpu_prof_valid_us  = 0;
+    gpu_prof_build_us  = 0;
+    gpu_prof_wait_us   = 0;
+    gpu_prof_drain_us  = 0;
+    gpu_prof_waves     = 0;
+    gpu_prof_nops      = len / GPU_OP_STRIDE;
+
     var buf = sc_gpuop_buf();
+    var t_copy = rdtsc();
     if (proc_copy_from_user(proc_get_cr3(proc_current_get()), buf, desc_uva, len) == 0) {
         return 0 - GPO_E_DESC;
     }
+    gpu_prof_copyin_us = gpu_prof_us(t_copy);
 
     var n   = len / GPU_OP_STRIDE;
     var fbw = gpu_bb_pitch / 4;
     var fbh = gpu_bb_fbsize / gpu_bb_pitch;
 
+    # VALIDATE phase — per RECORD. If `F` is per-primitive, this is one of the two places it can live.
+    var t_val = rdtsc();
     var i = 0;
     while (i < n) {
         var e = gpo_validate(buf + i * GPU_OP_STRIDE, fbw, fbh);
-        if (e != 0) { return 0 - ((i << 8) | e); }
+        if (e != 0) { gpu_prof_valid_us = gpu_prof_us(t_val); return 0 - ((i << 8) | e); }
         i = i + 1;
     }
+    gpu_prof_valid_us = gpu_prof_us(t_val);
     return gpo_execute_all(buf, n);
 }
 
@@ -2961,6 +2976,16 @@ fn gpo_execute_all(buf, n) {
     store32(done_phys, GPU_MT_NOTYET);
     gpu_mfence();
 
+    # ⭐ 1.56.26 — BUILD phase. Per-op prep (gpu_texl_build / gpu_tex_prep) plus ring emission. This and
+    # VALIDATE are the two candidates for the per-primitive term in `F`; WAIT below is everything else.
+    # ⚠ The suspend/restore of gpu_batch_active inside gpu_tex_list means an op 0x0C dispatch ALSO waits
+    # on its own fence from in here, so raw elapsed time across this loop CONTAINS GPU execution. That
+    # is netted out below via gpu_prof_drain_us — see the ⛔⛔ note at the self-drain site in gpu.cyr.
+    # ⛔ An earlier version of this comment said the contamination "is not a measurement bug, it is the
+    # shape of the code". That was wrong and it was the whole defect: GPU cost is wave-proportional and
+    # waves scale with primitive count, so leaving it in BUILD makes the per-primitive slope this cut
+    # measures come out per-primitive REGARDLESS of what the CPU actually does.
+    var t_build = rdtsc();
     gpu_batch_active = 1;
     var err = 0;
     var j = 0;
@@ -2970,11 +2995,31 @@ fn gpo_execute_all(buf, n) {
         j = j + 1;
     }
     gpu_batch_active = 0;                      # restored on EVERY exit path below
+    # ⭐ NET THE SELF-DRAIN OUT OF BUILD. Ops that suspend batching to wait on their own fence
+    # (gpu_tex_list, gpu_tri_list) executed GPU work inside the loop above and accumulated it into
+    # gpu_prof_drain_us. Subtracting it here is what makes BUILD mean "CPU prep + ring emission" —
+    # the thing the whole cut is trying to measure the slope of. ⚠ Floored at 0: the drain is a
+    # SUBSET of the build window so the difference cannot legitimately go negative, but an integer
+    # µs conversion applied to two different windows can round the wrong way by a tick, and a huge
+    # positive from an underflowed subtraction would read as a real measurement.
+    var build_total = gpu_prof_us(t_build);
+    if (build_total > gpu_prof_drain_us) {
+        gpu_prof_build_us = build_total - gpu_prof_drain_us;
+    }
+    if (build_total <= gpu_prof_drain_us) {
+        gpu_prof_build_us = 0;
+    }
 
     if (err != 0) { return 0 - err; }
+    # WAIT phase — the batch fence and the spin on it. What col-major actually moved.
+    var t_wait = rdtsc();
     gpu_batch_tail(done_mc);
     gpu_mfence();
-    if (gpu_ring_kick_wait(done_phys, 100000) != 1) { return 0 - GPO_E_BATCH; }
+    if (gpu_ring_kick_wait(done_phys, 100000) != 1) {
+        gpu_prof_wait_us = gpu_prof_us(t_wait) + gpu_prof_drain_us;
+        return 0 - GPO_E_BATCH;
+    }
+    gpu_prof_wait_us = gpu_prof_us(t_wait) + gpu_prof_drain_us;
     return 0;
 }
 
@@ -3050,6 +3095,31 @@ fn gpu_caps_sys(buf, len) {
     var opmask = 0;
     if (shader_ok == 1) { opmask = GPU_OP_SUPPORTED; }
     store32(buf + 28, opmask);
+
+    # ⭐ 1.56.26 — THE PHASE PROFILE, as an OPT-IN TAIL. A caller asking for 32 bytes gets exactly the
+    # eight-word probe it always got; only a caller that asks for 64 gets the profile. Extending by
+    # length rather than by a new syscall is what the reserved-tail shape is for — no ABI break, no
+    # second number to keep in step, and old binaries are bit-identical in behaviour.
+    #
+    # ⛔ AND THE RANGE CHECK WIDENS WITH THE WRITE. The guard at the top validates only 32 bytes because
+    # that was all this ever wrote; writing 64 behind a 32-byte check would be the identical defect this
+    # cycle just fixed in #82/#83 — a bound that describes the OLD access.
+    # ⛔ REFUSE, don't half-write. A caller that asks for 64 bytes it does not own gets -1, not a silent
+    # 32-byte answer: this file rejects rather than clips everywhere else (#87/#88 reject off-screen
+    # rects, the flags word accepts nothing rather than accepting-and-ignoring), and a partial write
+    # here would hand back a buffer whose second half is the caller's own stale bytes — indistinguishable
+    # from a profile that legitimately read zero.
+    if (len >= 64) {
+        if (is_user_range(buf, 64) == 0) { return 0 - 1; }
+        store32(buf + 32, gpu_prof_copyin_us);   # descriptor copy-in
+        store32(buf + 36, gpu_prof_valid_us);    # gpo_validate over all records
+        store32(buf + 40, gpu_prof_build_us);    # gpo_execute: per-op prep + ring emission
+        store32(buf + 44, gpu_prof_wait_us);     # batch fence + spin
+        store32(buf + 48, gpu_prof_gx);          # grid X actually programmed, LAST dispatch
+        store32(buf + 52, gpu_prof_gy);          # grid Y actually programmed, LAST dispatch
+        store32(buf + 56, gpu_prof_waves);       # gx*gy summed over EVERY dispatch in the call
+        store32(buf + 60, gpu_prof_nops);        # records in the call
+    }
     return 0;
 }
 

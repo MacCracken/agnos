@@ -156,6 +156,21 @@ stage_one agnos/tests/gpu gputri.cyr gputri || rc=1
 # different picture; 95 means both rungs green.
 stage_one agnos/tests/gpu gputex.cyr gputex || rc=1
 
+# gpuprof — 1.56.26: DECOMPOSE `F`. Rung 14b's refit left 264 us of cost FIXED IN WAVE COUNT but
+# measured only at 32 primitives, and the two surviving readings differ by 17x: per-PRIMITIVE
+# (~7.4 us each => a 640-column DOOM frame carries ~4.7 ms of CPU that NO transpose removes) or
+# per-DISPATCH (0.27 ms, irrelevant). `run /bin/gpuprof` issues op 0x0C at n=32 and n=256 and reads
+# the kernel's own per-phase timings back through the 64-byte #89 tail (copyin / validate / build /
+# wait), so the SLOPE of CPU cost against primitive count answers it directly.
+# ⭐ It also prints OBSERVED vs PREDICTED wave counts. Every wave figure in this arc before 1.56.26
+# was computed ring-3-side from a model of the kernel; gpu_prof_gx/_gy are captured inside
+# gpu_blend_cov_run itself. A disagreement is a finding in its own right.
+# EXIT: 95 = both points ran, verdict printed (READ THE TABLE, the code only says the run was valid)
+#       96 = no GPU/carveout (QEMU's honest answer)  90 = every CPU phase read 0us => instrument or
+#       TSC broken, NOT "instant"   89 = a #92 failed   88 = #86 slot failed   87 = kernel predates
+#       the #89 profile tail.
+stage_one agnos/tests/gpu gpuprof.cyr gpuprof || rc=1
+
 # rupantara gpulayer — the ML-layer-on-GPU crown proof (1.54.x C6). A real bias-free MLP up-projection matmul
 # (rosnet linear_fwd 8x8x32) run on the gfx90c shader cores via #83, tiled 8x8 and byte-compared against
 # rupantara's CPU linear_fwd. Exit 95 = byte-identical AND all 4 tiles on the GPU (crown); 96 = identical but
