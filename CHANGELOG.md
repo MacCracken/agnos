@@ -3,6 +3,108 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.24] - 2026-07-28
+
+**Truth-up, and the four real defects a full GPU review found (open cycle).** Zero burns — every
+item here is provable on the host. The cycle exists because a review of the whole GPU surface
+against kernel source turned up a release plan that was materially false and four correctness
+defects that had survived precisely because nothing exercised them. Bumped on cycle open; the user
+tags on close.
+
+### Fixed — op `0x09` accepted two things its own worker refuses
+
+`gpo_validate_tri` blessed `GPU_RULE_EVENODD` and `GPU_TRI_FLAG_DERIVE`; the shared worker
+`gpu_edge_cov` rejects `rule != GPU_RULE_NONZERO` outright, and there is **no edge synthesis
+anywhere in the kernel** for DERIVE — `gpu_tri_rgba` calls `gpu_edge_cov` unconditionally, and the
+DERIVE path hands it `edge_mc = 0, n_edges = 0`. Both requests therefore passed validation and died
+deep in pass 2 as an opaque `GPO_E_DISPATCH`, indistinguishable from a wedged GPU.
+
+This is the **exact defect `gpo_validate_edge` already documents for op `0x08`** — its comment reads
+*"the ABI would ACCEPT rule 1 and then silently fail it … and the worker never runs in QEMU so the
+reject had no test at all."* The fix shipped for `0x08` and was never applied to its twin.
+
+- EVENODD now rejects at the validator with `GPO_E_RULE`, matching `0x08`.
+- DERIVE now returns a new **`GPO_E_NOTIMPL` (29)** — "ABI-legal but unimplemented", its own code
+  because the caller's fix (take the explicit-edge path) differs from `GPO_E_RESERVED`'s (stop
+  setting garbage bits) and `GPO_E_RULE`'s (pass a legal value).
+- ⭐ The DERIVE reject is placed **last**, after every geometry check, so it still means "well-formed
+  in every other respect" and the existing geometry battery keeps asserting through that path.
+- ⛔ **The selftest had frozen the bug as correct behaviour** — `"tri: well-formed DERIVE"` asserted
+  `ea_expect_valid`. Flipped, with a note to flip it back only in the change that lands synthesis.
+- op `0x09` had **no winding-rule coverage at all**, which is how this survived. Added both arms
+  (EVENODD refused, NONZERO accepted — the second so the first proves something).
+- `edge-abi` battery **89 → 91 of 91**; `edge-abi-smoke` **16 passed, 0 failed**.
+
+### Fixed — `gpu_fence`'s ring append could write past the ring
+
+The five-dword `WRITE_DATA` append stored at an **unmasked** `gpu_arena_phys + (gpu_ring_wptr << 2)`
+while `gpu_ring_put` masks every store with `& GPU_RING_DW_MASK`. At `gpu_ring_wptr` 16384 the packet
+lands past the ring's `0x10000` end, on the MQD save area, with no page tables to stop it. Now
+**per-dword masked** — each dword masks its own index.
+
+⛔ **Not a masked `base`.** Five dwords from one base still run off the end when the cursor sits
+within five of the wrap: it would look corrected and fail only at the boundary. The in-source comment
+warning against that shortcut is retained and expanded.
+
+⚠ Unreachable in a shipped boot (~3 275 fences needed in one boot) — and that is exactly why it
+survived, while **gpu.md's risk register asserted the mask was already there**. Unreachable is not
+the same as correct.
+
+### Fixed — ATOM FB-scratch guard was off by one dword
+
+`atom_fb_read`/`atom_fb_write` tested `(atom_fb_base + idx * 4) > atom_scratch_size`, accepting an
+offset **equal** to the size — a `load32`/`store32` at dword [256] of a 256-dword (1024-byte)
+scratch. Two bugs in one line: `>` should have been a full `off + 4 <= size` bound, and the guard's
+arithmetic differed from the access's (`atom_fb_base + idx*4` vs `(atom_fb_base/4 + idx)*4`), so they
+would diverge on any unaligned base. Guard and access now share one expression, `atom_fb_off(idx)`.
+
+⚠ This is **vendor VBIOS bytecode driving the interpreter** — the index is data from the ROM, not a
+kernel-chosen value, so the bound is a trust boundary rather than a defensive nicety.
+
+### Added — `proc_copy_to_user`, and `#82`/`#83` now write back through it
+
+Both GPU matmul syscalls wrote their result to ring 3 by probing the destination with
+`proc_copy_from_user` and then running a raw `store32`/`store64` loop into the user VA. The in-source
+comment said so: *"no proc_copy_TO_user primitive exists."* That reasoning is sound about faulting
+and silent about permission — the read-side probe validates Present + User + PS and **never looks at
+the R/W bit**, so a present, user, **read-only** destination passed and was written anyway. Ring 0
+does not honour R/W unless `CR0.WP` is set, so the store simply succeeded against memory the process
+had asked the kernel to protect.
+
+`proc_copy_to_user(cr3, uva, src, len)` mirrors its read-side twin exactly — same boot-CR3 walk, same
+Present/User/PS requirements, same 0/1 convention — plus the one line that is the whole point:
+`(pde & 2) == 0` ⇒ refuse.
+
+### Fixed — documentation that disagreed with the kernel
+
+- **The shared shader body is 417 dwords, not 442.** Three comments called 442 "the body"; 442 is
+  `tex_rgba`'s **total** (25 prologue + 417). `tex_list` is 458 (41 + 417), so the 16-dword delta is
+  prologue-vs-prologue. `texl-body-identity.sh` prints all three and asserts only the 417.
+- **17 hand-assembled shaders, not 11** (correct at 1.56.7; six landed since).
+- **M1 / M2 / M3 and rung 16 `tile-own` marked closed.** All four were shipped and iron- or
+  host-proven while their rows read as unbuilt — rung 16 has been green since 1.56.17 and the string
+  `tileown` appeared nowhere in gpu.md, so it was double-counted as remaining work.
+- **H0's anchor list re-derived.** It warned that citations were "~60 lines short"; they were **~3,300**
+  (`gpu_dcn_write_committed` cited :5054, actually :8318) — a stale warning that made a useless map
+  look merely imprecise. Replaced with fresh anchors *and* the instruction to grep `^fn <name>(`
+  instead, because this cycle's own edits moved several of them again.
+- **The release plan is rebuilt as ten numbered 1.56.x cuts.** The previous REMAINING table listed
+  MODESET as "not started, recommended next" when its own closing criterion had been met on iron at
+  1.56.12, gated 3D on MODESET when 3D had already shipped rungs 9–14b without it, and prescribed an
+  L1 discriminator that had already run and returned VOID. Three agents planned against those rows.
+
+### Removed — a hardware-purchase proposal that should never have been written down
+
+gpu.md carried a bullet advocating a **USB HDMI capture dongle** as *"the highest-value un-done item
+in this doc"* and *"an operator purchase decision."* Deleted, with a tombstone in its place. It was
+wrong three ways: it violates a standing hard rule (no box in the signal path, no hardware-purchase
+suggestions); it is **technically void** — agnos has **zero isochronous USB endpoint support**
+(`grep -riE 'isoch|isoc' kernel/` returns nothing; `xhci_ctx.cyr` configures interrupt-IN and bulk
+only), and UVC/UAC both mandate isochronous, so the machine under test cannot enumerate the
+instrument; and it is unnecessary, because the adjudication problem was never a missing instrument
+but burns run without a negative control in the same boot. An agent read that bullet and relayed the
+idea to the operator on 2026-07-20.
+
 ## [1.56.23] - 2026-07-27
 
 **Rung 14's oracle, then rung 14b (open cycle).** 1.56.22 closed rung 13 and met rung 14's
@@ -124,20 +226,88 @@ Window B is the nasty one: the wave count and the write count both look correct.
 Every gate added here was **mutation-tested**, including one that first *crashed* instead of failing
 — the exact shape `check.sh` warns about.
 
-### ⚠ NOT YET MEASURED
+### ⭐⭐⭐ CLOSED ON IRON — burn 2, exit 95, zero red lines
 
-The iron instrument is built and staged but **nothing has run on hardware**. `gputex` gains a
-col-major arm whose oracle is the row-major arm (already proven byte-identical to 32 individual
-op 0x0B dispatches), so it inherits that proof and adds no new arithmetic: **the same records, one
-bit different, must render byte-identically** — the kernel does the transpose. It prints both wave
-counts so the burn checks the *mechanism* and not just the clock. Pre-registered on this geometry:
-**1 536 waves row-major vs 64 col-major (24×)**; from the measured coefficients, ~306 µs vs ~13 µs.
+`CM == RM` byte-identical on all three arms, reproduced across two independent boots, rung 13
+unregressed 17/17 in both. ⭐ **And the op-to-op seam closed with it** — `IDENTICAL batched and
+alone` iron-proves the `gpu_batch_active` suspend in `gpu_tex_list`: two op 0x0C records in one #92
+array each draw what they draw alone, so the single shared prep slot survives. That is the shape a
+DOOM frame actually has (512-primitive cap, ~640 columns ⇒ two ops) and it had never run on silicon.
 
-⚠ Two coverage limits, named rather than papered over: col-major's **wave-uniform** guard needs
-*varying widths*, which this fixed-width geometry cannot provide (`texlist.cyr`'s mixed/wide cases
-cover it on the host); and four encoding classes in the changed dwords have **one** assembler, not
-the tree's standing two — though 14b introduces no new class, only new operand fields in opcodes
-already shipping in the iron-proven row-major blob.
+### ⛔⛔⛔ THE COST MODEL IS INVERTED — and rung 14's own conclusion is retracted
+
+Rung 14 recorded *"cost is the grid you LAUNCH, not the pixels you shade"* and *"the `py>=ph` guard
+makes a wave EXIT; it does not make it FREE."* Six RM/CM pairs across two burns refute both:
+
+| | ns per **launched** wave | ns per **working** wave |
+|---|---|---|
+| four uniform pairs | 27–35 | **27–35** |
+| two ragged pairs | **17** | **27–28** |
+
+The working column is one number across every pair; the launched column splits, because ragged
+launches 1504 waves and only **940** work. A three-parameter fit gives **a = −5 ns/launched
+(statistically zero) · b = 36 ns/working · F = 264 µs fixed**. ⇒ **A launched-but-exiting wave is
+free.**
+
+⭐ **Why the original fit said 177 ns, mechanically:** it was `a·launched + b·working` with **no
+constant term**, on two points — zero degrees of freedom. Re-running that regression on its own
+numbers reproduces 177/22 exactly, so the arithmetic was right and the *model* was wrong: 264 µs of
+fixed cost had nowhere to go but the launched coefficient (1536 × 177 ns ≈ 272 µs ≈ that cost).
+Nothing inside those two points could have revealed it. **A third point at 24× fewer waves is what
+made it visible** — which is what rung 14b's transpose produces, and what the pre-registered "if the
+speedup does not track the wave ratio, something else moved" was written to catch.
+
+⇒ **"Row-major cannot draw a DOOM frame — 24.5 ms" is RETRACTED.** That was 128 000 × 177 ns; the
+measured cost is **4.6 ms**, which fits a 28.6 ms budget. Col-major remains a **50× GPU reduction**
+(0.09 ms) and is worth every line — but the honest reason to keep it is that it is 50× cheaper, not
+that the alternative is impossible.
+
+⚠⚠ **The real blocker is now `F`, and it is an INFERENCE.** 264 µs is fixed in wave count but was
+measured only at 32 primitives. One FULLCOV op 0x0B dispatch benches at 27.8 µs, so the remaining
+~236 µs plausibly scales per-primitive (~7.4 µs: validation plus `gpu_tex_prep`). If so, 640 columns
+is **~4.7 ms of CPU per frame**, comparable to the whole row-major GPU cost and **not reducible by
+transposing anything**. If `F` is per-*dispatch* instead, it is 0.27 ms and irrelevant. The two
+answers differ by 17× and this burn cannot separate them — measuring it is the next bite, and it
+stays out of the plan as fact until it is measured.
+
+### ⛔ THE UNITS TRAP, THIRD TIME, SECOND TIME ON IRON
+
+Burn 1 came back exit 89 — `the SOLO list-B call was REJECTED` — and it was **the instrument, not
+the kernel**. `var o1[16]` handed to a writer that lays down a 64-byte op record: function-local
+`var X[N]` is **N BYTES** (module-scope is N × u64), so a 48-byte stack smash corrupted the locals
+the *second* record was built from. `var q[32]` held a 128-byte two-op array.
+
+`check-array-sizing.sh` exists **because** of this class (`gputri.cyr`'s `var sizes[8]`, which
+printed every number correctly and returned exit 142) — **and it was green on this bug**, because it
+only sees stores written directly to the named array and here the array was passed *by address*.
+
+Gate extended with a `f(&buf, LEN)` rule, mutation-tested both ways, plus two precision fixes found
+while writing it — both instances of the "cries wolf" failure its own header warns about:
+
+- the obvious regex also matches `store8(&msg, 72)` where 72 is the byte **value**; it flagged
+  `main.cyr`'s "HI"/"PI", a DHCP option code and a correct header read. Now parses call sites and
+  skips `store*`/`load*`.
+- it matched **across functions**: `gpu.cyr` has `var hdr[32]` read with 32 *and* `var hdr[48]` read
+  with 48, both correct. Now scoped to the declaration's enclosing block.
+
+Zero false positives; both real bugs caught under mutation.
+
+### ⛔ AND THE FRESHNESS GATE PASSED ON A STALE TOOL — one level below last cycle's fix
+
+Rung 14 added a staged-tool `cmp` gate after a stale `/bin/gputex` was caught pre-flash. **That gate
+passed on a stale binary this cycle.** `stage-tools.sh` only compiles when passed `--build`; without
+it, `stage_one` copies whatever `_agnos` binary exists and prints `staged: … bytes`, reading exactly
+like a fresh stage — and the `cmp` then compared that copy against **the same stale artifact**. The
+staged `gputex` was 313 448 B with no col-major code (real build: 331 232 B); it would have run
+rungs 13+14, exited **95**, and produced zero rung-14b evidence. *A stale oracle does not fail, it
+agrees* — the same sentence as last cycle, one level down. Two gates added: source-newer-than-build
+(a missing `_agnos` build is now an error, not a skipped `cmp`), and arm-presence on `gputex` itself.
+
+⚠ Two coverage limits stand: col-major's **wave-uniform** guard needs *varying widths*, which this
+fixed-width geometry cannot provide (`texlist.cyr`'s mixed/wide cases cover it on the host); and four
+encoding classes in the changed dwords have **one** assembler, not the tree's standing two — though
+14b introduces no new class, only new operand fields in opcodes already shipping in the iron-proven
+row-major blob.
 
 ### ⛔⛔ THE PLAN'S "WALLS AS TEXTURED QUADS" PREMISE IS REFUTED — measured, not argued
 

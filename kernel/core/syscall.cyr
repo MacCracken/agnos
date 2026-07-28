@@ -1239,6 +1239,15 @@ var GPO_E_LUTSLOT  = 27;             # op    — LUT slot missing, invalid, or s
 # flip a bit. GPO_E_RESERVED would say "a flag bit is wrong" when every flag is individually legal and
 # it is their DISAGREEMENT that is not executable — one dispatch has one lane axis.
 var GPO_E_MIXMODE  = 28;             # op    — primitives in one 0x0C array disagree on COLMAJOR
+# ⭐ 1.56.24. "This flag/mode is DEFINED by the ABI but no worker can execute it yet." Its own code
+# because the caller's fix is specific and none of the neighbours say it: GPO_E_RESERVED means "that
+# bit is not a thing" (fix: stop setting garbage), GPO_E_RULE means "that rule value is not a thing"
+# (fix: pass a legal one) — but NOTIMPL means "you asked correctly for something unbuilt" and the fix
+# is to take the other, working path. ⛔ It exists because the alternative was worse: the validator
+# BLESSED these requests and the worker then refused them deep in dispatch, surfacing as a generic
+# GPO_E_DISPATCH — the "ABI accepts then silently fails" defect that gpo_validate_edge's comment
+# already names for op 0x08. Same defect, same fix, applied to op 0x09 five months late.
+var GPO_E_NOTIMPL  = 29;             # op    — ABI-legal but unimplemented (see the two sites below)
 var GPO_E_TRILIST  = 24;             # op    — triangle count/slot invalid, or a per-triangle record is
 var GPU_COV_MAX_DIM = 4096;          # per-side mask cap — a REJECT, never a clamp
 # ⭐ THE COORDINATE DOMAIN (B3). 2^28 = 4096 px in 16.16 — the same 4096 as GPU_COV_MAX_DIM, so
@@ -1692,13 +1701,23 @@ fn gpo_validate_tri(rec, fbw, fbh) {
     if (derive == 1) {
         if (edge_id != 0) { return GPO_E_EDGEBUF; }
         if (nr != 0) { return GPO_E_EDGEBUF; }
+        # ⛔ DERIVE IS NOT IMPLEMENTED — the reject is at the BOTTOM of this function, not here.
+        # See the block above `return 0`. Placing it last is deliberate: every real defect in the
+        # request still gets its own specific code, and NOTIMPL then means "well-formed in every
+        # other respect, but unbuildable."
     }
     if (derive == 0) {
         if (ne < 3) { return GPO_E_EDGEBUF; }
         if (ne > GPU_EDGE_MAX) { return GPO_E_EDGEBUF; }
-        if (rule != GPU_RULE_NONZERO) {
-            if (rule != GPU_RULE_EVENODD) { return GPO_E_RULE; }
-        }
+        # ⛔ 1.56.24 — NONZERO ONLY, AND THE REJECT LIVES HERE, exactly as it does for op 0x08 in
+        # gpo_validate_edge. This block used to accept EVENODD as well, while the shared worker
+        # gpu_edge_cov (gpu.cyr) rejects `rule != GPU_RULE_NONZERO` outright — so rule 1 passed
+        # validation and died as an opaque GPO_E_DISPATCH. gpo_validate_edge's own comment already
+        # spells out why that is wrong twice over ("the ABI would ACCEPT rule 1 and then silently
+        # fail it ... and the worker never runs in QEMU so the reject had no test at all"); the fix
+        # was applied to op 0x08 and not to its twin. refraster.cyr implements `wind != 0` and
+        # nothing else, so an EVENODD path would still ship with NO oracle.
+        if (rule != GPU_RULE_NONZERO) { return GPO_E_RULE; }
         if (w * h * ne > GPU_EDGE_WORK_MAX) { return GPO_E_WORK; }
     }
 
@@ -1751,6 +1770,20 @@ fn gpo_validate_tri(rec, fbw, fbh) {
         if (ec > lim) { return GPO_E_FRAME; }
         ci = ci + 1;
     }
+
+    # ⛔ 1.56.24 — DERIVE IS NOT IMPLEMENTED, AND THIS VALIDATOR USED TO BLESS IT.
+    # There is no edge synthesis anywhere in the kernel: gpu_tri_rgba (gpu.cyr) calls gpu_edge_cov
+    # unconditionally, and on the DERIVE path gpo_execute leaves edge_mc = 0 and n_edges = 0, so
+    # gpu_edge_cov's `n_edges < 1` guard refuses — the caller got a generic GPO_E_DISPATCH from deep
+    # inside pass 2, with no way to tell "unbuilt feature" from "the GPU wedged". That is the exact
+    # "ABI accepts then silently fails" defect gpo_validate_edge's comment names for op 0x08; the fix
+    # shipped for 0x08 and was never applied to its twin.
+    # ⭐ LAST, not at the flag test, on purpose: everything above still returns its own specific code,
+    # so NOTIMPL here carries real information — "this request is well-formed in every other respect."
+    # That is why the geometry battery can keep asserting through the DERIVE path.
+    # Delete this in the SAME change that lands edge synthesis, never before — the ACCEPTED surface
+    # must equal the PROVEN surface.
+    if (derive == 1) { return GPO_E_NOTIMPL; }
     return 0;
 }
 
@@ -2231,7 +2264,10 @@ fn edge_abi_selftest() {
     }
 
 
-    # well-formed, DERIVE (no edge slot at all) -> VALID
+    # well-formed, DERIVE (no edge slot at all) -> NOT IMPLEMENTED (1.56.24)
+    # ⛔ This assertion used to be ea_expect_valid. That was the bug in test form: the ABI blessed a
+    # request no worker can execute, and the selftest FROZE that gap as correct behaviour. Flip this
+    # back to ea_expect_valid only in the change that lands edge synthesis.
     var t1 = 0; while (t1 < 16) { store32(&d + t1 * 4, 0); t1 = t1 + 1; }
     store32(&d +  0, GPU_OP_TRI_RGBA);
     store32(&d +  4, GPU_TRI_FLAG_DERIVE);
@@ -2241,7 +2277,7 @@ fn edge_abi_selftest() {
     store32(&d + 32, 256 * 65536); store32(&d + 36, 0);
     store32(&d + 40, 0);       store32(&d + 44, 256 * 65536);
     store32(&d + 48, 0xFFFF0000); store32(&d + 52, 0xFF00FF00); store32(&d + 56, 0xFF0000FF);
-    pass = pass + ea_expect_valid(&d, "tri: well-formed DERIVE", 23);
+    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "tri: well-formed DERIVE is unimplemented", 40);
 
     # the RESERVED dword 2 must be zero -- the one forward-compat slot
     store32(&d +  8, 1);
@@ -2267,7 +2303,11 @@ fn edge_abi_selftest() {
     # ACCEPTED. This case exists because that floor would have rejected most real triangles.
     store32(&d + 32, 16 * 65536); store32(&d + 36, 0);
     store32(&d + 40, 0);          store32(&d + 44, 16 * 65536);
-    pass = pass + ea_expect_valid(&d, "tri: small frame is legal", 25);
+    # ⚠ Expects NOTIMPL, not VALID, because this descriptor rides the DERIVE path (1.56.24) — and
+    # NOTIMPL is still a passing result for THIS assertion's purpose: it is returned last, after
+    # every geometry check, so reaching it proves the AREA floor did NOT reject a 16x16 frame. A
+    # GPO_E_AREA here would be the regression this case exists to catch.
+    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "tri: small frame clears the AREA floor", 38);
 
     # coordinate outside the +-2^28 window
     store32(&d + 32, 0x20000000);
@@ -2295,6 +2335,26 @@ fn edge_abi_selftest() {
     store32(&d + 32, 256 * 65536); store32(&d + 44, 256 * 65536);
     store32(&d + 48, 0xFFFF0000); store32(&d + 52, 0xFF00FF00); store32(&d + 56, 0xFF0000FF);
     pass = pass + ea_expect(&d, GPO_E_DIM, "tri: dst runs off the framebuffer", 33);
+
+    # ⭐ 1.56.24 — THE EVEN-ODD REJECT. op 0x09 had NO rule coverage at all, which is how it accepted
+    # a rule its own worker refuses for five months. Explicit-edge path (flags = 0) so the rule check
+    # is reachable: gpu_edge_cov rejects `rule != GPU_RULE_NONZERO`, refraster.cyr implements
+    # `wind != 0` and nothing else, so EVENODD would ship with no oracle. Rejected at the VALIDATOR
+    # where QEMU can see it — the worker never runs here, which is exactly why the old reject was
+    # untestable. Mirrors "edge-abi: even-odd rule" for op 0x08.
+    var ta = 0; while (ta < 16) { store32(&d + ta * 4, 0); ta = ta + 1; }
+    store32(&d +  0, GPU_OP_TRI_RGBA);
+    store32(&d +  4, 0);                        # explicit edges, NOT derive
+    store32(&d + 12, 14);                       # edge slot
+    store32(&d + 16, (64 * 65536) + 64);        # wh = 64x64
+    store32(&d + 20, 0);
+    store32(&d + 32, 256 * 65536); store32(&d + 44, 256 * 65536);
+    store32(&d + 48, 0xFFFF0000); store32(&d + 52, 0xFF00FF00); store32(&d + 56, 0xFF0000FF);
+    store32(&d + 60, (GPU_RULE_EVENODD << 16) + 3);
+    pass = pass + ea_expect(&d, GPO_E_RULE, "tri: even-odd rule is refused", 29);
+    # and the NONZERO twin must still be accepted, or the reject above proves nothing
+    store32(&d + 60, (GPU_RULE_NONZERO << 16) + 3);
+    pass = pass + ea_expect_valid(&d, "tri: nonzero rule with explicit edges", 37);
 
 
     # ======================================================================================
@@ -2656,8 +2716,8 @@ fn edge_abi_selftest() {
         r = r + 1;
     }
 
-    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 89 cases correct\n", 21);
-    if (pass == 89) {
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 91 cases correct\n", 21);
+    if (pass == 91) {
         kprint("edge-abi: PASS -- the 0x08/0x09/0x0A/0x0B/0x0C ABIs reject every malformed record,\n", 83);
         kprint("edge-abi: and a well-formed one is accepted or correctly reports no-GPU.\n", 73);
         return 1;

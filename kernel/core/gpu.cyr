@@ -1617,23 +1617,28 @@ fn gpu_fence() {
 
     # Append the 5-dword WRITE_DATA packet at the tracked cursor (cursor is DWORDS -> *4).
     #
-    # ⚠ UNMASKED, AND KNOWINGLY SO PENDING A REAL FIX. gpu_ring_put masks every store with
-    # `& GPU_RING_DW_MASK` (the ring is 16384 dwords; the cursor deliberately does NOT wrap, the STORE
-    # does). This path does not, so if gpu_ring_wptr ever reached 16384 these five dwords would land
-    # past the ring's 0x10000 end — directly on the MQD save area, with no page tables to stop it.
-    # ⛔ DO NOT "FIX" THIS BY MASKING `base`. The packet is five dwords from one base, so a masked base
-    # still runs off the end when the cursor sits within five dwords of the wrap — it would look
-    # corrected and fail only at the boundary, which is the worst of both. The correct fix is either
-    # per-dword masking (gpu_ring_put's shape) or an explicit wrap check before the append, and that is
-    # a change to this function's cursor accounting rather than a one-line edit.
-    # Not reachable today: the cursor starts at 8 and advances 5 per call, so it needs ~3275 fences in
-    # one boot. Recorded 2026-07-26 by the arena-extent survey; unreachable is not the same as correct.
-    var base = gpu_arena_phys + (gpu_ring_wptr << 2);
-    store32(base + 0x00, GPU_PM4_WRITE_DATA_HDR);        # PACKET3(WRITE_DATA, count=3)
-    store32(base + 0x04, GPU_PM4_WRITE_DATA_CTL);        # DST_SEL=5 (memory) | WR_CONFIRM
-    store32(base + 0x08, sent_mc & 0xFFFFFFFF);          # DST_ADDR_LO (MC/aperture, no PTs)
-    store32(base + 0x0C, (sent_mc >> 32) & 0xFFFFFFFF);  # DST_ADDR_HI
-    store32(base + 0x10, GPU_C2E_SENTINEL);              # DATA = sentinel to write
+    # ✅ FIXED 1.56.24 — PER-DWORD MASKED, gpu_ring_put's shape.
+    # ⛔ THE HISTORY IS THE POINT, because the obvious fix is the wrong one. This append used to read
+    # `var base = gpu_arena_phys + (gpu_ring_wptr << 2)` with NO mask, while gpu_ring_put masks every
+    # store with `& GPU_RING_DW_MASK` (the ring is 16384 dwords; the CURSOR stays monotonic — that is
+    # what the CP's wptr register expects — and the STORE wraps). So if gpu_ring_wptr ever reached
+    # 16384 these five dwords landed past the ring's 0x10000 end, directly on the MQD save area, with
+    # no page tables to stop it.
+    # ⛔ DO NOT COLLAPSE THIS BACK TO A MASKED `base`. The packet is five dwords from one base, so a
+    # masked base still runs off the end whenever the cursor sits within five dwords of the wrap — it
+    # would look corrected and fail ONLY at the boundary, which is worse than the original bug because
+    # it also looks fixed. Each dword masks its OWN index; that is the whole content of this fix.
+    # ⚠ It was never reachable in a shipped boot (cursor starts at 8, +5 per call ⇒ ~3275 fences in one
+    # boot), and that is exactly why it survived: unreachable is not the same as correct, and the risk
+    # register in gpu.md asserted the mask was already here. Recorded 2026-07-26 by the arena-extent
+    # survey, fixed 1.56.24. Behaviour below 16384 dwords is byte-identical to the old code.
+    var rb = gpu_arena_phys;
+    var w0 = gpu_ring_wptr;
+    store32(rb + (((w0 + 0) & GPU_RING_DW_MASK) << 2), GPU_PM4_WRITE_DATA_HDR);        # PACKET3(WRITE_DATA, count=3)
+    store32(rb + (((w0 + 1) & GPU_RING_DW_MASK) << 2), GPU_PM4_WRITE_DATA_CTL);        # DST_SEL=5 (memory) | WR_CONFIRM
+    store32(rb + (((w0 + 2) & GPU_RING_DW_MASK) << 2), sent_mc & 0xFFFFFFFF);          # DST_ADDR_LO (MC/aperture, no PTs)
+    store32(rb + (((w0 + 3) & GPU_RING_DW_MASK) << 2), (sent_mc >> 32) & 0xFFFFFFFF);  # DST_ADDR_HI
+    store32(rb + (((w0 + 4) & GPU_RING_DW_MASK) << 2), GPU_C2E_SENTINEL);              # DATA = sentinel to write
     gpu_mfence();                                        # ring bytes visible before the kick
 
     var new_wptr = gpu_ring_wptr + 5;                    # header + 4 body = 5 dwords
@@ -3804,9 +3809,14 @@ fn gpu_tri_dispatch(rec_phys, w, h, dx, dy) {
 # tex_list` re-assembles the source and diffs it against this table; check.sh runs it every build.
 # A dword edited here to "fix" something on iron would pass no gate and fail as a wedged queue.
 #
-# ⭐ 458 vs rung 13's 442: the whole delta is the 16-instruction prologue that picks which primitive
-# this workgroup shades. The other 442 are character-identical to tex_rgba.s and gated as such by
-# scripts/check/texl-body-identity.sh.
+# ⭐ THE THREE NUMBERS, CORRECTED 1.56.24 — they were conflated, and the conflation hid which one the
+# gate actually proves. `sh scripts/check/texl-body-identity.sh` prints all three:
+#     tex_rgba = 442 dwords total  =  25-dword prologue + 417 SHARED
+#     tex_list = 458 dwords total  =  41-dword prologue + 417 SHARED
+# So the shared, character-identical body is **417**, and the 16-dword total delta is the difference
+# between the two PROLOGUES (41 − 25), not a "16-instruction prologue bolted onto 442". Three comments
+# in this tree called the shared body "442" — it is tex_rgba's TOTAL, which happens to be a number the
+# gate never asserts. Quote 417 when you mean the gated body and 442/458 only for whole-blob sizes.
 fn tex_list_write(dst_phys) {
     store32(dst_phys + 0,    0xbefe01c1);
     store32(dst_phys + 4,    0x8f0e0608);
@@ -4282,7 +4292,7 @@ fn tex_list_write(dst_phys) {
 # and the shipped dispatcher issues this blob with NO PM4 change.
 #
 # ⚠ It is a THIRD BLOB rather than a branch inside tex_list because both must carry rung 13's
-# 442-dword texturing body character-identically; a runtime branch inside that body is an edit to it,
+# 417-dword texturing body character-identically; a runtime branch inside that body is an edit to it,
 # and rung 13's 17/17 iron proof is exactly what an edit would throw away.
 fn tex_list_cm_write(dst_phys) {
     store32(dst_phys + 0,    0xbefe01c1);
@@ -5478,7 +5488,7 @@ fn gpu_tex_list(pkva, n_prims, uw, uh, udx, udy) {
 
     var rec_mc    = gpu_arena_mc   + GPU_TEXL_PREP_SUBOFF;
     # ⭐ THE MODE SELECTS THE BLOB. Two resident shaders, one dispatch each — never one shader with a
-    # runtime branch, because both blobs must carry rung 13's 442-dword body CHARACTER-IDENTICALLY and
+    # runtime branch, because both blobs must carry rung 13's 417-dword body CHARACTER-IDENTICALLY and
     # a branch inside the body is an edit to it. 4 KB of arena buys keeping the 17/17 iron proof.
     var shader_mc = gpu_arena_mc   + GPU_TEXL_SHADER_SUBOFF;
     if (gpu_texl_colmajor == 1) {
@@ -7791,15 +7801,13 @@ fn gpu_dispatch_sys(a_uva, b_uva, c_uva) {
     if (fault != 0) { return 0 - 3; }
     if (ok != 1)    { return 0 - 2; }
 
-    # Fault-proof the write-back: no proc_copy_TO_user primitive exists, so confirm C's user pages are
-    # present+user first (page-walk into a_phys, now free — its A copy was already consumed by the
-    # dispatch), then the direct store32 loop cannot #PF.
-    if (proc_copy_from_user(cr3, a_phys, c_uva, nbytes) == 0) { return 0 - 5; }
-    s = 0;
-    while (s < n) {
-        store32(c_uva + (s << 2), load32(c_phys + (s << 2)) & 0xFFFFFFFF);
-        s = s + 1;
-    }
+    # ✅ 1.56.24 — write back through proc_copy_to_user, which checks Present + WRITABLE + User + PS.
+    # ⛔ The old form probed with proc_copy_from_user and then ran a raw store32 loop into c_uva. That
+    # probe is a READ-side check and never looks at the R/W bit, so a present, user, READ-ONLY
+    # destination passed it and got written anyway — ring 0 ignores R/W unless CR0.WP is set, so the
+    # store silently succeeded against memory the process had asked to protect. Same fix applied to
+    # #83. See proc_copy_to_user's header for the full account.
+    if (proc_copy_to_user(cr3, c_uva, c_phys, nbytes) == 0) { return 0 - 5; }
     return 0;
 }
 
@@ -8097,13 +8105,10 @@ fn gpu_dispatch_f64_sys(a_uva, b_uva, c_uva) {
     if (fault != 0) { return 0 - 3; }
     if (ok != 1)    { return 0 - 2; }
 
-    # Fault-proof the write-back (present+user check into a_phys, now free), then store.
-    if (proc_copy_from_user(cr3, a_phys, c_uva, nbytes) == 0) { return 0 - 5; }
-    s = 0;
-    while (s < n) {
-        store64(c_uva + (s << 3), load64(c_phys + (s << 3)));
-        s = s + 1;
-    }
+    # ✅ 1.56.24 — write back through proc_copy_to_user (Present + WRITABLE + User + PS). The old form
+    # probed with the READ-side proc_copy_from_user, which never checks the R/W bit, then raw-stored
+    # into c_uva — so a present, user, read-only destination was written anyway. Twin of the #82 fix.
+    if (proc_copy_to_user(cr3, c_uva, c_phys, nbytes) == 0) { return 0 - 5; }
     return 0;
 }
 

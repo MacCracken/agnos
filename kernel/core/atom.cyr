@@ -324,13 +324,32 @@ fn atom_ws_write(idx, val) {
     if (idx < atom_cur_ws_size) { store32(atom_cur_ws_ptr + idx * 4, val & 0xFFFFFFFF); }
     return 0;
 }
+# ⛔ 1.56.24 — THE GUARD IS COMPUTED FROM THE SAME EXPRESSION AS THE ACCESS. Keep it that way.
+# The old form tested `(atom_fb_base + idx * 4) > atom_scratch_size` while the access was at
+# `(atom_fb_base / 4 + idx) * 4`, so guard and access were two different pieces of arithmetic that
+# happened to agree. Two bugs in one line:
+#   (1) OFF BY ONE DWORD — `>` accepts an offset EQUAL to the size, and the scratch is 1024 bytes
+#       (256 dwords, atom.cyr:963/965), so `idx` landing exactly at byte 1024 read/WROTE dword [256]:
+#       one dword past the end of the region the surrounding comments declare. A `>=` alone is still
+#       wrong; a 4-byte access needs `off + 4 <= size`, which is what is written below.
+#   (2) The two expressions differ whenever `atom_fb_base` is not 4-aligned (`/4*4` truncates), so a
+#       future unaligned base would have made the guard describe a different address than the access.
+# This is vendor VBIOS bytecode driving the interpreter — the index is DATA FROM THE ROM, not a
+# kernel-chosen value, so the bound is a real trust boundary and not a defensive nicety.
+fn atom_fb_off(idx) { return (atom_fb_base / 4 + idx) * 4; }
+fn atom_fb_oob(idx) {
+    var off = atom_fb_off(idx);
+    if (off < 0) { return 1; }
+    if (off + 4 > atom_scratch_size) { return 1; }
+    return 0;
+}
 fn atom_fb_read(idx) {
-    if ((atom_fb_base + idx * 4) > atom_scratch_size) { return 0; }
-    return load32(atom_scratch_base + (atom_fb_base / 4 + idx) * 4);
+    if (atom_fb_oob(idx) == 1) { return 0; }
+    return load32(atom_scratch_base + atom_fb_off(idx));
 }
 fn atom_fb_write(idx, val) {
-    if ((atom_fb_base + idx * 4) > atom_scratch_size) { return 0; }
-    store32(atom_scratch_base + (atom_fb_base / 4 + idx) * 4, val & 0xFFFFFFFF);
+    if (atom_fb_oob(idx) == 1) { return 0; }
+    store32(atom_scratch_base + atom_fb_off(idx), val & 0xFFFFFFFF);
     return 0;
 }
 

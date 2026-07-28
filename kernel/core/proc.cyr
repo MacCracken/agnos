@@ -1038,6 +1038,52 @@ fn proc_copy_from_user(cr3, dst, uva, len) {
     return 1;
 }
 
+# 1.56.24 — the WRITE-side twin of proc_copy_from_user, and the reason it exists.
+#
+# ⛔ THE DEFECT IT REPLACES. #82/#83 (gpu_dispatch_sys / gpu_dispatch_f64_sys) wrote their result
+# back to ring 3 as: "probe the destination with proc_copy_from_user, then raw store32 into the user
+# VA." The comment there said so outright — *"no proc_copy_TO_user primitive exists, so confirm C's
+# user pages are present+user first, then the direct store32 loop cannot #PF."* That reasoning is
+# sound about FAULTING and silent about PERMISSION: proc_copy_from_user validates Present + User + PS
+# because it is a READ, and never looks at the R/W bit (PDE bit 1). So a destination that is present,
+# user, and READ-ONLY passed the probe and then got written anyway. Ring 0 does not honour the R/W bit
+# unless CR0.WP is set, so the store simply succeeded — silently writing memory the process had asked
+# the kernel to protect. A read-only or copy-on-write mapping is exactly where that matters.
+#
+# ⭐ THE CHECK THAT MAKES THIS DIFFERENT IS ONE LINE: `(pde & 2) == 0` ⇒ refuse. Everything else
+# mirrors proc_copy_from_user deliberately — same boot-CR3 walk of the caller's tables, same
+# Present+User+PS requirements, same 2 MB huge-page shape, same 0/1 return convention — because two
+# primitives that walk the same tables differently is how one of them drifts.
+#
+# Returns 1 on success, 0 on ANY absent / non-user / non-writable / non-huge mapping. ⛔ On 0 the copy
+# may be PARTIAL: it validates each 2 MB page as it reaches it, so a caller must treat 0 as "the
+# destination is not fully writable" and report it, never retry.
+fn proc_copy_to_user(cr3, uva, src, len) {
+    var copied = 0;
+    while (copied < len) {
+        var va = uva + copied;
+        var pml4e = load64(cr3);
+        if ((pml4e & 1) == 0) { return 0; }
+        var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+        var pdpte = load64(pdpt_addr);
+        if ((pdpte & 1) == 0) { return 0; }
+        var pd_addr = pdpte & 0xFFFFFFFFF000;
+        var pde = load64(pd_addr + ((va >> 21) & 0x1FF) * 8);
+        if ((pde & 1) == 0) { return 0; }      # not present
+        if ((pde & 2) == 0) { return 0; }      # ⭐ NOT WRITABLE — the check the read-side twin lacks
+        if ((pde & 4) == 0) { return 0; }      # not a user page
+        if ((pde & 0x80) == 0) { return 0; }   # not a 2 MB huge page (unexpected shape)
+        var page_phys = pde & 0x000FFFFFFFE00000;
+        var off = va & 0x1FFFFF;
+        var chunk = 0x200000 - off;
+        if (chunk > len - copied) { chunk = len - copied; }
+        var k = 0;
+        while (k < chunk) { store8(page_phys + off + k, load8(src + copied + k)); k = k + 1; }
+        copied = copied + chunk;
+    }
+    return 1;
+}
+
 # Unmap a 2MB page in a process's page directory (for guard pages)
 #
 # 1.41.13 — guard-page unmap must NEVER punch the kernel identity map. A user

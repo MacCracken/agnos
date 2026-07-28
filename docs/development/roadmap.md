@@ -15,7 +15,7 @@
   some point and that sed did nothing for months; restored 2026-07-14.)
 -->
 
-> **Current**: v1.56.23 — live state (kernel head, cyrius pin, active burn, sweeps, sizes) lives in [`state.md`](state.md).
+> **Current**: v1.56.24 — live state (kernel head, cyrius pin, active burn, sweeps, sizes) lives in [`state.md`](state.md).
 
 > **This file is forward-facing.** Completed arcs are not re-narrated here — each gets one line in the
 > [Completed arcs ledger](#completed-arcs-ledger), and the history is the CHANGELOG's job. Per-arc reasoning
@@ -39,8 +39,16 @@ falsified record and remaining ladder live in the single GPU document,
 opaque via `#87` and translucent via `#92` op 0x01 (premultiplied src-over), unblocked by setu asking
 `shm_create_gpu` #86 (root blocker was memory, not alpha); the full premultiplied chain shipped across 10
 draw-stack repos on cyrius 6.4.71. Shader ISA is sovereign — 11 `.s`-backed kernels reference-verified against
-their iron-proven committed hex, and the **llvm-mc build gate removed (1.56.8)** because a sovereign build
-takes no C/C++ toolchain. Decisions D-1/D-2/D-4 ratified (1.56.8). The S lane (S0-S12) and D lane (D1/D2) are
+their iron-proven committed hex — **17 of them, not the 11 this line said until 2026-07-28** (6 gated by
+`check.sh`; all 17 currently match) — and the **llvm-mc build gate removed (1.56.8)** because a sovereign build
+takes no C/C++ toolchain (⚠ **but llvm-mc returned as a CHECK tool** — `check/shader-blob.sh` requires it and
+`check.sh` goes RED without LLVM, reversing D-1; cut 1.56.24). Decisions D-1/D-2/D-4 ratified (1.56.8). **The
+live-pipe MODESET is DONE** (`#93 gpu_modeset_op`, ops 0x00-0x06; M1-M3 read the pipe, M4 OTG lock, M5 VTOTAL
+retime to the milliHz, **M6 the OTG envelope — `OTG_MASTER_EN` 0→1, frame counter 2615→0→115, panel blanked
+and relit**, M8 DIG/BE, M9 the in-boot sequencing experiment; 1.56.9-1.56.15). **AGNOS RASTERISES IN 3D** —
+rungs 9-14b **and 16** iron-closed (1.56.16-1.56.23): edge coverage, the crossover kill-gate (GPU wins at 1751
+px), barycentric RGBA, tri-list, affine texturing byte-identical to the host reference, fused `TEX_LIST` +
+col-major, tile-ownership proof. Ops `0x08`-`0x0C`. The S lane (S0-S12) and D lane (D1/D2) are
 closed on iron; the D-lane code was deleted after it produced its answer. **`#90 gpu_readback_shm` + `#91
 gpu_blit_bb` closed** (iron exit 95 — screen-capture readback + overlap-safe bb→bb blit; a reused-slot
 readback-coherence bug found+fixed with a scoped `clflush`, closing the `#89→#92` band). **The ML crown (C6)
@@ -49,11 +57,19 @@ cores **bit-identical to CPU** (rupantara 0.4.1 f64/`#83`, tentib 1.0.1 ternary-
 K, attn11 1.14.1 `qlinear_fwd`/`#83`; all iron exit 95, 2026-07-23), retiring the "GPU capability with no
 caller" anti-pattern the crown was named for.
 
-**▶ REMAINING:** **modeset** (own the pipe from cold; harness half is zero-burn — **the recommended next
-item**) · **HDMI audio** (zero-burn Linux discriminator first) · **3D** (a rendering primitive — the
-soorat/kiran consumer stack is cataloged and waits on the kernel) · a minor invalidate-hoist perf item · plus
-the **ML full-forward wiring** follow-on (a per-repo consumer task, not a kernel blocker). ⚠ Every GPU-pixel
-arm is IRON-ONLY (QEMU has no AMD GPU). **Next-agent handoff: see gpu.md § 🤝 Handoff.**
+**▶ REMAINING — ten numbered cuts, rebuilt 2026-07-28 from source** (full table in gpu.md § release plan).
+⛔ The text here previously said "modeset — own the pipe from cold, the recommended next item" and "HDMI audio
+— zero-burn Linux discriminator first." **Both were false**: the live-pipe modeset had been iron-closed since
+1.56.12, and the L1 discriminator had already run and returned **VOID**. Three agents planned against it.
+
+**1.56.24** truth-up + four real correctness defects (**0 burns**) · **1.56.25** boot hygiene, reclaims ~24 s
+and ~170 ms per boot (**0 burns**) · **1.56.26** decompose the 264 µs `F` term (17× unmeasured) · **1.56.27-30**
+rungs 15 bilinear / 17 depth / 18 persp-correct / 19 pilot — which also pays the rung-closure debt, the kernel
+being **six** rungs ahead of a shipped consumer against a rule saying one · **1.56.31 modeset's true residual:
+the COLD case only** · **1.56.32** HDMI audio — (a) sequencing ELIMINATED by M9, surviving candidates are (b) a
+write that does not latch and (c) the bare-metal environment · **1.56.33** the invalidate hoist. Plus the **ML
+full-forward wiring** follow-on (per-repo consumer task, not a kernel blocker). ⚠ Every GPU-pixel arm is
+IRON-ONLY (QEMU has no AMD GPU). **Start at 1.56.24 — the two zero-burn cuts come first on purpose.**
 
 ---
 
@@ -196,7 +212,7 @@ item, not a kernel one. Arc plan: [`docs/development/planning/gpu.md`](planning/
 | **`bg-fault` on-iron survival** | **Uncertain — confirm** | A faulted background job (`&`) halts rather than being torn down; bg-proc fault teardown needs a scheduler-yield-from-fault path. Recorded at 1.50.9 as riding the next burn, with the deterministic bg-fault integration test deferred as heavier than a hermetic selftest. No CHANGELOG entry since claims either that survival was observed on iron or that the yield-from-fault path was written. It may have ridden a later burn silently, or it may never have been exercised. |
 | **Backspace on iron** | **Uncertain — free to verify next burn** | A 1.42.x residual. The original diagnosis blamed the delivery layer, not the kernel: Backspace was not arriving as `0x0E` under archaemenid's UEFI USB-legacy emulation. That entire layer has since been replaced by the native interrupt-driven xHCI USB-HID path, iron-closed at 1.53.14, which maps the key explicitly (`hid_translate.cyr`, `0x2A` to `0x0E`). The probable cause is gone, but "probably fixed by a rewrite of the layer underneath" is not evidence of a fix, and no burn has confirmed it. Costs nothing to check: press Backspace at the `[ASSIST] >` prompt. |
 | **Bench-history snapshot in repo** | **Uncertain — one command settles it** | Decide whether to check in the last-released `BENCHMARKS.md` and `bench-history.csv` as a tagged-state reference, or leave them CI-only. Both files exist in the working tree, neither is gitignored, and `.github/workflows/ci.yml` already uploads both as a 90-day artifact — so the CI half is live. Whether they are git-tracked could not be determined here (git is off-limits to the agent); `git ls-files BENCHMARKS.md` answers it. Original v1.27.1 carry-forward. |
-| **Optical via USB-MS (SCSI MMC profile) or ATAPI** | Open — no slot | The surface is stubbed but not driven: `msc_print_pdt_label` decodes optical PDTs while Phase 4 does not differentiate handling by PDT, and `msc_read_demo` skips silently when the sector size is not 512. AHCI likewise skips ATAPI ports. The HP external USB Blu-ray derps archaemenid at cold boot if it is plugged in before power-on (a USB hand-off or firmware quirk); hot-add support would fix the cold-plug quirk as a side effect. Alternative iron path: the AllInOne internal CD/DVD, likely SATA ATAPI, which would revive the previously-punted ATAPI/AHCI passthrough. The old "folds into 1.35.x plug-and-play" slot is dead; this needs a new one. |
+| **Optical via USB-MS (SCSI MMC profile) or ATAPI** | Open — no slot | The surface is stubbed but not driven: `msc_print_pdt_label` decodes optical PDTs while Phase 4 does not differentiate handling by PDT, and `msc_read_demo` skips silently when the sector size is not 512. AHCI likewise skips ATAPI ports. The HP external USB Blu-ray derps archaemenid at cold boot if it is plugged in before power-on (a USB hand-off or firmware quirk); hot-add support would fix the cold-plug quirk as a side effect. Alternative iron path: the AllInOne internal CD/DVD, likely SATA ATAPI, which would revive the previously-punted ATAPI/AHCI passthrough. The old "folds into 1.35.x plug-and-play" slot is dead; **the replacement slot now exists** — see [USB device classes and plug-and-play](#usb-device-classes-and-plug-and-play) under Future minors, where the hot-add half of this item lives (hot-plug fixes the cold-plug quirk as a side effect, and the PDT-differentiation complaint is downstream of descriptor-driven class dispatch). |
 | **Hardware-validation infra** | Open — **needs a new rationale** | An RPi4 and NUC harness on the self-hosted runner. No harness exists and nothing under `.github/workflows/` references one. Its only stated justification was "unblocks SMP-AP-wakeup-on-real-hardware", and that item shipped without it — validated by direct archaemenid burns in the 1.46.x arc. So this either needs a fresh justification or should be re-sited as a 1.6x-decade (Pi) prerequisite. |
 
 ---
@@ -225,6 +241,60 @@ Filed out of the 1.51.x sovereign-package-manager arc. Cross-repo plan:
 - **Build confinement** — this **converges with the deferred "Native sandbox-confinement primitives"** item
   below. The takumi build sandbox is a *consumer* of that same primitive; **do not build it twice.** The
   alternative is an explicit no-op-with-warning at server bring-up.
+
+### USB device classes and plug-and-play
+
+Revives the slot the optical/USB-MS item above says is dead ("the old *folds into 1.35.x plug-and-play*
+slot is dead; this needs a new one"). **This is the new one.** Filed 2026-07-28 after an audit of the
+actual USB surface at 1.56.23 — the gap is wider than "hot-add", and every item below was verified
+against source, not inferred.
+
+**What agnos drives today.** An xHCI host controller (`arch/x86_64/usb/xhci.cyr` and peers) with exactly
+**two hardcoded class paths**: a HID-boot keyboard and USB mass storage. There is no class registry —
+`xhci.cyr:1235` walks the config descriptor and matches literally `bInterfaceClass == 0x03 &&
+bInterfaceSubClass == 0x01 && bInterfaceProtocol == 0x01`; every other interface sets `in_kbd_intf = 0`
+and is dropped on the floor. Mass storage is a separate hand-rolled path (`usb/msc.cyr`).
+
+- **Isochronous endpoints — the hard gate, nothing above it can ship first.** `xhci_ctx.cyr` configures
+  exactly two endpoint types: interrupt-IN (`xhci_input_ctx_add_interrupt_in`) and bulk IN/OUT
+  (`xhci_input_ctx_add_bulk_pair`, "Phase 2 USB MS"). `grep -riE 'isoch|isoc' kernel/` over the whole
+  tree returns **nothing** — there is zero isochronous support in agnos. Isochronous needs its own TRB
+  form, per-frame scheduling against the microframe counter, and bandwidth reservation at configure time;
+  it is not a variation on bulk. **USB Audio Class and UVC both mandate it**, so audio and video capture
+  devices are undrivable until this lands. ⚠ This is also why "just use a USB dongle" is never a shortcut
+  for an HDMI problem: it is strictly *more* kernel work than the bug it proposes to dodge. See
+  `project_archaemenid_hardware_target` — proposing one is a hard-rule violation regardless.
+- **Descriptor-driven class enumeration** — replace the hardcoded triple-match with a real
+  (class, subclass, protocol) → driver dispatch table, so adding a class is registering a driver rather
+  than editing the enumerator. Prerequisite for every item below it, and it retires the
+  "Phase 4 does not differentiate handling by PDT" complaint in the optical item.
+- **Hot-plug / hot-add.** Attach-after-boot does not enumerate. `xhci_drain_port_change_events`
+  (`xhci_port.cyr:91`) walks the event ring, advances ERDP and RW1C-clears `USBSTS.PCD` — it *discards*
+  port-change events as a pre-reset drain; nothing routes an attach to enumeration. Fixing this also
+  fixes the cold-plug quirk the optical item describes (the HP external USB Blu-ray derping archaemenid
+  when present at power-on), which is the cheapest justification on this list.
+- **Hub class driver** — none exists; only root-hub ports are usable. Any device behind a hub is
+  invisible today. Needs the hub class, port power/reset per downstream port, and TT handling for
+  full/low-speed devices behind a high-speed hub.
+- **HID beyond one boot keyboard.** `hid.cyr:17`: *"Single-keyboard scope for MVP… Second keyboard
+  plugged later is ignored — first-wins."* No report-descriptor parsing (boot protocol only), no second
+  keyboard. ⚠ **The MOUSE half of this is NOT in this slot** — it is owned by the desktop arc
+  ([`agnosticos/docs/development/planning/desktop-arc-handoff.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/desktop-arc-handoff.md) §4 item 6), re-sited there
+  2026-07-28 because it ranks by desktop need rather than by USB completeness, and because it depends on
+  none of this slot: a boot mouse is interrupt-IN, the one endpoint type agnos already configures. What
+  stays here is the *general* HID lift — report-descriptor parsing and multi-device HID — which the mouse
+  does not need and which nothing currently queued demands.
+
+**Sequencing.** Class dispatch first (it is the cheap refactor everything else registers against), then
+hot-plug (self-justifying via the cold-plug quirk), then hub, then isochronous. Isochronous is
+deliberately last: it is the largest single lift and nothing currently queued consumes it — put it behind
+a real consumer, not behind a workaround. (The mouse is not in this sequence; it is a desktop-arc item and
+runs independently of all four.)
+
+**Decade placement is an open question.** This is cross-platform feature work, not an AMD-line item, and
+the decade map (below) already has an unresolved collision. The 1.7x radios decade needs "HCI-over-USB on
+the xHCI stack", which is a *consumer* of class dispatch and possibly of isochronous — so this slot is
+plausibly a 1.7x prerequisite rather than its own decade. Confirm with the operator before opening.
 
 ### Userland environment and tools
 

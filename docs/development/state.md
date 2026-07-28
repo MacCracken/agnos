@@ -6,32 +6,54 @@ type: state
 
 # AGNOS — Live State
 
-> **Last refresh**: 2026-07-27 · kernel head **1.56.23** · **▶ ACTIVE — 1.56.x GPU (the one open GPU release; there is no 1.57/1.58/1.59).** Full plan + reference:
+> **Last refresh**: 2026-07-28 · kernel head **1.56.24** (open) · **▶ ACTIVE — 1.56.x GPU (the one open GPU release; there is no 1.57/1.58/1.59).** Full plan + reference:
 [`docs/development/planning/gpu.md`](planning/gpu.md) — the single GPU document. **DONE and shipped:**
 (1) **the ring-3 GPU band has consumers** — aethersafha composites on the GPU (opaque via `#87`, translucent
 via `#92` op 0x01 premultiplied src-over), unblocked by setu 0.6.0/0.7.0 asking `shm_create_gpu` #86 (the
 root blocker was memory: #71 = system RAM the GPU can't reach, NOT the alpha convention). Full premultiplied
 chain shipped across 10 repos on cyrius 6.4.71 (setu 0.7.0 · aethersafha 0.9.7 · sadish 0.5.0 · dhancha 0.9.2
 · rekha 0.3.3 · rupa 0.1.1 · bhumi 1.1.1 · crab 0.4.2 · jalwa 1.4.2 · puka 0.6.6). (2) **Shader ISA is
-sovereign** — all 11 `.s`-backed kernels reference-verified byte-identical to their committed hex; the
-**llvm-mc build gate was REMOVED (1.56.8)** because llvm-mc is C++ and a sovereign build depends on no C/C++
-toolchain (sovereign assembler = mabda's Cyrius `gfx9_encode.cyr`). (3) **D-1/D-2/D-4 ratified (1.56.8):**
+sovereign** — all **17** `.s`-backed kernels reference-verified byte-identical to their committed hex (the
+count was 11 at 1.56.7; six landed since — edge_setup, edge_cov, tri_rgba, tex_rgba, tex_list, tex_list_cm);
+the **llvm-mc BUILD gate was REMOVED (1.56.8)** because llvm-mc is C++ and a sovereign build depends on no
+C/C++ toolchain (sovereign assembler = mabda's Cyrius `gfx9_encode.cyr`). ⚠ **But llvm-mc came back as a
+CHECK tool and nobody noticed:** `scripts/check/shader-blob.sh:31-34` hard-requires `llvm-mc` + `llvm-objcopy`
+and `exit 2`s without them, and `scripts/check.sh:86-90` treats exit 2 as drift — so **`check.sh` goes RED on
+a box with no LLVM**, quietly reversing ratified decision D-1. Also only **6 of the 17** blobs are gated at
+all (all 17 currently match; it is a coverage gap, not a break). Both are cut 1.56.24. (3) **D-1/D-2/D-4 ratified (1.56.8):**
 llvm-mc rejected; `#92` blend = premultiplied f32, frozen; whole-surface translucency IS a real MUDRA/SHANTA
-requirement → DCN second plane stays a live deferred item. **REMAINING (iron-gated unless noted; ⇒ next-agent handoff: [`planning/gpu.md`](planning/gpu.md) § 🤝 Handoff):** **MODESET** (own the pipe from cold — **recommended next**;
-harness half is zero-burn; L1 discriminator runs first, free) · **HDMI audio** (zero-burn Linux discriminator
-first; ⛔ the DCCG symbol-clock lead is FALSIFIED, in-boot A/B burn 11) · **3D — the rung ladder is at 14.** Rungs 9–13 are IRON-CLOSED
+requirement → DCN second plane stays a live deferred item. **REMAINING — rebuilt 2026-07-28 as numbered cuts; see [`planning/gpu.md`](planning/gpu.md) § release plan. ⛔ The previous text here was materially false and three agents planned against it:** it called MODESET "recommended next, own the pipe from cold" when **the live-pipe modeset is DONE** (M1-M6 iron-closed 1.56.11/1.56.12; item 7's own criterion `OTG_MASTER_EN` 0→1 met at 1.56.12 — frame counter 2615→0→115, panel blanked and relit), and it twice promised an "L1 discriminator runs first, free" that **had already run and returned VOID** (2026-07-24/25; the positive control did not sound, so it carries zero information — never write it up as "sequencing exonerated"). **Start at cut 1.56.24** (zero burns: four real correctness defects + this ledger). Then 1.56.25 boot hygiene (zero burns), 1.56.26 decompose `F`, 1.56.27-30 rungs 15/17/18/19 + the consumer debt, **1.56.31 MODESET's true residual — the COLD case only**, 1.56.32 HDMI audio, 1.56.33 the invalidate hoist. · **HDMI audio: (a) sequencing is ELIMINATED** by M9 (1.56.15 — both arms exit 95 in one boot, DIG_MODE 2→3 readback-verified, ATOM #4 rc 0, #76 DISABLE+ENABLE rc 0); ⛔ the DCCG symbol-clock lead is FALSIFIED (in-boot A/B, burn 11). Surviving candidates: **(b) a write that does not latch · (c) the bare-metal environment.** · **3D — the rung ladder is at 14b, and rung 16 `tile-own` is ALSO done (1.56.17, host, 0 burns).** Rungs 9–13 are IRON-CLOSED
 (edge coverage · attribute interpolation · tri-list · **texturing 17/17 byte-identical, both formats, WRAP,
-FULLCOV**). **Rung 14 (DOOM affine) — op 0x0C CORRECTNESS CLOSED ON IRON 2026-07-27 (burn 1, exit 95; all
-three cases byte-identical to 32 individual op 0x0B dispatches, rung 13 unregressed 17/17). The
-TIMING refuted the pre-registered speedup: 851→306 µs = 2.78x, not >10x, because fusion removes
-SUBMISSION cost and not SHADING cost — both paths launch the same 1536 wavefronts. A two-point fit
-against the ragged case gives 177 ns per LAUNCHED wave vs 22 ns per additional WORKING wave (launch
-dominates 8:1), so a 640-column DOOM frame is 24.5 ms of a 28.6 ms budget row-major and 0.51 ms
-column-major (50x fewer waves). ⇒ THE DEFERRED COLUMN-MAJOR FLAG IS NOW REQUIRED and is the next
-rung-14 bite — a shader-prologue change plus a per-primitive flag, with the record array,
-per-primitive origin, grid decomposition and ABI carrying over unchanged.** As built at 1.56.23: op `0x0C GPU_OP_TEX_LIST` fuses N
+FULLCOV**). **⭐⭐⭐ RUNG 14 *AND* 14b ARE BOTH IRON-CLOSED 2026-07-27 (burn 2, exit 95, zero red
+lines).** op 0x0C `TEX_LIST` is byte-identical to 32 individual op 0x0B dispatches; the col-major
+flag `GPU_TEX_FLAG_COLMAJOR` renders **byte-identical to row-major** on all three arms across two
+independent boots; and the **op-to-op seam** closed with them (`IDENTICAL batched and alone` —
+two op 0x0C records in one #92 array, iron-proving the `gpu_batch_active` suspend in `gpu_tex_list`,
+which is the shape a DOOM frame actually has since 640 columns exceeds the 512 cap).
+⛔⛔⛔ **AND THE COST MODEL IS INVERTED — do NOT carry rung 14's 177 ns figure forward, it is
+RETRACTED.** Six RM/CM pairs across two burns fit **a = −5 ns per LAUNCHED wave (statistically
+zero) · b = 36 ns per WORKING wave · F = 264 µs fixed**. ⇒ *A launched-but-exiting wave is FREE*,
+the exact opposite of what rung 14 recorded. Its 177/22 came from an `a·launched + b·working` fit
+with **no constant term** on two points (zero degrees of freedom): re-running that regression
+reproduces 177/22 exactly, so the arithmetic was right and the MODEL was wrong — 264 µs of fixed
+cost had nowhere to go but the launched coefficient. A third point at 24× fewer waves is what
+exposed it. ⇒ **"row-major cannot draw a DOOM frame — 24.5 ms" is RETRACTED**; measured, that frame
+is **4.6 ms** and fits the budget. Col-major remains a **50× GPU reduction** (0.09 ms) and is worth
+keeping — because it is 50× cheaper, not because the alternative is impossible.
+⚠⚠ **THE OPEN QUESTION IS `F`, AND IT IS AN INFERENCE, NOT A MEASUREMENT.** 264 µs is fixed in wave
+count but was only ever measured at **32 primitives**. One FULLCOV op 0x0B dispatch benches at
+27.8 µs, so the remaining ~236 µs plausibly scales per-primitive (~7.4 µs: validation plus
+`gpu_tex_prep` in `gpu_texl_build`). If so a 640-column frame carries **~4.7 ms of CPU**, comparable
+to the entire row-major GPU cost and **not reducible by transposing anything**; if `F` is
+per-*dispatch* it is 0.27 ms and irrelevant. **The two answers differ by 17× and no burn has
+separated them.** ⇒ NEXT BITE: decompose `syscall(92)` into validate / build / dispatch-and-wait,
+and have the kernel report the grid it actually launched (today's wave counts are computed CPU-side
+by the instrument, so they predict rather than observe). As built at 1.56.23: op `0x0C GPU_OP_TEX_LIST` fuses N
 textured primitives into ONE dispatch — ABI 83/83, validator, record array, dispatch, shader (458 dwords =
-a 16-instruction prologue on rung 13's character-identical body, gated by `texl-body-identity.sh`), host
+a **41**-dword prologue + the **417**-dword character-identical body, gated by `texl-body-identity.sh`;
+⚠ corrected 1.56.24 — "a 16-instruction prologue on rung 13's 442" conflated tex_rgba's 442-dword TOTAL
+with the 417 the gate actually asserts: tex_rgba = 25 + 417, tex_list = 41 + 417, so the 16-dword delta is
+prologue-vs-prologue), host
 grid-mapping oracle 6/6 + 3/3 mutations, and a `gputex` case demanding byte-identity against 32 individual
 op 0x0B dispatches. ⛔ **Two plan premises were overturned by measurement this cycle** — rung 14 is
 DISPATCH-bound not bandwidth-bound (52.7 µs fixed vs ≥3680 MB/s), and "walls batch as textured quads" is
@@ -57,7 +79,7 @@ five burns 2026-07-22, then code+flag DELETED — see [[feedback_dlane_five_burn
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.56.23** | [`VERSION`](../../VERSION) |
+| **Kernel** | **1.56.24** | [`VERSION`](../../VERSION) |
 | **Cyrius toolchain pin** | **6.2.36** | `cyrius.cyml [package].cyrius` |
 | **Released** | 2026-07-26 | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | **Iron-validated** | 2026-05-25 (archaemenid NUC AMD — **MVP gate green since Attempt 68 / 1.30.9**; **1.32.x networking arc iron-COMPLETE**: r8169 unicast-RX solved at 1.32.7 + DHCP real lease `.142` iron-verified at 1.32.9; storage trio + GPT + ext4 + shell byte-clean). The 1.33.x ext2/4-WRITE + 1.34.x FAT-family arcs are QEMU/`fsck`-validated; their final-bite iron burns stay user-driven (pending). | NUC AMD Attempts 68 (MVP gate) + 71-77 (FB) + 80-91 (storage arc) + 92+ (networking arc — DHCP iron-verified 1.32.9) |
