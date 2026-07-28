@@ -5358,8 +5358,26 @@ vx0, vy0, vx1, vy1, vx2, vy2, u0, v0, u1, v1, u2, v2) {
     var limu = (tw * 65536 - mu) * a2;
     var limv = (th * 65536 - mv) * a2;
 
-    var q = 0;
-    while (q < 40) { store32(rec_phys + q * 4, 0); q = q + 1; }   # Q9 stays ZERO: the extension point
+    # ⭐⭐ 1.56.27 — ZERO ONLY WHAT STAYS ZERO. This loop used to run `q < 40`, writing all forty words
+    # and then having thirty-six of them overwritten by the stores immediately below. That was ~47% of
+    # this function's entire cost, and the reason is WHERE it writes, not how much:
+    #
+    #   `rec_phys` is in the GPU arena, which is **UC-mapped** (uncached — see gpu_arena_phys at the top
+    #   of this file and the arena setup). An uncached 32-bit store is not store-buffered; it goes to
+    #   DRAM and waits. Measured on iron 2026-07-28 (cut 1.56.26): the BUILD phase costs **7.29 µs per
+    #   primitive**, and this function issues **76** UC stores per primitive (40 fill + 36 explicit)
+    #   ⇒ **96 ns per store**, which is exactly the right order for UC. The "22,000 cycles to prepare an
+    #   affine frame" was never arithmetic — it was 76 serialised memory round-trips.
+    #
+    # ⛔ The explicit stores below cover words 0..35 CONTIGUOUSLY, with no gaps — so only words 36..39
+    # are genuinely left zero, and those are the Q9 extension point. ⚠ They DO still need zeroing: the
+    # prep table at GPU_TEXL_PREP_SUBOFF is ONE fixed 512-record region reused across calls, so a stale
+    # Q9 from a previous frame would otherwise survive into this one.
+    # ⚠ Safe because nothing observes the record in between: there is no call, fence or dispatch between
+    # this fill and the stores, and gpu_texl_build finishes every record before gpu_tex_list dispatches.
+    # ⚠ If a future field lands in words 36..39, WIDEN THIS FILL — do not assume the tail is dead.
+    var q = 36;
+    while (q < 40) { store32(rec_phys + q * 4, 0); q = q + 1; }
 
     store32(rec_phys +   0, cov_mc & 0xFFFFFFFF);
     store32(rec_phys +   4, (cov_mc >> 32) & 0xFFFFFFFF);

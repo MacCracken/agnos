@@ -3,6 +3,53 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.27] - 2026-07-28
+
+**`gpu_tex_prep`: stop paying for uncached stores nobody reads (open cycle).** One-line change, ~47%
+of the cost of the term 1.56.26 just measured. Prediction pre-registered before the burn. Bumped on
+cycle open; the user tags on close.
+
+### Fixed — the prep record zero-filled 40 uncached words to preserve 4
+
+1.56.26 measured `F` at **7.29 µs per primitive**, all of it in `gpu_tex_prep`. The cost turned out not
+to be arithmetic at all but **where the function writes**: `rec_phys` is in the GPU arena, which is
+**UC-mapped**, and an uncached 32-bit store is not store-buffered — it goes to DRAM and waits.
+
+Per primitive the function issued **76** UC stores: a `while (q < 40)` zero-fill followed by 36
+explicit field stores. 7.29 µs ÷ 76 = **96 ns/store**, exactly the right order for UC. The
+"22,000 cycles to prepare an affine frame" was 76 serialised memory round-trips.
+
+⭐ **And the explicit stores cover words 0..35 contiguously, with no gaps** — so the fill was writing
+forty words in order to preserve **four**. Narrowed to `q = 36`.
+
+⚠ Words 36..39 still need zeroing and the loop is not simply deleted: the prep table at
+`GPU_TEXL_PREP_SUBOFF` is ONE fixed 512-record region reused across calls, so a stale Q9 from a
+previous frame would otherwise survive into this one. ⚠ Safe because nothing observes the record in
+between — no call, fence or dispatch separates the fill from the stores, and `gpu_texl_build`
+completes every record before `gpu_tex_list` dispatches. ⚠ If a future field lands in words 36..39,
+the fill must widen; the comment says so at the site.
+
+Host oracle `texlist` unchanged: 6/6 cases exact, **5/5 mutations RED**.
+
+### Pre-registered — the prediction, written before the evidence
+
+| | measured 1.56.26 | predicted 1.56.27 |
+|---|---|---|
+| UC stores / primitive | 76 | **40** |
+| `build` slope | 7.29 µs/prim | **~3.84 µs/prim** |
+| 640-column DOOM CPU | 4.71 ms | **~2.46 ms** |
+
+⛔ **This is deliberate discipline, not ceremony.** The 96 ns/store figure is an arithmetic fit to a
+single measurement — the same shape as the 177 ns/launched-wave number this arc spent a burn
+retracting. The difference is that this one is committed to **in advance** and is falsifiable: a build
+slope that barely moves (> 6 µs/prim) refutes the UC-store model outright and sends the next session
+back to read `gpu_tex_prep` rather than optimise further on a wrong theory. Rubric:
+`agnosticos iron-nuc-zen-log.md#tracker-15627-texprep-uc`.
+
+**Follow-on if CONFIRMED:** assemble the record in a **cached** scratch buffer and bulk-copy it to UC
+once. Cached stores are store-buffered and effectively free, turning 40 serialised UC writes into a
+handful of wide ones.
+
 ## [1.56.26] - 2026-07-28
 
 **Decompose `F` — the instrument (open cycle).** The kernel now times its own `#92` phases and
