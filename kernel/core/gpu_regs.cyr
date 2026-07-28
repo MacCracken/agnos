@@ -1172,6 +1172,11 @@ var GPU_TEX_PREP_SUBOFF        = 0xE3000;    # 160-byte texture prep record  -> 
 # extents rather than eyeballing them. Lesson: derive the gap, don't spot it.
 var GPU_TEXL_PREP_SUBOFF       = 0xAA000;    # 512 records x 160 B  -> ends 0xBE000
 var GPU_TEXL_SHADER_SUBOFF     = 0x5B000;    # residency slot 11, rung 14 fused list  -> ends 0x5C000
+# ⭐ RUNG 14b. A THIRD BLOB, not a branch inside the second. tex_list_cm.s is tex_list.s with the lane
+# axis transposed; both carry tex_rgba.s's iron-proven 442-dword body CHARACTER-IDENTICALLY, and a
+# blob that edits the body throws away rung 13's 17/17 proof. Two resident blobs cost 4 KB of an
+# arena that has 0x4000 free here; a shared blob with a runtime branch would cost the proof.
+var GPU_TEXL_CM_SHADER_SUBOFF  = 0x5C000;    # residency slot 11b, rung 14b col-major  -> ends 0x5D000
 var GPU_TRI_PREP_SUBOFF        = 0xE0000;    # 64 records x 128 B  -> ends 0xE2000
 var GPU_TRI_EDGE_SUBOFF        = 0xE2000;    # synthesised frame edges when DERIVE is set -> ends 0xE3000
 var GPU_TRI_COV_SUBOFF         = 0xE4000;    # 8bpp coverage scratch, 1 MB  -> ends 0x1E4000

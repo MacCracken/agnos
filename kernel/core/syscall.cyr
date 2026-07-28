@@ -1076,6 +1076,30 @@ var GPU_TEX_FLAG_FULLCOV = 0x02;     # every pixel of the rect is covered; skip 
 # surface stays equal to the PROVEN surface. DOOM's textures are power-of-two already.
 var GPU_TEX_FLAG_WRAP  = 0x04;       # tile the texture instead of clamping; dims must be 2^k
 var GPU_TEX_FLAGS_KNOWN = 0x07;      # anything outside this is REJECTED, never accepted-and-ignored
+
+# ⭐ RUNG 14b — COLMAJOR: TRANSPOSE THE LANE AXIS. Row-major puts the 64 lanes on X, so a 1-px DOOM
+# column lights ONE lane and launches ph wavefronts. Measured on iron at 1.56.23: 177 ns per LAUNCHED
+# wave against 22 ns per additional WORKING one — launch dominates 8:1, so the wave COUNT is the cost,
+# not the pixel count. With lanes on Y a 200-row column is ceil(200/64) = 4 wavefronts, not 200.
+# GPU_TEXL_MAX_WAVES's own comment below pre-registered this flag as the fix "if the residual pixel
+# cost is too high"; the measurement asking for it now exists.
+#
+# ⛔ LIST-UNIFORM, ENFORCED. The address form lives in the BLOB and a DISPATCH_DIRECT packet names ONE
+# shader; tile_shift is one scalar and the grid is one (gx, gy). One dispatch physically has one lane
+# axis. The bit is per-PRIMITIVE in the ABI — the extension point stays general — but every primitive
+# in an array must agree, or the op is refused with GPO_E_MIXMODE.
+#
+# ⛔ LEGAL BUT SLOWER ON WIDE PRIMITIVES, and that is the caller's call, not the kernel's. Col-major
+# wins iff ceil(ph/64)*pw < ceil(pw/64)*ph — essentially iff ph > pw. Set on a 200x1 strip it costs
+# 200 waves where row-major costs 4. The kernel rejects for SAFETY (the wave cap still bounds the
+# TRANSPOSED grid), never for taste.
+var GPU_TEX_FLAG_COLMAJOR = 0x08;    # op 0x0C only: lanes walk Y; tile_shift from ph, rows from pw
+
+# ⛔ A SEPARATE MASK, NOT A WIDENED GPU_TEX_FLAGS_KNOWN. That constant is shared with op 0x0B
+# (gpo_flags_known, gpo_validate_tritex), whose shader has no col-major body at all. Widening it would
+# make 0x0B accept-and-IGNORE this bit — exactly the failure mode the flags vocabulary exists to
+# prevent. Op 0x0B must keep REJECTING 0x08.
+var GPU_TEXL_PRIM_FLAGS_KNOWN = 0x0F;   # op 0x0C per-primitive: IDX8 | FULLCOV | WRAP | COLMAJOR
 var GPU_TEX_LUT_ENTRIES = 256;       # a full byte of index; a short LUT is a reject, not a clamp
 
 # ⭐ RUNG 14 — N TEXTURED PRIMITIVES IN ONE DISPATCH. The rung's structural blocker, measured.
@@ -1110,13 +1134,20 @@ var GPU_TEX_LIST_MAX   = 512;        # per-record primitive cap; a reject, never
 # case — ONE 4096-wide primitive among 511 one-pixel columns forces tile_shift = 6 and a grid 64x
 # wider than 511 of the 512 primitives can use (47185920 waves; rejected).
 #
-# ⛔ HONEST LIMIT, to be MEASURED on the first burn rather than assumed: a 1-px-wide primitive uses
-# ONE of its wavefront's 64 lanes. DOOM columns are 1 px wide, so the fused path trades a 27.9 us
-# per-dispatch fixed cost for ~1/64 lane efficiency. The trade is still overwhelmingly favourable
-# (640 dispatches x 27.9 us = 17.9 ms of pure overhead, versus one dispatch), but the residual pixel
-# cost is the number the burn must produce. If it is too high the fix is a per-primitive
-# COLUMN-MAJOR flag letting lanes walk Y instead of X — deliberately NOT built ahead of a
-# measurement saying it is needed.
+# ⛔⛔ THE HONEST LIMIT WAS MEASURED, AND IT IS FATAL ROW-MAJOR. This comment used to end "the residual
+# pixel cost is the number the burn must produce. If it is too high the fix is a per-primitive
+# COLUMN-MAJOR flag letting lanes walk Y instead of X — deliberately NOT built ahead of a measurement
+# saying it is needed." Burn 1 (1.56.23) produced the number: 3.1% lane occupancy at 2 px wide, 99.6 ns
+# per USEFUL pixel against rung 13's 1.6 ns/px slope. A 640-column DOOM frame is 128000 launched waves
+# = 24.5 ms of a 28.6 ms budget. ⇒ GPU_TEX_FLAG_COLMAJOR is now REQUIRED, and is built (rung 14b);
+# the same frame column-major is 2560 waves = 0.51 ms.
+#
+# ⭐ THE DEFERRAL WORKED AS DESIGNED — the flag was named here, left unbuilt pending a measurement, and
+# the measurement said build it. Building it on the guess would have been right for the wrong reason.
+#
+# ⚠ THIS CAP IS AXIS-AWARE AS OF 14b. Under COLMAJOR the launched grid is
+# (n_prims << ceil(log2(ceil(max_ph/64)))) * max_pw — tiles from the HEIGHT, rows from the WIDTH. A cap
+# computed off the wrong axis can sit 64x below the grid actually launched, which is a wedged queue.
 var GPU_TEXL_MAX_WAVES = 262144;     # launched wavefronts per op 0x0C dispatch
 var GPU_TEX_PRIM_BYTES = 96;         # per-primitive input record, ring-3 supplied:
 #   +0  wh        h<<16 | w      (rect size)
@@ -1124,7 +1155,8 @@ var GPU_TEX_PRIM_BYTES = 96;         # per-primitive input record, ring-3 suppli
 #   +8  tex_id    #86 slot
 #   +12 lut_id    #86 slot (IDX8 only, else 0)
 #   +16 texwh     th<<16 | tw
-#   +20 flags     per-primitive: IDX8 | WRAP
+#   +20 flags     per-primitive: IDX8 | WRAP | COLMAJOR
+#                 (FULLCOV mandatory; COLMAJOR must agree across the list)
 #   +24 vx0 vy0 vx1 vy1 vx2 vy2  (i32 16.16)
 #   +48 u0 v0 u1 v1 u2 v2        (i32 16.16)
 # ⚠ 96 B: a 24-byte header + 48 bytes of coords = 72, rounded
@@ -1203,6 +1235,10 @@ var GPO_E_TEXDIM   = 26;             # op    — texture w/h is zero or exceeds 
 # WITHOUT IDX8 — the second because accepting it would silently ignore a slot the caller believes is
 # in use, which is the same failure mode the flags word exists to prevent.
 var GPO_E_LUTSLOT  = 27;             # op    — LUT slot missing, invalid, or supplied when unusable
+# ⭐ Rung 14b. Its own code because the fix is specific and non-obvious: SPLIT THE LIST, do not
+# flip a bit. GPO_E_RESERVED would say "a flag bit is wrong" when every flag is individually legal and
+# it is their DISAGREEMENT that is not executable — one dispatch has one lane axis.
+var GPO_E_MIXMODE  = 28;             # op    — primitives in one 0x0C array disagree on COLMAJOR
 var GPO_E_TRILIST  = 24;             # op    — triangle count/slot invalid, or a per-triangle record is
 var GPU_COV_MAX_DIM = 4096;          # per-side mask cap — a REJECT, never a clamp
 # ⭐ THE COORDINATE DOMAIN (B3). 2^28 = 4096 px in 16.16 — the same 4096 as GPU_COV_MAX_DIM, so
@@ -1351,6 +1387,10 @@ fn gpo_validate_texlist(rec, fbw, fbh) {
     if (np > GPU_TEX_LIST_MAX) { return GPO_E_TRILIST; }
     var lmaxw = 0;
     var lmaxh = 0;
+    # The list's lane axis, latched from primitive 0 and required to hold for every other primitive.
+    # -1 = not yet seen. ⚠ Latched INSIDE the loop, not read ahead of it, so the primitive that sets
+    # the mode is the same one the bounds checks above have already vetted.
+    var lcm = 0 - 1;
 
     var pid = load32(rec + 12) & 0xFFFFFFFF;
     if (shm_slot_valid(pid) == 0) { return GPO_E_TRILIST; }
@@ -1381,11 +1421,23 @@ fn gpo_validate_texlist(rec, fbw, fbh) {
         if (ph > lmaxh) { lmaxh = ph; }
 
         var pflags = load32(b + 20) & 0xFFFFFFFF;
-        if ((pflags & (0 - 1 - GPU_TEX_FLAGS_KNOWN)) != 0) { return GPO_E_RESERVED; }
+        # ⚠ GPU_TEXL_PRIM_FLAGS_KNOWN, not GPU_TEX_FLAGS_KNOWN — this op accepts COLMAJOR and op 0x0B
+        # must keep rejecting it. Sharing the mask would make 0x0B accept-and-ignore the bit.
+        if ((pflags & (0 - 1 - GPU_TEXL_PRIM_FLAGS_KNOWN)) != 0) { return GPO_E_RESERVED; }
         # ⛔ FULLCOV IS REQUIRED, not merely permitted. This op has no coverage pass at all — that
         # absence is what removes rung 12's shared-slot failure mode. A primitive without it would
         # be asking for a mask that is never produced.
         if ((pflags & GPU_TEX_FLAG_FULLCOV) == 0) { return GPO_E_RESERVED; }
+
+        # ⛔ ONE DISPATCH, ONE LANE AXIS. Checked in BOTH directions on purpose: the dangerous
+        # direction is a row-major primitive 0 followed by a COLMAJOR primitive 1, because a driver
+        # that sampled only primitive 0 would dispatch row-major and SILENTLY DISCARD primitive 1's
+        # flag — a picture the caller did not ask for, with no error. Latching from primitive 0 and
+        # comparing every successor makes both directions the same reject.
+        var pcm = 0;
+        if ((pflags & GPU_TEX_FLAG_COLMAJOR) != 0) { pcm = 1; }
+        if (lcm < 0) { lcm = pcm; }
+        if (pcm != lcm) { return GPO_E_MIXMODE; }
 
         var twh = load32(b + 16) & 0xFFFFFFFF;
         var tw = twh & 0xFFFF;
@@ -1419,7 +1471,17 @@ fn gpo_validate_texlist(rec, fbw, fbh) {
         }
 
         # reserved tail
-        if ((load32(b + 72) & 0xFFFFFFFF) != 0) { return GPO_E_RESERVED; }
+        # ⛔ ALL SIX DWORDS, NOT THE FIRST. +72..95 is declared "the extension point, MUST be zero",
+        # and until 14b only +72 was actually checked — +76/+80/+84/+88/+92 were accepted and ignored,
+        # which is the precise thing an extension point must never do. A caller who parks a future
+        # flag at +92 gets it silently dropped today and a silent behaviour CHANGE the day it acquires
+        # meaning. 14b leans on this extension point (it is the stated reason COLMAJOR stays
+        # per-primitive rather than moving to the header), so the gap is paid off here.
+        var rz = 0;
+        while (rz < 6) {
+            if ((load32(b + 72 + rz * 4) & 0xFFFFFFFF) != 0) { return GPO_E_RESERVED; }
+            rz = rz + 1;
+        }
         i = i + 1;
     }
 
@@ -1433,10 +1495,17 @@ fn gpo_validate_texlist(rec, fbw, fbh) {
     # primitive with 511 one-pixel columns forces tile_shift = 6, so the grid is 64x wider than 511
     # of the 512 primitives can use. Bounding the launched lanes catches that; bounding sum(pw*ph)
     # would not. On this silicon an unbounded dispatch is a wedged queue with no pointer back here.
+    #
+    # ⚠ AXIS-AWARE SINCE 14b. The lane axis is the one tile_shift is computed from, and the OTHER
+    # axis becomes the row count. Getting this backwards does not produce a wrong picture — it
+    # produces a cap computed against a grid nobody launches, which can sit 64x under the real one.
+    var laxis = lmaxw;
+    var lrows = lmaxh;
+    if (lcm == 1) { laxis = lmaxh; lrows = lmaxw; }
     var lt = 0;
-    var ltiles = (lmaxw + 63) / 64;
+    var ltiles = (laxis + 63) / 64;
     while ((1 << lt) < ltiles) { lt = lt + 1; }
-    if ((np << lt) * lmaxh > GPU_TEXL_MAX_WAVES) { return GPO_E_WORK; }
+    if ((np << lt) * lrows > GPU_TEXL_MAX_WAVES) { return GPO_E_WORK; }
     return 0;
 }
 
@@ -2426,7 +2495,12 @@ fn edge_abi_selftest() {
     # is asking for a mask that is never produced.
     store32(pb + 1 * GPU_TEX_PRIM_BYTES + 20, 0);
     pass = pass + ea_expect(&d, GPO_E_RESERVED, "texl: primitive without FULLCOV", 31);
-    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 20, GPU_TEX_FLAG_FULLCOV | 0x08);
+    # ⚠ 0x10, NOT 0x08. This case used 0x08 until rung 14b DEFINED that bit as COLMAJOR, at which
+    # point it stopped testing "a bit this op does not define" and started testing the mix rule —
+    # it went red wanting GPO_E_RESERVED and getting GPO_E_MIXMODE. The battery caught its own
+    # obsolescence, which is the behaviour worth having: the case must always name the LOWEST
+    # still-undefined bit, so it moves every time the vocabulary grows.
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 20, GPU_TEX_FLAG_FULLCOV | 0x10);
     pass = pass + ea_expect(&d, GPO_E_RESERVED, "texl: primitive unknown flag bit", 32);
     store32(pb + 1 * GPU_TEX_PRIM_BYTES + 20, GPU_TEX_FLAG_FULLCOV);
 
@@ -2501,9 +2575,66 @@ fn edge_abi_selftest() {
         lw = lw + 1;
     }
     pass = pass + ea_expect(&d, 0, "texl: nine 1-px columns 1024 rows tall are accepted", 51);
+
+    # ⭐⭐ RUNG 14b — THE ONE GEOMETRY THAT CAN ONLY ANSWER DIFFERENTLY IF THE AXIS ACTUALLY SWAPPED.
+    # Nine primitives at 1024 x 1088, identical in every field but the COLMAJOR bit:
+    #     row-major: ltiles = ceil(1024/64) = 16 -> lt = 4 -> (9<<4) * 1088 = 156672   ACCEPT
+    #     col-major: ltiles = ceil(1088/64) = 17 -> lt = 5 -> (9<<5) * 1024 = 294912   REJECT
+    # Same nine records, one flag bit apart, opposite verdicts.
+    #
+    # ⛔⛔ THE OBVIOUS CASE — "mirror the row-major reject by transposing 2048x1024" — IS BOTH ILLEGAL
+    # AND VACUOUS, and it would have gone red on a CORRECT kernel. Illegal: this battery validates
+    # against a 2560x1440 framebuffer, and `py + ph > fbh` is checked INSIDE the per-primitive loop,
+    # 50-odd lines before the wave bound, so a 2048-tall primitive returns GPO_E_DIM and never reaches
+    # the cap at all. Vacuous: 2048 = 2 x 1024 and ceil(2048/64) = 2 x ceil(1024/64), so lt rises by
+    # exactly 1 while the row count halves and the PRODUCT IS INVARIANT — any primitive whose two
+    # dimensions are both multiples of 64 in a power-of-two ratio scores identically under both
+    # formulas. 1088 breaks the symmetry precisely because ceil(1088/64) = 17 is just past a power of
+    # two. This is the same trap the comment above already records falling into once; the tempting
+    # "fix" both times is to weaken the validator.
+    #
+    # ⚠ AND THE ACCEPT HALF MUST BE THE ROW-MAJOR ARM OF THE SAME GEOMETRY, not some other shape. The
+    # existing "nine 1-px columns" accept is passed by a validator that ignores the flag ENTIRELY
+    # (144 waves col-major, 9216 row-major, both under the cap), so it cannot witness the swap.
+    lw = 0;
+    while (lw < 9) {
+        ea_seed_prim(pb, lw, 14, 0, 8, 8, GPU_TEX_FLAG_FULLCOV, 1024, 1088, 0, 0);
+        lw = lw + 1;
+    }
+    pass = pass + ea_expect(&d, 0, "texl: nine 1024x1088 row-major are accepted", 43);
+    lw = 0;
+    while (lw < 9) {
+        ea_seed_prim(pb, lw, 14, 0, 8, 8,
+        GPU_TEX_FLAG_FULLCOV | GPU_TEX_FLAG_COLMAJOR, 1024, 1088, 0, 0);
+        lw = lw + 1;
+    }
+    pass = pass + ea_expect(&d, GPO_E_WORK, "texl: the SAME nine col-major exceed the cap", 44);
+
     store32(&d + 24, 2);
     ea_seed_prim(pb, 0, 14, 0, 8, 8, GPU_TEX_FLAG_FULLCOV, 16, 16, 0, 0);
     ea_seed_prim(pb, 1, 14, 0, 8, 8, GPU_TEX_FLAG_FULLCOV, 16, 16, 16, 0);
+
+    # ⛔ ONE DISPATCH, ONE LANE AXIS — and the two directions are NOT interchangeable as tests.
+    # This one mutates primitive [1] and leaves primitive [0] at the well-formed fixture, per the
+    # doctrine above: a validator that sampled only the first entry would pass it. It is also the
+    # DANGEROUS direction — a driver reading the mode from primitive 0 alone would dispatch
+    # row-major and SILENTLY DISCARD primitive 1's flag, drawing a picture nobody asked for with no
+    # error anywhere. The reverse direction at least disagrees loudly with itself.
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 20, GPU_TEX_FLAG_FULLCOV | GPU_TEX_FLAG_COLMAJOR);
+    pass = pass + ea_expect(&d, GPO_E_MIXMODE, "texl: a COLMAJOR primitive in a row-major list", 46);
+    store32(pb + 0 * GPU_TEX_PRIM_BYTES + 20, GPU_TEX_FLAG_FULLCOV | GPU_TEX_FLAG_COLMAJOR);
+    pass = pass + ea_expect(&d, 0, "texl: an all-COLMAJOR list is accepted", 38);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 20, GPU_TEX_FLAG_FULLCOV);
+    pass = pass + ea_expect(&d, GPO_E_MIXMODE, "texl: a row-major primitive in a COLMAJOR list", 46);
+    store32(pb + 0 * GPU_TEX_PRIM_BYTES + 20, GPU_TEX_FLAG_FULLCOV);
+
+    # ⛔ THE FAR END OF THE RESERVED TAIL. +72 was the only dword ever checked; +76..+92 were accepted
+    # and ignored, which is the one thing an extension point must never do. Mutating +92 rather than
+    # +72 is the whole point — a loop that checked only the first dword passes every test anyone
+    # would think to write. Primitive [1] again, never [0].
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 92, 1);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "texl: reserved dword +92 must be zero", 37);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 92, 0);
 
     store32(&d +  4, 1);
     pass = pass + ea_expect(&d, GPO_E_RESERVED, "texl: header flags must be zero", 31);
@@ -2525,8 +2656,8 @@ fn edge_abi_selftest() {
         r = r + 1;
     }
 
-    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 83 cases correct\n", 21);
-    if (pass == 83) {
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 89 cases correct\n", 21);
+    if (pass == 89) {
         kprint("edge-abi: PASS -- the 0x08/0x09/0x0A/0x0B/0x0C ABIs reject every malformed record,\n", 83);
         kprint("edge-abi: and a well-formed one is accepted or correctly reports no-GPU.\n", 73);
         return 1;

@@ -11,6 +11,13 @@
 # gates had the bare form and had simply never failed. A failing command inside an `&&`/`||` list is
 # exempt from `set -e`, which is why the kprint gate below — the one gate written that way — was the
 # only one that could ever report a failure and let the run continue to its summary.
+#
+# ⚠⚠ AND IT CAME BACK. The texl-body-identity gate, added by rung 14 AFTER that sweep, shipped in the
+# bare form — so from rung 14 until 2026-07-27 the gate that is the entire safety argument for
+# tex_list.s carrying tex_rgba.s's proven body could not report a failure. It had simply never failed,
+# which is the same reason the original eight went unnoticed. ⇒ A one-time sweep does not hold this
+# invariant; only a mutation test does. When you add a gate, force it red on purpose and confirm the
+# run reaches "N passed, M failed" — a green run proves nothing about the failure path.
 set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -76,7 +83,7 @@ BLOBDRIFT=""
 # ⚠ tex_rgba and tex_list were NOT in this list until rung 14 — the two largest and most
 # intricate blobs in the tree were the two nobody was diffing. Both pass; the gap was in the gate,
 # not the tables.
-for sb in edge_setup edge_cov tri_rgba tex_rgba tex_list; do
+for sb in edge_setup edge_cov tri_rgba tex_rgba tex_list tex_list_cm; do
     sh "$ROOT/scripts/check/shader-blob.sh" check "$ROOT/kernel/shaders/$sb.s" "$sb" >/tmp/shader-blob-$sb.log 2>&1 \
         || BLOBDRIFT="$BLOBDRIFT$sb "
 done
@@ -86,9 +93,17 @@ check "shader blobs match their .s sources" $rc
 
 # tex_list.s is tex_rgba.s's proven body under a new prologue. A copy is only as good as the proof
 # that it IS one: this gate fails the build the moment the two bodies diverge by a single character.
-sh "$ROOT/scripts/check/texl-body-identity.sh" >/tmp/texl-body.log 2>&1; rc=$?
+sh "$ROOT/scripts/check/texl-body-identity.sh" >/tmp/texl-body.log 2>&1 && rc=0 || rc=$?
 check "rung 14's shader carries rung 13's body verbatim" $rc
 [ $rc -eq 0 ] || cat /tmp/texl-body.log
+
+# tex_list_cm.s is tex_list.s with the lane axis transposed, DERIVED by this script rather than
+# hand-copied. ⚠ It cannot reuse the gate above: that one asserts the differing dwords form a
+# contiguous prefix (true when the only difference is a prologue), and 14b differs in TWO runs by
+# construction — the prologue AND a declared 4-instruction address window inside the body region.
+python3 "$ROOT/scripts/check/texl-cm-derive.py" check >/tmp/texl-cm.log 2>&1 && rc=0 || rc=$?
+check "rung 14b's col-major shader is the declared derivation" $rc
+[ $rc -eq 0 ] || cat /tmp/texl-cm.log
 
 # Call arity. cycc WARNS on an argument-count mismatch and builds anyway, so a wrong call ships green.
 # Wired in 2026-07-22 after the 1.56.x audit found gpu_blend_cov_run declared with 12 parameters and
