@@ -1148,7 +1148,19 @@ gpu_display_vblank();
 # name — it decides whether the module is a constant or the pixel clock); the live pixel clock + DPREFCLK
 # (free, and it measures any spread-spectrum); which DIG carries the lit stream; whether the Azalia endpoint
 # is awake or in D3; and whether the GOP already programmed the DTO/AFMT. Gated on P0.
+#
+# ⛔ GATED 1.56.25 — it printed a labeled-hex line per Azalia endpoint on EVERY production boot
+# (`gpu: audio probe az<N> pre=0x… back=0x… hpc=0x… rcd=0x… csi=0x…`). Its own header says
+# "removed once P3b lands, same disposal as the P0 diagnostic" — **P3b landed at 1.55.12**, twelve
+# patch cuts before this gate. Two rules it was breaking meanwhile: no hex dumps in the normal
+# success path ([[feedback_kernel_logs_plain_no_codes]] — console logs read like a real driver), and
+# its two immediate neighbours here (SCANOUT_REDIRECT, SCANOUT_REGDUMP) were already `#ifdef`-gated,
+# so it was the odd one out rather than the convention. Kept rather than deleted because the probe
+# itself is a genuinely useful read-only discriminator for the remaining HDMI-audio candidates
+# (cut 1.56.32) — build with `GPU_AUDIO_PROBE=1` when you want it.
+#ifdef GPU_AUDIO_PROBE
 gpu_audio_probe();
+#endif
 
 # GPU arc 1.55.x (Thrust P) P3b prerequisite: derive the live pixel clock. The HDMI audio DTO's module field
 # IS the pixel clock (in 100 Hz units) and the ACR CTS is computed from it, but the DCCG register that holds

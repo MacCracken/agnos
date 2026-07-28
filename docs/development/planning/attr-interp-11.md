@@ -1,10 +1,43 @@
 # RUNG 11 — IMPLEMENTATION PLAN
 
+## ⛔ STATUS — SHIPPED. THIS IS HISTORY, NOT A PLAN. (banner added 2026-07-28)
+
+**Rung 11 shipped and is iron-closed** — `tri_rgba` is op `0x09 GPU_OP_TRI_RGBA`, bit 9 of
+`GPU_OP_SUPPORTED = 0x1F1F`, iron-validated at **1.56.20**. Everything below is the plan that
+produced it. **Read it for the refutations — that is the stated reason it was kept — and take no
+number from it.**
+
+⛔ **Every hard number in this file that I checked against the shipped kernel was wrong.** Verified
+2026-07-28:
+
+| This file says | Shipped | Where |
+|---|---|---|
+| `GPU_TRI_AREA_MIN = 2^32`, `GPU_TRI_AREA_MAX = 2^53` (§2.2, §2.3, §2.5, Decision 8, §6, §10) | **`65536` (2^16)** and **`4398046511104` (2^42)** | `syscall.cyr:1020-1021` |
+| `RSRC1 = 0x002C018F` — 64 VGPRs, "MEASURED from the assembled object" (§1.8) | **`0x002C0187`** — **32** VGPRs | `gpu_regs.cyr:1190` (`GPU_COMPUTE_PGM_RSRC1_TRI`) |
+| blob is "~200 dwords", revised to "269" (§1.7, §8.2, bite-7 note) | **278** | `tri_rgba_write` in `gpu.cyr`; regenerated 269 → 278 by the burn-5 signed-`mul_hi` fix |
+
+⚠ **The area bounds are the dangerous one.** They are two orders of magnitude apart, and the kernel's
+own comment at `syscall.cyr:1718-1721` names this file's numbers as the defect — a 2^32 floor would
+have **rejected most real triangles**, which is exactly what the shipped `"tri: small frame clears the
+AREA floor"` selftest exists to prevent regressing.
+
+⚠ **This file's own header claimed "gpu.md's rung-11 row points here" — it did not.** A repo-wide grep
+for `attr-interp-11` returned zero inbound references; the string appeared in gpu.md only as a bite
+*name* in a code span, with no link. The link was added to gpu.md's rung-11 row on 2026-07-28, so the
+claim is now true. ⛔ A doc asserting its own inbound links is worthless — grep for them.
+
+⚠ **On this file existing at all:** gpu.md rule 1 is "no new GPU arc documents, everything goes here,"
+and this file was created three days after that rule. It survives as a **refutation record**, which is
+a category gpu.md's release tables genuinely cannot hold, and it is now explicitly demoted to history
+so it cannot be mistaken for live plan. Do not create its successor.
+
+---
+
 <!-- Rung 11 implementation plan. Produced 2026-07-26 by a 2-ground survey + 3 independent designs
      + 3 adversarial judges (exactness lens, emission lens, cost/consumer lens) + this synthesis.
      Kept because the plan's VALUE is its refutations: three designs were scored, two were killed
      with concrete counterexamples, and ONE UNANIMOUS JUDGE RECOMMENDATION WAS ITSELF REFUTED here
-     (§1.3, the E-clamp). gpu.md's rung-11 row points here. -->
+     (§1.3, the E-clamp). -->
 
 ## `tri_rgba`: exact integer barycentric attribute interpolation on gfx90c, one new blob
 

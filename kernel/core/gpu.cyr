@@ -107,22 +107,14 @@ var gpu_grad_armed    = 0;   # 1 = grad_linear resident in its own arena slot fo
 var gpu_perm_ok       = 0;   # plan-S4: 1 = v_perm_b32 byte crossbar + channel swap proven on iron
 var gpu_blend_pk_ok   = 0;   # plan-S4: 1 = VOP3P packed blend proven bit-identical to the f32 blend
 var gpu_batch_ok      = 0;   # plan-S12: 1 = a batched frame proven pixel-identical to op-by-op
-# plan-D lane: a monotonic phase clock so a PHOTO IDENTIFIES ITSELF.
-# The D1 hold is a few seconds in the middle of scrolling console text, and two shots taken seconds apart
-# are indistinguishable after the fact — which is exactly why burn 4's bar photos could not be assigned to
-# a phase. Stamping each transition means the last visible line in any photo states which state is live.
-# ⚠ rdtsc, not timer_ticks: these tests run BEFORE sti, so the 100 Hz tick does not advance yet.
-var gpu_ts_base = 0;
-fn gpu_ts_reset() { gpu_ts_base = rdtsc(); return 0; }
-fn gpu_ts_mark(label, len) {
-    var us = 0;
-    if (gpu_ts_base != 0) { us = (rdtsc() - gpu_ts_base) / gpu_tsc_per_us(); }
-    kprint("gpu: [T+", 8);
-    kprint_num(us / 1000);
-    kprint("ms] ", 4);
-    kprintln(label, len);
-    return 0;
-}
+# ⛔ REMOVED 1.56.25 — the plan-D phase clock (`gpu_ts_base` / `gpu_ts_reset()` / `gpu_ts_mark()`).
+# It stamped "gpu: [T+NNNms] <label>" on each D-lane transition so a framebuffer PHOTO could identify
+# which phase it caught. Its consumers were the D-lane boot self-tests, and those were deleted at
+# 1.56.x — the note directly below has said so ever since, while the clock itself stayed, callerless
+# and reading as live instrumentation to anyone planning the next photo bite. Zero call sites
+# repo-wide at removal. The D lane is closed; if a future visual bite needs phase stamping, write it
+# then against that bite's actual oracle — and see [[feedback_dlane_five_burns_what_went_wrong]] on
+# why a visual test must not be a boot self-test in the first place.
 var gpu_otg_lock_acked = 0;  # last gpu_otg_lock result — 0 means the lock TIMED OUT and nothing committed
 # gpu_d1_ok / gpu_d2_ok are GONE with the boot self-tests that set them (1.56.x). Nothing ever read them —
 # they were write-only flags, which is the tell that a boot self-test was standing in for a result the
@@ -8518,59 +8510,34 @@ fn gpu_blit_arm() {
 # HUBP_BLANK write, so the worst case is a torn frame that self-clears or reboots away, never a dead pipe.
 # ⚠ The lock MUST be cleared on every exit path or the pipe freezes on its last frame; the status poll is bounded.
 fn gpu_scanout_clear_tiling() {
-    # ⚠⚠ RETIRED 2026-07-20 — DO NOT RE-ARM. Register-truth (HIGH confidence) proved this whole path is
-    # mis-targeted: 0x607 is EARLIEST_INUSE_C (read-only in-use STATUS), NOT DCSURF_SURFACE_PITCH (real =
-    # 0x603), and 0x60B is SECONDARY_ADDR_HIGH not primary. Writing 2560→0x607 + the address split, committed
-    # atomically under the OTG master update lock, poisoned the surface descriptor → HUBP underflow → BLACK
-    # BOX + wedge on iron (burn #3). The banding was never a pitch fault; the replacement path is the
-    # address-flip pattern probe (gpu_scanout_pattern_probe) which touches ONLY the P0-verified 0x60A/0x60B.
+    # ⚠⚠ RETIRED 2026-07-20 — DO NOT RE-ARM. Writing 2560→pitch plus the address split, committed
+    # atomically under the OTG master update lock, poisoned the surface descriptor → HUBP underflow →
+    # BLACK BOX + wedge on iron (burn #3). The banding was never a pitch fault at all: the real P4 root
+    # cause was a surface/raster SCALE mismatch, fixed READ-ONLY at 1.55.28 by gpu_scanout_matchgeom().
     # Left as a hard no-op so a stale #ifdef SCANOUT_LINEAR build can never black the box again.
-    kprintln("gpu: scanout_clear_tiling RETIRED (0x607 was wrong reg) -- no-op", 64);
+    #
+    # ⛔⛔ THE "REGISTER-TRUTH" EXPLANATION THIS COMMENT USED TO GIVE IS ITSELF REFUTED (corrected
+    # 1.56.25). It claimed "0x607 is EARLIEST_INUSE_C (read-only STATUS), NOT DCSURF_SURFACE_PITCH
+    # (real = 0x603), and 0x60B is SECONDARY_ADDR_HIGH". That is WRONG and it contradicted this very
+    # tree: gpu_regs.cyr:175 is `GPU_R_HUBP_SURF_PITCH = 0x607 -- regdump: 832`, confirmed against the
+    # IRON REGISTER DUMP (832 = viewport 800 aligned to 64), and gpu.cyr READS 0x607 as the pitch in
+    # both the P0 probe and gpu_scanout_matchgeom. **0x607 IS the pitch.** The offsets were never the
+    # bug — WRITING them under the update lock was. ⚠ This matters beyond tidiness: MODESET (cut
+    # 1.56.31) is the next thrust that writes DCN, both files get consulted before a DCN write, and a
+    # kernel that tells two stories about a register offset is how a burn gets spent on the wrong one.
+    # See [[reference_agnos_dcn_hubp_reg_offsets_derived]] — anchor reads, never trust a DERIVED write.
+    kprintln("gpu: scanout_clear_tiling RETIRED (writing pitch under the lock wedged it) -- no-op", 83);
     return 0;
 }
 
-fn gpu_scanout_clear_tiling_dead() {
-    if (gpu_display_ok != 1) { return 0; }
-
-    var h = gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
-    var o = gpu_display_pipe * GPU_DCN_OTG_STRIDE;
-    var lock_off = GPU_R_OTG_MASTER_UPDATE_LOCK + o;
-
-    # 1. Point the master update lock at this pipe, then take it. Bounded poll on the ack — proceed on timeout
-    #    exactly as amdgpu's REG_WAIT does (a stuck poll must never wedge boot).
-    var gc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_GLOBAL_CONTROL0 + o);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_GLOBAL_CONTROL0 + o,
-    (gc & (0 - 1 - GPU_OTG_LOCK_SEL_MASK)) | ((gpu_display_pipe << 25) & GPU_OTG_LOCK_SEL_MASK));
-    gpu_reg32_write(GPU_BASE_DCN_2, lock_off, 0x1);
-    var spins = 0;
-    while (spins < 100000) {
-        if ((gpu_reg32(GPU_BASE_DCN_2, lock_off) & GPU_OTG_UPDATE_LOCK_STATUS) != 0) { spins = 100000; }
-        else { spins = spins + 1; }
-    }
-
-    # 2. Clear DCC (full-write 0 = DCC off + TMZ off) and set a plain linear tiling config (SW_MODE=0, META_LINEAR).
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_SURFACE_CONTROL + h, 0);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_TILING_CONFIG + h, GPU_HUBP_META_LINEAR);
-
-    # 2b. PITCH — the burn-2 lead. The surface is already LINEAR, yet the console still shears, which on a linear
-    #     surface means the HUBP scans a DIFFERENT stride than fb_console writes. fb_console lays glyphs out at
-    #     fb_pitch() BYTES/row; the HUBP must scan exactly fb_pitch()/4 PIXELS/row over that same memory. Force
-    #     the HUBP's DCSURF_SURFACE_PITCH to match the console's actual layout so every row lands where the next
-    #     one begins. (No-op if they already agree; if they don't, this is the fix.)
-    var want_pitch = fb_pitch() / 4;
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_PITCH + h, want_pitch & 0x3FFF);
-    kprint("gpu: scanout pitch -> ", 22); kprint_num(want_pitch); kprintln(" px (= fb stride)", 17);
-
-    # 3. Re-arm the surface address (HIGH then LOW; LOW is the flip trigger) so the new config commits with a
-    #    fresh scanout base, then release the lock — the whole change latches atomically at the next VUPDATE.
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR_HI + h, (gpu_display_surf >> 32) & 0xFFFF);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR + h, gpu_display_surf & 0xFFFFFFFF);
-    gpu_reg32_write(GPU_BASE_DCN_2, lock_off, 0);       # UNLOCK — must always run
-    gpu_mfence();
-    gpu_display_wait_vblank(gpu_display_pipe);
-    kprintln("gpu: scanout tiling+dcc cleared to linear (residue fix)", 55);
-    return 1;
-}
+# ⛔ REMOVED 1.56.25 — `gpu_scanout_clear_tiling_dead()`, 42 lines of body, ZERO call sites.
+# It was the original P4 "fix": write the surface pitch and re-split the surface address under the OTG
+# master update lock. It BLACKED THE BOX AND WEDGED IT on iron (burn #3), and was then renamed `_dead`
+# rather than deleted — so the exact code that killed the display sat in the tree, uncalled, for weeks.
+# A body kept as a warning is a worse warning than a comment: it still compiles, it greps as if it were
+# live, and the one thing it is guaranteed not to be is correct.
+# ⭐ The real P4 root cause was a surface/raster SCALE mismatch, not a pitch fault, and the shipped fix
+# is READ-ONLY: `gpu_scanout_matchgeom()` (1.55.28). See the `0x607` note on the retired stub above.
 
 # gpu_scanout_pattern_probe — the SAFE, DECISIVE P4 bisector (replaces the retired pitch-write path). Paints a
 # test pattern into an agnos-OWNED linear buffer (gpu_bb_a, full console geometry, cleared) and flips scanout
@@ -8583,7 +8550,10 @@ fn gpu_scanout_clear_tiling_dead() {
 #   bottom 1/3 : 4px checkerboard                  — 2D high freq.
 # Crisp everywhere ⟹ HUBP scans an agnos linear buffer perfectly ⟹ banding is surface-content (the redirect is
 # the fix, and DOOM/blit#39 ARE band-free on this iron). Sheared/garbled ⟹ a real per-pipe scan-geometry fault
-# an address flip can never fix (then fix the VERIFIED 0x603, never 0x607).
+# an address flip can never fix. ⛔ The clause here that said "then fix the VERIFIED 0x603, never 0x607"
+# is REFUTED and was removed 1.56.25 — 0x607 IS DCSURF_SURFACE_PITCH, confirmed by the iron regdump
+# (gpu_regs.cyr:175, "regdump: 832"). And the answer to a scan-geometry fault is to READ the geometry,
+# which is what gpu_scanout_matchgeom() shipped at 1.55.28 — not to write a different offset.
 fn gpu_scanout_pattern_probe() {
     if (gpu_display_ok != 1) { return 0; }
     if (gpu_display_pipe < 0) { return 0; }
@@ -8722,30 +8692,14 @@ fn gpu_sdma_probe() {
 # register — so PROBE READ-ONLY FIRST and ABORT if the address looks wrong. Bases are header-verified (anchored
 # by the working SEG2=0xD20). Interrupts are OFF during GPU bringup, so the INDEX→DATA pair is atomic (no other
 # RSMU user). Full recipe adversarially verified vs renoir_ip_offset.h + nbio_v7_2.c + nbio_7_2_0_sh_mask.h.
-fn gpu_sdma_route_doorbell() {
-    # PROBE (read-only): arm INDEX at the doorbell-range reg, read DATA. Only OFFSET[11:2]/SIZE[20:16] bits may
-    # be set on the real register; any foreign bit ⟹ wrong address ⟹ ABORT before the destructive write.
-    gpu_reg32_write(GPU_BASE_NBIO_1, GPU_R_NBIO_RSMU_INDEX, GPU_NBIO_SDMA0_DBR_IDX);
-    gpu_reg32(GPU_BASE_NBIO_1, GPU_R_NBIO_RSMU_INDEX);
-    var cur = gpu_reg32(GPU_BASE_NBIO_1, GPU_R_NBIO_RSMU_DATA) & 0xFFFFFFFF;
-    kprint("gpu: sdma doorbell-range cur ", 29); kprint_num(cur); kprintln("", 0);
-    if ((cur & GPU_NBIO_DBR_FOREIGN) != 0) {
-        kprintln("gpu: sdma doorbell-range addressing SUSPECT -- route NOT written", 64);
-        return 0;
-    }
-    # WRITE the route (RMW preserves foreign bits; = 0x40780 when cur is clean). Re-arm INDEX before DATA.
-    var newv = (cur & GPU_NBIO_DBR_FOREIGN) | GPU_NBIO_SDMA0_DBR_VAL;
-    gpu_reg32_write(GPU_BASE_NBIO_1, GPU_R_NBIO_RSMU_INDEX, GPU_NBIO_SDMA0_DBR_IDX);
-    gpu_reg32(GPU_BASE_NBIO_1, GPU_R_NBIO_RSMU_INDEX);
-    gpu_reg32_write(GPU_BASE_NBIO_1, GPU_R_NBIO_RSMU_DATA, newv);
-    gpu_reg32(GPU_BASE_NBIO_1, GPU_R_NBIO_RSMU_DATA);
-    # VERIFY (re-read through the indirect port).
-    gpu_reg32_write(GPU_BASE_NBIO_1, GPU_R_NBIO_RSMU_INDEX, GPU_NBIO_SDMA0_DBR_IDX);
-    gpu_reg32(GPU_BASE_NBIO_1, GPU_R_NBIO_RSMU_INDEX);
-    var rb = gpu_reg32(GPU_BASE_NBIO_1, GPU_R_NBIO_RSMU_DATA) & 0xFFFFFFFF;
-    kprint("gpu: sdma doorbell-range routed ", 32); kprint_num(rb); kprintln("", 0);
-    return 1;
-}
+# ⛔ REMOVED 1.56.25 — `gpu_sdma_route_doorbell()`, ZERO call sites. It routed the SDMA doorbell as
+# part of the SDMA ring-up, which was ABANDONED after six burns: the ring rings up and never fetches
+# (doorbell CAPTURED=0 and a bare register-wptr both failed). Bring-up now disables the doorbell
+# outright, so this had nothing left to route. 2D shipped on CP-DMA over the proven MEC compute ring
+# instead and needs no SDMA. ⚠ The doorbell failure is an agnos SETUP gap, not a hardware limit —
+# Linux drives SDMA on this silicon fine; see [[reference_agnos_doorbells_dont_deliver_archaemenid]].
+# SDMA ring-up stays a deferred item for future async/parallel DMA; it starts from that memory, not
+# from this function.
 
 # gpu_sdma_bringup — the SDMA ring bring-up: bring up the SDMA0 GFX ring (the hardware fill/copy engine for 2D). Mirrors the
 # proven MEC ring bring-up (gpu_queue_setup): (the SDMA firmware load) PSP-load the SDMA ucode — the F32 is HALTED at boot and

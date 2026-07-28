@@ -169,41 +169,15 @@ elif [ -n "${BURN_SHADER_GLYPH:-}" ]; then
     echo "[2/2] Building the plan-S9 SHADER-GLYPH kernel (1bpp glyph expand; capture klug > shader_glyph.txt)."
     BUILD_ENV="SHADER_GLYPH=1"
     BUILD_TAG="SHADER_GLYPH"
-elif [ -n "${BURN_EDGE_PROBE:-}" ]; then
-    # ============================================================================================
-    # 3D ARC — THE EDGE-CAP MEASUREMENT KERNEL. ⚠ NOT A SHIPPING BUILD.
-    # ============================================================================================
-    # ⛔ Raises GPU_EDGE_CAP 64 -> 256 so `gputri --bench` can reach the points ABOVE the shipped
-    # cap. It exists because the cap must move on MEASUREMENT and the cap itself rejects the
-    # measurements. NEVER flash this as a normal kernel: it permits envelopes the 100 ms dispatch
-    # watchdog has NOT been shown to survive — extrapolation puts 4096^2 x E=64 at ~480 ms.
-    #
-    # ⚠ EDGE_CAP_PROBE SWAPS ONE CONSTANT, so this kernel is byte-identical in SIZE to the
-    # shipped one and `strings` cannot distinguish them — the ATOM_DRY shape. The observable is
-    # the boot line the kernel prints about itself:
-    #     gpu: edge rasteriser cap 256 edges      <- probe
-    #     gpu: edge rasteriser cap 64 edges       <- shipped
-    # CHECK THAT LINE IN THE LOG BEFORE TRUSTING ANY ABOVE-CAP NUMBER.
-    #
-    # Run: gputri --cov (must still be 20/20) THEN gputri --bench THEN klug > /cap.txt
-    # WHAT THIS BURN MUST PRODUCE: the us-per-edge column of the edge sweep, at ne = 4, 8, 16,
-    # 32, 64, 128, 256 on a fixed 128x128 mask. That is the term burn 5 never measured — it swept
-    # mask size at a CONSTANT 3-edge triangle, so it produced zero edge-count data.
-    #
-    # ⭐ THE QUESTION: is us-per-edge FLAT?
-    #   FLAT   => cost is linear in E, the work-product model (~28 us + ~0.00045 us/px/edge)
-    #             holds, and EDGE_CAP can be replaced by a w*h*n_edges bound derived from it.
-    #   CURVED => it does not hold, and the bound must be fitted to these points directly.
-    # Either answer moves the cap on MEASUREMENT. Neither is a failure.
-    #
-    # ⛔ AND WATCH THE WATCHDOG. Extrapolation puts 4096^2 x E=64 at ~480 ms against a 100 ms
-    # dispatch timeout. Nothing in this sweep goes near that (128x128 x E=256 extrapolates to
-    # ~1.9 ms), but a GPO_E_DISPATCH at the high end IS the watchdog talking and is itself a
-    # datum — record it rather than retrying.
-    echo "[2/2] Building the EDGE-CAP PROBE kernel (GPU_EDGE_CAP=256; MEASUREMENT ONLY)."
-    echo "      ⚠ VERIFY 'gpu: edge rasteriser cap 256 edges' in the boot log."
-    BUILD_ENV="EDGE_CAP_PROBE=1"
-    BUILD_TAG="EDGE_CAP_PROBE"
+# ⛔ REMOVED 1.56.25 — the BURN_EDGE_PROBE / EDGE_CAP_PROBE profile. IT WAS A TRAP THAT COULD COST A BURN.
+# It advertised "raises GPU_EDGE_CAP 64 -> 256 for the above-cap sweep", but NO kernel source has ever
+# carried an `#ifdef EDGE_CAP_PROBE` — `GPU_EDGE_CAP = 256` is an unconditional constant (gpu.cyr). So
+# `EDGE_CAP_PROBE=1` produced a kernel BYTE-IDENTICAL to the default while the profile told the operator
+# it was something else, and its own note conceded `strings` could not tell them apart.
+# ⭐ It is also OBSOLETE, not merely dead: the measurement it existed to enable ALREADY RAN (B10). The
+# shipped cap IS 256, and the real bound is no longer a cap at all — it is the measured work product
+# GPU_EDGE_WORK_MAX (w*h*n_edges, 28.8 us + 0.0005953*(w*h)*ne, linear in E to ~2.6% across 4..256).
+# The cap moved on measurement exactly as intended; nobody removed the scaffolding afterwards.
 elif [ -n "${BURN_TEX_RGBA:-}" ]; then
     # ============================================================================================
     # 3D ARC RUNG 13 — TEXTURING'S FIRST CONTACT WITH SILICON.

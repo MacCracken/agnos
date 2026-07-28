@@ -3,6 +3,77 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.25] - 2026-07-28
+
+**Boot hygiene: dead code, one burn-trap, and a refuted register story (open cycle).** Zero burns.
+Second of the two no-burn cuts opened by the 1.56.x review. Bumped on cycle open; the user tags on
+close.
+
+### Removed — three functions with zero call sites
+
+- **`gpu_scanout_clear_tiling_dead()`** (42 lines). The original P4 "fix": write the surface pitch and
+  re-split the address under the OTG master update lock. It **blacked the box and wedged it on iron**
+  (burn #3), and was then renamed `_dead` instead of deleted — so the exact code that killed the
+  display sat in the tree, uncalled, for weeks. ⛔ A body kept as a warning is a *worse* warning than a
+  comment: it still compiles, it greps as if live, and the one thing it is guaranteed not to be is
+  correct.
+- **`gpu_sdma_route_doorbell()`.** SDMA ring-up was abandoned after six burns (the ring rings up and
+  never fetches); bring-up now disables the doorbell outright, so this had nothing to route. 2D
+  shipped on CP-DMA over the proven MEC compute ring instead.
+- **The plan-D phase clock** (`gpu_ts_base` / `gpu_ts_reset()` / `gpu_ts_mark()`). It stamped a
+  monotonic `T+NNNms` on D-lane transitions so a framebuffer photo could identify its own phase. The
+  D-lane self-tests that used it were deleted at 1.56.x — the note directly below it has said so ever
+  since, while the clock stayed, reading as live instrumentation to anyone planning the next photo bite.
+
+### Changed — `gpu_audio_probe` is now `#ifdef GPU_AUDIO_PROBE`
+
+It printed a labeled-hex line per Azalia endpoint on **every production boot**. Its own header says
+*"removed once P3b lands"* — **P3b landed at 1.55.12**, twelve patch cuts earlier. It was breaking the
+no-hex-dumps-in-the-success-path rule, and both of its immediate neighbours in `main.cyr`
+(`SCANOUT_REDIRECT`, `SCANOUT_REGDUMP`) were already gated, so it was the odd one out rather than the
+convention. Kept rather than deleted — it is a genuinely useful read-only discriminator for the
+remaining HDMI-audio candidates (cut 1.56.32).
+
+### Removed — the `EDGE_CAP_PROBE` burn trap
+
+`burn-prep.sh` offered a `BURN_EDGE_PROBE` profile advertising *"raises `GPU_EDGE_CAP` 64 → 256"*.
+**No kernel source has ever carried an `#ifdef EDGE_CAP_PROBE`** — `GPU_EDGE_CAP = 256` is an
+unconditional constant. So `EDGE_CAP_PROBE=1` produced a kernel **byte-identical to the default**
+while the profile told the operator it was something else, and its own note conceded `strings` could
+not tell them apart. ⭐ It was also obsolete rather than merely dead: the measurement it existed to
+enable already ran (B10), the shipped cap **is** 256, and the real bound is no longer a cap at all but
+the measured work product `GPU_EDGE_WORK_MAX` (`w*h*n_edges`, `28.8 µs + 0.0005953*(w*h)*ne`, linear
+in E to ~2.6% across 4..256). The cap moved on measurement exactly as intended; nobody removed the
+scaffolding afterwards. Removed from `build.sh` and `burn-prep.sh` both.
+
+### Fixed — the refuted `0x607` story, before MODESET writes DCN again
+
+`gpu_scanout_clear_tiling`'s retirement note asserted *"0x607 is EARLIEST_INUSE_C (read-only STATUS),
+NOT DCSURF_SURFACE_PITCH (real = 0x603)"*. That is **wrong, and it contradicted this same tree**:
+`gpu_regs.cyr:175` is `GPU_R_HUBP_SURF_PITCH = 0x607 — regdump: 832`, confirmed against the iron
+register dump (832 = viewport 800 aligned to 64), and `gpu.cyr` reads `0x607` as the pitch in both the
+P0 probe and `gpu_scanout_matchgeom`. **The offsets were never the bug — writing them under the update
+lock was.** ⚠ This matters beyond tidiness: MODESET (cut 1.56.31) is the next thrust that writes DCN,
+both files are consulted before a DCN write, and a kernel telling two stories about a register offset
+is how a burn gets spent on the wrong one.
+
+### Deferred — the imitation edge moves to 1.56.32, deliberately
+
+STAGE-1 (a hand-rolled `DIG_ENABLE` drop + **120 ms** hold + AVMUTE cycle, plus a 40 ms prime and
+`gpu_hdmi_avmute_pulse` in `main.cyr`) does run in a default build — the `#ifndef MODESET_AUDIO` gate
+suppresses it only while the M9 experiment is armed, which is backwards now that M9 has closed. That
+is ~160 ms and a console blank per boot for a hypothesis the record already killed. **It was scoped
+into this cut and is being moved out, for two reasons:** the enclosing block also contains the AVMUTE
+unmute and the FIFO **drain arming** that the default audio path needs, so this is a restructure
+rather than a deletion; and removing it would change the exact bring-up sequence cut 1.56.32 exists to
+test. Its oracle is the operator's ear on iron — QEMU has no AMD GPU — so it does not belong in a
+zero-burn cut.
+
+⚠ Also corrected in the plan: the claim that the retracted SYMCLK A/B *"costs ~24 s of every boot"* is
+**false for a production build**. `HDMI_DCCG` and `HDMI_SYMCLK_AB` are both `#ifdef`-gated and off by
+default; a default kernel carries neither. The real (smaller) issue is that two flags still exist to
+arm a path gpu.md says must not be re-opened.
+
 ## [1.56.24] - 2026-07-28
 
 **Truth-up, and the four real defects a full GPU review found (open cycle).** Zero burns — every

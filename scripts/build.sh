@@ -193,7 +193,10 @@ else
         [ -n "$RAMDISK_ENABLE" ] && echo '#define RAMDISK_ENABLE'
         [ -n "$TCP_LISTEN_SMOKE" ] && echo '#define TCP_LISTEN_SMOKE'
         [ -n "$NET_VERBOSE" ]    && echo '#define NET_VERBOSE'
-        [ -n "$EDGE_CAP_PROBE" ]     && echo '#define EDGE_CAP_PROBE'
+        # ⛔ EDGE_CAP_PROBE removed 1.56.25 — it emitted a define NO kernel source ever tested, so setting it
+        # produced a byte-identical kernel while burn-prep.sh offered it as a distinct burn profile. See the
+        # tombstone in scripts/burn/burn-prep.sh. GPU_EDGE_CAP is an unconditional 256 and the real bound is
+        # the measured GPU_EDGE_WORK_MAX work product.
         [ -n "$TSC_SELFTEST" ]       && echo '#define TSC_SELFTEST'
         [ -n "$DE_SELFTEST" ]        && echo '#define DE_SELFTEST'
         [ -n "$EDGE_ABI_SELFTEST" ]  && echo '#define EDGE_ABI_SELFTEST'
@@ -342,6 +345,12 @@ else
         # SCANOUT_REGDUMP=1 — read-only dump of the live-pipe HUBP register block to klug, to re-anchor the real
         # pitch/viewport offsets against known geometry (the surface is scaled ~800x600→2560x1440). Pure reads.
         [ -n "$SCANOUT_REGDUMP" ]    && echo '#define SCANOUT_REGDUMP'
+        # GPU_AUDIO_PROBE=1 — the P3a read-only display-audio state probe (DP-vs-HDMI via DCCG DP_DTO_ENABLE,
+        # live pixel clock + DPREFCLK, which DIG carries the lit stream, Azalia D3 state, GOP DTO/AFMT state).
+        # Gated at 1.56.25: it had been printing a labeled-hex line per endpoint on every production boot, long
+        # past its own stated removal trigger (P3b, landed 1.55.12). Still useful for the remaining HDMI-audio
+        # candidates (cut 1.56.32) — arm it deliberately, do not restore it to the default boot path.
+        [ -n "$GPU_AUDIO_PROBE" ]    && echo '#define GPU_AUDIO_PROBE'
         # SCANOUT_MATCHGEOM=1 — THE P4 FIX: read the real surface geometry (viewport 0x5EA + pitch 0x607) and
         # override fb_console to render at it (800x600 scaled), instead of boot_info's 2560x1440 output. Pure
         # reads + software geometry switch + console redraw — NO register writes, cannot hang/black. Oracle: the
