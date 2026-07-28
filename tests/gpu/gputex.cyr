@@ -1032,10 +1032,15 @@ fn tl_batch2(): i64 {
     # ---- REFERENCE: each list as its OWN #92 call, so each is separately fenced ----
     if (syscall(88, 0xFF101010, (TLH * 65536) + TLW, (y0 * 65536) + x0) != 0) { return 0 - 4; }
     if (syscall(88, 0xFF101010, (TLH * 65536) + TLW, (y1 * 65536) + x0) != 0) { return 0 - 4; }
-    var o1[16];
+    # ⛔ 64 BYTES, NOT 16. Cyrius FUNCTION-LOCAL `var X[N]` allocates N **BYTES** (module-scope is
+    # N x u64). tl_op0c writes 16 dwords = 64 bytes, so `var o1[16]` was a 48-byte STACK SMASH.
+    # ⚠ THIS COST AN IRON BURN: the seam case returned `the SOLO list-B call was REJECTED` on
+    # 2026-07-27 because the overflow corrupted the neighbouring locals the SECOND record is built
+    # from. Every 64-byte op record in this file is `var d[64]` / `var e[64]` for exactly this reason.
+    var o1[64];
     tl_op0c(&o1, p1, x0, y0, TL_NP);
     if (syscall(92, &o1, 64) != 0) { return 0 - 201; }
-    var o2[16];
+    var o2[64];
     tl_op0c(&o2, p2, x0, y1, TL_NP);
     if (syscall(92, &o2, 64) != 0) { return 0 - 202; }
     if (tl_readback(&tl2_r1, x0, y0) != 0) { return 0 - 5; }
@@ -1058,7 +1063,8 @@ fn tl_batch2(): i64 {
     # ---- THE SEAM: both lists in ONE two-op array. len = 2 * GPU_OP_STRIDE = 128. ----
     if (syscall(88, 0xFF101010, (TLH * 65536) + TLW, (y0 * 65536) + x0) != 0) { return 0 - 4; }
     if (syscall(88, 0xFF101010, (TLH * 65536) + TLW, (y1 * 65536) + x0) != 0) { return 0 - 4; }
-    var q[32];
+    # ⛔ 128 BYTES: TWO 64-byte records. Same units trap as o1/o2 above.
+    var q[128];
     tl_op0c(&q,      p1, x0, y0, TL_NP);
     tl_op0c(&q + 64, p2, x0, y1, TL_NP);
     var rq = syscall(92, &q, 128);

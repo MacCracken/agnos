@@ -928,7 +928,43 @@ for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy
         fi
     fi
 done
-echo "  staged tools match their builds (modeset, gpuwedge, gputri, klug)"
+
+# ⛔⛔ AND THE BUILD ITSELF MUST BE NEWER THAN ITS SOURCE. Found 2026-07-27, one level deeper than
+# the gap above and by the same route — a rung whose oracle read as a clean success on stale code.
+#
+# `stage-tools.sh` only COMPILES when passed --build; without it, stage_one copies whatever
+# build/<name>_agnos already exists and prints "staged: ... bytes", which reads exactly like a fresh
+# stage. The cmp loop above then compares that staged copy against the SAME stale artifact and
+# reports MATCH. ⇒ The gate could confirm "staged == built" while both were older than the source.
+#
+# On the rung-14b prep, /bin/gputex was 313448 B with NO col-major code in it (the real build is
+# 331232 B). It would have run rungs 13 and 14, exited 95, and produced ZERO rung-14b evidence.
+# The previous cycle's lesson recurring verbatim: A STALE ORACLE DOES NOT FAIL, IT AGREES.
+_srcstale=0
+for _t in gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy; do
+    _cyr="tests/gpu/$_t.cyr"
+    _bin="tests/gpu/build/${_t}_agnos"
+    [ -f "$_cyr" ] || continue
+    if [ ! -f "$_bin" ]; then
+        echo "burn-prep: NO --agnos BUILD for $_t -- the cmp above SKIPS it, so staleness is invisible."
+        echo "  Fix:  sh scripts/burn/stage-tools.sh --build"
+        _srcstale=1
+        continue
+    fi
+    if [ "$_cyr" -nt "$_bin" ]; then
+        echo "burn-prep: SOURCE NEWER THAN BUILD -- $_cyr is newer than $_bin"
+        echo "  source: $(stat -c%y "$_cyr" | cut -d. -f1)"
+        echo "  build:  $(stat -c%y "$_bin" | cut -d. -f1)"
+        echo "  The staged tool would carry code this burn is NOT for, and would still exit 95."
+        echo "  Fix:  sh scripts/burn/stage-tools.sh --build     (plain stage-tools does NOT compile)"
+        _srcstale=1
+    fi
+done
+[ "$_srcstale" -eq 0 ] || exit 1
+# ⚠ DERIVED, NOT HARDCODED. This line used to name four tools while the loop checked ten — a message
+# that could disagree with the thing it reports on, which is how the gate read as covering gputex
+# when the reader had no way to tell.
+echo "  staged tools match their builds, and every --agnos build is newer than its source"
 case "$BUILD_TAG" in
     *GPU_RECOVER*)
         # ⛔ The staged tool must be able to invoke the arms, or the burn's own oracle is
@@ -953,6 +989,19 @@ for _m in "--cov" "--digest" "--bench"; do
         exit 1
     fi
 done
+# ⛔ RUNG 14b: gputex must carry the COL-MAJOR arm, not merely be fresh. Same doctrine as gputri's
+# --cov/--digest/--bench and gpuwedge's five arms: presence of the tool is not presence of the
+# experiment. A gputex without these strings runs rungs 13 and 14, prints its cases, and exits 95 —
+# a clean green that contains no rung-14b data at all.
+for _m in "COL-MAJOR did not reproduce" "waves: row-major" "1 x 0x0C CM"; do
+    if ! grep -qa -- "$_m" build/rootfs/bin/gputex 2>/dev/null; then
+        echo "burn-prep: STAGED /bin/gputex LACKS '$_m' -- rung 14b's oracle cannot be invoked."
+        echo "  It would still exit 95 on rungs 13+14. Fix:  sh scripts/burn/stage-tools.sh --build"
+        exit 1
+    fi
+done
+echo "  staged /bin/gputex carries the rung-14b col-major arm"
+
 # ⭐ And it must carry the NEGATIVE CONTROLS. A gputri without N1-N8 can still print "20 of 20",
 # and TWO of the twenty corpus cases have an ALL-ZERO correct answer -- so a shader that writes
 # nothing reproduces them byte-exactly. Staging a control-less build makes the burn unfalsifiable.
