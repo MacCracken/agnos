@@ -6,7 +6,7 @@ type: state
 
 # AGNOS — Live State
 
-> **Last refresh**: 2026-07-28 · kernel head **1.56.28** (open) · **▶ ACTIVE — 1.56.x GPU (the one open GPU release; there is no 1.57/1.58/1.59).** Full plan + reference:
+> **Last refresh**: 2026-07-28 · kernel head **1.56.29** (open) · **▶ ACTIVE — 1.56.x GPU (the one open GPU release; there is no 1.57/1.58/1.59).** Full plan + reference:
 [`docs/development/planning/gpu.md`](planning/gpu.md) — the single GPU document. **DONE and shipped:**
 (1) **the ring-3 GPU band has consumers** — aethersafha composites on the GPU (opaque via `#87`, translucent
 via `#92` op 0x01 premultiplied src-over), unblocked by setu 0.6.0/0.7.0 asking `shm_create_gpu` #86 (the
@@ -22,7 +22,27 @@ and `exit 2`s without them, and `scripts/check.sh:86-90` treats exit 2 as drift 
 a box with no LLVM**, quietly reversing ratified decision D-1. Also only **6 of the 17** blobs are gated at
 all (all 17 currently match; it is a coverage gap, not a break). Both are cut 1.56.24. (3) **D-1/D-2/D-4 ratified (1.56.8):**
 llvm-mc rejected; `#92` blend = premultiplied f32, frozen; whole-surface translucency IS a real MUDRA/SHANTA
-requirement → DCN second plane stays a live deferred item. **REMAINING — rebuilt 2026-07-28 as numbered cuts; see [`planning/gpu.md`](planning/gpu.md) § release plan. ⛔ The previous text here was materially false and three agents planned against it:** it called MODESET "recommended next, own the pipe from cold" when **the live-pipe modeset is DONE** (M1-M6 iron-closed 1.56.11/1.56.12; item 7's own criterion `OTG_MASTER_EN` 0→1 met at 1.56.12 — frame counter 2615→0→115, panel blanked and relit), and it twice promised an "L1 discriminator runs first, free" that **had already run and returned VOID** (2026-07-24/25; the positive control did not sound, so it carries zero information — never write it up as "sequencing exonerated"). **✅ 1.56.24 DONE** (zero burns: four real correctness defects + this ledger). **✅ 1.56.25 DONE** (zero burns: dead-code removal + the `EDGE_CAP_PROBE` burn-trap — a profile that built a kernel byte-identical to the default while telling the operator otherwise). **✅✅ 1.56.26 CLOSED ON IRON 2026-07-28** — `F` is **PER-PRIMITIVE, 7.35 µs each**, all of it in `gpu_texl_build`/`gpu_tex_prep` (build is 117× the validate slope). A 640-column DOOM frame carries **4.71 ms of CPU** that no transpose removes; **the GPU is no longer the bottleneck, the CPU prep is, by 52×**. **✅ 1.56.27 CONFIRMED ON IRON** — predicted 3.84, measured **4.21 µs/prim** (band 3.4-4.3); `wait` held flat (+1%) as the control, so the fix was cleanly CPU-only. DOOM CPU 4.71 → **2.71 ms**. Refit WITH a constant term: **85.6 ns/UC-store + 0.79 µs real arithmetic**. **▶ 1.56.28 ARMED — `store64` pairing, 40 → 20 UC stores** (predicted build 4.21 → ~2.50 µs/prim, DOOM CPU → ~1.62 ms). ⛔ The originally-scoped *cached scratch + bulk copy* is STRUCK: `memcpy` copies with `store64` too, so it yields the identical 20 transactions plus an extra pass — the bottleneck is transaction COUNT, and 128-bit stores are barred by the FP-free kernel posture. Prior root cause: Root cause of `F` is that the arena is **UC-mapped** and the prep record cost **76 uncached stores/prim at ~96 ns each**; the zero-fill wrote 40 words to preserve 4 (the explicit stores cover 0..35 contiguously). Narrowed to words 36-39. **Pre-registered prediction: build slope 7.29 → ~3.84 µs/prim, DOOM CPU 4.71 → ~2.46 ms** — falsifiable, written before the burn. Then 1.56.27-30 rungs 15/17/18/19 + the consumer debt, **1.56.31 MODESET's true residual — the COLD case only**, 1.56.32 HDMI audio, 1.56.33 the invalidate hoist. · **HDMI audio: (a) sequencing is ELIMINATED** by M9 (1.56.15 — both arms exit 95 in one boot, DIG_MODE 2→3 readback-verified, ATOM #4 rc 0, #76 DISABLE+ENABLE rc 0); ⛔ the DCCG symbol-clock lead is FALSIFIED (in-boot A/B, burn 11). Surviving candidates: **(b) a write that does not latch · (c) the bare-metal environment.** · **3D — the rung ladder is at 14b, and rung 16 `tile-own` is ALSO done (1.56.17, host, 0 burns).** Rungs 9–13 are IRON-CLOSED
+requirement → DCN second plane stays a live deferred item. **REMAINING — rebuilt 2026-07-28 as numbered cuts; see [`planning/gpu.md`](planning/gpu.md) § release plan. ⛔ The previous text here was materially false and three agents planned against it:** it called MODESET "recommended next, own the pipe from cold" when **the live-pipe modeset is DONE** (M1-M6 iron-closed 1.56.11/1.56.12; item 7's own criterion `OTG_MASTER_EN` 0→1 met at 1.56.12 — frame counter 2615→0→115, panel blanked and relit), and it twice promised an "L1 discriminator runs first, free" that **had already run and returned VOID** (2026-07-24/25; the positive control did not sound, so it carries zero information — never write it up as "sequencing exonerated"). **✅ 1.56.24 DONE** (zero burns: four real correctness defects + this ledger). **✅ 1.56.25 DONE** (zero burns: dead-code removal + the `EDGE_CAP_PROBE` burn-trap — a profile that built a kernel byte-identical to the default while telling the operator otherwise). **✅✅ 1.56.26 CLOSED ON IRON 2026-07-28** — `F` is **PER-PRIMITIVE, 7.35 µs each**, all of it in `gpu_texl_build`/`gpu_tex_prep` (build is 117× the validate slope). A 640-column DOOM frame carries **4.71 ms of CPU** that no transpose removes; **the GPU is no longer the bottleneck, the CPU prep is, by 52×**. **✅ 1.56.27 + ✅✅ 1.56.28 BOTH CLOSED ON IRON 2026-07-28 — `gpu_tex_prep` IS DONE.** The arena is
+**UC-mapped**, and the prep record was costing **76 uncached stores/prim**. Two cuts: narrow the
+zero-fill (76→40, predicted 3.84 / **measured 4.21**) then pair into `store64` (40→20, predicted 2.50 /
+**measured 2.487**). **DOOM CPU 4.71 → 1.61 ms; total `#92` at n=256 3248 → 1421 µs, 2.29×.**
+Corroborated independently by `gputex`'s op 0x0C window (216 → 160 µs = 1.75 µs/prim vs a build-slope
+delta of 1.72). Model, fitted across three store counts: **~86 ns per UC store + 0.79 µs of real
+arithmetic** ⇒ 2.487 is within ~3× of the floor, the last 20 stores need 128-bit stores the FP-free
+kernel posture bars, so **further work here is low-yield — STOP.**
+⛔ The scoped *"cached scratch + bulk copy"* follow-on is **STRUCK, not deferred**: `memcpy` copies its
+aligned bulk with `store64`, so it produces the identical 20 UC transactions plus an extra pass.
+⛔⛔ **AND THE PRE-REGISTERED CONTROL FAILED ON 1.56.28** — `wait` was written down as must-not-move and
+fell 51%. A global GPU speed-up is ruled out (`gputex`'s pure-GPU bench unchanged: 52.0→50.0 µs) and the
+drop is concentrated at high n (`wait @ n=32` +6%, `@ n=256` −43%), so `wait` most likely carries
+**CPU memory-controller backlog from the record writes themselves** — i.e. it was a **badly designed
+control, not a bonus**. ⚠ `build` and `wait` deltas came out *exactly* equal (557 µs); unexplained,
+needs a third primitive count, do not build on it. **⇒ `wait` is not a clean GPU-time measurement at
+high primitive counts and must not be cited as one until it has an independent control.**
+**▶ 1.56.29 OPEN — RUNG 15 `bilinear`.** Zero-burn half first: the CPU reference with IDENTICAL
+rounding (⚠ `v_cvt_pk_u8_f32` clamps negatives to 0 — the reference must clamp the same or the diff is
+unfair) plus a host model of the shader arithmetic, the pattern that landed rungs 9b/11/13.
+Remaining after rung 15: **1.56.30** rungs 17/18/19 + the rung-closure debt, **1.56.31 MODESET's true residual — the COLD case only**, 1.56.32 HDMI audio, 1.56.33 the invalidate hoist. · **HDMI audio: (a) sequencing is ELIMINATED** by M9 (1.56.15 — both arms exit 95 in one boot, DIG_MODE 2→3 readback-verified, ATOM #4 rc 0, #76 DISABLE+ENABLE rc 0); ⛔ the DCCG symbol-clock lead is FALSIFIED (in-boot A/B, burn 11). Surviving candidates: **(b) a write that does not latch · (c) the bare-metal environment.** · **3D — the rung ladder is at 14b, and rung 16 `tile-own` is ALSO done (1.56.17, host, 0 burns).** Rungs 9–13 are IRON-CLOSED
 (edge coverage · attribute interpolation · tri-list · **texturing 17/17 byte-identical, both formats, WRAP,
 FULLCOV**). **⭐⭐⭐ RUNG 14 *AND* 14b ARE BOTH IRON-CLOSED 2026-07-27 (burn 2, exit 95, zero red
 lines).** op 0x0C `TEX_LIST` is byte-identical to 32 individual op 0x0B dispatches; the col-major
@@ -87,7 +107,7 @@ five burns 2026-07-22, then code+flag DELETED — see [[feedback_dlane_five_burn
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.56.28** | [`VERSION`](../../VERSION) |
+| **Kernel** | **1.56.29** | [`VERSION`](../../VERSION) |
 | **Cyrius toolchain pin** | **6.2.36** | `cyrius.cyml [package].cyrius` |
 | **Released** | 2026-07-26 | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | **Iron-validated** | 2026-05-25 (archaemenid NUC AMD — **MVP gate green since Attempt 68 / 1.30.9**; **1.32.x networking arc iron-COMPLETE**: r8169 unicast-RX solved at 1.32.7 + DHCP real lease `.142` iron-verified at 1.32.9; storage trio + GPT + ext4 + shell byte-clean). The 1.33.x ext2/4-WRITE + 1.34.x FAT-family arcs are QEMU/`fsck`-validated; their final-bite iron burns stay user-driven (pending). | NUC AMD Attempts 68 (MVP gate) + 71-77 (FB) + 80-91 (storage arc) + 92+ (networking arc — DHCP iron-verified 1.32.9) |

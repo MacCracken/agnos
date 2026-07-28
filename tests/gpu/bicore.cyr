@@ -1,0 +1,112 @@
+# bicore.cyr — RUNG 15's CPU reference: 4-tap BILINEAR texture filtering, INTEGER-EXACT.
+#
+# ⭐ THIS IS THE ORACLE. The shader is measured against it. Written in the plainest arithmetic that is
+# still exact — same split as rung 13's texcore/texmodel: the reference states WHAT the answer is, the
+# model reproduces it at 32-bit register widths, the shader reproduces the model.
+#
+# ⚠ INCLUDABLE MODULE, NO main(). Cyrius shadows duplicate `fn` silently (last-def-wins, warn only),
+# so a consumer that includes a file carrying its own main() runs the WRONG one and still exits 0.
+# That cost a real debugging session on rung 11. Same split here.
+#
+# ============================================================================================
+# ⛔⛔ THE PLAN SAID FLOAT. IT IS INTEGER, AND THAT IS A DELIBERATE DEVIATION — READ THIS FIRST.
+# ============================================================================================
+# gpu.md's rung-15 row specifies "four `global_load_dword` + `v_cvt_f32_ubyte0..3` + lerp +
+# `v_cvt_pk_u8_f32`", and names its own risk: *"Byte-identical vs a CPU reference using IDENTICAL
+# rounding"*, with the f64-fidelity lesson restated (`v_fma_f64` vs `v_mul`+`v_add` mismatched 29/64
+# cells). That risk is real and it is the whole cost of the float path: matching gfx9's f32 lerp
+# bit-for-bit means matching its rounding at every step, in a reference written in a different
+# language on a different unit.
+#
+# ⭐ A 4-TAP BILINEAR ON 8-BIT TEXELS DOES NOT NEED FLOAT AT ALL, AND THE INTEGER FORM IS *EXACT*,
+# not merely close. With 8-bit fractional weights:
+#
+#     w00 = (256-fx)*(256-fy)   w10 = fx*(256-fy)   w01 = (256-fx)*fy   w11 = fx*fy
+#     out = (t00*w00 + t10*w10 + t01*w01 + t11*w11) >> 16
+#
+# Verified exhaustively on the host before this file was written:
+#   · the weight sum is **exactly 65536 for all 65,536 (fx,fy) pairs** — algebraically
+#     (256-fy)*[(256-fx)+fx] + fy*[(256-fx)+fx] = 256*256 — so a FLAT texture reproduces with ZERO
+#     DC error. A filter that cannot reproduce a flat field is broken in a way no spot-check finds.
+#   · the accumulator peaks at 255*65536 = **16,711,680 ≈ 2^24**, so it fits a 32-bit unsigned lane
+#     with 8 bits of headroom. **No 64-bit multiply is required.**
+#   · `fx=fy=0` returns `t00` bit-exactly for all 256 texel values (corner exactness).
+#
+# ⇒ THE CONSEQUENCES, which are why this is the better design and not just a shortcut:
+#   1. **There is no reference-rounding problem to solve.** The row's named risk is not mitigated,
+#      it is ELIMINATED — there is no float, so there is nothing to round differently.
+#   2. `v_mul_lo_u32` is **already iron-proven** as the `#82` integer MAC. The float path would
+#      introduce `v_cvt_f32_ubyte0..3` and `v_cvt_pk_u8_f32` — the first `v_cvt` in the texturing
+#      shader, which today contains **zero**.
+#   3. It keeps the rung in the everything-is-i64 world the whole arc has been proving.
+#
+# ⚠ FLOAT REMAINS THE FALLBACK, and the condition to reach for it is specific: if a consumer ever
+# needs weights finer than 8 bits (per-axis fractions beyond 1/256), the integer accumulator must
+# widen and the trade changes. For 8-bit texels it does not. Nothing else justifies reopening it.
+# ============================================================================================
+
+include "lib/io.cyr"
+
+var BI_WSHIFT = 16;         # weights sum to 1<<16
+var BI_FBITS  = 8;          # 8-bit fractional weights, 0..255
+
+# bi_frac(uv1616) — the 8-bit weight from a 16.16 coordinate: the top 8 bits of the low 16.
+# ⚠ Truncation, not rounding. The shader does the same shift; a rounded fraction here and a
+# truncated one there is precisely the class of mismatch this rung exists to avoid.
+fn bi_frac(c): i64 { return (c >> 8) & 0xFF; }
+
+# bi_floor(uv1616) — the integer texel index below a 16.16 coordinate.
+# ⚠ `>>>` is ARITHMETIC in Cyrius (inverted from C) — required here because UV may be NEGATIVE and
+# floor(-0.5) must be -1, not 0. Using `>>` would fold negatives to a huge positive and the WRAP
+# below would silently sample the wrong texel. This is the shift trap, applied deliberately.
+fn bi_floor(c): i64 { return c >>> 16; }
+
+# bi_wrap(i, n) — WRAP addressing, correct for negative indices.
+fn bi_wrap(i, n): i64 {
+    var m = i % n;
+    if (m < 0) { m = m + n; }
+    return m;
+}
+
+# bi_lerp4(t00, t10, t01, t11, fx, fy) — the exact 4-tap blend of ONE channel.
+# fx/fy are 0..255. All four texels are 0..255. Result is 0..255, exactly.
+fn bi_lerp4(t00, t10, t01, t11, fx, fy): i64 {
+    var ix = 256 - fx;
+    var iy = 256 - fy;
+    var w00 = ix * iy;
+    var w10 = fx * iy;
+    var w01 = ix * fy;
+    var w11 = fx * fy;
+    # ⚠ `>>` is LOGICAL in Cyrius; correct here because the accumulator is provably non-negative
+    # (every term is a product of non-negatives). An arithmetic shift would also work today, but
+    # stating the reason is what stops a future edit from flipping it on a signed value.
+    return (t00 * w00 + t10 * w10 + t01 * w01 + t11 * w11) >> BI_WSHIFT;
+}
+
+# bi_chan(px, k) — channel k (0=R,1=G,2=B,3=A) out of a packed 32-bit RGBA8 texel.
+fn bi_chan(px, k): i64 { return (px >> (k * 8)) & 0xFF; }
+
+# bi_sample(tex, tw, th, u, v) — one bilinear RGBA8 sample. u/v are 16.16 texel-space, WRAP-addressed.
+# Returns a packed 32-bit texel. tex is a byte address holding tw*th u32 texels.
+fn bi_sample(tex, tw, th, u, v): i64 {
+    var x0 = bi_wrap(bi_floor(u), tw);
+    var y0 = bi_wrap(bi_floor(v), th);
+    var x1 = bi_wrap(x0 + 1, tw);
+    var y1 = bi_wrap(y0 + 1, th);
+    var fx = bi_frac(u);
+    var fy = bi_frac(v);
+
+    var p00 = load32(tex + (y0 * tw + x0) * 4) & 0xFFFFFFFF;
+    var p10 = load32(tex + (y0 * tw + x1) * 4) & 0xFFFFFFFF;
+    var p01 = load32(tex + (y1 * tw + x0) * 4) & 0xFFFFFFFF;
+    var p11 = load32(tex + (y1 * tw + x1) * 4) & 0xFFFFFFFF;
+
+    var out = 0;
+    var k = 0;
+    while (k < 4) {
+        var c = bi_lerp4(bi_chan(p00, k), bi_chan(p10, k), bi_chan(p01, k), bi_chan(p11, k), fx, fy);
+        out = out | ((c & 0xFF) << (k * 8));
+        k = k + 1;
+    }
+    return out & 0xFFFFFFFF;
+}

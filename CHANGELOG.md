@@ -48,7 +48,47 @@ code, in both tools. ⚠ The run list that omitted `--cov` was the primary error
 code is what made it unreadable afterwards. The defect had been flagged in the 1.56.25 source review
 and not acted on.
 
-### Pre-registered
+### ⭐⭐ RESULT — IRON 2026-07-28: PRIMARY CONFIRMED, CONTROL FAILED
+
+```
+gputex        exit 95  -- all four arms IDENTICAL
+gputri --cov  exit 95  -- 20 of 20 byte-identical to refraster, N1-N8 all fired
+gpuprof  LO n=32   build=91us  wait=205us  cpu=95us
+         HI n=256  build=648us wait=762us  cpu=659us
+```
+
+**`build` slope 2.487 µs/prim against a predicted 2.50** (band 2.1–2.9). DOOM CPU **1.61 ms** against a
+predicted 1.62. Corroborated independently: `gputex`'s op 0x0C window went **216 → 160 µs = 1.75
+µs/prim** over 32 primitives, against a build-slope delta of **1.72 µs/prim** — two tools, two code
+paths, same number.
+
+**Total `#92` at n=256 across the three cuts: 3248 → 1421 µs, 2.29×. DOOM CPU 4.71 → 1.61 ms.**
+
+⛔⛔ **THE PRE-REGISTERED CONTROL FAILED, AND IT IS RECORDED AS A FAILURE.** The rubric said in advance
+that `wait` must stay ~5.1 µs/prim because this change is CPU-only, and that GPU time moving would mean
+**contamination, not that the fix was extra good**. It fell 51% (5.071 → 2.487). Reinterpreting that as
+a bonus is the exact move this arc has already been burned for.
+
+What the evidence supports, with its limits:
+- **A global GPU speed-up is RULED OUT** by an independent instrument: `gputex`'s pure-GPU bench (one
+  primitive, minimal prep) is unchanged — 32×32 `52.0 → 50.0 µs`, 256×256 `158.0 → 158.2 µs`.
+- **The drop is concentrated at high primitive counts** — `wait @ n=32` 193 → **205 µs (+6%)**, but
+  `wait @ n=256` 1329 → **762 µs (−43%)**.
+- ⇒ **Most likely `wait` at high n contains CPU-side memory-controller backlog from the record writes
+  themselves** (256 prims × 40 UC stores = 10,240 serialised writes vs 5,120; residual queue still
+  draining when the dispatch is kicked). **If so the control was BADLY DESIGNED rather than violated** —
+  it was never independent of the variable under test. That is an instrument defect, not a discovery.
+- ⚠ **UNEXPLAINED:** at 1.56.28 the `build` and `wait` deltas are *exactly* equal, both **557 µs**.
+  They were 1633/1151 and 943/1136 on the two prior burns, so it is not structural. One burn cannot
+  distinguish µs-granularity coincidence from something real. **Do not build on it.**
+
+**⇒ VERDICT ON THE WORK: `gpu_tex_prep` is DONE.** 2.487 µs/prim against a 0.79 µs arithmetic floor is
+within ~3× of irreducible; the remaining 20 UC stores cannot shrink without 128-bit stores, which the
+FP-free kernel posture bars. Further optimisation here is low-yield.
+**⇒ VERDICT ON THE INSTRUMENT: `wait` is NOT a clean GPU-time measurement at high primitive counts.**
+Before it is used as evidence again it needs a control genuinely independent of CPU store count.
+
+### Pre-registered (as it stood before the burn)
 
 | | 1.56.26 | 1.56.27 | predicted 1.56.28 |
 |---|---|---|---|

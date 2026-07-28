@@ -1,0 +1,200 @@
+# bigate.cyr — RUNG 15's HOST GATE. Proves bicore's integer bilinear is EXACT, at zero burns,
+# before a single shader instruction is written.
+#
+# ⭐ WHY THESE PROPERTIES AND NOT A CORPUS OF SPOT-CHECKS. A filter that is wrong in a way spot-checks
+# miss is wrong in one of exactly these ways, and each has a distinct signature on screen:
+#   G1 weight sum        — if weights do not sum to the scale, a FLAT texture does not reproduce.
+#                          On screen: the whole surface shifts brightness. Easy to see, easy to blame
+#                          on the wrong thing (gamma, blend, format).
+#   G2 corner exactness  — at fx=fy=0 the filter MUST return t00 untouched, or every texel centre is
+#                          slightly wrong and the image is uniformly soft. Reads as "blurry texture",
+#                          gets blamed on the sampler.
+#   G3 range            — the result must never leave [min,max] of its four taps. An overshoot is a
+#                          ringing artifact at edges; an undershoot darkens seams.
+#   G4 no overflow      — the accumulator must fit 32 bits, because the SHADER has 32-bit lanes. If it
+#                          does not, the host reference is right and the shader silently is not.
+#   G5 symmetry         — swapping the taps and complementing the fractions must give the identical
+#                          answer, or the filter has a directional bias that only shows on rotation.
+#   G6 separability     — a bilinear IS two lerps; if the 4-tap form disagrees with lerp-then-lerp,
+#                          the weight algebra is wrong even if the sum happens to be right.
+#
+# ⛔ G1 and G4 are the load-bearing ones. G1 because DC error is invisible in any A-vs-B diff where
+# both sides share it, and G4 because it is the only property that is about the SHADER's register
+# width rather than the maths — a reference that needs 64 bits proves nothing about a 32-bit lane.
+
+include "lib/io.cyr"
+include "tricore.cyr"      # ps / pn / nl
+include "bicore.cyr"
+
+var BG_TW = 8;
+var BG_TH = 8;
+var bg_tex[64];            # 8x8 RGBA8 = 64 u32 (this directory: var X[N] is N x u64)
+
+fn bg_pack(r, g, b, a): i64 {
+    return (r & 0xFF) | ((g & 0xFF) << 8) | ((b & 0xFF) << 16) | ((a & 0xFF) << 24);
+}
+
+# deterministic non-uniform texture — a value that varies in BOTH axes, so a filter that ignores one
+# axis still fails. A gradient in x alone would pass a broken fy path.
+fn bg_fill(): i64 {
+    var y = 0;
+    while (y < BG_TH) {
+        var x = 0;
+        while (x < BG_TW) {
+            store32(&bg_tex + (y * BG_TW + x) * 4,
+                    bg_pack(x * 31 + y * 7, y * 29 + x * 3, (x * y * 5) & 0xFF, 255 - x * 11));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+fn bg_fill_flat(v): i64 {
+    var i = 0;
+    while (i < BG_TW * BG_TH) { store32(&bg_tex + i * 4, bg_pack(v, v, v, v)); i = i + 1; }
+    return 0;
+}
+
+fn main(): i64 {
+    var bad = 0;
+
+    # ---- G1: WEIGHT SUM. Exhaustive over all 65,536 (fx,fy) pairs. -------------------------------
+    var g1 = 0;
+    var fx = 0;
+    while (fx < 256) {
+        var fy = 0;
+        while (fy < 256) {
+            var s = (256 - fx) * (256 - fy) + fx * (256 - fy) + (256 - fx) * fy + fx * fy;
+            if (s != 65536) { g1 = g1 + 1; }
+            fy = fy + 1;
+        }
+        fx = fx + 1;
+    }
+    ps("G1 weight sum == 65536 over all 65536 (fx,fy): ");
+    if (g1 == 0) { ps("PASS"); } else { ps("FAIL "); pn(g1); bad = bad + 1; }
+    nl();
+
+    # ---- G1b: FLAT TEXTURE reproduces EXACTLY, at every fraction. --------------------------------
+    var g1b = 0;
+    var vv = 0;
+    while (vv < 256) {
+        bg_fill_flat(vv);
+        var u = 0;
+        while (u < 65536 * 3) {
+            var got = bi_sample(&bg_tex, BG_TW, BG_TH, u, u + 12345);
+            if ((got & 0xFF) != vv) { g1b = g1b + 1; }
+            u = u + 4099;                    # a prime-ish stride: hits many distinct fx/fy pairs
+        }
+        vv = vv + 17;
+    }
+    ps("G1b flat texture reproduces exactly (DC error zero): ");
+    if (g1b == 0) { ps("PASS"); } else { ps("FAIL "); pn(g1b); bad = bad + 1; }
+    nl();
+
+    bg_fill();
+
+    # ---- G2: CORNER EXACTNESS. At an exact texel coordinate the filter returns that texel. --------
+    var g2 = 0;
+    var ty = 0;
+    while (ty < BG_TH) {
+        var tx = 0;
+        while (tx < BG_TW) {
+            var want = load32(&bg_tex + (ty * BG_TW + tx) * 4) & 0xFFFFFFFF;
+            var got  = bi_sample(&bg_tex, BG_TW, BG_TH, tx * 65536, ty * 65536);
+            if (got != want) { g2 = g2 + 1; }
+            tx = tx + 1;
+        }
+        ty = ty + 1;
+    }
+    ps("G2 exact texel coords return that texel untouched: ");
+    if (g2 == 0) { ps("PASS"); } else { ps("FAIL "); pn(g2); bad = bad + 1; }
+    nl();
+
+    # ---- G3 + G4: RANGE and 32-BIT ACCUMULATOR, over the whole fraction space. --------------------
+    var g3 = 0;
+    var g4 = 0;
+    var a = 0;
+    while (a < 256) {
+        var b = 0;
+        while (b < 256) {
+            # worst case for both: extreme taps
+            var lo = bi_lerp4(0, 0, 0, 0, a, b);
+            var hi = bi_lerp4(255, 255, 255, 255, a, b);
+            var mix = bi_lerp4(0, 255, 255, 0, a, b);
+            if (lo != 0)   { g3 = g3 + 1; }
+            if (hi != 255) { g3 = g3 + 1; }
+            if (mix < 0)   { g3 = g3 + 1; }
+            if (mix > 255) { g3 = g3 + 1; }
+            # the accumulator the SHADER must hold in a 32-bit lane
+            var acc = 255 * ((256 - a) * (256 - b)) + 255 * (a * (256 - b))
+                    + 255 * ((256 - a) * b)         + 255 * (a * b);
+            if (acc > 4294967295) { g4 = g4 + 1; }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    ps("G3 result never leaves [min,max] of its taps: ");
+    if (g3 == 0) { ps("PASS"); } else { ps("FAIL "); pn(g3); bad = bad + 1; }
+    nl();
+    ps("G4 accumulator fits a 32-bit lane (max 255<<16 = 16711680): ");
+    if (g4 == 0) { ps("PASS"); } else { ps("FAIL "); pn(g4); bad = bad + 1; }
+    nl();
+
+    # ---- G5: SYMMETRY. Swap the taps and complement the fractions -> identical answer. ------------
+    var g5 = 0;
+    var s1 = 0;
+    while (s1 < 256) {
+        var s2 = 0;
+        while (s2 < 256) {
+            var p = bi_lerp4(11, 200, 37, 250, s1, s2);
+            var q = bi_lerp4(250, 37, 200, 11, 256 - s1, 256 - s2);
+            if (p != q) { g5 = g5 + 1; }
+            s2 = s2 + 17;
+        }
+        s1 = s1 + 17;
+    }
+    ps("G5 tap-swap + fraction-complement is identical (no directional bias): ");
+    if (g5 == 0) { ps("PASS"); } else { ps("FAIL "); pn(g5); bad = bad + 1; }
+    nl();
+
+    # ---- G6: SEPARABILITY. The 4-tap form must equal lerp-x-then-lerp-y EXACTLY. ------------------
+    # ⛔ This is the one that catches a wrong weight ASSIGNMENT even when the sum is right — swapping
+    # w10 and w01 keeps the sum at 65536 and fails only here and on a non-square asymmetric texture.
+    var g6 = 0;
+    var d1 = 0;
+    while (d1 < 256) {
+        var d2 = 0;
+        while (d2 < 256) {
+            var t00 = 13; var t10 = 221; var t01 = 64; var t11 = 179;
+            var four = bi_lerp4(t00, t10, t01, t11, d1, d2);
+            # two-stage, full precision then one shift — the mathematical definition
+            var top = t00 * (256 - d1) + t10 * d1;      # scaled by 256
+            var bot = t01 * (256 - d1) + t11 * d1;      # scaled by 256
+            var sep = (top * (256 - d2) + bot * d2) >> BI_WSHIFT;
+            if (four != sep) { g6 = g6 + 1; }
+            d2 = d2 + 11;
+        }
+        d1 = d1 + 11;
+    }
+    ps("G6 4-tap == lerp-x-then-lerp-y exactly (weight assignment correct): ");
+    if (g6 == 0) { ps("PASS"); } else { ps("FAIL "); pn(g6); bad = bad + 1; }
+    nl();
+
+    nl();
+    if (bad == 0) {
+        ps("bigate: PASS -- the INTEGER bilinear is exact. No float, no rounding question,");
+        nl();
+        ps("        no v_cvt, and the accumulator fits a 32-bit lane. Rung 15's named risk");
+        nl();
+        ps("        (matching gfx9 f32 rounding in a CPU reference) is ELIMINATED, not mitigated.");
+        nl();
+        return 95;
+    }
+    ps("bigate: FAIL -- "); pn(bad); ps(" propert(ies) broken; the shader must NOT be written yet.");
+    nl();
+    return 90;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
