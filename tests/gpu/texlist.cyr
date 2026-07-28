@@ -53,10 +53,22 @@ var tl_shift = 0;
 var tl_maxh = 0;
 var tl_maxw = 0;
 
+# ⭐ RUNG 14b — THE LANE AXIS. 0 = lanes walk X (op 0x0C row-major, kernel/shaders/tex_list.s),
+# 1 = lanes walk Y (COLMAJOR, kernel/shaders/tex_list_cm.s). The model below is written the way the
+# SHADER is: the guards compare against a per-lane bound and a wave-uniform bound, never against a
+# thing named "width" or "height". That is what makes one swap transpose all of them at once, and it
+# is why the two blobs differ in only 7 shipped dwords.
+var tl_cm = 0;
+
 # ---- mutation switches: each disables one guard the prologue actually emits ----
 var tlm_noph = 0;                  # drop the `py >= ph` early exit
 var tlm_nopw = 0;                  # drop the `px >= pw` exec mask
 var tlm_shift0 = 0;                # force tile_shift = 0 regardless of width
+# ⭐ RUNG 14b's two mutations, and they map ONE-TO-ONE onto the two windows that are the entire
+# difference between the two blobs. A single "transpose not applied" switch would have conflated
+# them, and the two failures localise to different files' worth of work.
+var tlm_nowinp = 0;                # window P not applied: bounds stay row-major under COLMAJOR
+var tlm_nowinb = 0;                # window B not applied: address stays row-major under COLMAJOR
 
 fn tl_reset(): i64 {
     var i = 0;
@@ -89,7 +101,12 @@ fn tl_prep(): i64 {
         i = i + 1;
     }
 
-    var tiles = (tl_maxw + 63) / 64;
+    # ⭐ tile_shift COMES FROM THE LANE AXIS, whichever that is — max(pw) row-major, max(ph)
+    # col-major. This is the same one-line choice gpu_tex_list makes, and getting it backwards is
+    # not a wrong picture but a grid the wave cap never bounded.
+    var laxis = tl_maxw;
+    if (tl_cm != 0) { laxis = tl_maxh; }
+    var tiles = (laxis + 63) / 64;
     tl_shift = 0;
     while ((1 << tl_shift) < tiles) { tl_shift = tl_shift + 1; }
     if (tlm_shift0 != 0) { tl_shift = 0; }
@@ -101,35 +118,67 @@ fn tl_prep(): i64 {
 fn tl_run(): i64 {
     var writes = 0;
     var gx = tl_n << tl_shift;
+    # gy is the count of the WAVE-UNIFORM axis: rows (max ph) row-major, columns (max pw) col-major.
+    var gy = tl_maxh;
+    if (tl_cm != 0) { gy = tl_maxw; }
     var tgx = 0;
     while (tgx < gx) {
         var prim = tgx >> tl_shift;
         var tile = tgx - (prim << tl_shift);
-        # ⚠ A shift too small makes `prim` collide. The model must NOT clamp here — clamping would
-        # hide exactly the defect this file exists to catch.
+        # ⚠ NOT REACHABLE, AND KEPT ANYWAY — with gx = tl_n << tl_shift, `tgx >> tl_shift` is always
+        # below tl_n even under tlm_shift0, which mutates the shift BEFORE gx is formed. The earlier
+        # note here claimed this line catches a `prim` collision; it does not, and the shift-0
+        # mutation goes red by TRUNCATION instead (a 129-wide primitive gets only its first 64
+        # columns). Left as a belt for a future case that forms gx independently.
         if (prim >= tl_n) { prim = tl_n - 1; }
         var pw = load64(&tl_pw + prim * 8);
         var ph = load64(&tl_ph + prim * 8);
         var off = load64(&tl_off + prim * 8);
 
+        # ⭐ WINDOW P, MODELLED. The shader keeps the per-lane bound in s6 and the wave-uniform bound
+        # in s7, and col-major differs ONLY in which half of the packed pwh dword lands where. Every
+        # guard below reads these two, never pw/ph by name — the same property that lets one 3-dword
+        # swap transpose the whole prologue.
+        var lane_bound = pw;
+        var unif_bound = ph;
+        if (tl_cm != 0) {
+            lane_bound = ph;
+            unif_bound = pw;
+            if (tlm_nowinp != 0) { lane_bound = pw; unif_bound = ph; }
+        }
+
         var tgy = 0;
-        while (tgy < tl_maxh) {
+        while (tgy < gy) {
             var run_row = 1;
-            if (tlm_noph == 0) { if (tgy >= ph) { run_row = 0; } }
+            if (tlm_noph == 0) { if (tgy >= unif_bound) { run_row = 0; } }
             if (run_row != 0) {
                 var lane = 0;
                 while (lane < 64) {
-                    var px = tile * 64 + lane;
+                    # the PER-LANE coordinate: rect-local column row-major, rect-local ROW col-major
+                    var lc = tile * 64 + lane;
                     var live = 1;
-                    if (tlm_nopw == 0) { if (px >= pw) { live = 0; } }
+                    if (tlm_nopw == 0) { if (lc >= lane_bound) { live = 0; } }
                     if (live != 0) {
+                        # ⭐ WINDOW B, MODELLED. Which of (lc, tgy) is x and which is y is the whole
+                        # of the second edit window — the shader forms py*pitch + px*4 either way,
+                        # and only the register feeding each term moves.
+                        var x = lc;
+                        var y = tgy;
+                        if (tl_cm != 0) {
+                            x = tgy;
+                            y = lc;
+                            if (tlm_nowinb != 0) { x = lc; y = tgy; }
+                        }
                         # local hit counter — proves per-primitive coverage.
                         # ⚠ Only pixels INSIDE the primitive get a local slot; a mutation that
                         # writes outside is caught by the screen map instead, which is why both
                         # maps exist.
-                        if (px < pw) {
-                            if (tgy < ph) {
-                                var li = load64(&tl_base + prim * 8) + tgy * pw + px;
+                        # ⚠ THIS GUARD TRANSPOSES WITH THE REST. Leaving it reading (lc, tgy) while
+                        # the address reads (x, y) would index the local map from the wrong pair and
+                        # quietly re-grade the very mutation it is meant to expose.
+                        if (x < pw) {
+                            if (y < ph) {
+                                var li = load64(&tl_base + prim * 8) + y * pw + x;
                                 if (li >= 0) {
                                     if (li < 262144) {
                                         store8(&tl_hit + li, (load8(&tl_hit + li) & 0xFF) + 1);
@@ -138,7 +187,7 @@ fn tl_run(): i64 {
                             }
                         }
                         # screen hit counter — proves the address arithmetic lands in the rect
-                        var byteoff = off + tgy * TL_PITCH + px * 4;
+                        var byteoff = off + y * TL_PITCH + x * 4;
                         var si = byteoff / 4;
                         if (si >= 0) {
                             if (si < 65536) {
@@ -215,11 +264,15 @@ fn tl_case(label, llen): i64 {
         want = want + load64(&tl_pw + i * 8) * load64(&tl_ph + i * 8);
         i = i + 1;
     }
+    var gy = tl_maxh;
+    if (tl_cm != 0) { gy = tl_maxw; }
     ps("  "); print(label, llen);
+    if (tl_cm != 0) { ps(" [CM]"); }
+    if (tl_cm == 0) { ps(" [RM]"); }
     ps("  n="); pn(tl_n);
     ps(" shift="); pn(tl_shift);
     ps(" gx="); pn(tl_n << tl_shift);
-    ps(" gy="); pn(tl_maxh);
+    ps(" gy="); pn(gy);
     ps("  writes="); pn(writes); ps("/"); pn(want);
     if (lbad == 0) {
         if (sbad == 0) {
@@ -310,6 +363,40 @@ fn main(): i64 {
     fails = fails + tl_case("degenerate: a single 1x1 primitive         ", 44);
     nl();
 
+    # ---- RUNG 14b: THE SAME GEOMETRY, LANES ON Y ----------------------------------------------
+    # ⭐ THE POINT OF THE WHOLE RUNG, VISIBLE IN THE gx/gy COLUMNS ABOVE. A 64-column DOOM seg
+    # row-major launches gx=64 by gy=max(ph)=63 = 4032 wavefronts to shade 3264 pixels, each wave
+    # lighting ONE of its 64 lanes. Col-major it is gx=64 by gy=max(pw)=1 = 64 wavefronts for the
+    # same pixels. Iron measured 177 ns per LAUNCHED wave against 22 ns per additional WORKING one,
+    # which is why the wave COUNT is the number that matters and not the pixel count.
+    #
+    # ⚠ EVERY CASE HERE IS THE SAME GEOMETRY AS A ROW-MAJOR CASE ABOVE. Identical rects, identical
+    # coverage requirement, only the axis moved — so a difference in the verdict can only come from
+    # the transpose. A col-major-only shape would have proven the model self-consistent and nothing
+    # about the transpose.
+    ps("COL-MAJOR (lanes walk Y; tile_shift from max(ph), gy from max(pw)):"); nl();
+    tl_cm = 1;
+    tl_doom(64);    fails = fails + tl_case("DOOM: 64 columns, 1 px wide, ragged heights", 44);
+    tl_doom(7);     fails = fails + tl_case("DOOM: 7 columns (odd count)                ", 44);
+    tl_sprites(16); fails = fails + tl_case("sprites: 16 uniform 16x16                  ", 44);
+    tl_mixed(16);   fails = fails + tl_case("mixed widths 1/17/64/63                    ", 44);
+    tl_wide();      fails = fails + tl_case("wide: 65 / 128 / 129 / 1 px                ", 44);
+    # ⭐ THE TALL CASE — the one where col-major needs tile_shift > 0 and row-major does not. A
+    # 200-row column is ceil(200/64) = 4 tiles on the lane axis, so this is the ONLY shape here that
+    # exercises the multi-tile path in the transposed orientation. Without it, `ph > 64` would ship
+    # untested, and the plan's own failure table names "wrong only for ph > 64" as a distinct
+    # symptom with a distinct cause.
+    tl_n = 3;
+    store64(&tl_pw + 0 * 8, 1);   store64(&tl_ph + 0 * 8, 200);
+    store64(&tl_px + 0 * 8, 0);   store64(&tl_py + 0 * 8, 0);
+    store64(&tl_pw + 1 * 8, 1);   store64(&tl_ph + 1 * 8, 65);
+    store64(&tl_px + 1 * 8, 1);   store64(&tl_py + 1 * 8, 0);
+    store64(&tl_pw + 2 * 8, 2);   store64(&tl_ph + 2 * 8, 129);
+    store64(&tl_px + 2 * 8, 2);   store64(&tl_py + 2 * 8, 0);
+    fails = fails + tl_case("tall: ph 200 / 65 / 129 (shift > 0 on Y)   ", 44);
+    tl_cm = 0;
+    nl();
+
     if (fails != 0) {
         ps("texlist: FAIL -- the grid mapping is wrong; do NOT burn op 0x0C."); nl();
         return 86;
@@ -351,15 +438,41 @@ fn main(): i64 {
     tlm_shift0 = 0;
     mut = mut + m3;
 
+    # ---- RUNG 14b: one mutation per EDIT WINDOW ------------------------------------------------
+    # ⭐ TWO, NOT ONE. A single "transpose not applied" switch would go red for either window and
+    # localise to neither. tex_list_cm.s differs from tex_list.s in exactly two places, so the
+    # falsification has exactly two arms, and each names the file region to go read.
+
+    # 4. window P not applied — the bounds stay row-major while the ADDRESS transposes. On iron this
+    # is "the flag reached the record but not the bound unpack": every 1-px column admits only lane
+    # 0, so each primitive paints a single pixel and the picture is a sparse dotted line.
+    tl_cm = 1;
+    tlm_nowinp = 1;
+    tl_doom(64);
+    var m4 = tl_case("MUT window P (expect RED: bounds not transposed)  ", 49);
+    tlm_nowinp = 0;
+
+    # 5. window B not applied — the bounds transpose but the ADDRESS stays row-major. This is the
+    # nastier one: coverage per primitive is still 64 lanes wide, so the wave count looks RIGHT and
+    # only the destination is wrong. It writes a column's pixels along a ROW, straight through the
+    # neighbouring primitives' rects — which the screen map catches and the local map alone would
+    # under-report.
+    tlm_nowinb = 1;
+    tl_doom(64);
+    var m5 = tl_case("MUT window B (expect RED: address not transposed) ", 49);
+    tlm_nowinb = 0;
+    tl_cm = 0;
+    mut = mut + m4 + m5;
+
     nl();
-    if (mut != 3) {
+    if (mut != 5) {
         ps("texlist: FAIL -- only "); pn(mut);
-        ps(" of 3 mutations went red. A guard is unexercised, so this file"); nl();
+        ps(" of 5 mutations went red. A guard is unexercised, so this file"); nl();
         ps("  is reporting confidence it has not earned. Fix the CASES, not the mutations."); nl();
         return 86;
     }
-    ps("⭐ All 3 mutations RED: the ph guard, the pw exec mask and the tile shift are each"); nl();
-    ps("  load-bearing, and this file would have caught any of them going missing."); nl();
+    ps("⭐ All 5 mutations RED: the ph guard, the pw exec mask, the tile shift and BOTH col-major"); nl();
+    ps("  edit windows are each load-bearing, and this file would have caught any going missing."); nl();
     nl();
     ps("texlist: PASS -- op 0x0C's grid mapping is exact and its guards are proven necessary."); nl();
     return 95;

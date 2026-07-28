@@ -5,9 +5,139 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.56.23] - 2026-07-27
 
-**Rung 14's oracle (open cycle).** 1.56.22 closed rung 13 and met rung 14's addressing requirements
-on iron. This cycle answers the question the whole rung rests on. Bumped on cycle open; the user
-tags on close.
+**Rung 14's oracle, then rung 14b (open cycle).** 1.56.22 closed rung 13 and met rung 14's
+addressing requirements on iron. This cycle answers the question the whole rung rests on — and then
+builds what the answer demanded. Bumped on cycle open; the user tags on close.
+
+### ⭐⭐ RUNG 14b — `GPU_TEX_FLAG_COLMAJOR`, built because the measurement said to
+
+Rung 14's burn measured **177 ns per LAUNCHED wavefront against 22 ns per additional WORKING one** —
+launch dominates 8:1, so the cost is the grid you launch and very nearly not the pixels you shade. A
+1-px DOOM column lights ONE of 64 lanes, putting a 640-column frame at **24.5 ms of a 28.6 ms
+budget**. `GPU_TEX_FLAG_COLMAJOR` (0x08) transposes the lane axis so lanes walk Y: the same frame is
+**2 560 waves = 0.51 ms, 50× fewer**.
+
+⭐ **The deferral worked exactly as designed.** The flag was named in `GPU_TEXL_MAX_WAVES`'s own
+comment and *deliberately left unbuilt* pending a measurement. The measurement arrived and said
+build it. Building it on the guess would have been right for the wrong reason.
+
+**The oracle now shows the thesis directly** — same geometry, one bit apart:
+
+| | launched waves | pixels shaded |
+|---|---|---|
+| 64 DOOM columns, row-major | gx 64 × gy 63 = **4 032** | 3 280 |
+| 64 DOOM columns, col-major | gx 64 × gy 1 = **64** | 3 280 |
+
+### ⭐⭐ A THIRD BLOB, DERIVED RATHER THAN COPIED
+
+`kernel/shaders/tex_list_cm.s` is **generated** by `scripts/check/texl-cm-derive.py`, and re-running
+that script in `check` mode *is* the gate. Measured: **451 of 458 shipped dwords bit-identical** to
+`tex_list`, differing in exactly two runs — `[(29,31), (385,388)]` — with `.rodata` **byte-identical**,
+so RSRC1/RSRC2 carry over and the shipped dispatcher issues it with **no PM4 change**. All seven
+changed dwords were hand-decoded from the disassembly and mean what the source says.
+
+⛔ **It CANNOT claim tex_list's character-identical-body property, and the plan assumed it could.**
+Window B — the destination address — sits *inside* the `marker → s_endpgm` body region, because
+col-major forms `v1*pitch + s9*4` where row-major forms `s9*pitch + v1*4`. So 14b claims the weaker,
+still-mechanical property "identical to `tex_list.s` except two **declared** windows". It also needs
+its own gate: `texl-body-identity.sh` asserts the differing dwords form a contiguous **prefix**, which
+is true for a prologue-only difference and **fails this pair by construction** (7 ≠ 389).
+
+⭐ **The transpose ships no new arithmetic.** Feeding `gpu_tex_prep` the vertices with x/y swapped
+*is* the transpose — re-derived from the function rather than assumed: `cross' = −cross` so
+`sgn' = −sgn` and `a2` is unchanged; `kxb' = kyb`, `kxc' = kyc`, `k0b`/`k0c` invariant. Four record
+dwords move, and `E_B' = kxb'·py + kyb'·px + k0b = E_B` — same edge value at the same physical pixel,
+so the barycentric weights still pair with vertex B and the winding flip does not permute them.
+
+### ⛔ THE SAFETY BOUND NOW RUNS WHERE THE PACKET IS BUILT
+
+`gpu_tex_list` bounds the grid **it is about to launch**, not the one another file predicted.
+`gpo_validate_texlist` computes the same quantity, but duplicating a safety bound across two files
+behind a "keep these in step" comment is a request, not a guarantee — and `gpo_execute` reaches the
+dispatch with **no `gpo_validate` in front of it** on a shipping in-tree path. The consequence is not
+a wrong picture but a grid up to 64× over the cap, which on this silicon is a wedged queue with no
+pointer back.
+
+Also paid off here: the reserved tail checked **1 of its 6 dwords**. `+76..+92` were accepted and
+ignored — the one thing an extension point must never do, and pointed at directly because that
+extension point is the stated reason COLMAJOR stays per-primitive rather than moving to the header.
+
+### ⛔⛔ THE PLAN'S OWN TEST CASE WAS ILLEGAL *AND* VACUOUS — three reviewers, independently
+
+The pre-registered wave-cap case ("mirror the row-major reject by transposing 2048×1024") **would
+have gone red on a correct kernel**, twice over:
+
+- **Illegal.** The battery validates against a 2560×1440 framebuffer and `py + ph > fbh` is checked
+  *inside* the per-primitive loop, ~50 lines before the wave bound. A 2048-tall primitive returns
+  `GPO_E_DIM` and never reaches the cap.
+- **Vacuous.** `2048 = 2×1024` and `ceil(2048/64) = 2×ceil(1024/64)`, so `lt` rises by exactly 1
+  while the row count halves and **the product is invariant**. Any primitive whose dimensions are
+  both multiples of 64 in a power-of-two ratio scores identically under both formulas.
+
+Replaced with **nine at 1024 × 1088** — `ceil(1088/64) = 17`, just past a power of two, which breaks
+the symmetry. Same nine records, one flag bit apart, opposite verdicts: 156 672 waves row-major
+(accept) vs 294 912 col-major (`GPO_E_WORK`). **Negative-controlled**: a validator patched to ignore
+the flag turns exactly that one case red and leaves its row-major twin green.
+
+⚠ The existing "nine 1-px columns" accept **cannot** witness the swap — 144 waves col-major, 9 216
+row-major, both under the cap — so it passes on a kernel that ignores the flag entirely.
+
+### ⛔ AND THE BATTERY CAUGHT ITS OWN OBSOLESCENCE
+
+`"texl: primitive unknown flag bit"` seeded `0x08`, which 14b **defines**. It went red wanting
+`GPO_E_RESERVED` and getting `GPO_E_MIXMODE`. Moved to `0x10`: the case must always name the lowest
+still-undefined bit, so it moves every time the vocabulary grows.
+
+`GPO_E_MIXMODE` (28) is its own code because the fix is **split the list**, not flip a bit — every
+flag is individually legal and it is their *disagreement* that is not executable. Checked in **both
+directions**, mutating primitive **[1]**: the dangerous one is a row-major primitive 0 followed by a
+COLMAJOR primitive 1, where a driver sampling only primitive 0 would dispatch row-major and silently
+**discard** the flag.
+
+**ABI battery 83 → 89, all green in QEMU.**
+
+### ⭐ FIVE MUTATIONS, AND THE TWO NEW ONES BEHAVE DIFFERENTLY
+
+`texlist.cyr` grows col-major cases (including a `ph = 200/65/129` case — the only shape that
+exercises multi-tile on Y) and **two** mutations mapping 1:1 onto the two edit windows, because one
+"transpose not applied" switch would go red for either and localise to neither:
+
+| mutation | writes | signature |
+|---|---|---|
+| window P (bounds not transposed) | **64** / 3280 | one pixel per column — a sparse dotted line |
+| window B (address not transposed) | **3280** / 3280 | *right count, wrong places* — only the screen map catches it |
+
+Window B is the nasty one: the wave count and the write count both look correct.
+
+### ⛔ TWO GATES THAT COULD NOT FAIL
+
+- **`check.sh:89` had regressed a bug this file's own header documents fixing.** The
+  texl-body-identity gate — the entire safety argument for rung 14's shader copy — shipped with the
+  bare `; rc=$?` form under `set -e`. Verified by test: it *aborts the run*, so no FAIL line, no
+  later gates, no summary. From rung 14 until now that gate **could not report a failure**. A
+  one-time sweep does not hold this invariant; only a mutation test does.
+- **Nothing ever RAN `tests/gpu/*.cyr`.** They were scanned by `check-array-sizing.sh` and cited by
+  `shader-blob.sh`, and never executed. New `scripts/check/host-gpu-oracles.sh` runs `texlist` and
+  demands exit 95 (3 s). Scope stated honestly: `texlist` only — doomcol, doomwall, texmodel/texgate,
+  edgemodel and refraster remain unwired, which is a separate bite.
+
+Every gate added here was **mutation-tested**, including one that first *crashed* instead of failing
+— the exact shape `check.sh` warns about.
+
+### ⚠ NOT YET MEASURED
+
+The iron instrument is built and staged but **nothing has run on hardware**. `gputex` gains a
+col-major arm whose oracle is the row-major arm (already proven byte-identical to 32 individual
+op 0x0B dispatches), so it inherits that proof and adds no new arithmetic: **the same records, one
+bit different, must render byte-identically** — the kernel does the transpose. It prints both wave
+counts so the burn checks the *mechanism* and not just the clock. Pre-registered on this geometry:
+**1 536 waves row-major vs 64 col-major (24×)**; from the measured coefficients, ~306 µs vs ~13 µs.
+
+⚠ Two coverage limits, named rather than papered over: col-major's **wave-uniform** guard needs
+*varying widths*, which this fixed-width geometry cannot provide (`texlist.cyr`'s mixed/wide cases
+cover it on the host); and four encoding classes in the changed dwords have **one** assembler, not
+the tree's standing two — though 14b introduces no new class, only new operand fields in opcodes
+already shipping in the iron-proven row-major blob.
 
 ### ⛔⛔ THE PLAN'S "WALLS AS TEXTURED QUADS" PREMISE IS REFUTED — measured, not argued
 

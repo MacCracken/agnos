@@ -105,6 +105,12 @@ python3 "$ROOT/scripts/check/texl-cm-derive.py" check >/tmp/texl-cm.log 2>&1 && 
 check "rung 14b's col-major shader is the declared derivation" $rc
 [ $rc -eq 0 ] || cat /tmp/texl-cm.log
 
+# The host oracle for the op 0x0C grid mapping. ⚠ Until now NOTHING ran tests/gpu/*.cyr — they were
+# scanned and cited but never executed, so a red oracle stayed invisible until someone remembered it.
+sh "$ROOT/scripts/check/host-gpu-oracles.sh" >/tmp/host-gpu.log 2>&1 && rc=0 || rc=$?
+check "host GPU oracles pass (op 0x0C grid mapping + its 5 mutations)" $rc
+[ $rc -eq 0 ] || cat /tmp/host-gpu.log
+
 # Call arity. cycc WARNS on an argument-count mismatch and builds anyway, so a wrong call ships green.
 # Wired in 2026-07-22 after the 1.56.x audit found gpu_blend_cov_run declared with 12 parameters and
 # called with 11 at BOTH coverage sites — including gpu_cov_surface. (⚠ That worker was described here as

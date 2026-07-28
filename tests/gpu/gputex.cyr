@@ -566,7 +566,21 @@ var TL_NP = 32;                 # primitives per list — 32 two-px columns span
 var tl_prims[384];              # 32 x 96 B = 3072 B   (measured sizing: N x u64 in this directory)
 var tl_a[1536];                 # 64*48*4 = 12288 B — the op 0x0B rendering
 var tl_b[1536];                 # the op 0x0C rendering
+var tl_c[1536];                 # rung 14b: the op 0x0C COL-MAJOR rendering
 var tl_v[16];                   # one 48-byte vtx record, reused per individual dispatch
+
+# tl_maxph — the tallest column in the list. Needed to state the WAVE COUNTS, which are the number
+# rung 14b is actually about: iron measured 177 ns per LAUNCHED wave against 22 ns per additional
+# WORKING one, so the grid you launch is the cost and the pixels you shade very nearly are not.
+fn tl_maxph(ragged): i64 {
+    var m = 0;
+    var c = 0;
+    while (c < TL_NP) {
+        if (tl_ph(c, ragged) > m) { m = tl_ph(c, ragged); }
+        c = c + 1;
+    }
+    return m;
+}
 
 # tl_col_frame — column c's affine frame, RECT-LOCAL to its own (pw x TLH) strip.
 # Each column samples a different slice of the texture so a mis-indexed record shows as a WRONG
@@ -604,7 +618,7 @@ fn tl_pack_vtx(c, ragged): i64 {
 # ⚠ TAKES ITS DESTINATION so the two-op seam case below can build a SECOND list through this exact
 # code. A hand-rolled copy of the packing for the second list would be a second thing to get wrong,
 # and the whole argument of that case is that the two lists differ ONLY where it intends them to.
-fn tl_pack_prims_at(dst, tid, lid, idx8, x0, y0, ragged): i64 {
+fn tl_pack_prims_at(dst, tid, lid, idx8, x0, y0, ragged, cm): i64 {
     var w = tl_pw();
     var c = 0;
     while (c < TL_NP) {
@@ -619,6 +633,13 @@ fn tl_pack_prims_at(dst, tid, lid, idx8, x0, y0, ragged): i64 {
         store32(b + 16, (TXD * 65536) + TXD);
         var fl = 2;                                  # FULLCOV — mandatory for this op
         if (idx8 != 0) { fl = fl + 1; }
+        # ⭐ RUNG 14b: COLMAJOR IS THE **ONLY** FIELD THAT CHANGES, and that is the entire test.
+        # The caller does NOT transpose anything — geometry, origins, UVs and the affine frame are
+        # byte-for-byte what the row-major list carries. gpu_texl_build performs the transpose
+        # kernel-side by feeding gpu_tex_prep the vertices with x/y swapped. So "the same records
+        # plus one bit must draw the same picture" is a property ring 3 can state and check, and any
+        # divergence is the kernel's, not the test's.
+        if (cm != 0) { fl = fl + 8; }
         store32(b + 20, fl);
         store32(b + 24, 0);                    store32(b + 28, 0);
         store32(b + 32, w * 65536);            store32(b + 36, 0);
@@ -631,8 +652,8 @@ fn tl_pack_prims_at(dst, tid, lid, idx8, x0, y0, ragged): i64 {
     return 0;
 }
 
-fn tl_pack_prims(tid, lid, idx8, x0, y0, ragged): i64 {
-    return tl_pack_prims_at(&tl_prims, tid, lid, idx8, x0, y0, ragged);
+fn tl_pack_prims(tid, lid, idx8, x0, y0, ragged, cm): i64 {
+    return tl_pack_prims_at(&tl_prims, tid, lid, idx8, x0, y0, ragged, cm);
 }
 
 fn tl_readback(dst, x0, y0): i64 {
@@ -684,7 +705,7 @@ fn tl_run(idx8, ragged): i64 {
     store32(&wu + 28, (TXD * 65536) + TXD);
     if (idx8 != 0) { store32(&wu + 32, lid); }
     if (syscall(92, &wu, 64) != 0) { return 0 - 101; }
-    tl_pack_prims(tid, lid, idx8, x0, y0, ragged);
+    tl_pack_prims(tid, lid, idx8, x0, y0, ragged, 0);
     syscall(72, pid, &tl_prims, TL_NP * 96);
     var wl[64];
     var wq = 0;
@@ -699,6 +720,19 @@ fn tl_run(idx8, ragged): i64 {
         syscall(74, tid); syscall(74, lid); syscall(74, vid); syscall(74, pid);
         return 0 - 200 - ((0 - wrc) & 0xFF);
     }
+    # ⛔ AND ARM THE COL-MAJOR BLOB TOO, HERE. It lives in its OWN arena slot with its OWN residency
+    # flag (gpu_texl_cm_arm), so its first dispatch pays a 1832-byte write the row-major one already
+    # paid above. Leaving that inside the timed window would charge rung 14b for arming and could
+    # invert the very comparison this case exists to make.
+    tl_pack_prims(tid, lid, idx8, x0, y0, ragged, 1);
+    syscall(72, pid, &tl_prims, TL_NP * 96);
+    if (syscall(92, &wl, 64) != 0) {
+        syscall(74, tid); syscall(74, lid); syscall(74, vid); syscall(74, pid);
+        return 0 - 220;
+    }
+    # back to row-major records for the A/B arms below
+    tl_pack_prims(tid, lid, idx8, x0, y0, ragged, 0);
+    syscall(72, pid, &tl_prims, TL_NP * 96);
 
     # ---- A: N individual op 0x0B FULLCOV dispatches ----
     if (syscall(88, 0xFF101010, (TLH * 65536) + TLW, (y0 * 65536) + x0) != 0) { return 0 - 4; }
@@ -745,12 +779,50 @@ fn tl_run(idx8, ragged): i64 {
         return 0 - 200 - ((0 - rl) & 0xFF);
     }
     if (tl_readback(&tl_b, x0, y0) != 0) { return 0 - 5; }
+
+    # ---- C: THE SAME op 0x0C LIST, COL-MAJOR. Rung 14b. ----
+    # ⭐ THE ORACLE IS ARM B, NOT A MODEL. B is already proven byte-identical to 32 individual op
+    # 0x0B dispatches, so demanding C == B inherits that proof and adds no new arithmetic to get
+    # wrong. The records differ from B's in exactly ONE BIT; every other byte is identical, and the
+    # transpose happens kernel-side. So a differing pixel can only be the transpose.
+    tl_pack_prims(tid, lid, idx8, x0, y0, ragged, 1);
+    syscall(72, pid, &tl_prims, TL_NP * 96);
+    if (syscall(88, 0xFF101010, (TLH * 65536) + TLW, (y0 * 65536) + x0) != 0) { return 0 - 4; }
+    var te = syscall(95);
+    var rm = syscall(92, &e, 64);
+    var tf = syscall(95);
+    if (rm != 0) {
+        syscall(74, tid); syscall(74, lid); syscall(74, vid); syscall(74, pid);
+        return 0 - 240 - ((0 - rm) & 0xFF);
+    }
+    if (tl_readback(&tl_c, x0, y0) != 0) { return 0 - 5; }
     syscall(74, tid); syscall(74, lid); syscall(74, vid); syscall(74, pid);
 
     ps("    "); pn(TL_NP); ps(" x 0x0B = "); pn(tb - ta); ps(" us");
     ps("    1 x 0x0C = "); pn(td - tc); ps(" us");
     if (td > tc) {
         if (tb > ta) { ps("    speedup "); pn((tb - ta) * 10 / (td - tc)); ps("/10x"); }
+    }
+    nl();
+
+    # ⭐⭐ THE WAVE COUNTS ARE THE POINT, AND THEY ARE PRINTED SO THE BURN CHECKS THE MECHANISM AND
+    # NOT JUST THE CLOCK. A time that improves for some other reason (cache, clocks, luck) is not
+    # evidence the transpose happened; these two numbers are computed from the SAME rule the kernel
+    # uses, so a measured speedup that does not track them means something else moved.
+    #   row-major: gx = n << ceil(log2(ceil(max_pw/64))), gy = max_ph
+    #   col-major: gx = n << ceil(log2(ceil(max_ph/64))), gy = max_pw
+    var mph = tl_maxph(ragged);
+    var srm = 0;
+    while ((1 << srm) < (w + 63) / 64) { srm = srm + 1; }
+    var scm = 0;
+    while ((1 << scm) < (mph + 63) / 64) { scm = scm + 1; }
+    var wrm = (TL_NP << srm) * mph;
+    var wcm = (TL_NP << scm) * w;
+    ps("    waves: row-major "); pn(wrm); ps("  col-major "); pn(wcm);
+    if (wcm > 0) { ps("  ("); pn(wrm / wcm); ps("x fewer)"); }
+    ps("    1 x 0x0C CM = "); pn(tf - te); ps(" us");
+    if (tf > te) {
+        if (td > tc) { ps("  vs RM "); pn((td - tc) * 10 / (tf - te)); ps("/10x"); }
     }
     nl();
 
@@ -794,7 +866,51 @@ fn tl_run(idx8, ragged): i64 {
         pn(expect); puts2(" -- the comparison is vacuous");
         return 0 - 6;
     }
-    return bad;
+
+    # ---- rung 14b: C vs B, zero differing bytes ----
+    # ⚠ THE VACUITY GUARD IS RETAINED AND POINTS AT THE **COL-MAJOR** SIDE. The check above proves
+    # the 0x0B reference painted; it says nothing about C. A col-major dispatch that drew NOTHING
+    # would leave tl_c at the clear colour, and comparing it against a painted tl_b would go loudly
+    # red — but a col-major dispatch that drew nothing while B ALSO somehow drew nothing would
+    # compare equal. Demand C painted too, against the same geometry-derived bar.
+    var cpaint = 0;
+    var ck = 0;
+    while (ck < TLW * TLH) {
+        if ((load32(&tl_c + ck * 4) & 0xFFFFFFFF) != 0xFF101010) { cpaint = cpaint + 1; }
+        ck = ck + 1;
+    }
+    if (cpaint < expect * 3 / 4) {
+        ps("    ⛔ the COL-MAJOR side painted only "); pn(cpaint); ps(" px where the geometry demands ");
+        pn(expect); puts2(" -- the col-major comparison is vacuous");
+        return 0 - 7;
+    }
+    var cbad = 0;
+    var ci = 0;
+    while (ci < TLW * TLH) {
+        var gb2 = load32(&tl_b + ci * 4) & 0xFFFFFFFF;
+        var gc = load32(&tl_c + ci * 4) & 0xFFFFFFFF;
+        if (gb2 != gc) {
+            cbad = cbad + 1;
+            if (tx_dumped < 12) {
+                tx_dumped = tx_dumped + 1;
+                ps("    texl CM diff @ x="); pn(ci % TLW); ps(" y="); pn(ci / TLW);
+                ps("  col="); pn((ci % TLW) / w);
+                ps("  RM="); phex8(gb2); ps("  CM="); phex8(gc); nl();
+            }
+        }
+        ci = ci + 1;
+    }
+    # ⛔ SEPARATE RANGES AND ROW-MAJOR FIRST — not a sum, and not col-major first.
+    # Not a SUM, because a caller adding the two counts could not tell "the fused op is wrong" from
+    # "the transpose is wrong", and those localise to completely different files.
+    # ROW-MAJOR FIRST, because col-major is built ON row-major: if the fused op is already drawing
+    # the wrong picture, the transpose being wrong too is derivative and fixing it would be wasted
+    # work. This ordering is also what makes the col-major diagnosis in main() HONEST — it tells the
+    # reader "the record build and the grid are already proven by the row-major arm passing", and
+    # that sentence is only true because a non-zero `bad` returns here before cbad is ever reported.
+    if (bad != 0) { return bad; }
+    if (cbad != 0) { return 0 - 1000 - cbad; }
+    return 0;
 }
 
 # ==================================================================================================
@@ -908,8 +1024,8 @@ fn tl_batch2(): i64 {
 
     # A = uniform heights at y0.  B = RAGGED heights at y1. Different SHAPE and different ORIGIN, so
     # a record mix-up cannot render as the right picture by luck.
-    tl_pack_prims_at(&tl_prims,  tid, 0, 0, x0, y0, 0);
-    tl_pack_prims_at(&tl2_prims, tid, 0, 0, x0, y1, 1);
+    tl_pack_prims_at(&tl_prims,  tid, 0, 0, x0, y0, 0, 0);
+    tl_pack_prims_at(&tl2_prims, tid, 0, 0, x0, y1, 1, 0);
     syscall(72, p1, &tl_prims,  TL_NP * 96);
     syscall(72, p2, &tl2_prims, TL_NP * 96);
 
@@ -1036,15 +1152,25 @@ fn main(): i64 {
     if (tlr == 0 - 5) { puts2("#90 readback refused"); }
     if (tlr == 0 - 6) { puts2("VACUOUS -- the 0x0B side drew nothing"); }
     if (tlr == 0 - 101) { puts2("the 0x0B warm-up was REJECTED"); }
-    if (tlr <= 0 - 200) { ps("op 0x0C REJECTED, reason "); pn((0 - tlr) - 200); nl(); }
-    if (tlr == 0) { puts2("IDENTICAL to 32 individual dispatches"); }
+    if (tlr == 0 - 7) { puts2("VACUOUS -- the COL-MAJOR side drew nothing"); }
+    if (tlr == 0 - 220) { puts2("the COL-MAJOR warm-up was REJECTED"); }
+    # ⚠ ORDER MATTERS: the col-major packing sits BELOW -1000, so the generic "op 0x0C REJECTED"
+    # line has to exclude that range or it would report a byte mismatch as a reason code of 800.
+    if (tlr <= 0 - 1000) { ps("COL-MAJOR differs from ROW-MAJOR in "); pn((0 - tlr) - 1000); puts2(" px"); }
+    if (tlr <= 0 - 200) {
+        if (tlr > 0 - 1000) { ps("op 0x0C REJECTED, reason "); pn((0 - tlr) - 200); nl(); }
+    }
+    if (tlr == 0) { puts2("IDENTICAL to 32 individual dispatches, and CM == RM"); }
     if (tlr > 0) { ps(""); pn(tlr); puts2(" differing px"); }
 
     var tli = tl_run(1, 0);
     ps("  texl IDX8   ");
-    if (tli == 0) { puts2("IDENTICAL to 32 individual dispatches"); }
+    if (tli == 0) { puts2("IDENTICAL to 32 individual dispatches, and CM == RM"); }
     if (tli > 0) { ps(""); pn(tli); puts2(" differing px"); }
-    if (tli < 0) { ps("failed, code "); pn(0 - tli); nl(); }
+    if (tli <= 0 - 1000) { ps("COL-MAJOR differs from ROW-MAJOR in "); pn((0 - tli) - 1000); puts2(" px"); }
+    if (tli < 0) {
+        if (tli > 0 - 1000) { ps("failed, code "); pn(0 - tli); nl(); }
+    }
 
     # ⭐ RAGGED HEIGHTS — the only case that fires the shader's `py >= ph` guard on hardware. The
     # grid is sized by the TALLEST column, so every shorter column's workgroups ARE launched for
@@ -1052,12 +1178,16 @@ fn main(): i64 {
     # height, and the 0x0B side (which dispatches each column at its own height) will not.
     var tlg = tl_run(0, 1);
     ps("  texl ragged ");
-    if (tlg == 0) { puts2("IDENTICAL — the py>=ph guard holds on iron"); }
+    if (tlg == 0) { puts2("IDENTICAL — the py>=ph guard holds on iron, and CM == RM"); }
     if (tlg > 0) { ps(""); pn(tlg); puts2(" differing px — SUSPECT THE py>=ph GUARD"); }
-    if (tlg < 0) { ps("failed, code "); pn(0 - tlg); nl(); }
+    if (tlg <= 0 - 1000) { ps("COL-MAJOR differs from ROW-MAJOR in "); pn((0 - tlg) - 1000); puts2(" px"); }
+    if (tlg < 0) {
+        if (tlg > 0 - 1000) { ps("failed, code "); pn(0 - tlg); nl(); }
+    }
 
     # ---- THE OP-TO-OP SEAM: two op 0x0C records in ONE #92 array -----------------------------
     puts2("gputex: RUNG 14 -- TWO op 0x0C in one #92 array; each must draw what it draws ALONE");
+    var tlcm = 0;
     var tls = tl_batch2();
     ps("  texl seam   ");
     if (tls == 0 - 3) { puts2("slot allocation FAILED"); }
@@ -1102,6 +1232,31 @@ fn main(): i64 {
         puts2("gputex:   would be bought with a wrong picture. Refusing to report rung 13 green.");
         return 87;
     }
+    # ⛔ RUNG 14b's GATE COMES FIRST, and it must. A col-major mismatch is packed BELOW -1000, which
+    # is also `!= 0`, so the row-major gate below would otherwise swallow it and print a diagnosis
+    # pointing at gpu_texl_build when the row-major arm is provably fine. All three arms are checked
+    # here because any of them can carry the packing.
+    if (tlr <= 0 - 1000) { tlcm = 1; }
+    if (tli <= 0 - 1000) { tlcm = 1; }
+    if (tlg <= 0 - 1000) { tlcm = 1; }
+    if (tlcm != 0) {
+        puts2("gputex: ⛔ COL-MAJOR did not reproduce ROW-MAJOR byte for byte.");
+        puts2("gputex:   The records differ in ONE BIT and the kernel does the transpose, so the");
+        puts2("gputex:   texturing, the record build and the grid are all already proven by the");
+        puts2("gputex:   row-major arm passing. Read the SHAPE of the diff:");
+        puts2("gputex:   • wrong picture in COLUMNS, right in rows -> the x/y swap is PARTIAL;");
+        puts2("gputex:     one of px/py still derives from the old axis (window B, tex_list_cm.s).");
+        puts2("gputex:   • a sparse dotted line, one px per column -> the BOUNDS did not transpose");
+        puts2("gputex:     (window P): lanes are bounded by pw where they should be bounded by ph.");
+        puts2("gputex:   • correct only where ph <= 64 -> the multi-tile path; `tile` now indexes");
+        puts2("gputex:     ROWS and the >= bound swapped from pw to ph incorrectly.");
+        puts2("gputex:   • the AFFINE frame wrong (right pixels, wrong texels) -> the vertex x/y");
+        puts2("gputex:     swap in gpu_texl_build, not the shader.");
+        puts2("gputex:   texlist.cyr's MUT window P / MUT window B reproduce the first two on the");
+        puts2("gputex:   HOST at zero burns — run it before flashing anything.");
+        return 89;
+    }
+
     # ⛔ RUNG 14's GATE. Zero differing bytes, both formats, or this does not ship. A fused op that
     # is merely CLOSE to 32 individual dispatches is a fused op that draws a different picture.
     if (tlr != 0) {
