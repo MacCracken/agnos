@@ -86,13 +86,35 @@ fn bi_lerp4(t00, t10, t01, t11, fx, fy): i64 {
 # bi_chan(px, k) — channel k (0=R,1=G,2=B,3=A) out of a packed 32-bit RGBA8 texel.
 fn bi_chan(px, k): i64 { return (px >> (k * 8)) & 0xFF; }
 
-# bi_sample(tex, tw, th, u, v) — one bilinear RGBA8 sample. u/v are 16.16 texel-space, WRAP-addressed.
+# bi_clamp(i, n) — CLAMP addressing: the non-WRAP path.
+# ⚠⚠ THIS IS WHERE `bi_floor`'s ARITHMETIC SHIFT ACTUALLY MATTERS, and it is not where you would
+# guess. Under mask-WRAP an arithmetic and a logical shift are INDISTINGUISHABLE: they differ by a
+# multiple of 2^48, and the wrap mask sees only the low <=12 bits (GPU_TEX_MAX_DIM is 4096), so the
+# low bits are identical either way. Under CLAMP the same substitution is total — floor(-1) clamps to
+# 0, while a logical shift yields a huge positive that clamps to n-1, the OPPOSITE EDGE of the
+# texture. Measured, not reasoned: bimodel's M2 mutation is GREEN on the wrap sweep and RED on the
+# clamp sweep. ⇒ **A wrap-only test suite cannot prove the shift kind is correct.**
+fn bi_clamp(i, n): i64 {
+    if (i < 0) { return 0; }
+    if (i > n - 1) { return n - 1; }
+    return i;
+}
+
+# bi_sample(tex, tw, th, u, v, wrap) — one bilinear RGBA8 sample. u/v are 16.16 texel-space.
+# wrap != 0 selects WRAP (po2 dims, ABI-enforced), wrap == 0 selects CLAMP.
 # Returns a packed 32-bit texel. tex is a byte address holding tw*th u32 texels.
-fn bi_sample(tex, tw, th, u, v): i64 {
-    var x0 = bi_wrap(bi_floor(u), tw);
-    var y0 = bi_wrap(bi_floor(v), th);
-    var x1 = bi_wrap(x0 + 1, tw);
-    var y1 = bi_wrap(y0 + 1, th);
+fn bi_sample(tex, tw, th, u, v, wrap): i64 {
+    var bx = bi_floor(u);
+    var by = bi_floor(v);
+    var x0 = 0; var y0 = 0; var x1 = 0; var y1 = 0;
+    if (wrap != 0) {
+        x0 = bi_wrap(bx, tw);      y0 = bi_wrap(by, th);
+        x1 = bi_wrap(bx + 1, tw);  y1 = bi_wrap(by + 1, th);
+    }
+    if (wrap == 0) {
+        x0 = bi_clamp(bx, tw);     y0 = bi_clamp(by, th);
+        x1 = bi_clamp(bx + 1, tw); y1 = bi_clamp(by + 1, th);
+    }
     var fx = bi_frac(u);
     var fy = bi_frac(v);
 

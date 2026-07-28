@@ -82,7 +82,7 @@ fn main(): i64 {
         bg_fill_flat(vv);
         var u = 0;
         while (u < 65536 * 3) {
-            var got = bi_sample(&bg_tex, BG_TW, BG_TH, u, u + 12345);
+            var got = bi_sample(&bg_tex, BG_TW, BG_TH, u, u + 12345, 1);
             if ((got & 0xFF) != vv) { g1b = g1b + 1; }
             u = u + 4099;                    # a prime-ish stride: hits many distinct fx/fy pairs
         }
@@ -101,7 +101,7 @@ fn main(): i64 {
         var tx = 0;
         while (tx < BG_TW) {
             var want = load32(&bg_tex + (ty * BG_TW + tx) * 4) & 0xFFFFFFFF;
-            var got  = bi_sample(&bg_tex, BG_TW, BG_TH, tx * 65536, ty * 65536);
+            var got  = bi_sample(&bg_tex, BG_TW, BG_TH, tx * 65536, ty * 65536, 1);
             if (got != want) { g2 = g2 + 1; }
             tx = tx + 1;
         }

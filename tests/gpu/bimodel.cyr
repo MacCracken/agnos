@@ -1,0 +1,218 @@
+# bimodel.cyr — RUNG 15's CORRECTNESS GATE: the bilinear shader written in Cyrius at the GPU's
+# REGISTER WIDTHS, byte-diffed against bicore.cyr, which is the oracle.
+#
+# ⭐ THE POINT IS ATTRIBUTION, and rungs 11/13 earned it. Green here and red on iron ⇒ the fault is
+# the EMISSION, not the algorithm. When rung 11's burn came back red, this same split let a host
+# mutation reproduce the failing pixels BIT-EXACTLY and convict the shader in one pass instead of
+# burning iron to bisect it.
+#
+# WHAT THE MODEL ADDS OVER THE REFERENCE — the three things the reference is deliberately free of:
+#   1. **32-BIT LANES.** Every accumulate is masked to 32 bits, because `v_mul_lo_u32` + `v_add_u32`
+#      are 32-bit. bigate G4 proved the accumulator PEAKS at 16,711,680 and fits; this file proves
+#      the shader's actual sequence never exceeds it, which is a different claim.
+#   2. **MASK WRAP, NOT MODULO.** `GPU_TEX_FLAG_WRAP` is POWER-OF-TWO ONLY and that is a REJECT, not
+#      a clamp (`syscall.cyr`: *"a general modulo is an integer divide PER PIXEL; a power-of-two wrap
+#      is one AND"*). The reference uses `%` because it states the true semantics; the shader uses
+#      `v_and_b32`. Gate W below PROVES they agree on every po2 dimension rather than assuming it.
+#   3. **FOUR TAPS, FOUR ADDRESSES.** Rung 13 computed one address; bilinear computes four, and the
+#      +1 neighbour must wrap/clamp INDEPENDENTLY of the base. Forgetting that degenerates the filter
+#      to nearest-neighbour on the last row/column — a bug that looks like a seam, not like a filter.
+#
+# ⛔ EVERY GATE HERE IS PAIRED WITH A MUTATION THAT MUST BREAK IT. A gate nobody has seen fail is a
+# gate nobody knows is connected — that is the standing lesson from rung 9b's five mutations and
+# rung 14b's, and it is why this file is worth more than its assertions.
+
+include "lib/io.cyr"
+include "tricore.cyr"      # ps / pn / nl
+include "bicore.cyr"
+
+var BM_MASK32 = 4294967295;
+
+# ---- mutation switches: each must make a gate go RED ------------------------------------------
+var bm_mut_swap_w   = 0;   # M1 swap w10/w01 — keeps the weight SUM at 65536, wrong assignment
+var bm_mut_logical  = 0;   # M2 `>>` (logical) for the floor instead of `>>>` — breaks negative UV
+var bm_mut_acc16    = 0;   # M3 truncate the accumulator to 16 bits — simulates a too-narrow lane
+var bm_mut_no_plus1 = 0;   # M4 sample x0 twice instead of x0/x1 — degenerates to nearest
+var bm_mut_roundfrac= 0;   # M5 round the fraction instead of truncating
+
+# bm_floor32 — the shader's `v_ashrrev_i32 v, 16, uv`. ARITHMETIC shift: UV legitimately goes
+# negative under WRAP, and floor(-0.5) must be -1. ⚠ In Cyrius `>>>` is arithmetic and `>>` is
+# logical — inverted from C. M2 flips it to prove this line is load-bearing.
+fn bm_floor32(c): i64 {
+    if (bm_mut_logical != 0) { return (c >> 16) & BM_MASK32; }
+    return c >>> 16;
+}
+
+# bm_frac32 — the shader's `v_bfe_u32 v, uv, 8, 8`. Truncating, matching bi_frac.
+fn bm_frac32(c): i64 {
+    if (bm_mut_roundfrac != 0) { return (((c + 128) >> 8) & 0xFF); }
+    return (c >> 8) & 0xFF;
+}
+
+# bm_wrap_mask — the shader's `v_and_b32 v, mask, v`. Valid ONLY for power-of-two n; the ABI
+# rejects anything else under WRAP, so the shader never sees a non-po2 dimension.
+fn bm_wrap_mask(i, n): i64 { return i & (n - 1); }
+
+# bm_clamp — the non-WRAP path: clamp to [0, n-1].
+fn bm_clamp(i, n): i64 {
+    if (i < 0) { return 0; }
+    if (i > n - 1) { return n - 1; }
+    return i;
+}
+
+fn bm_addr(x, y, tw): i64 { return ((y * tw + x) * 4) & BM_MASK32; }
+
+# bm_sample — the shader's whole per-pixel sequence, at 32-bit widths.
+fn bm_sample(tex, tw, th, u, v, wrap): i64 {
+    var bx = bm_floor32(u);
+    var by = bm_floor32(v);
+    var fx = bm_frac32(u);
+    var fy = bm_frac32(v);
+
+    var x0 = 0; var y0 = 0; var x1 = 0; var y1 = 0;
+    if (wrap != 0) {
+        x0 = bm_wrap_mask(bx, tw);      y0 = bm_wrap_mask(by, th);
+        x1 = bm_wrap_mask(bx + 1, tw);  y1 = bm_wrap_mask(by + 1, th);
+    }
+    if (wrap == 0) {
+        x0 = bm_clamp(bx, tw);          y0 = bm_clamp(by, th);
+        x1 = bm_clamp(bx + 1, tw);      y1 = bm_clamp(by + 1, th);
+    }
+    # M4: the +1 neighbour collapses onto the base ⇒ nearest-neighbour, not bilinear.
+    if (bm_mut_no_plus1 != 0) { x1 = x0; y1 = y0; }
+
+    var p00 = load32(tex + bm_addr(x0, y0, tw)) & BM_MASK32;
+    var p10 = load32(tex + bm_addr(x1, y0, tw)) & BM_MASK32;
+    var p01 = load32(tex + bm_addr(x0, y1, tw)) & BM_MASK32;
+    var p11 = load32(tex + bm_addr(x1, y1, tw)) & BM_MASK32;
+
+    var ix = 256 - fx;
+    var iy = 256 - fy;
+    var w00 = (ix * iy) & BM_MASK32;
+    var w10 = (fx * iy) & BM_MASK32;
+    var w01 = (ix * fy) & BM_MASK32;
+    var w11 = (fx * fy) & BM_MASK32;
+    # M1: swapping these keeps the SUM at 65536 — G1 in bigate still passes — and is wrong.
+    if (bm_mut_swap_w != 0) { var t = w10; w10 = w01; w01 = t; }
+
+    var out = 0;
+    var k = 0;
+    while (k < 4) {
+        var sh = k * 8;
+        var c00 = (p00 >> sh) & 0xFF;
+        var c10 = (p10 >> sh) & 0xFF;
+        var c01 = (p01 >> sh) & 0xFF;
+        var c11 = (p11 >> sh) & 0xFF;
+        # every product and partial sum masked to 32 bits — this IS the lane
+        var acc = (c00 * w00) & BM_MASK32;
+        acc = (acc + ((c10 * w10) & BM_MASK32)) & BM_MASK32;
+        acc = (acc + ((c01 * w01) & BM_MASK32)) & BM_MASK32;
+        acc = (acc + ((c11 * w11) & BM_MASK32)) & BM_MASK32;
+        if (bm_mut_acc16 != 0) { acc = acc & 0xFFFF; }
+        var c = (acc >> 16) & 0xFF;
+        out = out | (c << sh);
+        k = k + 1;
+    }
+    return out & BM_MASK32;
+}
+
+# ---- the corpus -------------------------------------------------------------------------------
+var BM_TW = 8;
+var BM_TH = 8;
+var bm_tex[64];
+
+fn bm_fill(): i64 {
+    var y = 0;
+    while (y < BM_TH) {
+        var x = 0;
+        while (x < BM_TW) {
+            var r = (x * 31 + y * 7) & 0xFF;
+            var g = (y * 29 + x * 3) & 0xFF;
+            var b = (x * y * 5) & 0xFF;
+            var a = (255 - x * 11) & 0xFF;
+            store32(&bm_tex + (y * BM_TW + x) * 4, r | (g << 8) | (b << 16) | (a << 24));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+# Sweep model vs reference over a UV range that INCLUDES NEGATIVES and multiple tiles.
+fn bm_sweep_mode(wrap): i64 {
+    var diff = 0;
+    var u = 0 - (65536 * 2);
+    while (u < 65536 * 3) {
+        var v = 0 - (65536 * 2);
+        while (v < 65536 * 3) {
+            var want = bi_sample(&bm_tex, BM_TW, BM_TH, u, v, wrap);
+            var got  = bm_sample(&bm_tex, BM_TW, BM_TH, u, v, wrap);
+            if (want != got) { diff = diff + 1; }
+            v = v + 9973;
+        }
+        u = u + 9973;
+    }
+    return diff;
+}
+fn bm_sweep(): i64 { return bm_sweep_mode(1); }
+fn bm_sweep_clamp(): i64 { return bm_sweep_mode(0); }
+
+fn bm_gate(name, d, want_red): i64 {
+    ps(name);
+    if (want_red == 0) {
+        if (d == 0) { ps(" PASS"); nl(); return 0; }
+        ps(" FAIL diff="); pn(d); nl(); return 1;
+    }
+    if (d != 0) { ps(" RED (correct -- the gate is connected), diff="); pn(d); nl(); return 0; }
+    ps(" ** GATE NOT CONNECTED: the mutation changed nothing **"); nl(); return 1;
+}
+
+fn main(): i64 {
+    bm_fill();
+    var bad = 0;
+
+    ps("bimodel: rung 15 -- the bilinear shader at GPU register widths vs bicore"); nl(); nl();
+
+    bad = bad + bm_gate("W  model == reference, WRAP (po2 mask), negative + multi-tile UV:", bm_sweep(), 0);
+    bad = bad + bm_gate("C  model == reference, CLAMP, same UV range:", bm_sweep_clamp(), 0);
+
+    # ---- the mutations. Each MUST go red. --------------------------------------------------------
+    bm_mut_swap_w = 1;   bad = bad + bm_gate("M1 swap w10/w01 (weight SUM still 65536):", bm_sweep(), 1);   bm_mut_swap_w = 0;
+    bm_mut_logical = 1;
+    # ⚠⚠ M2 IS TESTED ON THE **CLAMP** SWEEP, AND THAT IS THE FINDING, NOT A WORKAROUND.
+    # Under mask-WRAP an arithmetic and a logical shift are INDISTINGUISHABLE — they differ by a
+    # multiple of 2^48 and the wrap mask sees only the low <=12 bits. M2 was written against the wrap
+    # sweep, came back GREEN, and the honest reading was "the gate is not connected" rather than
+    # "the mutation is wrong". It is connected — on the path where the difference is observable, where
+    # floor(-1) clamps to 0 but a logical shift clamps to n-1, the OPPOSITE EDGE.
+    # ⇒ A WRAP-ONLY SUITE CANNOT PROVE THE SHIFT KIND. Recorded because the next person to add a
+    # coordinate transform here will reach for a wrap-only test by default.
+    # ⭐ ASSERTED GREEN, ON PURPOSE. This is not a gate that failed to fire — it is a PROVEN
+    # INVISIBILITY, and asserting it is what keeps the finding honest: if a future change ever makes
+    # the shift kind observable under WRAP, this line goes red and tells you the addressing model
+    # changed underneath you.
+    bad = bad + bm_gate("M2 logical >> under WRAP -- PROVABLY INVISIBLE (mask sees low bits only):", bm_sweep(), 0);
+    bad = bad + bm_gate("M2 logical >> for the floor [CLAMP -- where it is observable]:", bm_sweep_clamp(), 1);
+    bm_mut_logical = 0;
+    bm_mut_acc16 = 1;    bad = bad + bm_gate("M3 accumulator truncated to 16 bits:", bm_sweep(), 1);        bm_mut_acc16 = 0;
+    bm_mut_no_plus1 = 1; bad = bad + bm_gate("M4 +1 neighbour collapsed (nearest, not bilinear):", bm_sweep(), 1); bm_mut_no_plus1 = 0;
+    bm_mut_roundfrac = 1;bad = bad + bm_gate("M5 fraction rounded instead of truncated:", bm_sweep(), 1);   bm_mut_roundfrac = 0;
+
+    nl();
+    if (bad == 0) {
+        ps("bimodel: PASS -- the 32-bit-lane model is byte-identical to the reference, and all five");
+        nl();
+        ps("         mutations break it WHERE THEY CAN. A red iron burn now convicts the EMISSION.");
+        nl();
+        ps("         ** M2 is provably INVISIBLE under WRAP and only observable under CLAMP: a");
+        nl();
+        ps("         wrap-only suite cannot prove the shift kind. **");
+        nl();
+        return 95;
+    }
+    ps("bimodel: FAIL -- "); pn(bad); ps(" gate(s) wrong; do NOT write the shader yet."); nl();
+    return 90;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
