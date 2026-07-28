@@ -1160,6 +1160,26 @@ var GPU_EDGE_SHADER_SUBOFF     = 0x56000;    # slot 6 — edge_cov blob   (133 d
 # 48 KB clear of the sacrificial slot at 0x1F0000 -- verified by scripts/check/check-arena.sh, not by eye.
 var GPU_TRI_SHADER_SUBOFF      = 0x59000;    # residency slot 9, 278 dwords  -> ends 0x5A000
 var GPU_COMPUTE_PGM_RSRC1_TEX  = 0x00AC0207;  # 32 VGPRs, 72 SGPRs — harvested from tex_rgba.s
+
+# ⭐ RUNG 15 (1.56.29) — A SEPARATE DESCRIPTOR FOR BILINEAR, NOT A WIDENED RSRC1_TEX.
+# ⛔ RSRC1_TEX is consumed by BOTH gpu_tex_list (op 0x0C, rung 14) and gpu_tri_tex (op 0x0B, rung 13),
+# and both are iron-proven. Widening it in place would raise the VGPR allocation — and therefore LOWER
+# the occupancy — of two shipped, working paths that gain nothing from the extra registers. Same
+# reasoning as GPU_TEXL_PRIM_FLAGS_KNOWN being its own mask rather than a widened GPU_TEX_FLAGS_KNOWN:
+# a constant shared by several consumers must not be moved for the benefit of one.
+#
+# **48 VGPRs, because 32 has ZERO headroom.** tex_rgba.s's high-water is v31 against 32 declared, and
+# bilinear needs ~+17 (four texels not one · four weights · two fractions · four 64-bit addresses not
+# one · accumulate scratch). ⛔ Hand-allocating those into the existing 32 is
+# [[reference_handwritten_shader_regalloc]] EXACTLY — rung 13 lost a burn to a scratch write over a
+# live v19, where the clobber wrote ZERO and read like a dead shader, invisible to llvm-mc, to the blob
+# gate AND to the host model. With no free registers that is not a risk, it is a guarantee.
+#
+# ⚠ THE OCCUPANCY TRADE IS DELIBERATE AND MEASURED: 8 waves/SIMD -> ~5. It is affordable because
+# 1.56.26/28 established the GPU is NOT the bottleneck — CPU prep dominated a DOOM frame by 52x before
+# the fix and still leads after (2.487 us/prim CPU vs 0.09 ms GPU col-major). Waves-in-flight is the
+# cheap resource here. That is a MEASUREMENT, not a guess, and it is why this trade is safe to make.
+var GPU_COMPUTE_PGM_RSRC1_TEXBI = 0x00AC020B;  # 48 VGPRs, 72 SGPRs — rung 15 bilinear only
 var GPU_TEX_SHADER_SUBOFF      = 0x5A000;    # residency slot 10, rung 13 texturing  -> ends 0x5B000
 var GPU_TEX_PREP_SUBOFF        = 0xE3000;    # 160-byte texture prep record  -> ends 0xE3400
 # ⭐ RUNG 14: the prep-record ARRAY, one 160-byte record per primitive, indexed by the shader from
