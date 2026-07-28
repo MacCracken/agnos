@@ -600,11 +600,15 @@ fn tl_pack_vtx(c, ragged): i64 {
 # tl_pack_prims — the same N frames as 96-byte TEX_LIST primitive records.
 # ⚠ Byte-for-byte the same geometry tl_pack_vtx produces; if these two ever disagree the test is
 # comparing two different pictures and its zero-diff demand becomes meaningless.
-fn tl_pack_prims(tid, lid, idx8, x0, y0, ragged): i64 {
+#
+# ⚠ TAKES ITS DESTINATION so the two-op seam case below can build a SECOND list through this exact
+# code. A hand-rolled copy of the packing for the second list would be a second thing to get wrong,
+# and the whole argument of that case is that the two lists differ ONLY where it intends them to.
+fn tl_pack_prims_at(dst, tid, lid, idx8, x0, y0, ragged): i64 {
     var w = tl_pw();
     var c = 0;
     while (c < TL_NP) {
-        var b = &tl_prims + c * 96;
+        var b = dst + c * 96;
         var TLHc = tl_ph(c, ragged);
         var z = 0;
         while (z < 24) { store32(b + z * 4, 0); z = z + 1; }
@@ -625,6 +629,10 @@ fn tl_pack_prims(tid, lid, idx8, x0, y0, ragged): i64 {
         c = c + 1;
     }
     return 0;
+}
+
+fn tl_pack_prims(tid, lid, idx8, x0, y0, ragged): i64 {
+    return tl_pack_prims_at(&tl_prims, tid, lid, idx8, x0, y0, ragged);
 }
 
 fn tl_readback(dst, x0, y0): i64 {
@@ -789,6 +797,168 @@ fn tl_run(idx8, ragged): i64 {
     return bad;
 }
 
+# ==================================================================================================
+# RUNG 14 — THE OP-TO-OP SEAM: TWO op 0x0C records in ONE #92 array.
+# ==================================================================================================
+# ⛔⛔ WHAT THIS CATCHES, AND WHY THE EXISTING CASES CANNOT. Every case above issues op 0x0C as a
+# ONE-OP #92 array, so gpo_execute_all's batch opens and closes around a single dispatch and the
+# shared prep slot is never reused while the GPU is mid-read. That is the only shape rung 14 was
+# ever tested in, and it is not the shape a DOOM frame has.
+#
+# THE DEFECT THIS IS THE REGRESSION FOR: GPU_TEXL_PREP_SUBOFF is ONE fixed
+# 512-record array. gpo_execute_all sets gpu_batch_active across the WHOLE op array, and with it set
+# gpu_blend_cov_run only QUEUES dwords and returns — no tail, no fence, no wait. So two op 0x0C
+# records in one array run:
+#     build list A into the prep slot  ->  queue A's dispatch (not executed yet)
+#     build list B into THE SAME SLOT  ->  queue B's dispatch
+#     ... one tail, and now BOTH dispatches read list B's records
+# List A therefore draws list B's primitives at list B's origins — which lands in rect B, leaving
+# rect A at the clear colour. It is rung 12's bug at the op-to-op seam rather than the
+# primitive-to-primitive one, and per-primitive records did nothing about it.
+#
+# ⭐ THIS IS NOT A HYPOTHETICAL SHAPE. GPU_TEX_LIST_MAX is 512; a DOOM frame is ~640 wall columns.
+# The frame rung 14b makes feasible CANNOT be one op — it is physically at least two.
+#
+# ⛔ THE TWO LISTS MUST DIFFER, OR THIS CASE PROVES NOTHING. If A and B were the same geometry at
+# the same origin, B's records overwriting A's would draw the identical picture and the comparison
+# would come back green on a broken kernel. So A is UNIFORM height at y0 and B is RAGGED at a
+# disjoint y1: under the defect, rect A comes back entirely clear. [[feedback_echo_vs_answer]]
+#
+# ⚠ THE ORACLE IS THE SAME LIST DRAWN ALONE, not a model. Each list is first issued as its OWN #92
+# call — separately fenced, the shape every green case above already proves correct — and read back.
+# Then both are issued in ONE two-op array and read back again. The demand is zero differing bytes.
+# A model would be a fresh thing to get wrong; "the same op, batched, must draw what it draws alone"
+# is the entire property at issue and needs no new arithmetic.
+#
+# ⚠ NEGATIVE CONTROL: this case cannot be toggled from ring 3 — the fix is a kernel-side suspend, so
+# there is no mutation switch to flip here. Its red-on-a-broken-kernel claim is a PREDICTION, stated
+# in advance: on a kernel whose gpu_tex_list does not suspend gpu_batch_active, `seam A` reports
+# ~3072 differing px (the whole rect, clear where it should be painted) and `seam B` reports 0.
+# If this case ever goes red in exactly that pattern, the suspend has been lost — look there first.
+
+var TL2_Y1 = 64;                # list B's top edge — disjoint from list A's rect at y = 8..56
+var tl2_prims[384];             # list B's 32 x 96 B primitive array
+var tl2_r1[1536];               # rect A, drawn by its OWN #92 call — the reference
+var tl2_r2[1536];               # rect B, ditto
+var tl2_g1[1536];               # rect A, drawn inside a TWO-OP array
+var tl2_g2[1536];               # rect B, ditto
+var tl2_bad1 = 0;
+var tl2_bad2 = 0;
+
+# tl_op0c — write one op 0x0C #92 record at `dst`. Factored out because the whole point of this case
+# is that the two records differ ONLY in the slot id and the rect, so they must be built identically.
+fn tl_op0c(dst, pid, x, y, np): i64 {
+    var z = 0;
+    while (z < 16) { store32(dst + z * 4, 0); z = z + 1; }
+    store32(dst +  0, 12);                       # op 0x0C TEX_LIST
+    store32(dst + 12, pid);
+    store32(dst + 16, (TLH * 65536) + TLW);
+    store32(dst + 20, (y * 65536) + x);
+    store32(dst + 24, np);
+    return 0;
+}
+
+fn tl2_cmp(refb, gotb, which): i64 {
+    var bad = 0;
+    var pi = 0;
+    while (pi < TLW * TLH) {
+        var ga = load32(refb + pi * 4) & 0xFFFFFFFF;
+        var gb = load32(gotb + pi * 4) & 0xFFFFFFFF;
+        if (ga != gb) {
+            bad = bad + 1;
+            if (tx_dumped < 16) {
+                tx_dumped = tx_dumped + 1;
+                ps("    seam list "); pn(which);
+                ps(" diff @ x="); pn(pi % TLW); ps(" y="); pn(pi / TLW);
+                ps("  alone="); phex8(ga); ps("  batched="); phex8(gb); nl();
+            }
+        }
+        pi = pi + 1;
+    }
+    return bad;
+}
+
+# tl_painted — how many px of a readback are not the clear colour.
+fn tl_painted(buf): i64 {
+    var n = 0;
+    var k = 0;
+    while (k < TLW * TLH) {
+        if ((load32(buf + k * 4) & 0xFFFFFFFF) != 0xFF101010) { n = n + 1; }
+        k = k + 1;
+    }
+    return n;
+}
+
+# tl_batch2 — the seam case. Returns 0, a positive total differing-byte count, or a negative code.
+fn tl_batch2(): i64 {
+    var x0 = 8;
+    var y0 = 8;
+    var y1 = TL2_Y1;
+    var w  = tl_pw();
+    tl2_bad1 = 0;
+    tl2_bad2 = 0;
+
+    var tid = syscall(86, 4096);
+    var p1  = syscall(86, 4096);
+    var p2  = syscall(86, 4096);
+    if (tid < 1) { return 0 - 3; }
+    if (p1 < 1) { return 0 - 3; }
+    if (p2 < 1) { return 0 - 3; }
+    syscall(72, tid, &tx_tex, TXD * TXD * 4);
+
+    # A = uniform heights at y0.  B = RAGGED heights at y1. Different SHAPE and different ORIGIN, so
+    # a record mix-up cannot render as the right picture by luck.
+    tl_pack_prims_at(&tl_prims,  tid, 0, 0, x0, y0, 0);
+    tl_pack_prims_at(&tl2_prims, tid, 0, 0, x0, y1, 1);
+    syscall(72, p1, &tl_prims,  TL_NP * 96);
+    syscall(72, p2, &tl2_prims, TL_NP * 96);
+
+    # ---- REFERENCE: each list as its OWN #92 call, so each is separately fenced ----
+    if (syscall(88, 0xFF101010, (TLH * 65536) + TLW, (y0 * 65536) + x0) != 0) { return 0 - 4; }
+    if (syscall(88, 0xFF101010, (TLH * 65536) + TLW, (y1 * 65536) + x0) != 0) { return 0 - 4; }
+    var o1[16];
+    tl_op0c(&o1, p1, x0, y0, TL_NP);
+    if (syscall(92, &o1, 64) != 0) { return 0 - 201; }
+    var o2[16];
+    tl_op0c(&o2, p2, x0, y1, TL_NP);
+    if (syscall(92, &o2, 64) != 0) { return 0 - 202; }
+    if (tl_readback(&tl2_r1, x0, y0) != 0) { return 0 - 5; }
+    if (tl_readback(&tl2_r2, x0, y1) != 0) { return 0 - 5; }
+
+    # ⛔ VACUITY GUARD, BOTH RECTS. If neither list painted, every buffer is the clear colour and the
+    # comparison below is 0 == 0 on a kernel that drew nothing at all. Expected = sum(pw*ph) per
+    # list; demand three quarters, the same derived bar tl_run uses.
+    var e1 = 0;
+    var e2 = 0;
+    var ek = 0;
+    while (ek < TL_NP) {
+        e1 = e1 + w * tl_ph(ek, 0);
+        e2 = e2 + w * tl_ph(ek, 1);
+        ek = ek + 1;
+    }
+    if (tl_painted(&tl2_r1) < e1 * 3 / 4) { return 0 - 6; }
+    if (tl_painted(&tl2_r2) < e2 * 3 / 4) { return 0 - 7; }
+
+    # ---- THE SEAM: both lists in ONE two-op array. len = 2 * GPU_OP_STRIDE = 128. ----
+    if (syscall(88, 0xFF101010, (TLH * 65536) + TLW, (y0 * 65536) + x0) != 0) { return 0 - 4; }
+    if (syscall(88, 0xFF101010, (TLH * 65536) + TLW, (y1 * 65536) + x0) != 0) { return 0 - 4; }
+    var q[32];
+    tl_op0c(&q,      p1, x0, y0, TL_NP);
+    tl_op0c(&q + 64, p2, x0, y1, TL_NP);
+    var rq = syscall(92, &q, 128);
+    if (rq != 0) {
+        syscall(74, tid); syscall(74, p1); syscall(74, p2);
+        return 0 - 300 - ((0 - rq) & 0xFF);
+    }
+    if (tl_readback(&tl2_g1, x0, y0) != 0) { return 0 - 5; }
+    if (tl_readback(&tl2_g2, x0, y1) != 0) { return 0 - 5; }
+    syscall(74, tid); syscall(74, p1); syscall(74, p2);
+
+    tl2_bad1 = tl2_cmp(&tl2_r1, &tl2_g1, 1);
+    tl2_bad2 = tl2_cmp(&tl2_r2, &tl2_g2, 2);
+    return tl2_bad1 + tl2_bad2;
+}
+
 fn main(): i64 {
     puts2("gputex: RUNG 13 -- nearest-neighbour affine texturing via #92 op 0x0B");
     tx_build_tex();
@@ -886,6 +1056,24 @@ fn main(): i64 {
     if (tlg > 0) { ps(""); pn(tlg); puts2(" differing px — SUSPECT THE py>=ph GUARD"); }
     if (tlg < 0) { ps("failed, code "); pn(0 - tlg); nl(); }
 
+    # ---- THE OP-TO-OP SEAM: two op 0x0C records in ONE #92 array -----------------------------
+    puts2("gputex: RUNG 14 -- TWO op 0x0C in one #92 array; each must draw what it draws ALONE");
+    var tls = tl_batch2();
+    ps("  texl seam   ");
+    if (tls == 0 - 3) { puts2("slot allocation FAILED"); }
+    if (tls == 0 - 4) { puts2("fill_rect refused"); }
+    if (tls == 0 - 5) { puts2("#90 readback refused"); }
+    if (tls == 0 - 6) { puts2("VACUOUS -- list A drew nothing even ALONE"); }
+    if (tls == 0 - 7) { puts2("VACUOUS -- list B drew nothing even ALONE"); }
+    if (tls == 0 - 201) { puts2("the SOLO list-A call was REJECTED"); }
+    if (tls == 0 - 202) { puts2("the SOLO list-B call was REJECTED"); }
+    if (tls <= 0 - 300) { ps("the TWO-OP array was REJECTED, reason "); pn((0 - tls) - 300); nl(); }
+    if (tls == 0) { puts2("IDENTICAL batched and alone -- the prep slot survives the seam"); }
+    if (tls > 0) {
+        ps(""); pn(tls); ps(" differing px  (list A "); pn(tl2_bad1);
+        ps(", list B "); pn(tl2_bad2); puts2(")");
+    }
+
     syscall(84);
     puts2("gputex: presented -- the tiles above are ON SCREEN now");
     tx_bench();
@@ -938,8 +1126,32 @@ fn main(): i64 {
         puts2("gputex:   pointer is the difference — check the per-primitive lut_id resolution.");
         return 88;
     }
+    # ⛔ THE OP-TO-OP SEAM GATE. A fused op that is correct alone and wrong when a second one follows
+    # it in the same array is not correct — and two ops is the MINIMUM a DOOM frame needs, because
+    # ~640 columns do not fit in one 512-primitive list.
+    if (tls < 0) {
+        puts2("gputex: ⛔ the two-op seam case could not run. It is the only case that exercises");
+        puts2("gputex:   op 0x0C with the batch OPEN across two dispatches, so a green run without");
+        puts2("gputex:   it does not cover the shape a DOOM frame actually has. Read the code above.");
+        return 89;
+    }
+    if (tls != 0) {
+        puts2("gputex: ⛔ op 0x0C does not survive being followed by a SECOND op 0x0C in one array.");
+        puts2("gputex:   Every single-op case above passed, so the texturing, the record build, the");
+        puts2("gputex:   grid and the ABI are all fine. The suspect is the SHARED PREP SLOT:");
+        puts2("gputex:   GPU_TEXL_PREP_SUBOFF is one 512-record array and gpo_execute_all holds");
+        puts2("gputex:   gpu_batch_active across the whole #92 array, so gpu_blend_cov_run returns");
+        puts2("gputex:   WITHOUT a fence and list B's build overwrites records list A has not been");
+        puts2("gputex:   read for yet. ⭐ THE SIGNATURE IS DIAGNOSTIC: list A wrong and list B clean");
+        puts2("gputex:   means exactly that, and the fix is gpu_tex_list's suspend of");
+        puts2("gputex:   gpu_batch_active around its dispatch -- the same 1.56.21 invariant");
+        puts2("gputex:   gpu_tri_list carries. Check that it is still there before looking anywhere");
+        puts2("gputex:   else. Both lists wrong is a DIFFERENT bug and none of the above applies.");
+        return 89;
+    }
     puts2("gputex: ⭐ RUNG 13 -- every rendered pixel byte-identical to texcore, both formats.");
     puts2("gputex: ⭐ RUNG 14 -- op 0x0C byte-identical to 32 individual op 0x0B dispatches.");
+    puts2("gputex: ⭐ RUNG 14 -- and byte-identical again with a SECOND op 0x0C in the same array.");
     return 95;
 }
 

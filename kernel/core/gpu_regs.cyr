@@ -1165,7 +1165,13 @@ var GPU_TEX_PREP_SUBOFF        = 0xE3000;    # 160-byte texture prep record  -> 
 # ⭐ RUNG 14: the prep-record ARRAY, one 160-byte record per primitive, indexed by the shader from
 # tgid_x. 512 x 160 = 81920 B. ⛔ This array is exactly what rung 12 lacked — its N triangles shared
 # ONE record slot, so the CPU overwrote each before the GPU read it. Per-primitive records make that
-# failure unrepresentable rather than merely guarded against.
+# failure unrepresentable rather than merely guarded against — WITHIN ONE OP.
+# ⛔ ACROSS OPS THE SLOT IS STILL SHARED, and this declaration is the reason: there is exactly ONE
+# array, so every op 0x0C in a batched #92 array rebuilds it from the top. gpu_tex_list suspends
+# gpu_batch_active around its dispatch so the GPU has drained before the next build lands.
+# A per-op region would fix it structurally, and the room is here — [0xBE000,0xC0000) is 0x2000
+# spare, 51 more records — but 51 is not a second 512-primitive list, so it is a real redesign of
+# the allocation and not a bump.
 # ⚠ TWO bad placements preceded this one — 0xF0000 landed inside the 1 MB coverage scratch, 0x1E4000
 # collided with GPU_SACRIFICIAL. Both were "obvious" gaps read off the declaration list by eye.
 # [0xAA000,0xC0000) is the largest ACTUALLY-free run (0x16000), computed by walking the sorted slot

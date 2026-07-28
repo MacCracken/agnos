@@ -5327,8 +5327,18 @@ vx0, vy0, vx1, vy1, vx2, vy2, u0, v0, u1, v1, u2, v2) {
 # ⛔ FULLCOV IS REQUIRED (gpo_validate_texlist enforces it), and that requirement is what makes the
 # op safe. Rung 12's tri-list corrupted every triangle but the last because N primitives SHARED
 # three fixed arena slots while the batch was open. Here each primitive owns a 160-byte record in an
-# array and there is no coverage stage to share — the failure mode is not guarded against, it is
-# unrepresentable.
+# array and there is no coverage stage to share — WITHIN ONE OP the failure mode is not guarded
+# against, it is unrepresentable.
+#
+# ⛔⛔ AND THE SCOPE OF THAT CLAIM WAS WRONG — READ THIS BEFORE TRUSTING THE SENTENCE ABOVE.
+# "Unrepresentable" holds per-op and FAILS ACROSS OPS. GPU_TEXL_PREP_SUBOFF is ONE
+# fixed prep slot, so two op 0x0C records in one batched #92 array both rebuild it from the top and
+# the second build overwrites records the first dispatch has not read yet — rung 12's bug at the
+# op-to-op seam instead of the primitive-to-primitive one. Per-primitive records solved the inner
+# sharing and did nothing for the outer. gpu_tex_list now suspends gpu_batch_active around its
+# dispatch for exactly this reason; the argument for why lives there, next to the code that acts on
+# it. ⚠ A DOOM frame is ~640 columns against a GPU_TEX_LIST_MAX of 512, so the workload this rung
+# exists to serve is PHYSICALLY two ops — this was never going to stay theoretical.
 
 # gpu_texl_build — fill the record array from the caller's primitive array. Returns max(ph), or 0.
 # ⚠ Every field has already been validated by gpo_validate_texlist; this function does NO checking
@@ -5488,8 +5498,50 @@ fn gpu_tex_list(pkva, n_prims, uw, uh, udx, udy) {
     # ⚠ gy is `lrows`, NOT `maxh` — under COLMAJOR the row axis is the WIDTH. Passing maxh here would
     # launch a correctly-shaped grid for the wrong orientation: the picture would be right only for
     # square primitives, which is the shape every quick test happens to use.
-    return gpu_blend_cov_run(shader_mc, rec_mc, bb_mc, pitch, n_prims, tshift, 0,
+    #
+    # ⛔⛔ THIS DISPATCH MUST NOT STAY INSIDE THE OUTER BATCH — the 1.56.21 invariant, second op.
+    #
+    # gpu_tri_list carries this suspend already and the comment above it records what it cost. The
+    # reason it applies HERE TOO is narrower and was mis-stated by rung 14's own header note, which
+    # claimed the failure mode is "unrepresentable" for op 0x0C. That is true WITHIN one op — each
+    # primitive owns its own 160-byte record in the array, which is exactly what rung 12 lacked — and
+    # FALSE ACROSS TWO OPS, because GPU_TEXL_PREP_SUBOFF is ONE fixed prep slot and every op 0x0C in
+    # the array rebuilds it from the top:
+    #     gpo_execute_all sets gpu_batch_active for the whole #92 array (syscall.cyr)
+    #     gpu_blend_cov_run then only QUEUES dwords and returns — no tail, no fence, no wait
+    #     the next op 0x0C's gpu_texl_build overwrites all 512 records the first is still to read
+    # So a two-op array does not draw two lists; it draws the SECOND list twice, in the first list's
+    # grid. Per-primitive records made the failure unrepresentable per-op and did nothing at all for
+    # the op-to-op seam.
+    #
+    # ⭐ AND THE TARGET WORKLOAD IS PHYSICALLY TWO OPS. GPU_TEX_LIST_MAX is 512 and a DOOM frame is
+    # ~640 wall columns, so the frame rung 14b just made feasible CANNOT be expressed as one op. This
+    # is latent only for as long as nobody draws the thing the rung was built for.
+    #
+    # Suspending makes this dispatch emit its own tail and WAIT, so the prep slot is free the moment
+    # the call returns. It gives back the batching win for this op only — the real answer is a
+    # per-op record region (there is room: [0xBE000,0xC0000) spare, 51 more records) or a ring-side
+    # fence, and neither is a fence patch's job.
+    var saved_batch = gpu_batch_active;
+    gpu_batch_active = 0;
+    var rc = gpu_blend_cov_run(shader_mc, rec_mc, bb_mc, pitch, n_prims, tshift, 0,
     GPU_COMPUTE_PGM_RSRC1_TEX, n_prims << tshift, lrows, done_mc, done_phys);
+    gpu_batch_active = saved_batch;
+
+    # ⚠ SUSPEND LATE, RESTORE ONCE. Everything above this point is CPU-only work that does not care
+    # about the flag, so wrapping only the dispatch leaves exactly ONE restore site and no early
+    # return that can leak a cleared flag into the rest of the array. gpu_tri_list needs its restore
+    # duplicated on a failure path because its suspend spans a loop; this one must not grow that
+    # shape.
+    #
+    # ⚠ Re-arm the shared fence slot, same reason as gpu_tri_list: the dispatch above already fenced
+    # and drained, so the slot now reads DONE, and the outer batch tail would sail through its wait
+    # believing a program it has not yet emitted has finished.
+    if (saved_batch != 0) {
+        store32(gpu_arena_phys + GPU_BLEND_DONE_SUBOFF, GPU_MT_NOTYET);
+        gpu_mfence();
+    }
+    return rc;
 }
 
 # Print the texture prep record so a ring-3 tool computing the same thing INDEPENDENTLY can
