@@ -3,6 +3,82 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.29] - 2026-07-28
+
+**Rung 15 `bilinear` — the zero-burn foundation (open cycle).** Reference, model, and ABI, all proven
+on the host before a single shader instruction exists. Bumped on cycle open; the user tags on close.
+
+### Changed from the plan — INTEGER bilinear, not float, and the named risk is ELIMINATED
+
+gpu.md's rung-15 row specified `v_cvt_f32_ubyte0..3` + an f32 lerp + `v_cvt_pk_u8_f32`, and named its
+own risk: *"byte-identical vs a CPU reference using IDENTICAL rounding"*, restating the f64-fidelity
+lesson where `v_fma_f64` vs `v_mul`+`v_add` mismatched 29/64 cells. That risk is the whole cost of the
+float path — matching gfx9's f32 rounding at every step, in a reference written in another language on
+another unit.
+
+**A 4-tap bilinear on 8-bit texels does not need float, and the integer form is EXACT.** With 8-bit
+weights `w00=(256-fx)(256-fy)` etc., verified exhaustively on the host before the reference was written:
+
+- the weight sum is **exactly 65536 for all 65,536 (fx,fy) pairs**, so a flat texture reproduces with
+  **zero DC error** — and DC error is invisible in any A-vs-B diff where both sides share it;
+- the accumulator peaks at **16,711,680**, fitting a **32-bit lane** with 8 bits of headroom, so no
+  64-bit multiply is needed;
+- `fx=fy=0` returns `t00` bit-exactly for all 256 texel values.
+
+⇒ There is no reference-rounding problem to *solve*: there is no float, so nothing rounds differently.
+`v_mul_lo_u32` is already iron-proven as the `#82` MAC, and `tex_rgba.s` today contains **zero** `v_cvt`.
+⚠ Float remains the documented fallback with one specific trigger — weights finer than 8 bits per axis.
+For 8-bit texels that does not arise; nothing else reopens it.
+
+### Added — `bicore` / `bigate` / `bimodel`, the three-file split rungs 9b/11/13 earned
+
+- **`tests/gpu/bicore.cyr`** — the oracle. Integer-exact, WRAP (po2 mask) and CLAMP.
+- **`tests/gpu/bigate.cyr`** — 7 properties, exhaustive where it matters. **exit 95.**
+- **`tests/gpu/bimodel.cyr`** — the shader's sequence at 32-bit register widths, byte-diffed against
+  the reference over negative and multi-tile UV in both addressing modes, with 5 mutations proving
+  every gate is connected. **exit 95.** Green here + red on iron ⇒ the fault is the EMISSION.
+
+### Found — a wrap-only test suite CANNOT prove the shift kind is correct
+
+Mutation M2 flips the floor's arithmetic `>>>` to logical `>>`. On the WRAP sweep it came back
+**green**, and the honest reading was *"the gate is not connected"* rather than *"the mutation is
+wrong"*. It is connected — the substitution is **provably invisible under mask-WRAP**: the two shifts
+differ by a multiple of 2^48 and the wrap mask sees only the low ≤12 bits (`GPU_TEX_MAX_DIM` is 4096).
+
+Under **CLAMP** the same substitution is total: `floor(-1)` clamps to 0, a logical shift clamps to
+`n-1` — **the opposite edge of the texture**. So the clamp path was added to reference and model, M2 now
+fires there, and the WRAP line is **asserted green on purpose**: if a future change ever makes the shift
+kind observable under WRAP, that line goes red and reports that the addressing model moved.
+
+⚠ Without this the shader would have been correct under WRAP — which is what DOOM uses — and wrong on
+every clamped sample, with a wrap-only suite showing all green.
+
+### Added — `GPU_TEX_FLAG_BILINEAR = 0x10`, RESERVED and REFUSED
+
+The bit is named and the ABI returns **`GPO_E_NOTIMPL`**, because the shader does not exist.
+⛔ Accepting it would recreate exactly the defect 1.56.24 fixed — an ABI blessing requests its worker
+cannot execute. **`GPO_E_NOTIMPL` was minted in that cut for op `0x09`'s `DERIVE`; this is its second
+user.**
+
+⚠ It required a two-level split to answer correctly. The first attempt returned `GPO_E_RESERVED`,
+because `gpo_validate`'s outer check calls any unlisted bit garbage. `BILINEAR` is now a **known name**
+at the outer level (`gpo_flags_known`) and **unbuilt** at the inner (`gpo_validate_tritex`) — "stop
+setting that bit" and "that flag is real but this kernel cannot run it" are different problems with
+different fixes. Deliberately **not** widened into `GPU_TEX_FLAGS_KNOWN` itself, or a future op reusing
+that constant would silently inherit a flag it has no shader for.
+
+ABI battery **91 → 93 of 93**; `edge-abi-smoke` **16 passed, 0 failed**.
+
+### Scoped — ONE blob, op 0x0B only
+
+The shader-copy rule makes a variant a **new blob**, never an edit or a runtime branch. Covering `0x0C`
+and its col-major twin too would mean **three** ~400-dword hand-assembled blobs with three drift gates,
+doubling the shader surface for a filter with **no consumer at all** — DOOM samples nearest. The 3D
+section's rule 2 says the kernel is never more than one rung ahead of a shipped consumer, and it is
+already six ahead. The list variants wait for someone to ask.
+
+**Remaining for rung 15:** the blob itself, then a `gputex` arm demanding byte-identity on iron.
+
 ## [1.56.28] - 2026-07-28
 
 **`gpu_tex_prep`: 40 uncached stores → 20 (open cycle).** The record is written with `store64` pairs.

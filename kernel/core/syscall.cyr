@@ -1100,6 +1100,25 @@ var GPU_TEX_FLAG_COLMAJOR = 0x08;    # op 0x0C only: lanes walk Y; tile_shift fr
 # make 0x0B accept-and-IGNORE this bit — exactly the failure mode the flags vocabulary exists to
 # prevent. Op 0x0B must keep REJECTING 0x08.
 var GPU_TEXL_PRIM_FLAGS_KNOWN = 0x0F;   # op 0x0C per-primitive: IDX8 | FULLCOV | WRAP | COLMAJOR
+
+# ⭐ RUNG 15 (1.56.29) — BILINEAR. The bit is RESERVED AND NAMED, and the ABI REFUSES it, because the
+# shader does not exist yet.
+# ⛔⛔ ACCEPTING IT NOW WOULD RECREATE THE EXACT DEFECT 1.56.24 FIXED. That cut found op 0x09 blessing
+# GPU_RULE_EVENODD and GPU_TRI_FLAG_DERIVE that its worker refuses — requests that passed validation and
+# died deep in pass 2 as an opaque GPO_E_DISPATCH. The rule earned there is that **the ACCEPTED surface
+# must equal the PROVEN surface**, so a named-but-unbuilt flag returns GPO_E_NOTIMPL, which is the code
+# minted in that same cut for precisely this situation. This is its second user.
+# ⚠ Deliberately NOT added to either FLAGS_KNOWN mask: leaving it out would make it read as a garbage
+# bit (GPO_E_RESERVED, "stop setting that"), when the truthful answer is "that flag is real, it is
+# spelled correctly, and this kernel cannot execute it yet" — a different problem with a different fix.
+# ⇒ Delete the reject in the SAME change that lands the blob, never before.
+# ⚠ SCOPE, decided 2026-07-28: op **0x0B ONLY**. The shader-copy rule makes a variant a NEW BLOB rather
+# than an edit or a runtime branch, so covering 0x0C and its col-major twin as well would mean THREE
+# new ~400-dword hand-assembled blobs with three drift gates — doubling the shader surface for a filter
+# that has **no consumer at all** (DOOM is a 1993 renderer; it samples nearest). The 3D section's own
+# rule 2 says the kernel is never more than one rung ahead of a shipped consumer, and it is already six
+# ahead. One blob, one op, and the list variants wait for someone to ask.
+var GPU_TEX_FLAG_BILINEAR = 0x10;    # op 0x0B: 4-tap bilinear. RESERVED — see GPO_E_NOTIMPL below.
 var GPU_TEX_LUT_ENTRIES = 256;       # a full byte of index; a short LUT is a reject, not a clamp
 
 # ⭐ RUNG 14 — N TEXTURED PRIMITIVES IN ONE DISPATCH. The rung's structural blocker, measured.
@@ -1181,7 +1200,13 @@ var GPU_OP_FLAGS_KNOWN = 0x00;
 # that is how a caller gets behaviour it did not ask for. Default is "no flags at all".
 fn gpo_flags_known(op) {
     if (op == GPU_OP_TRI_RGBA) { return GPU_TRI_FLAG_DERIVE; }
-    if (op == GPU_OP_TRI_TEX)  { return GPU_TEX_FLAGS_KNOWN; }
+    # ⭐ BILINEAR is added HERE but deliberately NOT to GPU_TEX_FLAGS_KNOWN itself. The two tests ask
+    # different questions and must keep giving different answers:
+    #   this one (outer, gpo_validate) — "is that bit a NAME this op knows?"  yes ⇒ fall through
+    #   gpo_validate_tritex (inner)     — "can this kernel EXECUTE it?"       no  ⇒ GPO_E_NOTIMPL
+    # Widening the shared constant instead would let the inner unknown-bit test accept it too, and a
+    # future op reusing GPU_TEX_FLAGS_KNOWN would silently inherit a flag it has no shader for.
+    if (op == GPU_OP_TRI_TEX)  { return GPU_TEX_FLAGS_KNOWN | GPU_TEX_FLAG_BILINEAR; }
     if (op == GPU_OP_TEX_LIST) { return 0; }   # per-PRIMITIVE flags live in the array, not here
     return GPU_OP_FLAGS_KNOWN;
 }
@@ -1520,6 +1545,11 @@ fn gpo_validate_texlist(rec, fbw, fbh) {
 
 fn gpo_validate_tritex(rec, fbw, fbh) {
     var flags = load32(rec + 4) & 0xFFFFFFFF;
+    # ⭐ BILINEAR is a REAL, correctly-spelled flag whose shader is not built (rung 15, 1.56.29). It is
+    # refused with GPO_E_NOTIMPL — "you asked correctly for something unbuilt" — and checked BEFORE the
+    # generic unknown-bit test below, which would otherwise call it GPO_E_RESERVED, i.e. "that bit is
+    # not a thing". Different diagnosis, different fix for the caller. Delete this with the blob.
+    if ((flags & GPU_TEX_FLAG_BILINEAR) != 0) { return GPO_E_NOTIMPL; }
     if ((flags & (0 - 1 - GPU_TEX_FLAGS_KNOWN)) != 0) { return GPO_E_RESERVED; }
 
     var wh  = load32(rec + 16) & 0xFFFFFFFF;
@@ -2467,6 +2497,19 @@ fn edge_abi_selftest() {
     pass = pass + ea_expect(&d, GPO_E_RESERVED, "tex: unknown flag bit", 21);
     store32(&d +  4, 0);
 
+    # ⭐ RUNG 15: BILINEAR is RESERVED-BUT-UNBUILT, and the two diagnoses must stay distinguishable.
+    # 0x08 above is a garbage bit ⇒ GPO_E_RESERVED ("that bit is not a thing"). 0x10 is a REAL flag
+    # whose shader does not exist ⇒ GPO_E_NOTIMPL ("you asked correctly for something unbuilt"). If
+    # these ever collapse to one code the caller cannot tell "stop setting that" from "take the other
+    # path", which is the whole reason GPO_E_NOTIMPL was minted at 1.56.24.
+    # ⛔ FLIP THIS TO ea_expect_valid IN THE SAME CHANGE THAT LANDS THE BLOB — not before, and not in
+    # a separate tidying pass. An ABI that accepts what no worker executes is the defect 1.56.24 fixed.
+    store32(&d +  4, GPU_TEX_FLAG_BILINEAR);
+    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "tex: BILINEAR is reserved but unbuilt", 37);
+    store32(&d +  4, GPU_TEX_FLAG_BILINEAR | 0x02);   # with a LEGAL companion flag
+    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "tex: BILINEAR refused even alongside FULLCOV", 44);
+    store32(&d +  4, 0);
+
     store32(&d + 28, (8 * 65536) + 0);
     pass = pass + ea_expect(&d, GPO_E_TEXDIM, "tex: texture width zero", 23);
     store32(&d + 28, (0 * 65536) + 8);
@@ -2716,8 +2759,8 @@ fn edge_abi_selftest() {
         r = r + 1;
     }
 
-    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 91 cases correct\n", 21);
-    if (pass == 91) {
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 93 cases correct\n", 21);
+    if (pass == 93) {
         kprint("edge-abi: PASS -- the 0x08/0x09/0x0A/0x0B/0x0C ABIs reject every malformed record,\n", 83);
         kprint("edge-abi: and a well-formed one is accepted or correctly reports no-GPU.\n", 73);
         return 1;
