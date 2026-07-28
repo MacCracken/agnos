@@ -95,12 +95,23 @@ stage_one cyim         src/main.cyr cyim     || rc=1
 # The seam mabda/tentib consume for GPU inference. Runs only on real AMD iron
 # (the GPU arc is not exercised under QEMU); harmless -1 on non-GPU boots.
 stage_one gpumm        src/main.cyr gpumm    || rc=1
-# tonegen is IN-TREE (agnos/audio-test), not a sibling repo — hence the agnos/ prefix,
+# tonegen is IN-TREE (agnos/tests/audio), not a sibling repo — hence the agnos/ prefix,
 # which stage_one resolves through $SIBLINGS. It is the ring-3 end of the display-audio
 # path: with HDA_HDMI=1 the kernel makes the GPU's HDMI controller the live sink, so
 # this streams its tone out over HDMI with no device flag. Without it staged there is
 # nothing in /bin to produce samples, and the armed audio path stays silent.
-stage_one agnos/audio-test tonegen.cyr tonegen || rc=1
+# ⛔ PATH FIXED 1.56.27 — this said `agnos/audio-test`, which HAS NOT EXISTED for some time;
+# tonegen lives at `agnos/tests/audio/` (the same `tests/<family>` shape as `tests/gpu`), and
+# `scripts/smoke/tonegen-smoke.sh` has been building it from there via `TG_ROOT="$ROOT/tests/audio"`
+# the whole while. So the staging entry was resolving to a directory that does not exist, printing
+# `ERROR: agnos/audio-test not found`, and making stage-tools.sh **exit 1 on every single run**.
+# ⚠ THE COST OF THAT was not the missing binary — it was the exit code. A non-zero exit from staging
+# is the one signal that says "a tool did not make it onto the fs", and it was firing unconditionally,
+# so it carried no information and got read as background noise. Any tool that genuinely failed to
+# stage would have looked exactly the same. Found 2026-07-28 while prepping the 1.56.26 burn, in the
+# same pass that caught `gpuprof` never being staged at all — the two are the same failure with
+# different symptoms.
+stage_one agnos/tests/audio tonegen.cyr tonegen || rc=1
 
 # GPU display/compositing proofs — the ring-3 ends of the 1.55.x/1.56.x band. IN-TREE
 # (agnos/tests/gpu), same agnos/ prefix as tonegen. These were staged BY HAND for every burn
