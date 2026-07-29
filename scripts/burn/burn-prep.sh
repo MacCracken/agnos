@@ -1003,6 +1003,18 @@ if ! grep -qa -- "NEGATIVE CONTROL N" build/rootfs/bin/gputri 2>/dev/null; then
     exit 1
 fi
 echo "  staged /bin/gputri carries --cov, --digest, --bench and the N1-N8 controls"
+# ⛔ RUNG 17: gpudepth must carry its WARM-UP, not merely exist. Its first burn measured its own
+# instrument -- gpu_rt_arm() runs the rung-6 audit on the first call of a boot, and that audit ends in
+# a 64 KB klug_spill() to NVMe, which landed INSIDE the timed loop and outweighed the measurement
+# ~500x. A pre-warm-up gpudepth still runs, still prints totals, and still exits 94 against a worker
+# that is fine -- a green-looking red with a wrong diagnosis. Presence of the tool is not presence of
+# the correction.
+if ! grep -qa -- "armed (the rung-6 audit ran OUTSIDE" build/rootfs/bin/gpudepth 2>/dev/null; then
+    echo "burn-prep: STAGED /bin/gpudepth LACKS its warm-up -- it would time the rung-6 audit."
+    echo "  Fix:  sh scripts/burn/stage-tools.sh --build"
+    exit 1
+fi
+echo "  staged /bin/gpudepth warms up outside the timed region"
 case "$BUILD_TAG" in
     *MODESET_AUDIO*)
         # The flags the operator is told to type MUST exist in the binary that gets flashed.

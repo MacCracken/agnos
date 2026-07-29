@@ -114,6 +114,32 @@ packet (CP-DMA `BYTE_COUNT` is 26 bits, ~64 MiB).
 count past 64 MiB would silently truncate and report success. The per-handle bound keeps this path
 off that edge; a larger `GPU_RT_HANDLE_SIZE` would have to split the call.
 
+### ⛔⛔ Then the confirming burn falsified 3 of 4 predictions — the INSTRUMENT was measuring itself
+
+`depth.txt`. Exit **94**, ratio **inverted**: the 1.92 MB clear looked **28× slower** than the 32 MB
+one. Both statements below are true, and the gap between them is the finding.
+
+**The fix worked — 254×.** The 32 MB clear went **221,875 µs → 873 µs**, i.e. **38.4 GB/s** where it
+had been 151 MB/s. ⭐ And the per-row model is now confirmed to **0.1%**, not a two-point
+coincidence: removing the one-time cost below and re-fitting the *previous* burn gives **108.2 µs/row**
+for 800×600 and **108.3 µs/row** for 4096×2048 — two independent rects.
+
+**The instrument was the problem.** `gpu_depth_clear` calls `gpu_rt_arm()`, which on the **first call
+of a boot** runs the whole rung-6 audit — and that audit ends in **`klug_spill()`, a 64 KB write of
+the log ring to ext2 on NVMe**. It landed **inside the first timed loop**: ~490 ms of filesystem I/O
+amortised across 20 iterations of ~50 µs of real work. The setup outweighed the measurement **~500×**
+and fired the discrimination gate against a worker that was fine. `gpudepth` now issues a throwaway
+64×64 clear **before** any timer starts.
+
+⚠ **Correction to the entry above**: the published **"89 ms per 800×600 clear, ~21 MB/s"** was
+contaminated by that same one-time cost divided across 20 reps. **The true per-clear was 64.9 ms**,
+~30 MB/s. The *conclusion* — per-row dispatch dominates — was right and is now confirmed to 0.1%; the
+number was not.
+
+⚠ The exit-94 diagnosis text was also stale: it still named `gpu_cp_dma_fill_rect`, which the worker
+no longer calls. It now lists the one-time-cost case **first**, because that is how the gate actually
+fired.
+
 ### ⭐ The transferable lesson — when the target is unreadable, cost is still observable
 
 Op `0x0D` writes a kernel-owned buffer ring 3 cannot read: no `#86` slot, and `#90` reads the
@@ -121,9 +147,17 @@ framebuffer, not Z. So there was **no byte-comparison oracle available**, and th
 "did it return 0". **It did return 0 — on a path three orders of magnitude off.** A return-code
 oracle would have closed rung 17's first op green.
 
-⇒ **Cost that must SCALE is a real oracle, and two points beat one**: a single 89 ms measurement has
+⇒ **Cost that must SCALE is a real oracle, and two points beat one**: a single measurement has
 nothing to be wrong against. Same shape as the discrimination gate that caught rung 15's half-texel
 offset — the useful check is the one comparing against something other than the thing under test.
+
+⚠ **And the sharper half, learned the hard way one burn later:** this oracle caught **two** real
+defects in two burns — a 254× worker bug, then its own contamination. But the second presented with
+**every return code 0, the gate firing correctly, and its stated diagnosis wrong.** A gate can be
+right that something is broken and wrong about *what* — and **the failure text is the part nobody
+mutation-tests.** A per-iteration average that silently contains a one-time cost lies by a factor
+nobody can see; warm up outside the timed region, and when a ratio **inverts** rather than merely
+missing, suspect the instrument before the subject.
 
 ### ⛔ Fixed — `gpuwedge --audit` claimed "READ-ONLY, writes nothing" and WROTE
 

@@ -132,20 +132,30 @@ carveout base, i.e. the console FB at offset 0, exactly where the map says. Not 
 have been VOID), not inside the region. TD-3's placement is confirmed against HARDWARE.
 ✅ **Op `0x0D` DEPTH_CLEAR is live on iron** — minted with its worker, mask `0x1F1F -> 0x3F1F`, ABI
 battery **103/103**, gated so nothing can store until the audit passes on that boot.
-⛔⛔ **AND THE BURN FOUND A ~1000x PERF DEFECT THE RUBRIC DID NOT ASK ABOUT.** 89 ms per 800x600
-clear = **21 MB/s**, against gputex's 3748 MB/s. The ≥2x gate passed (2.4x) and did its job —
-separating work from no-work — but **2.4x against a 17x byte ratio** is the second signal.
-Two-point fit: **91.5 us PER ROW**, dispatch-shaped, not bandwidth-shaped. Cause:
-`gpu_cp_dma_fill_rect` issues **one CP-DMA packet per row with its own fence wait** — 600 packets for
-800x600 — and a depth buffer is **contiguous**, so all of them were adjacent. The whole 32 MB handle
-fits ONE packet (CP-DMA BYTE_COUNT is 26 bits, ~64 MiB). **Fixed** to a single `gpu_cp_dma_fill`.
-⚠ `gpu_cpdma_submit` **masks** the byte count rather than rejecting it, so >64 MiB would silently
-truncate and report success; the handle bound keeps this path off that edge.
-⭐ **THE TRANSFERABLE LESSON: the target is unreadable from ring 3, so the obvious oracle was "did it
-return 0" — and it DID, on a path three orders of magnitude off.** When you cannot read the result,
-cost is still observable, and cost that must SCALE is a real oracle. Two points beat one.
-▶ **REMAINING: a confirming burn for the fix** (pre-registered in the tracker — 800x600 total must
-drop below 100,000 us from 1,788,344; ratio must move TOWARD 17x). Rides the next flash, no new tool.
+⛔⛔ **AND THE BURN FOUND A PERF DEFECT THE RUBRIC DID NOT ASK ABOUT — fixed, 254x, then the
+CONFIRMING burn falsified 3 of 4 predictions and found the INSTRUMENT was the problem.**
+`gpu_cp_dma_fill_rect` issued **one CP-DMA packet per row with its own fence wait** (600 packets for
+800x600) on a **contiguous** buffer. Replaced with a single `gpu_cp_dma_fill`: the 32 MB clear went
+**221,875 -> 873 us = 254x**, i.e. **38.4 GB/s** where it had been 151 MB/s. ⭐ The per-row model is
+now confirmed to **0.1%**: 108.2 us/row (800x600) vs 108.3 us/row (4096x2048), two independent rects.
+⛔⛔ **THE CONFIRMING BURN (`depth.txt`) CAME BACK exit 94 WITH THE RATIO INVERTED** — 1.92 MB looked
+**28x SLOWER** than 32 MB. Cause: `gpu_depth_clear` -> `gpu_rt_arm()` runs the whole rung-6 audit on
+the FIRST call of a boot, and that audit ends in **`klug_spill()` — a 64 KB ext2 write to NVMe**,
+which landed **inside the first timed loop**. ~490 ms of I/O amortised over 20 iterations of ~50 us
+of real work: **the instrument's setup outweighed the measurement ~500x** and fired the
+discrimination gate against a worker that was fine. Fixed: `gpudepth` warms up outside the timer.
+⚠ **CORRECTION**: the earlier "89 ms per 800x600 clear / 21 MB/s" figure was contaminated by that
+same one-time cost. **True per-clear was 64.9 ms**, ~30 MB/s. The CONCLUSION (per-row dispatch
+dominates) was right and is now confirmed to 0.1%; the number was not.
+⭐ **THE TRANSFERABLE PART: the timing oracle has caught TWO real defects in two burns on a target
+that cannot be read back at all — a 254x worker bug, then its own contamination.** But note how the
+second presented: **every return code was 0, the gate fired CORRECTLY, and its stated diagnosis was
+WRONG.** A gate can be right that something is broken and wrong about what — and the failure text is
+the part nobody mutation-tests. ⇒ **A per-iteration average silently containing a one-time cost lies
+by a factor nobody can see. Warm up outside the timed region; when a ratio INVERTS rather than merely
+missing, suspect the instrument before the subject.**
+▶ **REMAINING: re-run `gpudepth`** (pre-registered: small total 500-3,000 us, ratio 12-20x, exit 95).
+No new tool, no code change beyond the staged binary.
 
 Remaining after rung 15 — ⚠ **this list was STALE by +2 until 2026-07-28** (it still carried the
 pre-renumbering mapping and collapsed rungs 17/18/19 into one cut); [`planning/gpu.md`](planning/gpu.md)

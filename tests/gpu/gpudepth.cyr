@@ -89,6 +89,27 @@ fn main(): i64 {
     puts2("gpudepth: so a zero return code proves only that the syscall returned.");
     nl();
 
+    # ⛔⛔ WARM UP OUTSIDE THE TIMED REGION. THE FIRST BURN OF THIS TOOL MEASURED ITS OWN INSTRUMENT.
+    # gpu_depth_clear calls gpu_rt_arm(), which on the FIRST call of a boot runs the whole rung-6
+    # audit -- and that audit ends in klug_spill(), a 64 KB write of the log ring to ext2 on NVMe.
+    # That landed INSIDE the first timed loop and cost ~490 ms, which is ~500x the work being
+    # measured. It made the 1.92 MB clear look 28x SLOWER than the 32 MB one and fired the
+    # discrimination gate against a worker that was fine.
+    # ⚠ The contamination was present in the FIRST burn too, where it inflated the small clear's
+    # apparent cost from 64.9 ms to 89 ms -- so a published per-clear figure was wrong even though
+    # the conclusion drawn from it (per-row dispatch dominates) was right. An instrument that
+    # includes a one-time cost in a per-iteration average is lying by a factor nobody can see.
+    var warm = gd_clear(0, 64, 64, 0);
+    if (warm != 0) {
+        puts2("gpudepth: the warm-up clear was refused.");
+        puts2("gpudepth:   reason 7 (GPO_E_ARM) means rung 6's audit did NOT pass on this boot --");
+        puts2("gpudepth:   the render-target region is not provably free, so nothing was written.");
+        puts2("gpudepth:   Run `gpuwedge --rt-audit` and read WHICH of its seven checks refused.");
+        return 90;
+    }
+    puts2("gpudepth: armed (the rung-6 audit ran OUTSIDE the timed region -- see the note in source)");
+    nl();
+
     # ⭐ THE SMALL CLEAR FIRST, so that if the region is not armed we refuse before doing 17x the work.
     var reps = 20;
     var small = gd_time(0, 800, 600, reps);
@@ -119,9 +140,12 @@ fn main(): i64 {
     # tight bound would turn a bandwidth surprise into a false red.
     if (large < small * 2) {
         puts2("gpudepth: ⛔ 32 MB costs less than 2x the time of 1.92 MB -- the cost did NOT scale.");
-        puts2("gpudepth:   Both clears returned 0, so the ABI path works; suspect the WORKER is a");
-        puts2("gpudepth:   no-op -- check gpu_cp_dma_fill_rect's row_bytes/rows and that the MC");
-        puts2("gpudepth:   address from gpu_rt_handle_mc is non-zero.");
+        puts2("gpudepth:   Both clears returned 0, so the ABI path works. Suspects, in order:");
+        puts2("gpudepth:   (1) something ONE-TIME landed inside a timed loop -- that is what the");
+        puts2("gpudepth:       warm-up above exists to prevent, and it is how this gate first fired;");
+        puts2("gpudepth:   (2) gpu_cp_dma_fill's byte count is wrong or masked (BYTE_COUNT is 26");
+        puts2("gpudepth:       bits and gpu_cpdma_submit MASKS rather than rejects);");
+        puts2("gpudepth:   (3) gpu_rt_handle_mc returned 0 and the fill went nowhere.");
         return 94;
     }
     puts2("gpudepth: cost scaled with size -- the fill is doing real work.");
