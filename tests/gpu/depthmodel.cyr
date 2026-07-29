@@ -16,9 +16,36 @@
 #    header says it outright: *everything constant per triangle belongs on the CPU.*
 #    ⇒ Proving `hoisted == reference` is a real claim, not bookkeeping: the algebra that says the
 #    edge function is affine in (x,y) is exactly where a sign or a term goes missing.
-# 2. **32-BIT LANES.** Every accumulate is masked to 32 bits, because `v_mul_lo_u32` / `v_add_u32`
-#    are 32-bit. Gate A4 shows the depth numerator PEAKS well inside that; the model proves the
-#    shader's actual sequence never exceeds it, which is a different claim.
+# 2. **32-BIT LANES, ON EVERY LANE, FROM THE RESIDUES THE RECORD ACTUALLY CARRIES.** Every accumulate
+#    is masked to 32 bits and sign-restored, because `v_mul_lo_u32` / `v_add_u32` are 32-bit and the
+#    compares that read them are `v_cmp_*_i32`.
+#
+# ============================================================================================
+# ⛔⛔ THREE LANE-FIDELITY DEFECTS FIXED 2026-07-29 (plan bite B0). EACH ONE MADE THE MODEL PROVE
+#     SOMETHING WEAKER THAN IT CLAIMED, AND EACH WAS GREEN.
+# ============================================================================================
+# (a) **`zn` WAS ACCUMULATED IN UNMASKED i64** while `w0/w1/w2` were masked and sign-restored beside
+#     it. So the file's headline claim -- "at 32-bit lane widths" -- was true of the edge functions
+#     and false of the depth numerator, which is the ONE value this rung is about.
+# (b) **`KX/KY/KC` AND `area` WERE UNMASKED**, so the model computed from i64 coefficients the record
+#     cannot hold. `KX = sum(A_i z_i)` reaches ~2^39 at legal inputs; the record stores **mod-2^32
+#     residues** (plan 4.2 item 7). Computing from the true value instead of the residue is exact only
+#     because mod-2^32 is a ring homomorphism -- which is a THEOREM THE MODEL SHOULD WITNESS, not
+#     assume. `dm_ra/rb/rc` + `dm_kx32/ky32/kc32` now carry the residues and the lane path reads them.
+# (c) **`zn` WAS EVALUATED ONLY INSIDE THE TRIANGLE.** The shader is PREDICATED, never branched (plan
+#     4.4), so it evaluates `zn` on all 64 lanes of the tile including far outside. A bound derived
+#     over inside pixels is a bound over a domain the shader does not run on. Measured by an attacker:
+#     a triangle passing every proposed validator rule peaks at |zn| = 3.264e9 over its own bounding
+#     box -- **1.52x past a 32-bit lane** -- while its inside peak is legal. A4 reported 2,430,400
+#     (inside only) against a whole-frame peak; it now reports the whole frame, which is what the
+#     validator's corner bound (plan 1.4 rule 18) has to be sized against.
+#
+# ⭐ The new gates are **A5** (every lane's 32-bit value equals its true value) and **A6** (the
+# identity `w0 + w1 + w2 == area` AT LANE WIDTH, which the shader's derived `w2 = area - w0 - w1`
+# depends on and which nothing had ever checked). M5/M6 prove both are connected.
+# ⛔ M5 is the instructive one: it adds a MULTIPLE OF 2^32 to `KC`, so the residue -- and therefore
+# every rendered pixel -- is **byte-identically unchanged**, and only A5 moves. That is a defect the
+# reference diff is structurally incapable of seeing.
 #
 # ============================================================================================
 # ⛔⛔ WHAT THIS FILE DOES **NOT** COVER, STATED FIRST SO THE GREEN IS NOT OVER-READ
@@ -47,21 +74,46 @@ var dm_mut_quant  = 0;   # M2 quantise z -- simulates a divide that loses low bi
 var dm_mut_ulp    = 0;   # M2c z off by ONE -- the realistic divide error
 var dm_mut_acc16  = 0;   # M3 truncate the accumulator to 16 bits
 var dm_mut_swapk  = 0;   # M4 swap KX/KY
+var dm_mut_kcbig  = 0;   # M5 add a MULTIPLE OF 2^32 to KC -- residue unchanged, true value not
+var dm_mut_area1  = 0;   # M6 area off by one -- breaks the derived-w2 identity
 
 var DM_QUANT = 4;        # M2's shift: z = (z >> 4) << 4
 
+# dm_lane(v) — ONE 32-BIT LANE. Mask to 32 bits and restore the sign: exactly what a `v_mul_lo_u32`
+# or `v_add_u32` result is when the `v_cmp_*_i32` that reads it interprets those 32 bits.
+# ⚠ Forgetting the restore is the rung-11 unsigned-high-half defect in miniature.
+fn dm_lane(v): i64 {
+    var m = v & DM_MASK32;
+    if (m >= 2147483648) { m = m - 4294967296; }
+    return m;
+}
+
 # dm_hoist(t) — per-triangle CPU work: the three edge planes and the depth-numerator plane.
 # Results land in globals, mirroring "one record per triangle, written by the CPU".
-var dm_ea[3]; var dm_eb[3]; var dm_ec[3];      # edge i: A*x + B*y + C
-var dm_kx = 0; var dm_ky = 0; var dm_kc = 0;   # depth numerator plane
+#
+# ⭐ TWO PARALLEL SETS, DELIBERATELY. `dm_e*` / `dm_k*` are the TRUE i64 values -- the arithmetic
+# truth, which nothing in the hardware ever holds. `dm_r*` / `dm_k*32` are the **mod-2^32 residues**,
+# which is what a 32-bit record field actually carries and what the shader loads into an SGPR. The
+# lane path reads ONLY the residues. Keeping both is what lets A5 assert they agree rather than
+# assuming the homomorphism that makes the residues legitimate.
+var dm_ea[3]; var dm_eb[3]; var dm_ec[3];      # edge i: A*x + B*y + C, TRUE i64
+var dm_ra[3]; var dm_rb[3]; var dm_rc[3];      # the same three planes as mod-2^32 RESIDUES
+var dm_kx = 0; var dm_ky = 0; var dm_kc = 0;   # depth numerator plane, TRUE i64
+var dm_kx32 = 0; var dm_ky32 = 0; var dm_kc32 = 0;
 var dm_area = 0;
 
 fn dm_edge_plane(i, ax, ay, bx, by): i64 {
     # E(x,y) = (bx-ax)*(y-ay) - (by-ay)*(x-ax)
     #        = -(by-ay)*x + (bx-ax)*y + [ (by-ay)*ax - (bx-ax)*ay ]
-    store64(&dm_ea + i * 8, 0 - (by - ay));
-    store64(&dm_eb + i * 8, bx - ax);
-    store64(&dm_ec + i * 8, (by - ay) * ax - (bx - ax) * ay);
+    var a = 0 - (by - ay);
+    var b = bx - ax;
+    var c = (by - ay) * ax - (bx - ax) * ay;
+    store64(&dm_ea + i * 8, a);
+    store64(&dm_eb + i * 8, b);
+    store64(&dm_ec + i * 8, c);
+    store64(&dm_ra + i * 8, a & DM_MASK32);
+    store64(&dm_rb + i * 8, b & DM_MASK32);
+    store64(&dm_rc + i * 8, c & DM_MASK32);
     return 0;
 }
 
@@ -81,55 +133,88 @@ fn dm_hoist(t): i64 {
     dm_kc = z0 * load64(&dm_ec + 0) + z1 * load64(&dm_ec + 8) + z2 * load64(&dm_ec + 16);
     if (dm_mut_swapk != 0) { var s = dm_kx; dm_kx = dm_ky; dm_ky = s; }
     if (dm_mut_dropc != 0) { dm_kc = 0; }
+    # M5 -- a MULTIPLE of 2^32. The residue is bit-identical, so every rendered pixel is unchanged
+    # and the reference diff cannot move. Only the lane-fidelity counter can see it.
+    if (dm_mut_kcbig != 0) { dm_kc = dm_kc + 3 * 4294967296; }
     # ⭐ area is the SUM of the three edge planes and is constant in (x,y) -- the x and y terms
     # cancel identically. Computing it as the sum rather than as a fresh cross product is what makes
     # that cancellation observable rather than assumed.
     dm_area = load64(&dm_ec + 0) + load64(&dm_ec + 8) + load64(&dm_ec + 16);
+    if (dm_mut_area1 != 0) { dm_area = dm_area + 1; }
+    dm_kx32 = dm_kx & DM_MASK32;
+    dm_ky32 = dm_ky & DM_MASK32;
+    dm_kc32 = dm_kc & DM_MASK32;
     return 0;
 }
 
 var dm_cbuf[512];
 var dm_zbuf[512];
 var dm_ties = 0;
-var dm_peak = 0;          # largest |zn| seen -- A4 checks it against a 32-bit lane
+var dm_peak = 0;          # largest TRUE |zn| over EVERY LANE -- A4 checks it against a 32-bit lane
+var dm_lane_bad = 0;      # lanes where the 32-bit residue path != the true i64 value  (A5)
+var dm_sum_bad = 0;       # lanes where (w0 + w1 + w2) != area at lane width           (A6)
 
 fn dm_render(w, h, zclear, bg): i64 {
     dm_ties = 0;
     dm_peak = 0;
+    dm_lane_bad = 0;
+    dm_sum_bad = 0;
     var py = 0;
     while (py < h) {
         var px = 0;
         while (px < w) {
-            var pxq = 2 * px + 1;
-            var pyq = 2 * py + 1;
+            # ⚠ SCREEN coordinates -- dc_ox/dc_oy, exactly as dc_render does it. Missing this made the
+            # model sample at x = 0 while the off-origin frame's vertices sat at x = 700; A7c caught it
+            # on the first frame capable of seeing it, and the shipped corpus never could.
+            var pxq = 2 * (dc_ox + px) + 1;
+            var pyq = 2 * (dc_oy + py) + 1;
             var pz = zclear;
             var pc = bg;
             var t = 0;
             while (t < dc_n) {
                 dm_hoist(t);
-                var w0 = (load64(&dm_ea + 0)  * pxq + load64(&dm_eb + 0)  * pyq + load64(&dm_ec + 0))  & DM_MASK32;
-                var w1 = (load64(&dm_ea + 8)  * pxq + load64(&dm_eb + 8)  * pyq + load64(&dm_ec + 8))  & DM_MASK32;
-                var w2 = (load64(&dm_ea + 16) * pxq + load64(&dm_eb + 16) * pyq + load64(&dm_ec + 16)) & DM_MASK32;
-                # ⚠ Sign-restore from the 32-bit lane. The masks above ARE the lane; the compare
-                # below needs the signed value, and forgetting this is the rung-11 unsigned-high-half
-                # defect in miniature.
-                if (w0 >= 2147483648) { w0 = w0 - 4294967296; }
-                if (w1 >= 2147483648) { w1 = w1 - 4294967296; }
-                if (w2 >= 2147483648) { w2 = w2 - 4294967296; }
+                # ---- ⭐ EVERY LANE EVALUATES, INSIDE OR NOT --------------------------------------
+                # The shader is PREDICATED, never branched (plan 4.4): it computes w0/w1/w2 and zn on
+                # all 64 lanes of the tile and masks only the UPDATE. So the model evaluates them
+                # unconditionally too. Until 2026-07-29 `zn` was computed inside the `inside` test,
+                # which made A4's peak a bound over a domain the shader does not run on.
+                var w0t = load64(&dm_ea + 0)  * pxq + load64(&dm_eb + 0)  * pyq + load64(&dm_ec + 0);
+                var w1t = load64(&dm_ea + 8)  * pxq + load64(&dm_eb + 8)  * pyq + load64(&dm_ec + 8);
+                var w2t = load64(&dm_ea + 16) * pxq + load64(&dm_eb + 16) * pyq + load64(&dm_ec + 16);
+                var znt = dm_kx * pxq + dm_ky * pyq + dm_kc;
+                # ---- the SAME four numbers as the shader has them: from the mod-2^32 RESIDUES the
+                # record carries, in 32-bit lanes, sign-restored for the signed compares.
+                var w0 = dm_lane(load64(&dm_ra + 0)  * pxq + load64(&dm_rb + 0)  * pyq + load64(&dm_rc + 0));
+                var w1 = dm_lane(load64(&dm_ra + 8)  * pxq + load64(&dm_rb + 8)  * pyq + load64(&dm_rc + 8));
+                var w2 = dm_lane(load64(&dm_ra + 16) * pxq + load64(&dm_rb + 16) * pyq + load64(&dm_rc + 16));
+                var zn = dm_lane(dm_kx32 * pxq + dm_ky32 * pyq + dm_kc32);
+                var arl = dm_lane(dm_area);
+                # ---- A4: the peak is of the TRUE value, over the WHOLE FRAME. That is the number the
+                # validator's corner bound (plan 1.4 rule 18) must be sized against.
+                var mag = znt;
+                if (mag < 0) { mag = 0 - mag; }
+                if (mag > dm_peak) { dm_peak = mag; }
+                # ---- A5: the residue path agrees with the truth on this lane. Equality holds exactly
+                # when the true value fits a signed 32-bit lane, because mod-2^32 is a ring
+                # homomorphism -- so this counter IS the witness for that theorem, per lane.
+                if (w0 != w0t) { dm_lane_bad = dm_lane_bad + 1; }
+                if (w1 != w1t) { dm_lane_bad = dm_lane_bad + 1; }
+                if (w2 != w2t) { dm_lane_bad = dm_lane_bad + 1; }
+                if (zn != znt) { dm_lane_bad = dm_lane_bad + 1; }
+                # ---- A6: the identity the shader's DERIVED w2 rests on -- `v_sub_u32 v7, s41, v5`
+                # then `v_sub_u32 v7, v7, v6`. It is exact mod 2^32 only if the sum really is the area
+                # at lane width, and nothing had ever checked that.
+                if (dm_lane(w0 + w1 + w2) != arl) { dm_sum_bad = dm_sum_bad + 1; }
                 var inside = 0;
-                if (dm_area > 0) {
+                if (arl > 0) {
                     if (w0 >= 0) { if (w1 >= 0) { if (w2 >= 0) { inside = 1; } } }
                 }
-                if (dm_area < 0) {
+                if (arl < 0) {
                     if (w0 <= 0) { if (w1 <= 0) { if (w2 <= 0) { inside = 1; } } }
                 }
                 if (inside == 1) {
-                    var zn = dm_kx * pxq + dm_ky * pyq + dm_kc;
-                    var mag = zn;
-                    if (mag < 0) { mag = 0 - mag; }
-                    if (mag > dm_peak) { dm_peak = mag; }
                     if (dm_mut_acc16 != 0) { zn = zn & 0xFFFF; }
-                    var z = zn / dm_area;
+                    var z = zn / arl;
                     # M2 -- a divide that loses low bits. See the gate for why this is the one that
                     # matters and why it did NOT matter at rung 13.
                     if (dm_mut_quant != 0) { z = (z >>> DM_QUANT) << DM_QUANT; }
@@ -189,6 +274,25 @@ fn dm_orderdiff(): i64 {
     return d;
 }
 
+# dm_frame_check(name) — run the CURRENT frame through the model and demand all three at once:
+# byte-identity with the reference, zero lane overflows (A5), and the derived-w2 identity (A6).
+# ⚠ Reads whatever `dc_*` corpus and `dc_ox/dc_oy` the caller set; it does not choose a frame itself.
+fn dm_frame_check(name): i64 {
+    var d = dm_vs_ref();
+    ps(name);
+    ps(" model==ref diff="); pn(d);
+    ps("  lane-overflow="); pn(dm_lane_bad);
+    ps("  sum-identity="); pn(dm_sum_bad);
+    ps("  peak="); pn(dm_peak);
+    if (d == 0) {
+        if (dm_lane_bad == 0) {
+            if (dm_sum_bad == 0) { ps("  PASS"); nl(); return 0; }
+        }
+    }
+    ps("  FAIL"); nl();
+    return 1;
+}
+
 fn dm_gate(name, d, want_red): i64 {
     ps(name);
     if (want_red == 0) {
@@ -209,17 +313,100 @@ fn main(): i64 {
     bad = bad + dm_gate("A2 hoisted model == reference, colour AND z, order 1:", dm_vs_ref(), 0);
     bad = bad + dm_gate("A3 the model is order-INDEPENDENT (the rung's oracle):", dm_orderdiff(), 0);
 
-    # A4 -- the depth numerator must fit a 32-bit lane. Reported, because "it fits" is a claim about
-    # the CORPUS as much as the algebra, and a bigger frame would move it.
-    ps("A4 depth numerator peaks at "); pn(dm_peak); ps(" (32-bit lane holds 4294967295): ");
-    if (dm_peak <= 4294967295) { ps("PASS"); nl(); }
-    if (dm_peak > 4294967295) { ps("FAIL"); nl(); bad = bad + 1; }
+    # ---- A4/A5/A6 -- LANE FIDELITY, measured on one full frame -----------------------------------
+    dm_order(0);
+    dm_render(DC_W, DC_H, DC_FAR, DC_BG);
+
+    # A4 -- the depth numerator must fit a SIGNED 32-bit lane, over the WHOLE FRAME. Reported,
+    # because "it fits" is a claim about the CORPUS as much as the algebra, and a bigger frame moves
+    # it. ⛔ Two things were wrong here until 2026-07-29: the peak was taken over INSIDE pixels only
+    # (the shader is predicated and evaluates every lane), and the bound compared against 2^32-1
+    # rather than 2^31-1. A value in [2^31, 2^32) sign-restores NEGATIVE, so it fails the compare it
+    # feeds while passing an unsigned-width test -- A4 would have said PASS while A5 said FAIL.
+    ps("A4 depth numerator peaks at "); pn(dm_peak); ps(" over EVERY lane (signed lane holds 2147483647): ");
+    if (dm_peak <= 2147483647) { ps("PASS"); nl(); }
+    if (dm_peak > 2147483647) { ps("FAIL"); nl(); bad = bad + 1; }
+
+    ps("A5 every lane's mod-2^32 residue path == its true i64 value: ");
+    if (dm_lane_bad == 0) { ps("PASS"); nl(); }
+    if (dm_lane_bad != 0) { ps("FAIL, "); pn(dm_lane_bad); ps(" lane(s) overflowed"); nl(); bad = bad + 1; }
+
+    ps("A6 w0 + w1 + w2 == area AT LANE WIDTH on every lane (the derived-w2 identity): ");
+    if (dm_sum_bad == 0) { ps("PASS"); nl(); }
+    if (dm_sum_bad != 0) { ps("FAIL, "); pn(dm_sum_bad); ps(" lane(s)"); nl(); bad = bad + 1; }
+
+    # ---- A7 -- THE OTHER THREE FRAMES (plan bite B2) ---------------------------------------------
+    # ⛔ A5 above runs on the shipped corpus, where |KC| = 115,200 and every 32-bit residue IS its own
+    # true value. That is the EXACT NULL SET of the error A5 is written to catch -- the same shape as
+    # rung 15's half-texel, whose gates probed integer coordinates a pixel-centre rasteriser can never
+    # emit. A7c is where the residue path finally carries a value the record cannot hold.
+    nl();
+    dc_corpus_precision(0);
+    bad = bad + dm_frame_check("A7a PRECISION  ");
+    dc_corpus_quad(0);
+    bad = bad + dm_frame_check("A7b QUAD       ");
+    dc_ox = DC_OFF_X;
+    dc_corpus_offorigin(0);
+    bad = bad + dm_frame_check("A7c OFF-ORIGIN ");
+    dm_hoist(0);
+    var kcmag = dm_kc;
+    if (kcmag < 0) { kcmag = 0 - kcmag; }
+    # ⭐ A8 -- THE FRAME MUST ACTUALLY OVERFLOW, or A5 is a check with nothing to catch. This is the
+    # gate that stops the off-origin frame degrading back into a null set the way the plan's original
+    # x=700 parameters silently did (|KC| = 58,124,800, 26 bits, inside an i32).
+    ps("A8  |KC| = "); pn(kcmag); ps(" vs the signed 32-bit field it must NOT fit in (2147483647): ");
+    if (kcmag > 2147483647) { ps("PASS -- the residue path is load-bearing here"); nl(); }
+    if (kcmag <= 2147483647) {
+        ps("FAIL -- KC fits an i32, so A5 has nothing to catch on any frame in this tree"); nl();
+        bad = bad + 1;
+    }
+    ps("    the record carries the mod-2^32 residue "); pn(dm_kc32);
+    ps("; A5 proves it reconstructs zn exactly at every lane, and A4's peak shows why"); nl();
+    dc_ox = 0;
+    nl();
 
     # ---- mutations -------------------------------------------------------------------------------
     dm_order(0);
     dm_mut_dropc = 1;  bad = bad + dm_gate("M1 hoist constant term KC dropped:", dm_vs_ref(), 1);  dm_mut_dropc = 0;
     dm_mut_swapk = 1;  bad = bad + dm_gate("M4 KX/KY swapped:", dm_vs_ref(), 1);                   dm_mut_swapk = 0;
     dm_mut_acc16 = 1;  bad = bad + dm_gate("M3 numerator truncated to 16 bits:", dm_vs_ref(), 1);  dm_mut_acc16 = 0;
+
+    # ---- M5: THE ONE THE REFERENCE DIFF CANNOT SEE ----------------------------------------------
+    # Adding 3*2^32 to KC leaves the mod-2^32 residue bit-identical, so the shader's data, and
+    # therefore every rendered pixel, is unchanged. Only A5 can move. This is the shape of the
+    # off-origin failure the plan's OFF-ORIGIN frame will exercise for real (|KC| = 243e9 at x=700
+    # against 115,200 on this corpus), demonstrated here at zero geometry cost.
+    dm_mut_kcbig = 1;
+    dm_order(0);
+    var m5ref  = dm_vs_ref();
+    var m5lane = dm_lane_bad;
+    dm_mut_kcbig = 0;
+    ps("M5 KC + 3*2^32 (RESIDUE UNCHANGED): reference diff="); pn(m5ref);
+    ps("  lane violations="); pn(m5lane); nl();
+    if (m5lane == 0) {
+        ps("   ** A5 NOT CONNECTED: a true value 3*2^32 outside the lane moved nothing **"); nl();
+        bad = bad + 1;
+    }
+    if (m5ref != 0) {
+        ps("   ** MUTATION IS NOT WHAT IT CLAIMS: the residue changed, so this is not a pure"); nl();
+        ps("      lane-fidelity probe and A5's connection is unproven **"); nl();
+        bad = bad + 1;
+    }
+    if (m5lane > 0) {
+        if (m5ref == 0) {
+            ps("   ^ RED on A5, INVISIBLE to the reference diff -- the exact defect class A5 exists for"); nl();
+        }
+    }
+
+    # ---- M6: the derived-w2 identity ------------------------------------------------------------
+    dm_mut_area1 = 1;
+    dm_order(0);
+    dm_render(DC_W, DC_H, DC_FAR, DC_BG);
+    var m6sum = dm_sum_bad;
+    dm_mut_area1 = 0;
+    ps("M6 area off by one: "); pn(m6sum); ps(" lane(s) break w0+w1+w2 == area: ");
+    if (m6sum > 0) { ps("RED (correct -- A6 is connected)"); nl(); }
+    if (m6sum == 0) { ps("** A6 NOT CONNECTED **"); nl(); bad = bad + 1; }
 
     nl();
     # ---- ⭐⭐ M2: THE ONE THAT MATTERS, AND THE REASON IT DID NOT MATTER AT RUNG 13 ---------------

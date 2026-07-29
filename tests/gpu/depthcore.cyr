@@ -55,6 +55,24 @@ var dc_cbuf[512];                # 32*32 u32 colour
 var dc_zbuf[512];                # 32*32 u32 depth
 var dc_ties = 0;                 # pixels where two triangles interpolated to EXACTLY equal z
 
+# ⭐ THE RENDER WINDOW'S ORIGIN, in screen pixels. `dc_render` walks a w x h window whose top-left
+# screen pixel is (dc_ox, dc_oy); the sample point is the SCREEN pixel centre, so the arithmetic sees
+# real screen coordinates while the buffer stays 32x32. This is what makes the OFF-ORIGIN frame
+# possible without a 700-pixel-wide buffer, and it mirrors the shipping shader exactly: `dstxy` is
+# folded into the constant terms CPU-side and the shader works in draw-local coordinates (plan 4.2.3).
+# ⚠ Left at 0/0 by every other frame; a frame that sets it MUST put it back.
+var dc_ox = 0;
+var dc_oy = 0;
+
+# ---- ABI mirror constants -----------------------------------------------------------------------
+# ⚠ MIRRORED, NOT INCLUDED — a host test cannot include a kernel module, which is the same situation
+# `scripts/check/rt-region-derive.sh` exists to police for the TD-3 region. These three do NOT exist
+# in the kernel yet (they land with `gpo_validate_tridepth` at plan bite B5). **When B5 lands, wire
+# them into a derive gate in the same edit** — a mirror nobody diffs certifies the old value forever.
+var DC_ZMAX       = 16777215;    # GPU_TRID_Z_MAX      2^24-1, the largest legal per-vertex z
+var DC_ZCLEAR_MIN = 16777216;    # GPU_TRID_ZCLEAR_MIN 2^24,   every far value must exceed every legal z
+var DC_ZCLEAR_HW  = 4294967295;  # what gpudepth.cyr actually burns, and what the shader will compare against
+
 fn dc_reset(): i64 { dc_n = 0; dc_ties = 0; return 0; }
 
 fn dc_set(t, i, v): i64 { store64(&dc_tri + (t * DC_STRIDE + i) * 8, v); return 0; }
@@ -92,9 +110,10 @@ fn dc_render(w, h, zclear, bg): i64 {
     while (py < h) {
         var px = 0;
         while (px < w) {
-            # doubled pixel centre
-            var pxq = 2 * px + 1;
-            var pyq = 2 * py + 1;
+            # doubled pixel centre, in SCREEN coordinates -- the window origin is added here so the
+            # edge/depth arithmetic sees the real screen position (see dc_ox).
+            var pxq = 2 * (dc_ox + px) + 1;
+            var pyq = 2 * (dc_oy + py) + 1;
             var pz = zclear;
             var pc = bg;
             var t = 0;
@@ -216,6 +235,133 @@ fn dc_corpus_coplanar(swap): i64 {
     if (swap != 0) {
         dc_add(2, 4, 500,  28, 2, 500,  28, 28, 500, DC_BLUE);
         dc_add(2, 2, 500,  28, 4, 500,  4, 28, 500, DC_RED);
+    }
+    return 0;
+}
+
+# ==================================================================================================
+# ⭐⭐ THREE MORE FRAMES, ADDED 2026-07-29 — BECAUSE THE SHIPPED CORPUS IS A MEASURED NULL SET FOR
+#     THE PROPERTY RUNG 17 DECLARES LOAD-BEARING.
+# ==================================================================================================
+# The pair above has a z gradient of ~31 units per pixel while the whole design argues about being
+# exact to ONE unit. Those two numbers cannot both matter, and the measurement agrees: a divide one
+# ULP short changes **0 of 1024 pixels** on it. Three independent adversarial passes put a whole
+# table of broken implementations through this corpus and every one came out byte-identical:
+#
+#   broken implementation                      orderdiff   colour vs ref   z wrong
+#   divide one ULP short (4 models)                0        0 of 1024        --
+#   R2 with the correction dropped                 0        0                19 px
+#   rung-13 transplant, correction dropped         0        0                92 px
+#   uniform bias z -= k, any k in 1..64            0        0                507/507
+#   tile list walked BACKWARDS                     0        0                0
+#
+# ⛔ AND THE LAST ROW IS THE WORST ONE. `dc_ties == 0` (D0a) IS order-invariance -- so "the shader
+# processes the list in SUBMISSION ORDER", which is the entire claim of tile-serialisation, is
+# currently tested by NOTHING. A shader walking the list backwards passes every gate in this tree.
+#
+# ⛔ The two properties are also MUTUALLY EXCLUSIVE on one frame (measured sweep of z-separation
+# 800 -> 1): every separation where a 1-ULP error becomes visible also has `dc_ties > 0`, which fails
+# D0a and fires D1 for a *correct* shader. ⇒ separate frames, each with its own gate, not one frame
+# asked to do both jobs.
+
+# dc_corpus_precision(swap) — THE SAME GEOMETRY with the z span crushed from 800 to **2**, so one
+# unit of z is a large fraction of the whole range and a one-ULP divide error is visible.
+# ⚠ IT HAS TIES BY CONSTRUCTION, so it is **not** an order oracle. Render it in ONE fixed order.
+#
+# ⭐⭐ THE SPAN IS 2 BECAUSE OF A MEASURED SWEEP, NOT BECAUSE TIGHTER IS BETTER. Sensitivity to a
+# one-ULP error is **NOT MONOTONE** in the span, and the failure at the tight end is silent:
+#
+#     span    ties   px flipped by a +1 ULP error on one triangle
+#        1     182     0     <- ⛔ EVERY shared pixel ties; the strict `<` hands them all to the
+#        2      49    42        incumbent either way, so the frame is blind AGAIN, for the opposite
+#        3      41    24        reason. "Crush the span as tight as possible" lands exactly here.
+#        4      40    20
+#        8      18    12
+#      800       0     0     <- the shipped corpus: the measured null set, reproduced in-tree
+#
+# ⇒ 2 is the peak, and BOTH neighbours are worse. ⭐ That is not left as a comment: depthgate's D0d
+# re-runs the two endpoints of this table every time and asserts the chosen span beats both, so a
+# later retune cannot quietly land on either null set. Parameterised for exactly that reason.
+var DC_PREC_SPAN = 2;
+
+fn dc_corpus_precision_span(span, swap): i64 {
+    var hi = 100 + span;
+    dc_reset();
+    if (swap == 0) {
+        dc_add(2, 2, 100,  28, 4, hi,   4, 28, 100, DC_RED);
+        dc_add(2, 4, hi,   28, 2, 100,  28, 28, hi,  DC_BLUE);
+    }
+    if (swap != 0) {
+        dc_add(2, 4, hi,   28, 2, 100,  28, 28, hi,  DC_BLUE);
+        dc_add(2, 2, 100,  28, 4, hi,   4, 28, 100, DC_RED);
+    }
+    return 0;
+}
+
+fn dc_corpus_precision(swap): i64 { return dc_corpus_precision_span(DC_PREC_SPAN, swap); }
+
+# dc_corpus_quad(swap) — TWO TRIANGLES SHARING A DIAGONAL, the quad (4,4)-(27,4)-(27,27)-(4,27) split
+# corner-to-corner. Vertex z: (4,4)=100 (27,4)=300 (27,27)=500 (4,27)=300.
+#
+# ⭐ THIS IS THE ONLY WITNESS THAT THE TRIANGLE LIST IS WALKED IN SUBMISSION ORDER, and it is not an
+# academic construction: `dc_render` has **no top-left fill rule** (line 114 is a bare `w >= 0`), so
+# BOTH triangles of a split quad cover the shared diagonal, and along that diagonal they interpolate
+# to IDENTICAL z because both interpolate linearly between the same two endpoint depths. Every shared
+# edge in every real mesh -- rung 18's checkerboard floor, every DOOM wall -- is an exact tie decided
+# by list order. ⇒ the two orders MUST differ, and each must match the reference rendered in that
+# same order. That is what separates *a reversed list* (a 3-line prep bug) from *a broken serialiser*
+# (TD-5, a much larger bite) when the burn comes back wrong.
+fn dc_corpus_quad(swap): i64 {
+    dc_reset();
+    if (swap == 0) {
+        dc_add(4, 4, 100,  27,  4, 300,  27, 27, 500, DC_RED);
+        dc_add(4, 4, 100,  27, 27, 500,   4, 27, 300, DC_BLUE);
+    }
+    if (swap != 0) {
+        dc_add(4, 4, 100,  27, 27, 500,   4, 27, 300, DC_BLUE);
+        dc_add(4, 4, 100,  27,  4, 300,  27, 27, 500, DC_RED);
+    }
+    return 0;
+}
+
+# dc_corpus_offorigin(swap) — the interpenetrating pair translated +DC_OFF_X in x AND with its z
+# range scaled by DC_OFF_ZS, rendered through a window at dc_ox = DC_OFF_X (the caller sets it).
+#
+# ⭐ WHAT IT EXERCISES: the hoisted constant term `KC = sum(C_i z_i)` **exceeding a 32-bit field**,
+# which is the one place the design depends on the record storing **mod-2^32 residues** rather than
+# values. The model's A5 lane check has nothing to catch anywhere else in this tree.
+#
+# ⛔⛔ BOTH PARAMETERS ARE LOAD-BEARING, AND THE OBVIOUS ONE IS THE WRONG ONE. Translating by T
+# pixels gives, exactly, `KC' = KC - 2*T*KX`. So KC grows with POSITION only in proportion to KX --
+# and KX = sum(z_i A_i) scales with **z**, not with position. The plan specified x = 700 at the
+# shipped z range, which yields |KC| = 58,124,800: **26 bits, comfortably inside an i32**, i.e. a
+# frame that names the residue and never exercises it -- a third null-set probe of exactly the kind
+# this rung keeps finding. Measured, not argued: that value is reproduced by the formula above from
+# the origin corpus's KC = 115,200 and KX = 41,600.
+# ⇒ x = 4000 (inside the ABI's 4096-px coordinate cap) AND z scaled 10x, which puts |KC| past 2^31
+# while `zn = KX*x + KY*y + KC` stays ~2.4e7 -- the two magnitudes cancel, which IS the point. A gate
+# in depthmodel ASSERTS |KC| > 2^31 so the frame cannot silently degrade back to a null set.
+# ⚠ Scaling z uniformly leaves the COLOUR image byte-identical (it preserves every comparison and
+# every tie), so the frame is still a fair translation check for depthgate's D6.
+#
+# ⛔ NOT AN EXTERNAL ORACLE. A constant sample-point offset commutes with integer translation, so
+# byte-identity against the translated original is BLIND to a half-pixel convention error -- which is
+# exactly why the plan rejects translation equivariance as *the* external gate (6.2). It is used here
+# for the residue and corner-bound domains it opens, and for nothing else.
+var DC_OFF_X  = 4000;
+var DC_OFF_ZS = 10;
+
+fn dc_corpus_offorigin(swap): i64 {
+    dc_corpus(swap);
+    var t = 0;
+    while (t < dc_n) {
+        dc_set(t, 0, dc_get(t, 0) + DC_OFF_X);
+        dc_set(t, 3, dc_get(t, 3) + DC_OFF_X);
+        dc_set(t, 6, dc_get(t, 6) + DC_OFF_X);
+        dc_set(t, 2, dc_get(t, 2) * DC_OFF_ZS);
+        dc_set(t, 5, dc_get(t, 5) * DC_OFF_ZS);
+        dc_set(t, 8, dc_get(t, 8) * DC_OFF_ZS);
+        t = t + 1;
     }
     return 0;
 }

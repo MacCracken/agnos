@@ -140,6 +140,72 @@ number was not.
 no longer calls. It now lists the one-time-cost case **first**, because that is how the gate actually
 fired.
 
+### Added — RUNG 17 B2: three corpus frames, because the shipped one is a measured NULL SET
+
+`depthcore.cyr` + `depthgate.cyr`. On the shipped corpus a divide one ULP short flips **0 of 1024
+pixels** — reproduced in-tree, not repeated from an agent — and since `dc_ties == 0` **is**
+order-invariance, *"walks the triangle list in submission order"*, the entire claim of tile
+serialisation, **was tested by nothing**. A shader walking the list backwards passed every gate here.
+
+- **PRECISION frame + D0d** — z span 2; a one-ULP error flips **42 px** (49 ties).
+- **QUAD frame + D5** — two triangles sharing a diagonal, **23 exact ties, both orders differ in all
+  23**. `dc_render` has no top-left fill rule, so both triangles of a split quad cover the shared
+  diagonal and interpolate to identical z there: every shared edge in every real mesh is a tie decided
+  by list order. ⭐ The gate is stronger than the plan asked for — not "the two orders differ" but
+  **the first-submitted triangle won every one of the 23**, which a backwards walk fails and "they
+  differ" does not. ⚠ Numbered **D5**: the plan's "D3" collides with the shipped determinism control.
+- **OFF-ORIGIN frame + D6 / A7c / A8** — x = 4000 and z ×10, putting `|KC|` at **3,326,848,000**,
+  past a signed 32-bit field, so the mod-2^32 residue the record stores is finally load-bearing.
+- **D0e, the sentinel** — render at the far value iron actually burns (`0xFFFFFFFF`). ⚠ Every existing
+  call site passes `DC_FAR` = 1,000,000, which is **smaller than the ABI's own legal z ceiling**: the
+  reference's clear plane has been sitting *in front of* legal geometry for the whole rung.
+- **D7, the coverage map, printed before the burn rather than discovered after it** — of the 16
+  dispatch tiles, only **7 discriminate depth**, 9 are byte-identical for a painter's-order shader,
+  and **2 are entirely empty** (byte-identical for a shader that never ran in them).
+
+### ⛔⛔ Two plan numbers died on measurement — both the same shape, a frame that cannot witness
+
+**(a) ULP sensitivity is NOT monotone in the z span, and the tight end is a SECOND null set.** Swept
+1–800: span 2 flips 42, span 3 flips 24, span 4 flips 20, span 800 flips 0 — and **span 1 flips
+ZERO**, because all 182 shared pixels tie and the strict `<` hands every one to the incumbent in both
+directions. "Crush the span as tight as possible" lands exactly on it. D0d now **re-measures both
+endpoints every run** and asserts the chosen span beats both, so the peak is a gate and not a comment.
+
+**(b) The OFF-ORIGIN frame as specified would never have exercised the residue it exists for.** The
+plan said "x = 700, `|KC| = 243e9`, 39 bits". Measured: **58,124,800 — 26 bits, comfortably inside an
+i32**. The identity settles it — translating by `T` pixels gives exactly `KC' = KC - 2·T·KX`, so `KC`
+grows with position only in proportion to `KX = Σ z_i A_i`, which scales with **z**, not with
+position. Hence x = 4000 **and** z ×10, and a new gate **A8** asserting `|KC| > 2^31` so the frame
+cannot silently degrade back into a null set.
+
+### Fixed — RUNG 17 B0: `depthmodel` claimed 32-bit lanes and did not have them
+
+Three defects, each green, each making the file prove something weaker than its headline:
+
+- **`zn` was accumulated in unmasked i64** while `w0/w1/w2` were masked and sign-restored beside it —
+  so "at 32-bit lane widths" was true of the edge functions and false of the depth numerator, the one
+  value this rung is about. `KX/KY/KC` and `area` were unmasked too.
+- **`zn` was evaluated only INSIDE the triangle.** The shader is predicated, never branched, so it
+  evaluates every lane of the tile including far outside. A4's peak was therefore a bound over a
+  domain the shader does not run on: **2,430,400 inside-only against 4,836,800 whole-frame**, exactly
+  the 2× the plan predicted.
+- **A4 bounded against 2^32-1, not 2^31-1.** A value in `[2^31, 2^32)` sign-restores *negative*, so it
+  would have passed A4 while failing the signed compare it feeds.
+
+The model now computes from the **mod-2^32 residues the record actually carries** rather than from
+i64 truth, with `dm_lane()` as the single masking primitive. New **A5** (the residue path equals the
+true value at every lane — the witness for the ring-homomorphism argument that makes residues legal)
+and **A6** (`w0 + w1 + w2 == area` at lane width, the identity the shader's derived
+`w2 = area - w0 - w1` rests on and which nothing had ever checked).
+
+⭐ **M5 is the mutation worth reading.** It adds `3 × 2^32` to `KC`, so the residue — and therefore
+every rendered pixel — is **bit-identically unchanged**: reference diff **0**, lane violations
+**2048**. A defect the reference comparison is structurally incapable of seeing.
+
+⚠ **And A7c caught a real divergence on its first run**: `dm_render` was still sampling at `x = 0`
+while the off-origin frame's vertices sat at x = 4000. Localised from the printed peak alone —
+`58,596,800` is exactly `−38400·1 + 41600·63 + 56,014,400`, the blue triangle evaluated at `pxq = 1`.
+
 ### Added — RUNG 17's DIVIDE GATE, and the measurement that the corpus was blind
 
 `depthdiv.cyr`. **exit 95** — 23,950 boundary cases × 24 divisors, three mutations red.

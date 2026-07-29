@@ -1,6 +1,19 @@
 # Rung 17 `tri_depth` — build plan (derived 2026-07-28, adversarially verified)
 
-> **Status**: design only. No code written from this yet.
+> **Status (2026-07-29)**: **B0, B1, B2 LANDED — zero burns**, `host-gpu-oracles.sh` 8/8 exit 95,
+> `check.sh` 21/21. Next bite is **B3** (reshape `depthcore`+`depthmodel` to the shipping program).
+> ⛔ **The shader is B8, not "what's left"** — `state.md` briefly said "REMAINING: (2) the shader",
+> which collapsed seven bites into one; corrected.
+>
+> ⚠ **Three numbers in this document did not survive being measured**, all in the same direction —
+> a frame that names a property and cannot witness it. Each is corrected inline where it appears:
+> the PRECISION span (§6.3.1, sensitivity is **not monotone** — span 1 flips zero), the OFF-ORIGIN
+> parameters (§6.3.3, x=700 leaves `|KC|` **inside** an i32), and the QUAD gate's number (§6.3.2,
+> `D3` collides with the shipped determinism gate). B0 also found two defects this document did not
+> predict: `depthmodel` evaluated `zn` **only inside the triangle** while the shader is predicated
+> and evaluates every lane, and A4 bounded the numerator against **2^32-1 rather than 2^31-1**, so a
+> value that sign-restores negative would have passed A4 while failing the compare it feeds.
+>
 > Produced by a 4-lens investigation + 3 adversarial attackers over the shipped tree. ⚠ Numbers
 > attributed to agents are **not** independently verified unless marked MEASURED-BY-MAINTAINER below.
 >
@@ -558,9 +571,15 @@ Worse, the two properties are **mutually exclusive on one frame** (measured swee
 
 ⇒ **Three frames, ~30 lines in `depthcore.cyr`:**
 
-1. **PRECISION frame** — same geometry, z span compressed from 800 to **2–4**. Measured: ties 40–49, and a ±1 ULP error flips **40–49 pixels** instead of 0. It *has* ties, so it is **not** the order oracle: run it in **one fixed submission order** and byte-compare against `depthcore` rendered in that same order. New gate **D0d**: *"at least N shared pixels have |dz| <= 1"* — the precision analogue of D0a, asserting the corpus can witness a ULP before a burn is spent claiming it does.
-2. **QUAD frame** — two triangles sharing a diagonal, `(4,4)-(27,4)-(27,27)-(4,27)`, z 100/300/500. Measured: **23 tie pixels, and the two orders differ in all 23.** `depthcore` has **no top-left fill rule** (`dc_render:114` is a bare `w >= 0`), so both triangles of any quad cover the shared diagonal *and* interpolate to identical z there — every shared edge in every real mesh is an exact tie decided by list order. That is rung 18's checkerboard floor and every DOOM wall. New gate **D3**: the two orders must **differ**, and each must **match `depthcore` rendered in that order**. This is the **only** witness that the list is walked in submission order, and the only thing that separates *a reversed list* (a 3-line prep bug) from *a broken serialiser* (TD-5, "a separate larger bite").
-3. **OFF-ORIGIN frame** — the corpus triangle translated to x = 700. Exercises the mod-2^32 `KC` residue (`|KC| = 243e9` there vs 115,200 on the shipped corpus) and the corner bound over the whole-rect `|zn|` domain.
+1. **PRECISION frame** — same geometry, z span compressed from 800 to **2**. It *has* ties, so it is **not** the order oracle: run it in **one fixed submission order** and byte-compare against `depthcore` rendered in that same order. New gate **D0d**.
+
+   > ⭐ **LANDED, AND THE SWEEP CORRECTS THIS ROW.** The row said "span 2–4, ties 40–49, flips 40–49". Measured in-tree across spans 1–800: **span 2 flips 42 (49 ties); span 3 flips 24; span 4 flips 20**, so 3 and 4 are materially worse, not equivalent. ⛔ And the tight end is a **second null set**: **span 1 flips ZERO** — all 182 shared pixels tie, so the strict `<` hands every one to the incumbent in both directions. **Sensitivity is not monotone in the span**, and "tighter is finer" lands exactly on it. D0d therefore re-measures both endpoints every run and asserts the chosen span beats both, rather than leaving the peak as a comment.
+2. **QUAD frame** — two triangles sharing a diagonal, `(4,4)-(27,4)-(27,27)-(4,27)`, z 100/300/500. Measured: **23 tie pixels, and the two orders differ in all 23** — reproduced exactly in-tree. `depthcore` has **no top-left fill rule** (`dc_render:114` is a bare `w >= 0`), so both triangles of any quad cover the shared diagonal *and* interpolate to identical z there — every shared edge in every real mesh is an exact tie decided by list order. That is rung 18's checkerboard floor and every DOOM wall. This is the **only** witness that the list is walked in submission order, and the only thing that separates *a reversed list* (a 3-line prep bug) from *a broken serialiser* (TD-5, "a separate larger bite").
+
+   > ⚠ **NUMBERED D5, NOT D3.** `D3` is already the shipped determinism control (`depthgate.cyr:118`). Two gates called D3 is the ATOM_DRY defect one level up. ⭐ The landed gate is also **stronger than this row asked for**: not merely "the two orders differ" but *the **first**-submitted triangle won every one of the 23 ties* — a shader walking the list **backwards** satisfies "they differ" and fails this.
+3. **OFF-ORIGIN frame** — exercises the mod-2^32 `KC` residue and the corner bound over the whole-rect `|zn|` domain.
+
+   > ⛔ **THE PARAMETERS IN THIS ROW WERE WRONG AND THE FRAME WOULD HAVE BEEN A THIRD NULL SET.** "Translated to x = 700, `|KC| = 243e9`" is not reproducible: measured, x = 700 at the shipped z range gives **|KC| = 58,124,800 — 26 bits, comfortably inside an i32**, i.e. a frame that names the residue and never exercises it. The identity is exact and settles it: translating by `T` pixels gives **`KC' = KC - 2·T·KX`**, so `KC` grows with position only in proportion to `KX = Σ z_i A_i` — which scales with **z**, not with position. ⇒ landed as **x = 4000 (inside the ABI's 4096-px coord cap) AND z scaled 10×**, giving **|KC| = 3,326,848,000**, past a signed 32-bit field, while `zn` peaks at 48,368,000. New gate **A8** asserts the overflow so the frame cannot silently degrade back.
 
 New gate **D0e** — the sentinel: parameterise `dc_render`'s zclear, render at the value iron actually uses (`0xFFFFFFFF`), and assert `zclear >= 2^24` under the chosen compare. Every existing call site passes `DC_FAR = 1000000`, which is **smaller than the ABI's own legal z ceiling** — the reference's clear plane sits in front of legal geometry and has never once been exercised at the hardware value.
 
@@ -578,9 +597,9 @@ Each bite is independently verifiable and lands green. **Bites 1–6 are zero-bu
 
 | # | bite | verified by | burn |
 |---|---|---|---|
-| **B0** | `depthmodel` lane-fidelity fix (mask `zn`, `KX/KY/KC`, `area` to 32-bit lanes + sign restore) | `host-gpu-oracles.sh` exit 95 | 0 |
-| **B1** | `depthdiv.cyr` — R2 exactness gate + adversarial frame + 5 mutations | exit 95; printed table shows transplant green-on-corpus / RED-on-adversarial | 0 |
-| **B2** | ⭐ corpus: PRECISION + QUAD + OFF-ORIGIN frames; depthgate D0d / D3 / D0e; coverage print | exit 95; **D3 must show the two orders DIFFERING** | 0 |
+| ✅ **B0** | `depthmodel` lane-fidelity fix (mask `zn`, `KX/KY/KC`, `area` to 32-bit lanes + sign restore) | `host-gpu-oracles.sh` exit 95 | 0 |
+| ✅ **B1** | `depthdiv.cyr` — R2 exactness gate + adversarial frame + 5 mutations | exit 95; printed table shows transplant green-on-corpus / RED-on-adversarial | 0 |
+| ✅ **B2** | ⭐ corpus: PRECISION + QUAD + OFF-ORIGIN frames; depthgate D0d / D5 / D0e; coverage print | exit 95; **D5 shows the two orders DIFFERING** | 0 |
 | **B3** | reshape `depthcore`+`depthmodel` to the shipping program (winding normalisation, `dstxy` fold, derived `w2`, `v_max` clamp, unsigned compare, no min-bias) + G6 corner bound | byte-identical colour AND z, both orders, all frames | 0 |
 | **B4** | **external gates** G7 (constant-z silhouette vs the `tri_rgba` path) + G8 (analytic interpenetration line) | exit 95 | 0 |
 | **B5** | **ABI only** — `0x0E` constants, `gpo_validate_tridepth`, field mask, flags, `GPU_OP_SUPPORTED` bit 14, battery. Worker returns `GPO_E_NOTIMPL`. | `edge_abi_selftest` N of N; `kprint-len-check.sh` | 0 |

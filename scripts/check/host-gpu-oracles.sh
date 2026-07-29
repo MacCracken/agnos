@@ -21,6 +21,25 @@
 # triangles visible, and the image non-empty (two empty images are byte-identical). Its D2 mutation
 # makes every overlap a tie and MUST go order-dependent, or D1 is measuring nothing.
 #
+# ⭐⭐ THREE MORE FRAMES ADDED 2026-07-29, BECAUSE THE SHIPPED CORPUS WAS A MEASURED NULL SET FOR THE
+# TWO PROPERTIES THE RUNG IS ABOUT. On it, a divide one ULP short moves ZERO of 1024 pixels, and
+# `dc_ties == 0` *is* order-invariance — so "walks the triangle list in submission order", the entire
+# claim of tile serialisation, was tested by nothing at all. A shader walking the list backwards
+# passed every gate in this tree.
+#   • PRECISION (D0d) — z span 2, where a one-ULP error flips 42 px. ⚠ Sensitivity is NOT monotone in
+#     the span: at span 1 EVERY shared pixel ties and the frame is blind again for the opposite
+#     reason, so D0d re-measures both endpoints (span 1 and span 800 each flip 0) and asserts the
+#     chosen span beats them. "Tighter is finer" lands on the second null set.
+#   • QUAD (D5) — two triangles sharing a diagonal, 23 exact ties, the two orders differ in all 23,
+#     and the FIRST-submitted must win every one. The only witness of submission order in the tree.
+#     ⚠ Numbered D5, not the plan's "D3": D3 is already the determinism control.
+#   • OFF-ORIGIN (D6, and depthmodel A7c/A8) — x=4000 AND z scaled 10x, which puts |KC| at 3.33e9,
+#     past a signed 32-bit field, so the mod-2^32 residue the record stores is finally load-bearing.
+#     ⚠ The plan's x=700 at the shipped z range gives |KC| = 5.8e7 — 26 bits, inside an i32, a frame
+#     that names the residue and never exercises it. A8 asserts the overflow so it cannot regress.
+# depthmodel also gained A5/A6 (lane fidelity and the derived-w2 identity) at the same time; its
+# `zn`, `KX/KY/KC` and `area` were accumulated in unmasked i64 while the file claimed 32-bit lanes.
+#
 # ⭐ texgate ADDED AT RUNG 15 because it stopped being only rung 13's gate. It now carries the four
 # checks that decide whether a bilinear iron burn is interpretable: **gate 7** (the reciprocal
 # reproduces an exact divide across the WHOLE 16.16 word — the 8 fraction bits ONLY bilinear reads,

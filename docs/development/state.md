@@ -221,10 +221,41 @@ on an ABI-legal 5-px sliver (area=40). ⇒ recipe changed to **R2** (`R = floor(
 one correction, 5 instructions); both mul_hi operands provably non-negative so rung 11's
 signed-high-half fixup is STRUCTURALLY ABSENT. ⇒ **Boundary sweep, not a stride** — one-ULP errors
 live AT the multiples.
-▶ **REMAINING for rung 17: (2) the shader** — per [`planning/rung17-tri-depth.md`](planning/rung17-tri-depth.md),
-whose four pins must not be re-opened at transcription time. Tile-serialised,
-colour+depth in VGPRs, one `global_store` at the end, plus a lane-witness counter separating "no wave
-ran" from "wave ran and computed wrong". Build flag `GPU_OP_TRI_DEPTH`.
+✅ **(2) LANE FIDELITY (B0)** — `depthmodel` claimed "32-bit lanes" while accumulating `zn`,
+`KX/KY/KC` and `area` in **unmasked i64**, and evaluated `zn` **only inside the triangle** though the
+shader is predicated and runs every lane. Fixed: the model now computes from the **mod-2^32 residues
+the record actually carries**, and A4's whole-frame peak is **4,836,800** against the old inside-only
+2,430,400 — exactly the 2x the plan predicted. New **A5** (residue path == truth, per lane), **A6**
+(`w0+w1+w2 == area` at lane width — the identity the shader's derived `w2` rests on, never checked
+before). ⚠ A4 also bounded against 2^32-1 rather than **2^31-1**: a value that sign-restores negative
+would have passed A4 while failing the compare it feeds. **M5 is the instructive mutation** — adding
+`3*2^32` to KC leaves the residue bit-identical, so the reference diff is **0** and only A5 moves.
+✅ **(3) THREE NEW FRAMES (B2), AND THE SHIPPED CORPUS'S BLINDNESS REPRODUCED IN-TREE** — on it a
+one-ULP z error flips **0 of 1024 px**, and since `dc_ties == 0` **is** order-invariance, *"walks the
+list in submission order"* — the entire claim of tile serialisation — **was tested by nothing**.
+**PRECISION** (D0d, span 2, 42 px flip) · **QUAD** (D5, 23 ties, both orders differ in all 23, **and
+the first-submitted won every one** — a backwards walk passes "they differ" and fails this) ·
+**OFF-ORIGIN** (D6/A7c/A8) · **D0e** the sentinel (render at the hardware `0xFFFFFFFF`; ⚠ `DC_FAR` =
+1,000,000 sits **in front of** the ABI's own legal z ceiling) · **D7** coverage: of 16 dispatch tiles
+only **7 discriminate depth**, 9 are byte-identical for a painter's-order shader, **2 are entirely
+empty**.
+⛔⛔ **TWO PLAN NUMBERS DIED ON MEASUREMENT, BOTH THE SAME SHAPE — a frame that names a property and
+cannot witness it.** (a) **ULP sensitivity is NOT monotone in the z span**: at span **1** every shared
+pixel ties, the strict `<` hands them all to the incumbent either way, and the frame flips **zero** —
+a *second* null set that "tighter is finer" lands on exactly. D0d now re-measures both endpoints every
+run. (b) The plan's OFF-ORIGIN **x = 700 gives |KC| = 58,124,800 — 26 bits, inside an i32**, so it
+would never have exercised the residue it exists for. `KC' = KC - 2*T*KX` and `KX` scales with **z**,
+not position ⇒ landed at **x = 4000 AND z x10**, `|KC| = 3,326,848,000`, with **A8 asserting the
+overflow**.
+▶ **REMAINING for rung 17 — SEVEN bites, not "the shader"** (⚠ this line previously said *"REMAINING:
+(2) the shader"*, which collapsed B3–B9 into one and would have put a 584-dword blob ahead of the
+program it is supposed to reproduce). Per [`planning/rung17-tri-depth.md`](planning/rung17-tri-depth.md)
+§7: **B3** reshape reference+model to the shipping program (winding normalisation, `dstxy` fold,
+derived `w2`, `v_max` clamp, unsigned compare) — ⛔ *must land in ONE bite, or the byte-identity proof
+covers a different program than the one that flashes* · **B4** external gates G7/G8 · **B5** ABI
+`0x0E` · **B6** `0x10 GPU_OP_RT_READ` (**blocking**: without a z readback the burn cannot fail on a
+broken divide) · **B7** prep · **B8** `tri_depth.s` · **B9** worker · **B10** the burn. The four pins
+must not be re-opened at transcription time.
 
 Remaining after rung 15 — ⚠ **this list was STALE by +2 until 2026-07-28** (it still carried the
 pre-renumbering mapping and collapsed rungs 17/18/19 into one cut); [`planning/gpu.md`](planning/gpu.md)

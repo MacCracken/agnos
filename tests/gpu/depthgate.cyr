@@ -25,8 +25,10 @@ include "depthcore.cyr"
 # checks the renderer against an INDEPENDENT computation of the same quantity; asking the renderer
 # what it stored and then agreeing with it would be the shared-premise blindness rung 15 shipped.
 fn dg_z_at(t, px, py): i64 {
-    var pxq = 2 * px + 1;
-    var pyq = 2 * py + 1;
+    # ⚠ Screen coordinates, same as dc_render: the window origin must be added here too, or every
+    # off-origin gate would compare a z computed at x against a pixel drawn at x + DC_OFF_X.
+    var pxq = 2 * (dc_ox + px) + 1;
+    var pyq = 2 * (dc_oy + py) + 1;
     var ax = 2 * dc_get(t, 0); var ay = 2 * dc_get(t, 1);
     var bx = 2 * dc_get(t, 3); var by = 2 * dc_get(t, 4);
     var cx = 2 * dc_get(t, 6); var cy = 2 * dc_get(t, 7);
@@ -44,6 +46,21 @@ fn dg_z_at(t, px, py): i64 {
 fn dg_render_order(swap): i64 {
     dc_corpus(swap);
     return dc_render(DC_W, DC_H, DC_FAR, DC_BG);
+}
+
+# dg_ulp_flips(span) — how many pixels a ONE-ULP z error on one triangle moves, at a given z span of
+# the precision frame. ⚠ +1 on all three vertex z of a triangle shifts its interpolated z by exactly
+# one everywhere, which is the realistic shape of a divide that is short by one -- the same shape as
+# depthmodel's dm_mut_ulp, not a quantisation.
+fn dg_ulp_flips(span): i64 {
+    dc_corpus_precision_span(span, 0);
+    dc_render(DC_W, DC_H, DC_FAR, DC_BG);
+    dc_snapshot(DC_W, DC_H);
+    dc_set(1, 2, dc_get(1, 2) + 1);
+    dc_set(1, 5, dc_get(1, 5) + 1);
+    dc_set(1, 8, dc_get(1, 8) + 1);
+    dc_render(DC_W, DC_H, DC_FAR, DC_BG);
+    return dc_diff(DC_W, DC_H);
 }
 
 fn main(): i64 {
@@ -163,6 +180,202 @@ fn main(): i64 {
         ps("    ** only "); pn(d4n); ps(" shared pixels -- D4 proves little **"); nl();
         bad = bad + 1;
     }
+
+    # ==============================================================================================
+    # ⭐⭐ D0d / D0e / D5 / D6 / D7 — ADDED 2026-07-29 (plan bite B2), BECAUSE EVERY GATE ABOVE
+    #     RUNS ON A CORPUS MEASURED BLIND TO THE TWO THINGS THIS RUNG IS ABOUT.
+    # ==============================================================================================
+    # See dc_corpus_precision's block in depthcore.cyr for the measured table. Two sentences of it:
+    # a divide one ULP short changes **0 of 1024 pixels** here, and `dc_ties == 0` (D0a) **is**
+    # order-invariance, so "walks the list in submission order" is currently tested by nothing.
+    # ⚠ NUMBERING: the plan calls the quad gate "D3", but D3 is already the determinism control
+    # above. Numbered D5 here and corrected in planning/rung17-tri-depth.md rather than shadowing a
+    # shipped gate name -- two gates called D3 is the ATOM_DRY defect one level up.
+    nl();
+
+    # ---- D0d: THE PRECISION FRAME IS ULP-SENSITIVE, and that is MEASURED, not assumed. -----------
+    # ⛔ Pre-registered as a gate rather than discovered post-burn: if a +1 uniform z error on one
+    # triangle moves nothing HERE either, then no frame in this tree can witness a divide error and
+    # the burn cannot fail on the rung's only novel content.
+    dc_corpus_precision(0);
+    dc_render(DC_W, DC_H, DC_FAR, DC_BG);
+    var pties = dc_ties;
+    dc_snapshot(DC_W, DC_H);
+    dc_set(1, 2, dc_get(1, 2) + 1);        # +1 on all three vertex z of triangle 1 == a uniform
+    dc_set(1, 5, dc_get(1, 5) + 1);        # one-ULP error in its interpolated z everywhere
+    dc_set(1, 8, dc_get(1, 8) + 1);
+    dc_render(DC_W, DC_H, DC_FAR, DC_BG);
+    var pulp = dc_diff(DC_W, DC_H);
+    # ⭐ THE TWO ENDPOINTS, RE-MEASURED EVERY RUN. Span 800 is the shipped corpus (blind because the
+    # gradient dwarfs a ULP); span 1 is blind for the OPPOSITE reason -- every shared pixel ties, so
+    # the strict `<` hands them all to the incumbent either way. Sensitivity is NOT monotone in the
+    # span, and a retune "tighter is finer" lands straight on the second null set. Asserted, not
+    # commented, so that cannot happen silently.
+    var pnarrow = dg_ulp_flips(1);
+    var pwide   = dg_ulp_flips(800);
+    # Threshold 20 against a measured 42 at the swept optimum. ⚠ Deliberately NOT set just under 42:
+    # the span-1 row of that sweep flips ZERO, so a frame retuned "tighter" fails this loudly instead
+    # of drifting down to a number a tight threshold would have to be relaxed to accommodate.
+    ps("D0d PRECISION frame (span "); pn(DC_PREC_SPAN); ps("): a ONE-ULP z error flips ");
+    pn(pulp); ps(" px ("); pn(pties); ps(" ties): ");
+    if (pulp >= 20) { ps("PASS -- the frame can witness a ULP"); nl(); }
+    if (pulp < 20) {
+        ps("FAIL -- still nearly blind; no frame in this tree can catch a broken divide"); nl();
+        bad = bad + 1;
+    }
+    ps("    endpoints: span 1 flips "); pn(pnarrow); ps(" (ALL shared px tie -> blind), span 800 flips ");
+    pn(pwide); ps(" (the shipped corpus -> blind): ");
+    if (pulp > pnarrow) {
+        if (pulp > pwide) { ps("PASS -- the chosen span beats both"); nl(); }
+    }
+    if (pulp <= pnarrow) {
+        ps("FAIL -- a tighter span is no worse, so the non-monotonicity claim is wrong"); nl();
+        bad = bad + 1;
+    }
+    if (pulp > pnarrow) {
+        if (pulp <= pwide) {
+            ps("FAIL -- the shipped wide corpus is no worse, so this frame buys nothing"); nl();
+            bad = bad + 1;
+        }
+    }
+
+    # ---- D0e: THE SENTINEL. Render at the value IRON ACTUALLY BURNS. -----------------------------
+    # ⛔ Every call site above passes DC_FAR = 1,000,000, which is SMALLER than the ABI's own legal z
+    # ceiling (2^24-1 = 16,777,215). The reference's clear plane has been sitting IN FRONT of legal
+    # geometry for the whole rung, and the hardware value 0xFFFFFFFF has never once been exercised.
+    # ⚠ This is the frame where the signed-vs-unsigned pin bites: under `v_cmp_lt_i32`, 0xFFFFFFFF is
+    # -1, i.e. the NEAREST possible value, so nothing ever draws -- and a blank frame is byte-identical
+    # in both orders, so D1 goes GREEN. That is the single most expensive wrong pick on this rung.
+    dg_render_order(0);
+    dc_snapshot(DC_W, DC_H);
+    dc_corpus(0);
+    dc_render(DC_W, DC_H, DC_ZCLEAR_HW, DC_BG);
+    var d0e = dc_diff(DC_W, DC_H);
+    var d0ecov = dc_covered(DC_W, DC_H, DC_BG);
+    ps("D0e clearing at the HARDWARE far value 0xFFFFFFFF draws the same image ("); pn(d0ecov);
+    ps(" px): ");
+    if (d0e == 0) {
+        if (d0ecov > 200) { ps("PASS"); nl(); }
+    }
+    if (d0e != 0) { ps("FAIL "); pn(d0e); ps(" px differ"); nl(); bad = bad + 1; }
+    if (d0e == 0) {
+        if (d0ecov <= 200) {
+            ps("FAIL -- identical but EMPTY, which is what a signed compare produces"); nl();
+            bad = bad + 1;
+        }
+    }
+    ps("    the far value exceeds every legal z (>= 2^24), so an UNSIGNED compare is behind all geometry: ");
+    if (DC_ZCLEAR_HW > DC_ZMAX) { ps("PASS"); nl(); }
+    if (DC_ZCLEAR_HW <= DC_ZMAX) { ps("FAIL"); nl(); bad = bad + 1; }
+    ps("    ⚠ but DC_FAR = "); pn(DC_FAR); ps(" is BELOW the legal z ceiling "); pn(DC_ZMAX);
+    ps(" -- the reference's own clear plane sits in front of legal geometry"); nl();
+
+    # ---- D5: THE QUAD. The ONLY witness that the list is walked in SUBMISSION ORDER. -------------
+    # ⭐ And the claim is sharper than "the two orders differ": at a tie the STRICT `<` keeps the
+    # incumbent, so the FIRST-submitted triangle must win every tie. Order 0 submits red first, order
+    # 1 submits blue first ⇒ every differing pixel must be RED in order 0 and BLUE in order 1.
+    # A shader walking the list BACKWARDS gets this exactly inverted; "they differ" alone would not.
+    dc_corpus_quad(0);
+    dc_render(DC_W, DC_H, DC_FAR, DC_BG);
+    var qties = dc_ties;
+    dc_snapshot(DC_W, DC_H);
+    dc_corpus_quad(1);
+    dc_render(DC_W, DC_H, DC_FAR, DC_BG);
+    var qdiff = 0;
+    var qwrong = 0;
+    var qi = 0;
+    while (qi < DC_W * DC_H) {
+        var qa = load32(&dc_snap + qi * 4) & 0xFFFFFFFF;
+        var qb = load32(&dc_cbuf + qi * 4) & 0xFFFFFFFF;
+        if (qa != qb) {
+            qdiff = qdiff + 1;
+            if (qa != DC_RED)  { qwrong = qwrong + 1; }
+            if (qb != DC_BLUE) { qwrong = qwrong + 1; }
+        }
+        qi = qi + 1;
+    }
+    ps("D5  QUAD frame ("); pn(qties); ps(" ties): the two orders DIFFER at "); pn(qdiff);
+    ps(" px: ");
+    if (qdiff > 0) { ps("RED (correct -- submission order is now observable)"); nl(); }
+    if (qdiff == 0) {
+        ps("** NOT CONNECTED: a shared diagonal produced no ties, so nothing tests list order **"); nl();
+        bad = bad + 1;
+    }
+    ps("    and the FIRST-submitted triangle won every one of them: ");
+    if (qwrong == 0) { ps("PASS"); nl(); }
+    if (qwrong != 0) {
+        ps("FAIL "); pn(qwrong); ps(" -- the list is being resolved in the WRONG order"); nl();
+        bad = bad + 1;
+    }
+
+    # ---- D6: OFF-ORIGIN. The residue domain, and the corner bound's real workout. ----------------
+    # ⚠ Scope stated honestly: this is byte-identity against the translated original, which is BLIND
+    # to a half-pixel convention error (a constant sample offset commutes with integer translation --
+    # the plan rejects translation equivariance as *the* external gate for exactly that reason). Its
+    # value is the ARITHMETIC domain it opens: |KC| goes from ~1e5 to ~2e11, 39 bits, which is where
+    # depthmodel's A5 finally has a residue worth checking.
+    dg_render_order(0);
+    dc_snapshot(DC_W, DC_H);
+    dc_ox = DC_OFF_X;
+    dc_corpus_offorigin(0);
+    dc_render(DC_W, DC_H, DC_FAR, DC_BG);
+    var d6 = dc_diff(DC_W, DC_H);
+    var d6cov = dc_covered(DC_W, DC_H, DC_BG);
+    dc_ox = 0;
+    ps("D6  OFF-ORIGIN (window at x=DC_OFF_X) renders the translated figure identically ("); pn(d6cov);
+    ps(" px): ");
+    if (d6 == 0) {
+        if (d6cov > 200) { ps("PASS"); nl(); }
+    }
+    if (d6 != 0) { ps("FAIL "); pn(d6); ps(" px differ"); nl(); bad = bad + 1; }
+    if (d6 == 0) {
+        if (d6cov <= 200) { ps("FAIL -- identical but EMPTY"); nl(); bad = bad + 1; }
+    }
+
+    # ---- D7: THE COVERAGE MAP, printed in the gate rather than discovered after the burn. --------
+    # ⭐ The dispatch is one workgroup per 8x8 tile, so the 32x32 corpus is 16 tiles. A tile with no
+    # DUAL-COVERED pixel cannot distinguish a depth-tested shader from a painter's-order one, and a
+    # tile with no coverage at all is byte-identical for a shader that never ran in it. Knowing which
+    # tiles those are BEFORE the flash is the difference between "3 tiles wrong" being a signal and
+    # being noise.
+    dg_render_order(0);
+    var tdual = 0; var tdrawn = 0; var tempty = 0;
+    var ty = 0;
+    while (ty < 4) {
+        var tx = 0;
+        while (tx < 4) {
+            var ndual = 0; var ndrawn = 0;
+            var yy = 0;
+            while (yy < 8) {
+                var xx = 0;
+                while (xx < 8) {
+                    var gx = tx * 8 + xx;
+                    var gy = ty * 8 + yy;
+                    if ((load32(&dc_cbuf + (gy * DC_W + gx) * 4) & 0xFFFFFFFF) != DC_BG) {
+                        ndrawn = ndrawn + 1;
+                    }
+                    if (dg_z_at(0, gx, gy) >= 0) {
+                        if (dg_z_at(1, gx, gy) >= 0) { ndual = ndual + 1; }
+                    }
+                    xx = xx + 1;
+                }
+                yy = yy + 1;
+            }
+            if (ndual > 0)   { tdual  = tdual + 1; }
+            if (ndrawn > 0)  { tdrawn = tdrawn + 1; }
+            if (ndrawn == 0) { tempty = tempty + 1; }
+            tx = tx + 1;
+        }
+        ty = ty + 1;
+    }
+    ps("D7  tile coverage of the 16 dispatch tiles: "); pn(tdual);
+    ps(" discriminate depth, "); pn(tdrawn); ps(" draw anything, "); pn(tempty);
+    ps(" are ENTIRELY EMPTY"); nl();
+    ps("    ⇒ "); pn(16 - tdual); ps(" tiles prove nothing about z (a painter's-order shader is");
+    ps(" byte-identical there), and "); pn(tempty);
+    ps(" are byte-identical for a shader that never ran: ");
+    if (tdual >= 4) { ps("PASS"); nl(); }
+    if (tdual < 4) { ps("FAIL -- too few discriminating tiles to interpret a burn"); nl(); bad = bad + 1; }
 
     nl();
     if (bad == 0) {
