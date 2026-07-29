@@ -1082,21 +1082,21 @@ fn gpu_trid_prep_check(t, dx, dy, lx, ly) {
     var e2 = trid_edge(dax, day, dbx, dby, qx, qy);
     var ar = e0 + e1 + e2;
     var zn = e0 * (load32(b + 24) & 0xFFFFFFFF)
-           + e1 * (load32(b + 28) & 0xFFFFFFFF)
-           + e2 * (load32(b + 32) & 0xFFFFFFFF);
+    + e1 * (load32(b + 28) & 0xFFFFFFFF)
+    + e2 * (load32(b + 32) & 0xFFFFFFFF);
     if (ar < 0) { e0 = 0 - e0; e1 = 0 - e1; e2 = 0 - e2; ar = 0 - ar; zn = 0 - zn; }
 
     var ra = trid_lane(load32(rec + 36) & 0xFFFFFFFF);
     var w0 = trid_lane((load32(rec +  0) & 0xFFFFFFFF) * lxq
-                     + (load32(rec +  4) & 0xFFFFFFFF) * lyq
-                     + (load32(rec +  8) & 0xFFFFFFFF));
+    + (load32(rec +  4) & 0xFFFFFFFF) * lyq
+    + (load32(rec +  8) & 0xFFFFFFFF));
     var w1 = trid_lane((load32(rec + 12) & 0xFFFFFFFF) * lxq
-                     + (load32(rec + 16) & 0xFFFFFFFF) * lyq
-                     + (load32(rec + 20) & 0xFFFFFFFF));
+    + (load32(rec + 16) & 0xFFFFFFFF) * lyq
+    + (load32(rec + 20) & 0xFFFFFFFF));
     var w2 = trid_lane(ra - w0 - w1);
     var zl = trid_lane((load32(rec + 24) & 0xFFFFFFFF) * lxq
-                     + (load32(rec + 28) & 0xFFFFFFFF) * lyq
-                     + (load32(rec + 32) & 0xFFFFFFFF));
+    + (load32(rec + 28) & 0xFFFFFFFF) * lyq
+    + (load32(rec + 32) & 0xFFFFFFFF));
     # P4 / P1 / P2
     if (ra <= 0)  { return 1; }
     if (w0 != e0) { return 2; }
@@ -1146,7 +1146,7 @@ fn gpu_trid_prep_selftest() {
         return 0;
     }
     if (gpu_trid_prep_build(&trid_prep_buf + 3 * GPU_TRID_PREP_STRIDE,
-                            &trid_vtx_buf  + 3 * GPU_TRID_VTX_BYTES, 1, dx3, dy3) != 1) {
+    &trid_vtx_buf  + 3 * GPU_TRID_VTX_BYTES, 1, dx3, dy3) != 1) {
         kprintln("trid-prep: FAIL -- prep refused the off-origin triangle", 55);
         return 0;
     }
@@ -1186,6 +1186,76 @@ fn gpu_trid_prep_selftest() {
     return 1;
 }
 #endif
+
+var gpu_trid_armed = 0;
+
+fn gpu_trid_arm() {
+    if (gpu_trid_armed == 1) { return 1; }
+    if (gpu_present == 0) { return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+    if (gpu_matmul_ok != 1) { return 0; }
+    tri_depth_write(gpu_arena_phys + GPU_TRID_SHADER_SUBOFF);
+    gpu_mfence();
+    gpu_trid_armed = 1;
+    return 1;
+}
+
+# gpu_tri_depth — the depth-tested triangle worker. Builds prep, then ONE dispatch of one workgroup
+# per 8x8 tile through gpu_blend_cov_run UNMODIFIED.
+#
+# ⭐ THE KERNARG MAPPING IS WHY THAT DISPATCH PRIMITIVE NEEDS NO CHANGE. It emits exactly 8 USER_DATA
+# dwords — mask_mc lo/hi, dst_mc lo/hi, mask_pitch, dst_pitch, width, color — and this kernel reads
+# them as: prep base, colour base, n_tri, colour pitch, w, h. All eight are spent, which is precisely
+# why the z base, the witness base, the z pitch, zclear, bg and tiles_x travel in a 64-byte HEADER at
+# the front of the prep region instead of becoming kernargs 9 and 10. RSRC2 = 0x00000190 (USER_SGPR=8)
+# is byte-identical to the coverage kernel's, which is what keeps the primitive shared.
+fn gpu_tri_depth(rec, vkva) {
+    if (gpu_rt_arm() != 1) { return 0; }
+    if (gpu_trid_arm() != 1) { return 0; }
+    var zh  = load32(rec + 8)  & 0xFFFFFFFF;
+    var wid = load32(rec + 32) & 0xFFFFFFFF;
+    var wh  = load32(rec + 16) & 0xFFFFFFFF;
+    var dxy = load32(rec + 20) & 0xFFFFFFFF;
+    var nt  = load32(rec + 24) & 0xFFFFFFFF;
+    var zwh = load32(rec + 28) & 0xFFFFFFFF;
+    var w  = wh & 0xFFFF;
+    var h  = (wh >> 16) & 0xFFFF;
+    var dx = dxy & 0xFFFF;
+    var dy = (dxy >> 16) & 0xFFFF;
+    var zw = zwh & 0xFFFF;
+
+    var zmc = gpu_rt_handle_mc(zh);
+    if (zmc == 0) { return 0; }
+    # PRE-OFFSET both destinations to dstxy, so the shader indexes draw-local and never sees it.
+    var zpitch = zw * 4;
+    zmc = zmc + dy * zpitch + dx * 4;
+    var wmc = 0;
+    if (wid != 0) {
+        wmc = gpu_shm_mc(wid);
+        if (wmc == 0) { return 0; }
+    }
+    if (gpu_bb_pitch == 0) { return 0; }
+    var tgt = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { tgt = gpu_bb_b_mc; }
+    var dst_mc = tgt + dy * gpu_bb_pitch + dx * 4;
+
+    var pbase_phys = gpu_arena_phys + GPU_TRID_PREP_SUBOFF;
+    var pbase_mc   = gpu_arena_mc   + GPU_TRID_PREP_SUBOFF;
+    var tiles_x = w >> 3;
+    var tiles_y = h >> 3;
+    gpu_trid_prep_header(pbase_phys, zmc, wmc, zpitch, tiles_x);
+    if (gpu_trid_prep_build(pbase_phys + GPU_TRID_PREP_STRIDE, vkva, nt, dx, dy) != 1) { return 0; }
+    gpu_mfence();
+
+    # ⚠ ONE WORKGROUP PER TILE, and the grid is in WORKGROUPS: gx = w>>3, gy = h>>3. One workgroup is
+    # exactly one 64-lane wave covering an 8x8 tile — that identity is load-bearing for the whole
+    # serialisation claim, and at 16x16 it collapses outright.
+    return gpu_blend_cov_run(gpu_arena_mc + GPU_TRID_SHADER_SUBOFF, pbase_mc, dst_mc,
+    nt, gpu_bb_pitch, w, h, GPU_COMPUTE_PGM_RSRC1_TDEP, tiles_x, tiles_y,
+    gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
+    gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+}
 
 fn gpu_rt_read(zh, dst_id, w, h, zw) {
     if (gpu_rt_arm() != 1) { return 0; }
@@ -5843,6 +5913,130 @@ fn tex_rgba_write(dst_phys) {
 # high registers across waves, which on this silicon is a wrong picture, not a wedge, and therefore
 # the hardest possible thing to attribute. gpu_tex_dispatch picks both the slot and the descriptor
 # from the same `bilin` flag so the two cannot be set inconsistently.
+# tri_depth_write — rung 17's depth-tested triangle kernel, 116 dwords (464 B).
+# ⛔ GENERATED FROM kernel/shaders/tri_depth.s BY THE ASSEMBLER, NEVER HAND-EDITED.
+# scripts/check/shader-blob.sh re-assembles the source and diffs it against this table; a hand
+# edit here is a shader the .s does not describe, and the .s is what every comment reasons about.
+fn tri_depth_write(dst_phys) {
+    store32(dst_phys + 0, 0xc00a0400);
+    store32(dst_phys + 4, 0x00000000);
+    store32(dst_phys + 8, 0xc00a0500);
+    store32(dst_phys + 12, 0x00000010);
+    store32(dst_phys + 16, 0xbf8cc07f);
+    store32(dst_phys + 20, 0x8000c000);
+    store32(dst_phys + 24, 0x82018001);
+    store32(dst_phys + 28, 0x26200087);
+    store32(dst_phys + 32, 0x20220083);
+    store32(dst_phys + 36, 0x8e0a8308);
+    store32(dst_phys + 40, 0x8e0b8309);
+    store32(dst_phys + 44, 0x6820200a);
+    store32(dst_phys + 48, 0x6822220b);
+    store32(dst_phys + 52, 0x24022081);
+    store32(dst_phys + 56, 0x28020281);
+    store32(dst_phys + 60, 0x24042281);
+    store32(dst_phys + 64, 0x28040481);
+    store32(dst_phys + 68, 0x7e060215);
+    store32(dst_phys + 72, 0x7e080216);
+    store32(dst_phys + 76, 0xbe8c0080);
+    store32(dst_phys + 80, 0xbf0a050c);
+    store32(dst_phys + 84, 0xbf84003a);
+    store32(dst_phys + 88, 0xc00a0800);
+    store32(dst_phys + 92, 0x00000000);
+    store32(dst_phys + 96, 0xc00a0900);
+    store32(dst_phys + 100, 0x00000010);
+    store32(dst_phys + 104, 0xc00a0a00);
+    store32(dst_phys + 108, 0x00000020);
+    store32(dst_phys + 112, 0xc00a0b00);
+    store32(dst_phys + 116, 0x00000030);
+    store32(dst_phys + 120, 0xbf8cc07f);
+    store32(dst_phys + 124, 0xd2850005);
+    store32(dst_phys + 128, 0x00004101);
+    store32(dst_phys + 132, 0xd285000c);
+    store32(dst_phys + 136, 0x00004302);
+    store32(dst_phys + 140, 0x680a1905);
+    store32(dst_phys + 144, 0x680a0a22);
+    store32(dst_phys + 148, 0xd2850006);
+    store32(dst_phys + 152, 0x00004701);
+    store32(dst_phys + 156, 0xd285000c);
+    store32(dst_phys + 160, 0x00004902);
+    store32(dst_phys + 164, 0x680c1906);
+    store32(dst_phys + 168, 0x680c0c25);
+    store32(dst_phys + 172, 0x6a0e0a29);
+    store32(dst_phys + 176, 0x6a0e0d07);
+    store32(dst_phys + 180, 0xd2850008);
+    store32(dst_phys + 184, 0x00004d01);
+    store32(dst_phys + 188, 0xd285000c);
+    store32(dst_phys + 192, 0x00004f02);
+    store32(dst_phys + 196, 0x68101908);
+    store32(dst_phys + 200, 0x68101028);
+    store32(dst_phys + 204, 0x1a101080);
+    store32(dst_phys + 208, 0xd2860009);
+    store32(dst_phys + 212, 0x00005508);
+    store32(dst_phys + 216, 0xd285000a);
+    store32(dst_phys + 220, 0x00005309);
+    store32(dst_phys + 224, 0x6a141508);
+    store32(dst_phys + 228, 0x7d961429);
+    store32(dst_phys + 232, 0x38121280);
+    store32(dst_phys + 236, 0xd0c30018);
+    store32(dst_phys + 240, 0x00020a80);
+    store32(dst_phys + 244, 0xd0c3001a);
+    store32(dst_phys + 248, 0x00020c80);
+    store32(dst_phys + 252, 0x86981a18);
+    store32(dst_phys + 256, 0xd0c3001a);
+    store32(dst_phys + 260, 0x00020e80);
+    store32(dst_phys + 264, 0x86981a18);
+    store32(dst_phys + 268, 0xd0c9001a);
+    store32(dst_phys + 272, 0x00020709);
+    store32(dst_phys + 276, 0x86981a18);
+    store32(dst_phys + 280, 0x7e16022b);
+    store32(dst_phys + 284, 0xd1000003);
+    store32(dst_phys + 288, 0x00621303);
+    store32(dst_phys + 292, 0xd1000004);
+    store32(dst_phys + 296, 0x00621704);
+    store32(dst_phys + 300, 0x8000c000);
+    store32(dst_phys + 304, 0x82018001);
+    store32(dst_phys + 308, 0x800c810c);
+    store32(dst_phys + 312, 0xbf0a050c);
+    store32(dst_phys + 316, 0xbf85ffc6);
+    store32(dst_phys + 320, 0xd2850012);
+    store32(dst_phys + 324, 0x00000911);
+    store32(dst_phys + 328, 0x24262082);
+    store32(dst_phys + 332, 0x68242712);
+    store32(dst_phys + 336, 0x32242402);
+    store32(dst_phys + 340, 0x7e260203);
+    store32(dst_phys + 344, 0x38262680);
+    store32(dst_phys + 348, 0xdc718000);
+    store32(dst_phys + 352, 0x007f0412);
+    store32(dst_phys + 356, 0xd2850014);
+    store32(dst_phys + 360, 0x00002911);
+    store32(dst_phys + 364, 0x242a2082);
+    store32(dst_phys + 368, 0x68282b14);
+    store32(dst_phys + 372, 0x32282810);
+    store32(dst_phys + 376, 0x7e2a0211);
+    store32(dst_phys + 380, 0x382a2a80);
+    store32(dst_phys + 384, 0xdc718000);
+    store32(dst_phys + 388, 0x007f0314);
+    store32(dst_phys + 392, 0xbf138012);
+    store32(dst_phys + 396, 0xbf84000e);
+    store32(dst_phys + 400, 0x920d1709);
+    store32(dst_phys + 404, 0x800d080d);
+    store32(dst_phys + 408, 0x8e0e860d);
+    store32(dst_phys + 412, 0x870eff0e);
+    store32(dst_phys + 416, 0x17000000);
+    store32(dst_phys + 420, 0x282c000e);
+    store32(dst_phys + 424, 0x8e0f890d);
+    store32(dst_phys + 428, 0x242e0083);
+    store32(dst_phys + 432, 0x682e2e0f);
+    store32(dst_phys + 436, 0x322e2e12);
+    store32(dst_phys + 440, 0x7e300213);
+    store32(dst_phys + 444, 0x38303080);
+    store32(dst_phys + 448, 0xdc718000);
+    store32(dst_phys + 452, 0x007f1617);
+    store32(dst_phys + 456, 0xbf8c0f70);
+    store32(dst_phys + 460, 0xbf810000);
+    return 464;
+}
+
 fn tex_bilin_write(dst_phys) {
     store32(dst_phys + 0,    0xbefe01c1);
     store32(dst_phys + 4,    0xc00a0600);

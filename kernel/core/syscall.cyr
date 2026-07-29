@@ -1222,7 +1222,7 @@ var GPU_OP_SUPPORTED   = 0x17F1F;    # bits 0..4 + 8 EDGE_COV + 9 TRI_RGBA + 10 
 # advertises ops, not flags. An OP cannot.
 # ⇒ WHEN THE WORKER LANDS (plan bite B9), bit 14 clears HERE and the GPO_E_NOTIMPL return at the end
 # of gpo_validate_tridepth goes away, in one change. Both moves or neither.
-var GPU_OP_NOTIMPL_MASK = 0x4000;    # bit 14 TRI_DEPTH — validator-reachable, NOT advertised
+var GPU_OP_NOTIMPL_MASK = 0x0000;    # EMPTY — every op in GPU_OP_SUPPORTED has a worker
 
 # ---- rung 17 op 0x0E sizing. ⚠ Its OWN constants, not TRI_LIST's: the record, the stride and the
 # work unit all differ, and sharing a name would couple two ABIs that are free to move apart.
@@ -2972,10 +2972,10 @@ fn edge_abi_selftest() {
     store32(&d + 16, (32 * 65536) + 32);          # 32x32 draw rect
     store32(&d + 24, 1);                          # n_tris
     store32(&d + 28, (64 * 65536) + 64);          # 64x64 depth extent
-    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "tridepth: well-formed record reaches the unbuilt worker", 55);
+    pass = pass + ea_expect(&d, 0, "tridepth: well-formed record is accepted", 40);
 
     store32(&d +  8, GPU_RT_HANDLES - 1);
-    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "tridepth: the LAST depth handle is accepted", 43);
+    pass = pass + ea_expect(&d, 0, "tridepth: the LAST depth handle is accepted", 43);
     store32(&d +  8, GPU_RT_HANDLES);
     pass = pass + ea_expect(&d, GPO_E_BADSLOT, "tridepth: handle one past the last is refused", 45);
     store32(&d +  8, 0);
@@ -3083,7 +3083,7 @@ fn edge_abi_selftest() {
     store32(vb + 24, GPU_TRID_Z_MAX);
     store32(vb + 28, GPU_TRID_Z_MAX);
     store32(vb + 32, GPU_TRID_Z_MAX);
-    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "tridepth: z at the ABI ceiling is legal on a small rect", 55);
+    pass = pass + ea_expect(&d, 0, "tridepth: z at the ABI ceiling is legal on a small rect", 55);
     store32(vb + 28, GPU_TRID_Z_MAX + 1);
     pass = pass + ea_expect(&d, GPO_E_ZRANGE, "tridepth: z one past the ceiling, corner bound still slack", 58);
     store32(vb + 28, GPU_TRID_Z_MAX);
@@ -3091,7 +3091,7 @@ fn edge_abi_selftest() {
     # and the witness slot ACCEPTED -- one tile needs 64*2*4 = 512 B, and id 15 holds 4096.
     # ⚠ An all-reject battery for a field proves the rejects work and never that the field is usable.
     store32(&d + 32, 15);
-    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "tridepth: a well-formed witness slot is accepted", 48);
+    pass = pass + ea_expect(&d, 0, "tridepth: a well-formed witness slot is accepted", 48);
     store32(&d + 32, 0);
 
     # ---- op 0x10 RT_READ (rung 17, 1.56.30) ----------------------------------------------------
@@ -3350,13 +3350,11 @@ fn gpo_validate_tridepth(rec, fbw, fbh) {
         i = i + 1;
     }
 
-    # ⛔⛔ THE ABI IS COMPLETE AND THE WORKER IS NOT. Every rule above is real and tested; what does
-    # not exist yet is tri_depth.s and gpu_tri_depth(). NOTIMPL rather than 0 so a caller gets a
-    # specific, documented refusal instead of a blessing followed by a generic GPO_E_DISPATCH deep in
-    # the worker — the "ABI accepts then silently fails" defect GPO_E_NOTIMPL was minted for.
-    # ⇒ WHEN THE WORKER LANDS (plan bite B9) this line goes and bit 14 clears from
-    # GPU_OP_NOTIMPL_MASK, in ONE change, with the battery's expectations moving in the same edit.
-    return GPO_E_NOTIMPL;
+    # ⭐ ACCEPTED. tri_depth.s and gpu_tri_depth() landed with this line, and GPU_OP_NOTIMPL_MASK
+    # cleared bit 14 in the same change — the accepted surface and the proven surface move together
+    # or the mask is a lie. The worker still refuses with GPO_E_ARM where the render-target region is
+    # not provably free on this boot, which is an arming fact, not an ABI one.
+    return 0;
 }
 
 # ============================================================================================
@@ -3540,6 +3538,11 @@ fn gpo_execute(rec) {
     # ⭐ RUNG 17's READBACK. ⚠ GPO_E_ARM, not GPO_E_DISPATCH, for op 0x0D's stated reason: the
     # overwhelmingly likely refusal is rung 6's audit not having passed on this boot, which is an
     # ARMING fact (the region is not proven free) rather than a dispatch that failed.
+    if (op == GPU_OP_TRI_DEPTH) {
+        var tvk = load64(&shm_kva + ((load32(rec + 12) & 0xFFFFFFFF) - 1) * 8);
+        if (gpu_tri_depth(rec, tvk) != 1) { return GPO_E_ARM; }
+        return 0;
+    }
     if (op == GPU_OP_RT_READ) {
         var rzh  = load32(rec + 8)  & 0xFFFFFFFF;
         var rdid = load32(rec + 12) & 0xFFFFFFFF;

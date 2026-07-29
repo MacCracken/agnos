@@ -38,6 +38,10 @@ include "lib/io.cyr"
 # a double include does not error; it quietly picks one and the two could drift unnoticed.
 # slen/ps/nl come from tricore for the same reason and are NOT redefined here.
 include "tricore.cyr"
+# ⭐ RUNG 17's reference. Same combination depthgate.cyr already builds with, so the double
+# lib/io.cyr include is proven safe here. The corpus and the renderer live in ONE place: a burn
+# adjudicated against a private copy of the reference is adjudicated against a different program.
+include "depthcore.cyr"
 fn puts(s): i64 { ps(s); nl(); return 0; }
 fn pnum(v): i64 {
     if (v == 0) { print("0", 1); return 0; }
@@ -73,8 +77,8 @@ var SENTINEL = 0xA5;
 # the mask buffer declared next to it. A corrupted edge array produces a plausible WRONG
 # TRIANGLE, the single hardest symptom in this rung's failure table to attribute.
 var tri_edges[512];             # 4096 B = 256 edges x 16 B — the EDGE_CAP_PROBE ceiling,
-                                # not the shipped cap (still 64). The tool must be able to SUBMIT
-                                # what the probe kernel will accept, or the sweep cannot reach it.
+# not the shipped cap (still 64). The tool must be able to SUBMIT
+# what the probe kernel will accept, or the sweep cannot reach it.
 #
 # ⛔ And ONE buffer served as BOTH the sentinel prefill and the readback. That makes the
 # comparison read the GPU's own output as the "expected" value for any byte the GPU did not
@@ -466,12 +470,12 @@ fn tri_attr(): i64 {
     while (i < TC_N) {
         if (tc_get(i, 9) == TCF_REJECT) { i = i + 1; continue; }
         if (tri_prep(tc_get(i,0), tc_get(i,1), tc_get(i,2), tc_get(i,3),
-                     tc_get(i,4), tc_get(i,5), tc_get(i,6), tc_get(i,7), tc_get(i,8)) != 1) {
+        tc_get(i,4), tc_get(i,5), tc_get(i,6), tc_get(i,7), tc_get(i,8)) != 1) {
             i = i + 1; continue;
         }
         cases = cases + 1;
         if (tri_cov_capture(tc_cov(i,0), tc_cov(i,1), tc_cov(i,2), tc_cov(i,3),
-                            tc_cov(i,4), tc_cov(i,5), w, h, &bg) == 0) {
+        tc_cov(i,4), tc_cov(i,5), w, h, &bg) == 0) {
             puts("  ** coverage capture failed -- the reference cannot be fed the GPU's input");
             return 87;
         }
@@ -506,7 +510,7 @@ fn tri_attr(): i64 {
     while (gi < TC_N) {
         if (tc_get(gi, 9) == TCF_REJECT) { gi = gi + 1; continue; }
         if (tri_prep(tc_get(gi,0), tc_get(gi,1), tc_get(gi,2), tc_get(gi,3),
-                     tc_get(gi,4), tc_get(gi,5), tc_get(gi,6), tc_get(gi,7), tc_get(gi,8)) != 1) {
+        tc_get(gi,4), tc_get(gi,5), tc_get(gi,6), tc_get(gi,7), tc_get(gi,8)) != 1) {
             gi = gi + 1; continue;
         }
         # ⛔ gi, NOT i. `i` is the PRINTING loop's variable and it is still in scope here, parked at
@@ -515,7 +519,7 @@ fn tri_attr(): i64 {
         # correctly) stayed perfectly plausible. Two burns reported a shader disagreement that was
         # entirely this line. Cyrius has no unused-variable or scope warning to catch it.
         if (tri_cov_capture(tc_cov(gi,0), tc_cov(gi,1), tc_cov(gi,2), tc_cov(gi,3),
-                            tc_cov(gi,4), tc_cov(gi,5), w, h, &bg) == 0) {
+        tc_cov(gi,4), tc_cov(gi,5), w, h, &bg) == 0) {
             puts("  ** coverage capture failed -- the reference cannot be fed the GPU's input");
             return 87;
         }
@@ -766,7 +770,7 @@ fn tri_attr(): i64 {
     var cz = 0;
     while (cz < w * h) { store8(&bg + cz, 255); cz = cz + 1; }
     tri_prep(tc_get(0,0), tc_get(0,1), tc_get(0,2), tc_get(0,3),
-             tc_get(0,4), tc_get(0,5), tc_get(0,6), tc_get(0,7), tc_get(0,8));
+    tc_get(0,4), tc_get(0,5), tc_get(0,6), tc_get(0,7), tc_get(0,8));
     tri_ref_fill(&tri_ref, &bg, w, h);
     var d1 = digest(&tri_ref, bytes);
     var zz = 0;
@@ -932,8 +936,8 @@ fn tl_render_one(tbl, i, buf, cov, w, h, bg): i64 {
         y = y + 1;
     }
     if (tri_prep(tl_get(tbl,i,0), tl_get(tbl,i,1), tl_get(tbl,i,2), tl_get(tbl,i,3),
-                 tl_get(tbl,i,4), tl_get(tbl,i,5),
-                 tl_get(tbl,i,6), tl_get(tbl,i,7), tl_get(tbl,i,8)) != 1) { return 0; }
+    tl_get(tbl,i,4), tl_get(tbl,i,5),
+    tl_get(tbl,i,6), tl_get(tbl,i,7), tl_get(tbl,i,8)) != 1) { return 0; }
     var yy = 0;
     while (yy < h) {
         var xx = 0;
@@ -1067,8 +1071,8 @@ fn tri_list(): i64 {
     var ci = 0;
     while (ci < n) {
         if (tri_cov_capture(tl_get(&tl_tbl,ci,0), tl_get(&tl_tbl,ci,1), tl_get(&tl_tbl,ci,2),
-                            tl_get(&tl_tbl,ci,3), tl_get(&tl_tbl,ci,4), tl_get(&tl_tbl,ci,5),
-                            w, h, &tl_covs + ci * w * h) == 0) {
+        tl_get(&tl_tbl,ci,3), tl_get(&tl_tbl,ci,4), tl_get(&tl_tbl,ci,5),
+        w, h, &tl_covs + ci * w * h) == 0) {
             puts("gputri: coverage capture failed -- the reference cannot be fed the GPU's input");
             return 87;
         }
@@ -1750,7 +1754,7 @@ fn bench_ngon(ne): i64 {
         var ga = (k * step) % 256;
         var gb = ((k + 1) * step) % 256;
         edge_add(load64(&bg + ga * 16), load64(&bg + ga * 16 + 8),
-                 load64(&bg + gb * 16), load64(&bg + gb * 16 + 8));
+        load64(&bg + gb * 16), load64(&bg + gb * 16 + 8));
         k = k + 1;
     }
     return n_edges;
@@ -1854,6 +1858,234 @@ fn bench_point(w, h, batch): i64 {
     }
     if (g >= c) { ps("CPU wins (gpu is "); pnum((g * 100) / c); puts("% of cpu time)"); }
     return cov;
+}
+
+# ==================================================================================================
+# --depth — RUNG 17's INSTRUMENT. Depth-tested triangles via #92 op 0x0E, read back and adjudicated.
+# ==================================================================================================
+# ⭐ THE ORACLE IS ORDER-INDEPENDENCE, AND IT IS AN ANSWER THE HARDWARE MUST GIVE: two interpenetrating
+# triangles submitted in BOTH orders must produce byte-identical output. depthgate proves the property
+# holds for the algorithm before a single instruction ran, so a red burn here convicts the shader.
+#
+# ⛔⛔ BUT THE ORACLE ALONE IS NEARLY BLIND TO THE ONE THING THIS RUNG ADDS. Measured on the host: a
+# one-ULP z error moves order-independence by 1 px out of 507 while moving the direct reference diff
+# by 217 — ~200x less sensitive. And a divide with its correction dropped moves it by ZERO. So this
+# arm reads back **z as well as colour**, through op 0x10, and compares BOTH against the reference.
+# Without the z readback a broken divide — the rung's entire novel content — cannot fail this burn.
+#
+# ⚠ Colour comes back through #90 (a GPU capture of the back buffer); z cannot, because it lives in a
+# kernel-owned render-target handle ring 3 has no address for. That asymmetry is why op 0x10 exists.
+#
+# Exits (arm-specific): 95 all exact · 100 no GPU · 90 named #92 fault · 88 the buffer was UNTOUCHED
+#   94 the two submission orders DIFFER · 93 the lane witness is inconsistent
+#   92 z disagrees with the reference · 91 colour disagrees with the reference · 86 a control failed
+var dep_vtx[12];                 # 2 triangles x 48 B
+var dep_c0[512];                 # 32x32x4 colour, order 0
+var dep_c1[512];                 # ... order 1
+var dep_z0[512];                 # 32x32x4 depth, order 0
+var dep_z1[512];                 # ... order 1
+var dep_wit[1024];               # 16 tiles x 64 lanes x 2 words x 4 B = 8192 B
+var DEP_POISON = 0xDEADBEEF;
+# ⚠ MIRRORED from the kernel (GPU_TRID_BG / GPU_TRID_ZCLEAR in gpu.cyr). These are KERNEL-CHOSEN,
+# not record fields — the #92 record has no dword for either — so the reference must be rendered
+# with the same two values the shader initialises its registers to, or every pixel outside every
+# triangle disagrees and the arm reports a defect that is purely a background mismatch.
+var GPU_TRID_BG_REF = 0xFF000000;
+
+fn dep_pack(swap): i64 {
+    dc_corpus(swap);
+    var t = 0;
+    while (t < dc_n) {
+        var r = &dep_vtx + t * 48;
+        # ⚠ 16.16 with ZERO fraction. The validator refuses any coordinate with fraction bits set
+        # (GPO_E_SUBPIXEL) because the reference and model prove this arithmetic in the doubled
+        # INTEGER domain only — accepting arbitrary 16.16 and rounding kernel-side would answer a
+        # different question than the one that was asked.
+        store32(r +  0, (dc_get(t, 0) << 16) & 0xFFFFFFFF);
+        store32(r +  4, (dc_get(t, 1) << 16) & 0xFFFFFFFF);
+        store32(r +  8, (dc_get(t, 3) << 16) & 0xFFFFFFFF);
+        store32(r + 12, (dc_get(t, 4) << 16) & 0xFFFFFFFF);
+        store32(r + 16, (dc_get(t, 6) << 16) & 0xFFFFFFFF);
+        store32(r + 20, (dc_get(t, 7) << 16) & 0xFFFFFFFF);
+        store32(r + 24, dc_get(t, 2) & 0xFFFFFFFF);
+        store32(r + 28, dc_get(t, 5) & 0xFFFFFFFF);
+        store32(r + 32, dc_get(t, 8) & 0xFFFFFFFF);
+        store32(r + 36, dc_get(t, 9) & 0xFFFFFFFF);
+        store32(r + 40, 0);
+        store32(r + 44, 0);
+        t = t + 1;
+    }
+    return dc_n;
+}
+
+# dep_run — submit one order, read colour and z back. Returns 0, or an exit code.
+fn dep_run(swap, cbuf, zbuf): i64 {
+    var w = 32;
+    var h = 32;
+    var bytes = w * h * 4;
+    var n = dep_pack(swap);
+
+    var vid = syscall(86, n * 48);
+    if (vid < 1) { return 100; }
+    var cid = syscall(86, bytes);
+    if (cid < 1) { syscall(74, vid); return 100; }
+    var zid = syscall(86, bytes);
+    if (zid < 1) { syscall(74, vid); syscall(74, cid); return 100; }
+    var wid = syscall(86, 8192);
+    if (wid < 1) { syscall(74, vid); syscall(74, cid); syscall(74, zid); return 100; }
+
+    if (syscall(72, vid, &dep_vtx, n * 48) != 0) { return 90; }
+    # ⛔ PRE-SEED EVERY DESTINATION WITH POISON, and use a FRESH slot per run. A #86 slot is a fixed
+    # window per index, so a freed-then-reallocated slot hands back the SAME memory with the previous
+    # run's pixels in it — a stale ghost that reads as a pass. GPU_SHADER_OUT2_SUBOFF records the
+    # same failure from the other side: reusing a slot let a stale L2 line flush back over the
+    # pre-seed and mask whether the shader had written at all.
+    var i = 0;
+    while (i < bytes / 8) { store64(cbuf + i * 8, 0xA5A5A5A5A5A5A5A5); i = i + 1; }
+    if (syscall(72, cid, cbuf, bytes) != 0) { return 90; }
+    i = 0;
+    while (i < bytes / 8) { store64(zbuf + i * 8, 0xA5A5A5A5A5A5A5A5); i = i + 1; }
+    if (syscall(72, zid, zbuf, bytes) != 0) { return 90; }
+    i = 0;
+    while (i < 1024) { store64(&dep_wit + i * 8, 0xDEADBEEFDEADBEEF); i = i + 1; }
+    if (syscall(72, wid, &dep_wit, 8192) != 0) { return 90; }
+
+    # ---- op 0x0E: the depth-tested draw ----------------------------------------------------
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 14);                      # GPU_OP_TRI_DEPTH
+    store32(&d +  8, 0);                       # depth handle 0
+    store32(&d + 12, vid);
+    store32(&d + 16, (h * 65536) + w);
+    store32(&d + 24, n);
+    store32(&d + 28, (h * 65536) + w);         # depth extent == the draw rect here
+    store32(&d + 32, wid);
+    var rc = syscall(92, &d, 64);
+    if (rc != 0) {
+        syscall(74, vid); syscall(74, cid); syscall(74, zid); syscall(74, wid);
+        return tri_report((0 - rc) & 0xFF);
+    }
+
+    # ---- colour back out of the back buffer via #90, then into our buffer -------------------
+    if (syscall(90, cid, (h * 65536) + w, 0) != 0) { return 90; }
+    if (syscall(73, cid, cbuf, bytes) != 0) { return 90; }
+
+    # ---- ⭐ z back out of the KERNEL-OWNED handle via op 0x10 -------------------------------
+    z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 16);                      # GPU_OP_RT_READ
+    store32(&d +  8, 0);
+    store32(&d + 12, zid);
+    store32(&d + 16, (h * 65536) + w);
+    store32(&d + 28, (h * 65536) + w);
+    rc = syscall(92, &d, 64);
+    if (rc != 0) {
+        syscall(74, vid); syscall(74, cid); syscall(74, zid); syscall(74, wid);
+        return tri_report((0 - rc) & 0xFF);
+    }
+    if (syscall(73, zid, zbuf, bytes) != 0) { return 90; }
+    if (syscall(73, wid, &dep_wit, 8192) != 0) { return 90; }
+
+    syscall(74, vid); syscall(74, cid); syscall(74, zid); syscall(74, wid);
+    return 0;
+}
+
+# dep_witness_check — the five-way discrimination, from ONE self-describing word per lane.
+# ⭐ The host does not ask "is this poison?" — it asks whether the word at index i SAYS it belongs at
+# index i. The documented consequence of an under-granted SGPR file is a corrupted address carry
+# chain, i.e. lanes writing the WRONG LOCATION, and a dumb witness cannot see that at all.
+fn dep_witness_check(): i64 {
+    var tiles = 16;
+    var poison = 0;
+    var wrong = 0;
+    var badword1 = 0;
+    var i = 0;
+    while (i < tiles * 64) {
+        var got = load32(&dep_wit + i * 8) & 0xFFFFFFFF;
+        var want = (0x17000000 + (i & 0xFFFFC0) + (i & 63)) & 0xFFFFFFFF;
+        if (got == DEP_POISON) { poison = poison + 1; }
+        if (got != DEP_POISON) { if (got != want) { wrong = wrong + 1; } }
+        # word 1 is the extension point and must stay poison in v1
+        if ((load32(&dep_wit + i * 8 + 4) & 0xFFFFFFFF) != DEP_POISON) { badword1 = badword1 + 1; }
+        i = i + 1;
+    }
+    ps("gputri: witness -- "); pnum(poison); ps(" poison, "); pnum(wrong);
+    ps(" mislabelled, "); pnum(badword1); puts(" stray word-1 writes");
+    if (poison == tiles * 64) {
+        puts("gputri:   ALL POISON => NO WAVE RAN (residency / arm / RSRC1 / zero grid)");
+        return 1;
+    }
+    if (poison != 0) {
+        puts("gputri:   SCATTERED DROPOUTS => register aliasing. Re-run with ONE workgroup:");
+        puts("gputri:   if determinism returns it is aliasing/RSRC1, NOT a race, and no atomics.");
+        return 1;
+    }
+    if (wrong != 0) {
+        puts("gputri:   MISLABELLED => a lane wrote a location that is not its own (carry chain)");
+        return 1;
+    }
+    if (badword1 != 0) { puts("gputri:   word 1 was written; v1 reserves it"); return 1; }
+    return 0;
+}
+
+fn dep_cmp(a, b, n): i64 {
+    var d = 0;
+    var i = 0;
+    while (i < n) {
+        if ((load32(a + i * 4) & 0xFFFFFFFF) != (load32(b + i * 4) & 0xFFFFFFFF)) { d = d + 1; }
+        i = i + 1;
+    }
+    return d;
+}
+
+fn tri_depth_arm(): i64 {
+    var w = 32;
+    var h = 32;
+    var np = w * h;
+    puts("gputri: RUNG 17 -- depth-tested triangles via #92 op 0x0E, z read back via op 0x10");
+
+    var r0 = dep_run(0, &dep_c0, &dep_z0);
+    if (r0 != 0) { return r0; }
+    var wit = dep_witness_check();
+    var r1 = dep_run(1, &dep_c1, &dep_z1);
+    if (r1 != 0) { return r1; }
+
+    # ---- did anything happen at all? Two UNTOUCHED buffers are byte-identical. ---------------
+    var touched = 0;
+    var i = 0;
+    while (i < np) {
+        if ((load32(&dep_c0 + i * 4) & 0xFFFFFFFF) != 0xA5A5A5A5) { touched = touched + 1; }
+        i = i + 1;
+    }
+    ps("gputri: colour buffer touched at "); pnum(touched); puts(" of 1024 px");
+    if (touched == 0) { puts("gputri: UNTOUCHED -- the shader wrote nothing"); return 88; }
+
+    # ---- THE ORACLE ------------------------------------------------------------------------
+    var dc = dep_cmp(&dep_c0, &dep_c1, np);
+    var dz = dep_cmp(&dep_z0, &dep_z1, np);
+    ps("gputri: both submission orders -- colour differs at "); pnum(dc);
+    ps(" px, z differs at "); pnum(dz); puts(" px");
+    if (dc != 0) { puts("gputri: ORDER-DEPENDENT COLOUR -- see the rubric before blaming TD-5"); return 94; }
+    if (dz != 0) { puts("gputri: ORDER-DEPENDENT DEPTH"); return 94; }
+
+    # ---- and against the reference, which is the sensitive half ----------------------------
+    dc_corpus(0);
+    dc_render(w, h, DC_ZCLEAR_HW, GPU_TRID_BG_REF);
+    var rc_col = dep_cmp(&dep_c0, &dc_cbuf, np);
+    var rc_z   = dep_cmp(&dep_z0, &dc_zbuf, np);
+    ps("gputri: vs the CPU reference -- colour "); pnum(rc_col);
+    ps(" px differ, z "); pnum(rc_z); puts(" px differ");
+    if (rc_col != 0) { puts("gputri: COLOUR != reference"); return 91; }
+    if (rc_z != 0) {
+        puts("gputri: Z != reference -- this is the arm that can see a broken divide");
+        return 92;
+    }
+    if (wit != 0) { return 93; }
+
+    puts("gputri: PASS -- both orders byte-identical in COLOUR and DEPTH, both match the CPU");
+    puts("gputri:        reference, and every lane witness names its own slot.");
+    return 95;
 }
 
 fn tri_bench(): i64 {
@@ -1991,19 +2223,21 @@ fn main(): i64 {
             puts("gputri: RUNG 11 -- barycentric RGBA via #92 op 0x09");
             return tri_attr();
         }
+        if (streq(a, "--depth") == 1) { return tri_depth_arm(); }
         if (streq(a, "--list") == 1) { return tri_list(); }
         if (streq(a, "--digest") == 1) { return tri_digest(); }
         if (streq(a, "--bench") == 1) { return tri_bench(); }
         # An unknown argument is an ERROR, never a default action -- the typo that cost the M9
         # arc a flash on 2026-07-24 is exactly this failure mode.
         puts("gputri: UNKNOWN ARGUMENT -- nothing was done.");
-        puts("gputri: --cov --tri --list --digest --bench");
+        puts("gputri: --cov --tri --list --depth --digest --bench");
         return 84;
     }
     puts("gputri -- RUNG 9b, the edge rasteriser's instrument");
     puts("");
     puts("  run /bin/gputri --digest    reference digests, diff against host cpuref FIRST");
     puts("  run /bin/gputri --cov       the 20-case corpus + negative controls N1-N8");
+    puts("  run /bin/gputri --depth     RUNG 17: depth test, BOTH orders, colour AND z back");
     puts("  run /bin/gputri --bench     RUNG 10's KILL GATE: GPU vs CPU coverage crossover");
     puts("");
     puts("Exits: 95 all exact + all controls fired · 100 no GPU here · 96 shader not resident");
