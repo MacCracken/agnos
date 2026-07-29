@@ -3,6 +3,45 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.30] - 2026-07-28
+
+**Rung 17 `depth` — cycle OPEN.** Bumped on cycle open; the user tags on close.
+
+### Found before writing code — rung 17's first bite is an ARENA decision, not the op
+
+The release-plan row scopes 1.56.30 as *"op `0x0D GPU_OP_DEPTH_CLEAR`; minting it means growing
+`gpu_caps` #89's support word first"*. Reconnaissance against source (not the row) says the ABI half
+is the easy half and there is a **hard blocker underneath it that the row does not name**.
+
+**Verified from source, and the row is accurate here:** `GPU_OP_SUPPORTED = 0x1F1F`
+(`syscall.cyr:1192`), `0x0D` is genuinely free, and the mask must grow to `0x3F1F`. ⚠ That mask is
+*both* the validator gate (`:2797`) and what `gpu_caps` #89 advertises (`:3160`) — so growing it
+**advertises the op to ring 3**. Per the rule 1.56.24 established and rung 15 respected, the accepted
+surface must equal the proven surface, so the worker must land in the same change. That is the
+"deliberately awkward" property working as designed.
+
+**⛔ THE BLOCKER: there is nowhere to put the Z buffer.** `GPU_ARENA_SIZE` is **2 MB** and the slot
+map is nearly full — walking the sorted extents, the only free runs are
+**`[0x1E4000, 0x1F0000)` = 48 KB** and **`[0x1F1000, 0x200000)` = 60 KB**. The live scanout is
+**800×600** (`gpu: scanout surface 800x600`), so a Z buffer is **960 KB at 16-bit** or **1.92 MB at
+32-bit**. Neither fits, and neither is close.
+
+⚠ **Derived by walking the extents, not by eye** — the same method `GPU_TEXL_PREP_SUBOFF`'s comment
+records after two "obvious" gaps in this file turned out to collide.
+
+**⚠ A second tension the row contains, worth resolving before any code:** rung 17's design is
+*"one workgroup owns an 8×8 tile … holding colour + depth in **VGPRs** across the loop, one
+`global_store` at the end"* — yet the same row says *"Z lives in the kernel render arena"*. Those are
+consistent only if the arena Z persists **across dispatches** while VGPR depth is tile-local **within**
+one. If depth never outlives a dispatch, a separate `DEPTH_CLEAR` op has no state to clear and the
+clear value belongs in the depth op's own record instead. **Which of those two it is decides whether
+op `0x0D` should exist at all**, so it is settled first rather than discovered after the ABI ships.
+
+⇒ **1.56.30's real first bite is the arena decision** — grow `GPU_ARENA_SIZE` (2 MB → 4 MB), place Z
+outside the carveout, or drop the persistent Z in favour of a per-dispatch clear value. No ABI has
+been minted and no VERSION-visible surface has changed, deliberately: minting `0x0D` before that
+decision would advertise an op whose storage does not exist.
+
 ## [1.56.29] - 2026-07-28
 
 **Rung 15 `bilinear` — the zero-burn foundation (open cycle).** Reference, model, and ABI, all proven
@@ -258,6 +297,22 @@ something other than the reference.
 ⚠ Also corrected: the prediction's comment claimed frame 0 has `fx = fy = 0`. That premise was false
 (it is 128); the conclusion was right for a different reason — the tent kernel is interpolating at
 texel centres. Recorded rather than quietly rewritten.
+
+### Also in this cut — the two supporting changes the sections above lean on
+
+- **`texmodel.cyr` publishes the full 16.16 quotient** (`txm_uv16` / `txm_uv16_valid`, plus
+  `txm_frac_case` / `txm_frac_sweep`). `txm_axis` computed `q + m` and threw it away, keeping only
+  `>>> 16`. That discarded half is exactly what bilinear reads, so gate 7 had nothing to compare
+  until it was exposed. ⚠ Valid **only** on the non-short-circuited path — the two out-of-domain
+  guards return before a quotient exists, and comparing a stale value there would manufacture a
+  disagreement that is the instrument's fault. The skipped count is reported alongside for the same
+  reason rung 9b's clamp-hit counter exists: a gate that silently compared nothing would report a
+  confident zero.
+- **`docs/development/state.md`'s remaining-cuts list was STALE BY +2** and is corrected against
+  `planning/gpu.md`, which is authoritative. It still carried the pre-renumbering mapping and
+  collapsed rungs 17/18/19 into a single cut, so it named four cuts where there are six
+  (**1.56.30–1.56.35**). Exactly the drift that sends the next session to the wrong work — the same
+  failure class 1.56.24 was opened to fix, found in the file whose whole job is being current.
 
 ### ✅✅ Iron-validated — the re-burn confirms the fix, and all four predictions hold
 
