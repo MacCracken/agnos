@@ -81,6 +81,50 @@ the address the **display engine is actually scanning out from**, out of DCN, an
 inside the region — the one witness in the function that agnos did not write.
 [[feedback_oracle_must_test_external_invariant]]
 
+### ✅✅ Iron-validated — rung 6 CLOSED, op `0x0D` live, and a ~1000× perf defect found
+
+`tex3.txt`, 2026-07-28. **All four pre-registered predictions confirmed.** `gpuwedge --rt-audit`
+exit 95, `RT AUDIT PASS`; `gpudepth` exit 95; `gputri --cov` 20/20.
+
+⭐ **The region ends at `0x1030000000`, which is exactly the `top=1030000000` the boot path reports
+from an entirely independent source** (E820/PMM, unrelated to `MC_VM_FB_OFFSET`). Two unrelated
+witnesses agreeing is what makes the decode trustworthy rather than plausible.
+
+⭐ **Check 7 — the external witness — fired and was informative.** `live scanout mc f400000000` is
+the carveout base, i.e. the console framebuffer at offset 0, exactly where the slot map says it
+lives. Not a zero (which the tool would have called VOID), not inside the region. TD-3's placement is
+confirmed against **hardware**, not against agnos's own map.
+
+### ⛔⛔ Fixed — `DEPTH_CLEAR` worked and was ~1000× too slow, in a number no gate asked about
+
+**89 ms per 800×600 clear — 1.92 MB at ~21 MB/s**, against the **3748 MB/s** `gputex` measures for
+far harder work. The `≥2×` scaling gate **passed** at 2.4× and did exactly its job (separate work
+from no-work); the finding is that **2.4× against a 17× byte ratio** is a second signal, and reading
+it rather than banking the green is where the defect was.
+
+Two-point fit: **91.5 µs per ROW** — dispatch-shaped, not bandwidth-shaped, the same order as
+`gputex`'s ~48 µs fixed dispatch cost. Cause, from source: `gpu_cp_dma_fill_rect` issues **one CP-DMA
+packet per row, each with its own fence wait**. An 800×600 clear submitted **600 packets**; the 32 MB
+clear submitted 2048. ⭐ And every one was **adjacent** — a depth buffer is contiguous, so the rect
+helper was decomposing a single linear range for no reason. The whole 32 MB handle fits **one**
+packet (CP-DMA `BYTE_COUNT` is 26 bits, ~64 MiB).
+
+**Fixed**: a single `gpu_cp_dma_fill(mc, value, w*4*h)`. ⚠ Noted at the call site that
+`gpu_cpdma_submit` **masks** the byte count (`bytes & GPU_CPDMA_MAX`) rather than rejecting it — a
+count past 64 MiB would silently truncate and report success. The per-handle bound keeps this path
+off that edge; a larger `GPU_RT_HANDLE_SIZE` would have to split the call.
+
+### ⭐ The transferable lesson — when the target is unreadable, cost is still observable
+
+Op `0x0D` writes a kernel-owned buffer ring 3 cannot read: no `#86` slot, and `#90` reads the
+framebuffer, not Z. So there was **no byte-comparison oracle available**, and the obvious one was
+"did it return 0". **It did return 0 — on a path three orders of magnitude off.** A return-code
+oracle would have closed rung 17's first op green.
+
+⇒ **Cost that must SCALE is a real oracle, and two points beat one**: a single 89 ms measurement has
+nothing to be wrong against. Same shape as the discrimination gate that caught rung 15's half-texel
+offset — the useful check is the one comparing against something other than the thing under test.
+
 ### ⛔ Fixed — `gpuwedge --audit` claimed "READ-ONLY, writes nothing" and WROTE
 
 Found while wiring ARM F. `--audit` invoked arm **5** = `RECOV_ARM_E`, which audits the sacrificial

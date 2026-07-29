@@ -862,13 +862,24 @@ fn gpu_depth_clear(zh, w, h, value) {
     if (gpu_rt_arm() != 1) { return 0; }
     var mc = gpu_rt_handle_mc(zh);
     if (mc == 0) { return 0; }
-    var row_bytes = w * 4;
+    var bytes = w * 4 * h;
     # ⛔ BOUND THE WRITE AGAINST THE HANDLE, NOT AGAINST THE REGION. A w*h that fits the 256 MB region
     # but overruns this 32 MB handle would silently scribble on the NEXT handle -- a corruption whose
     # symptom appears in an unrelated buffer. The validator checks this too; this is the second gate,
     # because the worker is what actually issues the DMA.
-    if (row_bytes * h > GPU_RT_HANDLE_SIZE) { return 0; }
-    return gpu_cp_dma_fill_rect(mc, row_bytes, value, row_bytes, h);
+    if (bytes > GPU_RT_HANDLE_SIZE) { return 0; }
+    # ⛔⛔ ONE LINEAR FILL, NOT gpu_cp_dma_fill_rect. THE FIRST VERSION USED THE RECT PATH AND THE
+    # 1.56.30 BURN MEASURED THE COST: that helper issues ONE CP-DMA PACKET PER ROW, each with its own
+    # fence wait, so an 800x600 clear submitted 600 packets and took **89 ms** -- about 21 MB/s,
+    # against the 3748 MB/s gputex measures for far harder work. A two-point fit over the burn's two
+    # rects isolates it exactly: 91.5 us PER ROW, which is dispatch-shaped, not bandwidth-shaped.
+    # ⭐ A depth buffer is CONTIGUOUS -- stride == row_bytes by construction here -- so the rect helper
+    # was decomposing a single linear range into `rows` adjacent pieces for no reason. One packet
+    # covers it. ⚠ And the whole 32 MB handle fits: CP-DMA's BYTE_COUNT field is 26 bits (~64 MiB).
+    # ⛔ THAT LIMIT IS MASKED, NOT CHECKED, at gpu_cpdma_submit (`bytes & GPU_CPDMA_MAX`), so a count
+    # past 64 MiB would silently TRUNCATE and report success. The handle bound above is what keeps
+    # this path away from that edge; if GPU_RT_HANDLE_SIZE ever exceeds 64 MiB, this call must split.
+    return gpu_cp_dma_fill(mc, value, bytes);
 }
 
 fn gpu_wait_done(done_phys, expect, timeout_us) {

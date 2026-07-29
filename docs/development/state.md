@@ -123,20 +123,29 @@ not free ⇒ TD-3 has nowhere to live."* ⚠ With `VM_CONTEXT0` disabled there a
 an OOB store lands somewhere real — "free" must be MEASURED.
 ⭐ **Why it hid for six rungs:** rung 6's note says a failure stalls Phase II "at rung 11", yet
 rungs 11-16 all shipped — they fit the 2 MB arena. **Rung 17 is the first rung whose buffer does not.**
-✅ **RUNG 6 HOST HALF LANDED (1.56.30).** TD-3's constants declared (`GPU_RT_REGION_OFF` 0xB0000000 /
-256 MB / 8 handles x 32 MB); `gpu_rt_arena_audit()` runs **seven** READ-ONLY checks; `tests/gpu/rtaudit.cyr`
-proves the six arithmetic ones on the host (**exit 95**, C1-C7 + M1-M5 mutations) and confirms 32 MB really
-holds 2560x1440x4 colour AND depth. `gpuwedge --rt-audit` -> #94 ARM F, **outside** the `GPU_RECOVER` ifdef
-so it ships in a production kernel (verified against the BUILT BINARY, not the source).
-⭐ **Check 7 needs iron and it is the only one that matters**: checks 1-6 compare the region against agnos's
-OWN slot map, so a stale map passes all six together — the shared-premise blindness rung 15 shipped. Check 7
-reads the address the DISPLAY ENGINE IS ACTUALLY SCANNING OUT FROM and refuses if it is inside the region.
-⛔ **Found while wiring it: `gpuwedge --audit` said "READ-ONLY, writes nothing" and invoked ARM E, which
-audits then fires an UNGUARDED WRITE.** Renamed `--slot-audit`; labelled truthfully.
-⇒ **CHAIN: rung 6 IRON half (`gpuwedge --rt-audit`, rides any flash, 0 marginal burns) → build the handle
-table → op `0x0D` + worker → the tile-serialised depth rung.** No ABI minted yet, deliberately.
-⚠ The VGPR-vs-arena-Z tension RESOLVES: arena Z persists ACROSS dispatches, VGPR depth is tile-local
-WITHIN one. So `DEPTH_CLEAR` has state to clear and op `0x0D` is justified.
+✅✅ **RUNG 6 CLOSED AND IRON-VALIDATED (`tex3.txt`, 2026-07-28) — all four predictions confirmed.**
+`gpuwedge --rt-audit` exit 95, `RT AUDIT PASS`. Region `[0xB0000000, 0xC0000000)` -> phys
+`1020000000..1030000000`, and **`1030000000` is exactly the `top=1030000000` the boot path reports
+from an INDEPENDENT source** (E820/PMM, nothing to do with `MC_VM_FB_OFFSET`) — two unrelated
+witnesses agreeing. ⭐ **Check 7 fired and was informative**: `live scanout mc f400000000` = the
+carveout base, i.e. the console FB at offset 0, exactly where the map says. Not zero (which would
+have been VOID), not inside the region. TD-3's placement is confirmed against HARDWARE.
+✅ **Op `0x0D` DEPTH_CLEAR is live on iron** — minted with its worker, mask `0x1F1F -> 0x3F1F`, ABI
+battery **103/103**, gated so nothing can store until the audit passes on that boot.
+⛔⛔ **AND THE BURN FOUND A ~1000x PERF DEFECT THE RUBRIC DID NOT ASK ABOUT.** 89 ms per 800x600
+clear = **21 MB/s**, against gputex's 3748 MB/s. The ≥2x gate passed (2.4x) and did its job —
+separating work from no-work — but **2.4x against a 17x byte ratio** is the second signal.
+Two-point fit: **91.5 us PER ROW**, dispatch-shaped, not bandwidth-shaped. Cause:
+`gpu_cp_dma_fill_rect` issues **one CP-DMA packet per row with its own fence wait** — 600 packets for
+800x600 — and a depth buffer is **contiguous**, so all of them were adjacent. The whole 32 MB handle
+fits ONE packet (CP-DMA BYTE_COUNT is 26 bits, ~64 MiB). **Fixed** to a single `gpu_cp_dma_fill`.
+⚠ `gpu_cpdma_submit` **masks** the byte count rather than rejecting it, so >64 MiB would silently
+truncate and report success; the handle bound keeps this path off that edge.
+⭐ **THE TRANSFERABLE LESSON: the target is unreadable from ring 3, so the obvious oracle was "did it
+return 0" — and it DID, on a path three orders of magnitude off.** When you cannot read the result,
+cost is still observable, and cost that must SCALE is a real oracle. Two points beat one.
+▶ **REMAINING: a confirming burn for the fix** (pre-registered in the tracker — 800x600 total must
+drop below 100,000 us from 1,788,344; ratio must move TOWARD 17x). Rides the next flash, no new tool.
 
 Remaining after rung 15 — ⚠ **this list was STALE by +2 until 2026-07-28** (it still carried the
 pre-renumbering mapping and collapsed rungs 17/18/19 into one cut); [`planning/gpu.md`](planning/gpu.md)
