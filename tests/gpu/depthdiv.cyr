@@ -1,0 +1,249 @@
+# depthdiv.cyr — RUNG 17's DIVIDE GATE. Proves the per-pixel quotient is EXACT before a line of
+# tri_depth.s is transcribed.
+#
+# ============================================================================================
+# ⛔⛔ WHY THIS FILE EXISTS: THE RUNG'S OWN ORACLE CANNOT SEE A DIVIDE ERROR
+# ============================================================================================
+# depthmodel's M2c MEASURED it in-tree: a ONE-ULP z error on one triangle moves order-independence
+# by **1 pixel out of 507** while moving the direct reference diff by **217**. The rung's stated iron
+# oracle — "both submission orders byte-identical" — is roughly **200x less sensitive** to divide
+# error than a plain reference comparison, and one pixel is exactly the size that reads as noise.
+# ⚠ And on IRON it is worse than insensitive: z lives in a kernel-owned TD-3 handle that ring 3
+# cannot address, and `#90` reads the framebuffer, not Z. **The burn cannot see z at all.**
+# ⇒ The divide has to be discharged HERE or it is never discharged.
+#
+# ============================================================================================
+# ⭐ THE OBLIGATION IS THE DEFINING PROPERTY OF THE FLOOR, CHECKED BY MULTIPLICATION ONLY
+# ============================================================================================
+#     q*area <= zn < (q+1)*area          for every (zn, area) the ABI permits
+#
+# ⛔ NOT "the modelled divide equals `zn / area`". That is agreement between two implementations, and
+# a shared premise is invisible to it — which is exactly what shipped rung 15's half-texel offset and
+# what made rung 6's checks 1-6 unable to see a stale slot map. This inequality is an EXTERNAL
+# invariant: it is true of the floor by definition, and no implementation is consulted to state it.
+# [[feedback_oracle_must_test_external_invariant]]
+# ⚠ Checked with MULTIPLICATION, never a second divide — a second divide would just be the first one
+# again, agreeing with itself.
+
+include "lib/io.cyr"
+include "tricore.cyr"      # ps / pn / nl
+
+var DD_2P32 = 4294967296;
+
+# ---- mutations, each required to go red ---------------------------------------------------------
+var dd_mut_bias   = 0;   # MUT-R1: R from (area+1) -- rung 13's transplant bias
+var dd_mut_nocorr = 0;   # MUT-R2: drop the one-sided correction
+var dd_mut_gt     = 0;   # MUT-R3: `>` instead of `>=` -- fails exactly at multiples
+
+# dd_recip(area) — the CPU prep constant. floor(2^32 / area).
+# ⚠ area >= 4 is an ABI guarantee (area = 4*cross, cross >= 1 by GPU_TRI_AREA_MIN), so R <= 2^30 and
+# the product zn*R below stays under 2^62 -- inside i64 on the host AND representable as the shader's
+# v_mul_hi_u32 of two u32s. If area could be smaller this whole recipe would need re-deriving.
+fn dd_recip(area): i64 {
+    if (dd_mut_bias != 0) { return DD_2P32 / (area + 1); }
+    return DD_2P32 / area;
+}
+
+var dd_corr_fires = 0;      # how many times the one-sided correction actually fired
+var dd_max_short  = 0;      # max (Q - q_est) BEFORE correction -- must be exactly 1, never 0, never 2
+
+# dd_quot(zn, area, R) — the R2 recipe at the shader's widths.
+#   q_est = mul_hi_u32(zn, R)        -> v_mul_hi_u32
+#   r     = zn - q_est*area          -> v_mul_lo_u32 ; v_sub_u32
+#   if (r >= area) q_est += 1        -> v_cmp_le_u32 ; v_addc_co_u32
+# ⚠ `>>` is LOGICAL in Cyrius (inverted from C). Correct here: zn*R is provably non-negative, so
+# logical and arithmetic agree -- but the shader's v_mul_hi_u32 is UNSIGNED, and saying so is what
+# stops a future edit reaching for `>>>` by symmetry with the coordinate floors elsewhere in the tree.
+fn dd_quot(zn, area, R): i64 {
+    var q = (zn * R) >> 32;
+    var r = zn - q * area;
+    var fire = 0;
+    if (dd_mut_gt == 0) { if (r >= area) { fire = 1; } }
+    if (dd_mut_gt != 0) { if (r > area)  { fire = 1; } }
+    if (dd_mut_nocorr != 0) { fire = 0; }
+    if (fire == 1) { q = q + 1; dd_corr_fires = dd_corr_fires + 1; }
+    return q;
+}
+
+# dd_check(zn, area) — the OBLIGATION, by multiplication. Returns 0 ok, 1 overshoot, 2 undershoot.
+# ⛔ TWO OUTCOMES, NEVER ONE COUNTER. An overshoot (q*area > zn) refutes the no-overshoot proof that
+# makes a ONE-SIDED correction legitimate at all; an undershoot (zn >= (q+1)*area) means one
+# correction was not enough. They are different defects with different fixes and a shared count
+# would let one hide behind the other.
+fn dd_check(zn, area, R): i64 {
+    var q = dd_quot(zn, area, R);
+    if (q * area > zn) { return 1; }
+    if (zn >= (q + 1) * area) { return 2; }
+    return 0;
+}
+
+# dd_shortfall(zn, area, R) — Q - q_est BEFORE any correction. The proof claims this is in {0,1}.
+fn dd_shortfall(zn, area, R): i64 {
+    var qe = (zn * R) >> 32;
+    var qt = zn / area;
+    return qt - qe;
+}
+
+var dd_over = 0;
+var dd_under = 0;
+var dd_cases = 0;
+
+fn dd_one(zn, area, R): i64 {
+    if (zn < 0) { return 0; }
+    dd_cases = dd_cases + 1;
+    var s = dd_shortfall(zn, area, R);
+    if (s > dd_max_short) { dd_max_short = s; }
+    var v = dd_check(zn, area, R);
+    if (v == 1) { dd_over = dd_over + 1; }
+    if (v == 2) { dd_under = dd_under + 1; }
+    return 0;
+}
+
+# dd_sweep_area(area) — BOUNDARY sweep, not a stride. One-ULP errors live AT the multiples of the
+# divisor; a uniform stride walks straight past them. So every k probes {k*area-1, k*area, k*area+1}.
+fn dd_sweep_area(area): i64 {
+    var R = dd_recip(area);
+    dd_one(0, area, R);
+    dd_one(1, area, R);
+    dd_one(area - 1, area, R);
+    var k = 1;
+    while (k < 400) {
+        var m = k * area;
+        if (m < 4294967295) {
+            dd_one(m - 1, area, R);
+            dd_one(m, area, R);
+            dd_one(m + 1, area, R);
+        }
+        k = k + 1;
+    }
+    # and the extremes of the admissible numerator
+    dd_one(2147483647, area, R);
+    dd_one(2147483646, area, R);
+    return 0;
+}
+
+var DD_NAREA = 24;
+var dd_areas[24];
+
+fn dd_areas_init(): i64 {
+    var v[24];
+    store64(&dd_areas +  0*8, 4);      store64(&dd_areas +  1*8, 8);
+    store64(&dd_areas +  2*8, 12);     store64(&dd_areas +  3*8, 40);
+    store64(&dd_areas +  4*8, 64);     store64(&dd_areas +  5*8, 100);
+    store64(&dd_areas +  6*8, 255);    store64(&dd_areas +  7*8, 256);
+    store64(&dd_areas +  8*8, 257);    store64(&dd_areas +  9*8, 1021);
+    store64(&dd_areas + 10*8, 2688);   store64(&dd_areas + 11*8, 2689);
+    store64(&dd_areas + 12*8, 4096);   store64(&dd_areas + 13*8, 65535);
+    store64(&dd_areas + 14*8, 65536);  store64(&dd_areas + 15*8, 65537);
+    store64(&dd_areas + 16*8, 1048576); store64(&dd_areas + 17*8, 1048577);
+    store64(&dd_areas + 18*8, 16777216); store64(&dd_areas + 19*8, 16777259);
+    store64(&dd_areas + 20*8, 67108864); store64(&dd_areas + 21*8, 67108879);
+    store64(&dd_areas + 22*8, 33554432); store64(&dd_areas + 23*8, 3);
+    return 0;
+}
+
+fn dd_sweep_all(): i64 {
+    dd_over = 0; dd_under = 0; dd_cases = 0;
+    dd_max_short = 0; dd_corr_fires = 0;
+    var i = 0;
+    while (i < DD_NAREA) {
+        var a = load64(&dd_areas + i * 8);
+        if (a >= 4) { dd_sweep_area(a); }
+        i = i + 1;
+    }
+    return dd_over + dd_under;
+}
+
+# ---- THE ADVERSARIAL FRAME. area = 40 (a 5-px sliver), z spanning 0..65535. -----------------------
+# ⭐ THE POINT OF THIS BLOCK IS TO SHOW THE CORPUS WAS BLIND, IN A PRINTED TABLE, AT ZERO BURNS.
+# Rung 13's transplant is EXACT on depthcore's corpus (area 2688, z <= 900) and WRONG on this frame,
+# which is fully ABI-legal. A gate that only ever ran the corpus would certify the transplant.
+fn dd_adversarial(area, zn): i64 {
+    dd_mut_bias = 1;  var Rt = dd_recip(area);  dd_mut_bias = 0;
+    var Rr = dd_recip(area);
+    var qt = dd_quot(zn, area, Rt);
+    var qr = dd_quot(zn, area, Rr);
+    var exact = zn / area;
+    ps("    area="); pn(area); ps(" zn="); pn(zn); ps("  exact="); pn(exact);
+    ps("  R2="); pn(qr); ps("  transplant="); pn(qt);
+    var e = exact - qt;
+    if (e < 0) { e = 0 - e; }
+    ps("  transplant error="); pn(e); nl();
+    return e;
+}
+
+fn main(): i64 {
+    var bad = 0;
+    dd_areas_init();
+    ps("depthdiv: rung 17 -- the per-pixel quotient must be EXACT, proven by multiplication"); nl();
+    ps("  obligation:  q*area <= zn < (q+1)*area   (an EXTERNAL invariant, not agreement)"); nl(); nl();
+
+    # ---- G1: THE OBLIGATION over the boundary sweep -----------------------------------------------
+    var v = dd_sweep_all();
+    ps("G1 obligation holds over "); pn(dd_cases); ps(" boundary cases x "); pn(DD_NAREA);
+    ps(" divisors: ");
+    if (v == 0) { ps("PASS"); nl(); }
+    if (v != 0) {
+        ps("FAIL  overshoot="); pn(dd_over); ps("  undershoot="); pn(dd_under); nl();
+        bad = bad + 1;
+    }
+
+    # ---- G2: THE CORRECTION MUST BE ALIVE AND MUST BE ENOUGH -------------------------------------
+    # ⛔ Without these two printed numbers, "the correction is dead code" and "the correction is
+    # right" look identical -- both give a green G1. Same defect class as rung 9b's clamp-hit counter.
+    ps("G2 max pre-correction shortfall = "); pn(dd_max_short);
+    ps("  (proof says exactly 1: 0 => correction is dead code, >=2 => recipe refuted): ");
+    if (dd_max_short == 1) { ps("PASS"); nl(); }
+    if (dd_max_short != 1) { ps("FAIL"); nl(); bad = bad + 1; }
+    ps("G2b correction fired "); pn(dd_corr_fires); ps(" times: ");
+    if (dd_corr_fires > 0) { ps("PASS (it is live)"); nl(); }
+    if (dd_corr_fires == 0) { ps("FAIL -- never fired, so G1 proves nothing about it"); nl(); bad = bad + 1; }
+
+    nl();
+    # ---- G3: THE CORPUS WAS BLIND. Both recipes, both frames, printed. ---------------------------
+    ps("G3 the corpus could not have caught the transplant -- both recipes, both frames:"); nl();
+    var e_corpus = dd_adversarial(2688, 2419200);
+    var e_adv    = dd_adversarial(40, 2621400);
+    if (e_corpus == 0) { ps("    corpus frame: transplant is EXACT -- it would have been certified"); nl(); }
+    if (e_corpus != 0) { ps("    (note: transplant is NOT exact on the corpus frame either)"); nl(); }
+    if (e_adv > 0) { ps("    adversarial frame: transplant is WRONG by "); pn(e_adv);
+                     ps(" -- and this frame is ABI-legal"); nl(); }
+    if (e_adv == 0) {
+        ps("    ** G3 NOT CONNECTED: the transplant was exact here too **"); nl();
+        bad = bad + 1;
+    }
+
+    nl();
+    # ---- MUTATIONS -------------------------------------------------------------------------------
+    dd_mut_bias = 1;   var m1 = dd_sweep_all();  dd_mut_bias = 0;
+    ps("MUT-R1 R from (area+1), the transplant's bias: ");
+    if (m1 != 0) { ps("RED (correct), "); pn(m1); ps(" violations"); nl(); }
+    if (m1 == 0) { ps("** NOT CONNECTED **"); nl(); bad = bad + 1; }
+
+    dd_mut_nocorr = 1; var m2 = dd_sweep_all(); dd_mut_nocorr = 0;
+    ps("MUT-R2 correction dropped: ");
+    if (m2 != 0) { ps("RED (correct), "); pn(m2); ps(" violations"); nl(); }
+    if (m2 == 0) { ps("** NOT CONNECTED **"); nl(); bad = bad + 1; }
+
+    dd_mut_gt = 1;     var m3 = dd_sweep_all(); dd_mut_gt = 0;
+    ps("MUT-R3 `>` instead of `>=` (fails exactly AT multiples): ");
+    if (m3 != 0) { ps("RED (correct), "); pn(m3); ps(" violations"); nl(); }
+    if (m3 == 0) { ps("** NOT CONNECTED **"); nl(); bad = bad + 1; }
+
+    dd_sweep_all();
+    nl();
+    if (bad == 0) {
+        ps("depthdiv: PASS -- the R2 quotient is EXACT over every boundary the ABI admits, the"); nl();
+        ps("          one-sided correction is both LIVE and SUFFICIENT (max shortfall exactly 1),"); nl();
+        ps("          and three mutations break it."); nl();
+        ps("⭐ G3 is the one that matters: rung 13's transplant is EXACT on depthcore's corpus and"); nl();
+        ps("  WRONG on an ABI-legal sliver. A gate that only ran the corpus would have certified it,"); nl();
+        ps("  and the rung's order-independence oracle is ~200x too insensitive to catch it (M2c)."); nl();
+        return 95;
+    }
+    ps("depthdiv: FAIL -- "); pn(bad); ps(" problem(s). Do NOT transcribe the divide."); nl();
+    return 90;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

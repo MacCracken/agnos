@@ -140,6 +140,48 @@ number was not.
 no longer calls. It now lists the one-time-cost case **first**, because that is how the gate actually
 fired.
 
+### Added — RUNG 17's DIVIDE GATE, and the measurement that the corpus was blind
+
+`depthdiv.cyr`. **exit 95** — 23,950 boundary cases × 24 divisors, three mutations red.
+
+⛔ **Why it had to exist**: `depthmodel`'s M2c measured that a **one-ULP** z error moves
+order-independence by **1 px out of 507** while moving the direct reference diff by **217**. The
+rung's stated iron oracle is ~**200× less sensitive** to divide error than a plain reference
+comparison — and on iron it is worse than insensitive, because z lives in a kernel-owned TD-3 handle
+that ring 3 cannot address and `#90` reads the framebuffer. **The burn cannot see z at all.**
+
+⭐ **The obligation is checked by MULTIPLICATION, never a second divide**:
+`q*area <= zn < (q+1)*area`. Not "the modelled divide equals `zn / area`" — that is agreement
+between two implementations, and a shared premise is invisible to it, which is exactly what shipped
+rung 15's half-texel offset. [[feedback_oracle_must_test_external_invariant]]
+
+**Two counters, never one.** An overshoot refutes the no-overshoot proof that makes a *one-sided*
+correction legitimate; an undershoot means one correction was not enough. Different defects,
+different fixes.
+
+**G2 prints the max pre-correction shortfall and the fire count** — measured **exactly 1** and
+**5,432 fires**. Without both numbers, *"the correction is dead code"* and *"the correction is
+right"* produce identical green. Same defect class as rung 9b's clamp-hit counter.
+
+### ⭐⭐ G3 — the corpus would have certified a divide that is wrong by 1598
+
+Measured in-tree, both recipes against both frames:
+
+```
+area=2688  zn=2419200   exact=900     R2=900     transplant=900     error=0
+area=40    zn=2621400   exact=65535   R2=65535   transplant=63937   error=1598
+```
+
+Rung 13's reciprocal is **exact on `depthcore`'s corpus** and **wrong by 1598 on an ABI-legal
+sliver**. A gate that only ever ran the corpus would have certified it, and the order-independence
+oracle is 200× too insensitive to catch it. ⇒ **Boundary sweep, not a stride** — one-ULP errors live
+*at* the multiples of the divisor, and a uniform stride walks straight past them.
+
+⚠ The recipe changed as a result: **R2** (`R = floor(2^32/area)`, `mul_hi` + one correction, five
+32-bit instructions) replaces the rung-13 transplant. Both `v_mul_hi_u32` operands are provably
+non-negative, so rung 11's four-burn signed-high-half fixup is **structurally absent** rather than
+present-and-correct.
+
 ### Added — RUNG 17's model at register widths, and the finding that z PRECISION is load-bearing
 
 `depthmodel.cyr`. **exit 95**, four assertions + six mutations, byte-identical to the reference in

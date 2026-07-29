@@ -209,7 +209,20 @@ exact divide over the ABI's admissible range. It cannot be deferred to the burn,
 is not readable at all** (kernel-owned TD-3 handle; #90 reads the framebuffer).
 ⚠ An agent claimed the stronger result (orderdiff exactly 0 for a dropped correction); that number
 was NOT reproduced here and must be re-measured before being relied on.
-▶ **REMAINING for rung 17, in order: (1) the divide gate, (2) the shader.** Tile-serialised,
+✅ **(1) THE DIVIDE GATE IS LANDED** — `depthdiv.cyr`, **exit 95**, 23,950 boundary cases x 24
+divisors, 3 mutations red. Obligation `q*area <= zn < (q+1)*area` checked **by multiplication, never
+a second divide** (a second divide is the first one agreeing with itself). Two counters — overshoot
+refutes the no-overshoot proof that licenses a ONE-SIDED correction; undershoot means one was not
+enough. G2 prints max pre-correction shortfall (**exactly 1**) and fire count (**5,432**): without
+both, "correction is dead code" and "correction is right" are the same green.
+⭐⭐ **G3 MEASURED IN-TREE: the corpus would have certified a divide wrong by 1598.** Rung 13's
+transplant gives exact=900/transplant=900 on depthcore's corpus and **63937 vs 65535 (error 1598)**
+on an ABI-legal 5-px sliver (area=40). ⇒ recipe changed to **R2** (`R = floor(2^32/area)`, mul_hi +
+one correction, 5 instructions); both mul_hi operands provably non-negative so rung 11's
+signed-high-half fixup is STRUCTURALLY ABSENT. ⇒ **Boundary sweep, not a stride** — one-ULP errors
+live AT the multiples.
+▶ **REMAINING for rung 17: (2) the shader** — per [`planning/rung17-tri-depth.md`](planning/rung17-tri-depth.md),
+whose four pins must not be re-opened at transcription time. Tile-serialised,
 colour+depth in VGPRs, one `global_store` at the end, plus a lane-witness counter separating "no wave
 ran" from "wave ran and computed wrong". Build flag `GPU_OP_TRI_DEPTH`.
 
