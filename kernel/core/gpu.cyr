@@ -1478,6 +1478,85 @@ fn gpu_tper_prep_build(dst, vkva, nt, dx, dy) {
     return 1;
 }
 
+var gpu_tper_armed = 0;
+
+fn gpu_tper_arm() {
+    if (gpu_tper_armed == 1) { return 1; }
+    if (gpu_present == 0) { return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+    if (gpu_matmul_ok != 1) { return 0; }
+    tri_persp_write(gpu_arena_phys + GPU_TPER_SHADER_SUBOFF);
+    gpu_mfence();
+    gpu_tper_armed = 1;
+    return 1;
+}
+
+# gpu_tper_prep_header — the 64-byte header at the front of the prep region.
+# ⚠ w-1 and h-1 are stored as MASKS, which is why gpo_validate_triperspec requires the texture
+# dimensions to be powers of two UNCONDITIONALLY. A non-power-of-two texture would not wrap; it would
+# read the wrong texel and paint a plausible wrong picture.
+fn gpu_tper_prep_header(dst, tex_mc, tex_pitch, tw, th, bg, tiles_x) {
+    store32(dst +  0, tex_mc & 0xFFFFFFFF);
+    store32(dst +  4, (tex_mc >> 32) & 0xFFFFFFFF);
+    store32(dst +  8, tex_pitch & 0xFFFFFFFF);
+    store32(dst + 12, (tw - 1) & 0xFFFFFFFF);
+    store32(dst + 16, (th - 1) & 0xFFFFFFFF);
+    store32(dst + 20, bg & 0xFFFFFFFF);
+    store32(dst + 24, tiles_x & 0xFFFFFFFF);
+    var i = 28;
+    while (i < 64) { store32(dst + i, 0); i = i + 4; }
+    return 1;
+}
+
+# gpu_tri_persp — op 0x0F's worker. Builds prep, then ONE dispatch of one workgroup per 8x8 tile
+# through gpu_blend_cov_run UNMODIFIED.
+#
+# ⭐ THE KERNARG MAPPING IS WHY THAT PRIMITIVE NEEDS NO CHANGE, and it is also where rung 17's first
+# burn died. gpu_blend_cov_run emits exactly 8 USER_DATA dwords -- mask_mc lo/hi, dst_mc lo/hi,
+# **mask_pitch, dst_pitch**, width, color -- so `nt` passed as mask_pitch lands in s4 and the
+# framebuffer pitch in s5. tri_persp.s reads them in that order and
+# scripts/check/triper-contract.sh asserts it mechanically, because nothing on the host can see across
+# this boundary: the model has no kernargs and the assembler does not know what the caller passes.
+fn gpu_tri_persp(rec, vkva) {
+    if (gpu_tper_arm() != 1) { return 0; }
+    var tid = load32(rec +  8) & 0xFFFFFFFF;
+    var wh  = load32(rec + 16) & 0xFFFFFFFF;
+    var dxy = load32(rec + 20) & 0xFFFFFFFF;
+    var nt  = load32(rec + 24) & 0xFFFFFFFF;
+    var twh = load32(rec + 28) & 0xFFFFFFFF;
+    var w  = wh & 0xFFFF;
+    var h  = (wh >> 16) & 0xFFFF;
+    var dx = dxy & 0xFFFF;
+    var dy = (dxy >> 16) & 0xFFFF;
+    var tw = twh & 0xFFFF;
+    var th = (twh >> 16) & 0xFFFF;
+
+    # ⚠ shm_MC, not shm_kva: the GPU READS the texture, so it needs an address the GPU can reach. A
+    # PMM-backed slot has none, which the validator's shm_kva check does not cover -- so check here.
+    var tex_mc = gpu_shm_mc(tid);
+    if (tex_mc == 0) { return 0; }
+    if (gpu_bb_pitch == 0) { return 0; }
+    var tgt = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { tgt = gpu_bb_b_mc; }
+    var dst_mc = tgt + dy * gpu_bb_pitch + dx * 4;
+
+    var pbase_phys = gpu_arena_phys + GPU_TPER_PREP_SUBOFF;
+    var pbase_mc   = gpu_arena_mc   + GPU_TPER_PREP_SUBOFF;
+    var tiles_x = w >> 3;
+    var tiles_y = h >> 3;
+    gpu_tper_prep_header(pbase_phys, tex_mc, tw * 4, tw, th, GPU_TRID_BG, tiles_x);
+    if (gpu_tper_prep_build(pbase_phys + GPU_TPER_PREP_STRIDE, vkva, nt, dx, dy) != 1) { return 0; }
+    gpu_mfence();
+
+    # ⚠ ONE WORKGROUP PER TILE, grid in WORKGROUPS. One workgroup is exactly one 64-lane wave over an
+    # 8x8 tile, and that identity is load-bearing: at 16x16 the single-wave claim collapses.
+    return gpu_blend_cov_run(gpu_arena_mc + GPU_TPER_SHADER_SUBOFF, pbase_mc, dst_mc,
+    nt, gpu_bb_pitch, w, h, GPU_COMPUTE_PGM_RSRC1_TPER, tiles_x, tiles_y,
+    gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
+    gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+}
+
 var gpu_trid_armed = 0;
 
 fn gpu_trid_arm() {

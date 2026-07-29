@@ -1227,7 +1227,7 @@ var GPU_OP_SUPPORTED   = 0x1FF1F;    # bits 0..4 + 8 EDGE_COV + 9 TRI_RGBA + 10 
 # advertises ops, not flags. An OP cannot.
 # ⇒ WHEN THE WORKER LANDS (plan bite B9), bit 14 clears HERE and the GPO_E_NOTIMPL return at the end
 # of gpo_validate_tridepth goes away, in one change. Both moves or neither.
-var GPU_OP_NOTIMPL_MASK = 0x8000;    # bit 15 TRI_PERSP — ABI complete, worker not yet built
+var GPU_OP_NOTIMPL_MASK = 0x0000;    # EMPTY — every op in GPU_OP_SUPPORTED has a worker
 
 # ---- rung 17 op 0x0E sizing. ⚠ Its OWN constants, not TRI_LIST's: the record, the stride and the
 # work unit all differ, and sharing a name would couple two ABIs that are free to move apart.
@@ -3221,7 +3221,7 @@ fn edge_abi_selftest() {
     store32(&d + 16, (16 * 65536) + 16);          # 16x16 draw rect, both multiples of 8
     store32(&d + 24, 1);                          # n_tris
     store32(&d + 28, (8 * 65536) + 8);            # 8x8 texture
-    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "persp: well-formed record reaches the unbuilt worker", 52);
+    pass = pass + ea_expect(&d, 0, "persp: well-formed record is accepted", 37);
 
     store32(&d + 16, (16 * 65536) + 12);
     pass = pass + ea_expect(&d, GPO_E_ALIGN, "persp: width not a multiple of the tile", 39);
@@ -3232,6 +3232,10 @@ fn edge_abi_selftest() {
 
     store32(&d + 28, (8 * 65536) + 0);
     pass = pass + ea_expect(&d, GPO_E_TEXDIM, "persp: zero texture width", 25);
+    # ⭐ the shader masks with w-1/h-1 on every fetch, so a non-power-of-two texture reads the WRONG
+    # TEXEL rather than wrapping. This rule was missing when the validator first landed.
+    store32(&d + 28, (8 * 65536) + 6);
+    pass = pass + ea_expect(&d, GPO_E_TEXDIM, "persp: texture width not a power of two", 39);
     store32(&d + 28, (8 * 65536) + 8);
 
     store32(&d + 24, 0);
@@ -3253,7 +3257,7 @@ fn edge_abi_selftest() {
     store32(vb +  8, GPU_TPER_W_MIN - 1);
     pass = pass + ea_expect(&d, GPO_E_WRANGE, "persp: w one below the floor", 28);
     store32(vb +  8, GPU_TPER_W_MIN);
-    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "persp: w exactly at the floor is legal", 38);
+    pass = pass + ea_expect(&d, 0, "persp: w exactly at the floor is legal", 38);
     store32(vb +  8, GPU_TPER_W_MAX + 1);
     pass = pass + ea_expect(&d, GPO_E_WRANGE, "persp: w one above the ceiling", 30);
     store32(vb +  8, 1024);
@@ -3291,8 +3295,8 @@ fn edge_abi_selftest() {
         r = r + 1;
     }
 
-    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 151 cases correct\n", 22);
-    if (pass == 151) {
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 152 cases correct\n", 22);
+    if (pass == 152) {
         kprint("edge-abi: PASS -- the 0x08..0x0F and 0x10 ABIs reject every malformed record,\n", 78);
         kprint("edge-abi: record,\n", 18);
         kprint("edge-abi: and a well-formed one is accepted or correctly reports no-GPU.\n", 73);
@@ -3579,6 +3583,14 @@ fn gpo_validate_triperspec(rec, fbw, fbh) {
     if (th < 1) { return GPO_E_TEXDIM; }
     if (tw > GPU_TEX_MAX_DIM) { return GPO_E_TEXDIM; }
     if (th > GPU_TEX_MAX_DIM) { return GPO_E_TEXDIM; }
+    # ⛔⛔ POWERS OF TWO ARE MANDATORY HERE, UNCONDITIONALLY -- and this rule was MISSING when the
+    # validator first landed, because its texture checks were copied from op 0x0B where power-of-two is
+    # required only under the WRAP flag. tri_persp.s masks the interpolated coordinate with `w-1` and
+    # `h-1` on EVERY fetch, so a non-power-of-two texture does not wrap, it reads the WRONG TEXEL and
+    # silently paints a plausible wrong picture. ⚠ Found by reading the shader against the validator
+    # rather than by a burn; a reject, never a clamp, same doctrine as WRAP's.
+    if ((tw & (tw - 1)) != 0) { return GPO_E_TEXDIM; }
+    if ((th & (th - 1)) != 0) { return GPO_E_TEXDIM; }
     var tid = load32(rec + 8) & 0xFFFFFFFF;
     if (shm_slot_valid(tid) == 0) { return GPO_E_TEXSLOT; }
     var tslot = tid - 1;
@@ -3691,10 +3703,11 @@ fn gpo_validate_triperspec(rec, fbw, fbh) {
         i = i + 1;
     }
 
-    # ⛔ ABI COMPLETE, WORKER NOT. bit 15 is in GPU_OP_NOTIMPL_MASK so #89 does not advertise it, and
-    # this returns a specific documented refusal rather than a blessing followed by a generic dispatch
-    # failure. ⇒ when the shader lands, this line goes and the mask bit clears IN ONE CHANGE.
-    return GPO_E_NOTIMPL;
+    # ⭐ ACCEPTED. tri_persp.s (190 dwords, descriptor harvested) and gpu_tri_persp landed with this
+    # line, and GPU_OP_NOTIMPL_MASK cleared bit 15 in the SAME change -- the accepted surface and the
+    # proven surface move together or the mask is a lie. The worker still refuses with GPO_E_ARM where
+    # the GPU or its arena is not usable, which is an arming fact rather than an ABI one.
+    return 0;
 }
 
 fn gpo_validate(rec, fbw, fbh) {
@@ -3839,6 +3852,11 @@ fn gpo_execute(rec) {
     # ⭐ RUNG 17's READBACK. ⚠ GPO_E_ARM, not GPO_E_DISPATCH, for op 0x0D's stated reason: the
     # overwhelmingly likely refusal is rung 6's audit not having passed on this boot, which is an
     # ARMING fact (the region is not proven free) rather than a dispatch that failed.
+    if (op == GPU_OP_TRI_PERSP) {
+        var pvk = load64(&shm_kva + ((load32(rec + 12) & 0xFFFFFFFF) - 1) * 8);
+        if (gpu_tri_persp(rec, pvk) != 1) { return GPO_E_ARM; }
+        return 0;
+    }
     if (op == GPU_OP_TRI_DEPTH) {
         var tvk = load64(&shm_kva + ((load32(rec + 12) & 0xFFFFFFFF) - 1) * 8);
         if (gpu_tri_depth(rec, tvk) != 1) { return GPO_E_ARM; }

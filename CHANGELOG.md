@@ -7,6 +7,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 **Rung 18 `persp-correct` — cycle OPEN.** Bumped on cycle open; the user tags on close.
 
+### Added — RUNG 18's worker, and op `0x0F` is LIVE
+
+`gpu_tper_arm` + `gpu_tper_prep_header` + `gpu_tri_persp`. The validator now returns 0 on a well-formed
+record and `GPU_OP_NOTIMPL_MASK` cleared bit 15 **in the same change** — the accepted surface and the
+proven surface move together or the mask is a lie. Battery **152/152**, `edge-abi-smoke` 20/20,
+`check.sh` 23/23, 12 host oracles, `check-arena.sh` 61/0. The harvested `RSRC1 = 0x002C01C7` is present
+in the flashable binary.
+
+One dispatch of one workgroup per 8×8 tile through `gpu_blend_cov_run` **unmodified** — `RSRC2` harvests
+to `0x00000190`, byte-identical to the coverage kernel's, which is what keeps the primitive shared and
+why the texture base, pitch, masks, bg and `tiles_x` travel in a 64-byte header instead of becoming
+kernargs 9 and 10.
+
+### ⛔ Found by reading the shader against the validator: powers of two were not enforced
+
+`tri_persp.s` masks the interpolated coordinate with `w-1` and `h-1` on **every** fetch. But
+`gpo_validate_triperspec`'s texture checks were copied from op `0x0B`, where power-of-two is required
+only under the `WRAP` flag — so a non-power-of-two texture would have been **accepted**, and it would not
+wrap: it would read the **wrong texel** and paint a plausible wrong picture with no fault and no failing
+gate.
+
+⇒ the rule is now unconditional, with its own battery case. ⚠ Found by diffing the shader's actual
+addressing against the validator that admits it, not by a burn — which is the only place this class of
+mismatch is visible, since neither the host model nor the assembler knows what the validator accepts.
+
+⚠ Also: the worker checks `gpu_shm_mc(tid) != 0` itself. The validator verifies the texture slot has a
+`shm_kva`, but the **GPU** reads the texture, so it needs an MC address — a PMM-backed slot has a kva and
+no MC, and would pass validation and fail at dispatch.
+
 ### Added — `kernel/shaders/tri_persp.s`: rung 18's shader, 190 dwords
 
 Assembles clean on gfx90c. Registers verified from the **disassembly**, not the source: highest VGPR
