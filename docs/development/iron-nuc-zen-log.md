@@ -76,3 +76,57 @@ Of the 16 dispatch tiles in the 32×32 corpus, only **7** contain a dual-covered
 therefore distinguish depth from painter's order. **9** prove nothing about z. **2 are entirely
 empty** and are byte-identical for a shader that never ran in them. "Three tiles wrong" is a signal;
 "nine tiles identical" is not.
+
+### ✅✅ RESULT — CLOSED ON IRON 2026-07-29, exit 95, in TWO burns
+
+`gputri --cov` **20 of 20** (regression control held). `gputri --depth` **exit 95**:
+
+```
+witness -- 0 poison, 0 mislabelled, 0 stray word-1 writes
+colour buffer touched at 1024 of 1024 px
+both submission orders -- colour differs at 0 px, z differs at 0 px
+vs the CPU reference -- colour 0 px differ, z 0 px differ
+```
+
+**All five pre-registered predictions confirmed.** Depth-tested triangle rasterisation runs on gfx90c:
+one workgroup per 8×8 tile, one 64-lane wave, colour and z held in registers across the triangle
+loop, one store each at the end. Deterministic **without atomics and without a binning pass** — TD-5's
+escalation was never needed.
+
+### ⛔⛔ BURN 1 WAS RED, AND THE WAY IT WAS RED IS THE FINDING
+
+Burn 1 returned **exit 91** with a signature that passed every axis the rung was designed around:
+
+```
+witness -- 0 poison, 0 mislabelled, 0 stray word-1 writes     <- the wave ran, addressing correct
+colour buffer touched at 1024 of 1024 px                      <- it wrote everywhere
+both submission orders -- colour differs at 0 px, z differs at 0 px   <- THE ORACLE PASSED
+vs the CPU reference -- colour 1024 px differ, z 1024 px differ       <- and every pixel was wrong
+```
+
+**Cause**: `gpu_blend_cov_run` emits USER_DATA as `mask_mc lo/hi, dst_mc lo/hi, mask_pitch, dst_pitch,
+width, color`, so the worker's `n_tri` lands in **s4** and the framebuffer pitch in **s5**. The shader
+read them swapped. The triangle loop therefore ran `pitch` = **3328** times, walking off the end of
+the prep array into zeroed arena — where `area == 0` makes all three edge tests `0 <= 0`, i.e. inside
+on every lane — and painted a uniform frame, while the colour row stride became **2 bytes**.
+
+⇒ **A wave-uniform misread of a kernarg is deterministic by construction, so NO order-independence or
+determinism test can ever see one.** The rung's own oracle was green on a completely wrong frame. What
+caught it was the comparison against the CPU reference — which is only possible because the arm reads
+the render target back through op `0x10`.
+
+⭐ **This is the second time in two rungs that the oracle passed and an external comparison caught the
+defect** (rung 15's half-texel was the first). The pattern is now explicit: **agreement between the
+shader and anything co-designed with it is not evidence.** At least one gate must compare against
+something that shares no premise — an independently burned path, an analytic invariant, or a readback.
+
+⚠ **And it was invisible to everything cheaper than a burn**: it assembled cleanly under llvm-mc,
+matched its committed blob byte-for-byte, and left all 22 host gates green — because none of them can
+see across the kernarg boundary. The host model has no kernargs; the assembler does not know what the
+caller passes. ⇒ `scripts/check/tridepth-contract.sh` now asserts the contract as the two instructions
+that consume it (`s_cmp_lt_u32 s12, s4` at both loop sites, `v_mul_lo_u32 v18, v17, s5` for the row
+stride), plus the loop-carried-register span check. Mutation-tested by reverting the exact defect.
+
+⇒ **Carry-forward for rung 18 and every future kernel dispatched through a shared primitive**: the
+kernarg mapping is a CONTRACT between two files that no compiler checks. Assert it mechanically, or
+pay a burn to learn it.

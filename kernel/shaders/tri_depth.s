@@ -35,7 +35,7 @@
 // condition and s_cbranch_vccnz only when ANY does — either way one lane decides all 64. A wave
 // branch around the update would DILATE each triangle to its whole 8x8 tile, worst exactly at the
 // interpenetration line, which fails the both-orders oracle and reads as "the serialisation is not
-// serialising". The only branches here are on s5 (a kernarg) and s12 (an SALU counter), both
+// serialising". The only branches here are on s4 (a kernarg) and s12 (an SALU counter), both
 // wave-uniform by construction.
 //
 // ============================================================================================
@@ -74,7 +74,17 @@
 //  kernel UNMODIFIED, which is why the z and witness bases travel in the record header instead of
 //  becoming kernargs 9 and 10)
 //   s[0:1] prep record base MC, WALKED per iteration    s[2:3] colour base MC, PRE-OFFSET to dstxy
-//   s4  colour pitch bytes    s5  n_tri    s6  w    s7  h        s8 tgid_x    s9 tgid_y
+//   s4  n_tri                  s5  colour pitch bytes   s6  w    s7  h   s8 tgid_x  s9 tgid_y
+//   ⛔⛔ s4 IS THE COUNT AND s5 IS THE PITCH, IN THAT ORDER, AND THE FIRST BURN GOT IT BACKWARDS.
+//   gpu_blend_cov_run emits USER_DATA as mask_mc lo/hi, dst_mc lo/hi, **mask_pitch, dst_pitch**,
+//   width, color — so the worker's `n_tri` argument lands in s4 and the framebuffer pitch in s5.
+//   Reading them the other way round ran the triangle loop `pitch` times (3328) off the end of the
+//   prep array into zeroed arena, where area == 0 makes all three edge tests `0 <= 0` — INSIDE on
+//   every lane — and painted colour 0; the colour row stride became 2 bytes.
+//   ⚠ THE SIGNATURE WAS DIAGNOSTIC AND IS WORTH KEEPING: every lane witness correct, all 1024 px
+//   written, BOTH ORDERS BYTE-IDENTICAL, and all 1024 wrong against the reference. Deterministic and
+//   order-independent is exactly what a wave-uniform misread of a kernarg looks like — which is why
+//   the reference comparison, not the oracle, is what caught it.
 //
 //  HEADER, loaded once in the prologue by two s_load_dwordx4 from s[0:1] + 0
 //   s16:s17 z base MC, PRE-OFFSET to dstxy   s18:s19 witness base MC (0 = disabled)
@@ -144,7 +154,7 @@ tri_depth:
     v_mov_b32      v4, s22                  // cbest = bg
 
     s_mov_b32      s12, 0
-    s_cmp_lt_u32   s12, s5
+    s_cmp_lt_u32   s12, s4
     s_cbranch_scc0 L_STORE                  // PRE-TEST: an empty list is the common case at 8x8
 
 L_TRI:
@@ -237,12 +247,12 @@ L_TRI:
     s_add_u32      s0,  s0, 64
     s_addc_u32     s1,  s1, 0
     s_add_u32      s12, s12, 1
-    s_cmp_lt_u32   s12, s5
+    s_cmp_lt_u32   s12, s4
     s_cbranch_scc1 L_TRI
 
 L_STORE:
     // ---- colour: addr = base + ly*pitch + lx*4 --------------------------------------------
-    v_mul_lo_u32   v18, v17, s4
+    v_mul_lo_u32   v18, v17, s5
     v_lshlrev_b32  v19, 2, v16
     v_add_u32      v18, v18, v19
     v_add_co_u32   v18, vcc, s2, v18         // writes vcc, does not read it: one const-bus operand

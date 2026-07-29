@@ -122,6 +122,15 @@ sh "$ROOT/scripts/check/rt-region-derive.sh" >/tmp/rt-region.log 2>&1 && rc=0 ||
 check "rung 6's host proof mirrors the kernel's region constants" $rc
 [ $rc -eq 0 ] || cat /tmp/rt-region.log
 
+# ⛔ THE KERNARG CONTRACT, WHICH COST A BURN. gpu_blend_cov_run puts n_tri in s4 and the framebuffer
+# pitch in s5; tri_depth.s read them swapped. It assembled clean, matched its committed blob byte for
+# byte, and every host oracle stayed green — none of them can see across the kernarg boundary. Worse,
+# the resulting frame was DETERMINISTIC and ORDER-INDEPENDENT, so the rung's own oracle passed too.
+# Also gates the loop-carried registers against rung 13's v19 clobber. Both checks mutation-tested.
+sh "$ROOT/scripts/check/tridepth-contract.sh" >/tmp/tridepth-contract.log 2>&1 && rc=0 || rc=$?
+check "tri_depth.s kernarg contract + loop-carried registers" $rc
+[ $rc -eq 0 ] || cat /tmp/tridepth-contract.log
+
 # The host oracle for the op 0x0C grid mapping. ⚠ Until now NOTHING ran tests/gpu/*.cyr — they were
 # scanned and cited but never executed, so a red oracle stayed invisible until someone remembered it.
 sh "$ROOT/scripts/check/host-gpu-oracles.sh" >/tmp/host-gpu.log 2>&1 && rc=0 || rc=$?

@@ -140,6 +140,49 @@ number was not.
 no longer calls. It now lists the one-time-cost case **first**, because that is how the gate actually
 fired.
 
+### ✅✅ Iron-validated 2026-07-29 — THE DEPTH TEST RUNS ON gfx90c, exit 95
+
+`kernel/shaders/tri_depth.s` (116 dwords) + `gpu_tri_depth` + op `0x0E` + the `0x10` readback +
+`gputri --depth`. On archaemenid: `--cov` **20 of 20** (regression control held), `--depth` **exit 95**:
+
+```
+witness -- 0 poison, 0 mislabelled, 0 stray word-1 writes
+colour buffer touched at 1024 of 1024 px
+both submission orders -- colour differs at 0 px, z differs at 0 px
+vs the CPU reference -- colour 0 px differ, z 0 px differ
+```
+
+All five pre-registered predictions confirmed. One workgroup per 8×8 tile, one 64-lane wave, colour
+and depth held in registers across the triangle loop, one store each at the end — **deterministic
+without atomics and without a binning pass**, so TD-5's escalation was never needed.
+
+### ⛔⛔ Burn 1 was red, and HOW it was red is the finding
+
+Exit 91, with a signature that passed every axis the rung was designed around: **all 1024 lane
+witnesses correct, all 1024 pixels written, and both submission orders BYTE-IDENTICAL** — the rung's
+own oracle, green — while all 1024 pixels disagreed with the reference.
+
+**Cause**: `gpu_blend_cov_run` emits USER_DATA as `mask_mc lo/hi, dst_mc lo/hi, mask_pitch, dst_pitch,
+width, color`, so the worker's `n_tri` lands in **s4** and the framebuffer pitch in **s5**. The shader
+read them swapped, so the triangle loop ran `pitch` = **3328** times off the end of the prep array into
+zeroed arena — where `area == 0` makes all three edge tests `0 <= 0`, inside on every lane — painting a
+uniform frame with a **2-byte** colour row stride.
+
+⇒ **A wave-uniform misread of a kernarg is deterministic by construction, so no order-independence or
+determinism test can ever detect one.** Only the comparison against the CPU reference caught it, and
+only because the arm reads the render target back through op `0x10` — the op that was argued for on
+exactly these grounds before either burn.
+
+⭐ **Second time in two rungs that the oracle passed and an external comparison caught the defect**
+(rung 15's half-texel was the first). Stated plainly: **agreement between a shader and anything
+co-designed with it is not evidence.**
+
+⚠ It was invisible to everything cheaper than a burn — assembled clean under llvm-mc, matched its
+committed blob byte-for-byte, all 22 host gates green — because nothing on the host can see across the
+kernarg boundary. ⇒ **`scripts/check/tridepth-contract.sh`** now asserts the contract as the two
+instructions that consume it, plus the loop-carried-register span check, mutation-tested by reverting
+the exact defect. `check.sh` 21 → **22**.
+
 ### Added — RUNG 17 B7: `gpu_trid_prep_build`, and a selftest that shares no code with it
 
 The whole per-triangle CPU half — affine hoist, winding normalisation, `dstxy` fold, `R = 2^32/area`,

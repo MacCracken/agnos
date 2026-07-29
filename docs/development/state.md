@@ -344,7 +344,31 @@ x≈4000 prepped against a draw origin of 8, so the fold had nothing to cancel �
 fired, which is the correct diagnosis. Such a record is **ABI-illegal** (the corner bound refuses it);
 geometry must live near its own draw rect, which is why D6 moves the WINDOW with the geometry.
 Re-prepped at dx=4000, `KC` returns to **1,152,000** — depthmodel's A8 number, independently.
-▶ **REMAINING for rung 17 — THREE bites, not "the shader"** (⚠ this line previously said *"REMAINING:
+✅✅ **RUNG 17 IS CLOSED AND IRON-VALIDATED (2026-07-29, `depth4.txt`, exit 95) — THE DEPTH TEST RUNS
+ON gfx90c.** `tri_depth.s` 116 dwords · `RSRC1 = 0x002C0187` / `RSRC2 = 0x00000190` both harvested ·
+one workgroup per 8x8 tile, one 64-lane wave, colour+z in registers across the triangle loop, one
+store each at the end. `--cov` **20/20** (regression control held), `--depth` **exit 95**: witness
+`0 poison / 0 mislabelled`, 1024/1024 px written, **both orders differ at 0 px in colour AND z**, and
+**0 px differ from the CPU reference in colour AND z**. All five pre-registered predictions confirmed.
+⭐ **Deterministic with NO atomics and NO binning pass** — TD-5's escalation was never needed.
+⛔⛔ **BURN 1 WAS RED AND HOW IT WAS RED IS THE FINDING.** Exit 91 with a signature that passed every
+axis the rung was designed around: **all 1024 witnesses correct, all 1024 px written, both orders
+BYTE-IDENTICAL** — the oracle green — and all 1024 px wrong vs the reference. Cause: the dispatch
+primitive emits `mask_pitch` into **s4** and `dst_pitch` into **s5**, and the shader read them
+swapped, so the triangle loop ran `pitch` = **3328** times off the end of prep into zeroed arena where
+`area == 0` makes all three edge tests `0 <= 0` (inside on every lane), with a **2-byte** row stride.
+⇒ **A wave-uniform misread of a kernarg is deterministic by construction, so no order/determinism test
+can EVER see one.** Only the reference comparison caught it — possible only because the arm reads the
+render target back through op `0x10`, the op argued for on exactly these grounds before either burn.
+⭐ **Second time in two rungs the oracle passed and an external comparison caught the defect** (rung
+15's half-texel was the first): **agreement with anything co-designed is not evidence.**
+⚠ Invisible to everything cheaper than a burn — clean under llvm-mc, blob byte-identical, 22 host
+gates green — because nothing on the host sees across the kernarg boundary. ⇒
+`scripts/check/tridepth-contract.sh` asserts the contract as the two instructions that consume it plus
+the loop-carried-register span; mutation-tested by reverting the exact defect. `check.sh` 21 → **22**.
+▶ **NEXT: 1.56.31 rung 18 `persp-correct`** — interpolate `1/w`, divide per pixel, interpolate `u/w`,
+`v/w`. ⚠ Carry the rung-17 lesson in: the kernarg mapping is a contract between two files that no
+compiler checks, so assert it mechanically or pay a burn. (⚠ this line previously said *"REMAINING:
 (2) the shader"*, which collapsed B3–B9 into one and would have put a 584-dword blob ahead of the
 program it is supposed to reproduce). Per [`planning/rung17-tri-depth.md`](planning/rung17-tri-depth.md)
 §7: **B8** `tri_depth.s` · **B9** worker · **B10** the burn. The four pins must

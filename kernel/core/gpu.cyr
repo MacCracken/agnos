@@ -5938,7 +5938,7 @@ fn tri_depth_write(dst_phys) {
     store32(dst_phys + 68, 0x7e060215);
     store32(dst_phys + 72, 0x7e080216);
     store32(dst_phys + 76, 0xbe8c0080);
-    store32(dst_phys + 80, 0xbf0a050c);
+    store32(dst_phys + 80, 0xbf0a040c);
     store32(dst_phys + 84, 0xbf84003a);
     store32(dst_phys + 88, 0xc00a0800);
     store32(dst_phys + 92, 0x00000000);
@@ -5996,10 +5996,10 @@ fn tri_depth_write(dst_phys) {
     store32(dst_phys + 300, 0x8000c000);
     store32(dst_phys + 304, 0x82018001);
     store32(dst_phys + 308, 0x800c810c);
-    store32(dst_phys + 312, 0xbf0a050c);
+    store32(dst_phys + 312, 0xbf0a040c);
     store32(dst_phys + 316, 0xbf85ffc6);
     store32(dst_phys + 320, 0xd2850012);
-    store32(dst_phys + 324, 0x00000911);
+    store32(dst_phys + 324, 0x00000b11);
     store32(dst_phys + 328, 0x24262082);
     store32(dst_phys + 332, 0x68242712);
     store32(dst_phys + 336, 0x32242402);
