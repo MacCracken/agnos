@@ -91,6 +91,12 @@ chk "edge-abi: PASS -- the 0x08..0x0F and 0x10 ABIs reject every malformed recor
 # THE 9a ORACLE. The single WELL-FORMED record must reach residency and be told NOT YET. If this case
 # were absent the battery would still print 16/16 while proving only that malformed records are
 # rejected - which a function that rejected EVERYTHING would also satisfy.
+chk "tper-prep: 128 of 128 prep checks correct" \
+    "rung 18 prep reproduces the DIRECT edge functions at every sample of every triangle" \
+    "persp hoist/winding/dstxy-fold/64-bit-N-planes wrong - each FAIL names its triangle, sample, reason"
+chk "tper-prep: PASS -- the hoisted D and both 64-bit N planes reproduce the DIRECT edge" \
+    "the rung-18 prep selftest's own verdict line is PASS" \
+    "verdict line absent or FAIL"
 chk "trid-prep: 256 of 256 prep checks correct" \
     "rung 17 prep reproduces the DIRECT edge functions at every sample of every triangle" \
     "prep hoist/winding/dstxy-fold/R2 wrong - each FAIL line names its triangle, sample and reason"

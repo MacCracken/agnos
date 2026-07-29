@@ -1254,21 +1254,37 @@ var GPU_TRID_LANE_MAX   = 2147483647;  # 2^31-1
 # which is the opposite of rung 17, where four plan specifications were falsified during implementation.
 var GPU_TPER_VTX_BYTES  = 64;        # per-triangle: 3 x (x, y, w, u, v) + 1 reserved dword
 var GPU_TPER_LIST_MAX   = 256;       # per-record triangle cap; a reject, never a clamp
-var GPU_TPER_K          = 16;        # W_i = 2^K / w_i
+# GPU_TPER_K lives in gpu_regs.cyr -- ONE definition. It was duplicated here and as
+# GPU_TPER_K_SHIFT in gpu.cyr, which is ATOM_DRY: two constants that must agree and nothing diffing them.
 # ⛔⛔ THE w FLOOR IS THE LOAD-BEARING ONE, AND IT IS NOT A STYLE CHOICE. `W_i = 2^K / w_i`, so a SMALL
 # w gives a LARGE W and inflates every downstream width. Measured: `perspcore` originally used w = 1
 # and put the denominator past a 32-bit lane on ALL 4096 pixels of its full-screen frame, contradicting
 # `perspbits`' 24-29 bits on identical geometry — the two probes disagreed on nothing but the w scale.
 # ⇒ w is a FIXED-POINT MAGNITUDE, floored here, and a record below the floor is refused.
 var GPU_TPER_W_MIN      = 256;
-var GPU_TPER_W_MAX      = 268435456;   # 2^28, the same ceiling as the coordinate bound
+# ⛔⛔ THE CEILING IS 4096, AND THE FIRST VERSION OF THIS CONSTANT WAS A DIVIDE-BY-ZERO HOLE. It was set
+# to 2^28 by copying the COORDINATE bound, which has nothing to do with w. But `W_i = 2^16 / w_i` is an
+# INTEGER divide, so **W_i is 0 for every w >= 65537** — and this validator accepted those records, which
+# makes D = SUM e_i * W_i identically zero and divides by zero in prep AND in the shader.
+# ⚠ 65536 would close the crash and still be wrong: at w = 65536 the reciprocal is W = 1, i.e. ZERO bits
+# of precision, and the interpolation would be garbage while every gate stayed green.
+# ⇒ 4096 is the top of the band the host probes actually validated (perspbits swept K over w ~ 256..4096;
+# perspcore/perspmodel run there), giving W >= 16. **Widening it requires raising K and re-running the
+# perspbits sweep** — K is bounded above too, at 24, past which the numerator overflows i64.
+var GPU_TPER_W_MAX      = 4096;
 # ⛔ THE DENOMINATOR BOUND, and it exists because a design claim was FALSIFIED on the host. "D fits a
 # 32-bit lane" held on every early figure and is FALSE at the ABI's extremes: with w at its floor and
 # the coordinate ceiling at 4096x2048, `perspmodel` measured D = **8,583,644,160 = 2^33**, twice an
 # UNSIGNED lane. ⭐ D is affine in (x,y), so the DRAW RECT'S FOUR CORNERS bound it — rung 17's corner
 # bound is the precedent and depthgate's D8 proved that shortcut sound against brute force. Rejecting
 # here is what makes "D fits one lane" true BY CONSTRUCTION rather than by luck.
-var GPU_TPER_D_MAX      = 4294967295;  # 2^32-1, one unsigned lane
+# ⛔ 2^31-1, NOT 2^32-1, AND THE FIRST VALUE CONTRADICTED THE REFERENCE'S OWN COMMENT. perspcore and
+# perspmodel argue the restoring divide's remainder fits one lane because `rem < D` always — but with
+# D allowed up to 2^32-1, `(rem << 1) | bit` needs **33 bits** and the claim is false. Bounding D at
+# 2^31-1 makes `rem << 1 | bit` strictly under 2^32, which is what the gates already assert.
+# ⚠ Lowering it does NOT retire the C_D residue: bounding D AT A CORNER does not bound C_D, because
+# A_D*qx can cancel it. The residue is still load-bearing and prep's header still explains why.
+var GPU_TPER_D_MAX      = 2147483647;  # 2^31-1
 # The numerator is a REGISTER PAIR by design (measured 46-57 bits), so it needs no lane bound — but
 # prep evaluates it in i64, so it needs a bound that keeps the KERNEL's own arithmetic defined. Same
 # trap GPU_EDGE_COORD_MAX's comment names: past ~2^63 the oracle itself has no defined value.
@@ -3635,9 +3651,9 @@ fn gpo_validate_triperspec(rec, fbw, fbh) {
         if (a2 < GPU_TRI_AREA_MIN) { return GPO_E_AREA; }
         if (a2 > GPU_TRI_AREA_MAX) { return GPO_E_AREA; }
 
-        var W0 = (1 << GPU_TPER_K) / w0;
-        var W1 = (1 << GPU_TPER_K) / w1;
-        var W2 = (1 << GPU_TPER_K) / w2;
+        var W0 = (1 << GPU_TPER_K_SHIFT) / w0;
+        var W1 = (1 << GPU_TPER_K_SHIFT) / w1;
+        var W2 = (1 << GPU_TPER_K_SHIFT) / w2;
         var u0 = load32(b + 12) & 0xFFFFFFFF;
         var u1 = load32(b + 32) & 0xFFFFFFFF;
         var u2 = load32(b + 52) & 0xFFFFFFFF;

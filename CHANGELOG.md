@@ -7,6 +7,95 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 **Rung 18 `persp-correct` — cycle OPEN.** Bumped on cycle open; the user tags on close.
 
+### ⛔⛔ Fixed — SIX defects in the rung-18 ABI and prep, one of them a divide by zero
+
+An adversarial review of the prep design (three parallel attackers over the shipped tree) returned nine
+findings. Every one was verified against the code before being acted on; **five held, one overreached,
+and chasing that one surfaced a sixth defect the review had not found.** All six were mine, in code
+landed one and two bites earlier.
+
+1. **`GPU_TPER_W_MAX` was a divide-by-zero hole.** Set to 2^28 by copying the *coordinate* bound, which
+   has nothing to do with `w`. But `W = 2^16/w` is an integer divide, so **`W = 0` for every
+   `w ≥ 65537`** — and the validator accepted those records, making `D = Σ eᵢWᵢ` identically zero and
+   dividing by zero in prep *and* in the shader. ⚠ 65536 would close the crash and still be wrong: at
+   `w = 65536`, `W = 1`, i.e. **zero bits of reciprocal precision**, garbage interpolation with every
+   gate green. ⇒ **4096**, the top of the band the host probes actually validated. Widening it requires
+   raising `K` and re-running the sweep — and `K` is bounded above at 24 by measurement.
+2. **`GPU_TPER_D_MAX` contradicted the reference's own comment.** `perspcore`/`perspmodel` argue the
+   restoring divide's remainder fits one lane because `rem < D` — but I shipped `D_MAX = 2^32-1`, under
+   which `(rem<<1)|bit` needs **33 bits** and the claim is false. ⇒ **2^31-1.**
+3. **`perspmodel`'s A5 could not fail.** It masked the remainder to 32 bits and *then* recorded the peak,
+   so `pm_max_rem ≤ 4294967295` was **vacuously true** — a gate that cannot fail, in a file whose own
+   header is about gates that cannot fail, written the same day. Now sampled pre-mask.
+4. **`K` was defined twice** — `GPU_TPER_K` in `syscall.cyr` and `GPU_TPER_K_SHIFT` in `gpu.cyr`, two
+   constants that must agree with nothing diffing them. One definition now, in `gpu_regs.cyr`.
+5. **The derived magnitudes were 2× low** because they forgot coordinates may be **negative**:
+   `gpo_coord_bad` admits ±2^28, so doubled coordinates span [-8192, +8192] and a *difference* reaches
+   16384. Correctly `|Aᵢ| ≤ 2^14`, `|Cᵢ| ≤ 2^27`.
+
+### ⭐ And the sixth, which corrects me rather than the reviewer
+
+I dismissed "lowering D_MAX retires the residue" as an overreach, on the grounds that bounding `D` at a
+corner cannot bound `C_D` because `A_D·qx` can cancel it. **That is true of the unfolded value and false
+of the stored one.** Folding gives `C_D' = C_D + 2·dx·A_D + 2·dy·B_D`, which *is* `D` evaluated at the
+draw rect's own origin. Measured on a legal triangle: unfolded `|C_D| = 7,229,460,480`, **folded
+600,285,184**, against a max corner `|D|` of **625,848,064** — the same quantity one half-step apart.
+
+⇒ the four-corner bound bounds `C_D` to within `|A_D|+|B_D|`, so a 32-bit field is safe **by
+construction** and no residue argument is needed. The mask stays as belt-and-braces, but calling it
+load-bearing was wrong in a way that mattered: it justified a *rule against* bounding `C_D`, when the
+bound is precisely what makes the field safe. The reviewer was right; neither of us had the reason.
+
+⚠ **Q4 was asserting a property of an illegal record.** Its witness triangle had `D = 8,506,179,584` —
+refused under the corrected bound — and all three `w` at the floor, which makes `W` uniform and `D`
+*constant*, i.e. no perspective at all. Replaced with a derived witness (`w` = 256/512/4096, folded
+`|C_D|` tracking a corner `D`) and re-aimed to assert what is actually true: that the folded constant
+term **fits**, and fits because it tracks `D`.
+
+**Re-verified after all six**: prep selftest 128/128, `edge-abi-smoke` 20/20, `check.sh` 22/22, 12 host
+oracles, `check-arena.sh` 61/0.
+
+### Added — RUNG 18 prep: the perspective planes, and a selftest that shares no code with them
+
+`gpu_tper_prep_build` + `gpu_tper_prep_selftest` — **128 of 128** checks, `edge-abi-smoke` 20/20,
+`check-arena.sh` 61 slots / 0 overlaps, `check.sh` 22/22.
+
+A 96-byte record laid out for six `s_load_dwordx4`: two edge planes, `area`, the affine `D` plane, and
+both 64-bit `N` planes as lo/hi pairs. Arena slots derived by walking the sorted extents (the largest
+actually-free run is `[0x1F1000,0x200000)`, 60 KB) rather than read off the list — this file records two
+earlier "obvious gap" placements that collided.
+
+⭐ **Only two edge planes are stored**; `e2` is derived as `area - e0 - e1`. Safe here for a reason worth
+stating: `e0/e1/e2` feed **only the inside test**, so just their signs matter — `D` and `N` are evaluated
+from their own affine planes, so a derived `e2` never enters arithmetic whose exact value is read.
+
+⭐ **And the fold leaves `area` unchanged**, which is what keeps that identity valid draw-local:
+`Σ Cᵢ' = area + fx·ΣAᵢ + fy·ΣBᵢ` and both sums are identically zero. The same argument extends to the
+`D` plane — `Σ Cᵢ'·Wᵢ = C_D + fx·A_D + fy·B_D` — so folding the derived planes directly is consistent
+with folding the edge planes and re-deriving.
+
+### ⛔ `C_D` does not fit a 32-bit field, and it is stored as a residue on purpose
+
+Derived at the ABI's limits: `|Aᵢ| ≤ 2^13` in doubled coordinates and `Wᵢ ≤ 2^8` at the `w` floor, so
+`A_D ≤ 2^22.6` fits comfortably — but `|Cᵢ| ≤ 2^26`, so **`C_D` reaches 2^35.6.** Storing the mod-2^32
+residue is exact because mod-2^32 is a ring homomorphism *and* the validator's four-corner rule
+guarantees the **result** `D` fits a lane. ⚠ Do not later "fix" this by validating `|C_D| < 2^31` — that
+would refuse legal triangles. Same trap and same resolution as rung 17's `KC`.
+
+⛔ The `N` coefficients are 64-bit **pairs**, not residues: `C_Nu` reaches ~2^62, and unlike `D` the
+result is itself 64-bit, so there is no narrower lane for a residue to collapse into.
+
+⭐ **The selftest checks four properties a wrong hoist cannot produce**, not a second copy of the
+derivation: the affine `D` plane reproduces `Σ eᵢ·Wᵢ` with `eᵢ` from **direct cross products at the
+screen sample point** (testing hoist, winding and fold at once against a route sharing no algebra); the
+same for both reassembled 64-bit `N` planes; the derived-`e2` identity from the direct form; and — Q4 —
+that `C_D` **genuinely exceeds a 32-bit field on at least one triangle**, so the residue argument is
+exercised rather than merely stated. Without Q4 the residue could be a no-op on this data and the check
+would be a null-set probe, which is the defect rung 17 paid a burn to find.
+
+⚠ The `D` comparison is deliberately mod 2^32. Comparing the stored residue against the true value would
+refuse a legal record — the exact "fix" the prep header warns against.
+
 ### Added — RUNG 18 ABI: op `0x0F GPU_OP_TRI_PERSP`, with every bound traceable to a measurement
 
 `gpo_validate_triperspec`, field mask `0x00FF`, `GPU_OP_SUPPORTED` → `0x1FF1F`, and **15 new battery

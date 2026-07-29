@@ -1217,6 +1217,9 @@ edge_abi_selftest();
 # the R2 reciprocal are all provable in QEMU at zero flashes. Deriving `dst` from gpu_arena_phys
 # instead would have made every one of them iron-only.
 gpu_trid_prep_selftest();
+# ⭐ RUNG 18's prep, same reasoning: it writes to a plain buffer rather than the arena, so the hoist,
+# the winding, the dstxy fold and the 64-bit N planes are all provable in QEMU at zero flashes.
+gpu_tper_prep_selftest();
 #endif
 
 #ifdef ATOM_INSTR_SELFTEST

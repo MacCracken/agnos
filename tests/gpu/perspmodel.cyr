@@ -86,9 +86,14 @@ fn pm_div(Nhi, Nlo, D, nbits): i64 {
         var bit = 0;
         if (i >= 32) { bit = (Nhi >>> (i - 32)) & 1; }
         if (i < 32)  { bit = (Nlo >>> i) & 1; }
-        rem = ((rem << 1) | bit) & PM_M32;
+        # ⛔⛔ SAMPLE THE PRE-MASK VALUE. The first version masked to PM_M32 and THEN recorded the
+        # peak, which made A5 -- "the remainder fits a 32-bit lane" -- **VACUOUSLY TRUE**: a masked
+        # value cannot exceed the mask, so the gate could not fail. That is precisely the class of
+        # defect this file's own header is about, written the same day.
+        var rem_pre = (rem << 1) | bit;
+        if (rem_pre > pm_max_rem) { pm_max_rem = rem_pre; }
+        rem = rem_pre & PM_M32;
         if (pm_mut_rem31 != 0) { rem = rem & 2147483647; }
-        if (rem > pm_max_rem) { pm_max_rem = rem; }
         q = (q << 1) & PM_M32;
         if (rem >= D) { rem = rem - D; q = q | 1; }
         i = i - 1;
@@ -255,10 +260,15 @@ fn main(): i64 {
     if (pm_lane_bad != 0) { ps("FAIL, "); pn(pm_lane_bad); ps(" lanes"); nl(); bad = bad + 1; }
 
     # ⭐ the claim perspcore makes, CHECKED here: the divide's remainder never needs more than 32 bits.
+    # ⚠ pm_max_rem is now the PRE-MASK value, so this can actually fail. It is also what forced
+    # GPU_TPER_D_MAX down to 2^31-1: rem < D always, so a D of 2^32-1 would need 33 bits here.
     ps("A5 divide remainder peaks at "); pn(pm_max_rem);
-    ps(" -- a 32-bit lane holds 4294967295: ");
+    ps(" BEFORE masking -- a 32-bit lane holds 4294967295: ");
     if (pm_max_rem <= 4294967295) { ps("PASS -- the loop is 32-bit throughout"); nl(); }
-    if (pm_max_rem > 4294967295) { ps("FAIL"); nl(); bad = bad + 1; }
+    if (pm_max_rem > 4294967295) {
+        ps("FAIL -- the remainder needs 33 bits, so D is not bounded tightly enough"); nl();
+        bad = bad + 1;
+    }
 
     # ⛔ and the carry must actually PROPAGATE on this corpus, or M1 below is untestable.
     ps("A6 the 64-bit carry actually fires ("); pn(pm_carry_fires);

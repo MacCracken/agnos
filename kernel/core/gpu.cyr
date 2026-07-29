@@ -1029,6 +1029,160 @@ fn gpu_trid_prep_build(dst, vkva, nt, dx, dy) {
 
 #ifdef EDGE_ABI_SELFTEST
 # ============================================================================================
+# gpu_tper_prep_selftest — rung 18 prep, checked against DIRECT evaluation.
+# ============================================================================================
+# ⛔ IT DOES NOT RE-RUN THE HOIST AND COMPARE. Two copies of one derivation agreeing is the
+# shared-premise blindness that shipped rung 15's half-texel past four green gates and let rung 17's
+# order-independence oracle pass a completely wrong frame. What is checked are properties a wrong hoist
+# cannot produce:
+#   Q1  the record's affine D plane reproduces `SUM e_i * W_i` with e_i from DIRECT cross products at
+#       the SCREEN sample point -- testing the hoist, the winding AND the dstxy fold at once, against a
+#       route that shares no algebra with prep.
+#   Q2  the same for both 64-bit N planes, reassembled from their lo/hi halves.
+#   Q3  `area - e0 - e1 == e2` from the direct form -- the identity the derived e2 rests on.
+#   Q4  the FOLDED constant term C_D fits a signed 32-bit field, AND it tracks the corner value of D --
+#       which is the mechanism that makes it fit. ⚠ An earlier version asserted the opposite (that C_D
+#       must EXCEED a 32-bit field, to exercise a residue) on a triangle whose D was 8.5e9 -- a record
+#       the validator now REFUSES. Asserting a property of an illegal record proves nothing about any
+#       legal one.
+var tper_vtx_buf[24];      # 2 triangles x 64 B
+var tper_prep_buf[24];     # 2 records x 96 B
+
+fn tper_vtx(t, x0,y0,w0,u0,v0, x1,y1,w1,u1,v1, x2,y2,w2,u2,v2) {
+    var b = &tper_vtx_buf + t * GPU_TPER_VTX_BYTES;
+    store32(b +  0, (x0 * 65536) & 0xFFFFFFFF); store32(b +  4, (y0 * 65536) & 0xFFFFFFFF);
+    store32(b +  8, w0); store32(b + 12, u0); store32(b + 16, v0);
+    store32(b + 20, (x1 * 65536) & 0xFFFFFFFF); store32(b + 24, (y1 * 65536) & 0xFFFFFFFF);
+    store32(b + 28, w1); store32(b + 32, u1); store32(b + 36, v1);
+    store32(b + 40, (x2 * 65536) & 0xFFFFFFFF); store32(b + 44, (y2 * 65536) & 0xFFFFFFFF);
+    store32(b + 48, w2); store32(b + 52, u2); store32(b + 56, v2);
+    store32(b + 60, 0);
+    return 0;
+}
+
+fn tper_edge(ax, ay, bx, by, qx, qy) { return (bx - ax) * (qy - ay) - (by - ay) * (qx - ax); }
+
+fn tper_i32(v) {
+    var m = v & 0xFFFFFFFF;
+    if (m >= 2147483648) { m = m - 4294967296; }
+    return m;
+}
+
+fn tper_pair(rec, off) {
+    var lo = load32(rec + off) & 0xFFFFFFFF;
+    var hi = load32(rec + off + 4) & 0xFFFFFFFF;
+    var v = (hi << 32) | lo;
+    if (hi >= 2147483648) { v = v - (1 << 63) - (1 << 63); }
+    return v;
+}
+
+fn gpu_tper_prep_check(t, dx, dy, lx, ly) {
+    var b   = &tper_vtx_buf  + t * GPU_TPER_VTX_BYTES;
+    var rec = &tper_prep_buf + t * GPU_TPER_PREP_STRIDE;
+    var lxq = 2 * lx + 1;
+    var lyq = 2 * ly + 1;
+    var qx = 2 * (dx + lx) + 1;      # the SCREEN sample point -- the fold must reconcile the two
+    var qy = 2 * (dy + ly) + 1;
+    var dax = 2 * (gpo_i32(b +  0) >>> 16);  var day = 2 * (gpo_i32(b +  4) >>> 16);
+    var dbx = 2 * (gpo_i32(b + 20) >>> 16);  var dby = 2 * (gpo_i32(b + 24) >>> 16);
+    var dcx = 2 * (gpo_i32(b + 40) >>> 16);  var dcy = 2 * (gpo_i32(b + 44) >>> 16);
+    var e0 = tper_edge(dbx, dby, dcx, dcy, qx, qy);
+    var e1 = tper_edge(dcx, dcy, dax, day, qx, qy);
+    var e2 = tper_edge(dax, day, dbx, dby, qx, qy);
+    var ar = e0 + e1 + e2;
+    if (ar < 0) { e0 = 0-e0; e1 = 0-e1; e2 = 0-e2; ar = 0-ar; }
+    var one = 1 << GPU_TPER_K_SHIFT;
+    var W0 = one / (load32(b +  8) & 0xFFFFFFFF);
+    var W1 = one / (load32(b + 28) & 0xFFFFFFFF);
+    var W2 = one / (load32(b + 48) & 0xFFFFFFFF);
+
+    # Q3 -- the derived-e2 identity, from the DIRECT form
+    if (tper_i32(load32(rec + 24)) != ar) { return 3; }
+    if (ar - e0 - e1 != e2) { return 4; }
+
+    # Q1 -- the D plane. ⚠ compared mod 2^32, because C_D is a RESIDUE by design and the corner bound
+    # is what guarantees the RESULT fits. Comparing the residue against the true value would refuse a
+    # legal record -- the exact "fix" the prep header warns against.
+    var Dtrue = e0 * W0 + e1 * W1 + e2 * W2;
+    var Drec = tper_i32(load32(rec + 28)) * lxq + tper_i32(load32(rec + 32)) * lyq
+    + tper_i32(load32(rec + 36));
+    if ((Drec & 0xFFFFFFFF) != (Dtrue & 0xFFFFFFFF)) { return 1; }
+
+    # Q2 -- both 64-bit N planes, reassembled from lo/hi
+    var Nu = e0 * (W0 * (load32(b + 12) & 0xFFFFFFFF))
+    + e1 * (W1 * (load32(b + 32) & 0xFFFFFFFF))
+    + e2 * (W2 * (load32(b + 52) & 0xFFFFFFFF));
+    var Nurec = tper_pair(rec, 40) * lxq + tper_pair(rec, 48) * lyq + tper_pair(rec, 56);
+    if (Nurec != Nu) { return 2; }
+    var Nv = e0 * (W0 * (load32(b + 16) & 0xFFFFFFFF))
+    + e1 * (W1 * (load32(b + 36) & 0xFFFFFFFF))
+    + e2 * (W2 * (load32(b + 56) & 0xFFFFFFFF));
+    var Nvrec = tper_pair(rec, 64) * lxq + tper_pair(rec, 72) * lyq + tper_pair(rec, 80);
+    if (Nvrec != Nv) { return 5; }
+    return 0;
+}
+
+fn gpu_tper_prep_selftest() {
+    kprintln("tper-prep: ---- rung 18 prep vs DIRECT edge functions ----", 58);
+    var bad = 0;
+    var cases = 0;
+    var dx = 8;
+    var dy = 16;
+    # two triangles: a modest one, and one at the coordinate ceiling with w at its FLOOR so C_D is
+    # driven past a 32-bit field and the residue argument is actually exercised.
+    tper_vtx(0,   0,  0, 1024,        0,        0,
+    32,  0, 1024, 32*65536,        0,
+    0, 32, 4096,        0, 32*65536);
+    tper_vtx(1,   0, 2040,  256,  1234567,  7654321,
+    4088, 2040,  256, 98765432, 12345678,
+    2048,    8,  256, 55555555, 44444444);
+    if (gpu_tper_prep_build(&tper_prep_buf, &tper_vtx_buf, 2, dx, dy) != 1) {
+        kprintln("tper-prep: FAIL -- prep refused a well-formed triangle", 54);
+        return 0;
+    }
+    var t = 0;
+    while (t < 2) {
+        var ly = 0;
+        while (ly < 8) {
+            var lx = 0;
+            while (lx < 8) {
+                var rc = gpu_tper_prep_check(t, dx, dy, lx, ly);
+                cases = cases + 1;
+                if (rc != 0) {
+                    if (bad < 4) {
+                        kprint("tper-prep: FAIL tri ", 20); kprint_num(t);
+                        kprint(" at local ", 10); kprint_num(lx); kprint(",", 1); kprint_num(ly);
+                        kprint(" reason ", 8); kprint_num(rc); kprintln("", 0);
+                    }
+                    bad = bad + 1;
+                }
+                lx = lx + 1;
+            }
+            ly = ly + 1;
+        }
+        t = t + 1;
+    }
+    # ⭐ Q4 -- the folded C_D must FIT, and the reason it fits is that it tracks D at the rect origin.
+    var cd = tper_i32(load32(&tper_prep_buf + GPU_TPER_PREP_STRIDE + 36));
+    var cdm = cd;
+    if (cdm < 0) { cdm = 0 - cdm; }
+    kprint("tper-prep: folded |C_D| = ", 26); kprint_num(cdm);
+    kprintln(" -- a signed 32-bit field holds 2147483647", 42);
+    if (cdm > 2147483647) {
+        kprintln("tper-prep: FAIL -- the folded constant term does not fit its field", 66);
+        bad = bad + 1;
+    }
+    kprint("tper-prep: ", 11); kprint_num(cases - bad); kprint(" of ", 4); kprint_num(cases);
+    kprintln(" prep checks correct", 20);
+    if (bad != 0) { kprintln("tper-prep: FAIL -- see the named case(s) above", 46); return 0; }
+    kprintln("tper-prep: PASS -- the hoisted D and both 64-bit N planes reproduce the DIRECT edge", 83);
+    kprintln("tper-prep: functions at every sample, and the derived-e2 identity holds.", 72);
+    return 1;
+}
+#endif
+
+#ifdef EDGE_ABI_SELFTEST
+# ============================================================================================
 # gpu_trid_prep_selftest — rung 17 prep, checked against a formulation that SHARES NO CODE.
 # ============================================================================================
 # ⛔ IT DOES NOT RE-RUN THE HOIST AND COMPARE. Two copies of the same derivation agreeing is the
@@ -1186,6 +1340,143 @@ fn gpu_trid_prep_selftest() {
     return 1;
 }
 #endif
+
+# ============================================================================================
+# RUNG 18 PREP — the perspective planes, hoisted once per triangle on the CPU.
+# ============================================================================================
+# Perspective-correct interpolation is a_persp = N/D with
+#     D(x,y) = SUM e_i * W_i               and   N(x,y) = SUM e_i * (W_i * a_i),  W_i = 2^K / w_i
+# Both are AFFINE in (x,y), so both hoist to A*x + B*y + C exactly like rung 17's depth numerator, and
+# the per-pixel path is a few multiply-adds plus one divide. Everything below was pinned by host
+# measurement BEFORE this function existed (tests/gpu/persp*.cyr) — the inverse of rung 17, where four
+# plan specifications were falsified during implementation.
+#
+# THE 96-BYTE RECORD, laid out for SIX s_load_dwordx4 at 0x0/0x10/0x20/0x30/0x40/0x50:
+#   +0   A0      B0      C0        A1
+#   +16  B1      C1      area      A_D
+#   +32  B_D     C_D     A_Nu_lo   A_Nu_hi
+#   +48  B_Nu_lo B_Nu_hi C_Nu_lo   C_Nu_hi
+#   +64  A_Nv_lo A_Nv_hi B_Nv_lo   B_Nv_hi
+#   +80  C_Nv_lo C_Nv_hi RESERVED  RESERVED
+#
+# ⭐ ONLY TWO EDGE PLANES ARE STORED; e2 is DERIVED as `area - e0 - e1`, the identity rung 17 proved at
+# lane width. ⚠ Safe here for a reason worth stating: e0/e1/e2 feed ONLY the inside test, so just their
+# SIGNS matter. D and N are evaluated from their own affine planes, not from the e_i, so a derived e2
+# never enters arithmetic whose exact value is read.
+#
+# ⭐ AND THE FOLD LEAVES `area` UNCHANGED, which is what keeps that identity valid in draw-local
+# coordinates: sum(C_i') = area + fx*sum(A_i) + fy*sum(B_i), and both sums are identically zero because
+# the edge functions' x and y terms cancel. The same argument extends to the D plane —
+# sum(C_i' * W_i) = C_D + fx*A_D + fy*B_D — so folding the derived planes directly is consistent with
+# folding the edge planes and re-deriving.
+#
+# ⛔⛔ C_D FITS A 32-BIT FIELD **BY CONSTRUCTION**, AND THE FIRST VERSION OF THIS BLOCK GOT THE REASON
+# BACKWARDS. It claimed C_D "reaches 2^36.6 and does not fit", justified a mod-2^32 residue, and warned
+# against ever bounding it. The magnitude is right for the UNFOLDED value -- measured, |C_D| = 7.23e9 on
+# a legal triangle -- but the STORED value is the FOLDED one, and folding changes everything:
+#     C_D' = C_D + 2*dx*A_D + 2*dy*B_D  =  D evaluated at the draw rect's own origin.
+# Measured on that same triangle: folded |C_D| = 600,285,184 against a max corner |D| of 625,848,064 --
+# the same number, because they ARE the same quantity one half-step apart.
+# ⇒ `gpo_validate_triperspec`'s four-corner bound on D therefore bounds C_D to within |A_D| + |B_D|
+# (itself under 2^24.6), so a 32-bit field is safe without any residue argument at all.
+# ⚠ THE MASK IS KEPT as belt-and-braces, but it is NOT load-bearing, and saying otherwise was wrong in
+# a way that mattered: it justified a *rule against* bounding C_D, when the bound is exactly what makes
+# the field safe. ⛔ The earlier claim "bounding D at a corner does not bound C_D because A_D*qx can
+# cancel it" is true of the unfolded value and FALSE of the stored one.
+# ⛔ The N coefficients are 64-bit PAIRS, not residues: C_Nu reaches ~2^62, and unlike D the result N is
+# itself 64-bit, so there is no narrower lane for a residue to collapse into.
+
+fn gpu_tper_prep_build(dst, vkva, nt, dx, dy) {
+    var fx = 2 * dx;
+    var fy = 2 * dy;
+    var one = 1 << GPU_TPER_K_SHIFT;
+    var i = 0;
+    while (i < nt) {
+        var b   = vkva + i * GPU_TPER_VTX_BYTES;
+        var rec = dst  + i * GPU_TPER_PREP_STRIDE;
+        # ⚠ vertices arrive 16.16 with zero fraction (GPO_E_SUBPIXEL refuses otherwise) and the
+        # arithmetic lives in the DOUBLED-integer domain the reference and model prove, where a pixel
+        # centre (px + 0.5) is the exact integer 2*px + 1.
+        var dax = 2 * (gpo_i32(b +  0) >>> 16);  var day = 2 * (gpo_i32(b +  4) >>> 16);
+        var dbx = 2 * (gpo_i32(b + 20) >>> 16);  var dby = 2 * (gpo_i32(b + 24) >>> 16);
+        var dcx = 2 * (gpo_i32(b + 40) >>> 16);  var dcy = 2 * (gpo_i32(b + 44) >>> 16);
+        var w0 = load32(b +  8) & 0xFFFFFFFF;
+        var w1 = load32(b + 28) & 0xFFFFFFFF;
+        var w2 = load32(b + 48) & 0xFFFFFFFF;
+        if (w0 < 1) { return 0; }
+        if (w1 < 1) { return 0; }
+        if (w2 < 1) { return 0; }
+        var u0 = load32(b + 12) & 0xFFFFFFFF;
+        var u1 = load32(b + 32) & 0xFFFFFFFF;
+        var u2 = load32(b + 52) & 0xFFFFFFFF;
+        var v0 = load32(b + 16) & 0xFFFFFFFF;
+        var v1 = load32(b + 36) & 0xFFFFFFFF;
+        var v2 = load32(b + 56) & 0xFFFFFFFF;
+
+        # edge i opposes vertex i, the same assignment the reference uses. A permutation here would
+        # still sum to the area and would put the wrong attribute on the wrong barycentric.
+        var a0 = 0 - (dcy - dby);  var b0 = dcx - dbx;  var c0 = (dcy - dby) * dbx - (dcx - dbx) * dby;
+        var a1 = 0 - (day - dcy);  var b1 = dax - dcx;  var c1 = (day - dcy) * dcx - (dax - dcx) * dcy;
+        var a2 = 0 - (dby - day);  var b2 = dbx - dax;  var c2 = (dby - day) * dax - (dbx - dax) * day;
+        var area = c0 + c1 + c2;
+
+        # winding normalisation. ⛔ ALL THREE PLANES FLIP TOGETHER, and so does area -- the divide
+        # requires a positive denominator and every downstream plane inherits the sign.
+        if (area < 0) {
+            a0 = 0-a0; b0 = 0-b0; c0 = 0-c0;
+            a1 = 0-a1; b1 = 0-b1; c1 = 0-c1;
+            a2 = 0-a2; b2 = 0-b2; c2 = 0-c2;
+            area = 0 - area;
+        }
+        if (area == 0) { return 0; }        # the validator refuses first; this is the second gate
+
+        var W0 = one / w0;
+        var W1 = one / w1;
+        var W2 = one / w2;
+
+        # the D plane and the two N planes, in SCREEN coordinates
+        var ad = a0 * W0 + a1 * W1 + a2 * W2;
+        var bd = b0 * W0 + b1 * W1 + b2 * W2;
+        var cd = c0 * W0 + c1 * W1 + c2 * W2;
+        var K0u = W0 * u0; var K1u = W1 * u1; var K2u = W2 * u2;
+        var K0v = W0 * v0; var K1v = W1 * v1; var K2v = W2 * v2;
+        var anu = a0 * K0u + a1 * K1u + a2 * K2u;
+        var bnu = b0 * K0u + b1 * K1u + b2 * K2u;
+        var cnu = c0 * K0u + c1 * K1u + c2 * K2u;
+        var anv = a0 * K0v + a1 * K1v + a2 * K2v;
+        var bnv = b0 * K0v + b1 * K1v + b2 * K2v;
+        var cnv = c0 * K0v + c1 * K1v + c2 * K2v;
+
+        # ---- fold dstxy into every CONSTANT term, so the shader works draw-local and never sees it.
+        # ⭐ `area` is deliberately NOT folded: it is invariant under the fold (see the block above),
+        # which is exactly what keeps `e2 = area - e0 - e1` valid in the folded frame.
+        c0 = c0 + fx * a0 + fy * b0;
+        c1 = c1 + fx * a1 + fy * b1;
+        cd = cd + fx * ad + fy * bd;
+        cnu = cnu + fx * anu + fy * bnu;
+        cnv = cnv + fx * anv + fy * bnv;
+
+        store32(rec +  0, a0 & 0xFFFFFFFF);
+        store32(rec +  4, b0 & 0xFFFFFFFF);
+        store32(rec +  8, c0 & 0xFFFFFFFF);
+        store32(rec + 12, a1 & 0xFFFFFFFF);
+        store32(rec + 16, b1 & 0xFFFFFFFF);
+        store32(rec + 20, c1 & 0xFFFFFFFF);
+        store32(rec + 24, area & 0xFFFFFFFF);
+        store32(rec + 28, ad & 0xFFFFFFFF);
+        store32(rec + 32, bd & 0xFFFFFFFF);
+        store32(rec + 36, cd & 0xFFFFFFFF);          # bounded by the corner rule -- see the header
+        store32(rec + 40, anu & 0xFFFFFFFF);         store32(rec + 44, (anu >>> 32) & 0xFFFFFFFF);
+        store32(rec + 48, bnu & 0xFFFFFFFF);         store32(rec + 52, (bnu >>> 32) & 0xFFFFFFFF);
+        store32(rec + 56, cnu & 0xFFFFFFFF);         store32(rec + 60, (cnu >>> 32) & 0xFFFFFFFF);
+        store32(rec + 64, anv & 0xFFFFFFFF);         store32(rec + 68, (anv >>> 32) & 0xFFFFFFFF);
+        store32(rec + 72, bnv & 0xFFFFFFFF);         store32(rec + 76, (bnv >>> 32) & 0xFFFFFFFF);
+        store32(rec + 80, cnv & 0xFFFFFFFF);         store32(rec + 84, (cnv >>> 32) & 0xFFFFFFFF);
+        store32(rec + 88, 0);                        store32(rec + 92, 0);
+        i = i + 1;
+    }
+    return 1;
+}
 
 var gpu_trid_armed = 0;
 

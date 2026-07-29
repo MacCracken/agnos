@@ -1260,6 +1260,26 @@ var GPU_TRID_PREP_SUBOFF       = 0x1E4000;   # 1 header + 256 records x 64 B  ->
 # the PREDICTION and must be replaced by the harvested one, not confirmed by eye.
 var GPU_COMPUTE_PGM_RSRC1_TDEP = 0x002C0187;
 var GPU_TRID_PREP_STRIDE       = 64;         # bytes per prep record; the header is one stride too
+# ⭐ RUNG 18. A SIXTH resident blob and its own prep region. ⚠ Both placements DERIVED by walking the
+# sorted slot extents, per this file's own "derive the gap, don't spot it" — the largest actually-free
+# run is [0x1F1000,0x200000) at 60 KB, and [0x1EC000,0x1F0000) is the 16 KB rung 17 left behind.
+#   shader: 4 KB out of the 60 KB run, leaving 56 KB.
+#   prep:   1 header + 256 records x 96 B = 24.6 KB, taken from the same run after the shader.
+# ⛔ Do NOT share rung 17's prep region even though both hold per-triangle records: the strides differ
+# (64 vs 96 bytes) and sharing a fixed arena slot across ops is rung 12's exact failure.
+var GPU_TPER_SHADER_SUBOFF     = 0x1F1000;   # residency slot 14, rung 18 persp  -> ends 0x1F2000
+var GPU_TPER_PREP_SUBOFF       = 0x1F2000;   # 1 header + 256 records x 96 B     -> ends 0x1F8400
+var GPU_TPER_PREP_STRIDE       = 96;         # bytes per prep record; six s_load_dwordx4
+# ⭐ ONE DEFINITION of the reciprocal shift. It was duplicated as GPU_TPER_K in syscall.cyr and
+# GPU_TPER_K_SHIFT in gpu.cyr -- two constants that must agree with nothing diffing them, which is the
+# ATOM_DRY defect this tree keeps paying for. ⚠ Bounded ABOVE at 24 by measurement (perspbits: past
+# K=26 the numerator exceeds 62 bits and by K=30 the reference itself returns negative quotients on
+# 714,000 pixels) and BELOW by the reciprocal precision the w ceiling depends on.
+var GPU_TPER_K_SHIFT           = 16;
+# tri_persp: harvest from the assembled descriptor at the blob bite. The value below is a PREDICTION
+# and must be REPLACED by the harvested one, never confirmed by eye -- edge_cov's hand count was wrong
+# by an SGPR field because no hand count contains the XNACK rule.
+var GPU_COMPUTE_PGM_RSRC1_TPER = 0x002C0187;
 var GPU_TRI_PREP_SUBOFF        = 0xE0000;    # 64 records x 128 B  -> ends 0xE2000
 var GPU_TRI_EDGE_SUBOFF        = 0xE2000;    # synthesised frame edges when DERIVE is set -> ends 0xE3000
 var GPU_TRI_COV_SUBOFF         = 0xE4000;    # 8bpp coverage scratch, 1 MB  -> ends 0x1E4000
