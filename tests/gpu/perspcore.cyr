@@ -21,6 +21,19 @@
 # unchanged. `perspbits` measured what does NOT: N needs 49-51 bits, so it is a 64-bit quantity while
 # D fits a 32-bit lane.
 #
+# ⛔⛔ w IS A FIXED-POINT MAGNITUDE, NOT A SMALL INTEGER, AND THAT IS AN ABI CONSTRAINT rung 18 MUST
+# STATE. W_i = 2^K / w_i, so a SMALL w gives a LARGE W and inflates every downstream width. The first
+# version of this corpus used w = 1 and 16; measured, that put D past a 32-bit lane on all 4096 pixels
+# of the full-screen frame, contradicting perspbits' 24-29 bits on the same geometry. The two probes
+# disagreed only because perspbits used w ~ 4096 (W ~ 16) and this file used w = 1 (W = 65536) --
+# 4096x larger. ⇒ w is pinned to the range [PC_W_MIN, PC_W_MAX] here, the ratio is what creates the
+# perspective, and the shader's validator will need the same floor on w or D silently outgrows its lane.
+# ⚠ This is exactly the class of thing that has to be pinned in the REFERENCE before a shader exists:
+# a corpus that quietly uses unrepresentative magnitudes proves the arithmetic for a program nobody
+# ships.
+var PC_W_MIN = 256;             # nearest legal clip w -- the FLOOR that bounds W and therefore D
+var PC_W_MAX = 4096;            # farthest; the 16:1 ratio is what makes perspective visible
+#
 # ⛔ K IS PINNED AT 16, INSIDE A MEASURED WINDOW, NOT CHOSEN. `perspbits` swept it: K = 12..24 all
 # overflow nothing and agree on every one of 480,000 pixels, while K >= 26 pushes N past 62 bits and by
 # K = 30 the quotient comes out NEGATIVE on 714,000 of them — the reference itself undefined, which is
@@ -58,6 +71,12 @@ var pc_v[4096];                 # ... v
 var pc_ua[4096];                # the AFFINE u, for the discriminator
 var pc_cov[4096];               # 1 where covered
 var pc_covered = 0;
+# ⭐ THE SAMPLE WINDOW'S ORIGIN, in screen pixels. Lets a FULL-SCREEN figure be measured through a
+# 64x64 window, so the magnitudes are realistic without a 3.8 MB buffer. Same device rung 17 used
+# (dc_ox) for its off-origin frame, and for the same reason: the arithmetic must see real screen
+# coordinates even when the buffer is small.
+var pc_ox = 0;
+var pc_oy = 0;
 var pc_iters = 0;               # restoring-divide iterations consumed, so cost is reported not guessed
 
 fn pc_reset(): i64 { pc_n = 0; return 0; }
@@ -131,8 +150,8 @@ fn pc_render(): i64 {
     while (py < PC_H) {
         var px = 0;
         while (px < PC_W) {
-            var pxq = 2 * px + 1;
-            var pyq = 2 * py + 1;
+            var pxq = 2 * (pc_ox + px) + 1;
+            var pyq = 2 * (pc_oy + py) + 1;
             var t = 0;
             while (t < pc_n) {
                 var ax = 2 * pc_get(t,0);  var ay = 2 * pc_get(t,1);
@@ -214,10 +233,11 @@ fn pc_affine_diff(): i64 {
 # would make the two hypotheses agree everywhere and the oracle would discriminate nothing.
 fn pc_corpus_floor(): i64 {
     pc_reset();
+    pc_ox = 0; pc_oy = 0;
     var T = 256 * 65536;        # the texture axis, 16.16
     #        x   y   w   u  v        x   y   w   u  v        x   y   w   u  v
-    pc_add(  0, 63,  1,  0, 0,     63, 63,  1,  T, 0,     40, 24, 16,  T, T);
-    pc_add(  0, 63,  1,  0, 0,     40, 24, 16,  T, T,     24, 24, 16,  0, T);
+    pc_add(  0, 63, 256,  0, 0,    63, 63, 256,  T, 0,    40, 24, 4096,  T, T);
+    pc_add(  0, 63, 256,  0, 0,    40, 24, 4096, T, T,    24, 24, 4096,  0, T);
     return 0;
 }
 
@@ -233,18 +253,91 @@ fn pc_corpus_floor(): i64 {
 # too, and would prove nothing about the divide.
 fn pc_corpus_constattr(): i64 {
     pc_reset();
+    pc_ox = 0; pc_oy = 0;
     var C = 77 * 65536;         # any value; 77 is arbitrary and that is the point
-    pc_add(  0, 63,  1,  C, C,     63, 63,  1,  C, C,     40, 24, 16,  C, C);
-    pc_add(  0, 63,  1,  C, C,     40, 24, 16,  C, C,     24, 24, 16,  C, C);
+    pc_add(  0, 63, 256,  C, C,    63, 63, 256,  C, C,    40, 24, 4096,  C, C);
+    pc_add(  0, 63, 256,  C, C,    40, 24, 4096, C, C,    24, 24, 4096,  C, C);
     return C;
 }
 
 # pc_corpus_flat — the SAME two triangles at CONSTANT w. Perspective-correct and affine must agree
 # EXACTLY here, which is what proves the divide is not simply perturbing everything it touches.
+# pc_corpus_bigframe — the SAME floor quad at FULL-SCREEN scale (800x600), sampled through a 64x64
+# window near the bottom where w is smallest and therefore D largest.
+#
+# ⛔⛔ IT EXISTS BECAUSE THE 64x64 CORPUS IS A NULL SET FOR EVERY REGISTER-WIDTH HAZARD. Measured by
+# perspmodel on the small figure: the 64-bit carry fires **0 times**, masking the divide remainder to
+# 31 bits changes **nothing**, and sign-restoring D's intermediate changes **nothing** — so three of its
+# five mutations were untestable and the widths they guard were unexercised. The edge functions scale
+# with the square of the frame, so a full-screen figure is ~156x larger and pushes all three past the
+# boundary they are supposed to police.
+# ⚠ This is the same class of defect as rung 17's shipped corpus being blind to a one-ULP divide error
+# (0 of 1024 pixels). Finding it on the host costs a rebuild; finding it on iron costs a burn.
+fn pc_corpus_bigframe(): i64 {
+    pc_reset();
+    var T = 4096 * 65536;       # a 4096-texel axis, the ABI maximum
+    pc_add(   0, 599, 256, 0, 0,   799, 599, 256,  T, 0,   500, 240, 4096, T, T);
+    pc_add(   0, 599, 256, 0, 0,   500, 240, 4096, T, T,   300, 240, 4096, 0, T);
+    pc_ox = 368;                # a window at the bottom centre: fully covered, w smallest, D largest
+    pc_oy = 535;
+    return 0;
+}
+
+# pc_corpus_carry — three DISTINCT, NON-ALIGNED attribute values at the three vertices, at max frame
+# scale. ⛔⛔ IT EXISTS BECAUSE THE OTHER FRAMES CANNOT FIRE THE 64-BIT CARRY, AND THAT WAS MEASURED,
+# NOT SUSPECTED: perspmodel's A6 counted **0** carry propagations across every earlier frame, so its
+# M1 (drop the carry between the two halves) was testing nothing and reported RED only while the model
+# was accidentally rendering an empty image.
+# ⚠ Two reasons the earlier frames are blind to it. (1) Their vertex attributes are 0 or T, so at most
+# one of the three 64-bit terms is non-zero and there is nothing to carry BETWEEN. (2) A 16.16 value
+# whose texel part is a whole number has sixteen zero low bits, which suppresses low-word overflow.
+# ⇒ here all three vertices carry distinct values with dirty low bits, at 4096x2048 geometry (the ABI's
+# coordinate ceiling) so the edge functions are as large as the ABI permits and D approaches its lane.
+fn pc_corpus_carry(): i64 {
+    pc_reset();
+    pc_ox = 2040; pc_oy = 1000;
+    #          x     y     w    u                v
+    pc_add(    0, 2047,  256,  1234567,  7654321,
+            4095, 2047,  256, 98765432, 12345678,
+            2600,  900, 4096, 55555555, 44444444);
+    pc_add(    0, 2047,  256,  1234567,  7654321,
+            2600,  900, 4096, 55555555, 44444444,
+            1400,  900, 4096, 77777777, 33333333);
+    return 0;
+}
+
+# pc_corpus_maxd — ALL vertices at the w FLOOR (so W is maximal) and the largest area the ABI's
+# coordinate ceiling permits. ⛔⛔ THIS FRAME EXISTS TO BREAK A DESIGN CLAIM, AND IT DOES.
+#
+# `D = sum(e_i * W_i)`. With w pinned at its floor of 256, W = 2^16/256 = 256 everywhere, and the edge
+# functions at 4096x2048 (doubled: 8192x4096) reach ~2^25. So D reaches ~3 * 2^25 * 2^8 = 2^34.6 —
+# past even an UNSIGNED 32-bit lane, let alone the signed one.
+# ⇒ **"D fits a 32-bit lane" is FALSE at the ABI's extremes.** It held on every other frame here only
+# because those frames are small or use a large w. perspbits said 24-29 bits and perspgate said 22; both
+# were measuring figures that happen not to reach the corner.
+#
+# ⭐ THE FIX IS A VALIDATOR RULE, NOT A WIDER REGISTER, and it is precedented exactly: rung 17 bounds
+# |zn| < 2^31 by evaluating it at the DRAW RECT'S FOUR CORNERS, which is sound because zn is affine —
+# and depthgate's D8 proved that corner shortcut against brute force. D is affine in (x,y) too, so the
+# same four-corner evaluation bounds it. ⇒ rung 18's validator must REJECT any record whose D exceeds a
+# 32-bit lane at a corner, which makes "D fits one lane" true BY CONSTRUCTION instead of by luck.
+# ⇒ and then perspmodel's M4/M5 are unexercisable by any LEGAL record. That is not a gate failure; it is
+# evidence the rule is load-bearing, and this frame is what demonstrates it.
+fn pc_corpus_maxd(): i64 {
+    pc_reset();
+    pc_ox = 2040; pc_oy = 1000;
+    var T = 4096 * 65536;
+    pc_add(    0, 2047, 256, 1234567, 7654321,
+            4095, 2047, 256, 98765432, 12345678,
+            2048,    0, 256, 55555555, 44444444);
+    return 0;
+}
+
 fn pc_corpus_flat(): i64 {
     pc_reset();
+    pc_ox = 0; pc_oy = 0;
     var T = 256 * 65536;
-    pc_add(  0, 63,  4,  0, 0,     63, 63,  4,  T, 0,     40, 24,  4,  T, T);
-    pc_add(  0, 63,  4,  0, 0,     40, 24,  4,  T, T,     24, 24,  4,  0, T);
+    pc_add(  0, 63, 1024, 0, 0,    63, 63, 1024, T, 0,    40, 24, 1024,  T, T);
+    pc_add(  0, 63, 1024, 0, 0,    40, 24, 1024, T, T,    24, 24, 1024,  0, T);
     return 0;
 }

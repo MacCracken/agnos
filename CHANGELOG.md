@@ -7,6 +7,49 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 **Rung 18 `persp-correct` — cycle OPEN.** Bumped on cycle open; the user tags on close.
 
+### Added — `perspmodel.cyr`: multi-word arithmetic at register widths, and it broke a design claim
+
+`tests/gpu/perspmodel.cyr`, exit 95. **12** host oracles. The first model in this tree that has to carry
+a per-pixel value in a **register pair** — every earlier rung's values fit one 32-bit lane and
+`depthmodel`'s whole job was proving that. It mirrors the shader's sequence instruction for instruction:
+a four-instruction 64×32 multiply, and a two-instruction accumulate whose `v_addc_co_u32` consumes `vcc`
+as carry-in.
+
+### ⛔⛔ "D fits a 32-bit lane" is FALSE at the ABI's extremes — and that forces a validator rule
+
+`perspbits` measured `D` at 24–29 bits, `perspgate` at 22. Both were measuring figures that **happen not
+to reach the corner.** `D = Σ eᵢ·Wᵢ`, and with `w` at its pinned floor of 256 (so `W = 256` everywhere)
+and the edge functions at the ABI's 4096×2048 coordinate ceiling (~2^25), `D` reaches **8,583,644,160 =
+2^33** — twice an *unsigned* 32-bit lane. Measured on a frame built to break the claim.
+
+⭐ **The fix is a validator rule, not a wider register, and it is exactly precedented.** `D` is affine in
+(x,y), so evaluating it at the draw rect's **four corners** bounds it — the same shortcut rung 17 uses for
+`|zn| < 2^31`, and one `depthgate`'s D8 already proved sound against brute force. ⇒ rung 18's validator
+must reject any record whose `D` exceeds a lane at a corner, which makes "D fits one lane" true **by
+construction** instead of by luck.
+
+### ⛔ Three separate ways this model was measuring nothing, each caught by a counter rather than by luck
+
+1. **The model rendered an empty image on the full-screen frame** — it sampled at `2*px+1` without the
+   window origin while the geometry sat at x=368. ⚠ **Second time this exact omission has happened**
+   (rung 17's `depthmodel`, x=4000). Both times the only thing that caught it was a gate comparing model
+   to reference *on the frame in question*. And it mattered: all five mutations reported "RED" against
+   that empty image, so without A3b I would have concluded every one was connected while nothing was
+   being tested.
+2. **The 64-bit carry fired 0 times** on every original frame — the vertex attributes are 0 or `T`, so at
+   most one of the three terms is non-zero and there is nothing to carry *between*, and a whole-texel
+   16.16 value has sixteen zero low bits besides. A6 exists to count exactly this, and it failed. A new
+   frame with three distinct dirty attributes brings it to **8240** propagations.
+3. **The five hazards need five different figures.** M1–M3 connect on the small floor quad; M4/M5 only on
+   the max-D frame. ⇒ every mutation is now run across **all five frames** and required to connect on at
+   least one. Running a mutation on one frame and declaring it connected is how a gate ends up
+   permanently green — which is what rung 17's corpus did, and it cost a burn.
+
+⚠ Also fixed: `w = 1..16` in the original corpus was unrepresentative. `W = 2^K/w`, so a small `w` gives a
+large `W` and inflates every downstream width — it put `D` past a lane on *all* 4096 pixels and made this
+file contradict `perspbits` on identical geometry. `w` is now pinned to `[256, 4096]`, and the shader's
+validator will need the same floor or `D` silently outgrows its lane.
+
 ### Added — `perspcore.cyr` + `perspgate.cyr`: the reference, and proof the figure DISCRIMINATES
 
 `tests/gpu/perspcore.cyr` (the reference) and `perspgate.cyr` (exit 95). **11** host oracles now.

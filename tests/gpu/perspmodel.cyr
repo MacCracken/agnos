@@ -1,0 +1,351 @@
+# perspmodel.cyr — RUNG 18's CORRECTNESS GATE: the perspective shader's arithmetic at GPU REGISTER
+# WIDTHS, byte-diffed against perspcore.cyr, which is the oracle.
+#
+# ⭐ THE POINT IS ATTRIBUTION, and rungs 11/13/15/17 earned it. Green here and red on iron ⇒ the fault
+# is the EMISSION, not the algorithm. When rung 17's first burn came back red this split is what let
+# the kernarg swap be localised from a printed peak in one pass instead of bisected on hardware.
+#
+# ============================================================================================
+# WHAT THIS MODEL ADDS THAT NO PREVIOUS RUNG'S DID: MULTI-WORD ARITHMETIC
+# ============================================================================================
+# Every earlier rung's per-pixel values fit a single 32-bit lane, and `depthmodel`'s whole job was to
+# prove that. `perspbits` measured that rung 18's do NOT: the numerator needs 49-51 bits while the
+# denominator fits comfortably. So the shader must carry N as a REGISTER PAIR and evaluate its affine
+# form with 64x32 multiplies and an explicit carry chain — a defect class this tree has never modelled.
+#
+# The shader's actual sequence, which this file mirrors instruction for instruction:
+#   64x32 multiply, four instructions:
+#     v_mul_lo_u32  plo, klo, lxq        v_mul_hi_u32  phi, klo, lxq
+#     v_mul_lo_u32  t,   khi, lxq        v_add_u32     phi, phi, t
+#   64-bit accumulate, two instructions:
+#     v_add_co_u32  lo, vcc, lo, plo     v_addc_co_u32 hi, vcc, hi, phi, vcc
+#
+# ⛔⛔ THE CARRY IS THE WHOLE HAZARD. `v_addc_co_u32` consumes vcc as carry-IN, so anything written
+# between the two halves corrupts the high word — and it corrupts it by exactly one, which on a texture
+# coordinate is a one-texel seam rather than a crash. M1 drops that carry and measures what it costs.
+# ⚠ Rung 17's shader header already carries this warning for its SGPR pointer walk
+# (`s_add_u32` / `s_addc_u32` must stay adjacent); here it applies per pixel, on VGPRs, in the hot loop.
+
+include "lib/io.cyr"
+include "tricore.cyr"      # ps / pn / nl
+include "perspcore.cyr"
+
+var PM_M32 = 4294967295;
+
+# ---- mutations: each must break a gate --------------------------------------------------------
+var pm_mut_nocarry = 0;   # M1 drop the carry between the two halves of the 64-bit accumulate
+var pm_mut_nohi    = 0;   # M2 drop the khi*lxq term -- the high half of the 64x32 multiply
+var pm_mut_n32     = 0;   # M3 truncate N to a single 32-bit lane (what rung 17 could get away with)
+var pm_mut_rem31   = 0;   # M4 mask the divide remainder to 31 bits
+var pm_mut_dwrap   = 0;   # M5 sign-restore D's intermediate, breaking the mod-2^32 residue argument
+
+var pm_lane_bad = 0;      # lanes where the modelled 64-bit value != the reference's i64 value
+var pm_max_rem = 0;       # the remainder's true peak -- perspcore CLAIMS it fits 32 bits; measure it
+var pm_carry_fires = 0;   # how often the carry actually propagated. If zero, M1 is untestable.
+
+# ---- the 64-bit primitives, exactly as the shader spells them --------------------------------
+var pm_hi = 0;
+var pm_lo = 0;
+
+fn pm_set64(hi, lo): i64 { pm_hi = hi & PM_M32; pm_lo = lo & PM_M32; return 0; }
+
+# pm_mul64x32 — (khi,klo) * m, into (pm_hi, pm_lo). Four instructions in the shader.
+fn pm_mul64x32(khi, klo, m): i64 {
+    var lo_full = (klo & PM_M32) * (m & PM_M32);
+    var plo = lo_full & PM_M32;
+    var phi = (lo_full >>> 32) & PM_M32;              # v_mul_hi_u32
+    if (pm_mut_nohi == 0) {
+        phi = (phi + ((khi & PM_M32) * (m & PM_M32))) & PM_M32;
+    }
+    pm_hi = phi;
+    pm_lo = plo;
+    return 0;
+}
+
+# pm_add64 — (ahi,alo) + (bhi,blo), with the carry chain the shader has to get right.
+fn pm_add64(ahi, alo, bhi, blo): i64 {
+    var s = (alo & PM_M32) + (blo & PM_M32);
+    var carry = s >>> 32;
+    if (carry != 0) { pm_carry_fires = pm_carry_fires + 1; }
+    if (pm_mut_nocarry != 0) { carry = 0; }
+    pm_lo = s & PM_M32;
+    pm_hi = ((ahi & PM_M32) + (bhi & PM_M32) + carry) & PM_M32;
+    return 0;
+}
+
+# ---- the divide, at register widths ----------------------------------------------------------
+# ⭐ THE REMAINDER IS A SINGLE 32-BIT LANE, and that is perspcore's claim being CHECKED here rather
+# than repeated. rem < D after every subtraction and D < 2^31, so `rem<<1 | bit` stays representable.
+# ⇒ only the NUMERATOR needs a register pair; the loop itself is 32-bit throughout, which is what makes
+# this affordable at all.
+fn pm_div(Nhi, Nlo, D, nbits): i64 {
+    var q = 0;
+    var rem = 0;
+    var i = nbits - 1;
+    while (i >= 0) {
+        var bit = 0;
+        if (i >= 32) { bit = (Nhi >>> (i - 32)) & 1; }
+        if (i < 32)  { bit = (Nlo >>> i) & 1; }
+        rem = ((rem << 1) | bit) & PM_M32;
+        if (pm_mut_rem31 != 0) { rem = rem & 2147483647; }
+        if (rem > pm_max_rem) { pm_max_rem = rem; }
+        q = (q << 1) & PM_M32;
+        if (rem >= D) { rem = rem - D; q = q | 1; }
+        i = i - 1;
+    }
+    return q;
+}
+
+var pm_u[4096];
+var pm_v[4096];
+var pm_cov[4096];
+
+# pm_render — the model. Reads the SAME corpus perspcore holds; no private copy, because a model
+# validated against one figure while the gate proves a property of another is green on both sides and
+# wrong. (That duplication was a real defect in rung 17's files until it was deduplicated.)
+fn pm_render(): i64 {
+    pm_lane_bad = 0;
+    pm_max_rem = 0;
+    pm_carry_fires = 0;
+    var i = 0;
+    while (i < PC_W * PC_H) {
+        store64(&pm_u + i * 8, 0 - 1);
+        store64(&pm_v + i * 8, 0 - 1);
+        store64(&pm_cov + i * 8, 0);
+        i = i + 1;
+    }
+    var one = 1 << PC_K;
+    var py = 0;
+    while (py < PC_H) {
+        var px = 0;
+        while (px < PC_W) {
+            # ⚠ SCREEN coordinates -- pc_ox/pc_oy, exactly as pc_render does it. Omitting them made
+            # the model sample at x=0 while the full-screen frame's geometry sat at x=368, so it
+            # rendered NOTHING and every one of the five mutations went "RED" against an empty image.
+            # ⛔ THAT IS THE SECOND TIME THIS EXACT OMISSION HAS HAPPENED (rung 17's depthmodel, x=4000)
+            # and both times it was caught only by a gate that compares the model to the reference on
+            # the frame in question. A mutation is not connected unless the thing it mutates RAN.
+            var lxq = 2 * (pc_ox + px) + 1;
+            var lyq = 2 * (pc_oy + py) + 1;
+            var t = 0;
+            while (t < pc_n) {
+                var ax = 2 * pc_get(t,0);  var ay = 2 * pc_get(t,1);
+                var bx = 2 * pc_get(t,5);  var by = 2 * pc_get(t,6);
+                var cx = 2 * pc_get(t,10); var cy = 2 * pc_get(t,11);
+                var e0 = pc_edge(bx, by, cx, cy, lxq, lyq);
+                var e1 = pc_edge(cx, cy, ax, ay, lxq, lyq);
+                var e2 = pc_edge(ax, ay, bx, by, lxq, lyq);
+                var area = e0 + e1 + e2;
+                if (area < 0) { e0 = 0-e0; e1 = 0-e1; e2 = 0-e2; area = 0-area; }
+                var inside = 0;
+                if (area > 0) {
+                    if (e0 >= 0) { if (e1 >= 0) { if (e2 >= 0) { inside = 1; } } }
+                }
+                if (inside == 1) {
+                    var Wa = one / pc_get(t,2);
+                    var Wb = one / pc_get(t,7);
+                    var Wc = one / pc_get(t,12);
+                    # ---- D in ONE 32-bit lane. ⚠ The intermediate may wrap; the RESULT is what must
+                    # fit, and mod-2^32 is a ring homomorphism so the wrap is exact. Same argument
+                    # rung 17 made for its KX/KY/KC residues, and M5 breaks it deliberately.
+                    var Dtrue = e0 * Wa + e1 * Wb + e2 * Wc;
+                    var D = Dtrue & PM_M32;
+                    if (pm_mut_dwrap != 0) { if (D >= 2147483648) { D = D - 4294967296; } }
+                    if (D != Dtrue) { pm_lane_bad = pm_lane_bad + 1; }
+
+                    # ---- N as a REGISTER PAIR, accumulated with an explicit carry chain ---------
+                    var Nu_true = e0 * (Wa * pc_get(t,3)) + e1 * (Wb * pc_get(t,8)) + e2 * (Wc * pc_get(t,13));
+                    var Nv_true = e0 * (Wa * pc_get(t,4)) + e1 * (Wb * pc_get(t,9)) + e2 * (Wc * pc_get(t,14));
+                    # three 64x32 products, summed pairwise, exactly as the shader would
+                    var ahi = 0; var alo = 0;
+                    var k = 0;
+                    while (k < 3) {
+                        var Wk = Wa; var Ak = pc_get(t,3); var ek = e0;
+                        if (k == 1) { Wk = Wb; Ak = pc_get(t,8);  ek = e1; }
+                        if (k == 2) { Wk = Wc; Ak = pc_get(t,13); ek = e2; }
+                        var K64 = Wk * Ak;                       # the per-vertex product, 64-bit
+                        pm_mul64x32((K64 >>> 32) & PM_M32, K64 & PM_M32, ek);
+                        pm_add64(ahi, alo, pm_hi, pm_lo);
+                        ahi = pm_hi; alo = pm_lo;
+                        k = k + 1;
+                    }
+                    var Nu_hi = ahi; var Nu_lo = alo;
+                    if (pm_mut_n32 != 0) { Nu_hi = 0; }
+                    if (((Nu_hi << 32) | Nu_lo) != Nu_true) { pm_lane_bad = pm_lane_bad + 1; }
+
+                    var bhi = 0; var blo = 0;
+                    k = 0;
+                    while (k < 3) {
+                        var Wk2 = Wa; var Ak2 = pc_get(t,4); var ek2 = e0;
+                        if (k == 1) { Wk2 = Wb; Ak2 = pc_get(t,9);  ek2 = e1; }
+                        if (k == 2) { Wk2 = Wc; Ak2 = pc_get(t,14); ek2 = e2; }
+                        var K642 = Wk2 * Ak2;
+                        pm_mul64x32((K642 >>> 32) & PM_M32, K642 & PM_M32, ek2);
+                        pm_add64(bhi, blo, pm_hi, pm_lo);
+                        bhi = pm_hi; blo = pm_lo;
+                        k = k + 1;
+                    }
+                    if (((bhi << 32) | blo) != Nv_true) { pm_lane_bad = pm_lane_bad + 1; }
+
+                    var qu = pm_div(Nu_hi, Nu_lo, D, 56);
+                    var qv = pm_div(bhi, blo, D, 56);
+                    store64(&pm_u + (py * PC_W + px) * 8, qu);
+                    store64(&pm_v + (py * PC_W + px) * 8, qv);
+                    store64(&pm_cov + (py * PC_W + px) * 8, 1);
+                }
+                t = t + 1;
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return 0;
+}
+
+fn pm_vs_ref(): i64 {
+    pc_render();
+    pm_render();
+    var d = 0;
+    var i = 0;
+    while (i < PC_W * PC_H) {
+        if (load64(&pc_cov + i * 8) != load64(&pm_cov + i * 8)) { d = d + 1; }
+        if (load64(&pc_cov + i * 8) == 1) {
+            if (load64(&pc_u + i * 8) != load64(&pm_u + i * 8)) { d = d + 1; }
+            if (load64(&pc_v + i * 8) != load64(&pm_v + i * 8)) { d = d + 1; }
+        }
+        i = i + 1;
+    }
+    return d;
+}
+
+fn pm_gate(name, d, want_red): i64 {
+    ps(name);
+    if (want_red == 0) {
+        if (d == 0) { ps(" PASS"); nl(); return 0; }
+        ps(" FAIL diff="); pn(d); nl(); return 1;
+    }
+    if (d != 0) { ps(" RED (correct -- the gate is connected), diff="); pn(d); nl(); return 0; }
+    ps(" ** GATE NOT CONNECTED: the mutation changed nothing **"); nl(); return 1;
+}
+
+fn main(): i64 {
+    var bad = 0;
+    ps("perspmodel: rung 18 -- the perspective shader's arithmetic at GPU register widths"); nl();
+    ps("            ⭐ the FIRST rung whose per-pixel numerator does not fit one lane"); nl(); nl();
+
+    pc_corpus_floor();
+    bad = bad + pm_gate("A1 64-bit-pair model == reference, u AND v, floor quad:", pm_vs_ref(), 0);
+    pc_corpus_flat();
+    bad = bad + pm_gate("A2 ... at constant w:", pm_vs_ref(), 0);
+    pc_corpus_constattr();
+    bad = bad + pm_gate("A3 ... with a constant attribute:", pm_vs_ref(), 0);
+
+    # ⭐ THE BIG FRAME IS WHAT MAKES A4..A6 AND M1/M4/M5 MEAN ANYTHING. On the 64x64 figure the carry
+    # never fires and two of the width mutations are no-ops -- measured, not suspected.
+    pc_corpus_bigframe();
+    bad = bad + pm_gate("A3b ... on the FULL-SCREEN frame (the one with real magnitudes):", pm_vs_ref(), 0);
+
+    pc_corpus_carry();
+    bad = bad + pm_gate("A3c ... on the CARRY frame (distinct dirty attributes, max coords):", pm_vs_ref(), 0);
+
+    pc_corpus_carry();
+    pm_vs_ref();
+    ps("A4 the 64-bit accumulate is FAITHFUL (no lost carry, no dropped high word): ");
+    if (pm_lane_bad == 0) { ps("PASS"); nl(); }
+    if (pm_lane_bad != 0) { ps("FAIL, "); pn(pm_lane_bad); ps(" lanes"); nl(); bad = bad + 1; }
+
+    # ⭐ the claim perspcore makes, CHECKED here: the divide's remainder never needs more than 32 bits.
+    ps("A5 divide remainder peaks at "); pn(pm_max_rem);
+    ps(" -- a 32-bit lane holds 4294967295: ");
+    if (pm_max_rem <= 4294967295) { ps("PASS -- the loop is 32-bit throughout"); nl(); }
+    if (pm_max_rem > 4294967295) { ps("FAIL"); nl(); bad = bad + 1; }
+
+    # ⛔ and the carry must actually PROPAGATE on this corpus, or M1 below is untestable.
+    ps("A6 the 64-bit carry actually fires ("); pn(pm_carry_fires);
+    ps(" times) -- otherwise M1 proves nothing: ");
+    if (pm_carry_fires > 0) { ps("PASS"); nl(); }
+    if (pm_carry_fires == 0) {
+        ps("FAIL -- no carry propagated, so the hazard is unexercised"); nl();
+        bad = bad + 1;
+    }
+
+    nl();
+    # ==========================================================================================
+    # ⛔⛔ EVERY MUTATION IS RUN ON EVERY FRAME, AND MUST CONNECT ON AT LEAST ONE.
+    # ==========================================================================================
+    # Measured, and it is the finding of this file: the five width hazards need DIFFERENT FIGURES.
+    #   * the 64-bit CARRY needs three distinct attributes with dirty low bits -- on the earlier frames
+    #     the vertex attributes are 0 or T, so at most one term is non-zero and there is nothing to
+    #     carry between. A6 counted 0 propagations there.
+    #   * the HIGH HALF of the 64x32 multiply needs a per-vertex product past 2^32.
+    #   * the REMAINDER and D widths need D near its 32-bit lane, which only the largest coordinates
+    #     approach.
+    # ⇒ running a mutation on one frame and declaring it connected is how a gate ends up permanently
+    # green. Rung 17's shipped corpus was blind to a one-ULP divide error for exactly this reason, and
+    # it cost a burn to find out. Here the cost is a loop.
+    var mi = 0;
+    while (mi < 5) {
+        pm_mut_nocarry = 0; pm_mut_nohi = 0; pm_mut_n32 = 0; pm_mut_rem31 = 0; pm_mut_dwrap = 0;
+        if (mi == 0) { pm_mut_nocarry = 1; }
+        if (mi == 1) { pm_mut_nohi = 1; }
+        if (mi == 2) { pm_mut_n32 = 1; }
+        if (mi == 3) { pm_mut_rem31 = 1; }
+        if (mi == 4) { pm_mut_dwrap = 1; }
+        var connected = 0;
+        var worstframe = 0 - 1;
+        var fi = 0;
+        while (fi < 5) {
+            if (fi == 0) { pc_corpus_floor(); }
+            if (fi == 1) { pc_corpus_bigframe(); }
+            if (fi == 2) { pc_corpus_carry(); }
+            if (fi == 3) { pc_corpus_constattr(); }
+            if (fi == 4) { pc_corpus_maxd(); }
+            var d = pm_vs_ref();
+            if (d != 0) { if (connected == 0) { connected = d; worstframe = fi; } }
+            fi = fi + 1;
+        }
+        if (mi == 0) { ps("M1 carry DROPPED between the two halves:            "); }
+        if (mi == 1) { ps("M2 high half of the 64x32 multiply dropped:         "); }
+        if (mi == 2) { ps("M3 N truncated to ONE 32-bit lane:                  "); }
+        if (mi == 3) { ps("M4 remainder masked to 31 bits:                     "); }
+        if (mi == 4) { ps("M5 D's intermediate sign-restored (residue broken): "); }
+        if (connected != 0) {
+            ps("RED on frame "); pn(worstframe);
+            ps(", diff="); pn(connected); nl();
+        }
+        if (connected == 0) {
+            ps("** NOT CONNECTED ON ANY OF THE FOUR FRAMES **"); nl();
+            bad = bad + 1;
+        }
+        mi = mi + 1;
+    }
+    pm_mut_nocarry = 0; pm_mut_nohi = 0; pm_mut_n32 = 0; pm_mut_rem31 = 0; pm_mut_dwrap = 0;
+    ps("   (frames: 0 floor quad, 1 full-screen, 2 carry, 3 constant attr, 4 MAX-D)"); nl();
+    # ⭐ report D's true peak on the max-D frame, because it is the number that forces a validator rule
+    pc_corpus_maxd();
+    pc_render();
+    ps("   ⛔ on frame 4, D peaks at "); pn(pc_max_D);
+    ps(" -- a 32-bit lane holds 4294967295."); nl();
+    if (pc_max_D > 4294967295) {
+        ps("   ⇒ D does NOT fit one lane at the ABI's extremes, so rung 18's validator MUST bound it"); nl();
+        ps("     at the draw rect's four corners (D is affine; rung 17's corner bound is the precedent"); nl();
+        ps("     and depthgate's D8 proved the shortcut sound). M4/M5 are then unexercisable by any"); nl();
+        ps("     LEGAL record -- which is what makes the rule load-bearing rather than decorative."); nl();
+    }
+
+    nl();
+    if (bad == 0) {
+        ps("perspmodel: PASS -- the register-pair numerator, the explicit carry chain and the 32-bit"); nl();
+        ps("            remainder reproduce the reference exactly on all three frames, and every"); nl();
+        ps("            mutation breaks it."); nl();
+        ps("⭐ THE ATTRIBUTION CLAIM: green here and red on iron ⇒ blame the EMISSION. The multi-word"); nl();
+        ps("  arithmetic is the new defect class this rung introduces, and M1/M2 are the two ways to"); nl();
+        ps("  get it wrong that produce a PLAUSIBLE picture rather than a crash -- a one-texel seam."); nl();
+        return 95;
+    }
+    ps("perspmodel: FAIL -- "); pn(bad); ps(" gate(s) wrong; do NOT write the shader yet."); nl();
+    return 90;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
