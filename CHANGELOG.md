@@ -140,6 +140,47 @@ number was not.
 no longer calls. It now lists the one-time-cost case **first**, because that is how the gate actually
 fired.
 
+### Added — RUNG 17 B7: `gpu_trid_prep_build`, and a selftest that shares no code with it
+
+The whole per-triangle CPU half — affine hoist, winding normalisation, `dstxy` fold, `R = 2^32/area`,
+mod-2^32 residues — into a 64-byte record laid out for four `s_load_dwordx4` at `0x0/0x10/0x20/0x30`.
+Arena: `GPU_TRID_SHADER_SUBOFF = 0x5E000` (4 KB) and `GPU_TRID_PREP_SUBOFF = 0x1E4000` (32 KB), both
+placements **derived by walking the sorted slot extents**, per this file's own *"derive the gap, don't
+spot it"*. ⚠ `0x1E4000` appears in `gpu_regs.cyr` as a past collision, but that was an 80 KB slot
+overrunning `GPU_SACRIFICIAL`; 32 KB ends at `0x1EC000` and clears it by 16 KB. `check-arena.sh` 59
+slots, 0 overlaps.
+
+⭐ **Only two edge planes are stored.** `w2` is derived in the shader as `area - w0 - w1`, exact mod
+2^32 because the three planes sum to the area identically — and `area` is **unchanged by the fold**,
+which is what keeps that identity valid in draw-local coordinates: `Σ C_i' = area + fx·ΣA_i + fy·ΣB_i`
+and both sums are identically zero.
+
+⭐ **The selftest does not re-run the hoist and compare** — two copies of one derivation agreeing is
+the shared-premise blindness that shipped rung 15's half-texel. It checks four **external** properties
+the record must have that a wrong hoist cannot produce: the affine form reproduces the **direct edge
+functions** computed from the vertices by cross product at the screen sample point (testing hoist,
+fold and winding together, against a route with no shared algebra); the derived-`w2` identity at lane
+width; the floor obligation `q*area <= zn < (q+1)*area` **by multiplication only, never a second
+divide**; and `area > 0` on every record. **256 of 256 checks**, `edge-abi-smoke` 18/18.
+
+⚠ `dst` is a parameter rather than derived from `gpu_arena_phys`, deliberately: under QEMU the arena
+base is 0, so deriving it internally would have made the hoist, the winding, the fold and the
+reciprocal all **iron-only** — exactly the split rung 9a exists to avoid.
+
+### ⛔ The selftest's first run caught the design's own rule, on my test data
+
+**192 of 256**, with triangles 0–2 green and triangle 3 failing all 64 samples on **reason 5** — the
+depth numerator — while `w0/w1/w2` matched exactly. That is the correct diagnosis, not a puzzle: the
+planes were fine and only `zn` overflowed. Triangle 3 sits at x ≈ 4000 and I had prepped it against a
+draw origin of 8, so the `dstxy` fold had nothing to cancel: `KC` stayed at **−3.33e9** and `zn`
+reached **−3.32e9** at the window corner, past a signed 32-bit lane.
+
+⇒ Such a record is **ABI-illegal** — `gpo_validate_tridepth`'s corner bound refuses it — and this is
+the same fact from the other side as B3's finding that the fold cancels translation exactly. Geometry
+must live near its own draw rect, which is precisely why `depthgate`'s OFF-ORIGIN frame moves the
+*window* with the geometry rather than leaving it at zero. Re-prepped at `dx = 4000`, `KC` comes back
+to **1,152,000** — the same number `depthmodel`'s A8 measures independently — and the run is 256/256.
+
 ### Added — RUNG 17 B6: op `0x10 GPU_OP_RT_READ`, the readback that lets the burn FAIL
 
 `gpo_validate_rtread` + `gpu_rt_read`, field mask `0x009F`, `GPU_OP_SUPPORTED` → `0x17F1F`, nine new

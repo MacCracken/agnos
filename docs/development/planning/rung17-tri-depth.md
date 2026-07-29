@@ -1,7 +1,9 @@
 # Rung 17 `tri_depth` — build plan (derived 2026-07-28, adversarially verified)
 
-> **Status (2026-07-29)**: **B0–B6 LANDED — zero burns**, `host-gpu-oracles.sh` 8/8 exit 95,
-> `check.sh` 21/21, ABI battery **136/136**, `edge-abi-smoke` 16/16. Next bite is **B7** (prep).
+> **Status (2026-07-29)**: **B0–B7 LANDED — zero burns**, `host-gpu-oracles.sh` 8/8 exit 95,
+> `check.sh` 21/21, ABI battery **136/136**, `edge-abi-smoke` 18/18, prep selftest **256/256**.
+> Next bite is **B8** — `tri_depth.s`, the blob. Its four pins must not be re-opened at transcription
+> time, and §3's register map is written down BEFORE any instruction is.
 >
 > ⛔ **B5 did not land as specified.** It asked for `GPU_OP_SUPPORTED` bit 14 with a `GPO_E_NOTIMPL`
 > worker; that advertises a non-working op through `#89`, which 1.56.24 forbids. Resolved with
@@ -626,7 +628,7 @@ Each bite is independently verifiable and lands green. **Bites 1–6 are zero-bu
 | ✅ **B4** | **external gates** G7 (constant-z silhouette vs the `tri_rgba` path) + G8 (analytic interpenetration line) | exit 95 | 0 |
 | ✅ **B5** | **ABI only** — `0x0E` constants, `gpo_validate_tridepth`, field mask, flags, `GPU_OP_SUPPORTED` bit 14, battery. Worker returns `GPO_E_NOTIMPL`. ⛔ **Landed with `GPU_OP_NOTIMPL_MASK`, not as written** — see below. | `edge_abi_selftest` **127/127**; `edge-abi-smoke` 16/16; `kprint-len-check.sh` | 0 |
 | ✅ **B6** | **`0x10 GPU_OP_RT_READ`** — ⛔ **CP-DMA MC→MC, NOT the kernel memcpy this document specifies** (see §1.5) — validator, battery, `GPU_OP_SUPPORTED` bit 16 | battery **136/136**; `edge-abi-smoke` 16/16 | 0 |
-| **B7** | `gpu_tri_depth_prep` — affine hoist, winding, `dstxy` fold, `R = 2^32/area`, corner bounds, residues, arena write; `check-arena.sh` slots | a kernel selftest diffing prep output against `depthmodel`'s hoist on all four frames | 0 |
+| ✅ **B7** | `gpu_trid_prep_build` — affine hoist, winding, `dstxy` fold, `R = 2^32/area`, residues, arena slots; `check-arena.sh` | ⛔ **NOT a diff against `depthmodel`'s hoist** (host-only, and a second copy of the same derivation) — an EXTERNAL check against the **direct edge functions** by cross product, plus the derived-w2 identity and the floor obligation by multiplication. **256/256**, smoke 18/18 | 0 |
 | **B8** | `tri_depth.s` + the §3 register map as its header block + `edgeasm` emit + `ea_vgpr_check` + `tridepth-carry.sh` + RSRC harvest + blob table + `RSRC1_TDEP` | **two independent assemblers agree**; VGPR check green; carry gate green | 0 |
 | **B9** | `gpu_tri_depth()` worker — residency at `0x5E000`, witness slot → MC, dispatch through `gpu_blend_cov_run` **unmodified** | build green; `GPU_OP_SUPPORTED` and the worker land together | 0 |
 | **B10** | ⭐ **THE BURN.** `gputri` arm: 32×32 corpus, both orders, colour via `#90`→`#73`, **z via `0x10`**, witness via `#73`. Plus the one-workgroup re-run pre-registered as the aliasing-vs-race discriminator. | byte-identical colour **and z** across orders; both match `depthcore`; every witness word self-consistent | **1** |

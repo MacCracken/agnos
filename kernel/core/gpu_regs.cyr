@@ -1243,6 +1243,23 @@ var GPU_TEXL_CM_SHADER_SUBOFF  = 0x5C000;    # residency slot 11b, rung 14b col-
 # sorted slot extents — the next occupant is GPU_BR_SRC_SUBOFF at 0x60000 — not by eye; two earlier
 # placements in this file were "obvious" gaps read off the list that turned out to collide.
 var GPU_TEXBI_SHADER_SUBOFF    = 0x5D000;    # residency slot 12, rung 15 bilinear  -> ends 0x5E000
+# ⭐ RUNG 17. A FIFTH resident blob and its own prep region. ⚠ Both placements DERIVED by walking the
+# sorted slot extents, not read off the list by eye — this file records two earlier "obvious gap"
+# placements that collided, and the lesson it drew is *derive the gap, don't spot it*.
+#   [0x5E000,0x60000) is 0x2000 free (next occupant GPU_BR_SRC_SUBOFF at 0x60000) — 4 KB taken here,
+#   4 KB left. [0x1E4000,0x1F0000) is 0xC000 free (next occupant GPU_SACRIFICIAL at 0x1F0000) — 32 KB
+#   taken, 16 KB left. ⚠ 0x1E4000 appears in this file as a PAST COLLISION, but that was an 80 KB
+#   slot overrunning GPU_SACRIFICIAL; a 32 KB slot ends at 0x1EC000 and clears it by 16 KB.
+# ⛔ Do NOT reuse GPU_TRI_COV_SUBOFF's 1 MB even though 0x0E builds no coverage mask — sharing a
+# fixed arena slot across ops is rung 12's exact failure (tex_list.s:32-39).
+var GPU_TRID_SHADER_SUBOFF     = 0x5E000;    # residency slot 13, rung 17 tri_depth  -> ends 0x5F000
+var GPU_TRID_PREP_SUBOFF       = 0x1E4000;   # 1 header + 256 records x 64 B  -> ends 0x1EC000
+# tri_depth: 32 VGPRs, 48 SGPRs. ⛔ Its OWN constant even though the value collides byte-for-byte with
+# GPU_COMPUTE_PGM_RSRC1_TRI — sharing the name would couple two kernels' occupancy, the same reason
+# RSRC1_TEXBI exists beside RSRC1_TEX. HARVEST from the assembled descriptor at B8; the value below is
+# the PREDICTION and must be replaced by the harvested one, not confirmed by eye.
+var GPU_COMPUTE_PGM_RSRC1_TDEP = 0x002C0187;
+var GPU_TRID_PREP_STRIDE       = 64;         # bytes per prep record; the header is one stride too
 var GPU_TRI_PREP_SUBOFF        = 0xE0000;    # 64 records x 128 B  -> ends 0xE2000
 var GPU_TRI_EDGE_SUBOFF        = 0xE2000;    # synthesised frame edges when DERIVE is set -> ends 0xE3000
 var GPU_TRI_COV_SUBOFF         = 0xE4000;    # 8bpp coverage scratch, 1 MB  -> ends 0x1E4000

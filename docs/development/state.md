@@ -326,10 +326,28 @@ the region is at phys `1020000000..1030000000` ≈ **64.5 GB**, and `pt_init` id
 `gpu_readback_shm_sys` `#90` already proves on iron, with its scoped **clflush BEFORE** the DMA (a
 flush after would write a dirty line back over the GPU's fresh data) and no duplicate GL2 flush —
 `gpu_batch_tail`'s ACQUIRE_MEM TCWB already covers the source side.
-▶ **REMAINING for rung 17 — FOUR bites, not "the shader"** (⚠ this line previously said *"REMAINING:
+✅ **(8) PREP (B7) — `gpu_trid_prep_build`, 256/256, smoke 18/18.** Affine hoist · winding
+normalisation · `dstxy` fold · `R = 2^32/area` · mod-2^32 residues, into a 64-byte record laid out for
+four `s_load_dwordx4`. Arena `0x5E000` (shader, 4 KB) + `0x1E4000` (prep, 32 KB), both **derived by
+walking the sorted extents** per gpu_regs.cyr's own *"derive the gap, don't spot it"*; `check-arena.sh`
+59 slots 0 overlaps. ⭐ **Only TWO edge planes are stored** — `w2 = area - w0 - w1`, and `area` is
+UNCHANGED by the fold (`Σ C_i' = area + fx·ΣA_i + fy·ΣB_i`, both sums identically zero), which is what
+keeps that identity valid in draw-local coordinates.
+⭐ **The selftest shares no code with prep**: it checks the record's affine form against the **direct
+edge functions** by cross product from the vertices, the derived-w2 identity at lane width, and the
+floor obligation by multiplication only — not a second copy of the hoist. ⚠ `dst` is a parameter, not
+`gpu_arena_phys`, so all of it runs in QEMU; deriving it internally would have made the hoist, fold,
+winding and reciprocal **iron-only**.
+⛔ **Its first run was 192/256 and caught the design's own rule on my test data**: triangle 3 at
+x≈4000 prepped against a draw origin of 8, so the fold had nothing to cancel — `KC` stayed −3.33e9 and
+`zn` hit **−3.32e9**, past the lane. `w0/w1/w2` matched exactly and only reason 5 (the numerator)
+fired, which is the correct diagnosis. Such a record is **ABI-illegal** (the corner bound refuses it);
+geometry must live near its own draw rect, which is why D6 moves the WINDOW with the geometry.
+Re-prepped at dx=4000, `KC` returns to **1,152,000** — depthmodel's A8 number, independently.
+▶ **REMAINING for rung 17 — THREE bites, not "the shader"** (⚠ this line previously said *"REMAINING:
 (2) the shader"*, which collapsed B3–B9 into one and would have put a 584-dword blob ahead of the
 program it is supposed to reproduce). Per [`planning/rung17-tri-depth.md`](planning/rung17-tri-depth.md)
-§7: **B7** prep · **B8** `tri_depth.s` · **B9** worker · **B10** the burn. The four pins must
+§7: **B8** `tri_depth.s` · **B9** worker · **B10** the burn. The four pins must
 not be re-opened at transcription time.
 
 Remaining after rung 15 — ⚠ **this list was STALE by +2 until 2026-07-28** (it still carried the

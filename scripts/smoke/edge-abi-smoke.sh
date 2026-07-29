@@ -91,6 +91,14 @@ chk "edge-abi: PASS -- the 0x08/0x09/0x0A/0x0B/0x0C/0x0D/0x0E/0x10 ABIs reject e
 # THE 9a ORACLE. The single WELL-FORMED record must reach residency and be told NOT YET. If this case
 # were absent the battery would still print 16/16 while proving only that malformed records are
 # rejected - which a function that rejected EVERYTHING would also satisfy.
+chk "trid-prep: 256 of 256 prep checks correct" \
+    "rung 17 prep reproduces the DIRECT edge functions at every sample of every triangle" \
+    "prep hoist/winding/dstxy-fold/R2 wrong - each FAIL line names its triangle, sample and reason"
+# ⭐ THE VERDICT LINE TOO, not just the count. A count line can be printed by a selftest that checked
+# nothing; the verdict is only emitted when every one of the four external properties held.
+chk "trid-prep: PASS -- the hoisted record reproduces the DIRECT edge functions at every" \
+    "the prep selftest's own verdict line is PASS" \
+    "verdict line absent or FAIL"
 chk "edge-abi: PASS well-formed record" \
     "a well-formed record is ACCEPTED, or correctly reports GPO_E_ARM where there is no GPU" \
     "the valid record did not validate; a reject fired on a record that should have passed"

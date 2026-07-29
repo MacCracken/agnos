@@ -902,6 +902,291 @@ fn gpu_depth_clear(zh, w, h, value) {
 # ⚠ The SOURCE side is the shader's GL2 writes vs CP-DMA's MC-direct read. That is `gpu_batch_tail`'s
 # ACQUIRE_MEM TCWB write-back (decision D-6), already emitted per batch — NOT duplicated here, since
 # adding a second flush would be an unproven opcode solving a problem the ring already solves.
+# ============================================================================================
+# RUNG 17 PREP — everything constant per triangle, computed ONCE on the CPU.
+# ============================================================================================
+# The shader's per-pixel path is then a few MACs and no cross products. Rung 13's record header says
+# the doctrine outright: *everything constant per triangle belongs on the CPU.*
+#
+# PER-TRIANGLE RECORD, 64 B, laid out for FOUR s_load_dwordx4 at imm offsets 0x0/0x10/0x20/0x30:
+#   +0  A0  +4  B0  +8  C0  +12 A1      (s32..s35)
+#   +16 B1  +20 C1  +24 KX  +28 KY      (s36..s39)
+#   +32 KC  +36 area +40 R   +44 colour (s40..s43)
+#   +48..+63 RESERVED, zero             (s44..s47)
+# ⭐ ONLY TWO EDGE PLANES ARE STORED. w2 is DERIVED in the shader as `area - w0 - w1`, which saves a
+# multiply-add per pixel per triangle and is exact mod 2^32 because the three planes sum to the area
+# identically. depthmodel's A6 checks that identity at lane width on every lane of every frame.
+#
+# HEADER, 64 B, at the front of the region, two s_load_dwordx4 at 0x0/0x10:
+#   +0 z base MC lo  +4 hi   +8 witness base MC lo  +12 hi
+#   +16 z pitch bytes  +20 zclear  +24 bg  +28 tiles_x   +32..+63 reserved
+# ⚠ zclear and bg are KERNEL-CHOSEN, not record fields — the `#92` record has no dword for either
+# (mask 0x01FF stops at witness_id). Dwords 9..15 are reserved and must be zero, so promoting them to
+# caller-supplied fields later is a non-breaking extension by construction.
+var GPU_TRID_ZCLEAR = 4294967295;   # 0xFFFFFFFF — behind every legal z under the UNSIGNED compare
+var GPU_TRID_BG     = 4278190080;   # 0xFF000000 — opaque black; 0x0E REPLACES its rect
+
+# gpu_trid_prep_header — write the 64-byte header at `dst`.
+fn gpu_trid_prep_header(dst, zmc, wmc, zpitch, tiles_x) {
+    store32(dst +  0, zmc & 0xFFFFFFFF);
+    store32(dst +  4, (zmc >> 32) & 0xFFFFFFFF);
+    store32(dst +  8, wmc & 0xFFFFFFFF);
+    store32(dst + 12, (wmc >> 32) & 0xFFFFFFFF);
+    store32(dst + 16, zpitch & 0xFFFFFFFF);
+    store32(dst + 20, GPU_TRID_ZCLEAR & 0xFFFFFFFF);
+    store32(dst + 24, GPU_TRID_BG & 0xFFFFFFFF);
+    store32(dst + 28, tiles_x & 0xFFFFFFFF);
+    var i = 32;
+    while (i < 64) { store32(dst + i, 0); i = i + 4; }
+    return 1;
+}
+
+# gpu_trid_prep_build(dst, vkva, nt, dx, dy) — build `nt` prep records at `dst` from the ring-3
+# vertex array at `vkva`. Returns 1, or 0 if a triangle is degenerate (which the validator already
+# refuses; this is the second gate, because THIS is the code that would divide by zero).
+#
+# ⚠ `dst` is a parameter rather than derived from the arena so this is testable with no GPU present:
+# under QEMU `gpu_arena_phys` is 0 and there is nothing to write to, which would make the prep path
+# unverifiable exactly where it is cheapest to verify.
+fn gpu_trid_prep_build(dst, vkva, nt, dx, dy) {
+    var fx = 2 * dx;
+    var fy = 2 * dy;
+    var i = 0;
+    while (i < nt) {
+        var b   = vkva + i * GPU_TRID_VTX_BYTES;
+        var rec = dst  + i * GPU_TRID_PREP_STRIDE;
+        # ⚠ vertices arrive 16.16 with zero fraction (GPO_E_SUBPIXEL rejects otherwise), and the
+        # arithmetic below lives in the DOUBLED-integer domain the reference and model prove, where a
+        # pixel centre (px + 0.5) is the exact integer 2*px + 1.
+        var dax = 2 * (gpo_i32(b +  0) >>> 16);  var day = 2 * (gpo_i32(b +  4) >>> 16);
+        var dbx = 2 * (gpo_i32(b +  8) >>> 16);  var dby = 2 * (gpo_i32(b + 12) >>> 16);
+        var dcx = 2 * (gpo_i32(b + 16) >>> 16);  var dcy = 2 * (gpo_i32(b + 20) >>> 16);
+        var z0 = load32(b + 24) & 0xFFFFFFFF;
+        var z1 = load32(b + 28) & 0xFFFFFFFF;
+        var z2 = load32(b + 32) & 0xFFFFFFFF;
+
+        # edge i opposes vertex i, matching depthcore's w0/w1/w2 assignment exactly. A permutation
+        # here still sums to the area and puts the wrong z on the wrong barycentric — rung 15's
+        # weight-swap failure one level up.
+        var a0 = 0 - (dcy - dby);  var b0 = dcx - dbx;  var c0 = (dcy - dby) * dbx - (dcx - dbx) * dby;
+        var a1 = 0 - (day - dcy);  var b1 = dax - dcx;  var c1 = (day - dcy) * dcx - (dax - dcx) * dcy;
+        var a2 = 0 - (dby - day);  var b2 = dbx - dax;  var c2 = (dby - day) * dax - (dbx - dax) * day;
+        var area = c0 + c1 + c2;
+        var kx = z0 * a0 + z1 * a1 + z2 * a2;
+        var ky = z0 * b0 + z1 * b1 + z2 * b2;
+        var kc = z0 * c0 + z1 * c1 + z2 * c2;
+
+        # ---- winding normalisation. ⛔ THE PLANES AND KX/KY/KC FLIP TOGETHER. Negating `area` alone
+        # leaves the depth numerator signed wrong; the shader's clamp then turns it into 0 — "nearest"
+        # — and a clockwise triangle silently draws in front of everything. depthmodel's M7 is exactly
+        # that mutation, and only the reversed-winding frame can see it.
+        if (area < 0) {
+            a0 = 0 - a0; b0 = 0 - b0; c0 = 0 - c0;
+            a1 = 0 - a1; b1 = 0 - b1; c1 = 0 - c1;
+            a2 = 0 - a2; b2 = 0 - b2; c2 = 0 - c2;
+            kx = 0 - kx; ky = 0 - ky; kc = 0 - kc;
+            area = 0 - area;
+        }
+        if (area == 0) { return 0; }        # would divide by zero below — the validator refuses first
+
+        # ---- fold dstxy into the constant terms, so the shader works in DRAW-LOCAL coordinates and
+        # never sees dstxy. Substituting `pxq = lxq + 2*dx` into `A*pxq + B*pyq + C` gives
+        # `A*lxq + B*lyq + (C + 2*dx*A + 2*dy*B)`.
+        # ⭐ `area` is UNCHANGED by the fold, and that is what keeps `w2 = area - w0 - w1` valid in
+        # draw-local coordinates: sum(C_i') = area + fx*sum(A_i) + fy*sum(B_i), and both sums are
+        # identically zero because the edge functions' x and y terms cancel.
+        c0 = c0 + fx * a0 + fy * b0;
+        c1 = c1 + fx * a1 + fy * b1;
+        kc = kc + fx * kx + fy * ky;
+
+        # ---- R2's reciprocal. area >= 4 (GPU_TRI_AREA_MIN forbids cross == 0, and area = 4*cross),
+        # so R <= 2^30 and fits u32. depthdiv proves q_est in {Q-1, Q} for every zn < 2^32 and every
+        # divisor >= 2, which is what makes the shader's SINGLE one-sided correction exact.
+        var rr = 4294967296 / area;
+
+        # ⚠ STORED AS mod-2^32 RESIDUES, deliberately. The corner bound (gpo_validate_tridepth) is
+        # what guarantees the RESULT fits a 32-bit lane; the coefficients themselves need not, and
+        # mod-2^32 is a ring homomorphism so the reconstruction is exact. ⛔ Do NOT "fix" this later by
+        # validating |KC| < 2^31 — that would refuse legal triangles. depthmodel's A5/A11 witness it.
+        store32(rec +  0, a0 & 0xFFFFFFFF);
+        store32(rec +  4, b0 & 0xFFFFFFFF);
+        store32(rec +  8, c0 & 0xFFFFFFFF);
+        store32(rec + 12, a1 & 0xFFFFFFFF);
+        store32(rec + 16, b1 & 0xFFFFFFFF);
+        store32(rec + 20, c1 & 0xFFFFFFFF);
+        store32(rec + 24, kx & 0xFFFFFFFF);
+        store32(rec + 28, ky & 0xFFFFFFFF);
+        store32(rec + 32, kc & 0xFFFFFFFF);
+        store32(rec + 36, area & 0xFFFFFFFF);
+        store32(rec + 40, rr & 0xFFFFFFFF);
+        store32(rec + 44, load32(b + 36) & 0xFFFFFFFF);   # flat colour, premultiplied ARGB
+        var p = 48;
+        while (p < 64) { store32(rec + p, 0); p = p + 4; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+#ifdef EDGE_ABI_SELFTEST
+# ============================================================================================
+# gpu_trid_prep_selftest — rung 17 prep, checked against a formulation that SHARES NO CODE.
+# ============================================================================================
+# ⛔ IT DOES NOT RE-RUN THE HOIST AND COMPARE. Two copies of the same derivation agreeing is the
+# shared-premise blindness that shipped rung 15's half-texel with four green gates. What is checked
+# here are EXTERNAL invariants — properties the record must have that a wrong hoist cannot produce:
+#
+#   P1  the record's AFFINE form reproduces the DIRECT edge functions, evaluated from the vertices by
+#       cross products at the SCREEN sample point, at draw-local sample points. This tests the hoist,
+#       the dstxy fold and the winding normalisation together, against a route with no shared algebra.
+#   P2  `w0 + w1 + w2 == area` at 32-bit lane width — the identity the shader's DERIVED w2 rests on.
+#   P3  the stored R satisfies the floor obligation `q*area <= zn < (q+1)*area` **by multiplication
+#       only, never a second divide**, with the single one-sided correction depthdiv proves exact.
+#   P4  area > 0 on every record, which winding normalisation is what guarantees.
+#
+# ⚠ Runs with NO GPU: prep writes to a plain buffer, so QEMU exercises all of it.
+var trid_vtx_buf[24];      # 4 triangles x 48 B
+var trid_prep_buf[32];     # 4 records x 64 B
+
+fn trid_lane(v) {
+    var m = v & 0xFFFFFFFF;
+    if (m >= 2147483648) { m = m - 4294967296; }
+    return m;
+}
+
+fn trid_vtx(t, x0, y0, z0, x1, y1, z1, x2, y2, z2, col) {
+    var b = &trid_vtx_buf + t * GPU_TRID_VTX_BYTES;
+    store32(b +  0, (x0 * 65536) & 0xFFFFFFFF); store32(b +  4, (y0 * 65536) & 0xFFFFFFFF);
+    store32(b +  8, (x1 * 65536) & 0xFFFFFFFF); store32(b + 12, (y1 * 65536) & 0xFFFFFFFF);
+    store32(b + 16, (x2 * 65536) & 0xFFFFFFFF); store32(b + 20, (y2 * 65536) & 0xFFFFFFFF);
+    store32(b + 24, z0); store32(b + 28, z1); store32(b + 32, z2);
+    store32(b + 36, col); store32(b + 40, 0); store32(b + 44, 0);
+    return 0;
+}
+
+# the DIRECT edge function, from the vertices, by cross product — no plane, no hoist, no fold
+fn trid_edge(ax, ay, bx, by, qx, qy) { return (bx - ax) * (qy - ay) - (by - ay) * (qx - ax); }
+
+fn gpu_trid_prep_check(t, dx, dy, lx, ly) {
+    var b   = &trid_vtx_buf  + t * GPU_TRID_VTX_BYTES;
+    var rec = &trid_prep_buf + t * GPU_TRID_PREP_STRIDE;
+    var lxq = 2 * lx + 1;
+    var lyq = 2 * ly + 1;
+    # SCREEN sample point for the direct form -- the fold is what must reconcile the two
+    var qx = 2 * (dx + lx) + 1;
+    var qy = 2 * (dy + ly) + 1;
+    var dax = 2 * (gpo_i32(b +  0) >>> 16);  var day = 2 * (gpo_i32(b +  4) >>> 16);
+    var dbx = 2 * (gpo_i32(b +  8) >>> 16);  var dby = 2 * (gpo_i32(b + 12) >>> 16);
+    var dcx = 2 * (gpo_i32(b + 16) >>> 16);  var dcy = 2 * (gpo_i32(b + 20) >>> 16);
+    var e0 = trid_edge(dbx, dby, dcx, dcy, qx, qy);
+    var e1 = trid_edge(dcx, dcy, dax, day, qx, qy);
+    var e2 = trid_edge(dax, day, dbx, dby, qx, qy);
+    var ar = e0 + e1 + e2;
+    var zn = e0 * (load32(b + 24) & 0xFFFFFFFF)
+           + e1 * (load32(b + 28) & 0xFFFFFFFF)
+           + e2 * (load32(b + 32) & 0xFFFFFFFF);
+    if (ar < 0) { e0 = 0 - e0; e1 = 0 - e1; e2 = 0 - e2; ar = 0 - ar; zn = 0 - zn; }
+
+    var ra = trid_lane(load32(rec + 36) & 0xFFFFFFFF);
+    var w0 = trid_lane((load32(rec +  0) & 0xFFFFFFFF) * lxq
+                     + (load32(rec +  4) & 0xFFFFFFFF) * lyq
+                     + (load32(rec +  8) & 0xFFFFFFFF));
+    var w1 = trid_lane((load32(rec + 12) & 0xFFFFFFFF) * lxq
+                     + (load32(rec + 16) & 0xFFFFFFFF) * lyq
+                     + (load32(rec + 20) & 0xFFFFFFFF));
+    var w2 = trid_lane(ra - w0 - w1);
+    var zl = trid_lane((load32(rec + 24) & 0xFFFFFFFF) * lxq
+                     + (load32(rec + 28) & 0xFFFFFFFF) * lyq
+                     + (load32(rec + 32) & 0xFFFFFFFF));
+    # P4 / P1 / P2
+    if (ra <= 0)  { return 1; }
+    if (w0 != e0) { return 2; }
+    if (w1 != e1) { return 3; }
+    if (w2 != e2) { return 4; }
+    if (zl != zn) { return 5; }
+    if (trid_lane(w0 + w1 + w2) != ra) { return 6; }
+    # P3 -- the floor obligation, by MULTIPLICATION only. Only meaningful where zn >= 0, which the
+    # shader's v_max_i32 clamp guarantees for every lane that can affect output.
+    if (zl >= 0) {
+        var rr = load32(rec + 40) & 0xFFFFFFFF;
+        var q  = (zl * rr) >>> 32;
+        if (zl - q * ra >= ra) { q = q + 1; }        # the ONE one-sided correction
+        if (q * ra > zl) { return 7; }               # overshoot: the no-overshoot proof is wrong
+        if (zl >= (q + 1) * ra) { return 8; }        # undershoot: one correction was not enough
+    }
+    return 0;
+}
+
+fn gpu_trid_prep_selftest() {
+    kprintln("trid-prep: ---- rung 17 prep vs DIRECT edge functions ----", 58);
+    var bad = 0;
+    var cases = 0;
+    # four triangles: the corpus pair, its winding REVERSED (so normalisation must fire), and a
+    # far-from-origin one (so the fold and the residues carry real magnitude)
+    trid_vtx(0,  2, 2, 100,  28,  4, 900,   4, 28, 100, 0xFFFF0000);
+    trid_vtx(1,  2, 4, 900,  28,  2, 100,  28, 28, 900, 0xFF0000FF);
+    trid_vtx(2,  2, 2, 100,   4, 28, 100,  28,  4, 900, 0xFFFF0000);   # b<->c swapped
+    trid_vtx(3, 4002, 2, 1000, 4028, 4, 9000, 4004, 28, 1000, 0xFF00FF00);
+    var dx = 8;
+    var dy = 16;
+    # ⛔⛔ TWO PREP PASSES, BECAUSE GEOMETRY MUST LIVE NEAR ITS OWN DRAW RECT — and the first version
+    # of this selftest got that wrong, which is worth recording rather than quietly fixing. Triangle 3
+    # sits at x ~ 4000; prepped against a draw origin of 8 the `dstxy` fold has nothing to cancel, so
+    # KC stays at -3.33e9 and `zn` reaches **-3.32e9 at the window corner** — past a signed 32-bit
+    # lane. The check reported reason 5 on all 64 of its samples while w0/w1/w2 matched exactly, which
+    # is exactly the right diagnosis: the PLANES were fine and only the depth numerator overflowed.
+    # ⭐ That is the corner bound (gpo_validate_tridepth) doing its job on synthetic data — such a
+    # record is ABI-ILLEGAL and the validator refuses it — and it is why depthgate's OFF-ORIGIN frame
+    # moves the WINDOW with the geometry (dc_ox = DC_OFF_X) rather than leaving it at zero.
+    # ⇒ triangles 0-2 at a near origin; triangle 3 at dx = 4000, where the fold brings KC back to
+    # 1,152,000 — the same number depthmodel's A8 measures — and zn back to ~1.5e6.
+    var dx3 = 4000;
+    var dy3 = 0;
+    if (gpu_trid_prep_build(&trid_prep_buf, &trid_vtx_buf, 3, dx, dy) != 1) {
+        kprintln("trid-prep: FAIL -- prep refused a well-formed triangle", 54);
+        return 0;
+    }
+    if (gpu_trid_prep_build(&trid_prep_buf + 3 * GPU_TRID_PREP_STRIDE,
+                            &trid_vtx_buf  + 3 * GPU_TRID_VTX_BYTES, 1, dx3, dy3) != 1) {
+        kprintln("trid-prep: FAIL -- prep refused the off-origin triangle", 55);
+        return 0;
+    }
+    var t = 0;
+    while (t < 4) {
+        var cdx = dx;
+        var cdy = dy;
+        if (t == 3) { cdx = dx3; cdy = dy3; }
+        var ly = 0;
+        while (ly < 8) {
+            var lx = 0;
+            while (lx < 8) {
+                var rc = gpu_trid_prep_check(t, cdx, cdy, lx, ly);
+                cases = cases + 1;
+                if (rc != 0) {
+                    if (bad < 4) {
+                        kprint("trid-prep: FAIL tri ", 20); kprint_num(t);
+                        kprint(" at local ", 10); kprint_num(lx); kprint(",", 1); kprint_num(ly);
+                        kprint(" reason ", 8); kprint_num(rc); kprintln("", 0);
+                    }
+                    bad = bad + 1;
+                }
+                lx = lx + 1;
+            }
+            ly = ly + 1;
+        }
+        t = t + 1;
+    }
+    kprint("trid-prep: ", 11); kprint_num(cases - bad); kprint(" of ", 4); kprint_num(cases);
+    kprintln(" prep checks correct", 20);
+    if (bad != 0) {
+        kprintln("trid-prep: FAIL -- see the named case(s) above", 46);
+        return 0;
+    }
+    kprintln("trid-prep: PASS -- the hoisted record reproduces the DIRECT edge functions at every", 83);
+    kprintln("trid-prep: sample, the derived-w2 identity holds, and R meets the floor obligation.", 83);
+    return 1;
+}
+#endif
+
 fn gpu_rt_read(zh, dst_id, w, h, zw) {
     if (gpu_rt_arm() != 1) { return 0; }
     var src_mc = gpu_rt_handle_mc(zh);

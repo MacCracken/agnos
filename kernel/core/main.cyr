@@ -1212,6 +1212,11 @@ atom_math_selftest();
 # free) and 9b (shader, iron). Nesting it under a GPU gate would make it iron-only and hand back the
 # burn the split was created to save. Cf. ATOM_MATH_SELFTEST above, same mistake, same fix.
 edge_abi_selftest();
+# ⭐ RUNG 17's PREP, same reasoning one bite later: gpu_trid_prep_build touches no MMIO and writes to
+# a plain buffer rather than the arena, so the hoist, the winding normalisation, the dstxy fold and
+# the R2 reciprocal are all provable in QEMU at zero flashes. Deriving `dst` from gpu_arena_phys
+# instead would have made every one of them iron-only.
+gpu_trid_prep_selftest();
 #endif
 
 #ifdef ATOM_INSTR_SELFTEST
