@@ -247,15 +247,34 @@ run. (b) The plan's OFF-ORIGIN **x = 700 gives |KC| = 58,124,800 — 26 bits, in
 would never have exercised the residue it exists for. `KC' = KC - 2*T*KX` and `KX` scales with **z**,
 not position ⇒ landed at **x = 4000 AND z x10**, `|KC| = 3,326,848,000`, with **A8 asserting the
 overflow**.
-▶ **REMAINING for rung 17 — SEVEN bites, not "the shader"** (⚠ this line previously said *"REMAINING:
+✅ **(4) THE SHIPPING PROGRAM (B3), ALL FIVE CHANGES IN ONE BITE** — winding normalisation · `dstxy`
+folded into the constant terms · `w2` **derived** (`area - w0 - w1`) · the `v_max_i32` domain clamp ·
+**unsigned** depth compare. ⛔ *One bite by necessity*: each changes the program the byte-identity
+proof covers, so a split would prove a different program than the one that flashes. **Three of the
+five are invisible to a plain reference diff**, so each got the gate that can actually see it:
+**A12/D9** winding is a *labelling convention* — reversing it must change nothing, and `wind_flips`
+(**2048 vs 0**) separates "fired and was right" from "never fired" · **M7** normalise but forget to
+flip `KX/KY/KC` → RED (diff 567) · **A10** the clamp fires on **10 lanes, 0 of them inside** (it is
+the identity where it matters *by construction*, so output diffing can never witness it — a counter
+is the only honest gate) · **A9** at the hardware far value the unsigned compare draws **507 px and
+the signed one draws 0**, demonstrating the rung's worst wrong pick rather than asserting it ·
+**D8** the validator's four-corner shortcut proven against brute force (**4,836,800 == 4,836,800**,
+independently equal to `depthmodel`'s A4 peak).
+⛔⛔ **AND B3 FALSIFIED THE PLAN'S RESIDUE ARGUMENT — it named the wrong term.** §4.2 said
+`KX = Σ A_i z_i` "reaches ~2^39 and does not fit an i32". Two things it did not account for: **the
+`dstxy` fold makes the record draw-local and cancels position EXACTLY** (measured: off-origin `KC` is
+−3,326,848,000 before the fold, **+1,152,000** after — the origin corpus's KC × the z-scale, to the
+digit), so distance from the origin cannot enlarge a shipping record; and **the corner bound then
+pins the rest** — differencing two corners of the affine `zn` gives `|KX| < 2^32/(2w−2)` < 3.1e8 even
+at the smallest legal `w`, so **`KX` and `KY` ALWAYS fit** and only `KC` can exceed 2^31, by at most
+the `|KX|+|KY|` margin. ⇒ A8 re-aimed at the **fold identity** (which is what the frame really
+proves) and a new **A11** exercises residue reconstruction directly at the unfolded |KC| = 3.33e9.
+▶ **REMAINING for rung 17 — SIX bites, not "the shader"** (⚠ this line previously said *"REMAINING:
 (2) the shader"*, which collapsed B3–B9 into one and would have put a 584-dword blob ahead of the
 program it is supposed to reproduce). Per [`planning/rung17-tri-depth.md`](planning/rung17-tri-depth.md)
-§7: **B3** reshape reference+model to the shipping program (winding normalisation, `dstxy` fold,
-derived `w2`, `v_max` clamp, unsigned compare) — ⛔ *must land in ONE bite, or the byte-identity proof
-covers a different program than the one that flashes* · **B4** external gates G7/G8 · **B5** ABI
-`0x0E` · **B6** `0x10 GPU_OP_RT_READ` (**blocking**: without a z readback the burn cannot fail on a
-broken divide) · **B7** prep · **B8** `tri_depth.s` · **B9** worker · **B10** the burn. The four pins
-must not be re-opened at transcription time.
+§7: **B4** external gates G7/G8 · **B5** ABI `0x0E` · **B6** `0x10 GPU_OP_RT_READ` (**blocking**:
+without a z readback the burn cannot fail on a broken divide) · **B7** prep · **B8** `tri_depth.s` ·
+**B9** worker · **B10** the burn. The four pins must not be re-opened at transcription time.
 
 Remaining after rung 15 — ⚠ **this list was STALE by +2 until 2026-07-28** (it still carried the
 pre-renumbering mapping and collapsed rungs 17/18/19 into one cut); [`planning/gpu.md`](planning/gpu.md)

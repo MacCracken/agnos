@@ -1,18 +1,24 @@
 # Rung 17 `tri_depth` — build plan (derived 2026-07-28, adversarially verified)
 
-> **Status (2026-07-29)**: **B0, B1, B2 LANDED — zero burns**, `host-gpu-oracles.sh` 8/8 exit 95,
-> `check.sh` 21/21. Next bite is **B3** (reshape `depthcore`+`depthmodel` to the shipping program).
+> **Status (2026-07-29)**: **B0, B1, B2, B3 LANDED — zero burns**, `host-gpu-oracles.sh` 8/8 exit 95,
+> `check.sh` 21/21. Next bite is **B4** (the external gates G7/G8).
 > ⛔ **The shader is B8, not "what's left"** — `state.md` briefly said "REMAINING: (2) the shader",
 > which collapsed seven bites into one; corrected.
 >
-> ⚠ **Three numbers in this document did not survive being measured**, all in the same direction —
-> a frame that names a property and cannot witness it. Each is corrected inline where it appears:
-> the PRECISION span (§6.3.1, sensitivity is **not monotone** — span 1 flips zero), the OFF-ORIGIN
-> parameters (§6.3.3, x=700 leaves `|KC|` **inside** an i32), and the QUAD gate's number (§6.3.2,
-> `D3` collides with the shipped determinism gate). B0 also found two defects this document did not
-> predict: `depthmodel` evaluated `zn` **only inside the triangle** while the shader is predicated
-> and evaluates every lane, and A4 bounded the numerator against **2^32-1 rather than 2^31-1**, so a
-> value that sign-restores negative would have passed A4 while failing the compare it feeds.
+> ⚠ **Four numbers in this document did not survive being measured**, all in the same direction —
+> a frame or a bound that names a property and cannot witness it. Each is corrected inline where it
+> appears: the PRECISION span (§6.3.1, sensitivity is **not monotone** — span 1 flips zero), the
+> OFF-ORIGIN parameters (§6.3.3, x=700 leaves `|KC|` **inside** an i32), the QUAD gate's number
+> (§6.3.2, `D3` collides with the shipped determinism gate), and the residue magnitude argument
+> (§4.2, `KX` **always** fits under the corner bound; the `dstxy` fold cancels position exactly).
+>
+> B0/B3 also found four defects this document did not predict: `depthmodel` evaluated `zn` **only
+> inside the triangle** while the shader is predicated and evaluates every lane; A4 bounded the
+> numerator against **2^32-1 rather than 2^31-1**, so a value that sign-restores negative would have
+> passed A4 while failing the compare it feeds; the winding normalisation §2.5 asks for is **dead
+> code on every frame in the tree** (both corpus triangles wind positive, areas 2688 and 2704); and
+> the `v_max_i32` clamp is **unwitnessable by output diffing** by construction, so it needs a fire
+> counter rather than a mutation.
 >
 > Produced by a 4-lens investigation + 3 adversarial attackers over the shipped tree. ⚠ Numbers
 > attributed to agents are **not** independently verified unless marked MEASURED-BY-MAINTAINER below.
@@ -384,7 +390,11 @@ Per record: build the 64-byte header. Per triangle:
 6. assert `zclear >= GPU_TRID_ZCLEAR_MIN`;
 7. store `A/B/C`, `KX/KY/KC` as **mod-2^32 residues**.
 
-⚠ **The residues are deliberate and must be documented as such.** `KX = Σ A_i z_i` reaches ~2^39 at legal inputs and does not fit an i32 field. Storing residues is exact because mod-2^32 is a ring homomorphism *and* the corner bound guarantees the **result** fits a 32-bit lane. Without the comment, a later "fix" that validates `|KC| < 2^31` will refuse legal triangles. The shipped corpus sits at `x ∈ [2,28]` where `|KC| = 115,200` — the exact null set of this error.
+⚠ **The residues are deliberate and must be documented as such.** Storing residues is exact because mod-2^32 is a ring homomorphism *and* the corner bound guarantees the **result** fits a 32-bit lane. Without the comment, a later "fix" that validates `|KC| < 2^31` will refuse legal triangles.
+
+> ⛔ **THE MAGNITUDE ARGUMENT HERE IS WRONG, MEASURED AT B3, AND IT MATTERS BECAUSE IT NAMES THE WRONG TERM.** This paragraph said "`KX = Σ A_i z_i` reaches ~2^39 at legal inputs". That is the bound with *nothing else assumed* — but two things are assumed. **(1) The `dstxy` fold makes the record DRAW-LOCAL, and it cancels position exactly**: measured, the off-origin frame's `KC` is `-3,326,848,000` before the fold and `+1,152,000` after — precisely the origin corpus's `KC` scaled by z, because the fold adds `2·dx·KX` and the vertex translation subtracted it. ⇒ **moving geometry away from the origin cannot enlarge a shipping record's constants.** **(2) The corner bound then pins the rest.** `zn = KX·lxq + KY·lyq + KC` is affine and bounded by 2^31 at all four corners; differencing two corners gives `|KX| < 2^32/(2w-2)` — under 3.1e8 even for the smallest legal `w = 8` — and likewise `KY`. ⇒ **`KX` and `KY` always fit a signed 32-bit field**, and only `KC` can exceed 2^31, by at most the `|KX|+|KY|` margin. The residue is still required, but for one term in a narrow band, not for a 39-bit `KX`.
+>
+> ⇒ Gate **A8** was rewritten to assert the *fold identity* (`folded KC == origin KC × z-scale`, which is what the off-origin frame actually proves), and a new **A11** exercises residue reconstruction directly at the unfolded `|KC| = 3.33e9` rather than through a frame that can no longer reach one.
 
 ### 4.3 Outline
 
@@ -600,7 +610,7 @@ Each bite is independently verifiable and lands green. **Bites 1–6 are zero-bu
 | ✅ **B0** | `depthmodel` lane-fidelity fix (mask `zn`, `KX/KY/KC`, `area` to 32-bit lanes + sign restore) | `host-gpu-oracles.sh` exit 95 | 0 |
 | ✅ **B1** | `depthdiv.cyr` — R2 exactness gate + adversarial frame + 5 mutations | exit 95; printed table shows transplant green-on-corpus / RED-on-adversarial | 0 |
 | ✅ **B2** | ⭐ corpus: PRECISION + QUAD + OFF-ORIGIN frames; depthgate D0d / D5 / D0e; coverage print | exit 95; **D5 shows the two orders DIFFERING** | 0 |
-| **B3** | reshape `depthcore`+`depthmodel` to the shipping program (winding normalisation, `dstxy` fold, derived `w2`, `v_max` clamp, unsigned compare, no min-bias) + G6 corner bound | byte-identical colour AND z, both orders, all frames | 0 |
+| ✅ **B3** | reshape `depthcore`+`depthmodel` to the shipping program (winding normalisation, `dstxy` fold, derived `w2`, `v_max` clamp, unsigned compare, no min-bias) + G6 corner bound | byte-identical colour AND z, both orders, all frames | 0 |
 | **B4** | **external gates** G7 (constant-z silhouette vs the `tri_rgba` path) + G8 (analytic interpenetration line) | exit 95 | 0 |
 | **B5** | **ABI only** — `0x0E` constants, `gpo_validate_tridepth`, field mask, flags, `GPU_OP_SUPPORTED` bit 14, battery. Worker returns `GPO_E_NOTIMPL`. | `edge_abi_selftest` N of N; `kprint-len-check.sh` | 0 |
 | **B6** | **`0x10 GPU_OP_RT_READ`** — kernel memcpy from `gpu_rt_base_phys`, validator, battery, `GPU_OP_SUPPORTED` bit 16 | battery + a QEMU/mirshi round-trip against a `0x0D`-cleared handle | 0 |

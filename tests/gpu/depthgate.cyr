@@ -52,6 +52,29 @@ fn dg_render_order(swap): i64 {
 # the precision frame. ⚠ +1 on all three vertex z of a triangle shifts its interpolated z by exactly
 # one everywhere, which is the realistic shape of a divide that is short by one -- the same shape as
 # depthmodel's dm_mut_ulp, not a quantisation.
+# dg_absmax_at(t, px, py) — the largest |value| among w0, w1, w2 and zn for triangle `t` at one
+# pixel. ⚠ Evaluated UNCONDITIONALLY, inside the triangle or not: the shader is predicated and runs
+# every lane, so the bound the validator needs is over the whole draw rect, not over the covered set.
+fn dg_absmax_at(t, px, py): i64 {
+    var pxq = 2 * (dc_ox + px) + 1;
+    var pyq = 2 * (dc_oy + py) + 1;
+    var ax = 2 * dc_get(t, 0); var ay = 2 * dc_get(t, 1);
+    var bx = 2 * dc_get(t, 3); var by = 2 * dc_get(t, 4);
+    var cx = 2 * dc_get(t, 6); var cy = 2 * dc_get(t, 7);
+    var w0 = dc_edge(bx, by, cx, cy, pxq, pyq);
+    var w1 = dc_edge(cx, cy, ax, ay, pxq, pyq);
+    var w2 = dc_edge(ax, ay, bx, by, pxq, pyq);
+    var zn = w0 * dc_get(t, 2) + w1 * dc_get(t, 5) + w2 * dc_get(t, 8);
+    var m = w0; if (m < 0) { m = 0 - m; }
+    var a = w1; if (a < 0) { a = 0 - a; }
+    if (a > m) { m = a; }
+    a = w2; if (a < 0) { a = 0 - a; }
+    if (a > m) { m = a; }
+    a = zn; if (a < 0) { a = 0 - a; }
+    if (a > m) { m = a; }
+    return m;
+}
+
 fn dg_ulp_flips(span): i64 {
     dc_corpus_precision_span(span, 0);
     dc_render(DC_W, DC_H, DC_FAR, DC_BG);
@@ -376,6 +399,92 @@ fn main(): i64 {
     ps(" are byte-identical for a shader that never ran: ");
     if (tdual >= 4) { ps("PASS"); nl(); }
     if (tdual < 4) { ps("FAIL -- too few discriminating tiles to interpret a burn"); nl(); bad = bad + 1; }
+
+    # ---- D8: THE CORNER BOUND, and the shortcut it rests on, PROVEN rather than assumed ---------
+    # ⭐ The validator (plan 1.4 rule 18) will bound `w0 w1 w2 zn` by evaluating them at the FOUR
+    # CORNERS of the draw rect only, on the grounds that all four are affine in (x,y) so their
+    # extremes must lie at corners. That reasoning is correct but it is *reasoning*, and it is the
+    # only thing standing between an ABI-legal record and a 32-bit lane silently wrapping. So D8
+    # checks it against brute force: the corner maximum must EQUAL the maximum over every pixel of
+    # the rect. If a cheaper bound is ever substituted, this is what refuses it.
+    # ⛔ An attacker found a triangle that passes every other proposed rule and peaks at 1.52x a
+    # 32-bit lane over its own bounding box while its INSIDE peak is legal -- which is why this
+    # evaluates unconditionally and why an inside-only bound is not a bound at all.
+    dg_render_order(0);
+    var cmax = 0;
+    var fmax = 0;
+    var td = 0;
+    while (td < dc_n) {
+        var c1 = dg_absmax_at(td, 0, 0);
+        var c2 = dg_absmax_at(td, DC_W - 1, 0);
+        var c3 = dg_absmax_at(td, 0, DC_H - 1);
+        var c4 = dg_absmax_at(td, DC_W - 1, DC_H - 1);
+        if (c1 > cmax) { cmax = c1; }
+        if (c2 > cmax) { cmax = c2; }
+        if (c3 > cmax) { cmax = c3; }
+        if (c4 > cmax) { cmax = c4; }
+        var fy2 = 0;
+        while (fy2 < DC_H) {
+            var fx2 = 0;
+            while (fx2 < DC_W) {
+                var v = dg_absmax_at(td, fx2, fy2);
+                if (v > fmax) { fmax = v; }
+                fx2 = fx2 + 1;
+            }
+            fy2 = fy2 + 1;
+        }
+        td = td + 1;
+    }
+    ps("D8  corner bound "); pn(cmax); ps(" == brute-force whole-rect maximum "); pn(fmax);
+    ps(", both under 2^31: ");
+    if (cmax == fmax) {
+        if (cmax < 2147483648) { ps("PASS -- the four-corner shortcut is sound on real data"); nl(); }
+    }
+    if (cmax != fmax) {
+        ps("FAIL -- the extreme is NOT at a corner, so the validator's rule is unsound"); nl();
+        bad = bad + 1;
+    }
+    if (cmax == fmax) {
+        if (cmax >= 2147483648) {
+            ps("FAIL -- the corpus itself exceeds a 32-bit lane"); nl();
+            bad = bad + 1;
+        }
+    }
+
+    # ---- D9: WINDING IS A LABELLING CONVENTION, and the normalisation must actually run ---------
+    # ⛔ Both shipped triangles wind POSITIVE (areas 2688 and 2704) and every derived frame inherits
+    # it, so before this frame existed the normalisation added at B3 was dead code in every test in
+    # the tree. `dc_wind_flips` separates "fired and was right" from "never fired".
+    dg_render_order(0);
+    dc_snapshot(DC_W, DC_H);
+    var wfn = dc_wind_flips;
+    dc_corpus_reversed(0);
+    dc_render(DC_W, DC_H, DC_FAR, DC_BG);
+    var d9 = dc_diff(DC_W, DC_H);
+    var wfr = dc_wind_flips;
+    ps("D9  REVERSED winding renders identically (diff="); pn(d9); ps("); normalisation fired ");
+    pn(wfr); ps(" times vs "); pn(wfn); ps(" on the normal frame: ");
+    if (d9 == 0) {
+        if (wfr > 0) {
+            if (wfn == 0) { ps("PASS"); nl(); }
+        }
+    }
+    if (d9 != 0) {
+        ps("FAIL -- relabelling two vertices changed the image, which no correct raster can do"); nl();
+        bad = bad + 1;
+    }
+    if (d9 == 0) {
+        if (wfr == 0) {
+            ps("** NOT CONNECTED: the normalisation never ran on the reversed frame **"); nl();
+            bad = bad + 1;
+        }
+    }
+    if (d9 == 0) {
+        if (wfn != 0) {
+            ps("** the NORMAL frame also flipped -- the two frames are not distinct **"); nl();
+            bad = bad + 1;
+        }
+    }
 
     nl();
     if (bad == 0) {

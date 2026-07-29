@@ -54,6 +54,11 @@ var dc_n = 0;
 var dc_cbuf[512];                # 32*32 u32 colour
 var dc_zbuf[512];                # 32*32 u32 depth
 var dc_ties = 0;                 # pixels where two triangles interpolated to EXACTLY equal z
+# ⭐ How many times the winding normalisation actually FIRED. Without it, "the normalisation is
+# correct" and "the normalisation is dead code" produce the identical green -- and on the shipped
+# corpus it IS dead code, because both triangles wind positive (areas 2688 and 2704). Same doctrine
+# as depthdiv's correction-fire count and rung 9b's clamp-hit counter.
+var dc_wind_flips = 0;
 
 # ⭐ THE RENDER WINDOW'S ORIGIN, in screen pixels. `dc_render` walks a w x h window whose top-left
 # screen pixel is (dc_ox, dc_oy); the sample point is the SCREEN pixel centre, so the arithmetic sees
@@ -106,6 +111,7 @@ fn dc_edge(ax, ay, bx, by, pxq, pyq): i64 {
 fn dc_render(w, h, zclear, bg): i64 {
     var written = 0;
     dc_ties = 0;
+    dc_wind_flips = 0;
     var py = 0;
     while (py < h) {
         var px = 0;
@@ -125,15 +131,28 @@ fn dc_render(w, h, zclear, bg): i64 {
                 var w1 = dc_edge(cx, cy, ax, ay, pxq, pyq);
                 var w2 = dc_edge(ax, ay, bx, by, pxq, pyq);
                 var area = w0 + w1 + w2;
+                # ---- ⭐ WINDING NORMALISATION (plan 2.5, landed at bite B3) --------------------
+                # A clockwise triangle has area < 0 and all three edge functions <= 0 inside it. The
+                # shader CANNOT carry that second case: every reciprocal path requires area > 0, and
+                # `R = floor(2^32/area)` on a negative area is meaningless. So the sign is normalised
+                # once per triangle -- negate the three edge values and the area together -- and the
+                # inside test collapses to a single uniform `w_i >= 0`.
+                # ⭐ EXACT, not approximately equivalent: negating both numerator and denominator
+                # leaves `zn/area` unchanged, and inside the triangle `zn >= 0` and `area > 0`, so
+                # truncation and floor agree. The rendered image must therefore be BYTE-IDENTICAL to
+                # the two-branch form -- which is what makes this a safe restructuring rather than a
+                # behavioural change, and D9 proves it on a frame where the flip actually fires.
+                if (area < 0) {
+                    w0 = 0 - w0; w1 = 0 - w1; w2 = 0 - w2; area = 0 - area;
+                    dc_wind_flips = dc_wind_flips + 1;
+                }
                 # ⚠ REJECT DEGENERATE TRIANGLES rather than dividing by zero. A zero-area triangle
                 # covers nothing; silently skipping it is the correct raster answer, and the guard
-                # has to exist because the corpus is allowed to contain one.
+                # has to exist because the corpus is allowed to contain one. `area > 0` below is the
+                # guard: after normalisation the only remaining bad case is exactly zero.
                 var inside = 0;
                 if (area > 0) {
                     if (w0 >= 0) { if (w1 >= 0) { if (w2 >= 0) { inside = 1; } } }
-                }
-                if (area < 0) {
-                    if (w0 <= 0) { if (w1 <= 0) { if (w2 <= 0) { inside = 1; } } }
                 }
                 if (inside == 1) {
                     # ⭐ EXACT integer barycentric interpolation of z. The reference divides exactly;
@@ -348,6 +367,32 @@ fn dc_corpus_quad(swap): i64 {
 # byte-identity against the translated original is BLIND to a half-pixel convention error -- which is
 # exactly why the plan rejects translation equivariance as *the* external gate (6.2). It is used here
 # for the residue and corner-bound domains it opens, and for nothing else.
+# dc_corpus_reversed(swap) — the interpenetrating pair with the winding of BOTH triangles reversed
+# (vertices b and c swapped), so `area < 0` and the normalisation path is the one that runs.
+#
+# ⛔⛔ WITHOUT THIS FRAME THE WINDING NORMALISATION IS DEAD CODE IN EVERY TEST IN THIS TREE. Both
+# shipped triangles wind positive (areas 2688 and 2704), and so do the precision, quad and off-origin
+# frames, which are all derived from them. A normalisation that negated the wrong term -- or that
+# negated `area` and forgot `KX/KY/KC` -- would be green everywhere. `dc_wind_flips` is what turns
+# "it fired and was right" and "it never fired" into distinguishable results.
+#
+# ⭐ AND IT IS A REAL INVARIANT, not agreement between two implementations: **winding is a labelling
+# convention.** Barycentric coordinates are intrinsic to the point and the triangle, and each vertex
+# z travels with its own vertex, so relabelling b and c changes neither the covered set nor the
+# interpolated z at any point. The image MUST be byte-identical. Nothing about the reference or the
+# model can make that true if the normalisation is wrong.
+fn dc_corpus_reversed(swap): i64 {
+    dc_corpus(swap);
+    var t = 0;
+    while (t < dc_n) {
+        var bx = dc_get(t, 3); var by = dc_get(t, 4); var bz = dc_get(t, 5);
+        dc_set(t, 3, dc_get(t, 6)); dc_set(t, 4, dc_get(t, 7)); dc_set(t, 5, dc_get(t, 8));
+        dc_set(t, 6, bx);           dc_set(t, 7, by);           dc_set(t, 8, bz);
+        t = t + 1;
+    }
+    return 0;
+}
+
 var DC_OFF_X  = 4000;
 var DC_OFF_ZS = 10;
 

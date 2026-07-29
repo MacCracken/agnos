@@ -76,6 +76,14 @@ var dm_mut_acc16  = 0;   # M3 truncate the accumulator to 16 bits
 var dm_mut_swapk  = 0;   # M4 swap KX/KY
 var dm_mut_kcbig  = 0;   # M5 add a MULTIPLE OF 2^32 to KC -- residue unchanged, true value not
 var dm_mut_area1  = 0;   # M6 area off by one -- breaks the derived-w2 identity
+var dm_mut_windk  = 0;   # M7 normalise the winding but FORGET to flip KX/KY/KC
+var dm_mut_signed = 0;   # M8 signed depth compare -- the plan's worst wrong pick
+
+var dm_wind = 0;         # 1 if the last hoist normalised a clockwise triangle
+var dm_wind_flips = 0;   # how many hoists fired it this render (0 on every positive-winding frame)
+var dm_clamp_fires = 0;  # lanes where v_max_i32(0, zn) actually clamped
+var dm_clamp_inside = 0; # ...of which were INSIDE a triangle. MUST be 0: the clamp is required to be
+                         # the identity on every lane that can affect output (plan 2.3).
 
 var DM_QUANT = 4;        # M2's shift: z = (z >> 4) << 4
 
@@ -105,15 +113,27 @@ var dm_area = 0;
 fn dm_edge_plane(i, ax, ay, bx, by): i64 {
     # E(x,y) = (bx-ax)*(y-ay) - (by-ay)*(x-ax)
     #        = -(by-ay)*x + (bx-ax)*y + [ (by-ay)*ax - (bx-ax)*ay ]
-    var a = 0 - (by - ay);
-    var b = bx - ax;
-    var c = (by - ay) * ax - (bx - ax) * ay;
-    store64(&dm_ea + i * 8, a);
-    store64(&dm_eb + i * 8, b);
-    store64(&dm_ec + i * 8, c);
-    store64(&dm_ra + i * 8, a & DM_MASK32);
-    store64(&dm_rb + i * 8, b & DM_MASK32);
-    store64(&dm_rc + i * 8, c & DM_MASK32);
+    store64(&dm_ea + i * 8, 0 - (by - ay));
+    store64(&dm_eb + i * 8, bx - ax);
+    store64(&dm_ec + i * 8, (by - ay) * ax - (bx - ax) * ay);
+    return 0;
+}
+
+# dm_residues() — snapshot the finished plane coefficients as the mod-2^32 values a 32-bit record
+# field carries. ⚠ MUST BE THE LAST STEP OF THE HOIST: winding normalisation and the dstxy fold both
+# rewrite the true coefficients, and a residue taken before either one describes a record the kernel
+# would never write.
+fn dm_residues(): i64 {
+    var i = 0;
+    while (i < 3) {
+        store64(&dm_ra + i * 8, load64(&dm_ea + i * 8) & DM_MASK32);
+        store64(&dm_rb + i * 8, load64(&dm_eb + i * 8) & DM_MASK32);
+        store64(&dm_rc + i * 8, load64(&dm_ec + i * 8) & DM_MASK32);
+        i = i + 1;
+    }
+    dm_kx32 = dm_kx & DM_MASK32;
+    dm_ky32 = dm_ky & DM_MASK32;
+    dm_kc32 = dm_kc & DM_MASK32;
     return 0;
 }
 
@@ -131,19 +151,59 @@ fn dm_hoist(t): i64 {
     dm_kx = z0 * load64(&dm_ea + 0) + z1 * load64(&dm_ea + 8) + z2 * load64(&dm_ea + 16);
     dm_ky = z0 * load64(&dm_eb + 0) + z1 * load64(&dm_eb + 8) + z2 * load64(&dm_eb + 16);
     dm_kc = z0 * load64(&dm_ec + 0) + z1 * load64(&dm_ec + 8) + z2 * load64(&dm_ec + 16);
+    # ⭐ area is the SUM of the three edge planes and is constant in (x,y) -- the x and y terms
+    # cancel identically. Computing it as the sum rather than as a fresh cross product is what makes
+    # that cancellation observable rather than assumed.
+    dm_area = load64(&dm_ec + 0) + load64(&dm_ec + 8) + load64(&dm_ec + 16);
+
+    # ---- (2) WINDING NORMALISATION -- CPU, once per triangle (plan 2.5, bite B3) -----------------
+    # ⛔ THE SHADER CANNOT CARRY A NEGATIVE AREA. `R = floor(2^32/area)` is meaningless on one, and
+    # every reciprocal path downstream assumes area > 0. So a clockwise triangle is negated here,
+    # once, and the per-pixel inside test collapses to a single uniform `w_i >= 0`.
+    # ⚠ THE THREE PLANES AND `KX/KY/KC` MUST FLIP TOGETHER. Negating `area` alone leaves the depth
+    # numerator with the wrong sign, and `zn/area` then comes out negative -- which the clamp below
+    # turns into 0, i.e. "nearest", i.e. a clockwise triangle silently drawn in front of everything.
+    # M7 is exactly that mutation, and only the reversed-winding frame can see it.
+    dm_wind = 0;
+    if (dm_area < 0) {
+        var i = 0;
+        while (i < 3) {
+            store64(&dm_ea + i * 8, 0 - load64(&dm_ea + i * 8));
+            store64(&dm_eb + i * 8, 0 - load64(&dm_eb + i * 8));
+            store64(&dm_ec + i * 8, 0 - load64(&dm_ec + i * 8));
+            i = i + 1;
+        }
+        dm_area = 0 - dm_area;
+        if (dm_mut_windk == 0) { dm_kx = 0 - dm_kx; dm_ky = 0 - dm_ky; dm_kc = 0 - dm_kc; }
+        dm_wind = 1;
+        dm_wind_flips = dm_wind_flips + 1;
+    }
+
+    # ---- (3) FOLD THE DRAW ORIGIN INTO THE CONSTANT TERMS (plan 4.2.3) ---------------------------
+    # Substituting the screen sample `pxq = lxq + 2*dx` into `A*pxq + B*pyq + C` gives
+    # `A*lxq + B*lyq + (C + 2*dx*A + 2*dy*B)`. ⭐ After this the shader works ENTIRELY in draw-local
+    # coordinates and never sees `dstxy` -- which is why the model now stops adding the origin to its
+    # sample point. The reference still samples in SCREEN coordinates, deliberately: a reference that
+    # folded the same way could not witness a wrong fold.
+    var fx = 2 * dc_ox;
+    var fy = 2 * dc_oy;
+    var j = 0;
+    while (j < 3) {
+        store64(&dm_ec + j * 8, load64(&dm_ec + j * 8)
+                              + fx * load64(&dm_ea + j * 8)
+                              + fy * load64(&dm_eb + j * 8));
+        j = j + 1;
+    }
+    dm_kc = dm_kc + fx * dm_kx + fy * dm_ky;
+
+    # ---- mutations, applied to the FINISHED record ----------------------------------------------
     if (dm_mut_swapk != 0) { var s = dm_kx; dm_kx = dm_ky; dm_ky = s; }
     if (dm_mut_dropc != 0) { dm_kc = 0; }
     # M5 -- a MULTIPLE of 2^32. The residue is bit-identical, so every rendered pixel is unchanged
     # and the reference diff cannot move. Only the lane-fidelity counter can see it.
     if (dm_mut_kcbig != 0) { dm_kc = dm_kc + 3 * 4294967296; }
-    # ⭐ area is the SUM of the three edge planes and is constant in (x,y) -- the x and y terms
-    # cancel identically. Computing it as the sum rather than as a fresh cross product is what makes
-    # that cancellation observable rather than assumed.
-    dm_area = load64(&dm_ec + 0) + load64(&dm_ec + 8) + load64(&dm_ec + 16);
     if (dm_mut_area1 != 0) { dm_area = dm_area + 1; }
-    dm_kx32 = dm_kx & DM_MASK32;
-    dm_ky32 = dm_ky & DM_MASK32;
-    dm_kc32 = dm_kc & DM_MASK32;
+    dm_residues();
     return 0;
 }
 
@@ -159,16 +219,23 @@ fn dm_render(w, h, zclear, bg): i64 {
     dm_peak = 0;
     dm_lane_bad = 0;
     dm_sum_bad = 0;
+    dm_wind_flips = 0;
+    dm_clamp_fires = 0;
+    dm_clamp_inside = 0;
+    # ⭐ The far value is held as an UNSIGNED 32-bit word, because the depth compare is unsigned.
+    var zclr = zclear & DM_MASK32;
     var py = 0;
     while (py < h) {
         var px = 0;
         while (px < w) {
-            # ⚠ SCREEN coordinates -- dc_ox/dc_oy, exactly as dc_render does it. Missing this made the
-            # model sample at x = 0 while the off-origin frame's vertices sat at x = 700; A7c caught it
-            # on the first frame capable of seeing it, and the shipped corpus never could.
-            var pxq = 2 * (dc_ox + px) + 1;
-            var pyq = 2 * (dc_oy + py) + 1;
-            var pz = zclear;
+            # ⭐ DRAW-LOCAL doubled sample -- the origin is NOT added here. It is folded into the
+            # constant terms by the hoist (plan 4.2.3), exactly as prep does it, so the shader never
+            # sees `dstxy`. ⚠ This is deliberately where the model STOPS mirroring the reference:
+            # `dc_render` still samples in screen coordinates, so the off-origin frame is a real test
+            # of the fold rather than two files making the same substitution.
+            var lxq = 2 * px + 1;
+            var lyq = 2 * py + 1;
+            var pz = zclr;
             var pc = bg;
             var t = 0;
             while (t < dc_n) {
@@ -178,17 +245,22 @@ fn dm_render(w, h, zclear, bg): i64 {
                 # all 64 lanes of the tile and masks only the UPDATE. So the model evaluates them
                 # unconditionally too. Until 2026-07-29 `zn` was computed inside the `inside` test,
                 # which made A4's peak a bound over a domain the shader does not run on.
-                var w0t = load64(&dm_ea + 0)  * pxq + load64(&dm_eb + 0)  * pyq + load64(&dm_ec + 0);
-                var w1t = load64(&dm_ea + 8)  * pxq + load64(&dm_eb + 8)  * pyq + load64(&dm_ec + 8);
-                var w2t = load64(&dm_ea + 16) * pxq + load64(&dm_eb + 16) * pyq + load64(&dm_ec + 16);
-                var znt = dm_kx * pxq + dm_ky * pyq + dm_kc;
+                var w0t = load64(&dm_ea + 0)  * lxq + load64(&dm_eb + 0)  * lyq + load64(&dm_ec + 0);
+                var w1t = load64(&dm_ea + 8)  * lxq + load64(&dm_eb + 8)  * lyq + load64(&dm_ec + 8);
+                var w2t = load64(&dm_ea + 16) * lxq + load64(&dm_eb + 16) * lyq + load64(&dm_ec + 16);
+                var znt = dm_kx * lxq + dm_ky * lyq + dm_kc;
                 # ---- the SAME four numbers as the shader has them: from the mod-2^32 RESIDUES the
                 # record carries, in 32-bit lanes, sign-restored for the signed compares.
-                var w0 = dm_lane(load64(&dm_ra + 0)  * pxq + load64(&dm_rb + 0)  * pyq + load64(&dm_rc + 0));
-                var w1 = dm_lane(load64(&dm_ra + 8)  * pxq + load64(&dm_rb + 8)  * pyq + load64(&dm_rc + 8));
-                var w2 = dm_lane(load64(&dm_ra + 16) * pxq + load64(&dm_rb + 16) * pyq + load64(&dm_rc + 16));
-                var zn = dm_lane(dm_kx32 * pxq + dm_ky32 * pyq + dm_kc32);
+                var w0  = dm_lane(load64(&dm_ra + 0)  * lxq + load64(&dm_rb + 0)  * lyq + load64(&dm_rc + 0));
+                var w1  = dm_lane(load64(&dm_ra + 8)  * lxq + load64(&dm_rb + 8)  * lyq + load64(&dm_rc + 8));
+                var w2p = dm_lane(load64(&dm_ra + 16) * lxq + load64(&dm_rb + 16) * lyq + load64(&dm_rc + 16));
+                var zn  = dm_lane(dm_kx32 * lxq + dm_ky32 * lyq + dm_kc32);
                 var arl = dm_lane(dm_area);
+                # ⭐ w2 IS DERIVED, NOT EVALUATED -- `v_sub_u32 v7, s41, v5` then `v_sub_u32 v7, v7, v6`.
+                # That saves a multiply-add per pixel per triangle and is exact mod 2^32 only because
+                # the three edge planes sum to the area identically. `w2p` (the plane form) is kept
+                # solely so A6 can compare the two; the shader has no `w2p`.
+                var w2 = dm_lane(arl - w0 - w1);
                 # ---- A4: the peak is of the TRUE value, over the WHOLE FRAME. That is the number the
                 # validator's corner bound (plan 1.4 rule 18) must be sized against.
                 var mag = znt;
@@ -197,30 +269,50 @@ fn dm_render(w, h, zclear, bg): i64 {
                 # ---- A5: the residue path agrees with the truth on this lane. Equality holds exactly
                 # when the true value fits a signed 32-bit lane, because mod-2^32 is a ring
                 # homomorphism -- so this counter IS the witness for that theorem, per lane.
-                if (w0 != w0t) { dm_lane_bad = dm_lane_bad + 1; }
-                if (w1 != w1t) { dm_lane_bad = dm_lane_bad + 1; }
-                if (w2 != w2t) { dm_lane_bad = dm_lane_bad + 1; }
-                if (zn != znt) { dm_lane_bad = dm_lane_bad + 1; }
-                # ---- A6: the identity the shader's DERIVED w2 rests on -- `v_sub_u32 v7, s41, v5`
-                # then `v_sub_u32 v7, v7, v6`. It is exact mod 2^32 only if the sum really is the area
-                # at lane width, and nothing had ever checked that.
-                if (dm_lane(w0 + w1 + w2) != arl) { dm_sum_bad = dm_sum_bad + 1; }
+                if (w0  != w0t) { dm_lane_bad = dm_lane_bad + 1; }
+                if (w1  != w1t) { dm_lane_bad = dm_lane_bad + 1; }
+                if (w2p != w2t) { dm_lane_bad = dm_lane_bad + 1; }
+                if (zn  != znt) { dm_lane_bad = dm_lane_bad + 1; }
+                # ---- A6: THE DERIVED w2 EQUALS THE EVALUATED ONE, at lane width, on every lane.
+                # This is the identity the per-pixel saving rests on, and nothing had ever checked it.
+                if (w2 != w2p) { dm_sum_bad = dm_sum_bad + 1; }
+                # ---- the inside test, now UNIFORM: winding normalisation guarantees area > 0, so
+                # the `area < 0` branch that used to sit here is gone rather than merely unreachable.
                 var inside = 0;
                 if (arl > 0) {
                     if (w0 >= 0) { if (w1 >= 0) { if (w2 >= 0) { inside = 1; } } }
                 }
-                if (arl < 0) {
-                    if (w0 <= 0) { if (w1 <= 0) { if (w2 <= 0) { inside = 1; } } }
+                # ---- `v_max_i32 v8, 0, v8` -- THE DOMAIN CLAMP (plan 2.3) ------------------------
+                # One instruction that deletes a class. Inside the triangle every `w_i >= 0` and every
+                # `z_i >= 0`, so `zn >= 0` already and the clamp is the IDENTITY on every lane that
+                # can affect output. Outside, it turns a negative `zn` into 0 rather than a huge
+                # unsigned value, which is what makes the R2 divide's `zn < 2^32` precondition hold
+                # unconditionally instead of under a predicate.
+                # ⚠ Being the identity where it matters means output diffing can NEVER witness it.
+                # A10 counts instead: it must fire (or it is dead code) and must never fire inside.
+                if (zn < 0) {
+                    dm_clamp_fires = dm_clamp_fires + 1;
+                    if (inside == 1) { dm_clamp_inside = dm_clamp_inside + 1; }
+                    zn = 0;
                 }
                 if (inside == 1) {
                     if (dm_mut_acc16 != 0) { zn = zn & 0xFFFF; }
-                    var z = zn / arl;
+                    var z = (zn / arl) & DM_MASK32;
                     # M2 -- a divide that loses low bits. See the gate for why this is the one that
                     # matters and why it did NOT matter at rung 13.
-                    if (dm_mut_quant != 0) { z = (z >>> DM_QUANT) << DM_QUANT; }
-                    if (dm_mut_ulp != 0) { if (t == 1) { z = z + 1; } }
-                    if (z == pz) { dm_ties = dm_ties + 1; }
-                    if (z < pz) { pz = z; pc = dc_get(t, 9); }
+                    if (dm_mut_quant != 0) { z = ((z >>> DM_QUANT) << DM_QUANT) & DM_MASK32; }
+                    if (dm_mut_ulp != 0) { if (t == 1) { z = (z + 1) & DM_MASK32; } }
+                    # ---- ⛔⛔ THE DEPTH TEST: STRICT `<`, **UNSIGNED** -----------------------------
+                    # The single most expensive wrong pick available on this rung. Under a SIGNED
+                    # compare the hardware far value 0xFFFFFFFF reads as -1, i.e. the NEAREST possible
+                    # depth, so nothing ever passes the test, nothing draws -- and a blank frame is
+                    # byte-identical in both submission orders, so the rung's own oracle goes GREEN.
+                    # M8 renders exactly that, and A9 asserts it comes out empty.
+                    var zcmp  = z;
+                    var pzcmp = pz;
+                    if (dm_mut_signed != 0) { zcmp = dm_lane(z); pzcmp = dm_lane(pz); }
+                    if (zcmp == pzcmp) { dm_ties = dm_ties + 1; }
+                    if (zcmp < pzcmp) { pz = z; pc = dc_get(t, 9); }
                 }
                 t = t + 1;
             }
@@ -293,6 +385,16 @@ fn dm_frame_check(name): i64 {
     return 1;
 }
 
+fn dm_covered(w, h, bg): i64 {
+    var c = 0;
+    var i = 0;
+    while (i < w * h) {
+        if ((load32(&dm_cbuf + i * 4) & 0xFFFFFFFF) != (bg & 0xFFFFFFFF)) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
 fn dm_gate(name, d, want_red): i64 {
     ps(name);
     if (want_red == 0) {
@@ -349,23 +451,156 @@ fn main(): i64 {
     dc_corpus_offorigin(0);
     bad = bad + dm_frame_check("A7c OFF-ORIGIN ");
     dm_hoist(0);
-    var kcmag = dm_kc;
-    if (kcmag < 0) { kcmag = 0 - kcmag; }
-    # ⭐ A8 -- THE FRAME MUST ACTUALLY OVERFLOW, or A5 is a check with nothing to catch. This is the
-    # gate that stops the off-origin frame degrading back into a null set the way the plan's original
-    # x=700 parameters silently did (|KC| = 58,124,800, 26 bits, inside an i32).
-    ps("A8  |KC| = "); pn(kcmag); ps(" vs the signed 32-bit field it must NOT fit in (2147483647): ");
-    if (kcmag > 2147483647) { ps("PASS -- the residue path is load-bearing here"); nl(); }
-    if (kcmag <= 2147483647) {
-        ps("FAIL -- KC fits an i32, so A5 has nothing to catch on any frame in this tree"); nl();
+    var kc_folded = dm_kc;
+    # the SAME translated triangle without the fold -- i.e. the screen-coordinate record a kernel that
+    # did not fold `dstxy` would have to write
+    dc_ox = 0;
+    dm_hoist(0);
+    var kc_screen = dm_kc;
+    var kx_screen = dm_kx;
+    var ky_screen = dm_ky;
+    var kc_screen32 = dm_kc32;
+    var kx_screen32 = dm_kx32;
+    var ky_screen32 = dm_ky32;
+    dc_corpus(0);
+    dm_hoist(0);
+    var kc_origin = dm_kc;
+
+    # ---- ⭐⭐ A8 -- THE FOLD CANCELS THE TRANSLATION **EXACTLY**, AND THAT REPLACES THE OLD A8 ----
+    # ⛔ THE OLD A8 ASSERTED |KC| > 2^31 AND WAS RIGHT UNTIL B3, WHICH IS THE FINDING. Before the
+    # `dstxy` fold the off-origin record carried KC = -3,326,848,000. After it, the record is
+    # DRAW-LOCAL: the fold adds `2*dx*KX`, which is precisely what the vertex translation subtracted,
+    # so KC comes back to the ORIGIN corpus's value scaled by z -- 1,152,000 = 115,200 x 10.
+    # ⇒ **Moving geometry far from the origin cannot make the shipping record's constants large.**
+    # The residue's necessity is far narrower than the plan's 4.2 claims, and the corner bound is what
+    # narrows it: with `zn` affine and bounded by 2^31 at all four corners, `|KX| < 2^32/(2w-2)` and
+    # likewise KY, so BOTH always fit a 32-bit field; only KC can exceed 2^31, and only by the
+    # |KX|+|KY| margin. A11 below exercises the residue directly instead of through a frame.
+    ps("A8  the dstxy fold cancels the translation exactly: folded KC = "); pn(kc_folded);
+    ps(", origin KC x "); pn(DC_OFF_ZS); ps(" = "); pn(kc_origin * DC_OFF_ZS); ps(": ");
+    if (kc_folded == kc_origin * DC_OFF_ZS) { ps("PASS"); nl(); }
+    if (kc_folded != kc_origin * DC_OFF_ZS) { ps("FAIL"); nl(); bad = bad + 1; }
+
+    # ---- A11 -- THE RESIDUE, EXERCISED DIRECTLY AT A CONSTANT THAT GENUINELY OVERFLOWS -----------
+    # The unfolded (screen-coordinate) record for the same triangle carries |KC| = 3.33e9, past a
+    # signed 32-bit field. Reconstructing `zn` from its mod-2^32 residues at a screen sample point
+    # must still be exact -- that is the ring-homomorphism claim, tested on a value that needs it
+    # rather than on one that fits anyway.
+    var amag = kc_screen;
+    if (amag < 0) { amag = 0 - amag; }
+    var sxq = 2 * (DC_OFF_X + 10) + 1;
+    var syq = 2 * 10 + 1;
+    var zn_true = kx_screen * sxq + ky_screen * syq + kc_screen;
+    var zn_lane = dm_lane(kx_screen32 * sxq + ky_screen32 * syq + kc_screen32);
+    ps("A11 unfolded |KC| = "); pn(amag); ps(" exceeds a 32-bit field, and the residue path still");
+    ps(" reconstructs zn (true "); pn(zn_true); ps(" vs lane "); pn(zn_lane); ps("): ");
+    if (amag > 2147483647) {
+        if (zn_true == zn_lane) { ps("PASS"); nl(); }
+    }
+    if (amag <= 2147483647) {
+        ps("FAIL -- the probe constant no longer overflows, so it proves nothing"); nl();
         bad = bad + 1;
     }
-    ps("    the record carries the mod-2^32 residue "); pn(dm_kc32);
-    ps("; A5 proves it reconstructs zn exactly at every lane, and A4's peak shows why"); nl();
-    dc_ox = 0;
+    if (amag > 2147483647) {
+        if (zn_true != zn_lane) { ps("FAIL -- residue reconstruction is WRONG"); nl(); bad = bad + 1; }
+    }
     nl();
 
+    # ==============================================================================================
+    # A9 / A10 / A12 + M7 / M8 — THE FOUR SHIPPING-PROGRAM CHANGES OF BITE B3, EACH WITH THE GATE
+    # THAT CAN SEE IT. Three of the four are INVISIBLE to a plain reference diff.
+    # ==============================================================================================
+
+    # ---- A12 + M7: WINDING NORMALISATION -----------------------------------------------------
+    # ⛔ Both shipped triangles wind POSITIVE (areas 2688 and 2704), and every derived frame inherits
+    # that, so the normalisation is DEAD CODE in every other test here. The reversed frame is the only
+    # one that runs it, and `dm_wind_flips` is what distinguishes "fired and was right" from
+    # "never fired". ⭐ The invariant is real, not agreement: winding is a LABELLING convention --
+    # barycentric coordinates are intrinsic and each z travels with its vertex -- so reversing it must
+    # change nothing at all.
+    dm_order(0);
+    dm_render(DC_W, DC_H, DC_FAR, DC_BG);
+    var wf_normal = dm_wind_flips;
+    dc_corpus_reversed(0);
+    var d12 = dm_vs_ref();
+    var wf_rev = dm_wind_flips;
+    ps("A12 REVERSED winding renders identically (diff="); pn(d12); ps("), and the normalisation");
+    ps(" fired "); pn(wf_rev); ps(" times vs "); pn(wf_normal); ps(" on the normal frame: ");
+    if (d12 == 0) {
+        if (wf_rev > 0) {
+            if (wf_normal == 0) { ps("PASS"); nl(); }
+        }
+    }
+    if (d12 != 0) { ps("FAIL -- winding changed the image"); nl(); bad = bad + 1; }
+    if (d12 == 0) {
+        if (wf_rev == 0) {
+            ps("** NOT CONNECTED: the normalisation never ran, so A12 proves nothing **"); nl();
+            bad = bad + 1;
+        }
+    }
+
+    dc_corpus_reversed(0);
+    dm_mut_windk = 1;
+    var m7 = dm_vs_ref();
+    dm_mut_windk = 0;
+    ps("M7  winding normalised but KX/KY/KC NOT flipped: ");
+    if (m7 != 0) { ps("RED (correct), diff="); pn(m7); nl(); }
+    if (m7 == 0) {
+        ps("** NOT CONNECTED: the depth numerator's sign did not matter **"); nl();
+        bad = bad + 1;
+    }
+
+    # ---- A10: THE DOMAIN CLAMP, which output diffing can NEVER witness -------------------------
+    # It is the identity on every lane that can affect output, by construction (plan 2.3). So the
+    # only honest gate is a counter: it must FIRE (or it is dead code and the R2 precondition is
+    # unproven) and must NEVER fire on an inside lane (or it is changing the answer).
+    dm_order(0);
+    dm_render(DC_W, DC_H, DC_FAR, DC_BG);
+    ps("A10 v_max_i32 clamp fired on "); pn(dm_clamp_fires); ps(" lanes, ");
+    pn(dm_clamp_inside); ps(" of them INSIDE a triangle: ");
+    if (dm_clamp_fires > 0) {
+        if (dm_clamp_inside == 0) { ps("PASS -- live, and never where it could change the answer"); nl(); }
+    }
+    if (dm_clamp_fires == 0) {
+        ps("** NOT CONNECTED: no lane ever had a negative zn, so the clamp is dead code **"); nl();
+        bad = bad + 1;
+    }
+    if (dm_clamp_inside != 0) {
+        ps("FAIL -- the clamp altered an inside lane, so it is NOT the identity where it matters"); nl();
+        bad = bad + 1;
+    }
+
+    # ---- A9 + M8: THE SIGNED/UNSIGNED PIN, DEMONSTRATED RATHER THAN ASSERTED -------------------
+    # ⛔⛔ THE MOST EXPENSIVE WRONG PICK ON THIS RUNG, and the reason it is expensive is that it is
+    # SILENT: with the hardware far value 0xFFFFFFFF read as signed it is -1, the nearest possible
+    # depth, so no fragment ever passes the test. Nothing draws. And a blank frame is byte-identical
+    # in both submission orders -- so D1, the rung's own iron oracle, goes GREEN on it.
+    dm_order(0);
+    dm_render(DC_W, DC_H, DC_ZCLEAR_HW, DC_BG);
+    var cov_u = dm_covered(DC_W, DC_H, DC_BG);
+    dm_mut_signed = 1;
+    dm_render(DC_W, DC_H, DC_ZCLEAR_HW, DC_BG);
+    var cov_s = dm_covered(DC_W, DC_H, DC_BG);
+    dm_mut_signed = 0;
+    ps("A9  at the HARDWARE far value 0xFFFFFFFF: unsigned compare draws "); pn(cov_u);
+    ps(" px, signed draws "); pn(cov_s); ps(" px: ");
+    if (cov_u > 200) {
+        if (cov_s == 0) { ps("PASS -- and the signed frame is BLANK, which both orders match"); nl(); }
+    }
+    if (cov_u <= 200) {
+        ps("FAIL -- the unsigned compare does not draw at the value iron burns"); nl();
+        bad = bad + 1;
+    }
+    if (cov_u > 200) {
+        if (cov_s != 0) {
+            ps("** NOT CONNECTED: the signed compare still drew, so this corpus cannot"); nl();
+            ps("   demonstrate the pin and the burn would be spent finding out **"); nl();
+            bad = bad + 1;
+        }
+    }
+
     # ---- mutations -------------------------------------------------------------------------------
+    nl();
     dm_order(0);
     dm_mut_dropc = 1;  bad = bad + dm_gate("M1 hoist constant term KC dropped:", dm_vs_ref(), 1);  dm_mut_dropc = 0;
     dm_mut_swapk = 1;  bad = bad + dm_gate("M4 KX/KY swapped:", dm_vs_ref(), 1);                   dm_mut_swapk = 0;

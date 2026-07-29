@@ -140,6 +140,60 @@ number was not.
 no longer calls. It now lists the one-time-cost case **first**, because that is how the gate actually
 fired.
 
+### Changed — RUNG 17 B3: reference and model reshaped to the SHIPPING program, in one bite
+
+Five changes, landed together because each alters the program the byte-identity proof covers — split
+across bites, the proof would describe something other than what flashes. **Winding normalisation**
+(a clockwise triangle is negated once per triangle, so the per-pixel inside test collapses to a
+uniform `w_i >= 0` and every reciprocal path sees `area > 0`) · **`dstxy` folded into the constant
+terms** (`C' = C + 2·dx·A + 2·dy·B`, so the shader works entirely in draw-local coordinates and never
+sees the draw origin) · **`w2` derived** as `area - w0 - w1` · the **`v_max_i32` domain clamp** ·
+**unsigned** depth compare.
+
+⭐ **The reference deliberately does NOT fold.** `dc_render` still samples in screen coordinates while
+the model folds, so the off-origin frame is a real test of the fold rather than two files making the
+same substitution. Same reason the corpus was deduplicated: agreement between co-designed siblings is
+not evidence.
+
+**Three of the five are invisible to a plain reference diff**, so each got the gate that can see it:
+
+- **A12 / D9 — winding is a LABELLING convention.** Barycentric coordinates are intrinsic and each z
+  travels with its own vertex, so swapping two vertex labels must change nothing at all. ⛔ And it was
+  **dead code in every test in the tree**: both corpus triangles wind positive (areas 2688 and 2704)
+  and every derived frame inherits it. The new reversed frame fires the normalisation **2048 times
+  against 0** on the normal frame — without that counter, "correct" and "never ran" are one green.
+- **M7 — normalise the winding but forget to flip `KX/KY/KC`.** RED, diff 567. Negating `area` alone
+  leaves the depth numerator signed wrong, the clamp turns the result into 0 — "nearest" — and a
+  clockwise triangle silently draws in front of everything.
+- **A10 — the clamp fires on 10 lanes, 0 of them inside a triangle.** It is the identity on every
+  lane that can affect output *by construction*, so no output diff and no mutation can ever witness
+  it; a fire counter plus an inside counter is the only honest gate.
+- **A9 — the signed/unsigned pin, demonstrated instead of asserted.** At the hardware far value
+  `0xFFFFFFFF` the unsigned compare draws **507 px** and the signed one draws **0**. A blank frame is
+  byte-identical in both submission orders, so the rung's own iron oracle goes green on it.
+- **D8 — the validator's four-corner shortcut, proven against brute force.** Corner maximum
+  **4,836,800** equals the whole-rect maximum over all 1024 pixels, and independently equals
+  `depthmodel`'s A4 peak. The affine argument is sound, but it is reasoning, and it is the only thing
+  between an ABI-legal record and a lane wrapping silently.
+
+### ⛔⛔ B3 falsified the plan's residue argument — it named the wrong term
+
+§4.2 justified the mod-2^32 record fields with "`KX = Σ A_i z_i` reaches ~2^39 at legal inputs".
+Two things that bound does not account for:
+
+- **The `dstxy` fold cancels position exactly.** Measured: the off-origin frame's `KC` is
+  **−3,326,848,000** before the fold and **+1,152,000** after — the origin corpus's `KC` times the
+  z-scale, to the digit, because the fold adds `2·dx·KX` and the vertex translation subtracted it.
+  ⇒ **moving geometry away from the origin cannot enlarge a shipping record's constants.**
+- **The corner bound pins the rest.** `zn` is affine and bounded by 2^31 at all four corners;
+  differencing two corners gives `|KX| < 2^32/(2w−2)`, under 3.1e8 even at the smallest legal `w = 8`.
+  ⇒ **`KX` and `KY` always fit a signed 32-bit field.** Only `KC` can exceed 2^31, and only by the
+  `|KX| + |KY|` margin.
+
+⇒ **A8 re-aimed at the fold identity** (`folded KC == origin KC × z-scale`), which is what the
+off-origin frame actually proves, and a new **A11** exercises residue reconstruction directly at the
+unfolded `|KC| = 3,326,848,000` rather than through a frame that can no longer reach one.
+
 ### Added — RUNG 17 B2: three corpus frames, because the shipped one is a measured NULL SET
 
 `depthcore.cyr` + `depthgate.cyr`. On the shipped corpus a divide one ULP short flips **0 of 1024
