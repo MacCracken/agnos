@@ -1,0 +1,175 @@
+# depthcore.cyr — RUNG 17's CPU reference: depth-tested triangle rasterisation, TILE-SERIALISED.
+#
+# ⭐ THIS IS THE ORACLE. The shader is measured against it. Same three-file split rungs 9b/11/13/15
+# earned: the reference states WHAT the answer is, the model reproduces it at 32-bit register widths,
+# the shader reproduces the model.
+#
+# ⚠ INCLUDABLE MODULE, NO main(). Cyrius shadows duplicate `fn` silently (last-def-wins, warn only),
+# so a consumer that includes a file carrying its own main() runs the WRONG one and still exits 0.
+# That cost a real debugging session on rung 11.
+#
+# ============================================================================================
+# THE ALGORITHM IS THE SHADER'S, NOT A CONVENIENT EQUIVALENT
+# ============================================================================================
+# gpu.md's rung-17 row specifies: *one workgroup owns an 8x8 tile and processes that tile's triangle
+# list IN SUBMISSION ORDER IN A SINGLE WAVE, holding colour + depth in VGPRs across the loop, one
+# `global_store` at the end.* So the reference is written the same way — an outer loop over PIXELS,
+# an inner loop over TRIANGLES in submission order, with colour and z as per-pixel scalars that live
+# across the inner loop and are written once at the end.
+#
+# ⛔ IT WOULD HAVE BEEN EASIER TO WRITE THE LOOPS THE OTHER WAY ROUND (per triangle, over pixels) and
+# it would give the same answer for this corpus. It is deliberately NOT written that way: the whole
+# claim of rung 17 is that per-tile serialisation makes the result deterministic WITHOUT atomics, and
+# a reference whose loop structure differs from the shader's cannot witness that claim — it would
+# agree for reasons the shader does not share.
+#
+# ============================================================================================
+# ⛔⛔ Z-TIES ARE ORDER-DEPENDENT, AND THAT IS TRUE OF REAL HARDWARE TOO. READ THIS BEFORE
+#     TRUSTING THE ORDER-INDEPENDENCE GATE.
+# ============================================================================================
+# The depth test is a STRICT `<` (nearer wins, smaller z is nearer). At a pixel where two triangles
+# interpolate to EXACTLY the same z, the FIRST submitted wins, because the second's `z < zbuf` is
+# false. With `<=` the LAST would win. **Either way a tie is decided by submission order.**
+#
+# ⇒ "Two interpenetrating triangles in both orders produce byte-identical output" is therefore NOT a
+# universal truth — it holds only where every covered pixel has a STRICTLY unique nearest z. A corpus
+# that happened to contain a tie would make the rung-17 oracle fail against a *correct* shader, and
+# the burn would be spent chasing a defect that is not there.
+#
+# ⭐ So `dc_render` COUNTS TIE PIXELS (`dc_ties`) and the gate asserts that count is ZERO before it
+# trusts the order-independence result. The corpus is proven fair rather than assumed fair.
+
+include "lib/io.cyr"
+
+var DC_MAXTRI = 16;
+var DC_W = 32;
+var DC_H = 32;
+
+# Per triangle: x0 y0 z0 x1 y1 z1 x2 y2 z2 colour = 10 slots. Screen coords are INTEGER pixels;
+# z is an integer depth, larger = farther, matching a conventional z-buffer.
+var DC_STRIDE = 10;
+var dc_tri[160];                 # DC_MAXTRI * DC_STRIDE, i64 each
+var dc_n = 0;
+
+var dc_cbuf[512];                # 32*32 u32 colour
+var dc_zbuf[512];                # 32*32 u32 depth
+var dc_ties = 0;                 # pixels where two triangles interpolated to EXACTLY equal z
+
+fn dc_reset(): i64 { dc_n = 0; dc_ties = 0; return 0; }
+
+fn dc_set(t, i, v): i64 { store64(&dc_tri + (t * DC_STRIDE + i) * 8, v); return 0; }
+fn dc_get(t, i): i64 { return load64(&dc_tri + (t * DC_STRIDE + i) * 8); }
+
+fn dc_add(x0, y0, z0, x1, y1, z1, x2, y2, z2, colour): i64 {
+    if (dc_n >= DC_MAXTRI) { return 0; }
+    var t = dc_n;
+    dc_set(t, 0, x0); dc_set(t, 1, y0); dc_set(t, 2, z0);
+    dc_set(t, 3, x1); dc_set(t, 4, y1); dc_set(t, 5, z1);
+    dc_set(t, 6, x2); dc_set(t, 7, y2); dc_set(t, 8, z2);
+    dc_set(t, 9, colour);
+    dc_n = dc_n + 1;
+    return 1;
+}
+
+# dc_edge — the standard edge function, evaluated in DOUBLED pixel-centre coordinates so the +0.5 is
+# exact in integers: a pixel centre at (px + 0.5) becomes (2*px + 1) with every vertex doubled.
+# ⚠ This is the same texel/pixel-centre convention rung 13 fixed and rung 15's half-texel bug came
+# from getting wrong on the OTHER side. Doubling keeps it exact rather than approximately right.
+fn dc_edge(ax, ay, bx, by, pxq, pyq): i64 {
+    return (bx - ax) * (pyq - ay) - (by - ay) * (pxq - ax);
+}
+
+# dc_render — the tile-serialised reference. Renders the CURRENT triangle list into cbuf/zbuf.
+# `zclear` is the far value; `bg` the background colour. Returns the number of pixels written.
+#
+# ⚠ PIXELS ARE THE OUTER LOOP AND TRIANGLES THE INNER ONE — see the header. Colour and z live in
+# `pc`/`pz` across the whole triangle list and are stored ONCE, mirroring "hold in VGPRs, one
+# global_store at the end".
+fn dc_render(w, h, zclear, bg): i64 {
+    var written = 0;
+    dc_ties = 0;
+    var py = 0;
+    while (py < h) {
+        var px = 0;
+        while (px < w) {
+            # doubled pixel centre
+            var pxq = 2 * px + 1;
+            var pyq = 2 * py + 1;
+            var pz = zclear;
+            var pc = bg;
+            var t = 0;
+            while (t < dc_n) {
+                var ax = 2 * dc_get(t, 0); var ay = 2 * dc_get(t, 1);
+                var bx = 2 * dc_get(t, 3); var by = 2 * dc_get(t, 4);
+                var cx = 2 * dc_get(t, 6); var cy = 2 * dc_get(t, 7);
+                var w0 = dc_edge(bx, by, cx, cy, pxq, pyq);
+                var w1 = dc_edge(cx, cy, ax, ay, pxq, pyq);
+                var w2 = dc_edge(ax, ay, bx, by, pxq, pyq);
+                var area = w0 + w1 + w2;
+                # ⚠ REJECT DEGENERATE TRIANGLES rather than dividing by zero. A zero-area triangle
+                # covers nothing; silently skipping it is the correct raster answer, and the guard
+                # has to exist because the corpus is allowed to contain one.
+                var inside = 0;
+                if (area > 0) {
+                    if (w0 >= 0) { if (w1 >= 0) { if (w2 >= 0) { inside = 1; } } }
+                }
+                if (area < 0) {
+                    if (w0 <= 0) { if (w1 <= 0) { if (w2 <= 0) { inside = 1; } } }
+                }
+                if (inside == 1) {
+                    # ⭐ EXACT integer barycentric interpolation of z. The reference divides exactly;
+                    # the model will show what the shader does at register widths. Rounding is
+                    # TRUNCATION toward zero via the plain divide, and the model must match it.
+                    var zn = w0 * dc_get(t, 2) + w1 * dc_get(t, 5) + w2 * dc_get(t, 8);
+                    var z = zn / area;
+                    # ⛔ STRICT `<`: nearer wins, and a TIE keeps the incumbent (i.e. the EARLIER
+                    # triangle). Ties are therefore order-dependent -- counted, not hidden.
+                    if (z == pz) { dc_ties = dc_ties + 1; }
+                    if (z < pz) { pz = z; pc = dc_get(t, 9); }
+                }
+                t = t + 1;
+            }
+            store32(&dc_cbuf + (py * w + px) * 4, pc & 0xFFFFFFFF);
+            store32(&dc_zbuf + (py * w + px) * 4, pz & 0xFFFFFFFF);
+            written = written + 1;
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return written;
+}
+
+# dc_snapshot / dc_diff — copy the colour buffer aside and compare, so two submission orders can be
+# rendered and byte-compared without a second render target in the caller.
+var dc_snap[512];
+
+fn dc_snapshot(w, h): i64 {
+    var i = 0;
+    while (i < w * h) { store32(&dc_snap + i * 4, load32(&dc_cbuf + i * 4)); i = i + 1; }
+    return 0;
+}
+
+fn dc_diff(w, h): i64 {
+    var d = 0;
+    var i = 0;
+    while (i < w * h) {
+        var a = load32(&dc_snap + i * 4) & 0xFFFFFFFF;
+        var b = load32(&dc_cbuf + i * 4) & 0xFFFFFFFF;
+        if (a != b) { d = d + 1; }
+        i = i + 1;
+    }
+    return d;
+}
+
+# dc_covered — how many pixels the current buffer differs from the background, so a gate can prove
+# the corpus actually DREW something. ⛔ Two of rung 9b's twenty cases have an all-zero correct
+# answer, and a shader that writes nothing reproduces them byte-exactly; the same trap applies here.
+fn dc_covered(w, h, bg): i64 {
+    var c = 0;
+    var i = 0;
+    while (i < w * h) {
+        if ((load32(&dc_cbuf + i * 4) & 0xFFFFFFFF) != (bg & 0xFFFFFFFF)) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}

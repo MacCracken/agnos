@@ -125,7 +125,7 @@ check "rung 6's host proof mirrors the kernel's region constants" $rc
 # The host oracle for the op 0x0C grid mapping. ⚠ Until now NOTHING ran tests/gpu/*.cyr — they were
 # scanned and cited but never executed, so a red oracle stayed invisible until someone remembered it.
 sh "$ROOT/scripts/check/host-gpu-oracles.sh" >/tmp/host-gpu.log 2>&1 && rc=0 || rc=$?
-check "host GPU oracles pass (0x0C grid map, rung 15 bilinear exactness + model)" $rc
+check "host GPU oracles (0x0C grid, r15 bilinear, r6 region, r17 depth order)" $rc
 [ $rc -eq 0 ] || cat /tmp/host-gpu.log
 
 # Call arity. cycc WARNS on an argument-count mismatch and builds anyway, so a wrong call ships green.

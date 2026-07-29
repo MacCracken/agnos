@@ -132,30 +132,52 @@ carveout base, i.e. the console FB at offset 0, exactly where the map says. Not 
 have been VOID), not inside the region. TD-3's placement is confirmed against HARDWARE.
 ✅ **Op `0x0D` DEPTH_CLEAR is live on iron** — minted with its worker, mask `0x1F1F -> 0x3F1F`, ABI
 battery **103/103**, gated so nothing can store until the audit passes on that boot.
-⛔⛔ **AND THE BURN FOUND A PERF DEFECT THE RUBRIC DID NOT ASK ABOUT — fixed, 254x, then the
-CONFIRMING burn falsified 3 of 4 predictions and found the INSTRUMENT was the problem.**
-`gpu_cp_dma_fill_rect` issued **one CP-DMA packet per row with its own fence wait** (600 packets for
-800x600) on a **contiguous** buffer. Replaced with a single `gpu_cp_dma_fill`: the 32 MB clear went
-**221,875 -> 873 us = 254x**, i.e. **38.4 GB/s** where it had been 151 MB/s. ⭐ The per-row model is
-now confirmed to **0.1%**: 108.2 us/row (800x600) vs 108.3 us/row (4096x2048), two independent rects.
-⛔⛔ **THE CONFIRMING BURN (`depth.txt`) CAME BACK exit 94 WITH THE RATIO INVERTED** — 1.92 MB looked
-**28x SLOWER** than 32 MB. Cause: `gpu_depth_clear` -> `gpu_rt_arm()` runs the whole rung-6 audit on
-the FIRST call of a boot, and that audit ends in **`klug_spill()` — a 64 KB ext2 write to NVMe**,
-which landed **inside the first timed loop**. ~490 ms of I/O amortised over 20 iterations of ~50 us
-of real work: **the instrument's setup outweighed the measurement ~500x** and fired the
-discrimination gate against a worker that was fine. Fixed: `gpudepth` warms up outside the timer.
-⚠ **CORRECTION**: the earlier "89 ms per 800x600 clear / 21 MB/s" figure was contaminated by that
-same one-time cost. **True per-clear was 64.9 ms**, ~30 MB/s. The CONCLUSION (per-row dispatch
-dominates) was right and is now confirmed to 0.1%; the number was not.
-⭐ **THE TRANSFERABLE PART: the timing oracle has caught TWO real defects in two burns on a target
-that cannot be read back at all — a 254x worker bug, then its own contamination.** But note how the
-second presented: **every return code was 0, the gate fired CORRECTLY, and its stated diagnosis was
-WRONG.** A gate can be right that something is broken and wrong about what — and the failure text is
-the part nobody mutation-tests. ⇒ **A per-iteration average silently containing a one-time cost lies
-by a factor nobody can see. Warm up outside the timed region; when a ratio INVERTS rather than merely
-missing, suspect the instrument before the subject.**
-▶ **REMAINING: re-run `gpudepth`** (pre-registered: small total 500-3,000 us, ratio 12-20x, exit 95).
-No new tool, no code change beyond the staged binary.
+✅✅ **OP `0x0D` DEPTH_CLEAR IS COMPLETE AND IRON-VALIDATED (`depth2.txt`), after TWO defects the
+timing oracle caught on a target that cannot be read back at all.**
+**(1) A 262x WORKER BUG.** `gpu_cp_dma_fill_rect` issued **one CP-DMA packet per row with its own
+fence wait** (600 packets for 800x600) on a **contiguous** buffer. One `gpu_cp_dma_fill` instead:
+32 MB clear **221,875 -> 848 us**. ⭐ The per-row model was confirmed to **0.1%** (108.2 vs 108.3
+us/row across two independent rects).
+**(2) THE INSTRUMENT TIMING ITSELF.** `gpu_depth_clear` -> `gpu_rt_arm()` runs the whole rung-6 audit
+on the FIRST call of a boot, and that audit ends in **`klug_spill()` — a 64 KB ext2 write to NVMe**,
+landing INSIDE the first timed loop. ~490 ms of I/O over 20 iterations of ~50 us of real work: the
+setup outweighed the measurement **~500x** and INVERTED the ratio. Fixed with a warm-up outside the
+timer (worth **189x** of the total improvement by itself); `burn-prep` now refuses to stage a
+`gpudepth` lacking it.
+⚠ **CORRECTION**: the "89 ms per 800x600 clear / 21 MB/s" figure published mid-arc was contaminated
+by that one-time cost. True per-clear was **64.9 ms**. The conclusion was right; the number was not.
+⭐ **COST MODEL, now clean**: **86.5 us fixed per dispatch + 22.7 ps/byte = 44.1 GB/s marginal.** A
+full 800x600 depth clear is **130 us**, ~0.5% of a 35 Hz frame — not a design constraint on rung 17.
+Total arc: 800x600 x20 went **1,788,344 -> 2,602 us = 687x**.
+⛔⛔ **THE DISCRIMINATOR WORTH KEEPING — a falsified prediction is a DEFECT or a MODEL ERROR, and the
+residual tells you which.** The same prediction (ratio -> 17x) failed on two burns: once with a
+**490,462 us residual nothing explained** (a defect — the instrument), once with **zero unexplained
+residual**, both points fitting `F + b*bytes` and `F` corroborating two prior independent
+measurements (a model error — I assumed fixed cost would vanish; it became SINGULAR, not zero, and is
+still 67% of the small clear). **Do not accept "the prediction was optimistic" until the residual is
+accounted for.** The two look identical on a scorecard and are not the same event.
+⚠ **Carry-forward**: ~86.5 us is now the floor for ANY single fenced CP-DMA op. Rung 17's tile pass
+will issue many; a burst of small fills needs batching without a per-op fence — rung 14's fusion
+shape. Named so it is not rediscovered.
+✅ **RUNG 17's DEPTH REFERENCE + ORDER-INDEPENDENCE GATE LANDED** (`depthcore.cyr` / `depthgate.cyr`,
+host, **exit 95, 7 gates**) — the rung's OWN iron oracle is proven sound before a shader exists.
+⭐ The reference uses the **SHADER's loop structure** (pixels outer, triangles inner, colour+z per
+pixel across the inner loop, stored once), not a convenient equivalent: the other nesting is easier,
+gives the same answer here, and would agree for reasons the shader does not share — so it could not
+witness the serialisation claim.
+⛔⛔ **FOUND WHILE WRITING IT: Z-TIES ARE ORDER-DEPENDENT on ANY correct implementation, hardware
+included.** The test is a strict `<`, so at exactly-equal z the FIRST submitted wins (`<=` would give
+the LAST). ⇒ **"both orders byte-identical" is NOT universal** — it holds only where every covered
+pixel has a strictly unique nearest z. A corpus with one tie would FAIL A CORRECT SHADER on iron and
+the burn would chase a defect that is not there. `dc_render` counts ties; **D0a asserts zero**.
+Gates: **D0a** no ties · **D0b** 507 px covered (two EMPTY images are byte-identical) · **D0c** red
+290 / blue 217 both win (a pair where one occludes the other makes depth indistinguishable from
+painter's) · **D1** the oracle · **D2** co-planar MUST go order-dependent, 182 px — D1 is connected ·
+**D3** deterministic · **D4** on all 182 shared pixels the nearer won, checked against z **recomputed
+from the vertices**, not read from the renderer's own z-buffer.
+▶ **REMAINING for rung 17: the model at register widths, then the shader.** Tile-serialised,
+colour+depth in VGPRs, one `global_store` at the end, plus a lane-witness counter separating "no wave
+ran" from "wave ran and computed wrong". Build flag `GPU_OP_TRI_DEPTH`.
 
 Remaining after rung 15 — ⚠ **this list was STALE by +2 until 2026-07-28** (it still carried the
 pre-renumbering mapping and collapsed rungs 17/18/19 into one cut); [`planning/gpu.md`](planning/gpu.md)

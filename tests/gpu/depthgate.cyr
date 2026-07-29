@@ -1,0 +1,199 @@
+# depthgate.cyr — RUNG 17's HOST GATE. Proves the depth reference is order-independent, and proves
+# the gate that says so can actually FAIL.
+#
+# ⭐ ORDER-INDEPENDENCE IS *THE* PROPERTY THAT PROVES DEPTH, and it is the rung's stated iron oracle:
+# *"two interpenetrating triangles submitted in BOTH orders produce byte-identical output."* Testing
+# it here first means the burn is spent measuring the SHADER against a property already known to hold
+# for the algorithm — not discovering that the property was never true.
+#
+# ⛔ WITHOUT D2 THIS FILE WOULD BE WORTHLESS. A renderer that ignored z entirely and simply painted
+# in submission order would fail D1 — but so would a hundred other bugs, and more importantly a
+# renderer that drew NOTHING would PASS D1, because two empty images are byte-identical. D2 (the
+# no-depth-test mutation must break D1) and D0b (the corpus must actually cover pixels) are what turn
+# D1 from a tautology into evidence.
+
+include "lib/io.cyr"
+include "tricore.cyr"      # ps / pn / nl
+include "depthcore.cyr"
+
+var DG_BG   = 0xFF101010;
+var DG_FAR  = 1000000;
+var DG_RED  = 0xFFFF0000;
+var DG_BLUE = 0xFF0000FF;
+
+# ---- the interpenetrating pair ---------------------------------------------------------------
+# ⭐ TWO TRIANGLES THAT CROSS IN DEPTH. Each is nearer over part of the overlap, so neither can win
+# everywhere and painter's order cannot reproduce the correct image. A pair where one is wholly in
+# front would pass D1 for the WRONG reason -- the answer would be the same as painter's order.
+# Red slopes near->far left to right; blue slopes far->near. They cross in the middle.
+fn dg_add_red(): i64 {
+    return dc_add(2, 2, 100,  28, 4, 900,  4, 28, 100, DG_RED);
+}
+fn dg_add_blue(): i64 {
+    return dc_add(2, 4, 900,  28, 2, 100,  28, 28, 900, DG_BLUE);
+}
+
+# dg_z_at(t, px, py) — the interpolated z of triangle `t` at a pixel, or -1 if it does not cover it.
+# ⭐ RECOMPUTED FROM THE VERTICES, deliberately not read out of dc_zbuf. D4's whole value is that it
+# checks the renderer against an INDEPENDENT computation of the same quantity; asking the renderer
+# what it stored and then agreeing with it would be the shared-premise blindness rung 15 shipped.
+fn dg_z_at(t, px, py): i64 {
+    var pxq = 2 * px + 1;
+    var pyq = 2 * py + 1;
+    var ax = 2 * dc_get(t, 0); var ay = 2 * dc_get(t, 1);
+    var bx = 2 * dc_get(t, 3); var by = 2 * dc_get(t, 4);
+    var cx = 2 * dc_get(t, 6); var cy = 2 * dc_get(t, 7);
+    var w0 = dc_edge(bx, by, cx, cy, pxq, pyq);
+    var w1 = dc_edge(cx, cy, ax, ay, pxq, pyq);
+    var w2 = dc_edge(ax, ay, bx, by, pxq, pyq);
+    var area = w0 + w1 + w2;
+    var inside = 0;
+    if (area > 0) { if (w0 >= 0) { if (w1 >= 0) { if (w2 >= 0) { inside = 1; } } } }
+    if (area < 0) { if (w0 <= 0) { if (w1 <= 0) { if (w2 <= 0) { inside = 1; } } } }
+    if (inside == 0) { return 0 - 1; }
+    return (w0 * dc_get(t, 2) + w1 * dc_get(t, 5) + w2 * dc_get(t, 8)) / area;
+}
+
+fn dg_render_order(swap): i64 {
+    dc_reset();
+    if (swap == 0) { dg_add_red(); dg_add_blue(); }
+    if (swap != 0) { dg_add_blue(); dg_add_red(); }
+    return dc_render(DC_W, DC_H, DG_FAR, DG_BG);
+}
+
+fn main(): i64 {
+    var bad = 0;
+    ps("depthgate: rung 17 -- depth-tested rasterisation, order-independence on the host"); nl(); nl();
+
+    # ---- D0a: THE CORPUS MUST BE FAIR. No z-ties, or order-independence is not even true. --------
+    # ⛔ A tie is decided by submission order on ANY correct implementation, hardware included, so a
+    # corpus containing one would make a CORRECT shader fail the iron oracle. Proven, not assumed.
+    dg_render_order(0);
+    ps("D0a corpus has no z-ties (order-independence is a FAIR test): ");
+    if (dc_ties == 0) { ps("PASS"); nl(); }
+    if (dc_ties != 0) { ps("FAIL "); pn(dc_ties); ps(" tie pixels"); nl(); bad = bad + 1; }
+
+    # ---- D0b: AND IT MUST ACTUALLY DRAW. Two empty images are byte-identical. ---------------------
+    var cov = dc_covered(DC_W, DC_H, DG_BG);
+    ps("D0b the corpus covers pixels (an empty image would pass D1 vacuously): ");
+    if (cov > 200) { ps("PASS "); pn(cov); ps(" px"); nl(); }
+    if (cov <= 200) { ps("FAIL only "); pn(cov); ps(" px covered"); nl(); bad = bad + 1; }
+
+    # ---- D0c: BOTH triangles must be VISIBLE somewhere, or the pair is not interpenetrating. -----
+    # ⭐ THE CASE THAT MAKES THE PAIR MEANINGFUL. If one triangle wholly occludes the other, depth
+    # ordering is indistinguishable from painter's order and D1 proves nothing about the z test.
+    var nred = 0; var nblue = 0;
+    var i = 0;
+    while (i < DC_W * DC_H) {
+        var p = load32(&dc_cbuf + i * 4) & 0xFFFFFFFF;
+        if (p == DG_RED)  { nred  = nred + 1; }
+        if (p == DG_BLUE) { nblue = nblue + 1; }
+        i = i + 1;
+    }
+    ps("D0c both triangles win somewhere (they truly interpenetrate): ");
+    if (nred > 20) {
+        if (nblue > 20) { ps("PASS red "); pn(nred); ps(" px, blue "); pn(nblue); ps(" px"); nl(); }
+    }
+    if (nred <= 20) { ps("FAIL red only "); pn(nred); ps(" px"); nl(); bad = bad + 1; }
+    if (nred > 20) {
+        if (nblue <= 20) { ps("FAIL blue only "); pn(nblue); ps(" px"); nl(); bad = bad + 1; }
+    }
+
+    # ---- D1: THE RUNG'S ORACLE. Both submission orders, byte-identical. --------------------------
+    dg_render_order(0);
+    dc_snapshot(DC_W, DC_H);
+    dg_render_order(1);
+    var d1 = dc_diff(DC_W, DC_H);
+    ps("D1  both submission orders are byte-identical: ");
+    if (d1 == 0) { ps("PASS"); nl(); }
+    if (d1 != 0) { ps("FAIL "); pn(d1); ps(" differing px"); nl(); bad = bad + 1; }
+
+    # ---- D2: FALSIFICATION. Painter's order (no depth test) MUST break D1. -----------------------
+    # ⛔ THE GATE THAT MAKES D1 MEAN SOMETHING. Rendered without the z test, the second-submitted
+    # triangle overwrites the first wherever they overlap, so the two orders MUST differ. If this
+    # comes back green, D1 is not measuring the depth test and the whole file is decoration.
+    # ⚠ Implemented by giving every triangle the SAME z, which makes every overlap a tie and hands
+    # the pixel to submission order -- exactly painter's behaviour, using the shipped renderer rather
+    # than a second code path that could disagree with it for unrelated reasons.
+    dc_reset();
+    dc_add(2, 2, 500,  28, 4, 500,  4, 28, 500, DG_RED);
+    dc_add(2, 4, 500,  28, 2, 500,  28, 28, 500, DG_BLUE);
+    dc_render(DC_W, DC_H, DG_FAR, DG_BG);
+    dc_snapshot(DC_W, DC_H);
+    dc_reset();
+    dc_add(2, 4, 500,  28, 2, 500,  28, 28, 500, DG_BLUE);
+    dc_add(2, 2, 500,  28, 4, 500,  4, 28, 500, DG_RED);
+    dc_render(DC_W, DC_H, DG_FAR, DG_BG);
+    var d2 = dc_diff(DC_W, DC_H);
+    ps("D2  co-planar (every overlap a TIE) IS order-dependent -- D1 is connected: ");
+    if (d2 != 0) { ps("RED (correct), "); pn(d2); ps(" differing px"); nl(); }
+    if (d2 == 0) {
+        ps("** GATE NOT CONNECTED: even a pure tie was order-independent **"); nl();
+        bad = bad + 1;
+    }
+
+    # ---- D3: DETERMINISM. The same input twice must give the same output, bit for bit. ------------
+    # ⚠ On iron this is the check that separates "wrong" from "nondeterministic", and the rung's own
+    # failure table says a difference between two identical frames IS the finding (a wave race). On
+    # the host it can only ever pass -- which is exactly why it belongs here as the CONTROL: if it
+    # ever fails here, the reference itself has state it should not have.
+    dg_render_order(0);
+    dc_snapshot(DC_W, DC_H);
+    dg_render_order(0);
+    var d3 = dc_diff(DC_W, DC_H);
+    ps("D3  identical input renders identically (the reference is stateless): ");
+    if (d3 == 0) { ps("PASS"); nl(); }
+    if (d3 != 0) { ps("FAIL "); pn(d3); ps(" px"); nl(); bad = bad + 1; }
+
+    # ---- D4: THE NEAREST TRIANGLE WINS, checked against an independently computed answer. ---------
+    # ⭐ AN EXTERNAL INVARIANT, not agreement with another implementation. At a pixel covered by both,
+    # the colour must be whichever triangle has the smaller interpolated z there -- recomputed here
+    # from the vertices directly rather than trusting the renderer's own bookkeeping.
+    # [[feedback_oracle_must_test_external_invariant]]
+    dg_render_order(0);
+    var d4 = 0;
+    var d4n = 0;
+    var y2 = 0;
+    while (y2 < DC_H) {
+        var x2 = 0;
+        while (x2 < DC_W) {
+            var got = load32(&dc_cbuf + (y2 * DC_W + x2) * 4) & 0xFFFFFFFF;
+            if (got != DG_BG) {
+                var zr = dg_z_at(0, x2, y2);
+                var zb = dg_z_at(1, x2, y2);
+                # both cover this pixel?
+                if (zr >= 0) {
+                    if (zb >= 0) {
+                        d4n = d4n + 1;
+                        var want = DG_RED;
+                        if (zb < zr) { want = DG_BLUE; }
+                        if (got != want) { d4 = d4 + 1; }
+                    }
+                }
+            }
+            x2 = x2 + 1;
+        }
+        y2 = y2 + 1;
+    }
+    ps("D4  on every shared pixel the NEARER triangle won ("); pn(d4n); ps(" checked): ");
+    if (d4 == 0) { ps("PASS"); nl(); }
+    if (d4 != 0) { ps("FAIL "); pn(d4); ps(" px"); nl(); bad = bad + 1; }
+    if (d4n < 20) {
+        ps("    ** only "); pn(d4n); ps(" shared pixels -- D4 proves little **"); nl();
+        bad = bad + 1;
+    }
+
+    nl();
+    if (bad == 0) {
+        ps("depthgate: PASS -- depth-tested rasterisation is ORDER-INDEPENDENT on a corpus proven"); nl();
+        ps("           fair (no z-ties), truly interpenetrating, and non-empty; the co-planar"); nl();
+        ps("           mutation shows the gate can fail. Rung 17's iron oracle is sound BEFORE"); nl();
+        ps("           a single shader instruction exists."); nl();
+        return 95;
+    }
+    ps("depthgate: FAIL -- "); pn(bad); ps(" propert(ies) broken; do NOT write the shader yet."); nl();
+    return 90;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

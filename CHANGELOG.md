@@ -140,6 +140,84 @@ number was not.
 no longer calls. It now lists the one-time-cost case **first**, because that is how the gate actually
 fired.
 
+### Added — RUNG 17's depth reference and its order-independence gate (host, zero burns)
+
+`depthcore.cyr` + `depthgate.cyr`. **exit 95, seven gates.** This proves the rung's *own* iron oracle
+before a shader instruction exists: *two interpenetrating triangles submitted in both orders produce
+byte-identical output.*
+
+⭐ **The reference is written with the SHADER's loop structure, not a convenient equivalent** — pixels
+outer, triangles inner, colour and z held per-pixel across the inner loop and stored once, mirroring
+*"one workgroup owns an 8×8 tile, processes that tile's list in submission order in a single wave,
+holding colour + depth in VGPRs, one `global_store` at the end."* Writing the loops the other way
+round is easier and gives the same answer on this corpus — and would agree for reasons the shader
+does not share, so it could not witness the serialisation claim.
+
+⛔⛔ **Found while writing it: Z-TIES ARE ORDER-DEPENDENT, on any correct implementation including
+hardware.** The depth test is a strict `<`, so at a pixel where two triangles interpolate to exactly
+equal z the *first* submitted wins; with `<=` the *last* would. **So "both orders are byte-identical"
+is not a universal truth** — it holds only where every covered pixel has a strictly unique nearest z.
+A corpus containing one tie would fail a **correct** shader on iron, and the burn would be spent
+chasing a defect that is not there. `dc_render` therefore **counts** tie pixels and **D0a asserts the
+count is zero**: the corpus is proven fair rather than assumed fair.
+
+The gates, and what each stops:
+
+| | Gate | Stops |
+|---|---|---|
+| **D0a** | no z-ties | the oracle being unfair to a correct shader |
+| **D0b** | 507 px covered | *two empty images are byte-identical* — D1 passing vacuously |
+| **D0c** | red 290 px **and** blue 217 px both win | a pair where one wholly occludes the other, where depth order is indistinguishable from painter's |
+| **D1** | both orders byte-identical | — the rung's oracle |
+| **D2** | co-planar (every overlap a tie) **must** go order-dependent — 182 px | D1 being decoration |
+| **D3** | identical input renders identically | the reference having state it should not |
+| **D4** | on all 182 shared pixels the nearer triangle won | — checked against z **recomputed from the vertices**, not read out of the renderer's own z-buffer |
+
+⭐ D4 is the external-invariant check. Asking the renderer what it stored and then agreeing with it
+is the shared-premise blindness rung 15 shipped to iron.
+[[feedback_oracle_must_test_external_invariant]]
+
+### ✅✅ Closed — op `0x0D` iron-validated: 687× total, and a clean cost model
+
+`depth2.txt`. **3 of 4 predictions confirmed, exit 95.**
+
+```
+800x600 x20   burn 1 (per-row + contaminated)  1,788,344 us
+              burn 2 (linear  + contaminated)    491,461 us
+              burn 3 (linear  + warm)              2,602 us   <- 687x
+32 MB  x20    221,875 -> 848 us per clear                     <- 262x
+```
+
+The warm-up alone was worth **189×** of that — the measure of how much instrument was in the
+measurement.
+
+**Cost model, now clean: `86.5 µs fixed/dispatch + 22.7 ps/byte` = 44.1 GB/s marginal.** A full
+800×600 depth clear costs **130 µs**, ~0.5% of a 35 Hz frame — not a design constraint on rung 17.
+
+⚠ Prediction 3 (ratio 12–20×) **failed again — 6.5×** — and this time it is a model error, not a
+defect. **Fixed cost did not vanish; it became singular.** The 262× came from paying ~86 µs *once*
+instead of 600 times, not from making it small: at 1.92 MB the fixed term is still **67%** of the
+cost, which compresses the ratio. ⭐ And 86.5 µs corroborates two independent prior measurements —
+`gputex`'s ~48 µs/dispatch, and the earlier "108 µs/row" which *was* this same per-dispatch cost
+counted 600 times.
+
+### ⭐⭐ The discriminator: a falsified prediction is a DEFECT or a MODEL ERROR — the residual says which
+
+The same prediction failed on two consecutive burns and meant opposite things:
+
+- **Burn 2** — falsified with a **490,462 µs residual nothing in the model explained.** An
+  unexplained residual that size *is* the defect, and it was: the instrument timing itself.
+- **Burn 3** — falsified with **zero unexplained residual.** Both points fit `F + b·bytes`, `F`
+  corroborates two prior independent measurements, nothing is left over. The prediction was wrong;
+  the system is right.
+
+⇒ **Do not accept "the prediction was just optimistic" until the residual is accounted for.** The two
+cases look identical on a scorecard and are not the same event.
+
+⚠ **Carry-forward**: ~86.5 µs is now the floor for any single fenced CP-DMA op. Rung 17's tile pass
+will issue many, and a burst of small fills would need batching without a per-op fence — the same
+shape as rung 14's fusion. Named so it is not rediscovered as a surprise.
+
 ### ⭐ The transferable lesson — when the target is unreadable, cost is still observable
 
 Op `0x0D` writes a kernel-owned buffer ring 3 cannot read: no `#86` slot, and `#90` reads the

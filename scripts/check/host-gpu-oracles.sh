@@ -7,9 +7,18 @@
 # is the same class of defect as a gate wired with a bare `; rc=$?`: a check that exists on paper and
 # cannot fail in practice.
 #
-# ⚠ SCOPE, STATED HONESTLY: this runs texlist, bigate, bimodel and texgate. It does NOT run doomcol,
-# doomwall, edgemodel or refraster — those are equally host-runnable and equally unwired, and adding
-# them is a separate bite rather than something smuggled in beside a rung.
+# ⚠ SCOPE, STATED HONESTLY: this runs texlist, bigate, bimodel, texgate, rtaudit and depthgate. It
+# does NOT run doomcol, doomwall, edgemodel or refraster — those are equally host-runnable and
+# equally unwired, and adding them is a separate bite rather than something smuggled in beside a rung.
+# ⚠ This line has gone stale twice as oracles were added; it is the drift the tree keeps finding in
+# docs and scripts alike. If you add to the loop below, add here in the same edit.
+#
+# ⭐ depthgate ADDED AT RUNG 17. It proves the rung's OWN iron oracle before the shader exists:
+# two interpenetrating triangles in both submission orders must be byte-identical. ⚠ It also proves
+# the corpus is FAIR to that oracle — no z-ties (a tie is decided by submission order on ANY correct
+# implementation, hardware included, so a tie in the corpus would fail a CORRECT shader), both
+# triangles visible, and the image non-empty (two empty images are byte-identical). Its D2 mutation
+# makes every overlap a tie and MUST go order-dependent, or D1 is measuring nothing.
 #
 # ⭐ texgate ADDED AT RUNG 15 because it stopped being only rung 13's gate. It now carries the four
 # checks that decide whether a bilinear iron burn is interpretable: **gate 7** (the reciprocal
@@ -46,7 +55,7 @@ export CYRIUS_ALLOW_PARENT_INCLUDES
 mkdir -p "$GPU/build"
 
 rc=0
-for t in texlist bigate bimodel texgate rtaudit; do
+for t in texlist bigate bimodel texgate rtaudit depthgate; do
     out="$(cd "$GPU" && cyrius build "$t.cyr" "build/$t" 2>&1)" || {
         echo "host-gpu-oracles: FAIL -- $t.cyr does not BUILD"
         echo "$out" | tail -20
