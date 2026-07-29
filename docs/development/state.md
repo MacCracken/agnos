@@ -308,16 +308,28 @@ down before the `0x0D` battery (which uses no slots and never noticed), so every
 case returned "a REAL reject for an UNREAL reason" — and the two cases that *expect* `DSTSLOT` passed
 for the wrong reason and would have hidden it. ⚠ Slot ids are **1-based**; the neighbouring `0x0A`
 comments name the wrong sizes and still pass for a different reason than they claim.
-⚠ **Cyrius diagnostic bug, worth filing**: three added locals gave `undefined variable 'tb'` pointing
-at a correctly-declared variable with the caret on another line; the real defect was a later `var tz`
-duplicating an earlier local. In isolation the duplicate gives a clean `duplicate variable` at the
-right line — so the diagnostic degrades when a duplicate follows a new declaration. Bisected 1–4
-extra locals: **not** a per-function cap.
+⚠ **NOT a cyrius bug — retracted.** A build failure here was written up as "the diagnostic named the
+wrong identifier"; the build actually emits **two** errors and the first is exactly right
+(`duplicate variable` — `var tz` duplicated an earlier local in the same 900-line function). A
+`tail -3` showed only the cascade. ⇒ **reading the tail of a build log inverts cause and consequence**;
+nothing to file.
+✅ **(7) OP `0x10 GPU_OP_RT_READ` (B6) — the readback that lets the burn FAIL.** 136/136 battery,
+smoke 16/16, mask → `0x17F1F`. Blocking for a measured reason: a divide with its correction dropped
+gives order-diff **0**, colour-vs-ref **0**, 19 wrong z; a uniform bias gives 0, 0, **507/507** wrong
+z — and depth is unreadable from ring 3, so **without `0x10` the burn cannot fail on a broken
+divide**, which is the rung's entire novel content.
+⛔⛔ **THE PLAN'S IMPLEMENTATION WOULD HAVE #PF'd ON THE FIRST BYTE.** §1.5 specifies *"no DMA and no
+dispatch … a kernel `memcpy` from `gpu_rt_base_phys`"*. **Rung 6 already measured the refutation**:
+the region is at phys `1020000000..1030000000` ≈ **64.5 GB**, and `pt_init` identity-maps **0–4 GB**
+(`mbi.cyr:50` records `fb_fb_phys` #PF'ing once for exactly this). That address exists for the
+*audit's arithmetic*, not for loads. ⇒ implemented as **CP-DMA MC→MC**, the path
+`gpu_readback_shm_sys` `#90` already proves on iron, with its scoped **clflush BEFORE** the DMA (a
+flush after would write a dirty line back over the GPU's fresh data) and no duplicate GL2 flush —
+`gpu_batch_tail`'s ACQUIRE_MEM TCWB already covers the source side.
 ▶ **REMAINING for rung 17 — FOUR bites, not "the shader"** (⚠ this line previously said *"REMAINING:
 (2) the shader"*, which collapsed B3–B9 into one and would have put a 584-dword blob ahead of the
 program it is supposed to reproduce). Per [`planning/rung17-tri-depth.md`](planning/rung17-tri-depth.md)
-§7: **B6** `0x10 GPU_OP_RT_READ` (**blocking**: without a z readback the burn cannot fail on a broken
-divide) · **B7** prep · **B8** `tri_depth.s` · **B9** worker · **B10** the burn. The four pins must
+§7: **B7** prep · **B8** `tri_depth.s` · **B9** worker · **B10** the burn. The four pins must
 not be re-opened at transcription time.
 
 Remaining after rung 15 — ⚠ **this list was STALE by +2 until 2026-07-28** (it still carried the

@@ -882,6 +882,53 @@ fn gpu_depth_clear(zh, w, h, value) {
     return gpu_cp_dma_fill(mc, value, bytes);
 }
 
+# gpu_rt_read — op 0x10's worker. Copies a w x h 32-bit rect out of render-target handle `zh` (from
+# its origin) into the `#86` slot `dst_id`, packed at w*4 bytes per row. Returns 1 / 0.
+#
+# ⛔⛔ THIS IS A **GPU** COPY, NOT A KERNEL memcpy, AND THE PLAN SAID OTHERWISE. rung17-tri-depth.md
+# 1.5 specifies "~15 lines, no DMA and no dispatch: gpu_rt_base_phys is already cached, so it is a
+# kernel memcpy from gpu_rt_base_phys + zh*GPU_RT_HANDLE_SIZE". **That would #PF the kernel on the
+# first byte.** Rung 6 MEASURED the region on iron: phys `1020000000..1030000000`, i.e. ~64.5 GB —
+# and `pt_init` identity-maps only 0-4 GB (`paging.cyr:19`, and `mbi.cyr:50` records `fb_fb_phys`
+# already #PF'ing once for exactly this reason). `gpu_rt_base_phys` is a real address, but not one
+# this kernel can dereference; it exists for the AUDIT's arithmetic, not for loads.
+# ⇒ CP-DMA, MC-to-MC, which is what `gpu_readback_shm_sys` (#90) already does to capture the back
+# buffer into a client slot. Redesign, don't reinvent — and the reinvention here would have faulted.
+#
+# ⚠ COHERENCE, and it is not optional: the destination slot's CPU window is WC-mapped, and iron
+# (2026-07-23, gpucopy) showed a slot the CPU has ALREADY read returns a STALE cache-line ghost on
+# the next read — the fresh GPU write never reaches the CPU. Evict BEFORE the DMA, never after: a
+# flush afterwards writes a dirty line back OVER the GPU's fresh data. Same scoped clflush as #90.
+# ⚠ The SOURCE side is the shader's GL2 writes vs CP-DMA's MC-direct read. That is `gpu_batch_tail`'s
+# ACQUIRE_MEM TCWB write-back (decision D-6), already emitted per batch — NOT duplicated here, since
+# adding a second flush would be an unproven opcode solving a problem the ring already solves.
+fn gpu_rt_read(zh, dst_id, w, h, zw) {
+    if (gpu_rt_arm() != 1) { return 0; }
+    var src_mc = gpu_rt_handle_mc(zh);
+    if (src_mc == 0) { return 0; }
+    if (shm_slot_valid(dst_id) == 0) { return 0; }
+    var slot = dst_id - 1;
+    var dst_mc = load64(&shm_mc + slot * 8);
+    if (dst_mc == 0) { return 0; }                 # PMM-backed ⇒ the GPU cannot write it
+    var row = w * 4;
+    var total = row * h;
+    # Second gate, deliberately: the validator checks this too, but the worker is what issues the DMA.
+    if (total > load64(&shm_size + slot * 8)) { return 0; }
+    if (zw * 4 * h > GPU_RT_HANDLE_SIZE) { return 0; }
+    var kva = load64(&shm_kva + slot * 8);
+    if (kva != 0) {
+        var off = 0;
+        while (off < total) { clflush(kva + off); off = off + 64; }
+        gpu_mfence();
+    }
+    # ⚠ ONE PACKET PER ROW here, unlike gpu_depth_clear's single linear fill — and that is correct
+    # rather than the 262x defect repeating: the source rows are `zw*4` apart while the destination
+    # is packed `w*4`, so the ranges are NOT contiguous on both sides unless w == zw. A caller reading
+    # a full-width buffer pays one packet per row; the fix, if it ever matters, is to special-case
+    # w == zw into a single gpu_cp_dma, not to pretend the strides match.
+    return gpu_cp_dma_blit(dst_mc, row, src_mc, zw * 4, row, h);
+}
+
 fn gpu_wait_done(done_phys, expect, timeout_us) {
     var t0 = rdtsc();
     var limit = timeout_us * gpu_tsc_per_us();

@@ -140,6 +140,38 @@ number was not.
 no longer calls. It now lists the one-time-cost case **first**, because that is how the gate actually
 fired.
 
+### Added — RUNG 17 B6: op `0x10 GPU_OP_RT_READ`, the readback that lets the burn FAIL
+
+`gpo_validate_rtread` + `gpu_rt_read`, field mask `0x009F`, `GPU_OP_SUPPORTED` → `0x17F1F`, nine new
+battery cases — **136 of 136 correct**, `edge-abi-smoke` 16/16.
+
+⛔ **Blocking for the rung, and the reason is measured, not stylistic.** On the shipped corpus a
+divide with its correction dropped gives order-diff **0**, colour-vs-reference **0**, and 19 wrong z;
+a uniform bias of any size 1–64 gives 0, 0, and **507-of-507** wrong z. Depth lives in a kernel-owned
+TD-3 handle ring 3 cannot address, and `#90` reads the framebuffer. **Without this op the iron burn
+cannot fail on a broken divide** — and the divide is rung 17's entire novel content. Op `0x0D` could
+only ever be validated by timing because the arena is opaque; rung 17 must not inherit that blindness.
+
+### ⛔⛔ The plan specified a kernel `memcpy` here, and it would have #PF'd on the first byte
+
+`rung17-tri-depth.md` §1.5 says *"~15 lines, no DMA and no dispatch: `gpu_rt_base_phys` is already
+cached, so it is a kernel `memcpy` from `gpu_rt_base_phys + zh*GPU_RT_HANDLE_SIZE`"*. **Rung 6 already
+measured why that cannot work**: the region sits at physical `1020000000..1030000000` — about
+**64.5 GB** — while `pt_init` identity-maps only **0–4 GB** (`paging.cyr:19`), and `mbi.cyr:50`
+records `fb_fb_phys` #PF'ing once for exactly this reason. `gpu_rt_base_phys` is a real address, but
+not one this kernel can dereference; it exists for the *audit's arithmetic*, not for loads.
+
+⇒ Implemented as **CP-DMA, MC-to-MC** — precisely what `gpu_readback_shm_sys` (`#90`) already does to
+capture the back buffer into a client slot. Redesign, don't reinvent; here the reinvention faults.
+The iron-proven **scoped `clflush` before the DMA** comes with it (a WC-mapped slot the CPU has
+already read returns a stale cache-line ghost — and the flush must be *before*, since one afterwards
+writes a dirty line back over the GPU's fresh data). The source-side GL2 write-back is
+`gpu_batch_tail`'s `ACQUIRE_MEM` TCWB and is deliberately **not** duplicated here.
+
+⚠ One packet per row, unlike `gpu_depth_clear`'s single linear fill — and that is correct rather than
+the 262× defect repeating: source rows are `zw*4` apart while the destination is packed `w*4`, so the
+ranges are not contiguous on both sides unless `w == zw`.
+
 ### Added — RUNG 17 B5: op `0x0E GPU_OP_TRI_DEPTH`'s ABI, and a validator with 18 rules
 
 `gpo_validate_tridepth`, field mask `0x01FF`, `GPO_E_SUBPIXEL/ZRANGE/ALIGN` (30/31/32), and **24 new
@@ -199,15 +231,22 @@ bound has slack: a 4-px triangle in an 8×8 rect has area 64, so `zn = 64 × (2^
 the lane, and `z = 2^24` is still inside it. Both geometries are in the battery, and the interaction
 is documented where a caller reading only the z ceiling would otherwise be surprised.
 
-### Found — a cyrius diagnostic named the wrong identifier
+### ⚠ Retracted — there is no cyrius diagnostic bug here
 
-Adding three locals to `edge_abi_selftest` produced `error: undefined variable 'tb'` pointing at a
-line where `tb` was correctly declared two lines above, with the caret under a *different* line. The
-actual defect was a later `var tz` duplicating a local already declared earlier in the same function.
-⚠ The duplicate **in isolation** produces a clean `duplicate variable` error at the right line — so
-the diagnostic degrades specifically when a duplicate follows another new declaration. Bisected: 1, 2,
-3 and 4 additional locals all build fine, so it is not a per-function local cap. Worked around by
-reusing existing locals; worth filing against cyrius.
+An earlier draft of this entry reported that adding three locals to `edge_abi_selftest` produced
+`error: undefined variable 'tb'` naming a correctly-declared variable. **That was a truncated log,
+not a compiler defect.** The build emits TWO errors and the first one is exactly right:
+
+```
+error: core/syscall.cyr:2951:15: duplicate variable          <- var tz duplicates an earlier local
+error: core/syscall.cyr:2953:16: undefined variable 'tb'     <- cascade after error recovery
+```
+
+A `tail -3` showed only the second. The real defect was mine — `var tz` duplicated a local already
+declared earlier in the same 900-line function — and the compiler said so on line one. Recorded
+rather than deleted because the failure mode is worth naming: **reading the tail of a build log
+inverts which diagnostic is the cause and which is the consequence.** Fixed by reusing the existing
+locals (`vb`/`vz`/`L1`) instead of declaring new ones.
 
 ### Added — RUNG 17 B4: the two EXTERNAL gates, the only ones not resting on a shared premise
 

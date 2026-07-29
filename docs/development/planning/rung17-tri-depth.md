@@ -1,8 +1,7 @@
 # Rung 17 `tri_depth` — build plan (derived 2026-07-28, adversarially verified)
 
-> **Status (2026-07-29)**: **B0–B5 LANDED — zero burns**, `host-gpu-oracles.sh` 8/8 exit 95,
-> `check.sh` 21/21, ABI battery **127/127**, `edge-abi-smoke` 16/16. Next bite is **B6**
-> (`0x10 GPU_OP_RT_READ`, blocking).
+> **Status (2026-07-29)**: **B0–B6 LANDED — zero burns**, `host-gpu-oracles.sh` 8/8 exit 95,
+> `check.sh` 21/21, ABI battery **136/136**, `edge-abi-smoke` 16/16. Next bite is **B7** (prep).
 >
 > ⛔ **B5 did not land as specified.** It asked for `GPU_OP_SUPPORTED` bit 14 with a `GPO_E_NOTIMPL`
 > worker; that advertises a non-working op through `#89`, which 1.56.24 forbids. Resolved with
@@ -144,7 +143,9 @@ Dispatch from `gpo_validate` **before** the generic tail, alongside `0x08`/`0x0D
 
 `gpo_field_mask(0x10) = 0x009F` → `op · flags · z_handle(2) · dst_id(3) · wh(4) · zwh(7)`. `dstxy` rejected (a handle's origin is `(0,0)`).
 
-~15 lines, **no DMA and no dispatch**: `gpu_rt_base_phys` is already cached, so it is a kernel `memcpy` from `gpu_rt_base_phys + zh*GPU_RT_HANDLE_SIZE` into a validated `#86` slot's kva. `0x10..0x17` is the lane `gpu.md` already reserved for fill/blit/readback; `0x0F` stays free for rung 19.
+~15 lines into a validated `#86` slot.
+
+> ⛔⛔ **"NO DMA AND NO DISPATCH — A KERNEL `memcpy` FROM `gpu_rt_base_phys`" WOULD #PF ON THE FIRST BYTE, AND RUNG 6 HAD ALREADY MEASURED WHY.** The region sits at physical `1020000000..1030000000` — about **64.5 GB** — while `pt_init` identity-maps only **0–4 GB** (`paging.cyr:19`); `mbi.cyr:50` records `fb_fb_phys` #PF'ing once for precisely this reason. `gpu_rt_base_phys` is a real address but not a dereferenceable one: it exists for the audit's arithmetic. ⇒ landed as **CP-DMA, MC-to-MC**, which is what `gpu_readback_shm_sys` (`#90`) already does to capture the back buffer into a client slot — with its iron-proven scoped **`clflush` BEFORE** the DMA (after would write a dirty line back over the GPU's fresh data), and no duplicate GL2 flush since `gpu_batch_tail`'s ACQUIRE_MEM TCWB covers the source side. `0x10..0x17` is the lane `gpu.md` already reserved for fill/blit/readback; `0x0F` stays free for rung 19.
 
 **Why it is blocking**, measured by two independent attackers on the shipped corpus: a divide with the correction **dropped** gives orderdiff **0**, colour-vs-reference **0**, and **19 wrong z**. A uniform bias of any size 1..64 gives 0/0/**507-of-507 wrong z**. Without a z readback the iron burn **cannot fail on a broken divide**, and the divide is this rung's entire novel content. `0x0D` could only ever be validated by timing because the RT arena is opaque; rung 17 must not inherit that blindness.
 
@@ -624,7 +625,7 @@ Each bite is independently verifiable and lands green. **Bites 1–6 are zero-bu
 | ✅ **B3** | reshape `depthcore`+`depthmodel` to the shipping program (winding normalisation, `dstxy` fold, derived `w2`, `v_max` clamp, unsigned compare, no min-bias) + G6 corner bound | byte-identical colour AND z, both orders, all frames | 0 |
 | ✅ **B4** | **external gates** G7 (constant-z silhouette vs the `tri_rgba` path) + G8 (analytic interpenetration line) | exit 95 | 0 |
 | ✅ **B5** | **ABI only** — `0x0E` constants, `gpo_validate_tridepth`, field mask, flags, `GPU_OP_SUPPORTED` bit 14, battery. Worker returns `GPO_E_NOTIMPL`. ⛔ **Landed with `GPU_OP_NOTIMPL_MASK`, not as written** — see below. | `edge_abi_selftest` **127/127**; `edge-abi-smoke` 16/16; `kprint-len-check.sh` | 0 |
-| **B6** | **`0x10 GPU_OP_RT_READ`** — kernel memcpy from `gpu_rt_base_phys`, validator, battery, `GPU_OP_SUPPORTED` bit 16 | battery + a QEMU/mirshi round-trip against a `0x0D`-cleared handle | 0 |
+| ✅ **B6** | **`0x10 GPU_OP_RT_READ`** — ⛔ **CP-DMA MC→MC, NOT the kernel memcpy this document specifies** (see §1.5) — validator, battery, `GPU_OP_SUPPORTED` bit 16 | battery **136/136**; `edge-abi-smoke` 16/16 | 0 |
 | **B7** | `gpu_tri_depth_prep` — affine hoist, winding, `dstxy` fold, `R = 2^32/area`, corner bounds, residues, arena write; `check-arena.sh` slots | a kernel selftest diffing prep output against `depthmodel`'s hoist on all four frames | 0 |
 | **B8** | `tri_depth.s` + the §3 register map as its header block + `edgeasm` emit + `ea_vgpr_check` + `tridepth-carry.sh` + RSRC harvest + blob table + `RSRC1_TDEP` | **two independent assemblers agree**; VGPR check green; carry gate green | 0 |
 | **B9** | `gpu_tri_depth()` worker — residency at `0x5E000`, witness slot → MC, dispatch through `gpu_blend_cov_run` **unmodified** | build green; `GPU_OP_SUPPORTED` and the worker land together | 0 |
