@@ -97,7 +97,7 @@ doubling the shader surface for a filter with **no consumer at all** — DOOM sa
 section's rule 2 says the kernel is never more than one rung ahead of a shipped consumer, and it is
 already six ahead. The list variants wait for someone to ask.
 
-### Added — `kernel/shaders/tex_bilin.s`, the rung 15 blob (580 dwords, resident, dispatchable)
+### Added — `kernel/shaders/tex_bilin.s`, the rung 15 blob (584 dwords, resident, dispatchable)
 
 Derived from `tex_rgba.s`. Three changes: each axis captures the 8-bit fraction **before** it floors
 and emits **two** indices; the fetch pulls **four** texels with four addresses in flight and one
@@ -195,8 +195,73 @@ bigate's G2 observed on iron.
 check** — a pre-1.56.29 binary passes every col-major string, runs rungs 13/14/14b and exits 95 with
 zero bilinear data, on a burn whose whole purpose is bilinear.
 
-**Remaining for rung 15: the burn.** Everything host-provable is proven; the shader itself has no
-host oracle by construction.
+### ⛔⛔ Fixed — a HALF-TEXEL SAMPLING OFFSET the burn found *through a green result*
+
+**The first iron burn returned `BILINEAR 5 of 5 EXACT` and the filter was still wrong.** Frame 0 —
+the 1:1 identity frame — reported `vs NEAREST: 35 px differ`, falsifying a pre-registered prediction.
+A bilinear filter at exact 1:1 magnification must reproduce the texture **exactly**.
+
+The taps were being drawn from `floor(u)` with weight `frac(u)`. They must come from
+`floor(u - 0.5)` / `frac(u - 0.5)`.
+
+⭐ **The argument is convention-free**, so "AGNOS uses a different convention" was never available as
+a defence. Let texel *i*'s centre sit at *i + c* for **any** *c*:
+
+    correct nearest      = floor(u − c + 0.5)
+    correct linear taps  = floor(u − c)
+
+These differ by **exactly 0.5 for every c**. AGNOS shipped nearest = `floor(u)` (iron-proven 17/17
+across rungs 13/14) and bilinear = `floor(u)` — a difference of **zero**. `floor`/`floor` is not a
+matched pair under *any* convention, and nearest was the path pinned to iron, so linear moved.
+Measured: `biprobe` found all 64 frame-0 samples at `fx = fy = 128`, 63/64 differing from nearest as
+shipped, **0/64** with the bias. Adjudicated by four independent analyses and three adversarial
+refutation attempts; **0 of 3 could refute it.**
+
+**Fix**: `v_add_u32 v23, 0xFFFF8000, v23` per axis in `tex_bilin.s` (580 → **584 dwords**, no new
+VGPR, RSRC1 unchanged), `BI_HALF` in `bicore.cyr`, and the matching bias in `texcore.cyr`'s
+`tex_fetch_bilin` and `bimodel.cyr`'s `bm_sample`. ⛔ Deliberately **not** folded into
+`gpu_tex_prep`'s `mu`/`mv` — which looks free and is not: `limu` is *derived* from `mu`, so biasing
+it would shift the out-of-domain predicate by half a texel. The nearest path is untouched.
+
+### ⭐ The real lesson — an oracle that only checks internal agreement is blind to a shared premise
+
+**Byte-identity between a shader and its reference is structurally blind to an error the two
+share.** `bicore`, `bimodel`, `texcore`'s `tex_fetch_bilin` and `tex_bilin.s` all implemented the
+same wrong convention, so they all agreed, and every gate built on their agreement went green.
+
+Worse — **the two corner-exactness gates were probing coordinates the renderer cannot produce.**
+`bigate` G2 and `texgate` GATE 10a both sampled exact integers (`i * 65536`), but `tex_uv_at` always
+adds 32768 for the pixel centre, so *a pixel-centre rasteriser can never emit an integer `u` at any
+integer scale*. Their entire evidence base sat on the null set of the error, and GATE 10a actively
+**asserted the bug**.
+
+The only thing that surfaced it was `gputex`'s **discrimination gate** — the `vs NEAREST` line —
+added to catch a *dispatch* bug, because it is the one measurement in the suite that compares against
+something other than the reference.
+
+⇒ **At least one gate must test an EXTERNAL invariant, not internal agreement.** Landed:
+
+- **`texgate` GATE 11** — the absolute test: at a 1:1 mapping, bilinear output must be byte-identical
+  to the **source texture**, sampled through `tex_uv_at`. Compares against an artifact neither
+  implementation produced.
+- **`texgate` GATE 12** — falsifies GATE 11 (`tmut_centre` exactly cancels the bias): breaks **63 of
+  64**, reproducing the shipped defect on demand. *A gate nobody has seen fail is a gate nobody knows
+  is connected* — G2 and GATE 10a had never been seen to fail, and that cost a burn.
+- **`texgate` GATE 10 inverted** — same two probes, expectations swapped: agreement at texel
+  **centres** (reachable), blending at **boundaries** (49 interior).
+- **`bigate` G2 re-anchored** to texel centres, plus **G2b** proving boundaries blend rather than snap.
+- **`bimodel` M6** — the bias dropped, swept on **both** modes (red 1089 / 893). Without it the fix
+  would ship with nothing proving it load-bearing.
+- **`gputex`** now *asserts* frame 0 reports `vs NEAREST: 0`, turning the falsified prediction into a
+  permanent gate; `burn-prep` refuses to stage a binary lacking it.
+
+⚠ Also corrected: the prediction's comment claimed frame 0 has `fx = fy = 0`. That premise was false
+(it is 128); the conclusion was right for a different reason — the tent kernel is interpolating at
+texel centres. Recorded rather than quietly rewritten.
+
+**Remaining for rung 15: a re-burn.** The golden data moved on all five frames, so the previous 5/5
+EXACT carries no independent weight until the new gates ride along — it proved GPU == reference, and
+that remains true, of a reference that has since changed.
 
 ## [1.56.28] - 2026-07-28
 

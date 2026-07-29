@@ -94,21 +94,54 @@ fn main(): i64 {
 
     bg_fill();
 
-    # ---- G2: CORNER EXACTNESS. At an exact texel coordinate the filter returns that texel. --------
+    # ---- G2: CENTRE EXACTNESS. At a texel CENTRE the filter returns that texel untouched. --------
+    # ⛔⛔ THIS GATE PROBED THE WRONG COORDINATES UNTIL 2026-07-28, AND THAT IS HOW THE HALF-TEXEL
+    # DEFECT SHIPPED. It sampled `tx * 65536` — an exact texel BOUNDARY — and asserted the filter
+    # returns texel tx there. Under the (wrong) unbiased filter that was true, so G2 passed and
+    # certified the bug. Two things were wrong with it at once:
+    #   1. A boundary is where a correct linear filter returns the 50/50 BLEND of the two texels it
+    #      separates, not one of them. The property as written was false for a correct filter.
+    #   2. **The rasteriser can never produce that coordinate anyway.** `tex_uv_at` always adds 32768
+    #      for the pixel centre, so at any integer scale u is always half-integer. G2's entire
+    #      evidence base sat at coordinates the raster path cannot emit — exactly the null set of
+    #      the error it was supposed to catch.
+    # ⇒ The interpolating property lives at texel CENTRES (u = i + 0.5), which is BOTH true for a
+    # correct filter AND reachable by the renderer. Same test, correct anchor.
     var g2 = 0;
     var ty = 0;
     while (ty < BG_TH) {
         var tx = 0;
         while (tx < BG_TW) {
             var want = load32(&bg_tex + (ty * BG_TW + tx) * 4) & 0xFFFFFFFF;
-            var got  = bi_sample(&bg_tex, BG_TW, BG_TH, tx * 65536, ty * 65536, 1);
+            var got  = bi_sample(&bg_tex, BG_TW, BG_TH,
+                                 tx * 65536 + BI_HALF, ty * 65536 + BI_HALF, 1);
             if (got != want) { g2 = g2 + 1; }
             tx = tx + 1;
         }
         ty = ty + 1;
     }
-    ps("G2 exact texel coords return that texel untouched: ");
+    ps("G2 texel CENTRES return that texel untouched (interpolating): ");
     if (g2 == 0) { ps("PASS"); } else { ps("FAIL "); pn(g2); bad = bad + 1; }
+    nl();
+
+    # ---- G2b: THE OTHER HALF OF G2, and the one that makes it non-vacuous. -----------------------
+    # A filter that ignored its fraction entirely would pass G2. At a texel BOUNDARY the filter must
+    # return the 50/50 blend of the two neighbours — i.e. it must NOT return either texel. Sampling
+    # interior boundaries only, so clamping cannot collapse the pair and mask the property.
+    var g2b = 0;
+    var by2 = 1;
+    while (by2 < BG_TH) {
+        var bx2 = 1;
+        while (bx2 < BG_TW) {
+            var t = load32(&bg_tex + (by2 * BG_TW + bx2) * 4) & 0xFFFFFFFF;
+            var g  = bi_sample(&bg_tex, BG_TW, BG_TH, bx2 * 65536, by2 * 65536, 1);
+            if (g == t) { g2b = g2b + 1; }
+            bx2 = bx2 + 1;
+        }
+        by2 = by2 + 1;
+    }
+    ps("G2b texel BOUNDARIES blend rather than snap (the fraction is live): ");
+    if (g2b == 0) { ps("PASS"); } else { ps("FAIL "); pn(g2b); bad = bad + 1; }
     nl();
 
     # ---- G3 + G4: RANGE and 32-BIT ACCUMULATOR, over the whole fraction space. --------------------

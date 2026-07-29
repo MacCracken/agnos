@@ -194,44 +194,142 @@ fn main(): i64 {
         ps(" samples, WRAP and CLAMP, negative and multi-tile UV"); nl();
     }
 
-    # --- GATE 10: FALSIFICATION — bilinear MUST degenerate to nearest at exact texel coords ----
-    # ⭐ THE TWO-SIDED GATE. At fx = fy = 0 the filter must return the tapped texel UNTOUCHED (bigate
-    # G2), so tex_fetch_bilin and tex_fetch must agree EXACTLY there — otherwise every texel centre is
-    # slightly wrong and the image is uniformly soft, which reads as "blurry sampler" and gets blamed
-    # anywhere but here. And OFF the texel grid they must DISAGREE somewhere, or tex_fetch_bilin is
-    # secretly doing nearest and gate 9 above is comparing two nearest implementations.
+    # --- GATE 10: THE TWO ANCHORS — INVERTED 2026-07-28 AFTER THE FIRST IRON BURN ---------------
+    # ⛔⛔ THIS GATE USED TO ASSERT THE BUG, AND THAT IS WHY IT MATTERS MORE THAN THE FIX ITSELF.
+    # As first written it demanded that bilinear equal nearest at EXACT INTEGER coordinates
+    # (`tx2 * 65536`), and called the half-texel offsets the "maximally-filtered point". Both anchors
+    # were exactly backwards, and worse, **the renderer can never produce an integer coordinate**:
+    # `tex_uv_at` always adds 32768 for the pixel centre, so at any integer scale u is half-integer.
+    # The gate was collecting its evidence at coordinates the raster path cannot emit — the null set
+    # of the error — and passing, which is how the half-texel defect reached iron with 5/5 EXACT.
+    #
+    # ⭐ CORRECT ANCHORS, and note they are the SAME two probes with their expectations swapped:
+    #   10a  at a texel CENTRE (i + 0.5) the tent kernel is interpolating ⇒ bilinear == nearest,
+    #        exactly. This coordinate IS reachable — it is what a 1:1 pixel-centre raster produces.
+    #   10b  at a texel BOUNDARY (i) a correct filter returns the 50/50 blend of the two texels it
+    #        separates ⇒ bilinear must DIFFER from nearest. Interior boundaries only, so clamping
+    #        cannot collapse the pair and hide the property.
     var g10a = 0;
     var g10b = 0;
+    var g10bn = 0;
     var ty = 0;
     while (ty < 8) {
         var tx2 = 0;
         while (tx2 < 8) {
-            var e1 = tex_fetch(&tg_tex, &tg_lut, 8, 8, tx2 * 65536, ty * 65536, 0);
-            var e2 = tex_fetch_bilin(&tg_tex, &tg_lut, 8, 8, tx2 * 65536, ty * 65536, 0);
-            if (e1 != e2) { g10a = g10a + 1; }
-            # half a texel along both axes -- the maximally-filtered point
-            var h1 = tex_fetch(&tg_tex, &tg_lut, 8, 8, tx2 * 65536 + 32768, ty * 65536 + 32768, 0);
-            var h2 = tex_fetch_bilin(&tg_tex, &tg_lut, 8, 8, tx2 * 65536 + 32768, ty * 65536 + 32768, 0);
-            if (h1 != h2) { g10b = g10b + 1; }
+            # 10a — texel CENTRE: interpolating, must agree with nearest
+            var c1 = tex_fetch(&tg_tex, &tg_lut, 8, 8, tx2 * 65536 + 32768, ty * 65536 + 32768, 0);
+            var c2 = tex_fetch_bilin(&tg_tex, &tg_lut, 8, 8, tx2 * 65536 + 32768, ty * 65536 + 32768, 0);
+            if (c1 != c2) { g10a = g10a + 1; }
+            # 10b — texel BOUNDARY, interior only: must blend, i.e. must NOT match nearest
+            if (tx2 > 0) {
+                if (ty > 0) {
+                    var b1 = tex_fetch(&tg_tex, &tg_lut, 8, 8, tx2 * 65536, ty * 65536, 0);
+                    var b2 = tex_fetch_bilin(&tg_tex, &tg_lut, 8, 8, tx2 * 65536, ty * 65536, 0);
+                    g10bn = g10bn + 1;
+                    if (b1 != b2) { g10b = g10b + 1; }
+                }
+            }
             tx2 = tx2 + 1;
         }
         ty = ty + 1;
     }
     if (g10a != 0) {
-        ps("  GATE 10 FAILED: at EXACT texel coords bilinear differs from nearest in "); pn(g10a);
-        ps(" of 64 texels -- corner exactness is broken"); nl();
+        ps("  GATE 10a FAILED: at texel CENTRES bilinear differs from nearest in "); pn(g10a);
+        ps(" of 64 -- the filter is not interpolating; the half-texel bias is wrong or absent"); nl();
         fail = fail + 1;
     }
-    if (g10b == 0) {
-        ps("  GATE 10 FAILED: at HALF-texel offsets bilinear is still identical to nearest --"); nl();
-        ps("    tex_fetch_bilin is not filtering, and gate 9 is comparing two nearest paths"); nl();
+    if (g10b != g10bn) {
+        ps("  GATE 10b FAILED: only "); pn(g10b); ps(" of "); pn(g10bn);
+        ps(" interior BOUNDARIES blend -- the filter is snapping, not interpolating"); nl();
         fail = fail + 1;
     }
     if (g10a == 0) {
-        if (g10b != 0) {
-            ps("  gate 10 GREEN: exact at all 64 texel centres, and filters at "); pn(g10b);
-            ps(" of 64 half-texel offsets"); nl();
+        if (g10b == g10bn) {
+            ps("  gate 10 GREEN: exact at all 64 texel CENTRES (reachable by a pixel-centre raster),");
+            nl();
+            ps("    and blends at all "); pn(g10bn); ps(" interior boundaries"); nl();
         }
+    }
+
+    # --- GATE 11: THE ABSOLUTE TEST — the one that would have caught the half-texel defect -------
+    # ⛔⛔ EVERY OTHER GATE IN THIS TREE COMPARES ONE IMPLEMENTATION TO ANOTHER. bicore vs bimodel,
+    # texcore vs bicore, shader vs reference — and a convention error SHARED by both sides is
+    # invisible to all of them by construction. That is not a hypothetical: it is exactly how the
+    # 1.56.29 burn returned "BILINEAR 5 of 5 EXACT" on a filter that was half a texel out.
+    #
+    # ⭐ THIS GATE COMPARES AGAINST AN ARTIFACT NEITHER SIDE PRODUCED: the source texture itself.
+    # At a 1:1 pixel-to-texel mapping a correct bilinear filter must reproduce the texture EXACTLY
+    # ("bilinear at 1:1 is identity"), because every sample lands on a texel centre and the tent
+    # kernel is interpolating. Nearest passes this trivially; the shipped bilinear failed it 63/64.
+    # ⚠ It MUST anchor to tex_uv_at, not to hand-written coordinates — the whole failure of gates
+    # G2/10a was that they probed coordinates the rasteriser cannot emit.
+    if (tri_prep(0, 0, 8, 0, 0, 8, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF) != 1) {
+        ps("  GATE 11 SKIPPED: tri_prep refused the 1:1 frame"); nl();
+        fail = fail + 1;
+    }
+    if (tex_prep(0, 0, 8 << 16, 0, 0, 8 << 16) != 1) {
+        ps("  GATE 11 SKIPPED: tex_prep refused the 1:1 frame"); nl();
+        fail = fail + 1;
+    }
+    var g11 = 0;
+    var g11n = 0;
+    var qy = 0;
+    while (qy < 8) {
+        var qx = 0;
+        while (qx < 8) {
+            tex_uv_at(qx, qy);
+            var want = load32(&tg_tex + (qy * 8 + qx) * 4) & 0xFFFFFFFF;
+            var got  = tex_fetch_bilin(&tg_tex, &tg_lut, 8, 8, tx_u_out, tx_v_out, 0);
+            g11n = g11n + 1;
+            if (got != want) { g11 = g11 + 1; }
+            qx = qx + 1;
+        }
+        qy = qy + 1;
+    }
+    if (g11 != 0) {
+        ps("  GATE 11 FAILED: at a 1:1 mapping bilinear differs from the SOURCE TEXTURE in ");
+        pn(g11); ps(" of "); pn(g11n); ps(" texels."); nl();
+        ps("    A correct bilinear filter is IDENTITY at 1:1 magnification. This is an ABSOLUTE"); nl();
+        ps("    test -- it does not compare against any other implementation, so no shared"); nl();
+        ps("    convention error can hide from it. Check the half-texel bias (BI_HALF)."); nl();
+        fail = fail + 1;
+    }
+    if (g11 == 0) {
+        ps("  gate 11 GREEN: bilinear reproduces the source texture EXACTLY at a 1:1 mapping,"); nl();
+        ps("    sampled through tex_uv_at -- an ABSOLUTE oracle, not an agreement between two"); nl();
+        ps("    implementations that could share a wrong convention"); nl();
+    }
+
+    # --- GATE 12: FALSIFICATION — gate 11 must REPRODUCE the defect it was written for ---------
+    # ⭐ tmut_centre adds +32768, which on the bilinear path EXACTLY CANCELS the BI_HALF bias — so
+    # this mutation reconstructs the shipped-1.56.29 filter precisely. If gate 11 stays green under
+    # it, gate 11 cannot see the very bug it exists to catch and is worth nothing.
+    # ⛔ This is the check that gates 2/10a lacked. Both were green, both were probing coordinates
+    # the rasteriser cannot emit, and neither had ever been shown to fail. A gate nobody has seen
+    # fail is a gate nobody knows is connected — and here that cost an iron burn.
+    tmut_centre = 1;
+    var g12 = 0;
+    var ry = 0;
+    while (ry < 8) {
+        var rx = 0;
+        while (rx < 8) {
+            tex_uv_at(rx, ry);
+            var w2 = load32(&tg_tex + (ry * 8 + rx) * 4) & 0xFFFFFFFF;
+            var g2x = tex_fetch_bilin(&tg_tex, &tg_lut, 8, 8, tx_u_out, tx_v_out, 0);
+            if (g2x != w2) { g12 = g12 + 1; }
+            rx = rx + 1;
+        }
+        ry = ry + 1;
+    }
+    tmut_centre = 0;
+    if (g12 == 0) {
+        ps("  GATE 12 FAILED: reverting the half-texel bias changed NOTHING at 1:1 -- gate 11 is"); nl();
+        ps("    not connected and cannot detect the defect it was written to catch"); nl();
+        fail = fail + 1;
+    }
+    if (g12 != 0) {
+        ps("  gate 12 GREEN: reverting the bias breaks "); pn(g12);
+        ps(" of 64 at 1:1 -- gate 11 reproduces the 1.56.29 defect on demand"); nl();
     }
 
     if (fail != 0) {

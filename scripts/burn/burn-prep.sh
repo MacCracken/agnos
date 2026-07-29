@@ -983,14 +983,15 @@ echo "  staged /bin/gputex carries the rung-14b col-major arm"
 # arm goes green on any frame where the two filters agree. Staging a gputex whose bilinear arm lacks
 # that check would make the burn unfalsifiable in exactly the way gputri's missing negative controls
 # would — which is the defect the block below this one exists to prevent.
-for _m in "BILINEAR -- 4-tap integer filter" "vs NEAREST: " "IDENTICAL to nearest on every frame"; do
+for _m in "BILINEAR -- 4-tap integer filter" "vs NEAREST: " "IDENTICAL to nearest on every frame" \
+          "BILINEAR at 1:1 differs from NEAREST in"; do
     if ! grep -qa -- "$_m" build/rootfs/bin/gputex 2>/dev/null; then
         echo "burn-prep: STAGED /bin/gputex LACKS '$_m' -- rung 15's oracle cannot be invoked."
         echo "  It would still exit 95 on rungs 13+14+14b. Fix:  sh scripts/burn/stage-tools.sh --build"
         exit 1
     fi
 done
-echo "  staged /bin/gputex carries the rung-15 bilinear arm AND its discrimination gate"
+echo "  staged /bin/gputex carries the rung-15 bilinear arm, its discrimination gate AND the 1:1 identity gate"
 
 # ⭐ And it must carry the NEGATIVE CONTROLS. A gputri without N1-N8 can still print "20 of 20",
 # and TWO of the twenty corpus cases have an ALL-ZERO correct answer -- so a shader that writes

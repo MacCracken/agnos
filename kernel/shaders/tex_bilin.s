@@ -40,6 +40,33 @@
 // Q9 +144 stays the reserved extension point.
 //
 // ============================================================================================
+// ⛔⛔ THE HALF-TEXEL BIAS — ADDED AFTER THE FIRST IRON BURN. THE BURN SAID "5 of 5 EXACT" AND THE
+//     FILTER WAS STILL WRONG. READ THIS BEFORE TOUCHING THE AXIS BLOCKS.
+// ============================================================================================
+// The first version of this blob took its taps from floor(u) with weight frac(u). `gputex` came back
+// **BILINEAR 5 of 5 EXACT** — shader byte-identical to the bicore reference on every frame — while
+// frame 0, the 1:1 identity frame, reported `vs NEAREST: 35 px differ`. A bilinear filter at exact
+// 1:1 magnification must reproduce the texture EXACTLY. It did not.
+//
+// ⭐ THE ARGUMENT IS CONVENTION-FREE, so "our convention differs" was never available as a defence.
+// Let texel i's centre sit at i+c for ANY c. Then correct nearest = floor(u - c + 0.5) and correct
+// linear taps = floor(u - c) — differing by EXACTLY 0.5 for every c. This blob shipped nearest =
+// floor(u) (tex_rgba, iron-proven 17/17) and bilinear = floor(u): a difference of ZERO. floor/floor
+// is not a matched pair under ANY convention, and nearest was the one pinned to iron, so linear moved.
+//
+// ⛔⛔ THE REAL LESSON IS ABOUT THE ORACLE, NOT THE ARITHMETIC. Byte-identity between a shader and its
+// reference is STRUCTURALLY BLIND to an error the two SHARE. bicore, bimodel, texcore's
+// tex_fetch_bilin and this file all implemented the same wrong convention, so all of them agreed and
+// every gate built on their agreement went green. Worse, the two "corner exactness" gates (bigate G2,
+// texgate GATE 10) probed EXACT INTEGER coordinates — and `tex_uv_at` always adds 32768 for the pixel
+// centre, so **a pixel-centre rasteriser can never emit an integer u at any integer scale**. Those
+// gates were collecting evidence at coordinates the raster path cannot produce: precisely the null
+// set of the error, and one of them actively ASSERTED the bug.
+// ⇒ The only thing that caught it was `gputex`'s DISCRIMINATION GATE — the `vs NEAREST` line — which
+// exists because it is the one measurement in the suite that compares against something OTHER than
+// the reference. **At least one gate must test an EXTERNAL invariant, not internal agreement.**
+//
+// ============================================================================================
 // ⛔⛔ THE REGISTER MAP. WRITE IT DOWN, THEN TRANSCRIBE — NEVER THE OTHER WAY ROUND.
 // ============================================================================================
 // Rung 13 lost an iron burn to a scratch write over a live v19: A2_hi is 0 for any frame whose area
@@ -360,6 +387,15 @@ L_HAVE_COV:
     // the reference is precisely the mismatch class this rung's host gates exist to catch (bimodel
     // M5), and it would show as a uniform half-texel drift, not as an obvious break.
     v_add_u32       v23, s17, v23           // q + mu, 16.16
+    // ⛔⛔ THE HALF-TEXEL BIAS. ITS ABSENCE WAS THE 1.56.29 BURN'S FINDING — see the header.
+    // 0xFFFF8000 is -32768 in two's complement: one VOP2-with-literal, no VCC, no new VGPR.
+    // ⚠ MUST PRECEDE THE FRACTION CAPTURE. Both the taps and the weight derive from the shifted
+    // coordinate; biasing after the capture would fix the taps and leave the weight half a texel out,
+    // which is a subtler wrong than the bug it replaces.
+    // ⚠ v_add_u32-with-literal, NOT v_subrev_u32: `edgeasm.cyr` already emits this encoding class
+    // (e_vop2_lit), so the sovereign second assembler covers it for free. v_subrev would have been
+    // one dword cheaper and a NEW encoding class — the two-assembler discipline costs more than a dword.
+    v_add_u32       v23, 0xFFFF8000, v23    // ⭐ -0.5 texel: taps from floor(u-0.5), weight frac(u-0.5)
     v_lshrrev_b32   v33, 8, v23
     v_and_b32       v33, 0xFF, v33          // ⭐ v33 = fx, 0..255 — MUST SURVIVE THE WHOLE V BLOCK
 
@@ -506,6 +542,7 @@ L_U_TAIL:
 
     // ⭐RUNG15 — capture fy before the floor, exactly as the U axis captured fx.
     v_add_u32       v23, s17, v23           // q + mv, 16.16
+    v_add_u32       v23, 0xFFFF8000, v23    // ⭐ -0.5 texel — see the U axis for the full reasoning
     v_lshrrev_b32   v36, 8, v23
     v_and_b32       v36, 0xFF, v36          // ⭐ v36 = fy, 0..255
 

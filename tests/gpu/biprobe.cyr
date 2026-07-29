@@ -1,0 +1,129 @@
+# biprobe.cyr — WHY DID FRAME 0 ("1:1-identity") DIFFER FROM NEAREST IN 35 PIXELS?
+#
+# The 1.56.29 bilinear burn came back 5/5 EXACT (GPU == bicore) but FALSIFIED pre-registered
+# prediction 3, which said frame 0 must report `vs NEAREST: 0`. It reported 35.
+#
+# ⚠ THE BURN CANNOT ADJUDICATE THIS. It proves GPU == reference. A convention shared by BOTH is
+# invisible to it, by construction. This probe asks the host what the sample coordinates ACTUALLY
+# are on frame 0, so the answer comes from measurement rather than from re-reading the shader.
+
+include "lib/io.cyr"
+include "texcore.cyr"
+
+var BP_TW = 8;
+var BP_TH = 8;
+var bp_tex[64];
+
+fn bp_build(): i64 {
+    var y = 0;
+    while (y < BP_TH) {
+        var x = 0;
+        while (x < BP_TW) {
+            var r = (x * 31 + y * 7) & 0xFF;
+            var g = (y * 29 + x * 3) & 0xFF;
+            var b = (x * y * 5) & 0xFF;
+            store32(&bp_tex + (y * BP_TW + x) * 4, r | (g << 8) | (b << 16) | (255 << 24));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+fn main(): i64 {
+    bp_build();
+
+    # frame 0 exactly as gputex's txf(0) defines it: screen triangle (0,0),(8,0),(0,8)
+    # mapped to UV (0,0),(8,0),(0,8) -- a pure identity in continuous coordinates.
+    if (tri_prep(0, 0, 8, 0, 0, 8, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF) != 1) {
+        ps("biprobe: tri_prep REFUSED"); nl(); return 90;
+    }
+    if (tex_prep(0, 0, 8 << 16, 0, 0, 8 << 16) != 1) {
+        ps("biprobe: tex_prep REFUSED"); nl(); return 90;
+    }
+
+    ps("biprobe: frame 0 '1:1-identity' -- what UV does each pixel centre actually sample?"); nl();
+    nl();
+    ps("  px py    u(16.16)   floor(u)  frac(u)      v(16.16)   floor(v)  frac(v)"); nl();
+
+    var shown = 0;
+    var fx0 = 0;          # how many samples land on fx == 0 (a texel BOUNDARY)
+    var fx128 = 0;        # how many land on fx == 128 (a texel CENTRE, half-texel offset)
+    var fxother = 0;
+    var py = 0;
+    while (py < 8) {
+        var px = 0;
+        while (px < 8) {
+            tex_uv_at(px, py);
+            var u = tx_u_out;
+            var v = tx_v_out;
+            var bu = u >>> 16;
+            var fu = (u >> 8) & 0xFF;
+            var fv = (v >> 8) & 0xFF;
+            if (fu == 0) { fx0 = fx0 + 1; }
+            if (fu == 128) { fx128 = fx128 + 1; }
+            if (fu != 0) { if (fu != 128) { fxother = fxother + 1; } }
+            if (shown < 6) {
+                ps("  "); pn(px); ps("  "); pn(py); ps("    ");
+                pn(u); ps("      "); pn(bu); ps("       "); pn(fu);
+                ps("        "); pn(v); ps("      "); pn(v >>> 16); ps("       "); pn(fv);
+                nl();
+                shown = shown + 1;
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    nl();
+    ps("  fraction census over the 8x8 block:  fx==0: "); pn(fx0);
+    ps("   fx==128: "); pn(fx128); ps("   other: "); pn(fxother); nl();
+    nl();
+
+    # ---- the decisive comparison ---------------------------------------------------------------
+    # At a 1:1 pixel-to-texel mapping, a bilinear filter is expected to REPRODUCE THE TEXTURE
+    # EXACTLY -- "bilinear at 1:1 is identity" is the standard property. Measure whether it does.
+    var diff = 0;
+    var cov = 0;
+    var py2 = 0;
+    while (py2 < 8) {
+        var px2 = 0;
+        while (px2 < 8) {
+            tex_uv_at(px2, py2);
+            tx_bilin = 0;
+            var n = tex_fetch(&bp_tex, &bp_tex, BP_TW, BP_TH, tx_u_out, tx_v_out, 0);
+            var b = tex_fetch_bilin(&bp_tex, &bp_tex, BP_TW, BP_TH, tx_u_out, tx_v_out, 0);
+            cov = cov + 1;
+            if (n != b) { diff = diff + 1; }
+            px2 = px2 + 1;
+        }
+        py2 = py2 + 1;
+    }
+    ps("  AS SHIPPED: bilinear differs from nearest in "); pn(diff); ps(" of "); pn(cov);
+    ps(" samples at a 1:1 mapping"); nl();
+
+    # ---- ⭐ INVERTED INTO A REGRESSION GATE, 2026-07-28 -----------------------------------------
+    # This probe was written to DIAGNOSE the defect and originally carried a second measurement that
+    # passed `tx_u_out - 32768` by hand to demonstrate the fix. That arm is now WRONG: BI_HALF is
+    # applied inside tex_fetch_bilin, so passing a pre-shifted coordinate double-shifts by a full
+    # texel. It has been deleted rather than adjusted -- a diagnostic that silently becomes a
+    # different measurement after the thing it diagnosed is fixed is worse than no diagnostic.
+    #
+    # What remains is the standing assertion: at a 1:1 mapping, bilinear IS nearest. The two
+    # census lines above are kept because they name WHY (every sample at fx = 128, a texel centre),
+    # which is the part that took a burn to learn.
+    if (diff != 0) {
+        ps("  ⛔ REGRESSION: at a 1:1 mapping bilinear must be IDENTICAL to nearest -- every"); nl();
+        ps("    sample lands on a texel CENTRE, where an interpolating filter returns that texel"); nl();
+        ps("    untouched. "); pn(diff); ps(" of "); pn(cov); ps(" differ. This is the half-texel");
+        nl();
+        ps("    defect the first 1.56.29 iron burn exposed. Check BI_HALF in bicore.cyr and the"); nl();
+        ps("    two 'v_add_u32 v23, 0xFFFF8000, v23' in kernel/shaders/tex_bilin.s."); nl();
+        return 91;
+    }
+    ps("  ⇒ bilinear reproduces nearest exactly at 1:1 -- the half-texel bias is present."); nl();
+    ps("    (texgate GATE 11 is the permanent form of this check; GATE 12 falsifies it.)"); nl();
+    return 95;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

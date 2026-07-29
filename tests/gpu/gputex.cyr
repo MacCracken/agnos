@@ -1167,13 +1167,20 @@ fn main(): i64 {
     # RSRC1_TEX where RSRC1_TEXBI belongs — then on any frame where the two filters happen to agree,
     # the arm would go green having proven nothing. So every case ALSO measures how far the GPU's
     # output sits from the NEAREST reference, and the run FAILS if that distance is zero everywhere.
-    # ⚠ Frame 0 is the 1:1 identity case: fx = fy = 0, so bilinear MUST equal nearest there. That is
-    # bigate's G2 (corner exactness) observed on iron, and it is why the gate is on the TOTAL across
-    # frames rather than per-frame — a per-frame gate would fail on the one frame whose agreement is
-    # the correct answer.
+    # ⚠⚠ FRAME 0 IS THE 1:1 IDENTITY CASE AND MUST REPORT `vs NEAREST: 0`. IT IS ASSERTED BELOW.
+    # ⛔ THE ORIGINAL VERSION OF THIS COMMENT STATED A FALSE PREMISE and it is corrected here rather
+    # than quietly rewritten: it said "fx = fy = 0, so bilinear MUST equal nearest". The CONCLUSION is
+    # right; the mechanism is not. `tex_uv_at` samples at PIXEL CENTRES (px + 0.5), so at a 1:1
+    # mapping every sample lands at fx = fy = **128**, a texel CENTRE — never 0. Bilinear equals
+    # nearest there because the tent kernel is INTERPOLATING at texel centres, not because the
+    # fraction vanishes. (Measured: tests/gpu/biprobe.cyr, 64 of 64 samples at fx = 128.)
+    # ⭐ The first burn falsified this prediction — frame 0 reported 35 — and the prediction was
+    # RIGHT: the filter was missing its half-texel bias. Turning it into a live assertion is what
+    # makes that finding permanent instead of a log entry.
     puts2("gputex: BILINEAR -- 4-tap integer filter, CLAMP path; must match bicore byte for byte");
     var bexact = 0;
     var bdiscrim = 0;
+    var bident = 0;      # frame 0 (1:1) must be IDENTICAL to nearest -- see the note above
     tx_bilin = 1;
     var bi = 0;
     while (bi < TXN) {
@@ -1198,6 +1205,8 @@ fn main(): i64 {
             }
             bdiscrim = bdiscrim + nd;
             ps("      vs NEAREST: "); pn(nd); puts2(" px differ");
+            # ⭐ THE 1:1 IDENTITY ASSERTION — the falsified prediction, made permanent.
+            if (bi == 0) { if (nd != 0) { bident = bident + nd; } }
         }
         bi = bi + 1;
     }
@@ -1306,6 +1315,22 @@ fn main(): i64 {
     # ⛔ THE ARM MUST BE ABLE TO TELL BILINEAR FROM NEAREST. Zero separation means every frame agreed
     # with the nearest reference, so a kernel that silently dispatched the rung-13 blob would have
     # scored a perfect green. A gate that cannot fail is not a gate.
+    # ⛔⛔ THE 1:1 IDENTITY GATE — the pre-registered prediction the FIRST burn falsified.
+    # A bilinear filter at exact 1:1 magnification reproduces the texture EXACTLY, because every
+    # sample lands on a texel centre and the tent kernel is interpolating there. Frame 0 is that
+    # mapping. The 1.56.29 burn reported 35 px differing and the filter was missing its half-texel
+    # bias; this assertion is what stops that shipping green a second time.
+    # ⚠ This is the ONLY iron check that compares against something other than the reference. Every
+    # other line in this arm compares GPU to bicore, and a convention error SHARED by shader and
+    # reference is invisible to all of them by construction -- which is exactly how it shipped.
+    if (bident != 0) {
+        ps("gputex: ⛔ BILINEAR at 1:1 differs from NEAREST in "); pn(bident); puts2(" px.");
+        puts2("gputex:   At a 1:1 pixel-to-texel mapping every sample lands on a texel CENTRE, where");
+        puts2("gputex:   an interpolating filter must return that texel untouched. This is the");
+        puts2("gputex:   half-texel-bias defect the first 1.56.29 burn exposed -- check the two");
+        puts2("gputex:   'v_add_u32 v23, 0xFFFF8000, v23' in tex_bilin.s and BI_HALF in bicore.cyr.");
+        return 86;
+    }
     if (bdiscrim == 0) {
         puts2("gputex: ⛔ BILINEAR output is IDENTICAL to nearest on every frame, so this arm cannot");
         puts2("gputex:   distinguish a working filter from one that was never dispatched. Either the");

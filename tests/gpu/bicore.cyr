@@ -50,6 +50,36 @@ include "lib/io.cyr"
 var BI_WSHIFT = 16;         # weights sum to 1<<16
 var BI_FBITS  = 8;          # 8-bit fractional weights, 0..255
 
+# ============================================================================================
+# ⛔⛔ BI_HALF — THE HALF-TEXEL BIAS. ADDED 2026-07-28 AFTER THE 1.56.29 IRON BURN FOUND ITS ABSENCE.
+# ============================================================================================
+# The first version of this file took its taps from floor(u) with weight frac(u). That is WRONG, and
+# the burn proved it in the only way it could: `gputex` reported BILINEAR 5 of 5 EXACT (shader ==
+# this reference, byte for byte) while frame 0 — the 1:1 identity frame — reported `vs NEAREST: 35 px
+# differ`. A bilinear filter at exact 1:1 magnification must reproduce the texture EXACTLY.
+#
+# ⭐ THE ARGUMENT IS CONVENTION-FREE, WHICH IS WHY THERE IS NO "BUT OUR CONVENTION IS DIFFERENT"
+# DEFENCE. Let texel i's centre sit at i+c, for ANY c. Then
+#       correct nearest      = floor(u - c + 0.5)
+#       correct linear taps  = floor(u - c)
+# and those differ by EXACTLY 0.5 for every c. AGNOS ships nearest = floor(u) (texcore's tex_fetch,
+# iron-proven 17/17 across rungs 13/14) and shipped bilinear = floor(u) — a difference of ZERO. A
+# floor/floor pair is not matched under ANY convention, so one of the two had to move, and it could
+# not be nearest.
+#
+# ⇒ The tent kernel is INTERPOLATING (h(0)=1, h(±1)=0), so with the bias applied the reconstruction
+# passes exactly through every texel value at every texel CENTRE: at u = i + 0.5, frac(u-0.5) = 0 and
+# the filter returns T[i] untouched. That is GL 4.6 §8.14.2 verbatim (i0 = floor(u - 0.5),
+# alpha = frac(u - 0.5)) and D3D's rule, arrived at here from the internal inconsistency alone.
+#
+# ⚠ WHY NO HOST GATE CAUGHT IT, which is the more useful lesson than the bug. bigate's G2 and
+# texgate's GATE 10 both probed EXACT INTEGER coordinates (i * 65536) — but `tex_uv_at` always adds
+# 32768 for the pixel centre, so **a pixel-centre rasteriser can never emit an integer u at any
+# integer scale**. The entire corner-exactness evidence base was collected at coordinates the raster
+# path cannot produce: precisely the null set of the error. Both gates have been re-pointed at texel
+# CENTRES, where the property is both true and reachable.
+var BI_HALF = 32768;        # 0.5 texel in 16.16 — the sample-to-tap bias
+
 # bi_frac(uv1616) — the 8-bit weight from a 16.16 coordinate: the top 8 bits of the low 16.
 # ⚠ Truncation, not rounding. The shader does the same shift; a rounded fraction here and a
 # truncated one there is precisely the class of mismatch this rung exists to avoid.
@@ -104,6 +134,13 @@ fn bi_clamp(i, n): i64 {
 # wrap != 0 selects WRAP (po2 dims, ABI-enforced), wrap == 0 selects CLAMP.
 # Returns a packed 32-bit texel. tex is a byte address holding tw*th u32 texels.
 fn bi_sample(tex, tw, th, u, v, wrap): i64 {
+    # ⭐ THE HALF-TEXEL BIAS, APPLIED ONCE AND BEFORE EVERYTHING. Both the taps AND the weight must
+    # come from the shifted coordinate — see BI_HALF's block above for why this is convention-free.
+    # ⚠ It goes here, not inside bi_floor/bi_frac: those are also the model's spec for the shader's
+    # `v_ashrrev_i32` / `v_lshrrev_b32+v_and_b32` pair, and burying a bias inside them would make the
+    # shader and the reference disagree about what those primitives mean.
+    u = u - BI_HALF;
+    v = v - BI_HALF;
     var bx = bi_floor(u);
     var by = bi_floor(v);
     var x0 = 0; var y0 = 0; var x1 = 0; var y1 = 0;

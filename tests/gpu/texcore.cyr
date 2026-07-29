@@ -210,7 +210,18 @@ var tx_premul_hits = 0;
 # shared bug: clamp(clamp(-1)+1) = 1 but clamp(-1+1) = 0. Under mask-WRAP the two orders are
 # identical, so a wrap-only corpus would never separate them.
 fn tex_fetch_bilin(tex, lut, tw, th, u, v, idx8): i64 {
+    # ⚠ tmut_centre NOW MEANS SOMETHING DIFFERENT ON THIS PATH, and saying so is the point. On the
+    # nearest path +32768 is "the +0.5 the plan warns about" — a bug. Here it exactly CANCELS the
+    # BI_HALF bias below, so it reverts the half-texel fix. Still a valid mutation, different meaning.
+    # ⛔ STANDING GAP: tex_selftest/tex_falsify never call this function, so tmut_centre has never
+    # been falsified on the BILINEAR path at all. Written down rather than implied.
     if (tmut_centre == 1) { u = u + 32768; v = v + 32768; }
+    # ⭐ THE HALF-TEXEL BIAS — see bicore.cyr's BI_HALF block for the convention-free argument.
+    # Nearest is floor(u); linear taps are floor(u - 0.5). Those are the SAME convention (texel i's
+    # centre at i + 0.5), not a contradiction — they differ by 0.5 because nearest rounds to the
+    # nearest centre while linear brackets between centres.
+    u = u - BI_HALF;
+    v = v - BI_HALF;
     var bx = u >>> 16;
     var by = v >>> 16;
     if (tmut_lshift == 1) { bx = u >> 16; by = v >> 16; }

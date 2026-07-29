@@ -66,9 +66,35 @@ Gates 9/10 give the new four-tap addressing its first oracle (2178 samples, WRAP
 multi-tile UV; corner-exact at all 64 texel centres). `burn-prep.sh` refuses to flash a `gputex`
 lacking the bilinear arm **or** its discrimination check — a pre-1.56.29 binary passes every
 col-major string and exits 95 with zero bilinear data.
-▶ **REMAINING for rung 15: THE BURN.** Everything host-provable is proven; the shader itself has no
-host oracle by construction. Run order on iron: `gputri --cov` (must still be 20/20) → `gputex` →
-`klug > /tex1.txt`.
+⛔⛔ **THE BURN RAN 2026-07-28 AND FOUND A REAL DEFECT *THROUGH A GREEN RESULT*.** `gputex` reported
+**BILINEAR 5 of 5 EXACT** — and the filter was still wrong. Frame 0 (the 1:1 identity frame) reported
+`vs NEAREST: 35 px differ`, **falsifying pre-registered prediction 3**. A bilinear filter at exact
+1:1 magnification must reproduce the texture EXACTLY. The taps were coming from `floor(u)`/`frac(u)`;
+they must come from **`floor(u - 0.5)`/`frac(u - 0.5)`**.
+⭐ **CONVENTION-FREE ARGUMENT** (so "our convention differs" was never a defence): for texel *i*'s
+centre at *i+c*, correct nearest = `floor(u-c+0.5)` and correct linear taps = `floor(u-c)` — differing
+by **exactly 0.5 for every c**. AGNOS shipped both as `floor(u)`, a difference of ZERO. Not a matched
+pair under ANY convention; nearest is pinned to iron 17/17, so linear moved. Adjudicated by four
+independent analyses + three adversarial refuters — **0 of 3 could refute it**.
+✅ **FIXED** (1.56.29, same open cycle): `v_add_u32 v23, 0xFFFF8000, v23` per axis in `tex_bilin.s`
+(580 → **584 dwords**, no new VGPR, RSRC1 unchanged), `BI_HALF` in `bicore`, matching bias in
+`texcore`'s `tex_fetch_bilin` and `bimodel`'s `bm_sample`. ⛔ **NOT** folded into `gpu_tex_prep`'s
+`mu`/`mv` — looks free, is not: `limu` is *derived* from `mu`, so it would shift the out-of-domain
+predicate half a texel. Nearest untouched.
+⛔⛔ **THE LESSON, which outlives the bug: byte-identity between a shader and its reference is
+STRUCTURALLY BLIND to an error the two SHARE.** All four implementations carried the same wrong
+convention, so all agreed and every gate built on their agreement went green. Worse — `bigate` G2 and
+`texgate` GATE 10a probed **exact integer coordinates**, but `tex_uv_at` always adds 32768 for the
+pixel centre, so **a pixel-centre rasteriser can never emit an integer u at any integer scale**: they
+were collecting evidence on the null set of the error, and 10a actively *asserted* the bug. The only
+thing that caught it was the **discrimination gate** (`vs NEAREST`), the one measurement comparing
+against something other than the reference. ⇒ **At least one gate must test an EXTERNAL invariant.**
+New: `texgate` **GATE 11** (absolute — bilinear at 1:1 == the source texture, via `tex_uv_at`) and
+**GATE 12** (falsifies it, breaks 63/64); GATE 10 inverted; `bigate` G2 re-anchored + G2b;
+`bimodel` **M6**; `gputex` now asserts frame 0 == 0 and `burn-prep` enforces its presence.
+▶ **REMAINING for rung 15: A RE-BURN.** ⚠ The golden data moved on all five frames, so the previous
+5/5 EXACT carries no independent weight — it proved GPU == reference, of a reference that has since
+changed. Run order on iron: `gputri --cov` (must still be 20/20) → `gputex` → `klug > /tex1.txt`.
 ⛔ **THE TRAP CLASS THIS RUNG KEEPS PRODUCING: correct under WRAP, wrong under CLAMP.** Three instances
 now — the M2 shift kind, the `+1` neighbour needing the **pre-clamp floor**, and the out-of-domain
 predicates needing to fire on **both** taps. A wrap-only suite sees none of them. Anyone adding a

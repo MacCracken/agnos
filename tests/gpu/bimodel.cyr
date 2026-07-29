@@ -34,6 +34,12 @@ var bm_mut_logical  = 0;   # M2 `>>` (logical) for the floor instead of `>>>` �
 var bm_mut_acc16    = 0;   # M3 truncate the accumulator to 16 bits — simulates a too-narrow lane
 var bm_mut_no_plus1 = 0;   # M4 sample x0 twice instead of x0/x1 — degenerates to nearest
 var bm_mut_roundfrac= 0;   # M5 round the fraction instead of truncating
+# ⭐ M6 — DROP THE HALF-TEXEL BIAS. This is the mutation that reproduces the defect the 1.56.29 iron
+# burn exposed: taps and weight taken from floor(u)/frac(u) instead of floor(u-0.5)/frac(u-0.5).
+# ⛔ WITHOUT M6 THE FIX SHIPS WITH NOTHING PROVING IT IS LOAD-BEARING. Every other gate in this file
+# compares the model against bicore, and both moved together — so all of them would stay green with
+# the bias deleted from both. M6 is the one that fails if the bias stops mattering.
+var bm_mut_nohalf   = 0;   # M6 revert the half-texel bias (the shipped 1.56.29 defect)
 
 # bm_floor32 — the shader's `v_ashrrev_i32 v, 16, uv`. ARITHMETIC shift: UV legitimately goes
 # negative under WRAP, and floor(-0.5) must be -1. ⚠ In Cyrius `>>>` is arithmetic and `>>` is
@@ -64,6 +70,11 @@ fn bm_addr(x, y, tw): i64 { return ((y * tw + x) * 4) & BM_MASK32; }
 
 # bm_sample — the shader's whole per-pixel sequence, at 32-bit widths.
 fn bm_sample(tex, tw, th, u, v, wrap): i64 {
+    # ⭐ THE HALF-TEXEL BIAS, mirroring the shader's placement EXACTLY: one subtract on the 16.16
+    # coordinate, before the floor and before the fraction capture, so both derive from it.
+    # In tex_bilin.s this is a single `v_add_u32 v23, 0xFFFF8000, v23` per axis, inserted directly
+    # after the `q + mu` add and before `v_lshrrev_b32 v33, 8, v23`.
+    if (bm_mut_nohalf == 0) { u = u - BI_HALF; v = v - BI_HALF; }
     var bx = bm_floor32(u);
     var by = bm_floor32(v);
     var fx = bm_frac32(u);
@@ -197,10 +208,17 @@ fn main(): i64 {
     bm_mut_acc16 = 1;    bad = bad + bm_gate("M3 accumulator truncated to 16 bits:", bm_sweep(), 1);        bm_mut_acc16 = 0;
     bm_mut_no_plus1 = 1; bad = bad + bm_gate("M4 +1 neighbour collapsed (nearest, not bilinear):", bm_sweep(), 1); bm_mut_no_plus1 = 0;
     bm_mut_roundfrac = 1;bad = bad + bm_gate("M5 fraction rounded instead of truncated:", bm_sweep(), 1);   bm_mut_roundfrac = 0;
+    # ⭐ M6 — THE 1.56.29 DEFECT ITSELF, kept as a live mutation. Swept on BOTH modes: unlike M2 (the
+    # shift kind, provably invisible under WRAP) a half-texel bias is observable in both, and
+    # asserting that is what stops anyone re-deriving "it only matters under clamp".
+    bm_mut_nohalf = 1;
+    bad = bad + bm_gate("M6 half-texel bias dropped [WRAP] -- the shipped 1.56.29 defect:", bm_sweep(), 1);
+    bad = bad + bm_gate("M6 half-texel bias dropped [CLAMP]:", bm_sweep_clamp(), 1);
+    bm_mut_nohalf = 0;
 
     nl();
     if (bad == 0) {
-        ps("bimodel: PASS -- the 32-bit-lane model is byte-identical to the reference, and all five");
+        ps("bimodel: PASS -- the 32-bit-lane model is byte-identical to the reference, and all SIX");
         nl();
         ps("         mutations break it WHERE THEY CAN. A red iron burn now convicts the EMISSION.");
         nl();
