@@ -990,7 +990,16 @@ Every bite must name which instrument it uses. The arc's existing three — **I1
 | `0x0D` | `GPU_OP_DEPTH_CLEAR` | `z_handle · wh · value` | 17 | the pilot |
 
 `GPU_OP_SUPPORTED` grew `0x1F` → **`0x1F1F` (shipped 1.56.23** — ops 0x00–0x04 and 0x08–0x0C**)**;
-rung 17 must extend it to `0x3F1F`.
+rung 17 extended it to **`0x3F1F`** (bit 13 `0x0D DEPTH_CLEAR`, 1.56.30) and then to **`0x7F1F`**
+(bit 14 `0x0E TRI_DEPTH`).
+
+> ⭐⭐ **AND `GPU_OP_SUPPORTED` IS NO LONGER WHAT `#89` ADVERTISES.** It is the VALIDATOR's
+> reachability gate — `gpo_validate` rejects anything outside it with `GPO_E_BADOP` at its first
+> line, so an op left out of the word cannot have a single one of its field rules tested. What ring
+> 3 is *told* must stay the smaller set, or the advertised surface exceeds the proven one, which is
+> the 1.56.24 defect exactly. **`GPU_OP_NOTIMPL_MASK`** holds ops whose ABI is finished and whose
+> worker is not, and `gpu_caps +28` reports `GPU_OP_SUPPORTED & ~GPU_OP_NOTIMPL_MASK`. `0x0E` sits
+> in it until the worker lands; both moves happen in one change or the mask becomes a lie.
 
 ⛔ **`0x0C` WAS RESERVED HERE FOR `DEPTH_CLEAR` AND 1.56.23 ALLOCATED IT TO `TEX_LIST` INSTEAD.** The
 collision was caught during handoff prep, not at rung 17 — where it would have surfaced as an op

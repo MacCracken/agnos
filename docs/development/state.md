@@ -284,12 +284,41 @@ same rational at every covered pixel, cross-multiplied in exact integers (**689/
 ⭐ **All three passed first run, so all three are falsified in-file** — `M-D10` moves the 2D path's
 sample from the pixel centre to its corner (**a half-pixel error, the rung-15 class exactly**) and
 **92 px** change; `M-D11a` reddens 689, `M-D11b` reddens 182.
-▶ **REMAINING for rung 17 — FIVE bites, not "the shader"** (⚠ this line previously said *"REMAINING:
+✅ **(6) OP `0x0E`'s ABI (B5) — 127/127 battery, `edge-abi-smoke` 16/16.** `gpo_validate_tridepth`,
+18 rules, field mask `0x01FF`, `GPO_E_SUBPIXEL/ZRANGE/ALIGN` (30/31/32), 24 new cases. The **ALIGN**
+rule is what lets the shader keep `exec == -1` throughout (no partial tile ⇒ no bounds guard ⇒ no
+forged S1 dropout signature); **SUBPIXEL is a reject, not a quantisation**; the **corner bound** is
+evaluated at the draw rect's four corners because the shader is predicated, with `gpo_lane_bad`
+bounding against **2^31−1 SIGNED** (a value in `[2^31, 2^32)` fits the register and restores negative
+in the compare that reads it).
+⛔ **`GPU_OP_SUPPORTED` AND WHAT `#89` ADVERTISES ARE NOW TWO WORDS, because the plan's B5 asked for
+something the kernel forbids.** It said "bit 14 … worker returns `GPO_E_NOTIMPL`" — but
+`syscall.cyr`'s own comment says growing that word **advertises the op**, and 1.56.24 fixed exactly
+that defect. Leaving `0x0E` out is equally impossible: `gpo_validate` gates on it at line 1, so no
+field rule could be tested. ⇒ **`GPU_OP_NOTIMPL_MASK`** — `GPU_OP_SUPPORTED` (`0x7F1F`) is the
+*validator's* gate, `gpu_caps +28` reports `& ~GPU_OP_NOTIMPL_MASK`. Rung 15's bilinear flag is the
+precedent one level down; a *flag* needed no such word because `#89` advertises ops, not flags.
+⛔⛔ **`GPU_TRID_Z_MAX` IS NECESSARY BUT NOT SUFFICIENT — measured.** On a 32×32 rect `zn` at a corner
+is `area × z = 4096z`, so **any z above ~524,000 fails the corner bound** and the 2^24−1 ceiling is
+unreachable: the two rules cannot be told apart, and "z one past the ceiling" would pass even if the
+ceiling rule did not exist. Witnessing it needs slack — a 4-px triangle in an 8×8 rect (area 64,
+`zn = 1.07e9`). Both geometries are in the battery.
+⛔ **The first run came back 118/127 and the file had already named the trap**: the shm table is torn
+down before the `0x0D` battery (which uses no slots and never noticed), so every slot-using `0x0E`
+case returned "a REAL reject for an UNREAL reason" — and the two cases that *expect* `DSTSLOT` passed
+for the wrong reason and would have hidden it. ⚠ Slot ids are **1-based**; the neighbouring `0x0A`
+comments name the wrong sizes and still pass for a different reason than they claim.
+⚠ **Cyrius diagnostic bug, worth filing**: three added locals gave `undefined variable 'tb'` pointing
+at a correctly-declared variable with the caret on another line; the real defect was a later `var tz`
+duplicating an earlier local. In isolation the duplicate gives a clean `duplicate variable` at the
+right line — so the diagnostic degrades when a duplicate follows a new declaration. Bisected 1–4
+extra locals: **not** a per-function cap.
+▶ **REMAINING for rung 17 — FOUR bites, not "the shader"** (⚠ this line previously said *"REMAINING:
 (2) the shader"*, which collapsed B3–B9 into one and would have put a 584-dword blob ahead of the
 program it is supposed to reproduce). Per [`planning/rung17-tri-depth.md`](planning/rung17-tri-depth.md)
-§7: **B5** ABI `0x0E` · **B6** `0x10 GPU_OP_RT_READ` (**blocking**: without a z readback the burn
-cannot fail on a broken divide) · **B7** prep · **B8** `tri_depth.s` · **B9** worker · **B10** the
-burn. The four pins must not be re-opened at transcription time.
+§7: **B6** `0x10 GPU_OP_RT_READ` (**blocking**: without a z readback the burn cannot fail on a broken
+divide) · **B7** prep · **B8** `tri_depth.s` · **B9** worker · **B10** the burn. The four pins must
+not be re-opened at transcription time.
 
 Remaining after rung 15 — ⚠ **this list was STALE by +2 until 2026-07-28** (it still carried the
 pre-renumbering mapping and collapsed rungs 17/18/19 into one cut); [`planning/gpu.md`](planning/gpu.md)

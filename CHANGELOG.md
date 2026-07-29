@@ -140,6 +140,75 @@ number was not.
 no longer calls. It now lists the one-time-cost case **first**, because that is how the gate actually
 fired.
 
+### Added — RUNG 17 B5: op `0x0E GPU_OP_TRI_DEPTH`'s ABI, and a validator with 18 rules
+
+`gpo_validate_tridepth`, field mask `0x01FF`, `GPO_E_SUBPIXEL/ZRANGE/ALIGN` (30/31/32), and **24 new
+ABI battery cases — 127 of 127 correct**, `edge-abi-smoke` 16/16.
+
+⭐ **The alignment rule is what lets the shader run with `exec == -1` throughout.** `w`, `h`, `dx`,
+`dy` must all be multiples of the 8×8 tile, so there is no partial tile and the kernel needs no
+bounds guard. Both halves matter: without the rule the last tile row stores past the back buffer and
+`VM_CONTEXT0` is disabled so the write lands somewhere real; with a prologue guard instead, every
+edge tile shows lane dropouts byte-identical to the S1 register-aliasing signature the lane witness
+exists to detect.
+
+⭐ **Sub-pixel coordinates are REJECTED, not quantised** — the reference and model prove this
+arithmetic in the doubled-integer domain only, so rounding kernel-side would accept a request and
+silently answer a different one. Same doctrine as `WRAP`'s power-of-two reject.
+
+⭐ **The corner bound evaluates `w0/w1/w2/zn` at the four corners of the draw rect**, not over the
+covered set, because the shader is predicated and runs every lane of the tile. `gpo_lane_bad` bounds
+against **2^31−1, signed**: a value in `[2^31, 2^32)` fits a 32-bit register but restores *negative*
+in the `v_cmp_*_i32` that reads it.
+
+### ⛔ `GPU_OP_SUPPORTED` and what `#89` advertises are now two different words
+
+The plan's B5 said "`GPU_OP_SUPPORTED` bit 14 … worker returns `GPO_E_NOTIMPL`". That is not
+available: `syscall.cyr`'s own comment four lines above the constant says growing it **advertises the
+op**, and 1.56.24 established that the accepted surface must equal the proven one. But leaving `0x0E`
+out is equally impossible — `gpo_validate` gates on that word at its first line, so every field rule
+below would answer `GPO_E_BADOP` and none could be tested.
+
+⇒ **`GPU_OP_NOTIMPL_MASK`**. `GPU_OP_SUPPORTED` (now `0x7F1F`) is the *validator's reachability gate*;
+`gpu_caps +28` reports `GPU_OP_SUPPORTED & ~GPU_OP_NOTIMPL_MASK`, so ring 3 is never told an op works
+when it does not. Rung 15's bilinear flag set the precedent one level down — minted `NOTIMPL`, moved
+to accepted in the same change as the blob — but a *flag* could do that without this word because
+`#89` advertises ops, not flags. When the worker lands, bit 14 clears and the `GPO_E_NOTIMPL` return
+at the end of the validator goes, in one change.
+
+### ⛔ Two traps this battery walked into, both already documented in the file that set them
+
+- **The shm table is torn down before the `0x0D` battery** — which needs no slots and never noticed.
+  The first run came back **118/127** with nine `got 24`/`got 17`: green on every case that rejects
+  before a slot lookup, red on every case that reaches one. That is precisely *"a REAL reject for an
+  UNREAL reason, which is the worst kind of red because the code under test was fine"* — the restore
+  loop's own comment, arriving from the other direction. Worse, the two cases that *expect*
+  `GPO_E_DSTSLOT` were passing for the wrong reason and would have hidden it. Fixed by re-seeding
+  inside the block and restoring after.
+- **Slot ids are 1-based** (`shm_slot_valid`: `slot = id - 1`). The neighbouring `0x0A` cases carry
+  comments naming the wrong sizes for these ids and still pass, for a different reason than they
+  claim. Every id here was re-derived from the seeding block rather than copied.
+
+### ⛔ `GPU_TRID_Z_MAX` is necessary but NOT sufficient — the corner bound is the binding constraint
+
+Measured while writing the battery: on a 32×32 draw rect, `zn` at a rect corner is `area × z` =
+`4096 × z`, so **any z above ~524,000 fails the corner bound** and the 2^24−1 ceiling is unreachable
+there — the two rules cannot be told apart, and a "z one past the ceiling" case would pass even if
+the ceiling rule did not exist. Witnessing the ceiling on its own terms needs a rect where the corner
+bound has slack: a 4-px triangle in an 8×8 rect has area 64, so `zn = 64 × (2^24−1) = 1.07e9`, inside
+the lane, and `z = 2^24` is still inside it. Both geometries are in the battery, and the interaction
+is documented where a caller reading only the z ceiling would otherwise be surprised.
+
+### Found — a cyrius diagnostic named the wrong identifier
+
+Adding three locals to `edge_abi_selftest` produced `error: undefined variable 'tb'` pointing at a
+line where `tb` was correctly declared two lines above, with the caret under a *different* line. The
+actual defect was a later `var tz` duplicating a local already declared earlier in the same function.
+⚠ The duplicate **in isolation** produces a clean `duplicate variable` error at the right line — so
+the diagnostic degrades specifically when a duplicate follows another new declaration. Bisected: 1, 2,
+3 and 4 additional locals all build fine, so it is not a per-function local cap. Worked around by
+reusing existing locals; worth filing against cyrius.
+
 ### Added — RUNG 17 B4: the two EXTERNAL gates, the only ones not resting on a shared premise
 
 ⛔ **Everything else in `depthgate`/`depthmodel` is an agreement between two artifacts written the

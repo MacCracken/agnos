@@ -1,7 +1,13 @@
 # Rung 17 `tri_depth` — build plan (derived 2026-07-28, adversarially verified)
 
-> **Status (2026-07-29)**: **B0, B1, B2, B3, B4 LANDED — zero burns**, `host-gpu-oracles.sh` 8/8 exit 95,
-> `check.sh` 21/21. Next bite is **B5** (the `0x0E` ABI, worker returning `GPO_E_NOTIMPL`).
+> **Status (2026-07-29)**: **B0–B5 LANDED — zero burns**, `host-gpu-oracles.sh` 8/8 exit 95,
+> `check.sh` 21/21, ABI battery **127/127**, `edge-abi-smoke` 16/16. Next bite is **B6**
+> (`0x10 GPU_OP_RT_READ`, blocking).
+>
+> ⛔ **B5 did not land as specified.** It asked for `GPU_OP_SUPPORTED` bit 14 with a `GPO_E_NOTIMPL`
+> worker; that advertises a non-working op through `#89`, which 1.56.24 forbids. Resolved with
+> `GPU_OP_NOTIMPL_MASK` — see §1.6. ⚠ Also measured there: **`GPU_TRID_Z_MAX` is necessary but not
+> sufficient**, because the corner bound binds far below it at any useful rect size.
 >
 > ⭐ **B4 landed as D10/D11 with in-file falsification.** All three external assertions passed on
 > their first run, which is precisely when "the gate is right" and "the gate is inert" look the same;
@@ -167,7 +173,7 @@ GPO_E_ALIGN        = 32
 
 | site | change |
 |---|---|
-| `syscall.cyr:1201` `GPU_OP_SUPPORTED` | `0x3F1F` → **`0x17F1F`** (bit 14 = `0x0E`, bit 16 = `0x10`) |
+| `syscall.cyr:1201` `GPU_OP_SUPPORTED` | `0x3F1F` → **`0x7F1F`** at B5 (bit 14 = `0x0E`); bit 16 = `0x10` follows at B6. ⛔ **AND A SECOND WORD**: this constant is now the *validator's* reachability gate only — `gpu_caps +28` reports `GPU_OP_SUPPORTED & ~GPU_OP_NOTIMPL_MASK`, because B5 as written ("bit 14 … worker returns `GPO_E_NOTIMPL`") advertises an op that does not work, which is the 1.56.24 defect and which `syscall.cyr`'s own comment forbids. Leaving `0x0E` out was equally impossible: `gpo_validate` gates on the word at line 1, so no field rule could be tested at all. |
 | `gpo_field_mask` | `+ 0x01FF` for `0x0E`, `+ 0x009F` for `0x10` |
 | `gpo_flags_known` | `return 0` for both |
 | `gpo_validate` dispatch | two lines, above the generic tail |
@@ -617,7 +623,7 @@ Each bite is independently verifiable and lands green. **Bites 1–6 are zero-bu
 | ✅ **B2** | ⭐ corpus: PRECISION + QUAD + OFF-ORIGIN frames; depthgate D0d / D5 / D0e; coverage print | exit 95; **D5 shows the two orders DIFFERING** | 0 |
 | ✅ **B3** | reshape `depthcore`+`depthmodel` to the shipping program (winding normalisation, `dstxy` fold, derived `w2`, `v_max` clamp, unsigned compare, no min-bias) + G6 corner bound | byte-identical colour AND z, both orders, all frames | 0 |
 | ✅ **B4** | **external gates** G7 (constant-z silhouette vs the `tri_rgba` path) + G8 (analytic interpenetration line) | exit 95 | 0 |
-| **B5** | **ABI only** — `0x0E` constants, `gpo_validate_tridepth`, field mask, flags, `GPU_OP_SUPPORTED` bit 14, battery. Worker returns `GPO_E_NOTIMPL`. | `edge_abi_selftest` N of N; `kprint-len-check.sh` | 0 |
+| ✅ **B5** | **ABI only** — `0x0E` constants, `gpo_validate_tridepth`, field mask, flags, `GPU_OP_SUPPORTED` bit 14, battery. Worker returns `GPO_E_NOTIMPL`. ⛔ **Landed with `GPU_OP_NOTIMPL_MASK`, not as written** — see below. | `edge_abi_selftest` **127/127**; `edge-abi-smoke` 16/16; `kprint-len-check.sh` | 0 |
 | **B6** | **`0x10 GPU_OP_RT_READ`** — kernel memcpy from `gpu_rt_base_phys`, validator, battery, `GPU_OP_SUPPORTED` bit 16 | battery + a QEMU/mirshi round-trip against a `0x0D`-cleared handle | 0 |
 | **B7** | `gpu_tri_depth_prep` — affine hoist, winding, `dstxy` fold, `R = 2^32/area`, corner bounds, residues, arena write; `check-arena.sh` slots | a kernel selftest diffing prep output against `depthmodel`'s hoist on all four frames | 0 |
 | **B8** | `tri_depth.s` + the §3 register map as its header block + `edgeasm` emit + `ea_vgpr_check` + `tridepth-carry.sh` + RSRC harvest + blob table + `RSRC1_TDEP` | **two independent assemblers agree**; VGPR check green; carry gate green | 0 |
