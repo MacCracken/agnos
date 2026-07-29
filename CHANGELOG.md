@@ -7,6 +7,51 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 **Rung 18 `persp-correct` — cycle OPEN.** Bumped on cycle open; the user tags on close.
 
+### Added — `perspdiv.cyr`: the per-pixel divide, and the DECISION it forces
+
+`tests/gpu/perspdiv.cyr`, exit 95, wired in (**10** host oracles now). The obligation is the defining
+property of the floor, `q*D <= N < (q+1)*D`, checked **by multiplication only, never a second divide** —
+the same doctrine `depthdiv` established for rung 17, with two counters because an overshoot and an
+undershoot are different defects.
+
+Two candidates, over 730 boundary cases spanning the measured domain (`N` to 2^51, `D` in [2^23, 2^29],
+divisors at powers of two ±1 plus the odd/prime and the measured extremes):
+
+| candidate | violations | cost | needs a proof? |
+|---|---|---|---|
+| **A** restoring divide | **0** (0 overshoot, 0 undershoot), 52 iterations | ~156 instr/px | **no — exact by construction** |
+| **B** `v_rcp_f32` seed + correction | **0** at both ISA extremes | ~96 instr/px | yes, a derived error bound |
+
+⭐ **DECISION: candidate A.** Four reasons, none of them preference:
+
+1. **Exact by construction** — no bound to prove, no ISA guarantee to trust, and **no reference that
+   has to model an approximation.** That answers the release row's own objection rather than accepting
+   it.
+2. **The tree already chose this, for this reason.** `edge_setup.s` picked a 32-iteration restoring loop
+   over `v_rcp_f32`, and its comment is the precedent verbatim.
+3. **Affordable on a measurement, not a hope** — 1.56.26/27/28 measured CPU prep dominating GPU time by
+   **~52×**, so ~52 iterations per pixel spends the cheap resource.
+4. Candidate B **works** but needs a correction loop sized from a **derived bound of 32**
+   (`Q·2^-23 = 2^28·2^-23`), not the **9** this sweep observed.
+
+### ⛔ Two defects in this gate, both mine, both worth recording
+
+- **The first sweep ran 32 of 576 cases.** It invented `N` independently of `D` and then discarded
+  everything outside the domain — but `N ≈ Q·D`, so a large divisor comes with a small quotient. A
+  sweep that generates out-of-range values and filters them reports coverage it does not have. Fixed by
+  sweeping `(Q, D)` and **deriving** `N`.
+- **Candidate B failed at `eps = 0`** — i.e. with a *perfect* reciprocal — which is impossible for the
+  candidate and therefore had to be the gate. It was: the staged multiply overflowed i64. ⭐ That
+  `eps = 0` arm exists as a **control** precisely so a mis-measurement announces itself instead of
+  being written up as a finding about the candidate.
+
+⚠ **And one thing left explicitly unverified rather than claimed.** A Newton step should collapse B's
+32 corrections to 1 (it doubles the seed's 23 significant bits to ~46). The implementation here does
+**not** — measured, it leaves the observed maximum at 9 — so its fixed-point staging is wrong somewhere.
+It is kept out of the live path and labelled as an unverified lead, because a refinement whose own gate
+cannot demonstrate it working is the "exact only empirically" defect wearing a proof. B's numbers above
+are the honest no-Newton numbers.
+
 ### Added — `perspbits.cyr`: the width question, MEASURED before any design
 
 `tests/gpu/perspbits.cyr`, exit 95, wired into `host-gpu-oracles.sh` (now **9** oracles).

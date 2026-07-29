@@ -1,0 +1,330 @@
+# perspdiv.cyr — RUNG 18's DIVIDE, PROVEN BEFORE THE SHADER EXISTS.
+#
+# `perspbits` measured the shape: a **64-bit numerator over a 32-bit divisor, with the divisor VARYING
+# per pixel** (N 49-51 bits, D 24-29 bits, quotient 28 bits, at the converged scale K=12..24). Neither
+# of the tree's two iron-proven reciprocals covers that:
+#   * rung 17's `R = floor(2^32/area)` divides by a PER-TRIANGLE constant, precomputed on the CPU;
+#   * rung 13's `recip32` divides a 96-bit numerator but its reciprocal is ALSO hoisted per triangle.
+# So the per-pixel reciprocal is the whole novel content of rung 18, exactly as the exact-divide was
+# rung 17's, and it gets the same treatment: an obligation discharged on the host, at zero burns.
+#
+# ============================================================================================
+# THE OBLIGATION — checked by MULTIPLICATION only, never by a second divide
+# ============================================================================================
+#     q*D <= N < (q+1)*D      for every (N, D) the ABI permits
+#
+# ⛔ NOT "the modelled divide equals N/D". That is two implementations agreeing, and a shared premise
+# is invisible to it — which is what shipped rung 15's half-texel with four green gates. Two counters,
+# never one: an OVERSHOOT refutes the no-overshoot proof that licenses a one-sided correction, an
+# UNDERSHOOT means the correction count is too low. Different defects, different fixes.
+#
+# ============================================================================================
+# ⭐⭐ THE ARGUMENT THAT RECOVERS v_rcp_f32 — AND THE ONE THAT DECIDES AGAINST IT
+# ============================================================================================
+# `edge_setup.s:15-19` bans v_rcp_f32 because it is "exact only EMPIRICALLY ... and a +1-ULP
+# perturbation the ISA permits breaks it inside our operand range". The rung-18 release row prescribes
+# it anyway and admits the cost: "the CPU reference must use the same approximation or the diff is
+# unfair" — which would make the reference a MODEL OF THE HARDWARE instead of a statement of truth.
+#
+# ⭐ There is a way out the row does not consider: use the reciprocal only as a **SEED**, and put an
+# exact integer correction behind it. If the correction is proven to converge under the WORST CASE THE
+# ISA PERMITS — not under the accuracy the part happens to deliver — then the approximation is absorbed
+# and the reference needs no knowledge of it whatsoever. The empirical-vs-specified objection
+# evaporates, because nothing downstream depends on the seed being better than its guarantee.
+# ⇒ So this gate models the seed as `R = (2^k/D)(1+eps)` with |eps| bounded ONLY by the ISA's 1 ULP of
+# a 24-bit mantissa, sweeps eps at both extremes, and MEASURES how many corrections that forces. That
+# number, not an opinion, decides between the two candidates.
+
+include "lib/io.cyr"
+include "tricore.cyr"      # ps / pn / nl
+
+# ---- the measured domain, from perspbits ------------------------------------------------------
+var PD_N_MAX  = 2251799813685248;   # 2^51 — the numerator width perspbits measured
+var PD_D_MIN  = 8388608;            # 2^23 — smallest inside-triangle denominator observed
+var PD_D_MAX  = 536870912;          # 2^29 — largest, at extreme perspective
+var PD_Q_MAX  = 268435456;          # 2^28 — a 16.16 coordinate on a 4096-texel axis
+
+var pd_over  = 0;      # q*D >  N          -- the estimate overshot
+var pd_under = 0;      # N   >= (q+1)*D    -- one correction was not enough
+var pd_iters = 0;      # restoring-divide iterations actually consumed
+var pd_cases = 0;
+
+# ---- mutations --------------------------------------------------------------------------------
+var pd_mut_short  = 0;   # stop the restoring divide one iteration early
+var pd_mut_nocorr = 0;   # drop candidate B's correction entirely
+var pd_mut_gt     = 0;   # `>` instead of `>=` in the correction test
+var pd_mut_nonewt = 0;   # candidate C without its Newton step -- must blow the correction count
+
+# ==============================================================================================
+# CANDIDATE A — the restoring divide. EXACT BY CONSTRUCTION, no bound to prove.
+# ==============================================================================================
+# ⭐ This is what `edge_setup.s` chose for the same reason, and its comment is the precedent: "The
+# 32-iteration restoring loop below is exact BY CONSTRUCTION, and hoisted per edge it costs nothing
+# amortised." Here it can NOT be hoisted — the divisor varies per pixel — so it is paid per pixel, and
+# whether that is affordable is a separate measured question (see the cost note at the bottom).
+#
+# ⚠ The trip count is WAVE-UNIFORM (a fixed constant), which is what makes it legal to drive with
+# s_cbranch_scc1 in a shader. A per-lane trip count would be the dilation defect rung 17's header
+# spends a paragraph on.
+fn pd_divide_exact(N, D, nbits): i64 {
+    var q = 0;
+    var rem = 0;
+    var lim = nbits;
+    if (pd_mut_short != 0) { lim = nbits - 1; }
+    var i = lim - 1;
+    while (i >= 0) {
+        rem = (rem << 1) | ((N >>> i) & 1);
+        q = q << 1;
+        if (rem >= D) { rem = rem - D; q = q | 1; }
+        pd_iters = pd_iters + 1;
+        i = i - 1;
+    }
+    return q;
+}
+
+# ==============================================================================================
+# CANDIDATE B — a SEED with an exact correction. The seed's error is bounded ONLY by the ISA.
+# ==============================================================================================
+# pd_seed models `v_rcp_f32` honestly: the ISA guarantees 1 ULP of a 24-bit mantissa, so the returned
+# reciprocal may be off by a relative 2^-23 in EITHER direction. `sgn` selects the extreme.
+# ⛔ It deliberately does NOT model the accuracy the part actually delivers. A correction that only
+# converges under observed behaviour is the "exact only empirically" defect wearing a proof.
+var PD_K = 60;                      # the fixed-point shift for the reciprocal
+var PD_ULP = 8388608;               # 2^23 — the mantissa the ISA guarantees
+
+fn pd_seed(D, sgn): i64 {
+    var exact = 0;
+    # 2^K / D, computed in halves so it fits i64 on the host
+    exact = (1 << (PD_K - 32)) / D;
+    exact = exact << 32;
+    var e2 = ((1 << (PD_K - 32)) % D) << 32;
+    exact = exact + e2 / D;
+    # perturb by exactly one ULP of a 24-bit mantissa, in the chosen direction
+    var d = exact / PD_ULP;
+    if (sgn > 0) { return exact + d; }
+    if (sgn < 0) { return exact - d; }
+    return exact;
+}
+
+# ⭐⭐ pd_newton — ONE Newton-Raphson step on the seed, and the reason it is the whole ballgame.
+# The seed carries the ISA's guaranteed 24-bit mantissa, so its relative error is up to 2^-23. The
+# quotient is up to 2^28, so q_est can be off by Q*eps = 2^28 * 2^-23 = **32**. That is the DERIVED
+# bound, and it is what the shader's correction loop would have to run -- a fixed, wave-uniform 32
+# iterations at three instructions each.
+# ⛔ THE SWEEP BELOW OBSERVES ONLY 9, AND THAT GAP IS THE POINT: 730 boundary cases do not reach the
+# worst case, so the observed maximum is NOT the bound. Sizing a shader loop from it would be the same
+# insensitive-sweep error that made the first version of perspbits believe a one-pixel probe.
+# ⭐ Newton doubles the significant bits: r' = r*(2 - D*r), so ~23 becomes ~46, and Q*2^-46 << 1 means
+# ONE correction is enough by construction rather than by observation. Two multiplies and a subtract
+# replace thirty-one correction steps.
+# ⛔⛔ NOT WIRED IN, AND DELIBERATELY LEFT THAT WAY. The staging below does not refine — measured, it
+# leaves the observed correction count at 9 instead of collapsing it to 1, so the fixed-point scaling
+# is wrong somewhere. It is kept as a NAMED, UNVERIFIED lead rather than deleted, and it is NOT in the
+# live path, because a refinement whose own gate cannot show it working is exactly the "exact only
+# empirically" defect this file exists to refuse. If candidate B is ever revived, this is where to
+# start and the first thing to do is make it drive the observed maximum to 1.
+fn pd_newton(R, D): i64 {
+    if (pd_mut_nonewt != 0) { return R; }
+    # e = 2^K - D*R, computed in the high half so nothing overflows; r' = R + (R*e >> K)
+    var Rhi = R >>> 32;
+    var Rlo = R & 4294967295;
+    # D*R at 2^K scale, keeping only what matters near 2^K
+    var t = D * Rhi + ((D * Rlo) >>> 32);        # ~ D*R >> 32
+    var e = (1 << (PD_K - 32)) - t;              # the residual, at 2^(K-32) scale
+    var corr = (Rhi * e) + ((Rlo * e) >>> 32);   # R*e >> 32
+    return R + (corr >>> (PD_K - 64 + 32));
+}
+
+# pd_divide_seeded — q_est from the seed, then bounded corrections. Returns q; records how many
+# correction steps were consumed so the shader's loop can be a FIXED, wave-uniform count.
+var pd_corr_max = 0;
+var pd_corr_fires = 0;
+
+fn pd_divide_seeded(N, D, sgn): i64 {
+    var R = pd_seed(D, sgn);   # ⚠ NO Newton -- see pd_newton's block. B is measured RAW.
+    # q_est = floor(N*R / 2^K), staged so no intermediate exceeds i64.
+    # ⛔ THE FIRST VERSION OVERFLOWED HERE and reported candidate B as broken at eps = 0 -- i.e. with a
+    # PERFECT seed. That was the gate's defect, not the candidate's, and it is exactly why eps = 0 is
+    # swept as a control: a recipe that fails with an exact reciprocal is being measured wrong.
+    var Nhi = N >>> 32;
+    var Nlo = N & 4294967295;
+    var q = ((Nhi * R) >>> (PD_K - 32)) + ((Nlo >>> 16) * R >>> (PD_K - 16));
+    if (pd_mut_nocorr != 0) { return q; }
+    var steps = 0;
+    while (steps < 4096) {
+        var fire = 0;
+        if (q * D > N) { q = q - 1; fire = 1; }
+        if (fire == 0) {
+            var nxt = (q + 1) * D;
+            if (pd_mut_gt == 0) { if (N >= nxt) { q = q + 1; fire = 1; } }
+            if (pd_mut_gt != 0) { if (N >  nxt) { q = q + 1; fire = 1; } }
+        }
+        if (fire == 0) { break; }
+        steps = steps + 1;
+        pd_corr_fires = pd_corr_fires + 1;
+    }
+    if (steps > pd_corr_max) { pd_corr_max = steps; }
+    return q;
+}
+
+# ---- the obligation, by multiplication only ---------------------------------------------------
+fn pd_check(q, N, D): i64 {
+    pd_cases = pd_cases + 1;
+    if (q * D > N) { pd_over = pd_over + 1; return 1; }
+    if (N >= (q + 1) * D) { pd_under = pd_under + 1; return 2; }
+    return 0;
+}
+
+# ---- the sweep. ⭐ BOUNDARIES, NOT A STRIDE: one-ULP errors live AT the multiples of D, and a
+# uniform stride walks straight past them. Same lesson depthdiv recorded for rung 17.
+# ⛔ AND IT SWEEPS (Q, D), DERIVING N = Q*D -- not (N, D) with N invented independently. The first
+# version did the latter and only **32 of 576** cases survived its own domain filter, because Q and D
+# are NOT independent: N ~ Q*D, so a large divisor comes with a small quotient. A sweep that generates
+# N beyond 2^51 and then discards it is reporting coverage it does not have.
+var pd_Ds[32];
+var pd_nD = 0;
+
+fn pd_dset(): i64 {
+    # 24 divisors spanning the measured range: powers of two, their neighbours, and the extremes.
+    pd_nD = 0;
+    var b = 23;
+    while (b <= 29) {
+        var v = 1 << b;
+        store64(&pd_Ds + pd_nD * 8, v - 1);     pd_nD = pd_nD + 1;
+        store64(&pd_Ds + pd_nD * 8, v);         pd_nD = pd_nD + 1;
+        store64(&pd_Ds + pd_nD * 8, v + 1);     pd_nD = pd_nD + 1;
+        b = b + 1;
+    }
+    store64(&pd_Ds + pd_nD * 8, 12345677);      pd_nD = pd_nD + 1;   # a prime-ish odd divisor
+    store64(&pd_Ds + pd_nD * 8, 7753496);       pd_nD = pd_nD + 1;   # perspbits' measured min inside D
+    store64(&pd_Ds + pd_nD * 8, 8060312);       pd_nD = pd_nD + 1;   # ... at extreme perspective
+    return pd_nD;
+}
+
+# pd_run_sweep(mode, sgn) -- mode 0 = candidate A, 1 = candidate B. Returns violations.
+fn pd_run_sweep(mode, sgn): i64 {
+    var bad = 0;
+    pd_dset();
+    var di = 0;
+    while (di < pd_nD) {
+        var D = load64(&pd_Ds + di * 8);
+        var qi = 0;
+        while (qi < 12) {
+            # quotients across the whole 16.16 range, including 0 and the ceiling
+            var Q = 0;
+            if (qi == 0)  { Q = 0; }
+            if (qi == 1)  { Q = 1; }
+            if (qi == 2)  { Q = 2; }
+            if (qi > 2)   { Q = (PD_Q_MAX / 1024) * (1 << (qi - 3)); }
+            if (Q > PD_Q_MAX) { Q = PD_Q_MAX; }
+            var off = 0 - 1;
+            while (off <= 1) {
+                var N = Q * D + off;
+                var skip = 0;
+                if (N < 0) { skip = 1; }
+                if (N > PD_N_MAX) { skip = 1; }
+                if (skip == 0) {
+                    var q = 0;
+                    if (mode == 0) { q = pd_divide_exact(N, D, 52); }
+                    if (mode != 0) { q = pd_divide_seeded(N, D, sgn); }
+                    if (pd_check(q, N, D) != 0) { bad = bad + 1; }
+                }
+                off = off + 1;
+            }
+            qi = qi + 1;
+        }
+        di = di + 1;
+    }
+    return bad;
+}
+
+fn pd_gate(name, bad): i64 {
+    ps(name);
+    if (bad == 0) { ps(" PASS"); nl(); return 0; }
+    ps(" FAIL "); pn(bad); ps(" violations"); nl(); return 1;
+}
+
+fn main(): i64 {
+    var bad = 0;
+    ps("perspdiv: rung 18 -- the PER-PIXEL divide, N up to 2^51 over D in [2^23, 2^29]"); nl();
+    ps("          obligation q*D <= N < (q+1)*D, by MULTIPLICATION only, never a second divide"); nl(); nl();
+
+    # ---- CANDIDATE A -------------------------------------------------------------------------
+    pd_over = 0; pd_under = 0; pd_cases = 0; pd_iters = 0;
+    var a = pd_run_sweep(0, 0);
+    bad = bad + pd_gate("A1 restoring divide is EXACT over the whole measured domain:", a);
+    ps("   "); pn(pd_cases); ps(" cases, overshoot "); pn(pd_over);
+    ps(", undershoot "); pn(pd_under);
+    ps(", iterations per divide "); pn(pd_iters / pd_cases); nl();
+
+    # ---- CANDIDATE B, at BOTH extremes of the ISA's guarantee ---------------------------------
+    nl();
+    ps("B -- seed modelled as (2^K/D)(1+eps) with |eps| = 1 ULP of a 24-bit mantissa, the ISA's"); nl();
+    ps("     GUARANTEE rather than the accuracy the part happens to deliver."); nl();
+    var s = 0 - 1;
+    while (s <= 1) {
+        pd_over = 0; pd_under = 0; pd_cases = 0; pd_corr_max = 0; pd_corr_fires = 0;
+        var b = pd_run_sweep(1, s);
+        ps("   eps sign "); pn(s);
+        ps(": violations "); pn(b);
+        ps(", max corrections OBSERVED "); pn(pd_corr_max);
+        ps(", fires "); pn(pd_corr_fires); nl();
+        if (b != 0) { bad = bad + 1; }
+        if (pd_corr_max > 1) {
+            ps("   ⛔ more than ONE correction observed -- and the DERIVED bound without Newton is 32"); nl();
+            ps("      (Q * 2^-23 = 2^28 * 2^-23). A shader loop must be sized from the BOUND, not"); nl();
+            ps("      from what a 730-case sweep happened to reach."); nl();
+        }
+        s = s + 1;
+    }
+
+    # ---- mutations: each must break its gate --------------------------------------------------
+    nl();
+    pd_mut_short = 1;
+    pd_over = 0; pd_under = 0; pd_cases = 0;
+    var m1 = pd_run_sweep(0, 0);
+    pd_mut_short = 0;
+    ps("M1 restoring divide stopped ONE iteration early: ");
+    if (m1 > 0) { ps("RED (correct), "); pn(m1); ps(" violations"); nl(); }
+    if (m1 == 0) { ps("** NOT CONNECTED: a short divide changed nothing **"); nl(); bad = bad + 1; }
+
+    pd_mut_nocorr = 1;
+    pd_over = 0; pd_under = 0; pd_cases = 0;
+    var m2 = pd_run_sweep(1, 1);
+    pd_mut_nocorr = 0;
+    ps("M2 seeded divide with the correction DROPPED: ");
+    if (m2 > 0) { ps("RED (correct), "); pn(m2); ps(" violations"); nl(); }
+    if (m2 == 0) { ps("** NOT CONNECTED: the correction is dead code **"); nl(); bad = bad + 1; }
+
+    pd_mut_gt = 1;
+    pd_over = 0; pd_under = 0; pd_cases = 0;
+    var m3 = pd_run_sweep(1, 0);
+    pd_mut_gt = 0;
+    ps("M3 correction test `>` instead of `>=` (fails AT the multiples): ");
+    if (m3 > 0) { ps("RED (correct), "); pn(m3); ps(" violations"); nl(); }
+    if (m3 == 0) { ps("** NOT CONNECTED **"); nl(); bad = bad + 1; }
+
+    nl();
+    if (bad == 0) {
+        ps("perspdiv: PASS -- the obligation holds by multiplication over the measured domain, and"); nl();
+        ps("          every mutation breaks it."); nl(); nl();
+        ps("⭐ DECISION: CANDIDATE A, the restoring divide. Four reasons, none of them taste:"); nl();
+        ps("   1. EXACT BY CONSTRUCTION -- no error bound to prove, no ISA guarantee to trust, and"); nl();
+        ps("      no reference that has to model an approximation. That is the row's own objection"); nl();
+        ps("      (\"the CPU reference must use the same approximation\") answered rather than accepted."); nl();
+        ps("   2. THE TREE ALREADY CHOSE IT for the same reason -- edge_setup.s picked a 32-iteration"); nl();
+        ps("      restoring loop over v_rcp_f32, and its comment is the precedent verbatim."); nl();
+        ps("   3. AFFORDABLE ON A MEASUREMENT, not a hope: 1.56.26/27/28 measured CPU prep dominating"); nl();
+        ps("      GPU time by ~52x, so ~52 iterations per pixel is spending the cheap resource."); nl();
+        ps("   4. Candidate B WORKS (0 violations at both ISA extremes) but needs a correction loop"); nl();
+        ps("      sized from the DERIVED bound of 32, not the 9 this sweep observed -- and the Newton"); nl();
+        ps("      step that would collapse 32 to 1 is not yet verified here. Revive it only with a"); nl();
+        ps("      gate that drives the observed maximum to 1."); nl();
+        return 95;
+    }
+    ps("perspdiv: FAIL -- "); pn(bad); ps(" gate(s) wrong; do NOT write the shader yet."); nl();
+    return 90;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
