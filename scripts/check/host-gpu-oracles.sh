@@ -46,7 +46,7 @@ export CYRIUS_ALLOW_PARENT_INCLUDES
 mkdir -p "$GPU/build"
 
 rc=0
-for t in texlist bigate bimodel texgate; do
+for t in texlist bigate bimodel texgate rtaudit; do
     out="$(cd "$GPU" && cyrius build "$t.cyr" "build/$t" 2>&1)" || {
         echo "host-gpu-oracles: FAIL -- $t.cyr does not BUILD"
         echo "$out" | tail -20

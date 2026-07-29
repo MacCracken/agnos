@@ -115,6 +115,13 @@ sh "$ROOT/scripts/check/texbi-body-identity.sh" >/tmp/texbi-body.log 2>&1 && rc=
 check "rung 15's shader carries rung 13's head and tail verbatim" $rc
 [ $rc -eq 0 ] || cat /tmp/texbi-body.log
 
+# rtaudit.cyr mirrors nine constants out of gpu_regs.cyr because a host test cannot include a kernel
+# module. ⛔ A mirror nobody diffs is ATOM_DRY: move GPU_RT_REGION_OFF and the host proof keeps
+# certifying the OLD placement, green, forever. Mutation-tested (perturb one mirrored value -> DRIFT).
+sh "$ROOT/scripts/check/rt-region-derive.sh" >/tmp/rt-region.log 2>&1 && rc=0 || rc=$?
+check "rung 6's host proof mirrors the kernel's region constants" $rc
+[ $rc -eq 0 ] || cat /tmp/rt-region.log
+
 # The host oracle for the op 0x0C grid mapping. ⚠ Until now NOTHING ran tests/gpu/*.cyr — they were
 # scanned and cited but never executed, so a red oracle stayed invisible until someone remembered it.
 sh "$ROOT/scripts/check/host-gpu-oracles.sh" >/tmp/host-gpu.log 2>&1 && rc=0 || rc=$?

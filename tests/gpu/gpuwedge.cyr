@@ -80,27 +80,27 @@ fn recover_op(arm): i64 {
 fn report(arm, r): i64 {
     if (r == 95) { w_puts("gpuwedge: arm OK (exit 95)", 26); return 95; }
     if (r == 0 - 1) {
-        w_puts("gpuwedge: refused -- no GPU, or this kernel lacks GPU_RECOVER.", 61);
-        w_puts("gpuwedge: the wedge arms are COMPILED OUT without that flag, by design:", 70);
-        w_puts("gpuwedge: a production kernel must not be able to hang its own GPU.", 66);
+        w_puts("gpuwedge: refused -- no GPU, or this kernel lacks GPU_RECOVER.", 62);
+        w_puts("gpuwedge: the wedge arms are COMPILED OUT without that flag, by design:", 71);
+        w_puts("gpuwedge: a production kernel must not be able to hang its own GPU.", 67);
         return 96;
     }
     if (r == 0 - 2) {
-        w_puts("gpuwedge: ARM A FAILED -- the wedge RETIRED instead of hanging.", 62);
-        w_puts("gpuwedge: nothing was hung, so arms B-E would prove NOTHING. Stop here.", 70);
+        w_puts("gpuwedge: ARM A FAILED -- the wedge RETIRED instead of hanging.", 63);
+        w_puts("gpuwedge: nothing was hung, so arms B-E would prove NOTHING. Stop here.", 71);
         return 90;
     }
     if (r == 0 - 3) {
-        w_puts("gpuwedge: ARM C FAILED -- matmul NOT bit-correct.", 48);
-        w_puts("gpuwedge: recovery is WORSE THAN THE HANG. R-4 must be the default.", 66);
+        w_puts("gpuwedge: ARM C FAILED -- matmul NOT bit-correct.", 49);
+        w_puts("gpuwedge: recovery is WORSE THAN THE HANG. R-4 must be the default.", 67);
         return 89;
     }
     if (r == 0 - 4) {
-        w_puts("gpuwedge: ARM B -- the ladder reached R-4 and gave up.", 53);
-        w_puts("gpuwedge: that is a RESULT, not a crash: check the panel and the shell.", 70);
-        w_puts("gpuwedge: if both are alive, R-4's degradation works and Phase III is", 68);
-        w_puts("gpuwedge: survivable; if the console died, it is NOT, and that one fact", 70);
-        w_puts("gpuwedge: settles the whole GFX-ring question. Run --console next.", 65);
+        w_puts("gpuwedge: ARM B -- the ladder reached R-4 and gave up.", 54);
+        w_puts("gpuwedge: that is a RESULT, not a crash: check the panel and the shell.", 71);
+        w_puts("gpuwedge: if both are alive, R-4's degradation works and Phase III is", 69);
+        w_puts("gpuwedge: survivable; if the console died, it is NOT, and that one fact", 71);
+        w_puts("gpuwedge: settles the whole GFX-ring question. Run --console next.", 66);
         return 91;
     }
     w_puts("gpuwedge: unexpected return ", 28); w_num(r); print("\n", 1);
@@ -112,52 +112,69 @@ fn main(): i64 {
     if (argc() >= 2) {
         var a = argv(1);
         if (streq(a, "--baseline") == 1) {
-            w_puts("gpuwedge: ARM C (BEFORE) -- establishing the bit-correct baseline", 64);
+            w_puts("gpuwedge: ARM C (BEFORE) -- establishing the bit-correct baseline", 65);
             return report(ARM_C, recover_op(ARM_C));
         }
         if (streq(a, "--wedge") == 1) {
-            w_puts("gpuwedge: ARM A -- WEDGING THE GPU ON PURPOSE.", 45);
-            w_puts("gpuwedge: the panel may go dark. That is the experiment, not a fault.", 68);
-            w_puts("gpuwedge: the ORACLE is the forensic bracket in the log, not this exit.", 70);
+            w_puts("gpuwedge: ARM A -- WEDGING THE GPU ON PURPOSE.", 46);
+            w_puts("gpuwedge: the panel may go dark. That is the experiment, not a fault.", 69);
+            w_puts("gpuwedge: the ORACLE is the forensic bracket in the log, not this exit.", 71);
             return report(ARM_A, recover_op(ARM_A));
         }
         if (streq(a, "--recover") == 1) {
-            w_puts("gpuwedge: ARM B -- dequeue + re-map", 34);
+            w_puts("gpuwedge: ARM B -- dequeue + re-map", 35);
             return report(ARM_B, recover_op(ARM_B));
         }
         if (streq(a, "--verify") == 1) {
-            w_puts("gpuwedge: ARM C (AFTER) -- matmul must STILL be bit-correct", 58);
+            w_puts("gpuwedge: ARM C (AFTER) -- matmul must STILL be bit-correct", 59);
             return report(ARM_C, recover_op(ARM_C));
         }
-        if (streq(a, "--audit") == 1) {
-            w_puts("gpuwedge: RUNG 6 -- arena audit (READ-ONLY, writes nothing)", 58);
+        # ⛔⛔ THIS LABEL WAS FALSE UNTIL 1.56.30 AND IT MATTERED. It read "RUNG 6 -- arena audit
+        # (READ-ONLY, writes nothing)" while invoking arm 5 = RECOV_ARM_E, which audits the
+        # sacrificial slot and THEN FIRES AN UNGUARDED WRITE — that arm IS rung 5's negative
+        # control, and writing is the entire experiment. An operator reading "writes nothing"
+        # and running it on a machine they cared about would have been misled by the tool, which
+        # is precisely the failure this file's own unknown-argument comment warns about.
+        # ⇒ Renamed to what it does. Rung 6's genuinely read-only audit is --rt-audit below.
+        if (streq(a, "--slot-audit") == 1) {
+            w_puts("gpuwedge: ARM E -- sacrificial-slot audit, THEN an unguarded write", 66);
+            w_puts("gpuwedge: this WRITES. It is rung 5's negative control, not an inspection.", 74);
             return report(5, recover_op(5));
         }
+        # ⭐ RUNG 6 (1.56.30) — TD-3's render-target region audit. READ-ONLY for real: it writes no
+        # memory and no register, only reads MC_VM_FB_* / CONFIG_MEMSIZE / the live DCN scanout
+        # address. Safe on any machine, at any time, and it rides an existing flash at zero
+        # marginal burns. A REFUSAL IS A SUCCESSFUL RUN — that is the outcome that saves the TMR.
+        if (streq(a, "--rt-audit") == 1) {
+            w_puts("gpuwedge: RUNG 6 -- render-target region audit (READ-ONLY)", 58);
+            return report(6, recover_op(6));
+        }
         if (streq(a, "--console") == 1) {
-            w_puts("gpuwedge: ARM D -- console survival while the GPU is wedged", 58);
+            w_puts("gpuwedge: ARM D -- console survival while the GPU is wedged", 59);
             return report(ARM_D, recover_op(ARM_D));
         }
         # ⛔ An unknown argument is an ERROR, never a default action. A tool that silently does
         # something other than what was asked is how a typo becomes a wasted burn -- the exact
         # failure that cost the M9 arc a flash on 2026-07-24.
-        w_puts("gpuwedge: UNKNOWN ARGUMENT -- nothing was done.", 46);
-        w_puts("gpuwedge: --baseline --wedge --recover --verify --console --audit", 64);
+        w_puts("gpuwedge: UNKNOWN ARGUMENT -- nothing was done.", 47);
+        w_puts("gpuwedge: --baseline --wedge --recover --verify --console", 57);
+        w_puts("gpuwedge: --slot-audit (WRITES) --rt-audit (read-only)", 54);
         return 84;
     }
-    w_puts("gpuwedge -- RUNG 5, the GPU hang/recovery battery", 48);
+    w_puts("gpuwedge -- RUNG 5, the GPU hang/recovery battery", 49);
     w_puts("", 0);
-    w_puts("⚠ NO ARGUMENTS SEEN -- nothing was done. This tool never acts by default:", 72);
-    w_puts("  one of its arms deliberately hangs the GPU.", 44);
+    w_puts("⚠ NO ARGUMENTS SEEN -- nothing was done. This tool never acts by default:", 75);
+    w_puts("  one of its arms deliberately hangs the GPU.", 45);
     w_puts("", 0);
-    w_puts("Run IN THIS ORDER, one boot:", 27);
-    w_puts("  run /bin/gpuwedge --baseline    C before -- the baseline", 57);
-    w_puts("  run /bin/gpuwedge --wedge       A        -- the bracket is the oracle", 70);
-    w_puts("  run /bin/gpuwedge --recover     B        -- CP_HQD_ACTIVE must read 0", 70);
-    w_puts("  run /bin/gpuwedge --verify      C after  -- still bit-correct?", 63);
-    w_puts("  run /bin/gpuwedge --console     D        -- did the console survive?", 69);
-    w_puts("  run /bin/gpuwedge --audit       rung 6   -- READ-ONLY arena audit", 66);
-    w_puts("  run /bin/klug > /wedge.txt", 27);
-    w_puts("  exit 83 = NO ARGUMENT -- this help, nothing measured (NOT 'shader not resident')", 80);
+    w_puts("Run IN THIS ORDER, one boot:", 28);
+    w_puts("  run /bin/gpuwedge --baseline    C before -- the baseline", 58);
+    w_puts("  run /bin/gpuwedge --wedge       A        -- the bracket is the oracle", 71);
+    w_puts("  run /bin/gpuwedge --recover     B        -- CP_HQD_ACTIVE must read 0", 71);
+    w_puts("  run /bin/gpuwedge --verify      C after  -- still bit-correct?", 64);
+    w_puts("  run /bin/gpuwedge --console     D        -- did the console survive?", 70);
+    w_puts("  run /bin/gpuwedge --audit       rung 6   -- READ-ONLY arena audit", 67);
+    w_puts("  run /bin/klug > /wedge.txt", 28);
+    w_puts("  exit 83 = NO ARGUMENT -- this help, nothing measured (NOT 'shader not resident')", 82);
     # ⛔ 1.56.27 — was `return 96`, the same code as a real "shader not resident" failure. Twin of the
     # gputri defect that cost a regression check on the 2026-07-28 burn: a burn log showing 96 could
     # not distinguish "you forgot the flag" from "the GPU is broken", and those have different fixes.

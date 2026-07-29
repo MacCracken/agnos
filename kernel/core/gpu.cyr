@@ -681,6 +681,134 @@ fn gpu_arena_audit() {
     return ok;
 }
 
+# gpu_rt_overlaps — do [a, a+la) and [b, b+lb) intersect? Written out rather than inlined because it
+# is used three times below and an off-by-one in ONE of them would produce a PASS on a claimed region.
+fn gpu_rt_overlaps(a, la, b, lb) {
+    if (a >= b + lb) { return 0; }
+    if (b >= a + la) { return 0; }
+    return 1;
+}
+
+# gpu_rt_arena_audit — RUNG 6 of the 3D arc. Prove TD-3's render-target region is genuinely unclaimed
+# BEFORE anything stores into it. READ-ONLY: this function writes no memory and no register.
+#
+# ⛔ WHY THIS RUNG EXISTS AT ALL. With VM_CONTEXT0 disabled there are NO PAGE TABLES, so an
+# out-of-bounds store does not fault — it lands somewhere REAL. The two places it must never land are
+# the console framebuffer at carveout offset 0 and the PSP TMR at 0x60000000, whose ucode agnos
+# re-loads only at boot; corrupting it is not recoverable without a reboot. "Free" therefore has to be
+# MEASURED, not asserted from a comment.
+#
+# ⚠ WHY IT SURFACED ONLY AT RUNG 17, six rungs after it was scheduled. Its own plan row warns that a
+# failure "stalls Phase II at rung 11" — yet rungs 11-16 all shipped without it, because coverage
+# masks and prep records fit the 2 MB command arena. Rung 17's depth buffer is the FIRST buffer that
+# does not: 800x600 needs 960 KB at 16-bit and the arena has 48 KB + 60 KB free. The dependency was
+# real the whole time and simply had no consumer until now.
+#
+# ⭐⭐ THE LAST CHECK IS THE ONLY ONE THAT CAN SEE A STALE MAP, AND THAT IS THE POINT.
+# Checks 1-6 compare the proposed region against agnos's OWN declared slot map. If that map is wrong —
+# if firmware, the PSP, or the display engine claimed this window without agnos knowing — every one of
+# them passes, because they are all downstream of the same premise. That is precisely the failure
+# rung 15 shipped to iron: four implementations agreeing with each other about a convention that was
+# wrong. Check 7 reads the address the DISPLAY ENGINE IS ACTUALLY SCANNING OUT FROM, out of hardware,
+# and refuses if it lands inside the region. It is the one witness here that agnos did not write.
+# [[feedback_oracle_must_test_external_invariant]]
+#
+# Returns 1 = provably unclaimed, 0 = refuse. A refusal is a SUCCESSFUL audit; it is the outcome that
+# saves the TMR.
+fn gpu_rt_arena_audit() {
+    if (gpu_present == 0) { return 0; }
+    kprintln("gpu: ---- RENDER-TARGET REGION AUDIT (read-only) ----", 53);
+
+    # Geometry from the HARDWARE, never from a constant. fb_off is the CPU-physical carveout base and
+    # fb_base the MC-aperture base; they are DIFFERENT domains on this APU and conflating them would
+    # make every bound below compare two unrelated numbers.
+    var r_off  = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_OFFSET)   & GPU_FB_LOC_MASK;
+    var r_base = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_LOC_BASE) & GPU_FB_LOC_MASK;
+    var fb_off  = r_off  << 24;
+    var fb_base = r_base << 24;
+    var vram_mb = gpu_reg32(GPU_BASE_NBIO_2, GPU_R_CONFIG_MEMSIZE) & 0xFFFFFFFF;
+    var carve_bytes = vram_mb * 1024 * 1024;
+
+    var rt_end  = GPU_RT_REGION_OFF + GPU_RT_REGION_SIZE;
+    var rt_phys = fb_off  + GPU_RT_REGION_OFF;
+    var rt_mc   = fb_base + GPU_RT_REGION_OFF;
+
+    kprint("gpu: carveout phys base ", 24); kprint_hex(fb_off);
+    kprint("  mc base ", 10); kprint_hex(fb_base);
+    kprint("  vram ", 7); kprint_num(vram_mb); kprintln(" MB", 3);
+    kprint("gpu: rt region offset ", 22); kprint_hex(GPU_RT_REGION_OFF);
+    kprint(" size ", 6); kprint_hex(GPU_RT_REGION_SIZE);
+    kprint(" ends ", 6); kprint_hex(rt_end); kprintln("", 0);
+    kprint("gpu: rt phys ", 13); kprint_hex(rt_phys);
+    kprint("  mc ", 5); kprint_hex(rt_mc); kprintln("", 0);
+
+    var ok = 1;
+
+    # 1 -- it must fit inside the carveout at all.
+    if (rt_end > carve_bytes) {
+        kprintln("gpu: AUDIT FAIL -- the region runs past the end of VRAM", 55);
+        ok = 0;
+    }
+    # 2 -- and it must end EXACTLY at the top. This is not tidiness: ending at the top is the whole
+    # reason an overrun is survivable, because it runs off into the fault net instead of down into
+    # the framebuffer or the TMR. If VRAM is a size that breaks it, the safety argument is void.
+    if (rt_end != carve_bytes) {
+        kprintln("gpu: AUDIT FAIL -- the region does NOT end at the carveout top", 62);
+        kprintln("gpu:   an overrun would land in real memory, not the fault net", 62);
+        ok = 0;
+    }
+    # 3 -- clear of the console framebuffer and the back-buffer window that starts at offset 0.
+    if (gpu_rt_overlaps(GPU_RT_REGION_OFF, GPU_RT_REGION_SIZE, 0, GPU_FB_BACK_LIMIT) == 1) {
+        kprintln("gpu: AUDIT FAIL -- overlaps the framebuffer / back-buffer window", 64);
+        ok = 0;
+    }
+    # 4 -- clear of the PSP TMR. The unrecoverable one: agnos re-loads that ucode only at boot.
+    if (gpu_rt_overlaps(GPU_RT_REGION_OFF, GPU_RT_REGION_SIZE, GPU_PSP_TMR_OFF, GPU_PSP_TMR_SIZE) == 1) {
+        kprintln("gpu: AUDIT FAIL -- overlaps the PSP TMR (needs a reboot to recover)", 67);
+        ok = 0;
+    }
+    # 5 -- clear of the 2 MB command arena (rings, MQD, shaders, scratch).
+    if (gpu_rt_overlaps(GPU_RT_REGION_OFF, GPU_RT_REGION_SIZE, GPU_VM_ARENA_OFF, GPU_ARENA_SIZE) == 1) {
+        kprintln("gpu: AUDIT FAIL -- overlaps the command arena", 45);
+        ok = 0;
+    }
+    # 6 -- the handle table must tile the region exactly. A short table silently strands memory; a
+    # long one hands out a handle whose last byte is outside the audited window, which is the very
+    # thing this function exists to prevent.
+    if (GPU_RT_HANDLES * GPU_RT_HANDLE_SIZE != GPU_RT_REGION_SIZE) {
+        kprintln("gpu: AUDIT FAIL -- handles x handle size does not equal the region", 66);
+        ok = 0;
+    }
+
+    # 7 -- ⭐ THE EXTERNAL WITNESS. Everything above is agnos checking agnos. This reads the address
+    # the display engine is ACTUALLY fetching from, out of DCN, and refuses if it is inside the
+    # region. It is the only check here that can catch a slot map that is simply wrong.
+    var slo = GPU_R_HUBP_SURF_ADDR    + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    var shi = GPU_R_HUBP_SURF_ADDR_HI + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    var s_lo = gpu_reg32(GPU_BASE_DCN_2, slo) & 0xFFFFFFFF;
+    var s_hi = gpu_reg32(GPU_BASE_DCN_2, shi) & 0xFFFF;
+    var scan_mc = (s_hi << 32) | s_lo;
+    kprint("gpu: live scanout mc ", 21); kprint_hex(scan_mc); kprintln("", 0);
+    if (scan_mc >= rt_mc) {
+        if (scan_mc < rt_mc + GPU_RT_REGION_SIZE) {
+            kprintln("gpu: AUDIT FAIL -- the DISPLAY is scanning out from inside the region", 69);
+            ok = 0;
+        }
+    }
+    # ⚠ A zero scanout address means DCN told us nothing, so check 7 proved nothing. Say so rather
+    # than letting a silent no-op read as a pass -- that is the vacuous-green shape this tree has
+    # already paid for more than once.
+    if (scan_mc == 0) {
+        kprintln("gpu: AUDIT NOTE -- scanout address reads 0; check 7 proved NOTHING", 66);
+    }
+
+    if (ok == 1) { kprintln("gpu: RT AUDIT PASS -- the region is provably unclaimed", 54); }
+    if (ok == 0) { kprintln("gpu: RT AUDIT REFUSED -- TD-3 must NOT be built here", 52); }
+    kprintln("gpu: ---- END RENDER-TARGET REGION AUDIT ----", 45);
+    klug_spill();
+    return ok;
+}
+
 fn gpu_wait_done(done_phys, expect, timeout_us) {
     var t0 = rdtsc();
     var limit = timeout_us * gpu_tsc_per_us();

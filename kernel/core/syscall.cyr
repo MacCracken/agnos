@@ -3289,6 +3289,9 @@ var RECOV_ARM_B = 2;   # dequeue + re-map  -> CP_HQD_ACTIVE must read 0, then wo
 var RECOV_ARM_C = 3;   # negative control  -> matmul bit-correct BEFORE and AFTER
 var RECOV_ARM_D = 4;   # free              -> is the console still painting while wedged?
 var RECOV_ARM_E = 5;   # the guard's own negative control
+# ⭐ RUNG 6 (1.56.30). READ-ONLY: writes no memory and no register, so unlike arm E it is safe to run
+# at any time and needs no audit of its own. It rides an existing flash at ZERO marginal burns.
+var RECOV_ARM_F = 6;   # rung 6 -- audit TD-3's render-target region before anything is built there
 
 fn gpu_recover_op_sys(arm) {
     if (gpu_present == 0) { return 0 - 1; }
@@ -3337,6 +3340,19 @@ fn gpu_recover_op_sys(arm) {
             return 0 - 3;
         }
         kprintln("recover: ARM C -- matmul bit-correct", 36);
+        return 95;
+    }
+    if (arm == RECOV_ARM_F) {
+        # ⭐ RUNG 6 — TD-3's render-target region audit. Rung 17's depth buffer is the first buffer
+        # too large for the 2 MB command arena, so this is the gate that has to pass before
+        # GPU_RT_REGION_OFF is built on. READ-ONLY throughout.
+        # ⚠ A REFUSAL IS A SUCCESSFUL RUN. The whole point is to find out here, for free, rather than
+        # by corrupting the PSP TMR — whose ucode agnos re-loads only at boot.
+        kprintln("recover: ARM F -- rung 6 render-target region audit", 51);
+        if (gpu_rt_arena_audit() != 1) {
+            kprintln("recover: ARM F -- the region is NOT provably free. TD-3 must not be built.", 74);
+            return 0 - 6;
+        }
         return 95;
     }
     if (arm == RECOV_ARM_E) {

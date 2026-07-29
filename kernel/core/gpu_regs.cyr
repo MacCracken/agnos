@@ -838,6 +838,12 @@ var GPU_PSP_STATUS_MASK     = 0xFFFF;      # C2PMSG_64 low16 = status (0 = OK)
 var GPU_PSP_CMD_SETUP_TMR   = 0x5;         # GFX_CMD_ID_SETUP_TMR
 var GPU_PSP_CMD_LOAD_IP_FW  = 0x6;         # GFX_CMD_ID_LOAD_IP_FW (C1b-2)
 var GPU_PSP_TMR_SIZE        = 0x400000;    # TMR = 4 MB (fixed on gfx9/Renoir)
+# ⚠ NUMERICALLY EQUAL TO GPU_FB_BACK_LIMIT TODAY, AND DELIBERATELY ITS OWN CONSTANT. The back-buffer
+# window happens to end exactly where the TMR begins, but "where back buffers stop" and "where the
+# PSP's ucode lives" are different facts that could move independently. gpu_rt_arena_audit checks the
+# region against BOTH, and writing one of those checks in terms of the other would silently collapse
+# two guards into one the day either value changes.
+var GPU_PSP_TMR_OFF         = 0x60000000;  # carveout offset of the TMR — unrecoverable if corrupted
 var GPU_PSP_TMR_FLAGS       = 0x2;         # cmd_tmr.tmr_flags: virt_phy_addr=1
 var GPU_PSP_RESP_STATUS     = 0x360;       # resp.status byte offset in the 4 KB cmd buffer (0=OK)
 var GPU_PSP_RING_DW_MASK    = 0x1FFF;      # wptr wrap: (ring 0x8000 bytes)/4 - 1 = 0x2000-1
@@ -898,6 +904,32 @@ var GPU_VM_INVALIDATE_REQ_ALL = 0x7C0001;   # vmid0 flush: bit0 PER_VMID | L2_PT
 # dropped L2_PTES + spuriously set CLEAR_FAULT_STATUS(23);
 # caught by the the FB-aperture arena setup adversarial re-verify vs gc_9_0_sh_mask.h.)
 var GPU_VM_ARENA_OFF     = 0x80000000;      # arena 2 GB into the 3 GB carveout (clears TMR @0x60000000)
+
+# ============================================================================================
+# ⭐ TD-3 — THE KERNEL-OWNED RENDER-TARGET REGION. Declared at rung 6 (1.56.30), BEFORE anything
+#    stores into it, because rung 6 is the audit that proves it is free.
+# ============================================================================================
+# ⛔ WHY THIS IS NOT A `#86` SLOT. `SHM_MAX_SIZE` caps a slot at 2 MB, which holds 800x600x4 (1.92 MB)
+# and NOTHING larger — a 1280x720 colour buffer is 3.68 MB and its depth buffer another 3.68 MB. The
+# naive "just use a slot" ABI therefore works at archaemenid's current back-buffer size and **breaks
+# the instant the console goes native-resolution**. Multi-page slots would leak a size class into the
+# ring-3 ABI and re-open the "no MC address crosses the boundary" property. Handles do neither.
+#
+# ⚠ THESE ARE OFFSETS INTO THE CARVEOUT, not absolute addresses — same domain as GPU_VM_ARENA_OFF.
+# The CPU-side address is `fb_off + GPU_RT_REGION_OFF`, the MC-side is `fb_base + GPU_RT_REGION_OFF`,
+# and those two bases are DIFFERENT on this APU (MC_VM_FB_OFFSET vs MC_VM_FB_LOC_BASE).
+#
+# ⭐ THE PLACEMENT IS THE SAFETY ARGUMENT, and it is why the region ends exactly at the carveout top:
+# with `VM_CONTEXT0` disabled there are no page tables, so an out-of-bounds store lands somewhere
+# REAL. Ending at the top means an overrun runs off the END into the 0x1FFC fault net's dummy page,
+# rather than down into the console framebuffer at offset 0 or the PSP TMR at 0x60000000 — whose
+# ucode agnos re-loads only at boot, so corrupting it is not recoverable without a reboot.
+# ⇒ `gpu_rt_arena_audit()` asserts the exact-top property rather than assuming it: if VRAM is ever a
+# size for which 0xB0000000 + 256 MB is not the top, the safety argument is void and it REFUSES.
+var GPU_RT_REGION_OFF    = 0xB0000000;      # 2816 MB into the carveout
+var GPU_RT_REGION_SIZE   = 0x10000000;      # 256 MB -> ends at 0xC0000000 = the 3 GB carveout top
+var GPU_RT_HANDLES       = 8;               # opaque, ring 3 never sees an address
+var GPU_RT_HANDLE_SIZE   = 0x2000000;       # 32 MB each -> fits 2560x1440x4 colour AND depth
 var GPU_VM_DUMMY_SUBOFF  = 0x15000;         # dummy fault-sink page offset within the arena  -> ends 0x16000
 
 # --- the compute-queue HQD setup: compute-queue MQD/HQD (GC seg0; gfx9 gc_9_0_offset.h, ALL base_idx 0) ---

@@ -1,0 +1,121 @@
+# rtaudit.cyr — RUNG 6's HOST HALF. Six of `gpu_rt_arena_audit`'s seven checks are pure arithmetic on
+# compile-time constants plus one register read (VRAM size), so they can be proven at ZERO burns
+# before the iron run — and, more usefully, they can be MUTATED here, which they cannot be on iron.
+#
+# ⛔ WHAT THIS DOES **NOT** PROVE, stated first so the green is not over-read. Check 7 — the live DCN
+# scanout address — is the only check that can see a slot map that is simply WRONG, and it needs real
+# hardware. This file proves the arithmetic is right; it cannot prove the map is. That distinction is
+# the whole lesson of rung 15, where four implementations agreed with each other about a convention
+# that was wrong and every gate built on their agreement went green.
+#
+# ⚠ THE CONSTANTS ARE MIRRORED, NOT INCLUDED. kernel/core/gpu_regs.cyr is a kernel module that pulls
+# in the whole GPU register world; including it from a host test is not possible. So the values are
+# restated below and `scripts/check/rt-region-derive.sh` diffs them against the kernel — a mirror
+# nobody checks is the ATOM_DRY defect class, and this tree has paid for it.
+
+include "lib/io.cyr"
+include "tricore.cyr"      # ps / pn / nl
+
+# --- mirrored from kernel/core/gpu_regs.cyr (gate: scripts/check/rt-region-derive.sh) -------------
+var K_RT_REGION_OFF  = 2952790016;   # 0xB0000000
+var K_RT_REGION_SIZE = 268435456;    # 0x10000000 = 256 MB
+var K_RT_HANDLES     = 8;
+var K_RT_HANDLE_SIZE = 33554432;     # 0x2000000 = 32 MB
+var K_FB_BACK_LIMIT  = 1610612736;   # 0x60000000
+var K_PSP_TMR_OFF    = 1610612736;   # 0x60000000
+var K_PSP_TMR_SIZE   = 4194304;      # 0x400000 = 4 MB
+var K_VM_ARENA_OFF   = 2147483648;   # 0x80000000
+var K_ARENA_SIZE     = 2097152;      # 0x200000 = 2 MB
+var K_VRAM_MB        = 3072;         # archaemenid, from the boot log: "gpu: 3072MB VRAM"
+
+fn ra_overlaps(a, la, b, lb): i64 {
+    if (a >= b + lb) { return 0; }
+    if (b >= a + la) { return 0; }
+    return 1;
+}
+
+# ra_check(name, nlen, got, want) — got must equal want.
+fn ra_check(name, nlen, got, want): i64 {
+    ps("  "); print(name, nlen); ps(": ");
+    if (got == want) { ps("PASS"); nl(); return 0; }
+    ps("FAIL (got "); pn(got); ps(", want "); pn(want); ps(")"); nl();
+    return 1;
+}
+
+fn main(): i64 {
+    var bad = 0;
+    var carve = K_VRAM_MB * 1024 * 1024;
+    var rt_end = K_RT_REGION_OFF + K_RT_REGION_SIZE;
+
+    ps("rtaudit: rung 6 -- TD-3's render-target region, the arithmetic half"); nl();
+    ps("  carveout bytes "); pn(carve);
+    ps("   region ["); pn(K_RT_REGION_OFF); ps(", "); pn(rt_end); ps(")"); nl(); nl();
+
+    # C1 -- fits inside the carveout.
+    bad = bad + ra_check("C1 region fits inside VRAM", 26, rt_end > carve, 0);
+
+    # C2 -- ends EXACTLY at the top. ⭐ THIS IS THE SAFETY PROPERTY, NOT TIDINESS: it is the reason an
+    # overrun runs off the END into the 0x1FFC fault net instead of DOWN into the framebuffer at
+    # offset 0 or the PSP TMR. If it ever fails, TD-3's placement argument is void.
+    bad = bad + ra_check("C2 region ends at the carveout top", 34, rt_end, carve);
+
+    # C3 -- clear of the framebuffer / back-buffer window at offset 0.
+    bad = bad + ra_check("C3 clear of the FB window", 25,
+                         ra_overlaps(K_RT_REGION_OFF, K_RT_REGION_SIZE, 0, K_FB_BACK_LIMIT), 0);
+
+    # C4 -- clear of the PSP TMR. The unrecoverable one.
+    bad = bad + ra_check("C4 clear of the PSP TMR", 23,
+                         ra_overlaps(K_RT_REGION_OFF, K_RT_REGION_SIZE, K_PSP_TMR_OFF, K_PSP_TMR_SIZE), 0);
+
+    # C5 -- clear of the 2 MB command arena.
+    bad = bad + ra_check("C5 clear of the command arena", 29,
+                         ra_overlaps(K_RT_REGION_OFF, K_RT_REGION_SIZE, K_VM_ARENA_OFF, K_ARENA_SIZE), 0);
+
+    # C6 -- the handle table tiles the region exactly.
+    bad = bad + ra_check("C6 handles tile the region", 26,
+                         K_RT_HANDLES * K_RT_HANDLE_SIZE, K_RT_REGION_SIZE);
+
+    # C7 -- a handle must hold 2560x1440x4 colour AND depth, which is TD-3's stated sizing claim.
+    # ⚠ Asserted rather than assumed: the 32 MB figure is what makes "8 handles" the right count, and
+    # if the claim is false the whole region size is wrong rather than merely tight.
+    var need = 2560 * 1440 * 4 * 2;
+    ps("  C7 a handle holds 2560x1440x4 colour+depth: ");
+    if (K_RT_HANDLE_SIZE >= need) { ps("PASS ("); pn(K_RT_HANDLE_SIZE); ps(" >= "); pn(need); ps(")"); nl(); }
+    if (K_RT_HANDLE_SIZE < need) {
+        ps("FAIL ("); pn(K_RT_HANDLE_SIZE); ps(" < "); pn(need); ps(")"); nl();
+        bad = bad + 1;
+    }
+
+    nl();
+    # ---- MUTATIONS. Each must break a check, or that check is not connected. -------------------
+    # ⛔ THE POINT OF THIS BLOCK. On iron these checks can only ever be observed PASSING — there is no
+    # way to move the TMR to see the guard fire. Here they can be moved, and a guard nobody has seen
+    # fail is a guard nobody knows is wired.
+    var mut = 0;
+    # M1 -- slide the region down onto the command arena.
+    if (ra_overlaps(K_VM_ARENA_OFF, K_RT_REGION_SIZE, K_VM_ARENA_OFF, K_ARENA_SIZE) != 1) { mut = mut + 1; }
+    # M2 -- slide it down onto the PSP TMR.
+    if (ra_overlaps(K_PSP_TMR_OFF, K_RT_REGION_SIZE, K_PSP_TMR_OFF, K_PSP_TMR_SIZE) != 1) { mut = mut + 1; }
+    # M3 -- start it at 0, inside the framebuffer window.
+    if (ra_overlaps(0, K_RT_REGION_SIZE, 0, K_FB_BACK_LIMIT) != 1) { mut = mut + 1; }
+    # M4 -- a region that does NOT end at the carveout top must be caught by C2.
+    if ((K_RT_REGION_OFF - 65536) + K_RT_REGION_SIZE == carve) { mut = mut + 1; }
+    # M5 -- a handle table that does not tile the region must be caught by C6.
+    if (7 * K_RT_HANDLE_SIZE == K_RT_REGION_SIZE) { mut = mut + 1; }
+    ps("  M1-M5 every guard fires when its region is moved onto a claimed window: ");
+    if (mut == 0) { ps("PASS"); nl(); }
+    if (mut != 0) { ps("FAIL "); pn(mut); ps(" guard(s) did not fire"); nl(); bad = bad + mut; }
+
+    nl();
+    if (bad == 0) {
+        ps("rtaudit: PASS -- TD-3's placement arithmetic is sound and every guard is connected."); nl();
+        ps("⚠ This proves the ARITHMETIC only. Check 7 -- the live DCN scanout address -- is the"); nl();
+        ps("  only one that can catch a slot map that is simply WRONG, and it needs iron."); nl();
+        return 95;
+    }
+    ps("rtaudit: FAIL -- "); pn(bad); ps(" problem(s). TD-3 must not be built until they clear."); nl();
+    return 90;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

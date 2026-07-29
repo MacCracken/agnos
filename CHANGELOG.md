@@ -7,7 +7,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 **Rung 17 `depth` — cycle OPEN.** Bumped on cycle open; the user tags on close.
 
-### Found before writing code — rung 17's first bite is an ARENA decision, not the op
+### Found before writing code — rung 17 is gated on rung 6, which was never run
 
 The release-plan row scopes 1.56.30 as *"op `0x0D GPU_OP_DEPTH_CLEAR`; minting it means growing
 `gpu_caps` #89's support word first"*. Reconnaissance against source (not the row) says the ABI half
@@ -20,26 +20,75 @@ is the easy half and there is a **hard blocker underneath it that the row does n
 surface must equal the proven surface, so the worker must land in the same change. That is the
 "deliberately awkward" property working as designed.
 
-**⛔ THE BLOCKER: there is nowhere to put the Z buffer.** `GPU_ARENA_SIZE` is **2 MB** and the slot
-map is nearly full — walking the sorted extents, the only free runs are
-**`[0x1E4000, 0x1F0000)` = 48 KB** and **`[0x1F1000, 0x200000)` = 60 KB**. The live scanout is
-**800×600** (`gpu: scanout surface 800x600`), so a Z buffer is **960 KB at 16-bit** or **1.92 MB at
-32-bit**. Neither fits, and neither is close.
+**⛔ THE BLOCKER — and it is NOT a storage decision; that was already ratified.** A first pass here
+measured `GPU_ARENA_SIZE` (2 MB, only 48 KB + 60 KB free by extent-walk) and concluded there was
+nowhere to put Z. **That was the wrong arena.** `GPU_ARENA` is the command / shader / scratch
+carveout; **TD-3** (`gpu.md:1006, :1029`) long ago ratified that render targets live in a *separate*
+**256 MB region at `GPU_RT_REGION_OFF = 0xB0000000`** — 8 opaque handles x 32 MB, sized for
+2560x1440x4 colour **and** depth, ending exactly at the 3 GB carveout top so an overrun runs off the
+end into the `0x1FFC` fault net rather than into the console FB at offset 0 or the PSP TMR at
+`0x60000000`. Recorded because the mistake is instructive: the answer was already in the decision
+table, and the arithmetic that "found a blocker" was measuring the wrong region entirely.
 
-⚠ **Derived by walking the extents, not by eye** — the same method `GPU_TEXL_PREP_SUBOFF`'s comment
-records after two "obvious" gaps in this file turned out to collide.
+**The real blocker is that TD-3 was never BUILT.** `GPU_RT_REGION_OFF` appears **nowhere in
+`kernel/core/*.cyr`** — zero hits — and **rung 6 `arena-audit` has never run.** That rung is the
+read-only iron verification that `[GPU_RT_REGION_OFF, carveout_top)` is genuinely unclaimed, and its
+own failure note gates exactly this: *"Region not free ⇒ TD-3 has nowhere to live."* ⚠ With
+`VM_CONTEXT0` disabled there are **no page tables**, so an out-of-bounds store lands somewhere real —
+"free" has to be **measured**, not assumed.
 
-**⚠ A second tension the row contains, worth resolving before any code:** rung 17's design is
-*"one workgroup owns an 8×8 tile … holding colour + depth in **VGPRs** across the loop, one
-`global_store` at the end"* — yet the same row says *"Z lives in the kernel render arena"*. Those are
-consistent only if the arena Z persists **across dispatches** while VGPR depth is tile-local **within**
-one. If depth never outlives a dispatch, a separate `DEPTH_CLEAR` op has no state to clear and the
-clear value belongs in the depth op's own record instead. **Which of those two it is decides whether
-op `0x0D` should exist at all**, so it is settled first rather than discovered after the ABI ships.
+⭐ **Why this went unnoticed through six rungs:** rung 6's note says a failure stalls Phase II *"at
+rung 11"*, yet rungs 11-16 all shipped. They never needed it — coverage masks and prep records fit
+the 2 MB arena. **Rung 17 is the first rung whose buffer does not**, which is why the dependency
+surfaces now rather than earlier.
 
-⇒ **1.56.30's real first bite is the arena decision** — grow `GPU_ARENA_SIZE` (2 MB → 4 MB), place Z
-outside the carveout, or drop the persistent Z in favour of a per-dispatch clear value. No ABI has
-been minted and no VERSION-visible surface has changed, deliberately: minting `0x0D` before that
+⇒ **The real chain: rung 6 `arena-audit` -> implement `GPU_RT_REGION_OFF` + the handle table ->
+op `0x0D` + worker -> the tile-serialised depth rung.** Rung 6 is read-only, rides an existing flash
+at **0 marginal burns**, and reads `MC_VM_FB_OFFSET` (0x96B), `MC_VM_FB_LOC_BASE` (0x980) and
+`_LOC_TOP` (0x981) against the published slot map. No ABI minted, deliberately: advertising an op
+whose storage region is neither built nor verified is the 1.56.24 defect with extra steps.
+
+⚠ **The second tension RESOLVES rather than staying open.** The row specifies depth in **VGPRs**
+across a tile's triangle loop *and* "Z lives in the kernel render arena" — consistent, because arena Z
+persists **across dispatches** in the TD-3 region while VGPR depth is tile-local **within** one. So
+`DEPTH_CLEAR` does have state to clear, and op `0x0D` is justified.
+
+### Added — RUNG 6 `arena-audit`: TD-3's constants, a seven-check audit, and its host proof
+
+- **`GPU_RT_REGION_OFF` = 0xB0000000 / `_SIZE` = 256 MB / 8 handles × 32 MB** in `gpu_regs.cyr`,
+  declared **before** anything stores into the region, because rung 6 is the audit that proves it free.
+- **`gpu_rt_arena_audit()`** — seven checks, **READ-ONLY** (writes no memory and no register): fits
+  VRAM · ends *exactly* at the carveout top · clear of the framebuffer window · clear of the PSP TMR ·
+  clear of the command arena · the handle table tiles the region exactly · and the external witness.
+- **`tests/gpu/rtaudit.cyr`** — proves the six arithmetic checks on the host, **exit 95**, with
+  **five mutations** that each move the region onto a claimed window and must fire. On iron these
+  guards can only ever be observed *passing*; there is no way to move the TMR to see one fire.
+  ⭐ C7 confirms TD-3's sizing claim rather than assuming it: 32 MB ≥ 2560×1440×4 colour **and**
+  depth (33,554,432 ≥ 29,491,200).
+- **`gpuwedge --rt-audit`** → `#94` ARM F. ⚠ Placed **outside** the `GPU_RECOVER` `#ifdef` so it
+  exists in a production kernel — verified against the **built binary** (`ARM F` present, `ARM A`
+  absent in a default build), not against the source.
+- **`scripts/check/rt-region-derive.sh`** — `rtaudit` mirrors nine kernel constants because a host
+  test cannot include a kernel module, and **a mirror nobody diffs is ATOM_DRY**: move
+  `GPU_RT_REGION_OFF` and the host proof keeps certifying the *old* placement, green, forever.
+  Mutation-tested, and the new `check.sh` gate was forced red to prove the run still reaches its
+  summary — which that file's own header demands of every added gate.
+
+⭐ **Check 7 is the one that matters, and it is deliberately the only one needing iron.** Checks 1–6
+compare the region against agnos's **own** declared slot map; if that map is stale they all pass
+together, because they share a premise. That is exactly the blindness rung 15 shipped. Check 7 reads
+the address the **display engine is actually scanning out from**, out of DCN, and refuses if it lands
+inside the region — the one witness in the function that agnos did not write.
+[[feedback_oracle_must_test_external_invariant]]
+
+### ⛔ Fixed — `gpuwedge --audit` claimed "READ-ONLY, writes nothing" and WROTE
+
+Found while wiring ARM F. `--audit` invoked arm **5** = `RECOV_ARM_E`, which audits the sacrificial
+slot and **then fires an unguarded write** — that arm *is* rung 5's negative control and writing is
+the entire experiment. An operator reading "writes nothing" and running it on a machine they cared
+about would have been misled **by the tool**, which is precisely the failure this file's own
+unknown-argument comment warns about. Renamed **`--slot-audit`** and labelled truthfully, with the
+read-only rung-6 audit as a separate `--rt-audit`.
 decision would advertise an op whose storage does not exist.
 
 ## [1.56.29] - 2026-07-28

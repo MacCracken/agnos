@@ -106,21 +106,37 @@ says one). 1.56.32's item, and this close made it one worse.
 now — the M2 shift kind, the `+1` neighbour needing the **pre-clamp floor**, and the out-of-domain
 predicates needing to fire on **both** taps. A wrap-only suite sees none of them. Anyone adding a
 coordinate transform here must sweep CLAMP too.
-**▶ 1.56.30 OPEN — RUNG 17 `depth`. ⛔ ITS FIRST BITE IS AN ARENA DECISION, NOT THE OP.**
-Verified from source (the plan row is accurate): `GPU_OP_SUPPORTED = 0x1F1F`, `0x0D` is free, mask
-must grow to `0x3F1F`. ⚠ That mask is BOTH the validator gate and what `gpu_caps` #89 advertises, so
-growing it ADVERTISES the op — accepted-must-equal-proven means the worker lands in the same change.
-⛔ **THE BLOCKER: there is nowhere to put the Z buffer.** `GPU_ARENA_SIZE` is 2 MB and the slot map is
-nearly full — the only free runs are `[0x1E4000,0x1F0000)` = **48 KB** and `[0x1F1000,0x200000)` =
-**60 KB**. Scanout is 800x600, so Z is **960 KB at 16-bit / 1.92 MB at 32-bit**. Neither fits.
-(Derived by walking the sorted extents, not by eye — two "obvious" gaps in that file have collided
-before.) ⚠ **Second tension in the same row**: it specifies depth held in **VGPRs** across a tile's
-triangle loop *and* "Z lives in the kernel render arena". Consistent only if arena Z persists ACROSS
-dispatches while VGPR depth is tile-local WITHIN one — and if depth never outlives a dispatch, a
-separate `DEPTH_CLEAR` has no state to clear and the clear value belongs in the depth op's record.
-**That decides whether op `0x0D` should exist at all.** ⇒ Settle the arena + persistence question
-first: grow `GPU_ARENA_SIZE` (2→4 MB), place Z outside the carveout, or drop the persistent Z. No ABI
-minted yet, deliberately — advertising an op whose storage does not exist is the 1.56.24 defect.
+**▶ 1.56.30 OPEN — RUNG 17 `depth` IS GATED ON RUNG 6, WHICH WAS NEVER RUN.**
+Verified from source: `GPU_OP_SUPPORTED = 0x1F1F`, `0x0D` free, mask grows to `0x3F1F`. ⚠ That mask is
+BOTH the validator gate and what `gpu_caps` #89 advertises, so growing it ADVERTISES the op —
+accepted-must-equal-proven means the worker lands in the same change.
+⛔ **CORRECTION, recorded because the mistake is instructive:** a first pass measured `GPU_ARENA_SIZE`
+(2 MB, 48 KB + 60 KB free) and reported "nowhere to put Z" as an open decision. **Wrong arena.**
+`GPU_ARENA` is the command/shader/scratch carveout; **TD-3 already ratified** that render targets live
+in a SEPARATE **256 MB region at `GPU_RT_REGION_OFF = 0xB0000000`** (8 handles x 32 MB, fits
+2560x1440x4 colour + depth, ending at the 3 GB carveout top so an overrun hits the fault net). The
+answer was in the decision table; the arithmetic was measuring the wrong region.
+⛔ **THE REAL BLOCKER: TD-3 WAS NEVER BUILT.** `GPU_RT_REGION_OFF` appears **nowhere in
+`kernel/core/*.cyr`**, and **rung 6 `arena-audit` has never run** — the read-only iron check that
+`[GPU_RT_REGION_OFF, carveout_top)` is genuinely unclaimed. Its own note gates this exactly: *"Region
+not free ⇒ TD-3 has nowhere to live."* ⚠ With `VM_CONTEXT0` disabled there are **no page tables**, so
+an OOB store lands somewhere real — "free" must be MEASURED.
+⭐ **Why it hid for six rungs:** rung 6's note says a failure stalls Phase II "at rung 11", yet
+rungs 11-16 all shipped — they fit the 2 MB arena. **Rung 17 is the first rung whose buffer does not.**
+✅ **RUNG 6 HOST HALF LANDED (1.56.30).** TD-3's constants declared (`GPU_RT_REGION_OFF` 0xB0000000 /
+256 MB / 8 handles x 32 MB); `gpu_rt_arena_audit()` runs **seven** READ-ONLY checks; `tests/gpu/rtaudit.cyr`
+proves the six arithmetic ones on the host (**exit 95**, C1-C7 + M1-M5 mutations) and confirms 32 MB really
+holds 2560x1440x4 colour AND depth. `gpuwedge --rt-audit` -> #94 ARM F, **outside** the `GPU_RECOVER` ifdef
+so it ships in a production kernel (verified against the BUILT BINARY, not the source).
+⭐ **Check 7 needs iron and it is the only one that matters**: checks 1-6 compare the region against agnos's
+OWN slot map, so a stale map passes all six together — the shared-premise blindness rung 15 shipped. Check 7
+reads the address the DISPLAY ENGINE IS ACTUALLY SCANNING OUT FROM and refuses if it is inside the region.
+⛔ **Found while wiring it: `gpuwedge --audit` said "READ-ONLY, writes nothing" and invoked ARM E, which
+audits then fires an UNGUARDED WRITE.** Renamed `--slot-audit`; labelled truthfully.
+⇒ **CHAIN: rung 6 IRON half (`gpuwedge --rt-audit`, rides any flash, 0 marginal burns) → build the handle
+table → op `0x0D` + worker → the tile-serialised depth rung.** No ABI minted yet, deliberately.
+⚠ The VGPR-vs-arena-Z tension RESOLVES: arena Z persists ACROSS dispatches, VGPR depth is tile-local
+WITHIN one. So `DEPTH_CLEAR` has state to clear and op `0x0D` is justified.
 
 Remaining after rung 15 — ⚠ **this list was STALE by +2 until 2026-07-28** (it still carried the
 pre-renumbering mapping and collapsed rungs 17/18/19 into one cut); [`planning/gpu.md`](planning/gpu.md)
