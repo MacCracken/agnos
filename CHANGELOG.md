@@ -259,9 +259,34 @@ something other than the reference.
 (it is 128); the conclusion was right for a different reason — the tent kernel is interpolating at
 texel centres. Recorded rather than quietly rewritten.
 
-**Remaining for rung 15: a re-burn.** The golden data moved on all five frames, so the previous 5/5
-EXACT carries no independent weight until the new gates ride along — it proved GPU == reference, and
-that remains true, of a reference that has since changed.
+### ✅✅ Iron-validated — the re-burn confirms the fix, and all four predictions hold
+
+`gputri --cov` **20/20**; `gputex` **exit 95**, BILINEAR **5 of 5 EXACT**, and **frame 0 reports
+`vs NEAREST: 0`** — the prediction the first burn falsified, now confirmed.
+
+| Frame | Burn 1 `vs NEAREST` | Burn 2 |
+|---|---|---|
+| 0 · 1:1-identity | **35** | ✅ **0** |
+| 1 · non-integer-scale | 89 | 86 |
+| 2 · magnified-3tex | 300 | 278 |
+| 3 · skewed | 208 | 202 |
+| 4 · negative-UV | 119 | 114 |
+| **total** | 751 | **680** |
+
+⭐ **`exit 95` is now itself the assertion passing** — the 1:1-identity gate returns **86** if frame 0
+differs by a single pixel, so a green exit is positive evidence rather than the absence of evidence
+it was on burn 1.
+
+The golden data moved on all five frames, as predicted, because the reference moved with the shader.
+**Frame 0 is the only number in that table that could adjudicate anything** — it is the one pinned by
+an *external* invariant (bilinear at 1:1 is identity) rather than by agreement with a reference. That
+is the whole lesson of this rung in one column.
+
+**Rung 15 is closed and iron-validated**: blob, ABI, residency, dispatch selection, the 48-VGPR
+descriptor **and** the filter kernel.
+
+⚠ **Carry-forward, made one worse by this close**: the kernel is now **seven** rungs ahead of a
+shipped consumer. The 3D section's rule 2 says one. That is 1.56.32's item and it is still open.
 
 ## [1.56.28] - 2026-07-28
 

@@ -92,9 +92,16 @@ against something other than the reference. ⇒ **At least one gate must test an
 New: `texgate` **GATE 11** (absolute — bilinear at 1:1 == the source texture, via `tex_uv_at`) and
 **GATE 12** (falsifies it, breaks 63/64); GATE 10 inverted; `bigate` G2 re-anchored + G2b;
 `bimodel` **M6**; `gputex` now asserts frame 0 == 0 and `burn-prep` enforces its presence.
-▶ **REMAINING for rung 15: A RE-BURN.** ⚠ The golden data moved on all five frames, so the previous
-5/5 EXACT carries no independent weight — it proved GPU == reference, of a reference that has since
-changed. Run order on iron: `gputri --cov` (must still be 20/20) → `gputex` → `klug > /tex1.txt`.
+✅✅ **RE-BURN 2026-07-28 (`tex2.txt`): RUNG 15 IS CLOSED AND IRON-VALIDATED — all four predictions
+hold.** `gputri --cov` 20/20; `gputex` **exit 95**, BILINEAR **5 of 5 EXACT**, and **frame 0 reports
+`vs NEAREST: 0`** (was 35) — the falsified prediction now CONFIRMED. ⭐ `exit 95` is itself the
+assertion passing: the new 1:1-identity gate returns 86 on a single differing pixel, so a green exit
+is positive evidence rather than the absence of evidence it was on burn 1. The golden data moved on
+all five frames as predicted (89→86, 300→278, 208→202, 119→114; total 751→**680**) because the
+reference moved with the shader — frame 0 is the only number that could adjudicate anything, because
+it is pinned by an EXTERNAL invariant rather than by agreement with a reference.
+⚠ **Carry-forward**: the rung-closure debt is now **seven** rungs ahead of a shipped consumer (rule 2
+says one). 1.56.32's item, and this close made it one worse.
 ⛔ **THE TRAP CLASS THIS RUNG KEEPS PRODUCING: correct under WRAP, wrong under CLAMP.** Three instances
 now — the M2 shift kind, the `+1` neighbour needing the **pre-clamp floor**, and the out-of-domain
 predicates needing to fire on **both** taps. A wrap-only suite sees none of them. Anyone adding a
