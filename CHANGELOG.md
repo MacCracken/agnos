@@ -7,6 +7,40 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 **Rung 18 `persp-correct` — cycle OPEN.** Bumped on cycle open; the user tags on close.
 
+### Added — RUNG 18 ABI: op `0x0F GPU_OP_TRI_PERSP`, with every bound traceable to a measurement
+
+`gpo_validate_triperspec`, field mask `0x00FF`, `GPU_OP_SUPPORTED` → `0x1FF1F`, and **15 new battery
+cases — 151 of 151 correct**, `edge-abi-smoke` 18/18, `check.sh` 22/22.
+
+⭐ **This is the inverse of rung 17.** There, four plan specifications were falsified during
+implementation — the residue magnitude, the advertising model, the off-origin parameters, and a kernel
+`memcpy` from an address 64 GB above the identity map that would have `#PF`'d on its first byte. Here
+every rule was derived from a host measurement *before* the validator existed, and the two that matter
+most exist because they broke my own claims:
+
+- **`GPO_E_WRANGE` — a floor and ceiling on `w`.** `W = 2^K/w`, so a small `w` gives a large `W` and
+  inflates every downstream width. Two host probes disagreed on nothing but the `w` scale, and the
+  smaller one put the denominator past its lane on **all 4096 pixels** of identical geometry. `w` is a
+  fixed-point magnitude, floored, and a record below it is refused rather than silently rescaled.
+- **`GPO_E_DRANGE` — a four-corner bound on the denominator.** "D fits a 32-bit lane" held on every
+  early figure and is **false at the ABI's extremes**: measured at **8,583,644,160 = 2^33** with `w` at
+  its floor and the coordinate ceiling, twice an *unsigned* lane. `D` is affine, so four corners bound
+  it — rung 17's precedent, and one `depthgate`'s D8 already proved sound against brute force. The
+  battery case for it uses an **otherwise entirely legal** record, which is the point.
+
+Two codes rather than one because the caller's fix differs: `WRANGE` says rescale your clip `w`,
+`DRANGE` says shrink the rect or raise `w`. Sharing a code would point at the wrong number.
+
+⚠ **`0x0F` was earmarked "for rung 19" and that reservation was protecting nothing** — rung 19 is the
+consumer close (a game in a setu window, presented via `#84`) and mints no op. Taking it keeps every
+triangle-draw op in one contiguous lane, `0x08..0x0F`.
+
+⚠ Field offsets match the neighbours rather than being compact: `tex_id`/`texwh` where `0x0B` puts them,
+`vtx_id`/`n_tris` where `0x0E` does. A field meaning the same thing should live at the same dword.
+
+⚠ Miscounted the battery total by one (152 for 15 new cases on top of 136) and the smoke script's
+expected verdict string didn't match my `sed`. Both surfaced as a red gate, which is what they are for.
+
 ### Added — `perspmodel.cyr`: multi-word arithmetic at register widths, and it broke a design claim
 
 `tests/gpu/perspmodel.cyr`, exit 95. **12** host oracles. The first model in this tree that has to carry

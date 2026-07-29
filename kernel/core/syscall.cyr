@@ -1195,14 +1195,19 @@ var GPU_EDGE_MAX       = 256;        # per-op cap; a reject, never a clamp
 # ABI battery before assuming ANY code is free -- that renumbering is why this warning exists.
 var GPU_OP_DEPTH_CLEAR = 0x0D;       # clear a TD-3 depth handle           (3D arc rung 17)
 var GPU_OP_TRI_DEPTH   = 0x0E;       # depth-tested triangle list          (3D arc rung 17)
-# ⭐ 0x10 opens the fill/blit/READBACK lane gpu.md reserved at 0x10..0x17. ⚠ 0x0F is deliberately
-# skipped and stays free for rung 19 — taking the next contiguous code would spend a reservation.
+# ⭐ RUNG 18 takes 0x0F, the last code in the triangle-draw lane (0x08..0x0F). ⚠ The rung-17 comment
+# here earmarked 0x0F "for rung 19" — but rung 19 is the CONSUMER close (a game in a setu window,
+# presented with #84) and mints no op at all, so the reservation was protecting nothing. Taking it keeps
+# every triangle-draw op inside one contiguous lane, which is what makes GPU_OP_SUPPORTED's bit index
+# readable as a family rather than a scatter.
+var GPU_OP_TRI_PERSP   = 0x0F;       # perspective-correct textured triangles   (3D arc rung 18)
+# ⭐ 0x10 opens the fill/blit/READBACK lane gpu.md reserved at 0x10..0x17.
 var GPU_OP_RT_READ     = 0x10;       # copy a render-target handle out to a #86 slot (rung 17)
 # ⛔ GROWING THIS WORD ADVERTISES THE OP. It is both the validator's gate (gpo_validate) and what
 # gpu_caps #89 reports to ring 3, which is the "deliberately awkward" property the plan wanted: you
 # cannot add an op here without also promising it works. So 0x0D is added in the SAME change as
 # gpu_depth_clear, and that worker refuses with GPO_E_ARM until rung 6's audit passes on this boot.
-var GPU_OP_SUPPORTED   = 0x17F1F;    # bits 0..4 + 8 EDGE_COV + 9 TRI_RGBA + 10 TRI_LIST + 11 TRI_TEX + 12 TEX_LIST + 13 DEPTH_CLEAR + 14 TRI_DEPTH + 16 RT_READ — MUST equal what gpo_validate REACHES
+var GPU_OP_SUPPORTED   = 0x1FF1F;    # bits 0..4 + 8 EDGE_COV + 9 TRI_RGBA + 10 TRI_LIST + 11 TRI_TEX + 12 TEX_LIST + 13 DEPTH_CLEAR + 14 TRI_DEPTH + 15 TRI_PERSP + 16 RT_READ — MUST equal what gpo_validate REACHES
 
 # ⭐⭐ GPU_OP_NOTIMPL_MASK — ops whose ABI is COMPLETE and whose WORKER IS NOT. Reachable by the
 # validator (so every rule below is exercised by the battery through the real dispatch path) and
@@ -1222,7 +1227,7 @@ var GPU_OP_SUPPORTED   = 0x17F1F;    # bits 0..4 + 8 EDGE_COV + 9 TRI_RGBA + 10 
 # advertises ops, not flags. An OP cannot.
 # ⇒ WHEN THE WORKER LANDS (plan bite B9), bit 14 clears HERE and the GPO_E_NOTIMPL return at the end
 # of gpo_validate_tridepth goes away, in one change. Both moves or neither.
-var GPU_OP_NOTIMPL_MASK = 0x0000;    # EMPTY — every op in GPU_OP_SUPPORTED has a worker
+var GPU_OP_NOTIMPL_MASK = 0x8000;    # bit 15 TRI_PERSP — ABI complete, worker not yet built
 
 # ---- rung 17 op 0x0E sizing. ⚠ Its OWN constants, not TRI_LIST's: the record, the stride and the
 # work unit all differ, and sharing a name would couple two ABIs that are free to move apart.
@@ -1244,6 +1249,30 @@ var GPU_TILE            = 8;         # one workgroup owns an 8x8 tile == exactly
 # The 32-bit lane the shader evaluates w0/w1/w2 and zn in. ⚠ A SIGNED bound: a value in
 # [2^31, 2^32) restores NEGATIVE and fails the compare it feeds while passing an unsigned width test.
 var GPU_TRID_LANE_MAX   = 2147483647;  # 2^31-1
+
+# ---- rung 18 op 0x0F sizing. ⭐ EVERY BOUND HERE WAS MEASURED ON THE HOST BEFORE THIS ABI EXISTED,
+# which is the opposite of rung 17, where four plan specifications were falsified during implementation.
+var GPU_TPER_VTX_BYTES  = 64;        # per-triangle: 3 x (x, y, w, u, v) + 1 reserved dword
+var GPU_TPER_LIST_MAX   = 256;       # per-record triangle cap; a reject, never a clamp
+var GPU_TPER_K          = 16;        # W_i = 2^K / w_i
+# ⛔⛔ THE w FLOOR IS THE LOAD-BEARING ONE, AND IT IS NOT A STYLE CHOICE. `W_i = 2^K / w_i`, so a SMALL
+# w gives a LARGE W and inflates every downstream width. Measured: `perspcore` originally used w = 1
+# and put the denominator past a 32-bit lane on ALL 4096 pixels of its full-screen frame, contradicting
+# `perspbits`' 24-29 bits on identical geometry — the two probes disagreed on nothing but the w scale.
+# ⇒ w is a FIXED-POINT MAGNITUDE, floored here, and a record below the floor is refused.
+var GPU_TPER_W_MIN      = 256;
+var GPU_TPER_W_MAX      = 268435456;   # 2^28, the same ceiling as the coordinate bound
+# ⛔ THE DENOMINATOR BOUND, and it exists because a design claim was FALSIFIED on the host. "D fits a
+# 32-bit lane" held on every early figure and is FALSE at the ABI's extremes: with w at its floor and
+# the coordinate ceiling at 4096x2048, `perspmodel` measured D = **8,583,644,160 = 2^33**, twice an
+# UNSIGNED lane. ⭐ D is affine in (x,y), so the DRAW RECT'S FOUR CORNERS bound it — rung 17's corner
+# bound is the precedent and depthgate's D8 proved that shortcut sound against brute force. Rejecting
+# here is what makes "D fits one lane" true BY CONSTRUCTION rather than by luck.
+var GPU_TPER_D_MAX      = 4294967295;  # 2^32-1, one unsigned lane
+# The numerator is a REGISTER PAIR by design (measured 46-57 bits), so it needs no lane bound — but
+# prep evaluates it in i64, so it needs a bound that keeps the KERNEL's own arithmetic defined. Same
+# trap GPU_EDGE_COORD_MAX's comment names: past ~2^63 the oracle itself has no defined value.
+var GPU_TPER_N_MAX      = 4611686018427387904;   # 2^62, two bits of margin inside i64
 
 # Flags word (+4). NOTHING is accepted here yet, on purpose: a flag that is accepted and ignored is how
 # a caller silently gets behaviour it did not ask for. bit0 SERIALIZE and bit1 CHECK_PREMUL are reserved
@@ -1344,6 +1373,12 @@ var GPO_E_ZRANGE   = 31;             # op    — z out of range, or |w|/|zn| exc
 # guard instead would make every edge tile show lane dropouts — byte-identical to the S1 per-lane
 # signature the lane witness exists to detect, and the burn would be spent telling them apart.
 var GPO_E_ALIGN    = 32;             # op    — w/h/dx/dy not a multiple of GPU_TILE
+# ⭐ Rung 18. Two codes, because the caller's FIX differs: WRANGE means "your w is outside the
+# representable band" (fix: rescale the clip w), DRANGE means "this geometry's denominator or numerator
+# outgrows the lane at a corner of your draw rect" (fix: shrink the rect or raise w). Sharing one code
+# would tell a caller to change the wrong number.
+var GPO_E_WRANGE   = 33;             # op    — a per-vertex w outside [GPU_TPER_W_MIN, _W_MAX]
+var GPO_E_DRANGE   = 34;             # op    — D or N exceeds its lane at a draw-rect corner
 var GPO_E_TRILIST  = 24;             # op    — triangle count/slot invalid, or a per-triangle record is
 var GPU_COV_MAX_DIM = 4096;          # per-side mask cap — a REJECT, never a clamp
 # ⭐ THE COORDINATE DOMAIN (B3). 2^28 = 4096 px in 16.16 — the same 4096 as GPU_COV_MAX_DIM, so
@@ -1414,6 +1449,11 @@ fn gpo_field_mask(op) {
     # as EDGE_COV and DEPTH_CLEAR. The readback rect starts at the handle's corner; placing it is the
     # caller's business once the pixels are in its own slot.
     if (op == GPU_OP_RT_READ)     { return 0x009F; }
+    # rung 18: op(0) flags(1) tex_id(2) vtx_id(3) wh(4) dstxy(5) n_tris(6) texwh(7)
+    # ⚠ Field offsets chosen to MATCH THE NEIGHBOURS rather than to be compact: tex_id and texwh sit
+    # where op 0x0B puts them, vtx_id and n_tris where 0x0E puts them. A field that means the same thing
+    # should live at the same dword across ops, so a reader who knows one record can read the next.
+    if (op == GPU_OP_TRI_PERSP)   { return 0x00FF; }
     return 0;
 }
 
@@ -3141,6 +3181,91 @@ fn edge_abi_selftest() {
     pass = pass + ea_expect(&d, GPO_E_RESERVED, "rtread: unknown flag bit", 24);
     store32(&d +  4, 0);
 
+    # ---- op 0x0F TRI_PERSP (rung 18) -----------------------------------------------------------
+    # ⛔ WELL-FORMED CASES EXPECT GPO_E_NOTIMPL. The ABI is complete; the shader is not. Bit 15 sits in
+    # GPU_OP_NOTIMPL_MASK so #89 does not advertise it, exactly the mechanism rung 17 built for 0x0E.
+    # ⭐ EVERY REJECT BELOW POINTS AT A RULE THAT CAME FROM A HOST MEASUREMENT, not from a plan row.
+    kprint("edge-abi: ---- #92 op 0x0F TRI_PERSP ABI battery ----\n", 54);
+    vb = &eabi_edges;
+    vz = 0;
+    while (vz < 16) { store32(vb + vz * 4, 0); vz = vz + 1; }
+    # one well-formed triangle: 3 x (x, y, w, u, v) then a reserved dword
+    store32(vb +  0, 0);            store32(vb +  4, 0);
+    store32(vb +  8, 1024);         store32(vb + 12, 0);          store32(vb + 16, 0);
+    store32(vb + 20, 16 * 65536);   store32(vb + 24, 0);
+    store32(vb + 28, 1024);         store32(vb + 32, 16 * 65536); store32(vb + 36, 0);
+    store32(vb + 40, 0);            store32(vb + 44, 16 * 65536);
+    store32(vb + 48, 1024);         store32(vb + 52, 0);          store32(vb + 56, 16 * 65536);
+    store32(vb + 60, 0);
+
+    L1 = 0; while (L1 < 16) { store32(&d + L1 * 4, 0); L1 = L1 + 1; }
+    store32(&d +  0, GPU_OP_TRI_PERSP);
+    store32(&d +  8, 14);                         # texture slot
+    store32(&d + 12, 14);                         # vertex slot
+    store32(&d + 16, (16 * 65536) + 16);          # 16x16 draw rect, both multiples of 8
+    store32(&d + 24, 1);                          # n_tris
+    store32(&d + 28, (8 * 65536) + 8);            # 8x8 texture
+    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "persp: well-formed record reaches the unbuilt worker", 52);
+
+    store32(&d + 16, (16 * 65536) + 12);
+    pass = pass + ea_expect(&d, GPO_E_ALIGN, "persp: width not a multiple of the tile", 39);
+    store32(&d + 16, (16 * 65536) + 16);
+    store32(&d + 16, (16 * 65536) + 0);
+    pass = pass + ea_expect(&d, GPO_E_DIM, "persp: zero width", 17);
+    store32(&d + 16, (16 * 65536) + 16);
+
+    store32(&d + 28, (8 * 65536) + 0);
+    pass = pass + ea_expect(&d, GPO_E_TEXDIM, "persp: zero texture width", 25);
+    store32(&d + 28, (8 * 65536) + 8);
+
+    store32(&d + 24, 0);
+    pass = pass + ea_expect(&d, GPO_E_TRILIST, "persp: zero triangles", 21);
+    store32(&d + 24, GPU_TPER_LIST_MAX + 1);
+    pass = pass + ea_expect(&d, GPO_E_TRILIST, "persp: triangle count above the cap", 35);
+    store32(&d + 24, 1);
+
+    store32(vb + 60, 1);
+    pass = pass + ea_expect(&d, GPO_E_TRILIST, "persp: per-triangle reserved dword non-zero", 43);
+    store32(vb + 60, 0);
+
+    store32(vb + 20, (16 * 65536) + 1);
+    pass = pass + ea_expect(&d, GPO_E_SUBPIXEL, "persp: coordinate with fraction bits set", 40);
+    store32(vb + 20, 16 * 65536);
+
+    # ⭐⭐ THE w BAND -- the rule that exists because two host probes disagreed on nothing but the w
+    # scale, and the smaller one put the denominator past its lane on every pixel.
+    store32(vb +  8, GPU_TPER_W_MIN - 1);
+    pass = pass + ea_expect(&d, GPO_E_WRANGE, "persp: w one below the floor", 28);
+    store32(vb +  8, GPU_TPER_W_MIN);
+    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "persp: w exactly at the floor is legal", 38);
+    store32(vb +  8, GPU_TPER_W_MAX + 1);
+    pass = pass + ea_expect(&d, GPO_E_WRANGE, "persp: w one above the ceiling", 30);
+    store32(vb +  8, 1024);
+
+    # ⭐⭐ THE DENOMINATOR BOUND -- the rule that exists because "D fits a 32-bit lane" was FALSIFIED on
+    # the host at 2^33. Every w at the floor plus a large draw rect drives D past a lane; the record is
+    # otherwise entirely legal, which is the whole point.
+    store32(vb +  8, GPU_TPER_W_MIN);
+    store32(vb + 28, GPU_TPER_W_MIN);
+    store32(vb + 48, GPU_TPER_W_MIN);
+    store32(vb + 20, 2048 * 65536);   store32(vb + 44, 2048 * 65536);
+    store32(&d + 16, (1024 * 65536) + 1024);
+    pass = pass + ea_expect(&d, GPO_E_DRANGE, "persp: legal record whose D outgrows a 32-bit lane", 50);
+    store32(&d + 16, (16 * 65536) + 16);
+    store32(vb + 20, 16 * 65536);     store32(vb + 44, 16 * 65536);
+    store32(vb +  8, 1024); store32(vb + 28, 1024); store32(vb + 48, 1024);
+
+    store32(vb + 20, 0);   store32(vb + 44, 0);      # collapse to a line
+    pass = pass + ea_expect(&d, GPO_E_AREA, "persp: degenerate triangle would divide by zero", 47);
+    store32(vb + 20, 16 * 65536);  store32(vb + 44, 16 * 65536);
+
+    store32(&d +  4, 0x01);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "persp: unknown flag bit", 23);
+    store32(&d +  4, 0);
+    store32(&d + 32, 1);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "persp: dword 8 is not defined for this op", 41);
+    store32(&d + 32, 0);
+
     # Restore again, for the same reason the loop above does: a selftest that leaves the shm table
     # dirty hands the next allocation a slot that LOOKS taken, and the symptom surfaces far from here.
     r = 10;
@@ -3150,9 +3275,9 @@ fn edge_abi_selftest() {
         r = r + 1;
     }
 
-    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 136 cases correct\n", 22);
-    if (pass == 136) {
-        kprint("edge-abi: PASS -- the 0x08/0x09/0x0A/0x0B/0x0C/0x0D/0x0E/0x10 ABIs reject every malformed\n", 90);
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 151 cases correct\n", 22);
+    if (pass == 151) {
+        kprint("edge-abi: PASS -- the 0x08..0x0F and 0x10 ABIs reject every malformed record,\n", 78);
         kprint("edge-abi: record,\n", 18);
         kprint("edge-abi: and a well-formed one is accepted or correctly reports no-GPU.\n", 73);
         return 1;
@@ -3397,6 +3522,165 @@ fn gpo_validate_rtread(rec) {
     return 0;
 }
 
+# ============================================================================================
+# gpo_validate_triperspec(rec, fbw, fbh) — op 0x0F. RUNG 18's validator.
+# ============================================================================================
+# ⭐ EVERY BOUND BELOW WAS MEASURED ON THE HOST BEFORE THIS FUNCTION EXISTED, which is the opposite of
+# rung 17 — where four plan specifications were falsified during implementation and one of them (a
+# kernel memcpy from an address 64 GB above the identity map) would have #PF'd on the first byte.
+# The measurements live in tests/gpu/perspbits.cyr, perspdiv.cyr, perspgate.cyr and perspmodel.cyr.
+#
+# THE ARITHMETIC IT IS PROTECTING. Perspective-correct interpolation of an attribute `a`:
+#     a_persp = [ SUM e_i * (W_i * a_i) ] / [ SUM e_i * W_i ]        with W_i = 2^K / w_i
+# Both numerator and denominator are AFFINE in (x,y), so both hoist exactly like rung 17's depth
+# numerator — and both therefore admit a four-corner bound, which is what rules 9 and 10 are.
+fn gpo_validate_triperspec(rec, fbw, fbh) {
+    var wh  = load32(rec + 16) & 0xFFFFFFFF;
+    var dxy = load32(rec + 20) & 0xFFFFFFFF;
+    var twh = load32(rec + 28) & 0xFFFFFFFF;
+    var w  = wh & 0xFFFF;
+    var h  = (wh >> 16) & 0xFFFF;
+    var dx = dxy & 0xFFFF;
+    var dy = (dxy >> 16) & 0xFFFF;
+    var tw = twh & 0xFFFF;
+    var th = (twh >> 16) & 0xFFFF;
+    if (w < 1) { return GPO_E_DIM; }
+    if (h < 1) { return GPO_E_DIM; }
+
+    # ⭐ THE ALIGNMENT RULE, same as op 0x0E and for the same reason: with every extent a multiple of
+    # the 8x8 tile there is no partial tile, so the shader needs no bounds guard and never writes exec.
+    # ⚠ A prologue guard instead would forge the per-lane dropout signature a lane witness exists to
+    # detect, and the burn would be spent telling the two apart.
+    if ((w  & (GPU_TILE - 1)) != 0) { return GPO_E_ALIGN; }
+    if ((h  & (GPU_TILE - 1)) != 0) { return GPO_E_ALIGN; }
+    if ((dx & (GPU_TILE - 1)) != 0) { return GPO_E_ALIGN; }
+    if ((dy & (GPU_TILE - 1)) != 0) { return GPO_E_ALIGN; }
+    if (dx + w > fbw) { return GPO_E_BOUNDS; }
+    if (dy + h > fbh) { return GPO_E_BOUNDS; }
+
+    # texture, on the same terms op 0x0B uses -- two sites, one fact
+    if (tw < 1) { return GPO_E_TEXDIM; }
+    if (th < 1) { return GPO_E_TEXDIM; }
+    if (tw > GPU_TEX_MAX_DIM) { return GPO_E_TEXDIM; }
+    if (th > GPU_TEX_MAX_DIM) { return GPO_E_TEXDIM; }
+    var tid = load32(rec + 8) & 0xFFFFFFFF;
+    if (shm_slot_valid(tid) == 0) { return GPO_E_TEXSLOT; }
+    var tslot = tid - 1;
+    if (load64(&shm_kva + tslot * 8) == 0) { return GPO_E_TEXSLOT; }
+    if (load64(&shm_size + tslot * 8) < tw * th * 4) { return GPO_E_TEXSLOT; }
+
+    var nt = load32(rec + 24) & 0xFFFFFFFF;
+    if (nt < 1) { return GPO_E_TRILIST; }
+    if (nt > GPU_TPER_LIST_MAX) { return GPO_E_TRILIST; }
+    var tiles = (w >> 3) * (h >> 3);
+    if (tiles * nt > GPU_TRID_WORK_MAX) { return GPO_E_WORK; }
+
+    var vid = load32(rec + 12) & 0xFFFFFFFF;
+    if (shm_slot_valid(vid) == 0) { return GPO_E_TRILIST; }
+    var vslot = vid - 1;
+    if (load64(&shm_size + vslot * 8) < nt * GPU_TPER_VTX_BYTES) { return GPO_E_TRILIST; }
+    var vkva = load64(&shm_kva + vslot * 8);
+    if (vkva == 0) { return GPO_E_TRILIST; }
+
+    # the four corners of the DRAW RECT, as doubled sample points -- the same domain the reference and
+    # the register-width model prove, where a pixel centre is the exact integer 2*px + 1
+    var qx0 = 2 * dx + 1;
+    var qx1 = 2 * (dx + w - 1) + 1;
+    var qy0 = 2 * dy + 1;
+    var qy1 = 2 * (dy + h - 1) + 1;
+
+    var i = 0;
+    while (i < nt) {
+        var b = vkva + i * GPU_TPER_VTX_BYTES;
+        if ((load32(b + 60) & 0xFFFFFFFF) != 0) { return GPO_E_TRILIST; }
+
+        # ---- coordinates: the ABI window, and INTEGER pixels only -------------------------------
+        var f = 0;
+        while (f < 3) {
+            var cx = gpo_i32(b + f * 20 + 0);
+            var cy = gpo_i32(b + f * 20 + 4);
+            if (gpo_coord_bad(cx) == 1) { return GPO_E_COORD; }
+            if (gpo_coord_bad(cy) == 1) { return GPO_E_COORD; }
+            # ⛔ REJECT sub-pixel, do not quantise. The reference and model prove this arithmetic in the
+            # doubled-INTEGER domain only; rounding kernel-side would answer a different question than
+            # the one asked. Same doctrine as op 0x0E's GPO_E_SUBPIXEL and WRAP's power-of-two reject.
+            if ((cx & 0xFFFF) != 0) { return GPO_E_SUBPIXEL; }
+            if ((cy & 0xFFFF) != 0) { return GPO_E_SUBPIXEL; }
+            f = f + 1;
+        }
+
+        # ---- ⭐⭐ THE w BAND. `W_i = 2^K / w_i`, so a small w gives a LARGE W and inflates every
+        # downstream width. MEASURED: the reference originally used w = 1 and put D past a 32-bit lane
+        # on all 4096 pixels of its full-screen frame, contradicting an earlier probe's 24-29 bits on
+        # identical geometry -- the two disagreed on nothing but the w scale. w is a FIXED-POINT
+        # MAGNITUDE, and a record below the floor is refused rather than silently rescaled.
+        var w0 = load32(b +  8) & 0xFFFFFFFF;
+        var w1 = load32(b + 28) & 0xFFFFFFFF;
+        var w2 = load32(b + 48) & 0xFFFFFFFF;
+        if (w0 < GPU_TPER_W_MIN) { return GPO_E_WRANGE; }
+        if (w1 < GPU_TPER_W_MIN) { return GPO_E_WRANGE; }
+        if (w2 < GPU_TPER_W_MIN) { return GPO_E_WRANGE; }
+        if (w0 > GPU_TPER_W_MAX) { return GPO_E_WRANGE; }
+        if (w1 > GPU_TPER_W_MAX) { return GPO_E_WRANGE; }
+        if (w2 > GPU_TPER_W_MAX) { return GPO_E_WRANGE; }
+
+        var dax = 2 * (gpo_i32(b +  0) >>> 16);  var day = 2 * (gpo_i32(b +  4) >>> 16);
+        var dbx = 2 * (gpo_i32(b + 20) >>> 16);  var dby = 2 * (gpo_i32(b + 24) >>> 16);
+        var dcx = 2 * (gpo_i32(b + 40) >>> 16);  var dcy = 2 * (gpo_i32(b + 44) >>> 16);
+        # ⛔ GPU_TRI_AREA_MIN is what forbids a degenerate triangle, and it is the only thing between a
+        # ring-3 record and a kernel divide-by-zero in prep. A memory-safety rule, not a quality one.
+        var cross = ((dbx - dax) * (dcy - day) - (dby - day) * (dcx - dax)) / 4;
+        if (cross < 0) { cross = 0 - cross; }
+        var a2 = cross << 16;
+        if (a2 < GPU_TRI_AREA_MIN) { return GPO_E_AREA; }
+        if (a2 > GPU_TRI_AREA_MAX) { return GPO_E_AREA; }
+
+        var W0 = (1 << GPU_TPER_K) / w0;
+        var W1 = (1 << GPU_TPER_K) / w1;
+        var W2 = (1 << GPU_TPER_K) / w2;
+        var u0 = load32(b + 12) & 0xFFFFFFFF;
+        var u1 = load32(b + 32) & 0xFFFFFFFF;
+        var u2 = load32(b + 52) & 0xFFFFFFFF;
+        var v0 = load32(b + 16) & 0xFFFFFFFF;
+        var v1 = load32(b + 36) & 0xFFFFFFFF;
+        var v2 = load32(b + 56) & 0xFFFFFFFF;
+
+        var k = 0;
+        while (k < 4) {
+            var qx = qx0; var qy = qy0;
+            if (k == 1) { qx = qx1; qy = qy0; }
+            if (k == 2) { qx = qx0; qy = qy1; }
+            if (k == 3) { qx = qx1; qy = qy1; }
+            var e0 = (dcx - dbx) * (qy - dby) - (dcy - dby) * (qx - dbx);
+            var e1 = (dax - dcx) * (qy - dcy) - (day - dcy) * (qx - dcx);
+            var e2 = (dbx - dax) * (qy - day) - (dby - day) * (qx - dax);
+            # ⭐⭐ THE DENOMINATOR BOUND. This rule exists because a design claim was FALSIFIED on the
+            # host: "D fits a 32-bit lane" held on every early figure and is FALSE at the extremes --
+            # measured at **8,583,644,160 = 2^33** with w at its floor and the coordinate ceiling, twice
+            # an UNSIGNED lane. D is affine, so four corners bound it; depthgate's D8 proved that
+            # shortcut sound against brute force for exactly this shape of quantity.
+            var D = e0 * W0 + e1 * W1 + e2 * W2;
+            if (D < 0) { D = 0 - D; }
+            if (D > GPU_TPER_D_MAX) { return GPO_E_DRANGE; }
+            # the numerator is a REGISTER PAIR by design and needs no lane bound -- but prep evaluates
+            # it in i64, so it needs one that keeps the KERNEL's own arithmetic defined.
+            var Nu = e0 * (W0 * u0) + e1 * (W1 * u1) + e2 * (W2 * u2);
+            var Nv = e0 * (W0 * v0) + e1 * (W1 * v1) + e2 * (W2 * v2);
+            if (Nu < 0) { Nu = 0 - Nu; }
+            if (Nv < 0) { Nv = 0 - Nv; }
+            if (Nu > GPU_TPER_N_MAX) { return GPO_E_DRANGE; }
+            if (Nv > GPU_TPER_N_MAX) { return GPO_E_DRANGE; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+
+    # ⛔ ABI COMPLETE, WORKER NOT. bit 15 is in GPU_OP_NOTIMPL_MASK so #89 does not advertise it, and
+    # this returns a specific documented refusal rather than a blessing followed by a generic dispatch
+    # failure. ⇒ when the shader lands, this line goes and the mask bit clears IN ONE CHANGE.
+    return GPO_E_NOTIMPL;
+}
+
 fn gpo_validate(rec, fbw, fbh) {
     var op = load32(rec + 0) & 0xFFFFFFFF;
     if (op > 0x1F) { return GPO_E_BADOP; }
@@ -3425,6 +3709,7 @@ fn gpo_validate(rec, fbw, fbh) {
     if (op == GPU_OP_DEPTH_CLEAR) { return gpo_validate_depthclear(rec); }
     if (op == GPU_OP_TRI_DEPTH)   { return gpo_validate_tridepth(rec, fbw, fbh); }
     if (op == GPU_OP_RT_READ)     { return gpo_validate_rtread(rec); }
+    if (op == GPU_OP_TRI_PERSP)   { return gpo_validate_triperspec(rec, fbw, fbh); }
 
     var wh  = load32(rec + 16) & 0xFFFFFFFF;
     var dxy = load32(rec + 20) & 0xFFFFFFFF;
