@@ -55,6 +55,211 @@ fn dg_render_order(swap): i64 {
 # dg_absmax_at(t, px, py) — the largest |value| among w0, w1, w2 and zn for triangle `t` at one
 # pixel. ⚠ Evaluated UNCONDITIONALLY, inside the triangle or not: the shader is predicated and runs
 # every lane, so the bound the validator needs is over the whole draw rect, not over the covered set.
+# ==================================================================================================
+# ⭐⭐ THE EXTERNAL INVARIANTS (plan 6.2, bite B4) — the two gates that do NOT rest on a shared premise
+# ==================================================================================================
+# ⛔ EVERY GATE ABOVE IS INTERNAL. D1's both-orders oracle is a consistency property that a wrong
+# shader and a wrong reference can satisfy TOGETHER -- which is precisely what happened at rung 15,
+# where bicore, bimodel, texcore AND the shader all implemented the same wrong half-texel convention
+# and every agreement gate went green. `depthmodel` vs `depthcore` has the same exposure: they were
+# written in the same week by the same hand from the same derivation.
+# ⛔ Translation equivariance was REJECTED as the external gate: a constant sample-point offset
+# COMMUTES with integer translation, so it is blind to exactly the error it would be proposed to
+# catch. (D6 uses it, but only for the arithmetic domain it opens -- never as the oracle.)
+
+# ---- G7's counterparty: the inside test of the INDEPENDENTLY BURNED 2D path ----------------------
+# `tri_prep`/`tri_ref_px` is rung 9/11's reference for `tri_rgba` / op 0x0A -- a shipped, iron-burned
+# rasteriser. Three things make it a genuine external witness rather than a sibling:
+#   1. **Different number system.** It keeps vertices in PIXELS and samples at 16.16
+#      `(px << 16) + 32768`; `depthcore` DOUBLES the vertices and samples at `2*px + 1`. Both denote
+#      the pixel centre, and neither can be transformed into the other by a shared constant.
+#   2. **Different edge derivation.** Its signs fall out of the lambda_B / lambda_C definitions (see
+#      tricore.cyr:147-158, where getting them wrong produced a uniformly black frame); `depthcore`
+#      takes three symmetric cross products.
+#   3. **It was burned.** Its answers were checked against silicon, not against a co-designed model.
+# ⇒ if the two disagree on a single pixel of the silhouette, one of the two half-pixel conventions is
+# wrong -- and that is the exact class of defect rung 15 shipped past four green gates.
+# ---- mutations for the external gates: each MUST make its gate go red ----------------------------
+# ⛔ A gate that has never failed is a claim, not a check -- and these three passed on their first run,
+# which is exactly when that distinction matters most.
+var dg_mut_corner = 0;   # D10: sample at the pixel CORNER instead of its centre -- a half-pixel
+                         #      convention error, i.e. the precise class rung 15 shipped past four
+                         #      green gates. If D10 cannot see this, it cannot see the thing it exists for.
+var dg_mut_plane  = 0;   # D11a: perturb the fitted plane's constant term by one
+var dg_mut_lflip  = 0;   # D11b: reverse the sense of the interpenetration line
+
+fn dg_tp_inside(px, py): i64 {
+    var pcx = ((dc_ox + px) << 16) + 32768;
+    var pcy = ((dc_oy + py) << 16) + 32768;
+    if (dg_mut_corner != 0) {
+        pcx = (dc_ox + px) << 16;
+        pcy = (dc_oy + py) << 16;
+    }
+    var eb = tp_get(TP_KXB) * pcx + tp_get(TP_KYB) * pcy + tp_get(TP_K0B);
+    var ec = tp_get(TP_KXC) * pcx + tp_get(TP_KYC) * pcy + tp_get(TP_K0C);
+    var ea = tp_get(TP_A2) - eb - ec;      # the identity, not a third cross product
+    if (ea >= 0) { if (eb >= 0) { if (ec >= 0) { return 1; } } }
+    return 0;
+}
+
+# ---- G8's machinery: each triangle's depth plane fitted in 3-SPACE, from the vertices alone -------
+# ⭐ NOTHING HERE TOUCHES AN EDGE FUNCTION, A BARYCENTRIC WEIGHT OR THE HOIST. The three (x, y, z)
+# vertices span a plane; its normal is one 3D cross product, and `z = (a*X + b*Y + c)/d` follows. That
+# is a completely different route to the same quantity, which is what makes D11 external.
+var dg_pa[2]; var dg_pb[2]; var dg_pc[2]; var dg_pd[2];
+
+fn dg_plane_fit(t): i64 {
+    # ⚠ X and Y doubled, Z not -- matching the doubled sample points. z is linear in (x, y), so
+    # rescaling x and y just rescales the coefficients; evaluating at doubled samples recovers it.
+    var X0 = 2 * dc_get(t, 0); var Y0 = 2 * dc_get(t, 1); var Z0 = dc_get(t, 2);
+    var X1 = 2 * dc_get(t, 3); var Y1 = 2 * dc_get(t, 4); var Z1 = dc_get(t, 5);
+    var X2 = 2 * dc_get(t, 6); var Y2 = 2 * dc_get(t, 7); var Z2 = dc_get(t, 8);
+    var ux = X1 - X0; var uy = Y1 - Y0; var uz = Z1 - Z0;
+    var vx = X2 - X0; var vy = Y2 - Y0; var vz = Z2 - Z0;
+    var nx = uy * vz - uz * vy;
+    var ny = uz * vx - ux * vz;
+    var nz = ux * vy - uy * vx;
+    var a = 0 - nx;
+    var b = 0 - ny;
+    var c = nx * X0 + ny * Y0 + nz * Z0;
+    var d = nz;
+    if (dg_mut_plane != 0) { c = c + 1; }
+    # normalise to a positive denominator so sign(z0 - z1) == sign(L) below
+    if (d < 0) { a = 0 - a; b = 0 - b; c = 0 - c; d = 0 - d; }
+    store64(&dg_pa + t * 8, a);
+    store64(&dg_pb + t * 8, b);
+    store64(&dg_pc + t * 8, c);
+    store64(&dg_pd + t * 8, d);
+    return 0;
+}
+
+# dg_bary_at — the reference's OWN numerator and denominator at a pixel, for D11a to cross-multiply
+# against the plane fit. Left in globals because Cyrius has no tuple return.
+var dg_zn = 0;
+var dg_ar = 0;
+
+fn dg_bary_at(t, px, py): i64 {
+    var pxq = 2 * (dc_ox + px) + 1;
+    var pyq = 2 * (dc_oy + py) + 1;
+    var ax = 2 * dc_get(t, 0); var ay = 2 * dc_get(t, 1);
+    var bx = 2 * dc_get(t, 3); var by = 2 * dc_get(t, 4);
+    var cx = 2 * dc_get(t, 6); var cy = 2 * dc_get(t, 7);
+    var w0 = dc_edge(bx, by, cx, cy, pxq, pyq);
+    var w1 = dc_edge(cx, cy, ax, ay, pxq, pyq);
+    var w2 = dc_edge(ax, ay, bx, by, pxq, pyq);
+    dg_ar = w0 + w1 + w2;
+    dg_zn = w0 * dc_get(t, 2) + w1 * dc_get(t, 5) + w2 * dc_get(t, 8);
+    return 0;
+}
+
+# dg_g7() — the constant-z silhouette comparison. Returns the number of disagreeing pixels.
+# ⚠ COVERAGE is compared, not colour: `tri_ref_px` blends premultiplied ARGB against a coverage byte
+# produced by a separate area-integrating rasteriser, which is a different quantity. The INSIDE
+# DECISION is what the two paths genuinely share, and it is where a half-pixel convention lives.
+var dg_g7_cov = 0;
+var dg_g7_prep = 0;
+
+fn dg_g7(): i64 {
+    var bad7 = 0;
+    dg_g7_cov = 0;
+    dg_g7_prep = 0;
+    var t7 = 0;
+    while (t7 < 2) {
+        dc_corpus(0);
+        var vx0 = dc_get(t7, 0); var vy0 = dc_get(t7, 1);
+        var vx1 = dc_get(t7, 3); var vy1 = dc_get(t7, 4);
+        var vx2 = dc_get(t7, 6); var vy2 = dc_get(t7, 7);
+        # ONE triangle, CONSTANT z -- so the depth test cannot influence the silhouette and what is
+        # left is purely the coverage rule, which is the thing the two paths must agree about.
+        dc_reset();
+        dc_add(vx0, vy0, 500, vx1, vy1, 500, vx2, vy2, 500, DC_RED);
+        dc_render(DC_W, DC_H, DC_FAR, DC_BG);
+        if (tri_prep(vx0, vy0, vx1, vy1, vx2, vy2, DC_RED, DC_RED, DC_RED) != 1) {
+            dg_g7_prep = dg_g7_prep + 1;
+        }
+        var y7 = 0;
+        while (y7 < DC_H) {
+            var x7 = 0;
+            while (x7 < DC_W) {
+                var got = 0;
+                if ((load32(&dc_cbuf + (y7 * DC_W + x7) * 4) & 0xFFFFFFFF) != DC_BG) { got = 1; }
+                if (got == 1) { dg_g7_cov = dg_g7_cov + 1; }
+                if (got != dg_tp_inside(x7, y7)) { bad7 = bad7 + 1; }
+                x7 = x7 + 1;
+            }
+            y7 = y7 + 1;
+        }
+        t7 = t7 + 1;
+    }
+    return bad7;
+}
+
+# dg_g8() — the plane-fit identity (a) and the interpenetration line (b), in one pixel walk.
+var dg_g8a_bad = 0; var dg_g8a_n = 0;
+var dg_g8b_bad = 0; var dg_g8b_n = 0; var dg_g8_online = 0;
+
+fn dg_g8(): i64 {
+    dg_render_order(0);
+    dg_plane_fit(0);
+    dg_plane_fit(1);
+    var La = load64(&dg_pa + 0) * load64(&dg_pd + 8) - load64(&dg_pa + 8) * load64(&dg_pd + 0);
+    var Lb = load64(&dg_pb + 0) * load64(&dg_pd + 8) - load64(&dg_pb + 8) * load64(&dg_pd + 0);
+    var Lc = load64(&dg_pc + 0) * load64(&dg_pd + 8) - load64(&dg_pc + 8) * load64(&dg_pd + 0);
+    if (dg_mut_lflip != 0) { La = 0 - La; Lb = 0 - Lb; Lc = 0 - Lc; }
+    dg_g8a_bad = 0; dg_g8a_n = 0;
+    dg_g8b_bad = 0; dg_g8b_n = 0; dg_g8_online = 0;
+    var y8 = 0;
+    while (y8 < DC_H) {
+        var x8 = 0;
+        while (x8 < DC_W) {
+            var X = 2 * (dc_ox + x8) + 1;
+            var Y = 2 * (dc_oy + y8) + 1;
+            var z0 = dg_z_at(0, x8, y8);
+            var z1 = dg_z_at(1, x8, y8);
+            # (a) on every pixel each triangle covers
+            var tt = 0;
+            while (tt < 2) {
+                var zc = z0;
+                if (tt == 1) { zc = z1; }
+                if (zc >= 0) {
+                    dg_bary_at(tt, x8, y8);
+                    var lhs = (load64(&dg_pa + tt * 8) * X
+                             + load64(&dg_pb + tt * 8) * Y
+                             + load64(&dg_pc + tt * 8)) * dg_ar;
+                    var rhs = dg_zn * load64(&dg_pd + tt * 8);
+                    dg_g8a_n = dg_g8a_n + 1;
+                    if (lhs != rhs) { dg_g8a_bad = dg_g8a_bad + 1; }
+                }
+                tt = tt + 1;
+            }
+            # (b) on pixels both cover
+            if (z0 >= 0) {
+                if (z1 >= 0) {
+                    var L = La * X + Lb * Y + Lc;
+                    if (L == 0) { dg_g8_online = dg_g8_online + 1; }
+                    # ⚠ Only where the RENDERED (truncated) depths actually differ. Where they are
+                    # equal the pixel is a tie and submission order decides it, which says nothing
+                    # about the line. floor is monotone, so z0 != z1 implies the exact values differ
+                    # in the same direction -- no truncation case can slip through here.
+                    if (z0 != z1) {
+                        dg_g8b_n = dg_g8b_n + 1;
+                        var got = load32(&dc_cbuf + (y8 * DC_W + x8) * 4) & 0xFFFFFFFF;
+                        var want = DC_RED;
+                        if (z1 < z0) { want = DC_BLUE; }
+                        if (got != want) { dg_g8b_bad = dg_g8b_bad + 1; }
+                        # and the analytic line must agree about which side we are on
+                        if (z0 < z1) { if (L >= 0) { dg_g8b_bad = dg_g8b_bad + 1; } }
+                        if (z1 < z0) { if (L <= 0) { dg_g8b_bad = dg_g8b_bad + 1; } }
+                    }
+                }
+            }
+            x8 = x8 + 1;
+        }
+        y8 = y8 + 1;
+    }
+    return 0;
+}
+
 fn dg_absmax_at(t, px, py): i64 {
     var pxq = 2 * (dc_ox + px) + 1;
     var pyq = 2 * (dc_oy + py) + 1;
@@ -485,6 +690,98 @@ fn main(): i64 {
             bad = bad + 1;
         }
     }
+
+    nl();
+    # ---- D10 (G7): CONSTANT-Z SILHOUETTE vs THE INDEPENDENTLY BURNED 2D PATH -------------------
+    var d10 = dg_g7();
+    var d10cov = dg_g7_cov;
+    var d10bad_prep = dg_g7_prep;
+    ps("D10 EXTERNAL: constant-z silhouette == the burned 2D path (tri_prep, 16.16 sample, pixel");
+    ps(" vertices) over "); pn(d10cov); ps(" covered px: ");
+    if (d10 == 0) {
+        if (d10cov > 200) {
+            if (d10bad_prep == 0) { ps("PASS -- both half-pixel conventions agree"); nl(); }
+        }
+    }
+    if (d10 != 0) {
+        ps("FAIL "); pn(d10); ps(" px disagree -- ONE OF THE TWO SAMPLE CONVENTIONS IS WRONG"); nl();
+        bad = bad + 1;
+    }
+    if (d10 == 0) {
+        if (d10cov <= 200) { ps("FAIL -- silhouette essentially empty, nothing compared"); nl(); bad = bad + 1; }
+    }
+    if (d10bad_prep != 0) {
+        ps("FAIL -- tri_prep refused a corpus triangle, so it witnessed nothing"); nl();
+        bad = bad + 1;
+    }
+
+    # ---- D11 (G8): THE INTERPENETRATION LINE, DERIVED WITHOUT RENDERING ANYTHING ---------------
+    # ⭐ THE ONE GATE THAT TESTS THE GEOMETRY OF THE DEPTH DECISION RATHER THAN ITS BYTES. Each
+    # triangle's depth is a plane in 3-space fitted from its three (x,y,z) vertices by a single cross
+    # product -- no edge function, no barycentric weight, no hoist. Two planes meet in a LINE, and
+    # `z_0(x,y) = z_1(x,y)` is that line, obtainable on the CPU before anything is drawn.
+    #   D11a -- the fitted plane and the barycentric interpolation are the SAME rational at every
+    #           covered pixel: `(a*X + b*Y + c) * area == zn * d`, cross-multiplied, exact integers.
+    #           This validates the entire edge-function machinery against a route that shares no code.
+    #   D11b -- on every dual-covered pixel the winner is on the correct side of that line.
+    # Neither the shader nor `depthcore` can fake either one.
+    dg_g8();
+    var p11a = dg_g8a_bad; var n11a = dg_g8a_n;
+    var p11b = dg_g8b_bad; var n11b = dg_g8b_n; var online = dg_g8_online;
+    ps("D11a EXTERNAL: the 3D plane fit == the barycentric interpolation at all "); pn(n11a);
+    ps(" covered px: ");
+    if (p11a == 0) {
+        if (n11a > 400) { ps("PASS"); nl(); }
+    }
+    if (p11a != 0) { ps("FAIL "); pn(p11a); ps(" px"); nl(); bad = bad + 1; }
+    if (p11a == 0) {
+        if (n11a <= 400) { ps("FAIL -- too few covered px to mean anything"); nl(); bad = bad + 1; }
+    }
+    ps("D11b EXTERNAL: every one of "); pn(n11b);
+    ps(" dual-covered px is on the correct side of the analytic interpenetration line (");
+    pn(online); ps(" exactly ON it): ");
+    if (p11b == 0) {
+        if (n11b > 100) { ps("PASS"); nl(); }
+    }
+    if (p11b != 0) { ps("FAIL "); pn(p11b); ps(" violations"); nl(); bad = bad + 1; }
+    if (p11b == 0) {
+        if (n11b <= 100) {
+            ps("FAIL -- too few discriminating px; the line is untested"); nl();
+            bad = bad + 1;
+        }
+    }
+
+    # ---- ⭐⭐ AND NOW PROVE ALL THREE CAN FAIL -----------------------------------------------------
+    # All three passed on their first run. That is exactly the situation in which "the gate is right"
+    # and "the gate is inert" are indistinguishable, and it is how rung 15's half-texel reached iron.
+    # ⛔ M-D10 IS THE IMPORTANT ONE: it moves the 2D path's sample point from the pixel CENTRE to the
+    # pixel CORNER -- a half-pixel convention error, the precise defect class that shipped at rung 15
+    # past four green agreement gates. If D10 stayed green here it would be worthless.
+    dg_mut_corner = 1;
+    var md10 = dg_g7();
+    dg_mut_corner = 0;
+    ps("M-D10 sampling at the pixel CORNER instead of its centre (a HALF-PIXEL error): ");
+    if (md10 > 0) { ps("RED (correct), "); pn(md10); ps(" px -- D10 can see the rung-15 defect class"); nl(); }
+    if (md10 == 0) {
+        ps("** NOT CONNECTED: a half-pixel shift changed nothing, so D10 proves nothing **"); nl();
+        bad = bad + 1;
+    }
+
+    dg_mut_plane = 1;
+    dg_g8();
+    var md11a = dg_g8a_bad;
+    dg_mut_plane = 0;
+    ps("M-D11a fitted plane's constant term off by one: ");
+    if (md11a > 0) { ps("RED (correct), "); pn(md11a); ps(" px"); nl(); }
+    if (md11a == 0) { ps("** NOT CONNECTED **"); nl(); bad = bad + 1; }
+
+    dg_mut_lflip = 1;
+    dg_g8();
+    var md11b = dg_g8b_bad;
+    dg_mut_lflip = 0;
+    ps("M-D11b interpenetration line's sense reversed: ");
+    if (md11b > 0) { ps("RED (correct), "); pn(md11b); ps(" violations"); nl(); }
+    if (md11b == 0) { ps("** NOT CONNECTED **"); nl(); bad = bad + 1; }
 
     nl();
     if (bad == 0) {

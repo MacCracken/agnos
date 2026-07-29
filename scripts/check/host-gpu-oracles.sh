@@ -40,6 +40,23 @@
 # depthmodel also gained A5/A6 (lane fidelity and the derived-w2 identity) at the same time; its
 # `zn`, `KX/KY/KC` and `area` were accumulated in unmasked i64 while the file claimed 32-bit lanes.
 #
+# ⭐⭐ AND THE TWO EXTERNAL GATES (D10/D11), ADDED 2026-07-29, WHICH ARE THE ONLY ONES HERE THAT DO
+# NOT REST ON A SHARED PREMISE. Everything else in depthgate/depthmodel is an agreement between two
+# artifacts written the same week from the same derivation — which is exactly the configuration that
+# let rung 15 ship a half-texel offset with bicore, bimodel, texcore AND the shader all agreeing.
+#   • D10 — a constant-z silhouette must match `tri_prep`, the rung-9/11 reference for the
+#     INDEPENDENTLY BURNED `tri_rgba` / op 0x0A path. It keeps vertices in PIXELS and samples at
+#     16.16 `(px<<16)+32768`; depthcore DOUBLES vertices and samples at `2*px+1`. Same geometric
+#     point, two number systems that do not transform into each other by a shared constant.
+#   • D11 — each triangle's depth plane fitted in 3-SPACE from its vertices by one cross product,
+#     touching no edge function, no barycentric weight and no hoist. (a) the fit and the barycentric
+#     interpolation are the same rational at every covered pixel, cross-multiplied exactly;
+#     (b) every dual-covered pixel is on the correct side of the analytically derived
+#     interpenetration line.
+# ⛔ All three passed on their FIRST run, so all three are falsified in-file. M-D10 is the one that
+# matters: moving the 2D path's sample from the pixel centre to its corner — a half-pixel error, the
+# rung-15 class exactly — moves 92 px. A gate that has never failed is a claim, not a check.
+#
 # ⭐ texgate ADDED AT RUNG 15 because it stopped being only rung 13's gate. It now carries the four
 # checks that decide whether a bilinear iron burn is interpretable: **gate 7** (the reciprocal
 # reproduces an exact divide across the WHOLE 16.16 word — the 8 fraction bits ONLY bilinear reads,

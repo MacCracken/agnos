@@ -140,6 +140,37 @@ number was not.
 no longer calls. It now lists the one-time-cost case **first**, because that is how the gate actually
 fired.
 
+### Added — RUNG 17 B4: the two EXTERNAL gates, the only ones not resting on a shared premise
+
+⛔ **Everything else in `depthgate`/`depthmodel` is an agreement between two artifacts written the
+same week from the same derivation.** That is not a hypothetical weakness: it is the exact
+configuration in which rung 15 shipped a half-texel offset with `bicore`, `bimodel`, `texcore` **and**
+the shader all implementing the same wrong convention and every agreement gate green. D1's
+both-orders oracle is an internal consistency property a wrong shader and a wrong reference can
+satisfy together.
+
+- **D10 — constant-z silhouette vs the INDEPENDENTLY BURNED 2D path.** A single triangle at constant
+  z must cover exactly the pixels `tri_prep` covers — rung 9/11's reference for `tri_rgba` / op
+  `0x0A`, a shipped path whose answers were checked against silicon. Three things make it a real
+  witness rather than a sibling: it keeps vertices in **pixels** and samples at 16.16
+  `(px<<16)+32768` while `depthcore` **doubles** vertices and samples at `2·px+1` (same geometric
+  point, two number systems that do not transform into each other by a shared constant); its edge
+  signs fall out of the lambda definitions rather than from three symmetric cross products; and it
+  was burned. **689 covered px, 0 disagreements.**
+- **D11 — the interpenetration line, derived without rendering anything.** Each triangle's depth is a
+  plane in 3-space fitted from its three `(x,y,z)` vertices by one cross product — no edge function,
+  no barycentric weight, no hoist. **(a)** the fit and the barycentric interpolation are the same
+  rational at every covered pixel, checked by cross-multiplication in exact integers (`689/689`);
+  **(b)** every one of the **182** dual-covered pixels lies on the correct side of the analytically
+  derived line. ⚠ (b) is evaluated only where the *truncated* depths differ — where they are equal
+  the pixel is a tie decided by submission order, which says nothing about the line. `floor` is
+  monotone, so no truncation case can slip through.
+
+⭐ **All three passed on their first run, so all three are falsified in-file.** `M-D10` moves the 2D
+path's sample point from the pixel centre to its corner — a half-pixel error, the rung-15 class
+exactly — and **92 px** change. `M-D11a` (plane constant off by one) reddens 689; `M-D11b` (line
+sense reversed) reddens 182. A gate that has never failed is a claim, not a check.
+
 ### Changed — RUNG 17 B3: reference and model reshaped to the SHIPPING program, in one bite
 
 Five changes, landed together because each alters the program the byte-identity proof covers — split

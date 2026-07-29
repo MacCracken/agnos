@@ -269,12 +269,27 @@ pins the rest** — differencing two corners of the affine `zn` gives `|KX| < 2^
 at the smallest legal `w`, so **`KX` and `KY` ALWAYS fit** and only `KC` can exceed 2^31, by at most
 the `|KX|+|KY|` margin. ⇒ A8 re-aimed at the **fold identity** (which is what the frame really
 proves) and a new **A11** exercises residue reconstruction directly at the unfolded |KC| = 3.33e9.
-▶ **REMAINING for rung 17 — SIX bites, not "the shader"** (⚠ this line previously said *"REMAINING:
+✅ **(5) THE EXTERNAL GATES (B4) — the only two here that do NOT rest on a shared premise.**
+⛔ Everything else in `depthgate`/`depthmodel` is agreement between two artifacts written the same
+week from the same derivation — the exact configuration in which **rung 15 shipped a half-texel
+offset with `bicore`, `bimodel`, `texcore` AND the shader all agreeing.** **D10** compares a
+constant-z silhouette against `tri_prep`, rung 9/11's reference for the **independently burned**
+`tri_rgba`/`0x0A` path: it keeps vertices in **pixels** and samples at 16.16 `(px<<16)+32768` while
+`depthcore` **doubles** vertices and samples at `2·px+1` — the same geometric point in two number
+systems that no shared constant maps between (**689 px, 0 disagreements**). **D11** fits each
+triangle's depth plane in **3-space** from its vertices by one cross product, touching no edge
+function, no barycentric weight and no hoist: (a) the fit and the barycentric interpolation are the
+same rational at every covered pixel, cross-multiplied in exact integers (**689/689**); (b) all
+**182** dual-covered px lie on the correct side of the analytically derived interpenetration line.
+⭐ **All three passed first run, so all three are falsified in-file** — `M-D10` moves the 2D path's
+sample from the pixel centre to its corner (**a half-pixel error, the rung-15 class exactly**) and
+**92 px** change; `M-D11a` reddens 689, `M-D11b` reddens 182.
+▶ **REMAINING for rung 17 — FIVE bites, not "the shader"** (⚠ this line previously said *"REMAINING:
 (2) the shader"*, which collapsed B3–B9 into one and would have put a 584-dword blob ahead of the
 program it is supposed to reproduce). Per [`planning/rung17-tri-depth.md`](planning/rung17-tri-depth.md)
-§7: **B4** external gates G7/G8 · **B5** ABI `0x0E` · **B6** `0x10 GPU_OP_RT_READ` (**blocking**:
-without a z readback the burn cannot fail on a broken divide) · **B7** prep · **B8** `tri_depth.s` ·
-**B9** worker · **B10** the burn. The four pins must not be re-opened at transcription time.
+§7: **B5** ABI `0x0E` · **B6** `0x10 GPU_OP_RT_READ` (**blocking**: without a z readback the burn
+cannot fail on a broken divide) · **B7** prep · **B8** `tri_depth.s` · **B9** worker · **B10** the
+burn. The four pins must not be re-opened at transcription time.
 
 Remaining after rung 15 — ⚠ **this list was STALE by +2 until 2026-07-28** (it still carried the
 pre-renumbering mapping and collapsed rungs 17/18/19 into one cut); [`planning/gpu.md`](planning/gpu.md)

@@ -1,7 +1,12 @@
 # Rung 17 `tri_depth` — build plan (derived 2026-07-28, adversarially verified)
 
-> **Status (2026-07-29)**: **B0, B1, B2, B3 LANDED — zero burns**, `host-gpu-oracles.sh` 8/8 exit 95,
-> `check.sh` 21/21. Next bite is **B4** (the external gates G7/G8).
+> **Status (2026-07-29)**: **B0, B1, B2, B3, B4 LANDED — zero burns**, `host-gpu-oracles.sh` 8/8 exit 95,
+> `check.sh` 21/21. Next bite is **B5** (the `0x0E` ABI, worker returning `GPO_E_NOTIMPL`).
+>
+> ⭐ **B4 landed as D10/D11 with in-file falsification.** All three external assertions passed on
+> their first run, which is precisely when "the gate is right" and "the gate is inert" look the same;
+> `M-D10` (sample at the pixel corner instead of its centre — the rung-15 half-pixel class) moves
+> **92 px**, so D10 demonstrably sees the defect it exists for.
 > ⛔ **The shader is B8, not "what's left"** — `state.md` briefly said "REMAINING: (2) the shader",
 > which collapsed seven bites into one; corrected.
 >
@@ -611,7 +616,7 @@ Each bite is independently verifiable and lands green. **Bites 1–6 are zero-bu
 | ✅ **B1** | `depthdiv.cyr` — R2 exactness gate + adversarial frame + 5 mutations | exit 95; printed table shows transplant green-on-corpus / RED-on-adversarial | 0 |
 | ✅ **B2** | ⭐ corpus: PRECISION + QUAD + OFF-ORIGIN frames; depthgate D0d / D5 / D0e; coverage print | exit 95; **D5 shows the two orders DIFFERING** | 0 |
 | ✅ **B3** | reshape `depthcore`+`depthmodel` to the shipping program (winding normalisation, `dstxy` fold, derived `w2`, `v_max` clamp, unsigned compare, no min-bias) + G6 corner bound | byte-identical colour AND z, both orders, all frames | 0 |
-| **B4** | **external gates** G7 (constant-z silhouette vs the `tri_rgba` path) + G8 (analytic interpenetration line) | exit 95 | 0 |
+| ✅ **B4** | **external gates** G7 (constant-z silhouette vs the `tri_rgba` path) + G8 (analytic interpenetration line) | exit 95 | 0 |
 | **B5** | **ABI only** — `0x0E` constants, `gpo_validate_tridepth`, field mask, flags, `GPU_OP_SUPPORTED` bit 14, battery. Worker returns `GPO_E_NOTIMPL`. | `edge_abi_selftest` N of N; `kprint-len-check.sh` | 0 |
 | **B6** | **`0x10 GPU_OP_RT_READ`** — kernel memcpy from `gpu_rt_base_phys`, validator, battery, `GPU_OP_SUPPORTED` bit 16 | battery + a QEMU/mirshi round-trip against a `0x0D`-cleared handle | 0 |
 | **B7** | `gpu_tri_depth_prep` — affine hoist, winding, `dstxy` fold, `R = 2^32/area`, corner bounds, residues, arena write; `check-arena.sh` slots | a kernel selftest diffing prep output against `depthmodel`'s hoist on all four frames | 0 |
