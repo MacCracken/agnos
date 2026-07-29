@@ -3,6 +3,84 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.31] - 2026-07-29
+
+**Rung 18 `persp-correct` — cycle OPEN.** Bumped on cycle open; the user tags on close.
+
+### Added — `perspbits.cyr`: the width question, MEASURED before any design
+
+`tests/gpu/perspbits.cyr`, exit 95, wired into `host-gpu-oracles.sh` (now **9** oracles).
+
+Perspective-correct interpolation of an attribute `a` with per-vertex clip `w` is
+`a_persp = [Σ eᵢ·(aᵢ/wᵢ)] / [Σ eᵢ·(1/wᵢ)]`. With the reciprocal as a per-vertex fixed-point constant
+`Wᵢ = 2^K/wᵢ`, both numerator and denominator are **affine in screen space**, so they hoist to
+`A·x + B·y + C` exactly like rung 17's depth numerator — the hoist, the winding normalisation and the
+`dstxy` fold all carry over untouched. What does **not** carry over is the width.
+
+Measured on an 800×600 floor quad in strong perspective, a 4096-texel axis, every pixel of the draw
+rect (not just inside — the shader is predicated):
+
+| K | N bits | D bits | quotient | pixels where N > 62 bits |
+|---|---|---|---|---|
+| 12 | 49 | 25 | 28 | 0 |
+| 24 | 61 | 37 | 28 | 0 |
+| 26 | 63 | 39 | 28 | **217,200** |
+| 30 | 63 | 43 | 25 | **714,000** — the quotient goes NEGATIVE |
+
+⛔ **`K` is not a free parameter, and at `K = 30` the numerator is one bit from overflowing i64 in the
+REFERENCE.** That is the trap `GPU_EDGE_COORD_MAX`'s comment already names: *"above roughly M·d ~ 2^63
+the oracle itself has no defined value and 'identical' is meaningless."* At `K = 30` it is not a
+theoretical concern — 714,000 pixels are past it and the answer is garbage.
+
+⭐ **But there is a wide safe window, and it is genuinely converged.** `K = 12…24` all overflow nothing,
+and a **whole-frame** comparison between `K = 12` and `K = 24` moves **0 of 480,000 pixels**. ⚠ That
+whole-frame check replaced a single probe pixel deliberately: a one-pixel convergence test is exactly
+the insensitive oracle that shipped rung 15's half-texel and passed rung 17's kernarg swap. The
+one-pixel version said "moved 0" and would have been believed on no evidence.
+
+### ⇒ The shape of rung 18, decided by measurement rather than by the row
+
+**N needs 49–51 bits; D needs 24–29 and fits a 32-bit lane; the quotient is 28 bits** (the full 16.16
+coordinate for a 4096-texel axis, which is the floor — a Q-bit quotient over a D-bit divisor *requires*
+a (Q+D)-bit numerator, by construction).
+
+⇒ rung 18 is a **64-bit numerator over a 32-bit divisor, with the divisor VARYING per pixel.**
+- Rung 17's divide does **not** carry over: its divisor was `area`, constant per triangle and
+  precomputed on the CPU as `R = 2^32/area`. Here the divisor is a per-pixel affine value.
+- Rung 13's `recip32` is the closest prior art in shape (96-bit numerator / ~2^30 divisor) and is
+  iron-proven — but its reciprocal is also hoisted per triangle.
+- **The one remaining design decision is how to obtain a per-pixel reciprocal of a ~25-bit divisor.**
+  ⭐ This is where `v_rcp_f32` becomes defensible after all — not as the divide, but as a **seed** with
+  an exact integer correction after it. A proven one-sided correction absorbs the approximation, so the
+  reference needs no knowledge of it and stays an independent statement of truth. That dissolves the
+  row's own stated objection ("the CPU reference must use the same approximation") instead of accepting
+  it. ⚠ The correction's convergence must be PROVEN, the way `depthdiv` proved rung 17's — that gate,
+  not the shader, is the next thing to write.
+
+### ⛔ Found before writing code — the release row prescribes an instruction this tree forbids
+
+The row reads: *"interpolate `1/w`, divide per pixel (`v_rcp_f32`), interpolate `u/w`, `v/w`"*, and its
+own risk column admits the consequence: *"Off in the last ULP ⇒ `v_rcp_f32` is approximate and **the
+CPU reference must use the same approximation** or the diff is unfair."*
+
+**Verified against the shipped tree.** `v_rcp_f32` is emitted exactly **once** in all 19 shaders —
+`grad_linear.s:57`, a cosmetic gradient — and `edge_setup.s:15-19` forbids it for exact arithmetic in
+terms that apply verbatim here: *"LLVM's f32-reciprocal division macro is exact only EMPIRICALLY (its
+own source comment says so), was demonstrably wrong before 2020, and a +1-ULP perturbation the ISA
+permits breaks it inside our operand range. The 32-iteration restoring loop below is exact BY
+CONSTRUCTION."*
+
+⛔ **The deeper objection is not the accuracy, it is what the row does to the ORACLE.** A reference
+that must reproduce gfx9's reciprocal approximation bit-for-bit is no longer an independent statement
+of what the answer is — it becomes a model of the hardware. That is precisely the shared-premise
+structure that has now cost a burn in **each of the last two rungs**: rung 15's half-texel (four
+implementations carrying one wrong convention, every agreement gate green) and rung 17's kernarg swap
+(the order-independence oracle green on a completely wrong frame). Both were caught only by a
+comparison against something that shared no premise.
+
+⇒ The design is under adversarial review before transcription rather than after, and the outcome is
+recorded here either way.
+
 ## [1.56.30] - 2026-07-28
 
 **Rung 17 `depth` — cycle OPEN.** Bumped on cycle open; the user tags on close.

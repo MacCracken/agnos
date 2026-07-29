@@ -7,7 +7,7 @@
 # is the same class of defect as a gate wired with a bare `; rc=$?`: a check that exists on paper and
 # cannot fail in practice.
 #
-# ⚠ SCOPE, STATED HONESTLY: this runs texlist, bigate, bimodel, texgate, rtaudit, depthgate,
+# ⚠ SCOPE, STATED HONESTLY: this runs texlist, bigate, bimodel, texgate, rtaudit, depthgate, perspbits,
 # depthmodel and depthdiv. It
 # does NOT run doomcol, doomwall, edgemodel or refraster — those are equally host-runnable and
 # equally unwired, and adding them is a separate bite rather than something smuggled in beside a rung.
@@ -92,7 +92,7 @@ export CYRIUS_ALLOW_PARENT_INCLUDES
 mkdir -p "$GPU/build"
 
 rc=0
-for t in texlist bigate bimodel texgate rtaudit depthgate depthmodel depthdiv; do
+for t in texlist bigate bimodel texgate rtaudit depthgate depthmodel depthdiv perspbits; do
     out="$(cd "$GPU" && cyrius build "$t.cyr" "build/$t" 2>&1)" || {
         echo "host-gpu-oracles: FAIL -- $t.cyr does not BUILD"
         echo "$out" | tail -20

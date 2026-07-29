@@ -1,0 +1,228 @@
+# perspbits.cyr — RUNG 18's FIRST QUESTION, MEASURED: how many bits do the perspective numerator and
+# denominator actually need?
+#
+# ⭐ WHY THIS IS THE FIRST THING, BEFORE ANY DESIGN. Rung 17's whole shader rests on one premise: every
+# per-pixel quantity fits a SIGNED 32-BIT LANE, guaranteed by a validator corner bound. If rung 18's
+# numerator does not fit, then none of rung 17's machinery carries over unchanged and the shader is a
+# different program — 64-bit intermediates, a different divide, a different validator rule. That is a
+# decision worth one host program and zero burns.
+#
+# THE ALGEBRA. Perspective-correct interpolation of an attribute `a` with per-vertex clip `w`:
+#
+#     a_persp(x,y) = [ SUM e_i(x,y) * (a_i / w_i) ] / [ SUM e_i(x,y) * (1 / w_i) ]
+#
+# In integers, represent the reciprocal as a fixed-point per-vertex constant W_i = 2^K / w_i. Then
+#
+#     D(x,y) = SUM e_i * W_i              <- affine in (x,y), integer coefficients
+#     N(x,y) = SUM e_i * (W_i * a_i)      <- affine in (x,y), integer coefficients
+#     a_persp = N / D                     <- the 2^K cancels exactly
+#
+# ⭐ Both are affine, so BOTH hoist to A*x + B*y + C exactly like rung 17's depth numerator. The hoist
+# machinery, the winding normalisation and the dstxy fold all carry over untouched. What does NOT
+# obviously carry over is the WIDTH, and that is what this measures.
+#
+# ⛔ THE STRUCTURAL WORRY, STATED BEFORE MEASURING SO THE NUMBER CAN REFUTE IT: the quotient is a
+# texture coordinate in 16.16, up to 2^28 for a 4096-texel axis. If the quotient is ~2^28 and the
+# divisor is ~2^D bits, the numerator is ~2^(28+D) BY CONSTRUCTION. There is no arrangement of a
+# 32-bit numerator and a 32-bit divisor that yields a 28-bit fixed-point quotient with any headroom.
+# If that reasoning is right, rung 18 needs a 64/32 divide and the answer is a bit-width, not an opinion.
+
+include "lib/io.cyr"
+include "tricore.cyr"      # ps / pn / nl
+
+# ⛔⛔ K IS NOT FREE, AND THAT IS THE WHOLE FINDING OF THIS PROBE. W_i = 2^K / w_i, so K sets the
+# precision of the per-vertex reciprocal AND the magnitude of everything downstream:
+#   K too SMALL  -> W_i is coarse, the interpolated ratio is wrong, the picture bows like affine
+#   K too LARGE  -> N = sum(e_i * W_i * a_i) overflows, and at K=30 it already needs 63 bits, i.e. the
+#                   REFERENCE ITSELF is one bit from undefined. GPU_EDGE_COORD_MAX's comment names
+#                   exactly this trap: "above roughly M*d ~ 2^63 the oracle itself has no defined
+#                   value and 'identical' is meaningless."
+# ⇒ The question rung 18 turns on is whether a K exists that is large enough to be ACCURATE and small
+# enough to be REPRESENTABLE. That is a measurement, not an argument, and it is what pb_sweep answers.
+var pb_K = 30;
+
+fn pb_bits(v): i64 {
+    var m = v;
+    if (m < 0) { m = 0 - m; }
+    var n = 0;
+    while (m > 0) { n = n + 1; m = m >>> 1; }
+    return n;
+}
+
+var pb_maxN = 0;
+var pb_maxD = 0;
+var pb_maxQ = 0;
+var pb_snap[480000];
+var pb_minD = 0;
+var pb_probeQ = 0;      # the quotient at one fixed inside pixel, for the convergence check
+var pb_over = 0;        # pixels where N exceeded 62 bits -- the reference is undefined there
+var pb_q[480000];       # the WHOLE frame's quotients, so convergence is not judged from one pixel
+
+# pb_probe — a floor quad in STRONG perspective, the exact figure the rung's oracle calls for, and
+# evaluate N and D at every pixel of the draw rect (not just inside: the shader is PREDICATED and runs
+# every lane, which is the lesson rung 17's corner bound was written from).
+#
+# Geometry: a triangle of a ground quad seen from a camera near the plane, so w spans a wide range —
+# `wnear` at the bottom of the screen, `wfar` at the horizon. That ratio IS the perspective strength,
+# and it is what drives the bit width.
+# mulq -- W_i * a_i at full 16.16 attribute precision, the per-vertex product prep computes once.
+fn mulq(Wi, Ai): i64 { return Wi * Ai; }
+
+fn pb_probe(w, h, wnear, wfar, tex): i64 {
+    # vertices in doubled-integer screen coords, same domain rung 17 proves
+    var ax = 2 * 0;        var ay = 2 * (h - 1);     # bottom-left,  near
+    var bx = 2 * (w - 1);  var by = 2 * (h - 1);     # bottom-right, near
+    var cx = 2 * 0;        var cy = 2 * 0;           # top-left,     far
+    # per-vertex reciprocals, fixed point
+    var one = 1 << pb_K;
+    var Wa = one / wnear;
+    var Wb = one / wnear;
+    var Wc = one / wfar;
+    # per-vertex attribute (texture coordinate in 16.16), spanning the texture
+    var Ua = 0;
+    var Ub = tex * 65536;
+    var Uc = 0;
+
+    pb_maxN = 0; pb_maxD = 0; pb_maxQ = 0; pb_minD = 0;
+    var first = 1;
+    var py = 0;
+    while (py < h) {
+        var px = 0;
+        while (px < w) {
+            var qx = 2 * px + 1;
+            var qy = 2 * py + 1;
+            # the three edge functions, i opposing vertex i -- identical convention to depthcore
+            var e0 = (cx - bx) * (qy - by) - (cy - by) * (qx - bx);
+            var e1 = (ax - cx) * (qy - cy) - (ay - cy) * (qx - cx);
+            var e2 = (bx - ax) * (qy - ay) - (by - ay) * (qx - ax);
+            var area = e0 + e1 + e2;
+            if (area < 0) { e0 = 0 - e0; e1 = 0 - e1; e2 = 0 - e2; area = 0 - area; }
+            var D = e0 * Wa + e1 * Wb + e2 * Wc;
+            # ⚠ W_i * a_i is a PER-VERTEX product, computed once on the CPU -- it is what makes N affine
+            # ⚠ FULL 16.16, NOT divided back down. The shader must EMIT a 16.16 texture coordinate, so the
+            # quotient has to carry those 16 fraction bits -- an earlier version of this probe divided them
+            # out and measured integer-texel precision, understating the numerator by 16 bits.
+            var N = e0 * (Wa / 65536 * Ua) + e1 * (Wb / 65536 * Ub) + e2 * (Wc / 65536 * Uc);
+            N = e0 * mulq(Wa, Ua) + e1 * mulq(Wb, Ub) + e2 * mulq(Wc, Uc);
+            if (pb_bits(N) > pb_maxN) { pb_maxN = pb_bits(N); }
+            if (pb_bits(N) > 62) { pb_over = pb_over + 1; }
+            if (pb_bits(D) > pb_maxD) { pb_maxD = pb_bits(D); }
+            var inside = 0;
+            if (e0 >= 0) { if (e1 >= 0) { if (e2 >= 0) { inside = 1; } } }
+            if (inside == 1) {
+                if (D > 0) {
+                    var Q = N / D;
+                    if (pb_bits(Q) > pb_maxQ) { pb_maxQ = pb_bits(Q); }
+                    if (first == 1) { pb_minD = D; first = 0; }
+                    if (D < pb_minD) { pb_minD = D; }
+                    # one fixed sample, 3/4 down and 1/4 across -- well inside, strong perspective
+                    if (py == h * 3 / 4) { if (px == w / 4) { pb_probeQ = Q; } }
+                    store64(&pb_q + (py * w + px) * 8, Q);
+                }
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return 0;
+}
+
+fn pb_row(label, w, h, wnear, wfar, tex): i64 {
+    pb_probe(w, h, wnear, wfar, tex);
+    ps(label);
+    ps("  N needs "); pn(pb_maxN);
+    ps(" bits, D needs "); pn(pb_maxD);
+    ps(" bits, quotient "); pn(pb_maxQ);
+    ps(" bits, min inside D "); pn(pb_minD); nl();
+    return 0;
+}
+
+fn pb_sweep(): i64 {
+    ps("K   N bits  D bits  Q bits   q at the probe pixel   N>62 bits (reference undefined)"); nl();
+    var prev = 0;
+    var bestK = 0;
+    var k = 12;
+    while (k <= 34) {
+        pb_K = k;
+        pb_probe(800, 600, 4096, 256, 4096);
+        ps("  "); pn(k);
+        ps("    "); pn(pb_maxN);
+        ps("      "); pn(pb_maxD);
+        ps("      "); pn(pb_maxQ);
+        ps("        "); pn(pb_probeQ);
+        ps("            "); pn(pb_over);
+        # ⭐ CONVERGENCE, not absolute truth. An exact rational reference for this quantity needs ~2^73
+        # and overflows i64, so the honest test is whether the answer has STOPPED MOVING as K grows.
+        # Two consecutive K agreeing to the last 16.16 unit is the signal that K is large enough.
+        if (k > 12) {
+            var d = pb_probeQ - prev;
+            if (d < 0) { d = 0 - d; }
+            ps("   moved "); pn(d);
+            if (d <= 1) { if (pb_over == 0) { if (bestK == 0) { bestK = k; } } }
+        }
+        prev = pb_probeQ;
+        nl();
+        k = k + 2;
+    }
+    nl();
+    # ⛔ WHOLE-FRAME CONVERGENCE, because a single probe pixel is exactly the kind of insensitive
+    # oracle that shipped rung 15's half-texel and passed rung 17's kernarg swap. Snapshot every
+    # quotient at the low K, re-render at the high end of the safe window, and count how many moved.
+    pb_K = 12;
+    pb_probe(800, 600, 4096, 256, 4096);
+    var i = 0;
+    while (i < 480000) { store64(&pb_snap + i * 8, load64(&pb_q + i * 8)); i = i + 1; }
+    pb_K = 24;
+    pb_probe(800, 600, 4096, 256, 4096);
+    var moved = 0;
+    var worst = 0;
+    i = 0;
+    while (i < 480000) {
+        var d = load64(&pb_q + i * 8) - load64(&pb_snap + i * 8);
+        if (d < 0) { d = 0 - d; }
+        if (d != 0) { moved = moved + 1; }
+        if (d > worst) { worst = d; }
+        i = i + 1;
+    }
+    ps("WHOLE-FRAME convergence K=12 vs K=24: "); pn(moved);
+    ps(" of 480000 px moved, worst by "); pn(worst); ps(" (16.16 units)"); nl();
+    if (moved != 0) {
+        ps("  ⚠ the one-pixel probe said 'moved 0' and the FRAME disagrees -- K=12 is NOT converged"); nl();
+    }
+    nl();
+    if (bestK != 0) {
+        ps("⭐ USABLE WINDOW EXISTS: K = "); pn(bestK);
+        ps(" is the smallest K where the quotient has converged AND no pixel"); nl();
+        ps("   pushes the numerator past 62 bits. Rung 18's scaling is DETERMINED, not chosen."); nl();
+        return bestK;
+    }
+    ps("⛔ NO USABLE K: every K either has not converged or overflows the reference."); nl();
+    ps("   ⇒ the single-divide formulation is REFUTED and rung 18 needs the normalised-barycentric"); nl();
+    ps("     decomposition instead (divide the weights first, then combine)."); nl();
+    return 0;
+}
+
+fn main(): i64 {
+    ps("perspbits: rung 18 -- can the perspective divide be done in integers at ALL, and at what scale?"); nl();
+    ps("           a signed 32-bit lane holds 31 bits; i64 holds 63. Both bounds matter here."); nl(); nl();
+    var bestK = pb_sweep();
+    nl();
+    ps("Fixed at the chosen scale, across perspective strengths (800x600, 4096-texel axis):"); nl();
+    if (bestK != 0) { pb_K = bestK; }
+    pb_row("  mild    persp  2:1 : ", 800, 600, 4096, 2048, 4096);
+    pb_row("  strong  persp 16:1 : ", 800, 600, 4096,  256, 4096);
+    pb_row("  extreme persp 64:1 : ", 800, 600, 4096,   64, 4096);
+    nl();
+    ps("VERDICT"); nl();
+    if (pb_maxN > 31) {
+        ps("  ⛔ N needs "); pn(pb_maxN); ps(" bits -- it does NOT fit the 32-bit lane rung 17 assumes."); nl();
+        ps("  ⇒ rung 18 is a 64-bit numerator over a 32-bit divisor, with the divisor VARYING per"); nl();
+        ps("     pixel (rung 17's was constant per triangle and precomputed on the CPU). None of"); nl();
+        ps("     rung 17's divide carries over; only the affine hoist does."); nl();
+    }
+    if (bestK == 0) { return 90; }
+    return 95;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
