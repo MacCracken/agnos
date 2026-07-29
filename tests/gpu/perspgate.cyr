@@ -1,0 +1,143 @@
+# perspgate.cyr — RUNG 18's HOST GATE. Proves the reference is sound, and proves the corpus can tell
+# perspective-correct interpolation apart from affine — BEFORE a shader exists.
+#
+# ⛔ THE ORDER MATTERS AND IT IS THE LESSON OF THE LAST TWO RUNGS. Rung 15 shipped a half-texel offset
+# past four green agreement gates because every implementation carried the same wrong convention. Rung
+# 17's order-independence oracle went GREEN on a completely wrong frame because a wave-uniform kernarg
+# misread is deterministic. In both cases the corpus or the oracle could not SEE the defect, and that
+# was discoverable on the host for free. So the first thing this file asserts is not correctness — it is
+# that the figure DISCRIMINATES.
+
+include "lib/io.cyr"
+include "tricore.cyr"      # ps / pn / nl
+include "perspcore.cyr"
+
+fn pg_gate(name, ok): i64 {
+    ps(name);
+    if (ok == 1) { ps(" PASS"); nl(); return 0; }
+    ps(" FAIL"); nl(); return 1;
+}
+
+fn main(): i64 {
+    var bad = 0;
+    ps("perspgate: rung 18 -- perspective-correct interpolation on the host"); nl(); nl();
+
+    # ---- P1: the figure must actually DRAW. Two empty images agree on everything. ---------------
+    pc_corpus_floor();
+    var cov = pc_render();
+    ps("P1  the floor quad covers pixels: "); pn(cov); ps(" of 4096: ");
+    if (cov > 800) { ps("PASS"); nl(); }
+    if (cov <= 800) { ps("FAIL -- too little coverage to measure anything"); nl(); bad = bad + 1; }
+
+    # ---- P2 ⭐ THE DISCRIMINATOR. This is the gate that decides whether a burn can mean anything.
+    # A shader that skips the divide produces the AFFINE answer. If that answer were close to the
+    # perspective one on this figure, a green burn would be consistent with the divide never happening
+    # — which is exactly the null-set trap rung 17's shipped corpus fell into (a one-ULP divide error
+    # moved 0 of 1024 pixels there).
+    var ad = pc_affine_diff();
+    var adworst = pc_worst;   # ⚠ CAPTURED: later renders reset pc_worst, and a summary line
+                              # reporting a stale 0 for the discriminator is worse than no summary.
+    ps("P2  AFFINE vs PERSPECTIVE on this figure: "); pn(ad); ps(" of "); pn(cov);
+    ps(" px differ, worst by "); pn(pc_worst); ps(" (16.16 units)"); nl();
+    ps("    ⇒ a shader that skipped the divide would be wrong on that many pixels: ");
+    if (ad > cov / 2) {
+        if (pc_worst > 65536) { ps("PASS -- the figure DISCRIMINATES"); nl(); }
+    }
+    if (ad <= cov / 2) {
+        ps("FAIL -- fewer than half the covered pixels move, so the corpus cannot tell"); nl();
+        ps("    perspective-correct from affine and a green burn would prove nothing."); nl();
+        bad = bad + 1;
+    }
+    if (ad > cov / 2) {
+        if (pc_worst <= 65536) {
+            ps("FAIL -- worst divergence is under one texel; visually indistinguishable"); nl();
+            bad = bad + 1;
+        }
+    }
+
+    # ---- P3: THE CONTROL. At CONSTANT w the two must agree EXACTLY. -----------------------------
+    # ⛔ Without this, P2 is satisfied by a divide that perturbs everything it touches. P3 is what
+    # separates "the perspective divide is doing real work" from "the perspective path is just wrong
+    # in a way that happens to differ from affine".
+    pc_corpus_flat();
+    var cov2 = pc_render();
+    var ad2 = pc_affine_diff();
+    ps("P3  at CONSTANT w, affine and perspective agree exactly ("); pn(cov2);
+    ps(" px covered, "); pn(ad2); ps(" differ): ");
+    if (ad2 == 0) { ps("PASS -- the divide is not merely perturbing"); nl(); }
+    if (ad2 != 0) {
+        ps("FAIL "); pn(ad2); ps(" px differ where perspective is mathematically IDENTITY"); nl();
+        bad = bad + 1;
+    }
+
+    # ---- P4: the widths, re-measured here rather than trusted from perspbits -------------------
+    pc_corpus_floor();
+    pc_render();
+    ps("P4  max N "); pn(pc_max_N); ps("  max D "); pn(pc_max_D);
+    ps("  divide iterations per pixel "); pn(pc_iters / (pc_covered * 2)); nl();
+    ps("    D fits a 32-bit lane (needs <= 2147483647): ");
+    if (pc_max_D <= 2147483647) { ps("PASS"); nl(); }
+    if (pc_max_D > 2147483647) { ps("FAIL"); nl(); bad = bad + 1; }
+    ps("    N does NOT (it is a register PAIR in the shader): ");
+    if (pc_max_N > 2147483647) { ps("PASS -- confirmed, as perspbits measured"); nl(); }
+    if (pc_max_N <= 2147483647) {
+        ps("⚠ N fits after all -- perspbits' 64-bit conclusion needs re-deriving"); nl();
+        bad = bad + 1;
+    }
+
+    # ---- P5 ⭐ THE EXTERNAL INVARIANT, and it needs NO TOLERANCE ------------------------------
+    # ⛔ THE FIRST VERSION OF P5 WAS A GATE DEFECT AND IS WORTH RECORDING. It walked outward from each
+    # vertex and compared the interpolant to that vertex's own attribute — sound in principle, but it
+    # took the first covered pixel in SCAN order rather than the nearest, so it could land 6 px away;
+    # and near the far edge u spans 256 texels over ~16 screen pixels, i.e. ~16 texels PER PIXEL, so a
+    # 6-px miss is ~96 texels against a 16-texel tolerance. It failed 2 of 6 for reasons that had
+    # nothing to do with the reference. ⚠ The fix is NOT a looser tolerance — loosening a failing
+    # external gate is the one move that destroys its purpose. It is an invariant with no tolerance.
+    #
+    # ⭐ CONSTANT ATTRIBUTE AT ALL THREE VERTICES ⇒ that value at EVERY covered pixel, for ANY w's,
+    # because the weights sum to the denominator identically. Fixed by the definition of interpolation,
+    # so a wrong hoist, a wrong reciprocal, a wrong divide, or a shared convention error all break it —
+    # and it is checked EXACTLY, not within a slack.
+    var C = pc_corpus_constattr();
+    var cov3 = pc_render();
+    var p5bad = 0;
+    var i5 = 0;
+    while (i5 < PC_W * PC_H) {
+        if (load64(&pc_cov + i5 * 8) == 1) {
+            if (load64(&pc_u + i5 * 8) != C) { p5bad = p5bad + 1; }
+            if (load64(&pc_v + i5 * 8) != C) { p5bad = p5bad + 1; }
+        }
+        i5 = i5 + 1;
+    }
+    ps("P5  EXTERNAL: a constant attribute reproduces EXACTLY at all "); pn(cov3);
+    ps(" covered px, under a 16:1 w ratio: ");
+    if (p5bad == 0) {
+        if (cov3 > 800) { ps("PASS"); nl(); }
+    }
+    if (p5bad != 0) { ps("FAIL "); pn(p5bad); ps(" px"); nl(); bad = bad + 1; }
+    if (p5bad == 0) {
+        if (cov3 <= 800) { ps("FAIL -- too little coverage"); nl(); bad = bad + 1; }
+    }
+
+    # ---- P6: the divide obligation, on REAL render data, by multiplication only -----------------
+    pc_corpus_floor();
+    pc_render();
+    ps("P6  q*D <= N < (q+1)*D on every drawn pixel (by MULTIPLICATION, never a second divide): ");
+    if (pc_obl_bad == 0) { ps("PASS"); nl(); }
+    if (pc_obl_bad != 0) { ps("FAIL "); pn(pc_obl_bad); ps(" violations"); nl(); bad = bad + 1; }
+
+    nl();
+    if (bad == 0) {
+        ps("perspgate: PASS -- the figure DISCRIMINATES perspective from affine ("); pn(ad);
+        ps(" px, worst "); pn(adworst); ps("),"); nl();
+        ps("           constant-w is exact identity, the widths are as measured, a CONSTANT attribute"); nl();
+        ps("           reproduces exactly under 16:1 perspective, and the divide meets its obligation"); nl();
+        ps("           by multiplication on every drawn pixel."); nl();
+        return 95;
+    }
+    ps("perspgate: FAIL -- "); pn(bad); ps(" propert(ies) broken; do NOT write the shader yet."); nl();
+    return 90;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

@@ -1,0 +1,250 @@
+# perspcore.cyr — RUNG 18's CPU REFERENCE: perspective-correct attribute interpolation.
+#
+# ⭐ THIS IS THE ORACLE. Same three-file split rungs 9b/11/13/15/17 earned: the reference states WHAT
+# the answer is, the model reproduces it at GPU register widths, the shader reproduces the model.
+#
+# ⚠ INCLUDABLE MODULE, NO main(). Cyrius shadows duplicate `fn` silently (last definition wins, warn
+# only), so a consumer that includes a file carrying its own main() runs the WRONG one and still exits
+# 0. That cost a real debugging session on rung 11.
+#
+# ============================================================================================
+# THE ALGEBRA, AND WHY IT IS TWO OF RUNG 17'S PLANES
+# ============================================================================================
+#     a_persp(x,y) = [ SUM e_i(x,y) * (a_i / w_i) ] / [ SUM e_i(x,y) * (1 / w_i) ]
+#
+# With the reciprocal as a per-vertex fixed-point constant W_i = 2^K / w_i:
+#     D(x,y) = SUM e_i * W_i             <- affine in (x,y)
+#     N(x,y) = SUM e_i * (W_i * a_i)     <- affine in (x,y)
+#     a_persp = N / D                    <- the 2^K cancels EXACTLY, which is why K does not appear
+#                                           anywhere in the answer, only in the widths
+# ⇒ the affine hoist, the winding normalisation and the dstxy fold all carry over from rung 17
+# unchanged. `perspbits` measured what does NOT: N needs 49-51 bits, so it is a 64-bit quantity while
+# D fits a 32-bit lane.
+#
+# ⛔ K IS PINNED AT 16, INSIDE A MEASURED WINDOW, NOT CHOSEN. `perspbits` swept it: K = 12..24 all
+# overflow nothing and agree on every one of 480,000 pixels, while K >= 26 pushes N past 62 bits and by
+# K = 30 the quotient comes out NEGATIVE on 714,000 of them — the reference itself undefined, which is
+# the trap GPU_EDGE_COORD_MAX's comment names.
+#
+# ============================================================================================
+# ⭐⭐ THE DISCRIMINATOR IS BUILT IN, NOT BOLTED ON
+# ============================================================================================
+# The rung's own oracle row says it: *"Affine texturing is visibly and numerically wrong on exactly
+# this figure — the oracle discriminates the two hypotheses by construction."* So this reference
+# computes the coordinate BOTH ways at every pixel and reports the divergence. That number is what
+# makes a green iron burn mean "the divide happened" rather than "the picture looked fine":
+#   * a shader that skips the divide entirely produces the AFFINE answer, and `pc_affine_diff` is
+#     exactly how many pixels that would move;
+#   * if that count were small, this figure could not discriminate the two hypotheses and the corpus
+#     would be a null-set probe — the defect that made rung 17's shipped corpus blind to a one-ULP
+#     divide error (0 of 1024 pixels) and cost a burn to discover.
+# ⇒ the gate ASSERTS the divergence is large before it trusts any agreement.
+
+include "lib/io.cyr"
+
+var PC_K = 16;                  # W_i = 2^K / w_i, inside perspbits' measured window
+var PC_W = 64;
+var PC_H = 64;
+var PC_MAXTRI = 8;
+
+# Per triangle: x0 y0 w0 u0 v0  x1 y1 w1 u1 v1  x2 y2 w2 u2 v2 = 15 slots.
+# Screen coords are INTEGER pixels; w is a small positive integer (larger = farther); u/v are 16.16.
+var PC_STRIDE = 15;
+var pc_tri[120];
+var pc_n = 0;
+
+var pc_u[4096];                 # 64*64 perspective-correct u, 16.16
+var pc_v[4096];                 # ... v
+var pc_ua[4096];                # the AFFINE u, for the discriminator
+var pc_cov[4096];               # 1 where covered
+var pc_covered = 0;
+var pc_iters = 0;               # restoring-divide iterations consumed, so cost is reported not guessed
+
+fn pc_reset(): i64 { pc_n = 0; return 0; }
+fn pc_set(t, i, val): i64 { store64(&pc_tri + (t * PC_STRIDE + i) * 8, val); return 0; }
+fn pc_get(t, i): i64 { return load64(&pc_tri + (t * PC_STRIDE + i) * 8); }
+
+fn pc_add(x0,y0,w0,u0,v0, x1,y1,w1,u1,v1, x2,y2,w2,u2,v2): i64 {
+    if (pc_n >= PC_MAXTRI) { return 0; }
+    var t = pc_n;
+    pc_set(t,0,x0); pc_set(t,1,y0); pc_set(t,2,w0); pc_set(t,3,u0); pc_set(t,4,v0);
+    pc_set(t,5,x1); pc_set(t,6,y1); pc_set(t,7,w1); pc_set(t,8,u1); pc_set(t,9,v1);
+    pc_set(t,10,x2); pc_set(t,11,y2); pc_set(t,12,w2); pc_set(t,13,u2); pc_set(t,14,v2);
+    pc_n = pc_n + 1;
+    return 1;
+}
+
+# pc_edge — the standard edge function in DOUBLED pixel-centre coordinates, so the +0.5 is exact in
+# integers. Identical convention to depthcore: a pixel centre at (px + 0.5) is (2*px + 1) with every
+# vertex doubled. ⚠ The same convention rung 15's half-texel bug came from getting wrong on the other
+# side; doubling keeps it exact rather than approximately right.
+fn pc_edge(ax, ay, bx, by, pxq, pyq): i64 {
+    return (bx - ax) * (pyq - ay) - (by - ay) * (pxq - ax);
+}
+
+# ⭐ THE DIVIDE IS THE EXACT RESTORING LOOP, the candidate `perspdiv` selected. 52 iterations, exact by
+# construction, no error bound to prove and no ISA guarantee to trust — which is precisely what keeps
+# THIS file an independent statement of the answer rather than a model of the hardware's approximation.
+# ⚠ THE REMAINDER FITS 32 BITS even though the numerator is 64. `rem` is strictly less than D after
+# every subtraction and D < 2^30, so `rem << 1 | bit` stays under 2^31. That is a real finding about
+# the shader, not a host convenience: only the NUMERATOR needs a register pair, and the divide loop
+# itself is 32-bit throughout.
+fn pc_div(Nhi, Nlo, D, nbits): i64 {
+    var q = 0;
+    var rem = 0;
+    var i = nbits - 1;
+    while (i >= 0) {
+        var bit = 0;
+        if (i >= 32) { bit = (Nhi >>> (i - 32)) & 1; }
+        if (i < 32)  { bit = (Nlo >>> i) & 1; }
+        rem = (rem << 1) | bit;
+        q = q << 1;
+        if (rem >= D) { rem = rem - D; q = q | 1; }
+        pc_iters = pc_iters + 1;
+        i = i - 1;
+    }
+    return q;
+}
+
+var pc_obl_bad = 0;             # pixels where q*D <= N < (q+1)*D fails -- checked by MULTIPLICATION
+var pc_max_rem = 0;             # so the 32-bit-remainder claim is MEASURED, not asserted
+var pc_max_N = 0;
+var pc_max_D = 0;
+
+# pc_render — the reference. Pixels are the outer loop, triangles the inner one, mirroring the
+# shader's tile loop for the same reason depthcore does: a reference whose loop structure differs from
+# the shader's cannot witness the shader's claim.
+fn pc_render(): i64 {
+    pc_covered = 0;
+    pc_iters = 0;
+    pc_max_rem = 0; pc_max_N = 0; pc_max_D = 0; pc_obl_bad = 0;
+    var i = 0;
+    while (i < PC_W * PC_H) {
+        store64(&pc_u + i * 8, 0 - 1);
+        store64(&pc_v + i * 8, 0 - 1);
+        store64(&pc_ua + i * 8, 0 - 1);
+        store64(&pc_cov + i * 8, 0);
+        i = i + 1;
+    }
+    var one = 1 << PC_K;
+    var py = 0;
+    while (py < PC_H) {
+        var px = 0;
+        while (px < PC_W) {
+            var pxq = 2 * px + 1;
+            var pyq = 2 * py + 1;
+            var t = 0;
+            while (t < pc_n) {
+                var ax = 2 * pc_get(t,0);  var ay = 2 * pc_get(t,1);
+                var bx = 2 * pc_get(t,5);  var by = 2 * pc_get(t,6);
+                var cx = 2 * pc_get(t,10); var cy = 2 * pc_get(t,11);
+                var e0 = pc_edge(bx, by, cx, cy, pxq, pyq);
+                var e1 = pc_edge(cx, cy, ax, ay, pxq, pyq);
+                var e2 = pc_edge(ax, ay, bx, by, pxq, pyq);
+                var area = e0 + e1 + e2;
+                # winding normalisation, same as rung 17: the divide requires a positive denominator
+                if (area < 0) { e0 = 0-e0; e1 = 0-e1; e2 = 0-e2; area = 0-area; }
+                var inside = 0;
+                if (area > 0) {
+                    if (e0 >= 0) { if (e1 >= 0) { if (e2 >= 0) { inside = 1; } } }
+                }
+                if (inside == 1) {
+                    var Wa = one / pc_get(t,2);
+                    var Wb = one / pc_get(t,7);
+                    var Wc = one / pc_get(t,12);
+                    var D  = e0 * Wa + e1 * Wb + e2 * Wc;
+                    var Nu = e0 * (Wa * pc_get(t,3)) + e1 * (Wb * pc_get(t,8))  + e2 * (Wc * pc_get(t,13));
+                    var Nv = e0 * (Wa * pc_get(t,4)) + e1 * (Wb * pc_get(t,9))  + e2 * (Wc * pc_get(t,14));
+                    if (D > pc_max_D) { pc_max_D = D; }
+                    if (Nu > pc_max_N) { pc_max_N = Nu; }
+                    var qu = pc_div(Nu >>> 32, Nu & 4294967295, D, 56);
+                    var qv = pc_div(Nv >>> 32, Nv & 4294967295, D, 56);
+                    # ⭐ THE OBLIGATION, on real render data, by MULTIPLICATION only -- never a second
+                    # divide, which would be this file agreeing with itself. Same doctrine perspdiv
+                    # proved over its synthetic sweep; here it runs on every pixel actually drawn.
+                    if (qu * D > Nu) { pc_obl_bad = pc_obl_bad + 1; }
+                    if (Nu >= (qu + 1) * D) { pc_obl_bad = pc_obl_bad + 1; }
+                    if (qv * D > Nv) { pc_obl_bad = pc_obl_bad + 1; }
+                    if (Nv >= (qv + 1) * D) { pc_obl_bad = pc_obl_bad + 1; }
+                    # ⭐ THE AFFINE ANSWER, at the same pixel, for the discriminator. This is exactly
+                    # what a shader that skipped the divide would produce.
+                    var qa = (e0 * pc_get(t,3) + e1 * pc_get(t,8) + e2 * pc_get(t,13)) / area;
+                    store64(&pc_u  + (py * PC_W + px) * 8, qu);
+                    store64(&pc_v  + (py * PC_W + px) * 8, qv);
+                    store64(&pc_ua + (py * PC_W + px) * 8, qa);
+                    store64(&pc_cov + (py * PC_W + px) * 8, 1);
+                    pc_covered = pc_covered + 1;
+                }
+                t = t + 1;
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return pc_covered;
+}
+
+# pc_affine_diff — how many covered pixels the PERSPECTIVE and AFFINE answers disagree on, and by how
+# much. ⭐ THIS IS THE RUNG'S DISCRIMINATOR. A large number means the corpus can tell the two
+# hypotheses apart; a small one means it cannot, and a green burn would prove nothing.
+var pc_worst = 0;
+
+fn pc_affine_diff(): i64 {
+    var n = 0;
+    pc_worst = 0;
+    var i = 0;
+    while (i < PC_W * PC_H) {
+        if (load64(&pc_cov + i * 8) == 1) {
+            var d = load64(&pc_u + i * 8) - load64(&pc_ua + i * 8);
+            if (d < 0) { d = 0 - d; }
+            if (d != 0) { n = n + 1; }
+            if (d > pc_worst) { pc_worst = d; }
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+# ==================================================================================================
+# THE CORPUS — a floor quad in strong perspective, which is the figure the rung's row calls for.
+# ==================================================================================================
+# ⚠ THE COORDINATES ARE LOAD-BEARING. A floor receding to a horizon: the bottom edge is NEAR (small w)
+# and spans the full width, the top edge is FAR (large w) and is narrow. That 16:1 w ratio IS the
+# perspective strength, and it is what makes the affine answer visibly wrong — a quad at constant w
+# would make the two hypotheses agree everywhere and the oracle would discriminate nothing.
+fn pc_corpus_floor(): i64 {
+    pc_reset();
+    var T = 256 * 65536;        # the texture axis, 16.16
+    #        x   y   w   u  v        x   y   w   u  v        x   y   w   u  v
+    pc_add(  0, 63,  1,  0, 0,     63, 63,  1,  T, 0,     40, 24, 16,  T, T);
+    pc_add(  0, 63,  1,  0, 0,     40, 24, 16,  T, T,     24, 24, 16,  0, T);
+    return 0;
+}
+
+# pc_corpus_constattr — the SAME strong-perspective geometry with the ATTRIBUTE CONSTANT at all three
+# vertices. ⭐⭐ THIS IS RUNG 18'S EXTERNAL INVARIANT, and it needs no tolerance and no second
+# implementation to compare against: if every vertex carries the same attribute value, the interpolant
+# must return that value at EVERY covered pixel, for ANY set of w's, because the weights sum to the
+# denominator identically. It is fixed by the definition of interpolation, so a wrong hoist, a wrong
+# reciprocal, a wrong divide or a shared convention error all break it — which is exactly what
+# "external" has to mean after rung 15's half-texel and rung 17's kernarg swap both survived every
+# agreement gate in the tree.
+# ⛔ Note it keeps the 16:1 w ratio. At constant w this would be trivially satisfied by the affine path
+# too, and would prove nothing about the divide.
+fn pc_corpus_constattr(): i64 {
+    pc_reset();
+    var C = 77 * 65536;         # any value; 77 is arbitrary and that is the point
+    pc_add(  0, 63,  1,  C, C,     63, 63,  1,  C, C,     40, 24, 16,  C, C);
+    pc_add(  0, 63,  1,  C, C,     40, 24, 16,  C, C,     24, 24, 16,  C, C);
+    return C;
+}
+
+# pc_corpus_flat — the SAME two triangles at CONSTANT w. Perspective-correct and affine must agree
+# EXACTLY here, which is what proves the divide is not simply perturbing everything it touches.
+fn pc_corpus_flat(): i64 {
+    pc_reset();
+    var T = 256 * 65536;
+    pc_add(  0, 63,  4,  0, 0,     63, 63,  4,  T, 0,     40, 24,  4,  T, T);
+    pc_add(  0, 63,  4,  0, 0,     40, 24,  4,  T, T,     24, 24,  4,  0, T);
+    return 0;
+}

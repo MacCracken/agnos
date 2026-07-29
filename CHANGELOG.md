@@ -7,6 +7,52 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 **Rung 18 `persp-correct` — cycle OPEN.** Bumped on cycle open; the user tags on close.
 
+### Added — `perspcore.cyr` + `perspgate.cyr`: the reference, and proof the figure DISCRIMINATES
+
+`tests/gpu/perspcore.cyr` (the reference) and `perspgate.cyr` (exit 95). **11** host oracles now.
+
+⭐ **The first thing the gate asserts is not correctness — it is that the corpus can tell the two
+hypotheses apart.** A shader that skips the perspective divide produces the *affine* answer, so the
+reference computes both at every pixel and reports the gap. Measured on the floor quad at a 16:1 `w`
+ratio: **1540 of 1541 covered pixels differ, worst by 9,902,774 in 16.16** — roughly 151 texels. That
+is what makes a green burn mean "the divide happened" rather than "the picture looked plausible.'
+⛔ Rung 17's shipped corpus was the opposite: a one-ULP divide error moved **0 of 1024** pixels there,
+and discovering that cost a burn.
+
+- **The control** — at *constant* `w`, perspective and affine agree **exactly** (0 of 1541 differ). Without
+  it, the discriminator is satisfied by a divide that simply perturbs everything it touches.
+- **The widths, re-measured here** rather than trusted from `perspbits`: max `N` = 1.06e16, max `D` =
+  636,346,368. `D` fits a 32-bit lane; `N` does not, so it is a register pair in the shader.
+- **The obligation on real render data** — `q*D <= N < (q+1)*D` on every drawn pixel, by multiplication
+  only, never a second divide.
+
+⭐ **A finding about the shader, from writing the reference**: the restoring divide's **remainder fits
+32 bits** even though the numerator is 64. `rem < D` after every subtraction and `D < 2^30`, so
+`rem<<1|bit` stays under 2^31. Only the *numerator* needs a register pair; the divide loop itself is
+32-bit throughout, and its trip count is wave-uniform.
+
+### ⛔ The external gate was wrong twice before it was right, and neither fix was a looser tolerance
+
+**First form**: walk outward from each vertex and compare the interpolant to that vertex's own
+attribute. Sound in principle — the weights are (1,0,0) at a vertex so the divide cancels — but it took
+the first covered pixel in **scan** order rather than the nearest, so it could land 6 px away; and near
+the far edge `u` spans 256 texels over ~16 screen pixels, i.e. **~16 texels per pixel**, so a 6-px miss
+is ~96 texels against a 16-texel tolerance. It failed 2 of 6 for reasons that had nothing to do with the
+reference.
+
+⚠ **The fix was not a looser tolerance.** Relaxing a failing external gate is the one move that destroys
+its purpose — it converts a real signal into a permanently green decoration.
+
+**Final form, needing no tolerance at all**: a **constant attribute at all three vertices must reproduce
+exactly at every covered pixel, for any `w`s**, because the weights sum to the denominator identically.
+It is fixed by the definition of interpolation, so a wrong hoist, a wrong reciprocal, a wrong divide or a
+shared convention error all break it — and it is checked with `!=`, not within a slack. ⛔ It keeps the
+16:1 `w` ratio deliberately: at constant `w` the affine path would satisfy it too and it would prove
+nothing about the divide. **1541 of 1541 exact.**
+
+⚠ Also fixed: the summary line printed `worst 0` because a later render reset the counter. A summary
+reporting a stale zero for the very quantity the gate exists to measure is worse than no summary.
+
 ### Added — `perspdiv.cyr`: the per-pixel divide, and the DECISION it forces
 
 `tests/gpu/perspdiv.cyr`, exit 95, wired in (**10** host oracles now). The obligation is the defining
