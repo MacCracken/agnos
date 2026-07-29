@@ -1189,7 +1189,16 @@ var GPU_EDGE_BYTES     = 16;         # one edge = x0,y0,x1,y1 as 4x i32 in 16.16
 var GPU_EDGE_MAX       = 256;        # per-op cap; a reject, never a clamp
 # 0x05 channel swap (plan S4) · 0x06 cov-modulated source · 0x07 packed VOP3P blend ·
 # 0x10-0x17 CP-DMA-domain ops (fill/blit/readback, plan S12) · 0x18-0x1F control (barrier/present).
-var GPU_OP_SUPPORTED   = 0x1F1F;     # bits 0..4 + 8 EDGE_COV + 9 TRI_RGBA + 10 TRI_LIST + 11 TRI_TEX + 12 TEX_LIST — MUST equal what gpo_validate accepts
+# ⭐ RUNG 17 (1.56.30) — op 0x0D, minted WITH its worker in the same change.
+# ⚠ `0x0C` was reserved for DEPTH_CLEAR in the original plan and 1.56.23 allocated it to TEX_LIST, so
+# depth-clear takes the next free code. Check gpo_field_mask / gpo_flags_known / gpo_validate and the
+# ABI battery before assuming ANY code is free -- that renumbering is why this warning exists.
+var GPU_OP_DEPTH_CLEAR = 0x0D;       # clear a TD-3 depth handle           (3D arc rung 17)
+# ⛔ GROWING THIS WORD ADVERTISES THE OP. It is both the validator's gate (gpo_validate) and what
+# gpu_caps #89 reports to ring 3, which is the "deliberately awkward" property the plan wanted: you
+# cannot add an op here without also promising it works. So 0x0D is added in the SAME change as
+# gpu_depth_clear, and that worker refuses with GPO_E_ARM until rung 6's audit passes on this boot.
+var GPU_OP_SUPPORTED   = 0x3F1F;     # bits 0..4 + 8 EDGE_COV + 9 TRI_RGBA + 10 TRI_LIST + 11 TRI_TEX + 12 TEX_LIST + 13 DEPTH_CLEAR — MUST equal what gpo_validate accepts
 
 # Flags word (+4). NOTHING is accepted here yet, on purpose: a flag that is accepted and ignored is how
 # a caller silently gets behaviour it did not ask for. bit0 SERIALIZE and bit1 CHECK_PREMUL are reserved
@@ -1323,6 +1332,11 @@ fn gpo_field_mask(op) {
     # here and ignoring it is precisely the "silently gets behaviour it did not ask for" failure the
     # flags-word comment above refuses; placement is BLEND_COV's job, in a second record.
     if (op == GPU_OP_EDGE_COV)    { return 0x021F; }
+    # rung 17: op(0) flags(1) z_handle(2) wh(4) value(6)
+    # ⛔ dstxy (dword 5) is NOT defined and must be zero — same reasoning as EDGE_COV above. A depth
+    # handle's origin IS (0,0); it is not the framebuffer and there is nothing to place it at.
+    # z_handle sits at dword 2, matching EDGE_COV's dst_id rather than TRI_RGBA's reserved dword.
+    if (op == GPU_OP_DEPTH_CLEAR) { return 0x0057; }
     return 0;
 }
 
@@ -2780,8 +2794,54 @@ fn edge_abi_selftest() {
         r = r + 1;
     }
 
-    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 94 cases correct\n", 21);
-    if (pass == 94) {
+    # ---- op 0x0D DEPTH_CLEAR (rung 17, 1.56.30) ------------------------------------------------
+    # ⛔ THE OP IS MINTED WITH ITS WORKER, so these are ACCEPT cases, not GPO_E_NOTIMPL ones. What is
+    # being proven here is the ABI surface only; whether the region is actually free is rung 6's
+    # audit, evaluated at arm time on real hardware.
+    kprint("edge-abi: ---- #92 op 0x0D DEPTH_CLEAR ABI battery ----\n", 56);
+    var dz = 0;
+    while (dz < 16) { store32(&d + dz * 4, 0); dz = dz + 1; }
+    store32(&d +  0, GPU_OP_DEPTH_CLEAR);
+    store32(&d +  8, 0);                          # z_handle 0
+    store32(&d + 16, (600 * 65536) + 800);        # 800x600
+    store32(&d + 24, 0xFFFFFFFF);                 # clear value
+    pass = pass + ea_expect(&d, 0, "depth: well-formed 800x600 clear is accepted", 44);
+
+    store32(&d +  8, GPU_RT_HANDLES - 1);
+    pass = pass + ea_expect(&d, 0, "depth: the LAST handle is accepted", 34);
+    store32(&d +  8, GPU_RT_HANDLES);
+    pass = pass + ea_expect(&d, GPO_E_BADSLOT, "depth: handle one past the last is refused", 42);
+    store32(&d +  8, 0);
+
+    store32(&d + 16, (600 * 65536) + 0);
+    pass = pass + ea_expect(&d, GPO_E_DIM, "depth: zero width", 17);
+    store32(&d + 16, (0 * 65536) + 800);
+    pass = pass + ea_expect(&d, GPO_E_DIM, "depth: zero height", 18);
+
+    # ⭐ THE BOUND IS PER-HANDLE, NOT PER-REGION, and this is the case that proves it. 4096x2048x4 is
+    # 32 MB exactly -- the whole handle -- so 4096x2049 overruns into the NEXT handle while still
+    # sitting comfortably inside the 256 MB region. A region-sized check would accept it and the
+    # corruption would surface in an unrelated buffer.
+    store32(&d + 16, (2048 * 65536) + 4096);
+    pass = pass + ea_expect(&d, 0, "depth: 4096x2048 fills one handle exactly", 41);
+    store32(&d + 16, (2049 * 65536) + 4096);
+    pass = pass + ea_expect(&d, GPO_E_SLOTSIZE, "depth: one row past the handle is refused", 41);
+    store32(&d + 16, (600 * 65536) + 800);
+
+    # ⛔ dstxy is NOT defined by this op. Accepting and ignoring it is the failure the flags/field
+    # vocabulary exists to prevent -- a depth handle's origin IS (0,0).
+    store32(&d + 20, (16 * 65536) + 16);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "depth: dstxy set (undefined for this op)", 40);
+    store32(&d + 20, 0);
+
+    # And the op must be REACHABLE at all -- 0x0D was free until this cut, so a stale GPU_OP_SUPPORTED
+    # would answer GPO_E_BADOP for every case above and they would all fail together, loudly.
+    store32(&d +  4, 0x01);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "depth: unknown flag bit", 23);
+    store32(&d +  4, 0);
+
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 103 cases correct\n", 22);
+    if (pass == 103) {
         kprint("edge-abi: PASS -- the 0x08/0x09/0x0A/0x0B/0x0C ABIs reject every malformed record,\n", 83);
         kprint("edge-abi: and a well-formed one is accepted or correctly reports no-GPU.\n", 73);
         return 1;
@@ -2790,6 +2850,26 @@ fn edge_abi_selftest() {
     return 0;
 }
 #endif
+
+# gpo_validate_depthclear — op 0x0D. Validates on its OWN terms, like EDGE_COV: the generic tail
+# assumes "one source slot sized by w*h, one framebuffer destination at dstxy", and this op has none
+# of those three. Running it through the generic path would bounds-check a depth buffer against the
+# screen, which is meaningless.
+fn gpo_validate_depthclear(rec) {
+    var zh = load32(rec + 8) & 0xFFFFFFFF;
+    if (zh >= GPU_RT_HANDLES) { return GPO_E_BADSLOT; }
+    var wh = load32(rec + 16) & 0xFFFFFFFF;
+    var w  = wh & 0xFFFF;
+    var h  = (wh >> 16) & 0xFFFF;
+    if (w < 1) { return GPO_E_DIM; }
+    if (h < 1) { return GPO_E_DIM; }
+    # ⛔ BOUND AGAINST ONE HANDLE, NOT THE WHOLE REGION. A rect that fits 256 MB but overruns a 32 MB
+    # handle would scribble on the NEXT handle, and the symptom would appear in an unrelated buffer.
+    # ⚠ 32-bit Z, so 4 bytes per sample — the same figure gpu_depth_clear uses. Two sites, one fact:
+    # if the depth format ever changes, both move or the validator starts blessing overruns.
+    if (w * 4 * h > GPU_RT_HANDLE_SIZE) { return GPO_E_SLOTSIZE; }
+    return 0;
+}
 
 fn gpo_validate(rec, fbw, fbh) {
     var op = load32(rec + 0) & 0xFFFFFFFF;
@@ -2816,6 +2896,7 @@ fn gpo_validate(rec, fbw, fbh) {
     if (op == GPU_OP_TRI_LIST) { return gpo_validate_trilist(rec, fbw, fbh); }
     if (op == GPU_OP_TRI_TEX)  { return gpo_validate_tritex(rec, fbw, fbh); }
     if (op == GPU_OP_TEX_LIST) { return gpo_validate_texlist(rec, fbw, fbh); }
+    if (op == GPU_OP_DEPTH_CLEAR) { return gpo_validate_depthclear(rec); }
 
     var wh  = load32(rec + 16) & 0xFFFFFFFF;
     var dxy = load32(rec + 20) & 0xFFFFFFFF;
@@ -2917,6 +2998,15 @@ fn gpo_execute(rec) {
     # well-formed record is refused with GPO_E_ARM (not GPO_E_BADOP) and the whole ABI — 512-primitive
     # array, per-primitive flags, the mandatory FULLCOV rule, both texture formats — is provable in
     # QEMU at zero flashes. Arming is a one-function change that touches nothing here.
+    if (op == GPU_OP_DEPTH_CLEAR) {
+        # ⚠ GPO_E_ARM, not GPO_E_DISPATCH: the overwhelmingly likely refusal here is rung 6's audit
+        # not having passed on this boot, which is an ARMING fact — the region is not proven free —
+        # not a dispatch that was attempted and failed.
+        var zh = load32(rec + 8) & 0xFFFFFFFF;
+        var zv = load32(rec + 24) & 0xFFFFFFFF;
+        if (gpu_depth_clear(zh, w, h, zv) != 1) { return GPO_E_ARM; }
+        return 0;
+    }
     if (op == GPU_OP_TEX_LIST) {
         var Lp = load64(&shm_kva + ((load32(rec + 12) & 0xFFFFFFFF) - 1) * 8);
         var Ln = load32(rec + 24) & 0xFFFFFFFF;

@@ -1,0 +1,133 @@
+# gpudepth.cyr — RUNG 17's first instrument: op 0x0D GPU_OP_DEPTH_CLEAR on iron.
+#
+# ⛔⛔ THE HARD PART OF THIS TOOL IS THAT ITS TARGET IS UNREADABLE, AND PRETENDING OTHERWISE WOULD MAKE
+# IT WORTHLESS. Op 0x0D clears a depth buffer in TD-3's kernel-owned render-target region. Ring 3
+# never sees an address there — that is the entire point of opaque handles — and `#90` reads the
+# framebuffer, not the Z buffer. So there is **no byte-comparison oracle available**, and a tool that
+# printed "exit 95" off a zero return code would be asserting only that the syscall returned, which a
+# stub `return 0;` satisfies exactly.
+#
+# ⭐ THE ORACLE IS THEREFORE **TIME**, AND IT IS A REAL ONE. A CP-DMA fill of 1.92 MB has a duration;
+# a no-op does not. And the duration must SCALE with the rect: clearing a full 32 MB handle moves
+# ~17x the bytes of an 800x600 clear and must take measurably longer. Two points, the same technique
+# that rescued the 1.56.22 bandwidth number and rung 14's ragged case — one measurement can be
+# explained away, two that lie on a line cannot.
+#
+# ⚠ WHAT THIS STILL DOES NOT PROVE, stated so the green is not over-read: that the bytes written are
+# the VALUE asked for. Time proves work happened and scaled; it does not prove correctness of the
+# fill pattern. That arrives with rung 17's depth TEST, whose oracle is two interpenetrating
+# triangles in both orders — an observable that does not need to read Z directly.
+#
+# ⛔ uptime_us #95, NOT uptime_ms #40. A foreground `run` program executes with IF CLEARED, so the
+# timer never fires and #40 is FROZEN for the program's whole duration. Two iron burns were lost to
+# that. #95 is rdtsc-backed and needs no interrupts.
+#
+# Exits: 95 both clears ran and the cost scaled with size · 94 the clears returned but did NOT scale
+#        (suspect a no-op worker) · 90 an op was refused, reason printed · 83 no argument.
+
+include "lib/io.cyr"
+
+fn slen(s): i64 { var n = 0; while (load8(s + n) != 0) { n = n + 1; } return n; }
+fn ps(s): i64 { print(s, slen(s)); return 0; }
+fn nl(): i64 { print("\n", 1); return 0; }
+fn puts2(s): i64 { ps(s); nl(); return 0; }
+fn pn(v): i64 {
+    var b[32];
+    var i = 0; var neg = 0;
+    if (v < 0) { neg = 1; v = 0 - v; }
+    if (v == 0) { store8(&b + i, 48); i = i + 1; }
+    while (v > 0) { store8(&b + i, 48 + (v % 10)); v = v / 10; i = i + 1; }
+    if (neg == 1) { print("-", 1); }
+    while (i > 0) { i = i - 1; print(&b + i, 1); }
+    return 0;
+}
+
+var gd_rec[8];              # 64-byte op record (this directory: var X[N] is N x u64)
+
+fn gd_now(): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return syscall(95);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return 0;
+    #endif
+}
+
+# gd_clear(zh, w, h, value) — issue ONE op 0x0D. Returns the #92 return code.
+fn gd_clear(zh, w, h, value): i64 {
+    var z = 0;
+    while (z < 16) { store32(&gd_rec + z * 4, 0); z = z + 1; }
+    store32(&gd_rec +  0, 13);                       # op 0x0D
+    store32(&gd_rec +  8, zh);                       # z_handle
+    store32(&gd_rec + 16, (h * 65536) + w);          # wh
+    store32(&gd_rec + 24, value);                    # clear value
+    #ifdef CYRIUS_TARGET_AGNOS
+    return syscall(92, &gd_rec, 64);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return 0 - 1;
+    #endif
+}
+
+# gd_time(zh, w, h, reps) — elapsed us for `reps` clears, or 0-1 if any was refused.
+fn gd_time(zh, w, h, reps): i64 {
+    var t0 = gd_now();
+    var i = 0;
+    while (i < reps) {
+        var rc = gd_clear(zh, w, h, 0xFFFFFFFF);
+        if (rc != 0) { ps("gpudepth: op REFUSED, reason "); pn(0 - rc); nl(); return 0 - 1; }
+        i = i + 1;
+    }
+    var t1 = gd_now();
+    if (t1 <= t0) { return 0 - 1; }
+    return t1 - t0;
+}
+
+fn main(): i64 {
+    puts2("gpudepth: RUNG 17 -- op 0x0D DEPTH_CLEAR on TD-3's render-target region");
+    puts2("gpudepth: the oracle is TIME. The target is kernel-owned and unreadable from ring 3,");
+    puts2("gpudepth: so a zero return code proves only that the syscall returned.");
+    nl();
+
+    # ⭐ THE SMALL CLEAR FIRST, so that if the region is not armed we refuse before doing 17x the work.
+    var reps = 20;
+    var small = gd_time(0, 800, 600, reps);
+    if (small < 0) {
+        puts2("gpudepth: the 800x600 clear was refused.");
+        puts2("gpudepth:   reason 7 (GPO_E_ARM) means rung 6's audit did NOT pass on this boot --");
+        puts2("gpudepth:   the render-target region is not provably free, so nothing was written.");
+        puts2("gpudepth:   Run `gpuwedge --rt-audit` and read WHICH of its seven checks refused.");
+        return 90;
+    }
+    ps("gpudepth: 800x600 (1.92 MB) x "); pn(reps); ps(" = "); pn(small); puts2(" us total");
+
+    # A FULL HANDLE: 4096x2048x4 = 32 MB exactly, ~17x the bytes.
+    var large = gd_time(0, 4096, 2048, reps);
+    if (large < 0) { puts2("gpudepth: the full-handle clear was refused after the small one PASSED."); return 90; }
+    ps("gpudepth: 4096x2048 (32 MB) x "); pn(reps); ps(" = "); pn(large); puts2(" us total");
+    nl();
+
+    var sb = 800 * 600 * 4;
+    var lb = 4096 * 2048 * 4;
+    ps("gpudepth: bytes ratio "); pn(lb / sb); ps("x    time ratio ");
+    if (small > 0) { pn(large * 10 / small); ps("/10"); }
+    puts2("x");
+
+    # ⛔ THE DISCRIMINATION GATE. If 17x the bytes costs the same time, the worker is not moving bytes
+    # and both "successes" mean nothing. Deliberately a loose bound (2x, against an expected ~17x):
+    # the point is to separate WORK from NO WORK, not to police the DMA engine's efficiency, and a
+    # tight bound would turn a bandwidth surprise into a false red.
+    if (large < small * 2) {
+        puts2("gpudepth: ⛔ 32 MB costs less than 2x the time of 1.92 MB -- the cost did NOT scale.");
+        puts2("gpudepth:   Both clears returned 0, so the ABI path works; suspect the WORKER is a");
+        puts2("gpudepth:   no-op -- check gpu_cp_dma_fill_rect's row_bytes/rows and that the MC");
+        puts2("gpudepth:   address from gpu_rt_handle_mc is non-zero.");
+        return 94;
+    }
+    puts2("gpudepth: cost scaled with size -- the fill is doing real work.");
+    puts2("gpudepth: ⭐ op 0x0D is live on iron, on a region rung 6 proved free.");
+    return 95;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

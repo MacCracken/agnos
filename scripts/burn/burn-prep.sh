@@ -871,13 +871,14 @@ esac
 # one the burn was for.
 # ⇒ WHEN A CYCLE'S ORACLE IS A NEW OR CHANGED TOOL, ADD IT HERE IN THE SAME BITE. A tool absent from
 # this loop is a tool that can be silently stale, and a stale oracle does not fail — it agrees.
-for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy klug; do
+for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy gpudepth klug; do
     _src=""
     case "$_t" in
         modeset)  _src="tests/gpu/build/modeset_agnos" ;;
         gpuwedge) _src="tests/gpu/build/gpuwedge_agnos" ;;
         gputri)   _src="tests/gpu/build/gputri_agnos" ;;
         gputex)   _src="tests/gpu/build/gputex_agnos" ;;    # rungs 13 + 14 oracle
+        gpudepth) _src="tests/gpu/build/gpudepth_agnos" ;;  # rung 17 op 0x0D oracle
         gpucov)   _src="tests/gpu/build/gpucov_agnos" ;;
         gpublend) _src="tests/gpu/build/gpublend_agnos" ;;
         gpublit)  _src="tests/gpu/build/gpublit_agnos" ;;

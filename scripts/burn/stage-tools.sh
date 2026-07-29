@@ -182,6 +182,13 @@ stage_one agnos/tests/gpu gputex.cyr gputex || rc=1
 #       the #89 profile tail.
 stage_one agnos/tests/gpu gpuprof.cyr gpuprof || rc=1
 
+# gpudepth — RUNG 17 (1.56.30): op 0x0D DEPTH_CLEAR on TD-3's render-target region.
+# ⚠ Its oracle is TIME, not a byte-compare: the depth buffer is kernel-owned and ring 3 cannot read
+# it, so a zero return code proves only that the syscall returned. It clears 800x600 and then a full
+# 32 MB handle and demands the cost SCALE. Run it only AFTER `gpuwedge --rt-audit` passes — if the
+# region is not proven free the worker refuses with GPO_E_ARM and nothing is written, by design.
+stage_one agnos/tests/gpu gpudepth.cyr gpudepth || rc=1
+
 # rupantara gpulayer — the ML-layer-on-GPU crown proof (1.54.x C6). A real bias-free MLP up-projection matmul
 # (rosnet linear_fwd 8x8x32) run on the gfx90c shader cores via #83, tiled 8x8 and byte-compared against
 # rupantara's CPU linear_fwd. Exit 95 = byte-identical AND all 4 tiles on the GPU (crown); 96 = identical but

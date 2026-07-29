@@ -25,7 +25,14 @@ fi
 python3 - "$FILES" <<'PY'
 import re, sys
 
+# ⚠ ea_expect / ea_expect_valid ADDED 1.56.30. They take (rec, want, name, nlen) with the same
+# unchecked-length contract, and they were NOT covered — a rung-17 case shipped declaring 43 for a
+# 44-byte name and printed "...is accepte" in the ABI battery. Same defect class as the kprint one
+# this file was written for, in a function the gate simply did not look at. The lesson is not
+# "add ea_expect": it is that a length-checking gate must enumerate EVERY (string, length) API in
+# the tree, because the ones it omits are exactly where the bug survives.
 pat = re.compile(r'\bkprint(?:ln)?\("((?:[^"\\]|\\.)*)"\s*,\s*(\d+)\)')
+eapat = re.compile(r'\bea_expect(?:_valid)?\(.*?"((?:[^"\\]|\\.)*)"\s*,\s*(\d+)\)')
 bad = 0
 total = 0
 for path in sys.argv[1].split():
@@ -34,7 +41,7 @@ for path in sys.argv[1].split():
     except OSError:
         continue
     for lineno, line in enumerate(lines, 1):
-        for m in pat.finditer(line):
+        for m in list(pat.finditer(line)) + list(eapat.finditer(line)):
             literal, declared = m.group(1), int(m.group(2))
             # Cyrius escapes follow C conventions closely enough for a length count.
             actual = len(literal.encode().decode('unicode_escape'))
@@ -44,6 +51,6 @@ for path in sys.argv[1].split():
                 print(f"  MISMATCH {path}:{lineno}  declared={declared} actual={actual}")
                 print(f"           {literal!r}")
 
-print(f"  checked {total} kprint literals, {bad} mismatched")
+print(f"  checked {total} kprint/ea_expect literals, {bad} mismatched")
 sys.exit(1 if bad else 0)
 PY

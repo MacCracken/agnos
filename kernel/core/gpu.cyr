@@ -732,6 +732,11 @@ fn gpu_rt_arena_audit() {
     var rt_end  = GPU_RT_REGION_OFF + GPU_RT_REGION_SIZE;
     var rt_phys = fb_off  + GPU_RT_REGION_OFF;
     var rt_mc   = fb_base + GPU_RT_REGION_OFF;
+    # ⚠ Cached for the handle table, but DELIBERATELY NOT a licence to use them: gpu_rt_handle_mc
+    # refuses unless gpu_rt_audited is 1, which only happens if this function RETURNS 1 below.
+    # Setting them here rather than at the end keeps the arithmetic in one place; the gate is the flag.
+    gpu_rt_base_mc   = rt_mc;
+    gpu_rt_base_phys = rt_phys;
 
     kprint("gpu: carveout phys base ", 24); kprint_hex(fb_off);
     kprint("  mc base ", 10); kprint_hex(fb_base);
@@ -807,6 +812,63 @@ fn gpu_rt_arena_audit() {
     kprintln("gpu: ---- END RENDER-TARGET REGION AUDIT ----", 45);
     klug_spill();
     return ok;
+}
+
+# ============================================================================================
+# ⭐ TD-3's HANDLE TABLE — rung 6's audit is its ARMING PRECONDITION, not a suggestion.
+# ============================================================================================
+# ⛔ NOTHING MAY STORE INTO THE RENDER-TARGET REGION UNTIL THE AUDIT HAS PASSED **ON THIS BOOT**.
+# That is the whole point of rung 6, and making it a runtime gate rather than a comment is what makes
+# it hold: with VM_CONTEXT0 disabled there are no page tables, so a store into a region that turned
+# out to be claimed lands in the console framebuffer or the PSP TMR — and agnos re-loads PSP ucode
+# only at boot, so that one is not recoverable without a reboot.
+# ⭐ This also keeps the ABI honest in the sense 1.56.24 established: op 0x0D is ACCEPTED by the
+# validator because it is implemented, and its worker REFUSES with GPO_E_ARM where the region is not
+# provably free — exactly how gpu_tex_arm refuses where there is no GPU. Accepted == proven, with the
+# proof evaluated per boot instead of assumed at build time.
+var gpu_rt_audited   = 0;    # 1 = gpu_rt_arena_audit() returned 1 this boot
+var gpu_rt_base_mc   = 0;    # MC-side base of the region (valid only when gpu_rt_audited == 1)
+var gpu_rt_base_phys = 0;    # CPU-side base ditto
+
+fn gpu_rt_arm() {
+    if (gpu_rt_audited == 1) { return 1; }
+    if (gpu_present == 0) { return 0; }
+    if (gpu_rt_arena_audit() != 1) { return 0; }
+    gpu_rt_audited = 1;
+    return 1;
+}
+
+# gpu_rt_handle_mc — resolve an opaque handle to its MC base, or 0 if it is not usable.
+# ⚠ Returns 0 for an out-of-range handle AND for an unaudited region, and every caller must treat 0
+# as a refusal. Ring 3 never sees this number; it passes the handle INDEX and nothing else, which is
+# the property TD-3 chose handles over multi-page #86 slots to keep.
+fn gpu_rt_handle_mc(h) {
+    if (gpu_rt_audited == 0) { return 0; }
+    if (h < 0) { return 0; }
+    if (h >= GPU_RT_HANDLES) { return 0; }
+    return gpu_rt_base_mc + h * GPU_RT_HANDLE_SIZE;
+}
+
+# gpu_depth_clear — op 0x0D's worker. Clears a w x h 32-bit depth buffer in handle `zh` to `value`.
+#
+# ⭐ IT REUSES gpu_cp_dma_fill_rect, WHICH IS ALREADY IRON-PROVEN (gpu_cp_dma_fill_test). Rung 17's
+# first op does not need a new shader, a new ring, or a new packet class — a depth clear is a fill,
+# and the fill path exists and works. "Redesign, don't reinvent" applies to our own tree first.
+# ⚠ 32-bit Z, not 16: cp_dma fills DWORDS, so a 16-bit format would need the value pre-duplicated and
+# would buy nothing here — a 32 MB handle holds 800x600x4 (1.92 MB) with room to spare, and rung 17's
+# tile loop keeps depth in VGPRs anyway. The width is a per-op record field, so this is not a wall.
+# Returns 1 / 0.
+fn gpu_depth_clear(zh, w, h, value) {
+    if (gpu_rt_arm() != 1) { return 0; }
+    var mc = gpu_rt_handle_mc(zh);
+    if (mc == 0) { return 0; }
+    var row_bytes = w * 4;
+    # ⛔ BOUND THE WRITE AGAINST THE HANDLE, NOT AGAINST THE REGION. A w*h that fits the 256 MB region
+    # but overruns this 32 MB handle would silently scribble on the NEXT handle -- a corruption whose
+    # symptom appears in an unrelated buffer. The validator checks this too; this is the second gate,
+    # because the worker is what actually issues the DMA.
+    if (row_bytes * h > GPU_RT_HANDLE_SIZE) { return 0; }
+    return gpu_cp_dma_fill_rect(mc, row_bytes, value, row_bytes, h);
 }
 
 fn gpu_wait_done(done_phys, expect, timeout_us) {
