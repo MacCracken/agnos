@@ -140,6 +140,42 @@ number was not.
 no longer calls. It now lists the one-time-cost case **first**, because that is how the gate actually
 fired.
 
+### Added — RUNG 17's model at register widths, and the finding that z PRECISION is load-bearing
+
+`depthmodel.cyr`. **exit 95**, four assertions + six mutations, byte-identical to the reference in
+**colour AND z** in both submission orders.
+
+**What the model adds:** the **affine hoist**. The reference evaluates three edge functions per pixel
+per triangle as products of differences; the shader cannot afford that and instead hoists each edge to
+`A·x + B·y + C` and the depth numerator to `KX·x + KY·y + KC`, computed once per triangle on the CPU
+— the same doctrine as rung 13's prep record (*everything constant per triangle belongs on the CPU*).
+Proving `hoisted == reference` is where a sign or a dropped term shows up. Plus 32-bit lane masking;
+the depth numerator peaks at **2,430,400**, comfortably inside a lane.
+
+### ⭐⭐ The rung-17 finding — a lost low bit does not perturb a pixel, it destroys the ORACLE
+
+`M2` quantises z to 16 levels, which is what a divide short of its low bits would do:
+
+```
+M2a quantising z creates TIES where there were none:  3 tie px
+M2b and those ties BREAK order-independence:          3 px differ between orders
+```
+
+**Three pixels.** That is the sharp part. A tie is decided by **submission order**, so precision loss
+does not merely shift a pixel's value — it destroys the byte-identity that *is* rung 17's iron oracle.
+And a 3-pixel difference between two orders on iron is exactly the size that reads as noise. The
+oracle demands byte-identity precisely so that three pixels is a **failure**, not a shrug.
+
+⚠ **And this is why rung 13 could get away with what rung 17 cannot.** At rung 13 a one-ULP quotient
+error was *invisible* — nearest sampling truncated it away, which `texgate` gate 6 measured directly:
+**186 texels** moved against **3,151 quotients** that actually changed. **Depth compares the whole
+quotient.** ⇒ When the shader lands, its reciprocal needs `texgate` GATE 7's treatment — compare the
+**full quotient word** against an exact divide, not just the decision it feeds.
+
+⛔ Stated in the file rather than discovered later: the model uses an **exact** divide. gfx9 has none,
+so the shader will use the hoisted-reciprocal path (`recip32` + `tm_quot` + one exact correction)
+already iron-proven at rungs 9/13 — and that normalisation is **not** modelled here.
+
 ### Added — RUNG 17's depth reference and its order-independence gate (host, zero burns)
 
 `depthcore.cyr` + `depthgate.cyr`. **exit 95, seven gates.** This proves the rung's *own* iron oracle

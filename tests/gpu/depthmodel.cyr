@@ -1,0 +1,272 @@
+# depthmodel.cyr — RUNG 17's CORRECTNESS GATE: the depth shader's arithmetic at GPU REGISTER WIDTHS,
+# byte-diffed against depthcore.cyr, which is the oracle.
+#
+# ⭐ THE POINT IS ATTRIBUTION, and rungs 11/13/15 earned it. Green here and red on iron ⇒ the fault is
+# the EMISSION, not the algorithm. When rung 11's burn came back red, this same split reproduced the
+# failing pixels bit-exactly on the host and convicted the shader in one pass instead of bisecting on
+# iron.
+#
+# ============================================================================================
+# WHAT THE MODEL ADDS OVER THE REFERENCE
+# ============================================================================================
+# 1. **THE AFFINE HOIST.** The reference evaluates three edge functions per pixel per triangle as
+#    products of differences. The shader cannot afford that: it hoists each edge to `A*x + B*y + C`
+#    and the depth numerator to `KX*x + KY*y + KC`, all computed ONCE PER TRIANGLE on the CPU, so the
+#    per-pixel path is a few MACs and no cross products. Same doctrine as rung 13's record, whose
+#    header says it outright: *everything constant per triangle belongs on the CPU.*
+#    ⇒ Proving `hoisted == reference` is a real claim, not bookkeeping: the algebra that says the
+#    edge function is affine in (x,y) is exactly where a sign or a term goes missing.
+# 2. **32-BIT LANES.** Every accumulate is masked to 32 bits, because `v_mul_lo_u32` / `v_add_u32`
+#    are 32-bit. Gate A4 shows the depth numerator PEAKS well inside that; the model proves the
+#    shader's actual sequence never exceeds it, which is a different claim.
+#
+# ============================================================================================
+# ⛔⛔ WHAT THIS FILE DOES **NOT** COVER, STATED FIRST SO THE GREEN IS NOT OVER-READ
+# ============================================================================================
+# The per-pixel divide `z = zn / area` is modelled here as an EXACT divide. The shader cannot do that
+# — gfx9 has no integer divide — and will use the hoisted-reciprocal path (`recip32` + `tm_quot` +
+# one exact correction) that rungs 9/13 already run on iron. That normalisation is NOT modelled here.
+#
+# ⚠ AND IT IS NOT A FORMALITY, because rung 15 established what the reciprocal can hide: nearest
+# sampling consumed only the top 16 bits of its quotient, so 17/17 iron burns proved the divide only
+# in the high half, and bilinear's 8 extra bits had never been compared by anything. **Depth compares
+# the WHOLE quotient.** When the shader lands it needs texgate GATE 7's treatment — compare the full
+# quotient word against an exact divide, not just the decision it feeds.
+# ⇒ M2 below measures why that matters: it is the reason precision is load-bearing HERE and was not
+# at rung 13.
+
+include "lib/io.cyr"
+include "tricore.cyr"      # ps / pn / nl
+include "depthcore.cyr"
+
+var DM_MASK32 = 4294967295;
+
+# ---- mutations: each must break a gate --------------------------------------------------------
+var dm_mut_dropc  = 0;   # M1 drop the hoist's constant term KC
+var dm_mut_quant  = 0;   # M2 quantise z -- simulates a divide that loses low bits
+var dm_mut_acc16  = 0;   # M3 truncate the accumulator to 16 bits
+var dm_mut_swapk  = 0;   # M4 swap KX/KY
+
+var DM_QUANT = 4;        # M2's shift: z = (z >> 4) << 4
+
+# dm_hoist(t) — per-triangle CPU work: the three edge planes and the depth-numerator plane.
+# Results land in globals, mirroring "one record per triangle, written by the CPU".
+var dm_ea[3]; var dm_eb[3]; var dm_ec[3];      # edge i: A*x + B*y + C
+var dm_kx = 0; var dm_ky = 0; var dm_kc = 0;   # depth numerator plane
+var dm_area = 0;
+
+fn dm_edge_plane(i, ax, ay, bx, by): i64 {
+    # E(x,y) = (bx-ax)*(y-ay) - (by-ay)*(x-ax)
+    #        = -(by-ay)*x + (bx-ax)*y + [ (by-ay)*ax - (bx-ax)*ay ]
+    store64(&dm_ea + i * 8, 0 - (by - ay));
+    store64(&dm_eb + i * 8, bx - ax);
+    store64(&dm_ec + i * 8, (by - ay) * ax - (bx - ax) * ay);
+    return 0;
+}
+
+fn dm_hoist(t): i64 {
+    var ax = 2 * dc_get(t, 0); var ay = 2 * dc_get(t, 1);
+    var bx = 2 * dc_get(t, 3); var by = 2 * dc_get(t, 4);
+    var cx = 2 * dc_get(t, 6); var cy = 2 * dc_get(t, 7);
+    # w0 opposes vertex a (edge b->c), w1 opposes b (c->a), w2 opposes c (a->b) -- the SAME
+    # assignment depthcore uses. A permutation here would still sum to the area and would put the
+    # wrong z on the wrong barycentric, which is the rung-15 weight-swap failure one level up.
+    dm_edge_plane(0, bx, by, cx, cy);
+    dm_edge_plane(1, cx, cy, ax, ay);
+    dm_edge_plane(2, ax, ay, bx, by);
+    var z0 = dc_get(t, 2); var z1 = dc_get(t, 5); var z2 = dc_get(t, 8);
+    dm_kx = z0 * load64(&dm_ea + 0) + z1 * load64(&dm_ea + 8) + z2 * load64(&dm_ea + 16);
+    dm_ky = z0 * load64(&dm_eb + 0) + z1 * load64(&dm_eb + 8) + z2 * load64(&dm_eb + 16);
+    dm_kc = z0 * load64(&dm_ec + 0) + z1 * load64(&dm_ec + 8) + z2 * load64(&dm_ec + 16);
+    if (dm_mut_swapk != 0) { var s = dm_kx; dm_kx = dm_ky; dm_ky = s; }
+    if (dm_mut_dropc != 0) { dm_kc = 0; }
+    # ⭐ area is the SUM of the three edge planes and is constant in (x,y) -- the x and y terms
+    # cancel identically. Computing it as the sum rather than as a fresh cross product is what makes
+    # that cancellation observable rather than assumed.
+    dm_area = load64(&dm_ec + 0) + load64(&dm_ec + 8) + load64(&dm_ec + 16);
+    return 0;
+}
+
+var dm_cbuf[512];
+var dm_zbuf[512];
+var dm_ties = 0;
+var dm_peak = 0;          # largest |zn| seen -- A4 checks it against a 32-bit lane
+
+fn dm_render(w, h, zclear, bg): i64 {
+    dm_ties = 0;
+    dm_peak = 0;
+    var py = 0;
+    while (py < h) {
+        var px = 0;
+        while (px < w) {
+            var pxq = 2 * px + 1;
+            var pyq = 2 * py + 1;
+            var pz = zclear;
+            var pc = bg;
+            var t = 0;
+            while (t < dc_n) {
+                dm_hoist(t);
+                var w0 = (load64(&dm_ea + 0)  * pxq + load64(&dm_eb + 0)  * pyq + load64(&dm_ec + 0))  & DM_MASK32;
+                var w1 = (load64(&dm_ea + 8)  * pxq + load64(&dm_eb + 8)  * pyq + load64(&dm_ec + 8))  & DM_MASK32;
+                var w2 = (load64(&dm_ea + 16) * pxq + load64(&dm_eb + 16) * pyq + load64(&dm_ec + 16)) & DM_MASK32;
+                # ⚠ Sign-restore from the 32-bit lane. The masks above ARE the lane; the compare
+                # below needs the signed value, and forgetting this is the rung-11 unsigned-high-half
+                # defect in miniature.
+                if (w0 >= 2147483648) { w0 = w0 - 4294967296; }
+                if (w1 >= 2147483648) { w1 = w1 - 4294967296; }
+                if (w2 >= 2147483648) { w2 = w2 - 4294967296; }
+                var inside = 0;
+                if (dm_area > 0) {
+                    if (w0 >= 0) { if (w1 >= 0) { if (w2 >= 0) { inside = 1; } } }
+                }
+                if (dm_area < 0) {
+                    if (w0 <= 0) { if (w1 <= 0) { if (w2 <= 0) { inside = 1; } } }
+                }
+                if (inside == 1) {
+                    var zn = dm_kx * pxq + dm_ky * pyq + dm_kc;
+                    var mag = zn;
+                    if (mag < 0) { mag = 0 - mag; }
+                    if (mag > dm_peak) { dm_peak = mag; }
+                    if (dm_mut_acc16 != 0) { zn = zn & 0xFFFF; }
+                    var z = zn / dm_area;
+                    # M2 -- a divide that loses low bits. See the gate for why this is the one that
+                    # matters and why it did NOT matter at rung 13.
+                    if (dm_mut_quant != 0) { z = (z >>> DM_QUANT) << DM_QUANT; }
+                    if (z == pz) { dm_ties = dm_ties + 1; }
+                    if (z < pz) { pz = z; pc = dc_get(t, 9); }
+                }
+                t = t + 1;
+            }
+            store32(&dm_cbuf + (py * w + px) * 4, pc & 0xFFFFFFFF);
+            store32(&dm_zbuf + (py * w + px) * 4, pz & 0xFFFFFFFF);
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return 0;
+}
+
+# ---- the corpus, identical to depthgate's ------------------------------------------------------
+var DM_BG   = 0xFF101010;
+var DM_FAR  = 1000000;
+var DM_RED  = 0xFFFF0000;
+var DM_BLUE = 0xFF0000FF;
+
+fn dm_order(swap): i64 {
+    dc_reset();
+    if (swap == 0) {
+        dc_add(2, 2, 100,  28, 4, 900,  4, 28, 100, DM_RED);
+        dc_add(2, 4, 900,  28, 2, 100,  28, 28, 900, DM_BLUE);
+    }
+    if (swap != 0) {
+        dc_add(2, 4, 900,  28, 2, 100,  28, 28, 900, DM_BLUE);
+        dc_add(2, 2, 100,  28, 4, 900,  4, 28, 100, DM_RED);
+    }
+    return 0;
+}
+
+fn dm_vs_ref(): i64 {
+    dc_render(DC_W, DC_H, DM_FAR, DM_BG);
+    dm_render(DC_W, DC_H, DM_FAR, DM_BG);
+    var d = 0;
+    var i = 0;
+    while (i < DC_W * DC_H) {
+        var a = load32(&dc_cbuf + i * 4) & 0xFFFFFFFF;
+        var b = load32(&dm_cbuf + i * 4) & 0xFFFFFFFF;
+        var za = load32(&dc_zbuf + i * 4) & 0xFFFFFFFF;
+        var zb = load32(&dm_zbuf + i * 4) & 0xFFFFFFFF;
+        if (a != b) { d = d + 1; }
+        if (za != zb) { d = d + 1; }
+        i = i + 1;
+    }
+    return d;
+}
+
+var dm_snap[512];
+fn dm_snapshot(): i64 {
+    var i = 0;
+    while (i < DC_W * DC_H) { store32(&dm_snap + i * 4, load32(&dm_cbuf + i * 4)); i = i + 1; }
+    return 0;
+}
+fn dm_orderdiff(): i64 {
+    dm_order(0); dm_render(DC_W, DC_H, DM_FAR, DM_BG); dm_snapshot();
+    dm_order(1); dm_render(DC_W, DC_H, DM_FAR, DM_BG);
+    var d = 0;
+    var i = 0;
+    while (i < DC_W * DC_H) {
+        if ((load32(&dm_snap + i * 4) & 0xFFFFFFFF) != (load32(&dm_cbuf + i * 4) & 0xFFFFFFFF)) { d = d + 1; }
+        i = i + 1;
+    }
+    return d;
+}
+
+fn dm_gate(name, d, want_red): i64 {
+    ps(name);
+    if (want_red == 0) {
+        if (d == 0) { ps(" PASS"); nl(); return 0; }
+        ps(" FAIL diff="); pn(d); nl(); return 1;
+    }
+    if (d != 0) { ps(" RED (correct -- the gate is connected), diff="); pn(d); nl(); return 0; }
+    ps(" ** GATE NOT CONNECTED: the mutation changed nothing **"); nl(); return 1;
+}
+
+fn main(): i64 {
+    var bad = 0;
+    ps("depthmodel: rung 17 -- the depth shader's HOISTED arithmetic at GPU register widths"); nl(); nl();
+
+    dm_order(0);
+    bad = bad + dm_gate("A1 hoisted model == reference, colour AND z, order 0:", dm_vs_ref(), 0);
+    dm_order(1);
+    bad = bad + dm_gate("A2 hoisted model == reference, colour AND z, order 1:", dm_vs_ref(), 0);
+    bad = bad + dm_gate("A3 the model is order-INDEPENDENT (the rung's oracle):", dm_orderdiff(), 0);
+
+    # A4 -- the depth numerator must fit a 32-bit lane. Reported, because "it fits" is a claim about
+    # the CORPUS as much as the algebra, and a bigger frame would move it.
+    ps("A4 depth numerator peaks at "); pn(dm_peak); ps(" (32-bit lane holds 4294967295): ");
+    if (dm_peak <= 4294967295) { ps("PASS"); nl(); }
+    if (dm_peak > 4294967295) { ps("FAIL"); nl(); bad = bad + 1; }
+
+    # ---- mutations -------------------------------------------------------------------------------
+    dm_order(0);
+    dm_mut_dropc = 1;  bad = bad + dm_gate("M1 hoist constant term KC dropped:", dm_vs_ref(), 1);  dm_mut_dropc = 0;
+    dm_mut_swapk = 1;  bad = bad + dm_gate("M4 KX/KY swapped:", dm_vs_ref(), 1);                   dm_mut_swapk = 0;
+    dm_mut_acc16 = 1;  bad = bad + dm_gate("M3 numerator truncated to 16 bits:", dm_vs_ref(), 1);  dm_mut_acc16 = 0;
+
+    nl();
+    # ---- ⭐⭐ M2: THE ONE THAT MATTERS, AND THE REASON IT DID NOT MATTER AT RUNG 13 ---------------
+    # Quantising z to 16 levels is what a divide that loses its low bits would do. At rung 13 a
+    # one-ULP quotient error was INVISIBLE -- nearest sampling truncated it away, which texgate's
+    # gate 6 measured directly (186 texels moved, against 3151 quotients that actually changed).
+    # ⛔ DEPTH COMPARES THE WHOLE QUOTIENT. A lost low bit turns two distinct z values into a TIE,
+    # and a tie is decided by SUBMISSION ORDER -- so precision loss does not merely perturb a pixel,
+    # it destroys the order-independence property that IS the rung's iron oracle.
+    dm_mut_quant = 1;
+    dm_order(0); dm_render(DC_W, DC_H, DM_FAR, DM_BG);
+    var qties = dm_ties;
+    var qorder = dm_orderdiff();
+    dm_mut_quant = 0;
+    ps("M2a quantising z creates TIES where there were none: ");
+    if (qties > 0) { ps("RED (correct), "); pn(qties); ps(" tie px"); nl(); }
+    if (qties == 0) { ps("** NOT CONNECTED: no ties appeared **"); nl(); bad = bad + 1; }
+    ps("M2b and those ties BREAK order-independence: ");
+    if (qorder > 0) { ps("RED (correct), "); pn(qorder); ps(" px differ between orders"); nl(); }
+    if (qorder == 0) { ps("** NOT CONNECTED: order-independence survived **"); nl(); bad = bad + 1; }
+
+    nl();
+    if (bad == 0) {
+        ps("depthmodel: PASS -- the hoisted, 32-bit-lane model is byte-identical to the reference in"); nl();
+        ps("            colour AND z, is order-independent, and every mutation breaks it."); nl();
+        ps("⭐ M2 IS THE RUNG-17 FINDING: z PRECISION IS LOAD-BEARING FOR ORDER-INDEPENDENCE."); nl();
+        ps("  A lost low bit makes a TIE, and a tie is resolved by SUBMISSION ORDER -- so a divide"); nl();
+        ps("  that is one ULP short does not perturb a pixel, it destroys the rung's ORACLE."); nl();
+        ps("  ⚠ At rung 13 the same error was invisible (nearest truncated it away). The shader's"); nl();
+        ps("  reciprocal therefore needs texgate GATE 7's treatment: compare the WHOLE quotient"); nl();
+        ps("  word against an exact divide, not just the decision it feeds."); nl();
+        return 95;
+    }
+    ps("depthmodel: FAIL -- "); pn(bad); ps(" gate(s) wrong; do NOT write the shader yet."); nl();
+    return 90;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

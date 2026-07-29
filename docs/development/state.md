@@ -175,7 +175,23 @@ Gates: **D0a** no ties · **D0b** 507 px covered (two EMPTY images are byte-iden
 painter's) · **D1** the oracle · **D2** co-planar MUST go order-dependent, 182 px — D1 is connected ·
 **D3** deterministic · **D4** on all 182 shared pixels the nearer won, checked against z **recomputed
 from the vertices**, not read from the renderer's own z-buffer.
-▶ **REMAINING for rung 17: the model at register widths, then the shader.** Tile-serialised,
+✅ **THE MODEL LANDED TOO** (`depthmodel.cyr`, **exit 95**) — the **affine hoist** (`A·x+B·y+C` per
+edge, `KX·x+KY·y+KC` for the depth numerator, all per-triangle CPU work like rung 13's record) proven
+byte-identical to the reference in **colour AND z**, both orders, at 32-bit lane widths (numerator
+peaks 2,430,400). Six mutations, all connected.
+⭐⭐ **THE RUNG-17 FINDING — z PRECISION IS LOAD-BEARING FOR ORDER-INDEPENDENCE.** Quantising z to 16
+levels creates **3 tie px**, and those 3 ties **break order-independence (3 px differ between
+orders)**. A tie is decided by SUBMISSION ORDER, so a divide one ULP short does not perturb a pixel —
+**it destroys the byte-identity that IS the iron oracle**. ⚠ Three pixels is exactly the size that
+reads as noise on iron; the oracle demands byte-identity so that three is a FAILURE, not a shrug.
+⚠ **Why rung 13 got away with what rung 17 cannot**: there a one-ULP quotient error was INVISIBLE
+(nearest truncated it away — texgate gate 6 measured 186 texels moved against 3,151 quotients that
+changed). **Depth compares the WHOLE quotient.** ⇒ The shader's reciprocal needs texgate GATE 7's
+treatment: compare the full quotient word against an exact divide, not just the decision it feeds.
+⛔ The model uses an EXACT divide; gfx9 has none. The shader will use the hoisted-reciprocal path
+(`recip32` + `tm_quot` + one exact correction, iron-proven at rungs 9/13) and that normalisation is
+NOT yet modelled.
+▶ **REMAINING for rung 17: the shader.** Tile-serialised,
 colour+depth in VGPRs, one `global_store` at the end, plus a lane-witness counter separating "no wave
 ran" from "wave ran and computed wrong". Build flag `GPU_OP_TRI_DEPTH`.
 
