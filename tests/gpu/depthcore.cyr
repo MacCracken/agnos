@@ -173,3 +173,49 @@ fn dc_covered(w, h, bg): i64 {
     }
     return c;
 }
+
+# ============================================================================================
+# ⭐ THE SHARED CORPUS — ONE DEFINITION, consumed by BOTH depthgate and depthmodel.
+# ============================================================================================
+# ⛔ IT WAS DUPLICATED IN BOTH FILES UNTIL 2026-07-28, and that is the ATOM_DRY defect class this
+# tree keeps paying for: two artifacts differing in name but not in intent. The failure mode is
+# specific and nasty — the MODEL would be validated against one pair of triangles while the GATE
+# proved order-independence for a different pair, and both would be green. Nothing would report it,
+# because each file is internally consistent.
+# ⚠ These coordinates are load-bearing, not arbitrary: red slopes near->far left-to-right, blue the
+# opposite, so they CROSS in depth. depthgate's D0c asserts both win somewhere — a pair where one
+# wholly occludes the other makes depth indistinguishable from painter's order and proves nothing.
+var DC_BG   = 0xFF101010;
+var DC_FAR  = 1000000;
+var DC_RED  = 0xFFFF0000;
+var DC_BLUE = 0xFF0000FF;
+
+# dc_corpus(swap) — the interpenetrating pair, in submission order `swap`.
+fn dc_corpus(swap): i64 {
+    dc_reset();
+    if (swap == 0) {
+        dc_add(2, 2, 100,  28, 4, 900,  4, 28, 100, DC_RED);
+        dc_add(2, 4, 900,  28, 2, 100,  28, 28, 900, DC_BLUE);
+    }
+    if (swap != 0) {
+        dc_add(2, 4, 900,  28, 2, 100,  28, 28, 900, DC_BLUE);
+        dc_add(2, 2, 100,  28, 4, 900,  4, 28, 100, DC_RED);
+    }
+    return 0;
+}
+
+# dc_corpus_coplanar(swap) — the SAME two shapes at a single constant z, so every overlapping pixel
+# is a TIE. depthgate's D2 uses it to prove order-independence CAN fail; ties are resolved by
+# submission order on any correct implementation, so this pair must differ between the two orders.
+fn dc_corpus_coplanar(swap): i64 {
+    dc_reset();
+    if (swap == 0) {
+        dc_add(2, 2, 500,  28, 4, 500,  4, 28, 500, DC_RED);
+        dc_add(2, 4, 500,  28, 2, 500,  28, 28, 500, DC_BLUE);
+    }
+    if (swap != 0) {
+        dc_add(2, 4, 500,  28, 2, 500,  28, 28, 500, DC_BLUE);
+        dc_add(2, 2, 500,  28, 4, 500,  4, 28, 500, DC_RED);
+    }
+    return 0;
+}

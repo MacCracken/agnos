@@ -191,7 +191,25 @@ treatment: compare the full quotient word against an exact divide, not just the 
 ⛔ The model uses an EXACT divide; gfx9 has none. The shader will use the hoisted-reciprocal path
 (`recip32` + `tm_quot` + one exact correction, iron-proven at rungs 9/13) and that normalisation is
 NOT yet modelled.
-▶ **REMAINING for rung 17: the shader.** Tile-serialised,
+⛔⛔ **THE SHADER IS DESIGNED BUT NOT WRITTEN, AND THE REASON IS A FINDING.**
+[`planning/rung17-tri-depth.md`](planning/rung17-tri-depth.md) — a 4-lens + 3-attacker derivation over
+the shipped tree. **FOUR SEAMS WERE DECIDED TWICE, OPPOSITELY, AND THREE OF THE FOUR WRONG PICKS PASS
+THE RUNG'S OWN ORACLE.** Worst: a **signed** depth compare with the `0xFFFFFFFF` far value op 0x0D
+already burns makes `-1` the NEAREST value ⇒ nothing ever draws ⇒ both orders byte-identical ⇒
+**oracle GREEN on a blank frame.** Pinned: unsigned `v_cmp_lt_u32`, unbinned loop (TD-5 says no
+binning), NO exec guard (8-alignment validator rule instead — a prologue guard forges the S1
+per-lane-dropout signature the witness exists to detect), and REPLACE-not-composite.
+⛔ **MEASURED BY ME (`depthmodel` M2c, in-tree): the order-independence oracle is a NEARLY-BLIND
+detector of divide error.** A one-ULP z error on one triangle moves order-independence by **1 px out
+of 507** while moving the direct reference diff by **217** — ~200x less sensitive, and 1 px is
+exactly the size that reads as noise. ⚠ **This BOUNDS the M2a/M2b claim I recorded earlier**: z
+precision IS load-bearing, and the oracle built on it is NOT sensitive enough to police it.
+⇒ **The divide needs its own gate** — texgate GATE 7's treatment, the whole quotient word against an
+exact divide over the ABI's admissible range. It cannot be deferred to the burn, because **on iron z
+is not readable at all** (kernel-owned TD-3 handle; #90 reads the framebuffer).
+⚠ An agent claimed the stronger result (orderdiff exactly 0 for a dropped correction); that number
+was NOT reproduced here and must be re-measured before being relied on.
+▶ **REMAINING for rung 17, in order: (1) the divide gate, (2) the shader.** Tile-serialised,
 colour+depth in VGPRs, one `global_store` at the end, plus a lane-witness counter separating "no wave
 ran" from "wave ran and computed wrong". Build flag `GPU_OP_TRI_DEPTH`.
 

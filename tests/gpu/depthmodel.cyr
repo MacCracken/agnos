@@ -44,6 +44,7 @@ var DM_MASK32 = 4294967295;
 # ---- mutations: each must break a gate --------------------------------------------------------
 var dm_mut_dropc  = 0;   # M1 drop the hoist's constant term KC
 var dm_mut_quant  = 0;   # M2 quantise z -- simulates a divide that loses low bits
+var dm_mut_ulp    = 0;   # M2c z off by ONE -- the realistic divide error
 var dm_mut_acc16  = 0;   # M3 truncate the accumulator to 16 bits
 var dm_mut_swapk  = 0;   # M4 swap KX/KY
 
@@ -132,6 +133,7 @@ fn dm_render(w, h, zclear, bg): i64 {
                     # M2 -- a divide that loses low bits. See the gate for why this is the one that
                     # matters and why it did NOT matter at rung 13.
                     if (dm_mut_quant != 0) { z = (z >>> DM_QUANT) << DM_QUANT; }
+                    if (dm_mut_ulp != 0) { if (t == 1) { z = z + 1; } }
                     if (z == pz) { dm_ties = dm_ties + 1; }
                     if (z < pz) { pz = z; pc = dc_get(t, 9); }
                 }
@@ -146,28 +148,15 @@ fn dm_render(w, h, zclear, bg): i64 {
     return 0;
 }
 
-# ---- the corpus, identical to depthgate's ------------------------------------------------------
-var DM_BG   = 0xFF101010;
-var DM_FAR  = 1000000;
-var DM_RED  = 0xFFFF0000;
-var DM_BLUE = 0xFF0000FF;
-
-fn dm_order(swap): i64 {
-    dc_reset();
-    if (swap == 0) {
-        dc_add(2, 2, 100,  28, 4, 900,  4, 28, 100, DM_RED);
-        dc_add(2, 4, 900,  28, 2, 100,  28, 28, 900, DM_BLUE);
-    }
-    if (swap != 0) {
-        dc_add(2, 4, 900,  28, 2, 100,  28, 28, 900, DM_BLUE);
-        dc_add(2, 2, 100,  28, 4, 900,  4, 28, 100, DM_RED);
-    }
-    return 0;
-}
+# ---- the corpus ---------------------------------------------------------------------------------
+# ⭐ FROM depthcore.cyr, NOT restated here. It WAS restated here until 2026-07-28, which meant the
+# model could be validated against one pair of triangles while depthgate proved order-independence
+# for another -- both green, neither reporting it. One definition; see dc_corpus's block.
+fn dm_order(swap): i64 { return dc_corpus(swap); }
 
 fn dm_vs_ref(): i64 {
-    dc_render(DC_W, DC_H, DM_FAR, DM_BG);
-    dm_render(DC_W, DC_H, DM_FAR, DM_BG);
+    dc_render(DC_W, DC_H, DC_FAR, DC_BG);
+    dm_render(DC_W, DC_H, DC_FAR, DC_BG);
     var d = 0;
     var i = 0;
     while (i < DC_W * DC_H) {
@@ -189,8 +178,8 @@ fn dm_snapshot(): i64 {
     return 0;
 }
 fn dm_orderdiff(): i64 {
-    dm_order(0); dm_render(DC_W, DC_H, DM_FAR, DM_BG); dm_snapshot();
-    dm_order(1); dm_render(DC_W, DC_H, DM_FAR, DM_BG);
+    dm_order(0); dm_render(DC_W, DC_H, DC_FAR, DC_BG); dm_snapshot();
+    dm_order(1); dm_render(DC_W, DC_H, DC_FAR, DC_BG);
     var d = 0;
     var i = 0;
     while (i < DC_W * DC_H) {
@@ -241,7 +230,7 @@ fn main(): i64 {
     # and a tie is decided by SUBMISSION ORDER -- so precision loss does not merely perturb a pixel,
     # it destroys the order-independence property that IS the rung's iron oracle.
     dm_mut_quant = 1;
-    dm_order(0); dm_render(DC_W, DC_H, DM_FAR, DM_BG);
+    dm_order(0); dm_render(DC_W, DC_H, DC_FAR, DC_BG);
     var qties = dm_ties;
     var qorder = dm_orderdiff();
     dm_mut_quant = 0;
@@ -252,16 +241,45 @@ fn main(): i64 {
     if (qorder > 0) { ps("RED (correct), "); pn(qorder); ps(" px differ between orders"); nl(); }
     if (qorder == 0) { ps("** NOT CONNECTED: order-independence survived **"); nl(); bad = bad + 1; }
 
+    # ---- M2c: IS A **ONE-ULP** ERROR VISIBLE? Measure, do not assume. ---------------------------
+    dm_mut_ulp = 1;
+    dm_order(0); dm_render(DC_W, DC_H, DC_FAR, DC_BG);
+    var uties = dm_ties;
+    var uorder = dm_orderdiff();
+    dm_order(0);
+    var uref = dm_vs_ref();
+    dm_mut_ulp = 0;
+    # ⛔⛔ MEASURED, AND IT REFRAMES M2a/M2b. Quantising z by 16 levels breaks order-independence
+    # loudly (3 px). A **one-ULP** error -- the realistic shape of a divide that is short by one --
+    # moves order-independence by **1 pixel out of 507**, while the DIRECT comparison against the
+    # reference moves by **217**. Two orders of magnitude apart, on the same defect.
+    # ⇒ **ORDER-INDEPENDENCE IS A NEARLY-BLIND DETECTOR OF DIVIDE ERROR.** It is the rung's stated
+    # iron oracle and it is the WRONG instrument for this failure mode: one pixel is exactly the size
+    # that reads as noise, and a slightly different error shape would move zero.
+    # ⚠ This does NOT retract M2a/M2b -- precision really is load-bearing. It bounds them: the
+    # property is load-bearing, and the ORACLE built on it is not sensitive enough to police it.
+    # ⇒ THE DIVIDE NEEDS ITS OWN GATE, comparing the WHOLE quotient word against an exact divide over
+    # the ABI's admissible range -- texgate GATE 7's treatment, for exactly the reason rung 15 needed
+    # it. Order-independence cannot stand in for it, and on iron z is not even readable.
+    ps("M2c ONE-ULP z error on one triangle: ties="); pn(uties);
+    ps("  orderdiff="); pn(uorder); ps("  vs-reference="); pn(uref); nl();
+    ps("    ^ order-independence moves "); pn(uorder); ps(" px; direct z/colour comparison moves ");
+    pn(uref); ps(" -- the ORACLE is ~200x less sensitive than the reference diff."); nl();
+
     nl();
     if (bad == 0) {
         ps("depthmodel: PASS -- the hoisted, 32-bit-lane model is byte-identical to the reference in"); nl();
         ps("            colour AND z, is order-independent, and every mutation breaks it."); nl();
-        ps("⭐ M2 IS THE RUNG-17 FINDING: z PRECISION IS LOAD-BEARING FOR ORDER-INDEPENDENCE."); nl();
-        ps("  A lost low bit makes a TIE, and a tie is resolved by SUBMISSION ORDER -- so a divide"); nl();
-        ps("  that is one ULP short does not perturb a pixel, it destroys the rung's ORACLE."); nl();
-        ps("  ⚠ At rung 13 the same error was invisible (nearest truncated it away). The shader's"); nl();
-        ps("  reciprocal therefore needs texgate GATE 7's treatment: compare the WHOLE quotient"); nl();
-        ps("  word against an exact divide, not just the decision it feeds."); nl();
+        ps("⭐ M2a/M2b: z PRECISION IS LOAD-BEARING -- quantising z creates TIES, and a tie is"); nl();
+        ps("  resolved by SUBMISSION ORDER, so precision loss attacks the ORACLE itself."); nl();
+        ps("⛔ M2c BOUNDS THAT CLAIM, AND IT IS THE MORE USEFUL HALF: a ONE-ULP error moves"); nl();
+        ps("  order-independence by 1 px out of 507 while moving the direct reference diff by 217."); nl();
+        ps("  ⇒ ORDER-INDEPENDENCE IS A NEARLY-BLIND DETECTOR OF DIVIDE ERROR -- one pixel is the"); nl();
+        ps("  size that reads as noise, and a different error shape would move zero. The rung's"); nl();
+        ps("  stated iron oracle is the WRONG instrument for this failure mode."); nl();
+        ps("  ⇒ THE DIVIDE NEEDS ITS OWN GATE (texgate GATE 7's treatment: compare the WHOLE"); nl();
+        ps("  quotient word against an exact divide). On iron z is not readable at all, so this"); nl();
+        ps("  gate cannot be deferred to the burn."); nl();
         return 95;
     }
     ps("depthmodel: FAIL -- "); pn(bad); ps(" gate(s) wrong; do NOT write the shader yet."); nl();
