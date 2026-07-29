@@ -1003,6 +1003,25 @@ if ! grep -qa -- "NEGATIVE CONTROL N" build/rootfs/bin/gputri 2>/dev/null; then
     exit 1
 fi
 echo "  staged /bin/gputri carries --cov, --digest, --bench and the N1-N8 controls"
+
+# ⭐ THE DEPTH ARM, AND ITS Z READBACK SPECIFICALLY. A gputri staged without --depth pairs a NEW
+# kernel with a tool that cannot ask it anything — the silent-stale-tool failure this whole block
+# exists to prevent, and the same shape as the gputex bilinear-arm check above.
+# ⛔ The z readback is checked SEPARATELY and is not a nicety: measured on the host, a divide with
+# its correction dropped moves order-independence by ZERO pixels, and a uniform z bias of any size
+# moves it by zero while corrupting all 507. Colour-only, this burn CANNOT FAIL on a broken divide
+# — which is the only thing the depth rung adds.
+if ! grep -qa -- "RUNG 17 -- depth-tested triangles" build/rootfs/bin/gputri 2>/dev/null; then
+    echo "burn-prep: STAGED /bin/gputri has NO --depth arm -- a new kernel would be paired with a"
+    echo "  tool that cannot exercise it. Rebuild and re-stage."
+    exit 1
+fi
+if ! grep -qa -- "z read back via op 0x10" build/rootfs/bin/gputri 2>/dev/null; then
+    echo "burn-prep: STAGED /bin/gputri --depth does NOT read z back. Order-independence alone is"
+    echo "  measurably blind to a broken divide (0 px), so the burn could not fail on it."
+    exit 1
+fi
+echo "  staged /bin/gputri carries the rung-17 --depth arm AND its z readback via op 0x10"
 # ⛔ RUNG 17: gpudepth must carry its WARM-UP, not merely exist. Its first burn measured its own
 # instrument -- gpu_rt_arm() runs the rung-6 audit on the first call of a boot, and that audit ends in
 # a 64 KB klug_spill() to NVMe, which landed INSIDE the timed loop and outweighed the measurement
