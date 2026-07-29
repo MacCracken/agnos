@@ -127,6 +127,11 @@ check "rung 6's host proof mirrors the kernel's region constants" $rc
 # byte, and every host oracle stayed green — none of them can see across the kernarg boundary. Worse,
 # the resulting frame was DETERMINISTIC and ORDER-INDEPENDENT, so the rung's own oracle passed too.
 # Also gates the loop-carried registers against rung 13's v19 clobber. Both checks mutation-tested.
+# The same kernarg contract for rung 18's kernel, gated BEFORE its first burn rather than after one.
+sh "$ROOT/scripts/check/triper-contract.sh" >/tmp/triper-contract.log 2>&1 && rc=0 || rc=$?
+check "tri_persp.s kernarg contract + loop-carried registers" $rc
+[ $rc -eq 0 ] || cat /tmp/triper-contract.log
+
 sh "$ROOT/scripts/check/tridepth-contract.sh" >/tmp/tridepth-contract.log 2>&1 && rc=0 || rc=$?
 check "tri_depth.s kernarg contract + loop-carried registers" $rc
 [ $rc -eq 0 ] || cat /tmp/tridepth-contract.log

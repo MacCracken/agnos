@@ -1276,10 +1276,14 @@ var GPU_TPER_PREP_STRIDE       = 96;         # bytes per prep record; six s_load
 # K=26 the numerator exceeds 62 bits and by K=30 the reference itself returns negative quotients on
 # 714,000 pixels) and BELOW by the reciprocal precision the w ceiling depends on.
 var GPU_TPER_K_SHIFT           = 16;
-# tri_persp: harvest from the assembled descriptor at the blob bite. The value below is a PREDICTION
-# and must be REPLACED by the harvested one, never confirmed by eye -- edge_cov's hand count was wrong
-# by an SGPR field because no hand count contains the XNACK rule.
-var GPU_COMPUTE_PGM_RSRC1_TPER = 0x002C0187;
+# tri_persp: 32 VGPRs, 56 SGPRs. HARVESTED from the assembled descriptor's .rodata bytes 48/52.
+# ⚠ THE PREDICTION HERE WAS 0x002C0187 AND IT WAS WRONG -- that is rung 17's value at 48 SGPRs, and this
+# kernel declares 56 for its six-dwordx4 record. The granting rule is roundup8(next_free_sgpr + 6) with
+# the +6 being VCC(2) + XNACK(4), which no hand count contains. Under-allocating the SGPR file corrupts
+# the vcc carry chain in the address arithmetic and lanes write the WRONG PIXELS -- a plausible wrong
+# picture, not a fault. ⭐ RSRC2 harvests to 0x00000190, byte-identical to the coverage kernel's, which
+# is what lets gpu_blend_cov_run dispatch this UNMODIFIED.
+var GPU_COMPUTE_PGM_RSRC1_TPER = 0x002C01C7;
 var GPU_TRI_PREP_SUBOFF        = 0xE0000;    # 64 records x 128 B  -> ends 0xE2000
 var GPU_TRI_EDGE_SUBOFF        = 0xE2000;    # synthesised frame edges when DERIVE is set -> ends 0xE3000
 var GPU_TRI_COV_SUBOFF         = 0xE4000;    # 8bpp coverage scratch, 1 MB  -> ends 0x1E4000

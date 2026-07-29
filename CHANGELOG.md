@@ -7,6 +7,51 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 **Rung 18 `persp-correct` — cycle OPEN.** Bumped on cycle open; the user tags on close.
 
+### Added — `kernel/shaders/tri_persp.s`: rung 18's shader, 190 dwords
+
+Assembles clean on gfx90c. Registers verified from the **disassembly**, not the source: highest VGPR
+`v23` against 32 declared, highest SGPR `s55` against 56 — llvm-mc silently accepts an under-declared
+count, so the check has to read what was actually encoded.
+
+⭐ **The descriptor is harvested, and the prediction was wrong.** `gpu_regs.cyr` carried
+`0x002C0187` as a placeholder; the assembled `.rodata` gives **`0x002C01C7`**. That difference is 56
+SGPRs against rung 17's 48, and it is exactly why this tree harvests rather than hand-counts — the
+granting rule is `roundup8(next_free_sgpr + 6)` where the `+6` is VCC(2) + XNACK(4), which no hand
+count contains. Under-allocating the SGPR file corrupts the `vcc` carry chain in the address arithmetic
+and lanes write the **wrong pixels** — a plausible wrong picture, not a fault. `RSRC2` harvests to
+`0x00000190`, byte-identical to the coverage kernel's, which is what lets `gpu_blend_cov_run` dispatch
+this unmodified.
+
+**What is new versus every earlier kernel in the tree:**
+
+- **A 64-bit numerator in a register pair**, built by four-instruction 64×32 products and an explicit
+  carry chain. ⛔ The two halves of each accumulate stay adjacent, because `v_addc_co_u32` consumes
+  `vcc` as carry-in and a break between them corrupts the high word by exactly one — a one-texel seam,
+  not a crash. `perspmodel`'s M1 measures that at 312 pixels.
+- **An exact restoring divide**, 56 iterations, per attribute. No `v_rcp_f32` anywhere: the release row
+  prescribes it and its own risk column admits the cost — *"the CPU reference must use the same
+  approximation"* — which would make the reference a model of the hardware instead of a statement of
+  truth, the shared-premise structure that cost a burn in each of the last two rungs.
+- **The remainder is one lane** because `rem < D` and the validator caps `D` at 2^31−1. ⚠ That ABI bound
+  and this claim are the same fact.
+- **`e2` is derived** as `area − e0 − e1`, safe because only its *sign* is read; `D` and `N` come from
+  their own planes.
+
+⚠ Two constant-bus violations on first assembly: `v_addc_co_u32 v10, vcc, v10, s47, vcc` is rejected
+because the `vcc` carry-in already spends gfx9's single slot. Fixed with a `v_mov` **before** the pair,
+never between it — same class as the mandatory `v_mov` in rung 17's `v_cndmask`.
+
+### Added — `scripts/check/triper-contract.sh`: rung 17's gate, applied BEFORE a burn this time
+
+The kernarg contract (`s4` is the count, `s5` is the pitch) plus the loop-carried-register span check,
+asserted as the two instructions that consume them. **Mutation-tested**: reverting the loop bound to
+`s5` reproduces rung 17's exact defect and the gate goes red.
+
+⭐ That defect assembled cleanly, matched its committed blob byte-for-byte, left every host oracle green
+**and passed the rung's own order-independence oracle** — because a wave-uniform kernarg misread is
+deterministic by construction. It cost a hardware run to find. This shader was written with the lesson
+in its header and passes the gate on its first run; `check.sh` is now **23**.
+
 ### ⛔⛔ Fixed — SIX defects in the rung-18 ABI and prep, one of them a divide by zero
 
 An adversarial review of the prep design (three parallel attackers over the shipped tree) returned nine

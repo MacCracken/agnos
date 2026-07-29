@@ -38,6 +38,8 @@ var pm_mut_nohi    = 0;   # M2 drop the khi*lxq term -- the high half of the 64x
 var pm_mut_n32     = 0;   # M3 truncate N to a single 32-bit lane (what rung 17 could get away with)
 var pm_mut_rem31   = 0;   # M4 mask the divide remainder to 31 bits
 var pm_mut_dwrap   = 0;   # M5 sign-restore D's intermediate, breaking the mod-2^32 residue argument
+var pm_mut_pcarry  = 0;   # M6 drop the carry in the PLANE topology's accumulate
+var pm_topo_bad = 0;      # lanes where the two N topologies disagree
 
 var pm_lane_bad = 0;      # lanes where the modelled 64-bit value != the reference's i64 value
 var pm_max_rem = 0;       # the remainder's true peak -- perspcore CLAIMS it fits 32 bits; measure it
@@ -70,6 +72,30 @@ fn pm_add64(ahi, alo, bhi, blo): i64 {
     if (pm_mut_nocarry != 0) { carry = 0; }
     pm_lo = s & PM_M32;
     pm_hi = ((ahi & PM_M32) + (bhi & PM_M32) + carry) & PM_M32;
+    return 0;
+}
+
+# ==============================================================================================
+# ⭐⭐ THE PLANE TOPOLOGY — what the SHADER actually evaluates, which nothing else here modelled.
+# ==============================================================================================
+# ⛔ THE GAP THIS CLOSES, and it was found by an adversarial review rather than by me. Everything above
+# computes N as THREE 64x32 products summed (`SUM e_i * (W_i * a_i)`). But the 96-byte prep record stores
+# the N PLANE, and the shader evaluates `A_N*lxq + B_N*lyq + C_N` — **two** 64x32 products plus a 64-bit
+# constant, a different carry topology with a different number of accumulate steps.
+# ⇒ prep's own selftest checks the plane coefficients against direct edge functions, but in i64, not at
+# register widths. perspmodel checks register widths, but on the three-term form. Neither covers the
+# thing that ships. This does, and Q1 below diffs the two topologies per lane.
+fn pm_plane_eval(Ahi, Alo, Bhi, Blo, Chi, Clo, lxq, lyq) {
+    pm_mul64x32(Ahi, Alo, lxq);
+    var thi = pm_hi; var tlo = pm_lo;
+    pm_mul64x32(Bhi, Blo, lyq);
+    # ⚠ the accumulate the shader spells as v_add_co_u32 / v_addc_co_u32, carry-in and all
+    var sv = pm_mut_nocarry;
+    if (pm_mut_pcarry != 0) { pm_mut_nocarry = 1; }
+    pm_add64(thi, tlo, pm_hi, pm_lo);
+    thi = pm_hi; tlo = pm_lo;
+    pm_add64(thi, tlo, Chi, Clo);
+    pm_mut_nocarry = sv;
     return 0;
 }
 
@@ -112,6 +138,7 @@ fn pm_render(): i64 {
     pm_lane_bad = 0;
     pm_max_rem = 0;
     pm_carry_fires = 0;
+    pm_topo_bad = 0;
     var i = 0;
     while (i < PC_W * PC_H) {
         store64(&pm_u + i * 8, 0 - 1);
@@ -192,6 +219,37 @@ fn pm_render(): i64 {
                     }
                     if (((bhi << 32) | blo) != Nv_true) { pm_lane_bad = pm_lane_bad + 1; }
 
+                    # ---- ⭐ THE SAME N, VIA THE PLANE the record stores -- the shader's topology.
+                    # Coefficients derived here the way prep derives them; prep's own selftest is what
+                    # proves prep produces these same values, so the chain is two checked links rather
+                    # than one duplicated computation.
+                    var A0 = 0 - (2*pc_get(t,11) - 2*pc_get(t,6));
+                    var B0 = 2*pc_get(t,10) - 2*pc_get(t,5);
+                    var C0 = (2*pc_get(t,11) - 2*pc_get(t,6)) * (2*pc_get(t,5))
+                           - (2*pc_get(t,10) - 2*pc_get(t,5)) * (2*pc_get(t,6));
+                    var A1 = 0 - (2*pc_get(t,1) - 2*pc_get(t,11));
+                    var B1 = 2*pc_get(t,0) - 2*pc_get(t,10);
+                    var C1 = (2*pc_get(t,1) - 2*pc_get(t,11)) * (2*pc_get(t,10))
+                           - (2*pc_get(t,0) - 2*pc_get(t,10)) * (2*pc_get(t,11));
+                    var A2 = 0 - (2*pc_get(t,6) - 2*pc_get(t,1));
+                    var B2 = 2*pc_get(t,5) - 2*pc_get(t,0);
+                    var C2 = (2*pc_get(t,6) - 2*pc_get(t,1)) * (2*pc_get(t,0))
+                           - (2*pc_get(t,5) - 2*pc_get(t,0)) * (2*pc_get(t,1));
+                    var ars = C0 + C1 + C2;
+                    if (ars < 0) {
+                        A0=0-A0; B0=0-B0; C0=0-C0; A1=0-A1; B1=0-B1; C1=0-C1;
+                        A2=0-A2; B2=0-B2; C2=0-C2;
+                    }
+                    var Ku0 = Wa * pc_get(t,3); var Ku1 = Wb * pc_get(t,8); var Ku2 = Wc * pc_get(t,13);
+                    var AN = A0*Ku0 + A1*Ku1 + A2*Ku2;
+                    var BN = B0*Ku0 + B1*Ku1 + B2*Ku2;
+                    var CN = C0*Ku0 + C1*Ku1 + C2*Ku2;
+                    pm_plane_eval((AN >>> 32) & PM_M32, AN & PM_M32,
+                                  (BN >>> 32) & PM_M32, BN & PM_M32,
+                                  (CN >>> 32) & PM_M32, CN & PM_M32, lxq, lyq);
+                    if (pm_hi != Nu_hi) { pm_topo_bad = pm_topo_bad + 1; }
+                    if (pm_lo != Nu_lo) { pm_topo_bad = pm_topo_bad + 1; }
+
                     var qu = pm_div(Nu_hi, Nu_lo, D, 56);
                     var qv = pm_div(bhi, blo, D, 56);
                     store64(&pm_u + (py * PC_W + px) * 8, qu);
@@ -271,6 +329,11 @@ fn main(): i64 {
     }
 
     # ⛔ and the carry must actually PROPAGATE on this corpus, or M1 below is untestable.
+    ps("A7 the PLANE topology (2 products + a 64-bit constant, what the SHADER evaluates) agrees"); nl();
+    ps("   with the three-term form at register widths: ");
+    if (pm_topo_bad == 0) { ps("PASS"); nl(); }
+    if (pm_topo_bad != 0) { ps("FAIL, "); pn(pm_topo_bad); ps(" lanes"); nl(); bad = bad + 1; }
+
     ps("A6 the 64-bit carry actually fires ("); pn(pm_carry_fires);
     ps(" times) -- otherwise M1 proves nothing: ");
     if (pm_carry_fires > 0) { ps("PASS"); nl(); }
@@ -294,13 +357,14 @@ fn main(): i64 {
     # green. Rung 17's shipped corpus was blind to a one-ULP divide error for exactly this reason, and
     # it cost a burn to find out. Here the cost is a loop.
     var mi = 0;
-    while (mi < 5) {
-        pm_mut_nocarry = 0; pm_mut_nohi = 0; pm_mut_n32 = 0; pm_mut_rem31 = 0; pm_mut_dwrap = 0;
+    while (mi < 6) {
+        pm_mut_nocarry = 0; pm_mut_nohi = 0; pm_mut_n32 = 0; pm_mut_rem31 = 0; pm_mut_dwrap = 0; pm_mut_pcarry = 0;
         if (mi == 0) { pm_mut_nocarry = 1; }
         if (mi == 1) { pm_mut_nohi = 1; }
         if (mi == 2) { pm_mut_n32 = 1; }
         if (mi == 3) { pm_mut_rem31 = 1; }
         if (mi == 4) { pm_mut_dwrap = 1; }
+        if (mi == 5) { pm_mut_pcarry = 1; }
         var connected = 0;
         var worstframe = 0 - 1;
         var fi = 0;
@@ -311,6 +375,10 @@ fn main(): i64 {
             if (fi == 3) { pc_corpus_constattr(); }
             if (fi == 4) { pc_corpus_maxd(); }
             var d = pm_vs_ref();
+            # ⚠ M6 breaks a topology CROSS-CHECK, not the rendered output, so its signal is
+            # pm_topo_bad rather than a pixel diff. A mutation whose damage the comparison cannot see
+            # would report "not connected" and be silently discarded.
+            if (pm_mut_pcarry != 0) { d = pm_topo_bad; }
             if (d != 0) { if (connected == 0) { connected = d; worstframe = fi; } }
             fi = fi + 1;
         }
@@ -319,6 +387,7 @@ fn main(): i64 {
         if (mi == 2) { ps("M3 N truncated to ONE 32-bit lane:                  "); }
         if (mi == 3) { ps("M4 remainder masked to 31 bits:                     "); }
         if (mi == 4) { ps("M5 D's intermediate sign-restored (residue broken): "); }
+        if (mi == 5) { ps("M6 carry dropped in the PLANE topology's accumulate:  "); }
         if (connected != 0) {
             ps("RED on frame "); pn(worstframe);
             ps(", diff="); pn(connected); nl();
