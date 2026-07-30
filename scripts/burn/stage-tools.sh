@@ -23,12 +23,35 @@ mkdir -p "$DEST_DIR"
 BUILD=0
 [ "${1:-}" = "--build" ] && BUILD=1
 
+# Every destination name staged so far, space-delimited — the duplicate guard in
+# stage_one reads it. See the guard for why this exists.
+STAGED_NAMES=""
+
 # Tool table: <repo> <src-entry> <name>. `name` matches the tool's cyrius.cyml
 # [build] output; the agnos binary is staged at <repo>/build/<name>_agnos. Add a
 # row here as each tool gains an agnos build. (mihi is a LIBRARY — no standalone
 # binary; it is compiled INTO iam. chakshu/shu still pending an agnos build.)
+#
+# ⚠ The third field is the ROOTFS name and it must be UNIQUE across the whole
+# table. It is NOT the source filename: three different repos build a
+# `programs/gpumm.cyr` and they stage as three different binaries (gpumm /
+# gputern / gpuattn), because what the operator types is `run /bin/<name>`.
 stage_one() {
     repo="$1"; src="$2"; name="$3"
+    # Two rows claiming the same /bin/<name> is a SILENT overwrite: both print
+    # "staged:", both look green, and the image quietly holds whichever ran last.
+    # That is how tentib's crown proof displaced the standalone gpumm probe from
+    # the day the crown landed (2026-07-23) until this fix — filed as gpu.md
+    # §finding 7 on 2026-07-28, fixed 1.56.32. The seam proof was simply not on
+    # disk, so any "the seam still works" burn would have measured the wrong
+    # binary. Fail on the SECOND row, before it can copy over the first.
+    case " $STAGED_NAMES " in
+        *" $name "*)
+            echo "ERROR: '$name' is already staged — two rows claim $DEST_DIR/$name."
+            echo "       The rootfs name (3rd field) must be unique; rename one row."
+            return 1 ;;
+    esac
+    STAGED_NAMES="$STAGED_NAMES $name"
     rdir="$SIBLINGS/$repo"
     [ -d "$rdir" ] || { echo "ERROR: $repo not found at $rdir (set SIBLINGS_ROOT)"; return 1; }
     bin="$rdir/build/${name}_agnos"
@@ -195,13 +218,21 @@ stage_one agnos/tests/gpu gpudepth.cyr gpudepth || rc=1
 # 0 GPU tiles (QEMU/host — tiling proven, no GPU); 90 = byte mismatch. Real AMD iron only.
 stage_one rupantara programs/gpulayer.cyr gpulayer || rc=1
 
-# tentib gpumm — the SECOND ML-layer-on-GPU crown (1.54.x C6, INTEGER path). A real ternary BitLinear
+# tentib gputern — the SECOND ML-layer-on-GPU crown (1.54.x C6, INTEGER path). A real ternary BitLinear
 # projection `ternary_matmul_free(qx,sx,Wq,γ,0,y,8,16,32)` run on the gfx90c shader cores via #82, tiled 8x8
 # (K=16 = two k-tiles → exercises cross-tile i64 accumulation), signed (negative qx + ternary Wq), byte-
 # compared against tentib's CPU ternary_matmul_free. Exit 95 = byte-identical AND all 8 tiles on the GPU
 # (crown; bit-exact at ANY K — the integer advantage over the f64 #83 path); 96 = identical, 0 GPU tiles
 # (host/QEMU); 90 = mismatch. Real AMD iron only.
-stage_one tentib programs/gpumm.cyr gpumm || rc=1
+#
+# ⛔ STAGED AS `gputern`, NOT `gpumm` — renamed 1.56.32. tentib's source file is
+# `programs/gpumm.cyr`, and this row used to carry that name straight through to the rootfs, where
+# it collided with the standalone `gpumm` repo's probe two rows up (:97). This row runs LAST, so it
+# won the copy and `/bin/gpumm` was tentib's 154,384 B crown while the 36,816 B seam probe never
+# reached the image at all — both rows printing a green "staged:" line the whole time. The source
+# FILENAME is incidental: attn11 builds a `programs/gpumm.cyr` too and has always staged it as
+# `gpuattn`. Named for what it proves — the TERNARY integer path — matching gpulayer / gpuattn.
+stage_one tentib programs/gpumm.cyr gputern || rc=1
 
 # attn11 gpuattn — the THIRD ML-layer-on-GPU crown (1.54.x C6). attn11's OWN forward-projection hook
 # `qlinear_fwd` (src/ops.cyr), wired to route a bias-free K≤8 projection to rupantara's linear_fwd_gpu (#83)

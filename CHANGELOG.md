@@ -5,7 +5,93 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.56.32] - 2026-07-30
 
+### ⛔⛔ IRON BURN 1 (2026-07-30) — THE CONSUMER SHIPPED **AND** FOUND A KERNEL BUG NO INSTRUMENT COULD
+
+`cyrius-mine-cart` drew a real perspective-correct 3D scene on gfx90c on its first flash, and in the
+same frame exposed a latent kernel defect that eight rungs of proof binaries could not express.
+
+**Confirmed:** `--check` on iron returned numbers **byte-identical to the host** (300 frames, 66/66
+triangles, 0 pixel-losing drops, peak `|D|` 260,066,240, coverage 15,660/16,000, mutation caught).
+`gputri --persp` held at 0 of 1541. The ride: 900 frames, 0 dropped, peak `|D|` 259,600,320.
+
+**The defect — an op-to-op prep-arena race.** `gpu_tri_persp` builds its prep table at
+`gpu_arena_phys + GPU_TPER_PREP_SUBOFF`, **one fixed slot for every record**, then dispatches and
+returns; `gpo_execute_all` holds `gpu_batch_active` across the whole `#92` array, so
+`gpu_blend_cov_run` queues and returns **without a fence**. mine-cart's frame is two op `0x0F`
+records in one dispatch ⇒ record 1's prep build overwrites record 0's before the GPU reads it, and
+**both waves rasterise record 1's geometry**. Record 0 drew the walls with the floor texture; record
+1 drew them again with rock. Floor and ceiling never rendered; the walls appeared twice.
+
+⭐ **The kernel had already fixed this bug for op `0x0C`**, and `gpu_tex_list`'s comment describes the
+photograph in advance: *"a two-op array does not draw two lists; it draws the SECOND list twice, in
+the first list's grid"* … *"latent only for as long as nobody draws the thing the rung was built
+for."* Op `0x0F` shipped without the fix because rung 18's instrument dispatched exactly **one**
+record. mine-cart is the first caller in the project's history that could express the failure.
+
+### Fixed
+
+- **`gpu_tri_persp` (op `0x0F`) suspends `gpu_batch_active` around its dispatch**, matching `0x0C`
+  and `0x0A` verbatim, so the prep slot is free the moment the call returns.
+- ⭐ **`gpu_tri_depth` (op `0x0E`) carried the identical latent defect** at `GPU_TRID_PREP_SUBOFF` and
+  is fixed in the same change — **unobserved and deliberately so.** No caller has yet sent two `0x0E`
+  records, so it has never drawn a wrong frame; leaving it would sell the next consumer the same burn.
+
+⚠ Both are the narrow fix. The real answer is a per-op prep region or a ring-side fence, and neither
+is a same-cycle bug fix's job. Fixed **in-cycle** rather than as a new cut, following rung 15's
+precedent (found on iron, fixed and re-burned inside its own version).
+
+### ⛔ Why every host gate passed — and the instrument that was missing
+
+**No record-level check could have caught this.** Every record was ABI-perfect, the geometry correct,
+the emitter correct. The defect lives in the kernel's arena reuse *between* records. The gate proved
+the frame was LEGAL and NOT EMPTY and never asked what it LOOKED LIKE.
+
+Every rung of the kernel's own ladder shipped with a CPU reference and byte-compared against it
+(`perspcore`, `depthcore`, `texcore`). The consumer shipped without one. Added:
+
+- `src/refcore.cyr` — CPU rasteriser using the kernel's own arithmetic (doubled pixel centres,
+  `W = 2^16/w`, `D = Σe·W`, `u = N/D`), shared by the host tool and the on-iron verifier.
+- **`mine-cart --verify`** — renders one frame on the GPU *and* the CPU **on iron** and byte-compares,
+  reporting differing-pixel count and the first differing coordinate. What `gputri` does for the
+  kernel's rungs, the consumer now does for itself.
+- `tools/refrender.cyr` / `tools/dumptex.cyr` — the expected frame as a viewable image, and a texture
+  dump that settled "is it the texture?" in one host run **before** any theorising. It was not: tex_a
+  mean RGB (82,70,59), tex_b (88,82,76), alpha 255 throughout. The pink cast in the burn photo is a
+  glossy panel reflecting a lit room, auto-exposed — a reminder that a photograph is an instrument
+  with no oracle.
+
+
 **Rung 19 `pilot` — the CONSUMER CLOSE. Cycle OPEN.** Bumped on cycle open; the user tags on close.
+
+### Fixed — `/bin/gpumm` was two different binaries, and the one on disk was the wrong one
+
+`scripts/burn/stage-tools.sh` staged the standalone **gpumm** repo's seam probe *and*
+`tentib/programs/gpumm.cyr` under the same rootfs name. tentib's row runs later, so it won the
+copy: `/bin/gpumm` was tentib's **154,384 B** ternary crown, and the **36,816 B** `#82`/`#83` seam
+probe never reached the image at all. Both rows printed a green `staged:` line the entire time.
+
+The cost was not the missing binary — it was that `run /bin/gpumm` on iron silently measured
+something other than what it names. The standalone probe is the *reference consumer* of the compute
+seam, so any future "the seam still works" burn would have proven nothing about the seam. Filed as
+`docs/development/planning/gpu.md` finding 7 on 2026-07-28; present since the crown landed
+2026-07-23.
+
+- **`/bin/gpumm` keeps the standalone probe** — the repo's own name, and the seam's reference
+  consumer. **tentib's crown proof is now `/bin/gputern`**, named for the ternary integer path it
+  proves, alongside `gpulayer` (rupantara) and `gpuattn` (attn11). The source *filename* was always
+  incidental here: attn11 builds a `programs/gpumm.cyr` too and has always staged as `gpuattn`.
+- **`stage_one` gained a duplicate-rootfs-name guard.** A second row claiming an
+  already-staged name now fails loudly *before* it can copy over the first, instead of silently
+  overwriting it. Proven to fire and to block the copy.
+- ⚠ **Operators: `run /bin/gputern`, not `run /bin/gpumm`, for the tentib crown.** Anything in the
+  1.54.x–1.56.31 record that says `/bin/gpumm` for tentib means what is now `/bin/gputern`; the
+  historical entries are left as they were written.
+
+Verified: one staging run now emits `gpumm` **36,816 B** and `gputern` **154,384 B** as separate
+files, exit 0. Same defect class as the two already fixed in this script — `agnos/audio-test`
+(1.56.27, made staging exit 1 unconditionally) and `gpuprof` never being staged at all (1.56.4):
+**staging reports success while the image holds something other than what the operator thinks.**
+Docs updated: `roadmap.md`, `state.md`, `planning/gpu.md` (row 6 + finding 7 closed out).
 
 ### ⭐⭐ The kernel's 3D ops finally have an application
 
@@ -32,10 +118,48 @@ like — if the kernel had needed changing, the ABI was not finished in 1.56.31.
   burn in this arc whose primary oracle is a person looking at the screen**, which is why it is a shell
   command and never a boot selftest.
 
-⚠ **Deviation from the plan row as written**, stated plainly: the game presents **fullscreen via `#39`**,
-not as a setu window via `#84`. Op `0x0F` draws into the kernel's shared blit back buffer, so a windowed
-client and the compositor would contend for the same surface. That seam needs resolving and is not free;
-fullscreen is the honest first consumer.
+### ⭐ Fullscreen is the CORRECT target, and the reason is narrower than "no desktop yet"
+
+The plan row said "in a setu window via `#84`"; the game presents **fullscreen via `#39`**. That is not a
+shortfall to repay — it is the only correct target today — and the loose explanation ("the desktop isn't
+up") is **false and would rot**: aethersafha runs on agnos, grants windows, and already composites client
+surfaces on the GPU. Software clients get windows because they rasterise into their own buffer, and
+`setu_buf_create` asks the kernel for that buffer as a **`#86` carveout slot**, so the client→compositor
+transport is *already* GPU-visible memory. Transport is not the problem.
+
+⛔ **The boundary is one line, repeated in every worker: no GPU op that writes colour lets the caller name
+where the colour goes.** `gpu_tri_persp` derives its destination from two module globals
+(`gpu.cyr:1543-1545`: `var tgt = gpu_bb_a_mc; if (gpu_bb_back != 0) { tgt = gpu_bb_b_mc; }`), and the
+record ABI has no field to override it — `gpo_field_mask(0x0F)` is **`0x00FF`**, dwords 0–7 only
+(`syscall.cyr:1472`), and `gpo_validate`'s reserved sweep rejects anything outside the mask. The same
+holds for every colour-writing op: `0x01`, `0x02`/`0x03`, `0x04`, `0x09`, `0x0A`/`0x0C`, `0x0B`, `0x0E`'s
+colour half, `0x0F`. **No userland change can redirect that write.**
+
+⇒ A GPU draw therefore lands in the *same* shared back buffer the compositor stages into between its
+deferred `#39` and its `#84` flip, and `#92` carries no process identity, capability, or serialisation
+gate to arbitrate. **A GPU-rendering client today can own the whole frame or corrupt someone else's.**
+
+⭐ **The mechanism to fix it is already shipped and iron-proven — for depth.** `gpu_tri_depth` writes Z to
+a **ring-3-named handle** (`gpu_rt_handle_mc`, gated on the rung-6 arena audit that passed on iron at
+1.56.30) while writing colour to the back buffer, *in the same dispatch*, using a pre-offset idiom so the
+shader indexes draw-local and never sees the destination. Shaders already take `dst_mc`/`dst_pitch` as
+ordinary kernargs, so pointing colour at a handle or a `#86` slot needs **no shader, ring, packet-class
+or record-stride change**. Colour simply never got the field depth has.
+
+⚠ **The real cost is field placement, not plumbing, and it is worth recording before someone assumes it is
+free.** The ABI's stated doctrine is that a field meaning the same thing lives at the same dword across
+ops (`syscall.cyr:1455`, `:1469-1471`). But op `0x09`'s mask is **`0xFFFB` — every dword except the
+reserved one** — so under a strict reading there is **no unclaimed dword**: dword 9 is `color0` on `0x02`
+(`0x023B`) and `0x04` (`0x0633`), and dword 10 is `color1` on `0x04`. A destination field must either
+break that doctrine knowingly or arrive as a **fresh op code** (`0x11`–`0x1F` are free inside the existing
+u32 support mask and self-advertise through `#89`). Tracked as a follow-on row in `gpu.md`, not scheduled
+against 1.56.33–35.
+
+*(Boundary established by a parallel source audit with an adversarial refutation pass; the refuter
+confirmed the kernel-blocked claim from source and corrected three points, including the field placement
+above and an over-broad first draft that said "a windowed GPU client is kernel-blocked" — it is not.
+`mine-cart` already does `#92` → `#90` → `#73` into its own buffer. What is blocked is a **non-contending**
+caller-named colour destination.)*
 
 ### How a frame reaches the panel
 

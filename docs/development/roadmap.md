@@ -185,7 +185,8 @@ cores~~ — it has now, three times, all `run: exit 95` on archaemenid:
   both `#83` (unfused `v_mul_f64`+`v_add_f64`) and cyrius's `EMIT_F64V_FMADD` (SSE2 `mulpd+addpd`, no f64
   hardware FMA) round identically, and K=8 is a single k-tile. `/bin/gpulayer`.
 - **tentib 1.0.1** — ternary integer matmul via `#82`, **bit-exact at ANY K** (integer accumulate is
-  associative — proven K=16 cross-tile), and the first negative-integer proof of `#82`. `/bin/gpumm`.
+  associative — proven K=16 cross-tile), and the first negative-integer proof of `#82`. `/bin/gputern`
+  (staged as `/bin/gpumm` through 1.56.31, where it collided with the standalone gpumm probe).
 - **attn11 1.14.1** — the parent transformer's own `qlinear_fwd` hook routed to `#83`. `/bin/gpuattn`.
 
 This retires the "GPU capability with no caller" anti-pattern the row was written to track.

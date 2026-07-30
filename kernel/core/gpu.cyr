@@ -1554,10 +1554,32 @@ fn gpu_tri_persp(rec, vkva) {
 
     # ⚠ ONE WORKGROUP PER TILE, grid in WORKGROUPS. One workgroup is exactly one 64-lane wave over an
     # 8x8 tile, and that identity is load-bearing: at 16x16 the single-wave claim collapses.
-    return gpu_blend_cov_run(gpu_arena_mc + GPU_TPER_SHADER_SUBOFF, pbase_mc, dst_mc,
+    #
+    # ⛔⛔ SUSPEND BATCHING AROUND THE DISPATCH — THE OP-TO-OP PREP RACE, FIXED 1.56.33 AFTER IT DREW
+    # THE WRONG PICTURE ON IRON (1.56.32 burn 1, fixed in-cycle). GPU_TPER_PREP_SUBOFF is ONE fixed prep slot, and gpo_execute_all
+    # holds gpu_batch_active across the WHOLE #92 array, which makes gpu_blend_cov_run queue dwords
+    # and return without a tail, a fence or a wait. So the next op 0x0F's gpu_tper_prep_build
+    # overwrites the table this dispatch has not read yet:
+    #     a two-op array does not draw two triangle lists — it draws the SECOND list TWICE,
+    #     once in the first list's grid and with the FIRST list's texture.
+    # ⭐ This is verbatim the failure gpu_tex_list documents for op 0x0C at GPU_TEXL_PREP_SUBOFF, and
+    # it was fixed there and in gpu_tri_list while op 0x0F shipped without it — because rung 18's
+    # instrument (gputri --persp) only ever dispatched ONE record, so no caller could express it.
+    # cyrius-mine-cart 0.1.0 is the first, and its very first iron frame showed it: the floor and
+    # ceiling record silently drew the WALL geometry, leaving those regions unwritten and the walls
+    # painted twice. ⚠ NO host gate could have caught this — every record was ABI-perfect and the
+    # geometry was correct. It is a kernel arena race, visible only against a reference IMAGE.
+    # Suspending makes this dispatch emit its own tail and WAIT, so the prep slot is free the moment
+    # the call returns. It gives back the batching win for this op only; the real fix is a per-op
+    # prep region or a ring-side fence, and neither is this change's job.
+    var saved_batch = gpu_batch_active;
+    gpu_batch_active = 0;
+    var rc = gpu_blend_cov_run(gpu_arena_mc + GPU_TPER_SHADER_SUBOFF, pbase_mc, dst_mc,
     nt, gpu_bb_pitch, w, h, GPU_COMPUTE_PGM_RSRC1_TPER, tiles_x, tiles_y,
     gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
     gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+    gpu_batch_active = saved_batch;
+    return rc;
 }
 
 var gpu_trid_armed = 0;
@@ -1624,10 +1646,22 @@ fn gpu_tri_depth(rec, vkva) {
     # ⚠ ONE WORKGROUP PER TILE, and the grid is in WORKGROUPS: gx = w>>3, gy = h>>3. One workgroup is
     # exactly one 64-lane wave covering an 8x8 tile — that identity is load-bearing for the whole
     # serialisation claim, and at 16x16 it collapses outright.
-    return gpu_blend_cov_run(gpu_arena_mc + GPU_TRID_SHADER_SUBOFF, pbase_mc, dst_mc,
+    #
+    # ⛔ SUSPEND BATCHING AROUND THE DISPATCH — the same op-to-op prep race fixed in gpu_tri_persp
+    # above, and it is present here for exactly the same reason: GPU_TRID_PREP_SUBOFF is ONE fixed
+    # slot, gpo_execute_all holds gpu_batch_active across the whole #92 array, and gpu_blend_cov_run
+    # therefore returns without a fence. Two op 0x0E records in one array would draw the second
+    # list twice. ⚠ FIXED HERE UNOBSERVED, deliberately: no caller has yet dispatched two 0x0E
+    # records (gputri --depth sends one), so unlike op 0x0F this has never drawn a wrong frame — but
+    # the mechanism is identical and leaving it would mean the next consumer pays the same burn.
+    var saved_batch = gpu_batch_active;
+    gpu_batch_active = 0;
+    var rc = gpu_blend_cov_run(gpu_arena_mc + GPU_TRID_SHADER_SUBOFF, pbase_mc, dst_mc,
     nt, gpu_bb_pitch, w, h, GPU_COMPUTE_PGM_RSRC1_TDEP, tiles_x, tiles_y,
     gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
     gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+    gpu_batch_active = saved_batch;
+    return rc;
 }
 
 fn gpu_rt_read(zh, dst_id, w, h, zw) {
