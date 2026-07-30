@@ -210,6 +210,16 @@ stage_one tentib programs/gpumm.cyr gpumm || rc=1
 # 96 = identical, 0 GPU tiles (host/QEMU); 90/91 = mismatch (direct/hook). Real AMD iron only.
 stage_one attn11 programs/gpumm.cyr gpuattn || rc=1
 
+# ⭐⭐ mine-cart — 1.56.32, THE CONSUMER CLOSE. Not an instrument: an APPLICATION. A ride through a
+# curving mine tunnel, textured and perspective-correct, drawn entirely by #92 op 0x0F — the first
+# thing outside the kernel's own test tree to draw with the 3D ops, and the reason the rung ladder
+# was built. `run /bin/mine-cart` rides it; `run /bin/mine-cart --check` runs the same host gate the
+# build already passed, on agnos, and needs no GPU (exit 95 = pass).
+# ⛔ Its records are gated on the HOST before any flash: a single bad vertex makes #92 reject the
+# WHOLE batch and the frame comes back as whatever was in the slot, which on iron is indistinguishable
+# from "no GPU". `cyrius build src/main.cyr build/mine-cart && ./build/mine-cart --check` first.
+stage_one cyrius-mine-cart src/main.cyr mine-cart || rc=1
+
 # kriya dispatches on basename(argv[0]), so each delegated verb needs a
 # /bin/<verb> NAME resolving to the kriya binary. Create them as RELATIVE
 # symlinks (-> kriya) in the rootfs: install-media.sh's `cp -a` preserves them

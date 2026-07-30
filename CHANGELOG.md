@@ -3,6 +3,84 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.32] - 2026-07-30
+
+**Rung 19 `pilot` — the CONSUMER CLOSE. Cycle OPEN.** Bumped on cycle open; the user tags on close.
+
+### ⭐⭐ The kernel's 3D ops finally have an application
+
+[`cyrius-mine-cart`](https://github.com/MacCracken/cyrius-mine-cart) **0.1.0** — a ride through a
+curving mine tunnel, textured and perspective-correct, drawn entirely by `#92` op `0x0F`. It is the
+first thing outside this repo's own test tree to use the 3D ops at all.
+
+**This cut pays the rung-closure debt.** The 3D section's rule 2 says the kernel is never more than one
+rung ahead of a shipped consumer. **All nine 3D ops — `0x08` through `0x10` — had shipped
+with no consumer**, each rung closing on an instrument that rasterises a corpus and byte-diffs it against
+a reference, which rule 1 explicitly forbids as a closure condition. Instruments are the right way to *build* a rasteriser and the
+wrong way to know you have one, and the gap had grown long enough that the rule was written but not
+observed. It is observed now.
+
+**No kernel code changed in this cut.** The consumer is a sibling repo; the kernel's contribution is the
+staging row and the burn rubric. That is what "closes on a shipped consumer release" is supposed to look
+like — if the kernel had needed changing, the ABI was not finished in 1.56.31.
+
+### Added
+
+- `scripts/burn/stage-tools.sh` — stages `cyrius-mine-cart` as `/bin/mine-cart`. Not an instrument; an
+  application. `run /bin/mine-cart --check` runs its host gate on iron and needs no GPU.
+- `docs/development/iron-nuc-zen-log.md` — `tracker-15632-mine-cart`, pre-registered. ⭐ **The first GPU
+  burn in this arc whose primary oracle is a person looking at the screen**, which is why it is a shell
+  command and never a boot selftest.
+
+⚠ **Deviation from the plan row as written**, stated plainly: the game presents **fullscreen via `#39`**,
+not as a setu window via `#84`. Op `0x0F` draws into the kernel's shared blit back buffer, so a windowed
+client and the compositor would contend for the same surface. That seam needs resolving and is not free;
+fullscreen is the honest first consumer.
+
+### How a frame reaches the panel
+
+`#86` carveout slots (2 vertex, 2 texture, 1 readback — 1.16 MB) → `#72` upload → **one `#92` dispatch
+carrying two op `0x0F` records** → `#90` readback out of the blit back buffer → `#73` copy out → `#39`
+blit. 640×400, 66 triangles a frame, two 128×128 procedural textures, eight tunnel segments drawn
+far-to-near — op `0x0F` replaces rather than composites and a tunnel is convex from the inside, so
+painter's order *is* the depth test and no z-buffer is needed.
+
+### Validated before the flash
+
+- **Host gate**, 300 scripted frames, every record re-parsed **from its packed 64-byte bytes** against
+  the kernel's own rules rather than from the emitter's inputs: 66 of 66 triangles emitted on every ride
+  frame, **0** pixel-losing drops, peak `|D|` **260,066,240** of a permitted 2,147,483,647 (8× margin),
+  worst ride frame filling **15,660 of 16,000** coverage samples with the background quad excluded.
+- **Two assertions that are not ABI rules** — a coverage sweep (legal-and-empty is the one failure a burn
+  cannot tell from a refused batch), and a mutation that sets one fraction bit in an accepted record and
+  requires the gate to catch it and name it `GPO_E_SUBPIXEL`. A gate that cannot fail has not passed.
+- **Byte-identical gate output from the `--agnos` binary under mirshi**, and the 1.24 MB ELF loads and
+  runs in ring 3 on the real kernel under QEMU. The GPU path itself stays iron-only: `#86` slots come
+  from the GPU carveout, which QEMU has no GPU to provide.
+
+### Two gate defects found and fixed before they could mislead
+
+Both were found by reading the gate's own numbers, not by it failing — which is the argument for a gate
+that reports figures instead of a verdict.
+
+- **The coverage check could not fail.** It summed two overlapping lists (reporting 19,440 of 16,000
+  possible samples — a count larger than its own denominator passes any threshold), *and* it counted the
+  full-screen background quad, so "does the frame fill the screen" would have answered yes for a frame in
+  which every tunnel triangle had collapsed. Now a union, background excluded.
+- **The drop counters were per-frame, read once.** `mc_build` resets them, so the summary reported the
+  last frame's drops as if cumulative — it said "0 dropped" while 26 triangles had gone missing across
+  the run. Now accumulated, and split by kind: a `w`-band or coordinate drop loses real pixels and is
+  held to zero, while an area drop can only fire at `cross == 0` exactly, where the triangle is precisely
+  collinear and covers no pixel in any rasteriser.
+
+### Also corrected: the frustum was using half the available depth
+
+`w` must lie in `[256, 4096]` and is proportional to depth, so `z_far / z_near` can never exceed **16:1**
+— a larger scale pulls the near plane closer *and* the far plane in by the same factor. The first cut ran
+8:1, and the visible cost was specific: everything nearer than the near plane is not drawn, which is
+exactly the geometry that should sweep out to the sides and fill the screen when the cart passes close to
+a wall. Worst-frame coverage went from 41% to 98%.
+
 ## [1.56.31] - 2026-07-29
 
 **Rung 18 `persp-correct` — cycle OPEN.** Bumped on cycle open; the user tags on close.
