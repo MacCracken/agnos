@@ -5,6 +5,44 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.56.32] - 2026-07-30
 
+### ✅✅ RUNG 19 CLOSED ON IRON 2026-07-30 — `DIFFER: 0 of 256000 px` (`cart2.txt`)
+
+**The kernel's 3D ops have a real consumer, and it closed on a BYTE COMPARE, not a photograph.**
+`mine-cart --verify` renders one frame through `#92` op `0x0F` on gfx90c and through a CPU reference
+in the same process, and every one of 256,000 pixels agrees — with `untouched 0`, so the GPU wrote
+the whole frame and the poison could not pass as green. The ride: **600 frames PRESENTED**, 0 dropped,
+peak `|D|` 259,600,320, run twice identically. The panel shows the tunnel the host reference predicts.
+
+**Two burns.** The first drew the wrong picture. Between them, **three ABI facts no instrument in
+eight rungs could express**, each invisible to record-level validation:
+
+1. **`op 0x0F` records CANNOT be layered** — it replaces its whole rect (`tri_persp.s` writes `bg`
+   where nothing covered, then stores unconditionally), so a second record blacks out the first.
+   mine-cart shipped as two records. Found by making the CPU reference faithful and **reproducing the
+   iron frame on the host** — the strongest evidence in the arc, and it cost no burn.
+2. **`#39 blit` targets the SAME back buffer `op 0x0F` draws into** (`gpu_blit_target`), so a
+   draw → `#90` → `#73` → `#39` round trip leaves the un-offset original visible as an L-band. That
+   was the "duplicated area" in the first frame.
+3. ⛔ **`#92` carries TWO `dstxy` conventions** — `0x0A` is rect-LOCAL, `0x0E`/`0x0F` are
+   FRAMEBUFFER-ABSOLUTE (the prep folds `dstxy` into every plane constant, so the shader evaluates at
+   the screen sample point). Undocumented, and the absolute side had **never been exercised** because
+   `gputri` passes `dstxy = 0` on both records. Caught by an adversarial audit **after** the change set
+   was declared burn-ready; modelled at 251,227 of 256,000 px wrong. It would have reproduced the exact
+   wrong-picture signature the re-burn existed to close.
+
+**New permanent gates**, each pinning an assumption that was wrong: *the frame is exactly ONE record*,
+and *moving `dstxy` moves every vertex with it*. Both fired green on iron. Plus `--verify` itself — the
+consumer now byte-compares against a CPU reference the way every kernel rung always did.
+
+⚠ **Correction to an earlier entry in this cut:** peak `|D|` was reported as 941,949,120 (margin 2×)
+once the gate measured at real screen offsets. That figure was an **artifact of the coordinate-frame
+mismatch** — absolute corners against local vertices. With the frame consistent it is **260,066,240,
+margin 8×**. There was never a 2× margin.
+
+⚠ `gputri --persp` and `gpudepth` were not run this burn. Op `0x0F`'s single-record path is covered
+far more strongly by `--verify` (256,000 px vs 1541), but **op `0x0E` is unverified since its suspend
+landed** — run `gpudepth` on the next burn of any kind.
+
 ### ⛔⛔ IRON BURN 1 (2026-07-30) — THE CONSUMER SHIPPED **AND** FOUND A KERNEL BUG NO INSTRUMENT COULD
 
 `cyrius-mine-cart` drew a real perspective-correct 3D scene on gfx90c on its first flash, and in the
