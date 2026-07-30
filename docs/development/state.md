@@ -6,6 +6,16 @@ type: state
 
 # AGNOS — Live State
 
+> **Last refresh**: 2026-07-29 · kernel head **1.56.31** — ✅✅ **RUNG 18 CLOSED ON IRON, exit 95:
+perspective-correct textured rasterisation runs on gfx90c**, 0 of 1541 covered px differing from the CPU
+reference on a corpus that samples different texels from the affine answer at 731. Exact 56-iteration
+restoring divide, 64-bit numerator in a register pair, **no `v_rcp_f32`** — the release row prescribed it
+and its own risk column admitted the cost ("the CPU reference must use the same approximation"), which is
+the shared-premise structure that cost rungs 15 and 17 a burn each. Four burns: **one shader defect, three
+instrument/analysis.** ✅✅ **RUNG 17 CLOSED ON IRON** (1.56.30, two burns) — depth-tested triangles,
+deterministic with no atomics and no binning. Next: **1.56.32 rung 19 `pilot`** — the consumer close, which
+also pays the rung-closure debt (the kernel is now SEVEN rungs ahead of a shipped consumer).
+> — previous header follows —
 > **Last refresh**: 2026-07-28 · kernel head **1.56.30** (open; 1.56.29 closed — rung 15 iron-validated) · **▶ ACTIVE — 1.56.x GPU (the one open GPU release; there is no 1.57/1.58/1.59).** Full plan + reference:
 [`docs/development/planning/gpu.md`](planning/gpu.md) — the single GPU document. **DONE and shipped:**
 (1) **the ring-3 GPU band has consumers** — aethersafha composites on the GPU (opaque via `#87`, translucent

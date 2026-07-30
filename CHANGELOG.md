@@ -7,6 +7,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 **Rung 18 `persp-correct` — cycle OPEN.** Bumped on cycle open; the user tags on close.
 
+### ✅✅ RUNG 18 CLOSED ON IRON 2026-07-29 — perspective-correct texturing runs on gfx90c, exit 95
+
+`gputri --persp`: **0 of 1541** covered pixels differ from the CPU reference, on a corpus that samples
+different texels from the affine answer at **731** of them. `da == expect_da == 731` exactly. Controls
+held: `--cov` 20/20, `--depth` 95.
+
+Numerator and denominator hoisted to affine planes; a 64-bit numerator in a register pair with an
+explicit carry chain; an exact 56-iteration restoring divide per attribute; **no `v_rcp_f32` anywhere**,
+so the reference stayed an independent statement of truth rather than a model of the hardware.
+
+**Four burns, honestly attributed**: one was the shader (a 32-byte prep/stride skew), **three were the
+instrument and the reading of it** — two undersized buffers and a threshold derived from the wrong
+quantity. Worth stating plainly, because the instinct after a red result is to suspect the silicon, and
+here that instinct would have been wrong three times out of four.
+
+⭐ **Every defect was diagnosed from the printed numbers, none by bisection**, and in both ambiguous
+cases the discrimination came from having *two* comparisons: "748 vs 769 of 1541" reads as equidistant
+from both references ⇒ garbage coefficients, not a missing divide; "0 and 731" reads as a correct render
+against a wrong threshold. A single comparison could not have separated either pair.
+
 ### ✅✅ Iron burn 3 — RUNG 18's SHADER IS CORRECT: `vs PERSPECTIVE 0 of 1541`
 
 Perspective-correct textured rasterisation is **byte-identical to the CPU reference at every covered

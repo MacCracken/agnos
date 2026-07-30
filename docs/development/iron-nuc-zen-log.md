@@ -311,3 +311,47 @@ do that. So the arm now:
 
 ⚠ The old form could call a correct shader broken. The new one cannot: every threshold is a measured
 quantity of the corpus rather than a fraction chosen by hand.
+
+### ✅✅ Burn 4 — RUNG 18 CLOSED ON IRON 2026-07-29, exit 95
+
+```
+gputri --cov     20 of 20                     <- control held
+gputri --depth   exit 95                      <- control held
+gputri --persp   vs PERSPECTIVE   0 of 1541 covered px differ
+                 vs AFFINE      731 of 1541
+                 the two REFERENCES differ at 731 -- the corpus's discriminating power
+                 exit 95
+```
+
+**Perspective-correct textured rasterisation runs on gfx90c**, byte-identical to the CPU reference at
+every covered pixel: numerator and denominator hoisted to affine planes, a 64-bit numerator in a
+register pair with an explicit carry chain, an exact 56-iteration restoring divide per attribute, and
+**no `v_rcp_f32` anywhere**. `da == expect_da == 731` exactly — the GPU's divergence from affine equals
+the reference's own, to the pixel.
+
+### The four burns, honestly attributed
+
+| burn | exit | defect | whose |
+|---|---|---|---|
+| 1 | 100 | two undersized module-scope buffers in `gputri.cyr` (8N-byte trap) | the **instrument** |
+| 2 | 86 | 32-byte prep/shader stride skew — rung 17's `s_add_u32 s0,s0,64` copied into a 96-byte-stride kernel | the **shader** |
+| 3 | 87 | discriminator threshold derived from COORDINATE divergence while the arm compares TEXELS | the **analysis** |
+| 4 | 95 | — | — |
+
+⭐ **The shader itself needed ONE fix.** Three of the four burns were the instrument and the reading of
+it — which is worth stating plainly, because the instinct after a red result is to suspect the silicon
+or the kernel, and here that instinct would have been wrong three times out of four.
+
+⭐ **Every one was diagnosed from the printed numbers, none by bisection.** Burn 2's "748 vs 769 out of
+1541" said *equidistant from both references* ⇒ garbage coefficients, not a missing divide. Burn 3's
+"0 and 731" said *correct render, wrong threshold*. Both readings came from having **two** comparisons
+rather than one — the affine row exists solely to make that distinction possible.
+
+### What is now gated that was not before
+
+- `triper-contract.sh` **CHECK 3**: the shader's header step must equal `GPU_TPER_PREP_STRIDE`, read out
+  of `gpu_regs.cyr`. Mutation-tested. Nothing else in the tree can see that contract.
+- `perspgate` **P7**: the TEXTURED divergence, measured on the host — the number any textured
+  discriminator threshold must be derived from.
+- `gputri --persp` now refuses to judge the GPU at all unless the corpus itself discriminates, and every
+  threshold is a measured property of the corpus rather than a hand-chosen fraction.
