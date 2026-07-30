@@ -12,6 +12,37 @@ include "lib/io.cyr"
 include "tricore.cyr"      # ps / pn / nl
 include "perspcore.cyr"
 
+# ⭐⭐ THE TEXTURED DISCRIMINATOR. P2 measures how far the AFFINE coordinate is from the perspective
+# one; this measures how far the resulting TEXEL is, which is a different and smaller number — many
+# differing coordinates land in the same checkerboard cell and sample the same colour.
+# ⛔ CONFLATING THE TWO COST A BURN'S INTERPRETATION. gputri's --persp arm compares TEXELS, and its
+# discriminator threshold was set from P2's coordinate figure of 1540/1541. The GPU came back byte-exact
+# against the perspective reference (0 of 1541) and 731 from affine — correct in every way that matters,
+# and the arm called it a failure because 731 < half of 1541. The shader was right; the threshold was
+# derived from the wrong measurement.
+# ⇒ this gate exists so the threshold has a MEASURED floor of its own.
+var PG_TEXDIM = 256;
+var pg_tex[32768];              # 256x256 x 4 B, matching gputri's checkerboard exactly
+
+fn pg_checker(): i64 {
+    var i = 0;
+    while (i < PG_TEXDIM * PG_TEXDIM) {
+        var tx = i % PG_TEXDIM;
+        var ty = i / PG_TEXDIM;
+        var c = 0xFF202020;
+        if ((((tx >>> 4) + (ty >>> 4)) & 1) == 1) { c = 0xFFE0E0E0; }
+        store32(&pg_tex + i * 4, c);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn pg_fetch(u, v): i64 {
+    var tx = (u >>> 16) & (PG_TEXDIM - 1);
+    var ty = (v >>> 16) & (PG_TEXDIM - 1);
+    return load32(&pg_tex + (ty * PG_TEXDIM + tx) * 4) & 0xFFFFFFFF;
+}
+
 fn pg_gate(name, ok): i64 {
     ps(name);
     if (ok == 1) { ps(" PASS"); nl(); return 0; }
@@ -125,6 +156,34 @@ fn main(): i64 {
     ps("P6  q*D <= N < (q+1)*D on every drawn pixel (by MULTIPLICATION, never a second divide): ");
     if (pc_obl_bad == 0) { ps("PASS"); nl(); }
     if (pc_obl_bad != 0) { ps("FAIL "); pn(pc_obl_bad); ps(" violations"); nl(); bad = bad + 1; }
+
+    # ---- P7 ⭐ THE TEXTURED DISCRIMINATOR, which is what gputri's arm actually compares ----------
+    pc_corpus_floor();
+    var cov7 = pc_render();
+    pg_checker();
+    var texdiff = 0;
+    var n7 = 0;
+    var i7 = 0;
+    while (i7 < PC_W * PC_H) {
+        if (load64(&pc_cov + i7 * 8) == 1) {
+            n7 = n7 + 1;
+            var tp = pg_fetch(load64(&pc_u + i7 * 8), load64(&pc_v + i7 * 8));
+            var ta = pg_fetch(load64(&pc_ua + i7 * 8), load64(&pc_va + i7 * 8));
+            if (tp != ta) { texdiff = texdiff + 1; }
+        }
+        i7 = i7 + 1;
+    }
+    ps("P7  TEXTURED divergence: perspective vs affine sample DIFFERENT texels at ");
+    pn(texdiff); ps(" of "); pn(n7); ps(" covered px"); nl();
+    ps("    ⇒ this, NOT P2's coordinate figure, is the floor gputri's discriminator must use: ");
+    if (texdiff > n7 / 4) { ps("PASS"); nl(); }
+    if (texdiff <= n7 / 4) {
+        ps("FAIL -- fewer than a quarter of texels move, so a textured burn cannot discriminate"); nl();
+        bad = bad + 1;
+    }
+    ps("    ⚠ P2 measured "); pn(ad); ps(" COORDINATES differing and only "); pn(texdiff);
+    ps(" TEXELS -- the gap is"); nl();
+    ps("    the checkerboard cell size, and mistaking one for the other misreads a correct burn."); nl();
 
     nl();
     if (bad == 0) {

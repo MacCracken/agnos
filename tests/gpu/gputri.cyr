@@ -2103,7 +2103,7 @@ fn tri_depth_arm(): i64 {
 # the shape of both burns this arc has lost.
 #
 # Exits: 95 all exact AND discriminating · 100 no GPU · 90 named #92 fault · 88 the buffer was UNTOUCHED
-#   87 matches the AFFINE reference (the divide did not happen) · 86 differs from the PERSPECTIVE one
+#   87 the CORPUS cannot discriminate (a match would prove nothing) · 86 differs from PERSPECTIVE
 # ⛔⛔ MODULE-SCOPE `var X[N]` IS N x u64 = 8N BYTES, AND THE FIRST VERSION OF THESE THREE GOT IT
 # WRONG IN THE DANGEROUS DIRECTION. pp_tex was declared [16384] = 131,072 B for a 256x256x4 =
 # 262,144 B texture -- HALF -- so pp_checker overflowed it by 128 KB, and pp_got was [512] = 4,096 B
@@ -2273,20 +2273,58 @@ fn tri_persp_arm(): i64 {
     ps("gputri: vs AFFINE      reference "); pnum(da);
     ps(" of "); pnum(checked); puts(" covered px differ");
 
+    # ⭐ expect_da -- how far the two REFERENCES are from each other, after texturing. Computed here
+    # from the arm's own reference and its own fetch, so it is the corpus's property rather than the
+    # GPU's.
+    var expect_da = 0;
+    var y3 = 0;
+    while (y3 < h) {
+        var x3 = 0;
+        while (x3 < w) {
+            var j = y3 * w + x3;
+            if (load64(&pc_cov + j * 8) == 1) {
+                var tp = pp_fetch(load64(&pc_u + j * 8), load64(&pc_v + j * 8));
+                var ta = pp_fetch(load64(&pc_ua + j * 8), load64(&pc_va + j * 8));
+                if (tp != ta) { expect_da = expect_da + 1; }
+            }
+            x3 = x3 + 1;
+        }
+        y3 = y3 + 1;
+    }
+    ps("gputri: the two REFERENCES differ at "); pnum(expect_da);
+    puts(" covered px -- the corpus's own discriminating power");
+
+    # ⛔⛔ THE CORPUS MUST DISCRIMINATE, and this is checked BEFORE the GPU is judged. If the two
+    # references sampled the same texels everywhere, matching one would say nothing about the divide --
+    # the null-set trap rung 17's corpus fell into. perspgate's P7 measures the same quantity on the
+    # host and is where the expectation comes from.
+    if (expect_da < checked / 4) {
+        ps("gputri: the corpus CANNOT discriminate ("); pnum(expect_da);
+        puts(" px) -- a match would prove nothing");
+        return 87;
+    }
     if (dp != 0) {
         puts("gputri: DIFFERS from the perspective reference -- see the rubric before blaming the divide");
         return 86;
     }
-    # ⭐⭐ THE DISCRIMINATION. Matching perspective is necessary and NOT sufficient: on a figure where
-    # the two agreed, a shader that never divided would also match. perspgate measured the gap at 1540
-    # of 1541 px, so a small `da` here means the GPU is producing the affine answer.
-    if (da < checked / 2) {
-        ps("gputri: MATCHES THE AFFINE REFERENCE too closely ("); pnum(da);
-        puts(" px) -- the divide did not happen");
-        return 87;
+    # ⭐ dp == 0 IS THE ORACLE, AND IT IS SUFFICIENT ONCE THE CORPUS DISCRIMINATES: the GPU matched, at
+    # every covered pixel, a reference that provably samples different texels from the affine one at
+    # `expect_da` of them. A shader that skipped the divide could not do that.
+    # ⛔⛔ THE FIRST VERSION OF THIS ARM REQUIRED `da > checked/2` AND CALLED A CORRECT BURN A FAILURE.
+    # The threshold came from perspgate's P2 -- 1540 of 1541 COORDINATES differ -- but this arm compares
+    # TEXELS, and many differing coordinates land in the same checkerboard cell. The textured figure is
+    # 731. The GPU returned dp = 0 and da = 731, matching the host prediction EXACTLY, and was reported
+    # as "the divide did not happen". ⇒ two different quantities, one threshold, and the burn was
+    # misread. da is now checked for CONSISTENCY with the reference rather than against a bare fraction.
+    if (da != expect_da) {
+        ps("gputri: INCONSISTENT -- matched perspective exactly, yet differs from affine at ");
+        pnum(da); ps(" where the references differ at "); pnum(expect_da);
+        puts("; the arm's two references disagree with its comparison");
+        return 86;
     }
-    puts("gputri: PASS -- byte-identical to the PERSPECTIVE reference, and measurably DIFFERENT");
-    puts("gputri:        from the affine one, so the per-pixel divide demonstrably ran.");
+    puts("gputri: PASS -- byte-identical to the PERSPECTIVE reference at every covered pixel, on a");
+    puts("gputri:        corpus that provably samples different texels from the affine answer, so");
+    puts("gputri:        the per-pixel perspective divide demonstrably ran.");
     return 95;
 }
 

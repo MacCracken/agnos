@@ -268,3 +268,46 @@ Mutation-tested by restoring the 64 and watching it go red.
 
 ⭐ **The rubric worked.** "differs from perspective by ~all px → suspect the record layout, not the
 shader" was written before the flash and pointed straight at it.
+
+### ✅ Burn 3 — THE SHADER IS CORRECT. `vs PERSPECTIVE 0 of 1541`. The arm misread it.
+
+```
+gputri --cov     20 of 20                                      <- control held
+gputri --depth   exit 95                                       <- control held
+gputri --persp   buffer touched at 4096 of 4096 px
+                 vs PERSPECTIVE reference   0 of 1541 covered px differ
+                 vs AFFINE      reference 731 of 1541 covered px differ
+                 exit 87  "MATCHES THE AFFINE REFERENCE too closely"
+```
+
+⭐⭐ **`vs PERSPECTIVE = 0` is the result.** Perspective-correct textured rasterisation is byte-identical
+to the CPU reference at every covered pixel on gfx90c: a 64-bit numerator in a register pair, an exact
+56-iteration restoring divide per attribute, no `v_rcp_f32` anywhere. The verdict line is wrong; the
+render is not.
+
+### ⛔ The defect is an ANALYSIS error in the arm — two different quantities, one threshold
+
+The arm required `da > checked/2` and got 731 against a half of 770. That threshold came from
+`perspgate`'s P2: *"affine differs at 1540 of 1541"*. **But P2 measures COORDINATE divergence and the arm
+compares TEXELS.** After sampling a 16×16-cell checkerboard, most differing coordinates land in the same
+cell and return the same colour. The textured figure is smaller by exactly the cell size.
+
+⭐ **Confirmed by measurement, not by argument**: `perspgate`'s new **P7** applies the identical
+checkerboard fetch to both references on the host and measures **731 of 1541** — the number the GPU
+produced, to the pixel. The GPU matched the perspective reference exactly AND diverged from affine
+exactly as much as the reference itself does.
+
+### ⇒ The discrimination belongs on the CORPUS, not on the GPU comparison
+
+Once `dp == 0`, the divide provably ran: the GPU matched, at every covered pixel, a reference that
+samples different texels from the affine answer at 731 of them. A shader that skipped the divide cannot
+do that. So the arm now:
+
+1. computes `expect_da` — how far the two REFERENCES are from each other after texturing — and **refuses
+   to judge the GPU at all** if that is small, because then a match would prove nothing;
+2. requires `dp == 0`;
+3. requires `da == expect_da` exactly, as a consistency check that the arm's references agree with its
+   own comparison.
+
+⚠ The old form could call a correct shader broken. The new one cannot: every threshold is a measured
+quantity of the corpus rather than a fraction chosen by hand.

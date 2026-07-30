@@ -7,6 +7,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 **Rung 18 `persp-correct` — cycle OPEN.** Bumped on cycle open; the user tags on close.
 
+### ✅✅ Iron burn 3 — RUNG 18's SHADER IS CORRECT: `vs PERSPECTIVE 0 of 1541`
+
+Perspective-correct textured rasterisation is **byte-identical to the CPU reference at every covered
+pixel** on gfx90c — 64-bit numerator in a register pair, exact 56-iteration restoring divide per
+attribute, no `v_rcp_f32`. `--cov` 20/20 and `--depth` exit 95 held as controls.
+
+### ⛔ …and the arm reported it as a failure. Two quantities, one threshold.
+
+`--persp` returned exit 87 because it required `da > checked/2` and measured 731 against a half of 770.
+That threshold came from `perspgate`'s P2 — *"affine differs at 1540 of 1541"* — but **P2 measures
+COORDINATE divergence while the arm compares TEXELS.** On a 16×16-cell checkerboard most differing
+coordinates land in the same cell and return the same colour, so the textured figure is smaller by the
+cell size.
+
+⭐ New gate **P7** applies the identical fetch to both references on the host and measures **731 of
+1541** — the GPU's number to the pixel. So the GPU matched perspective exactly *and* diverged from affine
+by exactly what the reference does.
+
+⇒ **The discrimination belongs on the corpus, not on the GPU comparison.** Once `dp == 0` the divide
+provably ran, because the matched reference samples different texels from the affine answer at 731 of
+them. The arm now computes that figure from its own references, **refuses to judge the GPU if it is
+small**, then requires `dp == 0` and `da == expect_da`. Every threshold is a measured property of the
+corpus instead of a hand-chosen fraction — the old form could call a correct shader broken, and did.
+
 ### ⛔⛔ Fixed — a 32-byte prep/shader skew (rung 18's second burn, exit 86)
 
 The header occupies one record slot, so the shader's step past it and `GPU_TPER_PREP_STRIDE` are the
