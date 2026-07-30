@@ -7,6 +7,43 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 **Rung 18 `persp-correct` — cycle OPEN.** Bumped on cycle open; the user tags on close.
 
+### ⛔⛔ Fixed — a 32-byte prep/shader skew (rung 18's second burn, exit 86)
+
+The header occupies one record slot, so the shader's step past it and `GPU_TPER_PREP_STRIDE` are the
+same number. Rung 17's stride is 64; its `s_add_u32 s0, s0, 64` was copied into a kernel whose stride is
+**96**, so every record read began 32 bytes early — the header's tail plus record 0's head, read as
+`A0 B0 C0 A1 …`.
+
+⭐ **The numbers diagnosed it before any bisection.** `vs PERSPECTIVE 748` and `vs AFFINE 769` out of
+1541, with half being 770: the output is *equidistant from both references*, which on a two-colour
+checkerboard is what uncorrelated looks like. Had the divide simply not run, affine would have been ~0
+and perspective ~1540. The affine row is what separates "garbage coefficients" from "no divide" — and it
+exists only because the arm was built as a discrimination rather than an agreement.
+
+⚠ **Nothing on the host could have caught it**: the assembler does not know the stride, prep does not
+know what the shader steps, the blob gate compares the shader to itself, and both the reference and the
+register-width model compute from coefficients rather than from a record at an offset. It is a contract
+between two files — the same shape as the kernarg order that cost rung 17 a burn, one bite later.
+
+⇒ `triper-contract.sh` **CHECK 3** reads the stride out of `gpu_regs.cyr` and requires exactly two
+`s_add_u32 s0, s0, <stride>` in the shader. Mutation-tested. `check.sh` 23/23, blob 196 dwords.
+
+### ⛔ Fixed — two undersized buffers in `gputri.cyr` (rung 18's first burn, exit 100)
+
+Module-scope `var X[N]` is **N × u64 = 8N bytes**. `pp_tex` was `[16384]` = 131,072 B for a 262,144 B
+texture and `pp_got` was `[512]` = 4,096 B for a 16,384 B readback. `pp_checker()` runs before the
+allocations, so its 128 KB overflow corrupted the triangle count and `shm_create_gpu` was called with a
+bad size — surfacing as exit 100, "no GPU", on a boot where `--depth` had just passed.
+
+⚠ `check-array-sizing.sh` covers function-local arrays at literal offsets and says so; these are
+module-scope with computed offsets. ⇒ covered by a **runtime** guard (`pp_size_ok`) that ties each
+declared size to the bytes actually written, plus per-allocation diagnostics so a shared exit code can
+no longer hide which of three calls failed.
+
+⭐ The burn still earned its cost as a regression control: on the 1.56.31 kernel `--cov` is **20/20**
+and `--depth` is **exit 95**, so rungs 9b and 17 survive everything rung 18 added — a new op, a sixth
+resident blob, the arena slots and the ABI growth.
+
 ### Added — RUNG 18's worker, and op `0x0F` is LIVE
 
 `gpu_tper_arm` + `gpu_tper_prep_header` + `gpu_tri_persp`. The validator now returns 0 on a well-formed

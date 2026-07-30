@@ -1022,6 +1022,23 @@ if ! grep -qa -- "z read back via op 0x10" build/rootfs/bin/gputri 2>/dev/null; 
     exit 1
 fi
 echo "  staged /bin/gputri carries the rung-17 --depth arm AND its z readback via op 0x10"
+
+# ⭐ RUNG 18's ARM, AND ITS DISCRIMINATOR SPECIFICALLY. A gputri without --persp pairs a new kernel with
+# a tool that cannot exercise it. ⛔ And the discriminator is checked SEPARATELY because matching the
+# perspective reference is NECESSARY BUT NOT SUFFICIENT: measured on this figure, affine texturing is
+# wrong at 1540 of 1541 covered pixels, so without the affine comparison a green result is consistent
+# with the divide never happening -- the shape of both burns this arc has already lost.
+if ! grep -qa -- "RUNG 18 -- perspective-correct textured triangles" build/rootfs/bin/gputri 2>/dev/null; then
+    echo "burn-prep: STAGED /bin/gputri has NO --persp arm -- a new kernel would be paired with a"
+    echo "  tool that cannot exercise it. Rebuild and re-stage."
+    exit 1
+fi
+if ! grep -qa -- "vs AFFINE" build/rootfs/bin/gputri 2>/dev/null; then
+    echo "burn-prep: STAGED /bin/gputri --persp does NOT compare against the AFFINE reference."
+    echo "  Matching perspective alone cannot distinguish a working divide from no divide at all."
+    exit 1
+fi
+echo "  staged /bin/gputri carries the rung-18 --persp arm AND its affine discriminator"
 # ⛔ RUNG 17: gpudepth must carry its WARM-UP, not merely exist. Its first burn measured its own
 # instrument -- gpu_rt_arm() runs the rung-6 audit on the first call of a boot, and that audit ends in
 # a 64 KB klug_spill() to NVMe, which landed INSIDE the timed loop and outweighed the measurement

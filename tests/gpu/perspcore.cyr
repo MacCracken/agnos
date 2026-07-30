@@ -69,6 +69,7 @@ var pc_n = 0;
 var pc_u[4096];                 # 64*64 perspective-correct u, 16.16
 var pc_v[4096];                 # ... v
 var pc_ua[4096];                # the AFFINE u, for the discriminator
+var pc_va[4096];                # ... and the affine v, so a TEXTURED discriminator can fetch both
 var pc_cov[4096];               # 1 where covered
 var pc_covered = 0;
 # ⭐ THE SAMPLE WINDOW'S ORIGIN, in screen pixels. Lets a FULL-SCREEN figure be measured through a
@@ -142,6 +143,7 @@ fn pc_render(): i64 {
         store64(&pc_u + i * 8, 0 - 1);
         store64(&pc_v + i * 8, 0 - 1);
         store64(&pc_ua + i * 8, 0 - 1);
+        store64(&pc_va + i * 8, 0 - 1);
         store64(&pc_cov + i * 8, 0);
         i = i + 1;
     }
@@ -188,9 +190,11 @@ fn pc_render(): i64 {
                     # ⭐ THE AFFINE ANSWER, at the same pixel, for the discriminator. This is exactly
                     # what a shader that skipped the divide would produce.
                     var qa = (e0 * pc_get(t,3) + e1 * pc_get(t,8) + e2 * pc_get(t,13)) / area;
+                    var qav = (e0 * pc_get(t,4) + e1 * pc_get(t,9) + e2 * pc_get(t,14)) / area;
                     store64(&pc_u  + (py * PC_W + px) * 8, qu);
                     store64(&pc_v  + (py * PC_W + px) * 8, qv);
                     store64(&pc_ua + (py * PC_W + px) * 8, qa);
+                    store64(&pc_va + (py * PC_W + px) * 8, qav);
                     store64(&pc_cov + (py * PC_W + px) * 8, 1);
                     pc_covered = pc_covered + 1;
                 }

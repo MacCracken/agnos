@@ -80,4 +80,22 @@ else
     echo "triper-contract: PASS -- the loop body writes v3/v4 only via the two named v_cndmask"
 fi
 
+# ---- CHECK 3: the header step MUST equal the record stride ----------------------------------
+# ⛔⛔ THIS COST A BURN. The header occupies one record slot, so the shader's `s_add_u32 s0, s0, N`
+# past it and GPU_TPER_PREP_STRIDE are the same number. Rung 17's stride is 64 and rung 18's is 96;
+# copying the former left a 32-byte skew, so the shader read the header's tail plus record 0's head as
+# record 0. ⚠ The result was ~50% wrong against BOTH references (748 and 769 of 1541) -- equidistant,
+# which is the signature of garbage rather than of a wrong algorithm. Nothing else in the tree can see
+# this: the assembler does not know the stride and prep does not know what the shader steps.
+STRIDE="$(grep -oE 'var GPU_TPER_PREP_STRIDE[[:space:]]*=[[:space:]]*[0-9]+' "$ROOT/kernel/core/gpu_regs.cyr" | grep -oE '[0-9]+$')"
+[ -n "$STRIDE" ] || { echo "triper-contract: FAIL -- cannot read GPU_TPER_PREP_STRIDE"; exit 1; }
+STEPS="$(grep -cE "^[[:space:]]*s_add_u32[[:space:]]+s0,[[:space:]]*s0,[[:space:]]*$STRIDE[[:space:]]*$" "$SRC")"
+if [ "$STEPS" -eq 2 ]; then
+    echo "triper-contract: PASS -- header step and loop stride are both $STRIDE, matching the constant"
+else
+    echo "triper-contract: FAIL -- expected 2 s_add_u32 s0,s0,$STRIDE (header step + loop tail), found $STEPS"
+    echo "  GPU_TPER_PREP_STRIDE is $STRIDE. A mismatch skews every record read by the difference."
+    rc=1
+fi
+
 exit $rc

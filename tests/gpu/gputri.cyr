@@ -42,6 +42,9 @@ include "tricore.cyr"
 # lib/io.cyr include is proven safe here. The corpus and the renderer live in ONE place: a burn
 # adjudicated against a private copy of the reference is adjudicated against a different program.
 include "depthcore.cyr"
+# ⭐ RUNG 18's reference. Same combination perspgate builds with. The corpus and the renderer live in
+# ONE place: a burn adjudicated against a private copy of the reference adjudicates a different program.
+include "perspcore.cyr"
 fn puts(s): i64 { ps(s); nl(); return 0; }
 fn pnum(v): i64 {
     if (v == 0) { print("0", 1); return 0; }
@@ -2088,6 +2091,205 @@ fn tri_depth_arm(): i64 {
     return 95;
 }
 
+# ==================================================================================================
+# --persp — RUNG 18's INSTRUMENT. Perspective-correct textured triangles via #92 op 0x0F.
+# ==================================================================================================
+# ⭐⭐ THE ORACLE IS A DISCRIMINATION, NOT AN AGREEMENT, AND THAT IS THE WHOLE DESIGN. A shader that
+# skips the perspective divide produces the AFFINE answer, which on this figure is wrong at **1540 of
+# 1541** covered pixels, worst by ~151 texels (measured by perspgate before any shader existed). So this
+# arm renders the reference BOTH ways and asserts the GPU matches perspective AND DIFFERS from affine.
+# ⛔ Without the second half, a green result is consistent with the divide never happening -- which is
+# precisely the null-set trap rung 17's corpus fell into (a one-ULP divide error moved 0 of 1024 px) and
+# the shape of both burns this arc has lost.
+#
+# Exits: 95 all exact AND discriminating · 100 no GPU · 90 named #92 fault · 88 the buffer was UNTOUCHED
+#   87 matches the AFFINE reference (the divide did not happen) · 86 differs from the PERSPECTIVE one
+# ⛔⛔ MODULE-SCOPE `var X[N]` IS N x u64 = 8N BYTES, AND THE FIRST VERSION OF THESE THREE GOT IT
+# WRONG IN THE DANGEROUS DIRECTION. pp_tex was declared [16384] = 131,072 B for a 256x256x4 =
+# 262,144 B texture -- HALF -- so pp_checker overflowed it by 128 KB, and pp_got was [512] = 4,096 B
+# for a 64x64x4 = 16,384 B readback, a QUARTER. The burn came back exit 100 with nothing after the
+# banner.
+# ⚠ scripts/check/check-array-sizing.sh cannot see this: it gates FUNCTION-LOCAL arrays at LITERAL
+# offsets, and its own header says a clean run is not proof of absence. These are module-scope with
+# computed offsets. ⇒ the runtime guard in pp_size_ok() is what covers the gap, because a static gate
+# that cannot see the write is not the place to put the check.
+var PP_TEXDIM  = 256;
+var PP_TEX_U64 = 32768;          # 262,144 B = 256*256*4
+var PP_GOT_U64 = 2048;           # 16,384 B  = 64*64*4
+var pp_vtx[24];                  # 192 B, needs 2 x 64 = 128
+var pp_tex[32768];
+var pp_got[2048];
+
+# pp_size_ok — assert at RUNTIME that every buffer is big enough for what this arm will write into it.
+# ⭐ Declared sizes are literals and the requirements are computed, so nothing in the language ties
+# them together. This is the tie.
+fn pp_size_ok(w, h): i64 {
+    var need_tex = PP_TEXDIM * PP_TEXDIM * 4;
+    var need_got = w * h * 4;
+    var ok = 1;
+    if (need_tex > PP_TEX_U64 * 8) {
+        ps("gputri: pp_tex is "); pnum(PP_TEX_U64 * 8); ps(" B but needs "); pnum(need_tex);
+        puts(" -- module-scope var X[N] is 8N BYTES");
+        ok = 0;
+    }
+    if (need_got > PP_GOT_U64 * 8) {
+        ps("gputri: pp_got is "); pnum(PP_GOT_U64 * 8); ps(" B but needs "); pnum(need_got);
+        puts(" -- module-scope var X[N] is 8N BYTES");
+        ok = 0;
+    }
+    return ok;
+}
+
+fn pp_checker(): i64 {
+    var i = 0;
+    while (i < PP_TEXDIM * PP_TEXDIM) {
+        var tx = i % PP_TEXDIM;
+        var ty = i / PP_TEXDIM;
+        # ⚠ 16x16 cells: large enough that a perspective/affine difference of ~151 texels crosses many
+        # cell boundaries, so the discriminator sees COLOUR changes rather than sub-cell noise.
+        var c = 0xFF202020;
+        if ((((tx >>> 4) + (ty >>> 4)) & 1) == 1) { c = 0xFFE0E0E0; }
+        store32(&pp_tex + i * 4, c);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn pp_fetch(u, v): i64 {
+    var tx = (u >>> 16) & (PP_TEXDIM - 1);
+    var ty = (v >>> 16) & (PP_TEXDIM - 1);
+    return load32(&pp_tex + (ty * PP_TEXDIM + tx) * 4) & 0xFFFFFFFF;
+}
+
+fn pp_pack(): i64 {
+    pc_corpus_floor();
+    var t = 0;
+    while (t < pc_n) {
+        var r = &pp_vtx + t * 64;
+        var k = 0;
+        while (k < 3) {
+            store32(r + k * 20 +  0, (pc_get(t, k * 5 + 0) << 16) & 0xFFFFFFFF);
+            store32(r + k * 20 +  4, (pc_get(t, k * 5 + 1) << 16) & 0xFFFFFFFF);
+            store32(r + k * 20 +  8, pc_get(t, k * 5 + 2) & 0xFFFFFFFF);
+            store32(r + k * 20 + 12, pc_get(t, k * 5 + 3) & 0xFFFFFFFF);
+            store32(r + k * 20 + 16, pc_get(t, k * 5 + 4) & 0xFFFFFFFF);
+            k = k + 1;
+        }
+        store32(r + 60, 0);
+        t = t + 1;
+    }
+    return pc_n;
+}
+
+fn tri_persp_arm(): i64 {
+    var w = 64;
+    var h = 64;
+    var np = w * h;
+    var bytes = np * 4;
+    puts("gputri: RUNG 18 -- perspective-correct textured triangles via #92 op 0x0F");
+
+    if (pp_size_ok(w, h) != 1) { return 84; }
+    pp_checker();
+    var n = pp_pack();
+
+    # ⚠ EACH ALLOCATION REPORTS ITSELF. The first burn returned a bare 100 with nothing after the
+    # banner, which says "no GPU" -- and there plainly WAS one, since --depth had just passed. A shared
+    # silent exit code cannot distinguish three different failures.
+    var vid = syscall(86, n * 64);
+    if (vid < 1) { ps("gputri: vertex slot alloc failed ("); pnum(n * 64); puts(" B)"); return 100; }
+    var tid = syscall(86, PP_TEXDIM * PP_TEXDIM * 4);
+    if (tid < 1) {
+        ps("gputri: texture slot alloc failed ("); pnum(PP_TEXDIM * PP_TEXDIM * 4); puts(" B)");
+        syscall(74, vid); return 100;
+    }
+    var cid = syscall(86, bytes);
+    if (cid < 1) {
+        ps("gputri: readback slot alloc failed ("); pnum(bytes); puts(" B)");
+        syscall(74, vid); syscall(74, tid); return 100;
+    }
+
+    if (syscall(72, vid, &pp_vtx, n * 64) != 0) { return 90; }
+    if (syscall(72, tid, &pp_tex, PP_TEXDIM * PP_TEXDIM * 4) != 0) { return 90; }
+    # ⛔ PRE-SEED WITH POISON. A #86 slot is a fixed window per index, so a freed-then-reallocated slot
+    # hands back the same memory with the previous run's pixels in it -- a stale ghost that reads as a
+    # pass, which gpucopy hit on iron.
+    var i = 0;
+    while (i < bytes / 8) { store64(&pp_got + i * 8, 0xA5A5A5A5A5A5A5A5); i = i + 1; }
+    if (syscall(72, cid, &pp_got, bytes) != 0) { return 90; }
+
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 15);                      # GPU_OP_TRI_PERSP
+    store32(&d +  8, tid);
+    store32(&d + 12, vid);
+    store32(&d + 16, (h * 65536) + w);
+    store32(&d + 24, n);
+    store32(&d + 28, (PP_TEXDIM * 65536) + PP_TEXDIM);
+    var rc = syscall(92, &d, 64);
+    if (rc != 0) {
+        syscall(74, vid); syscall(74, tid); syscall(74, cid);
+        return tri_report((0 - rc) & 0xFF);
+    }
+    if (syscall(90, cid, (h * 65536) + w, 0) != 0) { return 90; }
+    if (syscall(73, cid, &pp_got, bytes) != 0) { return 90; }
+    syscall(74, vid); syscall(74, tid); syscall(74, cid);
+
+    # ---- did anything happen? Two UNTOUCHED buffers agree on everything. ----------------------
+    var touched = 0;
+    i = 0;
+    while (i < np) {
+        if ((load32(&pp_got + i * 4) & 0xFFFFFFFF) != 0xA5A5A5A5) { touched = touched + 1; }
+        i = i + 1;
+    }
+    ps("gputri: buffer touched at "); pnum(touched); puts(" of 4096 px");
+    if (touched == 0) { puts("gputri: UNTOUCHED -- the shader wrote nothing"); return 88; }
+
+    # ---- the reference, BOTH ways, textured with the same fetch the shader performs -----------
+    pc_corpus_floor();
+    var cov = pc_render();
+    var dp = 0;
+    var da = 0;
+    var checked = 0;
+    var y2 = 0;
+    while (y2 < h) {
+        var x2 = 0;
+        while (x2 < w) {
+            var idx = y2 * w + x2;
+            if (load64(&pc_cov + idx * 8) == 1) {
+                var got = load32(&pp_got + idx * 4) & 0xFFFFFFFF;
+                var wantp = pp_fetch(load64(&pc_u + idx * 8), load64(&pc_v + idx * 8));
+                var wanta = pp_fetch(load64(&pc_ua + idx * 8), load64(&pc_va + idx * 8));
+                checked = checked + 1;
+                if (got != wantp) { dp = dp + 1; }
+                if (got != wanta) { da = da + 1; }
+            }
+            x2 = x2 + 1;
+        }
+        y2 = y2 + 1;
+    }
+    ps("gputri: vs PERSPECTIVE reference "); pnum(dp);
+    ps(" of "); pnum(checked); puts(" covered px differ");
+    ps("gputri: vs AFFINE      reference "); pnum(da);
+    ps(" of "); pnum(checked); puts(" covered px differ");
+
+    if (dp != 0) {
+        puts("gputri: DIFFERS from the perspective reference -- see the rubric before blaming the divide");
+        return 86;
+    }
+    # ⭐⭐ THE DISCRIMINATION. Matching perspective is necessary and NOT sufficient: on a figure where
+    # the two agreed, a shader that never divided would also match. perspgate measured the gap at 1540
+    # of 1541 px, so a small `da` here means the GPU is producing the affine answer.
+    if (da < checked / 2) {
+        ps("gputri: MATCHES THE AFFINE REFERENCE too closely ("); pnum(da);
+        puts(" px) -- the divide did not happen");
+        return 87;
+    }
+    puts("gputri: PASS -- byte-identical to the PERSPECTIVE reference, and measurably DIFFERENT");
+    puts("gputri:        from the affine one, so the per-pixel divide demonstrably ran.");
+    return 95;
+}
+
 fn tri_bench(): i64 {
     puts("gputri: RUNG 10 -- THE KILL GATE. GPU vs CPU coverage cost.");
     puts("");
@@ -2224,13 +2426,14 @@ fn main(): i64 {
             return tri_attr();
         }
         if (streq(a, "--depth") == 1) { return tri_depth_arm(); }
+        if (streq(a, "--persp") == 1) { return tri_persp_arm(); }
         if (streq(a, "--list") == 1) { return tri_list(); }
         if (streq(a, "--digest") == 1) { return tri_digest(); }
         if (streq(a, "--bench") == 1) { return tri_bench(); }
         # An unknown argument is an ERROR, never a default action -- the typo that cost the M9
         # arc a flash on 2026-07-24 is exactly this failure mode.
         puts("gputri: UNKNOWN ARGUMENT -- nothing was done.");
-        puts("gputri: --cov --tri --list --depth --digest --bench");
+        puts("gputri: --cov --tri --list --depth --persp --digest --bench");
         return 84;
     }
     puts("gputri -- RUNG 9b, the edge rasteriser's instrument");
@@ -2238,6 +2441,7 @@ fn main(): i64 {
     puts("  run /bin/gputri --digest    reference digests, diff against host cpuref FIRST");
     puts("  run /bin/gputri --cov       the 20-case corpus + negative controls N1-N8");
     puts("  run /bin/gputri --depth     RUNG 17: depth test, BOTH orders, colour AND z back");
+    puts("  run /bin/gputri --persp     RUNG 18: perspective-correct texturing, vs BOTH references");
     puts("  run /bin/gputri --bench     RUNG 10's KILL GATE: GPU vs CPU coverage crossover");
     puts("");
     puts("Exits: 95 all exact + all controls fired · 100 no GPU here · 96 shader not resident");

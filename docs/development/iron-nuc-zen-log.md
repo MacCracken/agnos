@@ -130,3 +130,141 @@ stride), plus the loop-carried-register span check. Mutation-tested by reverting
 ⇒ **Carry-forward for rung 18 and every future kernel dispatched through a shared primitive**: the
 kernarg mapping is a CONTRACT between two files that no compiler checks. Assert it mechanically, or
 pay a burn to learn it.
+
+---
+
+## <a name="tracker-15631-persp"></a>tracker-15631-persp — RUNG 18: PERSPECTIVE-CORRECT TEXTURING'S FIRST CONTACT WITH SILICON (1.56.31)
+
+**Written BEFORE the flash.** Rung 17 needed two burns because its first failure looked like a pass on
+every axis the rung was designed around. Every branch below is pre-registered.
+
+**Artifact**: AGNOS 1.56.31 · `kernel/shaders/tri_persp.s`, 195 dwords, `RSRC1 = 0x002C01C7` /
+`RSRC2 = 0x00000190`, both **harvested** from the assembled descriptor. ⚠ The predicted RSRC1 was
+`0x002C0187` and was **wrong** — 56 SGPRs against rung 17's 48.
+
+**Run order** — `--cov` FIRST; a regression there invalidates everything after it.
+```
+run /bin/gputri --cov        must STILL be 20 of 20
+run /bin/gputri --depth      rung 17 regression: must STILL be exit 95
+run /bin/gputri --persp      the rung
+run /bin/klug > /persp1.txt
+```
+
+### The hypothesis
+
+A checkerboarded floor quad in 16:1 perspective, textured with per-pixel perspective-correct
+coordinates: numerator and denominator each hoisted to an affine plane, an exact 56-iteration restoring
+divide per attribute, no `v_rcp_f32` anywhere.
+
+### ⭐⭐ What makes this burn able to FAIL — the oracle is a DISCRIMINATION
+
+Matching the perspective reference is **necessary and not sufficient.** A shader that skipped the divide
+produces the *affine* answer, so `--persp` compares against **both** references and requires:
+
+| | required |
+|---|---|
+| vs the PERSPECTIVE reference | **0** of ~1541 covered px differ |
+| vs the AFFINE reference | **more than half** must differ |
+
+Measured on the host before the shader existed: affine differs at **1540 of 1541** px, worst by
+9,902,774 in 16.16 (~151 texels). ⛔ Without the second row a green result is consistent with the divide
+never happening — the null-set trap rung 17's corpus fell into, where a one-ULP divide error moved
+**0 of 1024** pixels. `burn-prep` refuses to stage a `gputri` lacking either comparison.
+
+### Pre-registered predictions
+
+1. `gputri --cov` is **20 of 20**, and `--depth` is still **exit 95**. (Regression controls — if either
+   moves, stop.)
+2. `--persp` exits **95**.
+3. vs perspective: **0** differing covered px.
+4. vs affine: **> 770** differing covered px (half of ~1541).
+5. The buffer is touched at all 4096 px — this op REPLACES its rect, and bg is stored where nothing is
+   covered via the accumulated-coverage predicate.
+
+### The diagnostic rubric — WHICH failure, not just "it failed"
+
+| symptom | exit | read it as | do NOT |
+|---|---|---|---|
+| matches affine closely | **87** | the divide did not run — check the record's D plane and the restoring loop, not the geometry | conclude the hoist is wrong |
+| differs from perspective by a few px | 86 | precision — the divide or the 64-bit carry chain | rewrite the interpolation |
+| differs from perspective by ~all px | 86 | a kernarg misread or a plane swapped — `triper-contract.sh` gates the first, so suspect the record layout | assume the shader is wrong before checking prep |
+| a one-texel SEAM along triangle edges | 86 | the 64-bit accumulate lost its carry — `perspmodel`'s M1 measures this at 312 px | call it a fill-rule problem |
+| horizontal streaking | 86 | the row index was computed wave-uniformly; `py` is per-lane here | blame the store address |
+| garbage outside the geometry | 86 | the accumulated-coverage predicate — bg is not reaching uncovered lanes | blame the texture fetch |
+| nothing written | 88 | residency, arm, RSRC1, or a zero grid | — |
+
+⛔ **A wave-uniform kernarg misread is deterministic**, so no determinism or repeatability test can see
+one. That is why the reference comparison — not repeatability — is the oracle here, and why the affine
+row exists beside it.
+
+### ⛔ Burn 1 — exit 100, and the defect was in the INSTRUMENT, not the kernel
+
+```
+gputri --cov     20 of 20                    <- regression control held
+gputri --depth   exit 95                     <- rung 17 still correct
+gputri --persp   exit 100, nothing after the banner
+```
+
+Exit 100 means "no GPU" — and there plainly was one, since `--depth` had just passed on the same boot.
+
+**Cause: two undersized buffers in `gputri.cyr`.** Module-scope `var X[N]` is **N × u64 = 8N bytes**.
+`pp_tex` was declared `[16384]` = 131,072 B for a 256×256×4 = **262,144 B** texture — half — and
+`pp_got` was `[512]` = 4,096 B for a 64×64×4 = **16,384 B** readback — a quarter. `pp_checker()` runs
+*before* the allocations and overflowed `pp_tex` by 128 KB into whatever follows in BSS, so the
+triangle count came back corrupted and `shm_create_gpu(n*64)` was called with a bad size.
+
+⚠ **`check-array-sizing.sh` could not catch it, and that is not a gap in the gate.** It covers
+FUNCTION-LOCAL arrays at LITERAL offsets; these are module-scope with computed offsets, and the gate's
+own header already says a clean run is not proof of absence. ⇒ the cover is a **runtime** guard
+(`pp_size_ok`) that ties each declared size to the bytes the arm will actually write — the two are
+literals and computations respectively, and nothing in the language relates them.
+
+⚠ And a second, smaller lesson: a bare shared exit code cannot distinguish three different allocation
+failures. Each `shm_create_gpu` call now names itself and its size before returning.
+
+⭐ **This burn was still worth its cost as a regression control**: `--cov` 20/20 and `--depth` exit 95
+on the 1.56.31 kernel prove rungs 9b and 17 survive everything rung 18 added — the ABI growth, the new
+op, the sixth resident blob and the arena slots.
+
+**Re-flash**: tool-only change, but the oracle is `run /bin/<tool>`, so `--update-all`.
+
+### ⛔⛔ Burn 2 — exit 86, and the READING of the numbers is the finding
+
+```
+gputri --cov     20 of 20            <- control held
+gputri --depth   exit 95             <- control held
+gputri --persp   buffer touched at 4096 of 4096 px
+                 vs PERSPECTIVE reference 748 of 1541 covered px differ
+                 vs AFFINE      reference 769 of 1541 covered px differ
+                 exit 86
+```
+
+⭐ **748 and 769 out of 1541, with half being 770.** The output is essentially EQUIDISTANT from both
+references — which on a two-colour checkerboard is what "uncorrelated with either" looks like, since a
+coordinate landing anywhere at random matches ~50% of the time. ⇒ this is **not** a precision defect and
+**not** a missing divide; the texture coordinates are garbage. The affine row is what establishes that:
+had the divide simply not run, `vs AFFINE` would have been ~0 and `vs PERSPECTIVE` ~1540.
+
+**Cause: a 32-byte skew between prep and the shader.**
+
+| | stride | shader steps past the header | prep writes record 0 at |
+|---|---|---|---|
+| rung 17 | 64 | 64 | +64 ✓ |
+| rung 18 | **96** | **64** | **+96** ✗ |
+
+The header occupies one record slot, so the shader's `s_add_u32 s0, s0, N` and `GPU_TPER_PREP_STRIDE`
+are the same number. Rung 17's stride is 64; its `s_add_u32 s0, s0, 64` was copied into a kernel whose
+stride is 96, so every record read began 32 bytes early — the header's tail followed by record 0's head,
+interpreted as `A0 B0 C0 A1 ...`.
+
+⚠ **Nothing on the host could see it.** The assembler does not know the stride; prep does not know what
+the shader steps; the blob gate compares the shader to itself; and both `perspcore` and `perspmodel`
+compute from coefficients rather than from a record at an offset. It is a contract between two files,
+like the kernarg order that cost rung 17 a burn — the same shape, one bite later.
+
+⇒ `scripts/check/triper-contract.sh` **CHECK 3** now reads `GPU_TPER_PREP_STRIDE` out of `gpu_regs.cyr`
+and requires exactly two `s_add_u32 s0, s0, <stride>` in the shader (header step + loop tail).
+Mutation-tested by restoring the 64 and watching it go red.
+
+⭐ **The rubric worked.** "differs from perspective by ~all px → suspect the record layout, not the
+shader" was written before the flash and pointed straight at it.

@@ -134,8 +134,15 @@ tri_persp:
     s_load_dwordx4 s[16:19], s[0:1], 0x0
     s_load_dwordx4 s[20:23], s[0:1], 0x10
     s_waitcnt      lgkmcnt(0)
-    // step past the 64-byte header. ⛔ NOTHING between these two: s_addc_u32 consumes SCC as carry-in.
-    s_add_u32      s0, s0, 64
+    // ⛔⛔ STEP ONE FULL STRIDE (96), NOT 64. THIS COST A BURN. The header occupies one record slot, so
+    // this step and GPU_TPER_PREP_STRIDE are THE SAME NUMBER — and rung 17's stride is 64, so copying
+    // its `s_add_u32 s0, s0, 64` left the shader reading the header's last 32 bytes plus record 0's
+    // first 64 as if they were record 0. ⚠ THE SIGNATURE: garbage coefficients give coordinates
+    // uncorrelated with anything, and on a two-colour checkerboard that reads as ~50% wrong against
+    // BOTH references at once (measured 748 and 769 of 1541) -- equidistant from perspective and
+    // affine, which is what says "neither" rather than "the divide is off".
+    // ⇒ scripts/check/triper-contract.sh now asserts this against the constant.
+    s_add_u32      s0, s0, 96
     s_addc_u32     s1, s1, 0
 
     // ---- lane -> tile-local, then draw-local ------------------------------------------------
@@ -158,6 +165,11 @@ tri_persp:
     v_mov_b32      v3, s21                  // ubest = bg (this op REPLACES its rect)
     v_mov_b32      v4, s21
 
+    // ⛔ COVERAGE MUST BE ACCUMULATED, because L_STORE fetches unconditionally. Without this the
+    // kernel paints a texel fetched at a bg-DERIVED coordinate wherever nothing is covered -- garbage
+    // outside the geometry rather than the background. Found while writing the test arm: the reference
+    // would have had to model the garbage, which is the wrong way round.
+    s_mov_b64      s[28:29], 0
     s_mov_b32      s12, 0
     s_cmp_lt_u32   s12, s4
     s_cbranch_scc0 L_STORE                  // an empty list is the common case at 8x8
@@ -202,6 +214,7 @@ L_TRI:
     s_and_b64      s[24:25], s[24:25], s[26:27]
     v_cmp_le_i32   s[26:27], 0, v7
     s_and_b64      s[24:25], s[24:25], s[26:27]      // = INSIDE
+    s_or_b64       s[28:29], s[28:29], s[24:25]      // any lane covered by ANY triangle, ever
 
     // ---- the U numerator as a 64-BIT PAIR ---------------------------------------------------
     // A_Nu * lxq, a 64x32 product in four instructions: lo, hi, the high operand's contribution, add.
@@ -332,6 +345,10 @@ L_STORE:
     v_addc_co_u32  v23, vcc, 0, v23, vcc
     global_load_dword v21, v[22:23], off glc
     s_waitcnt      vmcnt(0)
+    // ⭐ bg where NOTHING covered this lane. Predicated, never branched -- a wave branch here would
+    // give the whole tile one answer.
+    v_mov_b32      v20, s21
+    v_cndmask_b32  v21, v20, v21, s[28:29]
 
     // ---- store: addr = base + ly*pitch + lx*4 -----------------------------------------------
     v_mul_lo_u32   v18, v17, s5
