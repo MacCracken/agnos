@@ -46,6 +46,42 @@ Every write in the re-run is a value read from the same pipe moments earlier, so
 restore — the safest class of write there is. Verified mechanically: **20 registers saved, 20
 restored, none missing.** `check.sh` 23/23; `modeset-tool-smoke` **20/0**.
 
+### Added — `#12 SetPixelClock` reaches the host tooling, and characterising it changed the plan
+
+⭐ **`atom-interp.py` gains `build_set_pixel_clock_v1_7`, a `--command pixelclock` route, and a
+PS-READ ATTESTATION.** `CMD_SetPixelClock = 12` had been a constant referenced nowhere; the command
+can now be dry-run against the real VBIOS. **Zero burns**, and it already moved three things:
+
+- **The revision is DERIVED, not assumed.** archaemenid's MasterCommandTable reports index 12 at
+  `0x98EE`, **rev 1.7**, 1052 bytes, WS 16 B — so the struct is `set_pixel_clock_parameter_v1_7`, and
+  the tool **refuses** if a ROM reports any other revision rather than packing the wrong bytes.
+- ⭐⭐ **THE ATTESTATION IS THE POINT, and it fired on the first run.** The interpreter now records
+  which PS dwords the bytecode actually consumed. At `pll_id=0` the table stepped **9 opcodes, read
+  only PS dword 1, and returned clean with 0 reads / 0 writes / 0 delays** — it *dispatched on
+  `pll_id` and declined*. ⛔ **A clean return with no register activity reads as success and is not.**
+  Without the attestation that is indistinguishable from a working command.
+- ⛔ **`pll_id` 0, 1 and 2 ALL bail; only ≥ 3 runs the real path** (52 opcodes, 4 reads, 3 writes,
+  **all four PS dwords consumed**). On DCE, `ATOM_PPLL0/1/2` *are* 0/1/2 — so guessing from DCE
+  knowledge lands exactly on the branch that does nothing. **This is `phyid` again**, one command
+  class later, and it is why `--command pixelclock` **REFUSES without an explicit `--pll-id`**: no
+  default, no fallback, matching the kernel's own `atom_run_transmitter_enable_hdmi()` refusal.
+- ✅ **The v1.7 layout is now ATTESTED**: the accepted path consumes PS dwords **[0,1,2,3]** — all
+  sixteen bytes — so the transcription covers exactly what the table reads.
+
+⭐ **`#12`'s blast radius is DISJOINT from `#76`'s.** At zero seed the accepted path writes exactly two
+indices, `0x0140` and `0x0141` (BAR5+`0x500`/`0x504`) — `ctrl <- 0`, `divider <- 0x0E650730`,
+`ctrl <- 0x10` — plus one read of `0x5001`. Both writes fall **inside the already-vetted DCCG range
+`0xC0-0x1FF`**, and it touches **none** of the PHY (`0x5Dxx-0x5Exx`), the UNIPHY power block
+(`0x55xx`) or the OTG (`0x1A00-0x1BFF`). `#76`, which has blanked this panel twice, writes `0x556F`,
+`0x5E03` and `0x5DF0`. **These are different commands in every sense that matters to the display.**
+
+⚠ **ZERO-SEED CAVEAT, and it is the whole reason bite ③ exists.** Every read returned 0, so the table
+walked the path a zeroed machine dictates. That is exactly the trap `#76` set: a zero-seed dry run
+looked fine, and only a **real register snapshot** exposed the 87,292-read poll storm at the wrong
+`phyid`. So: the two-register footprint is **provisional**, the `pll_id` sweep shows only which values
+*bail* (3-8 are indistinguishable at zero seed) and **not which one is correct**, and the real value
+must still be derived from silicon. Bite ③ takes a snapshot and re-runs this.
+
 ### Derived — what "cold" actually requires (source + burn history, adversarially verified)
 
 - ⭐ **Nothing in AGNOS has ever programmed a pixel clock or a PLL.** `atom.cyr` carries only the
