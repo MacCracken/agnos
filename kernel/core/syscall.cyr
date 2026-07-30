@@ -4505,12 +4505,18 @@ fn mdo_dump() {
     # since the alternative is discovering the gap during adjudication.
     # ⚠ LOWER BOUND, deliberately stated: every read in that sweep returned 0, so the table walked a
     # zeroed machine's branches. Real values may steer it somewhere with a wider read set.
+    # ⛔ WIDENED AFTER BURN 1. The first version captured only the two indices #12 WRITES, and both
+    # read ZERO on the live pipe — a true reading that told us almost nothing on its own. The live
+    # value in this block turned out to sit one dword further on, at 0x142 (598,875,000, ~599 MHz),
+    # which only the pre-existing M1-BASE1 group happened to catch. ⇒ Capture the NEIGHBOURHOOD, not
+    # just the write set: a command's write targets and a block's live contents are different
+    # questions, and a dump scoped to the former cannot answer the latter.
     kprintln("modeset: dump group M12-pixclk", 30);
-    mdo_rd2a(0x0140); mdo_rd2a(0x0141);
-    mdo_rd2a(0x0144); mdo_rd2a(0x0145);
+    mdo_rd2a(0x0140); mdo_rd2a(0x0141); mdo_rd2a(0x0142); mdo_rd2a(0x0143);
+    mdo_rd2a(0x0144); mdo_rd2a(0x0145); mdo_rd2a(0x0146); mdo_rd2a(0x0147);
     mdo_rd2a(0x5001); mdo_rd2a(0x5081);
 
-    kprintln("modeset: dump end -- 107 registers (M1 67 + M2 10 + M3 4 + M8 12 + DIGBE 8 + PIXCLK 6)", 86);
+    kprintln("modeset: dump end -- 111 registers (M1 67 + M2 10 + M3 4 + M8 12 + DIGBE 8 + PIXCLK 10)", 87);
     return 0;
 }
 

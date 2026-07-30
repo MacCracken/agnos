@@ -288,24 +288,23 @@ var GPU_R_DP_DTO_PHASE        = 0x81;   # OTGn, stride 4: = the live PIXEL CLOCK
 var GPU_R_DP_DTO_MODULO       = 0x82;   # OTGn, stride 4: = DPREFCLK in Hz as VBIOS programmed it (~600e6)
 var GPU_DCN_PIXRATE_STRIDE    = 0x4;
 var GPU_DP_DTO_ENABLE         = 0x10;   # PIXEL_RATE_CNTL bit4
-# --- the pixel-clock PLL pair ATOM #12 writes (1.56.33 bite 1) -------------------------------
-# ⚠⚠ NAMES ARE PROVISIONAL AND THE EVIDENCE IS ONE ZERO-SEED DRY RUN. atom-interp.py stepping
-# SetPixelClock v1.7 with pll_id>=3 writes exactly these two indices, in a ctrl / data / ctrl
-# pattern — `[0x140] <- 0`, `[0x141] <- 0x0E650730`, `[0x140] <- 0x10` — where 0x140 = DCN_1 + 0x80.
-# ⛔ The FUNCTION is inferred from that pattern, not read from a datasheet, and every read in that
-# run returned 0 so the table walked a zeroed machine's path. Treat these names as a hypothesis the
-# next iron dump either confirms or kills; do not let the name become the evidence.
-# ⭐ They ARE inside the already-vetted DCCG window (0xC0-0x1FF absolute), and #12 touches NOTHING
-# in the PHY (0x5Dxx-0x5Exx), the UNIPHY power block (0x55xx) or the OTG (0x1A00-0x1BFF) — which is
-# what makes it a different risk class from #76.
-# ⭐ PER-PIPE, STRIDE 4 — and the single-run trace HID this. One dry run at crtc=0 showed only
-# 0x140/0x141 and would have shipped these as fixed offsets. Sweeping crtc_id 0..1 moved the pair to
-# 0x144/0x145, i.e. the same 4-dword stride the pixel-RATE block already uses (GPU_DCN_PIXRATE_STRIDE).
-# ⛔ The lesson is the sweep, not the number: a footprint measured at ONE parameter value is a slice,
-# not the shape. Always vary the selector before naming a register.
-var GPU_R_DCCG_PIXCLK_CNTL   = 0x80;   # + pipe * GPU_DCCG_PIXCLK_STRIDE. Written 0 then 0x10 around the divider
-var GPU_R_DCCG_PIXCLK_DIV    = 0x81;   # + pipe * GPU_DCCG_PIXCLK_STRIDE. Divider/feedback word (0x0E650730 @ zero seed)
-var GPU_DCCG_PIXCLK_STRIDE   = 0x4;    # measured: crtc 0 -> 0x140/0x141, crtc 1 -> 0x144/0x145
+# --- ATOM #12's write targets: THEY WERE ALREADY NAMED, 30 LINES BELOW. ----------------------
+#
+# ⛔⛔ 1.56.33 ADDED THREE DUPLICATE DEFINITIONS HERE FOR REGISTERS THIS FILE ALREADY DEFINED, and
+# the whole detour is worth one comment so nobody repeats it. `#12` was traced writing DCN_1 + 0x80
+# and 0x81; those were named GPU_R_ATOM12_TARGET_CNTL/_DATA "provisionally", the burn read them as
+# ZERO on a live pipe, and that was written up as "#12 targets a PLL this pipe is not using".
+# ⇒ ALL OF IT WAS AN ARTIFACT OF NOT READING THE REGISTER TABLE FIRST:
+#     DCN_1 + 0x80 = GPU_R_OTG_PIXEL_RATE_CNTL   (bit4 DP_DTO_ENABLE — the DP/HDMI discriminator)
+#     DCN_1 + 0x81 = GPU_R_DP_DTO_PHASE          (the live pixel clock in Hz, when the DTO is on)
+#     DCN_1 + 0x82 = GPU_R_DP_DTO_MODULO         (DPREFCLK in Hz, ~600e6)
+# ⭐ And the ZERO was never evidence of a dead PLL — it is DP_DTO_ENABLE **clear**, i.e. the DTO is
+# OFF, which is the CORRECT state for a PLL-driven HDMI pipe. The iron reading is a clean positive
+# result read backwards: MODULO = 598,875,000 matches this file's own "~600e6" prediction exactly.
+# ⇒ **This pipe is PLL-driven, so ATOM #12 IS the right mechanism for the cold path.**
+# ⚠ These offsets sit next to RISK R5 (0x0080 means different things on BASE_IDX 1 vs 2, and the
+# wrong base POWER-GATES A LIVE PIPE). Deriving a register identity from a command trace instead of
+# from this table is exactly how one ends up on the wrong side of that.
 
 var GPU_R_DCCG_AUDIO_DTO_SRC  = 0xAB;   # DTO0_SOURCE_SEL[2:0], DTO_SEL[5:4], DTO2_USE_512FBR_DTO b20 (GLOBAL → RMW only)
 var GPU_R_DCCG_AUDIO_DTO0_PHASE  = 0xAC;  # HDMI path

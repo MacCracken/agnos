@@ -11446,12 +11446,22 @@ fn gpu_pll_discover() {
     # not using and call it evidence — the stride was found by sweeping crtc_id, not by one trace.
     var pipe = gpu_display_pipe;
     if (pipe < 0) { pipe = 0; }
-    var po = pipe * GPU_DCCG_PIXCLK_STRIDE;
-    var c = gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_PIXCLK_CNTL + po) & 0xFFFFFFFF;
-    var d = gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_PIXCLK_DIV + po) & 0xFFFFFFFF;
-    kprint("gpu: pixclk pll pipe ", 21); kprint_num(pipe);
+    var po = pipe * GPU_DCN_PIXRATE_STRIDE;
+    # ⚠ BASE_IDX 1. On BASE_IDX 2 the same 0x80 is DCPG_DOMAIN0_PG_CONFIG and writing it POWER-GATES
+    # A LIVE PIPE (RISK R5). These are reads, but the base must still be stated at the call site.
+    var c = gpu_reg32(GPU_BASE_DCN_1, GPU_R_OTG_PIXEL_RATE_CNTL + po) & 0xFFFFFFFF;
+    var d = gpu_reg32(GPU_BASE_DCN_1, GPU_R_DP_DTO_PHASE + po) & 0xFFFFFFFF;
+    var b = gpu_reg32(GPU_BASE_DCN_1, GPU_R_DP_DTO_MODULO + po) & 0xFFFFFFFF;
+    kprint("gpu: atom12 target pipe ", 24); kprint_num(pipe);
     kprint(" cntl ", 6); kprint_hex(c);
-    kprint(" div ", 5); kprint_hex(d); kprintln("", 0);
+    kprint(" data ", 6); kprint_hex(d);
+    kprint(" blk82 ", 7); kprint_hex(b); kprintln("", 0);
+    # ⭐ IRON, 1.56.33 burn 1: cntl and data both read ZERO on the live pipe while blk82 carries
+    # ~599 MHz. So #12's target is very likely a PLL this display is not using — refusing is not
+    # merely cautious here, it is the difference between programming the live clock and a dead one.
+    if (c == 0) {
+        kprintln("gpu: atom12 target reads ZERO on a LIVE pipe -- it is not this pipe's clock", 75);
+    }
     kprintln("gpu: pll instance NOT derivable yet -- refusing to name one (see gpu_pll_discover)", 82);
     return 0 - 1;
 }
