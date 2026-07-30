@@ -3,6 +3,67 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.33] - 2026-07-30
+
+**MODESET — the COLD case. Cycle OPEN.** Bumped on cycle open; the user tags on close.
+
+### Fixed — the plan's own stated prerequisite, and it was still live
+
+⛔⛔ **`gpu.md` still recorded `MD-2 (phyid)` as "SETTLED: phyid=0" in the M8 row — including among
+its six mandatory gates before firing ATOM `#76`** — while three other rows recorded it overturned to
+`phyid=1` on iron six days earlier (2026-07-24). **That is the checklist a person reads immediately
+before running the arc's most destructive command, and it named the value that writes the DEAD
+instance** — the one that produced an 87,292-read poll storm against an unconfigured PHY.
+
+The kernel was never wrong: `gpu_phy_discover()` derives the instance from live silicon (`DIG_BE_EN_CNTL`
+bit0 · `FE_SOURCE_SELECT` ≠ 0 · `DIG_MODE` ∈ {2,3}, all three required) and
+`atom_run_transmitter_enable_hdmi()` **refuses** when nothing is live rather than falling back to 0.
+Only the plan was wrong. Both stale claims corrected in place, and the gate re-stated as what it
+should always have been: ⭐ **the gate is that the value was DERIVED from silicon and not guessed —
+not that it equals any particular number.**
+
+### Fixed — the recovery net had a hole positioned exactly where the cold path adds risk
+
+⭐⭐ **The modeset watchdog's recovery re-run restored SIX registers out of the TWENTY its own
+pre-risk save captures.** It replayed `DIG_BE_CNTL`, `OTG_CONTROL`, `H_TOTAL`, `V_TOTAL`,
+`OTG_CLOCK_CONTROL` and `OPTC_INPUT_CLOCK_CONTROL`, and skipped `H_BLANK_START_END`, `H_SYNC_A`,
+`H_SYNC_A_CNTL`, `H_TIMING_CNTL`, `V_TOTAL_MIN/MAX/CONTROL`, `V_BLANK_START_END`, `V_SYNC_A`,
+`V_SYNC_A_CNTL`, `INTERLACE_CONTROL`, `VSTARTUP_PARAM`, `VUPDATE_PARAM`, `VREADY_PARAM` and
+`VTG0_CONTROL`.
+
+**That was sound for every shipped rung and only for them** — M5 writes `V_TOTAL` alone, M6 replays
+the same mode, M8 touches PHY/DIG and not the raster — so the other fourteen still held their
+inherited values and restoring them would have been a no-op.
+
+⚠ **The cold path breaks that premise precisely.** Those fourteen registers *are* the raster program:
+they are what a cold bring-up writes. The moment one is programmed from a mode description rather
+than replayed from a snapshot, a six-register re-run can no longer reconstruct the inherited mode —
+and the watchdog, which has already relit this panel after a real `#76` PHY power-cycle, would have
+been unable to relight it after a raster reprogram. ⇒ **Widening the restore is a PREREQUISITE of the
+cold work, not a follow-up to it**, and it lands before any cold write exists to be recovered from.
+
+Every write in the re-run is a value read from the same pipe moments earlier, so this is a pure
+restore — the safest class of write there is. Verified mechanically: **20 registers saved, 20
+restored, none missing.** `check.sh` 23/23; `modeset-tool-smoke` **20/0**.
+
+### Derived — what "cold" actually requires (source + burn history, adversarially verified)
+
+- ⭐ **Nothing in AGNOS has ever programmed a pixel clock or a PLL.** `atom.cyr` carries only the
+  generic `atom_execute_table(index, ps_size)` plus wrappers for `#4` and `#76`; there is **no `#12`
+  wrapper and no parameter-struct builder**. Host-side, `atom-interp.py`'s `CMD_SetPixelClock = 12`
+  is a bare constant **referenced nowhere**, and its `--command` choices offer no route to run it.
+  `OTG_PIXEL_RATE_CNTL` / `DP_DTO_PHASE` / `DP_DTO_MODULO` appear **only as reads**; the sole DCCG
+  writes are the *audio* DTO. `#93`'s op table has no clock op. M7 is unstarted, not half-done.
+- ⚠ **"The live-pipe ladder is pure save-then-replay" is false and the correction matters.** Only M6
+  is same-mode replay. **M5 writes a `V_TOTAL` field of 1500 that was never read** and adjudicates it
+  against refresh predicted from `pixclk / (h_total × v_total)` — that is mode arithmetic, already
+  iron-validated to the milliHz. M8 runs `#4`/`#76` from hand-authored parameter blocks. So the cold
+  gap is narrower than "there is nothing to save": it is the **pixel PLL**, a **raster program written
+  from a mode description**, and **OTG bring-up where `mdo_wait_frame_stop`'s oracle inverts** (the
+  counter must *start*, and there is no prior frame count to compare against).
+- The `#93` ops live in `syscall.cyr:4146-5560`; `gpu.cyr` holds the primitives they call. A cold cut
+  touches **three** files — `syscall.cyr` (the op), `atom.cyr` (`#12`), `gpu.cyr` (raster/OTG primitives).
+
 ## [1.56.32] - 2026-07-30
 
 ### ✅✅ RUNG 19 CLOSED ON IRON 2026-07-30 — `DIFFER: 0 of 256000 px` (`cart2.txt`)

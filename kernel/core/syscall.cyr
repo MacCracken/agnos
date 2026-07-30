@@ -5254,8 +5254,38 @@ fn mdo_transmit_run(arm) {
         gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL, s_ctrl & (0 - 1 - GPU_OTG_MASTER_EN));
         gpu_mfence();
         gpu_dcn_hold_ms(60);
+        # ⛔⛔ THE FULL SAVE SET, NOT A SUBSET — WIDENED 1.56.33 BEFORE THE COLD PATH, NOT AFTER.
+        # This re-run used to restore SIX registers (BE, CONTROL, H_TOTAL, V_TOTAL, CLOCK_CONTROL,
+        # OPTC_INPUT_CLOCK_CONTROL) out of the twenty the save captures. That was SOUND FOR EVERY
+        # SHIPPED RUNG and only for them: M5 writes V_TOTAL alone, M6 replays the same mode, M8
+        # touches PHY/DIG and not the raster at all — so the other fourteen were still holding their
+        # inherited values and restoring them was a no-op.
+        # ⚠ THE COLD PATH BREAKS THAT PREMISE EXACTLY. H_BLANK / H_SYNC_A / H_TIMING_CNTL / V_BLANK /
+        # V_SYNC_A / VSTARTUP / VUPDATE / VREADY / VTG0 **are** the raster program — they are what a
+        # cold bring-up writes. The moment one is programmed from a mode description, a six-register
+        # re-run can no longer reconstruct the inherited mode, and the recovery net would have a hole
+        # positioned precisely under the new risk. Widening it is therefore a PREREQUISITE of the
+        # cold work, not a follow-up to it.
+        # ⭐ Every write here is a value read from THIS pipe moments ago (the save at the top of this
+        # op), so this is a pure restore — the safest class of write there is. Order mirrors the save:
+        # H group, V group, the DCN timing-generator params, then the clocks, then re-enable.
         gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_H_TOTAL, s_htot);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_H_BLANK_START_END, s_hbl);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_H_SYNC_A, s_hsa);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_H_SYNC_A_CNTL, s_hsac);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_H_TIMING_CNTL, s_htc);
         gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL, s_vtot);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL_MIN, s_vmin);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL_MAX, s_vmax);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL_CONTROL, s_vctl);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_BLANK_START_END, s_vbl);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_SYNC_A, s_vsa);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_SYNC_A_CNTL, s_vsac);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_INTERLACE_CONTROL, s_intl);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_VSTARTUP_PARAM, s_vst);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_VUPDATE_PARAM, s_vup);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_VREADY_PARAM, s_vrd);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_VTG0_CONTROL, s_vtg);
         gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CLOCK_CONTROL, s_occ);
         gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OPTC_INPUT_CLOCK_CONTROL, s_oicc);
         gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL, s_ctrl);
