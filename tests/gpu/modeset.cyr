@@ -217,6 +217,51 @@ fn modeset_vtotal(): i64 {
 #   95 = envelope OK (stopped then resumed, rate restored)   89 = disable did NOT stop the pipe (envelope no-op)
 #   96 = no GPU here (QEMU)             91 = pipe DARK -- did not resume (recover via H2)   90 = OPTC underflow
 #   92 = off-rate after re-enable       94 = refused (not calibrated / DRR on)   97 = unmeasurable   98 = latch
+# --pixclk — 1.56.33. Dispatch MDO_OP_PIXCLK (0x09) and REPORT THE REFUSAL AS A PASS.
+#
+# ⛔⛔ THIS FLAG WAS MISSING WHEN THE BURN WAS FIRST PRE-REGISTERED, and the gap is worth recording
+# because of its shape: the kernel op landed, the dump group landed, the rubric said "run
+# /bin/modeset --pixclk", and the tool had no such flag. It would have fallen through to usage —
+# and "no output for --pixclk" is INDISTINGUISHABLE from "the op refused silently", which is exactly
+# the class of burn line that cannot be adjudicated. Caught by the operator's stage-check reporting
+# the binary as byte-identical: it was, because nothing had been written here yet.
+#
+# ⭐ REASON 24 (MDO_E_NOPLL) IS THE EXPECTED, CORRECT ANSWER and exits 95. `pll_id` is #12's `phyid`
+# and no rule derives it from silicon yet, so the kernel refuses rather than guessing. Reporting
+# that as a failure would train the operator to treat the safety property as a defect.
+fn modeset_pixclk(): i64 {
+    var rec[64];
+    var i = 0;
+    while (i < 16) { store32(&rec + i * 4, 0); i = i + 1; }
+    store32(&rec + 0, 9);                                    # op = MDO_OP_PIXCLK (0x09)
+    var r = sys_gpu_modeset_op(&rec, 64);
+    if (r < 0) {
+        var code = 0 - r;
+        var reason = code & 0xFF;
+        m_puts("modeset: #93 pixclk idx="); m_num(code >> 8);
+        m_puts(" reason="); m_num(reason); m_nl();
+        if (reason == 24) {
+            m_puts("modeset: REFUSED with MDO_E_NOPLL -- and that is the PASS."); m_nl();
+            m_puts("modeset:   the PLL instance is not derivable from live silicon yet, so the"); m_nl();
+            m_puts("modeset:   kernel refuses instead of guessing. pll_id 0/1/2 make ATOM #12 bail"); m_nl();
+            m_puts("modeset:   with ZERO writes -- a clean return that reads exactly like success."); m_nl();
+            return 95;
+        }
+        if (reason == 1) { m_puts("modeset: no GPU / no live display -- QEMU has no DCN"); m_nl(); return 96; }
+        if (reason == 23) {
+            m_puts("modeset: derived OK but this build cannot execute #12 (ATOM_RUN_PIXCLK unset)"); m_nl();
+            m_puts("modeset: ** UNEXPECTED at this cut ** -- it got PAST gpu_pll_discover, which"); m_nl();
+            m_puts("modeset: refuses unconditionally. The refusal ordering is wrong. STOP."); m_nl();
+            return 89;
+        }
+        m_puts("modeset: unexpected refusal -- read the reason against MDO_E_* before proceeding"); m_nl();
+        return 94;
+    }
+    m_puts("modeset: ** #12 RETURNED SUCCESS ** -- it should be unreachable in this build."); m_nl();
+    m_puts("modeset: STOP. A clock command executed that nothing was supposed to be able to run."); m_nl();
+    return 88;
+}
+
 fn modeset_recommit(): i64 {
     var rec[64];
     var i = 0;
@@ -411,6 +456,7 @@ fn modeset_main(): i64 {
         if (streq(a1, "--lock") == 1) { return modeset_lock(); }
         if (streq(a1, "--vtotal") == 1) { return modeset_vtotal(); }
         if (streq(a1, "--recommit") == 1) { return modeset_recommit(); }
+        if (streq(a1, "--pixclk") == 1) { return modeset_pixclk(); }
         if (streq(a1, "--transmitter") == 1) { return modeset_transmitter(); }
         if (streq(a1, "--audio-pre") == 1) { return modeset_audio_pre(); }
         if (streq(a1, "--audio-post") == 1) { return modeset_audio_post(); }
@@ -418,7 +464,7 @@ fn modeset_main(): i64 {
         # ⛔ AN ARGUMENT WE DO NOT KNOW IS AN ERROR, NOT A CAPS PROBE. Silently running a
         # different operation than the one asked for is how a typo becomes a wasted burn.
         m_puts("modeset: UNKNOWN ARGUMENT -- no operation was performed."); m_nl();
-        m_puts("modeset: valid: --dump --lock --vtotal --recommit --transmitter"); m_nl();
+        m_puts("modeset: valid: --dump --lock --vtotal --recommit --transmitter --pixclk"); m_nl();
         m_puts("modeset:        --audio-pre --audio-post --caps"); m_nl();
         return 84;
     }
