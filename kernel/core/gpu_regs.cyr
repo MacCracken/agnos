@@ -1494,13 +1494,25 @@ var GPU_MMF_C_SUBOFF         = 0x1B800;     # f64 C[64] output (C[tid] = matmul 
 # V_TOTAL_MIN/_MAX = 0x5C8 = 1480, V_SYNC_A = 0x00050000 = a 5-line pulse, H_SYNC_A = 0x00200000 = 32.
 
 # --- OTG raster: sync + totals (M5 writes V_TOTAL/_MIN/_MAX; M6 reprograms the whole group) ---
-var GPU_R_OTG_H_SYNC_A                 = 0x1B2C; # BASE_IDX 2, abs 0x4FEC. H_SYNC_A: width [15:0], start [31:16]. amdgpu last 0x00200000 = 32
+# ⛔ THE FIELD ORDER ON THIS LINE WAS INVERTED UNTIL 1.56.33, and its own witness disproved it.
+# It read "width [15:0], start [31:16]". The DCN headers say OTG_H_SYNC_A_START is [15:0] and
+# OTG_H_SYNC_A_END is [31:16], and the annotation right here — 0x00200000 "= 32" — puts the 32 in the
+# HIGH half, so under the stated order this pipe would be running a ZERO-WIDTH horizontal sync.
+# ⭐ Settled against the iron capture, not against a header: the live pipe reads H_SYNC_A 0x00200000
+# and V_SYNC_A 0x00050000, and CVT-RB 2560x1440 has a 32-pixel hsync and a 5-line vsync. Both widths
+# land in the high half. ⇒ START [15:0], END [31:16], and amdgpu's optc1_program_timing writes START
+# as a literal 0 with END = the sync width, which is exactly what the two captured values are.
+var GPU_R_OTG_H_SYNC_A                 = 0x1B2C; # BASE_IDX 2, abs 0x4FEC. START [15:0], END [31:16]. amdgpu last 0x00200000 = end 32
 var GPU_R_OTG_H_SYNC_A_CNTL            = 0x1B2D; # BASE_IDX 2, abs 0x4FED. polarity bit0. amdgpu last 0x00000000
 var GPU_R_OTG_V_TOTAL_MIN              = 0x1B30; # BASE_IDX 2, abs 0x4FF0. amdgpu last 0x000005C8 = 1480 — an M1 anchor
 var GPU_R_OTG_V_TOTAL_MAX              = 0x1B31; # BASE_IDX 2, abs 0x4FF1. amdgpu last 0x000005C8 = 1480 — an M1 anchor
 var GPU_R_OTG_V_TOTAL_CONTROL          = 0x1B33; # BASE_IDX 2, abs 0x4FF3. min/max sel, drr. amdgpu last 0x00020003
-var GPU_R_OTG_V_SYNC_A                 = 0x1B37; # BASE_IDX 2, abs 0x4FF7. amdgpu last 0x00050000 = 5-line pulse — an M1 anchor
+var GPU_R_OTG_V_SYNC_A                 = 0x1B37; # BASE_IDX 2, abs 0x4FF7. START [15:0], END [31:16]. amdgpu last 0x00050000 = end 5 — an M1 anchor
 var GPU_R_OTG_V_SYNC_A_CNTL            = 0x1B38; # BASE_IDX 2, abs 0x4FF8. polarity bit0. amdgpu last 0x00000001
+# --- sync field encodings (1.56.33 bite 4, the raster program) ---
+var GPU_OTG_SYNC_MASK          = 0x7FFF; # both halves of H/V_SYNC_A are [14:0] within their 16-bit lane
+var GPU_OTG_SYNC_END_SHIFT     = 16;     # ...A_END occupies [31:16]; ...A_START is [15:0]
+var GPU_OTG_SYNC_POL           = 0x1;    # H/V_SYNC_A_CNTL bit0: 0 = positive-going sync, 1 = negative
 var GPU_R_OTG_TRIGA_CNTL               = 0x1B39; # BASE_IDX 2, abs 0x4FF9. amdgpu last 0x80010015
 var GPU_R_OTG_TRIGA_MANUAL_TRIG        = 0x1B3A; # BASE_IDX 2, abs 0x4FFA. amdgpu wrote this 207x — the per-frame trigger
 

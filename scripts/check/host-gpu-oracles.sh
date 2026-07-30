@@ -8,7 +8,7 @@
 # cannot fail in practice.
 #
 # ⚠ SCOPE, STATED HONESTLY: this runs texlist, bigate, bimodel, texgate, rtaudit, depthgate, perspbits, perspdiv, perspgate, perspmodel,
-# depthmodel and depthdiv. It
+# depthmodel, depthdiv and moderaster. It
 # does NOT run doomcol, doomwall, edgemodel or refraster — those are equally host-runnable and
 # equally unwired, and adding them is a separate bite rather than something smuggled in beside a rung.
 # ⚠ This line has gone stale twice as oracles were added; it is the drift the tree keeps finding in
@@ -92,7 +92,16 @@ export CYRIUS_ALLOW_PARENT_INCLUDES
 mkdir -p "$GPU/build"
 
 rc=0
-for t in texlist bigate bimodel texgate rtaudit depthgate depthmodel depthdiv perspbits perspdiv perspgate perspmodel; do
+# ⭐ moderaster ADDED AT 1.56.33 BITE 4, and it is the only oracle here with NO shared premise to
+# design around: it INCLUDES `kernel/core/mode_raster.cyr` rather than mirroring it, so there is one
+# implementation; its input is the published CVT-RB 2560x1440 timing; and its expected output is the
+# register set archaemenid's firmware left in the pipe, captured read-only on 2026-07-30. VESA on one
+# side, this board's GOP on the other, our arithmetic in the middle having authored neither.
+# ⚠ Its M1 mutation FAILED on its first run and the BUILDER was right — `blank_end = h_total -
+# h_front - h_active` cancels the front porch exactly, so h_front reaches H_TOTAL and never H_BLANK.
+# Both directions are now pinned (M1/M1c assert the cancellation, M1b asserts the register still
+# moves), because a change folding h_front into the blank formula would otherwise be invisible.
+for t in texlist bigate bimodel texgate rtaudit depthgate depthmodel depthdiv perspbits perspdiv perspgate perspmodel moderaster; do
     out="$(cd "$GPU" && cyrius build "$t.cyr" "build/$t" 2>&1)" || {
         echo "host-gpu-oracles: FAIL -- $t.cyr does not BUILD"
         echo "$out" | tail -20

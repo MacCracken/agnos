@@ -4237,6 +4237,13 @@ var MDO_E_NOHDMI     = 23;
 # a clean return that is indistinguishable from success, which is exactly how phyid=0 survived six
 # days pointed at a dead PHY. The tool reports "the kernel cannot name the PLL" and nobody guesses.
 var MDO_E_NOPLL      = 24;
+# ⭐ A DIFFERENT FACT FROM 24, AND SHARING A CODE WOULD HAVE HIDDEN IT. 24 says "this pipe has a PLL
+# and the kernel cannot name which one". This says "this pipe has NO PLL — its pixel clock comes from
+# the DTO, so ATOM #12 is the wrong command class entirely and no derivation rule would help." Not
+# reachable on archaemenid's HDMI link (DP_DTO_ENABLE reads clear, which is why #12 IS right here),
+# but a DP panel drives the DTO and would land on it. Minted with the refusal rather than after the
+# first burn that hit it, on the same reasoning that put MDO_E_NOHDMI on its own number.
+var MDO_E_DTOCLK     = 25;
 
 # mdo_caps_write(out_uva) -> 0 / MDO_E_OUTBUF. Writes 8x u32 LE describing the modeset surface. READ-ONLY of
 # kernel state; the ONLY write is to the validated user buffer, via the gpu_caps_sys direct-store idiom.
@@ -5602,10 +5609,21 @@ fn mdo_pixclk() {
     kprint(" crtc ", 6); kprint_num(gpu_display_pipe); kprintln("", 0);
 
     var pll = gpu_pll_discover();
+    # ⭐ -2 and -1 are DIFFERENT REFUSALS and the tool must be able to tell them apart. -2 says the
+    # pixel clock comes from the DTO, so #12 is the wrong command class and no PLL rule would help;
+    # -1 says #12 IS right for this pipe and only the instance is missing. Collapsing them would
+    # report "cannot name the PLL" for a pipe that has none — the failure mode MDO_E_NOHDMI was
+    # split off 14 to avoid, where a correct diagnosis reads as the wrong kind of problem.
+    if (pll == 0 - 2) {
+        kprintln("modeset: PIXCLK REFUSED -- this pipe's clock comes from the DTO, not a PLL", 74);
+        kprintln("modeset:   ATOM #12 programs a PLL, so it is the wrong command for this pipe.", 77);
+        return MDO_E_DTOCLK;
+    }
     if (pll < 0) {
         kprintln("modeset: PIXCLK REFUSED -- the PLL instance is not derivable from live silicon", 78);
-        kprintln("modeset:   pll_id 0/1/2 make ATOM #12 bail with ZERO writes -- a clean return that", 82);
-        kprintln("modeset:   reads exactly like success. Guessing here is how phyid=0 survived.", 77);
+        kprintln("modeset:   the DTO is off, so #12 IS the right command here -- only the instance", 80);
+        kprintln("modeset:   is missing. pll_id 0/1/2 make ATOM #12 bail with ZERO writes, a clean", 80);
+        kprintln("modeset:   return that reads exactly like success. Guessing is how phyid=0 lived.", 81);
         return MDO_E_NOPLL;
     }
 

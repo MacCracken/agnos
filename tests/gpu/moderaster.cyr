@@ -1,0 +1,239 @@
+# moderaster.cyr — BITE 4's HOST PROOF: the raster program rebuilds the INHERITED MODE exactly.
+#
+# ⭐⭐ THIS FILE INCLUDES THE KERNEL'S BUILDER, IT DOES NOT MIRROR IT. `mr_raster_build` is compiled
+# here from `kernel/core/mode_raster.cyr` — the same text the kernel links — so there is exactly ONE
+# implementation and nothing for a second one to agree with. ⛔ That is the rung-15 failure designed
+# out rather than gated around: bicore, bimodel, texcore and the shader all agreed about a convention
+# that was wrong, every gate built on their agreement went green, and a half-texel offset shipped.
+# ⚠ rtaudit.cyr's header states that including a kernel module from a host test "is not possible" and
+# mirrors its constants instead, with a script diffing the mirror. That claim was never tested and it
+# is FALSE — gpu_regs.cyr and mode_raster.cyr both include and build here under
+# CYRIUS_ALLOW_PARENT_INCLUDES=1. rtaudit's mirror is gated so it is not wrong, merely more expensive
+# than it needed to be; noted rather than churned.
+#
+# --- WHAT MAKES THIS AN EXTERNAL ORACLE -----------------------------------------------------------
+# The inputs are the CVT-RB 2560x1440 standard timing. The expected outputs are the values the
+# FIRMWARE left in archaemenid's pipe, captured by `modeset --dump` on 2026-07-30 (agnosticos
+# `docs/development/prior-art/dcn-modeset-pixclk-m12-iron-0730.txt`, group M1-OTG0). Neither side
+# was produced by the code under test, and the two were authored by parties that have never
+# communicated: VESA and whoever wrote this board's GOP.
+# ⇒ A green here means "a published mode description, run through our arithmetic, reproduces silicon
+# bit for bit" — not "two things we wrote this week agree".
+#
+# --- WHAT IT DOES NOT PROVE, STATED BEFORE THE GREEN CAN BE OVER-READ -----------------------------
+# ⛔ That a COLD pipe programmed with these values will light. It proves the arithmetic reconstructs a
+# mode that already works. Bite 5 is where the write happens, inside the widened watchdog, and its
+# oracle INVERTS: the frame counter must START, with no prior count to compare against.
+# ⛔ And it proves nothing at all about VSTARTUP_PARAM / VUPDATE_PARAM / VREADY_PARAM / VTG0_CONTROL.
+# Those are DML outputs, no mode description yields them, the builder does not emit them, and the
+# cold path must carry them from the inherited snapshot. Ten of the fourteen raster registers.
+#
+# Exit 95 = all checks pass · 90 = a check or a mutation failed.
+
+include "lib/io.cyr"
+include "tricore.cyr"                         # ps / pn / nl / print
+include "../../kernel/core/gpu_regs.cyr"      # field masks and shifts — the kernel's own
+include "../../kernel/core/mode_raster.cyr"   # ⭐ THE BUILDER ITSELF, not a copy of it
+
+# --- the iron capture, archaemenid 2026-07-30, `modeset --dump` group M1-OTG0 --------------------
+# ⚠ Offsets are the decimal ones the dump prints, so a reader can find each line in that capture by
+# eye. These are NOT derived from anything in this repo's arithmetic — they were read out of a live
+# display engine by a kernel that only read.
+var IRON_H_TOTAL     = 2719;        # rd 6954  (0x1B2A)  h_total 2720 - 1
+var IRON_H_BLANK     = 7342704;     # rd 6955  (0x1B2B)  start 2672, end 112
+var IRON_H_SYNC_A    = 2097152;     # rd 6956  (0x1B2C)  start 0, end 32
+var IRON_H_SYNC_CNTL = 0;           # rd 6957  (0x1B2D)  positive-going hsync
+var IRON_H_TIMING    = 0;           # rd 6958  (0x1B2E)  DIV_BY2 clear
+var IRON_V_TOTAL     = 1480;        # rd 6959  (0x1B2F)  v_total 1481 - 1
+var IRON_V_BLANK     = 2491846;     # rd 6966  (0x1B36)  start 1478, end 38
+var IRON_V_SYNC_A    = 327680;      # rd 6967  (0x1B37)  start 0, end 5
+var IRON_V_SYNC_CNTL = 1;           # rd 6968  (0x1B38)  negative-going vsync
+var IRON_INTERLACE   = 0;           # rd 6980  (0x1B44)  progressive
+
+var mr_fails = 0;
+
+fn mrk(name, nlen, got, want): i64 {
+    ps("  "); print(name, nlen); ps(": ");
+    if (got == want) { ps("PASS ("); pn(got); ps(")"); nl(); return 0; }
+    ps("FAIL (got "); pn(got); ps(", want "); pn(want); ps(")"); nl();
+    mr_fails = mr_fails + 1;
+    return 1;
+}
+
+# mrk_ne — a mutation must MOVE the value. A gate that cannot fail has not passed.
+fn mrk_ne(name, nlen, got, was): i64 {
+    ps("  "); print(name, nlen); ps(": ");
+    if (got != was) { ps("PASS (moved to "); pn(got); ps(")"); nl(); return 0; }
+    ps("FAIL (unchanged at "); pn(got); ps(") -- the mutation is not connected"); nl();
+    mr_fails = mr_fails + 1;
+    return 1;
+}
+
+fn mrk_refuse(name, nlen, rc): i64 {
+    ps("  "); print(name, nlen); ps(": ");
+    if (rc == 0 - 1) { ps("PASS (refused)"); nl(); return 0; }
+    ps("FAIL (accepted, rc "); pn(rc); ps(") -- an illegal description built a raster"); nl();
+    mr_fails = mr_fails + 1;
+    return 1;
+}
+
+fn main(): i64 {
+    var mode[96];
+    var out[112];                              # 80 used + a 32-byte guard tail
+    var i = 0;
+
+    ps("moderaster -- the raster program vs the INHERITED MODE (iron 2026-07-30)"); nl(); nl();
+
+    # ── C1: CVT-RB 2560x1440 in, archaemenid's live registers out ──────────────────────────────
+    ps("C1  CVT-RB 2560x1440 rebuilds the firmware's raster, register for register"); nl();
+    while (i < 112) { store64(&out + i, 0); i = i + 8; }
+    # ⚠ Guard pattern past the builder's last slot. If it ever writes an eleventh register the
+    # overrun is caught here rather than by whatever lives after `out` in the kernel's frame.
+    store64(&out + 80, 12345); store64(&out + 88, 12345);
+    store64(&out + 96, 12345); store64(&out + 104, 12345);
+
+    mr_mode_cvt_rb_2560x1440(&mode);
+    var rc = mr_raster_build(&mode, &out);
+    if (rc != 0) { ps("  FAIL: the standard timing was REFUSED, rc "); pn(rc); nl(); return 90; }
+
+    mrk("H_TOTAL           ", 18, load64(&out +  0), IRON_H_TOTAL);
+    mrk("H_BLANK_START_END ", 18, load64(&out +  8), IRON_H_BLANK);
+    mrk("H_SYNC_A          ", 18, load64(&out + 16), IRON_H_SYNC_A);
+    mrk("H_SYNC_A_CNTL     ", 18, load64(&out + 24), IRON_H_SYNC_CNTL);
+    mrk("H_TIMING_CNTL     ", 18, load64(&out + 32), IRON_H_TIMING);
+    mrk("V_TOTAL           ", 18, load64(&out + 40), IRON_V_TOTAL);
+    mrk("V_BLANK_START_END ", 18, load64(&out + 48), IRON_V_BLANK);
+    mrk("V_SYNC_A          ", 18, load64(&out + 56), IRON_V_SYNC_A);
+    mrk("V_SYNC_A_CNTL     ", 18, load64(&out + 64), IRON_V_SYNC_CNTL);
+    mrk("INTERLACE_CONTROL ", 18, load64(&out + 72), IRON_INTERLACE);
+    nl();
+
+    # ── C2: the builder stays inside its buffer ────────────────────────────────────────────────
+    ps("C2  the builder writes 10 slots and not an eleventh"); nl();
+    mrk("guard slot 10     ", 18, load64(&out +  80), 12345);
+    mrk("guard slot 11     ", 18, load64(&out +  88), 12345);
+    mrk("guard slot 12     ", 18, load64(&out +  96), 12345);
+    mrk("guard slot 13     ", 18, load64(&out + 104), 12345);
+    nl();
+
+    # ── C3: the decoded fields are the ones the boot path derived INDEPENDENTLY ────────────────
+    # ⭐ A third party to the comparison. `gpu_pixclk_discover` computes active/total/blanking by
+    # reading the registers and inverting the encoding; this file computes the same quantities from
+    # the CVT standard forwards. The boot log printed "2560x1440 total 2720x1481 blanking 160x41"
+    # before any of this existed, so agreement here is not two halves of one derivation.
+    ps("C3  totals and blanking agree with the boot path's independent decode"); nl();
+    var hb_v = load64(&out + 8);
+    var vb_v = load64(&out + 48);
+    var h_end = (hb_v >> GPU_OTG_BLANK_END_SHIFT) & GPU_OTG_BLANK_MASK;
+    var h_start = hb_v & GPU_OTG_BLANK_MASK;
+    var v_end = (vb_v >> GPU_OTG_BLANK_END_SHIFT) & GPU_OTG_BLANK_MASK;
+    var v_start = vb_v & GPU_OTG_BLANK_MASK;
+    mrk("h_total           ", 18, load64(&out + 0) + 1, 2720);
+    mrk("v_total           ", 18, load64(&out + 40) + 1, 1481);
+    mrk("h_active          ", 18, h_start - h_end, 2560);
+    mrk("v_active          ", 18, v_start - v_end, 1440);
+    mrk("h_blanking        ", 18, 2720 - (h_start - h_end), 160);
+    mrk("v_blanking        ", 18, 1481 - (v_start - v_end), 41);
+    nl();
+
+    # ── M1-M5: mutations. Each must MOVE a register the iron comparison above pinned. ──────────
+    # ⛔ Without these, C1 is a claim. Ten equalities that hold for a builder that ignores its input
+    # and returns ten constants would read exactly as green as ten that hold because the arithmetic
+    # is right — and the constants ARE sitting in this file, which is precisely how that mistake
+    # gets made.
+    ps("M1-M5  mutations move what they should move"); nl();
+
+    # ⭐ M1 WAS WRITTEN ASSERTING THAT h_front ALSO MOVES H_BLANK, AND THE MUTATION FALSIFIED IT ON
+    # ITS FIRST RUN — the builder was right and the assertion was wrong. `blank_end = h_total -
+    # h_front - h_active`, and `h_total` already CONTAINS h_front, so the term cancels exactly:
+    # blank_end is h_sync + h_back and the front porch cannot reach it. That is amdgpu's behaviour
+    # too, and it is now pinned in BOTH directions — M1 asserts the cancellation holds, M1b asserts
+    # the register is nonetheless reachable — because a "fix" folding h_front into the blank formula
+    # would otherwise be invisible to every check in this file.
+    mr_mode_set(&mode, 2560, 49, 32, 80, 0, 1440, 3, 5, 33, 1, 0, 0);   # h front porch +1
+    mr_raster_build(&mode, &out);
+    mrk_ne("M1 h_front+1 -> H_TOTAL   ", 26, load64(&out + 0), IRON_H_TOTAL);
+    mrk("M1 h_front+1 -> H_BLANK unmoved (it cancels)", 44, load64(&out + 8), IRON_H_BLANK);
+
+    mr_mode_set(&mode, 2560, 48, 32, 81, 0, 1440, 3, 5, 33, 1, 0, 0);   # h back porch +1
+    mr_raster_build(&mode, &out);
+    mrk_ne("M1b h_back+1 -> H_BLANK   ", 26, load64(&out + 8), IRON_H_BLANK);
+    mrk_ne("M1b h_back+1 -> H_TOTAL   ", 26, load64(&out + 0), IRON_H_TOTAL);
+
+    mr_mode_set(&mode, 2560, 48, 32, 80, 0, 1440, 4, 5, 33, 1, 0, 0);   # v front porch +1
+    mr_raster_build(&mode, &out);
+    mrk_ne("M1c v_front+1 -> V_TOTAL  ", 26, load64(&out + 40), IRON_V_TOTAL);
+    mrk("M1c v_front+1 -> V_BLANK unmoved (it cancels)", 45, load64(&out + 48), IRON_V_BLANK);
+
+    mr_mode_set(&mode, 2560, 48, 33, 80, 0, 1440, 3, 5, 33, 1, 0, 0);   # h sync width +1
+    mr_raster_build(&mode, &out);
+    mrk_ne("M2 h_sync+1  -> H_SYNC_A  ", 26, load64(&out + 16), IRON_H_SYNC_A);
+
+    mr_mode_set(&mode, 2560, 48, 32, 80, 1, 1440, 3, 5, 33, 0, 0, 0);   # both polarities flipped
+    mr_raster_build(&mode, &out);
+    mrk_ne("M3 hpol flip -> H_SYNC_CNTL", 27, load64(&out + 24), IRON_H_SYNC_CNTL);
+    mrk_ne("M3 vpol flip -> V_SYNC_CNTL", 27, load64(&out + 64), IRON_V_SYNC_CNTL);
+
+    mr_mode_set(&mode, 2560, 48, 32, 80, 0, 1441, 3, 5, 33, 1, 0, 0);   # v active +1
+    mr_raster_build(&mode, &out);
+    mrk_ne("M4 v_active+1 -> V_TOTAL  ", 26, load64(&out + 40), IRON_V_TOTAL);
+    mrk_ne("M4 v_active+1 -> V_BLANK  ", 26, load64(&out + 48), IRON_V_BLANK);
+
+    mr_mode_set(&mode, 2560, 48, 32, 80, 0, 1440, 3, 5, 33, 1, 1, 1);   # interlaced + div-by-2
+    mr_raster_build(&mode, &out);
+    mrk_ne("M5 interlace -> INTERLACE ", 26, load64(&out + 72), IRON_INTERLACE);
+    mrk_ne("M5 div2      -> H_TIMING  ", 26, load64(&out + 32), IRON_H_TIMING);
+    nl();
+
+    # ── R1-R5: refusals. An illegal description must not produce a raster. ─────────────────────
+    # ⚠ R2 is the one that matters most and it is the shape of a real defect: a ZERO sync width is
+    # what reading the sync field out of the wrong half of H_SYNC_A produces, and this tree recorded
+    # that field order backwards until this bite. The builder must refuse the artifact of its own
+    # documented bug rather than emit a zero-width pulse.
+    ps("R1-R5  illegal descriptions are refused, never clamped"); nl();
+
+    mr_mode_set(&mode, 0, 48, 32, 80, 0, 1440, 3, 5, 33, 1, 0, 0);
+    mrk_refuse("R1 zero h_active          ", 26, mr_raster_build(&mode, &out));
+
+    mr_mode_set(&mode, 2560, 48, 0, 80, 0, 1440, 3, 5, 33, 1, 0, 0);
+    mrk_refuse("R2 zero h_sync width      ", 26, mr_raster_build(&mode, &out));
+
+    mr_mode_set(&mode, 2560, 48, 32, 80, 0, 1440, 3, 0, 33, 1, 0, 0);
+    mrk_refuse("R3 zero v_sync width      ", 26, mr_raster_build(&mode, &out));
+
+    mr_mode_set(&mode, 40000, 48, 32, 80, 0, 1440, 3, 5, 33, 1, 0, 0);
+    mrk_refuse("R4 h_total past 15 bits   ", 26, mr_raster_build(&mode, &out));
+
+    mr_mode_set(&mode, 2560, 48, 32, 80, 2, 1440, 3, 5, 33, 1, 0, 0);
+    mrk_refuse("R5 polarity not 0 or 1    ", 26, mr_raster_build(&mode, &out));
+
+    mr_mode_set(&mode, 2560, 0 - 1, 32, 80, 0, 1440, 3, 5, 33, 1, 0, 0);
+    mrk_refuse("R6 negative front porch   ", 26, mr_raster_build(&mode, &out));
+
+    # ⭐ R7 IS THE ONE THE TOTAL CHECK DOES NOT COVER, and it was found by re-reading the builder
+    # rather than by anything failing. h_total = 32768 is legal (H_TOTAL holds total-1, [14:0]), but
+    # blank START = total - front_porch, so with a ZERO front porch START is 32768 too and the [14:0]
+    # mask wraps it to 0 — a raster whose blank begins at column zero, emitted silently.
+    mr_mode_set(&mode, 32000, 0, 32, 736, 0, 1440, 3, 5, 33, 1, 0, 0);
+    mrk_refuse("R7 blank START past 15 bit", 26, mr_raster_build(&mode, &out));
+
+    # ...and the same mode with a single line of front porch must still BUILD, or R7 is just the
+    # total check firing under a different name.
+    mr_mode_set(&mode, 32000, 1, 32, 735, 0, 1440, 3, 5, 33, 1, 0, 0);
+    var rc7 = mr_raster_build(&mode, &out);
+    mrk("R7b one px of front porch builds", 32, rc7, 0);
+    mrk("R7b blank START is 32767        ", 32, load64(&out + 8) & GPU_OTG_BLANK_MASK, 32767);
+    nl();
+
+    if (mr_fails == 0) {
+        ps("moderaster: ALL PASS -- CVT-RB 2560x1440 rebuilds the inherited raster exactly."); nl();
+        ps("  the 4 DML registers (VSTARTUP/VUPDATE/VREADY/VTG0) are NOT built here and must"); nl();
+        ps("  be carried from the inherited snapshot -- see mode_raster.cyr."); nl();
+        return 95;
+    }
+    ps("moderaster: "); pn(mr_fails); ps(" FAILED"); nl();
+    return 90;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

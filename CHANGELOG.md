@@ -136,6 +136,124 @@ refusing with `MDO_E_NOPLL` is the PASS**. It also carries the outstanding `gpud
 
 `check.sh` **23/23**; `modeset-tool-smoke` **20/0**; production build confirmed clean.
 
+### Fixed — the burn's correction reached `gpu_regs.cyr` and stopped there
+
+⛔⛔ **The register renaming landed in one file of two.** Burn 1 read `PIXEL_RATE_CNTL` and
+`DP_DTO_PHASE` as ZERO on the live pipe; that was written up as *"`#12` targets a PLL this pipe is not
+using"*, and then corrected — `cntl == 0` is `DP_DTO_ENABLE` **clear**, the DTO **off**, the correct
+state for a **PLL-driven** pipe, with `DP_DTO_MODULO = 598,875,000` matching this tree's own "~600e6"
+DPREFCLK prediction. `gpu_regs.cyr` got the correction. **`gpu.cyr` kept the retracted reading** — a
+header comment still calling `#12`'s target *"very likely a PLL this display is not using"*, and a
+console line printing **`atom12 target reads ZERO on a LIVE pipe -- it is not this pipe's clock`**.
+
+**Nothing was functionally wrong** — the reads already used the corrected names and the refusal held
+for its real reason — but the next burn would have printed a **retracted claim to the console**, out
+of the one function bites ④ and ⑤ are built on. ⭐ **Third time in this cut that a document asserted
+the state of an artifact instead of being derived from it**: the `--pixclk` rubric named a tool flag
+that did not exist, the MD-2 gate list named a `phyid` three other rows had overturned, and the
+correction reported itself landed in code it had not reached. **Before writing "landed", re-read the
+code.**
+
+- **`gpu_pll_discover()` tests `GPU_DP_DTO_ENABLE` BY NAME**, not a register against zero, and prints
+  `PIXEL_RATE_CNTL` / `DP_DTO_PHASE` / `DP_DTO_MODULO` under honest labels. Testing a named bit is
+  what makes the branch survive a register whose zero means something else.
+- ⭐ **Two DISTINGUISHABLE refusals**: **−1** PLL-driven with the instance underived (this panel), and
+  **−2** DTO-driven, where `#12` is the wrong command class outright. The refusal now stands on its
+  original and always-sufficient ground — *the instance is not derived* — rather than the overclaim
+  built on the misread. **A safety property justified by a wrong argument is weaker than the same
+  property justified by the right one.**
+- **`MDO_E_DTOCLK` (25)**, minted rather than folded into 24. *"This pipe has no PLL"* and *"this
+  kernel cannot name the PLL"* are different facts, and the second sends a reader hunting for a
+  derivation rule that could never help — the same failure `MDO_E_NOHDMI` was split off 14 to avoid.
+  Not reachable on archaemenid's HDMI link; a DP panel drives the DTO and would land on it.
+- **`/bin/modeset --pixclk` exits 87 on reason 25 with an explicit STOP**, and its usage block gained
+  the full exit legend. Burn 1 read that bit **clear**, and the entire cold path is built on `#12`
+  being a PLL command — so a 25 is a finding that halts the lane, never a pass.
+
+`check.sh` **23/23**; `modeset-tool-smoke` **20/0**; kernel 1,917,616 B.
+
+### Added — bite ④: the raster program, and it rebuilds the inherited mode bit for bit
+
+⭐⭐ **`kernel/core/mode_raster.cyr` — the first raster registers AGNOS has ever COMPUTED rather than
+replayed.** Every modeset shipped so far reads this pipe and writes values back to it: M5 restores the
+`V_TOTAL` it read, M6 reprograms the same mode, M8 never touches the raster. A cold bring-up has
+nothing to read back, so the registers must come from a timing description. `mr_raster_build` is that
+arithmetic and **nothing else** — no register read, no register write, no hardware. **Zero burns.**
+
+⭐ **THE PROOF INCLUDES THE BUILDER; IT DOES NOT MIRROR IT.** `tests/gpu/moderaster.cyr` compiles
+`mode_raster.cyr` itself, so **one implementation exists and there is no second one for it to agree
+with**. ⛔ That is the rung-15 failure designed out rather than gated around — bicore, bimodel,
+texcore and the shader all agreed about a convention that was wrong, every gate built on their
+agreement went green, and a half-texel offset shipped anyway.
+
+⭐⭐ **AND THE ORACLE IS EXTERNAL ON BOTH SIDES.** Input: the **published CVT-RB 2560×1440** timing
+(241.5 MHz, h 48/32/80, v 3/5/33, hsync positive, vsync negative). Expected output: the registers
+**archaemenid's firmware left in the pipe**, captured read-only on 2026-07-30. VESA authored one side,
+this board's GOP the other, and our arithmetic stands between them having authored neither.
+**All ten matched on the first run:**
+
+| register | built | iron (`pixclk.txt`, M1-OTG0) |
+|---|---|---|
+| `H_TOTAL` | 2719 | `rd 6954` 2719 |
+| `H_BLANK_START_END` | 7342704 | `rd 6955` 7342704 |
+| `H_SYNC_A` | 2097152 | `rd 6956` 2097152 |
+| `H_SYNC_A_CNTL` | 0 | `rd 6957` 0 |
+| `H_TIMING_CNTL` | 0 | `rd 6958` 0 |
+| `V_TOTAL` | 1480 | `rd 6959` 1480 |
+| `V_BLANK_START_END` | 2491846 | `rd 6966` 2491846 |
+| `V_SYNC_A` | 327680 | `rd 6967` 327680 |
+| `V_SYNC_A_CNTL` | 1 | `rd 6968` 1 |
+| `INTERLACE_CONTROL` | 0 | `rd 6980` 0 |
+
+⛔⛔ **TEN OF FOURTEEN, AND THE OTHER FOUR ARE NAMED.** `VSTARTUP_PARAM`, `VUPDATE_PARAM`,
+`VREADY_PARAM` and `VTG0_CONTROL` are **DML watermark outputs** — they depend on memory clock, HUBP
+fetch latency and plane configuration, **not on the timing** — so no mode description can yield them
+and the builder does not pretend to. The cold path must carry them from the inherited snapshot, which
+is exactly the save set the watchdog was widened to 20 registers to hold earlier in this cut.
+**Claiming "a mode description builds the raster program" without naming the four it cannot build is
+the kind of gap that gets discovered at 3am on a dark panel.**
+
+⭐ **THE MUTATION SUITE FAILED ON ITS FIRST RUN AND THE BUILDER WAS RIGHT.** `M1` asserted that
+raising the front porch moves `H_BLANK_START_END`. It does not, and cannot: `blank_end = h_total −
+h_front − h_active` and `h_total` already contains `h_front`, so the term **cancels exactly** —
+`blank_end` is sync + back porch and the front porch reaches only `H_TOTAL`. The assertion was wrong,
+not the arithmetic. Now pinned in **both** directions (`M1`/`M1c` assert the cancellation holds,
+`M1b` proves the register is still reachable via the back porch), because a change folding `h_front`
+into the blank formula would otherwise be invisible to every check in the file. **13 mutations, 8
+refusals, a 4-slot overrun guard, 6 independent-decode cross-checks.**
+
+⭐ **AND ONE SILENT-TRUNCATION EDGE FOUND BY RE-READING THE BUILDER, NOT BY A TEST FAILING.** The
+total check bounds `h_total ≤ 32768` because `H_TOTAL` holds `total − 1` in [14:0] — but the blank
+**START** fields are [14:0] as well and `start = total − front_porch`, so a total that fits by exactly
+one overflows `START` whenever the front porch is **zero**, and the mask wraps it to 0: a raster whose
+blank begins at column zero, emitted silently. Now refused, with `R7b` proving the same mode builds
+with one pixel of front porch so the refusal is not just the total check under another name. ⛔ The
+function's own comment already argued that refusing beats masking — the bug was sitting inside the
+paragraph complaining about it.
+
+⛔ **AND THE SYNC FIELD ORDER IN `gpu_regs.cyr` WAS BACKWARDS — its own witness disproved it.** The
+line read *"H_SYNC_A: width [15:0], start [31:16]"* while annotating its value `0x00200000` as
+"= 32" — putting the 32 in the **high** half, i.e. a **zero-width horizontal sync** on a live
+display. The DCN headers put `START` at [15:0] and `END` at [31:16], and the capture agrees: 32-pixel
+hsync and 5-line vsync, both in the high half, exactly as amdgpu's `optc1_program_timing` writes
+them (`START` a literal 0, `END` the width). Corrected in place with the evidence; `GPU_OTG_SYNC_MASK`
+/ `_END_SHIFT` / `_POL` added.
+
+⚠ **A tree assumption also found false and left alone:** `rtaudit.cyr` states that including a kernel
+module from a host test "is not possible" and mirrors its constants instead. Both `gpu_regs.cyr` and
+`mode_raster.cyr` include and build fine under `CYRIUS_ALLOW_PARENT_INCLUDES=1`. rtaudit's mirror is
+script-gated so it is not wrong, only more expensive than it needed to be — **noted, not churned**.
+
+⚠ **STATED PLAINLY: the builder ships with NO kernel caller.** It is included, proven and unreachable
+— **bite ⑤ is its caller**, and the arithmetic exists now so that a cold write is assembled against
+something already reviewed rather than written under time pressure beside a dark panel. That is the
+same shape as `MDO_OP_PIXCLK`, which also cannot reach silicon in any build today, and it is inside
+the plan rather than an instance of the "capability with no caller" anti-pattern rung 19 closed out:
+the closure condition for the cold path is a **lit pipe**, not this file.
+
+Wired into `host-gpu-oracles.sh` (13 oracles, all exit 95). `check.sh` **23/23**; `sweep.sh` **15/0**;
+kernel 1,920,992 B.
+
 ### Derived — what "cold" actually requires (source + burn history, adversarially verified)
 
 - ⭐ **Nothing in AGNOS has ever programmed a pixel clock or a PLL.** `atom.cyr` carries only the

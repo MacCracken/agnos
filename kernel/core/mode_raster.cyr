@@ -1,0 +1,163 @@
+# mode_raster.cyr — THE RASTER PROGRAM, COMPUTED FROM A MODE DESCRIPTION (1.56.33 bite 4)
+#
+# Every modeset AGNOS has shipped REPLAYS values it first read off this pipe. M5 writes a V_TOTAL of
+# 1500 and puts the inherited one back; M6 reprograms the same mode inside an OTG envelope; M8 runs
+# ATOM tables and does not touch the raster at all. A COLD bring-up cannot work that way: on a pipe
+# the firmware never lit there is nothing to read back, so the raster registers must be COMPUTED from
+# a timing description. This file is that computation and nothing else.
+#
+# ⭐ IT WRITES NO REGISTER, READS NO REGISTER, AND TOUCHES NO HARDWARE. That is deliberate and it is
+# what lets `tests/gpu/moderaster.cyr` include THIS FILE — not a copy of it — and prove it on the
+# host at zero burns. There is exactly one implementation, so there is no second one for it to agree
+# with. ⛔ That distinction is the whole lesson of rung 15, where four artifacts written the same week
+# from the same derivation agreed with each other about a convention that was wrong, and every gate
+# built on their agreement went green while the shader shipped a half-texel offset.
+#
+# ⭐⭐ THE GATE IS THAT IT REBUILDS THE INHERITED MODE EXACTLY. Fed CVT-RB 2560x1440 — a PUBLISHED
+# STANDARD TIMING, derived from no register this code will ever write — it must produce, bit for bit,
+# the values the firmware left in this pipe and the 2026-07-30 iron dump captured. The timing comes
+# from the CVT standard, the expected values come from silicon, and this file stands between them
+# having touched neither. That is an external invariant in the sense the arc keeps paying to learn:
+# a probe the system can EMIT, not an agreement between two things we wrote.
+# ⇒ Only once it can rebuild a mode that demonstrably works is it trusted to describe one that does
+# not exist yet.
+#
+# --- ENCODING -------------------------------------------------------------------------------------
+# All four rules are amdgpu's `optc1_program_timing` (dcn10_optc.c), and all four are CONFIRMED
+# against the capture rather than taken on the driver's word:
+#
+#   H_TOTAL / V_TOTAL     total - 1                          (both fields are [14:0])
+#   *_BLANK_START_END     END   = total - front_porch - active   ... i.e. sync + back porch
+#                         START = END + active
+#   *_SYNC_A              START = 0, END = the sync width     (amdgpu writes START as a literal 0)
+#   *_SYNC_A_CNTL         bit0 polarity, 0 = positive, 1 = negative
+#
+# ⛔ THE SYNC FIELD ORDER WAS RECORDED BACKWARDS IN gpu_regs.cyr UNTIL THIS BITE ("width [15:0],
+# start [31:16]"), and its own witness disproved it: the live pipe reads H_SYNC_A 0x00200000 with a
+# 32-pixel CVT-RB hsync, so the width is in the HIGH half. Under the old reading this display was
+# running a zero-width horizontal sync. Corrected in place; see the comment there.
+#
+# --- WHAT THIS DELIBERATELY DOES NOT PRODUCE ------------------------------------------------------
+# ⛔⛔ VSTARTUP_PARAM, VUPDATE_PARAM, VREADY_PARAM and VTG0_CONTROL. Those are DML watermark outputs —
+# they depend on memory clock, HUBP fetch latency and the plane configuration, NOT on the timing —
+# so NO mode description can yield them and this function does not pretend to. The cold path must
+# carry them forward from the inherited snapshot, which is precisely the save set the watchdog was
+# widened to 20 registers to hold earlier in this same cut.
+# ⇒ Saying "a mode description builds the raster program" without naming the four registers it cannot
+# build is the kind of gap that gets discovered at 3am on a dark panel. Ten of fourteen, stated.
+#
+# --- BUFFER LAYOUT --------------------------------------------------------------------------------
+# ⚠ Byte offsets, u64 slots. Cyrius `var X[N]` is N BYTES in a function and N*8 at module scope, so
+# callers size in bytes and this file never guesses ([[cyrius-var-array-u64-units]]).
+#
+#   mode[]   0 h_active   8 h_front   16 h_sync   24 h_back   32 h_pol
+#           40 v_active  48 v_front   56 v_sync   64 v_back   72 v_pol
+#           80 interlaced 88 div_by2
+#
+#   out[]    0 H_TOTAL    8 H_BLANK_START_END  16 H_SYNC_A  24 H_SYNC_A_CNTL  32 H_TIMING_CNTL
+#           40 V_TOTAL   48 V_BLANK_START_END  56 V_SYNC_A  64 V_SYNC_A_CNTL  72 INTERLACE_CONTROL
+#
+# Slot order is the WATCHDOG'S RESTORE ORDER minus the four DML registers, so a reader comparing this
+# against the recovery re-run is comparing two lists in the same sequence.
+
+var MR_SLOTS       = 10;    # out[] slots produced
+var MR_MODE_BYTES  = 96;    # 12 u64 inputs
+var MR_OUT_BYTES   = 80;    # 10 u64 outputs
+
+# mr_raster_build(mode, out) -> 0 ok, -1 the description is not a legal raster.
+#
+# ⚠ REFUSES, NEVER CLAMPS. A silently-corrected mode description is how a wrong raster reaches a
+# panel wearing the shape of a right one — the same reason gpu_pll_discover() returns -1 rather than
+# a plausible pll_id, one function over.
+fn mr_raster_build(mode, out): i64 {
+    var ha = load64(mode + 0);
+    var hf = load64(mode + 8);
+    var hs = load64(mode + 16);
+    var hb = load64(mode + 24);
+    var hp = load64(mode + 32);
+    var va = load64(mode + 40);
+    var vf = load64(mode + 48);
+    var vs = load64(mode + 56);
+    var vb = load64(mode + 64);
+    var vp = load64(mode + 72);
+    var il = load64(mode + 80);
+    var d2 = load64(mode + 88);
+
+    if (ha <= 0) { return 0 - 1; }
+    if (va <= 0) { return 0 - 1; }
+    # ⚠ A front or back porch of zero is legal timing; a sync of zero is not — it is the signature of
+    # reading the sync field out of the wrong half of the word, which this tree did for six days.
+    if (hs <= 0) { return 0 - 1; }
+    if (vs <= 0) { return 0 - 1; }
+    if (hf < 0 || hb < 0) { return 0 - 1; }
+    if (vf < 0 || vb < 0) { return 0 - 1; }
+    if (hp < 0 || hp > 1) { return 0 - 1; }
+    if (vp < 0 || vp > 1) { return 0 - 1; }
+    if (il < 0 || il > 1) { return 0 - 1; }
+    if (d2 < 0 || d2 > 1) { return 0 - 1; }
+
+    var htot = ha + hf + hs + hb;
+    var vtot = va + vf + vs + vb;
+    # Both totals are [14:0], so total-1 must fit in 15 bits. Refusing here rather than masking is the
+    # difference between "this mode does not fit the hardware" and a raster silently wrapped mod 32768.
+    if (htot > 32768) { return 0 - 1; }
+    if (vtot > 32768) { return 0 - 1; }
+    if (hs > 32767) { return 0 - 1; }
+    if (vs > 32767) { return 0 - 1; }
+
+    var hbe = htot - hf - ha;                  # amdgpu's asic_blank_end = sync + back porch
+    var hbs = hbe + ha;                        # ...and the active region ends the blank
+    var vbe = vtot - vf - va;
+    var vbs = vbe + va;
+
+    # ⛔ THE BLANK **START** FIELDS ARE ALSO [14:0], AND THE TOTAL CHECK ABOVE DOES NOT COVER THEM.
+    # start = total - front_porch, so a total that fits by exactly one still overflows the start
+    # field whenever the front porch is 0 (total 32768, hf 0 => start 32768 => masks to 0, a raster
+    # whose blank begins at column zero). Found by re-reading this function rather than by a test
+    # failing, which is the only way an unreachable-today edge ever gets found.
+    # ⚠ Refuse, do not mask — the whole reason the total check refuses instead of masking.
+    if (hbs > GPU_OTG_BLANK_MASK) { return 0 - 1; }
+    if (vbs > GPU_OTG_BLANK_MASK) { return 0 - 1; }
+
+    store64(out +  0, (htot - 1) & GPU_OTG_TOTAL_MASK);
+    store64(out +  8, (hbs & GPU_OTG_BLANK_MASK) | ((hbe & GPU_OTG_BLANK_MASK) << GPU_OTG_BLANK_END_SHIFT));
+    store64(out + 16, (hs & GPU_OTG_SYNC_MASK) << GPU_OTG_SYNC_END_SHIFT);
+    store64(out + 24, hp & GPU_OTG_SYNC_POL);
+    store64(out + 32, d2 & GPU_OTG_H_TIMING_DIV_BY2);
+    store64(out + 40, (vtot - 1) & GPU_OTG_TOTAL_MASK);
+    store64(out + 48, (vbs & GPU_OTG_BLANK_MASK) | ((vbe & GPU_OTG_BLANK_MASK) << GPU_OTG_BLANK_END_SHIFT));
+    store64(out + 56, (vs & GPU_OTG_SYNC_MASK) << GPU_OTG_SYNC_END_SHIFT);
+    store64(out + 64, vp & GPU_OTG_SYNC_POL);
+    store64(out + 72, il & GPU_OTG_INTERLACE_ENABLE);
+    return 0;
+}
+
+# mr_mode_set(mode, ha, hf, hs, hb, hp, va, vf, vs, vb, vp, il, d2) — fill a description buffer.
+# A helper rather than twelve stores at every call site, because a transposed pair in a hand-written
+# porch list is invisible on inspection and produces a mode that is merely slightly wrong.
+fn mr_mode_set(mode, ha, hf, hs, hb, hp, va, vf, vs, vb, vp, il, d2): i64 {
+    store64(mode +  0, ha);
+    store64(mode +  8, hf);
+    store64(mode + 16, hs);
+    store64(mode + 24, hb);
+    store64(mode + 32, hp);
+    store64(mode + 40, va);
+    store64(mode + 48, vf);
+    store64(mode + 56, vs);
+    store64(mode + 64, vb);
+    store64(mode + 72, vp);
+    store64(mode + 80, il);
+    store64(mode + 88, d2);
+    return 0;
+}
+
+# mr_mode_cvt_rb_2560x1440(mode) — archaemenid's panel, from the CVT-RB standard.
+#
+# ⭐ THESE TWELVE NUMBERS ARE THE EXTERNAL HALF OF THE ORACLE and none of them was read off this
+# machine. CVT reduced-blanking 2560x1440 @ 60 Hz: 241.500 MHz pixel clock, h 48/32/80 and v 3/5/33
+# porches, hsync POSITIVE and vsync NEGATIVE (RB inverts the classic CVT polarities). The boot log's
+# independently derived "display link 2560x1440 total 2720x1481 blanking 160x41" agrees with the
+# totals these produce, having been computed from the registers rather than from the standard.
+fn mr_mode_cvt_rb_2560x1440(mode): i64 {
+    return mr_mode_set(mode, 2560, 48, 32, 80, 0, 1440, 3, 5, 33, 1, 0, 0);
+}

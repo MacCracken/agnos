@@ -229,6 +229,11 @@ fn modeset_vtotal(): i64 {
 # ⭐ REASON 24 (MDO_E_NOPLL) IS THE EXPECTED, CORRECT ANSWER and exits 95. `pll_id` is #12's `phyid`
 # and no rule derives it from silicon yet, so the kernel refuses rather than guessing. Reporting
 # that as a failure would train the operator to treat the safety property as a defect.
+#   95 = refused with MDO_E_NOPLL -- THE PASS      96 = no GPU / no live display (QEMU)
+#   87 = refused with MDO_E_DTOCLK -- the pipe reports a DTO clock, so #12 is the wrong command
+#        for it. **STOP**: burn 1 read DP_DTO_ENABLE clear and the cold path is built on #12.
+#   89 = got past gpu_pll_discover (refusal ordering wrong)   88 = #12 EXECUTED -- STOP
+#   94 = some other refusal -- read it against MDO_E_* before proceeding
 fn modeset_pixclk(): i64 {
     var rec[64];
     var i = 0;
@@ -242,10 +247,23 @@ fn modeset_pixclk(): i64 {
         m_puts(" reason="); m_num(reason); m_nl();
         if (reason == 24) {
             m_puts("modeset: REFUSED with MDO_E_NOPLL -- and that is the PASS."); m_nl();
-            m_puts("modeset:   the PLL instance is not derivable from live silicon yet, so the"); m_nl();
-            m_puts("modeset:   kernel refuses instead of guessing. pll_id 0/1/2 make ATOM #12 bail"); m_nl();
-            m_puts("modeset:   with ZERO writes -- a clean return that reads exactly like success."); m_nl();
+            m_puts("modeset:   the DTO is off, so this pipe is PLL-driven and ATOM #12 is the right"); m_nl();
+            m_puts("modeset:   command for it. Only the INSTANCE is underived, so the kernel refuses"); m_nl();
+            m_puts("modeset:   instead of guessing. pll_id 0/1/2 make ATOM #12 bail with ZERO"); m_nl();
+            m_puts("modeset:   writes -- a clean return that reads exactly like success."); m_nl();
             return 95;
+        }
+        # ⛔ 25 IS NOT A PASS ON THIS PANEL. Burn 1 read DP_DTO_ENABLE clear, which is what makes #12
+        # the right mechanism at all; 25 means that bit came back SET. Either a DP output is driving
+        # this pipe or the discriminator is reading the wrong register — and the cold path is built
+        # on #12, so it must not proceed until that is settled. A separate exit from 94's generic
+        # "unexpected refusal" because this one names its own next step.
+        if (reason == 25) {
+            m_puts("modeset: REFUSED with MDO_E_DTOCLK -- this pipe reports a DTO-driven clock."); m_nl();
+            m_puts("modeset: ** UNEXPECTED on this panel ** -- burn 1 read DP_DTO_ENABLE CLEAR, and"); m_nl();
+            m_puts("modeset: the whole cold path assumes #12 (a PLL command) is the right mechanism."); m_nl();
+            m_puts("modeset: Re-read PIXEL_RATE_CNTL on BASE_IDX 1 before any clock work. STOP."); m_nl();
+            return 87;
         }
         if (reason == 1) { m_puts("modeset: no GPU / no live display -- QEMU has no DCN"); m_nl(); return 96; }
         if (reason == 23) {
