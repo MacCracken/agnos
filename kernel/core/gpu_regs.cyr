@@ -298,8 +298,14 @@ var GPU_DP_DTO_ENABLE         = 0x10;   # PIXEL_RATE_CNTL bit4
 # ⭐ They ARE inside the already-vetted DCCG window (0xC0-0x1FF absolute), and #12 touches NOTHING
 # in the PHY (0x5Dxx-0x5Exx), the UNIPHY power block (0x55xx) or the OTG (0x1A00-0x1BFF) — which is
 # what makes it a different risk class from #76.
-var GPU_R_DCCG_PIXCLK_CNTL   = 0x80;   # written 0 then 0x10 around the divider write
-var GPU_R_DCCG_PIXCLK_DIV    = 0x81;   # the divider/feedback word (0x0E650730 at zero seed)
+# ⭐ PER-PIPE, STRIDE 4 — and the single-run trace HID this. One dry run at crtc=0 showed only
+# 0x140/0x141 and would have shipped these as fixed offsets. Sweeping crtc_id 0..1 moved the pair to
+# 0x144/0x145, i.e. the same 4-dword stride the pixel-RATE block already uses (GPU_DCN_PIXRATE_STRIDE).
+# ⛔ The lesson is the sweep, not the number: a footprint measured at ONE parameter value is a slice,
+# not the shape. Always vary the selector before naming a register.
+var GPU_R_DCCG_PIXCLK_CNTL   = 0x80;   # + pipe * GPU_DCCG_PIXCLK_STRIDE. Written 0 then 0x10 around the divider
+var GPU_R_DCCG_PIXCLK_DIV    = 0x81;   # + pipe * GPU_DCCG_PIXCLK_STRIDE. Divider/feedback word (0x0E650730 @ zero seed)
+var GPU_DCCG_PIXCLK_STRIDE   = 0x4;    # measured: crtc 0 -> 0x140/0x141, crtc 1 -> 0x144/0x145
 
 var GPU_R_DCCG_AUDIO_DTO_SRC  = 0xAB;   # DTO0_SOURCE_SEL[2:0], DTO_SEL[5:4], DTO2_USE_512FBR_DTO b20 (GLOBAL → RMW only)
 var GPU_R_DCCG_AUDIO_DTO0_PHASE  = 0xAC;  # HDMI path

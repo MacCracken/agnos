@@ -11442,9 +11442,15 @@ fn gpu_refresh_measure(pipe) {
 fn gpu_pll_discover() {
     if (gpu_present == 0) { return 0 - 1; }
     if (gpu_display_ok != 1) { return 0 - 1; }
-    var c = gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_PIXCLK_CNTL) & 0xFFFFFFFF;
-    var d = gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_PIXCLK_DIV) & 0xFFFFFFFF;
-    kprint("gpu: pixclk pll cntl ", 21); kprint_hex(c);
+    # ⚠ PER-PIPE. Reading the pipe-0 pair on a pipe-1 boot would report a register this display is
+    # not using and call it evidence — the stride was found by sweeping crtc_id, not by one trace.
+    var pipe = gpu_display_pipe;
+    if (pipe < 0) { pipe = 0; }
+    var po = pipe * GPU_DCCG_PIXCLK_STRIDE;
+    var c = gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_PIXCLK_CNTL + po) & 0xFFFFFFFF;
+    var d = gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_PIXCLK_DIV + po) & 0xFFFFFFFF;
+    kprint("gpu: pixclk pll pipe ", 21); kprint_num(pipe);
+    kprint(" cntl ", 6); kprint_hex(c);
     kprint(" div ", 5); kprint_hex(d); kprintln("", 0);
     kprintln("gpu: pll instance NOT derivable yet -- refusing to name one (see gpu_pll_discover)", 82);
     return 0 - 1;

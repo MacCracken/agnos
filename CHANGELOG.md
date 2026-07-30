@@ -107,6 +107,35 @@ anything can run `#12` — rather than being assembled under time pressure once 
 
 `check.sh` **23/23**; `modeset-tool-smoke` **20/0**; production build confirmed free of selftest hooks.
 
+### Added — `#12`'s read set, found by SWEEPING, and the dump group that makes the next burn worth taking
+
+⭐⭐ **A footprint measured at one parameter value is a slice, not the shape.** Bite 2 named
+`GPU_R_DCCG_PIXCLK_CNTL/_DIV` as **fixed** offsets from a single `crtc=0` trace. Sweeping `crtc_id`
+0..1 and `pll_id` 3..8 moved the pair to `0x144/0x145` — **the registers are PER-PIPE with a 4-dword
+stride**, the same stride the pixel-RATE block already uses. Corrected to
+`+ pipe * GPU_DCCG_PIXCLK_STRIDE`, and `gpu_pll_discover()` now reads the pipe it is actually on;
+reading pipe 0's pair on a pipe-1 boot would have reported a register this display does not use and
+called it evidence.
+
+**The swept footprint**: reads `0x0140` `0x0144` `0x5001` `0x5081`; writes `0x0140/0x0141` (crtc 0)
+and `0x0144/0x0145` (crtc 1). All four writes sit inside the vetted DCCG window and **none** touch the
+PHY (`0x5Dxx-0x5Exx`), UNIPHY power (`0x55xx`) or OTG (`0x1A00-0x1BFF`) blocks that `#76` writes.
+
+**`mdo_dump` gains the `M12-pixclk` group** — 101 → **107 registers** — covering that read set on
+**both** pipes, including `0x5001`/`0x5081` whose block is **not yet identified**. ⚠ An unnamed
+register the command reads is exactly what a dump must carry; the alternative is discovering the gap
+during adjudication. ⛔ **This group exists because `#76` taught the lesson expensively**: M8b found
+agnos had never validly read any of `#76`'s sixteen indices, so its zero-seed dry run proved only
+that the decoder walks *a* path, and it took a real snapshot to expose the poll storm at the wrong
+`phyid`. `#12` is at precisely that stage now, and its footprint is explicitly a **LOWER BOUND** —
+every read in the sweep returned 0.
+
+**Burn pre-registered** as `tracker-15633-pixclk`: read-only, runs no ATOM table, and ⭐ **`--pixclk`
+refusing with `MDO_E_NOPLL` is the PASS**. It also carries the outstanding `gpudepth` regression from
+1.56.32 — op `0x0E` gained a `gpu_batch_active` suspend and has not run since.
+
+`check.sh` **23/23**; `modeset-tool-smoke` **20/0**; production build confirmed clean.
+
 ### Derived — what "cold" actually requires (source + burn history, adversarially verified)
 
 - ⭐ **Nothing in AGNOS has ever programmed a pixel clock or a PLL.** `atom.cyr` carries only the

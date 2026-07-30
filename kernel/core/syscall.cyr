@@ -4491,7 +4491,26 @@ fn mdo_dump() {
     mdo_rd2a(0x586F); mdo_rd2a(0x5870);
     mdo_rd2a(0x596F); mdo_rd2a(0x5970);
 
-    kprintln("modeset: dump end -- 101 registers (M1 67 + M2 10 + M3 4 + M8 12 + DIGBE 8)", 75);
+    # ── ATOM #12's READ SET — so a captured seed can actually drive SetPixelClock ────────────────
+    # ⛔⛔ THIS GROUP EXISTS BECAUSE #76 TAUGHT THE LESSON THE EXPENSIVE WAY. M8b found that agnos had
+    # NEVER validly read any of #76's sixteen indices, so a zero-seed dry run proved only that the
+    # decoder walks *a* path — and it took a real snapshot to expose the poll storm at the wrong
+    # phyid. #12 is at exactly that stage right now: its footprint is measured at ZERO SEED, and the
+    # value of the next burn is entirely whether these registers come back with real contents.
+    # ⭐ THE SET WAS FOUND BY SWEEPING, NOT BY ONE TRACE. A single run at crtc=0 shows only
+    # 0x140/0x141; sweeping crtc_id 0..1 and pll_id 3..8 adds 0x144/0x145 (the per-pipe stride) plus
+    # reads at 0x5001 and 0x5081. Both pipes are captured because the seed must be usable whichever
+    # pipe is live, and 0x5001/0x5081 are captured even though their block is NOT yet identified —
+    # ⚠ an unnamed register that the command reads is exactly the kind of thing a dump must carry,
+    # since the alternative is discovering the gap during adjudication.
+    # ⚠ LOWER BOUND, deliberately stated: every read in that sweep returned 0, so the table walked a
+    # zeroed machine's branches. Real values may steer it somewhere with a wider read set.
+    kprintln("modeset: dump group M12-pixclk", 30);
+    mdo_rd2a(0x0140); mdo_rd2a(0x0141);
+    mdo_rd2a(0x0144); mdo_rd2a(0x0145);
+    mdo_rd2a(0x5001); mdo_rd2a(0x5081);
+
+    kprintln("modeset: dump end -- 107 registers (M1 67 + M2 10 + M3 4 + M8 12 + DIGBE 8 + PIXCLK 6)", 86);
     return 0;
 }
 
