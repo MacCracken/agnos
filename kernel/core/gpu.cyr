@@ -11428,6 +11428,28 @@ fn gpu_refresh_measure(pipe) {
     return gpu_refresh_mhz;
 }
 
+# gpu_pll_discover — which PLL does ATOM #12 program? Reads the DCCG pair #12 writes and REFUSES.
+#
+# ⛔⛔ THIS RETURNS -1 ON PURPOSE, AND THAT IS THE DELIVERABLE. `pll_id` is #12's `phyid`: a small
+# integer naming which instance the command acts on, with a wrong-and-plausible value available. The
+# host sweep measured that `pll_id` 0, 1 and 2 make the table BAIL — 9 opcodes, zero register
+# activity, a clean return that reads exactly like success — while >=3 runs the real path. On DCE,
+# ATOM_PPLL0/1/2 ARE 0/1/2, so the value a person would reach for first is precisely the one that
+# does nothing. MD-2 shipped that mistake once already and it stood for six days.
+# ⇒ Until a rule exists that DERIVES the instance from live silicon, this refuses. The registers are
+# logged so the next iron dump supplies the rule; guessing here would put the guess in the kernel,
+# which is the one place the phyid fix was specifically designed to prevent.
+fn gpu_pll_discover() {
+    if (gpu_present == 0) { return 0 - 1; }
+    if (gpu_display_ok != 1) { return 0 - 1; }
+    var c = gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_PIXCLK_CNTL) & 0xFFFFFFFF;
+    var d = gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_PIXCLK_DIV) & 0xFFFFFFFF;
+    kprint("gpu: pixclk pll cntl ", 21); kprint_hex(c);
+    kprint(" div ", 5); kprint_hex(d); kprintln("", 0);
+    kprintln("gpu: pll instance NOT derivable yet -- refusing to name one (see gpu_pll_discover)", 82);
+    return 0 - 1;
+}
+
 fn gpu_pixclk_discover() {
     gpu_pixclk_100hz = 0;
     if (gpu_present == 0) { return 0; }

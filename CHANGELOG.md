@@ -82,6 +82,31 @@ looked fine, and only a **real register snapshot** exposed the 87,292-read poll 
 *bail* (3-8 are indistinguishable at zero seed) and **not which one is correct**, and the real value
 must still be derived from silicon. Bite ③ takes a snapshot and re-runs this.
 
+### Added — `MDO_OP_PIXCLK` (`#93` op `0x09`): the seam lands, and it REFUSES
+
+⭐⭐ **The op cannot reach silicon in any build today, and that is the deliverable.** It exists so the
+ABI, the parameter derivation and the refusal path are written, reviewed and advertised **before**
+anything can run `#12` — rather than being assembled under time pressure once a PLL rule exists.
+
+- **`atom_run_set_pixel_clock()`** (`atom.cyr`) packs the v1.7 struct and **refuses `pll_id < 3`**,
+  because the host sweep measured that 0/1/2 make the table dispatch and bail with zero writes.
+- **`gpu_pll_discover()`** (`gpu.cyr`) reads the DCCG pair `#12` writes and **returns −1**. ⛔ That is
+  deliberate: `pll_id` is `#12`'s `phyid`, and until a rule DERIVES it from live silicon, the kernel
+  refuses rather than shipping a guess — the exact failure the `phyid` fix was built to prevent.
+- **`MDO_E_NOPLL` (24)** — a *named* refusal. "This kernel cannot name the PLL" is a different fact
+  from "unknown op", and the tool must be able to tell them apart.
+- **No operands**, per the established `#93` doctrine: pixel clock from `gpu_pixclk_discover`, CRTC
+  from `gpu_display_pipe`, PLL from the discovery. Letting ring 3 pass `pll_id` would put the guess
+  back in the **ABI** — one layer further out than MD-2 put it — and let a caller aim a clock command
+  at the PLL driving the live pipe.
+- **`GPU_R_DCCG_PIXCLK_CNTL/_DIV` (DCN_1 + 0x80/0x81)** named ⚠ **PROVISIONALLY**, with the evidence
+  and its weakness in the comment: the function is inferred from one zero-seed write pattern, not read
+  from a datasheet. The next iron dump confirms or kills it. **The name must not become the evidence.**
+- `MDO_OP_SUPPORTED` **127 → 639** (un-armed) and **511 → 1023** (armed); `modeset-tool-smoke`'s
+  both-directions assertion updated with a note explaining why an added op must move *both* values.
+
+`check.sh` **23/23**; `modeset-tool-smoke` **20/0**; production build confirmed free of selftest hooks.
+
 ### Derived — what "cold" actually requires (source + burn history, adversarially verified)
 
 - ⭐ **Nothing in AGNOS has ever programmed a pixel clock or a PLL.** `atom.cyr` carries only the

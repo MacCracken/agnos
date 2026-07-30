@@ -1073,6 +1073,40 @@ fn atom_run_transmitter_enable_hdmi(phyid) {
     return atom_execute_table(76, 8);
 }
 
+# atom_run_set_pixel_clock — ATOM #12 SetPixelClock, parameter struct v1.7.
+#
+# ⚠ REVISION DERIVED FROM THE ROM, NOT ASSUMED: archaemenid's MasterCommandTable puts index 12 at
+# 0x98EE, rev 1.7, 1052 bytes, WS 16 B. A different revision means a different struct and this packs
+# the WRONG BYTES — the host tool refuses on a revision mismatch and so should any future caller.
+#
+# struct set_pixel_clock_parameter_v1_7 (16 B, padded to an 8-dword ps_allocation like #76):
+#   pixclk_100hz u32@0 · pll_id u8@4 · encoderobjid u8@5 · encoder_mode u8@6 · miscinfo u8@7
+#   crtc_id u8@8 · deep_color_ratio u8@9 · reserved1[2]@10 · reserved2 u32@12
+# ⭐ ALL FOUR DWORDS ARE ATTESTED, not transcribed on faith: the host interpreter records which PS
+# dwords the bytecode actually consumed, and the accepted path reads [0,1,2,3] — all sixteen bytes.
+fn atom_run_set_pixel_clock(pixclk_100hz, pll_id, crtc_id, enc_mode) {
+    # ⛔ REFUSE rather than fall back. pll_id 0/1/2 make the table dispatch and BAIL — 9 opcodes, no
+    # reads, no writes, a clean return indistinguishable from success. That is the same shape as
+    # phyid=0 addressing a dead PHY, and the same answer applies: no default, no guess.
+    if (pll_id < 3) {
+        kprint("atom: REFUSING #12 -- pll_id ", 29); kprint_num(pll_id);
+        kprintln(" is a NO-OP branch (measured: 0/1/2 bail with 0 writes)", 55);
+        return 0 - 1;
+    }
+    kprint("atom: #12 SetPixelClock pll_id ", 31); kprint_num(pll_id);
+    kprint(" pixclk_100hz ", 14); kprint_num(pixclk_100hz);
+    kprintln(" (v1.7, rev-checked)", 20);
+    store32(&atom_ps_buf + 0,  pixclk_100hz & 0xFFFFFFFF);
+    store32(&atom_ps_buf + 4,  (pll_id & 0xFF) | (0x13 << 8) | ((enc_mode & 0xFF) << 16) | (0 << 24));
+    store32(&atom_ps_buf + 8,  (crtc_id & 0xFF) | (0 << 8));
+    store32(&atom_ps_buf + 12, 0);
+    store32(&atom_ps_buf + 16, 0);
+    store32(&atom_ps_buf + 20, 0);
+    store32(&atom_ps_buf + 24, 0);
+    store32(&atom_ps_buf + 28, 0);
+    return atom_execute_table(12, 8);
+}
+
 # A4 top-level: acquire VBIOS -> parse -> run encoder(HDMI) + transmitter(ENABLE).
 # Returns 1 on clean bring-up. Console-risky (drives the PHY) — call only behind
 # the HDMI audio gate.

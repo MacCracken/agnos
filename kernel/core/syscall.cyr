@@ -4182,7 +4182,11 @@ var MDO_OP_RECOMMIT  = 0x05;        # M6 same-mode OTG envelope — OTG_MASTER_E
 var MDO_OP_TRANSMIT  = 0x06;        # M8 transmitter — ATOM #4 (+ #76, build-gated) INSIDE M6's envelope
 var MDO_OP_AUDIO_PRE  = 0x07;       # M9 CONTROL   — transmit + audio unmuted BEFORE the transmitter edge
 var MDO_OP_AUDIO_POST = 0x08;       # M9 TREATMENT — transmit + audio unmuted AFTER  the transmitter edge
+var MDO_OP_PIXCLK     = 0x09;       # 1.56.33 — ATOM #12 SetPixelClock; derives all params, refuses on pll_id
 # bit N set <=> op N implemented: 0 NOP,1 CAPS,2 DUMP,3 LOCK,4 VTOTAL,5 RECOMMIT,6 TRANSMIT,
+# 9 PIXCLK — advertised UNCONDITIONALLY on the TRANSMIT precedent: the op IS implemented, and a
+# build/boot that cannot derive a pll_id answers with the specific MDO_E_NOPLL rather than a generic
+# "unknown op", which is the difference between "this kernel cannot name the PLL" and "this ABI is old".
 # 7 AUDIO_PRE, 8 AUDIO_POST.
 # ⚠ TRANSMIT is advertised UNCONDITIONALLY even though its body needs HDMI_ATOM: the op really is
 # implemented, and a build without the flag answers with the specific MDO_E_NOATOM rather than a generic
@@ -4195,9 +4199,9 @@ var MDO_OP_AUDIO_POST = 0x08;       # M9 TREATMENT — transmit + audio unmuted 
 # experiment under two op codes — the ATOM_DRY class again, one layer up. Without it: MDO_E_BADOP, which
 # the tool reports as "wrong kernel" rather than silently producing a result that means nothing.
 #ifdef MODESET_AUDIO_ARMS
-var MDO_OP_SUPPORTED = 0x1FF;
+var MDO_OP_SUPPORTED = 0x3FF;
 #else
-var MDO_OP_SUPPORTED = 0x7F;
+var MDO_OP_SUPPORTED = 0x27F;
 #endif
 var MDO_E_NOGPU      = 1;           # call/op — GPU/display unavailable (write ops only, once they exist)
 var MDO_E_BADOP      = 2;           # op    — unknown, reserved, or not implemented in this kernel
@@ -4227,6 +4231,12 @@ var MDO_E_AUDIO      = 22;          # op    — M9: the DISPLAY survived but the
 # from MDO_E_MODESET on purpose: sharing 14 made the tool print "off-rate -- refresh did not return" for a
 # SIGNALLING failure, which reads as a timing problem and sent the first M9 burn's diagnosis the wrong way.
 var MDO_E_NOHDMI     = 23;
+# ⭐ A NAMED REFUSAL, NOT A GENERIC FAILURE. PIXCLK derives every parameter in-kernel and one of them
+# — the PLL instance — has no derivation rule yet. Returning this rather than picking a plausible
+# integer is the whole point: pll_id 0/1/2 make ATOM #12 dispatch and BAIL with zero register writes,
+# a clean return that is indistinguishable from success, which is exactly how phyid=0 survived six
+# days pointed at a dead PHY. The tool reports "the kernel cannot name the PLL" and nobody guesses.
+var MDO_E_NOPLL      = 24;
 
 # mdo_caps_write(out_uva) -> 0 / MDO_E_OUTBUF. Writes 8x u32 LE describing the modeset surface. READ-ONLY of
 # kernel state; the ONLY write is to the validated user buffer, via the gpu_caps_sys direct-store idiom.
@@ -5502,6 +5512,18 @@ fn mdo_validate(rec) {
         if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
         if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
     }
+    if (op == MDO_OP_PIXCLK) {
+        # 1.56.33 — same doctrine as every op above it: NO OPERANDS. The pixel clock comes from
+        # gpu_pixclk_discover (measured off the live pipe), the CRTC from gpu_display_pipe, and the
+        # PLL instance from gpu_pll_discover — which currently refuses. ⛔ Deliberately NOT a
+        # ring-3 parameter: letting a caller pass pll_id would put the guess back in the ABI, one
+        # layer out from where MD-2 put it, and a caller could then aim a clock command at the PLL
+        # driving the live pipe.
+        if ((load32(rec +  8) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 12) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+    }
     if (op == MDO_OP_TRANSMIT) {
         # M8 derives everything in-kernel (live DIG, saved timing, ATOM params) — no operands. What runs is
         # governed by BUILD FLAGS, never by the ABI: a ring-3 caller can NEVER ask for the live PHY edge.
@@ -5531,6 +5553,46 @@ fn mdo_validate(rec) {
     return 0;
 }
 
+# mdo_pixclk — 1.56.33 bite 2. Derive every SetPixelClock parameter in-kernel, then REFUSE.
+#
+# ⛔⛔ THIS OP CANNOT REACH SILICON IN ANY BUILD TODAY, AND THAT IS THE DELIVERABLE. It exists to
+# land the ABI, the parameter derivation and the refusal path BEFORE anything can run #12 — so that
+# when a PLL-derivation rule arrives it drops into a seam that is already reviewed, already
+# advertised through #89-style caps, and already refuses correctly.
+#
+# The pattern is the transmitter's, one command later: what runs is a BUILD property, ring 3 can
+# never ask for the live edge, and the one parameter with no derivation produces a NAMED refusal
+# instead of a plausible integer.
+fn mdo_pixclk() {
+    if (gpu_present == 0) { return MDO_E_NOGPU; }
+    if (gpu_display_ok != 1) { return MDO_E_NOGPU; }
+
+    gpu_pixclk_discover();
+    var pc = gpu_pixclk_100hz;
+    if (pc <= 0) {
+        kprintln("modeset: PIXCLK -- no measured pixel clock; refusing", 52);
+        return MDO_E_NOGPU;
+    }
+    kprint("modeset: PIXCLK measured pixclk_100hz ", 38); kprint_num(pc);
+    kprint(" crtc ", 6); kprint_num(gpu_display_pipe); kprintln("", 0);
+
+    var pll = gpu_pll_discover();
+    if (pll < 0) {
+        kprintln("modeset: PIXCLK REFUSED -- the PLL instance is not derivable from live silicon", 78);
+        kprintln("modeset:   pll_id 0/1/2 make ATOM #12 bail with ZERO writes -- a clean return that", 82);
+        kprintln("modeset:   reads exactly like success. Guessing here is how phyid=0 survived.", 77);
+        return MDO_E_NOPLL;
+    }
+
+    # ⛔ UNREACHABLE TODAY (gpu_pll_discover always refuses). Kept so the seam is written, reviewed
+    # and gated now rather than under time pressure once a derivation exists.
+    #ifdef ATOM_RUN_PIXCLK
+    return atom_run_set_pixel_clock(pc, pll, gpu_display_pipe, 3);
+    #endif
+    kprintln("modeset: PIXCLK -- derived, but this build cannot execute #12 (ATOM_RUN_PIXCLK unset)", 85);
+    return MDO_E_NOATOM;
+}
+
 fn mdo_execute(rec) {
     var op = load32(rec) & 0xFFFFFFFF;
     if (op == MDO_OP_NOP)  { return 0; }
@@ -5540,6 +5602,7 @@ fn mdo_execute(rec) {
     if (op == MDO_OP_VTOTAL) { return mdo_vtotal(); }
     if (op == MDO_OP_RECOMMIT) { return mdo_recommit(); }
     if (op == MDO_OP_TRANSMIT) { return mdo_transmit(0); }
+    if (op == MDO_OP_PIXCLK) { return mdo_pixclk(); }
     #ifdef MODESET_AUDIO_ARMS
     if (op == MDO_OP_AUDIO_PRE)  { return mdo_transmit(1); }
     if (op == MDO_OP_AUDIO_POST) { return mdo_transmit(2); }

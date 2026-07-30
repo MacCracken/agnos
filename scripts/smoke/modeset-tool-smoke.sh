@@ -91,8 +91,13 @@ want "$LOG" "modeset: caps OK" \
      "no 'caps OK' — the tool did not run or #93 failed (see error lines above)"
 # The op-support mask must be EXACTLY the value this build's flags call for, and the two legal values are
 # not interchangeable — the mask is the ABI's self-description, so a wrong one is a lie the tool believes.
-#   127 = NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT + TRANSMIT   (no M9 arms)
-#   511 = the above + AUDIO_PRE + AUDIO_POST                        (MODESET_AUDIO_ARMS)
+#   639 = NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT + TRANSMIT + PIXCLK   (no M9 arms)
+#  1023 = the above + AUDIO_PRE + AUDIO_POST                                 (MODESET_AUDIO_ARMS)
+# ⚠ These were 127 / 511 until 1.56.33 added MDO_OP_PIXCLK (bit 9, +512). PIXCLK is advertised
+# UNCONDITIONALLY on the TRANSMIT precedent — the op IS implemented and a kernel that cannot derive
+# a PLL answers with the specific MDO_E_NOPLL rather than a generic "unknown op". ⛔ If you are here
+# because this assertion failed, check whether an op was added WITHOUT updating both values: the
+# mask is the ABI's self-description and a stale expectation here trains the operator to ignore it.
 # ⚠ Checking BOTH directions matters more than checking either. If this only ever asserted 127, a build that
 # forgot MODESET_AUDIO_ARMS would advertise the audio arms as ABSENT and the tool would report "wrong
 # kernel" — but a build that wrongly advertised them would sail through, and the operator would spend a burn
@@ -106,17 +111,17 @@ strings "$AGNOS" | grep -q "ARM 1 CONTROL: unmute BEFORE the edge" && K_AUDIO=1
 strings "$AGNOS" | grep -q "ATOM #76 CYCLE: DISABLE then ENABLE" && K_CYCLE=1
 echo "  (kernel flags read from the binary: MODESET_AUDIO=$K_AUDIO ATOM_TX_CYCLE=$K_CYCLE)"
 if [ "$K_AUDIO" = 1 ] && [ "$K_CYCLE" = 1 ]; then
-  want "$LOG" "modeset: opmask=511" \
-       "the op-support mask is 511 — the M9 audio arms ARE advertised, as MODESET_AUDIO_ARMS requires" \
-       "opmask != 511 — MODESET_AUDIO_ARMS did not reach MDO_OP_SUPPORTED, so --audio-pre/--audio-post cannot dispatch"
-  wantno "$LOG" "modeset: opmask=127" \
-       "the mask is not the un-armed 127 — the widening is real, not a stale constant" \
-       "opmask=127 in an ARMED build — the derived flag never took"
+  want "$LOG" "modeset: opmask=1023" \
+       "the op-support mask is 1023 — the M9 audio arms ARE advertised, as MODESET_AUDIO_ARMS requires" \
+       "opmask != 1023 — MODESET_AUDIO_ARMS did not reach MDO_OP_SUPPORTED, so --audio-pre/--audio-post cannot dispatch"
+  wantno "$LOG" "modeset: opmask=639" \
+       "the mask is not the un-armed 639 — the widening is real, not a stale constant" \
+       "opmask=639 in an ARMED build — the derived flag never took"
 else
-  want "$LOG" "modeset: opmask=127" \
-       "the op-support mask is 127 (NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT + TRANSMIT) — the kernel wrote real caps, not zeros" \
-       "opmask != 127 — the caps write is wrong or a constant read 0"
-  wantno "$LOG" "modeset: opmask=511" \
+  want "$LOG" "modeset: opmask=639" \
+       "the op-support mask is 639 (NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT + TRANSMIT + PIXCLK) — the kernel wrote real caps, not zeros" \
+       "opmask != 639 — the caps write is wrong or a constant read 0"
+  wantno "$LOG" "modeset: opmask=1023" \
        "⛔ the M9 audio arms are ABSENT from this build — an unarmed kernel must not advertise them" \
        "opmask=511 without MODESET_AUDIO+ATOM_TX_CYCLE — the kernel is advertising ops whose experiment does not exist"
 fi
