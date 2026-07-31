@@ -397,6 +397,50 @@ rather than claimed.
 
 `check.sh` **23/23**; `modeset-tool-smoke` **20/0**; `host-gpu-oracles` **13/13**; kernel 1,921,904 B.
 
+### ✅/⛔ IRON BURN 2 (2026-07-30) — 5 OF 5 PREDICTIONS CONFIRMED, AND THE QUESTION STILL DID NOT CLOSE
+
+`dcn-modeset-pllblk-iron-0730.txt`. `gpudepth` **95** · `gputri --persp` **95** (0 of 1541) ·
+`--pixclk` **reason 24, exit 95** · dump **120 registers** with `M12-pllblk` · every line tagged
+`rd`/`rd1`/**`rda`** and the decoder reporting *"every line is SELF-DESCRIBING"* · ⭐ **BOTH**
+coordinate cross-checks OK, including `DP_DTO_MODULO` (rel `0x0082` + `0xC0` = abs `0x0142`, both
+`0x23B21B78`) — **the pair that could only answer `n/a` last burn.** Anchors hold, `#76` 16/16,
+**phyid = 1** re-derived.
+
+⛔⛔ **But all five `pll_id` candidates still storm, and NONE is adjudicable** — every one still has
+unseeded reads (20: 10 · 21: 2 · 22: 10 · 23: 17 · 24: 17 of their distinct reads). That is not the
+pre-registered "none clean ⇒ the combo-PHY reading is wrong" branch; it is a third outcome, and the
+honest reading is that the instrument still is not sharp enough to ask the question.
+
+⛔⛔ **THIS RETRACTS THE PREVIOUS ENTRY'S READING OF `pll_id` 20 AND 21.** They were written up as
+*"poll seeded real values and still storm ⇒ genuine evidence against"*, measured from **the last four
+reads of the trace**. The last four reads are not the read set. Neither was ever evidence.
+
+⭐⭐ **And the same mistake built the group that failed to close it:** `M12-pllblk` captured three
+registers per instance by **mirroring the M2 group**, when `#12` reads **nineteen** per instance and
+M2's three are not the ones it polls. The capture set should have come from `#12`'s own trace, which
+was already in hand.
+
+⭐ **THIRD INSTANCE OF ONE SHAPE IN THIS CUT — a SAMPLE IS NOT THE SHAPE:** swept `crtc_id` when
+`pll_id` was the axis · swept `pll_id` **3-8** as the whole space · read a trace's **tail** as its
+read set. Each sample looked like an answer. ⇒ Take the union over the whole parameter, and derive a
+capture set from the trace of *the command in question*.
+
+**Fixed:** `M12-pllblk` rebuilt from `#12`'s own union of per-instance relative offsets —
+`+01 +03 +05 +07 +0C +10 +12 +13 +14 +16 +1A +1B +1C +1D +1E +1F +20 +21 +22`, **19 × 5 instances =
+95 registers**, instance N at `0x5DF0 + N*0xD8` (verified against all five bases). Dump **120 → 206**.
+⚠ Still a lower bound — measured against a partly-zero seed; if the next sweep cannot adjudicate,
+**re-derive from its traces**. ⚠ Not a blind range scan: every offset is one the command demonstrably
+reads, and this burn read nine registers across those blocks without a hang.
+
+### Known — `modeset-tool-smoke` intermittently WEDGES (pre-existing; A/B-proven not this change)
+
+The smoke went flaky while verifying the widened dump. **An A/B with the change reverted flakes
+identically — 3 of 6 failures on each side** — so the 206-register dump is exonerated. Failing runs
+stop dead at `modeset: running /bin/modeset` (90 lines; the boot never reaches the later tool runs),
+and raising `QEMU_TIMEOUT` 40 → 70 does not help, so it is a **wedge, not a truncation**.
+⚠ It is **not** in `sweep.sh`, so the burn gate is unaffected — but a green 20/0 from this smoke
+should not be quoted without a repeat until it is fixed. Its own bite.
+
 ### Known — the dump's `rd` tag meant two different things (⭐ NOW FIXED, above — kept for the record)
 
 `mdo_rd2` prints **BASE_IDX-2-RELATIVE** offsets and `mdo_rd2a` prints **ABSOLUTE** ones, and both tag

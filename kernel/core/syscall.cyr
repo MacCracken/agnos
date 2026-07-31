@@ -4552,12 +4552,40 @@ fn mdo_dump() {
     # ⇒ With instances 2-4 captured, the next seeded sweep can run the discriminator that settled `phyid`:
     # the correct instance completes clean while the wrong ones storm. Instances 0 and 1 are already in
     # the M2 group, so only 2-4 are added here — three registers each, mirroring M2's coverage exactly.
+    # ⛔⛔ THE FIRST VERSION OF THIS GROUP CAPTURED 3 REGISTERS PER INSTANCE BY MIRRORING M2's GROUP,
+    # AND THE 2026-07-30 BURN PROVED THAT WAS THE WRONG DERIVATION. `#12` reads NINETEEN registers per
+    # instance, and M2's three (+0x00, +0x10, +0x16) are not the ones it polls. So all five candidates
+    # still storm on unsatisfiable reads, and NONE of the five could be adjudicated — including the
+    # three a tail-of-trace sample had made look like real evidence.
+    # ⭐ THE LESSON, THIRD TIME IN THIS CUT: a SAMPLE IS NOT THE SHAPE. First `crtc_id` was swept when
+    # `pll_id` was the axis; then `pll_id` 3-8 stood in for the whole space; then the last four reads of
+    # a trace stood in for its read set. Each time the sample looked like an answer.
+    # ⭐ SO THIS SET IS DERIVED FROM #12's OWN MEASURED READS, not from another command's group and not
+    # by scanning: the union of relative offsets it reads inside an instance block is
+    #   +01 +03 +05 +07 +0C +10 +12 +13 +14 +16 +1A +1B +1C +1D +1E +1F +20 +21 +22
+    # identical across instances 0, 3 and 4 (1 and 2 read a subset only because their partial seeds
+    # make the table bail sooner). Instance N sits at 0x5DF0 + N*0xD8 — verified against all five bases.
+    # ⚠ NOT A BLIND RANGE SCAN, which is forbidden here and locked this box on 2026-07-17: every offset
+    # is one the command demonstrably reads, and the 2026-07-30 burn already read 0x5FA0/0x5FB0/0x5FB6,
+    # 0x6078/0x6088/0x608E and 0x6150/0x6160/0x6166 without a hang, so these blocks are reachable.
+    # The per-register progressive print is retained, so a hang still localises to its last line.
+    # ⚠ LOWER BOUND, stated as always: the read set was measured against a partly-zero seed, so seeding
+    # these may steer the table further. If the next sweep still cannot adjudicate, re-derive from ITS
+    # traces rather than assuming this set is final.
     kprintln("modeset: dump group M12-pllblk", 30);
-    mdo_rd2a(0x5FA0); mdo_rd2a(0x5FB0); mdo_rd2a(0x5FB6);
-    mdo_rd2a(0x6078); mdo_rd2a(0x6088); mdo_rd2a(0x608E);
-    mdo_rd2a(0x6150); mdo_rd2a(0x6160); mdo_rd2a(0x6166);
+    var pinst = 0;
+    var pb = 0;
+    while (pinst < 5) {
+        pb = 0x5DF0 + pinst * 0xD8;
+        mdo_rd2a(pb + 0x01); mdo_rd2a(pb + 0x03); mdo_rd2a(pb + 0x05); mdo_rd2a(pb + 0x07);
+        mdo_rd2a(pb + 0x0C); mdo_rd2a(pb + 0x10); mdo_rd2a(pb + 0x12); mdo_rd2a(pb + 0x13);
+        mdo_rd2a(pb + 0x14); mdo_rd2a(pb + 0x16); mdo_rd2a(pb + 0x1A); mdo_rd2a(pb + 0x1B);
+        mdo_rd2a(pb + 0x1C); mdo_rd2a(pb + 0x1D); mdo_rd2a(pb + 0x1E); mdo_rd2a(pb + 0x1F);
+        mdo_rd2a(pb + 0x20); mdo_rd2a(pb + 0x21); mdo_rd2a(pb + 0x22);
+        pinst = pinst + 1;
+    }
 
-    kprintln("modeset: dump end -- 120 registers (M1 67 + M2 10 + M3 4 + M8 12 + DIGBE 8 + PIXCLK 10 + PLLBLK 9)", 98);
+    kprintln("modeset: dump end -- 206 registers (M1 67 + M2 10 + M3 4 + M8 12 + DIGBE 8 + PIXCLK 10 + PLLBLK 95)", 99);
     return 0;
 }
 
