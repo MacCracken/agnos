@@ -61,7 +61,24 @@ fi
 # banner + BUILD_TAG stamp — so the burn artifact carried no record of which arm produced it. That is
 # exactly the failure the standing rule ("every #ifdef bite names its BURN_* flag in burn-prep.sh, and you
 # verify by `cmp`-ing the two binaries, not by the burn tag") exists to prevent. Arms added retroactively.
-if [ -n "${BURN_SHADER_OPS:-}" ]; then
+if [ -n "${BURN_CRCCAL:-}" ]; then
+    # 1.56.34 — the AFMT audio-CRC NULL calibration (`run /bin/modeset --crccal`).
+    # ⛔⛔ THIS ARM EXISTS BECAUSE ITS ABSENCE COST A BURN ON 2026-07-31. The experiment was prepped as a
+    # BARE kernel; `gpu_hdmi_audio_enable()` is only ever CALLED inside `#ifdef HDMI_ATOM` (main.cyr), so
+    # the entire audio path was compiled out, `gpu_hdmi_audio_on` was 0, and the op refused before taking
+    # a single measurement. The subject of the experiment was not in the build.
+    # ⇒ This is the standing rule stated in this very file — *every #ifdef bite names its BURN_* flag in
+    # burn-prep.sh* — and it was broken in the same cut whose CHANGELOG documents ATOM_RUN_PIXCLK being
+    # referenced in three places and declared in none. Naming the flag HERE is what makes the arm real.
+    # ⚠ HDMI_ATOM only. NOT MODESET_AUDIO (that suppresses the boot-time enable so the #93 op owns
+    # staging/unmute — the calibration needs the audio path UP at boot, which is the default branch) and
+    # NOT ATOM_RUN_TRANSMITTER/ATOM_TX_CYCLE (the calibration touches no PHY and must not).
+    # Oracle: `run /bin/modeset --crccal` -> exit 95 and a VERDICT block in klug. Exit 96 now says WHICH
+    # of "built without HDMI_ATOM" and "hardware refused" it hit; before this arm it could not.
+    echo "[2/2] Building the 1.56.34 CRCCAL kernel (HDMI_ATOM=1; run /bin/modeset --crccal; capture klug > crccal.txt)."
+    BUILD_ENV="HDMI_ATOM=1"
+    BUILD_TAG="CRCCAL"
+elif [ -n "${BURN_SHADER_OPS:-}" ]; then
     # 1.56.4 — FOUR proofs in ONE boot. Burns block the operator's machine, so this arm deliberately
     # bundles everything the realignment owes rather than spending four boots:
     #   A1  #92 gpu_shader_op descriptor seam (plan S8 / D-3)  -> run /bin/gpublend, /bin/gpucov

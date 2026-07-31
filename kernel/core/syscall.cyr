@@ -5762,8 +5762,23 @@ fn mdo_pixclk() {
 fn mdo_crccal() {
     if (gpu_present == 0) { return MDO_E_NOGPU; }
     if (gpu_display_ok != 1) { return MDO_E_NOGPU; }
+    # ⛔⛔ THIS REFUSAL MUST NAME THE BUILD OR THE SILICON, NEVER BOTH AT ONCE — and it cost a burn to
+    # learn. The 2026-07-31 CRCCAL burn returned "the HDMI audio path did not come up", which reads as a
+    # statement about THIS MACHINE. It was not: the kernel was built BARE, `gpu_hdmi_audio_enable()` is
+    # only ever CALLED inside `#ifdef HDMI_ATOM` (main.cyr), so the audio path was compiled out and
+    # `gpu_hdmi_audio_on` could never be anything but 0. A message that cannot tell "your build lacks the
+    # feature" from "your hardware refused" is the same defect class as an exit code that cannot tell a
+    # refusal from a pass — which is what this whole cut exists to remove.
     if (gpu_hdmi_audio_on == 0) {
-        kprintln("modeset: CRCCAL -- the HDMI audio path did not come up; nothing to calibrate", 76);
+        #ifdef HDMI_ATOM
+        kprintln("modeset: CRCCAL -- HDMI_ATOM is in this build, but the audio path did NOT come up", 81);
+        kprintln("modeset:   on this hardware. That is a real finding about the machine -- read the", 81);
+        kprintln("modeset:   gpu: lines above for where the bring-up stopped.", 59);
+        #else
+        kprintln("modeset: CRCCAL -- this kernel was built WITHOUT HDMI_ATOM, so the HDMI audio", 77);
+        kprintln("modeset:   path is COMPILED OUT and could never have come up. This says NOTHING", 79);
+        kprintln("modeset:   about the hardware. Rebuild: BURN_CRCCAL=1 sh scripts/burn/burn-prep.sh", 82);
+        #endif
         return MDO_E_NOGPU;
     }
     var d = gpu_audio_dig * GPU_DCN_DIG_STRIDE;

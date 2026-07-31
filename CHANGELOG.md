@@ -63,6 +63,49 @@ and starts the feed on real hardware — a dispatch bug found on iron would be f
 `modeset-tool-smoke` **20 → 23 assertions**, six consecutive runs green (the intermittent wedge that
 made this smoke unreliable was fixed in `sched.cyr` by a separate session; it is no longer flaky).
 
+### ⛔⛔ IRON BURN 1 (2026-07-31) — THE EXPERIMENT NEVER RAN: THE WRONG KERNEL WAS PREPPED
+
+✅ **What it did buy, and it is not nothing: the `sched.cyr` selector fix is IRON-VALIDATED.** Clean
+boot to `[ASSIST] >`, keyboard live, `smp: cpus online: 4`, no fault storm. The stale
+`rip < 0x1C0000` boundary that mis-classified the top ~28% of kernel `.text` as ring 3 — and
+`iretq`'d kmain into ring 3 on an unlucky tick — is gone, and both hardenings survive a real Zen boot.
+That change had never been on iron.
+
+⛔⛔ **But `--crccal` returned reason 1 / exit 96, and the cause was the BUILD.**
+`gpu_hdmi_audio_enable()` is only ever **called** inside `#ifdef HDMI_ATOM`, and `burn-prep.sh` was run
+with **no arm**, producing a bare kernel. The audio path was compiled out, `gpu_hdmi_audio_on` could
+never be anything but 0, and the op refused before taking a measurement. **The subject of the
+experiment was not in the kernel that was flashed.**
+
+⇒ ⭐⭐ **This is the standing rule broken by the same cut that quotes it.** `burn-prep.sh`'s own preamble
+says *every `#ifdef` bite names its `BURN_*` flag here*, memory records it as already costing **two
+burns**, and 1.56.33's close-out lists *"before writing 'landed', re-read the code"* among its paid-for
+rules — in the entry documenting `ATOM_RUN_PIXCLK` referenced in three places and declared in none.
+**Writing a rule down is not applying it.**
+
+⚠ **It was catchable on the host for free**, and the trap is worth recording: **a string check does NOT
+discriminate.** `gpu_hdmi_audio_*` and its literals ARE emitted in a bare kernel — they are unreachable,
+not eliminated — so the technique that found `atom_run_set_pixel_clock` missing in 1.56.33 returns a
+false negative here. Only the **call site** is gated. The discriminating checks are build size (bare
+1,926,416 B vs `HDMI_ATOM=1` 1,965,624 B, **+39 KB**) or reading the `#ifdef` around the call.
+
+⚠ **The pre-registered falsification row was right but under-specified**: it called exit 96 a non-result
+and said "re-run" — and a re-run of the same artifact would have failed identically. **A falsification
+row must name the causes it distinguishes between.**
+
+**Fixed, both zero-burn:**
+
+- ⭐ **`BURN_CRCCAL=1` arm in `burn-prep.sh`** (`HDMI_ATOM=1`). ⚠ That flag **only**: not
+  `MODESET_AUDIO` (it suppresses the boot-time enable so the `#93` op owns staging/unmute — the
+  calibration needs the path up at boot, which is the default branch), and not
+  `ATOM_RUN_TRANSMITTER`/`ATOM_TX_CYCLE` (the calibration touches no PHY and must not).
+- ⭐ **The refusal now names the BUILD or the SILICON, never both.** With `HDMI_ATOM`: *"HDMI_ATOM is in
+  this build, but the audio path did NOT come up on this hardware — that is a real finding."* Without:
+  *"this kernel was built WITHOUT HDMI_ATOM … this says NOTHING about the hardware."* Both branches
+  verified present in their respective builds. **A message that cannot tell "your build lacks the
+  feature" from "your hardware refused" is the same defect class as an exit code that cannot tell a
+  refusal from a pass.**
+
 ### Ruled out before spending a burn — the last "unexplained causal diff" is already spent
 
 ⛔ **`DIG_STEREOSYNC_GATE_EN` (DIG_FE_CNTL bit8) is NOT an open lead.** The known-good corpus calls it
