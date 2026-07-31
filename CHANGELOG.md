@@ -327,7 +327,77 @@ ATOM_RUN_PIXCLK=1` **builds at 1,960,464 B and carries both guard strings**; def
 **unchanged at 1,920,992 B**. ⚠ Declaring the flag makes `#12` *compilable*, **not reachable** —
 `gpu_pll_discover()` still refuses unconditionally, so the op cannot touch silicon in any build.
 
-### Known — the dump's `rd` tag means two different things (latent, deliberately not fixed here)
+### Fixed — the `rd`-tag ambiguity, and the gate for it could not fail until two mutations said so
+
+⭐ **`mdo_rd2a` now tags its lines `rda `.** `mdo_rd2` prints BASE_IDX-2-**relative** offsets and
+`mdo_rd2a` prints **absolute** ones; until now both said `rd `, in a scheme where `rd1` exists for no
+other purpose than telling the decoder which base a line is in. Dump header now reads
+`rd=+0x34C0 rd1=+0xC0 rda=absolute`, so every line is self-describing.
+
+⭐⭐ **AND THE TRANSFORM IS PROVEN BY THE CAPTURE, NOT ASSERTED.** `rd 6977` (relative `0x1B41`) and
+`rd 20481` (absolute `0x5001`) are the **same register read by the two different printers in one
+dump**, and `0x1B41 + 0x34C0 == 0x5001`. Both read `0x80011301`. `m1-decode.py` now normalises every
+line into one absolute space, writes the seed from that space, and cross-checks it.
+
+⛔⛔ **THE FIRST VERSION OF THAT CROSS-CHECK COULD NOT FAIL, AND ONLY A MUTATION SHOWED IT.** It
+compared the two raw printed values — equal because both printers read the same silicon, whatever
+arithmetic the script does — so corrupting `BASE_DCN_2` left it **green**. The claim is about the
+*index mapping*, so the mapping is what is now asserted: (1) `rel + base == abs`, (2) the two reads
+agree, (3) normalisation actually **filed** it there. Likewise the `#76` coverage check read `vals`
+(offsets as printed) while certifying `absv` (the seed) — emptying the legacy group list left it
+reporting a serene **16/16** with every seed index wrong; it now measures the space it certifies, and
+a group present in the capture whose indices vanish is a **failure**, not a gap.
+
+**Mutation battery, all three now fire:** wrong `BASE_DCN_2` → `FAIL … THE BASE CONSTANT IS WRONG`,
+rc 1 · legacy group list emptied → coverage 16/16 → **0/16**, rc 1 · seed emitter reverted to
+as-printed → rc 1. Baseline unchanged: anchors hold, `phyid = 1`, `#76` coverage 16/16, and the `#12`
+read set is **byte-identical** to the seed the `pll_id` sweep ran on, so that result stands.
+
+⚠ Legacy captures stay decodable — with no `rda` line the decoder resolves `rd` by **group header**
+and says so, reporting how many lines rest on the heuristic (36 of 107 in the 2026-07-30 capture).
+
+### Added — the full 14-register program: 10 computed, 4 CARRIED
+
+⭐ **`mr_program_build(mode, dml, out)`** completes bite ④. The ten timing registers are computed; the
+four DML watermark outputs — `VSTARTUP_PARAM`, `VUPDATE_PARAM`, `VREADY_PARAM`, `VTG0_CONTROL` — are
+**copied verbatim** from a block the caller reads off the inherited pipe, which is exactly the save
+set the watchdog was widened to hold. All fourteen now reproduce archaemenid's pipe: the ten from
+CVT-RB, the four byte-identical to the capture (`13`, `0x014002A8`, `300`, `0x85C60000`).
+
+⛔ **An ALL-ZERO `dml` block is refused (`-2`) — and a partially-zero one is NOT.** The first is an
+unfilled buffer, a structural fact this file can be certain of. The second would be a claim about
+which watermark values are legal on some pipe, which nothing in this repo can currently say, and
+inventing that rule to look thorough is how a plausible-but-wrong gate ships. Both halves asserted.
+
+### Added — the combo-PHY PLL blocks, so the next seed can finally adjudicate `pll_id`
+
+⭐⭐ **`pll_id` 20-24 select RDPCSTX instances 0-4 — DERIVED, and confirmed two independent ways.**
+The five blocks the sweep found sit on a **0xD8 stride**, which is the RDPCSTX per-instance stride
+the M2 group has always used (`0x5EC8 − 0x5DF0 = 0xD8`). The write sets confirm it without reference
+to that: `pll_id` 22 writes `0x5FA1/0x5FA3/0x5FA7/0x5FB0` = instance 2's base `0x5FA0`; 23 lands on
+`0x6078`; 24 on `0x6150`. ⚠ The *names* (`ATOM_COMBOPHY_PLL0..5`) are prior-art recall and are **not**
+verified in-tree; the stride, the blocks and the mapping are measured here.
+
+⛔⛔ **AND THAT IS WHY THE LAST SEED COULD NOT PICK ONE.** Re-running `#12` per instance:
+
+| `pll_id` | polls | in the seed? | reading |
+|---|---|---|---|
+| 20 | `0x5DFC`, `0x5E03` | **yes, real values** | storms ⇒ the `#76` wrong-instance signature — evidence *against* |
+| 21 | `0x5001` | **yes, real value** | storms — evidence *against* |
+| 22 | `0x5FB0` | **no** | reads 0 forever ⇒ **artifact of an incomplete capture, zero information** |
+| 23 | `0x6088` | **no** | same |
+| 24 | `0x6160` | **no** | same |
+
+**Three of the five were unadjudicable, and the storm looked identical to the two that carry
+information.** ⇒ `mdo_dump` gains **`M12-pllblk`** — RDPCSTX instances 2/3/4, three registers each,
+mirroring M2's coverage of 0/1 — **111 → 120 registers**. With those captured, the next seeded sweep
+runs the discriminator that settled `phyid`: **exactly one instance should complete clean while the
+rest storm.** ⚠ Still **not derived**; this is the instrument that can derive it, pre-registered
+rather than claimed.
+
+`check.sh` **23/23**; `modeset-tool-smoke` **20/0**; `host-gpu-oracles` **13/13**; kernel 1,921,904 B.
+
+### Known — the dump's `rd` tag meant two different things (⭐ NOW FIXED, above — kept for the record)
 
 `mdo_rd2` prints **BASE_IDX-2-RELATIVE** offsets and `mdo_rd2a` prints **ABSOLUTE** ones, and both tag
 their line `rd ` — while `rd1` exists precisely so the host decoder knows the base. `m1-decode.py`

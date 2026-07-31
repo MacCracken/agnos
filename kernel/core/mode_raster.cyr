@@ -132,6 +132,67 @@ fn mr_raster_build(mode, out): i64 {
     return 0;
 }
 
+# ===============================================================================================
+# THE FULL 14-REGISTER PROGRAM — 10 computed + 4 CARRIED (1.56.33, bite 5's prerequisite)
+# ===============================================================================================
+#
+# `mr_raster_build` produces the ten registers a timing description determines. A cold OTG bring-up
+# must write FOURTEEN. The other four — VSTARTUP_PARAM, VUPDATE_PARAM, VREADY_PARAM, VTG0_CONTROL —
+# are DML watermark outputs: they depend on memory clock, HUBP fetch latency and plane configuration,
+# NOT on the timing, so no mode description yields them and no arithmetic here can invent them.
+#
+# ⭐ SO THEY ARE CARRIED, NOT DERIVED, AND THE API MAKES THAT IMPOSSIBLE TO FORGET. The caller must
+# hand over a `dml` block read from the inherited pipe — precisely the values the widened 20-register
+# watchdog save already holds. A function that silently emitted zeros for four registers it could not
+# compute would be the exact "clean return that reads like success" shape this cut has now hit three
+# times: at pll_id 0-2, at the missing --pixclk flag, and at the undeclared ATOM_RUN_PIXCLK.
+#
+# ⚠ WHAT IS AND IS NOT JUDGED HERE. An ALL-ZERO dml block is refused: that is an unfilled buffer, a
+# structural fact this file can be certain of. Individual zeros are NOT judged, because nothing in
+# this repo can currently say which of the four may legitimately read zero on some pipe — and
+# inventing a legality rule to look thorough is how a plausible-but-wrong gate gets shipped.
+#
+#   dml[]   0 VSTARTUP_PARAM   8 VUPDATE_PARAM   16 VREADY_PARAM   24 VTG0_CONTROL
+#   out[]   0..72 as mr_raster_build, then 80 VSTARTUP · 88 VUPDATE · 96 VREADY · 104 VTG0_CONTROL
+#
+# Returns 0 on success · -1 the mode description is not a legal raster · -2 the dml block is unfilled.
+var MR_PROG_SLOTS = 14;
+var MR_DML_BYTES  = 32;
+var MR_PROG_BYTES = 112;
+
+fn mr_program_build(mode, dml, out): i64 {
+    var rc = mr_raster_build(mode, out);
+    if (rc != 0) { return rc; }
+    var vst = load64(dml + 0);
+    var vup = load64(dml + 8);
+    var vrd = load64(dml + 16);
+    var vtg = load64(dml + 24);
+    # ⛔ An unfilled buffer, refused. NOT a statement about which values are legal.
+    if (vst == 0) {
+        if (vup == 0) {
+            if (vrd == 0) {
+                if (vtg == 0) { return 0 - 2; }
+            }
+        }
+    }
+    # ⭐ COPIED VERBATIM. No masking, no arithmetic, nothing derived — if a bit of these ever changes
+    # between the snapshot and the program, that is a defect, and `moderaster` asserts byte-equality
+    # against the captured values for exactly that reason.
+    store64(out +  80, vst);
+    store64(out +  88, vup);
+    store64(out +  96, vrd);
+    store64(out + 104, vtg);
+    return 0;
+}
+
+fn mr_dml_set(dml, vst, vup, vrd, vtg): i64 {
+    store64(dml +  0, vst);
+    store64(dml +  8, vup);
+    store64(dml + 16, vrd);
+    store64(dml + 24, vtg);
+    return 0;
+}
+
 # mr_mode_set(mode, ha, hf, hs, hb, hp, va, vf, vs, vb, vp, il, d2) — fill a description buffer.
 # A helper rather than twelve stores at every call site, because a transposed pair in a hand-written
 # porch list is invisible on inspection and produces a mode that is merely slightly wrong.

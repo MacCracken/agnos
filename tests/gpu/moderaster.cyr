@@ -49,6 +49,13 @@ var IRON_V_BLANK     = 2491846;     # rd 6966  (0x1B36)  start 1478, end 38
 var IRON_V_SYNC_A    = 327680;      # rd 6967  (0x1B37)  start 0, end 5
 var IRON_V_SYNC_CNTL = 1;           # rd 6968  (0x1B38)  negative-going vsync
 var IRON_INTERLACE   = 0;           # rd 6980  (0x1B44)  progressive
+# ⭐ THE FOUR DML WATERMARK REGISTERS — the ones NO mode description can produce. Captured from the
+# same dump; carried, never computed. VUPDATE's 0x0140_02A8 and VTG0's 0x85C6_0000 are exactly the
+# kind of value that cannot be reconstructed from timing, which is the whole reason they are here.
+var IRON_VSTARTUP    = 13;          # rd 7047  (0x1B87)  OTG_VSTARTUP_PARAM
+var IRON_VUPDATE     = 20972200;    # rd 7048  (0x1B88)  OTG_VUPDATE_PARAM   = 0x0140_02A8
+var IRON_VREADY      = 300;         # rd 7049  (0x1B89)  OTG_VREADY_PARAM
+var IRON_VTG0        = 2244214784;  # rd 1320  (0x0528)  VTG0_CONTROL        = 0x85C6_0000
 
 var mr_fails = 0;
 
@@ -225,10 +232,52 @@ fn main(): i64 {
     mrk("R7b blank START is 32767        ", 32, load64(&out + 8) & GPU_OTG_BLANK_MASK, 32767);
     nl();
 
+    # ── C4: the FULL 14-register program — 10 computed + 4 CARRIED ────────────────────────────
+    # ⭐ The four DML registers must arrive BYTE-IDENTICAL to what was read off the pipe. They are
+    # not computed, not masked, not adjusted: if a single bit differs between the snapshot and the
+    # program, the cold path writes a watermark this hardware never chose. That is the entire
+    # property, so it is asserted directly rather than inferred from the program "looking right".
+    ps("C4  the 14-register program carries the 4 DML registers verbatim"); nl();
+    var dml[32];
+    var prog[128];
+    i = 0;
+    while (i < 128) { store64(&prog + i, 0); i = i + 8; }
+    mr_dml_set(&dml, IRON_VSTARTUP, IRON_VUPDATE, IRON_VREADY, IRON_VTG0);
+    mr_mode_cvt_rb_2560x1440(&mode);
+    var prc = mr_program_build(&mode, &dml, &prog);
+    mrk("program build rc  ", 18, prc, 0);
+    mrk("VSTARTUP_PARAM    ", 18, load64(&prog +  80), IRON_VSTARTUP);
+    mrk("VUPDATE_PARAM     ", 18, load64(&prog +  88), IRON_VUPDATE);
+    mrk("VREADY_PARAM      ", 18, load64(&prog +  96), IRON_VREADY);
+    mrk("VTG0_CONTROL      ", 18, load64(&prog + 104), IRON_VTG0);
+    # ...and the ten computed slots must be untouched by the carry.
+    mrk("H_TOTAL still      ", 19, load64(&prog +  0), IRON_H_TOTAL);
+    mrk("V_BLANK still      ", 19, load64(&prog + 48), IRON_V_BLANK);
+    mrk("INTERLACE still    ", 19, load64(&prog + 72), IRON_INTERLACE);
+    nl();
+
+    # ── R8: an unfilled DML block is refused, and a PARTIALLY filled one is NOT ────────────────
+    # ⚠ The second half matters as much as the first. Refusing an all-zero block is a claim about an
+    # UNFILLED BUFFER, which this file can be certain of. Refusing a single zero would be a claim
+    # about which watermark values are legal on some pipe — something nothing in this repo can say,
+    # and inventing that rule to look thorough is how a plausible-but-wrong gate ships.
+    ps("R8  an unfilled DML block is refused; a partially-zero one is not judged"); nl();
+    mr_dml_set(&dml, 0, 0, 0, 0);
+    mrk("R8 all-zero refused", 19, mr_program_build(&mode, &dml, &prog), 0 - 2);
+    mr_dml_set(&dml, 0, IRON_VUPDATE, 0, IRON_VTG0);
+    mrk("R8 partial accepted", 19, mr_program_build(&mode, &dml, &prog), 0);
+    # and a bad MODE must still be refused as -1, not masked by the dml path
+    mr_dml_set(&dml, IRON_VSTARTUP, IRON_VUPDATE, IRON_VREADY, IRON_VTG0);
+    mr_mode_set(&mode, 2560, 48, 0, 80, 0, 1440, 3, 5, 33, 1, 0, 0);
+    mrk("R8 bad mode is -1  ", 19, mr_program_build(&mode, &dml, &prog), 0 - 1);
+    nl();
+
     if (mr_fails == 0) {
-        ps("moderaster: ALL PASS -- CVT-RB 2560x1440 rebuilds the inherited raster exactly."); nl();
-        ps("  the 4 DML registers (VSTARTUP/VUPDATE/VREADY/VTG0) are NOT built here and must"); nl();
-        ps("  be carried from the inherited snapshot -- see mode_raster.cyr."); nl();
+        ps("moderaster: ALL PASS -- the full 14-register program reproduces the inherited pipe."); nl();
+        ps("  10 COMPUTED from the published CVT-RB 2560x1440 timing, bit for bit vs iron."); nl();
+        ps("  4 CARRIED verbatim (VSTARTUP/VUPDATE/VREADY/VTG0): DML watermark outputs that"); nl();
+        ps("  depend on memory clock and fetch latency, not timing, so no mode description can"); nl();
+        ps("  yield them -- mr_program_build REFUSES an unfilled dml block rather than zero them."); nl();
         return 95;
     }
     ps("moderaster: "); pn(mr_fails); ps(" FAILED"); nl();

@@ -4413,9 +4413,20 @@ fn mdo_rd1(off) {                                    # BASE_IDX 1 (GPU_BASE_DCN_
 # the 1.56.11 M2 dump read garbage (0/0xFFFFFFFF) at 0x92B0 instead of the PHY at abs 0x5d2d. Prints the
 # ABSOLUTE offset so the output diffs directly against the abs-labelled prior-art. Use ONLY for offsets the
 # plan lists as "BASE_IDX 2 absolute" (the M2 PHY/RDPCS group); everything else is base-relative (mdo_rd2).
+# ⛔⛔ TAG CHANGED `rd ` -> `rda ` AT 1.56.33. This printer emits an ABSOLUTE dword while mdo_rd2 emits a
+# BASE_IDX-2-RELATIVE one, and for four groups (M2-PHY/RDPCS, M8-76readset, M8-digbe, M12-pixclk) they
+# shared the tag `rd ` — in a scheme where `rd1` exists for no other reason than to tell the host decoder
+# which base a line is in. m1-decode.py consequently wrote every `rd` line into the ATOM seed as absolute,
+# so 87 of the last capture's 97 entries were RELATIVE offsets labelled ABSOLUTE (H_TOTAL's value filed at
+# 0x1B2A when its absolute index is 0x4FEA).
+# ⭐ Harmless until now purely by luck: #4, #76 and #12 read only the groups this printer emits, so every
+# seed that ever mattered was correct. The cold path is the first consumer that needs raster registers —
+# exactly the mislabelled ones — so the ambiguity is removed BEFORE a seed is trusted for a write.
+# ⚠ Legacy captures stay decodable: with no `rda` line present, m1-decode.py resolves `rd` by GROUP HEADER
+# (those same four groups are absolute) and says which rule it applied.
 fn mdo_rd2a(abs) {
     var v = gpu_reg32(GPU_BASE_DCN_2, abs - GPU_BASE_DCN_2) & 0xFFFFFFFF;
-    kprint("rd ", 3); kprint_num(abs); kprint(" ", 1); kprint_num(v); kprintln("", 0);
+    kprint("rda ", 4); kprint_num(abs); kprint(" ", 1); kprint_num(v); kprintln("", 0);
     return 0;
 }
 fn mdo_dump() {
@@ -4427,7 +4438,11 @@ fn mdo_dump() {
         kprintln("modeset: dump refused -- live pipe is not 0", 43);
         return MDO_E_NOGPU;
     }
-    kprintln("modeset: dump begin (rd offset value, both decimal; rd1 = BASE_IDX 1)", 69);
+    # ⭐ THE TAG CARRIES THE COORDINATE SYSTEM. Three of them, and a decoder needs all three:
+    #   rd  = BASE_IDX 2 RELATIVE (add 0x34C0 for the absolute dword the ATOM tables use)
+    #   rd1 = BASE_IDX 1 RELATIVE (add 0xC0)
+    #   rda = ABSOLUTE already
+    kprintln("modeset: dump begin (offset value, both decimal; rd=+0x34C0 rd1=+0xC0 rda=absolute)", 83);
 
     kprintln("modeset: dump group M1-OTG0", 27);
     mdo_rd2(0x1B2A); mdo_rd2(0x1B2B); mdo_rd2(0x1B2C); mdo_rd2(0x1B2D); mdo_rd2(0x1B2E);
@@ -4523,7 +4538,26 @@ fn mdo_dump() {
     mdo_rd2a(0x0144); mdo_rd2a(0x0145); mdo_rd2a(0x0146); mdo_rd2a(0x0147);
     mdo_rd2a(0x5001); mdo_rd2a(0x5081);
 
-    kprintln("modeset: dump end -- 111 registers (M1 67 + M2 10 + M3 4 + M8 12 + DIGBE 8 + PIXCLK 10)", 87);
+    # ── M12-pllblk: the COMBO-PHY PLL instances #12's pll_id 20-24 actually select ──────────────────
+    # ⭐⭐ DERIVED, NOT GUESSED, AND CONFIRMED TWO WAYS. The 2026-07-30 full-space sweep showed `pll_id`
+    # 20-24 write five distinct blocks on a 0xD8 stride; that is the RDPCSTX per-instance stride the M2
+    # group already uses (0x5EC8 - 0x5DF0 = 0xD8), so pll_id 20+N selects RDPCSTX instance N. The write
+    # sets confirm it independently — pll_id 22 writes 0x5FA1/0x5FA3/0x5FA7/0x5FB0, exactly instance 2's
+    # base 0x5FA0 neighbourhood; 23 lands on 0x6078; 24 on 0x6150.
+    # ⛔ AND THIS GROUP EXISTS BECAUSE THE LAST SEED COULD NOT ADJUDICATE THEM. Re-running #12 against
+    # the real snapshot, pll_id 22/23/24 poll 0x5FB0 / 0x6088 / 0x6160 — none of which the dump captured,
+    # so they read 0 forever and storm. That storm is an ARTIFACT OF AN INCOMPLETE CAPTURE and carries no
+    # information about silicon, which is a completely different fact from pll_id 20's storm (it polls
+    # 0x5DFC and 0x5E03, both seeded with REAL values, i.e. the #76 wrong-instance signature).
+    # ⇒ With instances 2-4 captured, the next seeded sweep can run the discriminator that settled `phyid`:
+    # the correct instance completes clean while the wrong ones storm. Instances 0 and 1 are already in
+    # the M2 group, so only 2-4 are added here — three registers each, mirroring M2's coverage exactly.
+    kprintln("modeset: dump group M12-pllblk", 30);
+    mdo_rd2a(0x5FA0); mdo_rd2a(0x5FB0); mdo_rd2a(0x5FB6);
+    mdo_rd2a(0x6078); mdo_rd2a(0x6088); mdo_rd2a(0x608E);
+    mdo_rd2a(0x6150); mdo_rd2a(0x6160); mdo_rd2a(0x6166);
+
+    kprintln("modeset: dump end -- 120 registers (M1 67 + M2 10 + M3 4 + M8 12 + DIGBE 8 + PIXCLK 10 + PLLBLK 9)", 98);
     return 0;
 }
 
