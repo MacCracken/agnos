@@ -11436,11 +11436,20 @@ fn gpu_refresh_measure(pipe) {
 # ⛔⛔ RETURNING A NEGATIVE IS THE DELIVERABLE, NOT A GAP. `pll_id` is #12's `phyid`: a small integer
 # naming which instance the command acts on, with a wrong-and-plausible value available. The host
 # sweep measured that `pll_id` 0, 1 and 2 make the table BAIL — 9 opcodes, zero register activity, a
-# clean return that reads exactly like success — while >=3 runs the real path. On DCE, ATOM_PPLL0/1/2
-# ARE 0/1/2, so the value a person reaches for first is precisely the one that does nothing. MD-2
-# shipped that mistake once already and it stood for six days. Until a rule DERIVES the instance from
-# live silicon this refuses; guessing here would put the guess in the kernel, which is the one place
-# the phyid fix was specifically designed to prevent.
+# clean return that reads exactly like success. On DCE, ATOM_PPLL0/1/2 ARE 0/1/2, so the value a
+# person reaches for first is precisely the one that does nothing. MD-2 shipped that mistake once
+# already and it stood for six days. Until a rule DERIVES the instance from live silicon this
+# refuses; guessing would put the guess in the kernel, the one place the phyid fix was built to
+# prevent.
+#
+# ⭐⭐ AND THE FULL-SPACE SWEEP AGAINST A REAL SNAPSHOT (2026-07-30) MADE THAT REFUSAL LOAD-BEARING
+# FOR A MEASURED REASON, replacing the retracted "it would have hit a dead PLL". `pll_id` is
+# OVERLOADED: 3-19 and 255 are benign (55 opcodes, DCCG writes only), while **20-24 drive a PHY,
+# not a PLL** — 175k-510k opcodes, up to 177k reads (a poll storm, the wrong-phyid #76 signature),
+# each writing a different PHY/RDPCS instance block on a 0xD8 stride, and calling ATOM table 77.
+# ⇒ A guessed value landing in 20-24 does not merely program the wrong clock; it fires a superset of
+# the transmitter writes that have blanked this panel twice. `atom_run_set_pixel_clock()` now refuses
+# that band explicitly — `pll_id < 3` had admitted every one of them. See atom.cyr for the full map.
 #
 # ⛔ THIS FUNCTION USED TO READ ITS OWN EVIDENCE BACKWARDS, and that is why it now tests the DTO
 # enable bit BY NAME rather than testing a register against zero. 1.56.33 burn 1 read PIXEL_RATE_CNTL

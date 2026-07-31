@@ -436,6 +436,33 @@ else
         # bring it back — the panel goes dark between the two halves by design. Only survivable inside M6's
         # OTG envelope with the H2 latch armed. ATOM_RUN_TRANSMITTER (enable-only) is its negative control.
         [ -n "$ATOM_TX_CYCLE" ] && echo '#define ATOM_TX_CYCLE'
+        # ATOM_RUN_PIXCLK=1 — 1.56.33: let MDO_OP_PIXCLK actually call ATOM #12 SetPixelClock.
+        # ⛔⛔ THIS FLAG WAS REFERENCED BY `#ifdef ATOM_RUN_PIXCLK` IN syscall.cyr, BY THE KERNEL'S OWN
+        # "this build cannot execute #12 (ATOM_RUN_PIXCLK unset)" MESSAGE, AND BY /bin/modeset — AND IT
+        # WAS DECLARED NOWHERE. Setting it in the environment produced a byte-identical kernel, so the
+        # only reachable outcome was the refusal, and a person who set it would have read that refusal
+        # as evidence about silicon rather than about a flag that does not exist.
+        # ⚠ That is the SAME defect shape this cut already paid for twice: a rubric naming a
+        # `--pixclk` flag the tool did not have, where "no output" is indistinguishable from "refused
+        # silently". Declaring it here makes the guarded code compilable and inspectable — it does NOT
+        # make #12 reachable on iron, because gpu_pll_discover() still refuses unconditionally.
+        # ⛔ DO NOT SET THIS FOR A BURN until a rule DERIVES the PLL instance from live silicon.
+        # atom_run_set_pixel_clock() refuses pll_id < 3 (bail branches) AND 20-24, which the
+        # 2026-07-30 full-space sweep measured as driving a PHY/RDPCS instance and calling table 77 —
+        # a superset of #76's writes, on the command that has blanked this panel twice.
+        # ⚠ IT REQUIRES HDMI_ATOM, and finding that out cost a link error: on its own the flag makes
+        # mdo_pixclk call an atom_run_set_pixel_clock() that is not in the build, and cyrius refuses
+        # the binary with "1 reachable undefined function". A flag whose failure mode is a link error
+        # two minutes into a build is barely better than one that silently does nothing, so the
+        # dependency is checked HERE, by name, and says what to do about it.
+        if [ -n "$ATOM_RUN_PIXCLK" ] && [ -z "$HDMI_ATOM" ]; then
+            echo "ERROR: ATOM_RUN_PIXCLK=1 requires HDMI_ATOM=1 (it calls into core/atom.cyr)." >&2
+            echo "       Use: HDMI_ATOM=1 ATOM_RUN_PIXCLK=1 sh scripts/build.sh" >&2
+            echo "       Note this only makes #12 COMPILABLE -- gpu_pll_discover() still refuses" >&2
+            echo "       unconditionally, so the op cannot reach silicon in this build either." >&2
+            exit 1
+        fi
+        [ -n "$ATOM_RUN_PIXCLK" ] && echo '#define ATOM_RUN_PIXCLK'
         # ATOM_TX_ANY — derived, never set by hand: "some form of #76 runs". Cyrius has no
         # `#if defined(A) || defined(B)`, and the post-edge infoframe replay is needed by BOTH transmitter
         # rungs, so emit one symbol rather than duplicate the block (a duplicated block is how the two

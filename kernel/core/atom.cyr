@@ -1093,6 +1093,28 @@ fn atom_run_set_pixel_clock(pixclk_100hz, pll_id, crtc_id, enc_mode) {
         kprintln(" is a NO-OP branch (measured: 0/1/2 bail with 0 writes)", 55);
         return 0 - 1;
     }
+    # ⛔⛔ AND REFUSE 20-24, WHICH `pll_id < 3` DID NOT COVER. Sweeping the WHOLE parameter space
+    # against a real iron snapshot (2026-07-30) — not the 3..8 slice bite 1 measured — found the
+    # v1.7 `pll_id` byte is OVERLOADED, with four regimes and only one of them benign:
+    #     0-2       bail, 9 opcodes, zero activity — reads exactly like success
+    #     3-19      BENIGN: 55 opcodes, writes 0x0140/0x0141 (DCCG) and reads 0x5001 (OTG0_CONTROL)
+    #     20-24     ⛔ A PHY, NOT A PLL. 175k-510k opcodes, 78k-177k reads (a poll storm, the exact
+    #               signature of the wrong-phyid #76 run), each value writing a DIFFERENT PHY/RDPCS
+    #               instance block on a 0xD8 stride — 20:0x5DF1-0x5E12 · 22:0x5FA1-0x5FC2 ·
+    #               23:0x6079-0x609A · 24:0x6151-0x6172 — and CALLING ATOM TABLE 77.
+    #     25-254    bail, 7 opcodes
+    #     255       ATOM_PPLL_INVALID: benign, 49 opcodes, the same DCCG footprint
+    # ⭐ FIVE dangerous values, matching the FIVE DIG instances the snapshot enumerates (live = 1).
+    # ⛔ SO "#12's blast radius is DISJOINT from #76's" IS FALSE — it is true only of 3-19/255. At
+    # pll_id=20 this command writes 22 PHY registers where #76 wrote one, i.e. a SUPERSET of the
+    # command that has blanked this panel twice. `pll_id < 3` admitted every one of those values.
+    if (pll_id > 19) {
+        if (pll_id < 25) {
+            kprint("atom: REFUSING #12 -- pll_id ", 29); kprint_num(pll_id);
+            kprintln(" drives a PHY, not a PLL (measured: writes 0x5Dxx-0x61xx)", 57);
+            return 0 - 1;
+        }
+    }
     kprint("atom: #12 SetPixelClock pll_id ", 31); kprint_num(pll_id);
     kprint(" pixclk_100hz ", 14); kprint_num(pixclk_100hz);
     kprintln(" (v1.7, rev-checked)", 20);

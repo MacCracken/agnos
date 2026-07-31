@@ -68,6 +68,13 @@ can now be dry-run against the real VBIOS. **Zero burns**, and it already moved 
 - ✅ **The v1.7 layout is now ATTESTED**: the accepted path consumes PS dwords **[0,1,2,3]** — all
   sixteen bytes — so the transcription covers exactly what the table reads.
 
+⛔⛔ **RETRACTED LATER IN THIS SAME CUT — see "the `pll_id` space is OVERLOADED" below.** This
+paragraph read *"`#12`'s blast radius is DISJOINT from `#76`'s … these are different commands in
+every sense that matters to the display."* **That is true only of `pll_id` 3-19 and 255.** At
+`pll_id` 20-24 `#12` writes 22 PHY/RDPCS registers and calls ATOM table 77 — a **superset** of the
+transmitter's writes. The claim was generalised from a sweep of `pll_id` **3-8**, entirely inside the
+benign band. — original paragraph follows —
+
 ⭐ **`#12`'s blast radius is DISJOINT from `#76`'s.** At zero seed the accepted path writes exactly two
 indices, `0x0140` and `0x0141` (BAR5+`0x500`/`0x504`) — `ctrl <- 0`, `divider <- 0x0E650730`,
 `ctrl <- 0x10` — plus one read of `0x5001`. Both writes fall **inside the already-vetted DCCG range
@@ -253,6 +260,86 @@ the closure condition for the cold path is a **lit pipe**, not this file.
 
 Wired into `host-gpu-oracles.sh` (13 oracles, all exit 95). `check.sh` **23/23**; `sweep.sh` **15/0**;
 kernel 1,920,992 B.
+
+### Fixed — the snapshot re-run: `pll_id` is OVERLOADED, and 20-24 drive a PHY
+
+⭐⭐ **The zero-burn re-derivation ran, and sweeping the WHOLE parameter space — which bite ① did not
+do — found a second command hiding inside `#12`.** The capture was decoded (`m1-decode.py`, all
+anchors hold, **phyid = 1** re-derived from the live DIG back end) and `#12` re-run against real
+values: **52 opcodes → 55, 4 reads → 5**, exactly as the "this footprint is a LOWER BOUND" caveat
+predicted. Then the sweep:
+
+| `pll_id` | opcodes | reads | writes | touches |
+|---|---|---|---|---|
+| 0-2 | 9 | 0 | 0 | nothing — bails, **reads exactly like success** |
+| **3-19** | 55 | 5 | 3 | `0x0140`/`0x0141` (DCCG) + a read of `0x5001` — **benign** |
+| **20** | 509,839 | 78,432 | 98 | ⛔ `0x5DF1`-`0x5E12` PHY/RDPCS |
+| **21** | 354,983 | 177,422 | 3 | ⛔ `0x5001`, `0x5E0F` |
+| **22** | 350,563 | 175,201 | 40 | ⛔ `0x5FA1`-`0x5FC2` |
+| **23** | 187,313 | 93,584 | 40 | ⛔ `0x6079`-`0x609A` |
+| **24** | 175,657 | 87,756 | 40 | ⛔ `0x6151`-`0x6172` |
+| 25-254 | 7 | 0 | 0 | nothing — bails |
+| **255** | 49 | 5 | 3 | the benign DCCG footprint — `ATOM_PPLL_INVALID` |
+
+⭐ **The 20-24 blocks sit on a 0xD8 stride — the per-instance PHY/RDPCS stride — and there are FIVE
+of them, matching the five DIG instances the snapshot enumerates (live = 1).** In that range the
+v1.7 `pll_id` byte is not a PLL selector at all: it names a **transmitter instance**, and `#12`
+**calls ATOM table 77**. The 78k-177k reads are the poll-storm signature of the wrong-`phyid` `#76`
+run (87,292 reads against unconfigured silicon).
+
+⛔⛔ **This retracts this cut's own "DISJOINT blast radius" claim** (corrected in place above). At
+`pll_id=20`, `#12` writes **22 PHY registers to `#76`'s one** under the same seed — a **superset** of
+the command that has blanked this panel twice. ⇒ The cut had already written *"a footprint measured
+at one parameter value is a slice, not the shape"* and then **swept the wrong axis**: sweeping
+`crtc_id` found a per-pipe stride; sweeping `pll_id` past 8 found a different command.
+
+- **`atom_run_set_pixel_clock()` now refuses 20-24 by name.** The old `pll_id < 3` guard **admitted
+  every dangerous value.** ⭐ This is what makes the refusal load-bearing for a *measured* reason,
+  replacing the retracted "it would have hit a dead PLL": a wrong guess is no longer the wrong clock,
+  it is a PHY write storm.
+- **`atom-interp.py` warns loudly** on 20-24 rather than refusing — characterising that band is the
+  tool's job — and prints that the kernel refuses it.
+- ⚠ **The instance is STILL NOT DERIVED and `gpu_pll_discover()` still returns −1.** `pll_id` 3-19
+  are byte-identical on this snapshot, so nothing here picks one. What changed is the cost of being
+  wrong.
+
+### Fixed — `ATOM_RUN_PIXCLK` was referenced in three places and DECLARED IN NONE
+
+⛔⛔ **The flag gating `#12`'s only call site did not exist.** `syscall.cyr` branches on
+`#ifdef ATOM_RUN_PIXCLK`, the kernel prints *"this build cannot execute #12 (ATOM_RUN_PIXCLK unset)"*
+and `/bin/modeset` reports it — while `scripts/build.sh` never defined it. Setting it produced a
+**byte-identical kernel**, so the only reachable outcome was the refusal, and anyone who set it would
+have read that refusal as a fact about silicon rather than about a flag that does not exist.
+⭐ **Same defect shape this cut already paid for twice** — a rubric naming a `--pixclk` flag the tool
+did not have, where "no output" cannot be told apart from "refused silently".
+
+⚠ **And it has a prerequisite that cost a link error to find:** on its own it makes `mdo_pixclk` call
+an `atom_run_set_pixel_clock()` that is not in the build, and cyrius refuses with *"1 reachable
+undefined function"*. `build.sh` now checks the dependency **by name** and says what to do:
+
+```
+ERROR: ATOM_RUN_PIXCLK=1 requires HDMI_ATOM=1 (it calls into core/atom.cyr).
+       Use: HDMI_ATOM=1 ATOM_RUN_PIXCLK=1 sh scripts/build.sh
+```
+
+Verified in all three configurations: flag alone **refuses legibly**; `HDMI_ATOM=1
+ATOM_RUN_PIXCLK=1` **builds at 1,960,464 B and carries both guard strings**; default build
+**unchanged at 1,920,992 B**. ⚠ Declaring the flag makes `#12` *compilable*, **not reachable** —
+`gpu_pll_discover()` still refuses unconditionally, so the op cannot touch silicon in any build.
+
+### Known — the dump's `rd` tag means two different things (latent, deliberately not fixed here)
+
+`mdo_rd2` prints **BASE_IDX-2-RELATIVE** offsets and `mdo_rd2a` prints **ABSOLUTE** ones, and both tag
+their line `rd ` — while `rd1` exists precisely so the host decoder knows the base. `m1-decode.py`
+writes every `rd` line into the ATOM seed as absolute, so **87 of the snapshot's 97 entries carry a
+relative offset labelled absolute** (e.g. `0x1B2A 0xA9F` — H_TOTAL's value at H_TOTAL's *relative*
+index; its absolute is `0x4FEA`).
+
+⭐ **Harmless so far, and only by luck:** `#4`, `#76` and `#12` read only the `mdo_rd2a`-printed
+groups, so every seed that has ever mattered was correct — including the one used above. ⛔ **Bite ⑤
+is the first consumer that needs raster registers**, which are exactly the mislabelled ones. **Not
+fixed in this change**: it alters the dump format that prior-art captures are parsed with, and that
+deserves its own bite rather than being smuggled in beside a parameter sweep.
 
 ### Derived — what "cold" actually requires (source + burn history, adversarially verified)
 
