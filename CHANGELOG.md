@@ -3,6 +3,88 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.34] - 2026-07-31
+
+**HDMI AUDIO — the two surviving candidates. Cycle OPEN.** Bumped on cycle open; the user tags on close.
+
+### Added — `MDO_OP_CRCCAL` (`#93` op `0x0A`): calibrate the CRC against its own NULL case, in one boot
+
+⛔⛔ **THE HOLE THIS CLOSES IS IN THE INSTRUMENT, NOT THE HARDWARE, AND IT IS LOAD-BEARING FOR THE WHOLE
+ARC.** `gpu_hdmi_audio_crc_one` prints **"saw samples, but they are silence"** whenever `CRC_DONE`
+asserts with a zero CRC. **It has never earned that.** `DONE=1, CRC=0` is equally consistent with:
+
+- **(a)** 2048 genuinely-zero samples traversed the tap — what the probe claims; and
+- **(b)** the counter simply completed and **nothing traversed** — never ruled out,
+
+and **(b) INVERTS the arc's reading of where the fault sits.** Under it the read side never drains, and
+every register hypothesis built on *"samples arrive but produce no sound"* was aimed at the wrong half
+of the pipe.
+
+⭐ **The control run that proved both taps content-sensitive used only stimuli that FLOWED** (silence →
+CRC 0, tone → CRC non-zero). **A stimulus set with no null case cannot distinguish flow from no-flow.**
+The null has never been taken.
+
+`MDO_OP_CRCCAL` takes it, in one boot, with the feed restored to however it was found:
+**N1** feed STOPPED → CRC both taps · **F** feed RUNNING → CRC both taps · **N2** STOPPED again →
+CRC both taps (so a one-off is not mistaken for a rule). All four outcomes are named in the verdict
+block, including the one that declares **every prior CRC reading in this arc void as evidence**.
+
+⭐ **It needs no ear, which is exactly why it precedes any listening burn** — it is entirely source-side
+and self-controlled, so it is immune to the sink-latched state that made ~24 prior burns
+un-adjudicable. Run it from the shell (`/bin/modeset --crccal`), not as a boot selftest: it stops and
+starts the codec feed, so it must be repeatable without a reflash.
+
+- **`hda_hdmi_feed_running()`** — reads `SD_CTL`'s RUN bit. ⭐ **The hardware, not `hda_stream_on`**,
+  which is the 100 Hz refill servicer's own flag; believing our own bookkeeping is the same class of
+  mistake as trusting a register that merely echoes a write. ⚠ Still a register the driver set, so not
+  a strong oracle alone — the point is that a **disagreement** between it and `hda_stream_on` is itself
+  a finding.
+- **`MDO_OP_SUPPORTED` 639 → 1663 (un-armed) and 1023 → 2047 (armed)** — moved in **both** directions,
+  because the calibration is an **instrument check, not an audio arm**, and must exist in a plain
+  kernel. `modeset-tool-smoke`'s hard-coded mask assertions updated to match.
+
+### Fixed — `--pixclk` had no selftest and no gate, for the whole of the cut that added it
+
+⛔⛔ **The selftest's own comment states the rule it was violating:** *"the selftest must exercise every
+flag the operator is told to type, or the burn is the first place a dispatch bug is discovered."*
+`--pixclk` shipped in 1.56.33 and was **never added to that list, and never gated in the smoke** — so
+the only thing that ever ran it was an iron burn.
+
+⭐ **And 1.56.33 paid for the same lesson from the other direction**: its burn rubric named `--pixclk`
+before the *tool* had the flag, caught only by an operator stage-check that noticed the binary was
+byte-identical when it should not have been. **Both halves are now covered** — the selftest runs
+`--pixclk` and `--crccal`, and the smoke gates both, mutation-checked to confirm the assertions fail
+when the dispatch line is absent.
+
+⚠ The `--crccal` gate also asserts the **negative**: none of the three phase banners may appear under
+QEMU. A refusal that still stopped the codec feed would be a refusal in name only, and this op stops
+and starts the feed on real hardware — a dispatch bug found on iron would be found mid-experiment.
+
+`modeset-tool-smoke` **20 → 23 assertions**, six consecutive runs green (the intermittent wedge that
+made this smoke unreliable was fixed in `sched.cyr` by a separate session; it is no longer flaky).
+
+### Ruled out before spending a burn — the last "unexplained causal diff" is already spent
+
+⛔ **`DIG_STEREOSYNC_GATE_EN` (DIG_FE_CNTL bit8) is NOT an open lead.** The known-good corpus calls it
+*"the only unexplained causal difference"* on the block, and DIG1 — the live encoder — does read
+`0x01000100` on amdgpu with the bit SET. But **agnos already writes it** (`gpu.cyr:12231`, and again at
+`:12556`) and gets no audio; `gpu.md:291` records the same. Marked spent so the next session does not
+re-derive it as fresh.
+
+**Dead leads, not to be re-opened:** sequencing (eliminated by M9) · the DCCG symbol clock (falsified)
+· L1 (ran and returned **VOID** — the positive control did not sound, so it carries zero information
+and must never be written up as "sequencing exonerated") · `DIG_STEREOSYNC_GATE_EN` (above).
+**Surviving: (b) a write that does not latch · (c) the bare-metal environment.**
+
+### Note — this cut opened alongside a second session in the same working tree
+
+⚠ The spawned `modeset-tool-smoke` wedge task ran **in `/home/macro/Repos/agnos` itself, not an
+isolated worktree**, and for a window both sessions were editing kernel source and rebuilding the same
+`build/agnos`. Work here was **paused** rather than verified against a mixed tree — a gate result
+covering two change sets cannot be attributed, which is the precise condition this arc exists to
+eliminate. The other session landed a `sched.cyr` fix and cleaned up its instrumentation; verification
+below is against the clean tree afterwards.
+
 ## [1.56.33] - 2026-07-30
 
 **MODESET — the COLD case. CYCLE CLOSED.** Bumped on cycle open; the user tags on close.

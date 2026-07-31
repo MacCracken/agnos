@@ -111,20 +111,40 @@ strings "$AGNOS" | grep -q "ARM 1 CONTROL: unmute BEFORE the edge" && K_AUDIO=1
 strings "$AGNOS" | grep -q "ATOM #76 CYCLE: DISABLE then ENABLE" && K_CYCLE=1
 echo "  (kernel flags read from the binary: MODESET_AUDIO=$K_AUDIO ATOM_TX_CYCLE=$K_CYCLE)"
 if [ "$K_AUDIO" = 1 ] && [ "$K_CYCLE" = 1 ]; then
-  want "$LOG" "modeset: opmask=1023" \
-       "the op-support mask is 1023 — the M9 audio arms ARE advertised, as MODESET_AUDIO_ARMS requires" \
-       "opmask != 1023 — MODESET_AUDIO_ARMS did not reach MDO_OP_SUPPORTED, so --audio-pre/--audio-post cannot dispatch"
-  wantno "$LOG" "modeset: opmask=639" \
-       "the mask is not the un-armed 639 — the widening is real, not a stale constant" \
-       "opmask=639 in an ARMED build — the derived flag never took"
+  want "$LOG" "modeset: opmask=2047" \
+       "the op-support mask is 2047 — the M9 audio arms ARE advertised, as MODESET_AUDIO_ARMS requires" \
+       "opmask != 2047 — MODESET_AUDIO_ARMS did not reach MDO_OP_SUPPORTED, so --audio-pre/--audio-post cannot dispatch"
+  wantno "$LOG" "modeset: opmask=1663" \
+       "the mask is not the un-armed 1663 — the widening is real, not a stale constant" \
+       "opmask=1663 in an ARMED build — the derived flag never took"
 else
-  want "$LOG" "modeset: opmask=639" \
-       "the op-support mask is 639 (NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT + TRANSMIT + PIXCLK) — the kernel wrote real caps, not zeros" \
-       "opmask != 639 — the caps write is wrong or a constant read 0"
-  wantno "$LOG" "modeset: opmask=1023" \
+  want "$LOG" "modeset: opmask=1663" \
+       "the op-support mask is 1663 (NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT + TRANSMIT + PIXCLK + CRCCAL) — the kernel wrote real caps, not zeros" \
+       "opmask != 1663 — the caps write is wrong or a constant read 0"
+  wantno "$LOG" "modeset: opmask=2047" \
        "⛔ the M9 audio arms are ABSENT from this build — an unarmed kernel must not advertise them" \
-       "opmask=511 without MODESET_AUDIO+ATOM_TX_CYCLE — the kernel is advertising ops whose experiment does not exist"
+       "opmask=2047 without MODESET_AUDIO+ATOM_TX_CYCLE — the kernel is advertising ops whose experiment does not exist"
 fi
+# --pixclk arg path (1.56.33 ATOM #12). ⛔ THIS ASSERTION WAS MISSING FOR THE WHOLE OF 1.56.33 — the cut
+# that added the flag — while the file's own selftest comment states the rule: exercise every flag the
+# operator is told to type. Under QEMU mdo_pixclk refuses at gpu_present (reason 1) before deriving
+# anything or reaching gpu_pixclk_source_check, so reason 1 proves the PIXCLK op DISPATCHED.
+want "$LOG" "modeset: #93 pixclk idx=0 reason=1" \
+     "★ --pixclk routed to the PIXCLK op and returned reason 1 (no DCN under QEMU) — the ATOM #12 seam dispatched, no table run" \
+     "--pixclk did not reach the PIXCLK op — argv broken, or the op rejected the record (not reason 1)"
+# --crccal arg path (1.56.34, the CRC null calibration). Under QEMU mdo_crccal refuses at gpu_present
+# (reason 1) BEFORE hda_hdmi_feed_stop() — so reason 1 proves the CRCCAL op dispatched with the codec feed
+# and the AFMT block untouched. ⚠ This op STOPS AND STARTS THE CODEC FEED on real hardware; a dispatch bug
+# discovered on iron would be discovered mid-experiment, which is what this gate exists to prevent.
+want "$LOG" "modeset: #93 crccal idx=0 reason=1" \
+     "★ --crccal routed to the CRCCAL op and returned reason 1 (no DCN under QEMU) — the calibration op dispatched, codec feed untouched" \
+     "--crccal did not reach the CRCCAL op — argv broken, or the op rejected the record (not reason 1)"
+# ⛔ And the calibration must NOT have run its phases under QEMU — a refusal that still stopped the feed
+# would be a refusal in name only. None of the three phase banners may appear.
+wantno "$LOG" "CRCCAL -- N1: the NULL case" \
+     "⛔ the CRCCAL phases did NOT run under QEMU — it refused before touching the codec feed" \
+     "CRCCAL ran its NULL phase with no GPU present — the gpu_present gate does not precede the feed stop"
+
 # Under QEMU there is no AMD GPU, so the display must read DARK — this is what makes exit 96 the right answer.
 want "$LOG" "modeset: display DARK" \
      "the caps honestly report no lit display under QEMU" \

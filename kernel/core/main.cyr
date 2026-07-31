@@ -5239,6 +5239,18 @@ kprintln("modeset: running /bin/modeset --audio-pre", 41);
 sh_exec("run /bin/modeset --audio-pre", 28);
 kprintln("modeset: running /bin/modeset --audio-post", 42);
 sh_exec("run /bin/modeset --audio-post", 29);
+# ⛔⛔ `--pixclk` WAS MISSING FROM THIS LIST FOR THE WHOLE OF 1.56.33 — the cut that added it. The comment
+# four lines up states the rule it violated: *the selftest must exercise every flag the operator is told to
+# type, or the burn is the first place a dispatch bug is discovered.* And 1.56.33 paid for exactly that
+# lesson from the other direction — the burn rubric named `--pixclk` before the TOOL had the flag, caught
+# only by an operator stage-check. Both halves of that mistake are now covered here.
+kprintln("modeset: running /bin/modeset --pixclk", 38);
+sh_exec("run /bin/modeset --pixclk", 25);
+# 1.56.34 — the CRC calibration. Under QEMU mdo_crccal refuses at gpu_present (reason 1) BEFORE touching the
+# codec feed, so this proves the CRCCAL op dispatches with the feed and the AFMT untouched. The real
+# measurement — the NULL case the arc never took — is on iron.
+kprintln("modeset: running /bin/modeset --crccal", 38);
+sh_exec("run /bin/modeset --crccal", 25);
 #endif
 
 # === Boot self-tests + kybernet launch split out (1.36.2 refactor) ===
