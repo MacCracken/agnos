@@ -5,7 +5,70 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.56.33] - 2026-07-30
 
-**MODESET — the COLD case. Cycle OPEN.** Bumped on cycle open; the user tags on close.
+**MODESET — the COLD case. CYCLE CLOSED.** Bumped on cycle open; the user tags on close.
+
+### ✅ CLOSE-OUT — what this cut set out to do, and what it actually established
+
+**The goal was to light a pipe the firmware never lit.** Five bites were planned; **four landed, all
+zero-burn except read-only captures, and the fifth is deliberately NOT taken.**
+
+- ✅ **Prerequisites** — the `phyid` self-contradiction fixed (the gate now reads *derived from
+  silicon*, not *equals a number*), and the watchdog's recovery re-run widened **6 of 20 → 20/20**.
+- ✅ **① `#12` host tooling** — `build_set_pixel_clock_v1_7`, `--command pixelclock`, and the PS-read
+  attestation that caught `pll_id` 0/1/2 dispatching and bailing with zero writes.
+- ✅ **② the kernel seam** — `MDO_OP_PIXCLK` (`#93` op `0x09`), no operands, named refusals.
+- ✅ **③ + the re-burns** — four read-only captures, each of which changed the plan.
+- ✅ **④ the raster program** — `mode_raster.cyr`: **10 registers computed** from published CVT-RB
+  timing, bit-identical to the firmware's, **+ 4 carried** verbatim (the DML watermarks no mode
+  description can yield). Proven by a host oracle that **includes the builder rather than mirroring
+  it**, with external ground truth on both sides.
+- ⛔ **⑤ cold OTG bring-up — NOT TAKEN, by operator decision.** See below.
+
+⭐⭐ **THE HEADLINE RESULT IS A NEGATIVE ONE, AND IT IS WORTH MORE THAN THE FEATURE WOULD HAVE BEEN:**
+**ATOM `#12` programs the DTO on this part, not a PLL.** `pll_id` is degenerate in the only band that
+runs — eighteen values, byte-identical writes — so **there was never an instance to derive.** Three
+burns hunted a rule for something that does not exist. The pre-registered *"more than one clean ⇒
+report and stop, do not pick"* branch fired exactly as written.
+
+### ⛔⛔ SETTLED — `#12` IS NOT TO BE FIRED AT THE LIVE PIPE
+
+**Operator decision at close. This is policy, not a pending gap** — do not re-open it by constructing
+a "safe enough" argument. `#12` sets `DP_DTO_ENABLE`, which on a DTO-off pipe **moves the clock
+source** rather than reprogramming it, and the pipe in question is the one the console is on. This arc
+has already blanked that panel twice with `#76`. `gpu_pixclk_source_check()` refuses permanently for a
+lit pipe; **no derivation rule changes that.**
+
+⭐ **A future cold path needs a different TARGET, not a better parameter — and one exists, measured:**
+**pipe 1 is DARK** (`OTG1_CONTROL` abs `0x5081` = `0x80000300`, `OTG_MASTER_EN` clear) against pipe
+0's `0x80011301` with it set. A cold bring-up has somewhere to run that is not the console. Recorded,
+**not scheduled.**
+
+### Carry-forward out of 1.56.33 (named, none blocking)
+
+1. **`modeset-tool-smoke` intermittently wedges** — pre-existing, A/B-proven not from this cut
+   (3 of 6 failures with the change reverted), not in `sweep.sh`. Own bite.
+2. **`pll_id` 22/23/24 remain unadjudicable** — accepted: their blocks poison the aperture when
+   widened, and they are not needed now that the band is known degenerate.
+3. **Cold OTG bring-up** — unstarted by decision, with a measured non-console target if it is ever
+   scheduled.
+
+### The four process rules this cut paid for, in order of what they cost
+
+1. ⭐⭐ **A SAMPLE IS NOT THE SHAPE** — three times: swept `crtc_id` when `pll_id` was the axis; swept
+   `pll_id` 3-8 as the whole space; read a trace's **tail** as its read set. Each sample looked like
+   an answer, and the third turned two null results into "evidence" that had to be retracted.
+2. ⭐⭐ **"EVERY OFFSET IS ONE THE COMMAND READS" IS TRUE AND NOT SUFFICIENT** — that read set came
+   from a **dry run over a snapshot**. It says what the bytecode *would* read, not what is safe to
+   touch on silicon. Reading `0x5FA5` **poisoned the register aperture for the whole rest of the
+   boot.** Reachability must be established per-register on iron.
+3. ⭐ **BEFORE WRITING "LANDED", RE-READ THE CODE** — three documents in this cut asserted the state
+   of an artifact instead of being derived from it: a rubric naming a `--pixclk` flag that did not
+   exist, a gate list naming an overturned `phyid`, and a correction reporting itself landed in code
+   it had reached in one file of two.
+4. ⭐ **A GATE THAT READS A DIFFERENT VARIABLE FROM THE ARTIFACT IT CERTIFIES IS NOT A GATE** — the
+   coordinate cross-check compared two raw printed values (equal regardless of the arithmetic) and
+   the `#76` coverage check read printed offsets while certifying the seed. Both went green while
+   wrong; only mutations exposed them.
 
 ### Fixed — the plan's own stated prerequisite, and it was still live
 
@@ -431,6 +494,101 @@ capture set from the trace of *the command in question*.
 ⚠ Still a lower bound — measured against a partly-zero seed; if the next sweep cannot adjudicate,
 **re-derive from its traces**. ⚠ Not a blind range scan: every offset is one the command demonstrably
 reads, and this burn read nine registers across those blocks without a hang.
+
+### ⛔⛔⛔ IRON BURN 3 (2026-07-30) — THE WIDENED DUMP POISONED THE REGISTER APERTURE
+
+`dcn-modeset-pllblk-wide-iron-0730.txt`. **The 206-register group is destructive, and the trigger is
+named: `0x5FA5`** (PHY instance 2, offset `+05`). It reads `0xFFFFFFFF`, and **every read after it for
+the whole rest of the boot returns `0xFFFFFFFF`.** Instances 0 and 1 read all nineteen offsets clean;
+instance 2 read `+01` and `+03` clean and died at `+05`; instances 3 and 4 were all-ones throughout.
+
+⭐ **Not a property of those registers** — the previous burn read `0x5FB0`/`0x5FB6`/`0x6088`/`0x608E`/
+`0x6160`/`0x6166` and got real values (`0x00100607`, `0x00063333`, `0x10100005`, …). The wide read
+killed them. ⛔ **And the damage outlived the dump**: the next command, `modeset --pixclk`, read
+`OTG_INTERLACE_CONTROL` as garbage, reported **"display timing is interlaced"** on a progressive pipe
+and refused with reason 1 / exit 96. **Non-fatal** — console, shell and klug all survived — but every
+register read after the trigger in that boot is **void**.
+
+⇒ **THE JUSTIFICATION THAT FAILED.** The set was defended in-source as *"NOT a blind range scan —
+every offset is one the command demonstrably reads."* True, and **not sufficient**: the read set came
+from a **dry run over a snapshot**, so it says what the ATOM bytecode *would* read, not what is safe
+to touch on this silicon. **Reachability must be established per-register on iron; it cannot be
+inherited from an interpreter trace.** The nine-register version survived only by missing `+05`.
+
+**Fixed — the set is now bounded by what iron has SURVIVED, on both sides:** instances 0 and 1 get
+the full offset set (all clean this burn) **plus `+17`** (`0x5EDF`); instances 2/3/4 get **only**
+`+00`/`+10`/`+16`, the three the previous burn survived. Dump **206 → 160**. `m1-decode.py` now
+**drops all-ones reads from the seed** (55 dropped, first at `0x5FA5`) and says so — an absent entry
+reads 0 and shows in the unseeded count, a **poisoned entry lies**.
+
+### ⭐⭐ AND THE BURN STILL PAID — `pll_id=20` ELIMINATED ON EVIDENCE, THE FIRST REAL ELIMINATION
+
+Instances 0 and 1 were read **before** the poison, so their values are good. Re-seeded with them:
+
+| `pll_id` | reads | unseeded | verdict |
+|---|---|---|---|
+| **20** | 5 | **0** | ⭐ **fully adjudicable — storms ⇒ NOT the live PLL** |
+| **21** | 6 | **1** (`0x5EDF`, inst 1 `+17`) | one register short |
+| 22/23/24 | — | 10-12 | unadjudicable; their blocks are now known-dangerous to widen |
+
+⭐ With a full real seed the read sets **collapse from 19 to 5-6** — the table takes short branches
+when its polls are satisfied, the same shape as the `phyid` discriminator (wrong instance 87k reads /
+correct instance 21).
+
+⇒ **`pll_id=21` is the live candidate — by elimination plus `phyid=1` — and one register from a
+positive derivation.** ⚠ It will not be shortcut: elimination-plus-plausible is exactly the reasoning
+`phyid=0` survived six days on. `gpu_pll_discover()` keeps refusing until `0x5EDF` is seeded and 21
+completes clean. ⚠ 22/23/24 stay unadjudicable — the accepted price of not poisoning the aperture, and
+they are not needed.
+
+### ⭐⭐⭐ IRON BURN 4 (2026-07-30) — THE PLL QUESTION DISSOLVED: `#12` PROGRAMS THE DTO, NOT A PLL
+
+`dcn-modeset-pllblk-safe-iron-0730.txt`. The narrowed group is safe: **160 registers, zero all-ones**,
+instances 2/3/4 back to their exact pre-poison values, both cross-checks OK, anchors hold, phyid = 1,
+and `--pixclk` **returned to reason 24 / exit 95** with the clock derived — confirming the previous
+boot's exit 96 was the poison, not a reading.
+
+`0x5EDF` landed (`0xA0000001`), completing instances 0 and 1. The full sweep:
+
+| `pll_id` | verdict | unseeded | |
+|---|---|---|---|
+| 0-2 | bail, 9 opcodes | — | reads exactly like success |
+| **3-19** | **CLEAN** | **0** | ⭐ all seventeen **byte-identical** |
+| **20**, **21** | **STORM** | **0** | fully adjudicable ⇒ **eliminated on evidence** |
+| 22-24 | STORM | 10-17 | unadjudicable; aperture-poisoning to widen |
+| **255** | **CLEAN** | 0 | same three writes as 3-19 |
+
+Eighteen values produce the **same three writes with the same values**:
+
+```
+0x0140 <- 0x00000000    OTG_PIXEL_RATE_CNTL (DCN_1+0x80): clear DP_DTO_ENABLE
+0x0141 <- 0x0E650730    DP_DTO_PHASE        (DCN_1+0x81): 241,502,000 = the pixel clock IN HZ
+0x0140 <- 0x00000010    OTG_PIXEL_RATE_CNTL: SET DP_DTO_ENABLE (GPU_DP_DTO_ENABLE = 0x10)
+```
+
+⭐ **Write 2 tracks the target** across three clocks — 241.502 / 148.5 / 270.0 MHz each land as their
+exact Hz value — and the live `DP_DTO_MODULO` is DPREFCLK (598,875,000), so `DPREFCLK × PHASE/MODULO`
+reproduces the target exactly. Register identities re-grepped on **both** bases per the standing rule.
+
+⇒ ⭐⭐ **ATOM `#12` programs the DTO on this part, not a PLL.** `pll_id` is degenerate in the working
+band because **there is no instance behind it** — three burns hunted a rule to derive something that
+does not exist. The pre-registered branch *"more than one clean ⇒ the discriminator does not
+discriminate; report and stop, do not pick"* fired exactly as written, and the **reason** it cannot
+discriminate is now known rather than suspected.
+
+⛔ **This corrects this arc's own adjudication for the second time.** The earlier correction concluded
+*"the DTO is off ⇒ this pipe is PLL-driven, so `#12` IS the right mechanism."* Half right, and the
+wrong half matters: `#12` **is** the right command, but it drives the **DTO** — so on a pipe whose DTO
+is OFF, running it does not reprogram the existing clock, it **moves the pipe onto a different
+source**. A live-pipe modeset action, not a parameter update.
+
+**Fixed:** `gpu_pll_discover` **renamed `gpu_pixclk_source_check`** — the old name carried a dead
+claim, and a name must never become the evidence. It still refuses, now for the **measured** reason:
+`-1` DTO off ⇒ `#12` would move the clock source · `-2` DTO already on ⇒ `#12` would reprogram a live
+clock. `MDO_E_NOPLL`/`MDO_E_DTOCLK` retargeted; all call sites updated; `HDMI_ATOM=1
+ATOM_RUN_PIXCLK=1` still links (1,961,864 B). ⚠ **Still refusing** — what is known is the mechanism
+and the parameter's irrelevance, **not** that switching this live pipe to the DTO is safe. Making
+`#12` runnable is a burn-risk decision and is not taken here.
 
 ### Known — `modeset-tool-smoke` intermittently WEDGES (pre-existing; A/B-proven not this change)
 

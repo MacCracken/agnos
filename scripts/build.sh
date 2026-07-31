@@ -445,7 +445,7 @@ else
         # ⚠ That is the SAME defect shape this cut already paid for twice: a rubric naming a
         # `--pixclk` flag the tool did not have, where "no output" is indistinguishable from "refused
         # silently". Declaring it here makes the guarded code compilable and inspectable — it does NOT
-        # make #12 reachable on iron, because gpu_pll_discover() still refuses unconditionally.
+        # make #12 reachable on iron, because gpu_pixclk_source_check() still refuses unconditionally.
         # ⛔ DO NOT SET THIS FOR A BURN until a rule DERIVES the PLL instance from live silicon.
         # atom_run_set_pixel_clock() refuses pll_id < 3 (bail branches) AND 20-24, which the
         # 2026-07-30 full-space sweep measured as driving a PHY/RDPCS instance and calling table 77 —
@@ -458,7 +458,7 @@ else
         if [ -n "$ATOM_RUN_PIXCLK" ] && [ -z "$HDMI_ATOM" ]; then
             echo "ERROR: ATOM_RUN_PIXCLK=1 requires HDMI_ATOM=1 (it calls into core/atom.cyr)." >&2
             echo "       Use: HDMI_ATOM=1 ATOM_RUN_PIXCLK=1 sh scripts/build.sh" >&2
-            echo "       Note this only makes #12 COMPILABLE -- gpu_pll_discover() still refuses" >&2
+            echo "       Note this only makes #12 COMPILABLE -- gpu_pixclk_source_check() still refuses" >&2
             echo "       unconditionally, so the op cannot reach silicon in this build either." >&2
             exit 1
         fi

@@ -67,7 +67,7 @@ var MR_OUT_BYTES   = 80;    # 10 u64 outputs
 # mr_raster_build(mode, out) -> 0 ok, -1 the description is not a legal raster.
 #
 # ⚠ REFUSES, NEVER CLAMPS. A silently-corrected mode description is how a wrong raster reaches a
-# panel wearing the shape of a right one — the same reason gpu_pll_discover() returns -1 rather than
+# panel wearing the shape of a right one — the same reason gpu_pixclk_source_check() returns -1 rather than
 # a plausible pll_id, one function over.
 fn mr_raster_build(mode, out): i64 {
     var ha = load64(mode + 0);

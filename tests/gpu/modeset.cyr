@@ -232,7 +232,7 @@ fn modeset_vtotal(): i64 {
 #   95 = refused with MDO_E_NOPLL -- THE PASS      96 = no GPU / no live display (QEMU)
 #   87 = refused with MDO_E_DTOCLK -- the pipe reports a DTO clock, so #12 is the wrong command
 #        for it. **STOP**: burn 1 read DP_DTO_ENABLE clear and the cold path is built on #12.
-#   89 = got past gpu_pll_discover (refusal ordering wrong)   88 = #12 EXECUTED -- STOP
+#   89 = got past gpu_pixclk_source_check (refusal ordering wrong)   88 = #12 EXECUTED -- STOP
 #   94 = some other refusal -- read it against MDO_E_* before proceeding
 fn modeset_pixclk(): i64 {
     var rec[64];
@@ -268,7 +268,7 @@ fn modeset_pixclk(): i64 {
         if (reason == 1) { m_puts("modeset: no GPU / no live display -- QEMU has no DCN"); m_nl(); return 96; }
         if (reason == 23) {
             m_puts("modeset: derived OK but this build cannot execute #12 (ATOM_RUN_PIXCLK unset)"); m_nl();
-            m_puts("modeset: ** UNEXPECTED at this cut ** -- it got PAST gpu_pll_discover, which"); m_nl();
+            m_puts("modeset: ** UNEXPECTED at this cut ** -- it got PAST gpu_pixclk_source_check, which"); m_nl();
             m_puts("modeset: refuses unconditionally. The refusal ordering is wrong. STOP."); m_nl();
             return 89;
         }

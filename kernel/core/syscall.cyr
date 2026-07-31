@@ -4572,20 +4572,54 @@ fn mdo_dump() {
     # ⚠ LOWER BOUND, stated as always: the read set was measured against a partly-zero seed, so seeding
     # these may steer the table further. If the next sweep still cannot adjudicate, re-derive from ITS
     # traces rather than assuming this set is final.
+    # ⛔⛔⛔ THE 2026-07-30 WIDE BURN PROVED THIS GROUP CAN POISON THE REGISTER APERTURE, and the
+    # trigger is named: **reading 0x5FA5 (instance 2, offset +05) returns 0xFFFFFFFF and every read
+    # after it — for the WHOLE REST OF THE BOOT — returns 0xFFFFFFFF too.** Instances 0 and 1 read all
+    # nineteen offsets cleanly; instance 2 read +01 and +03 cleanly and died at +05; instances 3 and 4
+    # were all-ones from their first read. ⭐ It is NOT a property of those registers: the previous
+    # burn read 0x5FB0/0x5FB6/0x6088/0x608E/0x6160/0x6166 and got REAL values from every one. The wide
+    # read killed them.
+    # ⛔ AND THE DAMAGE OUTLIVED THE DUMP: the very next command, `modeset --pixclk`, read
+    # OTG_INTERLACE_CONTROL as garbage and reported "display timing is interlaced" — a pipe that is
+    # progressive — so it refused with reason 1 instead of deriving the clock. The whole aperture was
+    # returning all-ones by then. Non-fatal (console and shell survived), but every register read after
+    # the trigger in that boot is VOID.
+    # ⇒ THE JUSTIFICATION THAT FAILED, recorded so it is not repeated: the offsets were defended as
+    # "not a blind range scan — every one is a register the command demonstrably reads". That is true
+    # and it is NOT SUFFICIENT. The read set came from a DRY RUN over a snapshot: it says what the ATOM
+    # bytecode WOULD read, not what is safe to touch on this silicon. Reachability must be established
+    # per-register on iron, not inherited from an interpreter trace.
+    #
+    # ⭐ SO THE SET IS NOW BOUNDED BY WHAT IRON HAS ACTUALLY SURVIVED, on both sides:
+    #   • instances 0 and 1 — the full offset set, every one of which read cleanly on the wide burn,
+    #     plus +17 (0x5EDF), the ONE register `pll_id=21` still needs and which sits between two
+    #     offsets (+16, +1A) that both read clean on instance 1.
+    #   • instances 2, 3, 4 — ONLY +00, +10, +16, the three the PREVIOUS burn read and survived.
+    #     ⛔ Do not extend these without a per-register iron probe; +05 is proven destructive.
+    # ⚠ COST, STATED: `pll_id` 22/23/24 stay unadjudicable. That is the price of not poisoning the
+    # aperture, and it is the right trade — `pll_id=20` is now fully seeded and ELIMINATED on evidence,
+    # so 21 is the live candidate and it needs instance 1, not instances 2-4.
     kprintln("modeset: dump group M12-pllblk", 30);
     var pinst = 0;
     var pb = 0;
-    while (pinst < 5) {
+    while (pinst < 2) {
         pb = 0x5DF0 + pinst * 0xD8;
         mdo_rd2a(pb + 0x01); mdo_rd2a(pb + 0x03); mdo_rd2a(pb + 0x05); mdo_rd2a(pb + 0x07);
         mdo_rd2a(pb + 0x0C); mdo_rd2a(pb + 0x10); mdo_rd2a(pb + 0x12); mdo_rd2a(pb + 0x13);
-        mdo_rd2a(pb + 0x14); mdo_rd2a(pb + 0x16); mdo_rd2a(pb + 0x1A); mdo_rd2a(pb + 0x1B);
-        mdo_rd2a(pb + 0x1C); mdo_rd2a(pb + 0x1D); mdo_rd2a(pb + 0x1E); mdo_rd2a(pb + 0x1F);
-        mdo_rd2a(pb + 0x20); mdo_rd2a(pb + 0x21); mdo_rd2a(pb + 0x22);
+        mdo_rd2a(pb + 0x14); mdo_rd2a(pb + 0x16); mdo_rd2a(pb + 0x17); mdo_rd2a(pb + 0x1A);
+        mdo_rd2a(pb + 0x1B); mdo_rd2a(pb + 0x1C); mdo_rd2a(pb + 0x1D); mdo_rd2a(pb + 0x1E);
+        mdo_rd2a(pb + 0x1F); mdo_rd2a(pb + 0x20); mdo_rd2a(pb + 0x21); mdo_rd2a(pb + 0x22);
+        pinst = pinst + 1;
+    }
+    # ⛔ Instances 2-4: the previously-survived three offsets ONLY. Never the wide set.
+    pinst = 2;
+    while (pinst < 5) {
+        pb = 0x5DF0 + pinst * 0xD8;
+        mdo_rd2a(pb + 0x00); mdo_rd2a(pb + 0x10); mdo_rd2a(pb + 0x16);
         pinst = pinst + 1;
     }
 
-    kprintln("modeset: dump end -- 206 registers (M1 67 + M2 10 + M3 4 + M8 12 + DIGBE 8 + PIXCLK 10 + PLLBLK 95)", 99);
+    kprintln("modeset: dump end -- 160 registers (M1 67 + M2 10 + M3 4 + M8 12 + DIGBE 8 + PIXCLK 10 + PLLBLK 49)", 99);
     return 0;
 }
 
@@ -5609,7 +5643,7 @@ fn mdo_validate(rec) {
     if (op == MDO_OP_PIXCLK) {
         # 1.56.33 — same doctrine as every op above it: NO OPERANDS. The pixel clock comes from
         # gpu_pixclk_discover (measured off the live pipe), the CRTC from gpu_display_pipe, and the
-        # PLL instance from gpu_pll_discover — which currently refuses. ⛔ Deliberately NOT a
+        # clock-source check from gpu_pixclk_source_check — which currently refuses. ⛔ Deliberately NOT a
         # ring-3 parameter: letting a caller pass pll_id would put the guess back in the ABI, one
         # layer out from where MD-2 put it, and a caller could then aim a clock command at the PLL
         # driving the live pipe.
@@ -5670,26 +5704,26 @@ fn mdo_pixclk() {
     kprint("modeset: PIXCLK measured pixclk_100hz ", 38); kprint_num(pc);
     kprint(" crtc ", 6); kprint_num(gpu_display_pipe); kprintln("", 0);
 
-    var pll = gpu_pll_discover();
+    var pll = gpu_pixclk_source_check();
     # ⭐ -2 and -1 are DIFFERENT REFUSALS and the tool must be able to tell them apart. -2 says the
     # pixel clock comes from the DTO, so #12 is the wrong command class and no PLL rule would help;
     # -1 says #12 IS right for this pipe and only the instance is missing. Collapsing them would
     # report "cannot name the PLL" for a pipe that has none — the failure mode MDO_E_NOHDMI was
     # split off 14 to avoid, where a correct diagnosis reads as the wrong kind of problem.
     if (pll == 0 - 2) {
-        kprintln("modeset: PIXCLK REFUSED -- this pipe's clock comes from the DTO, not a PLL", 74);
-        kprintln("modeset:   ATOM #12 programs a PLL, so it is the wrong command for this pipe.", 77);
+        kprintln("modeset: PIXCLK REFUSED -- this pipe ALREADY runs on the DTO, so #12 would", 74);
+        kprintln("modeset:   reprogram a live clock rather than establish one.", 60);
         return MDO_E_DTOCLK;
     }
     if (pll < 0) {
-        kprintln("modeset: PIXCLK REFUSED -- the PLL instance is not derivable from live silicon", 78);
-        kprintln("modeset:   the DTO is off, so #12 IS the right command here -- only the instance", 80);
-        kprintln("modeset:   is missing. pll_id 0/1/2 make ATOM #12 bail with ZERO writes, a clean", 80);
-        kprintln("modeset:   return that reads exactly like success. Guessing is how phyid=0 lived.", 81);
+        kprintln("modeset: PIXCLK REFUSED -- ATOM #12 programs the DTO and ENABLES it, and this", 77);
+        kprintln("modeset:   pipe's DTO is OFF, so running it MOVES the clock source on a live pipe.", 82);
+        kprintln("modeset:   There is NO PLL instance to derive: pll_id 3-19 and 255 all produce", 78);
+        kprintln("modeset:   byte-identical writes. Measured on iron 2026-07-30, not assumed.", 75);
         return MDO_E_NOPLL;
     }
 
-    # ⛔ UNREACHABLE TODAY (gpu_pll_discover always refuses). Kept so the seam is written, reviewed
+    # ⛔ UNREACHABLE TODAY (gpu_pixclk_source_check always refuses). Kept so the seam is written, reviewed
     # and gated now rather than under time pressure once a derivation exists.
     #ifdef ATOM_RUN_PIXCLK
     return atom_run_set_pixel_clock(pc, pll, gpu_display_pipe, 3);

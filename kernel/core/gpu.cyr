@@ -11428,45 +11428,50 @@ fn gpu_refresh_measure(pipe) {
     return gpu_refresh_mhz;
 }
 
-# gpu_pll_discover — is this pipe's pixel clock PLL-driven, and if so WHICH PLL? Refuses either way.
+# gpu_pixclk_source_check — WHAT DRIVES THIS PIPE'S PIXEL CLOCK, and can ATOM #12 be run on it?
 #
-#   returns -1  PLL-driven, but the INSTANCE is not derivable from live silicon yet — the live case.
-#           -2  DTO-driven: this pipe has no PLL to name, and ATOM #12 is the WRONG command for it.
+#   returns -1  refuse: running #12 would MOVE this pipe's clock source (see below) — the live case
+#           -2  refuse: this pipe already runs on the DTO, so #12's enable is not a no-op either
 #
-# ⛔⛔ RETURNING A NEGATIVE IS THE DELIVERABLE, NOT A GAP. `pll_id` is #12's `phyid`: a small integer
-# naming which instance the command acts on, with a wrong-and-plausible value available. The host
-# sweep measured that `pll_id` 0, 1 and 2 make the table BAIL — 9 opcodes, zero register activity, a
-# clean return that reads exactly like success. On DCE, ATOM_PPLL0/1/2 ARE 0/1/2, so the value a
-# person reaches for first is precisely the one that does nothing. MD-2 shipped that mistake once
-# already and it stood for six days. Until a rule DERIVES the instance from live silicon this
-# refuses; guessing would put the guess in the kernel, the one place the phyid fix was built to
-# prevent.
+# ⛔⛔⛔ RENAMED FROM `gpu_pll_discover` 2026-07-30, AND THE OLD NAME WAS CARRYING A DEAD CLAIM.
+# It existed to "derive which PLL instance ATOM #12 programs", refused because no rule derived one,
+# and three burns were spent trying to find that rule. **There is no PLL instance to derive.**
+# Measured against a complete real iron seed (`dcn-modeset-pllblk-safe-iron-0730.txt`):
 #
-# ⭐⭐ AND THE FULL-SPACE SWEEP AGAINST A REAL SNAPSHOT (2026-07-30) MADE THAT REFUSAL LOAD-BEARING
-# FOR A MEASURED REASON, replacing the retracted "it would have hit a dead PLL". `pll_id` is
-# OVERLOADED: 3-19 and 255 are benign (55 opcodes, DCCG writes only), while **20-24 drive a PHY,
-# not a PLL** — 175k-510k opcodes, up to 177k reads (a poll storm, the wrong-phyid #76 signature),
-# each writing a different PHY/RDPCS instance block on a 0xD8 stride, and calling ATOM table 77.
-# ⇒ A guessed value landing in 20-24 does not merely program the wrong clock; it fires a superset of
-# the transmitter writes that have blanked this panel twice. `atom_run_set_pixel_clock()` now refuses
-# that band explicitly — `pll_id < 3` had admitted every one of them. See atom.cyr for the full map.
+#   pll_id 0-2      bail, 9 opcodes, zero register activity — reads exactly like success
+#   pll_id 3-19     ⭐ ALL EIGHTEEN (with 255) produce BYTE-IDENTICAL writes. The parameter selects
+#                   NOTHING in this band.
+#   pll_id 20,21    fully seeded, both STORM -> neither combo-PHY instance is this pipe's clock
+#   pll_id 22-24    unadjudicable, and their blocks POISON the register aperture when widened
+#   pll_id 25-254   bail, 7 opcodes            255  same three writes as 3-19
 #
-# ⛔ THIS FUNCTION USED TO READ ITS OWN EVIDENCE BACKWARDS, and that is why it now tests the DTO
-# enable bit BY NAME rather than testing a register against zero. 1.56.33 burn 1 read PIXEL_RATE_CNTL
-# and DP_DTO_PHASE as ZERO on the live pipe, and the write-up concluded "#12 targets a PLL this pipe
-# is not using". The opposite is true: cntl == 0 means DP_DTO_ENABLE is CLEAR, the DTO is OFF, and
-# that is the CORRECT state for a PLL-driven HDMI pipe — while DP_DTO_MODULO read 598,875,000, the
-# DPREFCLK gpu_regs.cyr had already predicted as "~600e6". A clean positive result, misread because
-# the register identities were derived from an ATOM command trace instead of from the register table
-# that already named all three, thirty lines below where duplicates were being added for them.
-# ⇒ THIS PIPE IS PLL-DRIVEN AND ATOM #12 IS THE RIGHT MECHANISM for the cold path. The refusal below
-# stands on its original and always-sufficient ground: the instance is not derived. A safety property
-# justified by a wrong argument is weaker than the same property justified by the right one.
-fn gpu_pll_discover() {
+# ⭐⭐ AND WHAT THOSE THREE WRITES ACTUALLY DO IS THE ANSWER:
+#     1.  OTG_PIXEL_RATE_CNTL (DCN_1+0x80) <- 0          clear DP_DTO_ENABLE
+#     2.  DP_DTO_PHASE        (DCN_1+0x81) <- pixel clock IN HZ
+#     3.  OTG_PIXEL_RATE_CNTL (DCN_1+0x80) <- 0x10       SET DP_DTO_ENABLE (GPU_DP_DTO_ENABLE)
+# Write 2 was verified to track the target across three clocks (241.502 / 148.5 / 270.0 MHz, each
+# landing in the register as its exact Hz value), and the live DP_DTO_MODULO is DPREFCLK, so
+# DPREFCLK x PHASE/MODULO reproduces the target exactly. ⇒ **ATOM #12 PROGRAMS THE DTO ON THIS PART,
+# NOT A PLL.** `pll_id` is degenerate in the working band because there is no instance behind it.
+#
+# ⛔ THIS ALSO CORRECTS THIS FILE'S OWN PREVIOUS CONCLUSION, which read "the DTO is off, so this pipe
+# is PLL-driven and ATOM 12 is the right command". Half right, and the wrong half matters: #12 IS the
+# right command, but it drives the DTO — so on a pipe whose DTO is OFF, running it does not reprogram
+# the existing clock, it MOVES the pipe onto a different source. That is a live-pipe modeset action,
+# not a parameter update, and it is why this still refuses.
+#
+# ⛔⛔ SETTLED BY OPERATOR DECISION, 1.56.33 CLOSE: **#12 IS NOT TO BE FIRED AT THE LIVE PIPE.** This
+# is policy, not a pending gap — do not re-open it by finding a "safe enough" argument. The panel this
+# refusal protects is the one a person is reading the console on, and the arc has already blanked it
+# twice with #76. The refusal below is therefore PERMANENT for a lit pipe, and no derivation rule will
+# change that; what a future cold path needs is a DIFFERENT TARGET, not a better parameter.
+# ⭐ AND THAT TARGET EXISTS AND IS MEASURED: pipe 1 is DARK on this machine — OTG1_CONTROL (abs
+# 0x5081) reads 0x80000300, OTG_MASTER_EN clear, against pipe 0's 0x80011301 with it set. A cold
+# bring-up has somewhere to run that is not the console. That is where bite 5 goes if it is ever
+# scheduled; it is not scheduled here.
+fn gpu_pixclk_source_check() {
     if (gpu_present == 0) { return 0 - 1; }
     if (gpu_display_ok != 1) { return 0 - 1; }
-    # ⚠ PER-PIPE. Reading the pipe-0 pair on a pipe-1 boot would report a register this display is
-    # not using and call it evidence — the stride was found by sweeping crtc_id, not by one trace.
     var pipe = gpu_display_pipe;
     if (pipe < 0) { pipe = 0; }
     var po = pipe * GPU_DCN_PIXRATE_STRIDE;
@@ -11480,14 +11485,11 @@ fn gpu_pll_discover() {
     kprint(" dto phase ", 11); kprint_hex(phase);
     kprint(" dto modulo ", 12); kprint_hex(modulo); kprintln("", 0);
     if ((rate & GPU_DP_DTO_ENABLE) != 0) {
-        # ⚠ NOT REACHABLE on archaemenid's HDMI link, and kept anyway: it is the only branch that can
-        # tell a future DP panel the whole command class is wrong for it, instead of reporting a
-        # missing instance for a clock that has no instance to miss. Those are different facts.
-        kprintln("gpu: this pipe is DTO-driven -- it has no PLL, and ATOM 12 is the wrong command", 79);
+        kprintln("gpu: this pipe already runs on the DTO -- ATOM 12 would reprogram a live clock", 78);
         return 0 - 2;
     }
-    kprintln("gpu: the DTO is off, so this pipe is PLL-driven and ATOM 12 is the right command", 80);
-    kprintln("gpu: pll instance NOT derivable yet -- refusing to name one (see gpu_pll_discover)", 82);
+    kprintln("gpu: the DTO is OFF, so this pipe is driven by something else -- ATOM 12 programs", 81);
+    kprintln("gpu: the DTO and ENABLES it, which MOVES the clock source. Refusing on a live pipe.", 83);
     return 0 - 1;
 }
 
