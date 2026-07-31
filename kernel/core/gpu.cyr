@@ -229,6 +229,13 @@ var gpu_v_active      = 0;    # link active height — computed alongside gpu_h_
 # P3b-ii pre-flight: 1 = every precondition for the DVI->HDMI DIG_MODE flip is verified clear on the live
 # encoder. 0 = do NOT flip (a hazard is armed, or the link/encoder isn't ours to touch). Read-only result.
 var gpu_hdmi_flip_ok  = 0;
+# The DIG_MODE the BACK END was inherited with, latched by the FIRST modeset audio arm of the boot and
+# never rewritten. Arms normalise to it at ENTRY so each starts from identical signalling; the arm then
+# deliberately LEAVES the link in HDMI so the operator's listening window is on a link that can actually
+# carry data islands. 0 = not yet latched (a literal init, because a module-scope `var x = <expr>` reads
+# 0 forever in this kernel — and 0 is not a signalling mode any live link holds, so it doubles as the
+# sentinel without needing a runtime initialiser).
+var gpu_dig_mode_boot = 0;
 # P3b-iii: 1 = the display side of the audio path is programmed (link in HDMI signalling, DTO fed the live
 # pixel clock, endpoint enabled, AFMT tap open). This is the half the 1.53.5 HDA work was missing.
 var gpu_hdmi_audio_on = 0;
@@ -12361,17 +12368,43 @@ fn gpu_hdmi_audio_unmute() {
     var dr = GPU_R_AZ_ENDPOINT_DATA  + az * GPU_DCN_AZ_STRIDE;
 
     # 1. AZ AUDIO_ENABLED (bit31) — the capture's first post-edge write.
+    #
+    # ⛔⛔ UN-GATE THE ENDPOINT CLOCK ACROSS THESE WRITES, AND RE-GATE AFTER. This function is called from
+    # a DIFFERENT place than gpu_hdmi_audio_enable(), whose CLOCK_GATING_DISABLE bracket has already been
+    # CLOSED by the time control reaches here — so without re-opening it, every endpoint write below goes
+    # into a gated clock. This file's own rule, stated where the bracket is opened: "a register write into
+    # a gated clock is dropped SILENTLY." A silently-dropped write is precisely candidate (b), and having
+    # the arc's two surviving candidates include "a write that does not latch" while the unmute path wrote
+    # into a gated endpoint is not a coincidence worth preserving.
+    #
+    # ⭐ AMDGPU'S EXACT SHAPE, decoded from the ftrace rather than inferred — dce_aud_az_enable writes the
+    # enable WITH the gate held open, then closes it in a second store to the same ordinal:
+    #     0x384c <- 0x54          (select HOT_PLUG_CONTROL)
+    #     0x384d <- 0x80000001    AUDIO_ENABLED | CLOCK_GATING_DISABLE
+    #     0x384c <- 0x54          (re-select — the index window has NO memory)
+    #     0x384d <- 0x80000000    AUDIO_ENABLED, gate closed
+    # (agnosticos/docs/development/prior-art/amdgpu-hdmi-modeset-writes-0717.txt, the four writes
+    # immediately before AFMT_AUDIO_PACKET_CONTROL <- 0x04000801 and HDMI_GC <- 0x04.)
     gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_HOT_PLUG_CONTROL);
     var hpc1 = gpu_reg32(GPU_BASE_DCN_2, dr);
-    gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc1 | GPU_AZ_AUDIO_ENABLED);
+    gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc1 | GPU_AZ_AUDIO_ENABLED | GPU_AZ_CLOCK_GATING_DISABLE);
 
     # 2. The slot map, on the far side of that transition (agnos rule; read back, never assumed).
+    #    Written while the gate is still open — that is the whole reason the close is deferred to step 2b.
     gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_MULTICHANNEL_ENABLE);
     gpu_reg32_write(GPU_BASE_DCN_2, dr, GPU_AZ_MULTICHANNEL_STEREO);
     gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_MULTICHANNEL_ENABLE);
     if ((gpu_reg32(GPU_BASE_DCN_2, dr) & 0x1) == 0) {
         kprintln("gpu: hdmi endpoint slot map did not take", 40);
     }
+
+    # 2b. Close the gate, leaving AUDIO_ENABLED set — amdgpu's second store. ⚠ Re-select the ordinal
+    # first: `dr` returns whatever `ir` last named, and step 2 left it pointing at MULTICHANNEL_ENABLE.
+    # Writing 0x80000000 into THAT ordinal instead is how this window destroyed its own slot-map write
+    # once before (fixed by hand at four sites in 1.55.15).
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_HOT_PLUG_CONTROL);
+    gpu_reg32_write(GPU_BASE_DCN_2, dr,
+    (hpc1 | GPU_AZ_AUDIO_ENABLED) & (0 - 1 - GPU_AZ_CLOCK_GATING_DISABLE));
 
     # 3. THE UNMUTE — open the sample tap. This single bit is what the arc has spent sixteen burns reaching.
     var apc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
@@ -12383,6 +12416,21 @@ fn gpu_hdmi_audio_unmute() {
     gpu_mfence();
 
     kprintln("gpu: hdmi audio UNMUTED (AUDIO_ENABLED + slot map + SAMPLE_SEND + GC)", 69);
+
+    # ⭐⭐ 5. THE FIRST PROBE THIS PATH HAS EVER HAD DOWNSTREAM OF THE TAP.
+    #
+    # ⛔ The MODESET_AUDIO route had NO post-unmute instrument at all, and that is why every CRC line in
+    # the 2026-07-24 M9 capture reads "did not complete". Those readings were taken by the probe inside
+    # gpu_hdmi_audio_enable(), which under MODESET_AUDIO runs while the tap is STAGED SHUT — SAMPLE_SEND
+    # is deliberately cleared there and is not set until this function, later, from a different caller.
+    # So "no samples" was the guaranteed answer to a question asked with the valve closed, and sessions
+    # read it as a regression against the 0716-0720 burns, which probed a completely different state.
+    #
+    # ⚠ WHAT THIS CAN AND CANNOT SAY. CRC non-zero at a tap means bytes with CONTENT crossed it. A zero
+    # CRC, or a counter that never completes, is NOT yet interpretable — `--crccal` has to establish
+    # first that this counter can FAIL to complete when nothing flows. Until that null is on record, read
+    # a positive as evidence and a negative as nothing at all. Do not turn a non-answer into a verdict.
+    gpu_hdmi_audio_crc_probe(d);
     return 1;
 }
 #endif

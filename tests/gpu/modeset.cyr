@@ -526,17 +526,29 @@ fn modeset_main(): i64 {
         m_puts("modeset:        --crccal --audio-pre --audio-post --caps"); m_nl();
         return 84;
     }
-    # ⛔⛔ NO ARGUMENTS SEEN. This is the argv-init trap, and on the 2026-07-24 M9 burn it cost
-    # the whole run: the operator typed `modeset --audio-pre` (no `run /bin/` prefix), argc read
-    # 0, this fell through to the caps probe, and caps returned 95 on a lit panel — an exit code
-    # indistinguishable from a successful arm. Two arms were "run", neither existed, and the
-    # resulting silence looked like data. Falling back is still right (a bare `run /bin/modeset`
-    # must work), but it must NEVER be silent about it.
+    # ⛔⛔⛔ RETRACTED 2026-07-31 — THIS COMMENT USED TO BLAME THE OPERATOR'S INVOCATION, AND IT WAS
+    # FLATLY FALSE. It claimed the 2026-07-24 M9 burn was lost because `modeset --audio-pre` was typed
+    # without the `run /bin/` prefix, argc read 0, and the arms silently fell through to the caps probe.
+    # ⭐ MEASURED ON IRON, same boot, both forms, 2026-07-31: `run /bin/modeset --audio-pre` and
+    # `modeset --audio-pre` produce BYTE-IDENTICAL output and the same exit 95 — the full ATOM #4 trace,
+    # the #76 DISABLE/ENABLE cycle, the staging, the unmute, the verdict. agnoshi resolves the bare name
+    # and passes argv correctly. **The prefix has never mattered.**
+    #
+    # ⛔ AND THE HARM WAS NOT THE WRONG FACT — IT WAS WHAT THE WRONG FACT WAS USED FOR. A later session
+    # read this comment, treated it as measured, and told the operator his typing had cost a burn. It had
+    # not. **Never explain a failure to produce a result by how the operator invoked the thing, unless
+    # that has been measured on iron in the same boot as the working form.** The default assumption is
+    # that the code is wrong, because it is.
+    #
+    # The fallback + loud banner below STAY: a bare `run /bin/modeset` must work, and a caps probe that
+    # returns 95 really is indistinguishable from a successful arm, so it must announce itself. That part
+    # was always sound. Only the causal story attached to it was invented.
     m_puts("modeset: ================================================================"); m_nl();
     m_puts("modeset: ⚠ NO ARGUMENTS SEEN -- running the CAPS PROBE only."); m_nl();
     m_puts("modeset: IF YOU ASKED FOR AN ARM, IT DID **NOT** RUN. Nothing was written,"); m_nl();
     m_puts("modeset: no edge fired, and any silence you hear means NOTHING."); m_nl();
-    m_puts("modeset: Invoke with the full path:   run /bin/modeset --audio-pre"); m_nl();
+    m_puts("modeset: (This is NOT about how you typed it -- `modeset --audio-pre` and"); m_nl();
+    m_puts("modeset:  `run /bin/modeset --audio-pre` are iron-proven identical.)"); m_nl();
     m_puts("modeset: ================================================================"); m_nl();
     return modeset_caps();
 }

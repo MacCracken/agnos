@@ -5096,6 +5096,54 @@ fn mdo_transmit_run(arm) {
     # phyid names. Both are 1 on archaemenid so `d` happened to work — that coincidence is the whole
     # front-end/back-end conflation this arc already paid for once. Index them by s_phy.
     var db      = s_phy * GPU_DCN_DIG_STRIDE;
+
+    # ⛔⛔⛔ NORMALISE DIG_MODE TO THE BOOT-INHERITED VALUE **HERE**, AT ARM ENTRY — NOT AT ARM EXIT.
+    #
+    # This used to be done at the END of the arm, to keep the arms independent (arm 1 must not hand arm 2
+    # a link already sitting in HDMI). The independence requirement is REAL and is kept. Restoring at the
+    # END, however, made the whole experiment incapable of producing its own result:
+    #
+    #   the operator listens AFTER the command returns — and by then the arm had put DIG_MODE back to 2
+    #   (DVI). **Every HDMI_* register is inert in DVI mode** (gpu.cyr's own safety contract), so there
+    #   are no data islands, no audio sample packets, and no possible sound — in EITHER arm, at ANY
+    #   unmute position, no matter how correct every register was while the op was still running.
+    #
+    # ⇒ The 2026-07-24 "both arms silent" verdict had TWO independent structural causes, and the missing
+    # HDA_TONE was only the first. A burn cannot measure a thing it switches off before the measurement.
+    #
+    # Doing it at entry satisfies both requirements at once: every arm STARTS from the identical
+    # boot-inherited signalling regardless of what ran before it, and every arm ENDS in HDMI, which is
+    # both the state under test and the state the operator is listening to.
+    #
+    # ⚠ Safe by demonstration, not by argument: the 07-31 log shows the pipe re-enabled, relit and
+    # frequency-locked (`resumed 1`, 59951 mHz, within 7 ppm) with DIG_MODE ALREADY 3 — the old restore
+    # ran after that. The panel is iron-proven to work in HDMI signalling; leaving it there is not a new
+    # risk. The watchdog and the boot latch are unchanged and still cover a dark pipe.
+    # ⚠ LATCHED ON FIRST USE, FROM `db` — NOT from gpu_audio_probe(). The probe walks the FRONT ends and
+    # its `bc` is indexed by the stream encoder; DIG_BE_CNTL belongs to the BACK end and is indexed by
+    # s_phy. Both are 1 on archaemenid, and taking that coincidence for identity is the exact front/back
+    # conflation this file already paid for once. Latching here uses the same `db` every later write does.
+    # ⚠ Sound because MODESET_AUDIO suppresses the boot-time audio enable, so the FIRST arm of a boot
+    # necessarily observes the GOP's inherited signalling and nothing else can have moved it.
+    # Never hardcode 2: that is this box's inherited value, not a fact about DCN.
+    if (arm != 0) {
+        var be_pre = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db) & 0xFFFFFFFF;
+        var dm_pre = (be_pre & GPU_DIG_MODE_MASK) >> GPU_DIG_MODE_SHIFT;
+        if (gpu_dig_mode_boot == 0) {
+            gpu_dig_mode_boot = dm_pre;
+            kprint("modeset: transmit -- DIG_MODE inherited value latched: ", 55);
+            kprint_num(dm_pre); kprintln(" (first arm this boot)", 22);
+        }
+        if (dm_pre != gpu_dig_mode_boot) {
+            gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db,
+            (be_pre & (0 - 1 - GPU_DIG_MODE_MASK)) | (gpu_dig_mode_boot << GPU_DIG_MODE_SHIFT));
+            gpu_mfence();
+            kprint("modeset: transmit -- DIG_MODE normalised ", 41); kprint_num(dm_pre);
+            kprint(" -> ", 4); kprint_num(gpu_dig_mode_boot);
+            kprintln(" at ENTRY (arms start identical)", 32);
+        }
+    }
+
     var s_be    = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db) & 0xFFFFFFFF;
     var s_been  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + db) & 0xFFFFFFFF;
 
@@ -5195,6 +5243,21 @@ fn mdo_transmit_run(arm) {
     #ifdef MODESET_AUDIO
     var aud_fail = 0;
     var r_aud = 0;
+    # ⭐⭐ THE STIMULUS, AND ITS BLINDING — the two things M9 lacked on 2026-07-24.
+    #
+    # That burn ran with HDA_TONE off (deliberately, to keep the ear oracle unguessable) and with no
+    # ring-3 feed ever launched, so hda_stream_arm zero-filled the ring and BOTH arms streamed exact
+    # silence. "Silent, silent" was structurally guaranteed and went into the record as the falsification
+    # of the sequencing candidate. burn-prep.sh now REFUSES to build a MODESET_AUDIO arm without
+    # HDA_TONE; this is the other half — the arms are given DIFFERENT sweep bands so they are told apart
+    # by WHICH tone, not by whether one was heard.
+    #
+    # ⛔ Ask the operator "low or high?", never "did you hear it?". A yes/no ear oracle cannot separate a
+    # real negative from a null experiment, and cannot resist an expectant listener; a band he was not
+    # told in advance can do both. Bands are an octave-and-a-half apart and non-overlapping so no part of
+    # either sweep can be mistaken for the other.
+    if (arm == 1) { hda_tone_band(300, 600); }     # ARM 1 CONTROL   — the LOW sweep
+    if (arm == 2) { hda_tone_band(1000, 1400); }   # ARM 2 TREATMENT — the HIGH sweep
     if (arm != 0) {
         # ⛔ PASS THE LATCHED s_phy — DO NOT let this re-discover (M9d-fix, and it is the whole reason this
         # op latches a phy at the top). By the time control reaches here the BE<->FE disconnect above has
@@ -5478,29 +5541,28 @@ fn mdo_transmit_run(arm) {
     kprintln("  (2=DVI 3=HDMI)", 16);
 
     #ifdef MODESET_AUDIO
-    # ── LEAVE THE LINK AS WE FOUND IT (the M9-burn confound, closed) ────────────────────────────────
-    # ⛔ WITHOUT THIS THE ARMS ARE NOT INDEPENDENT. On the 2026-07-24 burn arm 1 left DIG_MODE at 3, so
-    # arm 2 began from a link that had been sitting in HDMI signalling since the previous invocation:
-    #       arm 1 pre-state  be_cntl 0x10020200   (DIG_MODE 2, DVI — the inherited GOP state)
-    #       arm 2 pre-state  be_cntl 0x10030200   (DIG_MODE 3, HDMI — arm 1's leftovers)
-    # Arm 1 therefore ran DVI->HDMI and arm 2 ran HDMI->HDMI. That did not rescue the both-silent
-    # verdict (neither position sounded from either starting state, and arm 2 had the more favourable
-    # one), but it makes any FUTURE sound-on-one-arm result uninterpretable: "the unmute was after the
-    # edge" and "the link was already in HDMI when this arm started" would be tangled, and no amount of
-    # re-running would separate them.
+    # ⛔⛔⛔ THE EXIT-TIME DIG_MODE RESTORE THAT USED TO SIT HERE IS DELETED. IT MADE THE EXPERIMENT
+    # INCAPABLE OF PRODUCING ITS OWN RESULT.
     #
-    # ⚠ RESTORE HERE, AFTER be1/dm1 ARE CAPTURED, so the verdict still adjudicates on the REAL
-    # post-edge state. Restoring before the read would make the no-hdmi gate report our own cleanup.
-    # ⚠ FIELD-modify the CURRENT value; never write back the whole snapshot
-    # ([[reference_agnos_dcn_hubp_reg_offsets_derived]]).
-    if (arm != 0) {
-        var be_now2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db) & 0xFFFFFFFF;
-        var be_rest = (be_now2 & (0 - 1 - GPU_DIG_MODE_MASK)) | (dm0 << GPU_DIG_MODE_SHIFT);
-        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db, be_rest);
-        gpu_mfence();
-        kprint("modeset: transmit -- DIG_MODE restored to inherited ", 52); kprint_num(dm0);
-        kprintln(" (arms stay independent)", 24);
-    }
+    # It wrote DIG_MODE back to the inherited 2 (DVI) as the last act of every arm, to keep the arms
+    # independent. Independence is a real requirement and it is KEPT — it now happens at arm ENTRY (see
+    # the normalisation block near the pre-state read), which is strictly better because it also survives
+    # a reboot, a crash mid-arm, or the arms being run in either order.
+    #
+    # What it also did: the operator listens AFTER the command returns, and this left the link in DVI.
+    # **Every HDMI_* register is inert in DVI mode** — gpu.cyr's own safety contract, and the reason the
+    # whole staging block is safe to run on a live console link in the first place. So there were no data
+    # islands and no audio sample packets during the entire listening window, in BOTH arms, at ANY unmute
+    # position, regardless of how correct every register was while the op was still executing.
+    #
+    # ⭐ Read the 2026-07-31 log against this: `DIG_MODE 2 -> 3` at the flip, the full #76 edge, the
+    # replay, `resumed 1` at 59951 mHz — and then `DIG_MODE restored to inherited 2`, one line before the
+    # verdict told the operator to EAR-CHECK the sink. It was asking him to listen to a DVI link.
+    #
+    # ⇒ Two independent structural causes for the 2026-07-24 "both arms silent" verdict, not one: the
+    # zero-filled ring, and this. Neither is a fact about the silicon. **A burn cannot measure a thing it
+    # switches off before the measurement.**
+    kprintln("modeset: transmit -- DIG_MODE LEFT AT 3 (HDMI) -- the sink is listenable NOW", 76);
     #endif
 
     # ── VERDICT ─────────────────────────────────────────────────────────────────────────────────────
@@ -5770,6 +5832,22 @@ fn mdo_crccal() {
     # feature" from "your hardware refused" is the same defect class as an exit code that cannot tell a
     # refusal from a pass — which is what this whole cut exists to remove.
     if (gpu_hdmi_audio_on == 0) {
+        # ⛔⛔ THE THIRD WAY THIS FLAG CAN BE 0, AND IT IS THE ONE THIS BUILD MAKES REACHABLE.
+        # Under MODESET_AUDIO the boot-time audio enable is SUPPRESSED BY DESIGN (main.cyr) — the whole M9
+        # experiment is that staging and the unmute sit on opposite sides of a real transmitter edge, so
+        # arming audio at boot would pre-empt the thing being measured. `gpu_hdmi_audio_on` is therefore 0
+        # until an audio ARM has run, and a `--crccal` typed FIRST would fall through to the branch below
+        # and report "the audio path did NOT come up -- that IS a real finding about the machine."
+        # ⇒ **A FALSE HARDWARE CLAIM, produced by the exact sentence added to stop false hardware claims.**
+        # Same defect as burns 1 and 2, one layer further in: a refusal that names a cause it has not
+        # distinguished. Order the phases so the arm runs first, and say so here rather than in a doc.
+        #ifdef MODESET_AUDIO
+        kprintln("modeset: CRCCAL -- this kernel is built with MODESET_AUDIO, so the boot-time audio", 82);
+        kprintln("modeset:   enable is SUPPRESSED BY DESIGN and nothing has staged the path yet.", 78);
+        kprintln("modeset:   Run an audio ARM first (--audio-pre or --audio-post), THEN --crccal in the", 85);
+        kprintln("modeset:   same boot. This says NOTHING about the hardware.", 59);
+        return MDO_E_NOGPU;
+        #endif
         #ifdef HDMI_ATOM
         # ⛔ HDMI_ATOM ALONE IS NOT THE PRECONDITION, and saying it was cost burn 2. The DCN-side enable
         # needs an HDMI HDA controller to bind to, and THAT is gated by a different flag — HDA_HDMI,

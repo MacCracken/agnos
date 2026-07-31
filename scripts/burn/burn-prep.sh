@@ -115,16 +115,20 @@ if [ -n "${BURN_CRCCAL:-}" ]; then
     # NOTHING added the new flag to the arms that depend on it. The 0724 M9 capture shows `display audio
     # path is HDMI on dig 1` -> `hdmi flip preconditions met` because back then the probe was ungated.
     # ⇒ **Any HDMI-audio burn taken since 1.56.25 would have been void**, and the arc paused for the 3D
-    # and modeset work immediately after, so nobody discovered it. Audit the other audio arms before
-    # using them.
+    # and modeset work immediately after, so nobody discovered it.
+    # ✅ THAT AUDIT IS DONE (1.56.34): all 16 arms reviewed, 13 fixed, 2 deliberately left without the flag
+    # (BURN_HDMI_ATOM_HALT, BURN_HDA_TONE — each says why in its own comment). ⭐ It also turned up three
+    # arms with NO audio in them at all: the M-lane transmitter arms gate on gpu_audio_dig too, via
+    # mdo_transmit_run(). Do not assume "audio arm" and "needs the probe" are the same set in either
+    # direction — read the arm.
     #
-    # ⭐ THE REQUIRED-FLAG ASSERTION BELOW EXISTS BECAUSE THREE BURNS WERE SPENT DISCOVERING THIS SET ONE
-    # FLAG AT A TIME (HDMI_ATOM -> +HDA_HDMI -> +GPU_AUDIO_PROBE). Each burn refused for a real reason and
-    # each reason was a MISSING BUILD FLAG, not the machine. A per-arm required list is checked at PREP
-    # time, so the next omission fails here in a second instead of on iron.
-    # ⇒ GENERALISED 1.56.34: this used to be a CRCCAL-only variable with its own inline loop. It is now the
-    # shared BUILD_REQUIRE contract declared at the top of this chain and checked once after it, so every
-    # audio arm states its own required set instead of one arm being the only protected one.
+    # ⭐ THE REQUIRED-FLAG ASSERTION EXISTS BECAUSE THREE BURNS WERE SPENT DISCOVERING THIS SET ONE FLAG AT
+    # A TIME (HDMI_ATOM -> +HDA_HDMI -> +GPU_AUDIO_PROBE). Each burn refused for a real reason and each
+    # reason was a MISSING BUILD FLAG, not the machine. The declared list is checked at PREP time, so the
+    # next omission fails in a second instead of on iron.
+    # ⇒ GENERALISED 1.56.34: this used to be a CRCCAL-only variable with its own inline loop, which meant
+    # exactly one arm in the file was protected. It is now the shared BUILD_REQUIRE contract declared at the
+    # top of this chain and enforced once after it, so every arm states its own required set.
     BUILD_REQUIRE="HDA_HDMI HDMI_ATOM HDA_TONE GPU_AUDIO_PROBE"
     echo "[2/2] Building the 1.56.34 CRCCAL kernel ($BUILD_REQUIRE; run /bin/modeset --crccal; capture klug > crccal.txt)."
     BUILD_ENV="HDA_HDMI=1 HDMI_ATOM=1 HDA_TONE=1 GPU_AUDIO_PROBE=1"
@@ -735,8 +739,23 @@ elif [ -n "${BURN_MODESET_AUDIO:-}" ]; then
     # ⛔ RUN BOTH IN ONE BOOT. A cross-boot comparison cannot control the sink's latched state
     # ([[feedback_ear_oracle_needs_negative_control]]). One sink state, one cable, one volume.
     #
-    # ⛔ HDA_TONE IS DELIBERATELY OFF. A fixed kernel sine is exactly guessable and would void the
-    # ear oracle. The tone comes from the ring-3 feed, not from the kernel.
+    # ⛔⛔⛔ HDA_TONE IS REQUIRED, AND ITS ABSENCE IS WHAT VOIDED THIS BURN ON 2026-07-24.
+    # This arm used to omit HDA_TONE on purpose, reasoning that "a fixed kernel sine is exactly
+    # guessable and would void the ear oracle -- the tone comes from the ring-3 feed." The reasoning
+    # about guessability is CORRECT. The conclusion was not: without HDA_TONE, hda.cyr's #else branch
+    # zero-fills the 64 KB PCM ring ("zero 64 KB = silence"), AND no ring-3 feed was ever launched --
+    # the entire operator transcript of the 07-24 capture is `modeset --audio-pre`, `modeset
+    # --audio-post`, `rm`, `klug`. BOTH ARMS STREAMED EXACT ZEROS, so "silent, silent" was structurally
+    # guaranteed and the arc recorded it as the falsification of the sequencing candidate.
+    #
+    # ⭐ A build-flag omission and a STIMULUS omission are the same defect: the subject of the
+    # experiment was not present. BUILD_REQUIRE catches the first class and is blind to the second,
+    # because nothing anywhere refuses when the tone is missing. An arm whose oracle is the operator's
+    # EAR must declare its stimulus the way it declares its flags -- so HDA_TONE is now in BUILD_REQUIRE.
+    #
+    # ⭐ The blinding is preserved by a better means: the two arms run the kernel tone at DIFFERENT
+    # frequencies (--audio-pre LOW, --audio-post HIGH), so the operator reports which one he heard
+    # rather than yes/no. A listener hearing nothing cannot produce that answer.
     # ⛔ BURN_AUDIO_TEARDOWN STAYS OFF. The shutdown release pop is the arc's only sink-side
     # instrument; tearing down on exit destroys it.
     #
@@ -761,9 +780,9 @@ elif [ -n "${BURN_MODESET_AUDIO:-}" ]; then
     # met` ONLY because gpu_audio_probe() was still ungated then. Setting the flag RESTORES the build M9 was
     # designed against; it does not change the experiment.
     echo "[2/2] Building the M9 SEQUENCING kernel (HDA_HDMI + HDMI_ATOM + ATOM_TX_CYCLE + MODESET_AUDIO + ATOM_TRACE + HDMI_AUDIO_DUMP + GPU_AUDIO_PROBE: staged-muted audio around a REAL #76 PHY edge; two arms differing ONLY in unmute position. ⛔ THE PANEL GOES DARK MID-SEQUENCE and must relight. EAR-CHECK the sink, EYE-CHECK the screen)."
-    BUILD_REQUIRE="HDA_HDMI HDMI_ATOM ATOM_TX_CYCLE MODESET_AUDIO ATOM_TRACE HDMI_AUDIO_DUMP GPU_AUDIO_PROBE"
-    BUILD_ENV="HDA_HDMI=1 HDMI_ATOM=1 ATOM_TX_CYCLE=1 MODESET_AUDIO=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1 GPU_AUDIO_PROBE=1"
-    BUILD_TAG="HDA_HDMI+HDMI_ATOM+ATOM_TX_CYCLE+MODESET_AUDIO+ATOM_TRACE+HDMI_AUDIO_DUMP"
+    BUILD_REQUIRE="HDA_HDMI HDMI_ATOM ATOM_TX_CYCLE MODESET_AUDIO ATOM_TRACE HDMI_AUDIO_DUMP GPU_AUDIO_PROBE HDA_TONE"
+    BUILD_ENV="HDA_HDMI=1 HDMI_ATOM=1 ATOM_TX_CYCLE=1 MODESET_AUDIO=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1 GPU_AUDIO_PROBE=1 HDA_TONE=1"
+    BUILD_TAG="HDA_HDMI+HDMI_ATOM+ATOM_TX_CYCLE+MODESET_AUDIO+ATOM_TRACE+HDMI_AUDIO_DUMP+HDA_TONE"
 elif [ -n "${BURN_MODESET_TX_CYCLE:-}" ]; then
     # ⛔⛔ M8e (re-scoped 1.56.14) — THE REAL TRANSMITTER EDGE. #76 DISABLE then ENABLE, inside M6's
     # iron-proven OTG envelope, aimed by gpu_phy_discover() at the LIVE transmitter (phyid=1, measured).
@@ -957,6 +976,38 @@ case " $BUILD_ENV " in
         ;;
 esac
 
+# ⛔⛔ THE STIMULUS SENTINEL: AN EAR-ORACLE ARM WITHOUT A STIMULUS DOES NOT BUILD.
+#
+# The sentinel above enforces "declare your flags". This one enforces the omission that class does NOT
+# cover, and it cost the arc its single most consequential wrong conclusion. M9 (2026-07-24) declared
+# every flag correctly, passed every gate that existed, produced a clean log — and measured nothing,
+# because MODESET_AUDIO's arms are adjudicated by the OPERATOR'S EAR and the ring they fed the encoder
+# was zero-filled. "Silent, silent" was structurally guaranteed, and it was recorded as the falsification
+# of the sequencing candidate, narrowing the arc to two candidates on the strength of a null experiment.
+#
+# ⭐ A MISSING STIMULUS IS WORSE THAN A MISSING BUILD FLAG. Every flag omission this file has suffered at
+# least produced a refusal line naming a precondition. A silent ring produces a complete, healthy,
+# entirely believable log. Nothing downstream can tell it from a hardware answer.
+#
+# MODESET_AUDIO is exactly the ear-adjudicated family, so it must carry HDA_TONE. (Arms whose oracle is a
+# PHOTOGRAPH or a register read are not covered and must not be — BURN_HDMI_ATOM_HALT's frozen framebuffer
+# would be actively degraded by a running feed.)
+case " $BUILD_ENV " in
+    *" MODESET_AUDIO=1 "*)
+        case " $BUILD_REQUIRE " in
+            *" HDA_TONE "*) ;;
+            *) echo "burn-prep: ABORT -- BUILD_TAG=$BUILD_TAG sets MODESET_AUDIO and does not require HDA_TONE." >&2
+               echo "           MODESET_AUDIO arms are adjudicated by the operator's EAR. Without HDA_TONE," >&2
+               echo "           hda_stream_arm zero-fills the 64 KB PCM ring and BOTH arms stream exact" >&2
+               echo "           silence -- a control and a treatment that are byte-identical non-experiments." >&2
+               echo "           That is what voided M9 on 2026-07-24 and produced the false 'sequencing is a" >&2
+               echo "           dead lead' finding. If two arms must stay blinded, vary the tone FREQUENCY" >&2
+               echo "           between them; do not remove the tone." >&2
+               exit 1 ;;
+        esac
+        ;;
+esac
+
 # AMBIENT-ENV LEAK, closed 2026-07-19. `env $BUILD_ENV` ADDS to the inherited environment — it does not
 # replace it. So an exported HDMI_ATOM=1 (or any other flag) lingering in the operator's shell from an earlier
 # experiment reaches build.sh and gets #define'd REGARDLESS of the profile selected above, silently producing
@@ -1028,7 +1079,17 @@ case "$BUILD_TAG" in *HDA_HDMI*)         verify_marker "ctl1 probing 2nd control
 case " $BUILD_REQUIRE " in
     *" GPU_AUDIO_PROBE "*) verify_marker "gpu: display audio probe armed" ;;
 esac
-case "$BUILD_TAG" in *HDA_TONE*)         verify_marker "sweep streaming" ;; esac
+# ⭐⭐ HDA_TONE — THE STIMULUS, and it gets the same end-to-end treatment as GPU_AUDIO_PROBE, keyed on
+# BUILD_REQUIRE as well as BUILD_TAG. Its absence is what voided M9 on 2026-07-24: both arms of the
+# sequencing A/B streamed a zero-filled ring, so "silent, silent" was structurally guaranteed and got
+# written down as the falsification of the sequencing candidate. Nothing anywhere REFUSES when the tone
+# is missing -- a stimulus omission is silent all the way down, which makes it strictly worse than a
+# missing build flag, every one of which at least produced a refusal line. So an arm whose oracle is the
+# operator's EAR declares its stimulus, and the declaration is proven into the artifact here.
+case " $BUILD_REQUIRE " in
+    *" HDA_TONE "*) verify_marker "sweep streaming" ;;
+    *) case "$BUILD_TAG" in *HDA_TONE*) verify_marker "sweep streaming" ;; esac ;;
+esac
 case "$BUILD_TAG" in *HDMI_AUDIO_DUMP*)  verify_marker "== agnos display-audio dump ==" ;; esac
 case "$BUILD_TAG" in *HDMI_AUDIO_SWEEP*) verify_marker "hdmi-sweep: cycling" ;; esac
 # MARKER-COVERAGE GAP, closed 2026-07-19. The four arms above covered only the HDA_* / HDMI_AUDIO_* flags,
@@ -1136,8 +1197,24 @@ done
 # On the rung-14b prep, /bin/gputex was 313448 B with NO col-major code in it (the real build is
 # 331232 B). It would have run rungs 13 and 14, exited 95, and produced ZERO rung-14b evidence.
 # The previous cycle's lesson recurring verbatim: A STALE ORACLE DOES NOT FAIL, IT AGREES.
+#
+# ⛔⛔⛔ AND THE LIST ITSELF WAS THE NEXT INSTANCE OF THE SAME BUG (2026-07-31). It was hardcoded as
+# eight names — gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy — and **`modeset` was not
+# among them**, while the comment four lines above congratulated itself for DERIVING the summary message
+# rather than hardcoding it. So the gate printed "every --agnos build is newer than its source" over a
+# `/bin/modeset` that was **twelve hours older than the source it was supposedly built from**, on a burn
+# whose entire oracle is `/bin/modeset`. The operator caught it by hand, from an md5 line, after flashing.
+# ⇒ **DERIVE THE LIST FROM stage-tools.sh.** A tool that is staged is a tool that can go stale; the two
+# lists must be the same list, or the gate silently stops covering whatever was added most recently —
+# which is always the thing the current burn is about.
 _srcstale=0
-for _t in gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy; do
+_tools=$(sed -n 's/^[[:space:]]*stage_one[[:space:]]\+agnos\/tests\/gpu[[:space:]]\+[^[:space:]]\+\.cyr[[:space:]]\+\([^[:space:]|]*\).*/\1/p' scripts/burn/stage-tools.sh)
+if [ -z "$_tools" ]; then
+    echo "burn-prep: ABORT -- could not derive the staged-tool list from stage-tools.sh."
+    echo "           The staleness gate would silently cover NOTHING. Fix the parse, do not bypass it."
+    exit 1
+fi
+for _t in $_tools; do
     _cyr="tests/gpu/$_t.cyr"
     _bin="tests/gpu/build/${_t}_agnos"
     [ -f "$_cyr" ] || continue

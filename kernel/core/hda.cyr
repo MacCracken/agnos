@@ -232,6 +232,20 @@ var hda_last_half[2];         # [per-instance] BDL half the DMA was last observe
 var hda_refills   = 0;        # refill count (diagnostic)
 var hda_gen_acc   = 0;        # HDA_TONE sweep NCO phase accumulator (16-bit)
 var hda_gen_inc   = 300;      # HDA_TONE sweep NCO phase increment (~freq), ramps
+# --- The sweep BAND. Literal initialisers only: a module-scope `var x = <expr>` reads 0 forever in the
+# agnos kernel ([[reference_cyrius_module_scope_var_expr_init_zero]]), and a zeroed `hi` would trap the
+# NCO at `lo` for the whole boot -- a constant tone that still sounds fine, so the bug would never
+# announce itself.
+#
+# ⭐ WHY THESE ARE VARIABLES AND NOT THE OLD 300/1400 LITERALS. An arm adjudicated by the operator's EAR
+# needs its arms to be told APART by ear, not merely heard. M9's two arms were both silent, which is
+# indistinguishable from "both arms sounded the same"; a yes/no oracle cannot separate a real negative
+# from a null experiment, and cannot resist an expectant listener either. Giving each arm its own sweep
+# BAND turns the report from "did you hear it?" into "which one did you hear?" -- a question a listener
+# hearing nothing cannot answer by accident. That also answers, without removing the stimulus, the
+# objection that retired the tone in the first place ("a fixed kernel sine is exactly guessable").
+var hda_gen_lo    = 300;      # sweep floor  — the NCO wraps back to this
+var hda_gen_hi    = 1400;     # sweep ceiling — the NCO wraps when it passes this
 # --- Gate 2: ring-3 snd_* syscall band (#64-69) state ---
 # The 64 KB ring is a single-producer (ring-3 snd_write) / single-consumer (DMA)
 # linear-counter buffer. Two heads, DISJOINT single-writers, so no lock:
@@ -1371,7 +1385,7 @@ fn hda_refill_half(ci, h) {
         # across refill boundaries too.
         if ((fi & 0x3F) == 0) {
             hda_gen_inc = hda_gen_inc + 1;
-            if (hda_gen_inc > 1400) { hda_gen_inc = 300; }
+            if (hda_gen_inc > hda_gen_hi) { hda_gen_inc = hda_gen_lo; }
         }
         fi = fi + 1;
     }
@@ -1600,7 +1614,7 @@ fn hda_stream_arm() {
     # PCM comes from producers (vani / cyrius-doom) via snd_write#66 once Gate 2 lands,
     # driving the SAME refill path.
     hda_gen_acc = 0;
-    hda_gen_inc = 300;
+    hda_gen_inc = hda_gen_lo;
     hda_refill_half(hda_active_ctl, 0);
     hda_refill_half(hda_active_ctl, 1);
     store64(&hda_last_half + hda_active_ctl * 8, 0);
@@ -1760,6 +1774,34 @@ fn hda_hdmi_feed_running() {
     return 0;
 }
 
+# hda_tone_band — retune the HDA_TONE sweep, and REFILL BOTH HALVES so the change is audible NOW.
+#
+# ⛔ THE REFILL IS THE POINT, and calling this without it is the bug it exists to prevent: the 64 KB ring
+# already holds ~0.34 s of the OLD band, and the 100 Hz servicer only rewrites a half once the DMA has
+# left it. Retuning the NCO alone would leave the operator listening to the previous arm's tone for the
+# first third of a second of the new one -- and on a 10 s listening window that is exactly the kind of
+# "I think I heard something" the ear oracle must never be asked to adjudicate.
+#
+# ⚠ Returns 0 without touching anything if instance 1 is not present, so a caller on a box without the
+# HDMI controller gets a refusal rather than a silent no-op on the ANALOG ring.
+fn hda_tone_band(lo, hi) {
+    var ci = 1;
+    if (load64(&hda_present + ci * 8) == 0) { return 0; }
+    if (lo < 1)    { lo = 1; }                 # an NCO increment of 0 is DC: no tone, and no way to tell
+    if (hi <= lo)  { hi = lo + 1; }            # an inverted band would wrap every frame into a buzz
+    hda_gen_lo  = lo;
+    hda_gen_hi  = hi;
+    hda_gen_inc = lo;
+    hda_gen_acc = 0;
+    var ci_save = hda_active_ctl;
+    hda_active_ctl = ci;
+    hda_refill_half(ci, 0);
+    hda_refill_half(ci, 1);
+    hda_active_ctl = ci_save;
+    kprint("hda: tone band ", 15); kprint_num(lo);
+    kprint(" -> ", 4); kprint_num(hi); kprintln(" (both halves refilled)", 23);
+    return 1;
+}
 fn hda_hdmi_feed_stop() {
     var ci = 1;                                        # instance 1 = the HDMI/DP controller
     if (load64(&hda_present + ci * 8) == 0) { return 0; }

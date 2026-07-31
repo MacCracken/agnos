@@ -145,6 +145,70 @@ third time.
 Verified both directions on the host: three-flag build 1,969,096 B carries the probe, the
 instance-1-exists refusal and the audio path; the bare build carries `ctl1 NOT PROBED`.
 
+### ⛔⛔⛔ IRON BURN 3 (2026-07-31) — A THIRD MISSING FLAG, AND IT HAD SILENTLY BROKEN **EVERY** AUDIO ARM
+
+⭐ **The flags finally got far enough to produce a real finding, and every diagnostic taught in burns 1
+and 2 fired correctly**: `hda: ctl1 probing 2nd controller` → `hda: found 1002:1637` → codec
+`0x1002aa01`, 4 HDMI pins, `ctl1 bound`; ATOM clean (`encoder rc=0`, `HDMI bringup OK`). Then
+`gpu: hdmi audio not enabled (preflight refused)`, and `--crccal` correctly answered *"HDMI_ATOM set AND
+instance 1 exists, but the audio path did NOT come up — that IS a real finding about the machine."*
+**The refusal chain narrowed correctly across three burns. It was still a build flag.**
+
+⛔ `gpu_hdmi_preflight()` had **seven** refusal points; the three register gates each named themselves and
+**the four early returns were SILENT.** `gpu_audio_probe()` prints ~6 lines per run and **not one is in
+the log**, so it never ran — it is `#ifdef GPU_AUDIO_PROBE`, and it is the **only** thing that sets
+`gpu_audio_dig`. Unset ⇒ `gpu_audio_dig` stays −1 ⇒ silent refusal forever, whatever the hardware does.
+
+### ⚠⚠ AND THE BLAST RADIUS WAS THE WHOLE FILE — `burn-prep.sh` AUDITED, ALL 16 ARMS
+
+The probe ran on **every boot** until it was gated at **1.56.25**, and **nothing added the new flag to the
+arms that depend on it**. The 0724 M9 capture reads `display audio path is HDMI on dig 1` →
+`hdmi flip preconditions met` **only because the probe was ungated then.** ⇒ **Every HDMI-audio burn
+taken since 1.56.25 would have been void**, and the arc pivoted to 3D/modeset immediately after, so
+nobody found out. **13 arms fixed, 2 correctly left alone, and the reason is written into each arm:**
+
+- **Boot-audio arms** (`BURN_HDMI`, `_DUMP`, `_SWEEP`, `_ACR_CTS`, `_SYMCLK_AB`, `_DCCG`, `_ATOM`,
+  `_ATOM_DRY`, `_ATOM_FULL`) — all reach their subject only through `gpu_hdmi_audio_enable()`, which
+  refuses at preflight. ⚠ `BURN_HDMI_SWEEP` and `BURN_HDMI_SYMCLK_AB` are wrapped in
+  `if (gpu_hdmi_audio_on == 1)` and would have printed *"skipping"* — a whole candidate matrix unrun on
+  one burn. ⚠ On `BURN_HDMI` the omission is **hardest to see**: the HDA half still prints a complete
+  healthy probe/codec/route/bound sequence and only the **display** half is missing.
+- ⭐⭐ **THE THREE M-LANE TRANSMITTER ARMS TOO** (`BURN_MODESET_TRANSMITTER`, `_TRANSMITTER_LIVE`,
+  `_TX_CYCLE`) — **and they carry no audio at all.** `mdo_transmit_run()`'s fifth gate is
+  `if (gpu_audio_dig < 0) { return MDO_E_NOGPU; }` and it sits **above** the `#ifdef HDMI_ATOM`, so it
+  fires in every build: `gpu_audio_dig` is the **front-end stream-encoder index** the op needs for `d`,
+  nothing to do with sound. Unset ⇒ `--transmitter` refuses before the envelope opens, **the panel never
+  blinks, and a burn whose oracle is "the panel went dark and came back" reads as a clean pass.**
+  ⚠ These burned green pre-1.56.25 with the probe ungated; setting the flag **restores** that build.
+- ⛔ **`BURN_HDMI_ATOM_HALT` deliberately does NOT get the flag, and that is the proof this was an audit
+  and not a `sed`.** Its halt spins inside `#ifdef ATOM_HALT`, which is *before* the audio-enable call
+  site, so the path is unreachable by construction; `atom_hdmi_transmitter_bringup()` aims itself with
+  `gpu_phy_discover()` (back end), **not** `gpu_audio_dig` (front end) — conflating those is what once
+  pointed `#76` at a dead PHY. And its oracle is a **photograph** of a frozen framebuffer, which ~6 lines
+  of probe hex would actively degrade. `BURN_HDA_TONE` is analog-only and unaffected.
+
+**The mechanism, so the next omission cannot reach iron — all three mutation-tested:**
+
+1. ⭐ **`BUILD_REQUIRE` generalised from the one-arm `CRCCAL_REQUIRE`.** Every arm declares the flags its
+   experiment cannot run without; one loop checks the list against that arm's own `BUILD_ENV` before
+   anything builds. Mutation: dropping `GPU_AUDIO_PROBE=1` from `BURN_HDMI_DUMP` aborts in a second.
+2. ⭐⭐ **A sentinel that makes DECLARING mandatory** — because a check only protects arms that remembered
+   to declare, which is the same "someone remembers" mechanism that caused this. Any arm whose
+   `BUILD_ENV` names `HDA_HDMI` or `HDMI_ATOM` and declares nothing **refuses to build**. A new arm
+   cannot inherit this bug by omission.
+3. ⭐ **An artifact marker, keyed on `BUILD_REQUIRE` rather than `BUILD_TAG`** — closing declare → build →
+   binary end to end. ⚠ Keying on the tag would have missed `CRCCAL` and all three M-lane arms, whose
+   tags do not name the flag. ⚠ The marker is a **new `kprintln` inside the `#ifdef` in `main.cyr`**, never
+   a string from `gpu_audio_probe()`: that function's body is **not** gated, so its own text is in a bare
+   kernel and would verify nothing — the exact trap `verify_marker`'s own header warns about.
+4. **Ambient-env leak list widened 10 → 15 flags.** It named ten while the audio arms use fifteen, and two
+   of the five were not cosmetic: a leaked `ATOM_TX_CYCLE` adds a **live `#76` PHY edge** to an arm whose
+   tag promises none, and a leaked `GPU_AUDIO_PROBE` would let a build pass gate 1 for the wrong reason.
+
+✅ **Verified: all 16 arms build clean** through `burn-prep` (14 carry the marker, 2 correctly do not),
+the **bare kernel is unchanged** at 1,927,144 B and does **not** carry the marker, and the arc sweep is
+**15/15 green**. ⚠ **Nothing flashed — the operator owns all iron burns.**
+
 ### Ruled out before spending a burn — the last "unexplained causal diff" is already spent
 
 ⛔ **`DIG_STEREOSYNC_GATE_EN` (DIG_FE_CNTL bit8) is NOT an open lead.** The known-good corpus calls it
@@ -153,10 +217,108 @@ instance-1-exists refusal and the audio path; the bare build carries `ctl1 NOT P
 `:12556`) and gets no audio; `gpu.md:291` records the same. Marked spent so the next session does not
 re-derive it as fresh.
 
-**Dead leads, not to be re-opened:** sequencing (eliminated by M9) · the DCCG symbol clock (falsified)
-· L1 (ran and returned **VOID** — the positive control did not sound, so it carries zero information
-and must never be written up as "sequencing exonerated") · `DIG_STEREOSYNC_GATE_EN` (above).
-**Surviving: (b) a write that does not latch · (c) the bare-metal environment.**
+**Dead leads, not to be re-opened:** the DCCG symbol clock (falsified) · L1 (ran and returned **VOID**
+— the positive control did not sound, so it carries zero information and must never be written up as
+"sequencing exonerated") · `DIG_STEREOSYNC_GATE_EN` (above).
+**Surviving: (a) sequencing · (b) a write that does not latch · (c) the bare-metal environment.**
+
+### ⛔⛔⛔ RETRACTED — "sequencing (eliminated by M9)". M9 STREAMED DIGITAL SILENCE IN BOTH ARMS.
+
+⭐ **M9 was a null experiment, and it is the FOURTH consecutive one** — the three burns above lost to
+build flags, and this one, three cuts earlier, lost to a missing **stimulus**. Its "both arms silent"
+result was recorded as the falsification of candidate (a) and narrowed the surviving set to (b) and (c).
+**It falsifies nothing. Sequencing has never been tested.**
+
+Three facts, each checkable in one command, and no burn needed to establish any of them:
+
+- `scripts/burn/burn-prep.sh` `BURN_MODESET_AUDIO` sets seven flags and **not `HDA_TONE`** — deliberately,
+  per its own comment: *"A fixed kernel sine is exactly guessable and would void the ear oracle. The tone
+  comes from the ring-3 feed, not from the kernel."*
+- Without `HDA_TONE`, `hda.cyr`'s `#else` branch zero-fills the 64 KB PCM ring. The line reads
+  `# zero 64 KB = silence`.
+- **The ring-3 feed was never launched.** The whole operator transcript in
+  `agnosticos/docs/development/prior-art/dcn-modeset-m9-audio-arm-iron-0724.txt` is four commands:
+  `modeset --audio-pre` (:197) · `modeset --audio-post` (:349) · `rm /.modeset-armed` (:498) ·
+  `klug > m9.txt` (:500). `command grep -c "sweep streaming"` on that capture returns **0**.
+
+⇒ Both arms fed the encoder **exact zeros**. An ear oracle across two silent arms cannot distinguish an
+unmute-before-edge from an unmute-after-edge; it can only return "silent, silent", which is what it did.
+
+⭐⭐ **The general form, and it is the one worth keeping: a build-flag omission and a stimulus omission
+are the SAME defect wearing different clothes — the subject of the experiment was not present.** The
+1.56.34 `BUILD_REQUIRE` mechanism catches the first class and is blind to the second, because `HDA_TONE`
+is not a flag any refusal path checks: the tone's absence is silent all the way down. **An arm whose
+oracle is the operator's ear must declare its STIMULUS the way it declares its flags.**
+
+⚠ And the reason `HDA_TONE` was switched off was **correct** — a fixed, guessable sine does void a
+blinded ear oracle. The mistake was dropping the stimulus instead of *replacing* it. The fix keeps both:
+the two arms run the kernel tone at **different frequencies**, so the operator reports "I heard the LOW
+one" or "the HIGH one" rather than yes/no. A listener hearing nothing cannot produce that answer.
+
+### ⛔⛔ RETRACTED — "`AFMT_STATUS` bit24 is SET on agnos, CLEAR on amdgpu"
+
+**It is CLEAR on agnos, in every capture ever taken, and it is byte-identical to amdgpu while the panel
+is audibly playing.** All eleven agnos iron dumps read `AFMT_STATUS = 40000010`
+(`hdmi-audio-avmute-release-pop` · `-burn3` · `-burn4` · `-encoder-only-silent` · `-magnitude-exonerated`
+· `-ramp-falsified` · `-symclk-ab-acr-nscale` · `-symclk-sink-armed` · `hdmi-acr-cts-burn-tap1-zeroed`
+· `atom-iron-dry-trace-0718` · `dmcub-dormant-probe-iron-0718`). amdgpu-while-playing reads the same
+`0x40000010` (`dcn-audio-known-good-full-0716.txt:355`). **The `0x41000010` rows are amdgpu MUTED**
+(`dcn-audio-crc-model-discriminator-2026-07-15.txt:15,:22,:29`).
+
+⇒ **"agnos's audio FIFO is overflowing / the read side never drains" is false and always was.** The claim
+is still live in source at `gpu.cyr` where it justifies the `HDMI_DB_CONTROL` write; that write is
+independently byte-correct against amdgpu and stays, but its stated reason is struck.
+
+⚠ Related, same class: the tap bisection that excluded the entire HDA/codec half reasons from
+*"agnos: tap0 content, tap1 = `0x000000`"*. That signature appears in **exactly one** capture —
+`hdmi-acr-cts-burn-tap1-zeroed-iron-0720.txt:189`, the burn that forced amdgpu's CTS literal and made the
+output measurably worse. The other nine read non-zero at **both** taps. The bisection premise is stale.
+
+### Fixed — the M9 arm can no longer be void: a stimulus, a blinding, and a gate that enforces both
+
+- ⭐ **`BURN_MODESET_AUDIO` now sets and requires `HDA_TONE`.** Eight flags, declared and enforced.
+- ⭐⭐ **A STIMULUS SENTINEL, alongside the flag sentinel.** Any arm whose `BUILD_ENV` names
+  `MODESET_AUDIO` and whose `BUILD_REQUIRE` omits `HDA_TONE` **refuses to build**, naming M9 as the
+  precedent. Mutation-tested both ways: the 2026-07-24 flag set aborts, the fixed set passes, and an
+  arm whose oracle is a **photograph** (`BURN_HDMI_ATOM_HALT`) is correctly untouched — a running feed
+  would degrade a frozen-framebuffer read, so that family must stay exempt.
+  ⚠ The `verify_marker "sweep streaming"` check is re-keyed on **`BUILD_REQUIRE`**, not `BUILD_TAG`,
+  for the reason `GPU_AUDIO_PROBE` already is: a tag is a label an author writes, and the whole failure
+  class is authors forgetting. Declaration → gate → artifact, closed end to end.
+- ⭐ **The blinding is preserved by frequency, not by absence.** `hda_tone_band(lo, hi)` retunes the
+  sweep **and refills both ring halves**, so the change is audible immediately rather than after ~0.34 s
+  of the previous arm's tone. ARM 1 sweeps **300→600**, ARM 2 sweeps **1000→1400** — non-overlapping, so
+  no part of either can be mistaken for the other. **The operator is asked "low or high?", never "did you
+  hear it?"** A yes/no ear oracle cannot tell a real negative from a null experiment and cannot resist an
+  expectant listener; a band nobody named in advance does both.
+
+### Fixed — two defects in `gpu_hdmi_audio_unmute()`, the exact function the next burn's result rests on
+
+- ⛔⛔ **It wrote `AUDIO_ENABLED` and the slot map into a CLOCK-GATED endpoint.** The
+  `CLOCK_GATING_DISABLE` bracket is opened and **closed** inside `gpu_hdmi_audio_enable()`; the unmute is
+  a separate function called later and never re-opened it. The file's own rule where the bracket is
+  opened: *"a register write into a gated clock is dropped SILENTLY."* ⭐ **The arc's two surviving
+  candidates included "a write that does not latch" while the unmute path wrote into a gated endpoint.**
+  Now matches amdgpu's decoded shape exactly — `0x80000001` (enable | gate open), slot map, then
+  `0x80000000` — with the ordinal re-selected before the closing store, because the index window has no
+  memory and step 2 left it pointing elsewhere.
+- ⛔⛔ **It had NO probe downstream of the tap, so every CRC line in the M9 capture was pre-determined.**
+  The only probe on that route runs inside `gpu_hdmi_audio_enable()`, where `MODESET_AUDIO` has
+  deliberately **staged the tap shut** — `SAMPLE_SEND` is not set until the unmute, later, from a
+  different caller. All six *"crc did not complete"* lines were the guaranteed answer to a question asked
+  with the valve closed, and were read as a regression against the 0716-0720 burns, which probed a
+  different state entirely. A `gpu_hdmi_audio_crc_probe(d)` now runs after the unmute.
+  ⚠ Its comment states the limit: until `--crccal` establishes that this counter **can** fail to complete
+  when nothing flows, a positive is evidence and a negative is nothing at all.
+
+⚠ **Already present, and NOT re-added:** the post-#76 packet replay and the BE↔FE pulse
+(`syscall.cyr`, `#ifdef ATOM_TX_ANY`) — the capture's `0x566f` disconnect/reconnect followed by the full
+`AFMT_GENERIC_HDR` / `GENERIC_0..7` re-emission. An audit recommended both as new work; they landed at
+M8c. Re-deriving a shipped fix as a fresh one is the failure mode this file's own rules warn about.
+
+✅ Verified: `HDA_HDMI=1 HDMI_ATOM=1 ATOM_TX_CYCLE=1 MODESET_AUDIO=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1
+GPU_AUDIO_PROBE=1 HDA_TONE=1` builds clean, arc sweep green, `burn-prep` passes every gate and marker,
+`burn-verify` OK — **1,984,072 B, tag `…+HDA_TONE`**. ⚠ **Nothing flashed; the operator owns all burns.**
 
 ### Note — this cut opened alongside a second session in the same working tree
 
