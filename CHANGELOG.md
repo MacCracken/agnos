@@ -106,6 +106,45 @@ row must name the causes it distinguishes between.**
   feature" from "your hardware refused" is the same defect class as an exit code that cannot tell a
   refusal from a pass.**
 
+### ⛔⛔ IRON BURN 2 (2026-07-31) — RIGHT DIAGNOSIS, WRONG FLAG. THE MESSAGE WORKED; I DID NOT.
+
+⭐ **The new refusal fired correctly on its first outing** — *"HDMI_ATOM is in this build, but the audio
+path did NOT come up on this hardware. That is a real finding about the machine"* — and **the sentence
+was wrong, because the precondition it named was not the only one.**
+
+⛔ **The HDMI HDA controller is enumerated under a DIFFERENT flag, `HDA_HDMI`**, which gates the
+instance-1 probe in `main.cyr`. Without it there is no HDMI controller, no codec, and nothing for the
+DCN side to bind to. `BURN_CRCCAL` set `HDMI_ATOM=1` alone. **A second burn lost to a build flag, in
+the cut that already documents this class of error twice.** ⚠ And **eleven existing audio arms in
+`burn-prep.sh` all set `HDA_HDMI=1`** — mine was the twelfth and the only one without it.
+
+⭐⭐ **The archive answered it in one grep.** Counting `hda: found` across every iron capture: **2** in
+`atom-iron-dry-trace` (07-18), `dmcub-dormant-probe` (07-18) and `dcn-modeset-m9-audio-arm` (07-24) —
+exactly the `HDA_HDMI` builds — and **1** in every capture from 07-24 onward. ⇒ **Nothing regressed.**
+The GPU-arc burns were built without the flag, and **nobody could see it, because a compiled-out probe
+leaves no trace in the log.**
+
+**Fixed — and the durable part is making absence visible:**
+
+1. ⭐ **`hda: ctl1 NOT PROBED -- this kernel was built without HDA_HDMI`.** Until now the block simply
+   vanished and the boot said **nothing**, so one `hda: found` was indistinguishable from a box whose
+   second controller failed to probe. **An absent subsystem must say it is absent and why — silence is
+   the one answer a reader cannot tell from "attempted and failed."**
+2. ⭐ **`--crccal` checks the CONTROLLER before blaming the machine.** No instance 1 ⇒ *"almost certainly
+   HDA_HDMI is unset. NOT a hardware fact."* Only with instance 1 present does it report a hardware
+   finding.
+3. **`BURN_CRCCAL` → `HDA_HDMI=1 HDMI_ATOM=1 HDA_TONE=1`.**
+
+⭐ **`HDA_TONE` is required and is not decoration:** it fills the PCM ring with a ~375 Hz triangle
+**instead of silence**, so the FLOW phase actually flows. Without it `CRC=0` in F is indistinguishable
+from the null — **the op would fail at exactly the ambiguity it exists to resolve.** ⛔ The *"do NOT pair
+with HDA_TONE"* warning attaches to `MODESET_AUDIO` (a guessable sine voids a **blinded ear oracle**);
+this calibration has no ear oracle. Transplanting it here by pattern-match would be the same error a
+third time.
+
+Verified both directions on the host: three-flag build 1,969,096 B carries the probe, the
+instance-1-exists refusal and the audio path; the bare build carries `ctl1 NOT PROBED`.
+
 ### Ruled out before spending a burn — the last "unexplained causal diff" is already spent
 
 ⛔ **`DIG_STEREOSYNC_GATE_EN` (DIG_FE_CNTL bit8) is NOT an open lead.** The known-good corpus calls it

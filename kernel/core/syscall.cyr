@@ -5771,9 +5771,20 @@ fn mdo_crccal() {
     # refusal from a pass — which is what this whole cut exists to remove.
     if (gpu_hdmi_audio_on == 0) {
         #ifdef HDMI_ATOM
-        kprintln("modeset: CRCCAL -- HDMI_ATOM is in this build, but the audio path did NOT come up", 81);
-        kprintln("modeset:   on this hardware. That is a real finding about the machine -- read the", 81);
-        kprintln("modeset:   gpu: lines above for where the bring-up stopped.", 59);
+        # ⛔ HDMI_ATOM ALONE IS NOT THE PRECONDITION, and saying it was cost burn 2. The DCN-side enable
+        # needs an HDMI HDA controller to bind to, and THAT is gated by a different flag — HDA_HDMI,
+        # which controls the instance-1 probe in main.cyr. So report the CONTROLLER state before blaming
+        # the machine: an absent instance 1 is a BUILD fact; present-but-unbound is a hardware fact.
+        var ci1 = hda_hdmi_feed_running();
+        if (ci1 < 0) {
+            kprintln("modeset: CRCCAL -- HDMI_ATOM is set, but there is NO instance-1 HDA controller,", 79);
+            kprintln("modeset:   so the DCN side had nothing to bind to. Almost certainly HDA_HDMI is", 79);
+            kprintln("modeset:   unset -- check the 'hda: ctl1' lines at boot. NOT a hardware fact.", 77);
+            return MDO_E_NOGPU;
+        }
+        kprintln("modeset: CRCCAL -- HDMI_ATOM set AND instance 1 exists, but the audio path did NOT", 82);
+        kprintln("modeset:   come up. That IS a real finding about the machine -- read the gpu: lines", 83);
+        kprintln("modeset:   above for where the bring-up stopped.", 48);
         #else
         kprintln("modeset: CRCCAL -- this kernel was built WITHOUT HDMI_ATOM, so the HDMI audio", 77);
         kprintln("modeset:   path is COMPILED OUT and could never have come up. This says NOTHING", 79);

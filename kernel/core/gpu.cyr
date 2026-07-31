@@ -11639,12 +11639,34 @@ fn gpu_smu_msg(msg, param) {
     return GPU_SMU_BUSY;
 }
 
+# ⛔⛔⛔ EVERY EARLY RETURN HERE USED TO BE SILENT, AND IT COST THREE BURNS. The caller printed only
+# "hdmi audio not enabled (preflight refused)" — a refusal with no reason — while the three gates BELOW
+# each named themselves. So a refusal from the top four was indistinguishable from a refusal from the
+# bottom three, and worse, indistinguishable from a missing BUILD FLAG: `gpu_audio_dig` is set ONLY by
+# `gpu_audio_probe()`, which is gated on `GPU_AUDIO_PROBE` — so an unarmed kernel refuses here forever,
+# silently, and the log says nothing about why.
+# ⇒ Same rule this whole cut keeps re-learning: **a refusal must name its reason, and a reason that is a
+# BUILD fact must not read as a hardware fact.** Silence is the one answer a reader cannot act on.
 fn gpu_hdmi_preflight() {
     gpu_hdmi_flip_ok = 0;
-    if (gpu_present == 0) { return 0; }
-    if (gpu_display_ok != 1) { return 0; }
-    if (gpu_audio_dp != 0) { return 0; }        # DP link: the HDMI block is not the path
-    if (gpu_audio_dig < 0) { return 0; }        # P3a never found a live encoder
+    if (gpu_present == 0) {
+        kprintln("gpu: hdmi preflight: no GPU", 27);
+        return 0;
+    }
+    if (gpu_display_ok != 1) {
+        kprintln("gpu: hdmi preflight: no lit display", 35);
+        return 0;
+    }
+    if (gpu_audio_dp != 0) {                    # DP link: the HDMI block is not the path
+        kprintln("gpu: hdmi preflight: this link is DP, so the HDMI block is not the audio path", 77);
+        return 0;
+    }
+    if (gpu_audio_dig < 0) {                    # P3a never found a live encoder
+        kprintln("gpu: hdmi preflight: no live stream encoder is known (gpu_audio_dig unset).", 75);
+        kprintln("gpu:   That is set ONLY by gpu_audio_probe(), which needs GPU_AUDIO_PROBE=1 --", 78);
+        kprintln("gpu:   so this is almost certainly a BUILD FLAG, not a fact about the hardware.", 79);
+        return 0;
+    }
     # Derive the DIG offset from the probed instance rather than hard-coding the iron's DIG1: the global IS
     # the single source of truth, and a literal would encode the same fact twice.
     var d = gpu_audio_dig * GPU_DCN_DIG_STRIDE;

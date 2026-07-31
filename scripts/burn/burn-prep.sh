@@ -55,6 +55,24 @@ fi
 # selftest code stays in-tree (still #ifdef-gated in build.sh); it's just not
 # ENABLED for the burn artifact now that the exec/EXT2 arc is iron-validated.
 # Opt back in for a validation burn with BURN_SELFTESTS=1 (EXEC + EXT2 write).
+#
+# --- THE PER-ARM REQUIRED-FLAG DECLARATION ------------------------------------------------------------
+# ⛔⛔ READ THIS BEFORE ADDING AN ARM THAT TOUCHES DISPLAY AUDIO OR THE MODESET TRANSMIT OP.
+#
+# Every arm below may set BUILD_REQUIRE to the list of flags its experiment CANNOT RUN WITHOUT. The list
+# is checked against that arm's own BUILD_ENV before anything builds, and a missing flag aborts the prep
+# in a second instead of costing a flash, a boot and an adjudication.
+#
+# WHY IT IS A PER-ARM DECLARATION AND NOT A GLOBAL RULE: the required set genuinely differs per arm, and
+# a blanket "every HDA_HDMI arm needs GPU_AUDIO_PROBE" would be wrong for BURN_HDMI_ATOM_HALT, which
+# freezes the framebuffer BEFORE the audio enable is ever called. A rule that is wrong for one arm gets
+# worked around, and then it protects none of them.
+#
+# ⇒ THE STANDING RULE, paid for three burns in a row on 2026-07-31 (HDMI_ATOM -> +HDA_HDMI ->
+#   +GPU_AUDIO_PROBE, one flash each): an arm that touches the audio path DECLARES its required set. The
+#   sentinel after the chain refuses to build an HDA_HDMI / HDMI_ATOM arm that declares nothing at all,
+#   so "someone remembers" is no longer part of the mechanism.
+BUILD_REQUIRE=""
 # --- 1.56.x SHADER arc arms ---------------------------------------------------
 # ⚠ These were MISSING until 1.56.4. Every 1.56.x shader burn (S1/D0, S2, grid, guard, coverage, glyph,
 # gradient) was reproduced by hand-exporting a define straight to build.sh, which bypasses this script's
@@ -75,8 +93,41 @@ if [ -n "${BURN_CRCCAL:-}" ]; then
     # NOT ATOM_RUN_TRANSMITTER/ATOM_TX_CYCLE (the calibration touches no PHY and must not).
     # Oracle: `run /bin/modeset --crccal` -> exit 95 and a VERDICT block in klug. Exit 96 now says WHICH
     # of "built without HDMI_ATOM" and "hardware refused" it hit; before this arm it could not.
-    echo "[2/2] Building the 1.56.34 CRCCAL kernel (HDMI_ATOM=1; run /bin/modeset --crccal; capture klug > crccal.txt)."
-    BUILD_ENV="HDMI_ATOM=1"
+    # ⛔⛔ AND THE FIRST VERSION OF THIS ARM WAS *STILL* WRONG — it set HDMI_ATOM alone, and burn 2 came
+    # back "HDMI_ATOM is in this build, but the audio path did NOT come up on this hardware". The HDMI
+    # controller is enumerated under a DIFFERENT flag: `HDA_HDMI` gates the instance-1 probe in main.cyr,
+    # and without it there is no HDMI HDA controller, no codec, and nothing for the DCN side to bind to.
+    # ⚠ ELEVEN existing audio arms in this file all set HDA_HDMI=1. Mine was the twelfth and the only one
+    # without it — a pattern that was there to be read.
+    # ⭐ HDA_TONE IS REQUIRED HERE AND IT IS NOT DECORATION: it fills the PCM ring with a ~375 Hz triangle
+    # instead of SILENCE. Without it the calibration's FLOW phase carries zero samples, so `CRC=0` in F
+    # would be indistinguishable from the null — the op would fail at precisely the ambiguity it exists to
+    # resolve, and would report "not flow-gated" from an artifact of its own build.
+    # ⛔ The "do NOT pair with HDA_TONE" warning on MODESET_AUDIO does NOT apply here. It exists because a
+    # fixed kernel sine is exactly guessable and would void a BLINDED EAR oracle. This calibration has no
+    # ear oracle at all — it is entirely source-side. Do not transplant that warning by pattern-match.
+    # ⛔⛔⛔ AND A *FOURTH* FLAG, FOUND BY BURN 3: `GPU_AUDIO_PROBE`. It gates `gpu_audio_probe()`, which is
+    # the only thing that sets `gpu_audio_dig` / `gpu_audio_dp`. Without it `gpu_audio_dig` stays -1 and
+    # `gpu_hdmi_preflight()` refuses at a SILENT early return — the boot prints only "preflight refused"
+    # with no reason, and the audio path never comes up however correct everything downstream is.
+    # ⚠⚠ THIS IS NOT JUST MY ARM — IT SILENTLY BROKE EVERY AUDIO ARM IN THIS FILE. The probe ran on every
+    # boot until it was gated at 1.56.25 (it was printing per-endpoint hex on production boots), and
+    # NOTHING added the new flag to the arms that depend on it. The 0724 M9 capture shows `display audio
+    # path is HDMI on dig 1` -> `hdmi flip preconditions met` because back then the probe was ungated.
+    # ⇒ **Any HDMI-audio burn taken since 1.56.25 would have been void**, and the arc paused for the 3D
+    # and modeset work immediately after, so nobody discovered it. Audit the other audio arms before
+    # using them.
+    #
+    # ⭐ THE REQUIRED-FLAG ASSERTION BELOW EXISTS BECAUSE THREE BURNS WERE SPENT DISCOVERING THIS SET ONE
+    # FLAG AT A TIME (HDMI_ATOM -> +HDA_HDMI -> +GPU_AUDIO_PROBE). Each burn refused for a real reason and
+    # each reason was a MISSING BUILD FLAG, not the machine. A per-arm required list is checked at PREP
+    # time, so the next omission fails here in a second instead of on iron.
+    # ⇒ GENERALISED 1.56.34: this used to be a CRCCAL-only variable with its own inline loop. It is now the
+    # shared BUILD_REQUIRE contract declared at the top of this chain and checked once after it, so every
+    # audio arm states its own required set instead of one arm being the only protected one.
+    BUILD_REQUIRE="HDA_HDMI HDMI_ATOM HDA_TONE GPU_AUDIO_PROBE"
+    echo "[2/2] Building the 1.56.34 CRCCAL kernel ($BUILD_REQUIRE; run /bin/modeset --crccal; capture klug > crccal.txt)."
+    BUILD_ENV="HDA_HDMI=1 HDMI_ATOM=1 HDA_TONE=1 GPU_AUDIO_PROBE=1"
     BUILD_TAG="CRCCAL"
 elif [ -n "${BURN_SHADER_OPS:-}" ]; then
     # 1.56.4 — FOUR proofs in ONE boot. Burns block the operator's machine, so this arm deliberately
@@ -548,8 +599,14 @@ elif [ -n "${BURN_HDMI_ACR_CTS:-}" ]; then
     # the exact mechanism between "amp armed + receiving our stream" and "decodes as CLEAN silence". agnos was
     # deliberately NOT writing them ("inert under SOURCE=0"); but amdgpu writes them WITH SOURCE=0, and this
     # register was never tested on this silicon. Display-safe (audio only, no PHY/PLL/OTG). Single variable.
-    echo "[2/2] Building the ACR-CTS kernel (HDA_HDMI + HDA_TONE + HDMI_ACR_CTS + HDMI_AUDIO_DUMP: program the ACR CTS registers to amdgpu's 241500; LISTEN for the tone)."
-    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ACR_CTS=1 HDMI_AUDIO_DUMP=1"
+    # ⭐ GPU_AUDIO_PROBE IS REQUIRED (1.56.34 audit). The three CTS stores live inside
+    # gpu_hdmi_program_infoframes(), and this build carries NO HDMI_ATOM — so the boot-time
+    # gpu_hdmi_audio_enable() is the only thing that reaches them. That call refuses at gpu_hdmi_preflight()
+    # for as long as gpu_audio_dig is -1, and gpu_audio_probe() is the only thing that ever sets it. Without
+    # the flag the register under test is NEVER WRITTEN and the burn listens to a kernel that did nothing.
+    echo "[2/2] Building the ACR-CTS kernel (HDA_HDMI + HDA_TONE + HDMI_ACR_CTS + HDMI_AUDIO_DUMP + GPU_AUDIO_PROBE: program the ACR CTS registers to amdgpu's 241500; LISTEN for the tone)."
+    BUILD_REQUIRE="HDA_HDMI HDA_TONE HDMI_ACR_CTS HDMI_AUDIO_DUMP GPU_AUDIO_PROBE"
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ACR_CTS=1 HDMI_AUDIO_DUMP=1 GPU_AUDIO_PROBE=1"
     BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_ACR_CTS+HDMI_AUDIO_DUMP"
 elif [ -n "${BURN_HDMI_SYMCLK_AB:-}" ]; then
     # THE ATTRIBUTION CONTROL BURN. 1.55.24 wrote the five DCCG symbol-clock stores blind and the burn was
@@ -562,8 +619,13 @@ elif [ -n "${BURN_HDMI_SYMCLK_AB:-}" ]; then
     # off then on, twice, each bracketed by a five-register readout, then the ACR N-scale discriminator.
     # NOTE: deliberately does NOT set HDMI_DCCG — that would apply the write at boot and leave window A
     # already-on. PASS IS THE OPERATOR'S EARS, and the question is whether A and B DIFFER.
-    echo "[2/2] Building the SYMCLK A/B kernel (HDA_HDMI + HDA_TONE + HDMI_SYMCLK_AB + HDMI_AUDIO_DUMP: two labelled listening windows in ONE boot, symclk OFF then ON; LISTEN for a difference)."
-    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_SYMCLK_AB=1 HDMI_AUDIO_DUMP=1"
+    # ⭐ GPU_AUDIO_PROBE IS REQUIRED (1.56.34 audit). The whole A/B sits inside `if (gpu_hdmi_audio_on == 1)`
+    # in main.cyr, and that flag is set only by a gpu_hdmi_audio_enable() that got past preflight — which
+    # needs gpu_audio_dig, which only gpu_audio_probe() sets. Without the flag the boot prints
+    # "symclk-ab: no HDMI audio path -- skipping" and the burn produces neither window.
+    echo "[2/2] Building the SYMCLK A/B kernel (HDA_HDMI + HDA_TONE + HDMI_SYMCLK_AB + HDMI_AUDIO_DUMP + GPU_AUDIO_PROBE: two labelled listening windows in ONE boot, symclk OFF then ON; LISTEN for a difference)."
+    BUILD_REQUIRE="HDA_HDMI HDA_TONE HDMI_SYMCLK_AB HDMI_AUDIO_DUMP GPU_AUDIO_PROBE"
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_SYMCLK_AB=1 HDMI_AUDIO_DUMP=1 GPU_AUDIO_PROBE=1"
     BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_SYMCLK_AB+HDMI_AUDIO_DUMP"
 elif [ -n "${BURN_HDMI_DCCG:-}" ]; then
     # THE DCCG SYMCLK BURN — the de-risked candidate. The amdgpu modeset capture proved agnos omits the DCCG
@@ -572,8 +634,12 @@ elif [ -n "${BURN_HDMI_DCCG:-}" ]; then
     # interpreter, NO transmitter, NO PHY power-cycle — host-visible DCCG only, so display-safe (worst case a
     # clock glitch, recoverable; not the transmitter's non-recoverable blank). If audio plays, the missing
     # symbol clock was the whole thing and we never touch the transmitter. PASS IS THE OPERATOR'S EARS.
-    echo "[2/2] Building the DCCG-symclk kernel (HDA_HDMI + HDA_TONE + HDMI_DCCG + HDMI_AUDIO_DUMP: apply the DCCG symbol-clock re-prime amdgpu does for HDMI; host-visible, display-safe; LISTEN for the tone)."
-    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_DCCG=1 HDMI_AUDIO_DUMP=1"
+    # ⭐ GPU_AUDIO_PROBE IS REQUIRED (1.56.34 audit). The five DCCG stores are inside gpu_hdmi_audio_enable()
+    # itself, which refuses at preflight while gpu_audio_dig is -1 — so the flag under test would never be
+    # applied at all, and the burn would read as "the symbol clock changed nothing".
+    echo "[2/2] Building the DCCG-symclk kernel (HDA_HDMI + HDA_TONE + HDMI_DCCG + HDMI_AUDIO_DUMP + GPU_AUDIO_PROBE: apply the DCCG symbol-clock re-prime amdgpu does for HDMI; host-visible, display-safe; LISTEN for the tone)."
+    BUILD_REQUIRE="HDA_HDMI HDA_TONE HDMI_DCCG HDMI_AUDIO_DUMP GPU_AUDIO_PROBE"
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_DCCG=1 HDMI_AUDIO_DUMP=1 GPU_AUDIO_PROBE=1"
     BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_DCCG+HDMI_AUDIO_DUMP"
 elif [ -n "${BURN_HDMI_ATOM_HALT:-}" ]; then
     # THE A4 ISOLATION BURN. Both the live and dry ATOM kernels blacked the iron display before the shell,
@@ -588,7 +654,20 @@ elif [ -n "${BURN_HDMI_ATOM_HALT:-}" ]; then
     #       => the ATOM path itself broke the display (gpu_vbios_acquire's pmm_alloc_2mb landing in the APU UMA
     #          carveout + the 1 MB VBIOS copy is the prime suspect); the last visible marker localizes it.
     # No ATOM_TRACE (keep the summary on one screen). No PHY drive. No audio.
-    echo "[2/2] Building the A4 ISOLATION kernel (HDA_HDMI + HDMI_ATOM + ATOM_DRY + ATOM_HALT: run the ATOM path with zero PHY writes, then FREEZE the framebuffer before the DIG flip; photograph the FB to isolate ATOM-path vs DIG-flip)."
+    # ⛔ GPU_AUDIO_PROBE IS **DELIBERATELY ABSENT**, AND THIS IS THE ARM THAT PROVES THE 1.56.34 AUDIT WAS AN
+    # AUDIT AND NOT A SED. Every other HDA_HDMI arm in this file gained the flag; this one must not.
+    #   * The halt spins forever at main.cyr's `#ifdef ATOM_HALT`, which is INSIDE `#ifdef HDMI_ATOM` and
+    #     therefore BEFORE the `gpu_hdmi_audio_enable()` call site. The audio path is not merely unused here
+    #     — it is unreachable by construction. Nothing in this arm consults gpu_audio_dig.
+    #   * atom_hdmi_transmitter_bringup() aims itself with gpu_phy_discover() (the BACK end, scanned live),
+    #     NOT with gpu_audio_dig (the FRONT end). Conflating those two is the error that once pointed #76 at
+    #     a dead PHY; do not re-introduce it here by assuming the probe is a prerequisite for ATOM.
+    #   * The oracle is a PHOTOGRAPH of the frozen framebuffer. gpu_audio_probe() prints ~6 lines of
+    #     labelled hex, which under ATOM_HALT means six lines of noise scrolling the ATOM step markers the
+    #     photo exists to capture — it would actively degrade the only instrument this arm has.
+    # BUILD_REQUIRE is still declared, because the sentinel after this chain refuses an undeclared audio arm.
+    echo "[2/2] Building the A4 ISOLATION kernel (HDA_HDMI + HDMI_ATOM + ATOM_DRY + ATOM_HALT: run the ATOM path with zero PHY writes, then FREEZE the framebuffer before the DIG flip; photograph the FB to isolate ATOM-path vs DIG-flip). NO GPU_AUDIO_PROBE -- the halt precedes the audio enable."
+    BUILD_REQUIRE="HDA_HDMI HDMI_ATOM ATOM_DRY ATOM_HALT"
     BUILD_ENV="HDA_HDMI=1 HDMI_ATOM=1 ATOM_DRY=1 ATOM_HALT=1"
     BUILD_TAG="HDA_HDMI+HDMI_ATOM+ATOM_DRY+ATOM_HALT"
 elif [ -n "${BURN_HDMI_ATOM_DRY:-}" ]; then
@@ -598,15 +677,30 @@ elif [ -n "${BURN_HDMI_ATOM_DRY:-}" ]; then
     # output is the deliverable: the exact write sequence agnos's interpreter produces, to diff against the
     # atom-interp.py oracle (transmitter: 21 reads / 17 writes / 5 delays, writes to UNIPHYA 0x55xx + RDPCS
     # 0x5Dxx-0x5Exx). Use this if a live BURN_HDMI_ATOM blacks/hangs the console before the shell.
-    echo "[2/2] Building the A4 DRY-VALIDATION kernel (HDA_HDMI + HDMI_ATOM + ATOM_DRY + ATOM_TRACE: run the ATOM interpreter with writes SUPPRESSED; capture the trace and diff vs the oracle. No PHY drive, console safe, no audio)."
-    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ATOM=1 ATOM_DRY=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1"
+    # ⚠ GPU_AUDIO_PROBE IS REQUIRED, AND THE REASONING SPLITS — say which half needs it rather than waving at
+    # the arm (1.56.34 audit). The ATOM-TRACE half does NOT: ATOM_DRY suppresses the MMIO and the interpreter
+    # aims itself by gpu_phy_discover(), so the write list this arm exists to produce is unaffected. But the
+    # arm ALSO declares HDA_TONE and HDMI_AUDIO_DUMP, and BOTH of those halves are dead without the probe:
+    # the sink-select + bind_single block and gpu_audio_dump() both sit behind `if (audio_sink_ok == 1)`,
+    # which in a non-MODESET_AUDIO build means gpu_hdmi_audio_on == 1 — unreachable while gpu_audio_dig is
+    # -1. So without it the tone stays on the analog jack nobody has plugged in and the register read-back
+    # never prints. Shipping a flag that cannot do anything is the ATOM_DRY defect exactly; either the flag
+    # is required or it should not be in BUILD_ENV, and here it is required.
+    echo "[2/2] Building the A4 DRY-VALIDATION kernel (HDA_HDMI + HDA_TONE + HDMI_ATOM + ATOM_DRY + ATOM_TRACE + HDMI_AUDIO_DUMP + GPU_AUDIO_PROBE: run the ATOM interpreter with writes SUPPRESSED; capture the trace and diff vs the oracle. No PHY drive, console safe)."
+    BUILD_REQUIRE="HDA_HDMI HDA_TONE HDMI_ATOM ATOM_DRY ATOM_TRACE HDMI_AUDIO_DUMP GPU_AUDIO_PROBE"
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ATOM=1 ATOM_DRY=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1 GPU_AUDIO_PROBE=1"
     BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_ATOM+ATOM_DRY+ATOM_TRACE+HDMI_AUDIO_DUMP"
 elif [ -n "${BURN_HDMI_ATOM_FULL:-}" ]; then
     # THE ENCODER+TRANSMITTER burn (ATOM_RUN_TRANSMITTER=1). ⚠ The transmitter ENABLE power-cycles the PHY and
     # BLANKS THE LIVE CONSOLE PIPE NON-RECOVERABLY on iron (proven 1.55.23) unless a full modeset (SetPixelClock
     # + OTG recommit) is also in place. DO NOT flash this until that modeset exists. Kept for that future work.
-    echo "[2/2] Building the A4 FULL kernel (HDA_HDMI + HDA_TONE + HDMI_ATOM + ATOM_RUN_TRANSMITTER + ATOM_TRACE + HDMI_AUDIO_DUMP: encoder + transmitter. ⚠ BLANKS THE CONSOLE without a full modeset — do not flash yet)."
-    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ATOM=1 ATOM_RUN_TRANSMITTER=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1"
+    # ⭐ GPU_AUDIO_PROBE IS REQUIRED (1.56.34 audit). The point of running the transmitter at boot is that
+    # gpu_hdmi_audio_enable() then follows it on a re-primed PHY; that call refuses at preflight while
+    # gpu_audio_dig is -1, so without the flag this arm would spend its PHY edge — the whole risk it carries
+    # — and then not attempt the thing the edge was for.
+    echo "[2/2] Building the A4 FULL kernel (HDA_HDMI + HDA_TONE + HDMI_ATOM + ATOM_RUN_TRANSMITTER + ATOM_TRACE + HDMI_AUDIO_DUMP + GPU_AUDIO_PROBE: encoder + transmitter. ⚠ BLANKS THE CONSOLE without a full modeset — do not flash yet)."
+    BUILD_REQUIRE="HDA_HDMI HDA_TONE HDMI_ATOM ATOM_RUN_TRANSMITTER ATOM_TRACE HDMI_AUDIO_DUMP GPU_AUDIO_PROBE"
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ATOM=1 ATOM_RUN_TRANSMITTER=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1 GPU_AUDIO_PROBE=1"
     BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_ATOM+ATOM_RUN_TRANSMITTER+ATOM_TRACE+HDMI_AUDIO_DUMP"
 elif [ -n "${BURN_GPU_RECOVER:-}" ]; then
     # ⛔⛔ 3D ARC RUNG 5 — THE GPU HANG/RECOVERY BATTERY. One boot, five arms.
@@ -656,8 +750,19 @@ elif [ -n "${BURN_MODESET_AUDIO:-}" ]; then
     # cleared FE_SOURCE_SELECT, staging REFUSES, and BOTH arms unmute over a register file that
     # was never programmed — two identical non-experiments wearing the names of a control and a
     # treatment. Landed 1.56.14; the H8 arm below proves it is in the artifact.
-    echo "[2/2] Building the M9 SEQUENCING kernel (HDA_HDMI + HDMI_ATOM + ATOM_TX_CYCLE + MODESET_AUDIO + ATOM_TRACE + HDMI_AUDIO_DUMP: staged-muted audio around a REAL #76 PHY edge; two arms differing ONLY in unmute position. ⛔ THE PANEL GOES DARK MID-SEQUENCE and must relight. EAR-CHECK the sink, EYE-CHECK the screen)."
-    BUILD_ENV="HDA_HDMI=1 HDMI_ATOM=1 ATOM_TX_CYCLE=1 MODESET_AUDIO=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1"
+    #
+    # ⛔⛔ SECOND PREREQUISITE, AND IT IS THE ONE THAT WOULD HAVE VOIDED THIS BURN SILENTLY (1.56.34 audit):
+    # **GPU_AUDIO_PROBE**. `mdo_transmit_run()` refuses at its fifth gate — "transmit refused -- no live DIG
+    # encoder found" — whenever gpu_audio_dig < 0, and that gate sits ABOVE the `#ifdef HDMI_ATOM`, so it
+    # applies no matter what else is set. Both --audio-pre and --audio-post would return MDO_E_NOGPU without
+    # touching a register: a control and a treatment that are byte-identical non-experiments, which is the
+    # exact failure the M9 prerequisite note above already describes from the other direction.
+    # ⚠ The 2026-07-24 M9 capture reads `display audio path is HDMI on dig 1` -> `hdmi flip preconditions
+    # met` ONLY because gpu_audio_probe() was still ungated then. Setting the flag RESTORES the build M9 was
+    # designed against; it does not change the experiment.
+    echo "[2/2] Building the M9 SEQUENCING kernel (HDA_HDMI + HDMI_ATOM + ATOM_TX_CYCLE + MODESET_AUDIO + ATOM_TRACE + HDMI_AUDIO_DUMP + GPU_AUDIO_PROBE: staged-muted audio around a REAL #76 PHY edge; two arms differing ONLY in unmute position. ⛔ THE PANEL GOES DARK MID-SEQUENCE and must relight. EAR-CHECK the sink, EYE-CHECK the screen)."
+    BUILD_REQUIRE="HDA_HDMI HDMI_ATOM ATOM_TX_CYCLE MODESET_AUDIO ATOM_TRACE HDMI_AUDIO_DUMP GPU_AUDIO_PROBE"
+    BUILD_ENV="HDA_HDMI=1 HDMI_ATOM=1 ATOM_TX_CYCLE=1 MODESET_AUDIO=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1 GPU_AUDIO_PROBE=1"
     BUILD_TAG="HDA_HDMI+HDMI_ATOM+ATOM_TX_CYCLE+MODESET_AUDIO+ATOM_TRACE+HDMI_AUDIO_DUMP"
 elif [ -n "${BURN_MODESET_TX_CYCLE:-}" ]; then
     # ⛔⛔ M8e (re-scoped 1.56.14) — THE REAL TRANSMITTER EDGE. #76 DISABLE then ENABLE, inside M6's
@@ -675,8 +780,19 @@ elif [ -n "${BURN_MODESET_TX_CYCLE:-}" ]; then
     #
     # Burn the NEGATIVE CONTROL first if in any doubt: BURN_MODESET_TRANSMITTER_LIVE runs the same code
     # path with ENABLE-only (no edge), so anything it changes did NOT come from the transmitter.
-    echo "[2/2] Building the M8e TRANSMITTER-CYCLE kernel (HDMI_ATOM + ATOM_TX_CYCLE + ATOM_TRACE: #76 DISABLE then ENABLE — a REAL PHY edge on the live link. ⛔ THE PANEL WILL GO DARK MID-SEQUENCE and must relight; H2 recovers in one boot. EYE-CHECK the screen)."
-    BUILD_ENV="HDMI_ATOM=1 ATOM_TX_CYCLE=1 ATOM_TRACE=1"
+    #
+    # ⛔⛔ GPU_AUDIO_PROBE IS REQUIRED **AND THIS ARM CARRIES NO AUDIO AT ALL** — the surprise of the 1.56.34
+    # audit, and the reason it did not stop at the HDA_HDMI arms. `mdo_transmit_run()`'s fifth gate is
+    # `if (gpu_audio_dig < 0) { "transmit refused -- no live DIG encoder found"; return MDO_E_NOGPU; }`, and
+    # it sits ABOVE the `#ifdef HDMI_ATOM`, so it fires in every build. gpu_audio_dig is the FRONT-end stream
+    # encoder index the op uses for `d` — nothing to do with sound — and gpu_audio_probe() is the only thing
+    # that sets it. Unset ⇒ `run /bin/modeset --transmitter` refuses before the envelope opens, the panel
+    # never blinks, and a burn whose oracle is "the panel went dark and came back" reads as a clean pass
+    # while proving nothing. ⚠ M8e burned green with the probe UNGATED (pre-1.56.25); this restores that
+    # build rather than changing it. The probe writes only the Azalia index window — no DIG, PHY or OTG.
+    echo "[2/2] Building the M8e TRANSMITTER-CYCLE kernel (HDMI_ATOM + ATOM_TX_CYCLE + ATOM_TRACE + GPU_AUDIO_PROBE: #76 DISABLE then ENABLE — a REAL PHY edge on the live link. ⛔ THE PANEL WILL GO DARK MID-SEQUENCE and must relight; H2 recovers in one boot. EYE-CHECK the screen)."
+    BUILD_REQUIRE="HDMI_ATOM ATOM_TX_CYCLE ATOM_TRACE GPU_AUDIO_PROBE"
+    BUILD_ENV="HDMI_ATOM=1 ATOM_TX_CYCLE=1 ATOM_TRACE=1 GPU_AUDIO_PROBE=1"
     BUILD_TAG="HDMI_ATOM+ATOM_TX_CYCLE+ATOM_TRACE"
 elif [ -n "${BURN_MODESET_TRANSMITTER_LIVE:-}" ]; then
     # ⛔⛔ M8e — THE DANGEROUS RUNG. ATOM #76 DIG1TransmitterControl(ENABLE) runs LIVE, inside M6's
@@ -688,8 +804,14 @@ elif [ -n "${BURN_MODESET_TRANSMITTER_LIVE:-}" ]; then
     # Recovery, in order: the in-kernel watchdog re-runs the inherited-mode program; if that fails it calls
     # power_reset(); and H2's latch makes that reboot clean and self-disabling (next boot SKIPS the modeset).
     # Worst case is ONE bad boot and `rm /.modeset-armed` — never a reflash.
-    echo "[2/2] Building the M8e LIVE-TRANSMITTER kernel (HDMI_ATOM + ATOM_RUN_TRANSMITTER + ATOM_TRACE: ATOM #4 AND the LIVE #76 PHY edge inside the OTG envelope. ⛔ THE PANEL MAY GO DARK — H2 recovers in one boot. EYE-CHECK the screen)."
-    BUILD_ENV="HDMI_ATOM=1 ATOM_RUN_TRANSMITTER=1 ATOM_TRACE=1"
+    # ⛔ GPU_AUDIO_PROBE IS REQUIRED, for the DIG INDEX and not for audio — see the full reasoning on
+    # BURN_MODESET_TX_CYCLE above. `mdo_transmit_run()` refuses on gpu_audio_dig < 0 before the `#ifdef
+    # HDMI_ATOM`, so without it this op returns MDO_E_NOGPU and the negative control it exists to be is not
+    # a control at all: it would run nothing and change nothing, which is indistinguishable from "the edge
+    # is a no-op" — the exact conclusion this rung is supposed to establish honestly.
+    echo "[2/2] Building the M8e LIVE-TRANSMITTER kernel (HDMI_ATOM + ATOM_RUN_TRANSMITTER + ATOM_TRACE + GPU_AUDIO_PROBE: ATOM #4 AND the LIVE #76 PHY edge inside the OTG envelope. ⛔ THE PANEL MAY GO DARK — H2 recovers in one boot. EYE-CHECK the screen)."
+    BUILD_REQUIRE="HDMI_ATOM ATOM_RUN_TRANSMITTER ATOM_TRACE GPU_AUDIO_PROBE"
+    BUILD_ENV="HDMI_ATOM=1 ATOM_RUN_TRANSMITTER=1 ATOM_TRACE=1 GPU_AUDIO_PROBE=1"
     BUILD_TAG="HDMI_ATOM+ATOM_RUN_TRANSMITTER+ATOM_TRACE"
 elif [ -n "${BURN_MODESET_TRANSMITTER:-}" ]; then
     # M8d — the SAFE transmitter rung, and the one to burn FIRST. `run /bin/modeset --transmitter` runs the
@@ -699,8 +821,13 @@ elif [ -n "${BURN_MODESET_TRANSMITTER:-}" ]; then
     # it retires every risk in the sequence except that one edge.
     # H8 proves the artifact matches this claim in BOTH directions before you flash (verify_marker on the
     # SKIPPED string, verify_absent on the live-edge string).
-    echo "[2/2] Building the M8d SAFE-TRANSMITTER kernel (HDMI_ATOM + ATOM_TRACE: ATOM #4 encoder + the full enveloped sequence, #76 COMPILED OUT — cannot blank via the PHY edge)."
-    BUILD_ENV="HDMI_ATOM=1 ATOM_TRACE=1"
+    # ⛔ GPU_AUDIO_PROBE IS REQUIRED, for the DIG INDEX and not for audio — see BURN_MODESET_TX_CYCLE above.
+    # This is the rung the file tells you to burn FIRST, so it is the one whose silent refusal would be
+    # costliest: `mdo_transmit_run()` bails on gpu_audio_dig < 0 before any of the sequence runs, and an
+    # M8d that refused would retire NONE of the risks the M8e rungs are told it retired.
+    echo "[2/2] Building the M8d SAFE-TRANSMITTER kernel (HDMI_ATOM + ATOM_TRACE + GPU_AUDIO_PROBE: ATOM #4 encoder + the full enveloped sequence, #76 COMPILED OUT — cannot blank via the PHY edge)."
+    BUILD_REQUIRE="HDMI_ATOM ATOM_TRACE GPU_AUDIO_PROBE"
+    BUILD_ENV="HDMI_ATOM=1 ATOM_TRACE=1 GPU_AUDIO_PROBE=1"
     BUILD_TAG="HDMI_ATOM+ATOM_TRACE"
 elif [ -n "${BURN_HDMI_ATOM:-}" ]; then
     # THE A4 ENCODER-ONLY BURN (the audio attempt). Iron 1.55.23 proved: the interpreter is bit-correct, but
@@ -713,8 +840,13 @@ elif [ -n "${BURN_HDMI_ATOM:-}" ]; then
     # path (gpu_hdmi_audio_enable) runs. LIVE (no ATOM_DRY): the encoder writes are actually applied, RMW'd
     # against the real running registers. ATOM_TRACE logs the 5 writes; HDMI_AUDIO_DUMP keeps the read-back.
     # Recovery if it misbehaves: flash without HDMI_ATOM. PASS IS THE OPERATOR'S EARS: a tone from the XB323U.
-    echo "[2/2] Building the A4 ENCODER-ONLY kernel (HDA_HDMI + HDA_TONE + HDMI_ATOM + ATOM_TRACE + HDMI_AUDIO_DUMP: run DIGxEncoderControl(HDMI) LIVE — PHY-safe front-end setup, transmitter SKIPPED — then the audio path. Recoverable flicker at worst; LISTEN for the tone)."
-    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ATOM=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1"
+    # ⭐ GPU_AUDIO_PROBE IS REQUIRED (1.56.34 audit). "Then the proven audio path (gpu_hdmi_audio_enable)
+    # runs" is this arm's whole second half, and it does not run: preflight refuses while gpu_audio_dig is
+    # -1. The burn would apply the five encoder writes, print a healthy ATOM summary, and then go silent at
+    # a SILENT early return — a boot that looks like a clean encoder success and a hardware audio refusal.
+    echo "[2/2] Building the A4 ENCODER-ONLY kernel (HDA_HDMI + HDA_TONE + HDMI_ATOM + ATOM_TRACE + HDMI_AUDIO_DUMP + GPU_AUDIO_PROBE: run DIGxEncoderControl(HDMI) LIVE — PHY-safe front-end setup, transmitter SKIPPED — then the audio path. Recoverable flicker at worst; LISTEN for the tone)."
+    BUILD_REQUIRE="HDA_HDMI HDA_TONE HDMI_ATOM ATOM_TRACE HDMI_AUDIO_DUMP GPU_AUDIO_PROBE"
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ATOM=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1 GPU_AUDIO_PROBE=1"
     BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_ATOM+ATOM_TRACE+HDMI_AUDIO_DUMP"
 elif [ -n "${BURN_HDMI_SWEEP:-}" ]; then
     # THE MATRIX BURN. The register-value class is exhausted (every DCN reg matches amdgpu, still silent),
@@ -723,8 +855,13 @@ elif [ -n "${BURN_HDMI_SWEEP:-}" ]; then
     # clock fix to the LIVE encoder, prints "hdmi-sweep: profile N = <name>", and holds ~3s. The operator
     # WATCHES serial + LISTENS — one boot tests the whole matrix. Adds HDMI_AUDIO_DUMP so the register state
     # of the LAST-applied profile is on record. PASS IS STILL THE OPERATOR'S EARS.
-    echo "[2/2] Building the HDMI-audio MATRIX kernel (HDA_HDMI + HDA_TONE + HDMI_AUDIO_SWEEP + HDMI_AUDIO_DUMP: cycle every candidate fix in one boot; watch serial + listen for which profile makes sound)."
-    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_AUDIO_SWEEP=1 HDMI_AUDIO_DUMP=1"
+    # ⭐ GPU_AUDIO_PROBE IS REQUIRED (1.56.34 audit), and this arm is the most expensive one to lose: the
+    # sweep is wrapped in `if (gpu_hdmi_audio_on == 1)` and its else-branch prints "hdmi-sweep: no HDMI audio
+    # path -- skipping sweep". Without the flag the operator sits through a boot waiting to hear which of N
+    # profiles works and NOT ONE of them is ever applied — a whole matrix, unrun, on one burn.
+    echo "[2/2] Building the HDMI-audio MATRIX kernel (HDA_HDMI + HDA_TONE + HDMI_AUDIO_SWEEP + HDMI_AUDIO_DUMP + GPU_AUDIO_PROBE: cycle every candidate fix in one boot; watch serial + listen for which profile makes sound)."
+    BUILD_REQUIRE="HDA_HDMI HDA_TONE HDMI_AUDIO_SWEEP HDMI_AUDIO_DUMP GPU_AUDIO_PROBE"
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_AUDIO_SWEEP=1 HDMI_AUDIO_DUMP=1 GPU_AUDIO_PROBE=1"
     BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_AUDIO_SWEEP+HDMI_AUDIO_DUMP"
 elif [ -n "${BURN_HDMI_DUMP:-}" ]; then
     # THE MEASUREMENT BURN. Use this one for the display-audio arc until the silence is explained.
@@ -739,8 +876,13 @@ elif [ -n "${BURN_HDMI_DUMP:-}" ]; then
     # answer about itself.
     #
     # PASS IS STILL THE OPERATOR'S EARS. Twelve burns read green while mute; the log line is not the oracle.
-    echo "[2/2] Building the HDMI-audio MEASUREMENT kernel (HDA_HDMI + HDA_TONE + HDMI_AUDIO_DUMP: sovereign DCN audio path + audible sweep + the full register read-back for diffing against amdgpu's known-good)."
-    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_AUDIO_DUMP=1"
+    # ⭐ GPU_AUDIO_PROBE IS REQUIRED (1.56.34 audit). The dump is the deliverable and it is doubly gated:
+    # gpu_audio_dump()'s call site sits inside `if (audio_sink_ok == 1)`, and the function itself opens with
+    # `if (gpu_audio_dig < 0) { return 0; }`. Without the flag the burn produces NO dump — and a missing
+    # dump would most likely be read as "the capture went wrong", not "the kernel never programmed anything".
+    echo "[2/2] Building the HDMI-audio MEASUREMENT kernel (HDA_HDMI + HDA_TONE + HDMI_AUDIO_DUMP + GPU_AUDIO_PROBE: sovereign DCN audio path + audible sweep + the full register read-back for diffing against amdgpu's known-good)."
+    BUILD_REQUIRE="HDA_HDMI HDA_TONE HDMI_AUDIO_DUMP GPU_AUDIO_PROBE"
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_AUDIO_DUMP=1 GPU_AUDIO_PROBE=1"
     BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_AUDIO_DUMP"
 elif [ -n "${BURN_HDMI:-}" ]; then
     # HDA_HDMI: probe/route/stream instance 1 (04:00.1, the HDMI/DP digital sink) + the sovereign DCN
@@ -752,8 +894,14 @@ elif [ -n "${BURN_HDMI:-}" ]; then
     # DIG_MODE and cannot black-screen loop.
     #
     # For the display-audio arc prefer BURN_HDMI_DUMP above — it adds the register read-back.
-    echo "[2/2] Building the HDMI-audio kernel (HDA_HDMI: sovereign DCN display-audio path on 04:00.1; HDA_TONE: audible sweep). Analog instance 0 still plays out the front jack."
-    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1"
+    # ⭐ GPU_AUDIO_PROBE IS REQUIRED (1.56.34 audit) — and on THIS arm the omission is hardest to see, because
+    # HDA_HDMI's own instance-1 probe still runs and still prints a healthy `hda: found 1002:1637` / codec /
+    # route / bound sequence. Only the DISPLAY half is missing: gpu_hdmi_audio_enable() refuses at preflight
+    # while gpu_audio_dig is -1, so DIG_MODE is never flipped, the sink-select never fires, and the tone this
+    # arm advertises goes out the analog jack. The boot log reads like a success. It is not one.
+    echo "[2/2] Building the HDMI-audio kernel (HDA_HDMI: sovereign DCN display-audio path on 04:00.1; HDA_TONE: audible sweep; GPU_AUDIO_PROBE: finds the live encoder the path is bound to). Analog instance 0 still plays out the front jack."
+    BUILD_REQUIRE="HDA_HDMI HDA_TONE GPU_AUDIO_PROBE"
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 GPU_AUDIO_PROBE=1"
     BUILD_TAG="HDA_HDMI+HDA_TONE"
 elif [ -n "${BURN_HDA_TONE:-}" ]; then
     echo "[2/2] Building the HDA_TONE first-tone kernel (hda_stream_arm fills a ~375 Hz triangle -> audible out the codec)..."
@@ -768,12 +916,58 @@ else
     BUILD_ENV=""
     BUILD_TAG="bare"
 fi
+
+# --- THE REQUIRED-FLAG GATE — checked ONCE, for every arm ---------------------------------------------
+# ⭐ THIS EXISTS BECAUSE THREE CONSECUTIVE BURNS ON 2026-07-31 EACH DISCOVERED ONE MISSING FLAG
+# (HDMI_ATOM -> +HDA_HDMI -> +GPU_AUDIO_PROBE). Every one refused for a real reason and every reason was a
+# BUILD fact, not the machine. Discovering a required set one iron burn at a time is the failure; a
+# declared set checked at PREP time turns each of those three flashes into a one-second abort.
+for _f in $BUILD_REQUIRE; do
+    case " $BUILD_ENV " in
+        *" $_f=1 "*) ;;
+        *) echo "burn-prep: ABORT -- this arm declares $_f as required and BUILD_ENV does not set it." >&2
+           echo "           BUILD_TAG=$BUILD_TAG" >&2
+           echo "           BUILD_ENV=$BUILD_ENV" >&2
+           echo "           BUILD_REQUIRE=$BUILD_REQUIRE" >&2
+           echo "           Three burns were lost to exactly this; no arm ships past this check." >&2
+           exit 1 ;;
+    esac
+done
+
+# ⛔ THE SENTINEL: AN AUDIO / TRANSMIT ARM THAT DECLARES NOTHING DOES NOT BUILD.
+#
+# The check above only protects arms that remembered to declare — which is the same "someone remembers"
+# mechanism that let gpu_audio_probe() get gated at 1.56.25 with no arm updated, silently voiding EVERY
+# HDMI-audio burn for nine cuts. So the requirement to declare is itself enforced: any arm whose BUILD_ENV
+# names HDA_HDMI or HDMI_ATOM is, by construction, either an audio arm or a modeset-transmit arm, and both
+# families run through gates on gpu_audio_dig. Such an arm must state its required set — including the case
+# where GPU_AUDIO_PROBE is deliberately NOT in it (BURN_HDMI_ATOM_HALT freezes the framebuffer before the
+# audio enable is reached, so it declares four flags and none of them is the probe).
+# ⇒ A NEW ARM CANNOT INHERIT THIS BUG BY OMISSION. It fails here, at prep, in a second.
+case " $BUILD_ENV " in
+    *" HDA_HDMI=1 "*|*" HDMI_ATOM=1 "*)
+        if [ -z "$BUILD_REQUIRE" ]; then
+            echo "burn-prep: ABORT -- BUILD_TAG=$BUILD_TAG sets HDA_HDMI or HDMI_ATOM and declares no BUILD_REQUIRE." >&2
+            echo "           Both families gate on gpu_audio_dig, which ONLY gpu_audio_probe() sets, which is" >&2
+            echo "           #ifdef GPU_AUDIO_PROBE. An undeclared arm here is how every audio burn taken" >&2
+            echo "           between 1.56.25 and 1.56.34 would have been void. Declare the arm's required" >&2
+            echo "           flags -- including deliberately OMITTING GPU_AUDIO_PROBE, with the reason." >&2
+            exit 1
+        fi
+        ;;
+esac
+
 # AMBIENT-ENV LEAK, closed 2026-07-19. `env $BUILD_ENV` ADDS to the inherited environment — it does not
 # replace it. So an exported HDMI_ATOM=1 (or any other flag) lingering in the operator's shell from an earlier
 # experiment reaches build.sh and gets #define'd REGARDLESS of the profile selected above, silently producing
 # an artifact that is not the one the burn tag names. Same family as the ATOM_DRY no-op: the tag stops
 # describing the binary. Clear every known build flag first, then apply only the profile's own.
+# ⚠ WIDENED 1.56.34. The list named ten flags while the audio arms above use fifteen, so five could still
+# leak — and two of them are not cosmetic: an exported ATOM_TX_CYCLE would add a LIVE #76 PHY edge to an arm
+# whose tag promises none, and an exported GPU_AUDIO_PROBE would silently supply the very flag the
+# required-flag gate above exists to make explicit, so a build could pass the gate for the wrong reason.
 if ! env -u HDA_HDMI -u HDA_TONE -u HDMI_DCCG -u HDMI_ATOM -u HDMI_AUDIO_DUMP -u HDMI_AUDIO_SWEEP \
+        -u HDMI_ACR_CTS -u HDMI_SYMCLK_AB -u GPU_AUDIO_PROBE -u MODESET_AUDIO -u ATOM_TX_CYCLE \
         -u ATOM_DRY -u ATOM_TRACE -u ATOM_HALT -u ATOM_RUN_TRANSMITTER \
         -u EXT2_WRITE_SELFTEST -u EXEC_SELFTEST -u THREAD_SELFTEST \
         $BUILD_ENV sh scripts/build.sh >/tmp/burn-prep-build.log 2>&1; then
@@ -824,6 +1018,16 @@ verify_absent() {
     fi
 }
 case "$BUILD_TAG" in *HDA_HDMI*)         verify_marker "ctl1 probing 2nd controller" ;; esac
+# ⭐ GPU_AUDIO_PROBE — the flag whose absence would have voided every HDMI-audio burn taken between 1.56.25
+# and 1.56.34, and the only one keyed on BUILD_REQUIRE rather than BUILD_TAG. That is deliberate and it is
+# what closes the loop end to end: the arm DECLARES the flag (BUILD_REQUIRE) -> the gate above proves it is
+# in BUILD_ENV -> this proves it survived into the artifact. Keying on the tag would miss it entirely,
+# because several arms that need it (CRCCAL, the three M-lane transmitter arms) do not name it in their tag.
+# ⚠ The marker is main.cyr's banner INSIDE the #ifdef, never a string from gpu_audio_probe() itself: that
+# function's body is not gated, so its own text is present in a bare kernel and would verify nothing.
+case " $BUILD_REQUIRE " in
+    *" GPU_AUDIO_PROBE "*) verify_marker "gpu: display audio probe armed" ;;
+esac
 case "$BUILD_TAG" in *HDA_TONE*)         verify_marker "sweep streaming" ;; esac
 case "$BUILD_TAG" in *HDMI_AUDIO_DUMP*)  verify_marker "== agnos display-audio dump ==" ;; esac
 case "$BUILD_TAG" in *HDMI_AUDIO_SWEEP*) verify_marker "hdmi-sweep: cycling" ;; esac

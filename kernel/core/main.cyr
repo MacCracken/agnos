@@ -709,6 +709,17 @@ if (hda_probe() != 0) {
     kprintln("hda: ctl1 no 2nd controller", 27);
 }
 hda_active_ctl = 0;
+#else
+# ⛔⛔ THIS LINE EXISTS BECAUSE ITS ABSENCE HID A BUILD ERROR ACROSS TWO BURNS. With HDA_HDMI unset the
+# whole block above vanishes and the boot said NOTHING about instance 1 — so a log with one `hda: found`
+# was indistinguishable from a box whose second controller failed to probe. Every capture since
+# 2026-07-24 reads `hda: found` ONCE; the three that read twice are all HDA_HDMI builds. Nobody could
+# see that from a boot log, because a compiled-out probe leaves no trace.
+# ⇒ An absent subsystem must SAY it is absent and WHY. Silence is the one answer a reader cannot
+# distinguish from "attempted and failed" — the same defect class as an exit code that cannot tell a
+# refusal from a pass, which is what the rest of this cut is about.
+kprintln("hda: ctl1 NOT PROBED -- this kernel was built without HDA_HDMI, so there is no", 78);
+kprintln("hda:      HDMI/DP audio controller and no HDMI audio path. Not a hardware fact.", 79);
 #endif
 # === GPU arc F0 (1.54.x) — kernel GPU probe =================================
 # Locate the AMD Cezanne iGPU (04:00.0, 1002:1638, gfx90c compute / DCN 2.1
@@ -1159,6 +1170,13 @@ gpu_display_vblank();
 # itself is a genuinely useful read-only discriminator for the remaining HDMI-audio candidates
 # (cut 1.56.32) — build with `GPU_AUDIO_PROBE=1` when you want it.
 #ifdef GPU_AUDIO_PROBE
+# ⭐ THE BURN-PREP MARKER, AND IT HAS TO BE HERE RATHER THAN INSIDE THE PROBE. gpu_audio_probe()'s own
+# body is NOT gated — only this call site is — so every string it prints is present in a bare kernel too,
+# and a marker taken from there would verify nothing. That is exactly the trap verify_marker's header in
+# burn-prep.sh warns about ("a plain build compiles the code and never calls it"). This line exists only
+# inside this #ifdef, so its presence in build/agnos proves the CALL is compiled and reached.
+# Same shape as SCANOUT_REGDUMP's "hubp regdump build armed" banner a few lines up.
+kprintln("gpu: display audio probe armed", 30);
 gpu_audio_probe();
 #endif
 
