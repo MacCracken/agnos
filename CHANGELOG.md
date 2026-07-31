@@ -274,7 +274,7 @@ kernel 1,920,992 B.
 
 ## [1.56.32] - 2026-07-30
 
-### ✅✅ RUNG 19 CLOSED ON IRON 2026-07-30 — `DIFFER: 0 of 256000 px` (`cart2.txt`)
+### ✅✅ RUNG 19 CLOSED ON IRON 2026-07-30 — `DIFFER: 0 of 256000 px` (`agnosticos/docs/development/prior-art/gpu-mine-cart-rung19-closed-0px-differ-iron-0730.txt`)
 
 **The kernel's 3D ops have a real consumer, and it closed on a BYTE COMPARE, not a photograph.**
 `mine-cart --verify` renders one frame through `#92` op `0x0F` on gfx90c and through a CPU reference
@@ -1082,7 +1082,7 @@ inside the region — the one witness in the function that agnos did not write.
 
 ### ✅✅ Iron-validated — rung 6 CLOSED, op `0x0D` live, and a ~1000× perf defect found
 
-`tex3.txt`, 2026-07-28. **All four pre-registered predictions confirmed.** `gpuwedge --rt-audit`
+`agnosticos/docs/development/prior-art/gpu-rt-arena-audit-rung6-closed-iron-0728.txt`, 2026-07-28. **All four pre-registered predictions confirmed.** `gpuwedge --rt-audit`
 exit 95, `RT AUDIT PASS`; `gpudepth` exit 95; `gputri --cov` 20/20.
 
 ⭐ **The region ends at `0x1030000000`, which is exactly the `top=1030000000` the boot path reports
@@ -1115,7 +1115,7 @@ off that edge; a larger `GPU_RT_HANDLE_SIZE` would have to split the call.
 
 ### ⛔⛔ Then the confirming burn falsified 3 of 4 predictions — the INSTRUMENT was measuring itself
 
-`depth.txt`. Exit **94**, ratio **inverted**: the 1.92 MB clear looked **28× slower** than the 32 MB
+`agnosticos/docs/development/prior-art/gpu-depth-clear-cost-no-scale-iron-0728.txt`. Exit **94**, ratio **inverted**: the 1.92 MB clear looked **28× slower** than the 32 MB
 one. Both statements below are true, and the gap between them is the finding.
 
 **The fix worked — 254×.** The 32 MB clear went **221,875 µs → 873 µs**, i.e. **38.4 GB/s** where it
@@ -1599,7 +1599,7 @@ is the shared-premise blindness rung 15 shipped to iron.
 
 ### ✅✅ Closed — op `0x0D` iron-validated: 687× total, and a clean cost model
 
-`depth2.txt`. **3 of 4 predictions confirmed, exit 95.**
+`agnosticos/docs/development/prior-art/gpu-depth-clear-op0d-validated-iron-0729.txt`. **3 of 4 predictions confirmed, exit 95.**
 
 ```
 800x600 x20   burn 1 (per-row + contaminated)  1,788,344 us

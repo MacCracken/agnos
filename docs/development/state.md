@@ -102,7 +102,7 @@ against something other than the reference. ⇒ **At least one gate must test an
 New: `texgate` **GATE 11** (absolute — bilinear at 1:1 == the source texture, via `tex_uv_at`) and
 **GATE 12** (falsifies it, breaks 63/64); GATE 10 inverted; `bigate` G2 re-anchored + G2b;
 `bimodel` **M6**; `gputex` now asserts frame 0 == 0 and `burn-prep` enforces its presence.
-✅✅ **RE-BURN 2026-07-28 (`tex2.txt`): RUNG 15 IS CLOSED AND IRON-VALIDATED — all four predictions
+✅✅ **RE-BURN 2026-07-28 (`agnosticos/docs/development/prior-art/gpu-tex-rung15-bilinear-validated-iron-0728.txt`): RUNG 15 IS CLOSED AND IRON-VALIDATED — all four predictions
 hold.** `gputri --cov` 20/20; `gputex` **exit 95**, BILINEAR **5 of 5 EXACT**, and **frame 0 reports
 `vs NEAREST: 0`** (was 35) — the falsified prediction now CONFIRMED. ⭐ `exit 95` is itself the
 assertion passing: the new 1:1-identity gate returns 86 on a single differing pixel, so a green exit
@@ -133,7 +133,7 @@ not free ⇒ TD-3 has nowhere to live."* ⚠ With `VM_CONTEXT0` disabled there a
 an OOB store lands somewhere real — "free" must be MEASURED.
 ⭐ **Why it hid for six rungs:** rung 6's note says a failure stalls Phase II "at rung 11", yet
 rungs 11-16 all shipped — they fit the 2 MB arena. **Rung 17 is the first rung whose buffer does not.**
-✅✅ **RUNG 6 CLOSED AND IRON-VALIDATED (`tex3.txt`, 2026-07-28) — all four predictions confirmed.**
+✅✅ **RUNG 6 CLOSED AND IRON-VALIDATED (`agnosticos/docs/development/prior-art/gpu-rt-arena-audit-rung6-closed-iron-0728.txt`, 2026-07-28) — all four predictions confirmed.**
 `gpuwedge --rt-audit` exit 95, `RT AUDIT PASS`. Region `[0xB0000000, 0xC0000000)` -> phys
 `1020000000..1030000000`, and **`1030000000` is exactly the `top=1030000000` the boot path reports
 from an INDEPENDENT source** (E820/PMM, nothing to do with `MC_VM_FB_OFFSET`) — two unrelated
@@ -142,7 +142,7 @@ carveout base, i.e. the console FB at offset 0, exactly where the map says. Not 
 have been VOID), not inside the region. TD-3's placement is confirmed against HARDWARE.
 ✅ **Op `0x0D` DEPTH_CLEAR is live on iron** — minted with its worker, mask `0x1F1F -> 0x3F1F`, ABI
 battery **103/103**, gated so nothing can store until the audit passes on that boot.
-✅✅ **OP `0x0D` DEPTH_CLEAR IS COMPLETE AND IRON-VALIDATED (`depth2.txt`), after TWO defects the
+✅✅ **OP `0x0D` DEPTH_CLEAR IS COMPLETE AND IRON-VALIDATED (`agnosticos/docs/development/prior-art/gpu-depth-clear-op0d-validated-iron-0729.txt`), after TWO defects the
 timing oracle caught on a target that cannot be read back at all.**
 **(1) A 262x WORKER BUG.** `gpu_cp_dma_fill_rect` issued **one CP-DMA packet per row with its own
 fence wait** (600 packets for 800x600) on a **contiguous** buffer. One `gpu_cp_dma_fill` instead:
@@ -354,7 +354,7 @@ x≈4000 prepped against a draw origin of 8, so the fold had nothing to cancel �
 fired, which is the correct diagnosis. Such a record is **ABI-illegal** (the corner bound refuses it);
 geometry must live near its own draw rect, which is why D6 moves the WINDOW with the geometry.
 Re-prepped at dx=4000, `KC` returns to **1,152,000** — depthmodel's A8 number, independently.
-✅✅ **RUNG 17 IS CLOSED AND IRON-VALIDATED (2026-07-29, `depth4.txt`, exit 95) — THE DEPTH TEST RUNS
+✅✅ **RUNG 17 IS CLOSED AND IRON-VALIDATED (2026-07-29, `agnosticos/docs/development/prior-art/gpu-depth-rung17-closed-iron-0729.txt`, exit 95) — THE DEPTH TEST RUNS
 ON gfx90c.** `tri_depth.s` 116 dwords · `RSRC1 = 0x002C0187` / `RSRC2 = 0x00000190` both harvested ·
 one workgroup per 8x8 tile, one 64-lane wave, colour+z in registers across the triangle loop, one
 store each at the end. `--cov` **20/20** (regression control held), `--depth` **exit 95**: witness
