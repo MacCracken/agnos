@@ -6,7 +6,7 @@ type: state
 
 # AGNOS — Live State
 
-> **Last refresh**: 2026-07-29 · kernel head **1.56.31** — ✅✅ **RUNG 18 CLOSED ON IRON, exit 95:
+> **Last refresh**: 2026-07-31 · kernel head **1.56.31** — ✅✅ **RUNG 18 CLOSED ON IRON, exit 95:
 perspective-correct textured rasterisation runs on gfx90c**, 0 of 1541 covered px differing from the CPU
 reference on a corpus that samples different texels from the affine answer at 731. Exact 56-iteration
 restoring divide, 64-bit numerator in a register pair, **no `v_rcp_f32`** — the release row prescribed it
@@ -16,7 +16,7 @@ instrument/analysis.** ✅✅ **RUNG 17 CLOSED ON IRON** (1.56.30, two burns) �
 deterministic with no atomics and no binning. Next: **1.56.32 rung 19 `pilot`** — the consumer close, which
 also pays the rung-closure debt (the kernel is now SEVEN rungs ahead of a shipped consumer).
 > — previous header follows —
-> **Last refresh**: 2026-07-28 · kernel head **1.56.30** (open; 1.56.29 closed — rung 15 iron-validated) · **▶ ACTIVE — 1.56.x GPU (the one open GPU release; there is no 1.57/1.58/1.59).** Full plan + reference:
+> **Last refresh**: 2026-07-31 · kernel head **1.56.30** (open; 1.56.29 closed — rung 15 iron-validated) · **▶ ACTIVE — 1.56.x GPU (the one open GPU release; there is no 1.57/1.58/1.59).** Full plan + reference:
 [`docs/development/planning/gpu.md`](planning/gpu.md) — the single GPU document. **DONE and shipped:**
 (1) **the ring-3 GPU band has consumers** — aethersafha composites on the GPU (opaque via `#87`, translucent
 via `#92` op 0x01 premultiplied src-over), unblocked by setu 0.6.0/0.7.0 asking `shm_create_gpu` #86 (the
@@ -456,9 +456,9 @@ five burns 2026-07-22, then code+flag DELETED — see [[feedback_dlane_five_burn
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.56.33** | [`VERSION`](../../VERSION) |
+| **Kernel** | **1.56.34** | [`VERSION`](../../VERSION) |
 | **Cyrius toolchain pin** | **6.2.36** | `cyrius.cyml [package].cyrius` |
-| **Released** | 2026-07-28 | [`CHANGELOG.md`](../../CHANGELOG.md) |
+| **Released** | 2026-07-31 | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | **Iron-validated** | 2026-05-25 (archaemenid NUC AMD — **MVP gate green since Attempt 68 / 1.30.9**; **1.32.x networking arc iron-COMPLETE**: r8169 unicast-RX solved at 1.32.7 + DHCP real lease `.142` iron-verified at 1.32.9; storage trio + GPT + ext4 + shell byte-clean). The 1.33.x ext2/4-WRITE + 1.34.x FAT-family arcs are QEMU/`fsck`-validated; their final-bite iron burns stay user-driven (pending). | NUC AMD Attempts 68 (MVP gate) + 71-77 (FB) + 80-91 (storage arc) + 92+ (networking arc — DHCP iron-verified 1.32.9) |
 
 ## Open investigations

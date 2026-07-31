@@ -4183,6 +4183,7 @@ var MDO_OP_TRANSMIT  = 0x06;        # M8 transmitter — ATOM #4 (+ #76, build-g
 var MDO_OP_AUDIO_PRE  = 0x07;       # M9 CONTROL   — transmit + audio unmuted BEFORE the transmitter edge
 var MDO_OP_AUDIO_POST = 0x08;       # M9 TREATMENT — transmit + audio unmuted AFTER  the transmitter edge
 var MDO_OP_PIXCLK     = 0x09;       # 1.56.33 — ATOM #12 SetPixelClock; derives all params, refuses on pll_id
+var MDO_OP_CRCCAL     = 0x0A;       # 1.56.34 — calibrate the AFMT audio CRC against its NULL case, in one boot
 # bit N set <=> op N implemented: 0 NOP,1 CAPS,2 DUMP,3 LOCK,4 VTOTAL,5 RECOMMIT,6 TRANSMIT,
 # 9 PIXCLK — advertised UNCONDITIONALLY on the TRANSMIT precedent: the op IS implemented, and a
 # build/boot that cannot derive a pll_id answers with the specific MDO_E_NOPLL rather than a generic
@@ -4198,10 +4199,13 @@ var MDO_OP_PIXCLK     = 0x09;       # 1.56.33 — ATOM #12 SetPixelClock; derive
 # Advertise on either flag alone and the tool can run a "control" and a "treatment" that are the SAME
 # experiment under two op codes — the ATOM_DRY class again, one layer up. Without it: MDO_E_BADOP, which
 # the tool reports as "wrong kernel" rather than silently producing a result that means nothing.
+# ⚠ 1.56.34: bit 10 (MDO_OP_CRCCAL 0x0A) added to BOTH values — the CRC calibration is not an audio ARM,
+# it is an INSTRUMENT check, so it must exist in a plain kernel. An added op must move both or the smoke's
+# both-directions assertion fails, which is the check that catches an op advertised in only one build.
 #ifdef MODESET_AUDIO_ARMS
-var MDO_OP_SUPPORTED = 0x3FF;
+var MDO_OP_SUPPORTED = 0x7FF;
 #else
-var MDO_OP_SUPPORTED = 0x27F;
+var MDO_OP_SUPPORTED = 0x67F;
 #endif
 var MDO_E_NOGPU      = 1;           # call/op — GPU/display unavailable (write ops only, once they exist)
 var MDO_E_BADOP      = 2;           # op    — unknown, reserved, or not implemented in this kernel
@@ -5732,6 +5736,99 @@ fn mdo_pixclk() {
     return MDO_E_NOATOM;
 }
 
+# mdo_crccal — 1.56.34 bite 1. CALIBRATE THE AFMT AUDIO CRC AGAINST ITS OWN NULL CASE, IN ONE BOOT.
+#
+# ⛔⛔ THE HOLE THIS CLOSES IS IN THE INSTRUMENT, NOT THE HARDWARE — and it is load-bearing for the whole
+# arc. `gpu_hdmi_audio_crc_one` prints **"saw samples, but they are silence"** whenever CRC_DONE asserts
+# with a zero CRC. That is a conclusion it has not earned: `DONE=1, CRC=0` is equally consistent with
+#     (a) 2048 genuinely-zero samples traversed the tap        <- what the probe claims
+#     (b) the counter simply completed and NOTHING traversed   <- never ruled out
+# and (b) INVERTS the arc's reading — under it, "the read side never drains" and every register hypothesis
+# built on "samples arrive but produce no sound" was aimed at the wrong half of the pipe.
+#
+# ⭐ The calibration control run on amdgpu proved both taps CONTENT-sensitive (silence -> 0, tone -> non-zero)
+# — but **both of those stimuli FLOWED.** A stimulus set containing only flowing cases cannot distinguish
+# flow from no-flow. **The null case IS the calibration**, and it has never been taken.
+#
+# ⚠ WHY THIS IS AN OP AND NOT A BOOT SELFTEST: it stops and starts the codec feed, so it must be repeatable
+# from the shell without a reflash, and its result must be readable next to the state it measured.
+# ⚠ WHY IT NEEDS NO EAR: it is entirely source-side and self-controlled, so it is immune to the sink-latched
+# state that makes cross-boot ear comparisons un-adjudicable. That is exactly why it goes FIRST.
+#
+# Sequence, all in one boot, with the feed restored to however it was found:
+#   N1  feed STOPPED  -> CRC both taps      the null
+#   F   feed RUNNING  -> CRC both taps      the flow case
+#   N2  feed STOPPED  -> CRC both taps      repeat the null, so a one-off is not mistaken for a rule
+fn mdo_crccal() {
+    if (gpu_present == 0) { return MDO_E_NOGPU; }
+    if (gpu_display_ok != 1) { return MDO_E_NOGPU; }
+    if (gpu_hdmi_audio_on == 0) {
+        kprintln("modeset: CRCCAL -- the HDMI audio path did not come up; nothing to calibrate", 76);
+        return MDO_E_NOGPU;
+    }
+    var d = gpu_audio_dig * GPU_DCN_DIG_STRIDE;
+
+    # ⭐ READ THE STATE BEFORE TOUCHING IT. If the feed is already stopped, the "null" phase is not a change
+    # this op made, and saying so is the difference between a controlled experiment and a coincidence.
+    var was_on = hda_hdmi_feed_running();
+    kprint("modeset: CRCCAL -- codec feed at entry, SD_CTL RUN = ", 53); kprint_num(was_on);
+    kprintln("  (1 run, 0 stopped, -1 absent)", 31);
+
+    kprintln("modeset: CRCCAL -- N1: the NULL case, codec feed STOPPED --------------------", 77);
+    hda_hdmi_feed_stop();
+    gpu_udelay(20000);
+    var n1a = gpu_hdmi_audio_crc_one(d, 0);
+    var n1b = gpu_hdmi_audio_crc_one(d, 1);
+
+    kprintln("modeset: CRCCAL -- F: the FLOW case, codec feed RUNNING ---------------------", 77);
+    hda_hdmi_feed_start();
+    gpu_udelay(60000);
+    var fa = gpu_hdmi_audio_crc_one(d, 0);
+    var fb = gpu_hdmi_audio_crc_one(d, 1);
+
+    kprintln("modeset: CRCCAL -- N2: the NULL case again, feed STOPPED --------------------", 77);
+    hda_hdmi_feed_stop();
+    gpu_udelay(20000);
+    var n2a = gpu_hdmi_audio_crc_one(d, 0);
+    var n2b = gpu_hdmi_audio_crc_one(d, 1);
+
+    # Leave the feed as it was found. An experiment that changes the machine it measured is a burn nobody
+    # can repeat.
+    if (was_on == 1) { hda_hdmi_feed_start(); }
+    if (was_on != 1) { hda_hdmi_feed_stop(); }
+
+    # ── THE VERDICT, and every branch is named so no outcome has to be interpreted after the fact ──
+    kprintln("modeset: CRCCAL -- VERDICT ------------------------------------------------", 75);
+    var null_done = 0;
+    if (n1a == 1 || n1b == 1) { null_done = 1; }
+    if (n2a == 1 || n2b == 1) { null_done = 1; }
+    var flow_done = 0;
+    if (fa == 1 || fb == 1) { flow_done = 1; }
+
+    if (null_done == 0) {
+        if (flow_done == 1) {
+            kprintln("modeset:   CRC_DONE is FLOW-GATED -- it completed with the feed running and", 75);
+            kprintln("modeset:   NOT with it stopped. A completion IS evidence samples traversed.", 75);
+            kprintln("modeset:   ** THE INSTRUMENT IS CALIBRATED ** and prior readings stand.", 71);
+            return 0;
+        }
+        kprintln("modeset:   the CRC completed in NEITHER phase -- this probe is inert on this", 76);
+        kprintln("modeset:   path and NO reading taken from it means anything. Do not spend a", 75);
+        kprintln("modeset:   burn on a CRC result until this is understood.", 57);
+        return 0;
+    }
+    if (flow_done == 1) {
+        kprintln("modeset:   ** CRC_DONE IS NOT FLOW-GATED ** -- it completes with the feed", 73);
+        kprintln("modeset:   STOPPED. A completion therefore proves NOTHING about traversal, and", 78);
+        kprintln("modeset:   every 'saw samples' this arc has printed is VOID as evidence. Only a", 79);
+        kprintln("modeset:   CRC VALUE that DIFFERS between the two phases carries information.", 77);
+        return 0;
+    }
+    kprintln("modeset:   the CRC completed ONLY with the feed stopped, which is incoherent --", 79);
+    kprintln("modeset:   suspect the probe or the feed control before any hardware reading.", 77);
+    return 0;
+}
+
 fn mdo_execute(rec) {
     var op = load32(rec) & 0xFFFFFFFF;
     if (op == MDO_OP_NOP)  { return 0; }
@@ -5742,6 +5839,7 @@ fn mdo_execute(rec) {
     if (op == MDO_OP_RECOMMIT) { return mdo_recommit(); }
     if (op == MDO_OP_TRANSMIT) { return mdo_transmit(0); }
     if (op == MDO_OP_PIXCLK) { return mdo_pixclk(); }
+    if (op == MDO_OP_CRCCAL) { return mdo_crccal(); }
     #ifdef MODESET_AUDIO_ARMS
     if (op == MDO_OP_AUDIO_PRE)  { return mdo_transmit(1); }
     if (op == MDO_OP_AUDIO_POST) { return mdo_transmit(2); }

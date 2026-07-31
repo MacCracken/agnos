@@ -280,6 +280,45 @@ fn modeset_pixclk(): i64 {
     return 88;
 }
 
+# --crccal — 1.56.34 bite 1. CALIBRATE THE AFMT AUDIO CRC AGAINST ITS NULL CASE, in one boot.
+#
+# ⛔ THE ARC'S CRC PROBE PRINTS "saw samples, but they are silence" ON A ZERO CRC, and it has never earned
+# that. `DONE=1, CRC=0` is equally "2048 zero samples traversed" and "the counter completed and nothing
+# traversed" — and the second INVERTS the arc's reading of where the fault is. The control run that proved
+# both taps content-sensitive used only stimuli that FLOWED, and a stimulus set with no null case cannot
+# distinguish flow from no-flow.
+# ⭐ This op stops the codec feed, measures, runs it, measures, stops it again, measures — one boot, one
+# sink state, feed restored to however it was found. **It needs no ear**, which is exactly why it goes
+# first: it is immune to the sink-latched state that made ~24 prior burns un-adjudicable.
+#   95 = the calibration RAN; read the VERDICT block in klug -- every branch is named there
+#   96 = no GPU / no lit display / the HDMI audio path did not come up (QEMU has no DCN)
+#   94 = an unexpected refusal -- read the reason against MDO_E_* before proceeding
+fn modeset_crccal(): i64 {
+    var rec[64];
+    var i = 0;
+    while (i < 16) { store32(&rec + i * 4, 0); i = i + 1; }
+    store32(&rec + 0, 10);                                   # op = MDO_OP_CRCCAL (0x0A)
+    var r = sys_gpu_modeset_op(&rec, 64);
+    if (r < 0) {
+        var code = 0 - r;
+        var reason = code & 0xFF;
+        m_puts("modeset: #93 crccal idx="); m_num(code >> 8);
+        m_puts(" reason="); m_num(reason); m_nl();
+        if (reason == 1) { m_puts("modeset: no GPU / no lit display / no HDMI audio path here"); m_nl(); return 96; }
+        if (reason == 2) {
+            m_puts("modeset: op NOT ADVERTISED -- this kernel predates MDO_OP_CRCCAL (0x0A)."); m_nl();
+            return 94;
+        }
+        m_puts("modeset: unexpected refusal -- read the reason against MDO_E_*"); m_nl();
+        return 94;
+    }
+    m_puts("modeset: CRCCAL ran -- the VERDICT is in the kernel log, not in this exit code."); m_nl();
+    m_puts("modeset:   capture it:  run /bin/klug > crccal.txt"); m_nl();
+    m_puts("modeset:   an exit of 95 means the EXPERIMENT completed, NOT that the result is"); m_nl();
+    m_puts("modeset:   favourable -- the verdict block names all four outcomes explicitly."); m_nl();
+    return 95;
+}
+
 fn modeset_recommit(): i64 {
     var rec[64];
     var i = 0;
@@ -475,6 +514,7 @@ fn modeset_main(): i64 {
         if (streq(a1, "--vtotal") == 1) { return modeset_vtotal(); }
         if (streq(a1, "--recommit") == 1) { return modeset_recommit(); }
         if (streq(a1, "--pixclk") == 1) { return modeset_pixclk(); }
+        if (streq(a1, "--crccal") == 1) { return modeset_crccal(); }
         if (streq(a1, "--transmitter") == 1) { return modeset_transmitter(); }
         if (streq(a1, "--audio-pre") == 1) { return modeset_audio_pre(); }
         if (streq(a1, "--audio-post") == 1) { return modeset_audio_post(); }
@@ -483,7 +523,7 @@ fn modeset_main(): i64 {
         # different operation than the one asked for is how a typo becomes a wasted burn.
         m_puts("modeset: UNKNOWN ARGUMENT -- no operation was performed."); m_nl();
         m_puts("modeset: valid: --dump --lock --vtotal --recommit --transmitter --pixclk"); m_nl();
-        m_puts("modeset:        --audio-pre --audio-post --caps"); m_nl();
+        m_puts("modeset:        --crccal --audio-pre --audio-post --caps"); m_nl();
         return 84;
     }
     # ⛔⛔ NO ARGUMENTS SEEN. This is the argv-init trap, and on the 2026-07-24 M9 burn it cost

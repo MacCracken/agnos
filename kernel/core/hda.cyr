@@ -1739,6 +1739,27 @@ fn hda_quiesce_all() {
     return 0;
 }
 
+# hda_hdmi_feed_running — is the HDMI stream DMA actually running? Reads SD_CTL's RUN bit.
+#
+# ⭐ IT READS THE HARDWARE, NOT `hda_stream_on`. That variable is the 100 Hz refill servicer's flag — our own
+# bookkeeping, and believing it is the same class of mistake as trusting a register that merely echoes a
+# write. SD_CTL RUN is what the controller is actually doing. ⚠ It is still a register the driver set, so it
+# is not a strong oracle on its own; the point is that a DISAGREEMENT between it and `hda_stream_on` is
+# itself a finding, and the caller is expected to report both rather than pick one.
+# Returns 1 running · 0 stopped · -1 the instance is not present.
+fn hda_hdmi_feed_running() {
+    var ci = 1;                                        # instance 1 = the HDMI/DP controller
+    if (load64(&hda_present + ci * 8) == 0) { return 0 - 1; }
+    var sd = load64(&hda_sd_base + ci * 8);
+    if (sd == 0) { return 0 - 1; }
+    var ci_save = hda_active_ctl;
+    hda_active_ctl = ci;
+    var ctl = hda_read32(sd + SD_CTL);
+    hda_active_ctl = ci_save;
+    if ((ctl & SD_RUN) != 0) { return 1; }
+    return 0;
+}
+
 fn hda_hdmi_feed_stop() {
     var ci = 1;                                        # instance 1 = the HDMI/DP controller
     if (load64(&hda_present + ci * 8) == 0) { return 0; }
