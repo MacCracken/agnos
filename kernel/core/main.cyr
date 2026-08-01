@@ -5214,6 +5214,23 @@ if (modeset_latch_blocked == 0) {
 if (modeset_latch_is_path("/.modeset-armed", 15) == 1) { kprintln("modeset: pathmatch positive OK", 30); }
 if (modeset_latch_is_path("/klug.txt", 9) == 0) { kprintln("modeset: pathmatch negative OK", 30); }
 modeset_disarm();
+# ⛔⛔⛔ THE PART THIS LANE WAS MISSING, AND ITS ABSENCE COST TWO IRON BOOTS ON 2026-07-31.
+#
+# The lane proved the latch file was removed, flushed and verified gone — and stopped there. Nobody ever
+# asked the only question that matters to an operator: **after the recovery the kernel itself prints,
+# does arming actually work again?** It did not, in two independent ways:
+#   1. `modeset_disarm` left `modeset_latch_blocked` at 1, so on a BLOCKED boot every arm still refused
+#      with "latch already blocked this boot" — after printing "verified good, latch cleared".
+#   2. It zeroed `modeset_latch_ino` and nothing re-created it, so even on a CLEAN boot every later arm
+#      refused with "latch surface unusable".
+# Both were invisible to a test that only checked the file was gone. ⇒ **Assert the RECOVERED state, not
+# the cleanup.** A recovery path that is never re-armed after is not a tested recovery path.
+if (modeset_arm(99) == 1) {
+    kprintln("modeset: re-arm after disarm OK", 31);
+    modeset_disarm();
+} else {
+    kprintln("modeset: re-arm after disarm FAILED -- recovery is broken", 57);
+}
 #endif
 #endif
 

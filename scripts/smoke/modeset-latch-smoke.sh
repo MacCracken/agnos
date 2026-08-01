@@ -201,6 +201,18 @@ if [ "$DISARM_BUILD" = 1 ]; then
     want "$LOGS/disarm.log" "modeset: pathmatch positive OK" "disarm: the path predicate accepts the latch path" "disarm: the path predicate rejected its own path"
     want "$LOGS/disarm.log" "modeset: pathmatch negative OK" "disarm: the path predicate REJECTS a neighbouring path" "disarm: the predicate matched a non-latch path — every rm would become a disarm"
     want "$LOGS/disarm.log" "modeset: verified good, latch cleared" "disarm: ★ the latch was removed, flushed and verified gone" "disarm: the disarm did not complete"
+    # ⛔⛔ THE ASSERTION THIS LANE WAS MISSING UNTIL 2026-07-31, AND ITS ABSENCE COST TWO IRON BOOTS.
+    # Everything above proves the CLEANUP. None of it asks the only question an operator cares about:
+    # after the recovery the kernel itself prints — `rm /.modeset-armed` — does arming work again?
+    # It did not, in two independent ways, and both were invisible to a file-is-gone check:
+    #   (1) modeset_disarm left modeset_latch_blocked = 1, so on a BLOCKED boot every later arm refused
+    #       with "latch already blocked this boot" — right after printing "verified good, latch cleared";
+    #   (2) it zeroed modeset_latch_ino and nothing re-created it, so even on a CLEAN boot every later
+    #       arm refused with "latch surface unusable".
+    # ⇒ Assert the RECOVERED state, not the cleanup. A recovery path nobody re-arms after is untested.
+    want   "$LOGS/disarm.log" "modeset: re-arm after disarm OK" "disarm: ★★ arming WORKS again after the operator's rm — the printed recovery is real" "disarm: arming is DEAD after a disarm — the recovery the kernel advertises does not recover"
+    wantno "$LOGS/disarm.log" "modeset: re-arm after disarm FAILED" "disarm: no re-arm failure reported" "disarm: the kernel itself reported that re-arming is broken"
+    wantno "$LOGS/disarm.log" "modeset: arm refused -- latch surface unusable" "disarm: the latch surface survived the disarm (re-created on demand)" "disarm: the surface was destroyed by the disarm and never re-created"
     if debugfs -R "stat /.modeset-armed" "$WORK/part.img" 2>&1 | grep -q "Inode:"; then
         dd if="$WORK/dis.img" bs=1M skip=33 count=67 of="$WORK/part.img" status=none
         if debugfs -R "stat /.modeset-armed" "$WORK/part.img" 2>&1 | grep -q "Inode:"; then F "disarm: /.modeset-armed still on the platter"; else P "disarm: /.modeset-armed is gone from the platter"; fi

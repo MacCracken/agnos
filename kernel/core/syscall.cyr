@@ -5562,7 +5562,34 @@ fn mdo_transmit_run(arm) {
     # ⇒ Two independent structural causes for the 2026-07-24 "both arms silent" verdict, not one: the
     # zero-filled ring, and this. Neither is a fact about the silicon. **A burn cannot measure a thing it
     # switches off before the measurement.**
-    kprintln("modeset: transmit -- DIG_MODE LEFT AT 3 (HDMI) -- the sink is listenable NOW", 76);
+    # ⭐⭐ THE LISTENING WINDOW LIVES *INSIDE* THE OP NOW, AND THEN THE PICTURE COMES BACK.
+    #
+    # Leaving DIG_MODE at 3 on return (1.56.34, first attempt) was right about audio and wrong about the
+    # operator: iron 2026-07-31 — *"monitor loses signal during entire test"*. He ran the remaining two
+    # commands BLIND, and the log shows it (`modeset --cc rccal`). On a one-machine setup that is not a
+    # cosmetic problem: the console is the only interface he has while agnos is up.
+    #
+    # ⚠ AND IT IS ALSO A FINDING, recorded here because it is the cleanest A/B the arc has produced: with
+    # DIG_MODE restored to 2 the panel relit every time; with it left at 3 the sink drops the link. Same
+    # timing, same PLL, `resumed 1`, refresh locked to 10 ppm — the ONLY delta is DVI vs HDMI signalling.
+    # ⇒ **The sink is rejecting agnos's HDMI stream, not just its audio.** A link the monitor has dropped
+    # cannot carry audio either, so this may be upstream of everything the audio arc has been chasing.
+    # Do NOT "fix" it by reverting to DVI: that hides the finding and guarantees silence.
+    #
+    # So: hold the HDMI state with the feed live for a bounded window the operator can listen through,
+    # announce both edges of it, then restore the inherited signalling so the console returns. The listen
+    # happens where the code controls it instead of after the prompt, which also removes the "how long do I
+    # wait" ambiguity from the burn card.
+    kprintln("modeset: >>> LISTEN NOW -- HDMI live, feed running, 12 s <<<", 60);
+    gpu_dcn_hold_ms(12000);
+    kprintln("modeset: <<< listening window CLOSED -- restoring inherited signalling >>>", 74);
+    if (gpu_dig_mode_boot != 0) {
+        var be_fin = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db) & 0xFFFFFFFF;
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db,
+        (be_fin & (0 - 1 - GPU_DIG_MODE_MASK)) | (gpu_dig_mode_boot << GPU_DIG_MODE_SHIFT));
+        gpu_mfence();
+        kprintln("modeset: transmit -- signalling restored; the picture should be BACK", 68);
+    }
     #endif
 
     # ── VERDICT ─────────────────────────────────────────────────────────────────────────────────────

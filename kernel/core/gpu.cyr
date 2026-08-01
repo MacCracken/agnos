@@ -12417,6 +12417,30 @@ fn gpu_hdmi_audio_unmute() {
 
     kprintln("gpu: hdmi audio UNMUTED (AUDIO_ENABLED + slot map + SAMPLE_SEND + GC)", 69);
 
+    # ⛔⛔⛔ 4b. START THE CODEC FEED. WITHOUT THIS THE TAP OPENS ONTO A DEAD DMA.
+    #
+    # ⭐ THIS IS THE 2026-07-31 FINDING, and it is measured, not argued. `gpu_hdmi_audio_enable()` calls
+    # `hda_hdmi_feed_stop()` on entry — deliberately, so the AFMT drain is armed on an EMPTY FIFO — and the
+    # ONLY restart in the tree is `hda_hdmi_feed_start()` at main.cyr, the terminal step of the BOOT-time
+    # bring-up. Under MODESET_AUDIO the ring-3 `#93` arm owns staging and unmute instead, and **nothing on
+    # that path ever restarted the feed.** So every arm ever run through the modeset op opened SAMPLE_SEND
+    # over a stopped DMA.
+    #
+    # Three independent facts from one boot, now that `--crccal` has calibrated the instrument:
+    #   * `CRCCAL -- codec feed at entry, SD_CTL RUN = 0` — the hardware's own RUN bit, after two arms;
+    #   * every tap read in both arms: "saw no samples (crc did not complete)";
+    #   * the calibration's F phase started the feed and immediately got tap0=0x30872b tap1=0x9c4a3a.
+    # And the verdict that makes those readable: **CRC_DONE is FLOW-GATED** — it completes with the feed
+    # running and not with it stopped, so "did not complete" genuinely means nothing traversed. Every
+    # earlier "no samples" on this path was true and was recording a stopped DMA, not a broken encoder.
+    #
+    # ⚠ ORDER MATTERS AND IT IS AMDGPU'S: the tap is opened on an empty FIFO FIRST, then the writer starts,
+    # so the AFMT read pointer and the codec write pointer begin together. That is the coherent-pointer
+    # start main.cyr's own comment describes as "the fix for the chronic FIFO overflow / null egress" —
+    # it was simply never wired into the ring-3 path.
+    hda_hdmi_feed_start();
+    gpu_udelay(40000);          # let real samples reach the FIFO before anything measures it
+
     # ⭐⭐ 5. THE FIRST PROBE THIS PATH HAS EVER HAD DOWNSTREAM OF THE TAP.
     #
     # ⛔ The MODESET_AUDIO route had NO post-unmute instrument at all, and that is why every CRC line in

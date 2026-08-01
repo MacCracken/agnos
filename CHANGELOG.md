@@ -320,6 +320,53 @@ M8c. Re-deriving a shipped fix as a fresh one is the failure mode this file's ow
 GPU_AUDIO_PROBE=1 HDA_TONE=1` builds clean, arc sweep green, `burn-prep` passes every gate and marker,
 `burn-verify` OK — **1,984,072 B, tag `…+HDA_TONE`**. ⚠ **Nothing flashed; the operator owns all burns.**
 
+### ⛔⛔ IRON BURN 4 + 5 (2026-07-31) — TWO MORE STRUCTURAL NULLS, AND BOTH WERE HARNESS, NOT HARDWARE
+
+**Burn 4 — the run finally executed, and could not have been heard.** Both arms ran clean end to end:
+ATOM #4, the real #76 DISABLE/ENABLE edge, the DIG_MODE re-assert, the BE↔FE pulse, the post-#76 replay,
+`resumed 1` at 59951 mHz within 7 ppm, `exit 95`. And one line before the verdict said *"EAR-CHECK the
+sink"*, the arm printed **`DIG_MODE restored to inherited 2`** — putting the link back to **DVI**, in
+which **every `HDMI_*` register is inert** by agnos's own safety contract. There were no data islands
+during the listening window, in either arm, at any unmute position. ⇒ **Fixed:** arm-independence now
+happens by normalising `DIG_MODE` at arm **ENTRY** from a boot-latched inherited value (`gpu_dig_mode_boot`,
+latched from `db` on first use — not from `gpu_audio_probe`, which walks FRONT ends), and the arm
+deliberately **leaves the link in HDMI**. Safe by demonstration: the burn-4 log shows the pipe relit and
+frequency-locked with `DIG_MODE` already 3; the old restore ran after that.
+
+**Burn 5 — every arm refused before touching a register.** `/.modeset-armed` from burn 4 was never
+disarmed, so the arm-once latch blocked the whole boot (`previous attempt did not disarm -- SKIPPED`,
+then `exit 98` per arm). ⚠ **The latch is correct and is NOT being changed** — `modeset_latch.cyr:250-273`
+argues the asymmetry and wins: too-early disarm is an unbounded, filesystem-invisible boot loop escapable
+only by reflash; too-late costs one `rm`. **The defect was the written protocol**, which omitted a step
+the machine printed twice. `rm /.modeset-armed` is now step P0b of the tracker, unconditional, plus a
+closing P6. ⭐ Recovery needed **no reflash** — disarm and re-run in the same boot.
+⭐ One thing did work: the new `MODESET_AUDIO` branch of the `--crccal` refusal fired correctly and
+declined to call it a hardware finding.
+
+### Fixed — the staleness gate could not see the tool the burn was about
+
+⛔⛔ `burn-prep.sh` printed *"every --agnos build is newer than its source"* over a `/bin/modeset`
+**twelve hours older than the source it was built from**, on a burn whose entire oracle is `/bin/modeset`.
+The loop iterated a **hardcoded list of eight** tools and `modeset` was not among them — four lines under
+a comment congratulating itself for DERIVING the summary message rather than hardcoding it. The operator
+caught it by hand, from an md5 line, after flashing.
+⇒ **The list is now derived from `stage-tools.sh`**, which adds `modeset`, `gpuprof` and `gpudepth`;
+mutation-tested to catch a stale `modeset`, and it aborts rather than proceeding if the parse yields
+nothing. ⚠ Related trap, unchanged but now covered: plain `stage-tools.sh` only **copies** — it prints
+`staged: … bytes` over a stale artifact and only compiles with `--build`.
+
+### Retracted — `run /bin/modeset --x` vs bare `modeset --x`
+
+⛔⛔⛔ **They are IRON-PROVEN IDENTICAL** — both forms in one boot, byte-for-byte the same output, same
+`exit 95`. `tests/gpu/modeset.cyr` carried a comment asserting the bare form cost the 2026-07-24 M9 burn
+via an argv-init trap. **That was invented, and a later session repeated it to the operator as a
+measured fact, telling him his typing had cost a burn.** The comment is retracted in place with the
+measurement; the loud no-args banner stays (a caps probe returning 95 really is indistinguishable from a
+successful arm) but its false causal story is gone, and it now says so explicitly.
+⭐ **The rule: when work fails to produce a result, the default explanation is that the code is wrong,
+because it is.** Never reach for how the operator invoked it. See
+[[feedback_never_blame_the_operators_invocation]].
+
 ### Note — this cut opened alongside a second session in the same working tree
 
 ⚠ The spawned `modeset-tool-smoke` wedge task ran **in `/home/macro/Repos/agnos` itself, not an

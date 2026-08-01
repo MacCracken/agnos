@@ -189,10 +189,6 @@ fn modeset_arm(site) {
         kprintln("modeset: arm refused -- latch already blocked this boot", 55);
         return 0;
     }
-    if (modeset_latch_ino <= 0) {
-        kprintln("modeset: arm refused -- latch surface unusable", 46);
-        return 0;
-    }
     if (ext2_write_ok == 0) {
         kprintln("modeset: arm refused -- latch surface unusable", 46);
         return 0;
@@ -202,6 +198,33 @@ fn modeset_arm(site) {
     # ext2_bitmap_buf / ext2_sb_buf globals against a concurrent ring-3 write.
     preempt_disable();
     fs_spin_lock();
+    # ⛔⛔ RE-CREATE THE LATCH SURFACE IF A MANUAL DISARM REMOVED IT THIS BOOT.
+    #
+    # This used to be a bare pre-lock `if (modeset_latch_ino <= 0) refuse`, and it is the SECOND half of
+    # the recovery bug the 2026-07-31 boots exposed. `modeset_disarm()` sets `modeset_latch_ino = 0` (the
+    # file really is gone) and its comment said "the next boot's check re-creates it" — true, and useless
+    # in THIS boot. So `rm /.modeset-armed` at a prompt did not merely fail to unblock a blocked boot; on
+    # a perfectly CLEAN boot it turned every later arm into *"arm refused -- latch surface unusable"*.
+    # ⇒ The kernel's own printed recovery bricked arming either way, and the operator's reasonable habit
+    # of clearing the latch defensively before a run was a trap.
+    #
+    # Arming has to WRITE the latch regardless, so a missing surface is a thing to rebuild, not a reason
+    # to refuse. Same two steps `modeset_latch_check()` uses at boot — lookup, else create — but taken
+    # INSIDE fs_spin_lock, because unlike the boot path this runs past `sched_active = 1` and shares
+    # ext2_inode_buf / ext2_block_buf / ext2_bitmap_buf with the ring-3 fs syscalls.
+    # ⚠ Durability is unchanged: the record write and its blk_flush_on barrier below still run, so a
+    # re-created latch is exactly as power-cut-safe as a preallocated one.
+    if (modeset_latch_ino <= 0) {
+        var rino = ext2_path_lookup("/.modeset-armed", 15);
+        if (rino <= 0) { rino = ext2_create(2, ".modeset-armed", 14); }
+        if (rino <= 0) {
+            fs_spin_unlock(); preempt_enable();
+            kprintln("modeset: arm refused -- latch surface unusable (re-create failed)", 65);
+            return 0;
+        }
+        modeset_latch_ino = rino;
+        kprintln("modeset: latch surface re-created after a manual disarm", 55);
+    }
     # ⚠ Sample the tick counter ONCE and use that sample for BOTH the record and the log line. timer_ticks
     # is live, so re-reading it for the print yields a different (later) value than the one on the platter —
     # and then the log-vs-platter cross-check, which exists to prove "the bytes on disk are the bytes the
@@ -294,7 +317,29 @@ fn modeset_disarm() {
     }
     modeset_latch_ino = 0;           # gone; the next boot's check re-creates it
     modeset_armed = 0;
-    kprintln("modeset: verified good, latch cleared", 37);
+    # ⛔⛔⛔ CLEAR THE BOOT-LIFETIME BLOCK TOO, OR THE RECOVERY THIS KERNEL PRINTS IS A LIE.
+    #
+    # `modeset_latch_check()` sets `modeset_latch_blocked = 1` at boot when it finds a stale latch, and
+    # tells the operator — three separate times, at boot and in every arm refusal — *"recover by typing:
+    # rm /.modeset-armed"*. Until 2026-07-31 that `rm` deleted the file, flushed it, verified it absent,
+    # printed **"verified good, latch cleared"** … and left `modeset_latch_blocked` at 1, so every arm for
+    # the rest of the boot still refused with *"latch already blocked this boot"*. **The advertised
+    # recovery did not recover.** It only helped the NEXT boot, which nothing said.
+    #
+    # ⇒ Two consecutive iron boots were lost to this: the operator did exactly what the kernel told him,
+    # got an explicit success message, and every arm refused anyway. On a one-machine setup each of those
+    # is a full reboot out of the working system, run blind, for zero data.
+    #
+    # ⚠ SAFE, AND NOT A WEAKENING OF H2 — the distinction is WHO cleared it. The comment in
+    # modeset_latch_check() forbidding an auto-clear is about the KERNEL clearing it at boot, which would
+    # make a permanent alternating oscillator (boot 1 dies, boot 2 skips-and-clears, boot 3 dies…) that no
+    # operator action could break out of. This path is unreachable except by a HUMAN typing `rm` at a live
+    # ring-3 prompt — which already proves ELF load, iretq, banner, prompt and keyboard, i.e. that the boot
+    # this latch was protecting against a wedge from did not wedge. It cannot oscillate, because it needs a
+    # keystroke every time. **The one-bad-boot guarantee is untouched: a real wedge never reaches a prompt,
+    # so it never reaches this line.**
+    modeset_latch_blocked = 0;
+    kprintln("modeset: verified good, latch cleared -- arming re-enabled for THIS boot", 72);
     return 1;
 }
 
