@@ -367,6 +367,69 @@ successful arm) but its false causal story is gone, and it now says so explicitl
 because it is.** Never reach for how the operator invoked it. See
 [[feedback_never_blame_the_operators_invocation]].
 
+### ⭐⭐ IRON BURN 6+7 (2026-07-31) — THE INSTRUMENT IS CALIBRATED AND SAMPLES REACH THE ENCODER. ARC PARKED.
+
+**⭐ `--crccal` ran, and it is the measurement this arc existed to take.** Three phases, one boot, feed
+restored as found:
+
+```
+N1  feed STOPPED  -> tap0 did not complete · tap1 did not complete
+F   feed RUNNING  -> tap0 0x30872b        · tap1 0x9c4a3a
+N2  feed STOPPED  -> tap0 did not complete · tap1 did not complete
+VERDICT: CRC_DONE is FLOW-GATED
+```
+
+⇒ **The counter cannot complete without flow.** Every prior "saw no samples" on this path was TRUE, and
+every "saw samples" was real. The ambiguity that made ~24 burns un-adjudicable — *"is `DONE=0` an empty
+pipe or an inert counter?"* — **is closed.** This also retires the 1.56.34 opening premise that the taps
+might have been lying: they were not.
+
+**⛔⛔ AND IT IMMEDIATELY EXPOSED THE REAL DEFECT: `CRCCAL -- codec feed at entry, SD_CTL RUN = 0`.**
+`gpu_hdmi_audio_enable()` calls `hda_hdmi_feed_stop()` on entry — deliberately, to arm the AFMT drain on
+an EMPTY FIFO — and the **only** restart in the tree is `hda_hdmi_feed_start()` at `main.cyr`, the terminal
+step of the **boot-time** bring-up. Under `MODESET_AUDIO` that boot path is suppressed by design and the
+ring-3 `#93` arm owns staging + unmute — **and nothing on that path ever restarted the feed.** Every arm
+ever run through the modeset op opened `SAMPLE_SEND` over a **stopped DMA**. `main.cyr`'s own comment calls
+feed-start "the fix for the chronic FIFO overflow / null egress"; it was simply never wired into the ring-3
+path. ⇒ Fixed: feed-start is now the terminal op of `gpu_hdmi_audio_unmute()`, in amdgpu's order — tap
+opens on an empty FIFO, then the writer starts, so both pointers begin together.
+
+**⭐⭐ RESULT, and it is the first forward motion in the arc: `gpu: hdmi audio tap 0 saw samples (crc
+42f0bf)` / `tap 1 saw samples (crc 9c4a3a)` — ARM 2, with the instrument calibrated in the same boot.**
+Audio samples demonstrably traverse the AFMT encoder on the modeset path. **The sink is still silent.**
+⚠ ARM 1 still reads "no samples", and the honest reading is INSTRUMENT, not hardware: the probe fires
+40 ms after feed-start and a 2048-sample CRC at 48 kHz needs **42.7 ms**. Do not record arm 1 as a
+negative; it was never given time to complete.
+
+⇒ **THE FAULT IS NOW LOCALISED DOWNSTREAM OF THE AFMT OUTPUT TAP** — packetisation onto the link, the
+transmitter/PHY, or the sink's acceptance of the stream. Not the codec, not the DMA, not the register
+block, all of which are now positively measured.
+
+### ⛔ Standing finding — THE SINK REJECTS agnos's HDMI SIGNALLING, not merely its audio
+
+The cleanest A/B this arc produced, and it was free: leaving `DIG_MODE` at **3** cost the picture for the
+entire run (*"monitor loses signal during entire test"*, operator, 2026-07-31 — he typed the rest of that
+boot blind, visible in the log as `modeset --cc rccal`); restoring it to **2** relit the panel every time.
+Same timing, same PLL, `resumed 1`, refresh locked to 7-10 ppm. **The only delta is DVI vs HDMI.**
+⇒ A link the monitor has dropped cannot carry audio either, so this may sit **upstream of everything the
+audio arc has been chasing**. Do not "fix" it by reverting to DVI — that hides it and guarantees silence.
+The listening window now lives inside the op (12 s, announced at both edges) and signalling is restored on
+exit, so the operator keeps his console.
+
+### ▶ HDMI AUDIO — PARKED BY OPERATOR DECISION 2026-07-31
+
+**Seven iron boots this cycle. Five were structural nulls, every one of them HARNESS, not silicon:**
+missing `HDA_TONE` (M9, 07-24) · three missing build flags · the exit-time `DIG_MODE`-to-DVI restore that
+made the listening window inert · a stale `/bin/modeset` a hardcoded staleness list could not see · a
+`rm /.modeset-armed` recovery that reported success and left arming dead two different ways. **Burns 6-7
+were the first that measured the machine**, and they moved the fault from "somewhere in a 40-register
+block" to "downstream of a tap we can now trust."
+
+**Where a future session starts — and it is NOT another register sweep:** the two open questions are
+(1) why the sink drops the link in HDMI signalling, and (2) what happens to samples between the AFMT
+output tap and the wire. Both are transmitter/packetisation questions. The register-value hypothesis class
+is exhausted and should not be re-opened.
+
 ### Note — this cut opened alongside a second session in the same working tree
 
 ⚠ The spawned `modeset-tool-smoke` wedge task ran **in `/home/macro/Repos/agnos` itself, not an
