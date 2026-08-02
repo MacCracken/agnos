@@ -35,6 +35,24 @@ echo ""
 echo "=== AGNOS burn-prep — stage the current kernel for an archaemenid iron burn ==="
 echo ""
 
+# --- 0. INVALIDATE THE OLD ARTIFACT BEFORE ANYTHING CAN ABORT -----------------------------------------
+# ⛔⛔ A BURN WAS LOST TO THIS ON 2026-08-02: the operator ran burn-prep, flashed, and booted a kernel
+# that auto-ran DOOM. `build/agnos` was a DOOM_SELFTEST kernel from the PREVIOUS DAY. Every abort path
+# in this script exits WITHOUT touching build/agnos, so a prep that stops early leaves yesterday's
+# kernel sitting exactly where the flash step looks for it — and it is not obviously stale, because it
+# is a working kernel that boots.
+#
+# ⛔ AND burn-verify.sh CANNOT CATCH THAT, BY CONSTRUCTION. It compares the binary against its OWN
+# stamp, so yesterday's kernel next to yesterday's stamp reports "Safe to flash." It was built to catch
+# check.sh/test.sh REBUILDING the artifact after prep — the opposite direction — and it does that well.
+# A stale-but-self-consistent pair sails straight through it.
+#
+# ⭐ THE FIX IS TO MAKE ABSENCE THE FAILURE MODE. Delete the artifact and its stamp up front: if this
+# script aborts for any reason, there is now NOTHING to flash, burn-verify says "no build/agnos", and
+# the operator is stopped by a missing file instead of misled by a working one. A burn costs a reboot
+# of the operator's only machine; a missing file costs a second.
+rm -f "$ROOT/build/agnos" "$ROOT/build/agnos.burn-tag"
+
 # --- 1. Sweep gate -----------------------------------------------------------
 if [ -z "${SKIP_SWEEP:-}" ]; then
     echo "[1/2] Running the arc sweep (must be all-green before a burn)..."
@@ -1349,6 +1367,27 @@ if ! grep -qa -- "armed (the rung-6 audit ran OUTSIDE" build/rootfs/bin/gpudepth
     exit 1
 fi
 echo "  staged /bin/gpudepth warms up outside the timed region"
+# ⭐ THE DESKTOP: /bin/aethersafha must be present AND must carry its oracle flag.
+# ⛔ This binary has two completely different behaviours off one argument. Bare, it starts the real
+# compositor, takes the screen and never returns. With --selftest it composites a sentinel surface,
+# reads the frame back through #90 before the #84 flip, and exits with a verdict. A build that
+# somehow lost the flag would not error -- `run /bin/aethersafha --selftest` would silently fall
+# through to the DESKTOP, the operator would see a desktop appear, and "the desktop came up" reads
+# like success while the oracle never ran and no exit code was ever produced. That is the same shape
+# as the argv bug that made `bnrmr agnos` print help instead of rendering, and it is why presence of
+# the tool is not presence of the test.
+# ⚠ Absence is a WARNING, not an abort: most burns do not drive the desktop, and this file is not
+# the place to decide that for the operator. A burn whose oracle IS the desktop needs both lines.
+if [ ! -x "$ROOT/build/rootfs/bin/aethersafha" ]; then
+    echo "  ⚠ /bin/aethersafha is NOT staged — if this burn drives the desktop, run:  sh scripts/burn/stage-tools.sh --build"
+else
+    if ! grep -qa -- "--selftest" "$ROOT/build/rootfs/bin/aethersafha" 2>/dev/null; then
+        echo "burn-prep: STAGED /bin/aethersafha LACKS --selftest — it would silently start the DESKTOP instead."
+        echo "  Fix:  sh scripts/burn/stage-tools.sh --build"
+        exit 1
+    fi
+    echo "  staged /bin/aethersafha carries its --selftest oracle"
+fi
 case "$BUILD_TAG" in
     *MODESET_AUDIO*)
         # The flags the operator is told to type MUST exist in the binary that gets flashed.

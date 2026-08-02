@@ -251,6 +251,46 @@ stage_one attn11 programs/gpumm.cyr gpuattn || rc=1
 # from "no GPU". `cyrius build src/main.cyr build/mine-cart && ./build/mine-cart --check` first.
 stage_one cyrius-mine-cart src/main.cyr mine-cart || rc=1
 
+# ⭐⭐ aethersafha — THE DESKTOP, and the first time any of it reaches an iron image.
+# ⛔ Until this row, NO desktop binary appeared in this file at all. The sovereign compositor has
+# composited on the GPU since aethersafha 0.9.6 — `#87 gpu_blit_shm` straight out of a client's
+# GPU-visible `#86` slot, `#92` op 0x01 for premultiplied surfaces, `#39` DEFER for the chrome layer,
+# one `#84` flip — and not one line of that has ever executed on silicon. QEMU cannot substitute and
+# never could: it exposes no AMD PCI device, so `gpu_find` never matches, `gpu_caps` reports flags 0,
+# `ae_gpu_probe` answers 0, and every GPU branch is dead for the whole run. A green desktop smoke
+# proves the CPU fallback, which was never the part in doubt.
+#
+# `run /bin/aethersafha --selftest` is the SELF-VALIDATING form, same contract as the gpu* proofs
+# above: it seeds a window's shared buffer with a four-band sentinel pattern, drives the REAL
+# `ae_gpu_frame_plan` -> `render_desktop` -> `ae_gpu_present_frame` sequence the live desktop runs,
+# captures the finished frame through `#90 gpu_readback_shm` BEFORE the `#84` flip, pulls it back to
+# userland with `#73`, and compares. One process — no setu client, no `spawn_path`, no loopback TCP,
+# no two-proc scheduling — so a non-95 exit points at the compositing path and nothing else.
+#
+# ⚠ THE CAPTURE MUST PRECEDE THE FLIP AND THE TOOL ENFORCES THAT INTERNALLY. `#84` toggles
+# `gpu_bb_back`, so a readback taken after the present samples the buffer the frame did NOT draw
+# into and returns the previous frame in full, with no error. On a static desktop that looks almost
+# right — the worst failure an instrument can have.
+#
+# EXIT: 95 = the GPU composited the client surface at the client's coordinates, verified against
+#            sentinels no compositor state can produce, with nothing leaked outside the window.
+#       96 = no GPU / not armed / no carveout. QEMU's honest answer and NOT a pass — it means the
+#            run proved nothing about hardware, which is what should be reported.
+#       90 backend · 91 screen too small · 92/93 `#86` slot · 94 `#72` seed
+#       80 the frame plan refused (admissibility, pre-syscall) · 81 the GPU declined and demoted
+#       82 the capture hook never ran ⇒ the frame never reached the flip — upstream of the readback,
+#          and hunting the GPU would be the wrong search · 83 `#90` rejected · 84 `#73` failed
+#       70-73 band 1-4 wrong (shift / short copy / row order / stride)
+#       74 sentinel found OUTSIDE the window · 75 sentinel found 300px away · 76 the capture buffer
+#          was contaminated before the run, so nothing downstream of it means anything.
+#
+# ⚠ Bare `run /bin/aethersafha` (no flag) starts the REAL DESKTOP and never returns — it takes the
+# screen and runs its frame loop until quit. That is the visual demo, not the oracle; read the
+# verdict from `--selftest`.
+# ⚠ ~15.5 MB, by far the largest staged binary. That is the full sigil link and is expected, not a
+# regression — `run` (sh_exec) is proven on ELFs this size; `spawn_path` is the one that is not.
+stage_one aethersafha  src/main.cyr aethersafha || rc=1
+
 # kriya dispatches on basename(argv[0]), so each delegated verb needs a
 # /bin/<verb> NAME resolving to the kriya binary. Create them as RELATIVE
 # symlinks (-> kriya) in the rootfs: install-media.sh's `cp -a` preserves them

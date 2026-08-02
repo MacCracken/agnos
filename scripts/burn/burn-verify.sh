@@ -53,6 +53,33 @@ if [ "$HAVE_SUM" != "$WANT_SUM" ]; then
     exit 1
 fi
 
+# ⛔ A SELF-CONSISTENT PAIR IS NOT A FRESH ONE, and that gap cost a burn on 2026-08-02.
+# Everything above proves the binary matches the stamp beside it. Yesterday's kernel next to
+# yesterday's stamp passes every one of those checks — which is exactly what happened: a DOOM_SELFTEST
+# kernel from the previous day was flashed, booted, and auto-ran DOOM, because burn-prep had left it in
+# place and this script said "Safe to flash".
+#
+# So also ask the question the stamp cannot answer: is this artifact NEWER than the sources it claims
+# to be built from? Anything under kernel/ that is newer than build/agnos means the binary predates the
+# tree and no stamp comparison will ever notice.
+NEWER="$(find "$ROOT/kernel" -name '*.cyr' -newer "$BIN" -print -quit 2>/dev/null || true)"
+if [ -n "$NEWER" ]; then
+    echo "burn-verify: STALE ARTIFACT -- build/agnos PREDATES the kernel sources."
+    echo "  newer than the binary: $NEWER"
+    echo ""
+    echo "  The stamp matches, so this binary IS what some burn-prep produced -- just not one that saw"
+    echo "  the current tree. A kernel from an earlier arm boots perfectly well and runs that arm's"
+    echo "  selftest, which is how a DOOM_SELFTEST kernel reached iron on 2026-08-02."
+    echo "  DO NOT FLASH. Re-run: sh scripts/burn/burn-prep.sh   (and run nothing after it)"
+    exit 1
+fi
+
 echo "burn-verify: OK -- build/agnos matches its stamp."
 echo "  $HAVE_SZ bytes, AGNOS $HAVE_VER, $TAG"
+echo "  built $(date -r "$BIN" '+%Y-%m-%d %H:%M:%S'), newer than every kernel/*.cyr"
+# ⭐ PRINT THE ARM, LOUDLY. "$TAG" is the difference between a kernel that boots to a prompt and one
+# that auto-execs a game; it was previously one word on a crowded line. If this does not say what you
+# expect this burn to be, stop.
+echo ""
+echo "  ARM: $TAG"
 echo "  Safe to flash."
