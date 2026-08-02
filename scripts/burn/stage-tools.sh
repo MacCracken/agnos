@@ -291,6 +291,34 @@ stage_one cyrius-mine-cart src/main.cyr mine-cart || rc=1
 # regression — `run` (sh_exec) is proven on ELFs this size; `spawn_path` is the one that is not.
 stage_one aethersafha  src/main.cyr aethersafha || rc=1
 
+# ⭐⭐ THE DESKTOP'S FIRST REAL CLIENTS ON IRON. aethersafha's agnos arm `spawn_path`#43's
+# `/bin/puka` then `/bin/crab` when its setu listener is up; each connects back over loopback:7700,
+# presents a surface bound to a GPU-visible `#86` shm buffer, and is composited by `#87`. Until now
+# neither existed on the image, so every iron boot showed ONE compositor-seeded chrome window and
+# the client half of the display protocol was never exercised on hardware at all.
+#
+# ⭐ BOTH ARE STAGED ON PURPOSE, and the pair is the instrument. `puka` here is setu's slim
+# `present_probe` — mabda-free, 101 KB, and the exact binary the QEMU smoke has always seeded, so it
+# is the PROVEN client. `crab` is the real dhancha file manager (sadish raster + rekha text), which
+# has never run on this hardware. One boot then discriminates: both present => the client path and
+# crab both work; probe only => the setu/two-proc path is fine and crab is the variable; neither =>
+# the fault is the client path itself, not either app. Staging only crab would conflate all three.
+#
+# ⚠ SIZE IS LOAD-BEARING FOR `spawn_path`, unlike `run`/sh_exec. spawn_path is proven on small
+# children (these are 101 KB and 323 KB) and is NOT proven on large ones — a 2.5 MB jalwa spawned
+# this way never ran, while 15 MB binaries exec fine through `run`. Do not add a big client here
+# expecting it to behave like /bin/aethersafha does.
+#
+# ⚠ `/bin/puka` is the FIRST-RESIDENT SLOT, not the puka terminal: full puka needs a mabda `--agnos`
+# GPU backend that does not exist yet. The name is what the compositor spawns, so the slot keeps it.
+# The two paths are both 9 characters, which is the length aethersafha passes to spawn_path.
+#
+# ⛔ NO EXIT CODE FROM EITHER — they are windows, not oracles. The verdict is aethersafha's serial:
+# "launched setu client #1" / "#2 (crab)" then "setu client presented surface". A client that spawns
+# but never presents prints the first line and not the second.
+stage_one setu         programs/present_probe.cyr puka || rc=1
+stage_one crab         src/main.cyr crab        || rc=1
+
 # kriya dispatches on basename(argv[0]), so each delegated verb needs a
 # /bin/<verb> NAME resolving to the kriya binary. Create them as RELATIVE
 # symlinks (-> kriya) in the rootfs: install-media.sh's `cp -a` preserves them

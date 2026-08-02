@@ -1171,7 +1171,7 @@ esac
 # one the burn was for.
 # ⇒ WHEN A CYCLE'S ORACLE IS A NEW OR CHANGED TOOL, ADD IT HERE IN THE SAME BITE. A tool absent from
 # this loop is a tool that can be silently stale, and a stale oracle does not fail — it agrees.
-for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy gpudepth klug; do
+for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy gpudepth klug aethersafha puka crab; do
     _src=""
     case "$_t" in
         modeset)  _src="tests/gpu/build/modeset_agnos" ;;
@@ -1185,6 +1185,20 @@ for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy
         gpufill)  _src="tests/gpu/build/gpufill_agnos" ;;
         gpucopy)  _src="tests/gpu/build/gpucopy_agnos" ;;
         klug)    _src="" ;;   # klug is staged from its own repo; size-compare only
+        # ⛔ ADDED 2026-08-02 AFTER THIS GATE MISSED IT. The desktop burn staged an aethersafha
+        # NINE HOURS OLD -- no geometry fix, none of the new diagnostics -- and every check passed,
+        # because the only aethersafha check was a grep for "--selftest" and the OLD binary had that
+        # string too. Exactly the gputex failure one cycle earlier: the gate existed, verified the
+        # tools it knew about, and did not know about the one the burn was for.
+        # ⚠ Unlike klug, this one CAN be compared: aethersafha builds a real --agnos artifact at a
+        # known path, so compare bytes rather than settling for size-only.
+        aethersafha) _src="../aethersafha/build/aethersafha_agnos" ;;
+        # The desktop's two setu clients. ⚠ /bin/puka is setu's slim present_probe, NOT the puka
+        # terminal — the name is the compositor's first-resident slot. Both are spawn_path'd by
+        # aethersafha, so a stale one presents the wrong surface while the serial still says
+        # "launched setu client".
+        puka)        _src="../setu/build/puka_agnos" ;;
+        crab)        _src="../crab/build/crab_agnos" ;;
     esac
     _staged="build/rootfs/bin/$_t"
     if [ ! -f "$_staged" ]; then
