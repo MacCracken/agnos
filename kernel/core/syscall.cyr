@@ -4140,6 +4140,37 @@ fn gpu_caps_sys(buf, len) {
         store32(buf + 56, gpu_prof_waves);       # gx*gy summed over EVERY dispatch in the call
         store32(buf + 60, gpu_prof_nops);        # records in the call
     }
+
+    # ⭐ 1.56.36 — GPU IDENTITY, a THIRD opt-in tier at len >= 96. Same reserved-tail shape as the 64-byte
+    # profile above and for the same reasons: a caller asking 32 or 64 is bit-identical to before, there is
+    # no second syscall number to keep in step, and old binaries do not change behaviour.
+    #
+    # ⛔ WHY THIS EXISTS AT ALL: #89 reported GEOMETRY and said nothing about WHICH GPU this is, so on a
+    # sovereign box `iam` (the fastfetch-equivalent) had no GPU line and mihi's accelerator registry
+    # detected ZERO accelerators — its whole detection surface is sysfs (`/sys/class/drm/...`) through
+    # ai-hwaccel, and agnos has no sysfs. The kernel has known the answer since probe and simply never
+    # offered it. agnos drives this iGPU natively; not being able to say so was a reporting gap, not a
+    # capability one.
+    # ⛔ AND THE RANGE CHECK WIDENS WITH THE WRITE, exactly as the 64-byte tier documents: refuse a caller
+    # that asks for 96 bytes it does not own rather than half-write and hand back stale bytes that are
+    # indistinguishable from a legitimately-zero identity.
+    if (len >= 96) {
+        if (is_user_range(buf, 96) == 0) { return 0 - 1; }
+        store32(buf + 64, gpu_vendor_id);        # PCI config vendor (0x1002 = AMD)
+        store32(buf + 68, gpu_device_id);        # PCI config device (0x1638 = Cezanne/Renoir iGPU)
+        store32(buf + 72, gpu_vram_mb);          # NBIO CONFIG_MEMSIZE, megabytes
+        store32(buf + 76, 0);                    # reserved — MUST read 0 so a later field is detectable
+        # +80..95 — 16 bytes, NUL-padded ASCII asic tag. A STRING, because ring 3 has no vendor/device
+        # table and building one there would duplicate a fact the kernel already holds. Written only when
+        # a GPU was actually probed, so an absent GPU reads all-zero rather than a stale label.
+        var t = 0;
+        while (t < 16) { store8(buf + 80 + t, 0); t = t + 1; }
+        if (gpu_present != 0) {
+            var nm = "gfx90c/DCN2.1";
+            var k = 0;
+            while (k < 13) { store8(buf + 80 + k, load8(nm + k)); k = k + 1; }
+        }
+    }
     return 0;
 }
 

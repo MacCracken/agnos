@@ -229,6 +229,12 @@ var gpu_v_active      = 0;    # link active height — computed alongside gpu_h_
 # P3b-ii pre-flight: 1 = every precondition for the DVI->HDMI DIG_MODE flip is verified clear on the live
 # encoder. 0 = do NOT flip (a hazard is armed, or the link/encoder isn't ours to touch). Read-only result.
 var gpu_hdmi_flip_ok  = 0;
+# GPU IDENTITY, latched at probe from PCI config + NBIO CONFIG_MEMSIZE. Plain literal initialisers: a
+# module-scope `var x = <expr>` reads 0 forever in this kernel. 0 = not probed, which is also the honest
+# answer on a box with no GPU, so no sentinel is needed.
+var gpu_vendor_id     = 0;
+var gpu_device_id     = 0;
+var gpu_vram_mb       = 0;
 # The DIG_MODE the BACK END was inherited with, latched by the FIRST modeset audio arm of the boot and
 # never rewritten. Arms normalise to it at ENTRY so each starts from identical signalling; the arm then
 # deliberately LEAVES the link in HDMI so the operator's listening window is on a link that can actually
@@ -1864,6 +1870,16 @@ fn gpu_probe() {
     kprint("gpu: ", 5);
     kprint_num(memsize);
     kprintln("MB VRAM", 7);
+
+    # Latch IDENTITY for ring 3. #89 gpu_caps reports GEOMETRY (back-buffer bounds, slot budget, op mask)
+    # and deliberately says nothing about WHICH GPU this is — so `iam` could not print a GPU line at all
+    # and mihi's accelerator registry, which is entirely sysfs-driven through ai-hwaccel, detects zero
+    # accelerators on a sovereign box. These three values are everything a fastfetch-style line needs.
+    # ⚠ Vendor/device come from PCI CONFIG, never from NBIO STRAP0 — STRAP0's device-id mirror reads 0x0 on
+    # Cezanne (the EPF0-strap alias quirk noted above), and amdgpu reads config directly for the same reason.
+    gpu_vram_mb = memsize;
+    gpu_vendor_id = pci_vendor(idx);
+    gpu_device_id = pci_device(idx);
 
     # GC — powered pre-driver; proves the graphics-core bus responds, not just
     # NBIO. (A power-gated GC reads 0 without meaning a mapping failure — STRAP0
