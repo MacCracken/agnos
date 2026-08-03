@@ -14,10 +14,10 @@ type: state
 |---|---|---|
 | Kernel head | **1.56.35 — OPEN** (opened 2026-08-02, the desktop's kernel half) | [`VERSION`](../../VERSION) |
 | Previous cut | **1.56.34 closed 2026-08-02** (HDMI audio), awaiting the user's tag | [`CHANGELOG.md`](../../CHANGELOG.md) |
-| `build/agnos` on disk | 1,928,888 B, 2026-08-02 19:21:51 — a **1.56.34** artifact. ⛔ **STALE the moment 1.56.35 opened**: `version-bump.sh` regenerated `kernel/version.cyr`, so the source is newer than the build and `burn-verify` will now correctly refuse it. Nothing is flashable until a fresh `burn-prep.sh` | `scripts/burn/burn-verify.sh` |
+| `build/agnos` on disk | 1,936,080 B, 2026-08-03 — **1.56.35 bare, BURNED and PASSED**. burn-tag `f96b469a…`, `burn-verify: OK`. ⚠ Any smoke/test run rebuilds it without the burn flags — re-run `burn-prep.sh` before any future flash | `scripts/burn/burn-verify.sh` |
 | Cyrius pin | **6.4.78** | `cyrius.cyml [package].cyrius` |
 | Bootloader | gnoboot **0.6.0**; Path C, `RDI = &boot_info`, magic `0x41474E4F`, entry `0x1000a8` | `gnoboot/VERSION` |
-| Iron target | archaemenid — Beelink SER NUC, AMD Cezanne APU, 4 CPUs, 64 GB. Build host **is** the target, so no serial channel exists. | — |
+| Iron target | archaemenid — Beelink SER NUC, AMD Cezanne APU, **8c/16t (agnos parks APIC id ≥ 4, runs 4)**, 64 GB. Build host **is** the target, so no serial channel exists. | — |
 
 ⭐ **RESOLVED 2026-08-03 — the `-smp 4` fault was `EFER.NXE` never being enabled on the APs.** The AP
 trampoline set `EFER |= 0x100` (LME only) while the BSP sets `0x900` (LME | NXE) — so on any AP, bit 63
@@ -26,6 +26,10 @@ every user stack. First touch of an NX page on an AP = reserved-bit `#PF`. One-l
 `kernel/arch/x86_64/smp.cyr:514`. `-smp 4` now reaches **connected 2, presented 2, exit 95** (fg and
 bg), `-smp 1` unchanged.
 → [`issues/2026-08-02-large-image-ptload-pde-absent-smp.md`](issues/2026-08-02-large-image-ptload-pde-absent-smp.md)
+⭐⭐ **BURNED 2026-08-03 — PASS.** The desktop hosts **two real client windows on iron at 4 CPUs**:
+`present_probe` + `crab`'s dual-pane file manager, both composited on archaemenid's panel, 278 frames,
+clean Esc quit, `smp: cpus online: 4`. Keys reached the client. The TLB shootdown IPI rode along clean —
+no wedge on any process exit. → tracker `#tracker-15635-desktop-smp` in agnosticos `iron-nuc-zen-log.md`.
 **NEXT BITE:** the desktop iron burn is unblocked — archaemenid runs 4 CPUs and that is now the tested
 configuration. ⚠ Note a cross-CPU **TLB shootdown IPI** also landed alongside (vector 0xF0); agnos had
 none at all before.

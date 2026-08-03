@@ -254,10 +254,16 @@ fn tlb_isr_build() {
     return 0;
 }
 
-# Fixed-delivery IPI to ALL-BUT-SELF: destination shorthand 0b11 (bits 19:18), delivery mode 000,
-# level assert, edge. 0x0C4000 | vector.
-fn apic_send_ipi_allbutself(vector) {
-    apic_write(0x300, 0x0C4000 | vector);
+# Fixed-delivery IPI to ONE physical APIC id. No destination shorthand: 0x004000 | vector, with the
+# target in ICR-high bits 31:24.
+# ⛔ DO NOT use the all-but-self shorthand (0x0C4000) here. agnos parks every AP with APIC id >= 4
+# (`smp.cyr:398`, `while (1==1) { hlt }`) BEFORE that AP programs its LAPIC or unmasks anything. On a
+# box with more than 4 cores — archaemenid is 8c/16t — a broadcast reaches those parked APs too, and
+# what they do with an unexpected vector is not something to discover during an iron burn. Targeting
+# only the CPUs agnos actually runs makes the question moot.
+fn apic_send_ipi_one(target, vector) {
+    apic_write(0x310, target << 24);
+    apic_write(0x300, 0x004000 | vector);
     var w = 0;
     while ((apic_read(0x300) & 0x1000) != 0) { if (w >= ICR_DELIVERY_WAIT) { break; } w = w + 1; }
     return 0;
@@ -274,7 +280,12 @@ fn tlb_shootdown_all() {
     if (cpu_count < 2) { return 0; }
     tlb_shoot_ack = 0;
     tlb_shoot_want = cpu_count - 1;
-    apic_send_ipi_allbutself(TLB_SHOOT_VECTOR);
+    var me = pcpu_cpu();
+    var t = 0;
+    while (t < cpu_count) {
+        if (t != me) { apic_send_ipi_one(t, TLB_SHOOT_VECTOR); }
+        t = t + 1;
+    }
     var w = 0;
     while (tlb_shoot_ack < tlb_shoot_want) {
         if (w >= TLB_SHOOT_WAIT) { break; }    # fail-safe: degrade to stale-TLB risk, never hang

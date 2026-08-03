@@ -41,8 +41,11 @@ under 4 CPUs while passing under 1. It explains the whole symptom set — SMP-on
 (more NX pages, more chance of landing on an AP), a victim address that moved between runs (whichever NX
 page the AP touched first), and why the **code** page never faulted (`proc_map_page`, no NX bit).
 
-Verified: `-smp 4` foreground and background both reach **connected 2, presented 2, `exit 95`**;
-`-smp 1` unchanged. → [`docs/development/issues/2026-08-02-large-image-ptload-pde-absent-smp.md`](docs/development/issues/2026-08-02-large-image-ptload-pde-absent-smp.md)
+Verified in QEMU at `-smp 1/4/8/16` (8 and 16 match archaemenid's core and thread counts; agnos parks
+APIC id >= 4 and reports `cpus online: 4` in all of them). ⭐ **Then verified on IRON 2026-08-03**:
+archaemenid boots to `smp: cpus online: 4` and the desktop hosts **two real client windows** —
+`present_probe` and `crab`'s dual-pane file manager, both composited on the panel, 278 frames, keys
+delivered to the client, clean Esc quit. → [`docs/development/issues/2026-08-02-large-image-ptload-pde-absent-smp.md`](docs/development/issues/2026-08-02-large-image-ptload-pde-absent-smp.md)
 
 ⚠ The error code carried `RSVD` (bit 3) from the first capture on 2026-08-02. It was missed for a day
 because `fmt_hex_buf` emits **zero characters** for a value with bit 63 set, so the fault recorder
@@ -57,7 +60,12 @@ while address spaces are recycled by LIFO `pmm_alloc` and, without PCID, a CR3 v
 wedged CPU degrades to stale-TLB risk rather than hanging), `apic_send_ipi_allbutself()`,
 `tlb_isr_build()` and `tlb_shootdown_handler()`; the vector is installed in `main.cyr`. Called from
 `proc_free_address_space`, `proc_unmap_page` and `proc_unmap_2mb_hi`. Inert single-core (`cpu_count < 2`
-short-circuits to a local flush). Verified running: `TLBSHOOT want=3 ack=3 cpus=4 apic=1`.
+short-circuits to a local flush). Verified running: `TLBSHOOT want=3 ack=3 cpus=4 apic=1`, and clean on
+iron 2026-08-03 (no wedge on any process exit, which was the named burn risk).
+
+⚠ It targets APIC ids `0..cpu_count-1` individually — **deliberately not the all-but-self shorthand**.
+archaemenid is 8c/16t and `smp.cyr:398` parks every AP with id >= 4 in `hlt` *before* that AP programs
+its LAPIC; a broadcast would reach those parked cores. Targeting is also ~50x cheaper in ack spins.
 
 Found while investigating the fault above; it is **not** that bug, but a real latent hole under SMP.
 
