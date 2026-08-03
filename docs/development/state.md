@@ -12,15 +12,30 @@ type: state
 
 | Field | Value | Source |
 |---|---|---|
-| Kernel head | **1.56.34 — OPEN** (opened 2026-07-31, HDMI audio) | [`VERSION`](../../VERSION) |
-| Previous cut | 1.56.33 closed 2026-07-30, awaiting the user's tag | [`CHANGELOG.md`](../../CHANGELOG.md) |
-| `build/agnos` on disk | **1,928,888 B**, 2026-08-02 19:21:51 — **1.56.34 bare, burn-prep'd + stamped** `7942dde38773b217…`, FLASHABLE until something rebuilds it | `scripts/burn/burn-verify.sh` |
+| Kernel head | **1.56.35 — OPEN** (opened 2026-08-02, the desktop's kernel half) | [`VERSION`](../../VERSION) |
+| Previous cut | **1.56.34 closed 2026-08-02** (HDMI audio), awaiting the user's tag | [`CHANGELOG.md`](../../CHANGELOG.md) |
+| `build/agnos` on disk | 1,928,888 B, 2026-08-02 19:21:51 — a **1.56.34** artifact. ⛔ **STALE the moment 1.56.35 opened**: `version-bump.sh` regenerated `kernel/version.cyr`, so the source is newer than the build and `burn-verify` will now correctly refuse it. Nothing is flashable until a fresh `burn-prep.sh` | `scripts/burn/burn-verify.sh` |
 | Cyrius pin | **6.4.78** | `cyrius.cyml [package].cyrius` |
 | Bootloader | gnoboot **0.6.0**; Path C, `RDI = &boot_info`, magic `0x41474E4F`, entry `0x1000a8` | `gnoboot/VERSION` |
 | Iron target | archaemenid — Beelink SER NUC, AMD Cezanne APU, 4 CPUs, 64 GB. Build host **is** the target, so no serial channel exists. | — |
 
-**NEXT BITE — the DESKTOP iron burn** (user-directed 2026-08-02). Two commands, one boot: `iam`, then `aethersafha`. `iam` is the arming step — a *completed foreground run* is what used to poison the CPU's syscall stack for the next large binary (see the fix below), so a burn that launches the compositor first tests the easy case. The panel is the readout: crab's dual file panes + the probe window means the whole path works on silicon. Text variant if a photo is inconvenient: `aethersafha --clients` prints `run: exit 95` for both-presented and stops itself after 30 s.
-Outcomes: desktop with client windows ⇒ works · chrome but no clients ⇒ the `spawn_path` routing did not hold on iron · `run: exit 142` ⇒ the `#PF` is NOT the kstack bug · box resets ⇒ same fault, kstack fix incomplete.
+**NEXT BITE — ⛔ NOT the desktop iron burn. It was superseded the same day it was named.** The desktop
+burn assumed the remaining question was iron-only; it is not. `run /bin/aethersafha` is fault-killed
+(`exit 142`) **in QEMU under `-smp 4`** and passes under `-smp 1` — same kernel, same binaries. So the
+next bite is **K1: root-cause the PT_LOAD PDE-absent fault**, which needs no hardware.
+→ [`issues/2026-08-02-large-image-ptload-pde-absent-smp.md`](issues/2026-08-02-large-image-ptload-pde-absent-smp.md)
+⛔ **`AE_CLIENTS_SMP` defaults to `"1"`** (`scripts/harness/aethersafha-clients-test.py:114`), so every
+desktop QEMU proof to date has silently been single-CPU while archaemenid runs 4 with the SMP gates
+live. Re-run the ladder at `AE_CLIENTS_SMP=4` before believing any desktop green.
+
+**1.56.35 is the desktop's kernel half** — opened 2026-08-02, scope in [`CHANGELOG.md`](../../CHANGELOG.md). The full
+rationale per item, and the substrate matrix that decides what each proof is worth, live in aethersafha
+[`planning/desktop.md` §6](https://github.com/MacCracken/aethersafha/blob/main/docs/development/planning/desktop.md).
+Headline four: **K1** the SMP PDE fault · **K3** `spawn_path #43` never calls `exec_redirect_apply` so
+the desktop procs interleave on the console unserialised (this has already corrupted one verdict) ·
+**K4** raise the loader's user-image floor `0x200000` → `0x400000` (free — every binary already bases
+at 0x400000) · **K6** CHANGELOG `net_src_for` (`net.cyr:203-206`), which exists in the shipped kernel
+under no version at all, and is why setu's client comments cite 1.56.34 and 1.56.35 inconsistently.
 
 **LANDED 2026-08-02, QEMU-verified with a control, NOT yet burned — the syscall-kstack restore.** `execwait #37`'s step (h) restored this CPU's SYSCALL kernel stack to the **raw identity VA** `0xF10000 + cpu*0x10000` instead of its direct-map alias, while `syscall_kstack_reserve` and step (f) both use the direct map. Region 7's identity VA (14-16 MB) is inside the user-segment range, so **every completed foreground `run` re-armed the 1.51.x "ark won't run" fault** for any later proc whose image reached past 15.06 MB. `/bin/aethersafha` (14.87 MB) is the first binary large enough to hit it. Control: on the unfixed kernel the armed sequence **triple-faults the machine**; fixed, it reaches 2 clients connected + presented. New harness mode `AE_CLIENTS_MODE=armed` exists precisely because every prior mode launched the compositor as the boot's FIRST command and could not see this. Paired userland change: agnoshi routes the foreground through `spawn_path #43` + a waitpid poll (pipelines and `>` stay on `#37`).
 

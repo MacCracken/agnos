@@ -276,6 +276,18 @@ fn dm_read_cr3() {
     return result;
 }
 
+# Diagnostic: read the live CR2 — the faulting virtual address of the most recent #PF. Valid until
+# the NEXT page fault, so a fault handler may read it directly. Single-local frame -> result at
+# [rbp-8], mirroring dm_read_cr3 exactly (the regalloc-sensitive idiom; do not add locals).
+fn dm_read_cr2() {
+    var result = 0;
+    asm {
+        0x0F; 0x20; 0xD0;          # mov rax, cr2
+        0x48; 0x89; 0x45; 0xF8;    # mov [rbp-8], rax
+    }
+    return result;
+}
+
 # Diagnostic: read the live RSP. Single-local frame -> result at [rbp-8].
 fn dm_read_rsp() {
     var result = 0;

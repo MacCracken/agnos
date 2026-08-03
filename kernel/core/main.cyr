@@ -3015,6 +3015,16 @@ fn fault_disk_selftest() {
     # If the box SURVIVED the ring-3 fault, control reaches here (exec_and_wait resumed via
     # fault_kill_current -> kernel_resume). A canary-bar HALT never prints this line.
     kprintln("fault: SURVIVED back in kernel", 30);
+    # ⭐ ASSERT THE FAULT DIAGNOSTIC, because an instrument nobody checks is not an instrument.
+    # fault_kill_current now records `fault: pid=.. vec=.. cr2=0x..` into the klug ring (it cannot
+    # kprint — the FB may be unmapped under the faulting proc's CR3). The ring is invisible on
+    # serial, so this selftest is the only place the recording can be proven to happen AND to
+    # carry the right number. ⚠ This faulter reads a KNOWN address — `movabs rdi,0x140000000`
+    # — so the expected line is `cr2=140000000` exactly. A gate that merely checks the line
+    # EXISTS would pass on a garbage address, which is the failure mode that matters: a
+    # diagnostic reporting a plausible wrong number is worse than none.
+    kprintln("fault: klug ring follows (expect cr2=140000000)", 47);
+    klug_dump();
     return 0;
 }
 fault_disk_selftest();

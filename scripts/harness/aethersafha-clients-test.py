@@ -104,7 +104,14 @@ except FileNotFoundError: pass
 print(f"built image: {IMG}")
 
 qemu = subprocess.Popen([
+    # ⛔ CPU COUNT IS A LIVE VARIABLE, and it was silently 1 for every run of this harness while
+    # archaemenid reports `smp: cpus online: 4`. The 2026-08-02 desktop burn died at the nested
+    # spawn_path with `exit 142` where this harness reaches 2/2 — and SMP was one of only three
+    # differences (the others being a real GPU and 62 GB of RAM). A single-CPU harness cannot see
+    # a scheduling or per-CPU-state race, which is precisely the class that shows up when a
+    # scheduler-entered proc spawns another. AE_CLIENTS_SMP=4 matches iron.
     "qemu-system-x86_64", "-machine", "q35", "-m", "2048M", "-cpu", "max",
+    "-smp", os.environ.get("AE_CLIENTS_SMP", "1"),
     "-drive", f"if=pflash,format=raw,readonly=on,file={OVMF_CODE}",
     "-drive", f"if=pflash,format=raw,file={WORK}/vars.fd",
     "-drive", f"file={IMG},format=raw,if=none,id=disk0",
@@ -176,11 +183,15 @@ try:
 
     def verdict(seg, label):
         code = None
-        for line in seg.splitlines():
-            t = line.strip()
-            if t.startswith("run: exit "):
-                try: code = int(t.split()[-1])
-                except ValueError: pass
+        # ⛔ DO NOT ANCHOR THIS TO THE START OF A LINE. agnos prints from several procs onto one
+        # console with no locking, so `run: exit 142` routinely lands MID-LINE — a real capture
+        # read `aethersafha: a11y nodes synced:run: exit 142`, which `startswith` missed, so the
+        # run reported exit=None, the klug dump was skipped, and the fault evidence was discarded
+        # on a boot that had produced it. Search anywhere in the segment instead.
+        import re as _re
+        for m in _re.finditer(r"run: exit (-?\d+)", seg):
+            try: code = int(m.group(1))
+            except ValueError: pass
         p(f"  [{label}] launched   :", "launched setu client #1" in seg)
         p(f"  [{label}] connected  :", seg.count("setu client connected"))
         p(f"  [{label}] presented  :", seg.count("setu client presented surface"))
@@ -258,6 +269,18 @@ try:
         p("background `aethersafha --clients &` (agnsh spawn_path #43)...")
         bg = run_wait("aethersafha --clients &\n", "probe ran for milliseconds", timeout=180)
         bg_code = verdict(bg, "bg")
+
+    # ⭐ IF ANYTHING WAS FAULT-KILLED, GET THE ADDRESS. `fault_kill_current` records
+    # `fault: pid=.. vec=.. cr2=0x..` into the klug ring and CANNOT print it (the FB may be
+    # unmapped under the faulting proc's CR3), so the ring is the only copy. Dumping it costs one
+    # command and turns `exit 142` — which names only the vector — into a located fault.
+    if (fg_code == 142) or (bg_code == 142):
+        p("fault-killed: dumping the klug ring for the CR2 line...")
+        typ("klug\n", settle=1.0)
+        time.sleep(8.0)
+        for line in ser().splitlines():
+            if line.startswith("fault: pid="):
+                p("  ⇒", line.strip())
 
     # ⛔ SERIAL IS THE COMPOSITOR'S OWN CLAIM, NOT EVIDENCE OF PIXELS. "setu client presented
     # surface" is printed by the same program being judged — a shared-premise oracle. The setu smoke

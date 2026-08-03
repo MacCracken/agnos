@@ -19,7 +19,78 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ---
 
-## [1.56.34] — 2026-07-31 — HDMI audio: CRC null-case calibration (cycle OPEN)
+## [1.56.35] — 2026-08-02 — the desktop's kernel half (cycle OPEN)
+
+Scope: what the sovereign desktop needs from the kernel to host real client windows. Opened the day
+1.56.34 closed, because the desktop's remaining blocker turned out to be a kernel fault that
+reproduces in QEMU — not, as assumed when the iron burn was scheduled, a hardware-only question.
+
+Full rationale per item, and the substrate matrix that decides what each proof is worth, live in
+aethersafha [`docs/development/planning/desktop.md`](https://github.com/MacCracken/aethersafha/blob/main/docs/development/planning/desktop.md).
+
+### Open — the cut's work, none of it landed yet
+
+- **A large binary reaches ring 3 with one of its own PT_LOAD PDEs absent, under SMP only.**
+  `run /bin/aethersafha` (15.6 MB) is fault-killed — `exit 142` (128 + vector 14) — after it binds its
+  setu listener, at or just after the nested `spawn_path #43`. Reproduces at `-smp 4`, passes at
+  `-smp 1`, same kernel and same binaries. Page is **absent** (error bit 0 = 0), proc is on its **own**
+  address space (`cr3 == own`), and the victim slot **moves** between runs (`idx=3` image data,
+  `idx=0x1fe` user stack). Probe: instrument the PT_LOAD mapping loop of `elf_load_from_file` — the
+  **#43** path, not the in-memory `#3` path — reading each PDE back through `cr3 → PML4[0] → PDPT[0] → PD`
+  immediately after `proc_map_page`. Tracked at
+  [`issues/2026-08-02-large-image-ptload-pde-absent-smp.md`](docs/development/issues/2026-08-02-large-image-ptload-pde-absent-smp.md).
+- **`spawn_path #43` never calls `exec_redirect_apply`** (`syscall.cyr:7618-7701`; `#37` does, at
+  `:7166`), so concurrent desktop procs interleave on the console unserialised. This has already
+  corrupted one verdict — `a11y nodes synced:run: exit 142` landed mid-line and the klug dump was
+  skipped on a boot that carried the evidence. Arm per-CPU, one-shot, applied to the **child's private**
+  fd table between `proc_set_ring3` and `proc_set_state(pid, 1)`.
+- **Raise the ELF loader's user-image floor** `0x200000` → `0x400000` (`elf.cyr:253`, `:277`). Today a
+  segment could override PD[1], where the boot TSS RSP0 seeds live (`gdt.cyr:45-48`). Measured: every
+  binary in the tree already bases its first PT_LOAD at `0x400000`, so the change costs nothing and
+  retires the class.
+- **A terminal needs a controlling-channel primitive — an agnos PTY "of sorts".** `pty|ptmx|devpts|
+  termios|TIOC` across `kernel/` returns **zero hits**, so a terminal emulator on the desktop has
+  nothing to host. Not a POSIX PTY port: the shape is agnos-native and it converges with the local-IPC
+  question below — a pty is a channel plus inheritance plus a line discipline, and agnos is missing the
+  first two for a `spawn_path` child.
+- **Local IPC / what an agnos socket is.** The sovereign display protocol currently runs its control
+  channel over **TCP on loopback:7700**, which drags a DHCP dependency into a local display protocol, a
+  `net_ip == 0` case unfixable from ring 3, and a `sock_connect #47` that holds preempt disabled for the
+  whole attempt. Design call, not a patch. Any kernel half lands here. Candidates, constraints and the
+  outstanding decision: [`planning/ipc.md`](docs/development/planning/ipc.md).
+- **`net_config #61`**: surface `lo_dropped` (`net.cyr:22`, incremented at `:210`) and `lo_count`.
+  `lo_dropped` is currently incremented and **never printed anywhere**, while a lo-ring drop costs a
+  full 1 s TCP RTO.
+- **A ring-3 socket read has no non-blocking form, and every setu client polls one every frame.** A
+  tagged socket fd's `sys_read` routes to the cyrius stdlib's `_agnos_sock_recv_block`, which polls
+  `sock_recv #49` under a **30 s wall-clock deadline** and a 6000-spin backstop, returning 0 for both
+  EOF **and** timeout. There is no way for ring 3 to ask "is there a byte waiting?" and get an
+  immediate answer, so a client's per-frame input poll is a blocking call wearing a non-blocking name.
+  ⚠ Measured state: the desktop runs at ~10 ms/frame in QEMU, so in practice data is pending on the
+  polls that matter — this is a latent hazard, not an observed stall, and the fix wants a measurement
+  before a design. Kernel-side options: a `sock_pending`-style query, or a documented non-blocking
+  recv the stdlib can expose without the deadline wrapper.
+
+## [1.56.34] — 2026-07-31 — HDMI audio: CRC null-case calibration
+
+### Added — `net_src_for`: an outbound segment's source is derived from its destination
+
+`net_src_for` (`kernel/core/net.cyr:203-206`) picks the source address for an outbound segment from the
+destination it is headed to, instead of stamping `net_ip` on everything. A loopback SYN therefore goes
+out `src = dst = 127.0.0.1`, its SYN-ACK comes back on a 4-tuple the client's own conn matches, and
+`tcp_find_conn` finds it.
+
+Before this, a ring-3 client dialling `127.0.0.1` got `sock_connect #47` returning **-1 instantly** with
+its own conn slot zeroed — not a handshake timeout, which is what made it read as a client bug for so
+long. It is what setu 0.7.2 worked around from userland by dialling `sys_net_ip()`; with `net_src_for`
+that workaround is unnecessary and setu 0.7.3 reverts it.
+
+⚠ Recorded retroactively at the 1.56.34 close: the function landed during this cycle (2026-08-02) but
+was never written up, so consumers had no version to name and setu's client comments cited 1.56.34 and
+1.56.35 inconsistently. **`>= 1.56.34` is the correct requirement.**
+
+⚠ Unchanged and still a kernel-side gap: `net_ip == 0` (no NIC ⇒ no DHCP) remains unfixable from ring 3,
+because a reply's destination would be 0, which `net_is_loopback` explicitly excludes.
 
 ### Fixed — ⛔ A COMPLETED FOREGROUND `run` LEFT THE CPU'S SYSCALL STACK AT AN ADDRESS LARGE PROGRAMS OVERWRITE
 

@@ -381,6 +381,70 @@ fn kernel_resume() {
 fn fault_kill_current(vector) {
     var pid = proc_current_get();
     var code = 128 + vector;
+    # ⭐ SAY WHERE THE FAULT WAS, not merely that there was one. Until this line, the ONLY record a
+    # fault-killed proc left was `128 + vector` — so `run: exit 142` meant "#PF killed it" and
+    # nothing more: no address, no localisation. That is not enough to iterate on an IRON-ONLY
+    # fault, which is exactly the class this path exists to explain (the 2026-08-02 desktop burn:
+    # the compositor died at its nested `spawn_path` with no way to ask which address).
+    # ⛔ kprint IS genuinely unsafe here — the FB may be unmapped under the faulting proc's CR3
+    # (idt.cyr's canary-paint #DF note), and that comment is why this path stayed mute. But
+    # `klug_append` is pure store8 + integer math into a kernel-resident ring, which is mapped
+    # under every per-proc CR3; the same property that makes it safe at the earliest boot makes it
+    # safe here. Read it after the box survives: `run /bin/klug > /f.txt`.
+    # ⚠ CR2 is valid until the NEXT page fault, so it must be read here, before anything else runs.
+    var fk_hex[16];                                   # fn-local var[N] = N BYTES; 16 hex digits exactly
+    var fk_n = 0;
+    klug_append("fault: pid=", 11);
+    fk_n = fmt_hex_buf(pid, &fk_hex);       klug_append(&fk_hex, fk_n);
+    klug_append(" vec=", 5);
+    fk_n = fmt_hex_buf(vector, &fk_hex);    klug_append(&fk_hex, fk_n);
+    klug_append(" cr2=0x", 7);
+    fk_n = fmt_hex_buf(dm_read_cr2(), &fk_hex);  klug_append(&fk_hex, fk_n);
+    # ⭐ THE ERROR CODE AND THE FAULTING RIP WERE ALREADY BEING CAPTURED AND THROWN AWAY. The #PF
+    # stub (idt.cyr) stamps CMOS **before** it dispatches to this kill path: 0x5F = the error-code
+    # low byte, 0x63-0x66 = the faulting RIP's low 32 bits. Nothing ever read them back on a
+    # SURVIVABLE kill — they were built for the halt/reboot path, where CMOS is the only medium that
+    # outlives the box. Reading them here costs four port reads and turns "something faulted at
+    # address X" into "this instruction did this KIND of access to X".
+    # ⚠ ERROR-CODE BITS (SDM Vol.3 4.7): 0=P (0 -> page NOT PRESENT / not visible to this CPU,
+    # 1 -> protection violation on a present page) · 1=W/R (1 -> the access was a WRITE) ·
+    # 2=U/S (1 -> the access was from RING 3) · 3=RSVD · 4=I/D (1 -> INSTRUCTION FETCH, i.e. the
+    # proc jumped into a page it may not execute — the NX/W^X signature).
+    # That present-bit alone splits "the mapping is not visible here" (a TLB/CR3/SMP problem) from
+    # "the mapping is visible and refused the access" (a permissions problem), which is the exact
+    # fork the desktop's spawn fault sits on.
+    klug_append(" err=0x", 7);
+    fk_n = fmt_hex_buf(cmos_read(0x5F), &fk_hex);   klug_append(&fk_hex, fk_n);
+    var fk_rip = cmos_read(0x63) | (cmos_read(0x64) << 8) | (cmos_read(0x65) << 16) | (cmos_read(0x66) << 24);
+    klug_append(" rip=0x", 7);
+    fk_n = fmt_hex_buf(fk_rip, &fk_hex);            klug_append(&fk_hex, fk_n);
+    # ⭐ IS THE PROC EVEN RUNNING ON ITS OWN ADDRESS SPACE? A not-present fault has two very
+    # different causes that no address can separate: the mapping vanished from THIS proc's tables,
+    # or the CPU is running this proc on ANOTHER proc's CR3. They are indistinguishable by CR2
+    # because every ring-3 image loads at the same 0x400000, so a small child's CR3 maps the
+    # 2 MB page the parent is executing from (PD[2]) while lacking the ones a large parent needs.
+    # Print both and the ambiguity is gone: live != own ⇒ a scheduler/context-switch defect;
+    # live == own ⇒ the page tables really did lose the entry.
+    # ⚠ Low 32 bits only — CR3s here are well under 4 GB and the line stays readable.
+    klug_append(" cr3=0x", 7);
+    fk_n = fmt_hex_buf(dm_read_cr3() & 0xFFFFF000, &fk_hex);   klug_append(&fk_hex, fk_n);
+    klug_append(" own=0x", 7);
+    fk_n = fmt_hex_buf(proc_get_cr3(pid) & 0xFFFFF000, &fk_hex); klug_append(&fk_hex, fk_n);
+    # ⭐ THE RAW PD ENTRY FOR THE FAULTING ADDRESS. cr3 == own proves the proc is on its own
+    # address space, so a not-present fault means the ENTRY itself is wrong — and there are two
+    # very different wrongs: 0 (never mapped, or cleared out from under it) versus non-zero with
+    # bad flags (mapped but, say, present-bit cleared or the wrong physical frame). Walking the
+    # same PML4[0]->PDPT[0]->PD path proc_map_page_nx writes through keeps this honest: if the
+    # walk disagrees with the hardware, the walk is what is wrong, not the CPU.
+    var fk_pml4e = load64(dm_read_cr3() & 0xFFFFF000);
+    var fk_pdpte = load64(fk_pml4e & 0xFFFFFFFFF000);
+    var fk_pd    = fk_pdpte & 0xFFFFFFFFF000;
+    var fk_pde   = load64(fk_pd + ((dm_read_cr2() >> 21) & 0x1FF) * 8);
+    klug_append(" pde=0x", 7);
+    fk_n = fmt_hex_buf(fk_pde, &fk_hex);            klug_append(&fk_hex, fk_n);
+    klug_append(" idx=", 5);
+    fk_n = fmt_hex_buf((dm_read_cr2() >> 21) & 0x1FF, &fk_hex);  klug_append(&fk_hex, fk_n);
+    klug_putc(10);
     sys_exit_code = code;
     proc_set_exit_code(pid, code);
     flock_release_pid(pid);                       # release advisory locks (mirror exit#0)
