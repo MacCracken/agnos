@@ -220,6 +220,36 @@ try:
         time.sleep(6.0)
         bg = ser()
         bg_code = verdict(bg, "desktop")
+    if MODE == "armed":
+        # ⭐ THE ARMED-STATE TEST, and the reason every other mode in this file was blind to a real
+        # kernel defect: they all launch the compositor as the FIRST command of the boot.
+        #
+        # `syscall_kstack_reserve` (syscall_hw.cyr) sets each CPU's SYSCALL kstack to the DIRECT-MAP
+        # VA, deliberately, because region 7's identity VA (14-16 MB) lies inside the user-segment
+        # range and a large binary's PT_LOADs override that PD entry in its own per-proc CR3. Until
+        # 1.56.35 the execwait #37 handler's step (h) restored the RAW identity VA instead, so a
+        # completed FOREGROUND run silently re-armed the pre-1.51.x fault for the rest of the boot.
+        # Any proc whose image reaches past 0xF10000 (15.06 MB) then #PF'd at CPL0 on its next
+        # syscall. /bin/aethersafha is 14.87 MB loaded at >= 2 MB — the first binary in this system
+        # big enough to be in range, which is why nothing else ever tripped it.
+        #
+        # So: run a SMALL program to completion through #37 first (arming the pointer), THEN launch
+        # the compositor. On a kernel without the fix this is expected to fault where plain "bg"
+        # mode passes; that difference IS the test.
+        # ⛔ The marker must be something the ARMING PROGRAM prints. The first cut waited for
+        # "run: exit", which agnsh emits ONLY on a non-zero code — so a SUCCESSFUL `iam` printed
+        # nothing, the step reported "completed: False", and the run could not testify that the
+        # pointer was ever armed. The verdict was unfalsifiable in the direction that mattered.
+        p("arming: foreground `iam` via execwait #37 (restores the CPU's syscall kstack)...")
+        arm = run_wait("iam\n", "Distro: AGNOS", timeout=90)
+        armed_ok = "Distro: AGNOS" in arm
+        p("  [arm] foreground run completed:", armed_ok)
+        if not armed_ok:
+            p("  ⛔ ARMING DID NOT RUN — this boot tests nothing. Do not read the verdict below.")
+        time.sleep(2.0)
+        p("background `aethersafha --clients &` AFTER a completed foreground run...")
+        bg = run_wait("aethersafha --clients &\n", "probe ran for milliseconds", timeout=180)
+        bg_code = verdict(bg, "armed")
     if MODE in ("bg", "both"):
         # BACKGROUND: agnsh routes a trailing `&` to spawn_path #43 (run_agnos.cyr:172), so the
         # compositor becomes an independently scheduled proc — the same shape as the kernel hook.
@@ -278,6 +308,16 @@ try:
         ok = (bg_code == 95)
         p(f"  foreground desktop (no &): clients presented = {'2+' if ok else 'FEWER THAN 2'}")
         p("  Judge this on the FRAMEBUFFER counts above and the PPM, not on the serial alone.")
+        rc = 0 if ok else 1
+        raise SystemExit(rc)
+    if MODE == "armed":
+        # ⛔ Do NOT fall through to the fg/bg comparison — this mode runs neither of those, and the
+        # shared verdict block reports "Neither path reached 95" for a single-mode run, which reads
+        # as a desktop failure when it only means "the other mode was not run in this boot".
+        ok = (bg_code == 95)
+        p(f"  after a completed foreground #37, backgrounded clients presented: {'2 (PASS)' if ok else 'FEWER THAN 2 (FAIL)'}")
+        p("  Compare against AE_CLIENTS_MODE=bg on the same kernel: bg passing while armed fails")
+        p("  means the completed foreground run — not the compositor — broke the following proc.")
         rc = 0 if ok else 1
         raise SystemExit(rc)
     p(f"  foreground exit {fg_code} · background exit {bg_code}")

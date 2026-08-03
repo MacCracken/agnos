@@ -178,6 +178,33 @@ fn net_is_loopback(dst_ip) {
     return 0;
 }
 
+# net_src_for(dst_ip) — the SOURCE address to put on a packet headed for dst_ip.
+#
+# ⛔ THIS EXISTS BECAUSE EVERY OUTBOUND SEGMENT USED TO CLAIM `net_ip` AS ITS SOURCE, INCLUDING
+# LOOPBACK ONES, AND THAT BREAKS 127.0.0.1 ENTIRELY. A SYN to 127.0.0.1 went out with src = net_ip,
+# so the passive open recorded the peer as net_ip and sent its SYN-ACK back to net_ip — while the
+# connecting side's conn holds dst_ip = 127.0.0.1. `tcp_find_conn(..., src_ip)` then finds no match,
+# the reply lands on an unknown 4-tuple, and `sock_connect` #47 returns -1 with its own slot zeroed.
+# The desktop's compositor<->client handshake could therefore never complete on a real boot; it was
+# masked in the one place anyone tested it by AETHERSAFHA_SETU_SELFTEST assigning
+# `net_ip = 0x7F000001`, which made src and dst agree by accident.
+#
+# ⭐ Every other stack does this and it is not novel: the source address comes from the ROUTE, and
+# the loopback route's source is 127.0.0.1. Only the destination's shape decides it.
+#
+# ⚠ ONLY 127.x REWRITES. `net_is_loopback` is deliberately NOT the test here — it also answers 1 for
+# `dst == net_ip` (a host dialling its own real address), and that case must keep net_ip as the
+# source so the 4-tuple stays (net_ip -> net_ip). Using net_is_loopback here would rewrite it to
+# 127.0.0.1 and break the case that already worked.
+#
+# ⭐ Fixes the NIC-less box too: with no DHCP `net_ip` is 0, so a loopback packet used to carry
+# src = 0 and the reply went to dst = 0, which is not loopback and got handed to a NIC that is not
+# there. A loopback source is correct with or without a NIC.
+fn net_src_for(dst_ip) {
+    if (((dst_ip >> 24) & 0xFF) == 127) { return 0x7F000001; }
+    return net_ip;
+}
+
 # Copy a fully-framed eth frame into the loopback queue (drop + count on full). 1.49.0 loopback bite 1.
 fn net_lo_enqueue(buf, len) {
     if (lo_count >= 8) { lo_dropped = lo_dropped + 1; return 0 - 1; }
@@ -239,7 +266,7 @@ fn udp_send(dst_ip, src_port, dst_port, data, data_len) {
     var p = &net_pkt;
     var off = eth_build(p, &dst_mac, &kmac, 0x0800);
     var udp_len = udp_build(p + off + 20, src_port, dst_port, data, data_len);
-    ip_build(p + off, net_ip, dst_ip, 17, udp_len);
+    ip_build(p + off, net_src_for(dst_ip), dst_ip, 17, udp_len);   # route-derived source (see net_src_for)
     return net_tx(p, off + 20 + udp_len);
 }
 

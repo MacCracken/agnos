@@ -32,7 +32,7 @@ fn icmp_send_echo_reply(src_ip, icmp_msg, icmp_len) {
     var ck = ip_checksum(p + off + 20, icmp_len);
     store8(p + off + 20 + 2, (ck >> 8) & 0xFF);
     store8(p + off + 20 + 3, ck & 0xFF);
-    ip_build(p + off, net_ip, src_ip, 1, icmp_len);
+    ip_build(p + off, net_src_for(src_ip), src_ip, 1, icmp_len);   # reply source matches the requester (see net_src_for)
     return net_tx(p, off + 20 + icmp_len);           # 1.49.0 loopback bite 2: echo reply loops too
 }
 
@@ -88,7 +88,7 @@ fn icmp_ping(dst_ip) {
     for (var i = 0; i < 32; i = i + 1) { store8(m + 8 + i, 0x41 + (i & 0x0F)); }
     var ck = ip_checksum(m, icmp_len);
     store8(m + 2, (ck >> 8) & 0xFF); store8(m + 3, ck & 0xFF);
-    ip_build(p + off, net_ip, dst_ip, 1, icmp_len);
+    ip_build(p + off, net_src_for(dst_ip), dst_ip, 1, icmp_len);   # route-derived source (see net_src_for)
 
     icmp_reply_seen = 0;
     var start = timer_ticks;

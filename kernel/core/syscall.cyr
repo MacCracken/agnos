@@ -7118,12 +7118,20 @@ fn ksyscall(num, arg1, arg2, arg3) {
         exec_redirect_restore();
 
         # (h) restore THIS CPU's PRIMARY SYSCALL kstack top so agnsh's own subsequent
-        # syscalls go back on 0xF10000+cpu*0x10000. 1.46.x 4b: the stub reads
+        # syscalls go back on its primary top. 1.46.x 4b: the stub reads
         # pcpu_syscall_kstack_top at runtime (r8*8+disp32), so NO syscall_init() stub
         # rebuild is needed — just re-point this CPU's slot at its primary top. (The MSR
         # programming syscall_init also did is unchanged from boot; nothing here
         # invalidates it, and exec_and_wait's own syscall_init already re-ran it.)
-        store64(&pcpu_syscall_kstack_top + pcpu_cpu() * 8, 0xF10000 + pcpu_cpu() * 0x10000);
+        # ⛔ MUST be the DIRECT-MAP VA, matching syscall_kstack_reserve (syscall_hw.cyr) and
+        # step (f)'s copy from pcpu_syscall_kstack_top2 — NOT the raw identity VA. Region 7's
+        # identity VA (14-16 MB) sits INSIDE the user-segment range (elf_load maps PT_LOADs to
+        # 256 MB), so a large binary's segments override that PD entry in its own per-proc CR3
+        # and the next SYSCALL loads RSP into a page the image clobbered -> #PF at CPL0. This
+        # line wrote the raw form, so every completed foreground #37 silently reverted the CPU
+        # to the pre-1.51.x address and re-armed the "ark won't run" fault for any large proc
+        # that ran afterwards.
+        store64(&pcpu_syscall_kstack_top + pcpu_cpu() * 8, DIRECTMAP_BASE + 0xF10000 + pcpu_cpu() * 0x10000);
 
         # (i) read the child's exit code (from the GLOBAL pid) BEFORE reaping (reap
         # collapses the slot), then reap: proc_reap_child frees the child's address

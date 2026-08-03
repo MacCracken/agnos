@@ -302,11 +302,14 @@ fn tcp_send_pkt(conn_id, flags, data, data_len) {
     memcpy(p + tcp_off + tcp_hdr_len + opt_len, data, data_len);
     var tcp_total = tcp_hdr_len + opt_len + data_len;
     # Compute TCP checksum
-    var cksum = tcp_checksum_compute(net_ip, dst_ip, p + tcp_off, tcp_total);
+    # ⛔ SOURCE COMES FROM THE ROUTE, NOT FROM net_ip. A loopback destination takes a loopback
+    # source, or the peer's reply is addressed somewhere this conn cannot match. See net_src_for.
+    var src_ip = net_src_for(dst_ip);
+    var cksum = tcp_checksum_compute(src_ip, dst_ip, p + tcp_off, tcp_total);
     store8(p + tcp_off + 16, (cksum >> 8) & 0xFF);
     store8(p + tcp_off + 17, cksum & 0xFF);
     # Build IP header (proto=6 for TCP)
-    ip_build(p + off, net_ip, dst_ip, 6, tcp_total);
+    ip_build(p + off, src_ip, dst_ip, 6, tcp_total);
     return net_tx(p, off + 20 + tcp_total);          # 1.49.0 loopback bite 2: 127.x/net_ip → lo queue
 }
 
