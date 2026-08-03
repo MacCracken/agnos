@@ -285,13 +285,29 @@ try:
     # `fault: pid=.. vec=.. cr2=0x..` into the klug ring and CANNOT print it (the FB may be
     # unmapped under the faulting proc's CR3), so the ring is the only copy. Dumping it costs one
     # command and turns `exit 142` — which names only the vector — into a located fault.
-    if (fg_code == 142) or (bg_code == 142):
-        p("fault-killed: dumping the klug ring for the CR2 line...")
+    # ⭐ AE_CLIENTS_KLUG=1 dumps the ring on a PASSING run too. Added 2026-08-03 for ELF_PDE_PROBE:
+    # a diagnostic must be provable against a KNOWN answer before its output is trusted, and the
+    # known answer here is the -smp 1 boot that passes. Without this the probe's PDE lines only ever
+    # surface on the failing run — i.e. exactly the run whose output you cannot yet believe.
+    want_klug = (fg_code == 142) or (bg_code == 142) or os.environ.get("AE_CLIENTS_KLUG") == "1"
+    if want_klug:
+        p("dumping the klug ring...")
         typ("klug\n", settle=1.0)
         time.sleep(8.0)
+        n_match = 0
+        n_mismatch = 0
         for line in ser().splitlines():
-            if line.startswith("fault: pid="):
-                p("  ⇒", line.strip())
+            kl = line.strip()          # ⚠ NOT `s` — that name is the monitor socket further down
+            if kl.startswith("fault: pid="):
+                p("  ⇒", kl)
+            if "pdeprobe" in kl:
+                if kl.endswith("MATCH"):
+                    n_match += 1
+                else:
+                    n_mismatch += 1
+                    p("  ⇒", kl)
+        if (n_match + n_mismatch) > 0:
+            p("  pdeprobe: %d MATCH, %d MISMATCH" % (n_match, n_mismatch))
 
     # ⛔ SERIAL IS THE COMPOSITOR'S OWN CLAIM, NOT EVIDENCE OF PIXELS. "setu client presented
     # surface" is printed by the same program being judged — a shared-premise oracle. The setu smoke

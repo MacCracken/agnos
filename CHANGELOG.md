@@ -56,8 +56,8 @@ aethersafha [`docs/development/planning/desktop.md`](https://github.com/MacCrack
 - **Local IPC / what an agnos socket is.** The sovereign display protocol currently runs its control
   channel over **TCP on loopback:7700**, which drags a DHCP dependency into a local display protocol, a
   `net_ip == 0` case unfixable from ring 3, and a `sock_connect #47` that holds preempt disabled for the
-  whole attempt. Design call, not a patch. Any kernel half lands here. **Decided 2026-08-03: `naadi`** —
-  one syscall `#96 nd_op`, VFS tag `VFS_NAADI = 11`, kernel band `nd_*`, ops `0x00`–`0x09` with `0x0A`
+  whole attempt. Design call, not a patch. Any kernel half lands here. **Decided 2026-08-03: `anu`** —
+  one syscall `#96 an_op`, VFS tag `VFS_ANU = 11`, kernel band `an_*`, ops `0x00`–`0x09` with `0x0A`
   `ND_HANDOFF` / `0x0B` `ND_DIAL` reserved and their caps bits clear. ⚠ `#96` is contested with `fork`
   (`docs/development/roadmap.md:41`); whichever lands first takes it and the other takes `#97`. Design,
   migration and kill criteria: [`planning/ipc.md`](docs/development/planning/ipc.md) §9.
@@ -1196,7 +1196,7 @@ deleted. ⚠ **This retracts the PROOF, not the kernel shm band below**: `shm_cr
 `docs/development/planning/ipc.md` §10.
 
 ⛔ **RETIRED 2026-08-03 (a separate claim from the one above)** — TCP-on-loopback is no longer the desktop
-transport, by operator ruling; the replacement is the agnos socket **`naadi`** (`planning/ipc.md` §9). Lines in
+transport, by operator ruling; the replacement is the agnos socket **`anu`** (`planning/ipc.md` §9). Lines in
 this entry are marked with whichever applies: *false green* = the evidence was rigged; *retired* = the result
 was real but the path is gone.
 
@@ -1215,7 +1215,7 @@ was real but the path is gone.
   why large frames went on shm) — but pixels leaving the wire for shm, and later PCM doing the same in a second
   subsystem, was the TRANSPORT being falsified, not a chunking technique worth keeping. **Parts 1-3 — cooperative
   yield · server-first · post-`sched_active` launch — STAND.** ⚠ The recipe was also only ever exercised against a
-  listener on TCP loopback, a transport RETIRED 2026-08-03 in favour of `naadi`; see `planning/ipc.md` §9-§10.
+  listener on TCP loopback, a transport RETIRED 2026-08-03 in favour of `anu`; see `planning/ipc.md` §9-§10.
 - Proof file exactly **245,760 B** (320×192×4); composited PPM had 2,032 green-border and 61,440 non-black pixels.
   ⚠ **QUALIFIED 2026-08-03 — this is the LINUX proof** (`setu_serve_probe` + `present_probe`, file backend). It is
   HONEST, it is unaffected by the selftest hook, and it STANDS. It is not, and never was, on-agnos evidence.
@@ -1231,7 +1231,7 @@ was real but the path is gone.
   and it **did** happen there: `aethersafha-clients-test.py` reached "connected: 2, presented: 2" un-rigged on
   2026-08-02 (QEMU `-smp 1`; never on iron).
   ⚠ The `tcp_send_pkt` loopback gate itself is a real fix and STANDS — only the enablement claim is withdrawn.
-  ⚠ Separately: TCP-on-loopback as the DISPLAY transport is RETIRED 2026-08-03 in favour of `naadi`
+  ⚠ Separately: TCP-on-loopback as the DISPLAY transport is RETIRED 2026-08-03 in favour of `anu`
   (`planning/ipc.md` §9); see §10.
 - The two-proc handshake blocker was root-caused via the QEMU monitor as a **console_lock preemption deadlock** (RIP
   spinning on a held lock, IF=0), fixed by flipping the proc READY after kmain's last `kprint` — NOT the stub `#DF`

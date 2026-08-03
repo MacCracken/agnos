@@ -1,6 +1,51 @@
 # A large binary reaches ring 3 with one of its own PT_LOAD PDEs absent (SMP only)
 
-**Opened** 2026-08-02 · **Status** OPEN, root cause NOT established · **Repro** QEMU, no hardware needed
+**Opened** 2026-08-02 · **Status** OPEN — root cause not established, but **the field is halved** · **Repro** QEMU, no hardware needed
+
+## ⭐ 2026-08-03 — THE MAPPING LANDS. SOMETHING UNDOES IT.
+
+`ELF_PDE_PROBE` (build flag, `scripts/build.sh`) reads every PT_LOAD and stack PDE back **immediately
+after** `elf_load_from_file` maps it, through the same `cr3 → PML4[0] → PDPT[0] → PD` walk, **and
+through the PD[511]-stashed user PML4 as well**. Result:
+
+| run | probe at map time | outcome |
+|---|---|---|
+| `-smp 1` | **21 MATCH, 0 MISMATCH** | passes, `exit 95`, 2 connected + presented |
+| `-smp 4` | **18 MATCH, 0 MISMATCH** | `exit 142`; pid 6 and 7 fault at `idx=1fe` with `pde=0` |
+
+**Every PDE is correct in BOTH tables when the loader writes it.** The entry the CPU later consults
+reads 0. So of the two stories no fault address could separate:
+
+- ~~(1) the PDE write never landed~~ — **ELIMINATED BY MEASUREMENT.**
+- **(2) it landed and something undid it later — this is what is happening.**
+
+That retires the whole "loader is wrong" class: header TOCTOU, bad `p_vaddr`, allocation failure,
+wrong segment bounds. **The next question is solely: what clears PD[510] after load?**
+
+⚠ **Both `-smp 4` victims were the USER STACK (`idx=1fe` = PD[510])**, not image data, on procs 6 and 7
+simultaneously, each on its own CR3.
+
+### Also eliminated by source review the same day (no runs spent)
+
+- **PMM double-allocation under SMP** — `pmm_alloc`, `pmm_free`, `pmm_alloc_2mb`, `pmm_alloc_2mb_run`
+  and `pmm_free_2mb` all hold `pmm_spin_lock` across scan-and-claim.
+- **Reap frees an address space still in use** — `proc_reap_off_cpu_fence` is present and correctly
+  ordered on **both** `proc_reap` and `proc_reap_child`: `proc_set_state(pid,0)` → detach CR3 → fence
+  → `proc_free_address_space`.
+- **ELF header TOCTOU between two CPUs** — already fixed at 1.46.8; `pcpu_elf_hdr_buf` is per-CPU and
+  its sizing is correct (`var[2048]` = 2048×u64 = 4 CPUs × 4096 B, matching `pcpu_cpu() * 4096`).
+
+### ⛔ Instrument note — this probe was wrong once before it was right (make it five)
+
+The first version walked only the **kernel-view** PD (the `new_cr3` handed to `proc_map_page_nx`),
+while `fault_kill_current` walks `dm_read_cr3()` — the **live** CR3, which for a ring-3 fault is the
+**user** PML4 from the PD[511] stash. **Two different tables.** It reported "63 MATCH" against a
+`pde=0` fault, which reads as a proven "landed then undone" and is nothing of the sort — the two
+readings were not about the same memory. `proc_map_page_nx` mirrors into the user PML4 **only if the
+stash is non-zero**, so "kernel PD fine, user PD empty" was a live possibility the probe could not
+see. Now it reads both and its verdict names which table is wrong (`KPD_BAD` / `UPD_BAD` / `NOSTASH`).
+**Checking one table and concluding about the other** is the fifth way a diagnostic has been wrong on
+this fault. Validate against the `-smp 1` boot that passes before believing anything it says.
 
 ## Symptom
 

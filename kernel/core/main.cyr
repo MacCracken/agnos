@@ -3224,7 +3224,7 @@ kprintln("exec: mishtone returned", 23);
 # `msh_client_connect` succeeds — i.e. only on a completed loopback:7701 TCP handshake.
 # jalwa's own retraction (audio.cyr:76-80) states that connect will not complete on an
 # ordinary agnos boot, so the smoke's "PASS — jalwa plays THROUGH the mishran mixer"
-# was unreachable. TCP-on-loopback is not the local-IPC transport; naadi is. See
+# was unreachable. TCP-on-loopback is not the local-IPC transport; anu is. See
 # docs/development/planning/ipc.md §9/§10. The in-process mixer proof survives as
 # MISHRAN_AUDIO_SELFTEST above (/bin/mishtone, msh_router_* only, no sockets).
 
@@ -4828,7 +4828,7 @@ asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x10; 0xE6; 0x71; }
 #
 # The premise is dead ANYWAY, and not because it was broken: TCP-on-loopback is the WRONG
 # PRIMITIVE for local display IPC and is NOT the desktop/display transport. The
-# replacement is the agnos socket (`naadi`). See docs/development/planning/ipc.md §9-§10.
+# replacement is the agnos socket (`anu`). See docs/development/planning/ipc.md §9-§10.
 # TCP stays — agnos is A General NETWORKED Operating System and TCP is correct for the
 # NETWORK. What is retired is a display protocol riding it.
 #

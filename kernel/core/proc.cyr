@@ -942,6 +942,92 @@ fn proc_map_page_nx(cr3, virt, phys) {
     return 0;
 }
 
+# === ELF_PDE_PROBE (2026-08-03) — read a PDE back through the SAME walk that wrote it =========
+# WHY: `run /bin/aethersafha` (15.6 MB) is fault-killed under -smp 4 with the faulting address's
+# PDE reading 0, on the proc's OWN cr3, victim slot moving between runs (PD[3] and PD[510]).
+# Two stories remain and NO fault address can separate them:
+#     (1) the PDE write never landed, or
+#     (2) it landed and something undid it later.
+# This reads the entry back IMMEDIATELY after the map call, through cr3 -> PML4[0] -> PDPT[0] -> PD,
+# mirroring proc_map_page_nx exactly. A mismatch here proves (1); all-match at map time plus a
+# later fault proves (2).
+#
+# ⚠ THIS PROBE IS NOT TRUSTED UNTIL IT IS VALIDATED AGAINST A KNOWN ANSWER. Four diagnostics on
+# this fault were wrong before they were right — including a page-table read-back with one load64
+# too many that reported stackpde=0 for EVERY proc, procs that boot fine included. The gate:
+# run at -smp 1 (which PASSES) and confirm the probe reports match on every page. A probe that
+# cries mismatch on a healthy boot is broken, and its -smp 4 output means nothing.
+#
+# ⚠ fmt_hex_buf emits ZERO characters for a zero value, which is how "pde=0x" once read as a
+# MISSING field rather than a zero one. epp_hex below prints a literal "0" for zero.
+#ifdef ELF_PDE_PROBE
+fn epp_hex(v) {
+    var b[16];                      # fn-local var[N] = N BYTES; 16 hex digits exactly
+    if (v == 0) { klug_append("0", 1); return 0; }
+    var n = fmt_hex_buf(v, &b);
+    klug_append(&b, n);
+    return 0;
+}
+# tag: 0 = a PT_LOAD segment page, 1 = the user stack page.
+fn elf_pde_probe(cr3, virt, phys, tag) {
+    var pml4e = load64(cr3);
+    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+    var pdpte = load64(pdpt_addr);
+    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    var pd_idx = (virt >> 21) & 0x1FF;
+    var got = load64(pd_addr + pd_idx * 8);
+    var want_phys = phys & 0xFFFFFFFFFFE00000;
+    var got_phys = got & 0x000FFFFFFFE00000;
+    # ⭐⭐ THE USER-SIDE MIRROR IS A SECOND, DIFFERENT TABLE — AND IT IS THE ONE RING 3 RUNS ON.
+    # proc_map_page_nx writes the kernel-view PD, then mirrors into the PD[511]-stashed user PML4
+    # **only if that stash is non-zero**. fault_kill_current walks dm_read_cr3() — the LIVE CR3,
+    # which for a ring-3 fault is the USER PML4. So a probe that checks only the kernel-view PD can
+    # report MATCH on every page while the table the CPU actually consults is empty. Checking one
+    # table and concluding about the other is how this probe nearly produced a false root cause.
+    var u_cr3 = load64(pd_addr + 511 * 8);
+    var u_got = 0;
+    var u_present = 0;
+    if (u_cr3 != 0) {
+        var u_pml4e = load64(u_cr3);
+        var u_pdpt = u_pml4e & 0xFFFFFFFFF000;
+        var u_pdpte = load64(u_pdpt);
+        var u_pd = u_pdpte & 0xFFFFFFFFF000;
+        u_got = load64(u_pd + pd_idx * 8);
+        u_present = 1;
+    }
+    var u_got_phys = u_got & 0x000FFFFFFFE00000;
+    klug_append("pdeprobe pid=", 13);
+    epp_hex(proc_current_get());
+    klug_append(" tag=", 5);
+    epp_hex(tag);
+    klug_append(" cpu=", 5);
+    epp_hex(pcpu_cpu());
+    klug_append(" va=0x", 6);
+    epp_hex(virt);
+    klug_append(" idx=0x", 7);
+    epp_hex(pd_idx);
+    klug_append(" want=0x", 8);
+    epp_hex(want_phys);
+    klug_append(" kpd=0x", 7);
+    epp_hex(got_phys);
+    klug_append(" ustash=0x", 10);
+    epp_hex(u_cr3);
+    klug_append(" upd=0x", 7);
+    epp_hex(u_got_phys);
+    # Verdict names WHICH table is wrong — that is the whole point of the probe.
+    if (u_cr3 == 0) { klug_append(" NOSTASH\n", 9); return 0; }
+    if (got_phys != want_phys) { klug_append(" KPD_BAD\n", 9); return 0; }
+    if ((got & 1) == 0) { klug_append(" KPD_BAD\n", 9); return 0; }
+    if (u_got_phys != want_phys) { klug_append(" UPD_BAD\n", 9); return 0; }
+    if ((u_got & 1) == 0) { klug_append(" UPD_BAD\n", 9); return 0; }
+    klug_append(" MATCH\n", 7);
+    return 0;
+}
+#endif
+#ifndef ELF_PDE_PROBE
+fn elf_pde_probe(cr3, virt, phys, tag) { return 0; }
+#endif
+
 # proc_map_page_hi(cr3, virt, phys) — like proc_map_page, but for the HIGH user
 # mmap arena (VA >= USER_HIMMAP_BASE = 128 GB). proc_map_page only ever touches
 # PDPT[0]'s single 0-1 GB PD; a high VA needs its OWN per-process PDPT entry +

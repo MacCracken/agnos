@@ -215,6 +215,17 @@ else
         [ -n "$DOOM_SELFTEST" ]      && echo '#define DOOM_SELFTEST'
         [ -n "$DOOM_DIRECTMAP" ]     && echo '#define DOOM_DIRECTMAP'
         [ -n "$AETHERSAFHA_SELFTEST" ] && echo '#define AETHERSAFHA_SELFTEST'
+        # ELF_PDE_PROBE (2026-08-03) — DIAGNOSTIC, not a gate. Reads each PT_LOAD/stack PDE back
+        # through cr3 -> PML4[0] -> PDPT[0] -> PD immediately after elf_load_from_file maps it, and
+        # records the result to the klug ring. It answers the one question no fault address can:
+        # did the PDE write LAND (and get undone later), or did it never land? For the -smp 4
+        # large-image #PF, agnos docs/development/issues/2026-08-02-large-image-ptload-pde-absent-smp.md.
+        # ⚠ It probes elf_load_from_file (the #43 spawn_path path) ONLY — NOT elf_load's in-memory
+        # #3 path, which an earlier attempt probed by mistake.
+        # ⚠ VALIDATE BEFORE TRUSTING: run at -smp 1 (which passes) and confirm every page reports
+        # MATCH. A probe that reports MISMATCH on a healthy boot is broken and its -smp 4 output
+        # means nothing. Build: ELF_PDE_PROBE=1 sh scripts/build.sh ; read with run /bin/klug.
+        [ -n "$ELF_PDE_PROBE" ]      && echo '#define ELF_PDE_PROBE'
         # ⛔ AETHERSAFHA_SETU_SELFTEST removed 2026-08-03 — the hook assigned net_ip = 0x7F000001 in the
         # kernel before launching the compositor, which is the ONLY reason a setu-over-TCP client
         # handshake completed on agnos BEFORE net_src_for (1.56.34). Every "green" that rode this

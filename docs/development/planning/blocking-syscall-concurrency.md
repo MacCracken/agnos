@@ -3,7 +3,7 @@
 **Status:** Path 1 (userland cooperative yield) SHIPPED — **the mechanism stands.** What is
 retracted (2026-08-03) is its **mishran duplex-AUDIO demonstration**: the only duplex proof
 was the `MISHRAN_DUPLEX_SELFTEST` false green (see Path 1 below), so that demo needs
-re-proving over `naadi`.
+re-proving over `anu`.
 
 > ⚠ **Scope of that retraction.** It voids **one demonstration**, not **two-proc concurrency
 > on agnos** — which is independently established and is NOT in question: the 1.53.8
@@ -57,12 +57,12 @@ mishran for the two-proc audio path:
   reason **that smoke's** loopback connect ever completed. Hook, define and script were
   removed 2026-08-03 and must not be re-added. The **cooperative-yield mechanism above
   still stands** — what is void is the RMS/PEAK measurement and the "deadlock broken"
-  claim resting on it. Re-prove over `naadi` when it lands.
+  claim resting on it. Re-prove over `anu` when it lands.
 - ⚠ **Say which of the two you mean.** Voiding that measurement is **not** a claim that no
   setu client ever connected on agnos — one did, un-rigged, on 1.56.34+ (post-`net_src_for`)
   under `scripts/harness/aethersafha-clients-test.py`. TCP-on-loopback is retired as the
   local display/IPC transport because it is the **wrong primitive**, not because it never
-  ran. See `docs/development/planning/ipc.md` §9 (naadi design) / §10 (removal inventory).
+  ran. See `docs/development/planning/ipc.md` §9 (anu design) / §10 (removal inventory).
 
 Four things were required together, worth recording:
 1. Cooperative yield (above).
@@ -77,8 +77,8 @@ Four things were required together, worth recording:
 4. ~~**Sub-window TCP chunks**~~ — ⛔ **RETIRED WRONG PREMISE, do not follow.** This item
    was never a requirement of the concurrency mechanism; it was an accommodation to a
    transport that should not have been carrying local IPC. Local control messages move over
-   **`naadi`** and bulk payload over the `sys_shm_*` band — see
-   `docs/development/planning/ipc.md` §9 (naadi design) / §10 (removal inventory), and the
+   **`anu`** and bulk payload over the `sys_shm_*` band — see
+   `docs/development/planning/ipc.md` §9 (anu design) / §10 (removal inventory), and the
    TCP-wire section below for the constraint it was working around. Items 1-3 stand.
 
 ## The TCP-wire constraint (`sock_send` #48)
@@ -86,7 +86,7 @@ Four things were required together, worth recording:
 > ⛔ **This section describes a constraint on the NETWORK stack, not a local-IPC design.**
 > Everything below about chunking payloads under the loopback window was written while
 > TCP-on-loopback was mistakenly treated as a local transport. It is **not** the local
-> IPC or display transport — `naadi` is (`docs/development/planning/ipc.md` §9-§10). Do
+> IPC or display transport — `anu` is (`docs/development/planning/ipc.md` §9-§10). Do
 > not use this section as a recipe for getting a local two-proc path working.
 
 `sock_send` #48 blocks preempt-held waiting for ACKs (`tcp_send`, ~8 s ceiling). On the
@@ -97,13 +97,13 @@ chunking PCM **below the window** (256 frames = 1024 B/write) + `sched_yield`-pa
 each `sock_send` fits and completes in-kernel. ⛔ That workaround is **retired along with
 the transport** — the "chunk it under the window" recipe is exactly the accommodation
 that should have falsified the premise instead of propping it up. The desktop does NOT
-"keep tiny control messages on TCP": local control messages move over `naadi`, and bulk
+"keep tiny control messages on TCP": local control messages move over `anu`, and bulk
 pixels move over the `sys_shm_*` band. Retracted 2026-08-03.
 
 Two clean fixes (either unblocks large-payload two-proc streaming without the chunking
 workaround):
 - **Shared-memory PCM transport for mishran** (`sys_shm_*`, like setu's framebuffer) —
-  move PCM over shm; control msgs go over **`naadi`**, not TCP (⛔ this bullet originally
+  move PCM over shm; control msgs go over **`anu`**, not TCP (⛔ this bullet originally
   read "keep control msgs on TCP" — corrected 2026-08-03). Userland (mishran) change.
 - **Non-blocking `sock_send`** — return partial + would-block (0) when the recv buffer
   is full, so the caller yields (as `sock_recv` #49 already does). Kernel change.

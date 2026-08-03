@@ -205,7 +205,7 @@ fn net_is_loopback(dst_ip) {
 # ⛔ THE TRANSPORT IS RETIRED ANYWAY — AND NOT FOR THAT REASON. TCP-on-loopback as the display
 # protocol is the WRONG PRIMITIVE for local display IPC (operator ruling, 2026-08-03): a local
 # channel has nothing to route, nothing to checksum, no window to negotiate, no RTO, and no business
-# owning a port. The replacement is the agnos socket (`naadi`).
+# owning a port. The replacement is the agnos socket (`anu`).
 # See docs/development/planning/ipc.md §9-§10.
 #
 # ⚠ `net_src_for` itself is CORRECT AND STAYS. Route-derived source selection is right regardless of
