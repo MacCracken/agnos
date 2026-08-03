@@ -1,7 +1,18 @@
 # Blocking syscalls vs. multi-proc concurrency
 
-**Status:** Path 1 (userland cooperative yield) SHIPPED + QEMU-validated. Path 2
-(per-proc syscall kstacks) TRACKED, deferred. Opened 2026-07-10 out of the mishran
+**Status:** Path 1 (userland cooperative yield) SHIPPED — **the mechanism stands.** What is
+retracted (2026-08-03) is its **mishran duplex-AUDIO demonstration**: the only duplex proof
+was the `MISHRAN_DUPLEX_SELFTEST` false green (see Path 1 below), so that demo needs
+re-proving over `naadi`.
+
+> ⚠ **Scope of that retraction.** It voids **one demonstration**, not **two-proc concurrency
+> on agnos** — which is independently established and is NOT in question: the 1.53.8
+> `console_lock` fix, and two setu clients that connected and presented concurrently with the
+> compositor under the un-rigged `scripts/harness/aethersafha-clients-test.py` (that harness
+> byte-scans the kernel and hard-exits if it carries any selftest hook). Do not read anything
+> here as "two procs can't run concurrently on agnos." They can.
+
+Path 2 (per-proc syscall kstacks) TRACKED, deferred. Opened 2026-07-10 out of the mishran
 two-proc audio bring-up.
 
 ## The invariant (why this is hard)
@@ -38,9 +49,20 @@ mishran for the two-proc audio path:
 - `mishran` `msh_router_pump` emits a block only when the DAC ring has room (else
   returns without mixing), and the transport backoffs `sched_yield` instead of
   `sleep_ms`.
-- `MISHRAN_DUPLEX_SELFTEST` (`main.cyr`, **post-`sched_active`**) + `scripts/
-  mishran-duplex-audio-smoke.sh`: two concurrent ring-3 procs, client → loopback →
-  mixer → vani → HDA, **RMS 2116 / PEAK 4448** (non-silent). Deadlock broken.
+- ⛔ **The duplex proof that used to be cited here is GONE and was never valid.**
+  `MISHRAN_DUPLEX_SELFTEST` (`main.cyr`) + `scripts/smoke/mishran-duplex-audio-smoke.sh`
+  claimed two concurrent ring-3 procs streaming client → **TCP loopback** → mixer → vani
+  → HDA at RMS 2116 / PEAK 4448, and called the deadlock broken. That number was a
+  **FALSE GREEN**: the hook assigned `net_ip = 0x7F000001` in the kernel, which is the only
+  reason **that smoke's** loopback connect ever completed. Hook, define and script were
+  removed 2026-08-03 and must not be re-added. The **cooperative-yield mechanism above
+  still stands** — what is void is the RMS/PEAK measurement and the "deadlock broken"
+  claim resting on it. Re-prove over `naadi` when it lands.
+- ⚠ **Say which of the two you mean.** Voiding that measurement is **not** a claim that no
+  setu client ever connected on agnos — one did, un-rigged, on 1.56.34+ (post-`net_src_for`)
+  under `scripts/harness/aethersafha-clients-test.py`. TCP-on-loopback is retired as the
+  local display/IPC transport because it is the **wrong primitive**, not because it never
+  ran. See `docs/development/planning/ipc.md` §9 (naadi design) / §10 (removal inventory).
 
 Four things were required together, worth recording:
 1. Cooperative yield (above).
@@ -52,23 +74,37 @@ Four things were required together, worth recording:
    a pre-scheduler boot-hook (`sched_active=0`) makes `sched_yield` a no-op and has no
    timer preemption, so a spawned secondary never runs. kmain idles (`while(1)
    arch_wait()`) and the live scheduler drives both procs.
-4. **Sub-window TCP chunks** — see below.
+4. ~~**Sub-window TCP chunks**~~ — ⛔ **RETIRED WRONG PREMISE, do not follow.** This item
+   was never a requirement of the concurrency mechanism; it was an accommodation to a
+   transport that should not have been carrying local IPC. Local control messages move over
+   **`naadi`** and bulk payload over the `sys_shm_*` band — see
+   `docs/development/planning/ipc.md` §9 (naadi design) / §10 (removal inventory), and the
+   TCP-wire section below for the constraint it was working around. Items 1-3 stand.
 
 ## The TCP-wire constraint (`sock_send` #48)
+
+> ⛔ **This section describes a constraint on the NETWORK stack, not a local-IPC design.**
+> Everything below about chunking payloads under the loopback window was written while
+> TCP-on-loopback was mistakenly treated as a local transport. It is **not** the local
+> IPC or display transport — `naadi` is (`docs/development/planning/ipc.md` §9-§10). Do
+> not use this section as a recipe for getting a local two-proc path working.
 
 `sock_send` #48 blocks preempt-held waiting for ACKs (`tcp_send`, ~8 s ceiling). On the
 agnos loopback the recv ring is ~2 KB; a payload larger than that fills the peer's recv
 buffer, and `sock_send` then blocks waiting for the peer to drain — which it can't,
 because the sender holds preemption. The mishran audio proof works around this by
 chunking PCM **below the window** (256 frames = 1024 B/write) + `sched_yield`-pacing, so
-each `sock_send` fits and completes in-kernel. This is the same constraint the desktop
-sidesteps by moving large data (the framebuffer) over **shared memory** and keeping only
-tiny control messages on TCP.
+each `sock_send` fits and completes in-kernel. ⛔ That workaround is **retired along with
+the transport** — the "chunk it under the window" recipe is exactly the accommodation
+that should have falsified the premise instead of propping it up. The desktop does NOT
+"keep tiny control messages on TCP": local control messages move over `naadi`, and bulk
+pixels move over the `sys_shm_*` band. Retracted 2026-08-03.
 
 Two clean fixes (either unblocks large-payload two-proc streaming without the chunking
 workaround):
 - **Shared-memory PCM transport for mishran** (`sys_shm_*`, like setu's framebuffer) —
-  keep control msgs on TCP, move PCM over shm. Userland (mishran) change; no kernel risk.
+  move PCM over shm; control msgs go over **`naadi`**, not TCP (⛔ this bullet originally
+  read "keep control msgs on TCP" — corrected 2026-08-03). Userland (mishran) change.
 - **Non-blocking `sock_send`** — return partial + would-block (0) when the recv buffer
   is full, so the caller yields (as `sock_recv` #49 already does). Kernel change.
 

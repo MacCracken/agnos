@@ -1193,10 +1193,17 @@ for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy
         # ⚠ Unlike klug, this one CAN be compared: aethersafha builds a real --agnos artifact at a
         # known path, so compare bytes rather than settling for size-only.
         aethersafha) _src="../aethersafha/build/aethersafha_agnos" ;;
-        # The desktop's two setu clients. ⚠ /bin/puka is setu's slim present_probe, NOT the puka
-        # terminal — the name is the compositor's first-resident slot. Both are spawn_path'd by
-        # aethersafha, so a stale one presents the wrong surface while the serial still says
-        # "launched setu client".
+        # ⛔ RETIRED TRANSPORT — STAGED, NOT A BURN OBJECTIVE. These two are aethersafha's setu
+        # clients, which connect back over loopback:7700. Operator ruling 2026-08-03: TCP-on-
+        # loopback is the WRONG PRIMITIVE for local display IPC and is being removed in favour of
+        # the agnos socket (naadi — docs/development/planning/ipc.md §9, removal inventory §10).
+        # They stay in this loop only so the staleness gate keeps matching what stage-tools.sh
+        # actually stages; DO NOT plan a burn around whether they present, and do not read a
+        # no-present as a defect in the clients, in crab, in spawn_path, or in the compositor —
+        # it indicts a path that is being deleted. The desktop's iron oracle is
+        # `run /bin/aethersafha --selftest` (single process, no network state), gated below.
+        # ⚠ /bin/puka is setu's slim present_probe, NOT the puka terminal — the name is the
+        # compositor's first-resident slot.
         puka)        _src="../setu/build/puka_agnos" ;;
         crab)        _src="../crab/build/crab_agnos" ;;
     esac

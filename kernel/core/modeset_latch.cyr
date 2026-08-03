@@ -287,8 +287,11 @@ fn modeset_arm(site) {
 #      OTG times off its own PLL: HUBP underflow leaves it counting while the pipe emits black, and an
 #      out-of-range timing leaves it counting while the sink reports No Signal. Keying a disarm on I1 is the
 #      echo-register failure that cost twelve mute audio burns. I1 stays a LOGGED DATUM, never a gate.
-#   4. The builds most likely to run a display experiment (AETHERSAFHA_SETU_SELFTEST, MISHRAN_DUPLEX_SELFTEST,
-#      TCP_LISTEN_SMOKE, ATOM_HALT) all end in an infinite idle and never reach the boot tail at all.
+#   4. The builds most likely to run a display experiment (TCP_LISTEN_SMOKE, ATOM_HALT, and any future
+#      experiment hook of that shape) all end in an infinite idle and never reach the boot tail at all.
+#      (The AETHERSAFHA_SETU_SELFTEST / MISHRAN_DUPLEX_SELFTEST hooks that used to head this list were
+#      DELETED 2026-08-03 — they rigged `net_ip = 0x7F000001` to manufacture a false green. The reasoning
+#      above is unaffected: it is about idle-ending experiment builds in general, not those two.)
 #
 # ⚠ IF ANYONE LATER ADDS AN AUTOMATIC DISARM: it becomes MANDATORY to gate it on an armed-this-boot flag,
 # or a blocked boot will clear a latch it never set. The only acceptable automatic trigger is the first

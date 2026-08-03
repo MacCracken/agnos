@@ -3211,20 +3211,22 @@ sh_exec("run /bin/mishtone", 17);
 kprintln("exec: mishtone returned", 23);
 #endif
 
-#ifdef MISHRAN_JALWA_SELFTEST
-# jalwa->mishran end-to-end audio proof (the "route through the mixer" gate). Runs
-# /bin/jalwa (the play-probe) as the PRIMARY via sh_exec — a 2.5 MB binary, and
-# sh_exec handles big ELFs (aethersafha is 15 MB), unlike spawn_path (proven only
-# for small children like puka/crab). jalwa spawn_path's the SMALL /bin/mishrand
-# daemon itself, waits for it to listen, then decodes a seeded /tone.wav and streams
-# its PCM to mishran (msh_client_*), which mixes it down to vani (audio_* ->
-# sys_snd_* #64-69). Two ring-3 procs concurrent over loopback — the desktop
-# primary+client model applied to audio. scripts/smoke/mishran-jalwa-audio-smoke.sh
-# captures the HDA output + asserts a non-silent wav.
-kprintln("exec: running /bin/jalwa", 24);
-sh_exec("run /bin/jalwa", 14);
-kprintln("exec: jalwa returned", 20);
-#endif
+# ⛔ REMOVED 2026-08-03 — the `MISHRAN_JALWA_SELFTEST` boot hook stood here (it ran
+# /bin/jalwa, which spawn_path'd /bin/mishrand and streamed PCM to it over
+# loopback:7701), together with scripts/smoke/mishran-jalwa-audio-smoke.sh. Both are
+# GONE. Do not re-add them.
+#
+# WHY: unlike AETHERSAFHA_SETU_SELFTEST / MISHRAN_DUPLEX_SELFTEST, this hook did NOT
+# assign net_ip — it manufactured nothing. It was removed for the OTHER reason: it was
+# a live, buildable gate whose pass condition ASSERTED the retired transport works on
+# agnos. Its smoke's gate 3 required the serial line "jalwa: audio routed through the
+# mishran mixer", which jalwa/src/playback/audio.cyr prints only when
+# `msh_client_connect` succeeds — i.e. only on a completed loopback:7701 TCP handshake.
+# jalwa's own retraction (audio.cyr:76-80) states that connect will not complete on an
+# ordinary agnos boot, so the smoke's "PASS — jalwa plays THROUGH the mishran mixer"
+# was unreachable. TCP-on-loopback is not the local-IPC transport; naadi is. See
+# docs/development/planning/ipc.md §9/§10. The in-process mixer proof survives as
+# MISHRAN_AUDIO_SELFTEST above (/bin/mishtone, msh_router_* only, no sockets).
 
 # 1.41.3 — FS-syscall self-test (compile-gated, FS_SYSCALL_SELFTEST=1). Drives
 # the new real FS syscalls (mkdir/open+CREAT/stat/rename/getdents/unlink/rmdir/
@@ -4805,125 +4807,25 @@ sched_active = 1;
 # context-switch issue, not an init issue. Held since Attempt 16.
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x10; 0xE6; 0x71; }
 
-# EFER.SCE re-assert wrapped in a FUNCTION (clean ABI boundary) so the raw
-# rdmsr/wrmsr — which clobbers eax/ecx/edx — can't corrupt cc5's regalloc at the
-# call site (the inline form silently zeroed a live local). exec_and_wait does the
-# same re-assert right before enter_ring3; the setu-e2e selftest below needs it so
-# the SCHEDULER-entered compositor (this boot's first ring-3 proc, entered via
-# iretq not enter_ring3) survives its first SYSCALL instead of #UD'ing on a
-# never-exercised SCE. EFER is a per-CPU MSR context switches don't touch → holds.
-fn efer_sce_enable(): i64 {
-    syscall_init();
-    asm {
-        0xB9; 0x80; 0x00; 0x00; 0xC0;   # mov ecx, 0xC0000080 (IA32_EFER)
-        0x0F; 0x32;                       # rdmsr
-        0x0D; 0x01; 0x00; 0x00; 0x00;     # or eax, 1 (SCE)
-        0x0F; 0x30;                       # wrmsr
-    }
-    return 0;
-}
-
-#ifdef AETHERSAFHA_SETU_SELFTEST
-# 3b — the sovereign DISPLAY PROTOCOL end-to-end on agnos. Runs AFTER
-# sched_active=1 (unlike AETHERSAFHA_SELFTEST at ~L2286) because it needs TWO
-# concurrent procs. Loads the compositor as a BACKGROUND ring-3 proc — mirroring
-# the spawn_path(#43) handler EXACTLY (boot-CR3 dance for the disk load + address
-# space; exec_env set so the loader builds a valid argv/envp stack; proc_set_ring3
-# + state=ready + EFER.SCE re-assert via efer_sce_enable) — then kmain IDLES via
-# arch_wait so the LIVE scheduler round-robins the compositor AND the /bin/puka it
-# spawn_path's. Foreground exec_and_wait would PIN kmain and starve the client.
+# ⛔ REMOVED 2026-08-03 — the `AETHERSAFHA_SETU_SELFTEST` and `MISHRAN_DUPLEX_SELFTEST`
+# boot hooks stood here, together with the `efer_sce_enable` helper that existed only to
+# serve them. They are GONE and must not come back in any form.
 #
-# STATUS: the compositor RUNS under the scheduler (reaches main + its FIRST SYSCALL
-# — the CR3 dance + exec_env + EFER re-assert cleared scheduler ENTRY). BLOCKER: its
-# SECOND syscall fails (a raw write right after the first prints; the next does not).
-# NOT a CR3/mmap issue — proc_get_user_cr3 returns out==in (agnos COLLAPSED the KPTI
-# split at proc.cyr:592-611; PD[511] = the FULL CR3 that maps the stub), so
-# kpti_user_cr3 already == the full CR3. A foreground exec_and_wait proc (agnsh,
-# enter_ring3) does thousands of syscalls fine; a SCHEDULER-entered (iretq) proc's
-# 2nd fails — the difference is the syscall / preemption-resume path (likely a stale
-# kernel-stack / RSP0 / per-CPU state after the first SYSRET). NOT root-caused. Do
-# NOT edit do_context_switch / proc_get_user_cr3 inline — their save/restore zone is
-# cc5-regalloc-sensitive (sched.cyr:341) and perturbing it regressed scheduling in a
-# way unrelated to the change's intent. See [[project_agnos_two_proc_concurrency_blocker]].
-kprintln("setu-e2e: loading compositor bg", 31);
-# No NIC in this QEMU (r8169 absent) → net_ip=0, so a loopback SYN's src_ip is 0 and
-# the peer's SYN-ACK (dst = that src_ip = 0) fails net_is_loopback (needs dst>>24==127
-# or dst==net_ip) → lost → connect times out. Set net_ip = 127.0.0.1 so the local
-# address IS loopback: both the SYN (src=127.0.0.1) and the SYN-ACK (dst=127.0.0.1)
-# are lo_ring-delivered, completing the on-device puka↔compositor handshake sans NIC.
-net_ip = 0x7F000001;
-var ae_p = "/bin/aethersafha";
-if (sh_abspath(ae_p, 16) >= 0) {
-    var spcr3 = proc_get_cr3(proc_current_get());
-    cr3_load(0x1000);                    # boot CR3 maps the NVMe BAR for the disk load
-    exec_env_src_set(0);                 # default kernel env (HOME=/ PWD=/) — valid envp stack
-    exec_env_len_set(0);
-    var ae_pid = elf_load_from_file(&sh_path_buf, sh_path_len, ae_p, 16);
-    cr3_load(spcr3);                     # restore on EVERY path (matches #43)
-    if (ae_pid >= 0) {
-        proc_set_ring3(ae_pid);          # CS=0x23 / SS=0x1B (else iretq lands ring-0)
-        efer_sce_enable();               # make the first SYSCALL from the scheduled compositor work
-        kprint("setu-e2e: ae pid=", 17); kprint_num(ae_pid); kprintln("", 0);
-        # CRITICAL: flip the compositor READY *AFTER* kmain's last kprint. These named
-        # spinlocks don't disable preemption (smp.cyr:47 "never hold a lock across a
-        # context switch / a kprint"), so if the compositor were schedulable during the
-        # kprint above, a timer tick that preempts kmain mid-print (holding console_lock)
-        # would let the compositor's own first console write DEADLOCK on that held lock
-        # (QEMU-monitor-confirmed: RIP in a spin loop on lock 0x1ce670, IF=0). kmain is
-        # SILENT hereafter, so the compositor has console_lock uncontended.
-        proc_set_state(ae_pid, 1);       # READY — the scheduler will run it
-        while (1 == 1) { arch_wait(); }  # kmain idles SILENTLY; scheduler drives compositor + puka
-
-    } else { kprintln("setu-e2e: load FAILED", 21); }
-} else { kprintln("setu-e2e: bad path", 18); }
-#endif
-
-#ifdef MISHRAN_DUPLEX_SELFTEST
-# mishran TWO-PROC audio proof — the REAL loopback wire, no jalwa (stays inside the
-# mishran repo). Runs AFTER sched_active=1 (like AETHERSAFHA_SETU_SELFTEST above)
-# because it needs TWO concurrent procs; the pre-scheduler selftest block (~L2286)
-# can't run two — sched_yield #44 no-ops (sched_active=0) and there is no timer
-# preempt, so a spawned secondary never gets CPU. Loads /bin/mishduplex (the mixer
-# SERVER) as a BACKGROUND ring-3 proc via the boot-CR3 dance (mirrors the spawn_path
-# #43 handler EXACTLY: boot-CR3 for the disk load, exec_env for a valid argv/envp
-# stack, proc_set_ring3 + EFER.SCE re-assert). mishduplex binds loopback:7701 + opens
-# the vani sink, then spawn_path's /bin/mishclient, which connects + streams a
-# square-wave tone (msh_client_*). The mixer fans it to vani (audio_* -> sys_snd_*
-# #64-69). kmain then IDLES via arch_wait so the LIVE scheduler round-robins BOTH
-# procs — the cooperative sched_yield #44 dance that replaces the old preempt-off
-# blocking writes (audio_write / sleep_ms), which starved the peer because the shared
-# per-CPU syscall kstack forbids the kernel preempting a blocking syscall (the
-# serial-kstack invariant; agnos-blocking-syscall-yield-fix). A foreground
-# exec_and_wait would PIN kmain and starve the client, so we load it as background.
-# scripts/smoke/mishran-duplex-audio-smoke.sh captures the HDA output + asserts a non-silent
-# wav = both procs interleaved, no deadlock, no starvation.
+# WHY: both hooks assigned `net_ip = 0x7F000001` in the KERNEL before launching their
+# ring-3 peer. agnos puts `net_ip` in an outbound SYN's SOURCE, so a client dialling
+# 127.0.0.1 normally gets its SYN-ACK addressed to `net_ip`, `tcp_find_conn` never
+# matches, and the connect fails. Forcing net_ip to loopback made src == dst, so the
+# handshake completed ONLY under these hooks — on an ordinary boot it could never
+# complete. Every "green" those hooks produced was a FALSE GREEN, and the scaffolding
+# that manufactured it was the mechanism by which a wrong premise looked proven.
 #
-# net_ip = 127.0.0.1 (same as setu): no NIC in this QEMU (r8169 absent), so a loopback
-# SYN's src_ip would be 0 and the SYN-ACK (dst=0) fails net_is_loopback — the connect
-# would time out. Setting net_ip to loopback makes both the SYN and SYN-ACK lo_ring-
-# delivered, completing the on-device client->server handshake sans NIC.
-kprintln("mishran-duplex: loading mixer server bg", 39);
-net_ip = 0x7F000001;
-var dx_p = "/bin/mishduplex";
-if (sh_abspath(dx_p, 15) >= 0) {
-    var dx_cr3 = proc_get_cr3(proc_current_get());
-    cr3_load(0x1000);                    # boot CR3 maps the NVMe BAR for the disk load
-    exec_env_src_set(0);                 # default kernel env (HOME=/ PWD=/) — valid envp stack
-    exec_env_len_set(0);
-    var dx_pid = elf_load_from_file(&sh_path_buf, sh_path_len, dx_p, 15);
-    cr3_load(dx_cr3);                     # restore on EVERY path (matches #43)
-    if (dx_pid >= 0) {
-        proc_set_ring3(dx_pid);          # CS=0x23 / SS=0x1B (else iretq lands ring-0)
-        efer_sce_enable();               # make the scheduled server's first SYSCALL work
-        kprint("mishran-duplex: server pid=", 27); kprint_num(dx_pid); kprintln("", 0);
-        # flip READY *AFTER* the last kprint (console_lock — kmain silent hereafter so
-        # the scheduled procs' console writes never deadlock on a kmain-held lock; see
-        # the AETHERSAFHA_SETU note above).
-        proc_set_state(dx_pid, 1);       # READY — the scheduler will run it
-        while (1 == 1) { arch_wait(); }  # kmain idles SILENTLY; scheduler drives server + client
-    } else { kprintln("mishran-duplex: load FAILED", 27); }
-} else { kprintln("mishran-duplex: bad path", 24); }
-#endif
+# The premise itself is dead: TCP-on-loopback is NOT the desktop/display transport. The
+# replacement is the agnos socket (`naadi`). See docs/development/planning/ipc.md §9-§10.
+# TCP stays — agnos is A General NETWORKED Operating System and TCP is correct for the
+# NETWORK. What is retired is a display protocol riding it.
+#
+# Do NOT reintroduce a boot hook that assigns `net_ip`. Source selection is route-derived
+# (`net_src_for`, net.cyr) and needs no kernel-side rigging.
 
 #ifdef THREAD_SELFTEST
 # 1.44.0 opening bite: prove preemptive kernel-thread time-slicing + the preempt

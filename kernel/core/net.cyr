@@ -185,9 +185,32 @@ fn net_is_loopback(dst_ip) {
 # so the passive open recorded the peer as net_ip and sent its SYN-ACK back to net_ip — while the
 # connecting side's conn holds dst_ip = 127.0.0.1. `tcp_find_conn(..., src_ip)` then finds no match,
 # the reply lands on an unknown 4-tuple, and `sock_connect` #47 returns -1 with its own slot zeroed.
-# The desktop's compositor<->client handshake could therefore never complete on a real boot; it was
-# masked in the one place anyone tested it by AETHERSAFHA_SETU_SELFTEST assigning
-# `net_ip = 0x7F000001`, which made src and dst agree by accident.
+#
+# ⛔ POST-MORTEM (2026-08-03) — HOW THIS WENT UNNOTICED, AND WHAT IT COST. BEFORE THIS FIX (agnos
+# 1.56.34), on-device loopback TCP could not complete on an ordinary boot. The one place anyone
+# tested it BEFORE THIS FIX was the `AETHERSAFHA_SETU_SELFTEST` / `MISHRAN_DUPLEX_SELFTEST` kernel
+# hooks, which assigned `net_ip = 0x7F000001` before launching their peer — making src and dst agree
+# BY ACCIDENT. Every "green" produced under those hooks was a FALSE GREEN and must not be cited as
+# proof of anything. Those hooks are DELETED (main.cyr) and must never be reintroduced; a
+# kernel-side `net_ip` assignment is rigging, not a fix.
+#
+# ⭐ AFTER THIS FIX IT DID WORK, UN-RIGGED — scope it honestly, do not over-retract. On 2026-08-02,
+# on 1.56.34+, `scripts/harness/aethersafha-clients-test.py` reached "connected: 2, presented: 2":
+# setu's slim `present_probe` (staged as /bin/puka) AND the real dhancha `crab` both connected and
+# presented. That harness byte-scans `build/agnos` and HARD-EXITS if the kernel carries any selftest
+# hook ("a kernel carrying any such hook does not fail this test, it INVALIDATES it"), and attaches
+# a virtio NIC so DHCP yields a real `net_ip` — it is the harness that CAUGHT the rigging. ⚠ Scope:
+# that run was QEMU at `-smp 1`. It was never shown on iron, and `-smp 4` fault-kills.
+#
+# ⛔ THE TRANSPORT IS RETIRED ANYWAY — AND NOT FOR THAT REASON. TCP-on-loopback as the display
+# protocol is the WRONG PRIMITIVE for local display IPC (operator ruling, 2026-08-03): a local
+# channel has nothing to route, nothing to checksum, no window to negotiate, no RTO, and no business
+# owning a port. The replacement is the agnos socket (`naadi`).
+# See docs/development/planning/ipc.md §9-§10.
+#
+# ⚠ `net_src_for` itself is CORRECT AND STAYS. Route-derived source selection is right regardless of
+# who first needed it, and TCP stays too — agnos is A General NETWORKED Operating System and TCP is
+# correct FOR THE NETWORK. What died is a display protocol riding it, not the stack.
 #
 # ⭐ Every other stack does this and it is not novel: the source address comes from the ROUTE, and
 # the loopback route's source is 127.0.0.1. Only the destination's shape decides it.

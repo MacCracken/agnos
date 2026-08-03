@@ -266,6 +266,9 @@ stage_one cyrius-mine-cart src/main.cyr mine-cart || rc=1
 # captures the finished frame through `#90 gpu_readback_shm` BEFORE the `#84` flip, pulls it back to
 # userland with `#73`, and compares. One process — no setu client, no `spawn_path`, no loopback TCP,
 # no two-proc scheduling — so a non-95 exit points at the compositing path and nothing else.
+# ⭐ AS OF 2026-08-03 THIS IS THE DESKTOP'S ONLY IRON ORACLE. The client-transport rows further down
+# are retired (TCP-on-loopback is the wrong primitive — see the banner above `stage_one setu`), so
+# `--selftest` is the whole of what a burn should read the desktop's verdict from.
 #
 # ⚠ THE CAPTURE MUST PRECEDE THE FLIP AND THE TOOL ENFORCES THAT INTERNALLY. `#84` toggles
 # `gpu_bb_back`, so a readback taken after the present samples the buffer the frame did NOT draw
@@ -291,31 +294,51 @@ stage_one cyrius-mine-cart src/main.cyr mine-cart || rc=1
 # regression — `run` (sh_exec) is proven on ELFs this size; `spawn_path` is the one that is not.
 stage_one aethersafha  src/main.cyr aethersafha || rc=1
 
-# ⭐⭐ THE DESKTOP'S FIRST REAL CLIENTS ON IRON. aethersafha's agnos arm `spawn_path`#43's
-# `/bin/puka` then `/bin/crab` when its setu listener is up; each connects back over loopback:7700,
-# presents a surface bound to a GPU-visible `#86` shm buffer, and is composited by `#87`. Until now
-# neither existed on the image, so every iron boot showed ONE compositor-seeded chrome window and
-# the client half of the display protocol was never exercised on hardware at all.
+# ⛔⛔⛔ RETIRED TRANSPORT — DO NOT AIM A BURN AT THIS, AND DO NOT DIAGNOSE FROM IT. ⛔⛔⛔
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# Operator ruling 2026-08-03: TCP-on-loopback is the WRONG PRIMITIVE for local display IPC. The
+# setu client transport below (connect back to 127.0.0.1:7700) is ARCHITECTURALLY RETIRED and is
+# being removed; the replacement is the agnos socket — `naadi`, agnos docs/development/planning/
+# ipc.md §9, with the removal inventory in §10.
 #
-# ⭐ BOTH ARE STAGED ON PURPOSE, and the pair is the instrument. `puka` here is setu's slim
-# `present_probe` — mabda-free, 101 KB, and the exact binary the QEMU smoke has always seeded, so it
-# is the PROVEN client. `crab` is the real dhancha file manager (sadish raster + rekha text), which
-# has never run on this hardware. One boot then discriminates: both present => the client path and
-# crab both work; probe only => the setu/two-proc path is fine and crab is the variable; neither =>
-# the fault is the client path itself, not either app. Staging only crab would conflate all three.
+# ⛔ THE DISCRIMINATION RUBRIC THAT USED TO LIVE HERE IS DELETED, NOT MOVED. It read "both present
+# => client path and crab both work; probe only => the setu/two-proc path is fine and crab is the
+# variable; neither => the fault is the client path itself". Following it on a burn sends the
+# session hunting for a bug in a path that is being deleted. AN IRON BURN IS EXPENSIVE AND
+# SERIALISING — a no-present here indicts the RETIRED TRANSPORT, not the client, not crab, not
+# spawn_path, not the compositor. There is nothing to fix and nothing to learn. Do not schedule a
+# burn for it, and if you get it as a side effect of some other burn, record it and move on.
 #
-# ⚠ SIZE IS LOAD-BEARING FOR `spawn_path`, unlike `run`/sh_exec. spawn_path is proven on small
-# children (these are 101 KB and 323 KB) and is NOT proven on large ones — a 2.5 MB jalwa spawned
-# this way never ran, while 15 MB binaries exec fine through `run`. Do not add a big client here
-# expecting it to behave like /bin/aethersafha does.
+# ⚠ CALIBRATION — the transport being retired is NOT the same claim as the transport never having
+# worked, and the second claim is FALSE. scripts/harness/aethersafha-clients-test.py is an honest
+# harness (it byte-scans build/agnos and hard-exits if the kernel carries a selftest hook, and it
+# attaches a virtio NIC so DHCP yields a real net_ip); its 2026-08-02 "connected: 2, presented: 2"
+# on 1.56.34+ is a REAL result and STANDS. Two setu clients did connect and did present. That is a
+# true result about a path we are retiring on design grounds, not a false green. What was never
+# established is the same thing on IRON — and it now never will be, because the path is going away.
+#
+# ⇒ THE DESKTOP'S IRON ORACLE IS `run /bin/aethersafha --selftest` (the block above), which is
+# single-process and touches no network state at all. That is the one to burn.
+#
+# STAGING IS RETAINED ON PURPOSE, and staging is all this is now:
+#   · burn-prep.sh's staleness gate (the `for _t in ... puka crab` loop, ~line 1174) hard-exits with
+#     "STAGING GAP" if either is missing, so deleting these two rows would break every burn-prep run
+#     rather than remove a hazard.
+#   · `crab` is the real dhancha file manager (sadish raster + rekha text) and outlives the
+#     transport — it is a naadi client the moment naadi lands. `puka` here is setu's slim
+#     `present_probe` and IS a transport artifact; it stays only as the compositor's first-resident
+#     slot filler until the naadi probe replaces it.
+# Neither is a burn objective. Nothing below is an instruction to test anything.
 #
 # ⚠ `/bin/puka` is the FIRST-RESIDENT SLOT, not the puka terminal: full puka needs a mabda `--agnos`
 # GPU backend that does not exist yet. The name is what the compositor spawns, so the slot keeps it.
 # The two paths are both 9 characters, which is the length aethersafha passes to spawn_path.
 #
-# ⛔ NO EXIT CODE FROM EITHER — they are windows, not oracles. The verdict is aethersafha's serial:
-# "launched setu client #1" / "#2 (crab)" then "setu client presented surface". A client that spawns
-# but never presents prints the first line and not the second.
+# ⚠ SIZE IS LOAD-BEARING FOR `spawn_path`, unlike `run`/sh_exec — kept because it is a spawn_path
+# fact, not a transport fact, and it will apply unchanged to naadi clients. spawn_path is proven on
+# small children (these are 101 KB and 323 KB) and is NOT proven on large ones: a 2.5 MB jalwa
+# spawned this way never ran, while 15 MB binaries exec fine through `run`.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
 stage_one setu         programs/present_probe.cyr puka || rc=1
 stage_one crab         src/main.cyr crab        || rc=1
 

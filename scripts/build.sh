@@ -215,13 +215,25 @@ else
         [ -n "$DOOM_SELFTEST" ]      && echo '#define DOOM_SELFTEST'
         [ -n "$DOOM_DIRECTMAP" ]     && echo '#define DOOM_DIRECTMAP'
         [ -n "$AETHERSAFHA_SELFTEST" ] && echo '#define AETHERSAFHA_SELFTEST'
-        [ -n "$AETHERSAFHA_SETU_SELFTEST" ] && echo '#define AETHERSAFHA_SETU_SELFTEST'
+        # ⛔ AETHERSAFHA_SETU_SELFTEST removed 2026-08-03 — the hook assigned net_ip = 0x7F000001 in the
+        # kernel before launching the compositor, which is the ONLY reason a setu-over-TCP client
+        # handshake ever completed on agnos. Every "green" that rode this define was a FALSE GREEN.
+        # TCP-on-loopback is not the desktop transport; naadi is. See agnos
+        # docs/development/planning/ipc.md §10. Do not re-add this define under any name.
         [ -n "$DOOM_AUDIO_SELFTEST" ] && echo '#define DOOM_AUDIO_SELFTEST'
         [ -n "$TONEGEN_SELFTEST" ]   && echo '#define TONEGEN_SELFTEST'
         [ -n "$VANITONE_AUDIO_SELFTEST" ] && echo '#define VANITONE_AUDIO_SELFTEST'
         [ -n "$MISHRAN_AUDIO_SELFTEST" ] && echo '#define MISHRAN_AUDIO_SELFTEST'
-        [ -n "$MISHRAN_JALWA_SELFTEST" ] && echo '#define MISHRAN_JALWA_SELFTEST'
-        [ -n "$MISHRAN_DUPLEX_SELFTEST" ] && echo '#define MISHRAN_DUPLEX_SELFTEST'
+        # ⛔ MISHRAN_JALWA_SELFTEST removed 2026-08-03 — a different defect from the two hooks either
+        # side of it: it assigned no net_ip, it was a buildable gate that ASSERTED the retired
+        # transport works. Its smoke passed only if jalwa printed "audio routed through the mishran
+        # mixer", which jalwa prints only on a completed loopback:7701 connect — impossible on an
+        # ordinary agnos boot. Local IPC is naadi, not TCP. See agnos
+        # docs/development/planning/ipc.md §9/§10. The in-process mixer proof is
+        # MISHRAN_AUDIO_SELFTEST above (mishtone, msh_router_* only — no sockets); it is honest, keep it.
+        # ⛔ MISHRAN_DUPLEX_SELFTEST removed 2026-08-03 — same defect as AETHERSAFHA_SETU_SELFTEST above:
+        # the hook manufactured the loopback address the duplex client needed, so its pass proved the
+        # hook, not the path. See agnos docs/development/planning/ipc.md §10.
         [ -n "$FP_SELFTEST" ]        && echo '#define FP_SELFTEST'
         [ -n "$FP_AREA_SELFTEST" ]   && echo '#define FP_AREA_SELFTEST'
         [ -n "$FP_NM_SELFTEST" ]     && echo '#define FP_NM_SELFTEST'

@@ -2,12 +2,20 @@
 # aethersafha-clients-test.py — reproduce, IN QEMU, the iron failure where the desktop's setu
 # clients spawn and never connect.
 #
-# ⛔ WHY THIS EXISTS. `scripts/smoke/aethersafha-setu-smoke.sh` PASSES: both clients connect and
-# present. But it launches the compositor from the AETHERSAFHA_SETU_SELFTEST kernel hook, as a
-# background proc ("loading compositor bg", "ae pid=2"). On iron the operator launched it the way a
-# person actually does — `aethersafha` at the agnsh prompt — and `--clients` returned 93 with NO
-# output from either client at all. The smoke could never have caught that, because it does not
-# exercise the launch path a human uses.
+# ⛔ THE TRANSPORT THIS HARNESS EXERCISES IS RETIRED (2026-08-03). setu over TCP-on-loopback was a
+# WRONG PREMISE and is being removed; the desktop transport is the agnos socket (naadi) — see agnos
+# docs/development/planning/ipc.md §10. This file is NOT a gate and must not be run as one: a pass
+# here would prove nothing about a transport that no longer exists. It is retained as the DIAGNOSIS
+# — it is the harness that caught the rigging, and its comments are the record of how the rigging
+# worked. Do not resurrect the TCP path on the strength of anything written below.
+#
+# ⛔ WHY THIS EXISTS. The now-deleted `scripts/smoke/aethersafha-setu-smoke.sh` PASSED: both clients
+# connected and presented. That pass was a FALSE GREEN. It launched the compositor from the
+# AETHERSAFHA_SETU_SELFTEST kernel hook (also deleted), which assigned net_ip = 0x7F000001 in the
+# kernel first — the only reason the loopback handshake ever completed. On iron the operator
+# launched it the way a person actually does — `aethersafha` at the agnsh prompt — and `--clients`
+# returned 93 with NO output from either client at all. The smoke could never have caught that: it
+# did not exercise the launch path a human uses, and it manufactured the address path besides.
 #
 # ⭐ The clients need NO GPU. `--clients` tests spawn_path + setu + scheduling, every one of which
 # QEMU runs faithfully. There was no reason to spend a burn on this question and this harness is the
@@ -66,11 +74,12 @@ def sh(cmd):
         print("FAIL build step:", cmd, "\n", r.stderr.decode("latin1")[:400]); sys.exit(1)
 
 # ⛔ THE KERNEL MUST BE BARE, and this check exists because the first run of this harness silently
-# tested the wrong thing. `scripts/smoke/aethersafha-setu-smoke.sh` rebuilds build/agnos with
-# AETHERSAFHA_SETU_SELFTEST=1 — a kernel that auto-runs the compositor at boot and never reaches
-# agnsh. The harness booted it, saw no banner, and reported "no agnsh banner" as if the boot were
-# broken. A selftest kernel here does not fail this test, it INVALIDATES it: the whole point is to
-# exercise the agnsh launch path, which that kernel never gets to.
+# tested the wrong thing. The retired `aethersafha-setu-smoke.sh` rebuilt build/agnos with
+# AETHERSAFHA_SETU_SELFTEST=1 — a kernel that auto-runs the compositor at boot, never reaches agnsh,
+# and assigns net_ip = 0x7F000001 so the loopback handshake succeeds. The harness booted it, saw no
+# banner, and reported "no agnsh banner" as if the boot were broken. That define and that smoke are
+# GONE (2026-08-03) and must not return; this guard stays as the tripwire, because a kernel carrying
+# any such hook does not fail this test, it INVALIDATES it.
 # ⚠ It also means running any smoke after burn-prep clobbers the staged burn artifact — re-run
 # burn-prep before flashing.
 with open(AGNOS, "rb") as _f:
@@ -123,10 +132,12 @@ qemu = subprocess.Popen([
     # (it wants dst>>24==127, or dst==net_ip which is 0 and explicitly excluded) — so the reply is
     # handed to `nic_send` and dropped. The connect then fails for a reason that has nothing to do
     # with the desktop.
-    # ⚠ `AETHERSAFHA_SETU_SELFTEST` hides this by assigning `net_ip = 0x7F000001` in the kernel hook
-    # before it launches the compositor. That fixup exists ONLY in that selftest, so the smoke has
-    # never exercised the address path a real boot takes — and a harness without a NIC reproduces
-    # the workaround's absence rather than any desktop fault.
+    # ⛔ THIS IS THE RIGGING ITSELF. `AETHERSAFHA_SETU_SELFTEST` hid the above by assigning
+    # `net_ip = 0x7F000001` in the kernel hook before it launched the compositor. That fixup existed
+    # ONLY in that selftest, so the smoke NEVER exercised the address path a real boot takes — an
+    # ordinary boot's compositor↔client handshake could not complete at all. Every green tied to that
+    # smoke was a false green, and it is why setu-over-TCP is retired in favour of naadi. The define,
+    # the hook and the smoke were deleted 2026-08-03; nothing here is a reason to restore them.
     # ⭐ archaemenid has a live r8169 and DHCPs to a real address, so a NIC here matches iron.
     "-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0",
     "-serial", f"file:{SER}", "-display", "none", "-no-reboot",

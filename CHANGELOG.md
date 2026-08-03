@@ -56,8 +56,15 @@ aethersafha [`docs/development/planning/desktop.md`](https://github.com/MacCrack
 - **Local IPC / what an agnos socket is.** The sovereign display protocol currently runs its control
   channel over **TCP on loopback:7700**, which drags a DHCP dependency into a local display protocol, a
   `net_ip == 0` case unfixable from ring 3, and a `sock_connect #47` that holds preempt disabled for the
-  whole attempt. Design call, not a patch. Any kernel half lands here. Candidates, constraints and the
-  outstanding decision: [`planning/ipc.md`](docs/development/planning/ipc.md).
+  whole attempt. Design call, not a patch. Any kernel half lands here. **Decided 2026-08-03: `naadi`** —
+  one syscall `#96 nd_op`, VFS tag `VFS_NAADI = 11`, kernel band `nd_*`, ops `0x00`–`0x09` with `0x0A`
+  `ND_HANDOFF` / `0x0B` `ND_DIAL` reserved and their caps bits clear. ⚠ `#96` is contested with `fork`
+  (`docs/development/roadmap.md:41`); whichever lands first takes it and the other takes `#97`. Design,
+  migration and kill criteria: [`planning/ipc.md`](docs/development/planning/ipc.md) §9.
+- **`epoll_wait`'s zero-result path halts the CPU with interrupts off.** `syscall.cyr:6695` runs a bare
+  `arch_wait()` — `hlt` with no `sti` (`arch/x86_64/io.cyr:143`) — inside an IF=0 syscall handler, on a
+  path taken regardless of watch type, so an `epoll_wait` on an unexpired timerfd or an unsignalled
+  signalfd hangs the box. Fix is to delete the call and fall through to `return found;`.
 - **`net_config #61`**: surface `lo_dropped` (`net.cyr:22`, incremented at `:210`) and `lo_count`.
   `lo_dropped` is currently incremented and **never printed anywhere**, while a lo-ring drop costs a
   full 1 s TCP RTO.
@@ -1178,6 +1185,21 @@ switch) · foreground `aethersafha` in QEMU reaches `exit 95`.
 - **`blk_close`#80**.
 
 ## [1.53.9] — 2026-07-09 — on-device setu SHARED-BUFFER present composites end to end on agnos
+
+⛔ **RETRACTED 2026-08-03 — the "end to end on agnos" half of this heading is a FALSE GREEN**, produced by the
+`AETHERSAFHA_SETU_SELFTEST` kernel hook's `net_ip = 0x7F000001` assignment. Its only on-agnos evidence was
+`aethersafha-setu-smoke.sh` gate 4, which passed solely because that assignment made src == dst == `127.0.0.1`
+so `tcp_find_conn` matched. On an ordinary 1.53.9 boot the compositor↔client connect could not complete —
+route-derived source selection (`net_src_for`) did not exist until **1.56.34**. The hook and that smoke are
+deleted. ⚠ **This retracts the PROOF, not the kernel shm band below**: `shm_create`#71 / `shm_write`#72 /
+`shm_read`#73 / `shm_free`#74 shipped, are unaffected, and stand — they need a different citation. See
+`docs/development/planning/ipc.md` §10.
+
+⛔ **RETIRED 2026-08-03 (a separate claim from the one above)** — TCP-on-loopback is no longer the desktop
+transport, by operator ruling; the replacement is the agnos socket **`naadi`** (`planning/ipc.md` §9). Lines in
+this entry are marked with whichever applies: *false green* = the evidence was rigged; *retired* = the result
+was real but the path is gone.
+
 - Added the kernel shm band: **`shm_create`#71 / `shm_write`#72 / `shm_read`#73 / `shm_free`#74** — a 16-slot table
   over single 2 MB pmm pages, 1-based ids (0 reserved as the setu inline sentinel). The page's `pmm_kva_for_access`
   KVA lives in the kernel mirror so client write and compositor read reach it from their own syscall CR3 — a pure
@@ -1188,14 +1210,35 @@ switch) · foreground `aethersafha` in QEMU reaches `exit 95`.
   yield (producers non-blocking + `sched_yield`#44) · server-first (bind before the client connects) ·
   post-`sched_active` launch · sub-window TCP chunks (`sock_send`#48 blocks preempt-held above the ~2 KB loopback
   ring, so large frames go on shm).
+  ⛔ **PART 4 RETRACTED 2026-08-03 — "sub-window TCP chunks" is FALSIFIED as a recipe step; do not follow it.**
+  The measurement under it stands (`sock_send`#48 does block preempt-held above the ~2 KB `TCP_RX_RING`, which is
+  why large frames went on shm) — but pixels leaving the wire for shm, and later PCM doing the same in a second
+  subsystem, was the TRANSPORT being falsified, not a chunking technique worth keeping. **Parts 1-3 — cooperative
+  yield · server-first · post-`sched_active` launch — STAND.** ⚠ The recipe was also only ever exercised against a
+  listener on TCP loopback, a transport RETIRED 2026-08-03 in favour of `naadi`; see `planning/ipc.md` §9-§10.
 - Proof file exactly **245,760 B** (320×192×4); composited PPM had 2,032 green-border and 61,440 non-black pixels.
+  ⚠ **QUALIFIED 2026-08-03 — this is the LINUX proof** (`setu_serve_probe` + `present_probe`, file backend). It is
+  HONEST, it is unaffected by the selftest hook, and it STANDS. It is not, and never was, on-agnos evidence.
 
 ## [1.53.8] — 2026-07-09 — loopback TCP works with no NIC + the on-device setu scaffold
 - Fixed: `tcp_send_pkt` dropped every loopback segment. Now gated on `nic_ready()==0 && net_is_loopback(dst)==0`.
   This is what enabled the two-proc setu handshake.
+  ⛔ **RETRACTED 2026-08-03 — "This is what enabled the two-proc setu handshake" is a FALSE GREEN**, produced by
+  the `AETHERSAFHA_SETU_SELFTEST` kernel hook's `net_ip = 0x7F000001` assignment. The only handshake this ever
+  completed was under that hook. On an ordinary boot every outbound SYN still claimed `net_ip` as its source, the
+  SYN-ACK came back on a 4-tuple `tcp_find_conn` could not match, and `sock_connect #47` returned **-1 instantly**.
+  An honest loopback connect first became possible at **1.56.34** (`net_src_for`, route-derived source selection).
+  ⚠ The `tcp_send_pkt` loopback gate itself is a real fix and STANDS — only the enablement claim is withdrawn.
+  ⚠ Separately: TCP-on-loopback as the DISPLAY transport is RETIRED 2026-08-03 in favour of `naadi`
+  (`planning/ipc.md` §9); see §10.
 - The two-proc handshake blocker was root-caused via the QEMU monitor as a **console_lock preemption deadlock** (RIP
   spinning on a held lock, IF=0), fixed by flipping the proc READY after kmain's last `kprint` — NOT the stub `#DF`
   the earlier theory named.
+  ⚠ **SCOPE-CORRECTED 2026-08-03 — not a retraction.** The console_lock root cause and its fix STAND: they were
+  read off the QEMU monitor (RIP spinning on a held lock with IF=0), evidence independent of any selftest hook.
+  What does not stand is the implied verdict that the setu handshake therefore worked — that verification came
+  off the rigged `AETHERSAFHA_SETU_SELFTEST` smoke. Deadlock: genuinely fixed here. Handshake: not honestly
+  demonstrated until 1.56.34.
 
 ## [1.53.7] — 2026-07-08 — console-perf closeout: interrupt-driven keyboard + FB RAM shadow buffer
 - Added the interrupt-driven USB-HID keyboard (xHCI MSI-X vector `0x51`), the net-RX-IRQ analog.

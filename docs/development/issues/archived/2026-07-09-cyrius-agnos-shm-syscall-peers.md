@@ -10,6 +10,26 @@ pattern). Re-proven on BOTH targets: `aethersafha-setu-smoke.sh` gate 4 GREEN wi
 native-wrapper binaries, and the Linux `setu_serve_probe`+`present_probe` PPM (file backend,
 unchanged) still 2032 green px. Nothing left but the git (setu cut). Historical detail below.
 
+> ⛔ **RETRACTED 2026-08-03 — the agnos-side CITED EVIDENCE above is invalid.** The
+> `aethersafha-setu-smoke.sh` "gate 4 green" was a **FALSE GREEN**: that gate passed only because
+> the `AETHERSAFHA_SETU_SELFTEST` kernel hook assigned `net_ip = 0x7F000001`, making src == dst
+> == `127.0.0.1` so `tcp_find_conn` matched. **Before `net_src_for` (agnos 1.56.34)** the
+> compositor↔client handshake could not complete on an ordinary boot. That script has been deleted
+> and the selftest hook removed. **This retraction is about the PROOF, not the FIX** — the
+> `sys_shm_*` wrappers (71-74) themselves are unaffected and are independently exercised by the
+> honest `aethersafha-smoke.sh` render proof; only the claim "re-proven on agnos via gate 4" must
+> not be cited. See agnos `docs/development/planning/ipc.md` §9-§10.
+>
+> ⚠ **SCOPE CORRECTION (2026-08-03, same day).** An earlier form of this retraction said the
+> transport "never worked on agnos" / "TCP was never the desktop transport". **That is FALSE and is
+> withdrawn.** *After* `net_src_for`, the un-rigged
+> `scripts/harness/aethersafha-clients-test.py` reached **"connected: 2, presented: 2"** on 1.56.34+
+> (2026-08-02) — that harness byte-scans `build/agnos` and hard-exits if the kernel carries any
+> selftest hook, and it is what caught the rigging. ⚠ QEMU at `-smp 1` only; never shown on iron,
+> `-smp 4` fault-kills. TCP-on-loopback is retired because it is the **wrong primitive** for local
+> display IPC (operator ruling), **not** because it was broken. The gate-4 citation above stays
+> retracted regardless — it was rigged.
+
 The agnos kernel shm half (`shm_create`#71 / `shm_write`#72 / `shm_read`#73 / `shm_free`#74)
 shipped + QEMU-proven (agnos 1.53.9). The cyrius ring-3 wrapper was the ABI-completeness half —
 now landed in 6.4.34. Originally the first consumer (setu `buf.cyr`) called #71-74 via **raw
@@ -97,9 +117,19 @@ fn sys_shm_free(id): i64            { return syscall(SYS_SHM_FREE, id); }
 ## Status of the other halves (all done — this is the only open piece)
 
 - **Kernel (agnos)** — `shm_create`/`shm_write`/`shm_read`/`shm_free` `#71-74` + the 16-slot pmm-page
-  table (`kernel/core/syscall.cyr`). **QEMU-proven**: `aethersafha-setu-smoke.sh` gate 4 green — a
+  table (`kernel/core/syscall.cyr`). ~~**QEMU-proven**: `aethersafha-setu-smoke.sh` gate 4 green — a
   setu client `shm_write`s a 320×192 frame, the compositor `shm_read`s + composites it on agnos
-  (`setu client CONNECTED + PRESENTED + composited on agnos`). agnos 1.53.9.
+  (`setu client CONNECTED + PRESENTED + composited on agnos`).~~ agnos 1.53.9.
+  ⛔ **RETRACTED 2026-08-03 — invalid proof, not an invalid fix.** The gate-4 "green" was a FALSE
+  GREEN: it passed only because the `AETHERSAFHA_SETU_SELFTEST` kernel hook assigned
+  `net_ip = 0x7F000001`. The connection the gate depended on could not complete on an ordinary boot
+  **before `net_src_for` (agnos 1.56.34)**, so this line proves nothing about the shm band. The
+  kernel shm `#71-74` implementation is not in question — it just needs a different citation.
+  ⚠ **Scope, so this is not read as more than it is**: after `net_src_for` an un-rigged client↔
+  compositor connect + present *did* land (`aethersafha-clients-test.py`, "connected: 2,
+  presented: 2", 2026-08-02, QEMU `-smp 1`, never on iron). TCP-on-loopback is retired as the
+  **wrong primitive**, not as a thing that never worked. See
+  `docs/development/planning/ipc.md` §9-§10.
 - **Consumer (setu `buf.cyr`)** — copy-based backend `setu_buf_create`/`_write`/`_read`/`_close`;
   the agnos branch calls the raw numbers `syscall(71..74)` (setu already links `syscalls`);
   Linux branch = `/dev/shm/setu-buf-<id>` write()/read(). Builds `--agnos` + Linux; the full present
