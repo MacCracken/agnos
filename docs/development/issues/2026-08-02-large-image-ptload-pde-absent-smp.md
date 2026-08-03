@@ -1,6 +1,75 @@
-# A large binary reaches ring 3 with one of its own PT_LOAD PDEs absent (SMP only)
+# The APs never enabled `EFER.NXE`, so every NX page was a reserved-bit `#PF` on an AP
 
-**Opened** 2026-08-02 · **Status** OPEN — root cause not established, but **the field is halved** · **Repro** QEMU, no hardware needed
+*(Filed as "a large binary reaches ring 3 with one of its own PT_LOAD PDEs absent (SMP only)". The PDE
+was never absent — see the root cause. Title kept in the body for searchability.)*
+
+**Opened** 2026-08-02 · **RESOLVED 2026-08-03** · **Repro** QEMU `-smp 4`, no hardware needed
+
+---
+
+## ⭐ ROOT CAUSE — one line
+
+`kernel/arch/x86_64/smp.cyr:514`, the AP trampoline's EFER write:
+
+```
+    or eax, 0x100      # LME only            <- BUG
+    or eax, 0x900      # LME | NXE           <- FIX
+```
+
+The **BSP** sets `EFER |= 0x900` (LME | **NXE**) in `kernel/arch/x86_64/boot_shim.cyr:100`. The **APs**
+set only `0x100` (LME). `EFER.NXE` (bit 11) is what makes bit 63 of a paging-structure entry mean
+*no-execute*; **with NXE clear, bit 63 is a RESERVED bit.**
+
+`proc_map_page_nx` stamps `0x8000000000000087` — bit 63 set — on **every W^X data page and every user
+stack**. So the first time any AP touched an NX page, the CPU raised a **reserved-bit page fault**.
+
+### Why every symptom followed
+
+| symptom | explanation |
+|---|---|
+| `-smp 4` fails, `-smp 1` passes | only APs lack NXE; the BSP has it |
+| Only the 15.6 MB image | more NX pages and a longer run ⇒ far likelier to be scheduled onto an AP |
+| Victim index MOVED between runs (`0x1fe`, `5`, `3`) | whichever NX page the AP happened to touch first |
+| **PD[2] never faulted** | code is mapped by `proc_map_page` — **no NX bit** — so the code page was always legal |
+| PDE verified present at load, spawn, every CR3 install, every tick | it *was* present. The entry was always correct |
+| Error code `0xc` / `0xe` | **bit 3 = RSVD** was set the whole time |
+
+### ⛔ What hid it for a day — an instrument, again
+
+`fmt_hex_buf` **emits zero characters for a value with bit 63 set.** The fault recorder printed
+`pde=0x`, which was read as *"the PDE is zero"* when it actually meant *"the PDE has NX set and the
+formatter cannot print it."* Every hypothesis in this document followed from that single misreading.
+
+The error code had been reporting `RSVD` in bit 3 from the very first capture on 2026-08-02. Bits 0-2
+were decoded; bit 3 was not. **The answer was in the first measurement.**
+
+⚠ This is the same failure class as the four instrument warnings already listed below, and the third
+distinct way `fmt_hex_buf` has produced a false reading on this issue. `epp_hex` and the fault recorder
+now split bit 63 and print `NX|<rest>` explicitly.
+
+### Verification
+
+```
+-smp 4 foreground : connected 2, presented 2, exit 95
+-smp 4 repeat     : connected 2, presented 2, exit 95
+-smp 4 background : connected 2, presented 2
+-smp 1 regression : connected 2, presented 2, exit 95
+```
+
+### Landed alongside (keep)
+
+- **TLB shootdown IPI** — `apic.cyr`: `tlb_shootdown_all()` (local CR3 reload → IPI all-but-self on
+  vector 0xF0 → bounded ack spin), `tlb_isr_build()`, `tlb_shootdown_handler()`; vector installed in
+  `main.cyr`; called from `proc_free_address_space`, `proc_unmap_page`, `proc_unmap_2mb_hi`. agnos had
+  **zero** cross-CPU invalidation — a real latent hole under SMP with recycled address spaces. Verified
+  running (`TLB_SHOOT_PROBE=1` → `TLBSHOOT want=3 ack=3 cpus=4 apic=1`). **Not** this bug, but correct.
+- **`ELF_PDE_PROBE=1`** diagnostics: per-PDE write verification, live page-table registry checked by
+  `pmm_alloc`/`pmm_alloc_2mb`, `pd_audit`/`pd_tripwire`, subject-controlled CR3-install and tick
+  watches, and hardware CR3/CR2 capture stamped in the `#PF` stub itself.
+
+---
+
+## (original filing) A large binary reaches ring 3 with one of its own PT_LOAD PDEs absent (SMP only)
 
 ## ⭐ 2026-08-03 — THE MAPPING LANDS. SOMETHING UNDOES IT.
 

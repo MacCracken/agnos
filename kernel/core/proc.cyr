@@ -651,7 +651,7 @@ fn proc_create_address_space() {
     # ELF_PDE_PROBE: record every address-space ALLOCATION. Paired with the FREE record in
     # proc_free_address_space, this shows whether one PML4 is handed out twice — and if so whether a
     # free came between (LIFO pmm reuse under a live occupant) or not (one proc loaded twice).
-#ifdef ELF_PDE_PROBE
+    #ifdef ELF_PDE_PROBE
     ptpage_selftest_once();
     ptpage_register(new_pml4);
     ptpage_register(new_pdpt);
@@ -667,7 +667,7 @@ fn proc_create_address_space() {
     klug_append(" cpu=", 5);
     epp_hex(pcpu_cpu());
     klug_putc(10);
-#endif
+    #endif
     return new_pml4;
 }
 
@@ -754,7 +754,7 @@ fn proc_free_address_space(cr3) {
     }
     # Free the three page-table pages (4 KB each).
     # ELF_PDE_PROBE: record every address-space FREE, before the pages go back to the allocator.
-#ifdef ELF_PDE_PROBE
+    #ifdef ELF_PDE_PROBE
     klug_append("asfree pml4=0x", 14);
     epp_hex(cr3);
     klug_append(" pdpt=0x", 8);
@@ -766,7 +766,7 @@ fn proc_free_address_space(cr3) {
     klug_append(" cpu=", 5);
     epp_hex(pcpu_cpu());
     klug_putc(10);
-#endif
+    #endif
     # ⭐ SHOOT DOWN BEFORE THESE PAGES GO BACK TO THE ALLOCATOR. LIFO pmm_alloc hands the same PML4
     # straight back out, and without PCID a CR3 value is the only TLB tag — so any CPU still holding
     # entries for this address space would apply them to its successor. This is the fix for the

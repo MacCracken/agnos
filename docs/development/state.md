@@ -19,19 +19,24 @@ type: state
 | Bootloader | gnoboot **0.6.0**; Path C, `RDI = &boot_info`, magic `0x41474E4F`, entry `0x1000a8` | `gnoboot/VERSION` |
 | Iron target | archaemenid — Beelink SER NUC, AMD Cezanne APU, 4 CPUs, 64 GB. Build host **is** the target, so no serial channel exists. | — |
 
-**NEXT BITE — ⛔ NOT the desktop iron burn. It was superseded the same day it was named.** The desktop
-burn assumed the remaining question was iron-only; it is not. `run /bin/aethersafha` is fault-killed
-(`exit 142`) **in QEMU under `-smp 4`** and passes under `-smp 1` — same kernel, same binaries. So the
-next bite is **K1: root-cause the PT_LOAD PDE-absent fault**, which needs no hardware.
+⭐ **RESOLVED 2026-08-03 — the `-smp 4` fault was `EFER.NXE` never being enabled on the APs.** The AP
+trampoline set `EFER |= 0x100` (LME only) while the BSP sets `0x900` (LME | NXE) — so on any AP, bit 63
+of a paging-structure entry was RESERVED, and `proc_map_page_nx` sets it on every W^X data page and
+every user stack. First touch of an NX page on an AP = reserved-bit `#PF`. One-line fix at
+`kernel/arch/x86_64/smp.cyr:514`. `-smp 4` now reaches **connected 2, presented 2, exit 95** (fg and
+bg), `-smp 1` unchanged.
 → [`issues/2026-08-02-large-image-ptload-pde-absent-smp.md`](issues/2026-08-02-large-image-ptload-pde-absent-smp.md)
-⛔ **`AE_CLIENTS_SMP` defaults to `"1"`** (`scripts/harness/aethersafha-clients-test.py:114`), so every
-desktop QEMU proof to date has silently been single-CPU while archaemenid runs 4 with the SMP gates
-live. Re-run the ladder at `AE_CLIENTS_SMP=4` before believing any desktop green.
+**NEXT BITE:** the desktop iron burn is unblocked — archaemenid runs 4 CPUs and that is now the tested
+configuration. ⚠ Note a cross-CPU **TLB shootdown IPI** also landed alongside (vector 0xF0); agnos had
+none at all before.
+⚠ **`AE_CLIENTS_SMP` still defaults to `"1"`** (`scripts/harness/aethersafha-clients-test.py:114`), so
+every desktop QEMU proof taken *before* 2026-08-03 was silently single-CPU. The `-smp 4` result above is
+explicit. **Pass `AE_CLIENTS_SMP=4` — it now passes, and it is what archaemenid runs.**
 
 **1.56.35 is the desktop's kernel half** — opened 2026-08-02, scope in [`CHANGELOG.md`](../../CHANGELOG.md). The full
 rationale per item, and the substrate matrix that decides what each proof is worth, live in aethersafha
 [`planning/desktop.md` §6](https://github.com/MacCracken/aethersafha/blob/main/docs/development/planning/desktop.md).
-Headline four: **K1** the SMP PDE fault · **K3** `spawn_path #43` never calls `exec_redirect_apply` so
+Headline four: ~~**K1** the SMP PDE fault~~ **(DONE 2026-08-03 — `EFER.NXE` on the APs)** · **K3** `spawn_path #43` never calls `exec_redirect_apply` so
 the desktop procs interleave on the console unserialised (this has already corrupted one verdict) ·
 **K4** raise the loader's user-image floor `0x200000` → `0x400000` (free — every binary already bases
 at 0x400000) · **K6** CHANGELOG `net_src_for` (`net.cyr:203-206`), which exists in the shipped kernel

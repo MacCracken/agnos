@@ -28,6 +28,48 @@ reproduces in QEMU — not, as assumed when the iron burn was scheduled, a hardw
 Full rationale per item, and the substrate matrix that decides what each proof is worth, live in
 aethersafha [`docs/development/planning/desktop.md`](https://github.com/MacCracken/aethersafha/blob/main/docs/development/planning/desktop.md).
 
+### Fixed — the APs never enabled `EFER.NXE`, so every NX page was a reserved-bit `#PF` on an AP
+
+`kernel/arch/x86_64/smp.cyr:514` — the AP trampoline set `EFER |= 0x100` (LME only). The BSP sets
+`0x900` (LME | **NXE**) in `boot_shim.cyr:100`. `EFER.NXE` is what makes bit 63 of a paging-structure
+entry mean *no-execute*; with it clear, **bit 63 is RESERVED**. `proc_map_page_nx` sets exactly that
+(`0x8000000000000087`) on every W^X data page and every user stack, so the first touch of any NX page on
+an AP raised a reserved-bit page fault. One line: `0x100` → `0x900`.
+
+This was the `-smp 4` desktop blocker: `run /bin/aethersafha` (15.6 MB) fault-killed with `exit 142`
+under 4 CPUs while passing under 1. It explains the whole symptom set — SMP-only (APs), large-image-only
+(more NX pages, more chance of landing on an AP), a victim address that moved between runs (whichever NX
+page the AP touched first), and why the **code** page never faulted (`proc_map_page`, no NX bit).
+
+Verified: `-smp 4` foreground and background both reach **connected 2, presented 2, `exit 95`**;
+`-smp 1` unchanged. → [`docs/development/issues/2026-08-02-large-image-ptload-pde-absent-smp.md`](docs/development/issues/2026-08-02-large-image-ptload-pde-absent-smp.md)
+
+⚠ The error code carried `RSVD` (bit 3) from the first capture on 2026-08-02. It was missed for a day
+because `fmt_hex_buf` emits **zero characters** for a value with bit 63 set, so the fault recorder
+printed `pde=0x` — read as "the PDE is zero" when it meant "the PDE has NX set and cannot be printed".
+`epp_hex` and the fault recorder now split bit 63 and render `NX|<rest>`.
+
+### Added — cross-CPU TLB shootdown (vector 0xF0)
+
+agnos had **no** cross-CPU TLB invalidation at all: every `invlpg_va()` flushed only the executing CPU,
+while address spaces are recycled by LIFO `pmm_alloc` and, without PCID, a CR3 value is the only TLB tag.
+`apic.cyr` gains `tlb_shootdown_all()` (local CR3 reload → IPI all-but-self → bounded ack spin, so a
+wedged CPU degrades to stale-TLB risk rather than hanging), `apic_send_ipi_allbutself()`,
+`tlb_isr_build()` and `tlb_shootdown_handler()`; the vector is installed in `main.cyr`. Called from
+`proc_free_address_space`, `proc_unmap_page` and `proc_unmap_2mb_hi`. Inert single-core (`cpu_count < 2`
+short-circuits to a local flush). Verified running: `TLBSHOOT want=3 ack=3 cpus=4 apic=1`.
+
+Found while investigating the fault above; it is **not** that bug, but a real latent hole under SMP.
+
+### Added — `ELF_PDE_PROBE` kernel diagnostics (build flag, off by default)
+
+Per-PDE write verification in `elf_load_from_file` (both the kernel PD and the PD[511]-stashed user
+mirror), a live page-table registry consulted by `pmm_alloc` **and** `pmm_alloc_2mb`, whole-PD audits at
+load and spawn, subject-controlled CR3-install and timer-tick watches, and hardware CR3/CR2 captured by
+the `#PF` stub itself before any kernel code runs. `AE_CLIENTS_KLUG=1` makes
+`aethersafha-clients-test.py` dump the klug ring on a **passing** run, so a probe can be validated
+against a known-good boot before its output is trusted.
+
 ### Open — the cut's work, none of it landed yet
 
 - **A large binary reaches ring 3 with one of its own PT_LOAD PDEs absent, under SMP only.**
