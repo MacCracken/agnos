@@ -20,6 +20,38 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 ## [1.56.34] — 2026-07-31 — HDMI audio: CRC null-case calibration (cycle OPEN)
+
+### Fixed — ⛔ A COMPLETED FOREGROUND `run` LEFT THE CPU'S SYSCALL STACK AT AN ADDRESS LARGE PROGRAMS OVERWRITE
+
+`syscall_kstack_reserve` deliberately places each CPU's SYSCALL kernel stack at its **direct-map** VA
+(`DIRECTMAP_BASE + 0xF10000 + cpu*0x10000`), because region 7's identity VA (14-16 MB) lies **inside** the
+user-segment range — `elf_load` maps PT_LOADs up to 256 MB, and `proc_map_page` overrides the per-proc PD
+entries it covers. That is the same class as the "ark won't run" bug fixed for `TSS.RSP0` at 1.51.x.
+
+The `execwait #37` handler's step (h) restored it to the **raw** `0xF10000 + cpu*0x10000` instead. Step (f),
+three lines above, copies from `pcpu_syscall_kstack_top2` — which *is* direct-mapped — so the two halves of
+the same swap disagreed, and only the restore was wrong.
+
+Effect: a fresh boot is safe, and **every completed foreground `run` re-armed the fault for the rest of the
+boot**. Any process whose image reaches past `0xF10000` (15.06 MB) then took its next SYSCALL with `RSP`
+pointing into a page its own segments had overwritten → `#PF` at CPL0 → `#DF` → triple fault.
+`/bin/aethersafha` (14.87 MB, loaded at ≥ 2 MB) is the first binary in this system large enough to be in
+range, which is why nothing else ever tripped it.
+
+⭐ **Demonstrated with a control, not argued.** New `AE_CLIENTS_MODE=armed` in
+`scripts/harness/aethersafha-clients-test.py` runs a small foreground program to completion **first**, then
+launches the compositor — the sequence every prior mode skipped by launching it as the boot's first command.
+On the unfixed kernel that sequence **kills the machine** (serial stops at the command echo, QEMU monitor
+gone); on the fixed kernel it reaches **2 clients connected and presented**. Plain `bg` mode passes on both,
+which is exactly why this hid.
+
+⚠ Very likely the `run: exit 142` that caused agnoshi 1.8.6 to revert foreground `spawn_path` routing — the
+mechanism and symptom class match — but **not yet re-confirmed on iron**.
+
+Verification: `check.sh` 23/23 · `sweep.sh` 15/15 (incl. exec-from-disk, FP ring-3, two-proc FP context
+switch) · foreground `aethersafha` in QEMU reaches `exit 95`.
+
+### Added — HDMI audio (the open bite)
 - Added `MDO_OP_CRCCAL` (`#93` op `0x0A`) + `/bin/modeset --crccal`: three-phase CRC null control in one boot — feed
   STOPPED → RUNNING → STOPPED again, both taps each phase, feed restored as found. Needs no ear; source-side and
   self-controlled.
