@@ -432,6 +432,7 @@ fn do_context_switch(isr_rsp) {
     }
     # S8 (KPTI): update THIS CPU's CR3 pair for the SYSCALL stub (4c per-CPU)
     store64(&pcpu_kpti_kernel_cr3 + pcpu_cpu() * 8, new_cr3);
+    pd_tripwire(new_cr3, 3);     # tag 3 = scheduler dispatch — SILENT unless PD[510] is already gone
     store64(&pcpu_kpti_user_cr3 + pcpu_cpu() * 8, proc_get_user_cr3(new_cr3));
 
     # 1.46.1: point TSS.RSP0 at the switched-to proc's OWN kernel stack (per-proc
@@ -633,6 +634,7 @@ fn sys_sched_yield() {
     var old_cr3 = proc_get_cr3(yp);
     if (new_cr3 != old_cr3) { cr3_load(new_cr3); }
     store64(&pcpu_kpti_kernel_cr3 + pcpu_cpu() * 8, new_cr3);                  # OMITTING these re-enters the YIELDER's
+    pd_tripwire(new_cr3, 3);     # tag 3 = scheduler dispatch — SILENT unless PD[510] is already gone
     store64(&pcpu_kpti_user_cr3 + pcpu_cpu() * 8, proc_get_user_cr3(new_cr3)); # CR3 on next's first syscall (1.40.x class); 4c per-CPU
     tss_set_rsp0(proc_rsp0_top(next));                 # 1.46.1: per-proc RSP0 (inert: #44 yield is IF=1-only; agnsh is IF=0 in production)
     fpu_set_ts();                                      # 1.53.x B3b: arm #NM for next — its first SSE op FXRSTORs its FP area

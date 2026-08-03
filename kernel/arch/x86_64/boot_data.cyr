@@ -51,6 +51,17 @@ var timer_isr[64];
 var kb_isr[96];    # keyboard ISR machine code (~83 bytes)
 var nic_rx_isr[64];  # NIC RX MSI-X ISR machine code (~62 bytes) — 1.51.5
 var xhci_rx_isr[64]; # xHCI RX (USB-HID) MSI-X ISR machine code (~62 bytes) — 1.53.7
+# TLB-shootdown IPI stub (vector 0xF0). agnos had NO cross-CPU TLB invalidation of any kind before
+# 2026-08-03 — every invlpg_va() flushed only the CPU executing it — so a PML4 recycled by LIFO
+# pmm_alloc left other CPUs translating the NEW occupant's addresses through the OLD occupant's
+# cached entries. See docs/development/issues/2026-08-02-large-image-ptload-pde-absent-smp.md.
+# ⭐ HARDWARE-TRUTH #PF CAPTURE (2026-08-03). Every prior instrument read page-table state from
+# Cyrius code running DOWNSTREAM of the fault handler, and inferred backwards — which is why they all
+# reported healthy tables against a not-present fault. These are stamped by the #PF STUB ITSELF, in
+# the first instructions after the trap, before any kernel code runs. They are the CPU's own view.
+var pf_hw_cr3 = 0;
+var pf_hw_cr2 = 0;
+var tlb_isr[64];
 var nm_isr[64];    # #NM (vector 7) FP-context-switch ISR machine code — 1.53.x B3 (timer_isr shape)
 var kb_buf[256];
 var kb_head = 0;

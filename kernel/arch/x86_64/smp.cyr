@@ -508,10 +508,17 @@ fn smp_build_trampoline() {
     # CR3 = 0x1000 (shared PML4)
     store8(p+off, 0xB8); store32(p+off+1, 0x1000); off = off + 5;
     store8(p+off, 0x0F); store8(p+off+1, 0x22); store8(p+off+2, 0xD8); off = off + 3;
-    # Enable LME in EFER
+    # Enable LME **and NXE** in EFER.
+    # ⛔ 0x100 (LME only) was the 2026-08-02 `-smp 4` large-image #PF. The BSP sets 0x900 in
+    # boot_shim.cyr:100 (LME | NXE); the APs only ever set LME. Without EFER.NXE, bit 63 of a
+    # paging-structure entry is a RESERVED bit — and proc_map_page_nx stamps exactly that on every
+    # W^X data page and every user stack (0x8000000000000087). So the FIRST touch of any NX page on
+    # an AP took a reserved-bit #PF (error code bit 3 set), while the same binary ran fine at -smp 1
+    # on the BSP. Code pages use proc_map_page (no NX), which is why the faulting address was always
+    # a stack or data page and never the code page.
     store8(p+off, 0xB9); store32(p+off+1, 0xC0000080); off = off + 5;
     store8(p+off, 0x0F); store8(p+off+1, 0x32); off = off + 2;
-    store8(p+off, 0x0D); store32(p+off+1, 0x100); off = off + 5;
+    store8(p+off, 0x0D); store32(p+off+1, 0x900); off = off + 5;
     store8(p+off, 0x0F); store8(p+off+1, 0x30); off = off + 2;
     # Enable paging: CR0 |= 0x80000000
     store8(p+off, 0x0F); store8(p+off+1, 0x20); store8(p+off+2, 0xC0); off = off + 3;

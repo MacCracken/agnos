@@ -185,3 +185,119 @@ fn apic_send_sipi(target, vector) {
     while ((apic_read(0x300) & 0x1000) != 0) { if (w2 >= ICR_DELIVERY_WAIT) { break; } w2 = w2 + 1; }
     return 0;
 }
+
+# === TLB SHOOTDOWN (2026-08-03) ==================================================================
+# agnos had NO cross-CPU TLB invalidation. Every `invlpg_va()` flushes only the CPU executing it, so
+# when an address space is torn down and its PML4 handed straight back out by LIFO `pmm_alloc`, other
+# CPUs keep translating the NEW occupant's addresses through the OLD occupant's cached entries. The
+# page tables are correct — the CPU never consults them. That is the 2026-08-02 `-smp 4` fault:
+# PDEs verified present at load, at spawn and at every dispatch, yet a not-present #PF whose victim
+# address moves run to run. Without PCID a CR3 VALUE is the only TLB tag there is, so a recycled PML4
+# is indistinguishable from the space it replaced.
+#
+# Design: sender flushes locally, IPIs all-but-self on vector 0xF0, then spins until every woken CPU
+# acknowledges. The handler reloads CR3 (flushes all non-global entries — coarser than per-page
+# invlpg, but correct, and this path is rare). Bounded wait so a wedged CPU degrades to a stale-TLB
+# risk instead of hanging the box, matching apic_send_init's ICR_DELIVERY_WAIT posture.
+var tlb_shoot_probe_n = 0;
+fn tlb_probe_hex(v) {
+    var b[16];
+    if (v == 0) { klug_append("0", 1); return 0; }
+    var n = fmt_hex_buf(v, &b);
+    klug_append(&b, n);
+    return 0;
+}
+var tlb_shoot_ack = 0;
+var tlb_shoot_want = 0;
+var TLB_SHOOT_VECTOR = 240;          # 0xF0 — clear of 7 / 32 / 33 / 80 / 81
+var TLB_SHOOT_WAIT = 2000000;
+
+# Handler body. Reload CR3 to flush this CPU's non-global TLB, then acknowledge and EOI.
+fn tlb_shootdown_handler() {
+    asm {
+        0x0F; 0x20; 0xD8;            # mov rax, cr3
+        0x0F; 0x22; 0xD8;            # mov cr3, rax
+    }
+    tlb_shoot_ack = tlb_shoot_ack + 1;
+    apic_eoi();
+    return 0;
+}
+
+# Build the vector-0xF0 stub — timer_isr_build's shape, minus the callee-saved block (this handler
+# never context-switches, so only the caller-saved set the ABI lets it clobber must be preserved).
+fn tlb_isr_build() {
+    var p = &tlb_isr;
+    var handler_addr = &tlb_shootdown_handler;
+    var off = 0;
+    store8(p + off, 0x50); off = off + 1;                                   # push rax
+    store8(p + off, 0x51); off = off + 1;                                   # push rcx
+    store8(p + off, 0x52); off = off + 1;                                   # push rdx
+    store8(p + off, 0x56); off = off + 1;                                   # push rsi
+    store8(p + off, 0x57); off = off + 1;                                   # push rdi
+    store8(p + off, 0x41); store8(p + off + 1, 0x50); off = off + 2;        # push r8
+    store8(p + off, 0x41); store8(p + off + 1, 0x51); off = off + 2;        # push r9
+    store8(p + off, 0x41); store8(p + off + 1, 0x52); off = off + 2;        # push r10
+    store8(p + off, 0x41); store8(p + off + 1, 0x53); off = off + 2;        # push r11
+    store8(p + off, 0x48); store8(p + off + 1, 0xB8); off = off + 2;        # mov rax, imm64
+    store64(p + off, handler_addr); off = off + 8;
+    store8(p + off, 0xFF); store8(p + off + 1, 0xD0); off = off + 2;        # call rax
+    store8(p + off, 0x41); store8(p + off + 1, 0x5B); off = off + 2;        # pop r11
+    store8(p + off, 0x41); store8(p + off + 1, 0x5A); off = off + 2;        # pop r10
+    store8(p + off, 0x41); store8(p + off + 1, 0x59); off = off + 2;        # pop r9
+    store8(p + off, 0x41); store8(p + off + 1, 0x58); off = off + 2;        # pop r8
+    store8(p + off, 0x5F); off = off + 1;                                   # pop rdi
+    store8(p + off, 0x5E); off = off + 1;                                   # pop rsi
+    store8(p + off, 0x5A); off = off + 1;                                   # pop rdx
+    store8(p + off, 0x59); off = off + 1;                                   # pop rcx
+    store8(p + off, 0x58); off = off + 1;                                   # pop rax
+    store8(p + off, 0x48); store8(p + off + 1, 0xCF); off = off + 2;        # iretq
+    return 0;
+}
+
+# Fixed-delivery IPI to ALL-BUT-SELF: destination shorthand 0b11 (bits 19:18), delivery mode 000,
+# level assert, edge. 0x0C4000 | vector.
+fn apic_send_ipi_allbutself(vector) {
+    apic_write(0x300, 0x0C4000 | vector);
+    var w = 0;
+    while ((apic_read(0x300) & 0x1000) != 0) { if (w >= ICR_DELIVERY_WAIT) { break; } w = w + 1; }
+    return 0;
+}
+
+# THE PUBLIC ENTRY. Call AFTER the page-table mutation is visible in memory and BEFORE the affected
+# pages can be reused. Single-core (cpu_count < 2) is a pure local flush — no IPI, no wait.
+fn tlb_shootdown_all() {
+    asm {
+        0x0F; 0x20; 0xD8;            # mov rax, cr3
+        0x0F; 0x22; 0xD8;            # mov cr3, rax   (flush THIS cpu first, always)
+    }
+    if (apic_enabled == 0) { return 0; }
+    if (cpu_count < 2) { return 0; }
+    tlb_shoot_ack = 0;
+    tlb_shoot_want = cpu_count - 1;
+    apic_send_ipi_allbutself(TLB_SHOOT_VECTOR);
+    var w = 0;
+    while (tlb_shoot_ack < tlb_shoot_want) {
+        if (w >= TLB_SHOOT_WAIT) { break; }    # fail-safe: degrade to stale-TLB risk, never hang
+        w = w + 1;
+        asm { 0xF3; 0x90; }                    # pause
+    }
+#ifdef TLB_SHOOT_PROBE
+    # CALIBRATE THE NULL: prove the shootdown fires and that acks come back. A silent fix is
+    # indistinguishable from no fix, which is how this whole investigation kept going wrong.
+    if (tlb_shoot_probe_n < 6) {
+        tlb_shoot_probe_n = tlb_shoot_probe_n + 1;
+        klug_append("TLBSHOOT want=", 14);
+        tlb_probe_hex(tlb_shoot_want);
+        klug_append(" ack=", 5);
+        tlb_probe_hex(tlb_shoot_ack);
+        klug_append(" cpus=", 6);
+        tlb_probe_hex(cpu_count);
+        klug_append(" apic=", 6);
+        tlb_probe_hex(apic_enabled);
+        klug_append(" spins=", 7);
+        tlb_probe_hex(w);
+        klug_putc(10);
+    }
+#endif
+    return 0;
+}

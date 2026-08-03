@@ -50,6 +50,7 @@ fn pic_mask_pit() {
 # Timer ISR handler — called from the ISR bytecode after regs are pushed.
 # rsp_after_push is the stack pointer with all 9 regs + hardware frame on it.
 fn timer_handler(rsp_after_push) {
+    pd510_tick_watch();
     # 1.46.x SMP sub-bite 6b: the BSP owns the wall clock + the single NIC ring. An AP's
     # timer tick must NOT bump timer_ticks (one global clock) nor re-enter net_rx_drain (one
     # shared r8169 ring, single-consumer). Gate both behind pcpu_cpu()==0. ALWAYS-TRUE

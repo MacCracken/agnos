@@ -565,6 +565,11 @@ fn pmm_alloc() {
             store8(pmm_bitmap_ptr + byte, b | (1 << bit));
             pmm_used = pmm_used + 1;
             pmm_spin_unlock();
+            # ELF_PDE_PROBE: is this page STILL a live proc's PML4/PDPT/PD? If so the allocator is
+            # about to hand it to a caller that will legitimately zero it — which is exactly how a
+            # verified-correct PDE later reads 0. Checked outside the lock: the registry has its own
+            # consistency and klug_append must not run under pmm_spin_lock.
+            ptpage_alarm_if_live(i * 0x1000);
             return i * 0x1000;
         }
     }
@@ -620,6 +625,7 @@ fn pmm_alloc_2mb() {
             for (var j = 0; j < 512; j = j + 1) { pmm_set(base + j); }
             pmm_used = pmm_used + 512;
             pmm_spin_unlock();
+            ptpage_alarm_if_live_2mb(base * 0x1000);
             return base * 0x1000;
         }
     }

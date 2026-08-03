@@ -225,6 +225,7 @@ else
         # ⚠ VALIDATE BEFORE TRUSTING: run at -smp 1 (which passes) and confirm every page reports
         # MATCH. A probe that reports MISMATCH on a healthy boot is broken and its -smp 4 output
         # means nothing. Build: ELF_PDE_PROBE=1 sh scripts/build.sh ; read with run /bin/klug.
+        [ -n "$TLB_SHOOT_PROBE" ]    && echo '#define TLB_SHOOT_PROBE'
         [ -n "$ELF_PDE_PROBE" ]      && echo '#define ELF_PDE_PROBE'
         # ⛔ AETHERSAFHA_SETU_SELFTEST removed 2026-08-03 — the hook assigned net_ip = 0x7F000001 in the
         # kernel before launching the compositor, which is the ONLY reason a setu-over-TCP client

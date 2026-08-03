@@ -300,7 +300,32 @@ try:
             kl = line.strip()          # ⚠ NOT `s` — that name is the monitor socket further down
             if kl.startswith("fault: pid="):
                 p("  ⇒", kl)
+            if "DESTROYED_LIVE" in kl:
+                p("  ⛔", kl)
+            if "PD510 " in kl:
+                p("  ●", kl)
+            if "CR3INST" in kl:
+                p("  ◆", kl)
+            if "CR3BAD" in kl:
+                p("  ⛔", kl)
+            if "PDWATCH" in kl:
+                p("  ◉", kl)
+            if "MMAPHI" in kl:
+                p("  ⛔", kl)
+            if "TLBSHOOT" in kl:
+                p("  ⚑", kl)
+            if "PDTRIP" in kl:
+                p("  ⛔", kl)
+            if "pdaudit" in kl:
+                p("  ▣", kl)
+            if "PTSELFTEST" in kl:
+                p("  ✔", kl)
+            if "PTREISSUE" in kl or "PTREISSUE2M" in kl:
+                p("  ⛔", kl)
+            if ("asalloc" in kl) or ("asfree" in kl):
+                p("  ‖", kl)
             if "pdeprobe" in kl:
+                p("  ·", kl)
                 if kl.endswith("MATCH"):
                     n_match += 1
                 else:

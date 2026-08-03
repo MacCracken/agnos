@@ -348,6 +348,8 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     var stack_kva = pmm_kva_for_access(stack_phys);   # 1.49.9: kernel access handle — identity <=256 MB, direct-map above
     proc_map_page_nx(new_cr3, stack_base, stack_phys);   # 1.50.6 W^X: the user stack is data -> NX (blocks stack shellcode; no signal trampoline runs there)
     elf_pde_probe(new_cr3, stack_base, stack_phys, 1);   # ELF_PDE_PROBE: PD[510] is one of the two observed victims
+    pd_audit(new_cr3, 1);                                # tag 1 = stack mapped, before the guard unmap
+    elf_pde_probe(new_cr3, stack_base, stack_phys, 9);   # tag 9 = re-verify the stack PDE VALUE at load end
     proc_unmap_page(new_cr3, stack_base - 0x200000);
     # ⛔ A stack-PDE read-back probe lived here on 2026-08-02 and was REMOVED, not fixed: it probed
     # the wrong mapping. The faults under investigation land on PD[3] (image data) as often as on

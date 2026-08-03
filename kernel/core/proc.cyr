@@ -464,6 +464,40 @@ fn proc_get_exit_code(pid) {
 # that's actually the kernel PML4 corrupts it in place, then `mov cr3, 0x1000`
 # walks zeros and #PFs. See iron-nuc-zen-log.md § Attempt 22 audit.
 var proc_pca_call_n = 0;
+#ifdef ELF_PDE_PROBE
+var cr3w_n = 0;
+fn cr3_install_watch(cr3) {
+    if (cr3 == 0) { return 0; }
+    if (cr3 == 0x1000) { return 0; }
+    var pml4e = load64(cr3);
+    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+    var pdpte = load64(pdpt_addr);
+    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    var e = load64(pd_addr + 510 * 8);
+    # SUBJECT CONTROL: log EVERY install of the faulting space 0xffd7000, present-or-absent, so the
+    # record proves this path ran for it — not just the anomaly. Bounded to 40 to survive the ring.
+    if ((cr3 & 0xFFFFF000) == 0xffd7000) {
+        if (cr3w_n < 40) {
+            cr3w_n = cr3w_n + 1;
+            klug_append("CR3INST as=0x", 13);
+            epp_hex(cr3);
+            klug_append(" pd=0x", 6);
+            epp_hex(pd_addr);
+            klug_append(" pde510=0x", 10);
+            epp_hex(e);
+            klug_append(" by=", 4);
+            epp_hex(proc_current_get());
+            klug_append(" cpu=", 5);
+            epp_hex(pcpu_cpu());
+            klug_putc(10);
+        }
+    }
+    return 0;
+}
+#endif
+#ifndef ELF_PDE_PROBE
+fn cr3_install_watch(cr3) { return 0; }
+#endif
 
 # Load cr3_val (first param at [rbp-8] per Cyrius calling convention)
 # into RAX, then write to CR3. Replaces the `var x = y; asm { mov cr3,
@@ -474,6 +508,10 @@ var proc_pca_call_n = 0;
 # See docs/development/issue/archive/2026-04-27-cyrius-fmt-tracks-braces-in-comments.md
 # for the cyrius v5.7.22 fix that allows raw `{`/`}` in comments again.
 fn cr3_load(cr3_val) {
+    # ⭐ THE UNIVERSAL CR3 CHOKEPOINT. Every ring-3 entry must pass through here, whatever path it
+    # took to get here — so a tripwire at THIS point cannot miss a proc the way a scheduler-only
+    # tripwire did. Check the stack PDE of the space being installed.
+    cr3_install_watch(cr3_val);
     asm {
         0x48; 0x8B; 0x45; 0xF8;   # mov rax, [rbp - 8]   (cr3_val)
         0x0F; 0x22; 0xD8;         # mov cr3, rax
@@ -610,6 +648,26 @@ fn proc_create_address_space() {
     # proc_free_address_space on teardown.
     store64(new_pd + 511 * 8, new_pml4);
 
+    # ELF_PDE_PROBE: record every address-space ALLOCATION. Paired with the FREE record in
+    # proc_free_address_space, this shows whether one PML4 is handed out twice — and if so whether a
+    # free came between (LIFO pmm reuse under a live occupant) or not (one proc loaded twice).
+#ifdef ELF_PDE_PROBE
+    ptpage_selftest_once();
+    ptpage_register(new_pml4);
+    ptpage_register(new_pdpt);
+    ptpage_register(new_pd);
+    klug_append("asalloc pml4=0x", 15);
+    epp_hex(new_pml4);
+    klug_append(" pdpt=0x", 8);
+    epp_hex(new_pdpt);
+    klug_append(" pd=0x", 6);
+    epp_hex(new_pd);
+    klug_append(" by=", 4);
+    epp_hex(proc_current_get());
+    klug_append(" cpu=", 5);
+    epp_hex(pcpu_cpu());
+    klug_putc(10);
+#endif
     return new_pml4;
 }
 
@@ -689,11 +747,34 @@ fn proc_free_address_space(cr3) {
                         }
                     }
                 }
+                ptpage_unregister(hpd);
                 pmm_free(hpd);
             }
         }
     }
     # Free the three page-table pages (4 KB each).
+    # ELF_PDE_PROBE: record every address-space FREE, before the pages go back to the allocator.
+#ifdef ELF_PDE_PROBE
+    klug_append("asfree pml4=0x", 14);
+    epp_hex(cr3);
+    klug_append(" pdpt=0x", 8);
+    epp_hex(pdpt);
+    klug_append(" pd=0x", 6);
+    epp_hex(pd);
+    klug_append(" by=", 4);
+    epp_hex(proc_current_get());
+    klug_append(" cpu=", 5);
+    epp_hex(pcpu_cpu());
+    klug_putc(10);
+#endif
+    # ⭐ SHOOT DOWN BEFORE THESE PAGES GO BACK TO THE ALLOCATOR. LIFO pmm_alloc hands the same PML4
+    # straight back out, and without PCID a CR3 value is the only TLB tag — so any CPU still holding
+    # entries for this address space would apply them to its successor. This is the fix for the
+    # 2026-08-02 -smp 4 large-image fault.
+    tlb_shootdown_all();
+    ptpage_unregister(pd);
+    ptpage_unregister(pdpt);
+    ptpage_unregister(cr3);
     pmm_free(pd);
     pmm_free(pdpt);
     pmm_free(cr3);
@@ -961,10 +1042,277 @@ fn proc_map_page_nx(cr3, virt, phys) {
 # ⚠ fmt_hex_buf emits ZERO characters for a zero value, which is how "pde=0x" once read as a
 # MISSING field rather than a zero one. epp_hex below prints a literal "0" for zero.
 #ifdef ELF_PDE_PROBE
+# === LIVE PAGE-TABLE REGISTRY ==================================================================
+# Every page currently serving as a PML4 / PDPT / PD for a live address space. pmm_alloc consults
+# it and screams if the allocator is about to reissue one. That is the whole question left on the
+# -smp 4 large-image fault: a PDE is written and VERIFIED correct, nothing else loads into that
+# address space, and it later reads 0 — which happens if the page holding it is handed to someone
+# who legitimately zeroes it (proc_create_user's memset, proc_map_page_hi's 512-entry clear).
+# Both of those are correct code; they are only dangerous if pmm_alloc returns a LIVE page.
+# ⚠ Module-global var[N] is N x u64 in Cyrius — 128 slots here, well past 16 procs x 3 tables.
+var ptpage_live[128];
+fn ptpage_register(a) {
+    if (a == 0) { return 0; }
+    var i = 0;
+    while (i < 128) {
+        if (load64(&ptpage_live + i * 8) == 0) { store64(&ptpage_live + i * 8, a); return 0; }
+        i = i + 1;
+    }
+    return 0;                      # registry full — silently skip rather than perturb the run
+}
+fn ptpage_unregister(a) {
+    var i = 0;
+    while (i < 128) {
+        if (load64(&ptpage_live + i * 8) == a) { store64(&ptpage_live + i * 8, 0); return 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn ptpage_is_live(a) {
+    var i = 0;
+    while (i < 128) {
+        if (load64(&ptpage_live + i * 8) == a) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+# ⭐ POSITIVE CONTROL — calibrate the NULL. A detector that never fires is indistinguishable from a
+# detector that CANNOT fire. This proves the registry+lookup path works, once, on the first
+# address-space creation: register a sentinel, assert it reads live, unregister, assert it reads dead.
+# If this prints FAIL (or never prints at all), every "no PTREISSUE" result below is meaningless.
+var ptpage_st_done = 0;
+fn ptpage_selftest_once() {
+    if (ptpage_st_done != 0) { return 0; }
+    ptpage_st_done = 1;
+    var probe = 0xDEAD000;
+    var a = ptpage_is_live(probe);
+    ptpage_register(probe);
+    var b = ptpage_is_live(probe);
+    ptpage_unregister(probe);
+    var c = ptpage_is_live(probe);
+    klug_append("PTSELFTEST before=", 18);
+    epp_hex(a);
+    klug_append(" registered=", 12);
+    epp_hex(b);
+    klug_append(" after=", 7);
+    epp_hex(c);
+    if (a == 0) {
+        if (b == 1) {
+            if (c == 0) { klug_append(" PASS\n", 6); return 0; }
+        }
+    }
+    klug_append(" FAIL\n", 6);
+    return 0;
+}
+# tag: 0 = proc_unmap_page (the loader guard / munmap path) · 1 = proc_unmap_2mb_hi (high arena).
+# The signal is `was=` : a GUARD unmap should find an ABSENT entry. Clearing a PRESENT user PDE means
+# a live mapping was destroyed — the failure this function caused once before, when the loader's guard
+# unmap on pid 2 deleted PD[7] and took agnsh's page tables with it.
+# Walk the WHOLE PD and report which user entries are present. Called at points in the proc lifecycle
+# to pin down WHEN a verified-written PDE becomes zero: end-of-load, pre-schedule, etc.
+# TRIPWIRE — silent unless PD[510] (the user stack) has gone absent. Safe to call on every scheduler
+# dispatch: a per-dispatch log floods and WRAPS the klug ring, which is how the first attempt at this
+# lost every record it was meant to capture.
+var pd_trip_seen = 0;
+fn pd_tripwire(cr3, tag) {
+    if (cr3 == 0) { return 0; }
+    if (cr3 == 0x1000) { return 0; }
+    var pml4e = load64(cr3);
+    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+    var pdpte = load64(pdpt_addr);
+    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    var e = load64(pd_addr + 510 * 8);
+    # ⚠ VALIDATE THE INSTRUMENT: log the PD this tripwire is actually WATCHING, a bounded number of
+    # times. "Never fires" is worthless if it is watching a different PD than the one that faults.
+    if (pd_trip_seen < 4) {
+        pd_trip_seen = pd_trip_seen + 1;
+        klug_append("PDWATCH as=0x", 13);
+        epp_hex(cr3);
+        klug_append(" pd=0x", 6);
+        epp_hex(pd_addr);
+        klug_append(" pd510=0x", 9);
+        epp_hex(e & 0x000FFFFFFFE00000);
+        klug_append(" p=", 3);
+        epp_hex(e & 1);
+        klug_putc(10);
+    }
+    if ((e & 1) != 0) { return 0; }        # stack present — nothing to say
+    klug_append("PDTRIP tag=", 11);
+    epp_hex(tag);
+    klug_append(" as=0x", 6);
+    epp_hex(cr3);
+    klug_append(" pd=0x", 6);
+    epp_hex(pd_addr);
+    klug_append(" pd510=0x", 9);
+    epp_hex(e);
+    klug_append(" pd2=0x", 7);
+    epp_hex(load64(pd_addr + 2 * 8) & 0x000FFFFFFFE00000);
+    klug_append(" by=", 4);
+    epp_hex(proc_current_get());
+    klug_append(" cpu=", 5);
+    epp_hex(pcpu_cpu());
+    klug_putc(10);
+    return 0;
+}
+fn pd_audit(cr3, tag) {
+    var pml4e = load64(cr3);
+    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+    var pdpte = load64(pdpt_addr);
+    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    var nuser = 0;
+    var bits = 0;
+    var i = 0;
+    while (i < 16) {                       # image region idx 0..15 as a bitmask
+        var e = load64(pd_addr + i * 8);
+        if ((e & 1) != 0) {
+            if ((e & 4) != 0) { bits = bits | (1 << i); }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 512) {
+        var e2 = load64(pd_addr + i * 8);
+        if ((e2 & 1) != 0) {
+            if ((e2 & 4) != 0) { nuser = nuser + 1; }
+        }
+        i = i + 1;
+    }
+    var stk = load64(pd_addr + 510 * 8);
+    klug_append("pdaudit tag=", 12);
+    epp_hex(tag);
+    klug_append(" as=0x", 6);
+    epp_hex(cr3);
+    klug_append(" pd=0x", 6);
+    epp_hex(pd_addr);
+    klug_append(" nuser=", 7);
+    epp_hex(nuser);
+    klug_append(" lo16=0x", 8);
+    epp_hex(bits);
+    klug_append(" pd510=0x", 9);
+    epp_hex(stk & 0x000FFFFFFFE00000);
+    klug_append(" by=", 4);
+    epp_hex(proc_current_get());
+    klug_append(" cpu=", 5);
+    epp_hex(pcpu_cpu());
+    klug_putc(10);
+    return 0;
+}
+fn unmap_probe(cr3, virt, pd_idx, entry, tag) {
+    var present = entry & 1;
+    var user = (entry >> 2) & 1;
+    klug_append("unmap tag=", 10);
+    epp_hex(tag);
+    klug_append(" cr3=0x", 7);
+    epp_hex(cr3);
+    klug_append(" va=0x", 6);
+    epp_hex(virt);
+    klug_append(" idx=0x", 7);
+    epp_hex(pd_idx);
+    klug_append(" was=0x", 7);
+    epp_hex(entry & 0x000FFFFFFFE00000);
+    klug_append(" p=", 3);
+    epp_hex(present);
+    klug_append(" u=", 3);
+    epp_hex(user);
+    klug_append(" by=", 4);
+    epp_hex(proc_current_get());
+    klug_append(" cpu=", 5);
+    epp_hex(pcpu_cpu());
+    if (present != 0) {
+        if (user != 0) { klug_append(" DESTROYED_LIVE\n", 15); return 0; }
+    }
+    klug_append(" noop\n", 6);
+    return 0;
+}
+# 2 MB variant: does ANY live page-table page fall inside [base, base+2MB)? pmm_alloc_2mb's callers
+# immediately memset the whole 2 MB region, so a PT page anywhere inside it is destroyed wholesale.
+# ⚠ The 4 KB detector could never see this: page tables are allocated by pmm_alloc (4 KB, top-down),
+# but they are DESTROYED by a 2 MB allocation that merely CONTAINS them.
+fn ptpage_alarm_if_live_2mb(base) {
+    var i = 0;
+    while (i < 128) {
+        var a = load64(&ptpage_live + i * 8);
+        if (a != 0) {
+            if (a >= base) {
+                if (a < base + 0x200000) {
+                    klug_append("PTREISSUE2M base=0x", 19);
+                    epp_hex(base);
+                    klug_append(" hits_pt=0x", 11);
+                    epp_hex(a);
+                    klug_append(" by=", 4);
+                    epp_hex(proc_current_get());
+                    klug_append(" cpu=", 5);
+                    epp_hex(pcpu_cpu());
+                    klug_putc(10);
+                    return 0;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+fn ptpage_alarm_if_live(a) {
+    if (ptpage_is_live(a) == 0) { return 0; }
+    ptpage_alarm(a);
+    return 0;
+}
+fn ptpage_alarm(a) {
+    klug_append("PTREISSUE addr=0x", 17);
+    epp_hex(a);
+    klug_append(" by=", 4);
+    epp_hex(proc_current_get());
+    klug_append(" cpu=", 5);
+    epp_hex(pcpu_cpu());
+    klug_putc(10);
+    return 0;
+}
+# Tick-rate bracket: sample PD[510] of the CURRENT proc's own space every timer tick. Logs the
+# TRANSITION only (present -> absent) plus a bounded number of healthy samples, so the ring survives.
+var t510_n = 0;
+var t510_last = 0 - 1;
+var t510_seen = 0;
+fn pd510_tick_watch() {
+    var pid = proc_current_get();
+    var cr3 = proc_get_cr3(pid);
+    if (cr3 == 0) { return 0; }
+    if (cr3 == 0x1000) { return 0; }
+    if ((cr3 & 0xFFFFF000) != 0xffd7000) { return 0; }
+    var pml4e = load64(cr3);
+    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+    var pdpte = load64(pdpt_addr);
+    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    var pdev = load64(pd_addr + 510 * 8);
+    t510_seen = t510_seen + 1;
+    if (pdev == t510_last) { return 0; }     # no change — stay quiet
+    t510_last = pdev;
+    var p = pdev & 1;
+    if (t510_n >= 12) { return 0; }
+    t510_n = t510_n + 1;
+    klug_append("PD510 pde=0x", 12);
+    epp_hex(pdev);
+    klug_append(" p=", 3);
+    epp_hex(p);
+    klug_append(" after_ticks=", 13);
+    epp_hex(t510_seen);
+    klug_append(" pd=0x", 6);
+    epp_hex(pd_addr);
+    klug_append(" by=", 4);
+    epp_hex(pid);
+    klug_append(" cpu=", 5);
+    epp_hex(pcpu_cpu());
+    klug_putc(10);
+    return 0;
+}
 fn epp_hex(v) {
     var b[16];                      # fn-local var[N] = N BYTES; 16 hex digits exactly
     if (v == 0) { klug_append("0", 1); return 0; }
-    var n = fmt_hex_buf(v, &b);
+    # ⛔ fmt_hex_buf emits ZERO CHARACTERS for a value with BIT 63 SET (a PDE with NX is
+    # 0x8000000000000087). That renders as an empty field, identical to the zero case, and is how
+    # "pde=0x" was read all day as "the PDE is zero" when the entry was PRESENT. Split the top bit off.
+    if (v < 0) { klug_append("NX|", 3); }
+    var n = fmt_hex_buf(v & 0x7FFFFFFFFFFFFFFF, &b);
+    if (n == 0) { klug_append("0", 1); return 0; }
     klug_append(&b, n);
     return 0;
 }
@@ -1010,6 +1358,8 @@ fn elf_pde_probe(cr3, virt, phys, tag) {
     epp_hex(want_phys);
     klug_append(" kpd=0x", 7);
     epp_hex(got_phys);
+    klug_append(" pd=0x", 6);
+    epp_hex(pd_addr);                  # ⭐ the PD's PHYSICAL page — two live procs sharing one is the smoking gun
     klug_append(" ustash=0x", 10);
     epp_hex(u_cr3);
     klug_append(" upd=0x", 7);
@@ -1026,6 +1376,17 @@ fn elf_pde_probe(cr3, virt, phys, tag) {
 #endif
 #ifndef ELF_PDE_PROBE
 fn elf_pde_probe(cr3, virt, phys, tag) { return 0; }
+fn ptpage_register(a) { return 0; }
+fn ptpage_unregister(a) { return 0; }
+fn ptpage_is_live(a) { return 0; }
+fn ptpage_alarm(a) { return 0; }
+fn ptpage_alarm_if_live(a) { return 0; }
+fn ptpage_alarm_if_live_2mb(base) { return 0; }
+fn ptpage_selftest_once() { return 0; }
+fn pd510_tick_watch() { return 0; }
+fn unmap_probe(cr3, virt, pd_idx, entry, tag) { return 0; }
+fn pd_audit(cr3, tag) { return 0; }
+fn pd_tripwire(cr3, tag) { return 0; }
 #endif
 
 # proc_map_page_hi(cr3, virt, phys) — like proc_map_page, but for the HIGH user
@@ -1052,6 +1413,7 @@ fn proc_map_page_hi(cr3, virt, phys) {
         pd_addr = pmm_alloc();
         if (pd_addr == 0) { return 0 - 1; }
         for (var z = 0; z < 512; z = z + 1) { store64(pd_addr + z * 8, 0); }
+        ptpage_register(pd_addr);
         store64(pdpt_addr + pdpt_idx * 8, pd_addr | 0x07);     # present + RW + user
     } else {
         pd_addr = pdpte & 0xFFFFFFFFF000;
@@ -1079,11 +1441,13 @@ fn proc_unmap_2mb_hi(cr3, virt) {
     var pd_addr = pdpte & 0xFFFFFFFFF000;
     var pd_idx = (virt >> 21) & 0x1FF;
     var entry = load64(pd_addr + pd_idx * 8);
+    unmap_probe(cr3, virt, pd_idx, entry, 1);
     if ((entry & 0x01) == 0) { return 0; }              # PDE not present
     if ((entry & 0x04) == 0) { return 0; }              # not user — never free a kernel page
     var phys = entry & 0x000FFFFFFFE00000;
     store64(pd_addr + pd_idx * 8, 0);                   # clear the PDE
     invlpg_va(virt);
+    tlb_shootdown_all();                                # other CPUs may still cache this translation
     pmm_free_2mb(phys);
     return 1;
 }
@@ -1196,6 +1560,10 @@ fn proc_unmap_page(cr3, virt) {
     var pd_addr = pdpte & 0xFFFFFFFFF000;
     var pd_idx = (virt >> 21) & 0x1FF;
     var k_entry = load64(pd_addr + pd_idx * 8);
+    # ELF_PDE_PROBE: a GUARD unmap should find NOTHING. If this clears a PRESENT user entry it has
+    # just destroyed a live mapping — the exact failure this function caused once before ("the
+    # loader's guard unmap on pid 2 deleted PD[7], the home of agnsh's page tables").
+    unmap_probe(cr3, virt, pd_idx, k_entry, 0);
     if ((k_entry & 0x04) != 0) {            # user page only — never a kernel PDE
         store64(pd_addr + pd_idx * 8, 0);
     }
@@ -1211,6 +1579,8 @@ fn proc_unmap_page(cr3, virt) {
             store64(u_pd + pd_idx * 8, 0);
         }
     }
+    # A cleared PDE is only cleared on THIS CPU until every other CPU drops its cached translation.
+    if ((k_entry & 0x04) != 0) { tlb_shootdown_all(); }
     return 0;
 }
 

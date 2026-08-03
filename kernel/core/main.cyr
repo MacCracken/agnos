@@ -187,6 +187,10 @@ fpu_area_selftest();
 # is only ever set by the FP_NM_SELFTEST probe below). Areas are already seeded above.
 nm_isr_build();
 idt_set_gate(&idt + 7 * 16, &nm_isr, 0x08, 0x8E);
+# TLB shootdown IPI (vector 0xF0). Must be installed on EVERY CPU's IDT — the IDT is shared here, so
+# one install covers all. Inert on a single-core boot (tlb_shootdown_all short-circuits on cpu_count).
+tlb_isr_build();
+idt_set_gate(&idt + 240 * 16, &tlb_isr, 0x08, 0x8E);
 #ifdef FP_NM_SELFTEST
 fpu_nm_selftest();
 #endif

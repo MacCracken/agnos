@@ -440,8 +440,46 @@ fn fault_kill_current(vector) {
     var fk_pdpte = load64(fk_pml4e & 0xFFFFFFFFF000);
     var fk_pd    = fk_pdpte & 0xFFFFFFFFF000;
     var fk_pde   = load64(fk_pd + ((dm_read_cr2() >> 21) & 0x1FF) * 8);
-    klug_append(" pde=0x", 7);
-    fk_n = fmt_hex_buf(fk_pde, &fk_hex);            klug_append(&fk_hex, fk_n);
+    klug_append(" pde=", 5);
+    if (fk_pde < 0) { klug_append("NX|", 3); }
+    fk_n = fmt_hex_buf(fk_pde & 0x7FFFFFFFFFFFFFFF, &fk_hex); klug_append(&fk_hex, fk_n);
+    if (fk_n == 0) { klug_append("0", 1); }
+    klug_append(" pdeP=", 6);
+    fk_n = fmt_hex_buf(fk_pde & 1, &fk_hex);        klug_append(&fk_hex, fk_n);
+    if (fk_n == 0) { klug_append("0", 1); }
+    # ⭐ WHICH PD DID THIS WALK LAND ON? ELF_PDE_PROBE records the PD address it wrote each PDE into.
+    # If the two disagree, the PDE was never cleared — the WALK diverged, i.e. PML4[0] or PDPT[0] is
+    # corrupt and the fault handler (and the CPU) are consulting a different page entirely. That
+    # distinction is invisible to a pde= value alone, which reads 0 in both cases.
+    klug_append(" HWCR3=0x", 9);
+    fk_n = fmt_hex_buf(pf_hw_cr3 & 0xFFFFF000, &fk_hex); klug_append(&fk_hex, fk_n);
+    if (fk_n == 0) { klug_append("0", 1); }
+    klug_append(" HWCR2=0x", 9);
+    fk_n = fmt_hex_buf(pf_hw_cr2, &fk_hex); klug_append(&fk_hex, fk_n);
+    if (fk_n == 0) { klug_append("0", 1); }
+    klug_append(" fpml4=0x", 9);
+    fk_n = fmt_hex_buf(fk_pml4e & 0xFFFFFFFFF000, &fk_hex); klug_append(&fk_hex, fk_n);
+    if (fk_n == 0) { klug_append("0", 1); }
+    klug_append(" fpd=0x", 7);
+    fk_n = fmt_hex_buf(fk_pd, &fk_hex);             klug_append(&fk_hex, fk_n);
+    if (fk_n == 0) { klug_append("0", 1); }
+    # ⭐ NEIGHBOURS. One cleared entry and a wholesale overwrite of the PD page both read pde=0 at the
+    # victim index and are otherwise indistinguishable. If PD[2] (image), PD[509] (guard) and PD[511]
+    # (the user-PML4 stash) survive while the victim is 0, exactly one entry was cleared. If they are
+    # ALL zero, the page's memory was destroyed — a stray write or DMA, not paging logic.
+    klug_append(" n2=0x", 6);
+    fk_n = fmt_hex_buf(load64(fk_pd + 2 * 8), &fk_hex);   klug_append(&fk_hex, fk_n);
+    if (fk_n == 0) { klug_append("0", 1); }
+    klug_append(" n509=0x", 8);
+    fk_n = fmt_hex_buf(load64(fk_pd + 509 * 8), &fk_hex); klug_append(&fk_hex, fk_n);
+    if (fk_n == 0) { klug_append("0", 1); }
+    klug_append(" n510=", 6);
+    if (load64(fk_pd + 510 * 8) < 0) { klug_append("NX|", 3); }
+    fk_n = fmt_hex_buf(load64(fk_pd + 510 * 8) & 0x7FFFFFFFFFFFFFFF, &fk_hex); klug_append(&fk_hex, fk_n);
+    if (fk_n == 0) { klug_append("0", 1); }
+    klug_append(" stash=0x", 9);
+    fk_n = fmt_hex_buf(load64(fk_pd + 511 * 8), &fk_hex); klug_append(&fk_hex, fk_n);
+    if (fk_n == 0) { klug_append("0", 1); }
     klug_append(" idx=", 5);
     fk_n = fmt_hex_buf((dm_read_cr2() >> 21) & 0x1FF, &fk_hex);  klug_append(&fk_hex, fk_n);
     klug_putc(10);
@@ -7694,6 +7732,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
             # fully wired (per-proc CR3 + ring-3 selectors), so flip it READY — under smp_sched_aps=1
             # this is the FIRST moment a woken AP may legitimately pick it. Ordered AFTER proc_set_ring3
             # so no AP can ever observe it ready-but-ring-0.
+            pd_audit(proc_get_cr3(sp_pid), 2);      # tag 2 = spawn_path, just before READY
             proc_set_state(sp_pid, 1);
         }
         stack_canary_check(canary);
