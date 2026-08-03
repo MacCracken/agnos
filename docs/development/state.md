@@ -14,7 +14,7 @@ type: state
 |---|---|---|
 | Kernel head | **1.56.34 — OPEN** (opened 2026-07-31, HDMI audio) | [`VERSION`](../../VERSION) |
 | Previous cut | 1.56.33 closed 2026-07-30, awaiting the user's tag | [`CHANGELOG.md`](../../CHANGELOG.md) |
-| `build/agnos` on disk | **1,928,744 B**, 2026-08-01 00:21 — ⛔ **not flashable**, see *Flash gate* | `wc -c build/agnos` |
+| `build/agnos` on disk | **1,928,888 B**, 2026-08-02 19:21:51 — **1.56.34 bare, burn-prep'd + stamped** `7942dde38773b217…`, FLASHABLE until something rebuilds it | `scripts/burn/burn-verify.sh` |
 | Cyrius pin | **6.4.78** | `cyrius.cyml [package].cyrius` |
 | Bootloader | gnoboot **0.6.0**; Path C, `RDI = &boot_info`, magic `0x41474E4F`, entry `0x1000a8` | `gnoboot/VERSION` |
 | Iron target | archaemenid — Beelink SER NUC, AMD Cezanne APU, 4 CPUs, 64 GB. Build host **is** the target, so no serial channel exists. | — |
