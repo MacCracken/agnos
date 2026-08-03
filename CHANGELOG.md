@@ -1224,10 +1224,12 @@ was real but the path is gone.
 - Fixed: `tcp_send_pkt` dropped every loopback segment. Now gated on `nic_ready()==0 && net_is_loopback(dst)==0`.
   This is what enabled the two-proc setu handshake.
   ⛔ **RETRACTED 2026-08-03 — "This is what enabled the two-proc setu handshake" is a FALSE GREEN**, produced by
-  the `AETHERSAFHA_SETU_SELFTEST` kernel hook's `net_ip = 0x7F000001` assignment. The only handshake this ever
+  the `AETHERSAFHA_SETU_SELFTEST` kernel hook's `net_ip = 0x7F000001` assignment. The only handshake **this change**
   completed was under that hook. On an ordinary boot every outbound SYN still claimed `net_ip` as its source, the
   SYN-ACK came back on a 4-tuple `tcp_find_conn` could not match, and `sock_connect #47` returned **-1 instantly**.
-  An honest loopback connect first became possible at **1.56.34** (`net_src_for`, route-derived source selection).
+  An honest loopback connect first became possible at **1.56.34** (`net_src_for`, route-derived source selection) —
+  and it **did** happen there: `aethersafha-clients-test.py` reached "connected: 2, presented: 2" un-rigged on
+  2026-08-02 (QEMU `-smp 1`; never on iron).
   ⚠ The `tcp_send_pkt` loopback gate itself is a real fix and STANDS — only the enablement claim is withdrawn.
   ⚠ Separately: TCP-on-loopback as the DISPLAY transport is RETIRED 2026-08-03 in favour of `naadi`
   (`planning/ipc.md` §9); see §10.

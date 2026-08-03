@@ -4814,12 +4814,20 @@ asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x10; 0xE6; 0x71; }
 # WHY: both hooks assigned `net_ip = 0x7F000001` in the KERNEL before launching their
 # ring-3 peer. agnos puts `net_ip` in an outbound SYN's SOURCE, so a client dialling
 # 127.0.0.1 normally gets its SYN-ACK addressed to `net_ip`, `tcp_find_conn` never
-# matches, and the connect fails. Forcing net_ip to loopback made src == dst, so the
-# handshake completed ONLY under these hooks — on an ordinary boot it could never
-# complete. Every "green" those hooks produced was a FALSE GREEN, and the scaffolding
-# that manufactured it was the mechanism by which a wrong premise looked proven.
+# matches, and the connect fails. Forcing net_ip to loopback made src == dst, so
+# BEFORE `net_src_for` (1.56.34) the handshake completed ONLY under these hooks — on an
+# ordinary boot of that era it could not complete. Every "green" those hooks produced was
+# a FALSE GREEN, and the scaffolding that manufactured it was the mechanism by which a
+# wrong premise looked proven.
 #
-# The premise itself is dead: TCP-on-loopback is NOT the desktop/display transport. The
+# ⭐ SCOPE, so this is not read as more than it is: AFTER `net_src_for` an un-rigged
+# connect DID land — `scripts/harness/aethersafha-clients-test.py` reached
+# "connected: 2, presented: 2" on 1.56.34+ (2026-08-02, QEMU `-smp 1`; never shown on
+# iron, `-smp 4` fault-kills). That harness hard-exits if the kernel carries any selftest
+# hook, and it is what CAUGHT this rigging.
+#
+# The premise is dead ANYWAY, and not because it was broken: TCP-on-loopback is the WRONG
+# PRIMITIVE for local display IPC and is NOT the desktop/display transport. The
 # replacement is the agnos socket (`naadi`). See docs/development/planning/ipc.md §9-§10.
 # TCP stays — agnos is A General NETWORKED Operating System and TCP is correct for the
 # NETWORK. What is retired is a display protocol riding it.

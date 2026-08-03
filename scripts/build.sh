@@ -217,9 +217,12 @@ else
         [ -n "$AETHERSAFHA_SELFTEST" ] && echo '#define AETHERSAFHA_SELFTEST'
         # ⛔ AETHERSAFHA_SETU_SELFTEST removed 2026-08-03 — the hook assigned net_ip = 0x7F000001 in the
         # kernel before launching the compositor, which is the ONLY reason a setu-over-TCP client
-        # handshake ever completed on agnos. Every "green" that rode this define was a FALSE GREEN.
-        # TCP-on-loopback is not the desktop transport; naadi is. See agnos
-        # docs/development/planning/ipc.md §10. Do not re-add this define under any name.
+        # handshake completed on agnos BEFORE net_src_for (1.56.34). Every "green" that rode this
+        # define was a FALSE GREEN. (After net_src_for an un-rigged connect DID land —
+        # scripts/harness/aethersafha-clients-test.py, "connected: 2, presented: 2", 2026-08-02,
+        # QEMU -smp 1, never on iron. TCP-on-loopback is retired as the WRONG PRIMITIVE for local
+        # display IPC, not as a thing that never worked.) The desktop transport is naadi. See agnos
+        # docs/development/planning/ipc.md §9-§10. Do not re-add this define under any name.
         [ -n "$DOOM_AUDIO_SELFTEST" ] && echo '#define DOOM_AUDIO_SELFTEST'
         [ -n "$TONEGEN_SELFTEST" ]   && echo '#define TONEGEN_SELFTEST'
         [ -n "$VANITONE_AUDIO_SELFTEST" ] && echo '#define VANITONE_AUDIO_SELFTEST'
@@ -228,7 +231,8 @@ else
         # side of it: it assigned no net_ip, it was a buildable gate that ASSERTED the retired
         # transport works. Its smoke passed only if jalwa printed "audio routed through the mishran
         # mixer", which jalwa prints only on a completed loopback:7701 connect — impossible on an
-        # ordinary agnos boot. Local IPC is naadi, not TCP. See agnos
+        # ordinary agnos boot BEFORE net_src_for (1.56.34), and in any case asserting a transport
+        # that is now retired as the wrong primitive. Local IPC is naadi, not TCP. See agnos
         # docs/development/planning/ipc.md §9/§10. The in-process mixer proof is
         # MISHRAN_AUDIO_SELFTEST above (mishtone, msh_router_* only — no sockets); it is honest, keep it.
         # ⛔ MISHRAN_DUPLEX_SELFTEST removed 2026-08-03 — same defect as AETHERSAFHA_SETU_SELFTEST above:

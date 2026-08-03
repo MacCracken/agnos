@@ -508,10 +508,9 @@ taxonomy forbids — the prerequisites already landed at 1.47.x, so it is **work
 because a TCP stack happened to exist, never discussed with the operator, and carried for a week.
 ⚠ Post-`net_src_for` the transport *did* carry a real client↔compositor connect + present, un-rigged
 (QEMU `-smp 1`, 2026-08-02 — §10.1). **That is not a reprieve**: it is retired on the architecture,
-not on the failure. A local display
-protocol has nothing to route, nothing to checksum, no window to negotiate, no RTO to wait out, and no
-business owning a port. Two processes on one box with a common ancestor need a channel handed to the
-child at spawn.
+not on the failure. A local display protocol has nothing to route, nothing to checksum, no window to
+negotiate, no RTO to wait out, and no business owning a port. Two processes on one box with a common
+ancestor need a channel handed to the child at spawn.
 
 ### 10.0 ⭐ The shape of the mistake — a square peg, and a week of shaping the peg
 
@@ -537,7 +536,7 @@ the primitive is wrong, and no further accommodation is the fix.
 
 ### 10.1 The receipts — what a display protocol forced into the kernel
 
-- ⛔ **`net.cyr:183-209` states it outright**, and the scope is **pre-`net_src_for` (agnos 1.56.34)**:
+- ⛔ **`net.cyr:181-225` states it outright**, and the scope is **pre-`net_src_for` (agnos 1.56.34)**:
   every outbound segment claimed `net_ip` as its source, so a SYN to 127.0.0.1 was answered to
   `net_ip` and `tcp_find_conn` never matched. **Before that fix the display protocol did not work on
   an ordinary boot, and the only test that passed then did so by accident** —
@@ -551,7 +550,7 @@ the primitive is wrong, and no further accommodation is the fix.
   rigging.** ⚠ Scope it honestly: QEMU at `-smp 1`, never shown on iron, and `-smp 4` fault-kills.
   ⛔ That result is **not** why the transport is going away — see §10.0: it is the **wrong
   primitive**, not a broken one.
-- **`net_src_for` (`net.cyr:203`) exists to fix that** — route-derived source selection, a real
+- **`net_src_for` (`net.cyr:226`) exists to fix that** — route-derived source selection, a real
   networking concept, added because a *local* channel needed it.
 - **`net_ingress.cyr:121-126` waits on DHCP in the boot path** (`while (net_ip == 0 && …)`).
 - **`sock_connect #47` holds preempt disabled for the whole attempt** — which is why a connect retry
