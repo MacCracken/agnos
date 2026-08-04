@@ -19,11 +19,33 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ---
 
-## [1.56.36] — 2026-08-03 — native-resolution scanout (cycle OPEN)
+## [1.56.37] — 2026-08-03 — the initial scanout (cycle OPEN)
 
-Scope: the desktop renders at **800x600 into a 2560x1440 panel** — a small window in the upper-left
-quadrant, not an upscale. This cycle makes the scanout surface match the display link the kernel has
+Scope: the boot console's first ~87 lines. agnos paints them at **boot_info's** geometry (2560x1440,
+pitch 10240) while DCN is still scanning the firmware's **800x600 pitch-832** surface and upscaling it, so
+2560-wide rows are read as 832-px rows and smear — the banding at the top of every boot photo. At ~line 88
+the register aperture maps and `gpu_scanout_matchgeom` corrects the geometry, but it only *cleared*, so
+those lines were erased rather than repaired.
+
+### Fixed — the boot log's first ~87 lines are repainted, not discarded
+
+New `klug_replay_fb()` (`kernel/core/klug.cyr`): repaint the captured ring to the **framebuffer only**.
+Every early line is already in klug — it is fed from the earliest boot by a pure `store8` path that runs
+before any console backend exists — so once the geometry is known the log is simply drawn again, correctly.
+`gpu_scanout_matchgeom()` calls it immediately after its `fb_console_clear()`.
+
+⛔ FB only, never serial and never back into the ring: `fb_print` reaches `fb_putc`, which does not tap
+klug (only `kprint`/`kprintln` do), so the ring cannot grow by its own contents.
+
+## [1.56.36] — 2026-08-03 — native-resolution scanout (RELEASED)
+
+Scope: the desktop rendered at **800x600 into a 2560x1440 panel** — a small window in the upper-left
+quadrant, not an upscale. This cycle made the scanout surface match the display link the kernel had
 already trained. See [`planning/gpu.md`](planning/gpu.md) for the register-level plan.
+
+**Iron-confirmed across four burns**: native 2560x1440 with the scaler in bypass; a console that scrolls
+15x cheaper via a hardware pan; the exit path no longer destroying its own result code; and the pan not
+contending with a full-screen compositor.
 
 ### Fixed — the console pan stole the scanout from full-screen apps
 

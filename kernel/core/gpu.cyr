@@ -10758,6 +10758,11 @@ fn gpu_scanout_matchgeom() {
     if (ppx < vw) { return 0; }             # pitch must be >= width
     fb_set_geom(vw, vh, ppx * 4);           # bytes/row = pitch-px * 4 (ARGB8888)
     fb_console_clear();                      # redraw at the new geometry (also resets cursor + shadow)
+    # ⭐ 1.56.37: REPAINT the boot log, do not just erase it. Everything printed before this point was
+    # drawn at boot_info's geometry into a surface DCN reads at a different pitch — the banding at the top
+    # of every boot photo. Clearing removed the banding and the ~87 lines with it; the klug ring still has
+    # every byte, so draw them again now that the geometry is right. FB only (see klug_replay_fb).
+    klug_replay_fb();
     kprint("gpu: console geometry matched to surface ", 41); kprint_num(vw);
     kprint("x", 1); kprint_num(vh);
     kprint(" pitch ", 7); kprint_num(ppx * 4);

@@ -68,6 +68,30 @@ fn klug_err(buf, len)  { kprint("[E] ", 4); kprintln(buf, len); return 0; }
 # Linear case (boot log << 16 KB, never wrapped) is the validated path; the
 # wrapped-ring unwrap (oldest→newest from klug_head) lands with the klug syscall
 # in 1.42.12. The call site is gated; this fn is DCE'd out of normal builds.
+# klug_replay_fb — repaint the captured log to the FRAMEBUFFER ONLY (1.56.37).
+#
+# THE PROBLEM: agnos paints the boot console from line 1 at **boot_info's** geometry (this box:
+# 2560x1440, pitch 10240) while DCN is still scanning the firmware's **800x600 pitch-832** surface and
+# upscaling it. 2560-wide rows read as 832-px rows, so the first ~87 lines smear into the banding in every
+# boot photo. At ~line 88 the register aperture maps, gpu_scanout_matchgeom reads the REAL viewport and
+# clears — and those 87 lines are simply GONE, because a clear is all it ever did.
+#
+# ⭐ THE FIX IS A REPAINT, NOT A RE-DERIVATION. Every one of those lines is already in the ring: klug is fed
+# from the earliest boot by a pure store8 path that runs before any console backend exists. So once the
+# geometry is known, the whole log can simply be drawn again — correctly this time.
+#
+# ⛔ FB ONLY — never serial, and never back into the ring. This replays bytes the ring ALREADY holds; a
+# serial echo would duplicate the whole boot log on a box that has one, and klug_append here would grow the
+# ring by its own contents on every call. fb_print reaches fb_putc, which does NOT tap klug (only
+# kprint/kprintln do), so the ring is untouched by construction — but say it out loud, because the next
+# person to "make it consistent" with klug_dump above will reach for serial_print.
+fn klug_replay_fb() {
+    var n = klug_head;
+    if (klug_count >= 65536) { n = 65536; }     # wrapped — best-effort, whole ring
+    fb_print(&klug_buf, n);
+    return 0;
+}
+
 fn klug_dump() {
     var begin = "KLUG-DUMP-BEGIN\n";
     serial_print(begin, 16); fb_print(begin, 16);
