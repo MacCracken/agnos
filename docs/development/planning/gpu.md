@@ -529,6 +529,87 @@ predicate by half a texel, and `mu` is shared with op `0x0C`.
 | **GOP-side `SetMode` in BOTH shapes** — same-mode re-arm (gnoboot 0.4.1) and different-mode bounce (0.4.2) | neither produced any visible mode-switch flicker on VGA or HDMI. **AMD Zen UEFI elides both call shapes.** Never re-propose a GOP-side SetMode workaround on AMD iron |
 | **The D lane's first four burns** | ⚠ FOUR OF FIVE were lost to the HARNESS, not to register work: (a) a hold on a bounded vblank poll collapsed a 4 s display window to ~50 ms; (b) **TWO burns whose stimulus was an ACHROMATIC console — every pixel `0x00FFFFFF` or `0x00000000`, R==G==B, so ANY colour permutation is the IDENTITY.** Those two could not have shown a change no matter how correct the register work was. That is arithmetic, not bad luck; (c) a register decoded by eye |
 
+## 2.2b NATIVE RESOLUTION — `MDO_OP_NATIVE` (#93 op `0x0B`) — BUILT 2026-08-03, awaiting its first burn
+
+**Every input was measured before a line was written.** This section is now the record of what shipped,
+plus the two things the burn has to answer.
+
+### What the 2026-08-03 read-only burn established
+
+- **A native 2560x1440 framebuffer ALREADY EXISTS**, allocated by the firmware after gnoboot 0.6.1's
+  GOP `SetMode`: `fb: w=0xa00 h=0x5a0 pitch=0x2800 phys=0xd0000000 size=0xe10000 mode=0x1`.
+  `0xe10000` = 14,745,600 = exactly 2560x1440x4. **No allocation and no pitch invention is needed.**
+- **DCN was NOT reprogrammed by that SetMode.** HUBP still reads viewport `0x5EA` = `0x02580320`
+  (800x600) and pitch `0x607` = 832 px, and upscales to the 2560x1440 link. GOP moves the GOP surface;
+  it does not touch DCN. That is the whole bug.
+- ✅ **RESOLVED — the missing `0x60A` was an artifact of the DUMP, not a mystery in the hardware.**
+  `gpu_scanout_regdump` (`gpu.cyr`) skips zero values to keep the klug ring small. The surface sits at
+  MC `0xF4_00000000`, so the low half reads **0** (skipped) and `0x60B` reads `0xF4` = **244** (printed)
+  — which is exactly `fb_base + (fb_phys - BAR0)` for `fb_phys == BAR0 == 0xd0000000`, the transform
+  `gpu_display_probe` has used since 1.55.1. ⇒ **The surface base does not move**, and the address write
+  in the op is a same-value write. It still reads and reconciles first (`MDO_E_SURFADDR` on a value it
+  cannot account for), because "the address is where I think it is" is a thing to verify on the day.
+
+### What shipped
+
+Runtime op behind the `/.modeset-armed` latch (`modeset_arm` site **11**), never a boot-time write: a
+bad write costs one reboot and the latch stops it re-firing into a loop. Envelope mirrors
+`mdo_recommit()`. Guards → save the HUBP group → `OTG_MASTER_EN=0` → `DSCL_MODE`→bypass, viewport,
+pitch, surface address → `OTG_MASTER_EN=1` → verify → rollback on failure → `fb_set_geom` +
+`fb_console_clear`. Registers, encodings, `MDO_E_*` reasons and tool exit codes are in the 1.56.36
+CHANGELOG entry and not duplicated here.
+
+⛔ **`SCL_MODE` bypass and the pitch move in ONE envelope.** Writing pitch 2560 to `0x607` with the
+scaler still active blacked the pipe and hung the box (§2.2). Source geometry and scaler mode are one
+atomic fact, which is also why the op refuses (`MDO_E_RASTER`) unless the target **equals** the link's
+active raster — with DSCL bypassed, source and raster must match exactly, and a target that does not is
+a scaled mode wearing a bypass.
+
+### Two corrections this implementation made to the spec that preceded it
+
+- ⛔ **The target must come from `boot_info`, NEVER from `fb_width()`/`fb_height()`/`fb_pitch()`.** The
+  first draft of this section said to guard on `fb_width()==2560`. Those accessors return the **P4
+  geometry override** once `gpu_scanout_matchgeom` has run — i.e. **800x600**, the very state being
+  corrected. That guard would have read "already native" on the broken pipe and refused forever.
+- **Check the frame-count STOP before reprogramming, not after.** `mdo_recommit` checks at the end
+  because every one of its writes is same-value and harmless on a live pipe. These writes are not: a
+  pitch change on a scanning pipe is precisely what hung this box. If the disable did not take, the op
+  puts `MASTER_EN` back and leaves the HUBP untouched (`MDO_E_NOSTOP`, tool exit 89).
+
+### Oracle — and the instrument that cannot serve as one
+
+The **panel**. ⚠ The OTG frame counter free-runs off the PLL, so it advances on a black screen exactly
+as it does on a good one (the M6 finding). A green `exit 95` means the ENVELOPE survived — stopped,
+reprogrammed, relit, counter moving — and says nothing about whether there is a picture. Both the
+kernel's success line and the tool's say so in as many words. Capture with `run /bin/klug > native.txt`,
+then disarm with `rm /.modeset-armed`.
+
+⛔ **BURN ORDER: `modeset --native` FIRST, THEN THE DESKTOP.** `fbinfo` (#38) and `blit` (#39) re-read
+`fb_width()`/`fb_height()`/`fb_pitch()` on **every** call, so the kernel side follows this op the instant
+`fb_set_geom` runs. A **compositor sizes its surfaces once**, at startup, from the `fbinfo` it read then
+— so running `--native` under a live desktop leaves it blitting an 800x600 buffer into a 2560x1440
+scanout: a small picture in the corner, which looks exactly like this op failing when it in fact
+succeeded. That is a burn spent on a false negative, and the tool now prints the warning on success.
+
+### The one named risk, so a bad burn is adjudicable
+
+**The DLG/TTU/RQ deadline registers are NOT touched.** The firmware's DML computed them for an 800x600
+fetch; a 2560x1440 fetch is ~7.7x the per-frame bytes (1.92 MB → 14.7 MB, ~115 MB/s → ~885 MB/s at
+60 Hz). The **bandwidth** is trivial for this UMA part; the **urgency scheduling** may not be. So the
+expected failure mode, if there is one, is a **HUBP underflow — a corrupt or black panel on a pipe whose
+frame counter is happily advancing.** ⇒ If the burn shows that, the next bite is **cloning HUBP0's DLG
+group**, NOT re-litigating the geometry. The op logs `underflow <before> -> <after>` for exactly this
+reason. ⚠ OPTC bit10 is already set at boot on this iron (§M6/D1), so a `0 -> 1` delta is the only form
+of that instrument worth reading.
+
+### What must NOT happen
+
+- ⛔ No boot-time native modeset until the op has succeeded on iron at least once.
+- ⛔ No fourth GOP `SetMode` variant. That lever is finished: it does exactly what UEFI promises
+  (moves the GOP surface) and nothing more (does not touch DCN).
+- ⛔ Never index `GPU_R_DSCL_SCL_MODE` by a DPP instance stride — that stride is not anchored on this
+  silicon. Pipe 0 only, which the op guards and which is archaemenid's only lit pipe anyway.
+
 ## 2.3 HDMI audio — the exhausted classes
 
 | Killed | What killed it |
@@ -688,6 +769,7 @@ Remaining work only. Nothing that has shipped appears here.
 | **1.56.33** ▶ | **MODESET — the COLD case, item 7's true residual.** Lighting a pipe the firmware never lit. **DONE, zero burns:** the `phyid` gate restated as *derived from silicon, not equal to a number*; the watchdog's restore widened **6 → 20 of 20** registers (it had restored 6 of what its own save captured — sound for every shipped rung, and **exactly wrong for a cold path because the missing fourteen ARE the raster program**); and `mode_raster.cyr` reproducing 10 of 14 registers bit-for-bit from published CVT-RB. **REMAINING: cold OTG bring-up inside the widened watchdog**, carrying `VSTARTUP`/`VUPDATE`/`VREADY`/`VTG0` from the inherited snapshot (no mode description yields them), with `mdo_wait_frame_stop`'s oracle **INVERTED** — the counter must *start*, and there is no prior count to compare. ⛔ Its TARGET must be **pipe 1** (dark, `OTG1_CONTROL 0x80000300`), never the live console. ⛔ **The PLL instance is still underived and `#12` did not close it** — `pll_id` 3-19 are byte-identical on the snapshot. Next candidates: the VBIOS object/PLL-assignment data tables, or amdgpu's `dc` PLL-selection logic. **NOT another sweep of the same command.** | 1-2 |
 | **1.56.34** ⏸ | **HDMI AUDIO — PARKED BY OPERATOR DECISION 2026-07-31. Do not re-open without an explicit ask.** State on parking: the CRC is calibrated, samples demonstrably reach the encoder output, the fault is **downstream of the AFMT output tap**, and **the sink rejects agnos's HDMI signalling outright** (`DIG_MODE`3 = no signal, `DIG_MODE`2 = relights). Surviving candidates: **(b) a write that does not latch** · **(c) the bare-metal environment** · **(a) sequencing, RE-OPENED** now that M9 is retracted as a null experiment. ⛔ **Do NOT resume with another register sweep — that class is exhausted.** Any resumption carries the four-flag set, a negative control in the same boot, and the blinded band protocol. It also carries the imitation-edge removal: a hand-rolled `DIG_ENABLE` drop + 120 ms hold + AVMUTE cycle still runs in a DEFAULT build for a hypothesis the record killed — but the enclosing block also holds the AVMUTE unmute and the FIFO drain arming, so it is a restructure, not a deletion. | 2-4 |
 | **1.56.35** | **The measured invalidate hoist.** S12 showed the batched frame is ~87% fixed cost — six per-dispatch whole-L2 invalidates, not the fence. Hoist ONE to the head of an all-shader batch. Needs its own oracle; the precedent for removing an "obviously safe" cache op is eight burns. Last because it is pure perf and the most expensive per unit of value. | 1-2 |
+| **1.56.36** ▶ | **NATIVE RESOLUTION — `MDO_OP_NATIVE` (#93 op `0x0B`). BUILT, awaiting its first burn (§2.2b).** Retargets HUBP0 from the firmware's upscaled 800×600 surface to the full-size one gnoboot 0.6.1's GOP `SetMode` already obtained, with `DSCL_MODE` → bypass, inside `mdo_recommit`'s envelope and its own rollback. All inputs measured; the last open question (the absent `0x60A`) closed as a **dump artifact** — `gpu_scanout_regdump` skips zeros and the surface sits at MC `0xF4_00000000`, so the low half really is 0. **REMAINING: one iron burn, run BEFORE the desktop starts** (a live compositor cached the old geometry and would draw small in the corner — a false negative). ⛔ The expected failure mode is a **HUBP underflow from untouched DLG/TTU deadlines**, not a geometry error: if the panel is corrupt or black while the frame counter advances, the next bite is **cloning HUBP0's DLG group**, not re-litigating the registers. | 1 |
 | **deferred** | **Second monitor / DCN second plane** — ratified as a real MUDRA/SHANTA requirement, opens after the cold modeset. Scope: DOMAIN2/DOMAIN3 power-ungate with PGFSM status wait → DPPCLK1 DTO + DPP clock enable → HUBP1 clock + VTG bind → ~25 DML-computed DLG/TTU/RQ deadline registers (**tractable only by cloning HUBP0's live values verbatim** — same OTG, same timing, same format, viewport ≤ HUBP0's) → surface config → DSCL bypass + RECOUT → MPCC1 insert → `MPC_OUT0_MUX` retarget, all under the OTG lock. ~50-70 register writes, 4-6 iron bites. ⚠ Renoir gives exactly **4 blendable planes** (bounded by `num_timing_generator = 4`, not the 6 MPCC instances) and they are the same 4 a second monitor wants, so MPC blending is a fast path for a few large surfaces, never a substitute for the shader path. ⚠ A second full-screen 32bpp plane at 2560×1440@60 roughly DOUBLES scanout bandwidth against `DCHUBBUB_ARB_*` watermarks the GOP sized for ONE plane; mitigation is a window-sized `RECOUT`. | — |
 | **deferred** | **Hardware cursor** — `CUR0_MODE` = 2/3, 32bpp ARGB per-pixel alpha up to 256×256, through the same MPCC path with **no second HUBP/DPP and no DLG/TTU work**. Optional polish; a software cursor works. · **SDMA ring-up** (parked with a known resume state, §2.2). · **Native-resolution console** — the residual banding is the ~84 boot lines agnos paints BEFORE the register aperture maps at ~log-line 85, so it cannot read the real geometry yet; fix options by risk are (1) PCI-find the GPU and read viewport `0x5EA` before `fb_console_init`, or (2) gnoboot reads the DCN viewport pre-EBS and writes real geometry into boot_info. | — |
 | **open bite** | **Caller-named colour destination** — the one thing a *non-contending* windowed GPU client actually needs (§1.3). A windowed client is NOT kernel-blocked today; what is blocked is drawing without sharing the compositor's mid-frame back buffer. Zero shader change — `gpu_blend_cov_run` already passes `dst_mc`/`dst_pitch` as kernargs, and `gpu_tri_depth` already resolves a ring-3-named handle. The real cost is field placement plus an ownership model for the 8 RT handles. **Not scheduled against the rows above; it competes with none of them.** | — |

@@ -4317,6 +4317,7 @@ var MDO_OP_AUDIO_PRE  = 0x07;       # M9 CONTROL   — transmit + audio unmuted 
 var MDO_OP_AUDIO_POST = 0x08;       # M9 TREATMENT — transmit + audio unmuted AFTER  the transmitter edge
 var MDO_OP_PIXCLK     = 0x09;       # 1.56.33 — ATOM #12 SetPixelClock; derives all params, refuses on pll_id
 var MDO_OP_CRCCAL     = 0x0A;       # 1.56.34 — calibrate the AFMT audio CRC against its NULL case, in one boot
+var MDO_OP_NATIVE     = 0x0B;       # 1.56.36 — NATIVE RESOLUTION: retarget HUBP to the full-size surface, scaler to bypass
 # bit N set <=> op N implemented: 0 NOP,1 CAPS,2 DUMP,3 LOCK,4 VTOTAL,5 RECOMMIT,6 TRANSMIT,
 # 9 PIXCLK — advertised UNCONDITIONALLY on the TRANSMIT precedent: the op IS implemented, and a
 # build/boot that cannot derive a pll_id answers with the specific MDO_E_NOPLL rather than a generic
@@ -4335,10 +4336,13 @@ var MDO_OP_CRCCAL     = 0x0A;       # 1.56.34 — calibrate the AFMT audio CRC a
 # ⚠ 1.56.34: bit 10 (MDO_OP_CRCCAL 0x0A) added to BOTH values — the CRC calibration is not an audio ARM,
 # it is an INSTRUMENT check, so it must exist in a plain kernel. An added op must move both or the smoke's
 # both-directions assertion fails, which is the check that catches an op advertised in only one build.
+# ⚠ 1.56.36: bit 11 (MDO_OP_NATIVE 0x0B) added to BOTH values, same rule. NATIVE is a DISPLAY op with no
+# audio content whatsoever, so gating it on MODESET_AUDIO_ARMS would make the native-resolution path exist
+# only in an audio-experiment kernel — the exact "advertised in one build" defect the assertion exists for.
 #ifdef MODESET_AUDIO_ARMS
-var MDO_OP_SUPPORTED = 0x7FF;
+var MDO_OP_SUPPORTED = 0xFFF;
 #else
-var MDO_OP_SUPPORTED = 0x67F;
+var MDO_OP_SUPPORTED = 0xE7F;
 #endif
 var MDO_E_NOGPU      = 1;           # call/op — GPU/display unavailable (write ops only, once they exist)
 var MDO_E_BADOP      = 2;           # op    — unknown, reserved, or not implemented in this kernel
@@ -4381,6 +4385,27 @@ var MDO_E_NOPLL      = 24;
 # but a DP panel drives the DTO and would land on it. Minted with the refusal rather than after the
 # first burn that hit it, on the same reasoning that put MDO_E_NOHDMI on its own number.
 var MDO_E_DTOCLK     = 25;
+# ── 1.56.36 NATIVE RESOLUTION. Four codes, not one, on the §1.4 rule that a red exit must name WHICH oracle
+# fired. Every one of these refuses BEFORE the pipe is touched, so the panel is untouched when they return.
+# op — boot_info does not describe a usable full-size 32bpp surface (no FB address, a pitch that is not a
+# whole number of pixels, or a geometry outside the sane window). Means "gnoboot did not get a native mode
+# from the GOP", NOT "the modeset failed" — the fix is on the bootloader side, so it must not share a code
+# with anything DCN-side or the burn gets pointed at the wrong repo.
+var MDO_E_NOTNATIVE  = 26;
+# ⭐ THE NEVER-WRITE-BLIND CODE. The HUBP's live surface address must reconcile with boot_info's fb_phys
+# through the SAME CPU->MC transform gpu_display_probe uses (fb_base + (fb_phys - BAR0)); a surface the
+# kernel cannot explain is a surface the kernel must not re-point. Distinct from 26 because 26 says "there
+# is no native surface to move to" and this says "there is one, but I cannot account for where the pipe is
+# currently reading" — opposite diagnoses, and one shared code would hide which.
+var MDO_E_SURFADDR   = 27;
+# op — the viewport ALREADY reads the target geometry: the pipe is native, nothing to do. NOT a failure and
+# NOT success either — the op deliberately does not blank a correct pipe to re-prove a state it can read.
+# Its own code so a second `--native` in the same boot is visibly a no-op instead of a mysterious green.
+var MDO_E_ALREADY    = 28;
+# op — the target geometry does not EQUAL the link's active raster. With the scaler in bypass, source and
+# raster must match exactly; anything else is a scaled mode wearing a bypass, which is how a "correct" pitch
+# blacked this pipe once already. Refuse rather than write a mismatch and read the panel to find out.
+var MDO_E_RASTER     = 29;
 
 # mdo_caps_write(out_uva) -> 0 / MDO_E_OUTBUF. Writes 8x u32 LE describing the modeset surface. READ-ONLY of
 # kernel state; the ONLY write is to the validated user buffer, via the gpu_caps_sys direct-store idiom.
@@ -5138,6 +5163,226 @@ fn mdo_recommit() {
     return 0;
 }
 
+# ── NATIVE RESOLUTION — #93 op 0x0B (1.56.36) ─────────────────────────────────────────────────────────
+# Stop the pipe upscaling an 800x600 surface to a 2560x1440 link and make it scan the full-size surface the
+# firmware ALREADY allocated. Every input is measured, none is invented:
+#
+#   • THE SURFACE EXISTS. gnoboot 0.6.1's GOP SetMode obtained `fb: w=0xa00 h=0x5a0 pitch=0x2800
+#     phys=0xd0000000 size=0xe10000`, and 0xe10000 = 14,745,600 = exactly 2560*1440*4. Nothing is allocated
+#     here and no pitch is invented — the op moves the PIPE to a buffer that is already there.
+#   • DCN WAS NOT REPROGRAMMED BY THAT SetMode, which is the entire bug: HUBP still reads viewport 0x5EA =
+#     0x02580320 (800x600) and pitch 0x607 = 832 px and scales the difference away. GOP moves the GOP
+#     surface; it does not touch DCN. ⛔ That lever is FINISHED — no fourth SetMode variant.
+#   • THE ADDRESS ALREADY RECONCILES, and the one open question in the spec is now closed. 0x60A was absent
+#     from the 2026-08-03 regdump only because `gpu_scanout_regdump` SKIPS ZERO VALUES; the surface sits at
+#     MC 0xF4_00000000, so the low half reads 0 (skipped) and 0x60B reads 0xF4 = 244 (printed). That is
+#     exactly `fb_base + (fb_phys - BAR0)` for fb_phys == BAR0 == 0xd0000000 — the transform
+#     gpu_display_probe already uses. So the surface base DOES NOT MOVE and the address write below is a
+#     same-value write. The op still READS and reconciles first, and refuses on a value it cannot account
+#     for, because "the address is where I think it is" is a thing to verify on the day, not to assume.
+#
+# ⛔ THE TARGET COMES FROM boot_info, NEVER FROM fb_width()/fb_height(). Those accessors return the P4
+# GEOMETRY OVERRIDE once gpu_scanout_matchgeom has run — i.e. 800x600, the very state being corrected. A
+# guard written against them would read "already native" on the broken pipe and refuse forever. (The §2.2b
+# spec said fb_width()==2560; that was wrong for this reason and the doc is corrected alongside this code.)
+#
+# ⛔ SCALER BYPASS AND PITCH MOVE IN ONE ENVELOPE, and that is not a style preference: writing the "correct"
+# pitch 2560 to 0x607 with the scaler still ACTIVE blacked the pipe and hung the box on 2026-07-20. Source
+# geometry and scaler mode are one atomic fact. Hence the op refuses unless the target EQUALS the link's
+# active raster (MDO_E_RASTER) — with DSCL in bypass, source and raster must match exactly, and a target
+# that does not is a scaled mode wearing a bypass.
+#
+# ⚠ WHAT THIS OP DOES NOT DO, NAMED SO A BAD BURN IS ADJUDICABLE: it does not touch the DLG/TTU/RQ deadline
+# registers. Those were DML-computed by the firmware for an 800x600 fetch, and a 2560x1440 fetch is ~7.7x
+# the per-frame bytes (1.92 MB -> 14.7 MB, ~115 MB/s -> ~885 MB/s at 60 Hz). The BANDWIDTH is trivial for
+# this UMA part; the URGENCY SCHEDULING may not be. So the expected failure mode, if there is one, is a
+# HUBP underflow — a corrupt or black panel on a pipe whose frame counter is happily advancing. If the burn
+# shows that, the next bite is cloning HUBP0's DLG group, NOT re-litigating the geometry.
+#
+# ⚠ AND THE FRAME COUNTER CANNOT SEE THAT. It free-runs off the OTG PLL, so it advances on a black panel
+# just as happily as on a good one (the M6 finding). The counter proves the ENVELOPE survived; only the
+# OPERATOR'S EYES prove the picture. The op says so in its own success line rather than implying a green.
+#
+# Runtime op, never boot-time: a bad write costs one reboot, and modeset_arm() + /.modeset-armed stop it
+# re-firing into a loop. It owns its own rollback — the restore set is the saved set, by construction.
+fn mdo_native() {
+    if (gpu_present == 0)      { return MDO_E_NOGPU; }
+    if (gpu_display_ok != 1)   { return MDO_E_NOGPU; }
+    if (gpu_display_pipe != 0) { kprintln("modeset: native refused -- live pipe is not 0", 45); return MDO_E_NOGPU; }
+    var pipe = 0;
+    var p = pipe * GPU_DCN_HUBP_STRIDE;
+    var otg = pipe * GPU_DCN_OTG_STRIDE;
+
+    # ── TARGET, from the boot_info handoff (see the fb_width() warning above) ──────────────────────────
+    var bi = load64(&boot_info_ptr);
+    if (bi == 0) { kprintln("modeset: native refused -- no boot_info handoff", 47); return MDO_E_NOTNATIVE; }
+    var fb_phys  = load64(bi + 0x48);
+    var bi_pitch = load32(bi + 0x50) & 0xFFFFFFFF;
+    var t_w      = load32(bi + 0x54) & 0xFFFFFFFF;
+    var t_h      = load32(bi + 0x58) & 0xFFFFFFFF;
+    if (fb_phys == 0) { kprintln("modeset: native refused -- boot_info framebuffer address is 0", 61); return MDO_E_NOTNATIVE; }
+    if ((bi_pitch & 3) != 0) { kprintln("modeset: native refused -- pitch is not whole 32bpp pixels", 58); return MDO_E_NOTNATIVE; }
+    var t_pitch = bi_pitch >> 2;
+    if (t_w < 640)        { kprintln("modeset: native refused -- boot_info width below 640", 52); return MDO_E_NOTNATIVE; }
+    if (t_w > 4096)       { kprintln("modeset: native refused -- boot_info width above 4096", 53); return MDO_E_NOTNATIVE; }
+    if (t_h < 480)        { kprintln("modeset: native refused -- boot_info height below 480", 53); return MDO_E_NOTNATIVE; }
+    if (t_h > 4096)       { kprintln("modeset: native refused -- boot_info height above 4096", 54); return MDO_E_NOTNATIVE; }
+    if (t_pitch < t_w)    { kprintln("modeset: native refused -- pitch is narrower than the width", 59); return MDO_E_NOTNATIVE; }
+    if (t_pitch > 0x3FFF) { kprintln("modeset: native refused -- pitch exceeds the 14-bit register field", 66); return MDO_E_NOTNATIVE; }
+
+    # ── The target must EQUAL the active raster, because the scaler is going to bypass ─────────────────
+    if (gpu_h_active == 0) { kprintln("modeset: native refused -- link active width never derived", 58); return MDO_E_RASTER; }
+    if (gpu_v_active == 0) { kprintln("modeset: native refused -- link active height never derived", 59); return MDO_E_RASTER; }
+    if (t_w != gpu_h_active) { kprintln("modeset: native refused -- target width is not the raster width", 63); return MDO_E_RASTER; }
+    if (t_h != gpu_v_active) { kprintln("modeset: native refused -- target height is not the raster height", 65); return MDO_E_RASTER; }
+
+    # ── Read the live HUBP group. This IS the save set — the restore below writes back exactly these. ──
+    var s_vp    = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_VIEWPORT_DIM + p) & 0xFFFFFFFF;
+    var s_pitch = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_PITCH   + p) & 0xFFFFFFFF;
+    var s_alo   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR    + p) & 0xFFFFFFFF;
+    var s_ahi   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR_HI + p) & 0xFFFFFFFF;
+    var s_scl   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DSCL_SCL_MODE) & 0xFFFFFFFF;
+    var cur_w = s_vp & 0xFFFF;
+    var cur_h = (s_vp >> 16) & 0xFFFF;
+    kprint("modeset: native pre-state viewport ", 35); kprint_num(cur_w); kprint("x", 1); kprint_num(cur_h);
+    kprint(" pitch ", 7); kprint_num(s_pitch & 0x3FFF);
+    kprint(" scl_mode ", 10); kprint_num(s_scl & GPU_DSCL_MODE_MASK);
+    kprint(" target ", 8); kprint_num(t_w); kprint("x", 1); kprint_num(t_h);
+    kprint(" pitch ", 7); kprint_num(t_pitch); kprintln("", 0);
+
+    # Already native? Say so as its own outcome. Blanking a correct pipe to re-prove a readable state is
+    # a burn spent on nothing, and a silent green would make a repeat run indistinguishable from the first.
+    if (cur_w == t_w) {
+        if (cur_h == t_h) {
+            kprintln("modeset: native -- the viewport ALREADY reads the target; nothing to do", 71);
+            return MDO_E_ALREADY;
+        }
+    }
+
+    # ── RECONCILE THE SURFACE ADDRESS — the never-write-blind gate ─────────────────────────────────────
+    # Same CPU->MC transform as gpu_display_probe: the framebuffer is addressed by the CPU through the GPU's
+    # BAR0 VRAM aperture, so the HUBP sees it at fb_base + (fb_phys - BAR0). Accept the raw CPU-phys form
+    # too — whichever the pipe is ACTUALLY using is the encoding this op writes back, which is how it obeys
+    # "match the encoding 0x60A actually uses" without deciding for the hardware.
+    # ⚠ Compose from the FIELD ([15:0]), restore from the WHOLE REGISTER. `_HIGH` is a 16-bit address field
+    # in a 32-bit register; masking it into the composition keeps a stray upper bit from shifting garbage
+    # into bit 48+ and failing an otherwise-good reconcile, while the save set keeps s_ahi verbatim so the
+    # rollback puts back what was actually there rather than a value this function reconstructed.
+    var live_surf   = ((s_ahi & 0xFFFF) << 32) | s_alo;
+    var r_base      = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_LOC_BASE) & GPU_FB_LOC_MASK;
+    var fb_base     = r_base << 24;
+    var bar0        = pci_bar0_64(gpu_pci_idx);
+    var expected_mc = 0;
+    if (bar0 != 0) { if (fb_phys >= bar0) { expected_mc = fb_base + (fb_phys - bar0); } }
+    var want = 0;
+    if (live_surf == fb_phys) { want = fb_phys; }
+    if (expected_mc != 0) { if (live_surf == expected_mc) { want = expected_mc; } }
+    if (want == 0) {
+        kprint("modeset: native refused -- HUBP surface ", 40); kprint_num(live_surf);
+        kprint(" matches neither fb_phys ", 25); kprint_num(fb_phys);
+        kprint(" nor its MC form ", 17); kprint_num(expected_mc); kprintln("", 0);
+        kprintln("modeset: refusing to re-point a surface this kernel cannot account for", 70);
+        return MDO_E_SURFADDR;
+    }
+
+    # ── ARM LAST. Every refusal above is read-only and leaves the pipe untouched, so arming before them
+    # would burn the latch on a call that never wrote a register — and leave the operator an
+    # `rm /.modeset-armed` to run for nothing. Arm immediately before the first write, not before the
+    # first guard. (M6 arms early; that is its historical shape, not a pattern worth copying.)
+    if (modeset_arm(11) != 1) { kprintln("modeset: native refused -- latch would not arm", 46); return MDO_E_ARM; }
+    # THE GATE, carried here for the same reason M6 carries it: these writes go direct with the OTG down,
+    # not through gpu_dcn_write_committed, so the gate living in those primitives is not on this path.
+    if (modeset_armed != 1297040453) { kprintln("modeset: native refused -- not armed", 36); return MDO_E_ARM; }
+
+    var s_ctrl = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL + otg) & 0xFFFFFFFF;
+    var unf0   = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 1;
+    var fc0    = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_FRAME_COUNT + otg) & GPU_OTG_FRAME_COUNT_MASK;
+
+    # === DISABLE ===
+    kprintln("modeset: native -- OTG_MASTER_EN 0 (disabling pipe; panel blanks briefly)", 73);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL + otg, s_ctrl & (0 - 1 - GPU_OTG_MASTER_EN));
+    gpu_mfence();
+    var stopped = mdo_wait_frame_stop(pipe);
+    var fc_dis  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_FRAME_COUNT + otg) & GPU_OTG_FRAME_COUNT_MASK;
+    kprint("modeset: native -- frame count ", 31); kprint_num(fc0); kprint(" -> ", 4); kprint_num(fc_dis);
+    kprint(" stopped ", 9); kprint_num(stopped); kprintln("", 0);
+
+    # ⛔ CHECK THE STOP **BEFORE** REPROGRAMMING, not after. M6 checks it at the end because every one of its
+    # writes is same-value and harmless on a live pipe. These writes are NOT: a pitch change on a scanning
+    # pipe is precisely what hung this box. If the disable did not take, put MASTER_EN back and leave the
+    # HUBP alone.
+    if (stopped == 0) {
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL + otg, s_ctrl);
+        gpu_mfence();
+        kprintln("modeset: NATIVE FAILED -- disable did not stop the pipe; HUBP left untouched", 76);
+        return MDO_E_NOSTOP;
+    }
+
+    # === REPROGRAM (OTG down: immediate, not VUPDATE double-buffered) ===
+    # Order is scaler-first by design. With the pipe stopped no instant is observable, but writing bypass
+    # before the geometry means that at no point in the register file does a full-size pitch coexist with an
+    # active scaling ratio — the exact combination that blacked the pipe. Defence in depth, at zero cost.
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DSCL_SCL_MODE, (s_scl & (0 - 1 - GPU_DSCL_MODE_MASK)) | GPU_DSCL_MODE_BYPASS);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_VIEWPORT_DIM + p, (t_h << 16) | t_w);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_PITCH + p, (s_pitch & (0 - 1 - 0x3FFF)) | t_pitch);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR + p, want & 0xFFFFFFFF);
+    # RMW the high half: replace the [15:0] address field, preserve whatever else lives in that register.
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR_HI + p, (s_ahi & (0 - 1 - 0xFFFF)) | ((want >> 32) & 0xFFFF));
+    gpu_mfence();
+
+    # === ENABLE ===
+    kprintln("modeset: native -- OTG_MASTER_EN 1 (re-enabling pipe)", 53);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL + otg, s_ctrl);
+    gpu_mfence();
+    var resumed = gpu_display_wait_vblank(pipe);
+    gpu_dcn_hold_ms(120);
+    var fc1  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_FRAME_COUNT + otg) & GPU_OTG_FRAME_COUNT_MASK;
+    var unf1 = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 1;
+    # Same D2 re-confirmation M6 carries: the bounded vblank wait can read 0 on a pipe that IS coming back.
+    if (resumed == 0) { if (fc1 != fc_dis) { resumed = 1; } }
+    kprint("modeset: native -- resumed ", 27); kprint_num(resumed);
+    kprint(" frame count ", 13); kprint_num(fc1);
+    kprint(" underflow ", 11); kprint_num(unf0); kprint(" -> ", 4); kprint_num(unf1); kprintln("", 0);
+
+    # === ROLLBACK — the op owns it. Restore set == save set. ===
+    if (resumed == 0) {
+        kprintln("modeset: NATIVE did not resume -- rolling back to the saved HUBP group", 70);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL + otg, s_ctrl & (0 - 1 - GPU_OTG_MASTER_EN));
+        gpu_mfence();
+        mdo_wait_frame_stop(pipe);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DSCL_SCL_MODE, s_scl);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_VIEWPORT_DIM + p, s_vp);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_PITCH + p, s_pitch);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR + p, s_alo);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR_HI + p, s_ahi);
+        gpu_mfence();
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL + otg, s_ctrl);
+        gpu_mfence();
+        var back = gpu_display_wait_vblank(pipe);
+        gpu_dcn_hold_ms(120);
+        var fc2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_FRAME_COUNT + otg) & GPU_OTG_FRAME_COUNT_MASK;
+        if (back == 0) { if (fc2 != fc1) { back = 1; } }
+        kprint("modeset: native rollback -- resumed ", 36); kprint_num(back);
+        kprint(" frame count ", 13); kprint_num(fc2); kprintln("", 0);
+        if (back == 0) { kprintln("modeset: NATIVE DARK -- rollback did NOT relight either -- power-cycle (H2)", 75); }
+        return MDO_E_NORESUME;
+    }
+
+    # ── Success on the ENVELOPE. Move the console to the geometry that is now live. ────────────────────
+    # fb_set_geom directly, NOT gpu_scanout_matchgeom: that helper early-returns once fb_geom_active() is 1,
+    # which it has been since the boot-time 800x600 match, so calling it here would silently do nothing.
+    fb_set_geom(t_w, t_h, t_pitch * 4);
+    fb_console_clear();
+    kprint("modeset: NATIVE OK -- pipe scanning ", 36); kprint_num(t_w); kprint("x", 1); kprint_num(t_h);
+    kprint(" pitch ", 7); kprint_num(t_pitch); kprintln(" px, scaler in BYPASS", 21);
+    if (unf0 == 0) {
+        if (unf1 != 0) { kprintln("modeset: NOTE OPTC underflow bit10 NEWLY set -- suspect the DLG/TTU deadlines", 77); }
+    }
+    kprintln("modeset: EYE-CHECK THE PANEL. The frame counter free-runs off the PLL and", 73);
+    kprintln("modeset: advances on a black screen too -- it proves the envelope, not the picture.", 83);
+    return 0;
+}
+
 # ── M8 the TRANSMITTER: ATOM #4 (+ #76) INSIDE M6's envelope (MODESET_OP_TRANSMIT) ─────────────────────
 # The culmination of the display arc: the DVI->HDMI encoder + transmitter edge run INSIDE the OTG envelope
 # M6 proved on iron, which is the one ordering agnos has structurally never produced. amdgpu runs #76 only
@@ -5866,6 +6111,16 @@ fn mdo_validate(rec) {
         if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
         if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
     }
+    if (op == MDO_OP_NATIVE) {
+        # 1.56.36 — NO OPERANDS, and deliberately so. The target geometry is read from the boot_info handoff
+        # and cross-checked against the live raster in-kernel; letting ring 3 pass a width/height/pitch would
+        # put an unvalidatable mode description into the ABI and hand a caller the ability to aim an
+        # arbitrary pitch at the scanning pipe — the write that hung this box once already.
+        if ((load32(rec +  8) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 12) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+    }
     if (op == MDO_OP_PIXCLK) {
         # 1.56.33 — same doctrine as every op above it: NO OPERANDS. The pixel clock comes from
         # gpu_pixclk_discover (measured off the live pipe), the CRTC from gpu_display_pipe, and the
@@ -6104,6 +6359,7 @@ fn mdo_execute(rec) {
     if (op == MDO_OP_TRANSMIT) { return mdo_transmit(0); }
     if (op == MDO_OP_PIXCLK) { return mdo_pixclk(); }
     if (op == MDO_OP_CRCCAL) { return mdo_crccal(); }
+    if (op == MDO_OP_NATIVE) { return mdo_native(); }
     #ifdef MODESET_AUDIO_ARMS
     if (op == MDO_OP_AUDIO_PRE)  { return mdo_transmit(1); }
     if (op == MDO_OP_AUDIO_POST) { return mdo_transmit(2); }

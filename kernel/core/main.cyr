@@ -5210,6 +5210,12 @@ sh_exec("run /bin/modeset --pixclk", 25);
 # measurement — the NULL case the arc never took — is on iron.
 kprintln("modeset: running /bin/modeset --crccal", 38);
 sh_exec("run /bin/modeset --crccal", 25);
+# 1.56.36 — NATIVE RESOLUTION. Under QEMU mdo_native refuses at gpu_present (reason 1) BEFORE reading
+# boot_info, before arming and before any OTG or HUBP write, so this proves the NATIVE op dispatches with
+# the pipe untouched. The real proof — a pipe scanning the full-size surface with the scaler bypassed — is
+# on iron by eye, because the frame counter free-runs off the PLL and cannot see a black panel.
+kprintln("modeset: running /bin/modeset --native", 38);
+sh_exec("run /bin/modeset --native", 25);
 #endif
 
 # === Boot self-tests + kybernet launch split out (1.36.2 refactor) ===

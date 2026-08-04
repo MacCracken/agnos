@@ -10775,7 +10775,13 @@ fn gpu_scanout_regdump() {
     if (gpu_display_ok != 1) { return 0; }
     if (gpu_display_pipe < 0) { return 0; }
     var p = gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
-    kprintln("gpu: --- HUBP regdump begin (rd offset value, both decimal) ---", 63);
+    kprintln("gpu: --- HUBP regdump begin (rd off val, decimal; ZEROS SKIPPED) ---", 68);
+    # ⛔ THE BANNER SAYS "ZEROS SKIPPED" BECAUSE A READER ONCE BUILT A FALSE FINDING ON THE GAP. On
+    # 2026-08-03 offset 0x60A (DCSURF_PRIMARY_SURFACE_ADDRESS) read 0 and so was not printed; that was
+    # read as "the register is absent / the address lives elsewhere", and an unrelated address-shaped
+    # register was decoded in its place as the live scanout base. The same boot's log printed
+    # "display pipe 0 live (scanout matches framebuffer)" — the gate the finding claimed was failing.
+    # A suppressed value makes ABSENT and ZERO indistinguishable, so the emitter must say which it is.
     var off = 0x5A0;
     while (off <= 0x640) {
         var v = gpu_reg32(GPU_BASE_DCN_2, off + p);
@@ -10784,6 +10790,7 @@ fn gpu_scanout_regdump() {
         }
         off = off + 1;
     }
+    kprintln("gpu: an offset MISSING above read 0 -- it is not absent, it is zero", 67);
     kprintln("gpu: --- HUBP regdump end ---", 29);
     return 0;
 }

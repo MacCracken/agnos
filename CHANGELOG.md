@@ -25,6 +25,41 @@ Scope: the desktop renders at **800x600 into a 2560x1440 panel** — a small win
 quadrant, not an upscale. This cycle makes the scanout surface match the display link the kernel has
 already trained. See [`planning/gpu.md`](planning/gpu.md) for the register-level plan.
 
+### Added — `MDO_OP_NATIVE` (#93 op `0x0B`): retarget the pipe to the full-size surface
+
+Runtime modeset op behind the `/.modeset-armed` latch (`modeset_arm` site **11**). Reads the target
+geometry from the boot_info handoff, reconciles the live HUBP surface address against `fb_phys`, then
+runs one OTG envelope: `OTG_MASTER_EN=0` → `DSCL_MODE`→bypass, viewport, pitch, surface address →
+`OTG_MASTER_EN=1`. Restores the saved HUBP group and re-enables if the pipe does not resume. On success
+calls `fb_set_geom(w, h, pitch*4)` + `fb_console_clear()`.
+
+Registers written, all BASE_IDX 2 (`GPU_BASE_DCN_2` = `0x34C0`), pipe 0 only:
+
+| Offset | Register | From | To |
+|---|---|---|---|
+| `0x0CEC` | `DSCL0_SCL_MODE` `DSCL_MODE` [2:0] | 1 (`SCALING_444_RGB_ENABLE`) | **6** (`DSCL_BYPASS`) |
+| `0x5EA` | `DCSURF_PRI_VIEWPORT_DIMENSION` W[15:0] H[31:16] | `0x02580320` (800x600) | `(h << 16) \| w` |
+| `0x607` | `DCSURF_SURFACE_PITCH` [13:0] px | 832 | boot_info pitch / 4 |
+| `0x60A`/`0x60B` | `DCSURF_PRIMARY_SURFACE_ADDRESS` / `_HIGH` | — | written back in the encoding the pipe already uses |
+
+New constants: `GPU_R_DSCL_SCL_MODE` = `0x0CEC`, `GPU_DSCL_MODE_MASK` = `0x7`,
+`GPU_DSCL_MODE_BYPASS` = `6` (`kernel/core/gpu_regs.cyr`).
+
+New `MDO_E_*` reasons: **26** `NOTNATIVE` (boot_info has no usable full-size 32bpp surface) · **27**
+`SURFADDR` (the live HUBP surface reconciles with neither `fb_phys` nor its MC form) · **28** `ALREADY`
+(the viewport already reads the target) · **29** `RASTER` (the target is not the link's active raster).
+
+`MDO_OP_SUPPORTED` **`0x67F` → `0xE7F`** (plain) and **`0x7FF` → `0xFFF`** (`MODESET_AUDIO_ARMS`) — bit
+11 in both. `modeset-tool-smoke` opmask expectations move **1663 → 3711** and **2047 → 4095**.
+
+`/bin/modeset --native` exit codes: **95** envelope survived (the panel, not this code, is the oracle) ·
+**86** already native · **85** no usable boot_info surface · **84** target is not the raster · **83**
+surface address did not reconcile · **89** disable did not stop the pipe (HUBP untouched) · **91** did
+not resume, rollback ran · **96** no GPU · **98** latch would not arm.
+
+`MODESET_TOOL_SELFTEST` runs `--native`; the smoke asserts it dispatches (reason 1 under QEMU) and that
+it arms nothing and writes no `OTG_MASTER_EN` with no GPU present. 26 passed, 0 failed.
+
 ## [1.56.35] — 2026-08-03 — the desktop's kernel half (RELEASED)
 
 Scope: what the sovereign desktop needs from the kernel to host real client windows. Opened the day

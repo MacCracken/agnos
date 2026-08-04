@@ -91,10 +91,13 @@ want "$LOG" "modeset: caps OK" \
      "no 'caps OK' — the tool did not run or #93 failed (see error lines above)"
 # The op-support mask must be EXACTLY the value this build's flags call for, and the two legal values are
 # not interchangeable — the mask is the ABI's self-description, so a wrong one is a lie the tool believes.
-#   639 = NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT + TRANSMIT + PIXCLK   (no M9 arms)
-#  1023 = the above + AUDIO_PRE + AUDIO_POST                                 (MODESET_AUDIO_ARMS)
-# ⚠ These were 127 / 511 until 1.56.33 added MDO_OP_PIXCLK (bit 9, +512). PIXCLK is advertised
-# UNCONDITIONALLY on the TRANSMIT precedent — the op IS implemented and a kernel that cannot derive
+#  3711 = NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT + TRANSMIT + PIXCLK + CRCCAL + NATIVE  (no M9 arms)
+#  4095 = the above + AUDIO_PRE + AUDIO_POST                                                  (MODESET_AUDIO_ARMS)
+# ⚠ These were 127 / 511 until 1.56.33 added MDO_OP_PIXCLK (bit 9, +512), then 1663 / 2047 with CRCCAL
+# (bit 10, +1024), and 1.56.36 added MDO_OP_NATIVE (bit 11, +2048) to BOTH. NATIVE carries no audio content
+# at all, so gating it on MODESET_AUDIO_ARMS would have put the native-resolution path in the audio-
+# experiment kernel only — the exact "advertised in one build" defect this pair of assertions exists for.
+# PIXCLK is advertised UNCONDITIONALLY on the TRANSMIT precedent — the op IS implemented and a kernel that cannot derive
 # a PLL answers with the specific MDO_E_NOPLL rather than a generic "unknown op". ⛔ If you are here
 # because this assertion failed, check whether an op was added WITHOUT updating both values: the
 # mask is the ABI's self-description and a stale expectation here trains the operator to ignore it.
@@ -111,19 +114,19 @@ strings "$AGNOS" | grep -q "ARM 1 CONTROL: unmute BEFORE the edge" && K_AUDIO=1
 strings "$AGNOS" | grep -q "ATOM #76 CYCLE: DISABLE then ENABLE" && K_CYCLE=1
 echo "  (kernel flags read from the binary: MODESET_AUDIO=$K_AUDIO ATOM_TX_CYCLE=$K_CYCLE)"
 if [ "$K_AUDIO" = 1 ] && [ "$K_CYCLE" = 1 ]; then
-  want "$LOG" "modeset: opmask=2047" \
-       "the op-support mask is 2047 — the M9 audio arms ARE advertised, as MODESET_AUDIO_ARMS requires" \
-       "opmask != 2047 — MODESET_AUDIO_ARMS did not reach MDO_OP_SUPPORTED, so --audio-pre/--audio-post cannot dispatch"
-  wantno "$LOG" "modeset: opmask=1663" \
-       "the mask is not the un-armed 1663 — the widening is real, not a stale constant" \
-       "opmask=1663 in an ARMED build — the derived flag never took"
+  want "$LOG" "modeset: opmask=4095" \
+       "the op-support mask is 4095 — the M9 audio arms ARE advertised, as MODESET_AUDIO_ARMS requires" \
+       "opmask != 4095 — MODESET_AUDIO_ARMS did not reach MDO_OP_SUPPORTED, so --audio-pre/--audio-post cannot dispatch"
+  wantno "$LOG" "modeset: opmask=3711" \
+       "the mask is not the un-armed 3711 — the widening is real, not a stale constant" \
+       "opmask=3711 in an ARMED build — the derived flag never took"
 else
-  want "$LOG" "modeset: opmask=1663" \
-       "the op-support mask is 1663 (NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT + TRANSMIT + PIXCLK + CRCCAL) — the kernel wrote real caps, not zeros" \
-       "opmask != 1663 — the caps write is wrong or a constant read 0"
-  wantno "$LOG" "modeset: opmask=2047" \
+  want "$LOG" "modeset: opmask=3711" \
+       "the op-support mask is 3711 (NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT + TRANSMIT + PIXCLK + CRCCAL + NATIVE) — the kernel wrote real caps, not zeros" \
+       "opmask != 3711 — the caps write is wrong or a constant read 0"
+  wantno "$LOG" "modeset: opmask=4095" \
        "⛔ the M9 audio arms are ABSENT from this build — an unarmed kernel must not advertise them" \
-       "opmask=2047 without MODESET_AUDIO+ATOM_TX_CYCLE — the kernel is advertising ops whose experiment does not exist"
+       "opmask=4095 without MODESET_AUDIO+ATOM_TX_CYCLE — the kernel is advertising ops whose experiment does not exist"
 fi
 # --pixclk arg path (1.56.33 ATOM #12). ⛔ THIS ASSERTION WAS MISSING FOR THE WHOLE OF 1.56.33 — the cut
 # that added the flag — while the file's own selftest comment states the rule: exercise every flag the
@@ -144,6 +147,22 @@ want "$LOG" "modeset: #93 crccal idx=0 reason=1" \
 wantno "$LOG" "CRCCAL -- N1: the NULL case" \
      "⛔ the CRCCAL phases did NOT run under QEMU — it refused before touching the codec feed" \
      "CRCCAL ran its NULL phase with no GPU present — the gpu_present gate does not precede the feed stop"
+# --native arg path (1.56.36, NATIVE RESOLUTION). Under QEMU mdo_native refuses at gpu_present (reason 1)
+# BEFORE reading boot_info, before arming, and before any OTG or HUBP write — so reason 1 proves the NATIVE
+# op dispatched with the pipe untouched. Same rule as --pixclk before it: exercise every flag the operator
+# is told to type, or the iron burn is the first place a dispatch bug is found.
+want "$LOG" "modeset: #93 native idx=0 reason=1" \
+     "★ --native routed to the NATIVE op and returned reason 1 (no DCN under QEMU) — the native-resolution op dispatched, pipe not touched" \
+     "--native did not reach the NATIVE op — argv broken, or the op rejected the record (not reason 1)"
+# ⛔ And it must have refused BEFORE the envelope: no arm, and above all no OTG_MASTER_EN write. This op
+# disables the live pipe and reprograms HUBP geometry — the write class that hung this box once already —
+# so "it refused at the gpu_present gate" has to be provable, not assumed.
+wantno "$LOG" "modeset: latch armed at site=11" \
+     "the NATIVE op refused BEFORE arming the latch under QEMU (gpu_present gate precedes the arm)" \
+     "NATIVE armed the latch under QEMU — the gpu_present gate must precede modeset_arm"
+wantno "$LOG" "modeset: native -- OTG_MASTER_EN 0" \
+     "the NATIVE op did NOT disable the pipe under QEMU (refused at the gpu_present gate first)" \
+     "NATIVE disabled the pipe under QEMU — the gpu_present gate must precede any OTG write"
 
 # Under QEMU there is no AMD GPU, so the display must read DARK — this is what makes exit 96 the right answer.
 want "$LOG" "modeset: display DARK" \

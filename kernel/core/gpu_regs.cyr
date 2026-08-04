@@ -196,6 +196,21 @@ var GPU_R_OTG_GLOBAL_CONTROL0    = 0x1B90; # OTGn (stride 0x80): OTG_MASTER_UPDA
 var GPU_OTG_UPDATE_LOCK_STATUS   = 0x100;  # OTG_MASTER_UPDATE_LOCK bit8 (locked ack)
 var GPU_OTG_LOCK_SEL_MASK        = 0xE000000; # OTG_GLOBAL_CONTROL0 [27:25]
 var GPU_DCN_HUBP_STRIDE     = 0xDC;  # per-HUBP instance stride
+# DSCL (the DPP scaler) SCL_MODE — the register that decides whether the pipe SCALES its source viewport up
+# to the raster or passes it straight through. ✅ OFFSET AND ENCODING BOTH CORROBORATED BY A MEASURED READ,
+# not decoded by eye: the 2026-07-20 P4 diagnosis read abs 0x0CEC = **1** on the live pipe, and 1 is
+# DSCL_MODE_SCALING_444_RGB_ENABLE — exactly the "800x600 surface scaled to the 2560x1440 link" that the
+# 1.333x-wide-ellipse artifact independently measured. A wrong offset reading a meaningful-and-corroborated
+# value is the coincidence this project has learned to demand.
+# Field DSCL_MODE [2:0] (amdgpu `enum dscl_mode_sel`): 0 = SCALING_444_BYPASS · 1 = SCALING_444_RGB_ENABLE ·
+# 2 = SCALING_444_YCBCR · 3 = SCALING_420_YCBCR · 4 = SCALING_420_LUMA_BYPASS · 5 = SCALING_420_CHROMA_BYPASS ·
+# 6 = DSCL_BYPASS (the whole scaler out of the path — what a 1:1 native surface needs).
+# ⛔ PIPE 0 ONLY. The per-DPP instance stride is NOT anchored on this silicon, so this offset must NEVER be
+# indexed as `+ n * stride` until an instance-1 read has been matched to a known value. Every consumer guards
+# gpu_display_pipe == 0, which is also archaemenid's only lit pipe.
+var GPU_R_DSCL_SCL_MODE     = 0x0CEC;
+var GPU_DSCL_MODE_MASK      = 0x7;   # DSCL_MODE [2:0]
+var GPU_DSCL_MODE_BYPASS    = 6;     # DSCL_BYPASS — scaler removed from the path (source == raster)
 # --- 1.56.x D0 — DCN MPC (Multiple Pipe/Plane Combine): the SCANOUT BLENDER. READ-ONLY this bite.
 # All BASE_IDX 2 (GPU_BASE_DCN_2), from the generated dcn_2_1_0_offset.h. ⚠ Per
 # [[reference_agnos_dcn_hubp_reg_offsets_derived]] these are NOT trusted until D0's constraint gate agrees —
