@@ -121,6 +121,39 @@ fn fb_console_init() {
     kfmt_hex0x(diag_size);
     serial_println("", 0);
 
+    # ⭐ ALSO to the klug ring (2026-08-03). The block above is serial-ONLY, and archaemenid has NO
+    # serial channel — the build host IS the target. So on the box this diagnostic actually matters
+    # on, the `fb:` line has never once been readable: it is absent from every iron spill while being
+    # the FIRST line in every QEMU log. That is exactly backwards, because this is the line that says
+    # whether the console started at the SURFACE geometry or the OUTPUT geometry — the difference
+    # between a clean early boot and the sheared text the 2026-08-03 burn photographed.
+    # ⛔ EVERY FIELD IS HEX AND LABELLED 0x. Without the prefix `w=800` reads as 800 decimal — which is
+    # precisely the wrong-geometry value being hunted on this box, so an unprefixed hex 0x800 (=2048)
+    # would look like a confirmed fault. Do not remove the prefixes.
+    # klug is a kernel-resident ring readable after the fact with `run /bin/klug > /f.txt`, and it is
+    # pure store8 + integer math, safe this early (same property the #PF recorder relies on).
+    var fbk[16];
+    var fbn = 0;
+    klug_append("fb: w=0x", 8);
+    fbn = fmt_hex_buf(diag_w, &fbk);      klug_append(&fbk, fbn);
+    if (fbn == 0) { klug_append("0", 1); }
+    klug_append(" h=0x", 5);
+    fbn = fmt_hex_buf(diag_h, &fbk);      klug_append(&fbk, fbn);
+    if (fbn == 0) { klug_append("0", 1); }
+    klug_append(" pitch=0x", 9);
+    fbn = fmt_hex_buf(diag_pitch, &fbk);  klug_append(&fbk, fbn);
+    if (fbn == 0) { klug_append("0", 1); }
+    klug_append(" phys=0x", 8);
+    fbn = fmt_hex_buf(diag_phys, &fbk);   klug_append(&fbk, fbn);
+    if (fbn == 0) { klug_append("0", 1); }
+    klug_append(" size=0x", 8);
+    fbn = fmt_hex_buf(diag_size, &fbk);   klug_append(&fbk, fbn);
+    if (fbn == 0) { klug_append("0", 1); }
+    klug_append(" mode=0x", 8);
+    fbn = fmt_hex_buf(diag_mode, &fbk);   klug_append(&fbk, fbn);
+    if (fbn == 0) { klug_append("0", 1); }
+    klug_putc(10);
+
     # Mirror the geometry to CMOS extended-bank scratch [0x90..0x9F] so
     # post-mortem read-boot-log can recover it on iron (single-machine
     # archaemenid setup, no serial cable). 16 contiguous bytes, virgin

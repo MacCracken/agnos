@@ -98,6 +98,37 @@ fn vfs_spin_unlock() {
 # proctab_lock guards proc_alloc_slot's scan/claim/proc_count-bump + the reap-path proc_count
 # decrement (proc_reap/proc_reap_child). Short, non-nesting (the critical sections do no I/O
 # and no allocation → no re-entry). Fixed-global (no param), like the heap/vfs pairs.
+# mmap arena cursor lock (1.56.36). `mmap_next_vaddr` (proc.cyr) is ONE global for every process and
+# was read-modify-written UNLOCKED inside sys_mmap's mapping loop, while the base handed back was
+# captured before the loop. Two concurrent multi-page mmaps therefore interleaved and punched a HOLE:
+# a caller got `base, len` with a middle page never mapped in its CR3. IRON-CONFIRMED 2026-08-03 —
+# `fault: pid=7 cr2=0x1043c000 err=0x6 pde=0 idx=82` (PD[130], inside the low arena at 0x10000000),
+# a user WRITE to a not-present page, which cost the desktop its second client on that burn.
+# Same fixed-global shape as the locks above (no parameter, so the [rbp-N] offsets are exact).
+var mmap_lock = 0;
+fn mmap_spin_lock() {
+    var old = 1;
+    while (old == 1) {
+        var addr = &mmap_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn mmap_spin_unlock() {
+    var addr = &mmap_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;            # xor rcx, rcx
+        0x48; 0x87; 0x08;            # xchg [rax], rcx
+    }
+    return 0;
+}
+
 fn proctab_spin_lock() {
     var old = 1;
     while (old == 1) {

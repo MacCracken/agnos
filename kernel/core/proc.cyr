@@ -1639,16 +1639,31 @@ fn sys_mmap(length) {
     if (pmm_count_2mb_free() < npages) { return 0; }       # not enough physical (pre-count)
     # LOW arena first (the proven path) when it still fits under the stack-guard
     # ceiling (0x3FA00000, below the user stack @0x3FC00000).
+    # ⭐ RESERVE THE WHOLE SPAN ATOMICALLY, THEN MAP INTO IT.
+    # The cursor read, the ceiling check and the advance are now one critical section, and the loop
+    # maps `base_vaddr + i*2MB` — a fixed range this caller owns — instead of re-reading a global that
+    # another CPU is also advancing. Previously the base was captured before the loop while the loop
+    # itself did an UNLOCKED read-modify-write of `mmap_next_vaddr`, so two concurrent multi-page
+    # mmaps interleaved and left a HOLE in each other's range.
+    # ⛔ IRON-CONFIRMED 2026-08-03, not theoretical: `fault: pid=7 cr2=0x1043c000 err=0x6 pde=0 idx=82`
+    # — PD[130], inside this arena, a user WRITE to a page that was never mapped. It cost the desktop
+    # its second client on that burn. The HIGH arena below already reserved per-process
+    # (`himmap_reserve`, 1.50.4); this brings the low arena to the same guarantee.
+    mmap_spin_lock();
+    var base_vaddr = 0;
     if ((mmap_next_vaddr + len) <= 0x3FA00000) {
-        var base_vaddr = mmap_next_vaddr;
+        base_vaddr = mmap_next_vaddr;
+        mmap_next_vaddr = mmap_next_vaddr + len;    # claim the ENTIRE span before releasing
+    }
+    mmap_spin_unlock();
+    if (base_vaddr != 0) {
         for (var i = 0; i < npages; i = i + 1) {
             var phys = pmm_alloc_2mb();
             if (phys == 0) { return 0; }            # pre-counted, but guard anyway
             # 1.49.12: zero via the kernel access handle — identity <=256 MB, direct-map above.
             var kva = pmm_kva_for_access(phys);
             memset(kva, 0, 0x200000);               # zero-fill (anonymous contract)
-            proc_map_page_nx(cr3, mmap_next_vaddr, phys);
-            mmap_next_vaddr = mmap_next_vaddr + 0x200000;
+            proc_map_page_nx(cr3, base_vaddr + i * 0x200000, phys);
         }
         return base_vaddr;
     }
@@ -1721,7 +1736,11 @@ fn sys_munmap(addr, length) {
         }
     }
     # LIFO vaddr reclaim: rewind the bump cursor if this was the most-recent map.
+    # The munmap rollback touches the same global the alloc path claims from, so it takes the same
+    # lock. Unlocked, a rollback racing an alloc could hand two callers the same base.
+    mmap_spin_lock();
     if ((addr + len) == mmap_next_vaddr) { mmap_next_vaddr = addr; }
+    mmap_spin_unlock();
     return 0;
 }
 #endif
