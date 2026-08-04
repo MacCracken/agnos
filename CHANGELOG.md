@@ -19,7 +19,13 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ---
 
-## [1.56.35] — 2026-08-02 — the desktop's kernel half (cycle OPEN)
+## [1.56.36] — 2026-08-03 — native-resolution scanout (cycle OPEN)
+
+Scope: the desktop renders at **800x600 into a 2560x1440 panel** — a small window in the upper-left
+quadrant, not an upscale. This cycle makes the scanout surface match the display link the kernel has
+already trained. See [`planning/gpu.md`](planning/gpu.md) for the register-level plan.
+
+## [1.56.35] — 2026-08-03 — the desktop's kernel half (RELEASED)
 
 Scope: what the sovereign desktop needs from the kernel to host real client windows. Opened the day
 1.56.34 closed, because the desktop's remaining blocker turned out to be a kernel fault that

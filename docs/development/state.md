@@ -12,8 +12,8 @@ type: state
 
 | Field | Value | Source |
 |---|---|---|
-| Kernel head | **1.56.35 — OPEN** (opened 2026-08-02, the desktop's kernel half) | [`VERSION`](../../VERSION) |
-| Previous cut | **1.56.34 closed 2026-08-02** (HDMI audio), awaiting the user's tag | [`CHANGELOG.md`](../../CHANGELOG.md) |
+| Kernel head | **1.56.36 — OPEN** (opened 2026-08-03, native-resolution scanout) | [`VERSION`](../../VERSION) |
+| Previous cut | **1.56.35 RELEASED 2026-08-03** — the desktop's kernel half; `EFER.NXE` on the APs + the TLB shootdown IPI. Iron-burned and PASSED | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | `build/agnos` on disk | 1,936,080 B, 2026-08-03 — **1.56.35 bare, BURNED and PASSED**. burn-tag `f96b469a…`, `burn-verify: OK`. ⚠ Any smoke/test run rebuilds it without the burn flags — re-run `burn-prep.sh` before any future flash | `scripts/burn/burn-verify.sh` |
 | Cyrius pin | **6.4.78** | `cyrius.cyml [package].cyrius` |
 | Bootloader | gnoboot **0.6.0**; Path C, `RDI = &boot_info`, magic `0x41474E4F`, entry `0x1000a8` | `gnoboot/VERSION` |
