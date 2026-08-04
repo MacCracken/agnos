@@ -260,6 +260,33 @@ var GPU_FB_BACK_LIMIT       = 0x60000000;
 var GPU_SHM_REGION_OFF      = 0xA0000000;
 var GPU_SHM_SLOT_SIZE       = 0x200000;   # 2 MB per slot — matches SHM_MAX_SIZE
 
+# === 1.56.36 — the CONSOLE PAN buffer (hardware-scrolled text console) ==================================
+# WHY A HARDWARE PAN EXISTS AT ALL: at native 2560x1440 the software scroll moves the WHOLE console region
+# once per scrolled LINE — measured on iron at pitch 10240 x 1440 rows = **14.7 MB of WC stores per line**,
+# against ~2.0 MB at the old 800x600 surface. 7.4x on every term, and WC stores are the expensive direction.
+# That is the "everything got slower after --native" the 2026-08-03 burn reported, and it is arithmetic, not
+# a defect. A pan replaces the copy with ONE surface-address write plus a 160 KB bottom-row clear.
+#
+# ⭐ THE MECHANISM IS ALREADY IRON-PROVEN — this invents nothing. `gpu_blit_present` re-points
+# DCSURF_PRIMARY_SURFACE_ADDRESS **live, every frame, with no OTG envelope** (that is how DOOM page-flips),
+# and `gpu_scanout_redirect` already pairs such a flip with `fb_set_scanout_base`. A pan is that same flip
+# at a sub-frame offset.
+#
+# ⛔ ITS OWN REGION, DELIBERATELY — NOT the A/B back buffers at GPU_FB_BACK_OFF. Panning a buffer that
+# full-screen apps also present from would make the console's pan offset and DOOM's page flips fight over
+# one address register, and a full-screen app exiting would hand back a scanout at an offset the console no
+# longer agrees with. Independent regions make that class of bug unconstructible.
+# 512 MB into the carveout: clear of the console FB (offset 0, ~15 MB at 2560x1440), the A/B back buffers
+# (1 GB), the PSP TMR (1.5 GB), the compute arena (2 GB), shm (2.5 GB) and the RT region (2816 MB).
+var GPU_FB_PAN_OFF          = 0x20000000;
+# HARD BOUND: the pan buffer must end before the back buffers. Same doctrine as GPU_FB_BACK_LIMIT — a
+# quirky/hostile geometry FALLS BACK to the software scroll rather than scribbling over another region.
+var GPU_FB_PAN_LIMIT        = 0x40000000;
+# Slack rows, as a multiple of the visible height. 2 = a double-height buffer: the scanout start walks down
+# one text row at a time through `height` rows of slack before one full-frame reset is needed. At 1440 rows
+# and a 16 px cell that is **90 pans per reset**, so the expensive copy is amortised ~90:1.
+var GPU_FB_PAN_HEIGHT_MUL   = 2;
+
 # === 1.55.x P3 — display-audio egress (the 1.53.5 HDA backlog closes here) ===
 # The HDA side already works: the GPU's audio function (PCI 04:00.1) is probed, its codec enumerated, a
 # digital pin routed, DigEn set, converter bound, tone streaming. It is SILENT because the DISPLAY side of

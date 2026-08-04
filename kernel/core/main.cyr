@@ -5216,6 +5216,12 @@ sh_exec("run /bin/modeset --crccal", 25);
 # on iron by eye, because the frame counter free-runs off the PLL and cannot see a black panel.
 kprintln("modeset: running /bin/modeset --native", 38);
 sh_exec("run /bin/modeset --native", 25);
+# 1.56.36 — the console hardware pan. Under QEMU mdo_pan refuses at gpu_present (reason 1) BEFORE reading
+# the viewport, before allocating the pan buffer and before any surface-address write, so this proves the
+# PAN op dispatches with the scanout untouched. The real proof — text scrolling by an address write — is
+# on iron by eye; no kernel instrument can see a torn or duplicated console row.
+kprintln("modeset: running /bin/modeset --pan", 35);
+sh_exec("run /bin/modeset --pan", 22);
 #endif
 
 # === Boot self-tests + kybernet launch split out (1.36.2 refactor) ===

@@ -4318,6 +4318,7 @@ var MDO_OP_AUDIO_POST = 0x08;       # M9 TREATMENT — transmit + audio unmuted 
 var MDO_OP_PIXCLK     = 0x09;       # 1.56.33 — ATOM #12 SetPixelClock; derives all params, refuses on pll_id
 var MDO_OP_CRCCAL     = 0x0A;       # 1.56.34 — calibrate the AFMT audio CRC against its NULL case, in one boot
 var MDO_OP_NATIVE     = 0x0B;       # 1.56.36 — NATIVE RESOLUTION: retarget HUBP to the full-size surface, scaler to bypass
+var MDO_OP_PAN        = 0x0C;       # 1.56.36 — CONSOLE HARDWARE PAN: scroll by moving the scanout start, not 14.7 MB
 # bit N set <=> op N implemented: 0 NOP,1 CAPS,2 DUMP,3 LOCK,4 VTOTAL,5 RECOMMIT,6 TRANSMIT,
 # 9 PIXCLK — advertised UNCONDITIONALLY on the TRANSMIT precedent: the op IS implemented, and a
 # build/boot that cannot derive a pll_id answers with the specific MDO_E_NOPLL rather than a generic
@@ -4336,13 +4337,14 @@ var MDO_OP_NATIVE     = 0x0B;       # 1.56.36 — NATIVE RESOLUTION: retarget HU
 # ⚠ 1.56.34: bit 10 (MDO_OP_CRCCAL 0x0A) added to BOTH values — the CRC calibration is not an audio ARM,
 # it is an INSTRUMENT check, so it must exist in a plain kernel. An added op must move both or the smoke's
 # both-directions assertion fails, which is the check that catches an op advertised in only one build.
-# ⚠ 1.56.36: bit 11 (MDO_OP_NATIVE 0x0B) added to BOTH values, same rule. NATIVE is a DISPLAY op with no
-# audio content whatsoever, so gating it on MODESET_AUDIO_ARMS would make the native-resolution path exist
-# only in an audio-experiment kernel — the exact "advertised in one build" defect the assertion exists for.
+# ⚠ 1.56.36: bit 11 (MDO_OP_NATIVE 0x0B) and bit 12 (MDO_OP_PAN 0x0C) added to BOTH values, same rule.
+# Both are DISPLAY ops with no audio content whatsoever, so gating either on MODESET_AUDIO_ARMS would make
+# the native-resolution and console-pan paths exist only in an audio-experiment kernel — the exact
+# "advertised in one build" defect the assertion exists for.
 #ifdef MODESET_AUDIO_ARMS
-var MDO_OP_SUPPORTED = 0xFFF;
+var MDO_OP_SUPPORTED = 0x1FFF;
 #else
-var MDO_OP_SUPPORTED = 0xE7F;
+var MDO_OP_SUPPORTED = 0x1E7F;
 #endif
 var MDO_E_NOGPU      = 1;           # call/op — GPU/display unavailable (write ops only, once they exist)
 var MDO_E_BADOP      = 2;           # op    — unknown, reserved, or not implemented in this kernel
@@ -4406,6 +4408,11 @@ var MDO_E_ALREADY    = 28;
 # raster must match exactly; anything else is a scaled mode wearing a bypass, which is how a "correct" pitch
 # blacked this pipe once already. Refuse rather than write a mismatch and read the panel to find out.
 var MDO_E_RASTER     = 29;
+# op — PAN: the pan buffer could not be armed. Either the geometry is unusable, or the buffer would not fit
+# below GPU_FB_PAN_LIMIT and arming it would scribble into the A/B back buffers. A refusal here leaves the
+# console exactly where it was, still on the old scanout and still using the software scroll — the pan is
+# a pure optimisation, so falling back to the slow path is always a correct answer.
+var MDO_E_NOPAN      = 30;
 
 # mdo_caps_write(out_uva) -> 0 / MDO_E_OUTBUF. Writes 8x u32 LE describing the modeset surface. READ-ONLY of
 # kernel state; the ONLY write is to the validated user buffer, via the gpu_caps_sys direct-store idiom.
@@ -5383,6 +5390,61 @@ fn mdo_native() {
     return 0;
 }
 
+# ── CONSOLE HARDWARE PAN — #93 op 0x0C (1.56.36) ──────────────────────────────────────────────────────
+# Move the console into an agnos-owned VRAM buffer TALLER than the screen and make scrolling a scanout-start
+# move instead of a full-screen copy.
+#
+# WHY: the 2026-08-03 native burn worked and the operator immediately reported the console had got slower.
+# That is arithmetic, not a defect — `fb_scroll_up` flushes `pitch * height` per scrolled LINE, which at
+# 2560x1440 is **14.7 MB of WC stores**, against ~2.0 MB at the old 800x600 surface. The pan replaces that
+# with one register write plus a 160 KB bottom-row clear, and one full-frame reset per 90 scrolls.
+#
+# ⭐ THE RISKIEST-LOOKING PART IS THE PART THAT IS ALREADY PROVEN. Re-pointing
+# DCSURF_PRIMARY_SURFACE_ADDRESS live, with no OTG envelope, is exactly what `gpu_blit_present` does every
+# frame to page-flip DOOM on this iron. This op does not invent a mechanism; it reuses the address group at
+# a sub-frame offset.
+#
+# ⛔ NO LATCH, AND THAT IS A CONSIDERED CHOICE, not an oversight. `modeset_arm` guards writes that can leave
+# the pipe DARK across a reboot — the OTG envelope, the PHY. This op writes only the address group, which
+# cannot hang or blank the pipe, and its entire state lives in RAM: a reboot restores the firmware scanout
+# with nothing to disarm. Taking the latch would cost the operator an `rm /.modeset-armed` for a write that
+# carries none of the risk the latch exists for. Same treatment `gpu_scanout_redirect` and
+# `gpu_blit_present` already get.
+#
+# ⚠ REQUIRES A NATIVE PIPE. On a scaled pipe the console geometry and the raster disagree, so a pan would
+# move the scanout by one text row of the SOURCE and the scaler would smear the result — refuse instead.
+fn mdo_pan() {
+    if (gpu_present == 0)      { return MDO_E_NOGPU; }
+    if (gpu_display_ok != 1)   { return MDO_E_NOGPU; }
+    if (gpu_display_pipe != 0) { kprintln("modeset: pan refused -- live pipe is not 0", 42); return MDO_E_NOGPU; }
+    if (fb_pan_armed() == 1) {
+        kprintln("modeset: pan -- already armed; the console is ALREADY hardware-scrolled", 71);
+        return MDO_E_ALREADY;
+    }
+    # The pipe must be native: viewport == raster, i.e. --native has run and the scaler is in bypass.
+    var vp = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_VIEWPORT_DIM) & 0xFFFFFFFF;
+    var vw = vp & 0xFFFF;
+    var vh = (vp >> 16) & 0xFFFF;
+    if (gpu_h_active == 0) { kprintln("modeset: pan refused -- link active width never derived", 55); return MDO_E_RASTER; }
+    if (vw != gpu_h_active) { kprintln("modeset: pan refused -- pipe is not native; run --native first", 62); return MDO_E_RASTER; }
+    if (vh != gpu_v_active) { kprintln("modeset: pan refused -- pipe is not native; run --native first", 62); return MDO_E_RASTER; }
+    kprint("modeset: pan arming -- console ", 31); kprint_num(fb_width());
+    kprint("x", 1); kprint_num(fb_height());
+    kprint(" pitch ", 7); kprint_num(fb_pitch());
+    kprint(" software scroll costs ", 23); kprint_num(fb_pitch() * fb_height() / 1024);
+    kprintln(" KB per line", 12);
+    if (gpu_pan_arm() != 1) {
+        kprintln("modeset: PAN REFUSED -- buffer would not fit below the back buffers; console unchanged", 86);
+        return MDO_E_NOPAN;
+    }
+    kprint("modeset: PAN ARMED -- scroll is now one address write + ", 56);
+    kprint_num(16 * fb_scale() * fb_pitch() / 1024);
+    kprintln(" KB, reset every 90 lines", 25);
+    kprintln("modeset: EYE-CHECK: type something that scrolls. Text must scroll cleanly with", 78);
+    kprintln("modeset: no tearing band, no duplicated row, and no garbage at the bottom.", 74);
+    return 0;
+}
+
 # ── M8 the TRANSMITTER: ATOM #4 (+ #76) INSIDE M6's envelope (MODESET_OP_TRANSMIT) ─────────────────────
 # The culmination of the display arc: the DVI->HDMI encoder + transmitter edge run INSIDE the OTG envelope
 # M6 proved on iron, which is the one ordering agnos has structurally never produced. amdgpu runs #76 only
@@ -6121,6 +6183,14 @@ fn mdo_validate(rec) {
         if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
         if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
     }
+    if (op == MDO_OP_PAN) {
+        # 1.56.36 — NO OPERANDS. The pan geometry is the live console geometry; the buffer offset is a
+        # build constant. A ring-3-supplied offset would let a caller aim the scanout at arbitrary VRAM.
+        if ((load32(rec +  8) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 12) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+    }
     if (op == MDO_OP_PIXCLK) {
         # 1.56.33 — same doctrine as every op above it: NO OPERANDS. The pixel clock comes from
         # gpu_pixclk_discover (measured off the live pipe), the CRTC from gpu_display_pipe, and the
@@ -6360,6 +6430,7 @@ fn mdo_execute(rec) {
     if (op == MDO_OP_PIXCLK) { return mdo_pixclk(); }
     if (op == MDO_OP_CRCCAL) { return mdo_crccal(); }
     if (op == MDO_OP_NATIVE) { return mdo_native(); }
+    if (op == MDO_OP_PAN) { return mdo_pan(); }
     #ifdef MODESET_AUDIO_ARMS
     if (op == MDO_OP_AUDIO_PRE)  { return mdo_transmit(1); }
     if (op == MDO_OP_AUDIO_POST) { return mdo_transmit(2); }

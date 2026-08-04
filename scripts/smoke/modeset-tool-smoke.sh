@@ -91,12 +91,13 @@ want "$LOG" "modeset: caps OK" \
      "no 'caps OK' — the tool did not run or #93 failed (see error lines above)"
 # The op-support mask must be EXACTLY the value this build's flags call for, and the two legal values are
 # not interchangeable — the mask is the ABI's self-description, so a wrong one is a lie the tool believes.
-#  3711 = NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT + TRANSMIT + PIXCLK + CRCCAL + NATIVE  (no M9 arms)
-#  4095 = the above + AUDIO_PRE + AUDIO_POST                                                  (MODESET_AUDIO_ARMS)
+#  7807 = the plain set: NOP CAPS DUMP LOCK VTOTAL RECOMMIT TRANSMIT PIXCLK CRCCAL NATIVE PAN  (no M9 arms)
+#  8191 = the above + AUDIO_PRE + AUDIO_POST                                                       (MODESET_AUDIO_ARMS)
 # ⚠ These were 127 / 511 until 1.56.33 added MDO_OP_PIXCLK (bit 9, +512), then 1663 / 2047 with CRCCAL
-# (bit 10, +1024), and 1.56.36 added MDO_OP_NATIVE (bit 11, +2048) to BOTH. NATIVE carries no audio content
-# at all, so gating it on MODESET_AUDIO_ARMS would have put the native-resolution path in the audio-
-# experiment kernel only — the exact "advertised in one build" defect this pair of assertions exists for.
+# (bit 10, +1024), and 1.56.36 added MDO_OP_NATIVE (bit 11, +2048) and MDO_OP_PAN (bit 12, +4096) to BOTH.
+# Neither carries any audio content, so gating either on MODESET_AUDIO_ARMS would have put the
+# native-resolution and console-pan paths in the audio-experiment kernel only — the exact "advertised in
+# one build" defect this pair of assertions exists for.
 # PIXCLK is advertised UNCONDITIONALLY on the TRANSMIT precedent — the op IS implemented and a kernel that cannot derive
 # a PLL answers with the specific MDO_E_NOPLL rather than a generic "unknown op". ⛔ If you are here
 # because this assertion failed, check whether an op was added WITHOUT updating both values: the
@@ -114,19 +115,19 @@ strings "$AGNOS" | grep -q "ARM 1 CONTROL: unmute BEFORE the edge" && K_AUDIO=1
 strings "$AGNOS" | grep -q "ATOM #76 CYCLE: DISABLE then ENABLE" && K_CYCLE=1
 echo "  (kernel flags read from the binary: MODESET_AUDIO=$K_AUDIO ATOM_TX_CYCLE=$K_CYCLE)"
 if [ "$K_AUDIO" = 1 ] && [ "$K_CYCLE" = 1 ]; then
-  want "$LOG" "modeset: opmask=4095" \
-       "the op-support mask is 4095 — the M9 audio arms ARE advertised, as MODESET_AUDIO_ARMS requires" \
-       "opmask != 4095 — MODESET_AUDIO_ARMS did not reach MDO_OP_SUPPORTED, so --audio-pre/--audio-post cannot dispatch"
-  wantno "$LOG" "modeset: opmask=3711" \
-       "the mask is not the un-armed 3711 — the widening is real, not a stale constant" \
-       "opmask=3711 in an ARMED build — the derived flag never took"
+  want "$LOG" "modeset: opmask=8191" \
+       "the op-support mask is 8191 — the M9 audio arms ARE advertised, as MODESET_AUDIO_ARMS requires" \
+       "opmask != 8191 — MODESET_AUDIO_ARMS did not reach MDO_OP_SUPPORTED, so --audio-pre/--audio-post cannot dispatch"
+  wantno "$LOG" "modeset: opmask=7807" \
+       "the mask is not the un-armed 7807 — the widening is real, not a stale constant" \
+       "opmask=7807 in an ARMED build — the derived flag never took"
 else
-  want "$LOG" "modeset: opmask=3711" \
-       "the op-support mask is 3711 (NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT + TRANSMIT + PIXCLK + CRCCAL + NATIVE) — the kernel wrote real caps, not zeros" \
-       "opmask != 3711 — the caps write is wrong or a constant read 0"
-  wantno "$LOG" "modeset: opmask=4095" \
+  want "$LOG" "modeset: opmask=7807" \
+       "the op-support mask is 7807 (the full plain op set incl. NATIVE + PAN) — the kernel wrote real caps, not zeros" \
+       "opmask != 7807 — the caps write is wrong or a constant read 0"
+  wantno "$LOG" "modeset: opmask=8191" \
        "⛔ the M9 audio arms are ABSENT from this build — an unarmed kernel must not advertise them" \
-       "opmask=4095 without MODESET_AUDIO+ATOM_TX_CYCLE — the kernel is advertising ops whose experiment does not exist"
+       "opmask=8191 without MODESET_AUDIO+ATOM_TX_CYCLE — the kernel is advertising ops whose experiment does not exist"
 fi
 # --pixclk arg path (1.56.33 ATOM #12). ⛔ THIS ASSERTION WAS MISSING FOR THE WHOLE OF 1.56.33 — the cut
 # that added the flag — while the file's own selftest comment states the rule: exercise every flag the
@@ -163,6 +164,16 @@ wantno "$LOG" "modeset: latch armed at site=11" \
 wantno "$LOG" "modeset: native -- OTG_MASTER_EN 0" \
      "the NATIVE op did NOT disable the pipe under QEMU (refused at the gpu_present gate first)" \
      "NATIVE disabled the pipe under QEMU — the gpu_present gate must precede any OTG write"
+# --pan arg path (1.56.36, the console hardware pan). Under QEMU mdo_pan refuses at gpu_present (reason 1)
+# BEFORE reading the viewport, allocating the pan buffer or writing the surface address.
+want "$LOG" "modeset: #93 pan idx=0 reason=1" \
+     "★ --pan routed to the PAN op and returned reason 1 (no DCN under QEMU) — the pan op dispatched, scanout not touched" \
+     "--pan did not reach the PAN op — argv broken, or the op rejected the record (not reason 1)"
+# ⛔ And it must have refused BEFORE arming: no pan buffer allocated, no scanout re-point. A pan armed with
+# no GPU would move fb_console's paint base to an address nothing is scanning — an invisible console.
+wantno "$LOG" "modeset: PAN ARMED" \
+     "the PAN op did NOT arm under QEMU (refused at the gpu_present gate first)" \
+     "PAN armed with no GPU present — fb_console would paint into a buffer nothing scans"
 
 # Under QEMU there is no AMD GPU, so the display must read DARK — this is what makes exit 96 the right answer.
 want "$LOG" "modeset: display DARK" \

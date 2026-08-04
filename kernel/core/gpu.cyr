@@ -11038,6 +11038,75 @@ fn gpu_sdma_copy_test() {
 # agnos-owned, scanned buffer. No pitch/tiling/DCC write, no OTG lock. The console text itself is the oracle:
 # legible ⟹ P4 closed. ⚠ FIRST-CUT shares gpu_bb_a (fine at boot, before any app); shipping needs a dedicated
 # console slot (gpu_blit_target hands gpu_bb_a/b to full-screen apps) + gpu_display_restore_console re-pointed.
+# === 1.56.36 — CONSOLE HARDWARE PAN ====================================================================
+# See GPU_FB_PAN_OFF (gpu_regs.cyr) for the why, the measured cost it removes, and why the pan buffer is a
+# region of its own rather than the A/B back buffers.
+var gpu_pan_armed = 0;   # 1 = pan buffer allocated, WC-mapped, cleared, and scanned
+var gpu_pan_phys  = 0;   # CPU side (carveout direct-DRAM window, WC-mapped) — where fb_console paints
+var gpu_pan_mc    = 0;   # MC side — what the HUBP fetches
+
+# gpu_pan_commit — move the scanout start to `off` bytes into the pan buffer.
+# ⭐ NO OTG ENVELOPE, DELIBERATELY. This is the address group only, the exact write gpu_blit_present issues
+# every frame to page-flip DOOM; it is the one register group DCN is designed to take live, and agnos has
+# been doing it on this iron for cuts. HIGH then LOW, matching gpu_blit_present's order.
+# ⛔ Does NOT wait for vblank. A scroll happens per console line and a 60 Hz wait would throttle the console
+# to 60 lines/s — far slower than the software scroll it replaces. Tearing on a text console is a partially
+# updated line for one frame; the trade is deliberate.
+fn gpu_pan_commit(off) {
+    if (gpu_pan_armed != 1) { return 0; }
+    if (gpu_display_pipe < 0) { return 0; }
+    var tgt = gpu_pan_mc + off;
+    var slo = GPU_R_HUBP_SURF_ADDR    + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    var shi = GPU_R_HUBP_SURF_ADDR_HI + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    gpu_reg32_write(GPU_BASE_DCN_2, shi, (tgt >> 32) & 0xFFFF);
+    gpu_reg32_write(GPU_BASE_DCN_2, slo, tgt & 0xFFFFFFFF);
+    gpu_mfence();
+    return 1;
+}
+
+# gpu_pan_arm — allocate + map + seed the pan buffer, flip scanout to it, and hand fb_console the offsets.
+# Returns 1 armed, 0 refused (every refusal leaves the console exactly as it was, on the old scanout).
+fn gpu_pan_arm() {
+    if (gpu_pan_armed == 1) { return 1; }
+    if (gpu_present == 0) { return 0; }
+    if (gpu_display_ok != 1) { return 0; }
+    if (gpu_display_pipe < 0) { return 0; }
+    var pitch  = fb_pitch();
+    var height = fb_height();
+    if (pitch == 0) { return 0; }
+    if (height == 0) { return 0; }
+    var vis  = pitch * height;                       # one visible screenful
+    var tall = vis * GPU_FB_PAN_HEIGHT_MUL;          # the buffer, slack included
+    var span = ((tall + 0x1FFFFF) >> 21) << 21;      # whole 2 MB regions (the WC-remap unit)
+    # HARD BOUND — fall back to the software scroll rather than scribble into the back buffers.
+    if (GPU_FB_PAN_OFF + span > GPU_FB_PAN_LIMIT) { return 0; }
+    var r_off  = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_OFFSET)   & GPU_FB_LOC_MASK;
+    var r_base = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_LOC_BASE) & GPU_FB_LOC_MASK;
+    gpu_pan_phys = (r_off  << 24) + GPU_FB_PAN_OFF;
+    gpu_pan_mc   = (r_base << 24) + GPU_FB_PAN_OFF;
+    var p = 0;
+    while (p < span) { vmm_remap_wc_2mb(gpu_pan_phys + p); p = p + 0x200000; }
+    # Clear the WHOLE buffer, slack included. The slack rows scroll into view later, so anything left there
+    # is content the operator will eventually see — an uncleared tail would surface as garbage 90 lines in.
+    var z = 0;
+    while (z < tall) { store64(gpu_pan_phys + z, 0); z = z + 8; }
+    # Seed the visible screenful with what is on the console right now, so the flip does not blank the log.
+    var src = fb_draw_base();
+    if (src != 0) {
+        var q = 0;
+        while (q < vis) { store64(gpu_pan_phys + q, load64(src + q)); q = q + 8; }
+    }
+    gpu_mfence();
+    gpu_pan_armed = 1;
+    # Flip scanout to the pan buffer at offset 0, then move the console's paint base to match. Order
+    # matters: the buffer already holds the seeded image, so the flip is invisible.
+    gpu_pan_commit(0);
+    gpu_display_wait_vblank(gpu_display_pipe);
+    fb_set_scanout_base(gpu_pan_phys);
+    fb_pan_arm(vis * (GPU_FB_PAN_HEIGHT_MUL - 1));   # slack bytes = the rows beyond the visible screenful
+    return 1;
+}
+
 fn gpu_scanout_redirect() {
     if (gpu_display_ok != 1) { return 0; }
     if (gpu_display_pipe < 0) { return 0; }
@@ -11146,6 +11215,18 @@ fn gpu_display_restore_console() {
     if (gpu_display_ok != 1) { return 0; }
     if (gpu_display_pipe < 0) { return 0; }
     if (gpu_display_surf == 0) { return 0; }
+    # ⛔ 1.56.36: RESTORE TO WHERE THE CONSOLE ACTUALLY PAINTS, which is not always gpu_display_surf.
+    # With the hardware pan armed, fb_console paints into the pan buffer at the current pan offset. Handing
+    # the scanout back to the firmware surface would leave the console painting one place and the hardware
+    # scanning another — an INVISIBLE console, and the failure would land on the operator the moment they
+    # quit the desktop, not on whoever armed the pan. Restore the pan target instead, offset included.
+    if (fb_pan_armed() == 1) {
+        gpu_pan_commit(fb_pan_bytes_get());
+        gpu_display_wait_vblank(gpu_display_pipe);
+        gpu_scanout_pid = 0 - 1;
+        gpu_bb_back = 0;
+        return 1;
+    }
     var slo = GPU_R_HUBP_SURF_ADDR    + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
     var shi = GPU_R_HUBP_SURF_ADDR_HI + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
     gpu_reg32_write(GPU_BASE_DCN_2, shi, (gpu_display_surf >> 32) & 0xFFFF);

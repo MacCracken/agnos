@@ -411,6 +411,66 @@ fn modeset_native(): i64 {
     return 95;
 }
 
+# --pan — 1.56.36. CONSOLE HARDWARE PAN (#93 op 0x0C). Move the console into an agnos-owned VRAM buffer
+# taller than the screen so scrolling moves the scanout start instead of copying the screen.
+#
+# ⛔ RUN `--native` FIRST. The op refuses on a scaled pipe (84) because a pan there would move the scanout
+# by one SOURCE text row and the scaler would smear it.
+#
+# ⚠ NO LATCH IS TAKEN, deliberately: this writes only the surface-address group — the same live write that
+# page-flips DOOM every frame — so it cannot hang or blank the pipe, and all its state is in RAM. A reboot
+# undoes it with nothing to disarm.
+#   95 = armed -- SCROLL SOMETHING AND WATCH IT      87 = already armed (a repeat run)
+#   84 = pipe is not native -- run --native first    82 = buffer would not fit; console left on the slow path
+#   96 = no GPU / live pipe != 0 (QEMU has no DCN)
+fn modeset_pan(): i64 {
+    var rec[64];
+    var i = 0;
+    while (i < 16) { store32(&rec + i * 4, 0); i = i + 1; }
+    store32(&rec + 0, 12);                                   # op = MDO_OP_PAN (0x0C)
+    var r = sys_gpu_modeset_op(&rec, 64);
+    if (r < 0) {
+        var code = 0 - r;
+        var reason = code & 0xFF;
+        m_puts("modeset: #93 pan idx="); m_num(code >> 8);
+        m_puts(" reason="); m_num(reason); m_nl();
+        if (reason == 1) { m_puts("modeset: no GPU / live pipe != 0 -- QEMU has no DCN"); m_nl(); return 96; }
+        if (reason == 2) {
+            m_puts("modeset: op NOT ADVERTISED -- this kernel predates MDO_OP_PAN (0x0C)."); m_nl();
+            return 94;
+        }
+        if (reason == 28) {
+            m_puts("modeset: ALREADY ARMED -- the console is already hardware-scrolled."); m_nl();
+            m_puts("modeset: Nothing changed. Not a failure."); m_nl();
+            return 87;
+        }
+        if (reason == 29) {
+            m_puts("modeset: the pipe is NOT NATIVE, so a pan would move the scanout by one SOURCE"); m_nl();
+            m_puts("modeset: text row and the scaler would smear it. Run:  modeset --native"); m_nl();
+            return 84;
+        }
+        if (reason == 30) {
+            m_puts("modeset: the pan buffer would not fit below the A/B back buffers, so it was"); m_nl();
+            m_puts("modeset: REFUSED rather than scribble over them. The console is untouched and"); m_nl();
+            m_puts("modeset: still on the software scroll -- slow, but entirely correct."); m_nl();
+            return 82;
+        }
+        m_puts("modeset: unexpected refusal -- read the reason against MDO_E_*"); m_nl();
+        return 97;
+    }
+    if (r != 0) {
+        m_puts("modeset: #93 pan returned unexpected "); m_num(r); m_nl();
+        return 99;
+    }
+    m_puts("modeset: PAN ARMED -- the console now scrolls by moving the scanout start."); m_nl();
+    m_puts("modeset: ⚠ THE ORACLE IS SCROLLING TEXT, not this exit code. Print enough to"); m_nl();
+    m_puts("modeset:   scroll (e.g.  run /bin/klug) and watch: text must move up cleanly,"); m_nl();
+    m_puts("modeset:   with no duplicated row, no torn band, and no garbage at the bottom."); m_nl();
+    m_puts("modeset:   Garbage at the bottom = the slack rows were not cleared."); m_nl();
+    m_puts("modeset:   A jump every ~90 lines = the reset copy; it should be invisible."); m_nl();
+    return 95;
+}
+
 fn modeset_recommit(): i64 {
     var rec[64];
     var i = 0;
@@ -606,6 +666,7 @@ fn modeset_main(): i64 {
         if (streq(a1, "--vtotal") == 1) { return modeset_vtotal(); }
         if (streq(a1, "--recommit") == 1) { return modeset_recommit(); }
         if (streq(a1, "--native") == 1) { return modeset_native(); }
+        if (streq(a1, "--pan") == 1) { return modeset_pan(); }
         if (streq(a1, "--pixclk") == 1) { return modeset_pixclk(); }
         if (streq(a1, "--crccal") == 1) { return modeset_crccal(); }
         if (streq(a1, "--transmitter") == 1) { return modeset_transmitter(); }
@@ -615,8 +676,8 @@ fn modeset_main(): i64 {
         # ⛔ AN ARGUMENT WE DO NOT KNOW IS AN ERROR, NOT A CAPS PROBE. Silently running a
         # different operation than the one asked for is how a typo becomes a wasted burn.
         m_puts("modeset: UNKNOWN ARGUMENT -- no operation was performed."); m_nl();
-        m_puts("modeset: valid: --dump --lock --vtotal --recommit --native --transmitter"); m_nl();
-        m_puts("modeset:        --pixclk --crccal --audio-pre --audio-post --caps"); m_nl();
+        m_puts("modeset: valid: --dump --lock --vtotal --recommit --native --pan"); m_nl();
+        m_puts("modeset:        --transmitter --pixclk --crccal --audio-pre --audio-post --caps"); m_nl();
         return 84;
     }
     # ⛔⛔⛔ RETRACTED 2026-07-31 — THIS COMMENT USED TO BLAME THE OPERATOR'S INVOCATION, AND IT WAS

@@ -374,8 +374,39 @@ fn fb_fb_phys() {
 # fb_draw_base — where fb_console PAINTS. Same as fb_fb_phys (the GOP FB) until the P4 console-redirect points
 # it at an agnos-owned buffer. Only the paint sites use this; WC-remap / fault-bar / P0 diag keep fb_fb_phys.
 # The shadow stays consistent automatically: sh_delta = fb_shadow - fb is recomputed from this same base.
+# === 1.56.36 — HARDWARE PAN state ======================================================================
+# When armed, the console lives in an agnos-owned VRAM buffer TALLER than the screen and "scrolls" by
+# moving the scanout start address down one text row instead of copying the whole console region. See
+# GPU_FB_PAN_OFF in gpu_regs.cyr for why it is a separate region and why the mechanism is already proven.
+#
+# ⛔ EVERY CONSUMER GOES THROUGH fb_draw_base(). Adding the pan there — rather than at each call site —
+# means every existing writer (fb_putc, fb_console_clear, the scroll's own clear, blit#39) follows the pan
+# for free, because they all compute `base + y * pitch` from it. A pan bolted on per-writer would need
+# every one of them found, and the one that was missed would paint into the off-screen slack.
+var fb_pan_bytes = 0;   # current scanout offset into the pan buffer, in BYTES (0 = top)
+var fb_pan_limit = 0;   # max value fb_pan_bytes may take; 0 = pan DISARMED (software scroll)
+fn fb_pan_armed() {
+    if (fb_pan_limit != 0) { return 1; }
+    return 0;
+}
+# fb_pan_arm — called by the #93 PAN op once the scanout has been flipped to the pan buffer AND
+# fb_set_scanout_base points at it. limit_bytes = slack rows * pitch.
+fn fb_pan_arm(limit_bytes) {
+    fb_pan_bytes = 0;
+    fb_pan_limit = limit_bytes;
+    return 0;
+}
+# fb_pan_disarm — fall back to the software scroll. The caller MUST have re-pointed the scanout first.
+fn fb_pan_disarm() {
+    fb_pan_bytes = 0;
+    fb_pan_limit = 0;
+    return 0;
+}
+fn fb_pan_bytes_get() {
+    return fb_pan_bytes;
+}
 fn fb_draw_base() {
-    if (fb_scanout_base != 0) { return fb_scanout_base; }
+    if (fb_scanout_base != 0) { return fb_scanout_base + fb_pan_bytes; }
     return fb_fb_phys();
 }
 # fb_set_scanout_base — the redirect switch (called from gpu_scanout_redirect once scanout is re-pointed).
@@ -683,6 +714,51 @@ fn fb_scroll_up() {
     # Two packed pixels per u64 for the bottom-row clear (1.43.1: current bg, not a
     # hardcoded FB_BG=0; black → 0, identical to before).
     var bg64 = (fb_bg_color << 32) | fb_bg_color;
+
+    # ═══ PAN PATH (1.56.36) — O(one text row) instead of O(whole screen) ═══════════════════════════════
+    # The scroll becomes: move the scanout start DOWN one text row, clear the row that has just come into
+    # view at the bottom, and commit the new address. No console-region copy at all.
+    #
+    # Cost per scrolled line at 2560x1440: ONE register write + cell_h * pitch = 16 * 10240 = **160 KB** of
+    # WC stores, against 14.7 MB for the software scroll. The reset below is the only full-frame copy, and
+    # it happens once per `slack / cell_h` = 90 scrolls, so the amortised traffic is ~30x lower.
+    if (fb_pan_armed() == 1) {
+        var base = fb_scanout_base;             # buffer origin (NOT fb_draw_base — that already adds the pan)
+        var step = cell_h * pitch;
+        var vis  = height * pitch;              # bytes in one visible screenful
+        var next = fb_pan_bytes + step;
+        # ── RESET. The scanout cannot walk past the end of the buffer, so when the next step would leave
+        # less than a full screen behind it, fold the content that WILL remain visible back to offset 0 and
+        # restart the pan there. Source and destination cannot overlap: a reset only triggers once
+        # next + vis > buffer end, i.e. next >= vis, so [next, next+vis-step) starts at or after
+        # [0, vis-step). A forward copy is therefore safe without a temp — same argument the shadow
+        # memmove below relies on, in the opposite direction.
+        if (next > fb_pan_limit) {
+            var keep = vis - step;              # rows that survive the scroll, i.e. everything but the top one
+            var k = 0;
+            while (k < keep) {
+                store64(base + k, load64(base + next + k));
+                k = k + 8;
+            }
+            fb_pan_bytes = 0;
+            next = 0;
+            # The bottom row is cleared below, at the post-reset offset.
+        }
+        # ── Clear the cell_h rows that are about to become the bottom line. At the new pan offset these sit
+        # at [next + vis - step, next + vis) — off-screen right up until the address commit below makes them
+        # the last visible row, so there is no flash of stale content.
+        var cb = base + next + vis - step;
+        var c = 0;
+        while (c < step) {
+            store64(cb + c, bg64);
+            c = c + 8;
+        }
+        fb_pan_bytes = next;
+        # ── Commit. gpu_pan_commit writes DCSURF_PRIMARY_SURFACE_ADDRESS live — the same address-group
+        # write gpu_blit_present does every frame for DOOM, which is why this needs no OTG envelope.
+        gpu_pan_commit(fb_pan_bytes);
+        return 0;
+    }
 
     if (fb_shadow != 0) {
         # SHADOW PATH (1.53.7). The killer optimization: the OLD path read the WC

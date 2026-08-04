@@ -25,6 +25,44 @@ Scope: the desktop renders at **800x600 into a 2560x1440 panel** — a small win
 quadrant, not an upscale. This cycle makes the scanout surface match the display link the kernel has
 already trained. See [`planning/gpu.md`](planning/gpu.md) for the register-level plan.
 
+### Added — `MDO_OP_PAN` (#93 op `0x0C`): hardware-scrolled console
+
+The console moves into an agnos-owned VRAM buffer `GPU_FB_PAN_HEIGHT_MUL` (2) times the screen height and
+scrolls by moving the scanout start one text row, instead of copying the console region.
+
+Measured cost per scrolled line at 2560×1440, pitch 10240: **14.7 MB of WC stores → 160 KB** (`cell_h ×
+pitch`) plus one `DCSURF_PRIMARY_SURFACE_ADDRESS` write. One full-frame reset copy per `slack / cell_h` =
+**90 scrolled lines**, giving ~30× less framebuffer traffic amortized. At the old 800×600 surface the
+software scroll cost ~2.0 MB/line, which is why this was not needed before 1.56.36.
+
+New VRAM region `GPU_FB_PAN_OFF` = `0x20000000` (512 MB into the carveout), bounded by `GPU_FB_PAN_LIMIT`
+= `0x40000000`; a buffer that would not fit refuses and leaves the software scroll in place. Separate from
+the A/B back buffers at `GPU_FB_BACK_OFF` so console panning and full-screen page-flips cannot contend for
+the address register.
+
+`fb_console.cyr`: `fb_pan_bytes` / `fb_pan_limit`, `fb_pan_arm()` / `fb_pan_disarm()` / `fb_pan_armed()` /
+`fb_pan_bytes_get()`; `fb_draw_base()` now returns `fb_scanout_base + fb_pan_bytes`, so every existing
+writer follows the pan without a call-site change. `gpu.cyr`: `gpu_pan_arm()`, `gpu_pan_commit(off)`.
+
+`gpu_display_restore_console()` now restores to the pan target at the current offset when the pan is
+armed, instead of `gpu_display_surf` — otherwise quitting a full-screen app left the console painting into
+the pan buffer while the hardware scanned the firmware surface (an invisible console).
+
+No latch: the op writes only the surface-address group — the same live write `gpu_blit_present` issues
+every frame — so it cannot hang or blank the pipe, and all its state is in RAM.
+
+New reason: **30** `NOPAN` (buffer would not fit below the back buffers). Reuses **28** `ALREADY` and
+**29** `RASTER` (pipe is not native — run `--native` first).
+
+`MDO_OP_SUPPORTED` **`0xE7F` → `0x1E7F`** (plain) and **`0xFFF` → `0x1FFF`** (`MODESET_AUDIO_ARMS`).
+`modeset-tool-smoke` opmask expectations move **3711 → 7807** and **4095 → 8191**.
+
+`/bin/modeset --pan` exit codes: **95** armed · **87** already armed · **84** pipe not native · **82**
+buffer would not fit (console left on the software scroll) · **96** no GPU.
+
+`MODESET_TOOL_SELFTEST` runs `--pan`; the smoke asserts it dispatches and that it arms nothing with no GPU
+present. 28 passed, 0 failed.
+
 ### Added — `MDO_OP_NATIVE` (#93 op `0x0B`): retarget the pipe to the full-size surface
 
 Runtime modeset op behind the `/.modeset-armed` latch (`modeset_arm` site **11**). Reads the target
