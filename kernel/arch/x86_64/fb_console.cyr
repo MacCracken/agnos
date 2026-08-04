@@ -271,6 +271,11 @@ fn fb_console_init() {
     fb_cur_x = 0;
     fb_cur_y = 0;
     fb_console_ready = 1;
+    # 1.56.37: hold the PANEL until the geometry is verified against hardware. boot_info reports the
+    # display OUTPUT (2560x1440), which on this box is NOT the surface DCN scans (800x600 pitch 832), so
+    # every line drawn before gpu_scanout_matchgeom smears. serial and klug are unaffected — only the draw
+    # waits, and the release replays the ring. fb_defer_rescue in main.cyr guarantees the wait ends.
+    fb_defer_begin();
     # 1.45.16: stash the FB base for the idt.cyr CPU-exception fault-bar (it runs
     # in a raw asm stub that can't call fb_fb_phys()). 0 until here → the stub's
     # null-guard skips the paint, so an early-boot fault still just CMOS-stamps.
@@ -983,8 +988,47 @@ fn fb_ansi_feed(ch) {
 # and the CSI bytes that follow) are intercepted by fb_ansi_feed first. Other
 # non-printable bytes outside 0x20..0x7F are silently dropped. Advances cursor;
 # wraps to next row at end of line; scrolls when bottom reached.
+# === 1.56.37 — DEFERRED PAINT: never draw a line at a geometry we have not verified ====================
+# ⛔ THE REPLAY ALONE DID NOT FIX THE REPORTED SYMPTOM, and the reason is worth keeping. A text console has
+# NO SCROLLBACK: repainting the ring after the clear only redraws the last ~18 rows that fit at 800x600,
+# and every earlier line scrolls straight off. So `klug_replay_fb` made the log *complete* in a sense
+# nobody can look at, while the thing the operator actually sees — the banded lines being drawn to the
+# panel for ~0.2 s BEFORE the switch — was untouched, because the replay runs after they are already up.
+# ⇒ To stop banding being seen, it must never be DRAWN. Everything still reaches serial and klug, so
+# nothing is lost; only the panel waits.
+#
+# ⚠ THE COST, STATED: between fb_console_init and the release point the panel shows whatever the firmware
+# left. A ring-0 boot fault still paints its canary bar (that path writes the FB directly, not through
+# fb_putc), so a dead box is still visibly dead — but the text leading up to it is not on the panel, and on
+# a box with no serial the klug spill (log line ~115) is the only other copy. The window this matters in is
+# a fault before the geometry is known, where today's alternative is unreadable banding anyway.
+#
+# ⚠ FAIL-SAFE DIRECTION IS *PAINT*. fb_defer starts at 0, so a build that never calls fb_defer_begin
+# behaves exactly as before. The release is called from TWO sites — gpu_scanout_matchgeom, and an
+# unconditional rescue in main.cyr — so a box where matchgeom bails still gets its console.
+var fb_defer = 0;
+fn fb_defer_begin() { fb_defer = 1; return 0; }
+fn fb_defer_off()   { fb_defer = 0; return 0; }   # geometry now known; caller does its own clear+replay
+# fb_defer_rescue — THE GUARANTEE. Called unconditionally past every geometry decision: if painting is
+# still deferred, nothing verified the geometry, so accept boot_info's and paint anyway. Without this a
+# headless/QEMU/no-DCN box would defer forever and show a blank panel for the whole session.
+fn fb_defer_rescue() {
+    if (fb_defer == 0) { return 0; }
+    fb_defer = 0;
+    fb_console_clear();
+    klug_replay_fb();
+    # ⭐ SAY WHICH PATH RELEASED THE PANEL. Two very different boots reach a working console — one where
+    # the DCN read verified the geometry (matchgeom, silent) and one where nothing could (this). They look
+    # identical on screen, and only this line separates "the geometry is measured" from "the geometry is
+    # boot_info's and unchecked". Printed AFTER the replay so it lands at the end of the restored log.
+    kprintln("fb: geometry unverified -- painting at boot_info geometry", 57);
+    return 0;
+}
 fn fb_putc(ch) {
     if (fb_console_ready == 0) { return 0; }
+    # Deferred: the byte is already in serial + klug (kprint tapped it before reaching here). Dropping the
+    # DRAW is the whole mechanism — the release replays the ring, so nothing is lost, it is only delayed.
+    if (fb_defer != 0) { return 0; }
     # ANSI/CSI interception (1.43.1): consume ESC + CSI bytes (colour, clear,
     # cursor). Returns 1 when the byte was part of a sequence → nothing to draw.
     if (fb_ansi_feed(ch) == 1) { return 0; }

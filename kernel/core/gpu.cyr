@@ -10757,6 +10757,7 @@ fn gpu_scanout_matchgeom() {
     if (vh > 4096) { return 0; }
     if (ppx < vw) { return 0; }             # pitch must be >= width
     fb_set_geom(vw, vh, ppx * 4);           # bytes/row = pitch-px * 4 (ARGB8888)
+    fb_defer_off();                          # 1.56.37: geometry verified — release the panel
     fb_console_clear();                      # redraw at the new geometry (also resets cursor + shadow)
     # ⭐ 1.56.37: REPAINT the boot log, do not just erase it. Everything printed before this point was
     # drawn at boot_info's geometry into a surface DCN reads at a different pitch — the banding at the top

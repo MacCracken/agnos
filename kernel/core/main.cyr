@@ -1150,6 +1150,13 @@ gpu_scanout_regdump();
 # switch, NO register writes (cannot hang/black). DEFAULT-ON as of 1.55.28. This is the LATE fallback; the EARLY
 # call in gpu_probe (right after the aperture maps) normally wins and is idempotent, so this then no-ops.
 gpu_scanout_matchgeom();
+# ⛔ 1.56.37 THE GUARANTEE. fb_console_init deferred the PANEL until the geometry could be checked against
+# hardware; matchgeom releases it on a box where the DCN read succeeds. This call is what covers every box
+# where it does NOT — QEMU, headless, a gated pipe, any early return in matchgeom's viewport guards. If
+# painting is still deferred here, nothing is going to verify the geometry, so accept boot_info's and paint.
+# ⚠ Unconditional and idempotent BY DESIGN: without it a no-DCN box defers forever and shows a blank panel
+# for the entire session, which is a far worse failure than the banding this replaces.
+fb_defer_rescue();
 
 # GPU arc 1.55.x (Thrust P) P2: vblank pacing — prove the signal a present loop paces on: the OTG frame
 # counter advances (the pipe is really scanning; frame boundaries are observable) and OTG_STATUS shows both

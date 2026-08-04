@@ -27,6 +27,20 @@ pitch 10240) while DCN is still scanning the firmware's **800x600 pitch-832** su
 the register aperture maps and `gpu_scanout_matchgeom` corrects the geometry, but it only *cleared*, so
 those lines were erased rather than repaired.
 
+### Fixed — the panel is held until the geometry is verified, so banded lines are never drawn
+
+`fb_console_init()` calls `fb_defer_begin()`; `fb_putc` drops the draw while deferred. serial and klug are
+unaffected, so nothing is lost — only the panel waits. `gpu_scanout_matchgeom()` calls `fb_defer_off()`
+once the DCN read verifies the geometry, then clears and replays, so the panel's first content is already
+correct.
+
+`fb_defer_rescue()` is called unconditionally from `main.cyr` past every geometry decision: if painting is
+still deferred, it accepts boot_info's geometry, paints, and logs
+`fb: geometry unverified -- painting at boot_info geometry`. This is what covers QEMU / headless / gated-
+pipe boots, where a permanent defer would blank the panel for the whole session.
+
+`fb_defer` starts at 0, so a build that never calls `fb_defer_begin` behaves exactly as before.
+
 ### Fixed — the boot log's first ~87 lines are repainted, not discarded
 
 New `klug_replay_fb()` (`kernel/core/klug.cyr`): repaint the captured ring to the **framebuffer only**.
