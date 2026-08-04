@@ -136,9 +136,16 @@ fn modeset_latch_check() {
     }
     if (st == 2) {
         modeset_latch_blocked = 1;
-        kprintln("modeset: previous attempt did not disarm -- SKIPPED", 51);
+        # ⭐ 1.56.38 — SAY WHAT IT MEANS, DO NOT ISSUE A CHORE. Since the disarm moved to clean shutdown
+        # (power.cyr), a latch surviving into this boot means exactly one thing: **the previous session did
+        # not end cleanly.** That is a fact about the machine, not a file for the operator to tidy up.
+        # This line used to read "recover by typing: rm /.modeset-armed", and the result was that it got
+        # typed before all six burns of the 1.56.36/37 arc — training the operator to clear a safety
+        # interlock by reflex, which is the one habit a safety interlock must never teach.
+        # The escape hatch still exists and still works; it is simply no longer advertised as the routine.
+        kprintln("modeset: last session did not end cleanly -- modeset SKIPPED this boot", 70);
         kprint("modeset: latch was ", 19); kprint(&modeset_latch_buf, 63); kprintln("", 0);
-        kprintln("modeset: recover by typing:  rm /.modeset-armed", 47);
+        kprintln("modeset: this boot runs the inherited mode; a clean shutdown clears it", 70);
         # ⚠ Deliberately does NOT clear the latch. Clearing here produces a permanent alternating
         # oscillator: boot 1 dies, boot 2 skips-and-clears, boot 3 dies, forever, with no operator action
         # able to break out — and it violates H2's own "exactly ONE bad boot" requirement at boot 3.
@@ -351,4 +358,38 @@ fn modeset_disarm() {
 fn modeset_latch_is_path(p, n) {
     if (n != 15) { return 0; }
     return memeq(p, "/.modeset-armed", 15);
+}
+
+# === 1.56.38 — the latch's missing disarm, released at CLEAN SHUTDOWN ==================================
+#
+# THE PROBLEM: modeset_arm() sets the latch before a risky step and NOTHING ever cleared it. Every boot of
+# the 1.56.36/37 display arc opened with `previous attempt did not disarm -- SKIPPED` and the operator
+# typed `rm /.modeset-armed` by hand — six burns in a row. The protocol was half-written, and its missing
+# half had been delegated to a human remembering to run a command.
+#
+# ⛔ WHY THE OBVIOUS AUTO-DISARM IS WRONG. "The modeset returned success, so clear the latch" fails on the
+# exact case the latch exists for: the OTG frame counter FREE-RUNS off the PLL and reads perfectly healthy
+# on a BLACK PANEL (the M6 finding, re-confirmed every burn since). A modeset that blanked the display
+# returns 0 and advances the counter. With a boot-time modeset, that is a boot loop.
+#
+# ⭐ THE ORACLE HAS TO BE ABLE TO SEE A PICTURE, so it is a CLEAN SHUTDOWN. Reaching power_sys means the
+# operator drove the machine to a deliberate stop — the display worked well enough to use. A blanked panel
+# makes that unreachable: they hold the power button, the latch survives, and the next boot refuses the
+# modeset and comes up on the inherited mode. See [[feedback_oracle_must_test_external_invariant]] — a
+# probe the system can EMIT is not an oracle; this one the system cannot fake.
+#
+# ⚠ A CONSIDERED REJECTION: an earlier draft disarmed on the first complete line typed at the shell. Same
+# logic, weaker signal — one keystroke sequence can be typed blind, while a deliberate reboot/poweroff
+# says the whole session was usable. It also wrote the filesystem at an arbitrary mid-session moment.
+# Shutdown is one controlled write at a point that already touches the disk.
+#
+# ⇒ The latch's state now means exactly one thing: **the previous session did not end cleanly.**
+var modeset_shutdown_disarmed = 0;
+fn modeset_disarm_on_shutdown() {
+    if (modeset_shutdown_disarmed != 0) { return 0; }     # power_sys is not re-entrant, but be certain
+    modeset_shutdown_disarmed = 1;
+    if (modeset_latch_state() == 0) { return 0; }         # nothing armed — the common case, stay silent
+    kprintln("modeset: clean shutdown -- latch released", 41);
+    modeset_disarm();
+    return 0;
 }

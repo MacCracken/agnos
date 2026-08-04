@@ -350,6 +350,29 @@ fn power_sys(magic1, magic2, cmd, arg) {
     if (magic1 != PWR_MAGIC1) { return 0 - 1; }
     if (magic2 != PWR_MAGIC2) { return 0 - 1; }
 
+    # ⭐ 1.56.38 — THE MODESET LATCH IS RELEASED HERE, AND NOWHERE ELSE THE OPERATOR CAN REACH.
+    #
+    # The latch arms before a risky modeset so a write that blanks the panel cannot repeat on the next
+    # boot. It needs a disarm, and the disarm needs an oracle that can tell a working display from a dead
+    # one. ⛔ "The modeset returned success" CANNOT: the OTG frame counter free-runs off the PLL and reads
+    # perfectly healthy on a black panel, so disarming on it would clear the latch for the exact failure it
+    # exists to catch — a boot loop, with a boot-time modeset.
+    #
+    # ⭐ A CLEAN SHUTDOWN IS THAT ORACLE. Reaching here means the operator drove the machine to a
+    # deliberate stop: the display worked well enough to use it. A modeset that blanked the panel makes
+    # this unreachable — the operator holds the power button instead, the latch survives untouched, and the
+    # next boot refuses the modeset and comes up on the inherited mode with a working console.
+    #
+    # ⇒ The latch's state now means exactly one thing: **the previous session did not end cleanly.** That
+    # is a system-lifecycle fact, not a file for a human to manage. `rm /.modeset-armed` still works as an
+    # escape hatch, but it is no longer the routine path and the kernel no longer instructs anyone to use
+    # it — a recovery mechanism the operator has to remember to run by hand is a mechanism that gets run at
+    # the wrong times, and it was run before all six burns of the 1.56.36/37 arc.
+    #
+    # ⚠ BEFORE power_quiesce_devices(), deliberately: the disarm unlinks and FLUSHES the filesystem, so it
+    # must happen while the block device is still live. Quiescing first would leave the write nowhere to go.
+    modeset_disarm_on_shutdown();
+
     # Every command shares the teardown. Getting the machine into a safe state is
     # not conditional on which way it is being stopped.
     power_quiesce_devices();

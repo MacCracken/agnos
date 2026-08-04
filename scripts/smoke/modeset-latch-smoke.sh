@@ -104,6 +104,18 @@ RC1=$(boot "$WORK/main.img" "$WORK/vars1.fd" "$LOGS/boot1.log" 25)
 grep -aE "^modeset:" "$LOGS/boot1.log" | sed 's/^/  /'
 
 want   "$LOGS/boot1.log" "modeset: no latch -- proceeding" "boot1: no latch on a fresh disk" "boot1: expected 'no latch -- proceeding'"
+# ⛔ 1.56.38 — A BOOT WITH NO GPU MUST NOT ARM THE LATCH. main.cyr now runs mdo_native() at boot to take
+# the console native; under QEMU there is no DCN, so it must refuse at the gpu_present gate BEFORE
+# modeset_arm(11). If it ever armed here, every headless/QEMU boot would strand a latch and the NEXT boot
+# would refuse modesets for a write that never happened — the exact friction this cut exists to remove,
+# reintroduced from the other end.
+wantno "$LOGS/boot1.log" "modeset: latch armed at site=11" \
+       "boot1: the boot-native modeset did NOT arm the latch with no GPU (gpu_present precedes the arm)" \
+       "boot1: boot-native armed the latch under QEMU — a headless boot would strand a latch every time"
+# And it must not claim a native console it could not have produced.
+wantno "$LOGS/boot1.log" "gpu: boot console is NATIVE" \
+       "boot1: no false 'boot console is NATIVE' with no DCN present" \
+       "boot1: claimed a native boot console under QEMU — mdo_native returned 0 with no GPU"
 want   "$LOGS/boot1.log" "modeset: latch consts BLOCKED=1 ARMED=1 TOKEN=1297040453" \
        "boot1: module constants are intact (not collapsed to 0 by the gvar-init defect)" \
        "boot1: the constants line is missing or changed — a constant may read 0"
@@ -112,7 +124,7 @@ want   "$LOGS/boot1.log" "modeset: latch flushed" "boot1: the durability flush w
 # DECISIVE evidence that both happened is on the platter (an ARMED record) and in rc1=137 (it hung).
 want   "$LOGS/boot1.log" "modeset: latch armed at site=5" "boot1: the latch armed" "boot1: the arm line did not survive the wedge (see platter assertions below)"
 want   "$LOGS/boot1.log" "modeset: RISKY STEP entered" "boot1: the risky step ran" "boot1: the risky-step line did not survive the wedge (see rc1)"
-wantno "$LOGS/boot1.log" "modeset: previous attempt did not disarm" "boot1: did NOT report a stale latch" "boot1: reported a stale latch on a fresh disk"
+wantno "$LOGS/boot1.log" "modeset: last session did not end cleanly" "boot1: did NOT report a stale latch" "boot1: reported a stale latch on a fresh disk"
 # Load-bearing: proves the wedge happened MID-BOOT rather than after everything already succeeded.
 wantno "$LOGS/boot1.log" "Launching kybernet" "boot1: wedged before the boot tail (the wedge really wedged)" "boot1: reached kybernet — the wedge did not wedge"
 if [ "$RC1" = 137 ]; then P "boot1: killed by SIGKILL (rc=137) — it hung as intended"; else F "boot1: rc=$RC1, expected 137 — qemu exited on its own, so nothing wedged"; fi
@@ -146,12 +158,19 @@ echo "=== BOOT 2 — SAME disk, SAME binary: must skip ==="
 RC2=$(boot "$WORK/main.img" "$WORK/vars1.fd" "$LOGS/boot2.log" 40)
 grep -aE "^modeset:" "$LOGS/boot2.log" | sed 's/^/  /'
 
-want   "$LOGS/boot2.log" "modeset: previous attempt did not disarm -- SKIPPED" "boot2: ★ the latch was found and the modeset SKIPPED" "boot2: the latch was not detected — H2 does not work"
+want   "$LOGS/boot2.log" "modeset: last session did not end cleanly -- modeset SKIPPED this boot" "boot2: ★ the latch was found and the modeset SKIPPED" "boot2: the latch was not detected — H2 does not work"
 want   "$LOGS/boot2.log" "modeset: RISKY STEP refused by latch" "boot2: ★ the risky step was REFUSED" "boot2: the risky step was not refused"
 wantno "$LOGS/boot2.log" "modeset: RISKY STEP entered" "boot2: ★ the risky step did NOT run" "boot2: the risky step RAN AGAIN — this is the unbounded-loop failure"
 wantno "$LOGS/boot2.log" "modeset: latch armed at site=" "boot2: did not re-arm" "boot2: re-armed while blocked"
 wantno "$LOGS/boot2.log" "modeset: verified good, latch cleared" "boot2: ★ the kernel did NOT auto-disarm" "boot2: the kernel auto-disarmed — that is the oscillator failure"
-want   "$LOGS/boot2.log" "modeset: recover by typing:  rm /.modeset-armed" "boot2: printed the recovery command" "boot2: no recovery instruction"
+# ⭐ 1.56.38 — the recovery line changed MEANING, not just wording. It used to read "recover by typing:
+# rm /.modeset-armed", i.e. a chore handed to the operator; the disarm now happens at clean shutdown
+# (power.cyr), so a surviving latch states a FACT — the last session did not end cleanly — and tells the
+# operator what this boot will do about it. Asserting the new line keeps the guarantee that a blocked boot
+# still EXPLAINS ITSELF, without re-teaching the habit of clearing a safety interlock by hand.
+want   "$LOGS/boot2.log" "modeset: this boot runs the inherited mode; a clean shutdown clears it" \
+       "boot2: ★ the blocked boot explains itself AND names the automatic way out (clean shutdown)" \
+       "boot2: the blocked boot printed no explanation of what happens next"
 want   "$LOGS/boot2.log" "Launching kybernet" "boot2: ★ reached the boot tail — the recovery boot is a NORMAL boot" "boot2: did not reach kybernet — recovery boot is not usable"
 # Proves boot 2 read boot 1's BYTES, not merely its own intent.
 if grep -a "modeset: latch was" "$LOGS/boot2.log" | grep -q "ticks=${TDRAW:-__none__}"; then P "boot2: ★ re-emitted boot 1's record verbatim (ticks=$TD) — it read the PLATTER, not its own intent"; else F "boot2: the re-emitted record does not carry boot 1's platter ticks ($TDRAW)"; fi
@@ -167,7 +186,7 @@ echo "=== CONTROL B — fresh disk, SAME firmware NVRAM: must NOT skip ==="
 mk_img "$WORK/fresh.img" "$RW_FEATURES"
 RCB=$(boot "$WORK/fresh.img" "$WORK/vars1.fd" "$LOGS/ctlB.log" 25)
 want   "$LOGS/ctlB.log" "modeset: no latch -- proceeding" "controlB: a fresh disk with the SAME firmware NVRAM does NOT skip — the latch lives on the filesystem" "controlB: skipped on a fresh disk — the latch is persisting somewhere else"
-wantno "$LOGS/ctlB.log" "modeset: previous attempt did not disarm" "controlB: no stale-latch report" "controlB: reported a stale latch on a fresh disk"
+wantno "$LOGS/ctlB.log" "modeset: last session did not end cleanly" "controlB: no stale-latch report" "controlB: reported a stale latch on a fresh disk"
 
 echo ""
 echo "=== READ-ONLY LANE — the fail-closed gate ==="

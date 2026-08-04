@@ -19,7 +19,48 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ---
 
-## [1.56.37] — 2026-08-03 — the initial scanout (cycle OPEN)
+## [1.56.38] — 2026-08-04 — the latch closes its own loop, and the console boots native (cycle OPEN)
+
+Scope: the two things the display arc left behind. **(1)** The modeset latch never auto-disarms after a
+successful modeset, so every boot in the 1.56.36/37 arc opened with `previous attempt did not disarm --
+SKIPPED` and needed a manual `rm /.modeset-armed`. **(2)** The boot console is still 800x600 upscaled —
+`MDO_OP_NATIVE` is iron-proven, so the native modeset can move to boot time, behind the latch that (1)
+makes usable.
+
+### Added — the console boots at native resolution
+
+`main.cyr` calls `mdo_native()` after `gpu_pixclk_discover()`, then `klug_replay_fb()` and logs
+`gpu: boot console is NATIVE -- 2560x1440 scanout, scaler bypassed`. It must sit after
+`gpu_pixclk_discover` because `mdo_native` refuses unless the target equals the link's active raster, and
+`gpu_h_active` / `gpu_v_active` are not derived until then.
+
+Not gated on success: a refusal (no GPU, latch armed, pipe != 0, raster mismatch) leaves the console on
+the inherited geometry, which is a correct outcome. The replay runs only when the geometry changed.
+
+### Fixed — the modeset latch is released at clean shutdown, not by the operator
+
+New `modeset_disarm_on_shutdown()` (`kernel/core/modeset_latch.cyr`), called from `power_sys()` before
+`power_quiesce_devices()` — so it covers `reboot`, `poweroff` and `halt` alike, and runs while the block
+device is still live. Once per boot, silent when nothing is armed.
+
+⛔ Deliberately **not** disarmed on modeset success: the OTG frame counter free-runs off the PLL and reads
+healthy on a black panel, so that would auto-clear the exact failure the latch exists to catch. Reaching
+`power_sys` means the operator drove the machine to a deliberate stop — the display worked well enough to
+use it. A blanked panel makes that unreachable; they hold the power button, the latch survives, and the
+next boot refuses the modeset.
+
+**Breaking (operator-visible):** the boot-time stale-latch message no longer reads
+`recover by typing: rm /.modeset-armed`. It now reads
+`last session did not end cleanly -- modeset SKIPPED this boot` plus
+`this boot runs the inherited mode; a clean shutdown clears it`. The latch state means one thing — the
+previous session did not end cleanly — and is no longer a file the operator is instructed to manage.
+`rm /.modeset-armed` still works as an escape hatch; it is simply no longer the routine path.
+
+`modeset-latch-smoke` gains two guards — a no-GPU boot must not arm the latch at site 11, and must not
+claim `gpu: boot console is NATIVE` — and its recovery assertion now targets the new guidance line.
+30 passed, 0 failed.
+
+## [1.56.37] — 2026-08-03 — the initial scanout (RELEASED)
 
 Scope: the boot console's first ~87 lines. agnos paints them at **boot_info's** geometry (2560x1440,
 pitch 10240) while DCN is still scanning the firmware's **800x600 pitch-832** surface and upscaling it, so

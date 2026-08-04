@@ -1198,6 +1198,34 @@ gpu_audio_probe();
 # rate. Read-only; gated on P0. Takes ~2 s of boot: five ~0.33 s measurement windows.
 gpu_pixclk_discover();
 
+# === 1.56.38 — BOOT TO NATIVE RESOLUTION ===============================================================
+# Run the modeset that `MDO_OP_NATIVE` proved on iron across five burns, at boot, so the console is
+# 2560x1440 with the scaler bypassed instead of an 800x600 surface upscaled to the link.
+#
+# ⛔ IT HAS TO BE HERE, NOT EARLIER. mdo_native refuses unless the target geometry EQUALS the link's
+# active raster, and gpu_h_active / gpu_v_active are not derived until gpu_pixclk_discover() above. Called
+# any sooner it returns MDO_E_RASTER every time — a silent no-op that looks like the feature not existing.
+#
+# ⭐ WHY A BOOT-TIME MODESET IS SAFE NOW, WHEN §2.2b said not to do this: that rule was
+# "no boot-time native modeset until the op has succeeded on iron at least once", and it has — five times.
+# What makes it RECOVERABLE rather than merely proven is the pair of changes in this cut. mdo_native arms
+# the latch; if this write blanks the panel the operator cannot confirm anything, so they power-cycle, the
+# latch survives, and modeset_arm refuses on the next boot — which comes up on the inherited mode with a
+# working console. Only an operator who can SEE the display disarms it (modeset_confirm_by_operator).
+# ⇒ The failure mode is one bad boot and a power cycle, never a loop, and never a reflash.
+#
+# ⚠ NOT gated on success: a refusal is completely normal. No GPU (QEMU), a latch still armed from a bad
+# previous boot, a pipe that is not 0, a raster that does not match — every one of those leaves the
+# console exactly as it was, on the inherited geometry, which is a correct outcome and not an error.
+# The klug replay only runs when the geometry actually changed, so a refusal costs nothing.
+if (mdo_native() == 0) {
+    # mdo_native already did fb_set_geom + fb_console_clear. Repaint the boot log at the new geometry —
+    # without this the operator gets a native-resolution console showing an empty screen, having silently
+    # thrown away every line printed up to here.
+    klug_replay_fb();
+    kprintln("gpu: boot console is NATIVE -- 2560x1440 scanout, scaler bypassed", 65);
+}
+
 #ifdef KLUG_SPILL_SELFTEST
 # H1 (gpu.md, modeset arc) — exercise the spill. Runs LATE, so the ring holds a full boot log and the
 # spilled bytes can be byte-compared against the serial capture from the host.
