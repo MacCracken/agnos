@@ -11055,6 +11055,19 @@ var gpu_pan_mc    = 0;   # MC side — what the HUBP fetches
 fn gpu_pan_commit(off) {
     if (gpu_pan_armed != 1) { return 0; }
     if (gpu_display_pipe < 0) { return 0; }
+    # ⛔⛔ NEVER STEAL THE SCANOUT FROM A FULL-SCREEN APP. fb_scroll_up calls this on EVERY console scroll,
+    # and the console keeps painting while an app owns the display — kernel log lines, the app's own stdout,
+    # and the read(fd=0) line discipline's keystroke ECHO all land in the console buffer. Before the pan
+    # that painting was harmless because nothing scanned the console buffer; committing an address makes it
+    # VISIBLE, so each of those scrolls yanked the display to the console for one frame until the
+    # compositor's next present flipped it back.
+    # ⭐ MEASURED ON IRON 2026-08-03 (panfix burn): with aethersafha running, the operator saw "the fb flash
+    # back to the shell once during startup and then per key press" — one flash for the compositor's own
+    # startup lines, then one per echoed keystroke. Exactly this call, exactly those two sources.
+    # The console still pans its OWN state (fb_pan_bytes advances, painting stays correct); it just does not
+    # touch the register. gpu_display_restore_console re-commits the current offset when the app exits,
+    # which is what puts the console back on screen at the right place.
+    if (gpu_scanout_pid >= 0) { return 0; }
     var tgt = gpu_pan_mc + off;
     var slo = GPU_R_HUBP_SURF_ADDR    + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
     var shi = GPU_R_HUBP_SURF_ADDR_HI + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
@@ -11221,9 +11234,13 @@ fn gpu_display_restore_console() {
     # scanning another — an INVISIBLE console, and the failure would land on the operator the moment they
     # quit the desktop, not on whoever armed the pan. Restore the pan target instead, offset included.
     if (fb_pan_armed() == 1) {
+        # ⛔ ORDER IS LOAD-BEARING: hand ownership back FIRST. gpu_pan_commit now refuses while
+        # gpu_scanout_pid >= 0 (so a scrolling console cannot steal the display from a running app), and
+        # this is the one caller that must get through — releasing ownership after the commit would make
+        # the restore itself a no-op and leave the console painting somewhere nothing scans.
+        gpu_scanout_pid = 0 - 1;
         gpu_pan_commit(fb_pan_bytes_get());
         gpu_display_wait_vblank(gpu_display_pipe);
-        gpu_scanout_pid = 0 - 1;
         gpu_bb_back = 0;
         return 1;
     }

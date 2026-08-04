@@ -5421,6 +5421,12 @@ fn mdo_pan() {
         kprintln("modeset: pan -- already armed; the console is ALREADY hardware-scrolled", 71);
         return MDO_E_ALREADY;
     }
+    # A full-screen app owns the display. Arming would commit the console's surface address over the top
+    # of it, and the app's next present would flip it straight back — a fight, not a modeset. Refuse.
+    if (gpu_scanout_pid >= 0) {
+        kprintln("modeset: pan refused -- a full-screen app owns the scanout; quit it first", 73);
+        return MDO_E_NOPAN;
+    }
     # The pipe must be native: viewport == raster, i.e. --native has run and the scaler is in bypass.
     var vp = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_VIEWPORT_DIM) & 0xFFFFFFFF;
     var vw = vp & 0xFFFF;
@@ -5437,9 +5443,14 @@ fn mdo_pan() {
         kprintln("modeset: PAN REFUSED -- buffer would not fit below the back buffers; console unchanged", 86);
         return MDO_E_NOPAN;
     }
+    # ⚠ COMPUTE the reset interval, never hardcode it. This line said "every 90 lines", which is the
+    # fb_scale()==1 answer; the 2026-08-03 iron run was at scale 2 (320 KB/line, not 160), where the real
+    # interval is 45. A log the project reads as evidence must not carry a number the build can contradict.
     kprint("modeset: PAN ARMED -- scroll is now one address write + ", 56);
     kprint_num(16 * fb_scale() * fb_pitch() / 1024);
-    kprintln(" KB, reset every 90 lines", 25);
+    kprint(" KB, reset every ", 17);
+    kprint_num(fb_height() / (16 * fb_scale()));
+    kprintln(" lines", 6);
     kprintln("modeset: EYE-CHECK: type something that scrolls. Text must scroll cleanly with", 78);
     kprintln("modeset: no tearing band, no duplicated row, and no garbage at the bottom.", 74);
     return 0;
@@ -6693,7 +6704,26 @@ fn ksyscall(num, arg1, arg2, arg3) {
                 kernel_resume();
             }
         }
-        return 0;
+        # ⛔⛔ EXIT MUST NOT RETURN TO RING 3. This used to `return 0` whenever the kernel_resume gate above
+        # did not fire, and that return goes back to a process already marked state 0 — with nothing left to
+        # execute. The caller is `_entry`'s `syscall(SYS_EXIT, r)`, which is the LAST instruction a Cyrius
+        # program emits, so control falls straight into the zero padding after `.text`, where `00 00` decodes
+        # as `add %al,(%rax)` with rax = 0: a write to address 0, #PF, and fault_kill_current.
+        #
+        # ⭐ AND THE DAMAGE IS NOT COSMETIC — IT DESTROYS THE EXIT CODE. proc_set_exit_code stored the real
+        # value at the top of this handler; the spurious #PF then runs fault_kill_current, which overwrites
+        # it with 128 + 14 = **142**. Every tool taking this path reported 142 no matter what it returned.
+        # MEASURED ON IRON 2026-08-03: `modeset --native` and `--pan` both completed their work, printed
+        # every line, returned 95 — and were recorded as `run: exit 142`, faulting at the two padding bytes
+        # immediately after their own `syscall` instruction (rip 0x407e96, `.text` end 0x407e98).
+        #
+        # The fix is the tail fault_kill_current already uses for exactly this case (a proc dying with no
+        # armed kernel_resume): enable interrupts and halt, and let the next timer tick's do_context_switch
+        # decline to revive this state-0 slot and switch away through the timer ISR's own pop+iretq epilogue.
+        # We never return through the abandoned syscall frame. preempt_count is 0 here — this handler holds
+        # no lock by this point — so do_context_switch is not preempt-gated and WILL switch.
+        while (1) { asm { sti; hlt; } }
+        return 0;                         # unreachable — kept for the type checker
     }
     if (num == 1) {
         # write(fd=arg1, buf=arg2, len=arg3)
@@ -7650,7 +7680,11 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (bl_w > 8192) { stack_canary_check(canary); return 0 - 1; }   # sanity cap (w*h*4 can't overflow)
         if (bl_h > 8192) { stack_canary_check(canary); return 0 - 1; }
         if (is_user_range(arg1, bl_w * bl_h * 4) == 0) { stack_canary_check(canary); return 0 - 1; }
-        var bl_fb_direct = fb_fb_phys();
+        # 1.56.36: fb_draw_base(), NOT fb_fb_phys(). With the console redirected or the hardware pan armed
+        # the console no longer paints at the firmware surface, so this fallback would render into a buffer
+        # nothing is scanning — the same invisible-output class as the gpu_display_restore_console hazard.
+        # Identical to the old value whenever neither is active (fb_draw_base falls through to fb_fb_phys).
+        var bl_fb_direct = fb_draw_base();
         if (bl_fb_direct == 0) { stack_canary_check(canary); return 0 - 1; }    # no framebuffer
         # 1.55.x display arc: render into the DOUBLE-BUFFER's back buffer when the DCN pipe is ours (P0),
         # so the finished frame can be swapped in during blank (tear-free) instead of being drawn straight

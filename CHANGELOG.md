@@ -25,14 +25,59 @@ Scope: the desktop renders at **800x600 into a 2560x1440 panel** — a small win
 quadrant, not an upscale. This cycle makes the scanout surface match the display link the kernel has
 already trained. See [`planning/gpu.md`](planning/gpu.md) for the register-level plan.
 
+### Fixed — the console pan stole the scanout from full-screen apps
+
+`gpu_pan_commit()` now returns early when `gpu_scanout_pid >= 0`. `fb_scroll_up` calls it on every console
+scroll, and the console keeps painting while a full-screen app owns the display — the app's own stdout and
+the `read(fd=0)` line discipline's keystroke echo both land there. Before the pan that painting was
+invisible; committing a surface address made each such scroll yank the scanout to the console for one
+frame until the app's next present flipped it back.
+
+Measured on iron 2026-08-03 with aethersafha: one flash during startup (the compositor's startup lines)
+and one per key press (the echo).
+
+`gpu_display_restore_console()` releases ownership (`gpu_scanout_pid = -1`) **before** calling
+`gpu_pan_commit()`, or the new guard would make the restore a no-op. `mdo_pan` refuses to arm while
+`gpu_scanout_pid >= 0` (new use of reason **30** `NOPAN`).
+
+### Fixed — `exit(2)` returned to ring 3 and the spurious #PF overwrote the exit code
+
+`kernel/core/syscall.cyr`, the `num == 0` handler. When the `kernel_resume` gate did not fire (any exit
+where `proc_current_get() != exec_resume_pid_get()`), exit fell through to `return 0` — back into a
+process already at state 0. `_entry`'s `syscall(SYS_EXIT, r)` is the last instruction a Cyrius program
+emits, so control ran into the zero padding after `.text`, where `00 00` decodes as `add %al,(%rax)` with
+`rax = 0`: a write to address 0, then `fault_kill_current`.
+
+`proc_set_exit_code` had already stored the real value; `fault_kill_current` then overwrote it with
+`128 + 14` = **142**. Tools reported 142 regardless of what they returned. Measured on iron 2026-08-03:
+`/bin/modeset --native` and `--pan` both completed, printed every line and returned 95, and were both
+recorded as `run: exit 142`, faulting at `rip=0x407e96` — the two padding bytes after their own `syscall`
+(`.text` ends at `0x407e98`).
+
+Exit now takes the same `while (1) { asm { sti; hlt; } }` tail `fault_kill_current` already uses for a
+proc dying with no armed resume. The endpoint is unchanged — the old path reached that same loop via the
+fault — so this removes the detour, not the mechanism.
+
+### Fixed — `blit`(#39) fallback rendered at the firmware surface, not where the console paints
+
+`bl_fb_direct` now comes from `fb_draw_base()` instead of `fb_fb_phys()`. With the console redirected or
+the hardware pan armed, the no-double-buffer fallback would have rendered into a buffer nothing was
+scanning. Identical to the old value when neither is active.
+
+### Fixed — `PAN ARMED` printed a hardcoded reset interval
+
+The line said "reset every 90 lines", the `fb_scale()`==1 answer. The 2026-08-03 iron run was at scale 2
+(320 KB/line), where the interval is 45. Now derived from `fb_height() / (16 * fb_scale())`.
+
 ### Added — `MDO_OP_PAN` (#93 op `0x0C`): hardware-scrolled console
 
 The console moves into an agnos-owned VRAM buffer `GPU_FB_PAN_HEIGHT_MUL` (2) times the screen height and
 scrolls by moving the scanout start one text row, instead of copying the console region.
 
-Measured cost per scrolled line at 2560×1440, pitch 10240: **14.7 MB of WC stores → 160 KB** (`cell_h ×
-pitch`) plus one `DCSURF_PRIMARY_SURFACE_ADDRESS` write. One full-frame reset copy per `slack / cell_h` =
-**90 scrolled lines**, giving ~30× less framebuffer traffic amortized. At the old 800×600 surface the
+Measured cost per scrolled line at 2560×1440, pitch 10240: **14,400 KB of WC stores → 320 KB** (`cell_h ×
+pitch`, iron-measured at `fb_scale` 2) plus one `DCSURF_PRIMARY_SURFACE_ADDRESS` write. One full-frame
+reset copy per `slack / cell_h` = **45 scrolled lines** at scale 2 (90 at scale 1), giving an amortized
+960 KB/line — a **15× reduction** (30× at scale 1). At the old 800×600 surface the
 software scroll cost ~2.0 MB/line, which is why this was not needed before 1.56.36.
 
 New VRAM region `GPU_FB_PAN_OFF` = `0x20000000` (512 MB into the carveout), bounded by `GPU_FB_PAN_LIMIT`
