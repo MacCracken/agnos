@@ -74,6 +74,20 @@ Landed for 1.56.34 but **never built, therefore unverified**: `MDO_OP_CRCCAL` + 
 
 `scripts/sweep.sh` takes **≈10–11 min and almost all of it is DEAD AIR.** QEMU **never exits on its own** — the kernel boots, prints, halts, and sits until `timeout` kills it — so every run consumes its full `QEMU_TIMEOUT` (57 smoke scripts carry one). Proven by shrinking one: `fp-selftest-smoke` returns "4 passed, 0 failed" **identically** at `QEMU_TIMEOUT` 40 → 15 → 8 → 5 s. The kernel build itself is 1 s. Fix is **harness-only**: run QEMU in the background and poll the serial log for the smoke's own terminal marker, killing on match, with `timeout` kept as the failure backstop. Expected ≈10–11 min → 1–2 min. ⛔ **Do NOT simply shorten timeouts** — that trades dead air for flaky truncation.
 
+### Syscall ABI — ✅ machine-checked since 2026-08-05: `kernel 96 · abi-doc 96 · cyrius 96`
+
+cyrius was never the gap (96/96 constants + wrappers). The doc documented **64 of 96**; 32 rows
+backfilled, the `45–59` placeholder deleted (it carried the circular "cyrius is authoritative" claim),
+`#84` corrected `present` → `gpu_present`. ⭐ Kept closed by **`scripts/check/syscall-abi-check.sh`** in
+`check.sh` — number sets three ways, doc-vs-cyrius names, kernel names (all 96 arms now carry a `# name`
+comment), and syscall rows filed in a struct section; four negative controls confirm it detects.
+⚠ `#44 sched_yield` comes from the ring-3 entry stub, not `ksyscall`, so `grep 'if (num == '` returns 95 and looks like a hole. → [ticket](issues/2026-08-05-abi-doc-covers-two-thirds-of-the-syscalls.md)
+→ [ticket](issues/2026-08-05-abi-doc-covers-two-thirds-of-the-syscalls.md)
+
+**Reserved, not minted:** `#96 fork` ([ticket](issues/2026-08-05-syscall-96-fork.md)) · `#97 chan_op`
+([ticket](issues/2026-08-05-syscall-97-chan-op.md)). Next free `#98`. ⛔ The gate FAILS on a doc row with
+no kernel arm, so mint each number in the same change as its dispatch arm — not ahead of it.
+
 ## FALSIFIED — do not re-open
 
 - **Sequencing is NOT eliminated.** The M9 burn (1.56.15) that "eliminated" it was a **null experiment** — both arms streamed digital silence (no `HDA_TONE`, no ring-3 feed), so a healthy, entirely believable log was produced by a zero-filled ring. Retracted; sequencing is re-open.

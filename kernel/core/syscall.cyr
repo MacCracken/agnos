@@ -6791,7 +6791,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         }
         return vfs_write(arg1, arg2, arg3);
     }
-    if (num == 2) { return proc_current_get(); }
+    if (num == 2) { return proc_current_get(); }   # getpid() -> pid
     if (num == 3) {
         # spawn(elf_addr, elf_size) — load an in-memory ELF + create a user process.
         # Returns new pid or -1. 1.41.5: the ELF image is a USER buffer — validate
@@ -6885,7 +6885,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         }
         return vfs_read(arg1, arg2, arg3);
     }
-    if (num == 6) { return vfs_close(arg1); }
+    if (num == 6) { return vfs_close(arg1); }   # close(fd) -> 0 / -1
     if (num == 7) {
         # open(name=arg1, namelen=arg2, flags=arg3) — mount-routed (1.41.3).
         # Re-routes from initrd-only: ext2 / FAT / exFAT by mount, with initrd
@@ -7326,8 +7326,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
         return sr;
     }
     if (num == 63) {
+        # symlink(target=arg1, targetlen=arg2, linkpath=arg3, linkpathlen=a4) -> 0 / -1
         # 1.51.0 (sovereign-package-manager kernel surface, ark v2 / agnova prerequisite — DO-FIRST):
-        # symlink(target=arg1, targetlen=arg2, linkpath=arg3, linkpathlen=a4) — create a symbolic link
+        # create a symbolic link
         # `linkpath` whose contents are the TEXT in `target`. The target is link TEXT, NOT a path to
         # resolve (a symlink may point at a nonexistent / relative target), so it is validated as a
         # bounded USER BUFFER (is_user_range, 1..one-ext2-block — ext2_symlink re-caps at blocksize),

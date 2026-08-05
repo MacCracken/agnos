@@ -55,6 +55,19 @@ sh "$ROOT/scripts/check/kprint-len-check.sh" > /tmp/kprint-len-check.log 2>&1 &&
 check "kprint literal lengths" $rc
 [ "$rc" = "0" ] || cat /tmp/kprint-len-check.log
 
+# Syscall ABI three-way consistency: kernel dispatch == ABI doc == the cyrius SysNrAgnos peer.
+# agnos redefines the syscall numbers (exit is #0, not Linux's 60), so a wrong number COMPILES CLEAN
+# and calls a different arm — confirmed shipping in jalwa as `poll`(7) -> `open` PER FRAME and
+# `read`(0) -> `exit`. Wired in 2026-08-05 after an audit found the ABI doc individually documented
+# 65 of 96 syscalls, with 32 missing entirely and the doc and the cyrius peer each naming the OTHER as
+# authoritative — so for a third of the ABI neither file was canonical and a wrong number in either
+# could be "verified" against the other. Those gaps accumulated over ~15 minor versions because
+# nothing diffed them. Same argument as the kprint gate: a hand-maintained table nothing compares
+# will drift, and the drift is invisible until it is a runtime fault in someone else's repo.
+sh "$ROOT/scripts/check/syscall-abi-check.sh" > /tmp/syscall-abi-check.log 2>&1 && rc=0 || rc=$?
+check "syscall ABI (kernel/doc/cyrius agree)" $rc
+[ "$rc" = "0" ] || cat /tmp/syscall-abi-check.log
+
 # GPU arena slot overlap. Every *_SUBOFF is a byte offset into the ONE compute arena, and two
 # subsystems owning the same bytes is a silent corruption — VM_CONTEXT0 is disabled, so there are no
 # page tables and an out-of-bounds GPU store lands somewhere REAL.
