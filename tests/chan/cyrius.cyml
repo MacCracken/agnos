@@ -1,0 +1,19 @@
+[package]
+name = "chantest"
+version = "0.1.0"
+description = "Host-side SEMANTIC PROOF for the local-IPC channel band (#97). Asserts the record/batch/liveness contract from planning/ipc.md §9 against Linux socketpair(SOCK_SEQPACKET) BEFORE any kernel code exists — bite 3 of the twelve-bite migration. Zero kernel lines, zero QEMU."
+license = "GPL-3.0-only"
+language = "cyrius"
+cyrius = "6.5.6"
+
+[build]
+entry = "chantest.cyr"
+output = "build/chantest"
+
+# ⛔ LINUX-ONLY, DELIBERATELY. This is the one bite in the migration that must NOT touch agnos: its
+# whole value is that it pins the contract down on a substrate that already implements message
+# boundaries correctly, so the kernel band later has something to be measured AGAINST rather than
+# being its own specification. Building it `--agnos` would defeat that — agnos has no socketpair, and
+# if it did, the proof would be checking the implementation against itself.
+[deps]
+stdlib = ["syscalls", "string", "alloc", "io", "fmt"]

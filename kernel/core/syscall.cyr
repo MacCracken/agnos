@@ -538,6 +538,7 @@ fn fault_kill_current(vector) {
     proc_set_exit_code(pid, code);
     flock_release_pid(pid);                       # release advisory locks (mirror exit#0)
     snd_release_pid(pid);                         # release any snd#64 audio slot (Gate 2)
+    shm_release_pid(pid);                         # 1.56.40 bite 1: release shm#71/#86 slots (mirror exit#0)
     gpu_release_pid(pid);                         # 1.55.x: hand the scanout back to the console. Without
     # this a full-screen app that FAULTS would strand its last
     # frame on the panel forever while the console scrolled
@@ -839,6 +840,71 @@ var shm_kva[16];                    # kernel access VA for the page (kernel-mirr
 var shm_size[16];                   # byte size per slot
 var shm_mc[16];                     # GPU MC address per slot (0 = PMM-backed ⇒ NOT GPU-reachable)
 
+# 1.56.40 (channel-band bite 1) — WHO OWNS A SLOT, AND WHICH INCARNATION OF THEM.
+#
+# ⛔ Before this, the shm table had NO owner field at all: `shm_slot_valid` checked bounds and a
+# non-zero phys, so **any process could read, write or FREE any other process's live buffer** — the
+# desktop's pixel surfaces and mishran's PCM among them. That is already how the compositor reads a
+# client's pixels, so it cannot simply be closed; bite 1 records ownership and closes only the
+# destructive op (`shm_free #74`). Reads and writes get a WARN COUNTER and are still permitted, so
+# nothing is refused that works today — see `shm_xown_warns`.
+#
+# ⛔ THE EPOCH IS NOT DECORATION. pids are recycled slot indices with no generation counter, so "pid 4
+# owns slot 2" goes stale the instant pid 4 dies and slot 4 is reused: the NEW pid 4 would inherit the
+# dead one's buffers. `shm_epoch` is a per-slot generation bumped on every create, so a stale id can be
+# told from a live one. The process-side half of that (`proc_epoch`) lands in bite 2 and is written but
+# never read; the two are combined at bite 4, when the channel band has a use for the pair.
+var shm_owner[16];                  # owning pid per slot (valid only where shm_phys != 0)
+var shm_epoch[16];                  # per-slot generation, bumped on every create — stale-id detection
+var shm_epoch_next = 1;             # monotonic source for the above; never wraps in any real uptime
+var shm_xown_warns = 0;             # cross-owner read/write count — COUNTED, NEVER REFUSED (bite 1)
+
+# Stamp ownership on a freshly-claimed slot. Both create paths (#71 pmm-backed, #86 GPU carveout) call
+# this so the two can never drift apart on who owns what.
+fn shm_claim(slot) {
+    store64(&shm_owner + slot * 8, proc_current_get());
+    store64(&shm_epoch + slot * 8, shm_epoch_next);
+    shm_epoch_next = shm_epoch_next + 1;
+    return 0;
+}
+
+# Count a cross-owner touch. ⛔ Deliberately returns nothing and refuses nothing: the compositor reading
+# a client's pixel buffer IS a cross-owner read and is the desktop's whole design today. The counter
+# exists so the flip to enforcement — which can only land once every client holds a channel to hang a
+# grant on — is made against a measured number instead of a guess.
+fn shm_note_xown(id) {
+    if (load64(&shm_owner + (id - 1) * 8) != proc_current_get()) {
+        shm_xown_warns = shm_xown_warns + 1;
+    }
+    return 0;
+}
+
+# Release every slot owned by `pid`. Sibling of flock_release_pid / snd_release_pid / gpu_release_pid,
+# and like them it MUST be called from BOTH death sites — the `exit #0` path and the fault-kill path —
+# or a proc that dies the other way leaks its buffers forever.
+#
+# ⚠ Before this, nothing released shm at all: a client that exited left its 2 MB slot claimed for the
+# rest of the boot, and `shm_create` calls `pmm_alloc_2mb()` unconditionally regardless of requested
+# size, so 16 exits of any size exhausted the table.
+#
+# ⛔ MEASURED 2026-08-05: THIS IS INERT IN THE DESKTOP WORKLOAD — instrumented, it frees NOTHING across
+# a full `AE_CLIENTS_MODE=desktop` run, because neither client exits inside the capture window. So the
+# desktop cannot validate it and must not be cited as evidence that it works; the boot selftest
+# (`shsys: shm owner gate OK`) is the coverage, and it drives the release directly.
+# ⚠ That measurement also RETRACTED a wrong attribution: a flaky desktop run was first blamed on this
+# function, and the instrumentation disproved it — a function that never executes cannot change an
+# outcome. See the desktop-mode flakiness note in the CHANGELOG.
+fn shm_release_pid(pid) {
+    var s = 0;
+    while (s < SHM_MAX) {
+        if (load64(&shm_phys + s * 8) != 0) {
+            if (load64(&shm_owner + s * 8) == pid) { shm_free(s + 1); }
+        }
+        s = s + 1;
+    }
+    return 0;
+}
+
 # ids are 1-BASED: 0 is the setu "inline pixels" sentinel (setu_attach arg5), so a real
 # shm buffer must never be 0. slot = id - 1.
 fn shm_slot_valid(id) {
@@ -875,6 +941,7 @@ fn shm_create(size) {
             store64(&shm_phys + i * 8, phys);
             store64(&shm_kva + i * 8, kva);
             store64(&shm_size + i * 8, size);
+            shm_claim(i);                           # 1.56.40 bite 1: owner + epoch
             return i + 1;                           # 1-based id (0 reserved for "inline")
         }
         i = i + 1;
@@ -909,6 +976,7 @@ fn shm_create_gpu(size) {
             store64(&shm_kva  + i * 8, cpu);            # the direct window IS the access VA
             store64(&shm_size + i * 8, size);
             store64(&shm_mc   + i * 8, mc);             # the GPU-visibility marker
+            shm_claim(i);                               # 1.56.40 bite 1: owner + epoch
             return i + 1;                               # 1-based id (0 = setu "inline pixels" sentinel)
         }
         i = i + 1;
@@ -6571,6 +6639,8 @@ fn shm_free(id) {
     store64(&shm_kva + slot * 8, 0);
     store64(&shm_size + slot * 8, 0);
     store64(&shm_mc + slot * 8, 0);
+    store64(&shm_owner + slot * 8, 0);          # 1.56.40 bite 1 — a recycled slot must not inherit an owner
+    store64(&shm_epoch + slot * 8, 0);
     return 0;
 }
 
@@ -6735,6 +6805,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # fork-per-accept worker that dies mid-turn can't strand the shared world).
         flock_release_pid(proc_current_get());
         snd_release_pid(proc_current_get());      # release any snd#64 audio slot (Gate 2)
+        shm_release_pid(proc_current_get());      # 1.56.40 bite 1: release shm#71/#86 slots (mirror fault-kill)
         gpu_release_pid(proc_current_get());      # 1.55.x: if it owned the scanout, hand the screen back
         # to the console (else a full-screen app quitting would
         # leave its last frame up while console text scrolled
@@ -7403,9 +7474,33 @@ fn ksyscall(num, arg1, arg2, arg3) {
     # the id, the compositor shm_read#73s them out — no inline TCP stream (deadlocks on
     # agnos > TCP_RX_RING), no cross-proc page mapping (no proc-exit free hazard).
     if (num == 71) { stack_canary_check(canary); return shm_create(arg1); }             # shm_create(size) -> id
-    if (num == 72) { stack_canary_check(canary); return shm_write(arg1, arg2, arg3); }  # shm_write(id, user_src, size)
-    if (num == 73) { stack_canary_check(canary); return shm_read(arg1, arg2, arg3); }   # shm_read(id, user_dst, size)
-    if (num == 74) { stack_canary_check(canary); return shm_free(arg1); }               # shm_free(id)
+    # 1.56.40 bite 1 — WARN ONLY on #72/#73. A cross-owner touch is counted and then ALLOWED, because
+    # the compositor reading a client's pixel buffer is exactly that and is the desktop's design today.
+    # Refusing here would break the working system to enforce a rule nothing can yet satisfy; the flip
+    # waits until every client holds a channel to hang a grant on. Read the count via `shm_xown_warns`.
+    if (num == 72) {                                                                    # shm_write(id, user_src, size)
+        if (shm_slot_valid(arg1) == 1) { shm_note_xown(arg1); }
+        stack_canary_check(canary);
+        return shm_write(arg1, arg2, arg3);
+    }
+    if (num == 73) {                                                                    # shm_read(id, user_dst, size)
+        if (shm_slot_valid(arg1) == 1) { shm_note_xown(arg1); }
+        stack_canary_check(canary);
+        return shm_read(arg1, arg2, arg3);
+    }
+    # ⛔ #74 IS GATED, and it is the only one that is. Freeing is destructive and unrecoverable: it
+    # returns the page to the PMM and clears the slot, so a hostile or buggy proc could drop the
+    # compositor's live surface out from under it. Unauthenticated until now. A non-owner gets -1.
+    if (num == 74) {                                                                    # shm_free(id)
+        if (shm_slot_valid(arg1) == 1) {
+            if (load64(&shm_owner + (arg1 - 1) * 8) != proc_current_get()) {
+                stack_canary_check(canary);
+                return 0 - 1;
+            }
+        }
+        stack_canary_check(canary);
+        return shm_free(arg1);
+    }
     # --- 1.53.10 raw block-device (#75-80) — native-install primitive (READ-PATH). ---
     # Non-destructive: enum/open(RO)/read/info/close. blk_write#78 is Phase 2 (gated).
     if (num == 75) { stack_canary_check(canary); return blk_enum_sys(arg1, arg2); }                          # blk_enum(buf, cap) -> count

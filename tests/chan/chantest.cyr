@@ -1,0 +1,227 @@
+# chantest.cyr — the host-side SEMANTIC PROOF for the local-IPC channel band (`#97 chan_op`).
+#
+# Bite 3 of the twelve-bite migration in docs/development/planning/ipc.md §9.6. Zero kernel lines,
+# zero QEMU, and agnos is untouched by it.
+#
+# ⭐ WHY A PROOF BEFORE AN IMPLEMENTATION. Every claim in §9 is, today, read-only static analysis —
+# §9.8 says so outright: "NOTHING HERE HAS BEEN BUILT OR BOOTED." The band's contract is therefore its
+# own only specification, and a kernel written against a spec nobody executed gets measured against
+# itself. This file executes the contract on a substrate that already implements the hard part
+# correctly — Linux `socketpair(SOCK_SEQPACKET)`, where message boundaries are the kernel's job, not
+# ours — so when the `chan_*` arms land at bite 4 there is something external to be wrong against.
+#
+# ⛔ WHAT IT CANNOT PROVE, STATED SO NOBODY CITES IT FOR MORE THAN IT IS. The authority model — an
+# inherited handle being INERT by construction (§9.3) — is a property of agnos's fd table and process
+# epochs and has no Linux analogue; SEQPACKET fds inherit and work exactly as normal. That half is
+# bite 5's selftest and its kill criterion, and this file is silent on it. What follows is the
+# RECORD / BATCH / LIVENESS contract only.
+#
+# ⛔ Do NOT mint a repo for this. It is a proof, and a repo is what would earn it a name
+# ([[feedback_naming_lanes]]).
+
+enum ChanK {
+    AF_UNIX_D     = 1;
+    SOCK_SEQPACKET_T = 5;      # the type SOCK_STREAM is not: boundaries preserved, no coalescing
+    REC_MAX       = 64;        # §3 "no production setu message exceeds 64 bytes"; the ceiling is 80
+    CH_OK         = 0;
+    MSG_DONTWAIT_F = 64;       # 0x40 — the flag that makes a receive answer immediately
+}
+
+# ⚠ Cyrius enum members take integer LITERALS, not expressions, so the two negative sentinels are
+# functions rather than `= 0 - 2`. §9.8 calls these "a third WOULD_BLOCK convention" and counts it as
+# an honest cost: agnos already carries two.
+fn CH_WOULD_BLOCK() { return 0 - 2; }   # a per-record result
+fn CH_PEER_GONE()   { return 0 - 3; }   # likewise per-record, never a batch error
+
+var pass_n = 0;
+var fail_n = 0;
+
+fn ok(cond, msg, mlen) {
+    if (cond == 1) { pass_n = pass_n + 1; return 0; }
+    fail_n = fail_n + 1;
+    print("  FAIL: ", 8);
+    print(msg, mlen);
+    print("\n", 1);
+    return 0;
+}
+
+# --- a channel: one socketpair, two endpoint fds -------------------------------------------------
+# Mirrors "minted as a PAIR" (§9.5) — there is no name, no bind, no connect. You get both ends or
+# nothing, which is the property that deletes the whole unlink-before-bind race class.
+fn chan_mint(out_fds) {
+    return sys_socketpair(AF_UNIX_D, SOCK_SEQPACKET_T, 0, out_fds);
+}
+
+# --- non-blocking receive of ONE record ----------------------------------------------------------
+# Returns byte count, or CH_WOULD_BLOCK / CH_PEER_GONE. ⛔ These are RESULTS, not errors: a caller
+# batching N of them must be able to see "nothing here" for one channel without the batch aborting.
+fn ch_recv(fd, buf, cap) {
+    var n = syscall(SYS_RECVFROM, fd, buf, cap, MSG_DONTWAIT_F, 0, 0);
+    if (n >= 0) {
+        # ⛔ A ZERO-LENGTH READ ON SEQPACKET MEANS THE PEER IS GONE, not "an empty message arrived".
+        # This is the one place the Linux substrate needs interpreting rather than trusting, and
+        # getting it backwards is how a live channel gets reaped.
+        if (n == 0) { return CH_PEER_GONE(); }
+        return n;
+    }
+    if (n == 0 - 11) { return CH_WOULD_BLOCK(); }    # -EAGAIN
+    if (n == 0 - 104) { return CH_PEER_GONE(); }     # -ECONNRESET
+    return n;
+}
+
+# --- THE BATCH IS THE POLL (§9.4) ----------------------------------------------------------------
+# One call carries an CH_RECV per held channel and returns the COUNT that produced data. No
+# registration, no watch table, no re-arming, and no ceiling of 8 (the epoll watch limit it replaces).
+# `results[i]` gets the per-channel outcome so a caller can tell drained from dead.
+fn ch_batch_recv(fds, n_fds, bufs, cap, results) {
+    var produced = 0;
+    var i = 0;
+    while (i < n_fds) {
+        var r = ch_recv(load64(fds + i * 8), bufs + i * cap, cap);
+        store64(results + i * 8, r);
+        if (r > 0) { produced = produced + 1; }
+        i = i + 1;
+    }
+    return produced;
+}
+
+fn fill(buf, n, seed) {
+    var i = 0;
+    while (i < n) { store8(buf + i, (seed + i) & 0xFF); i = i + 1; }
+    return 0;
+}
+
+fn bytes_eq(a, b, n) {
+    var i = 0;
+    while (i < n) { if (load8(a + i) != load8(b + i)) { return 0; } i = i + 1; }
+    return 1;
+}
+
+fn main(): i64 {
+    alloc_init();
+    println("=== channel-band semantic proof (host, socketpair SOCK_SEQPACKET) ===");
+
+    var fds = alloc(64);
+    var buf = alloc(512);
+    var got = alloc(512);
+
+    # ---------------------------------------------------------------------------------------------
+    # 1. RECORD FRAMING IS ALL-OR-NOTHING, and it is a property of the CHANNEL, not of the caller.
+    # ⛔ This is the AF_UNIX debt §9.5 names first: SOCK_STREAM has no message boundaries, SEQPACKET
+    # existed for decades and practice ignored it. Two 40-byte sends must arrive as two 40-byte
+    # receives — never one 80-byte read, never a 64+16 split.
+    # ---------------------------------------------------------------------------------------------
+    if (chan_mint(fds) != 0) { println("  FAIL: socketpair mint"); return 1; }
+    var a = load32(fds);
+    var b = load32(fds + 4);
+
+    fill(buf, 40, 1);
+    sys_write(a, buf, 40);
+    fill(buf + 64, 40, 200);
+    sys_write(a, buf + 64, 40);
+
+    var n1 = ch_recv(b, got, 512);
+    ok(n1 == 40, "record 1 arrives whole (40 B, not coalesced)", 44);
+    fill(buf, 40, 1);
+    ok(bytes_eq(got, buf, 40), "record 1 content intact", 23);
+
+    var n2 = ch_recv(b, got, 512);
+    ok(n2 == 40, "record 2 arrives SEPARATELY (boundary preserved)", 48);
+    fill(buf + 64, 40, 200);
+    ok(bytes_eq(got, buf + 64, 40), "record 2 content intact", 23);
+
+    var n3 = ch_recv(b, got, 512);
+    ok(n3 == CH_WOULD_BLOCK(), "drained channel reports WOULD_BLOCK, not 0", 42);
+
+    # ---------------------------------------------------------------------------------------------
+    # 2. THE BATCH IS THE POLL. Three channels, data on exactly one. The call must return COUNT 1 and
+    # must NOT abort on the two that had nothing — §9.4: "WOULD_BLOCK/PEER_GONE are per-record
+    # results, never batch errors, so a poll batch never aborts on 'nothing here'."
+    # ---------------------------------------------------------------------------------------------
+    var cfds = alloc(64);
+    var cbufs = alloc(3 * 128);
+    var cres = alloc(64);
+    var mint2 = alloc(64);
+    var k = 0;
+    var tx = alloc(32);
+    while (k < 3) {
+        if (chan_mint(mint2) != 0) { println("  FAIL: socketpair mint (batch)"); return 1; }
+        store64(tx + k * 8, load32(mint2));           # the writing end
+        store64(cfds + k * 8, load32(mint2 + 4));     # the polled end
+        k = k + 1;
+    }
+    fill(buf, 24, 7);
+    sys_write(load64(tx + 8), buf, 24);               # data on channel 1 only
+
+    var produced = ch_batch_recv(cfds, 3, cbufs, 128, cres);
+    ok(produced == 1, "batch of 3 with data on 1 returns COUNT 1", 41);
+    ok(load64(cres) == CH_WOULD_BLOCK(), "idle channel 0 -> per-record WOULD_BLOCK", 40);
+    ok(load64(cres + 8) == 24, "channel 1 delivered its 24 B in the same call", 45);
+    ok(load64(cres + 16) == CH_WOULD_BLOCK(), "idle channel 2 -> per-record WOULD_BLOCK", 40);
+    ok(bytes_eq(cbufs + 128, buf, 24), "batch payload lands in the right slot", 37);
+
+    # ---------------------------------------------------------------------------------------------
+    # 3. PEER-GONE IS A PER-RECORD RESULT AND IS DERIVED, NOT STORED (§9.3). Close one writer; that
+    # channel must report PEER_GONE while the OTHERS in the same batch keep working. A design that
+    # surfaced peer death as a batch error would take the whole compositor rotation down with one
+    # client exit.
+    # ---------------------------------------------------------------------------------------------
+    sys_close(load64(tx));                            # channel 0's writer exits
+    fill(buf, 16, 99);
+    sys_write(load64(tx + 16), buf, 16);              # channel 2 still live and sending
+
+    var produced2 = ch_batch_recv(cfds, 3, cbufs, 128, cres);
+    ok(load64(cres) == CH_PEER_GONE(), "dead peer -> PEER_GONE on ITS record", 36);
+    ok(produced2 == 1, "a dead channel does not abort the batch", 39);
+    ok(load64(cres + 16) == 16, "live channel still delivers alongside a dead one", 48);
+
+    # ---------------------------------------------------------------------------------------------
+    # 4. A RECORD TOO BIG FOR THE READER IS NOT SILENTLY TRUNCATED INTO A LIE. All-or-nothing means a
+    # short buffer must be detectable — §9.5's cost column calls this out: "two contracts in one
+    # object; guess wrong and framing is silently wrong". On SEQPACKET the excess is DISCARDED (that
+    # is MSG_TRUNC territory), so the honest assertion is that the reader gets at most `cap` and the
+    # NEXT record is still correctly framed — the stream is not left mid-record.
+    # ---------------------------------------------------------------------------------------------
+    fill(buf, 100, 3);
+    sys_write(a, buf, 100);
+    fill(buf + 128, 12, 55);
+    sys_write(a, buf + 128, 12);
+    var big = ch_recv(b, got, 32);                    # deliberately too small
+    ok(big == 32, "oversize record is capped at the reader's buffer", 48);
+    var nxt = ch_recv(b, got, 512);
+    ok(nxt == 12, "the NEXT record is still correctly framed after a cap", 53);
+    fill(buf + 128, 12, 55);
+    ok(bytes_eq(got, buf + 128, 12), "post-cap record content intact", 30);
+
+    # ---------------------------------------------------------------------------------------------
+    # 5. CURSORS ARE MONOTONIC AND EQUALITY MEANS GENUINELY DRAINED (§9.2). Modelled here as a send /
+    # receive count pair: after N sends and N receives the two are equal and the channel reports
+    # WOULD_BLOCK. The kernel keeps these as 64-bit counters that never wrap, which is the shape
+    # agnos's `pipe` already gets right — a wrapping cursor makes "drained" ambiguous.
+    # ---------------------------------------------------------------------------------------------
+    var sent = 0;
+    var recvd = 0;
+    var m = 0;
+    while (m < 8) {
+        fill(buf, 8, m);
+        sys_write(a, buf, 8);
+        sent = sent + 1;
+        m = m + 1;
+    }
+    while (ch_recv(b, got, 512) > 0) { recvd = recvd + 1; }
+    ok(sent == recvd, "every sent record is received exactly once", 42);
+    ok(ch_recv(b, got, 512) == CH_WOULD_BLOCK(), "cursor equality == genuinely drained", 36);
+
+    sys_close(a); sys_close(b);
+
+    print("\n", 1);
+    print("  passed ", 9); print_num(pass_n);
+    print("  failed ", 9); print_num(fail_n);
+    print("\n", 1);
+    if (fail_n == 0) { println("chan semantic proof: PASS"); return 0; }
+    println("chan semantic proof: FAIL");
+    return 1;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

@@ -51,6 +51,18 @@ else
         rc=1
     fi
 
+    for want in "shsys: shm owner gate OK|shm #74 owner gate + release-at-death (bite 1)" \
+                "shsys: proc_epoch bumps on reuse OK|proc_epoch increments when a slot is recycled (bite 2)"; do
+        line="${want%%|*}"; desc="${want#*|}"
+        if strings "$LOG" 2>/dev/null | grep -q "$line"; then
+            echo "  PASS: $desc"
+        else
+            echo "  FAIL: $desc"
+            strings "$LOG" 2>/dev/null | grep "shsys:" || true
+            rc=1
+        fi
+    done
+
     if strings "$LOG" 2>/dev/null | grep -q "shsys: ALL PASS"; then
         echo "  PASS: every syscall-hardening assertion (type-confusion, bounds, basename cap)"
     else

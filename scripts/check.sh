@@ -68,6 +68,16 @@ sh "$ROOT/scripts/check/syscall-abi-check.sh" > /tmp/syscall-abi-check.log 2>&1 
 check "syscall ABI (kernel/doc/cyrius agree)" $rc
 [ "$rc" = "0" ] || cat /tmp/syscall-abi-check.log
 
+# Channel-band (#97) semantic proof — host-side, no QEMU, milliseconds. Bite 3 of the local-IPC
+# migration: it executes the RECORD/BATCH/LIVENESS contract from planning/ipc.md §9 against Linux
+# socketpair(SOCK_SEQPACKET) so the kernel band, when it lands at bite 4, has something EXTERNAL to be
+# measured against rather than serving as its own specification (§9.8: every claim in that design is
+# currently "read-only static analysis"). Negative control: building it over SOCK_STREAM instead fails
+# exactly the 6 framing assertions and passes the rest — the proof discriminates the property it names.
+sh "$ROOT/scripts/check/chan-semantics-check.sh" > /tmp/chan-semantics.log 2>&1 && rc=0 || rc=$?
+check "channel-band semantics (host socketpair proof)" $rc
+[ "$rc" = "0" ] || cat /tmp/chan-semantics.log
+
 # GPU arena slot overlap. Every *_SUBOFF is a byte offset into the ONE compute arena, and two
 # subsystems owning the same bytes is a silent corruption — VM_CONTEXT0 is disabled, so there are no
 # page tables and an out-of-bounds GPU store lands somewhere REAL.

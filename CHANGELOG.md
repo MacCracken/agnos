@@ -73,6 +73,99 @@ collapse them.
 **Negative control, run:** restoring the bare `arch_wait()` makes the smoke exit 1 with the hang
 signature; removing it again restores PASS.
 
+### Added — shm gets an owner and a generation, and is released when its owner dies (bite 1)
+
+⛔ **The shm table had NO owner field.** `shm_slot_valid` checked bounds and a non-zero phys, so **any
+process could read, write or FREE any other's live buffer** — the desktop's pixel surfaces and mishran's
+PCM among them. And **nothing released shm at all**: a client that exited left its slot claimed for the
+rest of the boot, while `shm_create` calls `pmm_alloc_2mb()` unconditionally *regardless of requested
+size*, so 16 exits of any size exhausted the 16-slot table.
+
+`shm_owner[16]` + `shm_epoch[16]`, stamped by a shared `shm_claim(slot)` from **both** create paths
+(`#71` pmm-backed and `#86` GPU-carveout, so the two cannot drift on who owns what) and cleared on free.
+New `shm_release_pid(pid)` — sibling of `flock_release_pid` / `snd_release_pid` / `gpu_release_pid` —
+called from **both** death sites, the `exit #0` path and the fault-kill path.
+
+**`#74 shm_free` is now gated on the owner; a non-owner gets −1.** It is the only op gated. `#72`/`#73`
+get a **warn counter** (`shm_xown_warns`) and are still permitted, because a cross-owner read is what
+the compositor does every frame — refusing it would break the working desktop to enforce a rule nothing
+can yet satisfy. The flip to enforcement waits until every client holds a channel to hang a grant on,
+and will then be made against a measured number rather than a guess.
+
+⚠ **The epoch is not decoration.** pids are recycled slot indices, so "pid 4 owns slot 2" goes stale the
+moment pid 4 dies and the row is reused. `shm_epoch` is a per-slot generation bumped on every create.
+
+### Added — `proc_epoch[16]`: the process generation counter, written and never read (bite 2)
+
+Bumped in `proc_alloc_slot` — the single point every user proc is born through, and deliberately *not*
+on the death path, since a slot that is never reused must still not alias the proc that last held it.
+`(pid, epoch)` identifies a process **incarnation** rather than a table row, which is what makes an
+inherited handle inert by construction at bite 4 instead of merely unlikely to collide.
+
+⛔ **Unread on purpose.** Landing the write first means the counter is already correct and already
+exercised across a full boot before anything gates on it — so if bite 4's authority check ever refuses
+wrongly, the epoch is not one of the suspects.
+
+### Added — selftest coverage for both, with negative controls
+
+`SYSCALL_HARDEN_SELFTEST` gains: owner+epoch stamped on create · cross-owner **free refused** and the
+slot surviving the attempt · cross-owner **read allowed AND counted** (both halves, because "allowed on
+purpose" and "forgot to gate it" look identical from outside) · `shm_release_pid` reclaiming a slot ·
+and `proc_epoch` bumping across a genuine **slot reuse** (allocate, mark the row dead, allocate again),
+since a non-zero field would prove nothing about the property that matters.
+
+**Negative controls, run:** removing the `#74` owner gate fails the refusal assertions; removing the
+`proc_epoch` bump fails the reuse assertion. Both restore to green.
+
+⛔ **`shm_release_pid` is INERT in the desktop workload — measured, not assumed.** Instrumented, it
+frees nothing across a full `AE_CLIENTS_MODE=desktop` run: neither client exits inside the capture
+window. The desktop therefore cannot validate it and must not be cited as evidence it works — the boot
+selftest is the coverage, and it drives the release directly.
+
+⛔ **`AE_CLIENTS_MODE=desktop` is FLAKY, and a flaky run was briefly misattributed to bite 1.** Three
+repeat runs on one unchanged kernel produced two different failure shapes: serial "presented 2+" with
+**0** client pixels and a console-sized framebuffer, and serial "FEWER THAN 2" with a perfectly good
+**3,500** client pixels and a full-screen desktop. The first was initially blamed on `shm_release_pid`
+and a disable-it bisect appeared to confirm that — **wrong, and the instrumentation disproved it: a
+function that never executes cannot change an outcome.** The bisect was a false positive from the flake
+itself. ⭐ Note which oracle held: the **framebuffer** was right in the run where the compositor's own
+serial claim was wrong, which is the whole argument for gating on the panel rather than on the program
+under test. Do not gate CI on `desktop` mode until the flake is understood.
+
+### Added — the channel band's contract is executable before the band exists (bite 3)
+
+`tests/chan/chantest.cyr` + `scripts/check/chan-semantics-check.sh`, wired into `check.sh`. Host-side,
+no kernel, no QEMU, milliseconds.
+
+⭐ **Why a proof before an implementation.** §9.8 of the design says it outright — *"NOTHING HERE HAS
+BEEN BUILT OR BOOTED"*; every claim is read-only static analysis. That makes the contract its own only
+specification, and a kernel written against a spec nobody executed gets measured against itself. This
+runs the contract on a substrate that already implements the hard part correctly — Linux
+`socketpair(SOCK_SEQPACKET)`, where message boundaries are the kernel's job — so the `chan_*` arms have
+something **external** to be wrong against when they land.
+
+**18 assertions across the four properties the design actually rests on:**
+- **Record framing is all-or-nothing** — two 40 B sends arrive as two 40 B receives, never coalesced,
+  never split. The AF_UNIX debt §9.5 names first.
+- **The batch IS the poll** — 3 channels with data on 1 returns COUNT **1**, and the two idle ones
+  yield per-record `WOULD_BLOCK` **without aborting the batch**.
+- **Peer-gone is a per-record result, derived not stored** — closing one writer gives `PEER_GONE` on
+  *its* record while a live channel in the same batch still delivers. A design that surfaced peer death
+  as a batch error would take a whole compositor rotation down with one client exit.
+- **Cursor equality means genuinely drained** — every sent record received exactly once, then
+  `WOULD_BLOCK`.
+
+⭐ **Negative control, and it is the design's own claim turned into a test:** building the same file
+over **`SOCK_STREAM`** instead of `SOCK_SEQPACKET` fails exactly the **6** framing/ordering assertions
+and passes the other 12 — so the proof discriminates the specific property it names rather than merely
+passing.
+
+⛔ **What it deliberately does not cover:** the authority model — an inherited handle being INERT by
+construction (§9.3) — has no Linux analogue, since SEQPACKET fds inherit and work normally. That is
+bite 5's selftest and its kill criterion. Do not cite this check for it.
+
+⛔ **No repo was minted for this.** It is a proof; a repo is what would earn it a name.
+
 ### Changed — the arc sweep stops waiting for a clock: ~20 min → **395 s**, 16/16
 
 ⛔ **The problem was dead air, not slowness, and it had been measured and left.** `state.md` recorded on

@@ -73,6 +73,24 @@ var proc_ss[16];        # saved SS per pid (default 0x10 = ring-0 kernel data)
 # GUARDRAIL ([[project_agnos_auth_posture]]): signal-ownership hardening ONLY — must NOT
 # grow into pgid/sid or kill(-pgid, …); process-group semantics WOULD be Unix projection.
 var proc_ppid[16];      # saved parent pid per pid (default 0 = init)
+
+# 1.56.40 (channel-band bite 2) — THE PROCESS GENERATION COUNTER. Written here, read by NOTHING yet.
+#
+# ⛔ A pid IS NOT A DURABLE IDENTITY on agnos. pids are recycled slot indices with no generation
+# counter: `proc_alloc_slot` reuses the first dead slot, so "pid 4" after a death is a DIFFERENT
+# process that any stale record still names correctly. Every ownership claim in the kernel inherits
+# that hole — shm's owner field (bite 1) included.
+#
+# `proc_epoch[pid]` is bumped every time a slot is handed out, so the pair (pid, epoch) identifies a
+# process INCARNATION rather than a table row. A holder that stamps both can tell "my peer" from
+# "whoever got that slot next", which is what makes an inherited handle inert by construction at
+# bite 4 rather than merely unlikely to collide.
+#
+# ⛔ DELIBERATELY UNREAD IN THIS BITE. Landing the write first means the counter is already correct and
+# already exercised across a full boot before anything gates on it — so if bite 4's authority check
+# ever refuses wrongly, the epoch is not one of the suspects. Never wraps in any real uptime.
+var proc_epoch[16];     # per-slot generation; (pid, epoch) = a process incarnation
+fn proc_epoch_get(pid) { return load64(&proc_epoch + pid * 8); }
 # 1.46.x SMP sub-bite 6: per-pid "which CPU is running / mid-switching this proc"; -1 = none.
 # The scheduler FENCE — on_cpu_set(new, mycpu) is the LAST mutation under sched_lock, then the
 # lock releases and the lock-free restore proceeds with `new` claimed. sched_next selects only
@@ -266,6 +284,10 @@ fn proc_alloc_slot() {
     store64(&proc_on_cpu + idx * 8, 0 - 1);   # 1.46.x SMP6: recycled slot must not inherit a stale CPU id
     store64(&idle_owner + idx * 8, 0 - 1);     # 1.46.x STEP-2: recycled slot starts UNPINNED (a prior foreground proc may have left idle_owner=its launch CPU; a fresh proc must be free to migrate / not falsely pinned). Idles never reuse a slot, so their persistent pin is unaffected.
     store64(&proc_ppid + idx * 8, 0);          # 1.50.7: recycled slot must not inherit a stale parent (default init; proc_create_user sets the real creator)
+    # 1.56.40 bite 2: a slot handed out is a NEW incarnation, whether it is a fresh row or a recycled
+    # one — so the bump belongs here, at the single point every user proc is born through, and not on
+    # the death path (a slot that is never reused must still not alias the proc that last held it).
+    store64(&proc_epoch + idx * 8, load64(&proc_epoch + idx * 8) + 1);
     fpu_area_reset(idx);                        # 1.53.x B2: recycled slot must not inherit the prior occupant's saved XMM — reset to the fninit-equivalent default (matters once B3's #NM restore is live)
     # 1.53.x B3b: belt-and-suspenders for the dangling-owner hazard — if any CPU's FP
     # owner still names this recycled pid (a death path that didn't clear it), drop it so
