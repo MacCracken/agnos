@@ -230,6 +230,11 @@ kprintln("", 0);
 # (bite 2 switches consumers to direct-map pointers). Always-on; the directmap page tables are a few
 # pages from the <=256 MB pool.
 pmm_setup_directmap(pmm_memmap_ram_top);
+# 1.56.40 — reserve the channel band's 2 MB region. ⛔ MUST follow pmm_setup_directmap: the region is
+# addressed through DIRECTMAP_BASE (the only alias every per-proc CR3 mirrors), so reserving before the
+# direct map exists would stamp a VA that means something else. Failure is non-fatal — chan_op then
+# answers CH_E_NOREGION rather than the kernel refusing to boot over an IPC band nothing uses yet.
+chan_region_reserve();
 # 1.49.10: validate the direct-map in the context its consumers ACTUALLY run under — the kernel PML4
 # (CR3 0x1000), which carries PDPT[8..]. The OLD always-on probe (load64(DIRECTMAP_BASE+phys) ==
 # load64(phys)) was a FALSE POSITIVE: it ran under gnoboot's boot CR3, whose PDPT[8] is a 1 GB IDENTITY
@@ -3709,6 +3714,29 @@ fn syscall_harden_selftest() {
         if (pi2 != pi1) { kprintln("shsys: epoch test did not reuse SKIP", 36); }
         if (pi2 >= 0) { store64(&proc_table + pi2 * 176 + 8, 0); }   # leave the table clean
     }
+
+    # ⭐ 1.56.40 bite 4a — `#97 chan_op` CAPS + the REGION REACHABILITY kill criterion.
+    #
+    # ⛔ §9.9: "If the 2 MB region is not reachable from a spawned client's CR3, the static-region
+    # choice dies. Test this first in bite 4, before any userland." This asserts the KERNEL-CR3 half
+    # only — it runs from the boot selftest, so it proves the region exists, is direct-map addressable
+    # and survives a write/read round trip. **It does NOT prove the spawned-client half**, which is the
+    # part the criterion actually names, and which needs a ring-3 caller. Recorded here rather than
+    # left implicit, because a green line that reads like the criterion is met is worse than no line.
+    var caps = u + 640;
+    store64(caps, 0); store64(caps + 8, 0);
+    if (ksyscall(97, CH_CAPS, caps, 16) != 0) { kprintln("shsys: chan CAPS FAIL", 21); ok = 0; }
+    if (load32(caps) != CH_OP_SUPPORTED) { kprintln("shsys: chan caps mask FAIL", 26); ok = 0; }
+    if (load32(caps + 4) != CHAN_REGION_PAGES) { kprintln("shsys: chan region pages FAIL", 29); ok = 0; }
+    if (load64(caps + 8) != 1) { kprintln("shsys: chan region UNREACHABLE FAIL", 35); ok = 0; }
+    # An out-buffer too small, and an unimplemented op, must both be refused — the caps mask is a
+    # negotiation surface, so an op that answers anything but BADOP while its bit is clear is the
+    # defect that lets a client "work" against a kernel that cannot serve it.
+    if (ksyscall(97, CH_CAPS, caps, 8) != (0 - CH_E_OUTBUF)) { kprintln("shsys: chan short-buf rej FAIL", 30); ok = 0; }
+    if (ksyscall(97, 0x0A, caps, 16) != (0 - CH_E_BADOP)) { kprintln("shsys: chan HANDOFF rej FAIL", 28); ok = 0; }
+    if (ksyscall(97, 0x0B, caps, 16) != (0 - CH_E_BADOP)) { kprintln("shsys: chan DIAL rej FAIL", 25); ok = 0; }
+    if (ksyscall(97, 0x7F, caps, 16) != (0 - CH_E_BADOP)) { kprintln("shsys: chan unknown-op rej FAIL", 31); ok = 0; }
+    kprintln("shsys: chan CAPS + region OK (kernel CR3)", 41);
 
     # --- ext2 basename 255-cap (#6/#7): "/" + 256*'a' = 257 bytes, mkdir refused ---
     store8(u + 1024, 47);                       # '/'

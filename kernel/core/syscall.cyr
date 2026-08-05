@@ -4465,6 +4465,79 @@ var MDO_OP_SUPPORTED = 0x1FFF;
 #else
 var MDO_OP_SUPPORTED = 0x1E7F;
 #endif
+# =============================================================================================
+# 1.56.40 — THE LOCAL-IPC CHANNEL BAND (`#97 chan_op`), bite 4a: the region + CAPS.
+#
+# Design, migration and kill criteria: docs/development/planning/ipc.md §9. This is the kernel half
+# of retiring TCP-on-loopback as the desktop's control transport — a display protocol has nothing to
+# route, nothing to checksum, no window to negotiate and no business owning a port.
+#
+# ⛔ NO CODENAME. It is `chan_*` beside `pipe_*` / `shm_*` / `sock_*` / `net_*`, per the operator on
+# 2026-08-05: a name is a distribution fact, and a band that never leaves this kernel has no boundary
+# to cross. The design's Sanskrit working name is dropped. [[feedback_naming_lanes]]
+#
+# ⭐ WHY A STATIC 2 MB REGION RATHER THAN 32 `kmalloc`s (§9.2). Three reasons, and the third decides
+# it: creation cannot OOM · it sidesteps the 4096-byte slab ceiling · and **because channel pages are
+# never kmalloc'd or kfree'd, a destructive op inside a validate-then-execute batch cannot produce a
+# kernel-heap use-after-free.** That last is not hypothetical — it is the exact bug a judge found in
+# the rejected shared-region design (free-then-write in one batch, writing attacker-chosen bytes to a
+# kernel VA).
+#
+# ⛔ THE REGION IS REACHED THROUGH THE DIRECT MAP, WHICH IS WHY THIS WORKS AT ALL. Every per-proc CR3
+# mirrors kernel PDPT[1..511], so `DIRECTMAP_BASE + phys` resolves under ANY process's page tables —
+# the low identity map does not. §9.9 makes region reachability a KILL CRITERION and says to test it
+# "first in bite 4, before any userland"; `CH_CAPS` therefore performs the check on every call, from
+# whatever CR3 the caller happens to be running under.
+var CHAN_REGION_PAGES = 32;         # 32 x 4096 B carved out of one 2 MB page
+var chan_region_phys = 0;           # 0 = not reserved (no RAM at boot, or reserve not yet run)
+var chan_region_kva  = 0;           # DIRECTMAP_BASE + phys — valid under every CR3
+
+# Ops. ⛔ `CH_ENUM` is deliberately ABSENT from v1 — §9.7 item 5: it is the one op with no
+# today-consumer, and the roadmap's own rule is that the kernel grows per native workload. `CH_HANDOFF`
+# (0x0A) and `CH_DIAL` (0x0B) are RESERVED with their caps bits CLEAR: the shape of a relayed channel is
+# reserved, a relayed channel is not promised, and the kernel will never dial.
+var CH_CAPS   = 0x00;               # (out_uva, out_len) -> 0; writes the caps block
+var CH_E_BADOP  = 2;                # unknown, reserved, or not implemented in this kernel
+var CH_E_OUTBUF = 3;                # CAPS out_uva/out_len invalid
+var CH_E_NOREGION = 4;              # the 2 MB region is absent or unreachable from this CR3
+
+# ⛔ ONE BIT PER IMPLEMENTED OP, and an op that is merely reserved MUST read 0 — a caller negotiates on
+# this mask, so advertising an op the kernel does not run is how a client "works" against a kernel that
+# cannot serve it. Bite 4a implements CAPS only. This is the `MDO_OP_SUPPORTED` pattern that grew `#93`
+# across a whole arc under one number with no ABI break.
+var CH_OP_SUPPORTED = 0x0001;       # bit 0 = CH_CAPS
+
+# Reserve the region. Called once at boot, AFTER pmm_setup_directmap — the whole design rests on the
+# direct-map alias, so reserving before it exists would hand back a VA that means something else.
+fn chan_region_reserve() {
+    if (chan_region_phys != 0) { return 0; }
+    var p = pmm_alloc_2mb();
+    if (p == 0) { return 0 - 1; }
+    chan_region_phys = p;
+    chan_region_kva  = DIRECTMAP_BASE + p;
+    # Zero it once here rather than per-mint: a channel page must never hand a new owner the previous
+    # occupant's bytes, and doing it at reserve makes that true before any channel can exist.
+    memset(chan_region_kva, 0, 0x200000);
+    return 0;
+}
+
+# ⭐ THE KILL-CRITERION CHECK, RUN ON EVERY `CH_CAPS` CALL. Write a sentinel through the direct-map
+# alias and read it back, from whatever CR3 the caller is on. §9.9: "If the 2 MB region is not
+# reachable from a spawned client's CR3, the static-region choice dies."
+#
+# ⚠ It writes to the LAST 8 bytes of the region, not the first: page 0 is the first channel page a
+# real mint would hand out, and a probe that scribbles on it would be testing the region by corrupting
+# the thing it is reserving. The tail stays out of the 32-page carve.
+fn chan_region_reachable() {
+    if (chan_region_kva == 0) { return 0; }
+    var probe = chan_region_kva + 0x200000 - 8;
+    var want = 0x4348414E4F4B4159;          # arbitrary non-zero, non-repeating
+    store64(probe, want);
+    if (load64(probe) != want) { return 0; }
+    store64(probe, 0);
+    return 1;
+}
+
 var MDO_E_NOGPU      = 1;           # call/op — GPU/display unavailable (write ops only, once they exist)
 var MDO_E_BADOP      = 2;           # op    — unknown, reserved, or not implemented in this kernel
 var MDO_E_OUTBUF     = 3;           # op    — CAPS out_uva/out_len invalid
@@ -7473,6 +7546,31 @@ fn ksyscall(num, arg1, arg2, arg3) {
     # the client shm_write#72s its pixels into a kmalloc'd kernel buffer, ATTACH carries
     # the id, the compositor shm_read#73s them out — no inline TCP stream (deadlocks on
     # agnos > TCP_RX_RING), no cross-proc page mapping (no proc-exit free hazard).
+    # ⭐ 1.56.40 — `#97 chan_op(op, a1, a2, a3)`: the local-IPC channel band. Bite 4a implements CAPS
+    # only; every other op is BADOP and its caps bit is clear, so a client negotiating on the mask
+    # cannot "work" against a kernel that cannot serve it (§9.9's last kill criterion).
+    # ⛔ `#96` is `fork`'s. The operator assigned both on 2026-08-05; whichever lands first does NOT
+    # take the other's number.
+    if (num == 97) {
+        # chan_op(op, a1, a2, a3) -> 0 / negative CH_E_*
+        # CAPS(out_uva, out_len >= 16) -> 0. Layout: +0 op-support mask · +4 region pages ·
+        # +8 region reachable (1/0). ⛔ The reachability word is a LIVE probe run under the CALLER's
+        # CR3, not a boot-time cached answer — the claim being tested is that the region resolves from
+        # a spawned client's page tables, and a value stamped at boot under the kernel CR3 would say
+        # nothing about that. §9.9 makes it a kill criterion.
+        if (arg1 == CH_CAPS) {
+            if (arg3 < 16) { stack_canary_check(canary); return 0 - CH_E_OUTBUF; }
+            if (is_user_range(arg2, arg3) == 0) { stack_canary_check(canary); return 0 - CH_E_OUTBUF; }
+            if (chan_region_kva == 0) { stack_canary_check(canary); return 0 - CH_E_NOREGION; }
+            store32(arg2 + 0, CH_OP_SUPPORTED);
+            store32(arg2 + 4, CHAN_REGION_PAGES);
+            store64(arg2 + 8, chan_region_reachable());
+            stack_canary_check(canary);
+            return 0;
+        }
+        stack_canary_check(canary);
+        return 0 - CH_E_BADOP;
+    }
     if (num == 71) { stack_canary_check(canary); return shm_create(arg1); }             # shm_create(size) -> id
     # 1.56.40 bite 1 — WARN ONLY on #72/#73. A cross-owner touch is counted and then ALLOWED, because
     # the compositor reading a client's pixel buffer is exactly that and is the desktop's design today.
