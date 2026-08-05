@@ -883,19 +883,24 @@ klug_spill_prepare();
 gpu_display_probe();
 if (gpu_raster_derive() == 1) {
     if (mdo_native() == 0) {
-        # The geometry is now VERIFIED (read from the live HUBP) and native, so release the panel here
-        # rather than leaving it to gpu_scanout_matchgeom's 800x600 path further down.
-        fb_defer_off();
-        fb_console_clear();
-        klug_replay_fb();
         kprintln("gpu: boot console is NATIVE -- 2560x1440 scanout, scaler bypassed", 65);
-        # ⭐ AND PAN IT. Native ALONE made the boot 5.3x slower — measured on iron, `Timer ticks before
-        # sched`: 28 (800x600) -> 149 (native, SOFTWARE scroll) -> 11 (native + pan). The middle number is
-        # the 14,400 KB-per-scrolled-line cost the pan exists to remove. The two are ONE change.
+        # ⛔⛔ PAN **BEFORE** THE REPLAY, AND THE ORDER IS THE WHOLE POINT. The replay repaints the entire
+        # captured boot log — ~116 lines — and at 2560x1440 a 45-row console scrolls ~71 times to do it.
+        # On the SOFTWARE scroll that is 71 x 14,400 KB ≈ **1 GB of WC stores**, which is seconds, and it
+        # was the single most expensive operation in the boot. Arming the pan first makes the same replay
+        # 71 x 320 KB ≈ 22 MB — a ~45x reduction on exactly the operation that needed it most.
+        # ⚠ MEASURED CONSEQUENCE of getting this backwards (iron, 2026-08-04): the modeset moved to log
+        # line 116 as intended and the operator still reported "minor improvement but not much", because
+        # the expensive part had simply moved with it.
         # ⚠ mdo_pan arms the latch too (site 12), so an unclean shutdown skips BOTH on the next boot.
         if (mdo_pan() == 0) {
             kprintln("gpu: boot console PANS in hardware -- scroll is one address write", 65);
         }
+        # Only now release the panel: the geometry is native, the scroll is a register write, and the
+        # replay below is the first thing the operator ever sees agnos draw.
+        fb_defer_off();
+        fb_console_clear();
+        klug_replay_fb();
     }
 }
 

@@ -27,6 +27,34 @@ SKIPPED` and needed a manual `rm /.modeset-armed`. **(2)** The boot console is s
 `MDO_OP_NATIVE` is iron-proven, so the native modeset can move to boot time, behind the latch that (1)
 makes usable.
 
+### Fixed — a second `gpu_display_probe()` retracted a working display, breaking the compositor
+
+`gpu_display_probe()` now returns early when `gpu_display_ok == 1`. It runs from two sites since the boot
+modeset moved early; by the time the later one runs the console has legitimately moved to the pan buffer,
+so its `fb_phys` match cannot succeed and it was setting `gpu_display_ok = -1`.
+
+Not cosmetic: `gpu_blit_arm()` gates on `gpu_display_ok == 1`, so the double buffer never armed,
+aethersafha could not page-flip, and it rendered into the console's own buffer while `fb_console` kept
+painting there. Measured on iron 2026-08-04: `gpu: display pipe surface not matched` at log line 159, with
+the shell visibly flashing through the running desktop.
+
+### Changed — the boot pan arms BEFORE the boot log replay
+
+`klug_replay_fb()` repaints ~116 captured lines; at 2560x1440 a 45-row console scrolls ~71 times to do it.
+Running it before `mdo_pan()` cost 71 x 14,400 KB ≈ **1 GB of WC stores** — the single most expensive
+operation in the boot. Arming the pan first makes the same replay ~22 MB, a ~45x reduction. Order is now
+`mdo_native()` → `mdo_pan()` → `fb_defer_off()` → `fb_console_clear()` → `klug_replay_fb()`.
+
+### Changed — the boot modeset moved to the earliest point its preconditions allow
+
+The block now runs immediately after `klug_spill_prepare()` (log line ~116) instead of after
+`gpu_pixclk_discover()` (~141), and calls `gpu_display_probe()` itself rather than waiting for the call
+site behind `gpu_fw_load` / `gpu_fw_load_set` / `gpu_vm_setup` — none of which is display. The floor is the
+**latch**: `modeset_arm` needs ext2, so nvme → GPT → mount → `modeset_latch_check`.
+
+Because `fb_console` is still deferred at that point, the panel's first agnos content is already native and
+already panned, with the boot log replayed into it — there is no 800x600 phase.
+
 ### Changed — the boot modeset no longer waits ~2 s for a number it already has
 
 New `gpu_raster_derive()` (`kernel/core/gpu.cyr`), extracted from `gpu_pixclk_discover()`: the OTG reads

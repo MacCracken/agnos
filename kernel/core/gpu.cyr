@@ -10241,6 +10241,17 @@ fn gpu_dispatch_f64_sys(a_uva, b_uva, c_uva) {
 # gated pipes; a HUBP mismatch simply fails the gate. No-ops if the GPU is absent or the FB isn't GOP-lit.
 # DCN registers live at BASE_IDX 2 (GPU_BASE_DCN_2 = 0x34C0), NOT the seg1 0xC0 (DCE_VERSION only).
 fn gpu_display_probe() {
+    # ⛔⛔ 1.56.38 — NEVER CLOBBER A SUCCESSFUL PROBE. This runs from TWO sites now: the early boot-modeset
+    # block, and the original site ~130 log lines later. By the time the second one runs the console has
+    # legitimately moved to the PAN BUFFER, so the fb_phys match below cannot succeed — and it was setting
+    # gpu_display_ok = -1 on a display that is working perfectly.
+    # ⭐ MEASURED ON IRON 2026-08-04: `gpu: display pipe surface not matched` at log line 159, and the
+    # consequence was NOT cosmetic — gpu_blit_arm() gates on gpu_display_ok == 1, so the double buffer never
+    # armed, aethersafha could not page-flip, and it rendered straight into the console's own buffer while
+    # fb_console kept painting there. The operator saw the shell flashing through the desktop.
+    # ⚠ Leaving the second call in place was supposed to be the FAIL-SAFE. It was the failure: a probe that
+    # re-runs after the thing it probes has moved does not re-confirm, it retracts.
+    if (gpu_display_ok == 1) { return 1; }
     gpu_display_ok = 0;
     if (gpu_present == 0) { return 0; }
 
