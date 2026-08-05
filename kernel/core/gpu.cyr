@@ -11627,8 +11627,20 @@ fn gpu_pixclk_source_check() {
     return 0 - 1;
 }
 
-fn gpu_pixclk_discover() {
-    gpu_pixclk_100hz = 0;
+# gpu_raster_derive — 1.56.38: the LINK's raster, from registers alone, in microseconds.
+#
+# ⛔ EXTRACTED FROM gpu_pixclk_discover BECAUSE ITS COST WAS BEING CHARGED TO THE WRONG CALLER. Deriving
+# h_active / v_active / h_total / v_total is a handful of OTG reads; the ~2 SECONDS that function spends is
+# the refresh measurement AFTER them (five ~0.33 s windows in gpu_refresh_ticks). The boot-time native
+# modeset needs only the raster — it refuses unless the target equals the link's active size — so placing
+# it after the whole of gpu_pixclk_discover made it wait two seconds for a number it already had. The
+# operator saw exactly that: the console switching to native at the very end of boot, after sitting at
+# 800x600 through a stall with nothing printing.
+#
+# Returns 1 = raster derived and geometrically consistent, 0 = refused (and it says why).
+# ⚠ IDEMPOTENT and side-effect-free beyond the four globals, so gpu_pixclk_discover still calls it and
+# both call sites can run in the same boot.
+fn gpu_raster_derive() {
     if (gpu_present == 0) { return 0; }
     if (gpu_display_ok != 1) { return 0; }
     if (gpu_display_pipe < 0) { return 0; }
@@ -11693,6 +11705,18 @@ fn gpu_pixclk_discover() {
         kprintln("gpu: display vertical total below active, clock not derived", 59);
         return 0;
     }
+    return 1;
+}
+
+# gpu_pixclk_discover — the raster (above) PLUS the ~2 s refresh measurement that turns it into a pixel
+# clock. Everything after gpu_raster_derive here is the expensive half.
+fn gpu_pixclk_discover() {
+    gpu_pixclk_100hz = 0;
+    if (gpu_raster_derive() != 1) { return 0; }
+    var pipe = gpu_display_pipe;
+    var htotal = gpu_h_total;
+    var vtotal = gpu_v_total;
+    var hact = gpu_h_active;
 
     # Measure via I2 (gpu_refresh_ticks, above): several short windows, shortest kept, stability gated. It
     # logs the refresh and the window spread, so this path stays exactly as loud as it was before extraction.

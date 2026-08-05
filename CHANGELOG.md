@@ -27,6 +27,19 @@ SKIPPED` and needed a manual `rm /.modeset-armed`. **(2)** The boot console is s
 `MDO_OP_NATIVE` is iron-proven, so the native modeset can move to boot time, behind the latch that (1)
 makes usable.
 
+### Changed — the boot modeset no longer waits ~2 s for a number it already has
+
+New `gpu_raster_derive()` (`kernel/core/gpu.cyr`), extracted from `gpu_pixclk_discover()`: the OTG reads
+that set `gpu_h_active` / `gpu_v_active` / `gpu_h_total` / `gpu_v_total`, without the ~2 s refresh
+measurement (five ~0.33 s windows in `gpu_refresh_ticks`) that follows them. `gpu_pixclk_discover()` now
+calls it and keeps the measurement half; both call sites can run in the same boot.
+
+The boot native+pan block moves from after `gpu_pixclk_discover()` to immediately after
+`gpu_scanout_matchgeom()`, ahead of `gpu_display_vblank()` and the measurement. Measured consequence of
+the old placement (iron, 2026-08-04): the console switched to native at the very end of boot, after ~55
+log lines at 800x600 and a stall with nothing printing. The firmware/compute tail and the refresh
+measurement now run on an already-native, already-panned console.
+
 ### Added — the console boots at native resolution AND hardware-panned
 
 `main.cyr` calls `mdo_native()` after `gpu_pixclk_discover()`, then `mdo_pan()`, then `klug_replay_fb()`.
@@ -34,10 +47,11 @@ Ordering is forced: `mdo_native` refuses unless the target equals the link's act
 `gpu_h_active` / `gpu_v_active` are not derived until `gpu_pixclk_discover`; `mdo_pan` refuses unless the
 pipe is already native.
 
-**Both are needed together.** Measured on iron: `Timer ticks before sched` went **28** (1.56.37, 800x600)
-to **149** (native with the software scroll) across two consecutive boots — a 5.3x slower boot, which is
-the 14,400 KB-per-scrolled-line cost the pan exists to remove, reintroduced by taking the console native
-without taking it panned.
+**Both are needed together.** Measured on iron, `Timer ticks before sched`: **28** (1.56.37, 800x600) →
+**149** (native with the software scroll, two consecutive boots) → **11** (native + pan). The middle
+number is the 14,400 KB-per-scrolled-line cost the pan exists to remove, reintroduced by taking the
+console native without taking it panned; the last is the pan paying for itself against even the 800x600
+baseline.
 
 Neither is gated on success: a refusal (no GPU, latch armed, pipe != 0, raster mismatch) leaves the
 console on the inherited geometry and scroll, which is a correct outcome.

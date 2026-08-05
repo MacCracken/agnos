@@ -858,6 +858,48 @@ modeset_latch_check();
 # fail-safe — a read-only or absent ext2 returns 0 and no spill is attempted later.
 klug_spill_prepare();
 
+# === 1.56.38 — BOOT TO NATIVE RESOLUTION, AT THE EARLIEST POINT THAT IS POSSIBLE =======================
+# Take the console to 2560x1440 with the scaler bypassed and the hardware pan armed, HERE — before the GPU
+# firmware load, before the compute bring-up, before vblank pacing and the ~2 s refresh measurement.
+#
+# ⛔ THIS IS THE FLOOR, and it is set by the LATCH, not by the display. modeset_arm needs the ext2 latch,
+# which needs nvme -> GPT -> ext2 mount -> modeset_latch_check, all of which complete immediately above.
+# Nothing else this block touches is unavailable: the register aperture mapped in gpu_probe long ago, and
+# every read below is DCN or MC.
+#
+# ⛔ WHY gpu_display_probe() IS CALLED HERE RATHER THAN WAITED FOR. Its normal call site is ~130 log lines
+# further down, behind gpu_fw_load / gpu_fw_load_set / gpu_vm_setup — and NONE of that is display. Those
+# bring up the GFX/compute engines; the display is already lit by firmware before agnos touches anything,
+# and this probe is pure reads of DCN + MC registers. Waiting for the compute stack to come up before
+# looking at the display pipe was ordering by accident, not by dependency.
+# ⚠ It is IDEMPOTENT and its later call site is LEFT IN PLACE: if anything here refuses, the boot behaves
+# exactly as it did before this block existed. That is the fail-safe direction.
+#
+# ⭐ WHAT THIS BUYS, and it is the whole point: fb_console is still DEFERRED at this line (fb_defer_begin
+# ran at console init and nothing has released it yet). So the panel has shown firmware content up to
+# here and NOTHING of agnos. Releasing it below means the first agnos pixels the operator ever sees are
+# already native, already panned, with the whole boot log replayed into them. There is no 800x600 phase to
+# sit through — which is what three previous placements of this block all failed to deliver.
+gpu_display_probe();
+if (gpu_raster_derive() == 1) {
+    if (mdo_native() == 0) {
+        # The geometry is now VERIFIED (read from the live HUBP) and native, so release the panel here
+        # rather than leaving it to gpu_scanout_matchgeom's 800x600 path further down.
+        fb_defer_off();
+        fb_console_clear();
+        klug_replay_fb();
+        kprintln("gpu: boot console is NATIVE -- 2560x1440 scanout, scaler bypassed", 65);
+        # ⭐ AND PAN IT. Native ALONE made the boot 5.3x slower — measured on iron, `Timer ticks before
+        # sched`: 28 (800x600) -> 149 (native, SOFTWARE scroll) -> 11 (native + pan). The middle number is
+        # the 14,400 KB-per-scrolled-line cost the pan exists to remove. The two are ONE change.
+        # ⚠ mdo_pan arms the latch too (site 12), so an unclean shutdown skips BOTH on the next boot.
+        if (mdo_pan() == 0) {
+            kprintln("gpu: boot console PANS in hardware -- scroll is one address write", 65);
+        }
+    }
+}
+
+
 # GPU arc C1b-2 (1.54.x) — LOAD_IP_FW RLC_G: the first real firmware into the GPU.
 # Runs HERE (after the FS mounts) because it reads the AMD-signed RLC microcode from
 # the agnos-fs (/fw/rlc.bin) and feeds it to the PSP over the ring + TMR that
@@ -1162,6 +1204,7 @@ fb_defer_rescue();
 # counter advances (the pipe is really scanning; frame boundaries are observable) and OTG_STATUS shows both
 # the blank and active phases (we can tell where in the scan we are). Read-only; gated on P0. P1's flip
 # below is then PACED on this signal (block until the hardware actually took the surface).
+
 gpu_display_vblank();
 
 # GPU arc 1.55.x (Thrust P) P3a: display-audio state probe (READ-ONLY). The 1.53.5 HDA work streams a tone
@@ -1198,45 +1241,6 @@ gpu_audio_probe();
 # rate. Read-only; gated on P0. Takes ~2 s of boot: five ~0.33 s measurement windows.
 gpu_pixclk_discover();
 
-# === 1.56.38 — BOOT TO NATIVE RESOLUTION ===============================================================
-# Run the modeset that `MDO_OP_NATIVE` proved on iron across five burns, at boot, so the console is
-# 2560x1440 with the scaler bypassed instead of an 800x600 surface upscaled to the link.
-#
-# ⛔ IT HAS TO BE HERE, NOT EARLIER. mdo_native refuses unless the target geometry EQUALS the link's
-# active raster, and gpu_h_active / gpu_v_active are not derived until gpu_pixclk_discover() above. Called
-# any sooner it returns MDO_E_RASTER every time — a silent no-op that looks like the feature not existing.
-#
-# ⭐ WHY A BOOT-TIME MODESET IS SAFE NOW, WHEN §2.2b said not to do this: that rule was
-# "no boot-time native modeset until the op has succeeded on iron at least once", and it has — five times.
-# What makes it RECOVERABLE rather than merely proven is the pair of changes in this cut. mdo_native arms
-# the latch; if this write blanks the panel the operator cannot confirm anything, so they power-cycle, the
-# latch survives, and modeset_arm refuses on the next boot — which comes up on the inherited mode with a
-# working console. Only an operator who can SEE the display disarms it (modeset_confirm_by_operator).
-# ⇒ The failure mode is one bad boot and a power cycle, never a loop, and never a reflash.
-#
-# ⚠ NOT gated on success: a refusal is completely normal. No GPU (QEMU), a latch still armed from a bad
-# previous boot, a pipe that is not 0, a raster that does not match — every one of those leaves the
-# console exactly as it was, on the inherited geometry, which is a correct outcome and not an error.
-# The klug replay only runs when the geometry actually changed, so a refusal costs nothing.
-if (mdo_native() == 0) {
-    # mdo_native already did fb_set_geom + fb_console_clear. Repaint the boot log at the new geometry —
-    # without this the operator gets a native-resolution console showing an empty screen, having silently
-    # thrown away every line printed up to here.
-    klug_replay_fb();
-    kprintln("gpu: boot console is NATIVE -- 2560x1440 scanout, scaler bypassed", 65);
-    # ⭐ 1.56.38 — AND PAN IT, because native ALONE made the boot 5.3x slower. MEASURED ON IRON:
-    # `Timer ticks before sched` went 28 (1.56.37, 800x600) -> 149 (1.56.38 first cut, native with the
-    # SOFTWARE scroll), on two consecutive boots. That is the 14,400 KB-per-scrolled-line cost the pan was
-    # built to remove, reintroduced at boot by taking the console native without taking it panned.
-    # ⇒ The two belong together: native without the pan is a slower console, not a better one.
-    # Ordering is forced — mdo_pan refuses unless the pipe is already native (MDO_E_RASTER).
-    # ⚠ mdo_pan arms the latch too (site 12), so an unclean shutdown skips BOTH on the next boot and the
-    # console comes up on the inherited mode at the inherited speed. A refusal here is harmless: the
-    # console stays native on the software scroll, which is exactly the state this boot started in.
-    if (mdo_pan() == 0) {
-        kprintln("gpu: boot console PANS in hardware -- scroll is one address write", 65);
-    }
-}
 
 #ifdef KLUG_SPILL_SELFTEST
 # H1 (gpu.md, modeset arc) — exercise the spill. Runs LATE, so the ring holds a full boot log and the
