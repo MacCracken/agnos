@@ -58,13 +58,15 @@ python3 "$ROOT/scripts/tool/mk-dirty-journal-img.py" "$IMG" "$PART_OFFSET" 1 | s
 echo "Booting agnos against dirty-journal image (NVMe + GPT)..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/jbd2-refusal.log"
-timeout "${QEMU_TIMEOUT:-90}" qemu-system-x86_64 \
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
+qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-90}" \
+    qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$IMG,format=raw,if=none,id=disk0" \
     -device "nvme,drive=disk0,serial=AGNOS-EXT" \
-    -serial stdio -display none -no-reboot 2>/dev/null > "$LOG"
+    -serial stdio -display none -no-reboot
 
 echo ""
 echo "  --- jbd2 + shell-prompt lines from boot log ---"

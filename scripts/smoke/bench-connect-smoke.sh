@@ -73,14 +73,16 @@ trap 'kill $SVPID 2>/dev/null' EXIT
 echo "Booting BENCH kernel ($KVM_ARGS) — virtio-net + SLIRP, hoosh bench → 10.0.2.2:$PORT..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/bench.log"
-timeout "${QEMU_TIMEOUT:-160}" qemu-system-x86_64 \
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
+qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-160}" \
+    qemu-system-x86_64 \
     -machine q35 -m 1G $KVM_ARGS \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$IMG,format=raw,if=none,id=disk0" \
     -device "nvme,drive=disk0,serial=AGNOS-BENCH" \
     -netdev "user,id=u1,guestfwd=tcp:10.0.2.100:80-tcp:127.0.0.1:$PORT" -device "virtio-net-pci,netdev=u1" \
-    -serial stdio -display none -no-reboot 2>/dev/null > "$LOG"
+    -serial stdio -display none -no-reboot
 kill $SVPID 2>/dev/null
 
 echo ""

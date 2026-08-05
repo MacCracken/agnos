@@ -43,12 +43,14 @@ cp "$OVMF_VARS" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 
 echo "=== AGNOS 1.44.18 SMP-AP wake+park smoke (-smp 4) ==="
 LOG="$LOGS/smp.log"
-timeout "${QEMU_TIMEOUT:-60}" qemu-system-x86_64 \
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
+qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-60}" \
+    qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max -smp 4 \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$ESP,format=raw,if=none,id=esp0" -device "virtio-blk-pci,drive=esp0" \
-    -serial stdio -display none -no-reboot 2>/dev/null > "$LOG"
+    -serial stdio -display none -no-reboot
 
 echo "--- serial (smp lines) ---"; strings "$LOG" | grep -iE "smp|cpus" | sed 's/^/  /'
 rc=0

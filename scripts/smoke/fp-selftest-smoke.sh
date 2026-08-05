@@ -47,13 +47,15 @@ mcopy -i "$ESP"@@1048576 "$AGNOS" ::boot/agnos
 LOG="$LOGS/fp-selftest.log"
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 echo "=== AGNOS FP/SSE-enable smoke (FP_SELFTEST, -m 256M) ==="
-timeout "${QEMU_TIMEOUT:-40}" qemu-system-x86_64 \
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
+qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
+    qemu-system-x86_64 \
     -machine q35 -m 256M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$ESP,format=raw,if=none,id=esp0" \
     -device "virtio-blk-pci,drive=esp0" \
-    -serial stdio -display none -no-reboot 2>/dev/null > "$LOG"
+    -serial stdio -display none -no-reboot
 
 echo "--- FP / SSE / shell lines ---"
 strings "$LOG" | grep -E "SSE enabled|fp: movsd|fp: ring0|Invalid Opcode|#UD|AGNOS shell" | head

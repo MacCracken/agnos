@@ -62,13 +62,15 @@ python3 "$ROOT/scripts/tool/mk-dirty-journal-img.py" "$IMG" "$PART_OFFSET" --csu
 echo "Booting agnos (JBD2_TX_SELFTEST kernel, CSUM_V3 journal)..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/jbd2-tx.log"
-timeout "${QEMU_TIMEOUT:-90}" qemu-system-x86_64 \
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
+qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-90}" \
+    qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$IMG,format=raw,if=none,id=disk0" \
     -device "nvme,drive=disk0,serial=AGNOS-EXT" \
-    -serial stdio -display none -no-reboot 2>/dev/null > "$LOG"
+    -serial stdio -display none -no-reboot
 
 echo ""
 echo "  --- jbd2-tx + lifecycle trace ---"

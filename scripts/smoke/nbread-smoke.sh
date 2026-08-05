@@ -45,12 +45,14 @@ cp "$OVMF_VARS" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 
 echo "=== AGNOS 1.44.x non-blocking cooked-line read smoke ==="
 LOG="$LOGS/nbread.log"
-timeout "${QEMU_TIMEOUT:-40}" qemu-system-x86_64 \
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
+qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
+    qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$ESP,format=raw,if=none,id=esp0" -device "virtio-blk-pci,drive=esp0" \
-    -serial stdio -display none -no-reboot 2>/dev/null > "$LOG"
+    -serial stdio -display none -no-reboot
 
 echo "--- serial (nbread lines) ---"; strings "$LOG" | grep "nbread:" | sed 's/^/  /'
 rc=0

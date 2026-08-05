@@ -73,6 +73,37 @@ collapse them.
 **Negative control, run:** restoring the bare `arch_wait()` makes the smoke exit 1 with the hang
 signature; removing it again restores PASS.
 
+### Changed — the arc sweep stops waiting for a clock: ~20 min → **395 s**, 16/16
+
+⛔ **The problem was dead air, not slowness, and it had been measured and left.** `state.md` recorded on
+2026-07-23 that **QEMU never exits on its own** — the kernel boots, prints, halts, and sits — so every
+smoke consumed its entire `QEMU_TIMEOUT` even when the work finished in two seconds. Proven then by
+shrinking one: `fp-selftest-smoke` returned identically at 40 / 15 / 8 / 5 s.
+
+New `scripts/smoke/lib/qemu-dwell.sh`: background QEMU, poll the log for a marker, SIGTERM, **and wait
+for the process to actually exit** before returning. That last step is the point — `hda-smoke.sh`
+documents why the synchronous form was chosen (*"the file is fully written once QEMU has exited"*), and
+`wait` preserves that guarantee instead of discarding it; a bare kill plus an immediate `grep` would
+reintroduce exactly the flush race. The timeout is unchanged and still backstops a hung boot.
+**35 smokes converted.**
+
+⛔ **Marker choice is where this goes wrong, so it was made structural rather than per-file.** Stopping
+on a line printed *before* something a smoke asserts builds a truncation bug that reads as a kernel
+regression. Verified that **no sweep gate feeds stdin** — every one is boot-phase-only, and boot
+selftests run from `main.cyr` before kybernet execs the shell, so the prompt provably follows anything
+they printed. A smoke that DRIVES the shell must pass its own last expected line instead.
+
+⚠ `hda-smoke` / `hda-dual-smoke` still use fixed dwells: they take `-serial file:` (QEMU owns the file)
+rather than `-serial stdio`, which the helper does not yet cover.
+
+⛔ **Recorded because it cost a full sweep and hid itself.** The first cut of the helper referenced a
+bare `$QEMU_DWELL_DEBUG`; the smokes run under `set -eu`, so that is an unbound-variable **abort** on
+every run that does not set it, and 7 gates failed. It was invisible because **the run used to validate
+the change was the only one with that variable set** — the debug flag added to observe the fix was the
+single configuration that dodged its own bug. Re-verified afterwards with the variable *unset*, which is
+the case that broke. A neighbouring `set -e` hazard went with it: `kill -0 X && kill -KILL X` returns
+non-zero when the process has already exited, which is the common case here.
+
 ## [1.56.39] — 2026-08-05 — three kernel items the desktop has been owed (RELEASED)
 
 Scope: the 1.56.35 cut named eight things the sovereign desktop needs from the kernel and closed with

@@ -81,13 +81,21 @@ mcopy -i "$IMG"@@1048576 "$WORK/CATTEST.TXT" ::CATTEST.TXT
 echo "Booting FATFS_SELFTEST kernel (NVMe + GPT, FAT32 ESP)..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/fat-selftest.log"
-timeout "${QEMU_TIMEOUT:-30}" qemu-system-x86_64 \
+# Stop at the shell prompt instead of burning the whole dwell — QEMU never exits on its own, so this
+# smoke spent ~30 s of its 32 s waiting for a clock. SAFE HERE BECAUSE EVERY ASSERTION BELOW IS A
+# BOOT-TIME SELFTEST LINE: verified in the captured log that all four ("fat: mounted FAT32",
+# "fatr: chain-read OK", "VFS-CAT-FAT-OK", "CATTEST.TXT") land before the first `agnos>` — the prompt is
+# 7 bytes from the end of a 4051-byte log. The budget is unchanged and still backstops a hung boot.
+# ⛔ Do NOT copy this marker into a smoke that DRIVES the shell; its output comes after the prompt.
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
+qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-30}" \
+    qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$IMG,format=raw,if=none,id=disk0" \
     -device "nvme,drive=disk0,serial=AGNOS-FATTEST" \
-    -serial stdio -display none -no-reboot 2>/dev/null > "$LOG"
+    -serial stdio -display none -no-reboot
 
 echo ""
 echo "  --- fat lines from boot log ---"

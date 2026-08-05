@@ -82,13 +82,15 @@ LOG="$LOGS/exec-selftest.log"
 # truncated QEMU mid-selftest and the gate FALSELY read as a spawnpath failure (no `ring3:` line ever
 # printed). This is a harness-timeout artifact, NOT a #43 fault. The EXEC-only profile (no ring3
 # selftest) finishes far sooner — pass a lower QEMU_TIMEOUT for it if you want a quicker run.
-timeout "${QEMU_TIMEOUT:-90}" qemu-system-x86_64 \
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
+qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-90}" \
+    qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$IMG,format=raw,if=none,id=disk0" \
     -device "nvme,drive=disk0,serial=AGNOS-EXEC" \
-    -serial stdio -display none -no-reboot 2>/dev/null > "$LOG"
+    -serial stdio -display none -no-reboot
 
 echo ""
 echo "  --- exec lines from boot log ---"

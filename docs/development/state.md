@@ -70,23 +70,19 @@ Landed for 1.56.34 but **never built, therefore unverified**: `MDO_OP_CRCCAL` + 
 
 **The AMD-Zen scanout residue is RESOLVED at 1.55.28, not parked.** Root cause was a surface/raster **scale** mismatch, not tiling and not DCC: the firmware leaves an 800×600 surface DCN-scaled to 2560×1440 while `boot_info` reports the **output** geometry, so `fb_console` rendered 2560-wide and smeared. Fix is `gpu_scanout_matchgeom` — read the real viewport (HUBP `0x5EA` = 800×600) and pitch (`0x607` = 832 px) and override `fb_console`'s geometry. **Read-only, no register writes.** Neither parked option (HUBP `clear_tiling` port, simpledrm-style shadow-buffer console) was needed. Residual, accepted by operator decision 2026-07-20: the ~84 boot lines painted before the register aperture maps.
 
-### Sweep timing — actionable, measured 2026-07-23
+### Sweep timing — ✅ FIXED 2026-08-05: ~20 min → **395 s**, 16/16
 
-`scripts/sweep.sh` takes **≈10–11 min and almost all of it is DEAD AIR.** QEMU **never exits on its own** — the kernel boots, prints, halts, and sits until `timeout` kills it — so every run consumes its full `QEMU_TIMEOUT` (57 smoke scripts carry one). Proven by shrinking one: `fp-selftest-smoke` returns "4 passed, 0 failed" **identically** at `QEMU_TIMEOUT` 40 → 15 → 8 → 5 s. The kernel build itself is 1 s. Fix is **harness-only**: run QEMU in the background and poll the serial log for the smoke's own terminal marker, killing on match, with `timeout` kept as the failure backstop. Expected ≈10–11 min → 1–2 min. ⛔ **Do NOT simply shorten timeouts** — that trades dead air for flaky truncation.
-
-### Syscall ABI — ✅ machine-checked since 2026-08-05: `kernel 96 · abi-doc 96 · cyrius 96`
-
-cyrius was never the gap (96/96 constants + wrappers). The doc documented **64 of 96**; 32 rows
-backfilled, the `45–59` placeholder deleted (it carried the circular "cyrius is authoritative" claim),
-`#84` corrected `present` → `gpu_present`. ⭐ Kept closed by **`scripts/check/syscall-abi-check.sh`** in
-`check.sh` — number sets three ways, doc-vs-cyrius names, kernel names (all 96 arms now carry a `# name`
-comment), and syscall rows filed in a struct section; four negative controls confirm it detects.
-⚠ `#44 sched_yield` comes from the ring-3 entry stub, not `ksyscall`, so `grep 'if (num == '` returns 95 and looks like a hole. → [ticket](issues/2026-08-05-abi-doc-covers-two-thirds-of-the-syscalls.md)
-→ [ticket](issues/2026-08-05-abi-doc-covers-two-thirds-of-the-syscalls.md)
-
-**Reserved, not minted:** `#96 fork` ([ticket](issues/2026-08-05-syscall-96-fork.md)) · `#97 chan_op`
-([ticket](issues/2026-08-05-syscall-97-chan-op.md)). Next free `#98`. ⛔ The gate FAILS on a doc row with
-no kernel arm, so mint each number in the same change as its dispatch arm — not ahead of it.
+The 2026-07-23 diagnosis was right and sat unfixed: **QEMU never exits on its own**, so every smoke
+burned its whole `QEMU_TIMEOUT` waiting for nothing. New `scripts/smoke/lib/qemu-dwell.sh` backgrounds
+QEMU, polls for a marker, then SIGTERMs **and waits for the process to exit** — which is what preserves
+the "log is complete once QEMU has exited" guarantee `hda-smoke` documents; a bare kill would
+reintroduce that flush race. The budget is unchanged and still backstops a hung boot. **35 smokes
+converted.** ⛔ Marker choice is the hazard, and it is structural here, not per-file luck: no sweep gate
+feeds stdin, so all are boot-phase-only and the shell prompt provably follows anything a selftest
+printed. A smoke that DRIVES the shell must pass its own last line instead.
+⚠ Still on fixed dwells: `hda-smoke` / `hda-dual-smoke` use `-serial file:` (QEMU owns the file) rather
+than `-serial stdio`, which the helper does not yet cover.
+⛔ **Do NOT "fix" a slow gate by shortening its timeout** — that trades dead air for flaky truncation.
 
 ## FALSIFIED — do not re-open
 

@@ -69,13 +69,15 @@ mkfs.ext2 -F -q -L AGNOS-KLUG -b 4096 -m 0 -O "$FEATURES" -d "$SEED" -E offset=$
 echo "Booting KLUG_SPILL_SELFTEST kernel (NVMe + GPT partition)..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/klug-spill.log"
-timeout "${QEMU_TIMEOUT:-40}" qemu-system-x86_64 \
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
+qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
+    qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$IMG,format=raw,if=none,id=disk0" \
     -device "nvme,drive=disk0,serial=AGNOS-KLUG" \
-    -serial stdio -display none -no-reboot 2>/dev/null > "$LOG"
+    -serial stdio -display none -no-reboot
 
 echo "--- klug lines ---"
 grep -aE "klug:" "$LOG" | head -5
