@@ -3416,6 +3416,60 @@ fn exec_redirect_selftest() {
     return 0;
 }
 exec_redirect_selftest();
+
+# 1.56.39 — the spawn_path#43 arm of the same redirect (spawn_redirect_apply). It has no caller in
+# the tree yet: nothing arms #62 before a #43 today, so the whole apply path would ship unexercised
+# and only the no-arm early return would ever run. This drives both halves directly.
+#
+# The invariant under test is the one the refusal exists to protect: applying a redirect must NEVER
+# reach the GLOBAL vfs_table. A child with no private table (proc_fd_base == 0) must be refused, and
+# a child WITH one must have its own copy rewritten while the global stays byte-identical.
+fn spawn_redirect_selftest() {
+    var sfds[16];
+    if (vfs_create_pipe(&sfds) != 0) { kprintln("spawnredir: FAIL pipe", 21); return 0; }
+    var swfd = load64(&sfds + 8);
+
+    # Snapshot the GLOBAL fd 20 entry — nothing below is allowed to change it.
+    var g20 = &vfs_table + 20 * 32;
+    var snap[4];
+    var i = 0;
+    while (i < 32) { store64(&snap + i, load64(g20 + i)); i = i + 8; }
+
+    # (1) NEGATIVE CONTROL — proc 0 uses the global table (proc_fd_base[0] == 0), so a redirect
+    # aimed at it must be REFUSED, and must leave the one-shot cleared rather than armed.
+    redir_src_fd_set(20); redir_dst_fd_set(swfd); redir_pending_set(1);
+    if (spawn_redirect_apply(0) != 0 - 1) { kprintln("spawnredir: FAIL global not refused", 35); return 0; }
+    if (redir_pending_get() != 0) { kprintln("spawnredir: FAIL arm survived refusal", 37); return 0; }
+    var j = 0;
+    while (j < 32) {
+        if (load64(g20 + j) != load64(&snap + j)) { kprintln("spawnredir: FAIL global was written", 35); return 0; }
+        j = j + 8;
+    }
+    kprintln("spawnredir: global table refused", 32);
+
+    # (2) POSITIVE — give pid 15 a private table (the same call proc_create_user makes), arm, apply.
+    # The child's own entry 20 must become a copy of its entry `swfd`; the global must not move.
+    if (vfs_fd_inherit(15, 0) != 0) { kprintln("spawnredir: FAIL inherit", 24); return 0; }
+    if (proc_fd_base_get(15) == 0) { kprintln("spawnredir: FAIL no private table", 33); return 0; }
+    redir_src_fd_set(20); redir_dst_fd_set(swfd); redir_pending_set(1);
+    if (spawn_redirect_apply(15) != 0) { kprintln("spawnredir: FAIL apply", 22); return 0; }
+    if (redir_pending_get() != 0) { kprintln("spawnredir: FAIL arm survived apply", 35); return 0; }
+    var ctbl = vfs_fd_table_of(15);
+    var k = 0;
+    while (k < 32) {
+        if (load64(ctbl + 20 * 32 + k) != load64(ctbl + swfd * 32 + k)) {
+            kprintln("spawnredir: FAIL child entry not swapped", 40); proc_destroy_fd_table(15, 0); return 0;
+        }
+        if (load64(g20 + k) != load64(&snap + k)) {
+            kprintln("spawnredir: FAIL global moved on apply", 38); proc_destroy_fd_table(15, 0); return 0;
+        }
+        k = k + 8;
+    }
+    proc_destroy_fd_table(15, 0);
+    kprintln("spawnredir: child table swapped OK", 34);
+    return 0;
+}
+spawn_redirect_selftest();
 #endif
 
 # 1.44.x — NON-BLOCKING cooked-line read self-test (compile-gated, NBREAD_SELFTEST=1).

@@ -1,6 +1,6 @@
 ---
 name: AGNOS Local IPC — what an agnos socket is
-description: The single source of truth for the local-IPC / agnos-socket question — the design session's surveys, its three candidate designs, the judge panel's verdicts, and the decision that is still outstanding.
+description: The single source of truth for the local-IPC / agnos-socket question — the design session's surveys, its three candidate designs, the judge panel's verdicts, and the landed decision: the kernel chan_* band on syscall #97.
 type: planning
 ---
 
@@ -10,11 +10,12 @@ type: planning
 > [`gpu.md`](gpu.md) is to the GPU: one file, exhaustive, no sibling arc docs.
 > Opened 2026-08-02.
 >
-> ✅ **THE DECISION IS MADE — 2026-08-03: `anu`.** See **§9**, which is the operative section of this
+> ✅ **THE DECISION IS MADE — 2026-08-03, and NAMED + NUMBERED 2026-08-05: the kernel `chan_*` band on `#97`.**
+> See **§9**, which is the operative section of this
 > file. §§1–7 are the record of how it was reached and remain accurate as history; §7's checklist is
 > answered item-by-item in §9. Do not re-run the design phase.
 
-**Last refresh** 2026-08-03.
+**Last refresh** 2026-08-05 — named, numbered, and every operator decision closed.
 
 ---
 
@@ -64,8 +65,10 @@ Extracted JSON:
 Source journal: the same session's `subagents/workflows/wf_33810d40-2b7/journal.jsonl`.
 
 ⚠ A second workflow (`agnos-socket-decide`) was launched on 2026-08-02 to run the missing phase and
-**failed in full** — all 8 agents errored on a weekly account limit before returning anything. The
-decision is therefore still outstanding, and nothing in §7 has been superseded.
+**failed in full** — all 8 agents errored on a weekly account limit before returning anything. ✅ That
+gap is closed: the decision landed by hand in **§9** on 2026-08-03, and its last two open questions —
+the syscall number and the name — were settled by the operator on **2026-08-05**. Nothing here is
+outstanding.
 
 ⭐ **The lesson worth keeping:** a workflow's return value is not its output. Phase results live in
 `journal.jsonl` and survive the run that produced them.
@@ -317,14 +320,31 @@ not restart the design phase to produce it.
 
 ---
 
-## 9. ⭐ THE DECISION — `anu` (नाडी, *conduit / channel / vessel*)
+## 9. ⭐ THE DECISION — the kernel CHANNEL band (`chan_*`)
 
-**Decided 2026-08-03.** One syscall **`#96 an_op`**, VFS tag **`VFS_ANU = 11`**, kernel band `an_*`.
+**Decided 2026-08-03; named and numbered 2026-08-05.** One syscall **`#97 chan_op`**, VFS tag
+**`VFS_CHAN = 11`**, kernel band `chan_*`, ops `CH_*`.
+
+> ⛔ **IT DOES NOT GET A CODENAME, AND THAT IS A RULE, NOT A PREFERENCE.** This section was written
+> around a Sanskrit name (`anu`), and §9.7 spent one of its six operator decisions on choosing it.
+> Operator ruling 2026-08-05: *"it doesn't need a special name, it's in the kernel — unless we're
+> splitting it out to its own repo."* **A name is a distribution fact.** It exists so a thing can be
+> found and depended on across a repo boundary; a band that only ever appears as a prefix inside one
+> kernel has no boundary to cross, so the name bought nothing and cost a naming ceremony, a blocking
+> operator decision, and an indirection every reader had to resolve. `chan_*` sits beside `pipe_*`,
+> `shm_*`, `sock_*` and `net_*` — the convention the kernel already has. If this is ever split into
+> its own repo, **that** is when it earns a name. Memory: [[feedback_naming_lanes]].
+
+> ⭐ **`#97`, not `#96` — settled 2026-08-05.** `roadmap.md:41` reserves `#96` for **`fork`** and
+> **fork keeps it** (operator call). The channel band takes **`#97`**. This is no longer contested and
+> must not be re-opened as a question.
 
 > The three §5 designs were re-synthesized against a phase that first adjudicated **64 allegations**
-> against the live kernel. The re-synthesized candidates scored **anu 28** (sov 8 / corr 7 / incr 7 /
-> gen 6) · **dvara 27** (8/7/6/6) · **sanketa 26** (8/6/6/6). anu is the winner's **object model with
-> its scope corrected** — all three of its own fatal flaws were resolved, not accepted.
+> against the live kernel. The re-synthesized candidates scored **28** (sov 8 / corr 7 / incr 7 /
+> gen 6) · **dvara 27** (8/7/6/6) · **sanketa 26** (8/6/6/6). The winner's **object model, with its
+> scope corrected** — all three of its own fatal flaws were resolved, not accepted — is what §9
+> describes. (The candidate names are kept in §5 as the historical record of the judging; none of
+> them survives into the kernel.)
 
 ### 9.1 The answer, in one sentence
 
@@ -338,7 +358,7 @@ sanketa put the queue in the shared region with userland cursors and lost on its
 process that can reach a channel can **forge occupancy, rewind a peer's consumption, and inject** — on
 the display channel, keystroke capture and injection, *"NO MITIGATION IN v1."*
 
-**anu's cursors live in kernel arrays.** Ring 3 cannot address a cursor, so the entire class is gone.
+**The channel band's cursors live in kernel arrays.** Ring 3 cannot address a cursor, so the entire class is gone.
 One **2 MB region reserved at boot**, carved into 32 × 4096 B pages, reachable from every syscall CR3
 through the kernel mirror. Pre-reserved rather than 32 `kmalloc`s for three reasons — creation cannot
 OOM; it sidesteps the 4096-byte slab ceiling; and **decisively, because channel pages are never
@@ -355,31 +375,31 @@ A VFS fd, tag 11, spending exactly the **three** payload words the 32-byte slot 
 `[0] endpoint · [1] channel epoch at claim · [2] cached mode`. **Every operation re-derives authority:**
 
 ```
-ktag(base) == VFS_ANU
-nd_end_open[e] == 1
-nd_ch_epoch[e >> 1] == payload[1]                       — fd-vs-channel staleness
-nd_end_owner[e]     == proc_current_get()
-nd_end_oepoch[e]    == proc_epoch_get(proc_current_get())  — pid-vs-PROCESS staleness
+ktag(base) == VFS_CHAN
+chan_end_open[e] == 1
+chan_epoch[e >> 1] == payload[1]                       — fd-vs-channel staleness
+chan_end_owner[e]     == proc_current_get()
+chan_end_oepoch[e]    == proc_epoch_get(proc_current_get())  — pid-vs-PROCESS staleness
 ```
 
 ⭐ **The consequence is the whole design.** agnos has **no CLOEXEC** and an unconditional whole-table
-fd copy at spawn — so instead of fighting that default, anu **inverts** it: an inherited copy is
+fd copy at spawn — so instead of fighting that default, the channel band **inverts** it: an inherited copy is
 **inert**, every op on it returns −1. A child's channel set is exactly *what was explicitly endowed*.
 **A sandbox is DESCRIBED (a list of endowments), not CARVED (a list of denials).** kavach's agnos
 backend needs no close-loop and no `landlock_abstract_unix` analogue, because there is no ambient reach
 to revoke.
 
-`nd_end_open` is kept separate from `nd_end_owner` because **pid 0 is a real process** (`hda.cyr:258`).
-**Peer-gone is derived, never stored**: `peer_alive = nd_end_open[e ^ 1]` — a stored flag can go stale.
+`chan_end_open` is kept separate from `chan_end_owner` because **pid 0 is a real process** (`hda.cyr:258`).
+**Peer-gone is derived, never stored**: `peer_alive = chan_end_open[e ^ 1]` — a stored flag can go stale.
 
 ### 9.4 The wakeup — **the batch IS the poll**
 
 No blocking in v1, and the reason is the **stack, not a policy**: each CPU has one shared SYSCALL kernel
 stack, so N blocked waiters need N disjoint kernel stacks. Both escape hatches are refused — the
 `preempt_disable; sti; hlt` spin is the poison that made TCP toxic, and a kernel-side tail-call into
-`#44`'s abandon-frame path is illegal because `an_*` arms run inside `ksyscall` with stale captures.
+`#44`'s abandon-frame path is illegal because `chan_*` arms run inside `ksyscall` with stale captures.
 
-⭐ **One `an_op` call carries an `ND_RECV` per held channel and returns the COUNT that produced data.**
+⭐ **One `chan_op` call carries an `CH_RECV` per held channel and returns the COUNT that produced data.**
 A six-client compositor polls six channels in **one syscall** and gets its data in the same call — no
 registration, no watch table, no re-arming, no ceiling of 8. `WOULD_BLOCK`/`PEER_GONE` are **per-record
 results**, never batch errors, so a poll batch never aborts on "nothing here". Two syscalls per idle
@@ -394,16 +414,16 @@ immediately three ways). This design must **not** be justified on that number.
 
 ### 9.5 Where it beats AF_UNIX — and what each win costs
 
-| AF_UNIX debt | anu | cost |
+| AF_UNIX debt | the channel band | cost |
 |---|---|---|
 | The namespace **outlives the process** — unlink-before-bind races a live instance | **No namespace.** Minted as a pair or placed at birth. agnos already reproduced the abstract-namespace authority bug *without* AF_UNIX: `tcp_listen` gates only on duplicate-bind, so whoever binds 7700 first owns the display protocol **and every keystroke on it** | A process nobody spawned cannot find a service in v1 |
-| `SOCK_STREAM` has **no message boundaries**; SEQPACKET existed for decades and practice ignored it | Framing is a **property of the channel**, fixed at mint, reported by `ND_STAT` — not a flag anyone can forget. Centralises a discipline this ecosystem rebuilt **four times** | Two contracts in one object; guess wrong and framing is silently wrong |
-| **`SCM_RIGHTS` is a bolted-on ancillary-data parser** — a recurring CVE surface | Nothing passes *inside* a message. **`ND_GRANT(h, shm_id, mode)`** binds an shm slot to a channel. Closes a hole open **today**: any of 16 procs can read, write or **free** any other's pixel or PCM buffer | Bulk consumers learn a `{region, offset, length}` idiom |
+| `SOCK_STREAM` has **no message boundaries**; SEQPACKET existed for decades and practice ignored it | Framing is a **property of the channel**, fixed at mint, reported by `CH_STAT` — not a flag anyone can forget. Centralises a discipline this ecosystem rebuilt **four times** | Two contracts in one object; guess wrong and framing is silently wrong |
+| **`SCM_RIGHTS` is a bolted-on ancillary-data parser** — a recurring CVE surface | Nothing passes *inside* a message. **`CH_GRANT(h, shm_id, mode)`** binds an shm slot to a channel. Closes a hole open **today**: any of 16 procs can read, write or **free** any other's pixel or PCM buffer | Bulk consumers learn a `{region, offset, length}` idiom |
 | **`SO_PEERCRED` is a query you can forget**, and its pid is racy | Peer identity is a kernel fact re-derived **every operation**, carrying a **generation**. Two of its three fields don't exist here (`getuid` is literally `return 0`) | `proc_epoch[16]` is genuinely new state on the process-creation path |
 | **CLOEXEC is opt-in and forgettable** | Inverted — see §9.3 | Endowment is an explicit act; the hook sits on every process's birth path |
 | **Peer death is an errno on your next write** | A queryable, non-destructive liveness bit that **works for a non-child** — which agnos cannot do today at all | Learned up to one 10 ms rotation late |
 | **Readiness is a separate mechanism from receive** | The batch is the poll (§9.4) | 64 B copy-in per channel per rotation |
-| **Local and remote are different APIs** — the cardinal sin per AF_UNIX's own designers | Every record carries a `node` word (MUST be 0); `ND_DIAL` reserved, caps bit clear. Uses the shipped `MDO_OP_SUPPORTED` negotiation that grew `#93` across a whole arc under one number with no ABI break | ⚠ **Honest**: anu is *not* location-transparent and the kernel will never dial. The name promises an **identity model** that spans local and relayed channels, not one syscall |
+| **Local and remote are different APIs** — the cardinal sin per AF_UNIX's own designers | Every record carries a `node` word (MUST be 0); `CH_DIAL` reserved, caps bit clear. Uses the shipped `MDO_OP_SUPPORTED` negotiation that grew `#93` across a whole arc under one number with no ABI break | ⚠ **Honest**: the band is *not* location-transparent and the kernel will never dial. `CH_DIAL` reserves the *shape* of a relayed channel; it does not promise one |
 
 **Refused outright**, each with a why-it's-safe-here: the whole `AF_*`/`SOCK_*` matrix · `sockaddr_un`
 and its 108-byte truncation · `bind`/`listen`/`connect`/`accept` · the Linux abstract `@`-namespace ·
@@ -414,7 +434,7 @@ arrays at 1.56.4, and seven numbers would contradict a decision made two arcs ag
 
 ### 9.6 The migration — twelve bites, no flag day
 
-⛔ **anu REPLACES TCP. It is not a second transport.** TCP on loopback is the rejected primitive —
+⛔ **THE CHANNEL BAND REPLACES TCP. It is not a second transport.** TCP on loopback is the rejected primitive —
 it is not kept as a fallback, a compile-time option, a runtime switch, or a rollback path. Any plan
 that preserves it has not done the job.
 
@@ -430,14 +450,14 @@ is to delete that path.** Rejected 2026-08-03.
 
 | # | Repo | What | Desktop runs? |
 |---|---|---|---|
-| **0** | agnos | ⛔ **Delete the bare `arch_wait()` at `syscall.cyr:6695`** — a `hlt` with **no `sti`** inside an IF=0 handler. **An `epoll_wait` on an unexpired timerfd hangs the box today.** design-A claimed no consumer could reach it; that was false | ✅ removes a way to freeze the machine |
+| **0** | agnos | ⛔ **Delete the bare `arch_wait()` at `syscall.cyr:7098`** (it was 6695 when this table was written) — a `hlt` with **no `sti`** inside an IF=0 handler. **An `epoll_wait` on an unexpired timerfd hangs the box today.** design-A claimed no consumer could reach it; that was false | ✅ removes a way to freeze the machine |
 | **1** | agnos | shm **owner + epoch**, released at **both** death sites; gate `shm_free #74` on owner (unauthenticated today). ⛔ **`shm_write`/`shm_read` get a WARN COUNTER ONLY** | ✅ nothing is refused |
 | **2** | agnos | `proc_epoch[16]`, written and **never read** | ✅ |
-| **3** | new `anu` lib | The **Linux semantic proof** over `socketpair(SOCK_SEQPACKET)`. Zero kernel lines, zero QEMU | ✅ agnos untouched |
-| **4** | agnos | The band + `#96`, **kernel selftest only, no consumer** | ✅ nothing calls it |
+| **3** | host-side proof harness | The **Linux semantic proof** over `socketpair(SOCK_SEQPACKET)`. Zero kernel lines, zero QEMU. ⛔ **Do not mint a repo for this** — it is a proof, and a repo is what would earn it a name | ✅ agnos untouched |
+| **4** | agnos | The band + `#97`, **kernel selftest only, no consumer** | ✅ nothing calls it |
 | **5** | agnos | ⚠ **Highest-risk bite** — endow **with placement** inside `proc_create_user`. Must abort if the child's table is the global one, because `vfs_fd_inherit` **returns success on kmalloc failure** | ✅ no-op path proven across a full boot first |
-| **6** | setu 0.8.0 | ⭐ **anu REPLACES the agnos control transport.** The agnos arm of `src/client.cyr` speaks anu; the TCP arm is **deleted**, not gated. (Linux keeps its own transport because Linux is a different target — that is not a fallback.) | ✅ — nothing on agnos has spawned a client yet at this bite |
-| **7** | aethersafha | The compositor mints, labels and endows a channel per client and spawns them placed. `setu_srv_listen` and the accept block are **removed**, not bypassed | ✅ on anu |
+| **6** | setu 0.8.0 | ⭐ **THE CHANNEL BAND REPLACES the agnos control transport.** The agnos arm of `src/client.cyr` speaks `chan_op`; the TCP arm is **deleted**, not gated. (Linux keeps its own transport because Linux is a different target — that is not a fallback.) | ✅ — nothing on agnos has spawned a client yet at this bite |
+| **7** | aethersafha | The compositor mints, labels and endows a channel per client and spawns them placed. `setu_srv_listen` and the accept block are **removed**, not bypassed | ✅ on the channel band |
 | **8** | agnos | Retire the loopback carve-outs the display protocol forced into the network stack — the `net_ip == 0` case, and the 7700/7701 well-known ports | ✅ nothing dials them |
 | **9** | puka + agnoshi | ⭐ **The PTY** — a live agnsh prompt in a composited window. The gate no candidate could pass | ✅ |
 | **10** | agnos | `pipe_write`'s ~3-line producer refusal — it silently overwrites unread bytes today | ✅ |
@@ -448,20 +468,23 @@ taxonomy forbids — the prerequisites already landed at 1.47.x, so it is **work
 
 ### 9.7 What only the operator can decide
 
-1. ⛔ **`#96` IS CONTESTED.** `roadmap.md:41` reserves it for **`fork`** (agora's blocker). fork is
-   unslotted and gated behind `waitpid` wait-any, so anu likely lands first — **but whoever lands
-   takes it and the other takes #97. Neither should mint until you say.**
-2. **The name.** `anu` over `dvara` (used by two candidates for two *different* objects — a collision
-   this file already flagged) and `sanketa` (both connote a rendezvous this design refuses).
-3. **Sequencing against K1.** Bites 0, 1, 2, 10 are independent of the `-smp 4` fault and can land
-   alongside it. **Bites 4–9 should follow K1** — bite 7's `-smp 4` half cannot be proven while `-smp 4`
-   is broken.
+1. ✅ **SETTLED 2026-08-05 — the syscall number is `#97`.** `roadmap.md:41` reserves `#96` for **`fork`**
+   (agora's blocker) and **fork keeps it**. The channel band takes **`#97`**. ⛔ Not contested any more;
+   do not re-open it, and do not re-derive "whoever lands first takes it" — the operator assigned both.
+2. ✅ **SETTLED 2026-08-05 — there is no name.** The band is `chan_*`, in the kernel's own convention
+   (`pipe_*`, `shm_*`, `sock_*`, `net_*`). The candidate names (`anu`, `dvara`, `sanketa`) stay in §5 as
+   the record of the judging and appear nowhere in the kernel. **A codename is a distribution fact and
+   this does not cross a repo boundary** — see the ruling at the top of §9 and [[feedback_naming_lanes]].
+3. ✅ **SETTLED — sequencing against K1 is moot: K1 is DONE** (2026-08-03, `EFER.NXE` on the APs,
+   `smp.cyr:514`; `-smp 4` reaches connected 2 / presented 2, and the desktop hosted two real client
+   windows on iron at 4 CPUs). Every bite is now sequencable on its own merits. **Bites 0/1/2 are the
+   unblocked prefix** and land in **1.56.40** ahead of the band itself.
 4. **Whether the PTY rides this.** Recommended yes: it is the **only** named consumer with no setu
    lineage, so it is the only thing that can falsify "is this setu-shaped" (§7 item 3).
-5. **How much kernel growth in one cut.** Recommendation: **cut `ND_ENUM` from v1** — it is the one op
+5. **How much kernel growth in one cut.** Recommendation: **cut `CH_ENUM` from v1** — it is the one op
    with no today-consumer, which fails the roadmap's own growth rule.
 6. **When shm ENFORCE ships.** Warn-only in bite 1. The flip to refusal can land **once every client is
-   placed on a anu channel** (after bite 7), because only then does every shm toucher have a channel
+   placed on a channel** (after bite 7), because only then does every shm toucher have a channel
    to hang a grant on. It is a separate, deliberate decision — not a bite's side effect.
 
 ### 9.8 Honest costs — knowingly accepted
@@ -472,13 +495,13 @@ taxonomy forbids — the prerequisites already landed at 1.47.x, so it is **work
   and no sequencing makes that risk zero.
 - **v1 serves ONE topology: server-spawns-client.** The desktop therefore *cannot* falsify the
   generality claim, because server-spawns-client is exactly what aethersafha does.
-- **jalwa regresses under anu alone** — it dials mishran, and nobody can endow it an audio channel to
+- **jalwa regresses under the channel band alone** — it dials mishran, and nobody can endow it an audio channel to
   a mixer that did not spawn it.
-- **The AI band is NOT served in v1** — bote and majra are bind+accept servers; they are `ND_HANDOFF`
+- **The AI band is NOT served in v1** — bote and majra are bind+accept servers; they are `CH_HANDOFF`
   consumers. The architecture serves them; this cut does not.
 - **The grant budget is counted, not solved** — grants ride the same 16-slot table where every slot
   costs an unconditional 2 MB.
-- **A third WOULD_BLOCK convention.** agnos already carries two; anu adds `-2`/`-3`. Less uniform, not
+- **A third WOULD_BLOCK convention.** agnos already carries two; the band adds `-2`/`-3`. Less uniform, not
   more. A better project would unify all three.
 - **A new spinlock in a kernel mid-SMP-bringup**, while the desktop's blocker *is* an `-smp 4` fault.
 - ⛔ **NOTHING HERE HAS BEEN BUILT OR BOOTED.** Every claim is read-only static analysis at agnos
@@ -498,9 +521,9 @@ taxonomy forbids — the prerequisites already landed at 1.47.x, so it is **work
   **A test that only exercises `run` proves nothing about lifetime.**
 - If the placement hook destabilises spawn in any measurable way, placement moves out of the birth path
   — and then a child cannot be born holding a channel, **which voids the PTY answer**.
-- **setu 0.8.0 requires a `#96` kernel and says so** — a hard floor, exactly as 0.7.3 already declares
-  `agnos >= 1.56.34`. If a client silently *appears* to work on a pre-`#96` kernel instead of refusing
-  at startup, `ND_CAPS` is not doing its job.
+- **setu 0.8.0 requires a `#97` kernel and says so** — a hard floor, exactly as 0.7.3 already declares
+  `agnos >= 1.56.34`. If a client silently *appears* to work on a pre-`#97` kernel instead of refusing
+  at startup, `CH_CAPS` is not doing its job.
 
 ## 10. ⛔ The revert inventory — what TCP-on-loopback put into this system
 

@@ -30,8 +30,9 @@ fn elf_load(elf_addr, elf_size) {
 
     # Read entry point (e_entry at offset 24)
     var entry = load64(elf_addr + 24);
-    # Security: entry must be in userspace, not kernel memory
-    if (entry < 0x200000) { return 0 - 1; }
+    # Security: entry must be in userspace, not kernel memory. 1.56.39: the floor is 0x400000
+    # (PD[2]), not 0x200000 — see the PT_LOAD floor below for why PD[1] is not userspace.
+    if (entry < 0x400000) { return 0 - 1; }
 
     # Read program header offset (e_phoff at offset 32)
     var phoff = load64(elf_addr + 32);
@@ -64,7 +65,7 @@ fn elf_load(elf_addr, elf_size) {
             if (v_offset + v_filesz > elf_size) { return 0 - 1; }
             if (v_memsz < v_filesz) { return 0 - 1; }
             if (v_vaddr + v_memsz < v_vaddr) { return 0 - 1; }
-            if (v_vaddr < 0x200000) { return 0 - 1; }
+            if (v_vaddr < 0x400000) { return 0 - 1; }         # 1.56.39: PD[1] is not userspace
             if (v_memsz > 0x2000000) { return 0 - 1; }
             if (v_vaddr + v_memsz > 0x10000000) { return 0 - 1; }
         }
@@ -94,7 +95,7 @@ fn elf_load(elf_addr, elf_size) {
             if (p_memsz < p_filesz) { return 0 - 1; }
             if (p_vaddr + p_memsz < p_vaddr) { return 0 - 1; }
             # Security: segment must be in userspace
-            if (p_vaddr < 0x200000) { return 0 - 1; }
+            if (p_vaddr < 0x400000) { return 0 - 1; }         # 1.56.39: PD[1] is not userspace
             # Security: cap segment size to prevent exhausting physical memory
             if (p_memsz > 0x2000000) { return 0 - 1; }
             # 1.41.5: keep the segment below the mmap arena base (0x10000000) so a
@@ -225,7 +226,7 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     if (load8(hdr + 3) != 0x46) { return 0 - 1; }
     if (load8(hdr + 4) != 2) { return 0 - 1; }
     var entry = load64(hdr + 24);
-    if (entry < 0x200000) { return 0 - 1; }
+    if (entry < 0x400000) { return 0 - 1; }               # 1.56.39: PD[1] is not userspace
     var phoff = load64(hdr + 32);
     var phentsize = load16(hdr + 54);
     var phnum = load16(hdr + 56);
@@ -250,7 +251,15 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
             if (v_offset + v_filesz > fsize) { return 0 - 1; }
             if (v_memsz < v_filesz) { return 0 - 1; }
             if (v_vaddr + v_memsz < v_vaddr) { return 0 - 1; }
-            if (v_vaddr < 0x200000) { return 0 - 1; }
+            # ⛔ 1.56.39: the floor is 0x400000 (PD[2]), raised from 0x200000 (PD[1]).
+            # PD[1] covers 2-4 MB and holds the boot TSS RSP0 seeds (gdt.cyr:45-48), so a
+            # crafted on-disk p_vaddr in that range could have proc_map_page'd a USER page
+            # over the stack pointer the CPU loads on the next ring-3 -> ring-0 transition.
+            # It costs nothing to close: every binary in the tree already bases its first
+            # PT_LOAD at 0x400000 with e_entry 0x4000b0 — measured across all 44 staged
+            # binaries at 1.56.39, zero exceptions. Retires the class rather than the instance.
+            # The same floor is applied at all four sites (both loaders' entry + PT_LOAD checks).
+            if (v_vaddr < 0x400000) { return 0 - 1; }
             if (v_memsz > 0x2000000) { return 0 - 1; }
             if (v_vaddr + v_memsz > 0x10000000) { return 0 - 1; }
         }
@@ -274,7 +283,7 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
             if (p_offset + p_filesz > fsize) { return 0 - 1; }
             if (p_memsz < p_filesz) { return 0 - 1; }
             if (p_vaddr + p_memsz < p_vaddr) { return 0 - 1; }
-            if (p_vaddr < 0x200000) { return 0 - 1; }
+            if (p_vaddr < 0x400000) { return 0 - 1; }         # 1.56.39: PD[1] is not userspace
             if (p_memsz > 0x2000000) { return 0 - 1; }
             # 1.41.5: keep the segment below the mmap arena base (0x10000000) — a
             # crafted on-disk p_vaddr must not alias the process's mmap arena.

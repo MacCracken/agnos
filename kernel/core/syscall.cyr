@@ -204,6 +204,57 @@ fn exec_redirect_restore() {
     redir_pending_set(0);
     return 0;
 }
+
+# 1.56.39 — the spawn_path#43 arm of the SAME one-shot redirect #62 arms. Until now #43 never
+# consumed it: only #37 did (exec_redirect_apply above), so a BACKGROUND child's stdout could not
+# be pointed anywhere and every concurrent proc wrote to the console at once. That is not cosmetic
+# — three interleaved desktop procs already corrupted a verdict on 2026-08-02, landing
+# `a11y nodes synced:run: exit 142` mid-line and costing the boot that carried the evidence.
+#
+# APPLY-ONLY, deliberately: #37 needs the save/restore pair because it is run-to-completion — the
+# parent is suspended, the child runs on the parent's own table entry, and the entry has to go
+# back. #43 is the opposite shape. The child is created holding its OWN private fd table (
+# vfs_fd_inherit, from proc_create_user), the parent stays live and never blocks, and there is no
+# later moment at which "restore" would mean anything. The swap is written into the child's copy,
+# is private to that child for its whole life, and dies with the table at reap. No backup slot is
+# taken, so this cannot collide with a #37 redirect armed on another CPU.
+#
+# ⛔ REFUSES when the target's table IS the global `vfs_table`. Writing the redirect there would
+# repoint fd 1 for proc 0, every kthread and every later global-table user, permanently, with
+# nothing anywhere to restore it. A skipped redirect is an interleaved console line; a corrupted
+# global table is the box. Refuse, say so, and move on.
+#
+# ⛔ THE TEST IS THE RESOLVED TABLE, NOT `proc_fd_base_get(pid) == 0`. Two DIFFERENT states mean
+# "this proc uses the global table" and only one of them is a zero base:
+#   - `proc_fd_base[pid] == 0` — the implicit fallback, which is what vfs_fd_inherit leaves behind
+#     when its kmalloc fails (it returns 0 on success AND on that failure, so no caller can tell);
+#   - `proc_fd_base[pid] == &vfs_table` — set EXPLICITLY for proc 0 at `vfs.cyr:264`
+#     (*"proc 0 (kmain/kybernet) owns the static global table"*).
+# A `== 0` guard passes the second one straight through and writes the global table. That is not
+# hypothetical: it is what the first build of this function did, and the boot selftest caught it on
+# proc 0 (`spawnredir: FAIL global not refused`). `vfs_fd_table_of` folds both states into one
+# answer, which is why the comparison belongs on its result — the same shape `proc_destroy_fd_table`
+# already uses at `vfs.cyr:234-235`.
+#
+# Clears the one-shot on BOTH paths — a refusal that left it armed would silently apply to the
+# next spawn instead, which is the wrong child.
+fn spawn_redirect_apply(pid) {
+    if (redir_pending_get() == 0) { return 0; }
+    redir_pending_set(0);
+    var stbl = vfs_fd_table_of(pid);
+    if (stbl == &vfs_table) {
+        kprintln("spawn: child is on the global fd table -- redirect skipped", 58);
+        return 0 - 1;
+    }
+    var ssrc = stbl + redir_src_fd_get() * 32;
+    var sdst = stbl + redir_dst_fd_get() * 32;
+    var sk = 0;
+    while (sk < 32) {
+        store64(ssrc + sk, load64(sdst + sk));
+        sk = sk + 8;
+    }
+    return 0;
+}
 var pcpu_spawn_env_buf[512];   # 1.46.x STEP-2 (#3): PER-CPU spawn_path(#43) env staging. 128 u64 (1024 B) per CPU × 4; cpu c at byte c*1024.
 fn spawn_env_buf_base() { return &pcpu_spawn_env_buf + pcpu_cpu() * 1024; }
 # 1.44.20: blit#39 scaled-row staging — ONE expanded src row (w*scale px, 32bpp). [4096] =
@@ -7415,12 +7466,22 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 62) {
         # exec_redirect(src_fd=arg1, dst_fd=arg2) — arm a ONE-SHOT fd redirect for the
-        # NEXT execwait#37: the child's writes to src_fd (e.g. 1=stdout) route to dst_fd's
+        # NEXT exec: the child's writes to src_fd (e.g. 1=stdout) route to dst_fd's
         # backend (output capture). dst_fd should be an open writable file/pipe the caller
-        # then reads back after #37 returns. Both fds in [0,32). Cleared after the next #37
-        # (or re-armed by a later call). Returns 0, or -1 on a bad fd. AGNOS-native (a
-        # one-shot exec-time dup, not a persistent dup2 — the global fd table makes the
-        # run-to-completion swap clean without a per-proc fd layer). See the redir_* helpers.
+        # then reads back. Both fds in [0,32). Returns 0, or -1 on a bad fd. AGNOS-native
+        # (a one-shot exec-time dup, not a persistent dup2). See the redir_* helpers.
+        #
+        # 1.56.39: "the next exec" now means execwait#37 OR spawn_path#43, whichever the
+        # caller reaches first — #43 ignored the arm entirely before, so a background job's
+        # output could not be captured and every concurrent proc shared the console. The two
+        # consume it differently and the difference is structural, not incidental:
+        #   #37 — apply + RESTORE around a run-to-completion child (exec_redirect_apply /
+        #         exec_redirect_restore), because the parent is suspended and the entry must
+        #         go back afterwards.
+        #   #43 — apply ONLY, into the child's own private fd table (spawn_redirect_apply),
+        #         because the parent stays live and there is no "afterwards" to restore at.
+        # Either consumer clears the one-shot, including on its own refusal/failure paths, so
+        # an arm never survives into a later exec it was not meant for.
         if (arg1 < 0) { return 0 - 1; }
         if (arg1 >= 32) { return 0 - 1; }
         if (arg2 < 0) { return 0 - 1; }
@@ -8097,6 +8158,11 @@ fn ksyscall(num, arg1, arg2, arg3) {
             # SCHEDULER restores this proc, so it MUST carry CS=0x23/SS=0x1B or the iretq
             # lands a user RIP under ring-0 CS=0x08 → fault.
             proc_set_ring3(sp_pid);
+            # 1.56.39: consume an armed #62 redirect into the CHILD's private fd table. MUST sit
+            # before proc_set_state below — once the proc is READY an AP may pick it up and run it,
+            # and a redirect applied after the child's first write has already lost the line it
+            # existed to capture. See spawn_redirect_apply: apply-only, refuses the global table.
+            spawn_redirect_apply(sp_pid);
             # 1.46.x #2: elf_load_from_file returns the proc at state=3 (NOT schedulable). It is now
             # fully wired (per-proc CR3 + ring-3 selectors), so flip it READY — under smp_sched_aps=1
             # this is the FIRST moment a woken AP may legitimately pick it. Ordered AFTER proc_set_ring3
@@ -8104,6 +8170,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
             pd_audit(proc_get_cr3(sp_pid), 2);      # tag 2 = spawn_path, just before READY
             proc_set_state(sp_pid, 1);
         }
+        # 1.56.39: the load FAILED, so there is no child to redirect — but the arm is one-shot and
+        # would otherwise survive to the next exec and repoint a fd for a proc nobody armed it for.
+        # The caller armed it for THIS spawn; the spawn is over either way.
+        if (sp_pid < 0) { redir_pending_set(0); }
         stack_canary_check(canary);
         return sp_pid;
     }

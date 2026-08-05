@@ -333,15 +333,27 @@ fn pmm_setup_directmap(top_phys) {
 }
 
 # 1.49.9 (RAM-arc bite 3b): return a kernel VA the CURRENT CR3 can read/write to reach physical page
-# `phys` (ELF segment copy, page zeroing, argv staging). <=256 MB: the identity map (per-proc PD[8..127]),
-# ensured on demand. >256 MB: the direct-map (DIRECTMAP_BASE + phys) — at >256 MB the identity slot
-# PD[128..510] is the user's own mmap arena (zeroed per-proc), so identity is unusable there, but EVERY
-# CR3 inherits the direct-map PDPT[8+] (proc.cyr mirrors kernel PDPT[1..511]). Pairs with proc_map_page,
-# which stores the raw `phys` in the USER PTE; this is only the kernel's private access handle.
+# `phys` (ELF segment copy, page zeroing, argv staging). Pairs with proc_map_page, which stores the raw
+# `phys` in the USER PTE; this is only the kernel's private access handle.
+#
+# 1.56.39: ALWAYS the direct-map alias, for every phys. It used to split at 256 MB — identity below,
+# direct-map above — and that split was the hazard, not the fix. The direct map covers ALL RAM
+# (pmm_setup_directmap's loop starts at phys 0) and EVERY CR3 inherits it, because proc.cyr mirrors
+# kernel PDPT[1..511]; the low identity map does not survive per-proc. PD[0..7] (phys < 16 MB) is
+# where a per-proc CR3 puts the USER IMAGE, and PD[128..510] above 256 MB is the user's own mmap
+# arena — so an identity VA handed back here is a VA that means something else entirely under the
+# CR3 the caller is running on. hda.cyr already had to write `DIRECTMAP_BASE + pcm` by hand, with a
+# nine-line comment, precisely to route around this function's low answer (hda.cyr:1594-1602).
+#
+# ⛔ ORDERING: the direct map is installed by pmm_setup_directmap at main.cyr:232. Every call site
+# (elf.cyr:123/304/348, proc.cyr:1664/1676, syscall.cyr:823, hda.cyr:1579) runs far later — the
+# earliest is hda_probe at main.cyr:661. Do not add a caller ahead of line 232.
+#
+# The dropped `vmm_map(phys, phys, 0x83)` was a SIDE EFFECT, not a result: every caller uses only the
+# returned handle, and none re-derives an identity VA from `phys` afterwards. Verified call site by
+# call site at 1.56.39.
 fn pmm_kva_for_access(phys) {
-    if (phys >= 0x10000000) { return DIRECTMAP_BASE + phys; }
-    if (vmm_is_mapped(phys) == 0) { vmm_map(phys, phys, 0x83); }
-    return phys;
+    return DIRECTMAP_BASE + phys;
 }
 
 fn vmm_unmap(virt) {

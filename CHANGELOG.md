@@ -19,7 +19,106 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ---
 
-## [1.56.38] — 2026-08-04 — the latch closes its own loop, and the console boots native (cycle OPEN)
+## [1.56.39] — 2026-08-05 — three kernel items the desktop has been owed (cycle OPEN)
+
+Scope: the 1.56.35 cut named eight things the sovereign desktop needs from the kernel and closed with
+the SMP fault (K1) and the `net_src_for` documentation (K6). Three of the remainder are small,
+self-contained and independent of the local-IPC band that lands at 1.56.40. They are those three.
+`build/agnos` **1,952,640 B**.
+
+### Added — `spawn_path #43` consumes an armed `exec_redirect #62`
+
+New `spawn_redirect_apply(pid)` (`kernel/core/syscall.cyr`), called from the `#43` handler between
+`proc_set_ring3` and `proc_set_state(pid, 1)`. Before this, only `execwait #37` consumed the one-shot
+redirect, so a **background** child's `stdout` could not be pointed anywhere and every concurrent proc
+wrote to the console at once. Measured cost of that on 2026-08-02: three interleaved desktop procs
+produced `a11y nodes synced:run: exit 142` mid-line, and the klug dump was skipped on the boot that
+carried the evidence.
+
+**Apply-only, and the asymmetry with `#37` is structural.** `#37` is run-to-completion — the parent is
+suspended, the child runs on the parent's own `vfs_table` entry, and `exec_redirect_restore` has to put
+it back. `#43` returns immediately with the parent still live, and the child was created holding its
+**own private fd table** (`vfs_fd_inherit`, from `proc_create_user`), so the swap goes into that copy,
+is private to that child for its whole life, and dies with the table at reap. No backup slot is taken,
+so a `#43` redirect cannot collide with a `#37` redirect armed on another CPU.
+
+⛔ **Refuses when the child has no private table.** `proc_fd_base[pid] == 0` means the child fell back to
+the global `vfs_table`, which is what happens when `vfs_fd_inherit`'s `kmalloc` fails — and
+`vfs_fd_inherit` returns 0 on success *and* on that failure, so no caller can distinguish them. Writing
+the redirect there would repoint fd 1 for proc 0, every kthread and every later global-table user,
+permanently, with nothing to restore it. The refusal prints
+`spawn: no private fd table for the child -- redirect skipped`.
+
+The one-shot is cleared on **every** exit path — applied, refused, and on a failed load (`sp_pid < 0`) —
+so an arm can never survive into a later exec it was not meant for.
+
+⛔ **The refusal tests the RESOLVED table, not `proc_fd_base_get(pid) == 0`.** Two different states mean
+"this proc uses the global table" and only one of them is a zero base: the implicit fallback
+(`proc_fd_base[pid] == 0`, what a failed `vfs_fd_inherit` leaves), and an **explicit**
+`proc_fd_base_set(0, &vfs_table)` for proc 0 at `vfs.cyr:264`. A `== 0` guard passes the second one
+through and writes the global table. That is not hypothetical — it is what the first build of this
+function did, and the boot selftest below caught it on proc 0. The test is now
+`vfs_fd_table_of(pid) == &vfs_table`, the same shape `proc_destroy_fd_table` uses at `vfs.cyr:234-235`.
+
+### Added — `spawn_redirect_apply` boot selftest, under the existing `EXEC_REDIRECT_SELFTEST` gate
+
+Nothing in the tree arms `#62` before a `#43` yet, so the apply path had no caller and would have
+shipped with only its no-arm early return ever executed. `spawn_redirect_selftest()`
+(`kernel/core/main.cyr`) drives both halves directly and asserts the invariant the refusal exists to
+protect — that a redirect never reaches the global table:
+
+- **negative control** — a redirect aimed at proc 0 must return −1, must leave the one-shot cleared
+  rather than armed, and the global `vfs_table` entry must be byte-identical afterwards;
+- **positive** — `vfs_fd_inherit(15, 0)` (the same call `proc_create_user` makes) gives a pid its own
+  table; after apply, that copy's entry 20 equals its own entry `dst`, **and** the global is still
+  byte-identical.
+
+`scripts/smoke/exec-redirect-smoke.sh` gains both assertions: **4 passed, 0 failed**.
+
+### Changed — the ELF loader's user-image floor is `0x400000`, not `0x200000`
+
+`kernel/core/elf.cyr`, at **all four** sites: `e_entry` and the `PT_LOAD` `p_vaddr` check in **both**
+`elf_load` (the in-memory `#3` path) and `elf_load_from_file` (the `#37` / `#43` path). The roadmap item
+named only the two in `elf_load_from_file`; the in-memory path carried the byte-identical hazard.
+
+PD[1] covers 2–4 MB and holds the boot TSS RSP0 seeds (`gdt.cyr:45-48`), so a crafted on-disk `p_vaddr`
+in that range could have mapped a **user** page over the stack pointer the CPU loads on the next
+ring-3 → ring-0 transition.
+
+Measured before changing it: **all 44 staged binaries** in `build/rootfs/bin/` base their first `PT_LOAD`
+at `0x400000` with `e_entry` `0x4000b0`, zero exceptions. The floor costs nothing and retires the class.
+
+### Changed — `pmm_kva_for_access` returns the direct-map alias for every physical address
+
+`kernel/core/vmm.cyr`. It used to split at 256 MB — identity below, `DIRECTMAP_BASE + phys` above — and
+the split was the hazard rather than the fix. The direct map covers **all** RAM (`pmm_setup_directmap`'s
+loop starts at phys 0) and every CR3 inherits it, because `proc.cyr` mirrors kernel PDPT[1..511]. The low
+identity map does not survive per-proc: PD[0..7] (phys < 16 MB) is where a per-proc CR3 puts the **user
+image**, and PD[128..510] above 256 MB is the user's own mmap arena. An identity VA handed back from here
+is therefore a VA that means something else under the CR3 the caller is running on.
+
+`hda.cyr:1594-1602` already wrote `DIRECTMAP_BASE + pcm` by hand, with a nine-line comment, to route
+around this function's low answer. That carve-out is now what the function does.
+
+The dropped `vmm_map(phys, phys, 0x83)` was a **side effect, not a result** — every call site
+(`elf.cyr:123/304/348`, `proc.cyr:1664/1676`, `syscall.cyr:823`, `hda.cyr:1579`) uses only the returned
+handle and none re-derives an identity VA from `phys` afterwards; verified site by site.
+
+⛔ **Ordering constraint, now load-bearing:** the direct map is installed at `main.cyr:232`. The earliest
+call site is `hda_probe` at `main.cyr:661`. Do not add a caller ahead of line 232.
+
+### Changed — syscalls `#96` and `#97` are reserved, and the local-IPC band has no codename
+
+`docs/development/roadmap.md`: **`#96` = `fork`**, **`#97` = `chan_op`** (operator assignment, 2026-08-05).
+The next free number is `#98`. Neither `#96` nor `#97` is minted yet; neither is available to anything
+else.
+
+`docs/development/planning/ipc.md` §9: the local-IPC design ships as the kernel band **`chan_*`** on
+`#97`, VFS tag `VFS_CHAN = 11`, ops `CH_*` — in the convention `pipe_*`, `shm_*`, `sock_*` and `net_*`
+already use. The design's working codename is dropped; the candidate names stay in §5 as the record of
+the judging and appear nowhere in the kernel. Both of §9.7's remaining operator questions are closed.
+
+## [1.56.38] — 2026-08-04 — the latch closes its own loop, and the console boots native (RELEASED)
 
 Scope: the two things the display arc left behind. **(1)** The modeset latch never auto-disarms after a
 successful modeset, so every boot in the 1.56.36/37 arc opened with `previous attempt did not disarm --
