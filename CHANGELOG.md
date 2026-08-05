@@ -107,6 +107,49 @@ handle and none re-derives an identity VA from `phys` afterwards; verified site 
 ⛔ **Ordering constraint, now load-bearing:** the direct map is installed at `main.cyr:232`. The earliest
 call site is `hda_probe` at `main.cyr:661`. Do not add a caller ahead of line 232.
 
+### Fixed — the desktop harness reported on launch paths it never ran
+
+`scripts/harness/aethersafha-clients-test.py`. One mode runs per boot, so one of `fg_code`/`bg_code`
+is `None` on almost every run purely because that arm was never launched — and the verdict block
+tested the codes alone. Measured against this kernel at `AE_CLIENTS_SMP=4`, while **both** arms
+independently reached exit 95:
+
+| mode | printed | reality |
+|---|---|---|
+| `bg` | "Backgrounded (`&`) works; **FOREGROUND does not**" + "⇒ agnsh's blocking execwait #37 frame prevents the spawned clients being scheduled" | foreground was never launched; the cause was invented |
+| `fg` | "Both clients present on **BOTH** launch paths" | one path ran |
+
+A false red and a false green out of the same block. It now records `ran_fg` / `ran_bg` **at the
+launch sites** rather than re-deriving them from `MODE` at verdict time, prints
+`— (not run in this mode)` for an unrun arm, reports each arm that ran on its own, and gates the
+cross-path comparison on both having run. `None` now means exactly one thing — **ran and produced no
+exit code** — which is a failure.
+
+### Added — `desktop` mode gates on the framebuffer, not on the compositor's own claim
+
+The harness printed framebuffer colour counts and advised *"judge this on the FRAMEBUFFER counts"*
+while `rc` rested entirely on the serial line the compositor prints about itself — a shared-premise
+oracle, since the program making the claim is the program under test. `desktop` mode now fails unless
+the panel carries client pixels, and fails outright when no screendump was produced (`None` evidence
+is not zero evidence).
+
+⛔ **The gate excludes dim-green deliberately.** Measured with both clients presented: dim-green
+**952,731 px** of a 2048x2048 capture — 22.7% of the screen, which a client's 1-px border cannot be,
+so that count is dominated by compositor chrome in the same dark range. Gating on it would pass a
+desktop **hosting nothing**. The gate is present_probe's own bars + bright border: **signal 3,500 px
+· console null 0 px** (measured twice), floor **200**, overridable via `AE_CLIENTS_FBMIN`.
+**Negative control:** forcing the floor above the signal makes the harness **exit 1** — the gate is
+wired to the exit code, not printed beside it.
+
+⚠ Two gaps stated rather than hidden: bright-green reads **0 even on a passing run**, so the red bar
+carries the gate alone; and dim-green was excluded by reasoning from the pixel count, **not** from a
+measured hosting-nothing control.
+
+⛔ **Also fixed: the counts mean different things per mode, and that was never printed.** `--clients`
+stops ~1.09 s in, so in `fg`/`bg`/`both`/`armed` the screendump lands after the run ended and is a
+picture of the **console** — zero client pixels there is the expected result. Every mode now says
+which case it is in.
+
 ### Changed — syscalls `#96` and `#97` are reserved, and the local-IPC band has no codename
 
 `docs/development/roadmap.md`: **`#96` = `fork`**, **`#97` = `chan_op`** (operator assignment, 2026-08-05).

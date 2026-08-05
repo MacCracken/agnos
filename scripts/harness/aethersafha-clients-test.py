@@ -54,6 +54,18 @@ PART_OFFSET = 33 * 1048576
 # bg then reports "launched: False" on a boot where it reaches 2/2 cleanly on its own.
 # Use AE_CLIENTS_MODE=fg / =bg in separate invocations to compare the paths.
 MODE = os.environ.get("AE_CLIENTS_MODE", "bg")   # "fg" | "bg" | "both" (both = same-boot, interferes)
+
+# ⛔ THE FRAMEBUFFER GATE FOR `desktop` MODE — how many pixels carrying a CLIENT's own colours must
+# be on the panel before this harness will exit 0. Only `desktop` mode uses it, because it is the
+# only mode that still has a compositor on screen when the screendump fires (see the FRAMEBUFFER
+# block). Calibrated against a measured null and a measured signal on this box; both numbers are
+# recorded beside the gate below. Override with AE_CLIENTS_FBMIN to re-calibrate on other hardware
+# rather than editing this line — and if you raise it to make a run pass, you have broken the gate.
+# Signal 3,500 · null 0 (both measured 2026-08-05, agnos 1.56.39, this box). 200 sits ~17x under
+# the signal and well clear of the null. ⚠ bright-green reads 0 even on a PASSING run, so the red
+# bar is currently carrying this gate alone — if present_probe ever stops animating it, the gate
+# goes dark rather than red, and this comment is the only warning of that.
+FB_CLIENT_PX_MIN = int(os.environ.get("AE_CLIENTS_FBMIN", "200"))
 DISK_MB = 512
 PART_BLOCKS = ((DISK_MB - 33) * 1048576) // 4096
 EXT2_FEATURES = os.environ.get("EXT2_SMOKE_FEATURES", "^resize_inode,^dir_index,^huge_file,^metadata_csum,^64bit")
@@ -216,8 +228,16 @@ try:
 
     fg_code = None
     bg_code = None
+    # ⛔ WHICH ARMS ACTUALLY RAN — set at the launch sites below, never re-derived from MODE at
+    # verdict time. `fg_code is None` is AMBIGUOUS on its own: it means "this arm was not run in
+    # this mode" AND "this arm ran and never produced an exit code". Those are opposite facts and
+    # the verdict block used to conflate them, which is how a bg-only run printed a confident
+    # causal claim about the foreground path (see the verdict block for the full case).
+    ran_fg = False
+    ran_bg = False
     if MODE in ("fg", "both"):
         # FOREGROUND: agnsh execwait #37 — the blocking primitive, the path the iron burn used.
+        ran_fg = True
         p("foreground `aethersafha --clients` (agnsh execwait #37)...")
         fg = run_wait("aethersafha --clients\n", "run: exit", timeout=150)
         fg_code = verdict(fg, "fg")
@@ -277,6 +297,7 @@ try:
         # compositor becomes an independently scheduled proc — the same shape as the kernel hook.
         # ⚠ There is no `run: exit` here: execwait is what prints that. agnsh prints "[1] <pid>" and
         # the compositor reports its own verdict, so gate on the compositor's exit print instead.
+        ran_bg = True
         p("background `aethersafha --clients &` (agnsh spawn_path #43)...")
         bg = run_wait("aethersafha --clients &\n", "probe ran for milliseconds", timeout=180)
         bg_code = verdict(bg, "bg")
@@ -339,6 +360,10 @@ try:
     # already reported "0 green-border pixels ... NOTE: green border not detected" and dismissed it
     # as "serial gate is dispositive", which is precisely backwards: the FRAMEBUFFER is the external
     # invariant here. Capture it and count present_probe's own colours.
+    # None means "no framebuffer evidence at all" — a missing or unparsable screendump. Kept
+    # distinct from 0, which means "captured, and there were no client pixels in it". The desktop
+    # gate must not pass on the first and must not confuse it for the second.
+    fb_client_px = None
     time.sleep(2.0)
     PPM = os.path.join(WORK, "screen.ppm")
     s.sendall((f"screendump {PPM}\n").encode()); time.sleep(4.0); drain()
@@ -370,6 +395,33 @@ try:
             p(f"  blue bar px            : {bluebar}")
             p(f"  non-black px           : {nonblk}")
             p(f"  PPM: {PPM}")
+            # ⛔ dimgrn IS DELIBERATELY EXCLUDED, and this is the whole design of the gate.
+            # Measured on this box 2026-08-05, MODE=desktop with both clients presented:
+            # dim-green 952,731 px of a 2048x2048 capture (22.7% of the screen). A client's 1-px
+            # BORDER cannot be 22.7% of the panel, so that count is dominated by something that is
+            # not the client — almost certainly the compositor's own chrome, which sits in the same
+            # dark-green range. Gating on it would pass a desktop that came up and hosted NOTHING,
+            # and that is not hypothetical: aethersafha 0.12.0 fixed exactly that state (a leaked
+            # listener made run 2 host nothing while looking completely healthy — desktop.md §4).
+            # ⚠ I did not produce a hosting-nothing desktop to measure dim-green against, so this is
+            # reasoned from the pixel count, not from a measured negative control. Stated as such.
+            # What survives is present_probe's own BARS and bright border — colours the chrome does
+            # not use. Measured: signal 3,500 px (red bar), console null 0 px across two runs
+            # (MODE=fg and MODE=bg, where the capture is of the console after --clients exited).
+            fb_client_px = green + redbar + bluebar
+            # ⛔ WHAT THESE NUMBERS MEAN DEPENDS ENTIRELY ON THE MODE, AND A BARE ZERO READS AS A
+            # FAILURE IN EVERY MODE. `--clients` STOPS the instant both clients have presented
+            # (~1.09 s), so in fg/bg/both/armed the screendump lands seconds AFTER the run ended and
+            # is a picture of the CONSOLE. Zero client pixels there is the EXPECTED result and says
+            # nothing about the desktop — that exact reading was once taken as evidence of failure.
+            # Only `desktop` mode keeps a compositor on screen while this fires, so only there are
+            # these counts an oracle. Say which case this is, every time.
+            if MODE == "desktop":
+                p("  ⇒ THIS is the mode these counts are an oracle for — a live desktop is on screen.")
+            else:
+                p(f"  ⇒ MODE={MODE}: `--clients` had ALREADY EXITED when this was captured, so this is a")
+                p("    picture of the console, not of a desktop. Zero client pixels here is EXPECTED")
+                p("    and is NOT evidence about the desktop. Use AE_CLIENTS_MODE=desktop for pixels.")
         except Exception as e:
             p("screendump parse failed:", e)
     else:
@@ -380,10 +432,26 @@ try:
     if MODE == "desktop":
         # ⛔ Do not reuse the fg/bg comparison here — desktop mode runs neither, and printing that
         # line anyway produced a verdict that flatly contradicted the run it came from.
-        ok = (bg_code == 95)
-        p(f"  foreground desktop (no &): clients presented = {'2+' if ok else 'FEWER THAN 2'}")
-        p("  Judge this on the FRAMEBUFFER counts above and the PPM, not on the serial alone.")
-        rc = 0 if ok else 1
+        serial_ok = (bg_code == 95)
+        p(f"  serial (the compositor's own claim): clients presented = {'2+' if serial_ok else 'FEWER THAN 2'}")
+        # ⛔ AND NOW GATE ON THE FRAMEBUFFER, which this block previously only told the reader to
+        # "judge on" — advice, not a gate, so the exit code still rested entirely on the serial line
+        # the compositor prints about itself. Serial is a shared-premise oracle: the program being
+        # judged is the program making the claim. The framebuffer is the external invariant, and in
+        # THIS mode (and only this mode) a live desktop is still on screen when it is captured.
+        # A run whose serial says "presented" while the panel carries none of the client's own
+        # colours has not shown a desktop, and must not exit 0.
+        if fb_client_px is None:
+            p("  ⛔ NO FRAMEBUFFER EVIDENCE — screendump missing or unparsable. Cannot pass on serial alone.")
+            rc = 1
+        else:
+            fb_ok = (fb_client_px >= FB_CLIENT_PX_MIN)
+            p(f"  framebuffer (external): {fb_client_px} client-coloured px "
+              f"(need >= {FB_CLIENT_PX_MIN}) -> {'PASS' if fb_ok else 'FAIL'}")
+            if serial_ok and not fb_ok:
+                p("  ⛔ SERIAL SAYS PRESENTED, THE PANEL DOES NOT. Believe the panel — the compositor")
+                p("     is the thing under test and its own claim cannot corroborate itself.")
+            rc = 0 if (serial_ok and fb_ok) else 1
         raise SystemExit(rc)
     if MODE == "armed":
         # ⛔ Do NOT fall through to the fg/bg comparison — this mode runs neither of those, and the
@@ -395,17 +463,52 @@ try:
         p("  means the completed foreground run — not the compositor — broke the following proc.")
         rc = 0 if ok else 1
         raise SystemExit(rc)
-    p(f"  foreground exit {fg_code} · background exit {bg_code}")
-    if fg_code == 95 and (bg_code == 95 or bg_code is None):
-        p("  Both clients present on BOTH launch paths.")
-        rc = 0
-    elif bg_code == 95 and fg_code != 95:
-        p("  Backgrounded (`&`) works; FOREGROUND does not.")
-        p("  ⇒ agnsh's blocking execwait #37 frame prevents the spawned clients being scheduled.")
-        rc = 0
-    else:
-        p("  Neither path reached 95 — the fault is not (only) the launch path.")
+    # ⛔ AN ARM THAT DID NOT RUN IS NOT AN ARM THAT FAILED, AND MUST NOT APPEAR IN A CONCLUSION.
+    # The default mode is "bg" and fg/bg are meant to be run in SEPARATE invocations, so on almost
+    # every run one of these two codes is None purely because that arm was never launched. The
+    # earlier block tested the codes alone and produced two false verdicts, both observed on
+    # 2026-08-05 against agnos 1.56.39 while BOTH arms independently reached 95:
+    #   AE_CLIENTS_MODE=bg -> "Backgrounded works; FOREGROUND does not." plus the causal claim
+    #                         "⇒ agnsh's blocking execwait #37 frame prevents the spawned clients
+    #                         being scheduled" — invented for an arm that was never launched.
+    #   AE_CLIENTS_MODE=fg -> "Both clients present on BOTH launch paths." — from one path.
+    # This is the same defect the `desktop` and `armed` guards above were each added to fix, in the
+    # one block those guards jump over. An instrument that overstates its own coverage is worse than
+    # no instrument: it is a false green and a false red from the same run.
+    p("  foreground exit " + (str(fg_code) if ran_fg else "— (not run in this mode)")
+      + " · background exit " + (str(bg_code) if ran_bg else "— (not run in this mode)"))
+
+    rc = 0
+    for ran, code, name, how in ((ran_fg, fg_code, "FOREGROUND", "agnsh execwait #37"),
+                                 (ran_bg, bg_code, "BACKGROUND", "agnsh spawn_path #43")):
+        if not ran:
+            continue
+        if code == 95:
+            p(f"  {name} ({how}): both clients connected and presented.")
+            continue
         rc = 1
+        if code is None:
+            # RAN and produced nothing — a real failure, and a different one from "not run".
+            p(f"  {name} ({how}): FAILED — ran, but never reported an exit code (stall or timeout).")
+            continue
+        p(f"  {name} ({how}): FAILED — exit {code}. 93/91 point at different repos; see §7 of "
+          "aethersafha planning/desktop.md.")
+
+    # The cross-path comparison is the ONLY claim that needs both arms, so it is the only one gated
+    # on both having run. One mode per boot is the documented way to use this harness, so this line
+    # is normally absent — and its absence is not a result.
+    if ran_fg and ran_bg:
+        if fg_code == 95 and bg_code == 95:
+            p("  ⇒ Both launch paths work. (⚠ MODE=both runs them in ONE boot and they interfere; "
+              "the file documents this. Prefer separate fg/bg invocations.)")
+        elif bg_code == 95 and fg_code != 95:
+            p("  ⇒ Backgrounded works and foreground does not, IN THE SAME BOOT — consistent with "
+              "agnsh's blocking execwait #37 frame holding the spawned clients off the scheduler, "
+              "but MODE=both is known to interfere. Confirm with separate fg and bg runs before "
+              "believing it.")
+    elif rc == 0:
+        p(f"  ⇒ Only the {'foreground' if ran_fg else 'background'} path was exercised. "
+          "The other says nothing either way — run it separately to cover it.")
 finally:
     try: qemu.terminate(); qemu.wait(timeout=10)
     except Exception:
