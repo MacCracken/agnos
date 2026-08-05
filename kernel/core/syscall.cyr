@@ -7146,7 +7146,23 @@ fn ksyscall(num, arg1, arg2, arg3) {
                 }
             }
         }
-        if (found == 0) { arch_wait(); }
+        # ⛔ 1.56.40 (channel-band bite 0) — A BARE `arch_wait()` LIVED HERE AND COULD HANG THE BOX.
+        # `arch_wait()` is `hlt` with NO `sti` (`arch/x86_64/io.cyr:143`), and every syscall handler runs
+        # **IF=0** (SYSCALL SFMASK). A `hlt` with interrupts masked is not a nap — no timer tick, no IRQ,
+        # nothing can retire it. The CPU stops there permanently.
+        #
+        # It was reached on the ordinary `found == 0` path, i.e. whenever a watch had not fired yet — so
+        # an `epoll_wait` on an unexpired timerfd or an unsignalled signalfd wedged the machine. The
+        # design note that proposed keeping it argued no consumer could reach this path; that was false,
+        # it is the normal not-ready return.
+        #
+        # The fix is to delete it and fall through. `epoll_wait` here is a **poll**, not a sleep: it
+        # returns `found == 0` and ring 3 loops. That matches every other agnos "not ready" answer
+        # (`waitpid #4`, `sock_recv #49`, `sock_accept #57`, `flock #59` all return rather than block),
+        # and it is the ONLY shape available — a real blocked state needs a new proc state, a
+        # `sched_next` that skips it, a ready-edge, and a relaxation of `do_context_switch`'s
+        # unconditional ready-reset. That is a scheduler arc, and it must be named as one rather than
+        # smuggled in behind a `hlt`. See `planning/ipc.md` §9.4.
         return found;
     }
     if (num == 22) {

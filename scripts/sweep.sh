@@ -67,6 +67,14 @@ run_gate "ext2 WRITE regression (W1-W5)"             "EXT2_WRITE_SELFTEST=1"    
 # --- 1.40.x exec-from-disk: load + ring-3 run + ENOEXEC + subdir + clean return ---
 run_gate "1.40.x exec-from-disk (run /bin/prog2 + ENOEXEC)" "EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1" "exec-smoke.sh"
 
+# --- 1.41.5 syscall hardening + the 1.56.40 epoll no-hang lock ---
+# ⛔ SYSCALL_HARDEN_SELFTEST shipped in 1.41.5 with NO RUNNER — it appeared only in build.sh's
+# compile-gate list, so nothing in check.sh or sweep.sh ever built or ran it. Two consequences went
+# unnoticed for ~15 minor versions: it is the ONLY coverage epoll/timerfd/signalfd have, and it had
+# stopped COMPILING (two `ksyscall` calls passed 3 args to a 4-arity function, which cyrius made a hard
+# error). Both fixed 2026-08-05. A selftest nothing runs is not coverage; it is a comment.
+run_gate "1.41.5 syscall hardening + epoll no-hang"  "SYSCALL_HARDEN_SELFTEST=1"                "syscall-harden-smoke.sh"
+
 # --- 1.52.x audio: HDA probe -> reset -> verb ring -> codec graph -> stream DMA-arm ---
 run_gate "1.52.x audio HDA (probe/reset/verb/graph/stream)" "" "hda-smoke.sh"
 

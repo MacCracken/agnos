@@ -3628,6 +3628,35 @@ fn syscall_harden_selftest() {
     if (ffd >= 0) { if (ksyscall(23, ffd, 0, u + 320) == 0) { kprintln("shsys: timerfd typeconf rej FAIL", 32); ok = 0; } }
     if (tfd >= 0) { if (ksyscall(23, tfd, 0, u + 320) != 0) { kprintln("shsys: timerfd valid FAIL", 25); ok = 0; } }
 
+    # ⭐ 1.56.40 (channel-band bite 0) — THE REGRESSION LOCK FOR A KERNEL HANG.
+    #
+    # `epoll_wait` on a REAL epoll fd whose watches have NOT fired takes the `found == 0` path, which
+    # used to run a bare `arch_wait()` — `hlt` with NO `sti`, inside an IF=0 syscall handler. Nothing
+    # could retire it: no timer tick, no IRQ. The CPU stopped there permanently.
+    #
+    # ⛔ EVERY OTHER epoll ASSERTION IN THIS FILE DRIVES A REJECTION PATH — a non-epoll fd, an
+    # out-of-range watch fd — and all of them return long before reaching that line. That is exactly why
+    # a box-hang survived inside a selftest that already "covered epoll". Coverage of the refusals is
+    # not coverage of the success path.
+    #
+    # ⛔ THE ORACLE IS THAT THE NEXT LINE PRINTS AT ALL. On the unfixed kernel this call never returns,
+    # so the boot dies here and the smoke times out with no `shsys:` verdict — a TIMEOUT is the failure
+    # signal, not a missing assertion. Do not "fix" a timeout here by shortening the wait.
+    #
+    # Re-armed to 60 s first so the not-yet-expired state is deterministic rather than a race against
+    # however many ticks elapse between the arm above and this call.
+    if (tfd >= 0) {
+        store64(u + 320, 0);
+        store64(u + 336, 60);                  # interval 0s, initial 60s — cannot expire mid-selftest
+        if (ksyscall(23, tfd, 0, u + 320) != 0) { kprintln("shsys: timerfd re-arm FAIL", 26); ok = 0; }
+        if (efd >= 0) {
+            if (ksyscall(20, efd, 1, tfd) != 0) { kprintln("shsys: epoll_ctl timerfd FAIL", 29); ok = 0; }
+            # Must RETURN, and must return 0 — nothing is ready.
+            if (ksyscall(21, efd, u + 256, 4) != 0) { kprintln("shsys: epoll_wait unexpired FAIL", 32); ok = 0; }
+            kprintln("shsys: epoll_wait returned, no hang", 35);
+        }
+    }
+
     # --- signalfd happy path (mask range-validated, #5) ---
     store64(u + 400, 6);                       # mask
     var sfd = ksyscall(18, 0, u + 400, 0);
@@ -3637,13 +3666,15 @@ fn syscall_harden_selftest() {
     store8(u + 1024, 47);                       # '/'
     var bi = 0;
     while (bi < 256) { store8(u + 1024 + 1 + bi, 97); bi = bi + 1; }   # 'a' * 256
-    if (ksyscall(9, u + 1024, 257) == 0) { kprintln("shsys: basename-cap rej FAIL", 28); ok = 0; }
+    # ⚠ 1.56.40: `, 0` added. `ksyscall` is 4-arity and these two calls passed 3 — the selftest had not
+    # compiled since cyrius made arity a hard error, and nothing noticed because nothing ever built it.
+    if (ksyscall(9, u + 1024, 257, 0) == 0) { kprintln("shsys: basename-cap rej FAIL", 28); ok = 0; }
 
     # --- cleanup ---
     if (sfd >= 0) { ksyscall(6, sfd, 0, 0); }
     if (tfd >= 0) { ksyscall(6, tfd, 0, 0); }
     if (efd >= 0) { ksyscall(6, efd, 0, 0); }
-    if (ffd >= 0) { ksyscall(6, ffd, 0, 0); ksyscall(30, u + 0, 4); }  # close + unlink /shs
+    if (ffd >= 0) { ksyscall(6, ffd, 0, 0); ksyscall(30, u + 0, 4, 0); }  # close + unlink /shs
 
     pmm_free_2mb(u);
     if (ok == 1) { kprintln("shsys: ALL PASS", 15); }

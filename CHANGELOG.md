@@ -19,7 +19,61 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ---
 
-## [1.56.39] — 2026-08-05 — three kernel items the desktop has been owed (cycle OPEN)
+## [1.56.40] — 2026-08-05 — the local-IPC channel band (cycle OPEN)
+
+Scope: the desktop arc's remaining architectural item — replacing TCP-on-loopback as the display
+control transport with a kernel-owned channel band on `#97`. Design, twelve-bite migration and kill
+criteria: [`planning/ipc.md`](docs/development/planning/ipc.md) §9. Bites land in order; 0–5 land no
+consumer, so everything up to the cutover reverts by not landing the next bite.
+
+### Fixed — `epoll_wait` could halt the CPU permanently (bite 0)
+
+`syscall.cyr` — the `found == 0` path ran a bare `arch_wait()`. That is `hlt` with **no `sti`**
+(`arch/x86_64/io.cyr:143`), and every syscall handler runs **IF=0** (SYSCALL SFMASK). A `hlt` with
+interrupts masked is not a nap: no timer tick, no IRQ, nothing can retire it. The CPU stops there and
+the machine is gone.
+
+It sat on the ordinary not-ready return — so an `epoll_wait` on an **unexpired timerfd** or an
+unsignalled signalfd hung the box. The design note that proposed keeping it argued no consumer could
+reach that path; that was wrong, it is the normal return.
+
+Deleted; the handler falls through to `return found;`. `epoll_wait` is a **poll**, matching every other
+agnos not-ready answer (`waitpid #4`, `sock_recv #49`, `sock_accept #57`, `flock #59` all return rather
+than block). A truly blocking form needs a new proc state, a `sched_next` that skips it, a ready-edge,
+**and** a relaxation of `do_context_switch`'s unconditional ready-reset — a scheduler arc, to be named
+as one rather than smuggled in behind a `hlt`.
+
+### Fixed — `SYSCALL_HARDEN_SELFTEST` had no runner, and had stopped compiling
+
+⛔ **It shipped in 1.41.5 and nothing ever built it.** `SYSCALL_HARDEN_SELFTEST` appeared only in
+`scripts/build.sh`'s compile-gate list — no smoke, no `check.sh` entry, no `sweep.sh` row. Two things
+followed, both invisible for ~15 minor versions:
+
+- It is, by its own header, the **only** coverage `epoll` / `timerfd` / `signalfd` have.
+- It **did not compile**. Two `ksyscall` calls passed **3 arguments to a 4-arity function**
+  (`ksyscall(9, u + 1024, 257)` and `ksyscall(30, u + 0, 4)`) — an error since cyrius made arity hard.
+  Discovered only by building it for the first time.
+
+New `scripts/smoke/syscall-harden-smoke.sh`, wired into `sweep.sh`. **A selftest nothing runs is not
+coverage; it is a comment.**
+
+### Added — a regression lock for the hang, whose oracle is a timeout
+
+The selftest now drives `epoll_wait` on a **real** epoll fd watching a timerfd re-armed to 60 s, and
+asserts it returns 0. ⛔ Every pre-existing epoll assertion in that file drove a **rejection** path (a
+non-epoll fd, an out-of-range watch fd), all of which return long before reaching the `found == 0`
+line — which is exactly how a box-hang survived inside a selftest that already "covered epoll".
+**Coverage of the refusals is not coverage of the success path.**
+
+⛔ **The oracle is that the next line prints at all.** On the unfixed kernel the call never returns, the
+boot dies mid-selftest, and the smoke sees no `shsys:` verdict — so it reports "no verdict" as the hang
+signature, distinctly from "verdict says FAIL". The two mean different things and a grep-for-PASS would
+collapse them.
+
+**Negative control, run:** restoring the bare `arch_wait()` makes the smoke exit 1 with the hang
+signature; removing it again restores PASS.
+
+## [1.56.39] — 2026-08-05 — three kernel items the desktop has been owed (RELEASED)
 
 Scope: the 1.56.35 cut named eight things the sovereign desktop needs from the kernel and closed with
 the SMP fault (K1) and the `net_src_for` documentation (K6). Three of the remainder are small,
