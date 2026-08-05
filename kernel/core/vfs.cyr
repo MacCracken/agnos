@@ -32,6 +32,10 @@ enum VfsType {
     #   name[256], content[4096]}; flushed whole-file via
     #   vfs_write_on at close. Mirrors the shell echo> write.
     VFS_SOCK      = 10;  # 1.49.4 socket fd: payload[0]=TCP conn_id (read->tcp_recv / write->tcp_send / close->tcp_close)
+    VFS_CHAN      = 11;  # 1.56.40 local-IPC channel endpoint (#97 chan_op). payload[0]=endpoint id,
+    #   [1]=channel epoch AT CLAIM, [2]=cached mode. ⛔ Every op re-derives authority from these three
+    #   against the kernel-side tables — the fd is a CLAIM, not a capability, so an inherited copy is
+    #   inert by construction rather than by anyone remembering to close it. See planning/ipc.md §9.3.
 }
 
 # 1.41.7 — FAT/exFAT write-back fd. The secondary-FS backends write WHOLE files

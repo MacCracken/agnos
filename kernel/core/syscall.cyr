@@ -4496,8 +4496,74 @@ var chan_region_kva  = 0;           # DIRECTMAP_BASE + phys — valid under ever
 # today-consumer, and the roadmap's own rule is that the kernel grows per native workload. `CH_HANDOFF`
 # (0x0A) and `CH_DIAL` (0x0B) are RESERVED with their caps bits CLEAR: the shape of a relayed channel is
 # reserved, a relayed channel is not promised, and the kernel will never dial.
+# ⭐ THE OBJECT MODEL (§9.3). 32 endpoints = 16 channels, endpoint `e` paired with `e ^ 1`. Each
+# endpoint owns one 4096 B page of the region as its INBOX: a sender writes into its PEER's inbox.
+#
+# ⛔ CURSORS LIVE HERE, IN KERNEL ARRAYS — NOT IN THE PAGE. That is the single decision that kills the
+# whole forgery class: ring 3 cannot address a cursor, so it cannot fake occupancy, rewind a peer's
+# consumption, or inject. The rejected shared-region design put them in userland-visible memory and its
+# own correctness judge found keystroke capture and injection on the display channel with "NO
+# MITIGATION IN v1". Ring 3 never addresses the page either — it copies in and out through the syscall.
+#
+# ⛔ MONOTONIC AND NEVER WRAPPING. `chan_w`/`chan_r` count records for all time; equality means
+# genuinely drained. A wrapping cursor makes "drained" and "exactly one lap behind" the same value —
+# the shape agnos's `pipe` already gets right.
+var CHAN_ENDS      = 32;            # 32 endpoints -> 16 channels
+var CHAN_SLOTS     = 64;            # records per inbox page (64 x 64 B = 4096)
+var CHAN_REC_BYTES = 64;            # §3: no production setu message exceeds 64 bytes
+var chan_end_open[32];              # 1 = this endpoint exists
+var chan_end_owner[32];             # owning pid
+var chan_end_oepoch[32];            # proc_epoch AT CLAIM — pid recycling is why this exists (bite 2)
+var chan_epoch[16];                 # per-CHANNEL generation, bumped at mint; fd-vs-channel staleness
+var chan_epoch_next = 1;
+var chan_w[32];                     # records ever written INTO this endpoint's inbox
+var chan_r[32];                     # records ever read OUT by this endpoint's owner
+var chan_drops = 0;                 # bounded-queue drops — counted, because a silent drop is a lie
+# Per-slot record LENGTH, one byte per slot, 32 endpoints x 64 slots = 2048 bytes.
+# ⛔ MODULE-SCOPE `var X[N]` IS N x u64 (8N BYTES), not N bytes — function-local is the byte form. 2048
+# bytes therefore needs [256], and writing [2048] here would silently reserve 16 KB while writing [32]
+# would overrun into whatever follows. [[feedback_cyrius_var_array_u64_units]]
+var chan_lens[256];
+
+fn chan_page(e) { return chan_region_kva + e * 4096; }
+
+# ⭐ AUTHORITY IS RE-DERIVED ON EVERY OPERATION (§9.3) — five checks, and the fd supplies three of the
+# values being checked rather than being trusted itself.
+#
+# ⛔ THIS IS WHAT MAKES AN INHERITED HANDLE INERT. agnos has no CLOEXEC and copies the whole fd table
+# at spawn, so instead of fighting that default the band inverts it: a child that inherits a channel fd
+# holds a claim whose owner is its PARENT, and `chan_end_owner[e] == proc_current_get()` fails. Nothing
+# has to be revoked because nothing was ever granted. A sandbox is DESCRIBED, not CARVED.
+# ⚠ `chan_end_open` is kept separate from `chan_end_owner` because **pid 0 is a real process**, so a
+# zero owner cannot double as "no owner".
+fn chan_auth(base) {
+    if (ktag(base) != VFS_CHAN) { return 0 - 1; }
+    var e = kpayload(base, 0);
+    if (e < 0) { return 0 - 1; }
+    if (e >= CHAN_ENDS) { return 0 - 1; }
+    if (load64(&chan_end_open + e * 8) != 1) { return 0 - 1; }
+    if (load64(&chan_epoch + (e >> 1) * 8) != kpayload(base, 1)) { return 0 - 1; }   # fd vs CHANNEL
+    if (load64(&chan_end_owner + e * 8) != proc_current_get()) { return 0 - 1; }
+    # pid vs PROCESS — the incarnation check bite 2 exists for.
+    if (load64(&chan_end_oepoch + e * 8) != proc_epoch_get(proc_current_get())) { return 0 - 1; }
+    return e;
+}
+
+# ⛔ PEER LIVENESS IS DERIVED, NEVER STORED. A stored flag goes stale the moment the peer dies by a
+# path that forgot to clear it — and the death modes that matter here are faults, not clean exits.
+fn chan_peer_alive(e) { return load64(&chan_end_open + (e ^ 1) * 8); }
+
 var CH_CAPS   = 0x00;               # (out_uva, out_len) -> 0; writes the caps block
+var CH_MINT   = 0x01;               # (out_uva) -> 0; writes two fds — a channel is minted as a PAIR
+var CH_SEND   = 0x02;               # (fd, buf, len<=64) -> len / -CH_E_*
+var CH_RECV   = 0x03;               # (fd, buf, cap) -> len / -CH_E_WOULDBLOCK / -CH_E_PEERGONE
+var CH_CLOSE  = 0x04;               # (fd) -> 0
 var CH_E_BADOP  = 2;                # unknown, reserved, or not implemented in this kernel
+var CH_E_BADFD  = 5;                # not a channel fd, or authority failed (incl. an INHERITED claim)
+var CH_E_ARG    = 6;                # bad buffer / length
+var CH_E_FULL   = 7;                # no free channel
+var CH_E_WOULDBLOCK = 8;            # ⛔ a per-record RESULT, not an error — a poll batch must not abort
+var CH_E_PEERGONE   = 9;            # likewise per-record
 var CH_E_OUTBUF = 3;                # CAPS out_uva/out_len invalid
 var CH_E_NOREGION = 4;              # the 2 MB region is absent or unreachable from this CR3
 
@@ -4505,7 +4571,7 @@ var CH_E_NOREGION = 4;              # the 2 MB region is absent or unreachable f
 # this mask, so advertising an op the kernel does not run is how a client "works" against a kernel that
 # cannot serve it. Bite 4a implements CAPS only. This is the `MDO_OP_SUPPORTED` pattern that grew `#93`
 # across a whole arc under one number with no ABI break.
-var CH_OP_SUPPORTED = 0x0001;       # bit 0 = CH_CAPS
+var CH_OP_SUPPORTED = 0x001F;       # bits 0-4 = CAPS/MINT/SEND/RECV/CLOSE. Reserved ops stay CLEAR.
 
 # Reserve the region. Called once at boot, AFTER pmm_setup_directmap — the whole design rests on the
 # direct-map alias, so reserving before it exists would hand back a VA that means something else.
@@ -7565,6 +7631,138 @@ fn ksyscall(num, arg1, arg2, arg3) {
             store32(arg2 + 0, CH_OP_SUPPORTED);
             store32(arg2 + 4, CHAN_REGION_PAGES);
             store64(arg2 + 8, chan_region_reachable());
+            stack_canary_check(canary);
+            return 0;
+        }
+        # MINT(out_uva) -> 0, writing two fds. ⛔ A channel is minted as a PAIR and has NO NAME: you get
+        # both ends or nothing. That deletes the entire unlink-before-bind race class AF_UNIX carries,
+        # and it is why `tcp_listen`'s "whoever binds 7700 first owns the display protocol and every
+        # keystroke on it" cannot be reproduced here.
+        if (arg1 == CH_MINT) {
+            if (chan_region_kva == 0) { stack_canary_check(canary); return 0 - CH_E_NOREGION; }
+            if (is_user_range(arg2, 16) == 0) { stack_canary_check(canary); return 0 - CH_E_ARG; }
+            var c = 0;
+            var found = 0 - 1;
+            while (c < 16) {
+                if (load64(&chan_end_open + (c * 2) * 8) == 0) {
+                    if (load64(&chan_end_open + (c * 2 + 1) * 8) == 0) { found = c; c = 16; }
+                    else { c = c + 1; }
+                }
+                else { c = c + 1; }
+            }
+            if (found < 0) { stack_canary_check(canary); return 0 - CH_E_FULL; }
+            var ea = found * 2;
+            var eb = ea + 1;
+            # ⛔ TAG THE FIRST FD BEFORE ALLOCATING THE SECOND. `vfs_alloc` FINDS a free slot; it does
+            # not CLAIM one — the slot only stops being free once `ktag_set` writes a non-FREE tag. Two
+            # back-to-back allocs therefore return the SAME fd, and a channel minted onto one fd is a
+            # channel whose two ends are the same end. `vfs_create_pipe` gets this right and is the
+            # reference; this code did not, and the selftest caught it as `MINT gave one fd`.
+            var fa = vfs_alloc();
+            if (fa < 0) { stack_canary_check(canary); return 0 - CH_E_FULL; }
+            var ba = vfs_fd_table() + fa * 32;
+            ktag_set(ba, VFS_CHAN);
+            var fb = vfs_alloc();
+            if (fb < 0) { vfs_close(fa); stack_canary_check(canary); return 0 - CH_E_FULL; }
+            var bb = vfs_fd_table() + fb * 32;
+            ktag_set(bb, VFS_CHAN);
+            chan_epoch_next = chan_epoch_next + 1;
+            store64(&chan_epoch + found * 8, chan_epoch_next);
+            var me = proc_current_get();
+            var mye = proc_epoch_get(me);
+            var z = 0;
+            while (z < 2) {
+                var ee = ea + z;
+                store64(&chan_end_open + ee * 8, 1);
+                store64(&chan_end_owner + ee * 8, me);
+                store64(&chan_end_oepoch + ee * 8, mye);
+                store64(&chan_w + ee * 8, 0);
+                store64(&chan_r + ee * 8, 0);
+                memset(chan_page(ee), 0, 4096);   # never hand a new owner the last occupant's bytes
+                z = z + 1;
+            }
+            kpayload_set(ba, 0, ea);
+            kpayload_set(ba, 1, chan_epoch_next);
+            kpayload_set(ba, 2, 0);
+            kpayload_set(bb, 0, eb);
+            kpayload_set(bb, 1, chan_epoch_next);
+            kpayload_set(bb, 2, 0);
+            store64(arg2 + 0, fa);
+            store64(arg2 + 8, fb);
+            stack_canary_check(canary);
+            return 0;
+        }
+        # SEND(fd, buf, len) — writes into the PEER's inbox. ⛔ Bounded-queue-with-DROP-OLDEST, not
+        # back-pressure: §3 measured the workload as "presents are idempotent overwrites; input is
+        # droppable", and a blocking send would starve the peer it waits on — the poison that made TCP
+        # toxic here. Drops are COUNTED (`chan_drops`); a silent drop is a lie.
+        if (arg1 == CH_SEND) {
+            if (arg2 < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            if (arg2 >= 32) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            var sb = vfs_fd_table() + arg2 * 32;
+            var se = chan_auth(sb);
+            if (se < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            var slen = ksyscall_a4_get();
+            if (slen <= 0) { stack_canary_check(canary); return 0 - CH_E_ARG; }
+            if (slen > CHAN_REC_BYTES) { stack_canary_check(canary); return 0 - CH_E_ARG; }
+            if (is_user_range(arg3, slen) == 0) { stack_canary_check(canary); return 0 - CH_E_ARG; }
+            var pe = se ^ 1;
+            if (load64(&chan_end_open + pe * 8) != 1) { stack_canary_check(canary); return 0 - CH_E_PEERGONE; }
+            var wv = load64(&chan_w + pe * 8);
+            var rv = load64(&chan_r + pe * 8);
+            if ((wv - rv) >= CHAN_SLOTS) {
+                store64(&chan_r + pe * 8, rv + 1);      # drop the OLDEST
+                chan_drops = chan_drops + 1;
+            }
+            var slot = chan_page(pe) + (wv % CHAN_SLOTS) * CHAN_REC_BYTES;
+            memset(slot, 0, CHAN_REC_BYTES);
+            var si = 0;
+            while (si < slen) { store8(slot + si, load8(arg3 + si)); si = si + 1; }
+            store8(&chan_lens + (pe * CHAN_SLOTS + (wv % CHAN_SLOTS)), slen);
+            store64(&chan_w + pe * 8, wv + 1);
+            stack_canary_check(canary);
+            return slen;
+        }
+        # RECV(fd, buf, cap) -> len, or WOULDBLOCK / PEERGONE. ⛔ Those two are RESULTS, so a caller
+        # batching one per held channel never aborts the batch on "nothing here" (§9.4).
+        if (arg1 == CH_RECV) {
+            if (arg2 < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            if (arg2 >= 32) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            var rb = vfs_fd_table() + arg2 * 32;
+            var re = chan_auth(rb);
+            if (re < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            var rcap = ksyscall_a4_get();
+            if (rcap <= 0) { stack_canary_check(canary); return 0 - CH_E_ARG; }
+            if (is_user_range(arg3, rcap) == 0) { stack_canary_check(canary); return 0 - CH_E_ARG; }
+            var rw = load64(&chan_w + re * 8);
+            var rr = load64(&chan_r + re * 8);
+            if (rr >= rw) {
+                # Drained. Peer-gone is reported only once there is nothing left to read — a dead peer's
+                # already-queued records must still be delivered, or a client that exits right after
+                # presenting loses the present.
+                if (chan_peer_alive(re) == 0) { stack_canary_check(canary); return 0 - CH_E_PEERGONE; }
+                stack_canary_check(canary);
+                return 0 - CH_E_WOULDBLOCK;
+            }
+            var rslot = chan_page(re) + (rr % CHAN_SLOTS) * CHAN_REC_BYTES;
+            var rlen = load8(&chan_lens + (re * CHAN_SLOTS + (rr % CHAN_SLOTS)));
+            if (rlen > rcap) { rlen = rcap; }
+            var ri = 0;
+            while (ri < rlen) { store8(arg3 + ri, load8(rslot + ri)); ri = ri + 1; }
+            store64(&chan_r + re * 8, rr + 1);
+            stack_canary_check(canary);
+            return rlen;
+        }
+        if (arg1 == CH_CLOSE) {
+            if (arg2 < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            if (arg2 >= 32) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            var cb = vfs_fd_table() + arg2 * 32;
+            var ce = chan_auth(cb);
+            if (ce < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            store64(&chan_end_open + ce * 8, 0);
+            store64(&chan_end_owner + ce * 8, 0);
+            store64(&chan_end_oepoch + ce * 8, 0);
+            vfs_close(arg2);
             stack_canary_check(canary);
             return 0;
         }

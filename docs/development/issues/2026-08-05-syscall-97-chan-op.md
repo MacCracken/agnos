@@ -1,12 +1,19 @@
-# `#97 chan_op` — the local-IPC channel band: designed, decided, numbered, and not one line built
+# `#97 chan_op` — the local-IPC channel band: designed, decided, numbered, and now MINTED (bites 0-4a)
 
-**Status:** 🟡 **OPEN** — filed 2026-08-05. Design complete and ruled on; implementation is agnos **1.56.40**.
+**Status:** 🟠 **IN PROGRESS — bites 0-3 done, 4a landed, 4 blocked on cyrius.** Filed 2026-08-05.
+⭐ **`#97` is MINTED**: agnos 1.56.40 ships the dispatch arm, a boot-reserved 2 MB region and `CH_CAPS`.
+🔴 **Blocked**: the cyrius peer has no `SYS_CHAN_OP = 97`, so the ABI gate correctly reds `check.sh`
+(`kernel 97 · abi-doc 97 · cyrius 96`) and the ring-3 half of the region kill-criterion cannot be
+written. Filed against cyrius and marked ACTIONABLE there —
+[`2026-08-05-agnos-syscall-peer-...`](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-08-05-agnos-syscall-peer-two-new-numbers-and-a-circular-authority.md) §2.
+⚠ Bite 4a proves the region reachable under the **kernel** CR3 only; §9.9 names the **spawned-client**
+CR3, and that half is what the cyrius constant unblocks.
 **Number:** **`#97`** — ⭐ **settled 2026-08-05.** `#96` stays with `fork`
 ([`2026-08-05-syscall-96-fork.md`](2026-08-05-syscall-96-fork.md)). Next free is **`#98`**.
 **Cross-repo:** agnos (kernel) **+ cyrius** (`lib/syscalls_x86_64_agnos.cyr`) **+ setu 0.8.0** **+ aethersafha**.
 **Severity:** High — it is the desktop arc's remaining architectural item, and the transport it replaces
 is already ruled a wrong premise, so the current path is deprecated with nothing shipped behind it.
-**Affects:** agnos 1.56.39 and earlier.
+**Affects:** agnos 1.56.40 (in progress).
 
 ## Summary
 
@@ -41,13 +48,16 @@ leaves one kernel has no boundary to cross. Memory: [[feedback_naming_lanes]].
 ⭐ **Unblocked.** ipc.md §9.7 item 3 made bites 4–9 wait on K1 (the `-smp 4` PT_LOAD fault); **K1 is
 done** — agnos 1.56.35, `EFER.NXE` never enabled on the APs, `smp.cyr:514`.
 
-**Bites 0/1/2 land no consumer** and are the unblocked prefix:
+**Progress — all in agnos 1.56.40:**
 
-| bite | what | why it stands alone |
+| bite | what | state |
 |---|---|---|
-| **0** | Delete the bare `arch_wait()` at `syscall.cyr:7098` — a `hlt` with **no `sti`** inside an IF=0 handler | ⭐ **An `epoll_wait` on an unexpired timerfd hangs the box today.** Worth landing regardless of the rest |
-| **1** | shm **owner + epoch**, released at both death sites; gate `shm_free #74` on owner | ⛔ warn-counter only — nothing is refused yet |
-| **2** | `proc_epoch[16]`, written and **never read** | inert by construction |
+| **0** | Delete the bare `arch_wait()` in `epoll_wait` — `hlt` with no `sti` inside an IF=0 handler | ✅ **DONE.** It hung the box on an unexpired timerfd. Regression lock + negative control |
+| **1** | shm **owner + epoch**, released at both death sites; `shm_free #74` gated on owner | ✅ **DONE.** `#72`/`#73` warn-counted, never refused. ⚠ Measured INERT in the desktop workload — the selftest is its coverage |
+| **2** | `proc_epoch[16]`, written and **never read** | ✅ **DONE**, bumped in `proc_alloc_slot` |
+| **3** | Host semantic proof over `socketpair(SOCK_SEQPACKET)` | ✅ **DONE.** 18 assertions in `check.sh`; negative control over `SOCK_STREAM` fails exactly the 6 framing ones |
+| **4a** | `#97` + the 2 MB region + `CH_CAPS` | ✅ **LANDED.** ⚠ Region proven under the **kernel** CR3 only |
+| **4b** | the ring-3 half of the region kill criterion, then mint/close/send/recv | 🔴 **BLOCKED on cyrius `SYS_CHAN_OP = 97`** |
 
 ## Kill criterion worth repeating here
 

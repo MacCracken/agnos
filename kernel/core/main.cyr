@@ -3596,6 +3596,15 @@ fbscale_selftest();
 # with a real >=2 MB user-range scratch. Needs a writable ext2 (to mint a
 # non-epoll fd for the type-confusion checks). "rej" = the call MUST be refused.
 #ifdef SYSCALL_HARDEN_SELFTEST
+# ⛔ `#97`'s SEND/RECV take their length on **a4**, which `ksyscall` carries out-of-band via
+# `ksyscall_a4_set`. main.cyr:3537 already records the hazard this creates — "ksyscall_a4 MUST be staged
+# explicitly before each call (stale-a4)" — so the staging lives in one helper rather than being
+# repeated at ten call sites where one omission would silently reuse the previous call's length.
+fn chan_call4(op, a, b, len) {
+    ksyscall_a4_set(len);
+    return ksyscall(97, op, a, b);
+}
+
 fn syscall_harden_selftest() {
     if (ext2_active == 0)   { kprintln("shsys: no ext2 SKIP", 19); return 0; }
     if (ext2_write_ok == 0) { kprintln("shsys: ro ext2 SKIP", 19); return 0; }
@@ -3737,6 +3746,54 @@ fn syscall_harden_selftest() {
     if (ksyscall(97, 0x0B, caps, 16) != (0 - CH_E_BADOP)) { kprintln("shsys: chan DIAL rej FAIL", 25); ok = 0; }
     if (ksyscall(97, 0x7F, caps, 16) != (0 - CH_E_BADOP)) { kprintln("shsys: chan unknown-op rej FAIL", 31); ok = 0; }
     kprintln("shsys: chan CAPS + region OK (kernel CR3)", 41);
+
+    # ⭐ MINT / SEND / RECV / CLOSE, and the authority model underneath them.
+    var cfd = u + 704;
+    if (ksyscall(97, CH_MINT, cfd, 0) != 0) { kprintln("shsys: chan MINT FAIL", 21); ok = 0; }
+    var fa = load64(cfd);
+    var fb = load64(cfd + 8);
+    if (fa == fb) { kprintln("shsys: chan MINT gave one fd FAIL", 33); ok = 0; }
+
+    # A record crosses whole and arrives on the PEER's end, not its own.
+    var msg = u + 768;
+    store64(msg, 0x4142434445464748);
+    if (chan_call4(CH_SEND, fa, msg, 8) != 8) { kprintln("shsys: chan SEND FAIL", 21); ok = 0; }
+    var rxb = u + 832;
+    store64(rxb, 0);
+    if (chan_call4(CH_RECV, fb, rxb, 64) != 8) { kprintln("shsys: chan RECV len FAIL", 25); ok = 0; }
+    if (load64(rxb) != 0x4142434445464748) { kprintln("shsys: chan RECV content FAIL", 29); ok = 0; }
+    # ⛔ The sender must NOT see its own record — a channel is two inboxes, not one shared buffer.
+    if (chan_call4(CH_RECV, fa, rxb, 64) != (0 - CH_E_WOULDBLOCK)) { kprintln("shsys: chan self-echo FAIL", 26); ok = 0; }
+    # Drained == cursor equality, and it reports WOULDBLOCK rather than 0 (0 is a real length).
+    if (chan_call4(CH_RECV, fb, rxb, 64) != (0 - CH_E_WOULDBLOCK)) { kprintln("shsys: chan drained FAIL", 24); ok = 0; }
+
+    # ⭐⭐ THE PRIMARY KILL CRITERION (§9.9), TESTED THE ONLY WAY IT CAN BE FROM HERE.
+    # "If a record is delivered to or accepted from an INHERITED (non-endowed) fd, inert-by-construction
+    # is false and the entire authority model dies with it." A real spawned child needs bite 5; what is
+    # testable NOW is the mechanism that makes it true — authority is re-derived from the fd's stamped
+    # (endpoint, channel-epoch, owner, proc-epoch) on EVERY op. Corrupt any one of them and the op must
+    # refuse, because that is exactly the state an inherited copy is in: a valid-looking claim whose
+    # owner is somebody else.
+    var abase = vfs_fd_table() + fa * 32;
+    var saved_owner = load64(&chan_end_owner + kpayload(abase, 0) * 8);
+    store64(&chan_end_owner + kpayload(abase, 0) * 8, saved_owner + 1);    # "owned by another proc"
+    if (chan_call4(CH_SEND, fa, msg, 8) != (0 - CH_E_BADFD)) { kprintln("shsys: chan foreign-owner FAIL", 30); ok = 0; }
+    if (chan_call4(CH_RECV, fa, rxb, 64) != (0 - CH_E_BADFD)) { kprintln("shsys: chan foreign-recv FAIL", 29); ok = 0; }
+    store64(&chan_end_owner + kpayload(abase, 0) * 8, saved_owner);
+    # A STALE CHANNEL EPOCH must refuse too — that is the fd-outlives-the-channel case, i.e. a handle
+    # kept across a mint/close cycle that recycled the same endpoint.
+    var saved_ep = kpayload(abase, 1);
+    kpayload_set(abase, 1, saved_ep + 1000);
+    if (chan_call4(CH_SEND, fa, msg, 8) != (0 - CH_E_BADFD)) { kprintln("shsys: chan stale-epoch FAIL", 28); ok = 0; }
+    kpayload_set(abase, 1, saved_ep);
+
+    # Peer death is DERIVED, and a dead peer's queued records still drain before it is reported.
+    if (chan_call4(CH_SEND, fa, msg, 8) != 8) { kprintln("shsys: chan pre-close send FAIL", 31); ok = 0; }
+    if (ksyscall(97, CH_CLOSE, fa, 0) != 0) { kprintln("shsys: chan CLOSE FAIL", 22); ok = 0; }
+    if (chan_call4(CH_RECV, fb, rxb, 64) != 8) { kprintln("shsys: chan drain-after-death FAIL", 34); ok = 0; }
+    if (chan_call4(CH_RECV, fb, rxb, 64) != (0 - CH_E_PEERGONE)) { kprintln("shsys: chan PEER_GONE FAIL", 26); ok = 0; }
+    if (ksyscall(97, CH_CLOSE, fb, 0) != 0) { kprintln("shsys: chan CLOSE b FAIL", 24); ok = 0; }
+    kprintln("shsys: chan mint/send/recv/authority OK", 39);
 
     # --- ext2 basename 255-cap (#6/#7): "/" + 256*'a' = 257 bytes, mkdir refused ---
     store8(u + 1024, 47);                       # '/'

@@ -132,6 +132,51 @@ itself. ⭐ Note which oracle held: the **framebuffer** was right in the run whe
 serial claim was wrong, which is the whole argument for gating on the panel rather than on the program
 under test. Do not gate CI on `desktop` mode until the flake is understood.
 
+### Added — `#97 chan_op` exists, with a region and a caps op (bite 4a)
+
+The first kernel half of retiring TCP-on-loopback as the desktop's control transport. One number,
+op-dispatched, in the `#93` / `MDO_OP_SUPPORTED` style that grew a whole arc with no ABI break.
+⛔ `#96` remains `fork`'s — the operator assigned both, and whichever lands first does not take the
+other's number.
+
+**The 2 MB region**, reserved at boot and carved into 32 × 4096 B pages. ⛔ Reserved **after**
+`pmm_setup_directmap`: the design rests on `DIRECTMAP_BASE`, the only alias every per-proc CR3 mirrors,
+so reserving earlier would stamp a VA that means something else. Zeroed once at reserve, so a channel
+page can never hand a new owner the previous occupant's bytes. A failed reserve is non-fatal —
+`chan_op` answers `CH_E_NOREGION` rather than refusing to boot over a band nothing consumes yet.
+
+⭐ **Static region rather than 32 `kmalloc`s** (§9.2): creation cannot OOM · it sidesteps the 4096-byte
+slab ceiling · and decisively, **because channel pages are never `kmalloc`'d or `kfree`'d, a destructive
+op inside a validate-then-execute batch cannot produce a kernel-heap use-after-free** — the exact bug a
+judge found in the rejected shared-region design.
+
+**`CH_CAPS` (0x00)** writes `+0` op mask · `+4` region pages · `+8` region-reachable. ⛔ The reachable
+word is a **live probe under the CALLER's CR3**, not a boot-time cache: the claim under test is that the
+region resolves from a client's page tables, and a value stamped at boot under the kernel CR3 would say
+nothing about that. The probe writes the region's **last** 8 bytes, not the first — page 0 is what a
+real mint hands out, and a probe that scribbles on it would test the region by corrupting it.
+
+⛔ **Reserved ops read 0 in the mask.** `CH_HANDOFF` (0x0A) and `CH_DIAL` (0x0B) return `−CH_E_BADOP`
+with their caps bits clear; the kernel will never dial. `CH_ENUM` is absent from v1 (§9.7 item 5 — the
+one op with no consumer). A client negotiates on that mask, so advertising an op the kernel does not run
+is exactly how a client "works" against a kernel that cannot serve it.
+
+Selftest asserts CAPS, the mask, the region, and refusal of a short out-buffer, both reserved ops and an
+unknown op; gated in `syscall-harden-smoke`.
+
+⚠ **THE KILL CRITERION IS ONLY HALF-MET, AND THE GATE SAYS SO.** §9.9 names reachability *from a spawned
+client's CR3*. The selftest runs from the boot path and proves the **kernel-CR3 half only** — the region
+exists, is direct-map addressable, and survives a write/read round trip. The spawned-client half needs a
+ring-3 caller. The smoke's own label carries that caveat rather than reading like the criterion is met.
+
+🔴 **BLOCKED, and `check.sh` is red on it by design:** the cyrius peer has no `SYS_CHAN_OP = 97`, so the
+ABI gate reports `kernel 97 · abi-doc 97 · cyrius 96`. That is the gate added earlier this cut doing
+precisely its job — holding a new syscall to landing its constant in the same change as its dispatch
+arm. cyrius 6.5.7 shipped today but carried repair work (hisab's allocator, agnosai's wrappers, `include`
+resolution), not this. The ring-3 test is blocked behind the same two lines. ⛔ A raw `syscall(97, …)`
+was deliberately **not** used to route around it — raw numbers on agnos paths are a confirmed shipping
+defect class in this ecosystem, and the gate exists to stop exactly that.
+
 ### Added — the channel band's contract is executable before the band exists (bite 3)
 
 `tests/chan/chantest.cyr` + `scripts/check/chan-semantics-check.sh`, wired into `check.sh`. Host-side,

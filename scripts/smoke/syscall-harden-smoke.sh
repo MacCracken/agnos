@@ -53,7 +53,8 @@ else
 
     for want in "shsys: shm owner gate OK|shm #74 owner gate + release-at-death (bite 1)" \
                 "shsys: proc_epoch bumps on reuse OK|proc_epoch increments when a slot is recycled (bite 2)" \
-                "shsys: chan CAPS + region OK (kernel CR3)|#97 chan_op CAPS + 2 MB region reachable under the KERNEL CR3 (bite 4a; NOT the spawned-client half the kill criterion names)"; do
+                "shsys: chan CAPS + region OK (kernel CR3)|#97 chan_op CAPS + 2 MB region reachable under the KERNEL CR3 (bite 4a; NOT the spawned-client half the kill criterion names)" \
+                "shsys: chan mint/send/recv/authority OK|#97 mint/send/recv/close + authority re-derivation (foreign owner and stale epoch both refuse)"; do
         line="${want%%|*}"; desc="${want#*|}"
         if strings "$LOG" 2>/dev/null | grep -q "$line"; then
             echo "  PASS: $desc"
