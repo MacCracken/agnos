@@ -1,0 +1,164 @@
+# chanx.cyr — the RING-3 exerciser for the local-IPC channel band (`#97 chan_op`), on agnos.
+#
+# ⭐ THIS IS THE FILE THAT CLOSES BOTH OF §9.9's KILL CRITERIA, and neither is closeable from the boot
+# selftest — that runs under the kernel's own CR3 and as a single process, so it can prove the mechanism
+# but not the thing the criteria actually name:
+#
+#   1. "If the 2 MB region is not reachable from a SPAWNED CLIENT'S CR3, the static-region choice dies."
+#      The region lives at `DIRECTMAP_BASE + phys`. Every per-proc CR3 mirrors kernel PDPT[1..511], so
+#      it should resolve here — but "should" is the claim under test. `CH_CAPS` re-probes it live on
+#      every call, from whatever CR3 the caller is on, so calling it from a ring-3 proc IS the test.
+#
+#   2. ⭐⭐ THE PRIMARY ONE: "If a record is delivered to or accepted from an INHERITED (non-endowed) fd
+#      in a spawned child, inert-by-construction is FALSE and the entire authority model dies with it."
+#      agnos has no CLOEXEC and copies the whole fd table at spawn, so a child genuinely inherits the
+#      parent's channel fd at the same index. The band's answer is not to close it but to make it
+#      INERT: authority is re-derived per op, and `chan_end_owner[e] == proc_current_get()` fails for a
+#      child that was never endowed. **Only a real spawned child can test that** — the boot selftest can
+#      only fake it by corrupting the owner field, which tests the check, not the inheritance.
+#
+# ⛔ THE CHILD MUST *TRY* AND *FAIL*, NOT BE PREVENTED FROM TRYING. A test where the child never gets a
+# usable fd number proves nothing about inertness. The parent passes the fd it minted, by number, on the
+# child's argv — so the child holds exactly the handle the criterion is about and calls SEND/RECV on it.
+#
+# Modes: `chanx`         — parent: caps, mint, round-trip, then spawn `chanx child <fd>`
+#        `chanx child N` — child:  assert the INHERITED fd N is inert in both directions
+#
+# Every line is prefixed CHANX- so the smoke can gate on it without matching kernel chatter.
+
+fn say(s, n) { sys_write(1, s, n); sys_write(1, "\n", 1); return 0; }
+
+fn say_num(s, n, v) {
+    sys_write(1, s, n);
+    print_num(v);
+    sys_write(1, "\n", 1);
+    return 0;
+}
+
+fn child_main(fd): i64 {
+    var buf = alloc(128);
+    var ok = 1;
+
+    # ⛔ THE CRITERION. This fd is real, open in this process's table (inherited byte-for-byte at spawn),
+    # and names a live channel endpoint. It must nevertheless refuse BOTH directions, because this proc
+    # is not its owner. A success on either line means inert-by-construction is false.
+    store64(buf, 0x4445414442454546);
+    var sr = sys_chan_send(fd, buf, 8);
+    if (sr >= 0) { say("CHANX-CHILD-SEND-ACCEPTED-INHERITED-FD", 38); ok = 0; }
+    else { say("CHANX-CHILD-SEND-REFUSED", 24); }
+
+    var rr = sys_chan_recv(fd, buf, 64);
+    if (rr >= 0) { say("CHANX-CHILD-RECV-ACCEPTED-INHERITED-FD", 38); ok = 0; }
+    else { say("CHANX-CHILD-RECV-REFUSED", 24); }
+
+    # ⚠ The child DOES get its own working channel — inertness must be a property of the inherited
+    # claim, not of the child being unable to use the band at all. Without this, a kernel that simply
+    # refused every chan_op from a non-first process would pass the test above and be badly wrong.
+    var mine = alloc(32);
+    if (sys_chan_mint(mine) == 0) {
+        var ca = load64(mine);
+        var cb = load64(mine + 8);
+        store64(buf, 0x0102030405060708);
+        if (sys_chan_send(ca, buf, 8) != 8) { say("CHANX-CHILD-OWN-SEND-FAIL", 25); ok = 0; }
+        store64(buf, 0);
+        if (sys_chan_recv(cb, buf, 64) != 8) { say("CHANX-CHILD-OWN-RECV-FAIL", 25); ok = 0; }
+        if (load64(buf) != 0x0102030405060708) { say("CHANX-CHILD-OWN-CONTENT-FAIL", 28); ok = 0; }
+        sys_chan_close(ca);
+        sys_chan_close(cb);
+        if (ok == 1) { say("CHANX-CHILD-OWN-CHANNEL-OK", 26); }
+    }
+    else { say("CHANX-CHILD-OWN-MINT-FAIL", 25); ok = 0; }
+
+    if (ok == 1) { say("CHANX-CHILD-PASS", 16); return 0; }
+    say("CHANX-CHILD-FAIL", 16);
+    return 1;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    # `chanx child <fd>` — argv[1] == "child"
+    if (argc() > 2) {
+        var a1 = argv(1);
+        if (load8(a1) == 99) {                      # 'c'
+            var fdv = 0;
+            var p = argv(2);
+            var i = 0;
+            while (load8(p + i) >= 48) {
+                if (load8(p + i) > 57) { i = i; }
+                fdv = fdv * 10 + (load8(p + i) - 48);
+                i = i + 1;
+            }
+            return child_main(fdv);
+        }
+    }
+
+    say("CHANX-PARENT-START", 18);
+    var caps = alloc(64);
+    store64(caps, 0); store64(caps + 8, 0);
+    if (sys_chan_caps(caps, 16) != 0) { say("CHANX-CAPS-FAIL", 15); return 1; }
+
+    # ⭐ KILL CRITERION 1, from a ring-3 CR3 rather than the kernel's.
+    if (load64(caps + 8) != 1) { say("CHANX-REGION-UNREACHABLE-FROM-RING3", 35); return 1; }
+    say("CHANX-REGION-REACHABLE-FROM-RING3", 33);
+    say_num("CHANX-CAPS-MASK ", 16, load32(caps));
+
+    var fds = alloc(32);
+    if (sys_chan_mint(fds) != 0) { say("CHANX-MINT-FAIL", 15); return 1; }
+    var fa = load64(fds);
+    var fb = load64(fds + 8);
+    var buf = alloc(128);
+    store64(buf, 0x1122334455667788);
+    if (sys_chan_send(fa, buf, 8) != 8) { say("CHANX-SEND-FAIL", 15); return 1; }
+    store64(buf, 0);
+    if (sys_chan_recv(fb, buf, 64) != 8) { say("CHANX-RECV-FAIL", 15); return 1; }
+    if (load64(buf) != 0x1122334455667788) { say("CHANX-CONTENT-FAIL", 18); return 1; }
+    say("CHANX-ROUNDTRIP-OK", 18);
+
+    # Spawn the child holding the INHERITED fd. ⚠ `spawn_path #43` copies the whole fd table, so `fa`
+    # is open at the same index in the child — which is exactly the state the criterion is about.
+    var cmd = alloc(64);
+    var w = 0;
+    var lit = "/bin/chanx child ";
+    while (w < 17) { store8(cmd + w, load8(lit + w)); w = w + 1; }
+    var d = fa;
+    if (d >= 10) { store8(cmd + w, 48 + (d / 10)); w = w + 1; }
+    store8(cmd + w, 48 + (d % 10)); w = w + 1;
+    store8(cmd + w, 0);
+    say_num("CHANX-SPAWNING-CHILD-WITH-FD ", 29, fa);
+    var pid = sys_spawn_path(cmd, w);
+    say_num("CHANX-SPAWN-RET ", 16, pid);
+    if (pid < 0) { say("CHANX-SPAWN-FAIL", 16); return 1; }
+
+    # Let the child run to completion. ⛔ `#43` is non-blocking by design and the parent must not exit
+    # first — a dead parent releases the endpoint and the child would then be refused for the RIGHT
+    # answer for the WRONG reason (peer gone, not foreign owner), which would silently pass the test.
+    #
+    # ⛔ THIS WAS A `sched_yield` SPIN AND IT DID NOTHING. ipc.md §9.4 says it outright: "`sched_yield`
+    # #44 is a silent successful no-op under any of four guards, two enterable without the caller
+    # knowing — and a foreground `run` is IF=0 and gets the no-op." chanx runs under exactly that
+    # foreground `run`, so 200 yields were 200 no-ops, the child never got scheduled, and the smoke's
+    # "no record was accepted from an inherited fd" assertions passed on SILENCE. A vacuous pass on the
+    # primary kill criterion is the worst possible failure mode for this file.
+    #
+    # `sleep_ms` genuinely blocks (it is one of the two shipped "must wait" answers), and waitpid gives
+    # a definite end rather than a guessed one.
+    # ⛔ AND `waitpid` IS NOT THE RIGHT INSTRUMENT EITHER — measured, not assumed. A loop of
+    # `if (sys_waitpid(pid) >= 0) break;` exited on the FIRST call for a child that had produced no
+    # output at all: `#4` answers 0 for "no exit code yet", so `>= 0` is true immediately and the loop
+    # is a no-op wearing a wait's clothes. Two different "waits" in a row that did not wait is the same
+    # trap twice, which is why this now blocks on the one primitive whose blocking is not in question.
+    var waited = 0;
+    while (waited < 60) {
+        sys_sleep_ms(25);
+        waited = waited + 1;
+    }
+
+    sys_chan_close(fa);
+    sys_chan_close(fb);
+    say("CHANX-PARENT-DONE", 17);
+    return 0;
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

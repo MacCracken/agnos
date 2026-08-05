@@ -205,6 +205,7 @@ else
         [ -n "$MULTICHUNK_SELFTEST" ] && echo '#define MULTICHUNK_SELFTEST'
         [ -n "$EXEC_SELFTEST" ]      && echo '#define EXEC_SELFTEST'
         [ -n "$SYMLINK_SELFTEST" ]   && echo '#define SYMLINK_SELFTEST'
+        [ -n "$CHAN_RING3_SELFTEST" ] && echo '#define CHAN_RING3_SELFTEST'
         [ -n "$ARK_SELFTEST" ]       && echo '#define ARK_SELFTEST'
         [ -n "$ARK_INSTALL_SELFTEST" ] && echo '#define ARK_INSTALL_SELFTEST'
         [ -n "$BASESTACK_SELFTEST" ] && echo '#define BASESTACK_SELFTEST'

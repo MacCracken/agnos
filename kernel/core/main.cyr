@@ -2869,6 +2869,31 @@ fn symlink_disk_selftest() {
 symlink_disk_selftest();
 #endif
 
+#ifdef CHAN_RING3_SELFTEST
+# 1.56.40 — the RING-3 half of the channel band (`#97 chan_op`), and the only place §9.9's two kill
+# criteria can be tested at all. The exerciser is a REAL cyrius `--agnos` program
+# (tests/chan/chanx.cyr, staged at /bin/chanx by the smoke's mkfs seed) driving the cyrius
+# `sys_chan_*` PEER landed in 6.5.8 — not a raw hand-asm syscall, and not a raw `syscall(97, …)`.
+#
+# ⛔ WHY IT CANNOT BE DONE FROM THE BOOT SELFTEST. That runs under the KERNEL's CR3 and as ONE process:
+#   · region reachability is claimed "from a spawned client's CR3" — a kernel-CR3 pass says nothing;
+#   · the primary criterion is that an INHERITED fd is inert in a spawned child, and the boot selftest
+#     can only fake inheritance by corrupting the owner field, which tests the check, not the inherit.
+# chanx spawns a real `#43` child (agnos copies the whole fd table — there is no CLOEXEC) and hands it
+# the fd BY NUMBER on argv, so the child holds exactly the handle the criterion is about and calls
+# SEND/RECV on it. It then mints its OWN channel and uses it successfully, because "refused" and
+# "refused for the right reason" are different claims and only the pair separates them.
+fn chan_ring3_selftest() {
+    if (ext2_active == 0) { return 0; }
+    syscall_init();
+    kprintln("exec: running /bin/chanx", 24);
+    sh_exec("run /bin/chanx", 14);
+    kprintln("exec: chan ring3 selftest done", 30);
+    return 0;
+}
+chan_ring3_selftest();
+#endif
+
 #ifdef ARK_SELFTEST
 # Server-stage probe (compile-gated, ARK_SELFTEST=1): does the real ~16 MB ark
 # binary LOAD + RUN in ring 3 on agnos? ark is by far the largest binary attempted

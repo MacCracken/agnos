@@ -4,16 +4,22 @@ version = "0.1.0"
 description = "Host-side SEMANTIC PROOF for the local-IPC channel band (#97). Asserts the record/batch/liveness contract from planning/ipc.md §9 against Linux socketpair(SOCK_SEQPACKET) BEFORE any kernel code exists — bite 3 of the twelve-bite migration. Zero kernel lines, zero QEMU."
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.5.6"
+cyrius = "6.5.8"   # the release that landed the #97 chan_* peer (SYS_CHAN_OP + sys_chan_* wrappers)
 
 [build]
 entry = "chantest.cyr"
 output = "build/chantest"
 
-# ⛔ LINUX-ONLY, DELIBERATELY. This is the one bite in the migration that must NOT touch agnos: its
-# whole value is that it pins the contract down on a substrate that already implements message
-# boundaries correctly, so the kernel band later has something to be measured AGAINST rather than
-# being its own specification. Building it `--agnos` would defeat that — agnos has no socketpair, and
-# if it did, the proof would be checking the implementation against itself.
+# TWO programs live here and they target DIFFERENT platforms on purpose:
+#
+#   chantest.cyr  HOST ONLY (bite 3) — the semantic proof over Linux socketpair(SOCK_SEQPACKET). Its
+#                 whole value is pinning the contract down on a substrate that already implements
+#                 message boundaries correctly, so the kernel band has something to be measured
+#                 AGAINST. Building it `--agnos` would defeat that: agnos has no socketpair, and if it
+#                 did, the proof would be checking the implementation against itself.
+#   chanx.cyr     AGNOS ONLY (bite 4b) — the ring-3 exerciser that closes both of §9.9's kill criteria,
+#                 neither of which the boot selftest can reach: region reachability from a SPAWNED
+#                 CLIENT'S CR3, and an INHERITED channel fd being inert in a real spawned child.
+#                 Build with `cyrius build --agnos chanx.cyr build/chanx`.
 [deps]
-stdlib = ["syscalls", "string", "alloc", "io", "fmt"]
+stdlib = ["syscalls", "string", "alloc", "io", "fmt", "args"]

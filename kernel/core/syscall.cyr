@@ -539,6 +539,7 @@ fn fault_kill_current(vector) {
     flock_release_pid(pid);                       # release advisory locks (mirror exit#0)
     snd_release_pid(pid);                         # release any snd#64 audio slot (Gate 2)
     shm_release_pid(pid);                         # 1.56.40 bite 1: release shm#71/#86 slots (mirror exit#0)
+    chan_release_pid(pid);                        # 1.56.40 bite 4: release #97 channel endpoints (mirror exit#0)
     gpu_release_pid(pid);                         # 1.55.x: hand the scanout back to the console. Without
     # this a full-screen app that FAULTS would strand its last
     # frame on the panel forever while the console scrolled
@@ -4553,6 +4554,32 @@ fn chan_auth(base) {
 # path that forgot to clear it — and the death modes that matter here are faults, not clean exits.
 fn chan_peer_alive(e) { return load64(&chan_end_open + (e ^ 1) * 8); }
 
+# Release every endpoint owned by `pid`. Sibling of flock_/snd_/gpu_/shm_release_pid, and like them it
+# MUST run from BOTH death sites.
+#
+# ⛔ THIS WAS MISSING FROM THE FIRST CUT OF THE BAND and nothing caught it — the boot selftest closes
+# its channels by hand, so a leak on the death path is invisible there. With only 16 channels, a client
+# that faults leaves its endpoint claimed for the rest of the boot and the sixteenth crash exhausts the
+# table. Found while chasing why a spawned child produced no output; unrelated to that, and real.
+#
+# ⚠ It deliberately does NOT close the PEER. Peer-gone is derived from `chan_end_open[e ^ 1]`, so the
+# survivor must keep its own endpoint open in order to be TOLD its peer died — closing both would turn
+# a peer's death into the survivor's own fd going bad, which is a different and much worse error.
+fn chan_release_pid(pid) {
+    var e = 0;
+    while (e < CHAN_ENDS) {
+        if (load64(&chan_end_open + e * 8) == 1) {
+            if (load64(&chan_end_owner + e * 8) == pid) {
+                store64(&chan_end_open + e * 8, 0);
+                store64(&chan_end_owner + e * 8, 0);
+                store64(&chan_end_oepoch + e * 8, 0);
+            }
+        }
+        e = e + 1;
+    }
+    return 0;
+}
+
 var CH_CAPS   = 0x00;               # (out_uva, out_len) -> 0; writes the caps block
 var CH_MINT   = 0x01;               # (out_uva) -> 0; writes two fds — a channel is minted as a PAIR
 var CH_SEND   = 0x02;               # (fd, buf, len<=64) -> len / -CH_E_*
@@ -6945,6 +6972,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         flock_release_pid(proc_current_get());
         snd_release_pid(proc_current_get());      # release any snd#64 audio slot (Gate 2)
         shm_release_pid(proc_current_get());      # 1.56.40 bite 1: release shm#71/#86 slots (mirror fault-kill)
+        chan_release_pid(proc_current_get());     # 1.56.40 bite 4: release #97 channel endpoints (mirror fault-kill)
         gpu_release_pid(proc_current_get());      # 1.55.x: if it owned the scanout, hand the screen back
         # to the console (else a full-screen app quitting would
         # leave its last frame up while console text scrolled
