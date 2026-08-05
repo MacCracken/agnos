@@ -5404,12 +5404,16 @@ fn mdo_native() {
 # frame to page-flip DOOM on this iron. This op does not invent a mechanism; it reuses the address group at
 # a sub-frame offset.
 #
-# ⛔ NO LATCH, AND THAT IS A CONSIDERED CHOICE, not an oversight. `modeset_arm` guards writes that can leave
-# the pipe DARK across a reboot — the OTG envelope, the PHY. This op writes only the address group, which
-# cannot hang or blank the pipe, and its entire state lives in RAM: a reboot restores the firmware scanout
-# with nothing to disarm. Taking the latch would cost the operator an `rm /.modeset-armed` for a write that
-# carries none of the risk the latch exists for. Same treatment `gpu_scanout_redirect` and
-# `gpu_blit_present` already get.
+# ⛔⛔ THIS OP TAKES THE LATCH — AND THE EARLIER "no latch, a considered choice" NOTE HERE WAS RIGHT UNTIL
+# 1.56.38 AND IS NOW WRONG. Its argument: this writes only the address group, which cannot hang or blank
+# the pipe, and all its state is in RAM, so a reboot undoes it with nothing to disarm. Every clause of that
+# is still true — and it was load-bearing on the assumption the op is RUNTIME-ONLY. "A reboot undoes it"
+# is only a recovery while a human has to type the command.
+# ⭐ 1.56.38 runs the pan AT BOOT (main.cyr, straight after the native modeset), and that changes the
+# calculus completely: a pan that leaves the console unreadable would now REPEAT on every boot. Loopable
+# is exactly the property the latch exists for — the same reasoning that made the boot-time native modeset
+# need it. A write being individually harmless does not make it safe to run unconditionally at boot.
+# ⚠ Site 12, distinct from native's 11, so the latch record names WHICH of the two was in flight.
 #
 # ⚠ REQUIRES A NATIVE PIPE. On a scaled pipe the console geometry and the raster disagree, so a pan would
 # move the scanout by one text row of the SOURCE and the scaler would smear the result — refuse instead.
@@ -5439,6 +5443,10 @@ fn mdo_pan() {
     kprint(" pitch ", 7); kprint_num(fb_pitch());
     kprint(" software scroll costs ", 23); kprint_num(fb_pitch() * fb_height() / 1024);
     kprintln(" KB per line", 12);
+    # Arm LAST — every refusal above is read-only and leaves the console untouched, so arming before them
+    # would burn the latch on a call that never wrote a register. Same ordering as mdo_native.
+    if (modeset_arm(12) != 1) { kprintln("modeset: pan refused -- latch would not arm", 43); return MDO_E_ARM; }
+    if (modeset_armed != 1297040453) { kprintln("modeset: pan refused -- not armed", 33); return MDO_E_ARM; }
     if (gpu_pan_arm() != 1) {
         kprintln("modeset: PAN REFUSED -- buffer would not fit below the back buffers; console unchanged", 86);
         return MDO_E_NOPAN;

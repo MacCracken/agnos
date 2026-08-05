@@ -1224,6 +1224,18 @@ if (mdo_native() == 0) {
     # thrown away every line printed up to here.
     klug_replay_fb();
     kprintln("gpu: boot console is NATIVE -- 2560x1440 scanout, scaler bypassed", 65);
+    # ⭐ 1.56.38 — AND PAN IT, because native ALONE made the boot 5.3x slower. MEASURED ON IRON:
+    # `Timer ticks before sched` went 28 (1.56.37, 800x600) -> 149 (1.56.38 first cut, native with the
+    # SOFTWARE scroll), on two consecutive boots. That is the 14,400 KB-per-scrolled-line cost the pan was
+    # built to remove, reintroduced at boot by taking the console native without taking it panned.
+    # ⇒ The two belong together: native without the pan is a slower console, not a better one.
+    # Ordering is forced — mdo_pan refuses unless the pipe is already native (MDO_E_RASTER).
+    # ⚠ mdo_pan arms the latch too (site 12), so an unclean shutdown skips BOTH on the next boot and the
+    # console comes up on the inherited mode at the inherited speed. A refusal here is harmless: the
+    # console stays native on the software scroll, which is exactly the state this boot started in.
+    if (mdo_pan() == 0) {
+        kprintln("gpu: boot console PANS in hardware -- scroll is one address write", 65);
+    }
 }
 
 #ifdef KLUG_SPILL_SELFTEST

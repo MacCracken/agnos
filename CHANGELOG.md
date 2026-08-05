@@ -27,7 +27,31 @@ SKIPPED` and needed a manual `rm /.modeset-armed`. **(2)** The boot console is s
 `MDO_OP_NATIVE` is iron-proven, so the native modeset can move to boot time, behind the latch that (1)
 makes usable.
 
-### Added — the console boots at native resolution
+### Added — the console boots at native resolution AND hardware-panned
+
+`main.cyr` calls `mdo_native()` after `gpu_pixclk_discover()`, then `mdo_pan()`, then `klug_replay_fb()`.
+Ordering is forced: `mdo_native` refuses unless the target equals the link's active raster, and
+`gpu_h_active` / `gpu_v_active` are not derived until `gpu_pixclk_discover`; `mdo_pan` refuses unless the
+pipe is already native.
+
+**Both are needed together.** Measured on iron: `Timer ticks before sched` went **28** (1.56.37, 800x600)
+to **149** (native with the software scroll) across two consecutive boots — a 5.3x slower boot, which is
+the 14,400 KB-per-scrolled-line cost the pan exists to remove, reintroduced by taking the console native
+without taking it panned.
+
+Neither is gated on success: a refusal (no GPU, latch armed, pipe != 0, raster mismatch) leaves the
+console on the inherited geometry and scroll, which is a correct outcome.
+
+### Changed — `MDO_OP_PAN` now arms the latch (site 12)
+
+It did not before, on the argument that it writes only the surface-address group — the same live write
+that page-flips DOOM every frame — so it cannot hang or blank the pipe, and a reboot undoes it. All of
+that remains true, and it stopped being sufficient when the pan began running at boot: a pan that leaves
+the console unreadable would repeat every boot. Site 12 is distinct from native's 11 so the latch record
+names which was in flight. `/bin/modeset --pan` gains exit **98** (latch would not arm).
+
+`modeset-latch-smoke` gains two more guards — a no-GPU boot must not arm at site 12 and must not claim
+`gpu: boot console PANS in hardware`. 32 passed, 0 failed.
 
 `main.cyr` calls `mdo_native()` after `gpu_pixclk_discover()`, then `klug_replay_fb()` and logs
 `gpu: boot console is NATIVE -- 2560x1440 scanout, scaler bypassed`. It must sit after

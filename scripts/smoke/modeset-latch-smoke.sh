@@ -112,6 +112,15 @@ want   "$LOGS/boot1.log" "modeset: no latch -- proceeding" "boot1: no latch on a
 wantno "$LOGS/boot1.log" "modeset: latch armed at site=11" \
        "boot1: the boot-native modeset did NOT arm the latch with no GPU (gpu_present precedes the arm)" \
        "boot1: boot-native armed the latch under QEMU — a headless boot would strand a latch every time"
+# 1.56.38: the boot-time PAN arms at site 12 and must be gated identically. It only runs after a successful
+# native modeset, so with no GPU it should never be reached at all — but assert it rather than infer it,
+# because "unreachable" is exactly the kind of claim that stops being true when a call site moves.
+wantno "$LOGS/boot1.log" "modeset: latch armed at site=12" \
+       "boot1: the boot-time pan did NOT arm the latch with no GPU" \
+       "boot1: boot-pan armed the latch under QEMU — a headless boot would strand a latch every time"
+wantno "$LOGS/boot1.log" "gpu: boot console PANS in hardware" \
+       "boot1: no false 'boot console PANS' with no DCN present" \
+       "boot1: claimed a hardware-panned console under QEMU — mdo_pan returned 0 with no GPU"
 # And it must not claim a native console it could not have produced.
 wantno "$LOGS/boot1.log" "gpu: boot console is NATIVE" \
        "boot1: no false 'boot console is NATIVE' with no DCN present" \

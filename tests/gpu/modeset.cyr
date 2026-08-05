@@ -417,11 +417,14 @@ fn modeset_native(): i64 {
 # ⛔ RUN `--native` FIRST. The op refuses on a scaled pipe (84) because a pan there would move the scanout
 # by one SOURCE text row and the scaler would smear it.
 #
-# ⚠ NO LATCH IS TAKEN, deliberately: this writes only the surface-address group — the same live write that
-# page-flips DOOM every frame — so it cannot hang or blank the pipe, and all its state is in RAM. A reboot
-# undoes it with nothing to disarm.
+# ⚠ THE LATCH IS TAKEN (site 12) as of 1.56.38. It was not before, on the argument that this writes only
+# the surface-address group — the same live write that page-flips DOOM every frame — so it cannot hang or
+# blank the pipe, and a reboot undoes it. All of that is still true, and it stopped being sufficient the
+# moment 1.56.38 started running the pan AT BOOT: a pan that leaves the console unreadable would repeat on
+# every boot. Loopable is what the latch is for.
 #   95 = armed -- SCROLL SOMETHING AND WATCH IT      87 = already armed (a repeat run)
 #   84 = pipe is not native -- run --native first    82 = buffer would not fit; console left on the slow path
+#   98 = latch would not arm (last session did not end cleanly; a clean shutdown clears it)
 #   96 = no GPU / live pipe != 0 (QEMU has no DCN)
 fn modeset_pan(): i64 {
     var rec[64];
@@ -448,6 +451,11 @@ fn modeset_pan(): i64 {
             m_puts("modeset: the pipe is NOT NATIVE, so a pan would move the scanout by one SOURCE"); m_nl();
             m_puts("modeset: text row and the scaler would smear it. Run:  modeset --native"); m_nl();
             return 84;
+        }
+        if (reason == 4) {
+            m_puts("modeset: latch would not arm -- the last session did not end cleanly, so this"); m_nl();
+            m_puts("modeset: boot is running the inherited mode. A clean reboot/poweroff clears it."); m_nl();
+            return 98;
         }
         if (reason == 30) {
             m_puts("modeset: the pan buffer would not fit below the A/B back buffers, so it was"); m_nl();
