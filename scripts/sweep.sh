@@ -75,6 +75,12 @@ run_gate "1.40.x exec-from-disk (run /bin/prog2 + ENOEXEC)" "EXEC_SELFTEST=1 EXT
 # error). Both fixed 2026-08-05. A selftest nothing runs is not coverage; it is a comment.
 run_gate "1.41.5 syscall hardening + epoll no-hang"  "SYSCALL_HARDEN_SELFTEST=1"                "syscall-harden-smoke.sh"
 
+# --- 1.56.40 channel band (#97): the RING-3 half, and the only place §9.9's kill criteria can be met ---
+# ⛔ The boot selftest structurally cannot close either: it runs under the KERNEL's CR3 (so it says
+# nothing about region reachability from a client's page tables) and it can only FAKE an inherited fd by
+# corrupting the owner field, which tests the check rather than the inheritance.
+run_gate "1.56.40 chan #97 ring-3 kill criteria"     "CHAN_RING3_SELFTEST=1"                    "chan-ring3-smoke.sh"
+
 # --- 1.52.x audio: HDA probe -> reset -> verb ring -> codec graph -> stream DMA-arm ---
 run_gate "1.52.x audio HDA (probe/reset/verb/graph/stream)" "" "hda-smoke.sh"
 

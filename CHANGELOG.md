@@ -177,6 +177,67 @@ resolution), not this. The ring-3 test is blocked behind the same two lines. ⛔
 was deliberately **not** used to route around it — raw numbers on agnos paths are a confirmed shipping
 defect class in this ecosystem, and the gate exists to stop exactly that.
 
+### Added — the band's objects, and BOTH of §9.9's kill criteria closed (bite 4)
+
+`CH_MINT` / `CH_SEND` / `CH_RECV` / `CH_CLOSE` (mask `0x1F`; `CH_HANDOFF`/`CH_DIAL` still reserved with
+their bits clear). 32 endpoints → 16 channels, `e` paired with `e ^ 1`, each owning one 4096 B page of
+the region as its **inbox** — a sender writes into its peer's.
+
+⛔ **Cursors live in kernel arrays, not in the page.** Ring 3 cannot address a cursor, so forging
+occupancy, rewinding a peer's consumption, and injection are all gone by construction — the rejected
+shared-region design put them in userland-visible memory and its own judge found keystroke capture and
+injection on the display channel with *"NO MITIGATION IN v1"*. Ring 3 never addresses the page either;
+it copies through the syscall. Cursors are monotonic and never wrap, so equality means genuinely
+drained.
+
+Bounded-queue with **drop-oldest**, not back-pressure — §3 measured presents as idempotent overwrites
+and input as droppable, and a blocking send would starve the peer it waits on. Drops are counted.
+
+### Fixed — channel endpoints were never released at process death
+
+`chan_release_pid` at **both** death sites, beside `flock_`/`snd_`/`gpu_`/`shm_release_pid`. The first
+cut of the band shipped without it and nothing caught it: the boot selftest closes its channels by hand,
+so a leak on the death path is invisible there. With 16 channels, the sixteenth client crash exhausts
+the table. ⚠ It deliberately does **not** close the peer — peer-gone is derived from
+`chan_end_open[e ^ 1]`, so the survivor must keep its own endpoint open in order to be *told* its peer
+died.
+
+### Added — `tests/chan/chanx.cyr` + `chan-ring3-smoke.sh`: the kill criteria, actually tested
+
+⭐ **Kill criterion 1 — the 2 MB region resolves from a RING-3 proc's CR3.** `CH_CAPS` re-probes live on
+every call, so calling it from ring 3 *is* the test. The boot selftest runs under the kernel CR3 and
+could never have closed this.
+
+⭐⭐ **Kill criterion 2 — an INHERITED channel fd is inert.** The **kernel** mints the channel and queues
+a record *before* exec'ing chanx; `elf_load_from_file` copies the creator's whole fd table (agnos has no
+CLOEXEC), so the child holds a real, open, live handle owned by a proc that outlives it. Both SEND and
+RECV are refused, while the same proc's **own** channel works — because "refused" and "refused for the
+right reason" are different claims, and a kernel that blanket-refused every `chan_op` from a second
+process would pass the first assertion while being badly wrong.
+
+⛔ **Three "waits" that did not wait, all predicted by the design doc I was implementing.** The first
+shape had a parent spawn a child and wait: `sched_yield` is a documented no-op under a foreground `run`
+(§9.4); `waitpid #4` answers 0 for "not yet", so a `>= 0` loop exits instantly; and `sleep_ms` holds
+preempt disabled and **starves the very child it waits for** — §9.4 names that as "the poison that made
+TCP toxic". Minting in the kernel before exec removes the need for concurrency entirely.
+
+⛔ **The smoke's negative assertions were passing on SILENCE.** "No record accepted from an inherited
+fd" is satisfied just as well by a child that never ran — which is exactly what was happening. Every
+`deny` now requires positive evidence the arm executed and reports **VACUOUS** otherwise. On the primary
+kill criterion that is the difference between a proof and a decoration.
+
+⛔ **And the dwell marker truncated the test.** `CHANX-INH-` matched the *first* verdict line and killed
+QEMU before the second assertion ran, so a cut-off log read as a failing one. The marker is now
+`CHANX-DONE`, a line that can only be last — the exact hazard `qemu-dwell.sh`'s own header warns about,
+met in practice.
+
+**Mutation-proven, and the first attempt was not enough.** Removing the owner check alone did **not**
+break the test — the two identity checks (owner, and the bite-2 proc-epoch stamp) are **redundant**, so
+either alone suffices. Only removing **both** makes the inherited fd accept records, and the smoke then
+fails. ⚠ That run also exposed a confound: with an empty queue, RECV "refused" merely because there was
+nothing to read. The kernel now queues a record first, so a RECV refusal can only be the authority
+check — re-controlled, and with both checks removed **both** SEND and RECV are accepted.
+
 ### Added — the channel band's contract is executable before the band exists (bite 3)
 
 `tests/chan/chantest.cyr` + `scripts/check/chan-semantics-check.sh`, wired into `check.sh`. Host-side,

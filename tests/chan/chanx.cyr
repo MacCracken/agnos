@@ -35,7 +35,7 @@ fn say_num(s, n, v) {
     return 0;
 }
 
-fn child_main(fd): i64 {
+fn inherit_main(fd): i64 {
     var buf = alloc(128);
     var ok = 1;
 
@@ -44,12 +44,12 @@ fn child_main(fd): i64 {
     # is not its owner. A success on either line means inert-by-construction is false.
     store64(buf, 0x4445414442454546);
     var sr = sys_chan_send(fd, buf, 8);
-    if (sr >= 0) { say("CHANX-CHILD-SEND-ACCEPTED-INHERITED-FD", 38); ok = 0; }
-    else { say("CHANX-CHILD-SEND-REFUSED", 24); }
+    if (sr >= 0) { say("CHANX-INH-SEND-ACCEPTED-INHERITED-FD", 36); ok = 0; }
+    else { say("CHANX-INH-SEND-REFUSED", 22); }
 
     var rr = sys_chan_recv(fd, buf, 64);
-    if (rr >= 0) { say("CHANX-CHILD-RECV-ACCEPTED-INHERITED-FD", 38); ok = 0; }
-    else { say("CHANX-CHILD-RECV-REFUSED", 24); }
+    if (rr >= 0) { say("CHANX-INH-RECV-ACCEPTED-INHERITED-FD", 36); ok = 0; }
+    else { say("CHANX-INH-RECV-REFUSED", 22); }
 
     # ⚠ The child DOES get its own working channel — inertness must be a property of the inherited
     # claim, not of the child being unable to use the band at all. Without this, a kernel that simply
@@ -59,50 +59,41 @@ fn child_main(fd): i64 {
         var ca = load64(mine);
         var cb = load64(mine + 8);
         store64(buf, 0x0102030405060708);
-        if (sys_chan_send(ca, buf, 8) != 8) { say("CHANX-CHILD-OWN-SEND-FAIL", 25); ok = 0; }
+        if (sys_chan_send(ca, buf, 8) != 8) { say("CHANX-INH-OWN-SEND-FAIL", 23); ok = 0; }
         store64(buf, 0);
-        if (sys_chan_recv(cb, buf, 64) != 8) { say("CHANX-CHILD-OWN-RECV-FAIL", 25); ok = 0; }
-        if (load64(buf) != 0x0102030405060708) { say("CHANX-CHILD-OWN-CONTENT-FAIL", 28); ok = 0; }
+        if (sys_chan_recv(cb, buf, 64) != 8) { say("CHANX-INH-OWN-RECV-FAIL", 23); ok = 0; }
+        if (load64(buf) != 0x0102030405060708) { say("CHANX-INH-OWN-CONTENT-FAIL", 26); ok = 0; }
         sys_chan_close(ca);
         sys_chan_close(cb);
-        if (ok == 1) { say("CHANX-CHILD-OWN-CHANNEL-OK", 26); }
+        if (ok == 1) { say("CHANX-INH-OWN-CHANNEL-OK", 24); }
     }
-    else { say("CHANX-CHILD-OWN-MINT-FAIL", 25); ok = 0; }
+    else { say("CHANX-INH-OWN-MINT-FAIL", 23); ok = 0; }
 
-    if (ok == 1) { say("CHANX-CHILD-PASS", 16); return 0; }
-    say("CHANX-CHILD-FAIL", 16);
+    # ⛔ ONE UNCONDITIONAL FINAL LINE, and the smoke's dwell marker is THIS, not any verdict. A marker
+    # that matches a verdict truncates the run at the first one — the earlier `CHANX-INH-` marker fired
+    # on SEND-REFUSED and killed QEMU before RECV was even attempted, which reads as a failing assertion
+    # rather than a cut-off log. A terminal marker must be a line that can only be last.
+    if (ok == 1) { say("CHANX-INH-PASS", 14); }
+    else { say("CHANX-INH-FAIL", 14); }
+    say("CHANX-DONE", 10);
+    if (ok == 1) { return 0; }
     return 1;
 }
 
 fn main(): i64 {
     alloc_init();
+    say("CHANX-START", 11);
 
-    # `chanx child <fd>` — argv[1] == "child"
-    if (argc() > 2) {
-        var a1 = argv(1);
-        if (load8(a1) == 99) {                      # 'c'
-            var fdv = 0;
-            var p = argv(2);
-            var i = 0;
-            while (load8(p + i) >= 48) {
-                if (load8(p + i) > 57) { i = i; }
-                fdv = fdv * 10 + (load8(p + i) - 48);
-                i = i + 1;
-            }
-            return child_main(fdv);
-        }
-    }
-
-    say("CHANX-PARENT-START", 18);
     var caps = alloc(64);
     store64(caps, 0); store64(caps + 8, 0);
     if (sys_chan_caps(caps, 16) != 0) { say("CHANX-CAPS-FAIL", 15); return 1; }
 
-    # ⭐ KILL CRITERION 1, from a ring-3 CR3 rather than the kernel's.
+    # ⭐ KILL CRITERION 1 — from a RING-3 CR3, which the boot selftest cannot reach.
     if (load64(caps + 8) != 1) { say("CHANX-REGION-UNREACHABLE-FROM-RING3", 35); return 1; }
     say("CHANX-REGION-REACHABLE-FROM-RING3", 33);
     say_num("CHANX-CAPS-MASK ", 16, load32(caps));
 
+    # A ring-3 proc can mint and round-trip on its OWN channel.
     var fds = alloc(32);
     if (sys_chan_mint(fds) != 0) { say("CHANX-MINT-FAIL", 15); return 1; }
     var fa = load64(fds);
@@ -114,50 +105,29 @@ fn main(): i64 {
     if (sys_chan_recv(fb, buf, 64) != 8) { say("CHANX-RECV-FAIL", 15); return 1; }
     if (load64(buf) != 0x1122334455667788) { say("CHANX-CONTENT-FAIL", 18); return 1; }
     say("CHANX-ROUNDTRIP-OK", 18);
-
-    # Spawn the child holding the INHERITED fd. ⚠ `spawn_path #43` copies the whole fd table, so `fa`
-    # is open at the same index in the child — which is exactly the state the criterion is about.
-    var cmd = alloc(64);
-    var w = 0;
-    var lit = "/bin/chanx child ";
-    while (w < 17) { store8(cmd + w, load8(lit + w)); w = w + 1; }
-    var d = fa;
-    if (d >= 10) { store8(cmd + w, 48 + (d / 10)); w = w + 1; }
-    store8(cmd + w, 48 + (d % 10)); w = w + 1;
-    store8(cmd + w, 0);
-    say_num("CHANX-SPAWNING-CHILD-WITH-FD ", 29, fa);
-    var pid = sys_spawn_path(cmd, w);
-    say_num("CHANX-SPAWN-RET ", 16, pid);
-    if (pid < 0) { say("CHANX-SPAWN-FAIL", 16); return 1; }
-
-    # Let the child run to completion. ⛔ `#43` is non-blocking by design and the parent must not exit
-    # first — a dead parent releases the endpoint and the child would then be refused for the RIGHT
-    # answer for the WRONG reason (peer gone, not foreign owner), which would silently pass the test.
-    #
-    # ⛔ THIS WAS A `sched_yield` SPIN AND IT DID NOTHING. ipc.md §9.4 says it outright: "`sched_yield`
-    # #44 is a silent successful no-op under any of four guards, two enterable without the caller
-    # knowing — and a foreground `run` is IF=0 and gets the no-op." chanx runs under exactly that
-    # foreground `run`, so 200 yields were 200 no-ops, the child never got scheduled, and the smoke's
-    # "no record was accepted from an inherited fd" assertions passed on SILENCE. A vacuous pass on the
-    # primary kill criterion is the worst possible failure mode for this file.
-    #
-    # `sleep_ms` genuinely blocks (it is one of the two shipped "must wait" answers), and waitpid gives
-    # a definite end rather than a guessed one.
-    # ⛔ AND `waitpid` IS NOT THE RIGHT INSTRUMENT EITHER — measured, not assumed. A loop of
-    # `if (sys_waitpid(pid) >= 0) break;` exited on the FIRST call for a child that had produced no
-    # output at all: `#4` answers 0 for "no exit code yet", so `>= 0` is true immediately and the loop
-    # is a no-op wearing a wait's clothes. Two different "waits" in a row that did not wait is the same
-    # trap twice, which is why this now blocks on the one primitive whose blocking is not in question.
-    var waited = 0;
-    while (waited < 60) {
-        sys_sleep_ms(25);
-        waited = waited + 1;
-    }
-
     sys_chan_close(fa);
     sys_chan_close(fb);
-    say("CHANX-PARENT-DONE", 17);
-    return 0;
+
+    # ⭐⭐ KILL CRITERION 2 — `chanx inherit <fd>`. The fd was minted by the KERNEL proc before this one
+    # was loaded, and `elf_load_from_file` copied that proc's whole fd table into ours, so this handle
+    # is open, live, and owned by somebody else who is still running. Exactly the criterion's state.
+    if (argc() > 2) {
+        var a1 = argv(1);
+        if (load8(a1) == 105) {                     # 'i' — "inherit"
+            var fdv = 0;
+            var p = argv(2);
+            var i = 0;
+            while (load8(p + i) >= 48) {
+                if (load8(p + i) > 57) { i = i; }
+                fdv = fdv * 10 + (load8(p + i) - 48);
+                i = i + 1;
+            }
+            say_num("CHANX-INHERITED-FD ", 19, fdv);
+            return inherit_main(fdv);
+        }
+    }
+    say("CHANX-NO-INHERIT-ARG", 20);
+    return 1;
 }
 
 fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }

@@ -2886,8 +2886,45 @@ symlink_disk_selftest();
 fn chan_ring3_selftest() {
     if (ext2_active == 0) { return 0; }
     syscall_init();
+    # ⭐ MINT THE CHANNEL *HERE*, IN THIS PROC, BEFORE EXEC'ING THE CHILD — that is what makes the
+    # inherited-fd criterion testable at all.
+    #
+    # `elf_load_from_file` calls `vfs_fd_inherit(child, proc_current_get())` unconditionally, so the
+    # child receives a byte-for-byte copy of THIS proc's fd table — including the channel fd, at the
+    # same index. The owner recorded in `chan_end_owner` is this proc, which outlives the child. So the
+    # child holds a real, open, live channel fd that it did not earn, which is precisely the state
+    # §9.9's primary criterion is about.
+    #
+    # ⛔ THE EARLIER SHAPE — parent spawns child, parent waits — COULD NOT WORK, and the design document
+    # says why three separate times: `sched_yield` is a no-op under a foreground `run` (§9.4),
+    # `waitpid #4` answers 0 for "not yet" so a `>= 0` loop exits instantly, and `sleep_ms` holds
+    # preempt disabled and starves the very child it waits for. Minting here removes the need for the
+    # parent and child to be concurrent at all.
+    var cm = kmalloc(64);
+    if (cm == 0) { return 0; }
+    if (ksyscall(97, CH_MINT, cm, 0) != 0) { kprintln("chanx: kernel MINT failed", 25); return 0; }
+    var ifd = load64(cm);
+    # ⛔ QUEUE A RECORD ON THE INHERITED END BEFORE EXEC — otherwise the RECV half of the criterion is
+    # CONFOUNDED. An empty channel answers WOULDBLOCK, which is also negative, so a child that was
+    # correctly refused and a child that simply found nothing waiting are indistinguishable. Measured:
+    # with both identity checks removed, RECV still "refused" purely because the queue was empty. With a
+    # record sitting there, a refusal can only be the authority check.
+    var qbuf = kmalloc(64);
+    if (qbuf != 0) {
+        store64(qbuf, 0x5155455545444154);
+        ksyscall_a4_set(8);
+        ksyscall(97, CH_SEND, load64(cm + 8), qbuf);    # peer end sends -> lands in ifd's inbox
+    }
+    kprint("chanx: inheritable fd ", 22);
+    kprint_num(ifd);
+    kprintln("", 0);
+    var line = kmalloc(64);
+    var w = 0;
+    while (w < 23) { store8(line + w, load8("run /bin/chanx inherit " + w)); w = w + 1; }
+    if (ifd >= 10) { store8(line + w, 48 + (ifd / 10)); w = w + 1; }
+    store8(line + w, 48 + (ifd % 10)); w = w + 1;
     kprintln("exec: running /bin/chanx", 24);
-    sh_exec("run /bin/chanx", 14);
+    sh_exec(line, w);
     kprintln("exec: chan ring3 selftest done", 30);
     return 0;
 }

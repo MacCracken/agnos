@@ -1,13 +1,12 @@
 # `#97 chan_op` — the local-IPC channel band: designed, decided, numbered, and now MINTED (bites 0-4a)
 
-**Status:** 🟠 **IN PROGRESS — bites 0-3 done, 4a landed, 4 blocked on cyrius.** Filed 2026-08-05.
+**Status:** 🟢 **BITES 0-4 DONE — both §9.9 kill criteria CLOSED.** Filed 2026-08-05.
 ⭐ **`#97` is MINTED**: agnos 1.56.40 ships the dispatch arm, a boot-reserved 2 MB region and `CH_CAPS`.
-🔴 **Blocked**: the cyrius peer has no `SYS_CHAN_OP = 97`, so the ABI gate correctly reds `check.sh`
-(`kernel 97 · abi-doc 97 · cyrius 96`) and the ring-3 half of the region kill-criterion cannot be
-written. Filed against cyrius and marked ACTIONABLE there —
+✅ **Unblocked** — cyrius **6.5.8** landed `SYS_CHAN_OP = 97` + the `sys_chan_*` wrappers; the ABI gate
+reads `kernel 97 · abi-doc 97 · cyrius 97`. Ticket —
 [`2026-08-05-agnos-syscall-peer-...`](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-08-05-agnos-syscall-peer-two-new-numbers-and-a-circular-authority.md) §2.
-⚠ Bite 4a proves the region reachable under the **kernel** CR3 only; §9.9 names the **spawned-client**
-CR3, and that half is what the cyrius constant unblocks.
+⭐ Both criteria are now closed by `scripts/smoke/chan-ring3-smoke.sh` (in `sweep.sh`), mutation-proven.
+**Next: bite 5** (endow-with-placement in `proc_create_user`) — the highest-risk bite in the plan.
 **Number:** **`#97`** — ⭐ **settled 2026-08-05.** `#96` stays with `fork`
 ([`2026-08-05-syscall-96-fork.md`](2026-08-05-syscall-96-fork.md)). Next free is **`#98`**.
 **Cross-repo:** agnos (kernel) **+ cyrius** (`lib/syscalls_x86_64_agnos.cyr`) **+ setu 0.8.0** **+ aethersafha**.
@@ -56,8 +55,9 @@ done** — agnos 1.56.35, `EFER.NXE` never enabled on the APs, `smp.cyr:514`.
 | **1** | shm **owner + epoch**, released at both death sites; `shm_free #74` gated on owner | ✅ **DONE.** `#72`/`#73` warn-counted, never refused. ⚠ Measured INERT in the desktop workload — the selftest is its coverage |
 | **2** | `proc_epoch[16]`, written and **never read** | ✅ **DONE**, bumped in `proc_alloc_slot` |
 | **3** | Host semantic proof over `socketpair(SOCK_SEQPACKET)` | ✅ **DONE.** 18 assertions in `check.sh`; negative control over `SOCK_STREAM` fails exactly the 6 framing ones |
-| **4a** | `#97` + the 2 MB region + `CH_CAPS` | ✅ **LANDED.** ⚠ Region proven under the **kernel** CR3 only |
-| **4b** | the ring-3 half of the region kill criterion, then mint/close/send/recv | 🔴 **BLOCKED on cyrius `SYS_CHAN_OP = 97`** |
+| **4a** | `#97` + the 2 MB region + `CH_CAPS` | ✅ **DONE** |
+| **4b** | MINT/SEND/RECV/CLOSE, `chan_release_pid`, and the ring-3 exerciser | ✅ **DONE — both kill criteria closed**, mutation-proven (both identity checks must be removed before an inherited fd accepts anything) |
+| **5** | endow-with-placement in `proc_create_user` | ⏭ next — the plan's highest-risk bite |
 
 ## Kill criterion worth repeating here
 

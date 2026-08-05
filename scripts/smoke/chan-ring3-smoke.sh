@@ -68,10 +68,11 @@ echo "Booting (CHAN_RING3_SELFTEST runs /bin/chanx)..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/chan-ring3.log"
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
-# ⚠ Marker is the parent's own DONE line, not the shell prompt: the child is spawned NON-blocking and
-# its output lands after the parent returns, so stopping at the prompt could truncate the very
-# assertions this gate exists for.
-qemu_dwell "$LOG" "CHANX-PARENT-DONE" "${QEMU_TIMEOUT:-60}" \
+# ⛔ MARKER IS `CHANX-DONE`, A LINE THAT CAN ONLY BE LAST — not a verdict and not the shell prompt.
+# An earlier cut matched `CHANX-INH-`, which fired on the FIRST inherited-fd verdict and killed QEMU
+# before the second assertion ran; the truncated log then read as a failing test rather than a cut-off
+# one. This is the exact hazard qemu-dwell.sh's header warns about, met in practice.
+qemu_dwell "$LOG" "CHANX-DONE" "${QEMU_TIMEOUT:-60}" \
     qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
@@ -90,13 +91,13 @@ want() {
     if strings "$LOG" 2>/dev/null | grep -q "$1"; then echo "  PASS: $2"; else echo "  FAIL: $2"; rc=1; fi
 }
 # ⛔ A `deny` IS VACUOUS UNLESS THE CHILD ACTUALLY RAN. Absence of "record accepted" is satisfied just
-# as well by a child that never got scheduled — which is exactly what happened on the first run of this
+# as well by an arm that never ran — which is exactly what happened on the first run of this
 # smoke (a `sched_yield` spin that §9.4 documents as a no-op under a foreground `run`), and both denies
 # reported PASS on silence. On the PRIMARY kill criterion that is the worst possible failure mode, so
 # every deny now requires positive evidence the child executed.
 deny() {
-    if ! strings "$LOG" 2>/dev/null | grep -q "CHANX-CHILD-"; then
-        echo "  FAIL: $2 — VACUOUS: the child produced no output at all, so this proves nothing"
+    if ! strings "$LOG" 2>/dev/null | grep -q "CHANX-INH-"; then
+        echo "  FAIL: $2 — VACUOUS: the inherit arm produced no output at all, so this proves nothing"
         rc=1
         return 0
     fi
@@ -105,12 +106,12 @@ deny() {
 
 want "CHANX-REGION-REACHABLE-FROM-RING3" "kill criterion 1: the 2 MB region resolves from a RING-3 proc's CR3"
 want "CHANX-ROUNDTRIP-OK"                "a ring-3 proc mints a channel and round-trips a record"
-want "CHANX-CHILD-SEND-REFUSED"          "kill criterion 2: a spawned child's INHERITED fd refuses SEND"
-want "CHANX-CHILD-RECV-REFUSED"          "kill criterion 2: a spawned child's INHERITED fd refuses RECV"
-deny "CHANX-CHILD-SEND-ACCEPTED-INHERITED-FD" "no record ACCEPTED from an inherited fd (inert-by-construction holds)"
-deny "CHANX-CHILD-RECV-ACCEPTED-INHERITED-FD" "no record DELIVERED to an inherited fd (inert-by-construction holds)"
-want "CHANX-CHILD-OWN-CHANNEL-OK"        "the child's OWN channel works — inertness is the CLAIM's property, not a blanket refusal"
-want "CHANX-CHILD-PASS"                  "child verdict"
+want "CHANX-INH-SEND-REFUSED"            "kill criterion 2: an INHERITED fd refuses SEND (owner is another, live proc)"
+want "CHANX-INH-RECV-REFUSED"            "kill criterion 2: an INHERITED fd refuses RECV (owner is another, live proc)"
+deny "CHANX-INH-SEND-ACCEPTED-INHERITED-FD" "no record ACCEPTED from an inherited fd (inert-by-construction holds)"
+deny "CHANX-INH-RECV-ACCEPTED-INHERITED-FD" "no record DELIVERED to an inherited fd (inert-by-construction holds)"
+want "CHANX-INH-OWN-CHANNEL-OK"          "the same proc's OWN channel works — inertness is the CLAIM's property, not a blanket refusal"
+want "CHANX-INH-PASS"                    "inherited-fd verdict"
 
 echo ""
 if [ "$rc" -eq 0 ]; then echo "chan-ring3-smoke: PASS"; else echo "chan-ring3-smoke: FAIL"; fi
