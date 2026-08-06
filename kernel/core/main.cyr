@@ -2921,9 +2921,13 @@ fn chan_ring3_selftest() {
     # kernel refuses this proc" from "the kernel refuses this CLAIM", which is the distinction the
     # authority model rests on.
     var cm2 = kmalloc(64);
+    var endowfd = 0 - 1;
     if (cm2 != 0) {
         if (ksyscall(97, CH_MINT, cm2, 0) == 0) {
-            ksyscall(97, CH_ENDOW, load64(cm2), 0);
+            endowfd = ksyscall(97, CH_ENDOW, load64(cm2), 0);
+            kprint("chanx: endowed fd ", 18);
+            kprint_num(endowfd);
+            kprintln("", 0);
         }
     }
     kprint("chanx: inheritable fd ", 22);
@@ -2934,6 +2938,12 @@ fn chan_ring3_selftest() {
     while (w < 23) { store8(line + w, load8("run /bin/chanx inherit " + w)); w = w + 1; }
     if (ifd >= 10) { store8(line + w, 48 + (ifd / 10)); w = w + 1; }
     store8(line + w, 48 + (ifd % 10)); w = w + 1;
+    # ⭐ ANNOUNCE the endowed fd on argv. The design routes this through `#43`'s KEY=VALUE env blob;
+    # argv carries the same fact with the same guarantee (the parent decides it, the child reads it)
+    # and needs no env plumbing to demonstrate that the ANNOUNCED number is the one that lands.
+    store8(line + w, 32); w = w + 1;
+    if (endowfd >= 10) { store8(line + w, 48 + (endowfd / 10)); w = w + 1; }
+    store8(line + w, 48 + (endowfd % 10)); w = w + 1;
     kprintln("exec: running /bin/chanx", 24);
     sh_exec(line, w);
     kprintln("exec: chan ring3 selftest done", 30);
@@ -3876,13 +3886,19 @@ fn syscall_harden_selftest() {
     if (ksyscall(97, CH_MINT, efds, 0) != 0) { kprintln("shsys: chan endow MINT FAIL", 27); ok = 0; }
     var ea = load64(efds);
     var eb = load64(efds + 8);
-    if (ksyscall(97, CH_ENDOW, ea, 0) != 0) { kprintln("shsys: chan ENDOW FAIL", 22); ok = 0; }
+    # ⭐ ENDOW returns the fd the child will hold — the parent announces it (Wayland's WAYLAND_SOCKET
+    # shape). A zero return would be indistinguishable from "fd 0", so >= 3 is the real assertion.
+    var announced = ksyscall(97, CH_ENDOW, ea, 0);
+    if (announced < 3) { kprintln("shsys: chan ENDOW FAIL", 22); ok = 0; }
     var kid = proc_create_user(0x400000, 0x3FC00000);
     if (kid < 0) { kprintln("shsys: chan endow proc FAIL", 27); ok = 0; }
     if (kid >= 0) {
         var eabase = vfs_fd_table() + ea * 32;
         var eend = kpayload(eabase, 0);
         if (load64(&chan_end_owner + eend * 8) != kid) { kprintln("shsys: endow owner not moved FAIL", 33); ok = 0; }
+        # The announced fd must be exactly where the placement landed — if these can diverge, the child
+        # is told to look at a slot that holds nothing.
+        if (ktag(vfs_fd_table_of(kid) + announced * 32) != VFS_CHAN) { kprintln("shsys: endow fd mismatch FAIL", 29); ok = 0; }
         # ⛔ "THE PARENT'S OWN FD IS NOW INERT" IS *NOT* ASSERTED HERE, AND THE REASON IS THE TEST
         # ENVIRONMENT, NOT THE KERNEL. At this point in boot `proc_current_get()` and the slot
         # `proc_create_user` hands back are the SAME index, so "parent" and "child" are one pid and the

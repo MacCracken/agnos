@@ -283,6 +283,28 @@ trivially — measured, the parent's send returned 8. A degenerate fixture, not 
 asserted in `chanx`, where the two procs genuinely differ. Same reason kill criterion 2 could not live
 in the boot selftest either.
 
+### Added — announcement: `CH_ENDOW` returns the fd the child will hold
+
+A child must be able to FIND the channel it was born holding, or endowment is useless. `CH_ENDOW` now
+returns that fd index instead of 0, and the parent puts it in the child's environment — **exactly
+Wayland's `WAYLAND_SOCKET` shape, where the compositor sets the variable, not the kernel.**
+
+⛔ **And the kernel could not do it anyway, which settles the design rather than merely favouring it.**
+`elf_load_from_file` bakes the env strings into the child's init stack at `elf.cyr:417-451` and calls
+`proc_create_user` — where placement happens — only at `:473`. By the time the kernel knows the fd, the
+env is already written. So the number is decided at **arm** time and handed back.
+
+⛔ **Placement uses the number decided at arm time and REFUSES if it is no longer free** — it does not
+re-scan. A re-scan could land the endowment somewhere other than the index already announced to the
+child, which would leave the child looking at an empty slot: far harder to diagnose than a refusal, and
+precisely the divergence announcement exists to prevent.
+
+**Proven end-to-end in `chanx`:** the parent announced fd **7**, the child used fd **7** *directly* and
+it worked, while its inherited fd 3 stayed inert. ⛔ The test no longer SCANS for a working fd — scanning
+proves only that *some* fd works, which cannot catch a placement that lands somewhere other than the
+announced number. The kernel selftest additionally asserts the placed slot carries `VFS_CHAN` at exactly
+the announced index.
+
 ### Added — the channel band's contract is executable before the band exists (bite 3)
 
 `tests/chan/chantest.cyr` + `scripts/check/chan-semantics-check.sh`, wired into `check.sh`. Host-side,

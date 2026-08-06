@@ -4605,9 +4605,39 @@ var CH_ENDOW  = 0x05;               # (fd) -> 0; arm THIS endpoint for placement
 # endowed into init. Biasing by one removes the init-order dependency entirely rather than adding a
 # boot step that a future reorder could move.
 var pcpu_endow_end[4];              # armed endpoint id + 1; 0 = nothing armed
+var pcpu_endow_fd[4];               # the fd index the placement will use, decided at ARM time
 fn endow_arm_set(v) { store64(&pcpu_endow_end + pcpu_cpu() * 8, v + 1); return 0; }
 fn endow_arm_clear() { store64(&pcpu_endow_end + pcpu_cpu() * 8, 0); return 0; }
 fn endow_arm_get() { return load64(&pcpu_endow_end + pcpu_cpu() * 8) - 1; }
+fn endow_fd_set(v) { store64(&pcpu_endow_fd + pcpu_cpu() * 8, v); return 0; }
+fn endow_fd_get() { return load64(&pcpu_endow_fd + pcpu_cpu() * 8); }
+
+# ⭐ ANNOUNCEMENT: THE PARENT DOES IT, WHICH IS WHY `CH_ENDOW` RETURNS THE FD INSTEAD OF 0.
+#
+# A child must be able to FIND the channel it was born holding, or endowment is useless. ipc.md routes
+# that through the `KEY=VALUE` env blob `#43` already accepts — "exactly Wayland's WAYLAND_SOCKET
+# trick" — and in Wayland it is the COMPOSITOR that sets that variable in the child's environment, not
+# the kernel.
+#
+# ⛔ AND THE KERNEL CANNOT DO IT ANYWAY, WHICH SETTLES THE DESIGN RATHER THAN MERELY FAVOURING IT.
+# `elf_load_from_file` bakes the env strings into the child's init stack at elf.cyr:417-451, and calls
+# `proc_create_user` — where placement happens — only at :473. By the time the kernel knows the fd, the
+# env is already written. So the number has to be decided at ARM time and handed back to the parent,
+# which then puts `AGNOS_CHAN=<fd>` in the env it passes to `#43`. Zero kernel env plumbing.
+#
+# The index is the first free slot >= 3 in the ARMING proc's table (fd 0/1/2 are stdio). The child's
+# table is a byte copy of it, so the same slot is free there — normally. If the parent opens something
+# into that slot between arming and spawning, placement REFUSES rather than overwriting a live fd; see
+# chan_place_into_child.
+fn chan_endow_pick_fd() {
+    var tbl = vfs_fd_table();
+    var f = 3;
+    while (f < 32) {
+        if (ktag(tbl + f * 32) == VFS_FREE) { return f; }
+        f = f + 1;
+    }
+    return 0 - 1;
+}
 
 # ⛔ INERT UNTIL EXPLICITLY TURNED ON. ipc.md §9.6 calls bite 5 "the highest-risk bite" — the hook sits
 # on the birth path of EVERY user process — and requires the "no-op path proven across a full boot
@@ -4641,13 +4671,17 @@ fn chan_place_into_child(child_pid) {
         kprintln("chan: endow REFUSED -- child is on the global fd table", 54);
         return 0 - 1;
     }
-    # Find a free slot in the CHILD's table. fd 0/1/2 are inherited stdio; start above them.
-    var f = 3;
-    while (f < 32) {
-        if (ktag(tbl + f * 32) == VFS_FREE) { f = f; break; }
-        f = f + 1;
-    }
+    # ⛔ USE THE INDEX DECIDED AT ARM TIME, and REFUSE if it is no longer free rather than re-scanning.
+    # Re-scanning here would let the placement silently land somewhere other than the fd already
+    # announced to the child in its env — the child would then look at the wrong slot and find nothing,
+    # which is far harder to diagnose than a refusal.
+    var f = endow_fd_get();
+    if (f < 3) { return 0 - 1; }
     if (f >= 32) { return 0 - 1; }
+    if (ktag(tbl + f * 32) != VFS_FREE) {
+        kprintln("chan: endow REFUSED -- announced fd no longer free", 50);
+        return 0 - 1;
+    }
     # ⭐ OWNERSHIP TRANSFERS. The parent's claim on this endpoint dies here — the child is the owner,
     # stamped with the CHILD's proc epoch, so the parent's own fd for it becomes inert by exactly the
     # rule that makes an inherited copy inert. Endowment is a MOVE, not a share.
@@ -7867,9 +7901,12 @@ fn ksyscall(num, arg1, arg2, arg3) {
             var nb = vfs_fd_table() + arg2 * 32;
             var ne = chan_auth(nb);
             if (ne < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            var tfd = chan_endow_pick_fd();
+            if (tfd < 0) { stack_canary_check(canary); return 0 - CH_E_FULL; }
             endow_arm_set(ne);
+            endow_fd_set(tfd);
             stack_canary_check(canary);
-            return 0;
+            return tfd;                          # the fd the child will hold — announce it in its env
         }
         if (arg1 == CH_CLOSE) {
             if (arg2 < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }

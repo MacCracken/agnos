@@ -35,7 +35,7 @@ fn say_num(s, n, v) {
     return 0;
 }
 
-fn inherit_main(fd): i64 {
+fn inherit_main(fd, endowed_fd): i64 {
     var buf = alloc(128);
     var ok = 1;
 
@@ -80,19 +80,20 @@ fn inherit_main(fd): i64 {
     # ⚠ Discovered by scan rather than announced. The design routes announcement through the `#43`
     # KEY=VALUE env blob (Wayland's WAYLAND_SOCKET trick); that plumbing is not built yet, and scanning
     # proves the property without pretending the announcement exists.
-    var endowed = 0 - 1;
+    # ⛔ THE ANNOUNCED fd IS USED DIRECTLY — NOT DISCOVERED BY SCAN. Scanning would prove only that
+    # SOME fd works, which is a strictly weaker claim: it cannot catch a placement that lands somewhere
+    # other than the number the parent told the child about, and that divergence is the whole failure
+    # mode announcement exists to prevent. The parent decided this number at ARM time and passed it on
+    # argv (the design routes it through `#43`'s env blob; same fact, same guarantee).
     var probe = alloc(64);
     store64(probe, 0x454E444F57454421);
-    var f = 3;
-    while (f < 32) {
-        if (f != fd) {
-            if (sys_chan_send(f, probe, 8) == 8) { endowed = f; f = 32; }
-            else { f = f + 1; }
+    if (endowed_fd < 3) { say("CHANX-INH-NO-ANNOUNCED-FD", 25); ok = 0; }
+    else {
+        if (sys_chan_send(endowed_fd, probe, 8) != 8) {
+            say_num("CHANX-INH-ANNOUNCED-FD-DEAD ", 28, endowed_fd); ok = 0;
         }
-        else { f = f + 1; }
+        else { say_num("CHANX-INH-ENDOWED-FD-WORKS ", 27, endowed_fd); }
     }
-    if (endowed < 0) { say("CHANX-INH-NO-ENDOWED-FD", 23); ok = 0; }
-    else { say_num("CHANX-INH-ENDOWED-FD-WORKS ", 27, endowed); }
 
     if (ok == 1) { say("CHANX-INH-PASS", 14); }
     else { say("CHANX-INH-FAIL", 14); }
@@ -143,8 +144,20 @@ fn main(): i64 {
                 fdv = fdv * 10 + (load8(p + i) - 48);
                 i = i + 1;
             }
+            var efdv = 0 - 1;
+            if (argc() > 3) {
+                efdv = 0;
+                var q = argv(3);
+                var j = 0;
+                while (load8(q + j) >= 48) {
+                    if (load8(q + j) > 57) { j = j; }
+                    efdv = efdv * 10 + (load8(q + j) - 48);
+                    j = j + 1;
+                }
+            }
             say_num("CHANX-INHERITED-FD ", 19, fdv);
-            return inherit_main(fdv);
+            say_num("CHANX-ANNOUNCED-FD ", 19, efdv);
+            return inherit_main(fdv, efdv);
         }
     }
     say("CHANX-NO-INHERIT-ARG", 20);
