@@ -111,6 +111,7 @@ want "CHANX-INH-RECV-REFUSED"            "kill criterion 2: an INHERITED fd refu
 deny "CHANX-INH-SEND-ACCEPTED-INHERITED-FD" "no record ACCEPTED from an inherited fd (inert-by-construction holds)"
 deny "CHANX-INH-RECV-ACCEPTED-INHERITED-FD" "no record DELIVERED to an inherited fd (inert-by-construction holds)"
 want "CHANX-INH-OWN-CHANNEL-OK"          "the same proc's OWN channel works — inertness is the CLAIM's property, not a blanket refusal"
+want "CHANX-INH-ENDOWED-FD-WORKS"        "bite 5: an ENDOWED fd WORKS in the same proc whose INHERITED fd is inert"
 want "CHANX-INH-PASS"                    "inherited-fd verdict"
 
 echo ""

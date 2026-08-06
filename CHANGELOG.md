@@ -238,6 +238,51 @@ fails. ⚠ That run also exposed a confound: with an empty queue, RECV "refused"
 nothing to read. The kernel now queues a record first, so a RECV refusal can only be the authority
 check — re-controlled, and with both checks removed **both** SEND and RECV are accepted.
 
+### Added — endowment: a child can be BORN holding a channel (bite 5)
+
+`CH_ENDOW` (0x05, mask now `0x3F`) arms an endpoint; `chan_place_into_child` in `proc_create_user`
+places it into the next child. ⭐ **This is what makes inert-by-construction usable rather than merely
+safe** — without placement, "an inherited fd does nothing" would mean a child could never hold a
+channel at all. A sandbox is DESCRIBED (a list of endowments), not CARVED (a list of denials).
+
+⭐ **Placement is a MOVE, not a share.** Ownership transfers to the child and is re-stamped with the
+child's proc epoch, so the parent's own fd goes inert by exactly the rule that makes an inherited copy
+inert. A share would leave both usable and quietly defeat the model.
+
+⛔ **You can only endow what you currently own** — `CH_ENDOW` re-derives authority first, so an
+inherited (inert) claim cannot be used to hand a channel onward. Otherwise inertness would leak through
+the grant path.
+
+⛔ **Refuses if the child is on the GLOBAL fd table.** `vfs_fd_inherit` returns success on `kmalloc`
+failure, leaving `proc_fd_base[child] == 0` — "use the global table". Placing there would write a live
+channel fd into the table proc 0, every kthread and every future global-table user shares. The test is
+the RESOLVED table, not `proc_fd_base_get(pid) == 0`, because proc 0's base is set explicitly to
+`&vfs_table` — the same trap that bit `spawn_redirect_apply` at 1.56.39.
+
+⛔ **The arm is stored as endpoint+1 so that 0 means UNARMED.** Module-scope globals zero-init, so a −1
+sentinel would need a boot-time init — and until it ran, the hook would read 0 as "endpoint 0 is armed"
+and place a channel nobody endowed into the first process in the system. Caught before first boot;
+biasing by one removes the init-order dependency instead of adding a step a future reorder could move.
+
+**The no-op path was proven first, as §9.6 requires for "the highest-risk bite."** The hook sits on the
+birth path of *every* user process, so it landed behind `chan_endow_enabled = 0` — present and
+returning immediately — and a full sweep was **17/17** in that state before it was turned on. Setting
+that back to 0 is the intended rollback if placement is ever implicated.
+
+**Proven in `chanx`, one process holding both kinds of handle:** fd 3 **inherited** → refuses SEND and
+RECV; fd 5 **endowed** → works; its own minted channel → works. Together those separate "the kernel
+refuses this proc" from "the kernel refuses this CLAIM", which is the distinction the whole model rests
+on. ⚠ The endowed fd is found by SCAN, not announcement — the design routes announcement through `#43`'s
+`KEY=VALUE` env blob (Wayland's `WAYLAND_SOCKET` trick) and that plumbing is not built; scanning proves
+the property without pretending otherwise.
+
+⛔ **One assertion was REMOVED from the boot selftest rather than left to mislead.** "The parent's own
+fd is now inert" cannot be tested there: at that point in boot `proc_current_get()` and the slot
+`proc_create_user` returns are the **same index**, so parent and child are one pid and the check passes
+trivially — measured, the parent's send returned 8. A degenerate fixture, not a defect. The property is
+asserted in `chanx`, where the two procs genuinely differ. Same reason kill criterion 2 could not live
+in the boot selftest either.
+
 ### Added — the channel band's contract is executable before the band exists (bite 3)
 
 `tests/chan/chantest.cyr` + `scripts/check/chan-semantics-check.sh`, wired into `check.sh`. Host-side,

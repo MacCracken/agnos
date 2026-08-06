@@ -414,6 +414,14 @@ fn proc_create_user(entry, stack_top) {
     # cr3_load(0x1000)'d to boot CR3 for the disk read.)
     store64(&proc_ppid + idx * 8, proc_current_get());
     vfs_fd_inherit(idx, proc_current_get());
+    # 1.56.40 bite 5 — place an armed channel endowment into the child (planning/ipc.md §9.6).
+    # ⛔ THE HIGHEST-RISK LINE IN THE CUT: this sits on the birth path of EVERY user process, so a
+    # defect here does not break the channel band, it breaks spawn. It is deliberately the LAST thing
+    # proc_create_user does, after the child's fd table exists, and it returns immediately when nothing
+    # is armed — which is every spawn in the system except a deliberately endowed one.
+    # ⚠ If placement ever destabilises spawn measurably, ipc.md's kill criterion says it moves OFF the
+    # birth path — and a child then cannot be born holding a channel, which voids the PTY answer.
+    chan_place_into_child(idx);
     return idx;
 }
 

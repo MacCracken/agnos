@@ -4585,6 +4585,83 @@ var CH_MINT   = 0x01;               # (out_uva) -> 0; writes two fds — a chann
 var CH_SEND   = 0x02;               # (fd, buf, len<=64) -> len / -CH_E_*
 var CH_RECV   = 0x03;               # (fd, buf, cap) -> len / -CH_E_WOULDBLOCK / -CH_E_PEERGONE
 var CH_CLOSE  = 0x04;               # (fd) -> 0
+var CH_ENDOW  = 0x05;               # (fd) -> 0; arm THIS endpoint for placement into the next #43 child
+
+# ⭐ ENDOWMENT (bite 5) — the mechanism that lets a child be BORN holding a channel instead of dialling
+# for one. A parent arms an endpoint; the next `spawn_path #43` child is created owning it.
+#
+# ⛔ THIS IS WHAT MAKES THE WHOLE AUTHORITY MODEL USABLE RATHER THAN MERELY SAFE. Inert-by-construction
+# (bite 4) means an inherited fd does nothing — which, without placement, would mean a child can never
+# hold a channel at all. Endowment is the explicit act that grants one: a sandbox is DESCRIBED (a list
+# of endowments) rather than CARVED (a list of denials), and kavach's agnos backend needs no close-loop
+# because there is no ambient reach to revoke.
+#
+# Per-CPU and one-shot, mirroring `exec_redirect #62`'s arm — the arm and its consumption span two
+# syscalls on the same CPU, and a stale arm leaking into somebody else's spawn would hand a channel to
+# a process nobody endowed.
+# ⛔ STORED AS endpoint+1, SO 0 MEANS UNARMED. Module-scope globals zero-init, so a -1 sentinel would
+# require an explicit boot-time init — and until that ran, `endow_arm_get()` would answer 0 and the hook
+# would read it as "endpoint 0 is armed" on the FIRST spawn in the system, placing a channel nobody
+# endowed into init. Biasing by one removes the init-order dependency entirely rather than adding a
+# boot step that a future reorder could move.
+var pcpu_endow_end[4];              # armed endpoint id + 1; 0 = nothing armed
+fn endow_arm_set(v) { store64(&pcpu_endow_end + pcpu_cpu() * 8, v + 1); return 0; }
+fn endow_arm_clear() { store64(&pcpu_endow_end + pcpu_cpu() * 8, 0); return 0; }
+fn endow_arm_get() { return load64(&pcpu_endow_end + pcpu_cpu() * 8) - 1; }
+
+# ⛔ INERT UNTIL EXPLICITLY TURNED ON. ipc.md §9.6 calls bite 5 "the highest-risk bite" — the hook sits
+# on the birth path of EVERY user process — and requires the "no-op path proven across a full boot
+# first". This gate is that no-op: with it 0, `chan_place_into_child` returns immediately and
+# `proc_create_user` is byte-for-byte the function it was. Flip to 1 only once a full sweep is green
+# with the hook present and inert.
+# ⭐ ACTIVE. The inert path was proven first, exactly as ipc.md §9.6 requires for "the highest-risk
+# bite": with this 0 the hook is present on every user process's birth path and returns immediately,
+# and a full sweep was 17/17 in that state. Only then was it turned on. Setting this back to 0 disables
+# endowment without removing the hook — the intended rollback if placement is ever implicated.
+var chan_endow_enabled = 1;
+
+# Place the armed endpoint into a freshly-created child. Called from proc_create_user AFTER
+# vfs_fd_inherit, which is the single inheritance point for every user proc.
+#
+# ⛔ ABORT IF THE CHILD IS ON THE GLOBAL TABLE. `vfs_fd_inherit` RETURNS SUCCESS ON kmalloc FAILURE —
+# it leaves `proc_fd_base[child] == 0`, which silently means "use the global table". Placing an
+# endowment there would write a live channel fd into the table proc 0, every kthread and every future
+# global-table user shares, and transfer ownership to a child that may exit a millisecond later. The
+# resolved-table test (not `proc_fd_base_get(pid) == 0`) is used because proc 0's base is set
+# EXPLICITLY to `&vfs_table` — the same trap that bit `spawn_redirect_apply` at 1.56.39.
+fn chan_place_into_child(child_pid) {
+    if (chan_endow_enabled == 0) { return 0; }
+    var e = endow_arm_get();
+    if (e < 0) { return 0; }
+    endow_arm_clear();                          # one-shot: consumed whether or not it lands
+    if (e >= CHAN_ENDS) { return 0 - 1; }
+    if (load64(&chan_end_open + e * 8) != 1) { return 0 - 1; }
+    var tbl = vfs_fd_table_of(child_pid);
+    if (tbl == &vfs_table) {
+        kprintln("chan: endow REFUSED -- child is on the global fd table", 54);
+        return 0 - 1;
+    }
+    # Find a free slot in the CHILD's table. fd 0/1/2 are inherited stdio; start above them.
+    var f = 3;
+    while (f < 32) {
+        if (ktag(tbl + f * 32) == VFS_FREE) { f = f; break; }
+        f = f + 1;
+    }
+    if (f >= 32) { return 0 - 1; }
+    # ⭐ OWNERSHIP TRANSFERS. The parent's claim on this endpoint dies here — the child is the owner,
+    # stamped with the CHILD's proc epoch, so the parent's own fd for it becomes inert by exactly the
+    # rule that makes an inherited copy inert. Endowment is a MOVE, not a share.
+    store64(&chan_end_owner + e * 8, child_pid);
+    store64(&chan_end_oepoch + e * 8, proc_epoch_get(child_pid));
+    var cb = tbl + f * 32;
+    ktag_set(cb, VFS_CHAN);
+    kpayload_set(cb, 0, e);
+    kpayload_set(cb, 1, load64(&chan_epoch + (e >> 1) * 8));
+    kpayload_set(cb, 2, 0);
+    chan_placed_fd = f;
+    return f;
+}
+var chan_placed_fd = 0 - 1;         # the fd the last placement used — read by #43 to announce it
 var CH_E_BADOP  = 2;                # unknown, reserved, or not implemented in this kernel
 var CH_E_BADFD  = 5;                # not a channel fd, or authority failed (incl. an INHERITED claim)
 var CH_E_ARG    = 6;                # bad buffer / length
@@ -4598,7 +4675,7 @@ var CH_E_NOREGION = 4;              # the 2 MB region is absent or unreachable f
 # this mask, so advertising an op the kernel does not run is how a client "works" against a kernel that
 # cannot serve it. Bite 4a implements CAPS only. This is the `MDO_OP_SUPPORTED` pattern that grew `#93`
 # across a whole arc under one number with no ABI break.
-var CH_OP_SUPPORTED = 0x001F;       # bits 0-4 = CAPS/MINT/SEND/RECV/CLOSE. Reserved ops stay CLEAR.
+var CH_OP_SUPPORTED = 0x003F;       # bits 0-5 = CAPS/MINT/SEND/RECV/CLOSE/ENDOW. Reserved ops stay CLEAR.
 
 # Reserve the region. Called once at boot, AFTER pmm_setup_directmap — the whole design rests on the
 # direct-map alias, so reserving before it exists would hand back a VA that means something else.
@@ -7780,6 +7857,19 @@ fn ksyscall(num, arg1, arg2, arg3) {
             store64(&chan_r + re * 8, rr + 1);
             stack_canary_check(canary);
             return rlen;
+        }
+        # ENDOW(fd) -> 0. Arms this endpoint for the next `#43` child. ⛔ Authority is re-derived first:
+        # you can only endow what you currently own, so an inherited (inert) claim cannot be used to
+        # hand a channel onward — otherwise inert-by-construction would leak through the grant path.
+        if (arg1 == CH_ENDOW) {
+            if (arg2 < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            if (arg2 >= 32) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            var nb = vfs_fd_table() + arg2 * 32;
+            var ne = chan_auth(nb);
+            if (ne < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            endow_arm_set(ne);
+            stack_canary_check(canary);
+            return 0;
         }
         if (arg1 == CH_CLOSE) {
             if (arg2 < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }

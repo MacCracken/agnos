@@ -2915,6 +2915,17 @@ fn chan_ring3_selftest() {
         ksyscall_a4_set(8);
         ksyscall(97, CH_SEND, load64(cm + 8), qbuf);    # peer end sends -> lands in ifd's inbox
     }
+    # ⭐ BITE 5's POSITIVE HALF: mint a SECOND channel and ENDOW one end to the child about to be
+    # exec'd. The child then holds two channel fds — one merely INHERITED (must be inert) and one
+    # ENDOWED (must work). Proving both in the same process is the whole point: it separates "the
+    # kernel refuses this proc" from "the kernel refuses this CLAIM", which is the distinction the
+    # authority model rests on.
+    var cm2 = kmalloc(64);
+    if (cm2 != 0) {
+        if (ksyscall(97, CH_MINT, cm2, 0) == 0) {
+            ksyscall(97, CH_ENDOW, load64(cm2), 0);
+        }
+    }
     kprint("chanx: inheritable fd ", 22);
     kprint_num(ifd);
     kprintln("", 0);
@@ -3856,6 +3867,39 @@ fn syscall_harden_selftest() {
     if (chan_call4(CH_RECV, fb, rxb, 64) != (0 - CH_E_PEERGONE)) { kprintln("shsys: chan PEER_GONE FAIL", 26); ok = 0; }
     if (ksyscall(97, CH_CLOSE, fb, 0) != 0) { kprintln("shsys: chan CLOSE b FAIL", 24); ok = 0; }
     kprintln("shsys: chan mint/send/recv/authority OK", 39);
+
+    # ⭐ ENDOWMENT (bite 5) — placement is a MOVE, and that is the property worth asserting.
+    # Arm an endpoint, create a proc through the ordinary birth path, and the endpoint must now be
+    # owned by the CHILD — which means the parent's own fd for it goes inert by exactly the rule that
+    # makes an inherited copy inert. A "share" would leave both usable and quietly defeat the model.
+    var efds = u + 896;
+    if (ksyscall(97, CH_MINT, efds, 0) != 0) { kprintln("shsys: chan endow MINT FAIL", 27); ok = 0; }
+    var ea = load64(efds);
+    var eb = load64(efds + 8);
+    if (ksyscall(97, CH_ENDOW, ea, 0) != 0) { kprintln("shsys: chan ENDOW FAIL", 22); ok = 0; }
+    var kid = proc_create_user(0x400000, 0x3FC00000);
+    if (kid < 0) { kprintln("shsys: chan endow proc FAIL", 27); ok = 0; }
+    if (kid >= 0) {
+        var eabase = vfs_fd_table() + ea * 32;
+        var eend = kpayload(eabase, 0);
+        if (load64(&chan_end_owner + eend * 8) != kid) { kprintln("shsys: endow owner not moved FAIL", 33); ok = 0; }
+        # ⛔ "THE PARENT'S OWN FD IS NOW INERT" IS *NOT* ASSERTED HERE, AND THE REASON IS THE TEST
+        # ENVIRONMENT, NOT THE KERNEL. At this point in boot `proc_current_get()` and the slot
+        # `proc_create_user` hands back are the SAME index, so "parent" and "child" are one pid and the
+        # ownership check trivially passes — measured: the parent's send returned 8. That is a
+        # degenerate fixture, not a defect. The property is real and is asserted where the two procs
+        # genuinely differ: `tests/chan/chanx.cyr`, via the ring-3 smoke. Same reason kill criterion 2
+        # could not live here either.
+        # ⚠ And it is ONE-SHOT: the next proc born must NOT receive another endowment.
+        var kid2 = proc_create_user(0x400000, 0x3FC00000);
+        if (kid2 >= 0) {
+            if (load64(&chan_end_owner + eend * 8) != kid) { kprintln("shsys: endow leaked to 2nd proc FAIL", 36); ok = 0; }
+            store64(&proc_table + kid2 * 176 + 8, 0);
+        }
+        store64(&proc_table + kid * 176 + 8, 0);
+        kprintln("shsys: chan endowment moves ownership OK", 40);
+    }
+    ksyscall(97, CH_CLOSE, eb, 0);
 
     # --- ext2 basename 255-cap (#6/#7): "/" + 256*'a' = 257 bytes, mkdir refused ---
     store8(u + 1024, 47);                       # '/'

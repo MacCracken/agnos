@@ -73,6 +73,27 @@ fn inherit_main(fd): i64 {
     # that matches a verdict truncates the run at the first one — the earlier `CHANX-INH-` marker fired
     # on SEND-REFUSED and killed QEMU before RECV was even attempted, which reads as a failing assertion
     # rather than a cut-off log. A terminal marker must be a line that can only be last.
+    # ⭐ BITE 5's POSITIVE HALF, IN THE SAME PROCESS. The kernel endowed us one endpoint before exec.
+    # Exactly one fd in this table must accept a SEND — the ENDOWED one — while the inherited fd above
+    # refused. Both facts together are the claim: the kernel refuses a CLAIM it did not grant, not a
+    # PROCESS it does not like.
+    # ⚠ Discovered by scan rather than announced. The design routes announcement through the `#43`
+    # KEY=VALUE env blob (Wayland's WAYLAND_SOCKET trick); that plumbing is not built yet, and scanning
+    # proves the property without pretending the announcement exists.
+    var endowed = 0 - 1;
+    var probe = alloc(64);
+    store64(probe, 0x454E444F57454421);
+    var f = 3;
+    while (f < 32) {
+        if (f != fd) {
+            if (sys_chan_send(f, probe, 8) == 8) { endowed = f; f = 32; }
+            else { f = f + 1; }
+        }
+        else { f = f + 1; }
+    }
+    if (endowed < 0) { say("CHANX-INH-NO-ENDOWED-FD", 23); ok = 0; }
+    else { say_num("CHANX-INH-ENDOWED-FD-WORKS ", 27, endowed); }
+
     if (ok == 1) { say("CHANX-INH-PASS", 14); }
     else { say("CHANX-INH-FAIL", 14); }
     say("CHANX-DONE", 10);
