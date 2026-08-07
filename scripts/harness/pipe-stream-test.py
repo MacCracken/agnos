@@ -144,7 +144,14 @@ try:
     def ser():
         try: return open(SER, "rb").read().decode("latin1")
         except OSError: return ""
-    km = {' ': 'spc', '\n': 'ret', '-': 'minus', '.': 'dot', '/': 'slash', '&': 'shift-7'}
+    # ⛔ EVERY CHARACTER THE TEST TYPES NEEDS A KEY NAME. A missing entry does not error — QEMU
+    # silently drops the sendkey, so the GUEST RECEIVES A DIFFERENT COMMAND than the test thinks
+    # it sent. '|' was absent here: `grep . /etc/ssl/cert.pem | wc` arrived as
+    # `grep . /etc/ssl/cert.pem  wc`, grep prefixed every line with a filename (which it only
+    # does for MULTIPLE files), and the run looked like a broken pipeline redirect for an hour.
+    km = {' ': 'spc', '\n': 'ret', '-': 'minus', '.': 'dot', '/': 'slash', '&': 'shift-7',
+          '|': 'shift-backslash', '>': 'shift-dot', '<': 'shift-comma', '_': 'shift-minus',
+          ',': 'comma', ':': 'shift-semicolon', '=': 'equal', '*': 'shift-8'}
     def typ(word, settle=2.0):
         for ch in word:
             key = km.get(ch, ch)
@@ -194,13 +201,38 @@ try:
     p("pipeline produced output:", produced)
     p("prompt returned (the drain TERMINATED):", prompt_back)
 
-    if produced and prompt_back:
-        p("pipe-stream-test: PASS — `iam | wc` ran and the prompt returned, so the new empty-vs-EOF "
-          "semantics did not break existing pipelines (compatibility only — see the note above)")
+    # ⭐⭐ THE BITE 11 GATE — MORE THAN ONE BUFFER THROUGH THE PIPE.
+    # /etc/ssl/cert.pem is 185311 bytes / 3232 lines: ~45 times the 4080-byte ring. Under
+    # store-and-forward this was STRUCTURALLY impossible — stage 1 ran to completion before stage 2
+    # existed, so everything past one ring was lost (silently before ipc bite 10, as a short write
+    # after it). Streaming is the only way this number can come back right.
+    # ⛔ THE ASSERTION IS THE EXACT LINE COUNT, NOT "SOME OUTPUT". A truncated pipeline still prints a
+    # plausible number — that is precisely the failure this bite exists to end, so a gate that
+    # accepted any number would be measuring nothing.
+    # ⭐ THE ORACLE IS THE HOST'S OWN ANSWER, NOT A CONSTANT I TYPED. The first version asserted
+    # "3232" — the file's LINE count — and failed on a byte-exact run, because `grep .` correctly
+    # drops the 120 blank lines between certificates. Deriving the expectation from the same file the
+    # guest reads makes it an EXTERNAL invariant that survives the file changing, and it caught my
+    # wrong constant rather than the other way round.
+    _pem = os.path.join(ROOTFS, "etc/ssl/cert.pem")
+    _lines = [l for l in open(_pem, "rb").read().split(b"\n") if l]
+    want_lines = len(_lines)
+    want_bytes = sum(len(l) + 1 for l in _lines)
+
+    big = run_wait("grep . /etc/ssl/cert.pem | wc\n", None, timeout=240)
+    nums = [w for w in big.split() if w.isdigit()]
+    streamed = (str(want_lines) in nums) and (str(want_bytes) in nums)
+    p(f"streamed {want_lines} lines / {want_bytes} bytes ({want_bytes // 4080}x the 4080-byte ring):", streamed)
+    if not streamed:
+        p("  -> counts seen:", " ".join(nums)[:160])
+
+    if produced and prompt_back and streamed:
+        p(f"pipe-stream-test: PASS — pipelines still terminate, AND {want_bytes} bytes / {want_lines} "
+          f"lines crossed a 4080-byte pipe BYTE-EXACT against the host's own grep|wc: producer and "
+          f"consumer were alive together (ipc bite 11)")
         rc = 0
     else:
-        p("pipe-stream-test: FAIL — a pipeline that produces output but never returns the prompt is "
-          "the exact failure mode of a drain that never sees EOF")
+        p("pipe-stream-test: FAIL")
     p("serial:", SER)
 finally:
     qemu.terminate()

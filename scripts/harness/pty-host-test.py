@@ -152,7 +152,14 @@ try:
     def ser():
         try: return open(SER, "rb").read().decode("latin1")
         except OSError: return ""
-    km = {' ': 'spc', '\n': 'ret', '-': 'minus', '.': 'dot', '/': 'slash', '&': 'shift-7'}
+    # ⛔ EVERY CHARACTER THE TEST TYPES NEEDS A KEY NAME. A missing entry does not error — QEMU
+    # silently drops the sendkey, so the GUEST RECEIVES A DIFFERENT COMMAND than the test thinks
+    # it sent. '|' was absent here: `grep . /etc/ssl/cert.pem | wc` arrived as
+    # `grep . /etc/ssl/cert.pem  wc`, grep prefixed every line with a filename (which it only
+    # does for MULTIPLE files), and the run looked like a broken pipeline redirect for an hour.
+    km = {' ': 'spc', '\n': 'ret', '-': 'minus', '.': 'dot', '/': 'slash', '&': 'shift-7',
+          '|': 'shift-backslash', '>': 'shift-dot', '<': 'shift-comma', '_': 'shift-minus',
+          ',': 'comma', ':': 'shift-semicolon', '=': 'equal', '*': 'shift-8'}
     def typ(word, settle=2.0):
         for ch in word:
             key = km.get(ch, ch)

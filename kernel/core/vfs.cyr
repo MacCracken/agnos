@@ -1051,15 +1051,63 @@ fn pipe_rc_wclose(buf, pid) {
     return 0;
 }
 
-# How many write ends are still open on `buf`. ⚠ An UNTRACKED buffer answers 0 (= EOF) rather than
-# "writers open": the rc table holds 8 slots and a ninth pipe degrades to untracked. Answering
-# "writers open" there would hang a reader forever on a pipe nobody can ever close, whereas answering
-# EOF ends the read — the same direction the pre-bite-11 behaviour already took.
+# Is ANY write end for `buf` still open, anywhere on the box? Answered by SCANNING every process's fd
+# table for a VFS_PIPE slot pointing at this buffer whose `is_write_end` payload is 1.
+#
+# ⛔ A COUNTER CANNOT ANSWER THIS, AND THAT IS WHY THIS IS A SCAN. The `pipe_rc_*` refcount is
+# deliberately OWNER-ONLY — a child closing an inherited copy must not free the shared buffer — so it
+# says nothing about references held by other processes. And the reference that matters most for
+# streaming is exactly one of those: when the shell spawns stage 1 with its stdout redirected, the
+# write end lives in the CHILD's private table, not the shell's. An owner-only count would read zero
+# the moment the shell closed its own copy, and stage 2 would see EOF while the producer was still
+# writing — silently truncating the pipeline.
+#
+# ⚠ Cost is bounded and paid only on the EMPTY path: 16 procs × 32 slots = 512 tag checks, and only
+# when a reader finds nothing to read. A pipe with data never reaches here.
+# ⚠ Reflects reality rather than accounting, so no spawn/inherit/close site has to remember to keep a
+# tally in step — the class of bug that makes refcounts wrong.
 fn pipe_writers_open(buf) {
-    var i = 0;
-    while (i < 8) {
-        if (load64(&pipe_rc_buf + i * 8) == buf) { return load64(&pipe_rc_wcnt + i * 8); }
-        i = i + 1;
+    var pid = 0;
+    while (pid < 16) {
+        var tbl = proc_fd_base_get(pid);
+        # ⛔ A DEAD PROC'S FD TABLE IS NOT AN OPEN WRITE END, AND SKIPPING IT IS WHAT MAKES STREAMING
+        # TERMINATE. An exited proc keeps its slot and its table until someone `waitpid`s it — so
+        # counting it means the consumer waits for an EOF that only arrives once the SHELL reaps the
+        # producer, while the shell is waiting for the consumer to finish. Measured as a hard hang:
+        # `grep . cert.pem | wc` never returned and the prompt never came back.
+        # ⚠ state 0 = dead/reclaimable (proc.cyr). 1=ready, 2=running, 3=claiming are all alive.
+        # ⛔ pid 0 IS NEVER SKIPPED. It is the kernel/boot context, not a spawned proc, and its state
+        # word is not a liveness signal for it — the boot selftest creates pipes there before anything
+        # sets it, so skipping pid 0 made an OPEN write end invisible and the selftest's
+        # "empty with a live writer" assertion failed. Only SPAWNED procs can be dead-but-unreaped,
+        # and they are the only ones this exclusion exists for.
+        if (pid > 0) {
+            if (proc_get_state(pid) == 0) { tbl = 0; }
+        }
+        if (tbl != 0) {
+            var f = 0;
+            while (f < 32) {
+                var b = tbl + f * 32;
+                if (ktag(b) == VFS_PIPE) {
+                    if (kpayload(b, 2) == buf) {
+                        if (kpayload(b, 1) == 1) { return 1; }
+                    }
+                }
+                f = f + 1;
+            }
+        }
+        pid = pid + 1;
+    }
+    # The GLOBAL table too — the shell and anything else still on it hold their ends here.
+    var g = 0;
+    while (g < 32) {
+        var gb = &vfs_table + g * 32;
+        if (ktag(gb) == VFS_PIPE) {
+            if (kpayload(gb, 2) == buf) {
+                if (kpayload(gb, 1) == 1) { return 1; }
+            }
+        }
+        g = g + 1;
     }
     return 0;
 }

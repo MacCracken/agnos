@@ -26,7 +26,27 @@ control transport with a kernel-owned channel band on `#97`. Design, twelve-bite
 criteria: [`planning/ipc.md`](docs/development/planning/ipc.md) §9. Bites land in order; 0–5 land no
 consumer, so everything up to the cutover reverts by not landing the next bite.
 
-### Added — a pipe distinguishes "nothing yet" from EOF (ipc bite 11, partial)
+### Added — pipelines STREAM: 185191 bytes through a 4080-byte pipe (ipc bite 11)
+
+⭐⭐ **`grep . /etc/ssl/cert.pem | wc` now returns 3112 lines / 185191 bytes — BYTE-EXACT against the
+host's own `grep | wc`, through a ring 45x smaller than the payload.** Producer and consumer are alive
+together for the first time. Before this the same pipeline reported **4080** — the ring size, to the
+byte, because stage 1 ran to completion before stage 2 existed.
+
+Three things had to be true at once, and each was measured failing on its own:
+
+1. **Both stages spawned.** `#37` runs a child inside agnsh's syscall frame with IF cleared and the
+   child non-schedulable, so nothing else on the box runs; `#43`-with-poll fixes scheduling but still
+   waits to completion. Either leaves exactly one stage alive. (agnoshi)
+2. **Producers must handle short writes.** kriya's 542 raw `syscall(1, …)` sites ignored the return, so
+   a producer faster than its consumer silently dropped everything past a ring: measured **70347 of
+   185311 bytes** — streaming, but 62% missing behind a plausible-looking answer. (kriya)
+3. **A dead-but-unreaped proc is not an open write end.** Its fd table survives until `waitpid`, so
+   counting it made the consumer wait for an EOF that only arrives when the shell reaps the producer —
+   while the shell waits for the consumer. Measured as a hard hang. ⛔ **pid 0 is exempt**: it is the
+   boot context, not a spawned proc, and skipping it hid a genuinely open write end from the selftest.
+
+### Added — a pipe distinguishes "nothing yet" from EOF (ipc bite 11)
 
 ⛔ **`pipe_read` RETURNED 0 FOR BOTH, AND THAT IS WHAT CONFINED PIPES TO STORE-AND-FORWARD.** A
 consumer scheduled alongside a live producer saw `0` the first time it out-ran the writer and quit, so
@@ -54,15 +74,14 @@ it, because the SHELL owns that fd, not cmd1. Leaving it open means the drain re
 - **Gap 4 (N-stage tail state discarded on redirect restore)** — closed by **bite 10**: the read tail
   moved into the shared pipe buffer, so it is no longer carried in the swapped-in fd copy at all.
 
-⛔ **Bite 11 is NOT done.** True concurrent streaming still needs the shell to spawn stage 1 via the
-non-blocking `#43` instead of run-to-completion `#37`, so producer and consumer are alive together.
-The kernel side no longer blocks that; the driver is still sequential.
+⚠ **Consumers must handle -2 to benefit.** Programs that branch on `read() <= 0` treat it as EOF and
+stop at the first moment they out-run the writer — so kriya's `k_read` now retries on -2, which covers
+every applet through one chokepoint. The loop needs no timeout: the kernel returns 0 the instant the
+last write end closes, which is exactly Linux's blocking-`read` semantic.
 
-⚠ **And the new semantics are invisible to today's consumers** — recorded because a harness claimed
-otherwise twice. Existing programs branch on `read() <= 0`, so -2 and 0 are the same answer to them.
-Measured with the shell fix reverted: `iam | anuenue` passed, and `iam | wc` passed too. The change is
-therefore benign for every existing consumer and unprovable from userland; the kernel assertion pair is
-the real proof. `harness/pipe-stream-test.py` is a **compatibility** gate only, and now says so.
+⚠ `harness/pipe-stream-test.py`'s oracle is **derived from the host file at runtime**, not a constant.
+The first version asserted the file's 3232 lines and failed a byte-exact run, because `grep .`
+correctly drops its 120 blank lines — the guessed constant was wrong, not the kernel.
 
 ### Added — a live agnsh over the channel PTY (ipc bite 9)
 
