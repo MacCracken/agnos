@@ -3953,6 +3953,64 @@ fn syscall_harden_selftest() {
     if (ffd >= 0) { ksyscall(6, ffd, 0, 0); ksyscall(30, u + 0, 4, 0); }  # close + unlink /shs
 
     pmm_free_2mb(u);
+
+    # ⭐ ipc BITE 10 — THE PIPE MUST REFUSE, NOT OVERWRITE.
+    # ⛔ THE LOAD-BEARING ASSERTION IS THE LAST ONE. Everything before it (a short write, then a
+    # zero-length write) would also pass on a pipe that wraps and corrupts — a wrapping ring happily
+    # reports "full" too. The only assertion that distinguishes refusal from overwrite is reading
+    # back a byte the writer TRIED to clobber and finding the ORIGINAL value still there.
+    var pfds = kmalloc(32);
+    if (vfs_create_pipe(pfds) == 0) {
+        var prfd = load64(pfds);
+        var pwfd = load64(pfds + 8);
+        var rb = vfs_fd_table() + prfd * 32;
+        var wb = vfs_fd_table() + pwfd * 32;
+        # ⛔ 4096 IS THE CEILING. `slab_class_for` tops out at the 4096 class (`heap.cyr:26`), so
+        # `kmalloc(8192)` returns 0 — and the fill loop below then writes to address 0 and takes the
+        # box down with NO output at all, which reads exactly like the feature under test hanging.
+        # Guard it: a selftest that faults instead of failing teaches nothing.
+        var pbuf = kmalloc(4096);
+        if (pbuf == 0) { kprintln("shsys: pipe selftest kmalloc failed", 35); ok = 0; }
+
+        # Fill the ring past capacity in ONE call: exactly PIPE_RING must be accepted.
+        # ⚠ The count offered (PIPE_RING + 100) exceeds the buffer, deliberately — the clamp must
+        # stop the copy at PIPE_RING, well inside it. Requesting more than the source holds is how
+        # the clamp gets tested at all.
+        var i = 0;
+        while (i < 4096) { store8(pbuf + i, 65 + (i % 26)); i = i + 1; }
+        var w1 = pipe_write(wb, pbuf, PIPE_RING + 100);
+        if (w1 != PIPE_RING) { kprintln("shsys: pipe overlong write not clamped", 38); ok = 0; }
+
+        # Ring is full and the reader has consumed nothing: a further write must take ZERO.
+        # ⛔ Pre-bite-10 this returned 100 and silently overwrote the oldest 100 unread bytes.
+        var w2 = pipe_write(wb, pbuf, 100);
+        if (w2 != 0) { kprintln("shsys: pipe accepted a write into a FULL ring", 45); ok = 0; }
+
+        # ⭐ THE ONE THAT MATTERS. Byte 0 was written first and never read. If the refused write had
+        # overwritten instead, position 0 would now hold pbuf[0] from the SECOND write. Both writes
+        # start from the same pattern, so this only discriminates because the second write was
+        # refused entirely — read it back and it must still be the first write's byte.
+        var chk = kmalloc(256);
+        var r1 = pipe_read(rb, chk, 8);
+        if (r1 != 8) { kprintln("shsys: pipe read after full returned short", 42); ok = 0; }
+        var j = 0;
+        while (j < 8) {
+            if (load8(chk + j) != (65 + (j % 26))) { kprintln("shsys: pipe UNREAD BYTES WERE OVERWRITTEN", 41); ok = 0; }
+            j = j + 1;
+        }
+
+        # Space freed by that read must now be accepted — a refusal that never un-refuses is a hang.
+        var w3 = pipe_write(wb, pbuf, 8);
+        if (w3 != 8) { kprintln("shsys: pipe did not accept after the reader drained", 51); ok = 0; }
+
+        kfree_sized(pbuf, 4096);
+        kfree_sized(chk, 256);
+        vfs_close(prfd);
+        vfs_close(pwfd);
+    }
+    else { kprintln("shsys: pipe create failed", 25); ok = 0; }
+    kfree_sized(pfds, 32);
+
     if (ok == 1) { kprintln("shsys: ALL PASS", 15); }
     else { kprintln("shsys: FAIL", 11); }
     return 0;

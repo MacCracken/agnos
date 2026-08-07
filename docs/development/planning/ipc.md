@@ -458,9 +458,9 @@ is to delete that path.** Rejected 2026-08-03.
 | **5** | agnos | ⚠ **Highest-risk bite** — endow **with placement** inside `proc_create_user`. Must abort if the child's table is the global one, because `vfs_fd_inherit` **returns success on kmalloc failure** | ✅ no-op path proven across a full boot first |
 | **6** | setu 0.8.0 | ⭐ **THE CHANNEL BAND REPLACES the agnos control transport.** The agnos arm of `src/client.cyr` speaks `chan_op`; the TCP arm is **deleted**, not gated. (Linux keeps its own transport because Linux is a different target — that is not a fallback.) | ✅ — nothing on agnos has spawned a client yet at this bite |
 | **7** | aethersafha | The compositor mints, labels and endows a channel per client and spawns them placed. `setu_srv_listen` and the accept block are **removed**, not bypassed | ✅ **DONE 2026-08-07** — `presented: 2` under `-smp 4`, framebuffer-confirmed |
-| **8** | agnos | Retire the loopback carve-outs the display protocol forced into the network stack — the `net_ip == 0` case, and the 7700/7701 well-known ports | ✅ nothing dials them |
+| **8** | agnos | Retire the loopback carve-outs the display protocol forced into the network stack — the `net_ip == 0` case, and the 7700/7701 well-known ports | ✅ **CLOSED 2026-08-07 — NO CODE CHANGE NEEDED.** Both named items were verified absent from the boot path; see §10.5. ⛔ §10.1's "waits on DHCP **in the boot path**" was stale |
 | **9** | puka + agnoshi | ⭐ **The PTY** — a live agnsh prompt in a composited window. The gate no candidate could pass | ✅ |
-| **10** | agnos | `pipe_write`'s ~3-line producer refusal — it silently overwrites unread bytes today | ✅ |
+| **10** | agnos | `pipe_write`'s ~3-line producer refusal — it silently overwrites unread bytes today | ✅ **DONE 2026-08-07.** Not 3 lines — the root cause was structural (§10.6). Mutation-proven |
 | **11** | agnoshi + agnos | Concurrent pipelines. Named as a follow-on **because [[feedback_genuine_blocker_taxonomy]] forbids scoping it out** | ✅ |
 
 ⭐ The draft had scoped agnsh pipelines out permanently. That is precisely the cop-out the blocker
@@ -556,6 +556,65 @@ reading was available before any of the shaping work was done.
 stopgap, and then defended by a week of accommodations. **The accommodation count IS the falsification
 signal** — when a primitive needs six carve-outs, a boot-path wait and a test that passes by accident,
 the primitive is wrong, and no further accommodation is the fix.
+
+### 10.5 ⭐ Bite 8, closed by VERIFICATION — both named items were already absent
+
+⛔ **§10.1's line "`net_ingress.cyr:121-126` waits on DHCP **in the boot path**" is STALE, and it sent
+a session chasing kernel work that did not exist.** Re-derived live 2026-08-07 against agnos 1.56.40:
+
+| named item | actual state |
+|---|---|
+| the `net_ip == 0` DHCP wait | ⛔ **not in the boot path.** It is inside `loopback_selftest()` (`net_ingress.cyr:103`), whose only caller (`main.cyr:1501`) is wrapped in `#ifdef LOOPBACK_SELFTEST`, which `build.sh:266` emits **only** when the env var is set. It does not run on an ordinary boot. It is also a *networking* selftest legitimately waiting for an address to self-loop against — not a display carve-out |
+| the 7700/7701 well-known ports | ⛔ **no reservation exists.** All four kernel references (`main.cyr:3376/3384`, `syscall.cyr:7778`, `net_tcp.cyr:270`) are **comments and tombstones**. The kernel never reserved these ports; userland merely used them, and no longer does |
+
+⭐ **The precondition the row's "Desktop runs?" column asserts — *nothing dials them* — became true at
+setu 0.8.4** (2026-08-07), which removed TCP from setu's Linux arm as well as its agnos arm and added
+`check-no-tcp-on-agnos.sh` to keep it true.
+
+⛔ **WHAT BITE 8 IS NOT, RECORDED BECAUSE IT WAS NEARLY DONE BY MISTAKE.** It is not "remove TCP from
+the kernel". agnos's TCP stack, `lo_ring`/`net_is_loopback` loopback delivery, and `net_src_for` are
+general networking and **stay** — §10.1 says so of `net_src_for` explicitly. A general-purpose kernel
+having TCP is not the same thing as a display protocol riding on it, and conflating the two is how a
+scoped cleanup turns into an unrequested architectural edit.
+
+⚠ Residual, NOT part of this bite: the 8-slot conn table (a loopback connection costs two) and
+`TCP_RX_RING = 2048`. Both are network-stack sizing, both are moot for the desktop now that nothing
+local runs over TCP, and neither is a carve-out to retire.
+
+### 10.6 ⭐ Bite 10 — the pipe overwrote unread bytes, and it was not a 3-line fix
+
+**The row said "~3-line producer refusal". The root cause was structural.** `pipe_write` could not
+bound itself against the reader **because it could not see the reader**: the read tail lived at
+`base + 8` in the READ END's fd slot, and the writer holds the other fd — with per-proc fd tables the
+read end may not even be in the same table. So the writer wrapped `write_head % 4088` against nothing
+and overwrote unread bytes, **returning the full count**.
+
+⛔ **The old `if (written >= 4088) { break; }` was not a bound.** It capped a *single call*, not the
+ring: two 3000-byte writes wrapped and corrupted, and each call individually looked in range.
+
+**Fix** (`vfs.cyr`): the read tail moved into the **shared buffer**, where both ends can see it.
+Layout is now `[0..8)` write head · `[8..16)` read tail · `[16..4096)` ring. `pipe_write` refuses once
+`write_head - read_tail >= PIPE_RING` and returns short; the caller sees fewer bytes accepted than
+offered and can act on it.
+
+⚠ **Capacity is 4080, was 4088** — eight bytes bought the tail. Any doc quoting the MVP's "≤ 4088 B"
+needs updating. A pipe that silently loses data is not worth eight bytes.
+
+⭐ **This is what bite 11 (concurrent pipelines) needed anyway.** A shared, both-ends-visible tail is
+the prerequisite for a streaming pipe; the store-and-forward MVP only worked because the reader never
+ran concurrently with the writer.
+
+**Proof — mutation-tested, not asserted.** Assertions live in `syscall_harden_selftest` and the
+load-bearing one is deliberately the *last*: a short write and a zero-length write would **both pass on
+a wrapping ring** (a corrupting ring reports "full" too). Only reading back a byte the writer tried to
+clobber and finding the ORIGINAL value discriminates. With the refusal removed, all three fire —
+`pipe overlong write not clamped`, `pipe accepted a write into a FULL ring`, and
+`pipe UNREAD BYTES WERE OVERWRITTEN`. Restored: `sweep.sh` 17/17, `exec-redirect-smoke` 4/4 (which
+includes a pipe-backed stdin read).
+
+⚠ **A selftest that FAULTS teaches nothing.** The first version called `kmalloc(8192)`; `slab_class_for`
+tops out at the 4096 class (`heap.cyr:26`), so it returned 0, the fill loop wrote to address 0, and the
+box died with **no output at all** — indistinguishable from the feature under test hanging. Guarded now.
 
 ### 10.1 The receipts — what a display protocol forced into the kernel
 

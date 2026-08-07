@@ -24,7 +24,7 @@ enum VfsType {
     VFS_SIGNALFD  = 3;
     VFS_EPOLL     = 4;
     VFS_TIMERFD   = 5;
-    VFS_PIPE      = 6;
+    VFS_PIPE      = 6;   # buffer: [0..8) write head, [8..16) read tail, [16..4096) ring (PIPE_RING)
     VFS_EXT2_FILE = 7;   # payload[0]=pos, [1]=size, [2]=inode_num
     VFS_EXT2_DIR  = 8;   # payload[0]=read offset, [2]=dir inode (getdents, 1.41.3)
     VFS_SEC_WFILE = 9;   # FAT/exFAT write-back fd (1.41.7): payload[0]=content
@@ -810,6 +810,8 @@ fn vfs_read_timerfd(base, buf, count) {
 # A separate global tracks the read tail per pipe buffer.
 var pipe_tails[32];
 
+var PIPE_RING = 4080;   # 4096 - 8 (write head) - 8 (read tail)
+
 fn pipe_read(base, buf, count) {
     var pipe_buf = load64(base + 24);
     if (pipe_buf == 0) { return 0; }
@@ -823,35 +825,52 @@ fn pipe_read(base, buf, count) {
     # We need the write head from the write end. For simplicity,
     # the read end's data points to the pipe buffer, and pos = read tail.
     # The write head is stored at the first 8 bytes of the pipe buffer itself.
+    # ⭐ THE TAIL LIVES IN THE SHARED BUFFER, NOT IN THIS FD'S SLOT. It used to live only at
+    # `base + 8` — the READ end's own payload — which the WRITER cannot reach: the writer holds the
+    # other fd, and with per-proc fd tables the read end may not even be in the same table. That is
+    # not a detail of the old bug, it IS the old bug: `pipe_write` could not bound itself against the
+    # reader because it had no way to see where the reader was, so it wrapped and overwrote unread
+    # bytes with a success return.
+    # Layout: [0..8) write head · [8..16) read tail · [16..4096) data ring (PIPE_RING bytes).
+    # ⚠ Capacity is 4080, not 4088 — eight bytes bought the tail. A pipe that silently loses data is
+    # not worth eight bytes of capacity.
     var write_head = load64(pipe_buf);
-    var read_tail = load64(base + 8);
+    var read_tail = load64(pipe_buf + 8);
     if (write_head == read_tail) { return 0; }
     var copied = 0;
     while (copied < count) {
         if (read_tail == write_head) { break; }
-        # Data starts at pipe_buf + 8 (first 8 bytes = write head)
-        var byte_off = (read_tail % 4088) + 8;
+        var byte_off = (read_tail % PIPE_RING) + 16;
         store8(buf + copied, load8(pipe_buf + byte_off));
         read_tail = read_tail + 1;
         copied = copied + 1;
     }
-    store64(base + 8, read_tail);
+    store64(pipe_buf + 8, read_tail);
+    store64(base + 8, read_tail);          # kept in sync: this fd's payload 0 is still "pos"
     return copied;
 }
 
 fn pipe_write(base, buf, count) {
     var pipe_buf = load64(base + 24);
     if (pipe_buf == 0) { return 0; }
-    # Write head stored at first 8 bytes of pipe buffer
+    # ⛔ PRODUCER REFUSAL (ipc bite 10). This used to wrap `write_head % 4088` with NO reference to
+    # the reader at all, so once the writer got a ring ahead it silently overwrote bytes the reader
+    # had not consumed — and returned the full count, reporting success. Same defect class as the
+    # `CH_RECV` truncation the channel band shipped with: a local IPC primitive losing data behind a
+    # success return.
+    # ⛔ THE OLD `if (written >= 4088) break;` WAS NOT A BOUND. It capped a SINGLE call, not the ring:
+    # two 3000-byte writes wrapped and corrupted, and each call individually looked in-range.
+    # A short return is the contract — the caller sees fewer bytes accepted than offered and can act
+    # on it. Silence cannot be acted on.
     var write_head = load64(pipe_buf);
+    var read_tail = load64(pipe_buf + 8);
     var written = 0;
     while (written < count) {
-        # Check if buffer full (4087 bytes usable, after 8-byte header)
-        var byte_off = (write_head % 4088) + 8;
+        if ((write_head - read_tail) >= PIPE_RING) { break; }   # full — refuse, do NOT overwrite
+        var byte_off = (write_head % PIPE_RING) + 16;
         store8(pipe_buf + byte_off, load8(buf + written));
         write_head = write_head + 1;
         written = written + 1;
-        if (written >= 4088) { break; }
     }
     store64(pipe_buf, write_head);
     return written;
@@ -1019,8 +1038,9 @@ fn vfs_create_pipe(fds_ptr) {
     # Allocate a 4KB pipe buffer
     var pipe_buf = kmalloc(4096);
     if (pipe_buf == 0) { return 0 - 1; }
-    # Zero the write head (first 8 bytes of buffer)
+    # Zero the write head AND the read tail — [0..8) head, [8..16) tail, [16..) the ring.
     store64(pipe_buf, 0);
+    store64(pipe_buf + 8, 0);
     # Allocate read end fd
     var rfd = vfs_alloc();
     if (rfd < 0) { kfree_sized(pipe_buf, 4096); return 0 - 1; }

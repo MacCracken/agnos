@@ -26,6 +26,52 @@ control transport with a kernel-owned channel band on `#97`. Design, twelve-bite
 criteria: [`planning/ipc.md`](docs/development/planning/ipc.md) §9. Bites land in order; 0–5 land no
 consumer, so everything up to the cutover reverts by not landing the next bite.
 
+### Fixed — `pipe_write` silently overwrote unread bytes (ipc bite 10)
+
+⛔ **IT RETURNED THE FULL COUNT WHILE DESTROYING DATA.** `pipe_write` wrapped `write_head % 4088` with
+**no reference to the reader at all**, so once the writer got a ring ahead it overwrote bytes the
+reader had not consumed — and reported success. Same defect class as the `CH_RECV` truncation fixed
+above: a local IPC primitive losing data behind a success return.
+
+⛔ **The root cause was structural, not a missing bounds check.** The writer could not bound itself
+against the reader **because it could not see the reader**: the read tail lived in the READ END's fd
+slot (`base + 8`), and the writer holds the other fd — with per-proc fd tables the read end may not
+even be in the same table. The read tail now lives in the **shared buffer**, visible to both ends:
+`[0..8)` write head · `[8..16)` read tail · `[16..4096)` ring. `pipe_write` refuses once
+`write_head - read_tail >= PIPE_RING` and returns short, which a caller can act on.
+
+⛔ **The old `if (written >= 4088) { break; }` was not a bound** — it capped a single call, not the
+ring. Two 3000-byte writes wrapped and corrupted, and each call individually looked in range.
+
+### Breaking — pipe capacity is 4080 bytes, was 4088
+
+Eight bytes bought the shared read tail. Any consumer or doc quoting the store-and-forward MVP's
+"≤ 4088 B" should read 4080. **Migration:** none for correct callers — a write larger than the ring now
+returns short instead of silently corrupting. A caller that ignored the return value and assumed 4088
+went through was already losing data; it now sees a short count.
+
+⭐ This is the prerequisite bite 11 (concurrent pipelines) needed regardless: a both-ends-visible tail
+is what makes a *streaming* pipe possible. The store-and-forward MVP only worked because the reader
+never ran concurrently with the writer.
+
+**Proof, mutation-tested.** Assertions live in `syscall_harden_selftest`, and the load-bearing one is
+deliberately last: a short write and a zero-length write **both pass on a wrapping ring** — a
+corrupting ring reports "full" too. Only reading back a byte the writer tried to clobber and finding
+the ORIGINAL value discriminates refusal from overwrite. With the refusal removed all three assertions
+fire; restored, `sweep.sh` 17/17 and `exec-redirect-smoke` 4/4 (which includes a pipe-backed stdin read).
+
+### Closed by verification — the loopback carve-outs were already gone (ipc bite 8)
+
+**No code change.** Both items the bite names were re-derived live and found absent from the boot path:
+the `net_ip == 0` DHCP wait is inside `loopback_selftest()`, whose only caller is `#ifdef
+LOOPBACK_SELFTEST` and off by default; and the kernel **never reserved** ports 7700/7701 — all four
+references are comments and tombstones. `planning/ipc.md` §10.1's claim that the wait was "in the boot
+path" was stale and is corrected at §10.5.
+
+⛔ **Recorded because it was nearly done by mistake: bite 8 is not "remove TCP from the kernel".** The
+TCP stack, `lo_ring`/`net_is_loopback` loopback delivery, and `net_src_for` are general networking and
+stay. A general-purpose kernel having TCP is not a display protocol riding on it.
+
 ### Added — a real desktop: two independent clients composited over endowed channels (bite 7)
 
 ⭐⭐ **THE CUTOVER IS COMPLETE END TO END.** `aethersafha --clients` no longer listens on anything. For
