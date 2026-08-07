@@ -7885,7 +7885,15 @@ fn ksyscall(num, arg1, arg2, arg3) {
             }
             var rslot = chan_page(re) + (rr % CHAN_SLOTS) * CHAN_REC_BYTES;
             var rlen = load8(&chan_lens + (re * CHAN_SLOTS + (rr % CHAN_SLOTS)));
-            if (rlen > rcap) { rlen = rcap; }
+            # ⛔ A RECORD THAT DOES NOT FIT IS AN ERROR, NOT A TRUNCATION — and the record STAYS.
+            # This used to do `if (rlen > rcap) { rlen = rcap; }`, silently delivering a prefix and
+            # advancing the cursor past the rest. That is stream semantics smuggled into a record
+            # channel, and it makes all-or-nothing a lie the caller cannot detect.
+            # ⚠ It cost a real diagnosis: setu's `setu_read_msg` reads a 16-byte header and then the
+            # body separately. Against this truncation the header read consumed the ENTIRE message and
+            # the body read then found nothing — surfacing as an unexplained handshake failure several
+            # layers away, in another repo. Refusing here turns that into an immediate, local error.
+            if (rlen > rcap) { stack_canary_check(canary); return 0 - CH_E_ARG; }
             var ri = 0;
             while (ri < rlen) { store8(arg3 + ri, load8(rslot + ri)); ri = ri + 1; }
             store64(&chan_r + re * 8, rr + 1);

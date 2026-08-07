@@ -177,6 +177,24 @@ resolution), not this. The ring-3 test is blocked behind the same two lines. ⛔
 was deliberately **not** used to route around it — raw numbers on agnos paths are a confirmed shipping
 defect class in this ecosystem, and the gate exists to stop exactly that.
 
+### Fixed — `CH_RECV` silently truncated a record that did not fit, and consumed the rest
+
+It did `if (rlen > rcap) { rlen = rcap; }` — delivering a prefix and advancing the cursor past the
+remainder. **That is stream semantics smuggled into a record channel**, and it makes all-or-nothing a
+lie the caller cannot detect. A too-small buffer now returns `-CH_E_ARG` and the record **stays
+queued**.
+
+⛔ **It cost a real diagnosis, in another repo.** setu's `setu_read_msg` reads a 16-byte header and then
+the body separately — correct for a stream. Against this truncation the header read consumed the ENTIRE
+message and the body read found nothing, surfacing as an unexplained handshake failure inside
+aethersafha, two layers away. Refusing here makes it immediate and local.
+
+Selftest asserts **both** halves — the refusal, and that a full-size read afterwards still returns all
+8 bytes intact. A refusal that quietly consumed the record would pass the first assertion alone.
+
+⚠ setu's read path is still stream-shaped and must be fixed there; this only stops the kernel lying
+about it. Filed: setu `issues/2026-08-06-read-msg-is-stream-shaped-on-a-record-transport.md`.
+
 ### Added — the band's objects, and BOTH of §9.9's kill criteria closed (bite 4)
 
 `CH_MINT` / `CH_SEND` / `CH_RECV` / `CH_CLOSE` (mask `0x1F`; `CH_HANDOFF`/`CH_DIAL` still reserved with

@@ -3861,6 +3861,15 @@ fn syscall_harden_selftest() {
     if (chan_call4(CH_RECV, fa, rxb, 64) != (0 - CH_E_WOULDBLOCK)) { kprintln("shsys: chan self-echo FAIL", 26); ok = 0; }
     # Drained == cursor equality, and it reports WOULDBLOCK rather than 0 (0 is a real length).
     if (chan_call4(CH_RECV, fb, rxb, 64) != (0 - CH_E_WOULDBLOCK)) { kprintln("shsys: chan drained FAIL", 24); ok = 0; }
+    # ⛔ A TOO-SMALL BUFFER MUST REFUSE AND LEAVE THE RECORD IN PLACE, not deliver a prefix. Both
+    # halves are asserted: the refusal, AND that a full-size read afterwards still gets all 8 bytes —
+    # because a refusal that silently consumed the record would pass the first check alone.
+    store64(msg, 0x4142434445464748);
+    if (chan_call4(CH_SEND, fa, msg, 8) != 8) { kprintln("shsys: chan short-buf setup FAIL", 32); ok = 0; }
+    if (chan_call4(CH_RECV, fb, rxb, 4) != (0 - CH_E_ARG)) { kprintln("shsys: chan short-recv not refused FAIL", 39); ok = 0; }
+    store64(rxb, 0);
+    if (chan_call4(CH_RECV, fb, rxb, 64) != 8) { kprintln("shsys: chan record lost to short read FAIL", 42); ok = 0; }
+    if (load64(rxb) != 0x4142434445464748) { kprintln("shsys: chan short-read corrupted record FAIL", 44); ok = 0; }
 
     # ⭐⭐ THE PRIMARY KILL CRITERION (§9.9), TESTED THE ONLY WAY IT CAN BE FROM HERE.
     # "If a record is delivered to or accepted from an INHERITED (non-endowed) fd, inert-by-construction
