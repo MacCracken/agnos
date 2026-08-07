@@ -1,38 +1,19 @@
 #!/usr/bin/env python3
-# aethersafha-clients-test.py — reproduce, IN QEMU, the iron failure where the desktop's setu
-# clients spawn and never connect.
+# puka-terminal-test.py — ipc bite 9's LAST HALF: a live agnsh prompt in a COMPOSITED WINDOW.
 #
-# ⛔ THE TRANSPORT THIS HARNESS EXERCISES IS RETIRED (2026-08-03). setu over TCP-on-loopback was a
-# WRONG PREMISE and is being removed; the desktop transport is the agnos socket (naadi) — see agnos
-# docs/development/planning/ipc.md §10. This file is NOT a gate and must not be run as one: a pass
-# here would prove nothing about a transport that no longer exists. It is retained as the DIAGNOSIS
-# — it is the harness that caught the rigging, and its comments are the record of how the rigging
-# worked. Do not resurrect the TCP path on the strength of anything written below.
+# aethersafha hosts /bin/puka; puka opens a setu window, mints a PTY on the `#97` channel band, spawns
+# /bin/agnsh onto it, and paints the shell's output as glyphs into the window it presents.
 #
-# ⛔ WHY THIS EXISTS. The now-deleted `scripts/smoke/aethersafha-setu-smoke.sh` PASSED: both clients
-# connected and presented. That pass was a FALSE GREEN. It launched the compositor from the
-# AETHERSAFHA_SETU_SELFTEST kernel hook (also deleted), which assigned net_ip = 0x7F000001 in the
-# kernel first — the only reason the loopback handshake ever completed. On iron the operator
-# launched it the way a person actually does — `aethersafha` at the agnsh prompt — and `--clients`
-# returned 93 with NO output from either client at all. The smoke could never have caught that: it
-# did not exercise the launch path a human uses, and it manufactured the address path besides.
+# ⛔ THIS IS NOT THE DESKTOP GATE, AND ITS ORACLE IS DIFFERENT ON PURPOSE. It began as a copy of
+# aethersafha-clients-test.py, whose framebuffer oracle counts setu `present_probe`'s bright-green
+# border and bars — and puka REPLACES present_probe in the /bin/puka slot, so that oracle asks the
+# wrong question here and reported "FEWER THAN 2" on a run where everything worked. The oracle below
+# counts puka's own GLYPH colour instead.
 #
-# ⭐ The clients need NO GPU. `--clients` tests spawn_path + setu + scheduling, every one of which
-# QEMU runs faithfully. There was no reason to spend a burn on this question and this harness is the
-# apology for having done so.
-#
-# ⚠ crab's stdout DOES reach the console under the hook path ("crab: stat aethersafha ..."), so a
-# client that runs says so. Silence from both clients means neither executed an instruction.
-#
-# Sequence, both at the agnsh prompt on ONE boot:
-#   1. `aethersafha --clients`    -- foreground, via agnsh's blocking exec_and_wait
-#   2. `aethersafha --clients &`  -- background, via the non-blocking spawn_path #43 that
-#                                    agnsh-bg-test.py proves keeps the prompt live
-# Each run self-terminates on its own 30 s budget and prints `run: exit N`.
-#   95 both clients presented · 94 one · 93 neither · 92 no listener · 91 spawn refused
-#
-# PASS is not "the desktop worked" — it is "the two launch paths were compared and the result is
-# unambiguous". Read the printed verdict.
+# ⭐ THE ORACLE IS EXACT RGB (192,192,192) — puka's default foreground (`fb_def_fg`, xterm light grey).
+# Negative control, measured: the same desktop WITHOUT puka has **0** such pixels; with puka it has
+# ~5000. Nothing else on screen uses it — the compositor's chrome is dark greys and cyan — so a
+# nonzero count means glyphs were rasterised and composited, not merely that a window appeared.
 import os, socket, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -389,6 +370,23 @@ try:
     fb_client_px = None
     time.sleep(2.0)
     PPM = os.path.join(WORK, "screen.ppm")
+    # ⛔ WAIT FOR THE EVENT, DO NOT RACE THE CLOCK. Captured on a fixed delay this gate is FLAKY: one
+    # run in three landed the screendump before puka's first present and reported 0 glyph px on a boot
+    # where everything worked, which reads as a rendering failure rather than a capture taken too
+    # early. Two consecutive re-runs then gave 4991 each. A timing-dependent oracle that sometimes
+    # says zero is worse than no oracle — it teaches you to distrust a real red.
+    # puka prints "first present ok" exactly once, after its first successful COMMIT, so waiting on
+    # that marker makes the capture deterministic instead of hopeful.
+    _deadline = time.time() + 60
+    while time.time() < _deadline:
+        try:
+            if "puka: first present ok" in open(SER, "rb").read().decode("latin1"): break
+        except OSError: pass
+        time.sleep(0.5)
+    else:
+        p("  ⚠ puka never reported a first present within 60 s — capturing anyway, so the")
+        p("    framebuffer count below is evidence about THAT, not about the renderer.")
+    time.sleep(1.5)                    # let a frame or two land after the first commit
     s.sendall((f"screendump {PPM}\n").encode()); time.sleep(4.0); drain()
     if os.path.exists(PPM):
         with open(PPM, "rb") as f: raw = f.read()
@@ -453,28 +451,109 @@ try:
     p("")
     p("=== VERDICT ===")
     if MODE == "desktop":
-        # ⛔ Do not reuse the fg/bg comparison here — desktop mode runs neither, and printing that
-        # line anyway produced a verdict that flatly contradicted the run it came from.
-        serial_ok = (bg_code == 95)
-        p(f"  serial (the compositor's own claim): clients presented = {'2+' if serial_ok else 'FEWER THAN 2'}")
-        # ⛔ AND NOW GATE ON THE FRAMEBUFFER, which this block previously only told the reader to
-        # "judge on" — advice, not a gate, so the exit code still rested entirely on the serial line
-        # the compositor prints about itself. Serial is a shared-premise oracle: the program being
-        # judged is the program making the claim. The framebuffer is the external invariant, and in
-        # THIS mode (and only this mode) a live desktop is still on screen when it is captured.
-        # A run whose serial says "presented" while the panel carries none of the client's own
-        # colours has not shown a desktop, and must not exit 0.
-        if fb_client_px is None:
-            p("  ⛔ NO FRAMEBUFFER EVIDENCE — screendump missing or unparsable. Cannot pass on serial alone.")
+        # ⭐ THREE INDEPENDENT WITNESSES, AND THE LAST ONE IS THE ONLY EXTERNAL ONE.
+        #   1. puka's own markers      — it opened a window and put a shell on a PTY
+        #   2. the compositor's claim  — it presented a client surface
+        #   3. the FRAMEBUFFER         — puka's glyph colour is actually on the panel
+        # 1 and 2 are self-reports by the programs under test. 3 is the invariant: a run where both
+        # programs claim success and the panel carries no glyphs has not shown a terminal.
+        ser = ""
+        try: ser = open(SER, "rb").read().decode("latin1")
+        except OSError: pass
+
+        term_up   = "puka: terminal up" in ser
+        presented = "puka: first present ok" in ser
+        comp_saw  = "setu client presented surface" in ser
+
+        p(f"  puka opened a window + PTY : {term_up}")
+        p(f"  puka presented its surface : {presented}")
+        p(f"  compositor saw a client    : {comp_saw}")
+
+        # ⛔ puka REPORTS ITS OWN FAILURES, and each names a different cause. Surfacing them here is
+        # most of this gate's diagnostic value — "no terminal" otherwise looks identical whether the
+        # display, the pty, or the shell was the problem.
+        for marker, why in (
+            ("setuwin: setu connect refused", "setu refused the connection — a pre-0.8.0 setu has no agnos arm at all"),
+            ("puka: no display",              "win_open failed — no compositor, or the client was not endowed a channel"),
+            ("puka: no pty",                  "pty_open failed — the kernel would not mint a channel"),
+            ("puka: shell would not spawn",   "pty_spawn failed — /bin/agnsh missing, or spawn_path refused it"),
+            ("puka: first present REFUSED",   "the compositor rejected the surface"),
+        ):
+            if marker in ser:
+                p(f"  -> {why}")
+
+        # ⭐ THE EXTERNAL ORACLE: exact RGB (192,192,192), puka's `fb_def_fg`. Measured negative
+        # control — the same desktop WITHOUT puka has 0 of these; with puka, ~5000.
+        glyph_px = None
+        try:
+            d = open(os.path.join(WORK, "screen.ppm"), "rb").read()
+            k = d.index(b"255\n") + 4
+            hdr = d[:k].split(); gw, gh = int(hdr[1]), int(hdr[2])
+            px = d[k:]
+            glyph_px = sum(1 for q in range(0, gw * gh * 3 - 3, 3)
+                           if px[q] == 192 and px[q + 1] == 192 and px[q + 2] == 192)
+        except Exception as e:
+            p("  glyph-pixel scan failed:", e)
+
+        # ⭐⭐ INPUT PHASE — does a KEYSTROKE reach the shell? Typing must make the terminal render
+        # MORE glyphs than it did at rest, because agnsh echoes and answers. Comparing two captures of
+        # the same screen is an external oracle for the whole chain: QEMU key -> compositor ->
+        # SETU_INPUT_KEY -> puka's HID->evdev map -> input_from_keycode -> pty_write -> agnsh -> its
+        # output back over the PTY -> term_feed -> fb_render -> composited.
+        # ⛔ TAB FIRST. The compositor focuses the LAST client it added (crab), and forwards keys only
+        # to the focused window — so without cycling focus this types into the wrong client and the
+        # count would not move for a reason that has nothing to do with puka's input path.
+        def glyphs():
+            try:
+                d = open(os.path.join(WORK, "screen.ppm"), "rb").read()
+                k = d.index(b"255\n") + 4
+                hd = d[:k].split(); gw, gh = int(hd[1]), int(hd[2]); q = d[k:]
+                return sum(1 for j in range(0, gw * gh * 3 - 3, 3)
+                           if q[j] == 192 and q[j + 1] == 192 and q[j + 2] == 192)
+            except Exception:
+                return None
+
+        before = glyphs()
+        # ⛔ THE NEWLINE IS THE WHOLE POINT, AND IT MUST LAND. agnsh's `read_line` accumulates until
+        # it sees '\n' — without it the shell has taken the characters and is simply still waiting, so
+        # the panel correctly shows nothing and the test would blame the input path. A first run sent
+        # `ret` last and only 7 of 8 keys arrived; the missing one was the newline.
+        # ⚠ agnsh does NOT echo here. On the console the KERNEL supplies echo and line editing; a
+        # channel fd has no line discipline, so the shell receives raw bytes and the panel changes
+        # only when agnsh ANSWERS. That makes the answer — not the typing — the thing to wait for.
+        for _k in ("tab", "v", "e", "r", "s", "i", "o", "n"):
+            s.sendall((f"sendkey {_k}\n").encode()); time.sleep(0.2); drain()
+        time.sleep(0.5)
+        s.sendall(b"sendkey ret\n"); time.sleep(0.5); drain()
+        s.sendall(b"sendkey ret\n"); time.sleep(0.5); drain()
+        time.sleep(6.0)
+        s.sendall((f"screendump {PPM}\n").encode()); time.sleep(4.0); drain()
+        after = glyphs()
+        typed_ok = (before is not None) and (after is not None) and (after > before)
+        p(f"  keystrokes reached the shell: {typed_ok}  (glyph px {before} -> {after})")
+        if before is not None and after is not None and after == before:
+            p("     ⛔ the panel did not change — either focus never reached puka, the compositor did")
+            p("        not forward the key, or the HID->evdev map dropped it.")
+
+        GLYPH_MIN = 500
+        if glyph_px is None:
+            p("  ⛔ NO FRAMEBUFFER EVIDENCE — cannot pass on the programs' own claims alone.")
             rc = 1
         else:
-            fb_ok = (fb_client_px >= FB_CLIENT_PX_MIN)
-            p(f"  framebuffer (external): {fb_client_px} client-coloured px "
-              f"(need >= {FB_CLIENT_PX_MIN}) -> {'PASS' if fb_ok else 'FAIL'}")
-            if serial_ok and not fb_ok:
-                p("  ⛔ SERIAL SAYS PRESENTED, THE PANEL DOES NOT. Believe the panel — the compositor")
-                p("     is the thing under test and its own claim cannot corroborate itself.")
-            rc = 0 if (serial_ok and fb_ok) else 1
+            gok = glyph_px >= GLYPH_MIN
+            p(f"  framebuffer (external): {glyph_px} glyph px at exact C0C0C0 "
+              f"(need >= {GLYPH_MIN}) -> {'PASS' if gok else 'FAIL'}")
+            if term_up and presented and not gok:
+                p("  ⛔ BOTH PROGRAMS CLAIM SUCCESS AND THE PANEL SHOWS NO GLYPHS. Believe the panel:")
+                p("     a window that presents an empty buffer is not a terminal.")
+            rc = 0 if (term_up and presented and comp_saw and gok and typed_ok) else 1
+
+        p("")
+        if rc == 0:
+            p("puka-terminal-test: PASS — a live agnsh prompt is rendered in a composited window AND "
+              "keystrokes reach the shell (window + PTY + channel band + glyphs + input)")
+        else:
+            p("puka-terminal-test: FAIL")
         raise SystemExit(rc)
     if MODE == "armed":
         # ⛔ Do NOT fall through to the fg/bg comparison — this mode runs neither of those, and the
