@@ -246,6 +246,9 @@ fn proc_destroy_fd_table(pid, do_flush) {
                 if (ktag(base) == VFS_SEC_WFILE) { vfs_sec_wfile_flush(base); }
                 if (ktag(base) == VFS_PIPE) {     # 2c: free the OWNER's pipe buffer if still open at exit
                     var pb2 = kpayload(base, 2);
+                    # bite 11: a dying proc's WRITE end is a closed writer — a reader blocked on it
+                    # must see EOF, not wait forever on a producer that will never write again.
+                    if (kpayload(base, 1) == 1) { pipe_rc_wclose(pb2, pid); }
                     if (pipe_rc_release(pb2, pid) == 1) { kfree_sized(pb2, 4096); }
                 }
             }
@@ -836,7 +839,18 @@ fn pipe_read(base, buf, count) {
     # not worth eight bytes of capacity.
     var write_head = load64(pipe_buf);
     var read_tail = load64(pipe_buf + 8);
-    if (write_head == read_tail) { return 0; }
+    if (write_head == read_tail) {
+        # ⭐ ipc BITE 11 — EMPTY IS NOT EOF WHILE A WRITER IS STILL OPEN.
+        # ⛔ Returning 0 for both is what confined pipes to store-and-forward: a consumer running
+        # CONCURRENTLY with its producer saw "0" the first time it out-ran the writer and quit,
+        # so the only safe shape was to finish stage 1 entirely before starting stage 2.
+        # -2 is the kernel's established WOULD_BLOCK value — the same one the channel band and the
+        # cooked-line read use, so a caller that already handles one handles this.
+        # ⚠ THE SEQUENTIAL PATH IS UNCHANGED, BY CONSTRUCTION: once the shell closes the write end
+        # (which it must, and now does), the count is 0 and this returns 0 exactly as before.
+        if (pipe_writers_open(pipe_buf) > 0) { return 0 - 2; }
+        return 0;
+    }
     var copied = 0;
     while (copied < count) {
         if (read_tail == write_head) { break; }
@@ -998,6 +1012,12 @@ fn vfs_write(fd_idx, buf, count) {
 var pipe_rc_buf[8];     # tracked buffer ptr (0 = free slot)
 var pipe_rc_owner[8];   # creating proc's pid
 var pipe_rc_cnt[8];     # OWNER ends still open (starts at 2 = rfd + wfd)
+# ⭐ ipc BITE 11 — WRITE ends still open, tracked SEPARATELY from the total (starts at 1).
+# ⛔ WITHOUT THIS, "EMPTY" AND "EOF" ARE THE SAME ANSWER. `pipe_read` returned 0 for both, so a
+# consumer scheduled alongside a live producer could not tell "nothing yet" from "the writer is gone"
+# — which is precisely why pipes could only ever be run store-and-forward, one stage fully finished
+# before the next began. Streaming needs the two to be distinguishable, and nothing else does.
+var pipe_rc_wcnt[8];
 fn pipe_rc_register(buf, owner) {
     var i = 0;
     while (i < 8) {
@@ -1005,6 +1025,7 @@ fn pipe_rc_register(buf, owner) {
             store64(&pipe_rc_buf + i * 8, buf);
             store64(&pipe_rc_owner + i * 8, owner);
             store64(&pipe_rc_cnt + i * 8, 2);
+            store64(&pipe_rc_wcnt + i * 8, 1);      # exactly one write end at creation
             return 0;
         }
         i = i + 1;
@@ -1014,6 +1035,35 @@ fn pipe_rc_register(buf, owner) {
 # Decrement buf's count IF pid is its owner; return 1 when it hits 0 (the caller kfree's the
 # buffer), else 0. A non-owner close (an inherited child copy) OR an untracked/already-freed
 # buffer returns 0 — so a child copy and a double close never double-free.
+# Drop the WRITE-end count for `buf` (owner-only, same rule as pipe_rc_release). Called when a write
+# end is closed, so `pipe_read` can answer EOF instead of "nothing yet".
+fn pipe_rc_wclose(buf, pid) {
+    var i = 0;
+    while (i < 8) {
+        if (load64(&pipe_rc_buf + i * 8) == buf) {
+            if (load64(&pipe_rc_owner + i * 8) != pid) { return 0; }   # inherited copy → ignore
+            var w = load64(&pipe_rc_wcnt + i * 8);
+            if (w > 0) { store64(&pipe_rc_wcnt + i * 8, w - 1); }
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# How many write ends are still open on `buf`. ⚠ An UNTRACKED buffer answers 0 (= EOF) rather than
+# "writers open": the rc table holds 8 slots and a ninth pipe degrades to untracked. Answering
+# "writers open" there would hang a reader forever on a pipe nobody can ever close, whereas answering
+# EOF ends the read — the same direction the pre-bite-11 behaviour already took.
+fn pipe_writers_open(buf) {
+    var i = 0;
+    while (i < 8) {
+        if (load64(&pipe_rc_buf + i * 8) == buf) { return load64(&pipe_rc_wcnt + i * 8); }
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn pipe_rc_release(buf, pid) {
     var i = 0;
     while (i < 8) {
@@ -1024,6 +1074,7 @@ fn pipe_rc_release(buf, pid) {
                 store64(&pipe_rc_buf + i * 8, 0);
                 store64(&pipe_rc_owner + i * 8, 0);
                 store64(&pipe_rc_cnt + i * 8, 0);
+                store64(&pipe_rc_wcnt + i * 8, 0);
                 return 1;
             }
             store64(&pipe_rc_cnt + i * 8, c);
@@ -1174,6 +1225,10 @@ fn vfs_close_inner(fd_idx) {
     # buffer (kills the prior leak). A non-owner close (inherited child copy) is a no-op release.
     if (ktag(base) == VFS_PIPE) {
         var pb = kpayload(base, 2);
+        # ⭐ ipc BITE 11 — a WRITE end closing is what turns a reader's "nothing yet" into EOF.
+        # ⛔ ORDER MATTERS: drop the writer count BEFORE the general release, because the release may
+        # free the slot outright (last end) and then there is nothing left to decrement.
+        if (kpayload(base, 1) == 1) { pipe_rc_wclose(pb, proc_current_get()); }
         if (pipe_rc_release(pb, proc_current_get()) == 1) { kfree_sized(pb, 4096); }
     }
     if (ktag(base) == VFS_SOCK) { tcp_close(kpayload(base, 0)); }   # 1.49.4 tear down the TCP conn

@@ -26,6 +26,44 @@ control transport with a kernel-owned channel band on `#97`. Design, twelve-bite
 criteria: [`planning/ipc.md`](docs/development/planning/ipc.md) §9. Bites land in order; 0–5 land no
 consumer, so everything up to the cutover reverts by not landing the next bite.
 
+### Added — a pipe distinguishes "nothing yet" from EOF (ipc bite 11, partial)
+
+⛔ **`pipe_read` RETURNED 0 FOR BOTH, AND THAT IS WHAT CONFINED PIPES TO STORE-AND-FORWARD.** A
+consumer scheduled alongside a live producer saw `0` the first time it out-ran the writer and quit, so
+the only safe shape was to finish stage 1 entirely before starting stage 2. An empty pipe whose write
+end is still open now answers **-2 (WOULD_BLOCK)**; **0 means EOF** and only that. Same convention as
+the channel band and the cooked-line read, so a caller that handles one handles this.
+
+A per-buffer **write-end count** (`pipe_rc_wcnt`, beside the existing total) is decremented when a
+write end closes, at **both** death sites — `vfs_close` and proc teardown. ⚠ An untracked buffer (the
+rc table holds 8) answers "no writers" rather than "writers open": that ends a read, where the other
+direction would hang a reader forever on a pipe nobody can close.
+
+**Mutation-proven in BOTH directions**, which single assertions cannot be: removing the writers check
+fails "empty with a live writer was not WOULD_BLOCK"; freezing the count so it never decrements fails
+"after the last writer closed was not EOF". Either assertion alone would pass on a constant — only the
+*transition* proves a real count.
+
+⚠ **Requires the shell to close the write end** (agnoshi, next release): `cmd1` exiting does not close
+it, because the SHELL owns that fd, not cmd1. Leaving it open means the drain reads -2 forever.
+
+### Verified closed by inspection — ipc bite 11's other two gaps
+
+- **Gap 2 (`spawn_path#43` applies no redirect)** — closed at **1.56.39**: `spawn_redirect_apply(sp_pid)`
+  is wired into the `#43` path, apply-only into the child's private table.
+- **Gap 4 (N-stage tail state discarded on redirect restore)** — closed by **bite 10**: the read tail
+  moved into the shared pipe buffer, so it is no longer carried in the swapped-in fd copy at all.
+
+⛔ **Bite 11 is NOT done.** True concurrent streaming still needs the shell to spawn stage 1 via the
+non-blocking `#43` instead of run-to-completion `#37`, so producer and consumer are alive together.
+The kernel side no longer blocks that; the driver is still sequential.
+
+⚠ **And the new semantics are invisible to today's consumers** — recorded because a harness claimed
+otherwise twice. Existing programs branch on `read() <= 0`, so -2 and 0 are the same answer to them.
+Measured with the shell fix reverted: `iam | anuenue` passed, and `iam | wc` passed too. The change is
+therefore benign for every existing consumer and unprovable from userland; the kernel assertion pair is
+the real proof. `harness/pipe-stream-test.py` is a **compatibility** gate only, and now says so.
+
 ### Added — a live agnsh over the channel PTY (ipc bite 9)
 
 ⭐⭐ **THE REAL SHELL RUNS ON THE BAND.** `ptyhost agnsh` mints a channel, endows it in PTY mode and

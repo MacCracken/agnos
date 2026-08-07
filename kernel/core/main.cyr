@@ -4077,6 +4077,32 @@ fn syscall_harden_selftest() {
         kfree_sized(cm9, 64);
     }
 
+    # ⭐ ipc BITE 11 — EMPTY-WITH-WRITER MUST NOT LOOK LIKE EOF.
+    var b11 = kmalloc(32);
+    if (vfs_create_pipe(b11) == 0) {
+        var r11 = load64(b11);
+        var w11 = load64(b11 + 8);
+        var rb11 = vfs_fd_table() + r11 * 32;
+        var buf11 = kmalloc(128);
+
+        # Empty, write end OPEN -> WOULD_BLOCK, not EOF.
+        if (pipe_read(rb11, buf11, 64) != 0 - 2) { kprintln("shsys: empty pipe with a live writer was not WOULD_BLOCK", 56); ok = 0; }
+
+        # ⛔ THE LOAD-BEARING PAIR. Either assertion ALONE passes on the old behaviour or on a
+        # constant: returning -2 always would satisfy the first, returning 0 always would satisfy the
+        # second. Only the TRANSITION between them, driven by closing the write end, distinguishes a
+        # real writer count from a hard-coded answer.
+        vfs_close(w11);
+        if (pipe_read(rb11, buf11, 64) != 0) { kprintln("shsys: empty pipe after the last writer closed was not EOF", 58); ok = 0; }
+
+        # ⚠ And data still outranks both: a queued byte is delivered whether or not writers remain.
+        if (ok == 1) { kprintln("shsys: pipe empty-vs-EOF distinguished OK", 41); }
+        kfree_sized(buf11, 128);
+        vfs_close(r11);
+    }
+    else { kprintln("shsys: bite11 pipe create failed", 32); ok = 0; }
+    kfree_sized(b11, 32);
+
     if (ok == 1) { kprintln("shsys: ALL PASS", 15); }
     else { kprintln("shsys: FAIL", 11); }
     return 0;
