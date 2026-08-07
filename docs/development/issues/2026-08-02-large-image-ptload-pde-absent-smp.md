@@ -3,7 +3,13 @@
 *(Filed as "a large binary reaches ring 3 with one of its own PT_LOAD PDEs absent (SMP only)". The PDE
 was never absent — see the root cause. Title kept in the body for searchability.)*
 
-**Opened** 2026-08-02 · **RESOLVED 2026-08-03** · **Repro** QEMU `-smp 4`, no hardware needed
+**Status:** ✅ **RESOLVED 2026-08-03** — `EFER.NXE` on the APs, `kernel/arch/x86_64/smp.cyr`. This is
+the K1 that gated ipc bites 4-9; the channel band shipped on top of it (agnos 1.56.40, bites 0-7).
+
+⚠ Header normalised 2026-08-07 — the resolution was recorded, but not on a `**Status:**` line, so it
+was invisible to every status sweep over this directory.
+
+**Opened** 2026-08-02 · **Repro** QEMU `-smp 4`, no hardware needed
 
 ---
 

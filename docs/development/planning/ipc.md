@@ -457,7 +457,7 @@ is to delete that path.** Rejected 2026-08-03.
 | **4** | agnos | The band + `#97`, **kernel selftest only, no consumer** | ✅ nothing calls it |
 | **5** | agnos | ⚠ **Highest-risk bite** — endow **with placement** inside `proc_create_user`. Must abort if the child's table is the global one, because `vfs_fd_inherit` **returns success on kmalloc failure** | ✅ no-op path proven across a full boot first |
 | **6** | setu 0.8.0 | ⭐ **THE CHANNEL BAND REPLACES the agnos control transport.** The agnos arm of `src/client.cyr` speaks `chan_op`; the TCP arm is **deleted**, not gated. (Linux keeps its own transport because Linux is a different target — that is not a fallback.) | ✅ — nothing on agnos has spawned a client yet at this bite |
-| **7** | aethersafha | The compositor mints, labels and endows a channel per client and spawns them placed. `setu_srv_listen` and the accept block are **removed**, not bypassed | ✅ on the channel band |
+| **7** | aethersafha | The compositor mints, labels and endows a channel per client and spawns them placed. `setu_srv_listen` and the accept block are **removed**, not bypassed | ✅ **DONE 2026-08-07** — `presented: 2` under `-smp 4`, framebuffer-confirmed |
 | **8** | agnos | Retire the loopback carve-outs the display protocol forced into the network stack — the `net_ip == 0` case, and the 7700/7701 well-known ports | ✅ nothing dials them |
 | **9** | puka + agnoshi | ⭐ **The PTY** — a live agnsh prompt in a composited window. The gate no candidate could pass | ✅ |
 | **10** | agnos | `pipe_write`'s ~3-line producer refusal — it silently overwrites unread bytes today | ✅ |

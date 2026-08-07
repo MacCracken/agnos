@@ -1,6 +1,20 @@
 # `sys_mmap`'s low arena advances a GLOBAL cursor unlocked — concurrent multi-page mmaps punch holes
 
-**Opened** 2026-08-03 · **Status** OPEN, confirmed in source, not yet reproduced · **Repro** QEMU `-smp 4`, no hardware
+**Status:** ✅ **FIXED — and this header was WRONG for four days.** Opened 2026-08-03, fixed the same
+day, still labelled OPEN until an issue-rot audit on 2026-08-07 caught it. ⛔ A fixed defect still
+marked OPEN is worse than an unfiled one: it is a standing invitation to re-investigate solved work,
+and it makes every other OPEN label in the directory less trustworthy.
+
+**The fix** (`kernel/core/proc.cyr:1682-1688`): `mmap_spin_lock()` now wraps the cursor read, the
+ceiling check and the advance as **one critical section**, and the mapping loop writes into
+`base_vaddr + i*2MB` — a span this caller already owns — instead of re-reading a global another CPU is
+advancing. The whole span is claimed before the lock is released.
+
+⛔ **It was not theoretical.** Iron-confirmed 2026-08-03: `fault: pid=7 cr2=0x1043c000 err=0x6 pde=0
+idx=82` — a user WRITE inside this arena to a page that was never mapped. It cost the desktop its
+second client on that burn.
+
+**Repro (historical)** QEMU `-smp 4`, no hardware.
 
 ## The defect
 

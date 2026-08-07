@@ -26,6 +26,37 @@ control transport with a kernel-owned channel band on `#97`. Design, twelve-bite
 criteria: [`planning/ipc.md`](docs/development/planning/ipc.md) §9. Bites land in order; 0–5 land no
 consumer, so everything up to the cutover reverts by not landing the next bite.
 
+### Added — a real desktop: two independent clients composited over endowed channels (bite 7)
+
+⭐⭐ **THE CUTOVER IS COMPLETE END TO END.** `aethersafha --clients` no longer listens on anything. For
+each client it **mints** a channel, **endows** one end (`CH_ENDOW`, which returns the fd number the
+child will hold), stages `AGNOS_CHAN=<fd>` into the `#43` env blob, and spawns the client **already
+holding a connected end**. `setu_srv_listen` and the accept block are gone, not bypassed. The client's
+`setu_connect` dials nothing: it checks the kernel floor via `CH_CAPS`, reads `AGNOS_CHAN`, returns
+that fd — four lines.
+
+Proven under QEMU `-smp 4`: `present_probe` and `crab` both connect, complete the CREATE/ATTACH/COMMIT
+handshake, and present — `placed: 2`, `presented: 2`, and the external framebuffer oracle counts 3500
+client-coloured pixels (threshold 200). `sweep.sh` 17/17, `check.sh` 25/25.
+
+### Fixed — `CH_RECV` silently truncated a record that did not fit the caller's buffer
+
+`syscall.cyr` — RECV copied `min(rlen, rcap)` bytes and advanced the read cursor **past the whole
+record**. A caller asking for a 16-byte prefix of a 24-byte record therefore got 16 plausible bytes and
+lost the remaining 8 forever, with a success return. That is the failure mode a record transport exists
+to make impossible, and it turned a client-side framing bug in setu into an unexplained handshake
+failure two repos away.
+
+RECV now refuses with `-CH_E_ARG` and **leaves the record queued**, so a caller with an
+under-sized buffer gets an immediate, local, retryable error instead of silent data loss.
+
+### Fixed — the diagnostic that ate the evidence
+
+⛔ Worth recording as a pattern, not just a fix. The compositor's poll-failure branch called
+`sys_chan_recv` to report *which* kernel error class it hit. On a record transport **a read is not a
+peek**: that probe consumed the very handshake record it was trying to explain, so the instrumented
+build failed differently from the build being diagnosed. Removed, with a comment at the site.
+
 ### Fixed — `epoll_wait` could halt the CPU permanently (bite 0)
 
 `syscall.cyr` — the `found == 0` path ran a bare `arch_wait()`. That is `hlt` with **no `sti`**

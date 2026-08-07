@@ -1,12 +1,22 @@
 # `#97 chan_op` — the local-IPC channel band: designed, decided, numbered, and now MINTED (bites 0-4a)
 
-**Status:** 🟠 **BITES 0-6 DONE — both §9.9 kill criteria CLOSED; bite 7 blocked on two cyrius wrappers.** Filed 2026-08-05.
+**Status:** 🟠 **BITES 0-7 DONE — the desktop runs on the band.** Filed 2026-08-05.
+⭐⭐ **Bite 7 is proven**: `aethersafha --clients` mints/endows/spawns-placed, the listener is DELETED,
+and TWO independent clients (`present_probe` + `crab`) present under QEMU `-smp 4` — `presented: 2`,
+framebuffer-confirmed (3500 client px). `sweep.sh` 17/17, `check.sh` 25/25.
+✅ **setu 0.8.3 tagged 2026-08-07; `crab` and `aethersafha` are repinned to it with no overrides and
+build on both targets.** (0.8.2 shipped the record framing but broke the consumers' Linux builds —
+agnos-only `sys_uptime_ms` outside its `#ifdef`.)
+✅ **Bite 8's premise now holds.** setu **0.8.4** (tagged 2026-08-07) removed TCP from BOTH arms —
+`setu_listen`/`setu_accept` refuse on agnos, and Linux moved to AF_UNIX/SOCK_SEQPACKET, the same
+record semantics as the band. A CI gate (`check-no-tcp-on-agnos.sh`) keeps it true. **Nothing dials
+7700/7701**, so the kernel-side carve-outs can be retired. Bite 8 itself is not started.
 ⭐ **`#97` is MINTED**: agnos 1.56.40 ships the dispatch arm, a boot-reserved 2 MB region and `CH_CAPS`.
 ✅ **Unblocked** — cyrius **6.5.8** landed `SYS_CHAN_OP = 97` + the `sys_chan_*` wrappers; the ABI gate
 reads `kernel 97 · abi-doc 97 · cyrius 97`. Ticket —
 [`2026-08-05-agnos-syscall-peer-...`](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-08-05-agnos-syscall-peer-two-new-numbers-and-a-circular-authority.md) §2.
 ⭐ Both criteria are now closed by `scripts/smoke/chan-ring3-smoke.sh` (in `sweep.sh`), mutation-proven.
-**Next: bite 5** (endow-with-placement in `proc_create_user`) — the highest-risk bite in the plan.
+**Next: bite 8** (retire the loopback carve-outs in the network stack — nothing dials 7700/7701 now).
 **Number:** **`#97`** — ⭐ **settled 2026-08-05.** `#96` stays with `fork`
 ([`2026-08-05-syscall-96-fork.md`](2026-08-05-syscall-96-fork.md)). Next free is **`#98`**.
 **Cross-repo:** agnos (kernel) **+ cyrius** (`lib/syscalls_x86_64_agnos.cyr`) **+ setu 0.8.0** **+ aethersafha**.
@@ -59,7 +69,7 @@ done** — agnos 1.56.35, `EFER.NXE` never enabled on the APs, `smp.cyr:514`.
 | **4b** | MINT/SEND/RECV/CLOSE, `chan_release_pid`, and the ring-3 exerciser | ✅ **DONE — both kill criteria closed**, mutation-proven (both identity checks must be removed before an inherited fd accepts anything) |
 | **5** | endow-with-placement in `proc_create_user` | ✅ **DONE** — no-op path proven first (sweep 17/17 with the hook inert), then activated. Announcement lands too: `CH_ENDOW` returns the fd, the parent announces it |
 | **6** | setu 0.8.0 speaks the band; the TCP arm DELETED | ✅ **DONE — cut at 0.8.0, 2026-08-06.** agnos `setu_connect` is four lines and dials nothing; floor enforced via `CH_CAPS`; both targets build. ⚠ Awaiting the operator's tag before aethersafha can repin off `0.7.4`; ⚠ not runtime-proven until bite 7 sets `AGNOS_CHAN` |
-| **7** | aethersafha mints/endows/spawns placed; listener removed | 🔴 **BLOCKED on cyrius** ⚠ At repin, aethersafha must add **`args`** to its `[deps] stdlib` — setu 0.8.0's agnos arm calls `getenv`, and `dist/setu.deps` does not list it (the sidecar under-reports; `net`/`chrono`/`result` are missing too). Verified against a throwaway consumer. — needs `sys_chan_endow` (`CH_ENDOW` landed after 6.5.8) and a 4-arg `sys_spawn_path` to pass the env. → [cyrius ticket](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-08-06-chan-endow-peer-and-spawn-path-env-arity.md) |
+| **7** | aethersafha mints/endows/spawns placed; listener removed | ✅ **DONE 2026-08-07 — `presented: 2`, framebuffer-confirmed.** cyrius **6.5.9** landed `sys_chan_endow` + `sys_spawn_path_env`. ⚠ Needs **setu > 0.8.1** (record-framed `setu_read_msg`); consumers hold a TEMP `path` override until it is cut. ⚠ `args` must stay in aethersafha's `[deps] stdlib` — setu's agnos arm calls `getenv` and `dist/setu.deps` under-reports it. |
 
 ## Kill criterion worth repeating here
 
