@@ -26,6 +26,27 @@ control transport with a kernel-owned channel band on `#97`. Design, twelve-bite
 criteria: [`planning/ipc.md`](docs/development/planning/ipc.md) §9. Bites land in order; 0–5 land no
 consumer, so everything up to the cutover reverts by not landing the next bite.
 
+### Added — a live agnsh over the channel PTY (ipc bite 9)
+
+⭐⭐ **THE REAL SHELL RUNS ON THE BAND.** `ptyhost agnsh` mints a channel, endows it in PTY mode and
+spawns `/bin/agnsh` — which predates this band by years, was not adapted for it, and reads fd 0 with a
+plain `sys_read`. It printed its `[ASSIST] >` prompt, received a command typed into the host's endpoint,
+and answered with its Intent/Command/Risk block: **21 records** off the channel. Prompt out, keystrokes
+in, answer out.
+
+### Changed — `write(2)` on a channel fd is a SHORT WRITE, not an error
+
+⛔ **WITHOUT THIS A PTY IS UNUSABLE.** agnsh's banner exceeds 64 bytes in a single `write`, and erroring
+would make a shell fail to print its own greeting — "the terminal is broken" would be indistinguishable
+from "the shell crashed".
+
+`write(2)` is a **byte stream**; `CH_SEND` is a **record**. The difference is deliberate and now
+asserted both ways: a `#97` caller asking to send more than one record is making a framing error and
+still gets `-CH_E_ARG`; a `write(2)` caller is doing something ordinary and gets the POSIX answer —
+accept what fits, return the short count, caller loops. ⚠ This does not smuggle stream semantics into
+the band: record boundaries still hold on every `#97` path and a reader still receives whole records.
+A stream writer's bytes simply arrive as several records, which is exactly what a tty does.
+
 ### Added — an UNMODIFIED program's stdio rides a channel: the PTY plumbing (ipc bite 9)
 
 ⭐ A PTY decomposes into (i) a bidirectional local channel, (ii) an end handed to a child at spawn,

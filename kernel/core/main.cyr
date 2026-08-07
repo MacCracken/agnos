@@ -4043,6 +4043,20 @@ fn syscall_harden_selftest() {
             if (r9 != 8) { kprintln("shsys: read(2) did not reach the channel", 40); ok = 0; }
             if (load64(b9) != 0x5054594B4F4E4F57) { kprintln("shsys: read(2) channel content wrong", 36); ok = 0; }
 
+            # ⭐ A write(2) LONGER THAN ONE RECORD IS A SHORT WRITE, NOT AN ERROR — the POSIX answer,
+            # and what makes a PTY usable at all (agnsh's banner exceeds 64 bytes in one write).
+            # ⛔ `CH_SEND` still REFUSES the same length: record framing holds on the `#97` path.
+            var wbig = kmalloc(256);
+            var wi = 0;
+            while (wi < 200) { store8(wbig + wi, 65 + (wi % 26)); wi = wi + 1; }
+            var wsh = ksyscall(1, e9a, wbig, 200);
+            if (wsh != 64) { kprintln("shsys: long write(2) was not a 64-byte short write", 50); ok = 0; }
+            ksyscall_a4_set(200);
+            if (ksyscall(97, CH_SEND, e9a, wbig) >= 0) { kprintln("shsys: CH_SEND accepted an oversized record", 43); ok = 0; }
+            var wdrain = ksyscall(5, e9b, b9, 128);
+            if (wdrain != 64) { kprintln("shsys: short-written record did not read back whole", 51); ok = 0; }
+            kfree_sized(wbig, 256);
+
             # ⛔ EMPTY MUST BE WOULD_BLOCK (-2), NOT 0. Returning 0 would mean EOF, and every
             # `while (read(fd) > 0)` loop in userland would exit the instant the peer was merely slow.
             var r9b = ksyscall(5, e9b, b9, 64);

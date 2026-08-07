@@ -7254,8 +7254,20 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # band an API rather than a PTY (planning/ipc.md §1).
         var wep = chan_fd_endpoint(arg1);
         if (wep >= 0) {
-            var wr = chan_queue(wep, arg2, arg3);
-            if (wr < 0) { return 0 - 1; }        # peer gone / bad size — EPIPE-shaped
+            # ⭐ write(2) IS A BYTE STREAM; `CH_SEND` IS A RECORD. THE DIFFERENCE IS DELIBERATE.
+            # A caller of `#97` asking to send more than one record is making a framing error and gets
+            # -CH_E_ARG. A caller of write(2) is doing something completely ordinary, and POSIX already
+            # defines the answer: accept what fits and return the SHORT COUNT. The caller loops.
+            # ⛔ WITHOUT THIS A PTY IS UNUSABLE. agnsh's banner is longer than 64 bytes in one write;
+            # erroring would make a shell fail to print its own greeting, and "the terminal is broken"
+            # would be indistinguishable from "the shell crashed".
+            # ⚠ This does NOT smuggle stream semantics into the band: record boundaries still hold on
+            # every `#97` path, and a reader still receives whole records. It only means a stream
+            # writer's bytes arrive as several records — which is exactly what a tty does.
+            var wlen = arg3;
+            if (wlen > CHAN_REC_BYTES) { wlen = CHAN_REC_BYTES; }
+            var wr = chan_queue(wep, arg2, wlen);
+            if (wr < 0) { return 0 - 1; }        # peer gone / bad buffer — EPIPE-shaped
             return wr;
         }
         return vfs_write(arg1, arg2, arg3);

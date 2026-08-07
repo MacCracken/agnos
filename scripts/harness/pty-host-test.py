@@ -203,11 +203,22 @@ try:
     if "PTYX-STDIN-CONTENT-WRONG" in seg:
         p("  -> fd 0 delivered the WRONG bytes: record framing or endpoint pairing is wrong")
 
+    # ⭐ PHASE 2 — host the REAL SHELL. agnsh predates this band by years and reads fd 0 with a
+    # plain `sys_read`; nothing in it was adapted for a channel. If it prints its banner and answers
+    # a command over the endowed channel, the PTY is real rather than a shape that only toys fit.
+    shell_seg = run_wait("ptyhost agnsh &\n", "PTYHOST-DONE", timeout=120)
+    shell_ran   = "PTYHOST-SHELL-MODE" in shell_seg
+    shell_spoke = "agnoshi" in shell_seg
+    p("")
+    p("shell hosted        :", shell_ran)
+    p("agnsh spoke over PTY:", shell_spoke)
+
     if not ran:
         p("pty-host-test: FAIL — /bin/ptyhost never ran (VACUOUS: nothing below proves anything)")
-    elif ran and spawned and stdin_ok and done_ok and passed:
-        p("pty-host-test: PASS — an UNMODIFIED program's stdio rode a channel: plain read(2) on fd 0 "
-          "returned the host's record, plain write(2) on fd 1 reached the host's endpoint")
+    elif ran and spawned and stdin_ok and done_ok and passed and shell_ran and shell_spoke:
+        p("pty-host-test: PASS — an UNMODIFIED program's stdio rode a channel, and so did AGNSH: "
+          "plain read(2) on fd 0 returned the host's record, plain write(2) on fd 1 reached the "
+          "host's endpoint, and the real shell spoke over the PTY")
         rc = 0
     else:
         p("pty-host-test: FAIL")

@@ -45,8 +45,16 @@ fn main(): i64 {
     if (cfd < 0) { say_num("PTYHOST-ENDOW-FAIL ", 19, cfd); return 1; }
     say_num("PTYHOST-CHILD-FD ", 17, cfd);
 
+    # ⭐ `ptyhost agnsh` hosts the REAL SHELL instead of the toy child — the actual bite-9 goal minus
+    # the composited window. agnsh is the honest test because it was written years before this band
+    # and reads fd 0 with a plain `sys_read`; nothing in it was adapted.
     var path = "/bin/ptyx";
-    var pid = sys_spawn_path(path, 9);
+    var plen = 9;
+    var shell = 0;
+    if (argc() > 1) {
+        if (load8(argv(1)) == 97) { path = "/bin/agnsh"; plen = 10; shell = 1; }   # 'a'
+    }
+    var pid = sys_spawn_path(path, plen);
     if (pid < 0) { say_num("PTYHOST-SPAWN-FAIL ", 19, pid); return 1; }
     say_num("PTYHOST-SPAWNED ", 16, pid);
 
@@ -60,7 +68,24 @@ fn main(): i64 {
     var lines = 0;
     var idle = 0;
     var done = 0;
+    var fed = 0;
     while (done == 0) {
+        # ⛔ FEED THE SHELL ONLY AFTER IT HAS SPOKEN. A command sent before agnsh has drained its
+        # startup would sit in a queue it has not read yet, and a `version` that produced no answer
+        # would look like the channel failing rather than the shell not being ready.
+        if (shell == 1) {
+            if (fed == 0) {
+                if (lines > 2) {
+                    var cmd = alloc(32);
+                    store8(cmd, 118); store8(cmd + 1, 101); store8(cmd + 2, 114);
+                    store8(cmd + 3, 115); store8(cmd + 4, 105); store8(cmd + 5, 111);
+                    store8(cmd + 6, 110); store8(cmd + 7, 10);                  # "version\n"
+                    sys_chan_send(fa, cmd, 8);
+                    fed = 1;
+                    idle = 0;
+                }
+            }
+        }
         var r = sys_chan_recv(fa, rbuf, 128);
         if (r > 0) {
             idle = 0;
@@ -81,6 +106,7 @@ fn main(): i64 {
     }
 
     sys_waitpid(pid);
+    if (shell == 1) { say("PTYHOST-SHELL-MODE", 18); }
     say_num("PTYHOST-RECORDS ", 16, lines);
     if (lines > 0) { say("PTYHOST-PASS", 12); }
     else { say("PTYHOST-FAIL-NO-OUTPUT", 22); }
