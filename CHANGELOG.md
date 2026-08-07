@@ -19,6 +19,28 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ---
 
+## [1.56.41] — 2026-08-07 — cycle OPEN
+
+⭐ **1.56.40 shipped the whole ipc line — bites 0 through 11 are closed.** The channel band replaced
+TCP-on-loopback, the desktop runs on it, an unmodified program's stdio rides it as a PTY, and pipelines
+stream. `planning/ipc.md` §9.6's twelve-bite table has no open rows.
+
+This cycle is open for whatever comes next. Nothing is claimed here yet.
+
+⚠ **Carried in, unresolved:** the `VFS_CHAN` close leak — `vfs_close_inner` has arms for
+`VFS_EXT2_FILE`, `VFS_SEC_WFILE`, `VFS_PIPE` and `VFS_SOCK` but **none for `VFS_CHAN`**, so closing a
+channel fd zeroes the slot and leaves the endpoint claimed until the process dies. Whoever takes it
+must re-derive authority first: an inherited (non-owned) channel fd in a child must NOT release its
+parent's endpoint on `close()`, which is exactly the violation the band exists to prevent. `chan_auth`
+already implements the rule and `VFS_PIPE`'s owner-aware release is the shape to copy. ⚠ `vfs.cyr` is
+included ahead of the chan state, so the fix belongs at the `SYS_CLOSE` dispatch, not in
+`vfs_close_inner`.
+
+⛔ **Still never burned.** Every result since bite 7 is QEMU. The 2026-08-03 iron proof at
+`cpus online: 4` was the **TCP** path and is not evidence about the channel band.
+
+---
+
 ## [1.56.40] — 2026-08-05 — the local-IPC channel band (cycle OPEN)
 
 Scope: the desktop arc's remaining architectural item — replacing TCP-on-loopback as the display
