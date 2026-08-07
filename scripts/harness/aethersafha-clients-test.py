@@ -215,8 +215,16 @@ try:
         for m in _re.finditer(r"run: exit (-?\d+)", seg):
             try: code = int(m.group(1))
             except ValueError: pass
-        p(f"  [{label}] launched   :", "launched setu client #1" in seg)
-        p(f"  [{label}] connected  :", seg.count("setu client connected"))
+        # ⛔ MARKERS UPDATED FOR THE CHANNEL BAND (agnos 1.56.40 bite 7). The old ones were
+        # "launched setu client #1" and "setu client connected" — both are strings the TCP cutover
+        # DELETED, so this harness reported `launched: False, connected: 0` on a boot where both
+        # clients had in fact been spawned on placed channels. A stale marker does not read as a
+        # broken measurement; it reads as a broken kernel, which is strictly worse.
+        # ⚠ "connected" no longer EXISTS as an event: there is no accept, and a channel is live from
+        # the instant it is minted — before the client runs. What can be counted is placement and
+        # presentation, so the middle counter now reports placements.
+        p(f"  [{label}] launched   :", "client spawned on a placed channel" in seg)
+        p(f"  [{label}] placed     :", seg.count("client spawned on a placed channel"))
         p(f"  [{label}] presented  :", seg.count("setu client presented surface"))
         p(f"  [{label}] client says:", ("crab:" in seg) or ("present_probe:" in seg))
         p(f"  [{label}] exit       :", code)

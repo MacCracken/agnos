@@ -2944,6 +2944,18 @@ fn chan_ring3_selftest() {
     store8(line + w, 32); w = w + 1;
     if (endowfd >= 10) { store8(line + w, 48 + (endowfd / 10)); w = w + 1; }
     store8(line + w, 48 + (endowfd % 10)); w = w + 1;
+    # ⭐ STAGE AN ENV BLOB SO chanx CAN PROVE getenv() SEES IT. `elf_load_from_file` consumes
+    # exec_env_src/_len at entry regardless of which syscall got there, so setting it here reaches the
+    # `run` below. This isolates ONE question — does the announcement survive into a spawned child? —
+    # from the compositor's use of it, which is a different failure surface entirely.
+    var eb = kmalloc(64);
+    var ew = 0;
+    while (ew < 11) { store8(eb + ew, load8("AGNOS_CHAN=" + ew)); ew = ew + 1; }
+    if (endowfd >= 10) { store8(eb + ew, 48 + (endowfd / 10)); ew = ew + 1; }
+    store8(eb + ew, 48 + (endowfd % 10)); ew = ew + 1;
+    store8(eb + ew, 0); ew = ew + 1;
+    exec_env_src_set(eb);
+    exec_env_len_set(ew);
     kprintln("exec: running /bin/chanx", 24);
     sh_exec(line, w);
     kprintln("exec: chan ring3 selftest done", 30);

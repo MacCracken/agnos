@@ -58,8 +58,8 @@ done** — agnos 1.56.35, `EFER.NXE` never enabled on the APs, `smp.cyr:514`.
 | **4a** | `#97` + the 2 MB region + `CH_CAPS` | ✅ **DONE** |
 | **4b** | MINT/SEND/RECV/CLOSE, `chan_release_pid`, and the ring-3 exerciser | ✅ **DONE — both kill criteria closed**, mutation-proven (both identity checks must be removed before an inherited fd accepts anything) |
 | **5** | endow-with-placement in `proc_create_user` | ✅ **DONE** — no-op path proven first (sweep 17/17 with the hook inert), then activated. Announcement lands too: `CH_ENDOW` returns the fd, the parent announces it |
-| **6** | setu 0.8.0 speaks the band; the TCP arm DELETED | ✅ **DONE** — agnos `setu_connect` is four lines and dials nothing; floor enforced via `CH_CAPS`. ⚠ Not runtime-proven until bite 7 sets `AGNOS_CHAN` |
-| **7** | aethersafha mints/endows/spawns placed; listener removed | 🔴 **BLOCKED on cyrius** — needs `sys_chan_endow` (`CH_ENDOW` landed after 6.5.8) and a 4-arg `sys_spawn_path` to pass the env. → [cyrius ticket](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-08-06-chan-endow-peer-and-spawn-path-env-arity.md) |
+| **6** | setu 0.8.0 speaks the band; the TCP arm DELETED | ✅ **DONE — cut at 0.8.0, 2026-08-06.** agnos `setu_connect` is four lines and dials nothing; floor enforced via `CH_CAPS`; both targets build. ⚠ Awaiting the operator's tag before aethersafha can repin off `0.7.4`; ⚠ not runtime-proven until bite 7 sets `AGNOS_CHAN` |
+| **7** | aethersafha mints/endows/spawns placed; listener removed | 🔴 **BLOCKED on cyrius** ⚠ At repin, aethersafha must add **`args`** to its `[deps] stdlib` — setu 0.8.0's agnos arm calls `getenv`, and `dist/setu.deps` does not list it (the sidecar under-reports; `net`/`chrono`/`result` are missing too). Verified against a throwaway consumer. — needs `sys_chan_endow` (`CH_ENDOW` landed after 6.5.8) and a 4-arg `sys_spawn_path` to pass the env. → [cyrius ticket](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-08-06-chan-endow-peer-and-spawn-path-env-arity.md) |
 
 ## Kill criterion worth repeating here
 

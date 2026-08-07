@@ -105,6 +105,10 @@ fn inherit_main(fd, endowed_fd): i64 {
 fn main(): i64 {
     alloc_init();
     say("CHANX-START", 11);
+    # ⭐ Does the announcement survive into a spawned child's environment at all?
+    var envv = getenv("AGNOS_CHAN");
+    if (envv == 0) { say("CHANX-ENV-ABSENT", 16); }
+    else { say_num("CHANX-ENV-AGNOS_CHAN ", 21, load8(envv) - 48); }
 
     var caps = alloc(64);
     store64(caps, 0); store64(caps + 8, 0);
