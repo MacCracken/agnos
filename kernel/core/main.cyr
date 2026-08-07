@@ -2869,6 +2869,21 @@ fn symlink_disk_selftest() {
 symlink_disk_selftest();
 #endif
 
+# ⛔ THERE IS NO PTY BOOT SELFTEST, AND THAT IS A FINDING, NOT AN OMISSION (ipc bite 9).
+# A parent that holds a channel ACROSS a spawn cannot be the boot context. Two independent reasons,
+# both measured:
+#   1. This context is pid 0 and the FIRST user process is also slot 0, so `proc_alloc_slot` bumps
+#      pid 0's epoch when the child is born and the parent's own endpoints stop authorizing —
+#      `chan_auth` compares incarnations, which is exactly what bite 2 exists for. The parent's own
+#      `CH_RECV` answered BADFD on an endpoint nothing had closed.
+#   2. `sh_exec` is run-to-completion under IF=0, so a child spawned via `#43` is never SCHEDULED
+#      while the parent is still running. The first cut spun its entire retry budget against a peer
+#      that had not executed one instruction, and the log had no trace of the child at all.
+# ⚠ `chanx` never hit either because it only inspects the CHILD; nothing there survives the spawn and
+# reads back. The real gate is `scripts/harness/pty-host-test.py`, which drives `ptyhost &` under
+# agnsh so both processes are scheduled — the same shape the desktop harness uses.
+
+
 #ifdef CHAN_RING3_SELFTEST
 # 1.56.40 — the RING-3 half of the channel band (`#97 chan_op`), and the only place §9.9's two kill
 # criteria can be tested at all. The exerciser is a REAL cyrius `--agnos` program

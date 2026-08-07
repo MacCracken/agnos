@@ -26,6 +26,61 @@ control transport with a kernel-owned channel band on `#97`. Design, twelve-bite
 criteria: [`planning/ipc.md`](docs/development/planning/ipc.md) §9. Bites land in order; 0–5 land no
 consumer, so everything up to the cutover reverts by not landing the next bite.
 
+### Added — an UNMODIFIED program's stdio rides a channel: the PTY plumbing (ipc bite 9)
+
+⭐ A PTY decomposes into (i) a bidirectional local channel, (ii) an end handed to a child at spawn,
+(iii) a line discipline — and only (iii) is terminal-specific (`planning/ipc.md` §1). The band already
+gave (i) and (ii). **What was missing is that a child born holding a channel could not `read`/`write`
+it**: neither `vfs_read` nor `vfs_write` had a `VFS_CHAN` arm, so every program would have needed
+rewriting against `#97`. ⛔ A channel every program must be rewritten for is an API, not a PTY — and
+agnsh reads fd 0 with a plain `sys_read`, so it would never have worked.
+
+- `CH_SEND`/`CH_RECV` factored into `chan_queue`/`chan_deliver`; `read(2)`/`write(2)` route through the
+  same code, so the two paths cannot drift.
+- **`CH_ENDOW` gains a PTY mode** (a4 = `CH_ENDOW_STDIO`): the endowed endpoint is installed at the
+  child's fd **0, 1 and 2**. One endpoint behind several fds mirrors a real tty, where 0/1/2 are one
+  device. Opt-in — a compositor endowing a display channel must not have its client's stdio replaced.
+- Inert-by-construction holds on the new paths: `chan_fd_endpoint` returns -1 for "not mine" as well as
+  "not a channel", so an inherited fd falls through to `vfs_read`, which has no `VFS_CHAN` arm.
+
+**Two return values are the entire contract**, and both are asserted: empty → **-2 (WOULD_BLOCK)**,
+never 0, or every `while (read(fd) > 0)` exits the moment the peer is slow; peer gone → **0 (EOF)**, so
+that same loop terminates. ⛔ **The kernel does not block, and that is the design** — §9.4: *"No blocking
+in v1, and the reason is the STACK, not a policy"*, one SYSCALL stack per CPU. It is doubly wrong here:
+a channel's producer is a **peer process**, so `preempt_disable`-and-spin starves the very thing being
+waited on. That is why `kbd_read_blocking` may spin and this may not — the keyboard's producer is an IRQ.
+
+### Fixed — `chan_release_pid` matched the pid but not the INCARNATION
+
+⛔ Authority was epoch-aware while **revocation was not**, so the check was decorative on the death
+path. Matching on `pid` alone released endpoints belonging to a different incarnation of the same slot.
+Not hypothetical: at boot the spawning context is pid 0 and the first user process is also slot 0, so a
+parent that minted a channel and endowed one end had **both ends torn down when its child exited**, and
+its own `CH_RECV` then answered BADFD on an endpoint nothing had closed. Now compares `chan_end_oepoch`
+against `proc_epoch_get(pid)` — the same comparison `chan_auth` already made.
+
+### Fixed — `CH_ENDOW` read its mode from stale `ksyscall_a4`
+
+⛔ `ksyscall_a4` is shared staging: SEND and RECV use it as a **length**, and it is not cleared between
+ops. The first cut of PTY mode read `a4 != 0`, so a caller that had just done `ksyscall_a4_set(8)` for a
+SEND silently endowed in PTY mode and replaced an unrelated child's stdio. `CH_ENDOW_STDIO` is
+deliberately larger than `CHAN_REC_BYTES` so no legal length can ever collide with it.
+
+**Proof — `scripts/harness/pty-host-test.py`.** `/bin/ptyhost` (ring 3) mints, queues a record, endows
+in PTY mode and spawns `/bin/ptyx`, which **never calls `chan_op`**: it reads fd 0 and writes fd 1 with
+plain `read(2)`/`write(2)`. The host pumps its output back. Mutation-proven — disabling the stdio
+placement fails it, and the harness names *which direction* broke.
+
+⛔ **There is deliberately NO boot selftest for this, and the reason is a finding.** A parent holding a
+channel across a spawn cannot be the boot context: pid 0 collides with the first child's slot (above),
+and `sh_exec` is run-to-completion under IF=0 so the spawned child is never **scheduled** — the first
+cut spun its whole retry budget against a peer that had not executed one instruction, with no trace of
+the child in the log. The harness drives `ptyhost &` under agnsh so both processes actually run.
+
+⚠ **Scope, honestly:** this is the PTY *plumbing*, not "a live agnsh prompt in a composited window".
+Still open in bite 9: puka's agnos `pty_*` arm (all six functions are `#ifdef CYRIUS_TARGET_LINUX`
+today, stubbed to -1 on agnos), agnsh's blocking read learning to retry on -2, and key forwarding.
+
 ### Fixed — `pipe_write` silently overwrote unread bytes (ipc bite 10)
 
 ⛔ **IT RETURNED THE FULL COUNT WHILE DESTROYING DATA.** `pipe_write` wrapped `write_head % 4088` with

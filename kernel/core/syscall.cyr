@@ -4636,10 +4636,21 @@ fn chan_release_pid(pid) {
     var e = 0;
     while (e < CHAN_ENDS) {
         if (load64(&chan_end_open + e * 8) == 1) {
+            # ⛔ THE EPOCH IS PART OF THE IDENTITY HERE, NOT JUST IN chan_auth. Matching on `pid`
+            # alone releases endpoints belonging to a DIFFERENT INCARNATION of the same slot — and
+            # that is not hypothetical: at boot the spawning kernel context is pid 0 and the FIRST
+            # user process is also slot 0, so a parent that minted a channel and endowed one end had
+            # BOTH ends torn down the moment its child exited. The parent's own `CH_RECV` then
+            # answered BADFD on an endpoint nothing had closed.
+            # ⚠ `chan_auth` already compared incarnations (bite 2's whole purpose); this path did not,
+            # so authority was epoch-aware while REVOCATION was not. Both halves have to agree or the
+            # check is decorative.
             if (load64(&chan_end_owner + e * 8) == pid) {
-                store64(&chan_end_open + e * 8, 0);
-                store64(&chan_end_owner + e * 8, 0);
-                store64(&chan_end_oepoch + e * 8, 0);
+                if (load64(&chan_end_oepoch + e * 8) == proc_epoch_get(pid)) {
+                    store64(&chan_end_open + e * 8, 0);
+                    store64(&chan_end_owner + e * 8, 0);
+                    store64(&chan_end_oepoch + e * 8, 0);
+                }
             }
         }
         e = e + 1;
@@ -4678,6 +4689,14 @@ fn endow_arm_clear() { store64(&pcpu_endow_end + pcpu_cpu() * 8, 0); return 0; }
 fn endow_arm_get() { return load64(&pcpu_endow_end + pcpu_cpu() * 8) - 1; }
 fn endow_fd_set(v) { store64(&pcpu_endow_fd + pcpu_cpu() * 8, v); return 0; }
 fn endow_fd_get() { return load64(&pcpu_endow_fd + pcpu_cpu() * 8); }
+# ⭐ PTY MODE (ipc bite 9). When armed, the endowed endpoint is ALSO installed at the child's fd
+# 0, 1 and 2 — which is what makes it a terminal rather than a side channel: the child's stdin,
+# stdout and stderr ARE the channel, so a program that has never heard of `#97` (agnsh reads fd 0
+# with a plain `SYS_READ`) works unmodified. That is the whole difference between a PTY and an API.
+# ⚠ One endpoint behind four fds is CORRECT here and mirrors a real tty, where 0/1/2 are one device.
+var pcpu_endow_stdio[4];
+fn endow_stdio_set(v) { store64(&pcpu_endow_stdio + pcpu_cpu() * 8, v); return 0; }
+fn endow_stdio_get() { return load64(&pcpu_endow_stdio + pcpu_cpu() * 8); }
 
 # ⭐ ANNOUNCEMENT: THE PARENT DOES IT, WHICH IS WHY `CH_ENDOW` RETURNS THE FD INSTEAD OF 0.
 #
@@ -4731,6 +4750,9 @@ fn chan_place_into_child(child_pid) {
     var e = endow_arm_get();
     if (e < 0) { return 0; }
     endow_arm_clear();                          # one-shot: consumed whether or not it lands
+    var pty_mode = endow_stdio_get();
+    endow_stdio_set(0);                         # ⛔ cleared WITH the arm — a stale flag would silently
+    # turn the NEXT unrelated spawn's stdio into a channel, which is a very hard bug to see.
     if (e >= CHAN_ENDS) { return 0 - 1; }
     if (load64(&chan_end_open + e * 8) != 1) { return 0 - 1; }
     var tbl = vfs_fd_table_of(child_pid);
@@ -4759,6 +4781,22 @@ fn chan_place_into_child(child_pid) {
     kpayload_set(cb, 0, e);
     kpayload_set(cb, 1, load64(&chan_epoch + (e >> 1) * 8));
     kpayload_set(cb, 2, 0);
+    # ⭐ PTY MODE — the child's stdin/stdout/stderr BECOME this channel (ipc bite 9).
+    # ⛔ THIS IS WHAT MAKES IT A TERMINAL AND NOT A SIDE CHANNEL. agnsh reads fd 0 with a plain
+    # `SYS_READ` and writes fd 1 with a plain `SYS_WRITE`; it has never heard of `#97` and must not
+    # have to. Combined with the VFS_CHAN arms in the read/write dispatch, an unmodified program
+    # spawned this way talks to its terminal exactly as it would to a pipe or a tty slave.
+    # ⚠ Overwriting 0/1/2 (normally the console device) is the POINT, not a side effect — that is
+    # precisely what a pty slave does to a child at setsid+TIOCSCTTY time on Linux.
+    if (pty_mode != 0) {
+        var sfd = 0;
+        while (sfd < 3) {
+            var sb = tbl + sfd * 32;
+            var sk = 0;
+            while (sk < 32) { store64(sb + sk, load64(cb + sk)); sk = sk + 8; }
+            sfd = sfd + 1;
+        }
+    }
     chan_placed_fd = f;
     return f;
 }
@@ -4776,6 +4814,11 @@ var CH_E_NOREGION = 4;              # the 2 MB region is absent or unreachable f
 # this mask, so advertising an op the kernel does not run is how a client "works" against a kernel that
 # cannot serve it. Bite 4a implements CAPS only. This is the `MDO_OP_SUPPORTED` pattern that grew `#93`
 # across a whole arc under one number with no ABI break.
+# ⭐ PTY-mode endowment sentinel for `CH_ENDOW`'s a4. > CHAN_REC_BYTES on purpose: a4 doubles as a
+# record LENGTH for SEND/RECV and is not cleared between ops, so a value no length can take is the
+# only safe way to read a mode out of it.
+var CH_ENDOW_STDIO = 1000;
+
 var CH_OP_SUPPORTED = 0x003F;       # bits 0-5 = CAPS/MINT/SEND/RECV/CLOSE/ENDOW. Reserved ops stay CLEAR.
 
 # Reserve the region. Called once at boot, AFTER pmm_setup_directmap — the whole design rests on the
@@ -7968,6 +8011,14 @@ fn ksyscall(num, arg1, arg2, arg3) {
             if (tfd < 0) { stack_canary_check(canary); return 0 - CH_E_FULL; }
             endow_arm_set(ne);
             endow_fd_set(tfd);
+            # ⛔ AN EXACT SENTINEL, NOT `a4 != 0`. `ksyscall_a4` is shared staging: SEND and RECV use
+            # it as a LENGTH, and it is not cleared between ops. The first cut of this read `a4 != 0`
+            # and a selftest that had just done `ksyscall_a4_set(8)` for a SEND silently endowed in
+            # PTY mode — pty_mode came through as 8 — replacing an unrelated child's stdio.
+            # CH_ENDOW_STDIO is deliberately > CHAN_REC_BYTES so no legal length can ever collide.
+            var emode = 0;
+            if (ksyscall_a4_get() == CH_ENDOW_STDIO) { emode = 1; }
+            endow_stdio_set(emode);
             stack_canary_check(canary);
             return tfd;                          # the fd the child will hold — announce it in its env
         }
