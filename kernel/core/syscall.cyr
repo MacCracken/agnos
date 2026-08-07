@@ -4565,6 +4565,73 @@ fn chan_peer_alive(e) { return load64(&chan_end_open + (e ^ 1) * 8); }
 # ⚠ It deliberately does NOT close the PEER. Peer-gone is derived from `chan_end_open[e ^ 1]`, so the
 # survivor must keep its own endpoint open in order to be TOLD its peer died — closing both would turn
 # a peer's death into the survivor's own fd going bad, which is a different and much worse error.
+# ⭐ FACTORED OUT SO read(2)/write(2) AND `#97` SHARE ONE IMPLEMENTATION (ipc bite 9).
+# A PTY is (i) a bidirectional local channel, (ii) an end handed to a child at spawn, (iii) a line
+# discipline — and only (iii) is terminal-specific (planning/ipc.md §1). The band already gives (i)
+# and (ii). What was missing is that a child born holding a channel could not `read`/`write` it:
+# neither `vfs_read` nor `vfs_write` had a `VFS_CHAN` arm, so every program would have had to learn
+# `chan_op`. ⛔ A channel every program must be rewritten for is an API, not a PTY.
+#
+# ⛔ THESE TAKE AN ALREADY-AUTHORIZED ENDPOINT. Authority is re-derived by `chan_auth` at each call
+# site and is NOT re-checked here — keeping the check at the boundary is what makes an inherited fd
+# inert on every path, including these two new ones.
+fn chan_queue(se, ubuf, slen): i64 {
+    if (slen <= 0) { return 0 - CH_E_ARG; }
+    if (slen > CHAN_REC_BYTES) { return 0 - CH_E_ARG; }
+    if (is_user_range(ubuf, slen) == 0) { return 0 - CH_E_ARG; }
+    var pe = se ^ 1;
+    if (load64(&chan_end_open + pe * 8) != 1) { return 0 - CH_E_PEERGONE; }
+    var wv = load64(&chan_w + pe * 8);
+    var rv = load64(&chan_r + pe * 8);
+    if ((wv - rv) >= CHAN_SLOTS) {
+        store64(&chan_r + pe * 8, rv + 1);      # drop the OLDEST
+        chan_drops = chan_drops + 1;
+    }
+    var slot = chan_page(pe) + (wv % CHAN_SLOTS) * CHAN_REC_BYTES;
+    memset(slot, 0, CHAN_REC_BYTES);
+    var si = 0;
+    while (si < slen) { store8(slot + si, load8(ubuf + si)); si = si + 1; }
+    store8(&chan_lens + (pe * CHAN_SLOTS + (wv % CHAN_SLOTS)), slen);
+    store64(&chan_w + pe * 8, wv + 1);
+    return slen;
+}
+
+fn chan_deliver(re, ubuf, rcap): i64 {
+    if (rcap <= 0) { return 0 - CH_E_ARG; }
+    if (is_user_range(ubuf, rcap) == 0) { return 0 - CH_E_ARG; }
+    var rw = load64(&chan_w + re * 8);
+    var rr = load64(&chan_r + re * 8);
+    if (rr >= rw) {
+        # Drained. Peer-gone is reported only once there is nothing left to read — a dead peer's
+        # already-queued records must still be delivered, or a client that exits right after
+        # presenting loses the present.
+        if (chan_peer_alive(re) == 0) { return 0 - CH_E_PEERGONE; }
+        return 0 - CH_E_WOULDBLOCK;
+    }
+    var rslot = chan_page(re) + (rr % CHAN_SLOTS) * CHAN_REC_BYTES;
+    var rlen = load8(&chan_lens + (re * CHAN_SLOTS + (rr % CHAN_SLOTS)));
+    # ⛔ A RECORD THAT DOES NOT FIT IS AN ERROR, NOT A TRUNCATION — and the record STAYS.
+    if (rlen > rcap) { return 0 - CH_E_ARG; }
+    var ri = 0;
+    while (ri < rlen) { store8(ubuf + ri, load8(rslot + ri)); ri = ri + 1; }
+    store64(&chan_r + re * 8, rr + 1);
+    return rlen;
+}
+
+# read(2)/write(2) on a channel fd: the authorized endpoint for `fd`, or -1 when `fd` is not a live
+# channel this proc owns — in which case the caller falls through to the ordinary vfs path.
+# ⛔ -1 COVERS "NOT A CHANNEL" AND "NOT MINE" DELIBERATELY. An INHERITED channel fd must not become
+# readable just because the caller used `read` instead of `#97`; it falls through to `vfs_read`, which
+# has no VFS_CHAN arm and refuses. Inert-by-construction has to hold on every path that reaches an fd,
+# and adding paths is exactly when it gets lost.
+fn chan_fd_endpoint(fd): i64 {
+    if (fd < 0) { return 0 - 1; }
+    if (fd >= 32) { return 0 - 1; }
+    var b = vfs_fd_table() + fd * 32;
+    if (ktag(b) != VFS_CHAN) { return 0 - 1; }
+    return chan_auth(b);
+}
+
 fn chan_release_pid(pid) {
     var e = 0;
     while (e < CHAN_ENDS) {
@@ -7138,6 +7205,16 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg3 > 0) {
             if (is_user_range(arg2, arg3) == 0) { return 0 - 1; }
         }
+        # ⭐ ipc BITE 9 — an ordinary write(2) reaches a CHANNEL fd. A child spawned holding an
+        # endowed end writes its stdout with plain `write`, exactly as it would to a pipe or a pty
+        # slave. Without this every program would have to be rewritten against `#97`, which makes the
+        # band an API rather than a PTY (planning/ipc.md §1).
+        var wep = chan_fd_endpoint(arg1);
+        if (wep >= 0) {
+            var wr = chan_queue(wep, arg2, arg3);
+            if (wr < 0) { return 0 - 1; }        # peer gone / bad size — EPIPE-shaped
+            return wr;
+        }
         return vfs_write(arg1, arg2, arg3);
     }
     if (num == 2) { return proc_current_get(); }   # getpid() -> pid
@@ -7231,6 +7308,27 @@ fn ksyscall(num, arg1, arg2, arg3) {
                 if (ksyscall_a4_get() != 0) { return kbd_read_nonblock(arg2, arg3); }
                 return kbd_read_blocking(arg2, arg3);
             }
+        }
+        # ⭐ ipc BITE 9 — an ordinary read(2) reaches a CHANNEL fd.
+        # ⛔ WOULD_BLOCK IS RETURNED, NOT WAITED ON, AND THAT IS THE DESIGN — NOT A SHORTCUT.
+        # planning/ipc.md §9.4: "No blocking in v1, and the reason is the STACK, not a policy" — each
+        # CPU has ONE shared SYSCALL kernel stack, so N blocked waiters would need N disjoint kernel
+        # stacks. Both escape hatches are refused there: the `preempt_disable; sti; hlt` spin is the
+        # poison that made TCP toxic, and it is *especially* wrong here — a channel's producer is a
+        # PEER PROCESS, so disabling preemption starves the very thing the read is waiting for.
+        # (That is exactly why `kbd_read_blocking` may spin and this may not: the keyboard's producer
+        # is an IRQ, not a schedulable peer.)
+        # Retry belongs in userland, preemptibly. -2 is the kernel's established WOULD_BLOCK value,
+        # the same one the a4 non-blocking cooked-line read returns.
+        var rep = chan_fd_endpoint(arg1);
+        if (rep >= 0) {
+            var cr = chan_deliver(rep, arg2, arg3);
+            if (cr >= 0) { return cr; }
+            if (cr == 0 - CH_E_WOULDBLOCK) { return 0 - 2; }
+            # PEER GONE == EOF. A pty whose child exited reads 0, and so does this — it is what makes
+            # `while (read(fd) > 0)` terminate instead of spinning on an error it cannot interpret.
+            if (cr == 0 - CH_E_PEERGONE) { return 0; }
+            return 0 - 1;
         }
         return vfs_read(arg1, arg2, arg3);
     }
@@ -7841,26 +7939,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
             var sb = vfs_fd_table() + arg2 * 32;
             var se = chan_auth(sb);
             if (se < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            var slen = ksyscall_a4_get();
-            if (slen <= 0) { stack_canary_check(canary); return 0 - CH_E_ARG; }
-            if (slen > CHAN_REC_BYTES) { stack_canary_check(canary); return 0 - CH_E_ARG; }
-            if (is_user_range(arg3, slen) == 0) { stack_canary_check(canary); return 0 - CH_E_ARG; }
-            var pe = se ^ 1;
-            if (load64(&chan_end_open + pe * 8) != 1) { stack_canary_check(canary); return 0 - CH_E_PEERGONE; }
-            var wv = load64(&chan_w + pe * 8);
-            var rv = load64(&chan_r + pe * 8);
-            if ((wv - rv) >= CHAN_SLOTS) {
-                store64(&chan_r + pe * 8, rv + 1);      # drop the OLDEST
-                chan_drops = chan_drops + 1;
-            }
-            var slot = chan_page(pe) + (wv % CHAN_SLOTS) * CHAN_REC_BYTES;
-            memset(slot, 0, CHAN_REC_BYTES);
-            var si = 0;
-            while (si < slen) { store8(slot + si, load8(arg3 + si)); si = si + 1; }
-            store8(&chan_lens + (pe * CHAN_SLOTS + (wv % CHAN_SLOTS)), slen);
-            store64(&chan_w + pe * 8, wv + 1);
+            var sr = chan_queue(se, arg3, ksyscall_a4_get());
             stack_canary_check(canary);
-            return slen;
+            return sr;
         }
         # RECV(fd, buf, cap) -> len, or WOULDBLOCK / PEERGONE. ⛔ Those two are RESULTS, so a caller
         # batching one per held channel never aborts the batch on "nothing here" (§9.4).
@@ -7870,35 +7951,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
             var rb = vfs_fd_table() + arg2 * 32;
             var re = chan_auth(rb);
             if (re < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
-            var rcap = ksyscall_a4_get();
-            if (rcap <= 0) { stack_canary_check(canary); return 0 - CH_E_ARG; }
-            if (is_user_range(arg3, rcap) == 0) { stack_canary_check(canary); return 0 - CH_E_ARG; }
-            var rw = load64(&chan_w + re * 8);
-            var rr = load64(&chan_r + re * 8);
-            if (rr >= rw) {
-                # Drained. Peer-gone is reported only once there is nothing left to read — a dead peer's
-                # already-queued records must still be delivered, or a client that exits right after
-                # presenting loses the present.
-                if (chan_peer_alive(re) == 0) { stack_canary_check(canary); return 0 - CH_E_PEERGONE; }
-                stack_canary_check(canary);
-                return 0 - CH_E_WOULDBLOCK;
-            }
-            var rslot = chan_page(re) + (rr % CHAN_SLOTS) * CHAN_REC_BYTES;
-            var rlen = load8(&chan_lens + (re * CHAN_SLOTS + (rr % CHAN_SLOTS)));
-            # ⛔ A RECORD THAT DOES NOT FIT IS AN ERROR, NOT A TRUNCATION — and the record STAYS.
-            # This used to do `if (rlen > rcap) { rlen = rcap; }`, silently delivering a prefix and
-            # advancing the cursor past the rest. That is stream semantics smuggled into a record
-            # channel, and it makes all-or-nothing a lie the caller cannot detect.
-            # ⚠ It cost a real diagnosis: setu's `setu_read_msg` reads a 16-byte header and then the
-            # body separately. Against this truncation the header read consumed the ENTIRE message and
-            # the body read then found nothing — surfacing as an unexplained handshake failure several
-            # layers away, in another repo. Refusing here turns that into an immediate, local error.
-            if (rlen > rcap) { stack_canary_check(canary); return 0 - CH_E_ARG; }
-            var ri = 0;
-            while (ri < rlen) { store8(arg3 + ri, load8(rslot + ri)); ri = ri + 1; }
-            store64(&chan_r + re * 8, rr + 1);
+            var rr2 = chan_deliver(re, arg3, ksyscall_a4_get());
             stack_canary_check(canary);
-            return rlen;
+            return rr2;
         }
         # ENDOW(fd) -> 0. Arms this endpoint for the next `#43` child. ⛔ Authority is re-derived first:
         # you can only endow what you currently own, so an inherited (inert) claim cannot be used to

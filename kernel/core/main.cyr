@@ -4011,6 +4011,43 @@ fn syscall_harden_selftest() {
     else { kprintln("shsys: pipe create failed", 25); ok = 0; }
     kfree_sized(pfds, 32);
 
+    # ⭐ ipc BITE 9 — read(2)/write(2) MUST REACH A CHANNEL FD, or the band is an API and not a PTY.
+    var cm9 = kmalloc(64);
+    if (cm9 != 0) {
+        if (ksyscall(97, CH_MINT, cm9, 0) == 0) {
+            var e9a = load64(cm9);
+            var e9b = load64(cm9 + 8);
+            var b9 = kmalloc(256);
+            store64(b9, 0x5054594B4F4E4F57);          # "PTYKONOW" little-endian
+
+            # write(2) on the channel end, read(2) on its peer — no `#97` op in sight.
+            var w9 = ksyscall(1, e9a, b9, 8);
+            if (w9 != 8) { kprintln("shsys: write(2) did not reach the channel", 41); ok = 0; }
+            store64(b9, 0);
+            var r9 = ksyscall(5, e9b, b9, 64);
+            if (r9 != 8) { kprintln("shsys: read(2) did not reach the channel", 40); ok = 0; }
+            if (load64(b9) != 0x5054594B4F4E4F57) { kprintln("shsys: read(2) channel content wrong", 36); ok = 0; }
+
+            # ⛔ EMPTY MUST BE WOULD_BLOCK (-2), NOT 0. Returning 0 would mean EOF, and every
+            # `while (read(fd) > 0)` loop in userland would exit the instant the peer was merely slow.
+            var r9b = ksyscall(5, e9b, b9, 64);
+            if (r9b != 0 - 2) { kprintln("shsys: empty channel read(2) was not WOULD_BLOCK", 48); ok = 0; }
+
+            # ⛔ AND PEER-GONE MUST BE 0 (EOF), so the same loop TERMINATES when the child exits.
+            # These two are the whole contract: -2 means wait, 0 means done. Swap them and userland
+            # either spins forever or quits on the first idle poll.
+            ksyscall(97, CH_CLOSE, e9a, 0);
+            var r9c = ksyscall(5, e9b, b9, 64);
+            if (r9c != 0) { kprintln("shsys: read(2) after peer close was not EOF", 43); ok = 0; }
+
+            kfree_sized(b9, 256);
+            ksyscall(97, CH_CLOSE, e9b, 0);
+            if (ok == 1) { kprintln("shsys: read/write reach a channel fd OK", 39); }
+        }
+        else { kprintln("shsys: bite9 mint failed", 24); ok = 0; }
+        kfree_sized(cm9, 64);
+    }
+
     if (ok == 1) { kprintln("shsys: ALL PASS", 15); }
     else { kprintln("shsys: FAIL", 11); }
     return 0;
