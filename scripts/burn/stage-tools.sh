@@ -339,7 +339,26 @@ stage_one aethersafha  src/main.cyr aethersafha || rc=1
 # small children (these are 101 KB and 323 KB) and is NOT proven on large ones: a 2.5 MB jalwa
 # spawned this way never ran, while 15 MB binaries exec fine through `run`.
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
-stage_one setu         programs/present_probe.cyr puka || rc=1
+# ⭐⭐ WHICH puka IS IN THE SLOT IS NOW A DECLARED CHOICE, NOT AN IMPLICATION (2026-08-07).
+# ⛔ TWO HARNESSES WANT DIFFERENT BINARIES IN THE SAME `/bin/puka` SLOT, and that is not a mistake to
+# resolve — it is two different questions:
+#   · `aethersafha-clients-test.py`'s framebuffer oracle counts **present_probe's own** bright-green
+#     border and red bar. Putting the terminal here silently invalidates that gate.
+#   · `puka-terminal-test.py` needs the REAL terminal, and overrides the slot in its own seed only.
+# The compositor spawns the literal name `/bin/puka`, so the slot can hold exactly one of them.
+# ⇒ DEFAULT stays present_probe, so every existing gate keeps measuring what it was calibrated against.
+# `PUKA_TERMINAL=1` stages the real terminal instead — which is what an IRON burn of `AE-T2` needs,
+# because a burn cannot override a seed the way a QEMU harness can.
+# ⚠ `burn-prep.sh`'s staleness gate accepts EITHER and prints which one is in the slot; it fails only if
+# the staged binary matches neither, so this cannot silently ship a stale puka.
+# ⚠ Both source paths produce `build/puka_agnos` in their own repo, which is what `stage_one` derives
+# from the rootfs name — so the mechanism is unchanged, only the repo differs.
+if [ "${PUKA_TERMINAL:-0}" = "1" ]; then
+    echo "stage-tools: PUKA_TERMINAL=1 — /bin/puka will be the REAL terminal, not present_probe"
+    stage_one puka     src/main.cyr puka        || rc=1
+else
+    stage_one setu     programs/present_probe.cyr puka || rc=1
+fi
 stage_one crab         src/main.cyr crab        || rc=1
 
 # kriya dispatches on basename(argv[0]), so each delegated verb needs a

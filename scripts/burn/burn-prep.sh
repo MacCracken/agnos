@@ -1171,8 +1171,16 @@ esac
 # one the burn was for.
 # ⇒ WHEN A CYCLE'S ORACLE IS A NEW OR CHANGED TOOL, ADD IT HERE IN THE SAME BITE. A tool absent from
 # this loop is a tool that can be silently stale, and a stale oracle does not fail — it agrees.
-for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy gpudepth klug aethersafha puka crab; do
+# ⛔⛔ agnsh ADDED 2026-08-07 AFTER THE BURN THAT NEEDED IT RAN TWO VERSIONS STALE. The 1.56.41 desktop
+# burn's whole claim was "the hosted SHELL answers", and `/bin/agnsh` in the rootfs was **1.8.6** against
+# agnoshi's `VERSION` of **1.8.8** — because this loop did not cover it. The shell did answer, so nothing
+# was invalidated, but the answer came from a build nobody meant to test. That is the third instance of the
+# failure this loop's own comment names: a tool absent from here is a tool that can be silently stale, and
+# a stale oracle does not fail, it AGREES. ⚠ agnsh is staged by `stage-agnsh.sh`, not `stage-tools.sh`, and
+# living in a different script is exactly why it was missed.
+for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy gpudepth klug aethersafha puka crab agnsh; do
     _src=""
+    _puka_alt=""
     case "$_t" in
         modeset)  _src="tests/gpu/build/modeset_agnos" ;;
         gpuwedge) _src="tests/gpu/build/gpuwedge_agnos" ;;
@@ -1202,16 +1210,36 @@ for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy
         # no-present as a defect in the clients, in crab, in spawn_path, or in the compositor —
         # it indicts a path that is being deleted. The desktop's iron oracle is
         # `run /bin/aethersafha --selftest` (single process, no network state), gated below.
-        # ⚠ /bin/puka is setu's slim present_probe, NOT the puka terminal — the name is the
-        # compositor's first-resident slot.
-        puka)        _src="../setu/build/puka_agnos" ;;
+        # ⭐ /bin/puka may legitimately be EITHER of two binaries, so this row is resolved below
+        # rather than here — see the `_puka_alt` block. Default is setu's slim present_probe (the
+        # compositor's first-resident slot); `PUKA_TERMINAL=1 sh scripts/burn/stage-tools.sh` puts the
+        # real terminal there, which is what an iron burn of `AE-T2` requires.
+        puka)        _src="../setu/build/puka_agnos" ; _puka_alt="../puka/build/puka_agnos" ;;
         crab)        _src="../crab/build/crab_agnos" ;;
+        agnsh)       _src="../agnoshi/build/agnsh_agnos" ;;
     esac
     _staged="build/rootfs/bin/$_t"
     if [ ! -f "$_staged" ]; then
         echo "burn-prep: STAGING GAP -- $_staged is MISSING. install-media would flash no $_t."
         echo "  Fix:  sh scripts/burn/stage-tools.sh"
         exit 1
+    fi
+    # ⭐ A SLOT WITH TWO LEGITIMATE OCCUPANTS IS RESOLVED BY MATCHING, AND THE ANSWER IS PRINTED.
+    # /bin/puka is either setu's present_probe (default) or the real puka terminal
+    # (`PUKA_TERMINAL=1 stage-tools.sh`, which an iron `AE-T2` burn needs). ⛔ Accepting either must NOT
+    # weaken the gate into "anything goes": a binary matching NEITHER source is still stale and still
+    # aborts. What this buys is that the prep SAYS which one the operator is about to flash — the slot
+    # has misled every reader of stage-tools.sh since it was created, and a burn card that assumes the
+    # wrong occupant asks the operator to look for a terminal that was never staged.
+    if [ -n "$_puka_alt" ] && [ -f "$_puka_alt" ] && cmp -s "$_puka_alt" "$_staged"; then
+        echo "burn-prep: /bin/puka is the REAL TERMINAL ($(stat -c%s "$_staged") bytes) -- AE-T2 is burnable"
+        _src=""
+    elif [ -n "$_src" ] && [ -f "$_src" ] && cmp -s "$_src" "$_staged"; then
+        if [ -n "$_puka_alt" ]; then
+            echo "burn-prep: /bin/puka is setu's present_probe ($(stat -c%s "$_staged") bytes) -- NOT the terminal."
+            echo "           An AE-T2 burn needs:  PUKA_TERMINAL=1 sh scripts/burn/stage-tools.sh"
+        fi
+        _src=""
     fi
     if [ -n "$_src" ] && [ -f "$_src" ]; then
         if ! cmp -s "$_src" "$_staged"; then

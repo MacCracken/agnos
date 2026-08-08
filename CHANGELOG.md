@@ -25,7 +25,83 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 TCP-on-loopback, the desktop runs on it, an unmodified program's stdio rides it as a PTY, and pipelines
 stream. `planning/ipc.md` §9.6's twelve-bite table has no open rows.
 
-This cycle is open for whatever comes next. Nothing is claimed here yet.
+### Changed — `puka-terminal-test.py` gates the terminal's INPUT in three captures, not two
+
+⛔ **Its two-capture oracle stopped meaning what it said.** The block reasoned that "agnsh does NOT echo
+here", so any change in the glyph count had to be the shell answering. puka now owns the line discipline and
+**echoes locally**, so typing alone moves the count — a two-capture test would have reported PASS on a run
+where the shell never answered, the exact false green this harness exists to prevent.
+
+Three captures, each half gated on its own: `before → mid` proves the typed characters were **echoed**
+(puka's half); `mid → after` proves Enter made the shell **write back** (agnsh's half). ⭐ CR and LF paint
+no pixels, so every pixel of the second delta is the shell's own output. The floor is **derived from the
+run** — the first delta is 7 glyphs' worth of pixels, so two glyphs is `(mid - before) / 7 * 2` in this
+boot's own font and scale, rather than a typed-in pixel constant.
+
+### Added — the harness counts DELIVERED keys, so a lost keystroke names its own layer
+
+⛔ **A lost keystroke and a broken line discipline were indistinguishable, and one masqueraded as the
+other.** puka prints one `puka: key received` per decoded keycode; the harness counts them against what it
+typed and reports `keys DELIVERED to puka: N of 9`. When no line reaches the shell it now separates two
+different bugs: keys missing ⇒ **input delivery, and the terminal is untested by that run**; all keys
+present ⇒ **the line discipline**, with the CR-vs-LF rule named in the failure text.
+
+⚠ **A USB HID keyboard reports state on poll; it does not queue events.** The xHCI HID ring is drained only
+inside `kbscan #42`'s bounded `sti` window (`kernel/core/syscall.cyr:8746-8757`) and the compositor calls
+that once per frame, so a key pressed and released inside one frame is **never sampled**. Measured on the
+QEMU CPU composite path at QEMU's ~100 ms default hold: **0 of 9**, **4 of 9**, **4 of 9** delivered — and
+the 4-of-9 runs still completed a line and got an answer. Keys are now sent with an explicit
+`PUKA_KEY_HOLD_MS` (default 500) hold: **9 of 9**, deterministic across repeats. ⛔ The delivery count stays
+in the output either way, so the underlying loss cannot hide behind a passing gate. A human holds a key
+~100 ms and would lose keys on this same path; the fix is a faster frame or IRQ-buffered HID reports, and
+neither is test work.
+
+### Added — the terminal gate counts TEXT ROWS, because a pixel count is blind to layout
+
+⛔⛔ **This harness passed a build whose output was a STAIRCASE, before and after the fix, with
+byte-identical numbers** (4991 → 5176 → 6032 both times). The 2026-08-07 iron burn rendered agnsh's help
+with every line starting where the previous one ended — puka had no ONLCR — and the gate could not see it,
+**by construction**: a staircase draws exactly the same characters and only puts them in the wrong places.
+The operator's eye was the only oracle that could tell.
+
+It now bins glyph pixels into 16-px bands from the topmost glyph — self-calibrating against the window's
+unknown y origin — and gates on the count. Calibrated on **both arms of the same build** in QEMU:
+**ONLCR present = 6 rows · ONLCR removed = 8 rows · ceiling 7**, the only integer between them, so a correct
+run keeps one row of slack and a staircase still fails. ⚠ In the mutant run the shell still "ANSWERED",
+which is exactly why the pixel count could not carry this.
+
+### Added — `agnsh` in the burn staleness gate
+
+⛔ **The 1.56.41 burn's whole claim was "the hosted SHELL answers", and nothing verified which shell was
+staged.** `agnsh` is staged by `stage-agnsh.sh` rather than `stage-tools.sh`, and living in a different
+script is exactly why it was missing from `burn-prep.sh`'s loop — the third instance of the failure that
+loop's own comment names: *a tool absent from here is a tool that can be silently stale, and a stale oracle
+does not fail, it agrees.* Now compared against `../agnoshi/build/agnsh_agnos`.
+
+⚠ **Related but NOT staleness, and it produced a false finding on the way:** `agnsh` prints
+`agnoshi 1.8.6` while agnoshi's `VERSION` says **1.8.8**, because `src/agnsh.cyr:47` hardcodes the string.
+The staged binary is **byte-identical** to a fresh build, so the burn ran current code and the version line
+simply lies. ⇒ **A burn log cannot be used to tell whether the staged shell is current.**
+
+### Added — `PUKA_TERMINAL=1`: which binary occupies `/bin/puka` is a DECLARED choice
+
+⛔ **Two harnesses need different binaries in the same slot, and that is two questions, not a bug.**
+`aethersafha-clients-test.py`'s framebuffer oracle counts **present_probe's own** bright-green border and red
+bar; `puka-terminal-test.py` needs the real terminal and overrides the slot in its own seed. The compositor
+spawns the literal name `/bin/puka`, so exactly one can be staged.
+
+`scripts/burn/stage-tools.sh` keeps **present_probe as the default**, so every existing gate keeps measuring
+what it was calibrated against, and stages the **real terminal** under `PUKA_TERMINAL=1`. ⭐ That is what makes
+an `AE-T2` iron burn possible at all: **a burn cannot override a seed the way a QEMU harness can.**
+
+`scripts/burn/burn-prep.sh`'s staleness gate now accepts either occupant and **prints which one is in the
+slot** (`/bin/puka is the REAL TERMINAL (1537640 bytes) -- AE-T2 is burnable`, or the present_probe line with
+the command to change it). ⛔ It is not weakened: a binary matching **neither** source is still stale and still
+aborts the prep. What it buys is that the prep says what is about to be flashed — that slot has misled every
+reader of `stage-tools.sh` since it was created, and a burn card assuming the wrong occupant sends the operator
+looking for a terminal that was never staged.
+
+Nothing in the kernel is claimed in this cycle yet.
 
 ⚠ **Carried in, unresolved:** the `VFS_CHAN` close leak — `vfs_close_inner` has arms for
 `VFS_EXT2_FILE`, `VFS_SEC_WFILE`, `VFS_PIPE` and `VFS_SOCK` but **none for `VFS_CHAN`**, so closing a

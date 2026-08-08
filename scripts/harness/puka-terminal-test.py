@@ -513,27 +513,162 @@ try:
             except Exception:
                 return None
 
+        # ⛔⛔ A PIXEL COUNT IS BLIND TO LAYOUT, AND THAT BLINDNESS SHIPPED A BUG TO IRON.
+        # The 2026-08-07 burn rendered agnsh's output as a STAIRCASE — every line beginning where the
+        # previous one ended, then breaking mid-word at the right edge — because puka had no ONLCR and
+        # agnos's kernel console had made a bare LF mean newline-and-carriage-return for every program
+        # ever written against it. ⭐ THIS HARNESS PASSED THAT RUN with byte-identical counts
+        # (4991 -> 5176 -> 6032, before and after the fix), because a staircase draws **exactly the same
+        # characters** — it only puts them in the wrong places. The operator's eye caught what the gate
+        # structurally could not.
+        #
+        # ⇒ So count TEXT ROWS, not pixels. Glyph pixels are binned into 16-px bands (puka's cell height)
+        # measured from the topmost glyph, which self-calibrates against the window's unknown y origin.
+        # ⚠ THE EXPECTATION IS DERIVED, NOT TYPED: agnsh's startup banner is **4 lines** plus a prompt
+        # line, so a correctly-wrapped 80-column terminal shows 5 occupied rows. The staircase turns those
+        # same 4 lines into 7-8, because two of them (69 and 88 columns) overflow once they start mid-row.
+        def glyph_rows():
+            try:
+                d = open(os.path.join(WORK, "screen.ppm"), "rb").read()
+                k = d.index(b"255\n") + 4
+                hd = d[:k].split(); gw, gh = int(hd[1]), int(hd[2]); q = d[k:]
+                ys = set()
+                for y in range(gh):
+                    base = y * gw * 3
+                    for x in range(gw):
+                        j = base + x * 3
+                        if q[j] == 192 and q[j + 1] == 192 and q[j + 2] == 192:
+                            ys.add(y)
+                            break
+                if not ys:
+                    return None
+                top = min(ys)
+                return len({(y - top) // 16 for y in ys})
+            except Exception:
+                return None
+
         before = glyphs()
+        rows_before = glyph_rows()
         # ⛔ THE NEWLINE IS THE WHOLE POINT, AND IT MUST LAND. agnsh's `read_line` accumulates until
         # it sees '\n' — without it the shell has taken the characters and is simply still waiting, so
         # the panel correctly shows nothing and the test would blame the input path. A first run sent
         # `ret` last and only 7 of 8 keys arrived; the missing one was the newline.
-        # ⚠ agnsh does NOT echo here. On the console the KERNEL supplies echo and line editing; a
-        # channel fd has no line discipline, so the shell receives raw bytes and the panel changes
-        # only when agnsh ANSWERS. That makes the answer — not the typing — the thing to wait for.
-        for _k in ("tab", "v", "e", "r", "s", "i", "o", "n"):
-            s.sendall((f"sendkey {_k}\n").encode()); time.sleep(0.2); drain()
+        #
+        # ⛔⛔ THREE CAPTURES, NOT TWO — BECAUSE `after > before` STOPPED MEANING WHAT IT SAID.
+        # This block used to note that "agnsh does NOT echo here", so any change in the glyph count had
+        # to be the shell answering. That is no longer true and the note was deleted rather than left to
+        # mislead: puka now owns the line discipline (`puka/src/line_discipline.cyr`) and ECHOES locally,
+        # because a channel fd has none of the kernel console's echo. So typing alone moves the count,
+        # and a two-capture test would report PASS on a run where the shell never answered — the exact
+        # false green this harness exists to prevent.
+        #
+        # The three captures separate the two halves, and each is gated on its own:
+        #   before -> mid    the 7 typed characters were ECHOED    (puka's half)
+        #   mid    -> after  Enter made the shell WRITE BACK       (agnsh's half — the AE-T2 claim)
+        # ⭐ CR and LF paint NO pixels, so every pixel of the second delta is the shell's own output
+        # (its `version` reply plus a fresh prompt). The floor is DERIVED from this run, not typed in: the
+        # first delta is 7 glyphs' worth of pixels, so `(mid - before) / 7 * 2` is "at least two glyphs"
+        # measured in this boot's own font, at this boot's own scale. A hardcoded pixel constant would be
+        # the guessed-3232-lines mistake again.
+        _typed = ("tab", "v", "e", "r", "s", "i", "o", "n")
+        _enters = 2                      # the second is a spare: it prints a fresh prompt, also an answer
+        # ⛔⛔ HOLD EACH KEY LONGER THAN ONE COMPOSITOR FRAME, OR THE PRESS IS NEVER OBSERVED.
+        # ⭐ A USB HID keyboard REPORTS STATE ON POLL; it does not queue events. agnos drains the xHCI HID
+        # ring only inside `kbscan #42`'s bounded sti window (kernel/core/syscall.cyr:8746-8757), and the
+        # compositor calls that ONCE PER FRAME. So any key whose press+release completes inside one frame
+        # is not "dropped" anywhere — it is never sampled. QEMU's `sendkey` default hold is ~100 ms, and
+        # the CPU composite path in QEMU (no AMD PCI device ⇒ every GPU branch is dead) is slower than
+        # that with two windows on screen.
+        # Measured on this box, same build, three runs at the default hold: **0 of 9**, **4 of 9**,
+        # **4 of 9** keys delivered — and the run that delivered 4 still completed a line and got an
+        # answer, which is what makes this so easy to misread as a terminal bug.
+        # ⚠ THIS IS NOT THE HARNESS BEING GENEROUS. A human holds a key ~100 ms and would lose keys on
+        # this same path; the real fix is a faster frame (`AE-0a`) or IRQ-buffered HID reports, and both
+        # are system work, not test work. Raising the hold isolates the terminal from that defect so this
+        # gate measures ONE thing. The delivery count above stays in the output either way, so the
+        # underlying loss can never hide behind it.
+        _hold_ms = int(os.environ.get("PUKA_KEY_HOLD_MS", "500"))
+        # ⛔ `tab` is CONSUMED by the compositor (it cycles focus and is deliberately not forwarded), so
+        # the number puka should see is every other key plus the Enters — never len(_typed).
+        _expect_at_puka = (len(_typed) - 1) + _enters
+        for _k in _typed:
+            s.sendall((f"sendkey {_k} {_hold_ms}\n").encode()); time.sleep(_hold_ms / 1000.0 + 0.3); drain()
         time.sleep(0.5)
-        s.sendall(b"sendkey ret\n"); time.sleep(0.5); drain()
-        s.sendall(b"sendkey ret\n"); time.sleep(0.5); drain()
+        s.sendall((f"screendump {PPM}\n").encode()); time.sleep(3.0); drain()
+        mid = glyphs()
+        for _e in range(_enters):
+            s.sendall((f"sendkey ret {_hold_ms}\n").encode()); time.sleep(_hold_ms / 1000.0 + 0.5); drain()
         time.sleep(6.0)
         s.sendall((f"screendump {PPM}\n").encode()); time.sleep(4.0); drain()
         after = glyphs()
-        typed_ok = (before is not None) and (after is not None) and (after > before)
-        p(f"  keystrokes reached the shell: {typed_ok}  (glyph px {before} -> {after})")
-        if before is not None and after is not None and after == before:
-            p("     ⛔ the panel did not change — either focus never reached puka, the compositor did")
-            p("        not forward the key, or the HID->evdev map dropped it.")
+
+        # ⭐⭐ COUNT WHAT WAS DELIVERED BEFORE JUDGING WHAT WAS DONE WITH IT. puka prints one
+        # `puka: key received` per decoded keycode, so this is an exact count of keys that crossed the
+        # whole compositor->client seam, independent of anything downstream. ⛔ Without it a lost
+        # keystroke is INDISTINGUISHABLE from a broken line discipline — measured, 1 run in 3 loses
+        # several keys including Enter, and that run's symptom is "the shell never answered" even though
+        # every byte that arrived was handled correctly. Keys are produced by the xHCI HID ring and
+        # drained only inside `kbscan #42`'s bounded sti window (kernel/core/syscall.cyr:8746-8757), so a
+        # slow compositor frame can miss one. That is an INPUT-DELIVERY defect in the kernel/driver
+        # layer, not a terminal one, and this harness must name it as such rather than blame puka.
+        _ser = open(SER, "rb").read().decode("latin1")
+        keys_got = _ser.count("puka: key received")
+        line_sent = "puka: line sent to the shell" in _ser
+        refused = _ser.count("puka: byte refused by the line discipline")
+
+        echo_ok = (before is not None) and (mid is not None) and (mid > before)
+        answer_ok = False
+        answer_floor = None
+        if echo_ok and after is not None:
+            answer_floor = max(1, int((mid - before) / 7 * 2))
+            answer_ok = (after - mid) >= answer_floor
+        # ⭐ THE LAYOUT GATE, CALIBRATED AGAINST BOTH ARMS ON THIS BOX, SAME BUILD, SAME BOOT PATH:
+        #     ONLCR present (correct)  -> **6** text rows
+        #     ONLCR removed (mutant)   -> **8** text rows, and the shell still "ANSWERED" in that run,
+        #                                 which is precisely why the pixel count could not see it
+        # There is exactly one integer between them, so the ceiling is **7**: a correct run keeps one row
+        # of slack (for a wrapped prompt or a stray blank) and the staircase still fails by one.
+        # ⛔ If you raise this to make a run pass, you have deleted the only gate that can see a staircase.
+        rows_max = int(os.environ.get("PUKA_LAYOUT_ROWS_MAX", "7"))
+        layout_ok = (rows_before is not None) and (rows_before <= rows_max)
+        typed_ok = echo_ok and answer_ok and layout_ok
+        p(f"  banner LAYOUT (text rows used)    : {rows_before} (need <= {rows_max}; correct = 6, "
+          f"staircase = 8, both measured) -> {'PASS' if layout_ok else 'FAIL'}")
+        if rows_before is not None and not layout_ok:
+            p("     ⛔ THE SAME CHARACTERS IN THE WRONG PLACES — a STAIRCASE, not a wrapping bug.")
+            p("        Every line is starting where the previous one ENDED, then overflowing the right")
+            p("        edge and breaking mid-word. Cause: the child's bare LF is reaching the engine")
+            p("        without a carriage return. agnos's kernel console makes LF mean newline+CR")
+            p("        (fb_console.cyr:1051), so EVERY agnos program emits bare LF; a real terminal must")
+            p("        apply ONLCR in its line discipline — puka/src/line_discipline.cyr `ld_out_feed`.")
+            p("        ⛔ Do NOT 'fix' this by widening the grid: agnsh's longest help line is 77 of 80.")
+        p(f"  keys DELIVERED to puka           : {keys_got} of {_expect_at_puka} forwarded "
+          f"(tab is consumed by the compositor)")
+        p(f"  keystrokes ECHOED by puka        : {echo_ok}  (glyph px {before} -> {mid})")
+        p(f"  a completed line went to the shell: {line_sent}"
+          f"{'' if refused == 0 else f'   ⚠ {refused} byte(s) REFUSED by the discipline'}")
+        p(f"  shell ANSWERED over the PTY      : {answer_ok}  (glyph px {mid} -> {after}, "
+          f"need +{answer_floor} = 2 glyphs at this run's own scale)")
+        if before is not None and mid is not None and mid == before:
+            p("     ⛔ typing changed nothing — either focus never reached puka, the compositor did")
+            p("        not forward the key, or the HID->evdev map dropped it. Nothing is proven about")
+            p("        the shell: this half is puka's, and it failed before agnsh was ever involved.")
+        elif echo_ok and not answer_ok and not line_sent:
+            # ⭐ THE DISCRIMINATOR. No line reached the shell AND keys went missing ⇒ Enter never
+            # arrived, so nothing is proven or disproven about the discipline or about agnsh.
+            if keys_got < _expect_at_puka:
+                p(f"     ⚠ INPUT DELIVERY, NOT THE TERMINAL: only {keys_got} of {_expect_at_puka} keys")
+                p("        reached puka, so Enter was among the lost and no line could complete. The")
+                p("        line discipline and agnsh are UNTESTED by this run — re-run before drawing")
+                p("        any conclusion. Cause: the xHCI HID ring is drained only in kbscan #42's")
+                p("        bounded sti window, so a slow compositor frame can miss a key.")
+            else:
+                p("     ⛔ EVERY KEY ARRIVED AND NO LINE COMPLETED — that IS the line discipline.")
+                p("        Enter must arrive as LF (10): agnsh's read_line terminates on nothing else,")
+                p("        and the encoder emits CR (13), which puka/src/line_discipline.cyr converts.")
+        elif echo_ok and line_sent and not answer_ok:
+            p("     ⛔ A COMPLETE LINE REACHED THE SHELL AND IT WROTE NOTHING BACK. That is agnsh's")
+            p("        side, and it is the one case where the terminal is exonerated by its own log.")
 
         GLYPH_MIN = 500
         if glyph_px is None:
