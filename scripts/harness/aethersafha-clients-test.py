@@ -33,7 +33,7 @@
 #
 # PASS is not "the desktop worked" — it is "the two launch paths were compared and the result is
 # unambiguous". Read the printed verdict.
-import os, socket, subprocess, sys, time
+import os, socket, struct, subprocess, sys, time, zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 GNOBOOT = os.environ.get("GNOBOOT_ROOT", os.path.join(ROOT, "../gnoboot")) + "/build/BOOTX64.EFI"
@@ -270,6 +270,190 @@ try:
         time.sleep(6.0)
         bg = ser()
         bg_code = verdict(bg, "desktop")
+
+        # ⭐⭐ THE F7-F10 WINDOW-MOVE PHASE — the stimulus `AE-0a` was written for and has never had.
+        #
+        # `AE-0a` computes its damage band as union(cur, prev) *because* a window that MOVES leaves
+        # its old pixels on screen unless the band also covers where it WAS. That reasoning shipped
+        # and burned four times with nothing on the system able to move a window — AE-7 pointer input
+        # is a kernel xhci item — so the case the band exists for was never once exercised. A keyboard
+        # mover is the missing stimulus, and this phase exercises it without spending a burn.
+        #
+        # ⛔ F7-F10, NOT F1-F4. The 2026-08-08 build bound the mover to F1-F4 and F4 was ALREADY
+        # `IA_CLOSE_FOCUSED` — "move down" and "destroy the window" were one keystroke. Bindings live in
+        # aethersafha/src/input.cyr's `HidUsage`; read it before adding a key here.
+        #
+        # ⛔ IT IS ALSO THE ONLY LOCAL TEST FOR THE 2026-08-08 IRON RESULT, in which the compositor
+        # printed every other line of that burn and NOT its window-move line. From that
+        # log alone TWO explanations are indistinguishable — the keys were never pressed, or they
+        # arrived at the compositor and were silently dropped — and the honest reading of a missing
+        # marker is the second one, because the default explanation for work not happening is that
+        # the code is wrong. This phase separates them.
+        #
+        # ⭐ WHY THIS REPRODUCES IRON RATHER THAN MERELY RESEMBLING IT: the QEMU line above gives the
+        # guest `qemu-xhci` + `usb-kbd`, so the guest keyboard is USB HID on xHCI — the SAME producer
+        # archaemenid uses ("xhci: port 2 connected, FS ... hid: keyboard configured, boot protocol
+        # on, EP=129, polling 8-byte reports"). This is NOT the i8042 PS/2 path, which reaches the
+        # kernel through a different translation table entirely. If a function key is filtered
+        # anywhere in the HID path, it is filtered here too.
+        #
+        # ⚠ HOLD, DO NOT TAP. QEMU's default sendkey hold is ~100 ms while the compositor samples HID
+        # state once per frame, so a short press is NEVER SAMPLED rather than "dropped" — the exact
+        # confusion that cost a session in puka-terminal-test.py, where key loss was read as a
+        # terminal bug and was really poll-vs-frame sampling. 500 ms unless overridden.
+        AE_KEY_HOLD_MS = int(os.environ.get("AE_KEY_HOLD_MS", "500"))
+
+        def key_raw(name, hold_ms=None):
+            h = AE_KEY_HOLD_MS if hold_ms is None else hold_ms
+            s.sendall((f"sendkey {name} {h}\n").encode())
+            time.sleep(h / 1000.0 + 0.3); drain()
+
+        # A before-shot, so the after-shot the gate block takes below is a COMPARISON and not just a
+        # picture. ⚠ Neither is a gate here: in `desktop` mode a live agnsh console writes to the
+        # same framebuffer as the compositor, so a whole-frame pixel measure carries an uncontrolled
+        # writer. These are for the eye and for a diff, and the SERIAL MARKER is the oracle.
+        SHOT_BEFORE = os.path.join(WORK, "move-before.ppm")
+        s.sendall((f"screendump {SHOT_BEFORE}\n").encode()); time.sleep(3.0); drain()
+
+        mv_mark = len(ser())
+        p("")
+        p(f"=== F1-F4 WINDOW MOVE (USB HID on xHCI, {AE_KEY_HOLD_MS} ms hold) ===")
+        # TAB first: focus must land on a window before a move means anything, and TAB is the one
+        # compositor key proven to work on iron (it cycled focus four times in the 08-08 burn).
+        key_raw("tab")
+        MOVE_KEYS = ["f7", "f7", "f7", "f8", "f8", "f9", "f9", "f10", "f10", "f10"]
+        for _mk in MOVE_KEYS:
+            key_raw(_mk)
+        time.sleep(3.0)
+        mv = ser()[mv_mark:]
+
+        moved_n   = mv.count("aethersafha: F7-F10 moved the focused window")
+        usage_n   = mv.count("aethersafha: key usage seen:")
+        fwd_n     = mv.count("aethersafha: forwarded a key to the focused client")
+        tabbed_n  = mv.count("aethersafha: focus cycled by TAB")
+        p(f"  keys injected                    : tab + {len(MOVE_KEYS)} function keys")
+        p(f"  'F7-F10 moved the focused window': {moved_n}")
+        p(f"  'focus cycled by TAB'            : {tabbed_n}")
+        p(f"  'key usage seen:' traces         : {usage_n}")
+        p(f"  'forwarded a key to the client'  : {fwd_n}")
+
+        # ⭐ THE ATTRIBUTION. ⛔ READ THE SCOPE LINE FIRST: everything below is a statement about
+        # THE BINARY THIS RUN BOOTED, not about any binary that was ever flashed. Those are the same
+        # claim only when the staged /bin/aethersafha is byte-identical to the flashed one — and the
+        # first version of this block quietly assumed they were, so a PASS here would have printed
+        # "the iron burn's keys were never pressed" on a tree where the handler had already been
+        # fixed. That is a false exoneration of a bug that really existed, generated by a green run.
+        # ⇒ If you want this phase to testify about a past burn, boot that burn's artifact.
+        if moved_n > 0:
+            p("  ⭐ THE MOVER WORKS on the USB HID path IN THIS BUILD: a usage decoded, the handler")
+            p("     ran, and a window moved. The chain xHCI HID -> kb_buf -> kbscan#42 -> Set-1")
+            p("     decode -> input_map -> input_apply -> win_move is intact end to end.")
+            p("     ⚠ SCOPE: this says nothing about a previously flashed binary, and nothing about")
+            p("       the GPU path — QEMU has no amdgpu, so the compositor ran its CPU blit here.")
+            p("     ⚠ The marker latches on first move, so 1 is the maximum however many keys land.")
+            p("       Net displacement for the sequence above is 40 px LEFT and 40 px DOWN; look at")
+            p("       the two screendumps to confirm the window moved that far AND left no ghost.")
+        else:
+            if tabbed_n == 0:
+                p("  ⚠ TAB DID NOT CYCLE FOCUS EITHER — so this phase tests nothing about F1-F4.")
+                p("    Either no key reached the compositor at all or the desktop was already gone.")
+                p("    ⛔ Do NOT read the F1-F4 result below; fix the precondition first.")
+            else:
+                p("  ⛔ REPRODUCED LOCALLY: TAB reached the compositor and F7-F10 did not move a window.")
+                p("     That is a REAL defect, reproducible without hardware. Compare the 'key usage")
+                p("     seen:' traces against 64/65/66/67 (0x40-0x43): if the usages are absent the")
+                p("     drop is BELOW the compositor (kernel HID filter or the bhumi seam); if they")
+                p("     are present the drop is IN the handler.")
+
+        SHOT_AFTER = os.path.join(WORK, "move-after.ppm")
+        s.sendall((f"screendump {SHOT_AFTER}\n").encode()); time.sleep(3.0); drain()
+        # ⭐ EMIT PNGs TOO, because the ghost question is answered by LOOKING and nothing else here
+        # can answer it. ⛔ Do NOT try to settle it by correlating the two frames for a rigid shift:
+        # only ONE window moves, so every static pixel of console and of the other windows votes for
+        # "no displacement" and the best match is always (0,0). That measurement was run, it returned
+        # a confident and completely wrong answer, and the images settled it in one look.
+        for _nm in ("move-before", "move-after"):
+            try:
+                _pp = os.path.join(WORK, _nm + ".ppm")
+                with open(_pp, "rb") as _f: _raw = _f.read()
+                _parts = _raw.split(b"\n", 3)
+                _w, _hh = [int(_v) for _v in _parts[1].split()]
+                _px = _parts[3]
+                _S = 4                      # 2048x2048 surfaces are unwieldy; quarter-scale is legible
+                _ow, _oh = _w // _S, _hh // _S
+                _rows = []
+                for _y in range(_oh):
+                    _r = bytearray(); _base = (_y * _S) * _w * 3
+                    for _x in range(_ow):
+                        _i = _base + (_x * _S) * 3
+                        _r += _px[_i:_i+3]
+                    _rows.append(bytes(_r))
+                def _chunk(_t, _d):
+                    return (struct.pack(">I", len(_d)) + _t + _d
+                            + struct.pack(">I", zlib.crc32(_t + _d) & 0xffffffff))
+                _ihdr = struct.pack(">IIBBBBB", _ow, _oh, 8, 2, 0, 0, 0)
+                _idat = zlib.compress(b"".join(b"\x00" + _r for _r in _rows), 6)
+                with open(os.path.join(WORK, _nm + ".png"), "wb") as _f:
+                    _f.write(b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", _ihdr)
+                             + _chunk(b"IDAT", _idat) + _chunk(b"IEND", b""))
+            except Exception as _e:
+                p(f"  (png conversion of {_nm} failed: {_e})")
+        p(f"  shots: {SHOT_BEFORE} -> {SHOT_AFTER}")
+        p(f"  LOOK AT THESE: {os.path.join(WORK, 'move-before.png')} and move-after.png")
+
+        # ⛔⛔ THE F4 CLOSE PHASE. The 2026-08-08 GPU burn reported "closing application with f4 appears
+        # to have issues with flashing / not disappearing or closing properly" — TWO defects wearing one
+        # sentence, and this phase separates them:
+        #
+        #   "flashing" / "not disappearing" = the compositor's damage band. Every damage producer walks
+        #     the LIVE window list, so a REMOVED window is in neither `cur` nor `prev` and its rows are
+        #     never repainted. `#84 present` flips the target, so erasing takes one frame per buffer;
+        #     the close got one, so one buffer lost the window and the other kept it. ⇒ Covered by a
+        #     mutation-tested unit test (aethersafha tests/render.tcyr, "covered for TWO frames"),
+        #     because one framebuffer here cannot show a flip. The eye on iron is the other half.
+        #
+        #   "not closing properly" = the CLIENT. `SETU_CLOSE` (kind 7) was in the protocol from the
+        #     start, never sent and never handled, so the closed client stayed **orphaned alive** with
+        #     its `#97` channel end and one of only 16 system-wide `#86` shm slots held for the boot.
+        #     ⇒ THAT is what this phase gates, and it gates it on the client's own words.
+        #
+        # ⚠ Runs AFTER the move phase on purpose: closing a client removes a window the move phase
+        # wants. Do not reorder.
+        p("")
+        p("=== F4 CLOSE (SETU_CLOSE -> the client exits and releases its slot) ===")
+        cl_mark = len(ser())
+        # ⛔ TAB ONTO A WINDOW THAT HAS A CLIENT FIRST, or this phase tests nothing. The compositor
+        # seeds a window of its OWN with no `#97` peer, and `IA_FOCUS_NEXT` wraps 2 -> 0, so the single
+        # TAB in the move phase above left focus on exactly that clientless window. The first run of
+        # this phase therefore closed the seeded window, correctly notified nobody, and reported a
+        # failure that was really a focus-order mistake in the harness.
+        # ⚠ Two more TABs walk 0 -> 1 (puka) -> 2 (crab). Read the compositor's own
+        # "closed a window ... " line rather than inferring the case from silence.
+        key_raw("tab")
+        key_raw("tab")
+        key_raw("f4")
+        time.sleep(3.0)
+        cl = ser()[cl_mark:]
+        crab_gone = "crab: compositor closed the window -- exiting" in cl
+        puka_gone = "puka: compositor closed the window -- exiting" in cl
+        told = "aethersafha: closed a window and sent SETU_CLOSE to its client" in cl
+        orphan = "aethersafha: closed a window that has no client" in cl
+        p(f"  compositor sent SETU_CLOSE   : {told}")
+        p(f"  (or closed a clientless one) : {orphan}")
+        p(f"  crab acknowledged the close : {crab_gone}")
+        p(f"  puka acknowledged the close : {puka_gone}")
+        if crab_gone or puka_gone:
+            p("  ⭐ THE CLOSE REACHES THE CLIENT and the client exits. Its channel end and its #86 shm")
+            p("     slot go back to the kernel on process death — that release is the whole point.")
+        else:
+            p("  ⛔ NO CLIENT ACKNOWLEDGED THE CLOSE. Either SETU_CLOSE was not sent (compositor side:")
+            p("     comp_close_window must setu_send it to win_cfd), or the client is not handling kind")
+            p("     7, or the focused window was the compositor-seeded one which HAS no client (cfd 0)")
+            p("     and so correctly notifies nobody. ⚠ Check which window had focus before blaming the")
+            p("     wire: TAB order decides it, and a clientless window closing silently is CORRECT.")
+        SHOT_CLOSED = os.path.join(WORK, "close-after.ppm")
+        s.sendall((f"screendump {SHOT_CLOSED}\n").encode()); time.sleep(3.0); drain()
+        p(f"  shot: {SHOT_CLOSED} (compare with move-after — the window should be GONE, not doubled)")
     if MODE == "armed":
         # ⭐ THE ARMED-STATE TEST, and the reason every other mode in this file was blind to a real
         # kernel defect: they all launch the compositor as the FIRST command of the boot.
