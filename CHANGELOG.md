@@ -22,6 +22,16 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.42] — 2026-08-08 — cycle OPEN: ⛔ PS/2 IS DELETED, and the xHCI HID drain becomes a dispatcher
 
+### Fixed — mouse buttons are per-endpoint, so one device cannot release another's
+
+⛔ `hid_process_mouse_report` assigned the shared `hid_mouse_btn` from whichever interface reported LAST.
+archaemenid binds **two** boot-mouse interfaces — the real mouse, and the Keychron K2's phantom mouse on
+its interface 1 — so a single idle (all-zero) report from the keyboard cleared a button the user was
+physically holding, dropping a titlebar drag mid-gesture and handing ring 3 a release that never happened.
+⇒ `hid_ep_btn[]` keeps each endpoint's own bitmap and `hid_mouse_btn` is their union over bound mouse
+endpoints; a device can now only ever clear its own buttons. `hid_process_mouse_report` takes the endpoint
+index. Build 1 973 288 → 1 973 640 B.
+
 ### Added — `#98 ptrscan`: ring 3 can read the pointer (`AE-7` P3, kernel half)
 
 `ptrscan(buf, max)` → **16** on activity, **0** idle, **−1** on a bad range or `max < 16`. Record:

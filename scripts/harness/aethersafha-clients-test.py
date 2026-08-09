@@ -53,6 +53,88 @@ PART_OFFSET = 33 * 1048576
 # never scheduled enough to connect, and nothing reaps them), and they interfere with the next run —
 # bg then reports "launched: False" on a boot where it reaches 2/2 cleanly on its own.
 # Use AE_CLIENTS_MODE=fg / =bg in separate invocations to compare the paths.
+
+# ⭐ Find the cursor arrow in a PPM by matching its exact 10x20 two-tone shape. Returns (x, y) of the
+# bitmap origin, or None. Mirrors `cursor_fill_at`/`cursor_outline_at` in aethersafha/src/cursor.cyr —
+# ⚠ if the arrow's silhouette is deliberately changed there, this pattern must be updated with it, and the
+# failure mode is a loud "NO ARROW FOUND" rather than a silent pass.
+CURSOR_ART = [
+    "o.........",
+    "ooo.......",
+    "o#oo......",
+    "o##o......",
+    "o##oo.....",
+    "o###o.....",
+    "o###oo....",
+    "o####o....",
+    "o####oo...",
+    "o#####o...",
+    "o#####oo..",
+    "o######o..",
+    "o######oo.",
+    "o#######o.",
+    "o#######o.",
+    "o###o###o.",
+    "o##oo###o.",
+    "o#ooo###o.",
+    "ooo.o###o.",
+    "....ooooo.",
+]
+
+def cursor_arrow_find(path):
+    try:
+        f = open(path, "rb")
+        if f.readline().strip() != b"P6":
+            return None
+        line = f.readline()
+        while line.startswith(b"#"):
+            line = f.readline()
+        w, h = map(int, line.split())
+        f.readline()
+        data = f.read(w * h * 3)
+    except Exception:
+        return None
+    WHITE = b"\xff\xff\xff"
+    BLACK = b"\x00\x00\x00"
+    # Anchor on row 13 -- "o#######o" is a 9-pixel run this theme produces nowhere else, so the expensive
+    # full-shape check runs a handful of times instead of once per pixel.
+    anchor = BLACK + WHITE * 7 + BLACK
+    ah = len(CURSOR_ART)
+    aw = len(CURSOR_ART[0])
+    for y in range(13, h - (ah - 13)):
+        row = data[y * w * 3:(y + 1) * w * 3]
+        start = 0
+        while True:
+            i = row.find(anchor, start)
+            if i < 0:
+                break
+            start = i + 3
+            if i % 3 != 0:
+                continue
+            x0 = i // 3
+            y0 = y - 13
+            if x0 < 0 or y0 < 0 or x0 + aw > w or y0 + ah > h:
+                continue
+            ok = True
+            for ry in range(ah):
+                for rx in range(aw):
+                    ch = CURSOR_ART[ry][rx]
+                    if ch == ".":
+                        continue                       # transparent: whatever is behind it
+                    o = ((y0 + ry) * w + (x0 + rx)) * 3
+                    got = data[o:o + 3]
+                    if ch == "#" and got != WHITE:
+                        ok = False
+                        break
+                    if ch == "o" and got != BLACK:
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if ok:
+                return (x0, y0)
+    return None
+
 MODE = os.environ.get("AE_CLIENTS_MODE", "bg")   # "fg" | "bg" | "both" (both = same-boot, interferes)
 
 # ⛔ THE FRAMEBUFFER GATE FOR `desktop` MODE — how many pixels carrying a CLIENT's own colours must
@@ -332,6 +414,24 @@ try:
         MOVE_KEYS = ["f7", "f7", "f7", "f8", "f8", "f9", "f9", "f10", "f10", "f10"]
         for _mk in MOVE_KEYS:
             key_raw(_mk)
+        # ⭐⭐ LETTERS, BECAUSE FUNCTION KEYS CANNOT TEST THE FORWARD. Every key above is a COMPOSITOR
+        # ACTION (TAB cycles focus, F7-F10 move the window) and `input_handle` consumes any non-IA_NONE
+        # action rather than forwarding it — so a phase made only of those reports `forwarded a key: 0`
+        # NO MATTER WHAT the forward does. That is a vacuous gate, and it read as a puka failure on the
+        # 2026-08-08 burn when the forward had simply never been exercised.
+        # ⇒ A letter maps to IA_NONE, so it is the ONLY kind of key that reaches the focused client.
+        #
+        # ⛔⛔ AND TAB ONE MORE TIME FIRST, BECAUSE OF WHERE THE WRAP LANDS. Each client that completes
+        # its handshake calls `comp_focus(comp, comp_count(comp) - 1)`, so after both present focus sits
+        # on the LAST one — index 2 of {seeded, puka, crab}. The single TAB above therefore wraps 2 -> 0,
+        # onto the COMPOSITOR-SEEDED window, which has no client fd by design. ⚠ MEASURED: the letters
+        # reported `focused window has none, usage 11, focus index 0` — the forward was working and the
+        # gate was aimed at the one window that cannot receive. A second TAB moves 0 -> 1 = puka, which
+        # is the client the 2026-08-08 burn was actually about.
+        key_raw("tab")
+        FWD_KEYS = ["h", "i"]
+        for _fk in FWD_KEYS:
+            key_raw(_fk)
         time.sleep(3.0)
         mv = ser()[mv_mark:]
 
@@ -339,11 +439,28 @@ try:
         usage_n   = mv.count("aethersafha: key usage seen:")
         fwd_n     = mv.count("aethersafha: forwarded a key to the focused client")
         tabbed_n  = mv.count("aethersafha: focus cycled by TAB")
-        p(f"  keys injected                    : tab + {len(MOVE_KEYS)} function keys")
+        nofwd_n   = mv.count("aethersafha: a key reached NO client")
+        p(f"  keys injected                    : tab + {len(MOVE_KEYS)} function keys + {len(FWD_KEYS)} letters")
         p(f"  'F7-F10 moved the focused window': {moved_n}")
         p(f"  'focus cycled by TAB'            : {tabbed_n}")
         p(f"  'key usage seen:' traces         : {usage_n}")
         p(f"  'forwarded a key to the client'  : {fwd_n}")
+        p(f"  'a key reached NO client'        : {nofwd_n}")
+        # ⭐ THE FORWARD GATE. A letter reaching the compositor and NOT reaching a client means the
+        # focused window has no client fd — which is exactly the placed-client handshake failing, the
+        # 2026-08-08 defect. ⚠ Reported, not fatal: TAB order decides which window is focused, and the
+        # compositor-seeded window legitimately has no client, so this is attribution and not a verdict.
+        if fwd_n > 0:
+            p("  ⭐ A LETTER REACHED A CLIENT: the focused window has a live setu fd, so the")
+            p("     placed-client handshake completed and S->C input works.")
+        else:
+            if nofwd_n > 0:
+                p("  ⛔ A LETTER REACHED NO CLIENT — the focused window has cfd 0. If 'presented' above")
+                p("     is less than 2 this is the handshake failing; if it is 2, focus was on the")
+                p("     compositor-seeded window and TAB simply had not reached a client yet.")
+            else:
+                p("  ⚠ NEITHER MARKER FIRED — the letters did not reach the compositor at all, so this")
+                p("     says nothing about the forward. Check the 'key usage seen:' traces first.")
 
         # ⭐ THE ATTRIBUTION. ⛔ READ THE SCOPE LINE FIRST: everything below is a statement about
         # THE BINARY THIS RUN BOOTED, not about any binary that was ever flashed. Those are the same
@@ -469,6 +586,32 @@ try:
             p("     both of those BUT no motion  -> #98 or the bhumi decode, NOT the kernel HID path")
         p(f"  kernel-side markers: mouse configured={('hid: mouse configured' in ser())} "
           f"first report={('hid: first mouse report accumulated' in ser())}")
+
+        # ⭐⭐ THE CURSOR ORACLE — IS THERE AN ARROW ON THE PANEL, PIXEL FOR PIXEL?
+        #
+        # ⛔ EVERY EARLIER CURSOR CHECK WAS A SERIAL LINE, AND A SERIAL LINE IS THE COMPOSITOR'S OPINION.
+        # "pointer motion received -- the cursor is live" printed on the 1.56.42 burn while the cursor was
+        # INVISIBLE: the glyph had been refused and the text path retired, so the log described an intent
+        # and the panel showed nothing. The only honest question is what is in the framebuffer.
+        #
+        # ⭐ The two-tone design makes that answerable exactly. The arrow is pure white (255,255,255) fill
+        # inside pure black (0,0,0) outline, and no chrome in this theme uses either — so the FULL 10x20
+        # pattern can be matched literally, at whatever position the pointer ended up. Position-independent
+        # on purpose: the cursor's location after a sequence of relative mouse deltas is not something this
+        # harness should have to predict.
+        # ⚠ A SHAPE match, not a pixel count: a count would accept the same pixels rearranged, which is the
+        # exact blindness that passed a broken terminal layout earlier in this arc.
+        SHOT_CUR = os.path.join(WORK, "cursor.ppm")
+        s.sendall((f"screendump {SHOT_CUR}\n").encode()); time.sleep(3.0); drain()
+        found_at = cursor_arrow_find(SHOT_CUR)
+        if found_at is not None:
+            p(f"  ⭐⭐ AN ARROW IS ON THE PANEL at {found_at} -- matched all 200 pixels of the 10x20 shape")
+            p("     (white fill inside black outline, exactly as src/cursor.cyr derives it)")
+        else:
+            p("  ⛔ NO ARROW FOUND IN THE FRAMEBUFFER. This is the check a serial line cannot fake.")
+            p("     If 'motion reached the compositor' is True the pointer works and the DRAWING does not:")
+            p("     on this path the cursor is CPU-drawn (QEMU has no amdgpu), so suspect render_cursor_cpu")
+            p("     or a damage rect that never repainted -- NOT #92, which does not run here.")
 
         # ⛔⛔ THE F4 CLOSE PHASE. The 2026-08-08 GPU burn reported "closing application with f4 appears
         # to have issues with flashing / not disappearing or closing properly" — TWO defects wearing one

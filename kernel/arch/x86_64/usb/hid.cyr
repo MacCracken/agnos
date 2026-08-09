@@ -64,6 +64,13 @@ var hid_first_report = 0;   # one-shot: has the registry dispatched a keyboard r
 var hid_ep_slot[8];    # xHCI slot id
 var hid_ep_dci[8];     # Device Context Index of the interrupt-IN endpoint
 var hid_ep_kind[8];    # HidKind
+# ⛔⛔ BUTTONS ARE PER-ENDPOINT, AND ON THIS HARDWARE THAT IS NOT A REFINEMENT. `hid_mouse_btn` was a
+# single global assigned `btn` by whichever interface reported LAST, and archaemenid binds TWO boot-mouse
+# interfaces — the real mouse, and the Keychron's phantom mouse on its interface 1. One idle (all-zero)
+# report from the keyboard therefore clears a button the user is physically HOLDING: a titlebar drag drops
+# mid-gesture and ring 3 sees a release that never happened. ⇒ Keep each endpoint's own bitmap and OR them,
+# so a device can only ever clear ITS OWN buttons.
+var hid_ep_btn[8];     # last button bitmap reported by THIS endpoint
 # ⭐ PER-ENDPOINT RING STATE. The keyboard keeps its `hid_kbd_*` globals (its re-arm path still reads
 # them), but a second device cannot: archaemenid's Keychron puts a mouse endpoint in the SAME SLOT as the
 # keyboard, so ring/buffer/cycle state has to be per ROW, not per device and certainly not per slot.
@@ -178,13 +185,27 @@ fn hid_s8(b) {
 
 # Fold one boot-mouse report into the accumulator. Report layout (USB HID boot protocol):
 #   [0] buttons bitmap   [1] dX (s8)   [2] dY (s8, POSITIVE IS DOWN)   [3] wheel (s8, optional)
-fn hid_process_mouse_report(report_phys) {
+fn hid_process_mouse_report(report_phys, bi) {
     if (report_phys == 0) { return 0; }
     var btn = load8(report_phys + 0) & 0xFF;
     hid_mouse_dx = hid_mouse_dx + hid_s8(load8(report_phys + 1));
     hid_mouse_dy = hid_mouse_dy + hid_s8(load8(report_phys + 2));
-    hid_mouse_btn = btn;
-    hid_mouse_btn_seen = hid_mouse_btn_seen | btn;
+    # ⛔ RECORD THIS ENDPOINT'S BITMAP, THEN UNION — never assign the global from one device. See the
+    # `hid_ep_btn` banner: with two bound boot-mouse interfaces, last-writer-wins lets the keyboard's
+    # phantom mouse release a button the real mouse is holding.
+    if (bi >= 0) {
+        if (bi < HID_MAX_EP) { store64(&hid_ep_btn + bi * 8, btn); }
+    }
+    var uni = 0;
+    var bx = 0;
+    while (bx < hid_ep_count) {
+        if (load64(&hid_ep_kind + bx * 8) == HidKind.HID_KIND_MOUSE) {
+            uni = uni | load64(&hid_ep_btn + bx * 8);
+        }
+        bx = bx + 1;
+    }
+    hid_mouse_btn = uni;
+    hid_mouse_btn_seen = hid_mouse_btn_seen | uni;
     hid_mouse_seq = hid_mouse_seq + 1;
     if (hid_mouse_first == 0) {
         hid_mouse_first = 1;
@@ -737,12 +758,53 @@ fn hid_kbd_kick() {
 # transfers, and shouldn't be running concurrently with hid_poll under
 # the current cooperative-poll regime. If that invariant ever changes
 # (interrupt-driven xHCI), this loop needs to become event-type-aware.
+# ⭐⭐ THE DRAIN'S OWN TRY-LOCK — because `cli` is not a lock on four CPUs.
+#
+# ⛔⛔ `hid_poll` has TWO callers that can run at once: the `#98 ptrscan` / `#42 kbscan` syscall arms in
+# ring 3, and `xhci_rx_handler` in the MSI-X ISR. It dequeues the shared xHCI event ring and folds into a
+# shared accumulator, with no serialisation of any kind — and `keyboard.cyr`'s claim that this path is
+# "self-guarded (input_lock, cli-first)" is FALSE: `input_lock` is taken only by `hid_kb_push` and
+# `kb_read_scancode`, and guards `kb_buf` alone. On SMP, `cli` on one CPU does not exclude the MSI-X
+# handler on another, so two drains can advance `xhci_evt_ring_idx` over the same event or interleave a
+# read-modify-write on `hid_mouse_dx`.
+#
+# ⭐ A TRY-LOCK, NOT A SPIN, AND THAT CHOICE IS THE WHOLE SAFETY ARGUMENT. A spin would DEADLOCK the moment
+# the ISR interrupted a lock-holder on the same CPU — which is exactly the common case, since the syscall
+# arm enables interrupts around its drain. Failing to acquire simply means another context is already
+# draining this ring; it will consume the events, so returning is correct rather than lossy.
+# ⚠ Frame layout is load-bearing: this mirrors `input_spin_lock` in keyboard.cyr byte for byte, including
+# the DECLARATION ORDER of `old` then `addr` — the hand-assembled `xchg` addresses them as [rbp-0x08] and
+# [rbp-0x10]. Reordering these two lines silently breaks the lock.
+var hid_poll_lock = 0;
+fn hid_poll_trylock(): i64 {
+    var old = 1;
+    var addr = &hid_poll_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF0;                    # mov rax, [rbp-0x10] (addr)
+        0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;  # mov rcx, 1
+        0x48; 0x87; 0x08;                          # xchg [rax], rcx
+        0x48; 0x89; 0x4D; 0xF8;                    # mov [rbp-0x08], rcx (old)
+    }
+    if (old == 0) { return 1; }                    # we took it
+    return 0;                                      # someone else is draining
+}
+fn hid_poll_unlock() {
+    var addr = &hid_poll_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;                    # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;                          # xor rcx, rcx
+        0x48; 0x87; 0x08;                          # xchg [rax], rcx
+    }
+    return 0;
+}
+
 fn hid_poll() {
     # ⛔ THIS USED TO READ `hid_kbd_slot_id == 0`, i.e. "no KEYBOARD, do nothing" — which on a box with a
     # mouse and no keyboard means nothing is drained AND `IMAN.IP` below is never cleared, so the
     # controller sends no further MSI-X and every device goes quiet. The guard's real job is to prove
     # xHCI init ran before `xhci_rt_base` is touched, and a non-empty registry proves that just as well.
     if (hid_ep_count == 0) { return 0; }
+    if (hid_poll_trylock() == 0) { return 0; }     # another context owns the ring; it will drain it
     # Re-arm interrupter 0 FIRST (before draining): write-1-clear IMAN.IP (bit 0), keep IE (bit 1)
     # by writing 0x3 — the same value init used. Per xHCI 1.2 §5.5.2.1 an MSI-X message is generated
     # on the IP 0->1 edge; if software leaves IP set the controller sends NO further MSI-X, so the
@@ -774,6 +836,21 @@ fn hid_poll() {
             # by a second poller: this loop would already have eaten its completions.
             # ⚠ The doorbell target is `evt_ep`, which IS the matched row's DCI — the event told us.
             var bi = hid_ep_find(evt_slot, evt_ep);
+            # ⛔⛔ DID THE TRANSFER ACTUALLY SUCCEED? A Transaction Error, Babble, Stall or Data Buffer
+            # Error still posts a Transfer Event with IOC set — the TRB completed, it just did not carry
+            # data — and leaves the shared report page holding the PREVIOUS successful report. Folding
+            # that page again re-adds the last dX/dY as if the user had moved: a phantom cursor jump on
+            # every USB hiccup, of exactly the size of the last real motion. `xhci.cyr` checks this code
+            # on the command ring (`ccode` at its line 847); the HID drain never did.
+            # ⚠ Completion code is dword 2, bits 31..24. 1 = SUCCESS, 13 = SHORT_PACKET — a short packet
+            # is NORMAL for an interrupt-IN endpoint that sent fewer than the max-packet bytes, so it must
+            # be accepted or the boot mouse's 4-byte reports on an 8-byte endpoint would all be dropped.
+            var evt_dw2 = load32(evt + 8);
+            var ccode = (evt_dw2 >> 24) & 0xFF;
+            var cc_ok = 0;
+            if (ccode == 1) { cc_ok = 1; }
+            if (ccode == 13) { cc_ok = 1; }
+            if (cc_ok == 0) { bi = 0 - 1; }        # not a usable report: re-arm below, fold nothing
             if (hid_ep_kind_at(bi) == HidKind.HID_KIND_KBD) {
                 # ⭐ NAME THE PATH THAT DELIVERED THE FIRST KEY, once. Without this the drain is silent,
                 # and silence is why a mutation test of this very dispatch read GREEN while the keyboard
@@ -794,7 +871,7 @@ fn hid_poll() {
             # ⭐ THE MOUSE ARM. Every event is FOLDED, never latched — see the accumulator's header for
             # why keeping only the last report of a coalescing gap amplifies relative motion ~2-3x.
             if (hid_ep_kind_at(bi) == HidKind.HID_KIND_MOUSE) {
-                hid_process_mouse_report(load64(&hid_ep_buf + bi * 8));
+                hid_process_mouse_report(load64(&hid_ep_buf + bi * 8), bi);
                 processed = processed + 1;
                 hid_arm_row_trb(bi);
                 var mdb = xhci_mmio_base + xhci_db_off + evt_slot * 4;
@@ -817,5 +894,9 @@ fn hid_poll() {
         var new_erdp = xhci_evt_ring_phys + xhci_evt_ring_idx * 16;
         xhci_rt_write64(ir0 + XHCI_IR_ERDP, new_erdp | 0x8);
     }
+    # ⚠ THE ONLY EXIT PAST THE TRY-LOCK. Verified by inspection: between the acquire and here every branch
+    # falls through rather than returning, so one release covers the function. Any `return` added inside
+    # this body MUST release first, or the drain wedges for the rest of the boot and input dies silently.
+    hid_poll_unlock();
     return processed;
 }

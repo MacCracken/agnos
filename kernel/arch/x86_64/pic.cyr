@@ -243,7 +243,13 @@ fn nic_rx_isr_build() {
 # RX-IRQ fix (1.51.5): the same body the 100 Hz timer tick runs (hid_poll — drain the
 # xHCI event ring, diff the HID report, push scancodes to kb_buf, re-arm the TRB), but
 # triggered by the controller on report DMA so a blocked hlt wakes immediately instead of
-# on the next ~10 ms tick. hid_poll is RX-only, self-guarded (input_lock, cli-first), issues
+# on the next ~10 ms tick. hid_poll is RX-only, self-guarded (hid_poll_lock atomic try-lock), issues
+# ⚠ THAT USED TO SAY "input_lock, cli-first" AND IT WAS FALSE. `input_lock` is taken only by
+# `hid_kb_push` and `kb_read_scancode`, and guards `kb_buf` alone — it never covered the event-ring
+# dequeue or the mouse accumulator that `hid_poll` also touches, and `cli` on one CPU does not exclude
+# this handler running on another. hid_poll now owns a real `xchg` try-lock; the claim is true as of
+# 1.56.42. A comment asserting a lock that does not exist is worse than no comment at all, because the
+# next reader stops looking. [[feedback_audit_re_derive_dont_validate_comments]]
 # no TX and NEVER schedules — safe in interrupt context (keyboard.cyr:47-50 anticipates this).
 # MUST only be ARMED after enumeration (the MSI-X vector stays masked until post
 # hid_kbd_configure) so this hid_poll can't steal EP0 Transfer Events from the synchronous
