@@ -220,7 +220,7 @@ fn hid_mouse_configure(slot_id) {
         var mps_buf[2];
         var interval_byte = 0;
         if (xhci_find_hid_boot_endpoint(total_len, 0x02, skip,
-            &intf_num, &ep_addr, &mps_buf, &interval_byte) == 0) {
+        &intf_num, &ep_addr, &mps_buf, &interval_byte) == 0) {
             return bound;                 # no further boot-mouse interface on this device
         }
         var mps = load16(&mps_buf);
