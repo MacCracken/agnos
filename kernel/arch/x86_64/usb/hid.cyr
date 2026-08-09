@@ -193,6 +193,46 @@ fn hid_process_mouse_report(report_phys) {
     return 0;
 }
 
+# hid_mouse_take(out): drain the accumulator into a 16-byte record and reset it.
+# Returns 1 if there was anything to report, 0 if the pointer has been idle since the last drain.
+#
+# Record layout (little-endian, 16 bytes) — see `#98 ptrscan` in core/syscall.cyr:
+#   +0  s32 dx            summed since the last drain (positive = right)
+#   +4  s32 dy            summed since the last drain (POSITIVE = DOWN, as HID reports it)
+#   +8  u32 buttons       the CURRENT bitmap (bit0 left, bit1 right, bit2 middle)
+#   +12 u32 buttons_seen  OR of every bitmap seen since the last drain
+#
+# ⭐ WHY BOTH BUTTON FIELDS. `buttons` alone loses a click that begins and ends inside one drain
+# interval — press and release both land, the last report reads 0, and the consumer never sees it.
+# `buttons_seen` is what makes a fast click survive a slow frame. A consumer wanting edges compares
+# the two: a bit set in `seen` but clear in `buttons` is a click that already completed.
+#
+# ⚠ CALLER MUST HOLD IF=0. `hid_poll` also runs from the xHCI MSI-X ISR, so the accumulator has an
+# interrupt-context writer; a read-modify-write here with interrupts enabled can lose a whole report.
+fn hid_mouse_take(out) {
+    if (out == 0) { return 0; }
+    var idle = 0;
+    if (hid_mouse_dx == 0) {
+        if (hid_mouse_dy == 0) {
+            if (hid_mouse_btn == 0) {
+                if (hid_mouse_btn_seen == 0) { idle = 1; }
+            }
+        }
+    }
+    if (idle == 1) { return 0; }
+    store32(out + 0,  hid_mouse_dx);
+    store32(out + 4,  hid_mouse_dy);
+    store32(out + 8,  hid_mouse_btn);
+    store32(out + 12, hid_mouse_btn_seen);
+    # ⚠ RESET THE DELTAS, KEEP THE CURRENT BUTTON STATE. dx/dy are consumed — reporting them twice is
+    # exactly the double-apply this whole path exists to avoid. `hid_mouse_btn` is LEVEL, not an edge,
+    # so it persists until the device says otherwise; only the OR-accumulator is cleared.
+    hid_mouse_dx = 0;
+    hid_mouse_dy = 0;
+    hid_mouse_btn_seen = hid_mouse_btn;
+    return 1;
+}
+
 # hid_mouse_configure(slot_id): bind EVERY HID-boot-mouse interface this device exposes.
 #
 # ⛔ "FIND THE FIRST PROTOCOL-0x02 INTERFACE" IS THE TRAP THIS AVOIDS. On archaemenid the Keychron K2

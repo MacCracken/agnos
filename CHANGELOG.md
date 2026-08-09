@@ -22,6 +22,33 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.42] — 2026-08-08 — cycle OPEN: ⛔ PS/2 IS DELETED, and the xHCI HID drain becomes a dispatcher
 
+### Added — `#98 ptrscan`: ring 3 can read the pointer (`AE-7` P3, kernel half)
+
+`ptrscan(buf, max)` → **16** on activity, **0** idle, **−1** on a bad range or `max < 16`. Record:
+`+0` s32 dx · `+4` s32 dy (**positive = DOWN**) · `+8` u32 buttons (current level) · `+12` u32
+buttons_seen (OR since the last drain).
+
+⭐ **One merged sample, not a byte stream** — that is the design, not an optimisation. `kbscan #42` hands
+back raw scancodes because keys are discrete events; pointer motion is a **relative delta**, so the
+useful unit is the sum since you last asked. The kernel folds every report and this returns the fold.
+Streaming raw reports would have pushed the coalescing hazard into ring 3, where keeping only the last
+report of a gap **amplifies** motion ~2-3x. ⚠ `buttons_seen` is what lets a click that starts *and
+finishes* inside one frame survive.
+
+⚠ **The take runs inside the IF=0 window**, deliberately: `hid_poll` also runs from the xHCI MSI-X ISR,
+so read-and-clear of the accumulator with interrupts enabled can lose a whole report.
+⚠ **No 256-iteration spin**, unlike `#42` as it was written — that spin existed to catch a PS/2 IRQ1,
+which no longer exists, and `hid_poll` already loops to 64 events internally.
+
+⛔ **It must not share `kbscan #42`'s ring**: `dX = 0x01` decodes through the Set-1 table to HID `0x29`
+= **Escape**, so a one-pixel move on that pipe would quit the compositor — and that pipe also feeds
+cyrius-doom's `input_poll`.
+
+⚠ **Scope: the ring-3 dispatch is UNPROVEN.** The arm is written, the ABI gate agrees three ways
+(kernel ↔ `agnos-userland-abi.md` ↔ cyrius 6.5.13's `SYS_PTRSCAN`), and bhumi's decode is unit-tested —
+but nothing in ring 3 calls it yet, so "a user program can read pointer motion" is **not** demonstrated.
+`AE-7` P4's cursor is the first consumer and proves it. Do not record P3 as proven before then.
+
 ### Added — the USB mouse is bound and its reports accumulate (`AE-7` P2, kernel half)
 
 ⭐ `hid_mouse_enumerate()` probes **every** addressed slot with no early exit and binds **every**

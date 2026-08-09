@@ -33,7 +33,7 @@
 #
 # PASS is not "the desktop worked" — it is "the two launch paths were compared and the result is
 # unambiguous". Read the printed verdict.
-import os, socket, struct, subprocess, sys, time, zlib
+import os, re, socket, struct, subprocess, sys, time, zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 GNOBOOT = os.environ.get("GNOBOOT_ROOT", os.path.join(ROOT, "../gnoboot")) + "/build/BOOTX64.EFI"
@@ -138,6 +138,7 @@ qemu = subprocess.Popen([
     "-drive", f"file={IMG},format=raw,if=none,id=disk0",
     "-device", "nvme,drive=disk0,serial=AGNOS-AEC",
     "-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0",
+    "-device", "usb-mouse,bus=xhci.0",   # ⭐ AE-7: the pointer under test
     # ⛔ THE NIC IS LOAD-BEARING FOR A LOOPBACK TEST, which is not obvious and cost a cycle.
     # agnos picks the SOURCE address for an outbound SYN from `net_ip`. With no NIC there is no
     # DHCP, `net_ip` stays 0, and the peer's SYN-ACK goes to dst=0 — which fails `net_is_loopback`
@@ -263,6 +264,13 @@ try:
         # launches the foreground via spawn_path + a non-blocking waitpid poll, so this is the
         # invocation a human actually types.
         p("desktop `aethersafha` (FOREGROUND, no &) — capture WHILE it runs...")
+        # ⚠ PRIME FIRST. In QEMU the FIRST character of the FIRST typed line is dropped, so `aethersafha`
+        # arrived as `ethersafha`, agnsh handed it to the intent parser, and the desktop never launched —
+        # after which every later phase measured a boot with no compositor. Not the kbscan spin (the old
+        # 256-iteration drain does not fix it): q35's i8042 used to deliver keys in parallel and covered
+        # it, so deleting PS/2 made a pre-existing race visible. Iron has no PS/2 producer and has shown
+        # no key loss (AE-T2: 19/19), so this is believed emulation-only.
+        typ("\n", settle=0.5)
         typ("aethersafha\n", settle=1.0)
         for _w in range(24):
             if "setu client presented surface" in ser(): break
@@ -400,6 +408,67 @@ try:
                 p(f"  (png conversion of {_nm} failed: {_e})")
         p(f"  shots: {SHOT_BEFORE} -> {SHOT_AFTER}")
         p(f"  LOOK AT THESE: {os.path.join(WORK, 'move-before.png')} and move-after.png")
+
+        # ⭐⭐ THE POINTER PHASE (`AE-7`) — and this is also the FIRST ring-3 caller of `ptrscan #98`, so
+        # it is what proves that syscall at all. Until something called it, "a user program can read
+        # pointer motion" was written and unproven.
+        # ⚠ QEMU's `mouse_move` drives the usb-mouse attached to the same qemu-xhci as the keyboard, so
+        # the whole chain is exercised: HID report -> event ring -> the ONE drain -> registry dispatch ->
+        # kernel accumulator -> #98 -> bhumi decode -> kind-tagged event -> the compositor's cursor.
+        p("")
+        p("=== POINTER (ptrscan #98 -> bhumi -> cursor) ===")
+        pt_mark = len(ser())
+        # ⚠ SELECT THE USB MOUSE FIRST. q35 also exposes a PS/2 mouse, and HMP `mouse_move` drives
+        # whichever pointer QEMU has made current — which is NOT necessarily the usb-mouse on xhci.0 that
+        # agnos actually binds. Symptom when this is wrong: button events arrive and motion does not, i.e.
+        # the chain looks half-broken when it is entirely fine and the harness is simply talking to the
+        # wrong device. `info mice` marks the current one with a '*'.
+        try:
+            s.sendall(b"info mice\n"); time.sleep(0.4)
+            mice = s.recv(65536).decode("latin1", "replace")
+            p("  QEMU mice:")
+            for _ln in mice.splitlines():
+                if "mouse" in _ln.lower() or "index" in _ln.lower(): p("    " + _ln.strip())
+            _usb = None
+            for _ln in mice.splitlines():
+                if "HID Mouse" in _ln or "USB Mouse" in _ln:   # QEMU names it "QEMU HID Mouse"
+                    _m = re.search(r"index[=:]\s*(\d+)", _ln)
+                    if _m: _usb = _m.group(1)
+            if _usb is not None:
+                s.sendall(("mouse_set " + _usb + "\n").encode()); time.sleep(0.3); drain()
+                p(f"  selected the USB mouse (index {_usb})")
+            else:
+                p("  ⚠ no USB mouse row parsed; if it is already marked * this is cosmetic")
+        except OSError:
+            pass
+        for _i in range(10):
+            s.sendall(b"mouse_move 12 7\n"); time.sleep(0.12); drain()
+        s.sendall(b"mouse_button 1\n"); time.sleep(0.2); drain()
+        s.sendall(b"mouse_button 0\n"); time.sleep(0.6); drain()
+        time.sleep(2.0)
+        pt = ser()[pt_mark:]
+        moved = "aethersafha: pointer motion received -- the cursor is live" in pt
+        clicked = "aethersafha: pointer button click routed" in pt
+        # ⛔ PRECONDITION FIRST. The move phase already guards this way and the pointer phase did not —
+        # so when the desktop failed to launch, this printed a confident "no pointer motion" diagnosis
+        # about a boot that had no compositor in it at all. A verdict whose precondition is unchecked is
+        # not a verdict.
+        desktop_up = "aethersafha: bhumi backend up" in ser()
+        if desktop_up == False:
+            p("  ⛔ THE DESKTOP NEVER STARTED — this phase tests NOTHING about the pointer.")
+            p("     Fix that first; do not read the lines below as evidence about #98 or bhumi.")
+        p(f"  motion reached the compositor : {moved}")
+        p(f"  a click was routed            : {clicked}")
+        if moved:
+            p("  ⭐ THE POINTER CHAIN IS LIVE END TO END, and this is the first ring-3 use of #98.")
+        else:
+            p("  ⛔ NO POINTER MOTION AT THE COMPOSITOR. Read the layers in order before guessing:")
+            p("     'hid: mouse configured'      -> the endpoint bound at all")
+            p("     'hid: first mouse report'    -> the kernel accumulator saw a report")
+            p("     neither of those + no motion -> the mouse never bound; a QEMU -device usb-mouse issue")
+            p("     both of those BUT no motion  -> #98 or the bhumi decode, NOT the kernel HID path")
+        p(f"  kernel-side markers: mouse configured={('hid: mouse configured' in ser())} "
+          f"first report={('hid: first mouse report accumulated' in ser())}")
 
         # ⛔⛔ THE F4 CLOSE PHASE. The 2026-08-08 GPU burn reported "closing application with f4 appears
         # to have issues with flashing / not disappearing or closing properly" — TWO defects wearing one

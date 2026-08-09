@@ -67,6 +67,13 @@ try:
             time.sleep(0.10); drain()
         time.sleep(1.4)
 
+    # ⚠ PRIME THE INPUT PATH. In QEMU the FIRST character of the FIRST typed line is dropped — `help`
+    # arrives as `elp` — and everything after it is intact. It is not the kbscan spin (restoring the old
+    # 256-iteration drain does not fix it) and it is not new work: q35's i8042 used to deliver keys in
+    # parallel and covered it, so deleting PS/2 (2026-08-08) made a pre-existing race VISIBLE rather than
+    # creating one. ⚠ Iron has never had a PS/2 producer and has shown no key loss (AE-T2 burn: 19/19),
+    # so this is believed emulation-only — believed, not proven. A bare Enter absorbs the loss.
+    typ("\n")
     p("typing: help<Enter>");    typ("help\n")
     p("typing: version<Enter>"); typ("version\n")
     p("typing: mode<Enter>");    typ("mode\n")

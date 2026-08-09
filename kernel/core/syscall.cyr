@@ -7173,6 +7173,11 @@ fn blk_close_sys(h) {
     return 0;
 }
 
+
+# `ptrscan #98` reachability latches — see the arm for why.
+var ptrscan_called = 0;
+var ptrscan_gave = 0;
+
 fn ksyscall(num, arg1, arg2, arg3) {
     # Stack-canary backstop: snapshot at entry, re-checked before returning on the
     # syscalls that do the most pointer/buffer work (the 1.41.3 FS group + pipe/
@@ -8772,6 +8777,67 @@ fn ksyscall(num, arg1, arg2, arg3) {
         }
         stack_canary_check(canary);
         return ks_n;
+    }
+    if (num == 98) {
+        # ptrscan(buf=arg1, max=arg2) — NON-BLOCKING drain of ONE MERGED pointer sample.
+        # Returns 16 (bytes written) on motion/button activity, 0 when the pointer has been idle since
+        # the last call, -1 on a bad user range or a buffer smaller than one record.
+        #
+        # Record (16 B, little-endian): +0 s32 dx · +4 s32 dy (POSITIVE = DOWN) · +8 u32 buttons
+        # (current level) · +12 u32 buttons_seen (OR since last drain — this is what makes a click that
+        # starts and finishes inside one frame survive). Layout owned by hid_mouse_take().
+        #
+        # ⭐ ONE MERGED SAMPLE, NOT A BYTE STREAM, and that is the whole design. The keyboard's
+        # `kbscan #42` hands back raw scancodes because keys are discrete events. Pointer motion is a
+        # RELATIVE DELTA, so the useful unit is the sum since you last asked: the kernel folds every
+        # report (hid_process_mouse_report) and this returns the fold. Handing ring 3 a stream of raw
+        # reports would push the same coalescing hazard one layer up.
+        #
+        # ⛔ IT MUST NOT SHARE `kbscan #42`'s RING. A one-pixel-right motion is dX = 0x01, and 0x01 fed
+        # through bhumi's Set-1 decoder is HID 0x29 = ESCAPE = quit. Sharing the scancode pipe would mean
+        # moving the mouse kills the compositor — and that pipe also feeds cyrius-doom's input_poll.
+        #
+        # ⚠ NO 256-ITERATION SPIN, deliberately, unlike #42 as it was written. That spin existed to give
+        # the CPU post-`sti` instructions to take a pending PS/2 **IRQ1**; PS/2 is deleted and `hid_poll`
+        # already loops to 64 events internally. One call drains everything queued, and 256 would be
+        # ~256 posted MMIO writes to IMAN per frame for nothing.
+        if (arg2 < 16) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        preempt_disable();
+        kbd_irq_enable();                # sti — let a pending xHCI MSI-X land
+        hid_poll();                      # fold whatever the controller has queued
+        kbd_irq_disable();               # cli — the take below is a RMW against an ISR-context writer
+        # ⚠ The take runs INSIDE the IF=0 window on purpose: `hid_poll` also runs from the MSI-X ISR, so
+        # reading-and-clearing the accumulator with interrupts enabled can drop a whole report.
+        # ⭐ ONE-SHOT: prove ring 3 actually reached this arm. Without it, "no cursor" cannot distinguish
+        # "nobody called ptrscan" from "ptrscan was called and had nothing to report" — two different
+        # bugs in two different repos. Costs one line per boot.
+        if (ptrscan_called == 0) {
+            ptrscan_called = 1;
+            kprintln("ptrscan: first call from ring 3", 31);
+        }
+        # ⛔⛔ 16, NOT 2. FUNCTION-LOCAL `var X[N]` IS N **BYTES** in Cyrius (module-scope is N*8), and
+        # this was `var pscr[2]` with a comment confidently asserting "2 * 8 = 16 bytes" — the module-scope
+        # rule, applied to a function local. A 16-byte record was written into a 2-byte frame slot, so dx
+        # and dy came back as garbage and the cursor never moved while BUTTONS still worked. The wrong
+        # rule was written down next to the wrong code, which is what made it survive a read.
+        var pscr[16];                    # 16 BYTES — exactly one ptrscan record
+        var got = hid_mouse_take(&pscr);
+        if (got == 1) {
+            if (ptrscan_gave == 0) {
+                ptrscan_gave = 1;
+                kprintln("ptrscan: first sample handed to ring 3", 38);
+            }
+        }
+        preempt_enable();
+        if (got == 0) { stack_canary_check(canary); return 0; }
+        var pi = 0;
+        while (pi < 16) {
+            store8(arg1 + pi, load8(&pscr + pi));
+            pi = pi + 1;
+        }
+        stack_canary_check(canary);
+        return 16;
     }
     if (num == 43) {
         # spawn_path(path=arg1, len=arg2) — NON-BLOCKING from-disk spawn.
