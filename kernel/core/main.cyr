@@ -526,6 +526,13 @@ for (var s = 1; s <= 64; s = s + 1) {
         hid_kbd_configure(s);
     }
 }
+# ⭐ THEN BIND EVERY BOOT-MOUSE INTERFACE, over ALL slots with no early exit. Deliberately a second pass
+# rather than a branch inside the loop above: the keyboard pass is first-wins by design, while a pointer
+# is a SEAT — several devices may contribute motion to one cursor, which is how Linux's usbhid treats it.
+# ⚠ It must run AFTER the keyboard pass so that on a composite device (archaemenid's Keychron exposes a
+# boot mouse on interface 1 alongside its keyboard on interface 0) the slot is already configured and the
+# mouse binder skips SET_CONFIGURATION instead of resetting the keyboard's endpoint out from under it.
+hid_mouse_enumerate();
 
 # 1.53.7 — the keyboard is now enumerated + configured, so ARM the xHCI RX MSI-X vector
 # (0x51) for interrupt-driven input. Deferred to here (post hid_kbd_configure) so the

@@ -23,6 +23,11 @@ qemu = subprocess.Popen([
     "-drive", f"file={IMG},format=raw,if=none,id=disk0",
     "-device", "nvme,drive=disk0,serial=AGNOS-AGNSH",
     "-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0",
+    # ⭐ A REAL BOOT MOUSE on the same xHCI, so the HID binder has a protocol-0x02 interface to find.
+    # ⚠ It is a SEPARATE device here, which is the easy case. QEMU cannot reproduce archaemenid's hard
+    # one — a Keychron K2 exposing a boot keyboard AND a boot mouse in the SAME slot — so the composite
+    # path is iron-only and must not be called proven from a green run here.
+    "-device", "usb-mouse,bus=xhci.0",
     "-serial", f"file:{SER}", "-display", "none", "-no-reboot",
     "-monitor", f"unix:{MON},server,nowait",
 ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -66,6 +71,15 @@ try:
     p("typing: version<Enter>"); typ("version\n")
     p("typing: mode<Enter>");    typ("mode\n")
     time.sleep(0.8)
+    # ⭐ MOVE THE MOUSE, so the boot-mouse endpoint actually reports and the kernel's accumulator has
+    # something to fold. Without this, "hid: mouse configured" would be the whole of the evidence — a
+    # binder can perfectly bind a device that never speaks, which is the same class of green as a marker
+    # that proves only compilation.
+    for _i in range(12):
+        s.sendall(b"mouse_move 8 5\n"); time.sleep(0.12); drain()
+    s.sendall(b"mouse_button 1\n"); time.sleep(0.15); drain()
+    s.sendall(b"mouse_button 0\n"); time.sleep(0.5); drain()
+    time.sleep(1.2)
     new = ser()[mark:]
     p("================ NEW serial output after typing ================")
     p(new if new.strip() else "(((NO new output — keystrokes did not register)))")

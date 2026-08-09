@@ -20,7 +20,50 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
-## [Unreleased] — ⛔ PS/2 IS DELETED, and the xHCI HID drain becomes a dispatcher
+## [1.56.42] — 2026-08-08 — cycle OPEN: ⛔ PS/2 IS DELETED, and the xHCI HID drain becomes a dispatcher
+
+### Added — the USB mouse is bound and its reports accumulate (`AE-7` P2, kernel half)
+
+⭐ `hid_mouse_enumerate()` probes **every** addressed slot with no early exit and binds **every**
+HID-boot-mouse interface it finds — ring, `SET_PROTOCOL=boot`, endpoint added to the input context,
+Configure Endpoint, registry row, 16-deep pre-arm, doorbell.
+
+⛔ **"Find the first protocol-0x02 interface" would have bound the KEYBOARD.** archaemenid's Keychron K2
+advertises a boot mouse (interface 1, EP `0x82`) alongside its keyboard (interface 0, EP `0x81`) — *in
+the same slot*. A first-match search binds that, sees no motion, and presents as "mouse enumerated,
+cursor dead". Binding every such interface and merging motion into one pointer is what Linux's usbhid
+does anyway: all mice are one seat. ⚠ The walker therefore takes `want_proto` **and a `skip` count**, so
+a caller can reach the second matching interface on one device.
+
+⚠ **The composite case needs no separate code path**, which is worth stating because it looks like it
+should: `xhci_input_ctx_add_interrupt_in` sets Add Flags to `A0 | A_thisDCI`, and Configure Endpoint only
+acts on flagged contexts — so adding the mouse EP leaves the keyboard's running EP untouched. What the
+binder *must* do is skip `SET_CONFIGURATION` when the slot already has a bound endpoint; re-issuing it
+would reset the keyboard out from under itself. Hence `hid_ep_slot_bound()`.
+
+⚠ **The registry gained per-ENDPOINT ring state** (`ring`/`buf`/`idx`/`cycle`/`mps`) rather than
+per-device: two endpoints in one slot cannot share a ring cursor.
+
+### Fixed — relative motion no longer AMPLIFIES (D3)
+
+All 16 armed TRBs point at one report buffer, and the keyboard's own comment accepts that "a gap that
+coalesces >1 report keeps only the LAST". ⭐ **True for a keyboard, false for a mouse.** A keyboard report
+is idempotent state; a mouse report is a *relative delta*, so keeping the last and applying it N times is
+lossy **and amplifying** — at 8 ms reports against a 16 ms frame, a systematic ~2-3x motion multiplier
+that would present as "the cursor is too fast" and get tuned with a sensitivity constant instead of
+fixed. The drain now **folds** every event: dX/dY summed with explicit sign-extension (Cyrius has no i8),
+buttons OR'd *and* latched so a click inside one gap is not swallowed, plus a sequence counter so ring 3
+can tell "no motion" from "no poll".
+
+⚠ **Scope: the accumulation is written, not yet observable.** Nothing in ring 3 can read it until
+`#98 ptrscan` lands (P3), so "it accumulates rather than latches" is correct by construction and
+**unproven by measurement**. Do not record it as proven.
+
+⭐ **QEMU-verified end to end** (`-device usb-mouse` on the same `qemu-xhci`): two devices enumerate,
+`hid: mouse configured, boot protocol on, EP=129 interface=0`, `boot-mouse interfaces bound: 1`, injected
+motion produces `hid: first mouse report accumulated`, and the keyboard keeps typing on the same
+controller. Arc sweep **17/17**. ⚠ QEMU attaches the mouse as a SEPARATE device — the composite
+same-slot case is **iron-only** and must not be called proven from a green run here.
 
 ### Removed — every trace of i8042 / PS/2, by operator ruling
 
@@ -77,7 +120,7 @@ builds **no image** — it boots whatever `scripts/smoke/agnsh-smoke.sh` last le
 still printing the OLD boot banner. Correct order is `build.sh` → `agnsh-smoke.sh` → harness, and the
 proof is a unique string in the **serial log**, not in the source or the binary. With that fixed: clean
 build types and prints the marker; the mutant prints neither. Arc sweep **17/17**.
-## [1.56.41] — 2026-08-07 — cycle OPEN
+## [1.56.41] — 2026-08-07 — the desktop's window management on iron (RELEASED)
 
 ⭐ **1.56.40 shipped the whole ipc line — bites 0 through 11 are closed.** The channel band replaced
 TCP-on-loopback, the desktop runs on it, an unmodified program's stdio rides it as a PTY, and pipelines

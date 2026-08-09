@@ -64,18 +64,71 @@ var hid_first_report = 0;   # one-shot: has the registry dispatched a keyboard r
 var hid_ep_slot[8];    # xHCI slot id
 var hid_ep_dci[8];     # Device Context Index of the interrupt-IN endpoint
 var hid_ep_kind[8];    # HidKind
+# ⭐ PER-ENDPOINT RING STATE. The keyboard keeps its `hid_kbd_*` globals (its re-arm path still reads
+# them), but a second device cannot: archaemenid's Keychron puts a mouse endpoint in the SAME SLOT as the
+# keyboard, so ring/buffer/cycle state has to be per ROW, not per device and certainly not per slot.
+var hid_ep_ring[8];    # transfer-ring page phys
+var hid_ep_buf[8];     # report buffer phys (the controller DMAs into this)
+var hid_ep_idx[8];     # next Normal-TRB slot on that ring (0..254; 255 is the Link TRB)
+var hid_ep_cycle[8];   # producer cycle state for that ring
+var hid_ep_mps[8];     # wMaxPacketSize
 
 # hid_ep_register(slot_id, ep_addr, kind) -> row index, or -1 if the table is full.
 # ⚠ Stores the DCI, not the endpoint address: the Transfer Event reports a DCI, so converting once at
 # registration keeps `xhci_dci_for_ep` out of the per-event path.
-fn hid_ep_register(slot_id, ep_addr, kind) {
+fn hid_ep_register(slot_id, ep_addr, kind, ring, buf, mps) {
     if (hid_ep_count >= HID_MAX_EP) { return 0 - 1; }
     var i = hid_ep_count;
-    store64(&hid_ep_slot + i * 8, slot_id);
-    store64(&hid_ep_dci  + i * 8, xhci_dci_for_ep(ep_addr));
-    store64(&hid_ep_kind + i * 8, kind);
+    store64(&hid_ep_slot  + i * 8, slot_id);
+    store64(&hid_ep_dci   + i * 8, xhci_dci_for_ep(ep_addr));
+    store64(&hid_ep_kind  + i * 8, kind);
+    store64(&hid_ep_ring  + i * 8, ring);
+    store64(&hid_ep_buf   + i * 8, buf);
+    store64(&hid_ep_idx   + i * 8, 0);
+    store64(&hid_ep_cycle + i * 8, 1);
+    store64(&hid_ep_mps   + i * 8, mps);
     hid_ep_count = hid_ep_count + 1;
     return i;
+}
+
+# Is any HID endpoint already bound on this slot?
+# ⚠ Decides whether the mouse binder may issue SET_CONFIGURATION: re-issuing it on a slot the keyboard
+# already configured would reset that keyboard's endpoint. A composite device is configured ONCE.
+fn hid_ep_slot_bound(slot_id) {
+    var i = 0;
+    while (i < hid_ep_count) {
+        if (load64(&hid_ep_slot + i * 8) == slot_id) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Arm one Normal TRB on row `i`'s ring, mirroring hid_arm_xfer_trb's contract for the keyboard: IOC so
+# the completion surfaces as a Transfer Event, ISP so a short packet still completes, and a Link TRB
+# wrap at slot 255 with the cycle flipped. ⚠ The 16-deep batch discipline the keyboard needs applies
+# here too — a 1-deep interrupt-IN ring goes empty the moment polling pauses and the EP stalls.
+fn hid_arm_row_trb(i) {
+    var ring = load64(&hid_ep_ring + i * 8);
+    var buf  = load64(&hid_ep_buf  + i * 8);
+    if (ring == 0) { return 0; }
+    if (buf == 0) { return 0; }
+    var idx = load64(&hid_ep_idx + i * 8);
+    var cyc = load64(&hid_ep_cycle + i * 8);
+    var trb = ring + idx * 16;
+    store64(trb + 0, buf);
+    store32(trb + 8, load64(&hid_ep_mps + i * 8) & 0x1FFFF);
+    store32(trb + 12, (1 << 5) | (1 << 2) | (XHCI_TRB_NORMAL << 10) | (cyc & 0x1));
+    idx = idx + 1;
+    if (idx == 255) {
+        # Reached the Link TRB: align its cycle with the producer, flip ours, wrap to 0.
+        var link = ring + 255 * 16;
+        store32(link + 12, (XHCI_TRB_LINK << 10) | 0x2 | (cyc & 0x1));
+        idx = 0;
+        if (cyc == 1) { cyc = 0; } else { cyc = 1; }
+    }
+    store64(&hid_ep_idx + i * 8, idx);
+    store64(&hid_ep_cycle + i * 8, cyc);
+    return 1;
 }
 
 # hid_ep_find(slot_id, dci) -> row index, or -1 when this event is not ours.
@@ -96,6 +149,162 @@ fn hid_ep_kind_at(i) {
     if (i < 0) { return HidKind.HID_KIND_NONE; }
     if (i >= hid_ep_count) { return HidKind.HID_KIND_NONE; }
     return load64(&hid_ep_kind + i * 8);
+}
+
+# === HID-boot MOUSE — the accumulator and the binder ===
+#
+# ⛔⛔ WHY THIS ACCUMULATES INSTEAD OF LATCHING THE LAST REPORT. All 16 armed TRBs on an endpoint point
+# at ONE report buffer, and the drain re-reads that buffer per Transfer Event. The keyboard's own
+# comment calls the consequence acceptable — "a gap that coalesces >1 report keeps only the LAST" — and
+# for a keyboard it IS: a report is idempotent STATE, so the differ sees curr == prev and nothing
+# happens. A mouse report is a **relative delta**. Keeping only the last one and applying it N times is
+# lossy AND amplifying: at 8 ms reports against a 16 ms frame that is a systematic ~2-3x motion
+# multiplier, which would present as "the cursor is too fast" and get tuned with a sensitivity constant
+# instead of fixed. ⇒ Sum dX/dY across every event, OR the buttons, and hand ring 3 one merged sample.
+# ⚠ Buttons OR *and* keep the last state, so a press+release inside one coalescing gap is not swallowed.
+var hid_mouse_dx = 0;        # accumulated since the last drain by ring 3
+var hid_mouse_dy = 0;
+var hid_mouse_btn = 0;       # current button bitmap (bit0 left, bit1 right, bit2 middle)
+var hid_mouse_btn_seen = 0;  # OR of every bitmap seen since the last drain — catches a click in a gap
+var hid_mouse_seq = 0;       # bumps on every accepted report; ring 3 can tell "no motion" from "no poll"
+var hid_mouse_first = 0;     # one-shot marker latch
+
+# Sign-extend one HID byte: the boot-mouse report carries dX/dY as SIGNED int8, and Cyrius has no i8.
+fn hid_s8(b) {
+    var v = b & 0xFF;
+    if (v > 127) { return v - 256; }
+    return v;
+}
+
+# Fold one boot-mouse report into the accumulator. Report layout (USB HID boot protocol):
+#   [0] buttons bitmap   [1] dX (s8)   [2] dY (s8, POSITIVE IS DOWN)   [3] wheel (s8, optional)
+fn hid_process_mouse_report(report_phys) {
+    if (report_phys == 0) { return 0; }
+    var btn = load8(report_phys + 0) & 0xFF;
+    hid_mouse_dx = hid_mouse_dx + hid_s8(load8(report_phys + 1));
+    hid_mouse_dy = hid_mouse_dy + hid_s8(load8(report_phys + 2));
+    hid_mouse_btn = btn;
+    hid_mouse_btn_seen = hid_mouse_btn_seen | btn;
+    hid_mouse_seq = hid_mouse_seq + 1;
+    if (hid_mouse_first == 0) {
+        hid_mouse_first = 1;
+        kprintln("hid: first mouse report accumulated", 35);
+    }
+    return 0;
+}
+
+# hid_mouse_configure(slot_id): bind EVERY HID-boot-mouse interface this device exposes.
+#
+# ⛔ "FIND THE FIRST PROTOCOL-0x02 INTERFACE" IS THE TRAP THIS AVOIDS. On archaemenid the Keychron K2
+# keyboard ALSO advertises a boot mouse (interface 1, EP 0x82) alongside its keyboard (interface 0, EP
+# 0x81). A first-match search over devices can therefore bind the KEYBOARD and see no motion — the
+# failure presents as "mouse enumerated, cursor dead", which costs a burn to diagnose. Binding every
+# such interface and merging their motion into one pointer is also exactly what Linux's usbhid does:
+# all mice are one seat. The Keychron's mouse interface simply stays silent.
+# Returns the number of mouse interfaces bound on this slot.
+fn hid_mouse_configure(slot_id) {
+    if (xhci_desc_buf_phys == 0) { return 0; }
+    var bound = 0;
+    var skip = 0;
+    while (skip < 4) {
+        xhci_zero_page(xhci_desc_buf_phys);
+        if (xhci_get_config_descriptor(slot_id, 0, 9) == 0) { return bound; }
+        var total_len = load16(xhci_desc_buf_phys + 2);
+        if (total_len < 18) { return bound; }
+        if (total_len > 4096) { total_len = 4096; }
+        xhci_zero_page(xhci_desc_buf_phys);
+        if (xhci_get_config_descriptor(slot_id, 0, total_len) == 0) { return bound; }
+
+        var intf_num = 0;
+        var ep_addr = 0;
+        var mps_buf[2];
+        var interval_byte = 0;
+        if (xhci_find_hid_boot_endpoint(total_len, 0x02, skip,
+            &intf_num, &ep_addr, &mps_buf, &interval_byte) == 0) {
+            return bound;                 # no further boot-mouse interface on this device
+        }
+        var mps = load16(&mps_buf);
+        if (mps == 0) { mps = 8; }
+
+        # ⚠ SET_CONFIGURATION ONLY IF NOTHING IS BOUND ON THIS SLOT YET. Re-issuing it on a composite
+        # device whose keyboard is already configured would reset that keyboard's endpoint.
+        if (hid_ep_slot_bound(slot_id) == 0) {
+            var config_value = load8(xhci_desc_buf_phys + 5);
+            if (xhci_control_no_data(slot_id, 0x00, 0x09, config_value, 0) == 0) {
+                kprintln("hid: mouse SET_CONFIGURATION failed", 35);
+                return bound;
+            }
+        }
+        if (hid_set_protocol_boot(slot_id, intf_num) == 0) {
+            kprintln("hid: mouse SET_PROTOCOL=boot failed", 35);
+            return bound;
+        }
+
+        var xfer_ring = pmm_alloc();
+        if (xfer_ring == 0) { kprintln("hid: mouse xfer ring alloc failed", 33); return bound; }
+        if (vmm_is_mapped(xfer_ring) == 0) { vmm_map(xfer_ring, xfer_ring, 0x83); }
+        iommu_register_dma(xfer_ring);
+        xhci_zero_page(xfer_ring);
+        var report_buf = pmm_alloc();
+        if (report_buf == 0) { kprintln("hid: mouse report buf alloc failed", 34); return bound; }
+        if (vmm_is_mapped(report_buf) == 0) { vmm_map(report_buf, report_buf, 0x83); }
+        iommu_register_dma(report_buf);
+        xhci_zero_page(report_buf);
+        # Link TRB at slot 255, TC set — same wrap discipline as the keyboard ring.
+        var link = xfer_ring + 255 * 16;
+        store64(link, xfer_ring);
+        store32(link + 8, 0);
+        store32(link + 12, (XHCI_TRB_LINK << 10) | 0x2);
+
+        var ictx = xhci_slot_get(xhci_slot_input_ctx, slot_id);
+        if (ictx == 0) { return bound; }
+        var speed = xhci_slot_get(xhci_slot_speed, slot_id);
+        # ⚠ Add Flags become A0 | A_thisDCI, which does NOT disturb an endpoint already running on this
+        # slot: Configure Endpoint only acts on flagged contexts. That is what makes the composite case
+        # work without a separate code path.
+        var dci = xhci_input_ctx_add_interrupt_in(ictx, ep_addr, mps, interval_byte, speed, xfer_ring);
+        if (dci == 0) { return bound; }
+        if (xhci_configure_endpoint(slot_id, ictx) == 0) {
+            kprintln("hid: mouse Configure Endpoint failed", 36);
+            return bound;
+        }
+
+        var row = hid_ep_register(slot_id, ep_addr, HidKind.HID_KIND_MOUSE, xfer_ring, report_buf, mps);
+        if (row < 0) { kprintln("hid: mouse endpoint table full", 30); return bound; }
+        # Arm the ring 16 deep before the first doorbell — see the KBD-RING-DEPTH note on the keyboard
+        # ring: a shallow interrupt-IN ring empties during any polling gap and the EP stalls.
+        var armed = 0;
+        while (armed < 16) { hid_arm_row_trb(row); armed = armed + 1; }
+        var db_addr = xhci_mmio_base + xhci_db_off + slot_id * 4;
+        store32(db_addr, dci & 0xFF);
+
+        kprint("hid: mouse configured, boot protocol on, EP=", 44);
+        kprint_num(ep_addr);
+        kprint(" interface=", 11);
+        kprint_num(intf_num);
+        kprintln("", 0);
+        bound = bound + 1;
+        skip = skip + 1;
+    }
+    return bound;
+}
+
+# Probe every addressed slot for boot-mouse interfaces. Mirrors msc_enumerate's shape — one pass over
+# all slots with NO early exit, because more than one device can carry a mouse interface.
+fn hid_mouse_enumerate() {
+    if (xhci_running == 0) { return 0; }
+    var total = 0;
+    var sl = 1;
+    while (sl <= 64) {
+        if (xhci_slot_get(xhci_slot_input_ctx, sl) != 0) {
+            total = total + hid_mouse_configure(sl);
+        }
+        sl = sl + 1;
+    }
+    kprint("hid: boot-mouse interfaces bound: ", 34);
+    kprint_num(total);
+    kprintln("", 0);
+    return total;
 }
 
 # Initialize HID layer. Called from main.cyr after xhci_init. Does NOT
@@ -267,7 +476,7 @@ fn hid_kbd_configure(slot_id) {
     var mps_buf[2];                 # 16-bit slot
     var interval_byte = 0;
     store16(&mps_buf, 0);
-    if (xhci_find_hid_boot_kbd_endpoint(total_len,
+    if (xhci_find_hid_boot_endpoint(total_len, 0x01, 0,
     &intf_num, &ep_addr, &mps_buf, &interval_byte) == 0) {
         kprintln("hid: no HID-boot-kbd interface in config", 40);
         return 0;
@@ -391,7 +600,7 @@ fn hid_kbd_configure(slot_id) {
     # above stay: they are this device's ring/buffer state and the re-arm path still reads them. The
     # registry answers a different question — "is this Transfer Event mine, and what kind of device is
     # it" — which is the question a second HID device makes ambiguous.
-    hid_ep_register(slot_id, ep_addr, HidKind.HID_KIND_KBD);
+    hid_ep_register(slot_id, ep_addr, HidKind.HID_KIND_KBD, xfer_ring, report_buf, mps);
     var db_addr = xhci_mmio_base + xhci_db_off + slot_id * 4;
     store32(db_addr, dci & 0xFF);
 
@@ -541,6 +750,15 @@ fn hid_poll() {
                 hid_arm_xfer_trb();
                 var db_addr = xhci_mmio_base + xhci_db_off + evt_slot * 4;
                 store32(db_addr, evt_ep & 0xFF);
+            }
+            # ⭐ THE MOUSE ARM. Every event is FOLDED, never latched — see the accumulator's header for
+            # why keeping only the last report of a coalescing gap amplifies relative motion ~2-3x.
+            if (hid_ep_kind_at(bi) == HidKind.HID_KIND_MOUSE) {
+                hid_process_mouse_report(load64(&hid_ep_buf + bi * 8));
+                processed = processed + 1;
+                hid_arm_row_trb(bi);
+                var mdb = xhci_mmio_base + xhci_db_off + evt_slot * 4;
+                store32(mdb, evt_ep & 0xFF);
             }
         }
         # Consume the event regardless of which path matched — non-kbd

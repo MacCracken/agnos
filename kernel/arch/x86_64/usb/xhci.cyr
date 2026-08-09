@@ -1220,11 +1220,19 @@ fn xhci_get_config_descriptor(slot_id, config_idx, length) {
 # We scan TLVs sequentially. State machine: track whether we're currently
 # inside a matched HID-boot-keyboard interface; on first endpoint found
 # while in that state, if it's interrupt-IN, capture and return.
-fn xhci_find_hid_boot_kbd_endpoint(total_length,
+# ⚠ `want_proto` SELECTS THE DEVICE CLASS: 0x01 = boot keyboard, 0x02 = boot mouse. It used to be
+# hardcoded to 0x01 and the function was named `..._kbd_...`; a pointer needs the same walk with one
+# byte changed, and duplicating it would be the second copy of a state machine that already exists.
+# ⚠ `skip` lets a caller find the SECOND (third, …) matching interface on one device. That is not
+# hypothetical: archaemenid's Keychron K2 exposes a boot keyboard on interface 0 AND a boot mouse on
+# interface 1 of the SAME device, so "the first proto-0x02 interface in this config" is not always the
+# only one. Pass 0 for the first match.
+fn xhci_find_hid_boot_endpoint(total_length, want_proto, skip,
 out_intf_addr, out_ep_addr_p, out_mps_p, out_interval_p) {
     var off = 0;
     var in_kbd_intf = 0;
     var cur_intf_num = 0;
+    var seen = 0;
     while (off < total_length) {
         var b_length = load8(xhci_desc_buf_phys + off);
         if (b_length == 0) { return 0; }   # malformed — guard against infinite loop
@@ -1238,14 +1246,20 @@ out_intf_addr, out_ep_addr_p, out_mps_p, out_interval_p) {
             var i_sub   = load8(xhci_desc_buf_phys + off + 6);
             var i_proto = load8(xhci_desc_buf_phys + off + 7);
             cur_intf_num = load8(xhci_desc_buf_phys + off + 2);
+            in_kbd_intf = 0;
             if (i_class == 0x03) {
                 if (i_sub == 0x01) {
-                    if (i_proto == 0x01) {
-                        in_kbd_intf = 1;
-                        store8(out_intf_addr, cur_intf_num);
-                    } else { in_kbd_intf = 0; }
-                } else { in_kbd_intf = 0; }
-            } else { in_kbd_intf = 0; }
+                    if (i_proto == want_proto) {
+                        # ⚠ Matched the class triple — but honour `skip` first, so a caller asking for
+                        # the second boot-mouse interface on a composite device is not handed the first.
+                        if (seen >= skip) {
+                            in_kbd_intf = 1;
+                            store8(out_intf_addr, cur_intf_num);
+                        }
+                        seen = seen + 1;
+                    }
+                }
+            }
         } else {
             if (b_type == 5) {
                 # Endpoint Descriptor (USB 2.0 §9.6.6):
