@@ -562,6 +562,58 @@ try:
             s.sendall(b"mouse_move 12 7\n"); time.sleep(0.12); drain()
         s.sendall(b"mouse_button 1\n"); time.sleep(0.2); drain()
         s.sendall(b"mouse_button 0\n"); time.sleep(0.6); drain()
+
+        # ⭐⭐ DRAG: PRESS, MOVE, RELEASE — THE GESTURE NO ONE REMEMBERS TO PERFORM.
+        #
+        # ⛔ THIS IS AUTOMATED BECAUSE TWO CONSECUTIVE IRON BURNS LEFT IT UNMEASURED. The press-hold-RELEASE
+        # transition is the burn blocker `input_btn_transitions` was written for — before it, the kernel's
+        # re-seeding of `seen` to the held level made the release edge unreachable and a titlebar drag was
+        # entered and never exited. Both burns carried it in their watch steps; both times the operator did
+        # not perform the motion, and nothing noticed. A subject whose only oracle is a remembered human
+        # gesture is a subject that does not get tested.
+        #
+        # ⚠ The RELEASE is the assertion, not the movement. `drag started` proves the press hit a titlebar;
+        # `drag released` proves the transition that could not previously happen. `drag started` WITHOUT
+        # `drag released` is exactly the glued-window failure, so the absence is readable too.
+        # ⭐ AIM DETERMINISTICALLY: SLAM TO THE ORIGIN FIRST, THEN STEP ONTO A KNOWN TITLEBAR.
+        # A relative mouse has no absolute position to aim with and the first attempt at this missed
+        # entirely (it walked up-left from centre by a guessed amount and hit empty desktop). But the
+        # pointer CLAMPS at the screen edges, so driving it far past the top-left corner puts it at a
+        # KNOWN (0,0) whatever it was doing before — an absolute reference built out of relative moves.
+        # From there the first placed client sits at (30, 50) with a 30 px titlebar (aethersafha's cascade:
+        # `pcx = 30 + pstep * (w/6)`, `pcy = 50 + pstep * (h/6)`, and pstep = 0 for the first), so (50, 60)
+        # is inside its titlebar by 20 px in x and 10 px in y.
+        # ⚠ s8 per report: each `mouse_move` delta must stay within [-128, 127] or the HID byte wraps.
+        drag_mark = len(ser())
+        p("")
+        p("=== DRAG (press on a titlebar, move, RELEASE) ===")
+        for _ in range(40):                      # slam past the top-left; the clamp makes this absolute
+            s.sendall(b"mouse_move -100 -60\n"); time.sleep(0.03)
+        time.sleep(0.8); drain()
+        s.sendall(b"mouse_move 50 60\n")        # -> (50, 60): inside the first client's titlebar
+        time.sleep(0.8); drain()
+        s.sendall(b"mouse_button 1\n"); time.sleep(0.4); drain()
+        for _ in range(10):                      # drag while held
+            s.sendall(b"mouse_move 9 5\n"); time.sleep(0.08)
+        time.sleep(0.5); drain()
+        s.sendall(b"mouse_button 0\n"); time.sleep(1.2); drain()
+        dg = ser()[drag_mark:]
+        started  = "aethersafha: drag started" in dg
+        released = "aethersafha: drag released" in dg
+        p(f"  'drag started'  : {started}")
+        p(f"  'drag released' : {released}")
+        if started and released:
+            p("  ⭐⭐ THE RELEASE EDGE FIRES — the window stopped when the button came up. This is the")
+            p("     transition that was UNREACHABLE before input_btn_transitions: the kernel re-seeds")
+            p("     buttons_seen to the held level, so an edge on cur|seen never saw the button rise.")
+        if started and not released:
+            p("  ⛔⛔ DRAG ENTERED AND NEVER EXITED — the burn blocker is back. The window is now glued to")
+            p("     the pointer for the rest of this run. Check input_btn_transitions: RELEASE must test")
+            p("     `cur` ALONE, never `cur | seen`.")
+        if not started:
+            p("  ⚠ The press did not land on a titlebar, so this phase says NOTHING about the release.")
+            p("     Not a failure of the fix — a failure of aim. Adjust the walk above; do not read a")
+            p("     missing 'drag released' as a defect when 'drag started' is also missing.")
         time.sleep(2.0)
         pt = ser()[pt_mark:]
         moved = "aethersafha: pointer motion received -- the cursor is live" in pt
