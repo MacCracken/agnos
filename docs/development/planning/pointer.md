@@ -6,7 +6,7 @@ type: planning
 
 # Pointer input (`AE-7`) — design
 
-**Status** DESIGN, unbuilt. Opened 2026-08-08 after `AE-0a` and the F4 close both came back iron-proven.
+**Status** P0 + P1 DONE (2026-08-08); P2-P4 unbuilt. ⭐ PS/2 deleted from the kernel along the way. Opened 2026-08-08 after `AE-0a` and the F4 close both came back iron-proven.
 **Owner of the compositor half** aethersafha [`planning/desktop.md`](https://github.com/MacCracken/aethersafha/blob/main/docs/development/planning/desktop.md) `AE-7` row — point it here, do not duplicate.
 
 ⭐ **The headline: far less new code than the ladder assumed, and the risk is nearly all in four
@@ -89,7 +89,7 @@ the unit, not device.
 
 These are the actual work. Each is invisible today and each breaks a pointer specifically.
 
-### D1 ⛔⛔ `hid_poll` silently EATS every event it does not match
+### D1 ✅ FIXED 2026-08-08 — `hid_poll` silently ate every event it did not match
 
 `hid.cyr:457-460`. One drain loop, matched against the keyboard's slot+endpoint, and unmatched Transfer
 Events are consumed and dropped. ⇒ **A separate `hid_mouse_poll()` called after `hid_poll()` can never
@@ -99,7 +99,7 @@ shapes the whole kernel design.
 **Fix** one drain loop that dispatches on `(evt_slot, evt_ep)` against a small registry of bound HID
 endpoints. Not two pollers.
 
-### D2 ⛔ `hid_poll` no-ops entirely when no *keyboard* is configured
+### D2 ✅ FIXED 2026-08-08 — `hid_poll` no-op'd entirely when no *keyboard* was configured
 
 `hid.cyr:419` — `if (hid_kbd_slot_id == 0) { return 0; }`. On a mouse-only box nothing is drained **and
 `IMAN.IP` is never re-armed**, so the controller goes quiet. Must widen to "no HID device at all".
@@ -207,7 +207,7 @@ Each bite is independently verifiable, and only two need iron.
 | # | bite | verify |
 |---|---|---|
 | **P0** | ✅ **DONE 2026-08-08** (aethersafha, unreleased). The convention now has ONE definition in `src/window.cyr` — `win_total_h` / `win_body_y` / `win_bottom_y` / `win_prev_total_h` — and `TITLEBAR_H` moved there from render.cyr's button enum, which was the mechanical cause (compositor.cyr is included earlier and could not reach it). All nine consumers routed through the accessors. ⚠ It was worse than D4 described: `render_window`'s theme body fill contradicted its own client blit 50 lines below. `render.tcyr` 160 → **179**; two pre-existing asserts were CHANGED because they encoded the wrong convention and passed. | ✅ unit tests, mutation-verified both halves (7 asserts / 1 assert) |
-| **P1** | **Kernel: one drain, many endpoints.** Fix D1 + D2: a bound-endpoint registry, one dispatching drain loop, `hid_poll` no longer keyboard-gated. **Keyboard behaviour must not change.** | the full agnos smoke battery + arc sweep; keyboard still types in QEMU |
+| **P1** | ✅ **DONE 2026-08-08.** Bound-endpoint registry keyed on `(slot, DCI, kind)`, one dispatching drain, guard widened off `hid_kbd_slot_id`. ⭐ **PS/2 was DELETED in the same bite** (operator ruling) — it had to be: q35's i8042 kept delivering keys in QEMU and masked the xHCI path entirely, so no mutation test of this dispatch could bite. Also: `kbscan #42`'s 256-iteration IRQ1 spin → one `hid_poll()`. | ✅ arc sweep **17/17**; clean build prints `hid: first keyboard report dispatched via the endpoint registry` and types, mutant prints neither. ⚠ Requires `build.sh` → `agnsh-smoke.sh` → harness — the harness builds no image |
 | **P2** | **Kernel: bind every boot-mouse interface**, per-endpoint ring, SET_PROTOCOL boot, Configure Endpoint. Fix D3 by accumulating deltas at drain. Log the bound set. | QEMU with `-device usb-mouse`; the log must name **both** Keychron-mouse and real-mouse bindings on iron |
 | **P3** | **`#98` + the bhumi seam**: ring, syscall, kind-tagged events, capability gate, and an audit of all six consumer call sites. | host unit tests for the encode/decode and the button differ; QEMU end-to-end |
 | **P4** | **Compositor `AE-7`**: cursor glyph with retired-rect damage, click-to-focus via `comp_window_at`, titlebar drag via `input_move`, buttons forwarded to clients over the setu messages that already exist. | QEMU screendumps; then **one** iron burn |

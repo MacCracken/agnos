@@ -34,6 +34,70 @@ var hid_kbd_xfer_cycle  = 1;   # Producer cycle state for kbd ring
 var hid_curr_report[8];
 var hid_prev_report[8];
 
+# ⛔⛔ THE BOUND-ENDPOINT REGISTRY — why `hid_poll` cannot simply grow a second matcher.
+#
+# `hid_poll` drains ONE event ring shared by every device on the controller, and it **consumes every
+# event it looks at**, matched or not (see the drain loop). So a second poller — `hid_mouse_poll()`
+# called after `hid_poll()` — can never work: whichever runs first eats the other's Transfer Events and
+# the second sees an empty ring. There is exactly one drain, and it must dispatch.
+#
+# ⇒ Endpoints register here, and the drain looks up `(slot, DCI)`. Adding a device class is adding a row
+# and a `kind` arm, never a second drain.
+#
+# ⚠ THE UNIT IS AN ENDPOINT, NOT A DEVICE, and that is forced by the hardware in front of us: the
+# Keychron K2 on archaemenid exposes a boot **keyboard** on EP 0x81 *and* a boot **mouse** on EP 0x82
+# **within the same slot**. Keying this table by slot would make those two collide. See
+# `docs/development/planning/pointer.md` §0.
+#
+# ⚠ MODULE-SCOPE `var X[N]` IS N*8 BYTES in Cyrius (function-local is N bytes), so these are 8 u64 slots
+# each and are indexed with `* 8`. Same convention as `hid_curr_report` above.
+enum HidKind {
+    HID_KIND_NONE  = 0;
+    HID_KIND_KBD   = 1;
+    HID_KIND_MOUSE = 2;   # registered in P2; the drain already routes it to a no-op arm
+}
+enum HidReg {
+    HID_MAX_EP = 8;
+}
+var hid_ep_count = 0;
+var hid_first_report = 0;   # one-shot: has the registry dispatched a keyboard report yet?
+var hid_ep_slot[8];    # xHCI slot id
+var hid_ep_dci[8];     # Device Context Index of the interrupt-IN endpoint
+var hid_ep_kind[8];    # HidKind
+
+# hid_ep_register(slot_id, ep_addr, kind) -> row index, or -1 if the table is full.
+# ⚠ Stores the DCI, not the endpoint address: the Transfer Event reports a DCI, so converting once at
+# registration keeps `xhci_dci_for_ep` out of the per-event path.
+fn hid_ep_register(slot_id, ep_addr, kind) {
+    if (hid_ep_count >= HID_MAX_EP) { return 0 - 1; }
+    var i = hid_ep_count;
+    store64(&hid_ep_slot + i * 8, slot_id);
+    store64(&hid_ep_dci  + i * 8, xhci_dci_for_ep(ep_addr));
+    store64(&hid_ep_kind + i * 8, kind);
+    hid_ep_count = hid_ep_count + 1;
+    return i;
+}
+
+# hid_ep_find(slot_id, dci) -> row index, or -1 when this event is not ours.
+# ⚠ A miss is NORMAL and must stay silent: EP0 control-transfer completions land in this same ring and
+# belong to `xhci_wait_transfer_event`.
+fn hid_ep_find(slot_id, dci) {
+    var i = 0;
+    while (i < hid_ep_count) {
+        if (load64(&hid_ep_slot + i * 8) == slot_id) {
+            if (load64(&hid_ep_dci + i * 8) == dci) { return i; }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn hid_ep_kind_at(i) {
+    if (i < 0) { return HidKind.HID_KIND_NONE; }
+    if (i >= hid_ep_count) { return HidKind.HID_KIND_NONE; }
+    return load64(&hid_ep_kind + i * 8);
+}
+
 # Initialize HID layer. Called from main.cyr after xhci_init. Does NOT
 # require a keyboard to be present — keyboard discovery happens later
 # when port enumeration finds a HID-boot-class device (Phase 4).
@@ -45,14 +109,18 @@ fn hid_kbd_init() {
     }
     hid_kbd_slot_id = 0;
     hid_kbd_report_buf = 0;
+    # ⚠ Reset the registry here too, or a re-init would leave stale rows pointing at slots that no
+    # longer exist and the drain would dispatch reports out of a dead device's buffer.
+    hid_ep_count = 0;
     kprintln("hid: keyboard layer initialized", 31);
     return 0;
 }
 
-# Push a single PS/2 set-1 scancode byte into kb_buf, advancing kb_head
-# with 8-bit wrap. Mirrors the byte-write contract that kb_isr_build
-# (kernel/arch/x86_64/keyboard.cyr:3) implements for the PS/2 ISR path —
-# producer changes (HID), consumer (scancode_to_ascii) doesn't.
+# Push a single Set-1 scancode byte into kb_buf, advancing kb_head with 8-bit wrap.
+# ⚠ SET-1 IS THIS PATH'S WIRE FORMAT, NOT A PS/2 LEFTOVER. `hid_translate.cyr` maps HID usages to Set-1
+# so that one consumer (`scancode_to_ascii`) serves the whole system; the encoding outlived the bus that
+# named it. ⭐ Since 2026-08-08 this is the ONLY producer of kb_buf — the i8042 ISR that used to share it
+# is deleted (see the tombstone at the top of arch/x86_64/keyboard.cyr).
 fn hid_kb_push(scancode) {
     # input_lock (keyboard.cyr): serialize the kb_head RMW vs the kb_isr IRQ1 producer
     # (same-CPU, excluded by cli-first) and a foreign-CPU accessor (cross-CPU spinlock).
@@ -319,6 +387,11 @@ fn hid_kbd_configure(slot_id) {
     hid_kbd_ep_interval = interval_byte;
     hid_kbd_xfer_ring   = xfer_ring;
     hid_kbd_report_buf  = report_buf;
+    # ⭐ AND REGISTER THE ENDPOINT, which is what `hid_poll` now matches on. The `hid_kbd_*` globals
+    # above stay: they are this device's ring/buffer state and the re-arm path still reads them. The
+    # registry answers a different question — "is this Transfer Event mine, and what kind of device is
+    # it" — which is the question a second HID device makes ambiguous.
+    hid_ep_register(slot_id, ep_addr, HidKind.HID_KIND_KBD);
     var db_addr = xhci_mmio_base + xhci_db_off + slot_id * 4;
     store32(db_addr, dci & 0xFF);
 
@@ -416,7 +489,11 @@ fn hid_kbd_kick() {
 # the current cooperative-poll regime. If that invariant ever changes
 # (interrupt-driven xHCI), this loop needs to become event-type-aware.
 fn hid_poll() {
-    if (hid_kbd_slot_id == 0) { return 0; }
+    # ⛔ THIS USED TO READ `hid_kbd_slot_id == 0`, i.e. "no KEYBOARD, do nothing" — which on a box with a
+    # mouse and no keyboard means nothing is drained AND `IMAN.IP` below is never cleared, so the
+    # controller sends no further MSI-X and every device goes quiet. The guard's real job is to prove
+    # xHCI init ran before `xhci_rt_base` is touched, and a non-empty registry proves that just as well.
+    if (hid_ep_count == 0) { return 0; }
     # Re-arm interrupter 0 FIRST (before draining): write-1-clear IMAN.IP (bit 0), keep IE (bit 1)
     # by writing 0x3 — the same value init used. Per xHCI 1.2 §5.5.2.1 an MSI-X message is generated
     # on the IP 0->1 edge; if software leaves IP set the controller sends NO further MSI-X, so the
@@ -441,17 +518,29 @@ fn hid_poll() {
         var evt_type = (evt_dw3 >> 10) & 0x3F;
         var evt_slot = (evt_dw3 >> 24) & 0xFF;
         var evt_ep   = (evt_dw3 >> 16) & 0x1F;
-        var our_dci  = xhci_dci_for_ep(hid_kbd_ep_addr);
         if (evt_type == XHCI_TRB_TRANSFER_EVENT) {
-            if (evt_slot == hid_kbd_slot_id) {
-                if (evt_ep == our_dci) {
-                    # Kbd IN report just landed in hid_kbd_report_buf.
-                    hid_process_report(hid_kbd_report_buf);
-                    processed = processed + 1;
-                    hid_arm_xfer_trb();
-                    var db_addr = xhci_mmio_base + xhci_db_off + hid_kbd_slot_id * 4;
-                    store32(db_addr, our_dci & 0xFF);
+            # ⭐ ONE DRAIN, DISPATCHED. This used to compare against `hid_kbd_slot_id` and a freshly
+            # recomputed `xhci_dci_for_ep(hid_kbd_ep_addr)` — a hardcoded single-device match, below a
+            # loop that consumes the event either way. A second HID device therefore could not be served
+            # by a second poller: this loop would already have eaten its completions.
+            # ⚠ The doorbell target is `evt_ep`, which IS the matched row's DCI — the event told us.
+            var bi = hid_ep_find(evt_slot, evt_ep);
+            if (hid_ep_kind_at(bi) == HidKind.HID_KIND_KBD) {
+                # ⭐ NAME THE PATH THAT DELIVERED THE FIRST KEY, once. Without this the drain is silent,
+                # and silence is why a mutation test of this very dispatch read GREEN while the keyboard
+                # kept working — there was no way to tell whether keys came through here or through the
+                # PS/2 ISR that used to shadow it. A line here makes the producer self-identifying on any
+                # boot, QEMU or iron. [[feedback_instrument_discipline]]
+                if (hid_first_report == 0) {
+                    hid_first_report = 1;
+                    kprintln("hid: first keyboard report dispatched via the endpoint registry", 63);
                 }
+                # Kbd IN report just landed in hid_kbd_report_buf.
+                hid_process_report(hid_kbd_report_buf);
+                processed = processed + 1;
+                hid_arm_xfer_trb();
+                var db_addr = xhci_mmio_base + xhci_db_off + evt_slot * 4;
+                store32(db_addr, evt_ep & 0xFF);
             }
         }
         # Consume the event regardless of which path matched — non-kbd

@@ -6,11 +6,12 @@
 # ring 3 (1.41.x shell-separation); the in-kernel shell() is now a recovery
 # REPL. Both read keystrokes via kb_has_key()/kb_read_scancode(). Shell I/O
 # mirrors to the framebuffer via kprint so a serial-less box sees output.
-# Both the recovery REPL and agnsh's read(0) get keystrokes from kb_buf, filled
-# by the IRQ1 handler (kb_isr) — proven on archaemenid. hid_poll() additionally
-# drains the xHCI USB-HID ring (the QEMU path). Either way the reader must run
-# with interrupts enabled for IRQ1 to fire (the in-kernel shell already does;
-# kbd_read_blocking now does too, see core/syscall.cyr).
+# Both the recovery REPL and agnsh's read(0) get keystrokes from kb_buf, filled by `hid_poll()` draining
+# the xHCI USB-HID ring — the only producer on either substrate as of 2026-08-08.
+# ⛔ This comment used to credit "the IRQ1 handler (kb_isr) — proven on archaemenid". It was never proven;
+# that box has no PS/2 port and agnos disarms the firmware's SMM legacy route during xHCI init. The PS/2
+# path is deleted. ⚠ The reader must still run with interrupts enabled — not for IRQ1, but so the xHCI
+# MSI-X (vector 0x51) and the 100 Hz LAPIC tick can land, both of which also drive hid_poll.
 kprintln("Launching kybernet...", 21);
 # CMOS CP 0x15: reached kybernet-launch site (kybernet() runs the shell loop)
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x15; 0xE6; 0x71; }

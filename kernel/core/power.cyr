@@ -183,17 +183,11 @@ fn power_reset() {
         }
     }
 
-    # 2. The 8042 keyboard controller pulse. Very likely dead on this box (USB-only,
-    #    no PS/2 chip), which is exactly why it must never be the only method — but
-    #    it is harmless where absent. Wait for the input buffer to drain first; the
-    #    pulse is ignored if the controller is busy.
-    i = 0;
-    while (i < 10) {
-        st = inb(0x64);
-        if ((st & 0x02) == 0) { outb(0x64, 0xFE); }
-        gpu_udelay(1000);
-        i = i + 1;
-    }
+    # ⛔ RUNG 2 WAS THE 8042 KEYBOARD-CONTROLLER PULSE and is DELETED (2026-08-08, operator ruling: no
+    #    i8042 in agnos in any capacity). It polled status port 0x64 and pulsed command 0xFE. Its own
+    #    comment already conceded it was "very likely dead on this box (USB-only, no PS/2 chip)".
+    # ⚠ The ladder is not weakened: rung 1 (ACPI RESET_REG) is live on archaemenid — the boot log prints
+    #    `acpi: reset register space 1 address b2 value be` — and rung 3 (CF9) remains behind it.
 
     # 3. CF9 two-step, warm only. Gated on PCI mechanism 1 being proven.
     if (pci_count > 0) {

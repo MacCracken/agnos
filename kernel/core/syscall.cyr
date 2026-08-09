@@ -616,7 +616,7 @@ fn fault_kill_current(vector) {
 #
 # kb_has_key() also calls hid_poll() to drain the xHCI USB-HID event ring (how
 # QEMU's usb-kbd delivers — events DMA in regardless of any interrupt). One loop
-# serves both: iron fills kb_buf via IRQ1, QEMU via the polled hid_poll drain. We
+# serves both substrates identically now: kb_buf is filled by hid_poll's xHCI drain. We
 # busy-poll (no hlt) so the QEMU path needs no wake interrupt. Echo uses kputc
 # (serial + GOP framebuffer mirror) — the same fb path write(1) uses from a
 # ring-3 syscall since 1.41.12, so it renders under the unified exec CR3 on iron.
@@ -631,10 +631,10 @@ fn kbd_read_blocking(buf, count) {
     # modifier from a prior partial read (continuous drain below keeps it honest
     # within the line; this just guarantees a clean start)
     kbd_irq_enable();          # IF=1 for the WHOLE line so the spin can take the
-    # timer wake. INPUT PATH (corrected 1.44.x): archaemenid is USB-keyboard-only
-    # (no PS/2 / i8042), so keystrokes arrive via the xHCI USB-HID ring that
-    # kb_has_key()->hid_poll() drains; the IRQ1/kb_isr/PIC path is DEAD CODE on
-    # this hardware (QEMU's usb-kbd delivers via the same hid_poll ring). The old
+    # timer wake. INPUT PATH: keystrokes arrive via the xHCI USB-HID ring that
+    # kb_has_key()->hid_poll() drains. ⭐ As of 2026-08-08 that is the ONLY path —
+    # the IRQ1/kb_isr/PIC code this comment used to argue against is DELETED, so
+    # there is no longer a second producer to be confused with. The old
     # "IRQ1 fills kb_buf on iron" comment here was wrong and misdirected five
     # iron burns — see project_archaemenid_keystroke_path_usb_only.
     hid_kbd_kick();            # KBD-RING-DEPTH FIX: re-kick the kbd EP in case it
@@ -649,7 +649,7 @@ fn kbd_read_blocking(buf, count) {
         # spin can't let run) -> keyboard dies after the first line; invisible in QEMU (no SMM legacy
         # emulation). hlt yields the pipeline so SMM runs, and is the proven-on-iron recipe used by
         # sleep_ms#41 (DOOM frame pacing) + kbscan#42 (DOOM input). IF=1 (sti above) so the 100 Hz
-        # timer guarantees a wake even with no key; a keystroke's own IRQ1 wakes hlt immediately.
+        # timer guarantees a wake even with no key; the xHCI MSI-X on vector 0x51 wakes hlt on a key.
         # preempt_count>0 (preempt_disable above) so the timer ISR ticks+EOIs but never switches.
         var sc = kb_read_scancode();
         var ch = scancode_to_ascii(sc);
@@ -704,7 +704,7 @@ fn kbd_read_blocking(buf, count) {
 fn kbd_read_nonblock(buf, count) {
     if (count <= 0) { return 0; }
     preempt_disable();             # SHORT window — drain only, never spin (see header).
-    kbd_irq_enable();              # IF=1 so IRQ1 -> kb_isr (iron) / hid_poll (QEMU) can fill kb_buf.
+    kbd_irq_enable();              # IF=1 so the xHCI MSI-X (vector 0x51) / 100 Hz tick can drive hid_poll.
     if (nbline_pos == 0) { kb_shift = 0; kb_ctrl = 0; }   # clean modifiers ONLY at a fresh line
     # (never mid-line — a shift HELD across a poll boundary must survive into the next drain).
     var ret = 0 - 2;               # default WOULD_BLOCK — NOT 0 (0 is reserved for Ctrl-D EOF).
@@ -8743,24 +8743,25 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # state. The kernel keeps NO key-state here — it's a pure byte pipe off the
         # same kb_buf the shell drains, so it can't strand a modifier across calls.
         #
-        # The window: ring-3 runs IF=0 (ring3.cyr), so on iron a keystroke's IRQ1
-        # is only *latched* in the PIC IRR during the gap between syscalls; it's
-        # serviced (kb_isr -> kb_buf) only inside a kernel sti window. Open a brief
-        # one here — same sched_active=0 + sti recipe as sleep_ms#41, but BOUNDED
-        # (no hlt) so a poll never stalls a frame. The spin both (a) gives the CPU
-        # post-sti instructions to take a pending IRQ1 (sti enables IF only after
-        # the *next* instruction, so `sti; cli` alone leaves no window) and (b)
-        # drives hid_poll to drain the xHCI USB-HID ring (the QEMU producer). Then
-        # cli and copy whatever landed. Anything still queued in hardware drains on
-        # the next frame's poll — fine at human key rates vs the 35 Hz tic. a3
-        # unused. (tick_wait's per-frame sleep_ms#41 also fills kb_buf, so this
-        # window is belt-and-suspenders, not the sole capture path.)
+        # The window: ring-3 runs IF=0 (ring3.cyr), so a brief kernel sti window is opened here — the
+        # same sched_active=0 + sti recipe as sleep_ms#41, but BOUNDED (no hlt) so a poll never stalls a
+        # frame. `hid_poll()` drains the xHCI USB-HID ring synchronously; the sti lets a pending xHCI
+        # MSI-X (vector 0x51) be taken as well. Then cli and copy whatever landed.
+        #
+        # ⛔ THIS USED TO SPIN `hid_poll()` **256 TIMES**, and the reason was PS/2: the spin existed to
+        # give the CPU post-`sti` instructions to take a pending **IRQ1** latched in the 8259 IRR, since
+        # `sti; cli` back-to-back leaves no window. The PS/2 path is deleted (2026-08-08), so there is no
+        # IRQ1 to wait for — and `hid_poll` already loops internally to 64 events, so one call drains
+        # everything queued. ⚠ The 256 calls were not free: `hid_poll` writes `IMAN` on every entry, so
+        # this was ~256 posted MMIO writes per syscall on DOOM's per-frame input path.
+        # ⚠ Cost of the change: a report landing DURING the poll rather than before it is now picked up
+        # on the next frame instead of this one — one frame at 35 Hz. `kb_has_key()` in the copy loop
+        # below calls `hid_poll` again, which catches most of that.
         if (arg2 <= 0) { stack_canary_check(canary); return 0; }
         if (is_user_range(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
         preempt_disable();               # suspend preemption (timer still ticks+EOIs)
-        kbd_irq_enable();                # sti — service any PIC-latched IRQ1 into kb_buf
-        var ks_w = 0;
-        while (ks_w < 256) { hid_poll(); ks_w = ks_w + 1; }  # bounded window: take IRQ1 + drain xHCI ring
+        kbd_irq_enable();                # sti — allow a pending xHCI MSI-X to be taken
+        hid_poll();                      # drain the xHCI USB-HID ring (loops to 64 events internally)
         kbd_irq_disable();               # cli — restore IF=0 for the handler tail
         preempt_enable();
         var ks_n = 0;

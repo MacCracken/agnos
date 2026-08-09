@@ -48,7 +48,6 @@ var timer_ticks = 0;
 var tsc_per_us = 0;    # measured cycles per microsecond; 0 = calibration refused
 var tsc_base   = 0;    # rdtsc at the end of calibration; #95 reports microseconds since
 var timer_isr[64];
-var kb_isr[96];    # keyboard ISR machine code (~83 bytes)
 var nic_rx_isr[64];  # NIC RX MSI-X ISR machine code (~62 bytes) — 1.51.5
 var xhci_rx_isr[64]; # xHCI RX (USB-HID) MSI-X ISR machine code (~62 bytes) — 1.53.7
 # TLB-shootdown IPI stub (vector 0xF0). agnos had NO cross-CPU TLB invalidation of any kind before

@@ -19,6 +19,64 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ---
 
+
+## [Unreleased] — ⛔ PS/2 IS DELETED, and the xHCI HID drain becomes a dispatcher
+
+### Removed — every trace of i8042 / PS/2, by operator ruling
+
+⛔ **Zero i8042 port I/O remains in the kernel.** Gone: `kb_isr_build()` (54 lines that hand-assembled 83
+bytes of machine code whose middle instruction was `in al, 0x60`), the `var kb_isr[96]` .bss buffer, the
+**IDT gate on vector 33**, `pic_mask_pit()` and its call site, and the 8042 pulse-reset rung in
+`power_reset()`. `pic_init`'s master mask goes **0xFC → 0xFF**.
+
+⚠ **The mask change is not cosmetic and had to land in the same commit as the gate removal.** With vector
+33 unhooked, a delivered IRQ1 would reach `idt_init`'s default `isr_stub` — a bare `iretq` that sends **no
+EOI** — and the 8259's in-service bit would latch forever. QEMU's q35 always has a real i8042 that can
+assert it.
+
+⚠ **What deliberately SURVIVES, because it is not PS/2**: `kb_buf`/`kb_head`, the `input_lock` family,
+`kbd_irq_enable`/`disable`/`save`/`restore` (bare `sti`/`cli` — the xHCI producer itself uses the
+save/restore pair), and **`scancode_to_ascii` with its Set-1 tables**. Set-1 is the USB path's *wire
+format*: `hid_translate.cyr` maps HID usages to Set-1 and `hid_kb_push` writes them into that same ring.
+Deleting them would have deleted the keyboard. The reboot ladder keeps ACPI RESET_REG (live on
+archaemenid) and CF9.
+
+⭐ **It was dead on the target and alive in the emulator — the worst combination.** archaemenid has no PS/2
+port and its firmware does not emulate PS/2 over xHCI after ExitBootServices (CHANGELOG 1.30.9, iron
+attempt 68); agnos itself disarms the SMM route during xHCI init, since `xhci_usblegsup_claim()` clears
+the USBLEGCTLSTS SMI enables including "SMI on USB IRQ". But q35's i8042 is real, so in QEMU the path did
+deliver keys — which is how ~15 minor versions of comments came to assert IRQ1 was "the archaemenid
+keystroke path". The kernel contradicted itself in four places about this; those comments are corrected.
+
+### Changed — one drain, dispatched on a bound-endpoint registry (`AE-7` P1)
+
+⛔ **`hid_poll` consumed every event it looked at, matched or not**, so a second HID device could never be
+served by a second poller — whichever ran first ate the other's Transfer Events. Endpoints now register
+`(slot, DCI, kind)` and the single drain dispatches. Adding a device class is a row and a `kind` arm.
+⚠ **The unit is an ENDPOINT, not a device**: archaemenid's Keychron K2 exposes a boot keyboard on EP 0x81
+*and* a boot mouse on EP 0x82 **in the same slot**, so a slot-keyed table would collide.
+⛔ `hid_poll`'s guard was `hid_kbd_slot_id == 0` — "no *keyboard*, do nothing" — which on a mouse-only box
+drains nothing **and never re-arms `IMAN.IP`**. Now gated on the registry being non-empty.
+
+### Changed — `kbscan #42`'s 256-iteration spin is one `hid_poll()`
+
+That spin existed to give the CPU post-`sti` instructions to take a pending **IRQ1**. With PS/2 gone there
+is nothing to wait for, and `hid_poll` already loops to 64 events internally. ⚠ It was ~256 posted MMIO
+writes to `IMAN` per syscall on DOOM's per-frame input path. Cost: a report landing *during* the poll is
+picked up next frame — one frame at 35 Hz.
+
+### Added — the keyboard path names itself
+
+`hid: first keyboard report dispatched via the endpoint registry`, once per boot. ⚠ Added because a
+mutation test of that very dispatch read **green three times running** while the keyboard kept working,
+and there was no way to tell from a log which producer had delivered. Now any boot says so.
+
+⛔ **Verified honestly at the fourth attempt, and the first three were my error.** `agnsh-type-test.py`
+builds **no image** — it boots whatever `scripts/smoke/agnsh-smoke.sh` last left in
+`build/agnsh-smoke/agnos-agnsh.img`, so `build.sh` alone tests a stale kernel. The tell was the serial log
+still printing the OLD boot banner. Correct order is `build.sh` → `agnsh-smoke.sh` → harness, and the
+proof is a unique string in the **serial log**, not in the source or the binary. With that fixed: clean
+build types and prints the marker; the mutant prints neither. Arc sweep **17/17**.
 ## [1.56.41] — 2026-08-07 — cycle OPEN
 
 ⭐ **1.56.40 shipped the whole ipc line — bites 0 through 11 are closed.** The channel band replaced

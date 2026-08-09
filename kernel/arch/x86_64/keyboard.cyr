@@ -65,72 +65,35 @@ fn kbd_irq_restore(f) {
     return 0;
 }
 
-fn kb_isr_build() {
-    # Keyboard ISR: save regs, read scancode, store in ring buf, EOI, restore, iretq
-    var p = &kb_isr;
-    var ba = &kb_buf;
-    var ha = &kb_head;
-    var off = 0;
-    # Save all caller-saved registers
-    store8(p + off, 0x50); off = off + 1;  # push rax
-    store8(p + off, 0x51); off = off + 1;  # push rcx
-    store8(p + off, 0x52); off = off + 1;  # push rdx
-    store8(p + off, 0x56); off = off + 1;  # push rsi
-    store8(p + off, 0x57); off = off + 1;  # push rdi
-    store8(p + off, 0x41); store8(p + off + 1, 0x50); off = off + 2;  # push r8
-    store8(p + off, 0x41); store8(p + off + 1, 0x51); off = off + 2;  # push r9
-    store8(p + off, 0x41); store8(p + off + 1, 0x52); off = off + 2;  # push r10
-    store8(p + off, 0x41); store8(p + off + 1, 0x53); off = off + 2;  # push r11
-    # mov edx, 0x60; in al, dx (read scancode from keyboard port)
-    store8(p + off, 0xBA); store8(p + off + 1, 0x60); store8(p + off + 2, 0x00);
-    store8(p + off + 3, 0x00); store8(p + off + 4, 0x00); off = off + 5;
-    store8(p + off, 0xEC); off = off + 1;  # in al, dx
-    # movzx ecx, al (save scancode in cl)
-    store8(p + off, 0x0F); store8(p + off + 1, 0xB6); store8(p + off + 2, 0xC8); off = off + 3;
-    # mov rax, [head_addr] — load head index
-    store8(p + off, 0x48); store8(p + off + 1, 0xA1); off = off + 2;
-    store64(p + off, ha); off = off + 8;
-    # mov rdx, buf_addr
-    store8(p + off, 0x48); store8(p + off + 1, 0xBA); off = off + 2;
-    store64(p + off, ba); off = off + 8;
-    # mov [rdx + rax], cl — store scancode at buf[head]
-    store8(p + off, 0x88); store8(p + off + 1, 0x0C); store8(p + off + 2, 0x02); off = off + 3;
-    # inc rax; and al, 0xFF (wrap at 256)
-    store8(p + off, 0x48); store8(p + off + 1, 0xFF); store8(p + off + 2, 0xC0); off = off + 3;
-    store8(p + off, 0x24); store8(p + off + 1, 0xFF); off = off + 2;
-    # mov [head_addr], rax — store new head
-    store8(p + off, 0x48); store8(p + off + 1, 0xA3); off = off + 2;
-    store64(p + off, ha); off = off + 8;
-    # EOI: mov al,0x20; mov edx,0x20; out dx,al
-    store8(p + off, 0xB0); store8(p + off + 1, 0x20); off = off + 2;
-    store8(p + off, 0xBA); store64(p + off + 1, 0x20); off = off + 5;
-    store8(p + off, 0xEE); off = off + 1;
-    # Restore r11-r8, rdi, rsi, rdx, rcx, rax
-    store8(p + off, 0x41); store8(p + off + 1, 0x5B); off = off + 2;  # pop r11
-    store8(p + off, 0x41); store8(p + off + 1, 0x5A); off = off + 2;  # pop r10
-    store8(p + off, 0x41); store8(p + off + 1, 0x59); off = off + 2;  # pop r9
-    store8(p + off, 0x41); store8(p + off + 1, 0x58); off = off + 2;  # pop r8
-    store8(p + off, 0x5F); off = off + 1;  # pop rdi
-    store8(p + off, 0x5E); off = off + 1;  # pop rsi
-    store8(p + off, 0x5A); off = off + 1;  # pop rdx
-    store8(p + off, 0x59); off = off + 1;  # pop rcx
-    store8(p + off, 0x58); off = off + 1;  # pop rax
-    # iretq
-    store8(p + off, 0x48); store8(p + off + 1, 0xCF);
-    return 0;
-}
+# ⛔⛔ THE PS/2 ISR IS DELETED (2026-08-08, operator ruling: no i8042 in agnos, in any capacity).
+#
+# `kb_isr_build()` lived here and hand-assembled 83 bytes of machine code whose middle instruction was
+# `in al, 0x60` — the i8042 data port. It was installed on IDT vector 33 and EOI'd the legacy 8259.
+#
+# ⚠ IT WAS DEAD ON THE TARGET AND ALIVE IN THE EMULATOR, WHICH IS THE WORST COMBINATION. archaemenid has
+# no PS/2 port and its firmware does not emulate PS/2 over xHCI after ExitBootServices (CHANGELOG 1.30.9,
+# iron attempt 68) — and agnos itself disarms the SMM route during xHCI init, since
+# `xhci_usblegsup_claim()` clears the USBLEGCTLSTS SMI enables including "SMI on USB IRQ". But QEMU's q35
+# always has a real i8042, so in emulation this path DID deliver keys — masking the xHCI HID path
+# completely. A mutation test proved it: the xHCI endpoint dispatch was forced to always miss and the
+# keyboard still typed in QEMU. Every keyboard gate this project ran in emulation was measuring the path
+# the hardware does not have.
+#
+# ⇒ Keys now arrive one way on both substrates: xHCI HID -> `hid_poll` -> `hid_kb_push` -> `kb_buf`.
+# ⚠ `kb_buf`, `kb_head`, the `input_lock` family and `scancode_to_ascii`'s **Set-1 tables** all SURVIVE
+# and are not PS/2: Set-1 is the USB path's wire format — `hid_translate.cyr` maps HID usages to Set-1
+# and `hid_kb_push` writes them into this same ring. Deleting them would delete the keyboard.
 
 fn kb_has_key() {
-    # kb_buf has two producers feeding one consumer (scancode_to_ascii):
-    #   1. kb_isr — the IRQ1 handler. Reads a scancode from port 0x60 on each
-    #      keyboard interrupt and appends it to kb_buf. This is the producer
-    #      that delivers on archaemenid (the in-kernel shell + the read(0) path
-    #      both type via it); it requires IF=1.
-    #   2. hid_poll() — drains the xHCI USB-HID event ring (this call). The
-    #      QEMU producer (its usb-kbd DMAs reports into that ring); no-op when
-    #      no HID keyboard was configured (hid_kbd_slot_id == 0 inside hid_poll).
-    # Drain (2) here so a polling caller also services xHCI; (1) fills kb_buf
-    # asynchronously via the ISR.
+    # ⭐ ONE PRODUCER: `hid_poll()` drains the xHCI USB-HID event ring and `hid_kb_push` appends Set-1
+    # scancodes to kb_buf. That is the whole story on both substrates as of 2026-08-08.
+    # ⛔ There used to be a second producer — `kb_isr`, the PS/2 IRQ1 handler reading port 0x60 — and this
+    # comment claimed IT was "the producer that delivers on archaemenid". That was false: the box has no
+    # PS/2 port, and agnos itself disarms the firmware's SMM legacy route during xHCI init
+    # (`xhci_usblegsup_claim` clears the USBLEGCTLSTS SMI enables). It IS real in QEMU's q35, which is how
+    # a dead path stayed plausible for ~15 minor versions. Deleted; see the note atop this file.
+    # ⚠ Calling hid_poll here is what makes every polling consumer also a drain, so a caller parked in a
+    # spin still services the ring even if the MSI-X on vector 0x51 is missed.
     hid_poll();
     # 1.53.7's dispositive "xhci: RX MSI LIVE (… vector 0x51)" proof was REMOVED at 1.53.14 once the
     # interrupt-driven USB-HID path was iron-validated on real AMD FCH — printed from this read loop,
@@ -152,11 +115,12 @@ fn kb_read_scancode() {
     return sc;
 }
 
-# Enable / disable maskable interrupts (sti / cli) around the blocking-stdin
-# read. kbd_read_blocking (core/syscall.cyr) re-enables interrupts so IRQ1 ->
-# kb_isr delivers keystrokes — the SYSCALL instruction masks IF on entry, which
-# would otherwise lock out the only keystroke source on real hardware. Arch-
-# factored so core/syscall.cyr stays portable (aarch64 stubs these out).
+# Enable / disable maskable interrupts (sti / cli). ⚠ THE NAME IS HISTORICAL — these are bare `sti` and
+# `cli` with no port I/O and nothing keyboard-specific; `hid_kb_push` itself uses the save/restore pair.
+# They are kept because the SYSCALL instruction masks IF on entry, so a syscall that must let an
+# interrupt land has to re-enable it explicitly. ⭐ What they let land is now the **xHCI MSI-X on vector
+# 0x51** (and the 100 Hz LAPIC tick that also drives `hid_poll`) — NOT IRQ1, which is deleted along with
+# the rest of the PS/2 path. Arch-factored so core/syscall.cyr stays portable (aarch64 stubs these out).
 fn kbd_irq_enable()  { asm { 0xFB; } return 0; }   # sti
 fn kbd_irq_disable() { asm { 0xFA; } return 0; }   # cli
 

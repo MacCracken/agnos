@@ -104,7 +104,8 @@ timer_isr_build();
 idt_set_gate(&idt + 32 * 16, &timer_isr, 0x08, 0x8E);
 kprintln("Timer ISR installed", 19);
 
-# Initialize Local APIC (keeps PIC for keyboard IRQ1)
+# Initialize Local APIC. ⚠ The 8259 is now fully masked (pic_init writes 0xFF) — nothing is delivered
+# through it. The PIT COUNTER still free-runs for pit_ch0_read()/lapic_calibrate; only its IRQ is masked.
 apic_init();
 # Start APIC timer on vector 32 (same as PIT). CALIBRATE the div1 LAPIC input
 # against PIT ch0 (still free-running here, pre-pic_mask_pit) for a TRUE 100Hz.
@@ -113,11 +114,12 @@ apic_init();
 # 6h soak + tonegen). Called INLINE (boot-sequence order, not a gvar-init var);
 # lapic_reload_100hz falls back to 10M on an implausible measure.
 apic_timer_init(32, lapic_reload_100hz());
-# The LAPIC timer now owns vector 32 — mask the legacy PIT (IRQ0) so its
-# free-running ticks can't wedge the 8259's in-service register and block the
-# keyboard's IRQ1 (the iron keystroke path). See pic_mask_pit(). IF is still 0
-# here, so no PIT IRQ0 can have been delivered/latched yet.
-pic_mask_pit();
+# ⛔ `pic_mask_pit()` IS DELETED. It existed solely to keep the 8259's IRQ1 (the PS/2 keyboard)
+# deliverable by masking IRQ0 so a PIT tick could not wedge the in-service register. With no IRQ1
+# consumer there is no lower-priority line to protect, so `pic_init` now masks ALL 8259 lines outright.
+# ⚠ It was also already refuted as a fix on its own terms (CHANGELOG 1.44.25: "a NO-OP, not the fix").
+# ⚠ The PIT COUNTER keeps free-running — masking at the 8259 does not stop it, and `pit_ch0_read()`
+# still feeds lapic_calibrate and the GPU timebase.
 kprint("APIC: id=", 9);
 kprint_num(cpu_id);
 kprintln(" timer active", 13);
@@ -147,9 +149,11 @@ kb_shift = 0;
 kb_caps = 0;
 kb_ctrl = 0;
 kb_init_tables();
-kb_isr_build();
-idt_set_gate(&idt + 33 * 16, &kb_isr, 0x08, 0x8E);
-kprintln("Keyboard ISR installed (full US QWERTY)", 39);
+# ⛔ THE PS/2 ISR AND ITS IDT GATE (vector 33 / IRQ1) ARE DELETED — 2026-08-08, operator ruling.
+# Keys arrive by exactly one route now, on both substrates: xHCI HID -> hid_poll -> hid_kb_push -> kb_buf.
+# ⚠ `kb_init_tables()` above STAYS: those are the Set-1 scancode tables, which are the USB path's wire
+# format (hid_translate.cyr maps HID usages to Set-1), not i8042 hardware.
+kprintln("Keyboard scancode tables installed (US QWERTY, USB HID)", 55);
 
 # 1.51.5: NIC RX MSI-X ISR at vector 0x50 (80) — built + registered here; dormant
 # until virtio_net_init points the NIC's MSI-X table entry at this vector (bite 2).
@@ -4383,7 +4387,8 @@ kprintln("", 0);
 #
 # GATED OFF (iron multi-verb keyboard-death bisect). The "keyboard dies after the
 # first command" regression is IRON-ONLY — it does NOT reproduce in QEMU even over
-# the exact IRQ1/kb_isr keystroke path with -smp 4 + a 30 s dwell (see
+# the keystroke path with -smp 4 + a 30 s dwell (⚠ HISTORICAL: that bisect predates the 2026-08-08
+# PS/2 deletion and was written when IRQ1/kb_isr was believed to be the iron path; see
 # scripts/probe/agnsh-irq1-repro.py) — and bisects to THIS wake: multi-verb typing worked
 # on archaemenid at 14115 (1.41.15) and 1439 (DOOM, 1.43.8), both PRE-1.44.18, the
 # only sessions where AGNOS never woke the other Zen cores. Hypothesis: a woken-but-

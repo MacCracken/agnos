@@ -14,8 +14,16 @@ fn pic_init() {
     # ICW4: 8086 mode
     asm { 0xB0; 0x01; 0xBA; 0x21; 0x00; 0x00; 0x00; 0xEE; }  # out 0x21, 0x01
     asm { 0xB0; 0x01; 0xBA; 0xA1; 0x00; 0x00; 0x00; 0xEE; }  # out 0xA1, 0x01
-    # Mask all IRQs except IRQ0 (timer) + IRQ1 (keyboard)
-    asm { 0xB0; 0xFC; 0xBA; 0x21; 0x00; 0x00; 0x00; 0xEE; }  # out 0x21, 0xFC
+    # ⛔ MASK EVERY 8259 LINE. This used to be 0xFC — IRQ0 (PIT) and IRQ1 (PS/2 keyboard) unmasked.
+    # The PS/2 keyboard is deleted (2026-08-08, operator ruling) and the LAPIC timer owns the timebase,
+    # so nothing on this chip has a consumer: the NIC and xHCI are MSI-X, which bypasses the 8259.
+    # ⚠ MASKING IS NOT OPTIONAL NOW THAT VECTOR 33 IS GONE. Without a gate, a delivered IRQ1 lands on
+    # `idt_init`'s default `isr_stub` — a bare `iretq` that sends NO EOI — and the in-service bit latches
+    # forever. QEMU's q35 always has a real i8042 that can assert it, so this line is what keeps an
+    # unowned interrupt from wedging the chip.
+    # ⚠ The PIT COUNTER still free-runs below (mode-2 rate generator): masking the IRQ does not stop the
+    # counter, and `pit_ch0_read()` still feeds lapic_calibrate and the GPU timebase.
+    asm { 0xB0; 0xFF; 0xBA; 0x21; 0x00; 0x00; 0x00; 0xEE; }  # out 0x21, 0xFF (all master lines masked)
     asm { 0xB0; 0xFF; 0xBA; 0xA1; 0x00; 0x00; 0x00; 0xEE; }  # out 0xA1, 0xFF
     # Program PIT channel 0: mode 2 (rate generator), ~100 Hz
     # Command: channel 0, lobyte/hibyte, mode 2, binary
@@ -29,23 +37,11 @@ fn pic_init() {
     return 0;
 }
 
-# Mask the legacy PIT (IRQ0) at the master PIC once the LAPIC timer owns the
-# timebase. pic_init leaves the PIT free-running (mode-2 rate generator) AND
-# unmasks IRQ0, and apic_timer_init puts the LAPIC timer on the SAME vector
-# (INT32). Because timer_handler always EOIs the LAPIC when apic_enabled==1,
-# a PIT-delivered IRQ0 would leave the 8259's IRQ0 in-service bit set forever
-# -> the PIC then refuses to deliver the lower-priority IRQ1 (keyboard) ->
-# keyboard input dies on iron. kb_isr/IRQ1 IS the archaemenid keystroke path
-# (keyboard.cyr); QEMU types via the USB hid_poll ring, so the wedge is
-# invisible in every QEMU smoke. Fix: mask IRQ0, keep IRQ1 (master mask
-# 0xFC -> 0xFD). The LAPIC timer (INT32) never traverses the PIC, so the
-# timebase is unaffected. Prior art: Linux/xv6/SeaBIOS all disable the PIT
-# when switching the timebase to the LAPIC timer. Call AFTER apic_timer_init,
-# while IF=0 (no IRQ0 can have been delivered yet, so no unwedge is needed).
-fn pic_mask_pit() {
-    asm { 0xB0; 0xFD; 0xBA; 0x21; 0x00; 0x00; 0x00; 0xEE; }  # out 0x21, 0xFD (IRQ0 masked, IRQ1 keyboard live)
-    return 0;
-}
+# ⛔ `pic_mask_pit()` IS DELETED (2026-08-08). It masked IRQ0 so a PIT tick could not wedge the 8259's
+# in-service register and block the lower-priority **IRQ1 keyboard** — a workaround that existed only to
+# keep the PS/2 path deliverable. With that path gone, `pic_init` masks the whole chip outright and there
+# is nothing left to protect. ⚠ It had also been refuted on its own terms: CHANGELOG 1.44.25 records it
+# as "a NO-OP, not the fix", the real cause being the xHCI keyboard ring armed one TRB deep.
 
 # Timer ISR handler — called from the ISR bytecode after regs are pushed.
 # rsp_after_push is the stack pointer with all 9 regs + hardware frame on it.
