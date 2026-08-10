@@ -382,6 +382,148 @@ try:
         fg = run_wait("aethersafha --clients\n", "run: exit", timeout=150)
         fg_code = verdict(fg, "fg")
         time.sleep(3.0)
+    if MODE == "relaunch":
+        # ⛔⛔ THE THIRD LAUNCH IN ONE BOOT, AFTER F4 CLOSES AND AN Esc QUIT — the sequence the
+        # operator actually ran on iron 2026-08-09, against the flashed `tracker-15642-cleared`
+        # image. Reported outcome: the relaunched compositor "hit just FB lines".
+        #
+        # ⚠ THE FIRST CUT OF THIS MODE RAN THE WRONG SEQUENCE. It stopped after a plain second
+        # launch, that launch hosted both clients, and the mode reported the orphan-resource causes
+        # falsified. The operator's actual run had two more steps in it — F4 on each window, then
+        # Esc — and those steps are exactly the ones that exercise the teardown paths. A repro that
+        # drops the steps under suspicion answers a question nobody asked.
+        #
+        # What each step is there to leave behind:
+        #   1. `--clients` exits on its own verdict and does NOT close its clients. On agnos the only
+        #      teardown in `main.cyr` is `sys_close(setu_sfd)` inside `#ifndef CYRIUS_TARGET_AGNOS`,
+        #      so the one target with no listener has no teardown at all ⇒ TWO ORPHANS survive here,
+        #      holding their endowed channel ends and their shm slots, with nothing to reap them.
+        #   2. a plain launch, which mints two MORE channels and spawns two more clients.
+        #   3. F4 on each window: `SETU_CLOSE` (kind 7) reaches the client and it exits, and the
+        #      compositor `sys_close`s its own peer fd — the path that meets agnos 1.56.41's still
+        #      -carried `VFS_CHAN` close leak (`vfs_close_inner` has no `VFS_CHAN` arm, so the fd
+        #      slot is zeroed and the ENDPOINT stays claimed).
+        #   4. Esc quits the compositor, releasing whatever `chan_release_pid` / `shm_release_pid`
+        #      still attribute to it.
+        #   5. the relaunch. THIS is the subject. Everything above is setup.
+        #
+        # ⛔ THE VERDICT IS STEP 5 ALONE. Steps 1 and 2 are PRECONDITIONS: if either fails, this run
+        # says nothing about relaunching and must not be read either way.
+        # ⛔ DEDICATED VARIABLES, AND `ran_fg`/`ran_bg` STAY FALSE. Every launch here is FOREGROUND;
+        # reusing the fg/bg pair made the shared verdict block label a launch as
+        # "BACKGROUND (agnsh spawn_path #43)" and print "Both launch paths work" for a run that
+        # compared no paths at all — the exact defect the `desktop` and `armed` guards below were
+        # each added to fix, committed a third time by the person who had just read them.
+        RL_HOLD_MS = int(os.environ.get("AE_KEY_HOLD_MS", "500"))
+
+        def rl_key(name, hold_ms=None):
+            # ⚠ HOLD, DO NOT TAP — same reason as the move phase: the compositor samples HID state
+            # once per frame, so QEMU's ~100 ms default is never sampled rather than "dropped".
+            h = RL_HOLD_MS if hold_ms is None else hold_ms
+            s.sendall((f"sendkey {name} {h}\n").encode())
+            time.sleep(h / 1000.0 + 0.3); drain()
+
+        def rl_wait_presented(mark, n=2, secs=30):
+            for _w in range(secs):
+                seg = ser()[mark:]
+                if seg.count("setu client presented surface") >= n: return seg
+                if "run: exit" in seg: return seg
+                time.sleep(1.0)
+            return ser()[mark:]
+
+        p("=== STEP 1: `aethersafha --clients` (leaves two orphans behind) ===")
+        typ("\n", settle=0.5)                      # QEMU drops the first char after the prompt
+        one = run_wait("aethersafha --clients\n", "run: exit", timeout=150)
+        rl1_code = verdict(one, "step1")
+        time.sleep(3.0)
+
+        p("=== STEP 2: `aethersafha` plain, SAME BOOT ===")
+        mark2 = len(ser())
+        typ("aethersafha\n", settle=1.0)
+        two = rl_wait_presented(mark2)
+        time.sleep(3.0)
+        two = ser()[mark2:]
+        rl2_code = verdict(two, "step2")
+        rl_pres2 = two.count("setu client presented surface")
+
+        p("=== STEP 3: F4 on each window, then STEP 4: Esc to quit ===")
+        mark34 = len(ser())
+        # ⚠ TAB FIRST so focus is on a real client window. With the seeded placeholder gone (0.12.8)
+        # the list is {puka, crab} and focus already sits on the last one to present — but TAB is the
+        # one compositor key iron-proven to cycle focus, and starting from a known state costs one key.
+        rl_key("tab")
+        rl_key("f4")                                # close the focused window
+        rl_key("f4")                                # focus advances on close; close the other
+        time.sleep(2.0)
+        closed_seg = ser()[mark34:]
+        rl_closes = closed_seg.count("SETU_CLOSE") + closed_seg.count("closing the focused window") \
+                    + closed_seg.count("close")
+        rl_key("esc")
+        time.sleep(4.0)
+        quit_seg = ser()[mark34:]
+        rl_quit = ("frame loop ok" in quit_seg) or ("at exit — frames" in quit_seg)
+        p(f"  close-related lines after F4 F4 : {rl_closes}")
+        p(f"  compositor reached its exit path: {rl_quit}")
+        if not rl_quit:
+            p("  ⚠ Esc did not take — the compositor never printed its exit line. Step 5 below is then")
+            p("     NOT the operator's sequence, because the previous compositor is still running.")
+
+        # ⛔⛔ STEP 5 IS A LOOP, NOT ONE RELAUNCH — AND THE FIRST CUT OF THIS MODE GOT THAT WRONG.
+        # A single relaunch hosted both clients and the mode reported the orphan-resource causes
+        # "falsified as substrate-independent". That verdict was ARITHMETIC, not evidence: the
+        # process table caps at 16 (`proc.cyr:275`) and three launches never get near it.
+        #   base           : kmain, idle, agnsh                                  = 3
+        #   `--clients`    : ae + puka + puka's agnsh + crab, ae exits           = 6 live
+        #   plain launch   : + 4, then F4 F4 reaps 2, Esc reaps ae               = 7 live
+        #   one relaunch   : + 4                                                 = 11 of 16
+        # ⇒ It stopped FIVE SLOTS SHORT of the limit it was written to test, and called that a
+        # falsification. A budget test must consume the budget. [[feedback_oracle_must_test_external_invariant]]
+        #
+        # ⇒ Relaunch-and-quit until something breaks, and report the launch NUMBER it broke at.
+        # That number is the finding whichever way it goes: it is the operator's real budget before
+        # the desktop stops working, and if nothing breaks the orphan theory is genuinely spent.
+        RL_MAX = int(os.environ.get("AE_RELAUNCH_MAX", "6"))
+        import re as _re2
+        rl_broke_at = None
+        rl_started5 = True
+        rl_placed5 = 0
+        rl_pres5 = 0
+        rl_fault5 = None
+        rl_refusals = []
+        rl5_code = None
+        for _n in range(1, RL_MAX + 1):
+            p(f"=== STEP 5.{_n}: RELAUNCH #{_n} — the subject ===")
+            mark5 = len(ser())
+            typ("aethersafha\n", settle=1.0)
+            rl_wait_presented(mark5)
+            time.sleep(3.0)
+            five = ser()[mark5:]
+            rl5_code = verdict(five, f"relaunch{_n}")
+            # ⭐ NAME WHAT IT DID, in terms that separate the causes. "never started", "started and
+            # faulted" and "started and hosted nothing" are three different bugs in three different
+            # places, and the operator's report — "just FB lines" — is the THIRD shape, not the second.
+            rl_started5 = "aethersafha:" in five
+            rl_placed5  = five.count("client spawned on a placed channel")
+            rl_pres5    = five.count("setu client presented surface")
+            rl_fault5   = _re2.search(r"(fault: pid=|#PF|panic|GPF|exit 13[0-9]|exit 14[0-9])", five)
+            # ⛔ THE REFUSAL LINES ARE THE POINT. Each was written so its case could not pass
+            # silently, so naming which appeared localises the exhaustion to a specific pool rather
+            # than to "it broke". ⚠ `spawn_path_env FAILED` is the one that means a refused spawn —
+            # and on a full process table the KERNEL side of that is silent today, so this line is
+            # the only evidence there is.
+            rl_refusals = [t for t in ("spawn_path_env FAILED", "chan_mint FAILED",
+                                       "chan_endow FAILED", "no graphics-visible slot",
+                                       "refused a glyph run", "refused a cursor mask",
+                                       "the pointer moves to the CPU") if t in five]
+            p(f"  placed {rl_placed5} · presented {rl_pres5} · exit {rl5_code} · "
+              f"fault {rl_fault5.group(0) if rl_fault5 else None} · refusals {rl_refusals or None}")
+            if rl_fault5 or rl_pres5 < 2 or not rl_started5:
+                rl_broke_at = _n
+                p(f"  ⭐ BROKE AT RELAUNCH #{_n} — leaving it in this state for the record.")
+                break
+            # Quit it the way the operator does, so the next iteration starts from the same shape.
+            rl_key("esc")
+            time.sleep(3.0)
     if MODE == "desktop":
         # ⛔ THE ONLY TEST THAT CAN SHOW A DESKTOP. `--clients` STOPS as soon as both clients
         # connect (1.09 s in practice), so any screendump taken after it is a picture of the
@@ -1059,6 +1201,72 @@ try:
                 p("     is the thing under test and its own claim cannot corroborate itself.")
             rc = 0 if (serial_ok and fb_ok) else 1
         raise SystemExit(rc)
+    if MODE == "relaunch":
+        # ⛔ Its own verdict, for the same reason `desktop` and `armed` have theirs: this mode runs
+        # three FOREGROUND launches and compares the last to the first two, not fg against bg.
+        #
+        # ⛔⛔ A PASS HERE IS NOT "RELAUNCHING IS FINE ON IRON". QEMU has no amdgpu, so no launch here
+        # re-acquires a `#86` GPU-visible slot, a glyph staging slot or a cursor mask, and it does not
+        # reproduce the big-binary #PF kill documented as iron-only. ⭐ It CAN reach the 16-slot
+        # process table (`proc.cyr:275`) and the 32-endpoint channel pool, because those are pure
+        # kernel accounting and substrate-independent. A green run narrows the iron failure to what
+        # QEMU structurally cannot see; it does not clear the sequence.
+        #
+        # ⛔ PRECONDITIONS FIRST. Steps 1 and 2 are setup, and setup that did not happen makes the
+        # subject uninterpretable in BOTH directions — a relaunch that works after a step 1 that
+        # never left an orphan behind proves nothing at all.
+        if rl1_code != 95:
+            p(f"  ⚠ STEP 1 returned {rl1_code}, not 95 — no orphans were left behind, so the relaunch")
+            p("     was never given the state under suspicion. This run says NOTHING either way.")
+            raise SystemExit(1)
+        if rl_pres2 < 2:
+            p(f"  ⚠ STEP 2 hosted {rl_pres2} surfaces, not 2 — the F4 closes had nothing to close, so")
+            p("     the teardown paths were never exercised. This run says NOTHING either way.")
+            raise SystemExit(1)
+        p(f"  step 1 (`--clients`)        : exit {rl1_code}, two orphans left alive")
+        p(f"  step 2 (plain)              : {rl_pres2} surfaces presented, exit {rl2_code}")
+        p(f"  steps 3-4 (F4 F4, then Esc) : reached the exit path = {rl_quit}")
+        p(f"  step 5 (relaunch loop)      : broke at #{rl_broke_at}" if rl_broke_at
+          else f"  step 5 (relaunch loop)      : {RL_MAX} relaunches, none broke")
+        if rl_broke_at is None:
+            # ⛔ A PASS MEANS TWO OPPOSITE THINGS AND THE MESSAGE MUST SAY WHICH. Written for the
+            # UNFIXED build, "none broke" means the orphan theory is spent. On a build that carries
+            # `comp_close_all_clients`, "none broke" means the fix WORKED — and printing "the theory
+            # is spent" there would retire, as unsupported, the very hypothesis this run confirmed.
+            # The teardown line is in the serial or it is not, so the run can tell them apart itself.
+            _whole = ser()
+            _fixed = _whole.count("at exit — clients told to close")
+            _reaped = _whole.count("compositor closed the window -- exiting")
+            if _fixed:
+                p(f"  ⇒ {RL_MAX} relaunches, none broke — and the exit teardown fired {_fixed} times,")
+                p(f"     reaping {_reaped} client exits. This build carries `comp_close_all_clients`, so")
+                p("     this is the FIXED arm: the leak is closed, not absent. ⚠ Compare against a build")
+                p("     WITHOUT it — that arm breaks, and without the comparison this number proves little.")
+            else:
+                p(f"  ⇒ {RL_MAX} relaunches after the orphan-seeding sequence and the desktop still hosts")
+                p("     both clients every time, with NO exit teardown in the build. The orphan-")
+                p("     accumulation theory is spent at this count — raise AE_RELAUNCH_MAX to push")
+                p("     further, or the iron failure needs something QEMU cannot see (the GPU path's")
+                p("     #86 slots, real memory pressure, the iron-only #PF kill of a large binary).")
+            raise SystemExit(0)
+        p(f"  ⭐ REPRODUCED IN QEMU at relaunch #{rl_broke_at} — no burn required to iterate.")
+        if rl_fault5:
+            p(f"  ⇒ It DIED ({rl_fault5.group(0)}). A crash, not an empty desktop.")
+        elif not rl_started5:
+            p("  ⇒ It never printed a line — it did not get far enough to be the compositor's fault.")
+            p("     Suspect spawn/exec, not the desktop.")
+        else:
+            p("  ⇒ It came up and HOSTED NOTHING — the operator's 'just FB lines' shape, and the same")
+            p("     shape as 0.12.0's leaked slots. NOT a crash.")
+            p(f"     Placed {rl_placed5}, hosted {rl_pres5}. Placed-but-never-presented points at the")
+            p("     client or the handshake; placed 0 points at mint/endow/spawn.")
+            if "spawn_path_env FAILED" in rl_refusals:
+                p("     ⭐ `spawn_path_env FAILED` IS PRESENT — the spawn was refused. On a full 16-slot")
+                p("     process table that is exactly what happens, and the KERNEL side is silent.")
+            elif not rl_refusals:
+                p("     ⛔ AND NOT ONE REFUSAL LINE FIRED. Every one of them was written so its case")
+                p("     could not pass silently, so their combined absence is itself the finding.")
+        raise SystemExit(1)
     if MODE == "armed":
         # ⛔ Do NOT fall through to the fg/bg comparison — this mode runs neither of those, and the
         # shared verdict block reports "Neither path reached 95" for a single-mode run, which reads

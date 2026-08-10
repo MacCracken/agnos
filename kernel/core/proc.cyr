@@ -28,6 +28,9 @@ struct Process { pid; state; rsp; rip; rax; rbx; rcx; rdx; rsi; rdi; rbp; r8; r9
 
 var proc_table[2816];  # 16 processes x 176 bytes each
 var proc_count = 0;
+# First-occurrence latch for the "process table is full" refusal in proc_alloc_slot(). ⚠ Scalar, not
+# an array — module-scope `var X[N]` would be N x u64 here [[cyrius-var-array-u64-units]].
+var proc_full_said = 0;
 # 1.46.x SMP sub-bite 2 — per-CPU "current proc pid". Was a single global `proc_current_get()`;
 # under SMP each CPU runs a different proc, so it is indexed by APIC id (the tss_array
 # template). Single-core FAST PATH: while cpu_count<2 (single-core, or before the APs wake) the
@@ -272,7 +275,28 @@ fn proc_alloc_slot() {
         else { i = i + 1; }
     }
     if (idx < 0) {
-        if (proc_count >= 16) { proctab_spin_unlock(); return 0 - 1; }
+        if (proc_count >= 16) {
+            proctab_spin_unlock();
+            # ⛔⛔ SAY IT. Until now this returned -1 in SILENCE from four call sites, and the whole
+            # chain above it is silent too: elf_load_from_file passes the -1 through, spawn_path #43
+            # returns it, and the only thing that ever spoke was the CALLER — aethersafha printing
+            # "spawn_path_env FAILED", which names the symptom and not one word of the cause. A full
+            # process table then presents as a desktop that comes up, draws its chrome and hosts
+            # nothing, with nothing anywhere saying why. That is what the 2026-08-09 iron session hit.
+            # ⚠ Nothing REAPS an orphan: a compositor that exits without closing its clients leaves
+            # them alive holding their rows forever, so repeated launches march the count to the cap.
+            # An absent resource must say it is absent and why — the same rule that produced
+            # "hda: ctl1 NOT PROBED" and gpu_hdmi_preflight's self-naming early returns.
+            # ⚠ LATCHED, and deliberately not counted: the first refusal is the one that explains the
+            # boot, and an unlatched print inside an allocation failure is a storm waiting for a
+            # caller that retries.
+            if (proc_full_said == 0) {
+                proc_full_said = 1;
+                kprintln("proc: the process table is full and this spawn was refused", 58);
+                kprintln("proc: nothing reaps a process whose parent exited without closing it", 68);
+            }
+            return 0 - 1;
+        }
         idx = proc_count;
         proc_count = proc_count + 1;
     }

@@ -13474,5 +13474,23 @@ fn gpu_az_dump_ord(ir, dr, ordinal, label) {
 # presented is a no-op, and a long-running compositor simply never exits — so it keeps the screen.
 fn gpu_release_pid(pid) {
     if (gpu_scanout_pid != pid) { return 0; }
-    return gpu_display_restore_console();
+    var r = gpu_display_restore_console();
+    # ⛔⛔ AND SPILL THE LOG, BECAUSE THIS PROCESS'S OUTPUT WAS NEVER VISIBLE. A full-screen app owns the
+    # panel, so every `println` it made — and every kernel line printed while it ran — landed on a console
+    # UNDERNEATH its frames. Nothing read them and nothing wrote them anywhere: `klug_spill()` is called
+    # only from the boot, modeset and GPU-arc paths, so the desktop had no spill site at all.
+    #
+    # ⇒ On 2026-08-09 the desktop came up hosting nothing, printed `spawn_path_env FAILED` twice into a
+    # ring that reached no disk, and the burn produced **no evidence of any kind**. ⚠ The box is the dev
+    # host: booting agnos reboots the machine the operator would read a log ON, so by the time anyone can
+    # look, RAM is gone. There is no interactive recovery, ever — evidence must reach the DISK while the
+    # run is live or it does not exist. [[project_archaemenid_hardware_target]]
+    #
+    # ⭐ THE OWNERSHIP TEST ABOVE IS EXACTLY THE RIGHT GATE, and it costs nothing to reuse: reaching here
+    # means this pid HELD the scanout, i.e. the console was covered for the whole run. A process that
+    # never presented is already a no-op. So this fires ONCE per full-screen app exit — never on a shell
+    # command — and it fires on BOTH ways out, because `exit#0` (syscall.cyr:7202) and
+    # `fault_kill_current` (syscall.cyr:543) both come through here. The crash case gets it free.
+    klug_spill_covered_console();
+    return r;
 }

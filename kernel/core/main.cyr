@@ -1279,6 +1279,14 @@ kprint("klug: spilled ", 14); kprint_num(_klug_spilled); kprintln(" bytes to /kl
 klug_spill_wraptest();
 #endif
 
+#ifdef KLUG_SPILL_SCANOUT_TEST
+# The exercise for klug_spill_covered_console(), whose PRODUCTION call site — `gpu_release_pid`, guarded on
+# `gpu_scanout_pid == pid` — is set only by `gpu_blit_present` (`#84`), i.e. DCN register writes. QEMU has no
+# amdgpu, so that site is UNREACHABLE off iron and the function would otherwise reach hardware having never
+# once run. This calls it directly, on a substrate that has a disk, and asserts the count and the CR3.
+klug_spill_scanout_test();
+#endif
+
 #ifdef ATOM_MATH_SELFTEST
 # H6 (gpu.md, modeset arc) — the ATOM DIV32/MUL32 unit sweep against the atom-interp.py oracle.
 #

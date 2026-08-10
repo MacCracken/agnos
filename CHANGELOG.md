@@ -22,6 +22,53 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.42] — 2026-08-08 — cycle OPEN: ⛔ PS/2 IS DELETED, and the xHCI HID drain becomes a dispatcher
 
+### Added — a full-screen app's log now reaches the DISK when it exits, because nobody could ever see it
+
+⛔⛔ **A failed desktop run was unreadable by construction.** A process that owns the scanout draws over the
+console, so every line it printed — and every kernel line printed while it ran — landed on a surface nobody
+was looking at. `klug_spill()` was called only from the boot, modeset and GPU-arc paths, so the desktop had
+**no spill site at all**: the 2026-08-09 burn printed `spawn_path_env FAILED` twice into a ring that reached
+no disk and produced no evidence of any kind. ⚠ And there is no interactive recovery on this hardware — the
+iron target *is* the dev host, so booting agnos reboots the machine any log would be read on; by the time
+anyone can look, RAM is gone. Evidence must reach the disk while the run is live or it does not exist.
+
+⇒ `klug_spill_covered_console()`, called from `gpu_release_pid`. That function's existing ownership test is
+exactly the right gate and costs nothing to reuse: reaching it means this pid **held the scanout**. It fires
+once per full-screen app exit, never on a shell command, and covers **both** ways out — `exit#0` and
+`fault_kill_current` both route through it, so a crashed compositor gets it free. ⛔ Boot CR3 for the disk
+write, restored after: the live CR3 at the call site is the dying process's, under which the NVMe BAR is not
+mapped. Reports the byte count, because a silent spill returning 0 leaves `/klug.txt` holding a STALE BOOT —
+the "looks fine, is wrong" failure the whole mechanism exists to prevent.
+
+⛔ **Factored into `klug.cyr` rather than left inline, and that is the load-bearing decision.**
+`gpu_scanout_pid` is set only by `gpu_blit_present` (`#84`, DCN register writes), so the production call site
+is **unreachable in QEMU** — inline, this code would have flown to iron with zero executions, exactly how the
+window mover shipped as dead code and how the GPU cursor first ran on a burn. New
+`KLUG_SPILL_SCANOUT_TEST=1` calls it directly at boot: **PASS in QEMU, 2945 bytes spilled**, box boots on to
+the prompt. ⭐ **Mutation-verified** — forcing the count to 0 turns it red. ⚠ The test's CR3 assertion is
+honestly weak (at boot the entry CR3 already *is* boot CR3); the byte count is what it proves.
+
+### Fixed — a full process table refused every spawn in SILENCE, and it took down the desktop on iron
+
+⛔⛔ `proc_alloc_slot()` caps at **16** processes (`proc.cyr:275`) and returned **−1 with no diagnostic** —
+from four call sites, through `elf_load_from_file`, out of `spawn_path #43`, all mute. The only thing that
+ever spoke was the CALLER: aethersafha printing `spawn_path_env FAILED`, which names the symptom and not
+one word of the cause. ⇒ On the 2026-08-09 iron burn the desktop came up, drew its chrome and **hosted
+nothing**, with no line anywhere saying why — reported as *"just FB lines"*.
+
+⚠ **Nothing reaps an orphan.** A parent that exits without closing its children leaves them alive holding
+their process-table rows for the rest of the boot, so repeated desktop launches march the count to the cap
+in four cycles. The compositor half of that is fixed in aethersafha (`comp_close_all_clients`); this is the
+kernel half — **an absent resource must say it is absent and why**, the rule that already produced
+`hda: ctl1 NOT PROBED` and `gpu_hdmi_preflight`'s self-naming early returns.
+
+⇒ Latched, two lines: *"the process table is full and this spawn was refused"* and *"nothing reaps a
+process whose parent exited without closing it"*. ⚠ **Latched and deliberately uncounted** — the first
+refusal is the one that explains the boot, and an unlatched print inside an allocation failure is a storm
+waiting for a caller that retries. Reproduced and confirmed in QEMU by
+`AE_CLIENTS_MODE=relaunch` (new mode in `harness/aethersafha-clients-test.py`), which runs the operator's
+five-step sequence and then relaunches until something breaks: **#4 before the fixes, 8/8 clean after**.
+
 ### Fixed — `hid_poll` and `hid_mouse_take` are serialised; `cli` was never a lock on four CPUs
 
 ⛔⛔ `hid_poll` has two callers that can run simultaneously — the `#98 ptrscan` / `#42 kbscan` syscall arms

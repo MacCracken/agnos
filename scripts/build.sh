@@ -542,6 +542,11 @@ else
         # wraps (QEMU ~2.5 KB, iron ~16-20 KB, ring 64 KB), so this branch is otherwise untested and its
         # failure mode is a silently ROTATED log. Implies KLUG_SPILL_SELFTEST.
         [ -n "$KLUG_SPILL_WRAPTEST" ] && echo '#define KLUG_SPILL_WRAPTEST'
+        # KLUG_SPILL_SCANOUT_TEST=1 — exercise for klug_spill_covered_console(), the spill that fires when a
+        # full-screen app releases the scanout. Its real call site sits behind `gpu_scanout_pid`, which only
+        # `gpu_blit_present` (#84, DCN writes) sets — so on QEMU it is unreachable and the code would ship to
+        # iron unexecuted. This runs it at boot and asserts a non-zero byte count AND that CR3 was restored.
+        [ -n "$KLUG_SPILL_SCANOUT_TEST" ] && echo '#define KLUG_SPILL_SCANOUT_TEST'
         # MODESET_LATCH_SELFTEST=1 — H2: arm the latch and enter a SYNTHETIC risky step that wedges
         # (cli;hlt;jmp $), placed LATE per the S12 placement rule. Boot the SAME binary twice on the SAME
         # disk: boot 1 arms and wedges, boot 2 must find the latch and REFUSE. Boot 2 must be byte-identical
