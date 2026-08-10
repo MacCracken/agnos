@@ -299,6 +299,15 @@ try:
         except OSError: return ""
     km = {' ': 'spc', '\n': 'ret', '-': 'minus', '.': 'dot', '/': 'slash', '&': 'shift-7'}
     def typ(word, settle=2.0):
+        # ⛔⛔ PRIME WITH A BARE ENTER FIRST — THE FIRST CHARACTER GETS DROPPED. Measured 2026-08-09: the
+        # harness typed `aethersafha --clients &` and agnsh received `ethersafha --clients &`, did not
+        # recognise it, handed it to the intent parser ("Intent: 15") and the compositor never launched —
+        # reported as `launched: False`, which reads as a code failure and is a TYPING failure. The drop is
+        # in the first keystroke after the prompt appears (the HID path is still settling), so spending a
+        # throwaway Enter on it costs one redrawn prompt and makes every command land whole.
+        # ⚠ This bit `desktop` mode too; it had simply been getting away with it.
+        s.sendall(b"sendkey ret\n")
+        time.sleep(0.35); drain()
         for ch in word:
             key = km.get(ch, ch)
             if ch.isupper(): key = "shift-" + ch.lower()
