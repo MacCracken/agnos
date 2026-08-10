@@ -823,6 +823,51 @@ try:
         SHOT_CLOSED = os.path.join(WORK, "close-after.ppm")
         s.sendall((f"screendump {SHOT_CLOSED}\n").encode()); time.sleep(3.0); drain()
         p(f"  shot: {SHOT_CLOSED} (compare with move-after — the window should be GONE, not doubled)")
+
+        # ⭐⭐ RELAUNCH AFTER A FULL TEARDOWN — the operator's exact iron sequence, 2026-08-09:
+        # *"f4 both clients... esc out of ae; ae launch and all i got was fb text"*, and on that boot it
+        # went on to take the machine down.
+        #
+        # ⛔ NO OTHER MODE REACHES THIS. `both` runs the desktop twice but each run self-terminates on its
+        # own budget with its clients still attached — it never CLOSES the clients first, and closing is
+        # what releases their `#86` shm slots and `#97` channel ends. A second launch that comes up with a
+        # console and no composited desktop is the leaked-resource signature 0.12.0 had, and the only way
+        # to see it is to tear the first one down the way a person does.
+        # ⚠ "fb text and nothing else" is the DIAGNOSTIC: the compositor's startup lines reach the console
+        # while nothing is composited, which means it ran and could not draw — not that it failed to start.
+        rl_mark = len(ser())
+        p("")
+        p("=== RELAUNCH AFTER TEARDOWN (esc out, then run it again) ===")
+        key_raw("esc", hold_ms=200)
+        time.sleep(3.0); drain()
+        typ("aethersafha\n", settle=2.0)
+        time.sleep(25.0); drain()
+        rl = ser()[rl_mark:]
+        rl_up      = rl.count("aethersafha: desktop up")
+        rl_present = rl.count("aethersafha: setu client presented surface")
+        rl_gpu     = ("chrome fills are on the GPU" in rl)
+        rl_arrow   = ("the pointer is a real arrow" in rl)
+        rl_noslot  = ("no graphics-visible slot" in rl)
+        rl_spawn   = rl.count("client spawned on a placed channel")
+        rl_mintfail= ("chan_mint FAILED" in rl) or ("chan_endow FAILED" in rl)
+        p(f"  second 'desktop up'        : {rl_up}")
+        p(f"  clients spawned            : {rl_spawn}")
+        p(f"  clients presented          : {rl_present}")
+        p(f"  chrome on the GPU          : {rl_gpu}")
+        p(f"  cursor on the shader cores : {rl_arrow}")
+        p(f"  ⛔ no graphics-visible slot : {rl_noslot}")
+        p(f"  ⛔ chan mint/endow FAILED   : {rl_mintfail}")
+        SHOT_RELAUNCH = os.path.join(WORK, "relaunch.ppm")
+        s.sendall((f"screendump {SHOT_RELAUNCH}\n").encode()); time.sleep(3.0); drain()
+        if rl_up and rl_present >= 2 and rl_gpu:
+            p("  ⭐ THE SECOND DESKTOP CAME UP FULLY — no resource leaked across the teardown.")
+        else:
+            p("  ⛔ THE SECOND LAUNCH DID NOT COME UP CLEAN. Read the lines above in order:")
+            p("     no 'desktop up'      -> it never started (spawn/exec, not a leak)")
+            p("     up but 0 presented   -> channels or shm did not come back from the first run")
+            p("     presented but no GPU -> the compositing path lost its slot; CPU frames with the")
+            p("                             #39 blit gone is exactly 'fb text and nothing else'")
+        p(f"  shot: {SHOT_RELAUNCH}")
     if MODE == "armed":
         # ⭐ THE ARMED-STATE TEST, and the reason every other mode in this file was blind to a real
         # kernel defect: they all launch the compositor as the FIRST command of the boot.
