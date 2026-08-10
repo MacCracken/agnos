@@ -12074,6 +12074,68 @@ fn gpu_hdmi_program_infoframes(d, az) {
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d, ifc | GPU_AFMT_AUDIO_INFO_UPDATE);
 }
 
+# gpu_hdmi_asp_probe — read the DIG packet block IN DIG_MODE=3 WITH THE FEED LIVE, and say what each value
+# should be. Call it from inside the audio arm's listening window, nowhere else.
+#
+# ⛔⛔ WHY THIS EXISTS, AND WHY EVERY PRIOR REGISTER COMPARISON IN THIS ARC MISSED IT. Every `HDMI_*`
+# register is **inert while `DIG_MODE == 2`**, and agnos's boot-time `gpu: audio probe` runs at boot — where
+# `dig1 ... mode=2`, as the 2026-07-24 M9 capture records in its own log. The mode-3 flip happens LATER, in
+# the arm, and **nothing ever re-read the packet block afterwards.** ⇒ The arc's whole register corpus,
+# including the "every AFMT register is byte-identical to a working amdgpu" claim, was taken against a block
+# that was switched off. Byte-identical INERT registers say nothing about the HDMI packet path.
+# [[feedback_audit_re_derive_dont_validate_comments]]
+#
+# The comparison values are DIG1 on a **playing** amdgpu link, from
+# `agnosticos/docs/development/prior-art/dcn-audio-known-good-full-0716.txt`. ⚠ Read DIG**1** there, not
+# DIG0 — DIG0 is the unused encoder and its block is idle, so comparing against it would "confirm" silence.
+#
+# ⛔ THE NULL IS CALIBRATED IN THE OUTPUT, because this block's one status bit cannot do it alone:
+# `HDMI_AUDIO_PACKET_ERROR` reads 0 both when packets flow cleanly AND when none are attempted. Saying so in
+# the log is the difference between an instrument and twelve mute burns of green gates.
+# [[feedback_instrument_discipline]]
+fn gpu_hdmi_asp_probe() {
+    # ⛔ GUARD THE STRIDE, DO NOT TRUST THE CALLER. `gpu_audio_dig` is **−1** until `GPU_AUDIO_PROBE` sets
+    # it, and that has been the single most expensive fact in this arc — every HDMI-audio burn since 1.56.25
+    # was VOID because the flag was missing and nothing said so. A −1 here multiplies into a NEGATIVE stride
+    # and turns a read-only diagnostic into wild MMIO at an address nobody chose. Refuse, and NAME the
+    # reason, because a probe that prints plausible garbage is worse than one that prints nothing.
+    if (gpu_audio_dig < 0) {
+        kprintln("gpu: ASP probe REFUSED -- no audio DIG; this kernel lacks GPU_AUDIO_PROBE", 73);
+        return 0;
+    }
+    var d  = gpu_audio_dig * GPU_DCN_DIG_STRIDE;
+    var db = gpu_audio_dig * GPU_DCN_DIG_STRIDE;
+    var bec = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db);
+    var mode = (bec & GPU_DIG_MODE_MASK) >> GPU_DIG_MODE_SHIFT;
+    kprintln("gpu: ASP EGRESS PROBE -- the packet block, read in mode 3 with the feed live", 76);
+    kprint("gpu:   DIG_MODE now ", 20); kprint_num(mode);
+    kprintln("  -- want 3. A reading taken in mode 2 is VOID: the HDMI block is inert there", 77);
+    kprint("gpu:   HDMI_AUDIO_PACKET_CONTROL ", 33);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d));
+    kprintln("  amdgpu playing: 10", 20);
+    kprint("gpu:   HDMI_ACR_PACKET_CONTROL ", 31);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_PACKET_CONTROL + d));
+    kprintln("  amdgpu playing: 11000 (ACR_AUTO_SEND)", 39);
+    kprint("gpu:   HDMI_INFOFRAME_CONTROL0 ", 31);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d));
+    kprintln("  amdgpu playing: 10 (AUDIO_INFO_SEND)", 38);
+    kprint("gpu:   AFMT_AUDIO_PACKET_CONTROL ", 33);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d));
+    kprintln("  amdgpu playing: 801 (SAMPLE_SEND)", 35);
+    kprint("gpu:   AFMT_AUDIO_INFO0 ", 24);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_INFO0 + d));
+    kprintln("  amdgpu playing: 170", 21);
+    kprint("gpu:   AFMT_STATUS ", 19);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_STATUS + d));
+    kprintln("  amdgpu playing: 40000010", 26);
+    var hs = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_STATUS + d);
+    kprint("gpu:   HDMI_STATUS ", 19); kprint_hex(hs);
+    kprintln("  amdgpu playing: 0", 19);
+    kprint("gpu:   packet-error bit ", 24); kprint_num((hs >> 16) & 1); kprintln("", 0);
+    kprintln("gpu:   a ZERO there does NOT mean packets flow -- it is also what never-attempted reads", 87);
+    return 0;
+}
+
 fn gpu_hdmi_audio_enable(phy) {
     gpu_hdmi_audio_on = 0;
     if (gpu_hdmi_preflight() != 1) {

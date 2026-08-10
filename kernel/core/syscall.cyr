@@ -6545,6 +6545,11 @@ fn mdo_transmit_run(arm) {
     # announce both edges of it, then restore the inherited signalling so the console returns. The listen
     # happens where the code controls it instead of after the prompt, which also removes the "how long do I
     # wait" ambiguity from the burn card.
+    # ⛔ READ THE PACKET BLOCK HERE, AND ONLY HERE. This is the one moment in the whole arc where
+    # `DIG_MODE`=3 and the feed are simultaneously live — the boot-time `gpu: audio probe` runs in mode 2,
+    # where every `HDMI_*` register is inert, which is why "byte-identical to amdgpu" was never evidence
+    # about the packet path. Before the hold, so the values are the ones the listening window is made of.
+    gpu_hdmi_asp_probe();
     kprintln("modeset: >>> LISTEN NOW -- HDMI live, feed running, 12 s <<<", 60);
     gpu_dcn_hold_ms(12000);
     kprintln("modeset: <<< listening window CLOSED -- restoring inherited signalling >>>", 74);

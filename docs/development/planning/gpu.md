@@ -383,6 +383,105 @@ fixed 512 B while `ws_count` is a u8 (max 255), so a table with `ws_count > 128`
 - **⛔⛔ THE STANDING FINDING A RESUMPTION STARTS FROM: the sink REJECTS agnos's HDMI signalling outright.** `DIG_MODE`=3 ⇒ no signal for the
     whole run; `DIG_MODE`=2 ⇒ the panel relights every time, everything else identical. A dropped link cannot carry audio, so that is likely
     upstream of the entire audio question.
+    **⛔⛔⛔ FALSIFIED 2026-08-10 BY OUR OWN CAPTURE — DO NOT RESUME FROM THIS BULLET.** It is kept, struck,
+    because it stated the premise a resumption was told to start from, and a deleted premise gets
+    re-derived. `DIG_MODE`=3 **is achieved and it HOLDS**; see the capture-read below.
+
+### ⚖ AUDIT 2026-08-10 (agnos 1.56.43, ZERO burns) — what survives the park, and the one thing that must be settled first
+
+Ordered by how much it changes the next action.
+
+1. ⛔⛔ **THE RECORD CONTRADICTS ITSELF ON THE EXACT QUESTION A RESUMPTION STARTS FROM.** Two load-bearing
+   claims about `DIG_MODE`=3, on the same sink, cannot both be unconditionally true:
+   - the **standing finding** (above): *"`DIG_MODE`=3 ⇒ **no signal** for the whole run"*;
+   - the **2026-07-14 green screen**, labelled in §1.10 as *"this arc's single most load-bearing positive
+     result"*: *"**DIG_MODE=3 took**, the DIP engine runs, the AVI egresses, the sink treats the link as
+     HDMI."*
+
+   A panel rendering **GREEN/PINK is a lit panel decoding a signal**; *"no signal for the whole run"* is the
+   absence of one. ⇒ Either the sink accepts HDMI mode under conditions the pessimistic run did not have, or
+   one of the two is misattributed.
+   **This is not academic — it decides which arc gets resumed.** Parked pointing at the pessimistic claim, a
+   resumption hunts a link-mode rejection the other result says does not exist, while the gap this document
+   already flags goes unexamined: *"AVI InfoFrames and Audio Sample Packets come from DIFFERENT generators
+   … so 'AVI egresses' does NOT prove 'ASPs egress'."* If DIG_MODE=3 does take, **that** sentence is the
+   whole remaining question.
+   ✅ **SETTLED THE SAME DAY, FROM THE CAPTURES, ZERO BURNS — and the pessimistic claim LOSES.**
+   `prior-art/dcn-modeset-m9-audio-arm-iron-0724.txt` records the whole sequence, twice (once per arm):
+
+   ```
+   208: modeset: transmit -- DIG_MODE 2 -> 3 (HDMI signalling live; audio arm)
+   281: atom w=566f v=10030200            <- ENABLE writes it, still mode 3
+   284: atom w=566f v=10020200            <- ATOM #76 reverts it to mode 2 by itself
+   333: modeset: transmit -- DIG_MODE re-asserted to 3 after #76 (ATOM reset it to 2)
+   339: modeset: transmit -- DIG_MODE 2 -> 3        (arm 1 final)
+   488: modeset: transmit -- DIG_MODE 3 -> 3        (arm 2 — it was ALREADY 3)
+   ```
+
+   ⭐⭐⭐ **`DIG_MODE 3 -> 3` at line 488 is the whole answer: mode 3 was set, ATOM knocked it down, agnos
+   re-asserted it, and it HELD across the rest of the run into the second arm.** The panel did not go away —
+   the operator ran both arms and captured `klug` afterwards. ⇒ **The sink does not reject agnos's HDMI
+   signalling.** The link has been in HDMI mode on agnos since 2026-07-24.
+   ⭐ Corroborating both directions: amdgpu-playing writes `0x566f = 0x10030200` (mode 3) four times in
+   `amdgpu-hdmi-modeset-writes-0717.txt`, and every known-good dump reads `DIG1_DIG_BE_CNTL 0x10030200`;
+   agnos's *inherited GOP* state is `0x10020200` (mode 2), which is what the arc kept measuring before the
+   flip existed. **The green-screen result is consistent with the captures; the "no signal" claim is not.**
+
+   ⚠⚠ **AND NOTE WHICH RUN PROVED IT: M9 — the retracted null experiment.** Its *ear* result is void and
+   stays void (both arms fed digital silence). Its **register trace is a different oracle** — direct MMIO
+   readbacks — and is untouched by that retraction. ⇒ **Scope a retraction to the evidence it actually
+   killed.** M9's audio conclusion was worthless; M9's `DIG_MODE` trace is the thing that unblocks the arc,
+   and it sat unread for two weeks inside a capture labelled "null". [[feedback_retract_the_evidence_not_the_mechanism]]
+
+   ⚠ **Neither prose claim was ever written into the burn ledger.** The green screen has no entry and no
+   capture; "no signal for the whole run" has no entry either. Both lived only as summary sentences here,
+   and the arc was parked pointing at whichever one got written last. **A finding that is not in the ledger
+   cannot be adjudicated later** — which is this repo's own standing rule, applied to a *conclusion* rather
+   than a burn.
+
+2. ✅ **The leg's code survived nine cycles of desktop work, intact.** Every symbol the parked playbook
+   needs is present and still referenced: `MDO_OP_CRCCAL` + `mdo_crccal()` (`syscall.cyr`),
+   `hda_hdmi_feed_running()` (`hda.cyr`), `gpu_hdmi_audio_enable` / `gpu_hdmi_preflight` (`gpu.cyr`), the
+   `--audio-pre` / `--audio-post` / `--crccal` arms (`tests/gpu/modeset.cyr`), and **`CRCCAL_REQUIRE` is
+   still asserted at prep time** in `burn-prep.sh`. Nothing needs rebuilding to resume.
+
+3. ✅ **The PS/2 excision did NOT break the audio feed** — worth checking, because `pic.cyr` is the file
+   that arc rewrote and it names `HDA_TONE`. `hda_stream_service()` is called from the **timer ISR** as a
+   polled drain (`pic.cyr:73`, *"polled, no IRQ, like the NIC drain"*), so `pic_init`'s 0xFC→**0xFF** mask
+   cannot reach it. The refill path is intact.
+
+4. ⭐ **The native-modeset arc did NOT invalidate the transmitter findings, and this was the real risk.**
+   1.56.36/37/38 rewrote the display bring-up *after* the audio work was parked, so every register reading
+   this leg reasoned about was taken in a different boot state. **It does not matter, and the 2026-08-10
+   capture proves it with no burn spent**: the link is reported **identically before and after** the modeset
+   — `display link 2560x1440 total 2720x1481 blanking 160x41` at both line 123 (pre) and line 165 (post) —
+   at `pixel clock 241503 kHz`, the same 241.5 MHz the whole arc reasoned about. What native changed is the
+   **SCANOUT SURFACE** (800x600 pitch 832 → 2560x1440 pitch 2560, scaler bypassed); the **LINK was always
+   native** because the panel is. ⇒ Every transmitter / PHY / CTS / ACR finding in §2.3 stands unamended.
+
+5. ⚠ **The Audio InfoFrame is driven, so "the sink mutes because no AIF arrives" is NOT a free explanation.**
+   The physical model above requires AIF 0x84 (*"a sink receiving ASPs with no AIF MUST MUTE"*), and
+   `gpu.cyr` does set `AFMT_AUDIO_INFO_UPDATE` on `AFMT_INFOFRAME_CONTROL0` at three sites and gates on
+   `AFMT_AUDIO_INFO0 == STEREO`. ⚠ But every `HDMI_*`/`AFMT_*` packet register is **inert while
+   `DIG_MODE==2`** (§ the exhausted-classes table), so this says nothing until item 1 is settled — it only
+   removes a candidate that would otherwise look attractive on resumption.
+
+**⇒ VERDICT after the capture-read (2026-08-10, zero burns): THE LEG IS UNBLOCKED, AND THE QUESTION HAS
+CHANGED.**
+
+- ⛔ **RETIRED as a candidate: "the sink rejects HDMI signalling."** Falsified by our own M9 capture. The
+  link runs `DIG_MODE`=3 and holds it. **Do not spend a burn on link mode.**
+- ⇒ **THE REMAINING QUESTION IS THE ONE THIS DOCUMENT ALREADY WROTE DOWN**: *"AVI InfoFrames and Audio
+  Sample Packets come from DIFFERENT generators … so 'AVI egresses' does NOT prove 'ASPs egress'."* The link
+  is HDMI, the AVI is honoured, the samples reach the AFMT output tap — and no ASP has ever been shown to
+  leave the encoder. **That gap, not the link, is the arc.**
+- ⭐ **The three surviving candidates should be re-scoped accordingly.** (a) sequencing and (b) a write that
+  does not latch both now mean *within the packet path*, not *within link bring-up*; (c) the bare-metal
+  environment is unchanged. The register-poke class stays exhausted.
+- ⚠ **The parked playbook's value has shifted.** Its flag set, blinded-band protocol, negative control and
+  one-boot rule all still stand and must be carried. But `--crccal` calibrates the **AFMT output tap**,
+  which is already known-good and already proven flow-gated — so it measures upstream of where the question
+  now lives. **A resumption should instrument ASP EGRESS, not re-calibrate the tap.**
 - **THE REQUIRED FLAG SET for any HDMI-audio burn, discovered one burn at a time:** `HDA_HDMI` (gates the instance-1 HDA controller probe —
     without it there is no HDMI controller, no codec, nothing to bind to) **+ `HDMI_ATOM`** (gates the `gpu_hdmi_audio_enable` CALL SITE) **+
     `GPU_AUDIO_PROBE`** (the ONLY thing that sets `gpu_audio_dig`; unset ⇒ it stays −1 ⇒ silent refusal forever, whatever the hardware does) **+

@@ -20,7 +20,93 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
-## [1.56.42] — 2026-08-08 — cycle OPEN: ⛔ PS/2 IS DELETED, and the xHCI HID drain becomes a dispatcher
+## [1.56.43] — 2026-08-10 — cycle OPEN: the HDMI-audio leg, reviewed and audited toward a verdict
+
+⏸ **Opened for the audio leg, which has been PARKED under operator hold since 2026-08-07.** The desktop arc
+closed with 1.56.42 and its forward work moved into aethersafha's own roadmap (M6, userland), so the kernel's
+next question is the one that has been waiting longest: **HDMI audio has never made a sound on this box.**
+
+⚠ **Nothing is being re-derived here.** The parked playbook in agnosticos `iron-log.md` cost four burns to
+produce — the required flag set (`HDA_HDMI` + `HDMI_ATOM` + `HDA_TONE` + `GPU_AUDIO_PROBE`) and the
+pre-registered outcome table — and it stands. This cycle is a **review and audit first**: establish what is
+actually proven, what is falsified, and what is merely untested, before spending another boot.
+
+### Audited — the HDMI-audio leg, zero burns. Full findings in `planning/gpu.md` §2.3.
+
+⛔⛔ **The blocking finding is a CONTRADICTION IN OUR OWN RECORD, not a hardware unknown.** Two load-bearing
+claims about `DIG_MODE`=3 on the same sink cannot both be unconditionally true: the *standing finding a
+resumption starts from* says **`DIG_MODE`=3 ⇒ no signal for the whole run**, while the 2026-07-14 green
+screen — labelled *"this arc's single most load-bearing positive result"* — says **DIG_MODE=3 took and the
+sink honoured agnos's AVI InfoFrame.** A panel rendering green/pink is a lit panel decoding a signal.
+⇒ The leg is parked pointing at the pessimistic one, so a resumption would hunt a link-mode rejection the
+other result says does not exist — while the gap the document itself flags (*"AVI egresses does NOT prove
+ASPs egress"*, different generators) goes unexamined. ⭐ **Settle it from the captures, not a boot**; both
+events are on disk. A live candidate needing no sink theory at all: ATOM **`#76` ENABLE resets `DIG_MODE`
+back to 2 itself**, which alone yields "mode 3 never held".
+
+**What the audit cleared, so a resumption does not re-derive it:**
+- ✅ **The code survived nine cycles of desktop work.** `MDO_OP_CRCCAL` + `mdo_crccal()`,
+  `hda_hdmi_feed_running()`, `gpu_hdmi_audio_enable`/`_preflight`, the three `modeset` arms, and
+  `CRCCAL_REQUIRE` still asserted in `burn-prep.sh`. Nothing needs rebuilding.
+- ✅ **The PS/2 excision did not break the feed.** `hda_stream_service()` runs from the **timer ISR** as a
+  polled drain (`pic.cyr:73`), so `pic_init`'s 0xFC→**0xFF** mask cannot reach it. Checked because `pic.cyr`
+  is the file that arc rewrote and it names `HDA_TONE`.
+- ⭐ **The native-modeset arc did not invalidate the transmitter findings — and that was the real risk**,
+  since 1.56.36/37/38 rewrote the display bring-up *after* the audio work was parked. The 2026-08-10 capture
+  settles it for free: the link reads **identically before and after** the modeset (`display link 2560x1440
+  total 2720x1481 blanking 160x41`, `pixel clock 241503 kHz`). Native changed the **scanout surface**, not
+  the **link** — the link was always native, because the panel is.
+- ⚠ **The Audio InfoFrame is driven** (`AFMT_AUDIO_INFO_UPDATE` at three sites), so *"the sink mutes because
+  no AIF arrives"* is not available as a free explanation on resumption.
+
+⇒ **The capture-read was done the same day. See below.**
+
+### Fixed — the standing finding was FALSIFIED by our own capture, and the arc's question changed
+
+⭐⭐⭐ **`DIG_MODE`=3 IS ACHIEVED AND IT HOLDS.** `prior-art/dcn-modeset-m9-audio-arm-iron-0724.txt`, twice
+(once per arm): `DIG_MODE 2 -> 3` → ATOM `#76` reverts it (`w=566f v=10020200`) → agnos **re-asserts 3** →
+**`DIG_MODE 3 -> 3`** in the second arm, panel alive, both arms run, `klug` captured after. ⇒ **The sink
+does not reject agnos's HDMI signalling.** Corroborated: amdgpu-playing writes `0x566f = 0x10030200` four
+times; agnos's *inherited GOP* state is `0x10020200`, which is what the arc kept measuring before the flip
+existed.
+⚠⚠ **The run that proves it is M9 — the retracted null experiment.** Its ear result stays void (both arms
+fed digital silence); its **register trace is a different oracle** and is untouched by that retraction. The
+evidence that unblocks the arc sat unread for two weeks inside a capture labelled "null". ⇒ **Scope a
+retraction to the evidence it actually killed.**
+⚠ Neither prose claim was ever in the burn ledger — no entry, no capture, for either — so the arc was
+parked pointing at whichever was written last.
+
+### Added — `gpu_hdmi_asp_probe()`: the packet block, read in mode 3 with the feed live
+
+⛔⛔ **The instrument gap, stated plainly: no register comparison in this arc was ever taken with the HDMI
+block switched ON.** `gpu: audio probe` runs at **boot**, where M9's own log records `dig1 … mode=2`, and
+every `HDMI_*` register is **inert while `DIG_MODE == 2`**. The mode-3 flip happens later, inside the arm,
+and nothing re-read the packet block afterwards. ⇒ The corpus behind *"every AFMT register is byte-identical
+to a working amdgpu"* was measured against a block that was off.
+
+⇒ New probe called from **inside the audio arm's listening window** — the one moment mode 3 and the feed are
+simultaneously live. It prints `HDMI_STATUS`, `HDMI_AUDIO_PACKET_CONTROL`, `HDMI_ACR_PACKET_CONTROL`,
+`HDMI_INFOFRAME_CONTROL0`, `AFMT_AUDIO_PACKET_CONTROL`, `AFMT_AUDIO_INFO0` and `AFMT_STATUS`, **each with
+its known-good amdgpu-playing value inline**, so a mismatch names itself instead of needing a diff.
+⚠ The comparison values are **DIG1** from `dcn-audio-known-good-full-0716.txt` — DIG0 is the *unused*
+encoder and its block is idle, so comparing against it would "confirm" silence.
+⛔ **The NULL is calibrated in the output**: `HDMI_AUDIO_PACKET_ERROR` reads 0 both when packets flow
+cleanly and when none are attempted, so the probe says so rather than letting a 0 read as good news.
+⛔ **Guarded on `gpu_audio_dig < 0`** — it is −1 without `GPU_AUDIO_PROBE`, which would multiply into a
+negative stride and turn a read-only diagnostic into wild MMIO. It refuses and names the missing flag.
+⚠ **Not yet executed anywhere**: QEMU has no AMD device, so the arm refuses before reaching it. Its kprint
+lengths are gated by `check.sh` (which caught one off-by-one on the way in); its register reads run first on
+iron.
+
+### Reviewed — what the audit cleared, so a resumption does not re-derive it
+
+## [1.56.42] — 2026-08-08 — ⛔ PS/2 IS DELETED, the pointer lands, and a covered console stops losing its log (RELEASED)
+
+⭐ **Closed 2026-08-10.** What the cycle turned out to be, beyond the PS/2 excision it opened for: the
+`AE-7` pointer's whole kernel half (`#98 ptrscan`, per-endpoint mouse binding, the `hid_poll` try-lock), a
+process table that **names** its own exhaustion instead of refusing in silence, and a full-screen app's log
+finally reaching the disk. All four burned PASS on archaemenid — the last of them four compositor launches
+in one boot, with the spill verified byte-exact off the partition.
 
 ### Added — a full-screen app's log now reaches the DISK when it exits, because nobody could ever see it
 
@@ -358,7 +444,7 @@ included ahead of the chan state, so the fix belongs at the `SYS_CLOSE` dispatch
 
 ---
 
-## [1.56.40] — 2026-08-05 — the local-IPC channel band (cycle OPEN)
+## [1.56.40] — 2026-08-05 — the local-IPC channel band (RELEASED)
 
 Scope: the desktop arc's remaining architectural item — replacing TCP-on-loopback as the display
 control transport with a kernel-owned channel band on `#97`. Design, twelve-bite migration and kill
