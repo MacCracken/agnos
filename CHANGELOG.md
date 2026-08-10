@@ -48,6 +48,28 @@ window mover shipped as dead code and how the GPU cursor first ran on a burn. Ne
 the prompt. ⭐ **Mutation-verified** — forcing the count to 0 turns it red. ⚠ The test's CR3 assertion is
 honestly weak (at boot the entry CR3 already *is* boot CR3); the byte count is what it proves.
 
+⭐⭐⭐ **BURNED PASS 2026-08-10 — it ran at its production site, on iron, first execution anywhere**, on all
+four compositor exits of one boot: **11065 → 13924 → 18346 → 21809 bytes**. ⭐ Externally corroborated: the
+operator's own `klug` ring dump came out **21962 B**, the last spill plus the lines emitted after it, and the
+monotone growth is what an unwrapped boot-cumulative ring should show. **No wedge at Esc** — the boot-CR3
+window was the one genuinely new risk in that path.
+⭐⭐⭐ **AND THE FILE IS VERIFIED EXACT.** Pulled off the agnos-fs partition from Linux: `/klug.txt` holds
+**21809 bytes — the printed number to the byte** — and they are **BIT-IDENTICAL** to the first 21809 of the
+independently-captured `klug` ring dump. The dump's 153-byte remainder is precisely the three lines emitted
+*after* the write returned (the `spilled …` line itself among them), which is the documented property: the
+count line lands in the ring after the write, so it is correctly absent from the rescued file.
+⚠ Both channels read the same ring, so what this proves is the **write path** — an ext2/NVMe write under
+boot CR3 landing exactly the bytes it claimed — not the ring's own fidelity, which is klug's pre-existing
+property. ⚠ The file is 65536 B (21809 log + 43727 NUL): `klug_spill_prepare` pre-allocates the full ring
+size and a spill overwrites only the first N, so there is **no truncation and no length marker** and a
+reader must strip the tail.
+⭐ **The latch-blocked redirect paid off for real, unplanned.** The burn left the modeset latch armed, so the
+next boot came up blocked and `klug_spill_prepare`'s H2/S7 branch spilled it to **`/klug-2.txt`** instead.
+Prepare writes 64 KB over its target at every mount — without that branch the next boot would have destroyed
+the burn record before anyone looked for it. ⇒ **Pull both files after a burn.**
+⚠ The hook is `gpu_release_pid`, so this covers a run that EXITS — a compositor that WEDGES never reaches it
+and still writes nothing.
+
 ### Fixed — a full process table refused every spawn in SILENCE, and it took down the desktop on iron
 
 ⛔⛔ `proc_alloc_slot()` caps at **16** processes (`proc.cyr:275`) and returned **−1 with no diagnostic** —
@@ -68,6 +90,11 @@ refusal is the one that explains the boot, and an unlatched print inside an allo
 waiting for a caller that retries. Reproduced and confirmed in QEMU by
 `AE_CLIENTS_MODE=relaunch` (new mode in `harness/aethersafha-clients-test.py`), which runs the operator's
 five-step sequence and then relaunches until something breaks: **#4 before the fixes, 8/8 clean after**.
+
+⭐⭐ **BURNED PASS 2026-08-10**: four compositor launches in one boot, two clients presented on every one,
+and this refusal never fired — `proc: the process table is full` is absent from the capture, as is
+`spawn_path_env FAILED`. ⚠ That makes it a **corrected latent path, not an exercised one**: the fix works by
+the table never filling. The diagnostic itself has still only run under a deliberately-exhausted table.
 
 ### Fixed — `hid_poll` and `hid_mouse_take` are serialised; `cli` was never a lock on four CPUs
 
