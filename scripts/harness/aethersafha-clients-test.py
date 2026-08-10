@@ -135,6 +135,46 @@ def cursor_arrow_find(path):
                 return (x0, y0)
     return None
 
+
+# ⭐ Locate a window TITLEBAR in a PPM by its focused-accent underline: a long run of bright cyan that the
+# theme draws along the bottom of the focused window's titlebar and nowhere else. Returns a point INSIDE
+# that titlebar, or None.
+#
+# ⛔ WHY MEASURE INSTEAD OF COMPUTE. The first version of the drag phase aimed at (50, 60) from the
+# compositor's cascade arithmetic (`pcx = 30 + pstep * (w/6)`), and it worked once and then silently missed
+# — the window is not where that formula says, and a missed press reports "says nothing about the release",
+# i.e. the phase quietly stops testing. Deriving the target from the SCREEN cannot drift out of step with
+# the compositor's layout, because it is reading the compositor's own output.
+def find_titlebar(path):
+    try:
+        f = open(path, "rb")
+        if f.readline().strip() != b"P6":
+            return None
+        line = f.readline()
+        while line.startswith(b"#"):
+            line = f.readline()
+        w, h = map(int, line.split())
+        f.readline()
+        data = f.read(w * h * 3)
+    except Exception:
+        return None
+    for y in range(0, h):
+        base = y * w * 3
+        run = 0
+        start = 0
+        for x in range(0, w):
+            o = base + x * 3
+            if data[o] < 80 and data[o + 1] > 150 and data[o + 2] > 150:
+                if run == 0:
+                    start = x
+                run += 1
+                if run > 120:
+                    # A point inside the titlebar: along the accent run, a little ABOVE the underline.
+                    return (start + 40, max(0, y - 10))
+            else:
+                run = 0
+    return None
+
 MODE = os.environ.get("AE_CLIENTS_MODE", "bg")   # "fg" | "bg" | "both" (both = same-boot, interferes)
 
 # ⛔ THE FRAMEBUFFER GATE FOR `desktop` MODE — how many pixels carrying a CLIENT's own colours must
@@ -587,19 +627,75 @@ try:
         drag_mark = len(ser())
         p("")
         p("=== DRAG (press on a titlebar, move, RELEASE) ===")
-        for _ in range(40):                      # slam past the top-left; the clamp makes this absolute
+        # Slam past the top-left: the pointer CLAMPS, which turns relative moves into a known (0,0).
+        for _ in range(40):
             s.sendall(b"mouse_move -100 -60\n"); time.sleep(0.03)
         time.sleep(0.8); drain()
-        s.sendall(b"mouse_move 50 60\n")        # -> (50, 60): inside the first client's titlebar
-        time.sleep(0.8); drain()
-        s.sendall(b"mouse_button 1\n"); time.sleep(0.4); drain()
-        for _ in range(10):                      # drag while held
-            s.sendall(b"mouse_move 9 5\n"); time.sleep(0.08)
-        time.sleep(0.5); drain()
-        s.sendall(b"mouse_button 0\n"); time.sleep(1.2); drain()
+        # Then aim at a titlebar the compositor actually drew, read off the framebuffer.
+        SHOT_AIM = os.path.join(WORK, "aim.ppm")
+        s.sendall((f"screendump {SHOT_AIM}\n").encode()); time.sleep(2.5); drain()
+        tb = find_titlebar(SHOT_AIM)
+        # ⚠ RETRY THE MEASUREMENT. Two runs of the same binary gave different answers — one aimed and
+        # dragged, one found nothing — because the screendump can catch the panel mid-composite or before
+        # the desktop has settled after the slam. A gate that passes intermittently is not a gate: it
+        # teaches you to re-run until green, which is the opposite of an oracle.
+        aim_try = 0
+        while tb is None and aim_try < 3:
+            aim_try += 1
+            time.sleep(2.0)
+            s.sendall((f"screendump {SHOT_AIM}\n").encode()); time.sleep(2.5); drain()
+            tb = find_titlebar(SHOT_AIM)
+            if tb is not None:
+                p(f"  (titlebar found on retry {aim_try} — the first capture caught the panel unsettled)")
+        if tb is None:
+            p("  ⚠ No focused titlebar accent found after 4 captures — cannot aim, skipping the drag.")
+            p("     This says NOTHING about the release edge.")
+        else:
+            p(f"  aiming at titlebar {tb} (measured from the panel, not computed)")
+            tx, ty = tb
+            step = 0
+            while step < tx or step < ty:        # walk there in s8-safe increments from (0,0)
+                mx = min(100, max(0, tx - step))
+                my = min(100, max(0, ty - step))
+                if mx == 0 and my == 0:
+                    break
+                s.sendall((f"mouse_move {mx} {my}\n").encode()); time.sleep(0.05)
+                step += 100
+            time.sleep(0.8); drain()
+            s.sendall(b"mouse_button 1\n"); time.sleep(0.4); drain()
+            for _ in range(10):                  # drag while held
+                s.sendall(b"mouse_move 9 5\n"); time.sleep(0.08)
+            time.sleep(0.5); drain()
+            s.sendall(b"mouse_button 0\n"); time.sleep(1.2); drain()
         dg = ser()[drag_mark:]
         started  = "aethersafha: drag started" in dg
         released = "aethersafha: drag released" in dg
+        # One retry if the press missed: re-measure (the window may have moved) and try the gesture again.
+        if tb is not None and not started:
+            p("  (press missed the titlebar — re-measuring and retrying the gesture once)")
+            s.sendall((f"screendump {SHOT_AIM}\n").encode()); time.sleep(2.5); drain()
+            tb2 = find_titlebar(SHOT_AIM)
+            if tb2 is not None:
+                for _ in range(40):
+                    s.sendall(b"mouse_move -100 -60\n"); time.sleep(0.03)
+                time.sleep(0.6); drain()
+                tx2, ty2 = tb2
+                st2 = 0
+                while st2 < tx2 or st2 < ty2:
+                    mx = min(100, max(0, tx2 - st2)); my = min(100, max(0, ty2 - st2))
+                    if mx == 0 and my == 0:
+                        break
+                    s.sendall((f"mouse_move {mx} {my}\n").encode()); time.sleep(0.05)
+                    st2 += 100
+                time.sleep(0.6); drain()
+                s.sendall(b"mouse_button 1\n"); time.sleep(0.4); drain()
+                for _ in range(10):
+                    s.sendall(b"mouse_move 9 5\n"); time.sleep(0.08)
+                time.sleep(0.5); drain()
+                s.sendall(b"mouse_button 0\n"); time.sleep(1.2); drain()
+                dg = ser()[drag_mark:]
+                started  = "aethersafha: drag started" in dg
+                released = "aethersafha: drag released" in dg
         p(f"  'drag started'  : {started}")
         p(f"  'drag released' : {released}")
         if started and released:

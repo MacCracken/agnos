@@ -22,6 +22,35 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.42] — 2026-08-08 — cycle OPEN: ⛔ PS/2 IS DELETED, and the xHCI HID drain becomes a dispatcher
 
+### Fixed — `hid_poll` and `hid_mouse_take` are serialised; `cli` was never a lock on four CPUs
+
+⛔⛔ `hid_poll` has two callers that can run simultaneously — the `#98 ptrscan` / `#42 kbscan` syscall arms
+in ring 3, and `xhci_rx_handler` in the MSI-X ISR — and it dequeues the shared xHCI event ring and folds
+into a shared accumulator with **no serialisation of any kind**. `pic.cyr`'s claim that this path was
+"self-guarded (input_lock, cli-first)" was **false**: `input_lock` is taken only by `hid_kb_push` and
+`kb_read_scancode` and guards `kb_buf` alone. On SMP, `cli` on one CPU excludes nothing on another, so two
+drains could advance `xhci_evt_ring_idx` over the same event or interleave a read-modify-write on
+`hid_mouse_dx`.
+⇒ `hid_poll_lock`, an `xchg` **TRY**-lock mirroring `input_spin_lock`. Try rather than spin is the safety
+argument: a spin would deadlock the moment the ISR interrupted a holder on the same CPU, which is the
+common case since the syscall arm enables interrupts around its drain. Failing to acquire means another
+context is already draining, so returning is correct rather than lossy.
+⚠ `hid_mouse_take` takes it too. Its banner said "CALLER MUST HOLD IF=0" was sufficient; the syscall runs
+wherever agnsh migrated to while the interrupt lands on another CPU, so a whole report's delta could be
+lost between its read and its reset. The accumulator persists on a failed acquire, so nothing is dropped.
+⚠ The false `pic.cyr` comment is corrected — a comment asserting a lock that does not exist is worse than
+no comment, because the next reader stops looking.
+
+### Fixed — an errored USB transfer re-folded the stale report as phantom motion
+
+⛔ `hid_poll` never checked the Transfer Event completion code. A Transaction Error, Babble, Stall or Data
+Buffer Error still posts a Transfer Event with IOC set — the TRB completed, it just carried no data — and
+leaves the shared report page holding the PREVIOUS successful report. Folding it again re-adds the last
+dX/dY as if the user had moved: a phantom cursor jump on every USB hiccup, of exactly the size of the last
+real motion. `xhci.cyr` checks this code on the command ring; the HID drain did not.
+⇒ SUCCESS (1) and SHORT_PACKET (13) are accepted, everything else folds nothing. ⚠ Short packet must be
+accepted or a boot mouse's 4-byte report on an 8-byte endpoint would be dropped as an error.
+
 ### Fixed — mouse buttons are per-endpoint, so one device cannot release another's
 
 ⛔ `hid_process_mouse_report` assigned the shared `hid_mouse_btn` from whichever interface reported LAST.

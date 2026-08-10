@@ -228,10 +228,20 @@ fn hid_process_mouse_report(report_phys, bi) {
 # `buttons_seen` is what makes a fast click survive a slow frame. A consumer wanting edges compares
 # the two: a bit set in `seen` but clear in `buttons` is a click that already completed.
 #
-# ⚠ CALLER MUST HOLD IF=0. `hid_poll` also runs from the xHCI MSI-X ISR, so the accumulator has an
-# interrupt-context writer; a read-modify-write here with interrupts enabled can lose a whole report.
+# ⚠ THE ACCUMULATOR HAS AN INTERRUPT-CONTEXT WRITER (`hid_poll` also runs from the xHCI MSI-X ISR), so a
+# read-modify-write here must be serialised against it. ⛔ THIS USED TO SAY "CALLER MUST HOLD IF=0" AND
+# THAT WAS NOT ENOUGH: `cli` is per-CPU, and on four CPUs the syscall and the interrupt run on different
+# ones. It takes `hid_poll_lock` itself now and does not rely on the caller for anything.
 fn hid_mouse_take(out) {
     if (out == 0) { return 0; }
+    # ⛔⛔ `cli` IS NOT A LOCK ON FOUR CPUs, and the banner above claimed it was enough. This function
+    # read-modify-writes the same accumulator `hid_process_mouse_report` folds into from the MSI-X ISR;
+    # the syscall runs wherever agnsh migrated to (CPU 1 is routine) while the interrupt is delivered to
+    # CPU 0, so disabling interrupts locally excludes nothing. Interleaved, a whole report's delta is lost:
+    # this side reads `hid_mouse_dx`, the ISR adds to it, and this side then zeroes it.
+    # ⭐ THE SAME TRY-LOCK `hid_poll` OWNS, and try rather than spin for the same reason — failing simply
+    # means the drain is busy, and the accumulator PERSISTS, so the next poll gets the data. Lossless.
+    if (hid_poll_trylock() == 0) { return 0; }
     var idle = 0;
     if (hid_mouse_dx == 0) {
         if (hid_mouse_dy == 0) {
@@ -240,7 +250,7 @@ fn hid_mouse_take(out) {
             }
         }
     }
-    if (idle == 1) { return 0; }
+    if (idle == 1) { hid_poll_unlock(); return 0; }
     store32(out + 0,  hid_mouse_dx);
     store32(out + 4,  hid_mouse_dy);
     store32(out + 8,  hid_mouse_btn);
@@ -251,6 +261,7 @@ fn hid_mouse_take(out) {
     hid_mouse_dx = 0;
     hid_mouse_dy = 0;
     hid_mouse_btn_seen = hid_mouse_btn;
+    hid_poll_unlock();                             # the other exit is the idle branch above
     return 1;
 }
 
