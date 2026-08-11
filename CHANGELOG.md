@@ -97,10 +97,16 @@ negative stride and turn a read-only diagnostic into wild MMIO. It refuses and n
 ⭐⭐⭐ **BURNED 2026-08-10 — it ran, the reading is valid, and it closed the register axis.** `DIG_MODE now 3`
 in both arms. **Seven of eight registers byte-identical to a PLAYING amdgpu link**; the eighth
 (`AFMT_STATUS 41000010` vs `40000010`) is the sticky bit24 residue of the arm's own mute→unmute, which
-amdgpu also shows while still playing — **explained, not a lead.** ⇒ The prior corpus behind *"every AFMT
-register is byte-identical to a working amdgpu"* was taken in **mode 2 where those registers are inert**;
-this is the first measurement that means anything, and it says the packet block is configured exactly like a
-link that plays. **Still silent.** ⛔ The register-poke class is now exhausted **for real**.
+amdgpu also shows while still playing — **explained, not a lead.** ⛔⛔ **RETRACTED THE SAME DAY — the framing above was FALSE.** It claimed the prior corpus was taken in
+mode 2 where those registers are inert, and that this was "the first measurement that means anything".
+**Both are wrong and measurably so:** all nine 2026-07-16→07-20 audio burns ran the `DIG_MODE` 2→3 flip at
+boot and dumped afterwards — `hdmi-audio-burn3-iron-0716.txt` has `switched to HDMI signalling` at line 174,
+the dump at 186, and `DIG_BE_CNTL 10030200` (**mode 3**) at 227. ⇒ The register axis was already closed with
+the block ON three weeks earlier, **at 105 registers, not 8**, and this probe is a **subset
+re-confirmation**. ⭐ What survives is what was true all along: the packet block is configured exactly like a
+link that plays, and it is silent. ⚠ The error was an INFERENCE from two true facts (the mode-2 inertia
+rule; `gpu: audio probe` really does run at boot in mode 2) that was never checked against a capture — one
+grep for the flip line caught it.
 ⭐⭐ **New positive from the ear**: *"speakers did sound like they lost power when tests were over"* — the
 **release pop**, which this arc rules is evidence the sink's amp was **energised and driven**.
 ⛔ **And the burn found a defect in its own procedure**: `--crccal`'s *"inert in every phase"* verdict is

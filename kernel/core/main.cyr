@@ -4319,24 +4319,131 @@ r8169_rx_restart();
 # tone that streams to the HDMI sink while each profile re-applies the baseline + one delta on the live
 # encoder. The operator WATCHES this log and LISTENS: the profile named when sound appears is the fix.
 if (gpu_hdmi_audio_on == 1) {
+    # ⛔⛔ RESTRUCTURED 2026-08-10, BEFORE ITS FIRST BURN. The sweep has existed since the register class was
+    # first declared exhausted and has NEVER been run — no capture, no ledger entry. Read as originally
+    # written it had three defects that would each have produced a null regardless of whether any profile is
+    # the fix, and the operator's own prior ("boot-cycle stuff hasn't worked") is what prompted the re-read:
+    #
+    #   1. ⛔ **~3 s per profile.** A sink that must lock and unmute a newly-valid stream may take longer
+    #      than that, in which case EVERY profile reads silent — including a correct one. We know the amp is
+    #      armed (the shutdown release-pop) but armed and unmuted are different states. ⇒ 10 s.
+    #   2. ⛔ **Nothing identified the profile after the fact.** 16 profiles x 2 passes of scrolling console,
+    #      and the operator had to notice WHICH line was on screen at the moment sound appeared — the same
+    #      "only oracle is a human catching it live" shape that cost this arc the drag gesture twice.
+    #      ⇒ Each profile now plays its OWN ASCENDING TONE BAND, so the PITCH names the profile
+    #      independently of the console. Report "how far up the rise", and the two channels cross-check.
+    #   3. ⛔ **Both passes ran the same order**, so an order/latch effect was indistinguishable from a fix.
+    #      The record already warns: SINK-LATCHED STATE, re-run reversed before concluding anything.
+    #      ⇒ Pass 2 runs the profiles in REVERSE. A profile that sounds in both directions is real; one that
+    #      sounds only after some other profile has run is a latch effect and says so.
+    #
+    # ⚠ Cost: 16 x 10 s x 2 = ~5.3 minutes of attentive listening. That is the burn.
+    var HS_HOLD = 1000;                 # ticks at 100 Hz = 10 s per profile
     kprintln("hdmi-sweep: cycling HDMI-audio fix profiles -- watch + LISTEN", 61);
+    kprintln("hdmi-sweep: each profile plays its OWN pitch, RISING with the profile number.", 77);
+    kprintln("hdmi-sweep: if you hear anything, report the PITCH as well as the number.", 73);
+    kprintln("hdmi-sweep: pass 1 runs 0..15, pass 2 runs 15..0 -- a real fix sounds in BOTH.", 78);
     var hs_cnt = gpu_hdmi_audio_profile(0 - 1);
     var hs_pass = 0;
     while (hs_pass < 2) {
-        kprint("hdmi-sweep: pass ", 17); kprint_num(hs_pass + 1); kprintln(" of 2", 5);
-        var hs_n = 0;
-        while (hs_n < hs_cnt) {
+        kprint("hdmi-sweep: pass ", 17); kprint_num(hs_pass + 1);
+        if (hs_pass == 0) { kprintln(" of 2 -- ASCENDING 0..15", 24); }
+        if (hs_pass == 1) { kprintln(" of 2 -- REVERSED 15..0 (order/latch control)", 45); }
+        var hs_i = 0;
+        while (hs_i < hs_cnt) {
+            # Reverse the ORDER on pass 2, but keep each profile's own band, so a given pitch always names
+            # the same profile in both passes. Pitch is the identifier; order is the control.
+            var hs_n = hs_i;
+            if (hs_pass == 1) { hs_n = hs_cnt - 1 - hs_i; }
+            # The band ladder: profile n -> [200 + 120n, 300 + 120n]. n=0 is 200-300 Hz, n=15 is 2000-2100.
+            # Non-overlapping, monotonic, and inside a range this sink and these speakers reproduce.
+            hda_tone_band(200 + hs_n * 120, 300 + hs_n * 120);
             gpu_hdmi_audio_profile(hs_n);
+            kprint("hdmi-sweep: >>> profile ", 24); kprint_num(hs_n);
+            kprint(" HOLDING 10 s, pitch band ", 26); kprint_num(200 + hs_n * 120);
+            kprintln(" Hz <<<", 7);
             var hs_t0 = timer_ticks;
-            while ((timer_ticks - hs_t0) < 300) { arch_wait(); }   # hold ~3s to listen (100 Hz tick)
-            hs_n = hs_n + 1;
+            while ((timer_ticks - hs_t0) < HS_HOLD) { arch_wait(); }
+            kprint("hdmi-sweep: <<< profile ", 24); kprint_num(hs_n); kprintln(" done", 5);
+            hs_i = hs_i + 1;
         }
         hs_pass = hs_pass + 1;
     }
+    hda_tone_band(300, 600);
     gpu_hdmi_audio_profile(0);   # leave the console on the clean baseline
-    kprintln("hdmi-sweep: done -- note the profile number that made sound", 59);
+    kprintln("hdmi-sweep: done -- report the PROFILE NUMBER and the PITCH that made sound.", 76);
+    kprintln("hdmi-sweep: silence in ALL of them is a RESULT -- it retires this whole class.", 78);
 } else {
+    # ⛔ This is the branch that would waste the entire burn, so it names its own cause. `gpu_hdmi_audio_on`
+    # is set by the boot-time `gpu_hdmi_audio_enable`, which lives under `#ifdef HDA_HDMI` and the `#else`
+    # of `MODESET_AUDIO` — so a build with MODESET_AUDIO set, or HDA_HDMI unset, silently sweeps nothing.
     kprintln("hdmi-sweep: no HDMI audio path -- skipping sweep", 48);
+    kprintln("hdmi-sweep: that means gpu_hdmi_audio_on is 0 -- check HDA_HDMI is set and", 74);
+    kprintln("hdmi-sweep: MODESET_AUDIO is NOT (it suppresses the boot-time enable).", 70);
+}
+#endif
+
+#ifdef HDMI_QUIET_HOLD
+# ⭐⭐⭐ THE QUIET HOLD — the one condition this sink has NEVER been offered.
+#
+# ⛔ EVERY EXPERIMENT IN THIS ARC RE-BOUNCES THE LINK. The `--audio-pre`/`--audio-post` arms flip `DIG_MODE`
+# and restore it; the 16-profile sweep re-runs `gpu_hdmi_audio_enable()` as each profile's baseline reset —
+# the 2026-08-10 capture contains `display link switched to HDMI signalling` **34 times in 5.5 minutes**,
+# and the operator, listening, reported "the sound of speaker power and reset". That WAS the bounce: the amp
+# de-energising and re-energising, over and over. ⇒ **The sink has never had a stable, untouched HDMI link
+# with audio armed for longer than ~12 seconds**, so "a sink that needs longer than that to lock AND THEN
+# unmute" has never been tested — and it would present as exactly the silence this arc has recorded 24 times.
+#
+# ⛔ THE EXPERIMENT IS THE ABSENCE OF ACTION. Nothing below writes a single HDMI, DCN, AFMT or ATOM register.
+# The link is brought up ONCE by the boot-time `gpu_hdmi_audio_enable` above and then left completely alone.
+# Anything that "helps" here destroys the only variable being tested.
+#
+# ⭐ THE ORACLE IS A PITCH CHANGE, NOT A YES/NO. Two phases of equal length differ ONLY in what the timer
+# refills the PCM ring with — `hda_tone_band` touches the HDA ring, never the link. A listener who reports
+# "it changed from low to high partway through" has authenticated the audio as OURS in a way "did you hear
+# something?" never can, and has done it without being told which order the bands come in.
+# ⚠ `hda_tone_band` is the ONLY call in this block that changes any hardware state, and it is upstream of
+# tap 0 — the half of the chain this arc exonerated FINALLY, by a from-scratch Linux driver that played
+# audible sound from the identical feed.
+var QH_PHASE = 4500;                    # ticks at 100 Hz = 45 s per phase, 90 s total
+if (gpu_hdmi_audio_on == 1) {
+    var qh_d = gpu_audio_dig * GPU_DCN_DIG_STRIDE;
+    kprintln("hdmi-quiet: THE QUIET HOLD -- the link is up and will NOT be touched again.", 75);
+    kprintln("hdmi-quiet: two 45 s phases. The ONLY thing that changes is the tone in the ring.", 81);
+    kprintln("hdmi-quiet: LISTEN for the whole 90 s. The question is: did anything sound, and", 79);
+    kprintln("hdmi-quiet: did its PITCH CHANGE partway through? Report both.", 62);
+    var qh_ph = 0;
+    while (qh_ph < 2) {
+        # Phase 0 = 300-600 Hz, phase 1 = 1400-1700 Hz. Non-overlapping, ~1.5 octaves apart, the same
+        # separation the blinded-ear protocol uses. ⚠ Do NOT print which phase is which band before the
+        # burn — the operator reports the DIRECTION of the change, and that is the authentication.
+        if (qh_ph == 0) { hda_tone_band(300, 600); }
+        if (qh_ph == 1) { hda_tone_band(1400, 1700); }
+        kprint("hdmi-quiet: phase ", 18); kprint_num(qh_ph + 1); kprintln(" of 2 -- 45 s, untouched", 24);
+        var qh_t0 = timer_ticks;
+        var qh_next = 1500;                       # a status line every 15 s
+        while ((timer_ticks - qh_t0) < QH_PHASE) {
+            if ((timer_ticks - qh_t0) >= qh_next) {
+                # ⛔ READ ONLY. AFMT_STATUS is a pure load; the CRC taps are NOT probed here because arming
+                # a tap WRITES `AFMT_AUDIO_CRC_CONTROL`, and a write is the one thing this experiment
+                # forbids. ⭐ This is genuinely new data either way: every AFMT_STATUS reading this arc has
+                # ever taken was within ~12 s of a link bounce. Whether bit24 re-arms during a LONG stable
+                # hold has never been observed.
+                kprint("hdmi-quiet:   t+", 16); kprint_num((timer_ticks - qh_t0) / 100);
+                kprint(" s  AFMT_STATUS ", 16);
+                kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_STATUS + qh_d));
+                kprintln("  (amdgpu playing: 40000010)", 28);
+                qh_next = qh_next + 1500;
+            }
+            arch_wait();
+        }
+        qh_ph = qh_ph + 1;
+    }
+    kprintln("hdmi-quiet: done. Report: any sound at all, and whether the pitch changed.", 74);
+    kprintln("hdmi-quiet: silence across both phases retires the 'sink needs a long lock' idea.", 81);
+} else {
+    kprintln("hdmi-quiet: no HDMI audio path -- nothing to hold. BURN VOID.", 61);
+    kprintln("hdmi-quiet: gpu_hdmi_audio_on is 0 -- HDA_HDMI unset, or MODESET_AUDIO set.", 75);
 }
 #endif
 

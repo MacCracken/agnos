@@ -725,10 +725,30 @@ amdgpu-playing's `40000010`. Boot logs `AFMT drain steady after feed (bit24 clea
 stays set after restore because nothing acks it.** The arm stages MUTED before unmuting. ⇒ Expected residue.
 A cheap follow-up is to ack it after the unmute and re-read; it is not the cause.
 
-⇒ **THE REGISTER-POKE CLASS IS NOW EXHAUSTED FOR REAL.** The prior corpus — including *"every AFMT register
-is byte-identical to a working amdgpu"* — was measured in **mode 2, where every one of those registers is
-inert.** This is the first measurement that means anything, and it says the packet block is configured
-exactly like a link that plays.
+⛔⛔ **RETRACTED 2026-08-10, THE SAME DAY IT WAS WRITTEN — the paragraph that stood here was FALSE.** It read:
+*"The prior corpus — including 'every AFMT register is byte-identical to a working amdgpu' — was measured in
+**mode 2, where every one of those registers is inert.** This is the first measurement that means
+anything."* **Both sentences are wrong, and measurably so.**
+
+- **The pre-M9 corpus was NOT a mode-2 corpus.** All nine of the 2026-07-16→07-20 agnos audio burns ran the
+  `DIG_MODE` 2→3 flip **at boot** and dumped DIG1 afterwards. Verified in
+  `prior-art/hdmi-audio-burn3-iron-0716.txt`: `display link switched to HDMI signalling` at **line 174**,
+  `== agnos display-audio dump ==` at **line 186**, and the dump's own `DIG_BE_CNTL` at **line 227** reads
+  **`10030200` — DIG_MODE 3.** The same `switched to HDMI signalling` line is present in burn4, the
+  magnitude burn, the encoder-only burn and the ACR-CTS burn.
+- ⇒ **The 2026-08-10 ASP probe is a SUBSET RE-CONFIRMATION, not a first measurement.** The register axis was
+  already closed with the block ON three weeks earlier, **at 105 registers, not 8.**
+
+⭐ **What actually survives, and it is the thing that was true all along:** the packet block is configured
+exactly like a link that plays, in HDMI mode, with samples at the encoder output — and it is silent. The
+register-poke class was correctly exhausted the first time. The ASP probe re-confirms it at a later date, on
+a different arm, with an inline answer key — worth having, but it did not change the conclusion.
+
+⚠ **Why the error happened, since it is the second-order lesson:** the mode-2 inertia RULE is real
+(`gpu.cyr:11874` states it), and `gpu: audio probe` genuinely does run at boot in mode 2. From those two
+true facts the conclusion "therefore the whole corpus was mode-2" was **inferred and never checked against a
+single capture** — in an arc whose standing rule is that a readback proves nothing and provenance must be
+read off the log. One `grep` for the flip line would have caught it, and did.
 
 ⭐⭐ **NEW POSITIVE, from the ear: the sink's amp is ARMED and DRIVEN.** Operator, unprompted: *"speakers did
 sound like they lost power when tests were over."* That is the **shutdown release-pop**, which this document
@@ -742,12 +762,36 @@ complete. Proof it is not inert: **arm 2's taps completed in mode 3** (`crc ff59
 ⇒ **The parked playbook's ordering is wrong.** It requires the arms first (they stage the path) but the arms
 also tear the mode down. `--crccal` belongs **inside** the mode-3 window, where the ASP probe now sits.
 
-⚠ Arm 1's taps read no samples and arm 2's did — **not** an arm asymmetry in content: arm 1 samples the tap
-*before* the `#76` edge, arm 2 *after*. ✅ `hdmi audio clock ack did not arrive` fired in both arms and is a
-**known non-issue** (amdgpu polls that bit nowhere; its own comments say the wait does not work).
+⛔⛔ **ALSO RETRACTED, same day: the arm1-vs-arm2 tap explanation.** It read *"arm 1 samples the tap before
+the `#76` edge, arm 2 after"*. That is not the load-bearing difference. **ARM 1 UNMUTES WITH THE FRONT END
+DETACHED AND THE OTG STOPPED:** `syscall.cyr:6163` clears `DIG_FE_SOURCE_SELECT`, **arm 1's unmute is at
+:6238** — inside that window — while the reconnect is at **:6315**, the BE↔FE pulse + replay at **:6365**,
+`OTG_MASTER_EN 1` at **:6390**, and **arm 2's unmute at :6410**, after all of it.
+⚠ **Three things co-vary** between the arms (side of the `#76` edge · OTG stopped + FE detached vs running
+and attached · before vs after the post-`#76` pulse and infoframe replay), so **pipe/FE state is the LEADING
+CANDIDATE, not a finding** — this burn cannot separate them.
+⭐⭐ **The consequence is what matters: ARM 1 IS NOT THE CONTROL IT IS DOCUMENTED TO BE** (`syscall.cyr:6236`
+calls it the historical baseline; `:6205-6206` calls the split single-variable — both are false), and arm
+1's own taps show nothing traversed the encoder when it unmuted. ⇒ **A null arm1-vs-arm2 ear result from the
+2026-08-10 burn CANNOT retire sequencing.** Sequencing stays open.
+⚠ Scope: this touches nothing else here — the mode-3 packet readings, the taps, the bit24 residue and the
+listening window all come from **arm 2** and stand.
 
-⇒ **Surviving candidates: (b) a write that does not latch · (c) the bare-metal environment.** ⛔ **Do not
-spend another burn on register values.**
+⭐ **NEW, and it is a parity gap rather than a mechanism: the shipped `MODESET_AUDIO` build emits NO AVMUTE
+SET→CLEAR edge at all.** Both generators are compiled out — STAGE-1's SET/CLEAR at `gpu.cyr:12511`/`:12534`
+sit inside `#ifndef MODESET_AUDIO` (opened `:12507`), and `gpu_hdmi_avmute_pulse()` is gated at
+`main.cyr:1459-1461`. ⭐ Meanwhile the **known-good amdgpu trace emits a full SET→CLEAR cycle TWICE**
+(`amdgpu-hdmi-modeset-writes-0717.txt`: `0x563b <- 0x05` at :1204 and :6120, each paired with SAMPLE_SEND
+cleared, and the matching clears at :1777/:1964 and :6685/:6872 paired with SAMPLE_SEND set).
+⛔ **This does NOT resurrect "AVMUTE holds the sink muted"** — that mechanism is dead (1.55.20 shipped the
+edge under fair conditions and was silent; `HDMI_STATUS` bit0 reads 0). It means the 1.55.20 kill **cannot
+be cited about the 2026-08-10 burn, because that burn is not running that code.** Restore parity as a rider
+on an arm whose variable is something else; never as an arm of its own.
+✅ `hdmi audio clock ack did not arrive` fired in both arms and is a **known non-issue** (amdgpu polls that
+bit nowhere; its own comments say the wait does not work).
+
+⇒ **Surviving candidates: (a) sequencing — RE-OPENED, arm 1 was never a control · (b) a write that does not
+latch · (c) the bare-metal environment.** ⛔ **Do not spend another burn on register values.**
 
 ## 2.3 HDMI audio — the exhausted classes
 

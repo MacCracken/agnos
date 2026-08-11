@@ -899,7 +899,38 @@ elif [ -n "${BURN_HDMI_SWEEP:-}" ]; then
     echo "[2/2] Building the HDMI-audio MATRIX kernel (HDA_HDMI + HDA_TONE + HDMI_AUDIO_SWEEP + HDMI_AUDIO_DUMP + GPU_AUDIO_PROBE: cycle every candidate fix in one boot; watch serial + listen for which profile makes sound)."
     BUILD_REQUIRE="HDA_HDMI HDA_TONE HDMI_AUDIO_SWEEP HDMI_AUDIO_DUMP GPU_AUDIO_PROBE"
     BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_AUDIO_SWEEP=1 HDMI_AUDIO_DUMP=1 GPU_AUDIO_PROBE=1"
-    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_AUDIO_SWEEP+HDMI_AUDIO_DUMP"
+    # ⛔ THE TAG MUST NAME EVERY FLAG IN BUILD_ENV. It omitted GPU_AUDIO_PROBE until 2026-08-10, so
+    # `burn-verify` printed an ARM that under-reported the build — and GPU_AUDIO_PROBE is the exact flag
+    # whose silent absence VOIDED every HDMI-audio burn from 1.56.25 onward. A reader checking the tag to
+    # confirm the required set would have concluded it was missing and either re-prepped or, worse, believed
+    # a void burn. The tag is a burn artifact's only self-description; an incomplete one is a lie.
+    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_AUDIO_SWEEP+HDMI_AUDIO_DUMP+GPU_AUDIO_PROBE"
+elif [ -n "${BURN_HDMI_QUIET:-}" ]; then
+    # ⭐⭐⭐ THE QUIET HOLD — the one condition this sink has never been offered.
+    #
+    # ⛔ WHY IT EXISTS. Every experiment in this arc re-bounces the link: the --audio-pre/--audio-post arms
+    # flip DIG_MODE and restore it, and the 16-profile sweep re-runs gpu_hdmi_audio_enable() as each
+    # profile's baseline reset. The 2026-08-10 sweep capture contains `display link switched to HDMI
+    # signalling` **34 times in 5.5 minutes**, and the operator listening to it reported "the sound of
+    # speaker power and reset" — that WAS the bounce, the amp cycling. ⇒ The sink has never had a stable,
+    # untouched link with audio armed for more than ~12 s, so "this sink needs longer than that to lock and
+    # then unmute" is UNTESTED and would present as exactly the silence recorded ~24 times.
+    #
+    # ⛔ THE EXPERIMENT IS THE ABSENCE OF ACTION — no HDMI/DCN/AFMT/ATOM register is written after the
+    # boot-time bring-up. ⚠ Do NOT add a "helpful" re-enable, probe or CRC arm to this arm; arming a tap
+    # WRITES AFMT_AUDIO_CRC_CONTROL and destroys the only variable. AFMT_STATUS is read (a pure load) every
+    # 15 s, which is itself new data: every prior reading was within ~12 s of a bounce.
+    #
+    # ⭐ The oracle is a PITCH CHANGE across two 45 s phases, not a yes/no — the ring content is the only
+    # thing that changes, and a listener reporting the DIRECTION of the change has authenticated the audio
+    # as ours. ⚠ Do not tell the operator which phase is which band before the burn.
+    #
+    # ⛔ MODESET_AUDIO MUST NOT BE SET — it suppresses the boot-time enable, gpu_hdmi_audio_on stays 0, and
+    # the hold has no link to hold. The arm prints BURN VOID and names that cause if it happens.
+    echo "[2/2] Building the QUIET-HOLD kernel (HDA_HDMI + HDA_TONE + HDMI_QUIET_HOLD + GPU_AUDIO_PROBE: bring the link up ONCE, then touch nothing for 90 s across two tone phases; LISTEN for any sound and for a pitch change)."
+    BUILD_REQUIRE="HDA_HDMI HDA_TONE HDMI_QUIET_HOLD GPU_AUDIO_PROBE"
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_QUIET_HOLD=1 GPU_AUDIO_PROBE=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_QUIET_HOLD+GPU_AUDIO_PROBE"
 elif [ -n "${BURN_HDMI_DUMP:-}" ]; then
     # THE MEASUREMENT BURN. Use this one for the display-audio arc until the silence is explained.
     #
