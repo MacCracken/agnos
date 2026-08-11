@@ -118,6 +118,47 @@ fn ext2_store32_le(ptr, off, val) {
     return 0;
 }
 
+# --- Inode timestamps ------------------------------------------------------------------------------
+#
+# ⛔⛔ EVERY FILE agnos CREATED CARRIED 1970-01-01 UNTIL 2026-08-11, and the reason was a stale belief
+# written into this file: `ext2_unlink`'s i_dtime comment says *"We have no RTC → fixed epoch sentinel."*
+# **We do have an RTC.** `net_clock_seed_rtc()` reads it at boot and the console prints
+# `Wall clock: RTC seed Unix …` — at boot line ~67, where the ext2 mount is line ~143. The clock has been
+# available before any filesystem existed for the whole life of this driver; nothing ever asked for it.
+#
+# ⭐ MEASURED, not inferred: with the agnos-fs mounted from Linux, every agnos-written file reads
+# `mtime=0 ctime=0`. ⚠ `atime` shows a REAL value and is NOT evidence the driver stamps anything — the
+# mount is `relatime`, which refreshes atime on read whenever atime < mtime, and mtime is 0. Do not cite
+# atime as a working timestamp.
+#
+# ext2 inode time fields, all 32-bit LE seconds since the epoch:
+#   i_atime = 8   i_ctime = 12   i_mtime = 16   i_dtime = 20
+#
+# ⛔ THE GUARD IS THE POINT. `ntp_now()` returns **0 when the clock has never been synced** (no RTC, or a
+# boot that got there before the seed). Writing 0 is what we already do; writing a garbage non-zero would
+# be worse than the bug, because a plausible wrong date is harder to spot than 1970. So: stamp only when
+# the clock is real, and leave the epoch behaviour exactly as-is otherwise.
+# ⚠ `ntp_now()` is `net_unix_time + elapsed ticks`, so it advances during a boot — files do not all share
+# one second. Include order makes it reachable: net_ntp (agnos.cyr:106) / net_rtc (:107) precede ext2 (:112).
+fn ext2_stamp_new(buf) {
+    var t = ntp_now();
+    if (t == 0) { return 0; }              # no clock this boot — leave the fields zero, as before
+    ext2_store32_le(buf, 8,  t);           # i_atime
+    ext2_store32_le(buf, 12, t);           # i_ctime
+    ext2_store32_le(buf, 16, t);           # i_mtime
+    return t;
+}
+
+# Content changed: refresh mtime + ctime, leave atime alone (that is a READ time and we do not track reads).
+# ⚠ Caller must already hold the inode in `buf` and must write it back itself — this only edits the buffer.
+fn ext2_stamp_mtime(buf) {
+    var t = ntp_now();
+    if (t == 0) { return 0; }
+    ext2_store32_le(buf, 12, t);           # i_ctime — metadata changed too
+    ext2_store32_le(buf, 16, t);           # i_mtime
+    return t;
+}
+
 # --- Superblock field accessors (Haiku-style — endian-handled at boundary) -
 
 fn ext2_sb_inodes_count(sb)      { return ext2_load32_le(sb, 0); }
@@ -2496,6 +2537,7 @@ fn ext2_create(dir_ino, name, name_len) {
     while (z < ext2_inode_size) { store8(&ext2_inode_buf + z, 0); z = z + 1; }
     ext2_inode_set_mode(&ext2_inode_buf, 0x81A4);          # S_IFREG | 0644
     ext2_inode_set_links_count(&ext2_inode_buf, 1);
+    ext2_stamp_new(&ext2_inode_buf);                       # atime/ctime/mtime — or the buffer stays zeroed
     if (ext2_put_inode(ino, &ext2_inode_buf) != 0) { ext2_free_inode(ino, 0); return 0 - 1; }
 
     if (ext2_dir_insert(dir_ino, name, name_len, ino, 1) != 0) {
@@ -2527,7 +2569,15 @@ fn ext2_unlink(dir_ino, name, name_len) {
         # so a small dtime (e.g. 1) makes e2fsck read the freed inode as an
         # orphan-chain link to inode 1 → "corrupted orphan linked list". A
         # value above any inode number can't be a next-pointer, so it's
-        # treated as a deletion time. We have no RTC → fixed epoch sentinel
+        # treated as a deletion time.
+        # ⛔ THE NEXT LINE'S PREMISE IS FALSE AND IT COST EVERY FILE ITS DATE. "We have no RTC" was wrong
+        # when it was written: `net_clock_seed_rtc()` reads the CMOS RTC at boot and the console prints
+        # `Wall clock: RTC seed Unix …` well before ext2 mounts. Nothing in this driver ever asked for it,
+        # so creation left i_atime/i_ctime/i_mtime at 0 and Linux rendered every agnos file as 1970-01-01.
+        # Fixed 2026-08-11 via `ext2_stamp_new` / `ext2_stamp_mtime`. ⚠ The SENTINEL below is still correct
+        # for i_dtime — it must merely be larger than any inode number so e2fsck cannot read it as an
+        # orphan-chain pointer — but it is a sentinel by design, not a consequence of having no clock.
+        # We have no RTC → fixed epoch sentinel
         # (2025-ish); e2fsck checks dtime!=0 + plausibility, not the value.
         # (truncate_zero below re-reads/re-writes the inode but leaves
         # i_dtime untouched, so it survives.)
@@ -2619,6 +2669,7 @@ fn ext2_mkdir(parent_ino, name, name_len) {
     while (z < ext2_inode_size) { store8(&ext2_inode_buf + z, 0); z = z + 1; }
     ext2_inode_set_mode(&ext2_inode_buf, 0x41ED);          # S_IFDIR | 0755
     ext2_inode_set_links_count(&ext2_inode_buf, 2);
+    ext2_stamp_new(&ext2_inode_buf);                       # directories get real dates too
     ext2_inode_set_size_lo(&ext2_inode_buf, ext2_blocksize);
     ext2_inode_set_blocks_lo(&ext2_inode_buf, ext2_blocksize / 512);
     ext2_inode_set_block_ptr(&ext2_inode_buf, 0, db);
@@ -2884,6 +2935,7 @@ fn ext2_symlink(parent_ino, name, name_len, target, target_len) {
     while (z2 < ext2_inode_size) { store8(&ext2_inode_buf + z2, 0); z2 = z2 + 1; }
     ext2_inode_set_mode(&ext2_inode_buf, 0xA1FF);            # S_IFLNK | 0777
     ext2_inode_set_links_count(&ext2_inode_buf, 1);
+    ext2_stamp_new(&ext2_inode_buf);
     ext2_inode_set_size_lo(&ext2_inode_buf, target_len);
     if (target_len < 60) {
         # FAST: target inline in the i_block area (inode offset 40), 0 blocks
@@ -3383,6 +3435,13 @@ fn ext2_write_at(inode_num, offset, src, len) {
         var add = ext2_bmap_alloc_count * (ext2_blocksize / 512);
         ext2_inode_set_blocks_lo(&ext2_inode_buf, ext2_inode_blocks_lo(&ext2_inode_buf) + add);
     }
+    # The content changed, so mtime/ctime must move — otherwise a file agnos rewrites keeps whatever date
+    # it was CREATED with, which is the same class of lie as the 1970 stamp and harder to notice.
+    # ⚠ Deliberately in the shared tail, beside the i_size / i_blocks updates, so every write path that
+    # reaches this flush is stamped and a future path cannot forget to. ⚠ Cheap enough for the fault path:
+    # `klug_spill` rewrites 64 KB from `fault_kill_current`, and this adds two stores and a tick read —
+    # no allocation, no I/O of its own.
+    ext2_stamp_mtime(&ext2_inode_buf);
     if (ext2_put_inode(inode_num, &ext2_inode_buf) != 0) { return 0 - 1; }
     return written;
 }

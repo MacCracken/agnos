@@ -31,6 +31,64 @@ produce — the required flag set (`HDA_HDMI` + `HDMI_ATOM` + `HDA_TONE` + `GPU_
 pre-registered outcome table — and it stands. This cycle is a **review and audit first**: establish what is
 actually proven, what is falsified, and what is merely untested, before spending another boot.
 
+### Fixed — every file agnos created was dated 1970-01-01, because the driver believed there was no RTC
+
+⛔⛔ **MEASURED, from outside agnos**: with the agnos-fs mounted on Linux, every file the kernel had ever
+written read `mtime=0 ctime=0` — 94 of them at the volume root. Linux renders that as **1970-01-01** (or
+*Dec 31 1969* in a negative-offset timezone, which is how the operator first saw it).
+⚠ **`atime` is a decoy and must not be read as a working timestamp**: the mount is `relatime`, which
+refreshes atime on read whenever atime < mtime — and mtime was 0, so every read set it. It looked like one
+of the three fields worked. None did.
+
+⭐ **The cause is a stale belief written into the driver**, in `ext2_unlink`'s i_dtime comment: *"We have no
+RTC → fixed epoch sentinel."* **agnos has an RTC.** `net_clock_seed_rtc()` reads the CMOS at boot and the
+console prints `Wall clock: RTC seed Unix …` at boot line ~67, where the ext2 mount is line ~143 — the clock
+has been available before any filesystem existed for the entire life of this driver, and `ext2.cyr` contained
+exactly ONE timestamp reference: a *read* of i_mtime for `stat`. Nothing ever wrote one.
+
+⇒ `ext2_stamp_new()` (i_atime/i_ctime/i_mtime, offsets 8/12/16) on every inode-creating path —
+`ext2_create`, `ext2_mkdir`, `ext2_symlink` — and `ext2_stamp_mtime()` (i_ctime + i_mtime) in
+`ext2_write_at`'s **shared flush tail**, beside the i_size / i_blocks updates, so every write path that
+reaches that flush is stamped and a new one cannot forget to.
+⛔ **Guarded on the clock being real.** `ntp_now()` returns **0 when never synced**; on that path the fields
+stay zero, exactly as before. Writing a plausible-but-wrong date would be worse than 1970 — a wrong date is
+harder to notice than an absurd one. ⚠ `ntp_now()` advances with ticks, so files do not all share one second.
+⚠ Cheap enough for the fault path: `klug_spill` rewrites 64 KB from `fault_kill_current`, and this adds two
+stores and a tick read — no allocation, no I/O.
+
+⭐ **VERIFIED END-TO-END BEFORE IT GOES NEAR IRON, by an oracle outside agnos.** `ext2-write-smoke` (W1-W5)
+passes unchanged, and `debugfs` reading the resulting on-disk image shows regular files, a directory, a
+hardlink and a symlink all carrying `ctime/atime/mtime = Tue Aug 11 09:48:15 2026` — the wall-clock second
+the smoke ran, against a pre-image whose own timestamps read 09:48:11. Not agnos's claim about itself.
+
+### ⏸ SHELVED 2026-08-11 — the HDMI-audio leg, after four burns in one day
+
+⭐ **Every source-side observable agnos possesses now says PLAYING, and there is no sound.** Link in HDMI
+mode 3 and holding · packet block byte-identical to a playing amdgpu link, measured **with the HDMI block
+ON** · `AFMT_STATUS 40000010` stable across a 90 s untouched hold · **samples measured traversing the
+encoder output live** · the sink's amp demonstrably energised (the shutdown release pop).
+
+**Retired this round:** *"the sink needs a long stable lock"* (90 s untouched, amp armed, silent) and **the
+audio-DTO literal** — `DCCG_AUDIO_DTO0_MODULE` now writes the live-derived `gpu_pixclk_100hz` (241.5026 MHz)
+instead of amdgpu's hardcoded `0x24D998` (241.5000 MHz), because the register is documented *"= actual pixel
+clock in 100 Hz units"* and hardcoding a foreign clock is the reasoning §2.3 already killed for CTS.
+⚠ **The revert is KEPT on correctness grounds only. It produced no measured audio effect and is NOT a fix.**
+
+⛔⛔ **The bisect's leading candidate died on its own test, and that is the useful part.** tap 1 reads
+`4dc450` across **five burns and two different audio-DTO clock values**, 16 sweep profiles, two tone bands
+and two quiet holds. Changing the audio clock derivation should perturb a live packetised stage; it did not
+move one bit. ⇒ *"tap 1 is a stuck instrument"* now outranks *"the packetiser emits constant data"*, the
+July→August freeze is most likely an **instrument** regression, and **tap 1 must not be cited as evidence
+until it is re-validated** — including in the ~24 silent burns that already lean on it.
+
+⚠ Also re-opened by the audit: **arm 1 was never a valid control** (it unmutes with the front end detached
+and the OTG stopped, `syscall.cyr:6163` vs `:6238`), so no arm1-vs-arm2 result can retire sequencing.
+
+⇒ Surviving: **(a)** sequencing · **(b)** a write that does not latch (weakened) · **(c)** the bare metal.
+⛔ **Do not resume by re-running any instrument in that ledger.** This leg needs an oracle it does not have:
+one that observes the **wire** rather than the source. Everything agnos owns sits at or before the AFMT
+output tap, and that half is exhaustively green.
+
 ### Audited — the HDMI-audio leg, zero burns. Full findings in `planning/gpu.md` §2.3.
 
 ⛔⛔ **The blocking finding is a CONTRADICTION IN OUR OWN RECORD, not a hardware unknown.** Two load-bearing
