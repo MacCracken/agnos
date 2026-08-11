@@ -709,6 +709,46 @@ of that instrument worth reading.
 - ⛔ Never index `GPU_R_DSCL_SCL_MODE` by a DPP instance stride — that stride is not anchored on this
   silicon. Pipe 0 only, which the op guards and which is archaemenid's only lit pipe anyway.
 
+## 2.3a ⭐⭐⭐ BURNED 2026-08-10 — the register axis, closed WITH THE BLOCK ON
+
+`gpu_hdmi_asp_probe()` read the DIG1 packet block **in `DIG_MODE`=3 with the feed live** — the state this
+arc had never captured. `DIG_MODE now 3` in both arms, so the reading is valid.
+Captures: agnosticos `prior-art/hdmi-asp-egress-probe-iron-0810.txt` (+ the `/klug.txt` spill).
+
+**Seven of eight registers are byte-identical to a PLAYING amdgpu link**: `HDMI_AUDIO_PACKET_CONTROL` **10**
+· `HDMI_ACR_PACKET_CONTROL` **11000** · `HDMI_INFOFRAME_CONTROL0` **10** · `AFMT_AUDIO_PACKET_CONTROL`
+**801** · `AFMT_AUDIO_INFO0` **170** · `HDMI_STATUS` **0** · packet-error bit **0**.
+
+⚠ **The eighth is EXPLAINED, and must not be written up as a lead.** `AFMT_STATUS` reads `41000010` against
+amdgpu-playing's `40000010`. Boot logs `AFMT drain steady after feed (bit24 clear)`, so the arm set it — and
+§2.3's own STICKY OVERFLOW QUIRK already records that **muting the WORKING amdgpu path sets bit24 and it
+stays set after restore because nothing acks it.** The arm stages MUTED before unmuting. ⇒ Expected residue.
+A cheap follow-up is to ack it after the unmute and re-read; it is not the cause.
+
+⇒ **THE REGISTER-POKE CLASS IS NOW EXHAUSTED FOR REAL.** The prior corpus — including *"every AFMT register
+is byte-identical to a working amdgpu"* — was measured in **mode 2, where every one of those registers is
+inert.** This is the first measurement that means anything, and it says the packet block is configured
+exactly like a link that plays.
+
+⭐⭐ **NEW POSITIVE, from the ear: the sink's amp is ARMED and DRIVEN.** Operator, unprompted: *"speakers did
+sound like they lost power when tests were over."* That is the **shutdown release-pop**, which this document
+already rules is evidence rather than noise. ⇒ The remaining box is tight: **amp armed · link in HDMI ·
+packet block identical to a playing link · samples reaching the encoder output · no sound.**
+
+⛔⛔ **`--crccal`'s VERDICT IS VOID — same defect the probe was built to catch.** It reported the CRC
+*"completed in NEITHER phase … this probe is inert on this path"*. That is an artifact of **link mode**: each
+arm ends with `restoring inherited signalling` → `DIG_MODE` back to **2** → the AFMT block inert → no tap can
+complete. Proof it is not inert: **arm 2's taps completed in mode 3** (`crc ff590d` / `4dc450`).
+⇒ **The parked playbook's ordering is wrong.** It requires the arms first (they stage the path) but the arms
+also tear the mode down. `--crccal` belongs **inside** the mode-3 window, where the ASP probe now sits.
+
+⚠ Arm 1's taps read no samples and arm 2's did — **not** an arm asymmetry in content: arm 1 samples the tap
+*before* the `#76` edge, arm 2 *after*. ✅ `hdmi audio clock ack did not arrive` fired in both arms and is a
+**known non-issue** (amdgpu polls that bit nowhere; its own comments say the wait does not work).
+
+⇒ **Surviving candidates: (b) a write that does not latch · (c) the bare-metal environment.** ⛔ **Do not
+spend another burn on register values.**
+
 ## 2.3 HDMI audio — the exhausted classes
 
 | Killed | What killed it |

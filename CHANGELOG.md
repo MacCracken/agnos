@@ -94,9 +94,20 @@ encoder and its block is idle, so comparing against it would "confirm" silence.
 cleanly and when none are attempted, so the probe says so rather than letting a 0 read as good news.
 ⛔ **Guarded on `gpu_audio_dig < 0`** — it is −1 without `GPU_AUDIO_PROBE`, which would multiply into a
 negative stride and turn a read-only diagnostic into wild MMIO. It refuses and names the missing flag.
-⚠ **Not yet executed anywhere**: QEMU has no AMD device, so the arm refuses before reaching it. Its kprint
-lengths are gated by `check.sh` (which caught one off-by-one on the way in); its register reads run first on
-iron.
+⭐⭐⭐ **BURNED 2026-08-10 — it ran, the reading is valid, and it closed the register axis.** `DIG_MODE now 3`
+in both arms. **Seven of eight registers byte-identical to a PLAYING amdgpu link**; the eighth
+(`AFMT_STATUS 41000010` vs `40000010`) is the sticky bit24 residue of the arm's own mute→unmute, which
+amdgpu also shows while still playing — **explained, not a lead.** ⇒ The prior corpus behind *"every AFMT
+register is byte-identical to a working amdgpu"* was taken in **mode 2 where those registers are inert**;
+this is the first measurement that means anything, and it says the packet block is configured exactly like a
+link that plays. **Still silent.** ⛔ The register-poke class is now exhausted **for real**.
+⭐⭐ **New positive from the ear**: *"speakers did sound like they lost power when tests were over"* — the
+**release pop**, which this arc rules is evidence the sink's amp was **energised and driven**.
+⛔ **And the burn found a defect in its own procedure**: `--crccal`'s *"inert in every phase"* verdict is
+**VOID**, because each arm restores `DIG_MODE`=2 on exit and `--crccal` therefore always measures a **DVI**
+link — the same class of error the probe was built to catch. Arm 2's taps completed in mode 3 (`crc ff590d`),
+proving the probe is fine. The parked playbook's ordering is wrong; `--crccal` belongs inside the mode-3
+window. ⇒ Surviving: **(b) a write that does not latch · (c) the bare metal.**
 
 ### Reviewed — what the audit cleared, so a resumption does not re-derive it
 
