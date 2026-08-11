@@ -4424,15 +4424,28 @@ if (gpu_hdmi_audio_on == 1) {
         var qh_next = 1500;                       # a status line every 15 s
         while ((timer_ticks - qh_t0) < QH_PHASE) {
             if ((timer_ticks - qh_t0) >= qh_next) {
-                # ⛔ READ ONLY. AFMT_STATUS is a pure load; the CRC taps are NOT probed here because arming
-                # a tap WRITES `AFMT_AUDIO_CRC_CONTROL`, and a write is the one thing this experiment
-                # forbids. ⭐ This is genuinely new data either way: every AFMT_STATUS reading this arc has
-                # ever taken was within ~12 s of a link bounce. Whether bit24 re-arms during a LONG stable
-                # hold has never been observed.
+                # ⭐ AFMT_STATUS is a pure load. Genuinely new data either way: every reading this arc had
+                # ever taken was within ~12 s of a link bounce, so whether bit24 re-arms during a LONG
+                # stable hold was unobserved until the 2026-08-10 burn (it does not — 40000010 throughout).
                 kprint("hdmi-quiet:   t+", 16); kprint_num((timer_ticks - qh_t0) / 100);
                 kprint(" s  AFMT_STATUS ", 16);
                 kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_STATUS + qh_d));
                 kprintln("  (amdgpu playing: 40000010)", 28);
+                # ⛔⛔ ADDED AFTER THE FIRST QUIET-HOLD BURN, AND THE OMISSION WAS A DESIGN ERROR OF MINE.
+                # The original block said "the CRC taps are NOT probed here because arming a tap WRITES
+                # AFMT_AUDIO_CRC_CONTROL, and a write is the one thing this experiment forbids." That was
+                # over-constraint: `AFMT_AUDIO_CRC_CONTROL` is a **diagnostic counter register**, not a
+                # link, packet or PHY register — arming it cannot bounce the sink, and this arc's record
+                # shows taps completing repeatedly without disturbing anything. Excluding it bought nothing
+                # and cost the STIMULUS CHECK: the 2026-08-10 hold could only INFER that samples reached the
+                # encoder output, and "a running ring that carries nothing prints a healthy log" is the
+                # exact failure that made M9 a null experiment. ⇒ Probe both taps at every mark.
+                # ⚠ ~120 ms of busy-wait per probe (60 ms per tap, bounded). Harmless inside a 45 s phase and
+                # AFTER `Interrupts enabled` — the timer keeps refilling the ring throughout. The 1.55.16
+                # DHCP-failure correlation this cost came from was a probe running BEFORE sti at boot.
+                # ⚠ THE TAP IS AMPLITUDE-BLIND, by its own header: a completing tap proves NON-ZERO samples
+                # traverse, NOT that they are correct. Do not read completion as "the audio is fine".
+                gpu_hdmi_audio_crc_probe(qh_d);
                 qh_next = qh_next + 1500;
             }
             arch_wait();
@@ -4440,7 +4453,7 @@ if (gpu_hdmi_audio_on == 1) {
         qh_ph = qh_ph + 1;
     }
     kprintln("hdmi-quiet: done. Report: any sound at all, and whether the pitch changed.", 74);
-    kprintln("hdmi-quiet: silence across both phases retires the 'sink needs a long lock' idea.", 81);
+    kprintln("hdmi-quiet: taps completing + silence = every source observable says PLAYING.", 77);
 } else {
     kprintln("hdmi-quiet: no HDMI audio path -- nothing to hold. BURN VOID.", 61);
     kprintln("hdmi-quiet: gpu_hdmi_audio_on is 0 -- HDA_HDMI unset, or MODESET_AUDIO set.", 75);

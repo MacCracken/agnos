@@ -12233,13 +12233,48 @@ fn gpu_hdmi_audio_enable(phy) {
     # MODULE = the live pixel clock in 100 Hz units (this is what P3b-i derived); PHASE = a constant 24 MHz.
     # The sample rate NEVER enters either: Fs comes from the HDA converter format, and 128*Fs is derived
     # downstream. An Fs-scaled DTO would be a regression.
-    # MODULE: use amdgpu's LITERAL, not our live-derived pixel clock. agnos derives
-    # gpu_pixclk_100hz from the OTG and lands 0x24d9b2 where the audibly-playing
-    # amdgpu link reads 0x24d998 — about 10.8 ppm off. Almost certainly inaudible on
-    # its own, but it is the one remaining unexplained delta in the whole DCN audio
-    # register file, and "byte-matched to the working path" is worth more than a
-    # derivation we like better. Display-safe: audio DTO only.
-    gpu_reg32_write(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO0_MODULE, 0x24D998);
+    # ⛔⛔ REVERTED 2026-08-10 — THE LITERAL WAS THE SAME MISTAKE THIS ARC ALREADY KILLED FOR CTS.
+    #
+    # What stood here, from 1.55.26 until today: *"MODULE: use amdgpu's LITERAL, not our live-derived pixel
+    # clock. agnos derives gpu_pixclk_100hz from the OTG and lands 0x24d9b2 where the audibly-playing amdgpu
+    # link reads 0x24d998 — about 10.8 ppm off. Almost certainly inaudible on its own … 'byte-matched to the
+    # working path' is worth more than a derivation we like better."*
+    #
+    # ⛔ **This register is documented one line away, in gpu_regs.cyr:353, as "= actual pixel clock in
+    # 100 Hz units."** It is not a tuning constant; it is a statement about THIS machine's clock.
+    #   amdgpu literal 0x24D998 = 2 415 000 x100Hz = 241.5000 MHz  <- amdgpu's OWN clock
+    #   agnos derived  0x24D9B2 = 2 415 026 x100Hz = 241.5026 MHz  <- OURS, and the boot log measures
+    #                                                                 "pixel clock 241502 kHz" every burn
+    # ⇒ The literal tells the audio DTO the pixel clock is something it is not.
+    #
+    # ⭐ **gpu.md §2.3 already killed exactly this reasoning for the sibling register:** *"Copy amdgpu's CTS
+    # literal to avoid divergence — BACKWARDS REASONING: amdgpu wrote 241500 because amdgpu's own clock was
+    # 241500; agnos's is 241503 kHz. A CTS that does not match the actual TMDS clock breaks the sink's
+    # regeneration ⇒ null cells, WHICH IS EXACTLY WHAT ZEROED TAP1."* That lesson was applied to CTS and not
+    # to the DTO MODULE **in the same 1.55.26 change**. ⚠ The old comment's defence — "10.8 ppm, inaudible"
+    # — answers the wrong objection: 10.8 ppm of PITCH error is inaudible, but a clock-derivation register
+    # that disagrees with the actual clock is a REGENERATION failure, not a tuning one.
+    #
+    # ⭐ THE BISECT THAT LANDED HERE (2026-08-10, zero burns): tap 1 VARIED with content in every capture up
+    # to 1.55.24, the record notes 1.55.26 left "tap1 reading silence … it made things WORSE", and every
+    # 1.56.43 capture reads tap 1 **frozen at 4dc450** while tap 0 varies at every single reading — including
+    # four marks of a controlled hold where the tone band demonstrably changed.
+    # ⚠ NOT YET PROVEN: the CTS entry says its literal ZEROED tap1, and tap1 today is non-zero constant, so
+    # the two failures are not identical. This is a high-confidence lead with a decisive one-line test, not
+    # a confirmed cause. The test is whether tap 1 starts tracking content again.
+    #
+    # ⛔ FALL BACK, NEVER WRITE ZERO. `gpu_pixclk_100hz` is 0 until the OTG derivation runs; writing 0 into a
+    # DTO module is not "the honest value", it is a broken divisor. On a failed derivation, use the literal
+    # and SAY SO — and either way NAME the value written, because a burn that cannot tell which number went
+    # in cannot be read afterwards. Display-safe either way: audio DTO only.
+    var dto_mod = gpu_pixclk_100hz;
+    if (dto_mod == 0) {
+        dto_mod = 0x24D998;
+        kprintln("gpu: audio DTO module -- pixclk underived, FELL BACK to the amdgpu literal", 74);
+    }
+    gpu_reg32_write(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO0_MODULE, dto_mod);
+    kprint("gpu: audio DTO module written ", 30); kprint_hex(dto_mod);
+    kprintln("  (amdgpu's own clock reads 24d998)", 35);
     gpu_reg32_write(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO0_PHASE,  GPU_DCCG_AUDIO_DTO_PHASE_VAL);
 
     # --- 3b. ⚠⚠ MISIDENTIFIED REGISTERS — RETRACTED 2026-07-19. THIS BLOCK IS NOT "SYMCLK".
@@ -12802,8 +12837,14 @@ fn gpu_hdmi_audio_profile(n) {
         var pc2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL2 + d);
         gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL2 + d, (pc2 & (0 - 1 - GPU_AFMT_CHANNEL_ENABLE_MASK) & (0 - 1 - 0x2) & (0 - 1 - GPU_AFMT_60958_OSF_OVRD)) | GPU_AFMT_CHANNEL_ENABLE_STEREO | GPU_AFMT_AUDIO_LAYOUT_OVRD);
     } elif (n == 11) {
-        # C — re-latch the audio DTO to source 0 with amdgpu's exact MODULE, then re-cycle the AFMT clock so
-        #     the codec feed and the AFMT drain lock to ONE wall clock (the live flip may have stale-locked it).
+        # C — re-latch the audio DTO to source 0, then re-cycle the AFMT clock so the codec feed and the AFMT
+        #     drain lock to ONE wall clock (the live flip may have stale-locked it).
+        # ⚠ ITS MEANING CHANGED 2026-08-10 AND THE LITERAL IS DELIBERATE. The baseline enable path now writes
+        # the LIVE-DERIVED `gpu_pixclk_100hz`, because hardcoding amdgpu's 0x24d998 is the same backwards
+        # reasoning §2.3 killed for CTS — the register is documented "= actual pixel clock in 100 Hz units"
+        # and ours is 241.5026 MHz, not amdgpu's 241.5000. ⇒ This profile is no longer "apply the correct
+        # MODULE"; it is now the **CONTRAST that puts the suspect literal BACK**. If the derived baseline
+        # makes tap 1 track content again and this profile freezes it, that is the discriminator.
         kprintln("C DTO source0 + clock relatch", 29);
         gpu_reg32_write(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO_SRC, 0);
         gpu_reg32_write(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO0_MODULE, 0x24d998);
