@@ -779,9 +779,29 @@ fn kbd_read_nonblock(buf, count) {
 
 # System hostname — read-only identity for uname(34).nodename. Seeded to
 # "agnos"; no sethostname syscall yet (added only when a native workload needs a
-# mutable hostname — kernel grows per workload, not by Linux default). A gvar
-# string literal, safe to read from a syscall (post-gvar-init, like _AGNOS_VERSION).
+# mutable hostname — kernel grows per workload, not by Linux default).
+#
+# ⛔ THE GVAR FORM DID NOT WORK AND THE COMMENT THAT SAID IT DID WAS WRONG. This read
+# "A gvar string literal, safe to read from a syscall (post-gvar-init, like
+# _AGNOS_VERSION)" — an assertion, never a measurement. Measured 2026-08-11 in QEMU:
+# `iam` printed `Kernel: AGNOS ` (bare, trailing space) and an EMPTY `Host:`, while
+# `sysname` and `machine` — inline literals in the very same uname arm, through the very
+# same sysinfo_put_str — came out correct. Two literals right, two gvars empty, one
+# function: the gvar pointers are not live on the ring-3 syscall path.
+# ⭐ version.cyr already had the answer and had written it down: `agnos_version_str()`
+# exists precisely because the rodata pointer is baked into the FUNCTION at compile time,
+# and its comment names the _AGNOS_VERSION gvar as the thing not to use. uname reached for
+# the gvar anyway. The accessor form below is that same pattern for the hostname.
+# ⚠ The gvar is kept ONLY as the seed value's home; nothing reads it. Anything that needs
+# the hostname from a syscall must call kernel_hostname_str().
 var kernel_hostname = "agnos";
+
+# Program-body-safe hostname accessor — the rodata pointer is baked in at compile time,
+# so this is valid from a ring-3 syscall regardless of gvar-init ordering. Mirrors
+# agnos_version_str() in kernel/version.cyr. Callers copy from the returned pointer.
+fn kernel_hostname_str() {
+    return "agnos";
+}
 
 # Copy a NUL-terminated kernel string literal into a fixed `max`-byte user field,
 # NUL-padding the remainder. Stops at the source NUL or `max` bytes, whichever
@@ -8107,14 +8127,17 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 34) {
         # uname(buf=arg1, len=arg2) — writes the 64-byte identity struct: four
         # 16-byte NUL-padded fields at offsets 0/16/32/48 = sysname / nodename /
-        # release / machine. Static boot-time identity; invoked from ring 3 so
-        # the string gvars (_AGNOS_VERSION, kernel_hostname) are post-init-live.
+        # release / machine. Static boot-time identity. ⚠ Read through the FUNCTION
+        # accessors (agnos_version_str / kernel_hostname_str), NEVER the gvars.
         # a3 unused. Read by fixed offset, NOT NUL-terminated-variable. (sysinfo ABI)
         if (is_user_range(arg1, 64) == 0) { stack_canary_check(canary); return 0 - 1; }
         if (arg2 < 64) { stack_canary_check(canary); return 0 - 1; }
         sysinfo_put_str(arg1 +  0, "AGNOS", 16);          # sysname (kernel name)
-        sysinfo_put_str(arg1 + 16, kernel_hostname, 16);  # nodename (hostname)
-        sysinfo_put_str(arg1 + 32, _AGNOS_VERSION, 16);   # release (kernel version)
+        # ⛔ ACCESSORS, NOT GVARS — see the kernel_hostname_str banner. The gvar forms
+        # returned EMPTY fields here (measured, not theorised), which is why `iam` showed
+        # `Kernel: AGNOS` with no version and a blank `Host:` for as long as anyone recalls.
+        sysinfo_put_str(arg1 + 16, kernel_hostname_str(), 16);  # nodename (hostname)
+        sysinfo_put_str(arg1 + 32, agnos_version_str(), 16);    # release (kernel version)
         sysinfo_put_str(arg1 + 48, "x86_64", 16);         # machine (arch; aarch64 build would #ifdef)
         stack_canary_check(canary);
         return 0;
@@ -8835,6 +8858,15 @@ fn ksyscall(num, arg1, arg2, arg3) {
             }
         }
         preempt_enable();
+        # ⭐ THREAD-CONTEXT HALF OF THE HID DRAIN — see hid_service_deferred() in usb/hid.cyr. The
+        # hid_poll above may have run in ISR context (timer tick / MSI-X) where it can neither touch the
+        # console nor issue a command that blocks on a Completion Event, so it leaves flags behind.
+        # ⚠ PLACEMENT IS LOAD-BEARING, TWICE OVER. It must be AFTER preempt_enable(), because halted-
+        # endpoint recovery issues Reset Endpoint / Set TR Dequeue and those BLOCK on a Command
+        # Completion Event — unreachable with preemption disabled. And it must be BEFORE the idle
+        # early-return below, or a pointer that reports nothing would never service a halted endpoint,
+        # which is precisely the state a halted pointer endpoint puts the system in.
+        hid_service_deferred();
         if (got == 0) { stack_canary_check(canary); return 0; }
         var pi = 0;
         while (pi < 16) {

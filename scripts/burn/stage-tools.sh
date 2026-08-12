@@ -136,6 +136,13 @@ stage_one gpumm        src/main.cyr gpumm    || rc=1
 # different symptoms.
 stage_one agnos/tests/audio tonegen.cyr tonegen || rc=1
 
+# Fault stimulus for the roadmap's `bg-fault` Uncertain item. IN-TREE (agnos/tests/fault).
+# ⛔ THIS ITEM HAD NO STIMULUS AT ALL UNTIL 2026-08-11. It was recorded at 1.50.9 as "riding the
+# next burn" and rode several, and no CHANGELOG entry since records an outcome — because nothing
+# in the rootfs faults on purpose, so every one of those burns could only observe the absence of a
+# fault it never caused. That is the same shape as a stale oracle: it does not fail, it agrees.
+stage_one agnos/tests/fault faulter.cyr faulter || rc=1
+
 # GPU display/compositing proofs — the ring-3 ends of the 1.55.x/1.56.x band. IN-TREE
 # (agnos/tests/gpu), same agnos/ prefix as tonegen. These were staged BY HAND for every burn
 # through 1.56.3, which is why nothing in scripts/ referenced them; wired in at 1.56.4 so a

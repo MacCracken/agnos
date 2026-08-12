@@ -1,0 +1,40 @@
+# faulter — a program whose whole job is to take a page fault.
+#
+# WHY THIS EXISTS. The roadmap has carried "`bg-fault` on-iron survival" as an
+# Uncertain item since 1.50.9 — the question being whether a faulted background
+# (`&`) job gets torn down cleanly or halts the shell along with it. It rode
+# "the next burn" and no CHANGELOG entry since records an outcome, and the
+# reason is simple: NOTHING IN THE ROOTFS FAULTS ON PURPOSE. The item had no
+# stimulus, so every burn it "rode" could only have reported the absence of a
+# fault it never caused. ⇒ A gate whose stimulus cannot fire reports nothing,
+# forever, while looking like a check that passed.
+#
+# WHAT IT DOES. Announces itself, then dereferences a null pointer. The announce
+# comes FIRST and is unbuffered so the log distinguishes the two failure shapes
+# that would otherwise look identical:
+#   - no FAULTER-ALIVE line  -> the program never ran (spawn/exec problem)
+#   - FAULTER-ALIVE, no more -> it ran and faulted, which is the intended stimulus
+# Without that line, "the shell printed nothing" is unattributable.
+#
+# ⚠ IT MUST NEVER EXIT NORMALLY. An exit code would make this a well-behaved
+# program that merely returns non-zero, and the shell's teardown path for a
+# faulted job would go untested while the burn read as green. The store below is
+# the last thing that happens; the trailing exit is unreachable and is there only
+# so the entry shape matches every other agnos test program.
+
+fn main(): i64 {
+    sys_write(1, "FAULTER-ALIVE\n", 14);
+
+    # Address 0 is never mapped in any agnos address space — the low arena starts
+    # at PD[128]. A write (not a read) so the fault is unambiguous even if some
+    # future zero-page mapping is ever introduced for reads.
+    store64(0, 1);
+
+    # Unreachable. If this line is ever reached the test is VACUOUS and the burn
+    # result means nothing — the log will say so rather than exiting 0 quietly.
+    sys_write(1, "FAULTER-DID-NOT-FAULT\n", 22);
+    return 42;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

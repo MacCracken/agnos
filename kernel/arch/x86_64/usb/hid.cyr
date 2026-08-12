@@ -61,6 +61,28 @@ enum HidReg {
 }
 var hid_ep_count = 0;
 var hid_first_report = 0;   # one-shot: has the registry dispatched a keyboard report yet?
+
+# ⛔⛔ THESE THREE EXIST BECAUSE `hid_poll` RUNS IN INTERRUPT CONTEXT AND MUST NEVER TOUCH THE CONSOLE.
+# `kprintln` takes `console_spin_lock` (smp.cyr) — an unbounded `xchg` spin with NO `cli` and NO owner
+# check — and `hid_poll` is called from the 100 Hz timer ISR (pic.cyr:79) and the MSI-X handler
+# (pic.cyr:258). Ring-3 `write(1)` holds that lock with IF=0 (SYSCALL masks IF via SFMASK 0x40700) and
+# so cannot be preempted, but the KEYSTROKE ECHO does not: syscall.cyr's read loop calls
+# `kbd_irq_enable()` and then `kputc`, and an interrupt landing inside that window re-enters `hid_poll`
+# → `kprintln` → spins forever on a lock its own CPU holds. Hard hang, no recovery, no further log.
+# ⚠ The window is widened enormously by a line wrap: `fb_scroll_up` runs inside the held lock and is a
+# 14.7 MB copy at 2560x1440.
+# ⭐ The invariant was already written down in TWO places and was true when written — kprint.cyr's
+# header and smp.cyr's console-lock banner both say "no ISR calls kprint". These one-shots broke it.
+# ⛔ THE FIX IS NOT `serial_println`: archaemenid has no serial cable, so that would delete the
+# instrument on the only machine that matters. Defer instead — set a flag here, print from thread
+# context (`hid_service_deferred`, called from kb_has_key + the #98 ptrscan arm). The latches above/below
+# stay, so the message is still exactly one line per boot; only WHERE it prints changed.
+var hid_first_report_pending = 0;   # kbd one-shot owed to the console
+var hid_mouse_first_pending  = 0;   # mouse one-shot owed to the console
+var hid_ep_needs_reset[8];          # per-row: endpoint Halted, owed a reset from thread context
+#ifdef HID_CC_INJECT
+var hid_cc_inject_left = 20;        # test-only: reject this many completions (> the 16 armed TRBs)
+#endif
 var hid_ep_slot[8];    # xHCI slot id
 var hid_ep_dci[8];     # Device Context Index of the interrupt-IN endpoint
 var hid_ep_kind[8];    # HidKind
@@ -207,9 +229,12 @@ fn hid_process_mouse_report(report_phys, bi) {
     hid_mouse_btn = uni;
     hid_mouse_btn_seen = hid_mouse_btn_seen | uni;
     hid_mouse_seq = hid_mouse_seq + 1;
+    # ⚠ FLAG, DO NOT PRINT — hid_process_mouse_report is reached from hid_poll in ISR context, and this
+    # one-shot is the LIVE hazard of the pair: unlike the keyboard's (which cannot coincide with the echo
+    # of a previous key), it fires at an arbitrary later instant and can land inside the kputc window.
     if (hid_mouse_first == 0) {
         hid_mouse_first = 1;
-        kprintln("hid: first mouse report accumulated", 35);
+        hid_mouse_first_pending = 1;
     }
     return 0;
 }
@@ -809,6 +834,90 @@ fn hid_poll_unlock() {
     return 0;
 }
 
+# ================= DEFERRED HID SERVICE — THREAD CONTEXT ONLY =====================================
+#
+# ⛔⛔ EVERYTHING IN HERE IS WORK `hid_poll` IS NOT ALLOWED TO DO, and the reason is the same for both
+# halves: `hid_poll` runs in interrupt context (100 Hz timer tick, and the xHCI MSI-X handler), where
+# taking the console lock can deadlock the CPU against itself and where a command that BLOCKS on a
+# Command Completion Event can never complete. So the ISR records intent in a flag and returns; this
+# function is the thread-context half that acts on it.
+#
+# ⚠ CALL SITES MUST BE THREAD CONTEXT. Today: `kb_has_key()` (the keyboard read loop) and the `#98`
+# ptrscan syscall arm. Both are reached from ring 3 via a syscall, never from an ISR. ⛔ Do NOT add a
+# call from `pic.cyr` or any other interrupt handler — that reintroduces exactly the hang this exists
+# to prevent, and it would look like it works right up until a keystroke echo coincides with a tick.
+
+# Print the one-shots the drain owed us. Latches live at their producers, so this stays one line each
+# per boot no matter how often it is called.
+# ⚠ Reading-then-clearing without a lock is safe here: the ISR only ever sets these 0 -> 1, so the worst
+# interleaving is printing one tick later, never twice (the producer's own latch prevents a re-set).
+fn hid_flush_oneshots() {
+    if (hid_first_report_pending == 1) {
+        hid_first_report_pending = 0;
+        kprintln("hid: first keyboard report dispatched via the endpoint registry", 63);
+    }
+    if (hid_mouse_first_pending == 1) {
+        hid_mouse_first_pending = 0;
+        kprintln("hid: first mouse report accumulated", 35);
+    }
+    return 0;
+}
+
+# Recover any endpoint the drain saw halt. Stall (6), Transaction Error (4) and Babble (8) leave the
+# endpoint Halted with its dequeue pointer pinned; re-arming the ring is inert until Reset Endpoint has
+# moved it Halted -> Stopped and Set TR Dequeue has repositioned it. Mirrors the mass-storage recovery
+# in msc.cyr, minus the bulk-specific CBW/CSW resynchronisation which has no HID analogue.
+# ⚠ Gate Reset Endpoint on actually reading Halted: it is only legal from that state, and a Context
+# State Error abort on a wrong-state reset is its own failure mode (msc.cyr records one that bricked a
+# boot). If the state has already moved on, clear the flag and leave the endpoint alone.
+# ⚠⚠ PROVEN REACHABLE, NOT PROVEN CORRECT — AND THE DIFFERENCE MATTERS FOR WHOEVER TOUCHES THIS NEXT.
+# Injecting a halting completion code (HID_CC_INJECT with ccode 6) shows the flag is set, this function
+# is called from thread context, and the system survives. It does NOT show the reset sequence works,
+# because an injected code is fabricated by software: the CONTROLLER never actually halted, so
+# xhci_ep_state() reports Running and the body below early-outs before issuing a single command.
+# ⇒ The Reset Endpoint / Set TR Dequeue pair here has never executed anywhere. Validating it needs a
+# genuine halt — a real Stall from real silicon, or a controller-level fault-injection agnos does not
+# have. Treat the sequence as prior-art-shaped (it mirrors msc.cyr, which IS iron-proven) but untested.
+fn hid_recover_halted() {
+    var i = 0;
+    while (i < hid_ep_count) {
+        if (load64(&hid_ep_needs_reset + i * 8) == 1) {
+            store64(&hid_ep_needs_reset + i * 8, 0);
+            var slot = load64(&hid_ep_slot + i * 8);
+            var dci  = load64(&hid_ep_dci  + i * 8);
+            if (xhci_ep_state(slot, dci) == XHCI_EP_STATE_HALTED) {
+                if (xhci_cmd_reset_endpoint(slot, dci) == 0) {
+                    kprintln("hid: an endpoint halted and the controller refused to reset it", 62);
+                } else {
+                    # Reposition the dequeue pointer at the ring slot the producer will fill next, with
+                    # the producer's current cycle state, then re-arm and ring the doorbell. Without the
+                    # Set TR Dequeue the controller resumes at the pinned TRB and halts again immediately.
+                    var ring = load64(&hid_ep_ring  + i * 8);
+                    var idx  = load64(&hid_ep_idx   + i * 8);
+                    var cyc  = load64(&hid_ep_cycle + i * 8);
+                    if (xhci_cmd_set_tr_dequeue(slot, dci, ring + idx * 16, cyc & 0x1) == 0) {
+                        kprintln("hid: an endpoint reset but its dequeue pointer would not move", 61);
+                    } else {
+                        hid_arm_row_trb(i);
+                        var db = xhci_mmio_base + xhci_db_off + slot * 4;
+                        store32(db, dci & 0xFF);
+                        kprintln("hid: an endpoint halted and was reset; input from it should resume", 66);
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# The one entry point callers use. Cheap to call often: both halves short-circuit on a clean system.
+fn hid_service_deferred() {
+    hid_flush_oneshots();
+    hid_recover_halted();
+    return 0;
+}
+
 fn hid_poll() {
     # ⛔ THIS USED TO READ `hid_kbd_slot_id == 0`, i.e. "no KEYBOARD, do nothing" — which on a box with a
     # mouse and no keyboard means nothing is drained AND `IMAN.IP` below is never cleared, so the
@@ -846,7 +955,19 @@ fn hid_poll() {
             # loop that consumes the event either way. A second HID device therefore could not be served
             # by a second poller: this loop would already have eaten its completions.
             # ⚠ The doorbell target is `evt_ep`, which IS the matched row's DCI — the event told us.
-            var bi = hid_ep_find(evt_slot, evt_ep);
+            # ⭐⭐ TWO VARIABLES, AND THE SPLIT IS THE WHOLE FIX. `row` is the endpoint this event
+            # belongs to and is ALWAYS valid — it is used for ring MAINTENANCE (re-arm + doorbell), which
+            # must happen whether or not the transfer carried data. `cc_ok` gates only whether the report
+            # is FOLDED. Overloading one variable for both is what broke this: the old code did
+            # `if (cc_ok == 0) { bi = 0 - 1; }` with the comment "re-arm below, fold nothing", but
+            # `hid_ep_kind_at(-1)` is HID_KIND_NONE, so BOTH kind-gated blocks were skipped — and those
+            # blocks hold the ONLY re-arm and doorbell writes. There was no re-arm below.
+            # ⛔ THE CONSEQUENCE WAS SILENT AND TERMINAL. The event is consumed unconditionally further
+            # down, so each rejected completion permanently spent one TRB of a 16-deep ring. Sixteen
+            # cumulative errors empty the ring, and this file already documents what follows: "the
+            # controller hits the empty ring at the next service interval and STALLS the endpoint."
+            # Presents as INPUT FROZE, CPU STILL ALIVE, with nothing in the log.
+            var row = hid_ep_find(evt_slot, evt_ep);
             # ⛔⛔ DID THE TRANSFER ACTUALLY SUCCEED? A Transaction Error, Babble, Stall or Data Buffer
             # Error still posts a Transfer Event with IOC set — the TRB completed, it just did not carry
             # data — and leaves the shared report page holding the PREVIOUS successful report. Folding
@@ -861,30 +982,65 @@ fn hid_poll() {
             var cc_ok = 0;
             if (ccode == 1) { cc_ok = 1; }
             if (ccode == 13) { cc_ok = 1; }
-            if (cc_ok == 0) { bi = 0 - 1; }        # not a usable report: re-arm below, fold nothing
-            if (hid_ep_kind_at(bi) == HidKind.HID_KIND_KBD) {
-                # ⭐ NAME THE PATH THAT DELIVERED THE FIRST KEY, once. Without this the drain is silent,
-                # and silence is why a mutation test of this very dispatch read GREEN while the keyboard
-                # kept working — there was no way to tell whether keys came through here or through the
-                # PS/2 ISR that used to shadow it. A line here makes the producer self-identifying on any
-                # boot, QEMU or iron. [[feedback_instrument_discipline]]
-                if (hid_first_report == 0) {
-                    hid_first_report = 1;
-                    kprintln("hid: first keyboard report dispatched via the endpoint registry", 63);
+            #ifdef HID_CC_INJECT
+            # ⭐ FAULT INJECTION — THE ONLY WAY TO PROVE THE RE-ARM PATH. QEMU never emits a rejected
+            # completion code, so the "re-arm even when the report is unusable" fix above is otherwise
+            # compiled-but-never-executed. This forces the first 20 completions to look like a
+            # non-halting Data Buffer Error (2) — more than the 16 TRBs armed at init, so the ring is
+            # provably exhausted. WITH the fix the ring keeps being re-armed and the keyboard works
+            # again once injection stops; WITHOUT it the endpoint stalls and never recovers.
+            # ⛔ Build-gated and OFF by default. Never ship a kernel with this defined.
+            if (hid_cc_inject_left > 0) {
+                hid_cc_inject_left = hid_cc_inject_left - 1;
+                cc_ok = 0;
+                ccode = 2;                # Data Buffer Error: rejected, but NOT a halting code
+            }
+            #endif
+            # ⛔ A HALTING CODE MAKES A BARE RE-ARM INERT, so re-arming is necessary but NOT sufficient.
+            # Stall (6), Transaction Error (4) and Babble (8) leave the endpoint HALTED with its dequeue
+            # pointer pinned: the controller will not advance it again until software issues Reset
+            # Endpoint + Set TR Dequeue Pointer. Those commands BLOCK on a Command Completion Event, so
+            # they cannot run here in ISR context — flag the row and let hid_recover_halted() do it from
+            # thread context. ⚠ Without this, one marginal cable or hub glitch kills that device until
+            # reboot, silently. mass-storage has had this recovery for a while (msc.cyr); HID never did.
+            if (row >= 0) {
+                var halting = 0;
+                if (ccode == 4) { halting = 1; }
+                if (ccode == 6) { halting = 1; }
+                if (ccode == 8) { halting = 1; }
+                if (halting == 1) { store64(&hid_ep_needs_reset + row * 8, 1); }
+            }
+            if (hid_ep_kind_at(row) == HidKind.HID_KIND_KBD) {
+                if (cc_ok == 1) {
+                    # ⭐ NAME THE PATH THAT DELIVERED THE FIRST KEY, once. Without this the drain is
+                    # silent, and silence is why a mutation test of this very dispatch read GREEN while
+                    # the keyboard kept working — there was no way to tell whether keys came through here
+                    # or through the PS/2 ISR that used to shadow it. A flag here makes the producer
+                    # self-identifying on any boot, QEMU or iron. [[feedback_instrument_discipline]]
+                    # ⚠ FLAG, DO NOT PRINT — this runs in ISR context. See the hid_first_report_pending
+                    # banner at the top of this file for the deadlock a kprintln here causes.
+                    if (hid_first_report == 0) {
+                        hid_first_report = 1;
+                        hid_first_report_pending = 1;
+                    }
+                    # Kbd IN report just landed in hid_kbd_report_buf.
+                    hid_process_report(hid_kbd_report_buf);
+                    processed = processed + 1;
                 }
-                # Kbd IN report just landed in hid_kbd_report_buf.
-                hid_process_report(hid_kbd_report_buf);
-                processed = processed + 1;
+                # ⚠ UNCONDITIONAL — the ring must be re-armed even when the report was unusable.
                 hid_arm_xfer_trb();
                 var db_addr = xhci_mmio_base + xhci_db_off + evt_slot * 4;
                 store32(db_addr, evt_ep & 0xFF);
             }
             # ⭐ THE MOUSE ARM. Every event is FOLDED, never latched — see the accumulator's header for
             # why keeping only the last report of a coalescing gap amplifies relative motion ~2-3x.
-            if (hid_ep_kind_at(bi) == HidKind.HID_KIND_MOUSE) {
-                hid_process_mouse_report(load64(&hid_ep_buf + bi * 8), bi);
-                processed = processed + 1;
-                hid_arm_row_trb(bi);
+            if (hid_ep_kind_at(row) == HidKind.HID_KIND_MOUSE) {
+                if (cc_ok == 1) {
+                    hid_process_mouse_report(load64(&hid_ep_buf + row * 8), row);
+                    processed = processed + 1;
+                }
+                # ⚠ UNCONDITIONAL — see the keyboard arm above.
+                hid_arm_row_trb(row);
                 var mdb = xhci_mmio_base + xhci_db_off + evt_slot * 4;
                 store32(mdb, evt_ep & 0xFF);
             }

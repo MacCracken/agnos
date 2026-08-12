@@ -1209,7 +1209,14 @@ esac
 # failure this loop's own comment names: a tool absent from here is a tool that can be silently stale, and
 # a stale oracle does not fail, it AGREES. ⚠ agnsh is staged by `stage-agnsh.sh`, not `stage-tools.sh`, and
 # living in a different script is exactly why it was missed.
-for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy gpudepth klug aethersafha puka crab agnsh; do
+# ⛔⛔ kriya / iam / faulter ADDED 2026-08-11 FOR THE SWEEP BURN, WHICH IS A BURN WHOSE ORACLES ARE
+# ALL USERLAND. The rule this loop's own comments state four times over — "when a cycle's oracle is a
+# new or changed tool, ADD IT HERE IN THE SAME BITE" — applies with no kernel change at all this time:
+# the sweep's questions are `kriya ln -s` (newly un-gated at kriya 1.1.9), `iam`'s Kernel line (whose
+# leading hypothesis is literally "it was a stale staged binary"), and `faulter` (a stimulus that did
+# not exist before today). ⇒ An unverified /bin/iam would let the burn "confirm" the stale-binary
+# theory using a stale binary, which is the theory testing itself.
+for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy gpudepth klug aethersafha puka crab agnsh kriya iam faulter; do
     _src=""
     _puka_alt=""
     case "$_t" in
@@ -1224,6 +1231,9 @@ for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy
         gpufill)  _src="tests/gpu/build/gpufill_agnos" ;;
         gpucopy)  _src="tests/gpu/build/gpucopy_agnos" ;;
         klug)    _src="" ;;   # klug is staged from its own repo; size-compare only
+        kriya)   _src="../kriya/build/kriya_agnos" ;;
+        iam)     _src="../iam/build/iam_agnos" ;;
+        faulter) _src="tests/fault/build/faulter_agnos" ;;
         # ⛔ ADDED 2026-08-02 AFTER THIS GATE MISSED IT. The desktop burn staged an aethersafha
         # NINE HOURS OLD -- no geometry fix, none of the new diagnostics -- and every check passed,
         # because the only aethersafha check was a grep for "--selftest" and the OLD binary had that

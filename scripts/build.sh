@@ -341,6 +341,11 @@ else
         # stable lock before it unmutes has never been given one. ⛔ Do not combine with MODESET_AUDIO: that
         # suppresses the boot-time enable and there is no link to hold.
         [ -n "$HDMI_QUIET_HOLD" ]    && echo '#define HDMI_QUIET_HOLD'
+        # HID_CC_INJECT=1 — TEST ONLY. Forces the first 20 HID transfer completions to be rejected
+        # (non-halting Data Buffer Error), which is more than the 16 TRBs armed at init. This is the
+        # only way to exercise the "re-arm even when the report is unusable" path, since QEMU never
+        # emits a rejected completion code on its own. ⛔ Never flash a kernel built with this.
+        [ -n "$HID_CC_INJECT" ]      && echo '#define HID_CC_INJECT'
         # HDMI_DCCG=1 — apply the DCCG symbol-clock re-prime (SYMCLKA on) in gpu_hdmi_audio_enable: the
         # host-visible DCCG writes amdgpu makes for HDMI (abs 0x159-0x15c, 0x176) that agnos omitted, replicated
         # from the amdgpu modeset capture (ground truth). No PHY power-cycle ⇒ display-safe. Requires HDA_HDMI.

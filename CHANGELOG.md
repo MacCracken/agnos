@@ -31,6 +31,92 @@ produce — the required flag set (`HDA_HDMI` + `HDMI_ATOM` + `HDA_TONE` + `GPU_
 pre-registered outcome table — and it stands. This cycle is a **review and audit first**: establish what is
 actually proven, what is falsified, and what is merely untested, before spending another boot.
 
+### Fixed — a rejected HID completion code left the endpoint dead (input froze, CPU alive)
+
+`hid_poll`'s drain set `bi = -1` on any completion code other than SUCCESS/SHORT_PACKET, with the
+comment *"re-arm below, fold nothing"*. `hid_ep_kind_at(-1)` is `HID_KIND_NONE`, so both kind-gated
+blocks were skipped — and those blocks contained the only `hid_arm_xfer_trb()` / `hid_arm_row_trb()`
+calls and the only doorbell writes. The event was consumed unconditionally regardless, so every
+rejected completion permanently spent one TRB of the 16 armed at init. Sixteen cumulative errors
+emptied the ring and the controller stalled the endpoint.
+
+The drain now keeps the endpoint row (`row`) separate from the fold gate (`cc_ok`): re-arm and
+doorbell are unconditional inside each kind arm, and only report processing is gated.
+
+**Measured** via `HID_CC_INJECT=1` (new, build-gated; forces the first 20 completions to a
+non-halting Data Buffer Error — more than the 16 armed TRBs): with the fix the keyboard recovers and
+the shell answers; with the pre-fix gating restored as a control, input is dead for the remainder of
+the boot. `scripts/harness/hid-cc-inject-test.py`.
+
+### Fixed — the two `hid` one-shots called `kprintln` from interrupt context
+
+`hid.cyr`'s first-keyboard-report and first-mouse-report messages printed from inside `hid_poll`,
+which runs in the 100 Hz timer ISR (`pic.cyr:79`) and the xHCI MSI-X handler (`pic.cyr:258`).
+`kprintln` takes `console_spin_lock` — an unbounded `xchg` spin with no `cli` and no owner check.
+Ring-3 `write(1)` holds that lock with IF=0 and cannot be preempted, but the keystroke echo path
+enables interrupts around `kputc`; an interrupt landing there re-entered `hid_poll` → `kprintln` and
+spun forever on a lock its own CPU held. The window is widened by a line wrap, since `fb_scroll_up`
+runs inside the held lock (a 14.7 MB copy at 2560x1440).
+
+Both are now flags drained by `hid_service_deferred()` from thread context — `kb_has_key()` and the
+`#98` ptrscan arm. `hid_poll` is console-silent. The messages are unchanged and still one line per
+boot; only where they print moved. This restores the invariant already documented in `kprint.cyr`
+and `smp.cyr` ("no ISR calls kprint").
+
+**Measured**: `scripts/harness/hid-mouse-deferred-test.py` attaches a QEMU USB mouse, injects motion
+and asserts the one-shot arrives **without any typing** (the shell's `kb_has_key` poll loop drives
+the flush). Mutation-tested — disabling the flush call turns that assertion red.
+
+### Added — halted-endpoint recovery on the HID path (`hid_recover_halted`)
+
+Completion codes 4 / 6 / 8 (Transaction Error, Stall, Babble) leave the endpoint Halted with its
+dequeue pointer pinned, so a bare re-arm is inert. The drain now flags the row and
+`hid_recover_halted()` issues Reset Endpoint + Set TR Dequeue from thread context (they block on a
+Command Completion Event and cannot run in an ISR), mirroring the mass-storage recovery in
+`msc.cyr`. Previously `hid.cyr` had zero uses of either command.
+
+⚠ **Reachable, not validated.** An injected halting code shows the flag is set, the function runs
+and the system survives — but the controller never actually halted, so `xhci_ep_state()` reports
+Running and the body early-outs before issuing a command. The Reset/Set-TR-Dequeue pair has not
+executed anywhere; validating it needs a genuine hardware stall.
+
+### Verified on iron — Backspace, and file timestamps on the real volume
+
+Burned PASS 2026-08-11 on archaemenid (bare 1.56.43). Backspace reaches the line editor at the
+`[ASSIST] >` prompt. Files created on the NVMe agnos-fs carry real dates (`2026-08-12 01:27` UTC),
+and `mtime` advances on write (`01:27` → `01:29` after an append), so `ext2_stamp_mtime` fires on
+the write path and not only at create. Pre-existing files still read `1970-01-01`, which is the
+negative control.
+
+### Fixed — `uname`#34 returned EMPTY `nodename` and `release`
+
+`sysinfo_put_str` was handed the `kernel_hostname` and `_AGNOS_VERSION` **gvars**; the gvar pointers are
+not live on the ring-3 syscall path, so both fields came back all-zero. `sysname` and `machine` — inline
+string literals in the same arm, through the same helper — were unaffected. Both now read through
+program-body-safe function accessors: the existing `agnos_version_str()` (`kernel/version.cyr`) and a new
+`kernel_hostname_str()` (`kernel/core/syscall.cyr`), which bake the rodata pointer into the function at
+compile time.
+
+Observable: `iam` prints `Kernel: AGNOS 1.56.43` and `Host: agnos`, where it previously printed a bare
+`AGNOS` with a trailing space and an empty `Host:`. ABI unchanged — 64-byte struct, four 16-byte
+NUL-padded fields at offsets 0/16/32/48 (sysname / nodename / release / machine).
+
+### Added — `tests/fault/faulter.cyr`, a deliberate-`#PF` stimulus
+
+A minimal `--agnos` program that writes `FAULTER-ALIVE` to fd 1 and then stores to address 0. Staged to
+`/bin/faulter` by `stage-tools.sh`. Exists because the roadmap's `bg-fault` item had no stimulus in the
+rootfs at all, so it could not be tested by any burn it "rode".
+
+### Added — `scripts/harness/sweep-test.py`
+
+One QEMU boot that settles the userland half of the roadmap's Uncertain list: the `iam` Kernel line,
+`kriya ln -s`, `kriya readlink` no-follow, and shell survival of a faulted `&` job. Builds its own image
+from `build/rootfs` + `build/agnos`. The faulting check runs last so it cannot perturb the readings taken
+before it, and a warm-up keystroke absorbs the first-key-of-session drop that otherwise eats the leading
+character of the first command.
+
+`burn-prep.sh`'s staged-tool freshness gate now also covers `kriya`, `iam` and `faulter`.
+
 ### Fixed — every file agnos created was dated 1970-01-01, because the driver believed there was no RTC
 
 ⛔⛔ **MEASURED, from outside agnos**: with the agnos-fs mounted on Linux, every file the kernel had ever

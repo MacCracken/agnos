@@ -95,6 +95,13 @@ fn kb_has_key() {
     # ⚠ Calling hid_poll here is what makes every polling consumer also a drain, so a caller parked in a
     # spin still services the ring even if the MSI-X on vector 0x51 is missed.
     hid_poll();
+    # ⭐ THREAD-CONTEXT HALF OF THE HID DRAIN. hid_poll runs in ISR context too, where it may neither
+    # touch the console (console_spin_lock has no cli and no owner check -> same-CPU deadlock) nor issue
+    # a command that blocks on a Completion Event. It therefore records intent in flags; this call is
+    # what acts on them. kb_has_key is reached only from ring 3 via a syscall, so it is safe here.
+    # ⚠ It is placed AFTER hid_poll deliberately: a report drained a microsecond ago should flush its
+    # one-shot on this same pass rather than waiting for the next poll.
+    hid_service_deferred();
     # 1.53.7's dispositive "xhci: RX MSI LIVE (… vector 0x51)" proof was REMOVED at 1.53.14 once the
     # interrupt-driven USB-HID path was iron-validated on real AMD FCH — printed from this read loop,
     # it splattered onto the shell prompt. The keyboard responding IS the live signal now, and the
