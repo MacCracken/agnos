@@ -1,39 +1,24 @@
 #!/usr/bin/env python3
-# sweep-test — settle the roadmap's "Uncertain — verify on the next burn" items that are
-# USERLAND, in QEMU, so they do not each cost an iron boot.
+# hid-cc-inject-test — prove the HID drain RE-ARMS its ring on a REJECTED completion code.
 #
-# ⭐ WHY THIS EXISTS AT ALL. Those items were parked as "no work expected, ride the next burn"
-# and then rode several burns without producing an outcome. Three of the four are pure userland
-# behaviour — a shell reaction, a syscall wrapper, a version string — and userland is QEMU's
-# job, not iron's ([[feedback_localize_before_theorizing_userland_is_qemu]]). Only the ones that
-# genuinely need archaemenid's own silicon (the xHCI keyboard's Backspace scancode, timestamps
-# landing on a real disk) belong on a burn card. An iron boot costs the operator a reboot of
-# their only machine; a QEMU run costs a minute.
+# ⛔ REQUIRES A KERNEL BUILT WITH `HID_CC_INJECT=1` — it is inert otherwise, and a green run against a
+# normal kernel means nothing. Build with:  HID_CC_INJECT=1 sh scripts/build.sh
 #
-# Checks, in this order (see the ordering note below):
-#   1. iam Kernel line   — `iam` printed a bare "AGNOS" with no version. The whole chain is wired
-#                          (_AGNOS_VERSION -> uname#34 release@32 -> mihi_uname -> iam_render_kernel),
-#                          so the standing hypothesis is a stale staged binary. This runs a freshly
-#                          built one; a bare AGNOS here means the hypothesis is WRONG and there is
-#                          a real bug.
-#   2. kriya ln -s       — un-gated at kriya 1.1.9 (K_HAVE_SYMLINK 0 -> 1, routed through the named
-#                          SYS_SYMLINK#63). The kernel primitive is already proven by tests/symlink;
-#                          what is unproven is kriya's own wiring, which no host smoke can reach
-#                          because the agnos arm is compiled out on Linux by construction.
-#   3. kriya readlink    — the no-follow peer (#70). Reading back the LINK TEXT (not the followed
-#                          content) is what distinguishes a real readlink from a stat that followed.
-#   4. faulter &         — the `bg-fault` item: a background job that takes a #PF. Does the shell
-#                          survive and reap it, or halt with it?
+# That flag forces the first 20 transfer completions to a non-halting Data Buffer Error — more than the
+# 16 TRBs armed at init, so the ring is provably exhausted during the window. QEMU never emits a rejected
+# completion code on its own, so without injection the fix is compiled-but-never-executed.
 #
-# ⚠ ORDER IS DELIBERATE: the faulting job runs LAST. It is the only check that deliberately
-# destabilises the system, so anything it perturbs cannot contaminate a reading taken before it.
-# A fault-first ordering would make every later result un-attributable.
+#   WITH the 1.56.43 re-arm fix     -> the ring keeps being re-armed; once injection stops, keys work.
+#   WITHOUT it (restore the pre-fix `bi = -1` gating as a control)
+#                                   -> nothing re-arms, the controller hits an empty ring, the endpoint
+#                                      stalls, and the keyboard is dead for the rest of the boot.
 #
-# ⛔ Each check reports its own PASS/FAIL and the script exits non-zero if ANY fail — but a failure
-# here is a RESULT, not a broken harness. These are open questions; "kriya ln -s fails on agnos" is
-# exactly the kind of answer this exists to produce, and it should be read as data.
+# ⭐ THE CONTROL IS WHAT MAKES THIS A MEASUREMENT. Run both arms; a passing fixed arm alone does not
+# distinguish "the fix works" from "the injection never fired".
+# ⛔ NEVER FLASH A KERNEL BUILT WITH THIS FLAG — it deliberately destroys the first 20 input reports.
+# `burn-prep.sh` builds bare and `burn-verify.sh` prints `ARM: bare`; check for that line.
 #
-# Builds its own image from build/rootfs (so run stage-tools.sh first) + build/agnos.
+# Adapted from sweep-test.py (image build + xHCI keyboard driving are identical).
 import socket, subprocess, sys, time, os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

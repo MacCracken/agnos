@@ -3,7 +3,7 @@
 <!-- TOOLING ANCHOR: scripts/version-bump.sh seds ONLY the version numbers in `> **Current**: vX.Y.Z`
      and `Built with cyrius X.Y.Z`. Delete either anchor and that sed becomes a silent no-op. -->
 
-> **Current**: v1.56.43 — live state (kernel head, cyrius pin, active burn, sweeps, sizes) lives in [`state.md`](state.md).
+> **Current**: v1.56.44 — live state (kernel head, cyrius pin, active burn, sweeps, sizes) lives in [`state.md`](state.md).
 
 Forward-only. Shipped work is not narrated here: history is [`../../CHANGELOG.md`](../../CHANGELOG.md), live state is [`state.md`](state.md), the normative syscall contract is [`agnos-userland-abi.md`](agnos-userland-abi.md). **All GPU/display/HDMI work is one open release (1.56.x) and lives entirely in [`planning/gpu.md`](planning/gpu.md)** — plan, register facts, falsified record, remaining ladder. Do not re-narrate it here and do not open a second GPU doc. Ship milestones (beta/GA/maturity arc) live in the agnosticos roadmap. Language roadmap: `../../../cyrius/docs/development/roadmap.md`.
 
@@ -79,49 +79,18 @@ Forward-only. Shipped work is not narrated here: history is [`../../CHANGELOG.md
 | **RISC-V platform** | Boards on hand. Shifted from 1.7x when radios claimed that decade. | **1.8x** | — |
 | **agnos 2.0 — clean refactor/rewrite** | The old "held on Cyrius's cadence" gate is largely cleared (type system v5.10.x, closures v6.x, userland PIE v6.1.41). The genuinely unshipped prerequisite is **native generics + monomorphization**, which cyrius carries *unpinned* in `roadmap-future.md`. | deferred | cyrius generics; and the base-to-server surface backlog above takes priority |
 
-**Uncertain — verify on the next burn, no work expected:** *(empty — the backlog cleared 2026-08-11)*
-The one item that is not a burn question: whether `BENCHMARKS.md` and `bench-history.csv` are
-git-tracked (`git ls-files` settles it from a shell; CI already uploads both as a 90-day artifact).
+**Uncertain — verify on the next burn:** two carried from the 1.56.43 HID work
+([card](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md#tracker-15643-hid)),
+both needing a boot **with the mouse attached** — the 2026-08-11 burn ran without one:
+- **The mouse one-shot's deferred flush on iron.** QEMU-proven and mutation-tested; the keyboard half is
+  iron-proven, the mouse half is not.
+- **Whether the composite keyboard's phantom mouse interface is genuinely mute.** ⛔ Do NOT record the
+  2026-08-11 burn as evidence either way: no mouse report appeared, but nothing in the log shows a media
+  key was ever pressed, and a keypress leaves no trace unless it produces output. **A stimulus that may
+  never have fired reports zero regardless of the truth.** Press Volume-Up and *say so* — the question is
+  whether interface 1 emits in report protocol, which would let a media key move the cursor.
 
-⭐⭐ **THE WHOLE LIST IS GONE, AND ONLY TWO OF ITS ITEMS EVER NEEDED A BURN**
-([card](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md#tracker-15643-sweep)).
-Burned PASS 2026-08-11, both green first try:
-- **Backspace works on iron.** `versionX` + Backspace → `version` → `agnoshi 1.8.9`. The 1.53.14
-  native-xHCI HID rewrite **did** fix it, and the original UEFI-USB-legacy diagnosis is closed.
-- **File timestamps land on the real NVMe volume**, and mtime **updates on write** (`01:27` create →
-  `01:29` after an `echo`), so the write-path stamping works and not just create. ⭐ The negative
-  control held: every pre-existing file still reads `1970-01-01` while everything created that boot
-  carries a real date — the contrast is what makes it a measurement.
-
-⭐ **Four items left this list on 2026-08-11 without costing a burn, and the reason is worth keeping.**
-They had been parked as "ride the next burn, no work expected" and rode several without producing an
-outcome — because three of them are pure **userland** behaviour (a shell reaction, a syscall wrapper,
-a version string) and userland is QEMU's job. `scripts/harness/sweep-test.py` settles them in one
-QEMU boot; only what genuinely needs archaemenid's silicon stays above.
-
-- **`bg-fault` on-iron survival — SETTLED, and it had NO STIMULUS.** The shell survives and reaps a
-  faulted `&` job (`FAULTER-ALIVE` → `[1] 3` → `[1] Done`, prompt still answering). ⛔ It could not
-  have been settled by any earlier burn: **nothing in the rootfs faulted on purpose**, so every burn
-  it "rode" could only observe the absence of a fault it never caused. `tests/fault/faulter.cyr`
-  is that missing stimulus. A gate whose stimulus cannot fire reports nothing forever while reading
-  as a check that passed.
-- **`iam`'s bare `AGNOS` Kernel line — NOT a stale binary; a REAL kernel bug, now fixed.** The
-  standing hypothesis was a stale staged artifact. A freshly built `iam` reproduced it exactly, so
-  the hypothesis is **falsified**. `uname`#34 filled `nodename` and `release` from the
-  `kernel_hostname` / `_AGNOS_VERSION` **gvars**, which are not live on the ring-3 syscall path —
-  while `sysname` and `machine`, inline literals in the same arm through the same helper, were
-  correct. ⭐ `version.cyr` already carried the fix and had written down why (`agnos_version_str()`
-  exists so the rodata pointer is baked into the *function*); uname reached past it for the gvar.
-  Now `Kernel: AGNOS 1.56.43` and `Host: agnos`.
-- **`kriya ln -s` un-gate — SETTLED at kriya 1.1.9.** Creates a resolvable symlink; `readlink`
-  returns the link TEXT (`/etc/hostname`), not the followed content, so the no-follow contract holds.
-  ⛔ The un-gate was **not** a flag flip: the dead agnos arms carried `syscall(88/89, …)`, the Linux
-  numbers, which on agnos are `gpu_fill_rect` and `gpu_caps`.
-- **`winsize`#60 adoption in `kii`/`cyim`/`chakshu`** — re-classified. This is **adoption work**, not
-  a verification, so it never belonged on a burn list. ⚠ `cyim` additionally cannot be built for
-  agnos at all right now (its LSP calls `sys_waitpid` with Linux arity plus `fork`/`execve`/`dup2`),
-  so `/bin/cyim` in the rootfs is frozen at an old build and needs a capability gate first.
-
+Not a burn question: whether `BENCHMARKS.md` and `bench-history.csv` are git-tracked (`git ls-files`).
 
 ---
 

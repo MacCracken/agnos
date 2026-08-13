@@ -20,7 +20,51 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
-## [1.56.43] — 2026-08-10 — cycle OPEN: the HDMI-audio leg, reviewed and audited toward a verdict
+## [1.56.44] — 2026-08-13 — cycle OPEN: a fullscreen surface can be GPU-composited
+
+### Changed — `#86` GPU shm slots are 16 MB, not 2 MB
+
+`GPU_SHM_SLOT_SIZE` 0x200000 → **0x1000000**. `SHM_MAX_SIZE` (2 MB) is split into two constants: it now
+caps `#71` only, where `pmm_alloc_2mb` is genuinely one page; `#86` is capped by the new
+**`SHM_GPU_MAX_SIZE` = 16777216**.
+
+At 32bpp a 2 MB slot held 524,288 px (~724x724). A client surface at the native 2560x1440 is 14,745,600 B,
+so `shm_create_gpu` refused it and the client fell back to `shm_create#71` — system RAM, which the GPU
+cannot read (bus-master off by design) — putting that surface on the CPU path. A 16 MB slot holds
+2560x1440 with 2,031,616 B spare.
+
+⚠ 3840x2160 (33,177,600 B) still does not fit: 16 slots at that size need 531 MB and
+`GPU_SHM_REGION_OFF`..`GPU_RT_REGION_OFF` is 256 MB. 4K needs the carveout re-partitioned.
+
+New `GPU_SHM_REGION_SIZE` = 0x10000000 (256 MB, 0xA0000000 → 0xB0000000 = `GPU_RT_REGION_OFF`).
+`SHM_MAX * GPU_SHM_SLOT_SIZE` = 16 x 16 MB = 256 MB, checked against it in `shm_create_gpu`, which
+refuses rather than allocating past the region.
+
+### Fixed — `shm_create_gpu` WC-mapped only the first 2 MB of a slot
+
+`vmm_remap_wc_2mb` remaps one 2 MB page. One call covered a 2 MB slot exactly; at 16 MB it left 14 MB of
+every slot on the direct map's attributes, so the write-combining `shm_write`'s sequential store run
+depends on held for the first eighth of the slot and not the rest. Now loops over `GPU_SHM_SLOT_SIZE` in
+0x200000 steps.
+
+### Changed — `gpu_caps#89` +24 reports the GPU slot cap
+
+Was `SHM_MAX_SIZE` (the `#71` pmm cap), now `SHM_GPU_MAX_SIZE`. Ring 3 sizes `#86` requests from this
+field; reporting the pmm cap understated the GPU slot by 8x. Additive for consumers that only compare
+against it — aethersafha's `ae_gpu_wp_fits` reads it at runtime and needs no change.
+
+**Build**: 1,980,424 B. 4/4 kernel tests.
+⚠ **Unburned.** QEMU exposes no AMD PCI device, so `gpu_find` never matches and no `#86`/`#87` path
+executes there. First execution is an iron burn.
+
+## [1.56.43] — 2026-08-11 — the audio leg shelved, the Uncertain backlog emptied, three HID defects fixed (CLOSED)
+
+✅ **Cycle closed 2026-08-11.** It opened on the HDMI-audio leg and ended somewhere else, which is worth
+stating plainly rather than retitling away: the audio leg was **shelved again** after five burns established
+that every source-side observable says PLAYING and there is still no sound; the cycle's value came from what
+followed. **Three arcs shipped**: the ext2 timestamp fix (files no longer stamp 1970), the *Uncertain — ride
+the next burn* backlog cleared to empty (three of its four items were userland and never needed a burn at
+all), and three HID input-path defects found and fixed while explaining a single log line at the shell prompt.
 
 ⏸ **Opened for the audio leg, which has been PARKED under operator hold since 2026-08-07.** The desktop arc
 closed with 1.56.42 and its forward work moved into aethersafha's own roadmap (M6, userland), so the kernel's
@@ -116,6 +160,10 @@ before it, and a warm-up keystroke absorbs the first-key-of-session drop that ot
 character of the first command.
 
 `burn-prep.sh`'s staged-tool freshness gate now also covers `kriya`, `iam` and `faulter`.
+
+New: `scripts/harness/README.md` indexes all 16 QEMU harnesses (there was no index), records that
+`sweep.sh` runs `scripts/smoke/*` and never `harness/*.py`, and states the rule the sweep harness
+embodies — a question whose answer lives in userland does not cost an iron boot.
 
 ### Fixed — every file agnos created was dated 1970-01-01, because the driver believed there was no RTC
 

@@ -855,7 +855,13 @@ fn sys_open_ext2_inner(arg1, arg2, arg3) {
 # (proc_free_address_space only frees a proc's OWN arena pages, never the kernel heap).
 # See agnosticos docs/development/planning/shared-buffer-present.md.
 var SHM_MAX = 16;
-var SHM_MAX_SIZE = 2097152;         # 2 MB — one pmm page per buffer (bite-2 cap; multi-page = follow-up)
+# ⚠ TWO CAPS, TWO REASONS — they were one constant and that is what capped the GPU path at ~724x724.
+# `#71` is pmm-backed and `pmm_alloc_2mb` really is ONE page, so 2 MB is a true limit there.
+# `#86` is carved out of a fixed 256 MB GPU region by pure arithmetic, so its slot can be as large as
+# the region divided by the slot count — see GPU_SHM_SLOT_SIZE. Sharing one constant meant the honest
+# pmm limit silently became the GPU limit, and a fullscreen surface could not be composited at all.
+var SHM_MAX_SIZE = 2097152;         # 2 MB — `#71` only: one pmm page per buffer
+var SHM_GPU_MAX_SIZE = 16777216;    # 16 MB — `#86` only: one GPU carveout slot (2560x1440 = 14.7 MB)
 var shm_phys[16];                   # 2 MB physical base per slot (0 = free)
 var shm_kva[16];                    # kernel access VA for the page (kernel-mirror; every-CR3 reachable)
 var shm_size[16];                   # byte size per slot
@@ -974,12 +980,17 @@ fn shm_create(size) {
 # shm_write#72 / shm_read#73 / shm_free#74, but the page is carved out of the GPU CARVEOUT instead of PMM so
 # it has an MC address the CP-DMA engine can actually read. That is not an optimisation — `pmm_alloc_2mb`
 # returns SYSTEM RAM and the GPU cannot reach it at all (bus-master off by design), so a GPU composite is
-# impossible from a #71 buffer. Slot i is a FIXED 2 MB window at GPU_SHM_REGION_OFF + i*GPU_SHM_SLOT_SIZE —
+# impossible from a #71 buffer. Slot i is a FIXED GPU_SHM_SLOT_SIZE window (16 MB since 1.56.44, sized so
+# a native 2560x1440 surface fits) at GPU_SHM_REGION_OFF + i*GPU_SHM_SLOT_SIZE —
 # no allocator, and the MC address is pure arithmetic off the carveout base. Returns -1 when there is no GPU
 # carveout (QEMU): the caller then falls back to shm_create#71 and the CPU path, unchanged.
 fn shm_create_gpu(size) {
     if (size <= 0) { return 0 - 1; }
-    if (size > SHM_MAX_SIZE) { return 0 - 1; }
+    # ⚠ The GPU cap, NOT the pmm one. A slot here is a 16 MB window in the carveout.
+    if (size > SHM_GPU_MAX_SIZE) { return 0 - 1; }
+    # ⛔ STRUCTURAL BOUND: a slot must not reach past the region into GPU_RT_REGION_OFF. This is derived
+    # rather than asserted so raising SHM_MAX without raising the region refuses instead of scribbling.
+    if ((SHM_MAX * GPU_SHM_SLOT_SIZE) > GPU_SHM_REGION_SIZE) { return 0 - 1; }
     if (gpu_present == 0) { return 0 - 1; }
     if (gpu_arena_mc == 0) { return 0 - 1; }
     if (gpu_arena_phys == 0) { return 0 - 1; }
@@ -992,7 +1003,17 @@ fn shm_create_gpu(size) {
             var off = GPU_SHM_REGION_OFF + i * GPU_SHM_SLOT_SIZE;
             var cpu = cpu_carve + off;                  # CPU-side direct-DRAM window
             var mc  = mc_carve  + off;                  # what the CP-DMA engine addresses
-            vmm_remap_wc_2mb(cpu);                      # WC: shm_write is a big sequential CPU store run
+            # ⛔⛔ EVERY 2 MB PAGE OF THE SLOT, NOT JUST THE FIRST. `vmm_remap_wc_2mb` remaps ONE 2 MB
+            # page; when a slot was 2 MB that was the whole slot and a single call was correct. At 16 MB
+            # a single call leaves 14 MB of the slot on whatever the direct map had — the WC guarantee
+            # `shm_write`'s big sequential store run depends on would hold for the first 2 MB and
+            # silently not for the rest. This loop is the whole difference between a working multi-page
+            # slot and one that is slow-and-subtly-wrong in a way no return code reports.
+            var pg = 0;
+            while (pg < GPU_SHM_SLOT_SIZE) {
+                vmm_remap_wc_2mb(cpu + pg);
+                pg = pg + 0x200000;
+            }
             store64(&shm_phys + i * 8, cpu);            # non-zero ⇒ slot in use (shm_slot_valid)
             store64(&shm_kva  + i * 8, cpu);            # the direct window IS the access VA
             store64(&shm_size + i * 8, size);
@@ -4345,7 +4366,10 @@ fn gpu_caps_sys(buf, len) {
     store32(buf + 12, bh);
     store32(buf + 16, SHM_MAX);
     store32(buf + 20, freeslots);
-    store32(buf + 24, SHM_MAX_SIZE);
+    # ⚠ THE GPU CAP, because this record describes the GPU band. Reporting the pmm cap here told ring 3
+    # a fullscreen surface was impossible when it is the carveout slot that decides. aethersafha sizes
+    # its wallpaper request straight off this field (`ae_gpu_wp_fits`), so the value IS the contract.
+    store32(buf + 24, SHM_GPU_MAX_SIZE);
     # +28 — the gpu_shader_op#92 OP-SUPPORT MASK: bit N set <=> op code N is implemented by this kernel.
     # This is why op codes are capped at 0x1F (see GPU_OP_SUPPORTED): the code IS its bit index here, so
     # ring 3 discovers the exact op set instead of probing each one and reading E_BADOP. Reported as 0

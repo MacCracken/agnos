@@ -255,10 +255,29 @@ var GPU_FB_BACK_LIMIT       = 0x60000000;
 # engines reach only the FB aperture. A GPU composite therefore REQUIRES the client's pixels to live in the
 # CARVEOUT, which is what `shm_create_gpu`#86 allocates from here. 2.5 GB into the 3 GB carveout — clear of
 # the console FB (offset 0), the back buffers (1 GB), the PSP TMR (1.5 GB) and the compute arena (2 GB).
-# 16 slots x 2 MB = 32 MB, ending at 0xA2000000, well inside the carveout. Slot i is a FIXED window at
-# REGION_OFF + i*SLOT_SIZE — no allocator needed, and a slot's MC address is pure arithmetic.
+# ⛔⛔ 1.56.44 — THE SLOT WAS 2 MB AND THAT MEANT **A FULLSCREEN APP COULD NOT BE GPU-COMPOSITED AT ALL.**
+# 2 MB is 524,288 pixels at 32bpp (~724x724). A client surface at the native 2560x1440 needs 14.7 MB, so
+# `shm_create_gpu` REFUSED it, the client fell back to `shm_create#71` — system RAM the GPU physically
+# cannot read — and that window went to the CPU path. The one case that most wants the GPU was the one
+# case it could not serve. Worse in the consumer: aethersafha's frame plan is all-or-nothing (`AE-9`
+# deleted the `#39` blit, so there is no CPU layer to mix into a GPU frame), so ONE oversized surface
+# dropped the WHOLE frame to CPU — measured 6.40 ms -> 10.58 ms at 2560x1440.
+# ⚠ The old value's own comment said "one pmm page per buffer (bite-2 cap; multi-page = follow-up)".
+# The follow-up never came, and nothing noticed because every client so far was a small window.
+#
+# ⭐ THE FIX IS ARITHMETIC, NOT AN ALLOCATOR. This region is a FIXED 256 MB window
+# (0xA0000000 -> GPU_RT_REGION_OFF at 0xB0000000) and only 32 MB of it was ever used. Deriving the slot
+# size from the region means 16 slots x 16 MB, which holds 2560x1440 (14,745,600 B) with 1.8 MB spare,
+# and the region can never be overrun by construction — the bound is structural rather than asserted.
+# ⚠ 4K (3840x2160 = 33.2 MB) still does NOT fit: 16 such slots would need 531 MB and this region has
+# 256 MB. That needs the carveout re-partitioned, which is a separate change with its own burn.
+# ⚠ `#71` (pmm-backed) keeps its 2 MB cap — `pmm_alloc_2mb` really is one page. The two caps are now
+# separate constants precisely because they have different reasons.
 var GPU_SHM_REGION_OFF      = 0xA0000000;
-var GPU_SHM_SLOT_SIZE       = 0x200000;   # 2 MB per slot — matches SHM_MAX_SIZE
+# HARD BOUND: the region ends where the RT region begins. Same doctrine as GPU_FB_BACK_LIMIT — the slot
+# size is DERIVED from this, so a future SHM_MAX change cannot silently walk slots into the RT region.
+var GPU_SHM_REGION_SIZE     = 0x10000000;   # 256 MB -> ends exactly at GPU_RT_REGION_OFF
+var GPU_SHM_SLOT_SIZE       = 0x1000000;    # 16 MB per slot = GPU_SHM_REGION_SIZE / SHM_MAX (16)
 
 # === 1.56.36 — the CONSOLE PAN buffer (hardware-scrolled text console) ==================================
 # WHY A HARDWARE PAN EXISTS AT ALL: at native 2560x1440 the software scroll moves the WHOLE console region
@@ -969,11 +988,14 @@ var GPU_VM_ARENA_OFF     = 0x80000000;      # arena 2 GB into the 3 GB carveout 
 # ⭐ TD-3 — THE KERNEL-OWNED RENDER-TARGET REGION. Declared at rung 6 (1.56.30), BEFORE anything
 #    stores into it, because rung 6 is the audit that proves it is free.
 # ============================================================================================
-# ⛔ WHY THIS IS NOT A `#86` SLOT. `SHM_MAX_SIZE` caps a slot at 2 MB, which holds 800x600x4 (1.92 MB)
-# and NOTHING larger — a 1280x720 colour buffer is 3.68 MB and its depth buffer another 3.68 MB. The
-# naive "just use a slot" ABI therefore works at archaemenid's current back-buffer size and **breaks
-# the instant the console goes native-resolution**. Multi-page slots would leak a size class into the
-# ring-3 ABI and re-open the "no MC address crosses the boundary" property. Handles do neither.
+# ⛔ WHY THIS IS NOT A `#86` SLOT — and note the SIZE half of this argument expired at 1.56.44.
+# It used to read: "`SHM_MAX_SIZE` caps a slot at 2 MB, which holds 800x600x4 and NOTHING larger ...
+# breaks the instant the console goes native-resolution". That was true and it was the same defect that
+# stopped a FULLSCREEN APP being GPU-composited; slots are 16 MB now (`GPU_SHM_SLOT_SIZE`), so a
+# 1280x720 colour buffer (3.68 MB) and its depth buffer would both fit.
+# ⭐ THE REAL REASON STANDS AND IS THE OTHER HALF: a slot-based RT ABI leaks a SIZE CLASS into ring 3
+# and re-opens "no MC address crosses the boundary". Handles do neither, and that is why this region is
+# kernel-owned regardless of how big a slot gets.
 #
 # ⚠ THESE ARE OFFSETS INTO THE CARVEOUT, not absolute addresses — same domain as GPU_VM_ARENA_OFF.
 # The CPU-side address is `fb_off + GPU_RT_REGION_OFF`, the MC-side is `fb_base + GPU_RT_REGION_OFF`,
