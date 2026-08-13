@@ -129,6 +129,14 @@ sh "$ROOT/scripts/check/shader-tables.sh" >/dev/null || {
     sh "$ROOT/scripts/check/shader-tables.sh" >/dev/null
     exit 1
 }
+# Register declarations, likewise extracted rather than typed. ⚠ A TYPED budget is a second copy of
+# the .s file and it drifts: edgeasm asserted edge_setup against 56 VGPRs while the shader declared
+# 32, for the whole life of the file, because both sides of that comparison were written by hand.
+sh "$ROOT/scripts/check/shader-decls.sh" >/dev/null 2>&1 || {
+    echo "host-gpu-oracles: FAIL -- shader-decls.sh could not extract the register declarations"
+    sh "$ROOT/scripts/check/shader-decls.sh" >/dev/null
+    exit 1
+}
 
 rc=0
 # ⭐ moderaster ADDED AT 1.56.33 BITE 4, and it is the only oracle here with NO shared premise to

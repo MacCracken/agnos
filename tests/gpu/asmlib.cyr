@@ -99,6 +99,124 @@ fn ea_vgpr_check(declared, name): i64 {
     return 0;
 }
 
+# ============================================================================================
+# SGPR HIGH-WATER TRACKING — the peer of the VGPR tracker, and harder in three specific ways
+# ============================================================================================
+# Same hazard as VGPRs: `.amdhsa_next_free_sgpr` is a DECLARATION, RSRC1 is not GRBM-readable, and an
+# under-declaration corrupts at a distance with no fault. `shader-blob.sh:44-46` records it from a burn:
+# under-allocating the SGPR file "corrupts the carry chain and lanes write the WRONG PIXELS".
+#
+# ⛔⛔ WHY THIS IS NOT JUST `ea_vtrack` WITH A DIFFERENT VARIABLE. Three traps, all measured:
+#
+#  (1) DESTINATION WIDTH IS PER-(FORMAT, OPCODE), AND THE OPCODE SPACES OVERLAP.
+#      Raw op 0x20 is `s_and_saveexec_b64` in SOP1 (writes s[n:n+1], TWO) and `s_ashr_i32` in SOP2
+#      (writes ONE). Both are live in this tree, in the same function 27 lines apart. A single shared
+#      `is_pair_op(op)` helper is wrong for one of them BY CONSTRUCTION, and guessing "single"
+#      under-counts `s_and_saveexec_b64` — the sole high-water setter on edge_cov and glyph_1bpp.
+#      ⇒ TWO SEPARATE TABLES. Non-negotiable.
+#      ⚠ And no parity shortcut exists: SOP2 0x28 (`s_bfe_i64`) is even and writes 2.
+#
+#  (2) READS COUNT. `next_free_sgpr` is a FILE ALLOCATION, not a write set. `matmul_copy.s` writes zero
+#      numbered SGPRs — s0..s3 arrive as user SGPRs and are only read — yet declares nfs=4. A
+#      write-only tracker would report -1 there and authorise declaring 0. So `S()` folds reads in.
+#
+#  (3) THE RESERVED CODES ARE NOT SGPRs AND MUST NOT RAISE THE WATERMARK. The sdst field is a plain
+#      operand code; six live call sites in edgeasm.cyr pass 126 (EXEC_LO) or 106 (VCC) there, for
+#      `s_mov_b64 exec, -1` and the like. Tracking 106 would demand next_free_sgpr >= 108 against a
+#      MEASURED legal maximum of 102 (llvm-mc rejects 103). The filter is on the VALUE, not the
+#      spelling — edgeasm passes both the bare literal 106 and the symbol VCC for the same thing.
+#
+# ⚠ ALL WIDTHS BELOW WERE DECODED ON 2026-08-13, not recalled: each opcode was synthesised, the sdst
+# field varied 20 -> 40, and the operand that RESPONDED was read out of
+# `llvm-mc 22.1.8 -mcpu=gfx90c -disassemble`. Reading the FIRST printed operand instead is wrong and
+# was tried first — `s_setpc_b64` prints a source there and would be classed a 2-wide destination.
+var ea_sgpr_max = 0 - 1;
+
+# SOP1 sdst width. w2 = 0x01 03 05 07 09 19 1B 1C 1E 20 21 22 23 24 25 26 27 29 2B 2D 33 34 35
+#                  w0 = 0x1D (s_setpc_b64) 1F (s_rfe_b64) 2E (s_cbranch_join) 32 (s_set_gpr_idx_idx)
+#                       — these IGNORE the sdst field entirely (verified: it does not move the output)
+var AG_SOP1_W2_MASK = 0x00382AFF5A0002AA;
+var AG_SOP1_W0_MASK = 0x00044000A0000000;
+# SOP2 sdst width. w2 = 0x0B 0D 0F 11 13 15 17 19 1B 1D 1F 21 23 27 28
+#                  w0 = 0x29 (s_cbranch_g_fork) 2B (s_rfe_restore_b64)
+var AG_SOP2_W2_MASK = 0x0000018AAAAAA800;
+var AG_SOP2_W0_MASK = 0x00000A0000000000;
+
+fn ea_sop1_dwidth(op): i64 {
+    if (op < 0)  { ea_fail("SOP1 opcode negative"); return 0; }
+    if (op > 63) { ea_fail("SOP1 opcode out of the swept range -- width UNKNOWN, refusing to guess"); return 0; }
+    if (((AG_SOP1_W0_MASK >> op) & 1) == 1) { return 0; }
+    if (((AG_SOP1_W2_MASK >> op) & 1) == 1) { return 2; }
+    return 1;
+}
+fn ea_sop2_dwidth(op): i64 {
+    if (op < 0)  { ea_fail("SOP2 opcode negative"); return 0; }
+    if (op > 63) { ea_fail("SOP2 opcode out of the swept range -- width UNKNOWN, refusing to guess"); return 0; }
+    if (((AG_SOP2_W0_MASK >> op) & 1) == 1) { return 0; }
+    if (((AG_SOP2_W2_MASK >> op) & 1) == 1) { return 2; }
+    return 1;
+}
+# ⚠ SMEM's WIDTH IS IN THE OPCODE, not in a field: s_load_dword/x2/x4/x8/x16 = 0x00..0x04.
+# agnos emits only 0x02 (s_load_dwordx4) today. ⛔ An unknown SMEM op REFUSES rather than defaulting
+# to 1 — defaulting would under-count by up to 15 registers on the widest form.
+fn ea_smem_dwidth(op): i64 {
+    if (op == 0x00) { return 1; }   # s_load_dword
+    if (op == 0x01) { return 2; }   # s_load_dwordx2
+    if (op == 0x02) { return 4; }   # s_load_dwordx4      <- the only one agnos emits
+    if (op == 0x03) { return 8; }   # s_load_dwordx8
+    if (op == 0x04) { return 16; }  # s_load_dwordx16
+    if (op == 0x05) { return 1; }   # s_scratch_load_dword
+    if (op == 0x06) { return 2; }   # s_scratch_load_dwordx2
+    if (op == 0x07) { return 4; }   # s_scratch_load_dwordx4
+    if (op == 0x24) { return 2; }   # s_memtime
+    ea_fail("SMEM opcode has no known sdata width -- refusing to guess");
+    return 0;
+}
+
+fn ea_strack(n): i64 {
+    if (n < 0)    { ea_fail("SGPR operand code negative"); return n; }
+    if (n >= 128) { ea_fail("inline constant (>=128) in an SGPR register field"); return n; }
+    # 102..127 — FLAT_SCRATCH / XNACK / VCC / EXEC. Reserved separately and covered by the +6 in the
+    # RSRC1 derivation; they are NOT part of next_free_sgpr and must not raise the watermark.
+    if (n > 101) { return n; }
+    if (n > ea_sgpr_max) { ea_sgpr_max = n; }
+    return n;
+}
+# Track a w-register span starting at n. w == 0 means the opcode ignores the field: track NOTHING.
+fn ea_strack_n(n, w): i64 {
+    if (w < 0) { ea_fail("SGPR span width negative"); return n; }
+    var i = 0;
+    while (i < w) { ea_strack(n + i); i = i + 1; }
+    return n;
+}
+fn ea_sgpr_reset(): i64 { ea_sgpr_max = 0 - 1; return 0; }
+
+# UNDER-declaration guard, the exact peer of ea_vgpr_check.
+fn ea_sgpr_check(declared, name): i64 {
+    if (ea_sgpr_max < declared) { return 1; }
+    ps("  ** asmlib: "); ps(name);
+    ps(" declares "); pnum(declared); ps(" SGPRs but uses s");
+    pnum(ea_sgpr_max); ps(" -- UNDER-DECLARED, needs at least ");
+    pnum(ea_sgpr_max + 1); nl();
+    ea_fault = 1;
+    return 0;
+}
+# ⛔ THE CALIBRATION ASSERTION, AND WHY IT MUST BE EQUALITY. `ea_sgpr_check` uses `<`, which
+# STRUCTURALLY CANNOT detect an under-counting tracker: a tracker that misses registers reports a
+# LOWER high-water, which passes `<` more easily. Only equality against the shipped
+# `.amdhsa_next_free_sgpr` can fail when the tracker is wrong.
+# ⚠ Opt-in per emit list, because it is not universally true: blend_premul declares nfs=8 with a true
+# high-water of s6, so equality would fail on correct output there. Use `ea_sgpr_check` for that one.
+fn ea_sgpr_exact(declared, name): i64 {
+    if (ea_sgpr_max + 1 == declared) { return 1; }
+    ps("  ** asmlib: "); ps(name);
+    ps(" high-water s"); pnum(ea_sgpr_max);
+    ps(" => next_free_sgpr "); pnum(ea_sgpr_max + 1);
+    ps(", but the shader declares "); pnum(declared); nl();
+    ea_fault = 1;
+    return 0;
+}
+
 fn V(n): i64 {
     if (n < 0)   { ea_fail("VGPR index negative"); return 0; }
     if (n > 255) { ea_fail("VGPR index > 255 -- mabda would silently mask it to 8 bits"); return 0; }
@@ -108,6 +226,16 @@ fn V(n): i64 {
 fn S(n): i64 {
     if (n < 0)   { ea_fail("SGPR index negative"); return 0; }
     if (n > 101) { ea_fail("SGPR index > 101 -- not an SGPR"); return 0; }
+    ea_strack(n);
+    return gfx9_sgpr(n);
+}
+# ⚠ A 64-BIT SGPR SOURCE ENCODES ONLY ITS LOW INDEX, so `S(n)` cannot express one and would
+# under-count by one. Verified: `v_cndmask_b32_e64 v27, v27, v14, s[62:63]` carries src2 = 62 and s63
+# appears in no field. Use S2 wherever the operand is a 64-bit pair (an exec mask, a v_cmp result).
+fn S2(n): i64 {
+    if (n < 0)   { ea_fail("SGPR index negative"); return 0; }
+    if (n > 100) { ea_fail("64-bit SGPR pair base > 100 -- the high half is not an SGPR"); return 0; }
+    ea_strack(n); ea_strack(n + 1);
     return gfx9_sgpr(n);
 }
 # ⛔ FAILS LOUD instead of silently returning 255. mabda's gfx9_inline_int returns
@@ -159,11 +287,17 @@ var AG_WAITCNT_VMCNT0        = 0x0F70; # simm16 for `s_waitcnt vmcnt(0)` on gfx9
 var EA_ISA_BYTES = 8192;        # module-scope var[N] = N x u64, so isa[1024] is 8192 BYTES
 var isa[1024];
 
-fn e_vop1(p, op, vdst, s0): i64 { ea_vtrack(vdst); return gfx9_emit32(&isa, p, gfx9_enc_vop1(op, vdst, s0)); }
+# ⚠ VOP1 op 0x02 is `v_readfirstlane_b32`, whose `vdst` field names an SGPR (verified: 0x7e0e0503
+# disassembles to `v_readfirstlane_b32 s7, v3`). Absent from agnos's corpus today, but it is the same
+# defect class sitting in the most-used wrapper, so it costs one branch to close.
+fn e_vop1(p, op, vdst, s0): i64 {
+    if (op == 0x02) { ea_strack(vdst); } else { ea_vtrack(vdst); }
+    return gfx9_emit32(&isa, p, gfx9_enc_vop1(op, vdst, s0));
+}
 fn e_vop2(p, op, vdst, s0, vs1): i64 { ea_vtrack(vdst); ea_vtrack(vs1); return gfx9_emit32(&isa, p, gfx9_enc_vop2(op, vdst, s0, vs1)); }
 fn e_vopc(p, op, s0, vs1): i64 { ea_vtrack(vs1); return gfx9_emit32(&isa, p, gfx9_enc_vopc(op, s0, vs1)); }
-fn e_sop1(p, op, sdst, s0): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sop1(op, sdst, s0)); }
-fn e_sop2(p, op, sdst, s0, s1): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sop2(op, sdst, s0, s1)); }
+fn e_sop1(p, op, sdst, s0): i64 { ea_strack_n(sdst, ea_sop1_dwidth(op)); return gfx9_emit32(&isa, p, gfx9_enc_sop1(op, sdst, s0)); }
+fn e_sop2(p, op, sdst, s0, s1): i64 { ea_strack_n(sdst, ea_sop2_dwidth(op)); return gfx9_emit32(&isa, p, gfx9_enc_sop2(op, sdst, s0, s1)); }
 fn e_sopc(p, op, s0, s1): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sopc(op, s0, s1)); }
 fn e_sopp(p, op, imm): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sopp(op, imm)); }
 # ⚠ VOP1/VOP2 with src0 == 255 carry a TRAILING LITERAL DWORD. Missing that is a two-dword
@@ -179,6 +313,9 @@ fn e_vop2_lit(p, op, vdst, lit, vs1): i64 {
     return gfx9_emit32(&isa, q, lit);
 }
 fn e_sop1_lit(p, op, sdst, lit): i64 {
+    # ⛔ SEPARATE FUNCTION, SEPARATE INSTRUMENTATION. Wiring only e_sop1 would miss blend_rect's s20
+    # (`s_mov_b32 s20, 0xBB808081`), which is that shader's SGPR high-water.
+    ea_strack_n(sdst, ea_sop1_dwidth(op));
     var q = gfx9_emit32(&isa, p, gfx9_enc_sop1(op, sdst, GFX9_SRC_LITERAL));
     return gfx9_emit32(&isa, q, lit);
 }
@@ -193,7 +330,14 @@ fn e_sop1_lit(p, op, sdst, lit): i64 {
 # blend_rect stages -1/255f in an SGPR (`s_mov_b32 s20, 0xBB808081`) instead of inlining it into
 # the FMA: the constant physically cannot ride in the VOP3.
 fn e_vop3(p, op, vdst, s0, s1, s2): i64 {
-    ea_vtrack(vdst);
+    # ⛔ THE `vdst` FIELD IS NOT ALWAYS A VGPR. Every VOP3 opcode below 0x100 is a comparison whose
+    # destination is an SGPR PAIR carried in `vdst` (0x0FF = v_cmpx_t_u64_e64 is the last); 0x100
+    # (v_cndmask_b32_e64) is the first VGPR destination. Swept with llvm-mc: zero violations either
+    # side. ⚠ This was a LIVE DEFECT until 1.56.44 — edgeasm's `e_vop3(p, 0x0CD, 24, ...)`
+    # (edge_setup.s's `v_cmp_ne_u32_e64 s[24:25], 0, v16`) recorded SGPR 24 as *v24*, in the wrong
+    # file, masked only because edge_setup was budgeted against another shader's 56-VGPR descriptor.
+    # The test sits HERE, inside the wrapper, where a call site cannot forget it.
+    if (op < 0x100) { ea_strack_n(vdst, 2); } else { ea_vtrack(vdst); }
     if (s0 == GFX9_SRC_LITERAL) { ea_fail("VOP3 src0 is a LITERAL -- VOP3 has no literal form"); }
     if (s1 == GFX9_SRC_LITERAL) { ea_fail("VOP3 src1 is a LITERAL -- VOP3 has no literal form"); }
     if (s2 == GFX9_SRC_LITERAL) { ea_fail("VOP3 src2 is a LITERAL -- VOP3 has no literal form"); }
@@ -201,6 +345,9 @@ fn e_vop3(p, op, vdst, s0, s1, s2): i64 {
     return gfx9_emit32(&isa, q, gfx9_enc_vop3a_hi(s0, s1, s2));
 }
 fn e_vop3b(p, op, sdst, vdst, s0, s1, s2): i64 {
+    # VOP3b's `sdst` is the carry-out and is ALWAYS a pair (verified on 0x119 v_add_co_u32_e64,
+    # 0x11C v_addc_co_u32_e64, 0x1E0 v_div_scale_f32).
+    ea_strack_n(sdst, 2);
     ea_vtrack(vdst);
     if (s0 == GFX9_SRC_LITERAL) { ea_fail("VOP3b src0 is a LITERAL"); }
     var q = gfx9_emit32(&isa, p, gfx9_enc_vop3b_lo(op, sdst, vdst));
@@ -214,6 +361,10 @@ fn e_smem(p, op, sdata, sbase_sgpr, off): i64 {
     if ((sbase_sgpr & 1) != 0) { ea_fail("SMEM base SGPR is odd -- SMEM bases are aligned PAIRS"); }
     if (sdata < 0)   { ea_fail("SMEM sdata negative"); }
     if (sdata > 101) { ea_fail("SMEM sdata is not an SGPR"); }
+    # sdata spans a width the OPCODE determines (x1/x2/x4/x8/x16), and sbase is a 64-bit pair passed
+    # as a raw number here rather than through S(), so neither is tracked by anything else.
+    ea_strack_n(sdata, ea_smem_dwidth(op));
+    ea_strack_n(sbase_sgpr, 2);
     var q = gfx9_emit32(&isa, p, gfx9_enc_smem_lo(op, sdata, sbase_sgpr >> 1, 0));
     return gfx9_emit32(&isa, q, off);
 }

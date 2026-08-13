@@ -22,6 +22,75 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.44] — 2026-08-13 — cycle OPEN: a fullscreen surface can be GPU-composited
 
+### New — SGPR high-water tracking in `asmlib.cyr`, with an equality calibration that can actually fail
+
+The peer of the VGPR tracker, and harder in three measured ways.
+
+⛔ **Destination width is per-(format, opcode), and the opcode spaces overlap.** Raw op `0x20` is
+`s_and_saveexec_b64` in SOP1 (writes **2**) and `s_ashr_i32` in SOP2 (writes **1**) — both live in this
+tree, in the same function 27 lines apart. One shared `is_pair_op(op)` helper is wrong for one of them
+by construction, and guessing "single" under-counts `s_and_saveexec_b64`, the sole high-water setter on
+`edge_cov` and `glyph_1bpp`. **Two separate tables.** No parity shortcut exists either: SOP2 `0x28`
+(`s_bfe_i64`) is even and writes 2.
+
+⛔ **Reads count.** `next_free_sgpr` is a file allocation, not a write set — `matmul_copy` writes zero
+numbered SGPRs (s0..s3 arrive as user SGPRs, read only) yet declares nfs=4. A write-only tracker reports
+−1 there and authorises declaring 0.
+
+⛔ **Reserved codes must not raise the watermark.** Six live call sites pass `126` (EXEC_LO) or `106`
+(VCC) in the destination field. Tracking 106 would demand `next_free_sgpr ≥ 108` against a measured
+maximum of **102** (llvm-mc rejects 103). The filter is on the **value**, not the spelling — the tree
+passes both the bare literal `106` and the symbol `VCC` for the same thing.
+
+⚠ Every width was **decoded, not recalled**: each opcode synthesised, its `sdst` field varied 20→40,
+and the operand that *responded* read out of `llvm-mc 22.1.8 -disassemble`. Reading the first printed
+operand instead is wrong and was tried first — `s_setpc_b64` prints a source there and would be classed
+a 2-wide destination. VOP3's scalar/vector boundary is exactly `op < 0x100`, swept with zero violations
+either side.
+
+⭐ **A live defect this found:** `e_vop3` ran `ea_vtrack(vdst)` unconditionally, so `edge_setup`'s
+`v_cmp_ne_u32_e64 s[24:25], 0, v16` recorded **SGPR 24 as v24** — in the wrong register file. Masked
+only because edge_setup was budgeted against another shader's 56-VGPR descriptor.
+
+**Calibration asserts equality, not `<`.** ⛔ `<` structurally cannot detect an under-counting tracker:
+a tracker that misses registers reports a *lower* high-water, which passes `<` more easily.
+
+⛔⛔ **And the RSRC1 derivation cannot substitute for it — measured, this is why the derivation was
+descoped.** A width-blind tracker (exactly the pair-write bug this instrumentation exists to prevent)
+moves the RSRC1 SGPRS field on **0 of 20 shaders**. Largest width-blind error in the corpus is 3
+(`tri_depth`) against a granule slack of 5; `blend_rect`'s slack is 2. Separately, **E=5 and E=6 both
+fit all 20 shipped constants**, because no shipped shader has `nfs ≡ 3 (mod 8)` — so a `+5` derivation
+would pass 20/20 and under-declare by a full granule for one in eight future shaders, in the corrupting
+direction. A green derivation would have been read as calibrating the tracker and shipped the bug.
+
+**Three rules have a natural witness, each proven red by mutation, each naming a different shader:**
+
+| mutation | goes red on | reported |
+|---|---|---|
+| `ea_sop1_dwidth(0x20)` → 1 | `edge_cov` | `high-water s20 => next_free_sgpr 21, but the shader declares 22` |
+| `ea_sop2_dwidth(0x0B)` → 1 | `tri_rgba` | `s46 => 47, declares 48` |
+| revert `e_vop3`'s `op < 0x100` | `edge_setup` | `s24 => 25, declares 26` |
+
+### New — `edgeasm` gate 6: the five tracker rules the shipped corpus cannot witness
+
+SMEM `sdata` width, SMEM `sbase` pair, VOP3b `sdst` pair, `S()` read folding, `S2()` 64-bit reads,
+`e_sop1_lit`, `v_readfirstlane_b32`, and the reserved-code filter are exercised by **nothing** in the
+20 shaders — tri_rgba's widest `s_load_dwordx4` tops out at s43 under a high-water of 47, all seven
+SMEM call sites pass base 0, and every carry-out in the corpus goes to VCC. A rule with no witness is
+an assumption wearing a test's clothes.
+
+10 synthetic cases, **each falsified**: deleting any one instrumentation line moves exactly one number
+(`SMEM x4: s40 want s43` · `sbase: s3 want s31` · `VOP3b: s-1 want s31` · `S(): s-1 want s37` ·
+`S2(): s62 want s63` · `e_sop1_lit: s-1 want s20` · `readfirstlane: s-1 want s7` · `reserved filter:
+s126 want s101`).
+
+### New — `scripts/check/shader-decls.sh`; oracles no longer type a number they also check
+
+Register budgets are extracted from `kernel/shaders/*.s` into a generated, gitignored
+`tests/gpu/gen/shader_decls.cyr`. ⚠ A typed budget is a second copy of the `.s`, and **`edgeasm`
+shipped exactly that drift** — see the `edge_setup` fix below. Refuses rather than defaults on a shader
+with no declaration: emitting 0 would hand every oracle a budget that always passes.
+
 ### Fixed — ⛔ `edgeasm`'s tri_rgba gate passed a shader with NO `s_endpgm`
 
 `tri_check` loops `while (i < n)` where `n` is the emitted length, and the **only** place `n` was ever

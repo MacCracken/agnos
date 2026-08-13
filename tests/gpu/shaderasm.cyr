@@ -27,6 +27,10 @@ include "lib/io.cyr"
 include "../../../mabda/src/gfx9_encode.cyr"
 include "asmlib.cyr"
 include "gen/oracle_tables.cyr"
+# ⚠ Register declarations are EXTRACTED from kernel/shaders/*.s, never typed here — a typed
+# budget is a second copy of the .s, and edgeasm shipped exactly that drift (it asserted
+# edge_setup against 56 VGPRs while the shader declared 32). See shader-decls.sh.
+include "gen/shader_decls.cyr"
 include "../../kernel/shaders/emit/blend_rect.emit.cyr"
 
 # ============================================================================================
@@ -43,13 +47,29 @@ include "../../kernel/shaders/emit/blend_rect.emit.cyr"
 var n_pass = 0;
 var n_fail = 0;
 
-fn check_shader(emitted_bytes, want, want_n, declared_vgpr, name): i64 {
+# ⛔ THE SGPR ASSERTION IS EQUALITY, NOT `<`, AND THAT IS THE WHOLE POINT.
+# `ea_vgpr_check`/`ea_sgpr_check` test `high_water < declared` — an UNDER-declaration guard. That
+# comparison STRUCTURALLY CANNOT detect a tracker that under-counts: a tracker missing registers
+# reports a LOWER high-water, which passes `<` more easily. Only `ea_sgpr_exact` — high_water + 1 ==
+# the shipped `.amdhsa_next_free_sgpr` — fails when the tracker is wrong.
+#
+# ⛔⛔ AND THE RSRC1 DERIVATION CANNOT SUBSTITUTE FOR IT. Measured across all 20 shaders: a width-blind
+# tracker (one that records only the base register of every multi-register operand — i.e. exactly the
+# `s_and_saveexec_b64` / `s_load_dwordx4` / `v_cmp`-pair bug this instrumentation exists to prevent)
+# moves the RSRC1 SGPRS field on **0 of 20**. The largest width-blind error in the corpus is 3
+# (tri_depth) against a granule slack of 5; blend_rect's slack is 2. So a green RSRC1 derivation is
+# NOT evidence that the tracker is right, and reading it that way would ship the very bug it was
+# written to kill. Equality against the declaration is the only assertion with discriminating power.
+fn check_shader(emitted_bytes, want, want_n, declared_vgpr, declared_sgpr, name): i64 {
     if (ea_compare(emitted_bytes, want, want_n, name) != 1) { n_fail = n_fail + 1; return 0; }
     if (ea_vgpr_check(declared_vgpr, name) != 1)            { n_fail = n_fail + 1; return 0; }
+    if (ea_sgpr_exact(declared_sgpr, name) != 1)            { n_fail = n_fail + 1; return 0; }
     ps("  PASS  "); ps(name); ps("  ");
     pnum(want_n); ps(" of "); pnum(want_n);
-    ps(" dwords byte-identical, VGPR high-water v"); pnum(ea_vgpr_max);
-    ps(" vs declared "); pnum(declared_vgpr); nl();
+    ps(" dwords byte-identical, v"); pnum(ea_vgpr_max);
+    ps("/"); pnum(declared_vgpr);
+    ps(" VGPR, s"); pnum(ea_sgpr_max);
+    ps("+1 == "); pnum(declared_sgpr); ps(" SGPR (exact)"); nl();
     n_pass = n_pass + 1;
     return 1;
 }
@@ -64,9 +84,10 @@ fn main(): i64 {
     # declared_vgpr is `.amdhsa_next_free_vgpr` from kernel/shaders/blend_rect.s.
     ea_labels_reset();
     ea_vgpr_reset();
+    ea_sgpr_reset();
     var n = blend_rect_want_fill();
     var bytes = blend_rect_emit();
-    check_shader(bytes, &blend_rect_want, n, 13, "blend_rect");
+    check_shader(bytes, &blend_rect_want, n, blend_rect_nfv, blend_rect_nfs, "blend_rect");
 
     nl();
     ps("shaderasm: "); pnum(n_pass); ps(" passed, "); pnum(n_fail); puts(" failed");
