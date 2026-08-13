@@ -861,7 +861,7 @@ var SHM_MAX = 16;
 # the region divided by the slot count — see GPU_SHM_SLOT_SIZE. Sharing one constant meant the honest
 # pmm limit silently became the GPU limit, and a fullscreen surface could not be composited at all.
 var SHM_MAX_SIZE = 2097152;         # 2 MB — `#71` only: one pmm page per buffer
-var SHM_GPU_MAX_SIZE = 16777216;    # 16 MB — `#86` only: one GPU carveout slot (2560x1440 = 14.7 MB)
+var SHM_GPU_MAX_SIZE = 33554432;    # 32 MB — `#86` only: one GPU carveout slot (3840x2160 = 33,177,600 B)
 var shm_phys[16];                   # 2 MB physical base per slot (0 = free)
 var shm_kva[16];                    # kernel access VA for the page (kernel-mirror; every-CR3 reachable)
 var shm_size[16];                   # byte size per slot
@@ -980,8 +980,8 @@ fn shm_create(size) {
 # shm_write#72 / shm_read#73 / shm_free#74, but the page is carved out of the GPU CARVEOUT instead of PMM so
 # it has an MC address the CP-DMA engine can actually read. That is not an optimisation — `pmm_alloc_2mb`
 # returns SYSTEM RAM and the GPU cannot reach it at all (bus-master off by design), so a GPU composite is
-# impossible from a #71 buffer. Slot i is a FIXED GPU_SHM_SLOT_SIZE window (16 MB since 1.56.44, sized so
-# a native 2560x1440 surface fits) at GPU_SHM_REGION_OFF + i*GPU_SHM_SLOT_SIZE —
+# impossible from a #71 buffer. Slot i is a FIXED GPU_SHM_SLOT_SIZE window (32 MB since 1.56.44, sized so
+# a 3840x2160 surface fits) at GPU_SHM_REGION_OFF + i*GPU_SHM_SLOT_SIZE —
 # no allocator, and the MC address is pure arithmetic off the carveout base. Returns -1 when there is no GPU
 # carveout (QEMU): the caller then falls back to shm_create#71 and the CPU path, unchanged.
 fn shm_create_gpu(size) {
@@ -1009,9 +1009,14 @@ fn shm_create_gpu(size) {
             # `shm_write`'s big sequential store run depends on would hold for the first 2 MB and
             # silently not for the rest. This loop is the whole difference between a working multi-page
             # slot and one that is slow-and-subtly-wrong in a way no return code reports.
+            # ⛔ AND THE RETURN VALUE IS CHECKED. `vmm_remap_wc_2mb` answers 0 when its `pmm_alloc()`
+            # fails on the high path a carveout address always takes (`vmm.cyr:157-158, :188-189`).
+            # Discarding it stamps the slot and hands back a valid id over a partly-mapped window —
+            # verbatim the "slow-and-subtly-wrong in a way no return code reports" failure the comment
+            # above exists to prevent, reintroduced one line below it with the blast radius grown 8x.
             var pg = 0;
             while (pg < GPU_SHM_SLOT_SIZE) {
-                vmm_remap_wc_2mb(cpu + pg);
+                if (vmm_remap_wc_2mb(cpu + pg) != 1) { return 0 - 1; }
                 pg = pg + 0x200000;
             }
             store64(&shm_phys + i * 8, cpu);            # non-zero ⇒ slot in use (shm_slot_valid)
@@ -1058,6 +1063,31 @@ fn gpu_blit_shm_sys(id, wh, dstxy) {
     var tgt = gpu_bb_a_mc;
     if (gpu_bb_back != 0) { tgt = gpu_bb_b_mc; }
     var dst_mc = tgt + dy * gpu_bb_pitch + dx * 4;
+    # ⛔⛔ ONE PACKET WHEN THE BLIT IS CONTIGUOUS — 1.56.44. `gpu_cp_dma_blit` issues ONE CP-DMA PACKET
+    # PER ROW, each arming a fence, kicking the ring and spin-waiting. The 1.56.30 burn measured that
+    # shape exactly (`gpu.cyr:884-888`): an 800x600 clear = 600 packets = **89 ms**, a two-point fit
+    # isolating **91.5 us PER ROW** — dispatch-shaped, not bandwidth-shaped.
+    # ⛔ At 1440 rows that is ~132 ms for a fullscreen composite, against the ~10.58 ms CPU fallback it
+    # is supposed to beat. Raising the slot to 16 MB let a fullscreen surface THROUGH this path for the
+    # first time, so without this the multi-page work would have made the case it exists for **12x
+    # worse** while every gate still read green.
+    # ⭐ A fullscreen surface is CONTIGUOUS on both sides — the source is packed `w*4` by construction
+    # and the destination is a full-width run at dx == 0 — so the per-row helper was decomposing one
+    # linear range into `h` adjacent pieces for no reason. `gpu_depth_clear` already learned this and
+    # collapsed to one packet; `#87` never did.
+    # ⚠ Guarded on ALL THREE conditions, not just dx: a partial-width window is a real rect and MUST
+    # keep the per-row path, or its rows would be written over the destination's stride as one run.
+    # ⚠ CP-DMA BYTE_COUNT is 26 bits (~64 MiB) and is MASKED, not checked, at `gpu_cpdma_submit`
+    # (`bytes & GPU_CPDMA_MAX`) — so a count above it would silently wrap. 16 MB is well inside, and
+    # the check below is explicit rather than trusting the slot cap to stay smaller than the field.
+    if (dx == 0) {
+        if (row == gpu_bb_pitch) {
+            if ((row * h) <= GPU_CPDMA_MAX) {
+                if (gpu_cp_dma(dst_mc, src_mc, row * h) != 1) { return 0 - 1; }
+                return 0;
+            }
+        }
+    }
     if (gpu_cp_dma_blit(dst_mc, gpu_bb_pitch, src_mc, row, row, h) != 1) { return 0 - 1; }
     return 0;
 }

@@ -91,6 +91,18 @@ check "channel-band semantics (host socketpair proof)" $rc
 sh "$ROOT/scripts/check/check-arena.sh" > /tmp/check-arena.log 2>&1 && rc=0 || rc=$?
 check "gpu arena slots unaliased (extent-aware)" $rc
 [ "$rc" = "0" ] || cat /tmp/check-arena.log
+
+# GPU CARVEOUT top-level regions. check-arena.sh gates the *_SUBOFF slots INSIDE the 2 MB arena; the
+# regions THEMSELVES — console FB, pan, back buffers, PSP TMR, arena, shm, RT — had no gate at all.
+# They are hand-placed hex constants whose disjointness was argued in comments and checked by nobody,
+# in a region set where VM_CONTEXT0 is disabled: an overlap is not a fault, it is two subsystems
+# silently writing each other's bytes.
+# ⚠ Added with 1.56.44's shm relocation (0xA0000000 -> 0x90000000, 256 -> 512 MB), which is exactly the
+# class of change it guards. Mutation-tested three ways: an overlapping region, a slot that is not a
+# 2 MB multiple, and a slot count that outruns its region — each fails.
+sh "$ROOT/scripts/check/check-carveout.sh" > /tmp/check-carveout.log 2>&1 && rc=0 || rc=$?
+check "gpu carveout regions disjoint + shm table fits" $rc
+[ "$rc" = "0" ] || cat /tmp/check-carveout.log
 # The Cyrius var X[N] units trap: function-local is N BYTES, module-scope is N x u64. Cost the
 # rung-10 burn its exit code (a 40-byte stack smash that left every printed number correct).
 sh "$ROOT/scripts/check/check-array-sizing.sh" >/dev/null 2>&1 && rc=0 || rc=$?

@@ -269,15 +269,26 @@ var GPU_FB_BACK_LIMIT       = 0x60000000;
 # (0xA0000000 -> GPU_RT_REGION_OFF at 0xB0000000) and only 32 MB of it was ever used. Deriving the slot
 # size from the region means 16 slots x 16 MB, which holds 2560x1440 (14,745,600 B) with 1.8 MB spare,
 # and the region can never be overrun by construction — the bound is structural rather than asserted.
-# ⚠ 4K (3840x2160 = 33.2 MB) still does NOT fit: 16 such slots would need 531 MB and this region has
-# 256 MB. That needs the carveout re-partitioned, which is a separate change with its own burn.
+# ⚠ 5K (5120x2880 = 58,982,400 B) does NOT fit a 32 MB slot and would want 64 MB — 16 of those is
+# 1 GB, which this carveout can still afford (80.7% unclaimed) but which no longer fits between the
+# arena and the RT region. That is a further relocation, not a tweak.
 # ⚠ `#71` (pmm-backed) keeps its 2 MB cap — `pmm_alloc_2mb` really is one page. The two caps are now
 # separate constants precisely because they have different reasons.
-var GPU_SHM_REGION_OFF      = 0xA0000000;
+# ⭐ 1.56.44 (second bite) — RELOCATED 0xA0000000 -> 0x90000000 so the region can be 512 MB instead of
+# 256 MB, which is what 32 MB slots need. 16 MB slots covered 1920x1080 and 2560x1440 and STOPPED:
+# 3440x1440 ultrawide (19,814,400 B), 3840x1600 (24,576,000 B), 5120x1440 (29,491,200 B) and
+# 3840x2160 (33,177,600 B) were all refused and fell back to the CPU path. 32 MB covers every one of
+# them, 4K with 376,832 B spare.
+# ⚠ The move is INTO MEASURED FREE SPACE: the compute arena is 2 MB at GPU_VM_ARENA_OFF (0x80000000,
+# GPU_ARENA_SIZE) and ends at 0x80200000; nothing is claimed from there to the old base. Starting at
+# 0x90000000 keeps 254 MB clear after the arena and preserves the property the old placement had —
+# the region ENDS EXACTLY at GPU_RT_REGION_OFF, so shm and the RT handles remain adjacent with no gap
+# and no overlap.
+var GPU_SHM_REGION_OFF      = 0x90000000;
 # HARD BOUND: the region ends where the RT region begins. Same doctrine as GPU_FB_BACK_LIMIT — the slot
 # size is DERIVED from this, so a future SHM_MAX change cannot silently walk slots into the RT region.
-var GPU_SHM_REGION_SIZE     = 0x10000000;   # 256 MB -> ends exactly at GPU_RT_REGION_OFF
-var GPU_SHM_SLOT_SIZE       = 0x1000000;    # 16 MB per slot = GPU_SHM_REGION_SIZE / SHM_MAX (16)
+var GPU_SHM_REGION_SIZE     = 0x20000000;   # 512 MB -> ends exactly at GPU_RT_REGION_OFF
+var GPU_SHM_SLOT_SIZE       = 0x2000000;    # 32 MB per slot = GPU_SHM_REGION_SIZE / SHM_MAX (16)
 
 # === 1.56.36 — the CONSOLE PAN buffer (hardware-scrolled text console) ==================================
 # WHY A HARDWARE PAN EXISTS AT ALL: at native 2560x1440 the software scroll moves the WHOLE console region
@@ -296,7 +307,7 @@ var GPU_SHM_SLOT_SIZE       = 0x1000000;    # 16 MB per slot = GPU_SHM_REGION_SI
 # one address register, and a full-screen app exiting would hand back a scanout at an offset the console no
 # longer agrees with. Independent regions make that class of bug unconstructible.
 # 512 MB into the carveout: clear of the console FB (offset 0, ~15 MB at 2560x1440), the A/B back buffers
-# (1 GB), the PSP TMR (1.5 GB), the compute arena (2 GB), shm (2.5 GB) and the RT region (2816 MB).
+# (1 GB), the PSP TMR (1.5 GB), the compute arena (2 GB), shm (2.25 GB) and the RT region (2816 MB).
 var GPU_FB_PAN_OFF          = 0x20000000;
 # HARD BOUND: the pan buffer must end before the back buffers. Same doctrine as GPU_FB_BACK_LIMIT — a
 # quirky/hostile geometry FALLS BACK to the software scroll rather than scribbling over another region.

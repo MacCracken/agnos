@@ -22,7 +22,33 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.44] — 2026-08-13 — cycle OPEN: a fullscreen surface can be GPU-composited
 
-### Changed — `#86` GPU shm slots are 16 MB, not 2 MB
+### Changed — `#86` GPU shm slots are 32 MB; the region moves to `0x90000000` and doubles to 512 MB
+
+`GPU_SHM_REGION_OFF` `0xA0000000` → **`0x90000000`**, `GPU_SHM_REGION_SIZE` `0x10000000` →
+**`0x20000000`** (512 MB), `GPU_SHM_SLOT_SIZE` → **`0x2000000`** (32 MB), `SHM_GPU_MAX_SIZE` →
+**33554432**. 16 x 32 MB = 512 MB = the region exactly, ending at `GPU_RT_REGION_OFF` as before.
+
+Covered per slot: 1920x1080 (8,294,400 B), 2560x1440 (14,745,600 B), 3440x1440 (19,814,400 B),
+3840x1600 (24,576,000 B), 5120x1440 (29,491,200 B), 3840x2160 (33,177,600 B, 376,832 B spare).
+Not covered: 5120x2880 (58,982,400 B) — wants 64 MB slots.
+
+The move is into measured free space: the compute arena is 2 MB at `GPU_VM_ARENA_OFF` and ends at
+`0x80200000`; 254 MB stays clear between it and the new base.
+
+### New — `scripts/check/check-carveout.sh`, wired into `check.sh`
+
+`check-arena.sh` gates the `*_SUBOFF` slots inside the 2 MB compute arena. The top-level carveout
+regions — console FB, pan, back buffers, PSP TMR, arena, shm, RT — had no gate: hand-placed hex
+constants, disjointness argued in comments only, in a region set where `VM_CONTEXT0` is disabled so an
+overlap is silent mutual corruption rather than a fault.
+
+Checks half-open extent overlap between every region pair, each region against the 3 GB aperture,
+`SHM_MAX * GPU_SHM_SLOT_SIZE <= GPU_SHM_REGION_SIZE`, `SHM_GPU_MAX_SIZE <= GPU_SHM_SLOT_SIZE` (or
+`#89 +24` over-advertises), and that a slot is a whole number of 2 MB pages (or the WC remap loop
+leaves a tail). Mutation-tested three ways — overlapping region, unaligned slot, slot count outrunning
+the region — each fails.
+
+### Changed — `#86` GPU shm slots: the first bite (2 MB → 16 MB)
 
 `GPU_SHM_SLOT_SIZE` 0x200000 → **0x1000000**. `SHM_MAX_SIZE` (2 MB) is split into two constants: it now
 caps `#71` only, where `pmm_alloc_2mb` is genuinely one page; `#86` is capped by the new
@@ -33,8 +59,10 @@ so `shm_create_gpu` refused it and the client fell back to `shm_create#71` — s
 cannot read (bus-master off by design) — putting that surface on the CPU path. A 16 MB slot holds
 2560x1440 with 2,031,616 B spare.
 
-⚠ 3840x2160 (33,177,600 B) still does not fit: 16 slots at that size need 531 MB and
-`GPU_SHM_REGION_OFF`..`GPU_RT_REGION_OFF` is 256 MB. 4K needs the carveout re-partitioned.
+⚠ **16 MB covers 1920x1080 and 2560x1440 and stops there.** Not covered: 3440x1440 ultrawide
+(19,814,400 B), 3840x1600 (24,576,000 B), 5120x1440 (29,491,200 B), 3840x2160 4K (33,177,600 B).
+32 MB slots cover all of them with 376,832 B spare at 4K; 16 x 32 MB = 512 MB against a 256 MB region,
+so it needs the region relocated or `SHM_MAX` halved. Next stage — roadmap OPEN.
 
 New `GPU_SHM_REGION_SIZE` = 0x10000000 (256 MB, 0xA0000000 → 0xB0000000 = `GPU_RT_REGION_OFF`).
 `SHM_MAX * GPU_SHM_SLOT_SIZE` = 16 x 16 MB = 256 MB, checked against it in `shm_create_gpu`, which
@@ -46,6 +74,26 @@ refuses rather than allocating past the region.
 every slot on the direct map's attributes, so the write-combining `shm_write`'s sequential store run
 depends on held for the first eighth of the slot and not the rest. Now loops over `GPU_SHM_SLOT_SIZE` in
 0x200000 steps.
+
+### Changed — `#87 gpu_blit_shm` issues ONE CP-DMA packet for a contiguous blit
+
+`gpu_cp_dma_blit` issues one packet per row, each arming a fence, kicking the ring and spin-waiting.
+The 1.56.30 burn measured that shape: an 800x600 clear = 600 packets = 89 ms, two-point fit
+**91.5 us per row**, dispatch-shaped not bandwidth-shaped (`kernel/core/gpu.cyr:884-888`).
+
+At 1440 rows that is ~132 ms for a fullscreen composite against the ~10.58 ms CPU fallback. Raising the
+slot to 16 MB admitted a fullscreen surface to this path for the first time, so the two changes must
+ship together.
+
+`gpu_blit_shm_sys` now collapses to a single `gpu_cp_dma` when `dx == 0` and `w * 4 == gpu_bb_pitch`
+and `w * 4 * h <= GPU_CPDMA_MAX` (26-bit BYTE_COUNT, ~64 MiB). Partial-width rects keep the per-row
+path — all three conditions are required, not just `dx`. Same collapse `gpu_depth_clear` already makes.
+
+### Fixed — `shm_create_gpu` discarded `vmm_remap_wc_2mb`'s return value
+
+`vmm_remap_wc_2mb` returns 0 when its `pmm_alloc()` fails on the high path a carveout address always
+takes (`kernel/core/vmm.cyr:157-158, :188-189`). The slot was stamped and a valid id returned over a
+partly-mapped window. Now returns -1.
 
 ### Changed — `gpu_caps#89` +24 reports the GPU slot cap
 
