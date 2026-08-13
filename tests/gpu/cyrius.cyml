@@ -8,7 +8,9 @@ language = "cyrius"
 # INSIDE agnos and reach the kernel's syscalls, so a lagging pin here means the tools are built by a
 # different compiler than the kernel they exercise — and a codegen difference between the two would
 # surface as a GPU bug. Raised 6.4.74 -> 6.4.78 at rung 9a to match cyrius.cyml at the repo root.
-cyrius = "6.4.78"
+# Raised 6.4.78 -> 6.5.20 at 1.56.44, again to match the root — the root pin had drifted three minors
+# behind the installed cycc, so this file was tracking a value that was itself stale.
+cyrius = "6.5.20"
 
 [build]
 src = "gpufill.cyr"

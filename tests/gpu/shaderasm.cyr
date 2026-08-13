@@ -1,0 +1,90 @@
+# shaderasm.cyr — THE EQUIVALENCE ORACLE. Does agnos's own sovereign emit list reproduce the
+# committed, iron-proven shader bytes, byte for byte, with no llvm and no hardware?
+#
+# Exit 95 = every shader re-derived exactly. Exit 90 = a mismatch, a count error, or a refusal.
+#
+# ⭐ THE TWO SIDES ARE INDEPENDENT, WHICH IS THE ENTIRE VALUE:
+#   • EXPECTED — `kernel/core/gpu.cyr`'s committed hex, extracted MECHANICALLY by
+#     `scripts/check/shader-tables.sh` into `gen/oracle_tables.cyr`. Never typed.
+#   • EMITTED  — `kernel/shaders/emit/<name>.emit.cyr` run through mabda's encoder here.
+# A mistake on one side cannot be cancelled by the same mistake on the other. `edgeasm.cyr:36-40`
+# names this hazard and then hand-copies its own tables anyway; this file is what that comment
+# actually asks for.
+#
+# ⚠ THE COMMITTED HEX REMAINS THE AUTHORITY. This oracle does not generate what ships and cannot
+# change it. If an emit list and the hex disagree, the HEX is presumed right — it was burned on
+# archaemenid — and the emit list is wrong until proven otherwise.
+#
+# ⚠ WHAT THIS DOES NOT PROVE. Byte-identity says the emit list packs the same bits the hex does. It
+# says nothing about whether either MEANS what `kernel/shaders/<name>.s` says. Round-tripping needs a
+# disassembler and neither repo has one. For the seven shaders in `check.sh:122` the llvm-mc
+# `.s`-vs-hex gate covers that direction and stays.
+
+include "lib/io.cyr"
+# ⚠ Three levels up: tests/gpu -> tests -> agnos -> Repos, then mabda. Included LIVE from the sibling
+# checkout, never vendored — a copy drifts and the drift is invisible. `scripts/check/mabda-resolve.sh`
+# guarantees the checkout exists before this is built.
+include "../../../mabda/src/gfx9_encode.cyr"
+include "asmlib.cyr"
+include "gen/oracle_tables.cyr"
+include "../../kernel/shaders/emit/blend_rect.emit.cyr"
+
+# ============================================================================================
+# THE RETURN-VALUE SPLIT — REPORTED, DELIBERATELY NOT GATED
+# ============================================================================================
+# Measured across all 20 `*_write` functions: 13 return the DWORD count and 7 return BYTES
+# (dwords * 4). No call site anywhere consumes the value. `shader-tables.sh` accepts either and
+# rejects a third answer, because a value that is neither means the table and its own declaration
+# disagree.
+# ⚠ NOT NORMALISED ON PURPOSE. This oracle compares emitted against EXTRACTED, so the split cannot
+# affect the gate. Normalising 13 files would touch the file every kernel dev touches, to buy
+# nothing. Recorded so the inconsistency is a known one rather than a discovery.
+
+var n_pass = 0;
+var n_fail = 0;
+
+fn check_shader(emitted_bytes, want, want_n, declared_vgpr, name): i64 {
+    if (ea_compare(emitted_bytes, want, want_n, name) != 1) { n_fail = n_fail + 1; return 0; }
+    if (ea_vgpr_check(declared_vgpr, name) != 1)            { n_fail = n_fail + 1; return 0; }
+    ps("  PASS  "); ps(name); ps("  ");
+    pnum(want_n); ps(" of "); pnum(want_n);
+    ps(" dwords byte-identical, VGPR high-water v"); pnum(ea_vgpr_max);
+    ps(" vs declared "); pnum(declared_vgpr); nl();
+    n_pass = n_pass + 1;
+    return 1;
+}
+
+fn main(): i64 {
+    puts("shaderasm -- sovereign emit lists vs the committed, iron-proven hex");
+    puts("  encoder: mabda gfx9_encode.cyr (live, sibling checkout)");
+    puts("  expected: generated from kernel/core/gpu.cyr by scripts/check/shader-tables.sh");
+    nl();
+
+    # ---- blend_rect: 47 instructions, 60 dwords ----
+    # declared_vgpr is `.amdhsa_next_free_vgpr` from kernel/shaders/blend_rect.s.
+    ea_labels_reset();
+    ea_vgpr_reset();
+    var n = blend_rect_want_fill();
+    var bytes = blend_rect_emit();
+    check_shader(bytes, &blend_rect_want, n, 13, "blend_rect");
+
+    nl();
+    ps("shaderasm: "); pnum(n_pass); ps(" passed, "); pnum(n_fail); puts(" failed");
+
+    # ⛔ THE STICKY FAULT FLAG IS PART OF THE VERDICT. asmlib's refusals (VGPR out of range, VOP3
+    # literal, odd SMEM base, duplicate label) latch `ea_fault` and return a benign value, so a
+    # caller that ignores a return value still cannot report green. Checking only n_fail would let
+    # a refused encoding through whenever the refusal happened to produce matching bytes.
+    #
+    # ⚠ ORDER MATTERS FOR THE *DIAGNOSIS*, and getting it wrong was caught by this file's own
+    # mutation run: `ea_compare` also latches `ea_fault`, so testing ea_fault first reported a
+    # corrupted expected dword as "an asserting wrapper refused an encoding" — a true failure with a
+    # false cause, which sends the next reader to the wrong file. Concrete failures are counted and
+    # reported first; ea_fault is the residual case that means a wrapper refused something whose
+    # bytes nonetheless matched.
+    if (n_fail != 0)   { puts("shaderasm: FAIL -- see the mismatch above"); return 90; }
+    if (ea_fault != 0) { puts("shaderasm: FAIL -- an asserting wrapper refused an encoding"); return 90; }
+    if (n_pass == 0)   { puts("shaderasm: FAIL -- nothing was checked"); return 90; }
+    puts("shaderasm: PASS -- every emit list reproduces the shipped bytes exactly.");
+    return 95;
+}

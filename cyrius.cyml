@@ -10,7 +10,18 @@ language = "cyrius"
 # while the INSTALLED cycc actually built the kernel warn-only, so the fold and codegen fix were already in
 # the shipped binary; this bump ends the drift and makes the fix the enforced floor. Also brings in the
 # #92/#93 gpu_shader_op/gpu_modeset_op wrappers the H3 /bin/modeset consumes.
-cyrius = "6.4.78"
+#
+# 6.5.20 (1.56.44) — THE SAME DRIFT HAD REOPENED, and by the same mechanism the note above describes.
+# The pin read 6.4.78 while the installed cycc was 6.5.20, so every build in this tree emitted
+# `toolchain drift (snapshot may be stale)` and the binary was in fact already being produced by 6.5.20.
+# The declared floor was three minors behind the compiler that actually built the kernel — which means
+# the pin documented nothing and gated nothing. ⚠ THIS IS A RECURRING FAILURE, NOT AN INCIDENT: the pin
+# lags, the warning is tolerated as noise, and the declared graph stops describing the shipped artifact.
+# Re-check it at every cut, not when the warning becomes annoying.
+# ⚠ tests/gpu/cyrius.cyml MUST move in the same edit — its own header mandates tracking this value,
+# because ring-3 GPU tools built by a different compiler than the kernel they exercise would surface a
+# codegen difference as a GPU bug.
+cyrius = "6.5.20"
 
 [build]
 entry = "kernel/agnos.cyr"
@@ -33,8 +44,16 @@ stdlib = []
 # kernel/arch/x86_64/fb_console.cyr. kashi 0.1.0's font_data.cyr was extracted
 # byte-for-byte from agnos's tables, so glyph rendering is byte-identical to
 # 1.37.4 by construction. kashi reached **v1.0.0** (API freeze) on 2026-05-28;
-# scripts/build.sh + test.sh default KASHI_REF=1.0.0 for CI/clean-checkout
-# resolution. The stdlib-using library face (PSF import etc.) lives in
+# build.sh / test.sh / bench.sh default KASHI_REF=**1.0.4** for CI/clean-checkout
+# resolution — verified a real tag matching kashi's own VERSION on 2026-08-13.
+# ⛔ THOSE THREE SCRIPTS HAD THREE DIFFERENT ANSWERS at 1.56.44 (build 1.0.3,
+# bench 1.0.3, test 1.0.0) and this comment claimed a fourth (1.0.0), while the
+# sibling working tree was at 1.0.4. On THIS box none of that is visible: only
+# `path` is declared below, and the path WINS, so every local build silently used
+# the working tree whatever any script said. The divergence only bites a clean
+# checkout, where the kashi you get depends on which script ran first. Keep the
+# three in step and re-verify against kashi's VERSION at every cut.
+# The stdlib-using library face (PSF import etc.) lives in
 # kashi/src/lib.cyr and never reaches the kernel; the parallel agent develops
 # it independently per project_kashi_parallel_split memory.
 [deps.kashi]

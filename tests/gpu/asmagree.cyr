@@ -41,7 +41,9 @@
 # Run:    ./build/asmagree     -> 95 = every class agrees · 90 = a disagreement (named)
 
 include "lib/io.cyr"
-include "../../mabda/src/gfx9_encode.cyr"
+# ⛔ WAS `../../mabda/...` = agnos/mabda, absent. See the note in edgeasm.cyr — both sovereign-encoder
+# oracles were unbuildable and unrun until 1.56.44.
+include "../../../mabda/src/gfx9_encode.cyr"
 
 fn slen(s): i64 { var n = 0; while (load8(s + n) != 0) { n = n + 1; } return n; }
 fn ps(s): i64 { print(s, slen(s)); return 0; }

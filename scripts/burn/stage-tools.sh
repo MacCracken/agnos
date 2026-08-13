@@ -55,8 +55,31 @@ stage_one() {
     rdir="$SIBLINGS/$repo"
     [ -d "$rdir" ] || { echo "ERROR: $repo not found at $rdir (set SIBLINGS_ROOT)"; return 1; }
     bin="$rdir/build/${name}_agnos"
-    if [ "$BUILD" = "1" ]; then
-        echo "Building $name (agnos target) in $repo ..."
+    # ⛔⛔ IN-TREE ROWS BUILD WHEN ABSENT, BECAUSE THEIR BINARIES USED TO BE COMMITTED.
+    # Until 1.56.44, `tests/gpu/build/` held 51 TRACKED binaries, so every `agnos/tests/*` row below
+    # was satisfied by whatever artifact was in git — i.e. by whatever source existed when someone
+    # last ran a compiler. Plain `stage-tools.sh` (no --build) would copy that fossil to the rootfs
+    # and print "staged: ... bytes", which reads exactly like a fresh stage; burn-prep's cmp loop
+    # would then compare the fossil against ITSELF and report MATCH. That is the same shape as the
+    # edgeasm finding one bite earlier: `tests/gpu/build/edgeasm` was committed, ran, and printed
+    # "B4 PASS" while `edgeasm.cyr` could not compile AT ALL — a green light from a fossil.
+    # ⇒ The binaries are now gitignored, and their absence must produce a BUILD, not an error that
+    # tells a human to go type --build. A staged tool nobody can regenerate is not evidence.
+    # ⚠ SCOPED TO `agnos/*` ON PURPOSE — DO NOT WIDEN THIS TO SIBLING REPOS. Each sibling pins its
+    # OWN cyrius in its own cyrius.cyml; auto-building one here would silently compile it with
+    # whatever cyrius this repo's PATH resolves, producing an artifact built against a toolchain
+    # that repo never declared. In-tree rows are safe by construction — they build inside agnos's
+    # tree under agnos's own pin. Siblings keep the explicit --build contract and the error below.
+    _autobuild=0
+    case "$repo" in
+        agnos/*) [ -f "$bin" ] || _autobuild=1 ;;
+    esac
+    if [ "$BUILD" = "1" ] || [ "$_autobuild" = "1" ]; then
+        if [ "$_autobuild" = "1" ]; then
+            echo "Building $name (agnos target) in $repo -- no build present ..."
+        else
+            echo "Building $name (agnos target) in $repo ..."
+        fi
         ( cd "$rdir" && cyrius build --agnos "$src" "build/${name}_agnos" ) \
             || { echo "ERROR: $name (agnos) build failed"; return 1; }
     fi

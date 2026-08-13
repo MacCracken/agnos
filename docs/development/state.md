@@ -15,7 +15,7 @@ type: state
 | Kernel head | **1.56.43 — CLOSED 2026-08-11. NO CYCLE IS OPEN.** ⛔ Do not open one without the operator naming the number. | [`VERSION`](../../VERSION) |
 | Previous cut | **1.56.42 RELEASED 2026-08-10** — PS/2 deleted from the kernel · the USB pointer binding · a process table that NAMES its exhaustion · the covered-console `klug` spill. 1.56.41 before it: the desktop's window management on iron. | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | `build/agnos` on disk | 1,980,216 B, 2026-08-11 — **1.56.43 bare, BURNED and PASSED**. ⚠ Any smoke/test run rebuilds it without the burn flags — re-run `burn-prep.sh` before any flash | `scripts/burn/burn-verify.sh` |
-| Cyrius pin | **6.4.78** | `cyrius.cyml [package].cyrius` |
+| Cyrius pin | **6.5.20** — raised from 6.4.78 at 1.56.44; ⛔ the pin had drifted three minors behind the installed cycc and the rebuild is **byte-identical**, so the shipped kernel was already being built by 6.5.20 and the declared floor gated nothing. `tests/gpu` tracks it (6.5.20); six other test manifests deliberately hold feature-landing minimums | `cyrius.cyml [package].cyrius` |
 | Bootloader | gnoboot **0.6.1** (GOP mode selection — obtains a real 2560x1440 framebuffer); Path C, `RDI = &boot_info`, magic `0x41474E4F`, entry `0x1000a8` | `gnoboot/VERSION` |
 | Iron target | archaemenid — Beelink SER NUC, AMD Cezanne APU, **8c/16t (agnos parks APIC id ≥ 4, runs 4)**, 64 GB. Build host **is** the target, so no serial channel exists. | — |
 

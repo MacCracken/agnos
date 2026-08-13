@@ -37,7 +37,7 @@ enum SysNr {
     SYS_BRK = 12;       # → VirtualAlloc (grow-at-end via committed pages)
     SYS_MUNMAP = 11;    # → VirtualFree(MEM_RELEASE)
     SYS_EXIT = 60;      # → ExitProcess
-    SYS_EXIT_GROUP = 231; # → ExitProcess (aliased — Windows has no process group)
+    SYS_EXIT_GROUP = 231; # NOT rerouted — call sys_exit_group(), never syscall(231)
 }
 
 # File descriptors mirror Linux convention. GetStdHandle maps
@@ -116,6 +116,39 @@ fn sys_exit(code) {
     return 0;   # unreachable
 }
 
+# Terminate every thread in the process — the Linux exit_group(2) peer.
+# Routes through SYS_EXIT deliberately: ExitProcess already tears down all
+# threads, so on Windows this IS sys_exit. It exists so a portable epilogue
+# can call one name on every target. Do NOT issue SYS_EXIT_GROUP here — 231
+# has no PE reroute and would emit a raw `0F 05` (illegal instruction).
+# CHANGELOG [6.5.6]
+fn sys_exit_group(code) {
+    syscall(SYS_EXIT, code);
+    return 0;   # unreachable
+}
+
+# Change the working directory — NOT WIRED on Windows.
+#
+# There is no SetCurrentDirectoryW reroute, and inventing one is a COMPILER
+# change (a new 0xF0xx pseudo-syscall + a PE emitter arm), not a stdlib one.
+# Returns -1, the same honest degrade xstat and xrmdir already make on PE.
+# Wire the reroute when a consumer actually needs it. CHANGELOG [6.5.7]
+fn sys_chdir(path) { return 0 - 1; }
+
+# fchownat — no Windows equivalent (no POSIX uid/gid model). Returns -1, the same
+# honest degrade xstat/xrmdir make on PE. CHANGELOG [6.5.7]
+fn sys_fchownat(dirfd, path, uid, gid, flags) { return 0 - 1; }
+
+# at-family constants. The Linux values, defined here so the PORTABLE surface is
+# complete: this peer is STANDALONE (it does not include syscalls_linux_common.cyr,
+# where these live for the Linux/macOS peers), so without them a consumer calling
+# sys_fchownat(AT_FDCWD, ...) fails to compile on this target even though the
+# wrapper exists. The wrapper is a stub here, so the values are nominal — but
+# source portability is the whole point of having the name. CHANGELOG [6.5.7]
+var AT_FDCWD = 0 - 100;
+var AT_SYMLINK_NOFOLLOW = 256;   # 0x100
+var AT_REMOVEDIR = 512;          # 0x200
+
 # VirtualAlloc-backed allocation. The PE reroute intercepts
 # syscall(SYS_MMAP, ...) and emits a VirtualAlloc call with
 # MEM_COMMIT | MEM_RESERVE + PAGE_READWRITE.
@@ -173,6 +206,16 @@ fn WIFEXITED(status): i64 { return 1; }
 fn WIFSIGNALED(status): i64 { return 0; }
 # POSIX wait-status accessor: no terminating signal on Windows. 0.
 fn WTERMSIG(status): i64 { return 0; }
+# v6.5.19: `cyrius test`'s child deadline polls `sys_waitpid(pid, &st, WNOHANG)`
+# and SIGKILLs on expiry (cbt/build.cyr `run_binary_timed`). Both names are
+# referenced OUTSIDE any target guard so the shared code stays single-path; on
+# Windows the loop is unreachable anyway (`sys_fork` above returns -1, so the poll
+# takes the `w < 0` exit on its first pass). Same stub contract as the block above:
+# degrade safely rather than leave an undefined reference for the PE cross-build.
+var WNOHANG = 1;
+# No POSIX signals on Windows; a process is terminated via TerminateProcess
+# (PE reroute 0xF01D), not kill(2). Returns -1.
+fn sys_kill(pid, sig): i64 { return 0 - 1; }
 # chmod has no Windows equivalent (ACL model differs); no-op success.
 fn sys_chmod(path, mode): i64 { return 0; }
 # Best-effort dup2 stub: returns the requested newfd (handle dup is rerouted).

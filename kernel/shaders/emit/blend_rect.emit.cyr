@@ -1,0 +1,123 @@
+# blend_rect.emit.cyr — the SOVEREIGN SOURCE for blend_rect, as calls into agnos's asserting
+# wrappers over mabda's gfx9 encoder. 47 instructions, 60 dwords, 240 bytes.
+#
+# ⛔⛔ THE KERNEL NEVER INCLUDES THIS FILE. `kernel/core/gpu.cyr`'s `blend_rect_write(dst_phys)` — the
+# committed, iron-proven hex — remains the authority and the only thing that ships. This file costs
+# `build/agnos` exactly zero bytes; that was verified by rebuilding and comparing sha256 (1,980,696 B
+# / 6c256bc6..., byte-identical). It exists so the bytes have a derivation that is OURS, checkable on
+# a host with no GPU, no llvm, no C and no C++.
+#
+# ⭐ WHAT THE GATE PROVES: `tests/gpu/shaderasm.cyr` runs this list through mabda's encoder and diffs
+# the result against the committed dwords, extracted mechanically from gpu.cyr by
+# `scripts/check/shader-tables.sh`. The two sides are independent — a mistake here cannot be
+# cancelled by the same mistake in the expectation.
+# ⚠ WHAT IT DOES NOT PROVE: that either side MEANS what `kernel/shaders/blend_rect.s` says. That
+# direction needs a disassembler; neither agnos nor mabda has one. For the seven shaders in
+# `check.sh:122` the llvm-mc `.s`-vs-hex gate covers it and stays.
+#
+# ⭐ HOW THIS LIST WAS DERIVED, WHICH IS THE WHOLE POINT. Every operand below was decoded FROM THE
+# COMMITTED DWORDS by applying mabda's field formulas in reverse — `(x >> 9) & 0xFF` for a VOP1
+# opcode, `(x >> 25) & 0x3F` for VOP2, and so on — and only then cross-checked against the position
+# the instruction occupies in `blend_rect.s`. It was NOT transcribed from the `.s` by eye.
+# edgeasm.cyr:36-40 states why: hand-copying and then diffing marks its own homework, because both
+# sides would share the same mistake. All 60 dwords decoded with ZERO unexplained.
+#
+# ⚠ OPERAND CONVENTION (asmlib.cyr): destinations and `vsrc1` are RAW indices; sources go through
+# V()/S()/K()/F1. Passing `V(12)` where a raw index belongs still ENCODES correctly — mabda masks to
+# 8 bits — while feeding 268 to the VGPR high-water tracker and silently disabling the
+# under-declaration gate. Right output, poisoned check.
+#
+# REGISTER BUDGET, and it is checked rather than asserted: highest VGPR is v12 (from the v[6:7] store
+# address pair), so `.amdhsa_next_free_vgpr 13` is exact. Highest SGPR is s20, plus the s[16:17] pair
+# written by s_and_saveexec_b64, so `next_free_sgpr 21` is exact.
+
+fn blend_rect_emit(): i64 {
+    var p = 0;
+
+    # ---- BOUNDS GUARD: mask off lanes past the right edge BEFORE forming any address ----
+    # ⚠ The guard precedes the LOADS, not just the store. A masked-off lane must not load either: a
+    # load past the rect edge on the last row could read past the end of the mapped back buffer,
+    # which is a fault rather than a wasted fetch.
+    p = e_sop2(p, AG_SOP2_S_LSHL_B32, 9, S(7), K(6));            # s9  = tgid_x * 64      (first px x)
+    p = e_vop2(p, AG_VOP2_V_ADD_U32, 12, S(9), 0);               # v12 = s9 + v0          (this lane's x)
+    p = e_vopc(p, AG_VOPC_V_CMP_GT_U32, S(6), 12);               # vcc = width > x
+    p = e_sop1(p, AG_SOP1_S_AND_SAVEEXEC_B64, 16, VCC);          # s[16:17] = exec; exec &= vcc
+
+    # ---- scalar address setup: the whole group shares one row and one column base ----
+    # Scalar ops run regardless of EXEC, so this is safe (and cheaper) after the mask.
+    p = e_sop2(p, AG_SOP2_S_LSHL_B32, 10, S(7), K(8));           # s10 = tgid_x * 64 px * 4 B
+    p = e_sop2(p, AG_SOP2_S_MUL_I32,  11, S(8), S(4));           # s11 = tgid_y * src_pitch
+    p = e_sop2(p, AG_SOP2_S_ADD_U32,  11, S(11), S(10));
+    p = e_sop2(p, AG_SOP2_S_ADD_U32,  12, S(0), S(11));          # s12 = src_lo + off   (sets SCC)
+    p = e_sop2(p, AG_SOP2_S_ADDC_U32, 13, S(1), K(0));           # s13 = src_hi + carry -> s[12:13]
+    p = e_sop2(p, AG_SOP2_S_MUL_I32,  14, S(8), S(5));           # s14 = tgid_y * dst_pitch
+    p = e_sop2(p, AG_SOP2_S_ADD_U32,  14, S(14), S(10));
+    p = e_sop2(p, AG_SOP2_S_ADD_U32,  18, S(2), S(14));          # s18 = dst_lo + off   (sets SCC)
+    p = e_sop2(p, AG_SOP2_S_ADDC_U32, 19, S(3), K(0));           # s19 = dst_hi + carry -> s[18:19]
+
+    p = e_vop2(p, AG_VOP2_V_LSHLREV_B32, 1, K(2), 0);            # v1 = v0 * 4  (byte offset in group)
+
+    # ---- src pixel -> v2 ----
+    p = e_vop1(p, AG_VOP1_V_MOV_B32, 4, S(12));
+    p = e_vop1(p, AG_VOP1_V_MOV_B32, 5, S(13));
+    p = e_vop2(p, AG_VOP2_V_ADD_CO_U32,  4, V(4), 1);            # v4 = v4 + v1, carry -> vcc
+    p = e_vop2(p, AG_VOP2_V_ADDC_CO_U32, 5, K(0), 5);            # v5 = 0 + v5 + vcc
+    p = e_flat(p, 0x14, 0, 2, 0, 4, 0);                          # global_load_dword v2, v[4:5], off
+
+    # ---- dst pixel -> v3 ; v[6:7] is ALSO the store address (in place) ----
+    p = e_vop1(p, AG_VOP1_V_MOV_B32, 6, S(18));
+    p = e_vop1(p, AG_VOP1_V_MOV_B32, 7, S(19));
+    p = e_vop2(p, AG_VOP2_V_ADD_CO_U32,  6, V(6), 1);
+    p = e_vop2(p, AG_VOP2_V_ADDC_CO_U32, 7, K(0), 7);
+    p = e_flat(p, 0x14, 0, 3, 0, 6, 0);                          # global_load_dword v3, v[6:7], off
+    p = e_sopp(p, AG_SOPP_S_WAITCNT, AG_WAITCNT_VMCNT0);
+
+    # ---- blend body: ia = 1 - src_a/255, as one FMA ----
+    # ⛔ THE CONSTANT MUST BE STAGED IN AN SGPR. VOP3 has no 32-bit literal form on gfx9, so
+    # -1/255f cannot ride inside the FMA; `s_mov_b32 s20, 0xBB808081` is a two-dword SOP1 whose
+    # second dword IS the literal. asmlib's e_sop1_lit emits both in one call precisely because a
+    # half-emitted pair shifts every instruction after it with no fault.
+    # ⚠ s20 AND NOT s6. blend_premul.s stages this constant in s6, which here is the `width`
+    # kernarg — reusing it would corrupt an argument. This is the single register difference
+    # between the two kernels and the reason blend_rect is not a copy-paste of blend_premul.
+    p = e_vop1(p, AG_VOP1_V_CVT_F32_UBYTE3, 8, V(2));            # v8 = f32(src.a)
+    p = e_sop1_lit(p, AG_SOP1_S_MOV_B32, 20, 0xBB808081);        # s20 = -1/255f
+    p = e_vop3(p, AG_VOP3_V_FMA_F32, 8, V(8), S(20), F1);        # v8 = src_a * -1/255 + 1.0
+
+    # Four channel blocks, identical but for the ubyte selector and the pk_u8 byte index.
+    # ⚠ ROUNDING: v_cvt_pk_u8_f32 rounds to NEAREST — settled on iron (1.56.0 burn 1, where an
+    # added +0.5 came out +1 on every channel). No rounding bias is applied.
+    p = e_vop1(p, AG_VOP1_V_CVT_F32_UBYTE0, 9,  V(2));
+    p = e_vop1(p, AG_VOP1_V_CVT_F32_UBYTE0, 10, V(3));
+    p = e_vop3(p, AG_VOP3_V_FMA_F32, 9, V(10), V(8), V(9));      # v9 = dst*ia + src
+    p = e_vop3(p, AG_VOP3_V_CVT_PK_U8_F32, 11, V(9), K(0), V(11));
+
+    p = e_vop1(p, AG_VOP1_V_CVT_F32_UBYTE1, 9,  V(2));
+    p = e_vop1(p, AG_VOP1_V_CVT_F32_UBYTE1, 10, V(3));
+    p = e_vop3(p, AG_VOP3_V_FMA_F32, 9, V(10), V(8), V(9));
+    p = e_vop3(p, AG_VOP3_V_CVT_PK_U8_F32, 11, V(9), K(1), V(11));
+
+    p = e_vop1(p, AG_VOP1_V_CVT_F32_UBYTE2, 9,  V(2));
+    p = e_vop1(p, AG_VOP1_V_CVT_F32_UBYTE2, 10, V(3));
+    p = e_vop3(p, AG_VOP3_V_FMA_F32, 9, V(10), V(8), V(9));
+    p = e_vop3(p, AG_VOP3_V_CVT_PK_U8_F32, 11, V(9), K(2), V(11));
+
+    p = e_vop1(p, AG_VOP1_V_CVT_F32_UBYTE3, 9,  V(2));
+    p = e_vop1(p, AG_VOP1_V_CVT_F32_UBYTE3, 10, V(3));
+    p = e_vop3(p, AG_VOP3_V_FMA_F32, 9, V(10), V(8), V(9));
+    p = e_vop3(p, AG_VOP3_V_CVT_PK_U8_F32, 11, V(9), K(3), V(11));
+
+    # ---- store in place over the dst pixel ----
+    # ⚠ glc=1. The store must be globally coherent or the compositor's next read races it.
+    p = e_flat(p, 0x1C, 1, 0, 11, 6, 0);                         # global_store_dword v[6:7], v11 glc
+    p = e_sopp(p, AG_SOPP_S_WAITCNT, AG_WAITCNT_VMCNT0);
+    p = e_sopp(p, AG_SOPP_S_ENDPGM, 0);
+
+    # ⛔ NO PREFETCH PAD. Every mabda kernel builder appends `gfx9_emit_prefetch_pad` (64 bytes of
+    # s_nop). agnos ships NONE: `grep -c 0xbf800000 kernel/core/gpu.cyr` is 0 and every agnos blob
+    # ends on s_endpgm. asmlib deliberately does not re-export the pad so it cannot be added by
+    # reflex. ⚠ agnos gets away with this only because arena slots are heavily over-allocated
+    # (blend_rect's is a 4 KB slot for 240 B); an arena tightening would remove that safety net
+    # silently. Recorded here because it is an undocumented load-bearing dependency.
+    return p;
+}

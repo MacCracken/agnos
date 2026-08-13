@@ -3297,10 +3297,20 @@ fn gpu_shader_blend_test() {
     kprintln("gpu: shader alpha blend online (64 px, bit-correct vs CPU)", 58);
     return 1;
 }
-# blend_rect — iron-proven gfx90c ISA. Human-readable reference: kernel/shaders/blend_rect.s (documentation only).
+# blend_rect — iron-proven gfx90c ISA. Human-readable reference: kernel/shaders/blend_rect.s.
 # ⚠ These bytes ARE the shader — iron-proven on archaemenid, committed hex, the authority. AGNOS ships
 #   no assembler and its build requires no llvm and no C/C++. The sovereign gfx90c assembler in the
 #   ecosystem is mabda's Cyrius gfx9 encoder (mabda/src/gfx9_encode.cyr, HW-proven on Cezanne).
+# ⭐ AS OF 1.56.44 THIS BLOB HAS A SOVEREIGN DERIVATION, AND IT IS GATED.
+#   kernel/shaders/emit/blend_rect.emit.cyr is an emit list — 47 calls into agnos's asserting wrappers
+#   over mabda's encoder — that reproduces all 60 dwords below byte-for-byte on a host, with no llvm
+#   and no GPU. tests/gpu/shaderasm.cyr runs it against an expectation extracted mechanically from
+#   THIS function by scripts/check/shader-tables.sh, so neither side is derived from the other.
+#   ⛔ THE KERNEL DOES NOT INCLUDE THE EMIT LIST and these bytes remain the authority: if the two ever
+#   disagree, the hex is presumed right (it was burned) and the emit list is wrong. build/agnos is
+#   byte-identical with and without the emit list existing — verified, 1,980,696 B / 6c256bc6...
+#   ⚠ Byte-identity proves the emit list packs the same BITS. It does not prove either side MEANS
+#   what blend_rect.s says; that needs a disassembler, which neither repo has.
 fn blend_rect_write(dst_phys) {
     store32(dst_phys + 0,   0x8e098607);
     store32(dst_phys + 4,   0x68180009);

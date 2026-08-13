@@ -43,7 +43,13 @@
 # Run:    ./build/edgeasm   -> 95 calibration + label pass green · 90 a gate failed (named)
 
 include "lib/io.cyr"
-include "../../mabda/src/gfx9_encode.cyr"
+# ⛔ WAS `../../mabda/...` — which from tests/gpu/ resolves to agnos/mabda, a directory that has
+# never existed. This file did not COMPILE from the day it was written until 1.56.44, and neither
+# did asmagree.cyr beside it. Both are cited by name as agnos's sovereign-encoder evidence
+# (shader-blob.sh:13, burn-prep.sh:377) — the whole claim rested on two files nothing built.
+# ⚠ Three levels: tests/gpu -> tests -> agnos -> Repos, then mabda. Kept as a relative include
+# rather than a vendored copy for the reason at :19 — a copy drifts and the drift is invisible.
+include "../../../mabda/src/gfx9_encode.cyr"
 
 fn slen(s): i64 { var n = 0; while (load8(s + n) != 0) { n = n + 1; } return n; }
 fn ps(s): i64 { print(s, slen(s)); return 0; }

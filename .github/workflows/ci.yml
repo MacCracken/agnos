@@ -182,6 +182,23 @@ jobs:
       - name: Run test suite
         run: sh scripts/test.sh
 
+      - name: Host GPU oracles
+        # ⛔ ADDED 1.56.44, CLOSING A HOLE THE TREE HAD ARGUED ITSELF OUT OF. Before this step,
+        # NOTHING under .github/workflows/ invoked scripts/check.sh — so every gate hanging off it
+        # (host-gpu-oracles, check-arena, check-carveout, shader-blob, the derive gates) ran only
+        # when a human remembered to. host-gpu-oracles.sh's own header calls an unrun oracle "a check
+        # that exists on paper and cannot fail in practice"; the runner was itself that check.
+        #
+        # ⚠ This wires the ORACLE RUNNER specifically, not check.sh as a whole. check.sh hard-requires
+        # llvm-mc/llvm-objcopy (shader-blob.sh:29-31 exits 2 without them) and would need LLVM
+        # installed on the runner — a bigger, separate change. The 15 host oracles need only the
+        # cyrius toolchain already installed above, so they go in now rather than waiting for it.
+        #
+        # ⚠ edgeasm/asmagree include mabda from a SIBLING checkout, which CI does not have; the
+        # runner calls mabda-resolve.sh first, which clones the pinned tag (public repo, tag verified
+        # live 2026-08-13). Override with MABDA_REF to test against an unreleased mabda.
+        run: sh scripts/check/host-gpu-oracles.sh
+
   # ── Boot Test ──
   boot-test:
     name: QEMU Boot Test

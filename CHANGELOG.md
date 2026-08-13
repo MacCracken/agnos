@@ -22,6 +22,172 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.44] — 2026-08-13 — cycle OPEN: a fullscreen surface can be GPU-composited
 
+### Changed — cyrius pin **6.4.78 → 6.5.20**; the kernel was already being built by 6.5.20
+
+⛔ **The pin was documenting nothing and gating nothing.** Every build in this tree emitted
+`cyrius.cyml pins 6.4.78 but cycc is 6.5.20 — toolchain drift`, and the rebuild at the corrected pin is
+**byte-identical** — 1,980,696 B · `6c256bc62719ec26` before and after. That is the proof, not a null
+result: the shipped artifact had been produced by a compiler three minors ahead of the declared floor,
+so the manifest described a build that was not happening.
+
+⚠ **This is a recurring failure, not an incident.** The pin's own 6.4.74 comment records the identical
+sequence in July — *"The pin had lagged at 6.4.2 while the INSTALLED cycc actually built the kernel
+warn-only."* The mechanism is that the warning is tolerated as noise until someone bumps it. Re-check
+at every cut.
+
+`tests/gpu/cyrius.cyml` moved in the same edit, as its own header mandates: ring-3 GPU tools built by a
+different compiler than the kernel they exercise would surface a codegen difference as a GPU bug.
+
+⭐ **And that re-materialised `tests/gpu/lib/` — 12 stdlib files, +1012/−70 — which was carrying real
+defects and real gaps, not cosmetics.** The snapshot had been frozen at a 6.4.78-era stdlib:
+- `print_num` mishandled `i64::MIN` (`0 - n` is a no-op there, so the `n > 0` loop emitted **zero
+  digits** and printed a bare `-`). Fixed in cyrius 6.5.8; the GPU tools had never had the fix.
+- **13 syscall wrappers were missing, including agnos's own bands** — the whole `#97` channel set
+  (`sys_chan_mint`/`send`/`recv`/`close`/`endow`/`caps`), `sys_ptrscan` (#98), `sys_gpu_recover_op`,
+  `sys_uptime_us` and `sys_spawn_path_env`. Ring-3 GPU tools could not call syscalls this kernel ships.
+
+All 16 host oracles pass on the new snapshot.
+
+⚠ **Six other test manifests were deliberately NOT moved** — `tests/symlink` (6.3.9), `tests/audio` and
+`tests/fp` (6.4.2), `tests/blk` (6.4.39), `tests/chan` (6.5.8), `tests/fault` (6.5.18). Each records the
+release that landed the syscall peer it exercises (*"The agnos symlink syscall peer landed cyrius
+6.3.6"*), which is information a blanket bump would destroy. ⚠ But `tests/gpu`'s argument generalises to
+every ring-3 binary that reaches kernel syscalls, so this is a deferred decision, not a settled one.
+
+### Removed — 51 committed binaries under `tests/gpu/build/`, and the second fossil they were hiding
+
+Untracked and gitignored. Verification before removal: all 11 with a live source and a runnable gate
+**rebuilt byte-identical** to their committed copies, so tracking them carried no information. ⚠ Four —
+`au`, `gpublit_cmp`, `inc_probe`, `szprobe` — had **no `.cyr` source anywhere in the tree** and no
+reference from any script or doc: binaries this repo could not regenerate even in principle.
+
+⛔ **`scripts/burn/stage-tools.sh` was the second victim of the same mechanism.** Without `--build` it
+copied whatever binary was in git to the rootfs and printed `staged: … bytes`, which reads exactly like
+a fresh stage — and `burn-prep`'s cmp loop then compared the fossil **against itself** and reported
+MATCH. So a tool staged onto burn media could be built from source that no longer existed, and every
+check in the chain agreed it was fine. In-tree `agnos/*` rows now BUILD when the binary is absent.
+
+⚠ **Deliberately scoped to `agnos/*`; sibling rows keep the explicit `--build` contract.** Each sibling
+pins its *own* cyrius in its own manifest, so auto-building one here would compile it with whatever
+cyrius this repo's PATH resolves — an artifact built against a toolchain that repo never declared.
+
+### Changed — kashi ref aligned to **1.0.4** across all three scripts, which had three different answers
+
+`scripts/build.sh` and `scripts/bench.sh` defaulted `KASHI_REF=1.0.3`, `scripts/test.sh` defaulted
+`1.0.0`, and `cyrius.cyml`'s comment claimed a fourth answer (`1.0.0`) — while the sibling working tree
+was at **1.0.4** (verified a real tag matching kashi's own `VERSION`, clean tree).
+
+⛔ **None of that is visible on a developer box.** `[deps.kashi]` declares only `path`, and the path
+WINS, so every local build silently used the working tree whatever any script said. The divergence bites
+only a clean checkout — where the kashi you get depends on which script ran first.
+
+### New — a sovereign emit list for `blend_rect`, gated byte-for-byte against the iron-proven hex
+
+`kernel/shaders/emit/blend_rect.emit.cyr` — 47 calls into agnos's asserting wrappers over mabda's
+gfx9 encoder, reproducing all **60 of 60** committed dwords exactly, on a host, with **no llvm, no
+C/C++, no assembler and no GPU**. First shader in the tree with a derivation that is agnos's own.
+
+⛔ **The kernel never includes it and `build/agnos` is byte-identical** — 1,980,696 B ·
+`6c256bc62719ec26`, compared before and after. The committed hex in `gpu.cyr` remains the authority;
+if the two ever disagree, the hex is presumed right because it was burned on archaemenid.
+
+**The two sides are independent, which is the whole value.** `scripts/check/shader-tables.sh` extracts
+the expected dwords **mechanically** from `kernel/core/gpu.cyr` into a generated, gitignored
+`tests/gpu/gen/oracle_tables.cyr`. `edgeasm.cyr:36-40` states the rule — *"hand-copying and then
+diffing marks its own homework, because both sides would share the same mistake"* — and then
+hand-copies its own tables anyway; this is what that comment actually asks for. The extractor asserts
+**contiguity** (every offset exactly `4*i`, no gaps, no reordering) across all 20 shaders,
+**3,243 dwords** total, and rejects a `return` value that is neither the dword count nor the byte
+count.
+
+⭐ The emit list was **decoded from the committed dwords through mabda's field formulas in reverse**,
+then cross-checked against `blend_rect.s` — not transcribed from the `.s` by eye. All 60 decoded with
+**zero unexplained**, including the one non-instruction dword: `+112 = 0xbe9400ff` is SOP1 with
+`ssrc0 = 0xFF = GFX9_SRC_LITERAL`, consuming `+116 = 0xbb808081`, the f32 bit pattern of −1/255.
+
+⭐ It also yields four opcode constants **decoded from iron-proven bytes rather than recalled from a
+manual** — `v_cvt_f32_ubyte0..3` = `0x11`–`0x14`, `v_add_co_u32` = `0x19`, `v_addc_co_u32` = `0x1C`,
+`v_cvt_pk_u8_f32` = `0x1DD` — held agnos-local under an `AG_` prefix pending an upstream mabda 4.1.0.
+
+New `tests/gpu/asmlib.cyr` holds the shared safety layer (asserting wrappers, VGPR high-water tracker,
+label/fixup pass, the comparator). ⚠ These refusals stay **local to agnos permanently**: mabda's
+encoders are pure bit-packers *by design* — `vsrc1 = 300` silently encodes as `v44` — which is the
+right contract for a compiler whose register allocator guarantees the invariant upstream, and the
+wrong one for a human writing 47 instructions by hand. Pushing them upstream would change behaviour
+for 562 call sites to satisfy agnos's failure model rather than mabda's.
+
+Mutation-tested three ways, each red with the correct diagnosis:
+- a corrupted dword in `gpu.cyr` → `dword 30 (byte +120) emitted 0xd1cb0008, committed 0xd1cb0009`
+- a wrong operand in the emit list (`s20`→`s21`) → `dword 31 (byte +124) emitted 0x03c82b08, committed 0x03c82908`
+- a convention violation (`V(12)` where a raw index belongs) → `declares 13 VGPRs but uses v268`.
+  ⭐ This one matters most: it **encodes correctly** because mabda masks to 8 bits, while feeding 268
+  to the high-water tracker and silently disabling the under-declaration gate. Right output, poisoned
+  check — and the only reason it is catchable is that the tracker is a gate rather than a comment.
+
+⛔ A fourth defect was found in the oracle's own verdict ordering by that mutation run: `ea_compare`
+latches `ea_fault`, so testing `ea_fault` first reported a corrupted **expected** dword as *"an
+asserting wrapper refused an encoding"* — a true failure with a false cause, which sends the next
+reader to the wrong file. Concrete failures are now counted and reported first.
+
+⚠ **VGPR high-water is checked, SGPR is not yet.** `blend_rect` measures v12 against a declared 13 —
+exact. There is still **no over-declaration check anywhere** in the tree, and no hardware oracle for
+either direction: RSRC1 is not GRBM-readable, so nothing on the machine can contradict a wrong
+declaration and the failure is corruption at a distance.
+
+### Fixed — agnos's two sovereign-encoder oracles had never compiled, and a committed binary hid it
+
+`tests/gpu/edgeasm.cyr:46` and `tests/gpu/asmagree.cyr:44` both read
+`include "../../mabda/src/gfx9_encode.cyr"`. From `tests/gpu/` that resolves to `<agnos>/mabda` — a
+directory that has never existed in this repo. Correct is `../../../mabda`. **Neither file had built
+on any machine since the day it was written**, neither appeared in `host-gpu-oracles.sh`'s loop, and
+nothing under `.github/workflows/` invokes `check.sh` at all — so the runner that would have caught it
+was itself never run in CI.
+
+These two files carry agnos's entire "we have a sovereign gfx9 encoder" claim. They are cited **by
+name** at `scripts/check/shader-blob.sh:13` and `scripts/check/burn-prep.sh:377` as the proof the tree
+can reproduce iron-proven shader bytes without llvm.
+
+⛔ **Why it went unnoticed for so long: `tests/gpu/build/edgeasm` is a committed binary.** Running it
+exits 95 and prints *"B4 PASS — the tool reproduces a shipped iron-proven shader byte-for-byte"*. It is
+108,784 B; built from the fixed source it is 116,976 B. The artifact in the tree passed while the
+source beside it would not compile. 51 binaries are tracked under `tests/gpu/build/`. A committed build
+artifact is evidence about whatever source existed when someone last ran a compiler, not about the
+source next to it.
+
+Both now build and exit 95, and are in the runner's loop, which **rebuilds before it runs**.
+Mutation-tested both directions: one corrupted expected dword → `edgeasm exited 90, want 95`; the
+include reverted → `edgeasm.cyr does not BUILD`, correctly reported as tooling rather than as a red
+oracle.
+
+⭐ Their passing is also the first *empirical* answer to the mabda/agnos pin question — mabda pins
+cyrius 6.5.3, agnos's manifests pin 6.4.78, and `gfx9_encode.cyr` compiles inside agnos's test tree
+regardless. That had been argued from the source's simplicity; it is now built.
+
+### New — `scripts/check/mabda-resolve.sh`; host GPU oracles now run in CI
+
+`mabda-resolve.sh` ensures the sibling mabda checkout the oracles include is present, cloning the
+pinned tag (**4.0.8**, verified against mabda's own `VERSION` and a live remote tag) when it is not. It
+asserts the two included files specifically, not just the directory, so a partial checkout reports as
+tooling instead of as an opaque build failure. ⚠ There is deliberately **no `MABDA_DIR` override**:
+`include` bakes its relative path into the source, so an env var could not move where the compiler
+looks — offering one would be a knob that silently does nothing. Only `MABDA_REF` is overridable.
+
+`.github/workflows/ci.yml` gains a **Host GPU oracles** step running all 15. ⚠ This wires the oracle
+runner specifically, not `check.sh` as a whole — `shader-blob.sh:29-31` hard-exits without
+`llvm-mc`/`llvm-objcopy`, so full `check.sh` in CI needs an LLVM install and is a separate change.
+
+### Fixed — `scripts/ktest.sh` had been exiting 1 on every invocation for three weeks
+
+Its guard greps for exactly one `kybernet(); arch_halt();` in `boot_finish.cyr`. That line has read
+`kybernet(); power_quiesce_devices(); arch_halt();` since 2026-07-19, so the count was **0** and the
+script exited before building anything. The guard did its job; nobody ran it. Every QEMU
+kernel-test claim in that window rests on nothing.
+
+Guard and `sed` retargeted to the full current launch line, with `power_quiesce_devices()` preserved
+across the rewrite so the test path quiesces exactly as production does. ⚠ Matched as the whole line,
+not a substring: bare `arch_halt();` appears **twice** in `boot_finish.cyr` (the second is the no-shell
+fallback at `:31`), so a loosened pattern would double-match and reject a healthy tree.
+
 ### Changed — `#86` GPU shm slots are 32 MB; the region moves to `0x90000000` and doubles to 512 MB
 
 `GPU_SHM_REGION_OFF` `0xA0000000` → **`0x90000000`**, `GPU_SHM_REGION_SIZE` `0x10000000` →

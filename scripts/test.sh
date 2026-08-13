@@ -8,7 +8,7 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # kashi sibling/fetch handling — same contract as scripts/build.sh (see comment
 # there). Pinned at 1.0.0 (kashi's v1 API freeze).
 KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
-KASHI_REF="${KASHI_REF:-1.0.0}"
+KASHI_REF="${KASHI_REF:-1.0.4}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
     echo "  kashi not at $KASHI_DIR — cloning $KASHI_REF for test..." >&2
     rm -rf "$KASHI_DIR"

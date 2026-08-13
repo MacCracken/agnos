@@ -8,11 +8,34 @@
 # cannot fail in practice.
 #
 # ⚠ SCOPE, STATED HONESTLY: this runs texlist, bigate, bimodel, texgate, rtaudit, depthgate, perspbits, perspdiv, perspgate, perspmodel,
-# depthmodel, depthdiv and moderaster. It
+# depthmodel, depthdiv, moderaster and — added 1.56.44 — edgeasm, asmagree and shaderasm. It
 # does NOT run doomcol, doomwall, edgemodel or refraster — those are equally host-runnable and
 # equally unwired, and adding them is a separate bite rather than something smuggled in beside a rung.
 # ⚠ This line has gone stale twice as oracles were added; it is the drift the tree keeps finding in
 # docs and scripts alike. If you add to the loop below, add here in the same edit.
+#
+# ⭐⭐ edgeasm + asmagree ADDED 1.56.44, AND THEY ARE THE HEADER'S OWN WARNING COME TRUE, TWICE OVER.
+# These two files ARE agnos's sovereign-encoder evidence — cited by name at `shader-blob.sh:13` and
+# `burn-prep.sh:377` as the proof that the tree can reproduce iron-proven shader bytes without llvm.
+# Both included `../../mabda/src/gfx9_encode.cyr`, which from tests/gpu/ is `<agnos>/mabda` — absent.
+# ⛔ So neither had EVER COMPILED, let alone run, on any machine, since the day it was written. The
+# header above says an unrun oracle is "a check that exists on paper and cannot fail in practice";
+# these were a rung further gone — not merely unrun but unbuildable, while two other scripts cited
+# their results. Path fixed to `../../../mabda`, both now build under agnos's tree and exit 95, and
+# `mabda-resolve.sh` runs first so a missing sibling reports as TOOLING and not as a red oracle.
+#
+# ⛔⛔ AND HERE IS *WHY NOBODY NOTICED*, WHICH IS THE PART WORTH KEEPING. `tests/gpu/build/edgeasm` is
+# a COMMITTED BINARY (51 of them are tracked under tests/gpu/build/). Running it exits 95 and prints
+# "B4 PASS -- the tool reproduces a shipped iron-proven shader byte-for-byte". It is 108,784 bytes;
+# a build from the fixed source is 116,976. So the artifact in the tree PASSED while the source it
+# claims to represent DID NOT COMPILE — anyone who checked the oracle by running it got a green light
+# from a binary predating the breakage. A committed build artifact is not evidence about the source
+# beside it; it is evidence about whatever source existed when someone last ran a compiler. ⚠ THIS
+# LOOP REBUILDS BEFORE IT RUNS, which is the property that makes it a gate rather than a re-run of a
+# fossil — do not "optimise" it into reusing an existing build/<t>.
+# ⚠ Their pass is the first empirical answer to the mabda/agnos pin question: mabda pins cyrius
+# 6.5.3, agnos's manifests pin 6.4.78, and `gfx9_encode.cyr` compiles inside agnos's test tree
+# regardless. That was previously argued from the source's simplicity; it is now built.
 #
 # ⭐ depthgate ADDED AT RUNG 17. It proves the rung's OWN iron oracle before the shader exists:
 # two interpenetrating triangles in both submission orders must be byte-identical. ⚠ It also proves
@@ -91,6 +114,22 @@ export CYRIUS_ALLOW_PARENT_INCLUDES
 
 mkdir -p "$GPU/build"
 
+# edgeasm and asmagree include mabda's encoder from the sibling checkout. Resolve it BEFORE the loop
+# so an absent sibling is reported as a tooling failure with a clone attempt, rather than surfacing
+# as "edgeasm.cyr does not BUILD" — the two-very-different-things-at-2am distinction the parent-
+# includes note above already draws.
+sh "$ROOT/scripts/check/mabda-resolve.sh" || exit 2
+
+# shaderasm's EXPECTED side is generated from kernel/core/gpu.cyr, never committed and never typed.
+# Regenerating here — rather than trusting a file on disk — is what makes the oracle compare against
+# the hex that is in the tree RIGHT NOW. A stale gen/ would compare a new emit list against last
+# week's shader and pass, which is the committed-binary failure in a different costume.
+sh "$ROOT/scripts/check/shader-tables.sh" >/dev/null || {
+    echo "host-gpu-oracles: FAIL -- shader-tables.sh could not extract the expected dwords"
+    sh "$ROOT/scripts/check/shader-tables.sh" >/dev/null
+    exit 1
+}
+
 rc=0
 # ⭐ moderaster ADDED AT 1.56.33 BITE 4, and it is the only oracle here with NO shared premise to
 # design around: it INCLUDES `kernel/core/mode_raster.cyr` rather than mirroring it, so there is one
@@ -101,7 +140,7 @@ rc=0
 # h_front - h_active` cancels the front porch exactly, so h_front reaches H_TOTAL and never H_BLANK.
 # Both directions are now pinned (M1/M1c assert the cancellation, M1b asserts the register still
 # moves), because a change folding h_front into the blank formula would otherwise be invisible.
-for t in texlist bigate bimodel texgate rtaudit depthgate depthmodel depthdiv perspbits perspdiv perspgate perspmodel moderaster; do
+for t in texlist bigate bimodel texgate rtaudit depthgate depthmodel depthdiv perspbits perspdiv perspgate perspmodel moderaster edgeasm asmagree shaderasm; do
     out="$(cd "$GPU" && cyrius build "$t.cyr" "build/$t" 2>&1)" || {
         echo "host-gpu-oracles: FAIL -- $t.cyr does not BUILD"
         echo "$out" | tail -20

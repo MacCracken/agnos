@@ -53,17 +53,33 @@ restore_sources() {
 }
 trap restore_sources EXIT INT TERM
 
-# Guard the call-site rewrite: if `kybernet(); arch_halt();` ever moves or is
-# renamed (as it did at the 1.36.2 split), the sed would silently no-op and
-# sh_cmd_test() would never be wired in — the kernel would boot normally into
-# agnsh and emit zero test markers. Fail loud instead. Expect exactly one.
-BFIN_MATCHES=$(grep -c 'kybernet(); arch_halt();' "$BFIN_CYR" || true)
+# Guard the call-site rewrite: if the launch site ever moves or is renamed (as it
+# did at the 1.36.2 split), the sed would silently no-op and sh_cmd_test() would
+# never be wired in — the kernel would boot normally into agnsh and emit zero test
+# markers. Fail loud instead. Expect exactly one.
+#
+# ⛔ THIS GUARD DID ITS JOB AND THE FIX WAS NEVER MADE. boot_finish.cyr grew a
+# `power_quiesce_devices()` call between kybernet() and arch_halt() on 2026-07-19;
+# from then until 1.56.44 this script matched 0 and exited 1 on every invocation —
+# so `sh scripts/ktest.sh` had been dead for three weeks and every QEMU kernel-test
+# claim in that window rests on nothing. The guard fired correctly; nobody ran it.
+# That is the same defect class as host-gpu-oracles.sh being absent from CI.
+#
+# ⚠ Match the FULL launch line, not a substring. `arch_halt();` alone appears TWICE
+# in boot_finish.cyr (the second is the no-shell fallback at :31), so a loosened
+# pattern would double-match and the exact-count check below would reject a tree
+# that is actually fine — or worse, a `kybernet();`-only pattern would rewrite the
+# call while leaving the guard's own error text describing a line that no longer
+# exists. ⚠ power_quiesce_devices() is PRESERVED across the rewrite: the test path
+# should quiesce exactly as production does, or ktest measures a different shutdown.
+BFIN_LAUNCH='kybernet(); power_quiesce_devices(); arch_halt();'
+BFIN_MATCHES=$(grep -c "$BFIN_LAUNCH" "$BFIN_CYR" || true)
 if [ "$BFIN_MATCHES" -ne 1 ]; then
-    echo "ERROR: ktest.sh expected exactly 1 'kybernet(); arch_halt();' launch site in $BFIN_CYR, found $BFIN_MATCHES" >&2
+    echo "ERROR: ktest.sh expected exactly 1 '$BFIN_LAUNCH' launch site in $BFIN_CYR, found $BFIN_MATCHES" >&2
     echo "       the test entry-point rewrite would no-op — boot_finish.cyr's launch site diverged from ktest.sh's contract." >&2
     exit 1
 fi
-sed -i 's/kybernet(); arch_halt();/sh_cmd_test(); arch_halt();/' "$BFIN_CYR"
+sed -i 's/kybernet(); power_quiesce_devices(); arch_halt();/sh_cmd_test(); power_quiesce_devices(); arch_halt();/' "$BFIN_CYR"
 
 # Build the PRODUCTION ELF64 kernel (kybernet→sh_cmd_test already rewritten).
 # scripts/build.sh owns the kashi font-data prepend + the ELF64/multiboot2
