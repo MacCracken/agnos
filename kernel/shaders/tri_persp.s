@@ -119,8 +119,13 @@
 //  alignment; s[24:25] is correct.
 //
 // ⛔ RSRC1/RSRC2 ARE HARVESTED FROM THE ASSEMBLED DESCRIPTOR, NEVER HAND-COUNTED. The granting rule is
-// roundup8(next_free_sgpr + 6) and the +6 is VCC(2) + XNACK(4) — gfx90c is an APU and the triple
-// reserves XNACK. edge_cov's documented hand-miscount was exactly 22 + 2: a count that remembered VCC
+// roundup8(next_free_sgpr + 6).
+// ⛔ THE "+6 = VCC(2) + XNACK(4) — gfx90c is an APU so the triple reserves XNACK" gloss that stood
+// here until 1.56.44 IS MEASURED WRONG. llvm-mc 22.1.8, solving E over next_free_sgpr 1..39 on
+// gfx90c: defaults E=6; `.amdhsa_reserve_xnack_mask 0` alone E=6 (UNCHANGED);
+// `.amdhsa_reserve_flat_scratch 0` alone E=4; both waived E=2. XNACK contributes 2, not 4, and is
+// invisible while flat scratch is reserved. The dominating term for agnos is FLAT_SCRATCH — which
+// no agnos kernel uses; the +6 is simply LLVM's conservative default for hand-written asm. edge_cov's documented hand-miscount was exactly 22 + 2: a count that remembered VCC
 // and had no way to know about XNACK. Under-allocating the SGPR file corrupts the vcc carry chain in the
 // address arithmetic and lanes write the WRONG PIXELS — a plausible wrong picture, not a fault.
 

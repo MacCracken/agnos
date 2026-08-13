@@ -17,17 +17,30 @@
 # the compiler looks. Offering one would be a knob that silently does nothing. Only the REF is
 # overridable, and only for the clone fallback.
 #
-# ⚠ Pinned at 4.0.8, verified a real git tag matching mabda's own `VERSION` on 2026-08-13. Bump as
-# mabda cuts releases — §2 of the shader-pipeline plan lands `gfx9_rsrc1_ex` in 4.1.0, and the four
-# named opcode constants with it. Re-verify tag-vs-VERSION at every bump: this tree has shipped a
-# manifest declaring a tag whose sibling working copy had already moved past it.
+# ⚠ Pinned at 4.0.9, verified a real git tag matching mabda's own `VERSION` on 2026-08-13, on a clean
+# tree. Re-verify tag-vs-VERSION at every bump: this tree has shipped a manifest declaring a tag whose
+# sibling working copy had already moved past it.
+#
+# ⛔ 4.0.9 IS NOT THE RELEASE THIS COMMENT ORIGINALLY ANTICIPATED, and the correction is worth keeping.
+# It was going to be "4.1.0, landing `gfx9_rsrc1_ex` plus opcode constants, because agnos's corpus found
+# that `gfx9_rsrc1` under-allocates SGPRs." **That finding was FALSE and was retracted.** mabda's `+2`
+# (VCC only) and agnos's `+6` are two correct implementations of DIFFERENT reservation policies —
+# measured with llvm-mc by solving E over next_free_sgpr 1..39 on gfx90c: bare defaults E=6,
+# `.amdhsa_reserve_xnack_mask 0` alone E=6 (unchanged), `.amdhsa_reserve_flat_scratch 0` alone E=4, both
+# waived E=2. agnos declares LLVM's default; mabda declares xnack-/no-flat-scratch. Neither is a bug.
+# ⚠ The error was using agnos's own committed constants as the oracle for whether ANOTHER PROJECT is
+# wrong. 4.0.9 is what a real investigation produced instead: a genuine latent defect mabda already had
+# (`GFX9_SGPR_CAP` 104 -> 102, which had permitted the allocator to alias FLAT_SCRATCH_LO/HI), the
+# reservation POLICY finally written down where a reader will find it, and a toolchain pin bump.
+# ⚠ The four opcode constants agnos still holds locally under `AG_` in `tests/gpu/asmlib.cyr` were NOT
+# part of 4.0.9. They remain agnos-local until mabda takes them.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # tests/gpu/*.cyr include "../../../mabda/src/..." — three levels up from tests/gpu is the parent of
 # agnos, so the sibling checkout is the only place the compiler will look. Keep these in step.
 MABDA_DIR="$ROOT/../mabda"
-MABDA_REF="${MABDA_REF:-4.0.8}"
+MABDA_REF="${MABDA_REF:-4.0.9}"
 
 if [ ! -f "$MABDA_DIR/src/gfx9_encode.cyr" ]; then
     echo "  mabda not at $MABDA_DIR — cloning $MABDA_REF for the sovereign-encoder oracles..." >&2

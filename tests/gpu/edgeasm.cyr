@@ -51,255 +51,19 @@ include "lib/io.cyr"
 # rather than a vendored copy for the reason at :19 — a copy drifts and the drift is invisible.
 include "../../../mabda/src/gfx9_encode.cyr"
 
-fn slen(s): i64 { var n = 0; while (load8(s + n) != 0) { n = n + 1; } return n; }
-fn ps(s): i64 { print(s, slen(s)); return 0; }
-fn nl(): i64 { print("\n", 1); return 0; }
-fn puts(s): i64 { ps(s); nl(); return 0; }
-fn pnum(v): i64 {
-    if (v == 0) { print("0", 1); return 0; }
-    var neg = 0; var x = v;
-    if (x < 0) { neg = 1; x = 0 - x; }
-    var b[24]; var i = 0;
-    while (x > 0) { store8(&b + i, 48 + (x % 10)); x = x / 10; i = i + 1; }
-    if (neg == 1) { print("-", 1); }
-    while (i > 0) { i = i - 1; print(&b + i, 1); }
-    return 0;
-}
-fn phex(v): i64 {
-    ps("0x");
-    var i = 7;
-    while (i >= 0) {
-        var nib = (v >> (i * 4)) & 0xF;
-        var ch = 48 + nib;
-        if (nib > 9) { ch = 87 + nib; }
-        var c[2]; store8(&c, ch); print(&c, 1);
-        i = i - 1;
-    }
-    return 0;
-}
+# ⭐ THE WRAPPER LAYER MOVED OUT AT 1.56.44. This file carried its own copy of the print helpers,
+# the asserting wrappers, the VGPR tracker and the label/fixup pass — 249 lines that `asmlib.cyr`
+# now owns and `shaderasm.cyr` shares. Two copies of a verification layer is the one duplication
+# that cannot be tolerated: the copies drift, and the drift is invisible precisely because both
+# files are the things you would use to detect drift.
+# ⛔ 46 SYMBOLS COLLIDED between the two, and cycc builds that tree OK while reporting only 33 of
+# them — every duplicate `var` (13, four of them arrays) is passed over in total silence, and
+# host-gpu-oracles.sh discards build output on success so even the 33 never reach a human.
+# `scripts/check/check-dup-symbols.sh` is the standing gate for exactly that, added alongside.
+# ⚠ INCLUDE ORDER IS LOAD-BEARING: mabda's encoder must precede asmlib.cyr, which uses
+# gfx9_enc_*/gfx9_vgpr/gfx9_sgpr/GFX9_* and deliberately does not include it.
+include "asmlib.cyr"
 
-# ============================================================================================
-# ASSERTING WRAPPERS — every one exists to make a silent mis-encoding loud
-# ============================================================================================
-var ea_fault = 0;               # sticky: any refusal latches, so a caller that ignores a return
-                                # value still cannot report a green result
-fn ea_fail(msg): i64 { ea_fault = 1; ps("  ** edgeasm: "); puts(msg); return 0; }
-
-var VCC = 106;
-var EXEC_LO = 126;              # the EXEC mask as a scalar operand (s_mov_b64 exec, -1)
-var LIT = 255;
-var F1  = 242;                  # the f32 inline constant 1.0
-
-# ============================================================================================
-# VGPR HIGH-WATER TRACKING — the gate for a value the hardware will not tell you
-# ============================================================================================
-# ⛔ RSRC1 DECLARES THE VGPR COUNT AND IS NOT GRBM-READABLE. Nothing on the machine can be asked
-# "how many registers did you actually allocate?" — so an UNDER-declaration has no hardware oracle
-# at all. It does not run slow; the shader's high registers alias another wave's, or spill to a
-# scratch buffer agnos has never configured, and the result is corruption or a fault at a distance
-# from the cause.
-# ⭐ THE ASSEMBLER ALREADY KNOWS. It encoded every operand, so the maximum VGPR index in an emit
-# list is a mechanical fact, not an estimate. This converts the largest unmeasured assumption in
-# the shader ABI into a host-side check that costs nothing and runs before any flash.
-# ⚠ IT CATCHES UNDER-DECLARATION ONLY. Declaring MORE registers than are used is invisible here
-# and costs occupancy rather than correctness; that remains unmeasured.
-var ea_vgpr_max = 0 - 1;
-
-fn ea_vtrack(n): i64 {
-    if (n > ea_vgpr_max) { ea_vgpr_max = n; }
-    return n;
-}
-
-fn ea_vgpr_reset(): i64 { ea_vgpr_max = 0 - 1; return 0; }
-
-# declared = the .amdhsa_next_free_vgpr the blob ships with. Highest legal index is declared-1.
-fn ea_vgpr_check(declared, name): i64 {
-    if (ea_vgpr_max < declared) { return 1; }
-    ps("  ** edgeasm: "); ps(name);
-    ps(" declares "); pnum(declared); ps(" VGPRs but uses v");
-    pnum(ea_vgpr_max); ps(" -- UNDER-DECLARED, needs at least ");
-    pnum(ea_vgpr_max + 1); nl();
-    ea_fault = 1;
-    return 0;
-}
-
-fn V(n): i64 {
-    if (n < 0)   { ea_fail("VGPR index negative"); return 0; }
-    if (n > 255) { ea_fail("VGPR index > 255 -- mabda would silently mask it to 8 bits"); return 0; }
-    ea_vtrack(n);
-    return gfx9_vgpr(n);
-}
-fn S(n): i64 {
-    if (n < 0)   { ea_fail("SGPR index negative"); return 0; }
-    if (n > 101) { ea_fail("SGPR index > 101 -- not an SGPR"); return 0; }
-    return gfx9_sgpr(n);
-}
-# ⛔ FAILS LOUD instead of silently returning 255. mabda's gfx9_inline_int returns
-# GFX9_SRC_LITERAL for anything outside [-16, 64] and expects the CALLER to notice and emit a
-# trailing literal dword. In VOP3 there IS no literal form, so a 255 that slips through encodes
-# an operand that does not exist.
-fn K(k): i64 {
-    var r = gfx9_inline_int(k);
-    if (r == GFX9_SRC_LITERAL) { ea_fail("inline constant out of [-16,64] -- use a literal form"); return 0; }
-    return r;
-}
-
-var EA_ISA_BYTES = 8192;        # module-scope var[N] = N x u64, so isa[1024] is 8192 BYTES
-var isa[1024];
-
-fn e_vop1(p, op, vdst, s0): i64 { ea_vtrack(vdst); return gfx9_emit32(&isa, p, gfx9_enc_vop1(op, vdst, s0)); }
-fn e_vop2(p, op, vdst, s0, vs1): i64 { ea_vtrack(vdst); ea_vtrack(vs1); return gfx9_emit32(&isa, p, gfx9_enc_vop2(op, vdst, s0, vs1)); }
-fn e_vopc(p, op, s0, vs1): i64 { ea_vtrack(vs1); return gfx9_emit32(&isa, p, gfx9_enc_vopc(op, s0, vs1)); }
-fn e_sop1(p, op, sdst, s0): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sop1(op, sdst, s0)); }
-fn e_sop2(p, op, sdst, s0, s1): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sop2(op, sdst, s0, s1)); }
-fn e_sopc(p, op, s0, s1): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sopc(op, s0, s1)); }
-fn e_sopp(p, op, imm): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sopp(op, imm)); }
-# ⚠ VOP1/VOP2 with src0 == 255 carry a TRAILING LITERAL DWORD. Missing that is a two-dword
-# instruction counted as one, which shifts every position after it — and it is precisely what
-# broke the first B6 run: `v_mov_b32 v14, 0x7FFFFFFF` made every branch target land 4 bytes
-# early and the fixup pass correctly reported "branch to an UNDEFINED label".
-fn e_vop1_lit(p, op, vdst, lit): i64 {
-    var q = gfx9_emit32(&isa, p, gfx9_enc_vop1(op, vdst, GFX9_SRC_LITERAL));
-    return gfx9_emit32(&isa, q, lit);
-}
-fn e_vop2_lit(p, op, vdst, lit, vs1): i64 {
-    var q = gfx9_emit32(&isa, p, gfx9_enc_vop2(op, vdst, GFX9_SRC_LITERAL, vs1));
-    return gfx9_emit32(&isa, q, lit);
-}
-fn e_sop1_lit(p, op, sdst, lit): i64 {
-    var q = gfx9_emit32(&isa, p, gfx9_enc_sop1(op, sdst, GFX9_SRC_LITERAL));
-    return gfx9_emit32(&isa, q, lit);
-}
-
-# ⭐ BOTH DWORDS IN ONE CALL. A VOP3 is two dwords and every shipped agnos shader emits them as
-# two separate store32s. Dropping the hi dword is invisible: the stream still assembles, every
-# instruction after it shifts by one dword, and the result is a wrong picture with no fault.
-# One call cannot half-emit.
-#
-# ⛔ REFUSES src == 255. VOP3 has NO literal form — mabda's own compiler treats this as
-# CMP_ERR_VOP3_LITERAL. Silently encoding it names an operand that does not exist.
-fn e_vop3(p, op, vdst, s0, s1, s2): i64 {
-    ea_vtrack(vdst);
-    if (s0 == GFX9_SRC_LITERAL) { ea_fail("VOP3 src0 is a LITERAL -- VOP3 has no literal form"); }
-    if (s1 == GFX9_SRC_LITERAL) { ea_fail("VOP3 src1 is a LITERAL -- VOP3 has no literal form"); }
-    if (s2 == GFX9_SRC_LITERAL) { ea_fail("VOP3 src2 is a LITERAL -- VOP3 has no literal form"); }
-    var q = gfx9_emit32(&isa, p, gfx9_enc_vop3a_lo(op, vdst));
-    return gfx9_emit32(&isa, q, gfx9_enc_vop3a_hi(s0, s1, s2));
-}
-fn e_vop3b(p, op, sdst, vdst, s0, s1, s2): i64 {
-    ea_vtrack(vdst);
-    if (s0 == GFX9_SRC_LITERAL) { ea_fail("VOP3b src0 is a LITERAL"); }
-    var q = gfx9_emit32(&isa, p, gfx9_enc_vop3b_lo(op, sdst, vdst));
-    return gfx9_emit32(&isa, q, gfx9_enc_vop3a_hi(s0, s1, s2));
-}
-# FLAT is likewise two dwords and likewise silent if half-emitted.
-# SMEM — scalar memory load, two dwords. ⚠ THE SBASE FIELD IS THE SGPR PAIR INDEX SHIFTED RIGHT BY
-# ONE, not the SGPR number. Passing s[0:1] as 0 works by accident; passing s[4:5] as 4 instead of 2
-# silently loads from the wrong base, which is a plausible wrong picture rather than a fault. This
-# wrapper takes the SGPR NUMBER and does the shift itself, and refuses an odd one.
-fn e_smem(p, op, sdata, sbase_sgpr, off): i64 {
-    if ((sbase_sgpr & 1) != 0) { ea_fail("SMEM base SGPR is odd -- SMEM bases are aligned PAIRS"); }
-    if (sdata < 0)   { ea_fail("SMEM sdata negative"); }
-    if (sdata > 101) { ea_fail("SMEM sdata is not an SGPR"); }
-    var q = gfx9_emit32(&isa, p, gfx9_enc_smem_lo(op, sdata, sbase_sgpr >> 1, 0));
-    return gfx9_emit32(&isa, q, off);
-}
-
-fn e_flat(p, op, glc, vdst, data, vaddr, off): i64 {
-    # ⚠ ALL THREE of vdst/data/vaddr are raw VGPR indices here, and vaddr is a 64-bit address so it
-    # occupies vaddr AND vaddr+1. Tracking only vaddr would under-count by one on the very
-    # instruction most likely to sit at the top of the register file.
-    ea_vtrack(vdst); ea_vtrack(data); ea_vtrack(vaddr); ea_vtrack(vaddr + 1);
-    var q = gfx9_emit32(&isa, p, gfx9_enc_flat_lo(op, GFX9_FLAT_SEG_GLOBAL, off, glc, 0));
-    return gfx9_emit32(&isa, q, gfx9_enc_flat_hi(vdst, GFX9_SADDR_OFF, data, vaddr));
-}
-
-# ============================================================================================
-# THE LABEL / FIXUP PASS — lifted from mabda/src/gfx9_compile.cyr:827-884, LOCALLY
-# ============================================================================================
-# A branch's simm16 is (target - (branch_pc + 4)) / 4, in DWORDS, signed. Forward branches
-# cannot be resolved when emitted, so a placeholder goes down and the offset is patched once
-# every label position is known.
-#
-# ⚠ ARRAY SIZING RE-DERIVED, NOT COPIED. gfx9_compile declares `var patch_off[2048]`
-# FUNCTION-LOCAL, which in Cyrius is 2048 BYTES. At MODULE scope the same declaration is
-# 2048 x u64 = 8x that. [[feedback_cyrius_var_array_u64_units]] — the units are non-uniform by
-# scope and this is exactly the place that bites.
-var EA_MAXLAB = 64;
-var lab_off[64];                # byte offset of each label id (-1 = not yet seen)
-var patch_off[256];             # byte offset of the branch dword needing a fixup
-var patch_tgt[256];             # the label id it targets
-var n_patch = 0;
-
-fn ea_labels_reset(): i64 {
-    var i = 0;
-    while (i < EA_MAXLAB) { store64(&lab_off + i * 8, 0 - 1); i = i + 1; }
-    n_patch = 0;
-    return 0;
-}
-fn ea_label(p, id): i64 {
-    if (id < 0) { ea_fail("label id negative"); return p; }
-    if (id >= EA_MAXLAB) { ea_fail("label id over EA_MAXLAB"); return p; }
-    if (load64(&lab_off + id * 8) != 0 - 1) { ea_fail("label defined TWICE -- the second wins silently"); return p; }
-    store64(&lab_off + id * 8, p);
-    return p;
-}
-# Emit a branch whose target may not exist yet. The placeholder is 0.
-fn ea_branch(p, op, id): i64 {
-    if (n_patch >= 256) { ea_fail("branch patch list full"); return p; }
-    store64(&patch_off + n_patch * 8, p);
-    store64(&patch_tgt + n_patch * 8, id);
-    n_patch = n_patch + 1;
-    return gfx9_emit32(&isa, p, gfx9_enc_sopp(op, 0));
-}
-# ⭐ THE OFFSET ARITHMETIC, EXTRACTED SO IT CAN BE TESTED ON ITS OWN TERMS.
-# simm16 is SIGNED 16-bit and spans +-32767 DWORDS = 256 KB of branch distance, while the ISA
-# buffer is 8 KB. So no in-buffer branch can ever overflow it, and the check is UNREACHABLE
-# through ea_fixup() at this buffer size — which is exactly why deleting it passed the first
-# calibration. It is defence for a blob larger than today's, so it is tested DIRECTLY here
-# rather than through a 256 KB stream nobody will ever emit.
-# ⛔ An unchecked overflow would WRAP and branch somewhere plausible-looking: a wrong picture,
-# never a fault.
-fn ea_simm(br, tgt): i64 { return (tgt - (br + 4)) / 4; }
-fn ea_simm_ok(br, tgt): i64 {
-    var simm = ea_simm(br, tgt);
-    if (simm > 32767)     { return 0; }
-    if (simm < 0 - 32768) { return 0; }
-    return 1;
-}
-
-# Resolve every branch. Returns 1 / 0.
-fn ea_fixup(): i64 {
-    var i = 0;
-    while (i < n_patch) {
-        var br = load64(&patch_off + i * 8);
-        var id = load64(&patch_tgt + i * 8);
-        var tgt = load64(&lab_off + id * 8);
-        if (tgt == 0 - 1) { ea_fail("branch to an UNDEFINED label"); return 0; }
-        # ⛔ BOUNDS-CHECK THE PATCH SITE BEFORE COMPUTING ANYTHING. Found by mutation: deleting
-        # the simm16 range check below turned a clean refusal into a SIGSEGV, because this
-        # function wrote at `br` on trust. A fixup pass that can write outside its own buffer is
-        # a worse failure than the mis-encoding it exists to prevent — it corrupts whatever
-        # follows `isa` and the symptom appears somewhere else entirely.
-        # ⚠ HONEST LIMIT, RECORDED RATHER THAN PAPERED OVER. This bounds check is real and
-        # correct, but its DELETION is not reliably caught by gate 3 — and the reason is worth
-        # knowing: the out-of-bounds write it prevents does not fault (192 KB past `isa` is
-        # still mapped), it silently corrupts, and what it corrupts can include the battery's
-        # own counters. A test cannot dependably detect the removal of a guard against memory
-        # corruption, because the corruption is free to perturb the test. Kept as
-        # defence-in-depth on that understanding, not as something gate 3 proves.
-        if (br < 0)              { ea_fail("patch site negative"); return 0; }
-        if (br + 4 > EA_ISA_BYTES) { ea_fail("patch site outside the ISA buffer"); return 0; }
-        if (tgt < 0)             { ea_fail("label position negative"); return 0; }
-        if (tgt > EA_ISA_BYTES)  { ea_fail("label position outside the ISA buffer"); return 0; }
-        var simm = ea_simm(br, tgt);
-        if (ea_simm_ok(br, tgt) == 0) { ea_fail("branch offset overflows simm16"); return 0; }
-        var old = load32(&isa + br) & 0xFFFFFFFF;
-        store32(&isa + br, (old & 0xFFFF0000) | (simm & 0xFFFF));
-        i = i + 1;
-    }
-    return 1;
-}
 
 # ============================================================================================
 # THE CALIBRATION — blend_cov's 67 shipped, iron-proven dwords
@@ -1385,19 +1149,25 @@ fn tri_check(): i64 {
     if (bad != 0) { ps(" -- first divergence at "); pnum(first); }
     nl();
 
-    # ⚠ A FORWARD BRANCH CANNOT MATCH UNTIL ITS TARGET EXISTS. llvm-mc resolves s_cbranch_execz
-    # L_END against the FULL 269-dword layout; a partial emit has no L_END to resolve to, so the
-    # offset field legitimately differs. While the emit is incomplete this is reported as progress
-    # rather than failure -- but the moment it is complete, EVERY dword must agree, branches
-    # included, because then there is no honest reason for one to differ.
-    # ⛔ This is the one exemption in this file and it expires on its own. It cannot be used to
-    # wave through a real divergence, because a complete emit gets no exemption at all.
-    if (n < TRI_N_TOTAL) {
-        ps("  (incomplete: forward branches to not-yet-emitted labels are expected to differ;");
-        nl();
-        ps("   this gate becomes exact -- branches included -- when all ");
-        pnum(TRI_N_TOTAL); ps(" dwords are emitted)"); nl();
-        return 1;
+    # ⛔⛔ THIS WAS AN EXEMPTION THAT RETURNED 1 (PASS) WHENEVER `n < TRI_N_TOTAL`, AND IT WAS THE ONLY
+    # PLACE `n` WAS EVER COMPARED TO THE TABLE LENGTH. The loop above is `while (i < n)`, so a SHORT
+    # emit simply checked fewer dwords, found no divergence, and fell into the exemption. Measured
+    # 2026-08-13: deleting the trailing `s_endpgm` from `tri_emit` produced
+    #     tri_rgba: 268 of 269 dwords re-emitted, 268 agree
+    # and the oracle exited **95 — GREEN**. A shader with no program terminator, which would run off
+    # the end of its blob on hardware, passed this gate.
+    #
+    # ⚠ The original rationale was real and is preserved: a FORWARD BRANCH cannot match until its
+    # target exists. llvm-mc resolves `s_cbranch_execz L_END` against the full 269-dword layout, so
+    # while the emit was being AUTHORED a partial run legitimately differed in the offset field. The
+    # comment said the exemption "expires on its own" once the emit is complete — and it HAS: this
+    # blob has emitted 269 of 269 for some time. An expiry that nobody executes never happens.
+    # ⇒ Length is now a HARD assertion. If a partial emit is ever wanted again during authoring,
+    # lower TRI_N_TOTAL deliberately rather than restoring a branch that passes short output.
+    if (n != TRI_N_TOTAL) {
+        ps("  ** tri_rgba: emitted "); pnum(n); ps(" dwords, table has "); pnum(TRI_N_TOTAL);
+        puts(" -- LENGTH MISMATCH (a short emit is not a partial pass)");
+        return 0;
     }
     if (bad != 0) { return 0; }
     return 1;
@@ -1532,9 +1302,15 @@ fn main(): i64 {
     setup_want();
     ea_vgpr_reset();
     if (blob_check("edge_setup", 10, 58, setup_emit()) == 0) { ok = 0; }
-    # ⚠ edge_setup and edge_cov SHARE RSRC1 (0x002C00CD, 56 VGPRs) -- that shared descriptor is what
-    # lets the shipped dispatcher run both unmodified. So both are checked against 56.
-    if (ea_vgpr_check(56, "edge_setup") == 0) { ok = 0; }
+    # ⛔ THIS SAID "edge_setup and edge_cov SHARE RSRC1 (0x002C00CD, 56 VGPRs) ... so both are checked
+    # against 56", AND THAT IS FALSE. They have SEPARATE constants and separate dispatches:
+    #     gpu_regs.cyr:1408  _ESET = 0x002C00C7  -> VGPRS field 7  -> 32 granted   (edge_setup)
+    #     gpu_regs.cyr:1409  _EDGE = 0x002C00CD  -> VGPRS field 13 -> 56 granted   (edge_cov)
+    # and the .s files agree: edge_setup declares next_free_vgpr 32, edge_cov declares 56.
+    # ⇒ Checking edge_setup against 56 budgeted it against ANOTHER SHADER'S DESCRIPTOR and left 24
+    # registers of untested growth. Its real budget is 32, and its measured high-water is v31 — one
+    # register of margin, which is exactly the kind of fact a wrong budget hides until a burn.
+    if (ea_vgpr_check(32, "edge_setup") == 0) { ok = 0; }
     var setup_hi = ea_vgpr_max;
     cov_want();
     ea_vgpr_reset();
@@ -1565,7 +1341,7 @@ fn main(): i64 {
     # reported.
     ps("  edge_setup uses up to v"); pnum(setup_hi);
     ps(", edge_cov up to v"); pnum(cov_hi);
-    puts(" (both declare 56)");
+    puts(" (edge_setup declares 32, edge_cov 56 -- SEPARATE descriptors, see the note above)");
     var saved = ea_fault;
     ea_fault = 0;
     var fired = 0;

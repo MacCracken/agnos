@@ -108,6 +108,17 @@ check "gpu carveout regions disjoint + shm table fits" $rc
 sh "$ROOT/scripts/check/check-array-sizing.sh" >/dev/null 2>&1 && rc=0 || rc=$?
 check "no function-local array overruns" $rc
 
+# Module-scope symbol collisions between a tests/gpu oracle and a shared layer it includes. SIBLING of
+# the gate above, DIFFERENT scope: that one inspects function-LOCAL arrays, this one cross-file
+# module-scope declarations, and neither can see the other's class.
+# ⛔ WHY IT IS NEEDED: cycc warns about a duplicate `fn` and says NOTHING AT ALL about a duplicate
+# `var`, even at conflicting array sizes (measured, cycc 6.5.20). When edgeasm.cyr and asmlib.cyr both
+# declared the layer, 46 symbols collided, cycc reported 33 and built OK, and host-gpu-oracles.sh
+# discards build output on success -- so all 46 were invisible in practice.
+sh "$ROOT/scripts/check/check-dup-symbols.sh" >/tmp/check-dup.log 2>&1 && rc=0 || rc=$?
+check "no duplicate module-scope symbols in tests/gpu" $rc
+[ "$rc" = "0" ] || cat /tmp/check-dup.log
+
 # Shader blobs vs their sources. Each shipped shader is a store32 table in gpu.cyr that is supposed
 # to be exactly what the assembler produced from kernel/shaders/*.s -- and until 1.56.19 nothing
 # enforced it. A hand-edited dword, a paste that dropped one, or a .s edited after the table was

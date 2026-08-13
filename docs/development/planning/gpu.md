@@ -899,8 +899,16 @@ Writes that blank, black or wedge the box. Each has already cost a burn somewher
     `llvm-objcopy -O binary --only-section=.rodata <obj>`, then read **byte 48** (`RSRC1`) and **byte 52** (`RSRC2`). Verified by assembling
     probe descriptors and reproducing three shipped constants exactly: 56/22 → `0x002C00CD` (`RSRC1_EDGE`) · 48/64 → `RSRC1_TEXBI` ·
     32/48 → `RSRC1_TRI`.
-    **The granting rule no hand count contains:** `granted_sgpr = roundup8(next_free_sgpr + 6)`, where **+6 = VCC(2) + XNACK(4)** — gfx90c
-    is an APU, so the triple reserves XNACK.
+    **The granting rule no hand count contains:** `granted_sgpr = roundup8(next_free_sgpr + E)`.
+    ⛔ **This line read "+6 = VCC(2) + XNACK(4) — gfx90c is an APU, so the triple reserves XNACK" until 1.56.44, and that cause
+    attribution is MEASURED WRONG.** llvm-mc 22.1.8, solving `E` uniquely over `next_free_sgpr = 1..39` on gfx90c:
+    `bare defaults -> E=6` · `.amdhsa_reserve_xnack_mask 0` alone `-> E=6` (**UNCHANGED**) · `.amdhsa_reserve_flat_scratch 0` alone
+    `-> E=4` · both waived `-> E=2`. **XNACK contributes 2, not 4, and is invisible while flat scratch is reserved** (they overlap at
+    the top of the register file), so the dominating term for agnos's configuration is **FLAT_SCRATCH** — which no agnos kernel uses
+    (no `scratch_`/`flat_` instruction in any shader, every shipped RSRC2 has bit 0 clear, `COMPUTE_TMPRING_SIZE` never written).
+    The +6 is LLVM's conservative default for hand-written asm on an unspecified target id, not a property of the silicon.
+    ⚠ The rule-shape and the "harvest, never hand-count" conclusion both STAND. Only the mechanism was false — and it was false in
+    five files at once, which is what a rationale copied between documents rather than re-measured looks like.
     **⛔ DEMONSTRATED, not hypothetical.** A hand-derivation of `edge_cov`'s `RSRC1` gave `0x002C008D` (SGPR field 2 = 24 granted) against
     the real `0x002C00CD` (field 3 = 32) — exactly 22 + 2, a count that remembered VCC and had no way to know about XNACK. Not an
     arithmetic slip; a rule a hand count cannot hold. **Under-granting the SGPR file corrupts the VCC carry chain in the address arithmetic

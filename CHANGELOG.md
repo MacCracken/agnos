@@ -22,6 +22,139 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.44] — 2026-08-13 — cycle OPEN: a fullscreen surface can be GPU-composited
 
+### Fixed — ⛔ `edgeasm`'s tri_rgba gate passed a shader with NO `s_endpgm`
+
+`tri_check` loops `while (i < n)` where `n` is the emitted length, and the **only** place `n` was ever
+compared to the 269-dword table was an exemption block that `return 1`-ed whenever `n < TRI_N_TOTAL`.
+So a short emit checked fewer dwords, found no divergence, and passed. Measured — deleting the trailing
+`s_endpgm` from `tri_emit`:
+
+```
+tri_rgba: 268 of 269 dwords re-emitted, 268 agree
+exit=95
+```
+
+**A shader missing its program terminator, which on hardware runs off the end of its blob, was green.**
+
+⚠ The exemption's rationale was real — a forward branch cannot match until its target exists, so during
+authoring a partial emit legitimately differs in the offset field — and its own comment said it
+*"expires on its own"* once complete. It has emitted 269 of 269 for some time. **An expiry nobody
+executes never happens.** Length is now a hard assertion; the same mutation exits 90 with
+`LENGTH MISMATCH (a short emit is not a partial pass)`.
+
+### Fixed — `edgeasm` budgeted `edge_setup` against a different shader's descriptor
+
+`ea_vgpr_check(56, "edge_setup")` under a comment claiming edge_setup and edge_cov *"SHARE RSRC1
+(0x002C00CD, 56 VGPRs)"*. They do not: `gpu_regs.cyr:1408` `_ESET = 0x002C00C7` → VGPRS field 7 = **32
+granted**; `:1409` `_EDGE = 0x002C00CD` → field 13 = **56**. The `.s` files agree (32 vs 56) and the two
+dispatch separately. ⇒ 24 registers of untested growth, in the file about to become the template for
+the SGPR gate. Now checked against **32** — and that budget has **zero slack**: it holds at 32 and goes
+red at 31, because edge_setup's true high-water is **v31**.
+
+### New — `scripts/check/check-dup-symbols.sh`, and `edgeasm` now shares `asmlib.cyr`
+
+`edgeasm.cyr` carried its own copy of the print helpers, asserting wrappers, VGPR tracker and
+label/fixup pass — **236 lines** that `asmlib.cyr` now owns and `shaderasm.cyr` shares. Two copies of a
+verification layer is the one duplication that cannot be tolerated: they drift, and the drift is
+invisible precisely because both files are what you would use to detect drift. Output after the swap is
+identical to before, modulo `** edgeasm:` → `** asmlib:` on the refusal lines.
+
+⛔ **The gate exists because cycc's duplicate-symbol behaviour is not uniform.** A duplicate `fn` warns;
+a duplicate **`var` produces no diagnostic at all**, even at conflicting array sizes (probed directly,
+cycc 6.5.20). The two files shared **46 top-level symbols, 13 of them `var`** (four arrays: `isa`,
+`lab_off`, `patch_off`, `patch_tgt`). Measured on the collided tree: cycc mentioned **33** and reported
+**OK** — and `host-gpu-oracles.sh` discards build output on success, so in practice all 46 were
+invisible. ⚠ **Honest limit:** I could not demonstrate that this corrupts memory — several probe shapes
+left the adjacent symbol intact. The justification is silent, undiagnosed duplication with a layout the
+source does not determine, which is disqualifying on its own for a verification tool.
+
+⚠ Sibling of `check-array-sizing.sh`, different scope — that one inspects function-LOCAL arrays and
+structurally cannot see this class.
+
+### Changed — `MABDA_REF` 4.0.8 → **4.0.9**; all three sovereign-encoder oracles hold across the bump
+
+Verified a real remote tag against mabda's own `VERSION` on a clean tree. `edgeasm`, `asmagree` and
+`shaderasm` all still exit 95 — independent cross-repo confirmation of 4.0.9's own claim that no encoder
+output changed, from a tree that did not write the release.
+
+⚠ The pin comment previously anticipated **4.1.0** landing `gfx9_rsrc1_ex` "because agnos's corpus found
+that `gfx9_rsrc1` under-allocates SGPRs". **That finding was false and is retracted** (see below); 4.0.9
+is what an actual investigation produced instead. The four opcode constants agnos holds under `AG_` in
+`asmlib.cyr` were not part of it and remain agnos-local.
+
+### Measured — the uniform-alpha blend model, exhaustively, before any shader exists
+
+Host-side determination of the three properties that decide whether `blend_alpha` (M6-C3's `#92` op
+`0x11`) can be burned against a **zero-tolerance** oracle or needs a ULP budget. All exhaustive, not
+sampled:
+
+| property | space | result |
+|---|---|---|
+| `alpha=255` output bit-identical to `blend_rect` | 256³ = **16,777,216** | **0 differing** |
+| `alpha=0` leaves dst byte-untouched | 256³ | **0 perturbed** |
+| premultiplication `c ≤ a` survives scaling | 5 alphas × 256² | **0 violations** |
+
+⭐ The identity holds because `0x3B808081` is the correctly-rounded f32 nearest 1/255 (rel err +5.9e-8)
+and **`255 × 0x3B808081` rounds to exactly `1.0f`** — so `v_mul_f32(x, fa)` at alpha=255 is the exact
+identity and every channel falls through unchanged. ⇒ **the iron burn gets a zero-tolerance gate for
+free**, rather than blend_cov's `≤ 1 ULP, max printed` discipline.
+
+⭐ Also settled, because the model implementation depends on it: **f64-multiply-add-then-narrow is
+bit-identical to true single-rounding f32 FMA over this shader's entire input space** — verified against
+an 80-bit reference across **all 4,294,967,296** `(alpha, dc, ia, sc)` combinations, 0 mismatches. So a
+Cyrius model can use `f64` plus the `f32_from` narrowing builtin and be exact, with no FMA emulation.
+
+⚠ **These are host determinations, not yet a committed gate.** `tests/gpu/alphamodel.cyr` — the Cyrius
+oracle that puts them in `check.sh` — lands with the shader itself.
+
+### Fixed — the `+6 = VCC(2) + XNACK(4)` SGPR-granting rationale is wrong, in five files at once
+
+⛔ **agnos has documented a false mechanism for its own RSRC1 constants since rung 17.** Measured with
+llvm-mc 22.1.8, solving `E` in `granted = roundup8(next_free_sgpr + E)` **uniquely** over
+`next_free_sgpr = 1..39` on gfx90c:
+
+| configuration | E |
+|---|---|
+| bare `gfx90c`, all defaults — what every agnos `.s` asks for | **6** |
+| `.amdhsa_reserve_xnack_mask 0` alone | **6 — UNCHANGED** |
+| `.amdhsa_reserve_flat_scratch 0` alone | 4 |
+| both waived | 2 |
+
+**XNACK contributes 2, not 4, and is invisible while flat scratch is reserved** — they overlap at the top
+of the register file. So for agnos's configuration the dominating term is **FLAT_SCRATCH**, and XNACK is
+not the discriminator at all. ⚠ agnos's kernels use **no scratch whatsoever** — no `scratch_`/`flat_`
+instruction in any shader, every shipped RSRC2 has bit 0 clear, and `COMPUTE_TMPRING_SIZE` has never been
+written — so the +6 is simply LLVM's conservative default for hand-written asm, not a property of the
+silicon.
+
+Corrected in `gpu_regs.cyr:1375`, `planning/gpu.md`, `planning/rung17-tri-depth.md`, `tri_persp.s` and
+`tri_depth.s`. ⚠ **The rule shape and the "harvest, never hand-count" conclusion both STAND** — only the
+cause was false. Also fixed in passing: `gpu_regs.cyr` called `tri_persp` "56 SGPRs" when `0x002C01C7` is
+field 7 = **64** (`0x002C0187` is field 6 = 56). Binary byte-identical; `shader blobs match their .s
+sources` still passes.
+
+⚠ **This is what a rationale copied between documents rather than re-measured looks like** — one wrong
+sentence propagated to five files and then out of the repo entirely, as the retracted mabda finding below.
+
+### Retracted — the reported mabda `gfx9_rsrc1` bug does not exist
+
+An earlier entry in this cycle (and a roadmap row, now marked FALSIFIED) claimed mabda's
+`gfx9_rsrc1` under-allocates SGPRs. **It does not. mabda is correct and no PR should be opened.**
+
+The error was using agnos's own committed constants as the oracle for whether another project is wrong.
+`llvm-mc` is not an oracle for the *correct* SGPR grant — it emits whichever reservation policy you
+declare, and it emits **both** numbers from the same shader file: `0x002C00C3` (SGPRS 3) under bare
+gfx90c defaults, `0x002C0083` (SGPRS 2) under `xnack-` + `reserve_flat_scratch 0` — mabda's exact value.
+Both are arithmetically correct for their policy.
+
+⇒ **agnos over-declares by one 8-SGPR granule on 5 of 20 shaders** (`blend_pk`, `blend_rect`,
+`grad_linear`, `glyph_1bpp`, `edge_cov` — not "3 of 6"). Over-declaration costs occupancy and nothing
+else, and nothing can detect it in either direction. **agnos changes nothing.**
+
+⚠ Also corrected: the "562 call sites" figure quoted against `gfx9_rsrc1` was wrong wherever it came
+from — `gfx9_rsrc1` has **one** production call site (`mabda/src/gfx9_compile.cyr:958`) plus 5 test
+assertions, and `gfx9_enc_*` occurs 218 times in mabda's `src/`.
+
 ### Changed — cyrius pin **6.4.78 → 6.5.20**; the kernel was already being built by 6.5.20
 
 ⛔ **The pin was documenting nothing and gating nothing.** Every build in this tree emitted
@@ -113,8 +246,8 @@ New `tests/gpu/asmlib.cyr` holds the shared safety layer (asserting wrappers, VG
 label/fixup pass, the comparator). ⚠ These refusals stay **local to agnos permanently**: mabda's
 encoders are pure bit-packers *by design* — `vsrc1 = 300` silently encodes as `v44` — which is the
 right contract for a compiler whose register allocator guarantees the invariant upstream, and the
-wrong one for a human writing 47 instructions by hand. Pushing them upstream would change behaviour
-for 562 call sites to satisfy agnos's failure model rather than mabda's.
+wrong one for a human writing 47 instructions by hand. Pushing them upstream would change behaviour for
+every `gfx9_enc_*` call site in mabda (218 in `src/`) to satisfy agnos's failure model, not mabda's.
 
 Mutation-tested three ways, each red with the correct diagnosis:
 - a corrupted dword in `gpu.cyr` → `dword 30 (byte +120) emitted 0xd1cb0008, committed 0xd1cb0009`
