@@ -3608,6 +3608,107 @@ fn edge_abi_selftest() {
     pass = pass + ea_expect(&d, GPO_E_RESERVED, "persp: dword 8 is not defined for this op", 41);
     store32(&d + 32, 0);
 
+    # ================================================================================================
+    # ⛔⛔ THE SHARED GENERIC TAIL — ops 0x01-0x04 — WHICH THIS BATTERY HAS NEVER TOUCHED
+    # ================================================================================================
+    # Every case above constructs an op in 0x08..0x10, all of which DELEGATE to their own validator at
+    # the block near gpo_validate's top. **Not one case has ever used an op in 0x00-0x04**, so the
+    # shared generic tail — reserved-dword sweep, dimensions, bounds, slot, slot-size, arming — has
+    # been executed by ZERO of the 152 cases while four shipped ops depend on it.
+    #
+    # ⛔ THAT BLINDNESS WAS ABOUT TO COST A SHIPPED CONSUMER. Minting BLEND_ALPHA wanted an
+    # `alpha > 255` reject on dword 9. Written UNGUARDED in this shared tail it would also have hit
+    # 0x02/0x03/0x04, for which dword 9 is `color0` — a full 32-bit ARGB. aethersafha writes a real
+    # title colour there (aethersafha/src/gpu.cyr:670). Every non-near-black glyph run would have been
+    # refused, `ae_text_gpu_disable()` would latch, and ALL chrome text would fall to the CPU
+    # permanently, every boot — while this battery printed "152 of 152 cases correct".
+    kprint("edge-abi: ---- #92 shared tail: ops 0x01-0x04 (first coverage) ----\n", 68);
+
+    # ⚠ RESEED. An earlier restore loop zeroed slots 10-15, so without this every slot lookup below
+    # answers GPO_E_SLOTSIZE against a 0-byte slot and the cases measure nothing. Same reason the
+    # rung-17 section reseeds.
+    # ⛔ SLOT IDS ARE 1-BASED — `shm_slot_valid` does `slot = id - 1`, so INDEX 14 is **id 15**. The
+    # first draft of these cases used id 14 (index 13, 256 B) for a 1024-byte source and got a
+    # SLOTSIZE reject it read as a bug in the op. The file warns about this exactly here; it still
+    # caught me.
+    store64(&shm_phys + 14 * 8, 1); store64(&shm_mc + 14 * 8, 0x2000); store64(&shm_size + 14 * 8, 4096);
+    store64(&shm_kva  + 14 * 8, &eabi_edges);      # id 15 — 4096 B, room for a 16x16 BGRA source
+    store64(&shm_phys + 15 * 8, 1); store64(&shm_mc + 15 * 8, 0x3000); store64(&shm_size + 15 * 8, 16);
+    store64(&shm_kva  + 15 * 8, &eabi_edges);      # id 16 — 16 B, too small for anything
+
+    # ⭐ THE REGRESSION GUARD. A well-formed GLYPH_1BPP record carrying a REALISTIC colour at dword 9.
+    # This single case is the permanent proof that the alpha range check stays op-guarded.
+    L1 = 0; while (L1 < 16) { store32(&d + L1 * 4, 0); L1 = L1 + 1; }
+    store32(&d +  0, GPU_OP_GLYPH_1BPP);
+    store32(&d + 12, 15);                          # mask slot: id 15 (index 14), 4096 B
+    store32(&d + 16, (8 * 65536) + 8);             # 8x8 glyph => ((8+7)/8)*8 = 8 B, fits 16
+    store32(&d + 20, (16 * 65536) + 16);           # dstxy
+    store32(&d + 36, 0xFF3060A0);                  # color0 — a real title colour, NOT a 0..255 scalar
+    pass = pass + ea_expect_valid(&d, "glyph: a REAL colour at dword 9 is accepted (range check is op-guarded)", 71);
+
+    # And the same record with a near-black colour, so a reviewer can see the guard is not accidentally
+    # passing because the value happens to be small.
+    store32(&d + 36, 0x00000080);
+    pass = pass + ea_expect_valid(&d, "glyph: a small colour at dword 9 is accepted too", 48);
+
+    # ================================================================================================
+    # #92 op 0x06 BLEND_ALPHA
+    # ================================================================================================
+    # ⛔ WELL-FORMED RECORDS ASSERT GPO_E_NOTIMPL, NOT ea_expect_valid. The shader is authored but
+    # UNBURNED, so bit 6 is in GPU_OP_NOTIMPL_MASK and the validator refuses before arming.
+    # ⚠ `ea_expect_valid` accepts 0 OR GPO_E_ARM and would therefore PASS on a broken op — it must not
+    # be used here. When the burn lands, bit 6 clears and these flip to ea_expect_valid in the SAME
+    # change that clears it. Both moves or neither.
+    kprint("edge-abi: ---- #92 op 0x06 BLEND_ALPHA ABI battery ----\n", 56);
+    L1 = 0; while (L1 < 16) { store32(&d + L1 * 4, 0); L1 = L1 + 1; }
+    store32(&d +  0, GPU_OP_BLEND_ALPHA);
+    store32(&d +  8, 15);                          # src slot: id 15 (index 14), 4096 B
+    store32(&d + 16, (16 * 65536) + 16);           # 16x16 => 16*4*16 = 1024 B, fits
+    store32(&d + 20, (32 * 65536) + 32);           # dstxy
+    store32(&d + 36, 128);                         # alpha, mid-range
+    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "balpha: well-formed record reaches NOTIMPL", 42);
+
+    store32(&d + 36, 0);
+    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "balpha: alpha 0 is in range", 27);
+    store32(&d + 36, 255);
+    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "balpha: alpha 255 is in range", 29);
+
+    # ⭐ 256 is the off-by-one a caller meaning "opaque" would write. The shader reads alpha with
+    # v_cvt_f32_ubyte0 — BYTE 0 — so without this reject it would silently render FULLY TRANSPARENT.
+    store32(&d + 36, 256);
+    pass = pass + ea_expect(&d, GPO_E_ARANGE, "balpha: alpha 256 is refused, not truncated to 0", 48);
+    store32(&d + 36, 0xFF3060A0);
+    pass = pass + ea_expect(&d, GPO_E_ARANGE, "balpha: a color0-shaped value is refused", 40);
+    store32(&d + 36, 128);
+
+    # The reserved-dword sweep. Field mask 0x0237 defines {0,1,2,4,5,9}; every other dword must be 0.
+    store32(&d + 12, 1);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "balpha: dword 3 is not defined for this op", 42);
+    store32(&d + 12, 0);
+    store32(&d + 24, 1);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "balpha: dword 6 is not defined for this op", 42);
+    store32(&d + 24, 0);
+    store32(&d + 40, 1);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "balpha: dword 10 (color1) is not defined", 40);
+    store32(&d + 40, 0);
+    store32(&d +  4, 0x01);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "balpha: unknown flag bit", 24);
+    store32(&d +  4, 0);
+
+    store32(&d + 16, (16 * 65536) + 0);
+    pass = pass + ea_expect(&d, GPO_E_DIM, "balpha: zero width", 18);
+    store32(&d + 16, (16 * 65536) + 16);
+
+    store32(&d + 20, (1440 * 65536) + 2560);
+    pass = pass + ea_expect(&d, GPO_E_BOUNDS, "balpha: rect off the right/bottom edge", 38);
+    store32(&d + 20, (32 * 65536) + 32);
+
+    store32(&d +  8, 0);
+    pass = pass + ea_expect(&d, GPO_E_BADSLOT, "balpha: slot id 0 is not a slot", 31);
+    store32(&d +  8, 16);                          # id 16 (index 15) is 16 B — far too small for 1024
+    pass = pass + ea_expect(&d, GPO_E_SLOTSIZE, "balpha: source slot too small for w*4*h", 39);
+    store32(&d +  8, 15);
+
     # Restore again, for the same reason the loop above does: a selftest that leaves the shm table
     # dirty hands the next allocation a slot that LOOKS taken, and the symptom surfaces far from here.
     r = 10;
@@ -3617,11 +3718,14 @@ fn edge_abi_selftest() {
         r = r + 1;
     }
 
-    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 152 cases correct\n", 22);
-    if (pass == 152) {
-        kprint("edge-abi: PASS -- the 0x08..0x0F and 0x10 ABIs reject every malformed record,\n", 78);
-        kprint("edge-abi: record,\n", 18);
-        kprint("edge-abi: and a well-formed one is accepted or correctly reports no-GPU.\n", 73);
+    # ⚠ 152 -> 167: fifteen cases added when op 0x06 was minted. Thirteen exercise BLEND_ALPHA; TWO are
+    # the first coverage this battery has EVER had of the shared generic tail (ops 0x01-0x04), and they
+    # exist because an unguarded range check on dword 9 would have broken aethersafha's chrome text
+    # while this line still printed a clean pass.
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 167 cases correct\n", 22);
+    if (pass == 167) {
+        kprint("edge-abi: PASS -- the 0x01..0x06 and 0x08..0x10 ABIs reject every malformed\n", 76);
+        kprint("edge-abi: record, and a well-formed one is accepted or correctly reports no-GPU.\n", 81);
         return 1;
     }
     kprint("edge-abi: FAIL -- see the named case(s) above\n", 46);

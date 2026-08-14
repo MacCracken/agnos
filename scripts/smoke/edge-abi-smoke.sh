@@ -84,10 +84,10 @@ pass=0; fail=0
 chk() { if grep -q "$1" "$LOG"; then echo "PASS: $2"; pass=$((pass+1)); else echo "FAIL: '$1' — $3"; fail=$((fail+1)); fi; }
 nchk() { if grep -q "$1" "$LOG"; then echo "FAIL: '$1' present — $3"; fail=$((fail+1)); else echo "PASS: $2"; pass=$((pass+1)); fi; }
 
-chk "edge-abi: 152 of 152 cases correct" \
-    "every one of the 152 ABI cases returned the reason the ABI specifies" \
-    "not 152/152 - read the named FAIL line(s) above; each names its case, want and got"
-chk "edge-abi: PASS -- the 0x08..0x0F and 0x10 ABIs reject every malformed record," \
+chk "edge-abi: 167 of 167 cases correct" \
+    "every one of the 167 ABI cases returned the reason the ABI specifies" \
+    "not 167/167 - read the named FAIL line(s) above; each names its case, want and got"
+chk "edge-abi: PASS -- the 0x01..0x06 and 0x08..0x10 ABIs reject every malformed" \
     "the battery's own verdict line is PASS" \
     "verdict line absent or FAIL"
 # THE 9a ORACLE. The single WELL-FORMED record must reach residency and be told NOT YET. If this case
@@ -156,10 +156,28 @@ chk "edge-abi: PASS 4096x4096 x 64 edges exceeds the work budget" \
 chk "edge-abi: PASS 64x64 x 16 edges is INSIDE the budget" \
     "the envelope the OLD edge-cap wrongly FORBADE (~0.65 ms) is now ACCEPTED" \
     "a measured-fast envelope was rejected; the bound is too tight to use"
+# ⭐ THE REGRESSION GUARD, ASSERTED AT THE SMOKE LEVEL TOO. If this line ever disappears, the shared
+# generic tail (ops 0x01-0x04) has lost its ONLY coverage and an unguarded dword-9 range check could
+# ship again — which would take aethersafha's chrome text to the CPU permanently.
+chk "edge-abi: PASS glyph: a REAL colour at dword 9 is accepted" \
+    "the alpha range check is op-guarded; a real title colour still validates" \
+    "a real colour at dword 9 was REFUSED - the range check is not op-guarded and chrome text will fall to the CPU"
+chk "edge-abi: PASS balpha: alpha 256 is refused, not truncated to 0" \
+    "an off-by-one alpha is a loud refusal, not a silently transparent window" \
+    "alpha 256 was accepted - v_cvt_f32_ubyte0 would drop bits 8..31 and render fully transparent"
+chk "edge-abi: PASS balpha: well-formed record reaches NOTIMPL" \
+    "op 0x06 is reachable by the validator and correctly reports its worker is absent" \
+    "the well-formed BLEND_ALPHA record did not reach NOTIMPL"
 chk "AGNOS shell" \
     "boot completed past the battery (no fault)" \
     "boot did not reach shell"
 
 echo ""
-[ "$fail" -eq 0 ] && { echo "=== edge-abi-smoke: $pass passed, 0 failed ==="; exit 0; }
-echo "=== edge-abi-smoke: $pass passed, $fail failed ==="; exit 1
+# ⛔⛔ THE FAILURE LINE MUST NOT CONTAIN THE WORD "PASS", AND THAT IS NOT COSMETIC.
+# `scripts/sweep.sh:40` decides a smoke succeeded with `grep -qiE "smoke.*PASS"` — case-INSENSITIVE.
+# The old failure line read `edge-abi-smoke: 150 passed, 18 failed`, which matches that pattern, so
+# sweep would have tallied a FAILING battery as a PASS the moment this smoke was added to its table.
+# Verified by feeding sweep's exact grep the old string. ⇒ Success says PASS; failure says FAILED and
+# reports counts as "correct"/"wrong" so no substring can be mistaken for a verdict.
+[ "$fail" -eq 0 ] && { echo "=== edge-abi-smoke: PASS -- $pass checks, 0 failed ==="; exit 0; }
+echo "=== edge-abi-smoke: FAILED -- $pass correct, $fail wrong ==="; exit 1

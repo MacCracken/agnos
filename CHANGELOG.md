@@ -92,6 +92,37 @@ set) = 59,319 cases/gate. The exhaustive 256³ run was done once — **0 mismatc
 `SX_STRIDE` to 1 to reproduce. ⚠ The tie is the one genuinely input-sparse property, which is why its
 witnesses are pinned explicitly rather than left to the stride.
 
+### New — the `#92` ABI battery now RUNS, and gained its first coverage of ops `0x01`-`0x04`
+
+⛔⛔ **It was not merely unrun — it was BLIND.** `edge_abi_selftest` sits behind
+`#ifdef EDGE_ABI_SELFTEST`; nothing set it; `edge-abi-smoke.sh` is one of **68 of 83** smoke scripts
+missing from `sweep.sh`'s table. And **zero of its 152 cases constructed an op in `0x00`-`0x04`**, so
+`gpo_validate`'s shared generic tail — reserved sweep, dimensions, bounds, slot, slot-size, arming —
+was executed by no case at all, while four shipped ops depend on it.
+
+**152 → 167 cases.** Two are the first coverage that tail has ever had; thirteen exercise op `0x06`.
+Wired into `sweep.sh` and verified end to end under QEMU: **167 of 167, smoke exit 0.**
+
+⭐ **The regression guard.** A well-formed `GLYPH_1BPP` record carrying a real title colour
+(`0xFF3060A0`) at dword 9. Had the alpha range check been written unguarded in the shared tail, this
+case fails — and without it, aethersafha's chrome text would have fallen to the CPU permanently while
+the battery printed `152 of 152 cases correct`.
+
+⛔ **And wiring it in would have created a gate that reports PASS while failing.** `sweep.sh:40`
+detects success with `grep -qiE "smoke.*PASS"` — **case-insensitive** — and the old failure line read
+`edge-abi-smoke: 150 passed, 18 failed`, which matches. Verified by feeding sweep's exact grep the old
+string. Success now says `PASS`; failure says `FAILED … N correct, M wrong`, so no substring can be
+mistaken for a verdict.
+
+⚠ **Three defects of my own, each caught by an existing gate rather than by me:**
+- `kprint-len-check.sh` caught **4** wrong string lengths in the new cases.
+- The first draft used **slot id 14** for a 1024-byte source. Slot IDs are **1-based**
+  (`shm_slot_valid: slot = id - 1`), so id 14 is index 13 — a **256 B** slot — and the well-formed
+  case took a `GPO_E_SLOTSIZE` reject I initially read as a bug in the op. The file warns about the
+  1-based convention at exactly that spot. It also needed a **reseed**: an earlier restore loop zeroes
+  slots 10-15 before this section runs.
+- I claimed 16 new cases; there are **15**. The battery reported `167 of 168` and corrected me.
+
 ### New — `#92` op **`0x06 GPU_OP_BLEND_ALPHA`** minted (validator half); worker still to come
 
 Premultiplied src-over with a **uniform per-surface alpha 0..255** — the kernel side of aethersafha's

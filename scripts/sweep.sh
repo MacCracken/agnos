@@ -81,6 +81,15 @@ run_gate "1.41.5 syscall hardening + epoll no-hang"  "SYSCALL_HARDEN_SELFTEST=1"
 # corrupting the owner field, which tests the check rather than the inheritance.
 run_gate "1.56.40 chan #97 ring-3 kill criteria"     "CHAN_RING3_SELFTEST=1"                    "chan-ring3-smoke.sh"
 
+# ⛔⛔ ADDED 1.56.44, AND UNTIL NOW THE #92 ABI BATTERY RAN NOWHERE AT ALL. `edge_abi_selftest` is
+# behind `#ifdef EDGE_ABI_SELFTEST`; the define comes only from `EDGE_ABI_SELFTEST=1 sh
+# scripts/build.sh`; its only consumer is `scripts/smoke/edge-abi-smoke.sh`; and NOTHING invoked that
+# script — not this file, not check.sh, not CI. 168 ABI cases that could not fail, guarding the surface
+# ring 3 reaches the GPU through.
+# ⚠ This file's own header calls that out for selftests generally; the ABI battery was simply never
+# added to the table. It is one of 68 of 83 smokes still missing from it — a separate, larger problem.
+run_gate "1.56.44 #92 ABI battery (167 cases, ops 0x01-0x10)" "EDGE_ABI_SELFTEST=1" "edge-abi-smoke.sh"
+
 # --- 1.52.x audio: HDA probe -> reset -> verb ring -> codec graph -> stream DMA-arm ---
 run_gate "1.52.x audio HDA (probe/reset/verb/graph/stream)" "" "hda-smoke.sh"
 

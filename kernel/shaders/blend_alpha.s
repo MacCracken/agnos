@@ -2,7 +2,12 @@
 // 2-D GRID, in place on a strided surface.
 //
 // blend_rect.s plus one scalar: `alpha` in 0..255, applied to the whole rect. It is the shader behind
-// `#92` op 0x11 and aethersafha's per-window opacity (M6-C3).
+// `#92` op **0x06** and aethersafha's per-window opacity (M6-C3).
+// ⚠ An earlier draft said 0x11. That code is mechanically free but sits inside the reserved
+// `0x10-0x17` CP-DMA lane, and gpu.cyr states minting 0x10/0x11 needs a domain state machine nobody
+// wrote. This is a SHADER dispatch with no engine-domain transition, so it belongs in the composite
+// lane 0x00-0x07 — and 0x06 is the only free code there, since 0x05 and 0x07 have `perm_write` and
+// `blend_pk_write` (already-committed, iron-proven blobs) waiting for them.
 //
 // ⛔ THIS SHADER HAS NOT BEEN BURNED. Every claim below is a HOST claim. blend_rect's bytes are
 // iron-proven; these are not, and `shader-blob.sh:11-15` already records that a blob assembled but not
