@@ -1531,7 +1531,16 @@ var GPU_OP_SUPPORTED   = 0x1FF5F;    # bits 0..4 + 6 BLEND_ALPHA + 8 EDGE_COV + 
 # advertises ops, not flags. An OP cannot.
 # ⇒ WHEN THE WORKER LANDS (plan bite B9), bit 14 clears HERE and the GPO_E_NOTIMPL return at the end
 # of gpo_validate_tridepth goes away, in one change. Both moves or neither.
-var GPU_OP_NOTIMPL_MASK = 0x0040;    # bit 6 BLEND_ALPHA — ABI complete, shader authored but UNBURNED
+# ⭐⭐ CLEARED FOR THE 1.56.44 BURN. Bit 6 (BLEND_ALPHA) is out, so `#89 +28` advertises op 0x06 and
+# ring 3 can reach it — the ONLY way the shader gets tested at all. Everything else about blend_alpha
+# is host-proven (two independent assemblers agree on all 69 dwords; an interpreter executes them
+# against the kernel's own integer reference). The burn is the one thing left.
+# ⛔ THIS IS THE "BOTH MOVES OR NEITHER" HALF, AND THE OTHER HALF IS AUTOMATIC. gpo_validate's refusal
+# READS this word instead of hard-coding GPO_E_NOTIMPL, so clearing the bit removes the refusal in the
+# same edit — enforced by construction rather than by remembering.
+# ⛔⛔ IF THE BURN IS RED, REVERT THIS CONSTANT. An advertised op whose shader has never produced a
+# correct pixel is the 1.56.24 defect exactly: an advertised surface larger than the proven one.
+var GPU_OP_NOTIMPL_MASK = 0x0000;    # EMPTY — bit 6 cleared for the burn; revert if it comes back red
 
 # ---- rung 17 op 0x0E sizing. ⚠ Its OWN constants, not TRI_LIST's: the record, the stride and the
 # work unit all differ, and sharing a name would couple two ABIs that are free to move apart.
@@ -3654,11 +3663,12 @@ fn edge_abi_selftest() {
     # ================================================================================================
     # #92 op 0x06 BLEND_ALPHA
     # ================================================================================================
-    # ⛔ WELL-FORMED RECORDS ASSERT GPO_E_NOTIMPL, NOT ea_expect_valid. The shader is authored but
-    # UNBURNED, so bit 6 is in GPU_OP_NOTIMPL_MASK and the validator refuses before arming.
-    # ⚠ `ea_expect_valid` accepts 0 OR GPO_E_ARM and would therefore PASS on a broken op — it must not
-    # be used here. When the burn lands, bit 6 clears and these flip to ea_expect_valid in the SAME
-    # change that clears it. Both moves or neither.
+    # ⭐ FLIPPED WITH THE MASK, IN THE SAME CHANGE. These asserted GPO_E_NOTIMPL while bit 6 was set;
+    # bit 6 is now clear for the burn, so a well-formed record must VALIDATE instead.
+    # ⚠ `ea_expect_valid` accepts 0 OR GPO_E_ARM — under QEMU there is no GPU, so `gpu_blend_alpha_arm`
+    # returns 0 and the answer here is GPO_E_ARM. That is an ARMING fact, not a dispatch result, and it
+    # is the same answer every other shader op gives in this environment.
+    # ⛔ IF THE BURN IS RED these revert to ea_expect(GPO_E_NOTIMPL) together with the mask.
     kprint("edge-abi: ---- #92 op 0x06 BLEND_ALPHA ABI battery ----\n", 56);
     L1 = 0; while (L1 < 16) { store32(&d + L1 * 4, 0); L1 = L1 + 1; }
     store32(&d +  0, GPU_OP_BLEND_ALPHA);
@@ -3666,12 +3676,12 @@ fn edge_abi_selftest() {
     store32(&d + 16, (16 * 65536) + 16);           # 16x16 => 16*4*16 = 1024 B, fits
     store32(&d + 20, (32 * 65536) + 32);           # dstxy
     store32(&d + 36, 128);                         # alpha, mid-range
-    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "balpha: well-formed record reaches NOTIMPL", 42);
+    pass = pass + ea_expect_valid(&d, "balpha: a well-formed record VALIDATES (op 0x06 is live)", 56);
 
     store32(&d + 36, 0);
-    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "balpha: alpha 0 is in range", 27);
+    pass = pass + ea_expect_valid(&d, "balpha: alpha 0 is in range", 27);
     store32(&d + 36, 255);
-    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "balpha: alpha 255 is in range", 29);
+    pass = pass + ea_expect_valid(&d, "balpha: alpha 255 is in range", 29);
 
     # ⭐ 256 is the off-by-one a caller meaning "opaque" would write. The shader reads alpha with
     # v_cvt_f32_ubyte0 — BYTE 0 — so without this reject it would silently render FULLY TRANSPARENT.

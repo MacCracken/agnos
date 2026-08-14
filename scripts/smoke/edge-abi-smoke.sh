@@ -165,9 +165,12 @@ chk "edge-abi: PASS glyph: a REAL colour at dword 9 is accepted" \
 chk "edge-abi: PASS balpha: alpha 256 is refused, not truncated to 0" \
     "an off-by-one alpha is a loud refusal, not a silently transparent window" \
     "alpha 256 was accepted - v_cvt_f32_ubyte0 would drop bits 8..31 and render fully transparent"
-chk "edge-abi: PASS balpha: well-formed record reaches NOTIMPL" \
-    "op 0x06 is reachable by the validator and correctly reports its worker is absent" \
-    "the well-formed BLEND_ALPHA record did not reach NOTIMPL"
+# ⭐ FLIPPED WITH THE MASK. While bit 6 was in GPU_OP_NOTIMPL_MASK this asserted the op reported its
+# worker absent; the bit is now clear for the burn, so a well-formed record must VALIDATE.
+# ⛔ If the burn is red, this and the mask revert together.
+chk "edge-abi: PASS balpha: a well-formed record VALIDATES (op 0x06 is live)" \
+    "op 0x06 is advertised and a well-formed record passes the validator" \
+    "the well-formed BLEND_ALPHA record did not validate"
 chk "AGNOS shell" \
     "boot completed past the battery (no fault)" \
     "boot did not reach shell"
