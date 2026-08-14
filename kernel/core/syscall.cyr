@@ -4240,6 +4240,18 @@ fn gpo_execute(rec) {
         if (gpu_blend_surface(s1, w, h, dx, dy) != 1) { return GPO_E_DISPATCH; }
         return 0;
     }
+    # ⭐ op 0x06. UNREACHABLE while bit 6 is in GPU_OP_NOTIMPL_MASK — pass 1 refuses every record before
+    # gpo_execute_all runs — and written anyway for the reason this file states at the EDGE_COV branch:
+    # "so this file never contains a supported op with no execution path, which is how GPO_E_BADOP
+    # would surface as a mystery at the wrong layer." Landing the burn then becomes a one-constant
+    # change instead of an ABI edit.
+    # ⚠ `c0` is dword 9 — ALPHA for this op, a 0..255 scalar, not the ARGB it is for 0x02/0x03/0x04.
+    # gpo_validate has already refused anything above 255 with GPO_E_ARANGE.
+    if (op == GPU_OP_BLEND_ALPHA) {
+        var sa = load64(&shm_mc + ((load32(rec + 8) & 0xFFFFFFFF) - 1) * 8);
+        if (gpu_blend_alpha_surface(sa, w, h, dx, dy, c0) != 1) { return GPO_E_DISPATCH; }
+        return 0;
+    }
     if (op == GPU_OP_BLEND_COV) {
         var s2 = load64(&shm_mc + ((load32(rec + 12) & 0xFFFFFFFF) - 1) * 8);
         if (gpu_cov_surface(s2, w, h, dx, dy, c0) != 1) { return GPO_E_DISPATCH; }

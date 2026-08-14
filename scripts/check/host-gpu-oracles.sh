@@ -8,7 +8,7 @@
 # cannot fail in practice.
 #
 # ⚠ SCOPE, STATED HONESTLY: this runs texlist, bigate, bimodel, texgate, rtaudit, depthgate, perspbits, perspdiv, perspgate, perspmodel,
-# depthmodel, depthdiv, moderaster and — added 1.56.44 — edgeasm, asmagree, shaderasm and shaderexec. It
+# depthmodel, depthdiv, moderaster and — added 1.56.44 — edgeasm, asmagree, shaderasm, shaderexec and pm4lint. It
 # does NOT run doomcol, doomwall, edgemodel or refraster — those are equally host-runnable and
 # equally unwired, and adding them is a separate bite rather than something smuggled in beside a rung.
 # ⚠ This line has gone stale twice as oracles were added; it is the drift the tree keeps finding in
@@ -48,6 +48,17 @@
 # exhaustive 256^3 run was done once on 2026-08-13 — 0 mismatches on all three gates, 119 s — and is
 # not what ships, because 119 s against this runner's 3 s makes a gate people skip. Set SX_STRIDE to 1
 # to reproduce it. The count is printed at run time rather than implied.
+#
+# ⭐ pm4lint ADDED 1.56.44 — THE THIRD ORACLE THIS CUT FOUND SITTING UNWIRED. It is a mutation-
+# calibrated host PM4 decoder, written (its own header says) so that "every later rung in this arc
+# emits packets, and each one wants to say 'the stream is well-formed' before it costs a burn". It
+# self-reports "all 12 mutants rejected" — a genuinely falsified oracle — and nothing has ever run it.
+# ⚠ HONEST SCOPE, AND IT MATTERS FOR WHAT IT CAN BE CITED FOR: pm4lint checks a stream **transcribed
+# by hand from `gpu_matmul_run`**, not the live emission. So it validates the DECODER and the packet
+# INVARIANTS; it does NOT observe what `gpu_grid7_run` actually puts in the ring today, and a change
+# to that function would not move it. Do not cite it as a gate on dispatch emission — that gate does
+# not exist, and building one needs a host-side ring stub the kernel's kmode build cannot currently
+# provide.
 #
 # ⚠ Their pass is the first empirical answer to the mabda/agnos pin question: mabda pins cyrius
 # 6.5.3, agnos's manifests pin 6.4.78, and `gfx9_encode.cyr` compiles inside agnos's test tree
@@ -164,7 +175,7 @@ rc=0
 # h_front - h_active` cancels the front porch exactly, so h_front reaches H_TOTAL and never H_BLANK.
 # Both directions are now pinned (M1/M1c assert the cancellation, M1b asserts the register still
 # moves), because a change folding h_front into the blank formula would otherwise be invisible.
-for t in texlist bigate bimodel texgate rtaudit depthgate depthmodel depthdiv perspbits perspdiv perspgate perspmodel moderaster edgeasm asmagree shaderasm shaderexec; do
+for t in texlist bigate bimodel texgate rtaudit depthgate depthmodel depthdiv perspbits perspdiv perspgate perspmodel moderaster edgeasm asmagree shaderasm shaderexec pm4lint; do
     out="$(cd "$GPU" && cyrius build "$t.cyr" "build/$t" 2>&1)" || {
         echo "host-gpu-oracles: FAIL -- $t.cyr does not BUILD"
         echo "$out" | tail -20

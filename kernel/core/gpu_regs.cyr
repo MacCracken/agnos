@@ -1465,6 +1465,10 @@ var GPU_GRD_C0 = 0xFFC000C0;                 # row 0: OPAQUE magenta (alpha 255 
 var GPU_GRD_C1 = 0x00000000;                 # last row: fully transparent ⇒ the underlay ramps back in
 var GPU_GRD_L  = 0xFF202020;                 # underlay left  (dark)  — the fade-out must be visible
 var GPU_GRD_R  = 0xFFE0E0E0;                 # underlay right (light)   against BOTH              # glyph colour, stored verbatim (no blending in this kernel)              # underlay right half (near-white)   one edge is dark-on-light  # SET_SH_REG, 7 values (src_lo/hi, dst_lo/hi, src_pitch, dst_pitch, width)
+# ⭐ blend_alpha's residency slot. Extents walked sorted before placing it (the method this file
+# mandates after two by-eye collisions): GPU_TRID_SHADER_SUBOFF is 4 KB at 0x5E000 and ends exactly
+# here; GPU_BR_SRC_SUBOFF starts at 0x60000. 276 B of the 4 KB used.
+var GPU_BALPHA_SHADER_SUBOFF = 0x5F000;   # blend_alpha, 276 B -> ends 0x60000
 var GPU_BR_SRC_SUBOFF          = 0x60000;    # src rect: 256x64x4 = 64 KB -> ends 0x70000. Was 0x20000 == SDMA_RING.
 # Rect geometry. WIDTH MUST BE A MULTIPLE OF 64 — blend_rect has no bounds guard, so a partial trailing
 # workgroup would blend past the right edge into the neighbouring pixels.

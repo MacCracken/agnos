@@ -66,6 +66,7 @@ var gpu_bb_fbsize     = 0;   # framebuffer byte size (pitch*height) — the CP-D
 var gpu_blend_ok      = 0;   # plan-S2: 1 = per-pixel alpha blend proven on the CUs
 var gpu_rect_ok       = 0;   # plan-S5: 1 = grid blend into the scanout back buffer proven (and presented)
 var gpu_blend_armed   = 0;   # 1 = blend_rect resident in its own arena slot for #92 op GPU_OP_BLEND_RECT
+var gpu_balpha_armed  = 0;   # 1 = blend_alpha resident for #92 op GPU_OP_BLEND_ALPHA (0x06)
 var gpu_cov_ok        = 0;   # plan-S10: 1 = coverage (anti-aliased) blend proven on iron
 var gpu_cov_armed     = 0;   # 1 = blend_cov resident in its own arena slot for #92 op GPU_OP_BLEND_COV
 var gpu_glyph_ok      = 0;   # plan-S9: 1 = 1bpp glyph expansion proven on iron
@@ -3375,6 +3376,90 @@ fn blend_rect_write(dst_phys) {
     return 60;
 }
 
+# blend_alpha — blend_rect plus a UNIFORM per-surface alpha. Human-readable reference:
+# kernel/shaders/blend_alpha.s.
+# ⛔⛔ THESE BYTES HAVE NEVER RUN ON HARDWARE. Every other *_write in this file is iron-proven on
+# archaemenid; this one is not. `shader-blob.sh:11-15` sets the standard — an assembled-but-unrun blob
+# "has not met the bar for a hardware run" — and that is exactly what this is. It ships behind
+# GPU_OP_NOTIMPL_MASK bit 6 so `#89` never advertises it to ring 3.
+# ⭐ GENERATED, NOT TYPED: emitted by llvm-mc from blend_alpha.s and pasted mechanically. Two
+# independent assemblers agree on all 69 dwords (`scripts/check/shader-crossasm.sh`), and
+# `tests/gpu/shaderexec.cyr` EXECUTES them against the integer reference.
+# ⚠ USER_SGPR=8 — alpha in s7, TGIDs at s8/s9 — so this dispatches through gpu_grid8_run with
+# RSRC2 = GPU_COMPUTE_RSRC2_COV (0x190), NOT the 0x18E every 7-kernarg shader here uses.
+fn blend_alpha_write(dst_phys) {
+    store32(dst_phys + 0,    0x8e0f8608);
+    store32(dst_phys + 4,    0x6818000f);
+    store32(dst_phys + 8,    0x7d981806);
+    store32(dst_phys + 12,   0xbe90206a);
+    store32(dst_phys + 16,   0x8e0a8808);
+    store32(dst_phys + 20,   0x920b0409);
+    store32(dst_phys + 24,   0x800b0a0b);
+    store32(dst_phys + 28,   0x800c0b00);
+    store32(dst_phys + 32,   0x820d8001);
+    store32(dst_phys + 36,   0x920e0509);
+    store32(dst_phys + 40,   0x800e0a0e);
+    store32(dst_phys + 44,   0x80120e02);
+    store32(dst_phys + 48,   0x82138003);
+    store32(dst_phys + 52,   0x24020082);
+    store32(dst_phys + 56,   0x7e08020c);
+    store32(dst_phys + 60,   0x7e0a020d);
+    store32(dst_phys + 64,   0x32080304);
+    store32(dst_phys + 68,   0x380a0a80);
+    store32(dst_phys + 72,   0xdc508000);
+    store32(dst_phys + 76,   0x027f0004);
+    store32(dst_phys + 80,   0x7e0c0212);
+    store32(dst_phys + 84,   0x7e0e0213);
+    store32(dst_phys + 88,   0x320c0306);
+    store32(dst_phys + 92,   0x380e0e80);
+    store32(dst_phys + 96,   0xdc508000);
+    store32(dst_phys + 100,  0x037f0006);
+    store32(dst_phys + 104,  0xbf8c0f70);
+    store32(dst_phys + 108,  0xbe9500ff);
+    store32(dst_phys + 112,  0x3b808081);
+    store32(dst_phys + 116,  0x7e1a2207);
+    store32(dst_phys + 120,  0x0a1a1a15);
+    store32(dst_phys + 124,  0x7e102902);
+    store32(dst_phys + 128,  0x0a10110d);
+    store32(dst_phys + 132,  0xbe9400ff);
+    store32(dst_phys + 136,  0xbb808081);
+    store32(dst_phys + 140,  0xd1cb0008);
+    store32(dst_phys + 144,  0x03c82908);
+    store32(dst_phys + 148,  0x7e122302);
+    store32(dst_phys + 152,  0x0a12130d);
+    store32(dst_phys + 156,  0x7e142303);
+    store32(dst_phys + 160,  0xd1cb0009);
+    store32(dst_phys + 164,  0x0426110a);
+    store32(dst_phys + 168,  0xd1dd000b);
+    store32(dst_phys + 172,  0x042d0109);
+    store32(dst_phys + 176,  0x7e122502);
+    store32(dst_phys + 180,  0x0a12130d);
+    store32(dst_phys + 184,  0x7e142503);
+    store32(dst_phys + 188,  0xd1cb0009);
+    store32(dst_phys + 192,  0x0426110a);
+    store32(dst_phys + 196,  0xd1dd000b);
+    store32(dst_phys + 200,  0x042d0309);
+    store32(dst_phys + 204,  0x7e122702);
+    store32(dst_phys + 208,  0x0a12130d);
+    store32(dst_phys + 212,  0x7e142703);
+    store32(dst_phys + 216,  0xd1cb0009);
+    store32(dst_phys + 220,  0x0426110a);
+    store32(dst_phys + 224,  0xd1dd000b);
+    store32(dst_phys + 228,  0x042d0509);
+    store32(dst_phys + 232,  0x7e122902);
+    store32(dst_phys + 236,  0x0a12130d);
+    store32(dst_phys + 240,  0x7e142903);
+    store32(dst_phys + 244,  0xd1cb0009);
+    store32(dst_phys + 248,  0x0426110a);
+    store32(dst_phys + 252,  0xd1dd000b);
+    store32(dst_phys + 256,  0x042d0709);
+    store32(dst_phys + 260,  0xdc718000);
+    store32(dst_phys + 264,  0x007f0b06);
+    store32(dst_phys + 268,  0xbf8c0f70);
+    store32(dst_phys + 272,  0xbf810000);
+    return 69;
+}
+
 # gpu_blend_rect_run — dispatch blend_rect over a 2-D GRID of (gx, gy) workgroups, 64 threads each.
 #
 # The grid peer of gpu_matmul_run. Envelope is byte-identical to that iron-proven path — same pre-dispatch
@@ -3392,7 +3477,19 @@ fn blend_rect_write(dst_phys) {
 # TGID_Y) but have completely different kernarg MEANINGS (two pointers + three scalars vs one pointer +
 # five). Rather than a third near-identical copy of the ring program — the one place a typo is silent and
 # expensive — the emitter takes seven opaque dwords and the callers name them.
-fn gpu_grid7_run(shader_mc, k0, k1, k2, k3, k4, k5, k6, rsrc1, gx, gy, done_mc, done_phys) {
+# ⭐⭐ ONE DISPATCH IMPLEMENTATION, TWO ARITIES. `gpu_grid7_run` and `gpu_grid8_run` are both thin
+# wrappers over this; there is no second copy of the 40-line PM4 sequence.
+# ⛔ WHY NOT A CLONE. blend_alpha needs an EIGHTH USER_DATA dword (alpha at s7) and RSRC2 = 0x190
+# instead of 0x18E, and `gpu_grid7_run` hardcodes both. Cloning it would duplicate an iron-proven
+# dispatch sequence into a path that has NEVER been burned — and duplication in a dispatch layer
+# drifts invisibly, which is the same argument that pulled the wrapper layer out of edgeasm this cut.
+# ⛔ WHY THE 7-ARITY CALL SITES DO NOT MOVE. `gpu_grid7_run` keeps its exact signature, so all seven
+# existing callers — every one of them on a burned path — are untouched by construction.
+# ⚠ THE 7-DWORD EMISSION IS UNCHANGED BY CONSTRUCTION, NOT BY MEASUREMENT. `n_user == 7` takes the
+# identical branch with the identical constants; there is no host gate that observes what this
+# function actually puts in the ring. `pm4lint` validates a stream TRANSCRIBED from gpu_matmul_run,
+# not the live one, so it would not notice if this were wrong. That gate does not exist.
+fn gpu_grid_dispatch(shader_mc, k0, k1, k2, k3, k4, k5, k6, k7, n_user, rsrc1, rsrc2, gx, gy, done_mc, done_phys) {
     # 1.56.26 — OBSERVE the grid. Twin of the capture in gpu_blend_cov_run: these are the TWO dispatch
     # primitives in the kernel, and instrumenting only one would silently under-report waves for every
     # op that routes through the other — a grid cross-check that is blind on half the paths is worse
@@ -3417,10 +3514,15 @@ fn gpu_grid7_run(shader_mc, k0, k1, k2, k3, k4, k5, k6, rsrc1, gx, gy, done_mc, 
         gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
     }
     gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_LO); gpu_ring_put(pgm_lo); gpu_ring_put(pgm_hi);
-    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_RSRC1); gpu_ring_put(rsrc1); gpu_ring_put(GPU_COMPUTE_RSRC2_GRID2D);
-    gpu_ring_put(GPU_PM4_SET_SH_REG_N7); gpu_ring_put(GPU_SH_COMPUTE_USER_DATA_0);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_RSRC1); gpu_ring_put(rsrc1); gpu_ring_put(rsrc2);
+    # ⚠ The USER_DATA count is in the PM4 HEADER as well as the dword count — N7 and N8 are different
+    # packets, not the same packet with a different payload length. Emitting N7 and then 8 dwords would
+    # desynchronise the ring for everything after it.
+    if (n_user == 8) { gpu_ring_put(GPU_PM4_SET_SH_REG_N8); } else { gpu_ring_put(GPU_PM4_SET_SH_REG_N7); }
+    gpu_ring_put(GPU_SH_COMPUTE_USER_DATA_0);
     gpu_ring_put(k0); gpu_ring_put(k1); gpu_ring_put(k2); gpu_ring_put(k3);
     gpu_ring_put(k4); gpu_ring_put(k5); gpu_ring_put(k6);
+    if (n_user == 8) { gpu_ring_put(k7); }
     gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_START_X); gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(0);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_NUM_THREAD_X); gpu_ring_put(GPU_MT_NUM_THREAD_X); gpu_ring_put(1); gpu_ring_put(1);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_RESTART_X); gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(0);
@@ -3446,6 +3548,20 @@ fn gpu_grid7_run(shader_mc, k0, k1, k2, k3, k4, k5, k6, rsrc1, gx, gy, done_mc, 
     var drain_rc = gpu_ring_kick_wait(done_phys, 100000);
     gpu_prof_drain_us = gpu_prof_drain_us + gpu_prof_us(t_drain);
     return drain_rc;
+}
+
+# The 7-kernarg form. Signature UNCHANGED from before the split, so its seven callers are untouched.
+fn gpu_grid7_run(shader_mc, k0, k1, k2, k3, k4, k5, k6, rsrc1, gx, gy, done_mc, done_phys) {
+    return gpu_grid_dispatch(shader_mc, k0, k1, k2, k3, k4, k5, k6, 0, 7,
+    rsrc1, GPU_COMPUTE_RSRC2_GRID2D, gx, gy, done_mc, done_phys);
+}
+
+# The 8-kernarg form — blend_alpha's uniform alpha rides in k7 (s7), which pushes USER_SGPR 7 -> 8 and
+# therefore the TGIDs to s8/s9. ⚠ RSRC2 is a PARAMETER here because that shift changes it: 0x18E
+# (USER_SGPR=7) becomes 0x190 (USER_SGPR=8), which already exists as GPU_COMPUTE_RSRC2_COV.
+fn gpu_grid8_run(shader_mc, k0, k1, k2, k3, k4, k5, k6, k7, rsrc1, rsrc2, gx, gy, done_mc, done_phys) {
+    return gpu_grid_dispatch(shader_mc, k0, k1, k2, k3, k4, k5, k6, k7, 8,
+    rsrc1, rsrc2, gx, gy, done_mc, done_phys);
 }
 
 # ── plan-S12: the batch seam ───────────────────────────────────────────────────────────────────────────
@@ -8582,6 +8698,44 @@ fn gpu_blend_surface(src_mc, w, h, dx, dy) {
     var gx = (w + 63) / 64;                    # CEILING — the shader's EXEC guard trims the last group
     return gpu_blend_rect_run(gpu_arena_mc + GPU_BLEND_SHADER_SUBOFF, src_mc, dst_mc,
     w * 4, gpu_bb_pitch, w, gx, h,
+    gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
+    gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+}
+
+# gpu_blend_alpha_arm — residency for op 0x06. Same preconditions as gpu_blend_arm; a separate arena
+# slot and a separate latch, so arming one does not imply the other.
+fn gpu_blend_alpha_arm() {
+    if (gpu_balpha_armed == 1) { return 1; }
+    if (gpu_present == 0) { return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }      # ring never came up (QEMU) -> caller falls back
+    if (gpu_matmul_ok != 1) { return 0; }      # dispatch envelope unproven on this boot
+    blend_alpha_write(gpu_arena_phys + GPU_BALPHA_SHADER_SUBOFF);
+    gpu_mfence();
+    gpu_balpha_armed = 1;
+    return 1;
+}
+
+# gpu_blend_alpha_surface — the worker behind #92 op 0x06. Identical to gpu_blend_surface except the
+# eighth kernarg and the RSRC2 that shift implies.
+# ⛔ alpha REACHES THE SHADER IN BYTE 0 of s7 (`v_cvt_f32_ubyte0 v13, s7`). gpo_validate refuses
+# anything above 255 with GPO_E_ARANGE before this is called, so the masking here is belt-and-braces
+# for a future in-kernel caller that does not go through the validator — without it, an out-of-range
+# value renders FULLY TRANSPARENT rather than failing.
+# ⚠ THIS HAS NEVER RUN ON HARDWARE. Reachable only once GPU_OP_NOTIMPL_MASK bit 6 clears, which is the
+# same change that lands the burn result.
+fn gpu_blend_alpha_surface(src_mc, w, h, dx, dy, alpha) {
+    if (gpu_blend_alpha_arm() != 1) { return 0; }
+    var a = alpha & 0xFF;
+    var tgt = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { tgt = gpu_bb_b_mc; }
+    var dst_mc = tgt + dy * gpu_bb_pitch + dx * 4;
+    var gx = (w + 63) / 64;                    # CEILING — the shader's EXEC guard trims the last group
+    return gpu_grid8_run(gpu_arena_mc + GPU_BALPHA_SHADER_SUBOFF,
+    src_mc & 0xFFFFFFFF, (src_mc >> 32) & 0xFFFFFFFF,
+    dst_mc & 0xFFFFFFFF, (dst_mc >> 32) & 0xFFFFFFFF,
+    w * 4, gpu_bb_pitch, w, a,
+    GPU_COMPUTE_PGM_RSRC1_GRID, GPU_COMPUTE_RSRC2_COV, gx, h,
     gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
     gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
 }

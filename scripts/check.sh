@@ -138,7 +138,12 @@ BLOBDRIFT=""
 # ⚠ tex_rgba and tex_list were NOT in this list until rung 14 — the two largest and most
 # intricate blobs in the tree were the two nobody was diffing. Both pass; the gap was in the gate,
 # not the tables.
-for sb in edge_setup edge_cov tri_rgba tex_rgba tex_list tex_list_cm tex_bilin; do
+# ⚠ blend_alpha ADDED 1.56.44, closing a triangle that would otherwise have a loose corner. THREE
+# artifacts describe that shader: the .s, the emit list, and the committed hex in gpu.cyr.
+# `shader-crossasm.sh` ties the .s to the emit list (two independent assemblers) and `shaderexec.cyr`
+# executes the emit list — but NOTHING tied the committed HEX to either, so it could drift silently.
+# Verified by corrupting one committed dword before adding it here: check.sh stayed fully green.
+for sb in edge_setup edge_cov tri_rgba tex_rgba tex_list tex_list_cm tex_bilin blend_alpha; do
     sh "$ROOT/scripts/check/shader-blob.sh" check "$ROOT/kernel/shaders/$sb.s" "$sb" >/tmp/shader-blob-$sb.log 2>&1 \
         || BLOBDRIFT="$BLOBDRIFT$sb "
 done
