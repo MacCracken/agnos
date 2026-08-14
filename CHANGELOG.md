@@ -22,6 +22,77 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.44] — 2026-08-13 — cycle OPEN: a fullscreen surface can be GPU-composited
 
+### New — `tests/gpu/shaderexec.cyr`: the first thing in agnos that EXECUTES a shader
+
+A single-lane GFX9 interpreter over a shader's own dword stream. ~20 opcodes, 4 gates, 0.4 s.
+
+⛔⛔ **Every other gate in this tree is about ENCODING.** `shaderasm` proves an emit list packs the same
+bits as committed hex; `shader-crossasm` proves two assemblers agree; `shader-derive` proves one emit
+list is another plus a declared edit. **None of them computes a pixel.** For `blend_alpha` that meant
+14 dwords changed and the number constrained *semantically* by any host gate was **zero**.
+
+The sharpest demonstration: deleting `blend_alpha`'s entire 4-dword prologue and re-running the
+arithmetic model at α=255 scores **0 mismatches over all 16,777,216 cases** — because at α=255 the
+correct answer *is* `blend_rect`'s, so "equals blend_rect" is satisfied by "the feature is absent".
+shaderexec refuses that shader at byte **+112** on an uninitialised `v13`.
+
+⭐ **The calibration is the tree's first with independent provenance on both sides**: `blend_rect`'s
+iron-burned hex, interpreted, against `blend_ref_px` — **pure integer** arithmetic
+(`sc + ((dc*ia)*2 + 255)/510`) written years earlier for the kernel's own self-test. Neither derived
+from the other, so an interpreter bug fails there before it can flatter an unburned shader.
+
+⭐ **Gate 3 runs `blend_alpha` from its EMIT LIST**, so this is the only artifact whose verdict depends
+on what that list actually encodes rather than on what it equals.
+
+**Four findings from building it, each a defect in my own work first:**
+
+1. ⛔ **Whole-register initialisation tracking rejected a shipped shader.** It faulted at `+144` of
+   `blend_rect` on `v_cvt_pk_u8_f32 v11, v9, 0, v11`, which reads `v11` before anything writes it. The
+   read is real and benign — the four channel packs each replace one byte. Tracking is now **per byte**,
+   which states the property that matters: *the store must not write an undefined byte*. The coarse
+   model being wrong about a shader we know is right is exactly the calibration's job.
+2. ⛔ **`var x = <f64 expression>` without an explicit `: f64` compiles to INTEGER semantics, silently.**
+   `var frac = x - f64_from(n)` ran in integers, `frac` came out 0 instead of 0.8666, and `sx_cvt_u8`
+   returned 49 where 50 was correct. The f32 arithmetic around it was bit-exact throughout, so it
+   looked like a rounding disagreement rather than a type error. The only signal is a
+   `comparison mixes f64 and integer operands` warning — which I had been filtering out of build output.
+3. ⛔ **A function-local `var b[16]` overran its frame** — 16 BYTES, not 16 slots — and SIGSEGV'd.
+   `check-array-sizing.sh` named it exactly: *"LOCAL var b[16] = 16 BYTES but a store64 reaches byte
+   18"*. The gate doing its job on the person who should have known better.
+4. ⛔ **The harness's address path was degenerate and a mutation exposed it.** With tgid pinned to
+   (0,0) and both pitches 0, `s_mul_i32 s11, s9, s4` computed `0*0`, and replacing that multiply with
+   an ADD left the oracle **fully green**. That is the exact code path `blend_alpha`'s `s9 → s15`
+   relocation exists to protect. Now `tgid_y = 1`, `pitch = 16`, and the base pixels are poisoned with
+   `0xDEADBEEF` so an address collapsing to its base reads garbage instead of accidentally reading
+   right. The same mutation now reports **58,412 mismatches**.
+
+**Mutation-tested, all five red:**
+
+| mutation | caught by | reported |
+|---|---|---|
+| the fatal `s15 → s9` clobber in the emit list | gate 3 | 59,319 / 59,319 mismatches |
+| emit list scales dst instead of src | gate 3 | 59,319 mismatches |
+| `s_mul_i32` → `s_add` | gate 1 | 58,412 mismatches |
+| `s_add_u32` → `s_sub` | gate 1 | 59,319 mismatches |
+| `v_cvt_f32_ubyteN` reads the wrong byte | gate 1 | 59,319 mismatches |
+
+### New — gate 4: the rounding tie, which nothing else in the tree reaches
+
+⛔ **Added because a mutation FAILED to fire.** Deleting the ties-to-even branch left gates 1 and 3
+fully green — correctly, since `blend_rect` provably never produces a half-integer and gate 3 drives
+only α=255 (identical to blend_rect) and α=0 (no rounding). **The tie rule was exercised by nothing.**
+
+`blend_alpha` does reach it. Gate 4 pins the documented witness — α=4, sa=64, sc=64, dc=128, where
+`t = 128.5` exactly — and asserts RTNE gives **128**. With the tie branch removed it reports 129 and
+exits 90. ⚠ This **pins an assumption so a burn can refute it** rather than leaving it unstated; there
+is no hardware evidence either way, because the tree's only datum (249 → 250) is a tie where 250 is even.
+
+⚠ **Corpus is STRIDED and the reduction is printed, not hidden**: 39 values/axis (stride 8 + boundary
+set) = 59,319 cases/gate. The exhaustive 256³ run was done once — **0 mismatches on all three gates,
+119 s**. It is not what ships, because 119 s against this runner's 3 s makes a gate people skip. Set
+`SX_STRIDE` to 1 to reproduce. ⚠ The tie is the one genuinely input-sparse property, which is why its
+witnesses are pinned explicitly rather than left to the stride.
+
 ### New — `blend_alpha`: the shader for per-window opacity, authored and cross-checked, NOT burned
 
 `kernel/shaders/blend_alpha.s` + `kernel/shaders/emit/blend_alpha.emit.cyr` — blend_rect plus a uniform

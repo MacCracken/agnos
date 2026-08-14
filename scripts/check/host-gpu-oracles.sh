@@ -8,7 +8,7 @@
 # cannot fail in practice.
 #
 # ⚠ SCOPE, STATED HONESTLY: this runs texlist, bigate, bimodel, texgate, rtaudit, depthgate, perspbits, perspdiv, perspgate, perspmodel,
-# depthmodel, depthdiv, moderaster and — added 1.56.44 — edgeasm, asmagree and shaderasm. It
+# depthmodel, depthdiv, moderaster and — added 1.56.44 — edgeasm, asmagree, shaderasm and shaderexec. It
 # does NOT run doomcol, doomwall, edgemodel or refraster — those are equally host-runnable and
 # equally unwired, and adding them is a separate bite rather than something smuggled in beside a rung.
 # ⚠ This line has gone stale twice as oracles were added; it is the drift the tree keeps finding in
@@ -33,6 +33,22 @@
 # beside it; it is evidence about whatever source existed when someone last ran a compiler. ⚠ THIS
 # LOOP REBUILDS BEFORE IT RUNS, which is the property that makes it a gate rather than a re-run of a
 # fossil — do not "optimise" it into reusing an existing build/<t>.
+# ⭐⭐ shaderexec ADDED 1.56.44 AND IT IS THE ONLY ONE HERE THAT EXECUTES ANYTHING. Every other gate in
+# this tree — shaderasm, shader-crossasm, shader-derive, edgeasm — is about ENCODING: whether some
+# stream of dwords equals another stream of dwords. None of them computes a pixel. For `blend_alpha`
+# that meant 14 dwords changed and the number constrained SEMANTICALLY was ZERO.
+# ⛔ The demonstration: deleting blend_alpha's whole 4-dword prologue and re-running the ARITHMETIC
+# model at alpha=255 scores 0 mismatches over all 16,777,216 cases, because at alpha=255 the correct
+# answer IS blend_rect's — "equals blend_rect" is satisfied by "the feature is absent". shaderexec
+# refuses that shader at byte +112 on an uninitialised v13, because it actually runs the bytes.
+# ⭐ Its calibration is the tree's first with independent provenance on BOTH sides: blend_rect's
+# iron-burned hex, interpreted, against `blend_ref_px` — pure integer arithmetic written for the
+# kernel's own self-test. Neither is derived from the other, so an interpreter bug fails there first.
+# ⚠ Its corpus is STRIDED (39 values/axis, stride 8 + boundaries = 59,319 cases/gate, 0.4 s). The
+# exhaustive 256^3 run was done once on 2026-08-13 — 0 mismatches on all three gates, 119 s — and is
+# not what ships, because 119 s against this runner's 3 s makes a gate people skip. Set SX_STRIDE to 1
+# to reproduce it. The count is printed at run time rather than implied.
+#
 # ⚠ Their pass is the first empirical answer to the mabda/agnos pin question: mabda pins cyrius
 # 6.5.3, agnos's manifests pin 6.4.78, and `gfx9_encode.cyr` compiles inside agnos's test tree
 # regardless. That was previously argued from the source's simplicity; it is now built.
@@ -148,7 +164,7 @@ rc=0
 # h_front - h_active` cancels the front porch exactly, so h_front reaches H_TOTAL and never H_BLANK.
 # Both directions are now pinned (M1/M1c assert the cancellation, M1b asserts the register still
 # moves), because a change folding h_front into the blank formula would otherwise be invisible.
-for t in texlist bigate bimodel texgate rtaudit depthgate depthmodel depthdiv perspbits perspdiv perspgate perspmodel moderaster edgeasm asmagree shaderasm; do
+for t in texlist bigate bimodel texgate rtaudit depthgate depthmodel depthdiv perspbits perspdiv perspgate perspmodel moderaster edgeasm asmagree shaderasm shaderexec; do
     out="$(cd "$GPU" && cyrius build "$t.cyr" "build/$t" 2>&1)" || {
         echo "host-gpu-oracles: FAIL -- $t.cyr does not BUILD"
         echo "$out" | tail -20

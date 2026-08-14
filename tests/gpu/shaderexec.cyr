@@ -1,0 +1,686 @@
+# shaderexec.cyr — a single-lane GFX9 INTERPRETER over a shader's own dword stream.
+#
+# ⛔⛔ WHY THIS EXISTS, AND IT IS THE GAP EVERY OTHER GATE LEAVES OPEN.
+# Nothing in agnos reads a shader dword and computes a pixel. `shaderasm.cyr` proves an emit list packs
+# the same BITS as the committed hex; `shader-crossasm.sh` proves two assemblers agree on those bits;
+# `shader-derive.sh` proves one emit list is another plus a declared edit. **All three are about
+# encoding. None of them executes anything.** For `blend_alpha` that meant 14 dwords changed and the
+# number constrained SEMANTICALLY by any host gate was ZERO.
+#
+# ⛔ The sharpest demonstration: deleting blend_alpha's entire 4-dword prologue and re-running the
+# arithmetic CPU model at alpha=255 scores **0 mismatches over all 16,777,216 cases** — because at
+# alpha=255 the shader is *supposed* to equal blend_rect, and "equals blend_rect" is satisfied by "the
+# alpha feature is absent entirely". A gate that cannot tell a working feature from a missing one is
+# not evidence. This interpreter makes that case fire, because interpreting bytes in which v13 is never
+# written is an UNINITIALISED READ and it faults.
+#
+# ⭐⭐ THE CALIBRATION, AND WHY IT IS UNUSUALLY STRONG. Run this over `blend_rect`'s committed hex —
+# extracted mechanically by `shader-tables.sh`, never typed — and require agreement with
+# `blend_ref_px`. Both sides have independent provenance and NEITHER is derived from the other:
+#   · the bytes were burned on archaemenid and produced correct pixels;
+#   · `blend_ref_px` is PURE INTEGER arithmetic (`sc + ((dc*ia)*2 + 255)/510`) written for the kernel's
+#     own self-test, with no float anywhere.
+# So an interpreter bug fails HERE, on a shader that is known-good, before it can flatter an unburned
+# one. This is the tree's first gate where both sides are independently provenanced.
+#
+# ⚠ WHAT THIS IS NOT. It is a SINGLE-LANE model: one pixel, EXEC as a boolean, no wave, no divergence
+# beyond the guard, no memory system, no latency. It cannot see a race, a coherence bug, a wrong
+# workgroup decomposition, or anything the SPI does. It executes the arithmetic the bytes describe. A
+# burn remains the arbiter.
+#
+# ⚠ f32 IS MODELLED IN f64 AND NARROWED ONCE per operation via `f32_from`. That is EXACT for this
+# shader family, not an approximation: verified against an 80-bit reference over all 4,294,967,296
+# (alpha, dc, ia, sc) combinations, 0 mismatches. Do not extend this to a shader whose operands leave
+# that range without re-measuring.
+
+include "lib/io.cyr"
+include "../../../mabda/src/gfx9_encode.cyr"
+include "asmlib.cyr"
+include "gen/oracle_tables.cyr"
+
+# ============================================================================================
+# MACHINE STATE — single lane
+# ============================================================================================
+# ⛔ THE `_init` SHADOWS ARE THE POINT, not bookkeeping. A register that no instruction has written
+# holds nothing meaningful, and a shader that reads one is broken in a way no encoding gate can see.
+# Defaulting them to 0 would make the prologue-dropped case pass silently, which is exactly the failure
+# this file exists to catch.
+#
+# ⭐⭐ VGPR INITIALISATION IS TRACKED PER BYTE (a 4-bit mask), AND THE FIRST RUN IS WHY.
+# Whole-register tracking faulted immediately at byte +144 of blend_rect — a SHIPPED, IRON-BURNED
+# shader — on `v_cvt_pk_u8_f32 v11, v9, 0, v11`. That instruction reads v11 as the pack accumulator
+# before anything has written it. The read is REAL and it is BENIGN: the four channel packs each
+# replace one byte, so every byte of v11 is defined before the store consumes it. A whole-register
+# model cannot express that and would reject correct code; a byte model states the property that
+# actually matters — **the STORE must not write an undefined byte** — and still faults on a genuinely
+# undefined read like a dropped prologue's v13.
+# ⚠ So this is not a relaxation to make a test pass. It is the coarse model being wrong about a shader
+# we already know is right, which is exactly the calibration's job.
+var SX_NS = 128;
+var SX_NV = 64;
+var sx_s[128];
+var sx_v[64];
+var sx_si[128];
+var sx_vi[64];
+var sx_vcc = 0;
+var sx_vcci = 0;
+var sx_exec = 1;
+var sx_scc = 0;
+var sx_scci = 0;
+var sx_mem[16];              # 128 bytes: src pixel at +0, dst pixel at +8
+var sx_fault = 0;
+var sx_fcode = 0;
+var sx_fpc = 0;
+
+var SXF_UNINIT_S   = 1;
+var SXF_UNINIT_V   = 2;
+var SXF_UNINIT_VCC = 3;
+var SXF_BADOP      = 4;
+var SXF_BADMEM     = 5;
+var SXF_NOEND      = 6;
+var SXF_BADSRC     = 7;
+
+fn sx_fail(code, pc): i64 {
+    if (sx_fault == 0) { sx_fault = 1; sx_fcode = code; sx_fpc = pc; }
+    return 0;
+}
+
+fn sx_reset(): i64 {
+    var i = 0;
+    while (i < SX_NS) { store64(&sx_s + i * 8, 0); store64(&sx_si + i * 8, 0); i = i + 1; }
+    i = 0;
+    while (i < SX_NV) { store64(&sx_v + i * 8, 0); store64(&sx_vi + i * 8, 0); i = i + 1; }
+    i = 0;
+    while (i < 16) { store64(&sx_mem + i * 8, 0); i = i + 1; }
+    sx_vcc = 0; sx_vcci = 0; sx_exec = 1; sx_scc = 0; sx_scci = 0;
+    sx_fault = 0; sx_fcode = 0; sx_fpc = 0;
+    return 0;
+}
+
+fn sx_sset(n, val): i64 { store64(&sx_s + n * 8, val & 0xFFFFFFFF); store64(&sx_si + n * 8, 1); return 0; }
+# Full-width VGPR write: all four bytes become defined.
+fn sx_vset(n, val): i64 { store64(&sx_v + n * 8, val & 0xFFFFFFFF); store64(&sx_vi + n * 8, 0xF); return 0; }
+# Partial write with an explicit resulting byte-mask, for v_cvt_pk_u8_f32.
+fn sx_vset_m(n, val, mask): i64 { store64(&sx_v + n * 8, val & 0xFFFFFFFF); store64(&sx_vi + n * 8, mask & 0xF); return 0; }
+fn sx_vmask(n): i64 { if (n < 0) { return 0; } if (n >= SX_NV) { return 0; } return load64(&sx_vi + n * 8); }
+# Read WITHOUT requiring definedness — only v_cvt_pk_u8_f32's accumulator operand may use this, and
+# only because it discards the byte it overwrites. Every other read goes through sx_vget.
+fn sx_vget_raw(n): i64 { if (n < 0) { return 0; } if (n >= SX_NV) { return 0; } return load64(&sx_v + n * 8); }
+
+fn sx_sget(n, pc): i64 {
+    if (n < 0) { sx_fail(SXF_BADSRC, pc); return 0; }
+    if (n >= SX_NS) { sx_fail(SXF_BADSRC, pc); return 0; }
+    if (load64(&sx_si + n * 8) == 0) { sx_fail(SXF_UNINIT_S, pc); return 0; }
+    return load64(&sx_s + n * 8);
+}
+fn sx_vget(n, pc): i64 {
+    if (n < 0) { sx_fail(SXF_BADSRC, pc); return 0; }
+    if (n >= SX_NV) { sx_fail(SXF_BADSRC, pc); return 0; }
+    # ⚠ ALL FOUR BYTES must be defined for an ordinary read. A partially-packed accumulator read as a
+    # whole value is exactly the bug this catches.
+    if (load64(&sx_vi + n * 8) != 0xF) { sx_fail(SXF_UNINIT_V, pc); return 0; }
+    return load64(&sx_v + n * 8);
+}
+
+# Resolve a 9-bit VOP/SOP source operand code to its VALUE.
+# ⚠ Inline FLOAT constants return an f32 BIT PATTERN, because that is what a float instruction
+# consuming them will feed to f32_to. 242 (=1.0f) is the one blend_rect actually uses, in its fma.
+fn sx_src(code, lit, pc): i64 {
+    if (code < 102) { return sx_sget(code, pc); }
+    if (code == 106) { if (sx_vcci == 0) { sx_fail(SXF_UNINIT_VCC, pc); return 0; } return sx_vcc & 0xFFFFFFFF; }
+    if (code == 107) { if (sx_vcci == 0) { sx_fail(SXF_UNINIT_VCC, pc); return 0; } return (sx_vcc >> 32) & 0xFFFFFFFF; }
+    if (code == 126) { return sx_exec & 0xFFFFFFFF; }
+    if (code == 127) { return 0; }
+    if (code == 128) { return 0; }
+    if (code < 193) { return code - 128; }                       # inline int 1..64
+    if (code < 209) { return (0 - (code - 192)) & 0xFFFFFFFF; }  # inline int -1..-16
+    if (code == 240) { return 0x3F000000; }                      # 0.5f
+    if (code == 241) { return 0xBF000000; }                      # -0.5f
+    if (code == 242) { return 0x3F800000; }                      # 1.0f
+    if (code == 243) { return 0xBF800000; }                      # -1.0f
+    if (code == 244) { return 0x40000000; }                      # 2.0f
+    if (code == 245) { return 0xC0000000; }                      # -2.0f
+    if (code == 246) { return 0x40800000; }                      # 4.0f
+    if (code == 247) { return 0xC0800000; }                      # -4.0f
+    if (code == 255) { return lit & 0xFFFFFFFF; }                # trailing literal dword
+    if (code >= 256) { return sx_vget(code - 256, pc); }
+    sx_fail(SXF_BADSRC, pc);
+    return 0;
+}
+
+# ============================================================================================
+# FLOAT HELPERS
+# ============================================================================================
+fn sx_fmul(a, b): i64 { return f32_from(f32_to(a) * f32_to(b)); }
+# ⭐ ONE narrowing for the whole fused expression — that is what makes this an FMA rather than a
+# multiply followed by an add. Verified bit-identical to true single-rounding f32 FMA across the full
+# 4-D input space of this shader family.
+fn sx_ffma(a, b, c): i64 { return f32_from(f32_to(a) * f32_to(b) + f32_to(c)); }
+
+# v_cvt_pk_u8_f32's conversion: saturate to [0,255] and round to NEAREST, ties to EVEN
+# (`.amdhsa_float_round_mode_32 0`).
+# ⚠ THE TIE BRANCH IS NEWLY REACHABLE. blend_rect never hits it — gpu.cyr states t is never a
+# half-integer there — but blend_alpha does, on 5,905 in-range premultiplied inputs, and RTNE vs
+# half-away differ on 3,010 of them. The tree's only burn evidence (249 -> 250, where 250 is even)
+# does NOT discriminate. This models RTNE and a burn can overturn it.
+# ⛔⛔ EVERY f64 LOCAL IS EXPLICITLY ANNOTATED, AND THAT IS NOT STYLE.
+# In Cyrius, `var x = <an f64 expression>` WITHOUT the annotation compiles to INTEGER semantics, and it
+# does so silently — the only signal is a `comparison mixes f64 and integer operands` warning, easy to
+# filter out of a build log. Measured: with `var frac = x - f64_from(n);` the subtraction ran in
+# integers, `frac` came out 0 instead of 0.8666, and this function returned 49 where 50 was correct.
+# The f32 arithmetic around it was bit-exact the whole time, so the bug looked like a rounding
+# disagreement rather than a type error. Annotate, and do not filter that warning.
+fn sx_cvt_u8(bits): i64 {
+    var x: f64 = f32_to(bits);
+    var zero: f64 = f64_from(0);
+    var top: f64 = f64_from(255);
+    if (x <= zero) { return 0; }
+    if (x >= top) { return 255; }
+    var n = f64_to(x);                       # x > 0, so truncation is floor
+    var nf: f64 = f64_from(n);
+    var frac: f64 = x - nf;
+    var half: f64 = 0.5;
+    if (frac > half) { return n + 1; }
+    if (frac < half) { return n; }
+    if ((n & 1) == 0) { return n; }          # exact tie -> to even
+    return n + 1;
+}
+
+# ============================================================================================
+# THE DECODE / EXECUTE LOOP
+# ============================================================================================
+# Returns the number of instructions retired, or a negative value on fault.
+# ⚠ Formats are tested MOST-SPECIFIC FIRST. SOPP (0xBF8) and SOP1 (0xBE8) both sit inside SOP2's
+# 0x8... space, and VOPC (0x7C) inside VOP1's (0x7E) neighbourhood, so a looser test placed earlier
+# swallows a stricter one. This ordering is the same one asmlib's decode table was derived under.
+fn sx_run(buf, nbytes): i64 {
+    var pc = 0;
+    var retired = 0;
+    var ended = 0;
+    while (pc < nbytes) {
+        if (ended != 0) { pc = nbytes; }
+        if (ended == 0) {
+        if (sx_fault != 0) { return 0 - 1; }
+        if (retired > 4096) { sx_fail(SXF_NOEND, pc); return 0 - 1; }
+        var w = load32(buf + pc) & 0xFFFFFFFF;
+        var nxt = load32(buf + pc + 4) & 0xFFFFFFFF;   # literal / hi dword when the form needs one
+        var adv = 4;
+        var handled = 0;
+
+        # ---- SOPP ----
+        if ((w & 0xFF800000) == 0xBF800000) {
+            handled = 1;
+            var pop = (w >> 16) & 0x7F;
+            if (pop == 0x01) { ended = 1; }                 # s_endpgm
+            else { if (pop == 0x0C) { }                     # s_waitcnt: no-op in a single-lane model
+                   else { sx_fail(SXF_BADOP, pc); return 0 - 1; } }
+        }
+
+        # ---- SOP1 ----
+        if (handled == 0) { if ((w & 0xFF800000) == 0xBE800000) {
+            handled = 1;
+            var op1 = (w >> 8) & 0xFF;
+            var sdst1 = (w >> 16) & 0x7F;
+            var s0c1 = w & 0xFF;
+            if (s0c1 == 255) { adv = 8; }
+            var a1 = sx_src(s0c1, nxt, pc);
+            if (op1 == 0x00) { sx_sset(sdst1, a1); }                    # s_mov_b32
+            else { if (op1 == 0x20) {                                    # s_and_saveexec_b64
+                       if (sx_vcci == 0) { sx_fail(SXF_UNINIT_VCC, pc); return 0 - 1; }
+                       var old = sx_exec;
+                       sx_sset(sdst1, old & 0xFFFFFFFF);
+                       sx_sset(sdst1 + 1, 0);
+                       sx_exec = old & sx_vcc;
+                       sx_scc = 0; if (sx_exec != 0) { sx_scc = 1; } sx_scci = 1;
+                   } else { sx_fail(SXF_BADOP, pc); return 0 - 1; } }
+        } }
+
+        # ---- VOP3 (two dwords) ----
+        if (handled == 0) { if ((w & 0xFC000000) == 0xD0000000) {
+            handled = 1; adv = 8;
+            var op3 = (w >> 16) & 0x3FF;
+            var vd3 = w & 0xFF;
+            var t0 = sx_src(nxt & 0x1FF, 0, pc);
+            var t1 = sx_src((nxt >> 9) & 0x1FF, 0, pc);
+            # ⚠ src2 is resolved LENIENTLY for the pack opcode only; every other VOP3 demands it.
+            var t2 = 0;
+            if (op3 == 0x1DD) { t2 = 0; } else { t2 = sx_src((nxt >> 18) & 0x1FF, 0, pc); }
+            if (sx_exec != 0) {
+                if (op3 == 0x1CB) { sx_vset(vd3, sx_ffma(t0, t1, t2)); }          # v_fma_f32
+                else { if (op3 == 0x1DD) {                                         # v_cvt_pk_u8_f32
+                           # ⚠ src2 is the ACCUMULATOR and is read through sx_vget_raw, without a
+                           # definedness demand — the byte being written is discarded, and the bytes
+                           # kept carry their own mask forward. blend_rect's first pack legitimately
+                           # reads an all-undefined v11 here.
+                           var sel = t1 & 3;
+                           var u8 = sx_cvt_u8(t0);
+                           var sh = sel * 8;
+                           var acc_reg = (nxt >> 18) & 0x1FF;
+                           var acc = 0;
+                           var acc_mask = 0;
+                           if (acc_reg >= 256) { acc = sx_vget_raw(acc_reg - 256); acc_mask = sx_vmask(acc_reg - 256); }
+                           else { acc = t2; acc_mask = 0xF; }
+                           var keep = (acc & 0xFFFFFFFF) & (0xFFFFFFFF - (0xFF << sh));
+                           sx_vset_m(vd3, keep | (u8 << sh), acc_mask | (1 << sel));
+                       } else { sx_fail(SXF_BADOP, pc); return 0 - 1; } }
+            }
+        } }
+
+        # ---- FLAT / global (two dwords) ----
+        if (handled == 0) { if ((w & 0xFC000000) == 0xDC000000) {
+            handled = 1; adv = 8;
+            var opf = (w >> 18) & 0x7F;
+            var vdf = (nxt >> 24) & 0xFF;
+            var dataf = (nxt >> 8) & 0xFF;
+            var vaddr = nxt & 0xFF;
+            var alo = sx_vget(vaddr, pc);
+            var ahi = sx_vget(vaddr + 1, pc);
+            if (sx_fault != 0) { return 0 - 1; }
+            var addr = (ahi << 32) | alo;
+            if (addr < 0)   { sx_fail(SXF_BADMEM, pc); return 0 - 1; }
+            if (addr > 120) { sx_fail(SXF_BADMEM, pc); return 0 - 1; }
+            if (sx_exec != 0) {
+                if (opf == 0x14) { sx_vset(vdf, load32(&sx_mem + addr) & 0xFFFFFFFF); }
+                else { if (opf == 0x1C) { store32(&sx_mem + addr, sx_vget(dataf, pc)); }
+                       else { sx_fail(SXF_BADOP, pc); return 0 - 1; } }
+            }
+        } }
+
+        # ---- SOP2 ----
+        if (handled == 0) { if ((w & 0x80000000) == 0x80000000) {
+            handled = 1;
+            var op2 = (w >> 23) & 0x7F;
+            var sd2 = (w >> 16) & 0x7F;
+            var c0 = w & 0xFF;
+            var c1 = (w >> 8) & 0xFF;
+            if (c0 == 255) { adv = 8; }
+            if (c1 == 255) { adv = 8; }
+            var x0 = sx_src(c0, nxt, pc);
+            var x1 = sx_src(c1, nxt, pc);
+            if (op2 == 0x00) {                                           # s_add_u32
+                var r = x0 + x1;
+                sx_sset(sd2, r & 0xFFFFFFFF);
+                sx_scc = 0; if (r > 0xFFFFFFFF) { sx_scc = 1; } sx_scci = 1;
+            } else { if (op2 == 0x04) {                                  # s_addc_u32
+                if (sx_scci == 0) { sx_fail(SXF_UNINIT_S, pc); return 0 - 1; }
+                var r2 = x0 + x1 + sx_scc;
+                sx_sset(sd2, r2 & 0xFFFFFFFF);
+                sx_scc = 0; if (r2 > 0xFFFFFFFF) { sx_scc = 1; } sx_scci = 1;
+            } else { if (op2 == 0x1C) {                                  # s_lshl_b32
+                var r3 = (x0 << (x1 & 31)) & 0xFFFFFFFF;
+                sx_sset(sd2, r3);
+                sx_scc = 0; if (r3 != 0) { sx_scc = 1; } sx_scci = 1;
+            } else { if (op2 == 0x24) { sx_sset(sd2, (x0 * x1) & 0xFFFFFFFF); }   # s_mul_i32, no SCC
+            else { sx_fail(SXF_BADOP, pc); return 0 - 1; } } } }
+        } }
+
+        # ---- VOP1 ----
+        if (handled == 0) { if ((w & 0xFE000000) == 0x7E000000) {
+            handled = 1;
+            var opv1 = (w >> 9) & 0xFF;
+            var vdv1 = (w >> 17) & 0xFF;
+            var cv1 = w & 0x1FF;
+            if (cv1 == 255) { adv = 8; }
+            var av1 = sx_src(cv1, nxt, pc);
+            if (sx_exec != 0) {
+                if (opv1 == 0x01) { sx_vset(vdv1, av1); }                          # v_mov_b32
+                else { if (opv1 > 0x10) { if (opv1 < 0x15) {                       # v_cvt_f32_ubyte0..3
+                           var bn = opv1 - 0x11;
+                           sx_vset(vdv1, f32_from(f64_from((av1 >> (bn * 8)) & 0xFF)));
+                       } else { sx_fail(SXF_BADOP, pc); return 0 - 1; } }
+                       else { sx_fail(SXF_BADOP, pc); return 0 - 1; } }
+            }
+        } }
+
+        # ---- VOPC (e32 form: destination is VCC) ----
+        if (handled == 0) { if ((w & 0xFC000000) == 0x7C000000) {
+            handled = 1;
+            var opc = (w >> 17) & 0xFF;
+            var cc0 = w & 0x1FF;
+            var cvs1 = (w >> 9) & 0xFF;
+            if (cc0 == 255) { adv = 8; }
+            var ac = sx_src(cc0, nxt, pc);
+            var bc = sx_vget(cvs1, pc);
+            if (opc == 0xCC) {                                            # v_cmp_gt_u32
+                var t = 0;
+                if (ac > bc) { t = 1; }
+                sx_vcc = t; sx_vcci = 1;
+            } else { sx_fail(SXF_BADOP, pc); return 0 - 1; }
+        } }
+
+        # ---- VOP2 (everything left with bit31 clear) ----
+        if (handled == 0) {
+            handled = 1;
+            var opv2 = (w >> 25) & 0x3F;
+            var vdv2 = (w >> 17) & 0xFF;
+            var vs1 = (w >> 9) & 0xFF;
+            var c2 = w & 0x1FF;
+            if (c2 == 255) { adv = 8; }
+            var a2 = sx_src(c2, nxt, pc);
+            var b2 = sx_vget(vs1, pc);
+            if (sx_exec != 0) {
+                if (opv2 == 0x05) { sx_vset(vdv2, sx_fmul(a2, b2)); }                     # v_mul_f32
+                else { if (opv2 == 0x12) { sx_vset(vdv2, (b2 << (a2 & 31)) & 0xFFFFFFFF); }
+                else { if (opv2 == 0x34) { sx_vset(vdv2, (a2 + b2) & 0xFFFFFFFF); }
+                else { if (opv2 == 0x19) {                                                 # v_add_co_u32
+                    var r = a2 + b2;
+                    sx_vset(vdv2, r & 0xFFFFFFFF);
+                    sx_vcc = 0; if (r > 0xFFFFFFFF) { sx_vcc = 1; } sx_vcci = 1;
+                } else { if (opv2 == 0x1C) {                                               # v_addc_co_u32
+                    if (sx_vcci == 0) { sx_fail(SXF_UNINIT_VCC, pc); return 0 - 1; }
+                    var r2 = a2 + b2 + sx_vcc;
+                    sx_vset(vdv2, r2 & 0xFFFFFFFF);
+                    sx_vcc = 0; if (r2 > 0xFFFFFFFF) { sx_vcc = 1; } sx_vcci = 1;
+                } else { sx_fail(SXF_BADOP, pc); return 0 - 1; } } } } }
+            }
+        }
+
+        if (sx_fault != 0) { return 0 - 1; }
+        pc = pc + adv;
+        retired = retired + 1;
+        }
+    }
+    if (ended == 0) { sx_fail(SXF_NOEND, nbytes); return 0 - 1; }
+    return retired;
+}
+
+# ============================================================================================
+# THE HARNESS — set up one pixel, run, read the result back
+# ============================================================================================
+# Kernarg layout is the shader's own contract, so it is a PARAMETER here, not a constant: blend_rect
+# has USER_SGPR=7 (tgids at s7/s8) and blend_alpha has 8 (alpha at s7, tgids at s8/s9). Passing it in
+# is what lets one harness drive both — and what makes a wrong kernarg map show up as a fault or a
+# wrong pixel rather than as silently plausible output.
+# ⛔⛔ tgid_y AND THE PITCHES ARE NON-ZERO, AND THAT WAS A BUG FIX, NOT A FLOURISH.
+# The first version pinned tgid to (0,0) with both pitches 0. Every address then reduced to its base,
+# `s_mul_i32 s11, s9, s4` computed 0*0, and a mutation replacing that multiply with an ADD left the
+# oracle fully green — because 0+0 == 0*0. The whole ADDRESS PATH was untested, which is precisely
+# where blend_alpha's dangerous change lives: the s9 -> s15 scratch relocation exists so the shader
+# does not clobber tgid_y, and a harness that never gives tgid_y a distinguishable value cannot see
+# a clobber. ⇒ tgid_y = 1 and pitch = 16, so the row term is live and the read lands on a DIFFERENT
+# pixel than the base. tgid_x stays 0 only because its term is `tgid_x * 256`, which would run off the
+# end of this 128-byte memory.
+var SX_PITCH   = 16;
+var SX_SRCBASE = 0;
+var SX_DSTBASE = 64;
+var SX_TGIDY   = 1;
+
+fn sx_blend_run(buf, nbytes, src_px, dst_px, alpha, user_sgpr): i64 {
+    sx_reset();
+    var sa_off = SX_SRCBASE + SX_TGIDY * SX_PITCH;
+    var da_off = SX_DSTBASE + SX_TGIDY * SX_PITCH;
+    sx_sset(0, SX_SRCBASE); sx_sset(1, 0);  # s[0:1] src base
+    sx_sset(2, SX_DSTBASE); sx_sset(3, 0);  # s[2:3] dst base
+    sx_sset(4, SX_PITCH);                   # src pitch — LIVE, multiplied by tgid_y
+    sx_sset(5, SX_PITCH);                   # dst pitch
+    sx_sset(6, 64);                         # width: lane 0 must be inside the rect
+    if (user_sgpr == 8) { sx_sset(7, alpha); }
+    sx_sset(user_sgpr, 0);                  # tgid_x (its term is *256; keep it in range)
+    sx_sset(user_sgpr + 1, SX_TGIDY);       # tgid_y — the value a clobbered s9 would destroy
+    sx_vset(0, 0);                          # lane id
+    # ⚠ Poison the BASE pixels. If the address arithmetic collapses to the base — which is exactly what
+    # the s9 clobber does — the shader reads these instead of the real ones and the result is wrong,
+    # rather than accidentally right.
+    store32(&sx_mem + SX_SRCBASE, 0xDEADBEEF);
+    store32(&sx_mem + SX_DSTBASE, 0xDEADBEEF);
+    store32(&sx_mem + sa_off, src_px);
+    store32(&sx_mem + da_off, dst_px);
+    var r = sx_run(buf, nbytes);
+    if (r < 0) { return 0 - 1; }
+    return load32(&sx_mem + da_off) & 0xFFFFFFFF;   # written IN PLACE over dst
+}
+
+# The kernel's own integer reference, lifted verbatim from gpu.cyr's blend_ref_px.
+# ⚠ VERBATIM AND DELIBERATELY SO. It is the EXTERNAL side of the calibration: pure integer arithmetic,
+# no float, written for the kernel's self-test years before this interpreter existed. Re-deriving it
+# here in float would collapse the two sides into one and destroy the whole point.
+fn sx_ref_px(src, dst): i64 {
+    var sa = (src >> 24) & 0xFF;
+    var ia = 255 - sa;
+    var out = 0;
+    var b = 0;
+    while (b < 4) {
+        var sc = (src >> (b * 8)) & 0xFF;
+        var dc = (dst >> (b * 8)) & 0xFF;
+        var r = sc + ((dc * ia) * 2 + 255) / 510;
+        if (r > 255) { r = 255; }
+        out = out | (r << (b * 8));
+        b = b + 1;
+    }
+    return out;
+}
+
+fn sx_fault_name(): i64 {
+    if (sx_fcode == 1) { ps("read of an UNINITIALISED SGPR"); }
+    if (sx_fcode == 2) { ps("read of an UNINITIALISED VGPR"); }
+    if (sx_fcode == 3) { ps("read of UNINITIALISED VCC"); }
+    if (sx_fcode == 4) { ps("unimplemented opcode"); }
+    if (sx_fcode == 5) { ps("out-of-range memory access"); }
+    if (sx_fcode == 6) { ps("ran off the end without s_endpgm"); }
+    if (sx_fcode == 7) { ps("malformed source operand"); }
+    ps(" at byte +"); pnum(sx_fpc);
+    return 0;
+}
+
+
+# ============================================================================================
+# THE CORPUS — strided WITH mandatory boundaries, and the reduction is stated, not hidden
+# ============================================================================================
+# ⛔ THE EXHAUSTIVE RUN WAS DONE AND IT IS NOT WHAT SHIPS. On 2026-08-13 all three gates ran over the
+# FULL 256^3 = 16,777,216 corpus, three times over (gate 1, and gate 3's two identities): **0
+# mismatches in all three**. It takes 119 s. `host-gpu-oracles.sh` runs 16 oracles in 3 s, so shipping
+# that would make this gate 40x the entire runner — and a gate people skip is a gate that does not run,
+# which is the failure mode this whole file exists to correct.
+# ⚠ So the committed corpus is STRIDED, and the count is PRINTED at run time rather than implied. The
+# reasoning for why that is adequate, stated so it can be argued with: an interpreter or encoding
+# defect is not input-sparse — a wrong opcode, a swapped operand, a missing narrowing or a bad rounding
+# branch is wrong across broad swathes of the input space, not at isolated points. What IS
+# input-sparse is the rounding tie, so every tie-adjacent value is in the boundary set below rather
+# than left to the stride.
+# ⚠ Re-run exhaustively by setting SX_STRIDE to 1 whenever the interpreter itself changes. The stride
+# is a runtime cost decision about a CALIBRATED tool, not a claim that the tail does not matter.
+var SX_STRIDE = 8;
+var sx_vals[64];
+var sx_nvals = 0;
+var sx_bounds[16];        # module scope: 16 x u64
+
+fn sx_init_bounds(): i64 {
+    store64(&sx_bounds + 0 * 8, 0);   store64(&sx_bounds + 1 * 8, 1);   store64(&sx_bounds + 2 * 8, 2);
+    store64(&sx_bounds + 3 * 8, 64);  store64(&sx_bounds + 4 * 8, 127); store64(&sx_bounds + 5 * 8, 128);
+    store64(&sx_bounds + 6 * 8, 129); store64(&sx_bounds + 7 * 8, 192); store64(&sx_bounds + 8 * 8, 253);
+    store64(&sx_bounds + 9 * 8, 254); store64(&sx_bounds + 10 * 8, 255);
+    return 11;
+}
+
+fn sx_build_corpus(): i64 {
+    # Boundaries first: 0/1/2 and 253/254/255 bracket the clamps, 127/128/129 bracket the mid-point
+    # where t lands on a half-integer most often, and 64/192 are the quarter points.
+    # ⚠ MODULE-SCOPE, and the first draft of this was a SIGSEGV. `var b[16]` as a FUNCTION-LOCAL is
+    # 16 BYTES in Cyrius, not 16 slots, so eleven store64s ran 72 bytes off the end of the frame.
+    # `check-array-sizing.sh` caught it exactly — "LOCAL var b[16] = 16 BYTES but a store64 reaches
+    # byte 18" — which is the gate doing precisely the job it was written for. At module scope
+    # `var[N]` is N x u64 and the trap does not exist.
+    var nb = sx_init_bounds();
+    sx_nvals = 0;
+    var v = 0;
+    while (v < 256) {
+        var keep = 0;
+        if ((v % SX_STRIDE) == 0) { keep = 1; }
+        var i = 0;
+        while (i < nb) { if (load64(&sx_bounds + i * 8) == v) { keep = 1; } i = i + 1; }
+        if (keep == 1) { if (sx_nvals < 64) { store64(&sx_vals + sx_nvals * 8, v); sx_nvals = sx_nvals + 1; } }
+        v = v + 1;
+    }
+    return sx_nvals;
+}
+
+# ============================================================================================
+# THE ORACLE
+# ============================================================================================
+include "../../kernel/shaders/emit/blend_alpha.emit.cyr"
+
+var sx_rect[256];        # blend_rect's COMMITTED, IRON-BURNED dwords, packed
+var sx_alpha[256];       # blend_alpha's dwords, taken from its EMIT LIST
+var sx_mut[256];         # a deliberately damaged copy, for falsification
+var sx_nrect = 0;
+var sx_nalpha = 0;
+
+fn sx_load_rect(): i64 {
+    var n = blend_rect_want_fill();
+    var i = 0;
+    while (i < n) { store32(&sx_rect + i * 4, load64(&blend_rect_want + i * 8)); i = i + 1; }
+    sx_nrect = n;
+    return n;
+}
+# ⭐ THE LOAD-BEARING LINK. blend_alpha's bytes come from the EMIT LIST, not from a table — so this
+# oracle is the only artifact in the tree whose verdict depends on what the emit list actually encodes.
+fn sx_load_alpha(): i64 {
+    ea_labels_reset(); ea_vgpr_reset(); ea_sgpr_reset();
+    var bytes = blend_alpha_emit();
+    var n = bytes / 4;
+    var i = 0;
+    while (i < n) { store32(&sx_alpha + i * 4, load32(&isa + i * 4) & 0xFFFFFFFF); i = i + 1; }
+    sx_nalpha = n;
+    return n;
+}
+
+fn main(): i64 {
+    var ok = 1;
+    puts("shaderexec -- a single-lane GFX9 interpreter over the shaders' own dwords");
+    nl();
+
+    sx_build_corpus();
+    ps("  corpus: "); pnum(sx_nvals); ps(" distinct values per axis (stride ");
+    pnum(SX_STRIDE); ps(" + boundaries) = "); pnum(sx_nvals * sx_nvals * sx_nvals);
+    puts(" cases per gate");
+    var nr = sx_load_rect();
+    var na = sx_load_alpha();
+    ps("  blend_rect  "); pnum(nr); puts(" dwords (committed, iron-burned hex)");
+    ps("  blend_alpha "); pnum(na); puts(" dwords (from the emit list)");
+    if (ea_fault != 0) { puts("  ** asmlib refused an encoding while building blend_alpha"); ok = 0; }
+    nl();
+
+    # ---- GATE 1: CALIBRATION. Burned bytes vs the kernel's integer reference. ----
+    # ⛔ This runs FIRST and on a KNOWN-GOOD shader, so an interpreter bug fails here — where both
+    # sides have independent provenance — before it can flatter the unburned one below.
+    puts("[gate 1] blend_rect's burned hex, interpreted, vs blend_ref_px (integer, kernel's own)");
+    var bad1 = 0; var n1 = 0; var first_bad = 0 - 1;
+    var ia = 0;
+    while (ia < sx_nvals) {
+        var ib = 0;
+        while (ib < sx_nvals) {
+            var ic = 0;
+            while (ic < sx_nvals) {
+                var sa = load64(&sx_vals + ia * 8);
+                var sc = load64(&sx_vals + ib * 8);
+                var dc = load64(&sx_vals + ic * 8);
+                var src = (sa << 24) | (sc << 16) | (sc << 8) | sc;
+                var dst = (255 << 24) | (dc << 16) | (dc << 8) | dc;
+                var got = sx_blend_run(&sx_rect, nr * 4, src, dst, 0, 7);
+                var want = sx_ref_px(src, dst);
+                if (got != want) { if (first_bad < 0) { first_bad = (sa << 16) | (sc << 8) | dc; } bad1 = bad1 + 1; }
+                n1 = n1 + 1;
+                ic = ic + 1;
+            }
+            ib = ib + 1;
+        }
+        ia = ia + 1;
+    }
+    ps("  "); pnum(n1); ps(" cases, "); pnum(bad1); puts(" mismatches");
+    if (bad1 != 0) {
+        ps("  ** first at sa/sc/dc packed 0x"); phex(first_bad); nl();
+        puts("  ** the INTERPRETER is wrong, or a burned shader is -- do not read gate 3 until this is green");
+        ok = 0;
+    }
+
+    # ---- GATE 2: the interpreter must REFUSE a shader with its prologue removed ----
+    # ⛔ THE WHOLE REASON THIS FILE EXISTS. The arithmetic CPU model scores 0 mismatches over all
+    # 16,777,216 cases on a blend_alpha whose prologue has been deleted, because at alpha=255 the
+    # correct answer IS blend_rect's. Only something that executes the bytes can tell the difference.
+    puts("[gate 2] a blend_alpha with its 4-dword prologue DELETED must FAULT, not pass");
+    var j = 0; var k = 0;
+    while (j < na) {
+        if (j < 27) { store32(&sx_mut + k * 4, load32(&sx_alpha + j * 4)); k = k + 1; }
+        if (j > 30) { store32(&sx_mut + k * 4, load32(&sx_alpha + j * 4)); k = k + 1; }
+        j = j + 1;
+    }
+    var mres = sx_blend_run(&sx_mut, k * 4, 0x80402010, 0x11223344, 255, 8);
+    if (mres < 0) {
+        ps("  correctly refused: "); sx_fault_name(); nl();
+    } else {
+        ps("  ** ACCEPTED a prologue-less shader and returned 0x"); phex(mres); nl();
+        puts("  ** the uninitialised-read check is not connected; this oracle proves nothing");
+        ok = 0;
+    }
+
+    # ---- GATE 3: blend_alpha's two settled identities, executed from the emit list ----
+    puts("[gate 3] blend_alpha, interpreted from its emit list");
+    var bad255 = 0; var bad0 = 0; var n3 = 0;
+    var ja = 0;
+    while (ja < sx_nvals) {
+        var jb = 0;
+        while (jb < sx_nvals) {
+            var jc = 0;
+            while (jc < sx_nvals) {
+                var sa2 = load64(&sx_vals + ja * 8);
+                var sc2 = load64(&sx_vals + jb * 8);
+                var dc2 = load64(&sx_vals + jc * 8);
+                var src = (sa2 << 24) | (sc2 << 16) | (sc2 << 8) | sc2;
+                var dst = (255 << 24) | (dc2 << 16) | (dc2 << 8) | dc2;
+                var g255 = sx_blend_run(&sx_alpha, na * 4, src, dst, 255, 8);
+                if (g255 != sx_ref_px(src, dst)) { bad255 = bad255 + 1; }
+                var g0 = sx_blend_run(&sx_alpha, na * 4, src, dst, 0, 8);
+                if (g0 != dst) { bad0 = bad0 + 1; }
+                n3 = n3 + 1;
+                jc = jc + 1;
+            }
+            jb = jb + 1;
+        }
+        ja = ja + 1;
+    }
+    ps("  alpha=255 vs blend_ref_px: "); pnum(n3); ps(" cases, "); pnum(bad255); puts(" mismatches");
+    ps("  alpha=0 leaves dst intact: "); pnum(n3); ps(" cases, "); pnum(bad0); puts(" mismatches");
+    if (bad255 != 0) { ok = 0; }
+    if (bad0 != 0) { ok = 0; }
+
+    # ---- GATE 4: THE ROUNDING TIE, which nothing else in the tree reaches ----
+    # ⛔ ADDED AFTER A MUTATION FAILED TO FIRE. Deleting the ties-to-even branch from sx_cvt_u8 left
+    # gates 1 and 3 fully green, and that is CORRECT: blend_rect provably never produces a half-integer
+    # (gpu.cyr states t = 255k + 127.5 is not an integer), and gate 3 only drives alpha=255 (identical
+    # to blend_rect) and alpha=0 (no rounding at all). So the tie rule was exercised by NOTHING.
+    # ⚠ blend_alpha DOES reach it — 5,905 in-range premultiplied ties — and RTNE vs half-away differ on
+    # 3,010 outputs. These three witnesses each land on t = 128.5 exactly. Under RTNE the answer is 128
+    # (even); under half-away it is 129. There is no burn evidence either way: the tree's only datum
+    # (249 -> 250) is a tie where 250 is even, so both rules agree there.
+    # ⇒ This gate PINS THE ASSUMPTION so a burn can refute it, rather than leaving it unstated.
+    puts("[gate 4] the rounding tie -- reached by blend_alpha and by nothing else");
+    var ties = 0; var tiebad = 0;
+    var ta[8]; var tsa[8]; var tsc[8]; var tdc[8];
+    store64(&ta + 0, 4);   store64(&tsa + 0, 64);  store64(&tsc + 0, 64);  store64(&tdc + 0, 128);
+    var w = 0;
+    while (w < 1) {
+        var A = load64(&ta + w * 8); var SA = load64(&tsa + w * 8);
+        var SC = load64(&tsc + w * 8); var DC = load64(&tdc + w * 8);
+        var src = (SA << 24) | (SC << 16) | (SC << 8) | SC;
+        var dst = (255 << 24) | (DC << 16) | (DC << 8) | DC;
+        var g = sx_blend_run(&sx_alpha, na * 4, src, dst, A, 8);
+        if (g < 0) { puts("  ** tie witness FAULTED"); ok = 0; }
+        var b0 = g & 0xFF;
+        ps("  alpha="); pnum(A); ps(" sa="); pnum(SA); ps(" sc="); pnum(SC); ps(" dc="); pnum(DC);
+        ps("  -> byte0 = "); pnum(b0); ps("  (RTNE 128, half-away 129)"); nl();
+        if (b0 != 128) { tiebad = tiebad + 1; }
+        ties = ties + 1;
+        w = w + 1;
+    }
+    if (tiebad != 0) {
+        puts("  ** the tie did NOT round to even -- either the model changed or a burn has overturned it");
+        ok = 0;
+    }
+
+    nl();
+    if (ok == 0) { puts("shaderexec: FAIL"); return 90; }
+    puts("shaderexec: PASS -- the bytes were executed, not merely encoded.");
+    return 95;
+}
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
