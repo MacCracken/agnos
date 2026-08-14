@@ -34,7 +34,7 @@
 # LOOP REBUILDS BEFORE IT RUNS, which is the property that makes it a gate rather than a re-run of a
 # fossil — do not "optimise" it into reusing an existing build/<t>.
 # ⭐⭐ shaderexec ADDED 1.56.44 AND IT IS THE ONLY ONE HERE THAT EXECUTES ANYTHING. Every other gate in
-# this tree — shaderasm, shader-crossasm, shader-derive, edgeasm — is about ENCODING: whether some
+# this tree — shaderasm, shader-crossasm, edgeasm — is about ENCODING: whether some
 # stream of dwords equals another stream of dwords. None of them computes a pixel. For `blend_alpha`
 # that meant 14 dwords changed and the number constrained SEMANTICALLY was ZERO.
 # ⛔ The demonstration: deleting blend_alpha's whole 4-dword prologue and re-running the ARITHMETIC

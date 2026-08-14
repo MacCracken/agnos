@@ -1272,6 +1272,16 @@ var GPU_OP_BLEND_RECT  = 0x01;       # 32bpp premultiplied source, per-pixel src
 var GPU_OP_BLEND_COV   = 0x02;       # 8bpp coverage mask x one uniform colour           (was #93)
 var GPU_OP_GLYPH_1BPP  = 0x03;       # 1bpp bitmap, colour where set, dst untouched      (was #94)
 var GPU_OP_GRAD_LINEAR = 0x04;       # two-stop vertical gradient, NO source buffer      (never had one)
+# ⭐ 0x06 — BLEND_RECT with a UNIFORM per-surface alpha. aethersafha M6-C3 per-window opacity.
+# ⚠ WHY 0x06 AND NOT 0x11, which was the first proposal. 0x11 is mechanically free, but it sits inside
+# the `0x10-0x17 CP-DMA-domain` lane this file reserves two lines below, and `gpu.cyr` states that
+# minting 0x10/0x11 requires a domain state machine that was never written. This op is a SHADER
+# dispatch and adds no engine-domain transition, so it belongs in the composite lane 0x00-0x07 with
+# its siblings — where GPU_OP_SUPPORTED's bit index still reads as a family rather than a scatter.
+# ⚠ 0x06's `cov-modulated source` reservation has NO BLOB BEHIND IT (grep: 0 matches), unlike 0x05 and
+# 0x07, whose `perm_write` (gpu.cyr:7955) and `blend_pk_write` (:7997) are ALREADY-COMMITTED,
+# iron-proven blobs waiting for their codes. Taking either of those would displace a burned shader.
+var GPU_OP_BLEND_ALPHA = 0x06;       # premultiplied src-over x a UNIFORM alpha 0..255    (M6-C3)
 # ⭐ RUNG 9 (3D arc) — THE RASTERISER. An edge array (16.16) + a winding rule from a #86 slot,
 # rasterised to an 8bpp coverage mask. **This op IS the triangle rasteriser**: a triangle is a
 # 3-edge closed path, and nothing about the kernel is triangle-specific.
@@ -1480,7 +1490,8 @@ var GPU_RULE_NONZERO   = 0;
 var GPU_RULE_EVENODD   = 1;
 var GPU_EDGE_BYTES     = 16;         # one edge = x0,y0,x1,y1 as 4x i32 in 16.16
 var GPU_EDGE_MAX       = 256;        # per-op cap; a reject, never a clamp
-# 0x05 channel swap (plan S4) · 0x06 cov-modulated source · 0x07 packed VOP3P blend ·
+# 0x05 channel swap (plan S4) · 0x06 TAKEN by BLEND_ALPHA (its `cov-modulated source` reservation had
+# no blob behind it) · 0x07 packed VOP3P blend ·
 # 0x10-0x17 CP-DMA-domain ops (fill/blit/readback, plan S12) · 0x18-0x1F control (barrier/present).
 # ⭐ RUNG 17 (1.56.30) — op 0x0D, minted WITH its worker in the same change.
 # ⚠ `0x0C` was reserved for DEPTH_CLEAR in the original plan and 1.56.23 allocated it to TEX_LIST, so
@@ -1500,7 +1511,7 @@ var GPU_OP_RT_READ     = 0x10;       # copy a render-target handle out to a #86 
 # gpu_caps #89 reports to ring 3, which is the "deliberately awkward" property the plan wanted: you
 # cannot add an op here without also promising it works. So 0x0D is added in the SAME change as
 # gpu_depth_clear, and that worker refuses with GPO_E_ARM until rung 6's audit passes on this boot.
-var GPU_OP_SUPPORTED   = 0x1FF1F;    # bits 0..4 + 8 EDGE_COV + 9 TRI_RGBA + 10 TRI_LIST + 11 TRI_TEX + 12 TEX_LIST + 13 DEPTH_CLEAR + 14 TRI_DEPTH + 15 TRI_PERSP + 16 RT_READ — MUST equal what gpo_validate REACHES
+var GPU_OP_SUPPORTED   = 0x1FF5F;    # bits 0..4 + 6 BLEND_ALPHA + 8 EDGE_COV + 9 TRI_RGBA + 10 TRI_LIST + 11 TRI_TEX + 12 TEX_LIST + 13 DEPTH_CLEAR + 14 TRI_DEPTH + 15 TRI_PERSP + 16 RT_READ — MUST equal what gpo_validate REACHES
 
 # ⭐⭐ GPU_OP_NOTIMPL_MASK — ops whose ABI is COMPLETE and whose WORKER IS NOT. Reachable by the
 # validator (so every rule below is exercised by the battery through the real dispatch path) and
@@ -1520,7 +1531,7 @@ var GPU_OP_SUPPORTED   = 0x1FF1F;    # bits 0..4 + 8 EDGE_COV + 9 TRI_RGBA + 10 
 # advertises ops, not flags. An OP cannot.
 # ⇒ WHEN THE WORKER LANDS (plan bite B9), bit 14 clears HERE and the GPO_E_NOTIMPL return at the end
 # of gpo_validate_tridepth goes away, in one change. Both moves or neither.
-var GPU_OP_NOTIMPL_MASK = 0x0000;    # EMPTY — every op in GPU_OP_SUPPORTED has a worker
+var GPU_OP_NOTIMPL_MASK = 0x0040;    # bit 6 BLEND_ALPHA — ABI complete, shader authored but UNBURNED
 
 # ---- rung 17 op 0x0E sizing. ⚠ Its OWN constants, not TRI_LIST's: the record, the stride and the
 # work unit all differ, and sharing a name would couple two ABIs that are free to move apart.
@@ -1688,6 +1699,12 @@ var GPO_E_ALIGN    = 32;             # op    — w/h/dx/dy not a multiple of GPU
 # would tell a caller to change the wrong number.
 var GPO_E_WRANGE   = 33;             # op    — a per-vertex w outside [GPU_TPER_W_MIN, _W_MAX]
 var GPO_E_DRANGE   = 34;             # op    — D or N exceeds its lane at a draw-rect corner
+# ⭐ 35 — BLEND_ALPHA's alpha is outside 0..255. Its own code rather than GPO_E_RESERVED, which means
+# "a reserved field was non-zero" and would mis-describe this: dword 9 is a DEFINED field here, just
+# out of range. Sits with the ZRANGE/WRANGE/DRANGE family it resembles.
+# ⚠ Codes 9/10/14 are deliberate gaps; 35 is the next free number. Packed as `(i << 8) | e`, so any
+# value under 256 is representable.
+var GPO_E_ARANGE   = 35;             # op    — BLEND_ALPHA alpha outside 0..255
 var GPO_E_TRILIST  = 24;             # op    — triangle count/slot invalid, or a per-triangle record is
 var GPU_COV_MAX_DIM = 4096;          # per-side mask cap — a REJECT, never a clamp
 # ⭐ THE COORDINATE DOMAIN (B3). 2^28 = 4096 px in 16.16 — the same 4096 as GPU_COV_MAX_DIM, so
@@ -1716,6 +1733,16 @@ var GPU_EDGE_COORD_MAX = 268435456;  # 2^28
 fn gpo_field_mask(op) {
     if (op == GPU_OP_NOP)         { return 0x0003; }   # op flags
     if (op == GPU_OP_BLEND_RECT)  { return 0x0037; }   # op flags src_id wh dstxy
+    # ⭐ BLEND_RECT's mask PLUS dword 9. 0x0037 | 0x0200 = 0x0237.
+    # ⚠ DWORD 9 IS `alpha`, A 0..255 SCALAR HERE — and it is `color0`, a full 32-bit ARGB, for
+    # 0x02/0x03/0x04. Same dword, different type, which is a knowing exception to this function's
+    # own "a field means the same thing at the same dword" rule stated at :1757 and :1773. Dwords
+    # 6/7/8 are documented derive-hooks, 3 is a slot id and 10 is color1, so 9 is the least-bad slot.
+    # ⛔ THE RANGE CHECK FOR IT MUST BE OP-GUARDED. gpo_validate's generic tail is SHARED by
+    # 0x01-0x04, and aethersafha stores a real colour at dword 9 (src/gpu.cyr:670) — an unguarded
+    # `> 255` reject would refuse every non-near-black title, latch ae_text_gpu_disable() and drop
+    # all chrome text to the CPU permanently, every boot.
+    if (op == GPU_OP_BLEND_ALPHA) { return 0x0237; }   # op flags src_id wh dstxy alpha
     if (op == GPU_OP_BLEND_COV)   { return 0x023B; }   # op flags mask_id wh dstxy color0
     if (op == GPU_OP_GLYPH_1BPP)  { return 0x023B; }   # op flags mask_id wh dstxy color0
     if (op == GPU_OP_GRAD_LINEAR) { return 0x0633; }   # op flags wh dstxy color0 color1
@@ -1776,6 +1803,7 @@ fn gpo_slot_bytes(op, w, h) {
     # this function's own comment warns about for the 1bpp row stride.
     if (op == GPU_OP_EDGE_COV)   { return 0; }
     if (op == GPU_OP_BLEND_RECT) { return w * 4 * h; }
+    if (op == GPU_OP_BLEND_ALPHA) { return w * 4 * h; }   # same 32bpp premultiplied source
     if (op == GPU_OP_BLEND_COV)  { return w * h; }
     if (op == GPU_OP_GLYPH_1BPP) { return ((w + 7) / 8) * h; }
     return 0;
@@ -1785,6 +1813,7 @@ fn gpo_slot_bytes(op, w, h) {
 fn gpo_slot_field(op) {
     if (op == GPU_OP_EDGE_COV)   { return 12; }        # edge_id
     if (op == GPU_OP_BLEND_RECT) { return 8; }         # src_id
+    if (op == GPU_OP_BLEND_ALPHA) { return 8; }        # src_id — same dword as BLEND_RECT
     if (op == GPU_OP_BLEND_COV)  { return 12; }        # mask_id
     if (op == GPU_OP_GLYPH_1BPP) { return 12; }        # mask_id
     return 0;
@@ -4052,6 +4081,33 @@ fn gpo_validate(rec, fbw, fbh) {
         if (load64(&shm_mc + slot * 8) == 0) { return GPO_E_BADSLOT; }   # PMM-backed => GPU can't read it
         if (gpo_slot_bytes(op, w, h) > load64(&shm_size + slot * 8)) { return GPO_E_SLOTSIZE; }
     }
+
+    # ⭐ BLEND_ALPHA's alpha range, OP-GUARDED. dword 9 is a 0..255 SCALAR for this op alone.
+    # ⛔⛔ THIS CHECK MUST NEVER BE UNGUARDED, and the reason is a shipped consumer. This tail is SHARED
+    # by 0x01-0x04 (the delegation block above only redirects 0x08+), and for 0x02/0x03/0x04 dword 9 is
+    # `color0`, a full 32-bit ARGB. aethersafha writes a real title colour there
+    # (aethersafha/src/gpu.cyr:670, `store32(&d + 36, color)`), so an unguarded `> 255` reject would
+    # refuse every non-near-black glyph run, latch `ae_text_gpu_disable()` and drop ALL chrome text to
+    # the CPU permanently, every boot. ⚠ No existing gate would catch it: the ABI battery constructs no
+    # op in 0x00-0x04 at all, so this entire tail is executed by zero of its 152 cases.
+    #
+    # ⚠ THE CHECK AND THE SHADER'S BYTE LANE ARE LOAD-BEARING ON EACH OTHER. blend_alpha reads alpha
+    # with `v_cvt_f32_ubyte0 v13, s7` — BYTE 0. Without this reject, `alpha = 0x100` (a caller meaning
+    # "opaque", off by one) silently drops bits 8..31 and renders FULLY TRANSPARENT. With it, every
+    # color0-shaped misuse is a loud refusal instead of a wrong picture.
+    if (op == GPU_OP_BLEND_ALPHA) {
+        if ((load32(rec + 36) & 0xFFFFFFFF) > 255) { return GPO_E_ARANGE; }
+    }
+
+    # ⛔ NOTIMPL, READ FROM THE MASK RATHER THAN HARD-CODED — and that is the point.
+    # Every prior NOTIMPL op returned a literal GPO_E_NOTIMPL from its OWN validator, leaving the mask
+    # and the return as two hand-edited facts with nothing diffing them. That discipline has already
+    # slipped in this file (`:3505` still claims bit 15 is masked; it cleared when tri_persp landed).
+    # BLEND_ALPHA has no dedicated validator and rides this shared tail, so its return reads
+    # GPU_OP_NOTIMPL_MASK directly: clearing bit 6 when the burn lands removes the refusal in the SAME
+    # edit. Both moves or neither, enforced by construction instead of by memory.
+    # ⚠ Placed BEFORE the arming block on purpose — `gpu_blend_alpha_arm()` does not exist yet.
+    if (((GPU_OP_NOTIMPL_MASK >> op) & 1) == 1) { return GPO_E_NOTIMPL; }
 
     # Residency last: it is the only check with a side effect (a shader upload), so everything cheap and
     # pure runs first and a malformed batch never uploads anything.

@@ -6,21 +6,23 @@ type: state
 
 # AGNOS Kernel — Live State
 
-> **⛔ 120-LINE HARD CAP. NOT A LOG.** This file reached **694 lines** by absorbing arc narrative that belongs in [`CHANGELOG.md`](../../CHANGELOG.md), [`planning/gpu.md`](planning/gpu.md), or the burn ledger. Over 120 lines means consolidate: cut prose, never facts. Verify any single item against the live `VERSION` / `cyrius.cyml` before acting. **Last refresh** 2026-08-11.
+> **⛔ 120-LINE HARD CAP. NOT A LOG.** This file reached **694 lines** by absorbing arc narrative that belongs in [`CHANGELOG.md`](../../CHANGELOG.md), [`planning/gpu.md`](planning/gpu.md), or the burn ledger. Over 120 lines means consolidate: cut prose, never facts. Verify any single item against the live `VERSION` / `cyrius.cyml` before acting. **Last refresh** 2026-08-13.
 
 ## TRUE — measured, current
 
 | Field | Value | Source |
 |---|---|---|
-| Kernel head | **1.56.43 — CLOSED 2026-08-11. NO CYCLE IS OPEN.** ⛔ Do not open one without the operator naming the number. | [`VERSION`](../../VERSION) |
+| Kernel head | **1.56.44 — OPEN** (operator 2026-08-12). ⛔ This line read *"1.56.43 CLOSED, NO CYCLE IS OPEN"* while `VERSION` already said 1.56.44 and work was landing — the volatile-state file contradicting the tree it exists to describe. Re-read `VERSION` before trusting it. | [`VERSION`](../../VERSION) |
 | Previous cut | **1.56.42 RELEASED 2026-08-10** — PS/2 deleted from the kernel · the USB pointer binding · a process table that NAMES its exhaustion · the covered-console `klug` spill. 1.56.41 before it: the desktop's window management on iron. | [`CHANGELOG.md`](../../CHANGELOG.md) |
-| `build/agnos` on disk | 1,980,216 B, 2026-08-11 — **1.56.43 bare, BURNED and PASSED**. ⚠ Any smoke/test run rebuilds it without the burn flags — re-run `burn-prep.sh` before any flash | `scripts/burn/burn-verify.sh` |
-| Cyrius pin | **6.5.20** — raised from 6.4.78 at 1.56.44; ⛔ the pin had drifted three minors behind the installed cycc and the rebuild is **byte-identical**, so the shipped kernel was already being built by 6.5.20 and the declared floor gated nothing. `tests/gpu` tracks it (6.5.20); six other test manifests deliberately hold feature-landing minimums | `cyrius.cyml [package].cyrius` |
+| `build/agnos` on disk | **1,980,696 B · sha256 `6c256bc62719ec26`** (1.56.44 bare, 2026-08-13). ⛔ **UNBURNED** — 1.56.43's 1,980,216 B was the last artifact on iron. ⚠ A SIZE DOES NOT IDENTIFY A BINARY; quote the hash. ⚠ Any smoke/test run rebuilds without the burn flags — re-run `burn-prep.sh` before any flash | `sha256sum` |
+| Cyrius pin | **6.5.21** — raised 6.4.78 → 6.5.20 → 6.5.21 at 1.56.44, both byte-identical rebuilds; ⛔ the pin had drifted three minors behind the installed cycc and the rebuild is **byte-identical**, so the shipped kernel was already being built by 6.5.20 and the declared floor gated nothing. `tests/gpu` tracks it (6.5.21); six other test manifests deliberately hold feature-landing minimums | `cyrius.cyml [package].cyrius` |
 | Bootloader | gnoboot **0.6.1** (GOP mode selection — obtains a real 2560x1440 framebuffer); Path C, `RDI = &boot_info`, magic `0x41474E4F`, entry `0x1000a8` | `gnoboot/VERSION` |
 | Iron target | archaemenid — Beelink SER NUC, AMD Cezanne APU, **8c/16t (agnos parks APIC id ≥ 4, runs 4)**, 64 GB. Build host **is** the target, so no serial channel exists. | — |
 
 ⭐ **RESOLVED 1.56.35 — the `-smp 4` fault was `EFER.NXE` never enabled on the APs** (`smp.cyr:514`; the AP trampoline set LME only, so bit 63 of a paging entry was RESERVED and `proc_map_page_nx` sets it on every W^X data page and user stack). `-smp 4` reaches **connected 2 / presented 2, exit 95**.
 ⭐⭐⭐ **The desktop arc CLOSED at 1.56.42** and its forward work moved into aethersafha's own roadmap (M6, userland). Per-cut narrative → [`CHANGELOG.md`](../../CHANGELOG.md); burn ledger → agnosticos [`iron-log.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-log.md). The whole local-IPC channel band (`chan_*` on `#97`, bites 0-11) closed at **1.56.40** — `#97` replaced TCP-on-loopback, stdio rides a channel as a PTY, and pipelines stream byte-exact through a 4080 B ring.
+
+⭐⭐ **1.56.44 (in flight): the sovereign shader pipeline.** `blend_rect` has an emit list reproducing its 60 iron-proven dwords through mabda's encoder (`shaderasm`); `blend_alpha` — blend_rect + a uniform per-window alpha, 69 dwords — is authored and cross-checked by two independent assemblers (`shader-crossasm`), and `shaderexec` is a single-lane GFX9 interpreter that EXECUTES the bytes, calibrated on blend_rect's burned hex against the integer `blend_ref_px`. ⛔ **`blend_alpha` HAS NEVER BEEN BURNED** and its rounding-tie assumption (RTNE) has no hardware evidence either way. ⛔ Three gates in this area were found to be unrunnable or unfalsifiable and fixed: `edgeasm`/`asmagree` had never compiled, `edgeasm` passed a shader with no `s_endpgm`, and `ktest.sh` had exited 1 on every invocation for three weeks.
 
 ⚠ **Desktop-arc negatives that still stand** — these are the ones a reader will otherwise assume closed: `#98` **RESYNC is not iron-proven** (the ring never overflowed on any burn, so only the DRAIN was exercised); `#91` has no correct consumer and batched `#92` is unreachable; and **no burn has ever measured frame duration**, so there is **no speed claim** from any frame count.
 

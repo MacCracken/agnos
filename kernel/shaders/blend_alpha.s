@@ -9,7 +9,13 @@
 // run "has not met the bar for a hardware run". Treat the numbers here as a prediction to be tested.
 //
 // DERIVATION FROM blend_rect.s — 9 inserted dwords, 5 CHANGED, 55 unchanged. 60 -> 69 dwords, 276 B.
-// The derivation is machine-checked by `scripts/check/shader-derive.sh`; this comment is not the gate.
+// ⛔ THE DERIVATION IS NOT MACHINE-CHECKED. This line claimed `scripts/check/shader-derive.sh` gated it;
+// THAT SCRIPT DOES NOT EXIST and never did — it was named in five files before anyone wrote it, which is
+// the same cited-but-absent-gate defect this tree keeps finding. What DOES gate this shader:
+//   · `scripts/check/shader-crossasm.sh` — llvm-mc from this .s vs mabda from the emit list, 69/69 dwords
+//   · `tests/gpu/shaderexec.cyr`         — EXECUTES the bytes; the s9 clobber shows as 59,319 mismatches
+// Those cover correctness. The 9-inserted/5-changed decomposition below is DOCUMENTATION, verified once
+// by machine diff on 2026-08-13 and not re-checked on every build. Do not cite it as a gate.
 //
 // ⚠⚠ THE FIFTH CHANGE IS THE ONE THAT BITES, AND IT IS NOT A KERNARG RENAME.
 // Taking s7 for `alpha` pushes USER_SGPR 7 -> 8, so the TGIDs move s7/s8 -> s8/s9. Four of blend_rect's

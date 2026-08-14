@@ -3,8 +3,7 @@
 # ⛔⛔ WHY THIS EXISTS, AND IT IS THE GAP EVERY OTHER GATE LEAVES OPEN.
 # Nothing in agnos reads a shader dword and computes a pixel. `shaderasm.cyr` proves an emit list packs
 # the same BITS as the committed hex; `shader-crossasm.sh` proves two assemblers agree on those bits;
-# `shader-derive.sh` proves one emit list is another plus a declared edit. **All three are about
-# encoding. None of them executes anything.** For `blend_alpha` that meant 14 dwords changed and the
+# **Both are about encoding. Neither executes anything.** For `blend_alpha` that meant 14 dwords changed and the
 # number constrained SEMANTICALLY by any host gate was ZERO.
 #
 # ⛔ The sharpest demonstration: deleting blend_alpha's entire 4-dword prologue and re-running the

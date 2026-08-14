@@ -17,7 +17,9 @@
 # one is a later bite, gated on the burn.
 #
 # DERIVATION FROM blend_rect.emit.cyr — 9 inserted dwords, 5 CHANGED, 55 unchanged. Machine-checked by
-# `scripts/check/shader-derive.sh`; this comment is documentation, not the gate.
+# NOTHING — `scripts/check/shader-derive.sh` was cited in five files and never written. The gates that do
+# exist are `shader-crossasm.sh` (two assemblers, 69/69) and `shaderexec.cyr` (executes the bytes). The
+# decomposition below is documentation, verified once by machine diff, not re-checked per build.
 #
 # ⚠⚠ THE FIFTH CHANGE IS THE ONE THAT BITES. Taking s7 for `alpha` pushes USER_SGPR 7 -> 8, moving the
 # TGIDs s7/s8 -> s8/s9. Four dwords READ a TGID and obviously follow. The fifth WRITES s9 as the column

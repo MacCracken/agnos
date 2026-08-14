@@ -27,8 +27,7 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 A single-lane GFX9 interpreter over a shader's own dword stream. ~20 opcodes, 4 gates, 0.4 s.
 
 ⛔⛔ **Every other gate in this tree is about ENCODING.** `shaderasm` proves an emit list packs the same
-bits as committed hex; `shader-crossasm` proves two assemblers agree; `shader-derive` proves one emit
-list is another plus a declared edit. **None of them computes a pixel.** For `blend_alpha` that meant
+bits as committed hex; `shader-crossasm` proves two assemblers agree. **Neither computes a pixel.** For `blend_alpha` that meant
 14 dwords changed and the number constrained *semantically* by any host gate was **zero**.
 
 The sharpest demonstration: deleting `blend_alpha`'s entire 4-dword prologue and re-running the
@@ -92,6 +91,74 @@ set) = 59,319 cases/gate. The exhaustive 256³ run was done once — **0 mismatc
 119 s**. It is not what ships, because 119 s against this runner's 3 s makes a gate people skip. Set
 `SX_STRIDE` to 1 to reproduce. ⚠ The tie is the one genuinely input-sparse property, which is why its
 witnesses are pinned explicitly rather than left to the stride.
+
+### New — `#92` op **`0x06 GPU_OP_BLEND_ALPHA`** minted (validator half); worker still to come
+
+Premultiplied src-over with a **uniform per-surface alpha 0..255** — the kernel side of aethersafha's
+M6-C3 per-window opacity. `GPU_OP_SUPPORTED` `0x1FF1F` → **`0x1FF5F`**, `GPU_OP_NOTIMPL_MASK` →
+**`0x0040`**. Field mask `0x0237` (BLEND_RECT's `0x0037` plus dword 9), slot rules identical to
+BLEND_RECT. Kernel 1,980,696 → **1,981,080 B** (+384).
+
+⭐ **`0x06`, not `0x11`** (operator's call, and it is the better one). `0x11` is mechanically free but
+sits inside the reserved `0x10-0x17` CP-DMA lane, and `gpu.cyr` states that minting `0x10`/`0x11`
+requires a domain state machine that was never written. This op is a **shader dispatch** and adds no
+engine-domain transition, so it belongs in the composite lane `0x00-0x07` with its siblings. ⚠ Crucially
+`0x06`'s "cov-modulated source" reservation has **zero blob behind it**, whereas `0x05` and `0x07` have
+`perm_write` and `blend_pk_write` — already-committed, iron-proven blobs — waiting for their codes.
+Taking either of those would have displaced a burned shader.
+
+⛔ **The alpha range check is OP-GUARDED, and that is not defensive style.** `gpo_validate`'s generic
+tail is **shared** by `0x01`-`0x04` (the delegation block only redirects `0x08`+), and for
+`0x02`/`0x03`/`0x04` dword 9 is `color0`, a full 32-bit ARGB. aethersafha writes a real title colour
+there (`src/gpu.cyr:670`). An unguarded `> 255` reject would refuse every non-near-black glyph run,
+latch `ae_text_gpu_disable()`, and drop **all chrome text to the CPU permanently, every boot**.
+
+⚠ **The check and the shader's byte lane are load-bearing on each other.** blend_alpha reads alpha with
+`v_cvt_f32_ubyte0` — **byte 0**. Without the reject, `alpha = 0x100` (a caller meaning "opaque", off by
+one) silently drops bits 8..31 and renders **fully transparent**. New `GPO_E_ARANGE = 35`, its own code
+rather than `GPO_E_RESERVED` — dword 9 is a *defined* field here, just out of range.
+
+⭐ **NOTIMPL is now read from the mask instead of hard-coded.** Every prior NOTIMPL op returned a literal
+from its own validator, leaving the mask and the return as two hand-edited facts with nothing diffing
+them — a discipline that has already slipped in this file (`:3505` still claims bit 15 is masked; it
+cleared when `tri_persp` landed). BLEND_ALPHA has no dedicated validator, so its refusal reads
+`GPU_OP_NOTIMPL_MASK` directly: clearing bit 6 when the burn lands removes it in the **same edit**.
+Both moves or neither, enforced by construction rather than by memory.
+
+Caps arithmetic verified: `SUPPORTED & ~NOTIMPL` = `0x1FF1F`, **bit 6 clear** — the validator reaches
+the op so its field rules are testable, and `#89` never tells ring 3 it works.
+
+### ⛔ Not done, and both matter
+
+1. **No worker and no `gpo_execute` branch.** With NOTIMPL set, pass 1 refuses every record before
+   `gpo_execute_all` runs, so nothing is reachable — but `syscall.cyr:4154` records the tree's rule
+   that a branch is written anyway *"so this file never contains a supported op with no execution
+   path, which is how GPO_E_BADOP would surface as a mystery at the wrong layer."* That needs
+   `blend_alpha_write` (the 69 committed dwords), `gpu_blend_alpha_arm` and `gpu_blend_alpha_surface`.
+   ⚠ The USER_SGPR 7 → 8 change means the arming path pushes an eighth USER_DATA dword — check whether
+   a shared helper is involved before copying `gpu_blend_arm`.
+2. ⛔ **The ABI battery is BLIND, not merely unrun.** `edge_abi_selftest` sits behind
+   `#ifdef EDGE_ABI_SELFTEST`; nothing sets it, and `edge-abi-smoke.sh` is one of **68 of 83** smoke
+   scripts absent from `sweep.sh`'s table. Worse: **zero of its 152 cases construct an op in
+   `0x00`-`0x04`**, which is precisely the shared tail this change edits. A kernel carrying the
+   *unguarded* range check would have printed `152 of 152 cases correct` and shipped. Wiring and
+   calibrating it is the next bite, not a follow-up.
+
+### Fixed — `scripts/check/shader-derive.sh` was cited in five files and never written
+
+⛔ **A gate named in the present tense that does not exist.** `blend_alpha.s:12` said *"The derivation is
+machine-checked by `scripts/check/shader-derive.sh`"*; `blend_alpha.emit.cyr`, `host-gpu-oracles.sh`,
+`shaderexec.cyr` and an earlier entry in this very changelog all repeated it. **The script was never
+created.** This is the identical defect this cycle found twice in older work — `edgeasm`/`asmagree`
+cited by `shader-blob.sh` while unbuildable, and `stage-tools.sh` staging a fossil — committed here by
+the same hand that found those.
+
+⚠ **Corrected by naming what actually runs, not by writing the script.** `shader-crossasm.sh` (two
+independent assemblers, 69/69 dwords) and `shaderexec.cyr` (executes the bytes; the `s9` clobber shows
+as 59,319 mismatches) already cover the correctness a derive gate would have. The 9-inserted/5-changed
+decomposition is now labelled **documentation, verified once by machine diff on 2026-08-13 and not
+re-checked per build** — which is what it always was. Building a gate to make a stale comment true
+would have been building the wrong thing.
 
 ### New — `blend_alpha`: the shader for per-window opacity, authored and cross-checked, NOT burned
 
