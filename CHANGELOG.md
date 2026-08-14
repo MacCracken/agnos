@@ -22,6 +22,68 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.44] — 2026-08-13 — cycle OPEN: a fullscreen surface can be GPU-composited
 
+### New — `blend_alpha`: the shader for per-window opacity, authored and cross-checked, NOT burned
+
+`kernel/shaders/blend_alpha.s` + `kernel/shaders/emit/blend_alpha.emit.cyr` — blend_rect plus a uniform
+per-surface alpha. **55 instructions, 69 dwords, 276 B.** Zero new instruction formats. The kernel does
+not include it and there is no committed `blend_alpha_write`; `build/agnos` is byte-identical.
+
+⛔⛔ **THE FIFTH CHANGED DWORD, WHICH TWO ANALYSES MISSED.** Taking `s7` for `alpha` pushes USER_SGPR
+7 → 8, moving the TGIDs `s7`/`s8` → `s8`/`s9`. Four dwords **read** a TGID and obviously follow. The
+fifth **writes** `s9` as the column scratch — and under the new layout **`s9` IS tgid_y**, so it would
+destroy the row index before the two `s_mul_i32 …, s9, pitch` reads consume it. Column group 0 would
+write row 0 for every y. **It assembles clean, matches its own blob byte for byte, and faults nothing.**
+The scratch moves to **s15**, the only unused SGPR below the saved-EXEC pair (blend_rect touches
+s0–s14, s16–s20, skipping 15 so `s[16:17]` lands even-aligned).
+
+⚠ The prior design said the diff was "9 inserted, **0 changed**"; a first correction made it 9 + 4 by
+grepping for TGID *sources*. Both were wrong because a **destination register number** can collide with
+a relocated TGID. Measured decomposition: **55 equal · 9 inserted · 5 changed · 0 deleted.**
+
+⚠ **SCC is load-bearing between the address pairs** — `s_add_u32` sets it, `s_addc_u32` consumes it,
+and `s_lshl_b32` also writes it. All nine insertions are placed outside those pairs; inserting between
+`s12`/`s13` or `s18`/`s19` would drop a 64-bit carry silently.
+
+⭐ RSRC1 is **`0x002C00C3` — bit-identical to blend_rect's**, so no new constant. VGPR high-water
+v12 → v13 and SGPR s20 → s21, both inside their granules. RSRC2 becomes `0x00000190`, which already
+exists as `GPU_COMPUTE_RSRC2_COV`. Read out of llvm-mc's emitted kernel descriptor, not derived.
+
+### New — `scripts/check/shader-crossasm.sh`: two independent assemblers, for a shader with no hex
+
+`shaderasm` checks an emit list against **committed, iron-proven** hex — evidence about reality. An
+unburned shader has no such expectation, and reaching for shaderasm anyway would compare two host
+artifacts written the same week from the same story.
+
+⭐ So `blend_alpha` is assembled **twice**: the `.s` through **llvm-mc**, the emit list through
+**mabda's Cyrius encoder**. Two implementations by different people for different projects, neither
+derived from the other. **All 69 dwords identical**, zero wrapper faults, register high-waters exact
+(v13 vs declared 14, s21 vs declared 22).
+
+Mutation-tested from **both** sides, each red: perturbing the `.s` to scale dst instead of src
+(`0a14150d` vs `0a12130d`), and reverting the emit list's `s15` back to the fatal `s9`
+(`8e098608` vs `8e0f8608`) — that second one is the collision above, caught mechanically. Forced red
+*through `check.sh`* to confirm the run still reaches `27 passed, 1 failed` rather than aborting under
+`set -e`, per that file's own standing requirement.
+
+⚠ **This is an ENCODING gate and nothing more.** Both sides encode the same instruction sequence; if
+that sequence is semantically wrong, they agree and are both wrong. It narrows a burn's search space,
+it does not replace one.
+
+### Open — two `blend_alpha` questions only a burn can settle
+
+⛔ **The tie rule is newly reachable.** blend_rect never had to answer round-half-even vs half-away —
+`gpu.cyr` states the tie is unreachable for it (`t = 255k + 127.5` is never an integer). blend_alpha
+**reaches it**: 5,905 in-range premultiplied ties, on which the two rules differ for **3,010** outputs
+(e.g. α=4, sa=64, sc=64, dc=128 → `t = 128.5` exactly; RTNE → 128, half-away → 129). ⚠ The tree's only
+burn evidence does **not** discriminate: burn 1's 249 → 250 is a tie where 250 is even, so both rules
+agree there. This assumes RTNE, matching `.amdhsa_float_round_mode_32 0`.
+
+⚠ **The α=255 zero-tolerance oracle is powerful on IRON and vacuous on the host.** Deleting the entire
+prologue from the CPU model still scores **0 mismatches / 16,777,216**, as does a 1-ULP-low reciprocal —
+because at α=255 the shader is *supposed* to equal blend_rect, and "equals blend_rect" is satisfied by
+"the alpha feature is absent". On hardware it exercises the real s7/s8/s9 plumbing and is a genuine
+zero-tolerance gate; as a host check it carries no information about the feature.
+
 ### New — SGPR high-water tracking in `asmlib.cyr`, with an equality calibration that can actually fail
 
 The peer of the VGPR tracker, and harder in three measured ways.

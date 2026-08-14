@@ -21,7 +21,12 @@ language = "cyrius"
 # ⚠ tests/gpu/cyrius.cyml MUST move in the same edit — its own header mandates tracking this value,
 # because ring-3 GPU tools built by a different compiler than the kernel they exercise would surface a
 # codegen difference as a GPU bug.
-cyrius = "6.5.20"
+#
+# 6.5.21 (same cut) — 6.5.21 released while 1.56.44 was still open and the wrapper picked it up
+# immediately, so the pin was stale again within the day. Bumped rather than tolerated, which is the
+# whole point of the note above. ⭐ build/agnos is BYTE-IDENTICAL across 6.5.20 -> 6.5.21
+# (1,980,696 B / 6c256bc6...), so the span changed no codegen this kernel reaches.
+cyrius = "6.5.21"
 
 [build]
 entry = "kernel/agnos.cyr"

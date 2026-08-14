@@ -119,6 +119,15 @@ sh "$ROOT/scripts/check/check-dup-symbols.sh" >/tmp/check-dup.log 2>&1 && rc=0 |
 check "no duplicate module-scope symbols in tests/gpu" $rc
 [ "$rc" = "0" ] || cat /tmp/check-dup.log
 
+# An UNBURNED shader has no iron-proven hex to check against, so it is assembled twice — once by
+# llvm-mc from its .s, once by mabda's encoder from its emit list — and the dword streams must match.
+# ⚠ This is an ENCODING check only. Both sides encode the same instruction sequence; if that sequence
+# is semantically wrong they agree and are both wrong. It narrows a burn's search space, never replaces
+# it. Move a shader out of this gate and into shaderasm once it HAS committed, burned hex.
+sh "$ROOT/scripts/check/shader-crossasm.sh" >/tmp/check-crossasm.log 2>&1 && rc=0 || rc=$?
+check "unburned shaders encode identically under two assemblers" $rc
+[ "$rc" = "0" ] || cat /tmp/check-crossasm.log
+
 # Shader blobs vs their sources. Each shipped shader is a store32 table in gpu.cyr that is supposed
 # to be exactly what the assembler produced from kernel/shaders/*.s -- and until 1.56.19 nothing
 # enforced it. A hand-edited dword, a paste that dropped one, or a .s edited after the table was
