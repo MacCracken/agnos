@@ -22,6 +22,21 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.45] — 2026-08-16 — cycle OPEN
 
+### Changed — cyrius pin 6.5.21 -> **6.5.27**
+
+Part of the stack-wide toolchain sweep: aethersafha, dhancha, crab, puka, setu, rupa, sadish, rekha
+and kashi all move to 6.5.27, and the kernel goes with them so kernel and desktop keep declaring one
+language version — the same reason the pin moved to 6.5.21 in the first place.
+
+⭐ **The kernel binary is BYTE-IDENTICAL across the bump** — `6f8578cc4189ab9d`, 1,987,576 bytes
+before and after. The pin selects the stdlib snapshot under `~/.cyrius/versions/<pin>/lib`, and for
+the modules this kernel uses 6.5.21 and 6.5.27 emit the same code.
+
+⚠ **So no re-burn is required for this change.** 1.56.45's existing boot evidence covers these exact
+bytes; a burn would be testing an artifact it has already tested. That is worth stating rather than
+scheduling iron time out of caution.
+
+
 ### Fixed — an asynchronous log no longer eats the line the operator is typing
 
 ⛔⛔ **The signature, from the 1.56.45 burn.** A one-shot landed inside a command as it was typed:
