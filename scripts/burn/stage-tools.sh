@@ -360,9 +360,18 @@ stage_one aethersafha  src/main.cyr aethersafha || rc=1
 #     slot filler until the naadi probe replaces it.
 # Neither is a burn objective. Nothing below is an instruction to test anything.
 #
-# ⚠ `/bin/puka` is the FIRST-RESIDENT SLOT, not the puka terminal: full puka needs a mabda `--agnos`
-# GPU backend that does not exist yet. The name is what the compositor spawns, so the slot keeps it.
-# The two paths are both 9 characters, which is the length aethersafha passes to spawn_path.
+# ⛔⛔ THIS SAID "full puka needs a mabda `--agnos` GPU backend that does not exist yet" AND IT IS FALSE.
+# puka 0.6.12 builds `--agnos` clean (1,541,744 B) and the REAL TERMINAL has RUN ON IRON: `AE-T2`,
+# *"puka: terminal up -- 80x24, shell on a pty"* → *"first present ok"*, and the operator confirmed the
+# wrap fix on a later flash — *"puka displays shell in terminal as expected with expected wrap"*
+# (agnosticos `iron-nuc-zen-log.md:8938,9042,9150`). The blocker cleared and nobody deleted the excuse.
+# ⚠ IT COST A BURN. 2026-08-16: this comment was read as *"puka cannot be the terminal on agnos"*, so a
+# default-staged burn shipped `present_probe` in the slot and the operator — who had working terminal
+# logs — was told the terminal was blocked. The slot default is a HARNESS choice (below), never a
+# capability claim; a stale capability claim sitting next to it turned one into the other.
+# ⇒ `/bin/puka` is the FIRST-RESIDENT SLOT and holds EITHER binary by declared choice. The name is what
+# the compositor spawns, so the slot keeps it. Both paths are 9 characters, which is the length
+# aethersafha passes to spawn_path.
 #
 # ⚠ SIZE IS LOAD-BEARING FOR `spawn_path`, unlike `run`/sh_exec — kept because it is a spawn_path
 # fact, not a transport fact, and it will apply unchanged to naadi clients. spawn_path is proven on
