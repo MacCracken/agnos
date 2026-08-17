@@ -20,7 +20,40 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
-## [1.56.44] — 2026-08-13 — cycle OPEN: a fullscreen surface can be GPU-composited
+## [1.56.45] — 2026-08-16 — cycle OPEN
+
+No new work has been started in this cut.
+
+⚠ Edits carrying this version exist, and they are all consequences of the 1.56.44 burn rather than new
+work: six sites across `kernel/core/`, `kernel/shaders/`, `tests/gpu/` and `scripts/check/` asserted
+*"`blend_alpha` HAS NOT BEEN BURNED"* / *"these bytes have never run on hardware"* — false as of
+2026-08-16 — and the gate promotion those sites describe (crossasm → shaderasm, plus the partition
+assertion that keeps the emptied list from passing vacuously) is the burn's direct result. Both are
+recorded under **1.56.44**, where the evidence belongs, not restated as 1.56.45 deliverables.
+
+⛔ **Kernel state is UNCHANGED.** No `.cyr` edit in this cut alters emitted code — the only executable
+difference from 1.56.44 is `kernel/version.cyr`'s banner literal, which the bump regenerates.
+
+---
+
+## [1.56.44] — 2026-08-13 — the sovereign shader pipeline, and `#92` op 0x06 on iron (RELEASED 2026-08-16)
+
+### Iron-proven — `#92` op 0x06 `GPU_OP_BLEND_ALPHA`, archaemenid 2026-08-16
+
+`#89 gpu_caps` byte +28 reported **`0x1FF5F`** (bit 6 set; `GPU_OP_NOTIMPL_MASK` is `0x0000`). Ring 3
+issued op 0x06 and `blend_alpha`'s 69 dwords composited a translucent client surface across **244** and
+**537** frames, no `GPO_E_*`, no demotion. `gpu.cyr`'s `blend_alpha_write` is committed, burned hex.
+
+Gate moved with the evidence: `blend_alpha` leaves `scripts/check/shader-crossasm.sh` (two host
+assemblers agreeing) for `tests/gpu/shaderasm.cyr` (emit list vs the burned hex) — **69/69 dwords
+byte-identical, VGPR 13/14, SGPR 21+1 == 22 exact**. `shader-crossasm.sh`'s `UNBURNED` list is now
+empty and asserts that every `kernel/shaders/emit/*.emit.cyr` is gated exactly once, so an emit list
+added and wired to neither gate fails instead of passing through an empty loop.
+
+⛔ **The rounding tie is NOT settled by this burn.** 5,905 in-range premultiplied ties exist and
+round-half-even vs round-half-away differ on 3,010 outputs; nothing visible on a desktop distinguishes
+±1 on a channel. `blend_alpha.s`'s RTNE assumption stands on `.amdhsa_float_round_mode_32 0` and on no
+hardware evidence.
 
 ### New — `tests/gpu/shaderexec.cyr`: the first thing in agnos that EXECUTES a shader
 

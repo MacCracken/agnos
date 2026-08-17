@@ -32,6 +32,11 @@ include "gen/oracle_tables.cyr"
 # edge_setup against 56 VGPRs while the shader declared 32). See shader-decls.sh.
 include "gen/shader_decls.cyr"
 include "../../kernel/shaders/emit/blend_rect.emit.cyr"
+# ⭐⭐ blend_alpha GRADUATED HERE at the 1.56.44 burn. It was gated by `shader-crossasm.sh` — two
+# assemblers agreeing on the bits — because it had no iron-proven hex to compare against. It has hex
+# now: the 69 dwords in `gpu.cyr`'s `blend_alpha_write` dispatched on archaemenid and produced a
+# translucent window. `shader-crossasm.sh:44` states the promotion rule this follows.
+include "../../kernel/shaders/emit/blend_alpha.emit.cyr"
 
 # ============================================================================================
 # THE RETURN-VALUE SPLIT — REPORTED, DELIBERATELY NOT GATED
@@ -88,6 +93,19 @@ fn main(): i64 {
     var n = blend_rect_want_fill();
     var bytes = blend_rect_emit();
     check_shader(bytes, &blend_rect_want, n, blend_rect_nfv, blend_rect_nfs, "blend_rect");
+
+    # ---- blend_alpha: 55 instructions, 69 dwords ----
+    # ⛔ THE TRACKERS MUST BE RESET PER SHADER. `ea_vgpr_max`/`ea_sgpr_max` are high-water marks across
+    # every encode since the last reset, so a second shader checked without one asserts the UNION of
+    # both register footprints against its OWN declaration — which passes `<` and fails `== exact` for
+    # the shader with the smaller budget. `ea_labels_reset` likewise, or the second emit list's labels
+    # collide with the first's and asmlib refuses a duplicate.
+    ea_labels_reset();
+    ea_vgpr_reset();
+    ea_sgpr_reset();
+    var na = blend_alpha_want_fill();
+    var ba = blend_alpha_emit();
+    check_shader(ba, &blend_alpha_want, na, blend_alpha_nfv, blend_alpha_nfs, "blend_alpha");
 
     nl();
     ps("shaderasm: "); pnum(n_pass); ps(" passed, "); pnum(n_fail); puts(" failed");

@@ -42,7 +42,41 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
 
 # Shaders with an emit list but NO committed hex. ⚠ A shader gains committed hex only after a burn;
 # when that happens MOVE it out of this list and into shaderasm, which is the stronger gate.
-UNBURNED="blend_alpha"
+#
+# ⭐⭐ EMPTY AS OF THE 1.56.44 BURN — `blend_alpha` graduated. Its 69 dwords dispatched on archaemenid
+# and produced a translucent window, so `gpu.cyr`'s `blend_alpha_write` is now iron-proven hex and
+# `shaderasm.cyr` gates it against the emit list, which is the stronger comparison.
+UNBURNED=""
+
+# ⛔⛔ AN EMPTY LIST WOULD OTHERWISE MAKE THIS GATE VACUOUS, and this tree has already shipped four of
+# those. A `for` over nothing leaves `fail=0` and prints OK — indistinguishable from coverage, and
+# exactly how a THIRD emit list added tomorrow and wired into neither gate would pass silently.
+# ⇒ Assert the PARTITION instead: every `kernel/shaders/emit/*.emit.cyr` must be named either in
+# `UNBURNED` above or in a `check_shader(..., "<name>")` call in `tests/gpu/shaderasm.cyr`. That is a
+# claim with content whether or not this list has anything in it, and it is what makes "nothing to
+# cross-assemble" mean *covered* rather than *forgotten*.
+partition_fail=0
+covered=$(grep -oE 'check_shader\([^)]*"[a-z0-9_]+"\)' "$GPU/shaderasm.cyr" 2>/dev/null \
+          | sed -E 's/.*"([a-z0-9_]+)".*/\1/')
+for f in "$SHADERS"/emit/*.emit.cyr; do
+    [ -f "$f" ] || continue
+    base=$(basename "$f" .emit.cyr)
+    in_unburned=0; in_shaderasm=0
+    for u in $UNBURNED;  do [ "$u" = "$base" ] && in_unburned=1; done
+    for c in $covered;   do [ "$c" = "$base" ] && in_shaderasm=1; done
+    if [ "$in_unburned" = "1" ] && [ "$in_shaderasm" = "1" ]; then
+        echo "  FAIL: $base is in BOTH lists — a burned shader must leave UNBURNED when it enters shaderasm"
+        partition_fail=1
+    fi
+    if [ "$in_unburned" = "0" ] && [ "$in_shaderasm" = "0" ]; then
+        echo "  FAIL: $base has an emit list and NO gate — add it to UNBURNED here, or to shaderasm.cyr"
+        partition_fail=1
+    fi
+done
+if [ "$partition_fail" != "0" ]; then
+    echo "shader-crossasm: FAILED — every emit list must be gated exactly once"
+    exit 1
+fi
 
 fail=0
 for name in $UNBURNED; do
@@ -109,5 +143,12 @@ done
 if [ "$fail" != "0" ]; then
     echo "shader-crossasm: FAILED"
     exit 1
+fi
+# ⚠ SAY WHICH OF THE TWO GREENS THIS IS. "OK — every unburned shader encodes identically" over an
+# empty list is a true sentence that reads as coverage; the partition assertion above is what was
+# actually proven, and the message has to name it.
+if [ -z "$UNBURNED" ]; then
+    echo "shader-crossasm: OK — no shader currently lacks iron-proven hex; every emit list is gated by shaderasm"
+    exit 0
 fi
 echo "shader-crossasm: OK — every unburned shader encodes identically under two independent assemblers"

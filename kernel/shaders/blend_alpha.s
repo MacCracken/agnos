@@ -9,15 +9,21 @@
 // lane 0x00-0x07 — and 0x06 is the only free code there, since 0x05 and 0x07 have `perm_write` and
 // `blend_pk_write` (already-committed, iron-proven blobs) waiting for them.
 //
-// ⛔ THIS SHADER HAS NOT BEEN BURNED. Every claim below is a HOST claim. blend_rect's bytes are
-// iron-proven; these are not, and `shader-blob.sh:11-15` already records that a blob assembled but not
-// run "has not met the bar for a hardware run". Treat the numbers here as a prediction to be tested.
+// ⭐⭐ BURNED 2026-08-16 ON ARCHAEMENID, agnos 1.56.44. `#89 gpu_caps` +28 reported 0x1FF5F, ring 3
+// reached op 0x06, and aethersafha composited a translucent client surface across 244 and 537 frames
+// with no `GPO_E_*` and no demote. These 69 dwords are now IRON-PROVEN hex: they dispatched and they
+// produced a translucent window. The header below previously read "THIS SHADER HAS NOT BEEN BURNED …
+// treat the numbers here as a prediction to be tested" — the test happened.
+// ⚠ WHAT THE BURN DID *NOT* SETTLE, and it is the one claim in this file still unbacked: the ROUNDING
+// TIE (see the ⛔ block further down). Nothing on screen distinguishes ±1 on a channel, so RTNE remains
+// an assumption. A burn that shows a window is not a burn that shows a rounding mode.
 //
 // DERIVATION FROM blend_rect.s — 9 inserted dwords, 5 CHANGED, 55 unchanged. 60 -> 69 dwords, 276 B.
 // ⛔ THE DERIVATION IS NOT MACHINE-CHECKED. This line claimed `scripts/check/shader-derive.sh` gated it;
 // THAT SCRIPT DOES NOT EXIST and never did — it was named in five files before anyone wrote it, which is
 // the same cited-but-absent-gate defect this tree keeps finding. What DOES gate this shader:
-//   · `scripts/check/shader-crossasm.sh` — llvm-mc from this .s vs mabda from the emit list, 69/69 dwords
+//   · `tests/gpu/shaderasm.cyr`          — the emit list vs the COMMITTED, NOW-BURNED hex, 69/69 dwords,
+//     VGPR 13/14 and SGPR 21+1 == 22 exact. It graduated here from `shader-crossasm.sh` at the burn.
 //   · `tests/gpu/shaderexec.cyr`         — EXECUTES the bytes; the s9 clobber shows as 59,319 mismatches
 // Those cover correctness. The 9-inserted/5-changed decomposition below is DOCUMENTATION, verified once
 // by machine diff on 2026-08-13 and not re-checked on every build. Do not cite it as a gate.

@@ -1531,16 +1531,19 @@ var GPU_OP_SUPPORTED   = 0x1FF5F;    # bits 0..4 + 6 BLEND_ALPHA + 8 EDGE_COV + 
 # advertises ops, not flags. An OP cannot.
 # ⇒ WHEN THE WORKER LANDS (plan bite B9), bit 14 clears HERE and the GPO_E_NOTIMPL return at the end
 # of gpo_validate_tridepth goes away, in one change. Both moves or neither.
-# ⭐⭐ CLEARED FOR THE 1.56.44 BURN. Bit 6 (BLEND_ALPHA) is out, so `#89 +28` advertises op 0x06 and
-# ring 3 can reach it — the ONLY way the shader gets tested at all. Everything else about blend_alpha
-# is host-proven (two independent assemblers agree on all 69 dwords; an interpreter executes them
-# against the kernel's own integer reference). The burn is the one thing left.
+# ⭐⭐ CLEARED FOR THE 1.56.44 BURN, AND THE BURN CAME BACK GREEN (2026-08-16, archaemenid).
+# Bit 6 (BLEND_ALPHA) is out, so `#89 +28` advertises op 0x06 and ring 3 can reach it. That clearance
+# was provisional when it landed — "revert if it comes back red" — and it is now PERMANENT: `#89 +28`
+# reported 0x1FF5F on iron, the compositor issued op 0x06, and `blend_alpha` blended a translucent
+# client surface across 244 and 537 frames with no `GPO_E_*` and no demotion. The word therefore no
+# longer advertises a surface larger than the proven one, which was the whole 1.56.24 hazard.
 # ⛔ THIS IS THE "BOTH MOVES OR NEITHER" HALF, AND THE OTHER HALF IS AUTOMATIC. gpo_validate's refusal
 # READS this word instead of hard-coding GPO_E_NOTIMPL, so clearing the bit removes the refusal in the
 # same edit — enforced by construction rather than by remembering.
-# ⛔⛔ IF THE BURN IS RED, REVERT THIS CONSTANT. An advertised op whose shader has never produced a
-# correct pixel is the 1.56.24 defect exactly: an advertised surface larger than the proven one.
-var GPU_OP_NOTIMPL_MASK = 0x0000;    # EMPTY — bit 6 cleared for the burn; revert if it comes back red
+# ⚠ THE RULE STILL BINDS FOR THE NEXT OP. An op enters this word the moment its worker exists and its
+# shader has NOT produced a correct pixel on hardware, and leaves it only on a green burn. Bit 6 is out
+# because it earned it; nothing here is a precedent for advertising an unburned op.
+var GPU_OP_NOTIMPL_MASK = 0x0000;    # EMPTY — bit 6 cleared 1.56.44 and IRON-PROVEN 2026-08-16
 
 # ---- rung 17 op 0x0E sizing. ⚠ Its OWN constants, not TRI_LIST's: the record, the stride and the
 # work unit all differ, and sharing a name would couple two ABIs that are free to move apart.

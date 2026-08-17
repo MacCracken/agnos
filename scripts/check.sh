@@ -124,8 +124,12 @@ check "no duplicate module-scope symbols in tests/gpu" $rc
 # ⚠ This is an ENCODING check only. Both sides encode the same instruction sequence; if that sequence
 # is semantically wrong they agree and are both wrong. It narrows a burn's search space, never replaces
 # it. Move a shader out of this gate and into shaderasm once it HAS committed, burned hex.
+# ⭐ THE LIST IS EMPTY AS OF THE 1.56.44 BURN — `blend_alpha` graduated to shaderasm — so what this gate
+# now asserts is the PARTITION: every emit list is gated exactly once, by this script or by shaderasm.
+# ⚠ The label says so. An empty cross-assembly loop reporting "shaders encode identically" would be the
+# fourth vacuous gate this arc has found, and the label is half of how one gets noticed.
 sh "$ROOT/scripts/check/shader-crossasm.sh" >/tmp/check-crossasm.log 2>&1 && rc=0 || rc=$?
-check "unburned shaders encode identically under two assemblers" $rc
+check "every shader emit list is gated exactly once (crossasm or shaderasm)" $rc
 [ "$rc" = "0" ] || cat /tmp/check-crossasm.log
 
 # Shader blobs vs their sources. Each shipped shader is a store32 table in gpu.cyr that is supposed

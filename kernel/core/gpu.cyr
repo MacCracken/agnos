@@ -3378,12 +3378,16 @@ fn blend_rect_write(dst_phys) {
 
 # blend_alpha — blend_rect plus a UNIFORM per-surface alpha. Human-readable reference:
 # kernel/shaders/blend_alpha.s.
-# ⛔⛔ THESE BYTES HAVE NEVER RUN ON HARDWARE. Every other *_write in this file is iron-proven on
-# archaemenid; this one is not. `shader-blob.sh:11-15` sets the standard — an assembled-but-unrun blob
-# "has not met the bar for a hardware run" — and that is exactly what this is. It ships behind
-# GPU_OP_NOTIMPL_MASK bit 6 so `#89` never advertises it to ring 3.
-# ⭐ GENERATED, NOT TYPED: emitted by llvm-mc from blend_alpha.s and pasted mechanically. Two
-# independent assemblers agree on all 69 dwords (`scripts/check/shader-crossasm.sh`), and
+# ⭐⭐ THESE BYTES RAN ON ARCHAEMENID, 2026-08-16 (agnos 1.56.44). This banner previously read "THESE
+# BYTES HAVE NEVER RUN ON HARDWARE … it ships behind GPU_OP_NOTIMPL_MASK bit 6 so `#89` never
+# advertises it to ring 3". Bit 6 is clear, `#89 +28` reported 0x1FF5F on iron, and op 0x06 composited
+# a translucent client surface over 244 and 537 frames with no `GPO_E_*`. `shader-blob.sh:11-15`'s bar
+# — an assembled-but-unrun blob "has not met the bar for a hardware run" — is met.
+# ⚠ STILL UNPROVEN BY THAT BURN: the rounding tie. A visible translucent window does not discriminate
+# ±1 on a channel; `blend_alpha.s`'s RTNE assumption has no hardware evidence either way.
+# ⭐ GENERATED, NOT TYPED: emitted by llvm-mc from blend_alpha.s and pasted mechanically. The emit list
+# in `kernel/shaders/emit/` reproduces these 69 dwords byte-for-byte through mabda's encoder
+# (`tests/gpu/shaderasm.cyr`, which it entered from `shader-crossasm.sh` at this burn), and
 # `tests/gpu/shaderexec.cyr` EXECUTES them against the integer reference.
 # ⚠ USER_SGPR=8 — alpha in s7, TGIDs at s8/s9 — so this dispatches through gpu_grid8_run with
 # RSRC2 = GPU_COMPUTE_RSRC2_COV (0x190), NOT the 0x18E every 7-kernarg shader here uses.
@@ -8722,8 +8726,12 @@ fn gpu_blend_alpha_arm() {
 # anything above 255 with GPO_E_ARANGE before this is called, so the masking here is belt-and-braces
 # for a future in-kernel caller that does not go through the validator — without it, an out-of-range
 # value renders FULLY TRANSPARENT rather than failing.
-# ⚠ THIS HAS NEVER RUN ON HARDWARE. Reachable only once GPU_OP_NOTIMPL_MASK bit 6 clears, which is the
-# same change that lands the burn result.
+# ⭐ RUN ON HARDWARE 2026-08-16 (archaemenid, 1.56.44). This banner read "THIS HAS NEVER RUN ON
+# HARDWARE. Reachable only once GPU_OP_NOTIMPL_MASK bit 6 clears" — the bit is clear, ring 3 reached
+# it, and it composited a translucent surface over 244 and 537 frames with no `GPO_E_*`.
+# ⚠ WHAT THE BURN EXERCISED IS THE PATH, NOT THE CORNERS. Only whole-window rects at one alpha were
+# issued; `alpha == 0` (dst untouched) and the `w % 64 != 0` EXEC-guard trim have host coverage in
+# `shaderexec.cyr` and none on iron.
 fn gpu_blend_alpha_surface(src_mc, w, h, dx, dy, alpha) {
     if (gpu_blend_alpha_arm() != 1) { return 0; }
     var a = alpha & 0xFF;

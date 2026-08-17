@@ -19,8 +19,13 @@
 #   · the bytes were burned on archaemenid and produced correct pixels;
 #   · `blend_ref_px` is PURE INTEGER arithmetic (`sc + ((dc*ia)*2 + 255)/510`) written for the kernel's
 #     own self-test, with no float anywhere.
-# So an interpreter bug fails HERE, on a shader that is known-good, before it can flatter an unburned
+# So an interpreter bug fails HERE, on a shader that is known-good, before it can flatter the other
 # one. This is the tree's first gate where both sides are independently provenanced.
+# ⚠ `blend_alpha` WAS UNBURNED WHEN THIS FILE WAS WRITTEN AND IS NOT ANY MORE (archaemenid,
+# 2026-08-16). That does not weaken the calibration and it does not retire this file: a burn showed
+# the shader DISPATCHES and composites a visible translucent window, which is not the same claim as
+# "every one of its 16.7M outputs is the right byte" — and the rounding tie the gates below reach is
+# exactly the part hardware has still said nothing about.
 #
 # ⚠ WHAT THIS IS NOT. It is a SINGLE-LANE model: one pixel, EXEC as a boolean, no wave, no divergence
 # beyond the guard, no memory system, no latency. It cannot see a race, a coherence bug, a wrong
@@ -560,8 +565,10 @@ fn main(): i64 {
     nl();
 
     # ---- GATE 1: CALIBRATION. Burned bytes vs the kernel's integer reference. ----
-    # ⛔ This runs FIRST and on a KNOWN-GOOD shader, so an interpreter bug fails here — where both
-    # sides have independent provenance — before it can flatter the unburned one below.
+    # ⛔ This runs FIRST and on a shader whose bytes AND reference are independently provenanced, so an
+    # interpreter bug fails here before it can flatter blend_alpha below. ⚠ blend_alpha has since been
+    # burned; the ordering still matters, because its burn is evidence that the shader RUNS, not that
+    # every output byte is right.
     puts("[gate 1] blend_rect's burned hex, interpreted, vs blend_ref_px (integer, kernel's own)");
     var bad1 = 0; var n1 = 0; var first_bad = 0 - 1;
     var ia = 0;

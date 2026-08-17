@@ -1,24 +1,26 @@
 # blend_alpha.emit.cyr — the SOVEREIGN SOURCE for blend_alpha: blend_rect plus a uniform per-surface
 # alpha. 55 instructions, 69 dwords, 276 bytes. Reference listing: kernel/shaders/blend_alpha.s.
 #
-# ⛔⛔ THIS SHADER HAS NOT BEEN BURNED, AND THAT CHANGES WHAT THIS FILE IS.
-# blend_rect.emit.cyr is checked against COMMITTED, IRON-PROVEN hex — the bytes ran on archaemenid and
-# produced correct pixels, so byte-equivalence there is evidence about reality. blend_alpha has no such
-# hex. Its only oracles are host artifacts written the same week from the same arithmetic story, and
-# `scripts/check/shader-blob.sh:11-15` already records that an assembled-but-unrun blob "has not met
-# the bar for a hardware run". Everything below is a PREDICTION.
+# ⭐⭐ BURNED 2026-08-16 ON ARCHAEMENID (agnos 1.56.44), AND THAT CHANGES WHAT THIS FILE IS.
+# This header previously read "THIS SHADER HAS NOT BEEN BURNED … everything below is a PREDICTION",
+# and while that stood the file's only oracles were host artifacts written the same week from the same
+# arithmetic story. `gpu.cyr`'s `blend_alpha_write` has now DISPATCHED on hardware — `#89 gpu_caps` +28
+# reported 0x1FF5F, ring 3 reached `#92` op 0x06, and the compositor blended a translucent client
+# surface across 244 and 537 frames with no `GPO_E_*`. Those 69 dwords are iron-proven hex.
 #
-# ⭐ WHAT IS GENUINELY INDEPENDENT HERE, AND IT IS THE ONE THING WORTH TRUSTING: this emit list runs
-# through **mabda's encoder**, and `kernel/shaders/blend_alpha.s` runs through **llvm-mc**. Two
-# assemblers, neither derived from the other, must produce the same 69 dwords. That is a real check —
-# it is exactly the pairing agnos already relies on for the shaders it has burned.
+# ⭐ SO THE GATE MOVED, AND IT IS NOW THE STRONGER ONE. This emit list is checked by
+# `tests/gpu/shaderasm.cyr` against that committed hex — 69/69 dwords byte-identical, VGPR 13/14, SGPR
+# 21+1 == 22 exact — instead of by `shader-crossasm.sh`, which compared two host assemblers because
+# there was no hardware-backed expectation to compare to. `shader-crossasm.sh:43-45` states the
+# promotion rule; its `UNBURNED` list is now empty and asserts a partition rather than passing vacuously.
 #
-# ⛔ THE KERNEL DOES NOT INCLUDE THIS FILE and there is no committed `blend_alpha_write` yet. Adding
-# one is a later bite, gated on the burn.
+# ⚠ WHAT THE BURN DID NOT SETTLE: the rounding tie. 5,905 in-range premultiplied ties exist and RTNE vs
+# half-away differ on 3,010 outputs; nothing visible on a desktop distinguishes ±1 on a channel. RTNE
+# remains an ASSUMPTION, and a burn that shows a translucent window is not evidence about it.
 #
 # DERIVATION FROM blend_rect.emit.cyr — 9 inserted dwords, 5 CHANGED, 55 unchanged. Machine-checked by
 # NOTHING — `scripts/check/shader-derive.sh` was cited in five files and never written. The gates that do
-# exist are `shader-crossasm.sh` (two assemblers, 69/69) and `shaderexec.cyr` (executes the bytes). The
+# exist are `shaderasm.cyr` (emit list vs the burned hex) and `shaderexec.cyr` (executes the bytes). The
 # decomposition below is documentation, verified once by machine diff, not re-checked per build.
 #
 # ⚠⚠ THE FIFTH CHANGE IS THE ONE THAT BITES. Taking s7 for `alpha` pushes USER_SGPR 7 -> 8, moving the
