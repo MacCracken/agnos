@@ -20,7 +20,26 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
-## [1.56.45] — 2026-08-16 — cycle OPEN
+## [1.56.46] — 2026-08-17 — cycle OPEN
+
+### Changed — kashi clone fallback 1.0.5 -> **1.0.6**
+
+`scripts/build.sh` pins `KASHI_REF` for the case where the sibling checkout is absent — which is
+exactly CI. The manifest itself uses `path = "../kashi"` and always takes the sibling, so a stale
+`KASHI_REF` does not show up on a devbox at all: **CI silently builds the kernel against a different
+kashi than you do.** kashi 1.0.6 adds a publishable library face (`dist/kashi.cyr`); the freestanding
+core this kernel consumes is unchanged.
+
+⭐ **The kashi bump itself is byte-neutral** — rebuilt against 1.0.6 the kernel was still
+`6f8578cc4189ab9d`, 1,987,576 bytes, because 1.0.6 changed packaging, not glyph data, and this kernel
+takes only `src/font_data.cyr`.
+
+⚠ The shipped 1.56.46 binary is `6c557484a46a8526` — same 1,987,576 bytes, differing only in the
+embedded version string that `scripts/version-bump.sh --regen` writes into `kernel/version.cyr` and
+the `kernel/agnos.cyr` banner — **exactly 3 bytes differ** from the 1.56.45 build, measured with `cmp -l`. Stated separately so the kashi claim above is not read as covering a
+change it does not: no functional code moved in this cycle.
+
+## [1.56.45] — 2026-08-16 (RELEASED 2026-08-17)
 
 ### Changed — cyrius pin 6.5.21 -> **6.5.27**
 

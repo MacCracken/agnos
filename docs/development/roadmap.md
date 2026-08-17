@@ -3,7 +3,7 @@
 <!-- TOOLING ANCHOR: scripts/version-bump.sh seds ONLY the version numbers in `> **Current**: vX.Y.Z`
      and `Built with cyrius X.Y.Z`. Delete either anchor and that sed becomes a silent no-op. -->
 
-> **Current**: v1.56.45 — live state (kernel head, cyrius pin, active burn, sweeps, sizes) lives in [`state.md`](state.md).
+> **Current**: v1.56.46 — live state (kernel head, cyrius pin, active burn, sweeps, sizes) lives in [`state.md`](state.md).
 
 Forward-only. Shipped work is not narrated here: history is [`../../CHANGELOG.md`](../../CHANGELOG.md), live state is [`state.md`](state.md), the normative syscall contract is [`agnos-userland-abi.md`](agnos-userland-abi.md). **All GPU/display/HDMI work is one open release (1.56.x) and lives entirely in [`planning/gpu.md`](planning/gpu.md)** — plan, register facts, falsified record, remaining ladder. Do not re-narrate it here and do not open a second GPU doc. Ship milestones (beta/GA/maturity arc) live in the agnosticos roadmap. Language roadmap: `../../../cyrius/docs/development/roadmap.md`.
 
@@ -98,6 +98,6 @@ Not a burn question: whether `BENCHMARKS.md` and `bench-history.csv` are git-tra
 
 ---
 
-*Built with cyrius 6.5.21 · `VERSION` is the single source of truth for the kernel version; the Current line
+*Built with cyrius 6.5.27 · `VERSION` is the single source of truth for the kernel version; the Current line
 is maintained by `scripts/version-bump.sh`. At each arc close: delete the arc's forward-facing rows, let the
 CHANGELOG carry the history, and keep this file under ~120 lines. Per-cut prose does not belong here.*
