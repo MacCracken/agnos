@@ -10,7 +10,7 @@ language = "cyrius"
 # surface as a GPU bug. Raised 6.4.74 -> 6.4.78 at rung 9a to match cyrius.cyml at the repo root.
 # Raised 6.4.78 -> 6.5.20 and then -> 6.5.21 at 1.56.44, again to match the root — the root pin had
 # drifted three minors behind the installed cycc, and 6.5.21 landed before the cut closed.
-cyrius = "6.5.21"
+cyrius = "6.5.27"
 
 [build]
 src = "gpufill.cyr"

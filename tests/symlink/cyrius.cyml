@@ -5,7 +5,7 @@ description = "agnos symlink#63 round-trip exerciser — drives the cyrius sys_s
 license = "GPL-3.0-only"
 language = "cyrius"
 # The agnos symlink syscall peer landed cyrius 6.3.6; pin the current 6.3.9.
-cyrius = "6.3.9"
+cyrius = "6.5.27"
 
 [build]
 entry = "symtest.cyr"
