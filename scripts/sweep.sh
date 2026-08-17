@@ -111,6 +111,13 @@ run_gate "1.53.x FP-ring3 (real f64 in ring 3)" "FP_RING3_SELFTEST=1" "fp-ring3-
 run_gate "1.53.x FP-ctxsw (two-proc XMM preservation)" "FP_CTXSW_SELFTEST=1" "fp-ctxsw-smoke.sh"
 run_gate "1.53.x naad-ring3 (real DSP library f64 in ring 3, arc end-proof)" "NAAD_RING3_SELFTEST=1" "naad-ring3-smoke.sh"
 
+# --- 1.56.45 the console's live line: an async log must not alter what the operator is typing ---
+# ⛔ THE ONLY FRAMEBUFFER-ORACLE GATE IN THIS SWEEP, and it has to be. The defect it guards is INVISIBLE
+# in serial — a log line and a typed line are just two ordered writes there — which is exactly how it was
+# once diagnosed from a serial log and ruled "working as intended". Only the fb has a cursor to corrupt.
+# ⚠ Plain production build (no selftest env): the stimulus is a real USB mouse one-shot, not a hook.
+run_gate "1.56.45 console live line (async log vs. the typed prompt, FB oracle)" "" "console-line-smoke.sh"
+
 # --- Restore the plain production build as the working artifact ---
 echo ""
 echo "Restoring plain production build..."

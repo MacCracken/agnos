@@ -680,6 +680,10 @@ fn kbd_read_blocking(buf, count) {
         } elif (ch > 31) {              # Printable: store + echo (shell.cyr:800-805)
             store8(buf + n, ch);
             n = n + 1;
+            # ⭐ The operator now has an unsubmitted line on the glass, so an asynchronous log must
+            # save-erase-replay around it instead of appending to it. See `fb_line_live` in
+            # arch/x86_64/fb_console.cyr — it is cleared automatically when the newline is echoed.
+            fb_line_live = 1;
             kputc(ch);
         }
         # ch == 0 (modifier/release) or other control (<32, non-LF/BS): consumed
@@ -756,6 +760,7 @@ fn kbd_read_nonblock(buf, count) {
                     if (nbline_pos < 4095) {         # nbline_buf capacity (512 u64 = 4096 B)
                         store8(&nbline_buf + nbline_pos, ch);
                         nbline_pos = nbline_pos + 1;
+                        fb_line_live = 1;            # see the twin site above / fb_line_live
                         kputc(ch);
                     }
                 }

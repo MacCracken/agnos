@@ -39,9 +39,34 @@ first typing at the prompt. Latched by `hid_first_report` (`hid.cyr:63`), never 
 **Why it lands mid-prompt**: `kprintln` (`kprint.cyr:37-45`) fans out to serial + framebuffer + klug with
 no userland-aware branch, and `fb_println` paints at the live cursor. There is one console cursor and two
 writers — the kernel, and ring 3 via `write(1)` → `devs.cyr:71` → `kprint`. So the line is appended to
-`[ASSIST] > `. ⭐ **This is working as intended and should not be "fixed":** a boot-phase mute would hide
-exactly the lines you need when a session goes wrong. The defect is the *locking* of that print (#1), not
-its content or its timing.
+`[ASSIST] > `.
+
+⛔⛔ **THE RULING THAT USED TO SIT HERE WAS WRONG AND IT WAS REVERSED 2026-08-16.** It read: *"⭐ This is
+working as intended and should not be 'fixed': a boot-phase mute would hide exactly the lines you need
+when a session goes wrong. The defect is the locking of that print (#1), not its content or its timing."*
+
+**That is a false dichotomy.** The choice was never *corrupt the line* vs *mute the log* — there is a
+third option every line editor on every OS has used for forty years: **save the line, erase it, print the
+log, replay it.** Every byte still reaches serial, klug and the screen, in order; the operator's command
+survives; nothing is muted, deferred, or hidden. The argument for "as intended" defended a property
+(never hide a log) that the fix does not threaten.
+
+⚠ **The operator had already said it was a defect**, and it took two more months and an explicit *"I TOLD
+YOU TO FIX IT"* to overturn a paragraph that had ruled the report closed. ⇒ A finding that contradicts the
+operator's own experience of using the machine needs a much higher bar than one that agrees with it.
+
+**Fixed at 1.56.45**: `fb_console.cyr` keeps the current row's drawn bytes (`fb_line_buf`, 512 B, tracked
+at the DRAW so it matches the glass), and `fb_oob_begin`/`fb_oob_end` erase and replay around the fb write
+inside `kprint` **and** `kprintln`. Framebuffer only — serial and klug are cursorless transcripts and
+replaying into them would print the prompt twice. `kputc` is deliberately unwrapped: it carries the
+keystroke echo, which is part of the line rather than an interruption.
+
+**Gated by `scripts/harness/console-line-preserve-test.py`** (sweep: *console live line*), which types a
+partial command, fires the mouse one-shot while it is on screen, and requires the last console row to be
+pixel-identical before and after. ⛔ It is a **framebuffer** oracle because it has to be: in serial the
+log and the typed line are two ordered writes and look correct — **which is how this defect was diagnosed
+from a serial log and mis-ruled in the first place.** Mutation-tested: reverting the `kprintln` wrap makes
+it fail with 10,296 differing bytes.
 
 **The with-mouse / without-mouse difference**: irrelevant to the line seen (identical in both boots, and
 it comes from the keyboard). It matters for one thing only, and that thing is valuable — it is a clean

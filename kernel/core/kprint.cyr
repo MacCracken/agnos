@@ -25,10 +25,20 @@ fn kputc(ch) {
     return 0;
 }
 
+# ⭐⭐ THESE TWO SAVE-ERASE-REPLAY THE OPERATOR'S HALF-TYPED LINE. See the live-line banner in
+# `arch/x86_64/fb_console.cyr`. ⛔ THE FB ONLY: `serial_*` and `klug_*` are transcripts with no cursor,
+# and replaying into them would print the prompt twice and corrupt the log this console exists to keep.
+# ⚠ `kputc` below is deliberately NOT wrapped — it carries the keystroke ECHO, which is part of the line
+# being typed rather than something interrupting it. Wrapping it would erase and replay the line on every
+# single character.
+# ⚠ Both are wrapped, not just `kprintln`: ring 3 reaches the console through `kprint`
+# (`devs.cyr:71` → `write(1)`), so a second process printing while the operator types is the same defect.
 fn kprint(buf, len) {
     console_spin_lock();
     serial_print(buf, len);
+    var held = fb_oob_begin();
     fb_print(buf, len);
+    fb_oob_end(held);
     klug_append(buf, len);
     console_spin_unlock();
     return 0;
@@ -37,7 +47,9 @@ fn kprint(buf, len) {
 fn kprintln(buf, len) {
     console_spin_lock();
     serial_println(buf, len);
+    var held = fb_oob_begin();
     fb_println(buf, len);
+    fb_oob_end(held);
     klug_append(buf, len);    # capture the line + the newline serial/fb_println add
     klug_putc(10);
     console_spin_unlock();

@@ -1024,6 +1024,92 @@ fn fb_defer_rescue() {
     kprintln("fb: geometry unverified -- painting at boot_info geometry", 57);
     return 0;
 }
+# ============================================================================================
+# ⭐⭐ THE LIVE LINE — so an asynchronous log never eats what the operator is typing
+# ============================================================================================
+# ⛔⛔ THIS WAS RULED "WORKING AS INTENDED" AND THAT RULING WAS WRONG.
+# `issues/2026-08-11-hid-drain-rearm-and-isr-console-lock.md` explained why a one-shot lands mid-prompt
+# and then closed the question: *"This is working as intended and should not be fixed: a boot-phase mute
+# would hide exactly the lines you need when a session goes wrong."* ⚠ THE MUTE WAS A STRAW MAN — it was
+# never the only alternative, and the operator had already said so. What the operator actually sees is
+# their own command destroyed mid-keystroke:
+#     [ASSIST] > ahid: first mouse report accumulated
+#     ether      aethersafha --opacity 128 --client /present_probe
+# The `a` of `aethersafha` is stranded before the log and the rest resumes on the next row.
+#
+# ⭐ THE THIRD OPTION LOSES NOTHING, and it is what every line editor on every OS does: SAVE the line,
+# ERASE it, print the log, REPLAY it. Every log byte still reaches serial, klug and the screen in order;
+# the typed line survives; nothing is muted, deferred or hidden.
+#
+# ⛔ CAPTURE IS FRAMEBUFFER-ONLY, ON PURPOSE. serial and klug are TRANSCRIPTS with no cursor — replaying
+# there would print the prompt twice in the log and corrupt the very evidence this console exists to
+# preserve. Only the fb has a cursor, so only the fb erases and replays.
+# ⚠ It follows the DRAW, not the byte: `fb_defer` and `fb_console_ready` gate both, so the buffer always
+# describes what is actually on the glass. A capture that ran while the draw was deferred would replay a
+# line the screen never showed.
+var FB_LINE_MAX = 512;      # 2560 px / 8 px per cell = 320 columns at scale 1; 512 is headroom
+var fb_line_buf[64];        # module scope => 64 x u64 = 512 BYTES, addressed with store8/load8
+var fb_line_n = 0;          # bytes drawn on the current row since the last newline / CR
+var fb_line_hold = 0;       # 1 = do not capture: we are printing out-of-band, or replaying
+# ⛔⛔ 1 = THE OPERATOR IS MID-LINE. Set by the two line-read echo sites in `core/syscall.cyr`, cleared
+# the moment a newline is drawn. **Erase-and-replay happens ONLY when this is 1**, and that gate is not
+# an optimisation — without it the fix is a severe REGRESSION, caught by the sweep on its first run:
+#   `kprint_num` calls `kprint`, so a kernel line like "  PASS: n of m" is assembled from ~4 separate
+#   kprint calls. Erasing and replaying on each one turns an O(len) line into O(calls x len) glyph
+#   draws — at scale 2 that is ~1024 pixel stores PER CHARACTER, per call. The `#92` ABI battery
+#   (167 cases) starved and its verdict never printed: sweep went 19/19 -> 18/1.
+# ⇒ A kernel line under construction is a CONTINUATION, not an interruption. Only a line the OPERATOR
+# is typing can be interrupted, and only the line-read loops know that is happening.
+var fb_line_live = 0;
+
+# Record one drawn byte. Mirrors exactly what `fb_putc` does to the cursor below.
+fn fb_line_note(ch): i64 {
+    if (fb_line_hold != 0) { return 0; }
+    # ⚠ A drawn newline ENDS the operator's line as well as the row — Enter echoes one. Clearing `live`
+    # here rather than in the syscall keeps the two facts in one place and cannot drift.
+    if (ch == 10) { fb_line_n = 0; fb_line_live = 0; return 0; }   # newline: the row is finished
+    if (ch == 13) { fb_line_n = 0; fb_line_live = 0; return 0; }   # CR: the row is being overwritten
+    if (ch == 8) {                                      # backspace: the editor rubbed a char out
+        if (fb_line_n > 0) { fb_line_n = fb_line_n - 1; }
+        return 0;
+    }
+    if (ch < 0x20) { return 0; }
+    if (ch > 0x7F) { return 0; }
+    # ⚠ OVERFLOW DROPS THE TAIL RATHER THAN WRAPPING. A wrapped ring would replay the line out of order,
+    # which is worse than a long line replaying short. 512 B is past the widest console row.
+    if (fb_line_n >= FB_LINE_MAX) { return 0; }
+    store8(&fb_line_buf + fb_line_n, ch & 0xFF);
+    fb_line_n = fb_line_n + 1;
+    return 0;
+}
+
+# Called by `kprint`/`kprintln` INSIDE the console lock, before the fb write. -> 1 if a line was erased
+# and `fb_oob_end` must replay it, 0 if there was nothing on the row.
+fn fb_oob_begin(): i64 {
+    if (fb_console_ready == 0) { return 0; }
+    # ⛔ THE COST GATE. Nothing happens unless the operator is mid-line — see `fb_line_live`. A kernel
+    # line built from several `kprint` calls must NOT erase and replay between them.
+    if (fb_line_live == 0) { return 0; }
+    if (fb_line_n == 0) { return 0; }
+    fb_line_hold = 1;                       # the erase and the log must not be captured
+    var back = fb_cur_x;
+    fb_cur_x = 0;
+    for (var i = 0; i < back; i = i + 1) { fb_putc(32); }   # blank the row's cells
+    fb_cur_x = 0;
+    return 1;
+}
+
+# Replay the saved line so the operator's cursor lands exactly where it was.
+fn fb_oob_end(did): i64 {
+    if (did == 0) { fb_line_hold = 0; return 0; }
+    # ⚠ `kprint` (no trailing newline) can leave the cursor mid-row; the replay needs its own row or it
+    # would append the prompt to the log line — the defect, inverted.
+    if (fb_cur_x != 0) { fb_putc(10); }
+    for (var i = 0; i < fb_line_n; i = i + 1) { fb_putc(load8(&fb_line_buf + i)); }
+    fb_line_hold = 0;
+    return 0;
+}
+
 fn fb_putc(ch) {
     if (fb_console_ready == 0) { return 0; }
     # Deferred: the byte is already in serial + klug (kprint tapped it before reaching here). Dropping the
@@ -1032,6 +1118,9 @@ fn fb_putc(ch) {
     # ANSI/CSI interception (1.43.1): consume ESC + CSI bytes (colour, clear,
     # cursor). Returns 1 when the byte was part of a sequence → nothing to draw.
     if (fb_ansi_feed(ch) == 1) { return 0; }
+    # ⭐ CAPTURE HERE, past the defer and ANSI gates, so the buffer tracks what actually reaches the
+    # glass — see the live-line banner above. Cheap: a compare and a store8 per drawn byte.
+    fb_line_note(ch);
     var fb = fb_draw_base();
     if (fb == 0) { return 0; }
     var pitch = fb_pitch();

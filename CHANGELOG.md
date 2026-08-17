@@ -22,7 +22,46 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.45] — 2026-08-16 — cycle OPEN
 
-No new work has been started in this cut.
+### Fixed — an asynchronous log no longer eats the line the operator is typing
+
+⛔⛔ **The signature, from the 1.56.45 burn.** A one-shot landed inside a command as it was typed:
+
+```
+[ASSIST] > ahid: first mouse report accumulated
+ether      aethersafha --opacity 128 --client /present_probe
+```
+
+The `a` of `aethersafha` is stranded before the log and the rest resumes on the next row.
+
+**`fb_console.cyr` now keeps the current row's drawn bytes** (`fb_line_buf`, 512 B, recorded at the DRAW
+so it always matches the glass), and `fb_oob_begin`/`fb_oob_end` **save, erase, print, replay** around the
+framebuffer write in `kprint` and `kprintln`. ⚠ Framebuffer ONLY — `serial` and `klug` are cursorless
+transcripts, and replaying into them would print the prompt twice and corrupt the log. `kputc` is
+deliberately unwrapped: it carries the keystroke echo, which is part of the line, not an interruption.
+Both `kprint` and `kprintln` are wrapped, because ring 3 reaches the console through `kprint`
+(`devs.cyr:71`), so a second process printing over the operator's typing is the same defect.
+
+⛔ **This was previously ruled "working as intended" and that ruling is reversed.**
+`issues/2026-08-11-hid-drain-rearm-and-isr-console-lock.md` argued a fix would mean muting logs at boot.
+It would not: save-erase-replay hides nothing and defers nothing. The ticket is corrected in place.
+
+### Added — `console-line-preserve-test.py`, the sweep's first FRAMEBUFFER oracle (gate 19)
+
+Types a partial command at the prompt, fires the mouse one-shot **while it is on screen**, and requires
+the last console row to be **pixel-identical** before and after — the row is expected to move, so content
+is compared, not position. No glyph decoding: OCR would need a second copy of the kashi font in Python,
+which is the "two implementations of the same idea" trap.
+
+⛔ **It must be a framebuffer oracle.** In serial a log line and a typed line are two ordered writes and
+look perfectly correct — **which is exactly how this defect was diagnosed from a serial log and mis-ruled
+for two months.** Mutation-tested: reverting the `kprintln` wrap fails it with 10,296 differing bytes.
+⚠ Two non-vacuity gates: the one-shot must actually have fired (else INCONCLUSIVE, never a pass), and the
+framebuffer must have changed at all (else a kernel that dropped the log entirely would pass). The
+row-COUNT check that seemed obvious is wrong and was red on first run — the console is already scrolling
+by the time the prompt appears (57 text rows, last row pinned at 63 of 64), so a printed line shifts the
+screen up and never changes the count.
+
+### Nothing else has been started in this cut.
 
 ⚠ Edits carrying this version exist, and they are all consequences of the 1.56.44 burn rather than new
 work: six sites across `kernel/core/`, `kernel/shaders/`, `tests/gpu/` and `scripts/check/` asserted
