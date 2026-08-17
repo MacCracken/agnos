@@ -622,6 +622,10 @@ fn fault_kill_current(vector) {
 # ring-3 syscall since 1.41.12, so it renders under the unified exec CR3 on iron.
 fn kbd_read_blocking(buf, count) {
     if (count <= 0) { return 0; }
+    # ⛔ SAME RULE AS THE NON-BLOCKING TWIN (see its entry banner): the operator's line is LIVE from the
+    # moment something is reading it, not from the first echo. The one-shot that corrupts a prompt fires
+    # before the first key is echoed, so a flag set at the echo is always too late.
+    fb_line_live = 1;
     preempt_disable();         # 1.44.1: suspend preemption for the whole line read.
     # The timer ISR still EOIs + ticks, but do_context_switch is a no-op while
     # preempt_count>0. Replaces the old `sched_active=0`/save+restore toggle: the
@@ -680,10 +684,6 @@ fn kbd_read_blocking(buf, count) {
         } elif (ch > 31) {              # Printable: store + echo (shell.cyr:800-805)
             store8(buf + n, ch);
             n = n + 1;
-            # ⭐ The operator now has an unsubmitted line on the glass, so an asynchronous log must
-            # save-erase-replay around it instead of appending to it. See `fb_line_live` in
-            # arch/x86_64/fb_console.cyr — it is cleared automatically when the newline is echoed.
-            fb_line_live = 1;
             kputc(ch);
         }
         # ch == 0 (modifier/release) or other control (<32, non-LF/BS): consumed
@@ -711,6 +711,19 @@ fn kbd_read_nonblock(buf, count) {
     kbd_irq_enable();              # IF=1 so the xHCI MSI-X (vector 0x51) / 100 Hz tick can drive hid_poll.
     if (nbline_pos == 0) { kb_shift = 0; kb_ctrl = 0; }   # clean modifiers ONLY at a fresh line
     # (never mid-line — a shift HELD across a poll boundary must survive into the next drain).
+    # ⛔⛔ THE LINE IS LIVE FROM THE MOMENT SOMEONE IS READING IT, NOT FROM THE FIRST ECHO — and getting
+    # that wrong shipped a fix that did nothing on iron. `fb_line_live` used to be set beside the echo
+    # `kputc(ch)` below. But the one-shot that actually corrupts the prompt, `hid: first keyboard report
+    # dispatched`, fires when the first REPORT arrives — strictly BEFORE that key is cooked and echoed —
+    # so the flag was still 0 at print time and the save-erase-replay never ran. Measured on the 1.56.45
+    # burn: `[ASSIST] > hid: first keyboard report dispatched...` with the typed word on the next row,
+    # i.e. the exact defect, unchanged.
+    # ⇒ Setting it HERE means the prompt is protected from the instant agnsh starts polling, which is
+    # before any key can arrive. Idempotent: agnsh calls this continuously at the prompt.
+    # ⚠ Still cheap, and the perf guard still holds: a foreground `run` does NOT poll (agnsh uses
+    # exec_and_wait), so a child's output — the `#92` battery's 167 multi-`kprint` lines — never sees a
+    # live line. The bounded cost is a prompt-length replay while the shell is idle or a bg job prints.
+    fb_line_live = 1;
     var ret = 0 - 2;               # default WOULD_BLOCK — NOT 0 (0 is reserved for Ctrl-D EOF).
     var draining = 1;
     while (draining == 1) {
@@ -760,7 +773,6 @@ fn kbd_read_nonblock(buf, count) {
                     if (nbline_pos < 4095) {         # nbline_buf capacity (512 u64 = 4096 B)
                         store8(&nbline_buf + nbline_pos, ch);
                         nbline_pos = nbline_pos + 1;
-                        fb_line_live = 1;            # see the twin site above / fb_line_live
                         kputc(ch);
                     }
                 }

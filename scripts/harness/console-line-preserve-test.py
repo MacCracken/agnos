@@ -13,22 +13,24 @@
 # serial log and ruled it *"working as intended"*. **The corruption exists only on the framebuffer,
 # because only the framebuffer has a cursor.** So the oracle has to be the framebuffer.
 #
-# ⭐⭐ THE ASSERTION IS PIXEL EQUALITY, NOT OCR, and that is deliberate. Decoding glyphs would need a
-# second copy of the kashi font in Python — a private reimplementation of the thing under test, i.e.
-# the "two implementations of the same idea" trap agnos gpu.md §2.1 names. Instead:
+# ⭐⭐ THE ASSERTION ANCHORS ON THE PROMPT, PIXEL-EXACT, AND NEEDS NO FONT.
+# Decoding glyphs would need a second copy of the kashi font in Python — a private reimplementation of
+# the thing under test (agnos gpu.md §2.1's "two implementations of the same idea"). Instead:
 #
-#     1. type a partial command at the prompt (NO Enter) — the line is live on screen
-#     2. screendump  -> BEFORE
-#     3. move the mouse, which fires `hid: first mouse report accumulated` while that line is displayed
-#     4. screendump  -> AFTER
-#     5. the LAST NON-EMPTY console row must be PIXEL-IDENTICAL in both
+#     1. boot to a VIRGIN prompt, screendump  -> PROMPT. Its last text row is `[ASSIST] > ` and
+#        nothing else; measure how many cells that occupies (P).
+#     2. type a word. The FIRST keystroke fires `hid: first keyboard report dispatched`.
+#     3. screendump -> AFTER.
+#     4. the last text row of AFTER must begin with those SAME P cells, pixel-identical, and carry
+#        MORE ink after them (the typed word).
 #
-# The row is expected to MOVE (the log is printed above it), so the test compares the row's CONTENT, not
-# its position. That is precisely the property: the log may take screen space, it may not take my line.
-#
-# ⚠ WHAT THIS DOES NOT PROVE: that the log line itself is present and legible. That is asserted
-# separately and weakly (a new non-empty row appeared). Serial already proves the text; this file exists
-# for the cursor interaction alone.
+# ⛔ WHY THE PROMPT IS THE ANCHOR. Broken, the row reads `[ASSIST] > hid: first keyboard report ...` and
+# the typed word is pushed to the NEXT row — so the last text row starts with the WORD, not the prompt,
+# and the leading cells differ. Fixed, the log takes its own row above and the last row is
+# `[ASSIST] > <word>`. One comparison separates them.
+# ⚠ It deliberately does NOT retype to build a "before" image: QEMU drops the first character of the
+# FIRST typed line (agnsh-type-test.py documents it), so two typings produce two different strings and a
+# pixel compare between them would fail for a reason that has nothing to do with the defect.
 #
 # Exit 0 = the line survived. Exit 1 = it was altered. Exit 2 = the run could not be set up.
 import os, socket, subprocess, sys, time
@@ -147,22 +149,23 @@ try:
             s.sendall(("sendkey " + km.get(ch, ch) + "\n").encode())
             time.sleep(settle); drain()
 
-    # ⚠ PRIME WITH A BARE ENTER. QEMU drops the first character of the first typed line (documented in
-    # agnsh-type-test.py: `help` arrives as `elp`; emulation-only, iron has never shown it). The prime
-    # also burns the KEYBOARD one-shot, so the only log left to fire is the mouse one — which is what
-    # this test wants to control.
-    typ("\n"); time.sleep(1.5)
-
-    typ(TYPED); time.sleep(1.5)
+    # ⛔⛔ NO PRIMING ENTER, AND THAT IS THE WHOLE POINT.
+    # The first version of this harness typed a bare Enter first — which BURNED the keyboard one-shot
+    # before the real typing — and then used the MOUSE one-shot as the stimulus. It passed, and the fix
+    # it guarded did NOTHING on iron (1.56.45 burn: `[ASSIST] > hid: first keyboard report dispatched...`
+    # with the typed word on the next row). ⚠ The two one-shots are NOT interchangeable:
+    #   · `first mouse report accumulated` fires on motion, AFTER the operator has typed — the line is
+    #     already echoed, so any "is a line on screen" test is trivially satisfied.
+    #   · `first keyboard report dispatched` fires when the first REPORT arrives, BEFORE that key is
+    #     cooked and echoed. It lands on a bare prompt, and it is the one the operator hit — twice.
+    # ⇒ A harness that primes away the hard stimulus and measures the easy one is not a weaker gate, it
+    # is the WRONG gate. Type onto a virgin prompt and let the keyboard one-shot land where it lands.
     s.sendall((f"screendump {SHOT_BEFORE}\n").encode()); time.sleep(2.5); drain()
-
     mark = len(ser())
-    for _ in range(14):
-        s.sendall(b"mouse_move 9 6\n"); time.sleep(0.12); drain()
-    time.sleep(2.0)
+    typ(TYPED); time.sleep(2.5)
     s.sendall((f"screendump {SHOT_AFTER}\n").encode()); time.sleep(2.5); drain()
-    fired = "first mouse report accumulated" in ser()[mark:]
-    p("mouse one-shot fired while the line was live:", fired)
+    fired = "first keyboard report dispatched" in ser()[mark:]
+    p("keyboard one-shot fired on the first keystroke:", fired)
 
     b = read_ppm(SHOT_BEFORE); a = read_ppm(SHOT_AFTER)
     if b is None or a is None: p("FAIL: could not read a screendump"); sys.exit(2)
@@ -183,30 +186,60 @@ try:
         p("INCONCLUSIVE: the mouse one-shot never fired, so nothing interrupted the line — nothing tested")
         sys.exit(2)
 
-    # ⛔ NON-VACUITY GATE #2 — the SCREEN must have changed. Without this the whole test passes on a
-    # kernel that dropped the log entirely (the "boot-phase mute" this fix exists NOT to be), because an
-    # unchanged screen trivially has an unchanged line.
-    # ⚠ NOT "a row was added": measured 2026-08-16, the console is already SCROLLING by the time the
-    # shell prompt appears (57 text rows, last text row pinned at 63 of 64), so printing a line shifts
-    # the screen up and the row COUNT never moves. A row-count check would be permanently red here and
-    # was, on the first run of this harness. Whole-framebuffer inequality is scroll-agnostic and is the
-    # honest form of "something was printed".
+    # ⛔ NON-VACUITY GATE #2 — the SCREEN must have changed. Without it the test passes on a kernel that
+    # dropped the log entirely (the "boot-phase mute" this fix exists NOT to be), because an unchanged
+    # screen trivially has an unchanged prompt. ⚠ Not "a row was added": the console is already SCROLLING
+    # at the prompt (57 of 64 rows, last row pinned at 63), so a printed line shifts the screen up and the
+    # row COUNT never moves — a row-count check was red on this harness's first run.
     if bd == ad:
-        p("FAIL: the framebuffer is byte-identical before and after — the log never reached the screen")
+        p("FAIL: the framebuffer is byte-identical before and after — nothing was printed and nothing typed")
         rc = 1; sys.exit(1)
 
-    # ⭐ THE ASSERTION. Same content, wherever it now sits.
-    band_b = row_band(bw, bh, bd, rb, sc)
-    band_a = row_band(aw, ah, ad, ra, sc)
-    if band_b == band_a:
-        p(f"PASS: the typed line is pixel-identical after the log (moved row {rb} -> {ra})")
-        rc = 0
-    else:
-        diff = sum(1 for x, y in zip(band_b, band_a) if x != y)
-        p(f"FAIL: the log ALTERED the operator's line — {diff} bytes differ in the last text row")
-        p("      (this is the 1.56.45 signature: the log is appended to the prompt and the")
-        p("       remainder of the typed command is pushed onto the following row)")
+    # ⭐ THE ASSERTION. Measure the virgin prompt's width in CELLS, then require the post-typing row to
+    # start with exactly those cells.
+    cw = CELL_W * sc
+    ncols = bw // cw
+    def cell_ink(w, h, data, r, c, s_):
+        chh = CELL_H * s_
+        y0 = FB_CONSOLE_Y0 + r * chh
+        for y in range(y0, y0 + chh):
+            base = (y * w + c * cw) * 3
+            if any(v > 24 for v in data[base:base + cw * 3]): return True
+        return False
+    def cell_bytes(w, h, data, r, c, s_):
+        chh = CELL_H * s_
+        y0 = FB_CONSOLE_Y0 + r * chh
+        out = bytearray()
+        for y in range(y0, y0 + chh):
+            base = (y * w + c * cw) * 3
+            out += data[base:base + cw * 3]
+        return bytes(out)
+
+    P = 0
+    for c in range(ncols):
+        if cell_ink(bw, bh, bd, rb, c, sc): P = c + 1
+    ink_after = 0
+    for c in range(ncols):
+        if cell_ink(aw, ah, ad, ra, c, sc): ink_after = c + 1
+    p(f"prompt occupies {P} cells; the post-typing row carries ink out to {ink_after}")
+    if P < 4:
+        p("INCONCLUSIVE: no prompt found on the virgin row — the shell was not at a prompt"); sys.exit(2)
+
+    mismatch = -1
+    for c in range(P):
+        if cell_bytes(bw, bh, bd, rb, c, sc) != cell_bytes(aw, ah, ad, ra, c, sc):
+            mismatch = c; break
+    if mismatch >= 0:
+        p(f"FAIL: the log ALTERED the operator's line — cell {mismatch} of the last text row differs")
+        p("      the row no longer starts with the prompt, i.e. the log was appended to it and the")
+        p("      typed text was pushed onto the following row (the 1.56.45 iron signature)")
         rc = 1
+    elif ink_after <= P:
+        p(f"FAIL: the prompt survived but nothing was typed after it (ink {ink_after} <= prompt {P})")
+        rc = 1
+    else:
+        p(f"PASS: the row still starts with the prompt and carries the typed text ({P} -> {ink_after} cells)")
+        rc = 0
     s.sendall(b"quit\n"); time.sleep(0.3)
 finally:
     try: qemu.terminate(); qemu.wait(timeout=5)
