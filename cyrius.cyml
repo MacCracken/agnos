@@ -26,7 +26,7 @@ language = "cyrius"
 # immediately, so the pin was stale again within the day. Bumped rather than tolerated, which is the
 # whole point of the note above. ⭐ build/agnos is BYTE-IDENTICAL across 6.5.20 -> 6.5.21
 # (1,980,696 B / 6c256bc6...), so the span changed no codegen this kernel reaches.
-cyrius = "6.5.27"
+cyrius = "6.5.28"
 
 [build]
 entry = "kernel/agnos.cyr"

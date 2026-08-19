@@ -22,6 +22,42 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.46] — 2026-08-17 — cycle OPEN
 
+### Changed — cyrius pin 6.5.27 -> **6.5.28**; 9 kernel files reformatted
+
+`cyrfmt` did not track parentheses before 6.5.28: continuation lines inside an unclosed `(` were
+emitted at the enclosing statement's indent, so the formatter's own output failed its own
+`--check` — exit 1 with no file, no line, no diff. Canonical is now **2 spaces per open-paren
+level**, 4 accepted, deeper rejected.
+
+Reformatted, whitespace only (`git diff -w` is empty), 137 lines each way:
+`kernel/core/{virtio_net,virtio_blk,gpu,ext2,syscall}.cyr`,
+`kernel/arch/x86_64/usb/{xhci,hid,msc,xhci_ctx}.cyr`.
+
+x86_64 kernel **1,987,576 B**, multiboot2 ELF64 OK, entry `0x1000a8`. `scripts/test.sh` 4/0;
+syscall-abi, dup-symbols, kprint-len, array-sizing all PASS; boot to agnsh with xhci + hid + ext2 +
+gpu live and no fault. The pin is what CI installs (`cyrius.cyml` is the source of truth), so the
+bump and the reformat are one change: 6.5.27's checker does not accept 6.5.28's output.
+
+### Fixed — `scripts/check/fmt-fix.sh` rewrote files it then reported as failures
+
+⚠ BREAKING in cyrius 6.5.28: `cyrius fmt <f>` REWRITES THE FILE and prints nothing; `--dry` is the
+old stdout form. The body here was `cyrius fmt "$f" > "$tmp"`, so under 6.5.28 it rewrote `$f` as a
+side effect, left `$tmp` empty, failed the `[ -s "$tmp" ]` guard, and printed
+`ERROR: could not format` for a file it had already changed. Now formats in place against a
+backup copy and rolls back if the result fails `--check`.
+
+### Fixed — `scripts/build.sh --aarch64` probed a binary name dropped at cyrius v6.1.0
+
+`CC_ARM` was `$CYRIUS_HOME/bin/cc5_aarch64`. The backend was renamed to `cycc_aarch64` at v6.0.0
+and the back-compat symlink dropped at v6.1.0, so every aarch64 build since exited
+`ERROR: aarch64 cross-compiler not in toolchain` while the compiler sat in that same directory
+under its current name. Prefers `cycc_aarch64`, accepts the legacy name.
+
+⚠ `release.yml` wraps this build in `|| echo "aarch64 not yet portable"`, so the failure never
+surfaced. With the probe fixed the target compiles and reports its real state: **30 reachable
+undefined functions** (`ntp_now`, `exec_env_src_set`, `exec_env_len_set`, …) — x86-only symbols
+that accumulated with no aarch64 stub while the target could not be built. Not addressed here.
+
 ### Changed — kashi clone fallback 1.0.5 -> **1.0.6**
 
 `scripts/build.sh` pins `KASHI_REF` for the case where the sibling checkout is absent — which is

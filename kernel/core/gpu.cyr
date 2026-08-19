@@ -1145,11 +1145,11 @@ fn gpu_tper_prep_selftest() {
     # two triangles: a modest one, and one at the coordinate ceiling with w at its FLOOR so C_D is
     # driven past a 32-bit field and the residue argument is actually exercised.
     tper_vtx(0,   0,  0, 1024,        0,        0,
-    32,  0, 1024, 32*65536,        0,
-    0, 32, 4096,        0, 32*65536);
+      32,  0, 1024, 32*65536,        0,
+      0, 32, 4096,        0, 32*65536);
     tper_vtx(1,   0, 2040,  256,  1234567,  7654321,
-    4088, 2040,  256, 98765432, 12345678,
-    2048,    8,  256, 55555555, 44444444);
+      4088, 2040,  256, 98765432, 12345678,
+      2048,    8,  256, 55555555, 44444444);
     if (gpu_tper_prep_build(&tper_prep_buf, &tper_vtx_buf, 2, dx, dy) != 1) {
         kprintln("tper-prep: FAIL -- prep refused a well-formed triangle", 54);
         return 0;
@@ -1256,15 +1256,15 @@ fn gpu_trid_prep_check(t, dx, dy, lx, ly) {
 
     var ra = trid_lane(load32(rec + 36) & 0xFFFFFFFF);
     var w0 = trid_lane((load32(rec +  0) & 0xFFFFFFFF) * lxq
-    + (load32(rec +  4) & 0xFFFFFFFF) * lyq
-    + (load32(rec +  8) & 0xFFFFFFFF));
+      + (load32(rec +  4) & 0xFFFFFFFF) * lyq
+      + (load32(rec +  8) & 0xFFFFFFFF));
     var w1 = trid_lane((load32(rec + 12) & 0xFFFFFFFF) * lxq
-    + (load32(rec + 16) & 0xFFFFFFFF) * lyq
-    + (load32(rec + 20) & 0xFFFFFFFF));
+      + (load32(rec + 16) & 0xFFFFFFFF) * lyq
+      + (load32(rec + 20) & 0xFFFFFFFF));
     var w2 = trid_lane(ra - w0 - w1);
     var zl = trid_lane((load32(rec + 24) & 0xFFFFFFFF) * lxq
-    + (load32(rec + 28) & 0xFFFFFFFF) * lyq
-    + (load32(rec + 32) & 0xFFFFFFFF));
+      + (load32(rec + 28) & 0xFFFFFFFF) * lyq
+      + (load32(rec + 32) & 0xFFFFFFFF));
     # P4 / P1 / P2
     if (ra <= 0)  { return 1; }
     if (w0 != e0) { return 2; }
@@ -1314,7 +1314,7 @@ fn gpu_trid_prep_selftest() {
         return 0;
     }
     if (gpu_trid_prep_build(&trid_prep_buf + 3 * GPU_TRID_PREP_STRIDE,
-    &trid_vtx_buf  + 3 * GPU_TRID_VTX_BYTES, 1, dx3, dy3) != 1) {
+        &trid_vtx_buf  + 3 * GPU_TRID_VTX_BYTES, 1, dx3, dy3) != 1) {
         kprintln("trid-prep: FAIL -- prep refused the off-origin triangle", 55);
         return 0;
     }
@@ -1589,9 +1589,9 @@ fn gpu_tri_persp(rec, vkva) {
     var saved_batch = gpu_batch_active;
     gpu_batch_active = 0;
     var rc = gpu_blend_cov_run(gpu_arena_mc + GPU_TPER_SHADER_SUBOFF, pbase_mc, dst_mc,
-    nt, gpu_bb_pitch, w, h, GPU_COMPUTE_PGM_RSRC1_TPER, tiles_x, tiles_y,
-    gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
-    gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+      nt, gpu_bb_pitch, w, h, GPU_COMPUTE_PGM_RSRC1_TPER, tiles_x, tiles_y,
+      gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
+      gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
     gpu_batch_active = saved_batch;
     return rc;
 }
@@ -1671,9 +1671,9 @@ fn gpu_tri_depth(rec, vkva) {
     var saved_batch = gpu_batch_active;
     gpu_batch_active = 0;
     var rc = gpu_blend_cov_run(gpu_arena_mc + GPU_TRID_SHADER_SUBOFF, pbase_mc, dst_mc,
-    nt, gpu_bb_pitch, w, h, GPU_COMPUTE_PGM_RSRC1_TDEP, tiles_x, tiles_y,
-    gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
-    gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+      nt, gpu_bb_pitch, w, h, GPU_COMPUTE_PGM_RSRC1_TDEP, tiles_x, tiles_y,
+      gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
+      gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
     gpu_batch_active = saved_batch;
     return rc;
 }
@@ -3280,7 +3280,7 @@ fn gpu_shader_blend_test() {
     while (j < 64) {
         var got = load32(out_phys + (j << 2)) & 0xFFFFFFFF;
         var ref = blend_ref_px(load32(src_phys + (j << 2)) & 0xFFFFFFFF,
-        load32(dst_phys + (j << 2)) & 0xFFFFFFFF) & 0xFFFFFFFF;
+          load32(dst_phys + (j << 2)) & 0xFFFFFFFF) & 0xFFFFFFFF;
         if (got != GPU_MT_NOTYET) { stored = stored + 1; }
         if (got != ref) { if (ok == 1) { bad = j; } ok = 0; }
         j = j + 1;
@@ -3557,7 +3557,7 @@ fn gpu_grid_dispatch(shader_mc, k0, k1, k2, k3, k4, k5, k6, k7, n_user, rsrc1, r
 # The 7-kernarg form. Signature UNCHANGED from before the split, so its seven callers are untouched.
 fn gpu_grid7_run(shader_mc, k0, k1, k2, k3, k4, k5, k6, rsrc1, gx, gy, done_mc, done_phys) {
     return gpu_grid_dispatch(shader_mc, k0, k1, k2, k3, k4, k5, k6, 0, 7,
-    rsrc1, GPU_COMPUTE_RSRC2_GRID2D, gx, gy, done_mc, done_phys);
+      rsrc1, GPU_COMPUTE_RSRC2_GRID2D, gx, gy, done_mc, done_phys);
 }
 
 # The 8-kernarg form — blend_alpha's uniform alpha rides in k7 (s7), which pushes USER_SGPR 7 -> 8 and
@@ -3565,7 +3565,7 @@ fn gpu_grid7_run(shader_mc, k0, k1, k2, k3, k4, k5, k6, rsrc1, gx, gy, done_mc, 
 # (USER_SGPR=7) becomes 0x190 (USER_SGPR=8), which already exists as GPU_COMPUTE_RSRC2_COV.
 fn gpu_grid8_run(shader_mc, k0, k1, k2, k3, k4, k5, k6, k7, rsrc1, rsrc2, gx, gy, done_mc, done_phys) {
     return gpu_grid_dispatch(shader_mc, k0, k1, k2, k3, k4, k5, k6, k7, 8,
-    rsrc1, rsrc2, gx, gy, done_mc, done_phys);
+      rsrc1, rsrc2, gx, gy, done_mc, done_phys);
 }
 
 # ── plan-S12: the batch seam ───────────────────────────────────────────────────────────────────────────
@@ -3624,10 +3624,10 @@ fn gpu_ring_kick_wait(done_phys, timeout_us) {
 # existing call sites read as (src, dst, pitches, width) rather than as seven anonymous dwords.
 fn gpu_blend_rect_run(shader_mc, src_mc, dst_mc, src_pitch, dst_pitch, width, gx, gy, done_mc, done_phys) {
     return gpu_grid7_run(shader_mc,
-    src_mc & 0xFFFFFFFF, (src_mc >> 32) & 0xFFFFFFFF,
-    dst_mc & 0xFFFFFFFF, (dst_mc >> 32) & 0xFFFFFFFF,
-    src_pitch, dst_pitch, width,
-    GPU_COMPUTE_PGM_RSRC1_GRID, gx, gy, done_mc, done_phys);
+      src_mc & 0xFFFFFFFF, (src_mc >> 32) & 0xFFFFFFFF,
+      dst_mc & 0xFFFFFFFF, (dst_mc >> 32) & 0xFFFFFFFF,
+      src_pitch, dst_pitch, width,
+      GPU_COMPUTE_PGM_RSRC1_GRID, gx, gy, done_mc, done_phys);
 }
 
 # blend_cov — iron-proven gfx90c ISA. Human-readable reference: kernel/shaders/blend_cov.s (documentation only).
@@ -4386,7 +4386,7 @@ fn gpu_shader_cov_test() {
 
     var gx = (GPU_COV_N + 63) / 64;
     if (gpu_blend_cov_run(sh_mc, mk_mc, r_mc, GPU_COV_N, pitch, GPU_COV_N, GPU_COV_COLOR,
-    GPU_COMPUTE_PGM_RSRC1_COV, gx, GPU_COV_N, dn_mc, dn_phys) != 1) {
+        GPU_COMPUTE_PGM_RSRC1_COV, gx, GPU_COV_N, dn_mc, dn_phys) != 1) {
         kprintln("gpu: coverage dispatch did not complete", 39);
         return 0;
     }
@@ -4650,9 +4650,9 @@ fn gpu_shader_grad_test() {
 
     var gx = (GPU_GRD_W + 63) / 64;
     if (gpu_grid7_run(sh_mc,
-    g_mc & 0xFFFFFFFF, (g_mc >> 32) & 0xFFFFFFFF,
-    pitch, GPU_GRD_W, GPU_GRD_H, GPU_GRD_C0, GPU_GRD_C1,
-    GPU_COMPUTE_PGM_RSRC1_GRAD, gx, GPU_GRD_H, dn_mc, dn_phys) != 1) {
+        g_mc & 0xFFFFFFFF, (g_mc >> 32) & 0xFFFFFFFF,
+        pitch, GPU_GRD_W, GPU_GRD_H, GPU_GRD_C0, GPU_GRD_C1,
+        GPU_COMPUTE_PGM_RSRC1_GRAD, gx, GPU_GRD_H, dn_mc, dn_phys) != 1) {
         kprintln("gpu: gradient dispatch did not complete", 39);
         return 0;
     }
@@ -4734,9 +4734,9 @@ fn gpu_glyph_surface(bmp_mc, w, h, dx, dy, color) {
     var gx = (w + 63) / 64;
     var stride = (w + 7) / 8;                      # 1bpp: 8 px per byte, rows byte-aligned
     return gpu_blend_cov_run(gpu_arena_mc + GPU_GLYPH_SHADER_SUBOFF, bmp_mc, dst_mc,
-    stride, gpu_bb_pitch, w, color, GPU_COMPUTE_PGM_RSRC1_GLYPH, gx, h,
-    gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
-    gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+      stride, gpu_bb_pitch, w, color, GPU_COMPUTE_PGM_RSRC1_GLYPH, gx, h,
+      gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
+      gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
 }
 
 # gpu_shader_glyph_test — S8: expand a 1bpp bitmap to 32bpp with a transparent background.
@@ -4798,7 +4798,7 @@ fn gpu_shader_glyph_test() {
     }
     var gx = (GPU_GLY_W + 63) / 64;
     if (gpu_blend_cov_run(sh_mc, bm_mc, t_mc, GPU_GLY_STRIDE, pitch, GPU_GLY_W, GPU_GLY_FG,
-    GPU_COMPUTE_PGM_RSRC1_GLYPH, gx, GPU_GLY_H, dn_mc, dn_phys) != 1) {
+        GPU_COMPUTE_PGM_RSRC1_GLYPH, gx, GPU_GLY_H, dn_mc, dn_phys) != 1) {
         kprintln("gpu: glyph dispatch did not complete", 36);
         return 0;
     }
@@ -7418,7 +7418,7 @@ fn tex_bilin_write(dst_phys) {
 fn gpu_pack2(lo, hi) { return (lo & 0xFFFFFFFF) | ((hi & 0xFFFFFFFF) << 32); }
 
 fn gpu_tex_prep(rec_phys, cov_mc, tex_mc, lut_mc, tw, th, fmt,
-vx0, vy0, vx1, vy1, vx2, vy2, u0, v0, u1, v1, u2, v2) {
+  vx0, vy0, vx1, vy1, vx2, vy2, u0, v0, u1, v1, u2, v2) {
     var ax = vx0 >>> 16;  var ay = vy0 >>> 16;
     var bx = vx1 >>> 16;  var by = vy1 >>> 16;
     var cx = vx2 >>> 16;  var cy = vy2 >>> 16;
@@ -7641,9 +7641,9 @@ fn gpu_texl_build(pkva, n_prims, pitch) {
         # vocabulary exists to prevent. The record's col-major-ness is carried by the transposed
         # frame above, which every lane does read.
         if (gpu_tex_prep(rec, 0, tex_mc, lut_mc, twh & 0xFFFF, (twh >> 16) & 0xFFFF, pfl & 7,
-        tvx0, tvy0, tvx1, tvy1, tvx2, tvy2,
-        gpo_i32(b + 48), gpo_i32(b + 52), gpo_i32(b + 56),
-        gpo_i32(b + 60), gpo_i32(b + 64), gpo_i32(b + 68)) != 1) { return 0; }
+            tvx0, tvy0, tvx1, tvy1, tvx2, tvy2,
+            gpo_i32(b + 48), gpo_i32(b + 52), gpo_i32(b + 56),
+            gpo_i32(b + 60), gpo_i32(b + 64), gpo_i32(b + 68)) != 1) { return 0; }
 
         # the two list-only fields, in the record's declared spare
         # ⚠ A BYTE OFFSET from the back-buffer base, not an absolute address: the record then does
@@ -7746,7 +7746,7 @@ fn gpu_tex_list(pkva, n_prims, uw, uh, udx, udy) {
     var saved_batch = gpu_batch_active;
     gpu_batch_active = 0;
     var rc = gpu_blend_cov_run(shader_mc, rec_mc, bb_mc, pitch, n_prims, tshift, 0,
-    GPU_COMPUTE_PGM_RSRC1_TEX, n_prims << tshift, lrows, done_mc, done_phys);
+      GPU_COMPUTE_PGM_RSRC1_TEX, n_prims << tshift, lrows, done_mc, done_phys);
     gpu_batch_active = saved_batch;
 
     # ⚠ SUSPEND LATE, RESTORE ONCE. Everything above this point is CPU-only work that does not care
@@ -7890,7 +7890,7 @@ fn gpu_tri_tex(edge_mc, vtx_kva, tex_mc, lut_mc, texwh, flags, w, h, dx, dy, n_e
     # this path never wrote.
     var fmt = flags & 7;                         # IDX8 | FULLCOV | WRAP all reach the shader
     if (gpu_tex_prep(rec_phys, cov_mc, tex_mc, lut_mc, texwh & 0xFFFF, (texwh >> 16) & 0xFFFF, fmt,
-    vx0, vy0, vx1, vy1, vx2, vy2, u0, v0, u1, v1, u2, v2) != 1) { return 0; }
+        vx0, vy0, vx1, vy1, vx2, vy2, u0, v0, u1, v1, u2, v2) != 1) { return 0; }
 
     # ⛔ THE PROLOGUE RUNS BEFORE THE ARMING CHECK, ON PURPOSE. 13b's claim is that the CPU side is
     # complete and diffable against the host model while the shader is still absent; building the
@@ -7939,7 +7939,7 @@ fn gpu_tex_dispatch(rec_phys, w, h, dx, dy, bilin) {
     var gx = (w + 63) / 64;
     var gy = h;
     return gpu_blend_cov_run(shader_mc, rec_mc, dst_mc, pitch, 0, w, h,
-    rsrc1, gx, gy, done_mc, done_phys);
+      rsrc1, gx, gy, done_mc, done_phys);
 }
 
 fn gpu_tri_list(vtx_kva, n_tris, w, h, dx, dy) {
@@ -7995,7 +7995,7 @@ fn gpu_tri_list(vtx_kva, n_tris, w, h, dx, dy) {
 
         var edge_mc = gpu_arena_mc + GPU_TRI_EDGE_SUBOFF;
         if (gpu_tri_rgba(edge_mc, w, h, dx, dy, 3, GPU_RULE_NONZERO,
-        vx0, vy0, vx1, vy1, vx2, vy2, ca, cb, cc) != 1) {
+            vx0, vy0, vx1, vy1, vx2, vy2, ca, cb, cc) != 1) {
             gpu_batch_active = saved_batch;    # ⚠ restore on the FAILURE path too
             return 0;
         }
@@ -8063,9 +8063,9 @@ fn gpu_cov_surface(mask_mc, w, h, dx, dy, color) {
     var dst_mc = tgt + dy * gpu_bb_pitch + dx * 4;
     var gx = (w + 63) / 64;
     return gpu_blend_cov_run(gpu_arena_mc + GPU_COV_SHADER_SUBOFF, mask_mc, dst_mc,
-    w, gpu_bb_pitch, w, color, GPU_COMPUTE_PGM_RSRC1_COV, gx, h,
-    gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
-    gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+      w, gpu_bb_pitch, w, color, GPU_COMPUTE_PGM_RSRC1_COV, gx, h,
+      gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
+      gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
 }
 
 # perm — iron-proven gfx90c ISA. Human-readable reference: kernel/shaders/perm.s (documentation only).
@@ -8245,14 +8245,14 @@ fn gpu_shader_perm_test() {
     gpu_mfence();
 
     var pass = gpu_perm_run_one(shader_mc, src_mc, out_mc, done_mc, done_phys,
-    src_phys, out_phys, 0x03020100, 1);
+      src_phys, out_phys, 0x03020100, 1);
     if (pass != 1) { return 0; }
 
     var z2 = 0;
     while (z2 < 256) { store32(out_phys + (z2 << 2), GPU_MT_NOTYET); z2 = z2 + 1; }
     gpu_mfence();
     var pass2 = gpu_perm_run_one(shader_mc, src_mc, out_mc, done_mc, done_phys,
-    src_phys, out_phys, 0x03000102, 0);
+      src_phys, out_phys, 0x03000102, 0);
     if (pass2 != 1) { return 0; }
 
     gpu_perm_ok = 1;
@@ -8272,7 +8272,7 @@ fn gpu_perm_run_one(shader_mc, src_mc, out_mc, done_mc, done_phys, src_phys, out
     if (is_ctrl != 1) { kprintln("gpu: perm swap run, selector swaps red and blue", 47); }
 
     if (gpu_matmul_run(shader_mc, src_mc, out_mc, sel, done_mc, done_phys,
-    GPU_COMPUTE_PGM_RSRC1_V12) != 1) {
+        GPU_COMPUTE_PGM_RSRC1_V12) != 1) {
         kprintln("gpu: perm dispatch did not complete", 35);
         return 0;
     }
@@ -8379,12 +8379,12 @@ fn gpu_shader_blend_pk_test() {
     gpu_mfence();
 
     if (gpu_matmul_run(gpu_arena_mc + GPU_SHADER_SUBOFF, src_mc, dst_mc, f_mc, done_mc, done_phys,
-    GPU_COMPUTE_PGM_RSRC1_V12) != 1) {
+        GPU_COMPUTE_PGM_RSRC1_V12) != 1) {
         kprintln("gpu: float blend dispatch did not complete", 42); return 0;
     }
     # ⚠ _PK, not _V12 — blend_pk needs 24 SGPRs where blend_premul needs 16. See GPU_COMPUTE_PGM_RSRC1_PK.
     if (gpu_matmul_run(pk_mc, src_mc, dst_mc, p_mc, done_mc, done_phys,
-    GPU_COMPUTE_PGM_RSRC1_PK) != 1) {
+        GPU_COMPUTE_PGM_RSRC1_PK) != 1) {
         kprintln("gpu: packed blend dispatch did not complete", 43); return 0;
     }
 
@@ -8591,8 +8591,8 @@ fn gpu_edge_cov(edge_mc, dst_mc, w, h, n_edges, rule) {
     # s7=arg7 (gpu_blend_cov_run's SET_SH_REG_N8 staging). edge_setup reads s[0:1]=edges,
     # s[2:3]=prep, s4=n_edges.
     if (gpu_blend_cov_run(gpu_arena_mc + GPU_EDGE_SETUP_SUBOFF, edge_mc, prep_mc,
-    n_edges, 0, 0, 0, GPU_COMPUTE_PGM_RSRC1_ESET,
-    (n_edges + 63) / 64, 1, done_mc, done_phys) != 1) { return 0; }
+        n_edges, 0, 0, 0, GPU_COMPUTE_PGM_RSRC1_ESET,
+        (n_edges + 63) / 64, 1, done_mc, done_phys) != 1) { return 0; }
 
     # ---- dispatch 2: the rasteriser. ONE LANE PER PIXEL, 64x1 -> gx spans the row, gy IS py. ----
     # ⚠ THE LANE SHAPE IS 64x1, NOT AN 8x8 TILE. Every shipped 2-D consumer uses
@@ -8605,8 +8605,8 @@ fn gpu_edge_cov(edge_mc, dst_mc, w, h, n_edges, rule) {
     # which IS the S3-proven producer->consumer pattern. Chaining would save ~60 us and require
     # new PM4 agnos has never run. [[feedback_sovereignty_over_slip_at_base]]
     return gpu_blend_cov_run(gpu_arena_mc + GPU_EDGE_SHADER_SUBOFF, prep_mc, dst_mc,
-    n_edges, 0, w, 0, GPU_COMPUTE_PGM_RSRC1_EDGE,
-    (w + 63) / 64, h, done_mc, done_phys);
+      n_edges, 0, w, 0, GPU_COMPUTE_PGM_RSRC1_EDGE,
+      (w + 63) / 64, h, done_mc, done_phys);
 }
 
 # gpu_edge_arm — RUNG 9a: the edge rasteriser's residency hook.
@@ -8665,11 +8665,11 @@ fn gpu_grad_surface(w, h, dx, dy, c0, c1) {
     var dst_mc = tgt + dy * gpu_bb_pitch + dx * 4;
     var gx = (w + 63) / 64;                    # CEILING — the shader's EXEC guard trims the last group
     return gpu_grid7_run(gpu_arena_mc + GPU_GRAD_SHADER_SUBOFF,
-    dst_mc & 0xFFFFFFFF, (dst_mc >> 32) & 0xFFFFFFFF,
-    gpu_bb_pitch, w, h, c0, c1,
-    GPU_COMPUTE_PGM_RSRC1_GRAD, gx, h,
-    gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
-    gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+      dst_mc & 0xFFFFFFFF, (dst_mc >> 32) & 0xFFFFFFFF,
+      gpu_bb_pitch, w, h, c0, c1,
+      GPU_COMPUTE_PGM_RSRC1_GRAD, gx, h,
+      gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
+      gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
 }
 
 # gpu_blend_arm — make blend_rect resident for the RUNTIME (#92) path. Idempotent.
@@ -8701,9 +8701,9 @@ fn gpu_blend_surface(src_mc, w, h, dx, dy) {
     var dst_mc = tgt + dy * gpu_bb_pitch + dx * 4;
     var gx = (w + 63) / 64;                    # CEILING — the shader's EXEC guard trims the last group
     return gpu_blend_rect_run(gpu_arena_mc + GPU_BLEND_SHADER_SUBOFF, src_mc, dst_mc,
-    w * 4, gpu_bb_pitch, w, gx, h,
-    gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
-    gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+      w * 4, gpu_bb_pitch, w, gx, h,
+      gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
+      gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
 }
 
 # gpu_blend_alpha_arm — residency for op 0x06. Same preconditions as gpu_blend_arm; a separate arena
@@ -8740,12 +8740,12 @@ fn gpu_blend_alpha_surface(src_mc, w, h, dx, dy, alpha) {
     var dst_mc = tgt + dy * gpu_bb_pitch + dx * 4;
     var gx = (w + 63) / 64;                    # CEILING — the shader's EXEC guard trims the last group
     return gpu_grid8_run(gpu_arena_mc + GPU_BALPHA_SHADER_SUBOFF,
-    src_mc & 0xFFFFFFFF, (src_mc >> 32) & 0xFFFFFFFF,
-    dst_mc & 0xFFFFFFFF, (dst_mc >> 32) & 0xFFFFFFFF,
-    w * 4, gpu_bb_pitch, w, a,
-    GPU_COMPUTE_PGM_RSRC1_GRID, GPU_COMPUTE_RSRC2_COV, gx, h,
-    gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
-    gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+      src_mc & 0xFFFFFFFF, (src_mc >> 32) & 0xFFFFFFFF,
+      dst_mc & 0xFFFFFFFF, (dst_mc >> 32) & 0xFFFFFFFF,
+      w * 4, gpu_bb_pitch, w, a,
+      GPU_COMPUTE_PGM_RSRC1_GRID, GPU_COMPUTE_RSRC2_COV, gx, h,
+      gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
+      gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
 }
 
 # ── plan-S3: GL2 / scanout / CP-DMA coherence, characterised in ONE boot ──────────────────────────────
@@ -8782,9 +8782,9 @@ fn gpu_cohere_run(wb, inv, src_mc, dst_mc, n) {
     gpu_cohere_wb = wb;
     gpu_cohere_inv = inv;
     var r = gpu_blend_rect_run(gpu_arena_mc + GPU_BLEND_SHADER_SUBOFF, src_mc, dst_mc,
-    n * 4, n * 4, n, 1, n,
-    gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
-    gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+      n * 4, n * 4, n, 1, n,
+      gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
+      gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
     gpu_cohere_wb = 1;
     gpu_cohere_inv = 1;
     return r;
@@ -8864,8 +8864,8 @@ fn gpu_shader_cohere_test() {
     var a_dst_phys = bb_phys + GPU_COHERE_AY * pitch + GPU_COHERE_AX * 4;
     gpu_cohere_wb = 1; gpu_cohere_inv = 1;
     var ra = gpu_blend_rect_run(gpu_arena_mc + GPU_BLEND_SHADER_SUBOFF, src_mc, a_dst_mc,
-    n * 4, pitch, n, 1, n,
-    gpu_arena_mc + GPU_BLEND_DONE_SUBOFF, gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+      n * 4, pitch, n, 1, n,
+      gpu_arena_mc + GPU_BLEND_DONE_SUBOFF, gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
     var a_cpu = 0;
     if (ra == 1) {
         var ay = 0;
@@ -8883,8 +8883,8 @@ fn gpu_shader_cohere_test() {
     var b_dst_phys = bb_phys + GPU_COHERE_BY * pitch + GPU_COHERE_BX * 4;
     gpu_cohere_wb = 0; gpu_cohere_inv = 1;
     var rb = gpu_blend_rect_run(gpu_arena_mc + GPU_BLEND_SHADER_SUBOFF, src_mc, b_dst_mc,
-    n * 4, pitch, n, 1, n,
-    gpu_arena_mc + GPU_BLEND_DONE_SUBOFF, gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+      n * 4, pitch, n, 1, n,
+      gpu_arena_mc + GPU_BLEND_DONE_SUBOFF, gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
     gpu_cohere_wb = 1;
     var b_cpu = 0;
     if (rb == 1) {
@@ -10558,7 +10558,7 @@ fn gpu_otg_lock(pipe) {
     var o = pipe * GPU_DCN_OTG_STRIDE;
     var gc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_GLOBAL_CONTROL0 + o);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_GLOBAL_CONTROL0 + o,
-    (gc & (0 - 1 - GPU_OTG_LOCK_SEL_MASK)) | ((pipe << 25) & GPU_OTG_LOCK_SEL_MASK));
+      (gc & (0 - 1 - GPU_OTG_LOCK_SEL_MASK)) | ((pipe << 25) & GPU_OTG_LOCK_SEL_MASK));
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_MASTER_UPDATE_LOCK + o, 0x1);
     # ⚠ WALL-CLOCK bounded, not iteration bounded (1.56.x). 100 000 iterations of a UC MMIO read has an
     # unknowable duration — each one is a round trip to the device — so the old bound was a number of reads,
@@ -12076,7 +12076,7 @@ fn gpu_hdmi_stage_attributes(d) {
     # --- 1. Stage the HDMI block (inert while DIG_MODE==2, so this cannot disturb the console) ---
     var ctl = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_CONTROL + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_CONTROL + d,
-    (ctl & (0 - 1 - GPU_HDMI_CONTROL_KEEP)) | GPU_HDMI_CONTROL_SET);
+      (ctl & (0 - 1 - GPU_HDMI_CONTROL_KEEP)) | GPU_HDMI_CONTROL_SET);
     var gc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d, gc & (0 - 1 - GPU_HDMI_GC_AVMUTE));
     var vbi = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_VBI_PACKET_CONTROL + d);
@@ -12132,7 +12132,7 @@ fn gpu_hdmi_program_infoframes(d, az) {
     var cks = (0x100 - (sum & 0xFF)) & 0xFF;
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_HDR + d, GPU_AVI_HDR);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_0 + d,
-    cks | (GPU_AVI_DB1 << 8) | (GPU_AVI_DB2 << 16) | (GPU_AVI_DB3 << 24));
+      cks | (GPU_AVI_DB1 << 8) | (GPU_AVI_DB2 << 16) | (GPU_AVI_DB3 << 24));
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_1 + d, 0);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_2 + d, g2);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_3 + d, g3);
@@ -12142,14 +12142,14 @@ fn gpu_hdmi_program_infoframes(d, az) {
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_7 + d, 0);
     var vp1 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_VBI_PACKET_CONTROL1 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_VBI_PACKET_CONTROL1 + d,
-    vp1 | GPU_AFMT_GENERIC0_IMMEDIATE_UPDATE);
+      vp1 | GPU_AFMT_GENERIC0_IMMEDIATE_UPDATE);
     # GENERIC0_LINE is in CONTROL1, not CONTROL0 — dcn20 split enc1's fused write because DCN2 moved it.
     var gl = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL1 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL1 + d,
-    (gl & (0 - 1 - GPU_HDMI_GENERIC0_LINE_MASK)) | GPU_HDMI_GENERIC0_LINE_VAL);
+      (gl & (0 - 1 - GPU_HDMI_GENERIC0_LINE_MASK)) | GPU_HDMI_GENERIC0_LINE_VAL);
     var gp = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL0 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL0 + d,
-    gp | GPU_HDMI_GENERIC0_SEND | GPU_HDMI_GENERIC0_CONT);
+      gp | GPU_HDMI_GENERIC0_SEND | GPU_HDMI_GENERIC0_CONT);
 
     # ACR: hardware-measured CTS (SOURCE=0) + AUTO_SEND, but N is a per-Fs constant and must be written.
     var acr = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_PACKET_CONTROL + d);
@@ -12157,7 +12157,7 @@ fn gpu_hdmi_program_infoframes(d, az) {
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_PACKET_CONTROL + d, acr | GPU_HDMI_ACR_AUTO_SEND);
     var n48 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_1 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_1 + d,
-    (n48 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_48_VAL);
+      (n48 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_48_VAL);
     # ACR_SELECT is cleared above, which is hardware rate auto-select: the hardware picks the N/CTS pair from
     # the incoming Fs. tonegen is locked to 48 kHz so the 48 pair is the live one and it is correct — but the
     # 32 and 44.1 pairs are silence the moment anything plays at those rates. amdgpu writes all six. All three
@@ -12175,21 +12175,21 @@ fn gpu_hdmi_program_infoframes(d, az) {
     #ifdef HDMI_ACR_CTS
     var cts48 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_0 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_0 + d,
-    (cts48 & 0xFFF) | GPU_HDMI_ACR_CTS_48_VAL);
+      (cts48 & 0xFFF) | GPU_HDMI_ACR_CTS_48_VAL);
     var cts44 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_0 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_0 + d,
-    (cts44 & 0xFFF) | GPU_HDMI_ACR_CTS_48_VAL);
+      (cts44 & 0xFFF) | GPU_HDMI_ACR_CTS_48_VAL);
     var cts32 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_0 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_0 + d,
-    (cts32 & 0xFFF) | GPU_HDMI_ACR_CTS_48_VAL);
+      (cts32 & 0xFFF) | GPU_HDMI_ACR_CTS_48_VAL);
     kprintln("gpu: hdmi acr cts programmed (241500, amdgpu-match)", 51);
     #endif
     var n32 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_1 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_1 + d,
-    (n32 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_32_VAL);
+      (n32 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_32_VAL);
     var n44 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_1 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_1 + d,
-    (n44 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_44_VAL);
+      (n44 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_44_VAL);
 
     # HDMI_AUDIO_PACKETS_PER_LINE ([20:16]) — tested and FALSIFIED as a cause (2026-07-16). The DCE-formula
     # ppl=3 was burned on iron (HDMI_AUDIO_PKT_CONTROL 0x30010): still silent. The full amdgpu-while-playing
@@ -12198,34 +12198,34 @@ fn gpu_hdmi_program_infoframes(d, az) {
     # match the known-good byte-for-byte; DELAY_EN (bit4) is the only bit the working path sets here.
     var hap = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d,
-    (hap & (0 - 1 - GPU_HDMI_AUDIO_DELAY_MASK) & (0 - 1 - 0x1F0000)) | GPU_HDMI_AUDIO_DELAY_SET);
+      (hap & (0 - 1 - GPU_HDMI_AUDIO_DELAY_MASK) & (0 - 1 - 0x1F0000)) | GPU_HDMI_AUDIO_DELAY_SET);
 
     # Source select binds this DIG's AFMT to the Azalia endpoint; channel-enable is 8 bits and zero of them
     # is silence, so stereo must be spelled out.
     var sc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_SRC_CONTROL + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_SRC_CONTROL + d,
-    (sc & (0 - 1 - GPU_AFMT_AUDIO_SRC_SELECT_MASK)) | az);
+      (sc & (0 - 1 - GPU_AFMT_AUDIO_SRC_SELECT_MASK)) | az);
     # Clearing AUDIO_LAYOUT_OVRD (bit0) and 60958_OSF_OVRD (bit28) alongside the channel enable matches
     # dcn10_stream_encoder.c; known-good reads 0x300, with both overrides at 0. LAYOUT_SELECT, HBR_ENABLE_OVRD
     # and DP_AUDIO_STREAM_ID are deliberately left alone — amdgpu never writes them.
     var pc2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL2 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL2 + d,
-    (pc2 & (0 - 1 - GPU_AFMT_CHANNEL_ENABLE_MASK) & (0 - 1 - GPU_AFMT_AUDIO_LAYOUT_OVRD)
-    & (0 - 1 - GPU_AFMT_60958_OSF_OVRD)) | GPU_AFMT_CHANNEL_ENABLE_STEREO);
+      (pc2 & (0 - 1 - GPU_AFMT_CHANNEL_ENABLE_MASK) & (0 - 1 - GPU_AFMT_AUDIO_LAYOUT_OVRD)
+        & (0 - 1 - GPU_AFMT_60958_OSF_OVRD)) | GPU_AFMT_CHANNEL_ENABLE_STEREO);
 
     # IEC 60958 channel status. These MUST be populated before CS_UPDATE latches them: L/R = 0/0 is invalid
     # channel status and a strict sink rejects the substream. 1.55.12 set the latch over untouched registers
     # and therefore latched zeros. (AFMT_60958_2 is at 0x20A7, NOT adjacent to _0/_1 — see gpu_regs.cyr.)
     var cs0 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_60958_0 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_60958_0 + d,
-    (cs0 & (0 - 1 - GPU_AFMT_CS_CHANNEL_MASK) & (0 - 1 - GPU_AFMT_CS_CLOCK_ACCURACY_MASK))
-    | GPU_AFMT_CS_CHANNEL_L);
+      (cs0 & (0 - 1 - GPU_AFMT_CS_CHANNEL_MASK) & (0 - 1 - GPU_AFMT_CS_CLOCK_ACCURACY_MASK))
+      | GPU_AFMT_CS_CHANNEL_L);
     var cs1 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_60958_1 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_60958_1 + d,
-    (cs1 & (0 - 1 - GPU_AFMT_CS_CHANNEL_MASK)) | GPU_AFMT_CS_CHANNEL_R);
+      (cs1 & (0 - 1 - GPU_AFMT_CS_CHANNEL_MASK)) | GPU_AFMT_CS_CHANNEL_R);
     var cs2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_60958_2 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_60958_2 + d,
-    (cs2 & (0 - 1 - 0xFFFFFF)) | GPU_AFMT_60958_2_CHANNELS);
+      (cs2 & (0 - 1 - 0xFFFFFF)) | GPU_AFMT_60958_2_CHANNELS);
 
     # THE AUDIO INFOFRAME. This is what 1.55.12 missed and it is why the sink stayed silent through a
     # perfect-looking display side: the encoder was sending sample packets and ACR packets with NO Audio
@@ -12239,7 +12239,7 @@ fn gpu_hdmi_program_infoframes(d, az) {
     #     1.55.12's writes there were the wrong lever entirely and are gone.
     var il = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL1 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL1 + d,
-    (il & (0 - 1 - GPU_HDMI_AUDIO_INFO_LINE_MASK)) | GPU_HDMI_AUDIO_INFO_LINE_VAL);
+      (il & (0 - 1 - GPU_HDMI_AUDIO_INFO_LINE_MASK)) | GPU_HDMI_AUDIO_INFO_LINE_VAL);
     var hif = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d, hif | GPU_HDMI_AUDIO_INFO_SEND);
     var ifc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d);
@@ -12388,7 +12388,7 @@ fn gpu_hdmi_audio_enable(phy) {
     # --- 2. THE COMMIT: DIG_MODE 2 -> 3, read-modify-write ---
     var be = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db,
-    (be & (0 - 1 - GPU_DIG_MODE_MASK)) | (GPU_DIG_MODE_HDMI << GPU_DIG_MODE_SHIFT));
+      (be & (0 - 1 - GPU_DIG_MODE_MASK)) | (GPU_DIG_MODE_HDMI << GPU_DIG_MODE_SHIFT));
     var back = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db) & GPU_DIG_MODE_MASK) >> GPU_DIG_MODE_SHIFT;
     if (back != GPU_DIG_MODE_HDMI) {
         kprintln("gpu: hdmi mode did not take", 27);
@@ -12649,10 +12649,10 @@ fn gpu_hdmi_audio_enable(phy) {
     #ifdef MODESET_AUDIO
     # Stage MUTED — CS_UPDATE only. gpu_hdmi_audio_unmute() opens the tap after the edge.
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d,
-    (apc | GPU_AFMT_60958_CS_UPDATE) & (0 - 1 - GPU_AFMT_AUDIO_SAMPLE_SEND));
+      (apc | GPU_AFMT_60958_CS_UPDATE) & (0 - 1 - GPU_AFMT_AUDIO_SAMPLE_SEND));
     #else
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d,
-    apc | GPU_AFMT_60958_CS_UPDATE | GPU_AFMT_AUDIO_SAMPLE_SEND);
+      apc | GPU_AFMT_60958_CS_UPDATE | GPU_AFMT_AUDIO_SAMPLE_SEND);
     #endif
 
     # The hardware's own Audio InfoFrame, read back. Non-zero here means the AIF generator actually ran on
@@ -12835,7 +12835,7 @@ fn gpu_hdmi_audio_unmute() {
     # once before (fixed by hand at four sites in 1.55.15).
     gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_HOT_PLUG_CONTROL);
     gpu_reg32_write(GPU_BASE_DCN_2, dr,
-    (hpc1 | GPU_AZ_AUDIO_ENABLED) & (0 - 1 - GPU_AZ_CLOCK_GATING_DISABLE));
+      (hpc1 | GPU_AZ_AUDIO_ENABLED) & (0 - 1 - GPU_AZ_CLOCK_GATING_DISABLE));
 
     # 3. THE UNMUTE — open the sample tap. This single bit is what the arc has spent sixteen burns reaching.
     var apc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
@@ -13185,8 +13185,8 @@ fn gpu_hdmi_audio_crc_one(d, source) {
     # Disarm first: the counter is free-running once enabled, and re-arming a live one races its own DONE.
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_CRC_CONTROL + d, 0);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_CRC_CONTROL + d,
-    (GPU_AFMT_AUDIO_CRC_SAMPLES << GPU_AFMT_AUDIO_CRC_COUNT_SHIFT)
-    | ((source & 0x1) << GPU_AFMT_AUDIO_CRC_SOURCE_SHIFT) | GPU_AFMT_AUDIO_CRC_EN);
+      (GPU_AFMT_AUDIO_CRC_SAMPLES << GPU_AFMT_AUDIO_CRC_COUNT_SHIFT)
+      | ((source & 0x1) << GPU_AFMT_AUDIO_CRC_SOURCE_SHIFT) | GPU_AFMT_AUDIO_CRC_EN);
 
     # 2048 samples at 48 kHz is 42.7 ms, so 60 ms is the honest bound — the old 300 ms was 7x that, and with
     # TWO taps it put up to 600 ms of busy-wait into every burn kernel's boot BEFORE interrupts are enabled.
@@ -13287,7 +13287,7 @@ fn gpu_hdmi_audio_disable() {
     kprintln("audio teardown: rung 2 stop sample send", 39);
     v = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d,
-    v & (0 - 1 - GPU_AFMT_AUDIO_SAMPLE_SEND));
+      v & (0 - 1 - GPU_AFMT_AUDIO_SAMPLE_SEND));
     gpu_udelay(1000000);
 
     kprintln("audio teardown: rung 3 stop the codec feed", 42);
@@ -13312,7 +13312,7 @@ fn gpu_hdmi_audio_disable() {
     kprintln("audio teardown: rung 5 stop the packet generators", 49);
     v = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d,
-    v & (0 - 1 - GPU_HDMI_AUDIO_INFO_SEND));
+      v & (0 - 1 - GPU_HDMI_AUDIO_INFO_SEND));
     gpu_udelay(1000000);
 
     # LAST. Dropping the audio clock first would gate every preceding write into a
@@ -13451,7 +13451,7 @@ fn gpu_hdmi_acr_nscale() {
     var n0 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_1 + d);
     var c0 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_STATUS_0 + d) >> GPU_HDMI_ACR_CTS_48_SHIFT;
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_1 + d,
-    (n0 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | (GPU_HDMI_ACR_N_48_VAL * 2));
+      (n0 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | (GPU_HDMI_ACR_N_48_VAL * 2));
     gpu_udelay(200000);
     var c1 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_STATUS_0 + d) >> GPU_HDMI_ACR_CTS_48_SHIFT;
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_1 + d, n0);

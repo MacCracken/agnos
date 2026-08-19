@@ -562,8 +562,8 @@ fn ext2_init() {
     # Blocksize sanity. 1024/2048/4096 are the realistic values; refuse
     # anything else (Phase 1 buffer is 4096).
     if ((ext2_blocksize != 1024)
-    & (ext2_blocksize != 2048)
-    & (ext2_blocksize != 4096)) {
+      & (ext2_blocksize != 2048)
+      & (ext2_blocksize != 4096)) {
         kprint("ext2: unsupported blocksize ", 28);
         kprint_num(ext2_blocksize);
         kprintln("", 0);
@@ -2060,11 +2060,11 @@ fn ext2_read_at(inode_num, offset, buf, maxlen) {
         # kill-switch (set to 1 to force single-block).
         var dst = buf + bytes_done;
         if (iommu_active == 0 && off_in_block == 0 && phys != 0 && remaining >= ext2_blocksize
-        && (dst & 0xFFF) == 0 && (dst + ext2_blocksize) <= 0x10000000) {
+          && (dst & 0xFFF) == 0 && (dst + ext2_blocksize) <= 0x10000000) {
             var run = 1;
             while (run < ext2_read_coalesce_max
-            && (bytes_done + (run + 1) * ext2_blocksize) <= to_read
-            && (dst + (run + 1) * ext2_blocksize) <= 0x10000000) {
+              && (bytes_done + (run + 1) * ext2_blocksize) <= to_read
+              && (dst + (run + 1) * ext2_blocksize) <= 0x10000000) {
                 var np = ext2_logical_to_physical_cached(&ext2_inode_buf, logical + run, &cached_l1);
                 if (np != phys + run) { break; }   # non-contiguous, sparse, or error → end the run
                 run = run + 1;
@@ -2461,7 +2461,7 @@ fn ext2_dir_insert(dir_ino, name, name_len, child_ino, ftype) {
     if (ext2_write_block(nb, &ext2_dir_buf) != 0) { return 0 - 1; }
     ext2_inode_set_size_lo(&ext2_inode_buf, dir_size + ext2_blocksize);
     ext2_inode_set_blocks_lo(&ext2_inode_buf,
-    ext2_inode_blocks_lo(&ext2_inode_buf) + ext2_bmap_alloc_count * (ext2_blocksize / 512));
+      ext2_inode_blocks_lo(&ext2_inode_buf) + ext2_bmap_alloc_count * (ext2_blocksize / 512));
     if (ext2_put_inode(dir_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
     return 0;
 }
@@ -2499,7 +2499,7 @@ fn ext2_dir_remove(dir_ino, name, name_len) {
                                 ext2_store32_le(&ext2_dir_buf, off, 0);          # tombstone head
                             } else {
                                 ext2_store16_le(&ext2_dir_buf, prev + 4,
-                                ext2_load16_le(&ext2_dir_buf, prev + 4) + e_rl);  # coalesce
+                                  ext2_load16_le(&ext2_dir_buf, prev + 4) + e_rl);  # coalesce
                             }
                             if (ext2_csum_on != 0) { ext2_dir_tail_stamp(&ext2_dir_buf, dir_ino, dir_gen); }
                             if (ext2_write_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
@@ -3384,13 +3384,13 @@ fn ext2_write_at(inode_num, offset, src, len) {
         # partial/unaligned/high/extent write.
         var srcp = src + written;
         if (is_extent == 0 && boff == 0 && chunk == ext2_blocksize && iommu_active == 0
-        && (srcp & 0xFFF) == 0 && (srcp + ext2_blocksize) <= 0x10000000) {
+          && (srcp & 0xFFF) == 0 && (srcp + ext2_blocksize) <= 0x10000000) {
             var rphys = ext2_bmap_alloc(&ext2_inode_buf, lblk);
             if (rphys <= 0) { break; }   # ENOSPC — return partial
             var wrun = 1;
             while (wrun < ext2_read_coalesce_max
-            && (written + (wrun + 1) * ext2_blocksize) <= len
-            && (srcp + (wrun + 1) * ext2_blocksize) <= 0x10000000) {
+              && (written + (wrun + 1) * ext2_blocksize) <= len
+              && (srcp + (wrun + 1) * ext2_blocksize) <= 0x10000000) {
                 var nphys = ext2_bmap_alloc(&ext2_inode_buf, lblk + wrun);
                 if (nphys != rphys + wrun) { break; }   # non-contiguous / ENOSPC → end the run
                 wrun = wrun + 1;

@@ -3237,7 +3237,7 @@ fn edge_abi_selftest() {
     lw = 0;
     while (lw < 9) {
         ea_seed_prim(pb, lw, 14, 0, 8, 8,
-        GPU_TEX_FLAG_FULLCOV | GPU_TEX_FLAG_COLMAJOR, 1024, 1088, 0, 0);
+          GPU_TEX_FLAG_FULLCOV | GPU_TEX_FLAG_COLMAJOR, 1024, 1088, 0, 0);
         lw = lw + 1;
     }
     pass = pass + ea_expect(&d, GPO_E_WORK, "texl: the SAME nine col-major exceed the cap", 44);
@@ -4328,7 +4328,7 @@ fn gpo_execute(rec) {
         }
         var xne = load32(rec + 60) & 0xFFFF;
         if (gpu_tri_tex(xedge, xvtx, xtex, xlut, xtwh, xflags,
-        w, h, dx, dy, xne, GPU_RULE_NONZERO) != 1) { return GPO_E_ARM; }
+            w, h, dx, dy, xne, GPU_RULE_NONZERO) != 1) { return GPO_E_ARM; }
         return 0;
     }
     # ⭐ RUNG 14. Same staging doctrine as 9a and 13a: the branch lands before the shader does, so a
@@ -6377,7 +6377,7 @@ fn mdo_transmit_run(arm) {
         }
         if (dm_pre != gpu_dig_mode_boot) {
             gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db,
-            (be_pre & (0 - 1 - GPU_DIG_MODE_MASK)) | (gpu_dig_mode_boot << GPU_DIG_MODE_SHIFT));
+              (be_pre & (0 - 1 - GPU_DIG_MODE_MASK)) | (gpu_dig_mode_boot << GPU_DIG_MODE_SHIFT));
             gpu_mfence();
             kprint("modeset: transmit -- DIG_MODE normalised ", 41); kprint_num(dm_pre);
             kprint(" -> ", 4); kprint_num(gpu_dig_mode_boot);
@@ -6832,7 +6832,7 @@ fn mdo_transmit_run(arm) {
     if (gpu_dig_mode_boot != 0) {
         var be_fin = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db) & 0xFFFFFFFF;
         gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db,
-        (be_fin & (0 - 1 - GPU_DIG_MODE_MASK)) | (gpu_dig_mode_boot << GPU_DIG_MODE_SHIFT));
+          (be_fin & (0 - 1 - GPU_DIG_MODE_MASK)) | (gpu_dig_mode_boot << GPU_DIG_MODE_SHIFT));
         gpu_mfence();
         kprintln("modeset: transmit -- signalling restored; the picture should be BACK", 68);
     }

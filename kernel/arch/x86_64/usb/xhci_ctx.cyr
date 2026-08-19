@@ -312,7 +312,7 @@ fn xhci_interrupt_interval(b_interval, speed) {
 # TRBs filled in by xhci_kbd_arm_xfer_ring). xfer_ring_phys must be
 # 16-byte aligned (page-aligned satisfies); DCS=1 in the bottom bit.
 fn xhci_input_ctx_add_interrupt_in(ictx_phys, ep_addr, mps,
-b_interval, speed, xfer_ring_phys) {
+  b_interval, speed, xfer_ring_phys) {
     var dci = xhci_dci_for_ep(ep_addr);
     if (dci < 2) { return 0; }     # EP0 handled by xhci_alloc_input_ctx
 
@@ -384,7 +384,7 @@ b_interval, speed, xfer_ring_phys) {
 #   - CErr = 3 (max error retry count) on both directions, same as
 #     control / interrupt-IN convention.
 fn xhci_input_ctx_add_bulk_pair(ictx_phys, in_ep_addr, in_mps,
-out_ep_addr, out_mps, speed, in_ring_phys, out_ring_phys) {
+  out_ep_addr, out_mps, speed, in_ring_phys, out_ring_phys) {
     var in_dci  = xhci_dci_for_ep(in_ep_addr);
     var out_dci = xhci_dci_for_ep(out_ep_addr);
     if (in_dci < 2)  { return 0; }

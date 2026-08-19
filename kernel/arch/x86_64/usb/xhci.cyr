@@ -1202,7 +1202,7 @@ fn xhci_get_device_descriptor(slot_id, length) {
 #   bmRequestType=0x80, bRequest=6, wValue=(0x02<<8)|index, wIndex=0.
 fn xhci_get_config_descriptor(slot_id, config_idx, length) {
     return xhci_control_in(slot_id, 0x80,
-    0x06, (0x02 << 8) | (config_idx & 0xFF), 0, length, xhci_desc_buf_phys);
+      0x06, (0x02 << 8) | (config_idx & 0xFF), 0, length, xhci_desc_buf_phys);
 }
 
 # Walk the Configuration Descriptor in xhci_desc_buf_phys looking for an
@@ -1228,7 +1228,7 @@ fn xhci_get_config_descriptor(slot_id, config_idx, length) {
 # interface 1 of the SAME device, so "the first proto-0x02 interface in this config" is not always the
 # only one. Pass 0 for the first match.
 fn xhci_find_hid_boot_endpoint(total_length, want_proto, skip,
-out_intf_addr, out_ep_addr_p, out_mps_p, out_interval_p) {
+  out_intf_addr, out_ep_addr_p, out_mps_p, out_interval_p) {
     var off = 0;
     var in_kbd_intf = 0;
     var cur_intf_num = 0;

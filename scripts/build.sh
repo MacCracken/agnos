@@ -30,7 +30,12 @@ if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
         exit 1
     }
 fi
-CC_ARM="$CYRIUS_HOME/bin/cc5_aarch64"
+# ⚠ The aarch64 backend was renamed cc5_aarch64 -> cycc_aarch64 at cyrius v6.0.0; the back-compat
+# symlink lived through the v6.0.x window and DROPPED at v6.1.0. This probed only the old name, so
+# from v6.1.0 on the aarch64 build died with "cross-compiler not in toolchain" while the compiler
+# sat in the same directory under its current name. Prefer the 6.x name, accept the legacy one.
+CC_ARM="$CYRIUS_HOME/bin/cycc_aarch64"
+[ -x "$CC_ARM" ] || CC_ARM="$CYRIUS_HOME/bin/cc5_aarch64"
 echo "  toolchain: $CYRB" >&2
 ARCH="x86_64"
 

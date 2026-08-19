@@ -113,7 +113,7 @@ fn msc_ensure_table() {
 # in caller-provided out-pointers (interface number + both EP addrs +
 # both MPS values via the same word-pair layout as the HID walker).
 fn xhci_find_msc_bbb_endpoints(total_length,
-out_intf_p, out_in_ep_p, out_out_ep_p, out_in_mps_p, out_out_mps_p) {
+  out_intf_p, out_in_ep_p, out_out_ep_p, out_in_mps_p, out_out_mps_p) {
     var off = 0;
     var in_msc_intf = 0;
     var found_in    = 0;
@@ -200,7 +200,7 @@ out_intf_p, out_in_ep_p, out_out_ep_p, out_in_mps_p, out_out_mps_p) {
 fn msc_get_max_lun(slot_id, interface) {
     xhci_zero_page(xhci_desc_buf_phys);
     if (xhci_control_in(slot_id, 0xA1, 0xFE, 0, interface, 1,
-    xhci_desc_buf_phys) == 0) {
+        xhci_desc_buf_phys) == 0) {
         return 0;   # STALL or other failure — single-LUN per spec
     }
     return load8(xhci_desc_buf_phys) & 0x0F;
@@ -247,7 +247,7 @@ fn msc_probe_slot(slot_id) {
     store16(&ep_in_mps_buf, 0);
     store16(&ep_out_mps_buf, 0);
     if (xhci_find_msc_bbb_endpoints(total_len,
-    &intf_num, &ep_in, &ep_out, &ep_in_mps_buf, &ep_out_mps_buf) == 0) {
+        &intf_num, &ep_in, &ep_out, &ep_in_mps_buf, &ep_out_mps_buf) == 0) {
         return 0;
     }
     var ep_in_mps  = load16(&ep_in_mps_buf);
@@ -593,7 +593,7 @@ fn msc_configure_endpoints(slot_id) {
 
     # Add the bulk pair to the Input Context, then Configure Endpoint.
     if (xhci_input_ctx_add_bulk_pair(ictx, in_ep_addr, in_mps,
-    out_ep_addr, out_mps, speed, in_ring, out_ring) == 0) {
+        out_ep_addr, out_mps, speed, in_ring, out_ring) == 0) {
         kprintln("msc: input ctx add bulk pair failed", 35);
         return 0;
     }
@@ -777,7 +777,7 @@ fn msc_scsi_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in, m
             while (sd < 5000000) { sd = sd + 1; }
         }
         var r = msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len,
-        data_phys, data_len, dir_in);
+          data_phys, data_len, dir_in);
         if (r != 0) { return 1; }
         attempt = attempt + 1;
     }
