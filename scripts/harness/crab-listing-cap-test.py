@@ -13,7 +13,7 @@
 # ⛔ THE ORACLE IS AN EXACT COUNT AGAINST THE STAGED TREE, not "more than before". A cap raised from
 # 32 to 256 shows "more" for any directory over 32 whether or not it is now COMPLETE; only counting
 # the real entries in the seed distinguishes complete from merely-larger.
-import os, socket, subprocess, sys, time
+import os, re, socket, subprocess, sys, time
 
 ROOT   = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 ROOTFS = os.path.join(ROOT, "build/rootfs")
@@ -54,7 +54,7 @@ EXP_BIN  = len(os.listdir(os.path.join(SEED, "bin")))
 EXP_ROOT = len(os.listdir(SEED))
 p(f"seed: /bin/crab <- {CRAB} ({os.path.getsize(CRAB)} bytes)")
 p(f"seed: /bin has {EXP_BIN} entries, / has {EXP_ROOT}")
-p(f"expect {EXP_BIN} + {EXP_ROOT} = {EXP_BIN + EXP_ROOT} stat lines (plus . and .. if the kernel lists them)")
+p(f"expect the /bin pane to report {EXP_BIN} entries")
 
 sh(f"dd if=/dev/zero of={IMG} bs=1M count={DISK_MB} status=none")
 sh(f"parted -s {IMG} mklabel gpt mkpart ESP fat32 1MiB 33MiB set 1 esp on mkpart agnos-fs ext2 33MiB 100%")
@@ -117,15 +117,24 @@ try:
     time.sleep(20.0)
     out = ser()[mark:]
 
+    # ⭐ THE ORACLE IS THE SUMMARY LINE, NOT A COUNT OF PER-ENTRY LINES. crab used to narrate every
+    # entry, and this harness counted those lines — which made the diagnostic the thing being
+    # measured, and 114 console writes per navigation is what made crab feel slow on iron
+    # (2026-08-19). crab 0.4.14 prints one `crab: listed <n> entries in <path>` per readdir and
+    # keeps the per-entry trace behind CRAB_STAT_TRACE=1.
+    listed = {}
+    for lm in re.finditer(r"crab: listed (\d+) entries in (\S+)", out):
+        listed[lm.group(2)] = int(lm.group(1))
     stats = [l for l in out.splitlines() if l.startswith("crab: stat ")]
-    ran   = len(stats) > 0
-    p("crab ran (stat lines seen):", ran)
+    ran   = len(listed) > 0
+    p("crab produced a listing:", ran)
     if not ran:
         p("INCONCLUSIVE: crab produced no listing at all"); p(out[-1200:]); sys.exit(2)
 
     trunc = "listing truncated at the entry cap" in out
-    p(f"stat lines: {len(stats)}   (expected >= {EXP_BIN + EXP_ROOT})")
     p("truncation warning:", trunc)
+    # Per-entry lines are OFF by default since crab 0.4.14 — 0 here is correct and is the point.
+    p(f"per-entry stat lines: {len(stats)} (0 expected unless CRAB_STAT_TRACE=1)")
 
     # /bin is the left pane and is the one over the old 32 cap. Its entries are what must all appear.
     # ⚠ `crab_stat_all` prints the BARE NAME (`crab: stat <name> <size>`), not the joined path — both
@@ -133,13 +142,18 @@ try:
     binnames = set(os.listdir(os.path.join(SEED, "bin")))
     seen = set(l[len("crab: stat "):].rsplit(" ", 1)[0] for l in stats)
     missing = sorted(binnames - seen)
+    p("listings reported:", ", ".join(f"{k}={v}" for k, v in sorted(listed.items())))
+    binlisted = listed.get("/bin", -1)
     # ⚠ `seen` holds BOTH panes; the /bin figure is the intersection. Printing len(seen) overstated
     # it (39 of 45 when only 32 /bin entries were listed — the other 7 were root entries).
-    p(f"/bin entries listed: {len(binnames & seen)}/{len(binnames)}")
-    if missing: p("  MISSING:", " ".join(missing[:12]), "..." if len(missing) > 12 else "")
+    if stats:
+        p(f"/bin names seen in the trace: {len(binnames & seen)}/{len(binnames)}")
+        if missing: p("  MISSING:", " ".join(missing[:12]), "..." if len(missing) > 12 else "")
 
-    if not missing and not trunc:
-        p("PASS: every /bin entry was listed and nothing was truncated"); rc = 0
+    # /bin is the pane that exceeds the old 32 cap; its reported count must equal the real tree.
+    p(f"/bin listed count: {binlisted}  (tree has {EXP_BIN})")
+    if binlisted == EXP_BIN and not trunc:
+        p("PASS: the pane listed every /bin entry and nothing was truncated"); rc = 0
     else:
         p("FAIL: the pane did not list the directory completely"); rc = 1
 finally:

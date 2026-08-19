@@ -140,6 +140,22 @@ try:
     time.sleep(8.0)
     out = ser()[rmark:]
 
+    # ⛔⛔ THE CLIENT'S REPORT IS NOT THE TEST. The first version of this harness asserted only
+    # puka's own line — and it PASSED while the displayed area never changed on iron, because the
+    # compositor answered HS_BAD to every post-commit ATTACH and kept blitting the OLD `#86` slot.
+    # A client saying "I resized" proves intent; the SERVER saying it re-attached proves arrival.
+    # A present the CLIENT could not even make is a different fact from one the server rejected.
+    refused_over_cap = False
+    for rm in re.finditer(r"puka: present REFUSED, rc (\d+) at (\d+)x(\d+)", out):
+        need = int(rm.group(2)) * int(rm.group(3)) * 4
+        if need > 2097152: refused_over_cap = True
+    if refused_over_cap:
+        p("client present refused for a surface over the 2 MB #71 cap: True")
+
+    srv = re.search(r"client re-attached at a new size \(w, then h\):\s*\n\s*(\d+)\s*\n\s*(\d+)", out)
+    p("server accepted a re-attach:", srv is not None)
+    if srv is not None: p(f"  server extent: {srv.group(1)}x{srv.group(2)}")
+
     m = re.search(r"puka: resized by the compositor -- grid (\d+)x(\d+) cells, (\d+)x(\d+) px", out)
     p("resize handled:", m is not None)
     for ln in out.splitlines():
@@ -153,8 +169,27 @@ try:
         exact  = (pw == cols * 8 and ph == rows * 16)   # surface must be a whole number of cells
         p("grid grew past 80x24 :", grew)
         p("px == cells * 8x16   :", exact)
-        if grew and exact and "fb refit FAILED" not in out:
-            p("PASS: the terminal reflowed to the maximized window"); rc = 0
+        # The server's extent must MATCH what the client reflowed to, or the compositor is showing
+        # a different surface than the one puka drew.
+        agree = srv is not None and int(srv.group(1)) == pw and int(srv.group(2)) == ph
+        p("server extent == client extent:", agree)
+        if grew and exact and agree and "fb refit FAILED" not in out:
+            p("PASS: the terminal reflowed AND the compositor re-attached at that extent"); rc = 0
+        elif srv is None and refused_over_cap:
+            # ⛔⛔ NOT A FAILURE — QEMU CANNOT PRESENT THIS SURFACE AT ALL.
+            # setu asks for a `#86` GPU-visible slot (32 MB cap) and falls back to `#71` when there
+            # is no carveout. QEMU has no AMD GPU ("gpu: no AMD GPU found"), so every client buffer
+            # goes through `#71`, whose cap is **2 MB** (agnos syscall.cyr `SHM_MAX_SIZE`). puka
+            # opens at 640x384 = 983 040 B and fits; maximized it needs 16.5 MB and `setu_buf_create`
+            # refuses, so the present never happens and there is nothing for the server to re-attach.
+            # On iron the same surface is 2560x1408 = 14.4 MB against `#86`'s 32 MB and fits.
+            # ⇒ Scoring this FAIL would blame the compositor for an emulation limit.
+            p("INCONCLUSIVE: the maximized surface exceeds QEMU's 2 MB #71 cap (no GPU carveout),")
+            p("              so puka could not present it at all — this path is IRON-ONLY.")
+            rc = 2
+        elif srv is None:
+            p("FAIL: puka reflowed but the compositor never accepted a re-attach — the displayed")
+            p("      area cannot have changed (this is the 2026-08-19 iron defect)"); rc = 1
         else:
             p("FAIL: the event arrived but the grid did not follow correctly"); rc = 1
 finally:
