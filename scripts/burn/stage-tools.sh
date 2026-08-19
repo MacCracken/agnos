@@ -440,4 +440,24 @@ for ca in /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/cert
     fi
 done
 [ -f "$CA_DEST" ] || echo "WARNING: no host CA bundle found — whirl HTTPS will fail (no trust roots on the agnos-fs)"
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# ⭐ WALLPAPERS — aethersafha's assets, staged at the rootfs ROOT so `--wallpaper /<name>.png` works.
+# ⛔ THIS EXISTS BECAUSE A MANUAL COPY IS NOT A TEST FIXTURE. The 2026-08-18 review suite needs a
+# wallpaper on disk, and hand-placing one into build/rootfs/ survives exactly until the next clean
+# rootfs — at which point `--wallpaper` finds nothing, the compositor falls back to the gradient, and
+# the suite reports a PASS for a check it never ran. Staging is the only place that cannot forget.
+# ⚠ The desktop OWNS these (it is the thing that draws them); agnos only carries them to the disk.
+# Operator 2026-08-18: default wallpapers ship with the release, so expect this set to grow.
+AE_WP_DIR="${AE_WP_DIR:-$ROOT/../aethersafha/assets/wallpapers}"
+if [ -d "$AE_WP_DIR" ]; then
+    for _wp in "$AE_WP_DIR"/*.png "$AE_WP_DIR"/*.jpg; do
+        [ -f "$_wp" ] || continue
+        cp "$_wp" "$ROOT/build/rootfs/$(basename "$_wp")"
+        echo "staged: $ROOT/build/rootfs/$(basename "$_wp") ($(wc -c < "$_wp" | tr -d ' ') bytes) <- aethersafha/assets/wallpapers"
+    done
+else
+    echo "WARNING: no aethersafha wallpaper assets at $AE_WP_DIR — --wallpaper has nothing to load"
+fi
+
 exit $rc
