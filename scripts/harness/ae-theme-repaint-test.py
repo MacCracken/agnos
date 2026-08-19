@@ -130,22 +130,38 @@ try:
     def px(img, x, y):
         w, h, d = img; i = (y * w + x) * 3; return tuple(d[i:i+3])
 
-    # ⭐ OPEN THE LAUNCHER FIRST. The operator's burn did exactly this — F2, then theme cycling — and
-    # a launcher that registers no damage leaves the frame partially copied, which reads as "the
-    # background does not follow the theme". Testing the theme in isolation would miss the pairing.
+    # ⭐ EXERCISE THE LAUNCHER FIRST, THEN CLOSE IT. The operator's burn paired F2 with theme
+    # cycling, and a launcher that registers no damage leaves the frame partially copied — so the
+    # pairing is worth reproducing.
+    # ⛔⛔ BUT IT MUST BE CLOSED BEFORE F3, AND THIS HARNESS ORIGINALLY WAS NOT. `lnch_key` SWALLOWS
+    # every key it does not itself use (launcher.cyr:119) — deliberately, because a modal chooser
+    # that leaks keys types into the window behind it. So with the panel up, F3 never reaches the
+    # theme handler: four bursts of eight delivered ZERO switches and the run went INCONCLUSIVE
+    # every time. That is a harness that never performed its experiment, not a compositor defect.
+    # Esc is the launcher's own close key (`HID_ESC` -> LNCH_K_CONSUMED, `lnch_open = 0`).
     if os.environ.get("LNCH", "1") == "1":
         for _ in range(8):
             s.sendall(b"sendkey f2\n"); time.sleep(0.7); drain()
         time.sleep(2.0)
         p("launcher open:", "launcher opened" in ser()[mark:])
+        for _ in range(6):
+            s.sendall(b"sendkey esc\n"); time.sleep(0.7); drain()
+        time.sleep(2.0)
 
     mon(f"screendump {SHOT_A}", 3.0)
     before = read_ppm(SHOT_A)
+    # ⚠ RETRY THE BURST. QEMU drops keys that land between the compositor's once-per-frame HID
+    # drains, so a single burst can deliver ZERO — this run reported "theme switches observed: 0"
+    # and correctly went INCONCLUSIVE, which is a test that never ran, not a pass. Same retry shape
+    # the spawn in ae-resize-fault-test.py needed for the same reason.
     nsw = 0; kmark = len(ser())
-    for _ in range(8):
-        s.sendall(b"sendkey f3\n"); time.sleep(0.7); drain()
-    time.sleep(2.0)
-    nsw = ser()[kmark:].count("theme switched")
+    for attempt in range(4):
+        for _ in range(8):
+            s.sendall(b"sendkey f3\n"); time.sleep(0.7); drain()
+        time.sleep(2.0)
+        nsw = ser()[kmark:].count("theme switched")
+        if nsw > 0: break
+        p(f"  f3 burst {attempt + 1} delivered nothing — retrying")
     mon(f"screendump {SHOT_B}", 3.0)
     after = read_ppm(SHOT_B)
     p("theme switches observed:", nsw)
