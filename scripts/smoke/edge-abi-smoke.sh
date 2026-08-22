@@ -63,7 +63,18 @@ LOG="$LOGS/edge-abi.log"
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 echo "=== AGNOS rung 9a - #92 op 0x08 EDGE_COV ABI battery (EDGE_ABI_SELFTEST, -m 256M) ==="
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
-qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
+# ⛔⛔ 40 s WAS NOT ENOUGH ANY MORE, AND THE FAILURE LOOKED LIKE AN ABI REGRESSION. This battery grew
+# to 167 cases plus the tper-prep (128) and trid-prep (256) check sets, and every case kprints a line
+# over the serial port. At the old 40 s dwell the guest was still mid-battery when the timeout fired,
+# so the log ended abruptly inside the TRI_PERSP section and `chk` reported the cases that had simply
+# not been reached yet as WRONG — including "a real colour at dword 9 was REFUSED", which is the
+# regression guard for aethersafha's chrome text, and "the well-formed BLEND_ALPHA record did not
+# validate". Nothing was wrong with `gpo_validate`; the run was cut off. The tell is the companion
+# failure `AGNOS shell — boot did not reach shell`: the battery never finished, so nothing after it
+# could report. ⚠ Read that line FIRST whenever this smoke goes red — a truncated run indicts every
+# case it never ran.
+# Measured 2026-08-22: PASS at 240 s and at 180 s; the old 40 s reached ~23 of the checks.
+qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-180}" \
     qemu-system-x86_64 \
     -machine q35 -m 256M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \

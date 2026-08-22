@@ -22,6 +22,18 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.46] — 2026-08-17 — cycle OPEN
 
+### Fixed — `edge-abi-smoke` boot dwell 40 s -> 180 s (the battery outgrew its timeout)
+
+The `#92` ABI battery reached 167 cases plus tper-prep (128) and trid-prep (256), each kprinting over
+serial. At a 40 s dwell the guest was still mid-battery when the timeout fired: the log ended inside
+the TRI_PERSP section and `chk` reported every case not yet reached as WRONG — 10 FAIL lines
+including the aethersafha chrome-text regression guard ("a real colour at dword 9 was REFUSED") and
+"the well-formed BLEND_ALPHA record did not validate". `gpo_validate` was never at fault.
+
+The companion failure `AGNOS shell — boot did not reach shell` is the tell that the run was truncated
+and every case after the cut is unindicted. Measured 2026-08-22: PASS at 180 s and 240 s.
+`ARC SWEEP: PASS (19 passed, 0 failed)`; `burn-prep.sh` exits 0.
+
 ### Fixed — a PTY endpoint is now usable by the owner's DESCENDANTS (`#97`)
 
 `chan_auth` accepted only `chan_end_owner[e] == proc_current_get()`, so a program launched by a shell
