@@ -4791,6 +4791,20 @@ var CHAN_REC_BYTES = 64;            # §3: no production setu message exceeds 64
 var chan_end_open[32];              # 1 = this endpoint exists
 var chan_end_owner[32];             # owning pid
 var chan_end_oepoch[32];            # proc_epoch AT CLAIM — pid recycling is why this exists (bite 2)
+# ⭐⭐ 1 = THIS ENDPOINT IS A TERMINAL, and a terminal is SHARED WITH ITS DESCENDANTS.
+# ⛔ WHY THIS EXISTS. One rule was being applied to two different kinds of channel. For a DISPLAY
+# channel "an inherited handle is inert" is correct — a client's children must not draw on the
+# compositor's surface. For a PTY it is wrong by definition: every descendant of a shell holds the
+# terminal, which is what a tty IS. The distinction already existed at endow time (CH_ENDOW_STDIO /
+# `pty_mode`) and simply never reached `chan_auth`, so agnsh under puka could LAUNCH a program and
+# the program's every write was refused — measured in QEMU 2026-08-22: `help` (builtin, agnsh owns
+# the endpoint) rendered +11,186 glyph px while `ls`, `ls /`, `kriya ls` AND `kriya ls /bin` each
+# rendered an identical **266** — agnsh's prompt, and not one byte of any child's output.
+# ⚠ MUST BE CLEARED WHEREVER `chan_end_open` IS — mint, close and release. A stale bit on a recycled
+# endpoint would hand terminal authority to an unrelated channel, which is the exact shape of the
+# `endow_stdio` one-shot the arm code already guards ("a stale flag would silently turn the NEXT
+# unrelated spawn's stdio into a channel").
+var chan_end_pty[32];               # 1 = endowed in PTY mode; descendants of the owner may use it
 var chan_epoch[16];                 # per-CHANNEL generation, bumped at mint; fd-vs-channel staleness
 var chan_epoch_next = 1;
 var chan_w[32];                     # records ever written INTO this endpoint's inbox
@@ -4813,6 +4827,24 @@ fn chan_page(e) { return chan_region_kva + e * 4096; }
 # has to be revoked because nothing was ever granted. A sandbox is DESCRIBED, not CARVED.
 # ⚠ `chan_end_open` is kept separate from `chan_end_owner` because **pid 0 is a real process**, so a
 # zero owner cannot double as "no owner".
+# Is `cur` a descendant of `owner` (or the owner itself)? -> 1 / 0.
+# ⛔ BOUNDED AND CYCLE-GUARDED. `proc_ppid` is a 16-slot pid-indexed array that is REUSED as pids
+# recycle, so a malformed chain is reachable and an unbounded walk here would hang the kernel inside
+# a syscall with interrupts off. 16 steps is the whole table: no legal chain is longer.
+fn chan_pty_descendant(owner, cur) {
+    var p = cur;
+    var steps = 0;
+    while (steps < 16) {
+        if (p == owner) { return 1; }
+        if (p == 0) { return 0; }              # reached init without meeting the owner
+        var np = proc_get_ppid(p);
+        if (np == p) { return 0; }             # self-parent: malformed, refuse rather than spin
+        p = np;
+        steps = steps + 1;
+    }
+    return 0;
+}
+
 fn chan_auth(base) {
     if (ktag(base) != VFS_CHAN) { return 0 - 1; }
     var e = kpayload(base, 0);
@@ -4820,9 +4852,21 @@ fn chan_auth(base) {
     if (e >= CHAN_ENDS) { return 0 - 1; }
     if (load64(&chan_end_open + e * 8) != 1) { return 0 - 1; }
     if (load64(&chan_epoch + (e >> 1) * 8) != kpayload(base, 1)) { return 0 - 1; }   # fd vs CHANNEL
-    if (load64(&chan_end_owner + e * 8) != proc_current_get()) { return 0 - 1; }
-    # pid vs PROCESS — the incarnation check bite 2 exists for.
-    if (load64(&chan_end_oepoch + e * 8) != proc_epoch_get(proc_current_get())) { return 0 - 1; }
+    var owner = load64(&chan_end_owner + e * 8);
+    var cur = proc_current_get();
+    # The owner's own claim — unchanged. pid vs PROCESS, the incarnation check bite 2 exists for.
+    if (owner == cur) {
+        if (load64(&chan_end_oepoch + e * 8) != proc_epoch_get(cur)) { return 0 - 1; }
+        return e;
+    }
+    # ⭐ A TERMINAL IS SHARED WITH ITS DESCENDANTS — and ONLY a terminal. A display channel keeps the
+    # inert-on-inherit rule exactly as before, because this arm is gated on the PTY bit.
+    if (load64(&chan_end_pty + e * 8) != 1) { return 0 - 1; }
+    # ⛔ THE OWNER'S INCARNATION IS CHECKED, NOT THE CALLER'S. The stored epoch belongs to the owner,
+    # so comparing it against the CALLER would refuse every legitimate descendant. Without this the
+    # bit would survive the owner's death into a recycled pid and grant a stranger the terminal.
+    if (load64(&chan_end_oepoch + e * 8) != proc_epoch_get(owner)) { return 0 - 1; }
+    if (chan_pty_descendant(owner, cur) != 1) { return 0 - 1; }
     return e;
 }
 
@@ -4926,6 +4970,7 @@ fn chan_release_pid(pid) {
                     store64(&chan_end_open + e * 8, 0);
                     store64(&chan_end_owner + e * 8, 0);
                     store64(&chan_end_oepoch + e * 8, 0);
+                    store64(&chan_end_pty + e * 8, 0);
                 }
             }
         }
@@ -5052,6 +5097,10 @@ fn chan_place_into_child(child_pid) {
     # rule that makes an inherited copy inert. Endowment is a MOVE, not a share.
     store64(&chan_end_owner + e * 8, child_pid);
     store64(&chan_end_oepoch + e * 8, proc_epoch_get(child_pid));
+    # ⛔ WRITTEN ON BOTH PATHS, never only the PTY one — endpoints are recycled and a leftover 1 would
+    # make the next display endowment inheritable.
+    if (pty_mode != 0) { store64(&chan_end_pty + e * 8, 1); }
+    if (pty_mode == 0) { store64(&chan_end_pty + e * 8, 0); }
     var cb = tbl + f * 32;
     ktag_set(cb, VFS_CHAN);
     kpayload_set(cb, 0, e);
@@ -8252,6 +8301,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
             while (z < 2) {
                 var ee = ea + z;
                 store64(&chan_end_open + ee * 8, 1);
+                store64(&chan_end_pty + ee * 8, 0);      # fresh endpoint: not a terminal until endowed as one
                 store64(&chan_end_owner + ee * 8, me);
                 store64(&chan_end_oepoch + ee * 8, mye);
                 store64(&chan_w + ee * 8, 0);
@@ -8305,6 +8355,16 @@ fn ksyscall(num, arg1, arg2, arg3) {
             var nb = vfs_fd_table() + arg2 * 32;
             var ne = chan_auth(nb);
             if (ne < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            # ⛔⛔ ENDOWMENT REQUIRES REAL OWNERSHIP, NOT MERELY AUTHORITY TO USE. `chan_auth` now also
+            # answers yes to a DESCENDANT of a PTY endpoint's owner — correct for read/write, and
+            # catastrophic here, because `chan_endow_place` MOVES ownership. Without this gate any
+            # program agnsh launches could endow the terminal into a child of its own and agnsh would
+            # silently lose its own stdin/stdout. That is the exact hazard the banner above this block
+            # already names ("you can only endow what you currently own"); the PTY arm would have
+            # quietly widened it from a use-right into a transfer-right.
+            if (load64(&chan_end_owner + ne * 8) != proc_current_get()) {
+                stack_canary_check(canary); return 0 - CH_E_BADFD;
+            }
             var tfd = chan_endow_pick_fd();
             if (tfd < 0) { stack_canary_check(canary); return 0 - CH_E_FULL; }
             endow_arm_set(ne);
@@ -8327,6 +8387,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
             var ce = chan_auth(cb);
             if (ce < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
             store64(&chan_end_open + ce * 8, 0);
+            store64(&chan_end_pty + ce * 8, 0);
             store64(&chan_end_owner + ce * 8, 0);
             store64(&chan_end_oepoch + ce * 8, 0);
             vfs_close(arg2);

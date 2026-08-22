@@ -22,6 +22,28 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.46] — 2026-08-17 — cycle OPEN
 
+### Fixed — a PTY endpoint is now usable by the owner's DESCENDANTS (`#97`)
+
+`chan_auth` accepted only `chan_end_owner[e] == proc_current_get()`, so a program launched by a shell
+whose stdio is an endowed `#97` endpoint had every `read`/`write` on fd 0/1/2 refused with
+`CH_E_BADFD`. Under `/bin/puka` this made agnsh builtins render and every launched program silent.
+
+- New `chan_end_pty[32]`: 1 when the endpoint was endowed with `a4 == CH_ENDOW_STDIO` (1000).
+  Cleared at mint, `CH_CLOSE` and `chan_release_pid`, alongside `chan_end_open`.
+- `chan_auth` accepts a caller that is a descendant of the owner **only** when that flag is 1. The
+  owner's `chan_end_oepoch` is compared against `proc_epoch_get(owner)`; the parent walk uses
+  `proc_get_ppid`, bounded to 16 steps with a self-parent guard.
+- `CH_ENDOW` additionally requires `chan_end_owner[ne] == proc_current_get()`. Endowment MOVES
+  ownership, so descendant authority is a use-right, not a transfer-right.
+
+Display channels are unaffected: the arm is gated on the PTY flag, and an inherited display claim
+stays inert.
+
+Measured, QEMU, `scripts/harness/puka-child-stdout-test.py`, glyph px at RGB (192,192,192):
+`ls` **266 -> 1560**; `kriya ls /bin` 266 -> negative (the window scrolls). Builtin control `help`
+unchanged at +11,186. Before the fix `ls`, `ls /`, `kriya ls` and `kriya ls /bin` all rendered an
+identical 266 — agnsh's prompt.
+
 ### Changed — cyrius pin 6.5.27 -> **6.5.28**; 9 kernel files reformatted
 
 `cyrfmt` did not track parentheses before 6.5.28: continuation lines inside an unclosed `(` were
