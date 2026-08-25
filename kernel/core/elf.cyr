@@ -16,6 +16,10 @@
 var pcpu_elf_hdr_buf[2048];
 fn elf_hdr_buf_base() { return &pcpu_elf_hdr_buf + pcpu_cpu() * 4096; }
 
+var ELF_STACK_SIZE = 0x200000;      # the mapped stack page — also the string-region ceiling
+var ELF_INIT_BLOCK = 0x1FF000;      # SysV control block: [argc][argv..][NULL][envp..][NULL][auxv]
+var ELF_INIT_STR   = 0x1FF100;      # argv/envp string region: ELF_INIT_STR .. ELF_STACK_SIZE
+
 fn elf_load(elf_addr, elf_size) {
     var canary = stack_canary_secret;
     # Verify minimum ELF header size (64 bytes for ELF64)
@@ -135,6 +139,24 @@ fn elf_load(elf_addr, elf_size) {
         }
     }
 
+    # ── Ring-3 initial stack layout ───────────────────────────────────────────
+    # Both loaders map a full 2 MB page for the user stack (pmm_alloc_2mb +
+    # proc_map_page_nx). Until this cycle they set rsp near the BOTTOM of that
+    # page — 0x3000 for the argv path, 0x4000 for the in-memory path — so a
+    # program got 12 KB / 16 KB of downward growth while ~2.03 MB of the SAME
+    # MAPPED PAGE sat unused above rsp. Anything with a big frame died at the
+    # guard page as `run: exit 142` (128+14, #PF) with no other symptom, which
+    # reads like a program bug and is not one: chakshu's `-p` snapshot nests an
+    # 8 KB buffer inside another 8 KB frame and never returned.
+    #
+    # The init block is self-contained (control word, then the argv/envp pointer
+    # array, then the strings), so relocating it to the TOP of the page costs
+    # nothing and hands the program the whole 2 MB. Region sizes are
+    # byte-identical to the old layout — pointer array still 0xF8 (31 slots),
+    # string region still 0xF00 (3840 B) — so argv/envp capacity is unchanged.
+    # Only the base moved; the space below rsp grew 12 KB -> 0x1FF000
+    # (2,093,056 B). The guard page at stack_base - 0x200000 stays unmapped, so
+    # a genuine overflow still traps instead of corrupting a neighbour.
     # User stack: 1.44.x page-table VA-collision fix — FIXED 0x3FC00000 (PD[510], top of
     # the non-identity mmap arena), NOT the old striped 0x800000 + pid*0x400000 which put
     # pid>=2 stacks at >=16 MB (PD[8..63]), overwriting the identity-SUPERVISOR map of the
@@ -156,7 +178,7 @@ fn elf_load(elf_addr, elf_size) {
     proc_map_page_nx(new_cr3, stack_base, stack_phys);   # 1.50.6 W^X: stack is data -> NX
     # S6: unmap guard page below stack to trap overflow
     proc_unmap_page(new_cr3, stack_base - 0x200000);
-    var stack_top = stack_base + 0x4000;
+    var stack_top = stack_base + ELF_INIT_BLOCK;   # was 0x4000 (16 KB); now the whole page
 
     # Create process with its own page tables. 1.46.x #2: proc_create_USER leaves the slot at
     # state=3 (NOT schedulable) so a woken AP can't pick it before the CR3 + ring-3 selectors below
@@ -373,41 +395,41 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     # write the layout via stack_kva (identity <=256 MB, direct-map above) and the program reads it at
     # stack_base+off. Layout at entry: rsp -> [argc][argv0]..[argvN-1][NULL]
     # [envp NULL][auxv AT_NULL(0,0)] ; the argv strings live higher up the page.
-    # Control block at stack offset 0x3000 (16-aligned → rsp 16-aligned, ~12 KB
-    # of stack below it for the program); strings from 0x3100. argv_src is the
+    # Control block at ELF_INIT_BLOCK (16-aligned → rsp 16-aligned, ~2 MB of
+    # stack below it for the program); strings from ELF_INIT_STR. argv_src is the
     # raw command tail ("/bin/argc a b"); argv[0] is its first token. argc ≤ 16.
     var argc = 0;
-    var str_o = 0x3100;
+    var str_o = ELF_INIT_STR;
     var ai = 0;
     while (ai < argv_len) {
         while (ai < argv_len) { if (load8(argv_src + ai) != 32) { break; } ai = ai + 1; }   # skip spaces
         if (ai >= argv_len) { break; }
         if (argc >= 16) { break; }   # 1.46.x: raised 8->16. The argv pointer array
-        # (0x3008..0x3100) plus the 2-entry envp hold ~27 ptr slots, so 16 is safe
+        # (ELF_INIT_BLOCK+8..ELF_INIT_STR) plus the 2-entry envp hold ~27 ptr slots, so 16 is safe
         # headroom for longer positional command lines (e.g. `anuenue <sentence>` —
         # agnos has no working shell pipes yet, so positional argv is the only text
-        # path); the str_o < 0x4000 cap below still bounds total command length.
+        # path); the str_o < ELF_STACK_SIZE cap below still bounds total command length.
         var ts = ai;
         while (ai < argv_len) { if (load8(argv_src + ai) == 32) { break; } ai = ai + 1; }    # to next space
         var tl = ai - ts;
-        # 1.40.8: keep the arg strings within the reserved stack top (0x3100..
-        # 0x4000) — a long command line can't write past the stack region.
-        if (str_o + tl + 1 >= 0x4000) { break; }
+        # 1.40.8: keep the arg strings within the reserved stack top
+        # (ELF_INIT_STR..ELF_STACK_SIZE) — a long command line can't write past the stack region.
+        if (str_o + tl + 1 >= ELF_STACK_SIZE) { break; }
         var k = 0;
         while (k < tl) { store8(stack_kva +str_o + k, load8(argv_src + ts + k)); k = k + 1; }
         store8(stack_kva +str_o + tl, 0);                                                   # NUL
-        store64(stack_kva +0x3008 + argc * 8, stack_base + str_o);                          # argv[argc] -> string VA
+        store64(stack_kva + ELF_INIT_BLOCK + 8 + argc * 8, stack_base + str_o);                          # argv[argc] -> string VA
         str_o = str_o + tl + 1;
         argc = argc + 1;
     }
-    store64(stack_kva +0x3000, argc);                          # argc
-    store64(stack_kva +0x3008 + argc * 8, 0);                  # argv NULL
+    store64(stack_kva + ELF_INIT_BLOCK, argc);                          # argc
+    store64(stack_kva + ELF_INIT_BLOCK + 8 + argc * 8, 0);                  # argv NULL
 
     # 1.43.2: stage a minimal envp (HOME=/ , PWD=/) so ring-3 getenv() resolves on
     # agnos — previously envp was an immediate NULL, so getenv("HOME") always
     # returned 0 (the .agnshrc / commandress $PWD gap). SysV layout: the envp
     # pointer array follows the argv NULL, NULL-terminated, then the AT_NULL auxv.
-    # The "KEY=VALUE" strings share the 0x3100..0x4000 string region (str_o = the
+    # The "KEY=VALUE" strings share the ELF_INIT_STR..ELF_STACK_SIZE string region (str_o = the
     # next free offset after the argv strings). cyrius's agnos runtime reads these
     # via `_agnos_init_rsp + 8 + (argc+1+i)*8` (args_agnos.cyr) once getenv() gains
     # its agnos branch (cyrius-side, 1.43.2 language work). A uniform kernel-default
@@ -416,20 +438,20 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     var envc = 0;
     if (env_src == 0) {
         # No caller env: the uniform kernel default (the 1.43.2 behavior, byte-identical).
-        if (str_o + 7 < 0x4000) {                                # "HOME=/" + NUL
+        if (str_o + 7 < ELF_STACK_SIZE) {                                # "HOME=/" + NUL
             store8(stack_kva +str_o + 0, 72);  store8(stack_kva +str_o + 1, 79);
             store8(stack_kva +str_o + 2, 77);  store8(stack_kva +str_o + 3, 69);
             store8(stack_kva +str_o + 4, 61);  store8(stack_kva +str_o + 5, 47);
             store8(stack_kva +str_o + 6, 0);
-            store64(stack_kva +0x3008 + (argc + 1 + envc) * 8, stack_base + str_o);
+            store64(stack_kva + ELF_INIT_BLOCK + 8 + (argc + 1 + envc) * 8, stack_base + str_o);
             str_o = str_o + 7;
             envc = envc + 1;
         }
-        if (str_o + 6 < 0x4000) {                                # "PWD=/" + NUL
+        if (str_o + 6 < ELF_STACK_SIZE) {                                # "PWD=/" + NUL
             store8(stack_kva +str_o + 0, 80);  store8(stack_kva +str_o + 1, 87);
             store8(stack_kva +str_o + 2, 68);  store8(stack_kva +str_o + 3, 61);
             store8(stack_kva +str_o + 4, 47);  store8(stack_kva +str_o + 5, 0);
-            store64(stack_kva +0x3008 + (argc + 1 + envc) * 8, stack_base + str_o);
+            store64(stack_kva + ELF_INIT_BLOCK + 8 + (argc + 1 + envc) * 8, stack_base + str_o);
             str_o = str_o + 6;
             envc = envc + 1;
         }
@@ -438,7 +460,7 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
         # each non-empty "KEY=VALUE" into the string region + an envp pointer, mirroring the
         # argv tokenizer above. Defensive bounds even though sc_env_blob_ok pre-validated:
         # envc < 16 (the pointer-array/string-base invariant — see sc_env_blob_ok) and the
-        # 0x4000 string-region guard (shared with argv — long argv lines are real, attn11).
+        # ELF_STACK_SIZE string-region guard (shared with argv — long argv lines are real, attn11).
         var ei = 0;
         while (ei < env_len) {
             var es = ei;
@@ -446,21 +468,21 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
             var el = ei - es;
             if (el > 0) {
                 if (envc >= 16) { break; }
-                if (str_o + el + 1 >= 0x4000) { break; }
+                if (str_o + el + 1 >= ELF_STACK_SIZE) { break; }
                 var ek = 0;
                 while (ek < el) { store8(stack_kva +str_o + ek, load8(env_src + es + ek)); ek = ek + 1; }
                 store8(stack_kva +str_o + el, 0);
-                store64(stack_kva +0x3008 + (argc + 1 + envc) * 8, stack_base + str_o);
+                store64(stack_kva + ELF_INIT_BLOCK + 8 + (argc + 1 + envc) * 8, stack_base + str_o);
                 str_o = str_o + el + 1;
                 envc = envc + 1;
             }
             ei = ei + 1;
         }
     }
-    store64(stack_kva +0x3008 + (argc + 1 + envc) * 8, 0);     # envp NULL
-    store64(stack_kva +0x3008 + (argc + 2 + envc) * 8, 0);     # auxv AT_NULL type
-    store64(stack_kva +0x3008 + (argc + 3 + envc) * 8, 0);     # auxv AT_NULL val
-    var stack_top = stack_base + 0x3000;                         # rsp -> argc
+    store64(stack_kva + ELF_INIT_BLOCK + 8 + (argc + 1 + envc) * 8, 0);     # envp NULL
+    store64(stack_kva + ELF_INIT_BLOCK + 8 + (argc + 2 + envc) * 8, 0);     # auxv AT_NULL type
+    store64(stack_kva + ELF_INIT_BLOCK + 8 + (argc + 3 + envc) * 8, 0);     # auxv AT_NULL val
+    var stack_top = stack_base + ELF_INIT_BLOCK;                         # rsp -> argc
 
     # 1.46.x #2: create the proc NOT-yet-schedulable (state=3). elf_load_from_file does NOT set ring-3
     # selectors (the caller does — #43) or it's run out-of-band (#37 via exec_and_wait), so the proc is

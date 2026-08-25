@@ -22,6 +22,38 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.46] — 2026-08-17 — cycle OPEN
 
+### Fixed — ring-3 initial stack: 12 KB usable -> 2,093,056 B (`elf.cyr`)
+
+Both ELF loaders map a full 2 MB page for the user stack (`pmm_alloc_2mb` + `proc_map_page_nx` at
+`stack_base` 0x3FC00000), then set the entry `rsp` near the BOTTOM of that page: `stack_base + 0x3000`
+in `elf_load_from_file`, `stack_base + 0x4000` in `elf_load`. Downward growth was therefore capped at
+12 KB / 16 KB while ~2.03 MB of the same mapped page sat above `rsp`, unused.
+
+A ring-3 program whose frames exceeded that cap ran off the bottom into the guard page and was killed
+with exit code **142** (128 + 14, #PF). No fault line is printed for this path, so the only symptom was
+`run: exit 142`.
+
+The SysV init block (control word, argv/envp pointer array, strings) is self-contained, so it moved to
+the top of the page:
+
+| constant | value | region |
+|---|---|---|
+| `ELF_STACK_SIZE` | 0x200000 | mapped stack page; also the string-region ceiling |
+| `ELF_INIT_BLOCK` | 0x1FF000 | `[argc][argv..][NULL][envp..][NULL][auxv]` — entry `rsp` |
+| `ELF_INIT_STR` | 0x1FF100 | argv/envp strings, up to `ELF_STACK_SIZE` |
+
+Region sizes are byte-identical to the previous layout — pointer array 0xF8 (31 slots), string region
+0xF00 (3840 B) — so the argv cap (16), envc cap (16) and total command-line length are unchanged. The
+guard page at `stack_base - 0x200000` stays unmapped. Usable stack below `rsp` is now 0x1FF000
+(2,093,056 B) for both loaders.
+
+Measured under QEMU (q35, 512M, nvme): a probe taking 16 KB, 64 KB, 256 KB and 1 MB single-frame
+locals returns 1 from each and prints `survived all`; 16 KB was `run: exit 142` before. `agnsh` boots
+and `run /bin/shu -p` receives its `-p` argument, so the relocated argv/envp block still parses.
+chakshu's `-p` snapshot and its TUI both run on AGNOS as of this fix.
+
+Build: `build/agnos` 1,981,096 B. `scripts/test.sh` 4 passed; `scripts/check.sh` 28 passed.
+
 ### Fixed — `edge-abi-smoke` boot dwell 40 s -> 180 s (the battery outgrew its timeout)
 
 The `#92` ABI battery reached 167 cases plus tper-prep (128) and trid-prep (256), each kprinting over
