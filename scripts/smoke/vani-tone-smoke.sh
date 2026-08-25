@@ -60,12 +60,19 @@ cp "$BUNDLE" "$CB/vani-core.cyr"
 # Reuse the canonical vanitone source, swapping its include from the in-repo
 # src/alsa.cyr to the bundled vani-core.cyr so the build needs no yukti.
 sed 's|include "src/alsa.cyr"|include "vani-core.cyr"|' "$VANI_ROOT/programs/vanitone.cyr" > "$CB/vanitone.cyr"
+# ⚠ NO `cyrius = ` PIN HERE, DELIBERATELY (2026-08-24). This heredoc used to hardcode
+# cyrius = "6.4.2" — an EIGHTH nested manifest that no manifest grep and no git-based gate can
+# see, because it is written into build/ (gitignored) at runtime. It is the same defect that
+# broke CI on 2026-08-24 from tests/gpu, and scripts/check/toolchain-pin-check.sh is
+# structurally blind to it. A pin-less manifest resolves the ACTIVE toolchain instead, which on
+# a runner is by definition the one CI installed from the root manifest — so this fixture can
+# never again claim a toolchain nobody has. It is a throwaway consumer used to prove the bundle
+# builds; pinning it was never buying anything.
 cat > "$CB/cyrius.cyml" <<'EOF'
 [package]
 name = "vanitone"
 version = "0.0.1"
 language = "cyrius"
-cyrius = "6.4.2"
 
 [build]
 entry = "vanitone.cyr"

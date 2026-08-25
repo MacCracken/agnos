@@ -58,4 +58,53 @@ tests/gpu/gen/
 #   · all 11 rebuilt BYTE-IDENTICAL to the committed copies, so tracking them carried no information.
 # ⚠ Four of the 51 — au, gpublit_cmp, inc_probe, szprobe — had NO .cyr source anywhere in the tree
 # and no reference from any script or doc: binaries the repo could not regenerate even in principle.
-tests/gpu/build/
+#
+# ⛔⛔ WIDENED gpu -> * ON 2026-08-24, BECAUSE THE 1.56.44 PURGE ONLY SWEPT ONE OF SEVEN DIRECTORIES.
+# The rule above was written as `tests/gpu/build/` and TWELVE fossils survived it in the other six:
+#   tests/audio/build/{tonegen,tonegen_agnos}  tests/blk/build/{blkprobe,blkwr,gptwr}
+#   tests/chan/build/{chantest,chanx,ptyhost,ptyx}  tests/fault/build/faulter_agnos
+#   tests/fp/build/fpex  tests/symlink/build/symtest
+# ⚠ AND THEY WERE NOT BYTE-IDENTICAL, which is what separates this from the gpu case. Rebuilt at the
+# 6.5.28 pin, every one measured differed from its committed copy — symtest 13,856 B committed vs
+# 18,552 B built, gptwr 93,368 vs 97,880, blkprobe/blkwr 17,920 vs 18,328. So the 11 gpu tools'
+# "tracking them carried no information" did NOT hold here: these carried WRONG information, from a
+# toolchain nobody can now name.
+# ⚠⚠ WORSE, ONE OF THEM DEFEATED THE VERY FIX THE NOTE ABOVE DESCRIBES. stage_one's build-if-absent
+# (scripts/burn/stage-tools.sh) fires on `[ -f "$bin" ] || _autobuild=1` — a TRACKED fossil is always
+# present, so `faulter_agnos` and `tonegen_agnos` could never take that path. The repair the gpu purge
+# shipped was inert for the two in-tree rows outside tests/gpu; it only LOOKED complete because the
+# ignore beside it stopped at one directory. ⇒ The gitignore rule and the auto-build repair have to
+# cover the same set, or the second is a comment about the first.
+# ⚠ `tests/chan/build/{ptyhost,ptyx}` had the one real consumer that read a binary WITHOUT building it
+# (scripts/harness/pty-host-test.py); it now builds-if-absent, mirroring stage_one. `tonegen_agnos`
+# had no consumer at all.
+tests/*/build/
+
+# Vendored stdlib snapshots. ⛔ NEVER COMMIT THESE — same argument as the build artifacts above, one
+# layer down: `cyrius deps` (which `cyrius build` runs BY DEFAULT, no flag) rewrites tests/*/lib/ from
+# the pinned toolchain on every single build, so a committed copy is overwritten before it is ever
+# read. It cannot influence a build; it can only produce diff noise and misinform a reader.
+#
+# ⛔ AND IT DID BOTH (found 2026-08-24). tests/symlink/lib/ and tests/blk/lib/ held 7 syscalls*.cyr
+# each that matched NO installed snapshot — not the 6.5.28 pin, not the 6.5.27 it had just moved off,
+# not the 6.5.35 on the dev box. Both predate v6.4.51 (no `signal_ignore`, no `signal_default`), so
+# they had been fossils across dozens of releases. Last touched by "1.51.0 work" and "move folders".
+# ⚠ The FIVE other dirs matched 6.5.28 exactly — which is the trap: staleness here is silent and
+# per-directory, and the two that had drifted were indistinguishable from the five that had not
+# without diffing all 88 files against ~/.cyrius/versions/. Nothing in the tree did that.
+# ⚠ .gitignore's `/lib/` (line 9) is ROOT-ANCHORED, so it never covered these. That is the only
+# reason 88 vendored files were tracked at all — an omission, never a decision.
+#
+# Nothing needs them committed, and it was checked rather than assumed:
+#   · every tests/* manifest declares `[deps] stdlib = [...]` ONLY — no `[deps.NAME]` git deps — so
+#     resolution copies from ~/.cyrius/versions/<pin>/lib/, a LOCAL path. Verified by building
+#     tests/symlink with lib/ deleted under `unshare -rn` (no network at all): it succeeded and
+#     repopulated all 7 files byte-identical to the 6.5.28 pin.
+#   · no script or CI step builds a tests/* dir with `--no-deps`; every one (host-gpu-oracles.sh,
+#     the smoke scripts, stage-tools.sh) uses a plain `cyrius build`, which resolves deps first.
+#   · `--no-deps` would not read these anyway — it skips the stdlib include INJECTION entirely, so
+#     tests/symlink fails `undefined function 'sys_symlink'` with a FRESH lib/ just as with a stale
+#     one. There is no build mode in which a committed snapshot is the thing that gets compiled.
+#   · no cyrius.lock is written for stdlib-only manifests (the lock covers `[deps.NAME]` git deps),
+#     so untracking lib/ strands nothing — confirmed, no lock appears after a tests/* build.
+tests/*/lib/

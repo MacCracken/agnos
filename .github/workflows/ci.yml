@@ -66,6 +66,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Toolchain pin consistency
+        # ⛔ ADDED 2026-08-24 AFTER THIS EXACT DRIFT BROKE CI. Every job below installs ONE cyrius,
+        # read from the ROOT manifest. The wrapper resolves cyrius.cyml at the COMPILE CWD with NO
+        # ancestor walk-up, so `cd tests/gpu && cyrius build` (host-gpu-oracles.sh:179) resolves
+        # tests/gpu/cyrius.cyml instead — and a pin this runner did not install is a HARD ERROR:
+        #   error: cyrius.cyml pins version 6.5.27 but cyrius binary is not installed at
+        #          /home/runner/.cyrius/versions/6.5.27/bin/cyrius
+        # History: 362abd2 hand-synced all seven nested manifests to the then-root 6.5.27; ae46d32
+        # ("fixing format") moved the root to 6.5.28 two days later and stranded all seven again.
+        # One number, eight hand-maintained copies, bumped in separate commits.
+        #
+        # ⚠ RUNS BEFORE THE TOOLCHAIN INSTALL, DELIBERATELY. The gate is pure text comparison and
+        # needs no cyrius — so it still reports when the install itself is the thing that is wrong,
+        # and it fails in seconds instead of after a full build.
+        # ⚠ It CANNOT be a local-only gate: the dev box caches every version, so a stale nested pin
+        # resolves there and degrades to a warning. This is green-local / red-CI by construction,
+        # which is precisely why it must live in CI and not only in scripts/check.sh.
+        run: sh scripts/check/toolchain-pin-check.sh
+
+      - name: No regenerated files tracked
+        # ⛔ ADDED 2026-08-24. tests/*/lib/ is rewritten from the pinned toolchain by `cyrius deps`,
+        # which `cyrius build` runs BY DEFAULT — so a committed copy is overwritten before it is ever
+        # read, and its only effects are diff churn and misinforming whoever reads it. tests/*/build/
+        # is worse: a committed binary does not fail when it goes stale, it AGREES. `edgeasm` printed
+        # "B4 PASS" from a fossil while `edgeasm.cyr` beside it could not compile at all (1.56.44).
+        # That purge gitignored ONE of seven directories; twelve build fossils and 88 vendored stdlib
+        # files survived in the rest until this gate.
+        #
+        # ⚠ RUNS BEFORE THE TOOLCHAIN INSTALL, like the pin gate above and for the same reason: it is
+        # a pure index+ignore comparison, needs no cyrius, and fails in seconds rather than after a
+        # full build. ⚠ It must be in CI and not only in scripts/check.sh — CI is the only place that
+        # sees a fresh checkout, which is the exact state a tracked-artifact bug is about.
+        run: sh scripts/check/vendored-artifact-check.sh
+
       - name: Install Cyrius toolchain
         # Use cyrius's canonical installer (published as a release asset
         # alongside each tarball). Reads CYRIUS_VERSION from cyrius.cyml.
@@ -181,6 +215,12 @@ jobs:
 
       - name: Run test suite
         run: sh scripts/test.sh
+
+      - name: Toolchain pin consistency
+        # Repeated from the `check` job on purpose: `check` and `test` run in PARALLEL, so without
+        # this the GPU oracle step below still dies with the cryptic wrapper error while the crisp
+        # diagnosis appears in a different job's log. Costs milliseconds and invokes no compiler.
+        run: sh scripts/check/toolchain-pin-check.sh
 
       - name: Host GPU oracles
         # ⛔ ADDED 1.56.44, CLOSING A HOLE THE TREE HAD ARGUED ITSELF OUT OF. Before this step,

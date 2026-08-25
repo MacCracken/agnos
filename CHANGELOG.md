@@ -22,6 +22,69 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.46] — 2026-08-17 — cycle OPEN
 
+### Fixed — CI: seven nested `cyrius.cyml` pinned a toolchain no runner installs
+
+`.github/workflows/ci.yml` installs exactly one toolchain, read from the ROOT manifest
+(`export CYRIUS_VERSION="$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)"`, at lines 37/84/169/233/417
+and `release.yml:44`). The root pins **6.5.28**; `tests/{audio,blk,chan,fault,fp,gpu,symlink}/cyrius.cyml`
+all pinned **6.5.27**.
+
+The wrapper resolves `cyrius.cyml` from the compile CWD with no ancestor walk-up and no merge
+(`cyrius cbt/deps.cyr:203-245`), and `_try_redirect_to_pinned` (`cbt/cyrius.cyr:113-175`) hard-errors when
+the pinned version is absent from `$CYRIUS_HOME/versions/`. So `scripts/check/host-gpu-oracles.sh:179`
+(`cd "$GPU" && cyrius build "$t.cyr"`) failed on its first oracle:
+
+```
+host-gpu-oracles: FAIL -- texlist.cyr does not BUILD
+error: cyrius.cyml pins version 6.5.27 but cyrius binary is not installed at
+       /home/runner/.cyrius/versions/6.5.27/bin/cyrius
+```
+
+All seven are now **6.5.28**. Measured: all 61 `.cyr` files across the seven dirs compile to
+byte-identical binaries under 6.5.27 and 6.5.28, and all 18 oracles the runner iterates exit 95 under
+both — the 6.5.27/6.5.28 stdlib snapshots differ in one file (`freelist.cyr`), which no test dir vendors.
+Verified end to end against a synthetic runner containing only 6.5.28: 18/18 oracles PASS; reverting
+`tests/gpu` to 6.5.27 reproduces the failure above verbatim.
+
+Blast radius: 14 invocation sites `cd` into a nested-manifest dir; only `host-gpu-oracles.sh` is
+CI-wired, so the other 13 fail identically the moment they run on any single-toolchain box. Release is
+gated too — `release.yml` job `ci` uses `ci.yml`.
+
+### Added — `scripts/check/toolchain-pin-check.sh`, gating the pin across the tree
+
+Prior history: `362abd2` hand-synced all seven nested manifests to the then-root 6.5.27; `ae46d32`
+moved the root to 6.5.28 two days later and stranded all seven. One number, eight hand-maintained
+copies, bumped in separate commits. `tests/gpu/cyrius.cyml` and the root manifest each instruct a
+human to move the other in the same edit; that is the whole mechanism, and it has now failed.
+
+The gate asserts every `cyrius.cyml` in the tree pins the ROOT value, using CI's exact PCRE
+extraction so the two can never disagree about what the root pin is.
+
+**It never invokes `cyrius`.** A dev box caches every version, so a stale nested pin resolves there and
+degrades to `warning: ... toolchain drift`; the runner has one version and it is an error. The warning
+also compares the pin against the installed cycc rather than the root pin, so a correct manifest warns
+in identical words. Any gate that built something to test the pin would inherit that green-local /
+red-CI asymmetry. This one compares strings in files.
+
+Enumeration is `git ls-files --cached --others --exclude-standard` (so `.gitignore` owns the `build/`
+and `.claude/` exclusions, and a new sub-project's manifest is gated the moment it is written, before
+it is committed) minus the tracked vendored `*/lib/` snapshots. Wired at `ci.yml` in both `check` and
+`test` — in `check` it runs BEFORE the toolchain install, since it needs no toolchain — and registered
+in `scripts/check.sh` as `--- Toolchain ---`, ahead of `--- Build ---`.
+
+Falsified in-file, all five directions confirmed red: reverse drift (one nested reverted), forward
+drift (root bumped alone — the `ae46d32` shape), a nested manifest with no pin at all, fewer than two
+manifests found (vacuous enumeration), and an unreadable root pin.
+
+### Fixed — `vani-tone-smoke.sh` generated an eighth manifest pinning 6.4.2
+
+`scripts/smoke/vani-tone-smoke.sh:63-73` wrote a `cyrius.cyml` containing `cyrius = "6.4.2"` into
+`build/` (gitignored) and built from that directory — invisible to any manifest grep and to the new
+gate. The generated manifest now carries no `cyrius` key, so it resolves the active toolchain, which
+on a runner is the one installed from the root manifest.
+
+`scripts/check.sh` 29 passed (was 28); `scripts/test.sh` 4 passed. `build/agnos` 1,981,096 B.
+
 ### Fixed — ring-3 initial stack: 12 KB usable -> 2,093,056 B (`elf.cyr`)
 
 Both ELF loaders map a full 2 MB page for the user stack (`pmm_alloc_2mb` + `proc_map_page_nx` at

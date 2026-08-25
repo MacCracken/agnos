@@ -101,11 +101,24 @@ def sh(cmd):
 subprocess.run(["rm", "-rf", WORK]); os.makedirs(WORK, exist_ok=True)
 subprocess.run(["cp", "-a", ROOTFS, SEED])
 # ⭐ ipc BITE 9: stage the ring-3 PTY host and the unmodified child it hosts.
+# ⚠ BUILD-IF-ABSENT, mirroring stage_one's `agnos/*` rows (scripts/burn/stage-tools.sh). These two
+# binaries were TRACKED until 2026-08-24, so this branch could never fire and the "missing" error it
+# printed was unreachable — the harness always found a fossil and staged it. .gitignore's
+# `tests/*/build/` block has the measurements; the short version is that a committed --agnos binary is
+# evidence about whatever source existed when someone last ran a compiler, and a stale oracle does not
+# fail, it agrees. Building here makes the absence produce a BUILD, not an error telling a human to go
+# type the command that is right there in the string. In-tree row, so it compiles under agnos's own
+# pin — the same reason stage_one scopes its auto-build to `agnos/*` and not to sibling repos.
 for _b in ("ptyhost", "ptyx"):
     _src = os.path.join(ROOT, "tests/chan/build", _b)
     if not os.path.exists(_src):
-        print("FAIL: missing", _src, "(cd tests/chan && cyrius build --agnos %s.cyr build/%s)" % (_b, _b))
-        sys.exit(1)
+        print("building", _b, "(--agnos) — no build present ...")
+        _r = subprocess.run("cyrius build --agnos %s.cyr build/%s" % (_b, _b),
+                            shell=True, cwd=os.path.join(ROOT, "tests/chan"),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if _r.returncode != 0 or not os.path.exists(_src):
+            print("FAIL: could not build", _src, "\n", _r.stderr.decode("latin1")[:400])
+            sys.exit(1)
     subprocess.run(["cp", _src, os.path.join(SEED, "bin", _b)])
     subprocess.run(["chmod", "+x", os.path.join(SEED, "bin", _b)])
 sh(f"dd if=/dev/zero of={IMG} bs=1M count=128 status=none")

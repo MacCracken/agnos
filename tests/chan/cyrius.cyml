@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Host-side SEMANTIC PROOF for the local-IPC channel band (#97). Asserts the record/batch/liveness contract from planning/ipc.md §9 against Linux socketpair(SOCK_SEQPACKET) BEFORE any kernel code exists — bite 3 of the twelve-bite migration. Zero kernel lines, zero QEMU."
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.5.27"   # the release that landed the #97 chan_* peer (SYS_CHAN_OP + sys_chan_* wrappers)
+cyrius = "6.5.28"   # the release that landed the #97 chan_* peer (SYS_CHAN_OP + sys_chan_* wrappers)
 
 [build]
 entry = "chantest.cyr"

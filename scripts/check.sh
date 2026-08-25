@@ -37,6 +37,42 @@ check() {
 echo "=== AGNOS Check ==="
 echo ""
 
+# Toolchain pins. CI installs ONE cyrius, read from the ROOT manifest (ci.yml:37 and four sibling
+# jobs). A nested cyrius.cyml pinning anything else is a claim on a toolchain no runner has — and the
+# wrapper resolves the manifest at the COMPILE CWD, so `cd tests/gpu && cyrius build`
+# (host-gpu-oracles.sh:179) hard-errors "pins version X but cyrius binary is not installed" and takes
+# that whole gate down with it. That is exactly how 2026-08-24 CI broke.
+# ⛔ THIS IS THE FIRST GATE HERE THAT IS GREEN-LOCAL / RED-CI BY CONSTRUCTION, WHICH IS WHY IT EXISTS.
+# This box caches every cyrius version, so a stale nested pin RESOLVES and degrades to a warning; the
+# runner has one version and it is an error. Worse, the warning compares the pin to the INSTALLED
+# cycc, not to the root pin — so a CORRECT manifest warns in identical words and the warning cannot
+# say which file is broken. ⚠ The gate therefore NEVER INVOKES cyrius: it compares pin strings in
+# files, so its verdict does not depend on ~/.cyrius/versions/. A gate that built something to test
+# the pin would reproduce the very asymmetry it is meant to catch.
+# It runs FIRST because a broken toolchain precondition should report as TOOLING, not as a downstream
+# red gate — the same reason host-gpu-oracles.sh runs mabda-resolve.sh before its loop.
+echo "--- Toolchain ---"
+sh "$ROOT/scripts/check/toolchain-pin-check.sh" > /tmp/toolchain-pin-check.log 2>&1 && rc=0 || rc=$?
+check "all cyrius.cyml pins match the root pin" $rc
+[ "$rc" = "0" ] || cat /tmp/toolchain-pin-check.log
+echo ""
+
+# Regenerated files must not be tracked. Grouped with the toolchain gate because it shares that gate's
+# two properties: it invokes NO compiler (its verdict comes from the git index and the ignore rules, so
+# it answers the same on a box caching every cyrius version and on a runner with one), and it is a
+# precondition — a fossil binary under tests/*/build/ makes every downstream oracle a report about
+# whatever source existed when someone last ran a compiler.
+# ⛔ 2026-08-24: the 1.56.44 purge that gitignored tests/gpu/build/ swept ONE of seven directories.
+# Twelve fossils survived in the other six and were NOT byte-identical to a rebuild (symtest 13,856 B
+# committed vs 18,552 B built), and 88 vendored stdlib files under tests/*/lib/ were tracked besides —
+# two of those dirs matching NO installed snapshot, missing v6.4.51's signal_ignore. See the script
+# header. ⚠ Mutation-tested in all four failure paths (tracked file, missing ignore rule, and both
+# vacuity floors); a negative assertion that has never been forced red is not a gate.
+sh "$ROOT/scripts/check/vendored-artifact-check.sh" > /tmp/vendored-artifact-check.log 2>&1 && rc=0 || rc=$?
+check "no regenerated files tracked under tests/*/{lib,build}" $rc
+[ "$rc" = "0" ] || cat /tmp/vendored-artifact-check.log
+echo ""
+
 # Build
 echo "--- Build ---"
 sh "$ROOT/scripts/build.sh" > /dev/null 2>&1 && rc=0 || rc=$?
