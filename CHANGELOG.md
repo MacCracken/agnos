@@ -85,6 +85,78 @@ on a runner is the one installed from the root manifest.
 
 `scripts/check.sh` 29 passed (was 28); `scripts/test.sh` 4 passed. `build/agnos` 1,981,096 B.
 
+### Fixed — 88 vendored stdlib files + 12 build artifacts were tracked under `tests/*/`
+
+`.gitignore`'s `/lib/` is root-anchored, so it never covered `tests/*/lib/`. 88 vendored stdlib files
+were tracked across the seven test projects.
+
+`tests/symlink/lib/` and `tests/blk/lib/` (7 `syscalls*.cyr` each) matched **no** installed snapshot —
+not the 6.5.28 pin, not the 6.5.27 they had just moved off, not the 6.5.35 on the dev box. Both predate
+**v6.4.51**: no `signal_ignore`, no `signal_default`. Last written by `ca3219c` ("1.51.0 work") and
+`afa9808` ("move folders"). The other five dirs matched 6.5.28 byte for byte.
+
+The committed copies could not affect a build in either direction:
+
+- `cyrius deps` runs on every `cyrius build` **by default** and rewrites `lib/` from the pin, so the
+  snapshot is overwritten before it is read. Building `tests/symlink` rewrote all 7 files.
+- `--no-deps` does not read `lib/` either — it skips the stdlib include injection entirely, so
+  `tests/symlink` fails `undefined function 'sys_symlink'` against a **fresh** `lib/` exactly as against
+  a stale one. There is no build mode in which a committed snapshot is what gets compiled.
+- No `cyrius.lock` is written for stdlib-only manifests (the lock covers `[deps.NAME]` git deps), so
+  untracking strands nothing.
+
+`error: 'sys_symlink' expects 2 arguments, got 4` at `symtest.cyr:38` is **not** a staleness symptom: it
+is a host-target build of an `--agnos`-only program, and it reproduces verbatim against the fresh 6.5.28
+snapshot. `sys_symlink` is 2-arg in `syscalls_x86_64_linux.cyr` and 4-arg (a4 in r10) in
+`syscalls_x86_64_agnos.cyr`. Build it with `--agnos`.
+
+Twelve binaries were tracked under `tests/*/build/` — audio 2, blk 3, chan 4, fault 1, fp 1, symlink 1.
+The 1.56.44 purge covered `tests/gpu/build/` only. Unlike the 11 gpu tools, these were **not**
+byte-identical to a rebuild at the 6.5.28 pin:
+
+| binary | committed | rebuilt |
+|---|---|---|
+| `tests/symlink/build/symtest` | 13,856 B | 18,552 B |
+| `tests/blk/build/gptwr` | 93,368 B | 97,880 B |
+| `tests/blk/build/blkprobe` | 17,920 B | 18,328 B |
+| `tests/blk/build/blkwr` | 17,920 B | 18,328 B |
+
+`stage_one`'s build-if-absent (`scripts/burn/stage-tools.sh`, `[ -f "$bin" ] || _autobuild=1`) could
+never fire for `faulter_agnos` or `tonegen_agnos`: a tracked fossil is always present. The 1.56.44
+repair was inert for the two in-tree rows outside `tests/gpu`.
+
+Both classes are now untracked (`git rm -r --cached`; files stay on disk). `.gitignore` `tests/gpu/build/`
+widened to `tests/*/build/`, plus `tests/*/lib/`.
+
+Verified: with `lib/` and `build/` deleted in all seven dirs and no network (`unshare -rn`), every
+project builds — the stdlib resolves from `$CYRIUS_HOME/versions/6.5.28/lib/`, a local path, and
+repopulates byte-identical to the pin. `git status --porcelain` is empty after builds in all seven, and
+after `scripts/check.sh` + `scripts/test.sh`.
+
+### Added — `scripts/check/vendored-artifact-check.sh`, gating both classes
+
+Asserts two properties: nothing tracked under `tests/*/{lib,build}/`, and both paths ignored. The second
+is not decoration — `git rm --cached` without a matching ignore converts 100 tracked files into 100
+untracked ones, and every build leaves the tree dirty.
+
+**It never invokes `cyrius`.** Its verdict comes from the git index and the ignore rules, so it answers
+identically on a box caching every toolchain version and on a runner with one — the same property
+`toolchain-pin-check.sh` is built around.
+
+Falsified in-file, all four directions confirmed red: a tracked artifact (`git add -f`), a narrowed
+ignore rule, fewer than 20 tracked files under `tests/` (vacuous enumeration), and a `tests/*/` glob
+matching nothing (vacuous probe). Wired at `ci.yml` in `check` — before the toolchain install, since it
+needs no toolchain — and in `scripts/check.sh` under `--- Toolchain ---`.
+
+### Fixed — `pty-host-test.py` required binaries it refused to build
+
+`scripts/harness/pty-host-test.py` exited 1 with `FAIL: missing .../tests/chan/build/ptyhost` and printed
+the build command for a human to type. That branch was unreachable while the binaries were tracked. It now
+builds-if-absent, mirroring `stage_one`'s `agnos/*` rows (in-tree, so it compiles under this repo's own
+pin). At 6.5.28: `ptyhost` 55,896 B, `ptyx` 55,728 B.
+
+`scripts/check.sh` 30 passed (was 29); `scripts/test.sh` 4 passed. `build/agnos` 1,981,096 B.
+
 ### Fixed — ring-3 initial stack: 12 KB usable -> 2,093,056 B (`elf.cyr`)
 
 Both ELF loaders map a full 2 MB page for the user stack (`pmm_alloc_2mb` + `proc_map_page_nx` at

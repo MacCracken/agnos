@@ -56,6 +56,25 @@ set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT" || exit 1
 
+# ⚠ THE ENUMERATED LIST MOVES BETWEEN STAGES THROUGH A FILE, AND EVERY LOOP READS IT WITH `while read`
+# FED BY A REDIRECT. Deliberately NOT `for m in $MANIFESTS`, and deliberately NOT a pipe into the
+# loop. Both alternatives are broken here, for different reasons, and both were measured on a clean
+# tree (2026-08-24):
+#   · `for m in $MANIFESTS` depends on unquoted word splitting, which ZSH DOES NOT DO by default. The
+#     newline-separated list collapsed into ONE word, every per-item check ran against a single bogus
+#     concatenated path, and this gate reported a clean tree as 8-way drift. Measured: rc=0 under sh
+#     and bash, rc=1 under zsh, same bytes on disk.
+#   · `... | while read` runs the loop body in a SUBSHELL, so every offender it accumulates is
+#     discarded when the pipeline ends and the gate reports OK regardless of what it found.
+# ⭐ NEITHER BUG WAS VISIBLE WHERE THE GATE NORMALLY RUNS, which is why it survived: ubuntu-latest's
+# /bin/sh is dash (splits), check.sh and ci.yml both invoke this with an explicit `sh`, and the
+# shebang covers `./script`. It bit exactly one path — `zsh scripts/check/toolchain-pin-check.sh`,
+# typed by hand in this author's login shell. A gate that cries wolf in the shell its author uses
+# gets ignored, which costs more than the gate ever bought.
+# The file is also what makes a path containing spaces a non-issue, in every shell.
+TMPD="$(mktemp -d)" || { echo "toolchain-pin-check: FAILED — mktemp -d failed" >&2; exit 1; }
+trap 'rm -rf "$TMPD"' EXIT INT TERM
+
 # Use the EXACT extraction CI uses, so this gate and CI can never disagree about what "the root pin"
 # is. That expression needs PCRE; probe for it rather than letting an unsupported -P return empty and
 # turn this gate into a comparison of "" against "" that passes on every tree.
@@ -78,18 +97,18 @@ fi
 if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
     # Tracked + untracked-but-not-ignored, so .gitignore owns the build/ and .claude/ exclusions.
     # Then drop the vendored `cyrius deps` stdlib snapshots, which are tracked and so survive git.
-    MANIFESTS="$(git -C "$ROOT" ls-files --cached --others --exclude-standard -- '*cyrius.cyml' \
-                 | grep -vE '(^|/)lib/' || true)"
+    git -C "$ROOT" ls-files --cached --others --exclude-standard -- '*cyrius.cyml' \
+        | grep -vE '(^|/)lib/' | sort -u > "$TMPD/all" || true
     SRC="git ls-files (build/ + .claude/ via .gitignore) minus vendored */lib/ snapshots"
 else
     # Tarball / no-git fallback. Prunes the same four directory names by hand; kept SECOND so the
     # hand-kept list is never the thing that normally runs.
-    MANIFESTS="$(find . \( -name .git -o -name .claude -o -name build -o -name lib \) -prune -o \
-                 -name cyrius.cyml -print | sed 's|^\./||' | sort || true)"
+    find . \( -name .git -o -name .claude -o -name build -o -name lib \) -prune -o \
+        -name cyrius.cyml -print | sed 's|^\./||' | sort > "$TMPD/all" || true
     SRC="find with pruned .git/.claude/build/lib (git unavailable)"
 fi
 
-N="$(printf '%s\n' "$MANIFESTS" | grep -c . || true)"
+N="$(grep -c . "$TMPD/all" || true)"
 if [ "$N" -lt 2 ]; then
     echo "toolchain-pin-check: FAILED — found $N manifest(s); this gate is vacuous below 2." >&2
     echo "  enumerated via: $SRC" >&2
@@ -98,20 +117,28 @@ if [ "$N" -lt 2 ]; then
     exit 1
 fi
 
-DRIFT=""
-for m in $MANIFESTS; do
+# ⚠ OFFENDER LINES ARE BUILT WITH printf '%s' AND EMITTED WITH cat — never accumulated into a
+# variable replayed as `printf "$DRIFT"`. That shape hands file-derived data (a path, a pin string
+# grepped out of a manifest) to printf as its FORMAT argument, where a stray % is a conversion spec:
+# a manifest under a directory named `%s` consumes the next offender's text, and `%n` is a write
+# primitive. It also leans on the format string's `\n` escapes being interpreted, which is precisely
+# the behaviour that varies across shells' printf builtins — the same class of assumption that put
+# the word-splitting bug above into this file.
+: > "$TMPD/drift"
+while IFS= read -r m; do
+    [ -n "$m" ] || continue
     [ "$m" = "cyrius.cyml" ] && continue
     pin="$(grep -oP '(?<=^cyrius = ")[^"]+' "$ROOT/$m" 2>/dev/null || true)"
     if [ -z "$pin" ]; then
-        DRIFT="$DRIFT    $m: NO cyrius pin at all (root pins $ROOT_PIN)\n"
+        printf '    %s: NO cyrius pin at all (root pins %s)\n' "$m" "$ROOT_PIN" >> "$TMPD/drift"
     elif [ "$pin" != "$ROOT_PIN" ]; then
-        DRIFT="$DRIFT    $m: pins $pin  (root pins $ROOT_PIN)\n"
+        printf '    %s: pins %s  (root pins %s)\n' "$m" "$pin" "$ROOT_PIN" >> "$TMPD/drift"
     fi
-done
+done < "$TMPD/all"
 
-if [ -n "$DRIFT" ]; then
+if [ -s "$TMPD/drift" ]; then
     echo "toolchain-pin-check: FAILED — nested cyrius.cyml pins disagree with the ROOT pin ($ROOT_PIN)"
-    printf "$DRIFT"
+    cat "$TMPD/drift"
     echo ""
     echo "  CI installs ONLY $ROOT_PIN (ci.yml:37 reads the ROOT manifest). Any build that runs with"
     echo "  one of the above as its compile cwd resolves that manifest instead and hard-errors with"
