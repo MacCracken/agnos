@@ -20,6 +20,60 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.56.47] — 2026-08-24 — `#99 proclist`: AGNOS can enumerate its own processes
+
+### Added — `#99 proclist(buf, max)`, the first process-enumeration primitive
+
+AGNOS had no way to enumerate processes. The ring-3 surface offered `getpid`, `spawn`, `waitpid` and
+`kill`, and there is no procfs, so nothing could answer "what is running on this machine?". A system
+monitor was not degraded on AGNOS, it was impossible — chakshu's `--agnos` build rendered its column
+header and zero rows on every boot, correctly, because there was nothing to ask.
+
+```
+proclist(buf, max) -> records written, -1 on a bad user range or max < 1
+```
+
+64-byte record, one per live slot, dead slots skipped:
+
+| off | type | field |
+|---|---|---|
+| +0 | u64 | `pid` |
+| +8 | u64 | `state` — 1 ready · 2 running · 3 claiming |
+| +16 | u64 | `ppid` — 0 = init |
+| +24 | u8[32] | `name` — NUL-terminated basename |
+| +56 | u64 | `reserved` — always 0 |
+
+The walk runs under `preempt_disable`; the name field is NUL-padded to the full 32 bytes so ring 3
+cannot read a byte left by a previous occupant of the slot. Number chosen as `#99` because 0-95 and
+97-98 have arms and `99` had none; `#96` stays reserved for `fork` per the 2026-08-05 ruling.
+
+⚠ The `reserved` field is a decision, not slack. Per-process rss and cpu time are **not tracked by
+this kernel**, so they are not invented here. When they are, they land at `+56` and the record size
+does not change.
+
+### Added — per-process names (`proc_names[]`, `proc_set_name`, `proc_name_ptr`, `proc_clear_name`)
+
+`struct Process` is pure register state and `proc_create_user(entry, stack_top)` never saw a path, so
+a ring-3 process's only identity was its pid number. 1.56.47 records the basename at ELF load, in
+`elf_load_from_file` immediately after `proc_create_user` returns — the one point where a path and a
+pid are both in hand. Basename, not full path: `/bin/shu` tells a reader nothing that `shu` does not.
+
+16 processes × 32 bytes, declared `var proc_names[64]` — module-scope `var X[N]` is N × u64, the trap
+this tree has now hit three times.
+
+### Peer
+
+`cyrius` carries `SYS_PROCLIST = 99` + `fn sys_proclist(buf, max)` in
+`lib/syscalls_x86_64_agnos.cyr`, gated by `tests/gates/platform/syscall_wrapper_pass.sh` axis 5.
+Consumers must call it by name — a raw `syscall(99, …)` is the bug class where raw Linux numbers
+compile clean on agnos and dispatch a different arm. Issue records filed in both repos.
+
+⚠ A kernel older than 1.56.47 has no `#99` arm. A negative return means "this kernel cannot
+enumerate", which is a different fact from "no processes are running", and consumers must not
+conflate them.
+
+Build: `build/agnos` 1,983,648 B.
+
 ## [1.56.46] — 2026-08-17 — cycle OPEN
 
 ### Fixed — CI: seven nested `cyrius.cyml` pinned a toolchain no runner installs

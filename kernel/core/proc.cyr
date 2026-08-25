@@ -77,6 +77,62 @@ var proc_ss[16];        # saved SS per pid (default 0x10 = ring-0 kernel data)
 # grow into pgid/sid or kill(-pgid, …); process-group semantics WOULD be Unix projection.
 var proc_ppid[16];      # saved parent pid per pid (default 0 = init)
 
+# 1.56.47 — PER-PROCESS NAME, so a monitor can render a process TABLE and not just
+# a count. Nothing in the kernel recorded a name before this: `struct Process` is
+# pure register state and `proc_create_user(entry, stack_top)` never saw a path, so
+# the only identity a ring-3 process had was its pid. chakshu's AGNOS build could
+# therefore enumerate nothing and rendered a bare column header — the gap that
+# blocked its v1.0 "AGNOS default monitor" milestone.
+#
+# ⚠ SIZING, and it is the trap this file already documents twice: module-scope
+# `var X[N]` is N x u64 = N*8 BYTES [[cyrius-var-array-u64-units]]. 16 procs x
+# 32 bytes = 512 bytes, so the declaration is [64], NOT [512]. Indexed by SLOT
+# (pid), byte offset pid*PROC_NAME_MAX.
+var PROC_NAME_MAX = 32;
+var proc_names[64];     # 16 processes x 32 bytes, NUL-terminated
+
+# Record the basename of `path` for `pid`. Basename, not the full path: the table
+# column is narrow and "/bin/shu" tells a reader nothing "shu" does not. Truncates
+# at PROC_NAME_MAX-1 and always NUL-terminates.
+fn proc_set_name(pid, path, pathlen) {
+    if (pid < 0) { return 0 - 1; }
+    if (pid >= 16) { return 0 - 1; }
+    var base = &proc_names + pid * PROC_NAME_MAX;
+    # Walk to the last '/' so "/bin/agnsh" stores "agnsh".
+    var st = 0;
+    var i = 0;
+    while (i < pathlen) {
+        if (load8(path + i) == 47) { st = i + 1; }
+        i = i + 1;
+    }
+    var n = pathlen - st;
+    if (n > PROC_NAME_MAX - 1) { n = PROC_NAME_MAX - 1; }
+    if (n < 0) { n = 0; }
+    var k = 0;
+    while (k < n) {
+        store8(base + k, load8(path + st + k));
+        k = k + 1;
+    }
+    store8(base + n, 0);
+    return n;
+}
+
+# Pointer to pid's NUL-terminated name, or 0 when the pid is out of range.
+fn proc_name_ptr(pid) {
+    if (pid < 0) { return 0; }
+    if (pid >= 16) { return 0; }
+    return &proc_names + pid * PROC_NAME_MAX;
+}
+
+# Clear a slot's name when it is reused, so a dead process's name can never be
+# read back against a live pid that happens to land on the same slot.
+fn proc_clear_name(pid) {
+    var b = proc_name_ptr(pid);
+    if (b == 0) { return 0; }
+    store8(b, 0);
+    return 0;
+}
+
 # 1.56.40 (channel-band bite 2) — THE PROCESS GENERATION COUNTER. Written here, read by NOTHING yet.
 #
 # ⛔ A pid IS NOT A DURABLE IDENTITY on agnos. pids are recycled slot indices with no generation

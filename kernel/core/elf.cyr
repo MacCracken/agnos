@@ -493,7 +493,13 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     # Closes the mid-load window where proc_create_full's premature state=1 let a woken AP pick a proc
     # whose CR3/selectors weren't wired yet.
     var new_pid = proc_create_user(entry, stack_top);
-    if (new_pid >= 0) { proc_set_cr3(new_pid, new_cr3); }
+    if (new_pid >= 0) {
+        proc_set_cr3(new_pid, new_cr3);
+        # 1.56.47: record the basename so `proclist #99` can name this process.
+        # This is the ONLY point where a path and a pid are both in hand — the
+        # loader is handed `path`, and proc_create_user returns the slot.
+        proc_set_name(new_pid, path, namelen);
+    }
     stack_canary_check(canary);
     return new_pid;
 }

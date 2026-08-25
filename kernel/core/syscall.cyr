@@ -7506,6 +7506,7 @@ fn blk_close_sys(h) {
 
 # `ptrscan #98` reachability latches — see the arm for why.
 var ptrscan_called = 0;
+var proclist_called = 0;
 var ptrscan_gave = 0;
 
 fn ksyscall(num, arg1, arg2, arg3) {
@@ -9192,6 +9193,80 @@ fn ksyscall(num, arg1, arg2, arg3) {
         }
         stack_canary_check(canary);
         return 16;
+    }
+
+    if (num == 99) {
+        # proclist(buf=arg1, max=arg2) — snapshot of the LIVE process table.
+        # Returns the number of records written, or -1 on a bad user range / max < 1.
+        #
+        # Record (64 B, little-endian), one per live slot:
+        #   +0   u64 pid
+        #   +8   u64 state      1=ready · 2=running · 3=claiming (0=dead is skipped)
+        #   +16  u64 ppid       0 = init
+        #   +24  u8  name[32]   NUL-terminated basename, from proc_set_name at ELF load
+        #   +56  u64 reserved   always 0 — room to add rss/utime without a new number
+        #
+        # ⭐ WHY THIS EXISTS. AGNOS had no procfs and no enumeration primitive at all —
+        # the ring-3 surface offered getpid/spawn/waitpid/kill and nothing that could
+        # answer "what is running?". A system monitor therefore could not exist here:
+        # chakshu's AGNOS build rendered a column header and zero rows, which is what
+        # blocked its v1.0 "ship as the AGNOS default monitor" milestone. Every field
+        # above already existed in the kernel; none of it was reachable from ring 3.
+        #
+        # ⚠ A SNAPSHOT, NOT A HANDLE. The table is copied under preempt_disable so the
+        # set cannot change mid-walk. Callers must not assume a pid is still live when
+        # they act on it — that race is inherent to any ps(1) and is the caller's to
+        # handle (chakshu re-probes before it signals).
+        #
+        # ⚠ RESERVED FIELD IS DELIBERATE. Per-process rss and cpu time are NOT tracked
+        # by this kernel today, so they are not invented here. When they are, they land
+        # at +56 and the record size does not change — consumers that zero-check the
+        # field keep working. Adding a field by widening the record would need a new
+        # syscall number; adding it here does not.
+        if (arg2 < 1) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg1, arg2 * 64) == 0) { stack_canary_check(canary); return 0 - 1; }
+
+        if (proclist_called == 0) {
+            proclist_called = 1;
+            kprintln("proclist: first call from ring 3", 32);
+        }
+
+        preempt_disable();
+        var pl_n = 0;
+        var pl_i = 0;
+        while (pl_i < 16) {
+            if (pl_n >= arg2) { pl_i = 16; }
+            else {
+                var pl_st = load64(&proc_table + pl_i * 176 + 8);
+                if (pl_st != 0) {
+                    var pl_pid = load64(&proc_table + pl_i * 176);
+                    var pl_rec = arg1 + pl_n * 64;
+                    store64(pl_rec + 0, pl_pid);
+                    store64(pl_rec + 8, pl_st);
+                    store64(pl_rec + 16, proc_get_ppid(pl_pid));
+                    store64(pl_rec + 56, 0);
+                    # name: copy 32 bytes, NUL-padding the tail so ring 3 never reads
+                    # a stale byte from a previous occupant of this slot.
+                    var pl_src = proc_name_ptr(pl_pid);
+                    var pl_k = 0;
+                    var pl_done = 0;
+                    while (pl_k < 32) {
+                        var pl_c = 0;
+                        if (pl_done == 0) {
+                            if (pl_src != 0) { pl_c = load8(pl_src + pl_k); }
+                            if (pl_c == 0) { pl_done = 1; }
+                        }
+                        store8(pl_rec + 24 + pl_k, pl_c);
+                        pl_k = pl_k + 1;
+                    }
+                    pl_n = pl_n + 1;
+                }
+                pl_i = pl_i + 1;
+            }
+        }
+        preempt_enable();
+        stack_canary_check(canary);
+        return pl_n;
     }
     if (num == 43) {
         # spawn_path(path=arg1, len=arg2) — NON-BLOCKING from-disk spawn.
