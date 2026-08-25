@@ -16,14 +16,48 @@
 # ⚠ SIZED FOR THE FULL IRON BOOT LOG. The old 16 KB assumed a ~4 KB boot log, but
 # the log grew past it (GPU arc F0..C2x ~3 KB + full iron USB/device enumeration +
 # SMP push a clean iron boot to ~16-20 KB) — so the ring WRAPPED and the earliest
-# lines were lost (the `klug` tool faithfully returned the last 16 KB; the kernel
-# stops feeding the ring at the kybernet userland handoff, so the ring's newest
-# byte is ~kybernet and it held only the 16 KB before it). 64 KB holds the whole
-# boot log ~3x over with headroom for the rest of the arc. The userland `klug`
-# tool's read buffer + KLUG_RING_BYTES MUST match this size (they're bumped in
-# lockstep, else the tool only pulls its buffer's worth of the tail). Cyrius emits
-# module-global arrays as file-resident zero-data (not .bss), so the buffer costs
-# its full size in the kernel image — the check.sh size ceiling was raised to suit.
+# lines were lost (the `klug` tool faithfully returned the last 16 KB of whatever
+# had been printed by the time it ran). 64 KB holds the whole boot log ~3x over
+# with headroom for the rest of the arc. The userland `klug` tool's read buffer +
+# KLUG_RING_BYTES MUST match this size (they're bumped in lockstep, else the tool
+# only pulls its buffer's worth of the tail). Cyrius emits module-global arrays as
+# file-resident zero-data (not .bss), so the buffer costs its full size in the
+# kernel image — the check.sh size ceiling was raised to suit.
+#
+# ⛔ FALSE UNTIL 1.56.48 — RETAINED SO IT IS NOT RE-DERIVED. This note used to claim
+# "the kernel stops feeding the ring at the kybernet userland handoff, so the ring's
+# newest byte is ~kybernet and it held only the 16 KB before it". THERE IS NO HANDOFF
+# GATE. The tap in kputc/kprint/kprintln (core/kprint.cyr) is unconditional, so the
+# ring keeps taking (a) every runtime KERNEL line — drivers, faults, syscalls — and
+# (b) every console-bound RING-3 byte, because fd 1 is a VFS_DEVICE and `write(1,…)`
+# walks vfs_write (core/vfs.cyr:960) → dev_write → serial_dev_write (core/devs.cyr:71)
+# → kprint → klug_append. The newest byte is simply the last thing anyone printed,
+# kernel or userland. The SIZING verdict above survives — 16 KB was too small either
+# way — but the stated reason was wrong, and the truth costs log forensics:
+#
+# ⇒ PRINTING THE LOG RE-APPENDS THE LOG TO ITSELF. The `klug` tool's dump is up to
+# 65536 bytes and this ring is exactly 65536, so dumping to the console re-appends the
+# whole log. While the ring is still short of full (a ~20 KB iron boot log) that
+# DOUBLES it, and the next dump wraps and takes the boot head with it — the one thing
+# you were reading the log to find. `run /bin/klug > /f.txt` is REQUIRED, not merely
+# convenient; the same instruction already stands at core/syscall.cyr:444. A pipe is
+# safe for the same reason the redirect is: a pipe fd takes vfs_write's VFS_PIPE arm
+# and never reaches kprint, so only grep's matches are console-bound.
+#
+# ⚠ THE MECHANISM IS DELIBERATELY UNFIXED — OPERATOR CALL AT 1.56.48. The redirect is
+# the workflow, and the userland tool carries the warning (`klug --help` on AGNOS
+# builds, in the klug repo). Two seams were weighed and BOTH declined; do not re-derive:
+#   (a) klug#36 gains an op that dumps to the console kernel-side through a no-tap
+#       emitter — race-free and lossless, but that is syscall ABI surface bought to
+#       avoid a hazard a single `>` already avoids.
+#   (b) serial_dev_write emits through a no-tap kprint — one function, kills the class
+#       outright (no chatty ring-3 program can age the ring), but STRIPS RING-3 LINES
+#       FROM THE RING, and klug_spill_covered_console() below exists precisely to
+#       preserve those on a box whose console is covered by a full-screen app.
+# ⛔ The kernel CANNOT simply special-case "klug's own write". The dump is an ordinary
+# write(1,…) issued by a separate ring-3 instruction, indistinguishable from any other
+# program's output — which is why (a) has to MOVE the write into the kernel rather
+# than filter it, and why there is no cheap third option hiding here.
 
 var klug_buf[8192];        # 64 KB (8192 * 8)
 var klug_head = 0;         # next write offset, 0..65535

@@ -20,6 +20,28 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.56.48] — 2026-08-25 — klug ring: the header comment now matches the code
+
+### Fixed
+
+- **`kernel/core/klug.cyr`'s header claimed the kernel stops feeding the klug ring at the kybernet
+  userland handoff, so the ring's newest byte was ~kybernet.** There is no handoff gate. The tap in
+  `kputc`/`kprint`/`kprintln` (`core/kprint.cyr`) is unconditional, and ring-3 console output reaches
+  it through `vfs_write` (`core/vfs.cyr:960`) → `dev_write` → `serial_dev_write` (`core/devs.cyr:71`)
+  → `kprint` → `klug_append`. The newest byte is the last thing anyone printed, kernel or userland.
+  ⇒ Dumping the log to the console re-appends the log to itself: `klug`#36 returns up to 65536 bytes
+  and the ring is exactly 65536, so a console dump re-appends the whole log, and on a ring still short
+  of full it doubles the contents and the next dump wraps out the boot head. `run /bin/klug > /f.txt`
+  is required, not convenient — the instruction already stood at `core/syscall.cyr:444`. A pipe is
+  equally safe: a pipe fd takes `vfs_write`'s `VFS_PIPE` arm and never reaches `kprint`.
+  Comment only — no code change, and the 64 KB sizing verdict is unaffected.
+- The self-append mechanism is unfixed by decision. Two seams, named so they are not re-attempted:
+  a `klug`#36 op dumping console-side from the kernel through a no-tap emitter (ABI surface for a
+  hazard `>` already avoids), and `serial_dev_write` emitting through a no-tap `kprint` (kills the
+  class, but strips ring-3 lines from the ring, which `klug_spill_covered_console()` exists to
+  preserve). The kernel cannot special-case klug's own write: the dump is an ordinary `write(1,…)`
+  from a separate ring-3 instruction, indistinguishable from any other program's output.
+
 ## [1.56.47] — 2026-08-24 — `#99 proclist`: AGNOS can enumerate its own processes
 
 ### Added — `#99 proclist(buf, max)`, the first process-enumeration primitive
