@@ -124,7 +124,7 @@ fn loopback_selftest() {
         kprintln("lo: net_ip=0 skip", 17);
         return 0;
     }
-    if (icmp_ping(net_ip) >= 0) { kprintln("lo: ICMP ping loopback OK", 25); }
+    if (icmp_ping(net_ip, 0) >= 0) { kprintln("lo: ICMP ping loopback OK", 25); }
     else { kprintln("lo: ICMP ping loopback FAIL", 27); }
     var lid = tcp_listen(7777);
     var cid = tcp_connect(net_ip, 7777, 33333);

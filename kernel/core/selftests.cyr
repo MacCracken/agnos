@@ -109,7 +109,7 @@
     } else {
         kprintln("icmp: build FAIL", 16);
     }
-    var grtt = icmp_ping(net_gateway);
+    var grtt = icmp_ping(net_gateway, 0);
     if (grtt < 0) {
         kprintln("icmp: gw no reply", 17);
     } else {

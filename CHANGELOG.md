@@ -20,9 +20,51 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
-## [1.56.48] — 2026-08-25 — klug ring: the header comment now matches the code
+## [1.56.48] — 2026-08-26 — `icmp_echo_ex`#100, ICMP counters, id+seq reply matching, klug-ring header
+
+### Added
+
+- **`#100 icmp_echo_ex(dst_ip, timeout_ms)` → RTT ms (≥0) / -1** — `#55` with a caller-chosen
+  deadline. `timeout_ms <= 0` selects the kernel default (~3 s); clamped to 60 s. Resolution is the
+  100 Hz tick, so the bound rounds down to whole ticks with a floor of 1. Unblocks `yo -W` on AGNOS.
+- **`icmp_ping(dst_ip, timeout_ticks)`** — the kernel-side parameter behind `#100`. `0` selects the
+  historical 300-tick bound; all four in-kernel callers pass `0` and are behaviourally unchanged.
+- **`net_config`#61 fields 4..7 — ICMP counters.** 4=`icmp_tx` · 5=`icmp_rx` · 6=`icmp_replies_sent`
+  · 7=`icmp_timeouts`. Free-running, monotonic, never reset. Written without a lock
+  (`net_handle_icmp` is reachable from the timer ISR), so a torn read costs one count — diagnostics
+  only. ⚠ `0` is a legitimate value here, unlike fields 0..3 where `0` means "unset".
+- cyrius peer: `SYS_ICMP_ECHO_EX = 100`, `sys_icmp_echo_ex(dst_ip, timeout_ms)`, and
+  `sys_net_icmp_tx` / `_rx` / `_replies_sent` / `_timeouts`.
+  → [ticket](docs/development/issues/2026-08-26-syscall-100-icmp-echo-ex.md)
 
 ### Fixed
+
+- **An echo reply was matched on the ICMP identifier alone, so a stale reply satisfied the wrong
+  wait.** `icmp_id` is a per-kernel constant (`0x4147`), so a late reply to a *previous* ping — one
+  whose deadline had already expired — set `icmp_reply_seen` for whatever wait was currently open.
+  The RTT was then measured from the wrong start, and a host that had stopped answering could still
+  read as reachable. `net_handle_icmp` now requires the **sequence** to match as well; `icmp_ping`
+  already bumped `icmp_seq` per call, so the discriminator existed and was simply not being read.
+
+### Breaking
+
+- **`fn icmp_ping` takes two arguments.** In-kernel callers only — the ring-3 ABI is unchanged, and
+  `#55`'s arity is explicitly frozen at one argument. Pass `0` for the previous behaviour.
+- ⛔ **`#55 icmp_echo` did NOT gain a second argument, deliberately.** Unused syscall argument
+  registers are not zeroed by cyrius 6.5.35 — the compiler pops only as many as the call site passes
+  — so reading `a2` there would have handed every already-shipped one-argument caller a garbage
+  bound. **Widening a live syscall's arity is not backward compatible on this ABI.**
+
+### Verification
+
+QEMU, ring-3, against a booted kernel: `icmp_echo_ex(black_hole, 200)` returned -1 after
+**elapsed_ms=200** (was ~3000); counters closed as `tx=4 rx=3 repl=0 to=1`, i.e. `tx = rx + to`; an
+unknown `net_config` field still returns -1; `#55` unchanged. Regression: `yo`'s AGNOS smoke passes
+against this kernel — 2/2 replies, 0% loss through the unchanged `#55` path.
+
+Build: 1,984,736 B (x86_64).
+
+### Also fixed in this release
 
 - **`kernel/core/klug.cyr`'s header claimed the kernel stops feeding the klug ring at the kybernet
   userland handoff, so the ring's newest byte was ~kybernet.** There is no handoff gate. The tap in

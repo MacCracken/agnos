@@ -670,7 +670,7 @@ fn sh_exec(buf, len) {
         kprint_num((target >> 16) & 0xFF); kprint(".", 1);
         kprint_num((target >> 8) & 0xFF); kprint(".", 1);
         kprint_num(target & 0xFF); kprintln("", 0);
-        var rtt = icmp_ping(target);
+        var rtt = icmp_ping(target, 0);
         if (rtt < 0) {
             kprintln("ping: no reply (timeout)", 24);
         } else {

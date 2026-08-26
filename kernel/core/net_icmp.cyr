@@ -11,8 +11,24 @@
 # standalone audit doc (cf. the DNS bite's compression/resolver nuances).
 var icmp_id = 0x4147;        # "AG" — our echo identifier
 var icmp_seq = 0;            # incrementing echo sequence
-var icmp_reply_seen = 0;     # set when an echo reply matching icmp_id arrives
+var icmp_reply_seen = 0;     # set when an echo reply matching icmp_id AND icmp_seq arrives
 var icmp_reply_from = 0;     # src ip of that reply
+
+# --- ICMP counters (1.56.48) -------------------------------------------------
+# Readable from ring 3 via net_config#61 fields 4..7. They exist because a ring-3
+# prober that gets nothing back cannot otherwise tell "we never transmitted" from
+# "we transmitted and nothing answered" — yo's --diag could report the DHCP lease
+# and the icmp_echo return, and no more. Counters split that fork.
+#
+# Free-running u64, never reset, wrapping is not a concern at 100 Hz. Written only
+# from icmp_ping (thread context) and net_handle_icmp (reachable from the timer
+# ISR via net_rx_drain). A ++ on an aligned u64 is a single store on x86_64 and
+# these are diagnostics, not accounting — a torn read across an ISR boundary would
+# cost one count, so no lock is taken. Do not build control flow on them.
+var icmp_tx = 0;             # echo requests WE sent (icmp_ping)
+var icmp_rx = 0;             # echo replies that matched our id+seq
+var icmp_replies_sent = 0;   # inbound echo requests we answered (we were pinged)
+var icmp_timeouts = 0;       # icmp_ping calls that expired without a match
 
 # Reflect an inbound echo request (type 8) as an echo reply (type 0) — makes
 # AGNOS pingable. id/seq/payload are echoed verbatim (RFC 792 §Echo).
@@ -42,13 +58,31 @@ fn net_handle_icmp(pkt, icmp_off, icmp_len, src_ip) {
     var t = load8(pkt + icmp_off);
     if (t == 8) {
         icmp_send_echo_reply(src_ip, pkt + icmp_off, icmp_len);
+        icmp_replies_sent = icmp_replies_sent + 1;
         return 0;
     }
     if (t == 0) {
-        var id = (load8(pkt + icmp_off + 4) << 8) | load8(pkt + icmp_off + 5);
+        # 1.56.48: match id AND SEQUENCE, not id alone.
+        #
+        # id is a per-kernel constant (0x4147), so an id-only match accepted ANY
+        # echo reply carrying it — including a late reply to a PREVIOUS ping whose
+        # deadline had already expired. icmp_ping bumps icmp_seq per call, so the
+        # stale frame satisfied whatever wait happened to be open and was reported
+        # as that ping's round trip. The measured RTT was then timed from the wrong
+        # start, and a host that had stopped answering could still look reachable.
+        #
+        # yo's ADR 0002 records this as an untested hazard ("one ping is in flight
+        # kernel-wide, and a stale reply carrying 0x4147 satisfies whatever wait is
+        # currently open"). Matching the sequence closes it: a reply is ours only if
+        # it answers the request we are actually waiting on.
+        var id  = (load8(pkt + icmp_off + 4) << 8) | load8(pkt + icmp_off + 5);
+        var seq = (load8(pkt + icmp_off + 6) << 8) | load8(pkt + icmp_off + 7);
         if (id == icmp_id) {
-            icmp_reply_seen = 1;
-            icmp_reply_from = src_ip;
+            if (seq == icmp_seq) {
+                icmp_reply_seen = 1;
+                icmp_reply_from = src_ip;
+                icmp_rx = icmp_rx + 1;
+            }
         }
         return 0;
     }
@@ -65,9 +99,17 @@ fn net_handle_icmp(pkt, icmp_off, icmp_len, src_ip) {
     return 0;
 }
 
-# Send one echo request to dst_ip and wait (bounded ~3s) for the matching
-# reply. Returns elapsed timer_ticks (>= 0) on success, 0-1 on timeout/no-NIC.
-fn icmp_ping(dst_ip) {
+# Send one echo request to dst_ip and wait for the matching reply. Returns
+# elapsed timer_ticks (>= 0) on success, 0-1 on timeout/no-NIC.
+#
+# `timeout_ticks` bounds the wait, in 100 Hz ticks. Pass 0 for the historical
+# ~3 s default (300 ticks) — every pre-1.56.48 caller behaved that way, and the
+# comment on syscall #55 named a configurable timeout as "a future enhancement
+# that would parameterise icmp_ping". This is that enhancement; #55 keeps the
+# default and the new #100 (icmp_echo_ex) exposes the parameter to ring 3.
+fn icmp_ping(dst_ip, timeout_ticks) {
+    var bound = timeout_ticks;
+    if (bound <= 0) { bound = 300; }        # ~3 s at the 100 Hz timer
     # 1.49.0 loopback bite 2: a loopback dst (our own net_ip / 127.x) needs no NIC up.
     if (nic_ready() == 0 && net_is_loopback(dst_ip) == 0) { return 0 - 1; }
     icmp_seq = (icmp_seq + 1) & 0xFFFF;
@@ -93,11 +135,13 @@ fn icmp_ping(dst_ip) {
     icmp_reply_seen = 0;
     var start = timer_ticks;
     if (net_tx(p, off + 20 + icmp_len) < 0) { return 0 - 1; }
-    while ((timer_ticks - start) < 300) {     # ~3s at the 100 Hz timer
+    icmp_tx = icmp_tx + 1;
+    while ((timer_ticks - start) < bound) {
         net_poll();
         if (icmp_reply_seen == 1) { return timer_ticks - start; }
         arch_wait();
     }
+    icmp_timeouts = icmp_timeouts + 1;
     return 0 - 1;
 }
 

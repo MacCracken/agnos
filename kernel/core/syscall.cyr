@@ -9601,18 +9601,65 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # ping — the serial-kstack invariant) + sti (IF=1 so timer_ticks advances
         # + the hlt wakes) + cli + preempt_enable. The NIC is IRQ-less (IMR=0,
         # pure poll), so the only in-window IRQ is the timer. RTT resolution is the
-        # 100 Hz tick (10 ms); a sub-10 ms reply returns 0. a2..a4 unused. (The
-        # ~3 s timeout is icmp_ping's fixed bound; a configurable -W is a future
-        # enhancement that would parameterise icmp_ping.)
+        # 100 Hz tick (10 ms); a sub-10 ms reply returns 0. a2..a4 unused.
+        #
+        # ⛔ #55's ARITY IS FROZEN AT ONE ARGUMENT. The configurable timeout this
+        # comment used to promise lives at #100 (icmp_echo_ex) instead, and NOT by
+        # reading arg2 here. Reason, measured on cyrius 6.5.35: the compiler pops
+        # only as many registers as the call passes, so `syscall(SYS_ICMP_ECHO, ip)`
+        # leaves %rsi holding whatever the previous code left there. Had this arm
+        # started reading arg2 as a timeout, every already-shipped one-argument
+        # caller would have handed the kernel a garbage bound — sometimes huge,
+        # sometimes a few milliseconds, never reproducible. Widening a live
+        # syscall's arity is not backward compatible on this ABI.
         fb_dbg_beacon(5);                    # 1.45.16 canary: ICMP echo (ping) stage
         preempt_disable();
         asm { sti; }
-        var ie_ticks = icmp_ping(arg1);
+        var ie_ticks = icmp_ping(arg1, 0);
         asm { cli; }
         preempt_enable();
         if (ie_ticks < 0) { stack_canary_check(canary); return 0 - 1; }
         stack_canary_check(canary);
         return ie_ticks * 10;          # 100 Hz ticks -> milliseconds
+    }
+    if (num == 100) {
+        # icmp_echo_ex(dst_ip=arg1, timeout_ms=arg2) — #55 with a caller-chosen
+        # deadline. Same contract otherwise: sends one echo request, blocks for the
+        # matching reply, returns the round-trip time in MILLISECONDS (>= 0) or -1
+        # (timeout / NIC down). arg2 <= 0 means "kernel default" (~3 s), so the two
+        # arms agree when the caller expresses no preference.
+        #
+        # **Why a new number rather than a second argument to #55**: see the note in
+        # the #55 arm. Unused syscall argument registers are not zeroed by the
+        # compiler, so arity is part of a syscall's ABI here.
+        #
+        # Resolution is the 100 Hz tick, so the effective bound is rounded DOWN to
+        # whole ticks and a request under 10 ms becomes 1 tick, not 0 — a zero bound
+        # would mean "never wait", which no caller asking for 1 ms means. Clamped to
+        # 60 s so a bad value cannot park a ring-3 process in the sti-window for an
+        # unbounded stretch.
+        #
+        # Unblocks `yo -W` on AGNOS: yo accepts -W on every backend but could not
+        # honour it here, because the bound lived in the kernel and took no argument.
+        # Same sti-window discipline as #55 — preempt_disable + sti + cli +
+        # preempt_enable — because icmp_ping polls net_poll() and arch_wait()s on a
+        # timer_ticks deadline, which only advances with IF=1.
+        var ee_ms = arg2;
+        if (ee_ms > 60000) { ee_ms = 60000; }
+        var ee_ticks = 0;
+        if (ee_ms > 0) {
+            ee_ticks = ee_ms / 10;
+            if (ee_ticks < 1) { ee_ticks = 1; }   # sub-tick request still waits one tick
+        }
+        fb_dbg_beacon(5);                    # same stage marker as #55
+        preempt_disable();
+        asm { sti; }
+        var ex_ticks = icmp_ping(arg1, ee_ticks);
+        asm { cli; }
+        preempt_enable();
+        if (ex_ticks < 0) { stack_canary_check(canary); return 0 - 1; }
+        stack_canary_check(canary);
+        return ex_ticks * 10;          # 100 Hz ticks -> milliseconds
     }
     if (num == 56) {
         # sock_listen(port=arg1) — bind + listen on a local TCP port and return
@@ -9735,10 +9782,32 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # exact QEMU-passed / iron-failed gap that froze `yo google.com` /
         # `whirl https://google.com` (QEMU's dig smoke used an on-subnet @10.0.2.3).
         # a2..a4 unused. (1.45.16)
+        #
+        # 1.56.48 — fields 4..7 are ICMP COUNTERS, not config. The name stayed
+        # `net_config` deliberately: this syscall already takes a field selector and
+        # already returns -1 for an unknown one, so extending it is purely additive
+        # and costs no new syscall number. Minting a second number for four counters
+        # would have been the more expensive answer to the same question, and the
+        # roadmap is explicit that numbers are not spent casually.
+        #   field 4 = icmp_tx            echo requests this kernel sent
+        #   field 5 = icmp_rx            echo replies that matched our id+seq
+        #   field 6 = icmp_replies_sent  inbound echo requests we answered
+        #   field 7 = icmp_timeouts      icmp_ping calls that expired unmatched
+        # Free-running, never reset, monotonic. **Why they exist**: a ring-3 prober
+        # that gets nothing back cannot otherwise separate "we never transmitted"
+        # from "we transmitted and nothing answered" — `yo --diag` could report the
+        # DHCP lease and the icmp_echo return code and no more. tx>0 with rx==0 is a
+        # network problem; tx==0 is a local one. Diagnostics only: they are written
+        # without a lock (net_handle_icmp runs from the timer ISR), so a torn read
+        # costs one count. Do not build control flow on them.
         if (arg1 == 0) { stack_canary_check(canary); return net_ip; }
         if (arg1 == 1) { stack_canary_check(canary); return net_netmask; }
         if (arg1 == 2) { stack_canary_check(canary); return net_gateway; }
         if (arg1 == 3) { fb_dbg_beacon(1); stack_canary_check(canary); return net_dns_server; }
+        if (arg1 == 4) { stack_canary_check(canary); return icmp_tx; }
+        if (arg1 == 5) { stack_canary_check(canary); return icmp_rx; }
+        if (arg1 == 6) { stack_canary_check(canary); return icmp_replies_sent; }
+        if (arg1 == 7) { stack_canary_check(canary); return icmp_timeouts; }
         stack_canary_check(canary);
         return 0 - 1;
     }
