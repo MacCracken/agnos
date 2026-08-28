@@ -31,7 +31,7 @@
 # ⇒ The discriminator is that crab SAW the ask and said so. A build that ignores `WINDOW_CONFIGURE`
 # is silent, and silence is what this scores red.
 #     CRAB_BIN=/path/to/crab_agnos_without_resize python3 scripts/harness/crab-resize-test.py
-import os, socket, subprocess, sys, time
+import json, os, socket, subprocess, sys, time
 
 ROOT   = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 ROOTFS = os.path.join(ROOT, "build/rootfs")
@@ -40,6 +40,7 @@ SEED   = os.path.join(WORK, "seed")
 IMG    = os.path.join(WORK, "agnos-crabresize.img")
 SER    = os.path.join(WORK, "serial.log")
 MON    = "/tmp/agnos-crabresize.sock"
+QMP    = "/tmp/agnos-crabresize-qmp.sock"
 AGNOS  = os.path.join(ROOT, "build/agnos")
 GNOBOOT= os.path.join(ROOT, "../gnoboot/build/BOOTX64.EFI")
 CRAB   = os.environ.get("CRAB_BIN", os.path.join(ROOT, "../crab/build/crab_agnos"))
@@ -86,8 +87,9 @@ if OVMF_VARS:
     subprocess.run(["cp", OVMF_VARS, os.path.join(WORK, "vars.fd")])
     subprocess.run(["chmod", "+w", os.path.join(WORK, "vars.fd")])
 open(SER, "w").close()
-try: os.unlink(MON)
-except FileNotFoundError: pass
+for _sk in (MON, QMP):
+    try: os.unlink(_sk)
+    except FileNotFoundError: pass
 
 qemu = subprocess.Popen([
     "qemu-system-x86_64", "-machine", "q35", "-m", "2048M", "-cpu", "max", "-smp", "4",
@@ -98,6 +100,7 @@ qemu = subprocess.Popen([
     "-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0", "-device", "usb-mouse,bus=xhci.0",
     "-serial", f"file:{SER}", "-display", "none", "-no-reboot",
     "-monitor", f"unix:{MON},server,nowait",
+    "-qmp", f"unix:{QMP},server,nowait",
 ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def ser():
@@ -215,6 +218,46 @@ try:
     answered = ser()[lmark2:].count("crab: key received")
     p("keystrokes answered AFTER the resize:", answered)
 
+    # ⭐⭐⭐ THE MOUSE WHEEL, END TO END ACROSS FIVE REPOS. agnos reads HID report byte [3] (1.56.49)
+    # -> bhumi carries `BHUMI_EV_SCROLL` (1.4.3) -> setu `SETU_INPUT_PTR_SCROLL` (0.8.8) -> dhancha
+    # `POINTER_SCROLL` (0.9.18) -> aethersafha forwards it (0.16.21) -> crab scrolls the pane under
+    # the cursor. Every layer is host-tested; THIS is the only thing that exercises the wire.
+    # ⛔ QMP, NOT HMP. `sendkey` is keys and `mouse_button` is a 1/2/4 bitmask — HMP has no wheel verb
+    # at all, which is why no existing harness could have driven this.
+    # ⚠ Park the cursor over crab first: the compositor forwards a scroll to the window UNDER THE
+    # CURSOR, so a wheel sent while the pointer is over empty desktop is correctly delivered nowhere.
+    qs = None
+    wheel_scrolls = 0
+    try:
+        for _ in range(60):
+            try: qs = socket.socket(socket.AF_UNIX); qs.connect(QMP); break
+            except OSError: time.sleep(0.25)
+        if qs is not None:
+            qs.settimeout(3.0)
+            qs.recv(65536)
+            qs.sendall(b'{"execute":"qmp_capabilities"}\n')
+            qs.recv(65536)
+            wmark = len(ser())
+            for gx, gy in ((300, 250), (500, 350), (700, 200), (400, 450)):
+                mon("mouse_move -4000 -4000", 0.15)
+                mon(f"mouse_move {gx} {gy}", 0.25)
+                for direction in ("wheel-down", "wheel-up"):
+                    for _ in range(4):
+                        ev = {"execute": "input-send-event", "arguments": {"events": [
+                            {"type": "btn", "data": {"down": True,  "button": direction}},
+                            {"type": "btn", "data": {"down": False, "button": direction}}]}}
+                        qs.sendall((json.dumps(ev) + "\n").encode())
+                        try: qs.recv(65536)
+                        except Exception: pass
+                        time.sleep(0.2)
+                time.sleep(1.5)
+                if "crab: scroll" in ser()[wmark:]: break
+            time.sleep(2.0)
+            wheel_scrolls = ser()[wmark:].count("crab: scroll")
+    except Exception as e:
+        p("  wheel arm error:", e)
+    p("wheel: crab resolved", wheel_scrolls, "scroll(s)")
+
     # ⭐⭐ POINTER ARM (M2, *deferral #05*). crab is the FIRST client to decode `SETU_INPUT_PTR_MOVE`
     # — aethersafha's own note says "no shipped client decodes PTR_MOVE yet" — so nothing else has
     # ever exercised this wire end to end.
@@ -253,6 +296,7 @@ try:
     alive_after_click = ser()[amark:].count("crab: key received")
     p("keystrokes answered AFTER the click sweep:", alive_after_click)
 
+    p("compositor forwarded a scroll:", "forwarded a scroll" in ser())
     faulted = "fault: pid=" in ser()[mark:]
     p("kernel/userland fault:", faulted)
 
