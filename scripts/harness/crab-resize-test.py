@@ -363,6 +363,44 @@ try:
     else:
         p("  ⚠ no repeat observed (the key may never have reached crab)")
 
+    # ⭐ SORTING (M3 *#33*). The ORDER itself is asserted on the host against a real record buffer —
+    # crab does not log entry names, deliberately (the per-entry stat trace WAS the 2026-08-19
+    # performance regression). What only a real kernel can show is that the `s` key reaches crab and
+    # that the mode cycles through all four and wraps.
+    smark = len(ser())
+    for _ in range(10):
+        key("s", 0.5)
+    time.sleep(2.0)
+    sout = ser()[smark:]
+    modes = [m for m in ("name", "size", "modified", "kind") if ("crab: sort " + m) in sout]
+    p("sort modes reached:", ",".join(modes) if modes else "(none)")
+    # ⚠ NOT an exact sequence — QEMU drops keys between the compositor's once-per-frame HID drains, so
+    # ten presses do not reliably produce ten cycles. What must hold is that MORE THAN ONE mode was
+    # reached, which is the wrap and the cycle working at all.
+    if len(modes) >= 2:
+        p("  ✅ the sort key cycles on a real kernel")
+    elif len(modes) == 1:
+        p("  ⚠ only one mode seen — keys may have been dropped")
+    else:
+        p("  ⚠ no sort line — the key never reached crab")
+
+    # ⭐ THE DEFERRED STAT DRAIN COMPLETES (crab M3, *deferral #03*). The listing path no longer
+    # sweeps — that saving is proven in `crab-listing-cap-test.py`, which now sees ZERO `stat-cost`
+    # lines where it previously saw six totalling ~230 ms of blocking syscalls. What THAT harness
+    # cannot show is the other half: it runs crab with no compositor, so crab exits before the event
+    # loop and the drain never runs at all.
+    # ⛔ SO THE SAVING AND THE DRAIN MUST BE PROVEN IN DIFFERENT HARNESSES. Reporting only the
+    # missing `stat-cost` lines would be reporting that crab stopped statting, not that it moved the
+    # work — and those are the same observation right up until the sizes never arrive.
+    # ⚠ The oracle is crab's own one-line-per-sweep completion log; the batch itself is silent by
+    # design, because per-entry narration is what made crab slow on iron in the first place.
+    drained = "crab: stat-drain complete" in ser()[mark:]
+    p("deferred stat drain completed:", drained)
+    if drained:
+        p("  ✅ the sizes arrive off the keystroke path")
+    else:
+        p("  ⚠ no drain-complete line — the sizes may never have filled in")
+
     faulted = "fault: pid=" in ser()[mark:]
     p("kernel/userland fault:", faulted)
 

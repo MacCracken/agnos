@@ -20,6 +20,45 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.56.50] — 2026-08-28 — `#101 readdir_at`: a directory listing that can resume
+
+### Added
+
+- **`#101 readdir_at(path, buf, max, cursor_uva) -> count`** — `#81 readdir` with a cursor, so a
+  directory with more entries than the caller's buffer can be read in batches instead of being
+  silently truncated at `max`. Kernel leg `ext2_readdir_at_sys` (`kernel/core/ext2.cyr`).
+- **The cursor is the byte offset into the directory file** — POSIX `telldir`'s cookie, and the only
+  value that survives ext2 directories being a chain of variable-length records. An entry INDEX would
+  force a re-walk from the top on every call, which is the O(n²) resumability exists to avoid.
+- **Protocol**: `*cursor` is `0` to start; on return it is the offset to resume from, or **`-1` when
+  the directory is exhausted**. Callers loop `while (cur != -1)`. Passing `-1` back in returns `0`
+  and changes nothing, so a loop that overruns by one is harmless rather than an infinite restart.
+- **Errors**: `-1` bad pointer / not ext2, `-2` not found, `-4` not a directory, **`-5` a cursor that
+  is not 4-byte aligned**.
+
+⛔ **`#81` IS UNTOUCHED, AND THIS IS A SEPARATE NUMBER RATHER THAN A 4th ARGUMENT ON IT.** `#81`'s
+callers pass three arguments; the 4th register holds whatever the caller happened to leave there, and
+this argument is a **pointer the kernel writes through**. An opt-in "only if it looks valid" test on
+garbage is not a test. (`#96` is likewise held for `fork`.)
+
+⛔ **The cursor is user data and is validated as such** — rejected unless 4-byte aligned and inside
+the directory, since a misaligned offset would parse a record header out of the middle of a filename.
+`ext2_dirent_valid` still bounds every record to its block, so the worst a valid-looking wrong offset
+can do is yield nonsense names, never a read outside `ext2_dir_buf`.
+
+### Testing
+
+- **`tests/readdir/rdat.cyr`** — ring-3 exerciser; exit `95` iff the contract holds, `90`-`97`
+  pinpoint the clause that broke. **`scripts/harness/readdir-at-test.py`** boots it under QEMU.
+- ⭐ **The oracle is "paged == single-shot", not "paged > 0"**: the program compares its batched total
+  against what one `#81` call reports. A walk returning the first batch forever would still terminate
+  and still return entries; a walk skipping one record per batch would still look plausible. One
+  comparison catches omissions and duplicates together.
+- Mutation-proven four ways, each a full kernel rebuild and boot: resuming at the block start instead
+  of mid-block (exit 93 — never terminates), the budget checked after the record is consumed (92 —
+  a batch overruns `max`), exhaustion writing `0` instead of `-1` (93), and the alignment guard
+  removed (97).
+
 ## [1.56.49] — 2026-08-27 — mouse wheel: byte [3] is read, `#98 ptrscan` grows to 20 bytes
 
 ### Added

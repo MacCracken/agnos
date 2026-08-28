@@ -1,0 +1,55 @@
+# rdat — agnos ring-3 exerciser for the RESUMABLE readdir (#101, kernel `ext2_readdir_at_sys`).
+#
+# ⭐ THE GATE THIS PROVES. `#81 readdir(path, buf, max)` always starts at the top of the directory
+# and stops at `max`, so a directory with more entries than the caller's buffer is silently
+# truncated — crab's `CRAB_MAX_ENTRIES = 256` is exactly that ceiling. `#101` adds a cursor, so the
+# same directory can be read in batches.
+#
+# ⛔ THE ORACLE IS "PAGED == SINGLE-SHOT", NOT "PAGED > 0". A walk that returned the FIRST batch
+# forever would still terminate and still return entries; a walk that skipped one record per batch
+# would still look like a plausible listing. Only comparing the paged total against what #81 reports
+# in one call catches both, and it catches duplicates and omissions in the same comparison.
+#
+# Exit 95 iff the whole contract holds; 90-97 pinpoint where it broke.
+fn rdat_main(): i64 {
+    # ---- the reference: one shot, a buffer big enough for the whole directory ----
+    var one[4096];                              # 64 records * 64 B
+    var n1 = sys_readdir("/bin", &one, 64);
+    if (n1 < 1) { return 90; }                  # nothing to compare against
+
+    # ---- the paged walk: five at a time, driven by the cursor ----
+    var page[320];                              # 5 records * 64 B
+    var cur[8];
+    store64(&cur, 0);                           # 0 = start at the top
+    var total = 0;
+    var iters = 0;
+    while (load64(&cur) != (0 - 1)) {
+        var k = syscall(101, "/bin", &page, 5, &cur);
+        if (k < 0) { return 91; }
+        # ⛔ A BATCH MUST RESPECT ITS BUDGET. Overrunning it would corrupt the caller's buffer, which
+        # is the whole reason `max` is passed at all.
+        if (k > 5) { return 92; }
+        total = total + k;
+        iters = iters + 1;
+        # ⚠ Anti-hang. A cursor that never reaches -1 is the failure mode this loop cannot otherwise
+        # survive, and a wedged test reads as a broken harness rather than a broken kernel.
+        if (iters > 200) { return 93; }
+    }
+    if (total != n1) { return 94; }
+
+    # ⛔ AN EXHAUSTED CURSOR MUST BE A NO-OP, NOT A RESTART. A loop that overruns by one would
+    # otherwise begin the directory again — an infinite listing that looks like a very large one.
+    var k2 = syscall(101, "/bin", &page, 5, &cur);
+    if (k2 != 0) { return 96; }
+
+    # ⛔ A MISALIGNED CURSOR IS REFUSED. It is user data; ext2 records are 4-byte aligned, and an
+    # offset inside a record would parse a header out of the middle of a filename.
+    store64(&cur, 3);
+    if (syscall(101, "/bin", &page, 5, &cur) != (0 - 5)) { return 97; }
+
+    return 95;
+}
+
+fn main(): i64 { return rdat_main(); }
+fn _entry(): i64 { var rc = main(); syscall(SYS_EXIT, rc); return 0; }
+_entry();

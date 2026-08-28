@@ -8436,6 +8436,11 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 80) { stack_canary_check(canary); return blk_close_sys(arg1); }                               # blk_close(h) -> 0
     # directory listing (#81) — ring-3 readdir over the ext2 root; fills 64-byte {name,type} records.
     if (num == 81) { stack_canary_check(canary); return ext2_readdir_sys(arg1, arg2, arg3); }                # readdir(path, buf, max) -> count
+    # ⭐ resumable directory listing (#101, 1.56.50) — #81 with a cursor, so a directory larger than
+    # the caller's buffer can be read in batches instead of silently truncated at `max`.
+    # ⛔ A SEPARATE NUMBER, NOT A 4th ARG ON #81. Existing callers pass three; the 4th register would
+    # hold garbage, and this argument is a POINTER the kernel writes through.
+    if (num == 101) { stack_canary_check(canary); return ext2_readdir_at_sys(arg1, arg2, arg3, ksyscall_a4_get()); }  # readdir_at(path, buf, max, &cursor) -> count
     # GPU compute dispatch (#82) — the ring-3 dispatch seam (#82) ring-3 seam: run the proven 8x8 integer matmul on the caller's
     # A,B (64 i32 each) and write C=A*B to c_uva. The path mabda/tentib consume for GPU inference. -> 0 ok / <0 err.
     if (num == 82) { stack_canary_check(canary); return gpu_dispatch_sys(arg1, arg2, arg3); }                # gpu_dispatch(a, b, c)

@@ -2275,6 +2275,100 @@ fn ext2_readdir_sys(path, buf, max_entries) {
     return count;
 }
 
+# ⭐⭐ RESUMABLE readdir (#101, 1.56.50) — `readdir_at(path, buf, max, cursor_uva) -> count`.
+#
+# ⛔ WHY #81 COULD NOT SIMPLY GROW A 4th ARGUMENT. Its callers pass three; the 4th register holds
+# whatever the caller happened to leave there, and this argument is a POINTER the kernel writes
+# through. An opt-in "only if it looks valid" test on garbage is not a test. `#81` is untouched and
+# keeps its exact semantics; this is a separate number, the way `#96` is held for `fork`.
+#
+# ⭐ THE CURSOR IS THE BYTE OFFSET INTO THE DIRECTORY FILE — the same thing POSIX `telldir` returns,
+# and the only value that survives the fact that ext2 directories are a chain of variable-length
+# records: an ENTRY INDEX would have to re-walk from the top every call, which is the O(n^2) the
+# resumability exists to avoid.
+#
+# Protocol: `*cursor` is 0 to start. On return it is the offset to resume from, or **-1 when the
+# directory is exhausted**. A caller loops `while (cur != -1)`. Passing -1 back in is a no-op that
+# returns 0, so a loop that overruns by one is harmless rather than an infinite restart from the top.
+#
+# ⛔ THE CURSOR IS USER DATA AND IS VALIDATED AS SUCH. It is rejected unless it is 4-byte aligned
+# (ext2 records always are) and inside the directory; a misaligned or out-of-range value would parse
+# a record header out of the middle of a filename. `ext2_dirent_valid` still bounds every record to
+# its block, so the worst a *valid-looking* wrong offset can do is yield nonsense names — never a
+# read outside `ext2_dir_buf`.
+fn ext2_readdir_at_sys(path, buf, max_entries, cursor_uva) {
+    if (ext2_active == 0) { return 0 - 1; }
+    if (max_entries <= 0) { return 0; }
+    if (is_user_range(path, 256) == 0) { return 0 - 1; }
+    if (is_user_range(buf, max_entries * 64) == 0) { return 0 - 1; }
+    if (is_user_range(cursor_uva, 8) == 0) { return 0 - 1; }
+    var start = load64(cursor_uva);
+    if (start < 0) { return 0; }                        # already exhausted — a no-op, not a restart
+    # bounded strlen of the user path
+    var path_len = 0; var pdone = 0;
+    while ((path_len < 255) && (pdone == 0)) {
+        if (load8(path + path_len) == 0) { pdone = 1; } else { path_len = path_len + 1; }
+    }
+    var dir_ino = ext2_path_lookup(path, path_len);
+    if (dir_ino <= 0) { return 0 - 2; }
+    if (ext2_get_inode(dir_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    var mode = ext2_inode_mode(&ext2_inode_buf);
+    if ((mode & 0xF000) != 0x4000) { return 0 - 4; }    # not a directory
+    var dir_size = ext2_inode_filesize(&ext2_inode_buf);
+    if (dir_size == 0) { store64(cursor_uva, 0 - 1); return 0; }
+    if ((start & 3) != 0) { return 0 - 5; }             # ext2 records are 4-byte aligned
+    if (start >= dir_size) { store64(cursor_uva, 0 - 1); return 0; }
+
+    var count = 0;
+    var pos = start;
+    while (pos < dir_size) {
+        var logical = pos / ext2_blocksize;
+        var blkbase = logical * ext2_blocksize;
+        # ⚠ Re-fetched per block, exactly as #81 does — the proven behaviour is kept rather than
+        # optimised while changing the traversal.
+        if (ext2_get_inode(dir_ino, &ext2_inode_buf) != 0) { store64(cursor_uva, pos); return count; }
+        var phys = ext2_logical_to_physical(&ext2_inode_buf, logical);
+        if (phys == 0 - 1) { store64(cursor_uva, 0 - 1); return count; }
+        if (phys == 0) { pos = blkbase + ext2_blocksize; continue; }   # sparse block
+        if (ext2_read_block(phys, &ext2_dir_buf) != 0) { store64(cursor_uva, pos); return count; }
+
+        var off = pos - blkbase;                        # ⭐ resume MID-BLOCK, not at its start
+        while (off < ext2_blocksize) {
+            # ⛔ THE BUDGET IS CHECKED BEFORE THE RECORD IS CONSUMED, and the cursor is parked ON the
+            # record we did not take. Checking after would drop exactly one entry per batch — a bug
+            # that only shows up in directories larger than one batch, i.e. the case this exists for.
+            if (count >= max_entries) { store64(cursor_uva, blkbase + off); return count; }
+            var d = &ext2_dir_buf + off;
+            var inode_num = ext2_load32_le(d, 0);
+            var rec_len   = ext2_load16_le(d, 4);
+            var name_len  = load8(d + 6);
+            var ftype     = load8(d + 7);
+            if (ext2_dirent_valid(off, rec_len, name_len) == 0) { store64(cursor_uva, 0 - 1); return count; }
+            if (inode_num != 0) {
+                var skip = 0;                           # skip "." and ".."
+                if (name_len == 1) { if (load8(d + 8) == 46) { skip = 1; } }
+                if (name_len == 2) { if (load8(d + 8) == 46) { if (load8(d + 9) == 46) { skip = 1; } } }
+                if (skip == 0) {
+                    var rec = buf + count * 64;
+                    var n = name_len;
+                    if (n > 62) { n = 62; }
+                    var k = 0;
+                    while (k < n) { store8(rec + k, load8(d + 8 + k)); k = k + 1; }
+                    store8(rec + n, 0);                 # NUL-terminate the name
+                    var t = 0;
+                    if (ftype == 2) { t = 1; }          # EXT2_FT_DIR
+                    store8(rec + 63, t);
+                    count = count + 1;
+                }
+            }
+            off = off + rec_len;
+        }
+        pos = blkbase + ext2_blocksize;
+    }
+    store64(cursor_uva, 0 - 1);                         # walked off the end — exhausted
+    return count;
+}
+
 # Find a named entry inside a directory inode. Returns the entry's inode
 # number on hit, 0 if not found, -1 on error.
 # 1.47.2 perf — the directory name-scan given the dir inode ALREADY in `inode_buf`. Split out of

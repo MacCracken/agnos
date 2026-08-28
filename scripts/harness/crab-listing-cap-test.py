@@ -52,8 +52,19 @@ subprocess.run(["chmod", "+x", os.path.join(SEED, "bin", "crab")])
 # expectation has to come from the tree under test, not from a number typed here.
 EXP_BIN  = len(os.listdir(os.path.join(SEED, "bin")))
 EXP_ROOT = len(os.listdir(SEED))
+
+# ⭐ A DIRECTORY LARGER THAN THE PANE CAP (crab M3 *#02*, agnos 1.56.50 `#101 readdir_at`).
+# ⛔ THE CAP ONLY MISBEHAVES ABOVE ITSELF, so a seed of 46 entries cannot test it at all. crab's cap
+# is 1024; this directory is deliberately larger, so the listing MUST be truncated and crab must say
+# by how much — "showing 1024 of 1200", not "there are more".
+BIG_N = 1200
+BIG = os.path.join(SEED, "big")
+os.makedirs(BIG, exist_ok=True)
+for i in range(BIG_N):
+    open(os.path.join(BIG, f"f{i:05d}"), "w").close()
+EXP_BIG = len(os.listdir(BIG))
 p(f"seed: /bin/crab <- {CRAB} ({os.path.getsize(CRAB)} bytes)")
-p(f"seed: /bin has {EXP_BIN} entries, / has {EXP_ROOT}")
+p(f"seed: /bin has {EXP_BIN} entries, / has {EXP_ROOT}, /big has {EXP_BIG}")
 p(f"expect the /bin pane to report {EXP_BIN} entries")
 
 sh(f"dd if=/dev/zero of={IMG} bs=1M count={DISK_MB} status=none")
@@ -156,6 +167,71 @@ try:
         p("PASS: the pane listed every /bin entry and nothing was truncated"); rc = 0
     else:
         p("FAIL: the pane did not list the directory completely"); rc = 1
+
+    # ⭐ ARGV REACHES crab ON agnos (crab M3, unreleased, *deferral #11*). `/bin` and `/` were hardcoded, and
+    # `args` sat declared in crab's manifest and never called.
+    # ⛔ THE ORACLE IS AN ABSENCE, NOT A PRESENCE. Launching `crab /bin /bin` must list `/bin` TWICE
+    # and `/` NOT AT ALL — and `/` is exactly what the default run lists. A presence oracle ("did
+    # /bin appear?") passes whether or not argv landed, because /bin is also the default left pane.
+    # ⚠ THIS RIDES THE SAME BOOT as the run above; a second boot costs ~2 min for one launch. crab
+    # exits on its own (it has no compositor to connect to here), so agnsh takes another command.
+    # ⚠ argv on agnos is NOT the Linux mechanism: lib/args_agnos.cyr reads the init rsp that cycc
+    # parks in r15 at entry. It is compiler plumbing, so a green host test says nothing about here.
+    # ⭐ THE ORACLE IS PROVEN DISCRIMINATING BY THE RUN ABOVE, at no extra cost: the bare `crab`
+    # launch in this same boot reports `/=7, /bin=45`, which is precisely the shape that trips the
+    # `"/" in l2` FAIL branch. So the broken-argv output is on record, in this log, every run.
+    mark2 = len(ser())
+    typ("crab /bin /bin\n")
+    time.sleep(20.0)
+    out2 = ser()[mark2:]
+    l2 = {}
+    for lm in re.finditer(r"crab: listed (\d+) entries in (\S+)", out2):
+        l2.setdefault(lm.group(2), []).append(int(lm.group(1)))
+    p("argv run listed:", ", ".join(f"{k}x{len(v)}={v[0]}" for k, v in sorted(l2.items())) or "(nothing)")
+    if not l2:
+        p("INCONCLUSIVE: the argv run produced no listing at all"); rc = rc or 2
+    elif "/" in l2:
+        p("FAIL: argv did NOT reach crab — it fell back to the hardcoded / pane"); rc = 1
+    elif len(l2.get("/bin", [])) == 2:
+        p("PASS: argv reached crab — both panes took /bin and the default / never appeared")
+    else:
+        p("FAIL: unexpected argv listing shape"); rc = 1
+
+    # ⭐⭐ A DIRECTORY LARGER THAN THE PANE CAP IS TRUNCATED **AND SAYS BY HOW MUCH** (*#02*).
+    # ⛔ THE OLD MESSAGE WAS "has more entries than are shown", WHICH IS NOT AN ANSWER. `#81 readdir`
+    # stops at `max` and cannot see past it, so crab could not know the real number. `#101 readdir_at`
+    # carries a cursor, so once the pane buffer is full crab keeps walking WITHOUT storing, purely to
+    # count — which is what turns the warning into "showing 1024 of 1200".
+    # ⚠ The expectation comes from the seeded tree, not a number typed here.
+    markb = len(ser())
+    typ("crab /big /\n")
+    time.sleep(45.0)
+    outb = ser()[markb:]
+    mb = re.search(r"listing truncated at the entry cap -- /big showing (\d+) of (\d+)", outb)
+    p("big-directory warning:", mb.group(0)[-28:] if mb else "(not found)")
+    if not mb:
+        p("FAIL: no counted truncation warning for /big"); rc = 1
+        p("  saw:", " | ".join(l for l in outb.splitlines() if "crab:" in l)[:400])
+    else:
+        shown, total = int(mb.group(1)), int(mb.group(2))
+        p(f"  shown={shown} total={total}  (tree has {EXP_BIG})")
+        if total != EXP_BIG:
+            p(f"FAIL: crab counted {total}, the directory holds {EXP_BIG}"); rc = 1
+        elif shown != 1024:
+            p(f"FAIL: crab showed {shown}, the cap is 1024"); rc = 1
+        else:
+            p("PASS: the pane filled to its cap and crab reported the directory's TRUE size")
+
+    # ⛔ AND A REFUSED PATH IS ANNOUNCED, not silently swapped for the default. An empty pane with no
+    # message reads as a broken filesystem rather than as a rejected argument.
+    mark3 = len(ser())
+    typ("crab relative\n")
+    time.sleep(20.0)
+    out3 = ser()[mark3:]
+    said = "left path unusable" in out3
+    p("refusal announced on the console:", said)
+    if not said:
+        p("FAIL: an unusable path was swallowed"); rc = 1
 finally:
     try: qemu.kill()
     except Exception: pass
