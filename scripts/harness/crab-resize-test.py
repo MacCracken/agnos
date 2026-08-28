@@ -290,13 +290,79 @@ try:
     # re-readdirs and re-stats — the most work any input causes. If that wedged crab, the log would
     # look identical to a success up to this point.
     amark = len(ser())
-    for _ in range(6):
+    NKEY = 6
+    for _ in range(NKEY):
         key("j", 0.6)
     time.sleep(2.5)
     alive_after_click = ser()[amark:].count("crab: key received")
-    p("keystrokes answered AFTER the click sweep:", alive_after_click)
+    acted = ser()[amark:].count("crab: key press")
+    p("keystrokes answered AFTER the click sweep:", alive_after_click, "· acted on:", acted)
+
+    # ⭐⭐ FULL_KEYS (M2 *#06*). crab asks for `SETU_SURF_FULL_KEYS`, so the compositor forwards BOTH
+    # edges — `mods` 1 on press, 0 on release. Two counters, two different claims:
+    #   `crab: key received` — every KEY event the wire delivered. Should be ~2x the keystrokes.
+    #   `crab: key press`    — the ones crab ACTED on. Should be ~1x.
+    # ⛔ WITHOUT THE GATE THESE TWO ARE EQUAL, and that is the bug: two rows per Down, Enter
+    # descending twice. The compositor measured exactly this on its own chrome on 2026-08-18.
+    # ⚠ A RATIO, NOT AN EXACT COUNT. QEMU drops keys that land between the compositor's once-per-frame
+    # HID drains, so the absolute numbers vary run to run — what must hold is received > acted.
+    if alive_after_click > 0:
+        if acted > 0:
+            p(f"  FULL_KEYS ratio: received/acted = {alive_after_click}/{acted}"
+              + ("  ✅ releases delivered AND gated" if alive_after_click > acted
+                 else "  ⚠ equal — releases either absent or NOT gated"))
+        else:
+            p("  ⚠ events arrived but crab acted on none — the gate may be inverted")
 
     p("compositor forwarded a scroll:", "forwarded a scroll" in ser())
+    # ⭐⭐ HELD-KEY REPEAT (M2 *#06* second half). HMP `sendkey` sends a press AND a release, so it can
+    # never hold anything — which is why this needs QMP's `input-send-event` with `down: true` and no
+    # matching up until later. crab requests `SETU_SURF_FULL_KEYS`, so it sees both edges and can know
+    # the key is still down; `sys_pause` (#14) is already a bounded wait (measured 0-4 ms on a real
+    # kernel, because a device IRQ or the 100 Hz timer wakes its single hlt), so the idle path runs
+    # often enough to drive repeat from a clock check alone.
+    # ⚠ EXPECTED SHAPE, not an exact count: hold ~1.6 s with a 400 ms delay and a 60 ms interval is
+    # roughly (1600-400)/60 ~ 20 repeats. QEMU timing varies; what must hold is "many, not zero, and
+    # then it STOPS on release".
+    rep = 0
+    rep_after_release = 0
+    if qs is not None:
+        try:
+            rmark2 = len(ser())
+            def qkey(down):
+                ev = {"execute": "input-send-event", "arguments": {"events": [
+                    {"type": "key", "data": {"down": down,
+                     "key": {"type": "qcode", "data": "down"}}}]}}
+                qs.sendall((json.dumps(ev) + "\n").encode())
+                try: qs.recv(65536)
+                except Exception: pass
+            qkey(True)                      # press and HOLD
+            time.sleep(1.6)
+            # ⚠ DID THE HELD KEY EVEN ARRIVE? Without this, "0 repeats" cannot separate a crab bug
+            # from a harness that never delivered the key — and QMP `input-send-event` holding a key
+            # down is the one thing here that has no other confirmation.
+            hold_window = ser()[rmark2:]
+            arrived = hold_window.count("crab: key press")
+            released = hold_window.count("crab: key received") - arrived
+            p(f"  hold window: {arrived} press(es), {released} release(s) seen by crab")
+            rep = hold_window.count("crab: key repeat")
+            qkey(False)                     # release
+            time.sleep(1.2)
+            # ⛔ THE RELEASE MUST STOP IT. A latch that is not cleared on the release edge repeats
+            # forever — the stuck-key failure FULL_KEYS exists to make avoidable.
+            settle = len(ser())
+            time.sleep(1.5)
+            rep_after_release = ser()[settle:].count("crab: key repeat")
+        except Exception as e:
+            p("  repeat arm error:", e)
+    p("held-key repeat: fired", rep, "time(s) while held ·", rep_after_release, "after release")
+    if rep > 0 and rep_after_release == 0:
+        p("  ✅ repeat works AND stops on release")
+    elif rep > 0:
+        p("  ⛔ repeat did not stop on release — the held latch is not cleared")
+    else:
+        p("  ⚠ no repeat observed (the key may never have reached crab)")
+
     faulted = "fault: pid=" in ser()[mark:]
     p("kernel/userland fault:", faulted)
 
