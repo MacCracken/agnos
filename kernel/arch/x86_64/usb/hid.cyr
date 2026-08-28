@@ -197,6 +197,21 @@ var hid_mouse_btn = 0;       # current button bitmap (bit0 left, bit1 right, bit
 var hid_mouse_btn_seen = 0;  # OR of every bitmap seen since the last drain — catches a click in a gap
 var hid_mouse_seq = 0;       # bumps on every accepted report; ring 3 can tell "no motion" from "no poll"
 var hid_mouse_first = 0;     # one-shot marker latch
+# ⭐⭐ THE WHEEL (1.56.49). Byte [3] of the boot-mouse report, summed like dx/dy since the last drain.
+# ⛔ IT WAS DOCUMENTED IN THE LAYOUT COMMENT AND NEVER READ — "wheel (s8, optional)" sat above a
+# function that loaded only `+1` and `+2`, so every scroll the hardware sent was discarded at the very
+# bottom of the stack. Nothing above could have carried it: `#98 ptrscan`'s record had no field for it,
+# bhumi had no scroll concept, and setu had no message kind. Five repos looked like they were missing
+# a feature; the byte was being dropped here.
+var hid_mouse_wheel = 0;
+# ⚠ DIAGNOSTIC, ONE-SHOT, DRAINED IN THREAD CONTEXT. Records the first report that carried a NON-ZERO
+# wheel byte, plus the event's residual field, so the assumption below is CHECKABLE from a serial log
+# rather than argued. Printed from the `#98` arm, never from here — this file's own banner explains
+# why a kprintln in ISR context deadlocks.
+var hid_wheel_seen = 0;
+var hid_wheel_seen_pending = 0;
+var hid_wheel_dbg_b3 = 0;
+var hid_wheel_dbg_resid = 0;
 
 # Sign-extend one HID byte: the boot-mouse report carries dX/dY as SIGNED int8, and Cyrius has no i8.
 fn hid_s8(b) {
@@ -207,11 +222,33 @@ fn hid_s8(b) {
 
 # Fold one boot-mouse report into the accumulator. Report layout (USB HID boot protocol):
 #   [0] buttons bitmap   [1] dX (s8)   [2] dY (s8, POSITIVE IS DOWN)   [3] wheel (s8, optional)
-fn hid_process_mouse_report(report_phys, bi) {
+fn hid_process_mouse_report(report_phys, bi, resid) {
     if (report_phys == 0) { return 0; }
     var btn = load8(report_phys + 0) & 0xFF;
     hid_mouse_dx = hid_mouse_dx + hid_s8(load8(report_phys + 1));
     hid_mouse_dy = hid_mouse_dy + hid_s8(load8(report_phys + 2));
+    # ⭐ THE WHEEL, byte [3] (1.56.49). Folded exactly like dx/dy: it is a relative delta and keeping
+    # only the last one of a coalescing gap would under-report a fast scroll the same way it amplified
+    # motion — see this accumulator's header.
+    # ⛔ READ UNCONDITIONALLY, AND HERE IS WHY THAT IS SAFE RATHER THAN SLOPPY. USB HID boot protocol
+    # defines a 3-BYTE mouse report, so byte [3] is formally out of contract — but this file's own
+    # SHORT_PACKET note already says the opposite in practice: *"the boot mouse's 4-byte reports on an
+    # 8-byte endpoint"*. The report page is zeroed at configure time and each row owns its own page, so
+    # a device that genuinely sends three bytes leaves byte [3] at 0 for the life of the boot and the
+    # wheel simply stays 0. The failure mode a length gate would prevent — a stale byte re-read as a
+    # scroll — needs a device that alternates report lengths, which a fixed report descriptor cannot do.
+    # ⚠ THE ASSUMPTION IS INSTRUMENTED, NOT ASSERTED: `resid` is recorded below so a serial log can say
+    # what the controller actually reported. Tighten this to a length gate if a 3-byte device appears.
+    var wh = hid_s8(load8(report_phys + 3));
+    hid_mouse_wheel = hid_mouse_wheel + wh;
+    if (wh != 0) {
+        if (hid_wheel_seen == 0) {
+            hid_wheel_seen = 1;
+            hid_wheel_seen_pending = 1;
+            hid_wheel_dbg_b3 = load8(report_phys + 3) & 0xFF;
+            hid_wheel_dbg_resid = resid;
+        }
+    }
     # ⛔ RECORD THIS ENDPOINT'S BITMAP, THEN UNION — never assign the global from one device. See the
     # `hid_ep_btn` banner: with two bound boot-mouse interfaces, last-writer-wins lets the keyboard's
     # phantom mouse release a button the real mouse is holding.
@@ -257,7 +294,7 @@ fn hid_process_mouse_report(report_phys, bi) {
 # read-modify-write here must be serialised against it. ⛔ THIS USED TO SAY "CALLER MUST HOLD IF=0" AND
 # THAT WAS NOT ENOUGH: `cli` is per-CPU, and on four CPUs the syscall and the interrupt run on different
 # ones. It takes `hid_poll_lock` itself now and does not rely on the caller for anything.
-fn hid_mouse_take(out) {
+fn hid_mouse_take(out, cap) {
     if (out == 0) { return 0; }
     # ⛔⛔ `cli` IS NOT A LOCK ON FOUR CPUs, and the banner above claimed it was enough. This function
     # read-modify-writes the same accumulator `hid_process_mouse_report` folds into from the MSI-X ISR;
@@ -271,7 +308,12 @@ fn hid_mouse_take(out) {
     if (hid_mouse_dx == 0) {
         if (hid_mouse_dy == 0) {
             if (hid_mouse_btn == 0) {
-                if (hid_mouse_btn_seen == 0) { idle = 1; }
+                if (hid_mouse_btn_seen == 0) {
+                    # ⛔ THE WHEEL COUNTS AS ACTIVITY. Without this a pure scroll — no motion, no
+                    # button — reads as idle and the sample is dropped, which is exactly the shape of
+                    # "scrolling does nothing" that would look like a bug five layers up.
+                    if (hid_mouse_wheel == 0) { idle = 1; }
+                }
             }
         }
     }
@@ -280,14 +322,28 @@ fn hid_mouse_take(out) {
     store32(out + 4,  hid_mouse_dy);
     store32(out + 8,  hid_mouse_btn);
     store32(out + 12, hid_mouse_btn_seen);
+    # ⭐ THE RECORD GREW FROM 16 TO 20 BYTES AND OLD CALLERS ARE UNAFFECTED (1.56.49). A caller that
+    # asks for 16 gets exactly the 16 it always got; only one asking for >= 20 is told about the wheel.
+    # ⛔ A FLAG DAY WOULD HAVE BEEN THE WRONG ANSWER: `#98`'s record layout is a documented syscall
+    # contract with a live consumer (bhumi -> aethersafha), and growing it unconditionally would have
+    # written past a 16-byte buffer in every existing caller.
+    var n = 16;
+    if (cap >= 20) {
+        store32(out + 16, hid_mouse_wheel);
+        n = 20;
+    }
     # ⚠ RESET THE DELTAS, KEEP THE CURRENT BUTTON STATE. dx/dy are consumed — reporting them twice is
     # exactly the double-apply this whole path exists to avoid. `hid_mouse_btn` is LEVEL, not an edge,
     # so it persists until the device says otherwise; only the OR-accumulator is cleared.
     hid_mouse_dx = 0;
     hid_mouse_dy = 0;
     hid_mouse_btn_seen = hid_mouse_btn;
+    # ⚠ CLEARED EVEN WHEN THE CALLER DID NOT ASK FOR IT. A 16-byte caller cannot see the wheel, and
+    # leaving it to accumulate would hand the first 20-byte caller every scroll since boot as one
+    # enormous delta.
+    hid_mouse_wheel = 0;
     hid_poll_unlock();                             # the other exit is the idle branch above
-    return 1;
+    return n;
 }
 
 # hid_mouse_configure(slot_id): bind EVERY HID-boot-mouse interface this device exposes.
@@ -1036,7 +1092,7 @@ fn hid_poll() {
             # why keeping only the last report of a coalescing gap amplifies relative motion ~2-3x.
             if (hid_ep_kind_at(row) == HidKind.HID_KIND_MOUSE) {
                 if (cc_ok == 1) {
-                    hid_process_mouse_report(load64(&hid_ep_buf + row * 8), row);
+                    hid_process_mouse_report(load64(&hid_ep_buf + row * 8), row, evt_dw2 & 0xFFFFFF);
                     processed = processed + 1;
                 }
                 # ⚠ UNCONDITIONAL — see the keyboard arm above.

@@ -9126,12 +9126,24 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 98) {
         # ptrscan(buf=arg1, max=arg2) — NON-BLOCKING drain of ONE MERGED pointer sample.
-        # Returns 16 (bytes written) on motion/button activity, 0 when the pointer has been idle since
-        # the last call, -1 on a bad user range or a buffer smaller than one record.
+        # Returns the NUMBER OF BYTES WRITTEN (16 or 20) on motion/button/wheel activity, 0 when the
+        # pointer has been idle since the last call, -1 on a bad user range or a buffer smaller than one
+        # record.
         #
-        # Record (16 B, little-endian): +0 s32 dx · +4 s32 dy (POSITIVE = DOWN) · +8 u32 buttons
-        # (current level) · +12 u32 buttons_seen (OR since last drain — this is what makes a click that
-        # starts and finishes inside one frame survive). Layout owned by hid_mouse_take().
+        # Record (little-endian): +0 s32 dx · +4 s32 dy (POSITIVE = DOWN) · +8 u32 buttons (current
+        # level) · +12 u32 buttons_seen (OR since last drain — this is what makes a click that starts and
+        # finishes inside one frame survive). Layout owned by hid_mouse_take().
+        #
+        # ⭐⭐ +16 s32 WHEEL, AND ONLY IF THE CALLER ASKED FOR ROOM (1.56.49). Pass `max >= 20` and the
+        # record is 20 bytes with the wheel delta appended; pass 16 and you get exactly the 16 bytes this
+        # syscall has always returned. **The growth is opt-in per call, not a flag day.**
+        # ⛔ THE ALTERNATIVE WOULD HAVE WRITTEN PAST EVERY EXISTING CALLER'S BUFFER. This record is a
+        # documented contract with a live consumer chain (bhumi -> aethersafha), and `hid_mouse_take`
+        # used to write 16 bytes into a `var pscr[16]` frame slot — growing it unconditionally is a
+        # stack overwrite in the kernel, not a version bump.
+        # ⚠ THE WHEEL BYTE ITSELF WAS BEING DISCARDED IN THE HID DRAIN until 1.56.49 — byte [3] of the
+        # boot-mouse report was documented and never read. Nothing above this could have carried a
+        # scroll; the chain was broken at the bottom.
         #
         # ⭐ ONE MERGED SAMPLE, NOT A BYTE STREAM, and that is the whole design. The keyboard's
         # `kbscan #42` hands back raw scancodes because keys are discrete events. Pointer motion is a
@@ -9167,9 +9179,12 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # rule, applied to a function local. A 16-byte record was written into a 2-byte frame slot, so dx
         # and dy came back as garbage and the cursor never moved while BUTTONS still worked. The wrong
         # rule was written down next to the wrong code, which is what made it survive a read.
-        var pscr[16];                    # 16 BYTES — exactly one ptrscan record
-        var got = hid_mouse_take(&pscr);
-        if (got == 1) {
+        # ⛔ 24 BYTES, NOT 20 — and the reason is the trap recorded above: function-local `var X[N]` is N
+        # **BYTES** in Cyrius. The slot must hold the largest record this arm can write (20) with room to
+        # spare rather than exactly; a frame slot sized to the byte is how the dx/dy garbage bug happened.
+        var pscr[24];
+        var got = hid_mouse_take(&pscr, arg2);
+        if (got > 0) {
             if (ptrscan_gave == 0) {
                 ptrscan_gave = 1;
                 kprintln("ptrscan: first sample handed to ring 3", 38);
@@ -9185,14 +9200,27 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # early-return below, or a pointer that reports nothing would never service a halted endpoint,
         # which is precisely the state a halted pointer endpoint puts the system in.
         hid_service_deferred();
+        # ⚠ ONE-SHOT WHEEL DIAGNOSTIC, drained here because this is THREAD context. `hid_poll` can run
+        # from the MSI-X ISR where a kprintln deadlocks, so the fold records and this prints.
+        if (hid_wheel_seen_pending == 1) {
+            hid_wheel_seen_pending = 0;
+            kprint("hid: wheel byte seen, b3=", 25);
+            kprint_num(hid_wheel_dbg_b3);
+            kprint(" resid=", 7);
+            kprint_num(hid_wheel_dbg_resid);
+            kprintln("", 0);
+        }
         if (got == 0) { stack_canary_check(canary); return 0; }
         var pi = 0;
-        while (pi < 16) {
+        while (pi < got) {
             store8(arg1 + pi, load8(&pscr + pi));
             pi = pi + 1;
         }
         stack_canary_check(canary);
-        return 16;
+        # ⚠ `got`, NOT a literal 16 — the record is 20 bytes when the caller made room for the wheel,
+        # and returning 16 regardless would tell a 20-byte caller the wheel field it just received is
+        # not there.
+        return got;
     }
 
     if (num == 99) {

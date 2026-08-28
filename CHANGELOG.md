@@ -20,6 +20,45 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.56.49] — 2026-08-27 — mouse wheel: byte [3] is read, `#98 ptrscan` grows to 20 bytes
+
+### Added
+
+- **`#98 ptrscan` record field +16 `s32 wheel`** — the wheel delta summed since the last drain, sign
+  of the HID report byte (positive = wheel-up on the tested device). **Opt-in per call**: pass
+  `max >= 20` to receive a 20-byte record; `max == 16` returns the 16-byte record unchanged. The
+  syscall now returns the number of bytes written (16 or 20) rather than a literal 16.
+- **`hid_mouse_wheel`** — the accumulator behind that field. Folded per report like `dx`/`dy`, reset
+  on every drain including drains by 16-byte callers.
+- **`hid: wheel byte seen, b3=<byte> resid=<residual>`** — one-shot diagnostic on the first report
+  carrying a non-zero wheel byte. Printed from the `#98` arm (thread context), flagged from the fold.
+- **`scripts/harness/hid-wheel-test.py`** — injects wheel events over **QMP** `input-send-event`
+  (HMP has no wheel verb) and asserts the kernel line above.
+
+### Fixed
+
+- **`hid_process_mouse_report` discarded byte [3] of every boot-mouse report.** The layout comment
+  documented it as `wheel (s8, optional)`; only bytes [1] and [2] were read. A wheel field existed
+  nowhere above this point either — `#98`'s record had no slot for it.
+- **A wheel-only report no longer reads as idle.** `hid_mouse_take`'s idle test checked `dx`, `dy`
+  and both button fields; a scroll with no motion and no button was dropped.
+
+### ABI
+
+- `#98 ptrscan(buf, max)` → bytes written: **16** when `max` is 16..19, **20** when `max >= 20`, `0`
+  when idle, `-1` on a bad range or `max < 16`. Record: `+0 s32 dx` · `+4 s32 dy` (positive = down) ·
+  `+8 u32 buttons` · `+12 u32 buttons_seen` · **`+16 s32 wheel`** (only when 20 bytes were written).
+- `hid_process_mouse_report(report_phys, bi, resid)` and `hid_mouse_take(out, cap)` take one further
+  argument each. Both are kernel-internal; `hid_mouse_take` has one caller.
+
+### Measured
+
+- QEMU `usb-mouse`, boot protocol, xHCI: `b3=1` on wheel-up, `resid=0`. Byte [3] is present although
+  USB HID boot protocol specifies a 3-byte mouse report, matching this file's existing SHORT_PACKET
+  note about 4-byte boot-mouse reports. The wheel read is therefore ungated by length; the residual is
+  recorded by the diagnostic so the assumption is checkable per device.
+- Kernel build: 1,985,472 bytes.
+
 ## [1.56.48] — 2026-08-26 — `icmp_echo_ex`#100, ICMP counters, id+seq reply matching, klug-ring header
 
 ### Added
