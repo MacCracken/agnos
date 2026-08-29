@@ -249,19 +249,33 @@ fn pci_enable_msix_unmasked(idx) {
         var tob = pci_read32(bus, slot, func, msix_off + 4);
         var bir = tob & 0x07;
         var tbl_off = tob & 0xFFFFFFF8;
+        # ⛔ 1.56.51 — pci_bar_64 RETURNS 0 FOR A MALFORMED CAP AND THAT RETURN WAS NEVER CHECKED.
+        # `bir` comes straight out of the device's MSI-X Table Offset/BIR dword, so a device (or a
+        # misread) can name a BAR index this function rejects (bir > 5) or one that was never
+        # populated — either way it hands back 0. `tbl` then became `0 + tbl_off`, a LOW PHYSICAL
+        # ADDRESS, and the four store32s below wrote the MSI-X vector-0 entry (0xFEE00000 / 0 /
+        # 0x40 / 1) straight into the identity-mapped 0-2 MB window, where the boot PML4 (0x1000),
+        # PDPT (0x2000) and PD (0x3000) live. tbl_off is masked to 0xFFFFFFF8, so the landing site
+        # is device-chosen. Refuse instead: no MSI-X for this device beats corrupting page tables.
+        # ⚠ NOT an early `return 0` — the MSI fallback BELOW is still worth trying for a device
+        # whose MSI-X cap is malformed but whose MSI cap is fine. Guarding the rest of the block
+        # lets control fall out of the `msix_off != 0` arm instead. FuncMask stays SET (hdr_p1
+        # above), so such a device is left masked, not half-programmed.
         var bar = pci_bar_64(idx, bir);
-        var tbl = bar + tbl_off;
-        store32(tbl + 0,  0xFEE00000);
-        store32(tbl + 4,  0);
-        store32(tbl + 8,  0x40);
-        store32(tbl + 12, 1);
-        var flush = load32(tbl + 12);
+        if (bar != 0) {
+            var tbl = bar + tbl_off;
+            store32(tbl + 0,  0xFEE00000);
+            store32(tbl + 4,  0);
+            store32(tbl + 8,  0x40);
+            store32(tbl + 12, 1);
+            var flush = load32(tbl + 12);
 
-        # Phase 3 — clear FuncMask. Enable stays = 1.
-        var hdr_p3 = (hdr & 0x3FFFFFFF) | 0x80000000;
-        pci_write32(bus, slot, func, msix_off, hdr_p3);
+            # Phase 3 — clear FuncMask. Enable stays = 1.
+            var hdr_p3 = (hdr & 0x3FFFFFFF) | 0x80000000;
+            pci_write32(bus, slot, func, msix_off, hdr_p3);
 
-        return 1;
+            return 1;
+        }
     }
     var msi_off = pci_find_cap(idx, 0x05);
     if (msi_off != 0) {
@@ -289,7 +303,12 @@ fn pci_msix_arm_vector0(idx, vec) {
     var tob = pci_read32(bus, slot, func, msix_off + 4);
     var bir = tob & 0x07;
     var tbl_off = tob & 0xFFFFFFF8;
+    # 1.56.51: same unchecked-error-return defect as pci_enable_msix_unmasked Phase 2 — this
+    # function "recomputes the table address exactly as" that one, and faithfully reproduced the
+    # missing check. A 0 here would put the Message Data + Mask-clear stores into low physical
+    # memory (the boot page tables live at 0x1000/0x2000/0x3000) at a device-chosen offset.
     var bar = pci_bar_64(idx, bir);
+    if (bar == 0) { return 0; }
     var tbl = bar + tbl_off;
     store32(tbl + 8, vec);      # Message Data = the IDT vector to deliver on
     store32(tbl + 12, 0);       # clear per-vector Mask → the interrupter now posts

@@ -265,6 +265,10 @@ fn vmm_remap_wc_range(phys, size) {
 # identity-reachable under the boot CR3). Bite 2 switches the PMM/heap to hand out DIRECTMAP_BASE + phys
 # pointers. Returns 1 on success, 0 on pmm_alloc failure.
 var DIRECTMAP_BASE = 0x200000000;
+# 1.56.51 — the HIGHEST kernel PDPT index pmm_setup_directmap actually installed, so the high user
+# mmap arena can start ABOVE it instead of asserting a ceiling nothing enforces. 7 = "none yet"
+# (the direct map begins at PDPT[8]). See the ⛔ note on proc.cyr's USER_HIMMAP_BASE.
+var directmap_pdpt_top = 7;
 
 # Diagnostic: read the live CR3 (active PML4 phys + flags). Single-local frame -> result at [rbp-8].
 fn dm_read_cr3() {
@@ -325,6 +329,7 @@ fn pmm_setup_directmap(top_phys) {
             j = j + 1;
         }
         store64(0x2000 + (8 + gb) * 8, dm_pd | 0x03);     # PDPT[8+gb] in the kernel PDPT @ 0x2000 (apic.cyr-proven site)
+        if (8 + gb > directmap_pdpt_top) { directmap_pdpt_top = 8 + gb; }   # 1.56.51: record the real top
         gb = gb + 1;
     }
     asm { mov rax, cr3; }

@@ -49,10 +49,29 @@ fn slab_grow(class_idx) {
     # Allocate a 4KB page from PMM
     var page = pmm_alloc();
     if (page == 0) { return 0 - 1; }
-    # Ensure it's mapped (0x83 = Present+Writable+2MB page)
-    if (vmm_is_mapped(page) == 0) {
-        vmm_map(page, page, 0x83);
-    }
+    # ⛔⛔ 1.56.51 — SLAB BLOCKS ARE DIRECT-MAP VAs, NOT IDENTITY VAs, and that is a security
+    # boundary, not a style choice. pmm_alloc draws from [0x400000, 0xFFFF000] — precisely PD[2..127]
+    # of the per-process page directory, which elf.cyr will happily overwrite for any PT_LOAD in
+    # [0x400000, 0x10000000). A kmalloc'd object addressed by its phys==VA identity alias is
+    # therefore an object a crafted ELF segment can SHADOW under its own CR3: the kernel then reads
+    # attacker bytes out of what it believes is an fd table or an epoll watch list and dereferences
+    # them. DIRECTMAP_BASE + phys (kernel PDPT[8+], mirrored into every per-process PDPT and out of
+    # reach of the loaders' 0x10000000 ceiling) has no such alias. Same remedy as the PMM bitmap
+    # (pmm.cyr) and the page-table walks (proc.cyr's ptw_pd_kva header — read that one first).
+    # ⚠ Transparent to every caller: kmalloc's pointer is only ever load/store'd, never handed to
+    # a device as a physical address. Audited call site by call site at 1.56.51 — the consumers are
+    # TCP rings, the pipe buffer, dirent staging and selftest scratch; every DMA path in the tree
+    # (virtio, NVMe, xHCI, HDA, GPU) allocates from pmm_alloc directly and does not come through here.
+    # ⛔ The `vmm_map(page, page, 0x83)` that stood here is GONE, not merely unused. It wrote the
+    # BOOT PD at 0x3000 only, so it never propagated into a per-process CR3 that was created before
+    # it ran; and it was a no-op in practice anyway, since pmm_alloc caps at 256 MB and pt_init
+    # already identity-maps that whole window. Keeping it would map a page nothing addresses by
+    # identity any more — a stale side effect implying exactly the wrong thing about this allocator.
+    # ⛔ ORDERING: pmm_kva_for_access needs the direct map, installed at main.cyr:236.
+    # heap_init is main.cyr:401 and does not grow a slab; the earliest real kmalloc is far later
+    # (net_init :583, vfs_init :829, the selftests :2937+), and every other call site in the tree
+    # is inside a function reached after boot. Do not call kmalloc ahead of line 236.
+    var page_kva = pmm_kva_for_access(page);
     # Zero the whole fresh page ONCE here (amortized over blocks_per_page
     # blocks). Combined with kfree_sized's full-block scrub, this establishes
     # the heap invariant: every block on a free list is fully zero EXCEPT its
@@ -60,13 +79,13 @@ fn slab_grow(class_idx) {
     # bytes instead of re-zeroing the whole block — the 1.42.5 heap-zeroing win
     # (O(1) alloc-zero vs the old O(block_size)). pmm_alloc does not guarantee a
     # zeroed page, so this zero is required for the invariant on fresh slabs.
-    for (var z = 0; z < 4096; z = z + 8) { store64(page + z, 0); }
+    for (var z = 0; z < 4096; z = z + 8) { store64(page_kva + z, 0); }
     # Divide page into blocks, chain them as a free list
     var blocks_per_page = 4096 / block_size;
     if (blocks_per_page < 1) { blocks_per_page = 1; }
     var head = load64(&slab_free + class_idx * 8);
     for (var i = 0; i < blocks_per_page; i = i + 1) {
-        var block = page + i * block_size;
+        var block = page_kva + i * block_size;
         # Each free block's first 8 bytes = pointer to next free block
         store64(block, head);
         head = block;

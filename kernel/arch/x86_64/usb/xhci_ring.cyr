@@ -128,8 +128,23 @@ fn xhci_rings_init() {
             kprintln("", 0);
             return 0;
         }
-        # Allocate the pointer array (1 page = 512 u64 entries, plenty
-        # for any realistic MaxScratchpadBufs which tops out at 1023).
+        # ⛔ 1.56.51 — "PLENTY FOR ANY REALISTIC MaxScratchpadBufs WHICH TOPS OUT AT 1023" WAS THE
+        # WHOLE BUG, stated in the same breath as the number that contradicts it. The array is ONE
+        # 4 KB page = 512 u64 entries; HCSPARAMS2's MaxScratchpadBufs field is 10 bits, so the
+        # controller may legally ask for up to 1023 — and the fill loop below was bounded by
+        # xhci_max_scratchpad, not by the page. Entry 512 onward would have written buffer physes
+        # straight past the page into whatever pmm_alloc handed out next (live DMA rings, contexts,
+        # page tables), and then handed the controller an array it does not own the tail of.
+        # Refuse rather than truncate: a silently short scratchpad is a controller whose context-save
+        # backing is partly someone else's memory, which is worse than no xHCI at all.
+        if (xhci_max_scratchpad > 512) {
+            kprint("xhci: MaxScratchpadBufs=", 24);
+            kprint_num(xhci_max_scratchpad);
+            kprintln(" exceeds the 512-entry array - refusing", 39);
+            return 0;
+        }
+        # Allocate the pointer array (1 page = 512 u64 entries; the bound above is what makes
+        # that sufficient rather than merely likely).
         var sp_array = pmm_alloc();
         if (sp_array == 0) { kprintln("xhci: scratchpad array alloc failed", 35); return 0; }
         if (vmm_is_mapped(sp_array) == 0) { vmm_map(sp_array, sp_array, 0x83); }

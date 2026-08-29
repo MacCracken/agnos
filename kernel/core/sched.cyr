@@ -197,12 +197,21 @@ fn proc_restore_context(pid, isr_rsp) {
     store64(isr_rsp, load64(p + 144));        # r15
     # Hardware frame
     store64(isr_rsp + 120, load64(p + 24));   # rip
-    # 1.44.3: CS from the proc table (ring-0 0x08 / ring-3 0x1B) — was hardcoded
+    # 1.44.3: CS from the proc table (ring-0 0x08 / ring-3 0x23) — was hardcoded
     # 0x08, which iretq'd every switched-to proc into ring 0 regardless of privilege.
+    # ⛔ 1.56.51 — THIS SAID 0x1B AND THAT WAS BACKWARDS, in a comment a reader consults during the
+    # exact fault it describes. The derivation, so it is re-checkable rather than remembered:
+    # syscall_msr_init writes STAR[63:48] = 0x13, so hardware takes ring-3 CS = STAR[63:48]+16 =
+    # 0x23 and ring-3 SS = STAR[63:48]+8 = 0x1B. gdt_init agrees — user DS at selector 0x18
+    # (SS 0x1B), user CS at 0x20 (CS 0x23) — and so do proc_set_ring3, sys_sched_yield and
+    # sel_pair_consistent below, all of which pair (0x23, 0x1B). The inverted comment told anyone
+    # debugging the #GP(errcode 0x18) class that selector index 3 was a CS-load rejection when it
+    # is an SS one — the opposite conclusion and the opposite half of the pair to instrument.
     store64(isr_rsp + 128, load64(&proc_cs + pid * 8));
     store64(isr_rsp + 136, load64(p + 152));  # rflags
     store64(isr_rsp + 144, load64(p + 16));   # rsp
-    # 1.44.3: SS from the proc table (ring-0 0x10 / ring-3 0x23) — was hardcoded 0x10.
+    # 1.44.3: SS from the proc table (ring-0 0x10 / ring-3 0x1B) — was hardcoded 0x10.
+    # 1.56.51: was written "0x23" — the same inversion as the CS comment above; see it for why.
     store64(isr_rsp + 152, load64(&proc_ss + pid * 8));
     return 0;
 }

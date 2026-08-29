@@ -1039,11 +1039,23 @@ fn nvme_blk_read(sector, buf) {
     # is one atomic section (nvme_read_scratch is a shared bounce page). Polling-only
     # (IO-CQ IEN=0, no MSI/IDT vector), so no ISR contends → plain spinlock is safe.
     # fs_lock is held ABOVE this when FS reads a block (fs < nvme, forward order).
+    # ⛔ 1.56.51 — THE COPY LENGTH IS THE DEVICE'S REAL LBA SIZE, NOT A HARDCODED 512. This loop ran
+    # a fixed 64 iterations ("512 / 8") while nvme_read_lba transfers nvme_ns1_lba_bytes and
+    # blk_register_nvme registers that SAME value as the block layer's stride. On a 4096-byte-LBA
+    # namespace — which the Identify path already parses and which real NVMe ships — the block layer
+    # asked for 4096 bytes per LBA and got 512 copied, leaving 3584 bytes of the caller's buffer
+    # untouched: silent short reads and short writes through every filesystem above it.
+    # ⚠ Bounded by the scratch page, not merely by the device: the copy is via nvme_read_scratch,
+    # one 4 KB page. blk_lba_bytes_ok already refuses a registration larger than the bounce buffer
+    # (1.56.51), so this clamp is the same fact enforced at the second site rather than assumed.
+    var nb = nvme_ns1_lba_bytes;
+    if (nb < 8)    { nb = 512; }         # unset/absurd — fall back to the historical size
+    if (nb > 4096) { nb = 4096; }        # never past the scratch page
+    var nw = nb / 8;
     nvme_spin_lock();
     if (nvme_read_lba(sector, nvme_read_scratch) == 0) { nvme_spin_unlock(); return 0 - 1; }
-    # Copy LBA bytes from scratch into caller's buffer. 8-byte stride
-    # mirrors virtio_blk's loop — 512 / 8 = 64 iterations.
-    for (var i = 0; i < 64; i = i + 1) {
+    # Copy LBA bytes from scratch into caller's buffer. 8-byte stride mirrors virtio_blk's loop.
+    for (var i = 0; i < nw; i = i + 1) {
         store64(buf + i * 8, load64(nvme_read_scratch + i * 8));
     }
     nvme_spin_unlock();
@@ -1052,9 +1064,14 @@ fn nvme_blk_read(sector, buf) {
 
 fn nvme_blk_write(sector, buf) {
     if (nvme_io_ready == 0) { return 0 - 1; }
+    # 1.56.51: real LBA size, not a hardcoded 512 — see nvme_blk_read for the mechanism.
+    var nb = nvme_ns1_lba_bytes;
+    if (nb < 8)    { nb = 512; }
+    if (nb > 4096) { nb = 4096; }
+    var nw = nb / 8;
     nvme_spin_lock();
     # Copy caller's buffer into page-aligned scratch first.
-    for (var i = 0; i < 64; i = i + 1) {
+    for (var i = 0; i < nw; i = i + 1) {
         store64(nvme_read_scratch + i * 8, load64(buf + i * 8));
     }
     if (nvme_write_lba(sector, nvme_read_scratch) == 0) { nvme_spin_unlock(); return 0 - 1; }
@@ -1070,11 +1087,23 @@ fn nvme_blk_write(sector, buf) {
 # transfer never does — reusing the transfer ceiling would false-timeout
 # a flush that merely needed a few seconds. Returns 0 on success, -1 on
 # failure. 1.33.5 fsync barrier (per flush-cache-prior-art.md § 2.1).
+# ⛔ 1.56.51 — TAKES nvme_spin_lock, WHICH IT NEVER DID. Every other entry point in this shim
+# (nvme_blk_read/_write/_read_sectors/_write_sectors) brackets its submit+poll in the lock, and
+# power.cyr's ordering comment names the whole-controller lock as the invariant — but flush
+# submitted into the SHARED I/O submission queue and consumed the SHARED completion queue with no
+# lock at all. Under smp_sched_aps=1 a flush on one CPU and a read on another interleave their SQ
+# tail advance and, worse, either may reap the OTHER's completion out of the shared CQ: the read
+# returns "done" for a flush's CQE and hands the filesystem a buffer the controller never filled.
+# ⚠ The lock is held across a poll whose ceiling is ~30x the transfer budget, by design — a cache
+# flush legitimately takes seconds on a drive committing a large dirty cache, and a flush that
+# overlapped other I/O would not be a barrier. fsync is meant to be a stall.
 fn nvme_blk_flush() {
     if (nvme_io_ready == 0) { return 0 - 1; }
+    nvme_spin_lock();
     var cid = nvme_io_submit(0x00, 1, 0, 0, 0, 0, 0);
-    if (cid < 0) { return 0 - 1; }
-    if (nvme_io_poll_n(cid, 300000000) != 0) { return 0 - 1; }
+    if (cid < 0) { nvme_spin_unlock(); return 0 - 1; }
+    if (nvme_io_poll_n(cid, 300000000) != 0) { nvme_spin_unlock(); return 0 - 1; }
+    nvme_spin_unlock();
     return 0;
 }
 

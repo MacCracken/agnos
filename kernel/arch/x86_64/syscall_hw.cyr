@@ -530,6 +530,65 @@ fn syscall_stub_build() {
     # syscall_kstack_top before we reload the user RSP below. pop rbp — 0x5D
     store8(ep + eoff, 0x5D); eoff = eoff + 1;
 
+    # S9: Clear IBRS before returning to user mode (avoid user-mode perf hit).
+    #
+    # ⛔⛔ 1.56.51 — THIS BLOCK MOVED. It used to be emitted at the very END of the exit sequence,
+    # AFTER `mov rsp,[r8*8+krs_base]` had already loaded the caller's RING-3 RSP and after
+    # `mov cr3,r10` had installed the user CR3. Its three `push`es are therefore SUPERVISOR (CPL0)
+    # data writes through a fully user-controlled RSP — and they happen after the `clac` above has
+    # re-armed SMAP. On any CPU with CR4.SMAP set (the boot shim sets it) that is a #PF at CPL0 on
+    # the FIRST syscall of the boot: the user stack page is mapped US=1 by proc_map_page, EFLAGS.AC
+    # is clear, so idt.cyr's vector-14 stub takes the CPL0 branch and the box wedges with no banner
+    # past that point. On a CPU with IBRS but no SMAP it instead silently clobbers 24 bytes of the
+    # caller's SysV red zone on EVERY syscall return.
+    # ⚠ IT IS LATENT TODAY ONLY BY ACCIDENT, on both substrates agnos runs on: QEMU TCG `-cpu max`
+    # reports spec-ctrl=false, and AMD Cezanne advertises IBRS in CPUID Fn8000_0008_EBX[14] rather
+    # than leaf-7 EDX[26], which is the only bit syscall_init tests — so ibrs_supported is 0 on
+    # archaemenid and this block is not emitted at all. It WOULD be emitted on any Intel part with
+    # the Spectre-v2 microcode, or under KVM on Intel.
+    # ⭐ Emitted here instead: still on the KERNEL stack (the pops above balanced it back to
+    # syscall_kstack_top), so the pushes land in kernel memory. rax (return value) and rcx (user
+    # RIP) are live and are saved/restored by the block itself; r11 (user RFLAGS) is untouched.
+    # ⚠ REGISTER CONTRACT: clobbers-and-restores rax/rcx/rdx; writes MSR 0x48 (IA32_SPEC_CTRL) = 0;
+    # does NOT touch r8, which is what keeps the exit APIC block below the sole writer of r8.
+    #
+    # ⛔ HONEST LIMIT — VERIFIED BY EMIT ORDER, NOT BY A RUNNING KERNEL, AND THE A/B THAT WAS RUN
+    # RETURNED A NULL. What IS established: the pushes are emitted between the `pop rbp` above and
+    # the exit reload below, so they land on the kernel stack rather than the caller's ring-3 stack.
+    # What is NOT established: that the old position actually faults. Measured at 1.56.51 by
+    # forcing `ibrs_supported = 1` (QEMU TCG refuses `-cpu max,+spec-ctrl` — "TCG doesn't support
+    # requested feature ... spec-ctrl" — so the flag has to be forced) and running agnsh-smoke
+    # THREE times per arm: old position 3/3 booted to the agnsh banner, new position 3/3 booted.
+    # The experiment discriminates NOTHING and must not be written up as a confirmation.
+    # ⚠ Two single-run observations during that session DID show a missing agnsh banner and were
+    # briefly read as the predicted wedge. They were the OVMF hand-off flake; the 3x3 above is what
+    # settles it. This is exactly why state.md says to check the kernel banner before believing any
+    # verdict — and why one run is never a result here.
+    # ⚠ OPEN: why the old position does not fault under TCG is unexplained. The mechanism requires
+    # CR4.SMAP set (the boot shim ORs it), a US=1 user stack page (proc_map_page writes 0x87) and
+    # EFLAGS.AC clear (the `clac` above) — all three appear to hold, so either TCG does not enforce
+    # SMAP on this path or one of the three premises is false. Settling it needs a host whose
+    # CPUID leaf-7 EDX[26] is genuinely set: an Intel part with the Spectre-v2 microcode, or KVM on
+    # Intel. AMD Cezanne reports IBRS in Fn8000_0008_EBX[14], which syscall_init does not test, so
+    # archaemenid cannot serve as that host either.
+    if (ibrs_supported == 1) {
+        # Save rax (syscall return value), then wrmsr, then restore
+        store8(ep + eoff, 0x50); eoff = eoff + 1;  # push rax
+        store8(ep + eoff, 0x51); eoff = eoff + 1;  # push rcx (user RIP — save again)
+        store8(ep + eoff, 0x52); eoff = eoff + 1;  # push rdx
+        # mov ecx, 0x48
+        store8(ep + eoff, 0xB9); store32(ep + eoff + 1, 0x48); eoff = eoff + 5;
+        # xor edx, edx
+        store8(ep + eoff, 0x31); store8(ep + eoff + 1, 0xD2); eoff = eoff + 2;
+        # xor eax, eax (IBRS=0 to clear)
+        store8(ep + eoff, 0x31); store8(ep + eoff + 1, 0xC0); eoff = eoff + 2;
+        # wrmsr
+        store8(ep + eoff, 0x0F); store8(ep + eoff + 1, 0x30); eoff = eoff + 2;
+        store8(ep + eoff, 0x5A); eoff = eoff + 1;  # pop rdx
+        store8(ep + eoff, 0x59); eoff = eoff + 1;  # pop rcx
+        store8(ep + eoff, 0x58); eoff = eoff + 1;  # pop rax
+    }
+
     # 1.46.x 4b exit reload — restore the caller RSP from THIS CPU's pcpu_kernel_rsp_save slot.
     # rax holds the syscall RETURN VALUE here, so we re-read the APIC into r8 (EXIT-R8-FREE: r8 is
     # dead post-handler — the arg shuffle's `mov r8,rdx` value died inside the call) — NOT rax.
@@ -561,8 +620,10 @@ fn syscall_stub_build() {
     # S8 (KPTI): Switch from kernel CR3 back to user CR3 before SYSRET.
     # 1.46.x 4c POINT 6: load THIS CPU's user CR3 from pcpu_kpti_user_cr3, install it. r8 was RE-READ by
     # the 4b exit APIC block just above (the exit reload) and nothing between that block and here writes
-    # r8 (objdump-confirmed: the exit reload's `mov rsp,[r8*8+disp32]` is the last r8 use; the IBRS-clear
-    # block runs AFTER this). The SIB load folds the old indirection. Was 3 instr; now: mov r10,[r8*8 +
+    # r8 (objdump-confirmed: the exit reload's `mov rsp,[r8*8+disp32]` is the last r8 use). 1.56.51: the
+    # IBRS-clear block used to run AFTER this and now runs BEFORE the APIC block — it touches only
+    # rax/rcx/rdx, so it is not an r8 writer either way and this invariant is strengthened, not broken.
+    # The SIB load folds the old indirection. Was 3 instr; now: mov r10,[r8*8 +
     # &pcpu_kpti_user_cr3]; mov cr3,r10.
     # mov r10, [r8*8+disp32] — 4E 8B 14 C5 <disp32>
     store8(ep + eoff, 0x4E); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x14); store8(ep + eoff + 3, 0xC5); eoff = eoff + 4;
@@ -571,24 +632,8 @@ fn syscall_stub_build() {
     # mov cr3, r10 — 41 0F 22 DA (REX.B for r10; NOT 0x44 = REX.R → cr11 → #UD)
     store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x0F); store8(ep + eoff + 2, 0x22); store8(ep + eoff + 3, 0xDA); eoff = eoff + 4;
 
-    # S9: Clear IBRS before returning to user mode (avoid user-mode perf hit)
-    if (ibrs_supported == 1) {
-        # Save rax (syscall return value), then wrmsr, then restore
-        store8(ep + eoff, 0x50); eoff = eoff + 1;  # push rax
-        store8(ep + eoff, 0x51); eoff = eoff + 1;  # push rcx (user RIP — save again)
-        store8(ep + eoff, 0x52); eoff = eoff + 1;  # push rdx
-        # mov ecx, 0x48
-        store8(ep + eoff, 0xB9); store32(ep + eoff + 1, 0x48); eoff = eoff + 5;
-        # xor edx, edx
-        store8(ep + eoff, 0x31); store8(ep + eoff + 1, 0xD2); eoff = eoff + 2;
-        # xor eax, eax (IBRS=0 to clear)
-        store8(ep + eoff, 0x31); store8(ep + eoff + 1, 0xC0); eoff = eoff + 2;
-        # wrmsr
-        store8(ep + eoff, 0x0F); store8(ep + eoff + 1, 0x30); eoff = eoff + 2;
-        store8(ep + eoff, 0x5A); eoff = eoff + 1;  # pop rdx
-        store8(ep + eoff, 0x59); eoff = eoff + 1;  # pop rcx
-        store8(ep + eoff, 0x58); eoff = eoff + 1;  # pop rax
-    }
+    # (S9's IBRS-clear block used to sit HERE and was moved up, above the RSP/CR3 restore —
+    # see the ⛔⛔ note at its new site for why this position was a CPL0 write to the user stack.)
 
     # sysretq: atomically restores RIP from RCX, RFLAGS from R11,
     # CS = STAR[63:48]+16 = 0x23 (user CS; CPL/CS.RPL forced to 3), SS = STAR[63:48]+8 = 0x1B (user SS).

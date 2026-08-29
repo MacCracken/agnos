@@ -1,12 +1,47 @@
 ---
 name: 1.56.51 P-1 audit sweep — unfixed backlog
-description: Findings that survived adversarial verification in the 1.56.51 sweep and were NOT fixed in it.
+description: Findings that survived adversarial verification in the 1.56.51 sweep — with what has since been fixed marked inline (see the STATUS block).
 type: issue
 ---
 
 # 1.56.51 P-1 audit sweep — the backlog that did not land
 
 **Opened** 2026-08-28, at the close of the 1.56.51 audit/hardening sweep.
+
+## ⭐ STATUS — worked 2026-08-29, still inside the open 1.56.51 cut
+
+**P0: 1 of 2 closed.** `elf.cyr:312` is CLOSED, by the architecture change rather than a narrowed
+bound — every kernel page-table dereference and every `kmalloc` pointer now goes through the direct
+map (`DIRECTMAP_BASE + phys`, kernel PDPT[8+]), which no user segment can reach because both loaders
+cap `p_vaddr + p_memsz` at `0x10000000` = PDPT[0]. Narrowing the ceiling would have shrunk the window
+without closing the class. `syscall.cyr:1895` (`#92` TOCTOU) is **NOT** done.
+
+**P1: 17 of 26 closed** (16 fully + 1 partial). Marked inline below: ✅ FIXED / 🟠 PARTIAL.
+Everything unmarked is untouched.
+
+**P2: 0 of 29.** Not attempted.
+
+⚠ **Two entries did not land the way the finding proposed, and the reasons are the value:**
+- `syscall.cyr:7415` — the suggested "move the arm below tag validation" was implemented and then
+  REVERTED. It breaks the shipped ABI: the arm's documented form is `blk_open(_, BLK_RW_ARM_MAGIC)`
+  and every caller passes tag **0** (`tests/blk/blkwr.cyr:39`, plus the agnova/ark installers, which
+  cannot be re-verified from this repo). Measured: `blk-write-smoke` → `run: exit 85`. The two
+  hardenings that do NOT break the ABI landed (disarm on `blk_close`; the banner no longer claims a
+  capability gate that does not exist).
+- `syscall_hw.cyr:577` — the fix landed and is verified by EMIT ORDER, but the runtime A/B returned a
+  **null**: three runs per arm with `ibrs_supported` forced, old position 3/3 booted, new position
+  3/3 booted. Why the old position does not fault under TCG is unexplained and recorded at the site.
+  ⛔ Do not write that experiment up as a confirmation.
+
+⚠ **Verification-harness defects found while doing this work** (same class as the four the sweep
+itself found — a gate whose failure is indistinguishable from its success):
+- `ktest.sh` booted NOTHING on every invocation: its ESP image was 64 MB, outside the only
+  measured-working cell (`1MiB..33MiB` on a **128 MB** disk × nvme). Fixed; the suite now runs
+  **97 passed / 6 failed**, and those 6 are pre-existing (measured identical on a clean tree).
+- `agnsh-smoke` reported **PASS** on a kernel that wedged at agnsh's first syscall — its gates only
+  asked whether *kybernet tried*. Strengthened to require agnsh's own banner, and mutation-tested.
+- `chan-ring3-smoke` and `syscall-harden-smoke` do not build their own kernel; they inherit whatever
+  `sweep.sh` built. Running either standalone silently measures the wrong binary.
 
 ## What this is, and what it is not
 
@@ -34,9 +69,9 @@ area therefore carry a finder's claim with no refuter behind them — treat them
    a wall of assertion failures. See `state.md`'s note on `qemu_dwell_kernel`.
 
 
-## P0 — memory-safety or privilege, reachable from ring 3 or untrusted media — 2 item(s)
+## P0 — memory-safety or privilege, reachable from ring 3 or untrusted media — 2 item(s) · 1 FIXED
 
-### `kernel/core/elf.cyr:312` — ELF PT_LOAD may be mapped anywhere in the per-process kernel-identity PD window (PD[2..127]), shadowing the kernel's own page tables and heap under the child's CR3
+### ✅ FIXED 1.56.51 — `kernel/core/elf.cyr:312` — ELF PT_LOAD may be mapped anywhere in the per-process kernel-identity PD window (PD[2..127]), shadowing the kernel's own page tables and heap under the child's CR3
 
 **Mechanism.** Both loaders bound a PT_LOAD only by `p_vaddr >= 0x400000` (elf.cyr:102/:284/:308) and `p_vaddr + p_memsz <= 0x10000000` (elf.cyr:74/:109/:286/:312). That accepted span, [0x400000, 0x10000000) = 4 MB .. 256 MB, is exactly PD indices 2..127 of the per-process page directory. proc_create_address_space builds those very slots as the KERNEL IDENTITY window: PD[0..127] are copied from the boot PD and PD[8..127] are re-asserted as `(hi * 0x200000) | 0x83` (proc.cyr:684-699). The loader then calls proc_map_page / proc_map_page_nx (elf.cyr:129-130, :340-341), whose only index math is `pd_idx = (virt >> 21) & 0x1FF` (proc.cyr:1094, :1122) — so a segment at p_vaddr = 0xC00000 OVERWRITES PD[6] with `user_phys | 0x87`, destroying the identity mapping for physical 12-14 MB in that process's address space.
 
@@ -65,7 +100,7 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 **Suggested fix.** Copy the primitive/vertex array out of the shm slot into a per-CPU kernel staging buffer once, validate THAT copy, and have gpu_texl_build/gpu_tri_list read only the copy — the same discipline gpu_shader_op_sys already applies to the 64-byte records via proc_copy_from_user. Then correct the comment at 1895-1896.
 
 
-## P1 — correctness: wrong results, hangs, races, or a load-bearing false comment — 26 item(s)
+## P1 — correctness: wrong results, hangs, races, or a load-bearing false comment — 26 item(s) · 16 FIXED + 1 PARTIAL
 
 ### `kernel/arch/aarch64/timer.cyr:12` — aarch64 timer/rdtsc inline asm addresses [sp,#0], which is frame padding, not the intended local
 
@@ -75,7 +110,7 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** Address the locals through their real frame offsets, or (safer) return the register value directly rather than round-tripping through an assumed stack slot. Whatever form is chosen, add the input/output/clobber comment the repo rule requires — the current comments document only the instruction encoding, not the stack contract that is the part that is wrong.
 
-### `kernel/arch/x86_64/apic.cyr:281` — tlb_shootdown_all's ack handshake uses two unlocked globals and cannot make progress when two CPUs shoot down at once, silently degrading to the stale TLB it exists to prevent
+### ✅ FIXED 1.56.51 — `kernel/arch/x86_64/apic.cyr:281` — tlb_shootdown_all's ack handshake uses two unlocked globals and cannot make progress when two CPUs shoot down at once, silently degrading to the stale TLB it exists to prevent
 
 **Mechanism.** tlb_shoot_ack and tlb_shoot_want (lines 210-211) are plain i64 globals with no lock and no atomicity. tlb_shootdown_all resets ack=0 / want=cpu_count-1 (281-282), IPIs every other CPU (285-288), then spins on `tlb_shoot_ack < tlb_shoot_want` (290-294) with a 2,000,000-iteration bound whose expiry path is documented as 'fail-safe: degrade to stale-TLB risk, never hang' (291). Two problems compound. (1) The sender spins with IF=0 -- every caller is a ring-3 syscall handler, and SFMASK 0x40700 clears IF on SYSCALL entry -- so a spinning sender cannot service the OTHER sender's vector-0xF0 IPI. Two concurrent shootdowns therefore deadlock each other until BOTH time out, and both then proceed with an incomplete flush. (2) tlb_shootdown_handler does `tlb_shoot_ack = tlb_shoot_ack + 1` (line 221), a non-atomic read-modify-write executed by up to three APs simultaneously, so acks are lost even without (1); and a second sender's `tlb_shoot_ack = 0` (281) wipes the first sender's tally mid-flight.
 
@@ -91,7 +126,7 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** Take bus and func from pci_busfunc, allocate a context table per bus on demand and set that bus's root entry, and pass the real (bus, slot, func) into iommu_set_context. Until that exists, refuse to set GCMD.TE when any enumerated device sits outside bus 0 func 0, rather than enabling enforcement against tables that do not describe the machine.
 
-### `kernel/arch/x86_64/mbi.cyr:58` — boot_info is copied and consumed with no magic or struct_size validation, and the copy reads 8 bytes past the 120-byte source
+### ✅ FIXED 1.56.51 — `kernel/arch/x86_64/mbi.cyr:58` — boot_info is copied and consumed with no magic or struct_size validation, and the copy reads 8 bytes past the 120-byte source
 
 **Mechanism.** boot_info_capture_rdi latches whatever RDI held at kernel entry into boot_info_ptr and then, gated on nothing but `if (src != 0)`, does `memcpy(&boot_info_copy, src, 128)`. Per docs/development/state.md the gnoboot struct is 120 bytes (0x78) and carries magic 0x41474E4F at +0x00 and struct_size at +0x08 — neither is read here, and the fixed 128 is 8 bytes longer than the declared struct (boot_data.cyr's own comment concedes "[16]=128 B covers gnoboot's 120 B ... struct"). Grepping the tree, 0x41474E4F appears in exactly one executable position: main.cyr:429, a diagnostic print. Every consumer that actually uses the struct runs unvalidated and, critically, EARLIER: main.cyr:52 dereferences +0x70 for the KASLR base, main.cyr:59 hands the pointer to pmm_probe_memmap, acpi.cyr:456 reads the RSDP pointer at +0x38, fb_console.cyr:377 reads fb_phys at +0x48. main.cyr's own comment at :422-424 claims "bi==0 or a wrong magic => not a gnoboot Path-C boot ... report and skip rather than print garbage" — true only of the print at :429, and by then the struct has already been trusted three times.
 
@@ -99,7 +134,7 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** In boot_info_capture_rdi, verify `load32(src) == 0x41474E4F` and that `load64(src + 8)` is a sane struct_size (>= 0x78, <= 128) before copying, copy min(struct_size, 128) rather than a hardcoded 128, and leave boot_info_ptr at 0 when validation fails so every downstream `if (bi == 0)` guard engages.
 
-### `kernel/arch/x86_64/ring3.cyr:165` — enter_ring3 builds the ring-3 iretq frame at the fixed shared address 0x7000, the one piece of exec state that was never made per-CPU
+### ✅ FIXED 1.56.51 — `kernel/arch/x86_64/ring3.cyr:165` — enter_ring3 builds the ring-3 iretq frame at the fixed shared address 0x7000, the one piece of exec state that was never made per-CPU
 
 **Mechanism.** enter_ring3 writes the five-word iretq frame to absolute addresses 0x7000/0x7008/0x7010/0x7018/0x7020 (lines 165-186) and then does `mov rsp, 0x7000; iretq` (lines 225-226). 0x7000 is a single global cell in the 0-2 MB identity region that every per-process CR3 mirrors, so all CPUs write and read the same five words. This is the exact hazard the top of the same file already fixed one level up: pcpu_exec_entry_g / pcpu_exec_rsp_g / pcpu_exec_cr3_g / pcpu_exec_ctx / pcpu_exec_resume_pid were all converted to per-CPU arrays with the rationale 'two CPUs each in exec_and_wait would clobber one another's params (CPU A's enter_ring3 reading CPU B's entry -> iretq into the wrong RIP)' (ring3.cyr:4-11). The frame those per-CPU params feed is still shared. `var exec_preempt = 0;` (line 32) has the same shape: a plain global armed by kybernet and consumed-then-cleared at lines 182-183.
 
@@ -107,7 +142,7 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** Give the trampoline frame a per-CPU slot: `var fp = 0x7000 + pcpu_cpu() * 0x40;` write the five words there, and bake that value into the `mov rsp, imm32` (or load it via the proven `var x = fp; asm { mov rsp, rax }` idiom) instead of the hardcoded 0x7000. 0x7000-0x70FF is free inside the same identity page. Convert exec_preempt to `var pcpu_exec_preempt[4]` with set/get accessors, mirroring its four siblings in the same file.
 
-### `kernel/arch/x86_64/syscall_hw.cyr:577` — SYSCALL exit stub's IBRS-clear block pushes 3 qwords onto the USER stack at CPL0, after RSP and CR3 have already been restored
+### ✅ FIXED 1.56.51 — `kernel/arch/x86_64/syscall_hw.cyr:577` — SYSCALL exit stub's IBRS-clear block pushes 3 qwords onto the USER stack at CPL0, after RSP and CR3 have already been restored
 
 **Mechanism.** syscall_stub_build() emits the exit sequence in this order: (a) `pop r11; pop rcx; pop rbp` (lines 521-531, still on the kernel stack); (b) re-read the APIC into r8 and `mov rsp, [r8*8 + &pcpu_kernel_rsp_save]` (lines 556-559) -- RSP is now the caller's RING-3 RSP, because point3 SAVE at line 401 stored RSP into that slot while it was still the user RSP; (c) `mov r10,[r8*8+&pcpu_kpti_user_cr3]; mov cr3,r10` (lines 568-572); (d) ONLY THEN, `if (ibrs_supported == 1)`, `push rax; push rcx; push rdx; mov ecx,0x48; xor edx,edx; xor eax,eax; wrmsr; pop rdx; pop rcx; pop rax` (lines 577-590); (e) `sysretq`. The three pushes are supervisor-mode (CPL0) data writes through a fully user-controlled RSP, and they happen after the `clac` at line 515 has already re-armed SMAP. The entry-side IBRS block (lines 433-448) is correctly placed while RSP is still the kernel stack; only the exit block sits on the wrong side of the RSP reload. The pushes/pops are balanced so SYSRET still gets the right RSP -- the defect is purely that the memory they touch is the user's.
 
@@ -115,7 +150,7 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** Emit the IBRS-clear block while RSP is still the kernel stack -- immediately after the `pop rbp` at line 531 and before the exit APIC re-read/`mov rsp` at 540-559. rax (the syscall return value) and rcx (user RIP) still need the push/pop pair there, and the kernel stack has room. Alternatively drop the pushes entirely and use r8/r9/r10 as scratch for the wrmsr, since r8 is re-read anyway and rdx/rcx are dead at that point except for rcx=user RIP.
 
-### `kernel/arch/x86_64/usb/msc.cyr:80` — Per-slot MSC row table is one 4 KB page but is indexed by xHCI slot id up to 64 at a 256-byte stride
+### ✅ FIXED 1.56.51 — `kernel/arch/x86_64/usb/msc.cyr:80` — Per-slot MSC row table is one 4 KB page but is indexed by xHCI slot id up to 64 at a 256-byte stride
 
 **Mechanism.** msc_ensure_table() (msc.cyr:83-91) allocates exactly ONE page (`pmm_alloc()`, zeroed by xhci_zero_page which writes 512 u64 = 4096 B). msc_row_addr() (msc.cyr:80) returns `msc_table_phys + slot_id * MSC_ROW_BYTES` with MSC_ROW_BYTES = 256 (msc.cyr:56). 4096 / 256 = 16 rows, i.e. only slot ids 0..15 fit. But the file's own header comment says "slot_id is 1-based, 1..64" (msc.cyr:41) and msc_enumerate() loops `while (s <= 64)` (msc.cyr:409), probing every slot the xHC assigned. The two comments contradict each other and the code follows the wrong one: line 47 says "one row per slot, 256 bytes per slot = 4 KB page total", arithmetic that only holds for 16 slots. Nothing anywhere clamps slot_id in the msc path, in contrast to xhci_slot_get/xhci_slot_set which do bound-check (xhci_ctx.cyr:107-118).
 
@@ -139,7 +174,7 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** Make the drain the single owner of the event ring: have every waiter dispatch non-matching Transfer Events through the same registry hid_poll uses (hid_ep_find -> fold + hid_arm_row_trb + doorbell) instead of discarding them, or park them on a small deferred queue that hid_poll processes. At minimum, re-arm the owning row before discarding: a match on hid_ep_find(evt_slot, evt_ep) should always re-arm even when the waiter does not want the data.
 
-### `kernel/arch/x86_64/usb/xhci.cyr:1369` — SuperSpeed bMaxPacketSize0 is a log2 exponent, but is written into EP0 Max Packet Size as a byte count
+### ✅ FIXED 1.56.51 — `kernel/arch/x86_64/usb/xhci.cyr:1369` — SuperSpeed bMaxPacketSize0 is a log2 exponent, but is written into EP0 Max Packet Size as a byte count
 
 **Mechanism.** xhci_enumerate_port reads `var real_mps = load8(xhci_desc_buf_phys + 7)` (xhci.cyr:1369) and compares it against the speed-derived EP0 MPS from xhci_ep0_mps_for_speed (512 for XHCI_SPEED_SUPER / SUPER_PLUS, xhci_ctx.cyr:130-131). On mismatch it patches EP0 Context dword 1 with `((real_mps & 0xFFFF) << 16)` (xhci.cyr:1382) and caches it (xhci.cyr:1385). For USB 3.x devices bMaxPacketSize0 is NOT a byte count — it is the exponent, always 9, meaning 2^9 = 512. The comment three lines below the parse (xhci.cyr:1403) states this exactly: "bMaxPacketSize0 (8/16/32/64 for FS; 64 for HS; 9 for SS=2^9=512)" — so the code contradicts its own documented encoding. The FS/HS/LS branches happen to be correct, which is why this survived: only the SuperSpeed path is wrong, and it is wrong on every SuperSpeed device.
 
@@ -147,7 +182,7 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** Decode the SS form: `var real_mps = load8(desc+7); if (speed >= XHCI_SPEED_SUPER) { real_mps = 1 << (real_mps & 0x1F); }` (and reject exponents outside 9..15), before the compare at xhci.cyr:1371. Optionally also validate the FS value against {8,16,32,64}.
 
-### `kernel/arch/x86_64/usb/xhci_ring.cyr:144` — Scratchpad Buffer Array is one page (512 entries) but the fill loop is bounded by MaxScratchpadBufs, which the same comment says reaches 1023
+### ✅ FIXED 1.56.51 — `kernel/arch/x86_64/usb/xhci_ring.cyr:144` — Scratchpad Buffer Array is one page (512 entries) but the fill loop is bounded by MaxScratchpadBufs, which the same comment says reaches 1023
 
 **Mechanism.** xhci_rings_init allocates the Scratchpad Buffer Array with a single `pmm_alloc()` (xhci_ring.cyr:133) — 4096 bytes = 512 u64 entries. The fill loop is `while (i < xhci_max_scratchpad) { ... store64(sp_array + i * 8, buf); ... }` (xhci_ring.cyr:144-152), with no bound against 512. xhci_max_scratchpad is decoded straight from HCSPARAMS2 as `(sp_hi << 5) | sp_lo` with 5-bit Hi and Lo fields (xhci.cyr:234-236), i.e. 0..1023 — and xhci.cyr:232 spells that range out. The comment sitting immediately above the allocation (xhci_ring.cyr:131-132) asserts the bound is safe: "1 page = 512 u64 entries, plenty for any realistic MaxScratchpadBufs which tops out at 1023". 1023 is not less than 512; the comment states the exact number that falsifies it, which is why the mismatch reads as checked.
 
@@ -155,7 +190,7 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** Clamp before the loop: `if (xhci_max_scratchpad > 512) { kprintln(...); return 0; }` (or allocate ceil(n/512) pages for the array). Fix the comment at xhci_ring.cyr:131-132 so it no longer asserts a bound it disproves.
 
-### `kernel/core/acpi.cyr:151` — DRHD register base read up to 12 bytes past the DMAR table end, then used as an MMIO base
+### ✅ FIXED 1.56.51 — `kernel/core/acpi.cyr:151` — DRHD register base read up to 12 bytes past the DMAR table end, then used as an MMIO base
 
 **Mechanism.** acpi_parse_dmar's loop guard at :143 is `while (offset + 4 <= dmar_len)` — it only proves the 4-byte remapping-structure header (type at offset, length at offset+2) is inside the table. When entry_type == 0 (DRHD) the code at :151 reads `acpi_load64(dmar + offset + 8)`, i.e. bytes offset+8 .. offset+15, without ever checking `entry_len >= 16` or `offset + 16 <= dmar_len`. The `if (entry_len < 4) break;` guard at :146 stops the infinite-loop case but does nothing for this over-read. dmar_len also gets no upper bound (contrast acpi_rsdt_find:104 and acpi_xsdt_find:121, which both cap at 0x10000), so a corrupt length also lets the walk run arbitrarily far. The value read out of bounds becomes acpi_iommu_base (acpi.cyr:495) with no sanity check at all — not alignment, not range, not 'is this even MMIO'.
 
@@ -179,7 +214,7 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** Either wrap each x86-only reference in `#ifdef ARCH_X86_64` at its use site, or (better, since the list keeps growing) add the missing globals to arch/aarch64/stubs.cyr so the stub surface is the single declared contract, and keep `scripts/test.sh --aarch64` in the pre-commit path so the surface cannot silently rot again.
 
-### `kernel/core/main.cyr:190` — The vector-7 install comment claims #NM never fires in production and that CR0.TS is only set by a selftest; four production paths set it on every context switch
+### ✅ FIXED 1.56.51 — `kernel/core/main.cyr:190` — The vector-7 install comment claims #NM never fires in production and that CR0.TS is only set by a selftest; four production paths set it on every context switch
 
 **Mechanism.** main.cyr:189-191 reads: 'install the #NM (vector 7) handler for lazy per-proc FP save/restore. INERT until B3b sets CR0.TS on the switch paths -- production never #NMs today (TS is only ever set by the FP_NM_SELFTEST probe below).' B3b has since landed and is unconditional. fpu_set_ts() is called at sched.cyr:447 (every real do_context_switch), sched.cyr:640 (every #44 sched_yield), ring3.cyr:198 (every enter_ring3, i.e. every exec into ring 3), and syscall.cyr:371 (kernel_resume, i.e. every foreground exec return) -- none of them behind an #ifdef. The only FP_NM_SELFTEST setter is fpu.cyr:210, one of five.
 
@@ -195,7 +230,7 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** In net_demux_frame verify the IPv4 header checksum over ip_ihl bytes before dispatch (drop on mismatch), and add a pseudo-header verify in net_handle_tcp and net_handle_udp (UDP: skip when the transmitted checksum field is 0, per RFC 768) and a plain one's-complement verify in net_handle_icmp.
 
-### `kernel/core/nvme.cyr:1046` — nvme_blk_read/nvme_blk_write copy a hardcoded 512 bytes while nvme registers the device's real LBA size as the block layer's stride
+### ✅ FIXED 1.56.51 — `kernel/core/nvme.cyr:1046` — nvme_blk_read/nvme_blk_write copy a hardcoded 512 bytes while nvme registers the device's real LBA size as the block layer's stride
 
 **Mechanism.** nvme_register_block_dev (1151) publishes `nvme_ns1_lba_bytes` as `blk_lba_bytes`, and nvme_read_lba transfers a full `nvme_ns1_lba_bytes` into the scratch page (845). But the single-sector block-layer adapters copy a fixed 64 iterations of 8 bytes = 512: nvme_blk_read at 1046-1048 and nvme_blk_write at 1057-1059. The fallback loop in nvme_blk_read_sectors also strides `buf + i * 512` (1110), as does nvme_blk_write_sectors (1140) and block.cyr:273. So on any namespace whose LBADS is 12 (4096 B — normal on enterprise 4Kn SSDs) the whole single-LBA API silently transfers only the first eighth of each logical block while the layer above believes it got `blk_lba_bytes`.
 
@@ -203,7 +238,7 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** Make the single-LBA adapters copy `nvme_ns1_lba_bytes` (bounded by the 4 KB scratch), or — simpler and consistent with AHCI/virtio/ramdisk which are all hard-512 — refuse to register a namespace whose LBA size is not 512 until the block layer's 512-byte sector assumption is actually removed.
 
-### `kernel/core/nvme.cyr:1075` — nvme_blk_flush submits to the shared I/O SQ and consumes the shared CQ without nvme_spin_lock, contradicting power.cyr's explicit ordering comment
+### ✅ FIXED 1.56.51 — `kernel/core/nvme.cyr:1075` — nvme_blk_flush submits to the shared I/O SQ and consumes the shared CQ without nvme_spin_lock, contradicting power.cyr's explicit ordering comment
 
 **Mechanism.** Every other user of the NVMe I/O queues takes `nvme_spin_lock` around submit+poll and says why: nvme_blk_read (nvme.cyr:1042, "the IO SQ/CQ are shared"), nvme_blk_read_sectors (1099), nvme_blk_write_sectors (1129), nvme_read_sectors (885), nvme_write_sectors (910). `nvme_blk_flush` (1073-1079) takes no lock at all, yet it mutates exactly the same state: nvme_io_submit writes an SQE at `nvme_iosq_phys + nvme_iosq_tail * 64`, bumps `nvme_iosq_tail`, and rings the SQ doorbell (740-756); nvme_io_poll_n then advances `nvme_iocq_head` and flips `nvme_iocq_phase` and rings the CQ doorbell (773-778). power.cyr:34-35 asserts the opposite in a load-bearing comment: "Device flushes go outside it — block/nvme/ahci take their own locks". ahci_blk_flush does (ahci.cyr:1324 → ahci_issue_nodata → ahci_spin_lock); nvme_blk_flush does not.
 
@@ -211,7 +246,7 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** Wrap nvme_blk_flush's submit+poll in nvme_spin_lock/nvme_spin_unlock exactly as nvme_blk_write_sectors does (lock, submit, poll, unlock before any kprint). Same audit for msc_blk_flush and the whole virtio_blk backend, which take no lock anywhere.
 
-### `kernel/core/pci.cyr:253` — pci_bar_64's documented "0 = malformed cap" error return is used unchecked as an MSI-X table base, writing into the kernel page tables
+### ✅ FIXED 1.56.51 — `kernel/core/pci.cyr:253` — pci_bar_64's documented "0 = malformed cap" error return is used unchecked as an MSI-X table base, writing into the kernel page tables
 
 **Mechanism.** pci_bar_64 (pci.cyr:511-514) returns 0 for two distinct conditions its own comment at :509-510 calls out explicitly — an unimplemented BAR, and a slot consumed as the high half of a preceding 64-bit BAR ("caller error — BIR pointing at a consumed slot is a malformed cap"). Both callers in this file ignore that. pci_enable_msix_unmasked does `var bar = pci_bar_64(idx, bir); var tbl = bar + tbl_off;` at :252-253 and immediately store32s four dwords at :254-257; pci_msix_arm_vector0 repeats it at :292-296. With bar == 0, `tbl` collapses to `tbl_off` — a raw offset taken straight from the device's MSI-X capability dword (`tob & 0xFFFFFFF8`, :251/:291) — which is then treated as an absolute physical address in the identity-mapped 0-4 GB window. hda_probe:493 shows the intended discipline (`if (bar == 0) { ... return 0; }`); these two sites lack it. kernel/core/virtio_net.cyr:321 has the same shape.
 
@@ -219,7 +254,7 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** In pci_enable_msix_unmasked and pci_msix_arm_vector0 (and virtio_net.cyr:321), bail out when `pci_bar_64(idx, bir) == 0` — return 0 / -1 the way hda_probe:493 does — before computing `tbl`. Optionally have pci_bar_64 return -1 for the error so a zero base can never be mistaken for a valid one.
 
-### `kernel/core/power.cyr:314` — ACPI S5 retry writes PM1a_CNT using the base value read from PM1b_CNT, clearing SCI_EN — the exact thing the comment above it forbids
+### ✅ FIXED 1.56.51 — `kernel/core/power.cyr:314` — ACPI S5 retry writes PM1a_CNT using the base value read from PM1b_CNT, clearing SCI_EN — the exact thing the comment above it forbids
 
 **Mechanism.** The comment at :285-288 states the rule: the SLP_TYP/SLP_EN write must be read-modify-write against the register being written, because a blind store "would zero SCI_EN (bit0) and BM_RLD (bit1) ... dropping the machine out of ACPI mode mid-shutdown", and "Clear ONLY SLP_TYP + SLP_EN". Line 289 correctly establishes `base` from `inw(acpi_pm1a_cnt)`. But line 299, inside the `if (acpi_pm1b_cnt != 0)` block, REASSIGNS the same variable from `inw(acpi_pm1b_cnt)` — PM1b's live register contents. Line 314, the ACPICA-style retry pulse, then does `outw(acpi_pm1a_cnt, base | (acpi_slp_typa << 10) | 0x2000)` using that PM1b-derived value. There is no second `base` variable and no re-read of PM1a; the function declares `var base = 0;` once at :233.
 
@@ -227,7 +262,7 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** Use a separate variable for the PM1b read-modify-write base (e.g. `var base_b`), leaving `base` as PM1a's; or re-read `inw(acpi_pm1a_cnt)` at :314 rather than reusing a stale/aliased value.
 
-### `kernel/core/proc.cyr:1714` — USER_HIMMAP_BASE (128 GB) is inside pmm_setup_directmap's PDPT[8..511] range, not above it; the "direct map tops at PDPT[71]" comments are false
+### ✅ FIXED 1.56.51 — `kernel/core/proc.cyr:1714` — USER_HIMMAP_BASE (128 GB) is inside pmm_setup_directmap's PDPT[8..511] range, not above it; the "direct map tops at PDPT[71]" comments are false
 
 **Mechanism.** proc.cyr:1706-1709 and proc.cyr:1503-1509 both justify the high arena's placement with "128 GB is ABOVE the <=64 GB direct-map (PDPT[8..71])", and proc_free_address_space repeats it at proc.cyr:842 ("The kernel never uses PDPT[128..511] (the <=64 GB direct-map tops at PDPT[71])"). The code says otherwise: pmm_setup_directmap sizes itself from `pmm_memmap_ram_top` and clamps only at `if (ngb > 504) { ngb = 504; }` (vmm.cyr:314-316), installing a PD at `0x2000 + (8 + gb) * 8` for every GB (vmm.cyr:327). Its reach is PDPT[8..511] = 8 GB .. 512 GB. The 64 GB number comes from pmm_migrate_bitmap's BITMAP cap (pmm.cyr:249-253), which does not constrain the direct map at all — main.cyr:236 passes the raw, uncapped pmm_memmap_ram_top.
 
@@ -257,7 +292,7 @@ Compounding it, `mmap_next_vaddr` is a single GLOBAL cursor shared by every proc
 
 **Suggested fix.** Teach is_user_ptr / is_user_range about the high arena: accept [0x200000, 0x40000000) OR [USER_HIMMAP_BASE, HIMMAP_CEILING), and update the syscall.cyr:265-272 comment to name both windows. Note the second range must also be checked against the direct map's real ceiling (see the PDPT[128] finding) before it can be treated as safely per-process. Separately, make mmap_next_vaddr per-process (mirroring proc_himmap_next, proc.cyr:1716) so the low arena is not a machine-lifetime budget.
 
-### `kernel/core/sched.cyr:200` — The proc_cs/proc_ss comments invert CS and SS for ring 3 (they say CS=0x1B / SS=0x23; the code and the GDT say CS=0x23 / SS=0x1B)
+### ✅ FIXED 1.56.51 — `kernel/core/sched.cyr:200` — The proc_cs/proc_ss comments invert CS and SS for ring 3 (they say CS=0x1B / SS=0x23; the code and the GDT say CS=0x23 / SS=0x1B)
 
 **Mechanism.** sched.cyr:200 says 'CS from the proc table (ring-0 0x08 / ring-3 0x1B)' and sched.cyr:205 says 'SS from the proc table (ring-0 0x10 / ring-3 0x23)'. proc.cyr:59-61 repeats the same inversion: 'ring-0 (0x08/0x10) for kmain/idle/kthreads, ring-3 (0x1B/0x23) for user procs'. The code says the opposite: proc_set_ring3 (proc.cyr:428-429) stores proc_cs = 0x23 and proc_ss = 0x1B; sel_pair_consistent (sched.cyr:257-261) accepts exactly (0x08,0x10) and (0x23,0x1B); sys_sched_yield (sched.cyr:621-622) writes proc_cs=0x23 / proc_ss=0x1B; and gdt_init puts user DS at selector 0x18 (-> SS 0x1B) and user CS at 0x20 (-> CS 0x23) at gdt.cyr:17-18. Both comments sit directly above the two lines (202 and 206) that load the values into the iretq frame at isr_rsp+128 (CS) and isr_rsp+152 (SS).
 
@@ -265,7 +300,7 @@ Compounding it, `mmap_next_vaddr` is a single GLOBAL cursor shared by every proc
 
 **Suggested fix.** sched.cyr:200 -> '(ring-0 0x08 / ring-3 0x23)'; sched.cyr:205 -> '(ring-0 0x10 / ring-3 0x1B)'; proc.cyr:61 -> 'ring-3 (0x23/0x1B)'. Worth stating the derivation once next to sel_pair_consistent -- CS = STAR[63:48]+16 = 0x23, SS = STAR[63:48]+8 = 0x1B, per syscall_msr_init's STAR write -- so the pairing is re-derivable rather than remembered.
 
-### `kernel/core/syscall.cyr:263` — blit#39's fb_scale_rowbuf is shared across CPUs — its own comment names the SMP arc as the unwind, and the arc shipped without it
+### ✅ FIXED 1.56.51 — `kernel/core/syscall.cyr:263` — blit#39's fb_scale_rowbuf is shared across CPUs — its own comment names the SMP arc as the unwind, and the arc shipped without it
 
 **Mechanism.** `var fb_scale_rowbuf[4096]` (32 KB) is module-scope, not per-CPU. The scale>=2 path expands one source row into it (line 8878) and then copies that row to `scale` framebuffer rows (line 8892), with no lock. The handler's own comment at 8864-8866 states: 'The shared rowbuf is safe under the single-core IF=0 syscall invariant (the SMP arc must add this to its unwind list).' The SMP arc is live — smp_wake_enabled=1 (main.cyr:4541), smp_sched_aps=1 (smp.cyr:182), APs pull ready procs — and this buffer was never added to that list. IF=0 is per-CPU and excludes nothing across cores.
 
@@ -273,7 +308,7 @@ Compounding it, `mmap_next_vaddr` is a single GLOBAL cursor shared by every proc
 
 **Suggested fix.** Make it per-CPU: `var pcpu_fb_scale_rowbuf[16384]` with a `pcpu_cpu() * 32768` base accessor (4 CPUs x 32 KB), matching pcpu_sc_gpuop at line 1276. Then fix the two stale single-core comments.
 
-### `kernel/core/syscall.cyr:292` — open#7's sc_open_abs is a single shared path buffer whose 'single-threaded per syscall' justification was invalidated by SMP
+### ✅ FIXED 1.56.51 — `kernel/core/syscall.cyr:292` — open#7's sc_open_abs is a single shared path buffer whose 'single-threaded per syscall' justification was invalidated by SMP
 
 **Mechanism.** `var sc_open_abs[32]` is module-scope and NOT per-CPU, and its banner (lines 287-291) ends 'Single-threaded per syscall ⇒ one shared buffer is safe.' Every sibling scratch buffer in this file was converted for SMP and says so — pcpu_ew37_path (line 119, '1.46.x STEP-2 (#3): PER-CPU'), pcpu_spawn_path_buf (145), pcpu_ew37_env (154), pcpu_spawn_env_buf (258), pcpu_redir_backup (178), pcpu_sc_gpuop (1276). sc_open_abs was missed. The #7 handler writes the '/'-prefixed name into it at 7741-7745 and then routes on `op_path = &sc_open_abs` through vfs_resolve_mount (7747) and sys_open_ext2_inner (7756). Both the write and vfs_resolve_mount sit OUTSIDE the fs_spin_lock, which is only taken at 7755. With smp_wake_enabled=1 (main.cyr:4541) and smp_sched_aps=1 (smp.cyr:182), APs pull real ring-3 procs, so two CPUs can be inside this arm concurrently. IF=0 serializes nothing across CPUs.
 
@@ -281,7 +316,7 @@ Compounding it, `mmap_next_vaddr` is a single GLOBAL cursor shared by every proc
 
 **Suggested fix.** Convert to `var pcpu_sc_open_abs[128]` with an `sc_open_abs_base() { return &pcpu_sc_open_abs + pcpu_cpu() * 256; }` accessor, matching the pcpu_spawn_path_buf pattern at line 145, and rewrite the banner.
 
-### `kernel/core/syscall.cyr:7415` — The raw-disk-write "capability gate" is a plain magic constant any ring-3 process can send, checked before all validation and never cleared
+### 🟠 PARTIAL 1.56.51 — `kernel/core/syscall.cyr:7415` — The raw-disk-write "capability gate" is a plain magic constant any ring-3 process can send, checked before all validation and never cleared
 
 **Mechanism.** `blk_open_sys(tag, mode)` line 7415 reads `if (mode == BLK_RW_ARM_MAGIC) { blk_rw_armed = 1; return 0; }` as the FIRST statement — before the tag-range check (7416-7417) and before `blk_is_registered` (7418). There is no privilege check of any kind (agnos has no per-proc capabilities; proc.cyr says so). `BLK_RW_ARM_MAGIC = 0x424C4B5F5257` is a compile-time constant sitting in the kernel image. `blk_rw_armed` is a global that is never reset — not on blk_close_sys (7499-7504), not on process exit, not on any error path. So any ring-3 process, including one that has no block handle at all, permanently enables destructive raw-disk writes for the whole system with one syscall. The header comment at 7369-7371 states the shipped band is "the READ-PATH (Phase 1) — enum / open(RO) / read / info / close, all NON-DESTRUCTIVE. blk_write#78 is Phase 2 (capability-gated)" — both halves are false as built: #78 is dispatched at line 8434 and its only gate is this constant.
 
@@ -290,7 +325,7 @@ Compounding it, `mmap_next_vaddr` is a single GLOBAL cursor shared by every proc
 **Suggested fix.** Move the arm branch below the tag/registration validation, and replace the constant with a real check — at minimum gate it on a privileged pid/first-process check until per-proc capabilities land; clear `blk_rw_armed` on process exit and on blk_close. Also correct the 7369-7371 header comment so it no longer claims the band is non-destructive.
 
 
-## P2 — hardening / cleanup / dead code — 29 item(s)
+## P2 — hardening / cleanup / dead code — 29 item(s) · 0 FIXED
 
 Listed as one line each; the full mechanism is recoverable by re-reading the site.
 
@@ -336,6 +371,10 @@ Listed as one line each; the full mechanism is recoverable by re-reading the sit
   was excluded from the blanket conversion of the other 24).
 - **FAT multi-node cluster cycles** (`A -> B -> A`) still hang. The `fat_chain_overrun()` predicate and
   the exact per-site loop form are staged at `fat_next_cluster`'s header for whoever does the 13 sites.
+- ✅ **`ktest.sh` now runs** — it had been booting nothing (64 MB ESP, outside the measured cell).
+  97 passed / 6 failed; the 6 are pre-existing and measured identical on a clean tree.
+- ✅ **`agnsh-smoke` now has a real ring-3 oracle** — it used to pass a kernel that wedged at agnsh's
+  first syscall, because its gates only checked that kybernet ATTEMPTED the exec.
 - **W^X is enforced but not closed**: an RWX segment is reported, not refused, because refusing it
   regressed `ring3-smoke` 4 PASS -> 0. The loader prints
   `elf: W^X violation - RWX segment mapped writable+executable`; when that line stops appearing, the

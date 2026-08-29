@@ -187,14 +187,25 @@ fpu_area_init();
 fpu_area_selftest();
 #endif
 # 1.53.x B3: install the #NM (vector 7) handler for lazy per-proc FP save/restore.
-# INERT until B3b sets CR0.TS on the switch paths — production never #NMs today (TS
-# is only ever set by the FP_NM_SELFTEST probe below). Areas are already seeded above.
+# ⛔ 1.56.51 — NOT INERT, AND HAS NOT BEEN SINCE B3b. This comment said "INERT until B3b sets
+# CR0.TS on the switch paths — production never #NMs today (TS is only ever set by the
+# FP_NM_SELFTEST probe below)". B3b LANDED: four PRODUCTION paths call fpu_set_ts() on every
+# switch or entry — sched.cyr:456 (do_context_switch), sched.cyr:649 (sys_sched_yield),
+# ring3.cyr:198 (enter_ring3, the out-of-band exec entry) and syscall.cyr:425 — so vector 7 is
+# live on every boot and the fp-#NM / fp-ctxsw / naad-ring3 gates depend on it firing. Reading
+# this handler as dead code is how a real vector gets treated as removable.
+# Areas are already seeded above.
 nm_isr_build();
 idt_set_gate(&idt + 7 * 16, &nm_isr, 0x08, 0x8E);
 # TLB shootdown IPI (vector 0xF0). Must be installed on EVERY CPU's IDT — the IDT is shared here, so
 # one install covers all. Inert on a single-core boot (tlb_shootdown_all short-circuits on cpu_count).
 tlb_isr_build();
 idt_set_gate(&idt + 240 * 16, &tlb_isr, 0x08, 0x8E);
+# 1.56.51 — prove the shootdown handshake's hand-asm frame offsets are right BEFORE any AP exists.
+# A wrong [rbp-N] here is silent and would make the whole serialisation decorative; see the
+# function header in apic.cyr for the two precedents that make this worth a boot-time check.
+if (tlb_lock_selftest() == 1) { kprintln("tlb: handshake primitives OK", 28); }
+else { kprintln("tlb: HANDSHAKE PRIMITIVES BROKEN - shootdown serialisation is INERT", 67); }
 #ifdef FP_NM_SELFTEST
 fpu_nm_selftest();
 #endif
@@ -239,6 +250,14 @@ pmm_setup_directmap(pmm_memmap_ram_top);
 # direct map exists would stamp a VA that means something else. Failure is non-fatal — chan_op then
 # answers CH_E_NOREGION rather than the kernel refusing to boot over an IPC band nothing uses yet.
 chan_region_reserve();
+# 1.56.51 — blit#39's scaled-row staging, ONE 2 MB region sliced per-CPU. ⛔ MUST follow
+# pmm_setup_directmap: fb_scale_rowbuf_base() hands back DIRECTMAP_BASE + phys, the only alias
+# every per-process CR3 mirrors. Taken here, at boot, single-threaded, because the buffer became
+# PER-CPU at this cut (the old module-global was a cross-process pixel disclosure once APs began
+# scheduling ring-3 procs) and 4 x 32 KB of .bss would have spent nearly all the headroom under
+# check.sh's 2 MiB binary ceiling. Failure is non-fatal — blit#39's scale>=2 arm then returns -1
+# and the 1:1 path, which uses no staging at all, is unaffected.
+fb_scale_rowbuf_init();
 # 1.49.10: validate the direct-map in the context its consumers ACTUALLY run under — the kernel PML4
 # (CR3 0x1000), which carries PDPT[8..]. The OLD always-on probe (load64(DIRECTMAP_BASE+phys) ==
 # load64(phys)) was a FALSE POSITIVE: it ran under gnoboot's boot CR3, whose PDPT[8] is a 1 GB IDENTITY
@@ -2934,7 +2953,14 @@ fn chan_ring3_selftest() {
     # `waitpid #4` answers 0 for "not yet" so a `>= 0` loop exits instantly, and `sleep_ms` holds
     # preempt disabled and starves the very child it waits for. Minting here removes the need for the
     # parent and child to be concurrent at all.
-    var cm = kmalloc(64);
+    # ⛔ 1.56.51 — USER-WINDOW SCRATCH, NOT kmalloc. `#97 CH_MINT`/`CH_SEND` validate their buffer
+    # with is_user_range; a kernel heap pointer passed only because pmm_alloc's [4 MB, 256 MB) window
+    # overlapped the user VA window. The heap moved to the direct map (8 GB+) at 1.56.51 to close the
+    # PT_LOAD identity-shadowing class, so those pointers are now correctly refused. See the matching
+    # note in syscall_harden_selftest's bite 9.
+    var cs = pmm_alloc_2mb();
+    if (cs == 0) { return 0; }
+    var cm = cs + 0;
     if (cm == 0) { return 0; }
     if (ksyscall(97, CH_MINT, cm, 0) != 0) { kprintln("chanx: kernel MINT failed", 25); return 0; }
     var ifd = load64(cm);
@@ -2943,7 +2969,7 @@ fn chan_ring3_selftest() {
     # correctly refused and a child that simply found nothing waiting are indistinguishable. Measured:
     # with both identity checks removed, RECV still "refused" purely because the queue was empty. With a
     # record sitting there, a refusal can only be the authority check.
-    var qbuf = kmalloc(64);
+    var qbuf = cs + 128;
     if (qbuf != 0) {
         store64(qbuf, 0x5155455545444154);
         ksyscall_a4_set(8);
@@ -2954,7 +2980,7 @@ fn chan_ring3_selftest() {
     # ENDOWED (must work). Proving both in the same process is the whole point: it separates "the
     # kernel refuses this proc" from "the kernel refuses this CLAIM", which is the distinction the
     # authority model rests on.
-    var cm2 = kmalloc(64);
+    var cm2 = cs + 256;
     var endowfd = 0 - 1;
     if (cm2 != 0) {
         if (ksyscall(97, CH_MINT, cm2, 0) == 0) {
@@ -4046,12 +4072,22 @@ fn syscall_harden_selftest() {
     kfree_sized(pfds, 32);
 
     # ⭐ ipc BITE 9 — read(2)/write(2) MUST REACH A CHANNEL FD, or the band is an API and not a PTY.
-    var cm9 = kmalloc(64);
+    # ⛔ 1.56.51 — THESE BUFFERS COME FROM THE `u` SCRATCH, NOT FROM kmalloc, and that is a
+    # correctness fix rather than a style change. `#97 CH_MINT` validates its destination with
+    # is_user_range, i.e. [0x200000, 0x40000000). A kmalloc pointer satisfied that only by ACCIDENT:
+    # pmm_alloc hands out [4 MB, 256 MB), which happens to sit inside the user window. When 1.56.51
+    # moved the kernel heap onto the direct map (8 GB+, see heap.cyr) those pointers became — quite
+    # correctly — non-user pointers, and CH_MINT began refusing them. The sibling assertions in this
+    # same function never had the problem because they already used `u + N` (chan MINT at u+704,
+    # chan endow MINT at u+896); only this bite reached for the heap.
+    # ⚠ A kernel heap pointer is not a user pointer. Passing one to a user-pointer-validating syscall
+    # was testing the path with an argument no real caller can produce.
+    var cm9 = u + 1536;
     if (cm9 != 0) {
         if (ksyscall(97, CH_MINT, cm9, 0) == 0) {
             var e9a = load64(cm9);
             var e9b = load64(cm9 + 8);
-            var b9 = kmalloc(256);
+            var b9 = u + 1664;
             store64(b9, 0x5054594B4F4E4F57);          # "PTYKONOW" little-endian
 
             # write(2) on the channel end, read(2) on its peer — no `#97` op in sight.
@@ -4065,7 +4101,7 @@ fn syscall_harden_selftest() {
             # ⭐ A write(2) LONGER THAN ONE RECORD IS A SHORT WRITE, NOT AN ERROR — the POSIX answer,
             # and what makes a PTY usable at all (agnsh's banner exceeds 64 bytes in one write).
             # ⛔ `CH_SEND` still REFUSES the same length: record framing holds on the `#97` path.
-            var wbig = kmalloc(256);
+            var wbig = u + 1984;
             var wi = 0;
             while (wi < 200) { store8(wbig + wi, 65 + (wi % 26)); wi = wi + 1; }
             var wsh = ksyscall(1, e9a, wbig, 200);
@@ -4074,7 +4110,7 @@ fn syscall_harden_selftest() {
             if (ksyscall(97, CH_SEND, e9a, wbig) >= 0) { kprintln("shsys: CH_SEND accepted an oversized record", 43); ok = 0; }
             var wdrain = ksyscall(5, e9b, b9, 128);
             if (wdrain != 64) { kprintln("shsys: short-written record did not read back whole", 51); ok = 0; }
-            kfree_sized(wbig, 256);
+            # (wbig is scratch, not heap — nothing to free)
 
             # ⛔ EMPTY MUST BE WOULD_BLOCK (-2), NOT 0. Returning 0 would mean EOF, and every
             # `while (read(fd) > 0)` loop in userland would exit the instant the peer was merely slow.
@@ -4088,12 +4124,11 @@ fn syscall_harden_selftest() {
             var r9c = ksyscall(5, e9b, b9, 64);
             if (r9c != 0) { kprintln("shsys: read(2) after peer close was not EOF", 43); ok = 0; }
 
-            kfree_sized(b9, 256);
+            # (b9 is scratch, not heap — nothing to free)
             ksyscall(97, CH_CLOSE, e9b, 0);
             if (ok == 1) { kprintln("shsys: read/write reach a channel fd OK", 39); }
         }
         else { kprintln("shsys: bite9 mint failed", 24); ok = 0; }
-        kfree_sized(cm9, 64);
     }
 
     # ⭐ ipc BITE 11 — EMPTY-WITH-WRITER MUST NOT LOOK LIKE EOF.

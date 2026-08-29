@@ -209,6 +209,123 @@ fn tlb_probe_hex(v) {
 }
 var tlb_shoot_ack = 0;
 var tlb_shoot_want = 0;
+# ⛔⛔ 1.56.51 — THE HANDSHAKE WAS TWO UNLOCKED GLOBALS AND A NON-ATOMIC INCREMENT, so the mechanism
+# built to PREVENT a stale TLB silently degraded to one whenever two CPUs shot down at once. Three
+# compounding defects, all fixed here:
+#   (1) `tlb_shoot_ack = tlb_shoot_ack + 1` in the handler is a read-modify-write executed by up to
+#       three APs simultaneously — acks were simply lost. Now an atomic `lock inc` (tlb_ack_inc).
+#   (2) A second sender's `tlb_shoot_ack = 0` wiped the first sender's tally MID-FLIGHT. The whole
+#       reset/IPI/wait sequence is now serialised under tlb_shoot_lock, a dedicated leaf lock —
+#       tlb_shootdown_all acquires nothing else, so it slots cleanly into smp.cyr's lock order.
+#   (3) THE ONE THAT MADE THE OTHER TWO UNRECOVERABLE: every caller is a ring-3 syscall handler and
+#       SFMASK 0x40700 clears IF on SYSCALL entry, so a spinning sender runs with IF=0 and CANNOT
+#       take the other sender's vector-0xF0 IPI. Two concurrent shootdowns therefore blocked each
+#       other until BOTH timed out, and both then proceeded with the flush unperformed. A lock alone
+#       does not fix this — it just moves the block into the lock acquire. So a spinning CPU now
+#       SERVICES its own pending shootdown inline (tlb_service_self), which is what lets the peer
+#       make progress while this CPU is still IF=0.
+# ⚠ The per-CPU pending flag is what keeps inline service and the real IPI from double-acking: the
+# flag is taken ATOMICALLY (xchg), and whichever path takes it is the one that acks. The other sees
+# 0 and only EOIs.
+# ⚠ The 2,000,000-iteration bound is DELIBERATELY KEPT as the backstop. It is the reason a wedged
+# CPU degrades instead of hanging the box, and none of the above removes the need for it.
+var tlb_shoot_lock = 0;
+var pcpu_tlb_pending[4];
+
+# Atomic `lock inc [tlb_shoot_ack]`. Frame shape is spin_unlock's (one local `addr` at [rbp-0x08]) —
+# the fixed-global, no-parameter form this file's lock-order banner requires; a parameterised
+# variant was removed at 1.46.x precisely because cyrius spills the param and shifts these offsets.
+# ⚠ REGISTER CONTRACT: reads `addr` from [rbp-0x08]; clobbers rax; no outputs.
+fn tlb_ack_inc() {
+    var addr = &tlb_shoot_ack;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0xF0; 0x48; 0xFF; 0x00;      # lock inc qword [rax]
+    }
+    return 0;
+}
+
+# Atomically take THIS CPU's pending flag: returns its old value and leaves it 0.
+# ⚠ REGISTER CONTRACT: `addr` at [rbp-0x10], `old` at [rbp-0x08] — spin_lock's exact frame shape.
+# Clobbers rax, rcx.
+fn tlb_pending_take() {
+    var old = 0;
+    var addr = &pcpu_tlb_pending + pcpu_cpu() * 8;
+    asm {
+        0x48; 0x8B; 0x45; 0xF0;      # mov rax, [rbp-0x10] (addr)
+        0x48; 0x31; 0xC9;            # xor rcx, rcx
+        0x48; 0x87; 0x08;            # xchg [rax], rcx
+        0x48; 0x89; 0x4D; 0xF8;      # mov [rbp-0x08], rcx (old)
+    }
+    return old;
+}
+
+fn tlb_shoot_spin_lock() {
+    var old = 1;
+    while (old == 1) {
+        var addr = &tlb_shoot_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+        tlb_service_self();      # ⭐ service the PEER while waiting — see defect (3) above
+    }
+    return 0;
+}
+fn tlb_shoot_spin_unlock() {
+    var addr = &tlb_shoot_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;            # xor rcx, rcx
+        0x48; 0x87; 0x08;            # xchg [rax], rcx
+    }
+    return 0;
+}
+
+# ⭐ VALIDATE THE HAND-ASM FRAME CONTRACT AT BOOT, because every function above addresses its locals
+# through hardcoded [rbp-N] offsets and a wrong offset is SILENT: the xchg would simply operate on
+# some other address, the lock would never be held, and the serialisation this file just gained
+# would be decorative. That is not hypothetical in this codebase — a parameterised spin_lock_at()
+# was removed at 1.46.x for exactly this (cyrius spilled the param, the asm read its "addr" from the
+# slot holding `old`, and it xchg'd ADDRESS 1), and aarch64's timer.cyr still has five asm blocks
+# addressing [sp,#0] that is frame padding rather than the intended local.
+# Runs on the BSP before any AP is woken, so single-threaded and lock-free by construction.
+# Returns 1 if every primitive moved the memory it claims to; 0 otherwise (reported by the caller).
+fn tlb_lock_selftest() {
+    var ok = 1;
+    if (tlb_shoot_lock != 0) { ok = 0; }              # must start released
+    tlb_shoot_spin_lock();
+    if (tlb_shoot_lock != 1) { ok = 0; }              # xchg wrote the REAL global
+    tlb_shoot_spin_unlock();
+    if (tlb_shoot_lock != 0) { ok = 0; }              # and released it
+    # tlb_ack_inc must move tlb_shoot_ack by exactly one.
+    var a0 = tlb_shoot_ack;
+    tlb_ack_inc();
+    if (tlb_shoot_ack != a0 + 1) { ok = 0; }
+    tlb_shoot_ack = a0;
+    # tlb_pending_take must return the old value AND clear the slot.
+    store64(&pcpu_tlb_pending + pcpu_cpu() * 8, 1);
+    if (tlb_pending_take() != 1) { ok = 0; }
+    if (load64(&pcpu_tlb_pending + pcpu_cpu() * 8) != 0) { ok = 0; }
+    if (tlb_pending_take() != 0) { ok = 0; }          # idempotent once taken
+    return ok;
+}
+
+# Flush + ack THIS CPU's pending shootdown, if one is outstanding. Called from the two spin loops so
+# an IF=0 CPU still answers a peer. No EOI here — no interrupt was taken; the real IPI arrives later,
+# finds the flag already taken, and only EOIs.
+fn tlb_service_self() {
+    if (tlb_pending_take() == 1) {
+        asm {
+            0x0F; 0x20; 0xD8;        # mov rax, cr3
+            0x0F; 0x22; 0xD8;        # mov cr3, rax
+        }
+        tlb_ack_inc();
+    }
+    return 0;
+}
 var TLB_SHOOT_VECTOR = 240;          # 0xF0 — clear of 7 / 32 / 33 / 80 / 81
 var TLB_SHOOT_WAIT = 2000000;
 
@@ -218,7 +335,11 @@ fn tlb_shootdown_handler() {
         0x0F; 0x20; 0xD8;            # mov rax, cr3
         0x0F; 0x22; 0xD8;            # mov cr3, rax
     }
-    tlb_shoot_ack = tlb_shoot_ack + 1;
+    # 1.56.51: ack ONLY if this CPU's pending flag is still set. tlb_service_self may already have
+    # flushed-and-acked for this request from inside a spin loop, in which case the flag is gone and
+    # this delivery must not ack a second time — a double ack would let a sender believe a THIRD
+    # CPU had answered. The CR3 reload above is unconditional and harmless either way.
+    if (tlb_pending_take() == 1) { tlb_ack_inc(); }
     apic_eoi();
     return 0;
 }
@@ -278,9 +399,20 @@ fn tlb_shootdown_all() {
     }
     if (apic_enabled == 0) { return 0; }
     if (cpu_count < 2) { return 0; }
+    # 1.56.51: the whole reset/arm/IPI/wait is ONE critical section — see the banner at
+    # tlb_shoot_lock. Acquiring also services any shootdown already aimed at this CPU, so waiting
+    # for the lock cannot starve the peer that holds it.
+    tlb_shoot_spin_lock();
     tlb_shoot_ack = 0;
     tlb_shoot_want = cpu_count - 1;
     var me = pcpu_cpu();
+    # Arm every target's pending flag BEFORE any IPI goes out: the flag is what a peer spinning
+    # with IF=0 consults, and it must be visible no later than the interrupt it stands in for.
+    var a = 0;
+    while (a < cpu_count) {
+        if (a != me) { store64(&pcpu_tlb_pending + a * 8, 1); }
+        a = a + 1;
+    }
     var t = 0;
     while (t < cpu_count) {
         if (t != me) { apic_send_ipi_one(t, TLB_SHOOT_VECTOR); }
@@ -292,6 +424,14 @@ fn tlb_shootdown_all() {
         w = w + 1;
         asm { 0xF3; 0x90; }                    # pause
     }
+    # ⚠ Clear any flag that went unanswered (a CPU that timed out above), so a stale 1 cannot make
+    # the NEXT request look pre-acked.
+    var c = 0;
+    while (c < cpu_count) {
+        if (c != me) { store64(&pcpu_tlb_pending + c * 8, 0); }
+        c = c + 1;
+    }
+    tlb_shoot_spin_unlock();
     #ifdef TLB_SHOOT_PROBE
     # CALIBRATE THE NULL: prove the shootdown fires and that acks come back. A silent fix is
     # indistinguishable from no fix, which is how this whole investigation kept going wrong.

@@ -3,7 +3,7 @@
 # contains /bin/agnsh (the agnos-ABI build of the agnoshi shell). kybernet
 # (PID 1) execs /bin/agnsh in ring 3 — the "first boot-to-agnsh-on-disk".
 #
-# PASS = kybernet reaches "exec /bin/agnsh" AND does NOT print "emergency
+# PASS = kybernet reaches "exec /bin/agnsh", does NOT print "emergency
 # shell" (i.e. agnsh launched, no fallback). Prints the boot tail for eyeball.
 #
 # Build first:  ./scripts/build.sh                       (plain production kernel)
@@ -111,6 +111,19 @@ if strings "$LOG" | grep -q "kybernet: emergency shell"; then
     echo "  FAIL: fell back to the in-kernel emergency shell (agnsh did not launch)"; rc=1
 else
     echo "  PASS: did NOT fall back to the emergency shell"
+fi
+# ⛔⛔ 1.56.51 — THE TWO GATES ABOVE CANNOT DETECT agnsh DYING AT ITS FIRST SYSCALL, and this was
+# MEASURED, not imagined: a deliberately-broken SYSCALL exit stub wedged the kernel the instant
+# agnsh reached ring 3, the log ended at "kybernet: exec /bin/agnsh" with no banner and no fault
+# line — and this smoke reported PASS. Both gates were satisfied: the exec WAS attempted, and the
+# emergency-shell fallback never ran precisely BECAUSE the box was already dead. "kybernet tried"
+# is a statement about kybernet, not about agnos; the only evidence agnsh actually RAN is output
+# that agnsh itself produced. This is the same class as the four unfalsifiable gates the 1.56.51
+# sweep found — a gate whose failure mode is indistinguishable from its success.
+if strings "$LOG" | grep -q "agnoshi "; then
+    echo "  PASS: agnsh reached ring 3 and printed its own banner"
+else
+    echo "  FAIL: no agnsh banner — it exec'd but produced no output (wedged before its first write)"; rc=1
 fi
 echo ""
 if [ "$rc" -eq 0 ]; then echo "agnsh-smoke: PASS"; else echo "agnsh-smoke: FAIL"; fi

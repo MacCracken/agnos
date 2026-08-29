@@ -1366,7 +1366,27 @@ fn xhci_enumerate_port(port_num) {
     # Without this, GCD-9 (9 bytes) on an FS device that reports MPS=64
     # times out because xHCI expects multi-packet under the stale MPS=8.
     # Linux: xhci_check_maxpacket() in drivers/usb/host/xhci.c.
-    var real_mps = load8(xhci_desc_buf_phys + 7);
+    # ⛔ 1.56.51 — ON SUPERSPEED bMaxPacketSize0 IS A LOG2 EXPONENT, NOT A BYTE COUNT (USB 3.2
+    # §9.6.1: the field "shall be set to 09H, indicating a 512-byte maximum packet"). Read as a
+    # count it becomes NINE, so EP0 was programmed with Max Packet Size = 9 on every SS device —
+    # and because the Input Context was seeded with xhci_ep0_mps_for_speed(SUPER) = 512, real_mps
+    # != cur_mps always fired and an Evaluate Context actively REPLACED the correct 512 with 9.
+    # Every subsequent control transfer longer than 9 bytes then went out under a Max Packet Size
+    # the device does not implement. LS/FS/HS report a genuine byte count (8/16/32/64) and are
+    # unchanged.
+    var real_mps = load8(xhci_desc_buf_phys + 7) & 0xFF;
+    # ⚠ THE EXPONENT IS DEVICE-SUPPLIED, so bound it before shifting: `1 << 255` is not a large
+    # number, it is undefined. The spec permits exactly 09H here; accept the 3..12 (8..4096 B)
+    # window and fall back to the seeded 512 for anything else rather than trusting the shift.
+    var spd = xhci_slot_get(xhci_slot_speed, slot_id);
+    var is_ss = 0;
+    if (spd == XHCI_SPEED_SUPER)      { is_ss = 1; }
+    if (spd == XHCI_SPEED_SUPER_PLUS) { is_ss = 1; }
+    if (is_ss == 1) {
+        if (real_mps < 3)  { real_mps = 9; }
+        if (real_mps > 12) { real_mps = 9; }
+        real_mps = 1 << real_mps;
+    }
     var cur_mps  = xhci_slot_get(xhci_slot_max_packet, slot_id);
     if (real_mps != cur_mps) {
         var ictx2 = xhci_slot_get(xhci_slot_input_ctx, slot_id);

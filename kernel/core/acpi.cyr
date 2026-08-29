@@ -144,10 +144,18 @@ fn acpi_parse_dmar(dmar) {
         var entry_type = acpi_load16(dmar + offset);
         var entry_len = acpi_load16(dmar + offset + 2);
         if (entry_len < 4) { break; }  # Prevent infinite loop
+        # ⛔ 1.56.51 — BOUND THE ENTRY AGAINST THE TABLE BEFORE READING INSIDE IT. The loop guard
+        # is `offset + 4 <= dmar_len`, which proves only that the 4-byte type/length header fits.
+        # The DRHD read below is an acpi_load64 at offset+8, i.e. bytes [offset+8, offset+16) — so
+        # a truncated or malformed final entry made this read up to 12 bytes PAST the end of the
+        # DMAR table, and the garbage it returned was then used as an MMIO base and had GCMD.TE
+        # set against it. Firmware tables are untrusted input like any other.
+        if (offset + entry_len > dmar_len) { break; }      # entry runs past the table
         if (entry_type == 0) {
             # DRHD: DMA Remapping Hardware Unit Definition
             # offset+4: flags(1), offset+5: reserved(1), offset+6: segment(2)
             # offset+8: register_base_address(8)
+            if (entry_len < 16) { break; }                 # too short to carry a register base
             var reg_base = acpi_load64(dmar + offset + 8);
             if (reg_base != 0) {
                 return reg_base;

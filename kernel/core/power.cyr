@@ -295,10 +295,16 @@ fn power_off() {
     #    absent (QEMU and the AMD FCH both) — and port 0 is the 8237 DMA channel-0
     #    address latch, not a void. It also carries SLP_TYPb, which is a DIFFERENT
     #    value from SLP_TYPa; copying A into B is a common and silent bug.
+    # ⛔ 1.56.51 — A SEPARATE `baseb`, NOT A REASSIGNMENT OF `base`. This block used to overwrite
+    # `base` with the value read from PM1b_CNT, and step 6 below then re-issued its retry pulse to
+    # PM1a_CNT carrying PM1b's bits. That is precisely what the read-modify-write comment above
+    # forbids: the two registers hold DIFFERENT SCI_EN/BM_RLD state, so the retry could clear
+    # SCI_EN on PM1a and drop the machine out of ACPI mode — after which the firmware ignores the
+    # very write meant to power it off. `base` is now PM1a's for the whole function.
     if (acpi_pm1b_cnt != 0) {
-        base = inw(acpi_pm1b_cnt) & (0 - 1 - 0x1C00) & (0 - 1 - 0x2000);
-        outw(acpi_pm1b_cnt, base | (acpi_slp_typb << 10));
-        outw(acpi_pm1b_cnt, base | (acpi_slp_typb << 10) | 0x2000);
+        var baseb = inw(acpi_pm1b_cnt) & (0 - 1 - 0x1C00) & (0 - 1 - 0x2000);
+        outw(acpi_pm1b_cnt, baseb | (acpi_slp_typb << 10));
+        outw(acpi_pm1b_cnt, baseb | (acpi_slp_typb << 10) | 0x2000);
     }
 
     # 5. Wait for the platform to go. ⚠ ACPICA's equivalent poll is UNBOUNDED; ours

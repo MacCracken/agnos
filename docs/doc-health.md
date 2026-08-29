@@ -6,9 +6,17 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-08-28 (**1.56.51 P-1 audit sweep** — PARTIAL, see below). **⛔ THE MULTI-MINOR LAG HAPPENED A THIRD TIME, AND THIS FILE PREDICTED IT TWICE.** The ledger sat at **v1.44.9** from 2026-06-10 to 2026-08-28 — **~12 minors** (1.45.x net/server, 1.46.x SMP, 1.47.x-1.49.x, 1.50.x-1.53.x, the 1.54.x-1.56.x GPU/display/shader arcs) — with state.md/roadmap/CHANGELOG kept per-cut and the body docs un-swept, which is verbatim the failure the two notes below describe. The stated fix ("fold a doc-health touch into the cycle-OPEN sweep") was never adopted. ⚠ **This refresh is NOT that catch-up sweep** — it records only what 1.56.51 actually touched. The body docs (`README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`) remain unswept since 1.44.9 and their syscall counts, sizes and subsystem tables should be assumed stale — the surface has since grown to **0-101**.
+> **Last refresh**: 2026-08-29 (**1.56.51 audit-backlog first pass** — see the 2026-08-29 block; the 2026-08-28 block below it records the sweep that produced the backlog). **⛔ THE MULTI-MINOR LAG HAPPENED A THIRD TIME, AND THIS FILE PREDICTED IT TWICE.** The ledger sat at **v1.44.9** from 2026-06-10 to 2026-08-28 — **~12 minors** (1.45.x net/server, 1.46.x SMP, 1.47.x-1.49.x, 1.50.x-1.53.x, the 1.54.x-1.56.x GPU/display/shader arcs) — with state.md/roadmap/CHANGELOG kept per-cut and the body docs un-swept, which is verbatim the failure the two notes below describe. The stated fix ("fold a doc-health touch into the cycle-OPEN sweep") was never adopted. ⚠ **This refresh is NOT that catch-up sweep** — it records only what 1.56.51 actually touched. The body docs (`README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`) remain unswept since 1.44.9 and their syscall counts, sizes and subsystem tables should be assumed stale — the surface has since grown to **0-101**.
 >
-> ### 1.56.51 — what this cut touched
+> ### 2026-08-29 — the audit-backlog first pass (still inside the open 1.56.51 cut)
+>
+> ✅ **`CHANGELOG.md`** — four new sections under 1.56.51: the P0 identity-shadowing closure, the P1 batch, the two harness gates that could not fail, and the kmalloc consequence. The "Known — not fixed" bullets were reconciled rather than left to rot (the `blk` gate and `#92` entries now say what actually changed).
+> ✅ **`docs/development/issues/2026-08-28-p1-audit-sweep-backlog.md`** — a STATUS block at the top and inline ✅ FIXED / 🟠 PARTIAL markers on 19 entries, so the file reports what remains instead of what was once true. Section headings carry running counts.
+> ✅ **`docs/development/state.md`** — kernel-head row, gate counts (now including `ktest.sh` 97/6), and four new OPEN items: the identity-VA belief is now false for kernel structures; the IBRS relocation is emit-order-verified only; two smokes do not build their own kernel; do not run `check.sh` during a sweep. Held at 106 lines, under the 120 cap.
+> ✅ **`docs/development/roadmap.md`** — the audit-backlog row now carries real counts and records that the `elf.cyr:312` operator ruling was given and executed.
+> 🟠 **Body docs still unswept** — unchanged since 1.44.9; the debt below stands.
+>
+> ### 1.56.51 — what that cut touched
 >
 > ✅ **`docs/development/state.md`** — the TRUE table was **five patch releases stale** (kernel head 1.56.45, pin 6.5.21, `check.sh` 23/23) because all three of `version-bump.sh`'s state.md seds matched nothing and the script reported the file "Updated" anyway. Patterns fixed against the file's real shape AND asserted; arc narrative compressed back under the 120-line cap (100 lines).
 > ✅ **`docs/development/roadmap.md`** — audit-backlog + aarch64 rows added; ⛔ a **literal `\n` inside a table row** was merging the IPv6 and `fork` entries, so the `fork` row had never rendered. Repaired.

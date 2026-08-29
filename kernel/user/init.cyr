@@ -75,7 +75,7 @@ fn kybernet_exec_agnsh() {
     # it correct by construction. That cure has been in the binary since 1.46.3 but was NEVER burned
     # at IF=1. This flip runs the STEP-1-at-IF=1 burn that confirms it (smp_sched_aps stays 0; the
     # same cure covers STEP-2 since it lives in the shared do_context_switch path).
-    exec_preempt = 1;   # IF=1 PREEMPTIVE agnsh — load-bearing cure active (sched_fix_live_frame). Revert to 0 only for the IF=0 stopgap.
+    exec_preempt_set(1);   # IF=1 PREEMPTIVE agnsh — load-bearing cure active (sched_fix_live_frame). Revert to 0 only for the IF=0 stopgap.
     exec_and_wait(e, r, c);
     var code = proc_get_exit_code(pid);
     proc_reap(pid);

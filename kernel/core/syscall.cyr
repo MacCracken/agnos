@@ -260,7 +260,36 @@ fn spawn_env_buf_base() { return &pcpu_spawn_env_buf + pcpu_cpu() * 1024; }
 # 1.44.20: blit#39 scaled-row staging — ONE expanded src row (w*scale px, 32bpp). [4096] =
 # 4096 u64 = 32 KB (8N), the invariant the handler's `w*scale <= 8192` gate enforces (NOT
 # "max FB row" — the expanded width is what lands here). Single-core IF=0 handler scratch.
-var fb_scale_rowbuf[4096];
+# ⛔⛔ 1.56.51 — PER-CPU. This buffer was module-scope and its own comment at the scale>=2 loop
+# named the unwind: "safe under the single-core IF=0 syscall invariant (the SMP arc must add this
+# to its unwind list)". The SMP arc shipped and it was never added. IF=0 is PER-CPU and excludes
+# nothing across cores, so a compositor on CPU 0 could finish its expand pass, have a game on
+# CPU 1 overwrite the buffer mid-emit, and paint CPU 1's pixels into CPU 0's window rect — a
+# cross-process disclosure through the shared framebuffer, and a corrupt frame for both. Bounds
+# hold either way (the w*scale<=8192 gate below), so the defect is corruption, not overflow.
+# ⚠ NOT A .bss ARRAY, and that is deliberate. 32 KB x 4 CPUs is 128 KB of image, and check.sh's
+# binary gate is a HARD 2 MiB ceiling whose comment says to re-derive it, not chase it upward —
+# at this cut there were ~100 KB of headroom left, so a static array would have spent essentially
+# all of it on one blit scratch. Instead one 2 MB region is taken ONCE at boot
+# (fb_scale_rowbuf_init, main.cyr, single-threaded — so no lock, no init race, nothing to leak)
+# and sliced four ways. Costs zero image bytes; uses 128 KB of the 2 MB.
+# ⚠ Addressed through pmm_kva_for_access — the DIRECT MAP, never the phys==VA identity alias a
+# crafted PT_LOAD can shadow. See proc.cyr's ptw_pd_kva header.
+var fb_scale_rowbuf_phys = 0;
+var FB_SCALE_ROWBUF_STRIDE = 32768;      # 8192 px x 4 B — exactly the w*scale <= 8192 gate below
+fn fb_scale_rowbuf_init() {
+    if (fb_scale_rowbuf_phys != 0) { return 1; }
+    var p = pmm_alloc_2mb();
+    if (p == 0) { return 0; }
+    fb_scale_rowbuf_phys = p;
+    return 1;
+}
+# Returns THIS CPU's 32 KB slice, or 0 if the region was never obtained (the scale>=2 arm
+# rejects on 0 rather than writing through a null base).
+fn fb_scale_rowbuf_base() {
+    if (fb_scale_rowbuf_phys == 0) { return 0; }
+    return pmm_kva_for_access(fb_scale_rowbuf_phys) + pcpu_cpu() * FB_SCALE_ROWBUF_STRIDE;
+}
 
 # Security: a userspace pointer must lie in the user VA window [0x200000, 0x40000000):
 # above the kernel low region (0-2 MB) and below the 1 GB arena ceiling. EVERY
@@ -320,8 +349,21 @@ fn is_user_array(ptr, count, stride) {
 # mount — the writable ext2/primary root. This scratch buffer holds the "/"-prepended
 # form so bare names (`touch foo`, `cmd > foo`) create in the root FS instead of
 # falling through to the read-only initrd (the open handler uses it; the ext2 lookup
-# needs the leading '/'). Single-threaded per syscall ⇒ one shared buffer is safe.
-var sc_open_abs[32];   # 256 bytes: '/' + up to 254-char relative name
+# needs the leading '/').
+#
+# ⛔⛔ 1.56.51 — PER-CPU. The banner here used to end "Single-threaded per syscall ⇒ one shared
+# buffer is safe", and that premise died when the SMP arc shipped: smp_wake_enabled=1
+# (main.cyr) and smp_sched_aps=1 (smp.cyr) mean APs pull real ring-3 procs, and IF=0
+# serialises nothing ACROSS cores. Both the write below and the vfs_resolve_mount that consumes
+# it sit OUTSIDE fs_spin_lock (which #7 takes later, at the ext2 arm), so two CPUs could be in
+# this arm at once: CPU 0 writes "/config", CPU 1 overwrites it with "/secrets", and CPU 0 then
+# opens a path it never named — with the two procs' fd tables private, so nothing downstream
+# notices. Every sibling scratch buffer in this file was converted for SMP and says so
+# (pcpu_ew37_path, pcpu_spawn_path_buf, pcpu_ew37_env, pcpu_spawn_env_buf, pcpu_redir_backup,
+# pcpu_sc_gpuop); this one was missed, and its own comment is what stopped a reader noticing.
+# [128] = 128 u64 = 1024 B = 256 B per CPU x 4; cpu c at byte c*256. (The 8N module-global rule.)
+var pcpu_sc_open_abs[128];
+fn sc_open_abs_base() { return &pcpu_sc_open_abs + pcpu_cpu() * 256; }
 
 # 1.41.6 (#22): the path-argument preamble every mount-routed FS syscall shares —
 # a non-empty length AND a valid user range. Returns 1 if (ptr,len) is an
@@ -519,10 +561,14 @@ fn fault_kill_current(vector) {
     # bad flags (mapped but, say, present-bit cleared or the wrong physical frame). Walking the
     # same PML4[0]->PDPT[0]->PD path proc_map_page_nx writes through keeps this honest: if the
     # walk disagrees with the hardware, the walk is what is wrong, not the CPU.
-    var fk_pml4e = load64(dm_read_cr3() & 0xFFFFF000);
-    var fk_pdpte = load64(fk_pml4e & 0xFFFFFFFFF000);
-    var fk_pd    = fk_pdpte & 0xFFFFFFFFF000;
-    var fk_pde   = load64(fk_pd + ((dm_read_cr2() >> 21) & 0x1FF) * 8);
+    # 1.56.51: through the direct map, like every other page-table walk in the kernel — see
+    # proc.cyr's ptw_pd_kva header. A FAULT HANDLER especially must not walk identity VAs: the
+    # commonest reason to be here is that the faulting process shadowed exactly that window.
+    var fk_pml4e = load64(pmm_kva_for_access(dm_read_cr3() & 0xFFFFF000));
+    var fk_pdpte = load64(pmm_kva_for_access(fk_pml4e & 0xFFFFFFFFF000));
+    var fk_pd    = fk_pdpte & 0xFFFFFFFFF000;                 # RAW PHYS — printed below as fpd=
+    var fk_pd_kva = pmm_kva_for_access(fk_pd);                # every PDE read below goes through this
+    var fk_pde   = load64(fk_pd_kva + ((dm_read_cr2() >> 21) & 0x1FF) * 8);
     klug_append(" pde=", 5);
     if (fk_pde < 0) { klug_append("NX|", 3); }
     fk_n = fmt_hex_buf(fk_pde & 0x7FFFFFFFFFFFFFFF, &fk_hex); klug_append(&fk_hex, fk_n);
@@ -551,17 +597,17 @@ fn fault_kill_current(vector) {
     # (the user-PML4 stash) survive while the victim is 0, exactly one entry was cleared. If they are
     # ALL zero, the page's memory was destroyed — a stray write or DMA, not paging logic.
     klug_append(" n2=0x", 6);
-    fk_n = fmt_hex_buf(load64(fk_pd + 2 * 8), &fk_hex);   klug_append(&fk_hex, fk_n);
+    fk_n = fmt_hex_buf(load64(fk_pd_kva + 2 * 8), &fk_hex);   klug_append(&fk_hex, fk_n);
     if (fk_n == 0) { klug_append("0", 1); }
     klug_append(" n509=0x", 8);
-    fk_n = fmt_hex_buf(load64(fk_pd + 509 * 8), &fk_hex); klug_append(&fk_hex, fk_n);
+    fk_n = fmt_hex_buf(load64(fk_pd_kva + 509 * 8), &fk_hex); klug_append(&fk_hex, fk_n);
     if (fk_n == 0) { klug_append("0", 1); }
     klug_append(" n510=", 6);
-    if (load64(fk_pd + 510 * 8) < 0) { klug_append("NX|", 3); }
-    fk_n = fmt_hex_buf(load64(fk_pd + 510 * 8) & 0x7FFFFFFFFFFFFFFF, &fk_hex); klug_append(&fk_hex, fk_n);
+    if (load64(fk_pd_kva + 510 * 8) < 0) { klug_append("NX|", 3); }
+    fk_n = fmt_hex_buf(load64(fk_pd_kva + 510 * 8) & 0x7FFFFFFFFFFFFFFF, &fk_hex); klug_append(&fk_hex, fk_n);
     if (fk_n == 0) { klug_append("0", 1); }
     klug_append(" stash=0x", 9);
-    fk_n = fmt_hex_buf(load64(fk_pd + 511 * 8), &fk_hex); klug_append(&fk_hex, fk_n);
+    fk_n = fmt_hex_buf(load64(fk_pd_kva + 511 * 8), &fk_hex); klug_append(&fk_hex, fk_n);
     if (fk_n == 0) { klug_append("0", 1); }
     klug_append(" idx=", 5);
     fk_n = fmt_hex_buf((dm_read_cr2() >> 21) & 0x1FF, &fk_hex);  klug_append(&fk_hex, fk_n);
@@ -7433,9 +7479,19 @@ fn shm_free(id) {
 #
 # Exposes the kernel block layer (blk_read_on) to a privileged ring-3 installer so
 # agnova + sovereign mkfs/partition tools can detect disks and read raw sectors
-# WITHOUT shelling out to Linux parted/mkfs. This is the READ-PATH (Phase 1) —
-# enum / open(RO) / read / info / close, all NON-DESTRUCTIVE. blk_write#78 is
-# Phase 2 (capability-gated). Design + security posture:
+# WITHOUT shelling out to Linux parted/mkfs.
+#
+# ⛔⛔ 1.56.51 — THIS BANNER USED TO SAY "This is the READ-PATH (Phase 1) — enum / open(RO) / read /
+# info / close, all NON-DESTRUCTIVE. blk_write#78 is Phase 2 (capability-gated)." BOTH HALVES ARE
+# FALSE AS BUILT. #78 is dispatched today (see the `num == 78` arm), so the band is destructive;
+# and its "capability gate" is a plain compile-time magic constant sitting in the kernel image,
+# which any ring-3 process can send. That is a DELIBERATE placeholder — agnos has no per-proc
+# capabilities yet and the seam is named at BLK_RW_ARM_MAGIC — but a banner claiming a gate that
+# does not exist is how the placeholder stops being noticed. What 1.56.51 DID tighten: the arm is
+# no longer the first statement before all validation, and `blk_rw_armed` is now cleared on
+# blk_close so the window is bounded instead of lasting the whole boot. (Moving the arm below tag
+# validation was tried and reverted — it breaks the shipped ABI; see blk_open_sys.)
+# Design + security posture:
 #   docs/development/issue/2026-07-09-ring3-block-device-syscalls-for-install.md
 #
 # Handle model (Phase 1): the handle IS the backend tag (BLK_VIRTIO..BLK_RAMDISK,
@@ -7479,6 +7535,20 @@ fn blk_enum_sys(buf, cap) {
 # = RW (only when armed). mode == BLK_RW_ARM_MAGIC = the deliberate arm (sets the
 # write gate, returns 0) — the aegis/shakti capability seam. Validates tag registered.
 fn blk_open_sys(tag, mode) {
+    # ⚠⚠ 1.56.51 — THE ARM STAYS AHEAD OF TAG VALIDATION, AND THAT IS AN ABI CONSTRAINT, NOT AN
+    # OVERSIGHT. The audit's suggested fix was to move this branch below the tag/registration
+    # checks; that was TRIED at 1.56.51 and REVERTED because it breaks the shipped calling
+    # convention. `tag` is meaningless for the arm — the documented form is literally
+    # `blk_open(_, BLK_RW_ARM_MAGIC)` and every caller passes 0 (tests/blk/blkwr.cyr:39, and the
+    # agnova/ark installers in the sibling repos, which cannot be re-verified from here). With the
+    # reorder, `blk_open(0, MAGIC)` fails tag validation, the arm silently does not take, and the
+    # next RW open returns EPERM — measured as `blk-write-smoke: run: exit 85`.
+    # ⛔ Do not re-apply the reorder without changing the ABI and every caller together.
+    # What the reorder would have bought is small in any case: the arm touches no device, so
+    # requiring it to name one is cosmetic next to the real gap — that the token is a compile-time
+    # constant any ring-3 process can send. THAT is the deliberate placeholder (see the banner and
+    # BLK_RW_ARM_MAGIC); the honest hardening available without capabilities was bounding the
+    # window, which blk_close_sys now does.
     if (mode == BLK_RW_ARM_MAGIC) { blk_rw_armed = 1; return 0; }   # deliberate RW arm
     if (tag < 1) { return 0 - 1; }
     if (tag > 5) { return 0 - 1; }
@@ -7590,6 +7660,12 @@ fn blk_close_sys(h) {
     if (h < 1) { return 0 - 1; }
     if (h > 5) { return 0 - 1; }
     if (blk_is_registered(h) == 0) { return 0 - 1; }
+    # ⛔ 1.56.51 — DISARM ON CLOSE. `blk_rw_armed` was set once and never reset: not here, not on
+    # process exit, not on any error path — so a single arm left raw disk writes enabled for the
+    # rest of the boot, for every process, long after the installer that armed it had finished.
+    # Close is the natural end of the window an installer needs. A caller that wants to keep
+    # writing simply does not close, which is the same lifetime any handle already has.
+    blk_rw_armed = 0;
     return 0;
 }
 
@@ -7828,10 +7904,11 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var op_path = arg1;
         var op_len  = arg2;
         if (load8(arg1) != 47) {
-            store8(&sc_open_abs, 47);
+            var oabs = sc_open_abs_base();          # 1.56.51: THIS CPU's slice — see the banner
+            store8(oabs, 47);
             var opi = 0;
-            while (opi < arg2 && opi < 254) { store8(&sc_open_abs + 1 + opi, load8(arg1 + opi)); opi = opi + 1; }
-            op_path = &sc_open_abs;
+            while (opi < arg2 && opi < 254) { store8(oabs + 1 + opi, load8(arg1 + opi)); opi = opi + 1; }
+            op_path = oabs;
             op_len  = opi + 1;
         }
         var be7 = vfs_resolve_mount(op_path, op_len);
@@ -8567,10 +8644,15 @@ fn ksyscall(num, arg1, arg2, arg3) {
         store64(arg1 +  8, pmm_total * 4096);             # total RAM bytes (4 KB pages)
         store64(arg1 + 16, pmm_free_count() * 4096);      # free RAM bytes
         store64(arg1 + 24, proc_count);                   # proc-table high-water mark (1.44.x: ≥ live count — non-LIFO holes may make it over-report; cosmetic stat field, no control flow depends on it)
-        # cpu_count = ENUMERATED CPUs (BSP + APs that checked in via smp_start_aps). 1.44.18+ the
-        # APs are woken then PARK (IF=0 hlt) — exactly ONE CPU (the BSP) ever schedules — so this
-        # OVER-reports usable parallelism (e.g. 4 with -smp 4). Cosmetic stat; no scheduler decision
-        # reads it. A separate "schedulable CPUs" lands with the SMP arc that actually unparks APs.
+        # cpu_count = ENUMERATED CPUs (BSP + APs that checked in via smp_start_aps).
+        # ⛔ 1.56.51 — THIS COMMENT DESCRIBED A KERNEL THAT NO LONGER EXISTS, and it was cited as
+        # evidence elsewhere. It used to read "1.44.18+ the APs are woken then PARK (IF=0 hlt) —
+        # exactly ONE CPU (the BSP) ever schedules — so this OVER-reports usable parallelism".
+        # The SMP arc that "actually unparks APs" SHIPPED: smp_sched_aps=1 (smp.cyr) and
+        # smp_wake_enabled=1 (main.cyr), so APs pull real ring-3 procs and cpu_count reports
+        # parallelism that is genuinely usable. The stale claim mattered because two shared-scratch
+        # buffers (sc_open_abs, fb_scale_rowbuf) justified themselves on it. Both are per-CPU now.
+        # Still a cosmetic stat: no scheduler decision reads this field.
         store64(arg1 + 32, cpu_count);                    # online (enumerated) CPUs
         stack_canary_check(canary);
         return 0;
@@ -8951,9 +9033,11 @@ fn ksyscall(num, arg1, arg2, arg3) {
             # copy the clipped row (cw*4 bytes, NEVER pitch — pitch slack would spill into the
             # next row) to each of the `scale` dst rows, stopping at the clip. No FB read-back
             # (the FB is WC-mapped). In-bounds: dx*4 + cw*4 <= fw*4 <= pitch (asserted above);
-            # src reads stay in [0, w) per row and [0, h) rows by construction. The shared
-            # rowbuf is safe under the single-core IF=0 syscall invariant (the SMP arc must
-            # add this to its unwind list).
+            # src reads stay in [0, w) per row and [0, h) rows by construction.
+            # 1.56.51: the rowbuf is PER-CPU (see its banner) — the single-core IF=0 premise this
+            # comment used to assert is false under smp_sched_aps=1.
+            var bl_rowbuf = fb_scale_rowbuf_base();
+            if (bl_rowbuf == 0) { stack_canary_check(canary); return 0 - 1; }   # no staging region
             var bl_s = 0;
             while (bl_s < bl_h) {
                 if (bl_s * bl_scale >= bl_ch) { bl_s = bl_h; }           # rest fully clipped — done
@@ -8965,7 +9049,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
                         var bl_px = load32(bl_srow + bl_x * 4);
                         var bl_k = 0;
                         while (bl_k < bl_scale) {
-                            store32(&fb_scale_rowbuf + bl_o * 4, bl_px);
+                            store32(bl_rowbuf + bl_o * 4, bl_px);
                             bl_o = bl_o + 1;
                             bl_k = bl_k + 1;
                         }
@@ -8979,7 +9063,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
                             bl_drow = bl_fb + (bl_dy + bl_r) * bl_pitch + bl_dx * 4;
                             bl_c = 0;
                             while (bl_c < bl_cw) {
-                                store32(bl_drow + bl_c * 4, load32(&fb_scale_rowbuf + bl_c * 4));
+                                store32(bl_drow + bl_c * 4, load32(bl_rowbuf + bl_c * 4));
                                 bl_c = bl_c + 1;
                             }
                             bl_kr = bl_kr + 1;

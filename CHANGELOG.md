@@ -300,6 +300,108 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   Replaced with the gnoboot + OVMF path in both places, and in `kernel/agnos.cyr`'s header. Gate
   counts corrected: `check.sh` is 30 gates, not 11; `test.sh --all` tops out at 5 checks, not 7.
 
+### Security — P0: the ELF PT_LOAD identity-shadowing class, closed
+
+- **Every kernel page-table dereference now goes through the DIRECT MAP** (`DIRECTMAP_BASE + phys`,
+  kernel PDPT[8+]), never through a phys==VA identity address. Both ELF loaders bound a `PT_LOAD`
+  only by `p_vaddr >= 0x400000` and `p_vaddr + p_memsz <= 0x10000000` — exactly PD[2..127] of the
+  per-process page directory — while `proc_map_page`'s only index math is `(virt >> 21) & 0x1FF`.
+  A crafted segment at 0xC00000 therefore overwrote PD[6] with a ring-3-writable page and shadowed
+  the identity mapping of physical 12–14 MB *in that process's own address space*, which is where
+  its PML4/PDPT/PD and the whole kernel heap live (`pmm_alloc` hands out [0x400000, 0xFFFF000], a
+  strict subset of the same window). The next `load64(cr3)` under that CR3 then read attacker bytes
+  as a page-table entry and stored through the result: **ring 3 to arbitrary kernel write**.
+  `pmm.cyr` asserted the opposite as a load-bearing invariant and conceded on the next line that the
+  heap was clear "only by luck of placement".
+  Converted: new `ptw_pd_kva()` walk helper; `proc_map_page` / `_rx` / `_nx` / `_hi`;
+  `proc_unmap_page` / `proc_unmap_2mb_hi`; `proc_get_user_cr3`; `proc_create_address_space`
+  (zero + build of all three tables); `proc_free_address_space` (low sweep, high PDPT sweep, high PD
+  sweep); `proc_copy_from_user` / `_to_user` (walk **and** byte copy); `sys_munmap`;
+  `fault_kill_current`'s forensics walk; all five `ELF_PDE_PROBE` walks and the himem selftests.
+  Only the ADDRESS moves — a PDE's value stays a raw physical page number.
+- **`kmalloc` hands out direct-map pointers.** Slab pages come from the same `pmm_alloc` window, so a
+  kmalloc'd fd table or epoll watch list was equally shadowable. Transparent to callers (audited site
+  by site: every DMA path allocates from `pmm_alloc` directly and does not come through the heap).
+  The `vmm_map(page, page, 0x83)` that stood there is removed — it wrote only the boot PD, so it
+  never propagated into a per-process CR3, and was a no-op in practice.
+- `proc_get_user_cr3` returns `kernel_cr3`, never 0, on a broken chain: its value is loaded straight
+  into CR3 by the SYSCALL exit stub, where 0 is a guaranteed triple fault.
+
+### Security — P1: SMP scratch, unvalidated input, unchecked returns
+
+- **`open#7`'s `sc_open_abs` is per-CPU.** Its banner ended "Single-threaded per syscall ⇒ one shared
+  buffer is safe"; that premise died when APs began scheduling ring-3 procs. Both the write and the
+  `vfs_resolve_mount` that consumes it sit outside `fs_spin_lock`, so two CPUs in this arm produced
+  **path confusion** — CPU 0 opening the file CPU 1 named.
+- **`blit#39`'s `fb_scale_rowbuf` is per-CPU**, and moved from `.bss` to one boot-time 2 MB region
+  sliced four ways. Its own comment named the SMP arc as the unwind and the arc shipped without it:
+  a compositor and a game on two CPUs cross-painted, a **cross-process pixel disclosure**. Net −31 KB
+  of image (the old 32 KB static array is gone); `check.sh`'s 2 MiB ceiling is not moved.
+- **`enter_ring3`'s iretq frame is per-CPU** (`0x7000 + cpu*0x40`). The five params feeding it were
+  converted for SMP in 1.46.x; the frame they feed was left shared, so CPU A could `iretq` to CPU B's
+  RIP on B's RSP — and because every agnos ELF links at 0x400000, that does not fault cleanly.
+  `exec_preempt` is per-CPU too (one CPU could consume another's IF=1 arm).
+- **`boot_info` is validated before use** — magic `0x41474E4F` and `struct_size >= 0x78` — and copies
+  `min(struct_size, 128)` rather than a fixed 128 that over-read the 120-byte struct by 8. On failure
+  `boot_info_ptr` is left 0 so downstream guards engage. The only magic check in the tree was a
+  diagnostic print 370 lines *after* `pmm_probe_memmap` had already walked the struct.
+- **TLB shootdown handshake serialised.** Atomic `lock inc` ack (it was a plain read-modify-write run
+  by up to three APs), a dedicated leaf lock (a second sender wiped the first's tally mid-flight), and
+  inline self-service so an IF=0 sender can answer a peer instead of both timing out and proceeding
+  with the flush unperformed. A boot-time gate asserts the hand-asm `[rbp-N]` contracts actually move
+  the memory they name (`tlb: handshake primitives OK`); mutation-tested.
+- **SYSCALL exit stub's IBRS-clear block moved** above the RSP/CR3 restore. It pushed three qwords
+  through a fully user-controlled RSP at CPL0, after `clac` had re-armed SMAP.
+- `acpi_parse_dmar` bounds each entry against the table (the DRHD register base was read up to 12
+  bytes past the end, then used as an MMIO base).
+- `pci_bar_64`'s documented `0 = malformed cap` return is checked at **both** sites; MSI-X now falls
+  through to the MSI fallback instead of returning early.
+- MSC per-slot rows bounded to the 16 that fit the page (the header claimed 1..64 and enumeration
+  probed to 64, writing device-supplied bytes into the next PMM page); slots above the bound are
+  reported, not silently skipped. Table addressed through the direct map.
+- xHCI scratchpad array refuses `MaxScratchpadBufs > 512` (one 4 KB page = 512 entries; the field is
+  10 bits and the same comment said so).
+- SuperSpeed `bMaxPacketSize0` decoded as the log2 exponent it is — EP0 was being programmed with
+  Max Packet Size **9** and an Evaluate Context actively replaced the correct 512 with it.
+- `nvme_blk_read` / `_write` copy the device's real LBA size, not a hardcoded 512 (4 K-LBA namespaces
+  silently short-copied 3584 bytes); `nvme_blk_flush` takes `nvme_spin_lock` (it submitted into the
+  shared SQ and reaped the shared CQ with no lock).
+- ACPI S5 retry uses PM1a's own base — it was re-issuing the PM1a pulse with the value read from
+  PM1b, which is what the read-modify-write comment above it forbids.
+- High mmap arena floor derived from the real `directmap_pdpt_top`; `proc_map_page_hi` refuses a
+  present-but-supervisor PDPT entry rather than writing a per-process PDE into a shared kernel PD.
+  The "the direct map tops at PDPT[71]" claim appeared three times and was never enforced.
+- `blk_rw_armed` cleared on `blk_close` (it survived the whole boot), and the band's banner no longer
+  claims a non-destructive read-path with a capability-gated write.
+- Corrected load-bearing false comments: ring-3 CS/SS were documented inverted (`0x1B`/`0x23` where
+  the GDT, `proc_set_ring3` and `sel_pair_consistent` all say `0x23`/`0x1B`); the `#NM` vector was
+  described as inert when four production paths set CR0.TS on every switch; `sysinfo#35` still
+  claimed "exactly ONE CPU (the BSP) ever schedules".
+
+### Harness — two gates that could not fail
+
+- **`ktest.sh` booted nothing.** Its ESP image was 64 MB, outside the only measured-working cell
+  (`1MiB..33MiB` on a **128 MB** disk × nvme) that 1.56.51 established for the other 24 smokes. Every
+  invocation reported "kernel may have crashed or not reached boot_finish" — a harness failure wearing
+  the kernel's name. The suite now runs: **97 passed, 6 failed**, the six measured identical on a
+  clean tree (pmm ×2, vfs pipe ×1, initrd ×3) and therefore pre-existing.
+- **`agnsh-smoke` passed a wedged kernel.** Its two gates checked that *kybernet attempted the exec*
+  and that the emergency-shell fallback did not run — both satisfied by a box that died at agnsh's
+  first syscall, the second one precisely *because* it was already dead. It now requires agnsh's own
+  banner. Mutation-tested against a deliberately broken exit stub.
+
+### Consequence of the kmalloc move — two selftests were passing kernel pointers to user syscalls
+
+- `chan_ring3_selftest` and `syscall_harden_selftest`'s ipc bite 9 called
+  `ksyscall(97, CH_MINT, kmalloc(64), 0)`. `CH_MINT` validates its destination with `is_user_range`
+  — `[0x200000, 0x40000000)` — and a kernel heap pointer satisfied that **only by accident**, because
+  `pmm_alloc` hands out [4 MB, 256 MB), which overlaps the user VA window. With the heap on the
+  direct map those pointers are correctly refused, and both selftests began failing at their mint.
+  Fixed by giving them user-window scratch, which every sibling assertion in the same functions
+  already used (`chan MINT` at `u + 704`, `chan endow MINT` at `u + 896`). ⚠ No PRODUCTION path was
+  affected — audited: every non-selftest `ksyscall` caller passes a string literal or a `.bss`
+  global, never heap memory.
+
 ### Known — not fixed in this cut
 
 - **aarch64 does not compile**: 30 reachable undefined functions and 18 undefined variables;
@@ -313,6 +415,8 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   directly and will keep reporting a never-booted run as a wall of failures. The root cause — OVMF
   dropping to the boot-device menu instead of the removable-media path — is unexplained.
 - **`ext2_readlink`'s SLOW path** is unaudited; only the fast-symlink branch was capped.
+- **`ktest.sh`'s in-kernel suite has 6 pre-existing failures** (pmm x2, vfs empty-pipe x1, initrd x3),
+  visible for the first time now that the harness boots at all. Measured identical on a clean tree.
 - **`ring3-smoke` has 4 pre-existing failures** (preempt gate, parent spawn+wait, stress, yield).
   They are NOT from this work — measured identical against `ffdb611`, before any of it. They were
   invisible until the virtio-blk conversion above made the smoke runnable, which is the point:
@@ -324,17 +428,21 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   cursor, some return, some break, some do post-loop work), so a blanket transform is unsafe. The
   `fat_chain_overrun()` predicate and the exact per-site form are in place at the wrapper for
   whoever does that work — including why a module-global step counter is the *wrong* shape for it.
-- **The raw-block write gate (`blk_rw_armed` / `BLK_RW_ARM_MAGIC`) is a plain magic constant any
-  ring-3 caller can send.** Left as-is deliberately: the code already states this and names the seam
-  ("the arm call is the exact seam where an aegis/shakti installer-capability check lands when agnos
-  grows per-proc caps"). It is a documented posture pending per-process capabilities, not an
-  oversight — closing it needs the capability model, not a bigger constant.
+- **The raw-block write gate (`blk_rw_armed` / `BLK_RW_ARM_MAGIC`) is still a plain magic constant
+  any ring-3 caller can send.** Left as-is deliberately: the code already states this and names the
+  seam ("the arm call is the exact seam where an aegis/shakti installer-capability check lands when
+  agnos grows per-proc caps"). It is a documented posture pending per-process capabilities, not an
+  oversight — closing it needs the capability model, not a bigger constant. ⚠ The WINDOW is no longer
+  unbounded: `blk_rw_armed` now clears on `blk_close` (below). Moving the arm below tag validation
+  was tried and REVERTED — it breaks the shipped `blk_open(0, MAGIC)` ABI.
 - **`#92`'s primitive/vertex TOCTOU is unfixed** — it needs the per-primitive array copied into
   kernel staging before validation, the same discipline `gpu_shader_op_sys` already applies to the
-  64-byte records.
+  64-byte records. It is the one P0 of the two that did not land.
 
-Build: `build/agnos` **1,992,968 B** (multiboot2/ELF64, entry `0x1000a8`). `check.sh` 30/30,
-`test.sh` (x86) 4/4.
+Build: `build/agnos` **1,965,592 B** (multiboot2/ELF64, entry `0x1000a8`) — 27,376 B SMALLER than the
+mid-cut 1,992,968 B, because `blit#39`'s 32 KB scale rowbuf left `.bss` for a boot-time PMM region
+rather than growing to 128 KB as a per-CPU array. `check.sh` 30/30, `test.sh` (x86) 4/4,
+`sweep.sh` 19/19, `ktest.sh` 97/6 (those 6 pre-existing).
 
 
 ## [1.56.50] — 2026-08-28 — `#101 readdir_at`: a directory listing that can resume

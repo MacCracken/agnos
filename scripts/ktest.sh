@@ -124,7 +124,17 @@ fi
 KWORK="$ROOT/build/ktest-boot"
 rm -rf "$KWORK"; mkdir -p "$KWORK"
 IMG="$KWORK/ktest.img"
-dd if=/dev/zero of="$IMG" bs=1M count=64 status=none
+# ⛔⛔ 1.56.51 — THE DISK WAS 64 MB AND THAT IS WHY THIS HARNESS BOOTED NOTHING. Every invocation
+# died on "ERROR: test output not found (kernel may have crashed or not reached boot_finish)", which
+# reads as a KERNEL failure and is not one: OVMF never handed off, so the run measured nothing and
+# the in-kernel suite never executed. The 1.56.51 sweep isolated the working cell by a 2x2 over
+# {ESP geometry} x {block device} and recorded it in scripts/smoke/rtc-smoke.sh: ONLY
+# {1MiB..33MiB on a 128 MB disk} x {nvme} hands off. ktest.sh already had the right partition extent
+# and the right device — only the DISK SIZE was still on the old recipe, so it fell outside the
+# measured cell and was never re-tested. With 128 MB the suite runs: 97 passed, 6 failed.
+# ⚠ Do not "simplify" this back to 64 MB because the partition is only 32 MiB. The extent is not
+# the variable that was measured — the pair is.
+dd if=/dev/zero of="$IMG" bs=1M count=128 status=none
 parted -s "$IMG" mklabel gpt mkpart ESP fat32 1MiB 33MiB set 1 esp on
 mformat -i "$IMG"@@1048576 -F
 mmd -i "$IMG"@@1048576 ::EFI ::EFI/BOOT ::boot

@@ -58,7 +58,9 @@ var proc_signals[128];  # 16 processes x 8 bytes
 var proc_sigmask[128];  # 16 processes x 8 bytes
 # 1.44.3 (multi-threading): per-process saved CS/SS selectors so the scheduler can
 # resume a proc to its REAL privilege level — ring-0 (0x08/0x10) for kmain/idle/
-# kthreads, ring-3 (0x1B/0x23) for user procs — instead of proc_restore_context
+# kthreads, ring-3 (0x23/0x1B) for user procs — instead of proc_restore_context
+# (1.56.51: the ring-3 pair was written "0x1B/0x23", inverted; proc_set_ring3 below stores
+# proc_cs = 0x23 and proc_ss = 0x1B. Derivation at sched.cyr's proc_restore_context.)
 # hardcoding ring-0. Parallel pid-indexed arrays (like proc_signals), NOT new
 # Process-struct fields: that would push the slot past 176 B and require changing
 # the `pid * 176` stride at ~16 sites. Default ring-0 so every existing proc
@@ -209,7 +211,7 @@ fn proc_on_cpu_init() { var i = 0; while (i < 16) { store64(&proc_on_cpu + i * 8
 # maps PT_LOADs up to 256 MB, and proc_map_page OVERRIDES the per-proc PD entries it
 # covers — so a large binary (e.g. ark's ~16 MB image, segment to ~20 MB) clobbered PD[7]
 # in its own CR3 and the next CPL3->CPL0 interrupt #PF'd on the vanished stack -> #DF ->
-# triple fault (the "ark won't run" bug). The direct-map (PDPT[8..71], mirrored into every
+# triple fault (the "ark won't run" bug). The direct-map (PDPT[8..directmap_pdpt_top], mirrored into every
 # per-proc CR3, vmm.cyr pmm_setup_directmap) is at 8 GB+, far above ANY user VA (segments
 # <=256 MB, mmap/stack <=~1 GB), and is NEVER overridden by a user segment, so RSP0 is
 # always reachable. The phys stays reserved in region 7; only the VA the CPU loads moves up.
@@ -579,11 +581,12 @@ var cr3w_n = 0;
 fn cr3_install_watch(cr3) {
     if (cr3 == 0) { return 0; }
     if (cr3 == 0x1000) { return 0; }
-    var pml4e = load64(cr3);
+    var pml4e = load64(pmm_kva_for_access(cr3));        # 1.56.51: direct-map walk (ptw_pd_kva header)
     var pdpt_addr = pml4e & 0xFFFFFFFFF000;
-    var pdpte = load64(pdpt_addr);
-    var pd_addr = pdpte & 0xFFFFFFFFF000;
-    var e = load64(pd_addr + 510 * 8);
+    var pdpte = load64(pmm_kva_for_access(pdpt_addr));
+    var pd_addr = pdpte & 0xFFFFFFFFF000;               # RAW PHYS — what the klug lines print
+    var pd_kva = pmm_kva_for_access(pd_addr);           # the handle every deref below uses
+    var e = load64(pd_kva + 510 * 8);
     # SUBJECT CONTROL: log EVERY install of the faulting space 0xffd7000, present-or-absent, so the
     # record proves this path ran for it — not just the anomaly. Bounded to 40 to survive the ring.
     if ((cr3 & 0xFFFFF000) == 0xffd7000) {
@@ -638,6 +641,44 @@ fn cr3_load(cr3_val) {
 # silencing the warning this also closes a latent aarch64-correctness
 # gap: the aarch64 kernel was carrying x86 page-table code in these
 # slots and would have walked wrong memory if any caller had reached it.
+
+# ⛔⛔ 1.56.51 — EVERY PAGE-TABLE DEREFERENCE BELOW GOES THROUGH THE DIRECT MAP, NEVER THROUGH AN
+# IDENTITY VA. A page-table page is a raw PHYSICAL address. Using it as a VIRTUAL address only works
+# while the low identity window still means phys==VA under whatever CR3 the kernel happens to be
+# running on — and it does not. elf.cyr accepts a PT_LOAD anywhere in [0x400000, 0x10000000), which
+# is exactly PD[2..127] of the per-process PD, and proc_map_page's only index math is
+# `pd_idx = (virt >> 21) & 0x1FF`. So a crafted segment at, say, 0xC00000 overwrites PD[6] with a
+# ring-3-writable page and SHADOWS the identity mapping of physical 12-14 MB in that process's own
+# address space — where its PML4/PDPT/PD and the whole kernel heap live, because pmm_alloc hands out
+# [0x400000, 0xFFFF000], a strict subset of the same window. The next `load64(cr3)` under that CR3
+# then reads ATTACKER BYTES as a page-table entry and stores through the result: ring 3 to arbitrary
+# kernel write. pmm.cyr:317-330 asserted the opposite ("the ONLY per-proc PDE override inside
+# PD[0..127] is PD[2]") as a load-bearing invariant, and conceded on the next line that the heap was
+# clear "only by luck of placement".
+# ⭐ THE REMEDY IS THE ONE ALREADY APPLIED TWICE: the PMM bitmap (pmm.cyr:326-330) and the TSS RSP0
+# stack (proc.cyr:363) were both moved off identity onto DIRECTMAP_BASE + phys, which lives in kernel
+# PDPT[8..511] (8 GB+). proc_create_address_space mirrors kernel PDPT[1..511] into every per-process
+# PDPT, so that alias resolves under EVERY CR3; and no user segment can reach it, because the loaders
+# cap p_vaddr + p_memsz at 0x10000000 — PDPT[0]. Narrowing that ceiling would shrink the window
+# without closing the class; this closes it.
+# ⚠ ONLY THE ADDRESS MOVES. The VALUE stored in a PDE stays a raw physical page number — the CPU's
+# own page walker is physical and none of this touches it.
+# ⛔ ORDERING: the direct map is installed by pmm_setup_directmap at main.cyr:236. The earliest
+# caller of anything below is main.cyr:2596. Do not add a caller ahead of that line.
+#
+# ptw_pd_kva(cr3) — walk PML4[0] -> PDPT[0] -> PD and return the PD's DIRECT-MAP kernel VA, or 0 if
+# the chain is broken. 0 was previously "walk garbage and store through it"; callers now bail.
+fn ptw_pd_kva(cr3) {
+    if (cr3 == 0) { return 0; }
+    var pml4e = load64(pmm_kva_for_access(cr3));
+    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+    if (pdpt_addr == 0) { return 0; }
+    var pdpte = load64(pmm_kva_for_access(pdpt_addr));
+    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    if (pd_addr == 0) { return 0; }
+    return pmm_kva_for_access(pd_addr);
+}
+
 fn proc_create_address_space() {
     # Repair (J) — Attempt 23: bump the global call counter and compute the
     # CMOS slot base for this invocation's 6 pmm_alloc stamps. Only the first
@@ -659,15 +700,23 @@ fn proc_create_address_space() {
     if (pca_stamp_base != 0) { outb(0x70, pca_stamp_base + 2); outb(0x71, (new_pd >> 16) & 0xFF); }
     if (new_pd == 0) { pmm_free(new_pml4); pmm_free(new_pdpt); return 0; }
 
+    # 1.56.51 — the three tables are ZEROED AND BUILT THROUGH THE DIRECT MAP, not through their
+    # phys==VA identity alias. This function runs under the CALLER's CR3, and the caller may be a
+    # ring-3 process whose own PT_LOAD shadowed PD[2..127] — the very window pmm_alloc draws these
+    # pages from. See the ptw_pd_kva header. The VALUES written stay raw phys.
+    var kml4 = pmm_kva_for_access(new_pml4);
+    var kpdpt = pmm_kva_for_access(new_pdpt);
+    var kpd = pmm_kva_for_access(new_pd);
+
     # Zero all three pages
-    memset(new_pml4, 0, 4096);
-    memset(new_pdpt, 0, 4096);
-    memset(new_pd, 0, 4096);
+    memset(kml4, 0, 4096);
+    memset(kpdpt, 0, 4096);
+    memset(kpd, 0, 4096);
 
     # PML4[0] → PDPT (present + writable + user)
-    store64(new_pml4, new_pdpt | 0x07);
+    store64(kml4, new_pdpt | 0x07);
     # PDPT[0] → PD (present + writable + user)
-    store64(new_pdpt, new_pd | 0x07);
+    store64(kpdpt, new_pd | 0x07);
 
     # Copy kernel PD entries [0..127] from kernel PD at 0x3000 — covers
     # 0 GB through 256 MB (0x10000000), the kernel/identity half of the
@@ -682,8 +731,8 @@ fn proc_create_address_space() {
     # triple-fault in the memory-isolation test once the kernel started
     # living past 16 MB.
     for (var i = 0; i < 128; i = i + 1) {
-        var entry = load64(0x3000 + i * 8);
-        store64(new_pd + i * 8, entry);
+        var entry = load64(pmm_kva_for_access(0x3000) + i * 8);
+        store64(kpd + i * 8, entry);
     }
     # 1.43.x: the boot identity map the copy above inherits only covers 0-16MB
     # (PD[0..7]). The PMM 2MB pool now reaches 128MB (regions 8-63 = phys
@@ -695,7 +744,7 @@ fn proc_create_address_space() {
     # ring 3 out; user code/stack live in PD[2]/PD[4] and the mmap arena in
     # PD[128+], so no user VA resolves through these slots (no aliasing).
     for (var hi = 8; hi < 128; hi = hi + 1) {     # 1.49.6: 16-256MB (was 16-128MB) — full identity window
-        store64(new_pd + hi * 8, (hi * 0x200000) | 0x83);
+        store64(kpd + hi * 8, (hi * 0x200000) | 0x83);
     }
     # Direction B (page-map fragility, issue 2026-06-04): leave the mmap-arena
     # PD slots [128..510] — covering [0x10000000, 0x3FE00000), the arena
@@ -712,7 +761,7 @@ fn proc_create_address_space() {
     # win. Kernel slots [0..127] are untouched above. Entry 511 is the
     # user-CR3 stash (overwritten below), so this loop stops at 510.
     for (var ai = 128; ai < 511; ai = ai + 1) {
-        store64(new_pd + ai * 8, 0);
+        store64(kpd + ai * 8, 0);
     }
     # Mirror ALL present kernel PDPT entries [1..511], not just the 1–4 GB
     # huge pages. vmm_remap_uc_2mb / vmm_remap_wc_2mb (vmm.cyr) install
@@ -726,7 +775,7 @@ fn proc_create_address_space() {
     # so ring 3 still can't reach them — protection holds. (Entries that are
     # absent in the kernel PDPT copy as 0 = not-present, which is harmless.)
     for (var pi = 1; pi < 512; pi = pi + 1) {
-        store64(new_pdpt + pi * 8, load64(0x2000 + pi * 8));
+        store64(kpdpt + pi * 8, load64(pmm_kva_for_access(0x2000) + pi * 8));
     }
     # Mirror present kernel PML4 entries [1..511] too — vmm_remap_*'s
     # pml4_idx > 0 branch (phys ≥ 512 GB) installs whole high PDPTs directly
@@ -734,7 +783,7 @@ fn proc_create_address_space() {
     # reach them. PML4[0] stays our custom new_pdpt (set above); [1..511]
     # share the kernel's (supervisor-only, so ring 3 is still walled off).
     for (var mi = 1; mi < 512; mi = mi + 1) {
-        store64(new_pml4 + mi * 8, load64(0x1000 + mi * 8));
+        store64(kml4 + mi * 8, load64(pmm_kva_for_access(0x1000) + mi * 8));
     }
 
     # 1.40.3 collapsed the KPTI split for ring-3 bring-up: the minimal user CR3
@@ -756,7 +805,7 @@ fn proc_create_address_space() {
     # address-space construction now allocates exactly 3 page-table pages
     # (new_pml4/new_pdpt/new_pd), all reachable and all freed by
     # proc_free_address_space on teardown.
-    store64(new_pd + 511 * 8, new_pml4);
+    store64(kpd + 511 * 8, new_pml4);          # VALUE stays raw phys — proc_get_user_cr3 reads it back
 
     # ELF_PDE_PROBE: record every address-space ALLOCATION. Paired with the FREE record in
     # proc_free_address_space, this shows whether one PML4 is handed out twice — and if so whether a
@@ -819,16 +868,21 @@ fn proc_create_address_space() {
 fn proc_free_address_space(cr3) {
     if (cr3 == 0) { return 0 - 1; }
     if (cr3 == 0x1000) { return 0 - 1; }   # boot/kernel CR3 — never free its tables
-    var pml4e = load64(cr3);
+    # 1.56.51: the whole teardown walk goes through the direct map — see the ptw_pd_kva header.
+    var pml4e = load64(pmm_kva_for_access(cr3));
     var pdpt = pml4e & 0xFFFFFFFFF000;
-    var pdpte = load64(pdpt);
+    if (pdpt == 0) { return 0 - 1; }
+    var pdpt_kva = pmm_kva_for_access(pdpt);
+    var pdpte = load64(pdpt_kva);
     var pd = pdpte & 0xFFFFFFFFF000;
+    if (pd == 0) { return 0 - 1; }
+    var pd_kva = pmm_kva_for_access(pd);
     # Free user huge pages: present + user-bit set, across the FULL user PD range
     # 1..511 (covers ELF/stack AND the whole mmap arena 128..511). Supervisor
     # (kernel-mirror) and not-present entries are skipped; the index-511 stash
     # slot has no flag bits so it's skipped too.
     for (var i = 1; i < 512; i = i + 1) {
-        var e = load64(pd + i * 8);
+        var e = load64(pd_kva + i * 8);
         if ((e & 0x01) != 0) {
             if ((e & 0x04) != 0) {
                 pmm_free_2mb(e & 0x000FFFFFFFE00000);
@@ -839,18 +893,20 @@ fn proc_free_address_space(cr3) {
     # per-process PDs at PDPT[128..511] (VA >= 128 GB) on demand; the 0-1 GB PD
     # sweep above only walks PDPT[0]'s PD, so without this every process that
     # touched the high arena would leak its PDs + 2 MB pages on exit. The kernel
-    # never uses PDPT[128..511] (the <=64 GB direct-map tops at PDPT[71]), so any
+    # never uses PDPT[128..511] on this machine (1.56.51: the direct map tops at
+    # `directmap_pdpt_top`, recorded by pmm_setup_directmap — NOT the fixed PDPT[71] this comment
+    # used to assert; see the USER_HIMMAP_BASE header), so any
     # entry here that is PRESENT + USER (proc_map_page_hi sets 0x07, kernel entries
     # are supervisor) is a per-process arena PD: free its present+user 2 MB pages,
     # then the PD page itself. Procs that never mmap'd high find all-zero entries
     # (one cheap 384-entry scan).
     for (var hpi = 128; hpi < 512; hpi = hpi + 1) {
-        var hpe = load64(pdpt + hpi * 8);
+        var hpe = load64(pdpt_kva + hpi * 8);
         if ((hpe & 0x01) != 0) {
             if ((hpe & 0x04) != 0) {
                 var hpd = hpe & 0xFFFFFFFFF000;
                 for (var hj = 0; hj < 512; hj = hj + 1) {
-                    var he = load64(hpd + hj * 8);
+                    var he = load64(pmm_kva_for_access(hpd) + hj * 8);
                     if ((he & 0x01) != 0) {
                         if ((he & 0x04) != 0) {
                             pmm_free_2mb(he & 0x000FFFFFFFE00000);
@@ -995,11 +1051,19 @@ fn proc_reap_child(pid) {
 # Retrieve user CR3 from kernel page tables (stored in PD entry 511)
 fn proc_get_user_cr3(kernel_cr3) {
     if (kernel_cr3 == 0x1000) { return 0x1000; }  # Boot page tables, no KPTI
-    var pml4e = load64(kernel_cr3);
-    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
-    var pdpte = load64(pdpt_addr);
-    var pd_addr = pdpte & 0xFFFFFFFFF000;
-    return load64(pd_addr + 511 * 8);
+    var pd_kva = ptw_pd_kva(kernel_cr3);          # 1.56.51: direct-map walk, never an identity VA
+    # ⛔ A BROKEN CHAIN RETURNS kernel_cr3, NOT 0. This value's only consumer is
+    # pcpu_kpti_user_cr3, which the SYSCALL exit stub loads straight into CR3
+    # (syscall_hw.cyr `mov r10,[r8*8+&pcpu_kpti_user_cr3]; mov cr3,r10`) — so returning 0 here
+    # would be a guaranteed triple fault on the next syscall. KPTI has been COLLAPSED since
+    # 1.40.3 (PD[511] stashes new_pml4, i.e. this same CR3), so kernel_cr3 is the self-consistent
+    # answer and is what a healthy walk returns anyway. Unreachable in practice — every CR3 from
+    # proc_create_address_space has a non-zero PML4[0]/PDPT[0] — but the fallback must be the
+    # safe one, not the loud one.
+    if (pd_kva == 0) { return kernel_cr3; }
+    var stash = load64(pd_kva + 511 * 8);
+    if (stash == 0) { return kernel_cr3; }        # same reasoning: never hand back 0
+    return stash;
 }
 
 # 1.50.7: the proc's REAL parent pid (was a stub returning 0 always, which left kill#16's
@@ -1085,22 +1149,20 @@ fn invlpg_va(va) {
 }
 
 fn proc_map_page(cr3, virt, phys) {
-    # Get PD address from PML4 → PDPT → PD chain (x86 — see #ifdef above)
-    var pml4e = load64(cr3);
-    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
-    var pdpte = load64(pdpt_addr);
-    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    # Get PD address from PML4 → PDPT → PD chain (x86 — see #ifdef above).
+    # 1.56.51: through the direct map — see the ptw_pd_kva header for why identity is unsafe here.
+    var pd_kva = ptw_pd_kva(cr3);
+    if (pd_kva == 0) { return 0 - 1; }
     # Write PD entry in kernel page tables
     var pd_idx = (virt >> 21) & 0x1FF;
-    store64(pd_addr + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x87);
+    store64(pd_kva + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x87);
     # S8 (KPTI): also map in user page tables so ring-3 can access user pages
-    var u_cr3 = load64(pd_addr + 511 * 8);
+    var u_cr3 = load64(pd_kva + 511 * 8);
     if (u_cr3 != 0) {
-        var u_pml4e = load64(u_cr3);
-        var u_pdpt = u_pml4e & 0xFFFFFFFFF000;
-        var u_pdpte = load64(u_pdpt);
-        var u_pd = u_pdpte & 0xFFFFFFFFF000;
-        store64(u_pd + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x87);
+        var u_pd_kva = ptw_pd_kva(u_cr3);
+        if (u_pd_kva != 0) {
+            store64(u_pd_kva + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x87);
+        }
     }
     invlpg_va(virt);            # flush the (possibly stale not-present) 2 MB TLB entry
     return 0;
@@ -1135,38 +1197,32 @@ fn proc_map_page(cr3, virt, phys) {
 # makes this enforceable at PDE granularity at all. The RWX binaries in the tree are stale builds
 # from an older cyrius; the loaders now REFUSE that shape rather than quietly granting it.
 fn proc_map_page_rx(cr3, virt, phys) {
-    var pml4e = load64(cr3);
-    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
-    var pdpte = load64(pdpt_addr);
-    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    var pd_kva = ptw_pd_kva(cr3);                 # 1.56.51: direct-map walk (see ptw_pd_kva header)
+    if (pd_kva == 0) { return 0 - 1; }
     var pd_idx = (virt >> 21) & 0x1FF;
-    store64(pd_addr + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x85);
-    var u_cr3 = load64(pd_addr + 511 * 8);
+    store64(pd_kva + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x85);
+    var u_cr3 = load64(pd_kva + 511 * 8);
     if (u_cr3 != 0) {
-        var u_pml4e = load64(u_cr3);
-        var u_pdpt = u_pml4e & 0xFFFFFFFFF000;
-        var u_pdpte = load64(u_pdpt);
-        var u_pd = u_pdpte & 0xFFFFFFFFF000;
-        store64(u_pd + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x85);
+        var u_pd_kva = ptw_pd_kva(u_cr3);
+        if (u_pd_kva != 0) {
+            store64(u_pd_kva + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x85);
+        }
     }
     invlpg_va(virt);
     return 0;
 }
 
 fn proc_map_page_nx(cr3, virt, phys) {
-    var pml4e = load64(cr3);
-    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
-    var pdpte = load64(pdpt_addr);
-    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    var pd_kva = ptw_pd_kva(cr3);                 # 1.56.51: direct-map walk (see ptw_pd_kva header)
+    if (pd_kva == 0) { return 0 - 1; }
     var pd_idx = (virt >> 21) & 0x1FF;
-    store64(pd_addr + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x8000000000000087);
-    var u_cr3 = load64(pd_addr + 511 * 8);
+    store64(pd_kva + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x8000000000000087);
+    var u_cr3 = load64(pd_kva + 511 * 8);
     if (u_cr3 != 0) {
-        var u_pml4e = load64(u_cr3);
-        var u_pdpt = u_pml4e & 0xFFFFFFFFF000;
-        var u_pdpte = load64(u_pdpt);
-        var u_pd = u_pdpte & 0xFFFFFFFFF000;
-        store64(u_pd + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x8000000000000087);
+        var u_pd_kva = ptw_pd_kva(u_cr3);
+        if (u_pd_kva != 0) {
+            store64(u_pd_kva + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x8000000000000087);
+        }
     }
     invlpg_va(virt);
     return 0;
@@ -1266,11 +1322,12 @@ var pd_trip_seen = 0;
 fn pd_tripwire(cr3, tag) {
     if (cr3 == 0) { return 0; }
     if (cr3 == 0x1000) { return 0; }
-    var pml4e = load64(cr3);
+    var pml4e = load64(pmm_kva_for_access(cr3));        # 1.56.51: direct-map walk (ptw_pd_kva header)
     var pdpt_addr = pml4e & 0xFFFFFFFFF000;
-    var pdpte = load64(pdpt_addr);
-    var pd_addr = pdpte & 0xFFFFFFFFF000;
-    var e = load64(pd_addr + 510 * 8);
+    var pdpte = load64(pmm_kva_for_access(pdpt_addr));
+    var pd_addr = pdpte & 0xFFFFFFFFF000;               # RAW PHYS — what the klug lines print
+    var pd_kva = pmm_kva_for_access(pd_addr);           # the handle every deref below uses
+    var e = load64(pd_kva + 510 * 8);
     # ⚠ VALIDATE THE INSTRUMENT: log the PD this tripwire is actually WATCHING, a bounded number of
     # times. "Never fires" is worthless if it is watching a different PD than the one that faults.
     if (pd_trip_seen < 4) {
@@ -1295,7 +1352,7 @@ fn pd_tripwire(cr3, tag) {
     klug_append(" pd510=0x", 9);
     epp_hex(e);
     klug_append(" pd2=0x", 7);
-    epp_hex(load64(pd_addr + 2 * 8) & 0x000FFFFFFFE00000);
+    epp_hex(load64(pd_kva + 2 * 8) & 0x000FFFFFFFE00000);
     klug_append(" by=", 4);
     epp_hex(proc_current_get());
     klug_append(" cpu=", 5);
@@ -1304,15 +1361,16 @@ fn pd_tripwire(cr3, tag) {
     return 0;
 }
 fn pd_audit(cr3, tag) {
-    var pml4e = load64(cr3);
+    var pml4e = load64(pmm_kva_for_access(cr3));        # 1.56.51: direct-map walk (ptw_pd_kva header)
     var pdpt_addr = pml4e & 0xFFFFFFFFF000;
-    var pdpte = load64(pdpt_addr);
-    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    var pdpte = load64(pmm_kva_for_access(pdpt_addr));
+    var pd_addr = pdpte & 0xFFFFFFFFF000;               # RAW PHYS — what the klug lines print
+    var pd_kva = pmm_kva_for_access(pd_addr);           # the handle every deref below uses
     var nuser = 0;
     var bits = 0;
     var i = 0;
     while (i < 16) {                       # image region idx 0..15 as a bitmask
-        var e = load64(pd_addr + i * 8);
+        var e = load64(pd_kva + i * 8);
         if ((e & 1) != 0) {
             if ((e & 4) != 0) { bits = bits | (1 << i); }
         }
@@ -1320,13 +1378,13 @@ fn pd_audit(cr3, tag) {
     }
     i = 0;
     while (i < 512) {
-        var e2 = load64(pd_addr + i * 8);
+        var e2 = load64(pd_kva + i * 8);
         if ((e2 & 1) != 0) {
             if ((e2 & 4) != 0) { nuser = nuser + 1; }
         }
         i = i + 1;
     }
-    var stk = load64(pd_addr + 510 * 8);
+    var stk = load64(pd_kva + 510 * 8);
     klug_append("pdaudit tag=", 12);
     epp_hex(tag);
     klug_append(" as=0x", 6);
@@ -1427,11 +1485,12 @@ fn pd510_tick_watch() {
     if (cr3 == 0) { return 0; }
     if (cr3 == 0x1000) { return 0; }
     if ((cr3 & 0xFFFFF000) != 0xffd7000) { return 0; }
-    var pml4e = load64(cr3);
+    var pml4e = load64(pmm_kva_for_access(cr3));        # 1.56.51: direct-map walk (ptw_pd_kva header)
     var pdpt_addr = pml4e & 0xFFFFFFFFF000;
-    var pdpte = load64(pdpt_addr);
-    var pd_addr = pdpte & 0xFFFFFFFFF000;
-    var pdev = load64(pd_addr + 510 * 8);
+    var pdpte = load64(pmm_kva_for_access(pdpt_addr));
+    var pd_addr = pdpte & 0xFFFFFFFFF000;               # RAW PHYS — what the klug lines print
+    var pd_kva = pmm_kva_for_access(pd_addr);           # the handle every deref below uses
+    var pdev = load64(pd_kva + 510 * 8);
     t510_seen = t510_seen + 1;
     if (pdev == t510_last) { return 0; }     # no change — stay quiet
     t510_last = pdev;
@@ -1467,12 +1526,13 @@ fn epp_hex(v) {
 }
 # tag: 0 = a PT_LOAD segment page, 1 = the user stack page.
 fn elf_pde_probe(cr3, virt, phys, tag) {
-    var pml4e = load64(cr3);
+    var pml4e = load64(pmm_kva_for_access(cr3));        # 1.56.51: direct-map walk (ptw_pd_kva header)
     var pdpt_addr = pml4e & 0xFFFFFFFFF000;
-    var pdpte = load64(pdpt_addr);
-    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    var pdpte = load64(pmm_kva_for_access(pdpt_addr));
+    var pd_addr = pdpte & 0xFFFFFFFFF000;               # RAW PHYS — what the klug lines print
+    var pd_kva = pmm_kva_for_access(pd_addr);           # the handle every deref below uses
     var pd_idx = (virt >> 21) & 0x1FF;
-    var got = load64(pd_addr + pd_idx * 8);
+    var got = load64(pd_kva + pd_idx * 8);
     var want_phys = phys & 0xFFFFFFFFFFE00000;
     var got_phys = got & 0x000FFFFFFFE00000;
     # ⭐⭐ THE USER-SIDE MIRROR IS A SECOND, DIFFERENT TABLE — AND IT IS THE ONE RING 3 RUNS ON.
@@ -1481,15 +1541,12 @@ fn elf_pde_probe(cr3, virt, phys, tag) {
     # which for a ring-3 fault is the USER PML4. So a probe that checks only the kernel-view PD can
     # report MATCH on every page while the table the CPU actually consults is empty. Checking one
     # table and concluding about the other is how this probe nearly produced a false root cause.
-    var u_cr3 = load64(pd_addr + 511 * 8);
+    var u_cr3 = load64(pd_kva + 511 * 8);
     var u_got = 0;
     var u_present = 0;
     if (u_cr3 != 0) {
-        var u_pml4e = load64(u_cr3);
-        var u_pdpt = u_pml4e & 0xFFFFFFFFF000;
-        var u_pdpte = load64(u_pdpt);
-        var u_pd = u_pdpte & 0xFFFFFFFFF000;
-        u_got = load64(u_pd + pd_idx * 8);
+        var u_pd_kva = ptw_pd_kva(u_cr3);              # 1.56.51: direct-map walk
+        if (u_pd_kva != 0) { u_got = load64(u_pd_kva + pd_idx * 8); }
         u_present = 1;
     }
     var u_got_phys = u_got & 0x000FFFFFFFE00000;
@@ -1542,33 +1599,48 @@ fn pd_tripwire(cr3, tag) { return 0; }
 # mmap arena (VA >= USER_HIMMAP_BASE = 128 GB). proc_map_page only ever touches
 # PDPT[0]'s single 0-1 GB PD; a high VA needs its OWN per-process PDPT entry +
 # PD, neither of which exists until the first map. The high arena lives at
-# PDPT[128..511] (>= 128 GB) — chosen ABOVE the <=64 GB direct-map (PDPT[8..71])
+# PDPT[128..511] (>= 128 GB) — chosen above the direct map (1.56.51: whose top is
+# `directmap_pdpt_top`, recorded by pmm_setup_directmap; this comment used to assert a fixed
+# PDPT[8..71] ceiling that the code never enforced — see the USER_HIMMAP_BASE header)
 # and clear of every device BAR + the framebuffer (all PDPT[0..3]), so a PRESENT
 # entry in that range is unambiguously a per-process arena PD, never a shared
 # kernel entry. That is what lets teardown free it safely (proc_free_address_space).
 # On-demand: if the per-proc PDPT[hi] is absent, allocate a zero-filled PD
-# (pmm_alloc — 4 KB, <=256 MB identity, so reachable by its phys==VA here) and
+# (pmm_alloc — 4 KB; 1.56.51 zeroes and writes it through pmm_kva_for_access, NOT its phys==VA,
+# which is the identity alias a crafted PT_LOAD can shadow — see the ptw_pd_kva header) and
 # install it user (0x07); then write the 2 MB user PDE (0x87). KPTI is collapsed
 # (PD[511]==new_pml4==this CR3), so there is no separate user table to mirror.
 # Bite 1a (1.50.2): the mapper itself, verified hermetically by MMAP_HIMEM_SELFTEST;
 # sys_mmap routing + teardown are bite 1b. Returns 0 on success, -1 on PD-alloc fail.
 fn proc_map_page_hi(cr3, virt, phys) {
-    var pml4e = load64(cr3);
+    if (cr3 == 0) { return 0 - 1; }
+    var pml4e = load64(pmm_kva_for_access(cr3));               # 1.56.51: direct-map walk throughout
     var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+    if (pdpt_addr == 0) { return 0 - 1; }
+    var pdpt_kva = pmm_kva_for_access(pdpt_addr);
     var pdpt_idx = (virt >> 30) & 0x1FF;
-    var pdpte = load64(pdpt_addr + pdpt_idx * 8);
+    var pdpte = load64(pdpt_kva + pdpt_idx * 8);
     var pd_addr = 0;
     if ((pdpte & 1) == 0) {
         pd_addr = pmm_alloc();
         if (pd_addr == 0) { return 0 - 1; }
-        for (var z = 0; z < 512; z = z + 1) { store64(pd_addr + z * 8, 0); }
+        var npd_kva = pmm_kva_for_access(pd_addr);
+        for (var z = 0; z < 512; z = z + 1) { store64(npd_kva + z * 8, 0); }
         ptpage_register(pd_addr);
-        store64(pdpt_addr + pdpt_idx * 8, pd_addr | 0x07);     # present + RW + user
+        store64(pdpt_kva + pdpt_idx * 8, pd_addr | 0x07);      # present + RW + user — VALUE stays raw phys
     } else {
+        # ⛔ 1.56.51 — A PRESENT ENTRY IS ONLY OURS IF IT IS A **USER** ENTRY. Kernel PDPT entries
+        # are mirrored into every per-process PDPT by proc_create_address_space and carry U/S=0;
+        # the direct map installs exactly such entries, and (see the USER_HIMMAP_BASE header) its
+        # reach is PDPT[8..511], not the PDPT[8..71] the old comments claimed. Adopting one here
+        # would write a per-process user PDE into a page table the kernel and every other process
+        # share. Refuse instead — himmap_reserve's floor should already keep us clear of them, so
+        # reaching this is a bug somewhere else and must not be papered over.
+        if ((pdpte & 0x04) == 0) { return 0 - 1; }
         pd_addr = pdpte & 0xFFFFFFFFF000;
     }
     var pd_idx = (virt >> 21) & 0x1FF;
-    store64(pd_addr + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x8000000000000087);   # NX (1.50.5 W^X — anon arena)
+    store64(pmm_kva_for_access(pd_addr) + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x8000000000000087);   # NX (1.50.5 W^X — anon arena)
     invlpg_va(virt);
     return 0;
 }
@@ -1582,19 +1654,22 @@ fn proc_map_page_hi(cr3, virt, phys) {
 # process exit — bounded: <=384 PDs * 4 KB for the whole arena). 1.50.3. Returns 1
 # if a page was freed, 0 otherwise (absent / already-unmapped — idempotent).
 fn proc_unmap_2mb_hi(cr3, virt) {
-    var pml4e = load64(cr3);
+    if (cr3 == 0) { return 0; }
+    var pml4e = load64(pmm_kva_for_access(cr3));        # 1.56.51: direct-map walk throughout
     var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+    if (pdpt_addr == 0) { return 0; }
     var pdpt_idx = (virt >> 30) & 0x1FF;
-    var pdpte = load64(pdpt_addr + pdpt_idx * 8);
+    var pdpte = load64(pmm_kva_for_access(pdpt_addr) + pdpt_idx * 8);
     if ((pdpte & 0x01) == 0) { return 0; }              # PDPT entry absent — nothing mapped
     var pd_addr = pdpte & 0xFFFFFFFFF000;
+    var pd_kva = pmm_kva_for_access(pd_addr);
     var pd_idx = (virt >> 21) & 0x1FF;
-    var entry = load64(pd_addr + pd_idx * 8);
+    var entry = load64(pd_kva + pd_idx * 8);
     unmap_probe(cr3, virt, pd_idx, entry, 1);
     if ((entry & 0x01) == 0) { return 0; }              # PDE not present
     if ((entry & 0x04) == 0) { return 0; }              # not user — never free a kernel page
     var phys = entry & 0x000FFFFFFFE00000;
-    store64(pd_addr + pd_idx * 8, 0);                   # clear the PDE
+    store64(pd_kva + pd_idx * 8, 0);                    # clear the PDE
     invlpg_va(virt);
     tlb_shootdown_all();                                # other CPUs may still cache this translation
     pmm_free_2mb(phys);
@@ -1608,7 +1683,11 @@ fn proc_unmap_2mb_hi(cr3, virt) {
 # the NORMAL ESP-only deployment), and a blind load8 of an unmapped-but-in-range garbage VA
 # would #PF the handler. This walks the CALLER's page tables under boot-CR3 identity instead
 # (table pages are physical addresses — the same chain proc_map_page writes above), requires
-# each 2 MB PDE to be Present+User+PS, and copies via the identity-mapped physical page.
+# each 2 MB PDE to be Present+User+PS, and copies via the DIRECT-MAP alias of the physical page.
+# ⚠ 1.56.51: not the identity alias it used until then. A user data page whose phys lands in
+# PD[2..127] has a US=1 identity PDE under the caller's own CR3, so a CPL=0 load8 through it is a
+# SMAP violation — and PD[2..127] is also the window a crafted PT_LOAD can shadow. The direct map is
+# supervisor (0x83) and out of reach of any user segment. See the ptw_pd_kva header.
 # Returns 1 on success, 0 on ANY absent/non-user/non-huge mapping — the caller treats 0 as
 # "no env" (fallback to the default), never an error. VAs are < 1 GB (is_user_range), so
 # PML4[0]/PDPT[0] indices are 0 — mirroring proc_map_page's walk.
@@ -1616,13 +1695,13 @@ fn proc_copy_from_user(cr3, dst, uva, len) {
     var copied = 0;
     while (copied < len) {
         var va = uva + copied;
-        var pml4e = load64(cr3);
+        var pml4e = load64(pmm_kva_for_access(cr3));    # 1.56.51: direct-map walk throughout
         if ((pml4e & 1) == 0) { return 0; }
         var pdpt_addr = pml4e & 0xFFFFFFFFF000;
-        var pdpte = load64(pdpt_addr);
+        var pdpte = load64(pmm_kva_for_access(pdpt_addr));
         if ((pdpte & 1) == 0) { return 0; }
         var pd_addr = pdpte & 0xFFFFFFFFF000;
-        var pde = load64(pd_addr + ((va >> 21) & 0x1FF) * 8);
+        var pde = load64(pmm_kva_for_access(pd_addr) + ((va >> 21) & 0x1FF) * 8);
         if ((pde & 1) == 0) { return 0; }      # not present
         if ((pde & 4) == 0) { return 0; }      # not a user page
         if ((pde & 0x80) == 0) { return 0; }   # not a 2 MB huge page (unexpected shape)
@@ -1631,7 +1710,8 @@ fn proc_copy_from_user(cr3, dst, uva, len) {
         var chunk = 0x200000 - off;
         if (chunk > len - copied) { chunk = len - copied; }
         var k = 0;
-        while (k < chunk) { store8(dst + copied + k, load8(page_phys + off + k)); k = k + 1; }
+        var page_kva = pmm_kva_for_access(page_phys);   # 1.56.51: direct map, never the identity alias
+        while (k < chunk) { store8(dst + copied + k, load8(page_kva + off + k)); k = k + 1; }
         copied = copied + chunk;
     }
     return 1;
@@ -1661,13 +1741,13 @@ fn proc_copy_to_user(cr3, uva, src, len) {
     var copied = 0;
     while (copied < len) {
         var va = uva + copied;
-        var pml4e = load64(cr3);
+        var pml4e = load64(pmm_kva_for_access(cr3));    # 1.56.51: direct-map walk throughout
         if ((pml4e & 1) == 0) { return 0; }
         var pdpt_addr = pml4e & 0xFFFFFFFFF000;
-        var pdpte = load64(pdpt_addr);
+        var pdpte = load64(pmm_kva_for_access(pdpt_addr));
         if ((pdpte & 1) == 0) { return 0; }
         var pd_addr = pdpte & 0xFFFFFFFFF000;
-        var pde = load64(pd_addr + ((va >> 21) & 0x1FF) * 8);
+        var pde = load64(pmm_kva_for_access(pd_addr) + ((va >> 21) & 0x1FF) * 8);
         if ((pde & 1) == 0) { return 0; }      # not present
         if ((pde & 2) == 0) { return 0; }      # ⭐ NOT WRITABLE — the check the read-side twin lacks
         if ((pde & 4) == 0) { return 0; }      # not a user page
@@ -1677,7 +1757,8 @@ fn proc_copy_to_user(cr3, uva, src, len) {
         var chunk = 0x200000 - off;
         if (chunk > len - copied) { chunk = len - copied; }
         var k = 0;
-        while (k < chunk) { store8(page_phys + off + k, load8(src + copied + k)); k = k + 1; }
+        var page_kva = pmm_kva_for_access(page_phys);   # 1.56.51: direct map, never the identity alias
+        while (k < chunk) { store8(page_kva + off + k, load8(src + copied + k)); k = k + 1; }
         copied = copied + chunk;
     }
     return 1;
@@ -1702,30 +1783,28 @@ fn proc_copy_to_user(cr3, uva, src, len) {
 # what was killing agnsh after exec (CR2=0x?fee000 / CR3=same): the loader's
 # guard unmap on pid 2 deleted PD[7], the home of agnsh's page tables.
 fn proc_unmap_page(cr3, virt) {
-    # x86 page-table walk — see #ifdef ARCH_X86_64 above
-    var pml4e = load64(cr3);
-    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
-    var pdpte = load64(pdpt_addr);
-    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    # x86 page-table walk — see #ifdef ARCH_X86_64 above.
+    # 1.56.51: through the direct map — see the ptw_pd_kva header.
+    var pd_kva = ptw_pd_kva(cr3);
+    if (pd_kva == 0) { return 0 - 1; }
     var pd_idx = (virt >> 21) & 0x1FF;
-    var k_entry = load64(pd_addr + pd_idx * 8);
+    var k_entry = load64(pd_kva + pd_idx * 8);
     # ELF_PDE_PROBE: a GUARD unmap should find NOTHING. If this clears a PRESENT user entry it has
     # just destroyed a live mapping — the exact failure this function caused once before ("the
     # loader's guard unmap on pid 2 deleted PD[7], the home of agnsh's page tables").
     unmap_probe(cr3, virt, pd_idx, k_entry, 0);
     if ((k_entry & 0x04) != 0) {            # user page only — never a kernel PDE
-        store64(pd_addr + pd_idx * 8, 0);
+        store64(pd_kva + pd_idx * 8, 0);
     }
     # S8 (KPTI): also unmap in user page tables (same user-only guard)
-    var u_cr3 = load64(pd_addr + 511 * 8);
+    var u_cr3 = load64(pd_kva + 511 * 8);
     if (u_cr3 != 0) {
-        var u_pml4e = load64(u_cr3);
-        var u_pdpt = u_pml4e & 0xFFFFFFFFF000;
-        var u_pdpte = load64(u_pdpt);
-        var u_pd = u_pdpte & 0xFFFFFFFFF000;
-        var u_entry = load64(u_pd + pd_idx * 8);
-        if ((u_entry & 0x04) != 0) {
-            store64(u_pd + pd_idx * 8, 0);
+        var u_pd_kva = ptw_pd_kva(u_cr3);
+        if (u_pd_kva != 0) {
+            var u_entry = load64(u_pd_kva + pd_idx * 8);
+            if ((u_entry & 0x04) != 0) {
+                store64(u_pd_kva + pd_idx * 8, 0);
+            }
         }
     }
     # A cleared PDE is only cleared on THIS CPU until every other CPU drops its cached translation.
@@ -1743,10 +1822,25 @@ fn proc_unmap_page(cr3, virt) {
 var mmap_next_vaddr = 0x10000000;
 
 # HIGH user mmap arena. [USER_HIMMAP_BASE, HIMMAP_CEILING) = [128 GB, 512 GB),
-# backed by the direct-map, mapped via proc_map_page_hi into per-proc PDPT[128..511].
-# 128 GB is ABOVE the <=64 GB direct-map (PDPT[8..71]) and clear of every device BAR +
-# the FB (PDPT[0..3]), so its PDs are unambiguously per-process (freed by
-# proc_free_address_space). 1.50.4: the bump cursor is PER-PROCESS (proc_himmap_next,
+# mapped via proc_map_page_hi into per-proc PDPT[128..511], clear of every device BAR +
+# the FB (PDPT[0..3]).
+#
+# ⛔⛔ 1.56.51 — "128 GB IS ABOVE THE <=64 GB DIRECT-MAP (PDPT[8..71])" WAS FALSE, and the same
+# sentence appeared three times (here, at proc_map_page_hi, and in proc_free_address_space). There
+# is no 64 GB ceiling on the direct map: pmm_setup_directmap sizes itself from the RAW
+# pmm_memmap_ram_top and clamps only at 504 GB, so its reach is PDPT[8..511]. The 64 GB number
+# came from pmm_migrate_bitmap's BITMAP cap, which constrains nothing here. On a box with more
+# than ~120 GB of conventional RAM the direct map therefore OWNS PDPT[128] upward — and
+# proc_create_address_space copies kernel PDPT[1..511] into every process, so proc_map_page_hi's
+# on-demand branch would find the entry PRESENT, take the else, and write a per-process user PDE
+# into a page table the kernel and every other process share. The direct map for that GB is then
+# silently pointing at one process's private page (pmm_kva_for_access on anything in that range —
+# the PMM bitmap, sys_mmap's zero-fill, both ELF loaders — reads and writes the wrong frame), and
+# the mapping is useless to its owner anyway because the shared PDPT entry carries no U/S bit.
+# ⭐ Fixed on both sides: the base is now DERIVED from directmap_pdpt_top (vmm.cyr, recorded by
+# pmm_setup_directmap from what it really installed), and proc_map_page_hi REFUSES to adopt a
+# present-but-not-user PDPT entry rather than writing into it.
+# 1.50.4: the bump cursor is PER-PROCESS (proc_himmap_next,
 # indexed by pid; mirrors proc_rsp0) rather than global — each address space gets the
 # full [128 GB, 512 GB) independently, so a long-lived multi-process system never
 # exhausts the way one shared cursor would (each proc's high VAs live in its own CR3).
@@ -1757,11 +1851,21 @@ var proc_himmap_next[16];                # per-pid high cursor (0 = uninit -> ba
 # himmap_reserve(pid, len): reserve `len` bytes of high-arena VA for process `pid`
 # from its OWN bump cursor (lazy-init to USER_HIMMAP_BASE). Returns the base VA, or 0
 # if that process's high arena is exhausted (cursor + len would pass 512 GB).
+# 1.56.51 — the arena's real floor: the first GB above everything pmm_setup_directmap installed,
+# never below the historical USER_HIMMAP_BASE. On every machine with <=120 GB of RAM this is
+# exactly USER_HIMMAP_BASE and nothing moves; above that it steps the arena clear of the direct map
+# instead of colliding with it. Returns a 1 GB-aligned VA.
+fn himmap_floor() {
+    var f = (directmap_pdpt_top + 1) * 0x40000000;
+    if (f < USER_HIMMAP_BASE) { f = USER_HIMMAP_BASE; }
+    return f;
+}
 fn himmap_reserve(pid, len) {
     if (pid < 0) { return 0; }
     if (pid >= 16) { return 0; }
     var cur = load64(&proc_himmap_next + pid * 8);
-    if (cur == 0) { cur = USER_HIMMAP_BASE; }
+    if (cur == 0) { cur = himmap_floor(); }
+    if (cur < himmap_floor()) { cur = himmap_floor(); }   # a cursor seeded before the floor moved
     if ((cur + len) > HIMMAP_CEILING) { return 0; }
     store64(&proc_himmap_next + pid * 8, cur + len);
     return cur;
@@ -1867,15 +1971,13 @@ fn sys_munmap(addr, length) {
     # 0-1 GB PD, so walk PML4 -> PDPT[0] -> PD once).
     if (addr < 0x10000000) { return 0 - 1; }                  # below the arena
     if ((addr + len) > 0x40000000) { return 0 - 1; }          # past the low ceiling
-    var pml4e = load64(cr3);
-    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
-    var pdpte = load64(pdpt_addr);
-    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    var pd_kva = ptw_pd_kva(cr3);                             # 1.56.51: direct-map walk
+    if (pd_kva == 0) { return 0 - 1; }
     var flush = 0;
     for (var i = 0; i < npages; i = i + 1) {
         var vaddr = addr + i * 0x200000;
         var pd_idx = (vaddr >> 21) & 0x1FF;
-        var entry = load64(pd_addr + pd_idx * 8);
+        var entry = load64(pd_kva + pd_idx * 8);
         if ((entry & 1) != 0) {                               # present -> unmap + free
             var phys = entry & 0x000FFFFFFFE00000;
             proc_unmap_page(cr3, vaddr);                      # clears kernel + KPTI user PD

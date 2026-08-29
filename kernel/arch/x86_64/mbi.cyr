@@ -53,10 +53,36 @@ fn boot_info_capture_rdi(): i64 {
     # later read is CR3-independent. The copy must run now, before any
     # per-process CR3 is loaded — this top-level call is the first thing after
     # the boot shim, long before exec. memcpy(dst, src, n).
+    # ⛔⛔ 1.56.51 — VALIDATE BEFORE TRUSTING, AND THE VALIDATION MUST BE HERE, NOT 370 LINES LATER.
+    # This used to be `if (src != 0) { memcpy(&boot_info_copy, src, 128); ... }` — gated on nothing
+    # but non-zero. RDI at kernel entry is whatever the loader left there, and the only place in the
+    # tree that ever checked the magic was a DIAGNOSTIC PRINT at main.cyr:429, whose own comment
+    # claims "bi==0 or a wrong magic => not a gnoboot Path-C boot ... report and skip rather than
+    # print garbage". True of that print, and false of the kernel: by the time it runs the struct
+    # has already been trusted three times — main.cyr:52 dereferences +0x70 for the KASLR base,
+    # main.cyr:59 hands the pointer to pmm_probe_memmap, acpi.cyr reads the RSDP at +0x38.
+    # pmm_probe_memmap is the dangerous one: its gates are only mm!=0 / count!=0 / entsize>=40, and
+    # `count` is a load32, so a garbage struct walks up to 4294967295 entries of load32/load64
+    # across arbitrary physical addresses until it leaves the identity map and #PFs in boot context,
+    # where nothing catches it.
+    # ⚠ The fixed 128 was also 8 bytes LONGER than the struct it copies (gnoboot's is 120 / 0x78,
+    # as boot_data.cyr's own comment concedes), so even a well-formed boot over-read by 8 bytes.
+    # Copy min(struct_size, 128) instead — which accepts a future LARGER gnoboot struct by taking
+    # its prefix, rather than rejecting the boot outright.
+    # ⭐ On any failure boot_info_ptr is left ZERO, which is what makes every downstream
+    # `if (bi == 0)` guard engage instead of parsing garbage.
     var src = load64(&boot_info_ptr);
+    store64(&boot_info_ptr, 0);                  # nothing is trusted until it validates
     if (src != 0) {
-        memcpy(&boot_info_copy, src, 128);
-        store64(&boot_info_ptr, &boot_info_copy);
+        if ((load32(src) & 0xFFFFFFFF) == 0x41474E4F) {     # 'AGNO' — the Path C handoff magic
+            var ssz = load64(src + 8);                       # struct_size @ +0x08
+            if (ssz >= 0x78) {                               # at least the v2 struct we know
+                var n = ssz;
+                if (n > 128) { n = 128; }                    # never past boot_info_copy's 128 B
+                memcpy(&boot_info_copy, src, n);
+                store64(&boot_info_ptr, &boot_info_copy);
+            }
+        }
     }
     return 0;
 }
