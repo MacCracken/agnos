@@ -52,8 +52,24 @@ fi
 WORK="$ROOT/build/edge-abi-smoke"; LOGS="$ROOT/build/edge-abi-smoke-logs"
 rm -rf "$WORK" "$LOGS"; mkdir -p "$WORK" "$LOGS"
 ESP="$WORK/esp.img"
-dd if=/dev/zero of="$ESP" bs=1M count=64 status=none
-parted -s "$ESP" mklabel gpt mkpart ESP fat32 1MiB 100% set 1 esp on
+# ⛔⛔ 1.56.51 — THIS SMOKE COULD NOT BOOT ON THIS BOX, AND IT WAS TWO INDEPENDENT CAUSES.
+# Isolated by a 2x2 over {image geometry} x {block device}, one QEMU run per cell:
+#     geometry                     device       kernel ran?
+#     agnsh-style (ESP 1..33MiB)   nvme         YES
+#     agnsh-style (ESP 1..33MiB)   virtio-blk   no
+#     this file's (ESP 1MiB..100%) nvme         no
+#     this file's (ESP 1MiB..100%) virtio-blk   no      <- what the smoke actually shipped
+# Neither variable alone explains it and neither alone fixes it — BOTH had to change. OVMF starts
+# Boot0002 and then falls straight through to BootManagerMenuApp, so the firmware finds the device,
+# attempts the boot, and the load fails; the kernel never executes. The old `mkpart ESP fat32 1MiB
+# 100%` on a 64 MB disk yields a 63 MiB FAT32 at 1 sector/cluster (129024 clusters) that OVMF's FAT
+# driver will not boot; 1MiB..33MiB on a 128 MB disk yields 2 sectors/cluster and boots.
+# ⚠ THE IMAGE WAS NEVER THE OBVIOUS SUSPECT — it is structurally complete. mdir confirms
+# ::/EFI/BOOT/BOOTX64.EFI (32768 B) and ::/boot/agnos are both present and correct.
+# ⚠ The header below records a PASS on 2026-08-22, so this worked once; the box's OVMF is the thing
+# that moved. Matching agnsh-smoke's proven recipe is the cheap way to stop tracking that.
+dd if=/dev/zero of="$ESP" bs=1M count=128 status=none
+parted -s "$ESP" mklabel gpt mkpart ESP fat32 1MiB 33MiB set 1 esp on
 mformat -i "$ESP"@@1048576 -F
 mmd -i "$ESP"@@1048576 ::EFI ::EFI/BOOT ::boot
 mcopy -i "$ESP"@@1048576 "$GNOBOOT" ::EFI/BOOT/BOOTX64.EFI
@@ -81,7 +97,7 @@ qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-180}" "$WORK/vars.fd" "$OVMF_
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$ESP,format=raw,if=none,id=esp0" \
-    -device "virtio-blk-pci,drive=esp0" \
+    -device "nvme,drive=esp0,serial=EDGE-ABI" \
     -serial stdio -display none -no-reboot
 
 # ⛔⛔ 1.56.51 — A RUN THE KERNEL NEVER STARTED IS VOID, NOT FAILED, AND MUST SAY SO INSTEAD OF

@@ -132,6 +132,24 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 - **`edge-abi-smoke` now exits VOID (2) instead of faking 22 ABI failures** when the kernel never
   started. Its own header already stated the principle for the truncated case; a never-booted run is
   the stronger form of it.
+- **`edge-abi-smoke` could not boot at all on this box, from TWO independent causes**, isolated by a
+  2x2 over {ESP geometry} x {block device}, one QEMU run per cell — neither variable alone explains
+  the failure and neither alone fixes it:
+
+  | ESP geometry | device | kernel ran? |
+  |---|---|---|
+  | agnsh-style (1..33 MiB on 128 MB) | nvme | **yes** |
+  | agnsh-style | virtio-blk | no |
+  | this smoke's (1 MiB..100% on 64 MB) | nvme | no |
+  | this smoke's | virtio-blk | no |
+
+  `mkpart ESP fat32 1MiB 100%` on a 64 MB disk yields a 63 MiB FAT32 at **1 sector/cluster** (129024
+  clusters) that OVMF's FAT driver will not boot; 1..33 MiB yields 2 sectors/cluster and boots. The
+  image was never the obvious suspect — `mdir` confirms `BOOTX64.EFI` and `boot/agnos` are both
+  present and correct in it. Both changed to match `agnsh-smoke`'s proven recipe. **The 167-case
+  battery now runs and PASSES 23/23**, which is what verifies the `#92` op 0x09 fix above.
+  ⚠ 26 of the 83 smokes still attach `virtio-blk-pci`, which does not boot on this box under either
+  geometry. They are presumed unrunnable here and were not audited.
 
 ### Fixed — verification gates that could not fail
 
@@ -208,13 +226,10 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   `agnsh-smoke` / `exec-smoke` / `edge-abi-smoke`; the ~30 other smokes still call `qemu_dwell`
   directly and will keep reporting a never-booted run as a wall of failures. The root cause — OVMF
   dropping to the boot-device menu instead of the removable-media path — is unexplained.
-- **`edge-abi-smoke` (the 167-case `#92` ABI battery) could not be run on this box**: its virtio-blk
-  ESP never boots, VOID on every attempt including six consecutive firmware retries. So the
-  `#92` op 0x09 slot-id fix above is verified by reading the six sibling validators it now matches,
-  **not** by the battery. Re-run it wherever that path boots before trusting the GPU band.
-- **`ext2_readlink`'s SLOW path and `#92`'s primitive/vertex TOCTOU are unfixed** — the latter needs
-  the per-primitive array copied into kernel staging before validation, the same discipline
-  `gpu_shader_op_sys` already applies to the 64-byte records.
+- **`ext2_readlink`'s SLOW path** is unaudited; only the fast-symlink branch was capped.
+- **`#92`'s primitive/vertex TOCTOU is unfixed** — it needs the per-primitive array copied into
+  kernel staging before validation, the same discipline `gpu_shader_op_sys` already applies to the
+  64-byte records.
 
 Build: `build/agnos` **1,990,912 B** (multiboot2/ELF64, entry `0x1000a8`). `check.sh` 30/30,
 `test.sh` (x86) 4/4.
