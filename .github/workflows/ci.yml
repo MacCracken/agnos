@@ -159,23 +159,59 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Scan for dangerous patterns
+        # ⛔⛔ MEASURED 2026-08-28 (1.56.51): THIS JOB COULD NOT FAIL, AND EVERY HIT IT REPORTED WAS
+        # A FALSE POSITIVE. Two independent defects, both fixed here:
+        #   ① `WARN=1` was assigned and then only interpolated into a closing `echo`. The step's
+        #      exit status is its LAST command's, and that last command was an unconditional echo,
+        #      so the job was green no matter what the scan found. (The Format job directly above
+        #      ends `test $FAIL -eq 0 && echo ...`, which is why that one does gate — the contrast
+        #      is one line apart in the same file.)
+        #   ② `grep -rn 'syscall('` has no left word boundary, so it matched `test_hw_syscall(`
+        #      and `test_syscall(` — 5 hits on this tree, ALL function names, ZERO raw syscalls.
+        #      The exclusion list chased the symptom (`grep -v ksyscall`) instead of the pattern.
+        #      Likewise `while (1)` never matched the kernel's actual idiom `while (1 == 1)`; its 3
+        #      hits are the deliberate `sti; hlt` idle loops and the scheduler loop.
+        # So a scan that reported 8 findings, all wrong, and passed, was standing in for CLAUDE.md's
+        # closeout step 6 ("quick grep for new raw `syscall(`"). It is now precise and it gates.
         run: |
-          WARN=0
-          # Kernel should not call Linux syscalls
-          if grep -rn 'syscall(' kernel/ 2>/dev/null | grep -v '# ' | grep -v 'ksyscall'; then
-            echo "WARN: raw Linux syscall in kernel code"
-            WARN=1
+          set -u
+          rc=0
+
+          # ── VACUITY FLOOR ──────────────────────────────────────────────────────────────
+          # This tree has found several gates that passed by enumerating nothing. Assert the
+          # scan has files to scan, and PRINT the count, so a run that says "0 sources" is
+          # reporting that its own enumeration broke rather than that the kernel is clean.
+          NSRC=$(find kernel -name '*.cyr' | wc -l)
+          echo "scanning $NSRC .cyr sources"
+          if [ "$NSRC" -lt 50 ]; then
+            echo "FAIL: expected >= 50 kernel sources, found $NSRC — enumeration is broken, not the tree"
+            exit 1
           fi
-          # Check for unbounded loops without guards
-          if grep -rn 'while (1)' kernel/ 2>/dev/null | grep -v '# '; then
-            echo "WARN: infinite loop without break condition"
-            WARN=1
+
+          # ── GATING: raw Linux syscall in kernel code ────────────────────────────────────
+          # Left word boundary is what makes this mean anything: `[^A-Za-z0-9_]syscall(`
+          # matches a genuine `syscall(1, 2, 3)` call and does NOT match `ksyscall(`,
+          # `test_syscall(` or `test_hw_syscall(`. Verified both directions on this tree.
+          if grep -rnE '(^|[^A-Za-z0-9_])syscall\(' kernel/ 2>/dev/null | grep -vE ':\s*#'; then
+            echo "FAIL: raw Linux syscall in kernel code (the kernel is freestanding — it has no libc and no host kernel to call)"
+            rc=1
+          else
+            echo "PASS: no raw syscall() in kernel/"
           fi
-          # Verify no hardcoded memory addresses outside arch/
-          if grep -rn '0xFEE0\|0xB8000\|0x3F8' kernel/core/ 2>/dev/null | grep -v '# '; then
-            echo "INFO: hardcoded MMIO addresses in core/ (should be in arch/)"
-          fi
-          echo "security scan complete (warnings: $WARN)"
+
+          # ── NON-GATING, AND SAID SO ─────────────────────────────────────────────────────
+          # ⚠ These two are reading aids, not verdicts, and must not be re-wired into `rc`.
+          # An unbounded loop is CORRECT in an idle path (`while (1 == 1) { sti; hlt; }` is the
+          # halt idiom) and "is this loop bounded" is not decidable by grep — the old check
+          # asserted it anyway and was simply wrong every time. Likewise a hardcoded MMIO
+          # address in core/ is a layering smell, not a defect. Print, do not judge.
+          echo "INFO: infinite loops (expected: idle/halt paths and the scheduler)"
+          grep -rnE 'while \(1( == 1)?\)' kernel/ 2>/dev/null | grep -vE ':\s*#' | sed 's/^/  /' || true
+          echo "INFO: hardcoded MMIO addresses in core/ (belong in arch/)"
+          grep -rn '0xFEE0\|0xB8000\|0x3F8' kernel/core/ 2>/dev/null | grep -vE ':\s*#' | sed 's/^/  /' || true
+
+          echo "security scan complete (rc=$rc)"
+          exit $rc
 
   # ── Tests ──
   test:

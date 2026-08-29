@@ -5,10 +5,18 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CYRIUS_HOME="${CYRIUS_HOME:-$HOME/.cyrius}"
 CYRB="$CYRIUS_HOME/bin/cyrius"
 
-# kashi sibling/fetch handling — same contract as scripts/build.sh (see comment
-# there). Pinned at 1.0.0 (kashi's v1 API freeze).
+# kashi sibling/fetch handling — same contract as scripts/build.sh (see comment there).
+# ⛔ MEASURED 2026-08-28 (1.56.51): THE THREE SCRIPTS HAD DIVERGED AGAIN, AND THIS COMMENT NAMED A
+# FOURTH VALUE. build.sh defaulted 1.0.6, test.sh and bench.sh 1.0.4, and the line above said
+# "Pinned at 1.0.0". This is invisible on a dev box — cyrius.cyml declares `[deps.kashi] path`, and
+# the path WINS, so every local build silently uses the sibling working tree (1.0.6 here) whatever
+# any script's default says. It only bites a CLEAN CHECKOUT, where the kashi you get depends on
+# WHICH SCRIPT RAN FIRST, and the kernel that ships is then built against different glyph data than
+# the kernel that was tested. All three now default 1.0.6, matching ../kashi/VERSION.
+# ⚠ Keep them in step and re-verify against kashi's own VERSION at every cut. This has now
+# re-diverged twice; it is a recurring failure, not an incident.
 KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
-KASHI_REF="${KASHI_REF:-1.0.4}"
+KASHI_REF="${KASHI_REF:-1.0.6}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
     echo "  kashi not at $KASHI_DIR — cloning $KASHI_REF for test..." >&2
     rm -rf "$KASHI_DIR"
@@ -18,9 +26,18 @@ if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
         exit 1
     }
 fi
-# cc5_aarch64 existence is the gate for aarch64 cross-compile; cyrius
-# wrapper invokes it internally — we never call cc5/cc5_aarch64 directly.
-CC_ARM="$CYRIUS_HOME/bin/cc5_aarch64"
+# The aarch64 cross-compiler's existence gates test_aarch64; the cyrius wrapper invokes it
+# internally — we never call it directly.
+# ⛔⛔ MEASURED 2026-08-28 (1.56.51): THIS PROBED A BINARY THAT HAS NOT EXISTED SINCE cyrius v6.1.0.
+# The backend was renamed cc5_aarch64 -> cycc_aarch64 at v6.0.0 and the back-compat symlink dropped
+# at v6.1.0; this tree is on 6.5.36. build.sh HIT THIS EXACT BUG AND WAS FIXED FOR IT (see its
+# ⚠ comment at the CC_ARM assignment) — the fix was simply never carried across to here. So
+# test_aarch64 took its `[ ! -x "$CC_ARM" ]` early-return on EVERY invocation for the whole 6.1+
+# era: `sh scripts/test.sh --aarch64` printed one SKIP line, ran zero checks and exited 0, and
+# `--all` reported "4 passed, 0 failed" with the entire aarch64 half inert. CLAUDE.md's closeout
+# step calls for `scripts/test.sh --all` 7/7; 7 was not reachable.
+CC_ARM="$CYRIUS_HOME/bin/cycc_aarch64"
+[ -x "$CC_ARM" ] || CC_ARM="$CYRIUS_HOME/bin/cc5_aarch64"
 # Kernel-stdlib is at kernel/klib/ (renamed from kernel/lib/ to dodge the
 # cyrius wrapper's ./lib/ shadow contract). No CYRIUS_NO_WARN_SHADOW_LIB
 # needed — the wrapper sees no ./lib/ at compile cwd.
@@ -45,9 +62,24 @@ test_x86() {
     # we still prepend `#define ARCH_X86_64` to a temp source.
     mkdir -p $ROOT/build
     rm -f $ROOT/build/agnos_test
+    # ⛔⛔ MEASURED 2026-08-28 (1.56.51): THIS BUILT A DIFFERENT KERNEL THAN THE ONE THAT SHIPS,
+    # AND THEN VALIDATED THE DIFFERENCE AS CORRECT. build.sh prepends `#define ELF64_KERNEL` and
+    # exports `CYRIUS_ELF64_KERNEL=1` — the source-side and backend-side halves of the ELF64
+    # multiboot2 emit, which its own comment says "must be set in lockstep". test.sh set NEITHER,
+    # so it produced the legacy multiboot1/ELF32 kernel while build/agnos is multiboot2/ELF64.
+    # Measured side by side on the same tree:
+    #     test.sh's agnos_test : ELF32, entry 0x100060, 0x1BADB002 @84,  1,988,056 B
+    #     build.sh's agnos     : ELF64, entry 0x1000a8, 0xE85250D6 @120, 1,988,256 B
+    # The ELF assertion below was pinned to the FIRST column, so it passed — on a kernel nothing
+    # boots. gnoboot parses the multiboot2 header; the multiboot1 path was retired with Path A on
+    # 2026-05-13. The test suite has therefore never once validated the artifact that ships: break
+    # build/agnos's boot header tomorrow and this still reports PASS.
+    # Both gates are now set here exactly as build.sh sets them, so the two agree by construction.
+    export CYRIUS_ELF64_KERNEL=1
     if [ -x "$CYRB" ]; then
         PREPPED="$ROOT/build/agnos_prepped.cyr"
-        (echo '#define ARCH_X86_64' && cat "$KASHI_DIR/src/font_data.cyr" && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED"
+        (echo '#define ARCH_X86_64' && echo '#define ELF64_KERNEL' \
+            && cat "$KASHI_DIR/src/font_data.cyr" && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED"
         (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" $ROOT/build/agnos_test) 2>&1
         rm -f "$PREPPED"
     else
@@ -62,16 +94,31 @@ test_x86() {
         return
     fi
 
-    # Validate ELF
+    # Validate the boot header. Shape is DERIVED from EI_CLASS rather than hardcoded to one
+    # protocol — the same form build.sh validates build/agnos with, so the two cannot drift apart
+    # again the way they did before 1.56.51. ELF64/multiboot2 is what ships; the ELF32/multiboot1
+    # arm is kept only so the legacy emit is still checkable, not because anything boots it.
+    # ⚠ The expected shape is asserted, not just the magic: an ELF64 kernel carrying a multiboot1
+    # header (or the reverse) is exactly the failure this missed for months.
     python3 -c "
 import struct
 with open('$ROOT/build/agnos_test','rb') as f: d=f.read()
-mb = struct.unpack_from('<I',d,84)[0]
+if len(d) <= 1000: print('  WARN: kernel is implausibly small'); exit(1)
+eic = d[4]
+if eic == 2:   mb_off, exp_mb, exp_entry, label = 120, 0xe85250d6, 0x1000a8, 'multiboot2 (ELF64)'
+elif eic == 1: mb_off, exp_mb, exp_entry, label = 84,  0x1badb002, 0x100060, 'multiboot1 (ELF32)'
+else:          print('  WARN: unknown EI_CLASS {}'.format(eic)); exit(1)
+mb    = struct.unpack_from('<I',d,mb_off)[0]
 entry = struct.unpack_from('<I',d,24)[0]
-ok = mb == 0x1badb002 and entry == 0x100060 and len(d) > 1000
-exit(0 if ok else 1)
-" 2>/dev/null
-    check "x86 valid multiboot ELF" "0" "$?"
+if mb != exp_mb:
+    print('  WARN: {} expected magic 0x{:x} at offset {}, got 0x{:x}'.format(label, exp_mb, mb_off, mb)); exit(1)
+if entry != exp_entry:
+    print('  WARN: {} expected entry 0x{:x}, got 0x{:x}'.format(label, exp_entry, entry)); exit(1)
+if eic != 2:
+    print('  WARN: built ELF32/multiboot1 — build.sh ships ELF64/multiboot2; the gates have drifted'); exit(1)
+exit(0)
+"
+    check "x86 boot header matches the shipped ELF64/multiboot2 shape" "0" "$?"
 
     # Size check — ceiling bumped to 700KB at 1.31.3, then 800KB at 1.33.4
     # (the WRITE arc + symlink resolution + uninit materialization carried the
@@ -121,8 +168,26 @@ if [ "$SZ" -gt 50000 ] && [ "$SZ" -lt 2097152 ]; then
 test_aarch64() {
     echo "=== AGNOS Kernel Tests [aarch64] ==="
 
+    # ⛔⛔ MEASURED 2026-08-28 (1.56.51): THIS FUNCTION COULD NOT PRODUCE A FAILURE, BY TWO
+    # INDEPENDENT ROUTES, AND BOTH ARE FIXED HERE.
+    #   ① The cross-compiler probe named a binary dropped at cyrius v6.1.0 (see the CC_ARM comment
+    #     above), so it took this early return every time — a bare `return` that runs zero checks,
+    #     contributing neither a pass nor a fail. `test.sh --aarch64` exited 0 having tested nothing.
+    #   ② Even past that probe, the compile-failure branch below printed "SKIP: … (x86 inline asm
+    #     not yet ported)" and recorded NOTHING. A broken cross-compile and a working one produced
+    #     the same tally.
+    # Together those made "aarch64 is compile-only but green" unfalsifiable. It is not green:
+    # `sh scripts/build.sh --aarch64` fails with 30 reachable undefined functions and ~20 undefined
+    # variables, and had been failing long enough that build/agnos-aarch64 on the dev box was a
+    # MAY 12 artifact. A missing cross-compiler and a failing compile are now both real FAILs.
+    # ⚠ THIS DELIBERATELY TURNS `test.sh --all` RED while the aarch64 port is broken. That is the
+    # point: the previous green was reporting coverage that did not exist. check.sh and both CI
+    # workflows invoke `sh scripts/test.sh` with no argument (x86 only), so nothing that gates a
+    # release changes colour — only the claim about aarch64 does.
     if [ ! -x "$CC_ARM" ]; then
-        echo "  SKIP: aarch64 cross-compiler not found"
+        echo "  aarch64 cross-compiler not found at $CC_ARM"
+        echo "  (expected \$CYRIUS_HOME/bin/cycc_aarch64; the legacy cc5_aarch64 name was dropped at cyrius v6.1.0)"
+        check "aarch64 cross-compiler present" "0" "1"
         return
     fi
 
@@ -147,7 +212,10 @@ test_aarch64() {
         file /tmp/agnos_arm_test | grep -q "ARM aarch64"
         check "aarch64 valid ELF" "0" "$?"
     else
-        echo "  SKIP: aarch64 kernel compile (x86 inline asm not yet ported)"
+        echo "  aarch64 kernel compile FAILED — rerun for detail:  sh scripts/build.sh --aarch64"
+        echo "  (as of 1.56.51: 30 reachable undefined functions + ~20 undefined variables;"
+        echo "   the arch/aarch64/stubs.cyr surface has not kept up with core/)"
+        check "aarch64 kernel compiles" "0" "1"
     fi
 
     rm -f /tmp/agnos_arm_test

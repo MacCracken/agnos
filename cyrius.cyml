@@ -1,66 +1,21 @@
 [package]
 name = "agnos"
 version = "${file:VERSION}"
-description = "Sovereign operating system kernel"
+description = "A General Networked Operating System - Sovereign System Kernel"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/agnos"
 language = "cyrius"
-# 6.4.74 — the gvar-init const-folder + the `_cfo=0` codegen fix (17 sites) both landed here, filed by this
-# repo (issues/2026-07-23-cyrius-module-scope-var-expr-initializer-zero.md). The pin had lagged at 6.4.2
-# while the INSTALLED cycc actually built the kernel warn-only, so the fold and codegen fix were already in
-# the shipped binary; this bump ends the drift and makes the fix the enforced floor. Also brings in the
-# #92/#93 gpu_shader_op/gpu_modeset_op wrappers the H3 /bin/modeset consumes.
-#
-# 6.5.20 (1.56.44) — THE SAME DRIFT HAD REOPENED, and by the same mechanism the note above describes.
-# The pin read 6.4.78 while the installed cycc was 6.5.20, so every build in this tree emitted
-# `toolchain drift (snapshot may be stale)` and the binary was in fact already being produced by 6.5.20.
-# The declared floor was three minors behind the compiler that actually built the kernel — which means
-# the pin documented nothing and gated nothing. ⚠ THIS IS A RECURRING FAILURE, NOT AN INCIDENT: the pin
-# lags, the warning is tolerated as noise, and the declared graph stops describing the shipped artifact.
-# Re-check it at every cut, not when the warning becomes annoying.
-# ⚠ tests/gpu/cyrius.cyml MUST move in the same edit — its own header mandates tracking this value,
-# because ring-3 GPU tools built by a different compiler than the kernel they exercise would surface a
-# codegen difference as a GPU bug.
-#
-# 6.5.21 (same cut) — 6.5.21 released while 1.56.44 was still open and the wrapper picked it up
-# immediately, so the pin was stale again within the day. Bumped rather than tolerated, which is the
-# whole point of the note above. ⭐ build/agnos is BYTE-IDENTICAL across 6.5.20 -> 6.5.21
-# (1,980,696 B / 6c256bc6...), so the span changed no codegen this kernel reaches.
-cyrius = "6.5.28"
+cyrius = "6.5.36"
 
 [build]
 entry = "kernel/agnos.cyr"
 output = "build/agnos"
 
-#
-# AGNOS is a freestanding kernel binary. It vendors a syscall-free kernel
-# stdlib in kernel/klib/ (kstring, kfmt, ktagged) and links nothing from
-# the host Cyrius stdlib. No external Cyrius deps — `cyrius deps` is a
-# no-op here. (Dir is klib/ not lib/ — cyrius wrapper treats ./lib/ at
-# compile cwd as the stdlib-snapshot location; a distinct name eliminates
-# the shadow warning and any stomp risk from a future `cyrius deps` run.)
+# AGNOS is a freestanding kernel binary.
 [deps]
 stdlib = []
 
-# Console-font subsystem — kashi's FREESTANDING glyph core (src/font_data.cyr)
-# is zero-stdlib (uses only store8/load8 + arithmetic), so a freestanding kernel
-# can include it directly. Pulled in at 1.37.5 (arc-close hand-off, 2026-05-28)
-# to retire the inline VGA 8x16 / CGA 8x8 glyph tables that previously lived in
-# kernel/arch/x86_64/fb_console.cyr. kashi 0.1.0's font_data.cyr was extracted
-# byte-for-byte from agnos's tables, so glyph rendering is byte-identical to
-# 1.37.4 by construction. kashi reached **v1.0.0** (API freeze) on 2026-05-28;
-# build.sh / test.sh / bench.sh default KASHI_REF=**1.0.4** for CI/clean-checkout
-# resolution — verified a real tag matching kashi's own VERSION on 2026-08-13.
-# ⛔ THOSE THREE SCRIPTS HAD THREE DIFFERENT ANSWERS at 1.56.44 (build 1.0.3,
-# bench 1.0.3, test 1.0.0) and this comment claimed a fourth (1.0.0), while the
-# sibling working tree was at 1.0.4. On THIS box none of that is visible: only
-# `path` is declared below, and the path WINS, so every local build silently used
-# the working tree whatever any script said. The divergence only bites a clean
-# checkout, where the kashi you get depends on which script ran first. Keep the
-# three in step and re-verify against kashi's VERSION at every cut.
-# The stdlib-using library face (PSF import etc.) lives in
-# kashi/src/lib.cyr and never reaches the kernel; the parallel agent develops
-# it independently per project_kashi_parallel_split memory.
+# Vendored to keep pulling dependencies to 0
 [deps.kashi]
 path    = "../kashi"
 modules = ["src/font_data.cyr"]

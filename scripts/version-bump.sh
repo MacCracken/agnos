@@ -156,16 +156,44 @@ EOF
     updated="$updated  kernel/version.cyr (regenerated)\n"
 fi
 
-# 7. CHANGELOG.md — add new version section after [Unreleased]. Skipped in
-#    REGEN mode: opening a dated release section is a release act, and a
-#    regeneration must not manufacture one.
+# 7. CHANGELOG.md — open the new dated release section. Skipped in REGEN mode:
+#    opening a dated release section is a release act, and a regeneration must
+#    not manufacture one.
+#
+# ⛔⛔ MEASURED 2026-08-28 (1.56.51): THIS STEP WAS A SILENT NO-OP AND HAD BEEN FOR A LONG TIME.
+# It anchored on `/## \[Unreleased\]/` — a heading THIS CHANGELOG DOES NOT HAVE and, by the look
+# of the file, never has. `sed` matching nothing is not an error, so the append ran, changed zero
+# bytes, exited 0, and the script then unconditionally printed "Updated:   CHANGELOG.md". The bump
+# REPORTED doing a thing it did not do. Nothing downstream noticed except check.sh's
+# `version in changelog` gate, which fails AFTER the fact and blames the CHANGELOG rather than the
+# tool that was supposed to have written it — so every release has been hand-adding the header and
+# reading a false success line on the way past.
+# ⚠ THE ANCHOR IS NOW DERIVED FROM THE FILE'S REAL SHAPE, not from a heading convention this
+# project does not follow: insert immediately ABOVE the first `## [` release heading, which is
+# where a new release belongs in a reverse-chronological changelog by definition.
+# ⭐ AND THE RESULT IS ASSERTED. An anchor can rot again; a no-op that reports success cannot be
+# allowed to. If the heading is not in the file after the edit, this exits non-zero.
 if [ "$REGEN" = "0" ] && [ -f "$ROOT/CHANGELOG.md" ]; then
-    if ! grep -q "## \[$NEW\]" "$ROOT/CHANGELOG.md"; then
-        sed -i "/## \[Unreleased\]/a\\
-\\
-## [$NEW] — $(date +%Y-%m-%d)" "$ROOT/CHANGELOG.md"
+    if grep -q "^## \[$NEW\]" "$ROOT/CHANGELOG.md"; then
+        updated="$updated  CHANGELOG.md (section already open)\n"
+    else
+        ANCHOR=$(grep -n '^## \[' "$ROOT/CHANGELOG.md" | head -1 | cut -d: -f1)
+        if [ -z "$ANCHOR" ]; then
+            echo "error: CHANGELOG.md has no '## [x.y.z]' release heading to insert above." >&2
+            echo "       The file's shape changed; fix this anchor rather than letting the" >&2
+            echo "       bump silently skip the section (which is what it did until 1.56.51)." >&2
+            exit 1
+        fi
+        awk -v n="$ANCHOR" -v hdr="## [$NEW] — $(date +%Y-%m-%d)" \
+            'NR==n { print hdr; print "" } { print }' \
+            "$ROOT/CHANGELOG.md" > "$ROOT/CHANGELOG.md.tmp" \
+            && mv "$ROOT/CHANGELOG.md.tmp" "$ROOT/CHANGELOG.md"
+        grep -q "^## \[$NEW\]" "$ROOT/CHANGELOG.md" || {
+            echo "error: CHANGELOG.md section for $NEW was not written." >&2
+            exit 1
+        }
+        updated="$updated  CHANGELOG.md (opened section for $NEW)\n"
     fi
-    updated="$updated  CHANGELOG.md\n"
 fi
 
 # 8. docs/development/roadmap.md — update Current header version AND

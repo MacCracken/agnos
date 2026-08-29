@@ -288,8 +288,25 @@ fn net_recv_udp(buf, maxlen) {
     var copy_len = net_udp_buf_len;
     if (copy_len > maxlen) { copy_len = maxlen; }
     net_copy_buf(buf, &net_udp_buf, copy_len);
-    var result = net_udp_buf_len;
+    # ⛔ 1.56.51 SECURITY FIX. This returned `net_udp_buf_len` — the datagram's UN-TRUNCATED length —
+    # while having copied only `copy_len`. The COPY was correctly bounded; the RETURN VALUE was not,
+    # and a caller has nothing else to size its buffer by. Measured on the one real caller,
+    # user/shell.cyr's `recv` verb:
+    #     var rbuf[64];                        # 64 u64 slots = 512 bytes
+    #     var rlen = net_recv_udp(&rbuf, 512); # copies 512, RETURNED up to 1016
+    #     kprint(&rbuf, rlen);                 # reads 1016 from a 512-byte STACK buffer
+    # Ingress caps a datagram at 1016 bytes (see the cap above) into the 2048-byte net_udp_buf, so
+    # the over-read is up to 504 bytes PAST the end of a kernel stack buffer, printed to the console
+    # and into the klug ring. Those bytes are saved registers, return addresses and the stack canary
+    # copy — i.e. this disclosed exactly the two secrets (canary, text addresses) that the canary and
+    # KASLR exist to keep. An attacker supplies the trigger remotely by sending one oversized UDP
+    # datagram; the operator's next `recv` prints the stack.
+    # ⚠ TRUNCATION IS NOW SILENT: a caller that needs to know the datagram was longer than its
+    # buffer cannot learn it from this return value any more. That is the correct trade for a
+    # single-consumer legacy path — POSIX splits the two with MSG_TRUNC precisely because returning
+    # the untruncated length by default hands every caller a buffer overrun. If a future consumer
+    # needs the real length, add an out-parameter; do not restore this return.
     net_udp_buf_len = 0;
-    return result;
+    return copy_len;
 }
 

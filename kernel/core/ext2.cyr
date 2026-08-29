@@ -2216,7 +2216,13 @@ fn ext2_readdir_sys(path, buf, max_entries) {
     if (ext2_active == 0) { return 0 - 1; }
     if (max_entries <= 0) { return 0; }
     if (is_user_range(path, 256) == 0) { return 0 - 1; }
-    if (is_user_range(buf, max_entries * 64) == 0) { return 0 - 1; }
+    # ⛔ 1.56.51 SECURITY FIX. Was `is_user_range(buf, max_entries * 64)`. `max_entries` is arg3 of
+    # #81, entirely ring-3 chosen and checked only for `<= 0`, so the multiply wrapped before the
+    # validator ever saw it: 2^58 * 64 == 2^64 == 0, and is_user_range(buf, 0) passes. The record
+    # loop below is then bounded by the DIRECTORY's entry count rather than by max_entries, writing
+    # 64-byte records at buf + count*64 past the 0x40000000 ceiling — with ring-3-chosen contents,
+    # since the names come from a directory the caller can create. See is_user_array in syscall.cyr.
+    if (is_user_array(buf, max_entries, 64) == 0) { return 0 - 1; }
     # bounded strlen of the user path
     var path_len = 0; var pdone = 0;
     while ((path_len < 255) && (pdone == 0)) {
@@ -2300,7 +2306,10 @@ fn ext2_readdir_at_sys(path, buf, max_entries, cursor_uva) {
     if (ext2_active == 0) { return 0 - 1; }
     if (max_entries <= 0) { return 0; }
     if (is_user_range(path, 256) == 0) { return 0 - 1; }
-    if (is_user_range(buf, max_entries * 64) == 0) { return 0 - 1; }
+    # ⛔ 1.56.51 SECURITY FIX — the same wrap as #81 above, inherited when this arm was written
+    # against #81's preamble as its model. Sharper here: #101 also writes through `cursor_uva`, so a
+    # caller who survives the overflow gets both the record spray and a controlled 8-byte store.
+    if (is_user_array(buf, max_entries, 64) == 0) { return 0 - 1; }
     if (is_user_range(cursor_uva, 8) == 0) { return 0 - 1; }
     var start = load64(cursor_uva);
     if (start < 0) { return 0; }                        # already exhausted — a no-op, not a restart

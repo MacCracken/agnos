@@ -284,6 +284,38 @@ fn is_user_range(ptr, len) {
     return 1;
 }
 
+# is_user_array(ptr, count, stride) — is_user_range for a COUNT of fixed-size records (1.56.51).
+#
+# ⛔⛔ WHY THIS EXISTS, AND WHY is_user_range ALONE IS NOT ENOUGH. is_user_range's wrap check
+# (`ptr + len < ptr`) guards the ADDITION. It cannot guard a MULTIPLICATION that already happened
+# in the caller's argument list, because by then the wrapped product IS the length it was handed —
+# it validates a small window and returns 1, truthfully, about the wrong number.
+# Measured on this kernel's own call sites: `is_user_range(buf, max_entries * 64)` with a ring-3
+# `max_entries` of 2^58 computes 2^58 * 64 = 2^64, which is 0 in 64-bit. is_user_range(buf, 0) then
+# passes for any legal buf, and the write loop that follows is bounded by something else entirely —
+# the directory's entry count, the sector count, the process count — writing at buf + i*stride
+# straight through the 0x40000000 user ceiling and into the kernel PDPT mirror above it. Ring 3
+# chooses the content (file names it created, sectors it staged). That is a kernel write primitive.
+# 2^62 works too; so does 2^58 + 1, which lands on a length of 64.
+#
+# ⭐ THE BOUND IS A DIVISION, NOT A MULTIPLICATION, so it cannot itself overflow: a count above
+# 0x40000000 / stride could not fit inside the whole 1 GB user window at that stride even if the
+# arithmetic were exact, so rejecting it costs nothing a caller could legitimately have wanted —
+# is_user_range would have rejected the honest product anyway. Everything that survives the bound
+# has a product that is exact, and the existing range check then does the real work.
+#
+# ⚠ USE THIS AT EVERY SITE WHERE THE LENGTH IS count * stride WITH A RING-3 count. Three of the six
+# arithmetic-length call sites in this kernel were already safe because they clamp the count first
+# (epoll_wait#21 caps at 16, blit#39 at 8192x8192, snd_write#66 at 1048576) — and each of those
+# carries a comment saying so. The three that were exploitable carried no such comment. A helper is
+# what makes the property structural instead of a thing each new arm has to remember.
+fn is_user_array(ptr, count, stride) {
+    if (count < 0) { return 0; }
+    if (stride <= 0) { return 0; }
+    if (count > 0x40000000 / stride) { return 0; }   # product cannot fit the user window — reject before multiplying
+    return is_user_range(ptr, count * stride);
+}
+
 # A RELATIVE path (no leading '/') has no CWD in agnos, so it is rooted at the "/"
 # mount — the writable ext2/primary root. This scratch buffer holds the "/"-prepended
 # form so bare names (`touch foo`, `cmd > foo`) create in the root FS instead of
@@ -7434,11 +7466,29 @@ fn blk_read_sys(h, lba, buf, nsec) {
     if (blk_is_registered(h) == 0) { return 0 - 1; }
     if (nsec <= 0) { return 0 - 1; }
     if (lba < 0) { return 0 - 1; }
+    # ⛔ 1.56.51 SECURITY FIX (a): `lba + nsec` CAN OVERFLOW, and the capacity check it feeds is a
+    # signed `>`. With lba = 2^62 and nsec = 2^62 the sum is 2^63, i.e. NEGATIVE, so
+    # `lba + nsec > blk_capacity` is false and the bound passes on a wildly out-of-range request.
+    # Bound each operand first; both are then small enough that the sum is exact.
+    if (nsec > 0x100000) { return 0 - 1; }            # 1 Mi LBAs = 512 MB at 512 B/LBA — far past any legitimate call
+    if (lba > 0x1000000000000) { return 0 - 1; }      # 2^48 LBAs; no device this kernel drives is near it
     if (h == blk_active) {
         if (lba + nsec > blk_capacity) { return 0 - 1; }
     }
-    var total = nsec * blk_lba_bytes;
-    if (is_user_range(buf, total) == 0) { return 0 - 1; }
+    # ⚠ NOT FIXED HERE, AND DELIBERATELY SO: for h != blk_active the kernel HAS no capacity to check
+    # against — `blk_capacity` is the active backend's alone (block.cyr:38), and blk_info#79 already
+    # reports 0 for every other handle rather than inventing one. So a read on a registered
+    # non-active handle is still bounded only by whatever the backend driver does with an
+    # out-of-range LBA. That is a disclosure question about the DEVICE, not a kernel-memory-safety
+    # one, and closing it needs per-handle capacity that does not exist yet — a change to block.cyr's
+    # registration, not a bound that can be invented here.
+    # ⛔ 1.56.51 SECURITY FIX (b): `total = nsec * blk_lba_bytes` wrapped before is_user_range saw
+    # it — with blk_lba_bytes = 512, nsec = 2^55 gives exactly 2^64 == 0 and the validator passed a
+    # zero-length window. blk_read then writes DEVICE DATA to buf + i*blk_lba_bytes for nsec
+    # iterations: an unbounded kernel-memory WRITE driven from ring 3. Bound (a) alone would now
+    # stop it, but the range check is expressed structurally so a future change to that cap cannot
+    # silently re-open the hole.
+    if (is_user_array(buf, nsec, blk_lba_bytes) == 0) { return 0 - 1; }
     fs_spin_lock();
     var rc = nsec;
     var i = 0;
@@ -7464,11 +7514,16 @@ fn blk_write_sys(h, lba, buf, nsec) {
     if (blk_is_registered(h) == 0) { return 0 - 1; }
     if (nsec <= 0) { return 0 - 1; }
     if (lba < 0) { return 0 - 1; }
+    # ⛔ 1.56.51 SECURITY FIX — the same two defects as blk_read#77 above, in the disclosure
+    # direction: here the wrapped `total` let the loop read buf + i*blk_lba_bytes past the user
+    # ceiling and write it TO DISK. Reachable only once `blk_rw_armed` is set (the magic-armed gate
+    # at the top of this function), which is why it ranks below #77 — but the arm is a ring-3 call.
+    if (nsec > 0x100000) { return 0 - 1; }
+    if (lba > 0x1000000000000) { return 0 - 1; }
     if (h == blk_active) {
         if (lba + nsec > blk_capacity) { return 0 - 1; }
     }
-    var total = nsec * blk_lba_bytes;
-    if (is_user_range(buf, total) == 0) { return 0 - 1; }
+    if (is_user_array(buf, nsec, blk_lba_bytes) == 0) { return 0 - 1; }
     fs_spin_lock();
     var rc = nsec;
     var i = 0;
@@ -9257,7 +9312,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # field keep working. Adding a field by widening the record would need a new
         # syscall number; adding it here does not.
         if (arg2 < 1) { stack_canary_check(canary); return 0 - 1; }
-        if (is_user_range(arg1, arg2 * 64) == 0) { stack_canary_check(canary); return 0 - 1; }
+        # ⛔ 1.56.51 SECURITY FIX. Was `is_user_range(arg1, arg2 * 64)`. `arg2` is the caller's
+        # record capacity, ring-3 chosen and checked only for `< 1`, so 2^58 wrapped the product to
+        # 0 and the validator passed on a zero-length window. The fill loop below is bounded by the
+        # PROCESS COUNT, not by arg2, so the spill is up to the whole process table written past the
+        # user ceiling — and unlike #81 the contents are kernel-side records, which makes the same
+        # bug a disclosure primitive as well as a write. See is_user_array above.
+        if (is_user_array(arg1, arg2, 64) == 0) { stack_canary_check(canary); return 0 - 1; }
 
         if (proclist_called == 0) {
             proclist_called = 1;

@@ -16,9 +16,14 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # with a sibling-checkout default — works on a local devbox where both
 # repos live under ~/Repos/ AND in CI where actions/checkout only fetches
 # this repo. When the sibling is absent we clone the pinned tag (override
-# via KASHI_REF=<tag-or-branch>). Pinned at 1.0.6, verified a real tag matching
-# bump as kashi cuts new 1.x releases (only affects the clone fallback — the
-# freestanding font_data.cyr is byte-identical across the 1.0.x toolchain bumps).
+# via KASHI_REF=<tag-or-branch>). Pinned at 1.0.6 — a real tag, matching ../kashi/VERSION as of
+# 2026-08-28. Bump it as kashi cuts new 1.x releases. Affects ONLY the clone fallback: cyrius.cyml
+# declares `[deps.kashi] path`, and the path wins, so a box with the sibling checkout never reads
+# this value. That is exactly why it rots unnoticed.
+# ⚠ scripts/test.sh AND scripts/bench.sh carry the same default and MUST move with it — all three
+# had diverged by 1.56.51 (1.0.6 / 1.0.4 / 1.0.4). See the measured note at test.sh's KASHI_REF.
+# (The freestanding font_data.cyr has been byte-identical across the 1.0.x bumps, which is what
+# has kept the divergence from producing a visible symptom — not a reason to tolerate it.)
 KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
 KASHI_REF="${KASHI_REF:-1.0.6}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
@@ -50,6 +55,62 @@ if [ ! -x "$CYRB" ]; then
     exit 1
 fi
 
+# ── TOOLCHAIN PIN ENFORCEMENT (1.56.51) ──────────────────────────────────────
+# ⛔⛔ MEASURED 2026-08-28: BEFORE THIS BLOCK, THE ROOT MANIFEST'S `cyrius` PIN WAS READ BY NOTHING
+# DURING A KERNEL BUILD, AND THE WRAPPER'S DRIFT WARNING WAS STRUCTURALLY UNREACHABLE HERE.
+# The mechanism is one line below and its own comment at the `cat` site already NAMES it without
+# drawing the conclusion: the compile runs as `(cd "$ROOT/kernel" && "$CYRB" build ...)`, and the
+# wrapper resolves cyrius.cyml AT THE COMPILE CWD WITH NO ANCESTOR WALK-UP. There is no
+# `kernel/cyrius.cyml`, so the wrapper sees NO manifest, falls back to the default toolchain, and
+# has nothing to compare a pin against. Probed directly:
+#   · root pin 6.5.36 -> build/agnos e59a781e…, no warning
+#   · root pin 6.3.9  -> build/agnos e59a781e… BYTE-IDENTICAL, and STILL NO WARNING
+# Twelve minors of declared drift produced the same bytes and the same silence. That also means
+# every "byte-identical across the pin move" measurement previously recorded for this kernel was
+# comparing a binary to ITSELF: both halves were built by the installed cycc, not by the pins named.
+# ⚠ The wrapper's warning is real and does fire — just not here. In a directory that DOES have a
+# manifest it prints `warning: cyrius.cyml pins X but cycc is Y — toolchain drift`. So this was not
+# a missing feature upstream; it was this script standing outside the feature's reach.
+# ⚠ CI IS NOT AFFECTED THE SAME WAY, AND THAT ASYMMETRY IS THE HAZARD: the runner installs exactly
+# ONE cyrius (read from this same root manifest) so its default toolchain IS the pin by
+# construction. The dev box has ~480 versions cached and its default is whatever was installed
+# last. Identical trees, different compilers, no signal on the box where the work happens — the
+# same shape scripts/check/toolchain-pin-check.sh exists to kill for the nested manifests.
+#
+# ⭐ THE GATE NEVER BUILDS ANYTHING TO DECIDE. It compares two strings: the pin text from the root
+# manifest, and the version the wrapper reports FROM THE COMPILE CWD (`$ROOT/kernel`) — which is
+# the same resolution the real compile gets, so it cannot answer differently than the build does.
+# A gate that compiled a probe to test this would have its verdict decided by the contents of
+# ~/.cyrius/versions/, which is the bug, not the test.
+PIN=$(grep -oE '^cyrius = "[^"]+"' "$ROOT/cyrius.cyml" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/')
+if [ -z "$PIN" ]; then
+    echo "ERROR: no 'cyrius = \"X.Y.Z\"' pin found in $ROOT/cyrius.cyml" >&2
+    echo "  The pin is what CI installs (.github/workflows/ci.yml:37); without it the build is unpinned." >&2
+    exit 1
+fi
+# Resolved from $ROOT/kernel — the compile cwd — so this is the toolchain the build WILL use, not
+# the one a root-relative query would suggest.
+TCV=$(cd "$ROOT/kernel" && "$CYRB" --version 2>/dev/null | sed -n '1s/^cyrius \([0-9][^ ]*\).*/\1/p')
+if [ -z "$TCV" ]; then
+    echo "ERROR: could not read a version from '$CYRB --version'" >&2
+    exit 1
+fi
+if [ "$PIN" != "$TCV" ]; then
+    if [ -n "${AGNOS_ALLOW_PIN_DRIFT:-}" ]; then
+        echo "  ⚠ PIN DRIFT ALLOWED: cyrius.cyml pins $PIN, building with $TCV (AGNOS_ALLOW_PIN_DRIFT set)" >&2
+    else
+        echo "ERROR: toolchain drift — cyrius.cyml pins $PIN but the build would use $TCV" >&2
+        echo "  The kernel compiles from \$ROOT/kernel, which has no manifest, so the wrapper cannot" >&2
+        echo "  see the pin and will silently use its default toolchain. This gate is the only thing" >&2
+        echo "  that notices. Resolve it deliberately, one of:" >&2
+        echo "    · bump the pin to $TCV:  sed -i 's/^cyrius = .*/cyrius = \"$TCV\"/' cyrius.cyml" >&2
+        echo "      (then re-run scripts/check/toolchain-pin-check.sh — all 9 manifests move together)" >&2
+        echo "    · install and default to the pin:  cyriusly use $PIN" >&2
+        echo "    · build off-pin ON PURPOSE:  AGNOS_ALLOW_PIN_DRIFT=1 sh scripts/build.sh" >&2
+        exit 1
+    fi
+fi
+
 mkdir -p "$ROOT/build"
 
 if [ "$ARCH" = "aarch64" ]; then
@@ -61,6 +122,15 @@ if [ "$ARCH" = "aarch64" ]; then
     # `cyrius build -D ARCH_AARCH64` does not propagate into nested #ifdef
     # blocks reached via `include`. Workaround: prepend the define.
     PREPPED_ARM="$ROOT/build/agnos_arm.cyr"
+    # ⛔ MEASURED 2026-08-28 (1.56.51): DELETE THE OUTPUT BEFORE COMPILING, so a failed build leaves
+    # NOTHING rather than a stale binary. `set -e` aborts this script the moment the compile fails,
+    # which means the old code never reached its own chmod/size lines — and never touched the
+    # previous artifact either. On this box that left `build/agnos-aarch64` sitting at 93,640 B
+    # dated MAY 12 while every aarch64 build since had failed with 30 reachable undefined functions.
+    # A months-old kernel that looks exactly like a fresh one is the failure mode burn-prep.sh
+    # already refuses to allow for x86_64 ("absence is the only reliable failure mode"); the
+    # cross-compile had no such discipline.
+    rm -f "$ROOT/build/agnos-aarch64"
     (echo '#define ARCH_AARCH64' && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED_ARM"
     (cd "$ROOT/kernel" && "$CYRB" build --aarch64 --no-deps "$PREPPED_ARM" "$ROOT/build/agnos-aarch64")
     rm -f "$PREPPED_ARM"
@@ -617,7 +687,28 @@ if mb != exp_mb: print('WARN: bad multiboot magic (got 0x{:x} at file offset {},
 if entry != exp_entry: print('WARN: bad entry point (got 0x{:x}, expected 0x{:x})'.format(entry, exp_entry)); exit(1)
 print('  ' + label + ': OK')
 print('  entry: 0x{:x}'.format(entry))
-" 2>/dev/null || echo "  (python3 not available, skipping validation)"
+" 2>/dev/null && VRC=0 || VRC=$?
+    # ⚠ `&& VRC=0 || VRC=$?` rather than a bare `VRC=$?` on the next line: this script runs under
+    # `set -e`, so an unguarded failing command aborts BEFORE the assignment and both branches
+    # below become unreachable — the build would die silently and the python3-absent soft skip
+    # would become fatal. Putting the command in a condition context is what keeps `set -e` off it
+    # while still capturing the real status. (Caught in the 1.56.51 audit against this very block.)
+    # ⛔ MEASURED 2026-08-28 (1.56.51): THIS VALIDATION COULD NOT FAIL THE BUILD, AND MISREPORTED
+    # WHY. The old form was `python3 -c "…" 2>/dev/null || echo "  (python3 not available, skipping
+    # validation)"`. A `||` consumes the non-zero status, so `set -e` never saw it — and every one
+    # of the interpreter's OWN failure exits (bad multiboot magic, wrong entry point, unknown
+    # EI_CLASS) printed "python3 not available" as its explanation. The two conditions that must be
+    # told apart — "we could not check" and "we checked and it is WRONG" — were collapsed into the
+    # one message that is wrong in the second case, and neither stopped the build.
+    # They are now distinct: the interpreter's absence is probed separately and remains a soft skip;
+    # a real validation failure is fatal, because shipping a kernel whose boot header does not match
+    # what the bootloader will parse is not a warning-grade event.
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "  (python3 not available, skipping multiboot/ELF validation)"
+    elif [ "$VRC" != "0" ]; then
+        echo "ERROR: build/agnos failed multiboot/ELF validation (see WARN above)" >&2
+        exit 1
+    fi
 
     # ELF64 kernel boot — gnoboot maps the kernel, sets RDI=&boot_info,
     # and jmp rax's into the 64-bit entry (kernel/arch/x86_64/mbi.cyr

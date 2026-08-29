@@ -13,7 +13,10 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # 'undefined KASHI_FONT_VGA_8X16'). Resolution mirrors scripts/build.sh:
 # sibling-checkout default, auto-clone the pinned tag when absent.
 KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
-KASHI_REF="${KASHI_REF:-1.0.4}"
+# ⛔ 1.56.51: kept in step with scripts/build.sh and scripts/test.sh — see the measured note at
+# test.sh's KASHI_REF. The three had drifted to 1.0.6 / 1.0.4 / 1.0.4 with a comment naming
+# 1.0.0, invisible locally because [deps.kashi] path wins over any of them.
+KASHI_REF="${KASHI_REF:-1.0.6}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
     echo "  kashi not at $KASHI_DIR — cloning $KASHI_REF for bench build..." >&2
     rm -rf "$KASHI_DIR"
@@ -64,14 +67,38 @@ fi
 # the sed would silently no-op and bench_run_all() would never be wired in —
 # the bench kernel would just boot normally and emit ZERO numbers, populating an
 # empty BENCHMARKS.md while exiting 0. Fail loud instead. Expect exactly one.
-BFIN_MATCHES=$(grep -c 'kybernet(); arch_halt();' "$BFIN_CYR" || true)
+#
+# ⛔⛔ MEASURED 2026-08-28 (1.56.51): THIS GUARD FIRED ON EVERY RUN AND `bench.sh` HAS BEEN DEAD
+# SINCE 2026-07-19. boot_finish.cyr grew a `power_quiesce_devices()` call between `kybernet()` and
+# `arch_halt()` on that date, so the two-call pattern this script searched for matched 0 and the
+# `-ne 1` branch exited 1 before anything was built. Every benchmark claim in that window rests on
+# a harness that never ran.
+# ⛔ THIS IS THE SAME DEFECT, IN THE SAME LINE OF THE SAME FILE, THAT scripts/ktest.sh CARRIED —
+# and ktest.sh WAS FIXED AT 1.56.44 while this verbatim copy of its guard was left behind. Two
+# scripts hardcoding one source line is the mechanism; when that line moves, whichever copy nobody
+# runs stays broken silently. ⚠ If a third consumer of this launch site ever appears, factor the
+# pattern out rather than making a third copy.
+# ⚠ Match the FULL launch line, not a substring: `arch_halt();` alone appears TWICE in
+# boot_finish.cyr (the no-shell fallback is the second), so a loosened pattern double-matches and
+# the exact-count check rejects a tree that is fine.
+# ⚠ power_quiesce_devices() is PRESERVED across the rewrite, for the same reason ktest.sh preserves
+# it: the bench path must quiesce exactly as production does, or bench measures a different shutdown.
+BFIN_LAUNCH='kybernet(); power_quiesce_devices(); arch_halt();'
+BFIN_MATCHES=$(grep -c "$BFIN_LAUNCH" "$BFIN_CYR" || true)
 if [ "$BFIN_MATCHES" -ne 1 ]; then
-    echo "ERROR: bench.sh expected exactly 1 'kybernet(); arch_halt();' launch site in $BFIN_CYR, found $BFIN_MATCHES" >&2
+    echo "ERROR: bench.sh expected exactly 1 '$BFIN_LAUNCH' launch site in $BFIN_CYR, found $BFIN_MATCHES" >&2
     echo "       the bench entry-point rewrite would no-op — boot_finish.cyr's launch site diverged from bench.sh's contract." >&2
     rm -f "$BFIN_BAK" "$TPROC_BAK"
     exit 1
 fi
-sed -i 's/kybernet(); arch_halt();/bench_run_all(); arch_halt();/' "$BFIN_CYR"
+sed -i 's/kybernet(); power_quiesce_devices(); arch_halt();/bench_run_all(); power_quiesce_devices(); arch_halt();/' "$BFIN_CYR"
+# ⭐ ASSERT THE REWRITE LANDED. The count check above proves the pattern was PRESENT; it does not
+# prove the sed replaced it. A guard that only checks the precondition is how the 2026-07-19 break
+# stayed invisible for six weeks in the first place.
+grep -q 'bench_run_all(); power_quiesce_devices(); arch_halt();' "$BFIN_CYR" || {
+    echo "ERROR: bench.sh's entry-point rewrite did not land in $BFIN_CYR" >&2
+    exit 1
+}
 
 # Restore the rewritten sources no matter how we exit from here (build error,
 # QEMU failure, parse failure). The trap fires before the EXIT, leaving

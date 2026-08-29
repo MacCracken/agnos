@@ -20,6 +20,121 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.56.51] — 2026-08-28 — P-1 sweep: the size-multiply overflow class, and four gates that could not fail
+
+### Security — ring-3 and remote memory-safety fixes
+
+- **`is_user_array(ptr, count, stride)`** (`kernel/core/syscall.cyr`) — the range validator for a
+  COUNT of fixed-size records. `is_user_range`'s wrap check guards the ADDITION and cannot guard a
+  multiplication performed in the caller's argument list: by then the wrapped product IS the length
+  it was handed. The new helper bounds `count` against `0x40000000 / stride` — a division, so it
+  cannot itself overflow — before multiplying. Rejecting a count above that bound costs nothing a
+  caller could want: the honest product would not fit the 1 GB user window either.
+- **`#81 readdir` / `#101 readdir_at`** (`kernel/core/ext2.cyr`) — `is_user_range(buf,
+  max_entries * 64)` with a ring-3 `max_entries` checked only for `<= 0`. `max_entries = 2^58` makes
+  the product exactly `2^64 == 0`, so the validator passed a zero-length window; `2^58 + 1` validated
+  64 bytes. The same unsanitised `max_entries` was the loop's only bound, so records written were
+  limited by the DIRECTORY's entry count, at `buf + count * 64`, past the `0x40000000` ceiling into
+  the 1–4 GB range the per-process CR3 mirrors. Record contents are the caller's own filenames, so
+  this was a controlled-content kernel write. Both arms now use `is_user_array`.
+- **`#99 proclist`** (`kernel/core/syscall.cyr`) — the same wrap on `arg2 * 64`, with the fill loop
+  bounded by the process count rather than `arg2`. Kernel-side records, so a disclosure as well as a
+  write.
+- **`#77 blk_read` / `#78 blk_write`** (`kernel/core/syscall.cyr`) — two composing defects. `total =
+  nsec * blk_lba_bytes` wrapped (`nsec = 2^55` at 512 B/LBA gives `2^64 == 0`), and `lba + nsec` in
+  the capacity check could itself overflow to a negative value, so a signed `>` bound passed on an
+  out-of-range request. `nsec` is now capped at `0x100000` and `lba` at `2^48` before the sum, and
+  the range check goes through `is_user_array`. `#78` is additionally gated on `blk_rw_armed`.
+- **`net_recv_udp`** (`kernel/core/net_ingress.cyr`) — returned `net_udp_buf_len`, the datagram's
+  UN-TRUNCATED length, after copying only `min(len, maxlen)`. `user/shell.cyr`'s `recv` verb sizes
+  its `kprint` by that return: a 512-byte stack buffer, a return of up to 1016, and up to **504
+  bytes of adjacent kernel stack** — saved registers, return addresses, the canary copy — printed to
+  the console and the klug ring. An oversized UDP datagram is the remote half of the trigger. Now
+  returns the bytes actually copied; truncation is deliberately not signalled (see the note at the
+  site).
+- Three further arithmetic-length call sites were audited and are correct as written — `#21
+  epoll_wait` (clamps to 16), `#39 blit` (8192x8192), `#66 snd_write` (1048576). Each already
+  carried a comment saying so; the four that were exploitable carried none.
+
+### Fixed — verification gates that could not fail
+
+- **`scripts/sweep.sh`'s PASS detector scored total failure as PASS.** `grep -qiE "smoke.*PASS"` —
+  the `-i` makes `PASS` match the substring inside "**pass**ed", so `=== fp-nm-smoke: 0 passed, 7
+  failed ===` satisfied it. Four of the twelve gates the sweep runs (`fp-area`, `fp-nm`, `fp-ctxsw`,
+  `fp-selftest`) report in that form. The smokes' own `exit 0`/`exit 1` was being discarded; it is
+  now the oracle, with a narrow log assertion against the exact trap.
+- **`scripts/sweep.sh` ignored a failed build** and ran the smoke against whichever `build/agnos` was
+  left on disk from a previous gate — a different compile-gated configuration wearing this gate's
+  name. A build failure is now the gate's verdict.
+- **`scripts/bench.sh` had exited 1 on every invocation since 2026-07-19.** Its launch-site guard
+  searched for `kybernet(); arch_halt();`; `power_quiesce_devices()` was inserted between the two on
+  that date. `scripts/ktest.sh` carried the identical guard, hit the identical break, and was fixed
+  at 1.56.44 — this verbatim copy was not. The rewrite is now asserted to have landed, not merely
+  its precondition checked.
+- **`scripts/test.sh`'s aarch64 half could not produce a failure, by two independent routes.** Its
+  cross-compiler probe named `cc5_aarch64`, dropped at cyrius v6.1.0, so it took a bare `return` on
+  every run; and past that probe a compile FAILURE printed "SKIP" and recorded nothing. `--all`
+  reported "4 passed, 0 failed" with the aarch64 half inert.
+- **`scripts/test.sh` built and validated a kernel the project does not ship.** `build.sh` prepends
+  `#define ELF64_KERNEL` and exports `CYRIUS_ELF64_KERNEL=1`; `test.sh` set neither, producing
+  multiboot1/ELF32 (entry `0x100060`) while `build/agnos` is multiboot2/ELF64 (entry `0x1000a8`).
+  The ELF assertion was pinned to the former and passed. It now builds the shipped configuration and
+  derives the expected shape from `EI_CLASS`, as `build.sh` does.
+- **`build.sh`'s multiboot/ELF validation could not fail the build**, and reported every validation
+  failure as "python3 not available" — a `||` consumed the status. The two conditions are now
+  distinct: a missing interpreter is a soft skip, a bad boot header is fatal.
+- **The CI "Security Scan" job could not fail**, and all 8 hits it reported were false positives.
+  `WARN=1` was assigned and then only echoed; `grep -rn 'syscall('` had no left word boundary and
+  matched `test_hw_syscall(`. The raw-syscall check is now precise and gating, with a vacuity floor
+  on the source count; the two undecidable checks are printed as INFO and explicitly do not gate.
+- **`scripts/build.sh --aarch64` left a stale artifact on failure.** `build/agnos-aarch64` on the dev
+  box was a **May 12** binary while every build since had failed. The output is deleted before the
+  compile, so a failure leaves nothing.
+
+### Fixed — release tooling
+
+- **`scripts/version-bump.sh` reported updating `CHANGELOG.md` while doing nothing.** It anchored on
+  `## [Unreleased]`, a heading this file does not have; `sed` matching nothing exits 0. The section
+  is now inserted above the first `## [` heading and the result is asserted.
+- **`scripts/build.sh` now enforces the toolchain pin.** The kernel compiles from `$ROOT/kernel`,
+  which has no manifest, and the cyrius wrapper resolves `cyrius.cyml` at the compile cwd with no
+  ancestor walk-up — so the root pin was read by nothing during a kernel build and the wrapper's
+  drift warning was structurally unreachable. Measured: pin `6.3.9` and pin `6.5.36` produced the
+  byte-identical `build/agnos` with no warning, twelve minors apart. `build.sh` now compares the pin
+  against the toolchain the compile will actually use and fails on drift; `AGNOS_ALLOW_PIN_DRIFT=1`
+  is the deliberate override.
+- **`KASHI_REF` re-diverged across the three scripts** (build 1.0.6, test 1.0.4, bench 1.0.4, with a
+  comment naming 1.0.0). All three now default **1.0.6**, matching `../kashi/VERSION`. Invisible
+  locally because `[deps.kashi] path` wins; it decides which kashi a clean checkout gets.
+
+### Changed
+
+- **cyrius pin 6.5.28 -> 6.5.36** across all nine manifests (`toolchain-pin-check.sh` 9/9).
+- **`arch/aarch64`** — `stubs.cyr`'s `ksyscall` and `main.cyr` still used the bare `proc_current`
+  global, removed at 1.46.x SMP sub-bite 2 with the stated intent that "any unconverted read fails to
+  COMPILE". It did fail to compile; the aarch64 build was ungated, so nothing read the failure. Both
+  converted to `proc_current_get()` / `proc_current_set()`.
+- **`CLAUDE.md`** — the documented boot command `qemu-system-x86_64 -kernel build/agnos` does not
+  work and has not since the kernel became ELF64/multiboot2: QEMU rejects it for want of a PVH note.
+  Replaced with the gnoboot + OVMF path in both places, and in `kernel/agnos.cyr`'s header. Gate
+  counts corrected: `check.sh` is 30 gates, not 11; `test.sh --all` tops out at 5 checks, not 7.
+
+### Known — not fixed in this cut
+
+- **aarch64 does not compile**: 30 reachable undefined functions and 18 undefined variables;
+  `arch/aarch64/stubs.cyr` has not kept up with `core/`. `test.sh --all` is now RED because of it,
+  which is the honest state.
+- **`#77 blk_read` on a registered non-active handle is still unbounded in LBA** — `blk_capacity` is
+  the active backend's alone (`block.cyr:38`) and `blk_info#79` already reports 0 for other handles.
+  Closing it needs per-handle capacity, a `block.cyr` registration change.
+- **`scripts/smoke/agnsh-smoke.sh` is flaky under host load** (~1 in 4 here): the failing runs stall
+  in the UEFI boot-device menu and never load the kernel. `sweep.sh` retries twice for this class;
+  the standalone smoke does not. Raising `QEMU_TIMEOUT` does not help.
+
+Build: `build/agnos` **1,988,704 B** (multiboot2/ELF64, entry `0x1000a8`). `check.sh` 30/30,
+`test.sh` (x86) 4/4.
+
+
 ## [1.56.50] — 2026-08-28 — `#101 readdir_at`: a directory listing that can resume
 
 ### Added

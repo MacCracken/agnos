@@ -45,7 +45,13 @@ var sys_exit_code = 0;
 fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 0) { sys_exit_code = arg1; return 0; }
     if (num == 1) { return vfs_write(arg1, arg2, arg3); }
-    if (num == 2) { return proc_current; }
+    # 1.56.51: was `return proc_current;` — a bare global REMOVED at 1.46.x SMP sub-bite 2, where
+    # per-CPU state replaced it and core/proc.cyr's header states the removal was deliberate so
+    # "any unconverted read fails to COMPILE (the review's forcing-function safety net)". It did
+    # fail to compile, here and at arch/aarch64/main.cyr — but the aarch64 build was ungated
+    # (test.sh's cross-compiler probe named a binary dropped at cyrius v6.1.0), so the forcing
+    # function fired into a build nobody ran. Converted to the accessor, not re-globalised.
+    if (num == 2) { return proc_current_get(); }
     if (num == 5) { return vfs_read(arg1, arg2, arg3); }
     if (num == 6) { return vfs_close(arg1); }
     if (num == 7) { return initrd_open(arg1, arg2); }

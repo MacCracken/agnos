@@ -37,7 +37,10 @@ serial_println("Initrd mounted", 14);
 
 # Initialize process table
 proc_count = 0;
-proc_current = 0;
+# 1.56.51: was `proc_current = 0;` — see the note at arch/aarch64/stubs.cyr's ksyscall(num==2).
+# The global was removed at 1.46.x; this is the per-CPU accessor. Under aarch64 `cpu_count` is 1
+# (stubs.cyr), so the accessor takes its single-core fast path and writes slot 0 with no APIC read.
+proc_current_set(0);
 var p0 = proc_create(0);
 
 serial_println("Launching kybernet...", 21);

@@ -37,15 +37,28 @@ Do not inline state in this file — see Core rule above.
 sh scripts/build.sh                     # x86_64
 sh scripts/build.sh --aarch64           # aarch64 cross-compile
 
-# Boot on QEMU — `-cpu max` is mandatory (boot shim sets SMEP+SMAP in CR4)
-qemu-system-x86_64 -kernel build/agnos -cpu max -serial stdio -display none
+# Boot on QEMU — via gnoboot + OVMF. `-cpu max` is mandatory (boot shim sets SMEP+SMAP in CR4).
+# ⛔ `qemu-system-x86_64 -kernel build/agnos` DOES NOT WORK and this file documented it until
+# 1.56.51. The kernel has been ELF64/multiboot2 since Path C; an ELF64 image carries no PVH note,
+# so QEMU's Linux-protocol loader rejects it outright:
+#     qemu-system-x86_64: Error loading uncompressed kernel without PVH ELF Note
+# Booting needs a GPT image with gnoboot's BOOTX64.EFI on the ESP, which the smokes construct.
+# Use one of those rather than hand-rolling it:
+sh scripts/smoke/agnsh-smoke.sh         # boot to the agnsh prompt (needs ../gnoboot, ../agnoshi, OVMF)
+sh scripts/ktest.sh                     # in-kernel test suite under the same gnoboot path
 
 # Verify
 sh scripts/test.sh                      # x86_64 (default)
-sh scripts/test.sh --aarch64            # aarch64 (compile test)
+sh scripts/test.sh --aarch64            # aarch64 (compile test) — ⛔ RED as of 1.56.51, see below
 sh scripts/test.sh --all                # both
-sh scripts/check.sh                     # 11-point project validation
+sh scripts/check.sh                     # 30-gate project validation
 ```
+
+⛔ **aarch64 does not currently compile.** `sh scripts/build.sh --aarch64` fails with 30 reachable
+undefined functions and 18 undefined variables — `arch/aarch64/stubs.cyr` has not kept up with
+`core/`. It went unnoticed because `test.sh`'s cross-compiler probe named `cc5_aarch64`, a binary
+dropped at cyrius v6.1.0, so the aarch64 half of `--all` took an early return on every run and
+scored nothing. Both the probe and the silent-skip are fixed at 1.56.51; the port itself is not.
 
 ## Scaffolding
 
@@ -118,8 +131,14 @@ Release flow: `version-bump.sh` → fill CHANGELOG entries → commit → `git t
 
 Ship as the last patch of the current minor (e.g., `1.27.2` before `1.28.0`).
 
-1. **Full test sweep** — `scripts/check.sh` 11/11, `scripts/test.sh --all` 7/7.
-2. **Boot sweep** — `qemu-system-x86_64 -kernel build/agnos -cpu max -serial stdio` reaches every named checkpoint (banner / `Memory isolation: PASS` / `Userland exec complete` / `=== done ===`).
+1. **Full test sweep** — `scripts/check.sh` **30/30**, `scripts/test.sh` (x86) **4/4**.
+   ⚠ These counts were "11/11" and "`--all` 7/7" until 1.56.51 and neither was reachable: check.sh
+   has grown to 30 gates, and `--all` tops out at 5 checks of which the aarch64 one is currently a
+   FAIL. Re-read the tallies from a real run when you touch this list; do not copy them forward.
+2. **Boot sweep** — boot via gnoboot + OVMF (`scripts/smoke/agnsh-smoke.sh`, or `scripts/ktest.sh`
+   for the in-kernel suite) and confirm every named checkpoint (banner / `Memory isolation: PASS` /
+   `Userland exec complete` / `=== done ===`). ⛔ NOT `qemu -kernel`, which this step named until
+   1.56.51 — QEMU rejects the ELF64 image for want of a PVH note, so that command booted nothing.
 3. **Dead-code audit** — review the `dead: <fn>` list from `cyrius build`; remove anything no longer earned.
 4. **Code review pass** — walk the minor's diffs end-to-end for missed `#ifdef` guards (cross-arch leak class), unguarded asm, off-by-ones in fixup arithmetic, silently-ignored errors.
 5. **Cleanup sweep** — stale comments referencing old version pins, dead `#ifdef` branches, unused includes, orphaned files in `build/`.

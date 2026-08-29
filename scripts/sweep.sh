@@ -30,15 +30,47 @@ run_gate() {
     if [ "$smoke" = "CHECK" ]; then
         if sh "$ROOT/scripts/check.sh" > "/tmp/sweep-gate.log" 2>&1; then ok=1; tail -1 /tmp/sweep-gate.log; else tail -3 /tmp/sweep-gate.log; fi
     else
-        env $buildenv sh "$ROOT/scripts/build.sh" >/dev/null 2>&1 || { echo "  BUILD FAILED"; }
+        # ⛔ MEASURED 2026-08-28 (1.56.51): A FAILED BUILD USED TO BE PRINTED AND THEN IGNORED.
+        # The old form was `… || { echo "  BUILD FAILED"; }` — the `||` consumed the status, `ok`
+        # was untouched, and the loop below went on to run the smoke against WHATEVER build/agnos
+        # was left on disk from a previous gate. A gate whose build failed could therefore still be
+        # recorded PASS, on a binary built with a DIFFERENT $buildenv than the one it is testing.
+        # Every gate here exists to test one specific compile-gated configuration; running the
+        # previous gate's kernel is not a degraded test, it is a different test wearing this one's
+        # name. A build failure is now the gate's verdict.
+        if ! env $buildenv sh "$ROOT/scripts/build.sh" >/dev/null 2>&1; then
+            echo "  BUILD FAILED ($buildenv) — gate not run"
+            fail=$((fail+1)); results="$results\n  FAIL  $label (build)"
+            return
+        fi
         for attempt in 1 2; do
             # ⚠ smokes live in scripts/smoke/ since the 1.56.22 split. The gate table below still
             # names them bare (that is the readable form), so resolve here rather than editing 30
             # table rows — and fall back to the old flat location so a not-yet-moved smoke still runs.
             SMOKE_PATH="$ROOT/scripts/smoke/$smoke"
             [ -f "$SMOKE_PATH" ] || SMOKE_PATH="$ROOT/scripts/$smoke"
-            sh "$SMOKE_PATH" > "/tmp/sweep-gate.log" 2>&1
-            if grep -qiE "smoke.*PASS|smoke \(.*\): PASS" "/tmp/sweep-gate.log"; then ok=1; break; fi
+            # ⛔⛔ MEASURED 2026-08-28 (1.56.51): THE OLD DETECTOR RECORDED TOTAL FAILURE AS PASS.
+            # It was `grep -qiE "smoke.*PASS|smoke \(.*\): PASS"`. The `-i` makes the literal PASS
+            # match the substring "pass" inside the word "passed" — so a smoke whose FAILURE verdict
+            # reads `=== fp-nm-smoke: 0 passed, 7 failed ===` satisfies `smoke.*pass` and was scored
+            # a PASS. Fed the real runtime strings, the old pattern says PASS to all of these:
+            #     === fp-area-smoke: 3 passed, 5 failed ===
+            #     === fp-nm-smoke: 0 passed, 7 failed ===
+            #     === fp-ctxsw-smoke: 1 passed, 2 failed ===
+            #     === fp-selftest-smoke: 4 passed, 9 failed ===
+            # Those are FOUR of the twelve gates this sweep runs. A "15/15" or "16/16" from the old
+            # sweep did not mean what it said for any smoke reporting in the "N passed, M failed"
+            # form — it meant only that the smoke reached its verdict line at all.
+            # ⭐ AND THE CORRECT ORACLE WAS ALREADY THERE, BEING THROWN AWAY: every one of these
+            # smokes exits 0 on success and 1 on failure (`[ "$fail" -eq 0 ] && { …; exit 0; }; …;
+            # exit 1`). The status is now primary. The log grep is kept only as a SECOND, narrow
+            # assertion against the exact trap above — a smoke that exits 0 while printing
+            # "N passed, M failed" with M>0 is itself broken, and must not be scored a pass.
+            sh "$SMOKE_PATH" > "/tmp/sweep-gate.log" 2>&1 && smoke_rc=0 || smoke_rc=$?
+            if [ "$smoke_rc" = 0 ] \
+               && ! grep -qE 'passed, [1-9][0-9]* failed' "/tmp/sweep-gate.log"; then
+                ok=1; break
+            fi
         done
         grep -iE "PASS:|FAIL:|smoke:" "/tmp/sweep-gate.log" | sed 's/^/  /' || true
         [ "$ok" = 1 ] && [ "${attempt:-1}" = 2 ] && echo "  (passed on retry — transient host-load timing)"

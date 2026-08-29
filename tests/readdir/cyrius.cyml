@@ -4,13 +4,15 @@ version = "0.1.0"
 description = "agnos ring-3 resumable-readdir exerciser (#101, 1.56.50) — reads a directory in small batches via readdir_at's cursor and proves the paged walk sees exactly what the single-shot #81 sees; exits 95 iff the whole contract holds."
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.5.28"
+cyrius = "6.5.36"
 
 [build]
 src = "rdat.cyr"
 output = "build/rdat"
 
-# `syscalls` gives SYS_EXIT, sys_readdir (#81) and the raw `syscall()` used for #101 — the
-# stdlib has no sys_readdir_at wrapper yet, so the number is named here instead of inlined.
+# `syscalls` gives SYS_EXIT, sys_readdir (#81), and — since the 6.5.36 pin — SYS_READDIR_AT +
+# sys_readdir_at (#101) as a real wrapper. rdat.cyr still issues #101 through the raw
+# `syscall()` ON PURPOSE: this is the ABI exerciser, and routing it through the stdlib wrapper
+# would make it test the wrapper's agreement with itself rather than the kernel's arm.
 [deps]
 stdlib = ["syscalls"]
