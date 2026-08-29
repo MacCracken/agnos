@@ -60,14 +60,41 @@ cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/agnsh.log"
 echo "Booting production kernel (NVMe + ext2 with /bin/agnsh)..."
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
-qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
-    qemu-system-x86_64 \
-    -machine q35 -m 512M -cpu max \
-    -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
-    -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
-    -drive "file=$IMG,format=raw,if=none,id=disk0" \
-    -device "nvme,drive=disk0,serial=AGNOS-AGNSH" \
-    -serial stdio -display none -no-reboot
+
+# ⛔⛔ 1.56.51: RETRY ONLY WHEN THE KERNEL NEVER RAN — AND NEVER WHEN IT DID.
+# Measured 2026-08-28: this smoke fails roughly 1 run in 4 on an otherwise idle box, and far more
+# often under load (it failed 3 of 5 while a 12-agent audit was saturating the CPU). Every failing
+# run has the same signature: the serial log ends in OVMF's "Please select boot device" menu and
+# the kernel banner NEVER APPEARS. The firmware did not hand off, so the kernel under test never
+# executed — the run measured nothing. Raising QEMU_TIMEOUT does not help; the menu is terminal,
+# not slow. That flake cost a wrong bisect during the 1.56.51 sweep: a kernel change was blamed for
+# a boot failure and then found to pass 2 of 3 re-runs on the identical binary.
+# ⭐ THE RETRY IS PRINCIPLED, NOT BLIND, AND THAT DISTINCTION IS THE WHOLE POINT. "The kernel never
+# started" and "the kernel started and failed an assertion" are different events and only the first
+# is retryable. Gating on the banner keeps a REAL regression from being retried away — which is
+# exactly the risk in sweep.sh's unconditional double-run, where a genuine failure gets two chances
+# to look like a flake. If the banner is present, whatever the assertions say is the verdict.
+QEMU_TRIES="${QEMU_TRIES:-3}"
+qtry=1
+while [ "$qtry" -le "$QEMU_TRIES" ]; do
+    cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
+    qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
+        qemu-system-x86_64 \
+        -machine q35 -m 512M -cpu max \
+        -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
+        -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
+        -drive "file=$IMG,format=raw,if=none,id=disk0" \
+        -device "nvme,drive=disk0,serial=AGNOS-AGNSH" \
+        -serial stdio -display none -no-reboot
+    if strings "$LOG" | grep -q "AGNOS kernel v"; then break; fi
+    if [ "$qtry" -lt "$QEMU_TRIES" ]; then
+        echo "  (firmware never handed off — kernel did not start; retrying $qtry/$((QEMU_TRIES - 1)))"
+    else
+        echo "  UEFI never handed off to the kernel in $QEMU_TRIES attempts — INFRASTRUCTURE, not the kernel."
+        echo "  The assertions below therefore describe nothing; treat this run as VOID, not as a failure."
+    fi
+    qtry=$((qtry + 1))
+done
 
 echo ""
 echo "  --- boot tail (kybernet onward) ---"

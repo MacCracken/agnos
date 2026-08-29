@@ -64,6 +64,17 @@ fn elf_load(elf_addr, elf_size) {
             var v_vaddr  = load64(vph + 16);
             var v_filesz = load64(vph + 32);
             var v_memsz  = load64(vph + 40);
+            # ⛔ 1.56.51 SECURITY FIX — NEGATIVE FILE OFFSETS. Every bound below is an UPPER bound
+            # and every comparison is SIGNED (cyrius integers are i64; there is no unsigned type), so
+            # a negative v_offset passed all three: it is not >= the size, and adding a small positive
+            # filesz keeps the sum below the size too. Nothing anywhere tested for < 0. The mapping
+            # loop then computes its copy source as `base + v_offset + (lo - p_vaddr)` and memcpy is an
+            # unchecked byte copy, so a crafted PT_LOAD with v_offset = -0x100000 reads kernel memory
+            # BELOW the image and delivers it into a page the child maps at ring 3 — an arbitrary
+            # kernel-memory disclosure through spawn#3, with the attacker choosing the offset.
+            # All four check sites (both loaders, pre-pass and mapping loop) get the same floor.
+            if (v_offset < 0) { return 0 - 1; }
+            if (v_filesz < 0) { return 0 - 1; }
             if (v_offset >= elf_size) { return 0 - 1; }
             if (v_filesz > elf_size) { return 0 - 1; }
             if (v_offset + v_filesz > elf_size) { return 0 - 1; }
@@ -92,6 +103,17 @@ fn elf_load(elf_addr, elf_size) {
             var p_flags = load32(ph + 4);             # 1.50.6 W^X: PF_X=0x1 (executable)
 
             # Security: validate segment bounds within ELF file
+            # ⛔ 1.56.51 SECURITY FIX — NEGATIVE FILE OFFSETS. Every bound below is an UPPER bound
+            # and every comparison is SIGNED (cyrius integers are i64; there is no unsigned type), so
+            # a negative p_offset passed all three: it is not >= the size, and adding a small positive
+            # filesz keeps the sum below the size too. Nothing anywhere tested for < 0. The mapping
+            # loop then computes its copy source as `base + p_offset + (lo - p_vaddr)` and memcpy is an
+            # unchecked byte copy, so a crafted PT_LOAD with p_offset = -0x100000 reads kernel memory
+            # BELOW the image and delivers it into a page the child maps at ring 3 — an arbitrary
+            # kernel-memory disclosure through spawn#3, with the attacker choosing the offset.
+            # All four check sites (both loaders, pre-pass and mapping loop) get the same floor.
+            if (p_offset < 0) { return 0 - 1; }
+            if (p_filesz < 0) { return 0 - 1; }
             if (p_offset >= elf_size) { return 0 - 1; }
             if (p_filesz > elf_size) { return 0 - 1; }
             if (p_offset + p_filesz > elf_size) { return 0 - 1; }
@@ -106,6 +128,27 @@ fn elf_load(elf_addr, elf_size) {
             # crafted p_vaddr can't land a segment inside [0x10000000,0x40000000)
             # and alias the process's own future mmap/munmap. Legit segments are
             # well under 256 MB (p_vaddr >= 2 MB, p_memsz <= 32 MB).
+            #
+            # ⚠ 1.56.51 AUDIT — THIS CEILING IS A MITIGATION, NOT A CLOSED CLASS, AND THE GAP IS
+            # STRUCTURAL. The accepted span [0x400000, 0x10000000) is PD[2..127], and
+            # proc_create_address_space builds those very slots as the KERNEL IDENTITY window before
+            # the loader overwrites them: proc_map_page's only index math is
+            # `pd_idx = (virt >> 21) & 0x1FF`, so a PT_LOAD at 0xC00000 replaces PD[6] with
+            # `user_phys | 0x87` and the identity mapping for physical 12-14 MB is gone FOR THAT
+            # PROCESS. It matters because the kernel dereferences physical addresses AS virtual ones
+            # through that window while running under a per-process CR3 — the hazard pmm.cyr's
+            # `pmm_bitmap_use_directmap` header already states in general terms: "any kernel datum
+            # touched while running under a per-proc CR3 must be reached via the direct-map, never a
+            # <=256 MB identity VA". The PMM bitmap was fixed that way; nothing else was.
+            # ⛔ NARROWING THIS CONSTANT DOES NOT CLOSE IT — it only shrinks the window, because
+            # pmm_alloc_2mb can hand out any frame in the range and the collision is with WHATEVER
+            # was allocated there, not with a fixed layout. And the margin is thinner than it looks:
+            # measured 2026-08-28 across 1,335 ELF64 binaries in the sibling trees, the largest real
+            # userland image reaches p_vaddr + p_memsz = 0x14fce30 (**20.99 MB**, thoth_test), so a
+            # 32 MB ceiling leaves ~50% headroom and a 16 MB one would already reject shipped code.
+            # ⭐ THE ACTUAL FIX IS ARCHITECTURAL — move the user image above the kernel identity
+            # window, or stop reaching kernel data through identity VAs under a per-process CR3.
+            # Do not silently trade one for the other by editing this number.
             if (p_vaddr + p_memsz > 0x10000000) { return 0 - 1; }
 
             # 1.44.8: populate each 2 MB page via its PHYSICAL (kernel-identity) address —
@@ -268,6 +311,17 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
             var v_vaddr  = load64(vph + 16);
             var v_filesz = load64(vph + 32);
             var v_memsz  = load64(vph + 40);
+            # ⛔ 1.56.51 SECURITY FIX — NEGATIVE FILE OFFSETS. Every bound below is an UPPER bound
+            # and every comparison is SIGNED (cyrius integers are i64; there is no unsigned type), so
+            # a negative v_offset passed all three: it is not >= the size, and adding a small positive
+            # filesz keeps the sum below the size too. Nothing anywhere tested for < 0. The mapping
+            # loop then computes its copy source as `base + v_offset + (lo - p_vaddr)` and memcpy is an
+            # unchecked byte copy, so a crafted PT_LOAD with v_offset = -0x100000 reads kernel memory
+            # BELOW the image and delivers it into a page the child maps at ring 3 — an arbitrary
+            # kernel-memory disclosure through spawn#3, with the attacker choosing the offset.
+            # All four check sites (both loaders, pre-pass and mapping loop) get the same floor.
+            if (v_offset < 0) { return 0 - 1; }
+            if (v_filesz < 0) { return 0 - 1; }
             if (v_offset >= fsize) { return 0 - 1; }
             if (v_filesz > fsize) { return 0 - 1; }
             if (v_offset + v_filesz > fsize) { return 0 - 1; }
@@ -300,6 +354,17 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
             var p_memsz  = load64(ph + 40);
             var p_flags  = load32(ph + 4);             # 1.50.6 W^X: PF_X=0x1 (executable) / PF_W=0x2 / PF_R=0x4
             # Same security bounds as elf_load, validated against the file size.
+            # ⛔ 1.56.51 SECURITY FIX — NEGATIVE FILE OFFSETS. Every bound below is an UPPER bound
+            # and every comparison is SIGNED (cyrius integers are i64; there is no unsigned type), so
+            # a negative p_offset passed all three: it is not >= the size, and adding a small positive
+            # filesz keeps the sum below the size too. Nothing anywhere tested for < 0. The mapping
+            # loop then computes its copy source as `base + p_offset + (lo - p_vaddr)` and memcpy is an
+            # unchecked byte copy, so a crafted PT_LOAD with p_offset = -0x100000 reads kernel memory
+            # BELOW the image and delivers it into a page the child maps at ring 3 — an arbitrary
+            # kernel-memory disclosure through spawn#3, with the attacker choosing the offset.
+            # All four check sites (both loaders, pre-pass and mapping loop) get the same floor.
+            if (p_offset < 0) { return 0 - 1; }
+            if (p_filesz < 0) { return 0 - 1; }
             if (p_offset >= fsize) { return 0 - 1; }
             if (p_filesz > fsize) { return 0 - 1; }
             if (p_offset + p_filesz > fsize) { return 0 - 1; }

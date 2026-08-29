@@ -176,7 +176,7 @@ fn klug_spill_prepare() {
     if (ino <= 0) { kprintln("klug: spill file unavailable", 28); return 0; }
     # Allocate every block now, while the console is alive and a failure is readable. The content written
     # here is the ring as it stands at mount (mostly zeros this early) and is fully overwritten by a spill.
-    if (ext2_write_at(ino, 0, &klug_buf, 65536) <= 0) {
+    if (ext2_write_at_dma(ino, 0, &klug_buf, 65536) <= 0) {
         kprintln("klug: spill preallocation failed", 32);
         return 0;
     }
@@ -196,14 +196,14 @@ fn klug_spill() {
     var n = 0;
     if (klug_count >= 65536) {
         var tail = 65536 - klug_head;                                  # oldest run: head -> end
-        if (ext2_write_at(klug_spill_ino, 0, &klug_buf + klug_head, tail) <= 0) { return 0; }
+        if (ext2_write_at_dma(klug_spill_ino, 0, &klug_buf + klug_head, tail) <= 0) { return 0; }
         n = tail;
         if (klug_head > 0) {
-            if (ext2_write_at(klug_spill_ino, tail, &klug_buf, klug_head) > 0) { n = n + klug_head; }
+            if (ext2_write_at_dma(klug_spill_ino, tail, &klug_buf, klug_head) > 0) { n = n + klug_head; }
         }
     }
     if (klug_count < 65536) {
-        if (ext2_write_at(klug_spill_ino, 0, &klug_buf, klug_head) <= 0) { return 0; }
+        if (ext2_write_at_dma(klug_spill_ino, 0, &klug_buf, klug_head) <= 0) { return 0; }
         n = klug_head;
     }
     return n;

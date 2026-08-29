@@ -56,6 +56,83 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   epoll_wait` (clamps to 16), `#39 blit` (8192x8192), `#66 snd_write` (1048576). Each already
   carried a comment saying so; the four that were exploitable carried none.
 
+### Security — second P0 batch (audit sweep, all verified against the code before fixing)
+
+- **`elf_load` / `elf_load_from_file`: a NEGATIVE `p_offset` was accepted.** All three file-offset
+  checks are upper bounds and every comparison is signed, so a negative offset passed each one: it is
+  not `>= elf_size`, and adding a small positive `p_filesz` keeps the sum below it. The mapping loop
+  computes its copy source as `elf_addr + p_offset + (lo - p_vaddr)` and `memcpy` is unchecked, so a
+  crafted PT_LOAD read kernel memory *below* the image and delivered it into a page the child maps at
+  ring 3 — an arbitrary kernel-memory disclosure through `spawn#3`. A non-negative floor is now
+  applied at all four check sites (both loaders, pre-pass and mapping loop).
+- **`ext2_readlink`: the fast-symlink path had no 60-byte cap.** `tlen` is `i_size` off the disk and
+  the only gates were `tlen < 1` and `tlen > cap` — where `cap` is the *caller's* buffer, never the
+  source's. A fast symlink's target lives in the 60-byte `i_block[]` area inside a 512-byte scratch
+  of which at most 256 is filled, so an inode with `i_blocks == 0` and `i_size = 4096` made
+  `readlink#70` copy ~3.6 KB of adjacent kernel BSS out to ring 3. Bound now comes from the format.
+- **`ext2_dir_try_insert` / `ext2_dir_remove` skipped `ext2_dirent_valid`.** All four read-side
+  walkers gate every record on it; the two write-side walkers did not, so `off` could sit anywhere
+  in `[0, lim)` with no requirement that a record fits. Case B writes at `off + e_real` where
+  `e_real` derives from the on-disk `name_len` and reaches 264 — a block with a live entry at 4080
+  and `name_len = 255` writes 248 bytes past the 4096-byte `ext2_dir_buf`, carrying an
+  attacker-influenced filename. Both walkers now use the predicate, and both insert sites bound the
+  write against `lim`.
+- **`shm_create` and `shm_create_gpu` handed ring 3 unscrubbed memory.** `pmm_alloc_2mb` only flips
+  bitmap bits and `pmm_free_2mb` only clears them, so a region carries whatever the previous owner
+  left. Every other consumer already compensates (`sys_mmap`, both ELF loaders, `chan_region_reserve`
+  — the last with the rationale spelled out); these two arms did not. The GPU variant is worse in
+  kind: a carveout slot lives at a fixed offset per index, so client A's freed framebuffer reaches
+  client B verbatim. Both scrub now.
+- **Direct-DMA destinations in `ext2_read_at` / `ext2_write_at` are now opt-in.** Both coalescing
+  paths hand `dst` / `srcp` to `blk_{read,write}_sectors_direct`, which passes the value through to
+  the controller **as a physical address**. The gates tried to prove that with
+  `(p & 0xFFF) == 0 && p + bs <= 0x10000000` on the belief that 0-256 MB is identity under the
+  per-process CR3 — but `elf.cyr` overwrites exactly those PD slots with `pmm_alloc_2mb()` frames for
+  every PT_LOAD, so for a ring-3 address `VA != phys`. `read#5` passes the ring-3 buffer straight
+  through with no bounce, and `ext2_read_coalesce_max` is 16, so the path was live. Now default-deny
+  behind `ext2_read_at_dma` / `ext2_write_at_dma` wrappers that cannot leak the armed state; the
+  kernel-buffer callers (`vfs_read_file`, `vfs_read_file_at`, the klug spill) opt in, and the ring-3
+  arms of `vfs_read` / `vfs_write` deliberately do not.
+- **Device-reported LBA size is now validated at registration.** `blk_lba_bytes` is the per-LBA copy
+  length for both raw-block syscalls and the buffer is a fixed 4096-byte `blk_sc_bounce`, yet every
+  backend stored the device's claim verbatim — MSC decodes the SCSI READ CAPACITY(10) u32 and
+  rejected only `== 0`; NVMe computes `1 << lbads` from 8 device bits. `blk_lba_bytes_ok()` now gates
+  all four device-fed `blk_register_*` arms to {512, 4096} and logs its refusal. ⚠ The check is
+  **also** applied in `msc_register_block_dev` before its policy branches, because the NVMe-primary
+  and AHCI-primary arms call `blk_mark_registered(BLK_USB_MS)` directly and skip registration
+  entirely — the registered bit is what `blk_read_on` gates on, so those two paths bypassed the gate.
+- **`gpu_fill#85`: the band bound was a signed add that itself wrapped.** `y0` and `h` arrive as raw
+  syscall registers. With `pitch = 10240`, `y0 = h = 2^51` gives `off = span = 2^62` (both positive,
+  so `off < 0` and `span <= 0` both pass) and `off + span` reaches `2^63`, reading as
+  `INT64_MIN` — so `> gpu_bb_fbsize` is false and the guard passes. The fill then issued at
+  `tgt_mc + 2^62` for a byte count `gpu_cp_dma_fill` masks rather than rejects. Operands are now
+  bounded against the row count before any multiply.
+- **`#92` op 0x09 (TRI_RGBA): the edge slot id was never validated.** With DERIVE clear, `gpo_execute`
+  resolves `rec + 12` as `load64(&shm_mc + (id - 1) * 8)` into a 16-entry (128-byte) table using a
+  ring-3 u32 — `id = 0xFFFFFFFF` loads ~34 GB past it, `id = 0` loads 8 bytes before it, and the
+  result becomes a GPU MC address handed to the rasteriser. Seven sibling validators carry the slot
+  check; only this path lacked it, and its DERIVE alternative is rejected as `NOTIMPL`, so the
+  unchecked route was the only accepted one.
+- **`iommu.cyr`: `iommu_base` was added twice.** `iommu_write64`/`iommu_read64` take a bare register
+  offset and add the base themselves; the IOTLB invalidate pair passed `iommu_base + iro + 8`,
+  making the effective address `iommu_base * 2 + iro + 8` — a 64-bit store ~8.5 GB outside the mapped
+  window. The global IOTLB invalidate therefore never reached the hardware and translation was
+  enabled with a stale IOTLB. Latent on AMD Zen (`iommu_active` stays 0), live on Intel VT-d.
+
+### Fixed — the QEMU boot flake that was corrupting verification
+
+- **`qemu_dwell_kernel`** (`scripts/smoke/lib/qemu-dwell.sh`) — roughly 1 boot in 4 on this box (far
+  more under load) never leaves OVMF: the serial log ends in "Please select boot device" and the
+  kernel banner never appears, so the run measured nothing while its assertions reported a wall of
+  failures. Raising `QEMU_TIMEOUT` does not help — the menu is terminal, not slow. The new helper
+  retries **only when the kernel banner is absent**, which is what makes it sound: a real regression
+  gets no second chance, unlike `sweep.sh`'s unconditional double-run. Adopted by `agnsh-smoke`,
+  `exec-smoke` and `edge-abi-smoke`. ⚠ This flake cost a wrong bisect during this sweep — a kernel
+  change was blamed for a boot failure, then found to pass 2 of 3 re-runs on the identical binary.
+- **`edge-abi-smoke` now exits VOID (2) instead of faking 22 ABI failures** when the kernel never
+  started. Its own header already stated the principle for the truncated case; a never-booted run is
+  the stronger form of it.
+
 ### Fixed — verification gates that could not fail
 
 - **`scripts/sweep.sh`'s PASS detector scored total failure as PASS.** `grep -qiE "smoke.*PASS"` —
@@ -127,11 +204,19 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 - **`#77 blk_read` on a registered non-active handle is still unbounded in LBA** — `blk_capacity` is
   the active backend's alone (`block.cyr:38`) and `blk_info#79` already reports 0 for other handles.
   Closing it needs per-handle capacity, a `block.cyr` registration change.
-- **`scripts/smoke/agnsh-smoke.sh` is flaky under host load** (~1 in 4 here): the failing runs stall
-  in the UEFI boot-device menu and never load the kernel. `sweep.sh` retries twice for this class;
-  the standalone smoke does not. Raising `QEMU_TIMEOUT` does not help.
+- **The UEFI boot flake is contained, not cured.** `qemu_dwell_kernel` retries it away for
+  `agnsh-smoke` / `exec-smoke` / `edge-abi-smoke`; the ~30 other smokes still call `qemu_dwell`
+  directly and will keep reporting a never-booted run as a wall of failures. The root cause — OVMF
+  dropping to the boot-device menu instead of the removable-media path — is unexplained.
+- **`edge-abi-smoke` (the 167-case `#92` ABI battery) could not be run on this box**: its virtio-blk
+  ESP never boots, VOID on every attempt including six consecutive firmware retries. So the
+  `#92` op 0x09 slot-id fix above is verified by reading the six sibling validators it now matches,
+  **not** by the battery. Re-run it wherever that path boots before trusting the GPU band.
+- **`ext2_readlink`'s SLOW path and `#92`'s primitive/vertex TOCTOU are unfixed** — the latter needs
+  the per-primitive array copied into kernel staging before validation, the same discipline
+  `gpu_shader_op_sys` already applies to the 64-byte records.
 
-Build: `build/agnos` **1,988,704 B** (multiboot2/ELF64, entry `0x1000a8`). `check.sh` 30/30,
+Build: `build/agnos` **1,990,912 B** (multiboot2/ELF64, entry `0x1000a8`). `check.sh` 30/30,
 `test.sh` (x86) 4/4.
 
 

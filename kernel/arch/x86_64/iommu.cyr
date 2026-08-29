@@ -199,10 +199,20 @@ fn iommu_init() {
     var iro = ((ecap >> 8) & 0x3FF) * 16;  # IOTLB Register Offset
     if (iro != 0) {
         # IOTLB invalidate register at iro+8: bit 63 = IVT, bits [62:60] = 001 (global)
-        iommu_write64(iommu_base + iro + 8, (1 << 63) | (1 << 60));
+        # ⛔⛔ 1.56.51 FIX — iommu_base WAS ADDED TWICE. iommu_write64/iommu_read64 are
+        # `store64(iommu_base + off, ...)` / `load64(iommu_base + off)`: they take a BARE REGISTER
+        # OFFSET and add the base themselves, which is how every other call site in this file uses
+        # them (0x28, 0x10, 0x18). These two passed `iommu_base + iro + 8`, so the effective address
+        # was `iommu_base * 2 + iro + 8` — with a typical DMAR base of 0xFED90000 that is a 64-bit
+        # store near 0x1FDB2xxxx, roughly 8.5 GB up and outside the single page iommu_map_mmio()
+        # actually mapped. A wild store, and a wild load in the poll below it.
+        # ⚠ AND THE CONSEQUENCE IS NOT ONLY THE STORE: the global IOTLB invalidate therefore never
+        # reached the hardware, so translation was enabled ~20 lines below with a STALE IOTLB. Both
+        # halves are latent on this box (AMD Zen, iommu_active stays 0) and live on Intel VT-d.
+        iommu_write64(iro + 8, (1 << 63) | (1 << 60));
         timeout = 0;
         while (timeout < 1000000) {
-            if ((iommu_read64(iommu_base + iro + 8) & (1 << 63)) == 0) { break; }
+            if ((iommu_read64(iro + 8) & (1 << 63)) == 0) { break; }
             timeout = timeout + 1;
         }
     }

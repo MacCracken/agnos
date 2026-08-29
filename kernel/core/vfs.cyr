@@ -636,7 +636,7 @@ fn vfs_read_file_inner(path, namelen, dst, cap) {
                     var fsz = ext2_inode_filesize(&ext2_inode_buf);
                     var want = fsz;
                     if (want > cap) { want = cap; }
-                    return ext2_read_at(ino, 0, dst, want);
+                    return ext2_read_at_dma(ino, 0, dst, want);   # 1.56.51: kernel-buffer readers opt into direct DMA
                 }
             }
         }
@@ -700,7 +700,7 @@ fn vfs_read_file_at_inner(path, namelen, offset, dst, len) {
         if (ino > 0) {
             if (ext2_get_inode(ino, &ext2_inode_buf) == 0) {
                 if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) == 0x8000) {
-                    return ext2_read_at(ino, offset, dst, len);
+                    return ext2_read_at_dma(ino, offset, dst, len);   # 1.56.51: kernel-buffer readers opt into direct DMA
                 }
             }
         }

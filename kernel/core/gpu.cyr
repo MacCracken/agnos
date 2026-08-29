@@ -11399,6 +11399,22 @@ fn gpu_fill_sys(color, y0, h) {
     # rendering bug.
     if (gpu_bb_pitch == 0) { return 0 - 1; }
     if (y0 < 0) { return 0 - 1; }
+    # ⛔⛔ 1.56.51 SECURITY FIX — BOUND THE OPERANDS, NOT THE SUM. `y0` and `h` arrive as RAW syscall
+    # registers (arg2/arg3 of #85) with no mask anywhere upstream. The old guards were
+    # `off < 0`, `span <= 0` and `off + span > gpu_bb_fbsize` — and that last one is a SIGNED ADD
+    # THAT ITSELF WRAPS. With pitch = 10240, y0 ≈ 4.5e14 gives off ≈ 2^62 (positive, so `off < 0`
+    # passes) and an h of the same order gives span ≈ 2^62 (positive, so `span <= 0` passes); their
+    # sum reaches 2^63 and reads NEGATIVE, so `negative > gpu_bb_fbsize` is false and the bound
+    # passes. The fill then issued at `tgt_mc + off` — an arbitrary GPU MC offset — for `span` bytes,
+    # which gpu_cp_dma_fill MASKS rather than rejects, i.e. ~64 MiB of ring-3-chosen colour written
+    # wherever the caller aimed it. A guard whose own arithmetic can wrap is not a bound.
+    # ⭐ The row count is the natural domain here, and it is small by construction: every operand is
+    # compared against it BEFORE any multiply, so off/span cannot overflow rather than being checked
+    # after they have. Still REJECT rather than clip, per the band comment above.
+    var fbh = gpu_bb_fbsize / gpu_bb_pitch;
+    if (y0 > fbh) { return 0 - 1; }
+    if (h > fbh) { return 0 - 1; }
+    if (y0 + h > fbh) { return 0 - 1; }
     var off = y0 * gpu_bb_pitch;
     var span = h * gpu_bb_pitch;
     if (off < 0) { return 0 - 1; }

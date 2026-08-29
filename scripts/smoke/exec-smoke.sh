@@ -83,7 +83,9 @@ LOG="$LOGS/exec-selftest.log"
 # printed). This is a harness-timeout artifact, NOT a #43 fault. The EXEC-only profile (no ring3
 # selftest) finishes far sooner — pass a lower QEMU_TIMEOUT for it if you want a quicker run.
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
-qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-90}" \
+# 1.56.51: banner-gated retry — a run OVMF never handed off is VOID, not a failure of the exec
+# path. See qemu_dwell_kernel in scripts/smoke/lib/qemu-dwell.sh for the measurement.
+qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-90}" "$WORK/vars.fd" "$OVMF_VARS_SRC" \
     qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \

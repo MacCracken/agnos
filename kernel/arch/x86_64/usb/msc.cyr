@@ -1492,6 +1492,26 @@ fn msc_register_block_dev() {
     if (load8(row + 85) == 0) { return 0; }           # capacity not known
     var blk_bytes = load32(row + 80);
     if (blk_bytes == 0) { return 0; }
+    # ⛔⛔ 1.56.51 SECURITY GATE, AND IT MUST BE HERE RATHER THAN ONLY IN blk_register_usb_ms.
+    # `blk_bytes` is the SCSI READ CAPACITY(10) block size decoded straight off the wire — a
+    # device-controlled u32. block.cyr's blk_lba_bytes_ok() rejects anything but 512/4096 at
+    # registration, but TWO OF THE THREE ARMS BELOW NEVER REACH IT: on an NVMe-primary or
+    # AHCI-primary box the tertiary policy calls blk_mark_registered(BLK_USB_MS) directly and
+    # returns, deliberately skipping blk_register_usb_ms so the higher-priority backend keeps the
+    # slot. The registered BIT is what blk_read_on gates on, so ring 3 could then reach this device
+    # through blk_open#76 / blk_read#77 with the gate never having run — and msc_blk_read fills
+    # syscall.cyr's fixed 4096-byte blk_sc_bounce with `row + 80` bytes. A device claiming 8192
+    # overruns that kernel array by 4 KB on the first sector read.
+    # ⚠ THE POLICY BRANCHES ARE THE BYPASS. Validate before them, once, at the point where the
+    # device's claim first becomes actionable — not in whichever arm happens to be taken.
+    if (blk_bytes != 512) {
+        if (blk_bytes != 4096) {
+            kprint("msc: REFUSED — device reports ", 32);
+            kprint_num(blk_bytes);
+            kprintln(" B/LBA; only 512 and 4096 are supported", 39);
+            return 0;
+        }
+    }
     var sectors = load64(row + 72) + 1;
     if (sectors == 0) { return 0; }
 

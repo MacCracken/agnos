@@ -74,7 +74,8 @@ echo "=== AGNOS rung 9a - #92 op 0x08 EDGE_COV ABI battery (EDGE_ABI_SELFTEST, -
 # could report. ⚠ Read that line FIRST whenever this smoke goes red — a truncated run indicts every
 # case it never ran.
 # Measured 2026-08-22: PASS at 240 s and at 180 s; the old 40 s reached ~23 of the checks.
-qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-180}" \
+# 1.56.51: banner-gated retry — see qemu_dwell_kernel in scripts/smoke/lib/qemu-dwell.sh.
+qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-180}" "$WORK/vars.fd" "$OVMF_VARS_SRC" \
     qemu-system-x86_64 \
     -machine q35 -m 256M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
@@ -82,6 +83,26 @@ qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-180}" \
     -drive "file=$ESP,format=raw,if=none,id=esp0" \
     -device "virtio-blk-pci,drive=esp0" \
     -serial stdio -display none -no-reboot
+
+# ⛔⛔ 1.56.51 — A RUN THE KERNEL NEVER STARTED IS VOID, NOT FAILED, AND MUST SAY SO INSTEAD OF
+# INDICTING 22 ABI CASES. This file's own header already states the principle for the TRUNCATED case
+# ("a truncated run indicts every case it never ran"; "read that line FIRST"). The stronger case is
+# when the kernel never ran AT ALL — measured 2026-08-28, OVMF drops to "Please select boot device"
+# with the virtio-blk ESP on this box and never hands off, and qemu_dwell_kernel's three attempts all
+# ended the same way. Every `chk` below then greps an empty log and reports a wall of red naming real
+# regression guards — "a real colour at dword 9 was REFUSED", "the well-formed BLEND_ALPHA record did
+# not validate" — none of which was tested. That output is worse than no output: it points at the
+# kernel for a firmware failure, which is precisely the misattribution that cost a wrong bisect
+# earlier in this same sweep.
+# Exit 2, distinct from the exit 1 a genuine ABI failure produces, so a caller can tell them apart.
+if ! strings "$LOG" | grep -q "AGNOS kernel v"; then
+    echo ""
+    echo "=== edge-abi-smoke: VOID — the kernel never started ==="
+    echo "  OVMF never handed off to gnoboot; the serial log ends in the firmware boot menu."
+    echo "  NOTHING below this line was measured. This is NOT an ABI failure and must not be read as one."
+    echo "  Reproduce/diagnose:  strings $LOG | tail -30"
+    exit 2
+fi
 
 echo "--- edge-abi lines ---"
 # ⚠ THE DISPLAY CAP MUST EXCEED THE BATTERY. It sat at head -40 while the battery grew to 58,

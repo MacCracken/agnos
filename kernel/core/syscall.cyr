@@ -1014,6 +1014,15 @@ fn shm_create(size) {
             var phys = pmm_alloc_2mb();
             if (phys == 0) { return 0 - 1; }
             var kva = pmm_kva_for_access(phys);
+            # ⛔ 1.56.51 SECURITY FIX. pmm_alloc_2mb only flips bitmap bits and pmm_free_2mb only
+            # clears them — neither scrubs, so a fresh region holds whatever the PREVIOUS owner left.
+            # shm_create returned it to ring 3 unscrubbed, which is a cross-process disclosure of a
+            # dead process's memory (keys, buffers, stack spill) to whoever allocates next.
+            # ⚠ EVERY OTHER CONSUMER OF pmm_alloc_2mb ALREADY COMPENSATES: sys_mmap memsets
+            # (proc.cyr), both ELF loaders memset each page (elf.cyr), and chan_region_reserve does it
+            # with the rationale spelled out — "a channel page must never hand a new owner the
+            # previous occupant's bytes". This was the one arm that did not. Same fix, same reason.
+            memset(kva, 0, 0x200000);
             store64(&shm_phys + i * 8, phys);
             store64(&shm_kva + i * 8, kva);
             store64(&shm_size + i * 8, size);
@@ -1068,6 +1077,16 @@ fn shm_create_gpu(size) {
                 if (vmm_remap_wc_2mb(cpu + pg) != 1) { return 0 - 1; }
                 pg = pg + 0x200000;
             }
+            # ⛔ 1.56.51 SECURITY FIX — the shm_create#71 disclosure, in the GPU carveout. A carveout
+            # slot lives at a FIXED offset per index, so slot i is literally the same physical memory
+            # every time it is handed out: client A frees it, client B creates and receives A's pixels.
+            # For a compositor that is a cross-CLIENT framebuffer disclosure — one window's contents
+            # readable by the next window to allocate.
+            # ⚠ COST IS REAL AND ACCEPTED: this scrubs the whole GPU_SHM_SLOT_SIZE window, not just the
+            # requested `size`, because the next owner may ask for more than this one did and would
+            # otherwise read the tail. Scrubbing on free instead would cost exactly the same; scrubbing
+            # only `size` would leave the hole open.
+            memset(cpu, 0, GPU_SHM_SLOT_SIZE);
             store64(&shm_phys + i * 8, cpu);            # non-zero ⇒ slot in use (shm_slot_valid)
             store64(&shm_kva  + i * 8, cpu);            # the direct window IS the access VA
             store64(&shm_size + i * 8, size);
@@ -2292,6 +2311,22 @@ fn gpo_validate_tri(rec, fbw, fbh) {
         # nothing else, so an EVENODD path would still ship with NO oracle.
         if (rule != GPU_RULE_NONZERO) { return GPO_E_RULE; }
         if (w * h * ne > GPU_EDGE_WORK_MAX) { return GPO_E_WORK; }
+        # ⛔⛔ 1.56.51 SECURITY FIX — THE EDGE SLOT ID WAS NEVER VALIDATED ON THIS PATH. `edge_id` is
+        # read above and, with DERIVE clear, gpo_execute's TRI_RGBA arm resolves it as
+        # `load64(&shm_mc + ((load32(rec + 12) & 0xFFFFFFFF) - 1) * 8)`. `shm_mc` is `var shm_mc[16]`
+        # = 128 bytes, and edge_id is a ring-3 u32: id = 0xFFFFFFFF loads ~34 GB past the table, and
+        # id = 0 loads 8 bytes BEFORE it. Whatever comes back becomes `tedge`, a GPU MC address handed
+        # straight to gpu_tri_rgba — so ring 3 chooses where the rasteriser reads its edge list from.
+        # ⚠ THIS BRANCH VALIDATED THE EDGE COUNT AND THE FILL RULE AND THEN STOPPED SHORT OF THE
+        # POINTER. Every sibling validator carries these three lines — gpo_validate_edge for the very
+        # same buffer (its eid block), gpo_validate_tritex, gpo_validate_texlist, gpo_validate_trilist,
+        # gpo_validate_tridepth, gpo_validate_triperspec, gpo_validate_rtread. Only op 0x09's
+        # non-DERIVE path did not, and the DERIVE path is rejected as NOTIMPL below, which means the
+        # ONLY accepted route through this validator was the unchecked one.
+        if (shm_slot_valid(edge_id) == 0) { return GPO_E_BADSLOT; }
+        var e_s = edge_id - 1;
+        if (load64(&shm_mc + e_s * 8) == 0) { return GPO_E_BADSLOT; }        # PMM-backed => GPU can't read
+        if (ne * GPU_EDGE_BYTES > load64(&shm_size + e_s * 8)) { return GPO_E_EDGEBUF; }
     }
 
     # The attribute frame: three 16.16 screen-space vertices, dwords 6..11.

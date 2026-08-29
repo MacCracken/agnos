@@ -1894,6 +1894,46 @@ var ext2_indirect_disk_reads = 0;
 # shows the >2-page PRP-list DMA misbehaves where QEMU didn't).
 var ext2_read_coalesce_max = 16;
 
+# ⛔⛔ 1.56.51 SECURITY GATE — DIRECT-DMA DESTINATIONS MUST BE KERNEL-OWNED, AND THAT IS NOW OPT-IN.
+# The read and write coalescing paths below hand `dst` / `srcp` to blk_{read,write}_sectors_direct,
+# which passes the value THROUGH TO THE CONTROLLER AS A PHYSICAL ADDRESS (nvme_rw_internal loads it
+# into prp1). Both gates tried to prove that was safe with `(p & 0xFFF) == 0 && p + bs <= 0x10000000`
+# on the stated belief that 0-256 MB is identity under the per-process CR3.
+# ⛔ THAT BELIEF IS FALSE FOR EXACTLY THE CASE THAT MATTERS. proc_create_address_space does install
+# PD[0..127] as identity — and then elf.cyr calls proc_map_page(new_cr3, pg, phys) for every PT_LOAD
+# page, OVERWRITING those same PD slots with pmm_alloc_2mb() frames. A user buffer lives in one of
+# those segments by definition, so for a ring-3 address in [0x400000, 0x10000000) VA != phys.
+# `read#5` passes the ring-3 buffer straight through (syscall.cyr -> vfs_read -> ext2_read_at, no
+# bounce), so an ordinary read of >= 2 contiguous blocks into a page-aligned ring-3 buffer aimed the
+# controller's DMA at PHYSICAL `dst` — kernel memory at that numeric address — and wrote file data
+# over it. The write path is the mirror: it DMAs FROM physical `srcp`, publishing kernel memory to
+# the filesystem. `ext2_read_coalesce_max` is 16, not 1, so neither path was killed.
+# ⭐ DEFAULT-DENY, AND NO ARM/DISARM DANCE. The address alone cannot tell a kernel identity VA from a
+# user VA — pmm_kva_for_access(phys) for phys <= 256 MB lands in the very same numeric range a user
+# buffer does, which is why an `is_user_range` test cannot separate them. Only the CALLER knows. So
+# the fast path is off unless a caller opts in, and opting in is possible only through the wrappers
+# below, which clear the flag on the way out. A bare arm/disarm pair would leak the armed state on
+# every early return — the same asymmetry hazard the stac/clac bracketing rule exists for.
+# ⚠ ADDING A NEW _dma CALLER MEANS PROVING THE BUFFER IS KERNEL-OWNED. As of 1.56.51 the openers are
+# vfs_read_file / vfs_read_file_at (every caller passes kernel scratch or pmm_kva_for_access(phys) —
+# enumerated: elf.cyr:264/:400, gpu.cyr firmware loads, main.cyr scratch) and klug's spill (&klug_buf,
+# kernel BSS). vfs_read / vfs_write — the ring-3 arms — deliberately do NOT opt in.
+var ext2_dma_direct_ok = 0;
+
+fn ext2_read_at_dma(inode_num, off, buf, len) {
+    ext2_dma_direct_ok = 1;
+    var r = ext2_read_at(inode_num, off, buf, len);
+    ext2_dma_direct_ok = 0;
+    return r;
+}
+
+fn ext2_write_at_dma(inode_num, off, buf, len) {
+    ext2_dma_direct_ok = 1;
+    var r = ext2_write_at(inode_num, off, buf, len);
+    ext2_dma_direct_ok = 0;
+    return r;
+}
+
 fn ext2_logical_to_physical(inode_buf, logical_block) {
     # Phase 4 dispatch: ext4 extents inodes take a different code path
     # (Linux switched ext4 to extents as the default in 2008).
@@ -2059,7 +2099,8 @@ fn ext2_read_at(inode_num, offset, buf, maxlen) {
         # Intel VT-d — so VT-d safely falls back to the bounce path. `ext2_read_coalesce_max` is the
         # kill-switch (set to 1 to force single-block).
         var dst = buf + bytes_done;
-        if (iommu_active == 0 && off_in_block == 0 && phys != 0 && remaining >= ext2_blocksize
+        if (ext2_dma_direct_ok != 0
+          && iommu_active == 0 && off_in_block == 0 && phys != 0 && remaining >= ext2_blocksize
           && (dst & 0xFFF) == 0 && (dst + ext2_blocksize) <= 0x10000000) {
             var run = 1;
             while (run < ext2_read_coalesce_max
@@ -2503,15 +2544,30 @@ fn ext2_dir_try_insert(child_ino, name, name_len, ftype, needed) {
         var e_ino = ext2_load32_le(d, 0);
         var e_rl  = ext2_load16_le(d, 4);
         var e_nl  = load8(d + 6);
-        if (e_rl == 0) { return 0; }                  # corrupt — abandon block
+        # ⛔⛔ 1.56.51 SECURITY FIX. This walker rejected only `e_rl == 0` while ALL FOUR read-side
+        # walkers in this file gate every record on ext2_dirent_valid — whose
+        # `off_in_block + rec_len > ext2_blocksize` clause is the single check that keeps a walk
+        # inside the 4096-byte ext2_dir_buf. The write side skipped it, so `off` could sit anywhere
+        # in [0, lim) with no requirement that a record actually FITS there, and neither insert
+        # bounded its write: case A writes at `off`, case B at `off + e_real` where `e_real` is
+        # derived from the ON-DISK name_len and reaches 264. A crafted block with a live entry at
+        # off = 4080 and e_nl = 255 puts case B's write at 4344 — 248 bytes past the buffer, into
+        # adjacent kernel BSS, carrying an attacker-influenced filename. Reachable by creating a
+        # file in a directory on crafted media (USB mass storage, or the armed raw-block band).
+        if (ext2_dirent_valid(off, e_rl, e_nl) == 0) { return 0; }
         if (e_ino == 0) {
+            # ⚠ Bound the WRITE too, not just the record: ext2_dirent_valid bounds against
+            # ext2_blocksize, but this walker stops at `lim`, which is 12 bytes shorter when the
+            # csum tail is on. Writing into the tail would corrupt the checksum it is about to stamp.
             if (e_rl >= needed) {
+                if (off + needed > lim) { return 0; }
                 ext2_dirent_write(&ext2_dir_buf, off, child_ino, e_rl, name, name_len, ftype);
                 return 1;
             }
         } else {
             var e_real = ext2_round4(8 + e_nl);
             if (e_rl - e_real >= needed) {
+                if (off + e_real + needed > lim) { return 0; }
                 ext2_store16_le(&ext2_dir_buf, off + 4, e_real);   # shrink live entry
                 ext2_dirent_write(&ext2_dir_buf, off + e_real, child_ino, e_rl - e_real, name, name_len, ftype);
                 return 1;
@@ -2594,7 +2650,12 @@ fn ext2_dir_remove(dir_ino, name, name_len) {
                 var e_ino = ext2_load32_le(d, 0);
                 var e_rl  = ext2_load16_le(d, 4);
                 var e_nl  = load8(d + 6);
-                if (e_rl == 0) { return 0 - 1; }
+                # ⛔ 1.56.51 SECURITY FIX — the same missing predicate as ext2_dir_try_insert above.
+                # Here the overrun is on the READ side: `memeq(d + 8, name, name_len)` below runs at
+                # `off + 8 + name_len`, and with `off` unvalidated near `lim` and a 255-byte name that
+                # reaches ~262 bytes past ext2_dir_buf. Both write-side walkers now use the predicate
+                # the read-side walkers have always used.
+                if (ext2_dirent_valid(off, e_rl, e_nl) == 0) { return 0 - 1; }
                 if (e_ino != 0) {
                     if (e_nl == name_len) {
                         if (memeq(d + 8, name, name_len) == 1) {
@@ -3088,6 +3149,15 @@ fn ext2_readlink(inode_num, out, cap) {
     if (tlen > cap) { return 0 - 1; }
     if (ext2_inode_blocks_lo(&ext2_symres_inode) == 0) {
         # FAST: target inline at inode offset 40
+        # ⛔ 1.56.51 SECURITY FIX. `tlen` is i_size straight off the DISK and the only gates above are
+        # `tlen < 1` and `tlen > cap` — where `cap` is the CALLER's buffer size, never the SOURCE's.
+        # A fast symlink stores its target in the i_block[] area: 15 * 4 = 60 bytes. The scratch it is
+        # read into is `var ext2_symres_inode[64]` = 512 bytes, of which only ext2_inode_size (mount-
+        # capped at 256) is ever filled. So a crafted inode with i_blocks == 0 and i_size = 4096 made
+        # readlink#70 copy ~3.6 KB of adjacent kernel BSS from `&ext2_symres_inode + 40` straight out
+        # to a ring-3 buffer. The bound has to come from the FORMAT, not from the caller.
+        # (Linux applies the same rule in ext4_inode_is_fast_symlink: i_size < EXT4_N_BLOCKS * 4.)
+        if (tlen > 60) { return 0 - 1; }
         var k = 0;
         while (k < tlen) { store8(out + k, load8(&ext2_symres_inode + 40 + k)); k = k + 1; }
         return tlen;
@@ -3486,7 +3556,8 @@ fn ext2_write_at(inode_num, offset, src, len) {
         # with the read path) is the kill-switch. Falls through to the single-block path for a
         # partial/unaligned/high/extent write.
         var srcp = src + written;
-        if (is_extent == 0 && boff == 0 && chunk == ext2_blocksize && iommu_active == 0
+        if (ext2_dma_direct_ok != 0
+          && is_extent == 0 && boff == 0 && chunk == ext2_blocksize && iommu_active == 0
           && (srcp & 0xFFF) == 0 && (srcp + ext2_blocksize) <= 0x10000000) {
             var rphys = ext2_bmap_alloc(&ext2_inode_buf, lblk);
             if (rphys <= 0) { break; }   # ENOSPC — return partial

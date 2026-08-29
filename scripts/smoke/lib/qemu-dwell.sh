@@ -84,3 +84,45 @@ qemu_dwell() {
     fi
     return 0
 }
+
+# qemu_dwell_kernel — qemu_dwell, retried when the FIRMWARE never handed off to the kernel.
+#
+# ⛔⛔ 1.56.51, MEASURED. On this box roughly 1 boot in 4 (far more under load) never leaves OVMF:
+# the serial log ends in "Please select boot device" and the kernel banner never appears. The kernel
+# under test did not execute, so the run measured NOTHING — yet every assertion afterwards evaluates
+# against an empty log and the smoke reports a wall of failures. edge-abi-smoke printed
+# "FAILED -- 1 correct, 22 wrong" from exactly this, and agnsh-smoke's version of it cost a wrong
+# bisect during the 1.56.51 sweep (a kernel change was blamed, then found to pass on re-run).
+# Raising QEMU_TIMEOUT does not help — the boot menu is terminal, not slow.
+#
+# ⭐ THE RETRY IS GATED ON THE KERNEL BANNER, WHICH IS WHAT MAKES IT SOUND. "The kernel never
+# started" and "the kernel started and failed" are different events and only the first may be
+# retried. A blind re-run — sweep.sh's unconditional second attempt — gives a REAL regression two
+# chances to look like a flake. This gives it none: once the banner is in the log, the run stands
+# whatever the assertions say.
+#
+# Usage (identical to qemu_dwell, plus $4 = the vars.fd to refresh per attempt; pass "" to skip):
+#   qemu_dwell_kernel "$LOG" "agnos>" "$TIMEOUT" "$WORK/vars.fd" "$OVMF_VARS_SRC" qemu-system-x86_64 ...
+# Env: QEMU_TRIES (default 3).
+qemu_dwell_kernel() {
+    _qk_log="$1"; _qk_marker="$2"; _qk_max="$3"; _qk_vars="$4"; _qk_varsrc="$5"; shift 5
+    _qk_tries="${QEMU_TRIES:-3}"
+    _qk_i=1
+    while [ "$_qk_i" -le "$_qk_tries" ]; do
+        # A fresh NVRAM per attempt: a half-written vars.fd from a killed run is itself a way to
+        # land in the boot menu, so the retry must not inherit the previous attempt's state.
+        if [ -n "$_qk_vars" ] && [ -n "$_qk_varsrc" ]; then
+            cp "$_qk_varsrc" "$_qk_vars" && chmod +w "$_qk_vars"
+        fi
+        qemu_dwell "$_qk_log" "$_qk_marker" "$_qk_max" "$@"
+        if strings "$_qk_log" 2>/dev/null | grep -q "AGNOS kernel v"; then return 0; fi
+        if [ "$_qk_i" -lt "$_qk_tries" ]; then
+            echo "  (firmware never handed off — kernel did not start; retrying $_qk_i/$((_qk_tries - 1)))" >&2
+        else
+            echo "  UEFI never handed off to the kernel in $_qk_tries attempts — INFRASTRUCTURE, not the kernel." >&2
+            echo "  Any assertion below describes an EMPTY log; treat this run as VOID, not as a failure." >&2
+        fi
+        _qk_i=$((_qk_i + 1))
+    done
+    return 0
+}

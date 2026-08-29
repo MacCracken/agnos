@@ -52,6 +52,32 @@ var blk_registered = 0;
 # is empty. If NVMe later succeeds, it overrides. This conditional
 # keeps virtio as the fallback without it stomping NVMe's override on
 # re-init paths (none currently, but the symmetry is the design).
+# ⛔⛔ 1.56.51 SECURITY GATE — THE LBA SIZE IS DEVICE-CONTROLLED AND WAS STORED VERBATIM.
+# `blk_lba_bytes` is the per-LBA copy length for BOTH raw-block syscalls, and the buffer they copy
+# through is `var blk_sc_bounce[512]` in syscall.cyr — exactly 4096 bytes, fixed. Every backend fed
+# this value straight off the wire:
+#   · msc.cyr decodes the SCSI READ CAPACITY(10) big-endian u32 block size and rejects only == 0
+#     before calling blk_register_usb_ms;
+#   · nvme.cyr computes `1 << lbads` from 8 device-supplied bits of the LBAF entry, unvalidated.
+# A device reporting anything above 4096 therefore overran a fixed kernel array by
+# (reported - 4096) bytes on every sector copied. Hostile USB storage is a realistic threat model;
+# a merely BUGGY device is enough.
+# ⭐ THE TELL IS ALREADY IN THE TREE: msc.cyr's own read/write demo paths refuse `blk_bytes != 512`.
+# The constraint was known; it was enforced on the demo arm and not on the registration arm that
+# feeds the entire block layer. This is the choke point — all five backends pass through here.
+# 512 and 4096 are the only sizes this kernel's on-disk layouts and bounce buffer are built for.
+fn blk_lba_bytes_ok(lba_bytes) {
+    if (lba_bytes == 512)  { return 1; }
+    if (lba_bytes == 4096) { return 1; }
+    # ⚠ SAY SO. A refused backend simply does not appear, and "my disk did not come up" with no line
+    # in the log is the kind of silence that costs a day. The callers' own success paths print the
+    # size, so the reject path must too.
+    kprint("blk: REFUSED backend — device reports ", 40);
+    kprint_num(lba_bytes);
+    kprintln(" B/LBA; only 512 and 4096 are supported", 39);
+    return 0;
+}
+
 fn blk_register_virtio(capacity) {
     if (blk_active == 0) {
         blk_active    = BLK_VIRTIO;
@@ -66,6 +92,7 @@ fn blk_register_virtio(capacity) {
 # this is the last register call when both backends initialize on
 # the same boot.
 fn blk_register_nvme(capacity, lba_bytes) {
+    if (blk_lba_bytes_ok(lba_bytes) == 0) { return 0 - 1; }   # 1.56.51: device-reported size must fit blk_sc_bounce
     blk_active    = BLK_NVME;
     blk_capacity  = capacity;
     blk_lba_bytes = lba_bytes;
@@ -80,6 +107,7 @@ fn blk_register_nvme(capacity, lba_bytes) {
 # caller (ahci_register_block_dev); this function unconditionally
 # assigns once called.
 fn blk_register_ahci(capacity, lba_bytes) {
+    if (blk_lba_bytes_ok(lba_bytes) == 0) { return 0 - 1; }   # 1.56.51: device-reported size must fit blk_sc_bounce
     blk_active    = BLK_AHCI;
     blk_capacity  = capacity;
     blk_lba_bytes = lba_bytes;
@@ -92,6 +120,7 @@ fn blk_register_ahci(capacity, lba_bytes) {
 # Always assigns once called; the caller is responsible for not calling
 # when a higher-priority backend already holds the slot.
 fn blk_register_usb_ms(capacity, lba_bytes) {
+    if (blk_lba_bytes_ok(lba_bytes) == 0) { return 0 - 1; }   # 1.56.51: device-reported size must fit blk_sc_bounce
     blk_active    = BLK_USB_MS;
     blk_capacity  = capacity;
     blk_lba_bytes = lba_bytes;
@@ -107,6 +136,7 @@ fn blk_register_usb_ms(capacity, lba_bytes) {
 # blk_* dispatch. On boots with no other backend (e.g., pure-RAM smoke harness),
 # RAM-disk holds the slot.
 fn blk_register_ramdisk(capacity, lba_bytes) {
+    if (blk_lba_bytes_ok(lba_bytes) == 0) { return 0 - 1; }   # 1.56.51: device-reported size must fit blk_sc_bounce
     if (blk_active == BLK_NONE) {
         blk_active    = BLK_RAMDISK;
         blk_capacity  = capacity;
