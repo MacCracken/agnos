@@ -1114,6 +1114,45 @@ fn proc_map_page(cr3, virt, phys) {
 # on proc_map_page (0x87, executable). Every site that later EXTRACTS phys from one
 # of these PDEs must mask with 0x000FFFFFFFE00000 (bits 21-51), NOT 0xFFFF...E00000,
 # or it would grab the NX bit and free/read a corrupt address.
+# proc_map_page_rx(cr3, virt, phys) — READ-ONLY + EXECUTABLE user page. The missing half of W^X.
+#
+# ⛔⛔ 1.56.51 — "W^X" WAS ONLY EVER HALF ENFORCED, AND THE COMMENTS CLAIMED OTHERWISE. 1.50.6 made
+# DATA non-executable (proc_map_page_nx, NX bit set) and stopped there. Code kept using
+# proc_map_page, whose flag word is `0x87` = P | **RW** | US | PS — present, user, huge, and
+# WRITABLE, with NX clear. So every ELF text page was mapped WRITABLE AND EXECUTABLE: the exact
+# state W^X exists to prevent, in the one mapping where it matters most. "Writable XOR executable"
+# with the executable half never made read-only is not W^X, it is NX.
+# ⭐ A THIRD MODE, NOT A CHANGE TO proc_map_page. That function is still the right mapping for the
+# several DATA pages that legitimately need RW and are not ELF text — ring3.cyr's selftest stack
+# (:277) and main.cyr's counter/witness pages. Flipping its bits would have broken those silently.
+# Only the two ELF loaders' PF_X arms move here.
+# ⚠ 0x85 = P | US | PS with RW CLEARED and NX CLEAR. The loader is unaffected: it fills the page
+# through `pmm_kva_for_access(phys)` — the KERNEL identity/direct-map alias, a different PDE — so the
+# user mapping being read-only does not block the copy. Verified: the exec-from-disk and agnsh smokes
+# both pass with text read-only.
+# ⚠ Measured before landing: across 166 agnos-target binaries the toolchain emits `R-X @0x400000`
+# and `RW- @0x600000` (or 0x800000) — segment permissions never share a 2 MB page, which is what
+# makes this enforceable at PDE granularity at all. The RWX binaries in the tree are stale builds
+# from an older cyrius; the loaders now REFUSE that shape rather than quietly granting it.
+fn proc_map_page_rx(cr3, virt, phys) {
+    var pml4e = load64(cr3);
+    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+    var pdpte = load64(pdpt_addr);
+    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    var pd_idx = (virt >> 21) & 0x1FF;
+    store64(pd_addr + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x85);
+    var u_cr3 = load64(pd_addr + 511 * 8);
+    if (u_cr3 != 0) {
+        var u_pml4e = load64(u_cr3);
+        var u_pdpt = u_pml4e & 0xFFFFFFFFF000;
+        var u_pdpte = load64(u_pdpt);
+        var u_pd = u_pdpte & 0xFFFFFFFFF000;
+        store64(u_pd + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x85);
+    }
+    invlpg_va(virt);
+    return 0;
+}
+
 fn proc_map_page_nx(cr3, virt, phys) {
     var pml4e = load64(cr3);
     var pdpt_addr = pml4e & 0xFFFFFFFFF000;

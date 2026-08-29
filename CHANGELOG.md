@@ -151,6 +151,50 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   ⚠ 26 of the 83 smokes still attach `virtio-blk-pci`, which does not boot on this box under either
   geometry. They are presumed unrunnable here and were not audited.
 
+### Security — third batch: W^X actually enforced, plus two media parsers
+
+- **W^X was only ever half enforced, and the comments said otherwise.** 1.50.6 made data
+  non-executable and stopped there; code kept using `proc_map_page`, whose PDE flag word is
+  `0x87` = P | **RW** | US | PS with NX clear. Every ELF text page was therefore mapped **writable
+  and executable** — the exact state W^X exists to prevent. New `proc_map_page_rx` (`0x85`: RW
+  cleared, NX clear) is a *third* mode rather than a change to `proc_map_page`, because that
+  function is still correct for the data pages that legitimately need RW (`ring3.cyr`'s selftest
+  stack, `main.cyr`'s counter/witness pages) and flipping its bits would have broken them silently.
+  Both ELF loaders now map `PF_X` read-only, and **refuse** a `PF_W|PF_X` segment instead of quietly
+  granting RWX.
+  ⭐ **The result is verifiable from the build**: `proc_map_page` is now reported `dead` by
+  `CYRIUS_DCE=1` in the production configuration — no page in the shipped kernel is writable *and*
+  executable, and the writable-executable mapping routine is unreachable.
+  ⚠ Measured across 166 agnos-target binaries before landing: the toolchain emits `R-X @0x400000`
+  and `RW- @0x600000`/`0x800000`, so segment permissions never share a 2 MB page — which is what
+  makes this enforceable at PDE granularity. The RWX binaries in the tree are stale builds from an
+  older cyrius. Verified: `agnsh-smoke`, `exec-smoke`, `check.sh` 30/30.
+- **GPT: `SizeOfPartitionEntry` came off the disk unvalidated and was used as a DIVISOR.**
+  `entries_per_chunk = 4096 / gpt_partition_entry_size` at three sites, so a crafted header carrying
+  `0` is a kernel divide-by-zero; it is also the stride in `gpt_array_buf + i * entry_size` at two
+  more, walking out of a 4 KB buffer. Now bounded by the UEFI spec's own rule (multiple of 128,
+  ≥ 128, ≤ one chunk) with `NumberOfPartitionEntries` capped at what the 4-chunk walk can read.
+  ⚠ **`gpt_decode_header`'s return was discarded at both call sites**, so validating inside it would
+  have been inert — the globals are assigned before the check and the walk used them regardless.
+  Both callers now honour the verdict.
+- **ext2 extent header: `eh_max` was itself unvalidated, so `eh_entries > eh_max` bounded nothing.**
+  Both are u16 off the disk; a header setting both to 65535 satisfies the comparison and the walkers
+  then iterate 65535 × 12 = 786,420 bytes out of either the 60-byte `i_block[]` area or a 4096-byte
+  scratch. The check compared the header against *itself*; the missing comparison is against the
+  container, which only the caller knows — so `ext2_extent_header_validate` now takes a capacity, and
+  all seven call sites pass their real one (4 for a root, `ext2_extent_cap_block()` for a node, itself
+  clamped to the 4 KB scratch so a 64 KB-block filesystem cannot imply a 5460-entry walk).
+  Verified against `ext2-write-smoke` and `ext-extent-smoke` (depth-2 tree: inline index → index
+  block → leaves), both PASS.
+
+- **FAT: the next-cluster value was never range-checked.** `fat_next_cluster` returned whatever the
+  on-disk FAT said, filtered only for the EOC and BAD sentinels, and that value flows into
+  `fatfs_first_sector_of_cluster` = `data_start + (clus - 2) * sectors_per_cluster` — read as a
+  partition-relative LBA. A crafted entry naming a cluster beyond the volume is an arbitrary-offset
+  disk read driven by mounted media. Now wrapped (the body became `fat_next_cluster_raw`) so every
+  caller is covered and a future arm cannot forget the check; a self-referencing entry also ends the
+  chain instead of spinning. Verified against `fat-write-smoke` (3a-3e + LFN content + subdir), PASS.
+
 ### Fixed — verification gates that could not fail
 
 - **`scripts/sweep.sh`'s PASS detector scored total failure as PASS.** `grep -qiE "smoke.*PASS"` —
@@ -227,11 +271,21 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   directly and will keep reporting a never-booted run as a wall of failures. The root cause — OVMF
   dropping to the boot-device menu instead of the removable-media path — is unexplained.
 - **`ext2_readlink`'s SLOW path** is unaudited; only the fast-symlink branch was capped.
+- **FAT multi-node cluster cycles are still a hang.** The single-step wrapper cannot see `A -> B -> A`
+  with both in range, and the thirteen walk sites have differing loop shapes (some carry a `last`
+  cursor, some return, some break, some do post-loop work), so a blanket transform is unsafe. The
+  `fat_chain_overrun()` predicate and the exact per-site form are in place at the wrapper for
+  whoever does that work — including why a module-global step counter is the *wrong* shape for it.
+- **The raw-block write gate (`blk_rw_armed` / `BLK_RW_ARM_MAGIC`) is a plain magic constant any
+  ring-3 caller can send.** Left as-is deliberately: the code already states this and names the seam
+  ("the arm call is the exact seam where an aegis/shakti installer-capability check lands when agnos
+  grows per-proc caps"). It is a documented posture pending per-process capabilities, not an
+  oversight — closing it needs the capability model, not a bigger constant.
 - **`#92`'s primitive/vertex TOCTOU is unfixed** — it needs the per-primitive array copied into
   kernel staging before validation, the same discipline `gpu_shader_op_sys` already applies to the
   64-byte records.
 
-Build: `build/agnos` **1,990,912 B** (multiboot2/ELF64, entry `0x1000a8`). `check.sh` 30/30,
+Build: `build/agnos` **1,992,672 B** (multiboot2/ELF64, entry `0x1000a8`). `check.sh` 30/30,
 `test.sh` (x86) 4/4.
 
 

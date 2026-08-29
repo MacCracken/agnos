@@ -1370,11 +1370,33 @@ fn ext2_free_inode(inode_num, is_dir) {
 # Returns physical block#, 0 for sparse hole / unwritten extent (caller
 # zero-fills), -1 on error.
 
-fn ext2_extent_header_validate(hdr) {
+# ext2_extent_cap_block() — how many 12-byte extent entries a NODE header can hold.
+# Both node scratch buffers (ext2_extent_buf, ext2_indirect_buf_l1) are `var X[512]` = 4096 bytes,
+# so the capacity is bounded by the SMALLER of the filesystem block size and that buffer — a
+# 64 KB-block filesystem must not be allowed to imply a 5460-entry walk through a 4 KB array.
+fn ext2_extent_cap_block() {
+    var bs = ext2_blocksize;
+    if (bs > 4096) { bs = 4096; }
+    if (bs < 24) { return 0; }
+    return (bs - 12) / 12;
+}
+
+# ⛔⛔ 1.56.51 SECURITY FIX — `max` WAS ITSELF UNVALIDATED, SO `entries > max` COULD NOT BOUND
+# ANYTHING. Both fields are u16 read straight out of the on-disk extent header. A crafted header
+# setting eh_max = 65535 and eh_entries = 65535 satisfies `entries > max` (they are equal) and the
+# walkers then iterate 65535 entries at 12 bytes each — 786,420 bytes — out of a container that is
+# either the 60-byte i_block area (root) or a 4096-byte scratch buffer (node). The check compared
+# the header against ITSELF; the missing comparison is against the CONTAINER, which only the caller
+# knows, hence the parameter.
+# ⚠ ALL SEVEN CALL SITES pass their real capacity: 4 for a root header embedded in i_block[]
+# ((60 - 12) / 12), ext2_extent_cap_block() for a header read into a node buffer.
+fn ext2_extent_header_validate(hdr, cap) {
     var magic = ext2_load16_le(hdr, 0);
     if (magic != 0xF30A) { return 0; }
     var entries = ext2_load16_le(hdr, 2);
     var max     = ext2_load16_le(hdr, 4);
+    if (cap < 1) { return 0; }
+    if (max > cap) { return 0; }
     if (entries > max) { return 0; }
     return 1;
 }
@@ -1382,7 +1404,7 @@ fn ext2_extent_header_validate(hdr) {
 fn ext2_extent_logical_to_physical(inode_buf, logical_block) {
     # The root header lives embedded in i_block[0..11] (inode_buf + 40).
     var hdr = inode_buf + 40;
-    if (ext2_extent_header_validate(hdr) == 0) {
+    if (ext2_extent_header_validate(hdr, 4) == 0) {          # root lives in i_block[]: (60-12)/12 = 4
         kprintln("ext2: extent root: bad magic / entries", 38);
         return 0 - 1;
     }
@@ -1435,7 +1457,7 @@ fn ext2_extent_logical_to_physical(inode_buf, logical_block) {
         if (ext2_read_block(next_phys, &ext2_extent_buf) != 0) { return 0 - 1; }
 
         # Re-validate the new level's header.
-        if (ext2_extent_header_validate(&ext2_extent_buf) == 0) {
+        if (ext2_extent_header_validate(&ext2_extent_buf, ext2_extent_cap_block()) == 0) {
             kprintln("ext2: extent internal: bad magic", 32);
             return 0 - 1;
         }
@@ -1553,7 +1575,7 @@ fn ext2_extent_grow_indepth(inode_buf, inode_num) {
 # (→ 1.37.2) / out-of-order / IO error (caller frees nb). Uses ext2_extent_buf.
 fn ext2_extent_leaf_place(leafblk, lblk, nb, inode_num, inode_buf) {
     if (ext2_read_block(leafblk, &ext2_extent_buf) != 0) { return 0; }
-    if (ext2_extent_header_validate(&ext2_extent_buf) == 0) { return 0; }
+    if (ext2_extent_header_validate(&ext2_extent_buf, ext2_extent_cap_block()) == 0) { return 0; }
     var le = ext2_load16_le(&ext2_extent_buf, 2);
     var lm = ext2_load16_le(&ext2_extent_buf, 4);
     var placed = 0;
@@ -1673,7 +1695,7 @@ fn ext2_extent_grow_indepth2(inode_buf, inode_num) {
 # ext2_extent_buf (extent inodes never use the single-indirect scratch).
 fn ext2_extent_add_leaf_to_idxblk(idxblk, lblk, nbd, inode_num, inode_buf) {
     if (ext2_read_block(idxblk, &ext2_indirect_buf_l1) != 0) { return 0; }
-    if (ext2_extent_header_validate(&ext2_indirect_buf_l1) == 0) { return 0; }
+    if (ext2_extent_header_validate(&ext2_indirect_buf_l1, ext2_extent_cap_block()) == 0) { return 0; }
     var inent = ext2_load16_le(&ext2_indirect_buf_l1, 2);
     var imax  = ext2_load16_le(&ext2_indirect_buf_l1, 4);
     if (inent >= imax) {                                      # index block full → deeper split deferred
@@ -1708,7 +1730,7 @@ fn ext2_extent_add_leaf_to_idxblk(idxblk, lblk, nbd, inode_num, inode_buf) {
 
 fn ext2_extent_append_block(inode_buf, lblk, inode_num) {
     var hdr = inode_buf + 40;
-    if (ext2_extent_header_validate(hdr) == 0) { return 0; }
+    if (ext2_extent_header_validate(hdr, 4) == 0) { return 0; }   # root lives in i_block[]
     var depth = ext2_load16_le(hdr, 6);
     if (depth > 2) { kprintln("ext2: extent depth>2 append deferred", 36); return 0; }
 
@@ -1722,7 +1744,7 @@ fn ext2_extent_append_block(inode_buf, lblk, inode_num) {
         var idxblk = ext2_load32_le(rix, 4) | (ext2_load16_le(rix, 8) << 32);
         if (idxblk == 0) { return 0; }
         if (ext2_read_block(idxblk, &ext2_indirect_buf_l1) != 0) { return 0; }
-        if (ext2_extent_header_validate(&ext2_indirect_buf_l1) == 0) { return 0; }
+        if (ext2_extent_header_validate(&ext2_indirect_buf_l1, ext2_extent_cap_block()) == 0) { return 0; }
         var inent = ext2_load16_le(&ext2_indirect_buf_l1, 2);
         if (inent == 0) { return 0; }
         var iix = &ext2_indirect_buf_l1 + 12 + (inent - 1) * 12;   # rightmost idxblk index → leaf

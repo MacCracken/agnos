@@ -251,7 +251,50 @@ fn fatfs_init() {
 # error (caller treats 0 as end-of-chain). Caches the consulted FAT
 # sector in fatfs_fat_buf. FAT12 packs 1.5 bytes/entry and can straddle a
 # sector boundary. Audit § 2.3.
+# ⛔⛔ 1.56.51 SECURITY FIX, PART 1 OF 2 — THE NEXT-CLUSTER VALUE WAS NEVER RANGE-CHECKED.
+# The three arms below return whatever the on-disk FAT says, filtered only for the EOC and BAD
+# sentinels. A crafted FAT entry naming a cluster far beyond the volume flows into
+# `fatfs_first_sector_of_cluster(clus)` = `fatfs_data_start + (clus - 2) * sectors_per_cluster`,
+# which is then read as a partition-relative LBA — an arbitrary-offset disk read driven by mounted
+# media. Valid cluster numbers are 2 .. count_of_clusters + 1; anything else ends the chain.
+# ⭐ Done by wrapping rather than by editing three return sites, so EVERY caller is covered and a
+# future arm cannot forget the check.
 fn fat_next_cluster(cluster) {
+    var n = fat_next_cluster_raw(cluster);
+    if (n < 2) { return 0; }
+    if (fatfs_count_of_clusters < 1) { return 0; }
+    if (n > fatfs_count_of_clusters + 1) { return 0; }
+    # A self-referencing entry (A -> A) is the one cycle shape visible from a single step, and it is
+    # the cheapest one to craft. End the chain instead of spinning on it.
+    if (n == cluster) { return 0; }
+    return n;
+}
+
+# ⚠⚠ PART 2 IS NOT DONE, AND THIS IS THE HONEST STATE OF IT. The wrapper above ends a chain on an
+# out-of-range next cluster and on a SELF-reference, but a MULTI-NODE cycle (A -> B -> A, both in
+# range) is invisible from one step and still spins forever. There are THIRTEEN
+# `clus = fat_next_cluster(...)` walk sites in this file and their loop shapes differ — some carry a
+# `last`/`last_clus` cursor, some return, some break, some fall through to post-loop work — so a
+# blanket transform is not safe and each needs its own step counter.
+# ⭐ THE PREDICATE IS READY FOR THAT WORK: a chain cannot legitimately be longer than the volume has
+# clusters, so exceeding that count IS the cycle detector — no extra state and no second pass. The
+# per-site form is:
+#     var steps = 0;
+#     while (clus >= 2) {
+#         ...
+#         steps = steps + 1;
+#         if (fat_chain_overrun(steps) == 1) { clus = 0; }      # `clus = 0` exits via the loop's own
+#         else { clus = fat_next_cluster(clus); }               # condition, preserving post-loop work
+#     }
+# ⛔ DO NOT route this through a module-global counter reset at each loop head instead. A walk that
+# forgets its reset would inherit the previous walk's count and terminate EARLY — silent truncation
+# of a valid file, which is worse than the hang it replaces.
+fn fat_chain_overrun(steps) {
+    if (steps > fatfs_count_of_clusters) { return 1; }
+    return 0;
+}
+
+fn fat_next_cluster_raw(cluster) {
     if (cluster < 2) { return 0; }
     var fat_offset = 0;
     if (fatfs_type == 16) { fat_offset = cluster * 2; }

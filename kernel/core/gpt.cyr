@@ -92,6 +92,23 @@ fn gpt_decode_header(buf) {
     gpt_num_partition_entries = load32(buf + 80);
     gpt_partition_entry_size  = load32(buf + 84);
     gpt_partition_array_crc32 = load32(buf + 88);
+    # ⛔⛔ 1.56.51 SECURITY FIX — THESE TWO CAME OFF THE DISK AND WERE NEVER CHECKED, THEN USED AS A
+    # DIVISOR AND AS A STRIDE. `gpt_partition_entry_size` is the divisor in
+    # `entries_per_chunk = 4096 / gpt_partition_entry_size` at THREE sites (the array-CRC pass, the
+    # walk, and the print), so a crafted header carrying 0 is a divide-by-zero in the kernel on any
+    # disk this touches. It is also the stride in `off = gpt_array_buf + i * gpt_partition_entry_size`
+    # at two more, where an oversized value walks straight out of the 4 KB `gpt_array_buf`.
+    # A GPT is attacker-controlled in the threat model this kernel already accepts — removable USB
+    # mass storage, and the armed raw-block write band.
+    # ⚠ THE BOUNDS ARE THE UEFI SPEC'S, NOT INVENTED: §5.3 requires SizeOfPartitionEntry to be a
+    # multiple of 128 and at least 128; 128 is what every real formatter emits. Capping at one 4 KB
+    # chunk keeps `entries_per_chunk >= 1` so the chunk arithmetic below cannot divide to zero.
+    # NumberOfPartitionEntries is bounded by what the walk can actually read: 4 chunks of 4 KB.
+    if (gpt_partition_entry_size < 128)          { return 0 - 1; }
+    if (gpt_partition_entry_size > 4096)         { return 0 - 1; }
+    if ((gpt_partition_entry_size & 127) != 0)   { return 0 - 1; }
+    if (gpt_num_partition_entries < 1)           { return 0 - 1; }
+    if (gpt_num_partition_entries > 4096)        { return 0 - 1; }
     return 0;
 }
 
@@ -455,7 +472,13 @@ fn gpt_init() {
         return 0;
     }
 
-    gpt_decode_header(gpt_header_buf);
+    # ⚠ 1.56.51: the return is CHECKED now. gpt_decode_header validates the entry size and count it
+    # just read (see its body); both call sites previously discarded that verdict, which made the
+    # validation inert — the globals were already assigned by then and the walk used them anyway.
+    if (gpt_decode_header(gpt_header_buf) != 0) {
+        kprintln("gpt: header declares an unusable partition-entry geometry", 57);
+        return 0;
+    }
     # CMOS kcp = 0x49 (GPT header signature valid + decoded).
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x49; 0xE6; 0x71; }
 
@@ -471,7 +494,10 @@ fn gpt_init() {
         if (gpt_alt_lba == 0) { return 0; }
         if (blk_read(gpt_alt_lba, gpt_header_buf) != 0) { return 0; }
         if (gpt_validate_signature(gpt_header_buf) == 0) { return 0; }
-        gpt_decode_header(gpt_header_buf);
+        if (gpt_decode_header(gpt_header_buf) != 0) {
+            kprintln("gpt: backup header declares an unusable partition-entry geometry", 64);
+            return 0;
+        }
         gpt_header_crc_ok = gpt_validate_header_crc(gpt_header_buf);
         if (gpt_header_crc_ok == 0) {
             kprintln("gpt: backup header CRC mismatch -- both copies bad", 50);

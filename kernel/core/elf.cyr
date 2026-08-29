@@ -169,7 +169,14 @@ fn elf_load(elf_addr, elf_size) {
                 # 1.49.12: kernel access handle (identity <=256 MB / direct-map above) — same >256 MB
                 # raw-phys #PF fix as sys_mmap + elf_load_from_file. proc_map_page still stores raw `phys`.
                 var kva = pmm_kva_for_access(phys);
-                if ((p_flags & 1) != 0) { proc_map_page(new_cr3, pg, phys); }   # PF_X — executable code
+                # 1.56.51 W^X, both halves. PF_X -> read-only + executable (proc_map_page_rx);
+                # everything else -> writable + NX. A segment asking for BOTH (PF_W|PF_X) cannot be
+                # honoured under W^X, so it is refused rather than silently granted RWX — which is
+                # what proc_map_page did for every text page before this.
+                if ((p_flags & 1) != 0) {
+                    if ((p_flags & 2) != 0) { return 0 - 1; }   # RWX segment — refused
+                    proc_map_page_rx(new_cr3, pg, phys);
+                }
                 else { proc_map_page_nx(new_cr3, pg, phys); }                   # 1.50.6: non-PF_X data segment -> NX (W^X)
                 memset(kva, 0, 0x200000);            # zero whole page (BSS + slack)
                 var lo = p_vaddr;  if (pg > lo) { lo = pg; }
@@ -402,7 +409,11 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
                 # NOTE: cyrius/cyrld currently emits ONE RWE PT_LOAD per binary (code+data+bss together), so
                 # this segment IS PF_X → executable (no change); true segment W^X needs cyrius to emit
                 # separate RX-code / RW-data segments. The STACK NX below is the live W^X win for now.
-                if ((p_flags & 1) != 0) { proc_map_page(new_cr3, pg, phys); }
+                # 1.56.51 W^X — see the twin site in elf_load above.
+                if ((p_flags & 1) != 0) {
+                    if ((p_flags & 2) != 0) { return 0 - 1; }   # RWX segment — refused
+                    proc_map_page_rx(new_cr3, pg, phys);
+                }
                 else { proc_map_page_nx(new_cr3, pg, phys); }
                 elf_pde_probe(new_cr3, pg, phys, 0);   # ELF_PDE_PROBE: did this PDE actually land?
                 # Zero the whole page first (covers BSS + any slack), then copy
