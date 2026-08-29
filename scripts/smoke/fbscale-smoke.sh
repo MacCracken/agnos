@@ -32,8 +32,16 @@ OVMF_VARS=""; for c in /usr/share/edk2/x64/OVMF_VARS.4m.fd /usr/share/edk2/x64/O
 WORK="$ROOT/build/fbscale-smoke"; LOGS="$ROOT/build/fbscale-smoke-logs"
 rm -rf "$WORK" "$LOGS"; mkdir -p "$WORK" "$LOGS"
 ESP="$WORK/esp.img"
-dd if=/dev/zero of="$ESP" bs=1M count=64 status=none
-parted -s "$ESP" mklabel gpt mkpart ESP fat32 1MiB 100% set 1 esp on >/dev/null 2>&1
+# ⛔⛔ 1.56.51 — THIS SMOKE'S ESP RECIPE COULD NOT BOOT, AND THE FAILURE LOOKED LIKE THE KERNEL.
+# Isolated by a 2x2 over {ESP geometry} x {block device}, one QEMU run per cell: ONLY
+# {1MiB..33MiB on a 128 MB disk} x {nvme} hands off. The old `mkpart ESP fat32 1MiB 100%` on a 64 MB
+# disk yields a 63 MiB FAT32 at 1 sector/cluster (129024 clusters) that OVMF's FAT driver will not
+# boot, and virtio-blk does not boot on this box under EITHER geometry. Both had to change.
+# ⚠ The visible symptom was NOT "no boot" — it was the smoke's own assertions grepping an empty log
+# and reporting a wall of red naming real regression guards. 25 smokes shared this copy-pasted
+# recipe, four of them gates in sweep.sh. See scripts/smoke/edge-abi-smoke.sh for the measurement.
+dd if=/dev/zero of="$ESP" bs=1M count=128 status=none
+parted -s "$ESP" mklabel gpt mkpart ESP fat32 1MiB 33MiB set 1 esp on >/dev/null 2>&1
 mformat -i "$ESP"@@1048576 -F
 mmd -i "$ESP"@@1048576 ::EFI ::EFI/BOOT ::boot
 mcopy -i "$ESP"@@1048576 "$GNOBOOT" ::EFI/BOOT/BOOTX64.EFI
@@ -48,7 +56,7 @@ qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
-    -drive "file=$ESP,format=raw,if=none,id=esp0" -device "virtio-blk-pci,drive=esp0" \
+    -drive "file=$ESP,format=raw,if=none,id=esp0" -device "nvme,drive=esp0,serial=AGNOS-SMOKE" \
     -serial stdio -display none -no-reboot
 
 echo "--- serial (fbscale lines) ---"; strings "$LOG" | grep "fbscale:" | sed 's/^/  /'

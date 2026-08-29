@@ -60,12 +60,16 @@ fn timer_handler(rsp_after_push) {
         # ring-3 tool is in a poll loop. Otherwise LAN broadcast/multicast chatter
         # overruns the 64-deep r8169 ring during sleep_ms / idle gaps and the NIC drops
         # replies (the iron 50%-loss; QEMU's quiet point-to-point SLIRP never showed
-        # it). net_rx_drain is RX-only + self-guarded (net_rx_lock atomic try-lock, 1.46.x #5), so it
-        # issues no TX from interrupt context and no-ops (trylock fails) rather than re-enter a tool's
-        # in-flight drain — now correct cross-CPU. Runs before the context switch so it executes in the kernel context
+        # it). The drain is self-guarded (net_rx_lock atomic try-lock, 1.46.x #5), so it no-ops
+        # (trylock fails) rather than re-enter a tool's in-flight drain — now correct cross-CPU.
+        # ⛔ 1.56.51 — THIS SAID "RX-only ... issues no TX from interrupt context" AND IT WAS FALSE.
+        # net_demux_frame dispatches to net_handle_arp, which builds and nic_send()s an ARP reply,
+        # and to net_handle_tcp, whose passive open calls kmalloc (heap_spin_lock) — a same-CPU
+        # deadlock if the tick lands inside the heap critical section. Hence net_rx_drain_isr(),
+        # which latches interrupt context so the allocating path declines instead of hanging. Runs before the context switch so it executes in the kernel context
         # established at ISR entry (pre-CR3-swap); nic_ready() gates it to a no-op
         # until the NIC is up, so early-boot ticks are safe.
-        net_rx_drain();
+        net_rx_drain_isr();
         # B5 audio: service the output stream's double-buffer refill (polled, no IRQ,
         # like the NIC drain). No-op until a producer arms hda_stream_on (the HDA_TONE
         # sweep, or snd_write#66 at Gate 2), so early-boot + audio-idle ticks pay only
@@ -183,7 +187,7 @@ fn nic_rx_handler() {
     # r8169 is absent (QEMU/virtio: r8169_present==0 → returns immediately, no MMIO),
     # so the virtio-net MSI-X path is untouched (its used/avail ring self-re-arms).
     r8169_irq_ack();
-    net_rx_drain();
+    net_rx_drain_isr();
     nic_rx_irq_seen = 1;   # latch — this ISR only runs on a real MSI/MSI-X delivery; printed once from net_poll (non-ISR)
     apic_eoi();
     return 0;

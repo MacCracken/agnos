@@ -310,7 +310,7 @@ fn fb_verify_wc() {
     if (pat_idx == 1) {
         serial_println("fb: WC verified (PAT entry 1)", 29);
     } else {
-        serial_print("fb: WARN expected PAT entry 1 (WC), got entry ", 47);
+        serial_print("fb: WARN expected PAT entry 1 (WC), got entry ", 46);
         kfmt_int(pat_idx);
         serial_print(" PDE=", 5);
         kfmt_hex0x(pde);

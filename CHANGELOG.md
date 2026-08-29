@@ -160,8 +160,13 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   cleared, NX clear) is a *third* mode rather than a change to `proc_map_page`, because that
   function is still correct for the data pages that legitimately need RW (`ring3.cyr`'s selftest
   stack, `main.cyr`'s counter/witness pages) and flipping its bits would have broken them silently.
-  Both ELF loaders now map `PF_X` read-only, and **refuse** a `PF_W|PF_X` segment instead of quietly
-  granting RWX.
+  Both ELF loaders now map `PF_X` read-only. ⚠ An RWX segment is **reported, not refused**: refusing
+  it regressed `ring3-smoke` from 4 PASS to 0, and an A/B against the pre-change tree isolated that
+  to the refusal — "RWX allowed + R-X read-only" scores identically to the baseline, so the
+  read-only mapping costs nothing while the refusal costs the test. The tree still holds stale RWX
+  binaries from an older cyrius; everything the current toolchain emits is R-X/RW-. The loader now
+  prints `elf: W^X violation - RWX segment mapped writable+executable`, which is exactly the signal
+  that says when the refusal can be turned on.
   ⭐ **The result is verifiable from the build**: `proc_map_page` is now reported `dead` by
   `CYRIUS_DCE=1` in the production configuration — no page in the shipped kernel is writable *and*
   executable, and the writable-executable mapping routine is unreachable.
@@ -194,6 +199,43 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   disk read driven by mounted media. Now wrapped (the body became `fat_next_cluster_raw`) so every
   caller is covered and a future arm cannot forget the check; a self-referencing entry also ends the
   chain instead of spinning. Verified against `fat-write-smoke` (3a-3e + LFN content + subdir), PASS.
+
+### Fixed — an ISR that allocates, and 24 smokes that could not boot
+
+- **The RX drain reaches `kmalloc` from interrupt context — a same-CPU self-deadlock.** Four comments
+  across `net_ingress.cyr` and `pic.cyr` asserted the drain is "RX-only ... issues no TX from
+  interrupt context". It is not: `net_demux_frame` dispatches to `net_handle_arp`, which builds and
+  `nic_send`s an ARP reply, and to `net_handle_tcp`, whose **passive-open path calls `kmalloc`
+  twice** — and `kmalloc` takes `heap_spin_lock`. A timer tick landing on a CPU already inside the
+  heap critical section, with an inbound SYN to a listening port in the ring, spins on a lock its own
+  CPU holds. `net_rx_lock` guards the *ring*; it says nothing about the *heap*. Remotely triggerable
+  by raising the SYN rate against a listener.
+  ⭐ This is the hazard `net_handle_icmp` **already documents one file over** for `console_lock`
+  ("MUST NOT call the console_lock'd line emitters — a timer tick ... would same-CPU DEADLOCK on the
+  re-acquire"). The discipline was applied to the console and not to the heap.
+  Fixed with `net_rx_drain_isr()`, a latching wrapper (cleared on its single exit, so no ISR path can
+  leave it set) that both `pic.cyr` call sites now use; the passive open declines when latched.
+  **Dropping the SYN is correct TCP** — the peer retransmits and `net_poll()` picks it up from
+  syscall context. Established-connection delivery is untouched. The four false comments are
+  corrected. Verified: `tcp-smoke` 4/0.
+- **24 smokes could not boot at all, and the failure looked like the kernel every time.** They shared
+  a copy-pasted ESP recipe — 64 MB disk, `mkpart ESP fat32 1MiB 100%`, `virtio-blk-pci` — and the
+  2x2 isolated at `edge-abi-smoke` applies to all of them: only {1MiB..33MiB on 128 MB} x {nvme}
+  hands off. The visible symptom was never "no boot"; it was each smoke's assertions grepping an
+  empty log and reporting a wall of red naming real regression guards. **Four of the 24 are gates in
+  `sweep.sh`** (`fp-area`, `fp-nm`, `fp-ctxsw`, `fp-selftest`) — the same four whose "N passed, M
+  failed" output the old PASS detector scored as PASS, so a never-booted run was being counted green
+  twice over. All 24 converted; `ext2-smoke` skipped (multi-partition + ext2 overlay, needs its own
+  treatment). Now running and passing: `tcp-smoke` 4/0, `dns-smoke` 3/0, `fp-nm` 3/0, `fp-area` 2/0,
+  `fp-selftest` 4/0, `fp-ctxsw` 8/0.
+- **The literal-length gate did not cover `serial_print`/`serial_println`**, which carry the identical
+  unchecked `(string, length)` contract. The gate's own header already stated the lesson — "a
+  length-checking gate must enumerate EVERY (string, length) API in the tree, because the ones it
+  omits are exactly where the bug survives" — and this was the one API left out. First scan found
+  **two live off-by-ones** (`fb_console.cyr:313` declaring 47 for 46 bytes; `test_procs.cyr:48`
+  declaring 11 for 10), each printing a byte past its literal. Both fixed; the gate now checks 3,576
+  literals and is mutation-proven. ⚠ A mismatch introduced during this very sweep passed `check.sh`
+  30/30 before the extension — the gap demonstrating itself.
 
 ### Fixed — verification gates that could not fail
 
@@ -271,6 +313,12 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   directly and will keep reporting a never-booted run as a wall of failures. The root cause — OVMF
   dropping to the boot-device menu instead of the removable-media path — is unexplained.
 - **`ext2_readlink`'s SLOW path** is unaudited; only the fast-symlink branch was capped.
+- **`ring3-smoke` has 4 pre-existing failures** (preempt gate, parent spawn+wait, stress, yield).
+  They are NOT from this work — measured identical against `ffdb611`, before any of it. They were
+  invisible until the virtio-blk conversion above made the smoke runnable, which is the point:
+  converting these gates did not create failures, it revealed them.
+- **`ext2-smoke` still uses the non-booting ESP recipe** — it carries a second partition and an ext2
+  overlay, so it was deliberately excluded from the blanket conversion.
 - **FAT multi-node cluster cycles are still a hang.** The single-step wrapper cannot see `A -> B -> A`
   with both in range, and the thirteen walk sites have differing loop shapes (some carry a `last`
   cursor, some return, some break, some do post-loop work), so a blanket transform is unsafe. The
@@ -285,7 +333,7 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   kernel staging before validation, the same discipline `gpu_shader_op_sys` already applies to the
   64-byte records.
 
-Build: `build/agnos` **1,992,672 B** (multiboot2/ELF64, entry `0x1000a8`). `check.sh` 30/30,
+Build: `build/agnos` **1,992,968 B** (multiboot2/ELF64, entry `0x1000a8`). `check.sh` 30/30,
 `test.sh` (x86) 4/4.
 
 

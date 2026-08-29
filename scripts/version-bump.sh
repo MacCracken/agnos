@@ -61,14 +61,34 @@ updated="$updated  VERSION\n"
 #    characters that would otherwise collide with the `|` delimiter
 #    AND get parsed as ERE alternation operators after delimiter
 #    unescaping (causing every line to match the empty-alternative).
+# ⛔⛔ MEASURED 2026-08-28 (1.56.51): ALL THREE OF THE OLD state.md SEDS MATCHED NOTHING, and the
+# script reported the file "Updated" anyway — the same silent-no-op class as the CHANGELOG step
+# below. It looked for `| **Kernel** | **X.Y.Z** |`, `> **Last refresh**: DATE` and a
+# `| **Released** | DATE |` row; the file's real shapes are `| Kernel head | **X.Y.Z — OPEN** …`,
+# `**Last refresh** DATE` (no colon, mid-line) and no Released row at all. That is why state.md sat
+# at **1.56.45** while VERSION already said 1.56.50 — five patch releases of drift in the one file
+# whose entire job is to be current.
+# ⭐ Patterns are matched against the file's ACTUAL shape and the result is ASSERTED. A version site
+# that silently fails to update is worse than one that was never automated, because the "Updated:"
+# line tells you it happened.
 if [ -f "$ROOT/docs/development/state.md" ]; then
-    sed -i -E "s#^(\\| \\*\\*Kernel\\*\\* \\| )\\*\\*[0-9]+\\.[0-9]+\\.[0-9]+\\*\\*( \\|.*)#\\1**$NEW**\\2#" "$ROOT/docs/development/state.md"
+    ST="$ROOT/docs/development/state.md"
+    sed -i -E "s#^(\\| Kernel head \\| \\*\\*)[0-9]+\\.[0-9]+\\.[0-9]+#\\1$NEW#" "$ST"
+    grep -qE "^\\| Kernel head \\| \\*\\*$NEW" "$ST" || {
+        echo "error: state.md's 'Kernel head' row did not update to $NEW." >&2
+        echo "       The row's shape changed; fix this pattern rather than letting the bump" >&2
+        echo "       silently skip it (which is what it did until 1.56.51)." >&2
+        exit 1
+    }
     # Date stamps are release metadata, not version-derived — a REGEN must not
     # move them (it would date-stamp a release that did not happen).
     if [ "$REGEN" = "0" ]; then
         TODAY=$(date +%Y-%m-%d)
-        sed -i -E "s#^(> \\*\\*Last refresh\\*\\*: )[0-9]{4}-[0-9]{2}-[0-9]{2}#\\1$TODAY#" "$ROOT/docs/development/state.md"
-        sed -i -E "s#^(\\| \\*\\*Released\\*\\* \\| )[0-9]{4}-[0-9]{2}-[0-9]{2}( \\|.*)#\\1$TODAY\\2#" "$ROOT/docs/development/state.md"
+        sed -i -E "s#(\\*\\*Last refresh\\*\\* )[0-9]{4}-[0-9]{2}-[0-9]{2}#\\1$TODAY#" "$ST"
+        grep -q "\\*\\*Last refresh\\*\\* $TODAY" "$ST" || {
+            echo "error: state.md's 'Last refresh' stamp did not update to $TODAY." >&2
+            exit 1
+        }
     fi
     updated="$updated  docs/development/state.md\n"
 fi

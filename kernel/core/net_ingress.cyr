@@ -185,7 +185,8 @@ fn ip_safe_payload_len(ip_total, ip_ihl, avail) {
 }
 
 # Tool / recv-loop entry point: TX retransmits + RX drain. The 100 Hz timer ISR
-# (timer_handler, pic.cyr) calls net_rx_drain() directly instead, so it never
+# (timer_handler, pic.cyr) calls net_rx_drain_isr() directly instead (1.56.51: the latching
+# wrapper, not the bare drain — see its header), so it never
 # issues TX from interrupt context.
 # net_demux_frame — ethertype dispatch for ONE received (or looped-back) frame. Extracted from
 # net_rx_drain (1.49.0 loopback bite 1) so the loopback queue drains through the SAME demux path as
@@ -246,15 +247,42 @@ fn net_poll() {
 # ring went unserviced, so on a real LAN broadcast+multicast chatter overran the
 # 64-deep ring (missed=FIFO-overflow) and the NIC dropped frames — including the
 # tools' replies. That is the iron 50%-loss; QEMU's chatter-free point-to-point
-# SLIRP kept the ring empty so it never reproduced there. RX-only (no
-# tcp_retx_tick) so the ISR issues no TX and can't race a tool's in-flight
-# nic_send. 1.46.x SMP STEP-2 (#5): the old non-atomic `net_poll_busy` flag is now net_rx_lock — an
+# SLIRP kept the ring empty so it never reproduced there. No tcp_retx_tick, so the ISR runs no
+# RETRANSMIT timer and can't race a tool's in-flight nic_send.
+# ⛔ 1.56.51 — THIS READ "RX-only ... so the ISR issues no TX" AND THAT WAS FALSE. The drain
+# dispatches into net_demux_frame -> net_handle_{arp,icmp,udp,tcp}; those handlers are reply-capable
+# and net_handle_tcp's passive open ALLOCATES. The narrower claim above is the true one. See
+# net_rx_drain_isr() below for the heap-reentrancy latch that fact required. 1.46.x SMP STEP-2 (#5): the old non-atomic `net_poll_busy` flag is now net_rx_lock — an
 # ATOMIC xchg TRY-lock (smp.cyr) — so the single-consumer guard is correct CROSS-CPU. Under
 # smp_sched_aps=1 a BACKGROUND net program on an AP can call a net syscall → net_poll() → net_rx_drain
 # CONCURRENTLY with the BSP timer-ISR drain (pic.cyr, pcpu_cpu()==0-gated); the old check-then-set flag
 # raced across CPUs and would let BOTH drain the one shared ring → net_rx_pkt / r8169_rx_idx corruption.
 # net_rx_trylock() returns 0=acquired / 1=already-held; a same-CPU timer landing mid-drain (tool poll
 # loops run IF=1 in the sleep_ms sti-window) still just fails the trylock → no-op, exactly as before.
+
+# ⛔⛔ 1.56.51 — INTERRUPT-CONTEXT LATCH FOR THE RX DRAIN. The header above claimed "RX-only ... the
+# ISR issues no TX", and pic.cyr repeats it at the call site. That is FALSE in the way that matters:
+# the drain dispatches through net_demux_frame -> net_handle_tcp, whose PASSIVE-OPEN path calls
+# `kmalloc` TWICE (the rx_buf/retx_buf pair in net_tcp.cyr) — and kmalloc takes heap_spin_lock. A
+# timer tick landing on a CPU already inside the heap critical section, with an inbound SYN to a
+# listening port in the ring, makes the ISR spin on a lock ITS OWN CPU HOLDS: a same-CPU
+# self-deadlock, i.e. a hard hang. net_rx_lock guards the RING; it says nothing about the HEAP.
+# ⭐ THIS IS THE SAME HAZARD net_handle_icmp ALREADY DOCUMENTS ONE FILE OVER, for console_lock:
+# "reachable FROM THE TIMER ISR ... so it MUST NOT call the console_lock'd line emitters — a timer
+# tick landing while a thread holds console_lock would same-CPU DEADLOCK on the re-acquire." The
+# discipline was applied to the console and not to the heap.
+# ⚠ WRAPPER, NOT AN ARM/DISARM PAIR AT THE CALL SITES: the latch is cleared on the single exit here,
+# so no ISR path can leave it set — the same reasoning as the ext2 direct-DMA opt-in.
+# ⚠ pic.cyr must call THIS, not net_rx_drain: it is included long before core/net_*, so it can reach
+# a function but never the `net_in_isr` variable.
+var net_in_isr = 0;
+
+fn net_rx_drain_isr() {
+    net_in_isr = 1;
+    var d = net_rx_drain();
+    net_in_isr = 0;
+    return d;
+}
 
 fn net_rx_drain() {
     if (nic_ready() == 0) { return 0; }

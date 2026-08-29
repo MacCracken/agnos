@@ -45,7 +45,7 @@ fn test_proc_b() {
 # Test the SYSCALL interface via direct kernel call (not the instruction).
 fn test_hw_syscall() {
     ksyscall(1, 0, "HW-OK\n", 6);
-    serial_print("HW getpid=", 11);
+    serial_print("HW getpid=", 10);
     kprint_num(ksyscall(2, 0, 0, 0));
     serial_println("", 0);
     return 0;

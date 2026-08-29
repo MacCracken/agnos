@@ -33,6 +33,15 @@ import re, sys
 # the tree, because the ones it omits are exactly where the bug survives.
 pat = re.compile(r'\bkprint(?:ln)?\("((?:[^"\\]|\\.)*)"\s*,\s*(\d+)\)')
 eapat = re.compile(r'\bea_expect(?:_valid)?\(.*?"((?:[^"\\]|\\.)*)"\s*,\s*(\d+)\)')
+# ⚠ serial_print / serial_println ADDED 1.56.51 — AND THE GATE'S OWN LESSON ABOVE PREDICTED THIS.
+# They carry the identical (string, length) contract and were the one remaining uncovered API, so
+# they were exactly where the bug survived: the sweep found TWO live off-by-ones on the first scan
+# (fb_console.cyr's PAT warning declaring 47 for 46 bytes, test_procs.cyr's "HW getpid=" declaring
+# 11 for 10) — each printing one byte past its literal. A mismatch introduced during this very sweep
+# also passed check.sh 30/30 before this line existed, which is the same gap demonstrating itself.
+# ⚠ The ISR-safe console path (net_handle_icmp, elf.cyr's W^X notice) uses serial_println precisely
+# BECAUSE it is not console_lock'd — so this API is on the growth path, not a legacy corner.
+serpat = re.compile(r'\bserial_print(?:ln)?\("((?:[^"\\]|\\.)*)"\s*,\s*(\d+)\)')
 bad = 0
 total = 0
 for path in sys.argv[1].split():
@@ -41,7 +50,7 @@ for path in sys.argv[1].split():
     except OSError:
         continue
     for lineno, line in enumerate(lines, 1):
-        for m in list(pat.finditer(line)) + list(eapat.finditer(line)):
+        for m in list(pat.finditer(line)) + list(eapat.finditer(line)) + list(serpat.finditer(line)):
             literal, declared = m.group(1), int(m.group(2))
             # Cyrius escapes follow C conventions closely enough for a length count.
             actual = len(literal.encode().decode('unicode_escape'))
@@ -51,6 +60,6 @@ for path in sys.argv[1].split():
                 print(f"  MISMATCH {path}:{lineno}  declared={declared} actual={actual}")
                 print(f"           {literal!r}")
 
-print(f"  checked {total} kprint/ea_expect literals, {bad} mismatched")
+print(f"  checked {total} kprint/ea_expect/serial_print literals, {bad} mismatched")
 sys.exit(1 if bad else 0)
 PY

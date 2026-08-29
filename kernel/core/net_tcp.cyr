@@ -730,6 +730,16 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
         if ((flags & 0x10) != 0) { return 0; }
         var listen_id = tcp_find_listen(dst_port);
         if (listen_id < 0) { return 0; }
+        # ⛔⛔ 1.56.51 — NO PASSIVE OPEN FROM INTERRUPT CONTEXT. The two kmallocs below take
+        # heap_spin_lock, and this function is reachable from the timer ISR and the NIC MSI handler
+        # via net_rx_drain -> net_demux_frame. A tick landing on a CPU already inside the heap
+        # critical section would spin on a lock its OWN CPU holds — a hard hang, remotely triggerable
+        # by anyone able to raise the SYN rate against a listening port.
+        # ⚠ DROPPING THE SYN IS CORRECT TCP, not a degradation: the peer retransmits, and the retry
+        # is picked up by net_poll() from syscall context (a server in an accept loop polls) or by a
+        # later tick that does not collide with the heap. Established-connection data delivery is
+        # untouched — only the ALLOCATING path declines.
+        if (net_in_isr != 0) { return 0; }
         # Allocate a new conn slot for the incoming peer (1.45.2: reclaim-aware,
         # shared with tcp_connect — passive opens no longer leak slots either).
         var new_id = tcp_alloc_conn_slot();

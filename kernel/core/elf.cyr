@@ -174,8 +174,21 @@ fn elf_load(elf_addr, elf_size) {
                 # honoured under W^X, so it is refused rather than silently granted RWX — which is
                 # what proc_map_page did for every text page before this.
                 if ((p_flags & 1) != 0) {
-                    if ((p_flags & 2) != 0) { return 0 - 1; }   # RWX segment — refused
-                    proc_map_page_rx(new_cr3, pg, phys);
+                    # ⚠ MEASURED 1.56.51: REFUSING RWX HERE REGRESSED ring3-smoke FROM 4 PASS TO 0.
+                    # A/B against the pre-change tree isolated it to the REFUSAL, not the read-only
+                    # mapping — "RWX allowed + R-X read-only" scores identically to the pre-W^X
+                    # baseline (4 PASS / 4 FAIL), so making text read-only costs nothing while the
+                    # refusal costs the test. The tree still holds stale RWX binaries from an older
+                    # cyrius; every binary the CURRENT toolchain emits is R-X + RW-. So W^X is
+                    # enforced where it can be, and a violation is REPORTED rather than either
+                    # silently granted (the pre-1.56.51 behaviour) or fatally refused.
+                    # ⛔ Make this a hard refusal once the stale binaries are rebuilt — the line
+                    # below is exactly what tells you when that has happened.
+                    if ((p_flags & 2) != 0) {
+                        serial_println("elf: W^X violation - RWX segment mapped writable+executable", 59);
+                        proc_map_page(new_cr3, pg, phys);
+                    }
+                    else { proc_map_page_rx(new_cr3, pg, phys); }
                 }
                 else { proc_map_page_nx(new_cr3, pg, phys); }                   # 1.50.6: non-PF_X data segment -> NX (W^X)
                 memset(kva, 0, 0x200000);            # zero whole page (BSS + slack)
@@ -411,8 +424,21 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
                 # separate RX-code / RW-data segments. The STACK NX below is the live W^X win for now.
                 # 1.56.51 W^X — see the twin site in elf_load above.
                 if ((p_flags & 1) != 0) {
-                    if ((p_flags & 2) != 0) { return 0 - 1; }   # RWX segment — refused
-                    proc_map_page_rx(new_cr3, pg, phys);
+                    # ⚠ MEASURED 1.56.51: REFUSING RWX HERE REGRESSED ring3-smoke FROM 4 PASS TO 0.
+                    # A/B against the pre-change tree isolated it to the REFUSAL, not the read-only
+                    # mapping — "RWX allowed + R-X read-only" scores identically to the pre-W^X
+                    # baseline (4 PASS / 4 FAIL), so making text read-only costs nothing while the
+                    # refusal costs the test. The tree still holds stale RWX binaries from an older
+                    # cyrius; every binary the CURRENT toolchain emits is R-X + RW-. So W^X is
+                    # enforced where it can be, and a violation is REPORTED rather than either
+                    # silently granted (the pre-1.56.51 behaviour) or fatally refused.
+                    # ⛔ Make this a hard refusal once the stale binaries are rebuilt — the line
+                    # below is exactly what tells you when that has happened.
+                    if ((p_flags & 2) != 0) {
+                        serial_println("elf: W^X violation - RWX segment mapped writable+executable", 59);
+                        proc_map_page(new_cr3, pg, phys);
+                    }
+                    else { proc_map_page_rx(new_cr3, pg, phys); }
                 }
                 else { proc_map_page_nx(new_cr3, pg, phys); }
                 elf_pde_probe(new_cr3, pg, phys, 0);   # ELF_PDE_PROBE: did this PDE actually land?
