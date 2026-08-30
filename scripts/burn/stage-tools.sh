@@ -165,6 +165,9 @@ stage_one agnos/tests/audio tonegen.cyr tonegen || rc=1
 # in the rootfs faults on purpose, so every one of those burns could only observe the absence of a
 # fault it never caused. That is the same shape as a stale oracle: it does not fail, it agrees.
 stage_one agnos/tests/fault faulter.cyr faulter || rc=1
+# 1.56.54 — the fork#96 ring-3 oracle. fork's contract is entirely about the CALLER's resume context,
+# so it cannot be tested from kernel context (sys_fork refuses a kernel-CR3 caller by design).
+stage_one agnos/tests/fork forker.cyr forker || rc=1
 
 # GPU display/compositing proofs — the ring-3 ends of the 1.55.x/1.56.x band. IN-TREE
 # (agnos/tests/gpu), same agnos/ prefix as tonegen. These were staged BY HAND for every burn

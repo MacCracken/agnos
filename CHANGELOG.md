@@ -22,6 +22,59 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.54] — 2026-08-30 — the issues folder swept: 17 open → 6, and what archiving would have buried
 
+### Added — `waitpid`#4 wait-any, `proc_dup_address_space`, and `fork`#96 (PARTIAL)
+
+- **`waitpid`#4 gained wait-any (`arg1 < 0`)** — the prerequisite the fork issue named. Scans for a
+  dead child of the caller, reaps the lowest such pid and returns its exit code; **-2** while children
+  live, **-1** when there are none. ⚠ That split is the whole contract: collapsing them would make
+  *"all my children are still running"* indistinguishable from *"I have none"*, and a
+  fork-per-connection server would leave its accept loop the first time no child had finished.
+
+- **`proc_dup_address_space`** — full copy of PD[1..510] plus the high-arena PDPT[128..511] PDs.
+  ⛔ Full copy, **not** copy-on-write, and that is a decision: CoW needs a write-fault unshare path,
+  and agnos's `#PF` handler routes CPL3 faults to `fault_kill_current` and CPL0 to a halt — a CoW page
+  would present as a killed process. It reuses `proc_map_page`/`_nx`/`_hi` rather than writing PDEs by
+  hand, so the `0x87` bits, NX bit 63 and the KPTI entry-511 stash stay in one place. ⚠ PD[511] is the
+  user-CR3 stash, not a mapping — copying it would point the child's KPTI user CR3 at the parent's PML4.
+
+- **`fork`#96 — the hard part is built and MEASURED.** Dispatched from `syscall_handler`, **not**
+  `ksyscall`, for the same reason `#44`/`#14` are: the child's resume context comes from
+  `pcpu_sc_entry_regs`, which the entry stub fills and which is valid only on a path reached from the
+  ring-3 stub. ⭐ **A first draft added two new per-CPU cells and two stores to the hand-assembled
+  SYSCALL stub before finding that `sched_yield`#44 already captures exactly this set** — rcx (user
+  RIP), r11 (RFLAGS) and rbx/rbp/r12-r15. All of that was reverted; no stub change was needed.
+  ⭐ **Proven in QEMU** by a new ring-3 program `/bin/forker`: `FORK-CHILD` and `FORK-CHILD-OK` both
+  print — a second process resumes at the parent's post-SYSCALL RIP with `rax == 0`, sees the parent's
+  pre-fork stack value, and writes its **own** copy — and `FORK-PARENT` prints, so the parent survives
+  with a positive pid.
+  ⚠ **PARTIAL: `FORK-PARENT-OK` does not print.** The parent's `waitpid(-1)` loop times out and never
+  observes the exited child. `exit`#0 sets state 0 without reaping, so the child should be findable;
+  the failure is in the parent/child handoff, not in the copy or the resume.
+  ⛔ **The harness question is the real one, because agnos has almost nowhere a forked child can run.**
+  Two shapes were tried and both are structurally wrong — as properties of this kernel, not of `#96`:
+  foreground `exec_and_wait` runs its child **IF=0** (*"their no-context-switch model is
+  load-bearing"*), and the boot thread cannot safely be switched away from (*"restoring it would
+  time-travel kmain"*). ⇒ The one context where a forked child can be scheduled alongside its parent
+  is a proc spawned from agnsh via `spawn_path`#43 after boot — which is also the shape agora runs in.
+  ⚠ `scripts/smoke/fork-smoke.sh` is **deliberately not wired into `sweep.sh`** while it is red on that
+  last marker, and the cyrius `SYS_FORK` peer is **not** filed — the issue's own rule is *"do not mint
+  the number before the kernel arm exists"*, and it does not fully yet.
+
+### Fixed — the SYSCALL stub emitter had no bound check at all
+
+- `syscall_stub_build` writes into `syscall_entry_buf`, which is `var …[256]` at module scope =
+  **2048 bytes**, and `eoff` was never compared against it anywhere. Every byte past the end would
+  land in whatever `.bss` follows — silently, on the one path every syscall in the system runs
+  through, presenting as an unrelated global going wrong long after boot. It has never overflowed;
+  nothing said so. Now bounded, and the size is **printed**: `syscall: stub 258 bytes of 2048`.
+  ⚠ Measured because this cut nearly grew the stub by 16 bytes, and the buffer's own comment records
+  an earlier enlargement for IBRS — growth here has a history of finding a ceiling nobody watches.
+
+⚠ **The syscall-ABI gate cannot see `#96` (or `#44`).** It scans for `if (num == N)` in `ksyscall`,
+and both dispatch from `syscall_handler` instead — so neither appears in its kernel number set, and
+`#44` has been invisible to it since the gate was written. Not fixed here; recorded so the next ABI
+change does not trust a green gate over the dispatch chain.
+
 ### Fixed — the pipe contract change of 1.56.39–40 was never swept into its callers
 
 *ipc bites 10/11* made pipes streaming: the ring short-writes at `PIPE_RING` = 4080 instead of

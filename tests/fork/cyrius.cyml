@@ -1,0 +1,15 @@
+[package]
+name = "forker"
+version = "0.1.0"
+description = "agnos fork#96 test — proves a forked child RESUMES at the fork site, DIVERGES by return value, and gets its own copy of the parent's memory."
+license = "GPL-3.0-only"
+language = "cyrius"
+cyrius = "6.5.36"
+
+[build]
+src = "forker.cyr"
+output = "build/forker"
+
+# syscalls -> sys_write + SYS_EXIT + the raw syscall() builtin for #96/#4.
+[deps]
+stdlib = ["syscalls", "alloc"]

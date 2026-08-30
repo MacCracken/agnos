@@ -1,6 +1,22 @@
 # `#96 fork` — the number is reserved, the syscall is not built, and agora cannot run on agnos without it
 
-**Status:** 🔵 **OPEN — RESERVED AND UNBUILT at 1.56.54.** Re-verified 2026-08-30: no `num == 96` dispatch arm, no `proc_dup_address_space`, and the `waitpid`#4 wait-any prerequisite (`arg1 < 0`) is still rejected. agora's fork-per-connection BBS therefore still cannot serve a second connection on agnos. ⚠ **Order matters and has not changed**: wait-any first (it forces the `proc_ppid[16]` array fork also needs), then full-copy `proc_dup_address_space` over PD[1..510]. LARGE; wants slotting.
+**Status:** 🟡 **PARTIAL — 1.56.54. THE HARD PART IS BUILT AND MEASURED; THE wait-any HANDOFF IS NOT.**
+
+**What is done and proven** (`scripts/smoke/fork-smoke.sh`, ring-3 `/bin/forker`):
+- `waitpid`#4 **wait-any** (`arg1 < 0`) — scans for a dead child of the caller, reaps the lowest, returns its code; `-2` while children live, `-1` when there are none. The `-2`/`-1` split is the contract a fork loop depends on.
+- **`proc_dup_address_space`** — full copy (not CoW; agnos has no write-fault unshare path) of PD[1..510] plus the high-arena PDPT[128..511] PDs, reusing `proc_map_page`/`_nx`/`_hi` so the 0x87 bits, NX bit 63 and the KPTI entry-511 stash stay in one place.
+- **`sys_fork`#96**, dispatched from `syscall_handler` — **not** `ksyscall` — for the same reason `#44`/`#14` are: the child's resume context comes from `pcpu_sc_entry_regs`, valid only on a path reached from the ring-3 entry stub.
+- ⭐ **MEASURED IN QEMU**: `FORK-CHILD` and `FORK-CHILD-OK` both print. A second process really does resume at the parent's post-SYSCALL RIP with `rax == 0`, sees the parent's pre-fork stack value, and writes its **own** copy. `FORK-PARENT` prints too — the parent survives with a positive pid.
+
+**What is NOT done:** `FORK-PARENT-OK` — the parent's `waitpid(-1)` loop times out and never observes the exited child. `exit`#0 sets state 0 without reaping, so the child should be findable; the failure is in the parent/child handoff under a foreground `exec_and_wait`, not in the copy or the resume.
+
+⛔ **AND THE HARNESS QUESTION IS THE REAL ONE, because agnos has almost nowhere a forked child can run.** Two shapes were tried and both are structurally wrong, for reasons that are properties of this kernel rather than of `#96`:
+- **Foreground `exec_and_wait` runs the child IF=0** — sched.cyr states it: *"Refuse IF=0 callers (foreground exec/execwait children): their no-context-switch model is load-bearing."*
+- **The boot thread cannot safely be switched away from** — *"restoring it would time-travel kmain."* Marking the proc ready and polling from boot printed its banner and stopped.
+⇒ **The one context where a forked child can be scheduled alongside its parent is a proc spawned from agnsh via `spawn_path`#43, after boot.** That is where the remaining verification belongs, and it is also the shape the named consumer (agora, fork-per-connection) actually runs in.
+
+⚠ `scripts/smoke/fork-smoke.sh` is **deliberately NOT wired into `sweep.sh`** while it is red on `FORK-PARENT-OK`. A gate that passes while its subject is incomplete is the failure mode this repo has spent two cuts removing.
+⚠ The cyrius `SYS_FORK = 96` peer is **not** filed yet — the issue's own rule is *"do not mint the number before the kernel arm exists"*, and it now does, but not completely. File it when wait-any closes.
 
 **Original status:** 🟡 **OPEN** — filed 2026-08-05. Number assigned by the operator; nothing minted yet.
 **Number:** **`#96`** — ⭐ **settled 2026-08-05.** It was contested with the local-IPC band; the

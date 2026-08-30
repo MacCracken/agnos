@@ -879,6 +879,110 @@ fn proc_create_address_space() {
 # So the sweep is correct under BOTH the current (arena pre-copied as supervisor
 # identity, then overwritten user-on-map) and B2's (arena not-present until
 # mapped) PD-seeding layouts — it only ever frees PRESENT+USER entries.
+
+# === proc_dup_address_space — the fork half (1.56.54) ==============================================
+#
+# Duplicate `src_cr3` into a BRAND-NEW address space and return its CR3, or 0 on any failure. Every
+# user page is COPIED, not shared: after this returns, the two address spaces have no physical page
+# in common and a write in either is invisible to the other.
+#
+# ⛔⛔ FULL COPY, NOT COPY-ON-WRITE, AND THAT IS A DECISION RATHER THAN A SHORTCUT. CoW needs a
+# write-fault path — a #PF handler that distinguishes "this page is CoW, unshare it" from a real
+# fault, plus refcounts on every shared frame and a teardown that only frees at zero. agnos's #PF
+# handler routes CPL3 faults to `fault_kill_current` and CPL0 faults to a halt; there is no
+# unshare-and-resume anywhere, so a CoW page would present as a killed process. The roadmap's own
+# line is that this kernel grows per native workload rather than to match Linux, and the named
+# consumer (agora, fork-per-connection) forks and immediately diverges — it would take the copy
+# almost at once anyway.
+# ⚠ THE COST IS REAL AND IS THE CALLER'S TO KNOW: a fork of a process holding N MB of mapped pages
+# copies N MB. `sys_fork` bounds it by refusing when the PMM cannot cover the source's footprint.
+#
+# ⭐ IT REUSES proc_map_page / _nx / _hi RATHER THAN INSTALLING PDEs BY HAND. Those three are the only
+# code that knows the whole shape of an installed entry — the 0x87 user bits, bit 63 for NX, and the
+# KPTI entry-511 stash that must receive the SAME write or ring 3 walks a stale user PD. Hand-rolling
+# a `store64` here would be a fourth place that has to stay in step with all of that, and the tree has
+# already paid for exactly that mistake once (proc_unmap_page's supervisor guard, 1.41.13).
+#
+# ⚠ PD[511] IS THE USER-CR3 STASH, NOT A MAPPING — the loop stops at 510. proc_create_address_space
+# writes the new space's own stash; copying the source's would point this process's KPTI user CR3 at
+# the PARENT's PML4.
+# ⚠ SUPERVISOR ENTRIES ARE SKIPPED, exactly as proc_free_address_space skips them: PD[0..127] carry
+# the kernel identity mirror, which proc_create_address_space has already installed correctly for the
+# new space. Copying them would be a no-op at best; allocating fresh pages for them would double the
+# kernel's own image.
+fn proc_dup_address_space(src_cr3) {
+    if (src_cr3 == 0) { return 0; }
+    if (src_cr3 == 0x1000) { return 0; }          # never duplicate the kernel/boot CR3
+    var dst_cr3 = proc_create_address_space();
+    if (dst_cr3 == 0) { return 0; }
+    var src_pd = ptw_pd_kva(src_cr3);
+    if (src_pd == 0) { proc_free_address_space(dst_cr3); return 0; }
+
+    # --- low window: image, stack and the low mmap arena, PD[1..510] ---------------------------
+    for (var i = 1; i < 511; i = i + 1) {
+        var e = load64(src_pd + i * 8);
+        if ((e & 0x01) != 0) {
+            if ((e & 0x04) != 0) {                # present AND user — never a kernel mirror entry
+                var sphys = e & 0x000FFFFFFFE00000;
+                var nphys = pmm_alloc_2mb();
+                if (nphys == 0) { proc_free_address_space(dst_cr3); return 0; }
+                # ⚠ Through the DIRECT MAP on both sides. The identity alias is reachable by a crafted
+                # PT_LOAD (see the ptw_pd_kva header); a copy is exactly where reading the wrong frame
+                # would be invisible, because the destination would still be perfectly well-formed.
+                memcpy(pmm_kva_for_access(nphys), pmm_kva_for_access(sphys), 0x200000);
+                var va = i * 0x200000;
+                # ⚠ PRESERVE NX. Bit 63 is the sign bit in i64, so `e < 0` IS the NX test — Cyrius has
+                # no unsigned type and `e & 0x8000000000000000` would be a negative literal. Losing it
+                # would silently make a W^X-protected data page EXECUTABLE in the child.
+                var mr = 0;
+                if (e < 0) { mr = proc_map_page_nx(dst_cr3, va, nphys); }
+                else       { mr = proc_map_page(dst_cr3, va, nphys); }
+                if (mr != 0) {
+                    pmm_free_2mb(nphys);
+                    proc_free_address_space(dst_cr3);
+                    return 0;
+                }
+            }
+        }
+    }
+
+    # --- high mmap arena: per-process PDs at PDPT[128..511] ------------------------------------
+    # Mirrors proc_free_address_space's teardown walk. A process that never mmap'd high finds all-zero
+    # entries and this is one cheap 384-entry scan.
+    var src_pml4e = load64(pmm_kva_for_access(src_cr3));
+    var src_pdpt = src_pml4e & 0xFFFFFFFFF000;
+    if (src_pdpt != 0) {
+        var src_pdpt_kva = pmm_kva_for_access(src_pdpt);
+        for (var hi = 128; hi < 512; hi = hi + 1) {
+            var hpe = load64(src_pdpt_kva + hi * 8);
+            if ((hpe & 0x01) != 0) {
+                if ((hpe & 0x04) != 0) {          # present AND user — a per-process arena PD
+                    var hpd_kva = pmm_kva_for_access(hpe & 0xFFFFFFFFF000);
+                    for (var hj = 0; hj < 512; hj = hj + 1) {
+                        var he = load64(hpd_kva + hj * 8);
+                        if ((he & 0x01) != 0) {
+                            if ((he & 0x04) != 0) {
+                                var hsrc = he & 0x000FFFFFFFE00000;
+                                var hnew = pmm_alloc_2mb();
+                                if (hnew == 0) { proc_free_address_space(dst_cr3); return 0; }
+                                memcpy(pmm_kva_for_access(hnew), pmm_kva_for_access(hsrc), 0x200000);
+                                # VA reconstructed from the two indices: PDPT slot = 1 GB each.
+                                var hva = hi * 0x40000000 + hj * 0x200000;
+                                if (proc_map_page_hi(dst_cr3, hva, hnew) != 0) {
+                                    pmm_free_2mb(hnew);
+                                    proc_free_address_space(dst_cr3);
+                                    return 0;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return dst_cr3;
+}
+
 fn proc_free_address_space(cr3) {
     if (cr3 == 0) { return 0 - 1; }
     if (cr3 == 0x1000) { return 0 - 1; }   # boot/kernel CR3 — never free its tables

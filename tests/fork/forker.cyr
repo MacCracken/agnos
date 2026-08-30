@@ -1,0 +1,70 @@
+# forker — does `fork`#96 actually produce a second process that resumes where the parent called it?
+#
+# ⛔ WHY A RING-3 PROGRAM AND NOT A KERNEL SELFTEST. fork's whole contract is about the CALLER's
+# resume context: the child must continue at the parent's post-SYSCALL RIP, on the parent's user
+# stack, with rax = 0. A kernel selftest cannot express that — it has no ring-3 return to resume,
+# and `sys_fork` deliberately refuses a caller on the kernel CR3 for exactly that reason. The only
+# honest test is a real ring-3 program that forks and reports from both sides.
+#
+# ⚠ EVERY LINE IS ANNOUNCED, because the failure shapes are otherwise indistinguishable in a log:
+#   no FORKER-ALIVE            -> the program never ran (spawn/exec problem, not fork)
+#   FORKER-ALIVE, no CHILD/PARENT -> fork returned but neither side resumed usefully
+#   CHILD without PARENT       -> the parent did not survive its own fork
+#   PARENT without CHILD       -> the child was never scheduled, or resumed somewhere wrong
+
+fn main(): i64 {
+    sys_write(1, "FORKER-ALIVE\n", 13);
+
+    # A value on the parent's stack BEFORE the fork. Both sides must see it — the child because its
+    # address space is a COPY, the parent because forking must not disturb it.
+    var witness = 0x5A5A;
+
+    var r = syscall(96, 0, 0, 0);
+
+    if (r == 0) {
+        # ⭐ THE CHILD. It exists only if the kernel built a resume context that lands HERE — same
+        # RIP, same stack, rax = 0. If the context were stale (the pre-1.56.54 hazard of reading a
+        # proc_table row saved at the last PREEMPTION rather than at the fork) this line is not where
+        # it would appear.
+        sys_write(1, "FORK-CHILD\n", 11);
+        if (witness != 0x5A5A) { sys_write(1, "FORK-CHILD-STACK-WRONG\n", 23); syscall(SYS_EXIT, 3); }
+        # ⚠ Write through the witness to prove the copy is PRIVATE. The parent checks its own after.
+        witness = 0x1111;
+        if (witness != 0x1111) { sys_write(1, "FORK-CHILD-WRITE-WRONG\n", 23); syscall(SYS_EXIT, 4); }
+        sys_write(1, "FORK-CHILD-OK\n", 14);
+        syscall(SYS_EXIT, 7);
+    }
+
+    if (r < 0) {
+        sys_write(1, "FORK-FAILED\n", 12);
+        return 1;
+    }
+
+    # ⭐ THE PARENT. `r` is the child's pid — a positive number the child never sees.
+    sys_write(1, "FORK-PARENT\n", 12);
+    if (witness != 0x5A5A) { sys_write(1, "FORK-PARENT-STACK-CLOBBERED\n", 28); return 5; }
+
+    # ⛔ WAIT-ANY (-1), NOT waitpid(r). This is the prerequisite fork was blocked on, and using the
+    # single-pid form here would leave it untested by the one program that needs it. Loop while the
+    # kernel says -2 (WOULD_BLOCK); stop on the exit code, or on -1 (no children — which would mean
+    # the child vanished without being reapable).
+    var code = 0 - 2;
+    var spins = 0;
+    while (code == 0 - 2) {
+        code = syscall(4, 0 - 1, 0, 0);
+        spins = spins + 1;
+        if (spins > 100000) { sys_write(1, "FORK-WAIT-TIMEOUT\n", 18); return 6; }
+    }
+    if (code == 0 - 1) { sys_write(1, "FORK-WAIT-NO-CHILDREN\n", 22); return 7; }
+    if (code != 7) { sys_write(1, "FORK-WAIT-WRONG-CODE\n", 21); return 8; }
+
+    # ⚠ THE CHILD'S WRITE MUST NOT BE VISIBLE HERE. This is what distinguishes a real full copy from
+    # a shared mapping, and it is the whole reason proc_dup_address_space copies rather than aliases.
+    if (witness != 0x5A5A) { sys_write(1, "FORK-COW-LEAK\n", 14); return 9; }
+
+    sys_write(1, "FORK-PARENT-OK\n", 15);
+    return 0;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

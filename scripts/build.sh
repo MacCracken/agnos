@@ -287,6 +287,9 @@ else
         [ -n "$BOTE_SELFTEST" ] && echo '#define BOTE_SELFTEST'
         [ -n "$BENCH_CONNECT_SELFTEST" ] && echo '#define BENCH_CONNECT_SELFTEST'
         [ -n "$FAULT_SELFTEST" ]     && echo '#define FAULT_SELFTEST'
+        # FORK_SELFTEST=1 — 1.56.54: fork#96 end to end from ring 3 via /bin/forker. Needs the tool
+        # staged (scripts/burn/stage-tools.sh) — fork cannot be tested from kernel context at all.
+        [ -n "$FORK_SELFTEST" ]      && echo '#define FORK_SELFTEST'
         [ -n "$PIPE_RC_SELFTEST" ]   && echo '#define PIPE_RC_SELFTEST'
         [ -n "$DOOM_SELFTEST" ]      && echo '#define DOOM_SELFTEST'
         [ -n "$DOOM_DIRECTMAP" ]     && echo '#define DOOM_DIRECTMAP'

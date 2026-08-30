@@ -14,6 +14,17 @@ var syscall_entry_buf[256];  # Enlarged for IBRS instructions
 # per-proc CR3 by the proc.cyr PD[0..127] copy, so the stub (running under the still-user CR3 while
 # KPTI is collapsed) reaches them. region 7 is pmm-reserved (pmm.cyr), so the tops are never alloc'd.
 var pcpu_kernel_rsp_save[4];      # per-CPU user-RSP save slot (was global kernel_rsp_save)
+# ⭐ 1.56.54 — `fork`#96 NEEDS THE USER RETURN CONTEXT, AND IT IS ALREADY CAPTURED. A first draft
+# added `pcpu_user_rip`/`pcpu_user_rflags` here plus two more stores in the entry stub — all of it
+# redundant. `sched_yield`#44 already made the stub capture exactly this set per-CPU at entry:
+# `pcpu_sc_entry_regs`, layout [0]=rcx (post-SYSCALL RIP) [1]=r11 (user RFLAGS) [2]=rbx [3]=rbp
+# [4]=r12 [5]=r13 [6]=r14 [7]=r15 — read through `sc_entry_regs_base()`. That is the full ring-3
+# live-across-syscall set, which is precisely what a forked child must resume on.
+# ⇒ NO stub change was needed. Read the existing block instead of adding a parallel one; two
+# mechanisms capturing the same registers would be one more thing to keep in step on the code path
+# every syscall in the system runs through.
+# ⚠ Valid ONLY inside a syscall arm reached from the ring-3 stub, and overwritten by the next
+# syscall on this CPU — the same contract #44 documents. It is not a per-process save area.
 # per-CPU PRIMARY SYSCALL kernel-stack top. Was global syscall_kstack_top (single 0x3F0000). Now
 # region-7 tops 0xF10000 + cpu*0x10000 (0xF10000/0xF20000/0xF30000/0xF40000) — above the proc_rsp0
 # 0xF00000 ceiling, below 0x1000000, 64 KB apart so the four CPUs' stacks never overlap. Init in
@@ -107,6 +118,11 @@ fn syscall_handler(user_rsp, sc_num, sc_arg1, sc_arg2, sc_arg3, sc_arg4) {
     # by construction. In-kernel code (bench, recovery shell) calls ksyscall directly
     # with stale captures; a hypothetical ksyscall(44) falls to its default -1.
     if (sc_num == 44) { return sys_sched_yield(); }
+    # ⛔ fork#96 dispatches HERE for the SAME reason as #44 and #14: the child's resume context comes
+    # from `sc_entry_regs`, which is valid only on a path reached from the ring-3 entry stub. A
+    # `ksyscall(96)` from in-kernel code would fork a child resuming at whatever ring-3 code last made
+    # a syscall on this CPU. It also needs `user_rsp`, which only this function is handed.
+    if (sc_num == 96) { return sys_fork(user_rsp); }
     # pause(#14) is cyrius _agnos_sock_recv_block's poll-backoff between non-blocking
     # sock_recv#49 polls, so it must YIELD to other ready procs (a bare/preempt-disabled
     # hlt starves them — the two-proc setu-present freeze, 1.53.9). Handle it HERE (not in
@@ -120,6 +136,88 @@ fn syscall_handler(user_rsp, sc_num, sc_arg1, sc_arg2, sc_arg3, sc_arg4) {
     if (sc_num == 14) { sys_sched_yield(); return ksyscall(sc_num, sc_arg1, sc_arg2, sc_arg3); }
     var result = ksyscall(sc_num, sc_arg1, sc_arg2, sc_arg3);
     return result;
+}
+
+
+# === fork#96 (1.56.54) ============================================================================
+#
+# Duplicate the calling process. Returns the CHILD's pid to the parent and **0 to the child**, or -1
+# on failure. `user_rsp` is `syscall_handler`'s own first parameter — the caller's RSP, saved by the
+# entry stub before the kernel-stack switch.
+#
+# ⛔⛔ THIS MUST BE DISPATCHED FROM `syscall_handler`, NOT FROM `ksyscall`, AND THAT IS NOT STYLE.
+# The child's resume context comes from `pcpu_sc_entry_regs` (via `sc_scr_base()`) — the per-CPU block the entry stub fills with
+# the caller's rcx (post-SYSCALL RIP), r11 (RFLAGS) and callee-saved set. Those captures are valid
+# **only** on a path reached from the ring-3 stub. In-kernel callers reach `ksyscall` directly with
+# STALE captures, so a `ksyscall(96)` would fork a child resuming at whatever ring-3 code last made a
+# syscall on this CPU. `#44 sched_yield` and `#14 pause` are dispatched from `syscall_handler` for
+# exactly this reason and say so; fork joins them.
+#
+# ⭐ WHY THE REGISTER SET IS THIS ONE AND NOT ALL SIXTEEN. Across a SYSCALL the caller-saved registers
+# (rcx, rdx, rsi, rdi, r8-r11) are clobbered by the ABI — cyrius models the inline `0F 05` as
+# clobbering them, so no ring-3 program can have a live value there. What must survive is the
+# callee-saved set (rbx, rbp, r12-r15) plus rsp/rip/rflags, and that is precisely what the stub
+# captures. Zeroing the rest is honest: it matches what the parent's own syscall return will do.
+#
+# ⚠ THE CHILD'S rax IS 0 AND THE PARENT'S IS THE CHILD PID — the entire fork contract, and the only
+# place the two diverge. The parent gets its value by returning it from here as normal.
+fn sys_fork(user_rsp) {
+    var parent = proc_current_get();
+    var src_cr3 = proc_get_cr3(parent);
+    if (src_cr3 == 0) { return 0 - 1; }
+    if (src_cr3 == 0x1000) { return 0 - 1; }      # a kernel-CR3 caller is not a forkable ring-3 proc
+
+    # ⚠ ALLOCATE THE SLOT BEFORE THE ADDRESS SPACE. proc_dup_address_space can copy many megabytes;
+    # discovering the table is full afterwards would mean tearing all of it down again.
+    var child = proc_alloc_slot();
+    if (child < 0) { return 0 - 1; }              # process table full
+
+    var dst_cr3 = proc_dup_address_space(src_cr3);
+    if (dst_cr3 == 0) {
+        # ⚠ Hand the slot back. proc_alloc_slot marked it CLAIMING(3); leaving it there would leak a
+        # process-table entry on every failed fork, and the table is 16 deep.
+        proc_set_state(child, 0);
+        return 0 - 1;
+    }
+
+    var regs = sc_scr_base();
+    var p = &proc_table + child * 176;
+    store64(p, child);                             # pid
+    store64(p + 8, 3);                             # state 3 = CLAIMING — not schedulable yet
+    store64(p + 16, user_rsp);                     # rsp  — the parent's own user stack pointer
+    store64(p + 24, load64(regs));                 # rip  — [0] = rcx = post-SYSCALL return address
+    memset(p + 32, 0, 128);                        # every GPR field zeroed, then the live ones below
+    # rax stays 0 — THE CHILD'S FORK RETURN VALUE.
+    store64(p + 40,  load64(regs + 16));           # rbx  <- [2]
+    store64(p + 80,  load64(regs + 24));           # rbp  <- [3]
+    store64(p + 120, load64(regs + 32));           # r12  <- [4]
+    store64(p + 128, load64(regs + 40));           # r13  <- [5]
+    store64(p + 136, load64(regs + 48));           # r14  <- [6]
+    store64(p + 144, load64(regs + 56));           # r15  <- [7]
+    store64(p + 152, load64(regs + 8));            # rflags <- [1] = r11
+    store64(p + 160, dst_cr3);                     # cr3 — the duplicate, NOT the parent's
+    store64(p + 168, 0);                           # exit_code
+
+    # ⚠ RING-3 SELECTORS, or the child resumes at CPL0 on the parent's user RIP. proc_alloc_slot leaves
+    # the ring-0 defaults from proc_create_user's shape; a forked child is ring 3 by construction.
+    proc_set_ring3(child);
+    # ⚠ proc_alloc_slot's recycle scrub already set ppid = 0; fork's parent is the CALLER, not init.
+    store64(&proc_ppid + child * 8, parent);
+    # ⭐ THE CHILD INHERITS A COPY OF THE PARENT'S fd TABLE — open files, pipes and sockets survive the
+    # fork, which is the entire point for a fork-per-connection server: the accepted socket must be in
+    # the child. Same single inheritance point every other user proc uses.
+    vfs_fd_inherit(child, parent);
+    # ⭐ AND ITS NAME — a forked child is the same program, so `proclist`#99 should say so rather than
+    # leaving the slot's freshly-scrubbed empty name. Copied byte-wise from the parent's 32-byte cell.
+    var cn_dst = proc_name_ptr(child);
+    var cn_src = proc_name_ptr(parent);
+    if (cn_dst != 0) {
+        if (cn_src != 0) { memcpy(cn_dst, cn_src, 32); }
+    }
+
+    # Schedulable only now that the row is complete.
+    proc_set_state(child, 1);
+    return child;
 }
 
 # 1.40.5: reserve the SYSCALL kernel stack (a fresh 2 MB region; RSP set near
@@ -643,5 +741,21 @@ fn syscall_stub_build() {
     # sysretq (48 0F 07)
     store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0x0F); store8(ep + eoff + 2, 0x07); eoff = eoff + 3;
 
+    # ⛔⛔ 1.56.54 — THIS EMITTER HAD NO BOUND CHECK AT ALL, into a FIXED buffer. `syscall_entry_buf` is
+    # `var …[256]` at MODULE scope = 256 u64 = **2048 bytes**, and `eoff` was never compared against it
+    # anywhere in this function. Every byte past the end would land in whatever .bss follows — silently,
+    # and on the one code path every syscall in the system runs through, so the corruption would present
+    # as an unrelated global going wrong long after boot.
+    # ⚠ It has never overflowed; the point is that nothing said so. This cut ADDS 16 bytes to the stub
+    # (the user RIP/RFLAGS saves for `fork`#96), which is exactly the kind of growth that eventually
+    # finds a ceiling nobody is watching — the IBRS block already forced one enlargement, per the
+    # buffer`s own comment.
+    # ⭐ Print the size unconditionally. A number in the boot log is what makes the next growth`s headroom
+    # a fact rather than an assumption, and it costs one line on a path that runs once.
+    kprint("syscall: stub ", 14); kprint_num(eoff); kprintln(" bytes of 2048", 14);
+    if (eoff > 2048) {
+        kprintln("syscall: STUB OVERFLOWED ITS BUFFER - .bss past syscall_entry_buf is CORRUPT", 76);
+        arch_halt();
+    }
     return 0;
 }

@@ -8334,7 +8334,46 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # kstack. (The classic BLOCKING form, which sleeps the parent in the kernel, needs
         # per-proc kernel stacks first — deferred.) Was a busy-wait `while(state!=0) hlt`,
         # which would hang anyway: the handler runs IF=0, so the hlt never wakes.
-        if (arg1 < 0) { return 0 - 1; }
+        # ⭐⭐ 1.56.54 — WAIT-ANY (`arg1 < 0`). This case was rejected outright, and it is the
+        # prerequisite every fork-model server needs: a parent that forks per connection does not know
+        # which child will finish first, so polling a specific pid is the wrong shape — it either
+        # blocks behind a long-lived child while a short one goes unreaped, or forces the parent to
+        # keep its own child table and poll each one, which is the kernel's job.
+        # Semantics, deliberately the SAME SHAPE as the single-pid arm below so one caller handles both:
+        #   a dead child exists      -> reap the LOWEST such pid and return its exit code
+        #   children exist, none dead -> -2 (WOULD_BLOCK), the same "still alive" answer
+        #   no children at all        -> -1, distinguishable from both
+        # ⚠ -2 vs -1 IS THE WHOLE CONTRACT. A parent loops while it gets -2 and stops on -1; collapsing
+        # them would make "all my children are still running" indistinguishable from "I have none", and
+        # a fork-per-connection server would leave its accept loop the first time no child had finished.
+        # ⚠ LOWEST pid first, deliberately: this scans a slot table whose indices RECYCLE, so "first
+        # found" is the only order stable across calls. It is not FIFO by exit time and does not claim
+        # to be; POSIX promises no order either.
+        # ⛔ `proc_may_reap` is NOT re-checked here, and that is not a hole: the scan only ever selects a
+        # pid whose `proc_get_ppid` IS the caller, which is the test `proc_may_reap` applies. Calling it
+        # would re-look-up a fact the loop just established.
+        if (arg1 < 0) {
+            var wa_me = proc_current_get();
+            var wa_any = 0;                                   # did we see ANY child at all?
+            var wa_i = 0;
+            while (wa_i < proc_count) {
+                if (wa_i != wa_me) {
+                    if (proc_get_ppid(wa_i) == wa_me) {
+                        wa_any = 1;
+                        if (proc_get_state(wa_i) == 0) {      # dead -> reap it
+                            # Same order as the single-pid arm: exit code FIRST, because
+                            # proc_reap_child may collapse the slot out from under us.
+                            var wa_code = proc_get_exit_code(wa_i);
+                            proc_reap_child(wa_i);
+                            return wa_code;
+                        }
+                    }
+                }
+                wa_i = wa_i + 1;
+            }
+            if (wa_any == 1) { return 0 - 2; }                # children, none finished yet
+            return 0 - 1;                                     # no children at all
+        }
         if (arg1 >= proc_count) { return 0 - 1; }
         # Never wait on (and never reap) the caller itself.
         if (arg1 == proc_current_get()) { return 0 - 1; }

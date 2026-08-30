@@ -3244,6 +3244,61 @@ fn bench_connect_selftest() {
 bench_connect_selftest();
 #endif
 
+#ifdef FORK_SELFTEST
+# ⭐⭐ 1.56.54 — `fork`#96 END TO END, FROM RING 3, WHICH IS THE ONLY PLACE IT CAN BE TESTED.
+# fork's whole contract is the CALLER's resume context — the child must continue at the parent's
+# post-SYSCALL RIP, on the parent's user stack, with rax = 0 — and `sys_fork` deliberately REFUSES a
+# caller on the kernel CR3 for exactly that reason. So there is no kernel-side selftest to write; the
+# oracle is a staged ring-3 program that forks and reports from both sides.
+# `/bin/forker` prints, in order: FORKER-ALIVE, FORK-CHILD, FORK-CHILD-OK, FORK-PARENT,
+# FORK-PARENT-OK — and exits 0. Any missing line names its own failure (see the program`s header).
+# ⚠ Driven through `sh_exec("run …")`, the same path exec-from-disk and the fault selftest use, so a
+# spawn problem is distinguishable from a fork problem: no FORKER-ALIVE means it never ran.
+# ⛔⛔ NOT `sh_exec("run …")`, AND THE FIRST DRAFT WAS — WHICH IS WHY IT MEASURED A HANG.
+# `run` goes through `exec_and_wait`, and a FOREGROUND exec child runs **IF=0**: sched.cyr states the
+# rule outright — *"Refuse IF=0 callers (foreground exec/execwait children): their no-context-switch
+# model is load-bearing."* With interrupts off the timer never fires, no context switch ever happens,
+# and a forked child — however correctly built — can NEVER be scheduled while its parent runs. The
+# first run of this gate reported exactly that: FORKER-ALIVE and FORK-PARENT present, FORK-CHILD
+# absent, and the parent`s wait-any spinning to its 100000-iteration timeout.
+# ⇒ **A foreground-exec`d process cannot usefully fork.** That is a real property of agnos`s exec
+# model, not a defect in `#96`, and it is now stated in the ABI row. fork is for a process running
+# under the SCHEDULER — a spawned service, which is exactly what the named consumer (agora,
+# fork-per-connection) is.
+# ⭐ So this drives the NON-BLOCKING shape instead, the same one `spawn`#3 uses: load the ELF, mark it
+# ready, and let the timer round-robin it against this boot proc while we poll. `arch_wait()` is
+# `hlt` — interrupts are on here, so the tick both wakes us and runs the child.
+fn fork_disk_selftest() {
+    if (ext2_active == 0) { kprintln("fork: no ext2 - SKIP", 20); return 0; }
+    syscall_init();
+    kprintln("fork: running /bin/forker (scheduled, not foreground)", 53);
+    if (sh_abspath("/bin/forker", 11) < 0) { kprintln("fork: bad path", 14); return 0; }
+    var fpid = elf_load_from_file(&sh_path_buf, sh_path_len, "/bin/forker", 11);
+    if (fpid < 0) { kprintln("fork: /bin/forker is not an executable", 38); return 0; }
+    # ⛔⛔ AND THE SECOND SHAPE DOES NOT WORK EITHER, FOR A DIFFERENT AND EQUALLY REAL REASON.
+    # Marking the proc ready and polling from HERE means switching away from `kmain` and back —
+    # precisely the hazard sched.cyr names: *"sched_next`s no-ready fallback returns 0 (kmain), which
+    # is state 2 with a STALE slot while suspended in exec_and_wait — restoring it would time-travel
+    # kmain."* Measured: the banner printed and the boot stopped there.
+    # ⇒ **agnos has exactly one context in which a forked child can be scheduled alongside its parent:
+    # a proc spawned from agnsh via `spawn_path`#43, after boot.** Foreground `exec_and_wait` is IF=0
+    # by design; the boot thread is not a safe switch-away source. Neither is a defect in `#96` — they
+    # are properties of this kernel`s execution model, and fork is the first thing to require more.
+    # ⇒ THIS GATE THEREFORE PROVES THE HALF IT CAN, AND SAYS SO. Through foreground exec it can show
+    # that fork RETURNS a child pid to a surviving parent and that the kernel does not fault building
+    # the child. It CANNOT show the child resuming; that wants an agnsh-driven run and is recorded as
+    # the open half in the issue.
+    proc_current_set(fpid);
+    var fep = &proc_table + fpid * 176;
+    exec_and_wait(load64(fep + 24), load64(fep + 16), load64(fep + 160));
+    kprint("fork: forker exit ", 18);
+    kprint_num(proc_get_exit_code(fpid));
+    kprintln("", 0);
+    kprintln("fork: SURVIVED back in kernel", 29);
+    return 0;
+}
+#endif
+
 #ifdef FAULT_SELFTEST
 # 1.47.x — proc-teardown-on-fault self-test (compile-gated, FAULT_SELFTEST=1). Builds a
 # minimal static ELF64 whose entry READS an unmapped 5 GB address (movabs rdi,0x140000000;
@@ -5599,6 +5654,17 @@ if (smp_wake_enabled != 0) {
 }
 
 sched_active = 1;
+
+#ifdef FORK_SELFTEST
+# ⛔ DELIBERATELY HERE, AFTER `sched_active = 1`, AND NOT WITH THE OTHER SELFTESTS. A forked child is
+# a state-1 proc and nothing else — it runs only when the SCHEDULER round-robins to it. The boot
+# selftest block sits ~2350 lines earlier, where `sched_active` is still 0, so a child marked ready
+# there can never be dispatched: the first placement of this call printed its banner and then simply
+# stopped, because the parent was polling for an exit that could not happen.
+# ⇒ fork is the first thing in this kernel whose test REQUIRES a live scheduler. Anything added here
+# must stay after this line.
+fork_disk_selftest();
+#endif
 
 # === CMOS kernel checkpoint 16 (scheduler armed) ===
 # This is the AGNOS MVP closed-beta gate: reaching CP 16 means kernel
