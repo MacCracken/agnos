@@ -7686,7 +7686,7 @@ fn blk_enum_sys(buf, cap) {
             if (tag == blk_active) { capv = blk_capacity; }
             store64(buf + off + 0, tag);
             store64(buf + off + 8, capv);
-            store64(buf + off + 16, blk_lba_bytes);
+            store64(buf + off + 16, blk_lba_bytes_for(tag));   # 1.56.52: THIS tag's size, not the active one's
             count = count + 1;
         }
         tag = tag + 1;
@@ -7756,14 +7756,27 @@ fn blk_read_sys(h, lba, buf, nsec) {
     # iterations: an unbounded kernel-memory WRITE driven from ring 3. Bound (a) alone would now
     # stop it, but the range check is expressed structurally so a future change to that cap cannot
     # silently re-open the hole.
-    if (is_user_array(buf, nsec, blk_lba_bytes) == 0) { return 0 - 1; }
+    # ⛔ 1.56.52 — VALIDATE WITH THE SAME STRIDE THE COPY USES. This read blk_lba_bytes (the ACTIVE
+    # backend) while the copy below now uses this HANDLE's size. If the handle were the larger of the
+    # two — active 512 B, a registered 4096 B device — the validator would clear nsec*512 and the copy
+    # would move nsec*4096, straight past the 1 GB user ceiling. The two must be the same value.
+    if (is_user_array(buf, nsec, blk_lba_bytes_for(h)) == 0) { return 0 - 1; }
+    # ⛔⛔ 1.56.52 — THIS HANDLE'S LBA SIZE, NOT THE ACTIVE BACKEND'S. `blk_lba_bytes` is the global
+    # for whichever backend won blk_active, but blk_read_on reads from handle `h`. On an NVMe-primary
+    # box (4096 B/LBA) a read of a registered 512 B USB stick filled 512 bytes of the bounce and
+    # copied 4096 out — 3584 stale bytes of a buffer blk_write_sys stages other processes' USER data
+    # through. See the per-tag table in block.cyr.
+    var lbs = blk_lba_bytes_for(h);
     fs_spin_lock();
     var rc = nsec;
     var i = 0;
     while (i < nsec) {
+        # ⚠ SCRUB BEFORE EVERY READ. Defence in depth against exactly the class above: a backend that
+        # fills less than it was asked for now yields zeros, never the previous caller's bytes.
+        memset(&blk_sc_bounce, 0, lbs);
         if (blk_read_on(h, lba + i, &blk_sc_bounce) != 0) { rc = 0 - 1; i = nsec; }
         else {
-            shm_copy(buf + i * blk_lba_bytes, &blk_sc_bounce, blk_lba_bytes);
+            shm_copy(buf + i * lbs, &blk_sc_bounce, lbs);
             i = i + 1;
         }
     }
@@ -7791,12 +7804,17 @@ fn blk_write_sys(h, lba, buf, nsec) {
     if (h == blk_active) {
         if (lba + nsec > blk_capacity) { return 0 - 1; }
     }
-    if (is_user_array(buf, nsec, blk_lba_bytes) == 0) { return 0 - 1; }
+    # ⛔ 1.56.52 — VALIDATE WITH THE SAME STRIDE THE COPY USES. This read blk_lba_bytes (the ACTIVE
+    # backend) while the copy below now uses this HANDLE's size. If the handle were the larger of the
+    # two — active 512 B, a registered 4096 B device — the validator would clear nsec*512 and the copy
+    # would move nsec*4096, straight past the 1 GB user ceiling. The two must be the same value.
+    if (is_user_array(buf, nsec, blk_lba_bytes_for(h)) == 0) { return 0 - 1; }
+    var wlbs = blk_lba_bytes_for(h);
     fs_spin_lock();
     var rc = nsec;
     var i = 0;
     while (i < nsec) {
-        shm_copy(&blk_sc_bounce, buf + i * blk_lba_bytes, blk_lba_bytes);   # user -> bounce
+        shm_copy(&blk_sc_bounce, buf + i * wlbs, wlbs);   # user -> bounce (1.56.52: THIS handle's stride)
         if (blk_write_on(h, lba + i, &blk_sc_bounce) != 0) { rc = 0 - 1; i = nsec; }
         else { i = i + 1; }
     }

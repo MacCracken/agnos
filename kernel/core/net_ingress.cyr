@@ -65,7 +65,7 @@ fn net_handle_arp(pkt, len) {
     return 0;
 }
 
-fn net_handle_udp(pkt, ip_off, ip_payload_len, src_ip) {
+fn net_handle_udp(pkt, ip_off, ip_payload_len, src_ip, dst_ip) {
     # UDP header at ip_off: src_port(2) dst_port(2) length(2) checksum(2) data...
     if (ip_payload_len < 8) { return 0; }
     var src_port = (load8(pkt + ip_off) << 8) | load8(pkt + ip_off + 1);
@@ -77,11 +77,35 @@ fn net_handle_udp(pkt, ip_off, ip_payload_len, src_ip) {
     # subnet + gateway. Listener buf in udp_bind is kmalloc(1024) to match.
     # Legacy net_udp_buf (module-global var[256] = 2048 bytes) easily fits.
     if (udp_data_len > 1016) { udp_data_len = 1016; }
-    # Legacy global-buffer path — used by net_recv_udp (single-consumer).
-    net_copy_buf(&net_udp_buf, pkt + ip_off + 8, udp_data_len);
-    net_udp_buf_len = udp_data_len;
-    # 1.32.0 bite F — also dispatch to any matching bound listener.
+    # 1.32.0 bite F — dispatch to any matching bound listener.
+    # ⚠ 1.56.52: HOISTED ABOVE THE LEGACY FILL, because the legacy fill is now conditional on it.
     var lid = udp_find_listener(dst_port);
+
+    # ⛔ 1.56.52 — THE LEGACY BUFFER IS NO LONGER FILLED BY EVERY DATAGRAM THAT ARRIVES. It used to be
+    # written unconditionally, before and independent of the listener lookup: no port match, no
+    # destination check, no source check. So any inbound UDP — a broadcast, a stray datagram for
+    # another host on a hub/promiscuous path, or traffic for a port a listener had already claimed —
+    # overwrote whatever `recv` was about to show the operator, and a bound listener's traffic was
+    # duplicated into a second buffer nothing had asked for.
+    # Two conditions now, and both are about *whether this datagram is ours*:
+    #   · no bound listener claimed the port — a listener's datagram was already delivered to that
+    #     listener's own buffer below, so copying it here as well serves nobody; and
+    #   · the destination is an address we answer to.
+    # ⚠ THE DESTINATION SET MUST INCLUDE BROADCAST, and pre-lease traffic. DHCP OFFER/ACK arrive at
+    # 255.255.255.255 because dhcp_build_packet sets the broadcast flag, and net_ip is still 0 at
+    # that point — gating those out would break DHCP, which is the one thing this path must not do.
+    # ⚠ `^ 0xFFFFFFFF`, not `~`: Cyrius has only i64, so `~net_netmask` would set the high 32 bits.
+    var ours = 0;
+    if (net_ip == 0)         { ours = 1; }                                   # pre-lease: accept all
+    if (dst_ip == net_ip)    { ours = 1; }                                   # unicast to us
+    if (dst_ip == 0xFFFFFFFF) { ours = 1; }                                  # limited broadcast
+    if (dst_ip == (net_ip | (0xFFFFFFFF ^ net_netmask))) { ours = 1; }       # subnet broadcast
+    if (((dst_ip >> 24) & 0xFF) == 127) { ours = 1; }                        # loopback
+    if (lid < 0 && ours == 1) {
+        # Legacy global-buffer path — used by net_recv_udp (single-consumer).
+        net_copy_buf(&net_udp_buf, pkt + ip_off + 8, udp_data_len);
+        net_udp_buf_len = udp_data_len;
+    }
     if (lid >= 0) {
         var lb = udp_listener_base(lid);
         var lbuf = load64(lb + 16);
@@ -203,11 +227,14 @@ fn net_demux_frame(pkt, pkt_len) {
             var ip_total = (load8(ip_hdr + 2) << 8) | load8(ip_hdr + 3);
             var ip_proto = load8(ip_hdr + 9);
             var ip_src = (load8(ip_hdr + 12) << 24) | (load8(ip_hdr + 13) << 16) | (load8(ip_hdr + 14) << 8) | load8(ip_hdr + 15);
+            # 1.56.52: the DESTINATION, which no handler could see before. net_handle_udp needs it to
+            # tell "addressed to us" from "we happened to receive it" — see the gate there.
+            var ip_dst = (load8(ip_hdr + 16) << 24) | (load8(ip_hdr + 17) << 16) | (load8(ip_hdr + 18) << 8) | load8(ip_hdr + 19);
             # Clamp/validate the claimed IP length against what we actually received (1.35.7).
             var ip_payload_len = ip_safe_payload_len(ip_total, ip_ihl, pkt_len - 14);
             if (ip_payload_len >= 0) {
                 if (ip_proto == 1) { net_handle_icmp(pkt, 14 + ip_ihl, ip_payload_len, ip_src); }
-                if (ip_proto == 17) { net_handle_udp(pkt, 14 + ip_ihl, ip_payload_len, ip_src); }
+                if (ip_proto == 17) { net_handle_udp(pkt, 14 + ip_ihl, ip_payload_len, ip_src, ip_dst); }
                 if (ip_proto == 6) { net_handle_tcp(pkt, 14 + ip_ihl, ip_payload_len, ip_src); }
             }
         }

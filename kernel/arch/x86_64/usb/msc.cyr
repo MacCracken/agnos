@@ -711,7 +711,18 @@ fn msc_build_cbw(slot_id, lun, cdb_phys, cdb_len, data_len, dir_in) {
 #     timeout was abandoning live transfers as wedged.
 fn msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in) {
     var row = msc_row_addr(slot_id);
+    # 1.56.52: msc_row_addr returns 0 for an out-of-range slot (the bound added this cut), and every
+    # `store8(row + …)` below assumes otherwise. Cheap to close for the whole function.
+    if (row == 0) { return 0; }
     if (load8(row + 68) == 0) { return 0; }            # endpoints not ready
+    # ⛔ 1.56.52 — RECORD WHAT THE DATA PHASE ACTUALLY MOVED. xhci_wait_transfer_for_trb returns 1 for
+    # SHORT_PACKET as well as SUCCESS, setting xhci_last_xfer_bytes = expected - residue; this
+    # function tested only the 0/1 and then CLOBBERED that global with the CSW wait below. So a device
+    # that returned fewer bytes than asked reported full success, and the caller consumed whatever was
+    # already in the destination page — which pmm_alloc does not zero.
+    # ⚠ Reset per command so an early return leaves 0 rather than the previous command's count.
+    store32(row + 88, 0);      # bytes the xHC actually moved in the last data phase
+    store32(row + 92, 0);      # dCSWDataResidue — the DEVICE's own claim, advisory only
 
     # Step 1+2: build + send CBW on bulk-OUT.
     var tag = msc_build_cbw(slot_id, lun, cdb_phys, cdb_len, data_len, dir_in);
@@ -733,6 +744,17 @@ fn msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in) {
             store8(row + 69, 1);
             return 0;
         }
+        # ⚠ READ IT HERE. The CSW wait below overwrites xhci_last_xfer_bytes, so this is the only
+        # point at which the data phase's count is still available. <= data_len <= 65535, so the u32
+        # store is exact.
+        store32(row + 88, xhci_last_xfer_bytes);
+        #ifdef MSC_SHORT_INJECT
+        # Fault injection for the reject path, which NO in-tree test can otherwise reach: not one
+        # QEMU invocation under scripts/ attaches usb-storage, so every gate passes identically
+        # whether the short-read check below is correct, inverted or absent. Pretend the device
+        # returned 64 bytes fewer than asked on an IN transfer.
+        if (dir_in != 0) { if (data_len > 64) { store32(row + 88, data_len - 64); } }
+        #endif
     }
 
     # Step 4: post CSW receive on bulk-IN.
@@ -769,6 +791,11 @@ fn msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in) {
         store8(row + 69, 1);
         return 0;
     }
+    # The device's own residue claim. Recorded for the diagnostic below, never GATED on: a non-zero
+    # residue from a healthy device is the US_FL_IGNORE_RESIDUE quirk class, and refusing on it would
+    # brick sticks that merely misreport. The xHCI count above is the controller's measurement and is
+    # what the check uses. Safe to read: the >= 13 guard above already proved the CSW landed.
+    store32(row + 92, load32(csw + 8));
     var status = load8(csw + 12);
     if (status == 0) { return 1; }        # Pass
     if (status == 1) { return 0; }        # Command Failed (caller may retry)
@@ -1424,7 +1451,30 @@ fn msc_read_lba(slot_id, lun, lba, count, buf_phys) {
     # 1 retry — block-level I/O failures should surface fast (callers
     # like fatfs / GPT expect prompt errors), but a single transient
     # NAK-storm shouldn't lose the request.
-    return msc_scsi_exec(slot_id, lun, cdb_p, 10, buf_phys, bytes, 1, 1);
+    # ⛔ 1.56.52 — A SHORT DATA PHASE IS NOT SUCCESS FOR A FIXED-SIZE COMMAND. READ(10) asks for
+    # exactly `bytes`; anything less leaves the tail of the caller's buffer holding whatever was
+    # already in that page (pmm_alloc does not zero), and the block layer above has no way to tell.
+    # ⚠ ENFORCED HERE, NOT IN msc_bbb_exec. A blanket `moved == asked` inside the transport would
+    # BREAK ENUMERATION: REQUEST SENSE asks 18 and a spec-legal fixed-format response is 14; INQUIRY
+    # asks 36 and SPC-4 lets the device return the lesser of allocation length and available data.
+    # Both of those zero their destination page first, so a short response there is harmless. READ(10)
+    # and the SCSI commands with a fixed transfer length are the only ones where short == wrong.
+    # ⚠ The check uses the xHCI-reported count, not dCSWDataResidue — the controller's own
+    # measurement, free of the residue-misreporting quirk class. The residue is logged beside it so a
+    # burn can tell whether the two disagree, which is the datum that decides if a quirk is in play.
+    if (msc_scsi_exec(slot_id, lun, cdb_p, 10, buf_phys, bytes, 1, 1) == 0) { return 0; }
+    var got = load32(row + 88);
+    if (got != bytes) {
+        kprint("msc: READ(10) short data phase ", 31);
+        kprint_num(got);
+        kprint(" of ", 4);
+        kprint_num(bytes);
+        kprint(" B, device residue ", 19);
+        kprint_num(load32(row + 92));
+        kprintln("", 0);
+        return 0;
+    }
+    return 1;
 }
 
 # Issue SCSI WRITE(10) from buf_phys to (lba, count). Returns 1 / 0.
@@ -1439,6 +1489,12 @@ fn msc_write_lba(slot_id, lun, lba, count, buf_phys) {
     var cdb_buf[2];
     var cdb_p = &cdb_buf;
     msc_build_rw10_cdb(cdb_p, 0x2A, lba, count);
+    # ⚠ 1.56.52 — NO SHORT-TRANSFER CHECK ON THE WRITE PATH, DELIBERATELY. Short packet is not a
+    # device-driven condition on a bulk-OUT: msc_bulk_enqueue sets ISP only for IN, and the host
+    # controller transmits exactly `length`. A failing OUT surfaces as Transaction/Stall/Babble, which
+    # xhci_wait_transfer_for_trb already turns into 0 and the data-phase guard already catches. A
+    # `got != bytes` arm here would be unreachable by construction — dead code plus a kprint literal
+    # that can never print, for the next dead-code audit to trip over.
     return msc_scsi_exec(slot_id, lun, cdb_p, 10, buf_phys, bytes, 0, 1);
 }
 

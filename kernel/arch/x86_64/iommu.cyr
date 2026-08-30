@@ -66,6 +66,20 @@ fn iommu_map_mmio(phys_base) {
     # Check if PDPT entry exists for this region
     var pdpte = load64(0x2000 + pdpt_idx * 8);
     var pd_addr = 0;
+    # ⛔⛔ 1.56.52 — A PRESENT PDPT ENTRY MAY BE A 1 GB PAGE, NOT A POINTER TO A PD. This tested only
+    # the present bit and then took `pdpte & 0xFFFFFFFFF000` as a page-directory address. pt_init
+    # installs PDPT[3] as a 1 GB PAGE — `store64(0x2000 + 3 * 8, 0xC0000000 | 0x83)`, PS set — and
+    # IOMMU register blocks live at exactly that index (0xFED90000 >> 30 == 3), so this is the COMMON
+    # case, not a corner. The old code would have taken 0xC0000000 as a PD base and executed
+    # `store64(0xC0000000 + pd_idx * 8, ...)`: a wild supervisor write into the 3-4 GB window, which
+    # on a real box is device MMIO.
+    # ⚠ REFUSE rather than shatter. vmm_remap_uc_2mb already knows how to split a PS=1 1 GB entry,
+    # but this whole file has NEVER EXECUTED — it needs a DMAR table, i.e. an Intel VT-d machine, and
+    # archaemenid is AMD (AMD-Vi, no DMAR), while `grep -rn iommu scripts/ tests/` finds nothing. A
+    # refusal is verifiable by inspection and leaves the machine in the state it already ships in
+    # (translation never enabled); a shatter here would be new untested page-table surgery on a path
+    # no test can reach.
+    if ((pdpte & 0x80) != 0) { return 0 - 1; }   # 1 GB page — not a PD; refuse, never write through it
     if ((pdpte & 1) != 0) {
         pd_addr = pdpte & 0xFFFFFFFFF000;
     } else {
@@ -170,10 +184,36 @@ fn iommu_init() {
         iommu_allow_dma_2mb(i * 0x200000);
     }
 
-    # Set context entries for known PCI devices (VirtIO)
+    # Set context entries for known PCI devices.
+    # ⛔⛔ 1.56.52 — ROOT ENTRIES AND CONTEXTS EXIST FOR BUS 0 ONLY, SO ENABLING TRANSLATION ON A
+    # MACHINE WITH ANY DEVICE BEHIND A BRIDGE WOULD KILL ITS DMA. Exactly one root entry is written
+    # (bus 0); entries 1..255 stay not-present. This loop passed a hardcoded bus 0 AND func 0, taking
+    # only the slot from pci_devs and ignoring the real bus/func that pci_record already stored in
+    # pci_busfunc — which also made iommu_set_context's own `if (bus != 0) return -1` guard VACUOUS,
+    # since its only caller could never pass anything else. A device at 01:00.0 (the ordinary layout
+    # for NVMe behind a root port) therefore got a context written for bus 0 devfn 0 — the host
+    # bridge — while its real context, under bus 1's root entry, was never touched. The moment
+    # GCMD.TE goes up, every NVMe DMA is rejected with no root entry and the box hangs on a command
+    # that never completes, one line after printing "IOMMU: VT-d enabled".
+    # ⚠ FIX = REFUSE TO ENABLE, not build per-bus tables. Per-bus context tables are the right end
+    # state, but this file has NEVER RUN (it needs a DMAR table, i.e. Intel VT-d; archaemenid is AMD,
+    # and no smoke or test references it), so that rework would be unverifiable here. Refusing is
+    # checkable by inspection and leaves the machine exactly as it ships today — translation off.
+    # ⚠ func is now taken from pci_busfunc, so multi-function devices stop aliasing onto func 0.
+    var offbus = 0;
     for (var i = 0; i < pci_count; i = i + 1) {
         var slot = PciDev_slot(&pci_devs + i * 32);
-        iommu_set_context(0, slot, 0);
+        var bf = load64(&pci_busfunc + i * 8);
+        var dbus = (bf >> 8) & 0xFF;
+        var dfunc = bf & 0x07;
+        if (dbus != 0) { offbus = offbus + 1; }
+        else { iommu_set_context(0, slot, dfunc); }
+    }
+    if (offbus > 0) {
+        kprint("iommu: ", 7);
+        kprint_num(offbus);
+        kprintln(" device(s) off bus 0 - refusing to enable translation", 53);
+        return 0 - 1;
     }
 
     # Program root table address register

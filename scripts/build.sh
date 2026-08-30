@@ -362,6 +362,7 @@ else
         [ -n "$TCP_SELFTEST" ]   && echo '#define TCP_SELFTEST'
         [ -n "$NTP_SELFTEST" ]   && echo '#define NTP_SELFTEST'
         [ -n "$MMAP_SELFTEST" ]  && echo '#define MMAP_SELFTEST'
+        [ -n "$MSC_SHORT_INJECT" ] && echo '#define MSC_SHORT_INJECT'
         [ -n "$MMAP_HIMEM_SELFTEST" ] && echo '#define MMAP_HIMEM_SELFTEST'
         [ -n "$MMAP_HIMEM_E2E_SELFTEST" ] && echo '#define MMAP_HIMEM_E2E_SELFTEST'
         [ -n "$MMAP_HIMUNMAP_SELFTEST" ] && echo '#define MMAP_HIMUNMAP_SELFTEST'

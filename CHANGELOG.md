@@ -167,6 +167,101 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   check is the only form that can actually fail. Mutation-tested — the old `ELF_INIT_STR` reports
   `slots=31` against top index 35, exactly the overflow. `check.sh` is now **31 gates**.
 
+### Fixed — a short USB data phase was reported as success, and the whole MSC driver had no coverage
+
+- **`msc_bbb_exec` discarded the transferred byte count.** `xhci_wait_transfer_for_trb` returns 1 for
+  SHORT_PACKET as well as SUCCESS, setting `xhci_last_xfer_bytes = expected - residue`; the transport
+  tested only the 0/1 and then **clobbered that global** with the CSW wait. A device returning fewer
+  bytes than asked therefore reported full success, and the caller consumed whatever was already in
+  the destination page — which `pmm_alloc` does not zero. `dCSWDataResidue` appeared nowhere in the
+  file. Both are now recorded per-slot (row +88 / +92) and `READ(10)` refuses a short transfer.
+  ⚠ **Enforced at the SCSI layer, not in the transport.** A blanket "moved == asked" inside
+  `msc_bbb_exec` would break enumeration: REQUEST SENSE asks 18 and a spec-legal fixed-format reply is
+  14; INQUIRY asks 36 and SPC-4 permits the lesser of allocation length and available data. Both zero
+  their destination first, so short is harmless there. `READ(10)` is where short means wrong.
+  ⚠ **The check uses the xHCI count, not the residue** — the controller's own measurement, free of the
+  `US_FL_IGNORE_RESIDUE` quirk class that would brick sticks which merely misreport. The residue is
+  *logged* beside it, which is the datum that decides whether a quirk is in play.
+  ⚠ **No check on the WRITE path, deliberately** — `msc_bulk_enqueue` sets ISP only for IN, and the
+  controller transmits exactly `length` on a bulk-OUT, so `got != bytes` there is unreachable by
+  construction. Documented rather than added, so it is not dead code plus a literal that never prints.
+
+- ⭐ **NEW `scripts/smoke/msc-short-smoke.sh` — the tree's FIRST usb-storage coverage**, wired into
+  `sweep.sh`. Before this, **not one QEMU invocation anywhere under `scripts/` attached a usb-storage
+  device** — every one is `qemu-xhci` plus `usb-kbd`/`usb-mouse`. So the entire MSC transport (~1500
+  lines, five block-layer entry points) had zero automated coverage, and every gate passed identically
+  whether its short-read handling was correct, inverted or absent.
+  ⛔ **The absence was in the harness, not the capability.** Attaching `-device usb-storage,bus=xhci.0`
+  enumerates and registers on the first boot that tries it — the one catch is that OVMF then offers the
+  stick as a boot option and stops at its menu, so the NVMe drive needs an explicit `bootindex=0` or
+  nothing boots at all. Measured: `msc: READ(10) short data phase 448 of 512 B, device residue 0`.
+  The smoke runs both arms — injected (`MSC_SHORT_INJECT`, which shortens the recorded IN count) must
+  REFUSE, and plain must SUCCEED. Without the second arm any unconditional refusal would pass while
+  breaking every real stick.
+
+### Security — a raw-block read handed the caller another process's staged write data
+
+- **`blk_read#77` / `blk_write#78` used the ACTIVE backend's LBA size for a read of ANY handle**
+  (`kernel/core/block.cyr`, `kernel/core/syscall.cyr`). `blk_lba_bytes` is documented as "bytes per LBA
+  on the active backend", but `blk_read_on(h, …)` reads from handle `h`, which may be a different
+  backend with a different sector size. On an NVMe-primary box reporting 4096 B/LBA, a ring-3 read of a
+  registered 512 B USB stick filled 512 bytes of `blk_sc_bounce` and copied **4096** out — 3584 stale
+  bytes of a buffer that `blk_write_sys` stages other processes' **user data** through. No device
+  misbehaviour required.
+  ⛔ **And `blk_enum#75` reported that same global for every handle**, so the ABI actively told the
+  caller to size its buffer at 4096 for a 512 B device: the disclosure was the *documented* usage, not
+  an edge case.
+  Fixed with a per-tag LBA table written by all five registration paths; `#75` now reports each
+  handle's own size, and both syscalls take their stride from the handle.
+  ⚠ **The validators had to move with the copy.** `is_user_array(buf, nsec, blk_lba_bytes)` was still
+  the active backend's — so a handle with the *larger* size (active 512, device 4096) would have
+  cleared `nsec*512` and copied `nsec*4096`, straight past the 1 GB user ceiling. Both validators now
+  use the same stride the copy does.
+  ⚠ The bounce is also scrubbed before every read, so a backend that under-fills yields zeros rather
+  than the previous caller's bytes.
+
+### Fixed — TLB shootdown targeted a dense prefix, not the online set
+
+- **`tlb_shootdown_all` walked `0..cpu_count-1` and handed the loop index to `apic_send_ipi_one`**,
+  which writes `target << 24` into ICR_HI — so the loop index was used as a **physical APIC id**. But
+  `cpu_count` is only the *cardinality* of the online set; the set itself is `{0} ∪ {i : bit i of
+  ap_online_mask}`. They agree only for a dense prefix. If AP 3 checks in and APs 1–2 do not, the old
+  loops armed and IPI'd APIC id 1 — which does not exist — while id 3, the CPU actually running procs,
+  was never armed. `want` was `cpu_count-1`, acks stayed 0, and every shootdown burned the full
+  2,000,000-pause timeout then proceeded with the flush unperformed on the one CPU that needed it —
+  the exact stale-TLB-across-address-spaces failure the mechanism exists to prevent.
+  Now iterates the mask via a new `cpu_online_mask()`, counts `want` **during the arm pass** so it can
+  never disagree with what was armed, and bounds every loop by the array size (4) rather than a count.
+  The boot gate asserts the mask invariants; mutation-tested.
+
+### Fixed — VT-d could write through a 1 GB PDPTE, and enabled translation it had not described
+
+- **`iommu_map_mmio` tested only the present bit, then treated the PDPTE as a page-directory address.**
+  `pt_init` installs PDPT[3] as a **1 GB page** (`0xC0000000 | 0x83`, PS set), and IOMMU register
+  blocks live at exactly that index (`0xFED90000 >> 30 == 3`) — the common case, not a corner. The old
+  code took `0xC0000000` as a PD base and stored through it: a wild supervisor write into the 3–4 GB
+  window, which on real hardware is device MMIO. Now refuses a PS=1 entry.
+- **Root entries and contexts existed for bus 0 only**, with bus and func hardcoded at the single call
+  site — which also made `iommu_set_context`'s own `if (bus != 0)` guard vacuous. A device at 01:00.0
+  (the ordinary NVMe-behind-a-root-port layout) got a context written for the host bridge instead, and
+  the moment GCMD.TE went up every NVMe DMA would be rejected with no root entry. Now takes func from
+  `pci_busfunc` and **refuses to enable translation** when any enumerated device is off bus 0.
+  ⚠ **Refusal, not per-bus tables.** Per-bus contexts are the right end state, but this file has
+  **never executed** — it needs a DMAR table (Intel VT-d), archaemenid is AMD, and nothing under
+  `scripts/` or `tests/` references it. A refusal is checkable by inspection and leaves the machine
+  exactly as it ships; the rework would be unverifiable here.
+
+### Fixed — the legacy UDP buffer was filled by every datagram that arrived
+
+- `net_handle_udp` wrote `net_udp_buf` unconditionally, before and independent of the listener lookup:
+  no port match, no destination check. Any inbound UDP — a broadcast, a stray datagram, or traffic for
+  a port a listener had already claimed — overwrote what `recv` was about to show the operator, and a
+  bound listener's data was duplicated into a second buffer nothing asked for. Now gated on *no
+  listener claimed the port* **and** *the destination is ours*, with the destination threaded down from
+  `net_demux_frame`. ⚠ The address set must include limited and subnet broadcast and pre-lease traffic
+  — DHCP OFFER/ACK arrive at 255.255.255.255 while `net_ip` is still 0, and gating those out would
+  break the one thing this path must not break. Verified: loopback / DNS / NTP / ICMP smokes all pass.
+
 ### Fixed — device-supplied values that were trusted
 
 - **Both virtio queue sizes were taken from the device with only a zero check**

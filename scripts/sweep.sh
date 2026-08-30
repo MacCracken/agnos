@@ -91,6 +91,10 @@ run_gate "baseline check.sh (build/test/version/size)" "" "CHECK"
 run_gate "1.39.x FAT read (cat/ls reach FAT)"       "FATFS_SELFTEST=1"                         "fat-smoke.sh"
 run_gate "1.39.x FAT write (touch/echo/rm/mkdir/mv + subdir)" "FATFS_WRITE_SELFTEST=1 FAT_ALLOW_ESP_WRITE=1" "fat-write-smoke.sh"
 run_gate "1.39.x exFAT read"                         "EXFAT_SELFTEST=1"                         "exfat-smoke.sh"
+# 1.56.52 — the tree's FIRST usb-storage coverage. The MSC transport had none: no QEMU invocation
+# anywhere under scripts/ attached one, so every gate passed regardless of what msc.cyr did. This
+# smoke builds BOTH arms itself (injected + plain), so it needs no buildenv from here.
+run_gate "1.56.52 MSC short data phase (usb-storage)" ""                                         "msc-short-smoke.sh"
 run_gate "1.39.x exFAT write (+ subdir)"             "EXFAT_WRITE_SELFTEST=1"                   "exfat-write-smoke.sh"
 
 # --- ext2/jbd2 write regression bar (the iron-validated path must stay green) ---

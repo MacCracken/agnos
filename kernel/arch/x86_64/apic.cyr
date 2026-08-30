@@ -310,7 +310,24 @@ fn tlb_lock_selftest() {
     if (tlb_pending_take() != 1) { ok = 0; }
     if (load64(&pcpu_tlb_pending + pcpu_cpu() * 8) != 0) { ok = 0; }
     if (tlb_pending_take() != 0) { ok = 0; }          # idempotent once taken
+    # 1.56.52 — the online MASK, not the count, is what the shootdown targets. No AP has been woken
+    # at this point in boot, so the assertable facts are the invariants that hold for every mask:
+    # bit 0 (the BSP) is always set, and no bit outside 0..3 can be — pcpu_tlb_pending has four slots
+    # and apic_send_ipi_one would otherwise be handed an APIC id agnos never starts.
+    var m = cpu_online_mask();
+    if ((m & 1) != 1) { ok = 0; }                     # BSP must always be present
+    if ((m & 0xFFFFFFFFFFFFFFF0) != 0) { ok = 0; }    # nothing above id 3
     return ok;
+}
+
+# cpu_online_mask() — the SET of online APIC ids as a bitmask, which is what the shootdown must
+# target. Bit 0 is the BSP, always online and never represented in ap_online_mask (only ap_entry
+# sets bits, and the BSP does not run it). Bits 1..3 come from ap_online_mask, set by each AP under
+# smp.cyr's spinlock keyed on its OWN APIC id.
+# ⛔ `cpu_count` is NOT a substitute: it is the CARDINALITY of this set, and the two coincide only
+# when the online CPUs form a dense prefix. See the ⛔⛔ note in tlb_shootdown_all.
+fn cpu_online_mask() {
+    return 1 | ap_online_mask;
 }
 
 # Flush + ack THIS CPU's pending shootdown, if one is outstanding. Called from the two spin loops so
@@ -404,18 +421,43 @@ fn tlb_shootdown_all() {
     # for the lock cannot starve the peer that holds it.
     tlb_shoot_spin_lock();
     tlb_shoot_ack = 0;
-    tlb_shoot_want = cpu_count - 1;
     var me = pcpu_cpu();
-    # Arm every target's pending flag BEFORE any IPI goes out: the flag is what a peer spinning
-    # with IF=0 consults, and it must be visible no later than the interrupt it stands in for.
+    # ⛔⛔ 1.56.52 — ITERATE THE ONLINE MASK, NOT THE COUNT. These loops walked the dense prefix
+    # `0..cpu_count-1` and handed the loop index straight to apic_send_ipi_one, which writes
+    # `target << 24` into ICR_HI — so THE LOOP INDEX WAS USED AS A PHYSICAL APIC ID. But cpu_count is
+    # only the CARDINALITY of the online set; the set itself is {0 (BSP)} u {i : bit i of
+    # ap_online_mask}, which ap_entry fills by APIC id. Those two agree only when the online CPUs
+    # happen to form a dense prefix.
+    # ⚠ Divergence is not exotic: if AP 3 answers its SIPI and APs 1-2 do not (a sparse-APIC-id box,
+    # or an AP that wedges before setting its bit), then ap_online_mask = 0b1000 and cpu_count = 2.
+    # The old loops armed and IPI'd APIC id 1 — WHICH DOES NOT EXIST — while APIC id 3, the CPU that
+    # is actually running procs and caching translations, was never armed and never IPI'd. want was
+    # cpu_count-1 = 1 and ack stayed 0, so every shootdown burned the full 2,000,000-pause timeout
+    # and then fell through with the flush unperformed on the one CPU that needed it. That is the
+    # stale-TLB-across-address-spaces failure this whole mechanism exists to prevent, arrived at by a
+    # different road.
+    # ⚠ `want` is now COUNTED DURING THE ARM PASS rather than derived from cpu_count, so it can never
+    # disagree with the set that was actually armed. It is published before the first IPI goes out.
+    # ⚠ Bounds are the ARRAY SIZE (4) now, not a count, so pcpu_tlb_pending[4] cannot be exceeded
+    # even if cpu_count were ever wrong.
+    var mask = cpu_online_mask();
+    var want = 0;
     var a = 0;
-    while (a < cpu_count) {
-        if (a != me) { store64(&pcpu_tlb_pending + a * 8, 1); }
+    while (a < 4) {
+        if (a != me) {
+            if (((mask >> a) & 1) == 1) {
+                store64(&pcpu_tlb_pending + a * 8, 1);
+                want = want + 1;
+            }
+        }
         a = a + 1;
     }
+    tlb_shoot_want = want;
     var t = 0;
-    while (t < cpu_count) {
-        if (t != me) { apic_send_ipi_one(t, TLB_SHOOT_VECTOR); }
+    while (t < 4) {
+        if (t != me) {
+            if (((mask >> t) & 1) == 1) { apic_send_ipi_one(t, TLB_SHOOT_VECTOR); }
+        }
         t = t + 1;
     }
     var w = 0;
@@ -426,8 +468,10 @@ fn tlb_shootdown_all() {
     }
     # ⚠ Clear any flag that went unanswered (a CPU that timed out above), so a stale 1 cannot make
     # the NEXT request look pre-acked.
+    # 1.56.52: clear ALL four slots unconditionally — cheaper than a mask test and strictly safer
+    # against a stale 1 left by a CPU that went offline between two shootdowns.
     var c = 0;
-    while (c < cpu_count) {
+    while (c < 4) {
         if (c != me) { store64(&pcpu_tlb_pending + c * 8, 0); }
         c = c + 1;
     }

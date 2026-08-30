@@ -46,6 +46,31 @@ var blk_lba_bytes = 512; # bytes per LBA on the active backend
 # not just the override-policy winner held in `blk_active`.
 var blk_registered = 0;
 
+# ⛔⛔ 1.56.52 — PER-TAG LBA SIZE. `blk_lba_bytes` above is the ACTIVE backend's, but blk_read_on(h,…)
+# reads from HANDLE h, which may be a different backend with a different sector size — and both raw
+# syscalls used the global as their copy length regardless of h.
+# Failure trace, no device misbehaviour required: an NVMe-primary box reports 4096 B/LBA, so
+# blk_lba_bytes = 4096. A 512 B USB stick registers as BLK_USB_MS. Ring 3 calls blk_read(h=BLK_USB_MS):
+# blk_read_on fills 512 bytes of blk_sc_bounce, and the copy hands the caller 4096 — 3584 STALE bytes
+# of the shared bounce. That bounce is also blk_write_sys's staging buffer, so those bytes are
+# whatever USER DATA another process last staged for a write. A cross-process disclosure through a
+# read that behaved exactly as documented.
+# ⚠ AND blk_enum#75 REPORTED THE SAME GLOBAL FOR EVERY HANDLE, so the ABI actively told the caller to
+# size its buffer at 4096 for a 512 B device — the disclosure was not merely reachable, it was the
+# documented usage.
+# Indexed by tag (BLK_VIRTIO..BLK_RAMDISK = 1..5); slot 0 unused. Module scope ⇒ 6 u64 = 48 bytes.
+var blk_lba_by_tag[6];
+
+# The LBA size of a SPECIFIC handle. Falls back to the active global for an unregistered or
+# never-recorded tag, which is the pre-1.56.52 behaviour and cannot be worse than it.
+fn blk_lba_bytes_for(tag) {
+    if (tag < 1) { return blk_lba_bytes; }
+    if (tag > 5) { return blk_lba_bytes; }
+    var v = load64(&blk_lba_by_tag + tag * 8);
+    if (v == 0) { return blk_lba_bytes; }
+    return v;
+}
+
 # Backend registration ------------------------------------------------
 
 # Virtio registers first (init runs before NVMe), and only if the slot
@@ -84,6 +109,7 @@ fn blk_register_virtio(capacity) {
         blk_capacity  = capacity;
         blk_lba_bytes = 512;
     }
+    store64(&blk_lba_by_tag + BLK_VIRTIO * 8, 512);   # 1.56.52: per-tag, so blk_read/#77 uses THIS handle's size
     blk_registered = blk_registered | (1 << BLK_VIRTIO);
     return 0;
 }
@@ -96,6 +122,7 @@ fn blk_register_nvme(capacity, lba_bytes) {
     blk_active    = BLK_NVME;
     blk_capacity  = capacity;
     blk_lba_bytes = lba_bytes;
+    store64(&blk_lba_by_tag + BLK_NVME * 8, lba_bytes);   # 1.56.52: per-tag, so blk_read/#77 uses THIS handle's size
     blk_registered = blk_registered | (1 << BLK_NVME);
     return 0;
 }
@@ -111,6 +138,7 @@ fn blk_register_ahci(capacity, lba_bytes) {
     blk_active    = BLK_AHCI;
     blk_capacity  = capacity;
     blk_lba_bytes = lba_bytes;
+    store64(&blk_lba_by_tag + BLK_AHCI * 8, lba_bytes);   # 1.56.52: per-tag, so blk_read/#77 uses THIS handle's size
     blk_registered = blk_registered | (1 << BLK_AHCI);
     return 0;
 }
@@ -124,6 +152,7 @@ fn blk_register_usb_ms(capacity, lba_bytes) {
     blk_active    = BLK_USB_MS;
     blk_capacity  = capacity;
     blk_lba_bytes = lba_bytes;
+    store64(&blk_lba_by_tag + BLK_USB_MS * 8, lba_bytes);   # 1.56.52: per-tag, so blk_read/#77 uses THIS handle's size
     blk_registered = blk_registered | (1 << BLK_USB_MS);
     return 0;
 }
@@ -142,6 +171,7 @@ fn blk_register_ramdisk(capacity, lba_bytes) {
         blk_capacity  = capacity;
         blk_lba_bytes = lba_bytes;
     }
+    store64(&blk_lba_by_tag + BLK_RAMDISK * 8, lba_bytes);   # 1.56.52: per-tag, so blk_read/#77 uses THIS handle's size
     blk_registered = blk_registered | (1 << BLK_RAMDISK);
     return 0;
 }
