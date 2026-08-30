@@ -139,6 +139,15 @@ check "gpu arena slots unaliased (extent-aware)" $rc
 sh "$ROOT/scripts/check/check-carveout.sh" > /tmp/check-carveout.log 2>&1 && rc=0 || rc=$?
 check "gpu carveout regions disjoint + shm table fits" $rc
 [ "$rc" = "0" ] || cat /tmp/check-carveout.log
+# 1.56.52 — the SysV init-stack pointer array vs the argc/envc caps. Those caps live in two functions
+# that never see each other, so nothing in the kernel held the combined invariant and the array was
+# silently too small from the moment argc was raised 8 -> 16. The runtime guard added alongside this
+# is unreachable under the shipped caps by construction, so a static re-derivation is the only form
+# that can actually fail. Mutation-tested: restoring the old ELF_INIT_STR reports slots=31 vs top
+# index 35, which is exactly the overflow.
+sh "$ROOT/scripts/check/check-initstack.sh" > /tmp/check-initstack.log 2>&1 && rc=0 || rc=$?
+check "init-stack pointer array holds argc+envc" $rc
+[ "$rc" = "0" ] || cat /tmp/check-initstack.log
 # The Cyrius var X[N] units trap: function-local is N BYTES, module-scope is N x u64. Cost the
 # rung-10 burn its exit code (a 40-byte stack smash that left every printed number correct).
 sh "$ROOT/scripts/check/check-array-sizing.sh" >/dev/null 2>&1 && rc=0 || rc=$?

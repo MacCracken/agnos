@@ -21,16 +21,18 @@ fn vmm_map(virt, phys, flags) {
     return 0;
 }
 
-# Map a page as user-accessible (ring 3 can read/write, non-executable)
-# Security: NX bit (bit 63) prevents code execution on data/stack pages
-fn vmm_map_user(virt, phys) {
-    return vmm_map(virt, phys, 0x8000000000000087);
-}
-
-# Map a page as user-accessible and executable (for code segments)
-fn vmm_map_user_exec(virt, phys) {
-    return vmm_map(virt, phys, 0x87);
-}
+# ⛔ 1.56.52 — vmm_map_user / vmm_map_user_exec AND their vmm_alloc_* callers are DELETED.
+# `vmm_map_user_exec` mapped a user page with flag 0x87 = P | RW | US | PS — writable AND executable,
+# with NX clear. That is precisely the state W^X exists to prevent, and 1.56.51 had just finished
+# closing the same hole in the ELF loaders (which now use proc_map_page_rx, 0x85, for PF_X segments).
+# It had NO consumers: the whole chain vmm_alloc_user_exec -> vmm_map_user_exec -> vmm_map was
+# unreachable, so this was a W+X primitive sitting in the tree waiting for someone to reach for it.
+# ⚠ vmm_map_user / vmm_alloc_user went with them — removing vmm_alloc_user is what made vmm_map_user
+# dead, and a lone NX-only user mapper next to the deleted exec one invites reintroducing the pair.
+# Ring-3 mapping goes through proc_map_page / _rx / _nx, which are per-process and W^X-correct;
+# vmm_map writes the BOOT PD only and was never the right tool for a user page.
+# ⚠ The aarch64 twins in arch/aarch64/paging.cyr are deliberately left alone — that port does not
+# compile and is its own arc.
 
 # Repair (X) — remap a single 2MB chunk as Uncacheable (UC) by setting
 # PCD=1 | PWT=1 (PAT-bit=0) on the controlling PDE. For 2MB pages the
@@ -426,18 +428,3 @@ fn vmm_alloc_at(virt) {
     return phys;
 }
 
-# Allocate a physical page and map it as user-accessible (non-executable)
-fn vmm_alloc_user(virt) {
-    var phys = pmm_alloc();
-    if (phys == 0) { return 0; }
-    vmm_map_user(virt, phys);
-    return phys;
-}
-
-# Allocate a physical page and map it as user-accessible + executable
-fn vmm_alloc_user_exec(virt) {
-    var phys = pmm_alloc();
-    if (phys == 0) { return 0; }
-    vmm_map_user_exec(virt, phys);
-    return phys;
-}

@@ -132,7 +132,7 @@ fn fb_console_init() {
     # would look like a confirmed fault. Do not remove the prefixes.
     # klug is a kernel-resident ring readable after the fact with `run /bin/klug > /f.txt`, and it is
     # pure store8 + integer math, safe this early (same property the #PF recorder relies on).
-    var fbk[16];
+    var fbk[24];   # 1.56.52: fmt_hex_buf writes 17 B (16 digits + NUL) — [16] was a 1-byte OOB stack write
     var fbn = 0;
     klug_append("fb: w=0x", 8);
     fbn = fmt_hex_buf(diag_w, &fbk);      klug_append(&fbk, fbn);

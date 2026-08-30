@@ -8,6 +8,37 @@ type: issue
 
 **Opened** 2026-08-28, at the close of the 1.56.51 audit/hardening sweep.
 
+## ⭐⭐ STATUS — 1.56.52 (2026-08-29): BOTH P0s CLOSED
+
+**P0: 2 of 2 closed.** `elf.cyr:312` closed at 1.56.51 by the architecture change; `syscall.cyr:1895`
+(`#92` op 0x0C TOCTOU) closed at 1.56.52 by stage-and-revalidate. The `#92` battery grew 167 → 171 with
+two post-validation mutation cases and a control, and the pair is mutation-tested.
+
+**P1: 18 of 26** (17 fully + 1 partial). **P2: 11 of 30 confirmed items.**
+
+⛔ **A P2 turned out to be a P0, and a bug NOBODY HAD FILED turned out to be a privilege escalation.**
+Re-triaging the P2 list against the code (rather than trusting its label) moved four items up:
+- `proc.cyr:1830` (filed P2) is a **P0**: `sys_munmap` had no ingress cap on `length`, so `addr + len`
+  wrapped negative past a signed ceiling test, `pd_idx` cycled into the kernel identity window, and —
+  because the free site checked only the present bit, never the user bit — `pmm_free_2mb` marked
+  physical 2-256 MB **free while live**. Two integers through syscall 28.
+- `elf.cyr:357` and `proc.cyr:1788` are **P1** ring-3 memory exhaustion, not cleanup.
+- `kfmt.cyr:40` is a real out-of-bounds stack write across all 30 `fmt_hex_buf` call sites, and it is
+  **interlocked** with `kfmt.cyr:28`: fixing the negative-render bug is what makes `len == 16` common.
+- ⭐ **`gdt.cyr:82` was not in this backlog at all.** The TSS I/O-map base was written to offset 100
+  (reserved) instead of 102, leaving the real base at 0 — below the TSS limit — so the CPU believed an
+  I/O permission bitmap started at `TSS+0`, where zero bits mean ALLOWED. Ports `0x000-0x33F` were open
+  to ring 3, including `out 0x64, 0xFE` (CPU reset). Ports `>= 0x340` correctly `#GP`, so COM1 still
+  faulted: a silent PARTIAL failure, which is why twelve auditors missed it.
+
+⚠ **Findings whose severity the audit OVERSTATED, corrected here:** `elf.cyr:484`'s init-stack overrun
+spills into the child's **own** stack page (the loader writes through `stack_kva`), so it corrupts that
+child's argv — it is not a kernel-memory escape.
+
+⚠ **Two of the audit's own suggested fixes were wrong and were not taken as written:** the `blk` RW-arm
+reorder is an ABI break (measured, reverted at 1.56.51), and the init-stack guard it proposed
+(`argc + envc + 4 > slots`) is **off by one**, too permissive by exactly one slot.
+
 ## ⭐ STATUS — worked 2026-08-29, still inside the open 1.56.51 cut
 
 **P0: 1 of 2 closed.** `elf.cyr:312` is CLOSED, by the architecture change rather than a narrowed
@@ -91,7 +122,7 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** Reject any PT_LOAD that overlaps the per-process kernel-identity window. The loaders already know the boundary: user segments must stay under the first non-identity PD slot. Either (a) narrow the ceiling to the code/data window actually used by the toolchain (every staged binary bases at 0x400000 with memsz <= 32 MB, so `p_vaddr + p_memsz > 0x2000000` is a safe reject and retires the class the way the 0x400000 floor retired PD[1]), or (b) make proc_map_page/_nx refuse a pd_idx in [3, 127] outright and have the loader map segments through a non-identity window. Independently, move the kernel's identity-VA dereferences off identity: page-table walks in proc_map_page/_nx/_hi/proc_unmap_page/proc_get_user_cr3/sys_munmap and kmalloc pointers should use pmm_kva_for_access(phys) (DIRECTMAP_BASE + phys, PDPT[8+], never overridable by a user segment) — the exact remedy already applied to the PMM bitmap (pmm.cyr:326-330) and to TSS RSP0 (proc.cyr:363).
 
-### `kernel/core/syscall.cyr:1895` — gpu_shader_op#92: the primitive/vertex arrays validated in pass 1 are re-read from ring-3-writable shm in pass 2 (TOCTOU), and the comment asserting the opposite is false
+### ✅ FIXED 1.56.52 — `kernel/core/syscall.cyr:1895` — gpu_shader_op#92: the primitive/vertex arrays validated in pass 1 are re-read from ring-3-writable shm in pass 2 (TOCTOU), and the comment asserting the opposite is false
 
 **Mechanism.** gpu_shader_op_sys copies the 64-byte op RECORDS into the per-CPU kernel buffer (line 4443) — those are genuinely immutable. But for ops 0x0A/0x0B/0x0C the per-primitive geometry lives in an shm SLOT named by the record, and gpo_validate_texlist reads it directly from `pkva = shm_kva[slot]` (syscall.cyr:1940, 1947-2026). gpo_execute -> gpu_tex_list -> gpu_texl_build (gpu.cyr:7567-7654) then re-reads EVERY one of those fields from the same `pkva` and builds the GPU packet from the second read: pw/ph/px/py at gpu.cyr:7583-7588, tid/lid/twh at 7593-7595, and the destination offset `store32(rec + 144, (py * pitch + px * 4))` at 7652. Nothing re-validates them. The shm page stays ring-3-writable the whole time: shm_write#72 (syscall.cyr:8406) permits CROSS-OWNER writes by design — shm_note_xown only increments a counter (line 919-924, 'COUNTED, NEVER REFUSED'). Under smp_sched_aps=1 (smp.cyr:182) a second CPU can rewrite the slot between the two passes. The comment at syscall.cyr:1895-1896 — '⚠ PURE READS on the KERNEL-RESIDENT record and on the slot's kernel VA. Ring 3 cannot change a field between the check and the use.' — is true of the record and false of the slot, and it is the stated reason no re-check exists.
 
@@ -198,7 +229,7 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** In acpi_parse_dmar, require `entry_len >= 16` and `offset + 16 <= dmar_len` before reading the register base, and add the same `dmar_len > 0x10000 -> return 0` cap the RSDT/XSDT walkers already carry. In iommu_init, reject an acpi_iommu_base that is not 4 KB aligned or that falls inside the RAM the memmap reports as EfiConventionalMemory.
 
-### `kernel/core/elf.cyr:484` — SysV init-stack pointer array overruns ELF_INIT_STR: argc was raised 8->16 but sc_env_blob_ok's 16-entry env cap was derived against argc<=8
+### ✅ FIXED 1.56.52 — `kernel/core/elf.cyr:484` — SysV init-stack pointer array overruns ELF_INIT_STR: argc was raised 8->16 but sc_env_blob_ok's 16-entry env cap was derived against argc<=8
 
 **Mechanism.** The pointer array lives in [ELF_INIT_BLOCK+8, ELF_INIT_STR) = [0x1FF008, 0x1FF100) — exactly 31 slots. Slots consumed are argc argv pointers + 1 argv NULL + envc envp pointers + 1 envp NULL + 2 auxv words = argc + envc + 4, and the highest write is at index `argc + 3 + envc` (line 484). sc_env_blob_ok's banner (syscall.cyr:307-308) derives the 16-entry env cap from this and states 'with argc<=8, envc=16 tops out at 0x30E0' — correct arithmetic for the old ELF_INIT_BLOCK=0x3000/ELF_INIT_STR=0x3100 layout and for argc<=8. But elf.cyr:407 raised the argv cap to 16 ('1.46.x: raised 8->16') and its inline justification ('~27 ptr slots, so 16 is safe headroom') counts only a 2-entry envp, ignoring the 16-entry caller env that landed in 1.44.19. With argc=16 and envc=16 the top index is 35, i.e. address 0x1FF120 — 32 bytes INSIDE the string region. The `str_o + tl + 1 >= ELF_STACK_SIZE` guards at 417/471 bound the string region's upper end, not its lower end, so nothing catches this.
 

@@ -201,7 +201,7 @@ fn apic_send_sipi(target, vector) {
 # risk instead of hanging the box, matching apic_send_init's ICR_DELIVERY_WAIT posture.
 var tlb_shoot_probe_n = 0;
 fn tlb_probe_hex(v) {
-    var b[16];
+    var b[24];   # 1.56.52: fmt_hex_buf writes 17 B (16 digits + NUL) — [16] was a 1-byte OOB stack write
     if (v == 0) { klug_append("0", 1); return 0; }
     var n = fmt_hex_buf(v, &b);
     klug_append(&b, n);

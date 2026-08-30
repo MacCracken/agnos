@@ -84,7 +84,7 @@ fn kprint_byte(b) {
 # fb-visible twin of kfmt_hex (serial-only); callers supply their own
 # "0x" literal in the preceding kprint() label.
 fn kprint_hex(n) {
-    var buf[16];
+    var buf[24];   # 1.56.52: fmt_hex_buf writes 17 B (16 digits + NUL) — [16] was a 1-byte OOB stack write
     var len = fmt_hex_buf(n, &buf);
     kprint(&buf, len);
     return 0;

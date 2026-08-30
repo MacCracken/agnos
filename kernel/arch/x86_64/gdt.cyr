@@ -78,8 +78,28 @@ fn tss_init_cpu(cpu_id) {
     }
     # Set RSP0 = per-CPU kernel stack
     store64(tss_addr + 4, tss_get_cpu_stack(cpu_id));
-    # IOPB offset = 104 (no I/O bitmap)
-    store16(tss_addr + 100, 104);
+
+    # ⛔⛔ 1.56.52 — THE I/O-MAP BASE IS AT TSS OFFSET 102 (0x66), NOT 100, AND WRITING IT TO 100 GAVE
+    # RING 3 THE PORT SPACE. This line said `store16(tss_addr + 100, 104)`. Offset 0x64 = 100 is the
+    # RESERVED u16; 0x66 = 102 is `I/O map base address`. The 64-bit TSS is:
+    #   0x00 reserved u32 · 0x04 RSP0 · 0x0C RSP1 · 0x14 RSP2 · 0x1C reserved u64
+    #   0x24 IST1 … 0x54 IST7 · 0x5C reserved u64 · 0x64 reserved u16 · 0x66 IOPB base u16  ⇒ 0x68 = 104
+    # So the intended 104 landed in the reserved field and the REAL base stayed 0 from the zeroing
+    # loop above. Per SDM Vol 3 §19.5.2 a bitmap is absent only when the base is >= the TSS LIMIT, and
+    # the descriptor below sets limit 103 — so 0 < 103 meant the CPU believed an I/O permission bitmap
+    # started at TSS+0. Ring 3 runs IOPL=0 (ring3.cyr'"'"'s RFLAGS 0x002/0x202) so CPL 3 > IOPL and the
+    # bitmap IS consulted on every IN/OUT: for port N the CPU reads TSS + base + (N>>3), and a ZERO
+    # BIT MEANS ALLOWED. Bytes 0..103 of the TSS are almost entirely zero — the only non-zero ones are
+    # RSP0'"'"'s bytes and this very mis-write — so ports 0x000-0x33F were OPEN TO RING 3, including
+    # 0x64 (`out 0x64,0xFE` pulses the CPU reset line), 0x70/0x71 (CMOS + the NMI mask), 0x20/0x21 and
+    # 0xA0/0xA1 (the 8259 masks) and 0x40-0x43 (the PIT). Ports >= 0x340 read past the limit and
+    # correctly #GP, which is why COM1 at 0x3F8 still faulted — a SILENT PARTIAL failure, which is how
+    # this survived twelve subsystem auditors: it is not in the 1.56.51 backlog at all.
+    # ⚠ With the base at 102 the value 104 >= limit 103, so there is no bitmap and every ring-3 IN/OUT
+    # raises #GP — which is what the old comment always claimed was happening.
+    # ⚠ Verified no userland regressed: nothing in agnoshi/kriya/agnova/ark or tests/ executes IN/OUT
+    # (the 0xE4/0xE6/0xEC/0xEE matches there are all `sub rsp,imm8` and SHA-NI operands).
+    store16(tss_addr + 102, 104);   # I/O map base = 104 >= limit 103 ⇒ NO I/O permission bitmap
 
     # Build TSS descriptor in GDT at offset 0x28 + cpu_id * 16
     var gdt_off = 40 + cpu_id * 16;
@@ -113,6 +133,26 @@ fn tss_init_cpu(cpu_id) {
     }
 
     return 0;
+}
+
+# ⭐ 1.56.52 — ASSERT THE TSS FIELD PLACEMENT AT BOOT, because getting it wrong is SILENT. The old
+# `store16(tss_addr + 100, …)` wrote a plausible value into a field the CPU never reads, left the real
+# I/O-map base at 0, and handed ring 3 the low port space — and nothing anywhere noticed, because the
+# failure only shows up as ports BELOW 0x340 quietly working. An offset typo in a hardware structure
+# has no compile-time or run-time signal of its own, so it needs one written down.
+# Checks, for every CPU whose TSS has been initialised:
+#   · offset 102 (0x66, I/O map base) reads back the 104 we wrote, and
+#   · 104 >= tss_limit (103), which is the SDM condition for "no I/O permission bitmap", and
+#   · offset 100 (0x64, reserved) is still 0 — i.e. we are no longer scribbling on the reserved field.
+# Returns 1 if the layout is right, 0 otherwise. Mutation test: restore the +100 store and this must
+# report BROKEN.
+fn tss_iopb_selftest(cpu_id) {
+    if (cpu_id < 0) { return 0; }
+    if (cpu_id >= 4) { return 0; }
+    var tss_addr = &tss_array + cpu_id * 104;
+    if ((load16(tss_addr + 102) & 0xFFFF) != 104) { return 0; }   # I/O map base field
+    if ((load16(tss_addr + 100) & 0xFFFF) != 0)   { return 0; }   # reserved u16 must stay clear
+    return 1;
 }
 
 # Legacy init: calls tss_init_cpu(0) for BSP

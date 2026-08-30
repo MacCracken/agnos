@@ -362,13 +362,30 @@ fn test_kstdlib() {
     test_assert_eq(load8(&ibuf), 48, "fmt_int_buf 0 = '0'", 19);
 
     # fmt_hex_buf
-    var hbuf[16];
+    var hbuf[24];   # 1.56.52: fmt_hex_buf writes 17 B (16 digits + NUL) — [16] was a 1-byte OOB stack write
     var hlen = fmt_hex_buf(255, &hbuf);
     test_assert_eq(hlen, 2, "fmt_hex_buf ff len=2", 20);
     test_assert_eq(memeq(&hbuf, "ff", 2), 1, "fmt_hex_buf ff correct", 22);
 
     var hlen2 = fmt_hex_buf(0, &hbuf);
     test_assert_eq(hlen2, 1, "fmt_hex_buf 0 len=1", 19);
+
+    # 1.56.52 REGRESSION LOCKS. A NEGATIVE value used to render as an EMPTY STRING (the loop gate was
+    # a signed `> 0`), which three fault_kill_current sites then reported as a fabricated "0" — so the
+    # kernel's own crash record claimed cr2 was null for any high-half faulting address. 0x8000...0087
+    # is the exact shape proc_map_page_nx writes into every W^X PDE.
+    var hlen_neg = fmt_hex_buf(0 - 9223372036854775807 - 1, &hbuf);   # INT64_MIN, bit 63 set
+    test_assert_eq(hlen_neg, 16, "fmt_hex_buf negative len=16", 27);
+    test_assert_eq(memeq(&hbuf, "8000000000000000", 16), 1, "fmt_hex_buf negative correct", 27);
+
+    # fmt_int_buf: INT64_MIN negates to itself, so the old code rendered it as a bare "-".
+    var ibuf2[24];
+    var ilen_min = fmt_int_buf(0 - 9223372036854775807 - 1, &ibuf2);
+    test_assert_eq(ilen_min, 20, "fmt_int_buf INT64_MIN len=20", 28);
+    test_assert_eq(memeq(&ibuf2, "-9223372036854775808", 20), 1, "fmt_int_buf INT64_MIN correct", 29);
+    var ilen_neg1 = fmt_int_buf(0 - 1, &ibuf2);
+    test_assert_eq(ilen_neg1, 2, "fmt_int_buf -1 len=2", 20);
+    test_assert_eq(memeq(&ibuf2, "-1", 2), 1, "fmt_int_buf -1 correct (no spurious 0)", 38);
 
     return 0;
 }

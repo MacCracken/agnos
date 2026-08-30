@@ -20,6 +20,170 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.56.52] — 2026-08-29 — the audit backlog's two P0s, and a ring-3 port-I/O hole nobody had filed
+
+### Security — ring 3 could reach the platform through the TSS
+
+- **`tss_init_cpu` wrote the I/O-map base to TSS offset 100 instead of 102** (`kernel/arch/x86_64/gdt.cyr`).
+  Offset `0x64` is the reserved u16; `0x66` is `I/O map base address`. The intended 104 therefore landed
+  in the reserved field and the real base stayed **0** from the zeroing loop. Per SDM Vol 3 §19.5.2 a
+  bitmap is absent only when the base is `>=` the TSS limit — the descriptor sets limit 103, so `0 < 103`
+  meant the CPU believed an I/O permission bitmap started at `TSS+0`. Ring 3 runs IOPL=0, so CPL 3 > IOPL
+  and the bitmap **is** consulted on every `IN`/`OUT`: for port N the CPU reads `TSS + base + (N>>3)`, and
+  a **zero bit means allowed**. TSS bytes 0..103 are almost entirely zero, so ports `0x000-0x33F` were
+  open to ring 3 — including `0x64` (`out 0x64, 0xFE` pulses the CPU reset line), `0x70`/`0x71` (CMOS and
+  the NMI mask), the 8259 masks and the PIT. Ports `>= 0x340` read past the limit and correctly `#GP`,
+  which is why COM1 at `0x3F8` still faulted: a **silent partial** failure, and the reason this survived
+  twelve subsystem auditors. It is not in the 1.56.51 backlog at all.
+  ⚠ No userland regressed — nothing in agnoshi/kriya/agnova/ark or `tests/` executes `IN`/`OUT`.
+  ⭐ A boot gate now asserts the field placement (`tss: I/O map base at 0x66 OK`), because an offset typo
+  in a hardware structure has no signal of its own. Mutation-tested: the old offset reports `MISPLACED`.
+
+### Security — P0: `sys_munmap` could free live kernel memory
+
+- **`length` had no ingress cap and every comparison is signed** (`kernel/core/proc.cyr`).
+  `length = 0x7FFFFFFFFFD00000` rounds to a positive `len`; `addr + len` then wraps **negative**, so the
+  signed `(addr + len) > 0x40000000` ceiling test passes. `npages` becomes 4,398,046,511,103 and
+  `pd_idx = (vaddr >> 21) & 0x1FF` simply **cycles**, walking out of the arena into the kernel identity
+  window. Because the free site tested only the *present* bit and never the *user* bit,
+  `pmm_free_2mb` marked physical **2–256 MB free while live** — the SYSCALL kstack, the boot TSS RSP0
+  seeds, the direct-map PD pages — after which `pmm_alloc` hands those frames to the next caller. The
+  loop then spins ~4.4e12 more iterations with IF=0, so the box wedges too. Two integers through
+  syscall 28, no privilege, no crafted input.
+  Fixed four ways: a negative-length reject, a 64 GB cap mirroring `sys_mmap`, an explicit wrap check,
+  and the **user-bit guard** at the free site that `proc_unmap_2mb_hi` had always carried.
+- **The low ceiling was `0x40000000`, six MB above the arena's real top.** `sys_mmap` stops at
+  `0x3FA00000`, deliberately below the fixed user stack at `0x3FC00000`, so PD slots 509/510/511 — the
+  guard page, **the user stack**, and the user-CR3 stash — were inside the range ring 3 could name.
+  Now `0x3FA00000`, the constant `sys_mmap` actually allocates under.
+
+### Security — P0: `#92` op 0x0C validated one copy of the primitive array and drew from another
+
+- **The TOCTOU is closed by snapshotting** (`kernel/core/syscall.cyr`). Pass 1 validated the per-primitive
+  array in the shm slot; `gpu_texl_build` then re-read every field from that same slot and derived each
+  primitive's **destination byte offset** from the second read. The slot stays ring-3-writable throughout:
+  `shm_write#72` permits cross-owner writes by design, and with `smp_sched_aps=1` a second CPU can rewrite
+  it between the passes. Pass 2 also re-resolved `shm_kva` without re-checking validity, non-null or size,
+  so a slot freed (`#74`) or re-created smaller since pass 1 yielded a null or undersized pointer.
+  ⛔ **And nothing downstream clips.** The comment claiming "the shader clips to the union anyway" was a
+  second false load-bearing comment — the union never reaches the shader, and the shipped prologue applies
+  no framebuffer bound at all. On the 2560x1440 verification host (pitch 10240) one primitive with
+  `pw=1, ph=39323, py=65535` reaches past the back buffer into the GPU compute arena at `0x80000000` — the
+  ring buffer, the MQD and every resident shader blob — while still passing the launched-wave cap.
+  Fix: the per-primitive validator is extracted so one implementation serves both passes; pass 2 copies
+  the array into a per-CPU 64 KB window, re-validates the **copy**, and builds only from the copy.
+  `fbw`/`fbh` are now threaded from `gpu_shader_op_sys` rather than re-derived, which also removes a bare
+  divide and makes pass 2 use exactly pass 1's bounds. New `GPO_E_RACE = 36` (additive; 36 < 256, so the
+  packed `-((idx << 8) | reason)` encoding is unchanged).
+  ⚠ Reachable **on iron only** — `gpu_texl_arm` refuses when `gpu_present == 0`, so QEMU never dispatches
+  op 0x0C. The `#92` battery is therefore the only place this can be exercised, which is why the staging
+  region is taken unconditionally at boot rather than behind a `gpu_present` gate: a gate there would make
+  both the fix and its test dead code.
+  ⚠ **This does not make op 0x0C SMP-safe.** The shared prep slot and the global `gpu_texl_maxw/maxh/
+  colmajor` latches are untouched and pre-existing; two CPUs in op 0x0C still stomp each other's build.
+
+### Security — ring-3 memory exhaustion in both ELF loaders
+
+- **Every post-creation failure path leaked the address space** (`kernel/core/elf.cyr`). Both loaders
+  create the per-process PML4/PDPT/PD, map 2 MB user pages into it, and on any later error did a bare
+  `return 0 - 1`. `proc_free_address_space` is the only reclaimer and is reached exclusively through
+  `proc_reap`/`proc_reap_child` **with a pid** — none was created, so the pages are unreachable from any
+  CR3 chain and lost until reboot. Worse, the `proc_create_user` tails had **no failure arm at all**: fill
+  the 16-slot process table with spinning children, then loop `spawn`, and each call drops a fully
+  populated address space — 4,206,592 B minimum, 35,663,872 B for a binary at the loaders' own 32 MB
+  ceiling. The `pmm_alloc_2mb` arm is self-reinforcing. Now centralised through `elf_bail` across 25 sites
+  plus both tails.
+- **`sys_mmap` leaked a 2 MB region on two failure paths** (`kernel/core/proc.cyr`). The high arm's
+  `proc_map_page_hi` failure returned without freeing; the low arm discarded `proc_map_page_nx`'s return
+  entirely. The high one is deterministically reachable because the two allocators have different
+  ceilings: `pmm_alloc` stops at 256 MB while `pmm_alloc_2mb` scans all RAM, so a process that first
+  consumes every 2 MB region below 256 MB makes the PD allocation fail while the page allocation keeps
+  succeeding — every subsequent high mmap then leaks 2 MB.
+
+### Fixed — the formatting helpers the crash record depends on
+
+- **`fmt_hex_buf` returned an empty string for any negative value** (`kernel/klib/kfmt.cyr`). The loop gate
+  was a signed `> 0`, so bit 63 set meant the digit loop never ran and the function returned length 0 —
+  which three sites in `fault_kill_current` read as "the value was zero" and printed a fabricated `0`.
+  **Ring-3 reachable and it falsifies the crash record**: a load from any canonical high-half address sets
+  CR2 with bit 63 set, so the kernel's own post-mortem reported `HWCR2=0x0` — a null dereference that never
+  happened. Worse for PDEs, since `proc_map_page_nx` writes `phys | 0x8000000000000087`, making every W^X
+  data/stack PDE negative and an all-zero neighbour set read as "the page's memory was destroyed".
+- **`fmt_hex_buf` writes 17 bytes and all seven callers supplied 16.** A one-byte out-of-bounds stack
+  write. ⛔ The two fixes were interlocked: before the first, `len == 16` was essentially unreachable;
+  after it, every NX PDE and every high-half CR2 renders 16 digits, so the overflow goes from never-fires
+  to fires-on-every-page-fault. All seven buffers widened to `[24]`, and the two comments asserting
+  "16 hex digits exactly" — which is precisely the off-by-one — corrected.
+- **`fmt_int_buf` rendered the most-negative i64 as a bare `"-"`**: two's-complement negation is an
+  identity on `INT64_MIN`, so the signed digit loop never ran. Now peels one digit while the value is
+  still negative. Six regression locks added to the in-kernel suite.
+
+### Fixed — the SysV init-stack pointer array could overrun into the strings
+
+- The array is `[ELF_INIT_BLOCK+8, ELF_INIT_STR)` and the loader's last write is the auxv AT_NULL value at
+  index `argc + 3 + envc`. `argc` was raised 8 → 16 at 1.46.x while the window stayed 31 slots, so
+  `argc + envc >= 28` wrote past `ELF_INIT_STR` and clobbered the argv strings the array points at.
+  ⚠ Severity, stated honestly: the spill lands in the child's **own** 2 MB stack page (the loader writes
+  through `stack_kva`), so this corrupts the child's argv — it is not a kernel-memory escape.
+  `ELF_INIT_STR` widened to `0x1FF200` (63 slots), the combined bound now asserted in the env loop —
+  the only scope holding both counts — and written **from the constants** rather than as a hand-derived
+  number. ⛔ The invariant had already rotted in **three** separate comments ("~27 ptr slots", "31 slots",
+  "the 2-entry envp", the last wrong since 1.44.19); all three corrected.
+- ⭐ **New gate `scripts/check/check-initstack.sh`** re-derives the arithmetic from the live constants, so
+  raising either cap without widening the window fails the build. This is the durable half: with the
+  widened array the runtime guard is unreachable under the shipped caps by construction, so a static
+  check is the only form that can actually fail. Mutation-tested — the old `ELF_INIT_STR` reports
+  `slots=31` against top index 35, exactly the overflow. `check.sh` is now **31 gates**.
+
+### Fixed — device-supplied values that were trusted
+
+- **Both virtio queue sizes were taken from the device with only a zero check**
+  (`kernel/core/virtio_blk.cyr`, `kernel/core/virtio_net.cyr`), while each ring gets exactly one 4 KB
+  page. The used ring binds it: `6 + 8N <= 4096` gives `N <= 511`, and split rings need a power of two,
+  so 256 is the ceiling — the figure the surrounding comments already asserted and nothing enforced.
+  The spec permits up to 32768; at `N = 512` the descriptor table alone is 8192 B, double its page.
+  `QUEUE_SIZE` is read-write in modern virtio (1.2 §4.1.4.3), so both now shrink it, **re-read rather
+  than assume the write took**, reject a device that will not comply, and reject a non-power-of-two.
+  virtio-net additionally enforces a **lower** bound of 16, because `vnet_rx_prime` publishes 16 avail
+  entries unconditionally.
+- **virtio-net trusted the RX used-ring `desc_id` and length.** `buf_off = desc_id * 1536` indexes a
+  16-slot buffer, so any id the device invents reads at an arbitrary displacement; and the length was
+  clamped only against the *caller's* `maxlen`, never against the 1536-byte slot the data lives in.
+  Both bounded now, consume-then-drop so a bad entry is discarded rather than spun on.
+- **`ramdisk` bounds were signed and admitted negative sectors.** `sector >= capacity` passes for any
+  negative sector, which then indexes `&ramdisk_pages + (sector >> 3) * 8` at a negative displacement.
+  `start + count > capacity` could also wrap. Both rewritten operand-wise so no sum is evaluated.
+- **SuperSpeed interrupt `Interval` had neither the zero-guard nor the clamp the HS path has**
+  (`kernel/arch/x86_64/usb/xhci_ctx.cyr`) — from a device descriptor byte, where 0 produced -1 and
+  anything above 16 overran the 4-bit field into its neighbours. The doc comment already described the
+  clamped behaviour; it described the fixed code, not the shipped code.
+- **`_S5_` decode latched `acpi_s5_valid` on a FAILED SLP_TYPb read** (`kernel/core/acpi.cyr`). The
+  guard tested `bb <= 7` but not `bb >= 0`, and `acpi_aml_read_int` signals failure with a negative —
+  which the next line then clamped to 0, contradicting the comment two lines above that refuses exactly
+  that "mask it down" policy. Now symmetric with `a`, and the dead clamp removed.
+
+### Removed — a W+X primitive with no consumers
+
+- `vmm_map_user_exec` mapped a user page `0x87` = P | RW | US | PS: **writable and executable, NX
+  clear** — the state W^X exists to prevent, and the same hole 1.56.51 had just closed in the ELF
+  loaders. It had no callers; the whole `vmm_alloc_user_exec -> vmm_map_user_exec -> vmm_map` chain was
+  unreachable. Deleted along with the NX-only twin, since removing `vmm_alloc_user` is what made
+  `vmm_map_user` dead and a lone user mapper invites reintroducing the pair. Ring-3 mapping goes
+  through `proc_map_page` / `_rx` / `_nx`, which are per-process and W^X-correct. The unreachable-fn
+  count fell 189 → 185, confirming all four were dead.
+
+Build: `build/agnos` **1,969,400 B** (multiboot2/ELF64, entry `0x1000a8`). `check.sh` **31/31** (new
+`check-initstack.sh` gate), `test.sh` (x86) 4/4, `sweep.sh` 19/19, `ktest.sh` 103 passed / 6 failed
+(those 6 pre-existing). ⚠ `fp-nm-smoke` is a PRE-EXISTING ~50%% flake — measured 2 of 4 failures on the
+RELEASED 1.56.51 — so a red on that sweep gate means nothing without an A/B of several runs per arm.
+
+### Fixed — `#92` ABI battery: 167 → 171 cases
+
+- Four op-0x0C TOCTOU cases: a baseline, two post-validation mutations that must answer `GPO_E_RACE`, and
+  a **control** proving an unmutated list still reaches dispatch — without which a refusal that fired
+  unconditionally would satisfy the other two while breaking every real caller. Mutation-tested: disarming
+  the re-validation makes both mutation cases fail while baseline and control stay green.
+
 ## [1.56.51] — 2026-08-28 — P-1 sweep: the size-multiply overflow class, and four gates that could not fail
 
 ### Security — ring-3 and remote memory-safety fixes

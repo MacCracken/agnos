@@ -284,8 +284,20 @@ fn xhci_interrupt_interval(b_interval, speed) {
         if (hi > 15) { return 15; }
         return hi;
     }
-    if (speed == XHCI_SPEED_SUPER)      { return b_interval - 1; }
-    if (speed == XHCI_SPEED_SUPER_PLUS) { return b_interval - 1; }
+    # ⛔ 1.56.52 — SS AND SS+ HAD NEITHER THE ZERO-GUARD NOR THE CLAMP THE HS ARM ABOVE HAS, even
+    # though the doc comment already claimed "HS / SS: xHCI Interval = bInterval - 1 (clamped to
+    # 0..15)" — it described the fixed code, not the shipped code. b_interval is a DEVICE-SUPPLIED
+    # descriptor byte: 0 produced -1, and anything above 16 produced a value past the 4-bit Interval
+    # field, which the single consumer shifts into the EP context at bits [23:16] and would corrupt
+    # the neighbouring fields. Same clamp(b_interval, 1, 16) - 1 as Linux xhci_parse_exponent_interval,
+    # and bit-identical to today's output for every in-spec bInterval in [1, 16].
+    if (speed == XHCI_SPEED_SUPER || speed == XHCI_SPEED_SUPER_PLUS) {
+        var ss = b_interval;
+        if (ss == 0) { return 0; }
+        ss = ss - 1;
+        if (ss > 15) { return 15; }
+        return ss;
+    }
     # FS / LS: fls(8 * bInterval) - 1. Inline fls because the kernel has
     # no bsr intrinsic yet.
     var x = b_interval;

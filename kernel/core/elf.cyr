@@ -18,7 +18,51 @@ fn elf_hdr_buf_base() { return &pcpu_elf_hdr_buf + pcpu_cpu() * 4096; }
 
 var ELF_STACK_SIZE = 0x200000;      # the mapped stack page — also the string-region ceiling
 var ELF_INIT_BLOCK = 0x1FF000;      # SysV control block: [argc][argv..][NULL][envp..][NULL][auxv]
-var ELF_INIT_STR   = 0x1FF100;      # argv/envp string region: ELF_INIT_STR .. ELF_STACK_SIZE
+# ⛔⛔ 1.56.52 — WIDENED 0x1FF100 -> 0x1FF200 BECAUSE THE POINTER ARRAY COULD OVERRUN INTO THE STRINGS.
+# The array is [ELF_INIT_BLOCK+8, ELF_INIT_STR), and the loader's last write is the auxv AT_NULL VALUE
+# at index argc + 3 + envc. The caps are argc <= 16 (raised 8 -> 16 at 1.46.x) and envc <= 16 (the
+# caller-env blob, 1.44.19) — so the worst top index is 35 and the old 248-byte window held only 31
+# slots (0..30). Anything with argc + envc >= 28 wrote past ELF_INIT_STR and clobbered the argv
+# strings the very same array points at, so the child read garbage argv.
+# ⚠ SEVERITY, stated honestly: the spill lands INSIDE THE CHILD'S OWN 2 MB stack page (the loader
+# writes through stack_kva = pmm_kva_for_access(stack_phys)), so this corrupts the child's own argv —
+# it is NOT the kernel-memory escape the backlog title suggests.
+# ⚠ THE CAPS ARE ENFORCED IN TWO DIFFERENT FUNCTIONS AND NEITHER SEES THE OTHER'S COUNT: argc is
+# capped in the argv tokenizer, envc in the env loop, and sc_env_blob_ok (syscall.cyr) runs before
+# argv is tokenized so it structurally cannot know argc. That is why the combined invariant is
+# asserted in the env loop below, and gated statically by scripts/check/check-initstack.sh.
+# Derivation, kept HERE so it cannot rot again (it had already rotted in three separate comments):
+#   slots            = (ELF_INIT_STR - ELF_INIT_BLOCK - 8) / 8      = (0x200 - 8) / 8 = 63
+#   worst top index  = argc + 3 + envc                              = 16 + 3 + 16    = 35
+#   string region    = ELF_STACK_SIZE - ELF_INIT_STR                = 0x200000 - 0x1FF200 = 3584 B
+#   worst string use = argv (<=127 payload + <=16 NULs) + env (<=1024) = 1167 B      ⇒ 3584 is ample
+# rsp = stack_base + ELF_INIT_BLOCK is UNCHANGED, so the SysV entry contract and its 16-byte
+# alignment are untouched. ⚠ Anyone raising argc (the tokenizer cap) or envc (the env-loop cap) must
+# recheck the slot count above — those two are this window's only consumers.
+var ELF_INIT_STR   = 0x1FF200;      # argv/envp string region: ELF_INIT_STR .. ELF_STACK_SIZE
+
+# ⛔⛔ 1.56.52 — EVERY POST-CREATION FAILURE PATH IN BOTH LOADERS LEAKED THE ADDRESS SPACE.
+# proc_create_address_space allocates PML4 + PDPT + PD and the loaders then map 2 MB user pages into
+# it; on ANY error after that point both functions did a bare `return 0 - 1`. Nothing reclaims those
+# pages: proc_free_address_space is the only reclaimer and it is reached exclusively via
+# proc_reap / proc_reap_child WITH A PID — and no pid was ever created, so the tables are unreachable
+# from any CR3 chain and are lost until reboot.
+# ⚠ RING-3 REACHABLE WITH NO CRAFTED FILE. Fill the 16-slot process table with spinning children, then
+# loop spawn#3 / spawn_path#43: proc_create_user then fails and the fully-populated address space is
+# dropped on the floor — that tail had no failure arm at all. Per call this loses at least one PT_LOAD
+# 2 MB page + the 2 MB user stack + 3 x 4 KB tables = 4,206,592 B, and a binary sized at the loaders'
+# own 32 MB p_memsz ceiling loses 35,663,872 B. The pmm_alloc_2mb arm is self-reinforcing: once
+# enough regions are gone, every later exec fails part-way and leaks the rest.
+# ⭐ elf_bail centralises the cleanup so each site is a one-token change rather than a hand-repeated
+# pair that a future edit can forget half of.
+# ⚠ SAFE TO FREE HERE: neither loader ever installs new_cr3 (both are explicit that they do no CR3
+# switch), and all three syscall entries run them under boot CR3 0x1000 — so this can never free the
+# tables the CPU is currently walking. proc_free_address_space frees only PRESENT+USER PDEs, and all
+# three mappers set US, so the kernel-mirrored supervisor identity window PD[0..127] is untouched.
+fn elf_bail(cr3) {
+    proc_free_address_space(cr3);
+    return 0 - 1;
+}
 
 fn elf_load(elf_addr, elf_size) {
     var canary = stack_canary_secret;
@@ -112,18 +156,18 @@ fn elf_load(elf_addr, elf_size) {
             # BELOW the image and delivers it into a page the child maps at ring 3 — an arbitrary
             # kernel-memory disclosure through spawn#3, with the attacker choosing the offset.
             # All four check sites (both loaders, pre-pass and mapping loop) get the same floor.
-            if (p_offset < 0) { return 0 - 1; }
-            if (p_filesz < 0) { return 0 - 1; }
-            if (p_offset >= elf_size) { return 0 - 1; }
-            if (p_filesz > elf_size) { return 0 - 1; }
-            if (p_offset + p_filesz > elf_size) { return 0 - 1; }
+            if (p_offset < 0) { return elf_bail(new_cr3); }
+            if (p_filesz < 0) { return elf_bail(new_cr3); }
+            if (p_offset >= elf_size) { return elf_bail(new_cr3); }
+            if (p_filesz > elf_size) { return elf_bail(new_cr3); }
+            if (p_offset + p_filesz > elf_size) { return elf_bail(new_cr3); }
             # Security: validate memsz >= filesz and no overflow
-            if (p_memsz < p_filesz) { return 0 - 1; }
-            if (p_vaddr + p_memsz < p_vaddr) { return 0 - 1; }
+            if (p_memsz < p_filesz) { return elf_bail(new_cr3); }
+            if (p_vaddr + p_memsz < p_vaddr) { return elf_bail(new_cr3); }
             # Security: segment must be in userspace
-            if (p_vaddr < 0x400000) { return 0 - 1; }         # 1.56.39: PD[1] is not userspace
+            if (p_vaddr < 0x400000) { return elf_bail(new_cr3); }         # 1.56.39: PD[1] is not userspace
             # Security: cap segment size to prevent exhausting physical memory
-            if (p_memsz > 0x2000000) { return 0 - 1; }
+            if (p_memsz > 0x2000000) { return elf_bail(new_cr3); }
             # 1.41.5: keep the segment below the mmap arena base (0x10000000) so a
             # crafted p_vaddr can't land a segment inside [0x10000000,0x40000000)
             # and alias the process's own future mmap/munmap. Legit segments are
@@ -149,7 +193,7 @@ fn elf_load(elf_addr, elf_size) {
             # ⭐ THE ACTUAL FIX IS ARCHITECTURAL — move the user image above the kernel identity
             # window, or stop reaching kernel data through identity VAs under a per-process CR3.
             # Do not silently trade one for the other by editing this number.
-            if (p_vaddr + p_memsz > 0x10000000) { return 0 - 1; }
+            if (p_vaddr + p_memsz > 0x10000000) { return elf_bail(new_cr3); }
 
             # 1.44.8: populate each 2 MB page via its PHYSICAL (kernel-identity) address —
             # NOT by switching CR3 and writing the USER vaddr. The old form (pmm_alloc 4 KB;
@@ -165,7 +209,7 @@ fn elf_load(elf_addr, elf_size) {
             var pg = page_start;
             while (pg < page_end) {
                 var phys = pmm_alloc_2mb();
-                if (phys == 0) { return 0 - 1; }
+                if (phys == 0) { return elf_bail(new_cr3); }
                 # 1.49.12: kernel access handle (identity <=256 MB / direct-map above) — same >256 MB
                 # raw-phys #PF fix as sys_mmap + elf_load_from_file. proc_map_page still stores raw `phys`.
                 var kva = pmm_kva_for_access(phys);
@@ -215,8 +259,9 @@ fn elf_load(elf_addr, elf_size) {
     # The init block is self-contained (control word, then the argv/envp pointer
     # array, then the strings), so relocating it to the TOP of the page costs
     # nothing and hands the program the whole 2 MB. Region sizes are
-    # byte-identical to the old layout — pointer array still 0xF8 (31 slots),
-    # string region still 0xF00 (3840 B) — so argv/envp capacity is unchanged.
+    # byte-identical to the old layout in SHAPE. ⚠ 1.56.52 the numbers moved: the pointer array is
+    # now 0x1F8 (63 slots) and the string region 0xE00 (3584 B) — see the derivation at ELF_INIT_STR.
+    # This comment carried the third stale copy of that arithmetic, which is how the overrun survived.
     # Only the base moved; the space below rsp grew 12 KB -> 0x1FF000
     # (2,093,056 B). The guard page at stack_base - 0x200000 stays unmapped, so
     # a genuine overflow still traps instead of corrupting a neighbour.
@@ -230,7 +275,7 @@ fn elf_load(elf_addr, elf_size) {
     # VA actually resolves) and proc_free_address_space's pmm_free_2mb needs 2 MB alignment.
     var stack_base = 0x3FC00000;
     var stack_phys = pmm_alloc_2mb();
-    if (stack_phys == 0) { return 0 - 1; }
+    if (stack_phys == 0) { return elf_bail(new_cr3); }
     # 1.49.12: only the USER touches this stack (via proc_map_page below — the in-memory elf_load
     # stages no argv here), so the kernel needs no access handle. Keep the legacy identity vmm_map for
     # a <=256 MB stack, but NEVER for a >256 MB phys — vmm_map(high,high) would write a bogus low-VA→
@@ -247,6 +292,12 @@ fn elf_load(elf_addr, elf_size) {
     # state=3 (NOT schedulable) so a woken AP can't pick it before the CR3 + ring-3 selectors below
     # are wired; we flip it ready (state=1) as the LAST step. The spawned proc is scheduler-run.
     var new_pid = proc_create_user(entry, stack_top);
+    # ⛔ 1.56.52 — THIS TAIL HAD NO FAILURE ARM. proc_create_user returns -1 once proc_alloc_slot
+    # refuses (the 16-slot process table is full), and the FULLY-POPULATED address space — every
+    # PT_LOAD page plus the 2 MB user stack plus the three table pages — was simply dropped: no pid
+    # ever referenced it, so no reap can ever reclaim it. That is the cheapest form of the leak,
+    # needing no crafted binary at all: fill the table with spinning children, then loop spawn.
+    if (new_pid < 0) { proc_free_address_space(new_cr3); return new_pid; }
     if (new_pid >= 0) {
         proc_set_cr3(new_pid, new_cr3);
         # 1.44.8: a spawned ELF (spawn #3 / scheduler-run) runs in ring 3 — set its
@@ -383,18 +434,18 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
             # BELOW the image and delivers it into a page the child maps at ring 3 — an arbitrary
             # kernel-memory disclosure through spawn#3, with the attacker choosing the offset.
             # All four check sites (both loaders, pre-pass and mapping loop) get the same floor.
-            if (p_offset < 0) { return 0 - 1; }
-            if (p_filesz < 0) { return 0 - 1; }
-            if (p_offset >= fsize) { return 0 - 1; }
-            if (p_filesz > fsize) { return 0 - 1; }
-            if (p_offset + p_filesz > fsize) { return 0 - 1; }
-            if (p_memsz < p_filesz) { return 0 - 1; }
-            if (p_vaddr + p_memsz < p_vaddr) { return 0 - 1; }
-            if (p_vaddr < 0x400000) { return 0 - 1; }         # 1.56.39: PD[1] is not userspace
-            if (p_memsz > 0x2000000) { return 0 - 1; }
+            if (p_offset < 0) { return elf_bail(new_cr3); }
+            if (p_filesz < 0) { return elf_bail(new_cr3); }
+            if (p_offset >= fsize) { return elf_bail(new_cr3); }
+            if (p_filesz > fsize) { return elf_bail(new_cr3); }
+            if (p_offset + p_filesz > fsize) { return elf_bail(new_cr3); }
+            if (p_memsz < p_filesz) { return elf_bail(new_cr3); }
+            if (p_vaddr + p_memsz < p_vaddr) { return elf_bail(new_cr3); }
+            if (p_vaddr < 0x400000) { return elf_bail(new_cr3); }         # 1.56.39: PD[1] is not userspace
+            if (p_memsz > 0x2000000) { return elf_bail(new_cr3); }
             # 1.41.5: keep the segment below the mmap arena base (0x10000000) — a
             # crafted on-disk p_vaddr must not alias the process's mmap arena.
-            if (p_vaddr + p_memsz > 0x10000000) { return 0 - 1; }
+            if (p_vaddr + p_memsz > 0x10000000) { return elf_bail(new_cr3); }
 
             # Map + populate 2 MB pages WITHOUT a CR3 switch. Each page is
             # pmm_alloc'd and identity-mapped in the kernel (vmm_map phys→phys),
@@ -416,7 +467,7 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
                 # hazard pmm.cyr documents). This is what made the loaded code
                 # read as #UD in ring 3 at 1.40.3.
                 var phys = pmm_alloc_2mb();
-                if (phys == 0) { return 0 - 1; }
+                if (phys == 0) { return elf_bail(new_cr3); }
                 var kva = pmm_kva_for_access(phys);   # 1.49.9: kernel access handle — identity <=256 MB, direct-map above
                 # 1.50.6 W^X: PF_X segments stay executable; non-executable (data-only) segments are NX.
                 # NOTE: cyrius/cyrld currently emits ONE RWE PT_LOAD per binary (code+data+bss together), so
@@ -456,7 +507,7 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
                         var chunk = copy_len - done;
                         if (chunk > 65536) { chunk = 65536; }
                         var rn = vfs_read_file_at(path, namelen, file_off + done, kva + phys_off + done, chunk);
-                        if (rn != chunk) { return 0 - 1; }
+                        if (rn != chunk) { return elf_bail(new_cr3); }
                         done = done + chunk;
                     }
                 }
@@ -477,7 +528,7 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     # 0x10000000 with a ceiling (0x3FA00000) below this stack + its guard page.
     var stack_base = 0x3FC00000;
     var stack_phys = pmm_alloc_2mb();
-    if (stack_phys == 0) { return 0 - 1; }
+    if (stack_phys == 0) { return elf_bail(new_cr3); }
     var stack_kva = pmm_kva_for_access(stack_phys);   # 1.49.9: kernel access handle — identity <=256 MB, direct-map above
     proc_map_page_nx(new_cr3, stack_base, stack_phys);   # 1.50.6 W^X: the user stack is data -> NX (blocks stack shellcode; no signal trampoline runs there)
     elf_pde_probe(new_cr3, stack_base, stack_phys, 1);   # ELF_PDE_PROBE: PD[510] is one of the two observed victims
@@ -507,7 +558,10 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
         while (ai < argv_len) { if (load8(argv_src + ai) != 32) { break; } ai = ai + 1; }   # skip spaces
         if (ai >= argv_len) { break; }
         if (argc >= 16) { break; }   # 1.46.x: raised 8->16. The argv pointer array
-        # (ELF_INIT_BLOCK+8..ELF_INIT_STR) plus the 2-entry envp hold ~27 ptr slots, so 16 is safe
+        # ⚠ 1.56.52: this used to justify itself with "plus the 2-entry envp hold ~27 ptr slots".
+        # Both halves were wrong — the envp has been up to SIXTEEN entries since 1.44.19, and the
+        # window held 31 slots, not 27. The live derivation is at ELF_INIT_STR; the combined
+        # argc+envc bound is enforced in the env loop below, which is the only scope holding both.
         # headroom for longer positional command lines (e.g. `anuenue <sentence>` —
         # agnos has no working shell pipes yet, so positional argv is the only text
         # path); the str_o < ELF_STACK_SIZE cap below still bounds total command length.
@@ -570,6 +624,18 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
             var el = ei - es;
             if (el > 0) {
                 if (envc >= 16) { break; }
+                # ⛔ 1.56.52 — THE COMBINED INVARIANT, AND THE ONLY SCOPE THAT CAN ENFORCE IT.
+                # argc is capped by the argv tokenizer above and envc by the line above this one, but
+                # the pointer array is bounded by their SUM — and sc_env_blob_ok (syscall.cyr), which
+                # applies the 16-entry blob cap, runs BEFORE argv is tokenized and structurally
+                # cannot see argc. This function is the only place both counts are in scope.
+                # Accepting entry `envc` means the loop's last write (the auxv AT_NULL VALUE, below)
+                # lands at index argc + 3 + (envc + 1), which must stay <= slots - 1.
+                # ⚠ WRITTEN FROM THE CONSTANTS, NOT AS A HAND-DERIVED NUMBER — the whole reason this
+                # bug existed is that three separate comments carried a stale hand-derived slot count.
+                # ⚠ The backlog's suggested form (`argc + envc + 4 > slots`) is OFF BY ONE, too
+                # permissive by exactly one slot, because envc is pre-increment here.
+                if (argc + envc + 5 > (ELF_INIT_STR - ELF_INIT_BLOCK - 8) / 8) { break; }
                 if (str_o + el + 1 >= ELF_STACK_SIZE) { break; }
                 var ek = 0;
                 while (ek < el) { store8(stack_kva +str_o + ek, load8(env_src + es + ek)); ek = ek + 1; }
@@ -595,6 +661,9 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     # Closes the mid-load window where proc_create_full's premature state=1 let a woken AP pick a proc
     # whose CR3/selectors weren't wired yet.
     var new_pid = proc_create_user(entry, stack_top);
+    # ⛔ 1.56.52 — see the matching note in elf_load: a full process table made this drop the whole
+    # populated address space with no pid to reap it. stack_canary_check still runs on the way out.
+    if (new_pid < 0) { proc_free_address_space(new_cr3); stack_canary_check(canary); return new_pid; }
     if (new_pid >= 0) {
         proc_set_cr3(new_pid, new_cr3);
         # 1.56.47: record the basename so `proclist #99` can name this process.

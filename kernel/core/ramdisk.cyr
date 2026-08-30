@@ -89,6 +89,10 @@ fn ramdisk_init() {
 
 fn ramdisk_blk_read(sector, buf) {
     if (ramdisk_active == 0) { return 0 - 1; }
+    # ⛔ 1.56.52 — A LOWER BOUND TOO. Cyrius comparisons are SIGNED, so a NEGATIVE sector passed
+    # `sector >= ramdisk_capacity` and then indexed `&ramdisk_pages + (sector >> 3) * 8` at a negative
+    # displacement — an out-of-bounds load of a page pointer, followed by a 512-byte copy through it.
+    if (sector < 0) { return 0 - 1; }
     if (sector >= ramdisk_capacity) { return 0 - 1; }
     var page = load64(&ramdisk_pages + (sector >> 3) * 8);
     var off  = (sector & 7) * 512;
@@ -100,6 +104,10 @@ fn ramdisk_blk_read(sector, buf) {
 
 fn ramdisk_blk_write(sector, buf) {
     if (ramdisk_active == 0) { return 0 - 1; }
+    # ⛔ 1.56.52 — A LOWER BOUND TOO. Cyrius comparisons are SIGNED, so a NEGATIVE sector passed
+    # `sector >= ramdisk_capacity` and then indexed `&ramdisk_pages + (sector >> 3) * 8` at a negative
+    # displacement — an out-of-bounds load of a page pointer, followed by a 512-byte copy through it.
+    if (sector < 0) { return 0 - 1; }
     if (sector >= ramdisk_capacity) { return 0 - 1; }
     var page = load64(&ramdisk_pages + (sector >> 3) * 8);
     var off  = (sector & 7) * 512;
@@ -119,7 +127,14 @@ fn ramdisk_blk_flush() {
 
 fn ramdisk_blk_read_sectors(start, count, buf) {
     if (ramdisk_active == 0) { return 0 - 1; }
-    if (start + count > ramdisk_capacity) { return 0 - 1; }
+    # ⛔ 1.56.52 — `start + count` CAN WRAP, and the compare that consumed it is signed, so a large
+    # positive count produced a negative sum that passed. Bound each operand first, then subtract:
+    # once start is in [0, capacity], `ramdisk_capacity - start` is in [0, capacity] and cannot wrap,
+    # so the last compare is exact for every 64-bit count. Same operand-wise shape blk_read_sys uses.
+    if (start < 0)  { return 0 - 1; }
+    if (count <= 0) { return 0 - 1; }
+    if (start > ramdisk_capacity) { return 0 - 1; }
+    if (count > ramdisk_capacity - start) { return 0 - 1; }
     for (var i = 0; i < count; i = i + 1) {
         var r = ramdisk_blk_read(start + i, buf + i * 512);
         if (r != 0) { return 0 - 1; }

@@ -1513,7 +1513,9 @@ fn pd510_tick_watch() {
     return 0;
 }
 fn epp_hex(v) {
-    var b[16];                      # fn-local var[N] = N BYTES; 16 hex digits exactly
+    var b[24];                      # fn-local var[N] = N BYTES. 1.56.52: was [16] with the comment
+                                    # "16 hex digits exactly" — which is precisely the off-by-one:
+                                    # fmt_hex_buf also writes the NUL at buf[len], so 16 digits need 17.
     if (v == 0) { klug_append("0", 1); return 0; }
     # ⛔ fmt_hex_buf emits ZERO CHARACTERS for a value with BIT 63 SET (a PDE with NX is
     # 0x8000000000000087). That renders as an empty field, identical to the zero case, and is how
@@ -1916,7 +1918,13 @@ fn sys_mmap(length) {
             # 1.49.12: zero via the kernel access handle — identity <=256 MB, direct-map above.
             var kva = pmm_kva_for_access(phys);
             memset(kva, 0, 0x200000);               # zero-fill (anonymous contract)
-            proc_map_page_nx(cr3, base_vaddr + i * 0x200000, phys);
+            # 1.56.52: proc_map_page_nx's return was DISCARDED. It returns -1 when ptw_pd_kva(cr3)
+            # fails, and `phys` would then be neither mapped nor freed — unreachable from any PDE, so
+            # proc_free_address_space's sweep cannot reclaim it at exit either. Permanent 2 MB loss.
+            if (proc_map_page_nx(cr3, base_vaddr + i * 0x200000, phys) != 0) {
+                pmm_free_2mb(phys);
+                return 0;
+            }
         }
         return base_vaddr;
     }
@@ -1928,7 +1936,21 @@ fn sys_mmap(length) {
         if (hphys == 0) { return 0; }
         var hkva = pmm_kva_for_access(hphys);       # direct-map handle for the >256 MB zero-fill
         memset(hkva, 0, 0x200000);
-        if (proc_map_page_hi(cr3, hbase + j * 0x200000, hphys) != 0) { return 0; }   # on-demand PDPT+PD
+        # ⛔ 1.56.52 — FREE THE PAGE BEFORE BAILING. This was a bare `return 0`, so `hphys` was
+        # allocated and then dropped: never installed in any PDE, therefore invisible to
+        # proc_free_address_space's PDPT[128..511] sweep (which only reclaims PRESENT+USER entries),
+        # therefore lost until reboot. 2,097,152 bytes per failed call.
+        # ⚠ AND IT IS DETERMINISTICALLY REACHABLE FROM RING 3, because the two allocators have
+        # different ceilings: proc_map_page_hi's on-demand branch needs a 4 KB PD from pmm_alloc,
+        # which scans only up to pmm_alloc_top (hard-clamped to 65535 = 256 MB), while pmm_alloc_2mb
+        # scans the FULL RAM pool. So a process that first consumes every 2 MB region below 256 MB
+        # makes pmm_alloc fail while pmm_alloc_2mb keeps succeeding — every subsequent high mmap then
+        # allocates 2 MB, fails to map it, and leaks it. Unprivileged, unbounded, needs no crafted
+        # input, and syscall 27 has no gating.
+        if (proc_map_page_hi(cr3, hbase + j * 0x200000, hphys) != 0) {
+            pmm_free_2mb(hphys);
+            return 0;
+        }
     }
     return hbase;
 }
@@ -1943,8 +1965,32 @@ fn sys_mmap(length) {
 # Returns 0 on success, -1 on a bad request. See mmap-prior-art.md § 7.
 fn sys_munmap(addr, length) {
     if ((addr & 0x1FFFFF) != 0) { return 0 - 1; }            # not 2 MB-aligned
+    # ⛔⛔ 1.56.52 — `length` HAD NO INGRESS CAP AND THE CEILING TESTS BELOW WRAPPED. Cyrius has only
+    # i64 and every comparison is SIGNED. sys_mmap caps its length (`length > 0x1000000000`); this
+    # function did not, so `len` could be made huge-but-positive and `addr + len` could be made
+    # NEGATIVE, which sails through a signed `> ceiling` test.
+    # Worked example, both values ring-3 supplied through syscall 28 with no other validation:
+    #   length = 0x7FFFFFFFFFD00000 → +0x1FFFFF = 0x7FFFFFFFFFEFFFFF → masked len =
+    #   0x7FFFFFFFFFE00000 (positive, so the `len < 0x200000` floor does not fire)
+    #   addr = 0x10000000 → addr + len = 0x800000000FE00000, i.e. -9223372032825982976 as i64
+    #   ⇒ `(addr + len) > 0x40000000` is FALSE and the request is ACCEPTED.
+    # npages = 4,398,046,511,103. The loop's `pd_idx = (vaddr >> 21) & 0x1FF` then simply CYCLES, so
+    # it walks off the arena into the KERNEL IDENTITY window: at i = 385 pd_idx is 1 → PD[1] =
+    # 0x200000|0x83, and the free site tested ONLY the present bit, so pmm_free_2mb(0x200000) marked
+    # physical 2-4 MB — the SYSCALL kstack, the boot TSS RSP0 seeds — FREE WHILE LIVE. i = 386..511
+    # does the same for 4 MB..256 MB (proc_create_address_space seeds PD[0..127] from the boot PD and
+    # re-asserts PD[8..127] as `(hi * 0x200000) | 0x83`). proc_unmap_page correctly refuses to CLEAR a
+    # supervisor PDE, so the mappings survive — only the ALLOCATOR'S RECORD of them is destroyed, and
+    # pmm_alloc then hands those live frames to the next caller. The loop then spins ~4.4e12 more
+    # iterations with IF=0, so the box is wedged as well. Two integers, no privilege.
+    # ⚠ The high arm below had the identical unguarded compare; it did not corrupt only because
+    # proc_unmap_2mb_hi refuses a non-user PDE — which is exactly the guard the low arm lacked.
+    if (length < 0) { return 0 - 1; }                        # negative length is never legitimate
+    if (length > 0x1000000000) { return 0 - 1; }             # 64 GB, mirroring sys_mmap's cap
     var len = (length + 0x1FFFFF) & 0xFFFFFFFFFFE00000;       # round up to 2 MB
     if (len < 0x200000) { len = 0x200000; }
+    if (addr < 0) { return 0 - 1; }                          # signed-compare hygiene, as above
+    if (addr + len < addr) { return 0 - 1; }                 # belt-and-braces wrap check (is_user_range idiom)
     var cr3 = proc_get_cr3(proc_current_get());
     if (cr3 == 0) { return 0 - 1; }
     var npages = len / 0x200000;
@@ -1970,7 +2016,15 @@ fn sys_munmap(addr, length) {
     # LOW arena [256 MB, 1 GB) — the original path (the whole low arena shares one
     # 0-1 GB PD, so walk PML4 -> PDPT[0] -> PD once).
     if (addr < 0x10000000) { return 0 - 1; }                  # below the arena
-    if ((addr + len) > 0x40000000) { return 0 - 1; }          # past the low ceiling
+    # ⛔ 1.56.52 — 0x3FA00000, NOT 0x40000000. sys_mmap's low arena stops at 0x3FA00000 (the constant
+    # it bump-checks against), chosen to sit below the FIXED user stack at 0x3FC00000. This ceiling
+    # was 0x40000000, so the 6 MB gap [0x3FA00000, 0x40000000) — PD slots 509 (the loader's guard
+    # page), 510 (THE USER STACK) and 511 (the user-CR3 stash) — was inside the range ring 3 could
+    # name. `munmap(0x3FC00000, 0x200000)` read PD[510] = stack_phys|0x8000000000000087, saw the
+    # present bit, and freed the process's own live stack page. Nothing legitimate is lost by
+    # lowering it: sys_mmap never returns a low base at or above 0x3FA00000, so no honest munmap can
+    # name that span.
+    if ((addr + len) > 0x3FA00000) { return 0 - 1; }          # the arena's REAL top (see sys_mmap)
     var pd_kva = ptw_pd_kva(cr3);                             # 1.56.51: direct-map walk
     if (pd_kva == 0) { return 0 - 1; }
     var flush = 0;
@@ -1978,7 +2032,12 @@ fn sys_munmap(addr, length) {
         var vaddr = addr + i * 0x200000;
         var pd_idx = (vaddr >> 21) & 0x1FF;
         var entry = load64(pd_kva + pd_idx * 8);
-        if ((entry & 1) != 0) {                               # present -> unmap + free
+        # ⛔ 1.56.52 — THE USER BIT IS REQUIRED, NOT JUST PRESENT. proc_unmap_2mb_hi has always
+        # carried this guard ("not user — never free a kernel page") and proc_unmap_page refuses to
+        # CLEAR a supervisor PDE; the FREE here had neither, so any present kernel-identity PDE the
+        # index arithmetic reached was handed to pmm_free_2mb. The caps above make that unreachable;
+        # this is the defence in depth that keeps a future arithmetic slip from being catastrophic.
+        if ((entry & 1) != 0 && (entry & 0x04) != 0) {        # present AND user -> unmap + free
             var phys = entry & 0x000FFFFFFFE00000;
             proc_unmap_page(cr3, vaddr);                      # clears kernel + KPTI user PD
             flush = vaddr;

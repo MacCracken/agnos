@@ -292,6 +292,21 @@ fn vblk_setup_queue_0() {
     store16(vblk_common_cfg + VBLK_QUEUE_SEL, 0);
     vblk_qsize = load16(vblk_common_cfg + VBLK_QUEUE_SIZE);
     if (vblk_qsize == 0) { return 0 - 1; }
+    # ⛔ 1.56.52 — THE DEVICE'S queue_size WAS TRUSTED WITH ONLY A ZERO CHECK, while each ring gets
+    # exactly ONE 4 KB page. The comment below already asserts the 256 invariant; nothing enforced it.
+    # The used ring is the binding constraint: 6 + 8N <= 4096 gives N <= 511, and split rings require a
+    # power of two, so 256 is the ceiling. The spec permits up to 32768 — at N = 512 the descriptor
+    # table alone is 8192 B, double its page. QUEUE_SIZE is READ-WRITE in modern virtio (1.2 §4.1.4.3),
+    # so shrink it, then RE-READ rather than assuming the write took, and refuse if the device will not
+    # comply. Failing init is right: the block layer treats -1 as "no virtio backend" and NVMe/AHCI/USB
+    # still register, so the box boots.
+    if (vblk_qsize > 256) {
+        store16(vblk_common_cfg + VBLK_QUEUE_SIZE, 256);
+        vblk_qsize = load16(vblk_common_cfg + VBLK_QUEUE_SIZE);
+    }
+    if (vblk_qsize > 256) { return 0 - 1; }                          # device refused the shrink
+    if (vblk_qsize == 0) { return 0 - 1; }                           # the re-read can come back 0
+    if ((vblk_qsize & (vblk_qsize - 1)) != 0) { return 0 - 1; }      # split rings must be a power of two
 
     # Allocate three pages for desc / avail / used. Each is page-aligned
     # by pmm_alloc and fits in one 4 KB page for queue_size up to 256

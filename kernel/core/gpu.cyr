@@ -7571,9 +7571,12 @@ fn gpu_texl_build(pkva, n_prims, pitch) {
     gpu_texl_maxh = 0;
     gpu_texl_colmajor = 0;
     # ⚠ -1 until primitive 0 sets it. The validator already refuses a mixed list, so this pass agreeing
-    # with it is belt-and-braces — but the belt is load-bearing: gpo_execute reaches the dispatch with
-    # no gpo_validate in front of it on at least one shipping in-tree path, and a driver that sampled
-    # only primitive 0 would silently DISCARD a later primitive's flag rather than refuse.
+    # with it is belt-and-braces — but the belt is load-bearing, and a driver that sampled only
+    # primitive 0 would silently DISCARD a later primitive's flag rather than refuse.
+    # ⚠ 1.56.52: this used to say gpo_execute "reaches the dispatch with no gpo_validate in front of
+    # it on at least one shipping in-tree path". It now re-runs gpo_texlist_prims_ok on a per-CPU
+    # SNAPSHOT of the primitive array immediately before calling in here, so `pkva` is kernel-private
+    # by the time this function reads it — which is what closed the op-0x0C TOCTOU. The belt stays.
     var lcm = 0 - 1;
     var i = 0;
     while (i < n_prims) {

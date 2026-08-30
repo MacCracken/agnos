@@ -6,9 +6,26 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-08-29 (**1.56.51 audit-backlog first pass** — see the 2026-08-29 block; the 2026-08-28 block below it records the sweep that produced the backlog). **⛔ THE MULTI-MINOR LAG HAPPENED A THIRD TIME, AND THIS FILE PREDICTED IT TWICE.** The ledger sat at **v1.44.9** from 2026-06-10 to 2026-08-28 — **~12 minors** (1.45.x net/server, 1.46.x SMP, 1.47.x-1.49.x, 1.50.x-1.53.x, the 1.54.x-1.56.x GPU/display/shader arcs) — with state.md/roadmap/CHANGELOG kept per-cut and the body docs un-swept, which is verbatim the failure the two notes below describe. The stated fix ("fold a doc-health touch into the cycle-OPEN sweep") was never adopted. ⚠ **This refresh is NOT that catch-up sweep** — it records only what 1.56.51 actually touched. The body docs (`README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`) remain unswept since 1.44.9 and their syscall counts, sizes and subsystem tables should be assumed stale — the surface has since grown to **0-101**.
+> **Last refresh**: 2026-08-29 (**1.56.52 — both audit P0s closed** — see the 2026-08-29 block; the 2026-08-28 block below it records the sweep that produced the backlog). **⛔ THE MULTI-MINOR LAG HAPPENED A THIRD TIME, AND THIS FILE PREDICTED IT TWICE.** The ledger sat at **v1.44.9** from 2026-06-10 to 2026-08-28 — **~12 minors** (1.45.x net/server, 1.46.x SMP, 1.47.x-1.49.x, 1.50.x-1.53.x, the 1.54.x-1.56.x GPU/display/shader arcs) — with state.md/roadmap/CHANGELOG kept per-cut and the body docs un-swept, which is verbatim the failure the two notes below describe. The stated fix ("fold a doc-health touch into the cycle-OPEN sweep") was never adopted. ⚠ **This refresh is NOT that catch-up sweep** — it records only what 1.56.51 actually touched. The body docs (`README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`) remain unswept since 1.44.9 and their syscall counts, sizes and subsystem tables should be assumed stale — the surface has since grown to **0-101**.
 >
-> ### 2026-08-29 — the audit-backlog first pass (still inside the open 1.56.51 cut)
+> ### 1.56.52 (2026-08-29) — both audit P0s closed, plus a finding that was in no backlog
+>
+> ✅ **`CHANGELOG.md`** — full 1.56.52 arc: the TSS I/O-map escalation, the `sys_munmap` P0, the `#92`
+> TOCTOU, the ELF loader leaks, the `kfmt` interlocked pair, the init-stack widening, the device-trust
+> batch (virtio ×2, ramdisk, xHCI interval, ACPI S5), and the W+X mapper removal.
+> ✅ **`issues/2026-08-28-p1-audit-sweep-backlog.md`** — a 1.56.52 STATUS block recording that a second
+> pass RE-GRADED the P2 list and found a P0 in it, that `gdt.cyr:82` was in no backlog at all, and that
+> two of the audit's own suggested fixes were wrong (the `blk` reorder is an ABI break; the init-stack
+> guard is off by one). Inline ✅ markers extended.
+> ✅ **`docs/development/state.md`** — kernel-head row rewritten, gate count 31/31, and the OPEN section
+> CONSOLIDATED rather than grown (it had crossed the 120-line cap at 125; now exactly 120). New entries:
+> the severity labels are unreliable in both directions; three 1.56.52 fixes are asserted-not-exercised;
+> op 0x0C is still not SMP-safe; kernel structures are direct-map addressed now.
+> ✅ **`docs/development/roadmap.md`** — backlog row re-counted, both P0s marked closed.
+> ✅ **NEW `scripts/check/check-initstack.sh`** — the init-stack extent gate; `check.sh` is now 31 gates.
+> 🟠 **Body docs still unswept** — unchanged since 1.44.9; the debt below stands.
+>
+> ### 2026-08-29 — the audit-backlog first pass (inside the 1.56.51 cut)
 >
 > ✅ **`CHANGELOG.md`** — four new sections under 1.56.51: the P0 identity-shadowing closure, the P1 batch, the two harness gates that could not fail, and the kmalloc consequence. The "Known — not fixed" bullets were reconciled rather than left to rot (the `blk` gate and `#92` entries now say what actually changed).
 > ✅ **`docs/development/issues/2026-08-28-p1-audit-sweep-backlog.md`** — a STATUS block at the top and inline ✅ FIXED / 🟠 PARTIAL markers on 19 entries, so the file reports what remains instead of what was once true. Section headings carry running counts.

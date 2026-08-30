@@ -233,6 +233,18 @@ fn vnet_setup_queue(q_idx, qsize_out, desc_out, avail_out, used_out, notify_out)
     store16(vnet_common_cfg + VNET_QUEUE_SEL, q_idx);
     var qsz = load16(vnet_common_cfg + VNET_QUEUE_SIZE);
     if (qsz == 0) { return 0 - 1; }
+    # ⛔ 1.56.52 — same unbounded-queue_size defect as virtio_blk: each ring gets one 4 KB page, so
+    # N = 512 overruns both the descriptor table (8192 B) and the used ring (4102 B). QUEUE_SIZE is RW,
+    # so clamp, re-read, and refuse a device that will not comply.
+    # ⚠ The LOW bound matters here specifically: vnet_rx_prime publishes 16 avail entries
+    # unconditionally, so a queue smaller than 16 would write past the avail ring on its own.
+    if (qsz > 256) {
+        store16(vnet_common_cfg + VNET_QUEUE_SIZE, 256);
+        qsz = load16(vnet_common_cfg + VNET_QUEUE_SIZE);
+    }
+    if (qsz > 256) { return 0 - 1; }
+    if (qsz < 16)  { return 0 - 1; }
+    if ((qsz & (qsz - 1)) != 0) { return 0 - 1; }
 
     var p1 = pmm_alloc();
     var p2 = pmm_alloc();
@@ -436,15 +448,25 @@ fn virtio_net_poll(buf, maxlen) {
     asm { 0x0F; 0xAE; 0xF0; }
 
     var slot = vnet_rx_used_last % vnet_rx_qsize;
-    var entry_off = vnet_rx_used + 4 + slot * 8;
     var desc_id = load32(vnet_rx_used + 4 + slot * 8);
     var pkt_len = load32(vnet_rx_used + 4 + slot * 8 + 4);
     vnet_rx_used_last = vnet_rx_used_last + 1;
+
+    # ⛔ 1.56.52 — desc_id AND pkt_len COME FROM THE DEVICE AND WERE BOTH TRUSTED. `buf_off =
+    # desc_id * 1536` indexes a 16-slot RX buffer, so any desc_id the device invents reads at an
+    # arbitrary displacement from it; and pkt_len bounded only the copy against the CALLER's maxlen,
+    # never against the 1536-byte slot the data actually lives in.
+    # ⚠ Consume-then-drop, not retry: vnet_rx_used_last has already advanced above, so a bad entry is
+    # discarded rather than spun on. Not re-arming costs one of the 16 RX buffers, which is the right
+    # trade against a device that just lied.
+    if (desc_id < 0)  { store16(vnet_rxq_notify, 0); return 0; }
+    if (desc_id > 15) { store16(vnet_rxq_notify, 0); return 0; }
 
     # Strip the 12-byte modern virtio-net header.
     var hdr_len = 12;
     var data_len = pkt_len - hdr_len;
     if (data_len < 0) { data_len = 0; }
+    if (data_len > 1524) { data_len = 1524; }   # the 1536-byte slot minus the 12-byte header
     if (data_len > maxlen) { data_len = maxlen; }
 
     var buf_off = desc_id * 1536;

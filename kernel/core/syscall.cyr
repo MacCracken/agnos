@@ -517,7 +517,10 @@ fn fault_kill_current(vector) {
     # under every per-proc CR3; the same property that makes it safe at the earliest boot makes it
     # safe here. Read it after the box survives: `run /bin/klug > /f.txt`.
     # ⚠ CR2 is valid until the NEXT page fault, so it must be read here, before anything else runs.
-    var fk_hex[16];                                   # fn-local var[N] = N BYTES; 16 hex digits exactly
+    var fk_hex[24];   # 1.56.52: was [16] "16 hex digits exactly" — fmt_hex_buf also writes the NUL at
+                      # buf[len], so 16 digits need 17 bytes. Measured: in a frame without the
+                      # 16-alignment pad the 17th byte lands on `code`, so a #PF-killed proc would
+                      # have reported exit 0 (clean success) instead of 142.                                   # fn-local var[N] = N BYTES; 16 hex digits exactly
     var fk_n = 0;
     klug_append("fault: pid=", 11);
     fk_n = fmt_hex_buf(pid, &fk_hex);       klug_append(&fk_hex, fk_n);
@@ -1831,6 +1834,53 @@ var GPO_E_DRANGE   = 34;             # op    — D or N exceeds its lane at a dr
 # ⚠ Codes 9/10/14 are deliberate gaps; 35 is the next free number. Packed as `(i << 8) | e`, so any
 # value under 256 is representable.
 var GPO_E_ARANGE   = 35;             # op    — BLEND_ALPHA alpha outside 0..255
+# ⭐ 1.56.52 — the slot's contents changed between validation and use, or the slot itself was freed or
+# shrunk. Ring-3-observable in the same packed `-((idx << 8) | reason)` encoding as every other code
+# (36 < 256, so nothing about the encoding moves), and additive — gpu_caps#89's op-support mask is
+# untouched. Distinct from GPO_E_TRILIST on purpose: a caller that gets this back did NOT send a
+# malformed list, something rewrote the slot underneath it.
+var GPO_E_RACE     = 36;             # op    — slot mutated between validate and use (TOCTOU refusal)
+
+# ⛔⛔ 1.56.52 — THE #92 op 0x0C SNAPSHOT WINDOW. Pass 1 validates the per-primitive array in the shm
+# slot; pass 2's gpu_texl_build then RE-READS every field from that same slot and derives the
+# per-primitive DESTINATION BYTE OFFSET from the second read. The slot stays ring-3-writable
+# throughout: shm_write#72 permits cross-owner writes BY DESIGN (shm_note_xown only counts, it
+# refuses nothing), and with smp_sched_aps=1 a second CPU can rewrite it between the two passes.
+# ⛔ AND NOTHING DOWNSTREAM CLIPS. The shader applies no framebuffer bound at all — the per-primitive
+# px/py check in gpo_texlist_prims_ok IS the only thing bounding the write, so a px/py rewritten after
+# validation lands wherever the arithmetic says. On the 2560x1440 verification host (pitch 10240) a
+# single primitive with pw=1, ph=39323, px=0, py=65535 reaches past the back buffer into the GPU
+# compute arena at 0x80000000 — the ring buffer, the MQD and every resident shader blob — and still
+# passes the launched-wave cap.
+# ⚠ REACHABLE ON IRON ONLY: gpu_texl_arm refuses when gpu_present == 0, so under QEMU op 0x0C never
+# dispatches. The EDGE_ABI battery is therefore the only place this fix can be exercised at all,
+# which is exactly why the staging region is allocated unconditionally at boot rather than behind a
+# gpu_present gate — a gate there would make both the fix and its test dead code.
+# ⚠ ONE 2 MB REGION, TAKEN ONCE AT BOOT, SLICED PER-CPU. Not a static array: 4 x 512 x 96 = 196,608 B
+# of .bss against ~130 KB of headroom under check.sh's hard 2 MiB ceiling. Not lazily allocated
+# either — a first-touch pmm_alloc_2mb inside gpo_execute would scan the PMM mid-batch with IF
+# masked, and a sticky "allocation failed" latch would let any ring-3 process permanently disable the
+# compositor's fast path by arranging one unlucky moment. Boot time is single-threaded, so there is
+# no init race and nothing to latch.
+var GPU_TEXL_STAGE_STRIDE = 65536;   # per-CPU window; 512 * 96 = 49,152 rounded up
+var gpu_texl_stage_kva = 0;          # direct-map VA of the staging region, 0 = unavailable
+
+fn gpu_texl_stage_init() {
+    if (gpu_texl_stage_kva != 0) { return 1; }
+    var p = pmm_alloc_2mb();
+    if (p == 0) { return 0; }
+    # ⚠ DIRECT MAP, never the raw pmm_alloc_2mb result — dereferencing a physical address as a
+    # virtual one is the ring-3 -> arbitrary-kernel-write class closed at 1.56.51 (proc.cyr's
+    # ptw_pd_kva header).
+    gpu_texl_stage_kva = pmm_kva_for_access(p);
+    return 1;
+}
+
+# THIS CPU's 64 KB slice, or 0 if the region was never obtained.
+fn gpo_texl_stage_base() {
+    if (gpu_texl_stage_kva == 0) { return 0; }
+    return gpu_texl_stage_kva + pcpu_cpu() * GPU_TEXL_STAGE_STRIDE;
+}
 var GPO_E_TRILIST  = 24;             # op    — triangle count/slot invalid, or a per-triangle record is
 var GPU_COV_MAX_DIM = 4096;          # per-side mask cap — a REJECT, never a clamp
 # ⭐ THE COORDINATE DOMAIN (B3). 2^28 = 4096 px in 16.16 — the same 4096 as GPU_COV_MAX_DIM, so
@@ -1989,8 +2039,15 @@ fn gpo_lane_bad(v) {
 # ⛔ EVERY TRIANGLE IS VALIDATED BEFORE ANY IS DRAWN. A batch that validates lazily would draw the
 # first k triangles and then refuse, leaving the framebuffer in a state neither the caller nor the
 # kernel can describe. Reject-don't-clip is only enforceable if the whole batch is checked first.
-# ⚠ PURE READS on the KERNEL-RESIDENT record and on the slot's kernel VA. Ring 3 cannot change a
-# field between the check and the use.
+# ⚠ PURE READS on the KERNEL-RESIDENT record — that half is true: the 64-byte op records were
+# proc_copy_from_user'd into a per-CPU kernel buffer and ring 3 cannot touch them again.
+# ⛔ 1.56.52 — THE OTHER HALF WAS FALSE AND LOAD-BEARING. This used to end "...and on the slot's
+# kernel VA. Ring 3 cannot change a field between the check and the use." The SLOT is not immutable:
+# shm_write#72 permits cross-owner writes by design (shm_note_xown counts and refuses nothing), and
+# under smp_sched_aps=1 another CPU can rewrite it between pass 1 and pass 2. That sentence was the
+# stated reason no re-check existed. What makes the bound hold now is the pass-2 SNAPSHOT in
+# gpo_execute's GPU_OP_TEX_LIST arm, which copies the array into a per-CPU kernel window, re-runs
+# gpo_texlist_prims_ok on the COPY, and builds only from the copy.
 # gpo_validate_tritex — rung 13's ABI gate. Returns 0 or a GPO_E_*.
 #
 # ⛔ EVERY REJECT HERE IS A REJECT, NEVER A CLAMP. A silently clamped texture dimension reads back as
@@ -2006,37 +2063,21 @@ fn gpo_lane_bad(v) {
 # malformed entry out of 512 reach the shader, and the shader has no way to refuse — it would fetch
 # from a bad slot address at dispatch time, which on this silicon is a wedged queue with no pointer
 # back to the caller. The cost is a bounded pass over the array before anything is dispatched.
-fn gpo_validate_texlist(rec, fbw, fbh) {
-    if ((load32(rec + 4) & 0xFFFFFFFF) != 0) { return GPO_E_RESERVED; }   # header flags: none defined
-
-    var wh  = load32(rec + 16) & 0xFFFFFFFF;
-    var dxy = load32(rec + 20) & 0xFFFFFFFF;
-    var w = wh & 0xFFFF;
-    var h = (wh >> 16) & 0xFFFF;
-    if (w < 1) { return GPO_E_DIM; }
-    if (h < 1) { return GPO_E_DIM; }
-    if (w * h > GPU_TRI_MAX_PIXELS) { return GPO_E_WORK; }
-    var dx = dxy & 0xFFFF;
-    var dy = (dxy >> 16) & 0xFFFF;
-    if (dx + w > fbw) { return GPO_E_DIM; }
-    if (dy + h > fbh) { return GPO_E_DIM; }
-
-    var np = load32(rec + 24) & 0xFFFFFFFF;
-    if (np < 1) { return GPO_E_TRILIST; }
-    if (np > GPU_TEX_LIST_MAX) { return GPO_E_TRILIST; }
+# gpo_texlist_prims_ok(pkva, np, fbw, fbh, pid) -> 0 or a GPO_E_*.
+#
+# ⭐ 1.56.52 — EXTRACTED FROM gpo_validate_texlist SO ONE IMPLEMENTATION SERVES BOTH PASSES. Pass 1
+# calls it on the live shm slot (the ABI's reject-the-whole-batch-before-drawing-anything gate);
+# pass 2 calls it again on a KERNEL-PRIVATE SNAPSHOT of that slot, which is what makes the bytes it
+# validated and the bytes gpu_texl_build reads provably the same bytes. See the TOCTOU note at the
+# GPU_OP_TEX_LIST arm in gpo_execute.
+# ⚠ Pure extraction — no check was added, removed or reordered, so the #92 battery score is unmoved.
+fn gpo_texlist_prims_ok(pkva, np, fbw, fbh, pid) {
     var lmaxw = 0;
     var lmaxh = 0;
     # The list's lane axis, latched from primitive 0 and required to hold for every other primitive.
     # -1 = not yet seen. ⚠ Latched INSIDE the loop, not read ahead of it, so the primitive that sets
     # the mode is the same one the bounds checks above have already vetted.
     var lcm = 0 - 1;
-
-    var pid = load32(rec + 12) & 0xFFFFFFFF;
-    if (shm_slot_valid(pid) == 0) { return GPO_E_TRILIST; }
-    var pslot = pid - 1;
-    var pkva = load64(&shm_kva + pslot * 8);
-    if (pkva == 0) { return GPO_E_TRILIST; }
-    if (load64(&shm_size + pslot * 8) < np * GPU_TEX_PRIM_BYTES) { return GPO_E_TRILIST; }
 
     # ---- every primitive, in bounds and resolvable -------------------------------------
     var i = 0;
@@ -2051,9 +2092,16 @@ fn gpo_validate_texlist(rec, fbw, fbh) {
         var pxy = load32(b + 4) & 0xFFFFFFFF;
         var px = pxy & 0xFFFF;
         var py = (pxy >> 16) & 0xFFFF;
+        # ⛔⛔ THIS PAIR IS THE ONLY THING BOUNDING THE WRITE. 1.56.52 — the line that used to close
+        # this comment, "The shader clips to the union anyway", is FALSE: gpu_tex_list states that the
+        # union rect never reaches the shader, and the shipped prologue (modelled in
+        # tests/gpu/texlist.cyr) computes dst = bb + dst_off[prim] + py*pitch + px*4 with only
+        # px >= pw / py >= ph lane skips — no framebuffer clamp anywhere. So there is no second line
+        # of defence behind these two checks, and gpu_texl_build derives each primitive's destination
+        # byte offset from px/py directly.
         # ⚠ Bounded by the FRAMEBUFFER, not by the union rect. A primitive outside the union is a
         # caller error, but it is not a SAFETY error, and rejecting it here would make the union a
-        # second thing to compute correctly. The shader clips to the union anyway.
+        # second thing to compute correctly.
         if (px + pw > fbw) { return GPO_E_DIM; }
         if (py + ph > fbh) { return GPO_E_DIM; }
         if (pw > lmaxw) { lmaxw = pw; }
@@ -2146,6 +2194,35 @@ fn gpo_validate_texlist(rec, fbw, fbh) {
     while ((1 << lt) < ltiles) { lt = lt + 1; }
     if ((np << lt) * lrows > GPU_TEXL_MAX_WAVES) { return GPO_E_WORK; }
     return 0;
+}
+
+fn gpo_validate_texlist(rec, fbw, fbh) {
+    if ((load32(rec + 4) & 0xFFFFFFFF) != 0) { return GPO_E_RESERVED; }   # header flags: none defined
+
+    var wh  = load32(rec + 16) & 0xFFFFFFFF;
+    var dxy = load32(rec + 20) & 0xFFFFFFFF;
+    var w = wh & 0xFFFF;
+    var h = (wh >> 16) & 0xFFFF;
+    if (w < 1) { return GPO_E_DIM; }
+    if (h < 1) { return GPO_E_DIM; }
+    if (w * h > GPU_TRI_MAX_PIXELS) { return GPO_E_WORK; }
+    var dx = dxy & 0xFFFF;
+    var dy = (dxy >> 16) & 0xFFFF;
+    if (dx + w > fbw) { return GPO_E_DIM; }
+    if (dy + h > fbh) { return GPO_E_DIM; }
+
+    var np = load32(rec + 24) & 0xFFFFFFFF;
+    if (np < 1) { return GPO_E_TRILIST; }
+    if (np > GPU_TEX_LIST_MAX) { return GPO_E_TRILIST; }
+
+    var pid = load32(rec + 12) & 0xFFFFFFFF;
+    if (shm_slot_valid(pid) == 0) { return GPO_E_TRILIST; }
+    var pslot = pid - 1;
+    var pkva = load64(&shm_kva + pslot * 8);
+    if (pkva == 0) { return GPO_E_TRILIST; }
+    if (load64(&shm_size + pslot * 8) < np * GPU_TEX_PRIM_BYTES) { return GPO_E_TRILIST; }
+
+    return gpo_texlist_prims_ok(pkva, np, fbw, fbh, pid);
 }
 
 fn gpo_validate_tritex(rec, fbw, fbh) {
@@ -3210,7 +3287,7 @@ fn edge_abi_selftest() {
     # is REACHED — the answer must be GPO_E_ARM (no GPU in this environment), never GPO_E_BADOP.
     # ⚠ Safe to call here: gpu_texl_arm() checks gpu_present FIRST and returns 0, so nothing is
     # dispatched and no hardware is touched.
-    var xr = gpo_execute(&d);
+    var xr = gpo_execute(&d, 2560, 1440);   # same geometry ea_expect validates against
     if (xr == GPO_E_ARM) {
         kprint("edge-abi: PASS texl: the EXECUTOR branch is reached (GPO_E_ARM)\n", 64);
         pass = pass + 1;
@@ -3387,6 +3464,60 @@ fn edge_abi_selftest() {
     store32(&d +  8, 1);
     pass = pass + ea_expect(&d, GPO_E_RESERVED, "texl: reserved dword must be zero", 33);
     store32(&d +  8, 0);
+
+
+    # ⛔⛔ 1.56.52 — THE TOCTOU CASES. These are the ONLY test that can ever exercise the op-0x0C
+    # snapshot: gpu_texl_arm refuses when gpu_present == 0, so on QEMU nothing else reaches
+    # gpo_execute's TEX_LIST arm at all, and the bug itself is live only on iron. Each case mutates
+    # the primitive array AFTER gpo_validate has accepted it — exactly what a second CPU does through
+    # shm_write#72 between the two passes — and demands GPO_E_RACE rather than a dispatch.
+    # ⚠ The record stays well-formed throughout; only the SLOT changes. That is the whole point: a
+    # test that also broke the record would be proving the pass-1 validator, which already worked.
+
+    # (a) px/py rewritten past the framebuffer — the case that reaches the GPU compute arena on iron.
+    ea_seed_prim(pb, 0, 14, 0, 8, 8, GPU_TEX_FLAG_FULLCOV, 16, 16, 0, 0);
+    ea_seed_prim(pb, 1, 14, 0, 8, 8, GPU_TEX_FLAG_FULLCOV, 16, 16, 16, 0);
+    pass = pass + ea_expect(&d, 0, "texl: baseline list validates before mutation", 45);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 4, (65535 * 65536) | 65535);   # px=py=65535
+    var mr1 = gpo_execute(&d, 2560, 1440);
+    if (mr1 == GPO_E_RACE) {
+        kprint("edge-abi: PASS texl: px/py rewritten after validation is REFUSED (GPO_E_RACE)\n", 78);
+        pass = pass + 1;
+    }
+    if (mr1 != GPO_E_RACE) {
+        kprint("edge-abi: FAIL texl: post-validation px/py mutation not caught, got ", 68);
+        kprint_num(mr1);
+        kprint("\n", 1);
+    }
+
+    # (b) the texture slot id rewritten to one that is not resolvable.
+    ea_seed_prim(pb, 1, 14, 0, 8, 8, GPU_TEX_FLAG_FULLCOV, 16, 16, 16, 0);
+    store32(pb + 1 * GPU_TEX_PRIM_BYTES + 8, 12);                        # slot 12 is free
+    var mr2 = gpo_execute(&d, 2560, 1440);
+    if (mr2 == GPO_E_RACE) {
+        kprint("edge-abi: PASS texl: tex slot rewritten after validation is REFUSED (GPO_E_RACE)\n", 81);
+        pass = pass + 1;
+    }
+    if (mr2 != GPO_E_RACE) {
+        kprint("edge-abi: FAIL texl: post-validation slot mutation not caught, got ", 67);
+        kprint_num(mr2);
+        kprint("\n", 1);
+    }
+
+    # (c) CONTROL — restore the array and confirm an UNMUTATED list still reaches the executor. A
+    # refusal that fires unconditionally would satisfy (a) and (b) while breaking every real caller,
+    # so the pair is only meaningful with this.
+    ea_seed_prim(pb, 1, 14, 0, 8, 8, GPU_TEX_FLAG_FULLCOV, 16, 16, 16, 0);
+    var mr3 = gpo_execute(&d, 2560, 1440);
+    if (mr3 == GPO_E_ARM) {
+        kprint("edge-abi: PASS texl: an UNMUTATED list still reaches dispatch (GPO_E_ARM)\n", 74);
+        pass = pass + 1;
+    }
+    if (mr3 != GPO_E_ARM) {
+        kprint("edge-abi: FAIL texl: control list refused, got ", 47);
+        kprint_num(mr3);
+        kprint("\n", 1);
+    }
 
     # ⛔ TEARDOWN GOES LAST, AFTER EVERY BATTERY. It used to sit between the 0x08 and 0x0A blocks,
     # so the 0x0A cases ran against slots that had already been zeroed and a well-formed batch was
@@ -3861,12 +3992,16 @@ fn edge_abi_selftest() {
         r = r + 1;
     }
 
+    # ⚠ 167 -> 171 (1.56.52): four op-0x0C TOCTOU cases — a baseline, two post-validation mutations
+    # that must answer GPO_E_RACE, and a CONTROL proving an unmutated list still reaches dispatch.
+    # They are the only test that can exercise the pass-2 snapshot at all, since gpu_texl_arm refuses
+    # when gpu_present == 0 and the bug itself is live only on iron.
     # ⚠ 152 -> 167: fifteen cases added when op 0x06 was minted. Thirteen exercise BLEND_ALPHA; TWO are
     # the first coverage this battery has EVER had of the shared generic tail (ops 0x01-0x04), and they
     # exist because an unguarded range check on dword 9 would have broken aethersafha's chrome text
     # while this line still printed a clean pass.
-    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 167 cases correct\n", 22);
-    if (pass == 167) {
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 171 cases correct\n", 22);
+    if (pass == 171) {
         kprint("edge-abi: PASS -- the 0x01..0x06 and 0x08..0x10 ABIs reject every malformed\n", 76);
         kprint("edge-abi: record, and a well-formed one is accepted or correctly reports no-GPU.\n", 81);
         return 1;
@@ -4366,7 +4501,11 @@ fn gpo_validate(rec, fbw, fbh) {
 }
 
 # gpo_execute(rec) -> 0 or GPO_E_DISPATCH. Runs one already-validated record.
-fn gpo_execute(rec) {
+# ⚠ 1.56.52 — fbw/fbh ARE NOW PARAMETERS, threaded from gpu_shader_op_sys, which already computed
+# them for pass 1. Pass 2 re-validates its snapshot against EXACTLY the bounds pass 1 used, instead
+# of re-deriving them from gpu_bb_pitch/gpu_bb_fbsize — which would both re-introduce a bare divide
+# and let the two passes disagree if the framebuffer geometry moved between them.
+fn gpo_execute(rec, fbw, fbh) {
     var op  = load32(rec + 0)  & 0xFFFFFFFF;
     if (op == GPU_OP_NOP) { return 0; }
     var wh  = load32(rec + 16) & 0xFFFFFFFF;
@@ -4478,9 +4617,31 @@ fn gpo_execute(rec) {
         return 0;
     }
     if (op == GPU_OP_TEX_LIST) {
-        var Lp = load64(&shm_kva + ((load32(rec + 12) & 0xFFFFFFFF) - 1) * 8);
-        var Ln = load32(rec + 24) & 0xFFFFFFFF;
-        if (gpu_tex_list(Lp, Ln, w, h, dx, dy) != 1) { return GPO_E_ARM; }
+        # ⛔⛔ 1.56.52 — STAGE, RE-VALIDATE, THEN BUILD. See the GPO_E_RACE / staging banner for the
+        # mechanism. This arm used to resolve the slot's kernel VA and hand it straight to
+        # gpu_tex_list, which re-read every field and derived each primitive's destination offset from
+        # that SECOND read — so everything pass 1 proved was proved about bytes that could already
+        # have been replaced. It also re-resolved shm_kva without re-checking shm_slot_valid, the
+        # non-zero VA, or the size, so a slot freed (#74) or re-created smaller since pass 1 yielded a
+        # null or undersized pointer.
+        # ⚠ Lid/Ln come from the IMMUTABLE 64-byte record (proc_copy_from_user'd into the per-CPU
+        # buffer); only the ARRAY they name is mutable.
+        var Lid = load32(rec + 12) & 0xFFFFFFFF;
+        var Ln  = load32(rec + 24) & 0xFFFFFFFF;
+        if (Ln < 1) { return GPO_E_TRILIST; }
+        if (Ln > GPU_TEX_LIST_MAX) { return GPO_E_TRILIST; }
+        if (shm_slot_valid(Lid) == 0) { return GPO_E_RACE; }
+        var Ls = Lid - 1;
+        var Lp = load64(&shm_kva + Ls * 8);
+        if (Lp == 0) { return GPO_E_RACE; }
+        if (load64(&shm_size + Ls * 8) < Ln * GPU_TEX_PRIM_BYTES) { return GPO_E_RACE; }
+        var Lst = gpo_texl_stage_base();
+        if (Lst == 0) { return GPO_E_ARM; }             # no staging region — refuse, never dispatch
+        # ⛔ THE SNAPSHOT. Past this line nothing reads the ring-3-writable slot again.
+        memcpy(Lst, Lp, Ln * GPU_TEX_PRIM_BYTES);
+        var Le = gpo_texlist_prims_ok(Lst, Ln, fbw, fbh, Lid);
+        if (Le != 0) { return GPO_E_RACE; }             # the copy failed a check the live slot passed
+        if (gpu_tex_list(Lst, Ln, w, h, dx, dy) != 1) { return GPO_E_ARM; }
         return 0;
     }
     if (op == GPU_OP_TRI_RGBA) {
@@ -4571,7 +4732,7 @@ fn gpu_shader_op_sys(desc_uva, len) {
         i = i + 1;
     }
     gpu_prof_valid_us = gpu_prof_us(t_val);
-    return gpo_execute_all(buf, n);
+    return gpo_execute_all(buf, n, fbw, fbh);
 }
 
 # gpo_execute_all — plan-S12: the WHOLE op array in ONE GPU submission.
@@ -4594,7 +4755,7 @@ fn gpu_shader_op_sys(desc_uva, len) {
 # Emitting cannot fail partway. Pass 1 has already validated every op — bounds, slots, sizes, residency —
 # so pass 2's emitters only put dwords in the ring. That is what makes it safe to leave gpu_batch_active
 # set across the loop: there is no path that aborts mid-array and strands a fenceless partial program.
-fn gpo_execute_all(buf, n) {
+fn gpo_execute_all(buf, n, fbw, fbh) {
     var done_phys = gpu_arena_phys + GPU_BLEND_DONE_SUBOFF;
     var done_mc   = gpu_arena_mc   + GPU_BLEND_DONE_SUBOFF;
     store32(done_phys, GPU_MT_NOTYET);
@@ -4614,7 +4775,7 @@ fn gpo_execute_all(buf, n) {
     var err = 0;
     var j = 0;
     while (j < n) {
-        var e2 = gpo_execute(buf + j * GPU_OP_STRIDE);
+        var e2 = gpo_execute(buf + j * GPU_OP_STRIDE, fbw, fbh);
         if (e2 != 0) { err = (j << 8) | e2; j = n; }
         j = j + 1;
     }

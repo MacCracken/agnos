@@ -6,8 +6,25 @@
 fn fmt_int_buf(n, buf) {
     var bi = 23;
     var neg: i64 = 0;
-    if (n < 0) { neg = 1; n = 0 - n; }
-    if (n == 0) { store8(buf + bi, 48); bi = bi - 1; }
+    # ⛔ 1.56.52 — PEEL THE LAST DIGIT WHILE THE VALUE IS STILL NEGATIVE. This was
+    # `if (n < 0) { neg = 1; n = 0 - n; }`, and two's-complement negation is an IDENTITY on
+    # INT64_MIN (0x8000000000000000): `0 - n` is still 0x8000000000000000, still negative. So
+    # `n == 0` was false, the SIGNED `while (n > 0)` below never ran, and the whole render collapsed
+    # to a bare "-" (len 1) for that one input. Peeling one digit first means the negation only ever
+    # runs on a magnitude that is representable.
+    # ⚠ `%` and `/` truncate TOWARD ZERO in Cyrius, so INT64_MIN % 10 == -8 and INT64_MIN / 10 ==
+    # -922337203685477580 — both exact, no overflow. 48 + (0 - (n % 10)) is therefore the right digit.
+    # ⚠ THE `elif` IS LOAD-BEARING: with a plain `if`, a value like -1 (whose peel leaves n == 0)
+    # would take the zero arm too and emit a spurious extra '0' → "-01".
+    # Max length is unchanged at 20 ("-9223372036854775808"), so the NUL still lands at buf[20],
+    # inside every caller's 24-byte buffer.
+    if (n < 0) {
+        neg = 1;
+        store8(buf + bi, 48 + (0 - (n % 10)));
+        bi = bi - 1;
+        n = 0 - (n / 10);
+    }
+    elif (n == 0) { store8(buf + bi, 48); bi = bi - 1; }
     while (n > 0) { store8(buf + bi, 48 + n % 10); bi = bi - 1; n = n / 10; }
     if (neg == 1) { store8(buf + bi, 45); bi = bi - 1; }
     # Shift to start of buffer
@@ -20,12 +37,33 @@ fn fmt_int_buf(n, buf) {
     return len;
 }
 
-# Convert hex number to string in buffer, return length
+# Convert hex number to string in buffer, return length.
+#
+# ⛔ BUFFER CONTRACT: writes up to 17 BYTES — 16 hex digits plus the NUL at buf[len]. The buffer must
+# be at least 17; every caller uses `var x[24]`, matching fmt_int_buf. A [16] buffer is a one-byte
+# out-of-bounds stack write (that was the state until 1.56.52, at all seven call sites).
 fn fmt_hex_buf(n, buf) {
     var bi = 15;
     if (n == 0) { store8(buf, 48); store8(buf + 1, 0); return 1; }
     var tmp[16];
-    while (n > 0) {
+    # ⛔ 1.56.52 — `!= 0`, NOT `> 0`. The comparison is SIGNED, so any value with bit 63 set was < 0
+    # and this loop never ran: bi stayed 15, len came out 15 - 15 = 0, and the function returned an
+    # EMPTY STRING. That is not the zero rendering (the `n == 0` early-out above prints "0"), so a
+    # negative value produced a VANISHED FIELD — and three sites in fault_kill_current read a zero
+    # length as "the value was zero" and print a fabricated "0".
+    # ⚠ THAT IS RING-3 REACHABLE AND FALSIFIES THE CRASH RECORD: a ring-3 load from any canonical
+    # high-half address sets CR2 with bit 63 set, so the kernel's own post-mortem reported
+    # `HWCR2=0x0` — a null dereference that never happened. Worse for PDEs: proc_map_page_nx writes
+    # `phys | 0x8000000000000087`, so EVERY W^X data/stack PDE is negative, and an all-zero neighbour
+    # set reads as "the page's memory was destroyed". proc.cyr already records this class costing a
+    # full day ("that is how 'pde=0x' was read all day as 'the PDE is zero' when the entry was
+    # PRESENT") and carries a hand-written mask to dodge it.
+    # ⚠ Termination is safe because `>>` is LOGICAL in Cyrius: 4 bits consumed per iteration, so at
+    # most 16 iterations, bi walks 15..0 (store BEFORE the decrement) and ends at -1 ⇒ len 16.
+    # ⛔ THIS FIX HARD-REQUIRES THE [24] BUFFER WIDENING IN THE SAME CHANGE. Before it, len == 16 was
+    # essentially unreachable; after it, every NX PDE and every high-half CR2 renders 16 digits, which
+    # turns the 17-byte write above from never-fires into fires-on-every-page-fault.
+    while (n != 0) {
         var nib = n & 0xF;
         if (nib < 10) { store8(&tmp + bi, 48 + nib); }
         else { store8(&tmp + bi, 87 + nib); }
@@ -53,7 +91,7 @@ fn kfmt_int(n) {
 
 # Print hex number to serial (no prefix)
 fn kfmt_hex(n) {
-    var buf[16];
+    var buf[24];   # 1.56.52: fmt_hex_buf writes 17 B (16 digits + NUL) — [16] was a 1-byte OOB stack write
     var len = fmt_hex_buf(n, &buf);
     serial_print(&buf, len);
     return 0;

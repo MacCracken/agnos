@@ -78,6 +78,9 @@ kprintln("GDT loaded", 10);
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x81; 0xE6; 0x71; }   # CP 0x81: pre-tss
 tss_init();
 kprintln("TSS loaded (ring 3 ready)", 25);
+# 1.56.52 — prove the I/O-map base landed in the field the CPU actually reads. See tss_iopb_selftest.
+if (tss_iopb_selftest(0) == 1) { kprintln("tss: I/O map base at 0x66 OK - no ring-3 port access", 52); }
+else { kprintln("tss: IOPB BASE MISPLACED - RING 3 HAS PORT I/O", 46); }
 
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x82; 0xE6; 0x71; }   # CP 0x82: pre-idt
 idt_init();
@@ -258,6 +261,12 @@ chan_region_reserve();
 # check.sh's 2 MiB binary ceiling. Failure is non-fatal — blit#39's scale>=2 arm then returns -1
 # and the 1:1 path, which uses no staging at all, is unaffected.
 fb_scale_rowbuf_init();
+# 1.56.52 — #92 op 0x0C's per-CPU primitive-array snapshot window. ⛔ MUST follow pmm_setup_directmap
+# (gpo_texl_stage_base hands back DIRECTMAP_BASE + phys) and is taken HERE, at boot, single-threaded,
+# rather than lazily inside gpo_execute: a first-touch PMM scan mid-batch runs with IF masked, and a
+# sticky failure latch would let ring 3 permanently disable op 0x0C. Failure is non-fatal — the op
+# then answers GPO_E_ARM instead of dispatching against a slot it cannot snapshot.
+gpu_texl_stage_init();
 # 1.49.10: validate the direct-map in the context its consumers ACTUALLY run under — the kernel PML4
 # (CR3 0x1000), which carries PDPT[8..]. The OLD always-on probe (load64(DIRECTMAP_BASE+phys) ==
 # load64(phys)) was a FALSE POSITIVE: it ran under gnoboot's boot CR3, whose PDPT[8] is a 1 GB IDENTITY
