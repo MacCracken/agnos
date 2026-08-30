@@ -1,6 +1,8 @@
 # `open`(7) has no no-follow flag — a check-then-write TOCTOU that ring 3 cannot close
 
-**Status:** 🟡 **OPEN** — request. The kernel already has the machinery (`ext2_path_lookup_ex(path, len, follow_last)`, `kernel/core/ext2.cyr:3032`); it is reachable from ring 3 only through `readlink`#70. Exposing it on `open`(7) as an `AO_NOFOLLOW` flag would close the race.
+**Status:** ✅ **FIXED 1.56.53** — `AO_NOFOLLOW = 0x1000` landed on `open`(7), routing to `ext2_path_lookup_ex(..., follow_last=0)` and refusing when the final component is `0xA000`, exactly as proposed. Gated by `ext2w: Wlstat no-follow OK` (mutation-tested: ignoring the flag reports `AO_NOFOLLOW opened a SYMLINK`). ⭐ The cut also minted **`lstat`#102**, which this issue's own "Related" section anticipated — an iron burn supplied the consumer, in the form of two entries that could be listed but neither stat'd nor removed. `AO_EXCL` was NOT added and remains open.
+
+**Original status:** 🟡 OPEN — request. The kernel already has the machinery (`ext2_path_lookup_ex(path, len, follow_last)`, `kernel/core/ext2.cyr:3032`); it is reachable from ring 3 only through `readlink`#70. Exposing it on `open`(7) as an `AO_NOFOLLOW` flag would close the race.
 **Repo owning the design:** agnos.
 **Cross-repo:** cyrius needs no new wrapper — `sys_open(name, namelen, flags)` already passes flags in a3 (`lib/syscalls_x86_64_agnos.cyr:560`). A new flag constant is additive.
 **Consumer:** `whirl` — `-r` recursive fetch, `_save_tree` (`src/main.cyr`) / `fs_is_symlink` (`src/output.cyr`). Its roadmap carries this as **B2**.

@@ -4246,6 +4246,66 @@ fn ext2_write_selftest() {
     if (wsr == 1) { kprintln("ext2w: Wsymres resolve OK", 25); }
     else          { kprintln("ext2w: Wsymres resolve MISMATCH", 31); }
 
+    # === Wlstat: lstat#102 + AO_NOFOLLOW — the no-follow pair (1.56.53) ==============================
+    # ⛔⛔ THIS ARM EXISTS BECAUSE OF AN IRON BURN, and it reproduces that exact condition. The
+    # 2026-08-30 validation burn found `/sl_s` and `/lp` — fixtures this very selftest creates —
+    # sitting in the root filesystem of the machine, LISTABLE but neither stat-able nor removable.
+    # Every `ls` printed `kriya ls: cannot access '/sl_s': operation not permitted`, and so did `rm`.
+    # The cause was not unlink (the cleanup below removes both happily); it was that kriya's `rm` is
+    # written to NEVER follow a symlink and classifies with `fs_lstat_at` first, which on agnos routed
+    # to path-based #33 and followed the link into nothing. The two fixtures are the two shapes that
+    # break: a DANGLING target and a SELF-REFERENTIAL loop.
+    # ⚠ The control arms matter as much: a no-follow stat that refuses everything, or one that reports
+    # the TARGET's inode for a resolvable link, would both pass a test that only checked the two
+    # broken shapes.
+    var wls = 1;
+    var lsbuf[48];      # fn-local => 48 BYTES, exactly the agnos stat struct. NOT [6].
+
+    # (a) DANGLING: /sl_s -> "/aaa…" (70 B, does not exist). stat#33 FOLLOWS and must fail;
+    #     lstat#102 must SUCCEED and describe the link itself.
+    if (ksyscall(33, "/sl_s", 5, &lsbuf) == 0) { wls = 0; kprintln("ext2w: Wlstat stat followed a DANGLING link and succeeded", 57); }
+    if (ksyscall(102, "/sl_s", 5, &lsbuf) != 0) { wls = 0; kprintln("ext2w: Wlstat lstat FAILED on a dangling link - the iron bug", 60); }
+    else {
+        if ((load64(&lsbuf) & 0xF000) != 0xA000) { wls = 0; kprintln("ext2w: Wlstat lstat did not report S_IFLNK", 42); }
+        if (load64(&lsbuf + 16) != 70) { wls = 0; kprintln("ext2w: Wlstat lstat size is not the link TEXT length", 52); }
+    }
+
+    # (b) ELOOP: /lp -> "lp" (itself). stat#33 must fail; lstat#102 must succeed without looping.
+    if (ksyscall(33, "/lp", 3, &lsbuf) == 0) { wls = 0; kprintln("ext2w: Wlstat stat resolved a self-referential link", 51); }
+    if (ksyscall(102, "/lp", 3, &lsbuf) != 0) { wls = 0; kprintln("ext2w: Wlstat lstat FAILED on an ELOOP link - the iron bug", 58); }
+
+    # (c) CONTROL — a RESOLVABLE link must give DIFFERENT answers to the two calls, and both succeed.
+    #     /sl_f -> "/hl_b.txt". stat must report the TARGET's inode, lstat the LINK's own.
+    #     ⛔ Without this, "lstat == stat" (i.e. no-follow never implemented) still passes (a) and (b).
+    var tgt_st[48];
+    var lnk_st[48];
+    if (ksyscall(33, "/sl_f", 5, &tgt_st) != 0) { wls = 0; kprintln("ext2w: Wlstat stat failed on a RESOLVABLE link", 46); }
+    if (ksyscall(102, "/sl_f", 5, &lnk_st) != 0) { wls = 0; kprintln("ext2w: Wlstat lstat failed on a RESOLVABLE link", 47); }
+    if (load64(&tgt_st + 24) == load64(&lnk_st + 24)) { wls = 0; kprintln("ext2w: Wlstat lstat returned the TARGET inode - it followed", 59); }
+    if ((load64(&lnk_st) & 0xF000) != 0xA000) { wls = 0; kprintln("ext2w: Wlstat lstat of a resolvable link is not S_IFLNK", 55); }
+    if ((load64(&tgt_st) & 0xF000) != 0x8000) { wls = 0; kprintln("ext2w: Wlstat stat of a resolvable link is not the regular file", 63); }
+
+    # (d) CONTROL — a PLAIN FILE must be identical through both calls.
+    var reg_a[48];
+    var reg_b[48];
+    if (ksyscall(33, "/hl_b.txt", 9, &reg_a) != 0) { wls = 0; kprintln("ext2w: Wlstat stat failed on a plain file", 41); }
+    if (ksyscall(102, "/hl_b.txt", 9, &reg_b) != 0) { wls = 0; kprintln("ext2w: Wlstat lstat failed on a plain file", 42); }
+    if (load64(&reg_a + 24) != load64(&reg_b + 24)) { wls = 0; kprintln("ext2w: Wlstat the two calls disagree on a plain file", 52); }
+
+    # (e) AO_NOFOLLOW on open#7 — the filed ask. Opening the link WITHOUT the flag follows it to
+    #     /hl_b.txt and succeeds; WITH the flag it must be refused.
+    var fd_follow = ksyscall(7, "/sl_f", 5, 0);
+    if (fd_follow < 0) { wls = 0; kprintln("ext2w: Wlstat open without NOFOLLOW did not follow the link", 59); }
+    else { ksyscall(8, fd_follow, 0, 0); }
+    if (ksyscall(7, "/sl_f", 5, 0x1000) >= 0) { wls = 0; kprintln("ext2w: Wlstat AO_NOFOLLOW opened a SYMLINK", 42); }
+    # ⚠ And it must not refuse a plain file — a flag that rejects everything would pass the line above.
+    var fd_plain = ksyscall(7, "/hl_b.txt", 9, 0x1000);
+    if (fd_plain < 0) { wls = 0; kprintln("ext2w: Wlstat AO_NOFOLLOW refused a plain file", 46); }
+    else { ksyscall(8, fd_plain, 0, 0); }
+
+    if (wls == 1) { kprintln("ext2w: Wlstat no-follow OK", 26); }
+    else          { kprintln("ext2w: Wlstat no-follow MISMATCH", 32); }
+
     # === Wuninit: uninit-group materialization (1.33.4 bite 3) ===
     # Only meaningful on a multi-group flex_bg image (the 67 MiB write-smoke
     # is a single group 0 → SKIP). Scan for the first INODE_UNINIT + first

@@ -1133,6 +1133,28 @@ fn sysinfo_put_str(dst, src, max) {
 # called here are leaves w.r.t. the VFS boundary (no locked-fn re-entry).
 fn sys_open_ext2_inner(arg1, arg2, arg3) {
     if ((arg3 & 0x800) != 0) { return ext2_open_dir(arg1, arg2); }
+    # ⛔⛔ 1.56.53 — AO_NOFOLLOW (0x1000): REFUSE IF THE FINAL COMPONENT IS A SYMLINK.
+    # `open`(7) had no way to write a file without following a link at the last component, and no
+    # AO_EXCL either — so neither standard way to make a check-then-write safe was available. A ring-3
+    # program can DETECT a link first (`readlink`#70 is no-follow), but between that check and the open
+    # the path can be replaced with a symlink and the write lands wherever it points. whirl`s `-r`
+    # recursive fetch is the filed consumer: it does exactly that pre-check today and cannot close the
+    # race, because the atomic primitive did not exist.
+    # ⭐ THE LOOKUP MODE ALREADY EXISTED — `ext2_path_lookup_ex(path, len, follow_last)` has been in the
+    # tree since `readlink`#70 (1.53.6), whose own ABI note anticipated this reuse. This is not new
+    # path resolution; it is plumbing the flag that selects it through to open.
+    # ⚠ Mid-path symlinks still resolve — only the FINAL component is refused, matching POSIX
+    # O_NOFOLLOW and #70. ⚠ Additive: no existing caller sets 0x1000, so every current open is
+    # byte-identical. ⚠ FAT/exFAT cannot represent a symlink, so the flag is trivially satisfied there
+    # and the arm below never sees it.
+    if ((arg3 & 0x1000) != 0) {
+        var nf7 = ext2_path_lookup_ex(arg1, arg2, 0);       # 0 = do not follow the final component
+        if (nf7 > 0) {
+            if (ext2_get_inode(nf7, &ext2_inode_buf) == 0) {
+                if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) == 0xA000) { return 0 - 1; }   # S_IFLNK
+            }
+        }
+    }
     var ino7 = ext2_path_lookup(arg1, arg2);
     if (ino7 <= 0) {
         if ((arg3 & 0x100) == 0) { return 0 - 1; }
@@ -8392,7 +8414,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # open(name=arg1, namelen=arg2, flags=arg3) — mount-routed (1.41.3).
         # Re-routes from initrd-only: ext2 / FAT / exFAT by mount, with initrd
         # as the bare-name fallback. AO_DIRECTORY(0x800)→dir-fd (getdents);
-        # AO_CREAT(0x100) creates if absent; AO_TRUNC(0x200) zeroes existing.
+        # AO_CREAT(0x100) creates if absent; AO_TRUNC(0x200) zeroes existing;
+        # AO_NOFOLLOW(0x1000) refuses when the FINAL component is a symlink (1.56.53).
         if (sc_path_ok(arg1, arg2) == 0) { return 0 - 1; }
         # Normalize a RELATIVE name (no leading '/') to rooted-at-'/' — agnos has no
         # CWD, so `touch foo` / `cmd > foo` land in the writable root FS instead of
@@ -9106,6 +9129,49 @@ fn ksyscall(num, arg1, arg2, arg3) {
     # ⛔ A SEPARATE NUMBER, NOT A 4th ARG ON #81. Existing callers pass three; the 4th register would
     # hold garbage, and this argument is a POINTER the kernel writes through.
     if (num == 101) { stack_canary_check(canary); return ext2_readdir_at_sys(arg1, arg2, arg3, ksyscall_a4_get()); }  # readdir_at(path, buf, max, &cursor) -> count
+    if (num == 102) {
+        # lstat(path=arg1, pathlen=arg2, statbuf=arg3) — `stat`(#33) that does NOT follow a final
+        # symlink. Same 48-byte struct, same failure shape; the ONLY difference is follow_last=0.
+        #
+        # ⛔⛔ 1.56.53 — MINTED OFF AN IRON BURN, and the consequence it closes is not the one the
+        # roadmap predicted. That row read: "`lstat` — the only half of the old pair left … blocked on
+        # a consumer (kriya `ln -s`, or ark install layouts)". The 2026-08-30 validation burn produced a
+        # much blunter consumer: **two entries in the root filesystem that could be listed but neither
+        # stat`d nor removed.** `/sl_s` (a slow symlink whose 70-byte target does not exist) and `/lp`
+        # (a deliberate self-referential ELOOP link) are leftover EXT2_WRITE_SELFTEST fixtures on the
+        # persistent agnos-fs; the bare burn kernel never runs that selftest`s cleanup, so they stayed.
+        # Every `ls` printed `kriya ls: cannot access ... operation not permitted`, and `rm` failed the
+        # same way — five times in one capture.
+        # ⭐ THE KERNEL`S OWN unlink(#30) WAS NEVER THE PROBLEM. It resolves the PARENT and calls
+        # `ext2_unlink(parent, basename)`, which refuses only directories — the selftest`s own cleanup
+        # unlinks both of these fixtures successfully. What failed is that kriya`s `rm` is written to
+        # NEVER follow a symlink (its header says so) and classifies every operand with `fs_lstat_at`
+        # first — which on agnos routed to path-based #33 and followed the link into nothing.
+        # kriya`s own comment names this exactly: "agnos has no lstat peer at all … agnos roadmap
+        # carries `lstat` as unslotted-pending-a-consumer; THIS IS THAT CONSUMER."
+        # ⇒ A correct no-follow userland could not be correct on agnos, and the visible result was
+        # undeletable files.
+        #
+        # ⚠ A NEW NUMBER, NOT A FLAG ON #33. `stat`s 4th argument would have to ride `ksyscall_a4`,
+        # which is r10 — set unconditionally from whatever r10 held at the call (syscall_hw.cyr), so it
+        # is GARBAGE for every existing 3-argument caller, not 0. A flag there would break #33 for
+        # every current consumer. #102 is the next free number (101 is the previous high-water).
+        # ⚠ Mid-path symlinks still resolve; only the FINAL component is left unresolved — matching
+        # POSIX lstat and `readlink`#70, which introduced this exact lookup mode.
+        if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg3, 48) == 0) { stack_canary_check(canary); return 0 - 1; }
+        var be102 = vfs_resolve_mount(arg1, arg2);
+        # ⚠ FAT/exFAT cannot represent a symlink, so lstat there would be identical to stat — but #33
+        # already returns -1 for them, and quietly succeeding here would be a surface #33 does not have.
+        if (be102 != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
+        fs_spin_lock();
+        var lino = ext2_path_lookup_ex(arg1, arg2, 0);      # 0 = do NOT follow the final component
+        if (lino <= 0) { fs_spin_unlock(); stack_canary_check(canary); return 0 - 1; }
+        var lr = ext2_fill_stat(lino, arg3);
+        fs_spin_unlock();
+        stack_canary_check(canary);
+        return lr;
+    }
     # GPU compute dispatch (#82) — the ring-3 dispatch seam (#82) ring-3 seam: run the proven 8x8 integer matmul on the caller's
     # A,B (64 i32 each) and write C=A*B to c_uva. The path mabda/tentib consume for GPU inference. -> 0 ok / <0 err.
     if (num == 82) { stack_canary_check(canary); return gpu_dispatch_sys(arg1, arg2, arg3); }                # gpu_dispatch(a, b, c)

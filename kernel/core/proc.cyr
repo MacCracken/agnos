@@ -366,6 +366,20 @@ fn proc_alloc_slot() {
     store64(&proc_on_cpu + idx * 8, 0 - 1);   # 1.46.x SMP6: recycled slot must not inherit a stale CPU id
     store64(&idle_owner + idx * 8, 0 - 1);     # 1.46.x STEP-2: recycled slot starts UNPINNED (a prior foreground proc may have left idle_owner=its launch CPU; a fresh proc must be free to migrate / not falsely pinned). Idles never reuse a slot, so their persistent pin is unaffected.
     store64(&proc_ppid + idx * 8, 0);          # 1.50.7: recycled slot must not inherit a stale parent (default init; proc_create_user sets the real creator)
+    # ⛔⛔ 1.56.53 — proc_names WAS THE ONE MEMBER OF THIS FAMILY MISSING FROM THE SCRUB, and its
+    # absence made a PUBLISHED ABI GUARANTEE FALSE. `#99 proclist`s contract — in the issue record and
+    # in the userland ABI doc — reads: "the name field is NUL-padded to the full 32 bytes **so ring 3
+    # can never read a stale byte left by a previous occupant of the slot**." That is a slot-RECYCLE
+    # guarantee, not a within-record padding note, and a pid IS a slot index here (see the PID-RECYCLE
+    # banner below) with proc_alloc_slot reusing the first dead slot. Every other per-slot shadow is
+    # reset above — signals, sigmask, rsp0, on_cpu, idle_owner, ppid, epoch, the FPU area — each with a
+    # comment saying why a recycled slot must not inherit it. proc_names was added at 1.56.47 and never
+    # joined the pattern, so a fresh process could report the DEAD one`s name to ring 3.
+    # ⛔ AND THE FIX WAS ALREADY WRITTEN AND NEVER CALLED. `proc_clear_name` exists twenty lines up with
+    # the comment "Clear a slot`s name when it is reused, so a dead process`s name can never be read
+    # back against a live pid that happens to land on the same slot" — and `cyrius build` listed it as
+    # DEAD CODE. A guarantee, a function written to provide it, and no edge between them.
+    proc_clear_name(idx);
     # 1.56.40 bite 2: a slot handed out is a NEW incarnation, whether it is a fresh row or a recycled
     # one — so the bump belongs here, at the single point every user proc is born through, and not on
     # the death path (a slot that is never reused must still not alias the proc that last held it).
@@ -2049,6 +2063,7 @@ fn sys_munmap(addr, length) {
     var pd_kva = ptw_pd_kva(cr3);                             # 1.56.51: direct-map walk
     if (pd_kva == 0) { return 0 - 1; }
     var flush = 0;
+    var freed = 0;
     for (var i = 0; i < npages; i = i + 1) {
         var vaddr = addr + i * 0x200000;
         var pd_idx = (vaddr >> 21) & 0x1FF;
@@ -2064,14 +2079,36 @@ fn sys_munmap(addr, length) {
             flush = vaddr;
             asm { invlpg [rax]; }                             # drop the stale huge-page TLB entry
             pmm_free_2mb(phys);
+            freed = freed + 1;
         }
     }
     # LIFO vaddr reclaim: rewind the bump cursor if this was the most-recent map.
     # The munmap rollback touches the same global the alloc path claims from, so it takes the same
     # lock. Unlocked, a rollback racing an alloc could hand two callers the same base.
-    mmap_spin_lock();
-    if ((addr + len) == mmap_next_vaddr) { mmap_next_vaddr = addr; }
-    mmap_spin_unlock();
+    # ⛔⛔ 1.56.53 — `freed == npages` IS THE POINT OF THIS CONDITION, AND IT WAS MISSING. The rollback
+    # was gated on VA ARITHMETIC ALONE — `addr + len == mmap_next_vaddr` — against a cursor that is
+    # GLOBAL to every process, with no check that the caller owns, or has ever mapped, the span it is
+    # rewinding past. It also ran unconditionally: reached whether or not the loop above unmapped a
+    # single page.
+    # ⇒ Ring-3 reachable, and it needs no crafted input beyond two integers. A process that has never
+    # called mmap has NOTHING present in the low arena (proc_create_address_space explicitly zeroes
+    # PD[128..510] in every new address space), so its munmap frees nothing, skips every page, and
+    # falls straight into the rollback — rewinding the shared cursor past a span another process is
+    # using. The next sys_mmap then hands out a base already in use.
+    # ⚠ ACROSS processes that is harmless (separate CR3s). WITHIN one it is not: the caller can rewind,
+    # mmap twice, and get two overlapping regions, because proc_map_page_nx is a blind
+    # `store64(pd_kva + pd_idx * 8, ...)` with no present-check — so the second map OVERWRITES the
+    # first`s PDE and the first`s physical pages become unreachable from any PDE. proc_free_address_space
+    # reclaims by SWEEPING present+user PDEs, so it cannot find them either: they are leaked until
+    # reboot, 2 MB at a time, by a process leaking only its own memory but leaking it permanently.
+    # ⭐ REQUIRING `freed == npages` is the honest test of the property the rollback assumes: that this
+    # call actually owned and released the whole span it names. A caller unmapping its own most-recent
+    # full mapping — the LIFO case this optimisation exists for — still rewinds exactly as before.
+    if (freed == npages) {
+        mmap_spin_lock();
+        if ((addr + len) == mmap_next_vaddr) { mmap_next_vaddr = addr; }
+        mmap_spin_unlock();
+    }
     return 0;
 }
 #endif

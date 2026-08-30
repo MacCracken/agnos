@@ -22,6 +22,107 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.53] — 2026-08-30 — cycle OPEN: staged for the seven-cut iron validation burn
 
+### Verified — the seven-cut span is on iron, and the chain holds
+
+`#tracker-iron-v1` burned 2026-08-30 on archaemenid (62 GB, 2560x1440 boot_info surface). Capture:
+`agnosticos/basictests.txt`. All three subjects confirmed in one boot:
+
+```
+AGNOS kernel v1.56.53                                  <- kernel
+tss: I/O map base at 0x66 OK - no ring-3 port access   <- 1.56.52, first iron run
+tss: #DF has IST1 on the direct map OK                 <- 1.56.52, first iron run
+kybernet: starting init / 5 processes / exec /bin/agnsh <- kybernet (in-kernel PID 1)
+agnoshi 1.9.10                                         <- agnoshi, in ring 3
+[ASSIST] >
+```
+
+⭐ **The network changes survived real traffic**, which QEMU's SLIRP cannot prove: `whirl
+https://google.com` returned Google's 301 and `dig` resolved through 192.168.1.1 in 20 ms — so the
+IPv4 fragment reject, the ICMP/TCP destination gates and the DHCP option-length rule did not break a
+real lease, a real resolver, or a real TCP connection. `aethersafha` ran 100 frames.
+⚠ **No `fb: scanout match REFUSED`** — the 1.56.52 extent bound did not decline the override on the
+quiet-boot path, which was this cut's one new diagnostic and the burn's highest-risk watch item.
+⚠ A hexdump disproved a suspected input defect: garbled command lines in the capture are `08 20 08`
+backspace-space-backspace erase sequences — the operator correcting typos. Echo and backspace are
+correct on iron.
+
+### Fixed — `lstat`#102, minted off the burn
+
+- **Two root-filesystem entries could be listed but neither stat'd nor removed.** `/sl_s` (a slow
+  symlink whose 70-byte target does not exist) and `/lp` (a deliberate self-referential ELOOP link)
+  are leftover `EXT2_WRITE_SELFTEST` fixtures the bare burn kernel never cleans up; every `ls` and
+  every `rm` printed `operation not permitted`, five times in one capture.
+  ⭐ **`unlink`#30 was never the problem** — it resolves the parent and calls
+  `ext2_unlink(parent, basename)`, which refuses only directories, and the selftest's own cleanup
+  removes both happily. What failed is that kriya's `rm` is written to **never** follow a symlink and
+  classifies every operand with `fs_lstat_at` first, which on agnos routed to path-based `stat`#33 and
+  followed the link into nothing. kriya's own source names it: *"agnos has no lstat peer at all …
+  agnos roadmap carries `lstat` as unslotted-pending-a-consumer; **this is that consumer**."*
+  ⇒ A correct no-follow userland could not be correct on agnos.
+  ⛔ **A new number, not a flag on #33**: a 4th argument rides `ksyscall_a4` = **r10**, which the entry
+  stub sets from whatever r10 held at the call — **garbage** for every existing 3-argument caller, not
+  0. Same measured fact #100 and #101 both cite.
+  ⚠ **Two-sided**: needs the cyrius `sys_lstat`#102 peer before ring 3 can call it by name, so
+  `check.sh`'s syscall-ABI gate reads `kernel 102 · abi-doc 102 · cyrius 101` and is the tree's one
+  red gate — exactly how `symlink`#63 and `readlink`#70 shipped. Filed as
+  [`issues/2026-08-30-cyrius-agnos-sys-lstat-peer.md`](docs/development/issues/2026-08-30-cyrius-agnos-sys-lstat-peer.md).
+
+- **`AO_NOFOLLOW` (0x1000) on `open`(7)** — the filed hardening ask. `open` had no way to write a file
+  without following a link at the final component, and no `AO_EXCL` either, so neither standard way to
+  make a check-then-write safe existed. The lookup mode already existed; this plumbs the flag that
+  selects it. Additive — no existing caller sets the bit.
+  ⭐ Both gated by `ext2w: Wlstat no-follow OK`, six arms, which reproduces the **exact iron
+  condition** (dangling target, ELOOP loop) plus three controls: a resolvable link must give *different*
+  inodes to `stat` and `lstat`, a plain file must give the *same* through both, and `AO_NOFOLLOW` must
+  still open a plain file. Mutation-tested both ways — making `lstat` follow reports *"lstat FAILED on
+  a dangling link — the iron bug"* by name.
+
+### Fixed — a published `#99` guarantee that was false, and its fix was dead code
+
+- **`proc_names` was the one member of the per-slot family missing from the recycle scrub.**
+  `#99 proclist`'s contract — in its record *and* in the published ABI — reads *"the name field is
+  NUL-padded to the full 32 bytes **so ring 3 can never read a stale byte left by a previous occupant
+  of the slot**"*. That is a slot-**recycle** guarantee, a pid **is** a slot index here, and
+  `proc_alloc_slot` reuses the first dead slot. Every other per-slot shadow is reset there — signals,
+  sigmask, rsp0, on_cpu, idle_owner, ppid, epoch, the FPU area — each with a comment saying why a
+  recycled slot must not inherit it. `proc_names` arrived at 1.56.47 and never joined the pattern, so
+  a fresh process could report the **dead** one's name to ring 3.
+  ⛔ **And the fix had already been written and never called.** `proc_clear_name` sits twenty lines
+  above with the comment *"Clear a slot's name when it is reused, so a dead process's name can never be
+  read back against a live pid that happens to land on the same slot"* — and `cyrius build` listed it
+  as **dead code**. A guarantee, a function written to provide it, and no edge between them.
+
+### Fixed — `munmap` could rewind the global arena cursor past a span it never mapped
+
+- The LIFO rollback was gated on **VA arithmetic alone** — `addr + len == mmap_next_vaddr` — against a
+  cursor global to every process, with no check that the caller owns or has ever mapped the span, and
+  it ran whether or not the loop above unmapped a single page. A process that has never called `mmap`
+  has nothing present in the low arena (`proc_create_address_space` zeroes `PD[128..510]`), so its
+  `munmap` frees nothing, skips every page, and falls straight into the rollback.
+  ⚠ Across processes that is harmless (separate CR3s). **Within one it is not**: rewind, then `mmap`
+  twice, and `proc_map_page_nx`'s blind `store64` overwrites the first mapping's PDE — its physical
+  pages become unreachable from any PDE, so `proc_free_address_space`'s present+user sweep cannot
+  reclaim them either. Leaked until reboot, 2 MB at a time, ring-3 reachable with two integers.
+  Now gated on `freed == npages`: the honest test of the property the rollback assumes.
+
+### Fixed — two ktest gates that could not pass, both on record as "unexplained"
+
+`ktest.sh` **97 passed / 6 failed → 107 passed / 3 failed.** `state.md` called those six
+"pre-existing" and "Unexplained". Two were neither — they asserted contracts the tree had changed:
+
+- **`empty pipe read = 0`** was correct until the streaming-pipe work (*ipc bites 10/11*, 1.56.39–40)
+  made an empty pipe return **-2 WOULD_BLOCK** while any writer is open, and 0 only once every writer
+  has closed. The test's own `wfd` is open on the next line, so it could never again read 0. It now
+  asserts **both** halves — and the EOF arm matters: without it, a pipe that *always* returned -2 would
+  pass, and a reader would spin instead of terminating.
+- **`set page 4096 rejected`** asserted a 4096-page bitmap. `pmm_bitmap` is 8 KB = **65536** pages, and
+  `pmm_migrate_bitmap` grows it to full RAM on a big box, so setting page 4096 is legal. The bound is
+  now **derived from `pmm_bitmap_pages`** rather than written down, so it follows the allocator instead
+  of going stale again.
+- ⚠ The remaining **3 are environmental, not defects**: all three are `[initrd]` tests, and gnoboot
+  passes no initramfs — the iron boot log reads `boot_info: initramfs=0x0 sz=0x0`. They cannot pass in
+  this harness and should be recorded that way rather than as failures.
+
 ### Added — one diagnostic, so a burn cannot come back ambiguous
 
 - **`gpu_scanout_matchgeom` now says when it DECLINES the override.** 1.56.52 bounded it by the real

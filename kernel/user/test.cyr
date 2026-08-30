@@ -77,9 +77,19 @@ fn test_pmm() {
     pmm_clear(4095);
     test_assert_eq(pmm_test(4095), 0, "clear page 4095", 15);
 
-    # Boundary: page 4096 (out of bounds, should fail)
-    test_assert_eq(pmm_set(4096), 0 - 1, "set page 4096 rejected", 22);
-    test_assert_eq(pmm_test(4096), 0, "test page 4096 returns 0", 24);
+    # ⛔⛔ 1.56.53 — THIS ASSERTED A 4096-PAGE BITMAP AND THE BITMAP HAS BEEN 65536 PAGES FOR A LONG
+    # TIME, so both lines failed by construction and were carried in state.md as part of six
+    # "pre-existing / Unexplained" ktest failures. Page 4096 is 16 MB in; `pmm_bitmap` is 8 KB =
+    # 65536 pages = 256 MB (pmm.cyr), and `pmm_migrate_bitmap` grows it to cover full RAM on a big
+    # box. Setting page 4096 is a perfectly legal operation now, so "rejected" could never hold.
+    # ⭐ DERIVE THE BOUND, DO NOT WRITE IT DOWN. The previous literal went stale silently the moment
+    # the bitmap grew; reading `pmm_bitmap_pages` means the boundary case follows the allocator
+    # wherever it goes, including after migration. Same reasoning as check-initstack.sh re-deriving
+    # the init-stack extent from the live constants instead of restating it.
+    # ⚠ Page `pmm_bitmap_pages` is the first index PAST the end, so it must be refused; the in-range
+    # neighbour above (4095) still exercises the accept side.
+    test_assert_eq(pmm_set(pmm_bitmap_pages), 0 - 1, "set page past the bitmap rejected", 33);
+    test_assert_eq(pmm_test(pmm_bitmap_pages), 0, "test page past the bitmap = 0", 29);
 
     return 0;
 }
@@ -198,9 +208,17 @@ fn test_vfs() {
     test_assert_eq(rn, 4, "pipe read 4 bytes", 17);
     test_assert(memeq(&pbuf, "PIPE", 4) == 1, "pipe data correct", 17);
 
-    # Read from empty pipe returns 0
+    # ⛔⛔ 1.56.53 — THIS ASSERTED THE OLD CONTRACT AND FAILED BY CONSTRUCTION, and it was on record as
+    # a mystery. It read `test_assert_eq(rn2, 0, "empty pipe read = 0")`, which was correct until the
+    # streaming-pipe work ("ipc bites 10/11", 1.56.39-40) made an empty pipe return **-2 WOULD_BLOCK**
+    # while any writer is still open, and 0 only once every writer has closed — the change that lets a
+    # reader tell "nothing yet" from "end of stream". `wfd` is open on the line below, so this could
+    # never again read 0. state.md listed it among six ktest failures it called "pre-existing" and
+    # "Unexplained"; it was neither — it was created by that fix and nothing swept the callers.
+    # ⇒ A gate that cannot pass is not pre-existing noise, it is an unswept contract change wearing a
+    # mystery`s clothes. Now it asserts BOTH halves of the real contract.
     var rn2 = vfs_read(rfd, &pbuf, 16);
-    test_assert_eq(rn2, 0, "empty pipe read = 0", 20);
+    test_assert_eq(rn2, 0 - 2, "empty pipe + open writer = -2", 29);
 
     # Write on read-end rejected
     var bad_w = vfs_write(rfd, "X", 1);
@@ -210,8 +228,14 @@ fn test_vfs() {
     var bad_r = vfs_read(wfd, &pbuf, 16);
     test_assert_eq(bad_r, 0 - 1, "read on write-end = -1", 23);
 
-    vfs_close(rfd);
+    # ⭐ THE OTHER HALF: once every writer is closed, the same read must return 0 = EOF. Without this
+    # arm the assertion above is satisfied by a pipe that ALWAYS returns -2, which would make a reader
+    # spin forever instead of terminating — the exact shape the -2/0 split exists to prevent.
     vfs_close(wfd);
+    var rn3 = vfs_read(rfd, &pbuf, 16);
+    test_assert_eq(rn3, 0, "empty pipe + writers closed = 0 (EOF)", 37);
+
+    vfs_close(rfd);
 
     return 0;
 }
