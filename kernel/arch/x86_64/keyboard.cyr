@@ -238,7 +238,19 @@ fn scancode_to_ascii(sc) {
         return 0;
     }
 
-    # Bounds check
+    # ⛔ 1.56.52 — THIS WAS `if (sc >= 128) { return 0; }` AND IT WAS VACUOUS. The release branch at the
+    # top opens with `if (sc > 127)` and every path inside it returns, so control cannot reach here with
+    # sc >= 128 and the check could never fire. It read as a bounds check while screening nothing.
+    # ⚠ The index it FAILED to screen is a NEGATIVE sc: signed `sc > 127` is false, `sc >= 128` is
+    # false, and `load8(&sc_normal + sc)` then reads BELOW the table. Cyrius has no unsigned types, so
+    # every bound here is a signed compare — the same operand-wise reasoning the ramdisk and virtio
+    # fixes in this cut needed. ⚠ SIX call sites, not two, and none is the PS/2 `inb` path an earlier draft
+    # of this comment named — that was deleted with the i8042 (operator ruling 2026-08-08). They are
+    # usb/hid.cyr, usb/hid_translate.cyr, core/devs.cyr, core/syscall.cyr (x2) and user/shell.cyr, and
+    # every one sources its scancode from the USB HID stack as a 0..255 byte. So this is a LATENT hole,
+    # not a live one — and closing it stops the safety depending on a property of six callers that
+    # nothing enforces, for one compare in a path that already does four.
+    if (sc < 0) { return 0; }
     if (sc >= 128) { return 0; }
 
     # Look up in table

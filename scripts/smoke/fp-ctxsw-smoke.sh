@@ -60,14 +60,32 @@ mcopy -i "$ESP"@@1048576 "$AGNOS" ::boot/agnos
 # fast) and fall back to TCG with a longer timeout when /dev/kvm is absent (e.g. CI).
 if [ -w /dev/kvm ]; then ACCEL="-enable-kvm -cpu host"; DEF_TIMEOUT=50; else ACCEL="-cpu max"; DEF_TIMEOUT=180; fi
 boot_once() {   # $1 = extra qemu args (e.g. "-smp 4"), $2 = log path
-    cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
-    timeout "${QEMU_TIMEOUT:-$DEF_TIMEOUT}" qemu-system-x86_64 \
-        -machine q35 -m 256M $ACCEL $1 \
-        -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
-        -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
-        -drive "file=$ESP,format=raw,if=none,id=esp0" \
-        -device "nvme,drive=esp0,serial=AGNOS-SMOKE" \
-        -serial stdio -display none -no-reboot 2>/dev/null > "$2"
+    # ⛔⛔ RETRY ON A HAND-OFF THAT NEVER HAPPENED. Measured across four 1.56.52 sweeps: roughly 1 boot
+    # in 4 never leaves OVMF — the log ends at `gnoboot: fail @ EBS` and the boot menu, and the kernel
+    # under test DID NOT EXECUTE. Every assertion below then evaluates against an empty log and names a
+    # real property as broken; the sibling fp-ring3 gate reported "fpex never dispatched" from exactly
+    # this. ⚠ THE RETRY IS BANNER-GATED, which is the whole safety argument: "the kernel never started"
+    # and "the kernel started and failed" are different events and only the first may be retried. Once
+    # the banner is in the log the run stands, whatever the assertions then say — so a real regression
+    # gets no extra chances. ⚠ A FRESH NVRAM PER ATTEMPT: a half-written vars.fd from a killed run is
+    # itself a way to land in the boot menu.
+    _bo_i=1
+    while [ "$_bo_i" -le "${QEMU_TRIES:-6}" ]; do
+        cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
+        timeout "${QEMU_TIMEOUT:-$DEF_TIMEOUT}" qemu-system-x86_64 \
+            -machine q35 -m 256M $ACCEL $1 \
+            -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
+            -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
+            -drive "file=$ESP,format=raw,if=none,id=esp0" \
+            -device "nvme,drive=esp0,serial=AGNOS-SMOKE" \
+            -serial stdio -display none -no-reboot 2>/dev/null > "$2"
+        if strings "$2" 2>/dev/null | grep -q "AGNOS kernel v"; then return 0; fi
+        echo "  (firmware never handed off — kernel did not start; retrying $_bo_i)"
+        _bo_i=$((_bo_i + 1))
+    done
+    echo "  UEFI never handed off to the kernel in ${QEMU_TRIES:-6} attempts — INFRASTRUCTURE, not the kernel."
+    echo "  Any assertion below describes an EMPTY log; treat this run as VOID, not as a failure."
+    return 0
 }
 
 pass=0; fail=0

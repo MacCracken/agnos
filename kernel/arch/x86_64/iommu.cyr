@@ -107,8 +107,26 @@ fn iommu_map_mmio(phys_base) {
 # VT-d second-level entry format (2MB): phys_addr | 0x83 (Read+Write+SuperPage)
 
 # Allow DMA to a 2MB-aligned physical region
+#
+# ⛔⛔ 1.56.52 — REFUSE >= 1 GB RATHER THAN ALIASING ONTO AN EXISTING GRANT. There is exactly ONE
+# second-level table (a single 4 KB page = 512 entries x 2 MB = 1 GB), and the context entry hardcodes
+# AGAW=1 / 30-bit (`store64(ctx_entry + 8, 0x0101)`), so the table genuinely spans 1 GB and no more.
+# The index was `(phys >> 21) & 0x1FF`, and that mask made any address at or above 1 GB WRAP onto an
+# existing index and OVERWRITE it — with no present-bit test and no error returned. Two silent
+# consequences at once: the earlier grant at that index is destroyed, and the caller does not get the
+# grant it asked for, because translation is identity (Translation Type = 0) so the device DMAs at
+# IOVA == phys while the table now maps (phys mod 1 GB).
+# ⚠ REACHABLE: `iommu_register_dma(phys)` forwards an arbitrary caller address with only an
+# `iommu_active == 0` early-out, and its callers hand it PMM-allocated buffers.
+# ⚠ Latent on archaemenid (AMD — `iommu_init` returns -1 with no DMAR, so `iommu_active` stays 0) and
+# live on any Intel VT-d box. That is a reason to fix it blind, not a reason to leave it: nothing on
+# this bench can produce the failure, so it would surface first on somebody else`s hardware.
+# ⭐ A REFUSAL, matching the pattern this file`s other two 1.56.52 fixes chose. Silently mapping the
+# wrong thing is worse than telling the caller no.
 fn iommu_allow_dma_2mb(phys) {
     if (iommu_iot_l2 == 0) { return 0 - 1; }
+    if (phys < 0) { return 0 - 1; }
+    if (phys >= 0x40000000) { return 0 - 1; }   # past the single 1 GB second-level table
     var idx = (phys >> 21) & 0x1FF;
     var phys_2mb = phys & 0xFFFFFFFFFFE00000;
     # Second-level PDE: Read(0x01) + Write(0x02) + SuperPage(0x80) = 0x83

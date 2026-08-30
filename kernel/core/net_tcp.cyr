@@ -706,9 +706,35 @@ fn tcp_find_conn(src_port, dst_port, src_ip) {
     return 0 - 1;
 }
 
-fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
-    var canary = stack_canary_secret;
+# ⛔⛔ 1.56.52 — THE STACK CANARY WAS REMOVED FROM THIS FUNCTION, DELIBERATELY, AND THAT IS THE FIX.
+# It read `var canary = stack_canary_secret;` on entry and `stack_canary_check(canary)` on exactly
+# TWO of the function`s twenty-three `return` statements. Twenty-one exits — every early drop and
+# every hot ESTABLISHED/SYN_RCVD path — skipped it. A canary checked on 9% of exits detects nothing:
+# an overflow on any other path returns before the check, and the two paths that DO check are the
+# quiet ones.
+# ⚠ AND THERE IS NOTHING HERE FOR A CANARY TO PROTECT. Grep this function body for `var <name>[` and
+# there are zero local arrays — every local is a scalar (tcp, src_port, seq, ack, flags, cb, ncb,
+# rx_buf, retx_buf, isn, meta). A canary guards a local BUFFER against a local overflow; with no
+# buffer there is no mechanism it could catch, on any exit.
+# ⚠ It was not free either: `stack_canary_check` halts the CPU on mismatch, so what stood here was an
+# incoherent, mostly-unreachable panic path in the hottest function of the network receive stack —
+# and, worse, it read as protection to anyone auditing this file.
+# ⇒ Removed rather than completed. Adding it to all 23 exits would spend real work making a mechanism
+# with nothing to detect look thorough. If a local buffer is ever added here, add the canary WITH it,
+# on every exit, and say in a comment what it guards.
+fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip, dst_ip) {
     if (ip_payload_len < 20) { return 0; }
+    # ⛔⛔ 1.56.52 — THE SAME AMPLIFIER THE ICMP ARM CLOSES, AND THE TCP SIDE IS WORSE. This function
+    # matched only on (src_port, dst_port, src_ip) and tcp_find_listen(dst_port); the IPv4 DESTINATION
+    # was never even passed in. With any listener bound, a frame to the Ethernet broadcast MAC with
+    # IPv4 dst 255.255.255.255 and a SYN to that port took the PASSIVE-OPEN path: two kmallocs, a slot
+    # out of the 8-entry conn table, and a SYN-ACK sent to the SPOOFED source. One frame therefore buys
+    # a reply from every agnos box on the segment AND, at eight frames, an exhausted conn table.
+    # ⚠ Unicast only, deliberately narrower than net_handle_udp`s `ours`: that one must admit broadcast
+    # because DHCP OFFER/ACK arrive at 255.255.255.255 while net_ip is still 0. TCP has no such case —
+    # there is no broadcast TCP. The loopback selftest handshakes to net_ip, which this admits.
+    if (net_ip == 0) { return 0; }
+    if (dst_ip != net_ip) { return 0; }
     var tcp = pkt + ip_off;
     var src_port = (load8(tcp) << 8) | load8(tcp + 1);
     var dst_port = (load8(tcp + 2) << 8) | load8(tcp + 3);
@@ -932,10 +958,8 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
         if ((flags & 0x10) != 0) {
             store64(cb, 0);  # ACK of FIN -> CLOSED
         }
-        stack_canary_check(canary);
         return 1;
     }
-    stack_canary_check(canary);
     return 0;
 }
 

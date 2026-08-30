@@ -64,6 +64,7 @@ KVM_ARGS=""; [ -e /dev/kvm ] && KVM_ARGS="-enable-kvm -cpu host"
 # serial-file flush race — the file is fully written once QEMU has exited.
 DWELL=30; [ -e /dev/kvm ] || DWELL=60
 echo "=== booting QEMU with -device intel-hda ($( [ -e /dev/kvm ] && echo KVM || echo TCG ), ${DWELL}s dwell) ==="
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # qemu_assert_booted
 timeout "$DWELL" qemu-system-x86_64 -machine q35 -m 512M $KVM_ARGS \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
@@ -73,6 +74,10 @@ timeout "$DWELL" qemu-system-x86_64 -machine q35 -m 512M $KVM_ARGS \
     -device "intel-hda,id=hda0" \
     -device "hda-duplex,bus=hda0.0,audiodev=snd0" \
     -serial "file:$SER" -display none -no-reboot >/dev/null 2>&1 || true
+# ⛔ DID THE KERNEL RUN AT ALL? Without this, an OVMF hand-off failure makes every assertion
+# below evaluate against an empty log and print a wall of failures naming real properties.
+# See qemu_assert_booted in the lib for the measured rate and the log signature.
+qemu_assert_booted "$SER" || exit 1
 sync
 
 echo ""

@@ -280,7 +280,15 @@ jobs:
     name: QEMU Boot Test
     runs-on: [self-hosted, linux, x64]
     needs: [build]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # ⛔⛔ THE TAG CLAUSE IS NOT DECORATION — WITHOUT IT THIS JOB IS SKIPPED ON EVERY RELEASE.
+    # release.yml fires ONLY on tag refs and gates the release on `ci: uses: ./.github/workflows/ci.yml`,
+    # a job it names "CI Gate (must pass before release)". Under `workflow_call` the called workflow
+    # evaluates `github.ref` as the CALLER's ref, which for a tag push is `refs/tags/v1.56.52` and never
+    # `refs/heads/main`. So the old guard was false for every release, both self-hosted jobs were
+    # skipped, and release.yml has no boot of its own — grep it for qemu/boot/smoke/ktest and the only
+    # hit is a prose comment. ⇒ No tagged release of agnos has ever had its kernel booted by CI.
+    # ⚠ CLAUDE.md's Closeout step 2 ("Boot sweep") assumes this gate exists; it did not.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
     steps:
       - uses: actions/checkout@v4
         with:
@@ -464,7 +472,15 @@ jobs:
     name: Benchmarks
     runs-on: [self-hosted, linux, x64]
     needs: [build]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # ⛔⛔ THE TAG CLAUSE IS NOT DECORATION — WITHOUT IT THIS JOB IS SKIPPED ON EVERY RELEASE.
+    # release.yml fires ONLY on tag refs and gates the release on `ci: uses: ./.github/workflows/ci.yml`,
+    # a job it names "CI Gate (must pass before release)". Under `workflow_call` the called workflow
+    # evaluates `github.ref` as the CALLER's ref, which for a tag push is `refs/tags/v1.56.52` and never
+    # `refs/heads/main`. So the old guard was false for every release, both self-hosted jobs were
+    # skipped, and release.yml has no boot of its own — grep it for qemu/boot/smoke/ktest and the only
+    # hit is a prose comment. ⇒ No tagged release of agnos has ever had its kernel booted by CI.
+    # ⚠ CLAUDE.md's Closeout step 2 ("Boot sweep") assumes this gate exists; it did not.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
     steps:
       - uses: actions/checkout@v4
         with:

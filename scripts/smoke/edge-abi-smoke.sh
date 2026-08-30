@@ -80,7 +80,7 @@ cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 echo "=== AGNOS rung 9a - #92 op 0x08 EDGE_COV ABI battery (EDGE_ABI_SELFTEST, -m 256M) ==="
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
 # ⛔⛔ 40 s WAS NOT ENOUGH ANY MORE, AND THE FAILURE LOOKED LIKE AN ABI REGRESSION. This battery grew
-# to 171 cases plus the tper-prep (128) and trid-prep (256) check sets, and every case kprints a line
+# to 174 cases plus the tper-prep (128) and trid-prep (256) check sets, and every case kprints a line
 # over the serial port. At the old 40 s dwell the guest was still mid-battery when the timeout fired,
 # so the log ended abruptly inside the TRI_PERSP section and `chk` reported the cases that had simply
 # not been reached yet as WRONG — including "a real colour at dword 9 was REFUSED", which is the
@@ -132,9 +132,9 @@ pass=0; fail=0
 chk() { if grep -q "$1" "$LOG"; then echo "PASS: $2"; pass=$((pass+1)); else echo "FAIL: '$1' — $3"; fail=$((fail+1)); fi; }
 nchk() { if grep -q "$1" "$LOG"; then echo "FAIL: '$1' present — $3"; fail=$((fail+1)); else echo "PASS: $2"; pass=$((pass+1)); fi; }
 
-chk "edge-abi: 171 of 171 cases correct" \
-    "every one of the 171 ABI cases returned the reason the ABI specifies" \
-    "not 171/171 - read the named FAIL line(s) above; each names its case, want and got"
+chk "edge-abi: 173 of 173 cases correct" \
+    "every one of the 174 ABI cases returned the reason the ABI specifies" \
+    "not 174/174 - read the named FAIL line(s) above; each names its case, want and got"
 chk "edge-abi: PASS -- the 0x01..0x06 and 0x08..0x10 ABIs reject every malformed" \
     "the battery's own verdict line is PASS" \
     "verdict line absent or FAIL"

@@ -1,5 +1,20 @@
 # === IDT ===
 
+# ⛔ 1.56.52 — POINT ONE GATE AT AN IST STACK. `idt_set_gate` writes byte 4 (the IST index) as 0 for
+# every vector and has no parameter for it; rather than thread one through both callers and all 288
+# gate installs, this patches the single gate that needs it. Byte 4`s low 3 bits are the IST index;
+# the rest must stay zero.
+# ⚠ MUST RUN AFTER the vector`s gate is installed — idt_set_gate rewrites byte 4 to 0, so calling this
+# first is silently undone.
+fn idt_set_ist(vector, ist) {
+    if (vector < 0) { return 0 - 1; }
+    if (vector > 255) { return 0 - 1; }
+    if (ist < 1) { return 0 - 1; }
+    if (ist > 7) { return 0 - 1; }
+    store8(&idt + vector * 16 + 4, ist & 0x07);
+    return 0;
+}
+
 fn idt_set_gate(base, handler, selector, attr) {
     # IDT entry = 16 bytes:
     # [0-1] offset low, [2-3] selector, [4] IST=0, [5] type_attr
@@ -578,6 +593,10 @@ fn exc_handlers_init() {
         # Install as a 64-bit interrupt gate, kernel CS 0x08, present DPL0
         # (0x8E). CPU-generated exceptions ignore the gate DPL, so DPL0 is fine.
         idt_set_gate(&idt + v * 16, stub, 0x08, 0x8E);
+        # ⭐ 1.56.52 — VECTOR 8 GETS IST1. Must be AFTER the idt_set_gate above, which rewrites byte 4
+        # to 0. tss_init_cpu points TSS.IST1 at a per-CPU stack in region 7; see its banner for why
+        # #DF specifically cannot be delivered on RSP0.
+        if (v == 8) { idt_set_ist(8, 1); }
         off = off + tail + 35;
     }
     return 0;

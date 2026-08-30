@@ -61,6 +61,7 @@ echo "[3/4] Booting gnoboot+OVMF+NVMe, running /bin/naadex..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"; : > "$SLOG"
 KVM_ARGS=""; [ -e /dev/kvm ] && KVM_ARGS="-enable-kvm -cpu host"; [ -z "$KVM_ARGS" ] && KVM_ARGS="-cpu max"
 HARD=60; [ -e /dev/kvm ] || HARD=150
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # qemu_assert_booted
 qemu-system-x86_64 -machine q35 -m 512M $KVM_ARGS \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
@@ -74,6 +75,11 @@ while [ $i -lt $HARD ]; do
     kill -0 $QPID 2>/dev/null || break
 done
 kill $QPID 2>/dev/null; trap - EXIT; wait $QPID 2>/dev/null; sync
+# ⛔ DID THE KERNEL RUN AT ALL? Placed AFTER the wait loop, not after the launch — this smoke
+# backgrounds QEMU, so checking straight after the `&` would read an empty log every time.
+# Without this an OVMF hand-off failure makes every assertion below evaluate against that
+# empty log: this gate printed "fpex never dispatched" from a kernel that never executed.
+qemu_assert_booted "$SLOG" || exit 1
 
 echo "[4/4] Checks..."
 echo "  --- naadex serial lines ---"

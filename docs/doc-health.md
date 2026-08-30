@@ -17,12 +17,64 @@ type: state
 > pass RE-GRADED the P2 list and found a P0 in it, that `gdt.cyr:82` was in no backlog at all, and that
 > two of the audit's own suggested fixes were wrong (the `blk` reorder is an ABI break; the init-stack
 > guard is off by one). Inline ✅ markers extended.
-> ✅ **`docs/development/state.md`** — kernel-head row rewritten, gate count 31/31, and the OPEN section
+> ✅ **`docs/development/state.md`** — kernel-head row rewritten, gate count (31/31 at that point; 32/32 after the second pass), and the OPEN section
 > CONSOLIDATED rather than grown (it had crossed the 120-line cap at 125; now exactly 120). New entries:
 > the severity labels are unreliable in both directions; three 1.56.52 fixes are asserted-not-exercised;
 > op 0x0C is still not SMP-safe; kernel structures are direct-map addressed now.
 > ✅ **`docs/development/roadmap.md`** — backlog row re-counted, both P0s marked closed.
-> ✅ **NEW `scripts/check/check-initstack.sh`** — the init-stack extent gate; `check.sh` is now 31 gates.
+> ✅ **NEW `scripts/check/check-initstack.sh`** — the init-stack extent gate; `check.sh` was 31 gates at this point (32 after the second pass added `check-ci-release-gate.sh`).
+>
+> **Second pass, same day — the P1 tail, and a P0 found underneath one of them:**
+> ✅ **`CHANGELOG.md`** — four further sections: receive-checksum verification at every layer (nothing
+> verified one before, at any layer); the stolen-HID-event reclaim plus the keyboard-row decoy it
+> exposed; the user-pointer window P0 and the high-arena P1 it was blocking; and the `run_gate` display
+> filter that made a failing gate print nothing.
+> ✅ **`issues/2026-08-28-p1-audit-sweep-backlog.md`** — three items marked ✅ FIXED 1.56.52 with
+> RESOLUTION blocks. ⛔ The `proc.cyr:1781` block records that the item **could not be fixed as filed** —
+> its suggested fix would itself have been a ring-3 kernel-write primitive. P1 is now 21 of 26.
+> ✅ **`docs/development/state.md`** — five new OPEN entries: "is this a user pointer" is a page-table
+> question, not an address-range one; a validator gate must run under a real per-process CR3; a derived
+> constant with no observable effect on the test box cannot be gated by behaviour; a sweep gate can fail
+> and print nothing; the sweep's boot flake moves between gates. Kernel-head row rewritten.
+> ✅ **`docs/development/roadmap.md`** — backlog row re-counted to P1 5/26 remaining, and the HID
+> halted-endpoint row updated: the sequence it asks a real stall to validate is **no longer the one
+> that was reviewed there**, because `hid_recover_halted` was reading decoy producer state.
+> ✅ **NEW smokes** — `net-csum-smoke.sh` (the first gate anywhere in the tree that presents a *corrupt*
+> frame), `hid-reclaim-smoke.sh` (hermetic; brings its own event ring, transfer ring and doorbell page),
+> `userwin-smoke.sh` (runs under a real per-process CR3 — under the boot CR3 every arm scores a
+> meaningless pass). All three mutation-tested; `sweep.sh` is now 23 gates.
+>
+> ### 1.56.52 (2026-08-30) — the P2 tail, closed
+>
+> ✅ **`CHANGELOG.md`** — two further sections: "three P2 items that were not P2" (the DHCP option
+> read past a ring-0 stack buffer, IPv4 fragments reaching the TCP header path, and a release CI gate
+> that has never booted a kernel) and "the rest of the P2 tail (12 items)".
+> ✅ **`issues/2026-08-28-p1-audit-sweep-backlog.md`** — the **P2 section is CLOSED at 29 of 29**, every
+> item now carrying an inline ✅. ⛔ Its header had said `0 FIXED` while 14 were already done, because
+> that section — unlike P0/P1 — carried only a total and no per-item markers. Re-derived by reading
+> each site, with every already-fixed claim adversarially refuted before being recorded.
+> ✅ **`docs/development/state.md`** — the backlog entry rewritten (P0 2/2, P1 21/26, P2 29/29) and a
+> new entry: a status count and an item list that *can* disagree eventually *will* — mark items, not
+> totals. ⭐ The `fp-nm-smoke` "~50% coin flip" entry was **corrected, not extended**: it was never an
+> FP defect, and the note had been telling future sessions not to bisect against a working gate.
+> ✅ **`docs/development/roadmap.md`** — backlog row re-titled to name what remains (5 P1s, two of them
+> aarch64-gated) rather than what was done.
+> ✅ **NEW gate** `scripts/check/check-ci-release-gate.sh` (check.sh 31 → 32) — the release-CI property
+> cannot be tested from a developer machine, so a static re-read is the only form that can fail.
+> ✅ **NEW smoke** `scripts/smoke/dhcp-opt-smoke.sh`; `net-csum-smoke.sh` extended with three fragment
+> arms. `sweep.sh` is now 24 gates, and **all 7 previously unguarded gates were converted to
+> `qemu_dwell_kernel`**, which is what turned the sweep from intermittently-red to green.
+>
+> ✅ **NEW `issues/2026-08-30-tri-corner-bound-coordinate-frame.md`** — `#92` ops 0x09/0x0A validate the
+> frame-skew bound in SCREEN coordinates while the shader samples RECT-LOCAL ones. Filed rather than
+> fixed: op 0x09 is shipped and BURNED, so changing what its validator accepts wants an operator
+> ruling. Measured that it rejects nothing realistic, and that measurement is a permanent battery case.
+> ✅ **`CHANGELOG.md`** — a further section recording that an adversarial review of this cut's own P2
+> batch found **15 real defects, all of them in the FIXES rather than the findings**, and what shapes
+> they took.
+>
+> ⚠ **Still unswept since 1.44.9**: `README.md`, `architecture/overview.md`, `syscall-additions.md`,
+> `build.md`, `kybernet-bridge.md`. Unchanged by this cut and still to be assumed stale.
 > 🟠 **Body docs still unswept** — unchanged since 1.44.9; the debt below stands.
 >
 > ### 2026-08-29 — the audit-backlog first pass (inside the 1.56.51 cut)

@@ -57,7 +57,7 @@ LOG="$LOGS/fp-nm.log"
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 echo "=== AGNOS lazy-#NM FP smoke (FP_NM_SELFTEST, -m 256M) ==="
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
-qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
+qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" "$WORK/vars.fd" "$OVMF_VARS_SRC" \
     qemu-system-x86_64 \
     -machine q35 -m 256M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \

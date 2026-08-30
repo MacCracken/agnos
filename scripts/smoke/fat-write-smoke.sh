@@ -76,7 +76,7 @@ echo "Booting FATFS_WRITE_SELFTEST kernel (NVMe + GPT, FAT32 ESP)..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/fat-write-selftest.log"
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
-qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-30}" \
+qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-30}" "$WORK/vars.fd" "$OVMF_VARS_SRC" \
     qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \

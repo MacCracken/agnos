@@ -153,9 +153,21 @@ check "init-stack pointer array holds argc+envc" $rc
 sh "$ROOT/scripts/check/check-array-sizing.sh" >/dev/null 2>&1 && rc=0 || rc=$?
 check "no function-local array overruns" $rc
 
+# ⛔ THE RELEASE GATE THAT NEVER BOOTED A KERNEL. release.yml gates every release on a job it calls
+# "CI Gate (must pass before release)", but under workflow_call the called workflow sees the CALLER's
+# ref — a tag, never refs/heads/main — so both self-hosted jobs were skipped on every release run.
+# This property is untestable from a developer machine (no way to dispatch a tag-triggered reusable
+# workflow locally), so a static re-read is the only form that can fail. Mutation-tested both ways:
+# reverting a guard reports the job by name, and breaking the parser FAILS rather than passing green.
+sh "$ROOT/scripts/check/check-ci-release-gate.sh" > /tmp/check-ci-gate.log 2>&1 && rc=0 || rc=$?
+check "self-hosted CI jobs run on release tags" $rc
+[ "$rc" = "0" ] || cat /tmp/check-ci-gate.log
+
 # Module-scope symbol collisions between a tests/gpu oracle and a shared layer it includes. SIBLING of
-# the gate above, DIFFERENT scope: that one inspects function-LOCAL arrays, this one cross-file
+# check-array-sizing.sh, DIFFERENT scope: that one inspects function-LOCAL arrays, this one cross-file
 # module-scope declarations, and neither can see the other's class.
+# ⚠ NAMED, NOT "the gate above" — 1.56.52 inserted check-ci-release-gate.sh between the two and a
+# positional back-reference silently started pointing at the wrong gate. Reference gates by filename.
 # ⛔ WHY IT IS NEEDED: cycc warns about a duplicate `fn` and says NOTHING AT ALL about a duplicate
 # `var`, even at conflicting array sizes (measured, cycc 6.5.20). When edgeasm.cyr and asmlib.cyr both
 # declared the layer, 46 symbols collided, cycc reported 33 and built OK, and host-gpu-oracles.sh

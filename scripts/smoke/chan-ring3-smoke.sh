@@ -72,7 +72,7 @@ LOG="$LOGS/chan-ring3.log"
 # An earlier cut matched `CHANX-INH-`, which fired on the FIRST inherited-fd verdict and killed QEMU
 # before the second assertion ran; the truncated log then read as a failing test rather than a cut-off
 # one. This is the exact hazard qemu-dwell.sh's header warns about, met in practice.
-qemu_dwell "$LOG" "CHANX-DONE" "${QEMU_TIMEOUT:-60}" \
+qemu_dwell_kernel "$LOG" "CHANX-DONE" "${QEMU_TIMEOUT:-60}" "$WORK/vars.fd" "$OVMF_VARS_SRC" \
     qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \

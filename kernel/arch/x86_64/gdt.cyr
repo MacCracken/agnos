@@ -79,6 +79,31 @@ fn tss_init_cpu(cpu_id) {
     # Set RSP0 = per-CPU kernel stack
     store64(tss_addr + 4, tss_get_cpu_stack(cpu_id));
 
+    # ⛔⛔ 1.56.52 — IST1 FOR #DF, BECAUSE THE #DF HANDLER WAS RUNNING ON THE STACK WHOSE CORRUPTION
+    # CAUSES #DF. No IST was configured anywhere in the tree: `idt_set_gate` hardcodes byte 4 (the
+    # IST-index byte of a 64-bit gate) to 0 and takes no parameter for it, and this function zeroed the
+    # whole TSS and then wrote exactly two fields — RSP0 and the I/O-map base — leaving IST1..IST7 at 0.
+    # With IST = 0 the CPU performs NO unconditional stack switch on vector 8; it delivers on the
+    # current stack, or on TSS.RSP0 for a CPL3->CPL0 transition. ⇒ In the single commonest cause of
+    # #DF — a bad or overflowed RSP0, which is exactly what idt.cyr`s own vector-8 comment says the
+    # diagnostic is for — the #DF frame cannot be pushed either, and the CPU triple-faults straight to
+    # a silent reset. The entire CMOS diagnostic behind vector 8 is unreachable in its own failure mode.
+    # ⭐ AN IST STACK IS UNCONDITIONAL: on a gate with IST != 0 the CPU loads RSP from TSS.IST[n]
+    # regardless of the current privilege level, so #DF gets a known-good stack no matter how the
+    # faulting context wrecked its own. That is why Linux gives #DF (and NMI/MCE) an IST.
+    # ⚠ THE DIRECT-MAP VA, NOT THE IDENTITY VA — the same reason syscall_kstack_reserve documents at
+    # length: region 7`s identity VA (14-16 MB) sits inside the user-segment range, so a large binary
+    # like ark (segments to ~20 MB) overrides PD[7] in its own per-proc CR3 and would take the #DF
+    # stack with it. The direct map is PDPT[8..511], mirrored into every per-proc CR3 and never
+    # segment-overridden.
+    # ⚠ PLACEMENT IS EXACT AND THE GAP IS FULL. Region 7 (0xE00000-0x1000000) is reserved by pmm_init
+    # and already carries: proc_rsp0 pool 0xE00000-0xF00000, the PRIMARY syscall kstacks (tops
+    # 0xF10000 + cpu*0x10000 ⇒ 0xF00000-0xF40000) and the SECOND/nested ones (tops 0xF90000 +
+    # cpu*0x10000 ⇒ 0xF80000-0xFC0000). The free window is [0xF40000, 0xF80000) — 256 KB, which is
+    # 4 CPUs x 64 KB with nothing left over. Tops are 0xF50000 + cpu*0x10000. Do not add a fifth
+    # consumer here without re-deriving the map.
+    store64(tss_addr + 36, DIRECTMAP_BASE + 0xF50000 + cpu_id * 0x10000);   # 0x24 = IST1
+
     # ⛔⛔ 1.56.52 — THE I/O-MAP BASE IS AT TSS OFFSET 102 (0x66), NOT 100, AND WRITING IT TO 100 GAVE
     # RING 3 THE PORT SPACE. This line said `store16(tss_addr + 100, 104)`. Offset 0x64 = 100 is the
     # RESERVED u16; 0x66 = 102 is `I/O map base address`. The 64-bit TSS is:
@@ -152,6 +177,32 @@ fn tss_iopb_selftest(cpu_id) {
     var tss_addr = &tss_array + cpu_id * 104;
     if ((load16(tss_addr + 102) & 0xFFFF) != 104) { return 0; }   # I/O map base field
     if ((load16(tss_addr + 100) & 0xFFFF) != 0)   { return 0; }   # reserved u16 must stay clear
+    return 1;
+}
+
+# ⭐ 1.56.52 — #DF MUST HAVE AN IST STACK, AND THE CONFIGURATION HAS TO BE ASSERTED because it has no
+# signal of its own: nothing observable changes until a #DF actually happens, and by then the box is
+# either recovering or already gone. Two independent halves have to line up, written by two different
+# functions in two different files, and either one silently zero puts #DF back on RSP0:
+#   - TSS.IST1 (offset 0x24 = 36) must be non-zero and in the direct map, written by tss_init_cpu;
+#   - the vector-8 IDT gate`s byte 4 (IST index) must be 1, written by idt_set_ist AFTER idt_set_gate
+#     has zeroed it. Getting that ORDER wrong is silent and is the likeliest way to break this.
+# ⚠ Checks the DIRECT-MAP range specifically. An IST1 holding region 7`s identity VA would look
+# "configured" and still be wrong — a large binary overriding PD[7] in its per-proc CR3 would take the
+# #DF stack with it, which is the exact hazard syscall_kstack_reserve documents for the same region.
+fn tss_ist_selftest(cpu_id) {
+    if (cpu_id < 0) { return 0; }
+    if (cpu_id >= 4) { return 0; }
+    var tss_addr = &tss_array + cpu_id * 104;
+    var ist1 = load64(tss_addr + 36);
+    if (ist1 == 0) { return 0; }                      # no stack at all -> #DF lands on RSP0
+    if (ist1 < DIRECTMAP_BASE) { return 0; }          # an identity VA is not good enough — see banner
+    if ((load8(&idt + 8 * 16 + 4) & 0x07) != 1) { return 0; }   # vector 8 must select IST1
+    # ⚠ And the OTHER vectors must NOT have been given one by accident: an IST is an unconditional
+    # stack switch, so handing it to a re-entrant vector (the timer, say) would have every nested
+    # delivery reuse one stack and silently corrupt the outer frame.
+    if ((load8(&idt + 14 * 16 + 4) & 0x07) != 0) { return 0; }   # #PF must stay on RSP0
+    if ((load8(&idt + 32 * 16 + 4) & 0x07) != 0) { return 0; }   # the timer must stay on RSP0
     return 1;
 }
 

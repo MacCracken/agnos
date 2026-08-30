@@ -503,7 +503,20 @@ fn msc_alloc_bulk_ring() {
     var link = ring + (MSC_TRB_RING_TRBS - 1) * 16;
     store64(link + 0, ring);
     store32(link + 8, 0);
-    store32(link + 12, (XHCI_TRB_LINK << 10) | 0x2 | 0x1);  # TC=1, cycle=1
+    # ⛔⛔ 1.56.52 — NO `| 0x1`. The initial Link TRB C bit must be the OPPOSITE of the producer cycle,
+    # and msc_configure_endpoints seeds both directions at PCS = 1 (`store8(row + 32, 1)` /
+    # `store8(row + 33, 1)`), so writing C = 1 here made C == PCS at ring creation — the exact polarity
+    # xhci_ring.cyr documents as wrong in its "Repair (LL) 2026-05-17" note, per xHCI 1.2 §4.9.3.1:
+    # the Link starts opposite PCS so hardware does not FOLLOW it before software has filled the ring.
+    # The command ring was corrected then; the MSC bulk rings were missed and kept the old polarity.
+    # ⚠ Nothing downstream compensated: msc_bulk_enqueue only rewrites the Link C bit at the wrap
+    # itself, i.e. after 63 TRBs, so this value is what the controller sees for the ring`s whole life
+    # up to that point.
+    # ⚠ Taken on the same reasoning as its precedent — "defensive fix even though the first Enable Slot
+    # doesn`t reach wrap". Because the page is zeroed, HW stops at slot 0 (C=0 != PCS=1) today, so this
+    # is spec conformance rather than a demonstrated hang; the precedent was taken anyway, and a
+    # divergence between two rings in the same driver is worse than either polarity consistently.
+    store32(link + 12, (XHCI_TRB_LINK << 10) | 0x2);        # TC=1, C=0 (opposite of the initial PCS)
     return ring;
 }
 
@@ -1021,6 +1034,13 @@ fn msc_reset_recovery(slot_id) {
     xhci_drain_transfer_events(slot_id);
 
     # --- Step 8: host-side ring rewind ---
+    # ⛔⛔ 1.56.52 — THE LINK C BIT IS 0 HERE TOO. This block re-establishes the rings from scratch, so
+    # it must reproduce msc_alloc_bulk_ring`s polarity exactly: the initial Link C bit is the OPPOSITE
+    # of the producer cycle (xHCI 1.2 §4.9.3.1), and the two stores below reset both producer cycles to
+    # 1. Writing `| 0x1` here restored C == PCS == 1 on the same two ring pages the allocator had just
+    # been fixed to get right — so the fix would have lasted exactly until the device`s first stall,
+    # and every subsequent recovery would have undone it again. A fix that only holds until the error
+    # path runs is not a fix, and this path exists BECAUSE errors happen.
     var ring_in  = load64(row + 16);
     var ring_out = load64(row + 24);
     if (ring_in != 0) {
@@ -1028,14 +1048,14 @@ fn msc_reset_recovery(slot_id) {
         var link_in  = ring_in + (MSC_TRB_RING_TRBS - 1) * 16;
         store64(link_in + 0,  ring_in);
         store32(link_in + 8,  0);
-        store32(link_in + 12, (XHCI_TRB_LINK << 10) | 0x2 | 0x1);
+        store32(link_in + 12, (XHCI_TRB_LINK << 10) | 0x2);         # C=0 — see msc_alloc_bulk_ring
     }
     if (ring_out != 0) {
         xhci_zero_page(ring_out);
         var link_out = ring_out + (MSC_TRB_RING_TRBS - 1) * 16;
         store64(link_out + 0,  ring_out);
         store32(link_out + 8,  0);
-        store32(link_out + 12, (XHCI_TRB_LINK << 10) | 0x2 | 0x1);
+        store32(link_out + 12, (XHCI_TRB_LINK << 10) | 0x2);        # C=0 — see msc_alloc_bulk_ring
     }
     store8 (row + 32, 1);   # bulk_in_cycle  -> 1 (initial)
     store8 (row + 33, 1);   # bulk_out_cycle -> 1 (initial)

@@ -339,6 +339,20 @@ else
 
         [ -n "$NET_SELFTEST" ]       && echo '#define NET_SELFTEST'
         [ -n "$LOOPBACK_SELFTEST" ]  && echo '#define LOOPBACK_SELFTEST'
+        [ -n "$NET_CSUM_SELFTEST" ]   && echo '#define NET_CSUM_SELFTEST'
+        # HID_RECLAIM_SELFTEST=1 — 1.56.52: prove a HID Transfer Event consumed by one of the xHCI
+        # synchronous waiters is handed back to the owning interrupt-IN ring. Fully hermetic: brings
+        # its own event ring, transfer ring and doorbell page, so it needs no USB hardware.
+        [ -n "$HID_RECLAIM_SELFTEST" ] && echo '#define HID_RECLAIM_SELFTEST'
+        # USERWIN_SELFTEST=1 — 1.56.52: does "user pointer" mean the CALLER'S memory, or merely a low
+        # address? Runs under a real per-process CR3 (the boot CR3 takes is_user_range's exemption and
+        # would score a meaningless pass) and checks both directions: kernel memory inside the low
+        # window is REJECTED, pages the address space owns — low arena AND high arena — are ACCEPTED.
+        [ -n "$USERWIN_SELFTEST" ] && echo '#define USERWIN_SELFTEST'
+        # DHCP_OPT_SELFTEST=1 — 1.56.52: dhcp_find_option must refuse an option SHORTER than the
+        # width its caller is about to read. Hermetic: pure function over an in-memory blob, which is
+        # the only way to test an attack that otherwise needs a hostile DHCP server on the boot exchange.
+        [ -n "$DHCP_OPT_SELFTEST" ] && echo '#define DHCP_OPT_SELFTEST'
         [ -n "$PMM_FULLRAM_SELFTEST" ] && echo '#define PMM_FULLRAM_SELFTEST'
         [ -n "$PMM_HIRAM_SELFTEST" ] && echo '#define PMM_HIRAM_SELFTEST'
         [ -n "$PMM_RAMSTRESS_SELFTEST" ] && echo '#define PMM_RAMSTRESS_SELFTEST'

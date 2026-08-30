@@ -262,6 +262,411 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   — DHCP OFFER/ACK arrive at 255.255.255.255 while `net_ip` is still 0, and gating those out would
   break the one thing this path must not break. Verified: loopback / DNS / NTP / ICMP smokes all pass.
 
+### Security — P0: "user pointer" meant *a low address*, not *a page the caller owns*
+
+- **`is_user_ptr` / `is_user_range` were pure VA bounds checks**, and their comment reasoned entirely
+  about what lies *above* the 1 GB ceiling — device BARs, the 1–4 GB PDPT mirror — and never asked what
+  lies *inside* it. Under every per-process CR3 the answer is: the kernel.
+  `proc_create_address_space` copies kernel `PD[0..127]` (0–256 MB, identity, **U/S=0**) into each new
+  address space and explicitly rewrites `PD[8..127]` as `(hi * 0x200000) | 0x83` so the kernel can
+  reach the whole PMM pool. Measured on a freshly created address space:
+
+  | VA | `is_user_range` | PDE | present | user |
+  |---|---|---|---|---|
+  | `0x300000` — kernel image | **1** | `0x2000e3` | 1 | **0** |
+  | `0xE00000` — `proc_rsp0` pool | **1** | `0xE00083` | 1 | **0** |
+  | `0xF10000` — CPU0 SYSCALL kernel stack | **1** | `0xE00083` | 1 | **0** |
+  | `0x8000000` — identity window interior | **1** | `0x8000083` | 1 | **0** |
+
+  A syscall runs at CPL0 on the caller's CR3 with **AC=1** (the entry `STAC`), so SMAP is inert and a
+  supervisor page is freely accessible. Every arm that does a raw `load8`/`store8` on a validated
+  pointer — rather than going through `proc_copy_to_user` / `proc_copy_from_user`, which *do* check the
+  user bit — therefore read or wrote kernel physical memory on ring 3's behalf:
+  - `write(1, (void*)0x300000, 4096)` → 4 KB of the kernel image to stdout (**disclosure**)
+  - `read(fd, (void*)0xF08000, 0x8000)` → file bytes over CPU0's syscall kernel stack (**ring-0 execution**)
+
+  Unprivileged, deterministic, no crafted input, and every syscall taking a buffer is a candidate.
+  ⭐ **The check is now a page-table walk** (`user_range_mapped`) requiring PRESENT + **U/S=1** on every
+  2 MB page in the range, under the **live** CR3 (`dm_read_cr3()`, not `proc_get_cr3(current)` — the two
+  can disagree, which is why `fault_kill_current` prints both). The window survives only as a cheap
+  pre-filter. `is_user_ptr(p)` is now `is_user_range(p, 1)`.
+  ⚠ **The boot-CR3 exemption is not a hole**: boot self-tests drive syscall arms from kernel context
+  under CR3 `0x1000`, where the whole low window is supervisor identity and every walk would refuse.
+  Ring 3 cannot reach that branch — the SYSCALL stub runs on the calling process's CR3, and the one
+  place the kernel switches to `0x1000` mid-syscall (`spawn#3`) does so strictly *after* its
+  `is_user_range` call.
+
+### Fixed — P1: the high mmap arena was unreachable through the syscall ABI
+
+- **`sys_mmap` spills allocations too big for the ~768 MB low arena into `[128 GB, 512 GB)`, and the
+  1 GB ceiling then rejected every pointer into that region** — a process could obtain high memory and
+  never pass it to a syscall. `is_user_range` now admits `[himmap_floor(), HIMMAP_CEILING)`.
+  ⛔ **Widening the window alone would have been catastrophic**, which is why this could not ship before
+  the walk above. The kernel direct map owns `PDPT[8..511]` — VA 8 GB upward, the same PDPT range the
+  high arena lives in — so a hardcoded 128 GB floor on a box with more than ~120 GB of RAM hands ring 3
+  a name for arbitrary physical memory. Two independent things make it safe and both must stay: the
+  floor is **derived** from what `pmm_setup_directmap` actually installed (`himmap_floor()`, never the
+  `USER_HIMMAP_BASE` constant), and the walk refuses any page whose U/S bit is clear — which every
+  direct-map entry's is. Belt and braces, because the floor is a computation and U/S is hardware truth.
+  ⚠ The wrap check runs **first**, before any window comparison: Cyrius comparisons are signed, so a
+  length of `-1` would otherwise satisfy `ptr + len <= ceiling` while naming the whole address space.
+
+- **`proc_copy_to_user` / `proc_copy_from_user` hardcoded `PML4[0]` and `PDPT[0]`**, which is correct
+  only below 1 GB — survivable while the ceiling *was* 1 GB, not once a high VA is a legal pointer. A
+  high VA walked through entry 0 lands on `(va >> 21) & 0x1FF` of the **low** page directory: `0x2010000000`
+  aliases to `PD[128]`, the low mmap arena. The copy would silently read or write a different page of
+  the same process than the caller named. Both now index every level from the VA, and both reject a
+  supervisor PDPT entry and a 1 GB page outright.
+  ⭐ Gated by the **aliasing** case specifically, not by a plain "does a high VA work" arm: the gate
+  maps a second high page at `himmap_floor() + 0x10000000` — PD index 128, the *same slot* as its low
+  probe page — writes a marker through `proc_copy_to_user`, and asserts the marker landed in the high
+  frame **and** that the low page is untouched. Mutation-tested by restoring the hardcoded PDPT index:
+  the copy lands in the aliased low page and `proc_copy_to_user` still returns **success**, which is
+  exactly why a does-it-work arm would have scored a pass while corrupting.
+
+⚠ **`is_user_array` still bounds its count against the LOW window** (`count > 0x40000000 / stride`),
+so a high-arena buffer with a very large element count is rejected even though the range would fit.
+That fails **closed** — a conservative refusal, not a hole — and is left alone deliberately: the bound
+is a division specifically so it cannot itself overflow, and re-deriving it per-window would trade a
+provably-safe check for one that has to be re-argued. Named here so it is a known limit rather than a
+future surprise.
+
+⚠ **Cross-arch**: `user_range_mapped` is x86 page-table shaped (PML4/PDPT/PD, U/S, PS) and lives in the
+unconditionally-included `syscall.cyr`. It adds **no new aarch64 dangler** — `dm_read_cr3`,
+`pmm_kva_for_access` and `directmap_pdpt_top` are already referenced from `pmm.cyr`, `acpi.cyr` and
+`proc.cyr`, all unconditionally included, so that port was already depending on `core/vmm.cyr` symbols
+it does not get. It does mean the aarch64 port will need a real answer here, not a stub that returns 1.
+
+⭐ **`scripts/smoke/userwin-smoke.sh`** runs under a **real per-process CR3** — under the boot CR3
+`is_user_range` takes its exemption and every arm would score a meaningless pass, so the gate builds an
+address space, `cr3_load`s it, collects verdicts as flags, restores CR3, and only then prints. It checks
+**both directions**: kernel image, `proc_rsp0` pool, SYSCALL kernel stack, identity-window interior, an
+unmapped arena VA and a direct-map VA are all **rejected**; pages the address space genuinely owns — one
+in the low arena *and* one in the high arena — are **accepted**. Without those accept arms, "reject
+everything" would pass. Negative length and a range running past the end of the one mapped page are
+rejected too. Mutation-tested: removing the U/S check on the PDE — i.e. the pre-1.56.52 behaviour —
+reports all four kernel-memory arms by name.
+⚠ **What this gate does not cover**: the *derived* floor has no observable effect below ~120 GB of RAM,
+where `himmap_floor()` returns exactly `USER_HIMMAP_BASE`. A mutation swapping the derivation for the
+constant scores a PASS here, and that was measured, not assumed. The gate asserts the derivation itself
+instead — `himmap_floor() >= (directmap_pdpt_top + 1) * 0x40000000` — which holds on any box.
+
+### Fixed — a HID endpoint could run dry because another consumer ate its events
+
+- **The xHCI event ring is shared, and only `hid_poll` knew what a Transfer Event on an interrupt-IN
+  endpoint means** — that one armed TRB was consumed and another must be armed. The three synchronous
+  waiters (`xhci_wait_transfer_for_trb`, `xhci_wait_transfer_event`, `xhci_drain_transfer_events`)
+  spin on that same ring for *their* TRB and consume everything else to keep it moving. Each such
+  consume cost the owning HID ring one of its **16** armed TRBs, permanently. ⇒ Type while a USB disk
+  is doing bulk I/O and the keyboard degrades one TRB per keystroke; at 16 the endpoint has none left,
+  the controller posts nothing further, and input is dead for the rest of the boot with no error
+  anywhere. The reverse direction was already known and mitigated by ordering — `main.cyr` defers
+  arming the xHCI MSI-X vector until after `hid_kbd_configure` precisely so `hid_poll` cannot steal
+  EP0 completions from `xhci_wait_transfer_event` — but the forward direction was never handled.
+  The waiters now call `hid_reclaim_event(slot, dci)` before consuming a Transfer Event.
+  ⚠ **Re-arm only, never fold**: the report bytes are dropped. Folding them would run
+  `hid_process_report` from inside an MSC spin loop without `hid_poll_lock`, racing the real drain over
+  `hid_mouse_dx` and `kb_buf`. A keystroke lost during disk I/O beats a corrupted accumulator.
+  ⛔ **And it defers rather than arming**: the waiters run in thread context with interrupts **on**, so
+  the ISR could interrupt `hid_arm_row_trb` mid-update and corrupt `hid_ep_idx`/`hid_ep_cycle` —
+  trading a slow leak for ring corruption. The waiter bumps `hid_ep_rearm[row]`; `hid_service_rearms`
+  does the ring work under `hid_poll_lock`, driven by the 100 Hz tick, so a dry endpoint is paid back
+  within 10 ms even though no MSI-X will ever arrive to wake it.
+
+- **`hid_ep_idx` / `hid_ep_cycle` on a KEYBOARD row are a decoy, and `hid_recover_halted` read them.**
+  `hid_kbd_configure` registers the keyboard with the *same* ring and buffer as the `hid_kbd_*` globals
+  but a *separate* idx/cycle pair, and nothing in the steady-state path advances that pair — `hid_poll`
+  arms the keyboard through `hid_arm_xfer_trb`, which walks `hid_kbd_xfer_idx`/`hid_kbd_xfer_cycle`. So
+  the row's copy reads **0 / 1 forever**. Keyboard halt recovery therefore issued
+  `Set TR Dequeue Pointer` at ring slot **0** with cycle **1** while the real producer sat elsewhere:
+  the endpoint resumed on stale TRBs, or on a cycle mismatch halted again immediately. One ring with
+  two independent producer indices is the underlying hazard; `hid_row_arm` / `hid_row_idx` /
+  `hid_row_cycle` now route every caller to whichever pair is real for that row.
+
+⭐ **`scripts/smoke/hid-reclaim-smoke.sh`** — hermetic, and needs no USB hardware: the selftest brings
+its own event ring, transfer ring, doorbell landing pad and a synthetic HID row it registers and then
+un-registers, all under `hid_poll_lock` (which is what makes swapping `xhci_evt_ring_phys` and
+`xhci_mmio_base` safe — every `hid_poll` caller bails at its own try-lock before reading either).
+Reproducing the real thing needs a HID device *and* a USB disk *and* an operator typing during the
+transfer, sixteen times, which is why it survived to 1.56.52. Four arms: a foreign `(slot, dci)` is a
+silent miss; our event is claimed and **deferred**, not armed inline; the service pass arms exactly one
+IOC-bearing Normal TRB and rings the doorbell for the right DCI; and a **real waiter** drives the whole
+path — the arm that proves the reclaim is wired in rather than merely present. Mutation-tested three
+ways, each caught by the arm built for it: dropping the call site → `a real waiter consumed a HID event
+without reclaiming it`; claiming every event → `a foreign event was claimed as ours`; arming inline →
+`the ring was armed from the waiter, not deferred`.
+
+### Security — three "P2" items that were not P2
+
+The 1.56.51 P2 table was re-derived against the tree on 2026-08-30 — every entry read at its site,
+every *already-fixed* claim then adversarially refuted before being recorded, because a false ✅ buries
+a live defect where nobody looks again. 14 survived as genuinely fixed, 15 were open, 0 were stale.
+**Three of the 15 were mis-graded**, and all three are below. ⛔ That is now the third time this
+backlog's severity labels have been wrong in the dangerous direction.
+
+- **`dhcp_find_option` validated that an option's declared length FITS, never that it is big enough
+  for its reader** (`kernel/core/net_dhcp.cyr`). All five call sites read a fixed width off the
+  returned offset: 1 byte for option 53, and 4 bytes for options 54 / 1 / 3 / 6 through
+  `dhcp_load_u32_be`, which is four unguarded `load8`s. A server — or anyone able to spoof one on-link
+  during the boot exchange, the xid/chaddr match being the only barrier — sends a 1024-byte reply
+  whose **last** option declares `len 0`. That option sits at `i = opts_len - 2`, the old bound
+  `i + 2 + olen > opts_len` passes *exactly*, and the returned offset **is** `opts_len` — so the
+  4-byte read starts at `&rx + 240 + (n - 240)` = `&rx + n`, up to 4 bytes past the end of
+  `var rx[1024]`, which is **function-local and therefore 1024 bytes**. Those bytes become
+  `net_gateway` / `net_dns_server` and are **printed** to the console and into the klug ring.
+  Remotely-triggered ring-0 stack disclosure — the same class as the 1.56.51 `net_recv_udp` fix.
+  ⚠ Even in bounds it mis-parsed silently: a 1-byte option 3 made `assigned_gw` one real byte plus
+  three bytes of the *next* option.
+  ⭐ The bound went in the **helper**, not at each site — `dhcp_find_option(opts, len, tag, need)` —
+  for the reason written out above `is_user_array`: five callers exist today and each new arm would
+  otherwise have to remember. A refusal looks to every caller exactly like "option absent", which they
+  all already handle.
+
+- **IPv4 fragments were neither reassembled nor rejected** (`kernel/core/net_ingress.cyr`). Grep the
+  whole net stack for `frag` before this cut and there is nothing: `net_demux_frame` decoded ihl,
+  total length, protocol, src and dst, and never touched bytes +6/+7 where the flags and the 13-bit
+  offset live. The body of a **non-first fragment** was handed to the L4 handlers as though it were an
+  L4 header. ⚠ The receive checksums added earlier in this same cut are **not** a filter: the IPv4
+  header sum does not cover the payload, and the attacker owns the fragment body — for UDP, two zero
+  bytes at `l4+6/+7` take the RFC 768 "not computed" skip; for ICMP and TCP a sum can simply be
+  computed over what is sent. The TCP arm is the sharp end: a crafted body becomes a TCP header, and a
+  SYN to a listening port allocates two `kmalloc` buffers. Unauthenticated, remote, and an allocation
+  trigger as well as parse confusion. Now refused and counted (`net_drop_ip_frag`).
+  ⛔ **The test is `& 0x3FFF`, not `& 0x7FFF`.** Bytes 6–7 are flags(3) + offset(13): `0x8000`
+  reserved, `0x4000` DF, `0x2000` MF, `0x1FFF` offset. A datagram is unfragmented iff MF == 0 **and**
+  offset == 0. Folding DF into the test would drop nearly every packet the box receives — path-MTU
+  discovery sets it on most real traffic — while passing both fragment arms and looking correct.
+  ⚠ Placed after the header checksum so a corrupt header is reported as a checksum drop, not
+  miscounted as a fragment. Legitimate oversized traffic (a >MTU DNS reply) is now dropped rather than
+  mis-parsed; reassembly is a separate piece of work.
+
+- **No tagged release has ever had its kernel booted by CI** (`.github/workflows/ci.yml`).
+  `release.yml` fires only on tag refs and gates the release on `ci: uses: ./.github/workflows/ci.yml`
+  — a job it names *"CI Gate (must pass before release)"*. Under `workflow_call` the called workflow
+  evaluates `github.ref` as the **caller's** ref, which for a tag push is `refs/tags/v1.56.52` and
+  never `refs/heads/main`. Both self-hosted jobs (`boot-test`, `benchmarks`) carried
+  `if: … && github.ref == 'refs/heads/main'`, so both were skipped on every release; and `release.yml`
+  has no boot of its own — grep it for qemu/boot/smoke/ktest and the only hit is a prose comment.
+  ⚠ CLAUDE.md's Closeout step 2 ("Boot sweep") assumed that gate existed.
+  ⭐ **`scripts/check/check-ci-release-gate.sh`** (check.sh 31 → 32) is the durable half: the property
+  cannot be tested from a developer machine — there is no way to dispatch a tag-triggered reusable
+  workflow locally — so the fix would otherwise be asserted and never exercised. Mutation-tested both
+  ways: reverting a guard names the job, and **breaking the parser fails rather than passing green**,
+  which is the specific trap this repo has now hit four times.
+
+### Fixed — what an adversarial review of this cut's own P2 batch found
+
+Every change in the P2 batch was then attacked by an independent reviewer told to break it, and every
+problem claimed was independently confirmed before being acted on. **15 were real** (11 dismissed).
+They are listed because the shape of them is the useful part: none was in the *finding*, all were in
+the *fix*.
+
+- ⛔ **A gate I had just written could not fail.** `tss_ist_selftest`'s "the timer must stay on RSP0"
+  arm reads IDT vector 32 — but the call sat beside `exc_handlers_init`, twelve lines *before*
+  `idt_set_gate(&idt + 32 * 16, …)`. It was reading `idt_init`'s default gate, whose byte 4 is
+  hardcoded 0, so it passed unconditionally and could never have caught the regression it names.
+  Moved below the timer install; mutation-tested by actually adding `idt_set_ist(32, 1)`, which now
+  reports `#DF HAS NO IST`. ⇒ **A check placed before the thing it inspects is not a weak check, it is
+  no check** — and this is the same class this cut spent a day fixing in the harness.
+
+- ⛔ **The `acpi_va` fix for the ACPI reset register was inert.** `acpi_va` only takes its
+  `DIRECTMAP_BASE` branch when the live CR3 is the kernel PML4 (`0x1000`), and `power_reset` is reached
+  through syscall #13 running on the *calling process's* CR3 — so it fell to `return phys` and handed
+  back exactly the address it was called to translate. And even under CR3 `0x1000` it would not have
+  helped: the direct map covers `pmm_memmap_ram_top`, which is EfiConventionalMemory only, while a
+  SystemMemory RESET_REG at ≥ 4 GB is by construction a device register *outside* type-7 RAM. Replaced
+  with a refusal that falls through to CF9, following `iommu.cyr`'s precedent.
+
+- ⛔ **The ICMP destination fix reopened its own hole.** Admitting `127/8` "for loopback" let a frame
+  arriving *off the NIC* with IPv4 dst `127.0.0.1`, sent to the broadcast MAC, take the reply path —
+  the same amplifier, one address over. `net_demux_frame` is the shared demux for both the lo queue and
+  the wire and passes no discriminator. Removed: the only in-tree ICMP loopback consumer is
+  `icmp_ping(net_ip, 0)`, which the unicast test already admits.
+
+- ⛔ **The sibling site was left alone.** `ip_dst` was threaded into the ICMP and UDP arms but not TCP,
+  and TCP is the worse case: with any listener bound, a broadcast-addressed SYN took the passive-open
+  path — two `kmalloc`s, a slot from the 8-entry conn table, and a SYN-ACK to the *spoofed* source.
+  Eight frames exhaust the table. Now gated on unicast-to-us.
+
+- ⛔ **The MSC Link-TRB fix lasted until the first stall.** `msc_reset_recovery`'s step-8 ring rewind
+  re-established `C == PCS == 1` on the same two ring pages `msc_alloc_bulk_ring` had just been fixed to
+  get right, and every subsequent recovery would have undone it again. ⇒ A fix that only holds until the
+  error path runs is not a fix, and that path exists *because* errors happen.
+
+- ⛔ **The new CI gate had two ways to pass wrongly.** It line-parsed YAML, so an `if:` whose
+  `github.ref` test sat on a *continuation* line read as "does not test github.ref" — an affirmatively
+  wrong PASS for the exact guard the gate exists to catch. And its vacuity check only fired when *all*
+  self-hosted jobs vanished, so dropping one of two stayed green. Now absorbs continuation lines and
+  asserts an expected job count. Both mutation-tested.
+
+- **`#92` op 0x0A's new corner bound is evaluated in the wrong coordinate frame** — screen, where the
+  shader samples rect-local. Measured: a well-formed batch at a non-origin rect is still **accepted**,
+  so it rejects nothing realistic, and that measurement is now a permanent battery case (174 cases).
+  ⚠ **Not fixed here, deliberately**: the bound was copied from op 0x09, which is *shipped and burned*,
+  so changing what it accepts is an ABI-semantics change to a burned op and wants an operator ruling.
+  Filed as [`issues/2026-08-30-tri-corner-bound-coordinate-frame.md`](docs/development/issues/2026-08-30-tri-corner-bound-coordinate-frame.md).
+
+- Five comment defects, each a statement that was simply false: two blobs in the DHCP selftest whose
+  annotated arithmetic described a *different* blob; an archaemenid surface given as 2560×1600 when
+  every other statement in the tree says 2560×1440; "both call sites" for a function with six, naming
+  an `inb` path deleted with the i8042; and a `check.sh` back-reference reading "the gate above" that
+  the new gate's insertion silently repointed. ⇒ Reference gates by filename, not by position.
+
+### Fixed — the rest of the P2 tail (12 items)
+
+- **`#DF` had no IST stack, so its diagnostic was unreachable in its own failure mode**
+  (`kernel/arch/x86_64/idt.cyr`, `gdt.cyr`). `idt_set_gate` hardcoded byte 4 — the IST-index byte of a
+  64-bit gate — to 0 for all 288 gate installs and took no parameter for it, and `tss_init_cpu` zeroed
+  the TSS and then wrote exactly two fields, leaving IST1..IST7 at 0. With IST = 0 the CPU performs
+  **no unconditional stack switch** on vector 8; it delivers on the current stack, or on `TSS.RSP0` for
+  a CPL3→CPL0 transition. ⇒ In the commonest cause of `#DF` — a bad or overflowed RSP0, which is
+  exactly what idt.cyr's own vector-8 comment says the CMOS diagnostic exists for — the `#DF` frame
+  cannot be pushed either, and the CPU triple-faults to a silent reset. Now `TSS.IST1` (offset 0x24)
+  carries a per-CPU stack and `idt_set_ist(8, 1)` points vector 8 at it.
+  ⚠ **The direct-map VA, not the identity VA** — region 7's identity VA (14–16 MB) is inside the
+  user-segment range, so a large binary overriding `PD[7]` in its per-proc CR3 would take the `#DF`
+  stack with it. Same reasoning `syscall_kstack_reserve` records for the same region.
+  ⚠ **Placement is exact**: region 7 already holds the proc_rsp0 pool (`0xE00000`–`0xF00000`), the
+  primary syscall kstacks (`0xF00000`–`0xF40000`) and the nested ones (`0xF80000`–`0xFC0000`). The free
+  window is `[0xF40000, 0xF80000)` — 256 KB, which is 4 CPUs × 64 KB with nothing left over.
+  ⭐ `tss_ist_selftest` asserts **both** halves plus the negative: `#PF` and the timer must **not** have
+  been given an IST, since an unconditional stack switch on a re-entrant vector would have every nested
+  delivery reuse one stack. Mutation-tested three ways — no IST1, an identity VA, and calling
+  `idt_set_ist` *before* `idt_set_gate` (which silently rewrites byte 4 to 0).
+  ⛔ **The gate earned itself immediately**: placed beside the other TSS selftest it reported a correct
+  configuration as broken, because `idt_init()` had not run yet and the gate it inspects did not exist.
+  An asserted-only fix would have shipped looking fine.
+
+- **`iommu_allow_dma_2mb` aliased any address ≥ 1 GB onto an existing grant.** `(phys >> 21) & 0x1FF`
+  masks to 512 entries — one 4 KB second-level table = exactly 1 GB — and the context entry hardcodes
+  AGAW=1/30-bit, so the table genuinely spans 1 GB. An address at or above that wrapped onto an
+  existing index and **overwrote it**, with no present-bit test and no error: the earlier grant is
+  destroyed *and* the caller does not get the grant it asked for, since translation is identity so the
+  device DMAs at IOVA == phys while the table now maps `phys mod 1 GB`. Now refused.
+  ⚠ Latent on archaemenid (AMD — no DMAR, `iommu_active` stays 0) and live on any Intel VT-d box. That
+  is a reason to fix it blind, not to leave it: nothing on this bench can produce it, so it would
+  surface first on somebody else's hardware.
+
+- **The ACPI SystemMemory reset register was written as a raw physical address** (`kernel/core/power.cyr`).
+  `acpi_reset_addr` comes straight from the FADT GAS and is never translated; the arming logic gates on
+  FADT revision, `RESET_REG_SUP` and non-zero, but never on `< 4 GB`. All four `acpi_load*` helpers
+  route through `acpi_va` and there was no store counterpart. Firmware advertising a SystemMemory
+  RESET_REG at or above 4 GB lands on a VA the kernel PML4 does not map, turning the last-ditch reboot
+  rung into a CPL0 `#PF` hang. Now `store8(acpi_va(acpi_reset_addr), …)` — a no-op below 4 GB.
+
+- **`net_handle_icmp` answered echo requests without checking the destination** — a smurf amplifier.
+  Broadcast reception is required for ARP, so a frame addressed to `255.255.255.255` reached it
+  normally, and the type-8 arm replied with `icmp_len < 8` as its only precondition: one broadcast
+  request, one unicast reply from every agnos box on the segment. `ip_dst` is now threaded in and the
+  reply is gated on unicast-to-us or loopback.
+  ⚠ Deliberately a **narrower** address set than `net_handle_udp`'s: that one must admit broadcast
+  because DHCP OFFER/ACK arrive at `255.255.255.255` while `net_ip` is still 0. An echo reply has no
+  such requirement. Loopback stays admitted — `loopback_selftest` pings `net_ip` and asserts the reply.
+
+- **The MSC bulk ring's Link TRB was created with C == PCS** (`kernel/arch/x86_64/usb/msc.cyr`). The
+  initial Link C bit must be the *opposite* of the producer cycle (xHCI 1.2 §4.9.3.1) so hardware does
+  not follow it before software has filled the ring; `msc_configure_endpoints` seeds both directions at
+  PCS = 1 and this wrote C = 1. That is the exact polarity `xhci_ring.cyr` documents as wrong in its
+  "Repair (LL) 2026-05-17" note — the **command** ring was corrected then and the MSC bulk rings were
+  missed. Nothing downstream compensated: `msc_bulk_enqueue` only rewrites the Link C bit at the wrap,
+  63 TRBs later. Taken on its precedent's own reasoning ("defensive fix even though the first Enable
+  Slot doesn't reach wrap"); a divergence between two rings in one driver is worse than either polarity
+  applied consistently. Verified against `msc-short-smoke`, both A/B arms.
+
+- **`gpu_scanout_matchgeom` overrode the console geometry without bounding it by the real framebuffer.**
+  Every guard was a plausibility check on the register values themselves; none compared the result to
+  how much framebuffer exists. `fb_set_geom` is a bare three-field store, and afterwards
+  `fb_pitch()`/`fb_width()`/`fb_height()` are what **every paint site** computes its address from. A
+  pitch register reading up to 16383 px (the `0x3FFF` mask) with a 4096-px height describes a 268 MB
+  surface. Now bounded by `fb_size_or_fallback()` — the function whose own comment calls itself the
+  single source of truth "so the WC remap site and any future verify paths agree", and which until now
+  had only its two WC-remap callers.
+  ⚠ Read **before** `fb_set_geom` or it is circular: its fallback arm is `fb_pitch() * fb_height()`.
+  ⚠ The real archaemenid case *shrinks* the extent (a 2560×1600 boot_info surface overridden to the
+  panel's true 800×600), so it passes with room to spare — the bound only catches the growth direction.
+
+- **`gpu_caps#89` bit3 promised that `#92` would not then return `E_NOGPU`, and did not check two of
+  its four preconditions.** `gpu_shader_op_sys` gates on `gpu_present`, `gpu_matmul_ok`,
+  `gpu_blit_arm()` **success** and `gpu_bb_pitch != 0`; the caps gate tested `gpu_present`,
+  `gpu_arena_mc`, `gpu_ring_wptr`, `gpu_matmul_ok` — and the bare `gpu_blit_arm();` call **discarded its
+  return value**. The two omissions are independently reachable: `gpu_blit_arm` returns 0 on
+  `gpu_display_ok != 1`, a bad pipe or surface, a null `boot_info_ptr`, zero pitch or height, or the
+  back-buffer TMR bound — none of which touch the three the caps gate did test. On such a box bit3 read
+  SET and the next `#92` returned `E_NOGPU`: the exact "call it and read the error" shape `#86` already
+  proved wrong. ⚠ The two extra conditions are kept rather than dropped, because the invariant to hold
+  is `bit3 set ⇒ #92 will not refuse`, not set-iff.
+
+- **`#92` op 0x0A (TRI_LIST) had no frame-skew corner bound**, which op 0x09 documents as mandatory —
+  and this is not a stylistic sibling: op 0x0A reaches the **same shader**
+  (`gpu_tri_list` → `gpu_tri_rgba` → `gpu_tri_prep`), so it was the unguarded door to code op 0x09
+  guards. Added per triangle, bounding the ratio rather than clamping E (clamping breaks gradient
+  reproduction at the far corner instead of merely bounding it).
+  ⭐ **Battery 171 → 173**: the reject, plus the origin **control** that keeps it honest — without the
+  control, a bound that rejected every TRI_LIST record would score a pass. The count is asserted, not
+  printed, so adding a case without updating it fails the gate. Mutation-tested: removing the bound
+  reports `list: frame skew beyond the ratio want 23 got 0`.
+
+- **`#93 mdo_validate` had no operand block for `MDO_OP_CRCCAL`** — the one advertised op that
+  accepted-and-ignored its record fields. Bit 10 is set in `MDO_OP_SUPPORTED`, the dispatch runs
+  `mdo_crccal()`, and that function takes no arguments and reads nothing, so dwords +8/+12/+16/+20 were
+  silently ignored. Every other op refuses a dword it does not define, for the reason written out
+  repeatedly in that function: a field ignored today is a field a caller starts populating, and it
+  becomes load-bearing ABI the moment a revision gives it meaning. Refusing now costs nothing, because
+  no caller can depend on a value that has never been read.
+
+- **`net_handle_tcp`'s stack canary was checked on 2 of 23 exits, and had nothing to protect.**
+  Twenty-one exits — every early drop and every hot ESTABLISHED/SYN_RCVD path — skipped it, and the
+  function declares **zero** local arrays: every local is a scalar. A canary guards a local *buffer*;
+  with no buffer there is no mechanism it could catch on any exit. It was not free either —
+  `stack_canary_check` halts the CPU on mismatch — so what stood there was an incoherent,
+  mostly-unreachable panic path in the hottest function of the receive stack that *read as protection*.
+  ⇒ **Removed rather than completed.** Adding it to all 23 exits would spend real work making a
+  mechanism with nothing to detect look thorough.
+
+- **`scancode_to_ascii`'s "Bounds check" was vacuous** (`kernel/arch/x86_64/keyboard.cyr`). The release
+  branch above it opens with `if (sc > 127)` and every path inside returns, so `if (sc >= 128)` could
+  never fire. The index it *failed* to screen is a **negative** `sc` — Cyrius has no unsigned types, so
+  `sc > 127` and `sc >= 128` are both false and `load8(&sc_normal + sc)` reads below the table. No
+  current caller can produce one, so this is latent rather than live; closing it costs one compare.
+
+- **`timer_handler`'s comment named two guarantees that do not exist** (`kernel/arch/x86_64/pic.cyr`).
+  It claimed `hid_poll` "self-gates (hid_kbd_slot_id==0 → no-op pre-enum)" — that guard was **deleted**,
+  and hid.cyr records why: on a box with a mouse and no keyboard it drained nothing and never cleared
+  `IMAN.IP`, so every device went quiet. And "is cli-first RX-only, so it is … non-re-entrant" is false
+  on SMP — already corrected 165 lines below in the same file, on the MSI-X arm, without this copy
+  being touched. `hid_poll` is re-entrancy-safe because it takes its own try-lock, not because of `cli`.
+  ⚠ A comment promising a guard that was removed is worse than no comment: it tells the next reader the
+  caller is already protected, which is the reasoning that leaves the real protection out.
+
+⭐ **The P2 table itself said `0 FIXED` while 14 of its items were already done.** The P0/P1 sections
+carry inline ✅ markers; this one never got them, so the header count and the lines below disagreed
+with the code for two days — long enough for a session to redo finished work. Now marked inline, with
+the three mis-gradings flagged ⛔ in place.
+
+### Security — nothing verified a receive checksum, at any layer
+
+- **`net_demux_frame` accepted every frame the NIC handed it.** No IPv4 header checksum, no ICMP
+  checksum, no UDP checksum, no TCP checksum was ever computed on ingress — the only checksum code in
+  the tree was `tcp_checksum_compute`, used on **transmit** only. A corrupted segment whose `seq`
+  happened to land on `RCV.NXT` was appended to the receive ring and then **ACKed to the peer as
+  delivered**, which is worse than dropping it: the sender is told the bytes arrived and never
+  retransmits. A corrupted IPv4 header was parsed for its length and protocol fields regardless.
+  All four are now verified in `net_ingress.cyr` before the payload is acted on, each with its own
+  drop counter (`net_drop_ip_csum`, `net_drop_icmp_csum`, `net_drop_udp_csum`, `net_drop_tcp_csum`).
+  ⚠ A UDP checksum of **0** means *not computed* (RFC 768) and is skipped rather than treated as a
+  mismatch — agnos's own TX path emits exactly that, so failing it would have dropped loopback.
+  ⭐ `l4_pseudo_csum` is a deliberate near-duplicate of `tcp_checksum_compute` rather than a shared
+  helper: the TX path is load-bearing for every smoke in the suite and was left untouched.
+
+⭐ **`scripts/smoke/net-csum-smoke.sh`** is the first gate anywhere in the tree that presents a
+**corrupt** frame. Every other network gate proves good frames still pass, which a check that was
+inverted, absent, or dropping everything would also satisfy. `NET_CSUM_SELFTEST` drives
+`net_demux_frame` with a synthetic IPv4/UDP frame and asserts three arms: good frame **accepted**,
+one-bit-corrupt IPv4 header **dropped and counted**, non-zero-but-wrong UDP checksum **dropped and
+counted**. The accept arm is what keeps the other two honest. The UDP arm is the only exercise the
+non-zero verification branch gets, since agnos never transmits a non-zero UDP checksum.
+Mutation-tested: removing the IPv4 check reports `corrupt IP header ACCEPTED` and fails the gate.
+
 ### Fixed — device-supplied values that were trusted
 
 - **Both virtio queue sizes were taken from the device with only a zero check**
@@ -303,6 +708,84 @@ Build: `build/agnos` **1,969,400 B** (multiboot2/ELF64, entry `0x1000a8`). `chec
 `check-initstack.sh` gate), `test.sh` (x86) 4/4, `sweep.sh` 19/19, `ktest.sh` 103 passed / 6 failed
 (those 6 pre-existing). ⚠ `fp-nm-smoke` is a PRE-EXISTING ~50%% flake — measured 2 of 4 failures on the
 RELEASED 1.56.51 — so a red on that sweep gate means nothing without an A/B of several runs per arm.
+
+### Harness — 7 sweep gates reported a boot that never happened as a wall of failures
+
+- **`qemu_dwell_kernel` exists precisely to prevent this, and only 3 of 38 smokes used it.** The helper
+  retries when the firmware never hands off and then says *"treat this run as VOID, not as a failure"*;
+  its own header records that the unguarded form once *"cost a wrong bisect during the 1.56.51 sweep"*.
+  Of the sweep's 22 gate smokes, **2** were guarded and **7 were not**: `chan-ring3`, `exfat-write`,
+  `fat`, `fat-write`, `fp-area`, `fp-nm`, `fp-selftest`.
+  ⛔ **Captured in the act.** `chan-ring3` failed in two of three 1.56.52 sweeps and passed standalone
+  both times. Its serial log from the failing run:
+
+  ```
+  gnoboot v0.7.1: handing off to kernel
+  gnoboot: fail @ EBS
+  BdsDxe: loading Boot0000 "BootManagerMenuApp"
+  ```
+
+  gnoboot failed at `ExitBootServices`, so the kernel never executed and UEFI fell back to its boot
+  menu. The nine `FAIL:` lines that followed — including *"kill criterion 1: the 2 MB region resolves
+  from a RING-3 proc's CR3"* — were the smoke reporting missing markers from a kernel that never ran.
+  A reader would have concluded that nine ring-3 isolation properties had regressed.
+  All seven are now on `qemu_dwell_kernel`.
+  ⚠ **The retry is sound only because it is gated on the kernel banner** — "the kernel never started"
+  and "the kernel started and failed" are different events and only the first may be retried. It is
+  *not* a blind re-run; once the banner is in the log the run stands whatever the assertions say.
+
+- **`QEMU_TRIES` default 3 → 6**, because the rate the 3 was chosen against is not the real one. The
+  helper's header says *"roughly 1 boot in 4"* never leaves OVMF. Measured by running one smoke four
+  times and counting attempts: **3 kernel banners in 10 attempts** — a retry needed on every run and
+  one run exhausting all three tries. The cost of a higher budget is paid only by a kernel that cannot
+  boot at all, which `check.sh` and `test.sh` catch first and far more cheaply.
+
+- ⭐ **`fp-nm-smoke` is not a coin flip, and never was an FP defect.** `state.md` recorded it as a
+  **~50% coin flip** — *"2 of 4 runs FAIL on the RELEASED 1.56.51, same build, same host, no code
+  difference"* — and warned future sessions not to bisect against it. It is on the unguarded list, and
+  its recorded failure shape (*"`fp: #NM serviced` absent + `boot did not reach shell`"*) is precisely
+  what an empty log produces. With the guard: **6 runs, 6 passes**, two of which needed a retry and
+  would have been reds before. The gate was fine; the harness was reporting a boot that never happened.
+  ⚠ Not a claim that it can never fail — a run exhausting all six tries still scores red. It now says
+  so in words (`treat this run as VOID, not as a failure`) instead of naming an FP property.
+
+- ⭐ **Confirmed in a single green sweep, which is the measurement that closes this.** With every gate
+  guarded and the retry line visible, `sweep.sh` returned **23 passed, 0 failed** — the first fully
+  green sweep of the cut — while printing **7 retry events across 5 distinct gates**:
+
+  | gate | retries needed |
+  |---|---|
+  | `1.53.x FP-#NM (lazy save/restore serviced)` | 2 |
+  | `1.40.x exec-from-disk (run /bin/prog2 + ENOEXEC)` | 2 |
+  | `1.56.44 #92 ABI battery (171 cases)` | 1 |
+  | `1.53.x FP-area (per-proc FXSAVE state)` | 1 |
+  | `1.39.x FAT write (touch/echo/rm/mkdir/mv + subdir)` | 1 |
+
+  Three of those five were on the unguarded list and would have been reported FAIL in that same run —
+  and the gate needing the most retries is `FP-#NM`, the one recorded as a "~50% coin flip". The
+  sweep's flakiness was the harness, measured rather than inferred.
+
+
+### Harness — a failing sweep gate that printed nothing at all
+
+- **`run_gate`'s display filter was `grep -iE "PASS:|FAIL:|smoke:"`**, and several smokes report a
+  *launch* failure with a line matching none of those — `ERROR: QEMU produced NO boot output (0-byte
+  log) — launch failure, not an exFAT result.` is the exact wording in `exfat-write-smoke.sh`. So the
+  gate emitted a completely **empty** section and then scored FAIL: the transcript told the operator
+  that something went wrong and gave no way to tell a kernel regression from a firmware hand-off that
+  never happened. That distinction has its own `state.md` heading — *"A QEMU BOOT THAT NEVER HAPPENS
+  READS AS A KERNEL FAILURE"* — and this filter was erasing the evidence for it. Now also passes
+  `ERROR`, `SKIP`, `VOID` and `handed off`.
+  ⚠ The `handed off` term was added on a **second** pass: the first fix missed `qemu_dwell_kernel`'s
+  own retry line, so the first all-green sweep after the conversion reported `23 passed, 0 failed`
+  while saying nothing about how many gates had needed two or three attempts to get there. A gate that
+  passes on its fourth try is passing, but an operator should be able to see it.
+  ⚠ **Scoring is deliberately unchanged**: a launch failure is still a FAIL here. Downgrading it to
+  VOID inside `run_gate` would hand every real failure a way to hide. The fix is to make the
+  diagnostic visible, not to forgive it.
+  ⭐ This is the third defect found in `run_gate` in two cuts, all the same shape — the gate ran, and
+  what it reported was not what it measured. (1.56.51 found a build failure being printed and ignored,
+  and an `-i` grep scoring `0 passed, 7 failed` as a PASS.)
 
 ### Fixed — `#92` ABI battery: 167 → 171 cases
 

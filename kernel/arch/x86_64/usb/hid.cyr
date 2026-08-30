@@ -180,6 +180,89 @@ fn hid_ep_kind_at(i) {
     return load64(&hid_ep_kind + i * 8);
 }
 
+# ⛔⛔ THE KEYBOARD ROW'S `hid_ep_idx` / `hid_ep_cycle` ARE A DECOY, AND READING THEM IS A BUG.
+# `hid_kbd_configure` registers the keyboard with the SAME ring and buffer as the `hid_kbd_*` globals but
+# with its own idx/cycle pair, and NOTHING in the steady-state path ever advances that pair: `hid_poll`
+# arms the keyboard through `hid_arm_xfer_trb`, which walks `hid_kbd_xfer_idx`/`hid_kbd_xfer_cycle`. So
+# for a KBD row `hid_ep_idx` reads 0 and `hid_ep_cycle` reads 1 forever, wherever the real producer is.
+# One ring with two independent producer indices is the actual hazard; these three route every caller to
+# whichever pair is real for that row. Anything that arms a row, or tells the controller where a row's
+# producer sits, MUST go through them.
+fn hid_row_arm(i) {
+    if (hid_ep_kind_at(i) == HidKind.HID_KIND_KBD) { return hid_arm_xfer_trb(); }
+    return hid_arm_row_trb(i);
+}
+fn hid_row_idx(i) {
+    if (hid_ep_kind_at(i) == HidKind.HID_KIND_KBD) { return hid_kbd_xfer_idx; }
+    return load64(&hid_ep_idx + i * 8);
+}
+fn hid_row_cycle(i) {
+    if (hid_ep_kind_at(i) == HidKind.HID_KIND_KBD) { return hid_kbd_xfer_cycle; }
+    return load64(&hid_ep_cycle + i * 8);
+}
+
+# ⛔⛔ THE STOLEN-EVENT RECLAIM — WHY A HID ENDPOINT CAN RUN DRY WITH NOBODY AT FAULT.
+#
+# The xHCI event ring is SHARED by every consumer in this driver, and only `hid_poll` knows what a
+# Transfer Event on an interrupt-IN endpoint MEANS: one armed TRB was consumed, so arm another or the
+# endpoint runs out. The three synchronous waiters — `xhci_wait_transfer_for_trb`,
+# `xhci_wait_transfer_event`, `xhci_drain_transfer_events` — spin on that same ring waiting for THEIR
+# TRB and consume everything else to keep the ring moving. Each such consume permanently costs the
+# owning HID ring one of its 16 armed TRBs, and nothing ever gave it back.
+# ⇒ Type while a USB disk is doing bulk I/O and the keyboard degrades one TRB per keystroke. At 16 the
+# interrupt-IN endpoint has no TRBs left, the controller posts nothing further, and input is dead for
+# the rest of the boot with no error anywhere. The 16-deep arming that makes this survivable at all is
+# exactly what kept it invisible: it takes sixteen coincidences to show, and then it looks like a hang.
+#
+# ⚠ RE-ARM ONLY, NEVER FOLD. The report bytes are dropped on the floor. Folding them would mean running
+# `hid_process_report` / `hid_process_mouse_report` from inside an MSC spin loop WITHOUT `hid_poll_lock`,
+# racing the real drain on another CPU over `hid_mouse_dx` and `kb_buf`. A keystroke lost during disk
+# I/O is a far smaller defect than a corrupted accumulator — and vastly smaller than a dead endpoint.
+#
+# ⛔ AND IT DEFERS RATHER THAN ARMING HERE, which is the whole reason this is two functions. The waiters
+# run in THREAD context with interrupts ENABLED (an MSC bulk read spins for a long time); `hid_poll` runs
+# in ISR context on the timer tick and on MSI-X. Arming from the waiter would let the ISR interrupt
+# `hid_arm_row_trb` mid-update and corrupt `hid_ep_idx`/`hid_ep_cycle` — trading a slow leak for ring
+# corruption. So the waiter only bumps a counter, and `hid_service_rearms` does the ring work under
+# `hid_poll_lock`. The 100 Hz tick calls `hid_poll` unconditionally, so a pending re-arm is serviced
+# within 10 ms even when the endpoint is dry and no MSI-X will ever come.
+var hid_ep_rearm[8];         # TRBs owed to row i by a foreign waiter; drained by hid_service_rearms
+var hid_stolen_events = 0;   # total events reclaimed from a foreign waiter — surfaced by the selftest
+fn hid_reclaim_event(evt_slot, evt_dci) {
+    if (hid_ep_count == 0) { return 0; }
+    var row = hid_ep_find(evt_slot, evt_dci);
+    if (row < 0) { return 0; }   # EP0 / MSC / not ours — a miss is NORMAL and must stay silent
+    store64(&hid_ep_rearm + row * 8, load64(&hid_ep_rearm + row * 8) + 1);
+    hid_stolen_events = hid_stolen_events + 1;
+    return 1;
+}
+
+# ⚠ CALLER MUST HOLD `hid_poll_lock` — this walks the same producer state `hid_poll`'s arms do.
+fn hid_service_rearms() {
+    var i = 0;
+    var armed = 0;
+    while (i < hid_ep_count) {
+        var owed = load64(&hid_ep_rearm + i * 8);
+        if (owed > 0) {
+            # ⚠ Clear FIRST. A waiter on another CPU can bump this between the read and the clear; losing
+            # that one increment costs one TRB out of 16, whereas clearing after the arm loop could drop
+            # an arbitrary number of them. Under-arming is the fatal direction, so bias the race toward
+            # over-servicing: worst case we arm one TRB nobody owed, which is inert.
+            store64(&hid_ep_rearm + i * 8, 0);
+            var n = 0;
+            while (n < owed) {
+                hid_row_arm(i);
+                n = n + 1;
+            }
+            var db = xhci_mmio_base + xhci_db_off + load64(&hid_ep_slot + i * 8) * 4;
+            store32(db, load64(&hid_ep_dci + i * 8) & 0xFF);
+            armed = armed + owed;
+        }
+        i = i + 1;
+    }
+    return armed;
+}
+
 # === HID-boot MOUSE — the accumulator and the binder ===
 #
 # ⛔⛔ WHY THIS ACCUMULATES INSTEAD OF LATCHING THE LAST REPORT. All 16 armed TRBs on an endpoint point
@@ -948,13 +1031,19 @@ fn hid_recover_halted() {
                     # Reposition the dequeue pointer at the ring slot the producer will fill next, with
                     # the producer's current cycle state, then re-arm and ring the doorbell. Without the
                     # Set TR Dequeue the controller resumes at the pinned TRB and halts again immediately.
-                    var ring = load64(&hid_ep_ring  + i * 8);
-                    var idx  = load64(&hid_ep_idx   + i * 8);
-                    var cyc  = load64(&hid_ep_cycle + i * 8);
+                    # ⛔ VIA hid_row_idx / hid_row_cycle / hid_row_arm, NOT the raw arrays. On a KEYBOARD
+                    # row the raw `hid_ep_idx`/`hid_ep_cycle` read 0/1 forever — see their banner — so
+                    # this used to point the controller at ring slot 0 with cycle 1 while the real
+                    # producer sat somewhere else entirely, and the endpoint resumed on stale TRBs (or,
+                    # on a cycle mismatch, halted again at once). Keyboard halt recovery is the one
+                    # caller of this path, and so the one place the decoy could do damage.
+                    var ring = load64(&hid_ep_ring + i * 8);
+                    var idx  = hid_row_idx(i);
+                    var cyc  = hid_row_cycle(i);
                     if (xhci_cmd_set_tr_dequeue(slot, dci, ring + idx * 16, cyc & 0x1) == 0) {
                         kprintln("hid: an endpoint reset but its dequeue pointer would not move", 61);
                     } else {
-                        hid_arm_row_trb(i);
+                        hid_row_arm(i);
                         var db = xhci_mmio_base + xhci_db_off + slot * 4;
                         store32(db, dci & 0xFF);
                         kprintln("hid: an endpoint halted and was reset; input from it should resume", 66);
@@ -991,6 +1080,11 @@ fn hid_poll() {
     # ensures xHCI init ran, so xhci_rt_base is valid before we touch the interrupter register.
     var ir0 = xhci_rt_base + XHCI_RT_IR0_BASE;
     xhci_rt_write32(ir0 + XHCI_IR_IMAN, 0x3);
+    # ⭐ PAY BACK ANY TRB A FOREIGN WAITER TOOK. Must come BEFORE the drain, and can only happen here,
+    # because this is the one place holding `hid_poll_lock` while touching row producer state. See the
+    # reclaim banner: without this an endpoint whose events were eaten by an MSC bulk wait runs dry and
+    # stops reporting for the rest of the boot.
+    hid_service_rearms();
     var processed = 0;
     var drained = 0;
     while (drained < 64) {       # bound — prevents runaway on corrupt cycle
@@ -1123,3 +1217,165 @@ fn hid_poll() {
     hid_poll_unlock();
     return processed;
 }
+
+
+
+#ifdef HID_RECLAIM_SELFTEST
+# ⭐⭐ THE STOLEN-EVENT GATE — HERMETIC, AND IT NEEDS NO USB HARDWARE AT ALL.
+#
+# ⛔ WHY IT HAD TO BE HERMETIC. The defect only shows on a box that has BOTH a HID device and a USB
+# device doing bulk I/O, with the operator typing during the transfer, sixteen times. That is not a
+# thing a boot gate can arrange, and waiting for it to reproduce on iron is how this survived to 1.56.52.
+# So the test brings its own everything: its own event ring, its own transfer ring, its own doorbell
+# page, and a synthetic HID row it registers and then un-registers. Nothing here touches the controller.
+#
+# ⚠ THE THREE SWAPPED GLOBALS ARE THE DANGEROUS PART, and `hid_poll_lock` is what makes them safe.
+# `xhci_evt_ring_phys` and `xhci_mmio_base` are read by `hid_poll` from the 100 Hz tick and from the
+# MSI-X handler. Holding the lock for the whole test means every one of those callers bails at its own
+# try-lock BEFORE it reads either global (the count guard and the try-lock both precede the first read
+# — checked, and it is the reason the order in `hid_poll` matters). The synthetic row is torn down
+# before the lock is released, so `hid_ep_count` is never elevated outside the critical section.
+#
+# ⚠ `xhci_mmio_base` is biased so that `xhci_mmio_base + xhci_db_off + slot*4` lands exactly on
+# `hidrcl_db`. A doorbell write is a real MMIO store; pointing it at RAM is what lets arm 3 ASSERT the
+# doorbell was rung with the right DCI instead of merely assuming it.
+var hidrcl_evt[8];     # synthetic event ring: 64 B = 4 TRBs; the test posts 1 and stops on the 2nd
+var hidrcl_ring[64];   # synthetic transfer ring: 512 B = 32 TRBs; the arm walks idx 0 -> 1 only
+var hidrcl_buf[8];     # report-buffer address the arm writes into the TRB; never DMAed
+var hidrcl_db[8];      # doorbell landing pad — see the bias note above
+fn hid_reclaim_selftest() {
+    var fail = 0;
+    if (hid_poll_trylock() == 0) {
+        kprintln("hidrcl: could not take the poll lock - VOID, not a pass", 55);
+        return 0;
+    }
+    if (hid_ep_count >= HID_MAX_EP) {
+        hid_poll_unlock();
+        kprintln("hidrcl: endpoint table full - VOID, not a pass", 46);
+        return 0;
+    }
+    var saved_phys  = xhci_evt_ring_phys;
+    var saved_idx   = xhci_evt_ring_idx;
+    var saved_cycle = xhci_evt_ring_cycle;
+    var saved_mmio  = xhci_mmio_base;
+    var saved_stolen = hid_stolen_events;
+
+    var slot = 3;
+    var epa  = 0x83;                       # interrupt-IN endpoint 3
+    var dci  = xhci_dci_for_ep(epa);       # = 7; the event carries the DCI, so never hardcode it
+    var i = 0;
+    while (i < 8)  { store64(&hidrcl_evt  + i * 8, 0); i = i + 1; }
+    i = 0;
+    while (i < 64) { store64(&hidrcl_ring + i * 8, 0); i = i + 1; }
+    store64(&hidrcl_db, 0);
+
+    var row = hid_ep_register(slot, epa, HidKind.HID_KIND_MOUSE, &hidrcl_ring, &hidrcl_buf, 8);
+    if (row < 0) {
+        xhci_mmio_base = saved_mmio;
+        hid_poll_unlock();
+        kprintln("hidrcl: could not register the synthetic row - VOID, not a pass", 63);
+        return 0;
+    }
+    xhci_mmio_base      = &hidrcl_db - xhci_db_off - slot * 4;
+    xhci_evt_ring_phys  = &hidrcl_evt;
+    xhci_evt_ring_idx   = 0;
+    xhci_evt_ring_cycle = 1;
+
+    # --- ARM 1: a (slot, dci) that owns no row must be a silent miss ---------------------------
+    # The one that keeps the others honest. Without it, "reclaim everything unconditionally" scores a
+    # pass — and reclaiming an EP0 completion would arm a TRB on a ring that owes nobody anything.
+    if (hid_reclaim_event(0x7E, 0x1F) != 0) {
+        kprintln("hidrcl: a foreign event was claimed as ours", 43);
+        fail = 1;
+    }
+    if (hid_stolen_events != saved_stolen) {
+        kprintln("hidrcl: a foreign event was counted", 35);
+        fail = 1;
+    }
+
+    # --- ARM 2: our event is claimed, and DEFERRED rather than armed in place -------------------
+    if (hid_reclaim_event(slot, dci) != 1) {
+        kprintln("hidrcl: our own event was not claimed", 37);
+        fail = 1;
+    }
+    if (load64(&hid_ep_rearm + row * 8) != 1) {
+        kprintln("hidrcl: the re-arm was not recorded as owed", 43);
+        fail = 1;
+    }
+    if (load64(&hid_ep_idx + row * 8) != 0) {
+        # ⛔ Arming HERE would be the bug the deferral exists to avoid: the waiters run with interrupts
+        # on, so the ISR can interrupt hid_arm_row_trb mid-update and corrupt the producer index.
+        kprintln("hidrcl: the ring was armed from the waiter, not deferred", 56);
+        fail = 1;
+    }
+
+    # --- ARM 3: the service pass arms exactly one TRB and rings the right doorbell --------------
+    hid_service_rearms();
+    if (load64(&hid_ep_rearm + row * 8) != 0) {
+        kprintln("hidrcl: the owed re-arm was not cleared", 39);
+        fail = 1;
+    }
+    if (load64(&hid_ep_idx + row * 8) != 1) {
+        kprintln("hidrcl: the service pass did not arm a TRB", 42);
+        fail = 1;
+    }
+    var trb_ctrl = load32(&hidrcl_ring + 12);
+    # IOC (bit 5) so the completion surfaces as a Transfer Event, ISP (bit 2) so a short packet still
+    # completes, type Normal, cycle 1. An armed TRB missing IOC is armed and mute — worse than nothing.
+    if ((trb_ctrl & 0x20) == 0) {
+        kprintln("hidrcl: the re-armed TRB has no IOC - it would never report", 59);
+        fail = 1;
+    }
+    if (((trb_ctrl >> 10) & 0x3F) != XHCI_TRB_NORMAL) {
+        kprintln("hidrcl: the re-armed TRB is not a Normal TRB", 44);
+        fail = 1;
+    }
+    if (load64(&hidrcl_ring) != &hidrcl_buf) {
+        kprintln("hidrcl: the re-armed TRB points at the wrong buffer", 51);
+        fail = 1;
+    }
+    if ((load32(&hidrcl_db) & 0xFF) != dci) {
+        kprintln("hidrcl: the doorbell was not rung for that endpoint", 51);
+        fail = 1;
+    }
+
+    # --- ARM 4: end-to-end through a REAL waiter -----------------------------------------------
+    # Arms 1-3 prove the machinery; only this proves it is WIRED IN. `xhci_drain_transfer_events` is
+    # the discard site that MSC reset recovery drives. It is the one of the three safe to run here:
+    # the other two spin to a timeout, and one of them writes ERDP on the discard path, which would
+    # hand the controller a pointer to `hidrcl_evt`. Slot 0x7F matches nothing, so `drained` stays 0
+    # and the function's own ERDP write — guarded on `drained > 0` — never fires.
+    var before = hid_stolen_events;
+    store64(&hidrcl_evt, 0);
+    store32(&hidrcl_evt + 8, 0);
+    store32(&hidrcl_evt + 12, (slot << 24) | (dci << 16) | (XHCI_TRB_TRANSFER_EVENT << 10) | 1);
+    store32(&hidrcl_evt + 28, 0);      # next TRB: cycle 0 != 1, so the drain stops after one
+    xhci_evt_ring_idx   = 0;
+    xhci_evt_ring_cycle = 1;
+    xhci_drain_transfer_events(0x7F);
+    if (hid_stolen_events != before + 1) {
+        kprintln("hidrcl: a real waiter consumed a HID event without reclaiming it", 64);
+        fail = 1;
+    }
+    if (load64(&hid_ep_rearm + row * 8) != 1) {
+        kprintln("hidrcl: the waiter reclaimed but recorded nothing owed", 54);
+        fail = 1;
+    }
+
+    # --- teardown: pay off the debt, drop the row, restore every swapped global ----------------
+    store64(&hid_ep_rearm + row * 8, 0);
+    hid_ep_count = hid_ep_count - 1;
+    hid_stolen_events   = saved_stolen;
+    xhci_mmio_base      = saved_mmio;
+    xhci_evt_ring_phys  = saved_phys;
+    xhci_evt_ring_idx   = saved_idx;
+    xhci_evt_ring_cycle = saved_cycle;
+    hid_poll_unlock();
+    if (fail == 0) {
+        kprintln("hidrcl: stolen HID events are reclaimed and re-armed OK", 55);
+        return 1;
+    }
+    kprintln("hidrcl: RECLAIM FAIL", 20);
+    return 0;
+}
+#endif

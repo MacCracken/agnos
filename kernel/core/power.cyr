@@ -178,7 +178,32 @@ fn power_reset() {
             gpu_udelay(15000);                        # spec allows 15 ms to take effect
         }
         if (acpi_reset_space == 0) {                  # SystemMemory
-            store8(acpi_reset_addr, acpi_reset_value);
+            # ⛔⛔ 1.56.52 — SKIP THE RUNG RATHER THAN FAULT ON IT. `acpi_reset_addr` comes straight out
+            # of the FADT GAS (`acpi_gas_addr(116)`) and is never translated; the arming logic gates on
+            # FADT revision, RESET_REG_SUP and non-zero, but never on `< 4 GB`. A bare
+            # `store8(acpi_reset_addr, …)` on firmware advertising a SystemMemory RESET_REG at or above
+            # 4 GB writes an address the page tables do not map, and a CPL0 #PF here is a HANG on the
+            # last-ditch reboot path — so rungs 3 (CF9) and 4 (triple fault) never run.
+            # ⛔ AND `acpi_va` IS NOT THE FIX, THOUGH IT LOOKS LIKE ONE — that was this code for an hour.
+            # Two independent reasons, either fatal: (a) `acpi_va` only takes its DIRECTMAP_BASE branch
+            # when the live CR3 is the kernel PML4 (0x1000), and `power_reset` reaches here through
+            # syscall #13 running on the CALLING PROCESS`s CR3, so it falls to `return phys` and hands
+            # back exactly the raw address it was called to translate; (b) even under CR3 0x1000 the
+            # direct map only covers `pmm_memmap_ram_top`, which is EfiConventionalMemory only — and a
+            # SystemMemory RESET_REG at >= 4 GB is by construction a device register OUTSIDE type-7
+            # RAM, i.e. precisely the class the direct map does not carry. Mapping it properly means
+            # `vmm_remap_uc_2mb` (which also gives it the UC attribute the WB direct-map PDEs lack).
+            # ⭐ SO: REFUSE THE RUNG AND FALL THROUGH. `iommu.cyr` sets the precedent for exactly this
+            # ("amdvi: mmio above 4 GB (rare), skipping"). Skipping costs nothing a working box wanted —
+            # CF9 is right below and works on every PC-compatible chipset — while faulting costs the
+            # reboot entirely. A UC remap would be the complete answer if a box ever needs it.
+            # ⚠ Unexercisable on this bench: archaemenid`s boot log prints `acpi: reset register
+            # space 1 address b2` — SystemIO, the other arm entirely.
+            if (acpi_reset_addr >= 0x100000000) {
+                kprintln("acpi: SystemMemory RESET_REG >= 4 GB is unmapped - skipping to CF9", 66);
+            } else {
+                store8(acpi_reset_addr, acpi_reset_value);
+            }
             gpu_udelay(15000);
         }
     }

@@ -14,7 +14,9 @@ type: issue
 (`#92` op 0x0C TOCTOU) closed at 1.56.52 by stage-and-revalidate. The `#92` battery grew 167 → 171 with
 two post-validation mutation cases and a control, and the pair is mutation-tested.
 
-**P1: 18 of 26** (17 fully + 1 partial). **P2: 11 of 30 confirmed items.**
+**P1: 21 of 26** (20 fully + 1 partial). **P2: 29 of 29 — CLOSED.**
+
+⛔ **One P1 turned out to be sitting on a P0 that is in NO backlog** — `proc.cyr:1781` (the high arena is unreachable through the syscall ABI) could not be fixed as filed, because `is_user_range` was a bounds check and the low window is full of supervisor identity mappings of kernel memory. See that item's RESOLUTION block. This is the second time in this backlog that the severity label was wrong in the dangerous direction.
 
 ⛔ **A P2 turned out to be a P0, and a bug NOBODY HAD FILED turned out to be a privilege escalation.**
 Re-triaging the P2 list against the code (rather than trusting its label) moved four items up:
@@ -47,10 +49,10 @@ map (`DIRECTMAP_BASE + phys`, kernel PDPT[8+]), which no user segment can reach 
 cap `p_vaddr + p_memsz` at `0x10000000` = PDPT[0]. Narrowing the ceiling would have shrunk the window
 without closing the class. `syscall.cyr:1895` (`#92` TOCTOU) is **NOT** done.
 
-**P1: 17 of 26 closed** (16 fully + 1 partial). Marked inline below: ✅ FIXED / 🟠 PARTIAL.
+**P1: 21 of 26 closed** (20 fully + 1 partial). Marked inline below: ✅ FIXED / 🟠 PARTIAL.
 Everything unmarked is untouched.
 
-**P2: 0 of 29.** Not attempted.
+**P2: 29 of 29 — CLOSED** (2026-08-30). See the section's own header for how the count was re-derived.
 
 ⚠ **Two entries did not land the way the finding proposed, and the reasons are the value:**
 - `syscall.cyr:7415` — the suggested "move the arm below tag validation" was implemented and then
@@ -197,13 +199,17 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** After msc.cyr:690, require the full length: `if (xhci_last_xfer_bytes != data_len) { store8(row + 69, 1); return 0; }` (or return the actual count to the caller). Additionally read dCSWDataResidue at csw+8 and reject any command whose residue is non-zero when the caller demanded a fixed-size response.
 
-### `kernel/arch/x86_64/usb/xhci.cyr:884` — Synchronous event-ring waiters consume HID Transfer Events without re-arming the owning interrupt-IN ring, permanently spending its TRBs
+### ✅ FIXED 1.56.52 — `kernel/arch/x86_64/usb/xhci.cyr:884` — Synchronous event-ring waiters consume HID Transfer Events without re-arming the owning interrupt-IN ring, permanently spending its TRBs
 
 **Mechanism.** There is exactly one event ring and one dequeue cursor (xhci_evt_ring_idx / xhci_evt_ring_cycle). hid_poll is the only code that re-arms an interrupt-IN ring: it re-arms only on the branch where it MATCHED the event (hid.cyr:1087 hid_arm_xfer_trb / hid.cyr:1099 hid_arm_row_trb). Every synchronous waiter, by contrast, consumes non-matching events and throws them away with no re-arm: xhci_wait_transfer_for_trb (xhci.cyr:882-895), xhci_wait_transfer_event (xhci.cyr:942-951), xhci_cmd_wait (xhci_cmd.cyr:253-265), xhci_drain_transfer_events (xhci.cyr:991-999). hid.cyr:1021-1025 spells out exactly what a swallowed-without-re-arm completion costs: "each rejected completion permanently spent one TRB of a 16-deep ring. Sixteen cumulative errors empty the ring ... the controller hits the empty ring at the next service interval and STALLS the endpoint. Presents as INPUT FROZE, CPU STILL ALIVE, with nothing in the log." The guard that was supposed to prevent this is the MSI-X arming order (pic.cyr:254-256, main.cyr:537-544), but that only stops hid_poll from stealing from a waiter — it does nothing about the waiter stealing from hid_poll, and mass-storage bulk traffic runs entirely after the HID rings are armed.
 
 **Failure trace.** main.cyr:521-535 arms the keyboard and mouse interrupt-IN rings 16 TRBs deep (hid.cyr:701-711, hid.cyr:429-430); main.cyr:542-544 arms MSI-X; main.cyr:553 then runs msc_enumerate. Press keys (or move the mouse) while msc_probe_slot is running: msc_inquiry -> msc_scsi_exec -> msc_bbb_exec -> xhci_wait_transfer_for_trb(slot, data_trb, 36) spins up to XHCI_BULK_TIMEOUT_SPINS (~1 s). Each HID Transfer Event that lands during that spin fails the (slot, TRB-pointer) match at xhci.cyr:836-842, falls to xhci.cyr:884, and is dequeued and dropped — the HID ring is not re-armed and the report is not folded. TEST UNIT READY carries 3 retries each with a 50M-iteration (~100 ms) stall inside msc_reset_recovery (msc.cyr:893), widening the window further. The same shape recurs at runtime for every msc_blk_read/msc_blk_read_sectors once a USB stick is a live block backend. After 16 cumulative losses on one endpoint the controller finds no valid TRB at the next service interval and halts it; keyboard/mouse input dies for the rest of the boot with no log line. (state.md records the boot-probe instance of this as costing 'a TRB' and scopes it to that one window; the runtime block-I/O path has the identical shape and is unbounded.)
 
 **Suggested fix.** Make the drain the single owner of the event ring: have every waiter dispatch non-matching Transfer Events through the same registry hid_poll uses (hid_ep_find -> fold + hid_arm_row_trb + doorbell) instead of discarding them, or park them on a small deferred queue that hid_poll processes. At minimum, re-arm the owning row before discarding: a match on hid_ep_find(evt_slot, evt_ep) should always re-arm even when the waiter does not want the data.
+
+**RESOLUTION 1.56.52 — the deferred-queue form, not the fold form, and the difference is load-bearing.** The waiters call `hid_reclaim_event(slot, dci)` which only bumps `hid_ep_rearm[row]`; `hid_service_rearms` does the ring work under `hid_poll_lock`, called by `hid_poll` on the 100 Hz tick. Folding from the waiter — the other option above — would run `hid_process_report` inside an MSC spin loop WITHOUT the lock, racing the real drain over `hid_mouse_dx` and `kb_buf`; and arming from the waiter would let the ISR interrupt `hid_arm_row_trb` mid-update, trading a slow TRB leak for ring corruption. The report bytes are therefore dropped: a keystroke lost during disk I/O is a much smaller defect than either. Gated hermetically by `scripts/smoke/hid-reclaim-smoke.sh`, mutation-tested three ways.
+
+**AND A SECOND DEFECT THIS EXPOSED.** `hid_ep_idx`/`hid_ep_cycle` on a KEYBOARD row are a decoy: `hid_kbd_configure` registers the keyboard with the same ring as the `hid_kbd_*` globals but a separate idx/cycle pair that nothing in the steady-state path advances, so the row's copy reads 0/1 forever. `hid_recover_halted` read it, and therefore issued `Set TR Dequeue Pointer` at ring slot 0 with cycle 1 while the real producer sat elsewhere. Now routed through `hid_row_arm` / `hid_row_idx` / `hid_row_cycle`.
 
 ### ✅ FIXED 1.56.51 — `kernel/arch/x86_64/usb/xhci.cyr:1369` — SuperSpeed bMaxPacketSize0 is a log2 exponent, but is written into EP0 Max Packet Size as a byte count
 
@@ -253,7 +259,7 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** Replace with something re-derivable: '#NM is LIVE -- fpu_set_ts() runs on every switch (sched.cyr:447, 640), every ring-3 entry (ring3.cyr:198) and every kernel_resume (syscall.cyr:371), so vector 7 fires on each proc's first SSE op and nm_handler does the lazy FXSAVE/FXRSTOR. FP_NM_SELFTEST below is a probe, not the only setter.'
 
-### `kernel/core/net_ingress.cyr:193` — No receive-side checksum verification anywhere in the stack (IP, ICMP, UDP, TCP)
+### ✅ FIXED 1.56.52 — `kernel/core/net_ingress.cyr:193` — No receive-side checksum verification anywhere in the stack (IP, ICMP, UDP, TCP)
 
 **Mechanism.** ip_checksum (net.cyr:53) and tcp_checksum_compute (net_tcp.cyr:202) exist but every call site is on the TRANSMIT path only: net.cyr:94 (ip_build), net_icmp.cyr:48/131 (echo build), net_tcp.cyr:308 (segment build), plus selftests.cyr:105-107. net_demux_frame (:193-215) validates only the ethertype and the IPv4 length fields, then dispatches. net_handle_icmp, net_handle_udp and net_handle_tcp never recompute or compare the header/pseudo-header checksum carried in the frame. The result is that TCP's end-to-end integrity guarantee — the property the application layer is entitled to assume — is simply not provided, and the (weak but real) off-path barrier of having to produce a correct checksum is removed.
 
@@ -308,7 +314,7 @@ So on any machine with more than ~120 GB of conventional RAM (ngb >= 121 => 8 + 
 
 **Suggested fix.** Derive USER_HIMMAP_BASE from the direct map's actual top rather than a hard-coded 128 GB — e.g. place it at DIRECTMAP_BASE + 504 GB, or record the highest PDPT index pmm_setup_directmap installed and start the arena above it, refusing high mmap if none is left. At minimum add a hard guard in proc_map_page_hi: refuse (return -1) if the existing PDPT entry is present but not user (0x04 clear), so it can never adopt a kernel-owned PD. Fix the three comments (proc.cyr:1503-1509, :1706-1709, :842) which currently state a ceiling the code does not enforce.
 
-### `kernel/core/proc.cyr:1781` — sys_mmap's high arena returns VAs that is_user_range rejects unconditionally, so mmap'd memory becomes unusable as a syscall buffer once the shared low cursor is spent
+### ✅ FIXED 1.56.52 — `kernel/core/proc.cyr:1781` — sys_mmap's high arena returns VAs that is_user_range rejects unconditionally, so mmap'd memory becomes unusable as a syscall buffer once the shared low cursor is spent
 
 **Mechanism.** sys_mmap uses the LOW arena only while `(mmap_next_vaddr + len) <= 0x3FA00000` (proc.cyr:1764); otherwise it falls through to himmap_reserve, which hands back an address from [USER_HIMMAP_BASE, HIMMAP_CEILING) = [0x2000000000, 0x8000000000) (proc.cyr:1714-1728, :1781-1790).
 
@@ -322,6 +328,8 @@ Compounding it, `mmap_next_vaddr` is a single GLOBAL cursor shared by every proc
 4. read() returns -1 for a perfectly valid buffer. The same happens for write, getdents#29 (syscall.cyr:8070), epoll_wait#21 (:7947), shm_write#72/shm_read#73 (:7330/:7341) and every other buffer-taking syscall. From the program's point of view mmap succeeds and then all I/O into that memory fails, permanently, for the rest of the boot.
 
 **Suggested fix.** Teach is_user_ptr / is_user_range about the high arena: accept [0x200000, 0x40000000) OR [USER_HIMMAP_BASE, HIMMAP_CEILING), and update the syscall.cyr:265-272 comment to name both windows. Note the second range must also be checked against the direct map's real ceiling (see the PDPT[128] finding) before it can be treated as safely per-process. Separately, make mmap_next_vaddr per-process (mirroring proc_himmap_next, proc.cyr:1716) so the low arena is not a machine-lifetime budget.
+
+**RESOLUTION 1.56.52 — the suggested fix as written would have been a ring-3 kernel-write primitive, and implementing it surfaced a P0 underneath.** Widening the WINDOW is not the fix, because the window was never the check. `is_user_range` was a pure VA bounds test, and MEASURED on a freshly created address space the low window is full of the kernel: `0x300000` (kernel image), `0xE00000` (proc_rsp0 pool), `0xF10000` (CPU0 SYSCALL kernel stack) and `0x8000000` all returned `is_user_range=1` with `present=1 user=0`, because `proc_create_address_space` copies kernel `PD[0..127]` identity/supervisor into every process. A syscall runs at CPL0 with AC=1 from the entry STAC, so any arm doing a raw load8/store8 on a validated pointer read or wrote kernel memory for ring 3 — `read(fd, (void*)0xF08000, 0x8000)` writes file bytes over the syscall kernel stack. ⇒ The check is now a page-table walk (`user_range_mapped`) requiring PRESENT + U/S=1 per 2 MB page under the LIVE CR3, and only then is the high window admitted, floored at the DERIVED `himmap_floor()` and never the `USER_HIMMAP_BASE` constant (the direct map owns PDPT[8..511], so a hardcoded 128 GB floor names arbitrary physical memory on a >120 GB box). `proc_copy_to_user`/`proc_copy_from_user`'s hardcoded PML4[0]/PDPT[0] had to be fixed in the same change: a high VA aliased onto a LOW page directory slot and the copy silently succeeded against the wrong page. Gated by `scripts/smoke/userwin-smoke.sh`, mutation-tested both ways.
 
 ### ✅ FIXED 1.56.51 — `kernel/core/sched.cyr:200` — The proc_cs/proc_ss comments invert CS and SS for ring 3 (they say CS=0x1B / SS=0x23; the code and the GDT say CS=0x23 / SS=0x1B)
 
@@ -356,39 +364,48 @@ Compounding it, `mmap_next_vaddr` is a single GLOBAL cursor shared by every proc
 **Suggested fix.** Move the arm branch below the tag/registration validation, and replace the constant with a real check — at minimum gate it on a privileged pid/first-process check until per-proc capabilities land; clear `blk_rw_armed` on process exit and on blk_close. Also correct the 7369-7371 header comment so it no longer claims the band is non-destructive.
 
 
-## P2 — hardening / cleanup / dead code — 29 item(s) · 0 FIXED
+## P2 — hardening / cleanup / dead code — 29 item(s) · 29 FIXED — **CLOSED**
+
+⛔ **THIS TABLE SAID `0 FIXED` UNTIL 2026-08-30 WHILE 14 OF ITS ITEMS WERE ALREADY DONE.** The P0/P1
+sections carry inline ✅ markers; this one never got them, so the count above and the lines below
+disagreed with the code for two days — long enough for a session to re-do work that was finished.
+⭐ Re-derived by reading each site in the tree (not the git log — several fixes live in the
+uncommitted 1.56.52 working tree), and **every FIXED verdict was then adversarially refuted** before
+being recorded, because a false ✅ buries a live defect where nobody will look again. 14 survived,
+15 are genuinely open, 0 were stale findings.
+⚠ **Three of the 15 open items are mis-graded and are NOT P2** — see the ⛔ markers below.
 
 Listed as one line each; the full mechanism is recoverable by re-reading the site.
 
-- `.github/workflows/ci.yml:247` — The QEMU boot test and benchmarks are structurally skipped on every release, so the release CI gate never boots the kernel
-- `kernel/arch/x86_64/apic.cyr:285` — tlb_shootdown_all IPIs APIC ids 0..cpu_count-1, conflating an online COUNT with the set of online APIC IDs
-- `kernel/arch/x86_64/idt.cyr:9` — No IST is ever configured: the #DF handler runs on the same TSS.RSP0 whose corruption is the commonest cause of #DF, so the whole vector-8 CMOS diagnostic is unreachable in its own failure mode
-- `kernel/arch/x86_64/iommu.cyr:98` — iommu_allow_dma_2mb aliases any physical address >= 1 GB onto an existing grant in the single 1 GB second-level table
-- `kernel/arch/x86_64/keyboard.cyr:242` — scancode_to_ascii's "Bounds check" is vacuous and does not cover the case that could actually go out of bounds
-- `kernel/arch/x86_64/pic.cyr:77` — Timer-ISR comment names a hid_poll guard that no longer exists and that hid.cyr explicitly documents replacing
-- `kernel/arch/x86_64/usb/msc.cyr:465` — MSC bulk ring Link TRB is initialised with Cycle = 1 while the initial producer cycle is also 1 — the exact inversion xhci_ring.cyr documents as wrong
-- `kernel/arch/x86_64/usb/xhci_ctx.cyr:287` — SuperSpeed interrupt Interval is computed from a device byte with neither the zero-guard nor the clamp the HS path has
-- `kernel/core/acpi.cyr:368` — _S5_ decode accepts a failed AML integer read for SLP_TYPb and latches acpi_s5_valid, contradicting the comment two lines above
-- `kernel/core/elf.cyr:357` — Every error return after proc_create_address_space leaks the address space and its mapped 2 MB pages — a repeatable exec of one crafted file exhausts physical memory
-- `kernel/core/gpu.cyr:10942` — gpu_scanout_matchgeom overrides the console geometry from device registers without bounding it by the firmware framebuffer extent
-- `kernel/core/net_dhcp.cyr:37` — dhcp_find_option validates that the declared option length fits but not that it is large enough for its readers
-- `kernel/core/net_icmp.cyr:59` — Echo requests are answered without checking the IPv4 destination — broadcast/multicast ping amplifier
-- `kernel/core/net_ingress.cyr:81` — net_udp_buf is overwritten by every inbound UDP datagram regardless of port or destination
-- `kernel/core/net_ingress.cyr:206` — IPv4 fragmentation is neither reassembled nor rejected — non-first fragments are parsed as L4 headers
-- `kernel/core/net_tcp.cyr:710` — net_handle_tcp's stack canary is checked on 2 of ~20 return paths, and the function has no local buffer to protect
-- `kernel/core/power.cyr:181` — SystemMemory reset register written as a raw physical address, bypassing the acpi_va direct-map translation
-- `kernel/core/proc.cyr:1788` — sys_mmap high path leaks a 2 MB region permanently when proc_map_page_hi fails
-- `kernel/core/proc.cyr:1830` — sys_munmap's low-arena ceiling (0x40000000) is above the arena's real top (0x3FA00000), so ring 3 can unmap and free its own live user stack
-- `kernel/core/ramdisk.cyr:122` — ramdisk bounds checks are signed and admit negative sectors: `start + count > capacity` can wrap, and `sector >= capacity` passes for any negative sector
-- `kernel/core/syscall.cyr:2183` — #92 op 0x0A (TRI_LIST) omits the frame-skew corner bound that op 0x09 documents as mandatory for the same shader
-- `kernel/core/syscall.cyr:4565` — gpu_caps#89 bit3/bit4 promise "a caller that sees this bit set will not then get E_NOGPU" — but the caps gate omits two of #92's four preconditions
-- `kernel/core/syscall.cyr:7082` — mdo_validate has no operand block for MDO_OP_CRCCAL (0x0A) — the one advertised #93 op that accepts-and-ignores its record fields
-- `kernel/core/virtio_blk.cyr:293` — vblk_qsize is taken from the device with only a zero check, but the avail ring is a single 4 KB page sized for queue_size <= 256
-- `kernel/core/virtio_net.cyr:440` — virtio RX used-ring desc_id and length are trusted without bounds
-- `kernel/core/vmm.cyr:31` — vmm_map_user_exec / vmm_alloc_user_exec are dead code that would map user pages writable AND executable
-- `kernel/klib/kfmt.cyr:9` — fmt_int_buf renders the most-negative i64 as a bare "-"
-- `kernel/klib/kfmt.cyr:28` — fmt_hex_buf emits an empty string for any negative value, and three #PF-forensics sites read that as "the value was zero"
-- `kernel/klib/kfmt.cyr:40` — fmt_hex_buf needs 17 bytes but every caller supplies a 16-byte buffer
+- ✅ **FIXED 1.56.52 (was NOT P2 — the release gate had never booted the kernel, for any tag)** — `.github/workflows/ci.yml:247` — The QEMU boot test and benchmarks are structurally skipped on every release, so the release CI gate never boots the kernel
+- ✅ **FIXED 1.56.52** — `kernel/arch/x86_64/apic.cyr:285` — tlb_shootdown_all IPIs APIC ids 0..cpu_count-1, conflating an online COUNT with the set of online APIC IDs
+- ✅ **FIXED 1.56.52** — `kernel/arch/x86_64/idt.cyr:9` — No IST is ever configured: the #DF handler runs on the same TSS.RSP0 whose corruption is the commonest cause of #DF, so the whole vector-8 CMOS diagnostic is unreachable in its own failure mode
+- ✅ **FIXED 1.56.52** — `kernel/arch/x86_64/iommu.cyr:98` — iommu_allow_dma_2mb aliases any physical address >= 1 GB onto an existing grant in the single 1 GB second-level table
+- ✅ **FIXED 1.56.52** — `kernel/arch/x86_64/keyboard.cyr:242` — scancode_to_ascii's "Bounds check" is vacuous and does not cover the case that could actually go out of bounds
+- ✅ **FIXED 1.56.52** — `kernel/arch/x86_64/pic.cyr:77` — Timer-ISR comment names a hid_poll guard that no longer exists and that hid.cyr explicitly documents replacing
+- ✅ **FIXED 1.56.52** — `kernel/arch/x86_64/usb/msc.cyr:465` — MSC bulk ring Link TRB is initialised with Cycle = 1 while the initial producer cycle is also 1 — the exact inversion xhci_ring.cyr documents as wrong
+- ✅ **FIXED 1.56.52** — `kernel/arch/x86_64/usb/xhci_ctx.cyr:287` — SuperSpeed interrupt Interval is computed from a device byte with neither the zero-guard nor the clamp the HS path has
+- ✅ **FIXED 1.56.52** — `kernel/core/acpi.cyr:368` — _S5_ decode accepts a failed AML integer read for SLP_TYPb and latches acpi_s5_valid, contradicting the comment two lines above
+- ✅ **FIXED 1.56.52** — `kernel/core/elf.cyr:357` — Every error return after proc_create_address_space leaks the address space and its mapped 2 MB pages — a repeatable exec of one crafted file exhausts physical memory
+- ✅ **FIXED 1.56.52** — `kernel/core/gpu.cyr:10942` — gpu_scanout_matchgeom overrides the console geometry from device registers without bounding it by the firmware framebuffer extent
+- ✅ **FIXED 1.56.52 (was NOT P2 — remotely-triggered ring-0 stack disclosure)** — `kernel/core/net_dhcp.cyr:37` — dhcp_find_option validates that the declared option length fits but not that it is large enough for its readers
+- ✅ **FIXED 1.56.52** — `kernel/core/net_icmp.cyr:59` — Echo requests are answered without checking the IPv4 destination — broadcast/multicast ping amplifier
+- ✅ **FIXED 1.56.52** — `kernel/core/net_ingress.cyr:81` — net_udp_buf is overwritten by every inbound UDP datagram regardless of port or destination
+- ✅ **FIXED 1.56.52 (was NOT P2 — unauthenticated remote parse-confusion + allocation trigger)** — `kernel/core/net_ingress.cyr:206` — IPv4 fragmentation is neither reassembled nor rejected — non-first fragments are parsed as L4 headers
+- ✅ **FIXED 1.56.52** — `kernel/core/net_tcp.cyr:710` — net_handle_tcp's stack canary is checked on 2 of ~20 return paths, and the function has no local buffer to protect
+- ✅ **FIXED 1.56.52** — `kernel/core/power.cyr:181` — SystemMemory reset register written as a raw physical address, bypassing the acpi_va direct-map translation
+- ✅ **FIXED 1.56.52** — `kernel/core/proc.cyr:1788` — sys_mmap high path leaks a 2 MB region permanently when proc_map_page_hi fails
+- ✅ **FIXED 1.56.52** — `kernel/core/proc.cyr:1830` — sys_munmap's low-arena ceiling (0x40000000) is above the arena's real top (0x3FA00000), so ring 3 can unmap and free its own live user stack
+- ✅ **FIXED 1.56.52** — `kernel/core/ramdisk.cyr:122` — ramdisk bounds checks are signed and admit negative sectors: `start + count > capacity` can wrap, and `sector >= capacity` passes for any negative sector
+- ✅ **FIXED 1.56.52** — `kernel/core/syscall.cyr:2183` — #92 op 0x0A (TRI_LIST) omits the frame-skew corner bound that op 0x09 documents as mandatory for the same shader
+- ✅ **FIXED 1.56.52** — `kernel/core/syscall.cyr:4565` — gpu_caps#89 bit3/bit4 promise "a caller that sees this bit set will not then get E_NOGPU" — but the caps gate omits two of #92's four preconditions
+- ✅ **FIXED 1.56.52** — `kernel/core/syscall.cyr:7082` — mdo_validate has no operand block for MDO_OP_CRCCAL (0x0A) — the one advertised #93 op that accepts-and-ignores its record fields
+- ✅ **FIXED 1.56.52** — `kernel/core/virtio_blk.cyr:293` — vblk_qsize is taken from the device with only a zero check, but the avail ring is a single 4 KB page sized for queue_size <= 256
+- ✅ **FIXED 1.56.52** — `kernel/core/virtio_net.cyr:440` — virtio RX used-ring desc_id and length are trusted without bounds
+- ✅ **FIXED 1.56.52** — `kernel/core/vmm.cyr:31` — vmm_map_user_exec / vmm_alloc_user_exec are dead code that would map user pages writable AND executable
+- ✅ **FIXED 1.56.52** — `kernel/klib/kfmt.cyr:9` — fmt_int_buf renders the most-negative i64 as a bare "-"
+- ✅ **FIXED 1.56.52** — `kernel/klib/kfmt.cyr:28` — fmt_hex_buf emits an empty string for any negative value, and three #PF-forensics sites read that as "the value was zero"
+- ✅ **FIXED 1.56.52** — `kernel/klib/kfmt.cyr:40` — fmt_hex_buf needs 17 bytes but every caller supplies a 16-byte buffer
 
 
 ## Also carried out of the sweep, not in the tables above

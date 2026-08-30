@@ -119,6 +119,111 @@ fn net_handle_udp(pkt, ip_off, ip_payload_len, src_ip, dst_ip) {
     return udp_data_len;
 }
 
+#ifdef NET_CSUM_SELFTEST
+# ⛔⛔ 1.56.52 — POSITIVE EVIDENCE FOR THE RECEIVE-CHECKSUM DROP PATH. The network smokes prove GOOD
+# frames still pass (DHCP, DNS, NTP, ICMP, TCP all round-trip), which is necessary and not sufficient:
+# nothing in the tree ever presents a CORRUPT frame, so an inverted or absent check would pass every
+# one of them. This drives net_demux_frame directly with a synthetic frame and asserts both
+# directions — accepted when the checksum is right, DROPPED when one byte is flipped.
+# ⚠ MODULE SCOPE ON PURPOSE. `var csum_frame[16]` here is 16 u64 = 128 BYTES (the module rule), which
+# comfortably holds the 14 + 20 + 8 + 4 = 46-byte frame. A function-local `var f[16]` would be 16
+# BYTES and smash the stack — that inverted-units error is exactly what got the first draft of this
+# selftest refuted, and it is the same class as the four shell.cyr overflows this cut fixed.
+var csum_frame[16];
+
+fn net_csum_selftest() {
+    var f = &csum_frame;
+    var ok = 1;
+    var i = 0;
+    while (i < 128) { store8(f + i, 0); i = i + 1; }
+
+    # Ethernet: dst/src MAC left zero, ethertype IPv4.
+    store8(f + 12, 0x08); store8(f + 13, 0x00);
+    # IPv4: v4, ihl 5, total = 20 + 8 + 4 = 32, proto 17 (UDP), src 127.0.0.1, dst 127.0.0.1.
+    store8(f + 14, 0x45);
+    store8(f + 16, 0); store8(f + 17, 32);
+    store8(f + 22, 64);                       # TTL
+    store8(f + 23, 17);                       # proto UDP
+    store8(f + 26, 127); store8(f + 29, 1);   # src 127.0.0.1
+    store8(f + 30, 127); store8(f + 33, 1);   # dst 127.0.0.1
+    var ck = ip_checksum(f + 14, 20);
+    store8(f + 24, (ck >> 8) & 0xFF); store8(f + 25, ck & 0xFF);
+    # UDP: sport 4444, dport 5555, len 12, checksum 0 (= "not computed", the agnos TX convention).
+    store8(f + 34, 17); store8(f + 35, 92);   # 4444
+    store8(f + 36, 21); store8(f + 37, 179);  # 5555
+    store8(f + 38, 0);  store8(f + 39, 12);   # UDP length = 8 + 4
+    store8(f + 42, 67); store8(f + 43, 75); store8(f + 44, 83); store8(f + 45, 88);   # "CKSX"
+
+    # ARM 1 — a well-formed frame must be ACCEPTED.
+    var d0 = net_csum_drop_ip;
+    net_udp_buf_len = 0;
+    net_demux_frame(f, 46);
+    if (net_udp_buf_len != 4) { ok = 0; kprintln("csum: good frame REJECTED", 25); }
+    if (net_csum_drop_ip != d0) { ok = 0; kprintln("csum: good frame counted a drop", 31); }
+
+    # ARM 2 — flip one bit of the IPv4 header checksum; it must be DROPPED and counted.
+    store8(f + 25, load8(f + 25) ^ 1);
+    net_udp_buf_len = 0;
+    net_demux_frame(f, 46);
+    if (net_udp_buf_len != 0) { ok = 0; kprintln("csum: corrupt IP header ACCEPTED", 32); }
+    if (net_csum_drop_ip != d0 + 1) { ok = 0; kprintln("csum: corrupt IP header not counted", 35); }
+    store8(f + 25, load8(f + 25) ^ 1);        # restore
+
+    # ARM 3 — a real UDP checksum that is WRONG must be dropped (the non-zero path, which the
+    # agnos TX convention never exercises).
+    var d1 = net_csum_drop_udp;
+    store8(f + 40, 0xBA); store8(f + 41, 0xD1);   # a checksum that is non-zero and wrong
+    net_udp_buf_len = 0;
+    net_demux_frame(f, 46);
+    if (net_udp_buf_len != 0) { ok = 0; kprintln("csum: bad UDP checksum ACCEPTED", 31); }
+    if (net_csum_drop_udp != d1 + 1) { ok = 0; kprintln("csum: bad UDP checksum not counted", 34); }
+
+    # --- FRAGMENT ARMS (1.56.52) -------------------------------------------------------------
+    # ⚠ Bytes 6-7 must be restored AND the header checksum RECOMPUTED for each arm — otherwise the
+    # frame dies at the checksum check above and the arm proves nothing about fragment handling.
+    store8(f + 40, 0); store8(f + 41, 0);         # UDP checksum back to "not computed"
+    var d2 = net_drop_ip_frag;
+
+    # ARM 4 — MF set, offset 0: a FIRST fragment. Dropped and counted.
+    store8(f + 20, 0x20); store8(f + 21, 0x00);
+    store8(f + 24, 0); store8(f + 25, 0);
+    var ck4 = ip_checksum(f + 14, 20);
+    store8(f + 24, (ck4 >> 8) & 0xFF); store8(f + 25, ck4 & 0xFF);
+    net_udp_buf_len = 0;
+    net_demux_frame(f, 46);
+    if (net_udp_buf_len != 0) { ok = 0; kprintln("frag: a FIRST fragment (MF=1) was ACCEPTED", 42); }
+    if (net_drop_ip_frag != d2 + 1) { ok = 0; kprintln("frag: a FIRST fragment was not counted", 38); }
+
+    # ARM 5 — offset non-zero: a NON-FIRST fragment. This is the sharp end — its body was being
+    # parsed as an L4 header. Dropped and counted.
+    store8(f + 20, 0x00); store8(f + 21, 0x25);   # offset = 37 (in 8-byte units)
+    store8(f + 24, 0); store8(f + 25, 0);
+    var ck5 = ip_checksum(f + 14, 20);
+    store8(f + 24, (ck5 >> 8) & 0xFF); store8(f + 25, ck5 & 0xFF);
+    net_udp_buf_len = 0;
+    net_demux_frame(f, 46);
+    if (net_udp_buf_len != 0) { ok = 0; kprintln("frag: a NON-FIRST fragment was ACCEPTED", 39); }
+    if (net_drop_ip_frag != d2 + 2) { ok = 0; kprintln("frag: a NON-FIRST fragment was not counted", 42); }
+
+    # ARM 6 — DF set, MF 0, offset 0: an ORDINARY unfragmented packet. Must still be ACCEPTED.
+    # ⛔ THE HONESTY ARM, AND THE ONE THAT CATCHES THE PLAUSIBLE WRONG FIX. Path-MTU discovery sets
+    # DF on most real traffic; a mask of 0x7FFF instead of 0x3FFF drops nearly everything the box
+    # receives while passing arms 4 and 5 and looking entirely correct.
+    store8(f + 20, 0x40); store8(f + 21, 0x00);
+    store8(f + 24, 0); store8(f + 25, 0);
+    var ck6 = ip_checksum(f + 14, 20);
+    store8(f + 24, (ck6 >> 8) & 0xFF); store8(f + 25, ck6 & 0xFF);
+    net_udp_buf_len = 0;
+    net_demux_frame(f, 46);
+    if (net_udp_buf_len != 4) { ok = 0; kprintln("frag: DF was treated as a fragment - real traffic would die", 59); }
+    if (net_drop_ip_frag != d2 + 2) { ok = 0; kprintln("frag: a DF packet was counted as a fragment", 43); }
+
+    if (ok == 1) { kprintln("csum: RX verification OK (accept + IP drop + UDP drop + frag reject)", 68); }
+    else { kprintln("csum: RX verification FAIL", 26); }
+    return ok;
+}
+#endif
+
 # 1.49.0 loopback bite 1 self-test (called from main boot under LOOPBACK_SELFTEST). Proves a UDP
 # datagram to 127.0.0.1 loops back INTERNALLY: udp_send → net_tx routes it to the lo queue (NOT
 # nic_send) → net_poll's net_lo_drain runs it through net_demux_frame → net_handle_udp → net_udp_buf,
@@ -233,9 +338,71 @@ fn net_demux_frame(pkt, pkt_len) {
             # Clamp/validate the claimed IP length against what we actually received (1.35.7).
             var ip_payload_len = ip_safe_payload_len(ip_total, ip_ihl, pkt_len - 14);
             if (ip_payload_len >= 0) {
-                if (ip_proto == 1) { net_handle_icmp(pkt, 14 + ip_ihl, ip_payload_len, ip_src); }
-                if (ip_proto == 17) { net_handle_udp(pkt, 14 + ip_ihl, ip_payload_len, ip_src, ip_dst); }
-                if (ip_proto == 6) { net_handle_tcp(pkt, 14 + ip_ihl, ip_payload_len, ip_src); }
+                # ⛔⛔ 1.56.52 — VERIFY BEFORE DISPATCH. Nothing on this path checked a checksum, on
+                # any layer. Placed AFTER ip_safe_payload_len because that call is the single
+                # authority that 14 + ip_ihl <= pkt_len and 14 + ip_ihl + ip_payload_len <= pkt_len,
+                # so every read below is in bounds by construction.
+                if (ip_checksum(ip_hdr, ip_ihl) != 0) {
+                    net_csum_drop_ip = net_csum_drop_ip + 1;
+                    return 0;
+                }
+                # ⛔⛔ 1.56.52 — REFUSE FRAGMENTS. agnos has no reassembly: grep the whole net stack for
+                # `frag` and before this line there was nothing. So a fragmented datagram was neither
+                # reassembled NOR rejected — the header was decoded for its length and protocol and the
+                # BODY OF A NON-FIRST FRAGMENT was handed to the L4 handlers as though it were an L4
+                # header. Remote, unauthenticated, and the checksums added earlier in this same cut are
+                # not a filter: the IPv4 header sum does not cover the payload, and the attacker owns
+                # the fragment body, so for UDP two zero bytes at l4+6/+7 take the RFC 768 "not
+                # computed" skip and for ICMP/TCP a sum can simply be computed over what is sent. The
+                # TCP arm is the sharp end — a crafted body becomes a TCP header, and a SYN to a
+                # listening port allocates two kmalloc buffers.
+                # ⚠ THE TEST IS `& 0x3FFF`, NOT `& 0x7FFF`. Bytes 6-7 are flags(3) + offset(13):
+                # 0x8000 reserved, 0x4000 DF, 0x2000 MF, 0x1FFF offset. A datagram is unfragmented iff
+                # MF == 0 AND offset == 0. **DF must NOT be part of the test** — it is set on most real
+                # traffic by path-MTU discovery, and including it would drop nearly every packet the
+                # box receives while looking like a correct fix.
+                # ⚠ Placed AFTER the header checksum on purpose: a corrupt header must be reported as a
+                # checksum drop, not miscounted as a fragment.
+                var ip_frag = (load8(ip_hdr + 6) << 8) | load8(ip_hdr + 7);
+                if ((ip_frag & 0x3FFF) != 0) {
+                    net_drop_ip_frag = net_drop_ip_frag + 1;
+                    return 0;
+                }
+                var l4 = pkt + 14 + ip_ihl;
+                if (ip_proto == 1) {
+                    # ICMP carries NO pseudo-header, so the plain one's-complement sum applies.
+                    if (ip_checksum(l4, ip_payload_len) != 0) {
+                        net_csum_drop_icmp = net_csum_drop_icmp + 1;
+                        return 0;
+                    }
+                    net_handle_icmp(pkt, 14 + ip_ihl, ip_payload_len, ip_src, ip_dst);
+                }
+                if (ip_proto == 17) {
+                    # The < 8 guard lives inside net_handle_udp; hoisted because the checksum field
+                    # is a fixed-offset read at l4+6/+7 that happens before that call.
+                    if (ip_payload_len < 8) { return 0; }
+                    # ⛔ AN ALL-ZERO UDP CHECKSUM MEANS "NOT COMPUTED" (RFC 768) AND MUST BE ACCEPTED.
+                    # This is MANDATORY, not an optimisation: udp_build hardcodes store16(pkt + 6, 0),
+                    # so EVERY agnos-originated datagram carries zero. Without this skip the loopback
+                    # selftest and DHCP both die on the first frame.
+                    var uck = (load8(l4 + 6) << 8) | load8(l4 + 7);
+                    if (uck != 0) {
+                        if (l4_pseudo_csum(ip_src, ip_dst, 17, l4, ip_payload_len) != 0) {
+                            net_csum_drop_udp = net_csum_drop_udp + 1;
+                            return 0;
+                        }
+                    }
+                    net_handle_udp(pkt, 14 + ip_ihl, ip_payload_len, ip_src, ip_dst);
+                }
+                if (ip_proto == 6) {
+                    # ⚠ TCP has no "not computed" encoding — the checksum is mandatory on every
+                    # segment, so there is no zero-skip here and there must not be one.
+                    if (l4_pseudo_csum(ip_src, ip_dst, 6, l4, ip_payload_len) != 0) {
+                        net_csum_drop_tcp = net_csum_drop_tcp + 1;
+                        return 0;
+                    }
+                    net_handle_tcp(pkt, 14 + ip_ihl, ip_payload_len, ip_src, ip_dst);
+                }
             }
         }
     }

@@ -64,6 +64,49 @@ fn ip_checksum(buf, len) {
     return (0 - 1 - sum) & 0xFFFF;
 }
 
+# ⛔⛔ 1.56.52 — RECEIVE-SIDE CHECKSUM VERIFICATION. Until this cut agnos verified NOTHING on ingress:
+# every checksum call site in the tree was on the TX path, and net_demux_frame handed a frame to the
+# IP, ICMP, UDP and TCP handlers with no read, recompute or compare of any kind. A corrupted TCP
+# segment whose seq happened to equal RCV.NXT was appended to the receive ring, advanced RCV.NXT, and
+# was ACKed — i.e. corruption was acknowledged to the peer as delivered.
+# ⚠ These counters are written from thread context AND from the timer ISR (net_rx_drain_isr). An
+# aligned u64 increment is a single store on x86_64, and they are DIAGNOSTICS ONLY — no lock, and do
+# not build control flow on them. Same rationale as the icmp counters in net_icmp.cyr.
+var net_csum_drop_ip   = 0;
+var net_csum_drop_icmp = 0;
+var net_csum_drop_udp  = 0;
+var net_csum_drop_tcp  = 0;
+# 1.56.52 — IPv4 fragments, neither reassembled nor (until now) rejected. See net_demux_frame.
+var net_drop_ip_frag   = 0;
+
+# l4_pseudo_csum — one's-complement checksum over the IPv4 pseudo-header + an L4 segment.
+# ⚠ A DELIBERATE NEAR-DUPLICATE of tcp_checksum_compute (net_tcp.cyr), which hardcodes proto = 6 and
+# lives on the TX path. That function is NOT refactored to call this one: the transmit path is the
+# single thing this change must not perturb, and ~120 bytes of duplication is a cheap price for
+# leaving every outbound segment byte-identical. If they ever need to converge, do it in its own cut
+# with the TX smokes as the gate.
+# ⚠ Verification is `recompute == 0`, which holds for this one's-complement form INCLUDING the
+# RFC-768 transmit convention of sending 0xFFFF for a computed zero — one's-complement -0 == 0.
+fn l4_pseudo_csum(src_ip, dst_ip, proto, buf, len) {
+    var sum = 0;
+    sum = sum + ((src_ip >> 16) & 0xFFFF);
+    sum = sum + (src_ip & 0xFFFF);
+    sum = sum + ((dst_ip >> 16) & 0xFFFF);
+    sum = sum + (dst_ip & 0xFFFF);
+    sum = sum + proto;
+    sum = sum + len;
+    var i = 0;
+    while (i < len) {
+        var hi = load8(buf + i) << 8;
+        var lo = 0;
+        if (i + 1 < len) { lo = load8(buf + i + 1); }
+        sum = sum + hi + lo;
+        i = i + 2;
+    }
+    while (sum > 0xFFFF) { sum = (sum & 0xFFFF) + (sum >> 16); }
+    return (0 - 1 - sum) & 0xFFFF;
+}
+
 fn eth_build(pkt, dst_mac, src_mac, ethertype) {
     memcpy(pkt, dst_mac, 6);
     memcpy(pkt + 6, src_mac, 6);

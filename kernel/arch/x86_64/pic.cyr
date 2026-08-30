@@ -77,9 +77,21 @@ fn timer_handler(rsp_after_push) {
         hda_stream_service();
         # 1.53.7: belt-and-suspenders keyboard drain. The xHCI RX MSI-X ISR (vector 0x51) is the
         # primary path once armed post-enum; this tick drain keeps the keyboard alive if the MSI is
-        # missed/masked on real Zen (net kept both the tick drain + the MSI path too). hid_poll
-        # self-gates (hid_kbd_slot_id==0 → no-op pre-enum) and is cli-first RX-only, so it is safe
-        # early-boot and non-re-entrant vs a read-loop hid_poll.
+        # missed/masked on real Zen (net kept both the tick drain + the MSI path too).
+        # ⛔ 1.56.52 — THIS COMMENT NAMED TWO GUARANTEES THAT DO NOT EXIST, and the second was already
+        # corrected 165 lines below in this same file without this copy being touched.
+        #   (a) "hid_poll self-gates (hid_kbd_slot_id==0 → no-op pre-enum)" — that guard was DELETED,
+        #       and hid.cyr says why in the four lines above its replacement: on a box with a mouse and
+        #       no keyboard it drained nothing AND never cleared IMAN.IP, so the controller sent no
+        #       further MSI-X and every device went quiet. hid_poll now gates on `hid_ep_count == 0`,
+        #       which proves xHCI init ran without asserting anything about a keyboard.
+        #   (b) "is cli-first RX-only, so it is safe early-boot and non-re-entrant" — FALSE on SMP, and
+        #       the MSI-X arm at the bottom of this file already carries the correction: `cli` on one
+        #       CPU does not exclude this handler running on another. hid_poll is re-entrancy-safe
+        #       because it takes its own try-lock (`hid_poll_trylock`), not because of `cli`.
+        # ⚠ A comment promising a guard that was removed is worse than no comment: it tells the next
+        # reader the caller is already protected, which is exactly the reasoning that leaves the real
+        # protection out.
         hid_poll();
     }
     do_context_switch(rsp_after_push);

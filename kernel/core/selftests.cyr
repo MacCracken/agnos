@@ -266,6 +266,12 @@
 }
 #endif
 
+#ifdef USERWIN_SELFTEST
+user_window_selftest();
+#endif
+#ifdef DHCP_OPT_SELFTEST
+dhcpopt_selftest();
+#endif
 #ifdef MMAP_SELFTEST
 # Anonymous-mmap allocator self-test (1.35.3). Hermetic: exercises the new
 # 2 MB-contiguous allocator (pmm_alloc_2mb / _free_2mb / _count) + the mmap

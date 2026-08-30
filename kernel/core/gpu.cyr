@@ -10942,6 +10942,30 @@ fn gpu_scanout_matchgeom() {
     if (vw > 4096) { return 0; }
     if (vh > 4096) { return 0; }
     if (ppx < vw) { return 0; }             # pitch must be >= width
+    # ⛔⛔ 1.56.52 — BOUND THE NEW GEOMETRY BY THE REAL FRAMEBUFFER EXTENT. Every guard above is a
+    # PLAUSIBILITY check on the register values themselves; not one of them compares the result to how
+    # much framebuffer actually exists. `fb_set_geom` is a bare three-field store with no validation of
+    # its own, and afterwards fb_pitch()/fb_width()/fb_height() return these register-derived values in
+    # preference to boot_info — so EVERY paint site computes its address from them
+    # (`fb + (abs_y + dy) * pitch + (x_px + dx) * 4` in fb_fill_cell, `height * pitch` in fb_scroll_up).
+    # A pitch register reading up to 16383 px (the 0x3FFF mask) with a 4096-px height describes a
+    # 268 MB surface; drawing into a firmware framebuffer smaller than that walks straight off the end
+    # of the BAR mapping.
+    # ⭐ fb_size_or_fallback() is the function whose own comment calls itself "single source of truth so
+    # the WC remap site and any future verify paths agree" — this is that verify path, and until now it
+    # had only the two WC-remap callers.
+    # ⚠ READ IT BEFORE fb_set_geom OR IT IS CIRCULAR: its fallback arm is `fb_pitch() * fb_height()`,
+    # which after the override would be the very numbers being validated. The early return at the top of
+    # this function guarantees the override has not happened yet, so this reads the boot_info extent.
+    # ⚠ REFUSING ON AN UNKNOWN EXTENT (have == 0) IS THE CONSERVATIVE DIRECTION and cannot regress a
+    # working box: have == 0 means neither the firmware FrameBufferSize nor pitch*height is known, i.e.
+    # there is no framebuffer to render into and the override would not help. The real archaemenid case
+    # SHRINKS the extent (archaemenid`s 2560x1440 boot_info surface overridden to the firmware`s true 800x600), so it
+    # passes this bound with room to spare — the bound only catches the growth direction.
+    var new_bytes = ppx * 4 * vh;
+    var have = fb_size_or_fallback();
+    if (have == 0) { return 0; }
+    if (new_bytes > have) { return 0; }
     fb_set_geom(vw, vh, ppx * 4);           # bytes/row = pitch-px * 4 (ARGB8888)
     fb_defer_off();                          # 1.56.37: geometry verified — release the panel
     fb_console_clear();                      # redraw at the new geometry (also resets cursor + shadow)

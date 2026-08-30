@@ -25,7 +25,26 @@ var dhcp_pkt_buf[300];
 # Find the data offset of a DHCP option by tag within an options blob.
 # Returns -1 if not found or malformed. Returned offset points at the
 # option DATA byte (post-tag, post-len).
-fn dhcp_find_option(opts, opts_len, tag) {
+#
+# ⛔⛔ `need` IS NOT OPTIONAL, AND ITS ABSENCE WAS A REMOTE RING-0 STACK READ. Until 1.56.52 this
+# function validated only that the DECLARED length FITS (`i + 2 + olen > opts_len`) and never that it
+# is large enough for whoever is about to read it. Every one of the five call sites then read a FIXED
+# width off the returned offset — 1 byte for option 53, 4 bytes for options 54/1/3/6 through
+# `dhcp_load_u32_be`, which is four unguarded `load8`s. So a server (or anyone who can spoof one
+# on-link during the boot exchange — the xid/chaddr match is the only barrier) sends a 1024-byte reply
+# whose LAST option declares `olen = 0`. The option sits at `i = opts_len - 2`, the bound above passes
+# exactly, the returned offset IS `opts_len`, and the 4-byte read starts at `&rx + 240 + (n - 240)`
+# = `&rx + n` — up to 4 bytes past the end of `var rx[1024]`, which is FUNCTION-LOCAL and therefore
+# 1024 BYTES. Those bytes become `net_gateway` / `net_dns_server` and are PRINTED to the console and
+# into the klug ring. That is remotely-triggered kernel-stack disclosure — the same class as the
+# 1.56.51 `net_recv_udp` fix — and it was filed as a P2.
+# ⚠ The short-option case mis-parses even when it stays in bounds: a 1-byte option 3 makes
+# `assigned_gw` one real byte plus three bytes of the NEXT option.
+# ⭐ THE BOUND BELONGS IN THE HELPER, NOT AT EACH SITE. Five callers exist today and each new arm
+# would have to remember; the same reasoning is written out at length above `is_user_array` in
+# syscall.cyr. A caller that genuinely wants a variable-length option passes `need` = the minimum it
+# will actually touch — never 0 as a way of opting out.
+fn dhcp_find_option(opts, opts_len, tag, need) {
     var i = 0;
     while (i < opts_len) {
         var t = load8(opts + i);
@@ -34,11 +53,103 @@ fn dhcp_find_option(opts, opts_len, tag) {
         if (i + 1 >= opts_len) { return 0 - 1; }
         var olen = load8(opts + i + 1);
         if (i + 2 + olen > opts_len) { return 0 - 1; }
-        if (t == tag) { return i + 2; }
+        if (t == tag) {
+            # ⛔ The reader needs `need` bytes; the option carries `olen`. Refuse rather than hand back
+            # an offset the caller will read past. Refusing looks to the caller exactly like "option
+            # absent", which every call site already handles.
+            if (olen < need) { return 0 - 1; }
+            return i + 2;
+        }
         i = i + 2 + olen;
     }
     return 0 - 1;
 }
+
+
+#ifdef DHCP_OPT_SELFTEST
+# ⭐⭐ THE DHCP OPTION-LENGTH GATE — hermetic, no network, no server, no timing.
+#
+# `dhcp_find_option` is a pure function over a caller-supplied buffer, so the whole remote attack is
+# reproducible as an in-memory blob. That matters: the real trigger needs a hostile DHCP server on
+# the boot exchange, which no smoke can arrange, and it is exactly why this sat unfixed as a "P2".
+#
+# ⛔ THE ARM THAT MATTERS IS #3 — the LAST option declaring len 0. That is the one whose returned
+# offset equals opts_len, so the caller's 4-byte read starts one past the end of the blob. Arms 1-2
+# are the honesty arms: without them "return -1 always" scores a pass and DHCP silently stops working.
+var dhcpopt_buf[16];      # module scope => 16 u64 = 128 bytes; the blobs below use at most 12
+fn dhcpopt_selftest() {
+    var fail = 0;
+    var b = &dhcpopt_buf;
+    var i = 0;
+    while (i < 16) { store64(b + i * 8, 0); i = i + 1; }
+
+    # --- ARM 1: a well-formed 4-byte option is FOUND, and at the right offset ------------------
+    # [0]=tag 3, [1]=len 4, [2..5]=data. Data offset must be 2.
+    store8(b + 0, 3); store8(b + 1, 4);
+    store8(b + 2, 10); store8(b + 3, 0); store8(b + 4, 0); store8(b + 5, 1);
+    if (dhcp_find_option(b, 6, 3, 4) != 2) {
+        kprintln("dhcpopt: a well-formed option was refused", 41);
+        fail = 1;
+    }
+    # ⚠ And a 1-byte reader must still accept a 4-byte option — `need` is a MINIMUM, not an equality.
+    if (dhcp_find_option(b, 6, 3, 1) != 2) {
+        kprintln("dhcpopt: need was treated as an equality, not a minimum", 55);
+        fail = 1;
+    }
+
+    # --- ARM 2: absent tag is still -1, and a well-formed blob does not become unreadable -------
+    if (dhcp_find_option(b, 6, 54, 4) != 0 - 1) {
+        kprintln("dhcpopt: an absent tag was reported as present", 46);
+        fail = 1;
+    }
+
+    # --- ARM 3: THE ATTACK — the last option declares len 0 for a 4-byte reader -----------------
+    # ⛔ This is the shape that read past `var rx[1024]`. Laid out so the option sits at
+    # i = opts_len - 2: two pads, then tag 6 with declared length 0, opts_len = 4. The OLD bound
+    # `i + 2 + olen > opts_len` substitutes to `2 + 2 + 0 > 4` = `4 > 4` = FALSE, so it passes EXACTLY
+    # and returns offset i + 2 = 4 — which IS opts_len. A 4-byte read from there is off the end.
+    # ⚠ The general statement is `offset == opts_len whenever i == opts_len - 2 and olen == 0`; the
+    # numbers above are this blob`s, not the two-byte {tag, 0} variant`s.
+    store8(b + 0, 0);                       # pad, so the option is genuinely last
+    store8(b + 1, 0);
+    store8(b + 2, 6); store8(b + 3, 0);     # tag 6 (DNS), declared length 0
+    if (dhcp_find_option(b, 4, 6, 4) != 0 - 1) {
+        kprintln("dhcpopt: a zero-length option was handed to a 4-byte reader", 59);
+        fail = 1;
+    }
+
+    # --- ARM 4: a SHORT-but-nonzero option is refused too --------------------------------------
+    # ⚠ Not the same arm as #3: this one stays in bounds and would have mis-parsed SILENTLY. The blob
+    # below declares tag 3 with length 2 and data {10, 1}, followed by a second option {3, 4, 1,2,3,4}.
+    # Under the old code the returned offset is 2 and dhcp_load_u32_be reads b[2..5] = 10, 1, 3, 4 —
+    # so assigned_gw becomes 10.1.3.4: TWO real data bytes plus the NEXT option`s tag and len bytes.
+    # (The function header`s "one real byte plus three" describes the 1-byte case, not this one.)
+    # In bounds is not the same as correct, and a gate that only tested #3 would have let this through.
+    store8(b + 0, 3); store8(b + 1, 2);
+    store8(b + 2, 10); store8(b + 3, 1);
+    store8(b + 4, 3); store8(b + 5, 4);
+    store8(b + 6, 1); store8(b + 7, 2); store8(b + 8, 3); store8(b + 9, 4);
+    if (dhcp_find_option(b, 10, 3, 4) != 0 - 1) {
+        kprintln("dhcpopt: a 2-byte option was handed to a 4-byte reader", 54);
+        fail = 1;
+    }
+
+    # --- ARM 5: a declared length that RUNS OFF the blob is still refused ----------------------
+    # The pre-existing upper bound. Kept in the gate so a future edit cannot trade one for the other.
+    store8(b + 0, 3); store8(b + 1, 200);
+    if (dhcp_find_option(b, 6, 3, 4) != 0 - 1) {
+        kprintln("dhcpopt: an option running past the blob was accepted", 53);
+        fail = 1;
+    }
+
+    if (fail == 0) {
+        kprintln("dhcpopt: option lengths are checked against the reader OK", 57);
+        return 1;
+    }
+    kprintln("dhcpopt: OPTION LENGTH FAIL", 27);
+    return 0;
+}
+#endif
 
 fn dhcp_load_u32_be(p) {
     return (load8(p) << 24) | (load8(p + 1) << 16) | (load8(p + 2) << 8) | load8(p + 3);
@@ -183,10 +294,10 @@ fn dhcp_init() {
                 }
                 if (chaddr_match == 1) {
                     var oo = 240;
-                    var mt_off = dhcp_find_option(&rx + oo, n - oo, 53);
+                    var mt_off = dhcp_find_option(&rx + oo, n - oo, 53, 1);
                     if (mt_off >= 0 && load8(&rx + oo + mt_off) == 2) {
                         offered_ip = dhcp_load_u32_be(&rx + 16);
-                        var sid_off = dhcp_find_option(&rx + oo, n - oo, 54);
+                        var sid_off = dhcp_find_option(&rx + oo, n - oo, 54, 4);
                         if (sid_off >= 0) { server_id = dhcp_load_u32_be(&rx + oo + sid_off); }
                         got = 1;
                         break;
@@ -245,18 +356,18 @@ fn dhcp_init() {
                 }
                 if (chaddr_match == 1) {
                     var oo = 240;
-                    var mt_off = dhcp_find_option(&rx + oo, n - oo, 53);
+                    var mt_off = dhcp_find_option(&rx + oo, n - oo, 53, 1);
                     if (mt_off >= 0) {
                         var mt = load8(&rx + oo + mt_off);
                         if (mt == 5) {
-                            var nm_off = dhcp_find_option(&rx + oo, n - oo, 1);
+                            var nm_off = dhcp_find_option(&rx + oo, n - oo, 1, 4);
                             if (nm_off >= 0) { assigned_mask = dhcp_load_u32_be(&rx + oo + nm_off); }
-                            var gw_off = dhcp_find_option(&rx + oo, n - oo, 3);
+                            var gw_off = dhcp_find_option(&rx + oo, n - oo, 3, 4);
                             if (gw_off >= 0) { assigned_gw = dhcp_load_u32_be(&rx + oo + gw_off); }
                             # Option 6 (RFC 2132 §3.8) — DNS server list; take the
                             # first 4-byte address. Requested in the DISCOVER
                             # param-list; captured here for the 1.35.x DNS stub.
-                            var dns_off = dhcp_find_option(&rx + oo, n - oo, 6);
+                            var dns_off = dhcp_find_option(&rx + oo, n - oo, 6, 4);
                             if (dns_off >= 0) { assigned_dns = dhcp_load_u32_be(&rx + oo + dns_off); }
                             got = 1;
                             break;

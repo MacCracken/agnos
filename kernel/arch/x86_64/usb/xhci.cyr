@@ -881,6 +881,13 @@ fn xhci_wait_transfer_for_trb(slot_id, expected_trb_phys, expected_len) {
             }
             # Non-matching event — consume and continue. Advance ERDP so
             # the ring doesn't back up on long sequences of stale events.
+            # ⛔ BUT HAND A HID TRANSFER EVENT BACK FIRST. This ring is SHARED: a keystroke that lands
+            # while a bulk transfer is in flight arrives here, and consuming it without telling the HID
+            # layer costs that interrupt-IN endpoint one of its 16 armed TRBs forever. See the reclaim
+            # banner in hid.cyr — sixteen of these and the keyboard is dead for the rest of the boot.
+            if (evt_type == XHCI_TRB_TRANSFER_EVENT) {
+                hid_reclaim_event((evt_dw3 >> 24) & 0xFF, (evt_dw3 >> 16) & 0x1F);
+            }
             xhci_evt_ring_idx = xhci_evt_ring_idx + 1;
             if (xhci_evt_ring_idx == XHCI_EVT_RING_SEGMENT_SIZE) {
                 xhci_evt_ring_idx = 0;
@@ -940,6 +947,11 @@ fn xhci_wait_transfer_event(slot_id) {
                 }
             }
             # Non-matching or non-transfer event — consume and continue.
+            # ⛔ A HID Transfer Event consumed here is a TRB stolen from an interrupt-IN endpoint that
+            # will never get it back. Reclaim before advancing — see the banner in hid.cyr.
+            if (evt_type == XHCI_TRB_TRANSFER_EVENT) {
+                hid_reclaim_event((evt_dw3 >> 24) & 0xFF, (evt_dw3 >> 16) & 0x1F);
+            }
             xhci_evt_ring_idx = xhci_evt_ring_idx + 1;
             if (xhci_evt_ring_idx == XHCI_EVT_RING_SEGMENT_SIZE) {
                 xhci_evt_ring_idx = 0;
@@ -987,6 +999,11 @@ fn xhci_drain_transfer_events(slot_id) {
         if (evt_type == XHCI_TRB_TRANSFER_EVENT) {
             var evt_slot = (evt_dw3 >> 24) & 0xFF;
             if (evt_slot == slot_id) { drained = drained + 1; }
+            # ⛔ THIS DRAIN IS DELIBERATELY INDISCRIMINATE — the header above says so — and that is
+            # exactly why a HID endpoint on ANOTHER slot loses a TRB every time MSC reset recovery runs.
+            # `hid_ep_find` returns -1 for the MSC endpoint being recovered, so this is a no-op for the
+            # events this function is actually here to eat. See the reclaim banner in hid.cyr.
+            hid_reclaim_event(evt_slot, (evt_dw3 >> 16) & 0x1F);
         }
         xhci_evt_ring_idx = xhci_evt_ring_idx + 1;
         if (xhci_evt_ring_idx == XHCI_EVT_RING_SEGMENT_SIZE) {

@@ -22,8 +22,15 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 python3 - "$ROOT" <<'PY'
 import re,sys,glob,os
 root=sys.argv[1]; bad=0
-files=sorted(glob.glob(root+'/tests/gpu/*.cyr')+glob.glob(root+'/kernel/core/*.cyr')
-             +glob.glob(root+'/kernel/arch/x86_64/*.cyr'))
+# ⛔⛔ 1.56.52 — THE GLOB WAS THE GATE'S BLIND SPOT, NOT THE RULES. It covered tests/gpu, kernel/core
+# and kernel/arch/x86_64 ONLY — so `kernel/user/`, `kernel/klib/` and every SUBDIRECTORY
+# (kernel/arch/x86_64/usb/, ...) were never scanned. That is where the bugs were: shell.cyr held FOUR
+# ring-0 stack overflows of exactly the second rule's shape (`var cbuf[64]` handed to
+# `vfs_read(fd, &cbuf, 512)`), one of them remotely triggered, and kfmt.cyr's callers held a 17-byte
+# write into 16-byte buffers. Both rules below would have flagged them on the day they were written.
+# A gate that is right and not pointed at the code is indistinguishable from no gate.
+files=sorted(glob.glob(root+'/tests/**/*.cyr', recursive=True)
+             +glob.glob(root+'/kernel/**/*.cyr', recursive=True))
 for p in files:
     src=open(p).read()
     lines = src.split('\n')

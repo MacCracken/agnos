@@ -101,6 +101,7 @@ echo "  host debugfs baseline: Free blocks = ${BASE_FREE:-?}"
 echo "Booting EXT2_WRITE_SELFTEST kernel (NVMe + GPT partition)..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/write-selftest.log"
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # qemu_assert_booted
 timeout "${QEMU_TIMEOUT:-30}" qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
@@ -108,6 +109,10 @@ timeout "${QEMU_TIMEOUT:-30}" qemu-system-x86_64 \
     -drive "file=$IMG,format=raw,if=none,id=disk0" \
     -device "nvme,drive=disk0,serial=AGNOS-WTEST" \
     -serial stdio -display none -no-reboot 2>/dev/null > "$LOG"
+# ⛔ DID THE KERNEL RUN AT ALL? Without this, an OVMF hand-off failure makes every assertion
+# below evaluate against an empty log and print a wall of failures naming real properties.
+# See qemu_assert_booted in the lib for the measured rate and the log signature.
+qemu_assert_booted "$LOG" || exit 1
 
 echo ""
 echo "  --- ext2w self-test lines from boot log ---"

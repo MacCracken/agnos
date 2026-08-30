@@ -106,6 +106,20 @@ timer_ticks = 0;
 timer_isr_build();
 idt_set_gate(&idt + 32 * 16, &timer_isr, 0x08, 0x8E);
 kprintln("Timer ISR installed", 19);
+# ⛔⛔ 1.56.52 — #DF GETS ITS OWN STACK. THE PLACEMENT OF THIS CALL IS LOAD-BEARING AND IT WAS WRONG
+# TWICE. It reads THREE gates, and each must already be installed or its arm silently cannot fail:
+#   vector 8  — installed by exc_handlers_init (above). Placed next to the other TSS selftest at first,
+#               the whole check reported a correct configuration as broken, because idt_init() had not
+#               even run. That false red was the gate working.
+#   vector 14 — also exc_handlers_init, so it was real from the start.
+#   vector 32 — THE TIMER, installed on the line directly above THIS one. Sitting beside
+#               exc_handlers_init the arm read idt_init`s default gate, whose byte 4 is hardcoded 0 —
+#               so it passed unconditionally and could never have caught the regression it names
+#               (giving an IST to a re-entrant vector, where every nested delivery reuses one stack).
+# ⇒ A check placed before the thing it inspects is not a weak check, it is NO check. Anything added to
+# tss_ist_selftest must have its gate installed above this line.
+if (tss_ist_selftest(0) == 1) { kprintln("tss: #DF has IST1 on the direct map OK", 38); }
+else { kprintln("tss: #DF HAS NO IST - a bad RSP0 will triple-fault silently", 59); }
 
 # Initialize Local APIC. ⚠ The 8259 is now fully masked (pic_init writes 0xFF) — nothing is delivered
 # through it. The PIT COUNTER still free-runs for pit_ch0_read()/lapic_calibrate; only its IRQ is masked.
@@ -209,6 +223,12 @@ idt_set_gate(&idt + 240 * 16, &tlb_isr, 0x08, 0x8E);
 # function header in apic.cyr for the two precedents that make this worth a boot-time check.
 if (tlb_lock_selftest() == 1) { kprintln("tlb: handshake primitives OK", 28); }
 else { kprintln("tlb: HANDSHAKE PRIMITIVES BROKEN - shootdown serialisation is INERT", 67); }
+#ifdef HID_RECLAIM_SELFTEST
+# 1.56.52 — the stolen-event reclaim. Hermetic, so it deliberately runs HERE rather than after USB
+# init: it swaps xhci_evt_ring_phys/xhci_mmio_base for its own scratch pages under hid_poll_lock, and
+# doing that before the controller is live is strictly safer than doing it after.
+hid_reclaim_selftest();
+#endif
 #ifdef FP_NM_SELFTEST
 fpu_nm_selftest();
 #endif
@@ -1546,6 +1566,13 @@ if (audio_sink_ok == 1) {
 
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
+#endif
+
+# 1.56.52 — receive-checksum verification, both directions. The network smokes prove GOOD frames
+# still pass; nothing in the tree ever presents a CORRUPT one, so this is the only evidence the
+# DROP path works at all.
+#ifdef NET_CSUM_SELFTEST
+net_csum_selftest();
 #endif
 
 # FAT read self-test (1.34.x bite 2, compile-gated via FATFS_SELFTEST).

@@ -300,17 +300,221 @@ fn fb_scale_rowbuf_base() {
 # CR3 ALSO mirrors all sit ABOVE the ceiling — so without the upper bound a ring-3
 # caller could aim a kernel load64/store64 at MMIO or high kernel memory (1.41.5).
 # Returns 1 if the pointer/range is safe, 0 otherwise.
-fn is_user_ptr(ptr) {
-    if (ptr < 0x200000) { return 0; }
-    if (ptr >= 0x40000000) { return 0; }   # above the 1 GB user ceiling
+# ⛔⛔⛔ THE WINDOW IS NOT THE CHECK — MEASURED 2026-08-29, 1.56.52.
+#
+# Until this cut `is_user_ptr` / `is_user_range` were pure VA BOUNDS checks: "is this address inside
+# [2 MB, 1 GB)". The comment above reasoned entirely about what lies ABOVE the ceiling (device BARs,
+# the 1-4 GB PDPT mirror) and never asked what lies INSIDE it. Under every per-process CR3 the answer
+# is: the kernel. `proc_create_address_space` copies kernel PD[0..127] (0-256 MB, identity, U/S=0) into
+# each new address space and explicitly rewrites PD[8..127] as `(hi * 0x200000) | 0x83` so the kernel
+# can reach the whole PMM pool. Measured on a freshly created address space:
+#
+#   va=0x300000  is_user_range=1  pde=0x2000e3  present=1 user=0   <- kernel image
+#   va=0xe00000  is_user_range=1  pde=0xe00083  present=1 user=0   <- proc_rsp0 pool
+#   va=0xf10000  is_user_range=1  pde=0xe00083  present=1 user=0   <- CPU0 SYSCALL kernel stack
+#   va=0x8000000 is_user_range=1  pde=0x8000083 present=1 user=0   <- 128 MB, identity window interior
+#
+# A syscall runs at CPL0 on the CALLER's CR3 with AC=1 (the entry STAC), so SMAP is inert and a
+# supervisor page is freely accessible. Every arm that does a raw `load8`/`store8` on a validated
+# pointer — rather than going through proc_copy_to_user / proc_copy_from_user, which do check the
+# user bit — therefore reads or writes KERNEL PHYSICAL MEMORY on ring 3's behalf:
+#   write(1, (void*)0x300000, 4096)     -> 4 KB of the kernel image to stdout      (disclosure)
+#   read(fd, (void*)0xF08000, 0x8000)   -> file bytes over CPU0's syscall kstack   (ring-0 execution)
+# Unprivileged, deterministic, no crafted input, and every syscall taking a buffer is a candidate.
+#
+# ⭐ SO THE CHECK IS NOW A PAGE-TABLE WALK, and the window is only a cheap pre-filter. `is this VA in
+# a range` cannot distinguish the caller's own memory from kernel memory that happens to live at a low
+# VA; only `is the U/S bit set on the page this VA actually resolves to, under the CR3 this syscall is
+# running on` can. That is the property every caller needed all along.
+#
+# ⚠ AND IT IS WHAT LETS THE HIGH mmap ARENA IN AT ALL. sys_mmap spills allocations that do not fit the
+# ~768 MB low arena into [128 GB, 512 GB), and the 1 GB ceiling then rejected every pointer into that
+# region — a process could obtain high memory and never pass it to a syscall. Widening the WINDOW alone
+# would have been a catastrophe: the kernel direct map covers PDPT[8..511], i.e. VA 8 GB upward, so a
+# hardcoded 128 GB floor on a >120 GB-RAM box hands ring 3 a name for arbitrary physical memory. Two
+# things make the widening safe, and both must stay: the floor is DERIVED from what
+# pmm_setup_directmap really installed (`himmap_floor`), and the walk refuses any page whose U/S bit
+# is clear — which the direct map's entries are. Belt and braces, because the floor is a computation
+# and the U/S bit is hardware truth.
+fn user_range_mapped(cr3, ptr, len) {
+    if (cr3 == 0) { return 0; }
+    var off = 0;
+    while (off < len) {
+        var va = ptr + off;
+        # ⛔ A FULL WALK. proc_copy_to_user / proc_copy_from_user hardcode PML4[0] and PDPT[0], which is
+        # why they are correct only below 1 GB — a high-arena VA lives in PDPT[128..511] and they would
+        # validate it against a completely different page directory. Index every level from the VA.
+        var pml4e = load64(pmm_kva_for_access(cr3) + ((va >> 39) & 0x1FF) * 8);
+        if ((pml4e & 1) == 0) { return 0; }
+        if ((pml4e & 4) == 0) { return 0; }
+        var pdpte = load64(pmm_kva_for_access(pml4e & 0xFFFFFFFFF000) + ((va >> 30) & 0x1FF) * 8);
+        if ((pdpte & 1) == 0) { return 0; }
+        if ((pdpte & 4) == 0) { return 0; }      # ⭐ the direct map's PDPT entries die here
+        if ((pdpte & 0x80) != 0) { return 0; }   # a 1 GB page: the kernel maps none as user — refuse
+        var pde = load64(pmm_kva_for_access(pdpte & 0xFFFFFFFFF000) + ((va >> 21) & 0x1FF) * 8);
+        if ((pde & 1) == 0) { return 0; }        # not present
+        if ((pde & 4) == 0) { return 0; }        # ⭐ THE CHECK — supervisor identity pages die here
+        if ((pde & 0x80) == 0) { return 0; }     # not a 2 MB huge page: not a shape the VMM produces
+        # Advance to the next 2 MB boundary on the first step, then a full page each time. `va` is
+        # re-derived from `ptr + off` every iteration, so this cannot drift.
+        off = off + (0x200000 - (va & 0x1FFFFF));
+    }
     return 1;
 }
 
+# ⚠ THE LIVE CR3, not proc_get_cr3(proc_current_get()). What the subsequent load8 will actually walk is
+# the CR3 in the register, and the two can disagree — fault_kill_current prints both precisely because
+# "running on another proc's CR3" is a failure mode this kernel has had. Validate against the hardware.
+fn user_access_cr3() {
+    return dm_read_cr3() & 0xFFFFFFFFF000;
+}
+
+
+#ifdef USERWIN_SELFTEST
+# ⭐⭐ THE USER-WINDOW GATE — does "user pointer" mean the CALLER'S memory, or merely a low address?
+#
+# ⛔ RUNS UNDER A REAL PER-PROCESS CR3, and it has to. Under the boot CR3 the whole low window is
+# supervisor identity and `is_user_range` takes its documented boot exemption, so every arm would
+# score a meaningless pass. So the test builds an address space exactly as a process gets one,
+# cr3_loads it, collects verdicts as flags, restores CR3, and only then prints. Nothing is printed
+# while switched — the window is kept as small as the measurement allows.
+# ⚠ Switching CR3 here is safe for the same reason ring 3 works at all: a per-process address space
+# mirrors kernel PD[0..127], PDPT[1..511] and PML4[1..511], so kernel code and its stacks stay mapped.
+# spawn#3 does the same switch mid-syscall.
+var userwin_marker = 0;
+var userwin_readback = 0;
+fn user_window_selftest() {
+    var cr3 = proc_create_address_space();
+    if (cr3 == 0) { kprintln("userwin: no address space - VOID, not a pass", 44); return 0; }
+    # A page this "process" genuinely owns, in the low arena, and one in the high arena. Without these
+    # two the whole gate is satisfied by a validator that rejects everything.
+    var p_lo = pmm_alloc_2mb();
+    var p_hi = pmm_alloc_2mb();
+    if (p_lo == 0) { kprintln("userwin: no low page - VOID, not a pass", 39); return 0; }
+    if (p_hi == 0) { pmm_free_2mb(p_lo); kprintln("userwin: no high page - VOID, not a pass", 40); return 0; }
+    var va_lo = 0x10000000;                       # low mmap arena base
+    var va_hi = himmap_floor();                   # ⛔ derived, never the 128 GB constant
+    var mapped_lo = proc_map_page(cr3, va_lo, p_lo);
+    var mapped_hi = proc_map_page_hi(cr3, va_hi, p_hi);
+
+    var saved_cr3 = dm_read_cr3();
+    cr3_load(cr3);
+    # --- REJECT: kernel memory that merely happens to sit at a low VA -------------------------
+    var r_kimg   = is_user_range(0x300000, 512);      # kernel image, PD[1]
+    var r_rsp0   = is_user_range(0xE00000, 512);      # proc_rsp0 pool
+    var r_kstack = is_user_range(0xF08000, 0x8000);   # CPU0 SYSCALL kernel stack
+    var r_ident  = is_user_range(0x8000000, 512);     # identity window interior
+    var r_unmap  = is_user_range(0x12000000, 512);    # arena slot nothing mapped
+    # --- ACCEPT: pages this address space actually owns ----------------------------------------
+    var a_lo     = is_user_range(va_lo, 512);
+    var a_hi     = is_user_range(va_hi, 512);
+    # --- REJECT: arithmetic that names more than it seems --------------------------------------
+    var r_neg    = is_user_range(va_lo, 0 - 1);       # negative length
+    var r_span   = is_user_range(va_lo, 0x200000 + 8);# runs off the end of the one mapped page
+    var r_below  = is_user_range(0x1000, 512);        # below the floor
+    # ⛔ THE DIRECT MAP IS NOT USER MEMORY, and this is the arm that matters most for the high arena:
+    # pmm_setup_directmap owns PDPT[8..511], i.e. VA 8 GB upward, which is the same PDPT range the
+    # high arena lives in. If ring 3 could name a direct-map VA it could name arbitrary PHYSICAL
+    # memory. Two independent things forbid it — the derived floor and the walk's U/S check — and this
+    # arm holds whichever one is doing the work.
+    var r_dmap   = is_user_range(DIRECTMAP_BASE + 0x300000, 512);
+    cr3_load(saved_cr3);
+
+    # --- COPY HELPERS ON A HIGH VA — the aliasing case, gated -----------------------------------
+    # ⛔ THIS IS THE ARM THE COPY-HELPER FIX EXISTS FOR, and it is deliberately the ALIASING one.
+    # va_hi2 = floor + 0x10000000 has PD index (va >> 21) & 0x1FF == 128 — the SAME slot as va_lo.
+    # With PML4/PDPT hardcoded to entry 0 (the pre-1.56.52 walk) a copy to va_hi2 resolves to the LOW
+    # arena page, returns 1, and writes the caller's bytes into a page it never named. A plain
+    # "does a high VA work" arm would NOT catch that: it would score a pass while corrupting.
+    # ⚠ No CR3 switch here — the copy helpers take cr3 explicitly and reach page tables through the
+    # direct map, so they are correct to call from any address space.
+    var p_hi2 = pmm_alloc_2mb();
+    var c_to = 0;
+    var c_back = 0;
+    var c_landed = 0;
+    var c_lowclean = 0;
+    var c_kernrej = 1;
+    if (p_hi2 != 0) {
+        var va_hi2 = himmap_floor() + 0x10000000;
+        if (proc_map_page_hi(cr3, va_hi2, p_hi2) == 0) {
+            memset(pmm_kva_for_access(p_hi2), 0, 64);
+            memset(pmm_kva_for_access(p_lo), 0xAA, 64);
+            store64(&userwin_marker, 0x5345484F55524553);
+            c_to = proc_copy_to_user(cr3, va_hi2, &userwin_marker, 8);
+            if (load64(pmm_kva_for_access(p_hi2)) == 0x5345484F55524553) { c_landed = 1; }
+            if (load64(pmm_kva_for_access(p_lo)) == 0 - 6148914691236517206) { c_lowclean = 1; }   # 0xAAAA...AA as signed
+            store64(&userwin_readback, 0);
+            c_back = proc_copy_from_user(cr3, &userwin_readback, va_hi2, 8);
+            if (load64(&userwin_readback) != 0x5345484F55524553) { c_back = 0; }
+            # A kernel identity VA must be refused by the copy helpers too, not only by is_user_range.
+            if (proc_copy_to_user(cr3, 0x300000, &userwin_marker, 8) != 0) { c_kernrej = 0; }
+        }
+    }
+
+
+    proc_free_address_space(cr3);
+    var fail = 0;
+    if (mapped_lo != 0) { kprintln("userwin: could not map the low probe page - VOID, not a pass", 60); return 0; }
+    if (mapped_hi != 0) { kprintln("userwin: could not map the high probe page - VOID, not a pass", 61); return 0; }
+    if (r_kimg != 0)   { kprintln("userwin: the KERNEL IMAGE passes as a user pointer", 50); fail = 1; }
+    if (r_rsp0 != 0)   { kprintln("userwin: the proc_rsp0 POOL passes as a user pointer", 52); fail = 1; }
+    if (r_kstack != 0) { kprintln("userwin: the SYSCALL KERNEL STACK passes as a user pointer", 58); fail = 1; }
+    if (r_ident != 0)  { kprintln("userwin: the kernel IDENTITY WINDOW passes as a user pointer", 60); fail = 1; }
+    if (r_unmap != 0)  { kprintln("userwin: an UNMAPPED arena VA passes as a user pointer", 54); fail = 1; }
+    if (a_lo != 1)     { kprintln("userwin: a page the process OWNS was rejected (low arena)", 57); fail = 1; }
+    if (a_hi != 1)     { kprintln("userwin: a page the process OWNS was rejected (high arena)", 58); fail = 1; }
+    if (r_neg != 0)    { kprintln("userwin: a NEGATIVE length was accepted", 39); fail = 1; }
+    if (r_span != 0)   { kprintln("userwin: a range running PAST the mapped page was accepted", 58); fail = 1; }
+    if (r_below != 0)  { kprintln("userwin: an address below the floor was accepted", 48); fail = 1; }
+    if (r_dmap != 0)   { kprintln("userwin: a DIRECT-MAP kernel VA passes as a user pointer", 56); fail = 1; }
+    if (p_hi2 == 0)    { kprintln("userwin: no second high page - the COPY arms did not run", 56); fail = 1; }
+    if (c_to != 1)     { kprintln("userwin: proc_copy_to_user REFUSED a mapped high-arena VA", 57); fail = 1; }
+    if (c_landed != 1) { kprintln("userwin: proc_copy_to_user wrote SOMEWHERE ELSE than the page named", 67); fail = 1; }
+    if (c_lowclean != 1) { kprintln("userwin: the copy landed in the ALIASED LOW page - PDPT index ignored", 69); fail = 1; }
+    if (c_back != 1)   { kprintln("userwin: proc_copy_from_user could not read a high-arena VA back", 64); fail = 1; }
+    if (c_kernrej != 1) { kprintln("userwin: proc_copy_to_user accepted a KERNEL identity VA", 56); fail = 1; }
+    # ⚠ THE DERIVED FLOOR HAS NO OBSERVABLE EFFECT ON A SMALL-RAM BOX — himmap_floor() returns exactly
+    # USER_HIMMAP_BASE below ~120 GB of RAM, so no reachable pointer can distinguish the derived floor
+    # from the constant here, and a mutation swapping one for the other scores a PASS. Say so rather
+    # than let the gate imply coverage it does not have, and assert the DERIVATION itself instead: the
+    # floor must clear everything pmm_setup_directmap actually installed, which is checkable anywhere.
+    if (himmap_floor() < (directmap_pdpt_top + 1) * 0x40000000) {
+        kprintln("userwin: the high arena floor does not clear the direct map", 59);
+        fail = 1;
+    }
+    if (fail == 0) {
+        kprintln("userwin: user pointers mean OWNED pages, low and high arena both OK", 67);
+        return 1;
+    }
+    kprintln("userwin: USER WINDOW FAIL", 25);
+    return 0;
+}
+#endif
+
+fn is_user_ptr(ptr) {
+    return is_user_range(ptr, 1);
+}
+
 fn is_user_range(ptr, len) {
+    # ⚠ WRAP FIRST, before any window comparison. A negative or wrapping len makes every subsequent
+    # `ptr + len` comparison meaningless, and Cyrius comparisons are signed — so a length of -1 would
+    # satisfy `ptr + len <= ceiling` while naming the whole address space.
+    if (len < 0) { return 0; }
+    if (ptr + len < ptr) { return 0; }
     if (ptr < 0x200000) { return 0; }
-    if (ptr + len < ptr) { return 0; }          # wrap check
-    if (ptr + len > 0x40000000) { return 0; }    # above the 1 GB user ceiling
-    return 1;
+    if (ptr + len > 0x40000000) {
+        # HIGH arena. ⛔ himmap_floor(), NEVER the USER_HIMMAP_BASE constant — see the banner.
+        if (ptr < himmap_floor()) { return 0; }
+        if (ptr + len > HIMMAP_CEILING) { return 0; }
+    }
+    # ⛔ THE BOOT-CR3 EXEMPTION, and why it is not a hole. Boot self-tests drive syscall arms from
+    # KERNEL context under the boot CR3 (0x1000), where the whole low window is supervisor identity and
+    # every walk below would refuse. Ring 3 can never reach this branch: the SYSCALL stub runs on the
+    # calling process's CR3, and the one place the kernel switches to 0x1000 mid-syscall (spawn#3)
+    # does so strictly AFTER its is_user_range call.
+    var cr3 = user_access_cr3();
+    if (cr3 == 0x1000) { return 1; }
+    return user_range_mapped(cr3, ptr, len);
 }
 
 # is_user_array(ptr, count, stride) — is_user_range for a COUNT of fixed-size records (1.56.51).
@@ -2380,6 +2584,39 @@ fn gpo_validate_trilist(rec, fbw, fbh) {
         var a2 = cross << 16;
         if (a2 < GPU_TRI_AREA_MIN) { return GPO_E_AREA; }
         if (a2 > GPU_TRI_AREA_MAX) { return GPO_E_AREA; }
+
+        # ⛔⛔ 1.56.52 — THE FRAME-SKEW CORNER BOUND, WHICH THIS OP LACKED ENTIRELY. Op 0x09
+        # (gpo_validate_tri) carries it with a comment calling it mandatory, and this is not a stylistic
+        # sibling: op 0x0A reaches the SAME shader. gpo_execute`s TRI_LIST arm calls gpu_tri_list, which
+        # loops the triangles into gpu_tri_rgba — op 0x09`s exact worker — which calls gpu_tri_prep,
+        # which computes kxb/kyb/k0b and kxc/kyc/k0c from the frame. So every reason the bound exists on
+        # 0x09 applies unchanged here, and op 0x0A was the unguarded door to the same code.
+        # ⚠ BOUND THE RATIO, DO NOT CLAMP E — the wording is op 0x09`s and the reason is the same:
+        # clamping changes the interpolant (it breaks gradient reproduction at the far corner) rather
+        # than merely bounding it. E legally leaves [0, 2A] whenever a mask-rect corner falls outside
+        # the triangle, which is common; what is not legal is a frame so small relative to the rect that
+        # |E| runs away and the 96-bit numerator overflows.
+        # ⚠ PER TRIANGLE, unlike the work bound above — this is a property of one triangle against the
+        # shared rect, not of the batch.
+        var lim = a2 * GPU_TRI_E_RATIO;
+        var kxb = cy - ay;  var kyb = ax - cx;  var k0b = (ay * cx - ax * cy) << 16;
+        var kxc = ay - by;  var kyc = bx - ax;  var k0c = (ax * by - ay * bx) << 16;
+        var ci = 0;
+        while (ci < 4) {
+            var qx = dx;  var qy = dy;
+            if (ci == 1) { qx = dx + w - 1; }
+            if (ci == 2) { qy = dy + h - 1; }
+            if (ci == 3) { qx = dx + w - 1; qy = dy + h - 1; }
+            var pcx = (qx << 16) + 32768;
+            var pcy = (qy << 16) + 32768;
+            var eb = kxb * pcx + kyb * pcy + k0b;
+            var ec = kxc * pcx + kyc * pcy + k0c;
+            if (eb < 0) { eb = 0 - eb; }
+            if (ec < 0) { ec = 0 - ec; }
+            if (eb > lim) { return GPO_E_FRAME; }
+            if (ec > lim) { return GPO_E_FRAME; }
+            ci = ci + 1;
+        }
         i = i + 1;
     }
     return 0;
@@ -3140,6 +3377,46 @@ fn edge_abi_selftest() {
     store32(&d +  4, 1);
     pass = pass + ea_expect(&d, GPO_E_RESERVED, "list: flags must be zero", 24);
     store32(&d +  4, 0);
+
+    # ⭐⭐ 1.56.52 — THE FRAME-SKEW BOUND, WHICH THIS OP DID NOT HAVE. op 0x09 carries this check with a
+    # comment calling it mandatory, and op 0x0A reaches the SAME shader (gpu_tri_list -> gpu_tri_rgba ->
+    # gpu_tri_prep), so it was the unguarded door to code op 0x09 guards. Mirrors op 0x09`s fixture: a
+    # tiny frame under a rect placed far away, which drives |E| past the ratio through DISTANCE.
+    # ⚠ The rect must stay under GPU_TRI_MAX_PIXELS or the pixel cap fires first and this case silently
+    # tests GPO_E_WORK instead — the trap op 0x09`s own comment records hitting on its first run.
+    store32(vb +  0, 0);            store32(vb +  4, 0);
+    store32(vb +  8, 1 * 65536);    store32(vb + 12, 0);
+    store32(vb + 16, 0);            store32(vb + 20, 1 * 65536);
+    store32(&d + 16, (512 * 65536) + 512);      # 512x512 = 262144, well under 2^20
+    store32(&d + 20, (900 * 65536) + 1024);     # placed far from the 1 px frame at the origin
+    store32(&d + 24, 1);                        # one triangle — the skew is per-triangle
+    pass = pass + ea_expect(&d, GPO_E_FRAME, "list: frame skew beyond the ratio", 33);
+
+    # ⚠ THE CONTROL. Same tiny frame, rect back at the ORIGIN — must be ACCEPTED. Without it a bound
+    # that simply rejected every TRI_LIST record would score a pass on the case above.
+    store32(&d + 20, 0);
+    pass = pass + ea_expect_valid(&d, "list: a tiny frame at the origin still validates", 48);
+
+    # ⭐⭐ THE CONTROL THAT MATTERS MORE THAN THE ORIGIN ONE — a well-formed 64 px triangle with the
+    # rect at a realistic NON-ORIGIN position. The corner bound above builds its sample points from
+    # (dx, dy), i.e. SCREEN coordinates, while the shader samples RECT-LOCAL (px in [0,w), py in [0,h)
+    # — tri_rgba.s computes px = tgid_x*64 + lane and gpu_tri_dispatch folds dx/dy into the DESTINATION
+    # ADDRESS only). Those are different frames, so a bound written in one and a shader in the other
+    # could reject work the hardware would render fine, purely for being far from the origin.
+    # ⚠ MEASURED: this case is ACCEPTED, so the mismatch does not reject realistic batches — but it is
+    # a real question about op 0x09 too, which this bound was copied from, and op 0x09 is SHIPPED AND
+    # BURNED. Changing the frame is an ABI-semantics change to a burned op and wants an operator
+    # ruling, so it is filed rather than taken here:
+    #   docs/development/issues/2026-08-30-tri-corner-bound-coordinate-frame.md
+    # This case is the guard that keeps the question honest: if anyone changes either bound, a
+    # non-origin batch that starts being refused fails HERE and names itself.
+    store32(vb +  8, 64 * 65536);   store32(vb + 20, 64 * 65536);
+    store32(&d + 16, (64 * 65536) + 64);
+    store32(&d + 20, (900 * 65536) + 1024);
+    store32(&d + 24, 1);
+    pass = pass + ea_expect_valid(&d, "list: a well-formed batch at a NON-origin rect", 46);
+    store32(&d + 20, 0);
+    store32(&d + 24, 2);
 
     # ============================================================================================
     # op 0x0B TRI_TEX — rung 13a's ABI, proven here at ZERO BURNS
@@ -4002,8 +4279,11 @@ fn edge_abi_selftest() {
     # the first coverage this battery has EVER had of the shared generic tail (ops 0x01-0x04), and they
     # exist because an unguarded range check on dword 9 would have broken aethersafha's chrome text
     # while this line still printed a clean pass.
-    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 171 cases correct\n", 22);
-    if (pass == 171) {
+    # ⚠ 171 -> 173: two cases added at 1.56.52 when op 0x0A gained the frame-skew bound it had been
+    # missing — the reject, and the ORIGIN control that keeps it honest. The count is asserted, not
+    # printed, so adding a case without updating this line fails the gate rather than passing quietly.
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 174 cases correct\n", 22);
+    if (pass == 174) {
         kprint("edge-abi: PASS -- the 0x01..0x06 and 0x08..0x10 ABIs reject every malformed\n", 76);
         kprint("edge-abi: record, and a well-formed one is accepted or correctly reports no-GPU.\n", 81);
         return 1;
@@ -4832,7 +5112,9 @@ fn gpu_caps_sys(buf, len) {
     # rather than a prediction. Side effect is the one the caller is about to trigger anyway on its first
     # fill/blit; on a box where the double-buffer cannot arm, flags bit1 stays clear and the geometry reads 0,
     # which is the honest answer. (Caught by /bin/gpublit's self-validation: exit 97, iron 1.55.32.)
-    gpu_blit_arm();
+    # ⛔ 1.56.52 — CAPTURE THE RETURN. This was a bare `gpu_blit_arm();` that discarded its result, and
+    # that discard is precisely why bit3 below could promise something #92 would then refuse.
+    var blit_armed = gpu_blit_arm();
     var flags = 0;
     if (gpu_present != 0) { flags = flags | 1; }
     if (gpu_bb_armed == 1) { flags = flags | 2; }
@@ -4841,11 +5123,30 @@ fn gpu_caps_sys(buf, len) {
     # call-level gate exactly, so a caller that sees this bit set will not then get E_UNPROVEN/E_NOGPU.
     # Without it the only way to discover #92 is to call it and read the error, which is what #86's
     # "call it and look for -1" already proved to be the wrong shape.
+    # ⛔⛔ 1.56.52 — IT DID NOT MIRROR #92`s GATE, AND THE COMMENT ABOVE PROMISED THAT IT DID.
+    # `gpu_shader_op_sys` gates on FOUR conditions: gpu_present, gpu_matmul_ok, gpu_blit_arm() SUCCESS,
+    # and gpu_bb_pitch != 0. This tested gpu_present / gpu_arena_mc / gpu_ring_wptr / gpu_matmul_ok —
+    # two of #92`s four missing, and two of its own that #92 never asks about. The two omitted ones are
+    # independently reachable: gpu_blit_arm returns 0 on gpu_display_ok != 1, gpu_display_pipe < 0,
+    # gpu_display_surf == 0, a null boot_info_ptr, pitch == 0, height == 0, or the back-buffer TMR
+    # bound — and NONE of those touch gpu_arena_mc / gpu_ring_wptr / gpu_matmul_ok. So on a box where
+    # the GPU probed, the arena carved, the ring came up and the matmul self-test passed but the back
+    # buffer would not arm, bit3 read SET and the very next #92 returned E_NOGPU. That is the exact
+    # failure the bit exists to prevent, and the exact wrong shape ("call it and look for the error")
+    # that #86 already proved out.
+    # ⚠ The two extra conditions are KEPT rather than dropped to match #92 literally: a carveout and a
+    # live ring are real preconditions for compositing, and a bit that promises less than it can is
+    # merely conservative, while one that promises more is a lie. The invariant to hold is
+    # `bit3 set => #92 will not return E_NOGPU/E_UNPROVEN`, not set-iff.
     var shader_ok = 0;
     if (gpu_present != 0) {
         if (gpu_arena_mc != 0) {
             if (gpu_ring_wptr != 0) {
-                if (gpu_matmul_ok == 1) { shader_ok = 1; }
+                if (gpu_matmul_ok == 1) {
+                    if (blit_armed == 1) {
+                        if (gpu_bb_pitch != 0) { shader_ok = 1; }
+                    }
+                }
             }
         }
     }
@@ -7337,6 +7638,22 @@ fn mdo_validate(rec) {
     if (op == MDO_OP_TRANSMIT) {
         # M8 derives everything in-kernel (live DIG, saved timing, ATOM params) — no operands. What runs is
         # governed by BUILD FLAGS, never by the ABI: a ring-3 caller can NEVER ask for the live PHY edge.
+        if ((load32(rec +  8) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 12) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+    }
+    if (op == MDO_OP_CRCCAL) {
+        # ⛔⛔ 1.56.52 — CRCCAL WAS THE ONE ADVERTISED #93 OP WITH NO OPERAND BLOCK AT ALL. Bit 10 is set
+        # in MDO_OP_SUPPORTED (0x1E7F) so the support gate admits it, the dispatch runs
+        # `if (op == MDO_OP_CRCCAL) { return mdo_crccal(); }`, and `mdo_crccal()` takes no arguments and
+        # reads NOTHING from the record — so dwords +8/+12/+16/+20 were accepted and silently ignored.
+        # ⚠ ACCEPT-AND-IGNORE IS THE FAILURE, not a harmless one. Every other op in this function
+        # refuses a dword it does not define, and the reason is written out repeatedly above: a field
+        # that is ignored today is a field a caller starts populating, and it becomes load-bearing ABI
+        # the moment a future revision gives it a meaning — at which point old callers are silently
+        # passing garbage into it. Refusing now costs nothing, because no caller can be relying on a
+        # value that has never been read.
         if ((load32(rec +  8) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
         if ((load32(rec + 12) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
         if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }

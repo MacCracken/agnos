@@ -72,7 +72,18 @@ run_gate() {
                 ok=1; break
             fi
         done
-        grep -iE "PASS:|FAIL:|smoke:" "/tmp/sweep-gate.log" | sed 's/^/  /' || true
+        # ⛔ MEASURED 2026-08-29 (1.56.52): THIS FILTER HID THE ONE LINE THAT LOCALISES A FAILURE.
+        # It was `grep -iE "PASS:|FAIL:|smoke:"`, and several smokes report a LAUNCH failure with a
+        # line that matches none of those — `ERROR: QEMU produced NO boot output (0-byte log) —
+        # launch failure, not an exFAT result.` is the exact wording in exfat-write-smoke.sh. So the
+        # gate printed a completely EMPTY section and then scored FAIL, and the sweep transcript told
+        # the operator only that something went wrong, with no way to tell a kernel regression from a
+        # firmware hand-off that never happened. That distinction is the subject of its own state.md
+        # heading ("A QEMU BOOT THAT NEVER HAPPENS READS AS A KERNEL FAILURE"), and this filter was
+        # quietly erasing the evidence for it. ⚠ SCORING IS UNCHANGED — a launch failure is still a
+        # FAIL here, deliberately: downgrading it to VOID inside run_gate would give every real
+        # failure a way to hide. The fix is to make the diagnostic VISIBLE, not to forgive it.
+        grep -iE "PASS:|FAIL:|smoke:|ERROR|SKIP|VOID|handed off" "/tmp/sweep-gate.log" | sed 's/^/  /' || true
         [ "$ok" = 1 ] && [ "${attempt:-1}" = 2 ] && echo "  (passed on retry — transient host-load timing)"
     fi
     if [ "$ok" = 1 ]; then pass=$((pass+1)); results="$results\n  PASS  $label";
@@ -95,6 +106,19 @@ run_gate "1.39.x exFAT read"                         "EXFAT_SELFTEST=1"         
 # anywhere under scripts/ attached one, so every gate passed regardless of what msc.cyr did. This
 # smoke builds BOTH arms itself (injected + plain), so it needs no buildenv from here.
 run_gate "1.56.52 MSC short data phase (usb-storage)" ""                                         "msc-short-smoke.sh"
+# 1.56.52 — the first coverage of receive-side checksum verification. The other net gates only prove
+# GOOD frames pass; this one presents a corrupt frame, which nothing else in the tree does.
+run_gate "1.56.52 RX checksum verify (accept + drop)"  ""                                         "net-csum-smoke.sh"
+# 1.56.52 — a HID Transfer Event eaten by an xHCI synchronous waiter must be handed back to the ring
+# that owned it. Hermetic; no USB hardware required, though the smoke boots a usb-kbd anyway so the
+# swapped-globals teardown is exercised against a non-empty endpoint registry.
+run_gate "1.56.52 stolen HID event reclaim"            ""                                         "hid-reclaim-smoke.sh"
+# 1.56.52 — a "user pointer" must mean a page the CALLER OWNS, not merely a low address. The low
+# window is full of supervisor identity mappings of kernel memory; see the smoke header.
+run_gate "1.56.52 user-pointer window (owned, not low)" ""                                         "userwin-smoke.sh"
+# 1.56.52 — a DHCP option shorter than its reader is a remote ring-0 stack read. Hermetic: the helper
+# is a pure function over a blob, which is the only way to test an attack needing a hostile server.
+run_gate "1.56.52 DHCP option length vs reader"        ""                                         "dhcp-opt-smoke.sh"
 run_gate "1.39.x exFAT write (+ subdir)"             "EXFAT_WRITE_SELFTEST=1"                   "exfat-write-smoke.sh"
 
 # --- ext2/jbd2 write regression bar (the iron-validated path must stay green) ---

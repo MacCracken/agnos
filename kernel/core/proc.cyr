@@ -1698,11 +1698,21 @@ fn proc_copy_from_user(cr3, dst, uva, len) {
     var copied = 0;
     while (copied < len) {
         var va = uva + copied;
-        var pml4e = load64(pmm_kva_for_access(cr3));    # 1.56.51: direct-map walk throughout
+        # ⛔ 1.56.52 — INDEX PML4 AND PDPT FROM THE VA. Both were hardcoded to entry 0, which is correct
+        # only for VAs below 1 GB. That was survivable while is_user_range's ceiling WAS 1 GB; it is not
+        # now that the high mmap arena [128 GB, 512 GB) is a legal syscall pointer. A high VA walked
+        # through PML4[0]/PDPT[0] lands on `(va >> 21) & 0x1FF` of the LOW page directory — e.g.
+        # 0x2010000000 aliases to PD[128], the low mmap arena — so the copy would silently read or write
+        # a DIFFERENT page of the same process than the caller named. It fails safe today only by luck
+        # (whichever slot it aliases is usually the supervisor identity map, and the user-bit check
+        # below refuses it); an aliased slot that happens to hold a user page corrupts data instead.
+        var pml4e = load64(pmm_kva_for_access(cr3) + ((va >> 39) & 0x1FF) * 8);
         if ((pml4e & 1) == 0) { return 0; }
         var pdpt_addr = pml4e & 0xFFFFFFFFF000;
-        var pdpte = load64(pmm_kva_for_access(pdpt_addr));
+        var pdpte = load64(pmm_kva_for_access(pdpt_addr) + ((va >> 30) & 0x1FF) * 8);
         if ((pdpte & 1) == 0) { return 0; }
+        if ((pdpte & 4) == 0) { return 0; }    # supervisor PDPT (the direct map lives here) — not user
+        if ((pdpte & 0x80) != 0) { return 0; } # a 1 GB page: no user mapping has this shape
         var pd_addr = pdpte & 0xFFFFFFFFF000;
         var pde = load64(pmm_kva_for_access(pd_addr) + ((va >> 21) & 0x1FF) * 8);
         if ((pde & 1) == 0) { return 0; }      # not present
@@ -1744,11 +1754,21 @@ fn proc_copy_to_user(cr3, uva, src, len) {
     var copied = 0;
     while (copied < len) {
         var va = uva + copied;
-        var pml4e = load64(pmm_kva_for_access(cr3));    # 1.56.51: direct-map walk throughout
+        # ⛔ 1.56.52 — INDEX PML4 AND PDPT FROM THE VA. Both were hardcoded to entry 0, which is correct
+        # only for VAs below 1 GB. That was survivable while is_user_range's ceiling WAS 1 GB; it is not
+        # now that the high mmap arena [128 GB, 512 GB) is a legal syscall pointer. A high VA walked
+        # through PML4[0]/PDPT[0] lands on `(va >> 21) & 0x1FF` of the LOW page directory — e.g.
+        # 0x2010000000 aliases to PD[128], the low mmap arena — so the copy would silently read or write
+        # a DIFFERENT page of the same process than the caller named. It fails safe today only by luck
+        # (whichever slot it aliases is usually the supervisor identity map, and the user-bit check
+        # below refuses it); an aliased slot that happens to hold a user page corrupts data instead.
+        var pml4e = load64(pmm_kva_for_access(cr3) + ((va >> 39) & 0x1FF) * 8);
         if ((pml4e & 1) == 0) { return 0; }
         var pdpt_addr = pml4e & 0xFFFFFFFFF000;
-        var pdpte = load64(pmm_kva_for_access(pdpt_addr));
+        var pdpte = load64(pmm_kva_for_access(pdpt_addr) + ((va >> 30) & 0x1FF) * 8);
         if ((pdpte & 1) == 0) { return 0; }
+        if ((pdpte & 4) == 0) { return 0; }    # supervisor PDPT (the direct map lives here) — not user
+        if ((pdpte & 0x80) != 0) { return 0; } # a 1 GB page: no user mapping has this shape
         var pd_addr = pdpte & 0xFFFFFFFFF000;
         var pde = load64(pmm_kva_for_access(pd_addr) + ((va >> 21) & 0x1FF) * 8);
         if ((pde & 1) == 0) { return 0; }      # not present

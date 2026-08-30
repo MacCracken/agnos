@@ -103,10 +103,20 @@ qemu_dwell() {
 #
 # Usage (identical to qemu_dwell, plus $4 = the vars.fd to refresh per attempt; pass "" to skip):
 #   qemu_dwell_kernel "$LOG" "agnos>" "$TIMEOUT" "$WORK/vars.fd" "$OVMF_VARS_SRC" qemu-system-x86_64 ...
-# Env: QEMU_TRIES (default 3).
+# Env: QEMU_TRIES (default 6).
+# ⛔⛔ SIX, NOT THREE — AND THE OLD NUMBER WAS SET AGAINST A RATE THAT IS NOT THE REAL ONE. The header
+# above says "roughly 1 boot in 4" never leaves OVMF. MEASURED 2026-08-30 on this host by running one
+# smoke four times and counting attempts: **3 kernel banners in 10 attempts, ~30% hand-off success**,
+# with a retry needed on every single run and one run exhausting all three tries. At 3 tries that
+# leaves ~34% of gates reporting infrastructure as a kernel failure; at 6 it is ~12%, and under sweep
+# load (many QEMU launches back to back) the per-attempt rate is worse still, not better.
+# ⚠ THE COST IS PAID ONLY BY A KERNEL THAT CANNOT BOOT, which is exactly the case `check.sh` and
+# `test.sh` catch first and far more cheaply. A booting kernel stops at its first successful attempt.
+# ⚠ Retries are still BANNER-GATED, so raising this gives a real regression no extra chances: once the
+# banner is in the log the run stands, whatever the assertions then say.
 qemu_dwell_kernel() {
     _qk_log="$1"; _qk_marker="$2"; _qk_max="$3"; _qk_vars="$4"; _qk_varsrc="$5"; shift 5
-    _qk_tries="${QEMU_TRIES:-3}"
+    _qk_tries="${QEMU_TRIES:-6}"
     _qk_i=1
     while [ "$_qk_i" -le "$_qk_tries" ]; do
         # A fresh NVRAM per attempt: a half-written vars.fd from a killed run is itself a way to
@@ -125,4 +135,39 @@ qemu_dwell_kernel() {
         _qk_i=$((_qk_i + 1))
     done
     return 0
+}
+
+# qemu_assert_booted <log> — did the kernel actually RUN? Call this immediately after a QEMU run and
+# BEFORE any assertion, in any smoke that does not go through qemu_dwell_kernel.
+#
+# ⛔⛔ WHY THIS EXISTS SEPARATELY FROM qemu_dwell_kernel. Measured across four 1.56.52 sweeps: of the
+# 24 gate smokes, 2 used the guarded helper, 7 used the bare qemu_dwell (converted 2026-08-30), and
+# NINE roll their own `timeout … qemu-system-x86_64 …` with no hand-off check of any kind. Every gate
+# that failed in any of those sweeps — FAT read, chan-ring3, exFAT write, fp-selftest, fp-ring3 — was
+# from those two unguarded groups, and not one guarded gate ever failed. The signature is always the
+# same and it is in the log:
+#     gnoboot v0.7.1: handing off to kernel
+#     gnoboot: fail @ EBS
+#     BdsDxe: loading Boot0000 "BootManagerMenuApp"
+# The kernel never executed, so every assertion afterwards evaluates against an EMPTY log and the
+# smoke prints a wall of failures naming real properties. fp-ring3 reported "fpex never dispatched";
+# chan-ring3 reported NINE ring-3 isolation properties as broken. A reader would conclude the kernel
+# regressed.
+#
+# ⚠ THIS DOES NOT RETRY — the nine callers build their QEMU command inline in nine different shapes,
+# and wrapping each in a retry loop is a rewrite of nine working scripts for a benefit sweep.sh's
+# run_gate already partly provides (it makes a second attempt on failure). What this DOES give is an
+# honest verdict: one VOID line instead of a wall of false property failures, and a non-zero exit so
+# run_gate retries. ⇒ These nine effectively get 2 attempts where a qemu_dwell_kernel gate gets 6.
+# Converting them properly is worth doing; this is the honest floor until then.
+#
+# Returns 0 if the kernel banner is present, 1 otherwise (and prints why).
+qemu_assert_booted() {
+    if strings "$1" 2>/dev/null | grep -q "AGNOS kernel v"; then return 0; fi
+    echo "  UEFI never handed off to the kernel — the kernel under test DID NOT EXECUTE."
+    echo "  Any assertion below would describe an EMPTY log. Treat this run as VOID, not as a failure."
+    if strings "$1" 2>/dev/null | grep -q "fail @ EBS"; then
+        echo "  (gnoboot: fail @ EBS — the firmware ExitBootServices hand-off, the known ~1-in-4 flake)"
+    fi
+    return 1
 }

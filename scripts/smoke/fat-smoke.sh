@@ -88,7 +88,7 @@ LOG="$LOGS/fat-selftest.log"
 # 7 bytes from the end of a 4051-byte log. The budget is unchanged and still backstops a hung boot.
 # ⛔ Do NOT copy this marker into a smoke that DRIVES the shell; its output comes after the prompt.
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
-qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-30}" \
+qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-30}" "$WORK/vars.fd" "$OVMF_VARS_SRC" \
     qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
