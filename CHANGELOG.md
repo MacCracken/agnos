@@ -65,7 +65,7 @@ correct on iron.
   ⚠ **Two-sided**: needs the cyrius `sys_lstat`#102 peer before ring 3 can call it by name, so
   `check.sh`'s syscall-ABI gate reads `kernel 102 · abi-doc 102 · cyrius 101` and is the tree's one
   red gate — exactly how `symlink`#63 and `readlink`#70 shipped. Filed as
-  [`issues/2026-08-30-cyrius-agnos-sys-lstat-peer.md`](docs/development/issues/2026-08-30-cyrius-agnos-sys-lstat-peer.md).
+  [cyrius `issues/2026-08-30-agnos-sys-lstat-102-peer.md`](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-08-30-agnos-sys-lstat-102-peer.md) — ⚠ filed in the **cyrius** repo, which agnos never modifies.
 
 - **`AO_NOFOLLOW` (0x1000) on `open`(7)** — the filed hardening ask. `open` had no way to write a file
   without following a link at the final component, and no `AO_EXCL` either, so neither standard way to

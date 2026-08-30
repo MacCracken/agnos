@@ -90,6 +90,26 @@ type: state
 > it is 0-101. Left alone deliberately — this cut did not touch the bridge, and rewriting a design doc
 > unprompted while a burn is staged is the wrong order.
 >
+> ### 1.56.53 second pass (2026-08-30) — the iron burn's own findings
+>
+> ✅ **`CHANGELOG.md`** — the burn result (all three subjects verified, real network held), `lstat`#102
+> + `AO_NOFOLLOW`, the `#99` recycle-scrub leak whose fix was dead code, the `munmap` cursor rollback,
+> and two ktest gates that could not pass.
+> ✅ **NEW `cyrius/docs/development/issues/2026-08-30-agnos-sys-lstat-102-peer.md`** — ⛔ filed in the
+> **cyrius** repo, per the operator ruling that cyrius is never-touch and a cross-repo ask belongs in
+> that repo's own issues folder. An agnos-side duplicate was written first and **deleted**; the
+> roadmap, CHANGELOG and ABI row now point at the cyrius path.
+> ✅ **`docs/development/agnos-userland-abi.md`** — row 102, and the two-sided note now says the gate
+> stays red by design until the peer lands.
+> ✅ **`docs/development/state.md`** — iron row rewritten to the burn result; the ktest line corrected
+> from "97/6, six pre-existing" to **107/3** with *why* the two closed ones were never mysteries; and
+> three new entries: cyrius is never-touch, "pre-existing/unexplained" is not a diagnosis, and an iron
+> burn is a defect source to be read in full.
+> ✅ **`issues/2026-08-27-open-ao-nofollow-flag.md`** — marked FIXED; `AO_EXCL` explicitly still open.
+> ⚠ **17 issue files triaged with adversarial verification and NONE came back cleanly archivable** —
+> every shipped-syscall record carries a stale contract clause or an unswept caller. That is a finding
+> about the folder, not a queue of defects, and it wants its own pass.
+>
 > ⚠ **Still unswept since 1.44.9**: `README.md`, `architecture/overview.md`, `syscall-additions.md`,
 > `build.md`, `kybernet-bridge.md`. Unchanged by this cut and still to be assumed stale.
 > 🟠 **Body docs still unswept** — unchanged since 1.44.9; the debt below stands.
