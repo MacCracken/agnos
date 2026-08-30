@@ -320,7 +320,7 @@ fn net_recv_udp(buf, maxlen) {
     # while having copied only `copy_len`. The COPY was correctly bounded; the RETURN VALUE was not,
     # and a caller has nothing else to size its buffer by. Measured on the one real caller,
     # user/shell.cyr's `recv` verb:
-    #     var rbuf[64];                        # 64 u64 slots = 512 bytes
+    #     var rbuf[64];                        # ⛔ 64 BYTES — see the correction below
     #     var rlen = net_recv_udp(&rbuf, 512); # copies 512, RETURNED up to 1016
     #     kprint(&rbuf, rlen);                 # reads 1016 from a 512-byte STACK buffer
     # Ingress caps a datagram at 1016 bytes (see the cap above) into the 2048-byte net_udp_buf, so
@@ -329,6 +329,15 @@ fn net_recv_udp(buf, maxlen) {
     # copy — i.e. this disclosed exactly the two secrets (canary, text addresses) that the canary and
     # KASLR exist to keep. An attacker supplies the trigger remotely by sending one oversized UDP
     # datagram; the operator's next `recv` prints the stack.
+    # ⛔⛔ 1.56.52 — THE SIZING IN THE NOTE ABOVE WAS WRONG, AND IT HID A SECOND, WORSE BUG.
+    # `var rbuf[64]` is declared INSIDE `fn sh_exec`, and a FUNCTION-LOCAL `var x[N]` is N BYTES —
+    # the N-u64 rule is module scope only. So that buffer was 64 bytes, not 512, and this function's
+    # `maxlen`-bounded copy was still writing up to 512 into it: a 448-byte ring-0 stack OVERWRITE,
+    # remotely triggered by one oversized UDP datagram plus an operator `recv`. The 1.56.51 fix below
+    # is correct and stays — it closed a real 504-byte over-READ — but it was reasoned from the wrong
+    # buffer size, so the overflow underneath it was invisible. shell.cyr now declares [512].
+    # ⚠ Measured under the pinned toolchain rather than argued: writing 512 bytes into a
+    # function-local `var a[64]` SIGSEGVs; 64 and 65 do not.
     # ⚠ TRUNCATION IS NOW SILENT: a caller that needs to know the datagram was longer than its
     # buffer cannot learn it from this return value any more. That is the correct trade for a
     # single-consumer legacy path — POSIX splits the two with MSG_TRUNC precisely because returning

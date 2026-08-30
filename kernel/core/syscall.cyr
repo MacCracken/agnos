@@ -517,10 +517,12 @@ fn fault_kill_current(vector) {
     # under every per-proc CR3; the same property that makes it safe at the earliest boot makes it
     # safe here. Read it after the box survives: `run /bin/klug > /f.txt`.
     # ⚠ CR2 is valid until the NEXT page fault, so it must be read here, before anything else runs.
-    var fk_hex[24];   # 1.56.52: was [16] "16 hex digits exactly" — fmt_hex_buf also writes the NUL at
-                      # buf[len], so 16 digits need 17 bytes. Measured: in a frame without the
-                      # 16-alignment pad the 17th byte lands on `code`, so a #PF-killed proc would
-                      # have reported exit 0 (clean success) instead of 142.                                   # fn-local var[N] = N BYTES; 16 hex digits exactly
+    # ⛔ 1.56.52 — [24], NOT [16]. fn-local `var x[N]` is N BYTES, and fmt_hex_buf writes up to 17 of
+    # them (16 hex digits plus the NUL at buf[len]) — so the old [16], whose comment read "16 hex
+    # digits exactly", was that count off by exactly one. Measured on the shipped binary: in a frame
+    # without the 16-byte alignment pad the 17th byte lands on `code`, so a #PF-killed process would
+    # have reported exit 0 (clean success) instead of 142.
+    var fk_hex[24];
     var fk_n = 0;
     klug_append("fault: pid=", 11);
     fk_n = fmt_hex_buf(pid, &fk_hex);       klug_append(&fk_hex, fk_n);

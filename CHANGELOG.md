@@ -39,6 +39,38 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   ⭐ A boot gate now asserts the field placement (`tss: I/O map base at 0x66 OK`), because an offset typo
   in a hardware structure has no signal of its own. Mutation-tested: the old offset reports `MISPLACED`.
 
+### Security — four ring-0 stack overflows in the in-kernel shell, one of them remote
+
+- **A function-local `var x[N]` is N BYTES; the N-u64 rule is MODULE scope only** — and four buffers in
+  `kernel/user/shell.cyr` were sized as if the module rule applied, while being passed the larger length:
+
+  | site | declared | written by | overflow |
+  |---|---|---|---|
+  | `cat` | `cbuf[64]` | `vfs_read(fd, &cbuf, 512)` | 448 B on any file ≥ 64 B |
+  | `recv` | `rbuf[64]` | `net_recv_udp(&rbuf, 512)` | 448 B, **remotely triggered** |
+  | pipe test | `pbuf[16]` | `vfs_read(rfd, &pbuf, 128)` | 112 B |
+  | block dump | `rbuf[64]` | `blk_read(sector, &rbuf)` | 448 B at 512 B/LBA, **4032 B at 4096** |
+
+  All four are ring-0 stack in the in-kernel emergency shell. The `recv` one is driven end-to-end by an
+  attacker: send one oversized UDP datagram, wait for the operator to run `recv`.
+  ⛔ **The block-dump one has no literal length at the call site at all** — `blk_read` writes one whole
+  LBA, and the LBA size is the *device's*. It is 4096 on a 4K-LBA NVMe, a size the block layer began
+  honouring in this same cut, so the 4032-byte case is live rather than hypothetical. The hexdump below
+  it only *reads* 64 bytes, which is what kept it invisible.
+
+- ⛔⛔ **1.56.51 REASONED FROM A FALSE COMMENT ABOUT THE `recv` BUFFER AND FIXED THE SMALLER HALF.** Its
+  note in `net_ingress.cyr` quoted the site as `var rbuf[64];  # 64 u64 slots = 512 bytes` — the module
+  rule applied to a function-local declaration. The over-READ it closed (returning the untruncated
+  datagram length, disclosing up to 504 bytes of kernel stack including the canary) was real and the fix
+  stands. But because the buffer was believed to be 512 bytes, the over-WRITE underneath it could not be
+  seen. Comment corrected at the site so the next reader inherits the right rule.
+
+- ⚠ **Established by measurement, not by reading the compiler.** Under the pinned toolchain, writing 512
+  bytes into a function-local `var a[64]` SIGSEGVs while 64 and 65 do not. That check was worth running:
+  `main.cyr` already records the sizing being **non-uniform** at module scope (`var fpctxsw_payload[24]`
+  measured 24 bytes while a sibling `var fpu_state[1026]` measured 8208), with the standing advice to
+  "verify by `&next-&this` and OVER-size" — so neither rule can be applied from memory.
+
 ### Security — P0: `sys_munmap` could free live kernel memory
 
 - **`length` had no ingress cap and every comparison is signed** (`kernel/core/proc.cyr`).

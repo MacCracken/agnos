@@ -218,7 +218,11 @@ fn sh_cmd_cat(arg, arglen) {
     # mount — it uses bare names, and carries the boot programs).
     if (fd < 0) { fd = initrd_open(arg, arglen); }
     if (fd < 0) { kprintln("file not found", 14); return 0; }
-    var cbuf[64];
+    # ⛔⛔ 1.56.52 — [512], NOT [64]. A FUNCTION-LOCAL `var x[N]` IS N BYTES (module-scope is N u64 =
+    # 8N). This read asks for 512 into what was a 64-byte stack buffer — a 448-byte ring-0 stack
+    # smash on any file at least 64 bytes long. MEASURED, not reasoned: writing 512 bytes into a
+    # function-local `var a[64]` under the pinned toolchain SIGSEGVs, while 64 and 65 do not.
+    var cbuf[512];
     var n = vfs_read(fd, &cbuf, 512);
     while (n > 0) {
         kprint(&cbuf, n);
@@ -569,7 +573,16 @@ fn sh_exec(buf, len) {
     if (sh_streq(buf, clen, "recv", 4) == 1) {
         if (vnet_active == 0 && nic_ready() == 0) { kprintln("no network", 10); return 0; }
         # Boot net-probe already configured the stack; no SLIRP re-init.
-        var rbuf[64];
+        # ⛔⛔ 1.56.52 — [512], NOT [64], AND THIS ONE IS REMOTELY TRIGGERED. net_recv_udp copies
+        # min(datagram, maxlen) = up to 512 bytes into this buffer; at [64] that is a 448-byte ring-0
+        # stack smash, driven by an attacker sending one oversized UDP datagram and the operator then
+        # running `recv`.
+        # ⚠ 1.56.51 FIXED THE OVER-READ HERE AND REASONED FROM A FALSE COMMENT ABOUT THIS VERY LINE.
+        # net_ingress.cyr's fix note quoted it as `var rbuf[64];  # 64 u64 slots = 512 bytes` — which
+        # is the module-scope rule applied to a function-local declaration. The over-READ it fixed
+        # (returning the untruncated length) was real; the over-WRITE underneath it was invisible
+        # because the buffer was believed to be 512 bytes all along.
+        var rbuf[512];
         var rlen = net_recv_udp(&rbuf, 512);
         if (rlen == 0) {
             kprintln("no packet received", 18);
@@ -600,7 +613,8 @@ fn sh_exec(buf, len) {
         kprint_num(wn);
         kprintln(" bytes", 6);
         # Read it back
-        var pbuf[16];
+        # ⛔ 1.56.52 — [128], NOT [16]: the read asks for 128 (see the fn-local sizing note at `cat`).
+        var pbuf[128];
         var rn = vfs_read(rfd, &pbuf, 128);
         kprint("read ", 5);
         kprint_num(rn);
@@ -724,7 +738,14 @@ fn sh_exec(buf, len) {
         kprint("Reading sector ", 15);
         kprint_num(sector);
         kprintln(":", 1);
-        var rbuf[64];
+        # ⛔⛔ 1.56.52 — [4096], NOT [64]. blk_read writes ONE WHOLE LBA into this buffer, and the LBA
+        # size is the DEVICE's: 512 on most disks and 4096 on a 4K-LBA NVMe (a size the block layer
+        # now honours as of this same cut, so the larger case is live, not hypothetical). At [64]
+        # that is 448 bytes of ring-0 stack smashed on a 512 B disk and 4032 on a 4K one. The
+        # hexdump below only READS 64 bytes, which is what hid this — the overflow is in the callee's
+        # write, not in anything visible here. 4096 matches blk_sc_bounce, the largest LBA the block
+        # layer will register.
+        var rbuf[4096];
         var r = blk_read(sector, &rbuf);
         if (r != 0) { kprintln("read failed", 11); return 0; }
         # Hexdump first 64 bytes

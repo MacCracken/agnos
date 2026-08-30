@@ -91,24 +91,11 @@ Two distinct problems, both fixed, both worth knowing before trusting any smoke 
 - ⚠ **`ring3-smoke` has 4 real failures** (preempt gate, parent spawn+wait, stress, yield) — PRE-EXISTING, measured identical against `ffdb611`, visible only once the virtio-blk conversion made the smoke runnable. Genuine ring-3 spawn/yield defects, unexplained.
 - **`modeset-tool-smoke` mask** — `MDO_OP_SUPPORTED` is **`0xE7F` = 3711** (un-armed) / **`0xFFF` = 4095** (armed); bit 11 = `MDO_OP_NATIVE`, in BOTH values because it carries no audio content and must exist in a plain kernel. The smoke asserts both directions.
 
-- ⛔ **THE 1.56.51 SEVERITY LABELS ARE NOT RELIABLE IN EITHER DIRECTION — a second pass found a P0 in the
-  P2 list.** `proc.cyr:1830` (filed P2) is a P0: `sys_munmap`'s signed wrap reached `pmm_free_2mb` on live
-  kernel identity pages from two ring-3 integers. `elf.cyr:357` / `proc.cyr:1788` (filed P2) are ring-3
-  memory exhaustion. Conversely `elf.cyr:484` was filed as a memory-safety overrun and only spills into the
-  child's own stack page. ⚠ Two of the audit's own suggested fixes are WRONG: the `blk` arm reorder breaks
-  the ABI (measured, reverted), and its init-stack guard is off by one. Re-read against the code.
-- ⚠ **Three 1.56.52 fixes are asserted, not exercised.** (a) The TSS I/O-map base — `tss_iopb_selftest`
-  proves the value lands in the field the CPU reads (0x66) and the reserved u16 stays clear, but runs no
-  ring-3 `IN`/`OUT`. (b) `syscall_hw.cyr`'s IBRS relocation — emit-order only; its A/B returned a null
-  (3 runs per arm, both boot) and why the old position does not fault under TCG is UNEXPLAINED. (c) `#92`
-  op 0x0C is iron-only (`gpu_present == 0` under QEMU), so the 171-case battery proves the refusal logic,
-  not the hardware path.
-- ⚠ **`#92` op 0x0C is still NOT SMP-safe.** The snapshot closes validate-vs-use only; `GPU_TEXL_PREP_SUBOFF`
-  is one shared 512-record prep slot and `gpu_texl_maxw/maxh/colmajor` are global latches, so two CPUs still
-  stomp each other's build. Pre-existing, wrong-picture class, NOT re-opened by the fix.
-- ⛔ **Kernel structures are addressed through the DIRECT MAP now** (`pmm_kva_for_access` = `DIRECTMAP_BASE +
-  phys`): all page-table walks, `kmalloc`, the MSC row table. New code that dereferences a `pmm_alloc` result
-  by its raw physical value re-opens a ring-3 → arbitrary-kernel-write class. PDE *values* stay raw phys.
+- ⛔⛔ **`var x[N]` SIZING IS THE HIGHEST-YIELD TRAP IN THIS TREE — VERIFY IT, NEVER RECALL IT.** Function-local is **N BYTES**; module-scope is *usually* N u64 = 8N but is **NOT uniform** (main.cyr records `var fpctxsw_payload[24]` measuring 24 B beside `var fpu_state[1026]` measuring 8208 B). Measured under the 6.5.36 pin: writing 512 B into a fn-local `var a[64]` SIGSEGVs; 64 and 65 do not. ⛔ This one trap has now produced BOTH failure directions in this audit: a cluster of PHANTOM overflow findings (an auditor reading module `var x[N]` as N bytes), and four REAL ring-0 stack overflows in `shell.cyr` that 1.56.51 looked straight at and could not see, because its own comment asserted the wrong rule for the very buffer it was fixing. Verify by `&next-&this` or by an over-write probe.
+- ⛔ **THE 1.56.51 SEVERITY LABELS ARE NOT RELIABLE IN EITHER DIRECTION — a second pass found a P0 in the P2 list.** `proc.cyr:1830` (filed P2) is a P0: `sys_munmap`'s signed wrap reached `pmm_free_2mb` on live kernel identity pages from two ring-3 integers. `elf.cyr:357` / `proc.cyr:1788` (filed P2) are ring-3 memory exhaustion. Conversely `elf.cyr:484` was filed as a memory-safety overrun and only spills into the child's own stack page. ⚠ Two of the audit's own suggested fixes are WRONG: the `blk` arm reorder breaks the ABI (measured, reverted), and its init-stack guard is off by one. Re-read against the code.
+- ⚠ **Three 1.56.52 fixes are ASSERTED, NOT EXERCISED.** (a) TSS I/O-map base — `tss_iopb_selftest` proves the value lands in the field the CPU reads (0x66) and the reserved u16 stays clear, but runs no ring-3 `IN`/`OUT`. (b) `syscall_hw.cyr`'s IBRS relocation — emit-order only; its A/B returned a null (3 runs/arm, both boot) and why the old position does not fault under TCG is UNEXPLAINED. (c) `#92` op 0x0C is iron-only (`gpu_present == 0` under QEMU), so the 171-case battery proves the refusal logic, not the hardware path.
+- ⚠ **`#92` op 0x0C is still NOT SMP-safe.** The snapshot closes validate-vs-use only; `GPU_TEXL_PREP_SUBOFF` is one shared 512-record prep slot and `gpu_texl_maxw/maxh/colmajor` are global latches, so two CPUs still stomp each other's build. Pre-existing, wrong-picture class, NOT re-opened by the fix.
+- ⛔ **Kernel structures are addressed through the DIRECT MAP now** (`pmm_kva_for_access` = `DIRECTMAP_BASE + phys`): all page-table walks, `kmalloc`, the MSC row table. New code that dereferences a `pmm_alloc` result by its raw physical value re-opens a ring-3 → arbitrary-kernel-write class. PDE *values* stay raw phys.
 - ⚠ **Harness traps that cost real time here:** `chan-ring3-smoke` / `syscall-harden-smoke` do NOT build their own kernel (they inherit `sweep.sh`'s, so a standalone run measures the wrong binary); and `check.sh` calls `build.sh`, so running it during a sweep overwrites `build/agnos` mid-gate and invalidates the run.
 
 - **GPU / display / HDMI audio** — every register, burn result and falsified hypothesis: [`planning/gpu.md`](planning/gpu.md). *The* single GPU document; no new GPU arc docs.

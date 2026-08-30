@@ -382,11 +382,11 @@ fn acpi_find_s5() {
                                     # from "the AML cursor is lost". Symmetric now; the clamp is deleted
                                     # because with bb >= 0 enforced it can never fire.
                                     if (a >= 0) { if (a <= 7) { if (bb >= 0) { if (bb <= 7) {
-                                                acpi_slp_typa = a;
-                                                acpi_slp_typb = bb;
-                                                acpi_s5_valid = 1;
-                                                return 1;
-                                            } } } }
+                                                    acpi_slp_typa = a;
+                                                    acpi_slp_typb = bb;
+                                                    acpi_s5_valid = 1;
+                                                    return 1;
+                                                } } } }
                                 }
                             }
                         }
