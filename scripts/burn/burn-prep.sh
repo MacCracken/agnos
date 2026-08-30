@@ -1258,6 +1258,31 @@ for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy
         puka)        _src="../setu/build/puka_agnos" ; _puka_alt="../puka/build/puka_agnos" ;;
         crab)        _src="../crab/build/crab_agnos" ;;
         agnsh)       _src="../agnoshi/build/agnsh_agnos" ;;
+        # ⛔⛔ 2026-08-30 — THE OTHER TWELVE HAD NO `_src` AT ALL, SO THE LOOP CHECKED THEM FOR
+        # PRESENCE AND NEVER FOR STALENESS. Eighteen tools iterate here and only four could be
+        # compared; the rest fell through this case with `_src` empty and skipped the `cmp` entirely.
+        # ⇒ Measured the day this was found: `kriya` was stale by 27,688 bytes and `whirl` by 16, and
+        # the prep printed nothing about either — on a burn whose subject is agnoshi, whose file
+        # built-ins (cp/mv/rm/ls/mkdir/rmdir/touch/echo/wc/find/grep) are ALL symlinks to kriya.
+        # ⚠ This is verbatim the failure the comment fifteen lines above already describes — "the gate
+        # existed, verified the tools it knew about, and did not know about the one the burn was for"
+        # — written about gputex, while twelve rows including gputex`s siblings sat uncovered below it.
+        # Every one of them has a resolvable `<repo>/build/<name>_agnos`; there was no reason for the
+        # list to be short beyond nobody extending it.
+        klug)        _src="../klug/build/klug_agnos" ;;
+        kriya)       _src="../kriya/build/kriya_agnos" ;;
+        iam)         _src="../iam/build/iam_agnos" ;;
+        modeset)     _src="../agnos/tests/gpu/build/modeset_agnos" ;;
+        gpuwedge)    _src="../agnos/tests/gpu/build/gpuwedge_agnos" ;;
+        gputri)      _src="../agnos/tests/gpu/build/gputri_agnos" ;;
+        gputex)      _src="../agnos/tests/gpu/build/gputex_agnos" ;;
+        gpucov)      _src="../agnos/tests/gpu/build/gpucov_agnos" ;;
+        gpublend)    _src="../agnos/tests/gpu/build/gpublend_agnos" ;;
+        gpublit)     _src="../agnos/tests/gpu/build/gpublit_agnos" ;;
+        gpufill)     _src="../agnos/tests/gpu/build/gpufill_agnos" ;;
+        gpucopy)     _src="../agnos/tests/gpu/build/gpucopy_agnos" ;;
+        gpudepth)    _src="../agnos/tests/gpu/build/gpudepth_agnos" ;;
+        faulter)     _src="../agnos/tests/fault/build/faulter_agnos" ;;
     esac
     _staged="build/rootfs/bin/$_t"
     if [ ! -f "$_staged" ]; then

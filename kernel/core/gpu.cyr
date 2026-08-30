@@ -10964,8 +10964,19 @@ fn gpu_scanout_matchgeom() {
     # passes this bound with room to spare — the bound only catches the growth direction.
     var new_bytes = ppx * 4 * vh;
     var have = fb_size_or_fallback();
-    if (have == 0) { return 0; }
-    if (new_bytes > have) { return 0; }
+    # ⭐ 1.56.53 — SAY SO WHEN THE BOUND REFUSES. On iron a declined override is indistinguishable from
+    # "the viewport already matched", and this function is exactly the archaemenid quiet-boot path
+    # (a 2560x1440 boot_info surface vs the firmware`s real 800x600). If the bound ever refuses there,
+    # the console renders at the WRONG geometry and the screen bands — a symptom that would otherwise
+    # be attributed to anything but a bound added in the previous cut. One line, serial-only cost.
+    if (have == 0) {
+        kprintln("fb: scanout match REFUSED - framebuffer extent unknown", 54);
+        return 0;
+    }
+    if (new_bytes > have) {
+        kprintln("fb: scanout match REFUSED - register geometry exceeds the real framebuffer", 74);
+        return 0;
+    }
     fb_set_geom(vw, vh, ppx * 4);           # bytes/row = pitch-px * 4 (ARGB8888)
     fb_defer_off();                          # 1.56.37: geometry verified — release the panel
     fb_console_clear();                      # redraw at the new geometry (also resets cursor + shadow)

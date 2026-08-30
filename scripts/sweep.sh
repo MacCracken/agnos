@@ -148,7 +148,7 @@ run_gate "1.56.40 chan #97 ring-3 kill criteria"     "CHAN_RING3_SELFTEST=1"    
 # ring 3 reaches the GPU through.
 # ⚠ This file's own header calls that out for selftests generally; the ABI battery was simply never
 # added to the table. It is one of 68 of 83 smokes still missing from it — a separate, larger problem.
-run_gate "1.56.44 #92 ABI battery (171 cases, ops 0x01-0x10)" "EDGE_ABI_SELFTEST=1" "edge-abi-smoke.sh"
+run_gate "1.56.44 #92 ABI battery (174 cases, ops 0x01-0x10)" "EDGE_ABI_SELFTEST=1" "edge-abi-smoke.sh"
 
 # --- 1.52.x audio: HDA probe -> reset -> verb ring -> codec graph -> stream DMA-arm ---
 run_gate "1.52.x audio HDA (probe/reset/verb/graph/stream)" "" "hda-smoke.sh"

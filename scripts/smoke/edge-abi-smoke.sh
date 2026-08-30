@@ -132,7 +132,7 @@ pass=0; fail=0
 chk() { if grep -q "$1" "$LOG"; then echo "PASS: $2"; pass=$((pass+1)); else echo "FAIL: '$1' — $3"; fail=$((fail+1)); fi; }
 nchk() { if grep -q "$1" "$LOG"; then echo "FAIL: '$1' present — $3"; fail=$((fail+1)); else echo "PASS: $2"; pass=$((pass+1)); fi; }
 
-chk "edge-abi: 173 of 173 cases correct" \
+chk "edge-abi: 174 of 174 cases correct" \
     "every one of the 174 ABI cases returned the reason the ABI specifies" \
     "not 174/174 - read the named FAIL line(s) above; each names its case, want and got"
 chk "edge-abi: PASS -- the 0x01..0x06 and 0x08..0x10 ABIs reject every malformed" \

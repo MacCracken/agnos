@@ -20,6 +20,50 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.56.53] — 2026-08-30 — cycle OPEN: staged for the seven-cut iron validation burn
+
+### Added — one diagnostic, so a burn cannot come back ambiguous
+
+- **`gpu_scanout_matchgeom` now says when it DECLINES the override.** 1.56.52 bounded it by the real
+  framebuffer extent (`fb_size_or_fallback()`), and a declined override is otherwise indistinguishable
+  on iron from "the viewport already matched" — while the visible symptom, a banded or wrong-geometry
+  console, would get attributed to anything but a bound added the cut before. Two refusal reasons print
+  distinctly: extent unknown, and register geometry exceeding the real framebuffer. Serial-only cost.
+  ⚠ This is the archaemenid quiet-boot path specifically (a 2560x1440 `boot_info` surface against the
+  firmware's true 800x600), which is why it is worth a line rather than a comment.
+
+### Fixed — the burn-prep staleness gate covered 4 of the 18 tools it iterates
+
+- **`burn-prep.sh`'s stale-staged-tool check set `_src` for only `aethersafha`, `puka`, `crab` and
+  `agnsh`.** The loop walks eighteen; the other fourteen fell through the `case` with `_src` empty and
+  skipped the `cmp` entirely, so they were checked for **presence** and never for **staleness**.
+  ⇒ Measured the day it was found: `kriya` was stale by **27,688 bytes** and the prep printed nothing —
+  on a burn whose subject is agnoshi, whose file built-ins (`cp mv rm ls mkdir rmdir touch echo wc find
+  grep`) are **all symlinks to kriya**. `crab` was stale by 12,632 and `whirl` by 16.
+  ⛔ This is verbatim the failure the comment fifteen lines above it already describes — *"the gate
+  existed, verified the tools it knew about, and did not know about the one the burn was for"* — written
+  about `gputex`, while twelve rows including `gputex`'s own siblings sat uncovered below it. Every one
+  had a resolvable `<repo>/build/<name>_agnos`; the list was short because nobody extended it.
+
+### Fixed — the sweep's `#92` battery assertion drifted from the count it asserts
+
+- The battery's case count lives in **two** places — the kernel's `of N cases correct` literal and the
+  smoke's `chk` pattern — and the 173 → 174 move updated the literal and the smoke's *prose* but not the
+  **pattern**, so the gate failed against a kernel that was right. Both now read 174. ⚠ The failure is
+  loud (the gate goes red), which is the only reason a two-place count is tolerable here.
+
+### Changed — the iron baseline in `state.md` was wrong by two cuts
+
+- That row read *"1.56.44 … nothing from 1.56.45-1.56.51 has been on iron"*. The iron log records
+  **1.56.46 `6c557484…` flashed 2026-08-19** (`#tracker-desktop-b3`), and every tracker after it says
+  "kernel unchanged" — which is exactly how the rollup drifted, since b4–b9 were tool-side only.
+  **The machine has been running 1.56.46 for eleven days.**
+  ⚠ A wrong baseline here mis-aims a bisect: a regression found on the next burn would have been
+  attributed to work that has in fact been running on that machine since the 19th.
+  ⇒ The genuinely unburned span is **1.56.47 → 1.56.53** (seven cuts), plus **agnoshi 1.8.9 → 1.9.10**
+  (eleven cuts). Staged as [`#tracker-iron-v1`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md).
+
+
 ## [1.56.52] — 2026-08-29 — the audit backlog's two P0s, and a ring-3 port-I/O hole nobody had filed
 
 ### Security — ring 3 could reach the platform through the TSS

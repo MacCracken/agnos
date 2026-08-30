@@ -73,6 +73,23 @@ type: state
 > batch found **15 real defects, all of them in the FIXES rather than the findings**, and what shapes
 > they took.
 >
+> ### 1.56.53 (2026-08-30) — cycle OPEN, staged for the iron validation burn
+>
+> ✅ **`CHANGELOG.md`** — 1.56.53 opened: the scanout-refusal diagnostic, the `burn-prep` staleness gate
+> that covered 4 of the 18 tools it iterates, the `#92` battery count that drifted between its two
+> assertion sites, and the corrected iron baseline.
+> ✅ **`docs/development/state.md`** — TWO corrections, both of which would have mis-aimed a bisect:
+> the **Last artifact on iron** row said 1.56.44 when the iron log records **1.56.46 flashed
+> 2026-08-19** (the rollup drifted because b4–b9 were tool-side only and said "kernel unchanged"), and
+> the **`build/agnos` on disk** row now carries the stamped burn artifact plus a do-not-rebuild warning.
+> ✅ **NEW `agnosticos/.../iron-nuc-zen-log.md` `#tracker-iron-v1`** — the burn card: staged versions,
+> the dispositive 60-second test, the kernel→kybernet→agnoshi marker chain, and six falsification
+> branches ordered by likelihood, one of which (the IPv4 fragment reject) is flagged as an **intended**
+> behaviour change that will look like a regression.
+> ⚠ **`kybernet-bridge.md` is STALE and was not swept**: it states the kernel syscall surface as 0-33;
+> it is 0-101. Left alone deliberately — this cut did not touch the bridge, and rewriting a design doc
+> unprompted while a burn is staged is the wrong order.
+>
 > ⚠ **Still unswept since 1.44.9**: `README.md`, `architecture/overview.md`, `syscall-additions.md`,
 > `build.md`, `kybernet-bridge.md`. Unchanged by this cut and still to be assumed stale.
 > 🟠 **Body docs still unswept** — unchanged since 1.44.9; the debt below stands.
