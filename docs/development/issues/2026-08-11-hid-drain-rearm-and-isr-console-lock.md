@@ -1,7 +1,9 @@
 # HID input path — three defects found while explaining a log line at the shell prompt
 
 **Found**: 2026-08-11, investigating an operator report of a "mouse notification on the shell."
-**Status**: **#1 and #2 FIXED and MEASURED 2026-08-11; #3 added but its reset sequence is unvalidated.**
+**Status:** 🟠 **OPEN — #1/#2 FIXED AND MEASURED; #3 STILL HAS NEVER EXECUTED.** Re-verified 2026-08-30. `hid_recover_halted`'s Reset-Endpoint / Set-TR-Dequeue pair remains unexercised anywhere: an injected completion code is fabricated in software, so the controller never actually halts, `xhci_ep_state()` reports Running, and the body early-outs. ⭐ **1.56.52 CHANGED THAT CODE, so what a future stall will exercise is no longer what was reviewed here**: it was reading `hid_ep_idx`/`hid_ep_cycle` on a KEYBOARD row, which are a decoy that reads 0/1 forever, and now routes through `hid_row_idx`/`hid_row_cycle`/`hid_row_arm`. The same cut added the stolen-event reclaim on the three synchronous xHCI waiters. ⚠ The 2026-08-30 iron burn ran a real composite keyboard for a whole interactive session with **no** stall, so it did not exercise this either. Still blocked on a genuine hardware stall or controller-level fault injection agnos does not have.
+
+**Original status:** **#1 and #2 FIXED and MEASURED 2026-08-11; #3 added but its reset sequence is unvalidated.**
 **Kernel at time of finding**: 1.56.43.
 
 > **How they were proven** — neither fix was accepted on "it compiles":

@@ -110,6 +110,22 @@ type: state
 > every shipped-syscall record carries a stale contract clause or an unswept caller. That is a finding
 > about the folder, not a queue of defects, and it wants its own pass.
 >
+> ### 1.56.54 (2026-08-30) — the issues folder swept end to end
+>
+> ✅ **`docs/development/issues/`** — **17 open → 6.** Eleven resolved records got their Status headers
+> rewritten with resolution notes and moved to `archived/` (44 files there now). The six that remain
+> each state what they are actually waiting on; four of the six are waiting on a **ruling, hardware, or
+> a slotting decision**, not on code.
+> ✅ **`docs/development/agnos-userland-abi.md`** — four rows corrected to the post-*bites 10/11* kernel:
+> `read`#5 (`-2` WOULD_BLOCK), `write`#1 (short write, caller retries), `pipe`#25 (streaming, 4080-byte
+> ring, mandatory close), and `exec_redirect`#62, whose two bolded clauses had been **false since
+> 1.56.39**.
+> ✅ **`CHANGELOG.md`** — 1.56.54: the `BOTE_SELFTEST` boot hang, the four ABI rows, and the sweep table.
+> ✅ **`CLAUDE.md`** — the issues pointer said `archive/`; the directory is `archived/`. Corrected, plus
+> the two rules this sweep paid for.
+> ✅ **`docs/development/state.md`** — two new entries: a stale Status header is this folder's failure
+> mode, and *check what a shipped change broke before archiving it* — which caught a boot hang.
+>
 > ⚠ **Still unswept since 1.44.9**: `README.md`, `architecture/overview.md`, `syscall-additions.md`,
 > `build.md`, `kybernet-bridge.md`. Unchanged by this cut and still to be assumed stale.
 > 🟠 **Body docs still unswept** — unchanged since 1.44.9; the debt below stands.

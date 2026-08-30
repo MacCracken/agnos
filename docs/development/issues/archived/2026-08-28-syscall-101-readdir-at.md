@@ -1,6 +1,8 @@
 # `#101 readdir_at` — a directory listing that can resume
 
-**Status:** ✅ **Built** 2026-08-28 (agnos 1.56.50), and **exercised against a booted kernel**.
+**Status:** ✅ **RESOLVED — SHIPPED 1.56.50, hardened 1.56.51.** Swept 2026-08-30. Kernel arm, cursor contract, `-5` misalignment refusal and the ABI row are all present and consistent. Nothing carried.
+
+**Original status:** ✅ **Built** 2026-08-28 (agnos 1.56.50), and **exercised against a booted kernel**.
 **Repo owning the design:** agnos (this file).
 **Cross-repo:** filed in **both** repos — cyrius peer is
 `docs/development/issues/2026-08-28-cyrius-syscall-101-readdir-at-wrapper.md` (cyrius 6.5.36).

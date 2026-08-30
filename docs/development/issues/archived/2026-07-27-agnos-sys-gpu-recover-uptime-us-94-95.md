@@ -1,6 +1,8 @@
 # agnos syscalls #94 `gpu_recover_op` and #95 `uptime_us` have no stdlib wrapper
 
-**Status:** ✅ **FIXED — verified 2026-08-07 against cyrius 6.5.9.** Filed 2026-07-27 against cyrius
+**Status:** ✅ **RESOLVED — both cyrius wrappers exist and the class is now GATED.** Swept 2026-08-30. `SYS_GPU_RECOVER_OP = 94` and `SYS_UPTIME_US = 95` are in `lib/syscalls_x86_64_agnos.cyr`, and the three-way `syscall-abi-check.sh` gate now makes a missing peer a build failure rather than something a consumer discovers by calling `syscall(94, …)` raw.
+
+**Original status:** ✅ **FIXED — verified 2026-08-07 against cyrius 6.5.9.** Filed 2026-07-27 against cyrius
 **6.4.80** / agnos kernel **1.56.23**; sat labelled OPEN for eleven days after it shipped.
 `lib/syscalls_x86_64_agnos.cyr` now carries `SYS_GPU_RECOVER_OP = 94` (line 140) and
 `SYS_UPTIME_US = 95` (line 142) with `sys_gpu_recover_op(arm)` / `sys_uptime_us()` wrappers.

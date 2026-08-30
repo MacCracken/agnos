@@ -3169,8 +3169,26 @@ fn bote_mcp_selftest() {
     while (k < 32) { store64(ctab + k, load64(boottab + rfd_in * 32 + k)); k = k + 8; }
     k = 0;
     while (k < 32) { store64(ctab + 32 + k, load64(boottab + wfd_out * 32 + k)); k = k + 8; }
+    # ⛔⛔ 1.56.54 — CLOSE THE STDIN WRITE END, OR THE DOCUMENTED TERMINATION DOES NOT HAPPEN.
+    # This block`s own header says bote is run "to EOF (empty stdin pipe -> read 0)", and the comment
+    # below repeats it. That was true until the streaming-pipe work (*ipc bites 10/11*, 1.56.39-40)
+    # made `pipe_read` return **-2 WOULD_BLOCK** while any writer is still open, and 0 only once every
+    # writer has closed — the change that lets a reader tell "nothing yet" from "end of stream".
+    # `wfd_in` was written above and never closed, and it lives in proc 0`s table, so
+    # `pipe_writers_open` finds it and bote`s terminating read gets -2 rather than 0. Under
+    # run-to-completion `exec_and_wait`, a bote that retries on -2 does not fail this gate — it HANGS
+    # THE BOOT.
+    # ⭐ Closing the write end is not a workaround, it is the contract: agnoshi`s own pipeline does the
+    # same `sys_close(wfd)` between its two `#43` spawns, and pipe_read`s header calls that close
+    # mandatory ("once the shell closes the write end — which it must, and now does — the count is 0
+    # and this returns 0 exactly as before"). The request bytes are already in the ring; closing the
+    # writer does not disturb them, it only makes the reader`s EOF reachable.
+    # ⚠ REASONED, NOT MEASURED: `scripts/smoke/bote-mcp-smoke.sh` needs ../bote/build/bote-agnos, which
+    # is not built in this tree, so the gate could not be run to confirm. The kernel-side contract is
+    # unambiguous either way, and this restores what the header has claimed all along.
+    vfs_close(wfd_in);
     # run bote in ring 3; it reads the request from fd0, writes responses to fd1,
-    # then reads fd0 again -> empty pipe returns 0 -> EOF -> exits.
+    # then reads fd0 again -> the stdin pipe is empty AND its writer is closed -> 0 -> EOF -> exits.
     kprintln("bote: exec /bin/bote (MCP serve)", 32);
     var ep = &proc_table + pid * 176;
     var e = load64(ep + 24);

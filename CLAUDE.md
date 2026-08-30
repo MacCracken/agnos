@@ -163,7 +163,7 @@ These are *how the world is*, not *what we chose*. Reading the code alone won't 
 - [`docs/audit/`](docs/audit/) — security audit reports (`YYYY-MM-DD-*.md`).
 - [`docs/development/roadmap.md`](docs/development/roadmap.md) — completed, active, planned.
 - [`docs/development/state.md`](docs/development/state.md) — live state snapshot, refreshed every release.
-- [`docs/development/issues/`](docs/development/issues/) — open bug-investigation docs (one file per issue). `archive/` holds resolved ones with resolution notes.
+- [`docs/development/issues/`](docs/development/issues/) — open bug-investigation docs (one file per issue). **`archived/`** (not `archive/` — this line said the wrong name until 1.56.54) holds resolved ones with resolution notes. ⚠ **A resolved issue gets its Status header REWRITTEN before it is moved**, because the sweep of 2026-08-30 found that stale headers are the failure mode here, not missing files: `#98 ptrscan` still read "DESIGNED, UNBUILT" eleven cuts after it shipped, and `#97` read "bites 0-7 done" four cuts after bite 11. ⛔ **And check what the shipped change BROKE before archiving** — the pipes record looked like a clean ship and was hiding three unswept callers, one of them a boot hang.
 - [`docs/development/proposals/`](docs/development/proposals/) — pre-decision design drafts.
 - [`docs/development/kybernet-bridge.md`](docs/development/kybernet-bridge.md), [`security-hardening.md`](docs/development/security-hardening.md), [`syscall-additions.md`](docs/development/syscall-additions.md) — long-form design notes.
 - [`docs/doc-health.md`](docs/doc-health.md) — fresh / stale / archive / open-question ledger across this whole repo's docs. Refreshed in place when docs are touched.

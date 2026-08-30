@@ -1,6 +1,8 @@
 # The syscall ABI doc individually documents 65 of 96 syscalls, and names cyrius as its authority while cyrius names it as theirs
 
-**Status:** ✅ **RESOLVED 2026-08-05, same day** — gate built, 32 rows backfilled, circular authority cut.
+**Status:** ✅ **RESOLVED — the three-way gate shipped and the rows were backfilled.** Swept 2026-08-30. `scripts/check/syscall-abi-check.sh` compares kernel/doc/cyrius number sets and names, and the circular authority the issue describes (doc citing cyrius, cyrius citing doc) is cut: **the kernel is canonical**. ⚠ The gate is doing its job right now — it is RED at `kernel 102 · abi-doc 102 · cyrius 101` pending the `lstat`#102 peer, which is exactly the drift this issue existed to make visible.
+
+**Original status:** ✅ **RESOLVED 2026-08-05, same day** — gate built, 32 rows backfilled, circular authority cut.
 The one item left open is cyrius's stale provenance stamp (see *Remaining* at the bottom), which is a
 cyrius-repo edit.
 **Cross-repo:** agnos (`docs/development/agnos-userland-abi.md`) **+ cyrius** (`lib/syscalls_x86_64_agnos.cyr` header).

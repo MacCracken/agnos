@@ -1,6 +1,8 @@
 # `#99 proclist` — the first process-enumeration primitive
 
-**Status:** ✅ **Built** in 1.56.47 (`kernel/core/syscall.cyr`, `if (num == 99)`).
+**Status:** ✅ **RESOLVED — SHIPPED 1.56.47; its one real defect fixed at 1.56.53.** Swept 2026-08-30. ⛔ The record's published guarantee — *"the name field is NUL-padded to the full 32 bytes so ring 3 can never read a stale byte left by a previous occupant of the slot"* — was **FALSE as shipped**: a pid IS a slot index, `proc_alloc_slot` reuses the first dead slot, and `proc_names` was the one member of the per-slot family missing from its recycle scrub, so a fresh process could report the DEAD one's name. The fix, `proc_clear_name`, had been written with exactly that comment and was **dead code with zero callers**. Wired in at 1.56.53.
+
+**Original status:** ✅ **Built** in 1.56.47 (`kernel/core/syscall.cyr`, `if (num == 99)`).
 **Cross-repo:** peer filed at
 [`cyrius/docs/development/issues/2026-08-24-agnos-syscall-99-proclist-wrapper.md`](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-08-24-agnos-syscall-99-proclist-wrapper.md),
 per the standing rule that an agnos↔cyrius syscall is recorded on both sides.

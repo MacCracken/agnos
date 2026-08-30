@@ -8,7 +8,13 @@ type: issue
 
 **Opened** 2026-08-28, at the close of the 1.56.51 audit/hardening sweep.
 
-## ⭐⭐ STATUS — 1.56.52 (2026-08-29): BOTH P0s CLOSED
+## ⭐⭐ STATUS — 1.56.54 (2026-08-30): THIS IS NOW A TWO-ITEM aarch64 TAIL
+
+**Swept 2026-08-30.** P0 **2/2**, P2 **29/29**, P1 **21/26**. The genuinely-open remainder is **two aarch64 items**: `timer.cyr`'s inline asm addressing `[sp,#0]` (frame padding, not the intended local) and `klug.cyr`'s cross-arch leak — and the second is *why* `build.sh --aarch64` does not compile at all, so neither can be verified until the port builds. That makes the aarch64 arc, not this file, the thing to slot.
+⚠ Two further items are deliberately deferred WITH REASONS ON RECORD, not forgotten: the `blk` RW magic-constant gate (the proposed arm reorder is a **measured ABI break** — every caller passes tag 0, implemented and reverted) and `#92` op 0x0C's SMP-safety (shared prep slot + global latches, pre-existing and iron-only).
+⛔ **Read every severity label here as a LEAD, not a grade — they were wrong in the dangerous direction five times.** `proc.cyr:1830` (filed P2) was a P0; `proc.cyr:1781` (filed P1) could not be fixed as filed, because its suggested fix would itself have been a ring-3 kernel-write primitive; and three filed P2s were not P2 (a remote ring-0 stack read in the DHCP option parser, unauthenticated remote parse-confusion from unhandled IPv4 fragments, and a release CI gate that had never booted a kernel).
+
+## Earlier status — 1.56.52 (2026-08-29): BOTH P0s CLOSED
 
 **P0: 2 of 2 closed.** `elf.cyr:312` closed at 1.56.51 by the architecture change; `syscall.cyr:1895`
 (`#92` op 0x0C TOCTOU) closed at 1.56.52 by stage-and-revalidate. The `#92` battery grew 167 → 171 with

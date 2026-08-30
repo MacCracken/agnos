@@ -1,6 +1,8 @@
 # `#96 fork` — the number is reserved, the syscall is not built, and agora cannot run on agnos without it
 
-**Status:** 🟡 **OPEN** — filed 2026-08-05. Number assigned by the operator; nothing minted yet.
+**Status:** 🔵 **OPEN — RESERVED AND UNBUILT at 1.56.54.** Re-verified 2026-08-30: no `num == 96` dispatch arm, no `proc_dup_address_space`, and the `waitpid`#4 wait-any prerequisite (`arg1 < 0`) is still rejected. agora's fork-per-connection BBS therefore still cannot serve a second connection on agnos. ⚠ **Order matters and has not changed**: wait-any first (it forces the `proc_ppid[16]` array fork also needs), then full-copy `proc_dup_address_space` over PD[1..510]. LARGE; wants slotting.
+
+**Original status:** 🟡 **OPEN** — filed 2026-08-05. Number assigned by the operator; nothing minted yet.
 **Number:** **`#96`** — ⭐ **settled 2026-08-05.** It was contested with the local-IPC band; the
 operator ruled that **fork keeps `#96`** and the channel band takes **`#97`**
 ([`2026-08-05-syscall-97-chan-op.md`](2026-08-05-syscall-97-chan-op.md)). Next free is **`#98`**.

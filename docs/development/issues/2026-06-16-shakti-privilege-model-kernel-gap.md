@@ -1,6 +1,8 @@
 # shakti privilege-model kernel gap — what AGNOS needs for a `sudo` equivalent
 
-**Status**: Filed (informational / **blocks shakti 0.8.x**, does **not** block AGNOS).
+**Status:** 🟠 **OPEN — AND THE ASK IS A RULING, NOT CODE.** Re-verified 2026-08-30 against 1.56.54. Both P0s are genuinely absent: `getuid`#15 is still `return 0` (root), there is no uid/gid/cred array in `proc.cyr`, and neither `spawn`#3/#43 nor `execwait`#37 takes a credential argument. ⛔ **What is missing is a DECISION, and the repo's own doctrine leans hard toward declining**: `planning/ipc.md` §Identity says *"No uid/gid anywhere"*, and `proc.cyr` carries a matching guardrail. But doctrine is not an answer to a sibling repo, and none is recorded. ⇒ **If the ruling is "single-user always-root is the end state"**, the close is a doc edit and shakti re-scopes 0.8.x to *Linux + aarch64 only; AGNOS N/A by kernel design*. **If it is "yes"**, this is a LARGE arc (per-proc credentials, a user table, credential arguments on exec) that needs slotting. Either answer unblocks shakti; silence does not. ⚠ Also carried here: the `#75-80` block band's aegis capability gate depends on this same ruling. ⚠ Sub-items have MOVED since filing: P1 caller-supplied argv+envp **shipped** (argv 1.43.x, envp 1.44.19), P2 PTY is **partial** (`#97` band with PTY endowment; no termios), and P3 `getppid` has no syscall but ppid is now readable via `proclist`#99's record.
+
+**Original status:** Filed (informational / **blocks shakti 0.8.x**, does **not** block AGNOS).
 **Date**: 2026-06-16
 **From**: shakti 0.7.0 (AGNOS privilege-escalation tool — the `sudo`/`doas`
 equivalent; PAM auth, TOML policy, capability drop, session logging, LSM

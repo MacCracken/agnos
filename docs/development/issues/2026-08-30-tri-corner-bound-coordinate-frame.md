@@ -9,7 +9,9 @@ type: issue
 **Found** 2026-08-30, by an adversarial review of the 1.56.52 P2 batch — not by the 1.56.51 audit
 sweep, which did not look at either bound.
 
-**Status**: OPEN, and deliberately not fixed in 1.56.52. Op 0x09 is **shipped and burned**
+**Status:** 🟠 **OPEN — AND DELIBERATELY NOT FIXED; IT NEEDS AN OPERATOR RULING.** Re-verified 2026-08-30 at 1.56.54. Unchanged: both `gpo_validate_tri` (op 0x09) and `gpo_validate_trilist` (op 0x0A) evaluate the corner bound at SCREEN coordinates while the shader, the coverage pass and the byte-exact oracle all sample RECT-LOCAL ones. ⚠ **Measured, and it rejects nothing realistic** — a well-formed batch at a non-origin rect is accepted, and that measurement is a permanent battery case (`list: a well-formed batch at a NON-origin rect`, 174 cases). ⛔ **op 0x09 is SHIPPED AND BURNED**, so changing what its validator accepts is an ABI-semantics change to a burned op — which is why this is filed rather than taken. Do NOT close it by deleting either bound: the overflow it guards is real, only the frame is wrong.
+
+**Original status:** OPEN, and deliberately not fixed in 1.56.52. Op 0x09 is **shipped and burned**
 (`blend_alpha`/tri arc, iron 2026-08-16), so changing what its validator accepts is an ABI-semantics
 change to a burned op. That wants an operator ruling, not a patch-release edit.
 

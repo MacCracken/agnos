@@ -20,6 +20,65 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.56.54] — 2026-08-30 — the issues folder swept: 17 open → 6, and what archiving would have buried
+
+### Fixed — the pipe contract change of 1.56.39–40 was never swept into its callers
+
+*ipc bites 10/11* made pipes streaming: the ring short-writes at `PIPE_RING` = 4080 instead of
+wrapping-and-overwriting, and an empty ring returns **-2 WOULD_BLOCK** while any writer is open,
+returning **0** only once every writer has closed. That split is what lets a reader tell *"nothing
+yet"* from *"end of stream"*. **Nothing that depended on the old contracts was updated**, and the
+record looked like a clean ship — archiving it in that state was the thing to avoid.
+
+- **`BOTE_SELFTEST` could hang the boot.** Its own header says bote is run *"to EOF (empty stdin pipe
+  → read 0)"*, and `wfd_in` is written and **never closed** — it lives in proc 0's table, so
+  `pipe_writers_open` finds it and bote's terminating read gets `-2`, not `0`. Under
+  run-to-completion `exec_and_wait` a bote that retries on `-2` does not fail the gate, it **hangs**.
+  Now closed before the exec, which is what the contract requires — agnoshi's own pipeline already
+  does the same `sys_close(wfd)` between its two `#43` spawns, and `pipe_read`'s header calls that
+  close mandatory.
+  ⚠ **Reasoned, not measured**: `bote-mcp-smoke.sh` needs `../bote/build/bote-agnos`, which is not
+  built in this tree, so the gate could not be run to confirm. The kernel-side contract is unambiguous
+  either way.
+
+- **Four published ABI rows still described the pre-bites kernel.** `read`#5 said `bytes / -1` with no
+  mention of `-2` — on the one fd type that now returns it — four cuts after the kernel changed;
+  `write`#1 documented no short-write, so a caller writing `len` and assuming `len` was taken
+  **silently loses the tail**; `pipe`#25 said nothing about the ring, WOULD_BLOCK or the mandatory
+  close. ⛔ Worst, `exec_redirect`#62 asserted *"a save/swap/restore of the **global** `vfs_table`
+  entry"* and, in bold, *"**NOT applied to the non-blocking `spawn`#3**"* — **both false since
+  1.56.39**: fd tables are per-process, `#37` resolves the child's table, and `spawn_redirect_apply`
+  applies the redirect to `spawn_path`#43. This is the contract agnoshi, bote and cyrius are authored
+  against.
+
+### Changed — the issues folder, swept end to end
+
+**17 open → 6.** Eleven were resolved records whose *headers* had gone stale, which is the failure
+mode here rather than missing files: `#98 ptrscan` still read **"DESIGNED, UNBUILT"** eleven cuts
+after it shipped; `#97 chan_op` read **"bites 0-7 done"** four cuts after bite 11 landed. Each got its
+Status rewritten with a resolution note *before* being moved to `archived/`.
+
+⛔ **Every "already fixed" verdict was adversarially refuted before being acted on, and the refutations
+earned their keep three times** — the pipes record above, the `#99` guarantee that was false (fixed
+1.56.53), and the `mmap` low-arena rollback (fixed 1.56.53). A clean-looking ship is exactly when to
+check what it broke.
+
+**The six that remain, and what each is actually waiting on:**
+
+| issue | waiting on |
+|---|---|
+| `shakti-privilege-model-kernel-gap` | **an operator ruling**, not code — does agnos ever grow a privilege model? The repo's own doctrine (`ipc.md` §Identity: *"No uid/gid anywhere"*) leans toward declining, but doctrine is not an answer to a sibling repo. Either answer unblocks shakti; silence does not. The `#75-80` band's aegis capability gate depends on the same ruling. |
+| `syscall-96-fork` | slotting. Reserved and unbuilt; `waitpid` wait-any must land first (it forces the `proc_ppid[16]` array fork also needs). LARGE. |
+| `hid-drain-rearm-and-isr-console-lock` | **a genuine hardware stall.** ⚠ 1.56.52 *changed* that code, so what a future stall exercises is no longer what was reviewed there; the 2026-08-30 burn ran a real keyboard for a whole session without stalling. |
+| `open-ao-nofollow-flag` | `AO_EXCL` only — `AO_NOFOLLOW` shipped 1.56.53. |
+| `p1-audit-sweep-backlog` | **now a two-item aarch64 tail**, and the second item is *why* `--aarch64` does not compile. The aarch64 arc is the thing to slot, not this file. |
+| `tri-corner-bound-coordinate-frame` | **an operator ruling** — op 0x09 is shipped **and burned**, so changing what its validator accepts is an ABI-semantics change to a burned op. |
+
+⚠ **`CLAUDE.md` said `archive/`; the directory is `archived/`.** Corrected, along with the two rules
+this sweep paid for: rewrite the Status header before moving a file, and check what the shipped change
+*broke* before archiving it.
+
+
 ## [1.56.53] — 2026-08-30 — cycle OPEN: staged for the seven-cut iron validation burn
 
 ### Verified — the seven-cut span is on iron, and the chain holds

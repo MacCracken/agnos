@@ -1,6 +1,8 @@
 # 2026-07-09 — Ring-3 raw block-device syscalls (native-install primitive)
 
-**Status:** ✅ Phases 1-2 DONE — **cut 1.53.10** (2026-07-09). Read-path + gated write-path
+**Status:** ✅ **RESOLVED — the whole `#75-80` band shipped**, with the kernel arms, cyrius wrappers, the userland GPT/mkfs writer, the agnova port and the boot-what-it-wrote proof all landed. Swept 2026-08-30. ⚠ **One clause did NOT ship and is carried elsewhere, not here**: the aegis/shakti capability gate on the band. That depends on agnos having a privilege model at all, which is the open question in [`2026-06-16-shakti-privilege-model-kernel-gap.md`](2026-06-16-shakti-privilege-model-kernel-gap.md) — it needs an operator ruling and is tracked there.
+
+**Original status:** ✅ Phases 1-2 DONE — **cut 1.53.10** (2026-07-09). Read-path + gated write-path
 both QEMU-proven from ring 3 (`blk-ring3-smoke` exit 95 · `blk-write-smoke` exit 96,
 unarmed writes rejected). Remaining arc: cyrius `sys_blk_*` wrappers (ph.3), userland
 GPT-writer + `mkfs` (ph.4), agnova executor port (ph.5), end-to-end install proof (ph.6).

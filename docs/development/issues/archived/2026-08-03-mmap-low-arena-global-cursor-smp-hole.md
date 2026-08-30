@@ -1,6 +1,8 @@
 # `sys_mmap`'s low arena advances a GLOBAL cursor unlocked — concurrent multi-page mmaps punch holes
 
-**Status:** ✅ **FIXED — and this header was WRONG for four days.** Opened 2026-08-03, fixed the same
+**Status:** ✅ **RESOLVED — the race closed at 1.56.36, and a SECOND defect in the same function closed at 1.56.53.** Swept 2026-08-30. The unlocked read-modify-write is gone (whole-span claim under `mmap_spin_lock`). ⛔ The sweep then found the *rollback* was gated on VA arithmetic alone: a process that had never called `mmap` could rewind the global cursor past a span it never owned, then `mmap` twice and alias — leaking the first mapping's pages permanently, since `proc_map_page_nx` overwrites the PDE and the exit sweep only reclaims present+user entries. Now gated on `freed == npages`.
+
+**Original status:** ✅ **FIXED — and this header was WRONG for four days.** Opened 2026-08-03, fixed the same
 day, still labelled OPEN until an issue-rot audit on 2026-08-07 caught it. ⛔ A fixed defect still
 marked OPEN is worse than an unfiled one: it is a standing invitation to re-investigate solved work,
 and it makes every other OPEN label in the directory less trustworthy.

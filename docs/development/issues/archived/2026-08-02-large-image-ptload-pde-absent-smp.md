@@ -3,7 +3,9 @@
 *(Filed as "a large binary reaches ring 3 with one of its own PT_LOAD PDEs absent (SMP only)". The PDE
 was never absent — see the root cause. Title kept in the body for searchability.)*
 
-**Status:** ✅ **RESOLVED 2026-08-03** — `EFER.NXE` on the APs, `kernel/arch/x86_64/smp.cyr`. This is
+**Status:** ✅ **RESOLVED — the AP trampoline sets `EFER = LME|NXE`.** Swept 2026-08-30. With LME only, bit 63 of every NX PDE was a RESERVED bit on an AP, so any AP touching an NX page took a reserved-bit `#PF` — which presented as a large image's PDE being 'absent'. Fixed in the trampoline; `-smp 4` gates have run green since.
+
+**Original status:** ✅ **RESOLVED 2026-08-03** — `EFER.NXE` on the APs, `kernel/arch/x86_64/smp.cyr`. This is
 the K1 that gated ipc bites 4-9; the channel band shipped on top of it (agnos 1.56.40, bites 0-7).
 
 ⚠ Header normalised 2026-08-07 — the resolution was recorded, but not on a `**Status:**` line, so it

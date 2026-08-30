@@ -1,6 +1,8 @@
 # `#98 ptrscan` — the pointer band: a second HID device, and a ring that is safe for RELATIVE motion
 
-**Status:** 🔵 **DESIGNED, UNBUILT.** Filed 2026-08-08, opened the day `AE-0a` and the F4 close both came
+**Status:** ✅ **RESOLVED — SHIPPED 1.56.42, grown to a 20-byte wheel record at 1.56.49.** Swept 2026-08-30. The header below still read *"DESIGNED, UNBUILT"* eleven cuts after it was built: the kernel arm, all three named HID defects and the cyrius constant are all in. ⭐ Iron-confirmed 2026-08-30 — the burn enumerated a composite keyboard+mouse on one slot (`hid: mouse configured, boot protocol on, EP=130 interface=1`). Nothing carried.
+
+**Original status:** 🔵 **DESIGNED, UNBUILT.** Filed 2026-08-08, opened the day `AE-0a` and the F4 close both came
 back iron-proven and the operator asked for USB-mouse support.
 **Design:** [`planning/pointer.md`](../planning/pointer.md) — read it first; this ticket is the *number*
 and the *cross-repo contract*, not the design.

@@ -1,6 +1,8 @@
 # `#100 icmp_echo_ex(dst_ip, timeout_ms)` + ICMP counters on `net_config`#61
 
-**Status:** ✅ **Minted and QEMU-proven** 2026-08-26 (agnos 1.56.48).
+**Status:** ✅ **RESOLVED — SHIPPED 1.56.48 and now IRON-VERIFIED.** Swept 2026-08-30. The header said *"Minted and QEMU-proven"*; the 2026-08-30 archaemenid burn closed the remaining half — a live gateway ping succeeded against a real network (`icmp: gw reply`), which QEMU's SLIRP cannot prove. The cyrius wrapper is carried in that repo's own issues folder.
+
+**Original status:** ✅ **Minted and QEMU-proven** 2026-08-26 (agnos 1.56.48).
 **Repo owning the design:** agnos.
 **Cross-repo:** cyrius needs the wrappers — [`2026-08-24-agnos-syscall-99-proclist-wrapper.md`](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-08-24-agnos-syscall-99-proclist-wrapper.md) carries them.
 **Consumer:** `yo` — see its `docs/development/roadmap.md` § 0.6.x, which filed all of this as "blocked on agnos".

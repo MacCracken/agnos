@@ -1,6 +1,8 @@
 # `#97 chan_op` — the local-IPC channel band: designed, decided, numbered, and now MINTED (bites 0-4a)
 
-**Status:** 🟠 **BITES 0-7 DONE — the desktop runs on the band.** Filed 2026-08-05.
+**Status:** ✅ **RESOLVED — ALL TWELVE BITES (0-11) SHIPPED at 1.56.40.** Swept 2026-08-30. The header below said *"BITES 0-7 DONE"* for four cuts after bites 8-11 landed; `CH_OP_SUPPORTED = 0x003F`, the endowment/PTY mechanism, `chan_end_pty[32]` and the whole migration are in the tree, and `#97` has its own sweep gate (*chan #97 ring-3 kill criteria*). Nothing carried.
+
+**Original status:** 🟠 **BITES 0-7 DONE — the desktop runs on the band.** Filed 2026-08-05.
 ⭐⭐ **Bite 7 is proven**: `aethersafha --clients` mints/endows/spawns-placed, the listener is DELETED,
 and TWO independent clients (`present_probe` + `crab`) present under QEMU `-smp 4` — `presented: 2`,
 framebuffer-confirmed (3500 client px). `sweep.sh` 17/17, `check.sh` 25/25.
