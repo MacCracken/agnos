@@ -1,4 +1,4 @@
-# agnos.cyr — AGNOS kernel v1.56.54
+# agnos.cyr — AGNOS kernel v1.56.55
 # Boot: gnoboot + OVMF (QEMU) or install-usb.sh (iron) — see scripts/smoke/agnsh-smoke.sh.
 # ⛔ 1.56.51: this line read `qemu-system-x86_64 -kernel build/agnos …` and had been wrong since
 # the kernel became ELF64/multiboot2 under Path C. An ELF64 image has no PVH note, so QEMU's

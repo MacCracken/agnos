@@ -2625,10 +2625,19 @@ fn gpo_validate_trilist(rec, fbw, fbh) {
         var kxc = ay - by;  var kyc = bx - ax;  var k0c = (ax * by - ay * bx) << 16;
         var ci = 0;
         while (ci < 4) {
-            var qx = dx;  var qy = dy;
-            if (ci == 1) { qx = dx + w - 1; }
-            if (ci == 2) { qy = dy + h - 1; }
-            if (ci == 3) { qx = dx + w - 1; qy = dy + h - 1; }
+            # ⛔⛔ 1.56.55 — RECT-LOCAL CORNERS, NOT SCREEN. This read `qx = dx … dx + w - 1`, i.e. the
+            # rect`s position in the FRAMEBUFFER, while the shader samples RECT-LOCAL: tri_rgba.s
+            # computes `px = tgid_x*64 + lane` bounded by `s6 = w` and `Pcx = (px << 16) + 0x8000`, and
+            # `gpu_tri_prep` takes NO dx/dy — `gpu_tri_dispatch` folds the origin into the DESTINATION
+            # ADDRESS only. The coverage pass and the byte-exact oracle (tests/gpu/gputri.cyr) agree.
+            # ⇒ The bound was evaluating |E| over a set of points the hardware never visits, and NOT
+            # over the set it does. It could reject a record the GPU would render (a far-from-origin
+            # rect) and admit one that overflows (a large rect at the origin whose rect-local E runs
+            # away while the screen-coordinate corners sit close to the triangle).
+            var qx = 0;  var qy = 0;
+            if (ci == 1) { qx = w - 1; }
+            if (ci == 2) { qy = h - 1; }
+            if (ci == 3) { qx = w - 1; qy = h - 1; }
             var pcx = (qx << 16) + 32768;
             var pcy = (qy << 16) + 32768;
             var eb = kxb * pcx + kyb * pcy + k0b;
@@ -2748,10 +2757,16 @@ fn gpo_validate_tri(rec, fbw, fbh) {
     var kxc = ay - by;  var kyc = bx - ax;  var k0c = (ax * by - ay * bx) << 16;
     var ci = 0;
     while (ci < 4) {
-        var qx = dx;  var qy = dy;
-        if (ci == 1) { qx = dx + w - 1; }
-        if (ci == 2) { qy = dy + h - 1; }
-        if (ci == 3) { qx = dx + w - 1; qy = dy + h - 1; }
+        # ⛔⛔ 1.56.55 — RECT-LOCAL, and this one is a CHANGE TO A BURNED OP, taken on an operator
+        # ruling. Same defect as op 0x0A above and the same evidence: the shader, the coverage pass and
+        # the byte-exact oracle all sample px in [0,w) / py in [0,h); only these two validators used
+        # (dx, dy). op 0x09 shipped and was burned on 2026-08-16 with the screen-coordinate form, so
+        # this alters what a burned op ACCEPTS — which is why it waited for a ruling rather than being
+        # folded into the cut that found it.
+        var qx = 0;  var qy = 0;
+        if (ci == 1) { qx = w - 1; }
+        if (ci == 2) { qy = h - 1; }
+        if (ci == 3) { qx = w - 1; qy = h - 1; }
         var pcx = (qx << 16) + 32768;
         var pcy = (qy << 16) + 32768;
         var eb = kxb * pcx + kyb * pcy + k0b;
@@ -3311,8 +3326,17 @@ fn edge_abi_selftest() {
     # ratio bound. ⚠ THE RECT MUST STAY UNDER GPU_TRI_MAX_PIXELS or the pixel cap fires FIRST and
     # this case tests GPO_E_WORK instead -- which is what a 2048x2048 rect did on the first run.
     # 512x512 = 262144 is well under 2^20; the skew comes from the DISTANCE, not the size.
-    store32(&d + 16, (512 * 65536) + 512);      # 512x512
-    store32(&d + 20, (900 * 65536) + 1024);     # placed at (1024, 900), far from the frame
+    # ⛔ 1.56.55 — RE-DERIVED FOR THE RECT-LOCAL FRAME. This was a 512x512 rect placed at (1024, 900):
+    # under the old SCREEN-coordinate bound the DISTANCE produced the skew, and under the corrected
+    # rect-local one the position is irrelevant, so it stopped tripping (it reached GPO_E_NOTIMPL
+    # instead — the DERIVE arm below it). The skew now has to come from the rect being LARGE relative
+    # to the triangle, which is the quantity the bound actually guards.
+    # ⚠ Arithmetic, so this is checkable rather than tuned: a 1 px triangle gives a2 = 1<<16 = 65536 and
+    # lim = a2 * GPU_TRI_E_RATIO(1024) = 67,108,864. |E| at the far corner is about (w-1)<<16, so the
+    # bound trips for w >= 1026. 1088x512 = 557,056 stays under GPU_TRI_MAX_PIXELS (2^20) so the pixel
+    # cap does not fire first — the trap op 0x09`s own comment records hitting on its first run.
+    store32(&d + 16, (512 * 65536) + 1088);     # 1088x512
+    store32(&d + 20, 0);                        # at the ORIGIN — position no longer matters
     store32(&d + 32, 1 * 65536); store32(&d + 36, 0);
     store32(&d + 40, 0);         store32(&d + 44, 1 * 65536);
     pass = pass + ea_expect(&d, GPO_E_FRAME, "tri: frame skew beyond the ratio", 32);
@@ -3409,15 +3433,34 @@ fn edge_abi_selftest() {
     store32(vb +  0, 0);            store32(vb +  4, 0);
     store32(vb +  8, 1 * 65536);    store32(vb + 12, 0);
     store32(vb + 16, 0);            store32(vb + 20, 1 * 65536);
-    store32(&d + 16, (512 * 65536) + 512);      # 512x512 = 262144, well under 2^20
-    store32(&d + 20, (900 * 65536) + 1024);     # placed far from the 1 px frame at the origin
+    # ⛔ 1.56.55 — RE-DERIVED, same reason as op 0x09 above: the bound is rect-local now, so a far-away
+    # rect no longer skews anything. A LARGE rect against a 1 px triangle does. See the arithmetic there.
+    store32(&d + 16, (512 * 65536) + 1088);     # 1088x512 = 557,056, under 2^20
+    store32(&d + 20, 0);                        # at the ORIGIN
     store32(&d + 24, 1);                        # one triangle — the skew is per-triangle
     pass = pass + ea_expect(&d, GPO_E_FRAME, "list: frame skew beyond the ratio", 33);
 
-    # ⚠ THE CONTROL. Same tiny frame, rect back at the ORIGIN — must be ACCEPTED. Without it a bound
-    # that simply rejected every TRI_LIST record would score a pass on the case above.
+    # ⚠ THE CONTROL, RE-DERIVED 1.56.55. Its job is unchanged — without it, a bound that rejected every
+    # TRI_LIST record would score a pass on the case above — but its DISCRIMINATOR had to change with
+    # the frame. It used to move the rect back to the origin, which mattered only while the bound was
+    # evaluated in SCREEN coordinates. Rect-local, position is irrelevant and SIZE is everything, so
+    # the control is now a SMALL rect against the same 1 px triangle: |E| at (63,63) is about
+    # 63<<16 = 4.1M, comfortably under lim = 67.1M.
+    store32(&d + 16, (64 * 65536) + 64);        # 64x64 at the origin — inside the ratio
+    pass = pass + ea_expect_valid(&d, "list: a small rect against a tiny triangle validates", 52);
+
+    # ⭐⭐ THE CASE THAT ACTUALLY DISTINGUISHES THE TWO FRAMES, and without it the whole 1.56.55 fix is
+    # untestable: with every other case sitting at the origin, screen and rect-local coordinates
+    # COINCIDE, so reverting the bound to `dx`/`dy` left the battery green. Measured.
+    # ⚠ It needs BOTH properties at once — a tiny triangle (so `lim` is small) AND a rect far from the
+    # origin. Same 1 px triangle, same 64x64 rect, moved to (1024, 900):
+    #   rect-local: |E| at (63, 63)     ~= 63<<16   =  4.1M  <  lim 67.1M  -> ACCEPT (correct)
+    #   screen:     |E| at (1087, 963)  ~= 1087<<16 = 71.2M  >  lim 67.1M  -> REJECT (the old bug)
+    # The 64 px triangle used by the batch fixture cannot show this: its area makes `lim` ~1000x larger
+    # than either corner value, so both frames accept and the case proves nothing.
+    store32(&d + 20, (900 * 65536) + 1024);
+    pass = pass + ea_expect_valid(&d, "list: a tiny triangle FAR from the origin validates (rect-local)", 64);
     store32(&d + 20, 0);
-    pass = pass + ea_expect_valid(&d, "list: a tiny frame at the origin still validates", 48);
 
     # ⭐⭐ THE CONTROL THAT MATTERS MORE THAN THE ORIGIN ONE — a well-formed 64 px triangle with the
     # rect at a realistic NON-ORIGIN position. The corner bound above builds its sample points from
@@ -4304,8 +4347,8 @@ fn edge_abi_selftest() {
     # ⚠ 171 -> 173: two cases added at 1.56.52 when op 0x0A gained the frame-skew bound it had been
     # missing — the reject, and the ORIGIN control that keeps it honest. The count is asserted, not
     # printed, so adding a case without updating this line fails the gate rather than passing quietly.
-    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 174 cases correct\n", 22);
-    if (pass == 174) {
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 175 cases correct\n", 22);
+    if (pass == 175) {
         kprint("edge-abi: PASS -- the 0x01..0x06 and 0x08..0x10 ABIs reject every malformed\n", 76);
         kprint("edge-abi: record, and a well-formed one is accepted or correctly reports no-GPU.\n", 81);
         return 1;

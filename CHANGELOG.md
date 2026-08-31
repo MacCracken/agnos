@@ -20,6 +20,44 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.56.55] — 2026-08-30 — fork's return value was correct by accident, and the tri bound measured the wrong frame
+
+### Fixed — `fork`#96 wrote the child's return value into `r11`
+
+- 1.56.54 shipped fork **working by coincidence.** It wrote the child's `0` to `p+32`, which
+  `struct Process`'s doc-comment labels `rax`. It is not. `sched.cyr` carries the invariant:
+  *"REVERSED-LABEL SLOT MAP (load-bearing): the proc-slot caller-saved fields restore into the REVERSE
+  of their labels … p+32→r11 … p+112→rax. So the rax=0 return value goes to p+112 (NOT p+32)."*
+  The labels are right for the save side and for the symmetric timer round-trip, which is why nothing
+  had noticed — they are wrong for any row written **by hand**, which is exactly what fork does. The
+  child still read 0 only because the preceding `memset` zeroes `p+112` too.
+  ⭐ **Found by mutation, not by reading.** Setting `p+32` to 99 left the child reading 0 and the gate
+  green; setting `p+112` to 99 makes the child read 99 and the gate fail. The tell was a passing test
+  that could not fail — which is why the gate was held out of `sweep.sh` until this was answered.
+  ⇒ `fork-smoke.sh` is now in the sweep, and the cyrius `SYS_FORK`#96 peer is filed.
+
+### Fixed — the `#92` corner bound was evaluated in the wrong coordinate frame
+
+- Both `gpo_validate_tri` (op 0x09) and `gpo_validate_trilist` (op 0x0A) evaluated the frame-skew bound
+  at **screen**-coordinate rect corners `(dx, dy)`, while the shader samples **rect-local** ones —
+  `tri_rgba.s` computes `px = tgid_x*64 + lane` bounded by `s6 = w`, and `gpu_tri_prep` takes no
+  `dx`/`dy` at all. So the bound measured `|E|` over points the hardware never visits and not over the
+  ones it does: it could reject a record the GPU would render, and admit one that overflows.
+  ⚠ **op 0x09 is shipped and burned**, so this changes what a burned op accepts. Taken on an explicit
+  ruling, not folded in silently by the cut that found it.
+
+- ⛔ **The battery could not see the fix, twice, and both misses are the interesting part.** The two
+  existing frame-skew cases produced their skew from **distance** — the exact quantity the corrected
+  bound ignores — so they stopped tripping and had to be re-derived from arithmetic rather than tuned:
+  a 1 px triangle gives `lim = 65536 * 1024 = 67,108,864` and `|E|` at the far corner is about
+  `(w-1)<<16`, so the bound trips for `w >= 1026` (both now use 1088x512 at the origin). Then **every**
+  case sat at the origin, where the two frames coincide — and reverting the bound to `dx`/`dy` left the
+  battery **green**. A new case supplies the discrimination: a tiny triangle under a 64x64 rect at
+  `(1024, 900)`, accepted rect-locally (`|E|` ≈ 4.1M) and rejected in screen coordinates (≈ 71.2M).
+  ⚠ It needs **both** a small triangle and a far rect — the 64 px fixture triangle makes `lim` about
+  1000x larger than either corner value and proves nothing. Battery **174 → 175**.
+
+
 ## [1.56.54] — 2026-08-30 — the issues folder swept: 17 open → 6, and what archiving would have buried
 
 ### Added — `waitpid`#4 wait-any, `proc_dup_address_space`, and `fork`#96 (PARTIAL)

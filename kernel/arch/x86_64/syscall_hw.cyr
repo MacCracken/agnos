@@ -187,7 +187,19 @@ fn sys_fork(user_rsp) {
     store64(p + 16, user_rsp);                     # rsp  — the parent's own user stack pointer
     store64(p + 24, load64(regs));                 # rip  — [0] = rcx = post-SYSCALL return address
     memset(p + 32, 0, 128);                        # every GPR field zeroed, then the live ones below
-    # rax stays 0 — THE CHILD'S FORK RETURN VALUE.
+    # ⛔⛔ 1.56.55 — THE CHILD'S RETURN VALUE GOES TO p+112, NOT p+32, AND p+32 IS r11.
+    # sched.cyr states it as a load-bearing invariant: *"REVERSED-LABEL SLOT MAP … the proc-slot
+    # caller-saved fields restore into the REVERSE of their labels (derived from the ISR pop order,
+    # pic.cyr) … p+32→r11, p+48→r10, p+56→r9, p+64→r8, p+72→rdi, p+88→rsi, p+96→rdx, p+104→rcx,
+    # p+112→rax. So the rax=0 return value goes to p+112 (NOT p+32)."* The labels in the `struct
+    # Process` doc-comment are correct for the SAVE side and for the symmetric timer round-trip, which
+    # is why nothing has ever noticed; they are wrong for any row written BY HAND, which is exactly
+    # what fork does.
+    # ⚠ 1.56.54 wrote the 0 to p+32 and the child still saw 0 — **by accident**, because the memset
+    # above zeroes p+112 as well. Measured: mutating p+32 to 99 left the child reading 0, and the gate
+    # stayed green. So the fork contract was correct by coincidence and would have put any non-zero
+    # value into r11. Written explicitly now, so it is intentional and a mutation is detectable.
+    store64(p + 112, 0);                           # rax (reversed map) = THE CHILD`S FORK RETURN
     store64(p + 40,  load64(regs + 16));           # rbx  <- [2]
     store64(p + 80,  load64(regs + 24));           # rbp  <- [3]
     store64(p + 120, load64(regs + 32));           # r12  <- [4]

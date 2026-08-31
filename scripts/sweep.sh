@@ -119,6 +119,10 @@ run_gate "1.56.52 user-pointer window (owned, not low)" ""                      
 # 1.56.52 — a DHCP option shorter than its reader is a remote ring-0 stack read. Hermetic: the helper
 # is a pure function over a blob, which is the only way to test an attack needing a hostile server.
 run_gate "1.56.52 DHCP option length vs reader"        ""                                         "dhcp-opt-smoke.sh"
+# 1.56.55 — fork#96 end to end from ring 3: the child resumes at the parent's fork site with rax=0,
+# gets a PRIVATE copy of its memory, and the parent reaps it via waitpid wait-any. Builds its own
+# kernel (FORK_SELFTEST) and seeds /bin/forker, so it needs no buildenv here.
+run_gate "1.56.55 fork#96 + waitpid wait-any"          ""                                         "fork-smoke.sh"
 run_gate "1.39.x exFAT write (+ subdir)"             "EXFAT_WRITE_SELFTEST=1"                   "exfat-write-smoke.sh"
 
 # --- ext2/jbd2 write regression bar (the iron-validated path must stay green) ---

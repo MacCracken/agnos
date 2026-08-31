@@ -1,6 +1,13 @@
 # `#96 fork` — the number is reserved, the syscall is not built, and agora cannot run on agnos without it
 
-**Status:** 🟡 **PARTIAL — 1.56.54. THE HARD PART IS BUILT AND MEASURED; THE wait-any HANDOFF IS NOT.**
+**Status:** ✅ **BUILT AND GATED — 1.56.55.** `scripts/smoke/fork-smoke.sh` (in `sweep.sh`) proves the whole contract from ring 3: the child resumes at the parent's post-SYSCALL RIP with `rax == 0`, sees the parent's pre-fork stack value, writes its **own** copy, exits — and the parent reaps it with `waitpid(-1)` and confirms the child's write was **not** visible. Parent and child interleave in the log, so they are genuinely concurrent.
+
+⛔⛔ **THE REAL BUG WAS A SLOT-MAP INVERSION, AND 1.56.54 SHIPPED IT WORKING BY ACCIDENT.** fork wrote the child's return value to `p+32` — the `rax` field per `struct Process`'s doc-comment. It is not. `sched.cyr` carries the invariant: *"REVERSED-LABEL SLOT MAP (load-bearing): the proc-slot caller-saved fields restore into the REVERSE of their labels … p+32→r11 … p+112→rax. So the rax=0 return value goes to p+112 (NOT p+32)."* The labels are right for the SAVE side and for the symmetric timer round-trip, which is why nothing had noticed; they are wrong for any row written BY HAND — which is exactly what fork does. The child still read 0 only because the preceding `memset` zeroes `p+112` as well.
+⭐ **Caught by mutation, not by reading.** Setting `p+32` to 99 left the child reading 0 and the gate GREEN; setting `p+112` to 99 makes the child read 99 and the gate FAIL. A passing test that cannot fail is what exposed it.
+
+⚠ **Harness constraint, confirmed by log ORDER and worth keeping:** under a foreground `exec_and_wait` the child's lines appear only AFTER the run ends, so the parent's `waitpid` can never observe it — sched.cyr's IF=0 no-context-switch model. Both parent and child must be ordinary scheduled procs. Two earlier harness failures were mis-read as structural blockers and were not: `arch_wait()` is a bare `hlt` with no `sti`, and `elf_load_from_file` deliberately leaves ring-0 selectors for the caller to fix (`proc_set_ring3` before `proc_set_state(pid,1)` — the sequence `#43` documents).
+
+⚠ **Still owed:** the cyrius `SYS_FORK = 96` peer + `sys_fork()` wrapper. Now that the kernel arm exists and is gated, the issue's own rule (*"do not mint the number before the kernel arm exists"*) is satisfied — file it in `cyrius/docs/development/issues/`.
 
 **What is done and proven** (`scripts/smoke/fork-smoke.sh`, ring-3 `/bin/forker`):
 - `waitpid`#4 **wait-any** (`arg1 < 0`) — scans for a dead child of the caller, reaps the lowest, returns its code; `-2` while children live, `-1` when there are none. The `-2`/`-1` split is the contract a fork loop depends on.
