@@ -3288,9 +3288,32 @@ fn fork_disk_selftest() {
     # that fork RETURNS a child pid to a surviving parent and that the kernel does not fault building
     # the child. It CANNOT show the child resuming; that wants an agnsh-driven run and is recorded as
     # the open half in the issue.
-    proc_current_set(fpid);
-    var fep = &proc_table + fpid * 176;
-    exec_and_wait(load64(fep + 24), load64(fep + 16), load64(fep + 160));
+    # ⭐⭐ SCHEDULED, NOT FOREGROUND — and this is the whole harness question fork poses.
+    # Measured (1.56.54): under `exec_and_wait` the child`s FORK-CHILD/FORK-CHILD-OK lines appear in
+    # the log only AFTER `fork: SURVIVED back in kernel` — i.e. the child does not run until the
+    # foreground run has ENDED, so the parent`s `waitpid(-1)` can never observe it and spins to its
+    # timeout. That is the IF=0 no-context-switch model sched.cyr calls load-bearing, confirmed by log
+    # ORDER rather than by presence of the markers.
+    # ⇒ Both parent and child must be ordinary scheduled procs. Mark forker ready and let the timer
+    # round-robin all three of us (kmain, forker, and whatever forker forks).
+    # ⛔ AND `arch_wait()` IS `hlt` WITH NO `sti` — a bare hlt here hangs forever if IF is clear, which
+    # is exactly what the first attempt at this shape did: it printed the banner and stopped, and the
+    # cause was read as a scheduler property when it was a missing interrupt enable. `sti; hlt` is the
+    # idiom the rest of the tree uses when it means "wait for the next tick".
+    # ⛔ RING-3 SELECTORS FIRST, THEN READY — elf.cyr states the sequence outright: "elf_load_from_file
+    # does NOT set ring-3 selectors (the caller does — #43) … the CALLER flips it ready AFTER its own
+    # wiring". Skipping `proc_set_ring3` leaves the ring-0 defaults, so the scheduler`s iretq would
+    # return to a USER address at CPL0. That is why the first two attempts at this shape printed the
+    # banner and stopped: not a scheduler property, a missing line that #43 has and this did not.
+    proc_set_ring3(fpid);
+    proc_set_state(fpid, 1);
+    var fsp = 0;
+    while (fsp < 4000) {
+        if (proc_get_state(fpid) == 0) { break; }
+        asm { sti; hlt; }
+        fsp = fsp + 1;
+    }
+    if (proc_get_state(fpid) != 0) { kprintln("fork: /bin/forker never exited (timeout)", 40); return 0; }
     kprint("fork: forker exit ", 18);
     kprint_num(proc_get_exit_code(fpid));
     kprintln("", 0);

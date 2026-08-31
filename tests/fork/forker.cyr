@@ -12,6 +12,18 @@
 #   CHILD without PARENT       -> the parent did not survive its own fork
 #   PARENT without CHILD       -> the child was never scheduled, or resumed somewhere wrong
 
+# tiny unsigned-ish decimal emitter so the log carries actual VALUES, not just markers.
+fn _emit_num(n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { sys_write(1, "-", 1); n = 0 - n; }
+    if (n == 0) { sys_write(1, "0\n", 2); return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; sys_write(1, &b + i, 1); }
+    sys_write(1, "\n", 1);
+    return 0;
+}
+
 fn main(): i64 {
     sys_write(1, "FORKER-ALIVE\n", 13);
 
@@ -32,7 +44,13 @@ fn main(): i64 {
         witness = 0x1111;
         if (witness != 0x1111) { sys_write(1, "FORK-CHILD-WRITE-WRONG\n", 23); syscall(SYS_EXIT, 4); }
         sys_write(1, "FORK-CHILD-OK\n", 14);
-        syscall(SYS_EXIT, 7);
+        # ⛔ 11, NOT 7 — AND THE COLLISION IT AVOIDS IS A REAL ONE. When the child's exit code shared
+        # a value with one of the PARENT-path returns (FORK-WAIT-NO-CHILDREN returned 7), a kernel bug
+        # that gave the CHILD a non-zero fork return went undetected: the child fell through to the
+        # parent branch, found no children of its own, exited with that same 7, and the real parent's
+        # `code != 7` check passed. Measured — mutating the child's rax to 99 left this gate GREEN.
+        # The child's exit code must be a value NO parent path can produce.
+        syscall(SYS_EXIT, 11);
     }
 
     if (r < 0) {
@@ -56,7 +74,7 @@ fn main(): i64 {
         if (spins > 100000) { sys_write(1, "FORK-WAIT-TIMEOUT\n", 18); return 6; }
     }
     if (code == 0 - 1) { sys_write(1, "FORK-WAIT-NO-CHILDREN\n", 22); return 7; }
-    if (code != 7) { sys_write(1, "FORK-WAIT-WRONG-CODE\n", 21); return 8; }
+    if (code != 11) { sys_write(1, "FORK-WAIT-WRONG-CODE\n", 21); return 8; }
 
     # ⚠ THE CHILD'S WRITE MUST NOT BE VISIBLE HERE. This is what distinguishes a real full copy from
     # a shared mapping, and it is the whole reason proc_dup_address_space copies rather than aliases.
