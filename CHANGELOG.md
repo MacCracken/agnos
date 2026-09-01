@@ -51,10 +51,43 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   1 failed**; the single red is `check.sh`s syscall-ABI gate, which reports `#96 fork` and `#102 lstat`
   absent from cyrius and stays red by design until those peers land in that repo.
 
-### Changed — the issues folder: 7 open → 4, and two records that should never have been files
+### Resolved — the shakti privilege ruling existed all along, in the repo where architecture is ruled
+
+- ⛔⛔ **`issues/2026-06-16-shakti-privilege-model-kernel-gap.md` ASKED FOR A RULING THAT WAS MADE FIVE
+  WEEKS BEFORE IT WAS FILED.** Every revision of that file said the ask was *"a RULING, NOT CODE"* and
+  that none was recorded; the 2026-08-31 re-audit went further and asserted *"a full grep of `docs/`
+  finds only restatements of the open question, never an answer."* **That grep covered agnos only.**
+  This is a cross-repo architectural question and the answer lives in the **agnosticos** genesis repo:
+  `docs/development/planning/identity-and-authorization-model.md` — *"Identity & Authorization Model —
+  Recognition Over Interrogation"*, **2026-05-12**, against an issue filed **2026-06-16**.
+- **The ruling answers both P0s "no", by commitment rather than by default.** Its rejection table names
+  them: **"Account/uid as multi-user primitive"** → *"Permissions are fine-grained by capability
+  (`kavach`, `t-ron`)"*, and **"Sudo-and-retype-password for privilege"** → *"Physical presence +
+  capability token = intent verification"*. And: *"**Multi-user via avatara overlay, not via uid.** Same
+  kernel process space, different identity contexts."*
+  ⇒ agnos **does** grow an identity model covering **users and agents** both — `sigil` roots the user,
+  `t-ron` gates the agent, `avatara` carries the overlay, `kavach` holds per-action capability — and it
+  **does not** grow a per-process `uid`/`gid`. `getuid`#15 returning 0 is the decision, not a gap
+  awaiting one; `planning/ipc.md`s *"No uid/gid anywhere"* and `proc.cyr`s guardrail are downstream of
+  it, which earlier audits read as doctrine with no authority behind it.
+- **shakti is N/A on agnos by architecture**, not merely unbuilt: it is uid-de-escalation, and that
+  shape is explicitly rejected. 0.8.x re-scopes to Linux + aarch64 — the outcome the issue itself
+  listed as legitimate. The `#75-80` aegis capability gate is unblocked with it; it rides on `kavach`.
+- **Two kernel comments named the wrong successor and are corrected.** `syscall.cyr`s `#75-80` band
+  said its `BLK_RW_ARM_MAGIC` placeholder awaits *"when agnos grows per-proc caps"*, and `power.cyr`s
+  reboot gate said *"a uid check would be a gate that is always open"* as if provisionally. Both
+  placeholders are correct and stay; their successor is a **kavach capability gate in userland**, not a
+  kernel credential. Comment-only — no codegen change.
+- ⛔ **THE METHOD ERROR IS THE POINT.** A cross-repo question was answered from one repo, and the
+  negative result was recorded as fact in an issue header, a state.md rollup and a CHANGELOG entry. ⇒
+  **Before writing "no decision exists", search the genesis repo.** agnos is not where AGNOS
+  architecture is ruled.
+
+### Changed — the issues folder: 7 open → 3, and two records that should never have been files
 
 - ✅ **ARCHIVED, each with its Status header rewritten to a resolution note first**: `syscall-96-fork`,
-  `open-ao-nofollow`, `tri-corner-bound-coordinate-frame`. All three were **complete on the agnos side**
+  `open-ao-nofollow`, `tri-corner-bound-coordinate-frame`, and `shakti-privilege-model-kernel-gap`
+  (see the section above). All three were **complete on the agnos side**
   at 1.56.55 and were being held open waiting on **cyrius** peers. ⛔ That was the wrong reason to keep
   a record open: agnos does not modify cyrius, and those asks are filed and tracked *in cyrius*, so an
   open agnos issue for them is another repo`s backlog double-counted in this one.
@@ -64,10 +97,10 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   exist (above). Both files removed. ⇒ **A finding is not automatically a file.** Fix it, or put it
   where the work is already tracked; an issues folder that grows on every audit stops being a list of
   what is wrong and becomes a list of what was noticed.
-- **The 4 that remain are each blocked on something that is not code**: the shakti privilege-model
-  ruling (operator), HID `#3`s halted-endpoint recovery (a genuine hardware stall), the P-1 backlog`s
-  two-item aarch64 tail (the port does not compile), and `AO_EXCL` (unbuilt, and its requested flag bit
-  was corrected from `0x400` — which is `AO_APPEND` — to `0x2000` at 1.56.55).
+- **The 3 that remain**: HID `#3`s halted-endpoint recovery (needs a genuine hardware stall), the P-1
+  backlog`s two-item aarch64 tail (the port does not compile), and `AO_EXCL` (unbuilt; its requested
+  flag bit was corrected from `0x400` — which is `AO_APPEND` — to `0x2000` at 1.56.55). None is blocked
+  on a decision; all three are blocked on hardware, a port, or unwritten code.
 
 ⚠ **No `kernel/` source changed in this cut.** The 1.56.55 release binary is unaffected; everything
 here is harness, gate wiring and records.

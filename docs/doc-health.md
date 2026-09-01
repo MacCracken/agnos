@@ -17,9 +17,14 @@ type: state
 > control agreed for the wrong reason. The tagged text is left byte-identical with a `⚠ CORRECTED AT
 > 1.56.56` pointer above it; the correction itself lives in the 1.56.56 section.
 >
-> ✅ **`docs/development/issues/` — 7 open → 4.** `syscall-96-fork`, `open-ao-nofollow` and
-> `tri-corner-bound` archived, each with its Status header rewritten to a resolution note first. They
-> were being held open for **cyrius** peers, which is another repo`s backlog counted in this one.
+> ✅ **`docs/development/issues/` — 7 open → 3.** `syscall-96-fork`, `open-ao-nofollow`,
+> `tri-corner-bound` and `shakti-privilege-model-kernel-gap` archived, each with its Status header
+> rewritten to a resolution note first. The first three were being held open for **cyrius** peers,
+> which is another repo`s backlog counted in this one. ⛔⛔ **The fourth was asking for a ruling that had
+> existed since 2026-05-12** — agnosticos `planning/identity-and-authorization-model.md`, which rejects
+> "Account/uid as multi-user primitive" and "Sudo-and-retype-password for privilege" by name. The audit
+> missed it by grepping **agnos** for a **cross-repo architectural** question. ⇒ **agnos is not where
+> AGNOS architecture is ruled; agnosticos is. Search the genesis repo before recording "no decision".**
 > ⛔ **Two findings had been written up as new issue files and should not have been** — the `#92`
 > ABI-table gap is fully characterised known work (now a `roadmap.md` OPEN row) and the `ring3-smoke`
 > one described defects that do not exist. Both removed. ⇒ **A finding is not automatically a file.**

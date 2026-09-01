@@ -1,4 +1,68 @@
-# shakti privilege-model kernel gap — what AGNOS needs for a `sudo` equivalent
+# shakti privilege-model kernel gap — ANSWERED: agnos grows identity, but NOT uid, and not `sudo`
+
+**Status:** ✅ **RESOLVED — THE RULING EXISTS AND PREDATES THIS FILE BY A MONTH. Closed 2026-08-31.**
+
+⛔⛔ **THIS ISSUE`S CENTRAL CLAIM WAS FALSE, AND THE ERROR WAS SEARCHING THE WRONG REPO.** Every version
+of this header said the ask was *"a RULING, NOT CODE"* and that *"none is recorded"* — the 2026-08-31
+re-audit even asserted *"a full grep of `docs/` finds only restatements of the open question, never an
+answer."* That grep covered **agnos** only. This is a cross-repo architectural question and the ruling
+lives where architecture is decided: the **agnosticos** genesis repo, in
+[`docs/development/planning/identity-and-authorization-model.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/identity-and-authorization-model.md)
+— *"Identity & Authorization Model — Recognition Over Interrogation"*, **Last Updated 2026-05-12**,
+i.e. **five weeks BEFORE this issue was filed on 2026-06-16.** ⇒ **agnos is not where this gets ruled,
+and an agnos issue asking for the ruling was the wrong instrument from the start.**
+
+## The ruling, quoted
+
+> **Architectural commitment**: **recognition over interrogation; authorization > authentication.**
+
+Its rejection table answers both halves of this file directly:
+
+| Empire layer | What AGNOS rejects it for |
+|---|---|
+| **`Account/uid as multi-user primitive`** | *"Permissions are fine-grained by capability (`kavach`, `t-ron`)"* |
+| **`Sudo-and-retype-password for privilege`** | *"Physical presence + capability token = intent verification"* |
+
+> **Multi-user via avatara overlay, not via uid.** Same kernel process space, different identity
+> contexts. Each user`s data sits behind their `sigil` identity; their `kavach` capabilities are theirs.
+
+⇒ **BOTH P0s IN THIS FILE ARE ANSWERED "NO", AND NOT BY DEFAULT — BY COMMITMENT.** agnos does grow an
+identity model, and it covers **users and agents** both (`sigil` roots user identity, `t-ron` holds the
+agent-side gates, `avatara` carries the overlay, `kavach` holds per-action capability). What it does
+**not** grow is a per-process `uid`/`gid` credential in the process table, because coarse-grained-by-user
+is the specific thing the ruling rejects. `getuid`#15 returning 0 is not a gap awaiting a decision; it
+is the decision. So are `planning/ipc.md`s *"No uid/gid anywhere"* and `proc.cyr`s matching guardrail —
+they are **downstream of this ruling**, which earlier audits read as doctrine-without-authority.
+
+## What this means for shakti
+
+shakti is a `sudo`/`doas` equivalent — privilege **de-escalation from root via uid**. That primitive is
+not merely absent on agnos; its shape is explicitly rejected (*"proving identity to your own device is
+security theater"*; sudo-and-retype-password is a named empire pattern). ⇒ **shakti 0.8.x should
+re-scope to *Linux + aarch64 only; AGNOS N/A by architecture*** — which is exactly the outcome this
+file listed as legitimate. The AGNOS-side equivalent of "elevate for a dangerous action" already has an
+owner: `kavach` per-action capability gates plus physical presence, with `libro` as the audit chain.
+
+## What agnos still owes — small, and NOT a credential model
+
+The identity work is **userland** (`sigil`/`avatara`/`kavach`/`t-ron`), and the ruling says so outright:
+*"The architecture doesn`t need new subsystems — it needs the framework across the existing ones."*
+Its phasing puts multi-user at **Phase 4, post-public-beta**. Two kernel-side notes, carried forward:
+
+1. **Two kernel comments promise the wrong seam.** `syscall.cyr`s `#75-80` block band says the
+   `BLK_RW_ARM_MAGIC` token is a placeholder for *"when agnos grows per-proc caps"*, and `power.cyr`s
+   reboot gate says *"a uid check would be a gate that is always open."* Under the ruling the gate they
+   are standing in for is a **kavach capability check**, not a kernel uid — the placeholders are right,
+   their named successor is wrong. Corrected in-place at 1.56.56.
+2. **`kybernet` is the kernel-adjacent consumer**, not agnos: the ruling assigns it *"PID 1 sets up the
+   user-session context, attaches the recognized user`s avatara to console / tty / agnoshi"*, and notes
+   its current MVP is single-user no-recognition. Any future agnos-side work arrives as a kybernet
+   requirement, through that door.
+
+⚠ **The `#75-80` aegis capability gate is unblocked by this too** — it was listed here as riding on the
+same unmade ruling. It rides on `kavach`, and always did.
+
+**Original title:** shakti privilege-model kernel gap — what AGNOS needs for a `sudo` equivalent
 
 **Status:** 🟠 **OPEN — AND THE ASK IS A RULING, NOT CODE.** Re-verified 2026-08-30 against 1.56.54. Both P0s are genuinely absent: `getuid`#15 is still `return 0` (root), there is no uid/gid/cred array in `proc.cyr`, and neither `spawn`#3/#43 nor `execwait`#37 takes a credential argument. ⛔ **What is missing is a DECISION, and the repo's own doctrine leans hard toward declining**: `planning/ipc.md` §Identity says *"No uid/gid anywhere"*, and `proc.cyr` carries a matching guardrail. But doctrine is not an answer to a sibling repo, and none is recorded. ⇒ **If the ruling is "single-user always-root is the end state"**, the close is a doc edit and shakti re-scopes 0.8.x to *Linux + aarch64 only; AGNOS N/A by kernel design*. **If it is "yes"**, this is a LARGE arc (per-proc credentials, a user table, credential arguments on exec) that needs slotting. Either answer unblocks shakti; silence does not. ⚠ Also carried here: the `#75-80` block band's aegis capability gate depends on this same ruling. ⚠ Sub-items have MOVED since filing: P1 caller-supplied argv+envp **shipped** (argv 1.43.x, envp 1.44.19), P2 PTY is **partial** (`#97` band with PTY endowment; no termios), and P3 `getppid` has no syscall but ppid is now readable via `proclist`#99's record.
 

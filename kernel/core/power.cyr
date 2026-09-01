@@ -361,7 +361,14 @@ fn power_off() {
 # Linux's reboot(2) carries them, and it applies here verbatim.
 #
 # It is also the privilege gate, deliberately: `getuid` is hardcoded 0 and there is
-# no uid model, so a uid check would be a gate that is always open. An init-only
+# no uid model, so a uid check would be a gate that is always open.
+# ⭐ 1.56.56 — AND THAT IS PERMANENT, NOT PROVISIONAL. agnosticos
+# `planning/identity-and-authorization-model.md` (2026-05-12) rejects "Account/uid as multi-user
+# primitive" outright in favour of "fine-grained by capability (kavach, t-ron)", and rejects
+# "Sudo-and-retype-password for privilege" in favour of "physical presence + capability token".
+# `getuid` returning 0 is the decision, not a gap awaiting one — so this magic-token gate is not
+# waiting to be replaced by a uid check. Its eventual successor is a kavach capability gate in
+# userland. An init-only
 # (pid == 0) check would make a shell builtin a silent no-op, since agnsh runs as
 # its own pid. Magic-token arming is the established idiom in this tree — the same
 # shape as blk_rw_armed.

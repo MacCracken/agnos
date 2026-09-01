@@ -8079,7 +8079,15 @@ var blk_sc_bounce[512];   # 4096 B — one-LBA bounce (backends DMA into kernel 
 # agnos has no per-proc capability/uid yet (proc.cyr: "NOT Unix uid", auth-posture),
 # so this default-off + explicit-magic-arm is the boundary: a raw disk write can
 # never happen accidentally/incidentally, and the arm call is the exact seam where an
-# aegis/shakti installer-capability check lands when agnos grows per-proc caps.
+# aegis installer-capability check lands.
+# ⛔ 1.56.56 — AND THE SUCCESSOR NAMED HERE WAS WRONG. This said the check arrives "when agnos grows
+# per-proc caps", implying a kernel credential. agnosticos `planning/identity-and-authorization-model.md`
+# (2026-05-12) rules the opposite and by name: "Account/uid as multi-user primitive" is REJECTED —
+# "Permissions are fine-grained by capability (kavach, t-ron)" — and multi-user is "via avatara overlay,
+# not via uid. Same kernel process space, different identity contexts." So agnos is NOT growing per-proc
+# credentials; the gate this token stands in for is a KAVACH capability check in userland, and `shakti`
+# (a uid-de-escalating sudo equivalent) is N/A on agnos by architecture, not merely unbuilt.
+# ⇒ The placeholder is still correct and still default-off; only its successor was misnamed.
 var blk_rw_armed     = 0;
 var BLK_RW_ARM_MAGIC = 0x424C4B5F5257;   # "BLK_RW" — deliberate-arm token (not a plausible mode value)
 
