@@ -138,6 +138,11 @@ run_gate "1.40.x exec-from-disk (run /bin/prog2 + ENOEXEC)" "EXEC_SELFTEST=1 EXT
 # stopped COMPILING (two `ksyscall` calls passed 3 args to a 4-arity function, which cyrius made a hard
 # error). Both fixed 2026-08-05. A selftest nothing runs is not coverage; it is a comment.
 run_gate "1.41.5 syscall hardening + epoll no-hang"  "SYSCALL_HARDEN_SELFTEST=1"                "syscall-harden-smoke.sh"
+# ⛔ 1.56.55 — ADDED. This smoke carries the ONLY regression test for `proc_alloc_slot`s reuse scan
+# (`ring3: nonlifo reuse OK`), plus the ring-3 preempt gate and `sched_yield`#44 slice donation, and it
+# was in NO sweep row — so the 1.56.55 allocator change had to be verified by hand. It was also red
+# for a harness reason (a 40 s dwell that truncated its own tail); fixed in the smoke, 8/8 now.
+run_gate "1.44.x ring-3 procs, preempt gate, slot reuse, yield#44" "RING3_SELFTEST=1"           "ring3-smoke.sh"
 
 # --- 1.56.40 channel band (#97): the RING-3 half, and the only place §9.9's kill criteria can be met ---
 # ⛔ The boot selftest structurally cannot close either: it runs under the KERNEL's CR3 (so it says

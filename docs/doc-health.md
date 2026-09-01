@@ -6,12 +6,38 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-08-31 (**1.56.55 — the open-issue folder re-audited; see the 1.56.55 block**). Prior: 2026-08-29 (**1.56.52 — both audit P0s closed** — see the 2026-08-29 block; the 2026-08-28 block below it records the sweep that produced the backlog). **⛔ THE MULTI-MINOR LAG HAPPENED A THIRD TIME, AND THIS FILE PREDICTED IT TWICE.** The ledger sat at **v1.44.9** from 2026-06-10 to 2026-08-28 — **~12 minors** (1.45.x net/server, 1.46.x SMP, 1.47.x-1.49.x, 1.50.x-1.53.x, the 1.54.x-1.56.x GPU/display/shader arcs) — with state.md/roadmap/CHANGELOG kept per-cut and the body docs un-swept, which is verbatim the failure the two notes below describe. The stated fix ("fold a doc-health touch into the cycle-OPEN sweep") was never adopted. ⚠ **This refresh is NOT that catch-up sweep** — it records only what 1.56.51 actually touched. The body docs (`README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`) remain unswept since 1.44.9 and their syscall counts, sizes and subsystem tables should be assumed stale — the surface has since grown to **0-101**.
+> **Last refresh**: 2026-08-31 (**1.56.56 — a CHANGELOG correction and the issues folder 7 → 4; see the 1.56.56 block**). Prior: 1.56.55 (the open-issue re-audit). Prior: 2026-08-29 (**1.56.52 — both audit P0s closed** — see the 2026-08-29 block; the 2026-08-28 block below it records the sweep that produced the backlog). **⛔ THE MULTI-MINOR LAG HAPPENED A THIRD TIME, AND THIS FILE PREDICTED IT TWICE.** The ledger sat at **v1.44.9** from 2026-06-10 to 2026-08-28 — **~12 minors** (1.45.x net/server, 1.46.x SMP, 1.47.x-1.49.x, 1.50.x-1.53.x, the 1.54.x-1.56.x GPU/display/shader arcs) — with state.md/roadmap/CHANGELOG kept per-cut and the body docs un-swept, which is verbatim the failure the two notes below describe. The stated fix ("fold a doc-health touch into the cycle-OPEN sweep") was never adopted. ⚠ **This refresh is NOT that catch-up sweep** — it records only what 1.56.51 actually touched. The body docs (`README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`) remain unswept since 1.44.9 and their syscall counts, sizes and subsystem tables should be assumed stale — the surface has since grown to **0-101**.
+>
+> ### 1.56.56 (2026-08-31) — a correction, and the issues folder actually shrinking
+>
+> ⛔ **`CHANGELOG.md` 1.56.55 carried a wrong claim and it is corrected, not rewritten.** That entry
+> said `ring3-smoke.sh` had "two red assertions"; it had none. Its 40 s `qemu_dwell` truncated the
+> selftest before its last three markers printed, which made `gate held` look deterministic (it never
+> printed) and `yield OK` look flaky (it printed only when a boot got far enough) — on HEAD too, so the
+> control agreed for the wrong reason. The tagged text is left byte-identical with a `⚠ CORRECTED AT
+> 1.56.56` pointer above it; the correction itself lives in the 1.56.56 section.
+>
+> ✅ **`docs/development/issues/` — 7 open → 4.** `syscall-96-fork`, `open-ao-nofollow` and
+> `tri-corner-bound` archived, each with its Status header rewritten to a resolution note first. They
+> were being held open for **cyrius** peers, which is another repo`s backlog counted in this one.
+> ⛔ **Two findings had been written up as new issue files and should not have been** — the `#92`
+> ABI-table gap is fully characterised known work (now a `roadmap.md` OPEN row) and the `ring3-smoke`
+> one described defects that do not exist. Both removed. ⇒ **A finding is not automatically a file.**
+>
+> ✅ **`roadmap.md`** — `#92` ABI-table row added. ✅ **`state.md`** — open-issue rollup and the measured
+> gate tallies (`sweep.sh` 25/1 over 26 gates, `check.sh` 31/1). ✅ **`scripts/`** — `ring3-smoke.sh`
+> dwell 40 s → 120 s and wired into `sweep.sh`, so `proc_alloc_slot`, the ring-3 preempt gate and
+> `sched_yield`#44 are covered by the command that gets run.
 >
 > ### 1.56.55 (2026-08-31) — the open-issue folder re-audited, and four gates that could not fail
 >
-> ✅ **`docs/development/issues/` — all 7 open files re-verified against the live tree, NOTHING was
-> archived, and 2 new records were filed** (`gpu-op-92-abi-table-nine-ops-behind`, `ring3-smoke-not-in-sweep-two-red-assertions`) — 9 open. Two records that read as finished were not: `fork`#96 was hiding two multi-child defects,
+> ✅ **`docs/development/issues/` — all 7 open files re-verified against the live tree; THREE ARCHIVED
+> (`syscall-96-fork`, `open-ao-nofollow`, `tri-corner-bound`), leaving 4.** Each got its Status header
+> rewritten to a resolution note before the move, per the archiving rule. ⛔ **Two findings were briefly
+> written up as new issue files and should not have been**: the `#92` ABI-table gap is fully
+> characterised known work and belongs in `roadmap.md`s OPEN table (an issues file is for something to
+> investigate), and the `ring3-smoke` one described two defects that turned out not to exist. Both
+> removed. ⇒ **A finding is not automatically a file.** Fix it, or put it where the work is tracked. Two records that read as finished were not: `fork`#96 was hiding two multi-child defects,
 > and the `#92` corner-bound fix has no mutation coverage on **op 0x09**, the burned op the operator
 > ruling was actually about. Headers rewritten on `syscall-96-fork` (now 🟠, open on the cyrius peer),
 > `open-ao-nofollow` (now tracks its three unswept residuals; `AO_EXCL` handed to its own file),

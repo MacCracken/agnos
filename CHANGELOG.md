@@ -20,6 +20,59 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.56.56] — 2026-08-31 — the two red assertions were one truncated log, and three records that were done
+
+### Corrected — 1.56.55 reported two `ring3-smoke` defects that do not exist
+
+- ⛔⛔ **BOTH WERE ONE HARNESS BUG WEARING TWO DISGUISES, AND THE 1.56.55 NOTES ARE WRONG ABOUT THEM.**
+  That entry reads *"`ring3-smoke.sh` is not in `sweep.sh`, and two of its assertions are red … `ring3:
+  gate held` fails deterministically on HEAD too … `ring3: yield OK` is a load-sensitive timing ratio
+  that flakes on both trees."* The kernel is fine. `ring3-smoke.sh`s `qemu_dwell` was **40 s** and
+  `RING3_SELFTEST` does not finish in 40 s, so the last three markers — `ring3: yield OK`,
+  `ring3: gate held`, `ring3: done` — fell off the end of the captured log. `gate held` is the LAST
+  assertion before `done`, so it never printed at all and looked deterministic; `yield OK` printed only
+  when a boot happened to get that far, so it looked flaky.
+- ⭐ **THE TELL WAS IN THE LOG THE WHOLE TIME.** `ring3: Y=54 A=38284` satisfies the `A > Y*10` ratio by
+  70x, and the very next statement in `main.cyr` is the `yield OK` kprintln. ⇒ **A missing marker whose
+  precondition is visible on the line above it is a truncated log, not a failed assertion.**
+- ⛔ **AND THE CONTROL THAT LOOKED DECISIVE PROVED THE WRONG THING.** "It also fails on HEAD" was
+  measured (`git stash push -- kernel/`, rebuild, run) and was TRUE — but the dwell was 40 s on HEAD
+  too, so the control reproduced the harness bug rather than isolating a kernel one. Six QEMU boots
+  went into a flake table for a defect that was not there. A baseline that shares the suspect
+  condition is not a baseline.
+- **Dwell raised to 120 s: 8/8 assertions pass and `ring3: done` prints.**
+
+### Added — `ring3-smoke.sh` is a sweep gate
+
+- It carries the **only** regression test for `proc_alloc_slot`s reuse scan (`ring3: nonlifo reuse OK`)
+  — the code 1.56.55 changed to stop reusing an exited-but-unreaped child`s slot — plus the ring-3
+  preempt gate and `sched_yield`#44 slice donation, and it was in **no** sweep row. The 1.56.55
+  allocator change therefore had to be verified by hand. `sweep.sh` is now **26 gates, 25 passed /
+  1 failed**; the single red is `check.sh`s syscall-ABI gate, which reports `#96 fork` and `#102 lstat`
+  absent from cyrius and stays red by design until those peers land in that repo.
+
+### Changed — the issues folder: 7 open → 4, and two records that should never have been files
+
+- ✅ **ARCHIVED, each with its Status header rewritten to a resolution note first**: `syscall-96-fork`,
+  `open-ao-nofollow`, `tri-corner-bound-coordinate-frame`. All three were **complete on the agnos side**
+  at 1.56.55 and were being held open waiting on **cyrius** peers. ⛔ That was the wrong reason to keep
+  a record open: agnos does not modify cyrius, and those asks are filed and tracked *in cyrius*, so an
+  open agnos issue for them is another repo`s backlog double-counted in this one.
+- ⛔ **TWO FINDINGS WERE WRITTEN UP AS NEW ISSUE FILES AND SHOULD NOT HAVE BEEN.** The `#92` ABI-table
+  gap is fully characterised known work with nothing to investigate — it belongs in `roadmap.md`s OPEN
+  table, and is now a row there. The `ring3-smoke` one described two defects that turned out not to
+  exist (above). Both files removed. ⇒ **A finding is not automatically a file.** Fix it, or put it
+  where the work is already tracked; an issues folder that grows on every audit stops being a list of
+  what is wrong and becomes a list of what was noticed.
+- **The 4 that remain are each blocked on something that is not code**: the shakti privilege-model
+  ruling (operator), HID `#3`s halted-endpoint recovery (a genuine hardware stall), the P-1 backlog`s
+  two-item aarch64 tail (the port does not compile), and `AO_EXCL` (unbuilt, and its requested flag bit
+  was corrected from `0x400` — which is `AO_APPEND` — to `0x2000` at 1.56.55).
+
+⚠ **No `kernel/` source changed in this cut.** The 1.56.55 release binary is unaffected; everything
+here is harness, gate wiring and records.
+
+
 ## [1.56.55] — 2026-08-31 — fork was correct by accident three times over, and four gates could not fail
 
 ### Fixed — the `#92` corner-bound fix had no coverage on the op the ruling was about
@@ -44,6 +97,13 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   into the destination address only, and `tri_rgba.s` bounds `px` by `s6 = w` and `py` by `s7 = h`.
 
 ### Known — filed, not fixed
+
+> ⚠ **CORRECTED AT 1.56.56 — the second bullet below is WRONG and is left as tagged.** `ring3-smoke.sh`
+> had no red assertions: its 40 s `qemu_dwell` truncated the selftest before its last three markers
+> printed. `gate held` never printed at all (so it looked deterministic) and `yield OK` printed only
+> when a boot got far enough (so it looked flaky) — on HEAD too, which is why the control agreed. At a
+> 120 s dwell all 8 pass. The first bullet still stands, except that the `#92` gap is carried as a
+> `roadmap.md` row rather than an issue file. See the 1.56.56 section.
 
 - **The `#92` ABI table is nine ops and nine reason codes behind the kernel.** It documents ops
   `0x00`-`0x08` and reasons `1`-`20`; the kernel ships `0x00`-`0x10` and `1`-`29`, and

@@ -57,7 +57,17 @@ cp "$OVMF_VARS" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 echo "=== AGNOS 1.44.x preemptive ring-3 smoke ==="
 LOG="$LOGS/ring3.log"
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
-qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
+# ⛔⛔ 1.56.55 — 40 s WAS TOO SHORT AND THE TAIL OF THE SELFTEST FELL OFF THE END. RING3_SELFTEST
+# runs ~10 sub-tests, and the last three markers (`ring3: yield OK`, `ring3: gate held`, `ring3: done`)
+# landed after the dwell expired, so the smoke reported them "not found". That read as two defects that
+# do not exist: `gate held` looked like a DETERMINISTIC preempt-gate regression (it never printed), and
+# `yield OK` looked FLAKY (it printed only when the boot happened to get that far). Measured: at
+# QEMU_TIMEOUT=120 all eight assertions pass and `ring3: done` prints; at 40 the log simply stops
+# mid-selftest, most often right after the `ring3: Y= A=` line — with the ratio it needed already in it.
+# ⭐ THE TELL WAS IN THE LOG THE WHOLE TIME: `ring3: Y=54 A=38284` satisfies `A > Y*10` by 70x, and the
+# very next statement is the `yield OK` kprintln. A missing marker whose PRECONDITION is visible in the
+# line above it is a truncated log, not a failed assertion.
+qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-120}" \
     qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \

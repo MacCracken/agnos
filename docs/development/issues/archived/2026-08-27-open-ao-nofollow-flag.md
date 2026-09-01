@@ -1,6 +1,10 @@
 # `open`(7) has no no-follow flag — a check-then-write TOCTOU that ring 3 cannot close
 
-**Status:** 🟠 **`AO_NOFOLLOW` SHIPPED 1.56.53 AND WORKS; THIS FILE NOW TRACKS ITS THREE UNSWEPT RESIDUALS.** Re-audited 2026-08-31 against 1.56.55.
+**Status:** ✅ **RESOLVED — `AO_NOFOLLOW` SHIPPED 1.56.53, RESIDUALS SWEPT 1.56.55. Archived 2026-08-31.** The flag works and now has everything a shipped flag needs on the agnos side: an ABI row in §3.3 (missing for two cuts), and a real gate — `ext2-write-smoke.sh` asserted every other `ext2w:` marker but not `Wlstat no-follow`, so a kernel ignoring the flag entirely would have scored a PASS. Both fixed; `PASS: Wlstat (AO_NOFOLLOW refuses a symlink at the final component)` runs in the sweep.
+⚠ **Two items live elsewhere, deliberately, and neither belongs in an agnos issue:** the cyrius `AO_NOFOLLOW = 0x1000` constant is cyrius`s (ring 3 cannot name the flag until it lands; no peer issue was ever filed for it, unlike `#63`/`#70`/`#96`/`#102`), and `whirl` 0.6.13 still carries this as open kernel ask **B2**, unaware the flag shipped — that is a note for whirl, not open agnos work.
+⇒ **`AO_EXCL` moved out** to [`2026-08-31-open-ao-excl-flag.md`](2026-08-31-open-ao-excl-flag.md), filed by a second consumer (crab). ⚠ That filing asked for `0x400`, which is **`AO_APPEND`** — this file`s own flag table shows it. Corrected to `0x2000`.
+
+**Superseded status (kept for the arc):** 🟠 `AO_NOFOLLOW` SHIPPED 1.56.53 AND WORKS; THIS FILE NOW TRACKS ITS THREE UNSWEPT RESIDUALS. Re-audited 2026-08-31 against 1.56.55.
 ⇒ **`AO_EXCL` has moved out.** It is its own record now — [`2026-08-31-open-ao-excl-flag.md`](2026-08-31-open-ao-excl-flag.md), filed by a second consumer (crab) — so this file no longer carries it. ⚠ Note for whoever implements it: that filing originally asked for `0x400`, which is **`AO_APPEND`**; the corrected bit is `0x2000`. This issue's own flag table below shows `AO_APPEND = 0x400` and is what should have been read.
 ⛔ **What shipped reached the kernel and nothing else, which is why the flag is still unusable from ring 3 by name:**
 1. **No ABI row.** §3.3's flag table stopped at `AO_DIRECTORY 0x800` for two cuts — the flag shipped and the one artifact ring-3 authors read never mentioned it. `lstat`#102, minted by the *same* cut, got a full row. ✅ **Fixed 1.56.55.**
