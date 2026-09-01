@@ -121,6 +121,96 @@ fn exfat_cluster_sector(c) {
     return exfat_cluster_heap_offset + (c - 2) * exfat_sectors_per_cluster;
 }
 
+# 1.56.57 — statfs#103 on exFAT: count FREE clusters from the ALLOCATION BITMAP.
+#
+# ⛔⛔ exFAT HAS NO FREE-CLUSTER FIELD ANYWHERE IN THE BOOT SECTOR. Unlike ext2 (which keeps a live
+# `s_free_blocks_count` its allocator maintains), exFAT records allocation state ONLY in the allocation
+# bitmap — a regular file located through the 0x81 directory entry, one bit per cluster, 0 = free.
+# So an honest answer requires reading and popcounting it. There is no cached number to report and no
+# hint to trust; this scans.
+# ⚠ THE BITMAP IS CHAIN-READ, NOT CONTIGUOUS. This file's own note says why: *"System files — bitmap,
+# upcase — carry no NoFatChain flag, so they read via the chain."* Assuming contiguity would read the
+# right number of bytes from the wrong clusters on any fragmented volume — and would look perfectly
+# plausible on the unfragmented one a smoke builds.
+# ⚠ Bit i covers cluster i+2 (clusters number from 2). The loop is bounded by `exfat_cluster_count`
+# bits AND by `exfat_bitmap_length` bytes, whichever is smaller — a bitmap shorter than the cluster
+# count is a malformed volume, not something to read past.
+#
+# COST: `exfat_cluster_count / 8` bytes, read one sector at a time through `exfat_data_buf` with a
+# one-sector cache, so at most one block read per 512 bytes of bitmap. For a 1 TB volume at 128 KB
+# clusters that is ~1 KB; the cost only becomes real with very small clusters on a very large disk.
+# This is a UI capacity query, not a hot path.
+fn exfat_count_free_clusters() {
+    if (exfat_bitmap_cluster < 2) { return 0 - 1; }
+    if (exfat_bytes_per_cluster <= 0) { return 0 - 1; }
+    var total_bits = exfat_cluster_count;
+    var total_bytes = (total_bits + 7) / 8;
+    if (total_bytes > exfat_bitmap_length) { total_bytes = exfat_bitmap_length; }
+    var free_n = 0;
+    var bi = 0;                       # byte index into the bitmap file
+    var cur_c = exfat_bitmap_cluster; # cluster of the bitmap file we are currently inside
+    var cur_idx = 0;                  # which cluster-of-the-file that is
+    var cached = 0 - 1;               # which LBA exfat_data_buf holds
+    while (bi < total_bytes) {
+        var want = bi / exfat_bytes_per_cluster;
+        while (cur_idx < want) {
+            cur_c = exfat_next_cluster(cur_c);
+            if (cur_c < 2) { return 0 - 1; }                      # chain ended early — malformed
+            if (cur_c >= exfat_cluster_count + 2) { return 0 - 1; }
+            cur_idx = cur_idx + 1;
+        }
+        var inoff = bi % exfat_bytes_per_cluster;
+        var sec = exfat_cluster_sector(cur_c) + (inoff / 512);
+        if (cached != sec) {
+            if (exfat_blk_read(sec, &exfat_data_buf) != 0) { return 0 - 1; }
+            cached = sec;
+        }
+        var byte = load8(&exfat_data_buf + (inoff % 512));
+        var k = 0;
+        while (k < 8) {
+            if (bi * 8 + k < total_bits) {
+                if (((byte >> k) & 1) == 0) { free_n = free_n + 1; }
+            }
+            k = k + 1;
+        }
+        bi = bi + 1;
+    }
+    return free_n;
+}
+
+# 1.56.57 — statfs#103 path control on exFAT. Same shape and same reasoning as the FAT one: mirror
+# `exfat_open`’s resolution without the read, using the non-locking inner helpers because the statfs
+# arm holds `fs_spin_lock` across the call and that lock does not nest. An empty leaf is the mount
+# point itself and is accepted.
+fn exfat_statfs_path_ok(name, namelen) {
+    if (exfat_active == 0) { return 0; }
+    # ⛔ 1.56.57 — mount root detected BEFORE resolve_parent, for the same reason as the FAT arm: a
+    # leading-slash path drives leaf_len to 0 and resolve_parent refuses it, making an after-the-fact
+    # empty-leaf test unreachable. A path that is empty or all slashes IS the mount point.
+    var only_sl = 1;
+    var si = 0;
+    while (si < namelen) { if (load8(name + si) != 47) { only_sl = 0; } si = si + 1; }
+    if (only_sl == 1) { return 1; }
+    var res[24];
+    var dir_clus = exfat_resolve_parent(name, namelen);
+    if (dir_clus < 0) { return 0; }
+    if (exfat_leaf_len == 0) { return 1; }
+    if (exfat_find_in_dir(dir_clus, name + exfat_leaf_off, exfat_leaf_len, &res) != 1) { return 0; }
+    return 1;
+}
+
+# 1.56.57 — statfs#103 exFAT fill (§4.7). f_bsize is the CLUSTER size, matching the FAT arm and the
+# unit contract ext2 uses with its blocks. ⚠ exFAT has no reservation, so f_bavail == f_bfree.
+fn exfat_fill_statfs(buf) {
+    var fre = exfat_count_free_clusters();
+    if (fre < 0) { return 0 - 1; }    # bitmap unreadable — refuse rather than report a guess
+    store64(buf +  0, exfat_bytes_per_cluster);
+    store64(buf +  8, exfat_cluster_count);
+    store64(buf + 16, fre);
+    store64(buf + 24, fre);
+    return 0;
+}
+
 # Follow the FAT chain: next cluster after `c`, or 0 on EOC / bad / error.
 # exFAT FAT is 32-bit; EOC = 0xFFFFFFFF, bad = 0xFFFFFFF7. Caches the
 # consulted FAT sector. § 2.

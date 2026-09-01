@@ -710,6 +710,115 @@ fn fatfs_read(cluster, buf, maxlen) {
 # Raw FAT entry value at `cluster` (0=free, EOC/bad, or next-cluster).
 # Distinct from fat_next_cluster (which maps EOC/bad → 0); the allocator
 # needs the raw value to spot a free (==0) entry. -1 on IO error.
+# 1.56.57 — statfs#103 on FAT: count FREE data clusters by walking the FAT.
+#
+# ⛔⛔ THIS MUST NOT USE `fat_get_entry`, AND THAT IS THE WHOLE REASON IT EXISTS AS A SEPARATE
+# FUNCTION. `fat_get_entry` is a CHAIN-FOLLOW accessor: it maps every end-of-chain marker to 0
+# (`if (v32 >= 0x0FFFFFF8) { return 0; }`, and the FAT16/FAT12 arms do the same) so a caller walking a
+# chain stops cleanly. That makes a FREE cluster and the LAST CLUSTER OF EVERY FILE indistinguishable
+# through it — both read back 0. Counting zeros that way would report one spurious free cluster per
+# file on the volume: a plausible number, wrong in the direction that overstates free space, and
+# invisible without a host cross-check. So this reads the RAW entry and compares against 0 itself.
+#
+# ⛔ AND THE FSInfo HINT IS NOT AN OPTION HERE, BY agnos`s OWN DESIGN. FAT32 keeps a free-cluster hint
+# at FSInfo+488, but `fat_fsinfo_mark_unknown` deliberately stamps it 0xFFFFFFFF on every write path —
+# agnos declares it stale rather than maintaining it. Reading it back would be reading our own
+# "unknown" marker and reporting it as a count.
+#
+# COST: one pass over the in-use portion of FAT #0, `fatfs_sectors_per_fat` sectors at worst, through
+# the existing one-sector `fatfs_fat_buf` cache — so at most one block read per FAT sector, not per
+# cluster. Bounded, and this is a UI capacity query, not a hot path.
+# ⚠ Clusters are numbered from 2; entries 0 and 1 are reserved and are not free space.
+fn fat_count_free_clusters() {
+    var free_n = 0;
+    var c = 2;
+    var last = fatfs_count_of_clusters + 1;      # inclusive: cluster indices 2 .. count+1
+    while (c <= last) {
+        var fat_off = 0;
+        if (fatfs_type == 16) { fat_off = c * 2; }
+        if (fatfs_type == 32) { fat_off = c * 4; }
+        if (fatfs_type == 12) { fat_off = c + (c / 2); }
+        var sec = fatfs_fat_start + (fat_off / 512);
+        var off = fat_off % 512;
+        if (fatfs_fat_buf_sector != sec) {
+            if (fat_blk_read(sec, &fatfs_fat_buf) != 0) { return 0 - 1; }
+            fatfs_fat_buf_sector = sec;
+        }
+        var raw = 0;
+        if (fatfs_type == 16) {
+            raw = load8(&fatfs_fat_buf + off) | (load8(&fatfs_fat_buf + off + 1) << 8);
+        }
+        if (fatfs_type == 32) {
+            raw = load8(&fatfs_fat_buf + off) | (load8(&fatfs_fat_buf + off + 1) << 8) | (load8(&fatfs_fat_buf + off + 2) << 16) | (load8(&fatfs_fat_buf + off + 3) << 24);
+            raw = raw & 0x0FFFFFFF;
+        }
+        if (fatfs_type == 12) {
+            # ⚠ A FAT12 entry can straddle two sectors; take the second byte from the next one.
+            var b0 = load8(&fatfs_fat_buf + off);
+            var b1 = 0;
+            if (off == 511) {
+                if (fat_blk_read(sec + 1, &fatfs_fat_buf) != 0) { return 0 - 1; }
+                fatfs_fat_buf_sector = sec + 1;
+                b1 = load8(&fatfs_fat_buf + 0);
+            } else {
+                b1 = load8(&fatfs_fat_buf + off + 1);
+            }
+            var v12 = b0 | (b1 << 8);
+            if ((c & 1) == 1) { raw = v12 >> 4; } else { raw = v12 & 0x0FFF; }
+        }
+        if (raw == 0) { free_n = free_n + 1; }
+        c = c + 1;
+    }
+    return free_n;
+}
+
+# 1.56.57 — statfs#103 path control on FAT. Mirrors what `fatfs_open` does to resolve a path, minus
+# the read: resolve the parent, then require the leaf to exist. ⚠ CALLER HOLDS `fs_spin_lock` — these
+# are the non-locking inner helpers, chosen precisely so the statfs arm can hold ONE lock across the
+# whole operation without re-entering a spinlock that does not nest.
+# ⚠ An EMPTY leaf means the path IS the mount point ("/mnt/fat", or "/" on a root FAT mount). That
+# always exists when the backend is mounted, and is the common case for a capacity query — so it is
+# accepted without a directory search rather than refused for having no filename.
+fn fat_statfs_path_ok(name, namelen) {
+    if (fatfs_active == 0) { return 0; }
+    # ⛔⛔ 1.56.57 — THE MOUNT ROOT MUST BE DETECTED *BEFORE* resolve_parent, NOT AFTER IT.
+    # A first draft tested `fatfs_leaf_len == 0` after the call, and that line was UNREACHABLE for any
+    # path with a leading slash: `fatfs_resolve_parent("/", 1)` finds last_slash=0, sets leaf_len to
+    # 1-0-1 = 0, and its own `if (fatfs_leaf_len < 1) { return 0 - 1; }` guard then bails — so the
+    # caller sees dir_clus < 0 and refuses. `statfs("/")` on a ROOT-MOUNTED FAT was therefore rejected,
+    # which is the normal configuration for this backend (vfs_mount_init gives FAT "/" whenever ext2
+    # is absent) and the single most likely path a capacity query would ever pass.
+    # ⭐ The bug survived its own gate because the gate asked about "/mnt/fat" — the one spelling that
+    # works, since a mount-relative remainder of length 0 takes resolve_parent's no-slash arm. The
+    # smoke now asks about "/" too.
+    # ⇒ A path that is empty or consists ONLY of slashes IS the mount point. It exists whenever the
+    # backend is mounted, so accept it without a directory search.
+    var only_sl = 1;
+    var si = 0;
+    while (si < namelen) { if (load8(name + si) != 47) { only_sl = 0; } si = si + 1; }
+    if (only_sl == 1) { return 1; }
+    var result[16];
+    var dir_clus = fatfs_resolve_parent(name, namelen);
+    if (dir_clus < 0) { return 0; }
+    if (fatfs_leaf_len == 0) { return 1; }
+    if (fatfs_find_in_dir(dir_clus, name + fatfs_leaf_off, fatfs_leaf_len, &result) != 1) { return 0; }
+    return 1;
+}
+
+# 1.56.57 — statfs#103 FAT fill (§4.7). f_bsize is the CLUSTER size, so f_blocks/f_bfree are cluster
+# counts and `f_blocks * f_bsize` is the volume size — the same unit contract ext2 uses with its blocks.
+# ⚠ FAT has no reservation concept, so f_bavail == f_bfree. Stated, not silently equal.
+fn fat_fill_statfs(buf) {
+    var bsz = fatfs_bytes_per_sector * fatfs_sectors_per_cluster;
+    var fre = fat_count_free_clusters();
+    if (fre < 0) { return 0 - 1; }               # a FAT read failed — refuse rather than report a guess
+    store64(buf +  0, bsz);
+    store64(buf +  8, fatfs_count_of_clusters);
+    store64(buf + 16, fre);
+    store64(buf + 24, fre);
+    return 0;
+}
+
 fn fat_get_entry(cluster) {
     var fat_offset = 0;
     if (fatfs_type == 16) { fat_offset = cluster * 2; }

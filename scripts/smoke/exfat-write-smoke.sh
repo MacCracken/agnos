@@ -229,6 +229,22 @@ strings "$LOG" | grep -q "^vfsrf: exFAT whole-file read past 4KB OK" \
     || { echo "  FAIL: 1.40.1 vfs_read_file over exFAT (no 'whole-file read past 4KB OK')"; rc=1; }
 # 1.41.7: syscall write path over exFAT — open(AO_WRONLY|CREAT|TRUNC)+write+close
 # (VFS_SEC_WFILE -> vfs_write_on -> exfat_write_file) then read-back.
+# Wstatfs on exFAT: statfs#103's exFAT backend (1.56.57). ⛔ NOTE WHAT IS AND IS NOT CHECKED HERE.
+# f_bsize is cross-checked against a HARNESS-KNOWN value (`mkfs.exfat -c 512` above; fsck.exfat -v
+# confirms "cluster size: 512.00 B" on the same image). f_bfree has NO host oracle — fsck.exfat
+# reports geometry but no free count, unlike FAT's mtools `minfo` and ext2's `debugfs -R stats` — so
+# it rests on the in-kernel live arm: write a file, require the count to drop. That is stated rather
+# than papered over, because a reader comparing the three backends' gates should know exFAT's is the
+# weakest of them and why.
+strings "$LOG" | grep -E "^exfatw: Wstatfs (bsize|free after)" | sed 's/^/  /'
+if strings "$LOG" | grep -q "exfatw: Wstatfs OK"; then
+    echo "  PASS: Wstatfs on exFAT (cluster size is the mkfs 512, path resolved, bitmap count is live)"
+elif strings "$LOG" | grep -q "exfatw: Wstatfs MISMATCH"; then
+    echo "  FAIL: Wstatfs on exFAT — see the named exfatw: Wstatfs line(s) above"; rc=1
+else
+    echo "  FAIL: Wstatfs exFAT marker absent entirely (selftest did not run?)"; rc=1
+fi
+
 strings "$LOG" | grep -q "^syswr: exFAT write+readback OK" \
     && echo "  PASS: 1.41.7 syscall write+read-back over exFAT (open/write/close ABI)" \
     || { echo "  FAIL: 1.41.7 syscall exFAT write (no 'syswr: exFAT write+readback OK')"; rc=1; }

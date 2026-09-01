@@ -9348,14 +9348,31 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
         if (is_user_range(arg3, 32) == 0) { stack_canary_check(canary); return 0 - 1; }
         var be103 = vfs_resolve_mount(arg1, arg2);
-        if (be103 != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
-        # ⚠ THE PATH MUST RESOLVE. Without this a statfs of a nonexistent path would happily report the
-        # root volume`s numbers — and an implementation that ignored its path argument entirely would
-        # pass every plausibility check a selftest can make about the numbers themselves.
+        # ⚠ THE PATH MUST RESOLVE, ON EVERY BACKEND. Without it a statfs of a nonexistent path would
+        # happily report the volume`s numbers — and an implementation that ignored its path argument
+        # entirely would pass every plausibility check a selftest can make about the numbers themselves.
+        # It is the control that caught the 1.56.56 mutation, and all three arms carry it or the two new
+        # backends would ship with a weaker gate than the one they are joining.
+        # ⛔⛔ ONE LOCK, AND ONLY NON-LOCKING CALLEES INSIDE IT. `fs_spin_lock` is a plain xchg spinlock
+        # (smp.cyr) with NO reentrancy, so calling `vfs_open_on` — which takes it itself — from in here
+        # would deadlock the box outright. The FAT/exFAT arms therefore use the same inner helpers
+        # `fatfs_open`/`exfat_open` use beneath the lock (`*_resolve_parent` + `*_find_in_dir`), never
+        # the wrapped VFS entry points.
         fs_spin_lock();
-        var fsino = ext2_path_lookup(arg1, arg2);
-        if (fsino <= 0) { fs_spin_unlock(); stack_canary_check(canary); return 0 - 1; }
-        var fsr = ext2_fill_statfs(arg3);
+        var fsr = 0 - 1;
+        if (be103 == FS_EXT2) {
+            if (ext2_path_lookup(arg1, arg2) > 0) { fsr = ext2_fill_statfs(arg3); }
+        }
+        if (be103 == FS_FAT) {
+            var froff = arg1 + vfs_mnt_reloff;
+            var frlen = arg2 - vfs_mnt_reloff;
+            if (fat_statfs_path_ok(froff, frlen) == 1) { fsr = fat_fill_statfs(arg3); }
+        }
+        if (be103 == FS_EXFAT) {
+            var xroff = arg1 + vfs_mnt_reloff;
+            var xrlen = arg2 - vfs_mnt_reloff;
+            if (exfat_statfs_path_ok(xroff, xrlen) == 1) { fsr = exfat_fill_statfs(arg3); }
+        }
         fs_spin_unlock();
         stack_canary_check(canary);
         return fsr;

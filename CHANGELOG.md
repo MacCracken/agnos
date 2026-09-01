@@ -20,6 +20,60 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.56.57] — 2026-08-31 — statfs answers on all three filesystems, and the mount root was refused on two of them
+
+### Added — `statfs`#103 on FAT and exFAT
+
+- `#103` shipped ext2-only at 1.56.56. All three backends answer it now, each filling the same §4.7
+  record with its own allocation unit as `f_bsize` — an ext2 **block**, a FAT or exFAT **cluster** —
+  so `f_blocks * f_bsize` is the volume size on all three.
+- ⛔⛔ **NEITHER FAT NOR exFAT KEEPS A FREE COUNT, AND FAT`s HINT IS UNUSABLE BY agnos`s OWN DESIGN.**
+  FAT32 has an FSInfo free-cluster hint at offset 0x1E8 — and `fat_fsinfo_mark_unknown` stamps it
+  `0xFFFFFFFF` from **twelve** mutation sites. agnos declares that hint stale rather than maintaining
+  it, so reading it back would be reading our own "unknown" marker and reporting it as a count. exFAT
+  has no such field at all: allocation state lives only in the **allocation bitmap**. ⇒ Both scan. FAT
+  walks the FAT counting raw `0` entries (one block read per FAT sector, via the existing one-sector
+  cache); exFAT popcounts zero bits in the bitmap (one read per 512 B). Both return -1 on a read error
+  rather than reporting a guess.
+- ⭐ **THE FAT SCAN MUST READ RAW ENTRIES, AND THAT IS THE TRAP.** `fat_get_entry` is a chain-follow
+  accessor: it maps every end-of-chain marker to `0` so a walker stops cleanly. Through it, a FREE
+  cluster and THE LAST CLUSTER OF EVERY FILE are indistinguishable — counting zeros that way overstates
+  free space by one cluster per file. Plausible, wrong in the flattering direction, and invisible
+  without a host cross-check.
+- ⚠ `f_bavail == f_bfree` on both — neither format has a reservation concept. Asserted as an equality,
+  not left to coincidence.
+
+### Fixed — `statfs("/")` was REFUSED on a root-mounted FAT, and the first gate was green over it
+
+- ⛔ `fatfs_resolve_parent("/")` finds the slash at index 0, computes `leaf_len = 0`, and its own
+  `if (fatfs_leaf_len < 1) { return 0 - 1; }` guard then bails — so the empty-leaf accept downstream
+  was **unreachable for any leading-slash path**. `statfs("/")` failed on a root-mounted FAT, which is
+  the normal configuration whenever ext2 is absent, and the likeliest path a capacity query ever takes.
+  exFAT had the identical shape. Both now detect a path that is empty or all-slashes as the mount point
+  **before** calling `resolve_parent`.
+- ⭐ **THE FIRST VERSION OF THE GATE ASKED ONLY ABOUT `/mnt/fat`** — the one spelling that works, since
+  a mount-relative remainder of length 0 takes `resolve_parent`s no-slash arm. It passed. The bug was
+  found by an independent read of the code, not by the test written for it. The gate now asks about
+  `/` and about a trailing slash as well; removing the fix turns both arms red by name.
+
+### Verified — against independent oracles, not self-reports
+
+- **FAT**: `bsize=1024 blocks=129023`, cross-checked against `fsck.fat -n -v` on a rebuilt copy of the
+  same image — *"1024 bytes per cluster"*, *"129023 data clusters"*, bit-for-bit. The smoke also
+  captures mtools `minfo`s `free clusters=` **on the pristine image before boot**, because agnos
+  invalidates FSInfo during the run and a post-boot capture silently yields an empty string (measured).
+  The kernel`s count must not EXCEED that baseline — which is precisely what the `fat_get_entry` trap
+  would produce.
+- **exFAT**: `bsize=512` against the harness`s `mkfs.exfat -c 512`; `blocks=133120` × 512 = the 68 MiB
+  partition; free `133052 → 133046` after a 3000-byte write — **exactly 6 clusters** at 512 B each.
+- ⚠ **exFAT has NO host free-count oracle** (`fsck.exfat -v` reports geometry only, unlike FAT`s
+  `minfo` and ext2`s `debugfs`), so its gate rests on the in-kernel live arm. Stated in the smoke
+  itself, because a reader comparing the three gates should know which is weakest and why.
+- **Mutations, each caught by its own named arm**: inverting the exFAT bitmap polarity reports
+  `free=68` and it rises to `74` after the write → `f_bfree did not drop after a write`; removing the
+  FAT mount-root detection → `Wstatfs REFUSED the mount root /` plus the trailing-slash arm.
+
+
 ## [1.56.56] — 2026-08-31 — two syscalls shipped, a ruling found in the repo that owns it, and 7 open issues → 2
 
 ### Added — `AO_EXCL = 0x2000` on `open`#7

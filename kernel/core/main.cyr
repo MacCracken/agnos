@@ -1810,6 +1810,74 @@ if (fatfs_active == 1) {
     }
     if (rxn_ok == 1) { kprintln("fatw: fatrootext readback OK", 28); }
     else { kprintln("fatw: fatrootext readback FAIL", 30); }
+
+    # === Wstatfs-FAT: statfs#103 on the FAT backend (1.56.57) =====================
+    # ⛔ THE LIVE ARM IS THE ONE THAT MATTERS. f_bsize and f_blocks are static geometry — a wrong
+    # implementation can hardcode them and pass. Only "write a file and watch f_bfree DROP" separates a
+    # real count from a constant, and on FAT the count comes from a full FAT scan, so this also proves
+    # the scan runs and reads raw entries. ⚠ The host cross-check in the smoke (mtools `minfo` reports
+    # `free clusters=`) is the independent oracle; nothing in the kernel can supply that.
+    var fsf = 1;
+    var fsfb[32];
+    if (ksyscall(103, "/mnt/fat", 8, &fsfb) != 0) {
+        fsf = 0; kprintln("fatw: Wstatfs returned nonzero for /mnt/fat", 43);
+    }
+    var ff_bs = load64(&fsfb +  0);
+    var ff_tb = load64(&fsfb +  8);
+    var ff_fb = load64(&fsfb + 16);
+    var ff_av = load64(&fsfb + 24);
+    kprint("fatw: Wstatfs bsize=", 20); kprint_num(ff_bs);
+    kprint(" blocks=", 8); kprint_num(ff_tb);
+    kprint(" free=", 6); kprint_num(ff_fb);
+    kprint(" avail=", 7); kprint_num(ff_av); kprintln("", 0);
+
+    if (ff_bs != fatfs_bytes_per_sector * fatfs_sectors_per_cluster) { fsf = 0; kprintln("fatw: Wstatfs f_bsize disagrees with the mount", 46); }
+    if (ff_tb != fatfs_count_of_clusters) { fsf = 0; kprintln("fatw: Wstatfs f_blocks disagrees with the mount", 47); }
+    if (ff_fb > ff_tb) { fsf = 0; kprintln("fatw: Wstatfs f_bfree exceeds f_blocks", 38); }
+    # FAT has no reservation, so available and free must be identical — not merely close.
+    if (ff_av != ff_fb) { fsf = 0; kprintln("fatw: Wstatfs f_bavail != f_bfree on FAT", 40); }
+
+    # ⛔⛔ THE MOUNT ROOT ITSELF. This smoke root-mounts FAT (its image has no ext2, so vfs_mount_init
+    # gives FAT "/"), and "/" is the single most likely path a capacity query ever passes. It was
+    # REFUSED until 1.56.57: fatfs_resolve_parent("/") drives leaf_len to 0 and bails, so the
+    # empty-leaf accept downstream never ran. The first version of this gate asked only about
+    # "/mnt/fat" — the one spelling that works — and was green over the bug.
+    if (ksyscall(103, "/", 1, &fsfb) != 0) {
+        fsf = 0; kprintln("fatw: Wstatfs REFUSED the mount root /", 38);
+    }
+    # And a trailing slash must behave the same as no trailing slash.
+    if (ksyscall(103, "/mnt/fat/", 9, &fsfb) != 0) {
+        fsf = 0; kprintln("fatw: Wstatfs REFUSED /mnt/fat/ (trailing slash)", 48);
+    }
+
+    # ⛔ A NONEXISTENT PATH ON THE FAT MOUNT MUST BE REFUSED — the control that catches an arm which
+    # ignores its path and answers the volume regardless.
+    if (ksyscall(103, "/mnt/fat/NOSUCH.XXX", 19, &fsfb) >= 0) {
+        fsf = 0; kprintln("fatw: Wstatfs answered for a NONEXISTENT path", 45);
+    }
+
+    # ⛔ THE LIVE CHECK. Create a file on FAT and require f_bfree to drop.
+    # ⚠ Uses fatfs_write_file directly, the same call the rest of this selftest uses, rather than
+    # open#7 — this arm is about whether the FREE COUNT MOVES, not about the fd path, and routing it
+    # through the syscall layer would make a failure here ambiguous between the two.
+    var fsfb2[32];
+    var fsg_name[8];    # ⚠ BYTES, not slots — a function-local var x[N] allocates N BYTES in Cyrius. This held [4] and the 8 store8s below ran 4 bytes off the end of it; check-array-sizing.sh caught it.
+    store8(&fsg_name + 0, 87); store8(&fsg_name + 1, 83); store8(&fsg_name + 2, 70);   # "WSF"
+    store8(&fsg_name + 3, 71); store8(&fsg_name + 4, 46); store8(&fsg_name + 5, 66);   # "G.B"
+    store8(&fsg_name + 6, 73); store8(&fsg_name + 7, 78);                              # "IN"
+    var fsg_rc = fatfs_write_file(&fsg_name, 8, &fatfs_file_buf, 3000);
+    if (fsg_rc != 0) { fsf = 0; kprintln("fatw: Wstatfs could not write its growth file", 45); }
+    else {
+        if (ksyscall(103, "/mnt/fat", 8, &fsfb2) != 0) { fsf = 0; kprintln("fatw: Wstatfs second call failed", 32); }
+        else {
+            var ff_fb2 = load64(&fsfb2 + 16);
+            kprint("fatw: Wstatfs free after write=", 31); kprint_num(ff_fb2); kprintln("", 0);
+            if (ff_fb2 >= ff_fb) { fsf = 0; kprintln("fatw: Wstatfs f_bfree did not drop after a write", 48); }
+        }
+    }
+
+    if (fsf == 1) { kprintln("fatw: Wstatfs OK", 16); }
+    else          { kprintln("fatw: Wstatfs MISMATCH", 22); }
     # 1.40.13 mount-namespace: drive the real shell write verbs against the FAT
     # mount at /mnt/fat. This is the routing fix's whole point — the verbs reach
     # FAT *through the shell while ext2 owns "/"* (exactly the iron config: ext2
@@ -2265,6 +2333,70 @@ if (exfat_active == 1) {
         if (exfat_find_in_dir(shx_clus, "SUBD2", 5, &shx_d2) == 1) { kprintln("exfatw: subdir renamed-dir OK", 29); }
         else { kprintln("exfatw: subdir renamed-dir FAIL", 31); }
     } else { kprintln("exfatw: subdir parent-missing FAIL", 34); }
+
+    # === Wstatfs-exFAT: statfs#103 on the exFAT backend (1.56.57) =================
+    # ⛔ exFAT HAS NO FREE-CLUSTER FIELD, so f_bfree comes from popcounting the ALLOCATION BITMAP —
+    # and there is NO host oracle for it either (fsck.exfat -v reports cluster and volume size, not a
+    # free count, unlike FAT's mtools `minfo` and ext2's `debugfs -R stats`). ⇒ THE LIVE ARM CARRIES
+    # THIS GATE ALONE: write a file, require the count to DROP. That is the only assertion here a
+    # constant or a mis-scanned bitmap cannot satisfy, and it also proves the chain-walk runs.
+    var xsf = 1;
+    var xsfb[32];
+    if (ksyscall(103, "/mnt/exfat", 10, &xsfb) != 0) {
+        xsf = 0; kprintln("exfatw: Wstatfs returned nonzero for /mnt/exfat", 47);
+    }
+    var xf_bs = load64(&xsfb +  0);
+    var xf_tb = load64(&xsfb +  8);
+    var xf_fb = load64(&xsfb + 16);
+    var xf_av = load64(&xsfb + 24);
+    kprint("exfatw: Wstatfs bsize=", 22); kprint_num(xf_bs);
+    kprint(" blocks=", 8); kprint_num(xf_tb);
+    kprint(" free=", 6); kprint_num(xf_fb);
+    kprint(" avail=", 7); kprint_num(xf_av); kprintln("", 0);
+
+    # The harness builds this volume with `mkfs.exfat -c 512`, so the cluster size is a KNOWN value,
+    # not a self-reported one. fsck.exfat -v confirms "cluster size: 512.00 B" on the same image.
+    if (xf_bs != 512) { xsf = 0; kprintln("exfatw: Wstatfs f_bsize is not the mkfs 512", 43); }
+    if (xf_bs != exfat_bytes_per_cluster) { xsf = 0; kprintln("exfatw: Wstatfs f_bsize disagrees with the mount", 48); }
+    if (xf_tb != exfat_cluster_count) { xsf = 0; kprintln("exfatw: Wstatfs f_blocks disagrees with the mount", 49); }
+    if (xf_tb <= 0) { xsf = 0; kprintln("exfatw: Wstatfs f_blocks is not positive", 40); }
+    if (xf_fb > xf_tb) { xsf = 0; kprintln("exfatw: Wstatfs f_bfree exceeds f_blocks", 40); }
+    # exFAT has no reservation, so available and free must be identical — not merely close.
+    if (xf_av != xf_fb) { xsf = 0; kprintln("exfatw: Wstatfs f_bavail != f_bfree on exFAT", 44); }
+    # ⛔ A ZERO free count would satisfy every bound above. The bitmap on a freshly-made 32 MiB volume
+    # is overwhelmingly zero bits, so a scan that read the wrong clusters, or popcounted the wrong
+    # polarity, would land here.
+    if (xf_fb == 0) { xsf = 0; kprintln("exfatw: Wstatfs f_bfree is zero on a fresh volume", 49); }
+
+    # The mount root, and a trailing slash, must both be accepted — the FAT arm shipped a bug here.
+    if (ksyscall(103, "/mnt/exfat/", 11, &xsfb) != 0) {
+        xsf = 0; kprintln("exfatw: Wstatfs REFUSED /mnt/exfat/ (trailing slash)", 52);
+    }
+    # And a nonexistent name under it must be REFUSED.
+    if (ksyscall(103, "/mnt/exfat/NOSUCH.XXX", 21, &xsfb) >= 0) {
+        xsf = 0; kprintln("exfatw: Wstatfs answered for a NONEXISTENT path", 47);
+    }
+
+    # ⛔ THE LIVE CHECK — the one assertion no host oracle can replace here.
+    var xsfb2[32];
+    var xsg_name[10];   # ⚠ BYTES, not slots — see the FAT twin above; this held [4] against 10 store8s.
+    store8(&xsg_name + 0, 88); store8(&xsg_name + 1, 83); store8(&xsg_name + 2, 71);   # "XSG"
+    store8(&xsg_name + 3, 82); store8(&xsg_name + 4, 79); store8(&xsg_name + 5, 87);   # "ROW"
+    store8(&xsg_name + 6, 46); store8(&xsg_name + 7, 66); store8(&xsg_name + 8, 73);   # ".BI"
+    store8(&xsg_name + 9, 78);                                                          # "N"
+    var xsg_rc = exfat_write_file(&xsg_name, 10, &exfat_file_buf, 3000);
+    if (xsg_rc != 0) { xsf = 0; kprintln("exfatw: Wstatfs could not write its growth file", 47); }
+    else {
+        if (ksyscall(103, "/mnt/exfat", 10, &xsfb2) != 0) { xsf = 0; kprintln("exfatw: Wstatfs second call failed", 34); }
+        else {
+            var xf_fb2 = load64(&xsfb2 + 16);
+            kprint("exfatw: Wstatfs free after write=", 33); kprint_num(xf_fb2); kprintln("", 0);
+            if (xf_fb2 >= xf_fb) { xsf = 0; kprintln("exfatw: Wstatfs f_bfree did not drop after a write", 50); }
+        }
+    }
+
+    if (xsf == 1) { kprintln("exfatw: Wstatfs OK", 18); }
+    else          { kprintln("exfatw: Wstatfs MISMATCH", 24); }
     sh_exec("cat /mnt/exfat/SHEXDIR/SUBKEEP.TXT", 34);
     # 1.40.1 exec-from-disk bite 1: whole-file read past the 4 KB memfile cap
     # (vfs_read_file) over exFAT.

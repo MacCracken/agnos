@@ -43,7 +43,7 @@ OVMF_CODE=""; for c in $OVMF_CODE_CANDIDATES; do [ -f "$c" ] && { OVMF_CODE="$c"
 OVMF_VARS_SRC=""; for c in $OVMF_VARS_CANDIDATES; do [ -f "$c" ] && { OVMF_VARS_SRC="$c"; break; }; done
 [ -z "$OVMF_CODE" ] || [ -z "$OVMF_VARS_SRC" ] && { echo "ERROR: OVMF not found"; exit 1; }
 
-for tool in qemu-system-x86_64 parted mformat mmd mcopy mdir sgdisk fsck.fat dd strings; do
+for tool in qemu-system-x86_64 parted mformat mmd mcopy mdir minfo sgdisk fsck.fat dd strings; do
     command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: missing tool '$tool'"; exit 1; }
 done
 
@@ -71,6 +71,17 @@ mformat -i "$IMG"@@1048576 -F
 mmd -i "$IMG"@@1048576 ::EFI ::EFI/BOOT ::boot
 mcopy -i "$IMG"@@1048576 "$GNOBOOT" ::EFI/BOOT/BOOTX64.EFI
 mcopy -i "$IMG"@@1048576 "$AGNOS" ::boot/agnos
+
+# ⛔⛔ CAPTURE THE HOST FREE-CLUSTER COUNT NOW, ON THE PRISTINE IMAGE — IT CANNOT BE READ AFTERWARDS.
+# mtools `minfo` reports `free clusters=` from the FAT32 FSInfo sector, and agnos DELIBERATELY stamps
+# that field 0xFFFFFFFF (`fat_fsinfo_mark_unknown`) on every write path — it declares the hint stale
+# rather than maintaining it. So after the boot minfo prints no free-cluster line at all, and a
+# post-boot capture silently yields an empty string. Measured 2026-08-31: exactly that happened.
+# ⚠ This is the FAT analogue of the ext2 smoke`s `BASE_FREE` debugfs capture, and it is the only
+# INDEPENDENT oracle for statfs#103`s f_bfree — everything else the gate checks, the kernel checks
+# about its own numbers.
+BASE_FREE_FAT=$(minfo -i "$IMG"@@1048576 2>/dev/null | sed -n "s/^free clusters=\\([0-9]*\\).*/\\1/p" | head -1)
+echo "  host minfo baseline: free clusters = ${BASE_FREE_FAT:-<none>}"
 
 echo "Booting FATFS_WRITE_SELFTEST kernel (NVMe + GPT, FAT32 ESP)..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
@@ -104,6 +115,35 @@ if ! strings "$LOG" | grep -q "^fatw:"; then
 fi
 
 rc=0
+
+# Wstatfs on FAT: statfs#103's FAT backend (1.56.57). ⛔ THE HOST CROSS-CHECK IS THE POINT. Everything
+# the kernel can check about its own numbers, a hardcoded implementation could satisfy; only an
+# independent oracle catches a wrong count. mtools `minfo` reports `free clusters=` straight off the
+# image, which is exactly the quantity f_bfree claims — the FAT analogue of the ext2 gate's
+# `debugfs -R stats`. ⚠ Compared BEFORE the boot writes anything, against the kernel's FIRST reading.
+strings "$LOG" | grep -E "^fatw: Wstatfs (bsize|free after)" | sed 's/^/  /'
+K_BS=$(strings "$LOG" | sed -n 's/^fatw: Wstatfs bsize=\([0-9]*\) .*/\1/p' | head -1)
+K_FB=$(strings "$LOG" | sed -n 's/^fatw: Wstatfs .*free=\([0-9]*\) .*/\1/p' | head -1)
+H_FREE="$BASE_FREE_FAT"
+if [ -n "$K_FB" ] && [ -n "$H_FREE" ]; then
+    # ⚠ The kernel reads AFTER the selftest's earlier writes, so its count is <= the pristine host
+    # figure. An EQUAL or LOWER count is expected; a HIGHER one means the scan is over-counting free
+    # clusters — which is precisely what using fat_get_entry (EOC maps to 0) would produce.
+    if [ "$K_FB" -le "$H_FREE" ]; then
+        echo "  PASS: statfs f_bfree=$K_FB is consistent with host minfo free=$H_FREE (not over-counting)"
+    else
+        echo "  FAIL: statfs f_bfree=$K_FB EXCEEDS host minfo free=$H_FREE — the FAT scan is counting non-free entries"; rc=1
+    fi
+else
+    echo "  FAIL: could not compare statfs f_bfree (kernel='$K_FB' host='$H_FREE')"; rc=1
+fi
+if strings "$LOG" | grep -q "fatw: Wstatfs OK"; then
+    echo "  PASS: Wstatfs on FAT (geometry agrees with the mount, path resolved, free count is live)"
+elif strings "$LOG" | grep -q "fatw: Wstatfs MISMATCH"; then
+    echo "  FAIL: Wstatfs on FAT — see the named fatw: Wstatfs line(s) above"; rc=1
+else
+    echo "  FAIL: Wstatfs FAT marker absent entirely (selftest did not run?)"; rc=1
+fi
 
 # 1. self-test reported clean create (3a) + write (3b)
 if strings "$LOG" | grep -q "fatw: create NEWFILE.TXT rc=0"; then
