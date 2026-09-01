@@ -10,7 +10,8 @@ type: issue
 
 ## ⭐⭐ STATUS — 1.56.54 (2026-08-30): THIS IS NOW A TWO-ITEM aarch64 TAIL
 
-**Swept 2026-08-30.** P0 **2/2**, P2 **29/29**, P1 **21/26**. The genuinely-open remainder is **two aarch64 items**: `timer.cyr`'s inline asm addressing `[sp,#0]` (frame padding, not the intended local) and `klug.cyr`'s cross-arch leak — and the second is *why* `build.sh --aarch64` does not compile at all, so neither can be verified until the port builds. That makes the aarch64 arc, not this file, the thing to slot.
+**Swept 2026-08-30. Re-counted against the code 2026-08-31 (1.56.55).** P0 **2/2**, P2 **29/29**, P1 **23/26** — ⚠ **not 21**: `iommu.cyr:176` (fixed 1.56.51, by refusing to enable translation at all when devices sit off bus 0) and `msc.cyr:690` (fixed 1.56.52, with a fault-injected gate in `sweep.sh`) were both fixed and never ticked. This file carried **three different tallies at once** — this block said 21, the P1 section header said 16, and the marker count was 21. All three now agree at 23. ⇒ **If a tally and a marker disagree, re-count against the code; do not carry either forward.**
+⚠ **SPLIT RECOMMENDED, NOT YET DONE.** At 92 KB this file is 24 closed items of narrative wrapped around a 2-item live tail. The tail (both aarch64) belongs in its own record and the bulk belongs in `archived/`. ⛔ **A blanket archive would bury five things**: the items in *"Also carried out of the sweep"* are in no table, are still true, and have no other home. Whoever splits this must move them, not just the tables. The genuinely-open remainder is **two aarch64 items**: `timer.cyr`'s inline asm addressing `[sp,#0]` (frame padding, not the intended local) and `klug.cyr`'s cross-arch leak — and the second is *why* `build.sh --aarch64` does not compile at all, so neither can be verified until the port builds. That makes the aarch64 arc, not this file, the thing to slot.
 ⚠ Two further items are deliberately deferred WITH REASONS ON RECORD, not forgotten: the `blk` RW magic-constant gate (the proposed arm reorder is a **measured ABI break** — every caller passes tag 0, implemented and reverted) and `#92` op 0x0C's SMP-safety (shared prep slot + global latches, pre-existing and iron-only).
 ⛔ **Read every severity label here as a LEAD, not a grade — they were wrong in the dangerous direction five times.** `proc.cyr:1830` (filed P2) was a P0; `proc.cyr:1781` (filed P1) could not be fixed as filed, because its suggested fix would itself have been a ring-3 kernel-write primitive; and three filed P2s were not P2 (a remote ring-0 stack read in the DHCP option parser, unauthenticated remote parse-confusion from unhandled IPv4 fragments, and a release CI gate that had never booted a kernel).
 
@@ -108,7 +109,7 @@ area therefore carry a finder's claim with no refuter behind them — treat them
    a wall of assertion failures. See `state.md`'s note on `qemu_dwell_kernel`.
 
 
-## P0 — memory-safety or privilege, reachable from ring 3 or untrusted media — 2 item(s) · 1 FIXED
+## P0 — memory-safety or privilege, reachable from ring 3 or untrusted media — 2 item(s) · 2 FIXED · CLOSED
 
 ### ✅ FIXED 1.56.51 — `kernel/core/elf.cyr:312` — ELF PT_LOAD may be mapped anywhere in the per-process kernel-identity PD window (PD[2..127]), shadowing the kernel's own page tables and heap under the child's CR3
 
@@ -139,7 +140,11 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 **Suggested fix.** Copy the primitive/vertex array out of the shm slot into a per-CPU kernel staging buffer once, validate THAT copy, and have gpu_texl_build/gpu_tri_list read only the copy — the same discipline gpu_shader_op_sys already applies to the 64-byte records via proc_copy_from_user. Then correct the comment at 1895-1896.
 
 
-## P1 — correctness: wrong results, hangs, races, or a load-bearing false comment — 26 item(s) · 16 FIXED + 1 PARTIAL
+## P1 — correctness: wrong results, hangs, races, or a load-bearing false comment — 26 item(s) · 23 FIXED + 1 PARTIAL + 2 OPEN (both aarch64)
+<!-- ⚠ 1.56.55: this header read "16 FIXED + 1 PARTIAL" while the STATUS block at the top of the file
+     said 21/26 and the actual marker count was 21 — three different tallies in one file. Re-counted
+     against the code 2026-08-31: 23 FIXED. The two that were fixed and never marked are
+     `iommu.cyr:176` and `msc.cyr:690`; both now carry their ✅. The remaining 2 are the aarch64 pair. -->
 
 ### `kernel/arch/aarch64/timer.cyr:12` — aarch64 timer/rdtsc inline asm addresses [sp,#0], which is frame padding, not the intended local
 
@@ -157,7 +162,8 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** Serialize the whole handshake under a dedicated fixed-global xchg spinlock (tlb_shootdown_all is a leaf -- it acquires nothing else -- so it fits the smp.cyr lock-order table cleanly), and make the handler's increment atomic (`lock inc [tlb_shoot_ack]`, 0xF0 0x48 0xFF 0x05 or an xadd). The IF=0 mutual-block also needs addressing: either poll for the shootdown vector while spinning (check the LAPIC IRR / call the handler body inline when another shootdown is pending), or use a per-CPU pending-flag array so a spinning sender services incoming requests instead of ignoring them.
 
-### `kernel/arch/x86_64/iommu.cyr:176` — VT-d translation is enabled with root entries and contexts populated for bus 0 only, blocking DMA for every device behind a bridge
+### ✅ FIXED 1.56.51 — `kernel/arch/x86_64/iommu.cyr:176` — VT-d translation is enabled with root entries and contexts populated for bus 0 only, blocking DMA for every device behind a bridge
+> ✅ **Closed by REFUSAL, which is why it was easy to miss when scanning for a rewrite.** `iommu.cyr:230-235` now counts devices whose bus != 0 and, if any exist, prints `iommu: N device(s) off bus 0 - refusing to enable translation` and returns -1 — leaving the machine exactly as it ships today (translation off) rather than enabling it with contexts that would block their DMA. `func` is now taken from `pci_busfunc` too, so multi-function devices stop aliasing onto func 0. The file says why a full multi-bus root-table rework was not attempted: it would be unverifiable here. ⚠ Marked 2026-08-31 — the fix landed at 1.56.51 and the item was never ticked, which is one of the two reasons this section carried three different tallies.
 
 **Mechanism.** iommu_init writes exactly one root entry — `store64(iommu_root_table, ctx | 0x01)` at :159, bus 0 — and leaves entries 1..255 as the memset zeros from :151, i.e. not-present. The context loop at :174-177 then calls `iommu_set_context(0, slot, 0)` with a hardcoded bus 0 and func 0, taking only PciDev_slot from pci_devs and ignoring the real bus/func that pci_record stored in the pci_busfunc side array (pci.cyr:431). Because the caller always passes 0, iommu_set_context's own `if (bus != 0) { return 0 - 1; }` guard at :111 can never fire — it is vacuous at its only call site — and a device at 01:00.0 silently gets a context entry written for bus 0's devfn 0 instead. Line 211 then sets GCMD.TE, so translation is enforced against those tables. Neither iommu_wait_status return (:185, :212) is checked, so a failure to actually latch is invisible.
 
@@ -197,7 +203,8 @@ pmm.cyr:317-321 asserts the opposite as a load-bearing invariant — "the ONLY p
 
 **Suggested fix.** Either bound the index (`if (slot_id < 1) return 0; if (slot_id * MSC_ROW_BYTES + MSC_ROW_BYTES > 4096) return 0;` in msc_row_addr, with every caller checking for 0), or size the table to the slot range actually used (4 pages for 64 slots, or allocate MSC_ROW_BYTES*65 contiguously). Also fix the two contradictory comments at msc.cyr:41 and msc.cyr:47.
 
-### `kernel/arch/x86_64/usb/msc.cyr:690` — A short data phase is accepted as full success; the transferred byte count and dCSWDataResidue are both discarded
+### ✅ FIXED 1.56.52 — `kernel/arch/x86_64/usb/msc.cyr:690` — A short data phase is accepted as full success; the transferred byte count and dCSWDataResidue are both discarded
+> ✅ **Both counts are now recorded and the short phase is REFUSED.** `msc.cyr:737-738` resets `row+88` (bytes the xHC actually moved) and `row+92` (the device`s own dCSWDataResidue claim, advisory) per command so an early return leaves 0 rather than the previous command`s count; `msc.cyr:763` captures `xhci_last_xfer_bytes` at the only point it is still live, before the CSW wait overwrites it. ⭐ **And it has a gate that can fail**: `MSC_SHORT_INJECT` fault-injects the reject path that no in-tree device can otherwise reach, and `scripts/smoke/msc-short-smoke.sh` (in `sweep.sh`) asserts all three arms — the device enumerated, a short phase is refused with both counts reported, and a healthy device is NOT refused, which is the control that makes the first arm mean something. ⚠ Marked 2026-08-31; the fix and its gate landed at 1.56.52 and the item was never ticked.
 
 **Mechanism.** xhci_wait_transfer_for_trb returns 1 for XHCI_CC_SHORT_PACKET whenever residue < expected_len, setting xhci_last_xfer_bytes = expected_len - residue (xhci.cyr:866-876). msc_bbb_exec checks that value for the CSW receive (msc.cyr:710 `if (xhci_last_xfer_bytes < 13)`) but NOT for the data phase (msc.cyr:690) — it only tests the 0/1 return. xhci_last_xfer_bytes is then overwritten by the CSW wait, so the count is unrecoverable by the caller. The CSW's dCSWDataResidue field at csw+8 is never read anywhere in the file (msc.cyr:719-731 reads signature at +0, tag at +4, status at +12 and skips +8). So a device that returns fewer bytes than requested with bCSWStatus = 0 is indistinguishable from a full transfer.
 

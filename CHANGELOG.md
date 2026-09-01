@@ -20,7 +20,127 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
-## [1.56.55] — 2026-08-30 — fork's return value was correct by accident, and the tri bound measured the wrong frame
+## [1.56.55] — 2026-08-31 — fork was correct by accident three times over, and four gates could not fail
+
+### Fixed — the `#92` corner-bound fix had no coverage on the op the ruling was about
+
+- ⛔⛔ **1.56.55 corrected `gpo_validate_tri` (op `0x09`) to the rect-local frame and shipped it with a
+  battery that could not tell.** Every op-0x09 record sat at `dstxy 0` — including the frame-skew case
+  that same cut MOVED to the origin — except `tri: dst runs off the framebuffer`, which returns
+  `GPO_E_DIM` ~90 lines before the corner loop. At `dx=dy=0` the screen and rect-local corner sets are
+  identical by construction, so reverting the bound left the battery **green**. The only discriminating
+  case was op `0x0A`s, which routes to `gpo_validate_trilist` and never to `gpo_validate_tri`: the
+  unburned sibling had the test, the **burned** primary did not.
+- **Two cases added (battery 175 → 177), and the mutation now fails by name**:
+  `edge-abi: FAIL tri: a tiny triangle FAR from the origin clears the bound (rect-local) want 29 got 23`
+  — `GPO_E_NOTIMPL` (bound accepted) against `GPO_E_FRAME` (old bound rejected). Derived, not tuned: a
+  1 px triangle gives `a2 = 65536` (clears `GPU_TRI_AREA_MIN` at equality) and `lim = 67,108,864`; a
+  64x64 rect at (1024, 900) puts `|E|` at 4.16M rect-local and 71.27M in screen coordinates. It needs
+  **both** a tiny triangle and a far rect.
+- ⚠ **Three load-bearing false comments swept**, all calling the vertex frame screen-space when the
+  shader never receives an origin: `syscall.cyr:2725` (inside the corrected function) and the op
+  `0x0A`/`0x0B` per-triangle record layouts at `:1650`/`:1684` — the normative text a ring-3 caller
+  reads. Verified at source: `gpu_tri_prep` takes no `dx`/`dy`, `gpu_tri_dispatch` folds the origin
+  into the destination address only, and `tri_rgba.s` bounds `px` by `s6 = w` and `py` by `s7 = h`.
+
+### Known — filed, not fixed
+
+- **The `#92` ABI table is nine ops and nine reason codes behind the kernel.** It documents ops
+  `0x00`-`0x08` and reasons `1`-`20`; the kernel ships `0x00`-`0x10` and `1`-`29`, and
+  `GPU_OP_SUPPORTED = 0x1FF5F` advertises all of them to ring 3 — including `0x09`, which is burned.
+  The gap is now stated in the doc above the op table; the rows are not written, because deriving nine
+  op contracts from `gpo_validate*` is its own piece of work. ⇒ The durable fix is a **gate** that
+  diffs `GPU_OP_*` and `GPO_E_*` against the tables — `syscall-abi-check.sh` compares syscall NUMBERS
+  and cannot see inside an op-dispatched one. Filed as
+  `issues/2026-08-31-gpu-op-92-abi-table-nine-ops-behind.md`.
+- **`ring3-smoke.sh` is not in `sweep.sh`, and two of its assertions are red.** It carries the only
+  regression test for `proc_alloc_slot`s reuse scan — the code this cut changed — so that change was
+  verified by hand. `ring3: gate held` fails **deterministically on HEAD too** (measured with the
+  kernel changes stashed), and `ring3: yield OK` is a load-sensitive timing ratio that flakes on both
+  trees (HEAD 2/3 pass, patched 1/3 — not meaningful at n=3). ⚠ A single baseline run would have
+  supported the wrong conclusion, that the allocator change broke `sched_yield`; it did not. Adding a
+  knowingly-red gate to the sweep on release eve is an operator call. Filed as
+  `issues/2026-08-31-ring3-smoke-not-in-sweep-two-red-assertions.md`.
+
+### Fixed — `fork`#96 was broken for every case with more than one child
+
+- ⛔⛔ **TWO INDEPENDENT DEFECTS, AND THE SECOND ONE HID THE FIRST.** Adding a second forked child to
+  `tests/fork/forker.cyr` — the only shape that actually exercises wait-any — turned up both:
+  - **`proc_alloc_slot` reused an exited-but-UNREAPED child's slot.** agnos has no zombie state:
+    `exit`#0 sets `state = 0` and deliberately does **not** reap, so the row survives for the parent's
+    `waitpid`. That makes `state == 0` mean both *"free"* and *"waiting for its parent"*, and the scan
+    reused either. Forking twice returned **the same pid twice** (`FORK-MULTI-P1 pid=3` /
+    `FORK-MULTI-P2 pid=3`); child 2 was allocated straight over child 1's exit status before anyone
+    collected it. ⭐ The function's own banner stated the premise fork invalidated: *"safe today
+    because reuse only follows a reap done BY the reaper AFTER it captured the exit code"* — true while
+    every child was reaped synchronously by its spawner, false the moment fork produced the first
+    unreaped child. This is the allocator-side face of the rule the 1.44.15 multi-collapse revert
+    established from the reap side: *"a proc's slot must persist until ITS OWN waitpid reaps it."*
+  - **A reaped slot stayed its parent's child.** `proc_ppid` was cleared in exactly ONE place —
+    `proc_alloc_slot`'s recycle scrub — which runs at slot REUSE, not at reap. A reaped **non-top**
+    slot therefore kept `ppid == parent` + `state == 0`, verbatim the predicate wait-any scans for, so
+    the next `waitpid(-1)` re-matched it, returned its stale code again, and never advanced to the
+    parent's other children. Both `-2` (children live) and `-1` (no children) became unreachable.
+- **The fixes.** `proc_ppid` is cleared on **both** reap doors (`proc_reap`, `proc_reap_child`) — the
+  invariant is *"a reaped slot is nobody's child"*, and it has to hold on both or it returns through
+  the other one, since agnsh reaps foreground jobs via `proc_reap` and is itself a wait-any caller.
+  `proc_alloc_slot` then reuses a dead row only when it is reaped, orphaned, or its parent slot is
+  gone. ⚠ **The orphan clause is load-bearing, not defensive**: nothing in agnos reaps an orphan (the
+  table-full banner says so), so without it a zombie whose parent died unreaping would pin its slot
+  until reboot and march a 16-slot table to full.
+- ⭐ **MUTATION-TESTED ACROSS THREE KERNELS, AND PHASE 1 WAS GREEN IN ALL THREE** — which is exactly how
+  both defects survived: neither fix → `FORK-MULTI-EARLY-NOCHILD` (pid 3 twice); alloc guard only →
+  `FORK-MULTI-DUP` (pids 3 and 4, code 21 returned twice); both → **PASS**. ⛔ Note the masking: while
+  slots were being handed out twice the phantom could not form, so fixing the phantom alone changes
+  nothing observable. A first draft of the record predicted `DUP` for the unfixed kernel; the
+  measurement said `EARLY-NOCHILD`, and the record was corrected from the log rather than the reverse.
+
+### Fixed — four gates that could not fail, three of them green on nothing
+
+- ⛔⛔ **`fork-smoke.sh` WAS MEASURING THE PREVIOUS COMMAND'S KERNEL.** It ran
+  `mcopy … build/agnos ::boot/agnos` at line 64 and `FORK_SELFTEST=1 build.sh` at line 71 — so the ESP
+  received whatever kernel happened to be lying around, and the FORK_SELFTEST kernel the smoke exists
+  to boot was compiled *after* the disk it should have been written to. A standalone run on a tree
+  whose `build/agnos` was a plain kernel reported **all five markers absent**. ⭐ **It read green
+  because `sweep.sh` gives each smoke one retry**: attempt 1 failed while building the correct kernel,
+  attempt 2 booted it and passed. The gate was passing on its own retry, not on its subject. Build now
+  precedes image assembly — and `/bin/forker` is rebuilt too, which it never was, so an edit to
+  `forker.cyr` silently did not reach the boot.
+- ⛔ **`scripts/check/syscall-abi-check.sh` WAS BLIND TO `#96`.** It scans only `kernel/core/syscall.cyr`
+  for the kernel number set, and fork dispatches from `arch/x86_64/syscall_hw.cyr` (the ring-3 entry
+  stub, like `#44`/`#14`). So the kernel set excluded 96, the ABI doc had no `| 96 |` row, cyrius had no
+  `SYS_FORK` — and **all three sources agreed by mutual absence** while a shipped, sweep-gated syscall
+  was undocumented on both sides. The gate's own comment already said *"if the stub gains or loses a
+  number, this is where to add it"*; the instruction was right and was simply not followed. Its
+  `ENTRY_STUB_ONLY` map now carries `96`, and the check reads `kernel 103 · abi-doc 103 · cyrius 101`.
+- ⛔ **`ext2-write-smoke.sh` NEVER ASSERTED THE `AO_NOFOLLOW` MARKER.** `ext2.cyr` prints
+  `ext2w: Wlstat no-follow OK` / `... MISMATCH`, and the smoke asserted every other `ext2w:` marker but
+  not that one — so the gate the 1.56.53 entry and the issue header both cite as proof of the flag was
+  never an assertion, and a kernel ignoring the flag entirely would have scored a PASS. Added, with the
+  MISMATCH arm grepped separately so *failing* and *absent* do not share a message.
+- ⛔ **THIRTEEN SKIP GUARDS ACROSS SIX SMOKES SCORED AS PASSES.** `sweep.sh` scores a gate on exit
+  status alone, and these guards `exit 0` when a prerequisite is missing — so *"this gate measured
+  NOTHING"* rendered as a green tick, in five gates that are in the sweep table
+  (`chan-ring3`, `userwin`, `net-csum`, `msc-short`, `hid-reclaim`, plus `dhcp-opt`). All now exit 1,
+  per the doctrine `syscall-abi-check.sh` already states: *a check that quietly passes when it could
+  not find one of its inputs is a false green.*
+
+### Fixed — the ABI doc was three rows behind its own kernel
+
+- **`| 96 | fork |` added** — a shipped, sweep-gated syscall had no row at all (see the blind gate above).
+- **`#4 waitpid` rewritten.** It documented *"busy-waits until `state==0`"* and a two-valued return; it
+  is neither. It is a **non-blocking three-valued poll** (`exit_code` / `-2` WOULD_BLOCK / `-1`), and
+  `pid < 0` has been **wait-any** since 1.56.54. The row was never touched when that shipped.
+- **`AO_NOFOLLOW = 0x1000` added to §3.3.** The flag shipped at 1.56.53 and reached no doc and no cyrius
+  constant, so the one artifact ring-3 authors read stopped at `AO_DIRECTORY`. ⚠ Its cyrius peer is
+  still owed and, unlike `#63`/`#70`/`#96`/`#102`, was never even filed.
+- ⛔ **`AO_APPEND` (0x400) now carries its hazard.** It is declared in the ABI and in cyrius, **set at
+  runtime today** (cyrius `lib/io.cyr` bridges `O_APPEND` → `0x400` on every append-open), and honoured
+  by **no backend** — the ext2 path never tests the bit and the FAT/exFAT arm says *"AO_APPEND TODO"*.
+  A 2026-08-31 request proposed minting `AO_EXCL` on `0x400` after reading the kernel, where nothing
+  tests it; that would have turned every existing append-open into `EEXIST`. Corrected to `0x2000`.
+
+
 
 ### Fixed — `fork`#96 wrote the child's return value into `r11`
 

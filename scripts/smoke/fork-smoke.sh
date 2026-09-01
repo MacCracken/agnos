@@ -37,6 +37,24 @@ GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"
 AGNOS="$ROOT/build/agnos"
 AGNSH_BIN="${AGNSH_BIN:-$AGNOSHI/build/agnsh_agnos}"
 FORKER="${FORKER_BIN:-$ROOT/tests/fork/build/forker_agnos}"
+# ⛔⛔ 1.56.55 — BUILD BEFORE THE IMAGE IS ASSEMBLED. THIS WAS THE OTHER WAY ROUND AND THE GATE WAS
+# MEASURING THE PREVIOUS COMMAND'S KERNEL. `mcopy … "$AGNOS" ::boot/agnos` ran at what is now line ~72
+# while `FORK_SELFTEST=1 build.sh` ran ~7 lines LATER, so the ESP received whatever `build/agnos`
+# happened to be lying around and the FORK_SELFTEST kernel this smoke exists to boot was compiled
+# after the disk it should have been written to. A first run therefore booted a plain kernel, printed
+# no FORK-* marker at all, and left the right kernel behind for NEXT time.
+# ⭐ AND THAT IS WHY IT LOOKED GREEN: sweep.sh gives each smoke ONE retry, so attempt 1 failed while
+# building the correct kernel and attempt 2 booted it and passed. The gate was passing on its own
+# retry rather than on its subject, and would go red the moment the retry was removed or any other
+# gate rebuilt build/agnos in between. Measured 2026-08-31: a single standalone run on a tree whose
+# build/agnos was a plain kernel reported all five phase-1 markers absent.
+# ⚠ The forker is rebuilt here too. It was NEVER rebuilt by this script — the seed copied a stale
+# tests/fork/build/forker_agnos, so an edit to forker.cyr silently did not reach the boot.
+echo "Building FORK_SELFTEST kernel + /bin/forker (before the image is assembled)..."
+FORK_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/dev/null 2>&1 || { echo "BUILD FAILED (kernel)"; exit 1; }
+( cd "$ROOT/tests/fork" && cyrius build --agnos forker.cyr build/forker_agnos ) >/dev/null 2>&1 \
+    || { echo "BUILD FAILED (forker)"; exit 1; }
+
 [ -f "$GNOBOOT" ] || { echo "ERROR: gnoboot not built at $GNOBOOT"; exit 1; }
 [ -f "$AGNOS" ]   || { echo "ERROR: agnos not built — run ./scripts/build.sh"; exit 1; }
 [ -f "$AGNSH_BIN" ] || { echo "ERROR: agnsh-agnos not built ($AGNSH_BIN)"; exit 1; }
@@ -68,7 +86,6 @@ mkfs.ext2 -F -q -L AGNOS-FORKER -b 4096 -m 0 \
 
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/agnsh.log"
-FORK_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/dev/null 2>&1 || { echo "BUILD FAILED"; exit 1; }
 echo "Booting FORK_SELFTEST kernel (NVMe + ext2 with /bin/forker)..."
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
 
@@ -113,7 +130,12 @@ strings "$LOG" | sed -n '/kybernet: starting init/,$p' | sed 's/^/  /'
 echo ""
 
 rc=0
-for m in "FORKER-ALIVE" "FORK-CHILD" "FORK-CHILD-OK" "FORK-PARENT" "FORK-PARENT-OK"; do
+# ⭐ FORK-MULTI-* (1.56.55) is the TWO-CHILD phase, and it is the half that can actually fail.
+# The five phase-1 markers proved the fork CONTRACT and passed even while `waitpid(-1)` was broken
+# for every case with more than one child: a single child is the top proc slot, so the LIFO collapse
+# in proc_reap_child deleted the row and the stale-ppid phantom could not form. FORK-MULTI-OK is the
+# marker that goes red if either `store64(&proc_ppid + pid * 8, 0)` is removed from proc.cyr.
+for m in "FORKER-ALIVE" "FORK-CHILD" "FORK-CHILD-OK" "FORK-PARENT" "FORK-PARENT-OK" "FORK-MULTI-BEGIN" "FORK-MULTI-OK"; do
     if strings "$LOG" | grep -q "$m"; then
         echo "  PASS: $m"
     else
@@ -121,7 +143,7 @@ for m in "FORKER-ALIVE" "FORK-CHILD" "FORK-CHILD-OK" "FORK-PARENT" "FORK-PARENT-
     fi
 done
 # ⛔ The named failure lines the program emits are more informative than a missing marker — print any.
-strings "$LOG" | grep -E "FORK-FAILED|FORK-COW-LEAK|FORK-WAIT-|FORK-CHILD-STACK-WRONG|FORK-CHILD-WRITE-WRONG|FORK-PARENT-STACK-CLOBBERED" | sed 's/^/  SAID: /'
+strings "$LOG" | grep -E "FORK-FAILED|FORK-COW-LEAK|FORK-WAIT-|FORK-CHILD-STACK-WRONG|FORK-CHILD-WRITE-WRONG|FORK-PARENT-STACK-CLOBBERED|FORK-MULTI-DUP|FORK-MULTI-GHOST|FORK-MULTI-TIMEOUT|FORK-MULTI-EARLY-NOCHILD|FORK-MULTI-WRONG-CODE|FORK-MULTI-NOFORK" | sed 's/^/  SAID: /'
 # ⚠ The box must SURVIVE the fork — a child resuming on a bad context would fault or hang, and the
 # selftest prints this only after sh_exec returns.
 if strings "$LOG" | grep -q "fork: SURVIVED back in kernel"; then

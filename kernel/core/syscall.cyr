@@ -1647,7 +1647,7 @@ var GPU_TRI_FLAG_DERIVE = 0x01;      # synthesise the frame's 3 edges; edge_id a
 
 # ⭐ RUNG 12 — BATCHED TRIANGLES. N triangles from ONE #86 vertex slot in ONE record, so a mesh is a
 # single syscall, a single validation pass and a single arming check instead of N of each.
-# ⚠ The per-triangle record in the vertex slot is 48 BYTES: 6 x i32 screen-space 16.16 vertices
+# ⚠ The per-triangle record in the vertex slot is 48 BYTES: 6 x i32 RECT-LOCAL 16.16 vertices
 # followed by 3 x u32 premultiplied ARGB. Fixed stride so the kernel indexes rather than parses.
 #   +0  vx0 vy0 vx1 vy1 vx2 vy2      (i32, 16.16)
 #   +24 c0  c1  c2                   (u32, premultiplied ARGB)
@@ -1681,7 +1681,7 @@ var GPU_TRI_MAX_PIXELS = 1048576;            # w*h. ⚠ AN ARENA SIZE WEARING A 
 #
 # ⚠ The per-triangle record in the vertex slot is 48 BYTES and is NOT the same shape as op 0x0A's,
 # which packs colours. Here every field is a 16.16 signed coordinate:
-#   +0  vx0 vy0 vx1 vy1 vx2 vy2      (i32, 16.16 screen space)
+#   +0  vx0 vy0 vx1 vy1 vx2 vy2      (i32, 16.16 RECT-LOCAL — not screen; see gpo_validate_tri)
 #   +24 u0  v0  u1  v1  u2  v2       (i32, 16.16 TEXEL space)
 # There is no reserved tail: 12 x 4 = 48 exactly. A future extension takes a new stride constant
 # rather than stealing space that never existed.
@@ -2722,7 +2722,12 @@ fn gpo_validate_tri(rec, fbw, fbh) {
         if (ne * GPU_EDGE_BYTES > load64(&shm_size + e_s * 8)) { return GPO_E_EDGEBUF; }
     }
 
-    # The attribute frame: three 16.16 screen-space vertices, dwords 6..11.
+    # The attribute frame: three 16.16 RECT-LOCAL vertices, dwords 6..11.
+    # ⛔ 1.56.55 — THIS SAID "screen-space" AND IT IS THE FRAME THE BOUND BELOW GOT WRONG. The shader
+    # never sees dx/dy: `gpu_tri_prep(rec_phys, cov_mc, vx0..vy2, ca, cb, cc)` takes no origin, and
+    # `gpu_tri_dispatch(rec_phys, w, h, dx, dy)` folds it into the DESTINATION ADDRESS only. `tri_rgba.s`
+    # computes `px = tgid_x*64 + lane` bounded by `s6 = w` and `py = tgid_y` bounded by `s7 = h`, so it
+    # samples [0,w) x [0,h). The vertices are in that frame.
     var vx0 = gpo_i32(rec + 24);  var vy0 = gpo_i32(rec + 28);
     var vx1 = gpo_i32(rec + 32);  var vy1 = gpo_i32(rec + 36);
     var vx2 = gpo_i32(rec + 40);  var vy2 = gpo_i32(rec + 44);
@@ -3340,6 +3345,30 @@ fn edge_abi_selftest() {
     store32(&d + 32, 1 * 65536); store32(&d + 36, 0);
     store32(&d + 40, 0);         store32(&d + 44, 1 * 65536);
     pass = pass + ea_expect(&d, GPO_E_FRAME, "tri: frame skew beyond the ratio", 32);
+
+    # ⭐⭐ THE CASE THAT DISTINGUISHES THE TWO FRAMES FOR op 0x09 — AND WITHOUT IT THE 1.56.55 FIX HAD
+    # NO COVERAGE AT ALL ON THE OP THE OPERATOR RULING WAS ACTUALLY ABOUT. Measured 2026-08-31: every
+    # op-0x09 record in this battery sat at dstxy 0 — including the frame-skew case above, which the
+    # same cut MOVED to the origin — except `tri: dst runs off the framebuffer`, which returns
+    # GPO_E_DIM ~90 lines before the corner loop and so cannot reach it. At dx=dy=0 the screen and
+    # rect-local corner sets are IDENTICAL by construction, so reverting gpo_validate_tri to `dx`/`dy`
+    # left the battery GREEN. The only discriminating case in the file was op 0x0A`s, which routes to
+    # gpo_validate_trilist and never to gpo_validate_tri — the unburned sibling had the test, the
+    # burned primary did not.
+    # ⚠ Arithmetic, so this is checkable rather than tuned. Same 1 px triangle (a2 = 1<<16 = 65536,
+    # lim = a2 * GPU_TRI_E_RATIO(1024) = 67,108,864), same 64x64 rect, moved to (1024, 900):
+    #   rect-local: |E| at (63, 63)     ~= 63<<16   =  4.1M  <  lim 67.1M  -> clears the bound
+    #   screen:     |E| at (1087, 963)  ~= 1087<<16 = 71.2M  >  lim 67.1M  -> GPO_E_FRAME (the old bug)
+    # ⚠ The record is a DERIVE one, so "cleared the bound" reads as GPO_E_NOTIMPL, not valid — the
+    # DERIVE arm is what answers once the frame check passes. That is the discrimination: NOTIMPL means
+    # the bound accepted, GPO_E_FRAME means it rejected.
+    # ⚠ It needs BOTH properties at once. A 64 px triangle makes `lim` ~1000x either corner value, so
+    # both frames accept and the case proves nothing; a rect at the origin makes the frames coincide.
+    store32(&d + 16, (64 * 65536) + 64);        # 64x64 — small, so both corner values stay under lim
+    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "tri: small rect at the origin, same tiny triangle (the control)", 63);
+    store32(&d + 20, (900 * 65536) + 1024);     # ... and now the SAME rect, far from the origin
+    pass = pass + ea_expect(&d, GPO_E_NOTIMPL, "tri: a tiny triangle FAR from the origin clears the bound (rect-local)", 70);
+    store32(&d + 20, 0);
     store32(&d + 20, 0);
 
     # destination off the right edge of the framebuffer -- REJECT, never clip
@@ -4347,8 +4376,8 @@ fn edge_abi_selftest() {
     # ⚠ 171 -> 173: two cases added at 1.56.52 when op 0x0A gained the frame-skew bound it had been
     # missing — the reject, and the ORIGIN control that keeps it honest. The count is asserted, not
     # printed, so adding a case without updating this line fails the gate rather than passing quietly.
-    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 175 cases correct\n", 22);
-    if (pass == 175) {
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 177 cases correct\n", 22);
+    if (pass == 177) {
         kprint("edge-abi: PASS -- the 0x01..0x06 and 0x08..0x10 ABIs reject every malformed\n", 76);
         kprint("edge-abi: record, and a well-formed one is accepted or correctly reports no-GPU.\n", 81);
         return 1;
@@ -8037,7 +8066,7 @@ fn shm_free(id) {
 # blk_close so the window is bounded instead of lasting the whole boot. (Moving the arm below tag
 # validation was tried and reverted — it breaks the shipped ABI; see blk_open_sys.)
 # Design + security posture:
-#   docs/development/issue/2026-07-09-ring3-block-device-syscalls-for-install.md
+#   docs/development/issues/archived/2026-07-09-ring3-block-device-syscalls-for-install.md
 #
 # Handle model (Phase 1): the handle IS the backend tag (BLK_VIRTIO..BLK_RAMDISK,
 # 1..5), validated against blk_registered — no per-open state. Capacity is exact

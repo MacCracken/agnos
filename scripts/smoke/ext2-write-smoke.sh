@@ -292,6 +292,22 @@ else
     echo "  FAIL: Wsymres symlink resolution"; rc=1
 fi
 
+# ⛔⛔ Wlstat: AO_NOFOLLOW on open(7) (1.56.53) — THE KERNEL PRINTED THIS VERDICT FOR TWO CUTS AND
+# NOTHING READ IT. ext2.cyr emits "ext2w: Wlstat no-follow OK" or "... MISMATCH", and this script
+# asserted every other ext2w: marker but not that one — so the gate the 1.56.53 CHANGELOG and the
+# AO_NOFOLLOW issue both cite as proof of the flag could not go red. A kernel that ignored the flag
+# entirely and opened the symlink would print MISMATCH and still score a PASS here.
+# ⭐ Added 1.56.55, and it is a real assertion, not a marker check: the MISMATCH arm is grepped
+# explicitly so a silently-absent marker (a kernel built without the selftest, say) is distinguished
+# from an actively failing one. Both are rc=1; only the message differs, and the message is the point.
+if strings "$LOG" | grep -q "ext2w: Wlstat no-follow OK"; then
+    echo "  PASS: Wlstat (AO_NOFOLLOW refuses a symlink at the final component)"
+elif strings "$LOG" | grep -q "ext2w: Wlstat no-follow MISMATCH"; then
+    echo "  FAIL: Wlstat — AO_NOFOLLOW opened a SYMLINK (the flag is being ignored)"; rc=1
+else
+    echo "  FAIL: Wlstat no-follow marker absent entirely (selftest did not run?)"; rc=1
+fi
+
 # Wsync: s_state dirty/clean + sync (1.33.3 bite 4) — first write cleared
 # EXT2_VALID_FS (dirty), sync set it back (clean).
 if strings "$LOG" | grep -q "ext2w: Wsync state OK"; then

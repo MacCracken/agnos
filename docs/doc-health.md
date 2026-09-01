@@ -6,7 +6,36 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-08-29 (**1.56.52 — both audit P0s closed** — see the 2026-08-29 block; the 2026-08-28 block below it records the sweep that produced the backlog). **⛔ THE MULTI-MINOR LAG HAPPENED A THIRD TIME, AND THIS FILE PREDICTED IT TWICE.** The ledger sat at **v1.44.9** from 2026-06-10 to 2026-08-28 — **~12 minors** (1.45.x net/server, 1.46.x SMP, 1.47.x-1.49.x, 1.50.x-1.53.x, the 1.54.x-1.56.x GPU/display/shader arcs) — with state.md/roadmap/CHANGELOG kept per-cut and the body docs un-swept, which is verbatim the failure the two notes below describe. The stated fix ("fold a doc-health touch into the cycle-OPEN sweep") was never adopted. ⚠ **This refresh is NOT that catch-up sweep** — it records only what 1.56.51 actually touched. The body docs (`README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`) remain unswept since 1.44.9 and their syscall counts, sizes and subsystem tables should be assumed stale — the surface has since grown to **0-101**.
+> **Last refresh**: 2026-08-31 (**1.56.55 — the open-issue folder re-audited; see the 1.56.55 block**). Prior: 2026-08-29 (**1.56.52 — both audit P0s closed** — see the 2026-08-29 block; the 2026-08-28 block below it records the sweep that produced the backlog). **⛔ THE MULTI-MINOR LAG HAPPENED A THIRD TIME, AND THIS FILE PREDICTED IT TWICE.** The ledger sat at **v1.44.9** from 2026-06-10 to 2026-08-28 — **~12 minors** (1.45.x net/server, 1.46.x SMP, 1.47.x-1.49.x, 1.50.x-1.53.x, the 1.54.x-1.56.x GPU/display/shader arcs) — with state.md/roadmap/CHANGELOG kept per-cut and the body docs un-swept, which is verbatim the failure the two notes below describe. The stated fix ("fold a doc-health touch into the cycle-OPEN sweep") was never adopted. ⚠ **This refresh is NOT that catch-up sweep** — it records only what 1.56.51 actually touched. The body docs (`README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`) remain unswept since 1.44.9 and their syscall counts, sizes and subsystem tables should be assumed stale — the surface has since grown to **0-101**.
+>
+> ### 1.56.55 (2026-08-31) — the open-issue folder re-audited, and four gates that could not fail
+>
+> ✅ **`docs/development/issues/` — all 7 open files re-verified against the live tree, NOTHING was
+> archived, and 2 new records were filed** (`gpu-op-92-abi-table-nine-ops-behind`, `ring3-smoke-not-in-sweep-two-red-assertions`) — 9 open. Two records that read as finished were not: `fork`#96 was hiding two multi-child defects,
+> and the `#92` corner-bound fix has no mutation coverage on **op 0x09**, the burned op the operator
+> ruling was actually about. Headers rewritten on `syscall-96-fork` (now 🟠, open on the cyrius peer),
+> `open-ao-nofollow` (now tracks its three unswept residuals; `AO_EXCL` handed to its own file),
+> `hid-drain-rearm` (two live defects found inside the 1.56.52 rewrite), `open-ao-excl` (the proposed
+> flag bit was `AO_APPEND`), and `p1-audit-sweep-backlog` (three disagreeing tallies reconciled to 23/26).
+>
+> ✅ **`CHANGELOG.md`** — 1.56.55 extended: the two fork defects, the four false-green gates, and the
+> three ABI-doc rows that were behind the kernel.
+>
+> ✅ **`agnos-userland-abi.md`** — `| 96 | fork |` added (a shipped, sweep-gated syscall with no row);
+> `#4 waitpid` rewritten (it documented a blocking busy-wait and a two-valued return; it is a
+> non-blocking three-valued poll with wait-any); `AO_NOFOLLOW = 0x1000` added to §3.3 two cuts late;
+> `AO_APPEND` now carries the bit-collision hazard that nearly cost every append-open on agnos.
+>
+> ✅ **`roadmap.md`** — `fork` and `waitpid` wait-any moved to shipped; the "next free number is #101"
+> line corrected to #103, two mints after it stopped being true; the audit-backlog row re-tallied.
+>
+> ✅ **`state.md`** — the open-issue rollup was written for six issues and a different set of blockers.
+>
+> ⚠ **This file itself was wrong about the archive directory.** Six references read `issues/archive/`;
+> the directory is `issues/archived/`. Fixed — the same error CLAUDE.md carried until 1.56.54.
+> ⛔ **Still stale and NOT swept here** (unchanged since v1.44.9, ~12 minors): `README.md`,
+> `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`. Their syscall
+> counts, sizes and subsystem tables should be assumed wrong; the surface is now **0-102**.
 >
 > ### 1.56.52 (2026-08-29) — both audit P0s closed, plus a finding that was in no backlog
 >
@@ -167,7 +196,7 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Sma
 | 🟡 **Header-refreshed; content confirmed current** | 2 | syscall-additions.md + kybernet-bridge.md — surface (26 syscalls) / design (kybernet 1.2.1 bridge) confirmed unchanged since v1.21.0; headers bumped off the "v1.30.7 cycle" smell. |
 | 🟠 **Read-through outstanding** | 1 | `BENCHMARKS.md` (CI-generated; the standing policy decision — checked-in tagged-state reference vs CI-only — never resolved). |
 | 🔵 **Probably evergreen** | 3 | `CONTRIBUTING.md`, `SECURITY.md`, `LICENSE` — standard, re-read pass annually. |
-| 📦 **Archive — frozen by design** | 5 | `docs/development/issues/archive/` (3 files) + `docs/development/proposals/archive/` (2 files). Verified — nothing misclassified. |
+| 📦 **Archive — frozen by design** | 5 | `docs/development/issues/archived/` (3 files) + `docs/development/proposals/archive/` (2 files). Verified — nothing misclassified. |
 | 🟢 **Live (non-archive)** | 2 | `proposals/2026-05-11-kaslr-scope.md` (Option B shipped v1.28.0; Option A deferred cyrius v6.1.x PIE), `issues/2026-05-15-cyrius-nonzero-gvar-init-not-honored.md` (live upstream cyrius bug; agnos `fn`-wrapper workaround durable). |
 | ❓ **Open question** | 0 | No live strategic ambiguity. |
 | 📄 **Dated audit** | 1 | `audit/2026-04-13-security-audit.md` — frozen dated artifact; next pass produces a new dated file. |
@@ -216,10 +245,10 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Sma
 | File | Last touched | Status | Notes |
 |---|---|---|---|
 | `issues/2026-05-15-cyrius-nonzero-gvar-init-not-honored.md` | 2026-05-15 | 🟢 Live | **NEW since v1.28.4 sweep**. Upstream cyrius bug surfaced via the v1.30.x Path-C kernel/version.cyr design — kmode `var` globals with non-zero initializers don't honor those initializers because PARSE_PROG runs before EMIT_GVAR_INITS, so the kernel program body executes before globals get their non-zero values. Worked around in agnos by wrapping banner literals in `fn` bodies (rodata pointer baked in at compile time, no runtime init dependency). Upstream fix is a cyrius v5.12.x+ concern; agnos workaround is durable. |
-| `issues/archive/2026-04-27-serial-putc-cc5-regression.md` | 2026-05-11 | 📦 Archive | **Closed at v1.28.1**. Resolution section (matched-conditions re-measurement under cyrius 5.10.44 / QEMU 11.0 / Ryzen 7 5800H / TCG; bench delta table showing cc5 broadly equal-or-better than cc3; `serial_putc` outlier explained by QEMU UART-emulation latency, not codegen) prepended to the original body. Frozen. |
-| `issues/archive/2026-04-27-memory-isolation-deep.md` | 2026-05-11 | 📦 Archive | **Closed at v1.27.1**. Resolution section (SMAP root cause + observation-to-mechanism table + process note on the hypothesis class that misled triage) prepended to the original body. Frozen — refer back but do not edit. |
-| `issues/archive/2026-04-27-cr3-load-helper.md` | 2026-05-11 | 📦 Archive | Closed alongside the memory-isolation fix at v1.27.1 — the v1.26.0 helper was a real fix, just not the whole one. |
-| `issues/archive/2026-04-27-cyrius-fmt-tracks-braces-in-comments.md` | 2026-04-27 | 📦 Archive | Closed at v1.26.1 (cyrius 5.7.22 fmt fix). Frozen. |
+| `issues/archived/2026-04-27-serial-putc-cc5-regression.md` | 2026-05-11 | 📦 Archive | **Closed at v1.28.1**. Resolution section (matched-conditions re-measurement under cyrius 5.10.44 / QEMU 11.0 / Ryzen 7 5800H / TCG; bench delta table showing cc5 broadly equal-or-better than cc3; `serial_putc` outlier explained by QEMU UART-emulation latency, not codegen) prepended to the original body. Frozen. |
+| `issues/archived/2026-04-27-memory-isolation-deep.md` | 2026-05-11 | 📦 Archive | **Closed at v1.27.1**. Resolution section (SMAP root cause + observation-to-mechanism table + process note on the hypothesis class that misled triage) prepended to the original body. Frozen — refer back but do not edit. |
+| `issues/archived/2026-04-27-cr3-load-helper.md` | 2026-05-11 | 📦 Archive | Closed alongside the memory-isolation fix at v1.27.1 — the v1.26.0 helper was a real fix, just not the whole one. |
+| `issues/archived/2026-04-27-cyrius-fmt-tracks-braces-in-comments.md` | 2026-04-27 | 📦 Archive | Closed at v1.26.1 (cyrius 5.7.22 fmt fix). Frozen. |
 
 ## Tier 6 — `docs/development/proposals/`
 
@@ -246,5 +275,5 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Sma
 - **`state.md` is bumped by `scripts/version-bump.sh`** — exercised end-to-end at v1.27.2 / v1.28.0 / v1.29.0 / v1.30.0 / v1.30.7 (Kernel row, Last-refresh date, Released date updated by the script with no manual edits). The sed regexes use `#` as delimiter to avoid the ERE-`|`-alternation bug that surfaced at v1.27.1.
 - **Doc-health is refreshed at minor-closeout, AT LATEST** — the 2026-05-18 audit named this after the ledger aged out across THREE minor releases. **It happened again**: this ledger sat at v1.30.7 across the 1.31.x / 1.32.x / 1.33.x / 1.34.x arcs (FIVE minors) until the 2026-05-26 sweep. The commitment ("touch doc-health on every minor cut, even just a header bump confirming nothing moved") is sound but was not honored — the cut flow runs `version-bump.sh` (which does *not* touch this ledger) and the manual body sweep keeps getting deferred to the next cycle-open. **Practical fix**: fold a doc-health touch into the cycle-OPEN sweep (when the body sweep happens anyway), not the cycle-close, since cycle-opens reliably trigger a docs pass and closes don't.
 - **Script-fresh / body-stale gap is now named**: `scripts/version-bump.sh` refreshes the cheap fields (VERSION, kernel/agnos.cyr banner comment, state.md header date + Version-table row, roadmap.md "Current" line). Body prose drifts independently. Doc-health audits at minor-cut must specifically inspect body prose against header dates, not trust matching headers.
-- **Issue-doc archive on resolution** — when an issue doc closes, move it into `issues/archive/` with a prepended **Resolution (vX.Y.Z)** section. Never delete; the resolution narrative is the audit trail.
+- **Issue-doc archive on resolution** — when an issue doc closes, move it into `issues/archived/` with a prepended **Resolution (vX.Y.Z)** section. Never delete; the resolution narrative is the audit trail.
 - **Proposals graduate or die** — a proposal that sits in `proposals/` for more than one minor without progress should be either accepted (promote to a roadmap item with an ADR if the decision is non-obvious) or archived with a `Status: rejected` note.

@@ -20,8 +20,13 @@ cd "$ROOT" || exit 1
 GNOBOOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}/build/BOOTX64.EFI"
 OVMF_CODE=/usr/share/edk2/x64/OVMF_CODE.4m.fd
 OVMF_VARS=/usr/share/edk2/x64/OVMF_VARS.4m.fd
-[ -f "$GNOBOOT" ] || { echo "SKIP: gnoboot not built"; exit 0; }
-[ -f "$OVMF_CODE" ] || { echo "SKIP: OVMF not found"; exit 0; }
+# ⛔ 1.56.55 — A MISSING PREREQUISITE EXITS 1, NOT 0. These guards used to `exit 0`, and sweep.sh
+# scores a gate on exit status alone, so "this gate measured NOTHING" was rendered as a green tick.
+# Thirteen such guards across six smokes, five of them in the sweep table. Same doctrine as
+# syscall-abi-check.sh: a check that quietly passes when it could not find one of its inputs is a
+# false green. An absent prerequisite is not a pass and must not read as one.
+[ -f "$GNOBOOT" ] || { echo "ERROR: gnoboot not built — this gate measured NOTHING"; exit 1; }
+[ -f "$OVMF_CODE" ] || { echo "ERROR: OVMF not found — this gate measured NOTHING"; exit 1; }
 LOGS="$ROOT/build/hid-reclaim-logs"; rm -rf "$LOGS"; mkdir -p "$LOGS"
 LOG="$LOGS/hidrcl.log"
 

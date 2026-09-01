@@ -303,7 +303,9 @@ fn preempt_enable() { var s = preempt_cpu_slot(); var v = load64(s); if (v > 0) 
 fn preempt_enabled() { if (load64(preempt_cpu_slot()) == 0) { return 1; } return 0; }
 
 # Allocate a proc_table slot. NON-LIFO (1.44.x): REUSE the first dead (state==0) slot in
-# [0,proc_count) so an out-of-order background-job reap does not leak its slot; else APPEND
+# [0,proc_count) THAT IS NOT STILL AN UNREAPED CHILD (1.56.55 — see the ppid guard in the scan
+# below; a dead slot may be a zombie holding an exit status its parent has not collected yet)
+# so an out-of-order background-job reap does not leak its slot; else APPEND
 # at proc_count (cap 16). Returns the slot index, or -1 if the table is full. CLEARS the
 # pid-indexed signal arrays (proc_signals/proc_sigmask) for the slot so a RECYCLED slot does
 # not inherit the prior occupant's pending signals or mask — the create paths reset
@@ -313,9 +315,13 @@ fn preempt_enabled() { if (load64(preempt_cpu_slot()) == 0) { return 1; } return
 #   (do_context_switch no-ops while preempt_count>0; the reap paths run IF=0 in-handler / under
 #   boot CR3). The multi-threading/SMP arc ([[project_multithreading_future_arc]]) must add a
 #   lock or per-CPU free-list here.
-#   PID-RECYCLE: a pid IS a slot index, so a reused slot RECYCLES that pid. Safe today because
-#   reuse only follows a reap done BY the reaper (waitpid#4 / execwait#37) AFTER it captured the
-#   exit code. A FUTURE consumer caching a pid across a yield (real blocking waitpid, an agnsh
+#   PID-RECYCLE: a pid IS a slot index, so a reused slot RECYCLES that pid. This used to read
+#   "safe today because reuse only follows a reap done BY the reaper (waitpid#4 / execwait#37)
+#   AFTER it captured the exit code" — TRUE while every child was reaped synchronously by its
+#   spawner, and FALSE the moment `fork`#96 + wait-any produced an exited-but-unreaped child that
+#   a later fork then allocated straight over. The ppid guard in the scan below is what makes the
+#   original sentence true again, by construction rather than by convention.
+#   A FUTURE consumer caching a pid across a yield (real blocking waitpid, an agnsh
 #   job table, kill-by-saved-pid) MUST re-validate the slot still names the same logical process.
 fn proc_alloc_slot() {
     # 1.46.x SMP sub-bite 3: the scan-find-free + claim + proc_count-bump is a non-atomic RMW on
@@ -328,8 +334,51 @@ fn proc_alloc_slot() {
     proctab_spin_lock();
     var i = 0;
     var idx = 0 - 1;
+    var pp = 0;
+    var reusable = 0;
     while (i < proc_count) {
-        if (load64(&proc_table + i * 176 + 8) == 0) { idx = i; i = proc_count; }   # reuse a dead slot
+        if (load64(&proc_table + i * 176 + 8) == 0) {
+            # ⛔⛔ 1.56.55 — A DEAD SLOT IS NOT NECESSARILY A FREE ONE, AND `fork` IS WHAT MADE THE
+            # DIFFERENCE REACHABLE. agnos has NO zombie state: `exit`#0 sets state 0 and deliberately
+            # does NOT reap, so the row survives for the parent's `waitpid` to read. State 0 therefore
+            # means BOTH "reaped / free" AND "exited, awaiting its parent" — and this scan reused
+            # either one. The banner above stated the premise that made that safe: *"reuse only
+            # follows a reap done BY the reaper AFTER it captured the exit code."* That held while
+            # every child was reaped synchronously by its spawner. `fork`#96 + `waitpid` wait-any
+            # created the first exited-but-UNREAPED child in this kernel, and the very next `fork`
+            # then handed its slot away — destroying an exit status nobody had collected.
+            # ⭐ MEASURED, not reasoned: forking twice in a row returned **the same pid twice**
+            # (FORK-MULTI-P1 pid=3 / FORK-MULTI-P2 pid=3), because child 1 exited between the two
+            # calls and child 2 was allocated straight over it. The parent then reaped exactly ONE
+            # child and wait-any correctly answered -1 for the other — which had never existed as far
+            # as the table was concerned. This is the allocator-side face of the same rule the 1.44.15
+            # multi-collapse revert established from the reap side: *"a proc's slot must persist until
+            # ITS OWN waitpid reaps it."*
+            # ⇒ THE MARK IS `proc_ppid`, and it is exact as of this same cut: both reap doors now
+            # clear it (see proc_reap / proc_reap_child), so a non-zero ppid on a dead slot means
+            # PRECISELY "exited, not yet reaped". Reuse is allowed only when the row is genuinely
+            # nobody's business any more.
+            # ⚠ THE ORPHAN CLAUSE IS NOT OPTIONAL — without it this leaks. Nothing in agnos reaps an
+            # orphan (see the table-full banner below, which says so), so a zombie whose parent died
+            # unreaping would pin its slot until reboot and march a 16-slot table to full. If the
+            # parent slot is itself dead, or no longer exists, nobody will ever collect this row and
+            # it is free.
+            # ⚠ KNOWN, BOUNDED, AND IN THE SAFE DIRECTION: if the parent's slot has since been
+            # RECYCLED by an unrelated process, that process's live state pins this zombie. That is
+            # the pid-recycle hazard the banner above already flags for a future consumer; it can only
+            # over-PRESERVE a row, never hand a live one away.
+            pp = load64(&proc_ppid + i * 8);
+            reusable = 0;
+            if (pp == 0) { reusable = 1; }                                 # reaped — both reap doors clear ppid
+            if (pp >= proc_count) { reusable = 1; }                        # parent slot no longer exists
+            if (pp > 0) {
+                if (pp < proc_count) {
+                    if (load64(&proc_table + pp * 176 + 8) == 0) { reusable = 1; }   # orphan: parent is dead too
+                }
+            }
+            if (reusable == 1) { idx = i; i = proc_count; }
+            else { i = i + 1; }
+        }
         else { i = i + 1; }
     }
     if (idx < 0) {
@@ -632,7 +681,7 @@ fn cr3_install_watch(cr3) { return 0; }
 # assigned value in RAX, which cc5's regalloc breaks. Function-shaped
 # helpers using `[rbp-N]` param loads are robust across compiler
 # versions (same approach as kernel/arch/x86_64/io.cyr's outb/inb).
-# See docs/development/issue/archive/2026-04-27-cyrius-fmt-tracks-braces-in-comments.md
+# See docs/development/issues/archived/2026-04-27-cyrius-fmt-tracks-braces-in-comments.md
 # for the cyrius v5.7.22 fix that allows raw `{`/`}` in comments again.
 fn cr3_load(cr3_val) {
     # ⭐ THE UNIVERSAL CR3 CHOKEPOINT. Every ring-3 entry must pass through here, whatever path it
@@ -1104,6 +1153,12 @@ fn proc_reap(pid) {
     proc_set_cr3(pid, 0x1000);              # detach the stale per-process CR3
     proc_reap_off_cpu_fence(pid);           # GAP-C: wait out any in-flight restore before freeing
     if (cr3 != 0x1000) { proc_free_address_space(cr3); }
+    # 1.56.55 — the second reap door. See the long banner in proc_reap_child: a reaped slot must
+    # stop being its parent's child, or the parent's next `waitpid(-1)` re-matches this dead row
+    # forever and never reaches its other children. This path is the FOREGROUND reap (agnsh `run`,
+    # init's exec_and_wait), whose caller has already read the exit code — so the parent-child
+    # relationship is fully discharged here too, and agnsh is itself a wait-any caller.
+    store64(&proc_ppid + pid * 8, 0);
     # LIFO slot reclaim: hand the top dead slot back to the allocator.
     proctab_spin_lock();   # 1.46.x SMP sub-bite 3: proc_count decrement vs proc_alloc_slot's bump
     if (pid == proc_count - 1) { proc_count = proc_count - 1; }
@@ -1152,6 +1207,28 @@ fn proc_reap_child(pid) {
     proc_set_cr3(pid, 0x1000);              # detach the stale per-process CR3
     proc_reap_off_cpu_fence(pid);           # GAP-C: wait out any in-flight restore before freeing
     if (cr3 != 0x1000) { proc_free_address_space(cr3); }
+    # ⛔⛔ 1.56.55 — A REAPED SLOT MUST STOP BEING ITS PARENT'S CHILD, AND UNTIL NOW IT DID NOT.
+    # `proc_ppid` was cleared in exactly ONE place — proc_alloc_slot's recycle scrub (the 1.50.7
+    # line, "recycled slot must not inherit a stale parent") — and that runs at slot REUSE, not at
+    # reap. So a NON-TOP child survived its own reap still carrying `ppid == parent` AND `state == 0`,
+    # which is verbatim the predicate `waitpid`#4's wait-any arm scans for (syscall.cyr, `arg1 < 0`).
+    # The parent's next `waitpid(-1)` matched that same dead slot again, returned its stale exit code
+    # again, and never advanced to a second child — `-2` (children live) and `-1` (no children) both
+    # became unreachable, every other child went unreaped, and their FULL-COPY address spaces and
+    # slots leaked until the 16-slot table filled. Exactly the fork-per-connection shape agora runs.
+    # ⚠ NOT a double-free: proc_destroy_fd_table early-returns on a NULL base and cr3 is already
+    # 0x1000 by then, so the re-reap was SILENT. A loud failure would have been found years earlier.
+    # ⭐ THE GATE THAT SHIPPED WITH WAIT-ANY COULD NOT SEE IT. `tests/fork/forker.cyr` forked exactly
+    # ONE child, and one child is the TOP slot — the LIFO collapse below deletes the row, so the
+    # phantom cannot exist. It takes TWO children to appear; that is what the FORK-MULTI phase adds.
+    # ⛔ AND EVEN TWO CHILDREN DID NOT SHOW IT AT FIRST, because proc_alloc_slot's zombie-reuse bug
+    # (fixed in the same cut — see the guard there) handed BOTH children the same slot, so the
+    # phantom could not form. The recycle defect MASKED this one. With the guard in and this line
+    # removed the phase reports FORK-MULTI-DUP; with both in it passes. Both were measured.
+    # ⚠ The same clear is in `proc_reap` for the same reason. The invariant is "a reaped slot is
+    # nobody's child", and it has to hold on BOTH reap doors or it returns through the other one:
+    # agnsh reaps its foreground jobs via proc_reap and is itself a wait-any caller.
+    store64(&proc_ppid + pid * 8, 0);
     # LIFO slot reclaim: hand the top dead slot back to the allocator (same rule as proc_reap —
     # ONLY the topmost slot collapses). A non-top child that exits early keeps its slot until the
     # slots above it drain; proc_alloc_slot (1.44.12) reuses that hole so nothing leaks. The address

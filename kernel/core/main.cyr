@@ -294,7 +294,7 @@ gpu_texl_stage_init();
 # the >256 MB direct-map look "live" while every real >256 MB access returned 0, and is what got
 # mis-attributed to a cyrius load/store truncation. cyrius is EXONERATED (the SAME store64/load64 emit
 # round-trips fine under 0x1000); the bug was active-table geometry. Full root cause + the empirical
-# A/B/C/D/E walk that nailed it: docs/development/issue/2026-06-28-cyrius-high-va-load-store.md.
+# A/B/C/D/E walk that nailed it: docs/development/issues/archived/2026-06-28-cyrius-high-va-load-store.md.
 #
 # Test a TRUE >256 MB VA (phys 320 MB) whose low bits do NOT alias the <=256 MB identity map, round-trip
 # it under 0x1000 (boot stack <256 MB stays mapped via PD[0..127]), then restore the live CR3. Gated on

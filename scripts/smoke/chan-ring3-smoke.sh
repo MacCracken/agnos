@@ -38,10 +38,15 @@ PART_BLOCKS=$(( (100 - 33) * 1024 * 1024 / 4096 ))
 echo "=== chan ring-3 smoke (#97 kill criteria: region-from-ring3 + inherited-fd inertness) ==="
 
 for tool in qemu-system-x86_64 parted mformat mmd mcopy sgdisk mkfs.ext2 dd strings cyrius; do
-    command -v "$tool" >/dev/null 2>&1 || { echo "  SKIP: $tool not found"; exit 0; }
+# ⛔ 1.56.55 — A MISSING PREREQUISITE EXITS 1, NOT 0. These guards used to `exit 0`, and sweep.sh
+# scores a gate on exit status alone, so "this gate measured NOTHING" was rendered as a green tick.
+# Thirteen such guards across six smokes, five of them in the sweep table. Same doctrine as
+# syscall-abi-check.sh: a check that quietly passes when it could not find one of its inputs is a
+# false green. An absent prerequisite is not a pass and must not read as one.
+    command -v "$tool" >/dev/null 2>&1 || { echo "  ERROR: $tool not found — this gate measured NOTHING"; exit 1; }
 done
-[ -f "$GNOBOOT" ] || { echo "  SKIP: gnoboot not built at $GNOBOOT"; exit 0; }
-[ -f "$AGNOS" ]   || { echo "  SKIP: build/agnos missing — run scripts/build.sh"; exit 0; }
+[ -f "$GNOBOOT" ] || { echo "  ERROR: gnoboot not built at $GNOBOOT — this gate measured NOTHING"; exit 1; }
+[ -f "$AGNOS" ]   || { echo "  ERROR: build/agnos missing — run scripts/build.sh — this gate measured NOTHING"; exit 1; }
 
 echo "Building chanx exerciser (cyrius build --agnos)..."
 ( cd "$CHANX_DIR" && cyrius build --agnos chanx.cyr build/chanx ) >/dev/null 2>&1 \

@@ -81,6 +81,84 @@ fn main(): i64 {
     if (witness != 0x5A5A) { sys_write(1, "FORK-COW-LEAK\n", 14); return 9; }
 
     sys_write(1, "FORK-PARENT-OK\n", 15);
+
+    # ═════ PHASE 2 — TWO children, which is the only shape that actually tests wait-any ═════
+    # ⛔ WHY A SECOND PHASE AND NOT A WIDER FIRST ONE. Phase 1 is the fork CONTRACT — resume site,
+    # private copy, surviving parent — and it is proven and burned-adjacent; leaving it byte-identical
+    # keeps that proof intact rather than re-opening it. What phase 1 STRUCTURALLY CANNOT test is
+    # wait-any walking more than one child: with a single child the child is the TOP slot, so
+    # proc_reap_child's LIFO collapse deletes the row and every later scan is trivially correct.
+    # ⭐ IT CAUGHT TWO SEPARATE DEFECTS, AND THE SECOND ONE HID THE FIRST. Measured 2026-08-31, three
+    # kernels, phase 1 GREEN in all three — which is exactly how both defects survived until now:
+    #   proc.cyr as it shipped at 1.56.54  -> FORK-MULTI-EARLY-NOCHILD, and the log says why:
+    #       "FORK-MULTI-P1 pid=3 / FORK-MULTI-P2 pid=3" — THE SAME SLOT TWICE. agnos has no zombie
+    #       state, so `exit`#0 leaves state 0 and proc_alloc_slot reused child 1's row for child 2,
+    #       destroying an exit status nobody had collected. The parent then reaped ONE child and
+    #       correctly got -1 for the other.
+    #   + the alloc guard, WITHOUT the reap-side ppid clear -> FORK-MULTI-DUP, pids 3 and 4. Now the
+    #       two children are distinct, and the OTHER bug becomes visible: a reaped non-top slot kept
+    #       `ppid == parent` + `state == 0` (proc_ppid was cleared only at slot REUSE, never at reap),
+    #       which is verbatim the predicate wait-any scans for, so the second waitpid(-1) re-matched
+    #       the FIRST child and returned code 21 twice.
+    #   + both fixes -> PASS, pids 3 and 4, codes 21 and 22, then -1.
+    # ⛔ NOTE THE ORDER OF DISCOVERY, because it is the lesson: the recycle bug MASKS the phantom.
+    # While slots were being handed out twice the phantom could never form, so "fix the phantom" alone
+    # changes nothing observable here. A first draft of this comment predicted a DUP signature for the
+    # unfixed kernel; the measurement said EARLY-NOCHILD. The prediction was wrong and was corrected
+    # from the log rather than the other way round.
+    # ⛔ EXIT CODES 21/22, AND THE PARENT PATHS RETURN 30+. Phase 1's own banner explains why: when a
+    # child's exit code collides with a value some parent path can return, a kernel bug that gives the
+    # child a wrong fork return goes undetected. 11 is taken by phase 1's child; nothing here reuses it.
+    sys_write(1, "FORK-MULTI-BEGIN\n", 17);
+
+    # ⚠ EACH SIDE ANNOUNCES ITSELF, same rule as phase 1: "the child never ran" and "the child ran
+    # and the parent could not see it" are different defects and must not share a log signature.
+    var f1 = syscall(96, 0, 0, 0);
+    if (f1 == 0) { sys_write(1, "FORK-MULTI-C1\n", 14); syscall(SYS_EXIT, 21); }
+    if (f1 < 0) { sys_write(1, "FORK-MULTI-NOFORK1\n", 19); return 30; }
+    sys_write(1, "FORK-MULTI-P1 pid=", 18); _emit_num(f1);
+
+    var f2 = syscall(96, 0, 0, 0);
+    if (f2 == 0) { sys_write(1, "FORK-MULTI-C2\n", 14); syscall(SYS_EXIT, 22); }
+    if (f2 < 0) { sys_write(1, "FORK-MULTI-NOFORK2\n", 19); return 31; }
+    sys_write(1, "FORK-MULTI-P2 pid=", 18); _emit_num(f2);
+
+    # Reap BOTH, order-independent: the slot the allocator hands each child is not ours to predict,
+    # so assert on the SET of codes collected rather than on their sequence.
+    var got21 = 0;
+    var got22 = 0;
+    var reaped = 0;
+    var c2 = 0;
+    var spins2 = 0;
+    var known = 0;
+    while (reaped < 2) {
+        # ⚠ Bound EVERY iteration, not just the -2 ones. A first draft counted only WOULD_BLOCK, so
+        # any unexpected answer spun here forever and would have surfaced as a hang — reporting the
+        # harness rather than the defect. Every path out of this loop now names itself.
+        spins2 = spins2 + 1;
+        if (spins2 > 200000) { sys_write(1, "FORK-MULTI-TIMEOUT\n", 19); return 32; }
+        c2 = syscall(4, 0 - 1, 0, 0);
+        if (c2 == 0 - 1) { sys_write(1, "FORK-MULTI-EARLY-NOCHILD reaped=", 32); _emit_num(reaped); sys_write(1, "FORK-MULTI-EARLY-NOCHILD spins=", 31); _emit_num(spins2); return 33; }
+        known = 0;
+        if (c2 == 0 - 2) { known = 1; }
+        if (c2 == 21) { got21 = got21 + 1; reaped = reaped + 1; known = 1; }
+        if (c2 == 22) { got22 = got22 + 1; reaped = reaped + 1; known = 1; }
+        if (known == 0) { sys_write(1, "FORK-MULTI-WRONG-CODE\n", 22); _emit_num(c2); return 37; }
+    }
+
+    # ⛔ THE PHANTOM-RE-REAP SIGNATURE: got21 == 2 / got22 == 0 — the lower, non-top slot re-matched
+    # on the second call and the second child never seen. ⚠ This is what a kernel with the alloc
+    # guard but WITHOUT the reap-side ppid clear prints; it is NOT what 1.56.54 printed, because
+    # there the recycle bug got there first (see the phase banner above). Measured, not assumed.
+    if (got21 != 1) { sys_write(1, "FORK-MULTI-DUP\n", 15); _emit_num(got21); return 34; }
+    if (got22 != 1) { sys_write(1, "FORK-MULTI-DUP\n", 15); _emit_num(got22); return 35; }
+
+    # Both children are claimed, so wait-any must now answer -1 ("no children at all"). The phantom
+    # made this arm unreachable, so it is a distinct assertion and not a restatement of the two above.
+    var last = syscall(4, 0 - 1, 0, 0);
+    if (last != 0 - 1) { sys_write(1, "FORK-MULTI-GHOST\n", 17); _emit_num(last); return 36; }
+
+    sys_write(1, "FORK-MULTI-OK\n", 14);
     return 0;
 }
 

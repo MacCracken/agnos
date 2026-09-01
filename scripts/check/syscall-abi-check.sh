@@ -76,7 +76,20 @@ if not cypeer:
 # entry stub, so a naive `grep 'if (num == '` returns 95 and reports a hole that does not exist. That
 # trap cost time during the 2026-08-05 audit; it is handled explicitly rather than left to be
 # rediscovered. If the stub gains or loses a number, this is where to add it.
-ENTRY_STUB_ONLY = {44: "sched_yield"}
+#
+# ⛔⛔ 1.56.55 — AND THE STUB DID GAIN ONE, AND NOBODY ADDED IT, SO THIS GATE WENT BLIND ON `fork`.
+# `#96 fork` dispatches from arch/x86_64/syscall_hw.cyr (`if (sc_num == 96) { return sys_fork(...); }`)
+# for the same reason #44 and #14 do — the child's resume context lives in pcpu_sc_entry_regs, valid
+# only on a path reached from the ring-3 entry stub. It has NO arm in kernel/core/syscall.cyr, which
+# is the only file scanned below, so the kernel number set silently excluded 96. The ABI doc had no
+# `| 96 |` row and cyrius had no SYS_FORK either — so all THREE sources agreed by MUTUAL ABSENCE and
+# this check reported nothing while a shipped, sweep-gated syscall was undocumented on both sides.
+# ⭐ THAT IS THE EXACT FALSE-GREEN THIS FILE'S OWN HEADER WARNS ABOUT ("a check that quietly passes
+# when it could not find one of its three inputs is a false green, and this tree has paid for those").
+# The comment above already said "if the stub gains or loses a number, this is where to add it"; the
+# instruction was correct and simply was not followed when fork landed. Adding a number to the stub
+# WITHOUT adding it here now costs a red gate rather than a silent hole — which is the right cost.
+ENTRY_STUB_ONLY = {44: "sched_yield", 96: "fork"}
 
 ksrc = open("kernel/core/syscall.cyr", encoding="utf-8").read().splitlines()
 kernel = {}
