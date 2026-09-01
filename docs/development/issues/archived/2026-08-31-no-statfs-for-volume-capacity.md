@@ -16,7 +16,7 @@ ignoring its path argument would answer the root volume and pass every check abo
 `stat`#33 shipped with. FAT/exFAT can answer this (total/free clusters x sectors-per-cluster) but that
 is a second backend and a second set of controls — filed as a follow-on rather than half-built.
 ⚠ **The record size is frozen ABI**: 3-arg with no length parameter, so a wider record needs a new
-number. Four fields is what was asked for. ⚠ **The cyrius `sys_statfs`#103 peer is owed** — cyrius-side.
+number. Four fields is what was asked for. ⚠ **The cyrius `sys_statfs`#103 peer is owed and FILED** — cyrius `issues/2026-09-01-agnos-sys-statfs-103-peer.md` (2026-09-01), the third of three in the ABI gap alongside `#96 fork` and `#102 lstat`.
 
 **Original status:** 🟡 OPEN — a missing syscall, not a defect in an existing one.
 **Placement:** a new number beside `stat`#33 / `lstat`#102, and a matching cyrius wrapper in

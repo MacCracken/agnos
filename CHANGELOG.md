@@ -20,7 +20,27 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
-## [1.56.57] — 2026-08-31 — statfs answers on all three filesystems, and the mount root was refused on two of them
+## [1.56.57] — 2026-09-01 — statfs answers on all three filesystems, and the mount root was refused on two of them
+
+### Withdrawn — the proposed HID gate was going to prove a stub, not the kernel
+
+- ⛔⛔ **1.56.56 recorded that HID `#3` "needs a build-gated seam stubbing the three hardware calls" so a
+  selftest could drive the real `hid_recover_halted`. That recommendation is WITHDRAWN** on an operator
+  correction. Faking `xhci_ep_state`s verdict, Reset Endpoint and Set TR Dequeue in order to test the
+  code that talks to the controller inverts this repo`s first rule — *only a boot verifies kernel
+  correctness* — and would have produced exactly the thing three cuts of this arc have been removing: a
+  gate that passes because the harness agrees with itself.
+- ⭐ **THE PREMISE WAS ALSO WRONG. THE BUILD HOST *IS* THE IRON TARGET.** archaemenid carries two AMD
+  Renoir/Cezanne xHCI controllers (`04:00.3`, `04:00.4`) — the exact silicon this code drives. The
+  constraint was never "agnos has no hardware to stall"; it was that the 2026-08-30 burn happened not
+  to stall. An endpoint halt is **provokable** on real USB (a device pulled mid-transfer, one that
+  STALLs its interrupt-IN endpoint, a port reset under load), and provoking one is a burn procedure,
+  not a kernel change.
+- ⇒ Roadmapped as **1.56.58 item #1**: burn, provoke a halt, and assert not merely that the recovery
+  line prints but that **input actually resumes** — which is the whole point of the 16-deep re-arm,
+  since a 1-deep ring re-stalls at the next polling gap. ⚠ A stall that never comes is VOID, not a pass.
+- ⚠ **Nothing about the 1.56.56 fix is in doubt** — it is correct code in a path that has not executed.
+  What was wrong was the plan for proving it.
 
 ### Added — `statfs`#103 on FAT and exFAT
 

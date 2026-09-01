@@ -26,10 +26,22 @@ exercises `hid_ep_rearm` → `hid_service_rearms` → arm + doorbell and passes.
 into a helper and calling it from a selftest would gate the arithmetic but not the WIRING — reverting
 `hid_recover_halted` to `hid_row_arm(i)` would leave such a gate GREEN, because it never calls the real
 function. That is precisely the failure mode this repo has spent three cuts removing.
-⇒ **A real gate needs a build-gated seam** stubbing the three hardware calls (`xhci_ep_state`s verdict,
-Reset Endpoint, Set TR Dequeue) so a selftest can drive the REAL `hid_recover_halted` and assert the
-owed count, the absence of an inline arm, and the absence of a premature doorbell. That is the next
-piece of work on this record, and it is what would let #3 close.
+⛔⛔ **AND THE FIX THIS RECORD PREVIOUSLY PROPOSED — A BUILD-GATED SEAM STUBBING THE THREE HARDWARE
+CALLS — IS WITHDRAWN AS THE WRONG INSTINCT. Struck 2026-09-01 on an operator correction.** It read:
+*"a real gate needs a build-gated seam stubbing `xhci_ep_state`s verdict, Reset Endpoint and Set TR
+Dequeue so a selftest can drive the REAL hid_recover_halted."* ⇒ **That would have proven the stub, not
+the kernel.** This repo`s first rule is that only a boot verifies kernel correctness, and the failing
+path here is a REAL xHCI endpoint halt on real silicon — faking the controller to test the code that
+talks to the controller inverts the whole point.
+⭐ **AND THE HARDWARE IS NOT SCARCE — THE BUILD HOST *IS* THE TARGET.** archaemenid carries two AMD
+Renoir/Cezanne xHCI controllers (`04:00.3`, `04:00.4`), the exact silicon this code drives. The
+constraint was never "no hardware"; it was that the 2026-08-30 burn happened not to stall. An endpoint
+halt is PROVOKABLE on real USB — a device pulled mid-transfer, a device that STALLs its interrupt-IN
+endpoint, a port reset under load — and provoking one is a burn procedure, not a kernel change.
+⇒ **The gate belongs on iron, and is roadmapped for 1.56.58.** What this code still needs is a burn
+with a real device and a deliberate stall, reading the markers `hid_recover_halted` already emits.
+⚠ Nothing about the 1.56.56 FIX is in doubt — it is correct code in a path that has not executed. What
+was wrong was the plan for proving it.
 
 **Earlier status (1.56.55, when the two defects were found):**
 
