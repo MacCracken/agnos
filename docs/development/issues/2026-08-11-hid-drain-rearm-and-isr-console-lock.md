@@ -1,7 +1,37 @@
 # HID input path — three defects found while explaining a log line at the shell prompt
 
 **Found**: 2026-08-11, investigating an operator report of a "mouse notification on the shell."
-**Status:** 🟠 **OPEN — #1/#2 FIXED AND MEASURED; #3 STILL HAS NEVER EXECUTED, AND RE-READING IT AT 1.56.55 FOUND TWO LIVE DEFECTS INSIDE IT.** Re-audited 2026-08-31.
+**Status:** 🟠 **OPEN — #1/#2 FIXED AND MEASURED; THE TWO DEFECTS FOUND INSIDE #3 ARE NOW FIXED (1.56.56) BUT UNGATED; #3 ITSELF HAS STILL NEVER EXECUTED.**
+
+✅ **FIXED 1.56.56 — both defects, by one change.** `hid_recover_halted` no longer arms inline. It bumps
+`hid_ep_rearm[i]` by **16** and lets `hid_service_rearms` do the ring work under `hid_poll_lock`:
+- **Depth** — it called `hid_row_arm(i)` once, and that arms a SINGLE TRB on either branch, so recovery
+  restored a **1-deep** ring against this file`s own rule (*"a 1-deep interrupt-IN ring goes empty the
+  moment polling pauses and the EP stalls"*). Both init paths arm 16; recovery now owes 16.
+- **Locking** — it armed from THREAD context with interrupts enabled, which the reclaim banner forbids
+  in the imperative (*"the waiter only bumps a counter, and hid_service_rearms does the ring work under
+  hid_poll_lock"*). It was the one thread-context arm site ignoring the rule the rest of the file keeps.
+  ⛔ Taking the lock inline instead was rejected: it would be held across two `xhci_cmd_wait` spins in a
+  path the 100 Hz tick also takes — a new hazard, not a smaller one.
+⚠ **Cost, named:** input resumes on the next `hid_poll` rather than instantly — ≤10 ms via the tick,
+which is the guarantee the counter`s contract already states. The success message deliberately keeps its
+wording and byte length.
+
+⛔⛔ **AND IT SHIPPED WITHOUT A GATE. SAYING SO IS THE POINT.** `hid_recover_halted`s body is behind
+`if (xhci_ep_state(slot, dci) == XHCI_EP_STATE_HALTED)`, and a software-fabricated completion code never
+makes the controller halt — so the body early-outs and **none of this executed before the change or
+after it.** What IS covered: the mechanism the fix now depends on. `hid-reclaim-smoke.sh` (in `sweep.sh`)
+exercises `hid_ep_rearm` → `hid_service_rearms` → arm + doorbell and passes.
+⛔ **The obvious cheap gate was considered and REJECTED as one that cannot fail**: extracting the arm
+into a helper and calling it from a selftest would gate the arithmetic but not the WIRING — reverting
+`hid_recover_halted` to `hid_row_arm(i)` would leave such a gate GREEN, because it never calls the real
+function. That is precisely the failure mode this repo has spent three cuts removing.
+⇒ **A real gate needs a build-gated seam** stubbing the three hardware calls (`xhci_ep_state`s verdict,
+Reset Endpoint, Set TR Dequeue) so a selftest can drive the REAL `hid_recover_halted` and assert the
+owed count, the absence of an inline arm, and the absence of a premature doorbell. That is the next
+piece of work on this record, and it is what would let #3 close.
+
+**Earlier status (1.56.55, when the two defects were found):**
 
 ⛔ **`hid_recover_halted` RE-ARMS THE RECOVERED ENDPOINT TO DEPTH 1, against this file's own stall warning.** `hid.cyr:1046` calls `hid_row_arm(i)` exactly once, and `hid_row_arm` arms a single TRB on either arm (`hid_arm_xfer_trb()` for a keyboard row, `hid_arm_row_trb(i)` otherwise). `hid.cyr:137-138` states the rule this breaks: *"The 16-deep batch discipline the keyboard needs applies here too — a 1-deep interrupt-IN ring goes empty the moment polling pauses and the EP stalls."* ⇒ **The recovery path recovers into the condition that produces stalls** — `#2`'s defect, which this issue already fixed once on the init path, reappearing on the path that runs *after* a stall.
 

@@ -1,6 +1,24 @@
 # `open`#7 has no `AO_EXCL`, so an application's "do not overwrite" guard cannot exist on agnos
 
-**Status:** 🟡 **OPEN — THE ASK IS VALID, THE PROPOSED BIT WAS NOT. Corrected 2026-08-31 (1.56.55).**
+**Status:** ✅ **SHIPPED 1.56.56 as `AO_EXCL = 0x2000`, mutation-gated. Archived 2026-08-31.**
+The kernel arm is in `sys_open_ext2_inner` beside `AO_NOFOLLOW`, FAT/exFAT answer it through
+`fatfs_create`/`exfat_create`s existing-name refusal, and §3.3 of the userland ABI carries the row.
+⛔ **THE POSITION OF THE CHECK IS THE LOAD-BEARING PART, AND THE GATE ASSERTS IT.** The arm sits ABOVE
+the `AO_TRUNC` one: placed below it, an `AO_CREAT|AO_TRUNC|AO_EXCL` open — precisely what the filed
+consumer sends on every copy — would zero the file and *then* refuse it, destroying exactly what the
+flag protects. So `ext2w: Wexcl` asserts the surviving SIZE, not just the refusal. **Measured**: moving
+the check below the truncate reports `ext2w: Wexcl TRUNC|EXCL TRUNCATED the file it refused` and a
+second arm besides. Five arms in total — the refusal plus three controls, because a flag that refused
+everything, or nothing, would satisfy a lesser test.
+⚠ **Returns -1, not -17.** agnos has no `-errno`; crab`s `-17` assertion is its LINUX arm, and the
+translation belongs in the cyrius wrapper. ⚠ **The cyrius `AO_EXCL` peer constant is still owed** — as
+is `AO_NOFOLLOW`s from 1.56.53 — and is cyrius-side work, tracked there rather than here.
+⭐ **The bit was wrong as filed and that is the durable lesson**: `0x400` is `AO_APPEND`, declared in
+the ABI and SET AT RUNTIME by cyrius `lib/io.cyr` on every append-open. The kernel tests no `0x400`
+today, so reading the kernel alone made it look free. **The kernel is canonical for the syscall NUMBER
+set but not for the FLAG set** — the ABI table and the cyrius enum are.
+
+**Original status:** 🟡 OPEN — the ask is valid, the proposed bit was not. Corrected 2026-08-31 (1.56.55).
 ⛔ **This filing asked for `AO_EXCL = 0x400` on the stated premise that "0x400 is unused". It is not:
 `0x400` is `AO_APPEND`**, declared in [`agnos-userland-abi.md`](../agnos-userland-abi.md) §3.3 and in
 cyrius `lib/syscalls_x86_64_agnos.cyr`, and **set at runtime today** — cyrius `lib/io.cyr` bridges

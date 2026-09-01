@@ -226,7 +226,11 @@ fn hid_row_cycle(i) {
 # corruption. So the waiter only bumps a counter, and `hid_service_rearms` does the ring work under
 # `hid_poll_lock`. The 100 Hz tick calls `hid_poll` unconditionally, so a pending re-arm is serviced
 # within 10 ms even when the endpoint is dry and no MSI-X will ever come.
-var hid_ep_rearm[8];         # TRBs owed to row i by a foreign waiter; drained by hid_service_rearms
+var hid_ep_rearm[8];         # TRBs owed to row i; drained by hid_service_rearms under hid_poll_lock.
+# ⚠ 1.56.56 — TWO PRODUCERS NOW, not just "a foreign waiter": (1) hid_reclaim_event, +1 per event
+# stolen by a synchronous xHCI waiter; (2) hid_recover_halted, +16 after a successful endpoint reset
+# (a full batch, because a recovered ring must not come back 1-deep). So `owed` can exceed 16 in one
+# pass and the drain loop below can arm 17+ — inert, but it is why that loop is not bounded at 1.
 var hid_stolen_events = 0;   # total events reclaimed from a foreign waiter — surfaced by the selftest
 fn hid_reclaim_event(evt_slot, evt_dci) {
     if (hid_ep_count == 0) { return 0; }
@@ -1043,9 +1047,36 @@ fn hid_recover_halted() {
                     if (xhci_cmd_set_tr_dequeue(slot, dci, ring + idx * 16, cyc & 0x1) == 0) {
                         kprintln("hid: an endpoint reset but its dequeue pointer would not move", 61);
                     } else {
-                        hid_row_arm(i);
-                        var db = xhci_mmio_base + xhci_db_off + slot * 4;
-                        store32(db, dci & 0xFF);
+                        # ⛔⛔ 1.56.56 — DEFER THE ARM RATHER THAN DOING IT HERE. One change, two
+                        # defects, both found by reading rather than by a stall (this path has never
+                        # executed — see the issue record):
+                        # (1) DEPTH. This called `hid_row_arm(i)` exactly ONCE, and `hid_row_arm` arms a
+                        #     SINGLE TRB on either branch — so recovery restored a **1-deep** ring,
+                        #     against this file's own rule at the `hid_arm_row_trb` banner: *"The 16-deep
+                        #     batch discipline the keyboard needs applies here too — a 1-deep
+                        #     interrupt-IN ring goes empty the moment polling pauses and the EP stalls."*
+                        #     Halt recovery recovered INTO the condition that produces halts. Both init
+                        #     paths arm 16 (`while (armed < 16)`); recovery now owes the same.
+                        # (2) LOCKING. `hid_recover_halted` runs in THREAD context with interrupts
+                        #     ENABLED — its sole caller is `hid_service_deferred`, reached from
+                        #     `kb_has_key` and the `#98` ptrscan arm, never from an ISR. The reclaim
+                        #     banner forbids arming from there in the imperative: *"Arming from the
+                        #     waiter would let the ISR interrupt hid_arm_row_trb mid-update and corrupt
+                        #     hid_ep_idx/hid_ep_cycle — trading a slow leak for ring corruption. So the
+                        #     waiter only bumps a counter, and hid_service_rearms does the ring work
+                        #     under hid_poll_lock."* This was the one thread-context arm site that
+                        #     ignored the rule the rest of the file follows.
+                        # ⇒ Bump the owed counter; `hid_service_rearms` arms all 16 under `hid_poll_lock`
+                        # and rings the doorbell itself, so the inline doorbell goes too.
+                        # ⛔ WHY NOT JUST TAKE THE LOCK HERE: it would be held across two
+                        # `xhci_cmd_wait` spins (Reset Endpoint + Set TR Dequeue), inside a path the
+                        # 100 Hz tick also takes. That is a new hazard, not a smaller one.
+                        # ⚠ THE COST, NAMED: input resumes on the next `hid_poll` rather than instantly
+                        # — ≤10 ms via the tick, which is exactly the guarantee the counter's contract
+                        # already states, and sooner in practice since `kb_has_key` calls `hid_poll`
+                        # unconditionally. The message below already hedges ("should resume"); its
+                        # wording and its hardcoded byte length are deliberately unchanged.
+                        store64(&hid_ep_rearm + i * 8, load64(&hid_ep_rearm + i * 8) + 16);
                         kprintln("hid: an endpoint halted and was reset; input from it should resume", 66);
                     }
                 }

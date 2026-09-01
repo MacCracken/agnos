@@ -1135,7 +1135,8 @@ fn sys_open_ext2_inner(arg1, arg2, arg3) {
     if ((arg3 & 0x800) != 0) { return ext2_open_dir(arg1, arg2); }
     # ⛔⛔ 1.56.53 — AO_NOFOLLOW (0x1000): REFUSE IF THE FINAL COMPONENT IS A SYMLINK.
     # `open`(7) had no way to write a file without following a link at the last component, and no
-    # AO_EXCL either — so neither standard way to make a check-then-write safe was available. A ring-3
+    # AO_EXCL either — so neither standard way to make a check-then-write safe was available. ⭐ BOTH
+    # HALVES EXIST NOW: AO_EXCL (0x2000) landed at 1.56.56, in the arm below this one. A ring-3
     # program can DETECT a link first (`readlink`#70 is no-follow), but between that check and the open
     # the path can be replaced with a symlink and the write lands wherever it points. whirl`s `-r`
     # recursive fetch is the filed consumer: it does exactly that pre-check today and cannot close the
@@ -1153,6 +1154,27 @@ fn sys_open_ext2_inner(arg1, arg2, arg3) {
             if (ext2_get_inode(nf7, &ext2_inode_buf) == 0) {
                 if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) == 0xA000) { return 0 - 1; }   # S_IFLNK
             }
+        }
+    }
+    # ⛔⛔ 1.56.56 — AO_EXCL (0x2000): WITH AO_CREAT, REFUSE A FINAL COMPONENT THAT ALREADY RESOLVES.
+    # POSIX `O_EXCL`. Without `AO_CREAT` the bit is ignored, as POSIX leaves it undefined there.
+    # ⛔⛔ THE POSITION IS LOAD-BEARING AND IS THE WHOLE POINT OF THE FLAG. This runs BEFORE the
+    # `AO_TRUNC` arm below. Checked afterwards instead, an `AO_WRONLY|AO_CREAT|AO_TRUNC|AO_EXCL` open
+    # would `ext2_truncate_zero` the file and THEN refuse it — destroying exactly the data the caller
+    # used the flag to protect. The filed consumer (crab) sends precisely that flag set on every copy.
+    # ⭐ `ext2_path_lookup_ex(..., 0)` — NO-FOLLOW, not the following `ext2_path_lookup` below. POSIX
+    # says a symlink at the final component is EEXIST **even when it dangles**, so a following lookup
+    # would return 0 for a broken link and let the create proceed over it. Same lookup mode the
+    # `AO_NOFOLLOW` arm above uses; this is its second consumer, which is why that mode was worth having.
+    # ⚠ RETURNS -1, NOT -17. agnos has no `-errno` convention — §1 of the userland ABI. crab asserts
+    # -17 (EEXIST) on its LINUX arm; translating -1 to EEXIST belongs in the cyrius wrapper, not here.
+    # ⚠ Additive at 0x2000: verified free against the kernel, the ABI flag table and cyrius`s
+    # `AgnosOpenFlag` enum (which stops at `AO_DIRECTORY = 0x800`). ⛔ The originally-filed bit was
+    # 0x400 — that is `AO_APPEND`, declared in the ABI and SET AT RUNTIME by cyrius `lib/io.cyr` on
+    # every append-open, so minting here would have turned every one of those into EEXIST.
+    if ((arg3 & 0x2000) != 0) {
+        if ((arg3 & 0x100) != 0) {
+            if (ext2_path_lookup_ex(arg1, arg2, 0) > 0) { return 0 - 1; }
         }
     }
     var ino7 = ext2_path_lookup(arg1, arg2);
@@ -8567,7 +8589,17 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (be7 == FS_FAT || be7 == FS_EXFAT) {
             var roff = op_path + vfs_mnt_reloff;
             var rlen = op_len - vfs_mnt_reloff;
-            if ((arg3 & 0x100) != 0) { vfs_create_on(be7, roff, rlen); }   # AO_CREAT
+            # AO_CREAT. ⛔⛔ THE DISCARDED RETURN IS DELIBERATE WITHOUT AO_EXCL, AND CONSUMING IT
+            # UNCONDITIONALLY WOULD BREAK `touch`. `fatfs_create` and `exfat_create` both return -1 for a
+            # name that ALREADY EXISTS, and `touch <existing-file>` on a FAT volume must still succeed and
+            # open it — so that -1 is thrown away on purpose here. ⭐ With `AO_EXCL` the very same -1 IS
+            # the answer the caller asked for, so the flag is what selects whether we look at it. That is
+            # why FAT/exFAT can honour AO_EXCL at all without a second lookup: the create path already
+            # distinguishes the case, it just had no way to report it. (1.56.56)
+            if ((arg3 & 0x100) != 0) {
+                var cr7 = vfs_create_on(be7, roff, rlen);
+                if ((arg3 & 0x2000) != 0) { if (cr7 < 0) { return 0 - 1; } }
+            }
             # 1.41.7: write-access (AO_WRONLY/AO_RDWR, low 2 bits) → a write-back
             # fd that buffers content + flushes the whole file via vfs_write_on at
             # close, so agnsh can write a FAT/exFAT data partition. Else a read
@@ -9290,6 +9322,43 @@ fn ksyscall(num, arg1, arg2, arg3) {
         fs_spin_unlock();
         stack_canary_check(canary);
         return lr;
+    }
+    if (num == 103) {
+        # statfs(path=arg1, pathlen=arg2, buf=arg3) — fills the 32-byte volume-capacity record
+        # (§4.7): f_bsize / f_blocks / f_bfree / f_bavail, all u64 LE at offsets 0/8/16/24.
+        # ⭐ MINTED 1.56.56 FOR A NAMED CONSUMER. crab`s M6 sidebar draws a VOLUMES section with a
+        # capacity bar per mount; every widget it needs already ships, and the ONE thing it cannot do
+        # is ask how big a filesystem is or how much is free. There is no ring-3 workaround: `stat`
+        # reports a FILE, not the filesystem under it, and summing a tree answers a different question
+        # (what is used HERE) at a cost proportional to the disk.
+        # ⚠ PATH-BASED, not fd-based — matching `stat`#33, so a caller need not open a descriptor just
+        # to read a number, and matching how the consumer already asks about the filesystem.
+        # ⚠ WHY A NEW NUMBER: a 4th argument rides `ksyscall_a4` = r10, which the entry stub sets from
+        # whatever r10 held at the call — garbage for every existing 3-arg caller, not 0. The same
+        # measured fact #100/#101/#102 all cite.
+        # ⛔ THE RECORD SIZE IS FROZEN ABI THE MOMENT A CONSUMER READS IT. The filed spec is 3-arg with
+        # no length argument (like #33`s hardcoded 48), so there is no room to grow this record later —
+        # a wider one needs a NEW number. Four fields is exactly what was asked for; resist adding a
+        # fifth "while we are here", because it cannot be taken back.
+        # ⚠ ext2-ONLY, and it says so rather than guessing: `vfs_resolve_mount` routes, and a non-ext2
+        # backend returns -1. Same posture `stat`#33 shipped with ("FAT/exFAT degrade to -1 for now").
+        # FAT/exFAT can answer this — total/free clusters x sectors-per-cluster — but that is a second
+        # backend`s worth of work and a second set of controls, and shipping it unproven would be worse
+        # than saying no. Filed as a follow-on rather than half-built.
+        if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg3, 32) == 0) { stack_canary_check(canary); return 0 - 1; }
+        var be103 = vfs_resolve_mount(arg1, arg2);
+        if (be103 != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
+        # ⚠ THE PATH MUST RESOLVE. Without this a statfs of a nonexistent path would happily report the
+        # root volume`s numbers — and an implementation that ignored its path argument entirely would
+        # pass every plausibility check a selftest can make about the numbers themselves.
+        fs_spin_lock();
+        var fsino = ext2_path_lookup(arg1, arg2);
+        if (fsino <= 0) { fs_spin_unlock(); stack_canary_check(canary); return 0 - 1; }
+        var fsr = ext2_fill_statfs(arg3);
+        fs_spin_unlock();
+        stack_canary_check(canary);
+        return fsr;
     }
     # GPU compute dispatch (#82) — the ring-3 dispatch seam (#82) ring-3 seam: run the proven 8x8 integer matmul on the caller's
     # A,B (64 i32 each) and write C=A*B to c_uva. The path mabda/tentib consume for GPU inference. -> 0 ok / <0 err.

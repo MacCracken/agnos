@@ -232,6 +232,30 @@ fn ext2_sb_csum_compute() {
 # s_free_inodes_count @ +16 (both u32). The read path never needed these
 # (reading existing files doesn't consume space); the allocator does.
 fn ext2_sb_free_blocks_count(sb)        { return ext2_load32_le(sb, 12); }
+# 1.56.56 — s_r_blocks_count @ sb+8, the RESERVED block count. Added for statfs#103`s `f_bavail`:
+# POSIX distinguishes "free" from "available", and the difference is exactly this reservation.
+fn ext2_sb_r_blocks_count(sb)           { return ext2_load32_le(sb, 8); }
+
+# 1.56.56 — statfs#103: fill the 32-byte volume-capacity record (§4.7) from the RESIDENT superblock.
+# ⭐ NOTHING IS RE-READ FROM DISK. `ext2_sb_buf` is the live superblock and `s_free_blocks_count` is
+# maintained by the allocator (ext2_sb_set_free_blocks_count on every block alloc/free), so this
+# reports the CURRENT free count, not a mount-time snapshot — which is what a capacity bar needs.
+# ⚠ f_bavail = f_bfree - s_r_blocks_count, CLAMPED AT ZERO. The clamp is not defensive noise: a
+# filesystem may legitimately run below its reservation, at which point free < reserved and an
+# unclamped subtraction hands ring 3 a negative i64 that a progress bar renders as full or absurd.
+fn ext2_fill_statfs(buf) {
+    var bsz = ext2_blocksize;
+    var tot = ext2_sb_blocks_count(&ext2_sb_buf);
+    var fre = ext2_sb_free_blocks_count(&ext2_sb_buf);
+    var rsv = ext2_sb_r_blocks_count(&ext2_sb_buf);
+    var avl = fre - rsv;
+    if (avl < 0) { avl = 0; }
+    store64(buf +  0, bsz);
+    store64(buf +  8, tot);
+    store64(buf + 16, fre);
+    store64(buf + 24, avl);
+    return 0;
+}
 fn ext2_sb_free_inodes_count(sb)        { return ext2_load32_le(sb, 16); }
 fn ext2_sb_set_free_blocks_count(sb, v) { return ext2_store32_le(sb, 12, v); }
 fn ext2_sb_set_free_inodes_count(sb, v) { return ext2_store32_le(sb, 16, v); }
@@ -4296,15 +4320,116 @@ fn ext2_write_selftest() {
     #     /hl_b.txt and succeeds; WITH the flag it must be refused.
     var fd_follow = ksyscall(7, "/sl_f", 5, 0);
     if (fd_follow < 0) { wls = 0; kprintln("ext2w: Wlstat open without NOFOLLOW did not follow the link", 59); }
-    else { ksyscall(8, fd_follow, 0, 0); }
+    else { ksyscall(6, fd_follow, 0, 0); }   # ⛔ 1.56.56: was ksyscall(8) = dup (syscall.cyr: 'num == 8 -> return arg1'), which does NOT close — this leaked a vfs_table slot every boot. close is #6.
     if (ksyscall(7, "/sl_f", 5, 0x1000) >= 0) { wls = 0; kprintln("ext2w: Wlstat AO_NOFOLLOW opened a SYMLINK", 42); }
     # ⚠ And it must not refuse a plain file — a flag that rejects everything would pass the line above.
     var fd_plain = ksyscall(7, "/hl_b.txt", 9, 0x1000);
     if (fd_plain < 0) { wls = 0; kprintln("ext2w: Wlstat AO_NOFOLLOW refused a plain file", 46); }
-    else { ksyscall(8, fd_plain, 0, 0); }
+    else { ksyscall(6, fd_plain, 0, 0); }    # ⛔ 1.56.56: same dup-not-close leak as above.
 
     if (wls == 1) { kprintln("ext2w: Wlstat no-follow OK", 26); }
     else          { kprintln("ext2w: Wlstat no-follow MISMATCH", 32); }
+
+    # === Wexcl: AO_EXCL (0x2000) on open#7 — the second half of the check-then-write pair (1.56.56) ===
+    # ⛔ FIVE ARMS, AND (b)/(c)/(e) ARE NOT PADDING. A flag that refused EVERY open would satisfy (a)
+    # and (d) on its own; a flag that refused NOTHING would satisfy (b), (c) and (e). Only the set
+    # discriminates. This is the same shape the AO_NOFOLLOW bite above uses and for the same reason.
+    var wxc = 1;
+
+    # (a) THE ASK — AO_CREAT|AO_EXCL on a name that already exists must be REFUSED.
+    if (ksyscall(7, "/w4keep.txt", 11, 0x2100) >= 0) {
+        wxc = 0; kprintln("ext2w: Wexcl opened an EXISTING file", 36);
+    }
+
+    # (b) CONTROL — AO_CREAT alone on that same name must still SUCCEED (this is `touch`).
+    var fx_a = ksyscall(7, "/w4keep.txt", 11, 0x100);
+    if (fx_a < 0) { wxc = 0; kprintln("ext2w: Wexcl AO_CREAT alone refused an existing name", 52); }
+    else { ksyscall(6, fx_a, 0, 0); }
+
+    # (c) CONTROL — AO_CREAT|AO_EXCL on a NEW name must succeed and create it.
+    var fx_b = ksyscall(7, "/wxnew.txt", 10, 0x2100);
+    if (fx_b < 0) { wxc = 0; kprintln("ext2w: Wexcl refused a NEW name", 31); }
+    else { ksyscall(6, fx_b, 0, 0); }
+
+    # (d) ⛔⛔ THE DESTRUCTION CHECK — THIS IS WHY THE ARM SITS ABOVE THE AO_TRUNC ONE.
+    # AO_CREAT|AO_TRUNC|AO_EXCL is the exact flag set the filed consumer sends on every copy. If the
+    # EXCL test were placed after the truncate instead of before it, this open would zero the file and
+    # THEN refuse it — destroying the data the caller used the flag to protect. So the refusal alone is
+    # not enough: the SIZE must be unchanged afterwards. `/w4keep.txt` is "AGNOS-W4-WROTE", 14 bytes.
+    # ⚠ st_size is at statbuf offset 16, NOT 24 — 24 is st_ino (§4.1). The Wlstat bite above compares
+    # offset 24 because it is checking inode agreement, which is a different question.
+    if (ksyscall(7, "/w4keep.txt", 11, 0x2300) >= 0) {
+        wxc = 0; kprintln("ext2w: Wexcl TRUNC|EXCL opened an EXISTING file", 47);
+    }
+    var wxst[48];
+    if (ksyscall(33, "/w4keep.txt", 11, &wxst) != 0) {
+        wxc = 0; kprintln("ext2w: Wexcl stat failed after a refused TRUNC|EXCL", 51);
+    } else {
+        if (load64(&wxst + 16) != 14) {
+            wxc = 0; kprintln("ext2w: Wexcl TRUNC|EXCL TRUNCATED the file it refused", 53);
+        }
+    }
+
+    # (e) CONTROL — without AO_CREAT the bit is ignored (POSIX leaves it undefined there).
+    var fx_c = ksyscall(7, "/w4keep.txt", 11, 0x2000);
+    if (fx_c < 0) { wxc = 0; kprintln("ext2w: Wexcl without AO_CREAT refused an open", 45); }
+    else { ksyscall(6, fx_c, 0, 0); }
+
+    if (wxc == 1) { kprintln("ext2w: Wexcl EEXIST OK", 22); }
+    else          { kprintln("ext2w: Wexcl EEXIST MISMATCH", 28); }
+
+    # === Wstatfs: statfs#103 — volume capacity (1.56.56) ==========================
+    # ⛔ THE CONTROLS CARRY THE WEIGHT, not the happy path. An implementation that ignored its path
+    # argument and always answered the root volume, or one that returned boot-time constants, satisfies
+    # every plausibility check about the NUMBERS. (c) and (d) are what those two mutations trip.
+    var wstf = 1;
+    var sfb[32];
+
+    # (a) The happy path on the root mount.
+    if (ksyscall(103, "/", 1, &sfb) != 0) {
+        wstf = 0; kprintln("ext2w: Wstatfs returned nonzero for /", 37);
+    }
+    var sf_bs = load64(&sfb +  0);
+    var sf_tb = load64(&sfb +  8);
+    var sf_fb = load64(&sfb + 16);
+    var sf_av = load64(&sfb + 24);
+    kprint("ext2w: Wstatfs bsize=", 21); kprint_num(sf_bs);
+    kprint(" blocks=", 8); kprint_num(sf_tb);
+    kprint(" free=", 6); kprint_num(sf_fb);
+    kprint(" avail=", 7); kprint_num(sf_av); kprintln("", 0);
+
+    # (b) The block size must be the one the volume was actually made with, not a guess.
+    if (sf_bs != ext2_blocksize) { wstf = 0; kprintln("ext2w: Wstatfs f_bsize disagrees with the mount", 47); }
+    # Internal consistency: free cannot exceed total, available cannot exceed free.
+    if (sf_tb <= 0)     { wstf = 0; kprintln("ext2w: Wstatfs f_blocks is not positive", 39); }
+    if (sf_fb > sf_tb)  { wstf = 0; kprintln("ext2w: Wstatfs f_bfree exceeds f_blocks", 39); }
+    if (sf_av > sf_fb)  { wstf = 0; kprintln("ext2w: Wstatfs f_bavail exceeds f_bfree", 39); }
+
+    # (c) ⛔ THE PATH IS REALLY LOOKED UP. A nonexistent path must be REFUSED, not silently answered
+    #     with the root volume's numbers — which is what an arm that ignored its path would do.
+    if (ksyscall(103, "/no_such_statfs_path", 20, &sfb) >= 0) {
+        wstf = 0; kprintln("ext2w: Wstatfs answered for a NONEXISTENT path", 46);
+    }
+
+    # (d) ⛔ THE NUMBERS ARE LIVE, NOT A BOOT-TIME SNAPSHOT. Allocate a block by writing a file, and
+    #     f_bfree must DROP. This is the assertion a constant-returning implementation cannot pass,
+    #     and it is why statfs is worth having at all: a capacity bar that never moves is a lie.
+    var sfb2[32];
+    var wfd = ksyscall(7, "/wsfgrow.bin", 12, 0x2100);
+    if (wfd < 0) { wstf = 0; kprintln("ext2w: Wstatfs could not create its growth file", 47); }
+    else {
+        ksyscall(1, wfd, "AGNOS-STATFS-LIVE-CHECK", 23);   # write#1 — NOT 12, which is sync
+        ksyscall(6, wfd, 0, 0);
+        if (ksyscall(103, "/", 1, &sfb2) != 0) { wstf = 0; kprintln("ext2w: Wstatfs second call failed", 33); }
+        else {
+            var sf_fb2 = load64(&sfb2 + 16);
+            kprint("ext2w: Wstatfs free after write=", 32); kprint_num(sf_fb2); kprintln("", 0);
+            if (sf_fb2 >= sf_fb) { wstf = 0; kprintln("ext2w: Wstatfs f_bfree did not drop after a write", 49); }
+        }
+    }
+
+    if (wstf == 1) { kprintln("ext2w: Wstatfs OK", 17); }
+    else          { kprintln("ext2w: Wstatfs MISMATCH", 23); }
 
     # === Wuninit: uninit-group materialization (1.33.4 bite 3) ===
     # Only meaningful on a multi-group flex_bg image (the 67 MiB write-smoke

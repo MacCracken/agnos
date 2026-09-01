@@ -1,6 +1,24 @@
 # There is no `statfs`, so no ring-3 program can report a filesystem's size or free space
 
-**Status:** 🟡 **OPEN** — a missing syscall, not a defect in an existing one.
+**Status:** ✅ **SHIPPED 1.56.56 as `statfs`#103, mutation-gated. Archived 2026-08-31.**
+`sys_statfs(path, pathlen, buf) -> 0 / -1`, filling the 32-byte §4.7 record — `f_bsize` @0,
+`f_blocks` @8, `f_bfree` @16, `f_bavail` @24, all u64 LE. Path-based and mount-routed, matching
+`stat`#33. ⭐ **The free count is LIVE**, read from the resident superblock the allocator maintains —
+not a mount-time snapshot, which is what a capacity bar actually needs.
+**Measured on the gate`s own image** (67 MiB, `mkfs.ext2 -b 4096 -m 0`): `bsize=4096 blocks=17152
+free=16042 avail=16042`, and free drops to `16041` after a 23-byte write. `avail == free` because the
+image reserves nothing; `blocks` matches 67 MiB / 4096 exactly.
+⛔ **Two mutations, each caught by its own named arm**: reporting total as free →
+`f_bfree did not drop after a write`; removing the path lookup →
+`answered for a NONEXISTENT path`. That second arm is the one that matters — an implementation
+ignoring its path argument would answer the root volume and pass every check about the numbers.
+⚠ **ext2-only**, and it says so rather than guessing: a non-ext2 mount returns -1, the same posture
+`stat`#33 shipped with. FAT/exFAT can answer this (total/free clusters x sectors-per-cluster) but that
+is a second backend and a second set of controls — filed as a follow-on rather than half-built.
+⚠ **The record size is frozen ABI**: 3-arg with no length parameter, so a wider record needs a new
+number. Four fields is what was asked for. ⚠ **The cyrius `sys_statfs`#103 peer is owed** — cyrius-side.
+
+**Original status:** 🟡 OPEN — a missing syscall, not a defect in an existing one.
 **Placement:** a new number beside `stat`#33 / `lstat`#102, and a matching cyrius wrapper in
 `lib/syscalls_x86_64_agnos.cyr` (same kernel-mints-it / cyrius-owns-the-peer split as
 `sys_lstat`#102).

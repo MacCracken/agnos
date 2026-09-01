@@ -8,6 +8,22 @@ type: state
 
 > **Last refresh**: 2026-08-31 (**1.56.56 — a CHANGELOG correction and the issues folder 7 → 4; see the 1.56.56 block**). Prior: 1.56.55 (the open-issue re-audit). Prior: 2026-08-29 (**1.56.52 — both audit P0s closed** — see the 2026-08-29 block; the 2026-08-28 block below it records the sweep that produced the backlog). **⛔ THE MULTI-MINOR LAG HAPPENED A THIRD TIME, AND THIS FILE PREDICTED IT TWICE.** The ledger sat at **v1.44.9** from 2026-06-10 to 2026-08-28 — **~12 minors** (1.45.x net/server, 1.46.x SMP, 1.47.x-1.49.x, 1.50.x-1.53.x, the 1.54.x-1.56.x GPU/display/shader arcs) — with state.md/roadmap/CHANGELOG kept per-cut and the body docs un-swept, which is verbatim the failure the two notes below describe. The stated fix ("fold a doc-health touch into the cycle-OPEN sweep") was never adopted. ⚠ **This refresh is NOT that catch-up sweep** — it records only what 1.56.51 actually touched. The body docs (`README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`) remain unswept since 1.44.9 and their syscall counts, sizes and subsystem tables should be assumed stale — the surface has since grown to **0-101**.
 >
+> ### 1.56.56 (2026-08-31) — two syscalls shipped, a ruling found, and the issues folder 7 → 2
+>
+> ✅ **`agnos-userland-abi.md`** — two new rows and both are load-bearing, not inventory. `| 103 | statfs |`
+> (§4.7 record, ext2-only, record size frozen ABI because the call is 3-arg with no length parameter)
+> and `AO_EXCL = 0x2000` in §3.3, whose row states the thing the code comment states: the check is
+> evaluated BEFORE `AO_TRUNC`, or it destroys what it refuses.
+>
+> ✅ **`issues/`** — `open-ao-excl-flag` and `no-statfs-for-volume-capacity` both SHIPPED and archived
+> with resolution headers carrying their measured numbers and their mutation results.
+> ✅ **`issues/2026-08-11-hid-drain-rearm`** — both defects fixed; header records that the fix ships
+> **UNGATED** and why the cheap gate was refused. That is the honest state, not a hedge.
+>
+> ✅ **`roadmap.md`** — syscall line 0–103 / next free #104; FAT+exFAT `statfs` slotted **1.56.57** with
+> its real cost named (two fresh sets of controls, and exFAT`s free count lives in the allocation
+> bitmap rather than a superblock field).
+>
 > ### 1.56.56 (2026-08-31) — a correction, and the issues folder actually shrinking
 >
 > ⛔ **`CHANGELOG.md` 1.56.55 carried a wrong claim and it is corrected, not rewritten.** That entry
@@ -17,7 +33,7 @@ type: state
 > control agreed for the wrong reason. The tagged text is left byte-identical with a `⚠ CORRECTED AT
 > 1.56.56` pointer above it; the correction itself lives in the 1.56.56 section.
 >
-> ✅ **`docs/development/issues/` — 7 open → 3.** `syscall-96-fork`, `open-ao-nofollow`,
+> ✅ **`docs/development/issues/` — 7 open → 3 in this pass** (→ 2 once `AO_EXCL` and `statfs` shipped, see the 1.56.56 block above). `syscall-96-fork`, `open-ao-nofollow`,
 > `tri-corner-bound` and `shakti-privilege-model-kernel-gap` archived, each with its Status header
 > rewritten to a resolution note first. The first three were being held open for **cyrius** peers,
 > which is another repo`s backlog counted in this one. ⛔⛔ **The fourth was asking for a ruling that had

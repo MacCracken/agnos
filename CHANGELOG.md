@@ -20,7 +20,64 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
-## [1.56.56] — 2026-08-31 — the two red assertions were one truncated log, and three records that were done
+## [1.56.56] — 2026-08-31 — two syscalls shipped, a ruling found in the repo that owns it, and 7 open issues → 2
+
+### Added — `AO_EXCL = 0x2000` on `open`#7
+
+- With `AO_CREAT`, refuse a final component that already resolves. POSIX `O_EXCL`, completing the
+  check-then-write pair `AO_NOFOLLOW` opened at 1.56.53. Consumer: **crab**`s copy/move overwrite guard,
+  which on agnos was falling back to `AO_TRUNC` and destroying the destination.
+- ⛔⛔ **THE POSITION OF THE CHECK IS THE FEATURE.** The arm sits ABOVE the `AO_TRUNC` one. Below it, an
+  `AO_CREAT|AO_TRUNC|AO_EXCL` open — exactly what the consumer sends — would zero the file and *then*
+  refuse it, destroying what the flag exists to protect. So the gate asserts the surviving SIZE, not
+  just the refusal. **Measured**: moving the check below the truncate reports
+  `ext2w: Wexcl TRUNC|EXCL TRUNCATED the file it refused`, plus a second arm.
+- Five arms, because a flag that refused everything — or nothing — would satisfy a lesser test.
+  FAT/exFAT answer it through `fatfs_create`/`exfat_create`s existing-name refusal, whose return is
+  discarded *without* the flag because `touch <existing>` depends on that.
+- ⚠ **Returns -1, not -17** — agnos has no `-errno`; the translation belongs in the cyrius wrapper.
+- ⭐ **The filed bit was wrong and the reason generalises**: `0x400` is `AO_APPEND`, declared in the ABI
+  and set at runtime by cyrius `lib/io.cyr` on every append-open. The kernel tests no `0x400`, so
+  reading the kernel alone made it look free. **The kernel is canonical for the syscall NUMBER set but
+  not for the FLAG set.**
+
+### Added — `statfs`#103, volume capacity for a path
+
+- `sys_statfs(path, pathlen, buf)` fills a 32-byte record (§4.7): `f_bsize`/`f_blocks`/`f_bfree`/
+  `f_bavail`, u64 LE at 0/8/16/24. Path-based and mount-routed like `stat`#33. Consumer: **crab**`s M6
+  sidebar, which had every widget it needed and no way to ask how big a filesystem is.
+- ⭐ **The free count is LIVE** — read from the resident superblock the allocator maintains, not a
+  mount-time snapshot. **Measured** on the gate`s own image (67 MiB, `-b 4096 -m 0`):
+  `bsize=4096 blocks=17152 free=16042 avail=16042`, dropping to `16041` after a 23-byte write.
+  `avail == free` because the image reserves nothing; `blocks` is 67 MiB / 4096 exactly.
+- ⛔ **Two mutations, each caught by its own named arm**: total-as-free →
+  `f_bfree did not drop after a write`; no path lookup → `answered for a NONEXISTENT path`. The second
+  is the one that matters — an arm ignoring its path would answer the root volume and pass every check
+  about the numbers themselves.
+- ⚠ **ext2-only and it says so**: a non-ext2 mount returns -1, the posture `stat`#33 shipped with.
+  FAT/exFAT can answer it, but that is a second backend and a second set of controls — filed, not
+  half-built. ⚠ **The record size is frozen ABI**: 3-arg, no length parameter, so widening needs a new
+  number. ⚠ `f_bavail` is clamped at zero — a filesystem can legitimately run below its reservation, and
+  an unclamped subtraction hands ring 3 a negative that a progress bar renders as full.
+
+### Fixed — both defects inside `hid_recover_halted`, and it ships UNGATED
+
+- One change fixes both: it now bumps `hid_ep_rearm[i]` by **16** and lets `hid_service_rearms` do the
+  ring work under `hid_poll_lock`, instead of arming inline.
+  **(1) Depth** — it called `hid_row_arm(i)` once, arming a 1-deep ring, against the file`s own rule
+  that *"a 1-deep interrupt-IN ring goes empty the moment polling pauses and the EP stalls"*: recovery
+  recovered INTO the condition that produces halts. **(2) Locking** — it armed from thread context with
+  interrupts enabled, which the reclaim banner forbids in the imperative. Taking the lock inline was
+  rejected: it would be held across two `xhci_cmd_wait` spins in a path the 100 Hz tick also takes.
+- ⛔⛔ **AND IT HAS NO GATE — SAYING SO IS THE POINT.** The body is behind an `XHCI_EP_STATE_HALTED`
+  check that a software-fabricated completion code cannot satisfy, so none of it executes. The
+  *mechanism* the fix now depends on IS covered (`hid-reclaim-smoke.sh`, in the sweep, passes).
+  ⛔ The cheap gate was considered and **rejected as one that cannot fail**: extracting the arm and
+  calling it from a selftest would gate the arithmetic but not the wiring — reverting to
+  `hid_row_arm(i)` would leave it green. A real gate needs a build-gated seam stubbing the three
+  hardware calls so a selftest can drive the real function.
+
+### Corrected — 1.56.55 reported two `ring3-smoke` defects that do not exist
 
 ### Corrected — 1.56.55 reported two `ring3-smoke` defects that do not exist
 
@@ -83,7 +140,7 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   **Before writing "no decision exists", search the genesis repo.** agnos is not where AGNOS
   architecture is ruled.
 
-### Changed — the issues folder: 7 open → 3, and two records that should never have been files
+### Changed — the issues folder: 7 open → 3 by archiving, then → 2 as the two syscalls above shipped
 
 - ✅ **ARCHIVED, each with its Status header rewritten to a resolution note first**: `syscall-96-fork`,
   `open-ao-nofollow`, `tri-corner-bound-coordinate-frame`, and `shakti-privilege-model-kernel-gap`

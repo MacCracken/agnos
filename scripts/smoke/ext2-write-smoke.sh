@@ -308,6 +308,33 @@ else
     echo "  FAIL: Wlstat no-follow marker absent entirely (selftest did not run?)"; rc=1
 fi
 
+# Wexcl: AO_EXCL (0x2000) on open(7) — 1.56.56. The other half of the check-then-write pair that
+# AO_NOFOLLOW opened at 1.56.53. Five in-kernel arms: the refusal itself, plus three controls that
+# stop a refuse-everything or refuse-nothing implementation from scoring, plus the DESTRUCTION check
+# (AO_CREAT|AO_TRUNC|AO_EXCL must refuse *without* truncating — which is why the kernel arm sits
+# above the AO_TRUNC one). Three-arm shape as above: failing and absent must not share a message.
+if strings "$LOG" | grep -q "ext2w: Wexcl EEXIST OK"; then
+    echo "  PASS: Wexcl (AO_EXCL refuses an existing name, and does not truncate what it refuses)"
+elif strings "$LOG" | grep -q "ext2w: Wexcl EEXIST MISMATCH"; then
+    echo "  FAIL: Wexcl — AO_EXCL is not behaving; see the named ext2w: Wexcl line(s) above"; rc=1
+else
+    echo "  FAIL: Wexcl marker absent entirely (selftest did not run?)"; rc=1
+fi
+
+# Wstatfs: statfs#103 — volume capacity (1.56.56). Four in-kernel arms: the numbers agree with the
+# mount and with each other; a NONEXISTENT path is refused (an arm that ignored its path would answer
+# the root volume and pass every check about the numbers themselves); and f_bfree DROPS after a write,
+# which is what a constant-returning implementation cannot do. The kernel prints the values, so the
+# transcript carries them whether it passes or fails.
+strings "$LOG" | grep -E "^ext2w: Wstatfs (bsize|free after)" | sed 's/^/  /'
+if strings "$LOG" | grep -q "ext2w: Wstatfs OK"; then
+    echo "  PASS: Wstatfs (capacity agrees with the mount, path is resolved, free count is live)"
+elif strings "$LOG" | grep -q "ext2w: Wstatfs MISMATCH"; then
+    echo "  FAIL: Wstatfs — see the named ext2w: Wstatfs line(s) above"; rc=1
+else
+    echo "  FAIL: Wstatfs marker absent entirely (selftest did not run?)"; rc=1
+fi
+
 # Wsync: s_state dirty/clean + sync (1.33.3 bite 4) — first write cleared
 # EXT2_VALID_FS (dirty), sync set it back (clean).
 if strings "$LOG" | grep -q "ext2w: Wsync state OK"; then
