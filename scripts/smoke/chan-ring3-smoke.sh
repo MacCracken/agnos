@@ -88,7 +88,7 @@ qemu_dwell_kernel "$LOG" "CHANX-DONE" "${QEMU_TIMEOUT:-60}" "$WORK/vars.fd" "$OV
 
 echo ""
 echo "  --- CHANX lines ---"
-strings "$LOG" | grep -E "^CHANX-" | sed 's/^/  /' || echo "  (none)"
+strings "$LOG" | grep -E "^(\[[^]]*\] )?CHANX-" | sed 's/^/  /' || echo "  (none)"
 echo ""
 
 rc=0

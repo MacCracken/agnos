@@ -104,7 +104,7 @@ qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-120}" \
 
 echo ""
 echo "  --- #DE lines from the boot log ---"
-strings "$LOG" | grep -E "^de:|^run: exit|#PF|PANIC|^fault:|AGNOS shell|agnos>" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?de:|^run: exit|#PF|PANIC|^fault:|AGNOS shell|agnos>" | sed 's/^/  /'
 echo ""
 
 pass=0; fail=0

@@ -134,8 +134,17 @@ try:
     time.sleep(1.5)
     themed = ser()[kmark:].count("theme switched")
     p(f"key-delivery probe: F3 x{NPROBE} ->", themed, "theme switches   (expect", NPROBE, "fixed /", NPROBE*2, "doubling)")
+    # ⛔ AND NOW IT REALLY ABORTS. This said the word ABORT and then fell straight through to the
+    # F6/F5 sequence and the verdict, so a run in which ZERO keys reached the compositor still
+    # printed "NOT REPRODUCED: the compositor survived the sequence" and exited 0 — a pass issued
+    # for a sequence that was never delivered. themed == 0 IS the empty input set: no key arrived,
+    # so nothing downstream can distinguish "the fix holds" from "the harness typed into the void".
     if themed == 0:
         p("ABORT: no key reached the compositor — the sequence below cannot be trusted")
+        p("INCONCLUSIVE: key-delivery probe scored 0 theme switches, verdict withheld")
+        try: s.sendall(b"quit\n")
+        except Exception: pass
+        qemu.terminate(); sys.exit(2)
 
     # ⛔ THE SEQUENCE. Mouse to a window edge and PRESS-AND-HOLD so a resize grip is caught and the
     # gesture is left IN FLIGHT — that is the state the iron log shows ("resize started", never a
@@ -165,6 +174,12 @@ try:
         except Exception: pass
         qemu.terminate(); sys.exit(2)
 
+    # ⚠ SECOND MARK, AND IT IS LOAD-BEARING FOR THE VERDICT. Everything from here on IS the
+    # experiment; `smark` is what lets the verdict below tell "the compositor took the sequence and
+    # lived" apart from "the serial log stopped before the sequence ran". See the floor at the
+    # verdict. The mouse has not moved at all before this point, so on any run where the guest is
+    # still alive this window necessarily carries the first-sight pointer lines.
+    smark = len(ser())
     mon("mouse_move 0 0", 0.3)          # park at origin
     mon("mouse_move 700 500", 0.4)      # onto a client window's lower-right region
     mon("mouse_button 1", 0.6)          # PRESS AND HOLD — resize grip caught
@@ -182,12 +197,33 @@ try:
     mon("mouse_button 0", 0.5)          # release at last
     time.sleep(4.0)
 
-    out = ser()[mark:]
+    # ⚠ VACUITY FLOOR. READ THE VERDICT BELOW AS THE DOUBLE NEGATIVE IT IS: "survived" was asserted
+    # from the ABSENCE of two strings in `out`, and an EMPTY `out` contains neither. Every one of
+    # these printed "NOT REPRODUCED: the compositor survived the sequence" and exited 0 — QEMU killed
+    # by the host or by an OOM, the host disk full so the serial file stopped growing, the guest
+    # wedged the instant the client spawned. That is a clean bill of health issued for a machine that
+    # had stopped talking, and it is the same shape as the postfix run that scored "survived" for a
+    # window it never spawned (the `spawned` guard above exists because of that one). The `spawned`
+    # guard only covers a launcher that never fired; it says nothing about a compositor that spawned
+    # and then went silent, which is precisely the state a fault-under-test produces.
+    # ⭐ SO A SURVIVAL CLAIM NOW NEEDS POSITIVE EVIDENCE THAT THERE WAS SOMETHING ALIVE TO SURVIVE,
+    # and the evidence is PRINTED, not implied: a run reporting "0 B during the sequence" is telling
+    # the operator its own experiment stopped, not that the press-gate fix holds.
+    # ⚠ `alive` was already computed here and never read once — and was written `... or not faulted`,
+    # which is unconditionally true exactly when the fault is absent, i.e. in the only branch that
+    # would ever have consulted it. It is a real oracle now, spelled without the tautology.
+    out    = ser()[mark:]
+    seqlog = ser()[smark:]               # ⛔ the sequence window — see `smark` above
     faulted   = "fault: pid=" in out
     exited142 = "exit 142" in out
-    alive     = "aethersafha:" in ser()[-4000:] or not faulted
+    alive     = "aethersafha:" in ser()[-4000:]
+    qemu_up   = qemu.poll() is None
 
     p("---- verdict ----")
+    p(f"  serial since compositor up : {len(out)} B")
+    p(f"  serial during the sequence : {len(seqlog)} B")
+    p("  compositor still on serial :", alive)
+    p("  qemu still running         :", qemu_up)
     p("  page fault observed :", faulted)
     p("  exit 142 observed   :", exited142)
     for ln in out.splitlines():
@@ -195,6 +231,9 @@ try:
             p("   |", ln.strip()[:150])
     if faulted or exited142:
         p("REPRODUCED: the compositor faulted in QEMU on the iron sequence"); rc = 1
+    elif not out.strip() or not seqlog.strip() or not alive or not qemu_up:
+        p("INCONCLUSIVE: the guest stopped talking — an empty serial window proves nothing survived")
+        rc = 2
     else:
         p("NOT REPRODUCED: the compositor survived the sequence"); rc = 0
 finally:

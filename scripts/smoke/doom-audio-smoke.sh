@@ -154,7 +154,7 @@ PY
 fi
 
 echo ""
-echo "  --- snd/hda lines ---"; strings "$SLOG" | grep -aiE "^snd:|^hda:" | sed 's/^/    /' | head -12
+echo "  --- snd/hda lines ---"; strings "$SLOG" | grep -aiE "^(\[[^]]*\] )?snd:|^hda:" | sed 's/^/    /' | head -12
 echo "  full serial: $SLOG   wav: $WAV"
 echo ""
 [ "$rc" -eq 0 ] && echo "doom-audio-smoke: PASS — cyrius-doom SFX play through the sovereign HDA output on AGNOS" || echo "doom-audio-smoke: FAIL"

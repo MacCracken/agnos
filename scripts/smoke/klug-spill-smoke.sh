@@ -125,7 +125,7 @@ elif [ "${REPORTED:-0}" -gt 0 ] && [ "${SPILL_BYTES:-0}" -ge "${REPORTED:-1}" ];
     # Byte-level: once the serial console is up, the ring and the console must agree EXACTLY.
     #
     # ⛔⛔ THIS ORACLE WAS NEARLY VACUOUS AND ITS OWN NARROWING IS WHAT HID THAT. It enumerated
-    # `grep -a "^klug: "` and required zero misses — but a KLUG_SPILL_SELFTEST boot puts exactly ONE
+    # `grep -a "^klug: "` (anchored, no prefix tolerance) and required zero misses — but a KLUG_SPILL_SELFTEST boot puts exactly ONE
     # `klug: `-tagged line in the spill (`spill file ready`; `spilled N bytes` is printed AFTER the
     # snapshot is taken, so it is never in it). So the "independent oracle" compared 1 line out of 83.
     # And had that count gone to 0 — which ANY prefix in front of the tag does, a `[    4.123456] `

@@ -90,7 +90,7 @@ qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
 
 echo ""
 echo "  --- Wuninit self-test line ---"
-strings "$LOG" | grep -E "^ext2w: Wuninit" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?ext2w: Wuninit" | sed 's/^/  /'
 echo ""
 
 rc=0

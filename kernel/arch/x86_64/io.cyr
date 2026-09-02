@@ -72,6 +72,27 @@ fn rdtsc() {
     return result;
 }
 
+# Microseconds since the first statement of the boot body — the kernel log timebase (1.56.58).
+#
+# ⛔ THIS IS A FUNCTION, NOT AN INLINE READ IN kprint.cyr, BECAUSE kprint.cyr IS UNCONDITIONAL.
+# core/kprint.cyr is included at agnos.cyr:57, OUTSIDE both #ifdef ARCH_X86_64 blocks (10-27 and
+# 76-131), so it compiles on aarch64 too — while klog_tsc_boot / klog_tsc_per_us and rdtsc are
+# x86-only. Referencing them from kprint.cyr directly is exactly the cross-arch leak class already
+# filed at docs/development/issues/2026-08-28-p1-audit-sweep-backlog.md. The seam is the one
+# proc.cyr already uses for its x86 page-walk helpers: a real definition here, a no-op twin in
+# arch/aarch64/stubs.cyr.
+#
+# Returns 0 — not a negative sentinel — before calibration lands, so early lines render
+# [    0.000000]. That is deliberately what Linux prints for its own pre-timekeeping lines, and a
+# log prefix has nowhere to put an error code.
+fn klog_uptime_us() {
+    if (klog_tsc_per_us == 0) { return 0; }
+    if (klog_tsc_boot == 0)   { return 0; }
+    var kd = rdtsc() - klog_tsc_boot;
+    if (kd < 0) { return 0; }               # TSC went backwards — clamp, never wrap into a huge number
+    return kd / klog_tsc_per_us;
+}
+
 # Read 64-bit value of an x86 MSR. ecx = msr number; rdmsr returns
 # edx:eax (high32:low32); combine into rax. Used by Repair (V) to
 # stamp MTRR_DEF_TYPE (0x2FF) + PAT (0x277) for the MMIO cache-attribute

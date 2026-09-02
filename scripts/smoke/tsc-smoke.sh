@@ -113,7 +113,7 @@ echo "  --- tsc lines from the boot log ---"
 # reader misdiagnosing a stopped clock as a broken udelay. Diagnosing it cost a fresh 2-minute boot.
 # ⚠ The character class covers a THIRD adopter of the pattern for free; `^tsc:|^gpu-tsc:|^hda-tsc:`
 # would have to be edited again, and this bug is precisely what "edit it again" failed to do once.
-strings "$LOG" | grep -E "^[a-z-]*tsc:|^run: exit|AGNOS shell|agnos>" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?[a-z-]*tsc:|^run: exit|AGNOS shell|agnos>" | sed 's/^/  /'
 echo ""
 
 pass=0; fail=0
@@ -130,7 +130,7 @@ chk "tsc: ring-3 probe" \
 # busy loop run with INTERRUPTS DISABLED. `run: exit 0` means the clock did not advance -- which
 # is precisely what uptime_ms#40 does on this path, and precisely the failure that cost two iron
 # burns. Any NONZERO exit is the proof.
-if strings "$LOG" | grep -qE "^run: exit 1$"; then
+if strings "$LOG" | grep -qE "^(\[[^]]*\] )?run: exit 1$"; then
     echo "PASS: ⭐ uptime_us#95 ADVANCED with interrupts off ($(strings "$LOG" | grep -oE '^run: exit [0-9]+' | tail -1))"
     pass=$((pass+1))
 else
@@ -159,10 +159,10 @@ chk "hda-tsc: PASS" \
 # one, "first match wins" silently became "whichever selftest main.cyr happens to call first".
 # A gate whose correctness depends on unrelated call ordering is a gate waiting to test the wrong
 # thing.
-CAL=$(strings "$LOG" | grep -oE "^tsc: [0-9]+ cycles" | grep -oE "[0-9]+" | head -1)
+CAL=$(strings "$LOG" | grep -oE "^(\[[^]]*\] )?tsc: [0-9]+ cycles" | grep -oE "[0-9]+" | head -1)
 tsc_accessor_chk() {
     _name="$1"; _tag="$2"; _what="$3"
-    _got=$(strings "$LOG" | grep -oE "^${_tag}: [0-9]+/4 arms; per_us [0-9]+" | grep -oE "[0-9]+$" | head -1)
+    _got=$(strings "$LOG" | grep -oE "^(\[[^]]*\] )?${_tag}: [0-9]+/4 arms; per_us [0-9]+" | grep -oE "[0-9]+$" | head -1)
     if [ -n "$CAL" ] && [ -n "$_got" ] && [ "$CAL" = "$_got" ]; then
         echo "PASS: ⭐ $_name timing uses the CALIBRATED clock (accessor $_got == calibrated $CAL)"
         pass=$((pass+1))

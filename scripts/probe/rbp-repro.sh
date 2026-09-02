@@ -12,6 +12,35 @@
 # A #PF is v=0e; its CR2 is the faulting linear address. A clean boot takes
 # zero v=0e events. The RBP smash shows as a v=0e at cpl=3 with CR2 in 0x37fxxx.
 #
+# ⚠⚠ VACUITY FLOOR. THIS PROBE MAKES A NEGATIVE CLAIM, AND A NEGATIVE CLAIM OVER AN EMPTY LOG IS
+# WORTH NOTHING. Until 1.56.58 the verdict was one line — `[ "$smash" -eq 0 ] && echo "RESULT: NO
+# RBP smash across $boots boots"` — with nothing standing between "the awk found no 0x37fxxx CR2"
+# and "the smash is gone". The awk finds nothing over an EMPTY file too: on a missing or zero-byte `$INT` its
+# `END { printf("PFTOTAL=%d SMASHTOTAL=%d") }` emits `0 0`, the `${sm_n:-0}` default below launders
+# a failed awk into the same 0, and the script announces "NO RBP smash across 50 boots" having
+# examined 50 empty logs. That is not hypothetical here: state.md records that OVMF "intermittently
+# never hands off, ~1 run in 4 idle, far worse under load" — the log ends at "Please select boot
+# device", the kernel never runs, and this probe scores the run green. The same hole swallows a
+# QEMU build that ignores `-d int`, a `-D` that could not create the file, and a future QEMU whose
+# event header stops spelling `v=` (at which point the awk matches nothing and reports a clean tree).
+#
+# So both counters this probe already computes are now ASSERTED rather than merely printed:
+#   · exception records scanned — the enumeration the smash test runs over. Zero means the parse
+#     read nothing, not that the kernel faulted nothing. A real boot emits thousands.
+#   · boots that reached the `[ASSIST] >` prompt — line 42 has computed this since the probe was
+#     written and nothing ever tested it. The smash is a SYSCALL-path fault taken by ring-3 code;
+#     a boot that never reached the shell never issued the mmap, so "no smash" over such boots is
+#     a statement about a syscall that was never made.
+# ⭐ THE FLOORS GATE ONLY THE AFFIRMATIVE VERDICT. A detected smash is self-evidencing — you found
+# the thing — so `smash > 0` still reports STILL PRESENT without consulting them. The floors exist
+# to stop the OTHER branch, which is the one that can be true by accident.
+# ⚠ The prompt floor is `> 0`, NOT `== boots`, deliberately: with OVMF flaking one boot in four,
+# demanding every boot reach userland would make this probe cry wolf about firmware. The ratio is
+# printed instead, so a 1/50 reach rate is visible rather than asserted away.
+#
+# Exit: 0 = proven clean · 1 = smash reproduced · 2 = INCONCLUSIVE (measured nothing). Previously
+# every path exited 0 (the status of the trailing echo), so a caller could not tell the three apart.
+#
 # Usage:  N=50 sh scripts/probe/rbp-repro.sh
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
@@ -23,7 +52,7 @@ OVMF_CODE="${OVMF_CODE:-/usr/share/edk2/x64/OVMF_CODE.4m.fd}"
 OVMF_VARS_SRC="${OVMF_VARS_SRC:-/usr/share/edk2/x64/OVMF_VARS.4m.fd}"
 [ -f "$IMG" ] || { echo "ERROR: image $IMG not built — run agnsh-smoke.sh first"; exit 1; }
 
-smash=0; reached=0; pf_total=0; boots=0
+smash=0; reached=0; pf_total=0; boots=0; ev_total=0; blind=0
 LOGD="$WORK/rbp-repro"; rm -rf "$LOGD"; mkdir -p "$LOGD"
 i=1
 while [ "$i" -le "$N" ]; do
@@ -41,11 +70,28 @@ while [ "$i" -le "$N" ]; do
 
     if strings "$SER" | grep -q '\[ASSIST\] >'; then reached=$((reached+1)); fi
 
+    # ⚠ BLIND-BOOT GUARD, BEFORE THE AWK RUNS. An absent or zero-byte `-d int` log is not "a boot
+    # that took no faults", it is a boot this probe could not read — and the two are indistinguish-
+    # able downstream, because awk on a missing file writes to stderr, prints nothing, and leaves
+    # `$res` empty, which the `${pf_n:-0}` / `${sm_n:-0}` defaults below turn into a clean score.
+    # Count it as blind here so it can never be spent as evidence at the verdict.
+    if [ ! -s "$INT" ]; then
+        blind=$((blind+1))
+        echo "  [boot $i] BLIND: no -d int log at $INT — this boot measured nothing"
+        i=$((i+1))
+        continue
+    fi
+
     # awk pass: walk each event block. Remember the v= header (vector + cpl),
     # and when we hit the CR2= line inside a v=0e block, test the CR2 value.
     # Emit a line per #PF and flag RBP-smash CR2 (0x37f000-0x37ffff).
     res=$(awk '
         /v=[0-9a-fA-F]+/ {
+            # ev is the ENUMERATION COUNT for the assertion below — every event record this pass
+            # actually saw. Reported, not implied: a boot that says 0 records is reporting that the
+            # parse read nothing (empty log, -d int unsupported, header no longer spelled "v="),
+            # which is a different fact from "this boot took no page faults".
+            ev++;
             cur_v=""; cur_cpl=""; cur_ip="";
             if (match($0, /v=[0-9a-fA-F]+/))  { cur_v=substr($0,RSTART+2,RLENGTH-2); }
             if (match($0, /cpl=[0-9]+/))      { cur_cpl=substr($0,RSTART+4,RLENGTH-4); }
@@ -66,11 +112,17 @@ while [ "$i" -le "$N" ]; do
                 cur_v="";  # consume
             }
         }
-        END { printf("PFTOTAL=%d SMASHTOTAL=%d\n", pf+0, smash+0); }
+        END { printf("PFTOTAL=%d SMASHTOTAL=%d EVTOTAL=%d\n", pf+0, smash+0, ev+0); }
     ' "$INT")
 
     pf_n=$(printf '%s\n' "$res" | sed -n 's/.*PFTOTAL=\([0-9]*\).*/\1/p'); pf_n=${pf_n:-0}
     sm_n=$(printf '%s\n' "$res" | sed -n 's/.*SMASHTOTAL=\([0-9]*\).*/\1/p'); sm_n=${sm_n:-0}
+    ev_n=$(printf '%s\n' "$res" | sed -n 's/.*EVTOTAL=\([0-9]*\).*/\1/p'); ev_n=${ev_n:-0}
+    ev_total=$((ev_total + ev_n))
+    if [ "$ev_n" -eq 0 ]; then
+        blind=$((blind+1))
+        echo "  [boot $i] BLIND: $INT holds no 'v=' event records — the smash scan ran over nothing"
+    fi
     pf_total=$((pf_total + pf_n))
     if [ "$sm_n" -gt 0 ]; then
         smash=$((smash + sm_n))
@@ -83,6 +135,46 @@ done
 echo ""
 echo "=== rbp-repro: $boots boots ==="
 echo "  reached [ASSIST] > prompt : $reached / $boots"
+echo "  boots with a readable log : $((boots - blind)) / $boots"
+echo "  exception records scanned : $ev_total"
 echo "  total ring-any #PF (v=0e) : $pf_total"
 echo "  RBP-SMASH faults (0x37fxx): $smash"
-[ "$smash" -eq 0 ] && echo "RESULT: NO RBP smash across $boots boots" || echo "RESULT: RBP smash STILL PRESENT ($smash)"
+echo ""
+
+# ⭐ A DETECTED SMASH NEEDS NO FLOOR — finding the thing is its own evidence. Report and get out
+# before the vacuity checks, so a run that reproduces the bug on one readable log out of fifty is
+# still reported as a reproduction and not downgraded to "inconclusive".
+if [ "$smash" -gt 0 ]; then
+    echo "RESULT: RBP smash STILL PRESENT ($smash)"
+    exit 1
+fi
+
+# ⚠ EVERYTHING BELOW EXISTS BECAUSE `smash -eq 0` IS ALSO WHAT AN UNREAD LOG LOOKS LIKE. See the
+# VACUITY FLOOR note in the header: 50 boots that die in the OVMF menu produce 50 empty `-d int`
+# logs, zero matches, and — before 1.56.58 — the sentence "RESULT: NO RBP smash across 50 boots".
+vac=0
+if [ "$ev_total" -eq 0 ]; then
+    echo "  ⛔ zero exception records were scanned across all $boots boots."
+    echo "     The smash test ran over an empty set. Either no -d int log was written (QEMU"
+    echo "     rejected -d int, or -D could not create the file), or the event header this pass"
+    echo "     greps for ('v=XX') is no longer how this QEMU spells it. Check $LOGD/int-1.log."
+    vac=1
+fi
+if [ "$reached" -eq 0 ]; then
+    echo "  ⛔ not one boot reached the [ASSIST] > prompt."
+    echo "     The RBP smash is taken by ring-3 code across the mmap syscall. A boot that never"
+    echo "     got to agnsh never issued that syscall, so 'no smash' over these boots is a claim"
+    echo "     about a code path that did not run. Usual cause: OVMF never handed off (state.md —"
+    echo "     ~1 idle run in 4). Check $LOGD/ser-1.log for the kernel banner."
+    vac=1
+fi
+if [ "$vac" -ne 0 ]; then
+    echo "RESULT: INCONCLUSIVE — this run measured nothing about the RBP smash ($boots boots)"
+    exit 2
+fi
+
+if [ "$reached" -lt "$boots" ]; then
+    echo "  note: the verdict below rests on the $reached boot(s) that reached userland, not all $boots."
+fi
+echo "RESULT: NO RBP smash across $boots boots ($reached reached the prompt, $ev_total records scanned)"
+exit 0

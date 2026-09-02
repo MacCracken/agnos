@@ -336,7 +336,13 @@ if [ "$PYRC" != "0" ]; then
 fi
 
 dd if="$IMG" bs=1M skip=33 count=67 of="$WORK/part-post.img" status=none
-e2fsck -fn "$WORK/part-post.img" > "$LOGS/fsck-post.log" 2>&1 || true
+# e2fsck's exit code is NOT the cleanliness oracle (see the ⚠ block below) — but it is
+# the only signal that separates "checked the filesystem and reached a verdict" from
+# "never ran / died mid-pass", and the structural gate at the bottom needs to know the
+# difference before it believes its own silence. So CAPTURE it rather than launder it
+# away with a bare `|| true`.
+FSCKRC=0
+e2fsck -fn "$WORK/part-post.img" > "$LOGS/fsck-post.log" 2>&1 || FSCKRC=$?
 dumpe2fs -h "$WORK/part-post.img" > "$LOGS/dumpe2fs-post.log" 2>&1 || true
 
 # ⚠ THE ORACLE IS `dumpe2fs`'s "Filesystem state", NOT e2fsck's exit code.
@@ -355,12 +361,54 @@ case "$FSSTATE" in
         rc=1 ;;
 esac
 # Structural consistency is a separate question from cleanliness; report it too.
-if grep -qiE "^(Pass 5|.*: [0-9]+/[0-9]+ files)" "$LOGS/fsck-post.log"; then
+#
+# ⚠ VACUITY FLOOR. The damage grep below used to sit inside an `if` whose condition was a
+# FORMAT MATCH over e2fsck's own report — and both halves go empty together, so the check
+# reported neither PASS nor FAIL and rc was never touched. Reproduced end to end
+# (2026-09-02) with nothing but `truncate -s 34M` on the image, i.e. a partition copy
+# shorter than the filesystem its superblock describes — a short dd, a full build disk:
+#
+#     Pass 1: Checking inodes, blocks, and sizes
+#     Error reading block 1076 (Attempt to read block ... resulted in short read). ...
+#     Error while scanning inodes (3968): Can't read next inode
+#     e2fsck: aborted                                    <- exit 8, no Pass 5, no N/M files
+#
+# Neither `^Pass 5` nor `N/M files` is in that, so the outer if was FALSE, the inner grep
+# never ran, and the tail printed NOTHING between the FSSTATE line and the verdict. Worse:
+# dumpe2fs still read the (clean) superblock at +1024, so FSSTATE said `clean` and the
+# whole smoke exited 0 over a filesystem e2fsck could not read at all. That abort text
+# even contains the word "corrupt", which the damage grep matches — the format gate
+# short-circuited away the one assertion that would have caught it.
+#
+# So: prove the check RAN before believing that it found nothing, and PRINT the evidence
+# (exit status, report line count, marker) rather than implying it — a run that says
+# "0 line(s) of report" is telling you its own parse broke, not that the disk is healthy.
+# "We could not check it" and "it is undamaged" must never be the same colour.
+#
+# The exit status is used ONLY as that liveness signal, never as the damage oracle: 0/1/2/4
+# all mean e2fsck finished and judged (the control run — barrier removed, s_state=0x0000 —
+# completes and exits 0, so this arm cannot fire on it), while 8 (operational error),
+# 16 (usage), 32 (cancelled) and 128+n (killed by a signal) are exactly the statuses under
+# which the report goes missing.
+FSCKREPORT=0
+if grep -qiE "^(\[[^]]*\] )?(Pass 5|.*: [0-9]+/[0-9]+ files)" "$LOGS/fsck-post.log"; then FSCKREPORT=1; fi
+FSCKRAN=0
+case "$FSCKRC" in 0|1|2|4) FSCKRAN=1 ;; esac
+FSCKLINES="$(grep -c . "$LOGS/fsck-post.log" 2>/dev/null || true)"
+[ -n "$FSCKLINES" ] || FSCKLINES=0
+echo "  e2fsck: exit $FSCKRC, $FSCKLINES line(s) of report, completion marker=$FSCKREPORT"
+if [ "$FSCKREPORT" = 1 ] && [ "$FSCKRAN" = 1 ]; then
     if grep -qiE "FIXED|UNEXPECTED|corrupt|Inode .* is invalid" "$LOGS/fsck-post.log"; then
         echo "  FAIL: e2fsck reported structural damage (see $LOGS/fsck-post.log)"; rc=1
     else
         echo "  ok: e2fsck found no structural damage"
     fi
+else
+    echo "  FAIL: e2fsck never produced a complete report — structural integrity is UNVERIFIED"
+    echo "        (exit $FSCKRC, $FSCKLINES line(s), completion marker=$FSCKREPORT; see $LOGS/fsck-post.log)"
+    echo "        A missing report is not a clean one. If e2fsck's output format moved, repair the"
+    echo "        completion pattern above — do not delete this arm."
+    rc=1
 fi
 
 echo ""

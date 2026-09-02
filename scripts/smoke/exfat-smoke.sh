@@ -15,13 +15,18 @@
 #
 # Optional file readback: if you seed EXFTEST.BIN (3000 B, byte[i]=i&0xFF)
 # into the exFAT volume (e.g. via `sudo mount -t exfat`), the kernel also
-# prints `exfatr: file-read OK`. Not required for this smoke to PASS.
+# prints `exfatr: file-read OK`. Not required for this smoke to PASS — but
+# ⚠ EXFAT_SEED=1 IS ALL-OR-NOTHING: arming that lane and failing to seed is a
+# hard error (exit 1), never a downgrade to the unseeded lane. See the seed
+# block below for the run that scored PASS by seeding nothing.
 #
 # Build first:  EXFAT_SELFTEST=1 ./scripts/build.sh
 # Requires: qemu-system-x86_64, OVMF, parted, sgdisk, mtools (mformat/mmd/
 #           mcopy for the ESP), mkfs.exfat (exfatprogs), dd, strings.
-#           gnoboot at ../gnoboot/build/.
-# Exit 0 if both gates pass; 1 otherwise.
+#           gnoboot at ../gnoboot/build/. EXFAT_SEED=1 additionally needs
+#           sudo + cmp.
+# Exit 0 if every assertion the run's lane promises passed; 1 otherwise; 2 if
+# QEMU produced no output at all (launch failure, not an exFAT result).
 
 set -u
 
@@ -98,9 +103,31 @@ mkfs.exfat -c 512 "$EXPART" >/dev/null 2>&1 || { echo "ERROR: mkfs.exfat failed"
 # file-set read path). Without it the smoke validates mount + the upcase
 # chain-read oracle only. The seed runs on the standalone exfat.part BEFORE
 # it's dd'd into the image, so it survives.
+#
+# ⛔ ASKING FOR THE SEED AND NOT GETTING IT IS A HARD ERROR, NOT A WARNING. Until 1.56.58 a failed
+# loop mount printed "WARNING: seed mount failed — continuing without a seeded file", left SEEDED=0,
+# and fell through to the unseeded lane — which SKIPS both hard gates the seed exists to arm (the
+# byte-exact 0x85/0xC0/0xC1 file-set readback and the ls-name reconstruction) and then prints
+# "exFAT read smoke: PASS". MEASURED 2026-09-02 with the loop mount forced to fail: exit 0, verdict
+# PASS, two gates silently gone, and the only trace was a WARNING that scrolled past. The smoke
+# passed BECAUSE the setup it needed had failed. A stale loop mount from a killed earlier run
+# (`losetup -a`) is the common cause on this box, so the failure mode is not hypothetical — and it
+# converts an explicitly-armed run into an unarmed one that still scores green. If the operator
+# armed this lane, a lane that cannot arm is a failure of THIS RUN.
+# ⛔ AND THE MOUNT SUCCEEDING IS NOT THE SEED SUCCEEDING. `sudo cp … && sync` had its status
+# discarded, so a cp that failed (ENOSPC, a read-only mount) still reached SEEDED=1 — and the two
+# hard gates then FAILED against a volume with no file in it, blaming the kernel for a host seeding
+# failure. Same measurement: FAKE cp failure -> "FAIL: seeded file readback", verdict FAIL, kernel
+# entirely innocent. The producer is now verified by reading the file back THROUGH the mount, which
+# is the only window in which it is readable at all.
 SEEDED=0
 if [ -n "${EXFAT_SEED:-}" ]; then
     echo "Seeding EXFTEST.BIN (3000 B, byte[i]=i%256) via in-kernel exfat mount (sudo)..."
+    # The verifier is a prerequisite of the lane, not an optional nicety: if `cmp` is missing we
+    # cannot tell a landed seed from an empty volume, and "assume it worked" is the exact shape
+    # this block was just fixed for.
+    command -v cmp >/dev/null 2>&1 || {
+        echo "ERROR: EXFAT_SEED=1 needs 'cmp' to verify the seed actually landed."; exit 1; }
     python3 - "$WORK/EXFTEST.BIN" <<'PY'
 import sys
 open(sys.argv[1], 'wb').write(bytes(i % 256 for i in range(3000)))
@@ -109,15 +136,34 @@ PY
     MNT="$WORK/mnt"; mkdir -p "$MNT"
     if sudo mount -t exfat -o loop "$EXPART" "$MNT"; then
         sudo cp "$WORK/EXFTEST.BIN" "$MNT"/EXFTEST.BIN && sync
+        # ⚠ VERIFY WHILE STILL MOUNTED. After umount that path is an ordinary empty directory and
+        # every check against it would pass on nothing — the vacuity this whole block is about.
+        if sudo cmp -s "$WORK/EXFTEST.BIN" "$MNT"/EXFTEST.BIN; then SEED_OK=1; else SEED_OK=0; fi
+        # umount runs whatever the verifier said: a volume left mounted leaks the loop device that
+        # makes the NEXT run's mount fail. Report the seed verdict only after it is released.
         if sudo umount "$MNT"; then
-            SEEDED=1
-            echo "  seeded."
+            :
         else
             echo "ERROR: seed umount failed — $MNT still mounted (would leak a loop device). Aborting."
             exit 1
         fi
+        if [ "$SEED_OK" = "1" ]; then
+            SEEDED=1
+            echo "  seeded — EXFTEST.BIN verified byte-exact (3000 B) through the mount."
+        else
+            echo "ERROR: seed did not land — EXFTEST.BIN on the mounted volume is missing or differs"
+            echo "       from the source. EXFAT_SEED=1 was requested, so the file-set read gates this"
+            echo "       run was armed for cannot be exercised. Aborting rather than downgrading to"
+            echo "       the unseeded lane, which would score PASS having verified strictly less."
+            exit 1
+        fi
     else
-        echo "  WARNING: seed mount failed — continuing without a seeded file."
+        echo "ERROR: seed mount failed — EXFAT_SEED=1 was requested and the 0x85/0xC0/0xC1 file-set"
+        echo "       read gates CANNOT run without it. NOT continuing unseeded: that path scores"
+        echo "       'exFAT read smoke: PASS' with both of those gates skipped."
+        echo "       Common cause is a stale loop mount from an earlier run — check:"
+        echo "         losetup -a ; mount | grep exfat"
+        exit 1
     fi
 fi
 
@@ -152,52 +198,119 @@ fi
 
 echo ""
 echo "  --- exfat lines from boot log ---"
-strings "$LOG" | grep -E "^exfat:|^exfatr:|^exfatu:" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?exfat:|^exfatr:|^exfatu:" | sed 's/^/  /'
 echo ""
 
 rc=0
-if strings "$LOG" | grep -q "^exfat: mounted"; then
-    echo "  PASS: exFAT mount (boot-region parse + MSFT-Basic probe)"
+
+# ⚠ VACUITY FLOOR — the pattern is scripts/check/toolchain-pin-check.sh, which asserts and PRINTS
+# its manifest count so that "1 manifest" reports a broken enumeration rather than a clean tree.
+# The same disease has a different vector here: `rc` only ever moves when a branch RUNS, so a gate
+# that is SKIPPED is indistinguishable in the verdict from a gate that passed. Two shapes were
+# MEASURED doing exactly that against this file at 1.56.57, each by replaying a canned serial log:
+#   · the kernel's file-read verdict marker renamed ("no seeded file" -> "no seed file"): the
+#     if/elif chain below fell off its end, printed NOTHING AT ALL for that lane, and the smoke
+#     reported PASS/exit 0. The assertion did not fail — it stopped existing, silently.
+#   · a log carrying "exfatr: file-read FAIL" — the kernel's OWN readback-broken verdict, which
+#     that chain never named: same result, PASS/exit 0 over an explicit kernel failure.
+# So every verdict below is counted, the count is PRINTED next to the one the lane promises, and a
+# run that scores fewer FAILS. This cannot catch a check that is wrong, only one that is absent —
+# which is the failure this file actually had, twice.
+gates=0
+gpass() { echo "  PASS: $*"; gates=$((gates + 1)); }
+gfail() { echo "  FAIL: $*"; rc=1; gates=$((gates + 1)); }
+ginfo() { echo "  (info) $*"; gates=$((gates + 1)); }
+
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfat: mounted"; then
+    gpass "exFAT mount (boot-region parse + MSFT-Basic probe)"
 else
-    echo "  FAIL: exFAT mount (no 'exfat: mounted' in log)"; rc=1
+    gfail "exFAT mount (no 'exfat: mounted' in log)"
 fi
-if strings "$LOG" | grep -q "^exfatu: upcase-checksum OK"; then
-    echo "  PASS: multi-cluster FAT-chain read (upcase TableChecksum reproduced)"
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatu: upcase-checksum OK"; then
+    gpass "multi-cluster FAT-chain read (upcase TableChecksum reproduced)"
 else
-    echo "  FAIL: upcase-checksum (chain read) — see log"; rc=1
+    gfail "upcase-checksum (chain read) — see log"
 fi
 # File readback: a hard gate when we seeded a file, informational otherwise.
+# ⛔ THE CHAIN MUST END IN A FAILING else. main.cyr:2031-2034 prints exactly one of three verdicts
+# on this lane — "exfatr: file-read OK", "exfatr: file-read FAIL", "exfatr: no seeded file …" — and
+# the old chain named only the first and the third. Matching none of them meant matching nothing:
+# no line printed, no rc touched, verdict PASS. That covered BOTH a renamed marker and the kernel
+# saying outright that the readback was broken.
 if [ "$SEEDED" = "1" ]; then
-    if strings "$LOG" | grep -q "^exfatr: file-read OK"; then
-        echo "  PASS: seeded EXFTEST.BIN readback byte-exact (0x85/0xC0/0xC1 file-set read)"
+    if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatr: file-read OK"; then
+        gpass "seeded EXFTEST.BIN readback byte-exact (0x85/0xC0/0xC1 file-set read)"
     else
-        echo "  FAIL: seeded file readback (no 'exfatr: file-read OK' in log)"; rc=1
+        gfail "seeded file readback (no 'exfatr: file-read OK' in log)"
     fi
-elif strings "$LOG" | grep -q "^exfatr: file-read OK"; then
-    echo "  PASS (bonus): seeded file readback byte-exact"
-elif strings "$LOG" | grep -q "^exfatr: no seeded file"; then
-    echo "  (info) no seeded file — file-set read path compiled, run EXFAT_SEED=1 to exercise it"
+elif strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatr: file-read OK"; then
+    gpass "(bonus) unseeded run found a file and read it back byte-exact"
+elif strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatr: file-read FAIL"; then
+    gfail "file readback (kernel printed 'exfatr: file-read FAIL' — a file was present and read back WRONG)"
+elif strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatr: no seeded file"; then
+    ginfo "no seeded file — file-set read path compiled, run EXFAT_SEED=1 to exercise it"
+else
+    gfail "file-read lane produced NO recognised verdict — expected one of 'exfatr: file-read OK'"
+    echo "        / 'exfatr: file-read FAIL' / 'exfatr: no seeded file' (main.cyr:2031-2034)."
+    echo "        The lane did not run, or its marker was renamed and this check silently stopped"
+    echo "        asserting anything. exfatr lines actually seen:"
+    strings "$LOG" | grep "^\(\[[^]]*\] \)\{0,1\}exfatr:" | sed 's/^/          /' || true
 fi
 # 1.39.2 VFS-lift bite 2: the shell `ls` verb reaches exFAT via
 # vfs_print_dir_secondary → exfat_print_dir. Dispatch must run clean (marker
 # printed AND boot reaches the shell after, so exfat_print_dir returned);
 # when seeded, the reconstructed name must list.
 if strings "$LOG" | grep -q "vfsls: shell ls over exFAT" && strings "$LOG" | grep -q "AGNOS shell"; then
-    echo "  PASS: shell 'ls' dispatches to exFAT (exfat_print_dir ran clean, boot completed)"
+    gpass "shell 'ls' dispatches to exFAT (exfat_print_dir ran clean, boot completed)"
 else
-    echo "  FAIL: shell ls over exFAT (no 'vfsls' marker or boot didn't complete)"; rc=1
+    gfail "shell ls over exFAT (no 'vfsls' marker or boot didn't complete)"
 fi
 if [ "$SEEDED" = "1" ]; then
     if strings "$LOG" | grep -q "EXFTEST.BIN"; then
-        echo "  PASS: shell 'ls' lists exFAT name (exfat_print_dir reconstruction)"
+        gpass "shell 'ls' lists exFAT name (exfat_print_dir reconstruction)"
     else
-        echo "  FAIL: exFAT ls name (no 'EXFTEST.BIN' in log)"; rc=1
+        gfail "exFAT ls name (no 'EXFTEST.BIN' in log)"
     fi
+fi
+
+# Four verdicts in every run — mount / upcase chain-read / file-read lane / shell-ls dispatch —
+# plus the ls-name reconstruction when the seeded lane is armed. Below that the run skipped
+# something and its verdict describes fewer properties than the reader will assume.
+EXPECT_GATES=4
+LANE="NOT ARMED"
+if [ "$SEEDED" = "1" ]; then
+    EXPECT_GATES=5
+    LANE="ARMED (seed verified byte-exact)"
+else
+    # ⚠ "SKIP:" IS THE LOAD-BEARING WORD, NOT DECORATION. sweep.sh's transcript filter is
+    # `grep -iE "PASS:|FAIL:|smoke:|ERROR|SKIP|VOID|handed off"` — a line that matches none of
+    # those is invisible in the only place these gates are normally read, which is how a lane
+    # nothing arms stayed unnoticed. This line and the verdict below are the two that get through.
+    echo "  SKIP: seeded file-set lane — EXFAT_SEED unset, so the 0x85/0xC0/0xC1 readback and the"
+    echo "        ls-name reconstruction were NOT scored by this run."
+fi
+echo ""
+echo "  assertions scored: $gates/$EXPECT_GATES   seeded file-set lane: $LANE"
+if [ "$gates" -lt "$EXPECT_GATES" ]; then
+    echo "  FAIL: only $gates of $EXPECT_GATES assertions ran — a gate was SKIPPED, not passed."
+    echo "        This smoke is vacuous below $EXPECT_GATES. Treat the verdict as void and fix the"
+    echo "        enumeration; a renamed kernel marker is the usual cause."
+    rc=1
 fi
 
 echo ""
 echo "=========================================="
-if [ "$rc" = "0" ]; then echo "exFAT read smoke: PASS"; else echo "exFAT read smoke: FAIL"; fi
+# ⚠ THE SKIP BELONGS IN THE VERDICT LINE. sweep.sh:104 runs this gate with EXFAT_SELFTEST=1 and no
+# EXFAT_SEED (`grep -rn EXFAT_SEED scripts/` matches only this file), so EVERY automated run takes
+# the unarmed lane — the file-set read path this smoke is named for is never exercised by the
+# sweep. That is a caller-side gap and cannot be fixed from here (seeding needs an interactive
+# sudo loop mount, which is why it is opt-in), but it must not be INVISIBLE: a transcript reading
+# "PASS" with no qualifier is what let it stay unnoticed.
+if [ "$rc" = "0" ]; then
+    echo "exFAT read smoke: PASS — $gates assertions, seeded file-set lane: $LANE"
+else
+    echo "exFAT read smoke: FAIL"
+fi
 echo "Logs: $LOG"
 echo "=========================================="
 exit $rc

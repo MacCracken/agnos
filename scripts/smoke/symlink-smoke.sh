@@ -114,18 +114,18 @@ qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-60}" \
 
 echo ""
 echo "  --- symlink lines from boot log ---"
-strings "$LOG" | grep -E "^SYMLINK-|^READLINK-|^exec: .*symtest|^exec: symlink|^run: exit" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?SYMLINK-|^READLINK-|^exec: .*symtest|^exec: symlink|^run: exit" | sed 's/^/  /'
 echo ""
 
 rc=0
 # Gate 1: the exerciser created the symlink via the cyrius sys_symlink peer.
-if strings "$LOG" | grep -q "^SYMLINK-CREATE-OK"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}SYMLINK-CREATE-OK"; then
     echo "  PASS: sys_symlink peer created /hn_link (cyrius #63 -> kernel symlink#63 -> ext2_symlink)"
 else
     echo "  FAIL: no 'SYMLINK-CREATE-OK' (sys_symlink did not return 0 on agnos)"; rc=1
 fi
 # Gate 2: the kernel followed the symlink on open() and read the target file.
-if strings "$LOG" | grep -q "^SYMLINK-TRAVERSE-OK"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}SYMLINK-TRAVERSE-OK"; then
     echo "  PASS: open('/hn_link') followed the symlink to /etc/hostname (ext2_path_lookup follow)"
 else
     echo "  FAIL: no 'SYMLINK-TRAVERSE-OK' (open didn't resolve through the symlink to the target bytes)"; rc=1
@@ -133,13 +133,13 @@ fi
 # Gate 3: readlink#70 read the LINK TEXT (no-follow) — the introspection peer of #63.
 # The same /hn_link path that stage 2 FOLLOWED to "archaemenid" here returns its raw
 # target "/etc/hostname" (13 B), proving ext2_path_lookup_ex(follow_last=0).
-if strings "$LOG" | grep -q "^READLINK-OK"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}READLINK-OK"; then
     echo "  PASS: readlink('/hn_link') returned the link text '/etc/hostname' (kernel readlink#70, no-follow)"
 else
     echo "  FAIL: no 'READLINK-OK' (readlink#70 didn't return the symlink's target text; open-follows but readlink no-follows)"; rc=1
 fi
 # Gate 4: clean ring-3 exit (0 = all three stages passed inside the program).
-if strings "$LOG" | grep -q "^run: exit 0"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}run: exit 0"; then
     echo "  PASS: symtest exited 0 (create + traverse + readlink all passed in ring 3)"
 else
     echo "  WARN: no 'run: exit 0' marker (the three stage markers above are the load-bearing gate)"

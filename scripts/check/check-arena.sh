@@ -99,5 +99,47 @@ if [ "$nbare" -gt 0 ]; then
 fi
 
 nannot=$(printf '%s\n' "$ANNOT" | grep -c . || true)
-echo "  checked $nannot slot(s) with declared extents, $nbare without"
+
+# --- 4. vacuity floor -------------------------------------------------------------------------------
+# ⚠ EVERYTHING ABOVE IS A COUNT-OF-FAILURES == 0 OVER AN ENUMERATION THIS SCRIPT DOES ITSELF.
+# Sections 1-3 only report what they FOUND, so an enumeration that finds nothing reports nothing and
+# the gate exits 0 having compared no slots. That is not hypothetical — the two parses at the top of
+# this file hang on three exact literals: a COLUMN-0 `var` with a single space after it, an
+# ALL-CAPS `_SUBOFF` name, and the annotation spelled `-> ends 0x`. Re-indent the block by one space
+# (a formatter pass does exactly that), tab-align the `var`, lowercase one name, or re-spell the
+# annotation, and both ANNOT and BARE come back empty. The old form then printed
+# `checked 0 slot(s) with declared extents, 0 without` and exited 0 — proven, not argued: run against
+# a gpu_regs.cyr with every declaration indented one space it scored a clean PASS over an arena it
+# had not looked at. In a region set where VM_CONTEXT0 is disabled that green tick is worth nothing:
+# the collision it would have caught still lands on the console framebuffer or the PSP TMR.
+#
+# So the enumeration is ASSERTED, not implied, and the counts PRINT on success. Two axes, because
+# there are two ways for it to come back short:
+#   (a) FLOOR — how many slots exist at all, counted by a LOOSE grep that deliberately shares none of
+#       the anchoring the parses above depend on (leading whitespace allowed, any case, any spacing).
+#       The extent sweep annotated 47 and this file has only grown since (62 today), so a run that
+#       reports fewer than 40 is reporting that its own enumeration broke, not that the arena shrank.
+#   (b) RECONCILIATION — every declaration the loose grep sees must land in ANNOT or BARE. A parse
+#       that silently drops SOME rows is the same vacuous pass as one that drops all of them, only
+#       quieter: an unparsed slot is an unchecked slot, and section 3 cannot report it as bare
+#       because section 3's own grep missed it too.
+# ⛔ Neither axis is env-overridable. BARE_IS_FATAL above exists so a tree mid-annotation can still
+# run; there is no tree in which comparing zero slots is a pass.
+ARENA_SLOT_FLOOR=40
+ndecl=$(grep -cE "^[[:space:]]*(var|const|let)[[:space:]]+[A-Za-z0-9_]*_SUBOFF[[:space:]]*=[[:space:]]*0[xX][0-9A-Fa-f]+" "$SRC" || true)
+if [ "$ndecl" -lt "$ARENA_SLOT_FLOOR" ]; then
+    echo "  check-arena: FAILED — found $ndecl arena slot declaration(s) in $SRC;"
+    echo "  this gate is vacuous below $ARENA_SLOT_FLOOR. The extent sweep annotated 47 and the file has only"
+    echo "  grown since. Finding fewer means the enumeration broke, not that the arena is clean."
+    fail=1
+elif [ "$((nannot + nbare))" -ne "$ndecl" ]; then
+    echo "  check-arena: FAILED — $ndecl slot declaration(s) present, but only $((nannot + nbare))"
+    echo "  ($nannot annotated + $nbare bare) survived the parse; $((ndecl - nannot - nbare)) row(s) were dropped by the"
+    echo "  anchored greps at the top of this script (column-0 \`var \`, ALL-CAPS name, \`-> ends 0x\`)."
+    echo "  A dropped row is an UNCHECKED slot — it is not reported as bare either, because the same"
+    echo "  grep missed it. Fix the parse or the declaration; do not let the count disagree."
+    fail=1
+fi
+
+echo "  checked $nannot slot(s) with declared extents, $nbare without, of $ndecl declared"
 exit $fail

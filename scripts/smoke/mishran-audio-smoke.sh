@@ -147,7 +147,7 @@ PY
 fi
 
 echo ""
-echo "  --- snd/hda lines ---"; strings "$SLOG" | grep -aiE "^snd:|^hda:" | sed 's/^/    /' | head -12
+echo "  --- snd/hda lines ---"; strings "$SLOG" | grep -aiE "^(\[[^]]*\] )?snd:|^hda:" | sed 's/^/    /' | head -12
 echo "  full serial: $SLOG   wav: $WAV"
 echo ""
 [ "$rc" -eq 0 ] && echo "mishran-audio-smoke: PASS — the mishran mixer plays a mixed tone through vani -> HDA on AGNOS" || echo "mishran-audio-smoke: FAIL"

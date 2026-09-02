@@ -166,11 +166,69 @@ if [ -z "$TOTAL_LINE" ]; then
     exit 1
 fi
 
+# The producer is kernel/user/test.cyr:464-468, verbatim:
+#     serial_print("TOTAL: ", 7);  kfmt_int(test_pass);
+#     serial_print(" passed, ", 9); kfmt_int(test_fail); serial_println(" failed", 7);
+# so the line is exactly `TOTAL: <pass> passed, <fail> failed`. Parse BOTH halves. The failure
+# count is the verdict; the PASS count is the only thing that proves the verdict is about anything.
+PASSED=$(echo "$TOTAL_LINE" | sed 's/.*TOTAL: *//' | sed 's/ *passed.*//' | tr -d '[:space:]')
 FAILURES=$(echo "$TOTAL_LINE" | sed 's/.*passed, //' | sed 's/ failed.*//' | tr -d '[:space:]')
+
+# ⚠ A ROTTED PARSE MUST NOT BE ALLOWED TO DECIDE. Both extractions are unanchored substitutions: if
+# the producer's wording ever moves off `<n> passed, <n> failed`, NEITHER pattern matches and the
+# variable keeps the whole line — measured on `TOTAL: 97 ok, 6 bad`, the old form printed
+# "RESULT: TOTAL:97ok,6bad TESTS FAILED". Fail-closed but unreadable, and the same rot on the pass
+# side would feed a non-number to the `-lt` in the floor below (an arithmetic error in some shells,
+# a silent 0 in others — i.e. it would take the floor out with it). Demand digits from both, and
+# name the line that broke rather than describing it as a kernel failure.
+BAD_PARSE=""
+case "$PASSED"   in ''|*[!0-9]*) BAD_PARSE="pass count '$PASSED'" ;; esac
+case "$FAILURES" in ''|*[!0-9]*) BAD_PARSE="${BAD_PARSE:+$BAD_PARSE and }fail count '$FAILURES'" ;; esac
+if [ -n "$BAD_PARSE" ]; then
+    echo "ERROR: ktest.sh could not parse $BAD_PARSE out of the suite's TOTAL line:" >&2
+    echo "         $TOTAL_LINE" >&2
+    echo "       This harness's parse has diverged from kernel/user/test.cyr's reporter — the run is" >&2
+    echo "       unscored, NOT green. Fix the extraction here to match the producer's wording." >&2
+    exit 1
+fi
+
+# ⛔⛔ VACUITY FLOOR — WITHOUT IT THIS HARNESS CERTIFIES A KERNEL THAT RAN ZERO TESTS. The verdict
+# below is a statement about the FAILURE count alone, and "0 failed" is precisely what a suite that
+# executed nothing reports. All seven check bodies in sh_cmd_test() (pmm, heap, vfs, proc, syscall,
+# kstdlib, initrd — user/test.cyr) are `#ifdef TEST`-gated, and so is the reporter that prints this
+# line; compile the bodies out while the reporter survives — one mis-scoped `#ifdef`, or a build.sh
+# that stops prepending `#define TEST` ahead of the check bodies but not the runner — and the kernel
+# emits `TOTAL: 0 passed, 0 failed` followed by `ALL TESTS PASSED`, and the old form exited 0
+# announcing RESULT: ALL TESTS PASSED. Measured 2026-09-02 against that exact serial text. The -z
+# guard above catches only a MISSING TOTAL line; it has never fired on one reporting zero tests.
+# ⚠ So the executed count is asserted AND PRINTED on success rather than implied: a run that says
+# "3 checks" is reporting that the suite stopped being built, not that the kernel is clean.
+# ⚠ FLOOR DERIVATION, FROM RECORDED RUNS — do not round it to a nicer number without redoing this.
+# Every executed tally this tree has on record: 103 (97 passed / 6 failed, 1.56.51 — the header note
+# above), 109 (103/6, mid-1.56.52 CHANGELOG), 110 (107/3, end of 1.56.52 — state.md and CHANGELOG;
+# the three reds are the environmental [initrd] checks gnoboot cannot satisfy, not regressions —
+# i.e. THE HEALTHY TREE EXITS 1 HERE TODAY). `grep -c test_assert
+# kernel/user/test.cyr` counts 117 call sites across the seven bodies, the two largest being kstdlib
+# (30) and vfs (23) — measured 2026-09-02. 64 sits far enough below the 103-110 band that adding or
+# retiring a handful of assertions never cries wolf, and far enough above the 57 that would survive
+# BOTH of those bodies vanishing (110 - 53) that a suite which lost its two largest halves cannot
+# report green. It is a constant on purpose: an env-var override would be one `KTEST_MIN_CHECKS=0`
+# away from restoring exactly the vacuum it exists to close.
+KTEST_MIN_CHECKS=64
+EXECUTED=$((PASSED + FAILURES))
+if [ "$EXECUTED" -lt "$KTEST_MIN_CHECKS" ]; then
+    echo "ERROR: the in-kernel suite executed only $EXECUTED checks ($PASSED passed, $FAILURES failed);" >&2
+    echo "       this gate is vacuous below $KTEST_MIN_CHECKS and scores the run UNVERIFIED, not passed." >&2
+    echo "       Zero failures out of a suite that ran nothing is not a pass. Check that scripts/build.sh" >&2
+    echo "       still prepends '#define TEST' and that sh_cmd_test()'s seven check bodies are INSIDE" >&2
+    echo "       the TEST #ifdef rather than compiled away beneath a surviving reporter." >&2
+    exit 1
+fi
+
 if [ "$FAILURES" = "0" ]; then
-    echo "RESULT: ALL TESTS PASSED"
+    echo "RESULT: ALL TESTS PASSED — $EXECUTED checks executed (floor $KTEST_MIN_CHECKS), 0 failed"
     exit 0
 else
-    echo "RESULT: $FAILURES TESTS FAILED"
+    echo "RESULT: $FAILURES TESTS FAILED — $EXECUTED checks executed (floor $KTEST_MIN_CHECKS), $PASSED passed"
     exit 1
 fi

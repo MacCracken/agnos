@@ -29,8 +29,45 @@ root=sys.argv[1]; bad=0
 # `vfs_read(fd, &cbuf, 512)`), one of them remotely triggered, and kfmt.cyr's callers held a 17-byte
 # write into 16-byte buffers. Both rules below would have flagged them on the day they were written.
 # A gate that is right and not pointed at the code is indistinguishable from no gate.
-files=sorted(glob.glob(root+'/tests/**/*.cyr', recursive=True)
-             +glob.glob(root+'/kernel/**/*.cyr', recursive=True))
+tests_f=sorted(glob.glob(root+'/tests/**/*.cyr', recursive=True))
+kernel_f=sorted(glob.glob(root+'/kernel/**/*.cyr', recursive=True))
+files=sorted(tests_f+kernel_f)
+# ⚠ VACUITY FLOOR — THE GLOB IS ALSO HOW THIS GATE PASSES ON NOTHING, AND THE 1.56.52 REPAIR ABOVE
+# ADDED PATHS WITHOUT ADDING ONE. `bad` starts 0, so an EMPTY `files` walks straight to sys.exit(0)
+# and the shell below prints "PASS: no function-local var X[N] overruns" — the identical green line a
+# clean 265-file sweep prints. Two concrete ways that already exist here:
+#   · ROOT IS COMPUTED TWO LEVELS UP FROM $0 (line 21, and the 1.56.22 split is exactly the edit that
+#     changed how many levels that is). Move, copy or symlink this script one directory over and ROOT
+#     lands on a tree with no kernel/ and no tests/ — both globs return [], and the gate reports the
+#     kernel clean. Measured 2026-09-02: this script, unmodified, sitting at scripts/check/ in a tree
+#     whose two-levels-up ROOT holds neither directory printed the PASS line and exited 0 having
+#     opened zero files.
+#   · DROP THE `**/` (or rename/move either half) and the enumeration collapses to the 3 top-level
+#     kernel/*.cyr files across 1 directory, tests/ contributing 0 — a 99%-blind gate that still
+#     prints PASS. That is the SAME failure the header records costing four ring-0 stack overflows in
+#     kernel/user/, one remotely triggered.
+# So the enumeration is asserted and PRINTED rather than implied: a run that says "3 files across 1
+# directory" is reporting that its own glob broke, not that the kernel is clean. Floors are
+# STRUCTURAL, not hand-tuned counts that would rot as the tree grows — each half must contribute, and
+# the sweep must reach SUBDIRECTORIES, which is the entire content of the 1.56.52 fix.
+# ⚠ AND HERE IS WHAT THIS FLOOR DOES **NOT** CATCH, MEASURED 2026-09-02 SO NOBODY RE-DERIVES IT:
+# deleting only `recursive=True` does NOT empty the sweep — bare `**` degrades to `*`, so the globs
+# still return 114 files across 12 directories (of 265 across 27) and pass every floor here. A floor
+# is an anti-vacuity assertion, not a coverage assertion: it proves this run READ SOMETHING, never
+# that it read everything. Do not raise these numbers toward the live counts to chase that — a floor
+# tuned to today's tree fails on the day a subsystem is legitimately retired, and a gate that cries
+# wolf gets muted, which the header above already records this file learning the hard way.
+ndirs=len(set(os.path.dirname(p) for p in files))
+if len(tests_f)<1 or len(kernel_f)<1 or ndirs<4:
+    sys.stderr.write(
+        "  VACUOUS: enumerated %d .cyr file(s) across %d director(ies) "
+        "(tests/ %d, kernel/ %d) under %s\n"
+        %(len(files),ndirs,len(tests_f),len(kernel_f),root))
+    sys.stderr.write("  This gate is vacuous below one file per half and 4 directories: the tree has\n")
+    sys.stderr.write("  kernel/{core,klib,user,arch/*,shaders/emit} plus one tests/* project per\n")
+    sys.stderr.write("  subsystem. Finding fewer means the glob or ROOT broke, not that the code is clean.\n")
+    sys.exit(2)
+nlocal=0
 for p in files:
     src=open(p).read()
     lines = src.split('\n')
@@ -48,6 +85,7 @@ for p in files:
         m=re.search(r'^\s+var (\w+)\[(\d+)\]', l)
         depth = dep[i]
         if m and depth>0:
+            nlocal+=1
             name,n=m.group(1),int(m.group(2))
             end = len(lines)
             for k in range(i+1, len(lines)):
@@ -95,8 +133,32 @@ for p in files:
                           "length of %d" % (os.path.basename(p), i+1, name, n, n, need))
                     bad = 1
                     break
+# ⚠ SECOND FLOOR — THE FILES CAN BE THERE AND THE RULES STILL RUN ON NOTHING. Both rules hang off
+# ONE regex, `^\s+var (\w+)\[(\d+)\]`, which is indentation-sensitive BY DESIGN (the leading \s+ is
+# what distinguishes a function-local — N bytes — from a module-scope declaration at column 0 — 8N
+# bytes; that distinction is this gate's entire subject). So the day the formatter, a syntax change,
+# or a `let`/`var` rename moves that shape, every one of the 359 declarations here stops matching,
+# both rules iterate zero times, and the gate prints PASS over a fully-populated 265-file sweep. That
+# is a rot no file count can see, so the count of declarations ACTUALLY EXAMINED is asserted too.
+if nlocal<1:
+    sys.stderr.write("  VACUOUS: scanned %d .cyr file(s) but matched ZERO function-local "
+                     "`var X[N]` declarations\n"%len(files))
+    sys.stderr.write("  Both rules key off that one regex; zero matches means the parse rotted, not\n")
+    sys.stderr.write("  that the kernel declares no local arrays. Real tree: 359 declarations.\n")
+    sys.exit(2)
+print("  scanned %d .cyr file(s) across %d director(ies) (tests/ %d, kernel/ %d), "
+      "%d function-local var X[N] declaration(s) examined"
+      %(len(files),ndirs,len(tests_f),len(kernel_f),nlocal))
 sys.exit(bad)
 PY
-if [ $? -eq 0 ]; then echo "  PASS: no function-local var X[N] overruns"; exit 0; fi
+rc=$?
+if [ "$rc" -eq 0 ]; then echo "  PASS: no function-local var X[N] overruns"; exit 0; fi
+# ⚠ A VACUOUS RUN IS NOT A CLEAN RUN, AND MUST NOT BORROW THE OVERRUN WORDING. check.sh:153 invokes
+# this as `>/dev/null 2>&1` and keeps only the exit status, so the exit code is the ONLY channel that
+# survives — both floors therefore fail CLOSED (rc=2 -> exit 1) rather than warning.
+if [ "$rc" -eq 2 ]; then
+    echo "  FAIL: check-array-sizing enumerated nothing — this run verified NO code (see stderr)"
+    exit 1
+fi
 echo "  FAIL: a function-local array is sized in SLOTS where Cyrius allocates BYTES"
 exit 1

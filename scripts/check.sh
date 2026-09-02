@@ -196,6 +196,8 @@ check "every shader emit list is gated exactly once (crossasm or shaderasm)" $rc
 # with the shipped, iron-proven edge_cov blob, and mutation-tested both ways (a corrupted dword and
 # a deleted one both go red).
 BLOBDRIFT=""
+BLOBN=0
+BLOBVAC=""
 # ⚠ tex_rgba and tex_list were NOT in this list until rung 14 — the two largest and most
 # intricate blobs in the tree were the two nobody was diffing. Both pass; the gap was in the gate,
 # not the tables.
@@ -205,11 +207,30 @@ BLOBDRIFT=""
 # executes the emit list — but NOTHING tied the committed HEX to either, so it could drift silently.
 # Verified by corrupting one committed dword before adding it here: check.sh stayed fully green.
 for sb in edge_setup edge_cov tri_rgba tex_rgba tex_list tex_list_cm tex_bilin blend_alpha; do
+    BLOBN=$((BLOBN + 1))
     sh "$ROOT/scripts/check/shader-blob.sh" check "$ROOT/kernel/shaders/$sb.s" "$sb" >/tmp/shader-blob-$sb.log 2>&1 \
         || BLOBDRIFT="$BLOBDRIFT$sb "
 done
-test -z "$BLOBDRIFT" && rc=0 || rc=$?
-check "shader blobs match their .s sources" $rc
+# ⚠ VACUITY FLOOR, 2026-09-02. The verdict below is `test -z "$BLOBDRIFT"` over a variable that
+# STARTS EMPTY, so the gate's success condition is satisfied by a loop that never ran a single
+# iteration. Delete the names from the `for` list — during a rebase, while extracting them to a
+# generated list, or by a stray edit to a line nobody re-reads — and check.sh prints
+# "PASS: shader blobs match their .s sources" having assembled nothing and diffed nothing. The
+# iteration count is therefore asserted (>= 8, the number this gate is written around) and, with the
+# committed .s count beside it, PRINTED: a run that says "1 of 21 committed .s checked" is reporting
+# that its own list broke, not that the tables are clean.
+# ⚠ The second number is DERIVED, not typed, and it is not a pass condition — it is the coverage gap
+# in the open. 8 of 21 is what this hand-kept list covers; blend_cov, blend_pk, blend_premul,
+# blend_rect, glyph_1bpp, grad_linear, matmul_{copy,dot,f64,i32}, perm, tri_depth and tri_persp have
+# committed hex that nothing here diffs against their source. Closing that is a scope decision, not a
+# vacuity fix — but the number now appears on every run rather than living only in an issue doc.
+# (A NAMED shader whose .s is missing is already non-vacuous: shader-blob.sh:26 exits 2 on an absent
+# source, which lands the name in BLOBDRIFT. It is the empty LIST that scored green.)
+BLOBTOTAL=$(ls "$ROOT"/kernel/shaders/*.s 2>/dev/null | grep -c . || true)
+[ "$BLOBN" -ge 8 ] || BLOBVAC="enumerated $BLOBN blob name(s), not the 8 this gate is written around — the list broke, the tree did not"
+[ -z "$BLOBVAC" ] && [ -z "$BLOBDRIFT" ] && rc=0 || rc=$?
+check "shader blobs match their .s sources ($BLOBN of $BLOBTOTAL committed .s checked)" $rc
+[ -z "$BLOBVAC" ] || echo "    VACUOUS: $BLOBVAC"
 [ -z "$BLOBDRIFT" ] || { for sb in $BLOBDRIFT; do cat /tmp/shader-blob-$sb.log; done; }
 
 # tex_list.s is tex_rgba.s's proven body under a new prologue. A copy is only as good as the proof
@@ -271,9 +292,38 @@ check "host GPU oracles (0x0C grid, r15 bilinear, r6 region, r17 depth order)" $
 # Every argument after the missing one shifted by one position, which made done_phys undefined and turned
 # the function's first statement into a wild kernel store32. It had been warning in every build since the
 # glyph refactor. This promotes that warning to a build failure.
-ARITY=$(sh "$ROOT/scripts/build.sh" 2>&1 | grep -E "expects [0-9]+ arguments, got [0-9]+" || true)
-test -z "$ARITY" && rc=0 || rc=$?
-check "call arity (no cycc argument-count warnings)" $rc
+# ⚠ VACUITY FLOOR, 2026-09-02. THE PRODUCER'S EXIT STATUS USED TO BE UNREADABLE HERE, THREE TIMES
+# OVER. The gate was one line —
+#     ARITY=$(sh "$ROOT/scripts/build.sh" 2>&1 | grep -E "expects ... arguments, got ..." || true)
+# — and this is a NEGATIVE assertion, so everything that makes the build produce no output makes it
+# pass. A pipeline's status is the LAST command's, i.e. grep's, never build.sh's; the `|| true` then
+# launders even that, so `set -e` cannot see the failure either; and check() is handed the status of
+# `test -z` on an empty string. Measured on this tree 2026-09-02: point CYRIUS_HOME at a directory
+# with no wrapper and build.sh exits 1 after three lines ("ERROR: cyrius wrapper not found"), $ARITY
+# is empty, and the gate printed "PASS: call arity (no cycc argument-count warnings)" having compiled
+# nothing. Every way the build can die early — a stale nested cyrius.cyml pin (the exact 2026-08-24
+# CI break the first gate in this file exists for), an unreachable kashi checkout, a cycc that is not
+# on PATH — reads here as a clean tree. That is the same shape as the 1.56.44 gates found unrunnable.
+# The build rc is now captured and asserted, and the number of build-output lines grep actually
+# scanned is PRINTED beside the verdict: a healthy x86_64 build emits 8 non-empty lines (measured), a
+# build that died before invoking the compiler emits 3, so a run reporting "3 build lines scanned" is
+# reporting that its own producer died rather than that the tree is clean. Floor set at 5 — three
+# lines of headroom under the healthy count, two above the dead one.
+# ⚠ NOT resolved by reusing the "x86_64 build" gate's rc from further up this file. That gate is a
+# separate invocation and its own comment does not promise to stay one; this gate must be able to
+# fail on its own producer, in its own run, without a positional dependency on a gate above it.
+ARITY_LOG=/tmp/check-arity-build.log
+sh "$ROOT/scripts/build.sh" > "$ARITY_LOG" 2>&1 && ARITY_BUILD_RC=0 || ARITY_BUILD_RC=$?
+ARITY=$(grep -E "expects [0-9]+ arguments, got [0-9]+" "$ARITY_LOG" || true)
+ARITY_LINES=$(grep -c . "$ARITY_LOG" || true)
+ARITY_VAC=""
+[ "$ARITY_BUILD_RC" = "0" ] \
+    || ARITY_VAC="build.sh exited $ARITY_BUILD_RC — a build that did not compile emits no arity warnings, so an empty result here is not evidence"
+[ -n "$ARITY_VAC" ] || [ "$ARITY_LINES" -ge 5 ] \
+    || ARITY_VAC="build.sh produced $ARITY_LINES non-empty line(s); this gate is vacuous below 5 (a healthy build emits 8)"
+[ -z "$ARITY_VAC" ] && [ -z "$ARITY" ] && rc=0 || rc=$?
+check "call arity (no cycc argument-count warnings; $ARITY_LINES build lines scanned)" $rc
+[ -z "$ARITY_VAC" ] || echo "    VACUOUS: $ARITY_VAC — see $ARITY_LOG"
 [ -z "$ARITY" ] || echo "$ARITY" | sed 's/^/    /'
 
 
@@ -325,8 +375,28 @@ done
 test -z "$VDRIFT" && rc=0 || rc=$?
 check "version in kernel" $rc
 [ -z "$VDRIFT" ] || { echo "  VERSION is $VERSION — regenerate with: sh scripts/version-bump.sh --regen"; printf "$VDRIFT"; }
-grep -q "$VERSION" "$ROOT/CHANGELOG.md" 2>/dev/null && rc=0 || rc=$?
+# ⚠ VACUITY FLOOR, 2026-09-02. THE PATTERN WAS THE INPUT SET, AND AN EMPTY ONE MATCHED EVERYTHING.
+# The gate was `grep -q "$VERSION" CHANGELOG.md`, and with $VERSION empty that is `grep -q ""`, which
+# matches every line of every file — so a VERSION file that was truncated, half-written by an
+# interrupted version-bump.sh, or unreadable scored this gate GREEN while asserting nothing about the
+# changelog at all. Nothing upstream catches it either: the `doc: VERSION` gate above is `test -f`,
+# which passes on a 0-byte file, and sibling gate "version in kernel" is immune only by accident (its
+# VFN/VGV equality comparisons happen to fail against ""). Verified 2026-09-02: `VERSION="" ; grep -q
+# "" CHANGELOG.md` returns 0. The token is now shape-checked BEFORE it is used as a pattern.
+# ⚠ And matched with -F. The dots in 1.56.58 were regex wildcards in an unanchored match, so a
+# changelog containing `1x56x58` — or `v1.56.580` for a VERSION of 1.56.58 — satisfied it. -F makes
+# the pattern mean the string it looks like; `-e` guards a VERSION that starts with a dash.
+VCLOG=""
+case "$VERSION" in
+    "")                   VCLOG="VERSION file is empty — 'grep -q \"\"' matches every line, so this gate could not fail" ;;
+    [0-9]*.[0-9]*.[0-9]*) : ;;
+    *)                    VCLOG="VERSION file does not hold an X.Y.Z token (read: '$VERSION') — refusing to use it as a pattern" ;;
+esac
+[ -n "$VCLOG" ] || grep -qF -e "$VERSION" "$ROOT/CHANGELOG.md" 2>/dev/null \
+    || VCLOG="CHANGELOG.md contains no literal '$VERSION'"
+test -z "$VCLOG" && rc=0 || rc=$?
 check "version in changelog" $rc
+[ -z "$VCLOG" ] || echo "    $VCLOG"
 
 # Binary size sanity. The 350KB bound dated to the v1.22.0 / ~250KB era and
 # went stale across the storage (1.31.x), networking (1.32.x), ext2/4-write
@@ -352,7 +422,34 @@ check "version in changelog" $rc
 # Matches scripts/test.sh (bumped in lockstep).
 echo ""
 echo "--- Binary ---"
-SZ=$(wc -c < "$ROOT/build/agnos")
+# ⚠ VACUITY FLOOR, 2026-09-02. THIS GATE MEASURED WHATEVER FILE HAPPENED TO BE ON DISK, AND NOTHING
+# TIED THAT FILE TO A BUILD IN THIS RUN. It opened `SZ=$(wc -c < "$ROOT/build/agnos")`, which failed
+# two ways:
+#   · FOSSIL. build.sh does NOT `rm -f build/agnos` before an x86_64 build — it does exactly that for
+#     aarch64 (build.sh:133, added because a stale artifact was being re-measured after a failed
+#     cross-compile), and the x86_64 path never got the same treatment. So when the build gates above
+#     fail, yesterday's binary is still sitting there, and this gate weighed it and passed. Measured
+#     2026-09-02: `CYRIUS_HOME=<empty> sh scripts/build.sh` exits 1 and leaves the previous
+#     1,997,536-byte build/agnos untouched. Same class as vendored-artifact-check.sh:6-8 — a
+#     regenerated file left over from an earlier run is not evidence about the source beside it.
+#   · ABORT. With the file absent the command substitution fails, and `set -e` kills the whole script
+#     ON THIS LINE: no FAIL line, no "N passed, M failed" summary, just a log that stops mid-run. That
+#     is precisely the truncated-log failure the header at the top of this file forbids.
+# The size is now read only when the build that WRITES that file is known to have succeeded in this
+# run, and the absent-file case reports a FAIL instead of killing the run before the summary.
+# ⚠ ARITY_BUILD_RC, not the "x86_64 build" gate's rc, because the arity gate's invocation is the LAST
+# writer of build/agnos before this line — that is the build whose output this gate is weighing. If a
+# future edit moves this gate above that one, the variable is unset, `[ "" = "0" ]` is false, and the
+# gate fails closed rather than silently returning to measuring a fossil.
+SZ=0
+SZWHY=""
+if [ ! -f "$ROOT/build/agnos" ]; then
+    SZWHY="build/agnos does not exist — there is no binary to weigh"
+else
+    SZ=$(wc -c < "$ROOT/build/agnos")
+    [ "$ARITY_BUILD_RC" = "0" ] \
+        || SZWHY="the build that writes build/agnos exited $ARITY_BUILD_RC above, and build.sh does not remove the old x86_64 artifact first — this $SZ-byte file is a fossil from an earlier run, not this run's output"
+fi
 # ⚠ 2 MB, RAISED 2026-07-26 AS DELIBERATE TEMPORARY HEADROOM — NOT a derived bound.
 # Every raise above was reactive: an arc closed a few hundred bytes over the line and the ceiling
 # moved just past it. That pattern makes the gate a rubber stamp — it can only ever fire once per
@@ -363,8 +460,9 @@ SZ=$(wc -c < "$ROOT/build/agnos")
 # gating is "growth attributable to something other than new subsystems" — a runaway-bloat detector
 # rather than a high-water mark chased upward. Re-derive it before the 3D arc closes; do not simply
 # move it again.
-test "$SZ" -gt 50000 && test "$SZ" -lt 2097152 && rc=0 || rc=$?
+[ -z "$SZWHY" ] && test "$SZ" -gt 50000 && test "$SZ" -lt 2097152 && rc=0 || rc=$?
 check "binary size ($SZ bytes)" $rc
+[ -z "$SZWHY" ] || echo "    VACUOUS: $SZWHY"
 
 echo ""
 echo "=========================="

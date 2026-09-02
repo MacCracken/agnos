@@ -84,7 +84,7 @@ qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-240}" \
 
 echo ""
 echo "  --- ext-ext self-test lines ---"
-strings "$LOG" | grep -E "^ext-ext:" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?ext-ext:" | sed 's/^/  /'
 echo ""
 
 rc=0

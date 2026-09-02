@@ -218,6 +218,34 @@ try:
     answered = ser()[lmark2:].count("crab: key received")
     p("keystrokes answered AFTER the resize:", answered)
 
+    # ⚠⚠ VACUITY FLOOR FOR THE FIVE ARMS BELOW — wheel, FULL_KEYS gating, held-key repeat, sort
+    # cycling, deferred stat drain. Every one of them is measured and printed, and until 1.56.58 not
+    # one of them reached the exit code: the verdict at the bottom of this file reads `faulted`,
+    # `refused`, `resized`, `answered` and `clicks`, and nothing else. THE CONCRETE RUN THAT EXPOSED
+    # IT: QMP never connects. ZERO wheel events and ZERO held keys are then ever SENT, so
+    # `wheel_scrolls`, `rep` and `rep_after_release` hold the zeros they were initialised to, the
+    # `⚠ no repeat observed` / `⚠ no sort line` / `⚠ no drain-complete line` branches print, and the
+    # script still ends on `PASS: crab adopted the resize, resolved N click(s), and answered M
+    # keystrokes` with rc=0. README.md credits this harness with proving the wheel wire end to end
+    # across five repos (agnos → bhumi → setu → dhancha → aethersafha); a run that sent no wheel
+    # event proves nothing about that wire and must not be allowed to say PASS.
+    # ⛔ AND `qs is not None` IS NOT THE GUARD IT LOOKS LIKE — measured, not assumed. In the retry
+    # loop below, `qs = socket.socket(...)` ALWAYS succeeds and it is `qs.connect(QMP)` that raises,
+    # so after 60 failed attempts `qs` is a live object holding a socket that was never connected.
+    # The wheel arm therefore enters its `if qs is not None:` body and dies on the first `recv` with
+    # ENOTCONN (swallowed by the arm's own `except`), and the repeat arm's `if qs is not None:`
+    # likewise runs and throws. `qs` is genuinely None only if `socket.socket()` itself fails. Both
+    # shapes end the same way — nothing sent — which is why the floors below key on SENT/ARRIVED
+    # counts rather than on `qs`.
+    # ⭐ THE FLOOR IS DELIBERATELY NOT A FAILURE VERDICT, AND THAT DISTINCTION IS THE WHOLE POINT. An
+    # arm that measured and DISAGREED — events sent and no scroll, a held key that arrived and never
+    # repeated, received == acted — keeps its ⚠ and scores exactly as it did before; that is a
+    # result, and turning results into failures would change what this harness tests. What is
+    # corrected here is only the EMPTY case: an arm whose input set was empty is not evidence, so
+    # rc=0 becomes rc=2 and the run NAMES the arms that enumerated nothing. That is the same verdict
+    # this file already returns at the key-delivery probe (`4 probes`) and at the launcher.
+    unmeasured = []
+
     # ⭐⭐⭐ THE MOUSE WHEEL, END TO END ACROSS FIVE REPOS. agnos reads HID report byte [3] (1.56.49)
     # -> bhumi carries `BHUMI_EV_SCROLL` (1.4.3) -> setu `SETU_INPUT_PTR_SCROLL` (0.8.8) -> dhancha
     # `POINTER_SCROLL` (0.9.18) -> aethersafha forwards it (0.16.21) -> crab scrolls the pane under
@@ -228,6 +256,11 @@ try:
     # CURSOR, so a wheel sent while the pointer is over empty desktop is correctly delivered nowhere.
     qs = None
     wheel_scrolls = 0
+    # ⚠ COUNT THE STIMULI, NOT JUST THE ANSWERS. `wheel_scrolls == 0` is two different runs wearing
+    # the same number: crab ignored a wheel that arrived (a result), or no wheel ever left this
+    # process (nothing was asked). Only the send count separates them, so it is counted and printed.
+    wheel_sent = 0
+    wheel_err = None
     try:
         for _ in range(60):
             try: qs = socket.socket(socket.AF_UNIX); qs.connect(QMP); break
@@ -247,6 +280,7 @@ try:
                             {"type": "btn", "data": {"down": True,  "button": direction}},
                             {"type": "btn", "data": {"down": False, "button": direction}}]}}
                         qs.sendall((json.dumps(ev) + "\n").encode())
+                        wheel_sent += 1
                         try: qs.recv(65536)
                         except Exception: pass
                         time.sleep(0.2)
@@ -255,8 +289,17 @@ try:
             time.sleep(2.0)
             wheel_scrolls = ser()[wmark:].count("crab: scroll")
     except Exception as e:
+        wheel_err = e
         p("  wheel arm error:", e)
-    p("wheel: crab resolved", wheel_scrolls, "scroll(s)")
+    p("wheel: crab resolved", wheel_scrolls, "scroll(s) from", wheel_sent, "wheel event(s) SENT")
+    if wheel_sent == 0:
+        p("  ⚠ no wheel event left this process — the wheel wire was never asked anything")
+        unmeasured.append("wheel: 0 wheel events SENT (QMP never connected"
+                          + (f", or the arm aborted: {wheel_err}" if wheel_err else "")
+                          + ") — the five-repo wheel wire was not exercised")
+    elif wheel_err is not None and wheel_scrolls == 0:
+        unmeasured.append(f"wheel: the arm aborted mid-sweep ({wheel_err}) after {wheel_sent}"
+                          " event(s) with no scroll seen — the sweep did not finish")
 
     # ⭐⭐ POINTER ARM (M2, *deferral #05*). crab is the FIRST client to decode `SETU_INPUT_PTR_MOVE`
     # — aethersafha's own note says "no shipped client decodes PTR_MOVE yet" — so nothing else has
@@ -313,6 +356,14 @@ try:
                  else "  ⚠ equal — releases either absent or NOT gated"))
         else:
             p("  ⚠ events arrived but crab acted on none — the gate may be inverted")
+    else:
+        # ⚠ THE SILENT ARM. With `alive_after_click == 0` the block above prints NOTHING — not a
+        # ratio, not a warning — so the FULL_KEYS claim vanishes from the log without a word and the
+        # verdict, which never reads either counter, goes green anyway. A ratio computed over zero
+        # events compared nothing.
+        p(f"  ⚠ 0 key events arrived after the {NKEY}-key sweep — the FULL_KEYS ratio measured nothing")
+        unmeasured.append(f"FULL_KEYS: 0 `crab: key received` after {NKEY} keys — received-vs-acted"
+                          " compared nothing")
 
     p("compositor forwarded a scroll:", "forwarded a scroll" in ser())
     # ⭐⭐ HELD-KEY REPEAT (M2 *#06* second half). HMP `sendkey` sends a press AND a release, so it can
@@ -326,6 +377,12 @@ try:
     # then it STOPS on release".
     rep = 0
     rep_after_release = 0
+    # ⚠ HOISTED OUT OF THE `if qs is not None` BELOW ON PURPOSE. `arrived` was already computed and
+    # printed inside that block for exactly the reason its own comment gives — "0 repeats" cannot
+    # separate a crab bug from a harness that never delivered the key — and then it was never read
+    # again. Out here it survives the arm being skipped wholesale (no QMP) or dying in the except,
+    # which are the two ways this arm ends up measuring nothing while still printing "fired 0 time(s)".
+    held_presses = 0
     if qs is not None:
         try:
             rmark2 = len(ser())
@@ -343,6 +400,7 @@ try:
             # down is the one thing here that has no other confirmation.
             hold_window = ser()[rmark2:]
             arrived = hold_window.count("crab: key press")
+            held_presses = arrived
             released = hold_window.count("crab: key received") - arrived
             p(f"  hold window: {arrived} press(es), {released} release(s) seen by crab")
             rep = hold_window.count("crab: key repeat")
@@ -355,13 +413,22 @@ try:
             rep_after_release = ser()[settle:].count("crab: key repeat")
         except Exception as e:
             p("  repeat arm error:", e)
-    p("held-key repeat: fired", rep, "time(s) while held ·", rep_after_release, "after release")
-    if rep > 0 and rep_after_release == 0:
+    p("held-key repeat: fired", rep, "time(s) while held ·", rep_after_release, "after release",
+      f"· {held_presses} press edge(s) reached crab")
+    if held_presses == 0:
+        # ⚠ THE EMPTY CASE, SPLIT OUT OF THE OLD CATCH-ALL `⚠ no repeat observed`. No press edge
+        # reached crab, so nothing was ever held down and there was nothing for a repeat to come
+        # from: QMP never connected (the arm did not run at all), the except above swallowed it, or
+        # the hold was dropped between the compositor's once-per-frame HID drains.
+        p("  ⚠ no held key ever reached crab — this arm measured nothing")
+        unmeasured.append("held-key repeat: 0 press edges seen by crab (QMP down, arm skipped, or"
+                          " the hold never arrived) — repeat/latch were not exercised")
+    elif rep > 0 and rep_after_release == 0:
         p("  ✅ repeat works AND stops on release")
     elif rep > 0:
         p("  ⛔ repeat did not stop on release — the held latch is not cleared")
     else:
-        p("  ⚠ no repeat observed (the key may never have reached crab)")
+        p(f"  ⚠ no repeat observed despite {held_presses} press edge(s) — a measured negative")
 
     # ⭐ SORTING (M3 *#33*). The ORDER itself is asserted on the host against a real record buffer —
     # crab does not log entry names, deliberately (the per-entry stat trace WAS the 2026-08-19
@@ -373,7 +440,8 @@ try:
     time.sleep(2.0)
     sout = ser()[smark:]
     modes = [m for m in ("name", "size", "modified", "kind") if ("crab: sort " + m) in sout]
-    p("sort modes reached:", ",".join(modes) if modes else "(none)")
+    sort_lines = sout.count("crab: sort ")
+    p("sort modes reached:", ",".join(modes) if modes else "(none)", f"({sort_lines} sort line(s))")
     # ⚠ NOT an exact sequence — QEMU drops keys between the compositor's once-per-frame HID drains, so
     # ten presses do not reliably produce ten cycles. What must hold is that MORE THAN ONE mode was
     # reached, which is the wrap and the cycle working at all.
@@ -382,7 +450,13 @@ try:
     elif len(modes) == 1:
         p("  ⚠ only one mode seen — keys may have been dropped")
     else:
+        # ⚠ ZERO sort lines is the empty set, not a small one: the `s` key never reached crab, so the
+        # cycle-and-wrap claim was checked against no observations at all. `len(modes) >= 2` failing
+        # because one mode was seen is a dropped key (kept a ⚠, above); failing because NOTHING was
+        # seen is this harness reporting that its own enumeration produced nothing.
         p("  ⚠ no sort line — the key never reached crab")
+        unmeasured.append("sort cycling: 0 `crab: sort` lines from 10 `s` presses — the cycle and"
+                          " the wrap were checked against nothing")
 
     # ⭐ THE DEFERRED STAT DRAIN COMPLETES (crab M3, *deferral #03*). The listing path no longer
     # sweeps — that saving is proven in `crab-listing-cap-test.py`, which now sees ZERO `stat-cost`
@@ -399,12 +473,20 @@ try:
     if drained:
         p("  ✅ the sizes arrive off the keystroke path")
     else:
+        # ⚠ THE ORACLE IS A SINGLE LINE, SO ITS ABSENCE IS AN EMPTY INPUT SET, NOT A NEGATIVE
+        # RESULT. Nothing here can tell "crab moved the work and the batch never completed" from
+        # "crab never reached the drain" from "the line is spelled differently now" — and the arm
+        # exists precisely because the sibling harness cannot see the drain at all. A run with no
+        # line to read has not shown the other half of *deferral #03*; it has shown nothing.
         p("  ⚠ no drain-complete line — the sizes may never have filled in")
+        unmeasured.append("deferred stat drain: no `crab: stat-drain complete` line in the whole"
+                          " session — the drain half of *deferral #03* was not observed")
 
     faulted = "fault: pid=" in ser()[mark:]
     p("kernel/userland fault:", faulted)
 
     p("---- verdict ----")
+    p(f"auxiliary arms that enumerated something: {5 - len(unmeasured)}/5")
     if faulted:
         p("FAIL: a fault occurred during the sequence"); rc = 1
     elif refused and not resized:
@@ -432,6 +514,23 @@ try:
         p(f"PASS: crab adopted the resize, resolved {clicks} click(s), and answered {answered} keystrokes")
         p("      ⇒ this also demonstrates the event loop is still turning well past 0.4.15's ~2 s cap")
         rc = 0
+
+    # ⚠⚠ THE FLOOR ITSELF — see the long note above the five arms. Applied ONLY to the rc=0 branches:
+    # a fault or a dead crab is a real finding and outranks "this run measured nothing", so FAIL keeps
+    # rc=1. What this cannot be allowed to do is print PASS over a run whose auxiliary arms had an
+    # empty input set — the exact shape the 2026-09-02 sweep found here, where QMP never connecting
+    # left all five at their initialised zeros and the script still said PASS with rc=0.
+    if rc == 0 and unmeasured:
+        p("")
+        p(f"⛔ THE LINE ABOVE IS NOT THE WHOLE RUN: {len(unmeasured)} of the 5 auxiliary arms enumerated")
+        p("   NOTHING, so this run is not evidence for what they claim to prove:")
+        for u in unmeasured:
+            p("   ·", u)
+        p("   The primary claim (resize / liveness / pointer) stands on its own inputs, but an")
+        p("   assertion over an empty set is not a pass, so the RUN does not score green.")
+        p("   Re-run; if the same arms come back empty, the wire is the bug and not the flake.")
+        p("FINAL: INCONCLUSIVE (rc=2, not the rc=0 the verdict line implies)")
+        rc = 2
     p("serial:", SER)
 finally:
     try: s.sendall(b"quit\n")

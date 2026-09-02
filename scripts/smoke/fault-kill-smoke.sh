@@ -58,16 +58,16 @@ qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
 
 echo ""
 echo "  --- fault / run lines ---"
-strings "$LOG" | grep -E "^fault:|^run:" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?fault:|^run:" | sed 's/^/  /'
 echo "  -------------------------"
 rc=0
-strings "$LOG" | grep -q "^fault: running /bin/faulter" || { echo "  FAIL: faulter never dispatched (FAULT_SELFTEST build?)"; exit 1; }
-if strings "$LOG" | grep -q "^run: exit 142"; then
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}fault: running /bin/faulter" || { echo "  FAIL: faulter never dispatched (FAULT_SELFTEST build?)"; exit 1; }
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}run: exit 142"; then
     echo "  PASS: ring-3 #PF killed the proc with exit 142 (128+vector 14)"
 else
     echo "  FAIL: no 'run: exit 142' — fault kill-code not attributed"; rc=1
 fi
-if strings "$LOG" | grep -q "^fault: SURVIVED back in kernel"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}fault: SURVIVED back in kernel"; then
     echo "  PASS: box SURVIVED — exec_and_wait resumed after a ring-3 fault (no canary halt)"
 else
     echo "  FAIL: no SURVIVED marker — the box halted on the ring-3 fault"; rc=1

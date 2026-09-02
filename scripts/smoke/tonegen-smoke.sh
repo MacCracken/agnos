@@ -93,7 +93,8 @@ import sys, struct, math
 raw = open(sys.argv[1], "rb").read()
 i = raw.find(b"data"); off = i+8 if 0 <= i and i+8 <= len(raw) else 44
 pcm = raw[off:]; n = len(pcm)//4
-if n == 0: print("SILENT peak=0 freq=0 gap=1"); sys.exit(0)
+WANT = 180  # 10ms windows the continuity check below claims to cover = 1.8s
+if n == 0: print("SILENT peak=0 freq=0 gap=1 found=0 frames=0 want=%d" % WANT); sys.exit(0)
 if n > 6000000: n = 6000000
 S = struct.unpack("<%dh" % (n*2), pcm[:n*4])
 SR = 48000
@@ -103,11 +104,14 @@ peak = max(abs(v) for v in mono)
 W = SR//100  # 10ms
 env = [math.sqrt(sum(mono[k+j]*mono[k+j] for j in range(W))/W) for k in range(0, n-W, W)]
 mx = max(env) if env else 0
-# first index where energy is sustained (>= 0.4*peak-RMS for >= 30 windows)
+# first index where energy is sustained (>= 0.4*peak-RMS for >= 30 windows).
+# `found` is reported because start=0 means BOTH "the tone starts at sample 0" and "no tone
+# was located at all", and the caller's floor has to be able to tell those two apart.
 thr = mx*0.4
 start = 0
+found = 0
 for idx in range(len(env)-30):
-    if all(env[idx+q] > thr for q in range(30)): start = idx*W; break
+    if all(env[idx+q] > thr for q in range(30)): start = idx*W; found = 1; break
 # frequency of a 0.2s slice inside that tone via zero-crossings (of the AC-coupled signal)
 seg = mono[start:start+SR//5]
 if seg:
@@ -123,22 +127,61 @@ else:
     freq = 0
 # continuity: any 30ms silence gap *within* the sustained region (start..start+1.8s)?
 gap = 0
-region = env[start//W: start//W + 180]
+region = env[start//W: start//W + WANT]
 run = 0
 for e in region:
     if e < mx*0.05: run += 1
     else: run = 0
     if run >= 3: gap = 1
-print(f"peak={peak} freq={freq} gap={gap}")
+# `frames`/`want` are the enumeration count this verdict rests on, reported rather than implied:
+# gap==0 is the empty-set answer as much as it is the clean-tone answer.
+print(f"peak={peak} freq={freq} gap={gap} found={found} frames={len(region)} want={WANT}")
 PY
 )"
     echo "  wav: $WAV ($(wc -c < "$WAV") B) — $RES"
     PK="$(echo "$RES" | sed -n 's/.*peak=\([0-9]*\).*/\1/p')"
     FQ="$(echo "$RES" | sed -n 's/.*freq=\([0-9]*\).*/\1/p')"
     GP="$(echo "$RES" | sed -n 's/.*gap=\([0-9]*\).*/\1/p')"
+    FD="$(echo "$RES" | sed -n 's/.*found=\([0-9]*\).*/\1/p')"
+    FR="$(echo "$RES" | sed -n 's/.*frames=\([0-9]*\).*/\1/p')"
+    WN="$(echo "$RES" | sed -n 's/.*want=\([0-9]*\).*/\1/p')"
     [ "${PK:-0}" -gt 3000 ] && echo "  PASS: non-silent (peak=$PK)" || { echo "  FAIL: silent (peak=$PK)"; rc=1; }
     if [ "${FQ:-0}" -ge 400 ] && [ "${FQ:-0}" -le 480 ]; then echo "  PASS: first tone ~440 Hz (measured $FQ) — pitch correct"; else echo "  WARN: first tone freq=$FQ (expected ~440)"; fi
-    [ "${GP:-1}" -eq 0 ] && echo "  PASS: no silence gap within the sustained tone (continuous)" || echo "  FAIL: silence gap detected mid-tone (a DROPOUT — the path glitches even blocking-paced)"
+    # ⚠ THE MISSING rc, AND THE VACUITY FLOOR UNDER IT. Until 1.56.58 the dropout gate was one line:
+    #     [ "${GP:-1}" -eq 0 ] && echo "  PASS: no silence gap ..." || echo "  FAIL: silence gap ..."
+    # The else branch printed the word FAIL and never touched rc, so a run that had just reported a
+    # DROPOUT fell through to the verdict below and printed "tonegen-smoke: PASS", exit 0. Measured
+    # on a synthesised capture with 100 ms zeroed out of the sustained sine: "FAIL: silence gap
+    # detected mid-tone" and "tonegen-smoke: PASS" printed from the same run. The one property this
+    # whole script exists to prove — that the snd_* path does not glitch even when kernel-paced —
+    # was unfalsifiable, and had been since the gate was written.
+    # ⚠ AND THE PASS SIDE WAS VACUOUS TOO, which is the worse half. `gap` is a count of consecutive
+    # sub-threshold windows over an UNFLOORED enumeration: `region` is up to 180 windows taken from
+    # the located tone, and when there are none the loop never runs, gap stays 0, and "no silence gap
+    # within the sustained tone" prints having examined NOTHING. That is not hypothetical — the
+    # `kill $QPID` at line 77 fires the moment the HARD timeout expires whether or not tonegen
+    # finished, and the `done_marker` check at line 86 only WARNs about the missing marker, so a
+    # boot that stalls mid-stream leaves a wav holding a fraction of a second of tone and this gate
+    # was the only thing that would have noticed. Measured against the OLD form: a 0.5 s capture scored
+    # "PASS ... (continuous)" off 49 windows, a 10 ms capture scored it off ZERO, and 100 bytes of
+    # non-audio junk scored the whole smoke green — peak clears 3000 on garbage, the pitch check is
+    # WARN-only, and nothing else was left to object.
+    # start=0 was hiding the same hole from the other end: it means "tone begins at sample 0" and
+    # "no sustained tone found" indistinguishably, so an all-silent capture measured the first 1.8 s
+    # of silence against a threshold of 5% of near-zero, matched nothing, and reported continuity.
+    # So the analyser now reports whether it LOCATED the tone and HOW MANY windows it actually read,
+    # and both are asserted here before gap is believed. A run that says "frames=49/180" is reporting
+    # that its own enumeration broke, not that the audio path is clean.
+    # ⚠ The fallbacks are deliberately the FAILING values (found=0, frames=0, want=180): if the
+    # analyser dies or its output format rots, the parse yields empty and this must fail, not sail
+    # through on a "${WN:-0}" floor of zero that every capture clears.
+    if [ "${FD:-0}" -ne 1 ] || [ "${FR:-0}" -lt "${WN:-180}" ]; then
+        echo "  FAIL: continuity unverifiable — sustained tone located=${FD:-?}, examined ${FR:-?}/${WN:-180} 10ms windows (capture truncated, silent, or analyser output unparsable)"; rc=1
+    elif [ "${GP:-1}" -eq 0 ]; then
+        echo "  PASS: no silence gap within the sustained tone (continuous across $FR/$WN 10ms windows)"
+    else
+        echo "  FAIL: silence gap detected mid-tone (a DROPOUT — the path glitches even blocking-paced)"; rc=1
+    fi
 fi
 echo ""
 [ "$rc" -eq 0 ] && echo "tonegen-smoke: PASS — clean tones stream through the agnos snd_* band" || echo "tonegen-smoke: FAIL"

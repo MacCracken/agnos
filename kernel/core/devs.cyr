@@ -64,6 +64,16 @@ fn serial_dev_write(buf, count) {
     # dumping the ~16-20 KB boot log) silently truncated to the first 4 KB — the caller
     # saw a full-looking short return and did not loop. Chunking keeps whatever per-call
     # bound the 4096 was for while emitting everything.
+    # ⛔⛔ RAISE THE RAW FLAG AROUND THE WHOLE WRITE — THIS IS WHAT KEEPS THE 1.56.58 LOG TIMESTAMP OFF
+    # USERLAND OUTPUT. Everything below is RING-3 bytes (fd 1/2), and kprint is shared with the kernel
+    # emitters, so without this every `ls`, every pipe stage, every harness-parsed program line would
+    # gain a "[    4.123456] " prefix — and the chunking makes it worse than one stray prefix: a write
+    # larger than 4096 would take a fresh prefix every chunk, mid-stream.
+    # ⚠ AROUND THE LOOP, NOT INSIDE IT. A per-chunk raise/lower would leave klog_at_bol correct but
+    # re-decorate at each chunk boundary, which is the same bug in a smaller disguise.
+    # ⚠ A COUNTER, NOT A BOOLEAN: fault_kill_current and the recovery shell can reach console output
+    # while a ring-3 write is in flight, and a boolean would be cleared by the inner exit.
+    klog_raw_depth = klog_raw_depth + 1;
     var off = 0;
     while (off < count) {
         var chunk = count - off;
@@ -71,6 +81,7 @@ fn serial_dev_write(buf, count) {
         kprint(buf + off, chunk);
         off = off + chunk;
     }
+    klog_raw_depth = klog_raw_depth - 1;
     return count;
 }
 

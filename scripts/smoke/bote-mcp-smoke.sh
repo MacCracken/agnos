@@ -105,7 +105,7 @@ qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-120}" \
 
 echo ""
 echo "  --- bote / mcp lines from boot log ---"
-strings "$LOG" | grep -E "^bote:|serverInfo|jsonrpc|agnos-kernel|^run: exit|#PF|PANIC|^fault:" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?bote:|serverInfo|jsonrpc|agnos-kernel|^run: exit|#PF|PANIC|^fault:" | sed 's/^/  /'
 echo ""
 
 rc=0

@@ -4,12 +4,38 @@ description: Tree-wide sweep of the vacuous-pass class, found while closing the 
 type: issue
 ---
 
-# Vacuous gates — 33 confirmed, tree-wide
+# Vacuous gates — 33 confirmed, 39 fixed at 1.56.58
 
-**Status: FILED 2026-09-02, UNFIXED. Found at 1.56.57, none acted on.**
-Scope decision is the operator's: this was surfaced while fixing the four klug defects that cut
-was scoped to, and fixing 33 assertions across ~30 files is a different cut, not a widening
-of that one.
+**Status: MOSTLY FIXED at 1.56.58. 39 fixed / 1 declined / surfaces still unswept — STAYS OPEN.**
+Filed 2026-09-02 at 1.56.57 with none acted on; swept the same day at 1.56.58, one agent per file,
+each fix mutation-proven against its own empty-input case and then adversarially re-verified.
+
+**Why it is not archived.** Three reasons, and none of them is bookkeeping:
+
+1. **One finding was examined and DECLINED, not fixed** — `scripts/smoke/tonegen-smoke.sh` carried a
+   second vacuity beyond the assigned one; the assigned one is fixed, the second is recorded there.
+2. **The sweep surface was a floor, not a total.** It covered `scripts/smoke/*.sh`, `check.sh`,
+   `check/*.sh`, `harness/*.py`, `probe/*`, `tool/*` and `ktest.sh`. It did **NOT** cover
+   `.github/workflows/*.yml`, `scripts/burn/*`, or the `tests/*/` per-project harnesses. Closing this
+   file requires sweeping those.
+3. ⛔ **Two fixes moved the vacuity one level up rather than removing it, and adversarial verification
+   caught both.** `scripts/harness/agnsh-kvm-test.py` GATE 2 scores `if new.strip()` over serial
+   growth — but the kernel log writes to the SAME COM1 asynchronously, so ordinary kernel chatter
+   inside the ~5 s typing window satisfies it with **zero keystrokes delivered**. A floor that any
+   unrelated producer can satisfy is not a floor. Re-verify before trusting that gate.
+
+**What shipped alongside.** Six more vacuities were found *while proving* the assigned ones and fixed
+in the same pass — `modeset-latch-smoke.sh` had 4 of the same shape, `check-carveout.sh` 3,
+`chan-semantics-check.sh` 2 — which is why 33 findings produced 39 fixes.
+
+⚠ **A regression was introduced and then closed during this work, and it is worth recording because
+it is the same class.** `kprint-len-check.sh`'s new corpus floor was first written to apply to every
+invocation, which broke the documented single-file usage (`[file ...]`, line 13); exempting single-file
+mode then re-opened the hole from the other side, since a **missing** file enumerated 0 literals and
+scored PASS. A literal COUNT cannot discriminate there at all: `kernel/core/kprint.cyr` legitimately
+holds zero matching literals, because it is where the emitters are *defined*. The floor that works is
+**"did I read every file I was handed?"**, which is true of a healthy single file, a healthy tree, and
+nothing else.
 
 ## What this is
 

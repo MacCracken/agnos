@@ -45,7 +45,12 @@ OVMF_CODE=""; for c in $OVMF_CODE_CANDIDATES; do [ -f "$c" ] && { OVMF_CODE="$c"
 OVMF_VARS_SRC=""; for c in $OVMF_VARS_CANDIDATES; do [ -f "$c" ] && { OVMF_VARS_SRC="$c"; break; }; done
 [ -z "$OVMF_CODE" ] || [ -z "$OVMF_VARS_SRC" ] && { echo "ERROR: OVMF not found"; exit 1; }
 
-for tool in qemu-system-x86_64 parted mformat mmd mcopy sgdisk mkfs.ext2 debugfs e2fsck dd strings; do
+# ⚠ dumpe2fs ADDED 1.56.58 AND IT IS LOAD-BEARING, NOT COSMETIC. The metadata_csum gate now derives
+# HOST_CSUM from `dumpe2fs`'s "Filesystem features:" line; an unreadable line sets HOST_CSUM="?" which
+# is a HARD FAIL. Undeclared, a host without it would flip this smoke from silent-pass to a confusing
+# assertion failure instead of a named missing-tool error. It ships in e2fsprogs beside e2fsck, which
+# is already required — so this costs nothing and removes the confusing failure mode.
+for tool in qemu-system-x86_64 parted mformat mmd mcopy sgdisk mkfs.ext2 debugfs dumpe2fs e2fsck dd strings; do
     command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: missing tool '$tool'"; exit 1; }
 done
 
@@ -116,7 +121,7 @@ qemu_assert_booted "$LOG" || exit 1
 
 echo ""
 echo "  --- ext2w self-test lines from boot log ---"
-strings "$LOG" | grep -E "^ext2w:" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?ext2w:" | sed 's/^/  /'
 echo ""
 
 # Wrong-build guard. The ext2 write self-test only exists in a kernel built
@@ -124,7 +129,7 @@ echo ""
 # but emits ZERO `ext2w:` lines, so the gates below cascade red as if the ext2
 # backend were broken (the exFAT analogue was misfiled as the mkfs-1.3.2-drift
 # issue). Distinguish "kernel booted but selftest absent" from a real result.
-if ! strings "$LOG" | grep -q "^ext2w:"; then
+if ! strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}ext2w:"; then
     echo "  ERROR: kernel booted but produced NO 'ext2w:' lines — this build does"
     echo "         NOT contain the ext2 write self-test. Rebuild with the flag:"
     echo "             EXT2_WRITE_SELFTEST=1 ./scripts/build.sh"
@@ -142,9 +147,59 @@ else
 fi
 
 # Bite 2: when metadata_csum is on, cross-check the kernel's UUID-derived
-# csum seed against the host (crc32c(~0, uuid[16], 16)). On non-csum images
-# this is skipped (csum on=0). kprint_hex emits lowercase, no 0x, no pad.
-if strings "$LOG" | grep -q "ext2w: csum on=1"; then
+# csum seed against the host (crc32c(~0, uuid[16], 16)), then the six
+# checksum-recompute arms. kprint_hex emits lowercase, no 0x, no pad.
+#
+# ⚠⚠ VACUITY FLOOR — THE ARTIFACT UNDER TEST IS NOT ALLOWED TO DECIDE WHETHER IT GETS TESTED.
+# Until 1.56.58 these seven assertions opened on `if strings "$LOG" | grep -q "ext2w: csum on=1"`
+# with NO else branch: the kernel's own log line chose whether the checksum lane ran at all, and an
+# unmatched grep was an ABSENCE in the transcript rather than a verdict. Three concrete ways that
+# scored a silent green, every one of them reachable today:
+#   · THE DEFAULT PROFILE RETIRES THE LANE. Line 76 mkfs's `^metadata_csum`, so the kernel correctly
+#     prints `csum on=0` and all seven are skipped — and sweep.sh:129 runs this smoke with no
+#     EXT2_SMOKE_FEATURES override, so IN THE RELEASE SWEEP THEY HAVE NEVER EXECUTED, not once. The
+#     superblock / group-desc / bitmap / inode / dir-leaf checksum routines could regress arbitrarily
+#     while this smoke printed its full green wall and exited 0.
+#   · A KERNEL THAT STOPS DETECTING metadata_csum RETIRES ITS OWN ASSERTIONS. Mis-parse
+#     s_feature_ro_compat at mount, print `csum on=0` on a checksummed image, and the regression has
+#     deleted the evidence of itself — the seven checks that would have caught it do not run.
+#   · A MOUNT FAILURE PRINTS NO `csum on=` LINE AT ALL. ext2.cyr:3802 returns at
+#     `ext2w: not mounted -- skip`, ahead of the reporter, and an absent line skipped the block in
+#     exactly the same silence as an honest `on=0`.
+# ⭐ So the lane state now comes from the HOST's view of the image THIS SCRIPT JUST BUILT, the kernel
+# is REQUIRED TO AGREE with that oracle, and the number of assertions actually evaluated is PRINTED
+# either way. A run that says "csum lane: 0/7 evaluated" is reporting that it did not test
+# checksums; the old form said nothing whatsoever, which reads as a clean sheet.
+# ⚠ EXT2_SMOKE_REQUIRE_CSUM=1 turns an off-profile from a declared skip into a FAILURE — the knob a
+# caller wires up when it wants this smoke to *prove* the checksum path rather than report on it.
+CSUM_TOTAL=7            # assertions guarded below — the declared floor the tally is compared against
+CSUM_RAN=0
+
+HOST_FEATURES=$(dumpe2fs -h "$WORK/part-pre.img" 2>/dev/null | sed -nE 's/^Filesystem features:[[:space:]]+(.*)$/\1/p' | head -1)
+if [ -z "$HOST_FEATURES" ]; then
+    HOST_CSUM="?"                    # oracle broken — the FAIL below, never a silent "no csum"
+elif echo " $HOST_FEATURES " | grep -q " metadata_csum "; then
+    HOST_CSUM=1                      # space-wrapped so `metadata_csum_seed` cannot answer for it
+else
+    HOST_CSUM=0
+fi
+K_CSUM=$(strings "$LOG" | sed -nE 's/.*ext2w: csum on=([0-9]+).*/\1/p' | head -1)
+echo "  csum lane: host image says metadata_csum=$HOST_CSUM, kernel reports csum on=${K_CSUM:-<no line>}"
+
+if [ "$HOST_CSUM" = "?" ]; then
+    # V4 shape: a rotted parse — or a missing dumpe2fs, which is NOT in the tool preflight at line
+    # 48 — would answer "no csum" for every image and retire the lane precisely as the old form did.
+    echo "  FAIL: could not read 'Filesystem features:' from $WORK/part-pre.img via dumpe2fs —"
+    echo "        the csum lane's independent oracle is broken, so no verdict about it is trustworthy"; rc=1
+elif [ -z "$K_CSUM" ]; then
+    echo "  FAIL: kernel printed no 'ext2w: csum on=' line at all (ext2_write_selftest returned"
+    echo "        early — an unmounted FS does exactly that), so all $CSUM_TOTAL csum assertions are void"; rc=1
+elif [ "$K_CSUM" != "$HOST_CSUM" ]; then
+    echo "  FAIL: kernel says csum on=$K_CSUM but the host says metadata_csum=$HOST_CSUM on the very"
+    echo "        image this script just built — the mount-time feature parse disagrees with e2fsprogs"; rc=1
+fi
+
+if [ "$HOST_CSUM" = "1" ] && [ "$K_CSUM" = "1" ]; then
     K_SEED=$(strings "$LOG" | sed -nE 's/.*csum on=1 seed=([0-9a-f]+).*/\1/p' | head -1)
     UUID=$(dumpe2fs -h "$WORK/part-pre.img" 2>/dev/null | sed -nE 's/.*Filesystem UUID:[[:space:]]+([0-9a-f-]+).*/\1/p')
     H_SEED=$(python3 - "$UUID" <<'PY'
@@ -159,6 +214,7 @@ for x in u:
 print('%x' % c)
 PY
 )
+    CSUM_RAN=$((CSUM_RAN + 1))
     if [ -n "$K_SEED" ] && [ "$K_SEED" = "$H_SEED" ]; then
         echo "  PASS: csum seed matches host UUID-derived (0x$K_SEED)"
     else
@@ -167,11 +223,13 @@ PY
 
     # Bite 3: SB + group-desc checksum routines reproduce the on-disk
     # (e2fsprogs-written) values — compute-and-compare, no write needed.
+    CSUM_RAN=$((CSUM_RAN + 1))
     if strings "$LOG" | grep -q "ext2w: SB csum match"; then
         echo "  PASS: superblock s_checksum matches disk (ext2_sb_csum_compute)"
     else
         echo "  FAIL: superblock s_checksum mismatch"; strings "$LOG" | grep "SB csum" | sed 's/^/        /'; rc=1
     fi
+    CSUM_RAN=$((CSUM_RAN + 1))
     if strings "$LOG" | grep -q "ext2w: grp0 csum match"; then
         echo "  PASS: group-0 bg_checksum matches disk (ext2_grp_csum_compute)"
     else
@@ -179,11 +237,13 @@ PY
     fi
 
     # Bite 4: block + inode bitmap checksums reproduce on-disk values.
+    CSUM_RAN=$((CSUM_RAN + 1))
     if strings "$LOG" | grep -q "ext2w: blk-bitmap csum match"; then
         echo "  PASS: block-bitmap csum matches disk (ext2_set_block_bitmap_csum)"
     else
         echo "  FAIL: block-bitmap csum mismatch"; rc=1
     fi
+    CSUM_RAN=$((CSUM_RAN + 1))
     if strings "$LOG" | grep -q "ext2w: ino-bitmap csum match"; then
         echo "  PASS: inode-bitmap csum matches disk (span=inodes_per_group/8)"
     else
@@ -191,6 +251,7 @@ PY
     fi
 
     # Bite 5: inode checksum reproduces the on-disk value (root inode 2).
+    CSUM_RAN=$((CSUM_RAN + 1))
     if strings "$LOG" | grep -q "ext2w: inode2 csum match"; then
         echo "  PASS: inode csum matches disk (ext2_inode_csum_calc, root inode)"
     else
@@ -198,11 +259,31 @@ PY
     fi
 
     # Bite 6: directory-leaf checksum reproduces the on-disk det_checksum.
+    CSUM_RAN=$((CSUM_RAN + 1))
     if strings "$LOG" | grep -q "ext2w: rootdir csum match"; then
         echo "  PASS: dir-leaf csum matches disk (ext2_dir_leaf_csum, root block)"
     else
         echo "  FAIL: dir-leaf csum mismatch"; strings "$LOG" | grep "rootdir csum" | sed 's/^/        /'; rc=1
     fi
+fi
+
+# ⚠ THE TALLY IS THE FLOOR, and it is printed on every path — the point of the whole block above.
+# `CSUM_RAN` counts assertions REACHED, so a future edit that drops one of the seven (or an `if`
+# whose condition quietly stops holding) is reported as a broken enumeration instead of vanishing.
+if [ "$CSUM_RAN" -eq "$CSUM_TOTAL" ]; then
+    echo "  PASS: csum lane ON — $CSUM_RAN/$CSUM_TOTAL checksum assertions evaluated"
+elif [ "$CSUM_RAN" -ne 0 ]; then
+    echo "  FAIL: csum lane evaluated $CSUM_RAN/$CSUM_TOTAL assertions — the enumeration itself broke"; rc=1
+elif [ "$HOST_CSUM" = "0" ] && [ "$K_CSUM" = "0" ]; then
+    echo "  SKIP: csum lane OFF — 0/$CSUM_TOTAL checksum assertions ran (image profile: $EXT2_SMOKE_FEATURES)."
+    echo "        This run proves NOTHING about the crc32c/SB/group/bitmap/inode/dir-leaf checksums."
+    echo "        Prove them with: EXT2_SMOKE_FEATURES=\"^resize_inode,^dir_index,metadata_csum,64bit,extent,^uninit_bg\" $0"
+    if [ -n "${EXT2_SMOKE_REQUIRE_CSUM:-}" ]; then
+        echo "  FAIL: EXT2_SMOKE_REQUIRE_CSUM is set and this image profile has metadata_csum OFF —"
+        echo "        the caller asked for the checksum lane to be proven, and it did not run"; rc=1
+    fi
+else
+    echo "  FAIL: csum lane could not run — 0/$CSUM_TOTAL assertions evaluated (see the line(s) above)"; rc=1
 fi
 
 # Gate 1: identity write-back checks passed.
@@ -326,7 +407,7 @@ fi
 # the root volume and pass every check about the numbers themselves); and f_bfree DROPS after a write,
 # which is what a constant-returning implementation cannot do. The kernel prints the values, so the
 # transcript carries them whether it passes or fails.
-strings "$LOG" | grep -E "^ext2w: Wstatfs (bsize|free after)" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?ext2w: Wstatfs (bsize|free after)" | sed 's/^/  /'
 if strings "$LOG" | grep -q "ext2w: Wstatfs OK"; then
     echo "  PASS: Wstatfs (capacity agrees with the mount, path is resolved, free count is live)"
 elif strings "$LOG" | grep -q "ext2w: Wstatfs MISMATCH"; then

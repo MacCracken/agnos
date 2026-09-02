@@ -47,6 +47,22 @@ var timer_ticks = 0;
 # [[reference_cyrius_module_scope_var_expr_init_zero]]
 var tsc_per_us = 0;    # measured cycles per microsecond; 0 = calibration refused
 var tsc_base   = 0;    # rdtsc at the end of calibration; #95 reports microseconds since
+
+# ⭐ THE KERNEL LOG TIMEBASE (1.56.58) — DELIBERATELY SEPARATE FROM tsc_per_us/tsc_base ABOVE, AND
+# THE SEPARATION IS THE WHOLE POINT. Three things forced it:
+#   1. `tsc_base` means "rdtsc at the END of calibration" and `uptime_us`#95 is specified against it
+#      (syscall.cyr: microseconds since CALIBRATION, not since boot). A log timestamp needs time since
+#      BOOT. Re-pointing tsc_base would silently change a shipped syscall`s meaning.
+#   2. `tsc_per_us` is 0 until `tsc_calibrate()` at main.cyr — and core/hda.cyr:323 and core/gpu.cyr:280
+#      DEPEND on reading 0 before then, so they take their documented pre-calibration fallback. Setting
+#      it early to serve the log would silently retune GPU and audio delays.
+#   3. The log needs a number ~4,400 statements EARLIER than tsc_calibrate() runs.
+# ⛔ NOT `var klog_tsc_boot = rdtsc();` — a module-scope expression initialiser is NOT foldable, and in
+# kmode EMIT_GVAR_INITS runs AFTER PARSE_PROG (which never returns), so it would silently read 0 forever
+# and look correct. Captured as an explicit STATEMENT at the top of core/main.cyr.
+# [[reference_cyrius_module_scope_var_expr_init_zero]]
+var klog_tsc_boot   = 0;   # rdtsc at the first statement of the boot body; log t=0
+var klog_tsc_per_us = 0;   # cycles per microsecond, measured in lapic_calibrate`s existing PIT window
 var timer_isr[64];
 var nic_rx_isr[64];  # NIC RX MSI-X ISR machine code (~62 bytes) — 1.51.5
 var xhci_rx_isr[64]; # xHCI RX (USB-HID) MSI-X ISR machine code (~62 bytes) — 1.53.7

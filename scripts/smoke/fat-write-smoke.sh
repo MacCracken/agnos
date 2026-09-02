@@ -98,7 +98,7 @@ qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-30}" "$WORK/vars.fd" "$OVMF_V
 
 echo ""
 echo "  --- fat lines from boot log ---"
-strings "$LOG" | grep -E "^fat: mounted|^fatw:" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?fat: mounted|^fatw:" | sed 's/^/  /'
 echo ""
 
 # Wrong-build guard. The FAT write self-test only exists in a kernel built
@@ -106,7 +106,7 @@ echo ""
 # but emits ZERO `fatw:` lines, so the gates below cascade red as if the FAT
 # backend were broken (the exFAT analogue was misfiled as the mkfs-1.3.2-drift
 # issue). Distinguish "kernel booted but selftest absent" from a real result.
-if ! strings "$LOG" | grep -q "^fatw:"; then
+if ! strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}fatw:"; then
     echo "  ERROR: kernel booted but produced NO 'fatw:' lines — this build does"
     echo "         NOT contain the FAT write self-test. Rebuild with the flag:"
     echo "             FATFS_WRITE_SELFTEST=1 FAT_ALLOW_ESP_WRITE=1 ./scripts/build.sh"
@@ -121,7 +121,7 @@ rc=0
 # independent oracle catches a wrong count. mtools `minfo` reports `free clusters=` straight off the
 # image, which is exactly the quantity f_bfree claims — the FAT analogue of the ext2 gate's
 # `debugfs -R stats`. ⚠ Compared BEFORE the boot writes anything, against the kernel's FIRST reading.
-strings "$LOG" | grep -E "^fatw: Wstatfs (bsize|free after)" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?fatw: Wstatfs (bsize|free after)" | sed 's/^/  /'
 K_BS=$(strings "$LOG" | sed -n 's/^fatw: Wstatfs bsize=\([0-9]*\) .*/\1/p' | head -1)
 K_FB=$(strings "$LOG" | sed -n 's/^fatw: Wstatfs .*free=\([0-9]*\) .*/\1/p' | head -1)
 H_FREE="$BASE_FREE_FAT"
@@ -405,14 +405,14 @@ else
 fi
 # 1.40.1 exec-from-disk bite 1: vfs_read_file reads a 6000-byte file fully
 # (past the 4 KB memfile cap) — the read primitive the exec load path needs.
-if grep -q "^vfsrf: FAT whole-file read past 4KB OK" "$LOG" 2>/dev/null; then
+if grep -q "^\(\[[^]]*\] \)\{0,1\}vfsrf: FAT whole-file read past 4KB OK" "$LOG" 2>/dev/null; then
     echo "  PASS: 1.40.1 vfs_read_file whole-file read past 4 KB cap (FAT)"
 else
     echo "  FAIL: 1.40.1 vfs_read_file over FAT (no 'whole-file read past 4KB OK')"; rc=1
 fi
 # 1.41.7: syscall write path over FAT — open(AO_WRONLY|CREAT|TRUNC)+write+close
 # (VFS_SEC_WFILE -> vfs_write_on) then read-back. agnsh writes FAT via syscalls.
-if grep -q "^syswr: FAT write+readback OK" "$LOG" 2>/dev/null; then
+if grep -q "^\(\[[^]]*\] \)\{0,1\}syswr: FAT write+readback OK" "$LOG" 2>/dev/null; then
     echo "  PASS: 1.41.7 syscall write+read-back over FAT (open/write/close ABI)"
 else
     echo "  FAIL: 1.41.7 syscall FAT write (no 'syswr: FAT write+readback OK')"; rc=1

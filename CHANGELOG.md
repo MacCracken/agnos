@@ -20,6 +20,112 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.56.58] — 2026-09-02 — the kernel log gets a clock, and 39 gates that could not fail now can
+
+### Added — a Linux-style uptime prefix on every kernel log line
+
+- Every **kernel-origin** line now carries a fixed-width 15-byte field in `printk` shape —
+  `[    4.123456] ` — built by `klog_build_prefix` (`core/kprint.cyr`): seconds right-aligned in 5
+  columns space-padded, microseconds in 6 columns zero-padded. Emitted to **serial, framebuffer and
+  the klug ring**, in the order `kprint` already used.
+- ⛔⛔ **RING-3 OUTPUT IS NOT PREFIXED, AND THAT IS THE WHOLE DESIGN.** `kprint` is *also* the userland
+  stdout/stderr path — fd 0/1/2 are `VFS_DEVICE` 0, so `write(1,…)` walks `vfs_write` -> `dev_write`
+  -> `serial_dev_write` -> `kprint`. Decorating unconditionally would have stamped timestamps into
+  `ls` output, into every pipe stage, and into ~330 harness assertions that parse program text.
+  `serial_dev_write` raises `klog_raw_depth` around its whole chunk loop and those bytes pass through
+  byte-exact. ⚠ **Around the loop, not inside it** — it chunks at 4096, so a per-chunk raise would
+  re-decorate mid-stream every 4 KB, which is the same bug in a smaller disguise.
+- ⚠ **`klog_at_bol` tracks EVERY byte, raw ring-3 bytes included.** Ring-3 output is 23.5% of the ring
+  under a pty and 82.6% in a desktop session; if a program writes a partial line and a kernel line
+  follows, we are not at column 0 and a prefix there would split the operator's visible line.
+- ⚠ **`kputc` tracks the line position but never emits a prefix** — it carries the keystroke ECHO, so
+  a prefix there would land inside the operator's own command line. Same reason the `fb_oob` live-line
+  bracket already skips it.
+- ⚠ **The fb copy of the prefix sits INSIDE the `fb_oob_begin`/`fb_oob_end` window.** Outside it,
+  `fb_line_note` captures the prefix into `fb_line_buf` and `fb_oob_end` replays it as part of the
+  operator's typed line — the exact corruption `harness/console-line-preserve-test.py` exists to catch.
+
+### Added — a log timebase measured 4,400 statements earlier, for free
+
+- ⭐ **`timer_ticks` was unusable and `tsc_calibrate()` was far too late.** `sti` is at
+  `main.cyr:4532`, so a tick-derived clock reads `0.000000` for essentially the whole boot log — and
+  `timer_ticks` additionally FREEZES inside a foreground `run`, because ring 3 executes with IF=0.
+  `tsc_calibrate()` produces a good number but not until `main.cyr:4565`.
+- `lapic_calibrate` (`arch/x86_64/apic.cyr`) **already** measures a known wall interval — 8
+  free-running PIT ch0 periods, ~80 ms, needing no interrupts — at `main.cyr` ~line 128. Two `rdtsc`
+  reads inside that existing window yield cycles-per-microsecond at **no added boot time**.
+- ⚠ **Writes `klog_tsc_per_us`, NOT `tsc_per_us`, and the separation is load-bearing three ways:**
+  `uptime_us`#95 is specified against `tsc_base` meaning "since CALIBRATION" (re-pointing it would
+  silently change a shipped syscall); and `core/hda.cyr:323` and `core/gpu.cyr:280` **depend** on
+  reading `tsc_per_us == 0` before `main.cyr` so they take their documented pre-calibration fallback —
+  setting it early would silently retune GPU and audio delays.
+- ⭐ **CROSS-CHECKED, AND THAT IS THE PROOF IT IS SOUND.** `tsc_calibrate()` now compares the early
+  number against its own (50 ms of live ticks, interrupts on) and prints a verdict. Two independent
+  methods, same physical quantity. **Measured on a real boot: early 3193, late 3193 — exact.** A
+  refusal or a >12% disagreement prints a named warning instead of shipping a skewed divisor.
+- ⛔ **`klog_tsc_boot` is captured as a STATEMENT, not a `var … = rdtsc()` initialiser.** In kmode
+  `EMIT_GVAR_INITS` runs after `PARSE_PROG`, which is the boot sequence and never returns — so a
+  non-foldable module-scope initialiser reads 0 forever with no diagnostic (two archived filings).
+- ⛔ **`klog_uptime_us()` is a function with an aarch64 no-op twin**, because `core/kprint.cyr` is
+  included at `agnos.cyr:57` — OUTSIDE both `#ifdef ARCH_X86_64` blocks — so it compiles on aarch64
+  while `rdtsc`/`klog_tsc_*` are x86-only. Same seam `proc.cyr` uses. ⚠ The aarch64 twin returns 0 on
+  purpose: that arch's `timer_read_freq`/`timer_read_count` store through `[sp,#0]` (frame padding)
+  and return a constant 0 — an open P1. A stub that *looked* live would print fabricated timestamps.
+
+### Changed — 110 anchored assertions made prefix-tolerant
+
+- 110 `^`-anchored greps across 34 smoke scripts became `^\(\[[^]]*\] \)\{0,1\}` (BRE) /
+  `^(\[[^]]*\] )?` (ERE). Anchoring is preserved — a mid-line occurrence still does not match — and
+  the same pattern now matches both prefixed kernel lines and bare ring-3 lines, so no classification
+  of which is which was needed.
+- Verified by boot: `exec-smoke` **PASS** (16 transformed patterns), `ext2-write-smoke` **PASS**,
+  `klug-spill-smoke` **7/7**, `agnsh-smoke` **3/3**.
+- Binary **1,994,672 -> 1,997,536 B** (+2,864 for the whole feature); 99,616 B under the 2 MiB ceiling.
+
+### Fixed — 39 gates that could not fail, across 30 files
+
+- The tree-wide sweep of [`2026-09-02-vacuous-gates-sweep.md`](docs/development/issues/2026-09-02-vacuous-gates-sweep.md),
+  one agent per file, each fix mutation-proven against its own empty-input case then adversarially
+  re-verified. **39 fixed / 1 declined.** Six were found *while proving* the assigned ones
+  (`modeset-latch-smoke.sh` had 4 more of the same shape, `check-carveout.sh` 3,
+  `chan-semantics-check.sh` 2), which is why 33 findings produced 39 fixes.
+- ⛔ **`ktest.sh` announced `ALL TESTS PASSED` on a suite that enumerated ZERO tests.** It parsed only
+  the failure count, so `TOTAL: 0 passed, 0 failed` — what a mis-scoped `#ifdef TEST` produces — scored
+  green. It now asserts an executed-check floor and prints the count: `110 checks executed (floor 64)`.
+- ⛔ **`ext2-write-smoke.sh` never ran its seven metadata_csum assertions.** They were wrapped in an
+  `if` fed by the kernel's own log line, and the smoke's DEFAULT mkfs profile disables checksums —
+  with no `else`. The lane now declares itself: `SKIP: csum lane OFF — 0/7 checksum assertions ran`,
+  with the exact command to prove them, and cross-checks the host image against the kernel's report.
+- ⛔ **`check.sh` gate 22 ("call arity") passed whenever the build FAILED** — a dead build emits no
+  arity warnings, so the negative assertion had nothing to match. Gate 32 then weighed whatever
+  `build/agnos` fossil was on disk. Both now key off the captured build exit status.
+- ⛔ **Two harnesses had no exit code at all** (`agnsh-type-test.py`, `agnsh-kvm-test.py`): a guest that
+  triple-faulted printed `banner seen: False` and exited 0. `kriya-crash-probe.py` set `rc = 0`
+  unconditionally three lines below its hang detector.
+- ⚠ **Two fixes moved the vacuity up a level rather than removing it, and adversarial verification
+  caught both** — recorded in the issue file, which STAYS OPEN. `.github/workflows/`, `scripts/burn/`
+  and `tests/*/` were not swept; the count is a floor.
+
+### Changed — cyrius pin 6.5.41; klug 0.1.6 in lockstep
+
+- Nine `tests/*/cyrius.cyml` + the root manifest already moved to **6.5.41** at 1.56.57.
+- Sibling **klug 0.1.6** ships beside this: pin 6.5.35 -> 6.5.41, and `klug_time_prefix_len` so the
+  severity lens steps over the new uptime field. ⛔ **Without it the lens fails SILENTLY** — it tests
+  `[` at byte 0 and `]` at byte 2, so under a prefix byte 0 still matches but byte 2 is a space, every
+  line scores level 0, and `klug -w` prints nothing and exits 0. klug's tests **12 -> 37**, including
+  `test_time_prefix_needs_all_four_anchors` (byte 0 alone false-positives on a real `[E]` line).
+- ⚠ **klug 0.1.6 also stops `-w`/`-e` lying**: a production kernel emits ZERO leveled lines
+  (`klug_info`/`warn`/`err` have three call sites, all inside `#ifdef EXEC_SELFTEST`), so the filters
+  legitimately match nothing. It now says so on stderr rather than printing nothing and exiting 0.
+
+### Docs
+
+- `agnos-userland-abi.md` §4.5 corrected and extended: it said the klug ring was **16 KB** in three
+  places (it is 64 KB, and has been since the ring was raised), and it described the leveled-tag
+  contract as live when no production build emits one. Now carries the line format, the ring-3
+  exemption, and the BRE/ERE anchors a consumer must use.
+
+
 ## [1.56.57] — 2026-09-01 — statfs answers on all three filesystems, and the mount root was refused on two of them
 
 ### Fixed — 22 (string, length) mismatches, in three emitter families the gate never looked at

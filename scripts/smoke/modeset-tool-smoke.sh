@@ -80,7 +80,7 @@ qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
     -serial stdio -display none -no-reboot
 
 echo "--- modeset tool output ---"
-grep -aE "^modeset:|^run:" "$LOG" | sed 's/^/  /'
+grep -aE "^(\[[^]]*\] )?modeset:|^run:" "$LOG" | sed 's/^/  /'
 echo "---------------------------"
 
 pass=0; fail=0

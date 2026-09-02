@@ -39,6 +39,33 @@ PART_OFFSET = 33 * 1048576
 # Use AE_CLIENTS_MODE=fg / =bg in separate invocations to compare the paths.
 MODE = os.environ.get("AE_CLIENTS_MODE", "bg")   # "fg" | "bg" | "both" (both = same-boot, interferes)
 
+# ⚠ VACUITY FLOOR ON THE MODE STRING, AND IT IS CHECKED BEFORE THE IMAGE IS EVEN BUILT. Every
+# launch site below is an `if MODE in (...)` / `if MODE == ...`, and nothing re-derives the mode at
+# verdict time — so a string matching NONE of them launches nothing, leaves ran_fg/ran_bg False,
+# and walks into the shared fg/bg verdict, which starts at rc = 0 and can only ever RAISE it.
+# Measured against the pre-fix file (2026-09-02, reproduction of its own dispatch + verdict source):
+#     AE_CLIENTS_MODE=BG          -> exit 0
+#     AE_CLIENTS_MODE=background  -> exit 0
+#     AE_CLIENTS_MODE=Desktop     -> exit 0
+#     AE_CLIENTS_MODE=            -> exit 0
+# — each printing "foreground exit — (not run in this mode) · background exit — (not run in this
+# mode)" and then, because that trailing line reads `'foreground' if ran_fg else 'background'`,
+# the outright false "⇒ Only the background path was exercised" on a boot that exercised neither.
+# A green from this harness would then mean "the mode name was misspelt", which is
+# indistinguishable from "a program agnsh launched reached puka's window".
+# ⛔ Fail CLOSED, and fail with 2 (INCONCLUSIVE, per the header) rather than 1: nothing was
+# launched, so this run has no evidence of a defect either. 0 is the one answer it must not give.
+# ⚠ THIS TUPLE IS THE LAUNCH SITES, NOT A WISH LIST — every entry is grep-able as `MODE ==` or
+# `MODE in` below (fg/both -> :247, desktop -> :252, armed -> :285, bg/both -> :315). A mode branch
+# added above without an entry here is rejected loudly on its first run, which is the correct
+# direction for this to rot in: a mode that launches nothing must never be the mode that passes.
+MODES = ("fg", "bg", "both", "desktop", "armed")
+if MODE not in MODES:
+    print(f"INCONCLUSIVE: AE_CLIENTS_MODE={MODE!r} is not a mode this harness implements.")
+    print(f"  valid modes: {', '.join(MODES)}   (default: bg)")
+    print("  No arm would be launched, so nothing would be tested — exiting 2 rather than 0.")
+    sys.exit(2)
+
 # ⛔ THE FRAMEBUFFER GATE FOR `desktop` MODE — how many pixels carrying a CLIENT's own colours must
 # be on the panel before this harness will exit 0. Only `desktop` mode uses it, because it is the
 # only mode that still has a compositor on screen when the screendump fires (see the FRAMEBUFFER
@@ -813,9 +840,31 @@ try:
     p("  foreground exit " + (str(fg_code) if ran_fg else "— (not run in this mode)")
       + " · background exit " + (str(bg_code) if ran_bg else "— (not run in this mode)"))
 
+    # ⚠ VACUITY FLOOR ON THE ARM COUNT — the second half of the same defect the MODES guard at the
+    # top catches, kept here because the two fail in different edits. The loop below starts at
+    # rc = 0, can only RAISE it, and `continue`s past every arm that did not run: ZERO arms run is
+    # therefore ARITHMETICALLY IDENTICAL to two arms passing. The MODES guard is what normally
+    # stops a run reaching here with nothing launched, but it is one edit away from being wrong in
+    # the other direction — a new mode branch added above that neither sets ran_fg/ran_bg nor exits
+    # early falls straight through to this block and scores a green having launched nothing. That
+    # is not hypothetical in this file: `desktop` and `armed` each had to grow their own
+    # `raise SystemExit` for exactly that reason, and the comment above records two false verdicts
+    # this same block already produced by reasoning about arms that were never launched.
+    # ⭐ So COUNT the arms and PRINT the count rather than implying it: a run that says "0 of 2" is
+    # reporting that its own dispatch broke, not that the launch paths work.
+    arms = ((ran_fg, fg_code, "FOREGROUND", "agnsh execwait #37"),
+            (ran_bg, bg_code, "BACKGROUND", "agnsh spawn_path #43"))
+    n_ran = sum(1 for a in arms if a[0])
+    p(f"  arms exercised: {n_ran} of {len(arms)}  (MODE={MODE})")
+
     rc = 0
-    for ran, code, name, how in ((ran_fg, fg_code, "FOREGROUND", "agnsh execwait #37"),
-                                 (ran_bg, bg_code, "BACKGROUND", "agnsh spawn_path #43")):
+    if n_ran == 0:
+        # ⛔ Not 0 and not 1: nothing ran, so there is no pass to report AND no defect to report.
+        p("  ⛔ NO ARM RAN — this boot launched neither the foreground nor the background path, so")
+        p(f"     it tested nothing. MODE={MODE} reached the shared verdict without dispatching;")
+        p("     that is a broken invocation, not a green kernel. INCONCLUSIVE (2).")
+        rc = 2
+    for ran, code, name, how in arms:
         if not ran:
             continue
         if code == 95:

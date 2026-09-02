@@ -106,6 +106,6 @@ PY
     fi
 fi
 
-echo "  --- snd/hda lines ---"; grep -a -iE "^snd:|^hda:" "$SER" 2>/dev/null | sed 's/^/    /'
+echo "  --- snd/hda lines ---"; grep -a -iE "^\(\[[^]]*\] \)\{0,1\}snd:|^hda:" "$SER" 2>/dev/null | sed 's/^/    /'
 echo "  full serial: $SER"
 exit $rc

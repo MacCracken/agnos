@@ -15,8 +15,17 @@
 #     /dev/nvme0n1p2 ro, must contain the SKIPPED line. Treating a green run here as validation of the
 #     recovery claim is the D-lane mistake in a new costume.
 #
+# ⚠ IT TAKES TWO RUNS TO GET A GREEN, AND THAT IS DELIBERATE. The wedge lanes need a binary that wedges;
+# the disarm lane needs one that does not, so no single invocation can assert both halves. Each run scores
+# its own lane and leaves a receipt (build/modeset-latch-receipts/, keyed on VERSION); exit 0 means BOTH
+# lanes are green at this version. A run that covered one half exits 3 (PARTIAL) — never 0. See the
+# "VACUITY FLOOR — LANE COVERAGE" block below for what a green used to mean before 1.56.58.
+#   MODESET_LATCH_SELFTEST=1 sh scripts/build.sh && sh scripts/smoke/modeset-latch-smoke.sh   # wedge lane
+#   MODESET_LATCH_DISARM=1   sh scripts/build.sh && sh scripts/smoke/modeset-latch-smoke.sh   # disarm lane
+# Exit codes: 0 both lanes green · 1 an assertion failed · 2 HARD FAIL (fail-open) · 3 PARTIAL (one lane).
+#
 # Build first: MODESET_LATCH_SELFTEST=1 sh scripts/build.sh
-# Requires: qemu-system-x86_64, OVMF, parted, mtools, sgdisk, mkfs.ext2, debugfs, dd.
+# Requires: qemu-system-x86_64, OVMF, parted, mtools, sgdisk, mkfs.ext2, debugfs, dd, strings.
 
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
@@ -28,7 +37,12 @@ OVMF_VARS_CANDIDATES="/usr/share/edk2/x64/OVMF_VARS.4m.fd /usr/share/edk2/x64/OV
 OVMF_CODE=""; for c in $OVMF_CODE_CANDIDATES; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
 OVMF_VARS_SRC=""; for c in $OVMF_VARS_CANDIDATES; do [ -f "$c" ] && { OVMF_VARS_SRC="$c"; break; }; done
 [ -n "$OVMF_CODE" ] && [ -n "$OVMF_VARS_SRC" ] || { echo "ERROR: OVMF firmware not found." >&2; exit 1; }
-for tool in qemu-system-x86_64 parted mformat mmd mcopy sgdisk mkfs.ext2 debugfs dd; do
+# ⚠ `strings` IS IN THIS LIST BECAUSE TWO DECISIONS ARE MADE WITH IT — the MODESET_LATCH_SELFTEST guard
+# immediately below, and the lane selection at "TWO BUILDS, TWO LANE SETS". With strings absent from PATH
+# the guard's `! strings … | grep -q` is true for the wrong reason (the pipeline died, it did not fail to
+# match) and the script tells the operator to rebuild a binary that was already correct; the lane selector
+# has no `!` and would silently pick the wedge lane for a disarm binary.
+for tool in qemu-system-x86_64 parted mformat mmd mcopy sgdisk mkfs.ext2 debugfs dd strings; do
     command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: missing tool '$tool'" >&2; exit 1; }
 done
 
@@ -86,6 +100,44 @@ latch_payload() {  # $1 = img -> stdout
 # build" — which is noise that trains you to ignore red. Detect the build and run only its lanes.
 DISARM_BUILD=0
 strings "$AGNOS" | grep -q "modeset: pathmatch positive OK" && DISARM_BUILD=1
+if [ "$DISARM_BUILD" = 1 ]; then LANE=disarm; OTHER=wedge; else LANE=wedge; OTHER=disarm; fi
+
+# ⛔⛔ VACUITY FLOOR — LANE COVERAGE. THE ORACLE FOR *WHICH ASSERTIONS RUN* IS READ OUT OF THE BINARY
+# UNDER TEST, so the artifact gets a vote on which assertions are allowed to judge it. Until 1.56.58 the
+# unselected half was a bare `echo "SKIP: …"` that touched neither `pass` nor `fail`, and the verdict line
+# could not tell a lane that held from a lane that never ran:
+#   · a disarm-marked binary retired the whole wedge/control/read-only block — ~31 assertions INCLUDING
+#     the read-only lane's fail-CLOSED gate, which is the ONLY assertion in this file that can set hard=1
+#     and exit 2 — and the run still printed "8 passed, 0 failed" and exited 0. "The fail-open detector
+#     held" and "the fail-open detector was never run" came out the same colour, which is the header's own
+#     D-lane mistake wearing a third costume.
+#   · the default SELFTEST build retired the disarm lane's 8 assertions the same silent way.
+#   · and a lane that DID run but scored nothing — a renamed log path, boots that all died before writing,
+#     a helper that stopped being called — printed "0 passed, 0 failed" and exited 0 as well.
+# ⇒ Three changes, none of which alter what any assertion tests:
+#   (1) each lane counts the assertions it actually scored and is held to a FLOOR;
+#   (2) the count and the floor are PRINTED, not implied — a run that says "the wedge lane scored 2
+#       assertion(s)" is reporting that its own enumeration broke, not that the kernel is clean;
+#   (3) exit 0 requires BOTH lanes green. No single invocation can assert both halves — they need two
+#       different binaries — so the other half's green is carried in a RECEIPT under
+#       build/modeset-latch-receipts/, keyed on VERSION and rewritten (or DELETED) by every run of that
+#       lane. A run covering one half exits 3 (PARTIAL) and prints no success token, because
+#       "we could not test it" and "it works" must never be the same colour
+#       (scripts/smoke/console-line-smoke.sh:15-17, which resolves the same fork the same way).
+#
+# ⚠ FLOORS ARE FLOORS, NOT EQUALITIES, and they are deliberately close under the real counts (31-32 and 8
+# on a healthy run) so that losing a whole sub-lane — boot 2, control B, the read-only lane — trips them.
+# Adding assertions may raise them; a change that LOWERS one is removing coverage and should say so.
+WEDGE_MIN=28
+DISARM_MIN=7
+# ⚠ Receipts live under build/ but NOT under $WORK/$LOGS, which are rm -rf'd at the top of every run — the
+# whole point is that they outlive the rebuild the other lane requires. scripts/build.sh only `mkdir -p`s
+# build/ and removes named artifacts, so a rebuild does not clear them; build/ is gitignored (line 2), so
+# they are never committed. Keyed on VERSION because the two lanes are two builds of the SAME source cut:
+# a version bump correctly invalidates both halves and forces them to be re-run.
+VER="$(cat "$ROOT/VERSION" 2>/dev/null)"
+[ -n "$VER" ] || { echo "ERROR: cannot read $ROOT/VERSION — lane receipts are keyed on it" >&2; exit 1; }
+RECEIPTS="$ROOT/build/modeset-latch-receipts"; mkdir -p "$RECEIPTS"
 
 pass=0; fail=0; hard=0
 P() { echo "PASS: $1"; pass=$((pass+1)); }
@@ -94,14 +146,18 @@ has() { grep -aq "$2" "$1"; }
 want()  { if has "$1" "$2"; then P "$3"; else F "$4"; fi; }
 wantno(){ if has "$1" "$2"; then F "$4"; else P "$3"; fi; }
 
-if [ "$DISARM_BUILD" = 1 ]; then
-    echo "SKIP: wedge/control/read-only lanes (this binary is the MODESET_LATCH_DISARM build)"
+WEDGE_SCORED=0; DISARM_SCORED=0
+_scored_before=$((pass+fail))
+if [ "$LANE" = disarm ]; then
+    echo "NOT RUN: wedge/control/read-only lanes — this binary carries the MODESET_LATCH_DISARM marker."
+    echo "         That retires ~31 assertions, the fail-CLOSED gate among them. Scored as coverage lost,"
+    echo "         not as a skip — see '=== lane coverage ===' below."
 else
 echo "=== BOOT 1 — fresh disk: arm, then wedge ==="
 mk_img "$WORK/main.img" "$RW_FEATURES"
 cp "$OVMF_VARS_SRC" "$WORK/vars1.fd"; chmod +w "$WORK/vars1.fd"
 RC1=$(boot "$WORK/main.img" "$WORK/vars1.fd" "$LOGS/boot1.log" 25)
-grep -aE "^modeset:" "$LOGS/boot1.log" | sed 's/^/  /'
+grep -aE "^(\[[^]]*\] )?modeset:" "$LOGS/boot1.log" | sed 's/^/  /'
 
 want   "$LOGS/boot1.log" "modeset: no latch -- proceeding" "boot1: no latch on a fresh disk" "boot1: expected 'no latch -- proceeding'"
 # ⛔ 1.56.38 — A BOOT WITH NO GPU MUST NOT ARM THE LATCH. main.cyr now runs mdo_native() at boot to take
@@ -158,14 +214,26 @@ if [ -n "$TDRAW" ]; then P "boot1: the platter record carries a ticks field ($TD
 T1=$(grep -ao "armed at site=5 ticks=[0-9]*" "$LOGS/boot1.log" | head -1 | sed 's/.*ticks=//')
 if [ -n "$T1" ]; then
     if [ "$T1" = "$TD" ]; then P "boot1: logged ticks ($T1) == platter ticks ($TD) — two independent channels agree"; else F "boot1: logged ticks [$T1] != platter ticks [$TD]"; fi
+elif has "$LOGS/boot1.log" "modeset: latch armed at site=5"; then
+    # ⛔ NOT the truncation case. The arm line IS in the capture and the `ticks=<digits>` field could not be
+    # read out of it — that is a FORMAT CHANGE, and it silently retires the only two-independent-channel
+    # cross-check in this file (the grep at the top of this block is keyed on the literal
+    # `armed at site=5 ticks=`). Before 1.56.58 both outcomes fell into the same unscored NOTE, so a
+    # renamed field turned the cross-check into a no-op that neither passed nor failed and left the run
+    # green — exactly the rot this cross-check exists to catch.
+    F "boot1: the arm line survived but carries no parsable 'ticks=<digits>' — the cross-channel check has rotted, not been truncated"
 else
+    # The genuinely inconclusive case: the UART FIFO died with the CPU. This is NOT scored here and does
+    # not need to be — the surviving-arm-line assertion above (want 'modeset: latch armed at site=5')
+    # has already recorded a FAIL for the same capture, so the run cannot be green on the strength of
+    # this branch. Say which oracle is authoritative and move on.
     echo "NOTE: boot1's arm line did not survive the wedge in the serial capture; the platter record is the oracle."
 fi
 
 echo ""
 echo "=== BOOT 2 — SAME disk, SAME binary: must skip ==="
 RC2=$(boot "$WORK/main.img" "$WORK/vars1.fd" "$LOGS/boot2.log" 40)
-grep -aE "^modeset:" "$LOGS/boot2.log" | sed 's/^/  /'
+grep -aE "^(\[[^]]*\] )?modeset:" "$LOGS/boot2.log" | sed 's/^/  /'
 
 want   "$LOGS/boot2.log" "modeset: last session did not end cleanly -- modeset SKIPPED this boot" "boot2: ★ the latch was found and the modeset SKIPPED" "boot2: the latch was not detected — H2 does not work"
 want   "$LOGS/boot2.log" "modeset: RISKY STEP refused by latch" "boot2: ★ the risky step was REFUSED" "boot2: the risky step was not refused"
@@ -202,7 +270,7 @@ echo "=== READ-ONLY LANE — the fail-closed gate ==="
 mk_img "$WORK/ro.img" "$RO_FEATURES"
 cp "$OVMF_VARS_SRC" "$WORK/varsro.fd"; chmod +w "$WORK/varsro.fd"
 RCR=$(boot "$WORK/ro.img" "$WORK/varsro.fd" "$LOGS/ro.log" 40)
-grep -aE "^modeset:" "$LOGS/ro.log" | sed 's/^/  /'
+grep -aE "^(\[[^]]*\] )?modeset:" "$LOGS/ro.log" | sed 's/^/  /'
 want   "$LOGS/ro.log" "modeset: latch fs not writable -- REFUSING modeset" "ro: refused because the latch surface is not writable" "ro: did not refuse — the lane may not have achieved a read-only mount"
 if has "$LOGS/ro.log" "modeset: RISKY STEP entered"; then
     echo ""
@@ -218,14 +286,16 @@ fi
 want   "$LOGS/ro.log" "Launching kybernet" "ro: refusing did not itself wedge the boot" "ro: refusing wedged the boot"
 
 fi   # end wedge/control/ro lanes
+WEDGE_SCORED=$((pass+fail-_scored_before))
 
 echo ""
 echo "=== DISARM LANE (separate binary) ==="
-if [ "$DISARM_BUILD" = 1 ]; then
+_scored_before=$((pass+fail))
+if [ "$LANE" = disarm ]; then
     mk_img "$WORK/dis.img" "$RW_FEATURES"
     cp "$OVMF_VARS_SRC" "$WORK/varsd.fd"; chmod +w "$WORK/varsd.fd"
     RCD=$(boot "$WORK/dis.img" "$WORK/varsd.fd" "$LOGS/disarm.log" 40)
-    grep -aE "^modeset:" "$LOGS/disarm.log" | sed 's/^/  /'
+    grep -aE "^(\[[^]]*\] )?modeset:" "$LOGS/disarm.log" | sed 's/^/  /'
     want "$LOGS/disarm.log" "modeset: pathmatch positive OK" "disarm: the path predicate accepts the latch path" "disarm: the path predicate rejected its own path"
     want "$LOGS/disarm.log" "modeset: pathmatch negative OK" "disarm: the path predicate REJECTS a neighbouring path" "disarm: the predicate matched a non-latch path — every rm would become a disarm"
     want "$LOGS/disarm.log" "modeset: verified good, latch cleared" "disarm: ★ the latch was removed, flushed and verified gone" "disarm: the disarm did not complete"
@@ -241,17 +311,81 @@ if [ "$DISARM_BUILD" = 1 ]; then
     want   "$LOGS/disarm.log" "modeset: re-arm after disarm OK" "disarm: ★★ arming WORKS again after the operator's rm — the printed recovery is real" "disarm: arming is DEAD after a disarm — the recovery the kernel advertises does not recover"
     wantno "$LOGS/disarm.log" "modeset: re-arm after disarm FAILED" "disarm: no re-arm failure reported" "disarm: the kernel itself reported that re-arming is broken"
     wantno "$LOGS/disarm.log" "modeset: arm refused -- latch surface unusable" "disarm: the latch surface survived the disarm (re-created on demand)" "disarm: the surface was destroyed by the disarm and never re-created"
-    if debugfs -R "stat /.modeset-armed" "$WORK/part.img" 2>&1 | grep -q "Inode:"; then
-        dd if="$WORK/dis.img" bs=1M skip=33 count=67 of="$WORK/part.img" status=none
+    # ⛔ THIS EXTRACTION IS UNCONDITIONAL, AND THAT IS THE FIX. Until 1.56.58 the outer test here read
+    # $WORK/part.img BEFORE extracting it — and in a disarm build $WORK/part.img has never been written,
+    # because latch_payload() is only ever called from the wedge lane, which by construction did not run.
+    # $WORK is rm -rf'd at the top of every run, so the file was simply absent: debugfs printed no
+    # "Inode:", the `else` fired, and the lane scored `P "gone from the platter"` having read no image at
+    # all. It asserted the absence of a file in a filesystem that was not there.
+    dd if="$WORK/dis.img" bs=1M skip=33 count=67 of="$WORK/part.img" status=none
+    # ⚠ POSITIVE CONTROL, for the same reason. "debugfs found no /.modeset-armed" and "debugfs could not
+    # read this image at all" produce identical output, so the absence only means something once a file we
+    # KNOW is there has been seen. mk_img seeds /hello.txt into every image via $SEED; if that is not
+    # visible, the platter read is broken and the disarm verdict below would be vacuous.
+    if debugfs -R "stat /hello.txt" "$WORK/part.img" 2>&1 | grep -q "Inode:"; then
+        P "disarm: the platter is readable (the seeded /hello.txt is visible) — an absence here means something"
         if debugfs -R "stat /.modeset-armed" "$WORK/part.img" 2>&1 | grep -q "Inode:"; then F "disarm: /.modeset-armed still on the platter"; else P "disarm: /.modeset-armed is gone from the platter"; fi
     else
-        P "disarm: /.modeset-armed is gone from the platter"
+        F "disarm: cannot read the disarm image's filesystem (seeded /hello.txt not found) — 'the latch is gone' would be unprovable"
     fi
 else
-    echo "SKIP: rebuild with MODESET_LATCH_DISARM=1 to exercise the disarm lane"
+    echo "NOT RUN: the disarm lane — this binary has no MODESET_LATCH_DISARM marker."
+    echo "         Scored as coverage lost, not as a skip — see '=== lane coverage ===' below."
+fi
+DISARM_SCORED=$((pass+fail-_scored_before))
+
+echo ""
+echo "=== lane coverage ==="
+if [ "$LANE" = wedge ]; then
+    SCORED=$WEDGE_SCORED; MIN=$WEDGE_MIN
+    OTHER_MIN=$DISARM_MIN
+    OTHER_CMD="MODESET_LATCH_DISARM=1 sh scripts/build.sh && sh scripts/smoke/modeset-latch-smoke.sh"
+else
+    SCORED=$DISARM_SCORED; MIN=$DISARM_MIN
+    OTHER_MIN=$WEDGE_MIN
+    OTHER_CMD="MODESET_LATCH_SELFTEST=1 sh scripts/build.sh && sh scripts/smoke/modeset-latch-smoke.sh"
+fi
+echo "  lane run:  $LANE — $SCORED assertion(s) scored (floor $MIN)"
+if [ "$SCORED" -lt "$MIN" ]; then
+    F "lane coverage: the $LANE lane scored $SCORED assertion(s), floor is $MIN — it ran and enumerated (almost) nothing, which is a broken harness, not a clean kernel"
+fi
+[ "$LANE" = disarm ] && echo "  ⚠ this run says NOTHING about fail-open: the read-only lane's fail-CLOSED gate is in the other lane."
+
+# A run that is not green must not leave a green receipt behind for the next run to inherit.
+if [ "$fail" -eq 0 ] && [ "$hard" = 0 ]; then
+    printf 'lane=%s version=%s scored=%s date=%s\n' \
+        "$LANE" "$VER" "$SCORED" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RECEIPTS/$LANE"
+    echo "  receipt:   wrote $RECEIPTS/$LANE"
+else
+    rm -f "$RECEIPTS/$LANE"
+    echo "  receipt:   REMOVED $RECEIPTS/$LANE (this run was not green)"
+fi
+
+OTHER_OK=0
+if [ -f "$RECEIPTS/$OTHER" ]; then
+    OTHER_LINE="$(cat "$RECEIPTS/$OTHER" 2>/dev/null)"
+    OTHER_VER="$(printf '%s' "$OTHER_LINE" | sed -n 's/.*version=\([^ ]*\).*/\1/p')"
+    OTHER_SCORED="$(printf '%s' "$OTHER_LINE" | sed -n 's/.*scored=\([0-9]*\).*/\1/p')"
+    echo "  other lane ($OTHER): $OTHER_LINE"
+    if [ "$OTHER_VER" = "$VER" ] && [ -n "$OTHER_SCORED" ] && [ "$OTHER_SCORED" -ge "$OTHER_MIN" ]; then
+        OTHER_OK=1
+    elif [ "$OTHER_VER" != "$VER" ]; then
+        echo "  other lane ($OTHER): receipt is for version $OTHER_VER, this tree is $VER — stale, not counted"
+    else
+        echo "  other lane ($OTHER): receipt scored ${OTHER_SCORED:-?}, below its floor $OTHER_MIN — not counted"
+    fi
+else
+    echo "  other lane ($OTHER): NO RECEIPT — that half has never been green at $VER"
 fi
 
 echo ""
 [ "$hard" = 1 ] && { echo "=== modeset-latch-smoke: HARD FAIL (fail-open) ==="; exit 2; }
-[ "$fail" -eq 0 ] && { echo "=== modeset-latch-smoke: $pass passed, 0 failed ==="; exit 0; }
-echo "=== modeset-latch-smoke: $pass passed, $fail failed ==="; exit 1
+[ "$fail" -ne 0 ] && { echo "=== modeset-latch-smoke: $pass passed, $fail failed ==="; exit 1; }
+if [ "$OTHER_OK" != 1 ]; then
+    echo "=== modeset-latch-smoke: PARTIAL — the $LANE lane is green ($SCORED assertions), the $OTHER lane has not run at $VER ==="
+    echo "    Half the property is untested, so this is not a green. Build the other half and run again:"
+    echo "      $OTHER_CMD"
+    exit 3
+fi
+echo "=== modeset-latch-smoke: $pass passed, 0 failed — both lanes green at $VER ==="
+exit 0

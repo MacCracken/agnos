@@ -16,11 +16,87 @@
 # (net_icmp.cyr); the timer ISR is otherwise console-silent, kb_isr is asm-only, and
 # the fault handlers paint raw CMOS then halt. ORDER: console_lock sits between
 # proctab and nvme; FS code that kprints (fs_lock held) acquires console forward.
+# ── KERNEL-LOG LINE PREFIX (1.56.58) ──────────────────────────────────────────────────────────────
+#
+# Renders Linux printk shape: "[    4.123456] " — 1 + 5 + 1 + 6 + 1 + 1 = 15 bytes, seconds
+# space-padded to 5, microseconds zero-padded to 6. Matches `%5lu.%06lu` so a reader who knows dmesg
+# knows this.
+#
+# ⛔⛔ THE PREFIX IS FOR KERNEL-ORIGIN LINES ONLY, AND `klog_raw_depth` IS THE WHOLE REASON IT CAN BE.
+# `kprint` is ALSO the ring-3 stdout/stderr path: fd 0/1/2 are VFS_DEVICE 0 (core/vfs.cyr:278-283),
+# so a userland `write(1,…)` walks vfs_write -> dev_write -> serial_dev_write (core/devs.cyr) ->
+# kprint. Decorating unconditionally would stamp timestamps into `ls` output, into every pipe, and
+# into the ~330 harness assertions that parse program output. serial_dev_write raises this counter
+# around its kprint loop, so those bytes pass through byte-exact.
+#
+# ⚠ `klog_at_bol` IS TRACKED FOR RAW BYTES TOO, and that is deliberate. 23.5% of the ring under a pty
+# — 82.6% in a desktop session — is ring-3 output. If a program writes "abc" with no newline and a
+# kernel line follows, we are NOT at a line start, and injecting a prefix there would split the
+# operator's visible line. Tracking every byte means the prefix appears only at a true column 0.
+#
+# ⚠ NOT EMITTED FROM kputc — see the note there.
+var klog_at_bol    = 1;   # 1 = the next byte emitted starts a fresh console line
+var klog_raw_depth = 0;   # >0 = emit bytes UNDECORATED (ring-3 stdout/stderr passthrough)
+
+# Build the prefix into `dst` (needs 15 bytes) and return its length.
+#
+# ⚠ `dst` IS A FUNCTION-LOCAL `var buf[24]` AT EVERY CALL SITE, WHICH IS 24 BYTES. Function-local
+# var[N] is N BYTES; module-scope var[N] is usually N*8. That asymmetry is the highest-yield trap in
+# this tree (docs/development/state.md) — verify it, never recall it. 15 <= 24.
+#
+# ⚠ NO STRING LITERALS AND NO CALL TO kprint/kfmt HERE. It runs inside the console lock (a bare,
+# non-recursive xchg spinlock, arch/x86_64/smp.cyr) and is reached from the console emitters
+# themselves, so anything that re-enters them would self-deadlock.
+fn klog_build_prefix(dst) {
+    var us   = klog_uptime_us();
+    var secs = us / 1000000;
+    var frac = us - secs * 1000000;
+    # Clamp at the field width rather than letting a 6-digit second silently shift every later column.
+    # 99999 s is ~27.7 h of uptime; a box past it reports a pinned clock, not a corrupt line.
+    if (secs > 99999) { secs = 99999; frac = 999999; }
+    store8(dst, 91);                                    # 91 = 0x5B = the opening bracket
+
+    # Seconds: 5 wide, RIGHT-ALIGNED, SPACE-padded. Digit count is computed first so the pad can be
+    # written directly — the obvious alternative (write zeros, then overwrite leading ones with
+    # spaces) cannot tell a pad it just wrote from a genuine leading zero on the next pass.
+    var nd = 1;
+    var t  = secs;
+    while (t >= 10) { nd = nd + 1; t = t / 10; }
+    var s5 = secs;
+    var p  = 5;
+    while (p >= 1) {
+        if (p > 5 - nd) { store8(dst + p, 48 + (s5 % 10)); s5 = s5 / 10; }
+        if (p <= 5 - nd) { store8(dst + p, 32); }
+        p = p - 1;
+    }
+
+    store8(dst + 6, 46);                                # 46 = the decimal point
+    # Microseconds: 6 wide, ZERO-padded (a fraction pads with zeros, never spaces).
+    var f6 = frac;
+    var r  = 12;
+    while (r >= 7) {
+        store8(dst + r, 48 + (f6 % 10));
+        f6 = f6 / 10;
+        r = r - 1;
+    }
+    store8(dst + 13, 93);                               # 93 = the closing bracket
+    store8(dst + 14, 32);                               # one separating space
+    return 15;
+}
+
 fn kputc(ch) {
     console_spin_lock();
     serial_putc(ch);
     fb_putc(ch);
     klug_putc(ch);            # unify into the klug ring buffer (core/klug.cyr)
+    # ⛔ TRACKS THE LINE POSITION BUT NEVER EMITS A PREFIX, AND THAT ASYMMETRY IS THE POINT. kputc
+    # carries the KEYSTROKE ECHO — the operator typing. Stamping "[    4.123456] " in front of the
+    # first character they type would put a timestamp inside their own command line. The same reason
+    # the fb_oob live-line bracket deliberately skips kputc (see the banner below).
+    # ⚠ The tracking itself is NOT optional: echo moves the cursor off column 0, and a kernel line
+    # arriving mid-keystroke must know that.
+    klog_at_bol = 0;
+    if (ch == 10) { klog_at_bol = 1; }
     console_spin_unlock();
     return 0;
 }
@@ -35,23 +111,44 @@ fn kputc(ch) {
 # (`devs.cyr:71` → `write(1)`), so a second process printing while the operator types is the same defect.
 fn kprint(buf, len) {
     console_spin_lock();
+    # ⚠ THE PREFIX GOES TO ALL THREE SINKS IN THE SAME ORDER kprint ALREADY USES, and the fb copy MUST
+    # sit INSIDE the fb_oob_begin/fb_oob_end window. Outside it, fb_line_note captures the prefix into
+    # fb_line_buf (fb_console.cyr) and fb_oob_end REPLAYS it as part of the operator's typed line —
+    # the exact corruption scripts/harness/console-line-preserve-test.py exists to catch.
+    var pbuf[24];
+    var plen = 0;
+    if (klog_raw_depth == 0) { if (klog_at_bol == 1) { plen = klog_build_prefix(&pbuf); } }
+    if (plen > 0) { serial_print(&pbuf, plen); }
     serial_print(buf, len);
     var held = fb_oob_begin();
+    if (plen > 0) { fb_print(&pbuf, plen); }
     fb_print(buf, len);
     fb_oob_end(held);
+    if (plen > 0) { klug_append(&pbuf, plen); }
     klug_append(buf, len);
+    if (len > 0) {
+        klog_at_bol = 0;
+        if (load8(buf + len - 1) == 10) { klog_at_bol = 1; }
+    }
     console_spin_unlock();
     return 0;
 }
 
 fn kprintln(buf, len) {
     console_spin_lock();
+    var pbuf[24];
+    var plen = 0;
+    if (klog_raw_depth == 0) { if (klog_at_bol == 1) { plen = klog_build_prefix(&pbuf); } }
+    if (plen > 0) { serial_print(&pbuf, plen); }
     serial_println(buf, len);
     var held = fb_oob_begin();
+    if (plen > 0) { fb_print(&pbuf, plen); }
     fb_println(buf, len);
     fb_oob_end(held);
+    if (plen > 0) { klug_append(&pbuf, plen); }
     klug_append(buf, len);    # capture the line + the newline serial/fb_println add
     klug_putc(10);
+    klog_at_bol = 1;          # println always terminates the line
     console_spin_unlock();
     return 0;
 }

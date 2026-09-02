@@ -22,6 +22,21 @@
 # (BAR padded for alignment, or BAR sized to the next mode up). Under
 # pre-Attempt-73 gnoboots fb_size_or_fallback() returns the legacy
 # pitch*height value — backward-compatible.
+
+# ⭐ t=0 FOR THE KERNEL LOG (1.56.58). The FIRST executable statement of the boot body, so every
+# [    S.ssssss] prefix core/kprint.cyr emits is measured from here. rdtsc needs no setup and works
+# from instruction one, so this is safe at the very top.
+# ⛔ IT IS A STATEMENT, NOT `var klog_tsc_boot = rdtsc();`. In kmode EMIT_GVAR_INITS runs AFTER
+# PARSE_PROG, and PARSE_PROG is this boot sequence, which never returns — so a module-scope expression
+# initialiser never executes and the variable reads 0 forever, with no diagnostic. That trap has two
+# archived filings of its own (issues/archived/2026-07-23-cyrius-module-scope-var-expr-initializer-zero.md
+# and .../2026-07-23-kernel-expression-gvar-initialisers-never-run.md); cyrius 6.4.74 const-folds
+# LITERAL initialisers, which is exactly why a non-foldable one now fails silently rather than loudly.
+# ⚠ Lines emitted BEFORE this point (the boot shim, and the version banner in version.cyr which
+# agnos.cyr parses at :67 — ahead of core/main.cyr at :128) render 0.000000. Linux does the same for
+# its own pre-timekeeping lines; do not "fix" it by moving this into a file aarch64 also compiles.
+klog_tsc_boot = rdtsc();
+
 vmm_remap_wc_range(fb_fb_phys(), fb_size_or_fallback());
 
 # Populate the 8x8 font in BSS so fb_putc renders glyphs once shell()
@@ -4582,6 +4597,31 @@ fn tsc_calibrate() {
     }
     kprint("tsc: ", 5); kprint_num(tsc_per_us);
     kprintln(" cycles per microsecond (measured over 50 ms of live ticks)", 59);
+    # ⭐ 1.56.58 — CROSS-CHECK THE LOG TIMEBASE AGAINST THIS ONE. klog_tsc_per_us was measured ~4,400
+    # statements ago by lapic_calibrate, against 8 free-running PIT periods with interrupts OFF; this
+    # one was measured over 50 ms of LIVE TICKS with interrupts on. Two independent methods, same
+    # physical quantity — so a disagreement is real evidence, and agreement is the only proof the
+    # early number is sound. Without this the log would render a plausible timestamp built on an
+    # unverified divisor, which is the failure this tree keeps re-learning.
+    # ⚠ Band is ±12%: the early window is ~80 ms of PIT against a 15 ppm-slow tick, the late one 50 ms
+    # of a 100 Hz counter that can only resolve ±1 tick (±2% by itself), and on a boosting CPU the two
+    # windows genuinely sample different clock states. Tighter than 12% would flag hardware, not bugs.
+    if (klog_tsc_per_us == 0) {
+        kprintln("klog: NO LOG TIMEBASE -- lapic_calibrate refused; every timestamp reads 0.000000", 80);
+    }
+    if (klog_tsc_per_us != 0) {
+        var kdiff = klog_tsc_per_us - tsc_per_us;
+        if (kdiff < 0) { kdiff = 0 - kdiff; }
+        if (kdiff * 100 > tsc_per_us * 12) {
+            kprint("klog: TIMEBASE DISAGREES -- early=", 34); kprint_num(klog_tsc_per_us);
+            kprint(" late=", 6); kprint_num(tsc_per_us);
+            kprintln(" cycles/us; log timestamps are skewed", 37);
+        }
+        if (kdiff * 100 <= tsc_per_us * 12) {
+            kprint("klog: log timebase OK -- ", 25); kprint_num(klog_tsc_per_us);
+            kprintln(" cycles/us, agrees with tsc within 12%", 38);
+        }
+    }
     return 0;
 }
 tsc_calibrate();

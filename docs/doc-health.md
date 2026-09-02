@@ -6,7 +6,33 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-08-31 (**1.56.56 — a CHANGELOG correction and the issues folder 7 → 4; see the 1.56.56 block**). Prior: 1.56.55 (the open-issue re-audit). Prior: 2026-08-29 (**1.56.52 — both audit P0s closed** — see the 2026-08-29 block; the 2026-08-28 block below it records the sweep that produced the backlog). **⛔ THE MULTI-MINOR LAG HAPPENED A THIRD TIME, AND THIS FILE PREDICTED IT TWICE.** The ledger sat at **v1.44.9** from 2026-06-10 to 2026-08-28 — **~12 minors** (1.45.x net/server, 1.46.x SMP, 1.47.x-1.49.x, 1.50.x-1.53.x, the 1.54.x-1.56.x GPU/display/shader arcs) — with state.md/roadmap/CHANGELOG kept per-cut and the body docs un-swept, which is verbatim the failure the two notes below describe. The stated fix ("fold a doc-health touch into the cycle-OPEN sweep") was never adopted. ⚠ **This refresh is NOT that catch-up sweep** — it records only what 1.56.51 actually touched. The body docs (`README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`) remain unswept since 1.44.9 and their syscall counts, sizes and subsystem tables should be assumed stale — the surface has since grown to **0-101**.
+> **Last refresh**: 2026-09-02 (**1.56.58 — the klug line format became contract; see the 1.56.58 block**). Prior: 2026-08-31 (**1.56.56 — a CHANGELOG correction and the issues folder 7 → 4; see the 1.56.56 block**). Prior: 1.56.55 (the open-issue re-audit). Prior: 2026-08-29 (**1.56.52 — both audit P0s closed** — see the 2026-08-29 block; the 2026-08-28 block below it records the sweep that produced the backlog). **⛔ THE MULTI-MINOR LAG HAPPENED A THIRD TIME, AND THIS FILE PREDICTED IT TWICE.** The ledger sat at **v1.44.9** from 2026-06-10 to 2026-08-28 — **~12 minors** (1.45.x net/server, 1.46.x SMP, 1.47.x-1.49.x, 1.50.x-1.53.x, the 1.54.x-1.56.x GPU/display/shader arcs) — with state.md/roadmap/CHANGELOG kept per-cut and the body docs un-swept, which is verbatim the failure the two notes below describe. The stated fix ("fold a doc-health touch into the cycle-OPEN sweep") was never adopted. ⚠ **This refresh is NOT that catch-up sweep** — it records only what 1.56.51 actually touched. The body docs (`README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`) remain unswept since 1.44.9 and their syscall counts, sizes and subsystem tables should be assumed stale — the surface has since grown to **0-101**.
+>
+> ### 1.56.58 (2026-09-02) — the log line becomes contract, and a doc that was wrong in three places
+>
+> ✅ **`agnos-userland-abi.md`** §4.5 — corrected and extended. ⛔ It said the klug ring was **16 KB**
+> in three separate places; it is **64 KB** and has been since the ring was raised, so the written
+> contract disagreed with both the kernel (`var klug_buf[8192]`, module scope = N×u64) and the
+> userland reader (`KLUG_RING_BYTES = 65536`, pinned in klug's own tests). It also described the
+> `[I]`/`[W]`/`[E]` lens as live when **no production build emits a single leveled line**. Now carries
+> the 1.56.58 line format, the ring-3 exemption, and the BRE/ERE anchors a consumer must use.
+> ⚠ **The log LINE FORMAT is now de-facto ABI with no freeze status.** The doc's legend (:16-27) marks
+> syscall ROWS 🔒 FROZEN / ✅ DECIDED but says nothing about line shape — and 110 assertions across 34
+> smoke scripts now depend on it. Deciding that status is open work.
+>
+> ✅ **`state.md`** — kernel-head row rewritten for the cut; `build/agnos` row now says plainly that the
+> file is an ordinary dev build and that `burn-verify` says **DO NOT FLASH** (the tag is 1.56.53, and
+> was already stale before this cut). Bootloader row corrected **0.6.1 → 0.7.1** (the sibling had moved
+> and the row had not). Two `Previous cut` rows consolidated into one to stay under the 120-line cap.
+>
+> ✅ **`issues/2026-09-02-vacuous-gates-sweep.md`** — filed at 1.56.57 UNFIXED, swept at 1.56.58.
+> Status header rewritten in place **before** any move, per the folder's own rule; it **stays OPEN**
+> because one finding was declined, two fixes moved the vacuity up a level rather than removing it,
+> and `.github/workflows/`, `scripts/burn/` and `tests/*/` were never swept.
+>
+> ⚠ **Still unswept since 1.44.9**, unchanged by this cut and called out again because the note above
+> predicted exactly this: `README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`,
+> `kybernet-bridge.md`. `architecture/overview.md` additionally still says "Built with cyrius 6.0.56".
 >
 > ### 1.56.56 (2026-08-31) — two syscalls shipped, a ruling found, and the issues folder 7 → 2
 >

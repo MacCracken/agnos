@@ -155,21 +155,53 @@ try:
     # -d int exception census: count CPU exception vectors (v=00..1f) in the QEMU int log. The
     # SMP-fault signatures STEP-2 must produce ZERO of: #UD(06) #DF(08) #TS(0a) #NP(0b) #SS(0c)
     # #GP(0d) #PF(0e). (IRQs are v=20+, not counted.) A clean -smp 4 boot+#37s = 0 of these.
+    # ⚠ VACUITY FLOOR, 2026-09-02. THE CENSUS IS A NEGATIVE ASSERTION OVER A PRODUCER WHOSE SUCCESS
+    # IS NEVER CHECKED, AND UNTIL 1.56.58 AN EMPTY PRODUCER SCORED THE AFFIRMATIVE. `-d int -D QLOG`
+    # is appended to the qemu argv above and its outcome is discarded three ways over: qemu's stdout
+    # AND stderr go to DEVNULL, nothing ever reads qemu.poll(), and QLOG is read while the guest is
+    # still running. So a QEMU that rejected `-d int` on this build, died inside OVMF before the
+    # first exception, or could not create the file at all leaves `qlog = ""` — `re.findall` returns
+    # [], `bad` stays {}, `len(bad) == 0` is True, and the run printed the affirmative string
+    # "0 SMP-fault exceptions" and APPENDED IT TO THE PASS LINE. That is a clean bill of health
+    # issued by a census that read zero bytes, and it is the same shape as the grep-that-matched-
+    # nothing this sweep found in klug-spill-smoke.sh: an empty input set scoring as a clean run.
+    # ⭐ THE DISCRIMINATOR WAS ALREADY IN HAND AND NEVER CONSULTED — IT IS THE DENOMINATOR. Every IRQ
+    # is a `v=` record too (v=20+, deliberately NOT in the bad set), so any guest that got as far as
+    # the firmware handoff logs them continuously: a timer tick alone is one record per 10 ms of TCG
+    # wall clock, and this harness waits up to 120 s for the banner before it counts anything. A
+    # total `v=` count near zero therefore says the LOG is broken, never that the kernel is clean.
+    # ⚠ THE FLOOR IS DELIBERATELY FAR BELOW ANY REAL RUN rather than at a measured typical count: it
+    # is here to separate "nothing was logged" from "something was logged", not to grade the boot, so
+    # it can only ever fire on a producer that failed. And the count is PRINTED — into the verdict
+    # line and into the PASS line — rather than implied, because "0 SMP-fault exceptions in 7 v=
+    # records" is a run reporting that its own -d int producer broke, not that -smp 4 is clean.
+    DINT_MIN_VECS = 32
     dint_ok = True
     dint_report = "(skipped — set RUN37_DINT=1)"
     if DINT:
         import re as _re
         try: qlog = open(QLOG, "r", errors="replace").read()
         except OSError: qlog = ""
+        vecs = _re.findall(r"v=([0-9a-fA-F]{2})", qlog)
         bad = {}
-        for mvec in _re.findall(r"v=([0-9a-fA-F]{2})", qlog):
+        for mvec in vecs:
             iv = int(mvec, 16)
             if iv in (0x06, 0x08, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e):
                 bad[iv] = bad.get(iv, 0) + 1
-        dint_ok = (len(bad) == 0)
         names = {0x06:"#UD",0x08:"#DF",0x0a:"#TS",0x0b:"#NP",0x0c:"#SS",0x0d:"#GP",0x0e:"#PF"}
-        dint_report = "0 SMP-fault exceptions" if dint_ok else \
-            ", ".join(f"{names[k]}(v={k:#04x})x{bad[k]}" for k in sorted(bad))
+        if len(vecs) < DINT_MIN_VECS:
+            # ⛔ NOT a clean census — an ABSENT one. Fail closed and name the log that is missing.
+            dint_ok = False
+            dint_report = (f"INCONCLUSIVE — censused {len(vecs)} v= records ({len(qlog)} B in "
+                           f"{QLOG}), under the {DINT_MIN_VECS} floor: -d int logged nothing to "
+                           "count, so this run proves NOTHING about SMP faults")
+        elif bad:
+            dint_ok = False
+            dint_report = ", ".join(f"{names[k]}(v={k:#04x})x{bad[k]}" for k in sorted(bad)) + \
+                          f" in {len(vecs)} v= records"
+        else:
+            dint_ok = True
+            dint_report = f"0 SMP-fault exceptions in {len(vecs)} v= records"
 
     rendered_any = rendered1 or rendered2
     # agnsh's resume context is proven intact by EITHER `version` working after the #37s OR by the
@@ -189,7 +221,9 @@ try:
     prompt_ok = prompt_back1 or prompt_back2
     p("agnsh resume intact post-#37 (version works OR 2 renders):", resume_intact, f"(version={ver_live})")
     if rendered_any and prompt_ok and resume_intact and dint_ok:
-        p("run37-smp4-test: PASS — foreground execwait#37 rendered + agnsh resumed intact across two #37s (per-CPU ew37 OK)" + (" + 0 SMP-fault exceptions (-d int)" if DINT else ""))
+        # ⚠ the census verdict goes onto the PASS line VERBATIM (it was the fixed literal "0 SMP-fault
+        # exceptions" until 1.56.58) so the record count that earned it travels with the claim.
+        p("run37-smp4-test: PASS — foreground execwait#37 rendered + agnsh resumed intact across two #37s (per-CPU ew37 OK)" + (f" + {dint_report} (-d int)" if DINT else ""))
         rc = 0
     else:
         p("run37-smp4-test: FAIL")

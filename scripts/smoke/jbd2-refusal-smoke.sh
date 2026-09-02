@@ -70,7 +70,7 @@ qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-90}" \
 
 echo ""
 echo "  --- jbd2 + shell-prompt lines from boot log ---"
-strings "$LOG" | grep -E "^jbd2:|^AGNOS shell" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?jbd2:|^AGNOS shell" | sed 's/^/  /'
 echo ""
 
 rc=0
@@ -84,7 +84,7 @@ if strings "$LOG" | grep -q "refusing RW mount"; then
 else
     echo "  FAIL: refusal-reason text missing"; rc=1
 fi
-if strings "$LOG" | grep -q "^AGNOS shell"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}AGNOS shell"; then
     echo "  PASS: shell came up (RO mount allowed -- not a hang)"
 else
     echo "  FAIL: shell prompt never reached"; rc=1

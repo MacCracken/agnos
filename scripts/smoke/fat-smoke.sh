@@ -99,7 +99,7 @@ qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-30}" "$WORK/vars.fd" "$OVMF_V
 
 echo ""
 echo "  --- fat lines from boot log ---"
-strings "$LOG" | grep -E "^fat: mounted|^fatr:" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?fat: mounted|^fatr:" | sed 's/^/  /'
 echo ""
 
 rc=0

@@ -99,7 +99,7 @@ mkfs.ext4 -F -q -L AGNOS-MC -b 4096 -m 0 -g "$BPG" -i "$BYTES_PER_INODE" \
 dd if="$IMG" bs=1M skip=$ESP_END_MIB count=$(( PART_END_MIB - ESP_END_MIB )) of="$WORK/part-pre.img" status=none
 H_GROUPS=$(dumpe2fs -h "$WORK/part-pre.img" 2>/dev/null | sed -nE 's/.*Group descriptor size:[[:space:]]+([0-9]+).*/\1/p')
 H_IPG=$(dumpe2fs -h "$WORK/part-pre.img" 2>/dev/null | sed -nE 's/.*Inodes per group:[[:space:]]+([0-9]+).*/\1/p')
-H_NG=$(dumpe2fs "$WORK/part-pre.img" 2>/dev/null | grep -cE "^Group [0-9]+:")
+H_NG=$(dumpe2fs "$WORK/part-pre.img" 2>/dev/null | grep -cE "^(\[[^]]*\] )?Group [0-9]+:")
 H_DESC=${H_GROUPS:-?}
 GPB=$(( 4096 / ${H_GROUPS:-64} ))
 echo "  host fs: desc_size=$H_DESC  inodes/group=$H_IPG  groups=$H_NG  groups_per_bgdt_block=$GPB"
@@ -128,10 +128,10 @@ qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
 
 echo ""
 echo "  --- mc: self-test lines from boot log ---"
-strings "$LOG" | grep -E "^mc:" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?mc:" | sed 's/^/  /'
 echo ""
 
-if ! strings "$LOG" | grep -q "^mc:"; then
+if ! strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}mc:"; then
     echo "  ERROR: kernel booted but produced NO 'mc:' lines — this build does NOT"
     echo "         contain the multi-chunk self-test. Rebuild:  MULTICHUNK_SELFTEST=1 ./scripts/build.sh"
     echo "         Log: $LOG"

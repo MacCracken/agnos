@@ -58,8 +58,26 @@ UNBURNED=""
 partition_fail=0
 covered=$(grep -oE 'check_shader\([^)]*"[a-z0-9_]+"\)' "$GPU/shaderasm.cyr" 2>/dev/null \
           | sed -E 's/.*"([a-z0-9_]+)".*/\1/')
+# ⛔⛔ VACUITY FLOOR ON THE PARTITION'S OWN ENUMERATION. The partition IS the gate now that UNBURNED is
+# empty — and until 1.56.58 it was measured over an unfloored glob, so it had the exact shape it was
+# written to prevent, one level up. `for f in "$SHADERS"/emit/*.emit.cyr` with `[ -f "$f" ] || continue`
+# iterates ZERO times when the glob matches nothing: partition_fail stays 0, the empty UNBURNED loop
+# below adds nothing, and the script prints "OK — every emit list is gated by shaderasm" having read no
+# emit list at all. MEASURED (2026-09-02), on a copy of this script over a tree whose emit/ was empty:
+# that exact OK line, exit 0 — byte-identical to the run over the real two-list tree.
+# ⇒ The ways it goes empty are all edits somebody makes on purpose: emit/ renamed in a refactor, the
+# `.emit.cyr` suffix changed, or this script moved a directory so ROOT loses a level.
+# ⭐ WHY THE FLOOR IS 2 AND NOT 1: emit lists are never DELETED, they GRADUATE. A shader gets one when
+# it is first encoded and KEEPS it after the burn, because shaderasm gates the committed hex AGAINST
+# the emit list — burning makes the list load-bearing, not obsolete. That is precisely what blend_alpha
+# did at 1.56.44 when it left UNBURNED. The population is monotonic: blend_rect + blend_alpha today,
+# more later, fewer never. A count under 2 is this gate's enumeration breaking, not the tree changing.
+# ⚠ Counted INSIDE the loop rather than by a second glob, so the floor measures the iterations that
+# ACTUALLY RAN. A separate `ls "$SHADERS"/emit | wc -l` can report 2 while the loop above saw 0.
+n_emit=0
 for f in "$SHADERS"/emit/*.emit.cyr; do
     [ -f "$f" ] || continue
+    n_emit=$((n_emit + 1))
     base=$(basename "$f" .emit.cyr)
     in_unburned=0; in_shaderasm=0
     for u in $UNBURNED;  do [ "$u" = "$base" ] && in_unburned=1; done
@@ -73,6 +91,15 @@ for f in "$SHADERS"/emit/*.emit.cyr; do
         partition_fail=1
     fi
 done
+if [ "$n_emit" -lt 2 ]; then
+    echo "shader-crossasm: FAILED — enumerated $n_emit emit list(s); this gate is vacuous below 2."
+    echo "  looked for: $SHADERS/emit/*.emit.cyr"
+    echo "  The partition assertion is the ONLY thing this gate proves while UNBURNED is empty, and it"
+    echo "  proves nothing over an empty glob. Emit lists graduate, they are never deleted, so finding"
+    echo "  fewer than two means the enumeration broke (emit/ renamed, suffix changed, ROOT wrong) —"
+    echo "  not that the tree is clean."
+    exit 1
+fi
 if [ "$partition_fail" != "0" ]; then
     echo "shader-crossasm: FAILED — every emit list must be gated exactly once"
     exit 1
@@ -147,8 +174,11 @@ fi
 # ⚠ SAY WHICH OF THE TWO GREENS THIS IS. "OK — every unburned shader encodes identically" over an
 # empty list is a true sentence that reads as coverage; the partition assertion above is what was
 # actually proven, and the message has to name it.
+# ⚠ AND SAY HOW MANY IT COUNTED, not just that it looked. Both greens below carried the same words
+# whether the enumeration found two emit lists or none — a run that prints "1 emit list" is reporting
+# that its own enumeration broke, and a run that prints nothing at all reports it too late.
 if [ -z "$UNBURNED" ]; then
-    echo "shader-crossasm: OK — no shader currently lacks iron-proven hex; every emit list is gated by shaderasm"
+    echo "shader-crossasm: OK — $n_emit emit lists, none lacking iron-proven hex; each gated by shaderasm"
     exit 0
 fi
-echo "shader-crossasm: OK — every unburned shader encodes identically under two independent assemblers"
+echo "shader-crossasm: OK — $n_emit emit lists gated exactly once; every unburned shader encodes identically under two independent assemblers"

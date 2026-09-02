@@ -98,7 +98,7 @@ fi
 
 echo ""
 echo "  --- exfat write lines from boot log ---"
-strings "$LOG" | grep -E "^exfat:|^exfatw:" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?exfat:|^exfatw:" | sed 's/^/  /'
 echo ""
 
 # Wrong-build guard. The exFAT write self-test only exists in a kernel built
@@ -109,7 +109,7 @@ echo ""
 # (it was misfiled exactly that way as the 2026-05-31 mkfs-1.3.2-drift issue,
 # whose real cause was the smoke run against a leftover exec-iron build).
 # Distinguish "kernel booted but selftest absent" from a genuine result.
-if ! strings "$LOG" | grep -q "^exfatw:"; then
+if ! strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw:"; then
     echo "  ERROR: kernel booted but produced NO 'exfatw:' lines — this build does"
     echo "         NOT contain the exFAT write self-test. Rebuild with the flag:"
     echo "             EXFAT_WRITE_SELFTEST=1 ./scripts/build.sh"
@@ -127,82 +127,82 @@ echo ""
 
 rc=0
 # 3a — empty-file create (dir-set + SetChecksum + NameHash)
-strings "$LOG" | grep -q "^exfatw: create EXWRITE.BIN rc=0" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: create EXWRITE.BIN rc=0" \
     && echo "  PASS: 3a AGNOS wrote the dir-set (create rc=0)" \
     || { echo "  FAIL: 3a create rc != 0"; rc=1; }
-strings "$LOG" | grep -q "^exfatw: create find-back OK" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: create find-back OK" \
     && echo "  PASS: 3a AGNOS re-read its own dir-set (find-back)" \
     || { echo "  FAIL: 3a find-back"; rc=1; }
 # 3b — content write (bitmap alloc + contiguous clusters + round-trip read)
-strings "$LOG" | grep -q "^exfatw: write EXDATA.BIN rc=0" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: write EXDATA.BIN rc=0" \
     && echo "  PASS: 3b AGNOS wrote content (write rc=0)" \
     || { echo "  FAIL: 3b write rc != 0"; rc=1; }
-strings "$LOG" | grep -q "^exfatw: write round-trip OK" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: write round-trip OK" \
     && echo "  PASS: 3b multi-cluster content round-trip byte-exact" \
     || { echo "  FAIL: 3b round-trip"; rc=1; }
 # 3c — delete + truncate-to-zero (clusters freed; fsck-clean is the gate)
-strings "$LOG" | grep -q "^exfatw: delete EXDELME.BIN wrc=0 drc=0" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: delete EXDELME.BIN wrc=0 drc=0" \
     && echo "  PASS: 3c delete (write rc=0, delete rc=0)" \
     || { echo "  FAIL: 3c delete"; rc=1; }
-strings "$LOG" | grep -q "^exfatw: trunc EXTRUNC.BIN wrc=0 trc=0" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: trunc EXTRUNC.BIN wrc=0 trc=0" \
     && echo "  PASS: 3c truncate-to-zero (write rc=0, trunc rc=0)" \
     || { echo "  FAIL: 3c truncate"; rc=1; }
 # 1.34.2 — write parity: overwrite-existing, arbitrary truncate, ENOSPC
-strings "$LOG" | grep -q "^exfatw: overwrite round-trip OK" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: overwrite round-trip OK" \
     && echo "  PASS: 1.34.2 overwrite-existing (1000 B -> 2000 B, byte-exact)" \
     || { echo "  FAIL: 1.34.2 overwrite"; rc=1; }
-strings "$LOG" | grep -q "^exfatw: truncate round-trip OK" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: truncate round-trip OK" \
     && echo "  PASS: 1.34.2 arbitrary-length truncate (3000 B -> 1000 B)" \
     || { echo "  FAIL: 1.34.2 arbitrary truncate"; rc=1; }
-strings "$LOG" | grep -q "^exfatw: enospc clean -- no partial file" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: enospc clean -- no partial file" \
     && echo "  PASS: 1.34.2 ENOSPC rollback (oversize request, no partial file)" \
     || { echo "  FAIL: 1.34.2 ENOSPC"; rc=1; }
 # 1.34.4 bite 1 — root-directory extension: 10 new files past the 16-entry root
-strings "$LOG" | grep -q "^exfatw: rootext 10 new files nfail=0" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: rootext 10 new files nfail=0" \
     && echo "  PASS: 1.34.4 root extension (10 new files created past single-cluster root)" \
     || { echo "  FAIL: 1.34.4 root extension (some creates failed)"; rc=1; }
-strings "$LOG" | grep -q "^exfatw: rootext readback OK" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: rootext readback OK" \
     && echo "  PASS: 1.34.4 extended-root file readback byte-exact" \
     || { echo "  FAIL: 1.34.4 rootext readback"; rc=1; }
 # 1.34.5 — Unicode name: Café.txt (0xE9 'é'). fsck.exfat recomputes the
 # NameHash via the volume up-case table (é→É); ASCII-upcase → mismatch.
 # The fsck-clean gate above is the discriminator; these confirm create+find.
-strings "$LOG" | grep -q "^exfatw: unicode Cafe-acute rc=0" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: unicode Cafe-acute rc=0" \
     && echo "  PASS: 1.34.5 non-ASCII name create (real up-case NameHash)" \
     || { echo "  FAIL: 1.34.5 non-ASCII create"; rc=1; }
-strings "$LOG" | grep -q "^exfatw: unicode find+read OK" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: unicode find+read OK" \
     && echo "  PASS: 1.34.5 non-ASCII name find + content readback" \
     || { echo "  FAIL: 1.34.5 non-ASCII find/read"; rc=1; }
 # 1.39.3 VFS-lift bite 3: the shell write verbs reach exFAT (sh_cmd_touch /
 # sh_echo_redirect -> vfs_create_secondary / vfs_write_secondary ->
 # exfat_create / exfat_write_file). In-kernel find-back + content round-trip;
 # fsck.exfat -n (below) confirms the structure stayed clean after the writes.
-strings "$LOG" | grep -q "^exfatw: shell touch find-back OK" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: shell touch find-back OK" \
     && echo "  PASS: 1.39.3 shell 'touch' created file on exFAT (vfs_create_secondary)" \
     || { echo "  FAIL: 1.39.3 shell touch over exFAT"; rc=1; }
-strings "$LOG" | grep -q "^exfatw: shell echo round-trip OK" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: shell echo round-trip OK" \
     && echo "  PASS: 1.39.3 shell 'echo >' wrote content on exFAT (vfs_write_secondary)" \
     || { echo "  FAIL: 1.39.3 shell echo> over exFAT"; rc=1; }
 # 1.39.4 VFS-lift bite 4: shell `rm` over exFAT (vfs_delete_secondary ->
 # exfat_delete). In-kernel find after rm must miss; fsck.exfat -n (below)
 # confirms the dir-set + clusters were freed cleanly.
-strings "$LOG" | grep -q "^exfatw: shell rm gone OK" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: shell rm gone OK" \
     && echo "  PASS: 1.39.4 shell 'rm' removed file on exFAT (vfs_delete_secondary)" \
     || { echo "  FAIL: 1.39.4 shell rm over exFAT (target still present)"; rc=1; }
 # 1.39.6 VFS-lift bite 6: shell mkdir/rmdir over exFAT (vfs_mkdir_secondary/
 # vfs_rmdir_secondary -> exfat_mkdir/exfat_rmdir). In-kernel find confirms
 # the created dir-set + that the removed one is gone; fsck.exfat -n (below)
 # confirms the Directory dir-set + cluster are structurally sound.
-strings "$LOG" | grep -q "^exfatw: shell mkdir find-back OK" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: shell mkdir find-back OK" \
     && echo "  PASS: 1.39.6 shell 'mkdir' created dir on exFAT (exfat_mkdir)" \
     || { echo "  FAIL: 1.39.6 shell mkdir over exFAT"; rc=1; }
-strings "$LOG" | grep -q "^exfatw: shell rmdir gone OK" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: shell rmdir gone OK" \
     && echo "  PASS: 1.39.6 shell 'rmdir' removed dir on exFAT (exfat_rmdir)" \
     || { echo "  FAIL: 1.39.6 shell rmdir over exFAT (dir still present)"; rc=1; }
 # 1.39.7 VFS-lift bite 7: shell mv (rename) over exFAT (vfs_rename_secondary
 # -> exfat_rename re-emit-at-same-clusters). In-kernel: dst found + src gone;
 # fsck.exfat -n (below) confirms no cross-link / orphan after the re-emit.
-strings "$LOG" | grep -q "^exfatw: shell mv OK" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: shell mv OK" \
     && echo "  PASS: 1.39.7 shell 'mv' renamed file on exFAT (exfat_rename)" \
     || { echo "  FAIL: 1.39.7 shell mv over exFAT"; rc=1; }
 # 1.39.9 VFS-lift bite 9: subdirectory paths. Slashed paths inside SHEXDIR —
@@ -210,13 +210,13 @@ strings "$LOG" | grep -q "^exfatw: shell mv OK" \
 # finders + emit_set_in. In-kernel find-back inside SHEXDIR's cluster + the
 # `cat` output ("SUBDIR-EXFAT-OK") in the log; fsck.exfat (below) confirms the
 # subdir dir-sets + chains are clean.
-strings "$LOG" | grep -q "^exfatw: subdir find-back OK" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: subdir find-back OK" \
     && echo "  PASS: 1.39.9 subdir write+find inside SHEXDIR (exfat_resolve_parent)" \
     || { echo "  FAIL: 1.39.9 subdir write/find over exFAT"; rc=1; }
-strings "$LOG" | grep -q "^exfatw: subdir rm gone OK" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: subdir rm gone OK" \
     && echo "  PASS: 1.39.9 subdir 'rm' removed SHEXDIR/SUBRM.TXT" \
     || { echo "  FAIL: 1.39.9 subdir rm over exFAT (target still present)"; rc=1; }
-strings "$LOG" | grep -q "^exfatw: subdir renamed-dir OK" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exfatw: subdir renamed-dir OK" \
     && echo "  PASS: 1.39.9 subdir 'mkdir'+'mv' dir rename inside SHEXDIR" \
     || { echo "  FAIL: 1.39.9 subdir mkdir/mv over exFAT"; rc=1; }
 strings "$LOG" | grep -q "SUBDIR-EXFAT-OK" \
@@ -224,7 +224,7 @@ strings "$LOG" | grep -q "SUBDIR-EXFAT-OK" \
     || { echo "  FAIL: 1.39.9 subdir cat over exFAT (no 'SUBDIR-EXFAT-OK' in log)"; rc=1; }
 # 1.40.1 exec-from-disk bite 1: vfs_read_file reads a 6000-byte file fully
 # (past the 4 KB memfile cap) — the read primitive the exec load path needs.
-strings "$LOG" | grep -q "^vfsrf: exFAT whole-file read past 4KB OK" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}vfsrf: exFAT whole-file read past 4KB OK" \
     && echo "  PASS: 1.40.1 vfs_read_file whole-file read past 4 KB cap (exFAT)" \
     || { echo "  FAIL: 1.40.1 vfs_read_file over exFAT (no 'whole-file read past 4KB OK')"; rc=1; }
 # 1.41.7: syscall write path over exFAT — open(AO_WRONLY|CREAT|TRUNC)+write+close
@@ -236,7 +236,7 @@ strings "$LOG" | grep -q "^vfsrf: exFAT whole-file read past 4KB OK" \
 # it rests on the in-kernel live arm: write a file, require the count to drop. That is stated rather
 # than papered over, because a reader comparing the three backends' gates should know exFAT's is the
 # weakest of them and why.
-strings "$LOG" | grep -E "^exfatw: Wstatfs (bsize|free after)" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?exfatw: Wstatfs (bsize|free after)" | sed 's/^/  /'
 if strings "$LOG" | grep -q "exfatw: Wstatfs OK"; then
     echo "  PASS: Wstatfs on exFAT (cluster size is the mkfs 512, path resolved, bitmap count is live)"
 elif strings "$LOG" | grep -q "exfatw: Wstatfs MISMATCH"; then
@@ -245,7 +245,7 @@ else
     echo "  FAIL: Wstatfs exFAT marker absent entirely (selftest did not run?)"; rc=1
 fi
 
-strings "$LOG" | grep -q "^syswr: exFAT write+readback OK" \
+strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}syswr: exFAT write+readback OK" \
     && echo "  PASS: 1.41.7 syscall write+read-back over exFAT (open/write/close ABI)" \
     || { echo "  FAIL: 1.41.7 syscall exFAT write (no 'syswr: exFAT write+readback OK')"; rc=1; }
 # fsck must report clean AND see at least the one created file.

@@ -117,7 +117,7 @@ else
     echo "  FAIL: '$EXPECT' not found — $NAME did not produce its expected ring-3 output"; rc=1
 fi
 # Gate 2: clean exit (the recovery shell reports the program's exit code).
-if strings "$LOG" | grep -qE "^run: exit"; then
+if strings "$LOG" | grep -qE "^(\[[^]]*\] )?run: exit"; then
     echo "  PASS: $NAME exited cleanly ($(strings "$LOG" | grep -oE '^run: exit [0-9-]+' | head -1))"
 else
     echo "  WARN: no 'run: exit' ($NAME may have printed but not returned — see log)"

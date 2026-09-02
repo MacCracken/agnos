@@ -91,7 +91,7 @@ qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-90}" \
 
 echo ""
 echo "  --- jbd2 + shell-prompt lines from boot log ---"
-strings "$LOG" | grep -E "^jbd2:|^AGNOS shell" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?jbd2:|^AGNOS shell" | sed 's/^/  /'
 echo ""
 
 rc=0
@@ -105,7 +105,7 @@ check_line() {
 check_line "probe still detects dirty journal"  "jbd2: DIRTY journal"
 check_line "replay APPLIED 1 tx"                "jbd2: replay: APPLIED 1 tx"
 check_line "RW mount LIFTED"                    "RW mount LIFTED"
-if strings "$LOG" | grep -q "^AGNOS shell"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}AGNOS shell"; then
     echo "  PASS: shell came up at v1.38.3"
 else
     echo "  FAIL: shell prompt never reached"; rc=1

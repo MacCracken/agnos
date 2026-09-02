@@ -177,6 +177,21 @@ def find_titlebar(path):
 
 MODE = os.environ.get("AE_CLIENTS_MODE", "bg")   # "fg" | "bg" | "both" (both = same-boot, interferes)
 
+# ⚠ VACUITY FLOOR — FAIL CLOSED ON A MODE NOBODY IMPLEMENTS. Every launch site below is an
+# `if MODE in (...)` with NO else, and the three single-mode verdicts (`desktop`, `relaunch`,
+# `armed`) each raise before the shared fg/bg block. So a mode string outside this set matched
+# nothing anywhere: `AE_CLIENTS_MODE=BG` / `=background` / `=Desktop` built the 512 MB image, booted
+# QEMU, waited out the agnsh banner, launched NEITHER client, and then fell into the fg/bg verdict
+# with both `ran_*` flags still False — where the loop has no iterations, `rc` stays 0, and the
+# harness printed "Only the background path was exercised" and exited 0 having exercised neither.
+# A typo in an env var must not read as a working desktop. Named modes only, and loudly.
+MODES = ("fg", "bg", "both", "desktop", "relaunch", "armed")
+if MODE not in MODES:
+    print(f"FAIL: AE_CLIENTS_MODE={MODE!r} is not a mode this harness implements.")
+    print(f"      Known modes: {', '.join(MODES)}")
+    print("      An unknown mode launches no client at all and would exit 0 having tested nothing.")
+    sys.exit(2)
+
 # ⛔ THE FRAMEBUFFER GATE FOR `desktop` MODE — how many pixels carrying a CLIENT's own colours must
 # be on the panel before this harness will exit 0. Only `desktop` mode uses it, because it is the
 # only mode that still has a compositor on screen when the screendump fires (see the FRAMEBUFFER
@@ -1291,6 +1306,21 @@ try:
     # no instrument: it is a false green and a false red from the same run.
     p("  foreground exit " + (str(fg_code) if ran_fg else "— (not run in this mode)")
       + " · background exit " + (str(bg_code) if ran_bg else "— (not run in this mode)"))
+
+    # ⚠ VACUITY FLOOR — AN EMPTY ARM SET IS A FAILED RUN, NOT A CLEAN ONE. The loop below opens at
+    # rc = 0 and `continue`s past every arm that did not run, so "no arm ran" is indistinguishable
+    # from "every arm passed": zero iterations, no per-path line printed, exit 0. That is exactly
+    # what an unrecognised AE_CLIENTS_MODE produced before the floor at the MODE parse above — a
+    # 1300-line harness that booted QEMU, launched no client and certified the desktop — and it stays
+    # reachable the next time a mode is added to MODES with no launch site or no verdict of its own.
+    # The count is asserted AND PRINTED rather than implied: a run that says "arms exercised: 0" is
+    # reporting that this harness launched nothing, not that both launch paths are healthy.
+    arms_ran = int(ran_fg) + int(ran_bg)
+    p(f"  arms exercised: {arms_ran} of 2 (fg={ran_fg} bg={ran_bg})")
+    if arms_ran == 0:
+        p(f"  ⛔ NEITHER LAUNCH PATH RAN under MODE={MODE!r} — this boot tested nothing. Not a pass.")
+        p(f"     serial: {SER}")
+        raise SystemExit(1)
 
     rc = 0
     for ran, code, name, how in ((ran_fg, fg_code, "FOREGROUND", "agnsh execwait #37"),

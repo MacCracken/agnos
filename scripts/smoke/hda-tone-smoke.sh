@@ -139,6 +139,6 @@ PY
         echo "  FAIL: sweep stuck low (peak ${MAXF:-0} Hz <= 600) — refill did not stream new PCM (stale loop)"; rc=1
     fi
 fi
-echo "  --- hda lines ---"; grep -a -iE "^hda:" "$SER" 2>/dev/null | sed 's/^/    /'
+echo "  --- hda lines ---"; grep -a -iE "^\(\[[^]]*\] \)\{0,1\}hda:" "$SER" 2>/dev/null | sed 's/^/    /'
 echo "  full serial: $SER"
 exit $rc

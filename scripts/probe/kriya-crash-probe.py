@@ -76,17 +76,45 @@ try:
     p("banner seen:", ok)
     if not ok: p("FAIL: no agnsh banner"); p(ser()[-1500:]); sys.exit(1)
 
-    for cmd in ['bnrmr hi\n', 'kriya true\n', 'owl -p /hello.txt\n', 'echo Hello\n']:
+    # ⚠ VACUITY FLOOR ON THE LIST ITSELF. The verdict below is "every command came back", and that
+    # is TRUE OF AN EMPTY LIST: comment the three suspects out to "just re-check the known-good bin"
+    # and the probe goes green having driven nothing. This probe is named for four applets; below
+    # four it is not this probe, so the count is asserted rather than assumed.
+    CMDS = ['bnrmr hi\n', 'kriya true\n', 'owl -p /hello.txt\n', 'echo Hello\n']
+    if len(CMDS) < 4:
+        p(f"FAIL: probe enumerates {len(CMDS)} command(s) — vacuous below 4"); sys.exit(1)
+
+    returned = 0
+    hung = None
+    for cmd in CMDS:
         seg = run(cmd, timeout=35)
         p(f"=========== {cmd.strip()!r} ===========")
         p(seg if seg.strip() else "(empty / wedged — no output, no prompt return)")
         # if the prompt did NOT come back, the system hung here — note it
         if "ASSIST" not in seg:
             p(f">>> HUNG at {cmd.strip()!r} — no prompt returned, halting probe")
-            break
+            hung = cmd.strip(); break
+        returned += 1
     p("=== full serial tail ===")
     p(ser()[-3000:])
-    rc = 0
+    # ⚠ WHY THE VERDICT IS COMPUTED HERE AND PRINTED, NOT ASSUMED. `rc = 0` sat on this line
+    # unconditionally until 1.56.58 — three lines below the hang detector that had just printed
+    # ">>> HUNG at 'bnrmr hi'" and broken out of the loop. The probe reported the wedge in prose and
+    # then exited 0, so the exact crash this file exists to isolate scored the same as a clean run
+    # for anything reading status instead of eyeballing the log: a wrapper, `&& echo ok`, a sweep
+    # row. Same colour for the run where the serial log went unreadable and every seg came back ""
+    # — "we could not test it" and "it works" must never be the same colour. So the outcome is
+    # derived from the enumeration and PRINTED: a probe that says "1/4 returned a prompt" is
+    # reporting the hang it found, not a green tree.
+    p(f"commands that returned a prompt: {returned}/{len(CMDS)}")
+    if hung is not None:
+        p(f"FAIL: hung at {hung!r} — {returned}/{len(CMDS)} returned a prompt"); rc = 1
+    elif returned < len(CMDS):
+        # Unreachable while the hang above is the loop's only early exit; kept so that adding a
+        # second `break` cannot quietly shrink the enumeration back into a pass.
+        p(f"FAIL: only {returned}/{len(CMDS)} commands ran — the enumeration broke"); rc = 1
+    else:
+        p(f"PASS: all {returned}/{len(CMDS)} commands returned a prompt"); rc = 0
     s.sendall(b"quit\n"); time.sleep(0.2)
 finally:
     qemu.terminate()

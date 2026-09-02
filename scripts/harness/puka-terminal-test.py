@@ -35,6 +35,26 @@ PART_OFFSET = 33 * 1048576
 # bg then reports "launched: False" on a boot where it reaches 2/2 cleanly on its own.
 # Use AE_CLIENTS_MODE=fg / =bg in separate invocations to compare the paths.
 MODE = os.environ.get("AE_CLIENTS_MODE", "bg")   # "fg" | "bg" | "both" (both = same-boot, interferes)
+# ⛔ VACUITY FLOOR ON THE MODE ITSELF — AN UNSPELLABLE MODE IS AN EMPTY INPUT SET.
+# Every launch site below is an `if MODE in (...)` / `if MODE == ...` with NO else, and the fg/bg
+# verdict block at the bottom starts from `rc = 0` and `continue`s past every arm that did not run.
+# So a mode string matching none of the branches launched NOTHING and still exited 0. Measured
+# against that block's own source, `AE_CLIENTS_MODE=BG` (or `background`, or `Desktop`, or a value
+# that picked up a trailing space from a shell variable) printed:
+#     foreground exit — (not run in this mode) · background exit — (not run in this mode)
+#     ⇒ Only the background path was exercised. The other says nothing either way ...
+# — a green exit, plus a confident claim about a path nothing ran, from a boot that judged nothing.
+# The mode IS this harness's input set, so refusing an unrecognised one is the same floor
+# scripts/check/toolchain-pin-check.sh puts on its manifest count, for the same reason.
+# ⚠ EXIT 2, NOT 1. "You spelled the mode wrong" is not evidence about the kernel, and scoring it as a
+# test FAIL would be a false red out of a run that tested nothing. 2 is this family's INCONCLUSIVE
+# code (puka-child-stdout-test.py's header; launcher-panel-test.py:86) and it is non-zero, because
+# "we could not test it" and "it works" must never be the same colour — console-line-smoke.sh:15-17.
+MODES = ("fg", "bg", "both", "desktop", "armed")
+if MODE not in MODES:
+    print(f"INCONCLUSIVE: AE_CLIENTS_MODE={MODE!r} matches no launch branch — this harness would")
+    print(f"              boot a guest, launch nothing and judge nothing. Use one of: {', '.join(MODES)}")
+    sys.exit(2)
 
 # ⛔ THE FRAMEBUFFER GATE FOR `desktop` MODE — how many pixels carrying a CLIENT's own colours must
 # be on the panel before this harness will exit 0. Only `desktop` mode uses it, because it is the
@@ -715,11 +735,26 @@ try:
     p("  foreground exit " + (str(fg_code) if ran_fg else "— (not run in this mode)")
       + " · background exit " + (str(bg_code) if ran_bg else "— (not run in this mode)"))
 
+    # ⛔ VACUITY FLOOR ON THE VERDICT — `rc = 0` OVER AN EMPTY LOOP IS NOT A PASS.
+    # The loop below skips every arm that did not run, so when NO arm ran the body never executes at
+    # all: rc stays 0 and this harness exits green having booted a guest and scored nothing. The
+    # AE_CLIENTS_MODE floor at the top of the file is what makes that unreachable TODAY, but the
+    # defect was never really the mode string — it was a verdict that could not tell "every arm
+    # passed" from "there were no arms", and the next launch branch added here would re-open it. So
+    # count what was actually scored and PRINT the count rather than implying it: a run that says
+    # "arms scored: 0" is reporting that its own dispatch broke, not that the desktop works. Same
+    # shape and same reason as scripts/check/toolchain-pin-check.sh's asserted-and-printed manifest
+    # count.
+    # ⚠ It must also come BEFORE the cross-path lines below, because the `elif rc == 0` arm there
+    # reads a green rc as "only the <other> path was exercised" — which is how a no-arm run printed
+    # a claim about the background path on a boot that launched neither.
+    arms_scored = 0
     rc = 0
     for ran, code, name, how in ((ran_fg, fg_code, "FOREGROUND", "agnsh execwait #37"),
                                  (ran_bg, bg_code, "BACKGROUND", "agnsh spawn_path #43")):
         if not ran:
             continue
+        arms_scored += 1
         if code == 95:
             p(f"  {name} ({how}): both clients connected and presented.")
             continue
@@ -730,6 +765,13 @@ try:
             continue
         p(f"  {name} ({how}): FAILED — exit {code}. 93/91 point at different repos; see §7 of "
           "aethersafha planning/desktop.md.")
+
+    p(f"  arms scored: {arms_scored} of 2 (fg / bg) — one mode per boot, so 1 is the normal number")
+    if arms_scored == 0:
+        p(f"  ⛔ NO ARM RAN — MODE={MODE!r} reached this verdict without taking any launch branch, so")
+        p("     the guest booted, nothing was launched and nothing was judged. Everything printed")
+        p("     above this line is about a run that did not happen; this is INCONCLUSIVE, not a pass.")
+        rc = 2
 
     # The cross-path comparison is the ONLY claim that needs both arms, so it is the only one gated
     # on both having run. One mode per boot is the documented way to use this harness, so this line

@@ -77,7 +77,7 @@ qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-90}" \
 
 echo ""
 echo "  --- jbd2 trace from boot log ---"
-strings "$LOG" | grep -E "^jbd2:|^  tag:|^AGNOS shell" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?jbd2:|^  tag:|^AGNOS shell" | sed 's/^/  /'
 echo ""
 
 rc=0
@@ -99,7 +99,7 @@ check_line "descriptor block (seq=1 at blk=1)"  "$DESC_LINE"
 check_line "tag (dest_blk=$TARGET_BLK, LAST_TAG)" "$TAG_LINE"
 check_line "commit block (seq=1)"               "$COMMIT_LINE"
 check_line "end at blk=4 (1 complete tx)"       "$END_LINE"
-if strings "$LOG" | grep -q "^AGNOS shell"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}AGNOS shell"; then
     echo "  PASS: shell came up (RO mount allowed -- not a hang)"
 else
     echo "  FAIL: shell prompt never reached"; rc=1

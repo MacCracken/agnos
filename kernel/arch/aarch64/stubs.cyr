@@ -12,6 +12,15 @@ var cpu_id = 0;
 # Timer (referenced by core/sched.cyr via timer_handler)
 fn apic_eoi() { return 0; }
 
+# Kernel-log timebase (1.56.58). core/kprint.cyr is included unconditionally (agnos.cyr:57) and calls
+# this at every line start; the x86 twin is in arch/x86_64/io.cyr and reads rdtsc against a boot base.
+# ⛔ RETURNS 0 ON PURPOSE — DO NOT "IMPROVE" IT INTO A CNTVCT_EL0 READ WITHOUT FIXING timer.cyr FIRST.
+# timer_read_freq / timer_read_count in arch/aarch64/timer.cyr (and this file own rdtsc stub) store
+# and load through [sp,#0], which is FRAME PADDING, so all three return a constant 0 — an open P1,
+# docs/development/issues/2026-08-28-p1-audit-sweep-backlog.md:149-155. Wiring this to them would
+# print fabricated timestamps that look real. 0 renders [    0.000000], which is honestly "no clock".
+fn klog_uptime_us() { return 0; }
+
 # IRQ enable/disable around the blocking-stdin read (x86 sti/cli; referenced by
 # core/syscall.cyr's kbd_read_blocking). No-op here — aarch64 input bring-up is
 # a later arc.

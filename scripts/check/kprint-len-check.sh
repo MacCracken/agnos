@@ -16,13 +16,20 @@ set -e
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
+# ⚠ THE VACUITY FLOOR BELOW APPLIES ONLY TO THE FULL-TREE SWEEP, AND THIS FLAG IS WHY. Line 13
+# documents `[file ...]`, and docs/development/planning/rung17-tri-depth.md:185 tells readers to
+# "recount with scripts/check/kprint-len-check.sh <file>" — a single file has ~86 literals, so an
+# unconditional floor turns every documented single-file invocation into a spurious hard error.
+# A floor that fires on correct usage is a worse gate than no floor.
 if [ $# -gt 0 ]; then
     FILES="$*"
+    SWEEP=0
 else
     FILES="$(find kernel -name '*.cyr' | sort)"
+    SWEEP=1
 fi
 
-python3 - "$FILES" <<'PY'
+python3 - "$FILES" "$SWEEP" <<'PY'
 import re, sys
 
 # ⚠ ea_expect / ea_expect_valid ADDED 1.56.30. They take (rec, want, name, nlen) with the same
@@ -69,10 +76,17 @@ klugpat = re.compile(r'\bklug_(?:append|info|warn|err)\("((?:[^"\\]|\\.)*)"\s*,\
 tailpat = re.compile(r'\b(?:sh_exec|test_assert|test_assert_eq)\(.*"((?:[^"\\]|\\.)*)"\s*,\s*(\d+)\s*\)\s*;?\s*$')
 bad = 0
 total = 0
+sweep = int(sys.argv[2])
+unread = []
 for path in sys.argv[1].split():
     try:
         lines = open(path, encoding='utf-8').readlines()
     except OSError:
+        # ⛔ AN UNREADABLE FILE IS NOT A CLEAN FILE. This used to `continue`, so a renamed, deleted or
+        # permission-denied path contributed 0 literals and 0 mismatches — indistinguishable from a
+        # file that was checked and was fine. That is the vacuity this gate exists to refuse, sitting
+        # inside the gate itself.
+        unread.append(path)
         continue
     for lineno, line in enumerate(lines, 1):
         for m in list(pat.finditer(line)) + list(eapat.finditer(line)) + list(serpat.finditer(line)) + list(klugpat.finditer(line)) + list(tailpat.finditer(line.rstrip())):
@@ -85,10 +99,22 @@ for path in sys.argv[1].split():
                 print(f"  MISMATCH {path}:{lineno}  declared={declared} actual={actual}")
                 print(f"           {literal!r}")
 
-# ⚠ VACUITY FLOOR. A length gate that enumerates NOTHING reports "0 mismatched" — the same green as a
-# clean tree. This tree has already found four gates that passed by enumerating nothing, so assert a
-# plausible corpus: a broken file list or a dead regex must redden here rather than congratulate itself.
-if total < 3000:
+# ⛔ THE READABILITY FLOOR APPLIES IN BOTH MODES, AND IT IS THE ONE THAT ACTUALLY DISCRIMINATES.
+# A literal COUNT cannot be the single-file discriminator: kernel/core/kprint.cyr legitimately holds
+# ZERO matching literals (it is where the emitters are DEFINED, not called), so any count floor either
+# fails that correct file or passes a missing one. "Did I read every file I was handed?" is true of a
+# healthy single file, a healthy tree, and nothing else.
+if unread:
+    print(f"  ERROR: {len(unread)} file(s) could not be read — not checked, not clean:")
+    for u in unread[:10]:
+        print(f"           {u}")
+    sys.exit(1)
+
+# ⚠ CORPUS FLOOR, SWEEP MODE ONLY. In a full-tree run a collapsed file list or a dead regex must redden
+# rather than report a green "0 mismatched". It is gated to sweep mode because line 13 documents
+# `[file ...]` and docs/development/planning/rung17-tri-depth.md:185 tells readers to recount a single
+# file — ~86 literals — which an unconditional 3000 floor turned into a spurious hard error.
+if sweep == 1 and total < 3000:
     print(f"  ERROR: only {total} literals enumerated — the file list or a regex is broken, not the tree")
     sys.exit(1)
 print(f"  checked {total} kprint/ea_expect/serial_print/klug/sh_exec/test_assert literals, {bad} mismatched")

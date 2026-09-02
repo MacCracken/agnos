@@ -422,12 +422,22 @@ All-u64 (no sub-word fields → no Cyrius struct-padding ambiguity, same rule §
 
 ### 4.5 `klug` read (syscall 36 — variable-length log copy, not a struct)
 
-`klug(buf, len)` copies the unified **klug** kernel-log ring (`core/klug.cyr`, a 16 KB circular byte buffer fed by every `kprint`/`kputc`/`kprintln`) into the user `buf`, **oldest→newest** (chronological). It is not a fixed struct — it returns raw log text and the byte count:
+`klug(buf, len)` copies the unified **klug** kernel-log ring (`core/klug.cyr`, a **64 KB** circular byte buffer fed by every `kprint`/`kputc`/`kprintln`) into the user `buf`, **oldest→newest** (chronological). It is not a fixed struct — it returns raw log text and the byte count:
 
 - Returns `min(len, ring_fill)` — the number of bytes written — or `-1` if `is_user_range(buf, len)` fails.
 - When `len` < the current ring fill, returns the **newest** `len` bytes (the dmesg tail) so a small buffer still shows the most recent lines.
-- The ring wraps at 16 KB (old lines age out); the kernel unwraps oldest→newest so the userland reader always sees chronological order regardless of the wrap point.
-- Leveled lines carry an `[I]`/`[W]`/`[E]` prefix (from `klug_info`/`klug_warn`/`klug_err`) — the userland `klug`/`dmesg` tool greps on that prefix (the kernel does **no** filtering: it unifies the log; grep stays userland).
+- The ring wraps at **64 KB** (old lines age out); the kernel unwraps oldest→newest so the userland reader always sees chronological order regardless of the wrap point.
+  - ⚠ **This said 16 KB in three places until 1.56.58 and had been wrong since the ring was raised.** `core/klug.cyr` declares `var klug_buf[8192]` — module scope, so N×u64 = **65536 bytes** — and the userland reader pins the same number (`klug/src/klug.cyr`, `KLUG_RING_BYTES = 65536`, asserted in its test suite). The two must move in lockstep or the tool pulls only its own buffer's worth of the tail.
+
+**Line format (1.56.58).** Every **kernel-origin** line is prefixed with a fixed-width **15-byte** uptime field in Linux `printk` shape — `[    4.123456] ` — built by `klog_build_prefix` (`core/kprint.cyr`): `[`, seconds right-aligned in 5 columns and **space**-padded, `.`, microseconds in 6 columns **zero**-padded, `]`, one space. Time is measured from the first statement of the boot body; lines emitted before the timebase calibrates read `[    0.000000]`, as Linux does for its own pre-timekeeping lines.
+
+- ⛔ **RING-3 OUTPUT IS NOT PREFIXED, AND MUST NOT BECOME SO.** `kprint` is also the userland stdout/stderr path (fd 0/1/2 are `VFS_DEVICE` 0 → `vfs_write` → `dev_write` → `serial_dev_write` → `kprint`), so the kernel raises `klog_raw_depth` around that write and those bytes pass through **byte-exact**. Every program's output, every pipe stage and every harness that parses program text depends on it.
+- The prefix is emitted only at a true **beginning of line**. `klog_at_bol` tracks every byte — raw ring-3 bytes included — so a kernel line arriving while a program has written a partial line does not inject a field mid-line.
+- Consumers that anchor on a kernel line must accept the field as **optional**: `^\(\[[^]]*\] \)\{0,1\}` in BRE, `^(\[[^]]*\] )?` in ERE. Both prefixed and bare lines exist in the same log.
+
+**Severity tags.** Leveled lines carry an `[I]`/`[W]`/`[E]` tag from `klug_info`/`klug_warn`/`klug_err`, **after** any uptime field. The kernel does **no** filtering — it unifies the log; grep stays userland.
+
+- ⛔ **A production kernel emits ZERO leveled lines today.** All three of `klug_info`/`klug_warn`/`klug_err`'s call sites are inside `#ifdef EXEC_SELFTEST` (`core/main.cyr`), which is off in every shipping build — so `klug -w`/`-e` legitimately match nothing. The userland tool says so on stderr since klug 0.1.6 rather than printing nothing and exiting 0, because "no warnings" and "no lens" are otherwise the same output. Adopting the leveled API across the kernel is open work, not a documented state.
 
 ### 4.6 exec init stack — argv + envp (1.43.2)
 

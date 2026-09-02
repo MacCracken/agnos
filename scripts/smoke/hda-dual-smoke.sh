@@ -142,7 +142,7 @@ else
 fi
 
 echo "  --- hda lines from serial ---"
-grep -a -iE "^hda:" "$SER" 2>/dev/null | sed 's/^/    /'
+grep -a -iE "^\(\[[^]]*\] \)\{0,1\}hda:" "$SER" 2>/dev/null | sed 's/^/    /'
 echo "  full serial: $SER"
 [ "$rc" -eq 0 ] && echo "hda-dual-smoke: PASS" || echo "hda-dual-smoke: FAIL"
 exit $rc

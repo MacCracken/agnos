@@ -103,7 +103,7 @@ qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-120}" \
 
 echo ""
 echo "  --- ark / exec lines from boot log ---"
-strings "$LOG" | grep -E "^exec: .*ark|^run: exit|Available:|Unknown command|^Usage|#PF|PANIC|^fault:" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?exec: .*ark|^run: exit|Available:|Unknown command|^Usage|#PF|PANIC|^fault:" | sed 's/^/  /'
 echo ""
 
 rc=0
@@ -117,7 +117,7 @@ else
     echo "  FAIL: no ark CLI output — ark did not produce ring-3 output"; rc=1
 fi
 # Gate 2: clean exit (the recovery shell reports the program's exit code).
-if strings "$LOG" | grep -qE "^run: exit"; then
+if strings "$LOG" | grep -qE "^(\[[^]]*\] )?run: exit"; then
     echo "  PASS: ark exited cleanly ($(strings "$LOG" | grep -oE '^run: exit [0-9-]+' | head -1))"
 else
     echo "  WARN: no 'run: exit' (ark may have produced output but not returned — see log)"

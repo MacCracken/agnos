@@ -96,7 +96,7 @@ qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-90}" "$WORK/vars.fd" "$OVMF_V
 
 echo ""
 echo "  --- exec lines from boot log ---"
-strings "$LOG" | grep -E "^exec:|^run:" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?exec:|^run:" | sed 's/^/  /'
 echo ""
 
 # 1.40.3 validates exec-from-disk END TO END: /prog (a hand-built static ELF64)
@@ -105,26 +105,29 @@ echo ""
 # executed in ring 3 and its write(1,…) reached the console; "run: exit 42"
 # proves exec_and_wait resumed the kernel with the program's exit code.
 rc=0
+# Checks this run DECLINED to make. Non-zero here is not a failure, but it must never be silent:
+# see the spawn_path(#43) lane below for why a skip that nobody prints is a gate that cannot fail.
+skipped=0
 # 1.40.4: ENOEXEC — the non-ELF /notelf is refused cleanly (no crash; the boot
 # proceeds to the subdir run after it).
-if strings "$LOG" | grep -q "^run: not an executable"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}run: not an executable"; then
     echo "  PASS: ENOEXEC — non-ELF /notelf refused cleanly"
 else
     echo "  FAIL: no 'run: not an executable' for /notelf (ENOEXEC path)"; rc=1
 fi
 # Subdir program path — /bin/prog2 is loaded from a subdirectory (proves
 # sh_abspath + ext2_path_lookup), run in ring 3 (EXEC-DISK-OK), and exits 42.
-if strings "$LOG" | grep -q "^exec: running /bin/prog2"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exec: running /bin/prog2"; then
     echo "  PASS: subdir program /bin/prog2 dispatched (path resolution)"
 else
     echo "  FAIL: /bin/prog2 not attempted"; rc=1
 fi
-if strings "$LOG" | grep -q "^EXEC-DISK-OK"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}EXEC-DISK-OK"; then
     echo "  PASS: /bin/prog2 ran in ring 3 — write(1) reached the console"
 else
     echo "  FAIL: no 'EXEC-DISK-OK' (subdir program did not run in ring 3)"; rc=1
 fi
-if strings "$LOG" | grep -q "^run: exit 42"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}run: exit 42"; then
     echo "  PASS: exec_and_wait captured exit code 42 (/bin/prog2)"
 else
     echo "  FAIL: no 'run: exit 42' (ring-3 exit / exit-code path)"; rc=1
@@ -136,7 +139,7 @@ fi
 # requires argc>=2 AND argv[1] to point at the real "Z" string in the user stack
 # (the 1.40.7 wrong-buffer bug — strings in a kernel scratch page — would make
 # argv[1] dereference garbage; argc-count alone could not catch it).
-if strings "$LOG" | grep -q "^run: exit 90"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}run: exit 90"; then
     echo "  PASS: argv[1] dereferenced — /bin/argv Z exited with argv[1][0]=90"
 else
     echo "  FAIL: no 'run: exit 90' (argv[i] pointers don't resolve to arg strings)"; rc=1
@@ -147,7 +150,7 @@ fi
 # the PMM bitmap is 256 MB (pmm_total=65536) so totalram=0x10000000, byte3=0x10=16, exit = 65+16 = 81.
 # (Tracks the PMM-pool size — bump as the RAM arc grows the bitmap: 1 GB -> byte3 0x40 -> exit 129.)
 # Proves both syscalls dispatch from ring 3, pass is_user_range, and write the right struct bytes.
-if strings "$LOG" | grep -q "^run: exit 81"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}run: exit 81"; then
     echo "  PASS: sysinfo syscalls — /bin/sysi uname#34 + sysinfo#35 wrote correct struct bytes (exit 81, 256 MB pool)"
 else
     echo "  FAIL: no 'run: exit 81' (uname#34 / sysinfo#35 didn't write the expected struct bytes for the 256 MB PMM pool)"; rc=1
@@ -157,7 +160,7 @@ fi
 # proving the syscall copied the requested tail of the unified klug ring into a
 # user buffer (bounds + count). The [I]/[W]/[E] level lines emitted just before
 # also confirm the leveled-log API is captured.
-if strings "$LOG" | grep -q "^run: exit 200"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}run: exit 200"; then
     echo "  PASS: klug#36 — /bin/klug copied 200 B of the unified klug ring to a user buffer (exit 200)"
 else
     echo "  FAIL: no 'run: exit 200' (klug#36 didn't copy the requested ring bytes to userland)"; rc=1
@@ -173,12 +176,12 @@ fi
 # direct "run /bin/argv Z" above prints the first; exwv resuming correctly across the
 # nested exec AND carrying argv through #37 prints the second. If H1/H2 or the argv
 # split were broken, exwv would fault/hang/wrong-exit and this count stays at 1.
-if strings "$LOG" | grep -q "^exec: running /bin/exwv"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exec: running /bin/exwv"; then
     echo "  PASS: execwait #37 — /bin/exwv (ring-3 caller) dispatched"
 else
     echo "  FAIL: /bin/exwv not attempted (execwait validator missing)"; rc=1
 fi
-EXIT90_N=$(strings "$LOG" | grep -c "^run: exit 90")
+EXIT90_N=$(strings "$LOG" | grep -c "^\(\[[^]]*\] \)\{0,1\}run: exit 90")
 if [ "$EXIT90_N" -ge 2 ]; then
     echo "  PASS: execwait #37 — exwv resumed across the nested exec + carried argv through #37 (run: exit 90 count=$EXIT90_N)"
 else
@@ -187,7 +190,7 @@ fi
 # 1.43.2: envp — /bin/envtest reads envp[0][0] (the kernel-staged "HOME=/") and
 # exits with it: 'H' = 0x48 = 72. Proves the exec stack now carries a real envp at
 # the SysV offset cyrius's getenv() reads (and NOT argv — argv0 starts '/' = 47).
-if strings "$LOG" | grep -q "^run: exit 72"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}run: exit 72"; then
     echo "  PASS: envp — /bin/envtest read kernel-staged envp[0] \"HOME=/\" from ring 3 (exit 72='H')"
 else
     echo "  FAIL: no 'run: exit 72' (envp not staged / not readable at the SysV offset)"; rc=1
@@ -196,7 +199,7 @@ fi
 # a caller env blob "Q=1\0" via (a3=ptr, a4=len); the caller env REPLACES the default, so the
 # child's envp[0] = "Q=1" and envtest exits 'Q'=81. The exit-72 gate above stays as the
 # permanent default/fallback regression gate (env-less + garbage-a3/a4 callers keep HOME=/).
-if strings "$LOG" | grep -q "^run: exit 81"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}run: exit 81"; then
     echo "  PASS: per-process env — caller blob propagated through #37 a3/a4 to the child's envp[0] (exit 81='Q')"
 else
     echo "  FAIL: no 'run: exit 81' (caller env blob did not reach the child — gate chain or elf staging broke)"; rc=1
@@ -205,7 +208,7 @@ fi
 # 4x4 block to FB(0,0), exits bpp(32)+blit_rc(0)+56 = 88. Proves BOTH new syscalls
 # dispatch from ring 3, fbinfo writes the struct (bpp=32), and blit copies into
 # fb_phys + returns 0 (exit 87 would mean blit returned -1 / no FB present).
-if strings "$LOG" | grep -q "^run: exit 88"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}run: exit 88"; then
     echo "  PASS: fbinfo+blit — /bin/fbtest queried geometry + blitted to the framebuffer from ring 3 (exit 88)"
 else
     echo "  FAIL: no 'run: exit 88' (fbinfo/blit didn't dispatch, or blit returned -1 / no FB)"; rc=1
@@ -214,14 +217,14 @@ fi
 # 50 ms (5 ticks), reads again, exits t1-t0 = 50. Proves both syscalls dispatch
 # AND that sleep_ms advanced the clock via its sti+hlt window (exit 0 would mean
 # a frozen clock / broken sleep window — the waitpid IF=0 hard-hang class).
-if strings "$LOG" | grep -q "^run: exit 50"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}run: exit 50"; then
     echo "  PASS: uptime_ms+sleep_ms — /bin/timetest slept 50 ms and the monotonic clock advanced 50 ms (exit 50)"
 else
     echo "  FAIL: no 'run: exit 50' (timing syscalls didn't dispatch, or sleep_ms didn't advance the clock)"; rc=1
 fi
 # Clean return after ALL runs — "selftest done" proves exec_and_wait returned
 # into its caller frame each time (multi-run + shell-loop shape).
-if strings "$LOG" | grep -q "^exec: selftest done"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exec: selftest done"; then
     echo "  PASS: exec_and_wait returned cleanly after each run ('selftest done')"
 else
     echo "  FAIL: no 'exec: selftest done' (exec_and_wait did not return cleanly)"; rc=1
@@ -230,9 +233,78 @@ fi
 # 1.44.x spawn_path(#43) end-to-end — ONLY when the kernel was ALSO built with RING3_SELFTEST
 # (EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1 RING3_SELFTEST=1 ./scripts/build.sh). The RING3 setup's
 # spawn_path_parent issues #43 on /bin/prog2 (from disk, non-blocking), poll-waitpid(#4)s it,
-# and exits with prog2's code (42) — the exact spawn+reap agnsh `&` will use. The default
-# EXEC-only build lacks the "ring3: spawnpath OK" string, so this whole block is skipped there.
-if strings "$AGNOS" | grep -q "ring3: spawnpath OK"; then
+# and exits with prog2's code (42) — the exact spawn+reap agnsh `&` will use.
+#
+# ⛔⛔ WHY THIS BLOCK IS SHAPED THIS WAY, MEASURED 2026-09-02 (1.56.58). Until now it opened with
+#     if strings "$AGNOS" | grep -q "ring3: spawnpath OK"; then   … two checks … fi   ← no else
+# and that one line made the whole spawn_path lane UNABLE TO FAIL. The oracle was read out of the
+# ARTIFACT UNDER TEST: no marker in build/agnos ⇒ the lane retires ⇒ `rc` untouched ⇒
+# "exec-from-disk smoke: PASS", with not one line of output saying anything had been skipped.
+# Three distinct ways to score that green having verified nothing, all reproduced against the real
+# script with a stubbed QEMU (fixtures: a 5400-string kernel with and without the marker, and a
+# 64 KB all-NUL file standing in for a truncated build):
+#   · THE RELEASE SWEEP ITSELF. scripts/sweep.sh:132 runs this gate as
+#     `EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1` — no RING3_SELFTEST — so in EVERY sweep both checks
+#     below were skipped. #43 spawn or #4 poll-reap could break outright and the sweep's exec gate
+#     stayed green, because the assertion was never compiled into the kernel it built and this
+#     smoke agreed in silence. Measured: 17/17 PASS with the marker, 15/15 PASS without, and the
+#     two transcripts are indistinguishable.
+#   · A ROTTED ORACLE. A RING3_SELFTEST=1 build that dropped the define, or a reworded
+#     `kprintln("ring3: spawnpath OK", 19)` in kernel/core/main.cyr, yields a binary with no marker
+#     — which the old form could not tell apart from "you asked for the EXEC-only profile".
+#     Measured: RING3_SELFTEST=1 in the environment + a markerless kernel ⇒ PASS, rc=0.
+#   · AN EMPTY ENUMERATION. `strings` finding nothing at all (zero-byte or truncated build/agnos,
+#     a `strings` that failed) is the same event as "no match" to `grep -q`. Measured: a build/agnos
+#     with ZERO strings in it ⇒ PASS, rc=0. That is the purest form of the bug — the run's own
+#     oracle was broken and it reported the kernel clean.
+# ⭐ THE FIX DOES NOT CHANGE WHAT IS TESTED. The two checks below are byte-for-byte what they were.
+# What changes is that the lane state is DECLARED BY THE CALLER and only CONFIRMED against the
+# binary, and that a lane which does not run SAYS SO:
+#   require — the marker MUST be in the binary. Absent is a FAIL, not a skip. Set by
+#             EXEC_SMOKE_SPAWN_LANE=require, or implied by RING3_SELFTEST being in the environment
+#             (the caller asserting they built that lane — hold them to it rather than asking the
+#             binary what was asked for).
+#   auto    — the default. Run the checks when the marker is there; otherwise print an explicit
+#             SKIP naming what was NOT verified and carry it into the verdict line, so no reader of
+#             a sweep transcript can take this smoke's PASS for "spawn_path #43 is green".
+#             sweep.sh's run_gate already greps SKIP out of each gate log
+#             (`grep -iE "PASS:|FAIL:|smoke:|ERROR|SKIP|VOID|handed off"`), so the hole surfaces in
+#             the sweep output the moment this runs there — it needs no change on that side.
+#   off     — a written-down decision not to run it. Printed too; a suppression nobody can see is
+#             how this got here.
+# ⚠ VACUITY FLOOR, in the shape scripts/check/toolchain-pin-check.sh established. The marker lookup
+# is an ENUMERATION over build/agnos, so its size is asserted AND PRINTED rather than implied: the
+# 1,997,536 B kernel on this box yields 5395 strings (measured 2026-09-02), so anything under 500
+# means the enumeration broke. "Marker absent" from a run that scanned 12 strings is not evidence
+# about the build profile, and it must not be allowed to retire a lane — it FAILS.
+SPAWN_LANE="${EXEC_SMOKE_SPAWN_LANE:-}"
+if [ -z "$SPAWN_LANE" ]; then
+    if [ -n "${RING3_SELFTEST:-}" ]; then SPAWN_LANE="require"; else SPAWN_LANE="auto"; fi
+fi
+# `|| true`: grep -c exits 1 on zero matches, and on an empty stream it exits 1 having printed "0" —
+# both are ordinary here, and neither may abort the substitution.
+SPAWN_STRINGS_N=$(strings "$AGNOS" | grep -c . || true)
+SPAWN_MARK_N=$(strings "$AGNOS" | grep -c "ring3: spawnpath OK" || true)
+if [ "${SPAWN_STRINGS_N:-0}" -lt 500 ]; then
+    echo "  FAIL: spawn_path #43 oracle is VACUOUS — strings $AGNOS enumerated only ${SPAWN_STRINGS_N:-0} lines (floor 500; a real kernel yields ~5400)"
+    echo "        A missing 'ring3: spawnpath OK' in an enumeration this small says nothing about the build profile."
+    echo "        Fix the binary or the enumeration; do not read this as an EXEC-only build."
+    rc=1
+elif [ "$SPAWN_LANE" = "off" ]; then
+    echo "  SKIP: spawn_path #43 lane switched off by EXEC_SMOKE_SPAWN_LANE=off — #43 spawn + #4 poll-reap NOT verified by this run ($SPAWN_STRINGS_N strings scanned)"
+    skipped=$((skipped + 2))
+elif [ "$SPAWN_MARK_N" -eq 0 ] && [ "$SPAWN_LANE" = "require" ]; then
+    echo "  FAIL: spawn_path #43 lane REQUIRED (RING3_SELFTEST / EXEC_SMOKE_SPAWN_LANE=require) but 'ring3: spawnpath OK' is not in $AGNOS"
+    echo "        $SPAWN_STRINGS_N strings scanned, 0 matched — the build dropped the define, or main.cyr's kprintln text was reworded and this gate's oracle rotted."
+    echo "        rebuild: EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1 RING3_SELFTEST=1 sh scripts/build.sh"
+    rc=1
+elif [ "$SPAWN_MARK_N" -eq 0 ]; then
+    echo "  SKIP: spawn_path #43 lane not built — no 'ring3: spawnpath OK' in $SPAWN_STRINGS_N strings of $AGNOS; #43 spawn + #4 poll-reap NOT verified by this run"
+    echo "        this is the sweep's default profile (sweep.sh:132 sets no RING3_SELFTEST); close it with"
+    echo "        EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1 RING3_SELFTEST=1 sh scripts/build.sh && sh scripts/smoke/exec-smoke.sh"
+    skipped=$((skipped + 2))
+else
+    echo "  (spawn_path #43 lane present — 'ring3: spawnpath OK' found in $SPAWN_STRINGS_N strings of $AGNOS)"
     if strings "$LOG" | grep -q "ring3: spawnpath OK"; then
         echo "  PASS: spawn_path #43 — ring-3 parent launched /bin/prog2 non-blocking + poll-waitpid#4 reaped its exit 42 (entirely from ring 3)"
     else
@@ -240,7 +312,7 @@ if strings "$AGNOS" | grep -q "ring3: spawnpath OK"; then
     fi
     # Corroborate the #43 child actually RAN in ring 3: prog2's write(1) "EXEC-DISK-OK" must
     # now appear TWICE (once from the foreground `run /bin/prog2`, once from the #43 spawn).
-    EXEC_OK_N=$(strings "$LOG" | grep -c "^EXEC-DISK-OK")
+    EXEC_OK_N=$(strings "$LOG" | grep -c "^\(\[[^]]*\] \)\{0,1\}EXEC-DISK-OK")
     if [ "$EXEC_OK_N" -ge 2 ]; then
         echo "  PASS: the #43-spawned /bin/prog2 ran in ring 3 — EXEC-DISK-OK appeared $EXEC_OK_N times (foreground + #43)"
     else
@@ -258,7 +330,21 @@ fi
 
 echo ""
 echo "=========================================="
-if [ "$rc" = "0" ]; then echo "exec-from-disk smoke: PASS"; else echo "exec-from-disk smoke: FAIL"; fi
+# ⚠ A SKIP IS CARRIED INTO THE VERDICT, not just logged above it. The whole failure this file was
+# repaired for is that "exec-from-disk smoke: PASS" meant two different things — 17 checks green, or
+# 15 green and 2 never attempted — and printed the same bytes for both. It now says which.
+# ⚠ The wording is deliberately NOT "N passed, M failed": sweep.sh's run_gate treats that exact
+# phrasing as a smoke that exits 0 while reporting failures and scores it FAIL
+# (`grep -qE 'passed, [1-9][0-9]* failed'`). A skip is not a failure; it must not trip that.
+if [ "$rc" = "0" ]; then
+    if [ "$skipped" -gt 0 ]; then
+        echo "exec-from-disk smoke: PASS — but $skipped check(s) SKIPPED, see the SKIP line(s) above (this run did NOT verify them)"
+    else
+        echo "exec-from-disk smoke: PASS"
+    fi
+else
+    echo "exec-from-disk smoke: FAIL"
+fi
 echo "Logs: $LOG"
 echo "=========================================="
 exit $rc

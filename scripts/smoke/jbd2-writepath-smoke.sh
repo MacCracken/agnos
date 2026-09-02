@@ -77,7 +77,7 @@ timeout "${QEMU_TIMEOUT:-90}" qemu-system-x86_64 \
 
 echo ""
 echo "  --- jbd2 + selftest trace ---"
-strings "$LOG" | grep -E "^jbd2(:|-wp:)|^AGNOS shell" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?jbd2(:|-wp:)|^AGNOS shell" | sed 's/^/  /'
 echo ""
 
 rc=0
@@ -92,7 +92,7 @@ check_line "selftest reached the API"            "jbd2-wp: write-path selftest b
 check_line "commit emitted COMMITTED line"       "jbd2: commit_tx: COMMITTED seq=1 n_blocks=1"
 check_line "checkpoint + journal-clean reported" "checkpoint applied + journal clean"
 check_line "selftest PASS"                       "jbd2-wp: write-path selftest PASS"
-if strings "$LOG" | grep -q "^AGNOS shell"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}AGNOS shell"; then
     echo "  PASS: shell came up at v1.38.5"
 else
     echo "  FAIL: shell prompt never reached"; rc=1

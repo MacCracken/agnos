@@ -80,7 +80,7 @@ timeout "${QEMU_TIMEOUT:-90}" qemu-system-x86_64 \
 
 echo ""
 echo "  --- jbd2 + integration trace ---"
-strings "$LOG" | grep -E "^jbd2(:|-int:)|^AGNOS shell" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?jbd2(:|-int:)|^AGNOS shell" | sed 's/^/  /'
 echo ""
 
 rc=0
@@ -95,7 +95,7 @@ check_line "selftest reached the API"                "jbd2-int: integration self
 check_line "put_inode routed through journal"        "jbd2-int: put_inode routed through journal (logged 1 metadata blocks)"
 check_line "commit COMMITTED line"                   "jbd2: commit_tx: COMMITTED seq=1 n_blocks=1"
 check_line "integration selftest PASS"               "jbd2-int: integration selftest PASS"
-if strings "$LOG" | grep -q "^AGNOS shell"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}AGNOS shell"; then
     echo "  PASS: shell came up at v1.38.6"
 else
     echo "  FAIL: shell prompt never reached"; rc=1

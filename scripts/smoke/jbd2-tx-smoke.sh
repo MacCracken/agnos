@@ -74,7 +74,7 @@ qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-90}" \
 
 echo ""
 echo "  --- jbd2-tx + lifecycle trace ---"
-strings "$LOG" | grep -E "^jbd2(:|-tx:)|^  log:|^AGNOS shell" | sed 's/^/  /'
+strings "$LOG" | grep -E "^(\[[^]]*\] )?jbd2(:|-tx:)|^  log:|^AGNOS shell" | sed 's/^/  /'
 echo ""
 
 rc=0
@@ -91,7 +91,7 @@ check_line "selftest begin"                          "jbd2-tx: selftest begin"
 # now drives a real 3-block commit; the COMMITTED line is the gate.
 check_line "real commit (seq=1 n_blocks=3)"          "jbd2: commit_tx: COMMITTED seq=1 n_blocks=3"
 check_line "selftest PASS"                           "jbd2-tx: selftest PASS"
-if strings "$LOG" | grep -q "^AGNOS shell"; then
+if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}AGNOS shell"; then
     echo "  PASS: shell came up after selftest"
 else
     echo "  FAIL: shell prompt never reached"; rc=1

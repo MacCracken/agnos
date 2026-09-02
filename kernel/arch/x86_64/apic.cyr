@@ -103,6 +103,16 @@ fn lapic_calibrate() {
     }
 
     var start_lapic = apic_read(0x390);          # LAPIC current-count at the aligned start
+    # ⭐ 1.56.58 — THE KERNEL LOG TIMEBASE RIDES THIS WINDOW FOR FREE. The loop below already measures
+    # a known wall interval (8 ch0 periods) against a free-running PIT, needs NO interrupts, and runs
+    # at main.cyr ~line 128. Two rdtsc reads convert it into cycles-per-microsecond ~4,400 statements
+    # before `tsc_calibrate()` (main.cyr:4565) produces the same number — which matters because `sti`
+    # is at main.cyr:4532, so a timer_ticks-derived clock reads 0 for essentially the whole boot log,
+    # and `timer_ticks` additionally FREEZES inside a foreground `run` (ring 3 executes IF=0).
+    # ⚠ Writes klog_tsc_per_us, NOT tsc_per_us — see the note in arch/x86_64/boot_data.cyr for why
+    # those must stay distinct (uptime_us#95`s meaning, and hda/gpu`s documented pre-calibration
+    # fallback both depend on tsc_per_us staying 0 until main.cyr).
+    var start_tsc = rdtsc();
 
     # Count 8 full ch0 periods (~80 ms), each a cur > prev wrap.
     var periods = 0;
@@ -116,6 +126,17 @@ fn lapic_calibrate() {
     }
 
     var end_lapic = apic_read(0x390);
+    var end_tsc   = rdtsc();
+    # 8 ch0 periods == 8 * 11932/1193182 s == 80,001.2 us. Integer 80001 is within 15 ppm of the true
+    # window and is the same 15.1 ppm the 100 Hz tick itself carries, so this adds no new error.
+    # Sanity band mirrors tsc_calibrate()`s: below 100 MHz or above 10 GHz means the PIT misbehaved,
+    # and a refused calibration must leave 0 (the log then renders 0.000000) rather than ship a
+    # divisor that skews every timestamp built on it.
+    var kcyc = end_tsc - start_tsc;
+    if (kcyc > 0) {
+        var kper = kcyc / 80001;
+        if (kper >= 100) { if (kper <= 10000) { klog_tsc_per_us = kper; } }
+    }
     var delta = start_lapic - end_lapic;         # LAPIC counted DOWN; div1 => 1 tick per input clock
     if (delta <= 0) { return 0; }
     var reload = delta / 8;                      # ticks per ch0 period == ticks per 10ms == the 100Hz reload
