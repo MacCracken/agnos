@@ -1621,7 +1621,7 @@ fn unmap_probe(cr3, virt, pd_idx, entry, tag) {
     klug_append(" cpu=", 5);
     epp_hex(pcpu_cpu());
     if (present != 0) {
-        if (user != 0) { klug_append(" DESTROYED_LIVE\n", 15); return 0; }
+        if (user != 0) { klug_append(" DESTROYED_LIVE\n", 16); return 0; }
     }
     klug_append(" noop\n", 6);
     return 0;

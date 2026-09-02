@@ -30,7 +30,7 @@ fi
 # internally — we never call it directly.
 # ⛔⛔ MEASURED 2026-08-28 (1.56.51): THIS PROBED A BINARY THAT HAS NOT EXISTED SINCE cyrius v6.1.0.
 # The backend was renamed cc5_aarch64 -> cycc_aarch64 at v6.0.0 and the back-compat symlink dropped
-# at v6.1.0; this tree is on 6.5.36. build.sh HIT THIS EXACT BUG AND WAS FIXED FOR IT (see its
+# at v6.1.0; this tree is on 6.5.41. build.sh HIT THIS EXACT BUG AND WAS FIXED FOR IT (see its
 # ⚠ comment at the CC_ARM assignment) — the fix was simply never carried across to here. So
 # test_aarch64 took its `[ ! -x "$CC_ARM" ]` early-return on EVERY invocation for the whole 6.1+
 # era: `sh scripts/test.sh --aarch64` printed one SKIP line, ran zero checks and exited 0, and

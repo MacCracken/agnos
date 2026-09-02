@@ -22,6 +22,116 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.56.57] — 2026-09-01 — statfs answers on all three filesystems, and the mount root was refused on two of them
 
+### Fixed — 22 (string, length) mismatches, in three emitter families the gate never looked at
+
+- `scripts/check/kprint-len-check.sh` covered `kprint`/`kprintln`, `ea_expect`/`ea_expect_valid`
+  and `serial_print`/`serial_println`. It now also covers **`klug_append`/`klug_info`/`klug_warn`/
+  `klug_err`** and **`sh_exec`/`test_assert`/`test_assert_eq`**. Literals checked: **3,776 -> 4,084**.
+- ⭐ **The gate's own header predicted this for the third time and was right for the third time.**
+  It states that a length-checking gate must enumerate EVERY (string,length) API in the tree
+  "because the ones it omits are exactly where the bug survives". The omitted families held **22**
+  live mismatches; the covered ones held **0**.
+- Fixed: `kernel/core/proc.cyr:1624` declared 15 for the 16-byte `" DESTROYED_LIVE\n"` (truncating
+  its newline, so the next line ran on) — `ELF_PDE_PROBE` diagnostic, whose output is read with
+  `run /bin/klug`, i.e. a length bug in the log you enabled the probe to read. Plus **21** in
+  `kernel/user/test.cyr` (20) and `kernel/core/main.cyr` (1).
+- ⚠ **Most were `declared == actual + 1`** — someone counting the NUL. That over-reads one byte and
+  truncates nothing, so every one printed a plausible label. Three were the other direction and
+  visibly truncated on every `ktest.sh` run: `fmt_hex_buf negative correc`,
+  `getpid == proc_current`, `memfile create returns f`.
+- ⛔ **`sh_exec` is not a printer**, which is why it earns its own regex rather than being waved off
+  as cosmetic: `kernel/user/shell.cyr:501` computes `arglen = len - cmd_end`, so an over-long length
+  lengthens the **argv string** handed to the exec path. `main.cyr:3586` declared 38 for 37 bytes.
+- ⛔ **THE PATTERN HAD TO BE TAIL-ANCHORED, AND MEASURING THAT IS WHY IT IS.** The `(name, nlen)` pair
+  is the last two arguments, and these calls routinely carry an earlier `(string, int)` pair that is
+  NOT a length — `test_assert_eq(memchr("hello", 108, 5), 2, "memchr 'l' at 2", 15)`, where 108 is a
+  character code. A non-greedy prefix (the shape `ea_expect` uses) produced **5 false positives and
+  missed `test.cyr:403`**, whose line also carries a correct `memeq(&hbuf, "8000000000000000", 16)`.
+- Gate mutation-proven on three axes: each family reddens on a reintroduced mismatch, the char-code
+  trap stays quiet, and an empty file list now errors instead of reporting a green "0 mismatched".
+
+### Fixed — klug's strongest oracle was comparing 1 line out of 83, and 0 would have scored PASS
+
+- `scripts/smoke/klug-spill-smoke.sh` enumerated `grep -a "^klug: "` and required zero misses. A
+  `KLUG_SPILL_SELFTEST` boot puts exactly **one** `klug: `-tagged line in the spill (`spill file
+  ready`; `spilled N bytes` is printed *after* the snapshot). So the "independent oracle" compared
+  **1 of 83 lines** — and at zero matches the while-loop emits nothing, `miss` is 0, and it scores
+  PASS having compared nothing.
+- ⚠ **The obvious widening is wrong, and measuring it is why the replacement has the shape it does.**
+  "Every spill line appears in the serial capture" is FALSE BY DESIGN at the head: `klug_putc` is a
+  pure `store8` path running from the first instruction while `serial_putc` no-ops until the UART is
+  up. Measured on a live boot, spill line 1 (`fb: w=0x800 h=0x800 ...`) is in the ring and **not** on
+  serial — 82 of 83 match, and an all-lines check would fail a correct kernel.
+- The invariant that IS true, and is what now runs: find the first spill line that reached serial,
+  and from there require every line to. Self-calibrating (no hardcoded pre-UART head count),
+  compares **82** lines, and is **format-agnostic** — no anchor, so a prefixed log cannot empty it.
+  Mutation-proven on 4 axes including a simulated `[    4.123456] ` prefix on both sides.
+
+### Fixed — `klug -w` / `klug -e` reported "no warnings" on a kernel that has no lens at all (klug 0.1.5)
+
+- ⛔ The agnos kernel's `klug_info`/`klug_warn`/`klug_err` have **three call sites and all three are
+  inside `#ifdef EXEC_SELFTEST`** (`main.cyr:2737-2739`, guarded `2589-3038`), which is off in every
+  production build. A real boot log therefore carries **zero** tagged lines, every line scores level
+  0, and `klug -w` printed nothing and exited 0 — indistinguishable from "this box logged no
+  warnings".
+- Added `klug_has_level_tag` (sibling repo `klug`, `src/klug.cyr`), which answers a question
+  `klug_level_of` structurally cannot: that fn returns level 0 for a real `[I] ` *and* for an
+  untagged line, because both must appear in a bare dump. `klug_dump` now counts tagged lines and,
+  when a filter ran against zero of them, says so on **stderr** — stdout stays byte-exact and the
+  exit code stays 0, because this is a statement about the corpus, not a failed dump.
+- Tests **12 -> 24**, including a deliberate regression pin: `[    4.123456] [W] low memory` asserts
+  that a prepended field collapses the lens to level 0. The lens is a fixed-offset test (`[` at byte
+  0, `]` at byte 2), so the uptime-prefix proposal disarms it — pinned now as a known, tested
+  consequence rather than a surprise, and as a red test for whoever implements the prefix.
+- ⚠ Not staged. `scripts/burn/stage-tools.sh` refuses to build sibling repos by design, so the
+  rebuilt `build/klug_agnos` must be committed in the klug repo before staging. The klug manifest
+  still pins cyrius **6.5.35**.
+
+### Filed — 33 vacuous gates, tree-wide, unfixed
+
+- [`docs/development/issues/2026-09-02-vacuous-gates-sweep.md`](docs/development/issues/2026-09-02-vacuous-gates-sweep.md).
+  The sweep that found the two vacuous checks fixed above was run across `scripts/smoke/*.sh`,
+  `check.sh`, `check/*.sh`, `harness/*.py`, `probe/*`, `tool/*` and `ktest.sh`; each finding was
+  adversarially re-verified against source.
+- ⛔ **`ktest.sh:170` is the sharpest**: it parses only the failure count, so a suite that enumerated
+  **zero tests** prints `TOTAL: 0 passed, 0 failed` and the harness announces `ALL TESTS PASSED` and
+  exits 0. All seven check bodies are `#ifdef TEST`-gated; the pass count is never compared to
+  anything, and the script's own header records the known-good tally without reading it.
+- ⛔ Three more scored CRITICAL: `ext2-write-smoke.sh:147` (seven metadata_csum assertions wrapped in
+  an `if` the smoke's own default mkfs feature set makes false — no `else`, never run in the sweep),
+  `exec-smoke.sh:235` (the `spawn_path #43` lane is gated on a string in the binary under test, which
+  the sweep's build env does not produce), and two harnesses that have no exit code at all.
+- Count is a **floor**: `.github/workflows/*.yml`, `scripts/burn/*` and `tests/*/` were not swept.
+
+### Changed — cyrius pin 6.5.36 -> 6.5.41, across all 10 manifests
+
+- Pin raised in the root `cyrius.cyml` and the nine `tests/*/cyrius.cyml`
+  (`scripts/check/toolchain-pin-check.sh`: 10 manifests, all 6.5.41).
+- ⛔ **The tree was RED before this and the cause was the manifest, not the source.**
+  `cyriusly` was already on 6.5.41, so `build.sh`'s 1.56.51 pin-enforcement block hard-exited
+  with `toolchain drift — cyrius.cyml pins 6.5.36 but the build would use 6.5.41`, taking
+  `check.sh` gate `x86_64 build` down with it (31 passed / 1 failed).
+- ⭐ **`build/agnos` is BYTE-IDENTICAL across the bump — sha256 `cc5d8a2e…`, 1,994,672 B both
+  sides.** The pin has never been enforced at the `cycc` level (cyrius
+  `issues/2026-08-22-versioned-wrapper-does-not-pin-cycc.md`, unlanded), so every artifact in
+  this tree was already compiled by 6.5.41's cycc. This edit makes the manifest tell the truth;
+  it does not change the compiler.
+- Delta 6.5.37..6.5.41 carries no AGNOS-facing breakage: this tree declares `[deps] stdlib = []`
+  and uses no `Result`, no payload-carrying enum variant and no `private`, so the lib-side work
+  (hash seeding, `Result` allocator, `private` collisions, TLS slot leak) is unreachable from
+  here. 6.5.40 is compiler-internal limits only. The one gain is 6.5.37's AGNOS syscall peers
+  (`#96 fork`, `#102 lstat`, `#103 statfs`), which make `syscall-abi-check.sh` green against the
+  pinned snapshot rather than only against the sibling checkout.
+- ⚠ The "v6.5.36 enum Critical" named in cyrius's 6.5.41 entry is the `>= 2^62` constant
+  corruption that shipped in 6.5.31–6.5.35 and was **fixed at** 6.5.36 — this tree was already
+  past it and gains nothing there.
+- Verified: `check.sh` **32 / 0**, `test.sh` (x86) **4 / 4**, `agnsh-smoke` **3 / 3** to the
+  `[ASSIST] >` prompt, `klug-spill-smoke` **7 / 7** on a real gnoboot+OVMF boot,
+  `ktest.sh` **107 / 3** — the three FAILs are pre-existing initrd checks, identical before and
+  after the bump (isolated by rebuilding under the old pin with `AGNOS_ALLOW_PIN_DRIFT=1`).
+- ⚠ Doc counts corrected in the same edit: `state.md` said **9** manifests (10), and CLAUDE.md
+  said a **30**-gate `check.sh` / **30/30** (32).
+
 ### Withdrawn — the proposed HID gate was going to prove a stub, not the kernel
 
 - ⛔⛔ **1.56.56 recorded that HID `#3` "needs a build-gated seam stubbing the three hardware calls" so a

@@ -3583,7 +3583,7 @@ kprintln("exec: aethersafha returned", 26);
 # and asserts it's non-silent. doom exits when the ~8s test finishes, so the boot
 # does NOT park here (unlike DOOM_SELFTEST's forever game loop).
 kprintln("exec: running /bin/doom --audio-test", 36);
-sh_exec("run /bin/doom /DOOM1.WAD --audio-test", 38);
+sh_exec("run /bin/doom /DOOM1.WAD --audio-test", 37);
 kprintln("exec: doom audio-test returned", 30);
 #endif
 

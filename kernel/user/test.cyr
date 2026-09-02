@@ -72,7 +72,7 @@ fn test_pmm() {
     test_assert_eq(pmm_free_count(), before2, "double-free idempotent", 22);
 
     # Boundary: page 4095 (last valid)
-    test_assert_eq(pmm_set(4095), 0, "set page 4095 ok", 17);
+    test_assert_eq(pmm_set(4095), 0, "set page 4095 ok", 16);
     test_assert_eq(pmm_test(4095), 1, "test page 4095 set", 18);
     pmm_clear(4095);
     test_assert_eq(pmm_test(4095), 0, "clear page 4095", 15);
@@ -99,12 +99,12 @@ fn test_heap() {
     serial_println("[heap]", 6);
 
     # slab_class_for returns correct classes
-    test_assert_eq(slab_class_for(1), 0, "class for 1B = 0", 17);
-    test_assert_eq(slab_class_for(32), 0, "class for 32B = 0", 18);
-    test_assert_eq(slab_class_for(33), 1, "class for 33B = 1", 18);
-    test_assert_eq(slab_class_for(64), 1, "class for 64B = 1", 18);
-    test_assert_eq(slab_class_for(4096), 7, "class for 4096B = 7", 20);
-    test_assert_eq(slab_class_for(4097), 0 - 1, "class for 4097B = -1", 21);
+    test_assert_eq(slab_class_for(1), 0, "class for 1B = 0", 16);
+    test_assert_eq(slab_class_for(32), 0, "class for 32B = 0", 17);
+    test_assert_eq(slab_class_for(33), 1, "class for 33B = 1", 17);
+    test_assert_eq(slab_class_for(64), 1, "class for 64B = 1", 17);
+    test_assert_eq(slab_class_for(4096), 7, "class for 4096B = 7", 19);
+    test_assert_eq(slab_class_for(4097), 0 - 1, "class for 4097B = -1", 20);
 
     # Zero-size alloc returns 0
     test_assert_eq(kmalloc(0), 0, "kmalloc(0) returns 0", 20);
@@ -128,7 +128,7 @@ fn test_heap() {
     test_assert_eq(load64(a1), 0xDEADBEEF, "heap write/read", 15);
 
     # No overlap: writing a1 doesn't corrupt a2
-    test_assert_eq(load64(a2), 0, "no overlap a1->a2", 18);
+    test_assert_eq(load64(a2), 0, "no overlap a1->a2", 17);
 
     # Free and re-alloc should recycle
     kfree_sized(a1, 32);
@@ -165,7 +165,7 @@ fn test_vfs() {
 
     # Create memfile and read back
     var fd = vfs_create_memfile("HELLO", 5);
-    test_assert(fd > 0, "memfile create returns fd", 24);
+    test_assert(fd > 0, "memfile create returns fd", 25);
     var buf[16];
     var n = vfs_read(fd, &buf, 16);
     test_assert_eq(n, 5, "memfile read returns 5", 22);
@@ -182,13 +182,13 @@ fn test_vfs() {
 
     # Read on closed fd returns -1
     var n3 = vfs_read(fd, &buf, 16);
-    test_assert_eq(n3, 0 - 1, "read closed fd = -1", 20);
+    test_assert_eq(n3, 0 - 1, "read closed fd = -1", 19);
 
     # Invalid fd returns -1
-    test_assert_eq(vfs_read(0 - 1, &buf, 16), 0 - 1, "read fd=-1 rejected", 20);
-    test_assert_eq(vfs_read(32, &buf, 16), 0 - 1, "read fd=32 rejected", 20);
-    test_assert_eq(vfs_close(0 - 1), 0 - 1, "close fd=-1 rejected", 21);
-    test_assert_eq(vfs_close(32), 0 - 1, "close fd=32 rejected", 21);
+    test_assert_eq(vfs_read(0 - 1, &buf, 16), 0 - 1, "read fd=-1 rejected", 19);
+    test_assert_eq(vfs_read(32, &buf, 16), 0 - 1, "read fd=32 rejected", 19);
+    test_assert_eq(vfs_close(0 - 1), 0 - 1, "close fd=-1 rejected", 20);
+    test_assert_eq(vfs_close(32), 0 - 1, "close fd=32 rejected", 20);
 
     # Pipe create, write, read
     var pfds[2];
@@ -222,11 +222,11 @@ fn test_vfs() {
 
     # Write on read-end rejected
     var bad_w = vfs_write(rfd, "X", 1);
-    test_assert_eq(bad_w, 0 - 1, "write on read-end = -1", 23);
+    test_assert_eq(bad_w, 0 - 1, "write on read-end = -1", 22);
 
     # Read on write-end rejected
     var bad_r = vfs_read(wfd, &pbuf, 16);
-    test_assert_eq(bad_r, 0 - 1, "read on write-end = -1", 23);
+    test_assert_eq(bad_r, 0 - 1, "read on write-end = -1", 22);
 
     # ⭐ THE OTHER HALF: once every writer is closed, the same read must return 0 = EOF. Without this
     # arm the assertion above is satisfied by a pipe that ALWAYS returns -2, which would make a reader
@@ -253,7 +253,7 @@ fn test_proc() {
     test_assert(st >= 0, "pid 0 state valid", 17);
 
     # proc_get_state for out-of-bounds pid
-    test_assert_eq(proc_get_state(99), 0 - 1, "state pid=99 rejected", 22);
+    test_assert_eq(proc_get_state(99), 0 - 1, "state pid=99 rejected", 21);
 
     # proc_set_cr3 bounds check
     test_assert_eq(proc_set_cr3(99, 0), 0 - 1, "set_cr3 pid=99 rejected", 23);
@@ -288,7 +288,7 @@ fn test_syscall() {
 
     # getpid returns current process
     var pid = ksyscall(2, 0, 0, 0);
-    test_assert_eq(pid, proc_current_get(), "getpid == proc_current_get()", 22);
+    test_assert_eq(pid, proc_current_get(), "getpid == proc_current_get()", 28);
 
     # getuid returns 0 (root)
     var uid = ksyscall(15, 0, 0, 0);
@@ -296,7 +296,7 @@ fn test_syscall() {
 
     # write to fd 0 (serial) returns byte count
     var wn = ksyscall(1, 0, ".", 1);
-    test_assert_eq(wn, 1, "write(0, '.', 1) = 1", 21);
+    test_assert_eq(wn, 1, "write(0, '.', 1) = 1", 20);
 
     # read with invalid fd
     var rbuf[8];
@@ -400,7 +400,7 @@ fn test_kstdlib() {
     # is the exact shape proc_map_page_nx writes into every W^X PDE.
     var hlen_neg = fmt_hex_buf(0 - 9223372036854775807 - 1, &hbuf);   # INT64_MIN, bit 63 set
     test_assert_eq(hlen_neg, 16, "fmt_hex_buf negative len=16", 27);
-    test_assert_eq(memeq(&hbuf, "8000000000000000", 16), 1, "fmt_hex_buf negative correct", 27);
+    test_assert_eq(memeq(&hbuf, "8000000000000000", 16), 1, "fmt_hex_buf negative correct", 28);
 
     # fmt_int_buf: INT64_MIN negates to itself, so the old code rendered it as a bare "-".
     var ibuf2[24];

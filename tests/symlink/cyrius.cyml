@@ -8,7 +8,7 @@ language = "cyrius"
 # it must equal the ROOT manifest's pin, because CI installs only that one version and
 # the wrapper resolves the manifest at the compile cwd. scripts/check/toolchain-pin-check.sh
 # enforces it; this comment used to read "pin the current 6.3.9" while the line said 6.5.27.
-cyrius = "6.5.36"
+cyrius = "6.5.41"
 
 [build]
 entry = "symtest.cyr"

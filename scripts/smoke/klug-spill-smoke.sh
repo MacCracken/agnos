@@ -122,11 +122,47 @@ elif [ "${REPORTED:-0}" -gt 0 ] && [ "${SPILL_BYTES:-0}" -ge "${REPORTED:-1}" ];
     grep -aq "klug: spill file ready" "$WORK/spill-head.bin" && r=1 || r=0
     chk "$r" "the spill contains a late line (it is the CURRENT ring, not a stale prealloc)" \
             "no late line — /klug.txt still holds the mount-time preallocation, not the spill"
-    # Byte-level: every line in the spill must be a line the serial console actually emitted.
-    miss=$(grep -a "^klug: " "$WORK/spill-head.bin" | while read -r l; do grep -aqF "$l" "$LOG" || echo X; done | wc -l)
-    [ "${miss:-1}" = 0 ] && r=1 || r=0
-    chk "$r" "every klug line on disk also appears in the serial capture (independent oracle)" \
-            "$miss line(s) on disk were never emitted on serial — the spill is not the same log"
+    # Byte-level: once the serial console is up, the ring and the console must agree EXACTLY.
+    #
+    # ⛔⛔ THIS ORACLE WAS NEARLY VACUOUS AND ITS OWN NARROWING IS WHAT HID THAT. It enumerated
+    # `grep -a "^klug: "` and required zero misses — but a KLUG_SPILL_SELFTEST boot puts exactly ONE
+    # `klug: `-tagged line in the spill (`spill file ready`; `spilled N bytes` is printed AFTER the
+    # snapshot is taken, so it is never in it). So the "independent oracle" compared 1 line out of 83.
+    # And had that count gone to 0 — which ANY prefix in front of the tag does, a `[    4.123456] `
+    # uptime prefix being the live proposal — the while-loop would emit nothing, `miss` would be 0, and
+    # it would have scored PASS having compared NOTHING. Both halves of the tree's named failure mode.
+    #
+    # ⚠ THE OBVIOUS WIDENING IS WRONG AND MEASURING IT IS WHY THIS SHAPE EXISTS. "Every spill line
+    # appears in the serial capture" is FALSE BY DESIGN at the head: `klug_putc` is a pure store8 path
+    # that runs from the first instruction, while `serial_putc` no-ops until the UART is initialized
+    # (core/kprint.cyr header). Measured on this very boot, spill line 1
+    # (`fb: w=0x800 h=0x800 ...`) is in the ring and NOT on serial — 82 of 83 match, and a naive
+    # all-lines check would fail a correct kernel.
+    #
+    # ⇒ The invariant that IS true: find the first spill line that reached serial, and from there on
+    # require EVERY line to. That is self-calibrating (no hardcoded pre-UART head count), it compares
+    # ~80 lines instead of 1, and it is format-agnostic — no anchor, so a prefix change cannot silently
+    # empty it. The corpus size is asserted and PRINTED so a run that compares nothing says so.
+    cmp=0; miss=0; started=0
+    while IFS= read -r l; do
+        [ "${#l}" -lt 8 ] && continue
+        if grep -aqF "$l" "$LOG"; then
+            started=1; cmp=$((cmp+1))
+        elif [ "$started" = 1 ]; then
+            cmp=$((cmp+1)); miss=$((miss+1))
+        fi
+    done < "$WORK/spill-head.bin"
+    if [ "$cmp" -lt 20 ]; then
+        r=0
+        why="only $cmp line(s) enumerated from the spill — the oracle compared nothing meaningful"
+    elif [ "$miss" = 0 ]; then
+        r=1; why=""
+    else
+        r=0
+        why="$miss of $cmp line(s) after serial came up are on disk but were never emitted — the spill is not the same log"
+    fi
+    chk "$r" "spill and serial agree on every line once the UART is up ($cmp compared, independent oracle)" \
+            "$why"
 else
     echo "FAIL: nothing to compare — spill absent or shorter than reported"; fail=$((fail+1))
 fi
