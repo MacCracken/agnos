@@ -1,7 +1,10 @@
 # 2026-09-02 — ring-3 telemetry gaps a system monitor needs
 
-**Status:** 🟠 **OPEN — 8 of 9 sections CLOSED at 1.56.59. Only §8 (per-core CPU utilisation)
-remains, and it is now a small step; §7 was never ours.**
+**Status:** ✅ **RESOLVED — all 9 sections closed at 1.56.59.** Six shipped code; three closed by
+reasoning (§7 was repo policy; §8's cached/buffers and swap are correct as they are). Two §8 sub-items
+are deliberately NOT built with the cost stated — per-process start time needs a new syscall number
+now that `proclist`'s record is full, and interface enumeration would freeze an ifindex ABI while
+there is exactly one interface. Both are yours to call.
 
 ✅ **§1 packet counters + §2 network byte counters** — `net_config`#61 gains fields **8-11**
 (tx_packets / rx_packets / tx_bytes / rx_bytes). ⭐ **Counted at `nic_send`/`nic_poll`
@@ -11,8 +14,11 @@ drivers meet, so the numbers mean the same thing on both substrates. Loopback is
 construction. ⭐ **Extended #61 rather than minting a number, and that means you can read them TODAY**:
 `sys_net_config(field)` already passes an arbitrary field id, so there is no cyrius peer to wait for.
 
-✅ **§3 disk I/O counters** — new `blkstats`#105 `(tag, field) -> sectors`, field 0 read / 1 written,
-keyed by `blk_enum`#75's existing tag list as you asked. ⚠ **SECTORS, not bytes, deliberately**: this
+✅ **§3 disk I/O counters** — in **`sysinfo`#35's tail at `+104 + tag*16`** (sectors read / written,
+min length 200), keyed by `blk_enum`#75's tag list as you asked — and by the RAW tag, slot 0 wasted, so
+you use the same value #75 gave you with no `-1`. ⛔ First minted as `blkstats`#105 and **withdrawn**:
+a closed 5-value tag enum over flat arrays is a fixed-size tail block, not a syscall. The number would
+have been permanent surface for every consumer, gate and peer. ⚠ **SECTORS, not bytes, deliberately**: this
 layer moves exactly one sector per call, and a byte figure needs the per-device LBA size — which can
 be 4096, a live latent path here. Multiply by `blk_info`#79's reported size. Cyrius peer filed at
 `cyrius/docs/development/issues/2026-09-02-agnos-syscall-105-blkstats-wrapper.md`; until it lands,
@@ -63,8 +69,47 @@ PDEs". **That was a stale-build measurement, not a real result** — the walk wa
 Corrected rather than deleted, because a wrong measurement recorded as fact is what this tracker keeps
 finding.
 
-⚠ **§8 per-core CPU utilisation** now has its prerequisite: `proc_ticks` is per-slot and charged
-per-CPU, so idle/busy accounting is a smaller step than when you filed.
+✅ **§8 — CLOSED, all five sub-items, three of them by NOT building anything.**
+
+* **Per-core CPU utilisation — SHIPPED**, appended to **`sysinfo`#35 at +40** (min length 104):
+  `+40 + cpu*16 + 0` = user ticks, `+8` = kernel ticks, 4 CPUs. ⛔ First built as a new syscall
+  `cpustat`#106 and moved — #35 already takes a length and the ABI rule is "append at the tail", so
+  the number was needless and would have cost a third cyrius release. `sys_sysinfo(buf, len)` already
+  exists, so **you read this with no toolchain change at all**. A caller passing len=40 is
+  byte-identical to before. Split by the **privilege of the interrupted context** in the timer ISR — Linux's
+  `%us`/`%sy`, computed the same way, exact rather than sampled. You said this "follows naturally
+  from §4"; it did.
+  ⛔ **But there is no `idle` field, and that is the answer, not a shortfall.** agnos has no single
+  idle loop to instrument: `arch_wait()` (a bare `hlt`) is called from ~a dozen polling waits — DHCP
+  retry, `sleep_ms`#41, `kbd_read_blocking`, the NIC drain — so a CPU **halted inside a blocking
+  syscall is indistinguishable at the tick boundary** from one doing real kernel work. Both are ring 0.
+  ⇒ **Field 1 is "system + halted", not "busy-system".** Compute `user / (user + kernel)`; do not
+  render field 1 as CPU consumed. We declined to guess idle from the saved RIP or to flag one
+  `arch_wait` site and not the other eleven — that is a plausible-looking wrong number, and this cut
+  already declined one of those for RSS.
+* **cached / buffers — CLOSED, no work.** You read the ABI's omission as deliberate. It is; it stays.
+* **swap — CLOSED, no work.** No swap subsystem exists and none is planned. Correct for the design.
+* **Per-process start time — NOT BUILT, and here is the cost so you can decide if it is worth it.**
+  `proclist`#99's 64-byte record is now **full**: `+56` carries cpu ticks (low u32) and rss pages
+  (high u32) as of this cut. A start time needs a WIDER record, which per this doc's own rule means a
+  **new syscall number**, not a widening — so it is a real ABI decision rather than a field. Not taken
+  on our own initiative for an item you filed as informational. **Say the word and it gets a number.**
+* **Network interface enumeration — NOT BUILT, deliberately.** Your own note says there is exactly one
+  implicit interface. An enumeration that always returns 1 is ceremony, and it would freeze an ifindex
+  ABI before a second interface exists to shape it. Worth doing the day a second NIC does.
+
+⚠ **WHAT THIS SHIPPED WORK BROKE, checked before archiving per the folder rule.**
+1. **Nothing is pending.** `syscall-abi-check.sh` reads `kernel 106 · abi-doc 106 · cyrius 106` — all
+   agree, `check.sh` 32/32. §8 needed no new number once it was appended to `sysinfo`#35, so there is
+   **no third cyrius ask** outstanding for this filing.
+2. ⚠ Two asks were spent getting here that should have been one: `#104` (cyrius 6.5.43) and `#105`
+   (6.5.44) were filed separately although both came from THIS filing, whose full surface was known at
+   triage. That is recorded in the CHANGELOG as a process lesson, not glossed. `check.sh` is otherwise 32/32, `test.sh` 4/4, and every boot smoke is unchanged.
+
+⚠ **ONE ASSERTION IN THE GATE IS DELIBERATELY NARROW, and it is the one that matters.** §8 asserts that
+**USER ticks specifically** moved, not that user+kernel grew. A total-only assertion passes on a kernel
+whose RPL mask is wrong — everything charged to kernel, totals still plausible. Mutation-proven:
+inverting the ring test yields exit 73 with that diagnosis.
 
 **All of the above is boot-proven, not compiled**: `scripts/harness/telemetry-test.py` +
 `tests/telemetry/tlm.cyr`, exit 95. ⛔ The oracle is **"the counter MOVED"**, not "the counter is

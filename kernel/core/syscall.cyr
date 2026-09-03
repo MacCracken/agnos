@@ -9273,36 +9273,6 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 78) { stack_canary_check(canary); return blk_write_sys(arg1, arg2, arg3, ksyscall_a4_get()); } # blk_write(h, lba, buf, nsec) -> nsec (GATED on blk_rw_armed)
     if (num == 79) { stack_canary_check(canary); return blk_info_sys(arg1, arg2); }                          # blk_info(h, out) -> 0
     if (num == 80) { stack_canary_check(canary); return blk_close_sys(arg1); }                               # blk_close(h) -> 0
-    if (num == 105) {
-        # blkstats(tag=arg1, field=arg2) -> cumulative sector count, or -1.
-        #   field 0 = sectors READ · field 1 = sectors WRITTEN
-        # tag is a BLK_* device tag (1 virtio · 2 nvme · 3 ahci · 4 usb-ms · 5 ramdisk), the SAME
-        # identity `blk_enum`#75 hands out — so a consumer enumerates devices with #75 and reads each
-        # one's traffic here, with no second naming scheme to keep in step.
-        #
-        # ⭐ THE DISK RATE LINE (telemetry filing §3). Counted at `blk_read_on`/`blk_write_on`
-        # (core/block.cyr), the one place every backend passes through, and only on a COMPLETED
-        # transfer. Monotonic since boot and never reset — a monitor differences two samples.
-        #
-        # ⚠ A FIELD SELECTOR, NOT A RECORD, AND NOT AN EXTENSION OF `blk_info`#79. #79 fills a fixed
-        # struct with no length argument, so widening it is an ABI break for every shipped caller —
-        # the filing says as much. Two scalar arguments and an integer return need no buffer, so there
-        # is no user-range validation surface here at all and nothing to get wrong about it.
-        #
-        # ⚠ SECTORS, NOT BYTES, deliberately: this layer transfers exactly one sector per call, and a
-        # byte count would have to multiply by the per-device LBA size, which can be 4096. A consumer
-        # wanting bytes multiplies by `blk_info`#79's reported size, which it already has.
-        #
-        # ⛔ NO `blk_registered` GATE. An unregistered device legitimately reports 0, and refusing it
-        # would make "this device has done no I/O" and "this device does not exist" the same answer —
-        # the class of collapse this cut has spent its time removing. Only the RANGE is refused.
-        if (arg1 < 1) { stack_canary_check(canary); return 0 - 1; }
-        if (arg1 > 5) { stack_canary_check(canary); return 0 - 1; }
-        if (arg2 == 0) { stack_canary_check(canary); return load64(&blk_reads_by_tag  + arg1 * 8); }
-        if (arg2 == 1) { stack_canary_check(canary); return load64(&blk_writes_by_tag + arg1 * 8); }
-        stack_canary_check(canary);
-        return 0 - 1;
-    }
     # directory listing (#81) — ring-3 readdir over the ext2 root; fills 64-byte {name,type} records.
     if (num == 81) { stack_canary_check(canary); return ext2_readdir_sys(arg1, arg2, arg3); }                # readdir(path, buf, max) -> count
     # ⭐ resumable directory listing (#101, 1.56.50) — #81 with a cursor, so a directory larger than
@@ -9500,8 +9470,16 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # procs / cpus. Live volatile snapshot; single-core so no lock. The
         # kernel does the unit conversion (ticks→sec at 100 Hz, pages→bytes at
         # 4 KB) so userland never re-derives units. a3 unused.
-        if (is_user_range(arg1, 40) == 0) { stack_canary_check(canary); return 0 - 1; }
+        # ⛔ ONE RANGE CHECK, BEFORE ANY STORE, SIZED TO WHAT THE CALLER ASKED FOR. The first shape of
+        # the 1.56.59 tail append validated the wider window INSIDE the extension block, after the base
+        # fields were already written — so a caller passing len>=104 with a buffer valid for only 40
+        # got 40 bytes written AND a -1 back. A partial write with an error return is a contract nobody
+        # can code against. Deciding the length up front makes the arm all-or-nothing again.
         if (arg2 < 40) { stack_canary_check(canary); return 0 - 1; }
+        var si_len = 40;
+        if (arg2 >= 104) { si_len = 104; }
+        if (arg2 >= 200) { si_len = 200; }
+        if (is_user_range(arg1, si_len) == 0) { stack_canary_check(canary); return 0 - 1; }
         store64(arg1 +  0, timer_ticks / 100);            # uptime seconds (100 Hz)
         store64(arg1 +  8, pmm_total * 4096);             # total RAM bytes (4 KB pages)
         store64(arg1 + 16, pmm_free_count() * 4096);      # free RAM bytes
@@ -9516,6 +9494,81 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # buffers (sc_open_abs, fb_scale_rowbuf) justified themselves on it. Both are per-CPU now.
         # Still a cosmetic stat: no scheduler decision reads this field.
         store64(arg1 + 32, cpu_count);                    # online (enumerated) CPUs
+        # ── PER-CORE CPU ACCOUNTING, appended at +40 (1.56.59, telemetry filing §8) ──────────────
+        #
+        # ⭐ APPENDED HERE RATHER THAN MINTED AS A SYSCALL, AND THAT CHOICE IS THE POINT. This arm
+        # already takes a caller LENGTH, and this doc's own rule for the family is "future fields
+        # append at the tail and bump the minimum len; the existing offsets are frozen ABI the moment
+        # a consumer reads them" (agnos-userland-abi.md §4.4). Per-core ticks ARE system information.
+        # ⛔ IT WAS FIRST BUILT AS `cpustat`#106 AND THAT WAS A MISTAKE — a new syscall number is a
+        # cross-repo ask on the cyrius peer, i.e. a language-agent cycle, a cyrius release, and a
+        # re-pin of every sibling repo that wants one toolchain version. The extend-vs-mint test was
+        # applied correctly to `net_config`#61 (extended, no peer, shipped same day) and correctly
+        # ruled out for `blk_info`#79 (fixed arity, no length), then skipped here. It is applied now.
+        # ⚠⚠ AND ONE THING THIS IS *NOT*, corrected after an audit caught the claim: it is NOT free for
+        # a wrapper consumer. The cyrius peer is `fn sys_sysinfo(out)` — ARITY 1, with the length
+        # HARDCODED to 40 (cyrius/lib/sys.cyr:225-227). So +40..+103 is reachable today only by a raw
+        # `syscall(35, buf, 104)`, which is what tests/telemetry/tlm.cyr uses. A wrapper consumer needs
+        # a length-taking overload upstream — a NUMBER-FREE ask that touches no ABI-gate row, but not
+        # "no toolchain change at all", which is what three places here said until the audit.
+        # ⇒ The contrast with `net_config`#61 is real and worth keeping: its peer is
+        # `fn sys_net_config(field)`, which genuinely forwards an arbitrary id, so fields 8-11 shipped
+        # to consumers the same day with nothing upstream. #35 and #61 are NOT symmetric.
+        #
+        # Layout, 4 CPUs x 2 u64 = 64 bytes, minimum length 104:
+        #   +40 + cpu*16 + 0  u64  USER ticks   (interrupted CS was ring 3)
+        #   +40 + cpu*16 + 8  u64  KERNEL ticks (interrupted CS was ring 0)
+        #
+        # ⛔ THE LARGER RANGE IS VALIDATED ONLY WHEN THE CALLER ASKED FOR IT. A caller passing 40 must
+        # get BYTE-IDENTICAL behaviour — the same 40 bytes, the same `is_user_range(arg1, 40)`, no
+        # spurious -1 from validating a window it never offered. That is what makes this an append
+        # rather than an ABI break, and it is the one thing to preserve if this is ever touched again.
+        #
+        # ⛔⛔ NO `idle` FIELD, AND THE ABSENCE IS THE HONEST ANSWER. agnos has no single idle loop:
+        # `arch_wait()` (a bare `hlt`) is called from ~a dozen polling waits — DHCP retry, `sleep_ms`#41,
+        # `kbd_read_blocking`, the NIC drain — so a CPU halted inside a blocking syscall is
+        # INDISTINGUISHABLE at the tick boundary from one doing real kernel work. Both are ring 0.
+        # ⇒ The kernel field means "system + halted", NOT "busy-system". Compute utilisation as
+        # user/(user+kernel). Guessing idle from the saved RIP, or flagging one `arch_wait` site and not
+        # the other eleven, would be a plausible-looking wrong number.
+        if (si_len >= 104) {
+            var si_c = 0;
+            while (si_c < 4) {
+                store64(arg1 + 40 + si_c * 16 + 0, load64(&cpu_user_ticks + si_c * 8));
+                store64(arg1 + 40 + si_c * 16 + 8, load64(&cpu_kern_ticks + si_c * 8));
+                si_c = si_c + 1;
+            }
+        }
+        # ── PER-DEVICE DISK I/O, appended at +104 (1.56.59, telemetry filing §3) ────────────────────
+        #
+        # ⛔⛔ THIS WAS `blkstats`#105 AND THE NUMBER HAS BEEN WITHDRAWN. It was minted, filed upstream,
+        # and shipped as a cyrius peer in 6.5.44 before an extend-vs-mint audit of the whole syscall
+        # surface found it never needed a number: the tag space is a CLOSED 5-value enum over flat
+        # by-tag arrays, which is exactly a fixed-size tail block. Same filing, same cut, same consumer
+        # and the same shape as the per-core band directly above it. `blk_info`#79 was correctly ruled
+        # out (fixed arity, no length) and the test stopped there instead of continuing to #35.
+        # ⇒ Removed rather than left standing, because a needless syscall number is permanent surface:
+        # every consumer, every ABI gate and every peer carries it forever. The cyrius removal is filed.
+        #
+        # ⚠ INDEXED BY THE RAW `BLK_*` TAG, SLOT 0 DELIBERATELY WASTED. `blk_reads_by_tag[6]` reserves
+        # index 0 (BLK_NONE) and uses 1..5, so mirroring that exactly means a consumer reads
+        # `+104 + tag*16` with the SAME tag `blk_enum`#75 handed it — no -1 adjustment to get wrong.
+        # 16 bytes of padding is a cheap price for removing an off-by-one from every consumer.
+        #
+        #   +104 + tag*16 + 0  u64  cumulative sectors READ    (tag 1..5; slot 0 always 0)
+        #   +104 + tag*16 + 8  u64  cumulative sectors WRITTEN
+        #
+        # ⚠ SECTORS, NOT BYTES — this layer moves exactly one sector per call, and a byte figure needs
+        # the per-device LBA size, which can be 4096. Multiply by `blk_info`#79's reported size.
+        # ⚠ Monotonic since boot, never reset. An unregistered device legitimately reports 0.
+        if (si_len >= 200) {
+            var si_t = 0;
+            while (si_t < 6) {
+                store64(arg1 + 104 + si_t * 16 + 0, load64(&blk_reads_by_tag  + si_t * 8));
+                store64(arg1 + 104 + si_t * 16 + 8, load64(&blk_writes_by_tag + si_t * 8));
+                si_t = si_t + 1;
+            }
+        }
         stack_canary_check(canary);
         return 0;
     }

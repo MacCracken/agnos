@@ -66,6 +66,19 @@ fn timer_handler(rsp_after_push) {
     if (tk_p >= 0) {
         if (tk_p < 16) { store64(&proc_ticks + tk_p * 8, load64(&proc_ticks + tk_p * 8) + 1); }
     }
+    # ⭐ PER-CORE user/kernel split (telemetry §8) — decided by the PRIVILEGE OF THE INTERRUPTED
+    # CONTEXT, not by which process is scheduled. `proc_current_get()` above says who would run next;
+    # it says nothing about whether the CPU was executing user code when the tick landed, which is the
+    # question a per-core utilisation bar asks.
+    # ⚠ CS lives at frame+128 — the same offset `proc_save_context` reads it from (core/sched.cyr),
+    # cited rather than re-derived so the two cannot drift apart. RPL is the low 2 bits.
+    # ⚠ Charged on EVERY CPU (no BSP gate): this is per-core by definition.
+    var tk_cs = load64(rsp_after_push + 128);
+    var tk_c  = pcpu_cpu();
+    if (tk_c < 4) {
+        if ((tk_cs & 3) == 3) { store64(&cpu_user_ticks + tk_c * 8, load64(&cpu_user_ticks + tk_c * 8) + 1); }
+        if ((tk_cs & 3) != 3) { store64(&cpu_kern_ticks + tk_c * 8, load64(&cpu_kern_ticks + tk_c * 8) + 1); }
+    }
     # 1.46.x SMP sub-bite 6b: the BSP owns the wall clock + the single NIC ring. An AP's
     # timer tick must NOT bump timer_ticks (one global clock) nor re-enter net_rx_drain (one
     # shared r8169 ring, single-consumer). Gate both behind pcpu_cpu()==0. ALWAYS-TRUE

@@ -50,6 +50,41 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   was mutation-tested by copying all 64 bytes unconditionally and still passed — `vfs_mnt_prefix` is
   zero-initialised and written once per boot, so there is no stale tail yet. It is a regression guard
   for when `mount` becomes real, not a live oracle. Recorded rather than left to look like coverage.
+- ⛔ **AN AUDIT OF THE WHOLE 106-SYSCALL SURFACE NOW MAKES EXTEND-VS-MINT MECHANICAL** rather than
+  remembered — the thing that would have prevented this: **9 length-carrying** calls that take tail
+  fields (#29 #34 #35 #38 #89 #92 #93 #97 #98 — and two are proven, #35 grew 40→104 this cut and #98
+  grew 16→20 at 1.56.49), and **16 field/op selectors** where new ids are free (#61 #97 #92 #93 #105 …).
+  Only what neither can carry earns a number.
+- ⛔⛔ **`#105 blkstats` WAS THE SECOND AVOIDABLE MINT, AND IT IS NOW WITHDRAWN.** Its tag space is a
+  closed 5-value enum over flat by-tag arrays — exactly a fixed-size tail block. `blk_info`#79 was
+  correctly ruled out (fixed arity, no length) and the test stopped there instead of continuing to
+  `#35`. The counters now ride `sysinfo`'s tail at **`+104 + tag*16`**, sectors read / written,
+  minimum length **200**.
+  - ⚠ **Indexed by the RAW `BLK_*` tag with slot 0 deliberately wasted**, mirroring
+    `blk_reads_by_tag[6]`, so a consumer uses the **same tag `blk_enum`#75 gave it** with no `-1` to
+    get wrong. 16 bytes of padding buys an off-by-one removed from every consumer.
+  - ⛔ **Removed rather than left standing.** A needless syscall number is permanent surface — every
+    consumer, every ABI gate and every peer carries it forever, and it becomes the obvious place to
+    hang the next block-telemetry field, compounding the error. Removing it after exactly one release
+    has shipped it is the cheapest this ever gets.
+  - ⛔ **The cyrius withdrawal is filed and is Medium, not cosmetic**: until the peer drops
+    `SYS_BLKSTATS`, `sys_blkstats(tag, field)` is live in 6.5.44 against a kernel with no arm, so a
+    caller gets the dispatch fall-through and may render it as a statistic. Filed together with the
+    `sys_sysinfo` length overload — they are one piece of work.
+  - ⚠ **Removing the arm ate four live ones on the first attempt** (`#81`, `#101`, `#102`, `#103` sat
+    between `#105` and `#104` in the file) and the ABI gate caught it immediately — `kernel 101`
+    against `abi-doc 105`. Recovered from the diff and re-proven on a boot (`rdat` exit 95, so `#81`
+    and `#101` genuinely work), not just recompiled. A range delete between two syscall arms is not
+    safe in this file; the arms are not in numeric order.
+- ⛔⛔ **THE REAL LESSON OF THIS CUT, AND IT IS A PROCESS ONE: THREE SEPARATE CYRIUS ASKS WHERE ONE
+  WOULD HAVE DONE.** `#104`, `#105` and what became the `sysinfo` append all came from a SINGLE
+  consumer filing whose entire surface was known at triage. Working it section-by-section turned one
+  ask into three — `#104` cost a 6.5.43, `#105` a 6.5.44, and the third was only avoided by catching
+  that it never needed a number at all. **Every ask is a language-agent cycle, a release, and a re-pin
+  of every sibling that wants one toolchain version.** ⇒ When a filing's syscall surface is known,
+  mint the whole set and file ONE ask. And run the extend-vs-mint test on every candidate BEFORE
+  minting any of them: length-carrying calls take tail fields, field-selectors take new ids, and only
+  what neither can carry earns a number.
 - ⭐ **THE CROSS-REPO LOOP CLOSED INSIDE THE CUT, AND THAT IS WORTH RECORDING.** #104 was minted here,
   the peer was filed as an issue in cyrius's own tree
   (`docs/development/issues/2026-09-02-agnos-syscall-104-mountlist-wrapper.md`) per the NEVER-TOUCH
@@ -96,7 +131,7 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   setting that result was never executed (no runner, no `act`); and tonegen's 400-480 Hz band was
   never sampled against real captures, so its WARN→FAIL promotion bets on an unmeasured tolerance.
 
-### Added — the telemetry counters a system monitor is built from (chakshu §1/§2/§3/§4)
+### Added — the telemetry a system monitor is built from: chakshu's filing closed, all 9 sections
 
 - **§4 per-process CPU time — the section the filing calls "the one that changes what a system monitor
   can be on AGNOS".** Live in `proclist`#99's `+56` **low u32**, in 100 Hz ticks (one tick = 10 ms, the
@@ -153,6 +188,38 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
     That was a stale-build measurement, not a result.** The walk was correct throughout. Recorded
     rather than quietly dropped: a wrong measurement written down as fact is the failure this tree
     keeps finding, and it is no better when it is mine.
+- **§8 per-core CPU utilisation — appended to `sysinfo`#35 at +40**, behind a bumped minimum length of
+  104. `+40 + cpu*16 + 0` = USER ticks, `+8` = KERNEL ticks, 4 CPUs, 100 Hz. Split by the **privilege
+  of the interrupted context** in the timer ISR (read the CS the hardware frame saved at frame+128,
+  test the RPL) — Linux's `%us`/`%sy`, exact rather than sampled.
+  - ⛔⛔ **THIS WAS FIRST BUILT AS A NEW SYSCALL `cpustat`#106, AND THAT WAS THE MISTAKE.** `sysinfo`#35
+    already takes a caller length, and this repo's own ABI rule for that family is *"future fields
+    append at the tail and bump the minimum len"*. Per-core ticks are system information; they
+    belonged there. The extend-vs-mint test was applied correctly to `net_config`#61 (extended, no
+    peer, shipped same day) and correctly ruled out for `blk_info`#79 (fixed arity, no length) — then
+    **skipped** here. Minted, filed upstream, then withdrawn and re-done as an append.
+  - ⭐ **The cost that mistake would have carried, since it is the reason the rule exists:** a new
+    number is a cross-repo ask on the cyrius peer — a language-agent cycle, a cyrius release, and a
+    re-pin of every sibling repo that wants one toolchain version. ⚠ **but NOT "no toolchain change at all" — an audit caught
+    that claim and it was wrong in three places.** The peer is `fn sys_sysinfo(out)`, arity 1, length
+    hardcoded to 40, so the tail is reachable today only by a raw `syscall(35, buf, 104)`. A wrapper
+    consumer needs a length-taking overload upstream: **number-free, no ABI-gate row, one cheap ask** —
+    against `net_config`#61's peer, which genuinely forwards an arbitrary id and needed nothing. The
+    two were written up as symmetric; they are not.
+  - ⛔ **A caller passing len=40 is byte-identical to before.** The larger range is validated only when
+    the caller asked for it. Mutation-proven: relaxing the guard to `arg2 >= 40` reddens the gate
+    (exit 63, "wrote past +40 for a caller below the new minimum").
+  - ⚠ **One assertion in that gate cannot fail and says so in-file.** A small caller getting a spurious
+    `-1` from an over-wide `is_user_range` is undetectable from ring 3 — a 40-byte stack buffer still
+    has 104 valid bytes after it. Recorded rather than left looking like coverage.
+  - ⛔⛔ **NO `idle` FIELD.** `arch_wait()` (a bare `hlt`) is called from ~a dozen polling waits, so a
+    CPU halted in a blocking syscall is indistinguishable at the tick boundary from one doing kernel
+    work — both ring 0. The kernel field is **"system + halted"**, not "busy-system".
+- **Two §8 sub-items were deliberately NOT built, with the cost stated rather than silently skipped.**
+  *Per-process start time* needs a **new syscall number** — `proclist`#99's 64-byte record is now full
+  (`+56` carries ticks + rss as of this cut), and this repo's rule is mint-don't-widen, so it is an ABI
+  decision, not a field; the filing listed it as informational. *Interface enumeration* would freeze an
+  ifindex ABI while the filing itself notes there is exactly one implicit interface.
 - **Boot-proven** — `scripts/harness/telemetry-test.py` + `tests/telemetry/tlm.cyr`, exit **95**.
   ⛔ **The oracle is "the counter MOVED", not "the counter is readable."** Every one of these would
   read 0 on a kernel that declared the variable and never incremented it, and 0 is a plausible-looking
@@ -245,7 +312,7 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 - All **11** manifests (the root, nine `tests/*`, and the new `tests/mountlist`), plus sibling **klug**.
   `toolchain-pin-check.sh` 11/11. klug rebuilt and 37/37.
 
-### Changed — issues/ reviewed against live code; one archived, three headers corrected
+### Changed — issues/ reviewed against live code; TWO archived, three headers corrected
 
 - ⛔ **Only ONE of five was archivable, and the two that LOOKED closest to done were the furthest.**
   The P1 backlog reads 23/26 closed and is **21** — two items were fixed at the line named in the
@@ -253,8 +320,9 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   vacuous-gates file carried a corrected "39 fixed" header over its **unedited 273-line body**, which
   still describes all 33 findings as open. **Both would have archived cleanly on their own status
   text** — the failure that cost this repo eleven cuts on `#98` and four on `#97`.
-- ✅ **Archived**: the crab mount-enumeration filing, resolved by #104, with its status rewritten first
-  and what-it-broke recorded (the expected ABI-gate red). Archived count 50 → **51**.
+- ✅ **Archived, both with status rewritten first and what-they-broke recorded**: the crab
+  mount-enumeration filing (resolved by `#104`) and **chakshu's telemetry filing — all 9 sections
+  closed**, six by shipping code and three by reasoning. Archived count 50 → **52**.
 - Headers corrected in place on all three that stay open. The HID record understated itself: not merely
   "#3 has never executed" but **no in-tree build can even set its flag**, and the 1.56.58 iron slot
   passed with no HID entry at all — so the gate is UNSLOTTED, not scheduled. Three residuals there are

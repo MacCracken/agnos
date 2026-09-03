@@ -125,6 +125,14 @@ try:
     code = int(m[-1]) if m else None
     p("tlm exit code:", code if code is not None else "(never reported)")
     WHY = {
+        60: "§8 sysinfo(#35) with the OLD 40-byte length FAILED — the tail append broke an existing caller",
+        61: "§8 sysinfo(#35) at len=40 did not write the old tail (cpu_count) — the first 40 bytes moved",
+        62: "§8 sysinfo(#35) at a length between old and new minimum FAILED",
+        63: "§8 sysinfo(#35) wrote past +40 for a caller below the new minimum length",
+        70: "§8 sysinfo(#35) at len=104 failed — the per-core extension is not implemented",
+        71: "§8 per-core USER ticks went BACKWARDS",
+        72: "§8 per-core KERNEL ticks went BACKWARDS",
+        73: "§8 USER ticks did NOT move while this ring-3 process burned CPU — the CS ring test is wrong",
         80: "proclist(#99) returned no processes",
         81: "our own pid is absent from the process table",
         82: "our pid vanished from the table between two samples",
@@ -135,9 +143,11 @@ try:
         87: "§2 tx byte counter went BACKWARDS",
         88: "§1 tx packet counter NEVER MOVED under real traffic — declared but dead",
         89: "§2 tx BYTES did not outpace tx PACKETS — the byte counter is wired to the packet increment",
+        75: "§3 sysinfo(#35) at len=104 failed once the disk band was appended",
+        76: "§3 sysinfo(#35) wrote past +104 for a caller below the disk band's minimum length",
+        77: "§3 sysinfo(#35) at len=200 failed — the disk band is not implemented",
+        78: "§3 tag slot 0 (BLK_NONE) is non-zero — the tag indexing is off by one",
         90: "§3 no block device reports ANY sector read — the disk counters are dead",
-        91: "§3 sectors-read went BACKWARDS",
-        92: "§3 an out-of-range tag or unknown field was ACCEPTED instead of refused",
         93: "§5 our pid vanished before the RSS sample",
         94: "§5 per-process RSS is 0 for a RUNNING process — the counter is dead",
         96: "§5 RSS is not a multiple of 512 pages — unit and 2 MB mapping granularity disagree",

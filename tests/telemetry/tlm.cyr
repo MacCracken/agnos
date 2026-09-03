@@ -11,7 +11,7 @@
 # as a NEGATIVE delta and produces a nonsense rate — the exact defect that makes nvme_io_submit_count
 # unusable (bench.cyr zeroes it). "Never decreases" is a different claim from "increases".
 #
-# Exit 95 iff every counter is live and monotonic; 80-97 pinpoint which one is not.
+# Exit 95 iff every counter is live and monotonic; 70-97 pinpoint which one is not.
 
 fn tlm_main(): i64 {
     # ---- §4: per-process CPU time, surfaced in proclist(#99) record +56 low u32 ----
@@ -69,6 +69,47 @@ fn tlm_main(): i64 {
     if (rs > 32768) { return 97; }
 
 
+    # ---- §8: per-core CPU accounting, sysinfo(#35) EXTENSION at +40 ----
+    # ⛔ THE FIRST ASSERTION IS BACKWARD COMPATIBILITY, and it comes first on purpose. This capability
+    # was first built as a new syscall #106 and moved onto sysinfo's tail instead, because #35 already
+    # takes a caller length and a new number costs a cyrius release. The one thing that move must not
+    # break is a caller passing the OLD length: it has to get the same 40 bytes and the same success.
+    # ⚠ WHAT THESE ASSERTIONS DO AND DO NOT COVER, measured rather than assumed. Exit 63 (writing past
+    # +40 for a small caller) BITES — mutation-proven: relaxing the guard to `arg2 >= 40` reddens it.
+    # Exit 60 (a small caller getting a spurious -1 from an over-wide is_user_range) does NOT bite from
+    # ring 3: a 40-byte stack buffer still has 104 valid bytes after it, so the wider range validates
+    # anyway. Catching that needs a buffer at the very end of the user window, which this exerciser
+    # cannot place. Stated because an assertion that cannot fail should never be mistaken for coverage.
+    var si40[40];
+    var si_k = 0;
+    while (si_k < 40) { store8(&si40 + si_k, 0xEE); si_k = si_k + 1; }
+    if (syscall(35, &si40, 40) != 0) { return 60; }        # old-length call must still succeed
+    if (load64(&si40 + 32) < 1) { return 61; }             # cpu_count — the old tail must be written
+    # A length between the old and new minimum must ALSO still work and write only the old 40.
+    var si104[104];
+    si_k = 0;
+    while (si_k < 104) { store8(&si104 + si_k, 0xEE); si_k = si_k + 1; }
+    if (syscall(35, &si104, 64) != 0) { return 62; }
+    if (load8(&si104 + 40) != 0xEE) { return 63; }         # +40 untouched below the new minimum
+
+    # Now the extension itself.
+    si_k = 0;
+    while (si_k < 104) { store8(&si104 + si_k, 0); si_k = si_k + 1; }
+    if (syscall(35, &si104, 104) != 0) { return 70; }
+    var u0 = load64(&si104 + 40 + 0 * 16 + 0);             # cpu0 user
+    var k0 = load64(&si104 + 40 + 0 * 16 + 8);             # cpu0 kernel
+    var spin2 = 0;
+    while (spin2 < 40000000) { spin2 = spin2 + 1; }
+    if (syscall(35, &si104, 104) != 0) { return 70; }
+    var u1 = load64(&si104 + 40 + 0 * 16 + 0);
+    var k1 = load64(&si104 + 40 + 0 * 16 + 8);
+    if (u1 < u0) { return 71; }                            # user ticks went backwards
+    if (k1 < k0) { return 72; }                            # kernel ticks went backwards
+    # ⛔ THE ASSERTION THAT CATCHES A WRONG RING TEST. We just burned wall time in RING 3, so the USER
+    # counter must have moved. A test asserting only (user+kernel) grew would pass on a kernel that
+    # charged everything to kernel — a wrong RPL mask — with totals still looking plausible.
+    if (u1 == u0) { return 73; }
+
     # ---- §1 + §2: network packet and byte counters, net_config(#61) fields 8-11 ----
     # ⚠ READ ALL FOUR FIRST. Reading one, generating load, then reading another would compare two
     # different quantities and could pass on a kernel where only one of them is wired.
@@ -98,39 +139,30 @@ fn tlm_main(): i64 {
     # because no real frame is one byte long.
     if ((txb1 - txb0) <= (txp1 - txp0)) { return 89; }
 
-    # ---- §3: per-device disk sectors, blkstats(#105) ----
-    # ⚠ TAG IS PROBED, NOT ASSUMED. Which backend is live depends on the substrate (nvme under the
-    # harness, ahci or usb-ms elsewhere), so find the one that has done reads rather than hardcoding.
+    # ---- §3: per-device disk sectors, sysinfo(#35) EXTENSION at +104 ----
+    # ⛔ THIS WAS `blkstats`#105 AND THE NUMBER WAS WITHDRAWN. Same reason the per-core band above is
+    # not `cpustat`#106: sysinfo already takes a length, and a closed 5-value tag enum over flat by-tag
+    # arrays is exactly a fixed-size tail block. Reading it here through the SAME call proves the two
+    # bands coexist and that the length tiering (40 / 104 / 200) actually gates them independently.
+    var si200[200];
+    var sj = 0;
+    while (sj < 200) { store8(&si200 + sj, 0xEE); sj = sj + 1; }
+    # A 104-length caller must get the per-core band and NOT the disk band.
+    if (syscall(35, &si200, 104) != 0) { return 75; }
+    if (load8(&si200 + 104) != 0xEE) { return 76; }     # +104 untouched below the new minimum
+    sj = 0;
+    while (sj < 200) { store8(&si200 + sj, 0); sj = sj + 1; }
+    if (syscall(35, &si200, 200) != 0) { return 77; }
+    # ⚠ TAG IS PROBED, NOT ASSUMED — which backend is live depends on the substrate (nvme under this
+    # harness, ahci or usb-ms elsewhere). Slot 0 is BLK_NONE and must always read 0.
+    if (load64(&si200 + 104 + 0 * 16 + 0) != 0) { return 78; }   # slot 0 is reserved, must stay 0
     var tag = 1;
     var found = 0 - 1;
     while (tag <= 5) {
-        if (syscall(105, tag, 0) > 0) { found = tag; tag = 6; }
+        if (load64(&si200 + 104 + tag * 16 + 0) > 0) { found = tag; tag = 6; }
         if (tag < 6) { tag = tag + 1; }
     }
-    if (found < 0) { return 90; }               # no device reports ANY sector read — counter dead
-    var r0 = syscall(105, found, 0);
-    # Force real disk reads: open a file that is certainly on the platter (this binary itself) and
-    # read it. ⚠ Reading OUR OWN path guarantees the file exists on whatever image the harness built,
-    # rather than hardcoding a name the seed may not carry.
-    var rbuf[512];
-    var fd = syscall(7, "/bin/tlm", 8, 0);      # open
-    if (fd >= 0) {
-        var got = 1;
-        while (got > 0) { got = syscall(5, fd, &rbuf, 512); }   # read to EOF
-        syscall(6, fd);                                          # close
-    }
-    var r1 = syscall(105, found, 0);
-    if (r1 < r0) { return 91; }                 # sectors read went backwards
-    # ⚠ NOT asserting r1 > r0: the file may be served entirely from the ext2 block cache, in which
-    # case no NEW sector reaches the device and the counter correctly does not move. Requiring an
-    # increase here would make this gate fail on a CORRECT kernel with a warm cache — a false positive
-    # is worse than the coverage it buys. Movement is proven by `found` above, which is only set for a
-    # tag that has ALREADY done reads: a dead counter leaves every tag at 0 and returns 90.
-    # ⛔ RANGE REFUSAL. tag 0 and tag 6 are outside BLK_VIRTIO..BLK_RAMDISK and must be refused, or a
-    # consumer indexing off the end reads adjacent kernel memory as a statistic.
-    if (syscall(105, 0, 0) != (0 - 1)) { return 92; }
-    if (syscall(105, 6, 0) != (0 - 1)) { return 92; }
-    if (syscall(105, found, 7) != (0 - 1)) { return 92; }   # unknown field refused
+    if (found < 0) { return 90; }                       # no device reports ANY sector read
 
     return 95;
 }

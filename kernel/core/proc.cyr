@@ -40,6 +40,27 @@ var proc_full_said = 0;
 # review's forcing-function safety net). kpti_*/syscall-stub stay global until sub-bite 4 (the
 # stub reads them via baked imm64 — they can't be arrays until it's regenerated).
 var pcpu_curproc[4];     # per-CPU current-proc pid, indexed by APIC id (slot 0 = single-core)
+
+# ── PER-CORE CPU ACCOUNTING (1.56.59, telemetry filing §8) ───────────────────────────────────────
+#
+# 100 Hz ticks split by the PRIVILEGE OF THE INTERRUPTED CONTEXT, per CPU. This is Linux's `%us` /
+# `%sy` split and is computed the same way: the timer ISR reads the CS its hardware frame saved and
+# tests the RPL. It is exact — no sampling heuristic, no scheduler cooperation.
+#
+# ⛔⛔ THERE IS DELIBERATELY NO `idle` COUNTER, AND THE ABSENCE IS THE HONEST ANSWER. agnos has no
+# single idle loop to instrument: `arch_wait()` (a bare `hlt`) is called from a dozen polling waits —
+# DHCP retry, `sleep_ms`#41, `kbd_read_blocking`, the NIC drain — so a CPU halted inside a blocking
+# syscall is indistinguishable at the tick boundary from a CPU doing real kernel work. Both are ring 0.
+# ⇒ A monitor gets user vs kernel, which is a real split; it does NOT get idle separated from system.
+# Inventing an idle number here (guessing from the saved RIP, or flagging one arch_wait site and not
+# the other eleven) would be a plausible-looking wrong number, and this cut already declined one of
+# those. The limit is stated in the ABI row rather than papered over.
+#
+# ⚠ NOT gated on `pcpu_cpu()==0`, unlike `timer_ticks`. That gate exists because the wall clock is one
+# global; this is PER-CORE by definition and every CPU must charge its own slot.
+# ⚠ 4 slots, matching `pcpu_curproc` and the CPU-CAP invariant `pcpu_cpu()` enforces.
+var cpu_user_ticks[4];   # ticks whose interrupted CS was ring 3
+var cpu_kern_ticks[4];   # ticks whose interrupted CS was ring 0 (kernel work OR a halted poll wait)
 fn proc_current_get() {
     if (cpu_count < 2) { return load64(&pcpu_curproc); }
     var c = tss_get_current_cpu_id();
