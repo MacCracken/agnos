@@ -1,7 +1,7 @@
 # 2026-09-02 — ring-3 telemetry gaps a system monitor needs
 
-**Status:** 🟠 **OPEN — 7 of 9 sections CLOSED at 1.56.59. §5 (per-process RSS) was ATTEMPTED and
-did not land; §7 was never ours.**
+**Status:** 🟠 **OPEN — 8 of 9 sections CLOSED at 1.56.59. Only §8 (per-core CPU utilisation)
+remains, and it is now a small step; §7 was never ours.**
 
 ✅ **§1 packet counters + §2 network byte counters** — `net_config`#61 gains fields **8-11**
 (tx_packets / rx_packets / tx_bytes / rx_bytes). ⭐ **Counted at `nic_send`/`nic_poll`
@@ -34,25 +34,34 @@ one-shots now go to the klug ring, not the console, so `shu -p` is clean.
 ⚠ **§7 load average** is settled repo policy, not a pending question: `agnos-userland-abi.md:239` rules
 load-avg out of the kernel by name. Your userland-tally plan is the intended path.
 
-⛔ **§5 per-process RSS — ATTEMPTED AT 1.56.59, NOT LANDED. The `+56` high u32 still reads 0.**
-Both plausible designs were built and both measured 0, and the measurements are the useful output —
-they refute this filing's own assumption that the number is simply "one it computes":
+✅ **§5 per-process RSS — LANDED.** `proclist`#99's `+56` **high u32**, in 4 KiB pages.
 
-1. **Incremental accounting cannot work at all.** Charging in `proc_map_page` / releasing in
-   `proc_unmap_page` fails because the ELF loaders call `proc_create_address_space()` and map every
-   segment into the new `cr3` **before** `proc_set_cr3(new_pid, new_cr3)` binds it to a slot
-   (`elf.cyr` — the mapping loop is ~250 lines above the bind). At charge time no slot owns that cr3,
-   so every charge is dropped. Measured: 0 for every process. The boot gate caught it first run.
-2. **Computing it from the page directory also returns 0, and NOT because of the user-bit test.**
-   Instrumented to count PRESENT entries only, ignoring privilege, the walk finds **zero present PDEs**
-   in the PD that `ptw_pd_kva(cr3)` returns for a live ring-3 process. `rpd` is non-zero and `rcr3` is
-   neither 0 nor the boot cr3, so it reaches *a* page directory — just not the one holding that
-   process's mappings.
+⭐ **It is COMPUTED, not accounted — which is what you predicted**: *"the kernel must already know each
+address space's extent to tear it down, so this may be recording a number it computes."* It walks the
+process's page directory and counts PDEs that are **present AND user**, 512 pages (2 MB) each.
 
-⇒ **The open question is a page-table-topology one**: where a process's 2 MB user PDEs actually live
-relative to `PML4[0] → PDPT[0] → PD` as walked from `proclist`'s context. `proc_rss_pages` is left
-in-tree, wired to nothing, carrying these measurements in its banner so they are not re-derived.
-Read the high half as "not tracked", exactly as you read the whole u64 before 1.56.59.
+⛔ **The incremental version was built first and cannot work** — recorded so nobody re-attempts it. The
+ELF loaders map every segment into the new `cr3` **before** `proc_set_cr3` binds it to a slot
+(`elf.cyr` — the mapping loop is ~250 lines above the bind), so no slot owns that cr3 at charge time
+and every charge is dropped.
+
+⭐ **The measured topology, since it is the part that took the work.** A probe build dumped the walk
+for every live slot:
+```
+pid=6 cr3=ffd7000 pml4e=ffd6027 pdpte=ffd5027 pd=ffd5000 present=129 user=3
+pid=5 cr3=ffda000 pml4e=ffd9027 pdpte=ffd8027 pd=ffd8000 present=130 user=4
+pid<=4 cr3=1000 (the BOOT address space)                  present=512 user=0
+```
+`PML4[0] → PDPT[0] → PD` is exactly right. `present` is ~129 because `proc_create_address_space` fills
+PD[0..7] kernel-identity and PD[8..63] identity-**supervisor** (flag `0x83`, no US bit). **Only the
+loader's `0x87`/`0x85` mappings carry US** — so the US test is the whole discriminator, and a walk
+without it reports ~258 MB of kernel window as every process's RSS. The gate asserts a ceiling that
+catches exactly that, mutation-proven.
+
+⚠ An earlier note in this file said §5 "was attempted and did not land, the walk finds zero present
+PDEs". **That was a stale-build measurement, not a real result** — the walk was correct the whole time.
+Corrected rather than deleted, because a wrong measurement recorded as fact is what this tracker keeps
+finding.
 
 ⚠ **§8 per-core CPU utilisation** now has its prerequisite: `proc_ticks` is per-slot and charged
 per-CPU, so idle/busy accounting is a smaller step than when you filed.

@@ -11,8 +11,7 @@
 # as a NEGATIVE delta and produces a nonsense rate — the exact defect that makes nvme_io_submit_count
 # unusable (bench.cyr zeroes it). "Never decreases" is a different claim from "increases".
 #
-# Exit 95 iff every counter is live and monotonic; 80-92 pinpoint which one is not.
-# (§5 RSS carried 93-97 in a draft; it did not land, so those codes are unreachable and are gone.)
+# Exit 95 iff every counter is live and monotonic; 80-97 pinpoint which one is not.
 
 fn tlm_main(): i64 {
     # ---- §4: per-process CPU time, surfaced in proclist(#99) record +56 low u32 ----
@@ -45,7 +44,30 @@ fn tlm_main(): i64 {
     if (t1 < t0) { return 83; }                 # went BACKWARDS — reset somewhere, unusable as a rate
     if (t1 == t0) { return 84; }                # never moved — the counter is declared but dead
 
-    # ---- §5 per-process RSS is NOT asserted: it is not implemented. See the record. ----
+    # ---- §5: per-process RSS, proclist(#99) record +56 HIGH u32, in 4 KiB pages ----
+    # ⚠ SAMPLED FROM THE SAME RECORDS AS §4 — the high half of the slot whose low half was just proven
+    # live. Reading the whole u64 and shifting is what a real consumer does, so a kernel that wrote the
+    # two halves with separate stores and let them tear would be caught here.
+    var rs = 0 - 1;
+    i = 0;
+    while (i < n) {
+        if (load64(&buf + i * 64) == me) { rs = (load64(&buf + i * 64 + 56) >> 32) & 0xFFFFFFFF; }
+        i = i + 1;
+    }
+    if (rs < 0) { return 93; }
+    # ⛔ A RUNNING RING-3 PROCESS HAS RESIDENT MEMORY BY CONSTRUCTION — it is executing out of it. 0 is
+    # the answer a dead counter gives and the ONE value that cannot be true here, which is what makes
+    # this bite rather than decorate. Measured on a real boot: this process reports 3 user PDEs.
+    if (rs == 0) { return 94; }
+    # agnos maps user memory in 2 MB pages, so RSS moves in units of 512 x 4 KiB. A non-multiple means
+    # the accounting unit and the mapping granularity have drifted apart.
+    if ((rs % 512) != 0) { return 96; }
+    # ⛔ CEILING — THE ASSERTION THAT CATCHES THE WRONG WALK. `proc_create_address_space` fills PD[0..7]
+    # kernel-identity and PD[8..63] identity-SUPERVISOR, so a walk that dropped the US test would count
+    # ~129 entries and report ~258 MB for this ~22 KB binary. 32768 pages = 128 MB is comfortably above
+    # a real process and far below that failure.
+    if (rs > 32768) { return 97; }
+
 
     # ---- §1 + §2: network packet and byte counters, net_config(#61) fields 8-11 ----
     # ⚠ READ ALL FOUR FIRST. Reading one, generating load, then reading another would compare two

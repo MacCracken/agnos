@@ -138,8 +138,10 @@ try:
         90: "§3 no block device reports ANY sector read — the disk counters are dead",
         91: "§3 sectors-read went BACKWARDS",
         92: "§3 an out-of-range tag or unknown field was ACCEPTED instead of refused",
-        94: "§5 per-process RSS is 0 for a RUNNING process — the counter is declared but dead",
-        97: "§5 RSS is implausibly large — the charge is firing on re-maps too (double-count)",
+        93: "§5 our pid vanished before the RSS sample",
+        94: "§5 per-process RSS is 0 for a RUNNING process — the counter is dead",
+        96: "§5 RSS is not a multiple of 512 pages — unit and 2 MB mapping granularity disagree",
+        97: "§5 RSS implausibly large — the US-bit test is missing, so kernel-identity PDEs are counted",
     }
     faulted = "fault: pid=" in out
     p("kernel/userland fault:", faulted)

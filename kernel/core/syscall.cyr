@@ -10360,12 +10360,15 @@ fn ksyscall(num, arg1, arg2, arg3) {
                     # reachable here — the clamps are for the shape of the guarantee, not the range.)
                     var pl_tk = load64(&proc_ticks + pl_i * 8);
                     if (pl_tk > 4294967295) { pl_tk = 4294967295; }
-                    # ⛔ THE HIGH HALF (rss, §5) IS STILL 0 — ATTEMPTED AT 1.56.59 AND NOT LANDED.
-                    # `proc_rss_pages` (core/proc.cyr) exists and is wired to nothing on purpose: see
-                    # its banner for what was measured. Writing an unproven number here would be worse
-                    # than 0, because a monitor renders whatever it is handed and nobody re-checks a
-                    # number that draws. Read the high half as "not tracked".
-                    store64(pl_rec + 56, pl_tk);
+                    # BOTH HALVES LIVE AS OF 1.56.59: low u32 = cpu ticks (§4), high u32 = resident
+                    # 4 KiB pages (§5). ONE store64 so the halves cannot tear against a consumer
+                    # reading the slot as a u64 — which is what a consumer written against the
+                    # pre-split wording does.
+                    # ⚠ BOTH CLAMPED, NOT MASKED. Past 2^32 a mask WRAPS, and a monitor differencing
+                    # across a wrap computes a NEGATIVE delta. Saturating is wrong-but-monotonic.
+                    var pl_rs = proc_rss_pages(pl_i);
+                    if (pl_rs > 4294967295) { pl_rs = 4294967295; }
+                    store64(pl_rec + 56, (pl_rs << 32) | pl_tk);
                     # name: copy 32 bytes, NUL-padding the tail so ring 3 never reads
                     # a stale byte from a previous occupant of this slot.
                     var pl_src = proc_name_ptr(pl_pid);

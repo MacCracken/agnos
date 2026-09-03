@@ -135,19 +135,24 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
     a kernel-side byte count would be wrong the moment a 4Kn device appears.
   - ⛔ **No `blk_registered` gate**: an unregistered device legitimately reports 0, and refusing it
     would collapse "has done no I/O" and "does not exist" into one answer.
-- ⛔ **§5 per-process RSS — ATTEMPTED AND NOT LANDED. The `+56` high u32 still reads 0.** Both
-  plausible designs were built and both measured 0. The measurements are the deliverable, because they
-  refute the filing's own assumption that this is "recording a number it computes":
-  * **Incremental accounting cannot work.** The ELF loaders map every segment into the new `cr3`
-    **before** `proc_set_cr3` binds it to a slot (`elf.cyr` — the mapping loop is ~250 lines above the
-    bind), so no slot owns that cr3 at charge time and every charge is dropped.
-  * **The page-directory walk also returns 0, and not because of the user-bit test.** Instrumented to
-    count PRESENT entries only, ignoring privilege, it finds **zero present PDEs** in the PD that
-    `ptw_pd_kva(cr3)` returns for a live ring-3 process — while `rpd` is non-zero and `rcr3` is neither
-    0 nor the boot cr3. It reaches *a* page directory, just not the one holding the mappings.
-  ⇒ The open question is page-table topology, not accounting. `proc_rss_pages` is left in-tree wired to
-  nothing, carrying both measurements in its banner. ⚠ Shipping a zero-returning RSS would have been
-  worse than `n/a`: a monitor renders whatever it is handed, and nobody re-checks a number that draws.
+- **§5 per-process RSS — LANDED.** `proclist`#99's `+56` **high u32**, in 4 KiB pages.
+  - ⭐ **COMPUTED, not accounted** — exactly what the filing predicted (*"recording a number it
+    computes"*). Walks the process's page directory counting PDEs that are **present AND user**,
+    512 pages (2 MB) each.
+  - ⛔ **The incremental version was built first and cannot work.** The ELF loaders map every segment
+    into the new `cr3` **before** `proc_set_cr3` binds it to a slot (`elf.cyr` — the mapping loop is
+    ~250 lines above the bind), so no slot owns that cr3 at charge time and every charge is dropped.
+  - ⭐ **The measured topology, because finding it was the work.** A probe build dumped the walk per
+    live slot: `pid=6 cr3=ffd7000 pml4e=ffd6027 pdpte=ffd5027 pd=ffd5000 present=129 user=3`.
+    `PML4[0] → PDPT[0] → PD` is right; `present` is ~129 because `proc_create_address_space` fills
+    PD[0..7] kernel-identity and PD[8..63] identity-**supervisor** (`0x83`, no US bit). **Only the
+    loader's `0x87`/`0x85` carry US**, so the US test is the entire discriminator — a walk without it
+    reports ~258 MB of kernel window as every process's RSS. The gate's ceiling catches exactly that,
+    mutation-proven.
+  - ⚠ **An intermediate report in this cut said §5 "did not land — the walk finds zero present PDEs".
+    That was a stale-build measurement, not a result.** The walk was correct throughout. Recorded
+    rather than quietly dropped: a wrong measurement written down as fact is the failure this tree
+    keeps finding, and it is no better when it is mine.
 - **Boot-proven** — `scripts/harness/telemetry-test.py` + `tests/telemetry/tlm.cyr`, exit **95**.
   ⛔ **The oracle is "the counter MOVED", not "the counter is readable."** Every one of these would
   read 0 on a kernel that declared the variable and never incremented it, and 0 is a plausible-looking
