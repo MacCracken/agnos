@@ -1,7 +1,7 @@
 # 2026-09-02 — ring-3 telemetry gaps a system monitor needs
 
-**Status:** 🟠 **OPEN — 7 of 9 sections CLOSED at 1.56.59. Only §5 (per-process RSS) is genuine
-outstanding work; §7 was never ours.**
+**Status:** 🟠 **OPEN — 7 of 9 sections CLOSED at 1.56.59. §5 (per-process RSS) was ATTEMPTED and
+did not land; §7 was never ours.**
 
 ✅ **§1 packet counters + §2 network byte counters** — `net_config`#61 gains fields **8-11**
 (tx_packets / rx_packets / tx_bytes / rx_bytes). ⭐ **Counted at `nic_send`/`nic_poll`
@@ -34,12 +34,25 @@ one-shots now go to the klug ring, not the console, so `shu -p` is clean.
 ⚠ **§7 load average** is settled repo policy, not a pending question: `agnos-userland-abi.md:239` rules
 load-avg out of the kernel by name. Your userland-tally plan is the intended path.
 
-⛔ **§5 per-process RSS — GENUINELY NOT DONE, and the reason is a design call, not effort.** The `+56`
-**high u32** is reserved for it and reads 0. `proc_map_page` and its `_rx`/`_nx` siblings take a
-**`cr3`, not a pid**, so per-process page accounting needs either a cr3→slot lookup or the pid plumbed
-through four mapping functions. A hastily-derived RSS that looked plausible would be worse than `n/a`,
-because a monitor renders it either way and nobody re-checks a number that draws. Read the high half
-as "not tracked", exactly as you read the whole u64 before 1.56.59.
+⛔ **§5 per-process RSS — ATTEMPTED AT 1.56.59, NOT LANDED. The `+56` high u32 still reads 0.**
+Both plausible designs were built and both measured 0, and the measurements are the useful output —
+they refute this filing's own assumption that the number is simply "one it computes":
+
+1. **Incremental accounting cannot work at all.** Charging in `proc_map_page` / releasing in
+   `proc_unmap_page` fails because the ELF loaders call `proc_create_address_space()` and map every
+   segment into the new `cr3` **before** `proc_set_cr3(new_pid, new_cr3)` binds it to a slot
+   (`elf.cyr` — the mapping loop is ~250 lines above the bind). At charge time no slot owns that cr3,
+   so every charge is dropped. Measured: 0 for every process. The boot gate caught it first run.
+2. **Computing it from the page directory also returns 0, and NOT because of the user-bit test.**
+   Instrumented to count PRESENT entries only, ignoring privilege, the walk finds **zero present PDEs**
+   in the PD that `ptw_pd_kva(cr3)` returns for a live ring-3 process. `rpd` is non-zero and `rcr3` is
+   neither 0 nor the boot cr3, so it reaches *a* page directory — just not the one holding that
+   process's mappings.
+
+⇒ **The open question is a page-table-topology one**: where a process's 2 MB user PDEs actually live
+relative to `PML4[0] → PDPT[0] → PD` as walked from `proclist`'s context. `proc_rss_pages` is left
+in-tree, wired to nothing, carrying these measurements in its banner so they are not re-derived.
+Read the high half as "not tracked", exactly as you read the whole u64 before 1.56.59.
 
 ⚠ **§8 per-core CPU utilisation** now has its prerequisite: `proc_ticks` is per-slot and charged
 per-CPU, so idle/busy accounting is a smaller step than when you filed.

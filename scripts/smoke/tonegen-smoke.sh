@@ -83,7 +83,18 @@ rc=0
 strings "$SLOG" | grep -q "tonegen: audio-path test" \
     && echo "  PASS: /bin/tonegen started (exec'd from disk in ring 3)" \
     || { echo "  FAIL: tonegen never started"; rc=1; }
-[ "$done_marker" -eq 1 ] && echo "  PASS: tonegen ran to completion" || echo "  WARN: 'tonegen returned' marker not seen (hard timeout ${HARD}s)"
+# ⚠ A GATE THIS FILE'S OWN HEADER NAMES, SCORED AS A WARN. Line 13 lists "tonegen started + returned"
+# among the gates; until 1.56.59 the `+ returned` half was one WARN with no rc, so "tonegen ran to
+# completion" and "tonegen never came back" left the script in exactly the same state and both ended
+# at "tonegen-smoke: PASS", exit 0. The scenario is built by the loop directly above: `kill $QPID` at
+# line 77 fires the moment the HARD timeout expires whether or not tonegen finished, so a stream that
+# wedges mid-run yields a truncated wav and an unset done_marker — and nothing here objected.
+# MEASURED on the extracted-verdict rig, healthy 3 s 440 Hz capture with done_marker=0: the old form
+# printed "WARN: 'tonegen returned' marker not seen (hard timeout 75s)" and then "tonegen-smoke: PASS
+# — clean tones stream through the agnos snd_* band", exit 0. A truncated capture that happens to hold
+# 1.8 s of clean tone clears every remaining gate, so this WARN was the only thing that knew.
+[ "$done_marker" -eq 1 ] && echo "  PASS: tonegen ran to completion" \
+    || { echo "  FAIL: 'tonegen returned' marker never appeared (hard timeout ${HARD}s) — the run was cut off, so any wav below is a fragment of the stream, not the stream"; rc=1; }
 
 if [ ! -s "$WAV" ]; then
     echo "  FAIL: no wav captured at $WAV"; rc=1
@@ -146,7 +157,30 @@ PY
     FR="$(echo "$RES" | sed -n 's/.*frames=\([0-9]*\).*/\1/p')"
     WN="$(echo "$RES" | sed -n 's/.*want=\([0-9]*\).*/\1/p')"
     [ "${PK:-0}" -gt 3000 ] && echo "  PASS: non-silent (peak=$PK)" || { echo "  FAIL: silent (peak=$PK)"; rc=1; }
-    if [ "${FQ:-0}" -ge 400 ] && [ "${FQ:-0}" -le 480 ]; then echo "  PASS: first tone ~440 Hz (measured $FQ) — pitch correct"; else echo "  WARN: first tone freq=$FQ (expected ~440)"; fi
+    # ⚠ THE SECOND WARN-AS-A-GATE, AND THE ONE THAT LET A CAPTURE WITH NO WAVEFORM IN IT SCORE GREEN.
+    # Line 14 names "the first sustained tone reads ~440 Hz (pitch correct)" as a gate; through 1.56.58
+    # its else branch was a WARN that never touched rc, so pitch was unfalsifiable — the only sense in
+    # which this smoke checked the pitch was that it printed a number a human might read.
+    # ⛔ The concrete scenario is not a slightly-flat tone, it is NO TONE AT ALL. `freq` is counted from
+    # zero-up-crossings of the AC-coupled slice, so a DAC latched at a constant level — the classic
+    # stuck-ring symptom this smoke exists to catch — measures freq=0 while clearing every other gate:
+    # peak is loud, the envelope is flat so the tone "locates" at sample 0, and 180/180 windows read
+    # "continuous". MEASURED on the extracted-verdict rig against a synthesised 3 s DC rail at 12000:
+    # "PASS: non-silent (peak=12000)" · "WARN: first tone freq=0 (expected ~440)" · "PASS: no silence
+    # gap ... (continuous across 180/180 10ms windows)" · "tonegen-smoke: PASS", exit 0. A 1000 Hz
+    # capture — right path, wrong rate, i.e. a sample-rate regression — scored green the same way.
+    # ⭐ WHY IT IS SAFE TO SCORE IT NOW, when it was examined and left a WARN at 1.56.58 (the sweep's
+    # one declined finding — docs/development/issues/2026-09-02-vacuous-gates-sweep.md:15): all a WARN
+    # can buy is protection from a false red on an untrustworthy measurement, and the floor added at
+    # the bottom of this block in that SAME cut already refuses the verdict when the tone was not
+    # located or fewer than $WN windows were read — which is every case in which this number is not
+    # worth reading. On a truncated capture the two now fail together and say so in two lines; that is
+    # one root cause reported twice, not a spurious red.
+    if [ "${FQ:-0}" -ge 400 ] && [ "${FQ:-0}" -le 480 ]; then
+        echo "  PASS: first tone ~440 Hz (measured $FQ) — pitch correct"
+    else
+        echo "  FAIL: first tone freq=${FQ:-?} Hz, expected ~440 (located=${FD:-?}) — a measured 0 means no oscillation was counted at all in the located region (a latched DAC), anything else means the rate is wrong"; rc=1
+    fi
     # ⚠ THE MISSING rc, AND THE VACUITY FLOOR UNDER IT. Until 1.56.58 the dropout gate was one line:
     #     [ "${GP:-1}" -eq 0 ] && echo "  PASS: no silence gap ..." || echo "  FAIL: silence gap ..."
     # The else branch printed the word FAIL and never touched rc, so a run that had just reported a
@@ -160,12 +194,14 @@ PY
     # the located tone, and when there are none the loop never runs, gap stays 0, and "no silence gap
     # within the sustained tone" prints having examined NOTHING. That is not hypothetical — the
     # `kill $QPID` at line 77 fires the moment the HARD timeout expires whether or not tonegen
-    # finished, and the `done_marker` check at line 86 only WARNs about the missing marker, so a
+    # finished, and through 1.56.58 the `done_marker` check above only WARNed about the missing
+    # marker (it FAILs as of 1.56.59, so the same stall is now caught twice — which is right: one
+    # gate says the run was cut off, this one says what the fragment contains), so a
     # boot that stalls mid-stream leaves a wav holding a fraction of a second of tone and this gate
     # was the only thing that would have noticed. Measured against the OLD form: a 0.5 s capture scored
     # "PASS ... (continuous)" off 49 windows, a 10 ms capture scored it off ZERO, and 100 bytes of
-    # non-audio junk scored the whole smoke green — peak clears 3000 on garbage, the pitch check is
-    # WARN-only, and nothing else was left to object.
+    # non-audio junk scored the whole smoke green — peak clears 3000 on garbage, the pitch check was
+    # still WARN-only at that cut (it scores as of 1.56.59), and nothing else was left to object.
     # start=0 was hiding the same hole from the other end: it means "tone begins at sample 0" and
     # "no sustained tone found" indistinguishably, so an all-silent capture measured the first 1.8 s
     # of silence against a threshold of 5% of near-zero, matched nothing, and reported continuity.

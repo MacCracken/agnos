@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "agnos ring-3 exerciser for mountlist (#104, 1.56.59) — proves the kernel's mount table reaches ring 3 intact, that the record is NUL-padded, that the max budget is respected, and that the wrap-safe validator refuses a hostile count; exits 95 iff the whole contract holds."
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.5.43"
+cyrius = "6.5.44"
 
 [build]
 src = "mlist.cyr"

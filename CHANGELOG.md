@@ -60,6 +60,42 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   both shipped in exactly that state. The gate is designed to be red between minting and the peer
   landing. Do not "fix" a future one by editing cyrius, and do not weaken the gate.
 
+### Fixed — 38 more vacuous gates: the three surfaces the 1.56.58 sweep never reached
+
+- `.github/workflows/` **18** · `scripts/burn/` **12** · host GPU oracles **3** · the three named
+  residuals **5**. With 1.56.58's 39, that is **77** across the two cuts, and every filed finding in
+  [`2026-09-02-vacuous-gates-sweep.md`](docs/development/issues/2026-09-02-vacuous-gates-sweep.md)
+  is now resolved.
+- ⛔ **`release.yml` would have SHIPPED on a failed changelog parse.** A header drifting from
+  `## [1.56.59] —` to `## 1.56.59 —` produced a release body reading *"No changelog entry for this
+  release."* and exited 0. Worse: the awk pattern interpolated the tag as a **regex**, so a changelog
+  holding only `## [1x56x59]` satisfied the extractor for tag `1.56.59` — it would have published
+  **another version's notes** as this one's.
+- ⛔ **A SKIPPED `boot-test` satisfied `needs: [ci]`.** GitHub counts a skipped job as success for a
+  called workflow — the same structure `ci.yml:283-291` already records as having once shipped every
+  release with zero boot verification, where only the ref condition was repaired. A new `ci-gate` job
+  requires boot-test to have actually RUN on a push.
+- ⛔ **`burn-verify.sh` said "Safe to flash" with `kernel/` absent**, and printed an empty `ARM:` line
+  from a blank stamp. It is the last gate before writing the operator's only machine.
+- ⛔ **`ci.yml`'s format check exempted files by SUBSTRING**: a file named `ll.cyr` was silently
+  skipped because that string occurs inside `kernel/user/shell.cyr`. Measured — the same file renamed
+  `zz.cyr` was caught.
+- ✅ The 1.56.58 **declined** finding is fixed: tonegen's reason to decline had expired, since the
+  1.56.58 floor already refuses the verdict unless a sustained tone was located. And both
+  "moved the vacuity up a level" items are closed — `agnsh-kvm-test.py` GATE 2 scored serial growth
+  that the kernel log itself satisfies with **zero keystrokes delivered** (reproduced against a stub
+  guest), and now uses the sibling's ANSWERS oracle.
+- ⚠ **A CEILING THE SWEEP ADDED WAS REVERTED IN REVIEW.** The workflows fix imported check.sh gate 32's
+  **2 MiB size ceiling** into CI beside the 50000 floor. Only the floor is an anti-vacuity assertion;
+  the ceiling is a BUDGET, had never been a CI gate, and the binary sits **4% under it** — so it would
+  have turned every push red AND blocked releases on the next shader blob, with no local warning, and
+  the fix would have been to edit the number. **A floor that asserts more than "something was
+  enumerated" is scope creep wearing a floor's clothes.**
+- ⛔ **Two residual limits, stated because they are not closable here:** `ci-gate`'s logic is proven
+  over a 9-row `needs.*.result` matrix including the load-bearing skipped row, but GitHub actually
+  setting that result was never executed (no runner, no `act`); and tonegen's 400-480 Hz band was
+  never sampled against real captures, so its WARN→FAIL promotion bets on an unmeasured tolerance.
+
 ### Added — the telemetry counters a system monitor is built from (chakshu §1/§2/§3/§4)
 
 - **§4 per-process CPU time — the section the filing calls "the one that changes what a system monitor
@@ -99,11 +135,19 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
     a kernel-side byte count would be wrong the moment a 4Kn device appears.
   - ⛔ **No `blk_registered` gate**: an unregistered device legitimately reports 0, and refusing it
     would collapse "has done no I/O" and "does not exist" into one answer.
-- ⛔ **§5 per-process RSS is NOT done, and is recorded as a decision rather than left looking closed.**
-  The `+56` high u32 reads 0. `proc_map_page` and its siblings take a **`cr3`, not a pid**, so
-  per-process page accounting needs a cr3→slot lookup or the pid plumbed through four functions — a
-  design call. A hastily-derived RSS that *looked* plausible would be worse than `n/a`, because a
-  monitor renders it either way and nobody re-checks a number that draws.
+- ⛔ **§5 per-process RSS — ATTEMPTED AND NOT LANDED. The `+56` high u32 still reads 0.** Both
+  plausible designs were built and both measured 0. The measurements are the deliverable, because they
+  refute the filing's own assumption that this is "recording a number it computes":
+  * **Incremental accounting cannot work.** The ELF loaders map every segment into the new `cr3`
+    **before** `proc_set_cr3` binds it to a slot (`elf.cyr` — the mapping loop is ~250 lines above the
+    bind), so no slot owns that cr3 at charge time and every charge is dropped.
+  * **The page-directory walk also returns 0, and not because of the user-bit test.** Instrumented to
+    count PRESENT entries only, ignoring privilege, it finds **zero present PDEs** in the PD that
+    `ptw_pd_kva(cr3)` returns for a live ring-3 process — while `rpd` is non-zero and `rcr3` is neither
+    0 nor the boot cr3. It reaches *a* page directory, just not the one holding the mappings.
+  ⇒ The open question is page-table topology, not accounting. `proc_rss_pages` is left in-tree wired to
+  nothing, carrying both measurements in its banner. ⚠ Shipping a zero-returning RSS would have been
+  worse than `n/a`: a monitor renders whatever it is handed, and nobody re-checks a number that draws.
 - **Boot-proven** — `scripts/harness/telemetry-test.py` + `tests/telemetry/tlm.cyr`, exit **95**.
   ⛔ **The oracle is "the counter MOVED", not "the counter is readable."** Every one of these would
   read 0 on a kernel that declared the variable and never incremented it, and 0 is a plausible-looking
@@ -183,7 +227,15 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   while both arms sat 20 lines beneath it. chakshu reports this nearly made it file a phantom gap —
   the cost of a stale comment stated exactly: not confusion, but work done twice in two repos.
 
-### Changed — cyrius pin 6.5.41 -> 6.5.43
+### Changed — cyrius pin 6.5.41 -> 6.5.44, and the cross-repo loop closed TWICE inside one cut
+
+- All **12** manifests plus sibling **klug** (37/37). ⭐ **Both peers filed here landed upstream the
+  same day**: `#104 mountlist` in 6.5.43, then `#105 blkstats` **and** the stale `#61` field-range
+  comment (`counter (4..7)` → `4..11`) in 6.5.44. `syscall ABI` reads
+  `kernel 106 · abi-doc 106 · cyrius 106` — **32/0**.
+- ⚠ It was **31/1 twice** during the cut and both reds were correct: the gate is designed to read
+  `kernel N · abi-doc N · cyrius N-1` between minting and the peer landing. ⛔ Do not "fix" a future
+  one by editing cyrius; file the issue in `cyrius/docs/development/issues/` and let it land.
 
 - All **11** manifests (the root, nine `tests/*`, and the new `tests/mountlist`), plus sibling **klug**.
   `toolchain-pin-check.sh` 11/11. klug rebuilt and 37/37.

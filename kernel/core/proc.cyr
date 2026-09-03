@@ -76,6 +76,7 @@ var sched_active = 0;
 # reap and hand it a live process with 0 ticks — indistinguishable from a process that just started.
 var proc_ticks[16];     # per-slot 100 Hz tick count — the process's accumulated CPU time
 
+
 var proc_signals[128];  # 16 processes x 8 bytes
 var proc_sigmask[128];  # 16 processes x 8 bytes
 # 1.44.3 (multi-threading): per-process saved CS/SS selectors so the scheduler can
@@ -1369,6 +1370,86 @@ fn invlpg_va(va) {
         0x0F; 0x01; 0x38;         # invlpg [rax]
     }
     return 0;
+}
+
+# Which process slot owns this address space? -1 if none. (1.56.59, telemetry §5.)
+#
+# ⛔ THE BOOT/KERNEL CR3 IS REFUSED OUTRIGHT, and that guard is load-bearing rather than defensive:
+# `proc_create_full` and friends store 0x1000 as the DEFAULT cr3 (this file, three sites), so several
+# slots carry it at once and a lookup would match whichever came first — attributing kernel mappings
+# to an arbitrary process. Mappings into the boot address space are not any process's RSS.
+# ⚠ Live slots only (`state != 0`): a dead slot's stale cr3 must not capture a live mapping.
+fn proc_slot_of_cr3(cr3) {
+    if (cr3 == 0x1000) { return 0 - 1; }
+    if (cr3 == 0) { return 0 - 1; }
+    var si = 0;
+    while (si < 16) {
+        if (load64(&proc_table + si * 176 + 8) != 0) {
+            if (load64(&proc_table + si * 176 + 160) == cr3) { return si; }
+        }
+        si = si + 1;
+    }
+    return 0 - 1;
+}
+
+# Resident size of a process, in 4 KiB pages — COMPUTED FROM THE PAGE DIRECTORY, not accounted.
+#
+# ⭐⭐ THE FILING CALLED THIS EXACTLY RIGHT: "the kernel must already know each address space's extent
+# to tear it down, so this may be recording a number it COMPUTES rather than new accounting."
+# It is. The PD already holds the answer; walking it is the whole implementation.
+#
+# ⛔⛔ THE INCREMENTAL VERSION WAS WRITTEN FIRST AND WAS WRONG — recorded because the failure is not
+# obvious and the next person will reach for counters too. Charging at `proc_map_page` cannot work:
+# the ELF loaders call `proc_create_address_space()` and map every segment into the new cr3 BEFORE
+# `proc_set_cr3(new_pid, new_cr3)` binds it to a slot (elf.cyr — the mapping loop sits ~250 lines
+# above the bind). So at charge time NO slot owns that cr3, every charge is dropped, and the counter
+# reads 0 for every process. The boot gate caught it on the first run.
+# ⇒ Computing sidesteps the ordering entirely, and along with it the double-count-on-remap problem,
+# the release-on-unmap bookkeeping, and the floor-at-zero guard the incremental form needed. Fewer
+# moving parts AND exact, which is the rare case where the simpler design is also the more correct one.
+#
+# ⛔⛔ ATTEMPTED AT 1.56.59 AND NOT LANDED. THIS FUNCTION IS WIRED TO NOTHING. It is kept, unused,
+# because what was MEASURED while trying is the expensive part and must not be re-derived:
+#
+#   · The incremental form (charge in proc_map_page, release in proc_unmap_page) cannot work at all.
+#     The ELF loaders call `proc_create_address_space()` and map every segment into the new cr3
+#     BEFORE `proc_set_cr3(new_pid, new_cr3)` binds it to a slot (elf.cyr — the mapping loop sits
+#     ~250 lines above the bind), so at charge time NO slot owns that cr3 and every charge is dropped.
+#     Measured: RSS 0 for every process.
+#   · This computing form ALSO returns 0, and the reason is NOT the US-bit test. Instrumented to count
+#     PRESENT entries only, ignoring privilege, it still finds **ZERO present PDEs** in the PD that
+#     `ptw_pd_kva(cr3)` returns for a live ring-3 process (measured on a boot, via the telemetry gate's
+#     exit code). `rpd` is non-zero and `rcr3` is neither 0 nor the boot cr3, so the walk reaches *a*
+#     page directory — just not the one holding that process's mappings.
+#
+# ⇒ THE OPEN QUESTION IS WHERE A PROCESS'S 2 MB USER PDEs ACTUALLY LIVE relative to
+# PML4[0] -> PDPT[0] -> PD as walked from `proclist`'s context. That is a page-table-topology question,
+# not an accounting one, and the filing's assumption that this is "recording a number it computes" is
+# the thing being refuted. Whoever takes it should start from that measurement, not from this code.
+#
+# ⚠ COST, IF IT EVER WORKS: one 511-entry walk per process per call. `proclist`#99 is a monitor's ~1 Hz
+# sample over <=16 slots, so ~8 K loads/sec worst case — far below anything this kernel notices.
+# ⚠ ENTRY 511 IS SKIPPED: it is the KPTI user-PML4 stash (`proc_map_page` reads it as `u_cr3`), not a
+# user mapping. Counting it would add a phantom 2 MB to every process.
+# ⚠ PRESENT **AND** USER (bits 0 and 2). The PD also carries kernel identity/direct-map entries that
+# are present-supervisor; those are not the process's resident set.
+fn proc_rss_pages(pid) {
+    if (pid < 0) { return 0; }
+    if (pid >= 16) { return 0; }
+    if (load64(&proc_table + pid * 176 + 8) == 0) { return 0; }   # dead slot
+    var rcr3 = load64(&proc_table + pid * 176 + 160);
+    if (rcr3 == 0)      { return 0; }
+    if (rcr3 == 0x1000) { return 0; }        # boot/kernel address space is nobody's RSS
+    var rpd = ptw_pd_kva(rcr3);
+    if (rpd == 0) { return 0; }
+    var rn = 0;
+    var rk = 0;
+    while (rk < 511) {
+        var re = load64(rpd + rk * 8);
+        if ((re & 0x1) != 0) { if ((re & 0x04) != 0) { rn = rn + 512; } }   # 2 MB == 512 x 4 KiB
+        rk = rk + 1;
+    }
+    return rn;
 }
 
 fn proc_map_page(cr3, virt, phys) {

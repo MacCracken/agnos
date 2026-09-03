@@ -27,10 +27,30 @@
 # So both counters this probe already computes are now ASSERTED rather than merely printed:
 #   · exception records scanned — the enumeration the smash test runs over. Zero means the parse
 #     read nothing, not that the kernel faulted nothing. A real boot emits thousands.
-#   · boots that reached the `[ASSIST] >` prompt — line 42 has computed this since the probe was
-#     written and nothing ever tested it. The smash is a SYSCALL-path fault taken by ring-3 code;
-#     a boot that never reached the shell never issued the mmap, so "no smash" over such boots is
-#     a statement about a syscall that was never made.
+#   · boots that reached the `[ASSIST] >` prompt — the `strings | grep '[ASSIST] >'` in the boot
+#     loop has computed this since the probe was written and nothing ever tested it. The smash is
+#     a SYSCALL-path fault taken by ring-3 code; a boot that never reached the shell never issued
+#     the mmap, so "no smash" over such boots is a statement about a syscall that was never made.
+#
+# ⛔⛔ AND THE 1.56.58 FLOORS ABOVE MOVED THE VACUITY UP A LEVEL RATHER THAN CLOSING IT — twice, and
+# both halves are fixed at 1.56.59.
+#   (1) THE FLOORS ARE AGGREGATES, THE CLAIM IS ABOUT A BOOT. `ev_total > 0` and `reached > 0` are
+#       run-wide sums, so ONE boot can satisfy the records floor and a DIFFERENT boot the prompt
+#       floor while NO SINGLE BOOT ever ran ring-3 code under a log this probe could read — which is
+#       the entire measurement, since the smash is a ring-3 fault recorded in the -d int stream.
+#       MEASURED on the stub-QEMU rig, two boots, the first leaving a full 40-record log but dying
+#       before the shell and the second reaching the prompt with no log at all: both floors held and
+#       the old form printed "RESULT: NO RBP smash across 2 boots (1 reached the prompt, 40 records
+#       scanned)", exit 0, over zero boots that measured anything. Not a contrived pairing either —
+#       it is the ordinary shape of a flaky-OVMF run mixed with a QEMU that drops the -D file.
+#   (2) THE DENOMINATOR WAS THE REQUESTED BOOT COUNT. `$boots` is `N` — how many boots were ASKED
+#       for — so the headline said "across 50 boots" no matter how few produced evidence. Measured:
+#       4 boots of which 3 were blind printed "NO RBP smash across 4 boots (1 reached the prompt)".
+#       The reader is told the size of the request and has to work out the size of the evidence.
+#   ⇒ `evidenced` is the per-boot conjunction — this boot reached the prompt AND left a log with
+#     'v=' records in it. It is floored (a run with zero is INCONCLUSIVE, not clean) and it is the
+#     denominator the verdict is stated over. `blind`, computed since 1.56.58 and until now only
+#     printed, is what keeps a boot OUT of it, so the counter is finally load-bearing.
 # ⭐ THE FLOORS GATE ONLY THE AFFIRMATIVE VERDICT. A detected smash is self-evidencing — you found
 # the thing — so `smash > 0` still reports STILL PRESENT without consulting them. The floors exist
 # to stop the OTHER branch, which is the one that can be true by accident.
@@ -52,7 +72,7 @@ OVMF_CODE="${OVMF_CODE:-/usr/share/edk2/x64/OVMF_CODE.4m.fd}"
 OVMF_VARS_SRC="${OVMF_VARS_SRC:-/usr/share/edk2/x64/OVMF_VARS.4m.fd}"
 [ -f "$IMG" ] || { echo "ERROR: image $IMG not built — run agnsh-smoke.sh first"; exit 1; }
 
-smash=0; reached=0; pf_total=0; boots=0; ev_total=0; blind=0
+smash=0; reached=0; pf_total=0; boots=0; ev_total=0; blind=0; evidenced=0
 LOGD="$WORK/rbp-repro"; rm -rf "$LOGD"; mkdir -p "$LOGD"
 i=1
 while [ "$i" -le "$N" ]; do
@@ -68,7 +88,10 @@ while [ "$i" -le "$N" ]; do
         -serial stdio -display none -no-reboot \
         -d int -D "$INT" >"$SER" 2>/dev/null
 
-    if strings "$SER" | grep -q '\[ASSIST\] >'; then reached=$((reached+1)); fi
+    # ⚠ Remembered PER BOOT as well as summed, because the sum alone cannot say whether the boot that
+    # reached userland is the same boot whose log this probe could read. See (1) in the header.
+    this_reached=0
+    if strings "$SER" | grep -q '\[ASSIST\] >'; then reached=$((reached+1)); this_reached=1; fi
 
     # ⚠ BLIND-BOOT GUARD, BEFORE THE AWK RUNS. An absent or zero-byte `-d int` log is not "a boot
     # that took no faults", it is a boot this probe could not read — and the two are indistinguish-
@@ -123,6 +146,9 @@ while [ "$i" -le "$N" ]; do
         blind=$((blind+1))
         echo "  [boot $i] BLIND: $INT holds no 'v=' event records — the smash scan ran over nothing"
     fi
+    # ⭐ THE ONLY BOOTS THIS PROBE MAY SPEND AS EVIDENCE: ones that got ring-3 code running AND left a
+    # log the scan could read. Either alone proves nothing about a ring-3 fault recorded in -d int.
+    if [ "$ev_n" -gt 0 ] && [ "$this_reached" -eq 1 ]; then evidenced=$((evidenced+1)); fi
     pf_total=$((pf_total + pf_n))
     if [ "$sm_n" -gt 0 ]; then
         smash=$((smash + sm_n))
@@ -136,6 +162,7 @@ echo ""
 echo "=== rbp-repro: $boots boots ==="
 echo "  reached [ASSIST] > prompt : $reached / $boots"
 echo "  boots with a readable log : $((boots - blind)) / $boots"
+echo "  boots that did BOTH       : $evidenced / $boots   <- the evidence this verdict may spend"
 echo "  exception records scanned : $ev_total"
 echo "  total ring-any #PF (v=0e) : $pf_total"
 echo "  RBP-SMASH faults (0x37fxx): $smash"
@@ -168,13 +195,29 @@ if [ "$reached" -eq 0 ]; then
     echo "     ~1 idle run in 4). Check $LOGD/ser-1.log for the kernel banner."
     vac=1
 fi
+# ⛔ THE FLOOR THE TWO ABOVE CANNOT MAKE BETWEEN THEM. They are run-wide sums: satisfy one from boot 7
+# and the other from boot 12 and they both hold while not one boot both ran ring-3 code and produced a
+# readable log. The smash is a ring-3 fault RECORDED IN THE -d int STREAM — it takes one boot holding
+# both halves at once to be able to see it, and `evidenced` is the count of those. Measured on the
+# stub rig (intonly,assistonly): ev_total=40, reached=1, evidenced=0, and the pre-1.56.59 form
+# announced "NO RBP smash across 2 boots" over a run in which nothing was observable.
+if [ "$evidenced" -eq 0 ]; then
+    echo "  ⛔ not one boot BOTH reached the [ASSIST] > prompt AND left a readable -d int log."
+    echo "     $reached boot(s) reached the prompt and $((boots - blind)) left a readable log, but no"
+    echo "     single boot did both, so no boot was in a position to record the fault being looked"
+    echo "     for. The two floors above are aggregates and are satisfied by different boots here."
+    vac=1
+fi
 if [ "$vac" -ne 0 ]; then
     echo "RESULT: INCONCLUSIVE — this run measured nothing about the RBP smash ($boots boots)"
     exit 2
 fi
 
-if [ "$reached" -lt "$boots" ]; then
-    echo "  note: the verdict below rests on the $reached boot(s) that reached userland, not all $boots."
+# ⚠ THE DENOMINATOR IS `evidenced`, NOT `$boots`. `$boots` is `N` — the number of boots REQUESTED —
+# and stating the verdict over it let 1 useful boot out of 50 read as "NO RBP smash across 50 boots".
+# What the reader needs is the size of the evidence, with the size of the request beside it.
+if [ "$evidenced" -lt "$boots" ]; then
+    echo "  note: the verdict below rests on the $evidenced boot(s) that both reached userland and left a readable log — not on all $boots attempted ($blind blind, $((reached - evidenced)) reached the prompt but were blind)."
 fi
-echo "RESULT: NO RBP smash across $boots boots ($reached reached the prompt, $ev_total records scanned)"
+echo "RESULT: NO RBP smash across $evidenced boot(s) that measured something (of $boots attempted; $reached reached the prompt, $blind blind, $ev_total records scanned)"
 exit 0

@@ -4,52 +4,54 @@ description: Tree-wide sweep of the vacuous-pass class, found while closing the 
 type: issue
 ---
 
-# Vacuous gates — 33 confirmed, 39 fixed at 1.56.58
+# Vacuous gates — 77 fixed across 1.56.58 and 1.56.59
 
-**Status: MOSTLY FIXED at 1.56.58. 39 fixed / 1 declined / surfaces still unswept — STAYS OPEN.**
-Filed 2026-09-02 at 1.56.57 with none acted on; swept the same day at 1.56.58, one agent per file,
-each fix mutation-proven against its own empty-input case and then adversarially re-verified.
+**Status: ✅ ALL FILED FINDINGS RESOLVED. Every named surface swept. STAYS OPEN only for the two
+residual limits below, both of which are "cannot be executed here", not "not done".**
 
-**Why it is not archived.** Three reasons, and none of them is bookkeeping:
+* **1.56.58** — 39 fixed / 1 declined across 30 files (`scripts/smoke`, `check.sh`, `check/`,
+  `harness/`, `probe/`, `tool/`, `ktest.sh`).
+* **1.56.59** — the three surfaces 1.56.58 never reached, plus the three residuals it left:
+  **38 more fixed**. `.github/workflows/` **18**, `scripts/burn/` **12**, host GPU oracles **3**,
+  the three named residuals **5**.
 
-1. **One finding was examined and DECLINED, not fixed** — `scripts/smoke/tonegen-smoke.sh` carried a
-   second vacuity beyond the assigned one; the assigned one is fixed, the second is recorded there.
-2. **The sweep surface was a floor, not a total.** It covered `scripts/smoke/*.sh`, `check.sh`,
-   `check/*.sh`, `harness/*.py`, `probe/*`, `tool/*` and `ktest.sh`. It did **NOT** cover
-   `.github/workflows/*.yml`, `scripts/burn/*`, or the `tests/*/` per-project harnesses. Closing this
-   file requires sweeping those.
-3. ⛔ **Two fixes moved the vacuity one level up rather than removing it — and this header named only
-   ONE of them until 1.56.59, which is itself the failure mode this folder exists to prevent.**
-   * `scripts/harness/agnsh-kvm-test.py` GATE 2 scores `if new.strip()` over serial growth — but the
-     kernel log writes the SAME COM1 asynchronously, so ordinary kernel chatter inside the ~5 s typing
-     window satisfies it with **zero keystrokes delivered**. A floor any unrelated producer can satisfy
-     is not a floor. ⚠ Do not read the in-file comment at `:99-104` as covering this: it records a
-     MEASURED reason to reject asserting the *echoed* text (two KVM runs echoed `elp` for `help`), which
-     is a different gate. The correct fix is the sibling's ANSWERS oracle (`agnsh-type-test.py:148-158`),
-     which rejects echo-counting too.
-   * `scripts/probe/rbp-repro.sh` — the second one, unnamed here until now. The 1.56.58 pass DID add
-     both vacuity floors (`:154-160`, `:161-166`) and a caveat line. What remains is a headline whose
-     denominator is the REQUESTED boot count while its floors are aggregates, and a `blind` counter
-     computed at `:79`/`:123` and printed at `:138` that is never asserted.
+✅ **All three reasons this file stayed open at 1.56.58 are closed.**
+1. The DECLINED tonegen finding — its reason had expired (the 1.56.58 floor already refuses the
+   verdict unless a sustained tone was located), so both WARNs are now hard failures.
+2. Both "moved the vacuity up a level" items — `agnsh-kvm-test.py` GATE 2 now uses the sibling's
+   ANSWERS oracle instead of scoring serial growth the kernel log itself satisfies; `rbp-repro.sh`'s
+   affirmative no longer uses the requested boot count as its denominator, and its `blind` counter is
+   asserted rather than merely printed.
+3. All three unswept surfaces are swept.
 
-⛔ **AND A FINDING ABOUT THIS FILE ITSELF.** Its 1.56.58 status header was rewritten to say "39 fixed"
-while the **273-line body below it is the unedited original text**, still describing all 33 findings as
-open and unfixed. A reader who trusts the header archives it; a reader who trusts the body re-does the
-work. Both are wrong. The body is left as the historical record of what was found — that is deliberate
-— but nothing in it should be read as current state. **Current state is this header only.**
+⚠ **The sharpest finds of the 1.56.59 pass, because they are the ones that could ship a bad artifact:**
+* **`release.yml` shipped on a failed changelog parse.** A header drifting from `## [1.56.59] —` to
+  `## 1.56.59 —` produced a release body reading *"No changelog entry for this release."* and exited 0.
+  Worse, the awk pattern interpolated the tag as a **regex** — a changelog holding only `## [1x56x59]`
+  satisfied the extractor for tag `1.56.59` and would have shipped **another version's notes**.
+* **A SKIPPED boot-test satisfied `needs: [ci]`.** GitHub counts a skipped job as success for a called
+  workflow, which is the structure `ci.yml` already records as having once shipped every release with
+  zero boot verification — only the ref condition had been repaired. A new `ci-gate` job closes it.
+* **`burn-verify.sh` said "Safe to flash" with `kernel/` absent**, and printed an empty `ARM:` line on
+  a blank stamp. It is the last gate before writing to the operator's only machine.
+* **`ci.yml`'s format check exempted files by SUBSTRING**: `ll.cyr` was silently skipped because the
+  name occurs inside `kernel/user/shell.cyr`.
 
-**What shipped alongside.** Six more vacuities were found *while proving* the assigned ones and fixed
-in the same pass — `modeset-latch-smoke.sh` had 4 of the same shape, `check-carveout.sh` 3,
-`chan-semantics-check.sh` 2 — which is why 33 findings produced 39 fixes.
+⛔ **TWO RESIDUAL LIMITS, both honest, neither closable on this host:**
+1. `ci-gate`'s decision logic is proven over a 9-row matrix of `needs.*.result` including the
+   load-bearing skipped-boot-test row, and the wiring is verified by inspection — but **GitHub actually
+   setting `needs['boot-test'].result`** was never executed: no runner, no `act`.
+2. `tonegen`'s 400-480 Hz band is unchanged and **its spread against real captures was never sampled**
+   (no QEMU permitted in the sweep). A synthesised 440 Hz measures exactly 440; the promotion from WARN
+   to FAIL bets on a tolerance nobody has measured.
 
-⚠ **A regression was introduced and then closed during this work, and it is worth recording because
-it is the same class.** `kprint-len-check.sh`'s new corpus floor was first written to apply to every
-invocation, which broke the documented single-file usage (`[file ...]`, line 13); exempting single-file
-mode then re-opened the hole from the other side, since a **missing** file enumerated 0 literals and
-scored PASS. A literal COUNT cannot discriminate there at all: `kernel/core/kprint.cyr` legitimately
-holds zero matching literals, because it is where the emitters are *defined*. The floor that works is
-**"did I read every file I was handed?"**, which is true of a healthy single file, a healthy tree, and
-nothing else.
+⚠ **A CEILING THE SWEEP ADDED WAS REVERTED IN REVIEW, and it is worth recording as the failure mode of
+this kind of work.** The workflows fix imported check.sh gate 32's **2 MiB size ceiling** into CI
+alongside the 50000 floor. Only the floor is an anti-vacuity assertion; the ceiling is a BUDGET, it had
+never been a CI gate, and the binary sits **4% under it**. Enforced from CI it would have turned every
+push red AND blocked releases on the next shader blob, with no local warning first — and the fix would
+have been to edit the number, which is the rubber-stamp pattern check.sh already names. **A floor that
+asserts more than "something was enumerated" is scope creep wearing a floor's clothes.**
 
 ## What this is
 

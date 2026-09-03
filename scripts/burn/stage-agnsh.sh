@@ -53,10 +53,30 @@ case "$DESC" in
     *) echo "ERROR: $SRC is not a static x86-64 ELF64 ($DESC)"; exit 1 ;;
 esac
 
-mkdir -p "$DEST_DIR"
-cp "$SRC" "$DEST"
-chmod +x "$DEST"
+mkdir -p "$DEST_DIR" || { echo "ERROR: could not create $DEST_DIR"; exit 1; }
+# ⛔ THE COPY IS THE WHOLE JOB, SO ITS FAILURE MUST NOT PRINT "staged:".
+# This was `cp; chmod; stat; echo "staged:"` with nothing between them, under `set -u` and no `set -e`
+# — a negative-space gate of the worst kind, because a FAILED cp leaves the PREVIOUS run's /bin/agnsh
+# sitting at $DEST and `stat` then reports ITS size. The line "staged: build/rootfs/bin/agnsh (283K
+# bytes)" is printed either way, and the number is plausible either way, so the operator's only signal
+# says "fresh" while the rootfs holds yesterday's shell. That is the same shape burn-prep.sh spent
+# four separate comments on: a stale oracle does not fail, it AGREES — and stage-tools.sh already
+# fixed exactly this for the CA bundle ("the old `cp; echo` printed success even when the cp failed").
+# The concrete way it fires is not hypothetical: a previous run can leave $DEST mode 0555, and a plain
+# `cp` cannot reopen a read-only destination for writing. `cp -f` unlinks it first.
+if ! cp -f "$SRC" "$DEST"; then
+    echo "ERROR: could not copy $SRC -> $DEST"
+    echo "       (a stale /bin/agnsh may still be sitting there — do NOT treat this as staged)"
+    exit 1
+fi
+chmod +x "$DEST" || { echo "ERROR: could not chmod +x $DEST"; exit 1; }
+# ⚠ And PROVE the copy rather than assuming it: `cp` can return 0 having written a short file when the
+# device fills, and this destination is flashed to iron. cmp is 300 KB of reading and settles it.
+if ! cmp -s "$SRC" "$DEST"; then
+    echo "ERROR: $DEST does NOT match $SRC after the copy — the rootfs holds something else."
+    exit 1
+fi
 SZ="$(stat -c%s "$DEST")"
-echo "staged: $DEST ($SZ bytes)"
+echo "staged: $DEST ($SZ bytes, byte-identical to source)"
 echo "  source: $SRC  (CYRIUS_TARGET_AGNOS — agnos-runnable)"
 echo "  next:   fs-population copies build/rootfs/* onto the agnos-fs (smoke / install-media --update-fs / mount-modify)"

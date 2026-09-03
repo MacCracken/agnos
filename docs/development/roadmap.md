@@ -111,6 +111,6 @@ Not a burn question: whether `BENCHMARKS.md` and `bench-history.csv` are git-tra
 
 ---
 
-*Built with cyrius 6.5.43 · `VERSION` is the single source of truth for the kernel version; the Current line
+*Built with cyrius 6.5.44 · `VERSION` is the single source of truth for the kernel version; the Current line
 is maintained by `scripts/version-bump.sh`. At each arc close: delete the arc's forward-facing rows, let the
 CHANGELOG carry the history, and keep this file under ~120 lines. Per-cut prose does not belong here.*

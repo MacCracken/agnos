@@ -12,6 +12,7 @@
 # unusable (bench.cyr zeroes it). "Never decreases" is a different claim from "increases".
 #
 # Exit 95 iff every counter is live and monotonic; 80-92 pinpoint which one is not.
+# (§5 RSS carried 93-97 in a draft; it did not land, so those codes are unreachable and are gone.)
 
 fn tlm_main(): i64 {
     # ---- §4: per-process CPU time, surfaced in proclist(#99) record +56 low u32 ----
@@ -43,6 +44,8 @@ fn tlm_main(): i64 {
     if (t1 < 0) { return 82; }
     if (t1 < t0) { return 83; }                 # went BACKWARDS — reset somewhere, unusable as a rate
     if (t1 == t0) { return 84; }                # never moved — the counter is declared but dead
+
+    # ---- §5 per-process RSS is NOT asserted: it is not implemented. See the record. ----
 
     # ---- §1 + §2: network packet and byte counters, net_config(#61) fields 8-11 ----
     # ⚠ READ ALL FOUR FIRST. Reading one, generating load, then reading another would compare two

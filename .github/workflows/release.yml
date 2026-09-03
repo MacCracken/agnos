@@ -20,8 +20,20 @@ jobs:
   # ── Build release binaries ──
   build:
     name: Build Release
+    # ⚠ `needs: [ci]` ALONE DOES NOT MEAN "CI PROVED ANYTHING". A called workflow's conclusion is
+    # SUCCESS when each of its jobs either succeeded OR WAS SKIPPED, so this dependency could never
+    # tell "the kernel booted" from "the boot job did not run" — the exact condition ci.yml's
+    # boot-test comment says shipped every tagged release with zero boot verification. The floor
+    # for that lives inside the called workflow as its `ci-gate` job (ci.yml, added 1.56.59), which
+    # asserts each required job's result is literally "success"; a skip there fails ci, and this
+    # `needs:` then means what it looks like it means.
     needs: [ci]
     runs-on: ubuntu-latest
+    outputs:
+      # Consumed by the release job's payload gate below — it is the only thing that knows whether
+      # an aarch64 kernel exists to publish, and the only alternative is guessing from file
+      # presence, which is what shipped three dead references to an artifact never produced.
+      aarch64: ${{ steps.aarch64.outputs.aarch64 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -55,26 +67,106 @@ jobs:
           }
 
       - name: Build x86_64 kernel
+        # ⚠ SIZE FLOOR ADDED 2026-09-02 (1.56.59), same bounds as scripts/check.sh gate 32 and the
+        # matching step in ci.yml. The old step read the byte count and PRINTED it; nothing compared
+        # it to anything, so a `cyrius build` that exits 0 having written a truncated or 0-byte
+        # kernel reported "agnos-x86_64: 0 bytes" and this workflow published it as the release
+        # binary. A number nobody asserts against is a reading aid, not a gate.
         run: |
           sh scripts/build.sh
           cp build/agnos agnos-x86_64
-          echo "agnos-x86_64: $(wc -c < agnos-x86_64) bytes"
+          SZ=$(wc -c < agnos-x86_64)
+          echo "agnos-x86_64: $SZ bytes"
+          if [ "$SZ" -lt 50000 ]; then
+            echo "FAIL: agnos-x86_64 is $SZ bytes — too small to be a kernel (floor 50000, cf. check.sh gate 32)"
+            exit 1
+          fi
+          # ⛔ CEILING DELIBERATELY NOT ENFORCED — see the twin note in ci.yml. The 50000 floor above is
+          # the anti-vacuity assertion (a kernel was actually produced); the 2 MiB bound is check.sh
+          # gate 32's BUDGET, and enforcing it on the release path would block a tag over a number
+          # whose own comment says it is a grant that expires. Measured at the revert: 4% headroom.
+          echo "  (size ceiling is check.sh gate 32's, deliberately not enforced here — see ci.yml)" 
 
       - name: Build aarch64 kernel (compile test)
+        id: aarch64
+        # ⛔ MEASURED 2026-09-02 (1.56.59): THIS STEP COULD NOT FAIL, IT THREW AWAY THE ONE THING
+        # THAT WOULD HAVE EXPLAINED WHY, AND THREE PLACES DOWNSTREAM REFERENCED AN OUTPUT IT HAD
+        # NEVER ONCE PRODUCED. The old body was a single line:
+        #     (sh scripts/build.sh --aarch64 2>/dev/null && cp ... ) || echo "aarch64 not yet portable"
+        #   ① `2>/dev/null` discarded the compiler's stderr — which is the entire diagnosis. Per
+        #      CLAUDE.md the aarch64 build currently fails with 30 reachable undefined functions and
+        #      18 undefined variables, and NONE of that has ever appeared in a release log.
+        #   ② The trailing `|| echo` consumed the status, so the step is green either way.
+        #   ③ Worst: the echo says "aarch64 not yet portable" for BOTH failure modes. Measured
+        #      against a build stub that exits 0 and writes nothing, the step printed that same
+        #      sentence and exited 0 — a build that SUCCEEDED and produced no kernel, reported as
+        #      a porting gap. Those two must not be the same colour.
+        # ⇒ The compile test stays soft — the port is genuinely unfinished and the tree says so —
+        #   but it now RECORDS A VERDICT ("built" / "absent") that the payload gate below reads,
+        #   instead of leaving the release to infer it from whether a file happened to appear. And
+        #   a build that exits 0 without producing a plausible kernel is now a HARD failure, because
+        #   that is a broken build script, not an unfinished port.
         run: |
-          (sh scripts/build.sh --aarch64 2>/dev/null && cp build/agnos-aarch64 agnos-aarch64) || echo "aarch64 not yet portable"
+          set -o pipefail
+          if sh scripts/build.sh --aarch64 2>&1 | tee aarch64-build.log; then
+            [ -f build/agnos-aarch64 ] || {
+              echo "FAIL: --aarch64 exited 0 but produced no build/agnos-aarch64"
+              echo "      That is a build-script defect, not 'not yet portable'."
+              exit 1; }
+            cp build/agnos-aarch64 agnos-aarch64
+            SZ=$(wc -c < agnos-aarch64)
+            [ "$SZ" -ge 50000 ] || {
+              echo "FAIL: agnos-aarch64 is $SZ bytes — too small to be a kernel (floor 50000)"
+              exit 1; }
+            echo "aarch64=built" >> "$GITHUB_OUTPUT"
+            echo "agnos-aarch64: $SZ bytes"
+          else
+            echo "aarch64=absent" >> "$GITHUB_OUTPUT"
+            echo "NOTE: the aarch64 cross-build FAILED — stderr is in the log above, not discarded."
+            echo "      This release ships x86_64 only. See CLAUDE.md § Quick Start (aarch64 is RED)."
+          fi
 
       - name: Run tests
         run: sh scripts/test.sh
 
       - name: Extract changelog
+        # ⛔ MEASURED 2026-09-02 (1.56.59): A PARSE THAT ROTS SHIPPED THE RELEASE ANYWAY. The old
+        # body ran one awk and, when it came back empty, substituted the string "No changelog entry
+        # for this release." and carried on to publish. So the ONLY consequence of the extractor
+        # silently ceasing to work was that every subsequent release went out with a placeholder
+        # where its notes should be — the failure mode is invisible in CI and visible only to
+        # whoever reads the release page afterwards. Measured against a CHANGELOG whose headers had
+        # drifted from `## [1.56.59] — …` to `## 1.56.59 — …`: exit 0, release-body.md containing
+        # exactly that sentence. This is shape V4 — the assertion became a no-op and said nothing.
+        # ⚠ SECOND DEFECT, ALSO MEASURED: `$TAG` was interpolated straight into an awk REGEX, so the
+        # dots were wildcards. A CHANGELOG holding `## [1x56x59]` and no 1.56.59 section at all
+        # satisfied the extractor for tag 1.56.59 and shipped that other version's notes. The match
+        # is now `index($0, hdr) == 1` — literal text, anchored at column 1, no metacharacters.
+        # ⇒ An empty or implausibly-short extraction is now FATAL. There is no honest release to
+        #   make from notes nobody wrote, and the tag is already cut by the time this runs.
         run: |
           TAG="${GITHUB_REF_NAME#v}"
-          BODY=$(awk "/^## \\[$TAG\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md)
-          if [ -z "$BODY" ]; then
-            BODY="No changelog entry for this release."
+          BODY=$(awk -v tag="$TAG" '
+            BEGIN { hdr = "## [" tag "]" }
+            index($0, hdr) == 1 { found = 1; next }
+            /^## \[/            { if (found) exit }
+            found               { print }
+          ' CHANGELOG.md)
+
+          # ── VACUITY FLOOR ──────────────────────────────────────────────────────────────
+          # Count what was extracted and PRINT it, so a run that says "0 non-blank lines" is
+          # reporting that its own parse broke rather than that the release has nothing to say.
+          NLINES=$(printf '%s\n' "$BODY" | grep -c '[^[:space:]]' || true)
+          echo "changelog body for $TAG: $NLINES non-blank line(s)"
+          if [ "$NLINES" -lt 3 ]; then
+            echo "FAIL: CHANGELOG.md has no usable '## [$TAG]' section (extracted $NLINES non-blank lines)."
+            echo "      Either the entry was never written, or the header format this awk parses has"
+            echo "      drifted. Both are release-blocking; neither is a placeholder body."
+            echo "      headers this file actually has:"
+            grep -n '^## \[' CHANGELOG.md | head -10 | sed 's/^/        /'
+            exit 1
           fi
-          echo "$BODY" > release-body.md
+          printf '%s\n' "$BODY" > release-body.md
 
       - name: Create source archive
         run: |
@@ -82,12 +174,77 @@ jobs:
           git archive --format=tar.gz --prefix="agnos-${TAG}/" -o "agnos-${TAG}-src.tar.gz" HEAD
 
       - name: Generate checksums
+        # ⚠ `if [ -f agnos-aarch64 ]` WAS THE WHOLE AARCH64 ORACLE, and file-presence cannot tell
+        # "the port does not build yet" from "the build step silently lost its output". It is now
+        # driven by the verdict the compile-test step recorded, and a verdict that disagrees with
+        # the filesystem is a hard failure rather than a quietly shorter SHA256SUMS.
+        env:
+          AARCH64: ${{ steps.aarch64.outputs.aarch64 }}
         run: |
+          set -u
           TAG="${GITHUB_REF_NAME#v}"
           sha256sum agnos-x86_64 > SHA256SUMS
-          if [ -f agnos-aarch64 ]; then sha256sum agnos-aarch64 >> SHA256SUMS; fi
+          case "$AARCH64" in
+            built)
+              [ -f agnos-aarch64 ] || {
+                echo "FAIL: compile test recorded aarch64=built but agnos-aarch64 is gone"; exit 1; }
+              sha256sum agnos-aarch64 >> SHA256SUMS ;;
+            absent)
+              [ -f agnos-aarch64 ] && {
+                echo "FAIL: compile test recorded aarch64=absent but agnos-aarch64 exists"; exit 1; }
+              echo "(no agnos-aarch64 in this release — the compile test recorded 'absent')" ;;
+            *)
+              echo "FAIL: no aarch64 verdict was recorded (read: '$AARCH64')."
+              echo "      The compile-test step did not report, so nothing here knows what to ship."
+              exit 1 ;;
+          esac
           sha256sum "agnos-${TAG}-src.tar.gz" >> SHA256SUMS
           cat SHA256SUMS
+
+      - name: Verify release payload
+        # ⛔ ADDED 2026-09-02 (1.56.59). Nothing between the build steps and the GitHub release
+        # asserted that the release payload EXISTED. `upload-artifact` defaults to
+        # `if-no-files-found: warn` and `action-gh-release` defaults to
+        # `fail_on_unmatched_files: false`, so every file in both lists was optional by default:
+        # a `files:` entry that matched nothing was skipped in silence at both ends. That is how
+        # `agnos-aarch64` came to be named in three places while never once being produced. Assert
+        # each mandatory artifact is present AND NON-EMPTY, and print the sizes — a release that
+        # ships a 0-byte kernel is worse than one that fails to ship.
+        env:
+          AARCH64: ${{ steps.aarch64.outputs.aarch64 }}
+        run: |
+          set -u
+          TAG="${GITHUB_REF_NAME#v}"
+          rc=0
+          for f in agnos-x86_64 "agnos-${TAG}-src.tar.gz" SHA256SUMS release-body.md; do
+            if [ -s "$f" ]; then
+              printf '  OK      %10s  %s\n' "$(wc -c < "$f")" "$f"
+            else
+              printf '  MISSING/EMPTY      %s\n' "$f"
+              rc=1
+            fi
+          done
+          case "$AARCH64" in
+            built)
+              if [ -s agnos-aarch64 ]; then
+                printf '  OK      %10s  %s\n' "$(wc -c < agnos-aarch64)" "agnos-aarch64"
+              else
+                echo "  MISSING/EMPTY      agnos-aarch64 (but the compile test said 'built')"
+                rc=1
+              fi ;;
+            absent)
+              echo "  (skip)  agnos-aarch64 — compile test recorded 'absent'" ;;
+            *)
+              # ⚠ An UNSET verdict is not 'absent'. It means the compile-test step above did not
+              # report at all, which is the state the whole workflow was permanently in before
+              # 1.56.59 — and reading that as "no aarch64, carry on" is how it stayed invisible.
+              echo "  FAIL    agnos-aarch64 — no verdict recorded (read: '$AARCH64')"
+              rc=1 ;;
+          esac
+          if [ "$rc" != 0 ]; then
+            echo "FAIL: the release payload is incomplete — refusing to hand a partial set to the release job"
+          fi
+          exit $rc
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -99,6 +256,10 @@ jobs:
             agnos-*-src.tar.gz
             SHA256SUMS
             release-body.md
+          # ⚠ `error` since 2026-09-02. With the default `warn`, a build that produced NOTHING at
+          # all uploaded an empty artifact with a log warning and scored green; the release job
+          # below then failed on the download with a message about the wrong thing.
+          if-no-files-found: error
           retention-days: 5
 
   # ── Create GitHub Release ──
@@ -118,14 +279,68 @@ jobs:
         id: tag
         run: echo "clean=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
+      - name: Verify downloaded payload and compose the asset list
+        id: payload
+        # ⛔ ADDED 2026-09-02 (1.56.59). `action-gh-release` defaults to
+        # `fail_on_unmatched_files: false`, so the hand-written `files:` list below was a WISH LIST:
+        # any entry that matched nothing was dropped without comment, and the release published
+        # whatever survived. `agnos-aarch64` has been on that list since the file was written and
+        # has never once existed (the compile-test step that would produce it swallowed its own
+        # failure — see the build job). A release that silently ships four assets instead of five is
+        # indistinguishable, from here, from one that ships them all.
+        # ⇒ The asset list is now COMPUTED and then required. Mandatory files must exist and be
+        #   non-empty; agnos-aarch64 is listed only when the build job's recorded verdict says it
+        #   was built, and an unset verdict is fatal rather than "assume not". With every listed
+        #   path guaranteed present, `fail_on_unmatched_files: true` below can finally be turned on,
+        #   which closes the same hole for any asset added here in future.
+        env:
+          TAG: ${{ steps.tag.outputs.clean }}
+          AARCH64: ${{ needs.build.outputs.aarch64 }}
+        run: |
+          set -u
+          rc=0
+          FILES="agnos-x86_64 agnos-${TAG}-src.tar.gz SHA256SUMS"
+          for f in $FILES release-body.md; do
+            if [ -s "$f" ]; then
+              printf '  OK      %10s  %s\n' "$(wc -c < "$f")" "$f"
+            else
+              printf '  MISSING/EMPTY      %s\n' "$f"
+              rc=1
+            fi
+          done
+          case "$AARCH64" in
+            built)
+              if [ -s agnos-aarch64 ]; then
+                printf '  OK      %10s  %s\n' "$(wc -c < agnos-aarch64)" "agnos-aarch64"
+                FILES="$FILES agnos-aarch64"
+              else
+                echo "  MISSING/EMPTY      agnos-aarch64 (build job recorded 'built')"
+                rc=1
+              fi ;;
+            absent)
+              echo "  (skip)  agnos-aarch64 — the aarch64 compile test failed; this release is x86_64 only" ;;
+            *)
+              echo "FAIL: build job recorded no aarch64 verdict (read: '$AARCH64')"
+              rc=1 ;;
+          esac
+          if [ "$rc" != 0 ]; then
+            echo "FAIL: refusing to publish an incomplete release payload"
+            exit 1
+          fi
+          {
+            echo "files<<PAYLOAD_EOF"
+            for f in $FILES; do echo "$f"; done
+            echo "PAYLOAD_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "publishing: $FILES"
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           name: "AGNOS ${{ steps.tag.outputs.clean }}"
           body_path: release-body.md
           prerelease: ${{ startsWith(steps.tag.outputs.clean, '0.') }}
-          files: |
-            agnos-x86_64
-            agnos-aarch64
-            agnos-${{ steps.tag.outputs.clean }}-src.tar.gz
-            SHA256SUMS
+          files: ${{ steps.payload.outputs.files }}
+          # ⚠ Safe to require ONLY because the list above is computed from files just proven to
+          # exist. Left at its permissive default, this action drops unmatched entries in silence.
+          fail_on_unmatched_files: true

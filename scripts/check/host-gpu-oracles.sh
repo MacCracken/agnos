@@ -24,10 +24,13 @@
 # their results. Path fixed to `../../../mabda`, both now build under agnos's tree and exit 95, and
 # `mabda-resolve.sh` runs first so a missing sibling reports as TOOLING and not as a red oracle.
 #
-# ⛔⛔ AND HERE IS *WHY NOBODY NOTICED*, WHICH IS THE PART WORTH KEEPING. `tests/gpu/build/edgeasm` is
-# a COMMITTED BINARY (51 of them are tracked under tests/gpu/build/). Running it exits 95 and prints
-# "B4 PASS -- the tool reproduces a shipped iron-proven shader byte-for-byte". It is 108,784 bytes;
-# a build from the fixed source is 116,976. So the artifact in the tree PASSED while the source it
+# ⛔⛔ AND HERE IS *WHY NOBODY NOTICED*, WHICH IS THE PART WORTH KEEPING. `tests/gpu/build/edgeasm` WAS
+# a COMMITTED BINARY (51 of them were tracked under tests/gpu/build/ until they were purged at
+# 1.56.44 — `.gitignore:81` now holds `tests/*/build/` and `vendored-artifact-check.sh` gates it, so
+# the present tense this paragraph carried until 1.56.59 described a state the tree had already
+# fixed). Running it exited 95 and printed
+# "B4 PASS -- the tool reproduces a shipped iron-proven shader byte-for-byte". It was 108,784 bytes;
+# a build from the fixed source was 116,976. So the artifact in the tree PASSED while the source it
 # claims to represent DID NOT COMPILE — anyone who checked the oracle by running it got a green light
 # from a binary predating the breakage. A committed build artifact is not evidence about the source
 # beside it; it is evidence about whatever source existed when someone last ran a compiler. ⚠ THIS
@@ -175,7 +178,74 @@ rc=0
 # h_front - h_active` cancels the front porch exactly, so h_front reaches H_TOTAL and never H_BLANK.
 # Both directions are now pinned (M1/M1c assert the cancellation, M1b asserts the register still
 # moves), because a change folding h_front into the blank formula would otherwise be invisible.
-for t in texlist bigate bimodel texgate rtaudit depthgate depthmodel depthdiv perspbits perspdiv perspgate perspmodel moderaster edgeasm asmagree shaderasm shaderexec pm4lint; do
+# ⛔ VACUITY FLOOR, 2026-09-02 — TWO OF THEM, BECAUSE THIS RUNNER COULD PASS ON NOTHING TWICE OVER.
+#
+# (1) THE NAME LIST. The verdict at the bottom is `exit $rc` over an rc initialised to 0, so this
+#     script's success condition is satisfied by a loop that never runs a single iteration. Lose the
+#     names — a rebase resolving this line to the wrong side, a merge that eats it, an edit that
+#     extracts them to a generated list and forgets to feed it back — and host-gpu-oracles prints
+#     NOTHING AT ALL and exits 0, and both callers score it green: check.sh:283-285 keys on the exit
+#     status alone and only `cat`s this log when it is non-zero, and ci.yml's "Host GPU oracles" step
+#     is a bare `run:` with no output assertion at all. That is the same shape check.sh
+#     gate 14 was floored for at 1.56.58 (its shader-blob name list, `test -z "$BLOBDRIFT"` over a
+#     variable that starts empty), and the floor here is the same one: assert the iteration count
+#     against the number this file's own header enumerates by name, and PRINT it.
+#
+# (2) THE PER-ORACLE ASSERTION FLOOR, which is the one that matters. `exit 95` is the entire contract
+#     between these oracles and this runner, and every one of them computes it the same way: a
+#     failure counter the oracle increments itself, compared to zero — `if (bad == 0) { ... return
+#     95; }` in bigate.cyr, `if (missed != 0) { ... return 90; }` in pm4lint.cyr, and so on down the
+#     list. SEVENTEEN OF THE EIGHTEEN put no floor under that counter. `#ifdef` the gate bodies out,
+#     return early from main(), or edit a shared helper so it stops incrementing, and the counter
+#     stays 0, main() returns 95, and this loop prints "PASS -- <t> exit 95" over an oracle that
+#     asserted NOTHING. The runner was, in that state, testing that the oracle still compiles.
+#     ⭐ shaderasm.cyr:126 is the one exception and it is the shape the other seventeen want:
+#     `if (n_pass == 0) { puts("shaderasm: FAIL -- nothing was checked"); return 90; }`. This runner
+#     may not add that line where it belongs — inside each oracle — so it floors the nearest thing it
+#     can observe from outside: how much evidence the oracle actually printed before claiming 95.
+#
+# ⚠ WHAT THIS FLOOR CATCHES AND WHAT IT DOES NOT, said plainly, because an oversold floor is the
+#   same defect wearing the fix's clothes. It CATCHES an oracle whose assertion block was compiled
+#   out or that returned before reaching it: such a run emits its header and its verdict and nothing
+#   between them — 3 lines for a gutted bigate, measured — and cannot clear these floors. It does NOT
+#   catch a helper that keeps PRINTING each gate's label while no longer COUNTING anything, because
+#   bigate prints "G1 ...: PASS" outside the loop that computes it, so emptying the loop leaves the
+#   line count untouched. Only an `n_pass == 0` floor INSIDE the oracle sees that one; putting it in
+#   the other seventeen .cyr files is a separate bite and is filed as one.
+#
+# ⚠ THE NUMBERS ARE MEASURED, NOT CHOSEN. Each floor is two-thirds of the non-blank output its oracle
+#   emitted on this tree on 2026-09-02, freshly built by this very loop — a third of the volume left
+#   as slack for prose edits, and every floor still far above the header-plus-verdict remainder a
+#   gutted oracle prints. Healthy volumes that day, in list order: texlist 25, bigate 11, bimodel 15,
+#   texgate 33, rtaudit 13, depthgate 30, depthmodel 38, depthdiv 19, perspbits 27, perspdiv 32,
+#   perspgate 18, perspmodel 30, moderaster 66, edgeasm 30, asmagree 78, shaderasm 7, shaderexec 14,
+#   pm4lint 20. Re-measure after a run with:
+#       for f in /tmp/host-gpu-*.log; do printf '%s %s\n' "$f" "$(LC_ALL=C grep -ac . "$f")"; done
+#   A floor that trips after a prose edit is reporting that the measurement is stale: RE-MEASURE and
+#   raise it in the same edit. Deleting the number to make the gate quiet puts the hole back.
+#   ⚠ shaderasm's floor is 6 against a healthy 7, not the two-thirds 4, because its output is the
+#   smallest here and its header alone is 3 lines — at 4 a gutted shaderasm would still clear it.
+#   (It is also the one oracle that fails in-file first, returning 90; this is belt and braces.)
+#
+# ⚠ COUNTED WITH `grep -ac`, NOT `grep -c`, AND THE REASON IS ALREADY IN THE TREE: texlist writes 12
+#   NUL bytes to stdout, so GNU grep classifies its log as binary, prints NO COUNT and exits 1. With
+#   a plain `grep -c .` the count is the EMPTY STRING, `[ "" -lt 16 ]` is a shell syntax error whose
+#   non-zero status reads here as "not below the floor", and the floor would silently pass on the one
+#   oracle whose output it could not read — a V4 parse-rot living inside the fix for a V1 vacuity.
+#   The `|| true` and the `${lines:-0}` default below are there for the same reason: an unreadable
+#   log must score 0 lines and FAIL, never an empty string that tests as "fine".
+#
+# ⚠ NAME AND FLOOR TRAVEL TOGETHER as `name:floor` on one line. A parallel array of floors is the
+#   drift shape this file's own header warns about twice ("this line has gone stale twice as oracles
+#   were added"); a pair that must be edited as one cannot half-rot.
+ORACLE_FLOOR_TOTAL=18
+N_ORACLES=0
+for spec in texlist:16 bigate:7 bimodel:10 texgate:22 rtaudit:8 depthgate:20 depthmodel:25 \
+            depthdiv:12 perspbits:18 perspdiv:21 perspgate:12 perspmodel:20 moderaster:44 \
+            edgeasm:20 asmagree:52 shaderasm:6 shaderexec:9 pm4lint:13; do
+    t="${spec%%:*}"
+    floor="${spec##*:}"
+    N_ORACLES=$((N_ORACLES + 1))
     out="$(cd "$GPU" && cyrius build "$t.cyr" "build/$t" 2>&1)" || {
         echo "host-gpu-oracles: FAIL -- $t.cyr does not BUILD"
         echo "$out" | tail -20
@@ -183,12 +253,32 @@ for t in texlist bigate bimodel texgate rtaudit depthgate depthmodel depthdiv pe
     }
     "$GPU/build/$t" > "/tmp/host-gpu-$t.log" 2>&1
     got=$?
+    lines=$(LC_ALL=C grep -ac . "/tmp/host-gpu-$t.log" 2>/dev/null || true)
+    lines=${lines:-0}
+    # Anything that is not a plain integer scores ZERO and fails the floor. A count this loop cannot
+    # read is not evidence that the oracle was busy, and `[ "$x" -lt 7 ]` on a non-number exits
+    # non-zero — which reads as "not below the floor" and passes. Fail closed instead.
+    case "$lines" in *[!0-9]*) lines=0 ;; esac
     if [ "$got" -ne 95 ]; then
         echo "host-gpu-oracles: FAIL -- $t exited $got, want 95"
         tail -30 "/tmp/host-gpu-$t.log"
         rc=1
+    elif [ "$lines" -lt "$floor" ]; then
+        echo "host-gpu-oracles: FAIL -- $t exited 95 over $lines line(s) of output, floor $floor"
+        echo "    VACUOUS: $t reports success by finding no failures, and it printed too little to"
+        echo "    have looked for any. A gutted oracle exits 95 exactly as a clean one does; the"
+        echo "    output volume is the only part of that claim this runner can weigh."
+        tail -30 "/tmp/host-gpu-$t.log"
+        rc=1
     else
-        echo "host-gpu-oracles: PASS -- $t exit 95"
+        echo "host-gpu-oracles: PASS -- $t exit 95, $lines line(s) of evidence (floor $floor)"
     fi
 done
+if [ "$N_ORACLES" -lt "$ORACLE_FLOOR_TOTAL" ]; then
+    echo "host-gpu-oracles: FAIL -- ran $N_ORACLES oracle(s), not the $ORACLE_FLOOR_TOTAL this file names"
+    echo "    VACUOUS: the loop's name list is the whole gate. Fewer names means the LIST broke, not"
+    echo "    that the oracles are clean — and an empty list would have exited 0 having run nothing."
+    rc=1
+fi
+echo "host-gpu-oracles: enumerated $N_ORACLES of $ORACLE_FLOOR_TOTAL oracles, each floored on its own output volume"
 exit $rc

@@ -26,6 +26,10 @@ BUILD=0
 # Every destination name staged so far, space-delimited — the duplicate guard in
 # stage_one reads it. See the guard for why this exists.
 STAGED_NAMES=""
+# ⭐ HOW MANY ROWS ACTUALLY REACHED THE ROOTFS. Counted at the END of stage_one (not at the top like
+# STAGED_NAMES, which records ATTEMPTS for the duplicate guard) and floored at the bottom of this file.
+# See the VACUITY FLOOR there for why a count is asserted at all.
+STAGED_OK=0
 
 # Tool table: <repo> <src-entry> <name>. `name` matches the tool's cyrius.cyml
 # [build] output; the agnos binary is staged at <repo>/build/<name>_agnos. Add a
@@ -89,8 +93,33 @@ stage_one() {
         *"ELF 64-bit"*"x86-64"*"statically linked"*) : ;;
         *) echo "ERROR: $bin is not a static x86-64 ELF64 ($DESC)"; return 1 ;;
     esac
-    cp "$bin" "$DEST_DIR/$name"
-    chmod +x "$DEST_DIR/$name"
+    # ⛔ THE COPY'S RESULT WAS NEVER READ, AND THE "staged:" LINE PRINTED ANYWAY.
+    # This was `cp; chmod; echo "staged: ... ($(stat -c%s DEST) bytes)"` with nothing checking either
+    # command — under `set -u` with no `set -e`, so a failed cp just kept going. The consequence is not
+    # a missing file, it is a WRONG file that announces itself as right: cp fails, the PREVIOUS run's
+    # /bin/<name> stays where it is, and `stat` reports ITS size on a line that reads "staged". Every
+    # downstream reader — the operator, burn-prep's cmp loop, install-media — is then working from a
+    # rootfs that nobody staged.
+    # ⚠ THIS IS NOT HYPOTHETICAL AND THIS FILE ALREADY KNEW IT: the CA-bundle block below (~:437) was
+    # rewritten for exactly this reason — "the old `cp; echo` printed success even when the cp failed,
+    # masking the error" — and the fix was never carried back up here, where 34 rows use the same
+    # pattern to stage the binaries that get flashed. The concrete trigger is the same one recorded
+    # there: a previous run can leave the destination read-only, and a plain `cp` cannot reopen a
+    # read-only file for writing. `cp -f` unlinks it first.
+    if ! cp -f "$bin" "$DEST_DIR/$name"; then
+        echo "ERROR: could not copy $bin -> $DEST_DIR/$name"
+        echo "       (a stale /bin/$name may still be there — this row is NOT staged)"
+        return 1
+    fi
+    chmod +x "$DEST_DIR/$name" || { echo "ERROR: could not chmod +x $DEST_DIR/$name"; return 1; }
+    # ⚠ And PROVE it landed. `cp` can return 0 having written a short file when the device fills, and
+    # burn-prep's staleness gate compares the STAGED copy against this same source — so a truncated
+    # copy would be caught there as "STALE STAGED TOOL", one gate late and with the wrong diagnosis.
+    if ! cmp -s "$bin" "$DEST_DIR/$name"; then
+        echo "ERROR: $DEST_DIR/$name does NOT match $bin after the copy (short write? full disk?)"
+        return 1
+    fi
+    STAGED_OK=$((STAGED_OK + 1))
     echo "staged: $DEST_DIR/$name ($(stat -c%s "$DEST_DIR/$name") bytes) <- $repo"
 }
 
@@ -412,11 +441,26 @@ stage_one crab         src/main.cyr crab        || rc=1
 # (owl is AGNOS's cat — agnsh nudges `cat` -> owl). The rest of kriya's surface
 # (head/tail/sort/stat/ln/...) stays reachable via `kriya <applet>`; add more
 # names here if they earn a bareword. NB `ln` would ENOSYS until symlink#43.
+# ⛔ THE `linked:` LINE USED TO PRINT NO MATTER WHAT THE LOOP DID. `ln -sf` inside an unchecked loop,
+# then one affirmative line naming all eleven verbs — so a rootfs where the links could not be created
+# (a read-only staging dir, or a REAL FILE already sitting at build/rootfs/bin/ls from an older staging
+# scheme, which `ln -sf` will not replace on some coreutils) reported eleven links it does not have.
+# agnsh 1.5.0 DELETED its in-process file verbs, so a missing /bin/ls is not a cosmetic gap: it is
+# `ls` returning ENOENT on iron, on a burn whose staging said it was fine. Count them and say so.
 if [ -f "$DEST_DIR/kriya" ]; then
+    _nlink=0; _linkfail=""
     for u in cp mv rm mkdir rmdir touch echo wc find grep ls; do
-        ln -sf kriya "$DEST_DIR/$u"
+        if ln -sfn kriya "$DEST_DIR/$u" 2>/dev/null && [ -L "$DEST_DIR/$u" ]; then
+            _nlink=$((_nlink + 1))
+        else
+            _linkfail="$_linkfail $u"
+        fi
     done
-    echo "linked: $DEST_DIR/{cp,mv,rm,mkdir,rmdir,touch,echo,wc,find,grep,ls} -> kriya"
+    if [ -n "$_linkfail" ]; then
+        echo "ERROR: kriya verb links NOT created:$_linkfail  (agnsh 1.5.0 has no in-process fallback)"
+        rc=1
+    fi
+    echo "linked: $_nlink/11 kriya verb names in $DEST_DIR (cp mv rm mkdir rmdir touch echo wc find grep ls)"
 fi
 
 # CA trust store for the verifying HTTPS clients (whirl). tls_native verifies the
@@ -452,15 +496,61 @@ done
 # the suite reports a PASS for a check it never ran. Staging is the only place that cannot forget.
 # ⚠ The desktop OWNS these (it is the thing that draws them); agnos only carries them to the disk.
 # Operator 2026-08-18: default wallpapers ship with the release, so expect this set to grow.
+# ⛔ AND THE DIRECTORY EXISTING IS NOT THE SAME CLAIM AS A WALLPAPER BEING ON DISK. The `else` below
+# is reached only when $AE_WP_DIR is MISSING; a directory that exists and holds no .png/.jpg (a fresh
+# aethersafha checkout before its assets land, a renamed asset dir, a `--depth` clone) drops straight
+# through the `[ -f ] || continue` with ZERO iterations, prints nothing at all, and the staging run
+# ends green. That is the very failure this block's own header was written against — "hand-placing one
+# into build/rootfs/ survives exactly until the next clean rootfs, at which point `--wallpaper` finds
+# nothing, the compositor falls back to the gradient, and the suite reports a PASS for a check it
+# never ran". An empty enumeration reproduces it exactly, from inside the fix.
+# ⚠ Absence stays a WARNING, not an abort, because most burns do not drive the desktop — but it is now
+# printed for BOTH ways of having no wallpaper, and the count is printed when there are some.
 AE_WP_DIR="${AE_WP_DIR:-$ROOT/../aethersafha/assets/wallpapers}"
+_nwp=0
 if [ -d "$AE_WP_DIR" ]; then
     for _wp in "$AE_WP_DIR"/*.png "$AE_WP_DIR"/*.jpg; do
         [ -f "$_wp" ] || continue
-        cp "$_wp" "$ROOT/build/rootfs/$(basename "$_wp")"
+        if ! cp -f "$_wp" "$ROOT/build/rootfs/$(basename "$_wp")"; then
+            echo "ERROR: could not stage wallpaper $_wp -> $ROOT/build/rootfs/$(basename "$_wp")"; rc=1; continue
+        fi
+        _nwp=$((_nwp + 1))
         echo "staged: $ROOT/build/rootfs/$(basename "$_wp") ($(wc -c < "$_wp" | tr -d ' ') bytes) <- aethersafha/assets/wallpapers"
     done
+    if [ "$_nwp" -eq 0 ]; then
+        echo "WARNING: $AE_WP_DIR exists but holds NO .png/.jpg — 0 wallpapers staged."
+        echo "         --wallpaper /<name>.png will find nothing and the desktop will fall back to the"
+        echo "         gradient, which looks like a working default rather than a staging failure."
+    else
+        echo "staged: $_nwp wallpaper(s) at the rootfs root"
+    fi
 else
     echo "WARNING: no aethersafha wallpaper assets at $AE_WP_DIR — --wallpaper has nothing to load"
 fi
 
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# ⛔ VACUITY FLOOR — assert AND PRINT how many rows actually reached the rootfs.
+#
+# `rc` is a COUNT OF FAILURES over the table above: it starts 0 and only a failing row raises it. That
+# is the shape this tree names "a gate that passed by enumerating nothing" — over an EMPTY table it is
+# trivially 0, so the script exits 0 having staged not one binary. And the emptiness does not need a
+# malicious edit to happen: a bad merge that drops the `stage_one` block, an early `return` added to
+# stage_one, or a rename of $DEST_DIR all produce the same green nothing.
+#
+# ⚠ THE EXIT CODE IS THE SIGNAL, and this file already paid for that lesson from the other side: the
+# `agnos/audio-test` path was wrong for months, so stage-tools exited 1 on EVERY run, the one signal
+# that says "a tool did not make it onto the fs" carried no information, and it got read as background
+# noise (see the tonegen row, ~:154). A 0 that means nothing is the same defect in the other direction.
+#
+# 34 rows are staged today (33 tools + one of the two puka occupants). The floor is 25 so that
+# retiring a handful of rows does not redden a burn, while a table that has stopped enumerating
+# cannot pass. burn-prep.sh's STAGING GAP loop is the second line of defence, not the first — it
+# checks 18 named tools, so 16 could vanish here without it noticing.
+echo "staged $STAGED_OK tool binaries into $DEST_DIR"
+if [ "$STAGED_OK" -lt 25 ]; then
+    echo "ERROR: only $STAGED_OK tool(s) staged — the table enumerated (almost) nothing."
+    echo "       A rootfs this empty would still flash, and /bin/<tool> would be ENOENT on iron."
+    echo "       This is a staging failure even if every individual row above looked green."
+    rc=1
+fi
 exit $rc

@@ -1075,6 +1075,25 @@ if ! env -u HDA_HDMI -u HDA_TONE -u HDMI_DCCG -u HDMI_ATOM -u HDMI_AUDIO_DUMP -u
     exit 1
 fi
 
+# ⛔ FLOOR UNDER EVERY MARKER CLAIM BELOW: THE ARTIFACT HAS TO EXIST FIRST.
+# `verify_absent` is a NEGATIVE assertion implemented as `grep -qa "$1" build/agnos` — and grep over a
+# MISSING or EMPTY file finds nothing, which is indistinguishable from "the destructive path is not in
+# this build". So an absent artifact would make every ATOM_TX_CYCLE / ATOM_RUN_TRANSMITTER safety
+# proof pass by reading nothing at all, on precisely the burns that power-cycle the PHY. build.sh
+# returning 0 is not the same claim as build/agnos existing: this script DELETES it at :57 before
+# anything can abort, so "the build said OK but the file is not there" is a reachable state, not a
+# hypothetical. Assert it once, here, above both verify_ helpers.
+# ⚠ 50000 is check.sh gate 32's own lower bound for this file (a kernel is ~2 MB); anything under it
+# is a stub or a truncation, not a kernel, and would silence the greps just as effectively as absence.
+_ART_SZ=0
+[ -f build/agnos ] && _ART_SZ="$(stat -c %s build/agnos)"
+if [ "$_ART_SZ" -lt 50000 ]; then
+    echo "burn-prep: NO ARTIFACT TO VERIFY -- build/agnos is $_ART_SZ bytes (need >= 50000)."
+    echo "  build.sh exited 0 but left no usable kernel. Every verify_absent below would 'pass' by"
+    echo "  grepping an empty file, including the ATOM #76 safety proofs. See /tmp/burn-prep-build.log."
+    exit 1
+fi
+
 # --- PROVE THE FLAGS ACTUALLY LANDED IN THE ARTIFACT -------------------------
 # A burn was wasted on 2026-07-15 because build/agnos was silently rebuilt WITHOUT these flags between
 # burn-prep and the flash (scripts/check.sh line 24 runs build.sh with no BUILD_ENV, so ANY check.sh run
@@ -1087,6 +1106,14 @@ fi
 # Do NOT verify with a string from an #ifdef'd FUNCTION BODY: gpu_hdmi_audio_crc_probe's own text is
 # present in a bare production kernel too, because the function compiles and is simply never called. That
 # is the exact trap this check exists to close — "a plain build compiles the code and never calls it".
+# ⭐ COUNT THE VERIFICATIONS. Read the VACUITY FLOOR above the "markers verified" summary (~:1600) for
+# why a gate that can run ZERO times has to say so out loud. PRESENT and ABSENT are counted separately
+# and deliberately: the summary line claims the tag's code IS COMPILED AND REACHED, and only
+# verify_marker establishes that — verify_absent proves the opposite about a different string, and
+# THREE of them fire on every non-GPU_RECOVER, non-MODESET_AUDIO build (the `*)` arms below). Adding
+# the two together would make every arm in this file look covered, which is the failure re-created.
+_MARKERS_PRESENT=0
+_MARKERS_ABSENT=0
 verify_marker() {
     if ! grep -qa "$1" build/agnos; then
         echo ""
@@ -1096,6 +1123,7 @@ verify_marker() {
         echo "  DO NOT FLASH THIS. Re-run burn-prep and flash immediately, running nothing in between."
         exit 1
     fi
+    _MARKERS_PRESENT=$((_MARKERS_PRESENT + 1))
 }
 # verify_absent — THE OTHER HALF OF THE GATE, and M8 is why it exists.
 #
@@ -1116,6 +1144,7 @@ verify_absent() {
         echo "  Flashing this could drive the PHY when you expected it not to. DO NOT FLASH THIS."
         exit 1
     fi
+    _MARKERS_ABSENT=$((_MARKERS_ABSENT + 1))
 }
 case "$BUILD_TAG" in *HDA_HDMI*)         verify_marker "ctl1 probing 2nd controller" ;; esac
 # ⭐ GPU_AUDIO_PROBE — the flag whose absence would have voided every HDMI-audio burn taken between 1.56.25
@@ -1216,6 +1245,9 @@ esac
 # leading hypothesis is literally "it was a stale staged binary"), and `faulter` (a stimulus that did
 # not exist before today). ⇒ An unverified /bin/iam would let the burn "confirm" the stale-binary
 # theory using a stale binary, which is the theory testing itself.
+_cmp_n=0
+_cmp_skipped=""
+_cmp_tools=18   # the length of the list on the next line — the denominator the count is read against
 for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy gpudepth klug aethersafha puka crab agnsh kriya iam faulter; do
     _src=""
     _puka_alt=""
@@ -1284,6 +1316,7 @@ for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy
         gpudepth)    _src="../agnos/tests/gpu/build/gpudepth_agnos" ;;
         faulter)     _src="../agnos/tests/fault/build/faulter_agnos" ;;
     esac
+    _src0="$_src"   # pre-match copy — the accounting at the bottom of this loop body explains why
     _staged="build/rootfs/bin/$_t"
     if [ ! -f "$_staged" ]; then
         echo "burn-prep: STAGING GAP -- $_staged is MISSING. install-media would flash no $_t."
@@ -1307,6 +1340,29 @@ for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy
         fi
         _src=""
     fi
+    # ⛔ AND COUNT WHAT WAS ACTUALLY COMPARED, BECAUSE THE SKIP IS SILENT AND ALWAYS HAS BEEN.
+    # `[ -n "$_src" ] && [ -f "$_src" ]` is a check that DISAPPEARS in two different ways, both of them
+    # scoring the same green as a real comparison: `_src` left empty by the case above, or `_src` set
+    # to a path that does not exist. The 2026-08-30 note twelve lines up records the first way costing
+    # a burn's worth of trust (kriya stale by 27,688 bytes, prep said nothing) and adds twelve rows to
+    # close it — but the FIX IS STILL PARTLY INERT AND NOTHING SAYS SO:
+    #   · `klug) _src="" ;;` at :1243 matches FIRST, so the `klug) _src="../klug/build/klug_agnos"`
+    #     row added at :1282 by that very fix is unreachable and klug is compared against nothing;
+    #   · `modeset/gpuwedge/gputri/...` are likewise resolved by the earlier `tests/gpu/build/*` arms,
+    #     so the later `../agnos/tests/gpu/build/*` duplicates are dead too (harmless here, since the
+    #     earlier paths are the correct ones — but they mean the row count reads higher than the
+    #     coverage, which is how the first gap hid).
+    # The loop verdict below says "staged tools match their builds". Over an all-skipped run that is a
+    # sentence about nothing. So: count the real comparisons, NAME the tools that were skipped, and
+    # floor the count — a run that compared nothing must not print that line.
+    # ⚠ COUNTED FROM `_src0`, THE PRE-MATCH COPY, NOT FROM `$_src`. The block just above CLEARS `_src`
+    # when its cmp SUCCEEDS, so by this point an empty `_src` means either "matched" or "nothing to
+    # match against" — the two outcomes this count exists to tell apart. Reading `$_src` here would
+    # score every healthy tool as skipped and every skipped tool as healthy.
+    _cmp_ok=0
+    [ -n "$_src0" ] && [ -f "$_src0" ] && _cmp_ok=1
+    [ -n "$_puka_alt" ] && [ -f "$_puka_alt" ] && _cmp_ok=1
+    if [ "$_cmp_ok" = 1 ]; then _cmp_n=$((_cmp_n + 1)); else _cmp_skipped="$_cmp_skipped $_t"; fi
     if [ -n "$_src" ] && [ -f "$_src" ]; then
         if ! cmp -s "$_src" "$_staged"; then
             echo "burn-prep: STALE STAGED TOOL -- build/rootfs/bin/$_t differs from $_src"
@@ -1318,6 +1374,25 @@ for _t in modeset gpuwedge gputri gputex gpucov gpublend gpublit gpufill gpucopy
         fi
     fi
 done
+# ⛔ VACUITY FLOOR + the count, printed. `cmp -s` failures exit above; the DANGEROUS outcome is the one
+# with no output at all, where every row skipped and the loop fell through green having proven nothing
+# about any staged tool. The floor is 10 of 18 so that a temporarily-absent sibling build does not
+# redden a burn, while a run that lost its comparisons wholesale cannot pass. ⚠ The skipped list is
+# printed EVERY time, not only on failure: a tool that is silently uncompared is the exact hazard this
+# whole block is about, and "which ones" is the part a reader cannot reconstruct from a green line.
+echo "  staleness cmp: compared $_cmp_n of $_cmp_tools staged tools byte-for-byte"
+if [ -n "$_cmp_skipped" ]; then
+    echo "  ⚠ NOT compared (no resolvable <repo>/build/<name>_agnos to compare against):$_cmp_skipped"
+    echo "    These could be stale by any amount and this prep would not notice."
+fi
+if [ "$_cmp_n" -lt 10 ]; then
+    echo "burn-prep: STALENESS GATE COMPARED (ALMOST) NOTHING -- $_cmp_n of $_cmp_tools tools."
+    echo "  Every source path in the case above resolved to an absent or empty file, so the loop"
+    echo "  checked presence only. 'staged tools match their builds' would be a claim about nothing,"
+    echo "  and a stale oracle does not fail -- it agrees."
+    echo "  Fix:  sh scripts/burn/stage-tools.sh --build   (then re-run burn-prep)"
+    exit 1
+fi
 
 # ⛔⛔ AND THE BUILD ITSELF MUST BE NEWER THAN ITS SOURCE. Found 2026-07-27, one level deeper than
 # the gap above and by the same route — a rung whose oracle read as a clean success on stale code.
@@ -1347,10 +1422,22 @@ if [ -z "$_tools" ]; then
     echo "           The staleness gate would silently cover NOTHING. Fix the parse, do not bypass it."
     exit 1
 fi
+_ntools=$(printf '%s\n' "$_tools" | grep -c .)
+_nchecked=0
+_nosrc=""
 for _t in $_tools; do
     _cyr="tests/gpu/$_t.cyr"
     _bin="tests/gpu/build/${_t}_agnos"
-    [ -f "$_cyr" ] || continue
+    # ⛔ THE DERIVATION HAS A FLOOR (above) AND THE *WALK* DID NOT, which is the same defect one step
+    # further in. `[ -f "$_cyr" ] || continue` turns a source path that no longer resolves into a
+    # SILENT skip — and every path here is built by hand from a name and two hardcoded prefixes
+    # ("tests/gpu/$_t.cyr"), so one directory move empties the whole loop at once. The names still
+    # parse, the list is still non-empty, `_srcstale` stays 0, and the verdict below prints "every
+    # --agnos build is newer than its source" over ZERO comparisons. That is exactly the shape the
+    # comment above rejects for the LIST ("the gate silently stops covering whatever was added most
+    # recently"), reappearing in the loop that consumes it.
+    if [ ! -f "$_cyr" ]; then _nosrc="$_nosrc $_t"; continue; fi
+    _nchecked=$((_nchecked + 1))
     if [ ! -f "$_bin" ]; then
         echo "burn-prep: NO --agnos BUILD for $_t -- the cmp above SKIPS it, so staleness is invisible."
         echo "  Fix:  sh scripts/burn/stage-tools.sh --build"
@@ -1367,10 +1454,24 @@ for _t in $_tools; do
     fi
 done
 [ "$_srcstale" -eq 0 ] || exit 1
+if [ -n "$_nosrc" ]; then
+    echo "  ⚠ NO SOURCE FOUND for:$_nosrc  (expected tests/gpu/<name>.cyr) -- NOT freshness-checked."
+fi
+# ⛔ VACUITY FLOOR. 11 tools are derived from stage-tools.sh today and all 11 have a source; the floor
+# is 8 so that retiring a couple of rows does not redden a burn, while a loop that stopped finding
+# sources cannot print the line below. Both numbers are printed so the reader can see the coverage
+# rather than infer it from the absence of complaints.
+if [ "$_nchecked" -lt 8 ]; then
+    echo "burn-prep: FRESHNESS GATE CHECKED (ALMOST) NOTHING -- $_nchecked of $_ntools derived tools."
+    echo "  The names parsed out of stage-tools.sh no longer resolve to tests/gpu/<name>.cyr, so the"
+    echo "  source-newer-than-build walk compared nothing and would still have printed its green line."
+    echo "  Fix the path derivation in this block; do not bypass it."
+    exit 1
+fi
 # ⚠ DERIVED, NOT HARDCODED. This line used to name four tools while the loop checked ten — a message
 # that could disagree with the thing it reports on, which is how the gate read as covering gputex
 # when the reader had no way to tell.
-echo "  staged tools match their builds, and every --agnos build is newer than its source"
+echo "  staged tools match their builds, and all $_nchecked of $_ntools --agnos builds are newer than their source"
 case "$BUILD_TAG" in
     *GPU_RECOVER*)
         # ⛔ The staged tool must be able to invoke the arms, or the burn's own oracle is
@@ -1585,8 +1686,80 @@ MT="$(stat -c %y build/agnos 2>/dev/null | cut -d. -f1)"
 VER="$(cat VERSION 2>/dev/null)"
 SUM="$(sha256sum build/agnos 2>/dev/null | cut -c1-16)"
 echo "  build/agnos: $SZ bytes, built $MT  (AGNOS $VER, $BUILD_TAG)"
-if [ "$BUILD_TAG" != "bare" ]; then
-    echo "  markers verified: the $BUILD_TAG code is compiled AND reached (not merely present)."
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# ⛔⛔ VACUITY FLOOR ON THE MARKER GATE — and it is the loudest claim this script makes.
+#
+# This block used to be, in full:
+#     if [ "$BUILD_TAG" != "bare" ]; then
+#         echo "  markers verified: the $BUILD_TAG code is compiled AND reached (not merely present)."
+#     fi
+# — an AFFIRMATIVE claim about the artifact printed WITHOUT LOOKING AT HOW MANY MARKERS RAN. Every
+# verify_marker call above is inside a `case "$BUILD_TAG" in *FLAG*)` arm, so an arm whose tag matches
+# no pattern runs ZERO of them and this line prints anyway. Measured against the arms in this file:
+# SHADER_OPS, SHADER_BATCH, SHADER_PERM, SHADER_COHERE, SHADER_GRAD, SHADER_GLYPH, SHADER_COV,
+# SHADER_RECT, SHADER_BLEND, SHADER_PROBE, TEX_RGBA, TRI_RGBA, EDGE_COV and EXEC_SELFTEST — fourteen
+# arms — each printed "the <TAG> code is compiled AND reached" having verified NOTHING AT ALL.
+#
+# ⚠ That is not a cosmetic overstatement. It is the exact sentence a burn is adjudicated against, and
+# the file's own history says so twice: the MARKER-COVERAGE GAP note (~:1152) records that "every
+# HDMI_DCCG and ATOM_* burn shipped unverified for the very flag under test" while this same line
+# claimed the whole $BUILD_TAG was compiled and reached, and the 2026-07-15 loss (~:1084) was a burn
+# whose flags silently were not in the artifact. A count of zero is the strongest possible evidence
+# that the claim is unearned, and it was the one number never printed.
+#
+# ⇒ Print the count. Do not print the affirmative sentence over a count of zero. And redden when the
+# tag DOES name a flag this file dispatches on and the dispatch still produced nothing — that is a
+# ROTTED ARM (a reworded marker, a renamed flag, an arm whose body was gutted), which is a burn-
+# invalidating fact that must not exit 0.
+#
+# ⚠ HOW THE FLAG SET IS DERIVED, AND THE FLOOR UNDER *THAT*. The known-flag list is read out of this
+# file's own `*FLAG*)` case arms rather than hand-kept, for the reason burn-prep already states about
+# the staged-tool list (~:1345): "a hardcoded list silently stops covering whatever was added most
+# recently — which is always the thing the current burn is about". A derivation can itself enumerate
+# nothing, so it is floored and printed too. Residual hole, named honestly: DELETING a whole case arm
+# removes its flag from the derived set as well, so that mutation reddens nothing here — what it does
+# do is drop the count to 0, which now withholds the affirmative claim and says so.
+_SELF="$ROOT/scripts/burn/burn-prep.sh"
+_mflags=""
+if [ -r "$_SELF" ]; then
+    _mflags=$(sed -n '/^verify_marker() {/,/^SZ=/p' "$_SELF" \
+              | grep -oE '\*[A-Z][A-Z0-9_]+\*\)' | tr -d '*)' | sort -u)
+fi
+_nmflags=0
+if [ -n "$_mflags" ]; then _nmflags=$(printf '%s\n' "$_mflags" | grep -c .); fi
+if [ "$_nmflags" -lt 10 ]; then
+    echo ""
+    echo "burn-prep: ABORT -- could not derive the marker-dispatch flag list from $_SELF"
+    echo "           (found $_nmflags flags; this file carries ~21). The rot check below would cover"
+    echo "           NOTHING and this prep would certify the artifact on an unchecked claim."
+    echo "           Fix the parse, do not bypass it."
+    exit 1
+fi
+_dispatchable=""
+for _mf in $_mflags; do
+    case "$BUILD_TAG" in *"$_mf"*) _dispatchable="$_dispatchable $_mf" ;; esac
+done
+if [ "$_MARKERS_PRESENT" -gt 0 ]; then
+    echo "  markers verified: $_MARKERS_PRESENT present + $_MARKERS_ABSENT absent -- the $BUILD_TAG code is compiled AND reached (not merely present)."
+elif [ -n "$_dispatchable" ]; then
+    echo ""
+    echo "burn-prep: MARKER GATE VERIFIED NOTHING -- BUILD_TAG=$BUILD_TAG names$_dispatchable,"
+    echo "           which this file HAS a marker arm for, and yet 0 present-markers ran."
+    echo "           ($_MARKERS_ABSENT absent-markers did run, and they prove nothing about this flag.)"
+    echo "           The arm has rotted: a reworded kprintln, a renamed flag, or a gutted case body."
+    echo "           A burn taken on this would be adjudicated against a claim nobody checked."
+    echo "           DO NOT FLASH. Fix the marker arm, then re-run burn-prep."
+    exit 1
+else
+    echo "  markers verified: 0 present + $_MARKERS_ABSENT absent."
+    if [ "$BUILD_TAG" != "bare" ]; then
+        echo "  ⚠ NO MARKER ARM EXISTS FOR '$BUILD_TAG' — this prep proves the build SUCCEEDED and proves"
+        echo "    NOTHING about whether that arm's code reached the artifact. Do not read this burn as"
+        echo "    having tested $BUILD_TAG. To make it evidence, add a case arm above keyed on this tag"
+        echo "    whose marker is a kprintln INSIDE the flag's own #ifdef, in a function called"
+        echo "    unconditionally (see verify_marker's header for why the function body is not enough)."
+    fi
 fi
 
 # Stamp the artifact so staleness is DETECTABLE rather than silent. `sh scripts/burn/burn-verify.sh` re-checks

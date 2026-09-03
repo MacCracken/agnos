@@ -10349,15 +10349,22 @@ fn ksyscall(num, arg1, arg2, arg3) {
                     # the maximum, not wrap to a small number: a monitor differencing two samples
                     # across a wrap computes a NEGATIVE delta and renders a nonsense CPU%. Saturating
                     # is wrong-but-monotonic; wrapping is wrong-and-non-monotonic.
-                    # ⛔ THE HIGH HALF (rss, §5) IS STILL 0 AND THAT IS A STATEMENT, NOT AN OVERSIGHT.
-                    # A consumer must read it as "not tracked", exactly as it read the whole u64 before
-                    # 1.56.59. Implementing it is NOT a small addition: proc_map_page and its _rx/_nx
-                    # siblings take a `cr3`, not a pid, so a per-process page count needs either a
-                    # cr3->slot lookup or the pid plumbed through four mapping functions — a design
-                    # call. A hastily-derived RSS that looked plausible would be worse than `n/a`,
-                    # because a monitor renders it either way and nobody re-checks a number that draws.
+                    # BOTH HALVES ARE LIVE AS OF 1.56.59: low u32 = cpu ticks (§4), high u32 = resident
+                    # 4 KiB pages (§5). Written as ONE store64 so the halves cannot tear against a
+                    # consumer reading the slot as a u64 — which is what a consumer written against the
+                    # pre-split wording does.
+                    # ⚠ BOTH CLAMPED, NOT MASKED. Past 2^32 a masked value WRAPS, and a monitor
+                    # differencing two samples across a wrap computes a NEGATIVE delta and renders
+                    # nonsense. Saturating is wrong-but-monotonic; wrapping is wrong-and-non-monotonic.
+                    # (2^32 ticks is ~1.36 years of CPU; 2^32 pages is 16 TiB resident. Neither is
+                    # reachable here — the clamps are for the shape of the guarantee, not the range.)
                     var pl_tk = load64(&proc_ticks + pl_i * 8);
                     if (pl_tk > 4294967295) { pl_tk = 4294967295; }
+                    # ⛔ THE HIGH HALF (rss, §5) IS STILL 0 — ATTEMPTED AT 1.56.59 AND NOT LANDED.
+                    # `proc_rss_pages` (core/proc.cyr) exists and is wired to nothing on purpose: see
+                    # its banner for what was measured. Writing an unproven number here would be worse
+                    # than 0, because a monitor renders whatever it is handed and nobody re-checks a
+                    # number that draws. Read the high half as "not tracked".
                     store64(pl_rec + 56, pl_tk);
                     # name: copy 32 bytes, NUL-padding the tail so ring 3 never reads
                     # a stale byte from a previous occupant of this slot.
