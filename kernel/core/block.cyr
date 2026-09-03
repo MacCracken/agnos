@@ -192,14 +192,40 @@ fn blk_read(sector, buf) {
 # Returns -1 if `tag` is not a registered backend (defends consumers
 # against bit-mask vs ID confusion). Use `blk_registered & (1 << tag)`
 # to gate calls upstream when iterating.
+# ── PER-DEVICE I/O COUNTERS (1.56.59, telemetry filing §3) ───────────────────────────────────────
+#
+# ⭐ THIS ONE IS *IMPLEMENT* COUNTERS, NOT *EXPOSE* THEM, and the filing said so: this file declared
+# four module vars and `blk_lba_by_tag[6]` and ZERO statistics. The only accumulator in the whole block
+# path was `nvme_io_submit_count` — NVMe-only, submissions not bytes, no read/write split, and RESET BY
+# `bench.cyr` around its measurement windows, which is exactly what makes it unusable as telemetry.
+#
+# ⚠ KEYED BY TAG, matching `blk_lba_by_tag`'s existing convention (tags 1..5, slot 0 unused), so this
+# composes with `blk_enum`#75's device list instead of inventing a second identity scheme.
+# ⚠ SECTORS, NOT BYTES, and the reason is that a sector is what this layer actually transfers: every
+# read/write below moves exactly one. Bytes would require multiplying by `blk_lba_bytes`, which is
+# per-device and can be 4096 — so a byte count computed here would be wrong the moment a 4Kn device
+# appears, which is a LIVE latent path (`block.cyr`'s own `blk_lba_bytes_ok` admits 4096). A consumer
+# that wants bytes multiplies by `blk_info`#79's reported LBA size, which is already exposed.
+# ⚠ MONOTONIC AND NEVER RESET — same requirement as the network counters, and the same reason.
+# ⛔ Do NOT add a reset for benchmarking. That is the defect that made nvme_io_submit_count useless.
+var blk_reads_by_tag[6];    # cumulative sectors READ, indexed by tag
+var blk_writes_by_tag[6];   # cumulative sectors WRITTEN, indexed by tag
+
 fn blk_read_on(tag, sector, buf) {
     if ((blk_registered & (1 << tag)) == 0) { return 0 - 1; }
-    if (tag == BLK_VIRTIO)  { return vblk_blk_read(sector, buf); }
-    if (tag == BLK_NVME)    { return nvme_blk_read(sector, buf); }
-    if (tag == BLK_AHCI)    { return ahci_blk_read(sector, buf); }
-    if (tag == BLK_USB_MS)  { return msc_blk_read(sector, buf); }
-    if (tag == BLK_RAMDISK) { return ramdisk_blk_read(sector, buf); }
-    return 0 - 1;
+    # ⚠ COUNT ONLY A COMPLETED TRANSFER. Every driver arm returns <0 on failure; counting a failed
+    # read would make the number a request count wearing a throughput count's name, and a monitor
+    # differencing it would report bandwidth a sick disk never delivered.
+    var br = 0 - 1;
+    if (tag == BLK_VIRTIO)  { br = vblk_blk_read(sector, buf); }
+    if (tag == BLK_NVME)    { br = nvme_blk_read(sector, buf); }
+    if (tag == BLK_AHCI)    { br = ahci_blk_read(sector, buf); }
+    if (tag == BLK_USB_MS)  { br = msc_blk_read(sector, buf); }
+    if (tag == BLK_RAMDISK) { br = ramdisk_blk_read(sector, buf); }
+    if (br >= 0) {
+        if (tag >= 1) { if (tag <= 5) { store64(&blk_reads_by_tag + tag * 8, load64(&blk_reads_by_tag + tag * 8) + 1); } }
+    }
+    return br;
 }
 
 # Bite (G) helper — bit-test wrapper. Filesystem probes use this to
@@ -237,12 +263,16 @@ fn blk_write(sector, buf) {
 # registered-bit gate as the read side.
 fn blk_write_on(tag, sector, buf) {
     if ((blk_registered & (1 << tag)) == 0) { return 0 - 1; }
-    if (tag == BLK_VIRTIO)  { return vblk_blk_write(sector, buf); }
-    if (tag == BLK_NVME)    { return nvme_blk_write(sector, buf); }
-    if (tag == BLK_AHCI)    { return ahci_blk_write(sector, buf); }
-    if (tag == BLK_USB_MS)  { return msc_blk_write(sector, buf); }
-    if (tag == BLK_RAMDISK) { return ramdisk_blk_write(sector, buf); }
-    return 0 - 1;
+    var bw = 0 - 1;
+    if (tag == BLK_VIRTIO)  { bw = vblk_blk_write(sector, buf); }
+    if (tag == BLK_NVME)    { bw = nvme_blk_write(sector, buf); }
+    if (tag == BLK_AHCI)    { bw = ahci_blk_write(sector, buf); }
+    if (tag == BLK_USB_MS)  { bw = msc_blk_write(sector, buf); }
+    if (tag == BLK_RAMDISK) { bw = ramdisk_blk_write(sector, buf); }
+    if (bw >= 0) {
+        if (tag >= 1) { if (tag <= 5) { store64(&blk_writes_by_tag + tag * 8, load64(&blk_writes_by_tag + tag * 8) + 1); } }
+    }
+    return bw;
 }
 
 # Flush mirror of blk_write_on — issue a device cache-flush (durability

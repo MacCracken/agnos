@@ -1137,6 +1137,28 @@ fn r8169_irq_ack() {
 # in QEMU virtio wins because r8169 is absent. No-NIC case returns sane
 # defaults (caller bails on -1 / 0).
 
+# ── NETWORK TRAFFIC COUNTERS (1.56.59, telemetry filing §1 + §2) ─────────────────────────────────
+#
+# ⭐ DRIVER-AGNOSTIC ON PURPOSE, AND THAT IS WHY THEY LIVE HERE rather than in virtio_net.cyr. The
+# filing offered the virtio ring indices (`vnet_tx_idx`, `vnet_rx_used_last`) as ready-made packet
+# counts, and they are — but they exist only on the QEMU path, so a counter built on them reads 0 on
+# iron, where r8169 runs. `nic_send`/`nic_poll` below are the ONE place both drivers meet, so counting
+# here means the same numbers on both substrates and no per-driver duplication to drift.
+#
+# ⚠ MONOTONIC AND NEVER RESET — the filing's one hard requirement, because a monitor DIFFERENCES two
+# samples to get a rate. Anything that clears them turns the next sample into a negative delta and a
+# nonsense rate line. Nothing in this tree resets them; do not add a reset "for a benchmark" (that is
+# exactly what happened to `nvme_io_submit_count`, which bench.cyr zeroes around its windows, and it
+# is why the filing calls that counter unusable).
+#
+# ⚠ THE LOOPBACK PATH IS DELIBERATELY NOT COUNTED. `net.cyr`'s `lo_ring` drain calls `net_demux_frame`
+# directly and never reaches `nic_poll`, so `lo` traffic does not inflate the wire counters — which is
+# what a monitor showing an interface rate wants.
+var net_tx_packets = 0;   # frames handed to the NIC and accepted
+var net_tx_bytes   = 0;   # their total length
+var net_rx_packets = 0;   # frames taken off the wire
+var net_rx_bytes   = 0;   # their total length
+
 fn nic_ready() {
     if (r8169_present != 0) {
         if (r8169_tx_ring_phys != 0) { return 1; }
@@ -1146,26 +1168,53 @@ fn nic_ready() {
 }
 
 fn nic_send(buf, len) {
+    # ⚠ COUNT ONLY WHAT THE DRIVER ACCEPTED. Both send paths return <0 on refusal (ring full, no link),
+    # and counting a refused frame would make tx_packets drift above what the wire ever carried — the
+    # one thing a rate line must not do.
     if (r8169_present != 0) {
         if (r8169_tx_ring_phys != 0) {
-            return r8169_send(buf, len);
+            var rs = r8169_send(buf, len);
+            if (rs >= 0) {
+                net_tx_packets = net_tx_packets + 1;
+                net_tx_bytes   = net_tx_bytes + len;
+            }
+            return rs;
         }
     }
     if (vnet_active != 0) {
-        return virtio_net_send(buf, len);
+        var vs = virtio_net_send(buf, len);
+        if (vs >= 0) {
+            net_tx_packets = net_tx_packets + 1;
+            net_tx_bytes   = net_tx_bytes + len;
+        }
+        return vs;
     }
     return 0 - 1;
 }
 
 fn nic_poll(buf, maxlen) {
+    # ⚠ COUNT ONLY A REAL FRAME. Both polls return 0 for "ring empty", which is the common case — this
+    # is called from the 100 Hz tick — so counting anything but n > 0 would make rx_packets a tick
+    # counter wearing a packet counter's name.
+    # ⛔ THE r8169 ARM FALLS THROUGH TO virtio ON n <= 0 AND THAT SHAPE IS PRESERVED EXACTLY. Returning
+    # early on a zero would change which driver gets polled on a box that has both.
     if (r8169_present != 0) {
         if (r8169_rx_ring_phys != 0) {
             var n = r8169_poll(buf, maxlen);
-            if (n > 0) { return n; }
+            if (n > 0) {
+                net_rx_packets = net_rx_packets + 1;
+                net_rx_bytes   = net_rx_bytes + n;
+                return n;
+            }
         }
     }
     if (vnet_active != 0) {
-        return virtio_net_poll(buf, maxlen);
+        var vn = virtio_net_poll(buf, maxlen);
+        if (vn > 0) {
+            net_rx_packets = net_rx_packets + 1;
+            net_rx_bytes   = net_rx_bytes + vn;
+        }
+        return vn;
     }
     return 0;
 }

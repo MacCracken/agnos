@@ -60,6 +60,61 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   both shipped in exactly that state. The gate is designed to be red between minting and the peer
   landing. Do not "fix" a future one by editing cyrius, and do not weaken the gate.
 
+### Added — the telemetry counters a system monitor is built from (chakshu §1/§2/§3/§4)
+
+- **§4 per-process CPU time — the section the filing calls "the one that changes what a system monitor
+  can be on AGNOS".** Live in `proclist`#99's `+56` **low u32**, in 100 Hz ticks (one tick = 10 ms, the
+  unit `uptime_ms`#40 already reports in, so a consumer differences two samples exactly as it does
+  Linux jiffies).
+  - ⚠ **A parallel array, not a `struct Process` field, and that is forced.** The struct is 22 fields ×
+    8 B == the 176-byte stride `proc_table` is indexed by, all of it register state. Widening it would
+    move the stride and silently invalidate every `proc_table + i * 176 + N` in the tree.
+  - ⛔ **Charged OUTSIDE the BSP-only gate in `timer_handler`, and that is the whole correctness
+    argument.** That gate exists because `timer_ticks` is one global wall clock and the NIC ring has
+    one consumer. CPU time is the opposite shape: each CPU runs a **different** process and must charge
+    its own. Gating it would attribute every AP's work to nobody — and the bug would present as "the
+    monitor says the box is idle while it is busy", which is the hardest kind to trace to an
+    accounting line.
+  - ⛔ **Zeroed at slot ALLOC, not at exit or reap.** Clearing at exit would let a monitor sampling
+    between exit and reap see a live process with 0 ticks — indistinguishable from one that just
+    started. Alloc is the single moment the old value provably means nothing.
+  - ⚠ **Saturates at 2^32-1, does not wrap.** A wrap gives a consumer a NEGATIVE delta and a nonsense
+    CPU%. Saturating is wrong-but-monotonic; wrapping is wrong-and-non-monotonic.
+- **§1 packet counters + §2 network byte counters** — `net_config`#61 fields **8-11**.
+  - ⭐ **Counted at `nic_send`/`nic_poll`, NOT at the virtio ring indices the filing offered.** Those
+    exist only on the QEMU path, so a counter built on them reads 0 on iron where r8169 runs. Those two
+    functions are the one place both drivers meet. Loopback is excluded by construction — it calls
+    `net_demux_frame` directly and never reaches them.
+  - ⭐ **Extended #61 rather than minting, so it shipped to consumers the same day**:
+    `sys_net_config(field)` already passes an arbitrary field id, so there is **no cyrius peer to wait
+    for**. That is the difference between landing in this cut and landing in a toolchain release.
+  - ⚠ Only a transfer the driver **accepted** is counted; both send paths return <0 on refusal, and
+    counting a refused frame makes tx drift above what the wire ever carried.
+- **§3 per-device disk I/O — `blkstats`#105** `(tag, field) -> sectors`, keyed by `blk_enum`#75's
+  existing tag list. This one was *implement* counters, not *expose* them: `block.cyr` held **zero**
+  statistics, and the only accumulator in the whole block path was NVMe-only, counted submissions not
+  bytes, and is **reset by `bench.cyr`** — which is exactly what makes it unusable as telemetry.
+  - ⚠ **Sectors, not bytes.** This layer moves exactly one sector per call; a byte figure needs the
+    per-device LBA size, which can be **4096** — a live latent path (`blk_lba_bytes_ok` admits it), so
+    a kernel-side byte count would be wrong the moment a 4Kn device appears.
+  - ⛔ **No `blk_registered` gate**: an unregistered device legitimately reports 0, and refusing it
+    would collapse "has done no I/O" and "does not exist" into one answer.
+- ⛔ **§5 per-process RSS is NOT done, and is recorded as a decision rather than left looking closed.**
+  The `+56` high u32 reads 0. `proc_map_page` and its siblings take a **`cr3`, not a pid**, so
+  per-process page accounting needs a cr3→slot lookup or the pid plumbed through four functions — a
+  design call. A hastily-derived RSS that *looked* plausible would be worse than `n/a`, because a
+  monitor renders it either way and nobody re-checks a number that draws.
+- **Boot-proven** — `scripts/harness/telemetry-test.py` + `tests/telemetry/tlm.cyr`, exit **95**.
+  ⛔ **The oracle is "the counter MOVED", not "the counter is readable."** Every one of these would
+  read 0 on a kernel that declared the variable and never incremented it, and 0 is a plausible-looking
+  answer — so a gate that merely called the syscalls would pass on exactly the defect worth catching.
+  Each assertion samples, generates real load, and requires an increase; monotonicity is asserted
+  separately, because "never decreases" is a different claim from "increases".
+  ⚠ **Its first run FAILED at §1 and the gate was right** — the harness had no `-netdev`, so
+  `nic_send` correctly returned -1 and counted nothing. A correct kernel scoring a red because the
+  harness was wrong is the gate working. Mutation-proven on two axes afterwards (killing the tick
+  increment yields 84; wiring tx bytes to the packet increment yields 89).
+
 ### Added — the HID iron burn finally has an oracle (issue residual #1)
 
 - ⛔⛔ **THE ROADMAPPED BURN WAS UNFALSIFIABLE, AND THAT IS WHY THIS IS THE ITEM THAT MATTERED.**

@@ -54,6 +54,28 @@ fn proc_current_set(v) {
     return 0;
 }
 var sched_active = 0;
+
+# ── PER-PROCESS CPU TIME (1.56.59, telemetry filing §4) ───────────────────────────────────────────
+#
+# ⭐ THE FIELD A SYSTEM MONITOR EXISTS TO SHOW. chakshu's filing: "If only one gets done, §4 is the one
+# that changes what a system monitor can be on AGNOS." Its CPU% column read `n/a` because nothing in
+# this kernel counted a process's time anywhere.
+#
+# ⚠ A PARALLEL ARRAY, NOT A struct Process FIELD, AND THAT IS FORCED. `struct Process` is 22 fields x
+# 8 B == the 176-byte stride `proc_table` is indexed by; every one of those fields is register state
+# and there is no spare slot. Widening the struct would move the stride and silently invalidate every
+# `proc_table + i * 176 + N` in the tree — and this file alone has dozens. A side array costs 128 B.
+#
+# ⚠ INDEXED BY SLOT, NOT BY PID, matching `proc_table`'s own convention (`proc_get_state` takes what
+# it calls `pid` and indexes by it directly). Ticks accrue at the 100 Hz timer rate, so one unit is
+# 10 ms — the resolution `uptime_ms`#40 already reports in, deliberately, so a consumer differencing
+# two samples is doing the same arithmetic it does on Linux jiffies.
+#
+# ⛔ NOT RESET ON REAP. A slot is zeroed by `proc_alloc_slot` when it is handed out, which is the only
+# moment the count means nothing; clearing it at exit would race a monitor sampling between exit and
+# reap and hand it a live process with 0 ticks — indistinguishable from a process that just started.
+var proc_ticks[16];     # per-slot 100 Hz tick count — the process's accumulated CPU time
+
 var proc_signals[128];  # 16 processes x 8 bytes
 var proc_sigmask[128];  # 16 processes x 8 bytes
 # 1.44.3 (multi-threading): per-process saved CS/SS selectors so the scheduler can
@@ -408,6 +430,12 @@ fn proc_alloc_slot() {
         proc_count = proc_count + 1;
     }
     store64(&proc_table + idx * 176 + 8, 3);   # CLAIMING — release the lock with the slot owned
+    # ⭐ ZERO THE CPU-TIME COUNTER HERE — at ALLOC, not at exit or reap (telemetry §4). This slot may
+    # have held a previous process whose ticks are still in the array; a new process must not inherit
+    # them. ⛔ AND NOT AT REAP: a monitor sampling between exit and reap would then see a live process
+    # with 0 ticks, which is indistinguishable from one that just started. Alloc is the single moment
+    # the old value provably means nothing.
+    store64(&proc_ticks + idx * 8, 0);
     proctab_spin_unlock();
     store64(&proc_signals + idx * 8, 0);
     store64(&proc_sigmask + idx * 8, 0);

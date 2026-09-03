@@ -1,31 +1,53 @@
 # 2026-09-02 — ring-3 telemetry gaps a system monitor needs
 
-**Status:** 🟠 **OPEN — a consumer menu. 3 of 9 sections CLOSED at 1.56.59; §4 is blocked on a conflict
-this filing did not know about.**
+**Status:** 🟠 **OPEN — 7 of 9 sections CLOSED at 1.56.59. Only §5 (per-process RSS) is genuine
+outstanding work; §7 was never ours.**
 
-✅ **Closed at 1.56.59:**
-* **§0a** — the stale `statfs` comment (`syscall.cyr`) is rewritten. It claimed FAT/exFAT were "filed as
-  a follow-on rather than half-built" while both arms sat 20 lines beneath it. Confirmed: the comment,
-  not the code, was wrong.
-* **"One small annoyance"** — both console one-shots (`proclist`#99 and `ptrscan`#98) now
-  `klug_append` to the log ring instead of `kprintln` to the console, so they no longer land inside
-  `shu -p`'s output. The diagnostic is kept in full and is still reachable with `run /bin/klug`. ⚠ Since
-  1.56.58 those lines also carried a `[   37.727698] ` uptime prefix, so this was getting worse.
-* **§6 mount enumeration** — shipped as `mountlist`#104, boot-proven. ⭐ **You said "do not prioritise
-  this"; we did it anyway, because crab filed the same ask the same day with a case you did not have:
-  ALIASING.** An ext2-less boot mounts the same backend under both `/` and `/mnt/…`, so the
-  three-`statfs`-probes workaround lists one volume twice and cannot detect it. Your workaround is
-  correct for a monitor and wrong for a sidebar — the capability was worth more than either filing alone
-  suggested.
+✅ **§1 packet counters + §2 network byte counters** — `net_config`#61 gains fields **8-11**
+(tx_packets / rx_packets / tx_bytes / rx_bytes). ⭐ **Counted at `nic_send`/`nic_poll`
+(`core/r8169.cyr`), NOT at the virtio ring indices you offered** — those exist only on the QEMU path,
+so a counter built on them would read 0 on iron where r8169 runs. That seam is the one place both
+drivers meet, so the numbers mean the same thing on both substrates. Loopback is excluded by
+construction. ⭐ **Extended #61 rather than minting a number, and that means you can read them TODAY**:
+`sys_net_config(field)` already passes an arbitrary field id, so there is no cyrius peer to wait for.
 
-⛔ **§4 (per-process CPU time) and §5 (per-process RSS) BOTH claim `proclist`'s single `+56` slot, and
-the kernel comment promises both.** The record is exactly 64 bytes with `name[32]` spanning +24..+55, so
-+56 IS the final 8 bytes — one slot, two fields. This must be settled BEFORE either is built, because
-the fill loop already writes `store64(pl_rec + 56, 0)` and ring 3 will start reading whatever lands
-there. Cheap now, an ABI break later. **Not a defect in your filing** — you could not have seen it.
+✅ **§3 disk I/O counters** — new `blkstats`#105 `(tag, field) -> sectors`, field 0 read / 1 written,
+keyed by `blk_enum`#75's existing tag list as you asked. ⚠ **SECTORS, not bytes, deliberately**: this
+layer moves exactly one sector per call, and a byte figure needs the per-device LBA size — which can
+be 4096, a live latent path here. Multiply by `blk_info`#79's reported size. Cyrius peer filed at
+`cyrius/docs/development/issues/2026-09-02-agnos-syscall-105-blkstats-wrapper.md`; until it lands,
+issue 105 raw.
 
-⚠ **§7 (load average) is settled repo policy, not a pending question:** `agnos-userland-abi.md:239`
-rules load-avg out of the kernel by name. Your userland-tally plan is the intended path.
+✅ **§4 per-process CPU time — the one you said changes what a monitor can be.** Live in
+`proclist`#99's `+56` **low u32**, in 100 Hz ticks (one tick = 10 ms, the unit `uptime_ms`#40 already
+uses). Charged in the timer ISR to `proc_current_get()` on **every CPU** — outside the BSP-only gate,
+because each CPU runs a different process. Zeroed at slot ALLOC, not at reap, so a monitor sampling
+between exit and reap never sees a live process with 0 ticks. Saturates rather than wraps.
+
+✅ **§6 mount enumeration** — `mountlist`#104, shipped and boot-proven. ⭐ You said "do not prioritise
+this"; crab filed the same ask the same day with a case you did not have — **aliasing** — and it
+changed the verdict. Details in the archived crab record.
+
+✅ **§0a** stale `statfs` comment deleted. ✅ **the console `kprintln`** — both `proclist` and `ptrscan`
+one-shots now go to the klug ring, not the console, so `shu -p` is clean.
+
+⚠ **§7 load average** is settled repo policy, not a pending question: `agnos-userland-abi.md:239` rules
+load-avg out of the kernel by name. Your userland-tally plan is the intended path.
+
+⛔ **§5 per-process RSS — GENUINELY NOT DONE, and the reason is a design call, not effort.** The `+56`
+**high u32** is reserved for it and reads 0. `proc_map_page` and its `_rx`/`_nx` siblings take a
+**`cr3`, not a pid**, so per-process page accounting needs either a cr3→slot lookup or the pid plumbed
+through four mapping functions. A hastily-derived RSS that looked plausible would be worse than `n/a`,
+because a monitor renders it either way and nobody re-checks a number that draws. Read the high half
+as "not tracked", exactly as you read the whole u64 before 1.56.59.
+
+⚠ **§8 per-core CPU utilisation** now has its prerequisite: `proc_ticks` is per-slot and charged
+per-CPU, so idle/busy accounting is a smaller step than when you filed.
+
+**All of the above is boot-proven, not compiled**: `scripts/harness/telemetry-test.py` +
+`tests/telemetry/tlm.cyr`, exit 95. ⛔ The oracle is **"the counter MOVED"**, not "the counter is
+readable" — a declared-but-never-incremented variable reads 0, which looks like a valid answer, so
+every assertion samples, generates real load, and requires an increase. Mutation-proven on two axes.
 
 ---
 

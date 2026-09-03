@@ -47,6 +47,25 @@ fn pic_init() {
 # rsp_after_push is the stack pointer with all 9 regs + hardware frame on it.
 fn timer_handler(rsp_after_push) {
     pd510_tick_watch();
+    # ⭐ CHARGE THIS TICK TO THE RUNNING PROCESS (1.56.59, telemetry §4) — the per-process CPU time a
+    # monitor's CPU% column is built from.
+    # ⛔ OUTSIDE THE pcpu_cpu()==0 GATE BELOW, DELIBERATELY, AND THIS IS THE WHOLE CORRECTNESS ARGUMENT.
+    # That gate exists because `timer_ticks` is ONE GLOBAL wall clock and the NIC ring has ONE consumer,
+    # so only the BSP may touch them. CPU time is the opposite shape: each CPU runs a DIFFERENT process
+    # and must charge its OWN. Gating this would silently attribute every AP's work to nobody, and the
+    # bug would look like "the monitor says the box is idle while it is busy" — the exact symptom that
+    # is hardest to trace back to an accounting line.
+    # ⚠ `proc_current_get()` is already per-CPU (it reads the APIC id once cpu_count>=2), so there is no
+    # second CPU-identity mechanism here to keep in step with the first.
+    # ⚠ Charging the WHOLE tick to whoever is running at the boundary is the standard sampling model
+    # (Linux jiffy accounting does the same). It is statistical, not exact: a process that always
+    # yields just before the tick is undercounted. Over a monitor's sampling window that is noise, and
+    # the alternative — reading the TSC on every context switch — puts an rdtsc + divide in the
+    # scheduler's hot path to sharpen a number nobody reads at that resolution.
+    var tk_p = proc_current_get();
+    if (tk_p >= 0) {
+        if (tk_p < 16) { store64(&proc_ticks + tk_p * 8, load64(&proc_ticks + tk_p * 8) + 1); }
+    }
     # 1.46.x SMP sub-bite 6b: the BSP owns the wall clock + the single NIC ring. An AP's
     # timer tick must NOT bump timer_ticks (one global clock) nor re-enter net_rx_drain (one
     # shared r8169 ring, single-consumer). Gate both behind pcpu_cpu()==0. ALWAYS-TRUE

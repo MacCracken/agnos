@@ -9273,6 +9273,36 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 78) { stack_canary_check(canary); return blk_write_sys(arg1, arg2, arg3, ksyscall_a4_get()); } # blk_write(h, lba, buf, nsec) -> nsec (GATED on blk_rw_armed)
     if (num == 79) { stack_canary_check(canary); return blk_info_sys(arg1, arg2); }                          # blk_info(h, out) -> 0
     if (num == 80) { stack_canary_check(canary); return blk_close_sys(arg1); }                               # blk_close(h) -> 0
+    if (num == 105) {
+        # blkstats(tag=arg1, field=arg2) -> cumulative sector count, or -1.
+        #   field 0 = sectors READ · field 1 = sectors WRITTEN
+        # tag is a BLK_* device tag (1 virtio · 2 nvme · 3 ahci · 4 usb-ms · 5 ramdisk), the SAME
+        # identity `blk_enum`#75 hands out — so a consumer enumerates devices with #75 and reads each
+        # one's traffic here, with no second naming scheme to keep in step.
+        #
+        # ⭐ THE DISK RATE LINE (telemetry filing §3). Counted at `blk_read_on`/`blk_write_on`
+        # (core/block.cyr), the one place every backend passes through, and only on a COMPLETED
+        # transfer. Monotonic since boot and never reset — a monitor differences two samples.
+        #
+        # ⚠ A FIELD SELECTOR, NOT A RECORD, AND NOT AN EXTENSION OF `blk_info`#79. #79 fills a fixed
+        # struct with no length argument, so widening it is an ABI break for every shipped caller —
+        # the filing says as much. Two scalar arguments and an integer return need no buffer, so there
+        # is no user-range validation surface here at all and nothing to get wrong about it.
+        #
+        # ⚠ SECTORS, NOT BYTES, deliberately: this layer transfers exactly one sector per call, and a
+        # byte count would have to multiply by the per-device LBA size, which can be 4096. A consumer
+        # wanting bytes multiplies by `blk_info`#79's reported size, which it already has.
+        #
+        # ⛔ NO `blk_registered` GATE. An unregistered device legitimately reports 0, and refusing it
+        # would make "this device has done no I/O" and "this device does not exist" the same answer —
+        # the class of collapse this cut has spent its time removing. Only the RANGE is refused.
+        if (arg1 < 1) { stack_canary_check(canary); return 0 - 1; }
+        if (arg1 > 5) { stack_canary_check(canary); return 0 - 1; }
+        if (arg2 == 0) { stack_canary_check(canary); return load64(&blk_reads_by_tag  + arg1 * 8); }
+        if (arg2 == 1) { stack_canary_check(canary); return load64(&blk_writes_by_tag + arg1 * 8); }
+        stack_canary_check(canary);
+        return 0 - 1;
+    }
     # directory listing (#81) — ring-3 readdir over the ext2 root; fills 64-byte {name,type} records.
     if (num == 81) { stack_canary_check(canary); return ext2_readdir_sys(arg1, arg2, arg3); }                # readdir(path, buf, max) -> count
     # ⭐ resumable directory listing (#101, 1.56.50) — #81 with a cursor, so a directory larger than
@@ -10311,7 +10341,24 @@ fn ksyscall(num, arg1, arg2, arg3) {
                     store64(pl_rec + 0, pl_pid);
                     store64(pl_rec + 8, pl_st);
                     store64(pl_rec + 16, proc_get_ppid(pl_pid));
-                    store64(pl_rec + 56, 0);
+                    # ⭐ +56 IS TWO u32 HALVES (decided 1.56.59): low = cpu ticks (§4), high = rss
+                    # pages (§5). Written as one store64 so the halves cannot tear against a consumer
+                    # reading the slot as a u64 — which is exactly what a consumer written against the
+                    # pre-split wording does.
+                    # ⚠ CLAMPED, NOT MASKED. A tick count past 2^32 (~1.36 years of CPU) must pin at
+                    # the maximum, not wrap to a small number: a monitor differencing two samples
+                    # across a wrap computes a NEGATIVE delta and renders a nonsense CPU%. Saturating
+                    # is wrong-but-monotonic; wrapping is wrong-and-non-monotonic.
+                    # ⛔ THE HIGH HALF (rss, §5) IS STILL 0 AND THAT IS A STATEMENT, NOT AN OVERSIGHT.
+                    # A consumer must read it as "not tracked", exactly as it read the whole u64 before
+                    # 1.56.59. Implementing it is NOT a small addition: proc_map_page and its _rx/_nx
+                    # siblings take a `cr3`, not a pid, so a per-process page count needs either a
+                    # cr3->slot lookup or the pid plumbed through four mapping functions — a design
+                    # call. A hastily-derived RSS that looked plausible would be worse than `n/a`,
+                    # because a monitor renders it either way and nobody re-checks a number that draws.
+                    var pl_tk = load64(&proc_ticks + pl_i * 8);
+                    if (pl_tk > 4294967295) { pl_tk = 4294967295; }
+                    store64(pl_rec + 56, pl_tk);
                     # name: copy 32 bytes, NUL-padding the tail so ring 3 never reads
                     # a stale byte from a previous occupant of this slot.
                     var pl_src = proc_name_ptr(pl_pid);
@@ -10875,6 +10922,20 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg1 == 5) { stack_canary_check(canary); return icmp_rx; }
         if (arg1 == 6) { stack_canary_check(canary); return icmp_replies_sent; }
         if (arg1 == 7) { stack_canary_check(canary); return icmp_timeouts; }
+        # ── Traffic counters (1.56.59, telemetry filing §1 + §2) ──────────────────────────────────
+        # ⭐ EXTENDED #61 RATHER THAN MINTING A NUMBER, which is what this arm's own 1.56.48 note argues
+        # for: #61 is already a pure field selector with no buffer, so a new field costs one row here,
+        # no ABI record shape, and NO CYRIUS PEER — `sys_net_config(field)` already exists and takes an
+        # arbitrary field id, so a consumer can read these today with no toolchain change at all. That
+        # is the difference between shipping this cut and waiting for a peer release.
+        # ⚠ Monotonic since boot and never reset — a monitor differences two samples to get a rate.
+        # ⚠ Both NICs feed these: they are counted at `nic_send`/`nic_poll` (core/r8169.cyr), the one
+        # seam r8169 and virtio-net share, so the numbers mean the same thing on iron and under QEMU.
+        # Loopback is excluded by construction (it never reaches those functions).
+        if (arg1 == 8)  { stack_canary_check(canary); return net_tx_packets; }
+        if (arg1 == 9)  { stack_canary_check(canary); return net_rx_packets; }
+        if (arg1 == 10) { stack_canary_check(canary); return net_tx_bytes; }
+        if (arg1 == 11) { stack_canary_check(canary); return net_rx_bytes; }
         stack_canary_check(canary);
         return 0 - 1;
     }

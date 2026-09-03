@@ -1,0 +1,18 @@
+[package]
+name = "tlm"
+version = "0.1.0"
+description = "agnos ring-3 exerciser for the 1.56.59 telemetry counters — proves per-process CPU ticks (#99 +56), network packet/byte counters (#61 fields 8-11) and per-device disk sectors (#105) are LIVE and MONOTONIC, not merely present; exits 95 iff every counter moved under load."
+license = "GPL-3.0-only"
+language = "cyrius"
+cyrius = "6.5.43"
+
+[build]
+src = "tlm.cyr"
+output = "build/tlm"
+
+# ⚠ #105 IS ISSUED BY RAW NUMBER ON PURPOSE, and it has no wrapper yet — the cyrius peer is filed at
+# cyrius/docs/development/issues/2026-09-02-agnos-syscall-105-blkstats-wrapper.md. Even once it lands
+# this stays raw, the same rule tests/readdir/rdat.cyr records: this is the ABI exerciser, and routing
+# it through the stdlib wrapper would test the wrapper's agreement with itself, not the kernel arm.
+[deps]
+stdlib = ["syscalls"]

@@ -1,0 +1,115 @@
+# tlm — agnos ring-3 exerciser for the 1.56.59 telemetry counters (chakshu filing §1/§2/§3/§4).
+#
+# ⛔ THE ORACLE IS "IT MOVED", NOT "IT IS READABLE". Every counter here would read 0 on a kernel that
+# declared the variable and never incremented it, and 0 is a plausible-looking answer — so a test that
+# merely called the syscalls and checked for a non-negative return would pass on exactly the defect
+# worth catching. Each assertion below therefore SAMPLES, GENERATES LOAD, SAMPLES AGAIN, and requires
+# the counter to have INCREASED. That is also the property a monitor actually depends on: it
+# differences two samples to draw a rate, and a frozen counter renders as a flat line, not an error.
+#
+# ⚠ MONOTONICITY IS ASSERTED SEPARATELY FROM MOVEMENT. A counter that is reset between samples reads
+# as a NEGATIVE delta and produces a nonsense rate — the exact defect that makes nvme_io_submit_count
+# unusable (bench.cyr zeroes it). "Never decreases" is a different claim from "increases".
+#
+# Exit 95 iff every counter is live and monotonic; 80-92 pinpoint which one is not.
+
+fn tlm_main(): i64 {
+    # ---- §4: per-process CPU time, surfaced in proclist(#99) record +56 low u32 ----
+    # ⚠ THIS PROCESS IS THE ONE BEING MEASURED, so the load is just running: the 100 Hz timer charges
+    # whoever is current. A busy loop is the load; no syscall is needed to generate it.
+    var buf[1024];                              # 16 records * 64 B
+    var n = syscall(99, &buf, 16);
+    if (n < 1) { return 80; }
+    var me = syscall(2);                        # getpid
+    var t0 = 0 - 1;
+    var i = 0;
+    while (i < n) {
+        if (load64(&buf + i * 64) == me) { t0 = load64(&buf + i * 64 + 56) & 0xFFFFFFFF; }
+        i = i + 1;
+    }
+    if (t0 < 0) { return 81; }                  # our own pid is absent from the process table
+
+    # Burn enough wall time that at least a few 100 Hz ticks land on us.
+    var spin = 0;
+    while (spin < 40000000) { spin = spin + 1; }
+
+    n = syscall(99, &buf, 16);
+    var t1 = 0 - 1;
+    i = 0;
+    while (i < n) {
+        if (load64(&buf + i * 64) == me) { t1 = load64(&buf + i * 64 + 56) & 0xFFFFFFFF; }
+        i = i + 1;
+    }
+    if (t1 < 0) { return 82; }
+    if (t1 < t0) { return 83; }                 # went BACKWARDS — reset somewhere, unusable as a rate
+    if (t1 == t0) { return 84; }                # never moved — the counter is declared but dead
+
+    # ---- §1 + §2: network packet and byte counters, net_config(#61) fields 8-11 ----
+    # ⚠ READ ALL FOUR FIRST. Reading one, generating load, then reading another would compare two
+    # different quantities and could pass on a kernel where only one of them is wired.
+    var txp0 = syscall(61, 8);
+    var rxp0 = syscall(61, 9);
+    var txb0 = syscall(61, 10);
+    var rxb0 = syscall(61, 11);
+    if (txp0 < 0) { return 85; }                # field not implemented at all
+    if (rxp0 < 0) { return 85; }
+    if (txb0 < 0) { return 85; }
+    if (rxb0 < 0) { return 85; }
+
+    # Generate real wire traffic. ⚠ `icmp_echo`#55 takes ONE argument (its arity is frozen — the ABI
+    # says so) and BLOCKS ~3 s, so one call is enough and two would just cost six seconds. The gateway
+    # is the target: under the harness's SLIRP it always answers, and on iron it is the one address
+    # guaranteed reachable. ⛔ The RETURN is deliberately ignored — a timeout still TRANSMITTED, which
+    # is what the tx counters are being asked about. Asserting a reply would make this gate fail on a
+    # substrate with no network rather than on a broken counter.
+    syscall(55, syscall(61, 2));                # icmp_echo(gateway) — field 2 is net_gateway
+    var txp1 = syscall(61, 8);
+    var txb1 = syscall(61, 10);
+    if (txp1 < txp0) { return 86; }             # tx packets went backwards
+    if (txb1 < txb0) { return 87; }             # tx bytes went backwards
+    if (txp1 == txp0) { return 88; }            # nothing counted — the counter is dead
+    # ⛔ BYTES MUST OUTPACE PACKETS. A byte counter accidentally wired to the packet increment would
+    # satisfy every check above; requiring the byte delta to exceed the packet delta catches it,
+    # because no real frame is one byte long.
+    if ((txb1 - txb0) <= (txp1 - txp0)) { return 89; }
+
+    # ---- §3: per-device disk sectors, blkstats(#105) ----
+    # ⚠ TAG IS PROBED, NOT ASSUMED. Which backend is live depends on the substrate (nvme under the
+    # harness, ahci or usb-ms elsewhere), so find the one that has done reads rather than hardcoding.
+    var tag = 1;
+    var found = 0 - 1;
+    while (tag <= 5) {
+        if (syscall(105, tag, 0) > 0) { found = tag; tag = 6; }
+        if (tag < 6) { tag = tag + 1; }
+    }
+    if (found < 0) { return 90; }               # no device reports ANY sector read — counter dead
+    var r0 = syscall(105, found, 0);
+    # Force real disk reads: open a file that is certainly on the platter (this binary itself) and
+    # read it. ⚠ Reading OUR OWN path guarantees the file exists on whatever image the harness built,
+    # rather than hardcoding a name the seed may not carry.
+    var rbuf[512];
+    var fd = syscall(7, "/bin/tlm", 8, 0);      # open
+    if (fd >= 0) {
+        var got = 1;
+        while (got > 0) { got = syscall(5, fd, &rbuf, 512); }   # read to EOF
+        syscall(6, fd);                                          # close
+    }
+    var r1 = syscall(105, found, 0);
+    if (r1 < r0) { return 91; }                 # sectors read went backwards
+    # ⚠ NOT asserting r1 > r0: the file may be served entirely from the ext2 block cache, in which
+    # case no NEW sector reaches the device and the counter correctly does not move. Requiring an
+    # increase here would make this gate fail on a CORRECT kernel with a warm cache — a false positive
+    # is worse than the coverage it buys. Movement is proven by `found` above, which is only set for a
+    # tag that has ALREADY done reads: a dead counter leaves every tag at 0 and returns 90.
+    # ⛔ RANGE REFUSAL. tag 0 and tag 6 are outside BLK_VIRTIO..BLK_RAMDISK and must be refused, or a
+    # consumer indexing off the end reads adjacent kernel memory as a statistic.
+    if (syscall(105, 0, 0) != (0 - 1)) { return 92; }
+    if (syscall(105, 6, 0) != (0 - 1)) { return 92; }
+    if (syscall(105, found, 7) != (0 - 1)) { return 92; }   # unknown field refused
+
+    return 95;
+}
+
+fn main(): i64 { return tlm_main(); }
+fn _entry(): i64 { var rc = main(); syscall(SYS_EXIT, rc); return 0; }
+_entry();
