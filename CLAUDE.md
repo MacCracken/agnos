@@ -54,8 +54,8 @@ sh scripts/test.sh --all                # both
 sh scripts/check.sh                     # 32-gate project validation
 ```
 
-⛔ **aarch64 does not currently compile.** `sh scripts/build.sh --aarch64` fails with 30 reachable
-undefined functions and 18 undefined variables — `arch/aarch64/stubs.cyr` has not kept up with
+⛔ **aarch64 does not currently compile.** `sh scripts/build.sh --aarch64` fails with **32** reachable
+undefined functions and **46** undefined variables (re-measured 1.56.59; the surface has GROWN) — `arch/aarch64/stubs.cyr` has not kept up with
 `core/`. It went unnoticed because `test.sh`'s cross-compiler probe named `cc5_aarch64`, a binary
 dropped at cyrius v6.1.0, so the aarch64 half of `--all` took an early return on every run and
 scored nothing. Both the probe and the silent-skip are fixed at 1.56.51; the port itself is not.

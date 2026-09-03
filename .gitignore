@@ -108,3 +108,7 @@ tests/*/build/
 #   · no cyrius.lock is written for stdlib-only manifests (the lock covers `[deps.NAME]` git deps),
 #     so untracking lib/ strands nothing — confirmed, no lock appears after a tests/* build.
 tests/*/lib/
+
+# Python bytecode from the scripts/harness/*.py boot harnesses. Untracked noise otherwise —
+# every harness run leaves one, and it shows up in `git status` beside real work.
+__pycache__/

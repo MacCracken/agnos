@@ -80,8 +80,36 @@ var hid_first_report = 0;   # one-shot: has the registry dispatched a keyboard r
 var hid_first_report_pending = 0;   # kbd one-shot owed to the console
 var hid_mouse_first_pending  = 0;   # mouse one-shot owed to the console
 var hid_ep_needs_reset[8];          # per-row: endpoint Halted, owed a reset from thread context
+
+# ── HALT-RECOVERY TALLY (1.56.59) — THE ORACLE THE IRON BURN NEEDS ────────────────────────────────
+#
+# ⛔⛔ WITHOUT THESE THE BURN IS UNFALSIFIABLE, WHICH IS WHY THEY EXIST. The roadmapped procedure is
+# "provoke a real endpoint halt on archaemenid and confirm input resumes". Before 1.56.59 a provoked
+# halt whose state read came back non-Halted left **ZERO TRACE**: hid_recover_halted cleared the flag
+# before the state check and had no else branch. So the operator could not tell
+#     (a) no stall ever reached the driver — the provocation failed, and
+#     (b) a stall reached us, we saw the flag, and recovery DECLINED
+# apart. Both are silence, and (b) reads as a passing run. A burn that cannot fail honestly is not a
+# gate; it is a trip to the machine that produces a feeling.
+#
+# ⚠ COUNTERS, NOT A LOG LINE, AT THE FLAG-SET SITE — AND THE CONTEXT IS WHY. The flag is set inside
+# `hid_poll`, which the 100 Hz timer ISR calls (arch/x86_64/pic.cyr), so kprint is forbidden there:
+# it takes `console_spin_lock`, a bare non-recursive xchg spinlock. `klug_append` would be ISR-safe
+# (fault_kill_current uses it for exactly that reason) but it mutates the ring head OUTSIDE the
+# console lock, so an ISR append can interleave mid-line with a locked kprint on another CPU and
+# garble the log this instrument exists to produce. A plain integer add has neither problem.
+# ⇒ The ISR counts. Thread context reports.
+var hid_halt_flagged   = 0;   # halting completion codes seen (4/6/8) — incremented in ISR context
+var hid_halt_confirmed = 0;   # of those, the controller's EP state agreed it was Halted
+var hid_halt_declined  = 0;   # of those, it did NOT — the case that used to be silent
 #ifdef HID_CC_INJECT
 var hid_cc_inject_left = 20;        # test-only: reject this many completions (> the 16 armed TRBs)
+#endif
+#ifdef HID_CC_INJECT_HALT
+# Separate declaration, not a shared one: the two flags are independent and either may be defined
+# alone. 3 is deliberately small — a halting code flags the row, and one flagged row is all the
+# oracle needs; 20 would just print the decline line 20 times.
+var hid_cc_inject_left = 3;
 #endif
 var hid_ep_slot[8];    # xHCI slot id
 var hid_ep_dci[8];     # Device Context Index of the interrupt-IN endpoint
@@ -562,6 +590,17 @@ fn hid_kbd_init() {
     # longer exist and the drain would dispatch reports out of a dead device's buffer.
     hid_ep_count = 0;
     kprintln("hid: keyboard layer initialized", 31);
+    #ifdef HID_CC_INJECT_HALT
+    # ⛔ AN INDEPENDENT WITNESS THAT THIS BUILD CARRIES THE HALT INJECTOR, and it exists because the
+    # gate that needs it caught itself being vacuous. scripts/harness/hid-halt-oracle-test.py must
+    # refuse to run against a kernel without the injector — otherwise it greps for an absent string
+    # and scores a pass on a build that exercised nothing. Its FIRST attempt keyed that precondition
+    # on the SAME string it asserts, so deleting the decline line made the gate SKIP instead of FAIL:
+    # the oracle derived from the artifact under test, the exact V5 shape the 1.56.58 sweep fixed 39
+    # of. This banner is a SEPARATE marker, so removing the decline line now reddens the gate.
+    # ⚠ Also serves the operator: a kernel that prints this must never be flashed.
+    kprintln("hid: HALT INJECTION ARMED -- test build, never flash this", 57);
+    #endif
     return 0;
 }
 
@@ -1014,7 +1053,14 @@ fn hid_flush_oneshots() {
 # State Error abort on a wrong-state reset is its own failure mode (msc.cyr records one that bricked a
 # boot). If the state has already moved on, clear the flag and leave the endpoint alone.
 # ⚠⚠ PROVEN REACHABLE, NOT PROVEN CORRECT — AND THE DIFFERENCE MATTERS FOR WHOEVER TOUCHES THIS NEXT.
-# Injecting a halting completion code (HID_CC_INJECT with ccode 6) shows the flag is set, this function
+# ⛔⛔ AND READ THIS BEFORE REACHING FOR THE FLAG: `HID_CC_INJECT` AS SHIPPED **CANNOT** DO IT.
+# This comment used to say "HID_CC_INJECT with ccode 6" as though the build flag reproduced the state.
+# It does not, and never has in-tree: the shipped inject block forces `ccode = 2` (:1177, "Data Buffer
+# Error: rejected, but NOT a halting code"), while `hid_ep_needs_reset` is set only for 4/6/8
+# (:1189-1192). ⇒ Turning on `HID_CC_INJECT=1` and seeing nothing happen is the EXPECTED result, not
+# evidence that no stall occurred. The reachability claim below rests on a HAND-MODIFIED build that
+# changed that 2 to a 6; if you want to repeat it, change :1177 yourself and say so in the record.
+# Injecting a halting completion code shows the flag is set, this function
 # is called from thread context, and the system survives. It does NOT show the reset sequence works,
 # because an injected code is fabricated by software: the CONTROLLER never actually halted, so
 # xhci_ep_state() reports Running and the body below early-outs before issuing a single command.
@@ -1028,7 +1074,12 @@ fn hid_recover_halted() {
             store64(&hid_ep_needs_reset + i * 8, 0);
             var slot = load64(&hid_ep_slot + i * 8);
             var dci  = load64(&hid_ep_dci  + i * 8);
-            if (xhci_ep_state(slot, dci) == XHCI_EP_STATE_HALTED) {
+            # ⛔ READ THE STATE ONCE, INTO A LOCAL. It was read inline in the `if` before 1.56.59, so
+            # the value that decided the branch could not be reported by the branch that declined —
+            # and a decline that cannot say WHAT the controller answered is barely better than silence.
+            var epst = xhci_ep_state(slot, dci);
+            if (epst == XHCI_EP_STATE_HALTED) {
+                hid_halt_confirmed = hid_halt_confirmed + 1;
                 if (xhci_cmd_reset_endpoint(slot, dci) == 0) {
                     kprintln("hid: an endpoint halted and the controller refused to reset it", 62);
                 } else {
@@ -1080,6 +1131,36 @@ fn hid_recover_halted() {
                         kprintln("hid: an endpoint halted and was reset; input from it should resume", 66);
                     }
                 }
+            } else {
+                # ⭐⭐ 1.56.59 — RESIDUAL #1 OF THE HID ISSUE RECORD: THIS BRANCH DID NOT EXIST, AND ITS
+                # ABSENCE IS WHAT MADE THE IRON BURN UNFALSIFIABLE. The flag is cleared at the top of
+                # this block, so reaching here used to consume the only evidence a halt had occurred
+                # and emit nothing. A burn that provoked a real stall and landed here produced a
+                # console identical to a burn where the stall never happened — and the second reads
+                # as a pass. ⇒ The three outcomes are now distinguishable from the console alone:
+                #   flagged 0                      -> no halting completion code ever reached the
+                #                                     driver; the PROVOCATION failed, not the kernel.
+                #   flagged > 0, this line printed -> the halt reached us and the controller's EP
+                #                                     state disagreed. Recovery correctly declined —
+                #                                     and the `state` value says what it actually said.
+                #   flagged > 0, "reset" line      -> the Reset/Set-TR-Dequeue pair genuinely ran.
+                # ⚠ kprintln, NOT klug_append: this is thread context (sole caller is
+                # hid_service_deferred, from kb_has_key / the #98 arm — never an ISR), and archaemenid
+                # HAS NO SERIAL PORT. The operator reads the framebuffer console, so the one line that
+                # decides the burn has to be ON it.
+                # ⚠ Deliberately NOT rate-limited. It fires only when a halting completion code was
+                # seen, which a production kernel has never once done; if it ever becomes chatty, that
+                # is itself the finding.
+                hid_halt_declined = hid_halt_declined + 1;
+                kprint("hid: endpoint flagged HALTED but the controller reports EP state ", 65);
+                kprint_num(epst);
+                kprint(" -- recovery DECLINED, input from it stays dead (flagged/confirmed/declined ", 76);
+                kprint_num(hid_halt_flagged);
+                kprint("/", 1);
+                kprint_num(hid_halt_confirmed);
+                kprint("/", 1);
+                kprint_num(hid_halt_declined);
+                kprintln(")", 1);
             }
         }
         i = i + 1;
@@ -1163,6 +1244,24 @@ fn hid_poll() {
             var cc_ok = 0;
             if (ccode == 1) { cc_ok = 1; }
             if (ccode == 13) { cc_ok = 1; }
+            #ifdef HID_CC_INJECT_HALT
+            # ⭐ HALTING FAULT INJECTION (1.56.59) — WHAT MAKES THE HALT ORACLE REACHABLE IN-TREE.
+            # Injects 6 (Stall), a HALTING code, unlike the non-halting 2 the sibling flag below uses.
+            # So `hid_ep_needs_reset` IS set and `hid_recover_halted` actually runs — which no in-tree
+            # build could previously cause, and which is why this file's own reachability claim rested
+            # on a hand-modified build (see the banner above hid_recover_halted).
+            # ⚠ IT DOES NOT FABRICATE THE CONTROLLER'S VERDICT, and that is the line the 1.56.57
+            # operator ruling drew. `xhci_ep_state()` still reads the real Output EP Context; under
+            # QEMU the controller never halted, so it answers Running and recovery correctly DECLINES.
+            # ⇒ This proves the ORACLE — that the burn can tell its three outcomes apart. It does NOT
+            # prove the Reset/Set-TR-Dequeue sequence, which still needs a real stall on real silicon.
+            # ⛔ Build-gated and OFF by default. Never ship a kernel with this defined.
+            if (hid_cc_inject_left > 0) {
+                hid_cc_inject_left = hid_cc_inject_left - 1;
+                cc_ok = 0;
+                ccode = 6;                # Stall: a HALTING code (4/6/8 set the flag)
+            }
+            #endif
             #ifdef HID_CC_INJECT
             # ⭐ FAULT INJECTION — THE ONLY WAY TO PROVE THE RE-ARM PATH. QEMU never emits a rejected
             # completion code, so the "re-arm even when the report is unusable" fix above is otherwise
@@ -1189,7 +1288,15 @@ fn hid_poll() {
                 if (ccode == 4) { halting = 1; }
                 if (ccode == 6) { halting = 1; }
                 if (ccode == 8) { halting = 1; }
-                if (halting == 1) { store64(&hid_ep_needs_reset + row * 8, 1); }
+                if (halting == 1) {
+                    store64(&hid_ep_needs_reset + row * 8, 1);
+                    # ⚠ ISR CONTEXT — a plain add and nothing else. See the tally banner: no kprint
+                    # (console_spin_lock is non-recursive) and no klug_append (it mutates the ring
+                    # head outside that lock and would garble a concurrent line). This counter is the
+                    # ONLY evidence that a halt reached the driver at all, and the burn's first
+                    # question is exactly that.
+                    hid_halt_flagged = hid_halt_flagged + 1;
+                }
             }
             if (hid_ep_kind_at(row) == HidKind.HID_KIND_KBD) {
                 if (cc_ok == 1) {

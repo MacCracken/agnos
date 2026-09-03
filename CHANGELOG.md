@@ -20,6 +20,140 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.56.59] — 2026-09-02 — two consumers asked for the same thing, and the one told not to prioritise it was right
+
+### Added — `mountlist` #104: the mount table, enumerated
+
+- `mountlist(buf, max) -> count / -1`. **80-byte** records, all-u64 header per ABI §4.1:
+  `backend` @0 (`FsBackend` — 1 ext2 · 2 FAT · 3 exFAT; 0 `FS_NONE` never emitted), `prefixlen` @8,
+  `prefix` @16 (**64 B, NUL-padded**). `max` is a record count.
+- ⭐ **FILED BY TWO CONSUMERS ON THE SAME DAY, WITH OPPOSITE PRIORITIES, AND THE MINORITY WAS RIGHT.**
+  chakshu (the system monitor) listed it as its §6 and said **"do not prioritise this"** — a monitor
+  can `statfs` the three known prefixes. crab (the file manager) called it "the only thing we actually
+  need". crab wins on a case chakshu did not have: **aliasing**. `vfs_mount_init` (`core/vfs.cyr:396`)
+  gives an ext2-less boot the SAME backend under BOTH `/` and its `/mnt/…` prefix — its own comment
+  calls them "harmless redundant aliases", harmless to routing but **one volume listed twice** in a
+  sidebar. `statfs` answers *is this string mounted*; it cannot answer *are these two the same volume*.
+  ⇒ A "do not prioritise" from one consumer is not a verdict on the capability.
+- ⚠ **A new number, not a widening of `mount`#11** — #11 takes no arguments, and unused argument
+  registers carry **stale values, not zero** (the measured `#100`/`#101` rule), so widening it would
+  hand every shipped caller an arbitrary pointer.
+- ⛔ **The arm takes NO LOCK, and that is only safe while `mount`#11 and `umount`#24 are no-ops.** Both
+  are unconditional `return 0;`, so the table is written once by `vfs_mount_init` and immutable after.
+  The day `mount` becomes real this needs `fs_spin_lock`, or it hands ring 3 a torn prefix.
+- ⛔ Validated with `is_user_array`, not `is_user_range(buf, max * 80)` — the product wraps, verbatim
+  the `#99` defect fixed at 1.56.51.
+- **Boot-proven**: `scripts/harness/mountlist-test.py` + `tests/mountlist/mlist.cyr`, exit **95**. The
+  oracle is the table's SHAPE, not `count > 0` — a stub returning one zeroed record would pass a count
+  check. Mutation-proven: removing the `max` budget reddens it with the right message.
+- ⚠ **One assertion in that gate CANNOT CURRENTLY FAIL, and it says so in-file.** The NUL-padding check
+  was mutation-tested by copying all 64 bytes unconditionally and still passed — `vfs_mnt_prefix` is
+  zero-initialised and written once per boot, so there is no stale tail yet. It is a regression guard
+  for when `mount` becomes real, not a live oracle. Recorded rather than left to look like coverage.
+- ⭐ **THE CROSS-REPO LOOP CLOSED INSIDE THE CUT, AND THAT IS WORTH RECORDING.** #104 was minted here,
+  the peer was filed as an issue in cyrius's own tree
+  (`docs/development/issues/2026-09-02-agnos-syscall-104-mountlist-wrapper.md`) per the NEVER-TOUCH
+  ruling — no cyrius code edited from here — and **cyrius 6.5.43 shipped `SYS_MOUNTLIST` +
+  `sys_mountlist`** and archived the filing. `syscall ABI` reads `kernel 105 · abi-doc 105 · cyrius
+  105`: **32/0 green**.
+  ⚠ It was **31/1 mid-cut** and that red was correct, not a defect — `symlink`#63 and `readlink`#70
+  both shipped in exactly that state. The gate is designed to be red between minting and the peer
+  landing. Do not "fix" a future one by editing cyrius, and do not weaken the gate.
+
+### Added — the HID iron burn finally has an oracle (issue residual #1)
+
+- ⛔⛔ **THE ROADMAPPED BURN WAS UNFALSIFIABLE, AND THAT IS WHY THIS IS THE ITEM THAT MATTERED.**
+  `hid_recover_halted` cleared `hid_ep_needs_reset` **before** the EP-state check and had no else
+  branch. So a provoked halt whose state read came back non-Halted left **zero trace**, and
+  *"no stall ever reached the driver"* and *"a stall did and recovery DECLINED"* were the same silence
+  — with the second reading as a passing run. A burn that cannot fail honestly is a trip to the machine
+  that produces a feeling, not a gate.
+- The EP state is now read **once into a local**, so the branch that declines can report what the
+  controller actually answered; an `else` branch prints it with a `flagged/confirmed/declined` tally.
+- ⚠ **Counters at the flag-set site, not a log line — the context decides it.** The flag is set inside
+  `hid_poll`, which the 100 Hz timer ISR calls, so `kprint` is forbidden there (`console_spin_lock` is
+  a bare non-recursive xchg). Even `klug_append` would be wrong: it mutates the ring head OUTSIDE that
+  lock, so an ISR append can interleave mid-line with a locked `kprint` on another CPU and garble the
+  very log this instrument exists to produce. A plain integer add has neither problem.
+  **The ISR counts; thread context reports.**
+- ⚠ `kprintln`, not `klug_append`, for the decline line: archaemenid **has no serial port** — the build
+  host is the target — so the operator reads the framebuffer console, and the one line that decides the
+  burn has to be on it.
+- ⭐ **REACHABLE IN-TREE FOR THE FIRST TIME.** New `HID_CC_INJECT_HALT=1` injects **6 (Stall)**, a
+  halting code; the existing `HID_CC_INJECT` injects a deliberately non-halting **2** and therefore
+  could never set the flag — which is why this file's own reachability claim rested on a hand-modified
+  build, and why turning that flag on and seeing nothing was the *expected* result all along.
+- ⛔ **NOT the build-gated stub seam withdrawn at 1.56.57.** Nothing fabricates the controller's
+  verdict: `xhci_ep_state()` still reads the real Output EP Context, QEMU's controller never halted, so
+  recovery **correctly declines** — which is precisely the branch being proven. It proves the ORACLE.
+  The Reset/Set-TR-Dequeue sequence has still never executed anywhere and still needs real silicon.
+- **Measured on a live boot** — `scripts/harness/hid-halt-oracle-test.py`, keystrokes driven through the
+  QEMU monitor because `usb-kbd` emits no interrupt-IN completion until a key is actually pressed
+  (a boot-and-grep run exercises nothing, measured):
+  `hid: endpoint flagged HALTED but the controller reports EP state 0 -- recovery DECLINED, input from
+  it stays dead (flagged/confirmed/declined 3/0/1)`
+- ⚠ **THE NEW GATE CAUGHT ITSELF BEING VACUOUS.** Its first precondition keyed on the SAME string it
+  asserts, so deleting the decline line made it **SKIP instead of FAIL** — the oracle derived from the
+  artifact under test, the V5 shape, inside the gate written to prove an oracle. It now keys on a
+  separate `hid: HALT INJECTION ARMED` banner (which also warns the operator never to flash that
+  build), and is mutation-proven: removing the decline line yields **exit 1**, not a skip.
+- ⇒ **The burn is now worth slotting. It was not before.**
+
+### Fixed — the console is somebody else's stdout
+
+- `proclist`#99 and `ptrscan`#98's first-call one-shots now `klug_append` to the log ring instead of
+  `kprintln` to the console. Filed by chakshu: the line landed **inside** the monitor's output, between
+  its header and its process table, corrupting `shu -p` (its pipe-safe mode) and scribbling over a TUI
+  frame. ⚠ 1.56.58 made it worse, not better — the line had gained a `[   37.727698] ` uptime prefix.
+  The diagnostic is kept in full and still reachable with `run /bin/klug`.
+
+### Fixed — `proclist`'s `+56` promised two fields for one slot
+
+- The record is exactly 64 B with `name[32]` at +24..+55, so **+56 IS the final 8 bytes** — yet the
+  comment read "reserved — room to add rss/utime". Telemetry §4 (cpu time) and §5 (rss) both claim it.
+  Whichever shipped first would have taken the whole u64 and forced the other to a new syscall number.
+- **Split now as two u32 halves** — low @+56 = cpu ticks, high @+60 = rss pages — while the value is
+  still 0 and nothing reads it. A u64 zero-check still means "neither present", so consumers written
+  against the old wording keep working. That compatibility is why this is free today and an ABI break
+  after the first reader. u32 is not a ceiling: 2^32 ticks @100 Hz is ~1.36 years; 2^32 pages is 16 TiB.
+
+### Fixed — comments that would have sent the next author down a dead path
+
+- **`hid.cyr:1016-1017` claimed `HID_CC_INJECT with ccode 6` reproduces an endpoint halt. It cannot.**
+  The shipped inject block forces `ccode = 2` and calls it "NOT a halting code" (`:1177`), while the
+  flag needs 4/6/8 (`:1189-1192`). Turning the flag on and seeing nothing is the EXPECTED result — but
+  the comment made that read as "no stall occurred". The reachability claim rests on a hand-modified
+  build the tree does not contain, and now says so.
+- **`syscall.cyr`'s `statfs` comment** said FAT/exFAT were "filed as a follow-on rather than half-built"
+  while both arms sat 20 lines beneath it. chakshu reports this nearly made it file a phantom gap —
+  the cost of a stale comment stated exactly: not confusion, but work done twice in two repos.
+
+### Changed — cyrius pin 6.5.41 -> 6.5.43
+
+- All **11** manifests (the root, nine `tests/*`, and the new `tests/mountlist`), plus sibling **klug**.
+  `toolchain-pin-check.sh` 11/11. klug rebuilt and 37/37.
+
+### Changed — issues/ reviewed against live code; one archived, three headers corrected
+
+- ⛔ **Only ONE of five was archivable, and the two that LOOKED closest to done were the furthest.**
+  The P1 backlog reads 23/26 closed and is **21** — two items were fixed at the line named in the
+  finding's *title* but not at the sites the finding's own *Mechanism* paragraph enumerates. And the
+  vacuous-gates file carried a corrected "39 fixed" header over its **unedited 273-line body**, which
+  still describes all 33 findings as open. **Both would have archived cleanly on their own status
+  text** — the failure that cost this repo eleven cuts on `#98` and four on `#97`.
+- ✅ **Archived**: the crab mount-enumeration filing, resolved by #104, with its status rewritten first
+  and what-it-broke recorded (the expected ABI-gate red). Archived count 50 → **51**.
+- Headers corrected in place on all three that stay open. The HID record understated itself: not merely
+  "#3 has never executed" but **no in-tree build can even set its flag**, and the 1.56.58 iron slot
+  passed with no HID entry at all — so the gate is UNSLOTTED, not scheduled. Three residuals there are
+  in-tree and none is the withdrawn stub seam; the sharpest is that the early-out is **silent**, so the
+  roadmapped burn currently has **no oracle that can fail honestly**.
+- The vacuous-gates header said "two fixes moved the vacuity up a level" and named **one**. The second
+  (`scripts/probe/rbp-repro.sh`) is now named.
+- **aarch64 counts corrected in four places**: 30 fns + 18 vars → **32 + 46**. The surface has GROWN.
+  A count that only ever gets copied forward is the same rot class as a stale status header.
+
+
 ## [1.56.58] — 2026-09-02 — the kernel log gets a clock, and 39 gates that could not fail now can
 
 ### Added — a Linux-style uptime prefix on every kernel log line

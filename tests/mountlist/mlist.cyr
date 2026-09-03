@@ -1,0 +1,81 @@
+# mlist — agnos ring-3 exerciser for the mount-table getter (#104, kernel arm in core/syscall.cyr).
+#
+# ⭐ WHAT THIS PROVES, AND WHY A PROBE COULD NOT. crab (the AGNOS file manager) can already ask
+# `statfs("/mnt/fat", …)` whether one string is mounted. What it cannot do is ENUMERATE — and the
+# case that forces the difference is ALIASING: `vfs_mount_init` (core/vfs.cyr:396) gives an
+# ext2-less boot the SAME backend under BOTH "/" and its "/mnt/..." prefix, which its own comment
+# calls "harmless redundant aliases". Harmless to routing; to a sidebar they are one volume listed
+# twice, and no probe can tell. #104 returns the backend id alongside the prefix, so it can.
+#
+# ⛔ THE ORACLE IS THE TABLE'S SHAPE, NOT "count > 0". A stub returning 1 and a zeroed record would
+# pass any count check. Every assertion below is about CONTENT: root exists, its backend is a real
+# FsBackend, prefixes are NUL-padded rather than trailing whatever the slot held, the max budget is
+# honoured, and a hostile count is refused.
+#
+# Exit 95 iff the whole contract holds; 80-94 pinpoint where it broke.
+
+# Record: 80 B — +0 u64 backend · +8 u64 prefixlen · +16 64 B prefix, NUL-padded.
+fn ml_main(): i64 {
+    var buf[640];                               # 8 records * 80 B — the kernel's whole table
+    var n = syscall(104, &buf, 8);
+    if (n < 1) { return 80; }                   # every boot mounts at least "/"
+    if (n > 8) { return 81; }                   # more records than the buffer was sized for
+
+    # ---- every record must be structurally sound ----
+    var i = 0;
+    var saw_root = 0;
+    while (i < n) {
+        var rec = &buf + i * 80;
+        var be  = load64(rec + 0);
+        var pl  = load64(rec + 8);
+        # FS_NONE(0) is never emitted; FS_EXT2/FAT/EXFAT are 1..3.
+        if (be < 1) { return 82; }
+        if (be > 3) { return 83; }
+        if (pl < 1) { return 84; }
+        if (pl > 64) { return 85; }
+        # ⛔ THE PREFIX MUST BE NUL-PADDED PAST ITS LENGTH. A slot may hold a longer prefix from a
+        # previous occupant; if the kernel copied only `pl` bytes, ring 3 reads a stale tail.
+        # ⚠⚠ MEASURED 1.56.59: THIS ASSERTION CANNOT CURRENTLY FAIL, AND SAYING SO IS THE POINT.
+        # Mutation-tested by making the kernel copy all 64 bytes unconditionally — the test still
+        # PASSED, because `vfs_mnt_prefix` is zero-initialised and `vfs_mount_init` writes each slot
+        # exactly once per boot, so there is never a stale tail to read. It is a REGRESSION GUARD for
+        # the day `mount`#11 stops being a no-op and slots start being rewritten, not a live oracle.
+        # Do not read its green as evidence the padding works; assertion 89 below is what bites
+        # (mutation-proven: removing the max budget reddens it with the right message).
+        var j = pl;
+        while (j < 64) {
+            if (load8(rec + 16 + j) != 0) { return 86; }
+            j = j + 1;
+        }
+        # The first byte of every prefix is '/' (47) — all mounts are absolute.
+        if (load8(rec + 16) != 47) { return 87; }
+        if (pl == 1) { saw_root = 1; }          # "/" is the one 1-byte prefix
+        i = i + 1;
+    }
+    if (saw_root == 0) { return 88; }           # root is always mounted
+
+    # ---- the max budget must be respected ----
+    # ⚠ Asking for ONE record must return exactly one, not the whole table. The fill loop is bounded
+    # by the mount count, so a missing budget check would overrun the caller's buffer — the same
+    # defect class that shipped in #99 and was fixed at 1.56.51.
+    var one[80];
+    var k = syscall(104, &one, 1);
+    if (k != 1) { return 89; }
+
+    # ---- a hostile count must be refused, not wrapped ----
+    # ⛔ THIS IS THE SECURITY ASSERTION. `max` is ring-3 chosen, and `max * 80` overflows: the
+    # kernel must reject via is_user_array rather than multiplying first. A kernel that wrapped the
+    # product would pass its range check on a zero-length window and then write the whole table past
+    # the user ceiling. Verbatim the #99 bug, so it is asserted here rather than assumed.
+    if (syscall(104, &one, 0x7FFFFFFFFFFFFFF) != (0 - 1)) { return 90; }
+    if (syscall(104, &one, 0) != (0 - 1)) { return 91; }        # max < 1 refused
+
+    # ---- a kernel pointer must be refused ----
+    if (syscall(104, 0x1000, 1) != (0 - 1)) { return 92; }
+
+    return 95;
+}
+
+fn main(): i64 { return ml_main(); }
+fn _entry(): i64 { var rc = main(); syscall(SYS_EXIT, rc); return 0; }
+_entry();

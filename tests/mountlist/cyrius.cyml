@@ -1,0 +1,19 @@
+[package]
+name = "mlist"
+version = "0.1.0"
+description = "agnos ring-3 exerciser for mountlist (#104, 1.56.59) — proves the kernel's mount table reaches ring 3 intact, that the record is NUL-padded, that the max budget is respected, and that the wrap-safe validator refuses a hostile count; exits 95 iff the whole contract holds."
+license = "GPL-3.0-only"
+language = "cyrius"
+cyrius = "6.5.43"
+
+[build]
+src = "mlist.cyr"
+output = "build/mlist"
+
+# ⚠ #104 IS ISSUED BY RAW NUMBER ON PURPOSE, and there is no wrapper to use yet: the cyrius peer is
+# filed at cyrius/docs/development/issues/2026-09-02-cyrius-syscall-104-mountlist-wrapper.md and has
+# not landed. Even once it has, this stays raw — same rule tests/readdir/rdat.cyr records: this is the
+# ABI exerciser, and routing it through the stdlib wrapper would test the wrapper's agreement with
+# itself rather than the kernel's arm.
+[deps]
+stdlib = ["syscalls"]

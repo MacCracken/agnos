@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "agnos ring-3 resumable-readdir exerciser (#101, 1.56.50) — reads a directory in small batches via readdir_at's cursor and proves the paged walk sees exactly what the single-shot #81 sees; exits 95 iff the whole contract holds."
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.5.41"
+cyrius = "6.5.43"
 
 [build]
 src = "rdat.cyr"

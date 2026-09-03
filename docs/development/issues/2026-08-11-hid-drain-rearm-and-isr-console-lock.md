@@ -1,7 +1,57 @@
 # HID input path — three defects found while explaining a log line at the shell prompt
 
 **Found**: 2026-08-11, investigating an operator report of a "mouse notification on the shell."
-**Status:** 🟠 **OPEN — #1/#2 FIXED AND MEASURED; THE TWO DEFECTS FOUND INSIDE #3 ARE NOW FIXED (1.56.56) BUT UNGATED; #3 ITSELF HAS STILL NEVER EXECUTED.**
+**Status:** 🟠 **OPEN — #1/#2 FIXED AND MEASURED. #3's two 1.56.56 defects ARE fixed in the tree, but its
+Reset-Endpoint / Set-TR-Dequeue body HAS STILL NEVER EXECUTED — and it is worse than "no stall has happened".**
+
+⛔⛔ **NO IN-TREE BUILD CAN EVEN SET THE FLAG.** Re-derived 2026-09-02 at 1.56.59: the shipped
+`HID_CC_INJECT` block forces `ccode = 2` and its own comment calls that "NOT a halting code"
+(`hid.cyr:1177`), while `hid_ep_needs_reset` is set only for 4/6/8 (`hid.cyr:1189-1192`). So the
+"proven reachable" evidence at `hid.cyr:1016-1017` rests on a **hand-modified build this tree does not
+contain**, and that in-code comment — which reads as if `HID_CC_INJECT=1` does it — will send the next
+author to run a flag that provably cannot reach the code they are testing. They will read the silence
+as "no stall occurred". That is a trap, not a stale line.
+
+⛔ **THE 1.56.58 IRON SLOT PASSED WITHOUT THE BURN.** That CHANGELOG section carries no HID entry, so
+the gate is **UNSLOTTED at 1.56.59**, not scheduled. This file said "roadmapped for 1.56.58".
+
+⭐ **THREE RESIDUALS ARE ACTIONABLE IN-TREE, AND NONE IS THE WITHDRAWN STUB SEAM:**
+1. ✅ **THE SILENT EARLY-OUT — CLOSED AT 1.56.59. THE BURN NOW HAS AN ORACLE.** `hid_recover_halted`
+   cleared `hid_ep_needs_reset` before the EP-state check with no else branch, so a provoked halt whose
+   state read came back non-Halted left **zero trace** — and "no stall reached us" and "a stall did and
+   recovery declined" were the same silence, with the second reading as a pass.
+   * The EP state is now read once into a local so the branch that declines can report **what the
+     controller actually answered**, and an `else` branch prints it.
+   * Three counters — `hid_halt_flagged` / `_confirmed` / `_declined` — make the three outcomes
+     distinguishable from the console alone. ⚠ **Counters, not a log line, at the flag-set site**: that
+     runs in `hid_poll`, which the 100 Hz timer ISR calls, so `kprint` is forbidden (`console_spin_lock`
+     is non-recursive) and even `klug_append` would mutate the ring head outside that lock and could
+     garble a concurrent line. A plain integer add has neither problem. **The ISR counts; thread context
+     reports.**
+   * ⭐ **REACHABLE IN-TREE FOR THE FIRST TIME** via a new `HID_CC_INJECT_HALT=1` build flag, which
+     injects **6 (Stall)** — a halting code — where the existing `HID_CC_INJECT` injects the
+     deliberately non-halting 2 and therefore never set the flag at all.
+   * ⛔ **THIS IS NOT THE STUB SEAM WITHDRAWN AT 1.56.57.** Nothing fabricates the controller's verdict:
+     `xhci_ep_state()` still reads the real Output EP Context, QEMU's controller never halted, and so
+     recovery **correctly declines** — which is exactly the branch being proven. It proves the ORACLE,
+     not the Reset/Set-TR-Dequeue sequence, which has still never executed anywhere.
+   * **Measured on a live boot** (`scripts/harness/hid-halt-oracle-test.py`, keystrokes driven through
+     the QEMU monitor because `usb-kbd` emits no completion until a key is pressed):
+     `hid: endpoint flagged HALTED but the controller reports EP state 0 -- recovery DECLINED, input
+     from it stays dead (flagged/confirmed/declined 3/0/1)`
+   * ⚠ **THE GATE CAUGHT ITSELF BEING VACUOUS, AND THE FIX IS RECORDED BECAUSE IT IS THE POINT.** Its
+     first precondition keyed on the SAME string it asserts, so deleting the decline line made it SKIP
+     instead of FAIL — the oracle derived from the artifact under test, the V5 shape, inside the gate
+     written to prove an oracle. It now keys on a separate `HALT INJECTION ARMED` banner, and is
+     mutation-proven: removing the decline line yields **exit 1**, not a skip.
+   * ⇒ **The burn is now worth slotting.** It was not before.
+2. **The 1.56.56 locking fix moved only the WRITE side.** `hid.cyr:1045-1046` still read
+   `hid_row_idx`/`hid_row_cycle` as two UNLOCKED loads from thread context, while the ISR's wrap resets
+   idx to 0 and flips cycle in the same breath (`hid.cyr:148-149`, `:890-905`) — an interleaving hands
+   `xhci_cmd_set_tr_dequeue` a torn (idx, cycle) pair and the endpoint stays dead.
+3. **The gate covers less than this file claims.** `hid_reclaim_selftest` registers a MOUSE row
+   (`hid.cyr:1303`) and asserts owed==1 (`:1332-1350`). The 1.56.56 fix owes **16** on what is in
+   practice a KEYBOARD row, so neither the owed==16 loop nor the KBD branch is exercised anywhere.
 
 ✅ **FIXED 1.56.56 — both defects, by one change.** `hid_recover_halted` no longer arms inline. It bumps
 `hid_ep_rearm[i]` by **16** and lets `hid_service_rearms` do the ring work under `hid_poll_lock`:

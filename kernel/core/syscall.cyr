@@ -9340,11 +9340,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # no length argument (like #33`s hardcoded 48), so there is no room to grow this record later —
         # a wider one needs a NEW number. Four fields is exactly what was asked for; resist adding a
         # fifth "while we are here", because it cannot be taken back.
-        # ⚠ ext2-ONLY, and it says so rather than guessing: `vfs_resolve_mount` routes, and a non-ext2
-        # backend returns -1. Same posture `stat`#33 shipped with ("FAT/exFAT degrade to -1 for now").
-        # FAT/exFAT can answer this — total/free clusters x sectors-per-cluster — but that is a second
-        # backend`s worth of work and a second set of controls, and shipping it unproven would be worse
-        # than saying no. Filed as a follow-on rather than half-built.
+        # ⚠ ALL THREE BACKENDS ANSWER THIS — ext2, FAT and exFAT (arms below). ⛔ THIS COMMENT SAID
+        # "ext2-ONLY ... FAT/exFAT ... filed as a follow-on rather than half-built" UNTIL 1.56.59, and by
+        # then the FAT and exFAT arms were sitting 20 lines beneath it. The follow-on landed at 1.56.56
+        # and the comment was never re-read. chakshu (the AGNOS system monitor) reports that this text
+        # nearly made it file a phantom capability gap against a capability that shipped — which is the
+        # cost of a stale comment stated exactly: not confusion, but work done twice in two repos.
+        # ⚠ The ABI doc was correct throughout; only this comment drifted.
         if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
         if (is_user_range(arg3, 32) == 0) { stack_canary_check(canary); return 0 - 1; }
         var be103 = vfs_resolve_mount(arg1, arg2);
@@ -9376,6 +9378,67 @@ fn ksyscall(num, arg1, arg2, arg3) {
         fs_spin_unlock();
         stack_canary_check(canary);
         return fsr;
+    }
+    if (num == 104) {
+        # mountlist(buf=arg1, max=arg2) -> mounts written (>=0), or -1.
+        #
+        # Copies the live mount table out to ring 3. 80-byte records, all-u64 header so there is no
+        # Cyrius struct-padding ambiguity (the rule agnos-userland-abi.md §4.1 already follows):
+        #     +0   u64 backend   FsBackend — 1 = ext2 · 2 = FAT · 3 = exFAT (0 = FS_NONE never emitted)
+        #     +8   u64 prefixlen prefix length in bytes, 1..64
+        #     +16  64 B prefix   the mount prefix, NUL-PADDED to the full 64
+        #
+        # ⭐ FILED BY crab (the AGNOS file manager), 2026-09-02, for its VOLUMES sidebar — and by
+        # chakshu the same day as its §6. ⚠ THE TWO CONSUMERS DISAGREED, and crab is right: chakshu
+        # said "do not prioritise, a monitor can statfs the three known prefixes". That workaround
+        # cannot see ALIASING. `vfs_mount_init` (core/vfs.cyr:396) gives an ext2-less boot the SAME
+        # backend under BOTH "/" and its "/mnt/..." prefix — its own comment calls them "harmless
+        # redundant aliases", harmless to routing but the same volume listed TWICE in a sidebar. A
+        # statfs probe answers "is this string mounted"; it cannot answer "are these two the same
+        # volume". Enumeration can, because the backend id comes with the prefix.
+        #
+        # ⚠ A NEW NUMBER, NOT A WIDENING OF `mount`#11. #11 takes no arguments in the frozen ABI
+        # table, and this tree's measured rule (see #100/#101) is that unused syscall argument
+        # registers carry STALE VALUES, not zero — so widening #11 would hand every shipped caller
+        # an arbitrary pointer. crab asked for a new number for the same reason.
+        #
+        # ⛔ NO LOCK, AND THAT IS ONLY SAFE WHILE `mount`#11 AND `umount`#24 ARE NO-OPS. Both are
+        # unconditional `return 0;` (this file, the Tier 2 block), so the table is written exactly
+        # once by vfs_mount_init() and is immutable afterwards. ⇒ THE DAY #11 STOPS BEING A NO-OP,
+        # THIS NEEDS fs_spin_lock — and a torn read here would hand ring 3 a half-written prefix.
+        # Do not delete this note when implementing mount.
+        if (arg2 < 1) { stack_canary_check(canary); return 0 - 1; }
+        # ⛔ is_user_array, NOT is_user_range(arg1, arg2 * 80) — arg2 is a ring-3 chosen record count,
+        # and the product wraps. That exact bug shipped in #99 and was fixed at 1.56.51; the validator
+        # exists so it is not re-derived per syscall.
+        if (is_user_array(arg1, arg2, 80) == 0) { stack_canary_check(canary); return 0 - 1; }
+        var ml_n = 0;
+        var ml_i = 0;
+        while (ml_i < vfs_mnt_count) {
+            if (ml_n >= arg2) { ml_i = vfs_mnt_count; }
+            else {
+                var ml_be = load64(&vfs_mnt_backend + ml_i * 8);
+                var ml_pl = load64(&vfs_mnt_prefix_len + ml_i * 8);
+                if (ml_pl > 64) { ml_pl = 64; }          # cannot happen from vfs_mount_add; clamp anyway
+                var ml_rec = arg1 + ml_n * 80;
+                store64(ml_rec + 0, ml_be);
+                store64(ml_rec + 8, ml_pl);
+                # NUL-PAD THE WHOLE 64, do not copy only prefixlen bytes: the slot may hold a longer
+                # prefix from a previous occupant, and ring 3 must never read a stale tail byte. Same
+                # discipline #99 uses for its name field.
+                var ml_k = 0;
+                while (ml_k < 64) {
+                    var ml_c = 0;
+                    if (ml_k < ml_pl) { ml_c = load8(&vfs_mnt_prefix + ml_i * 64 + ml_k); }
+                    store8(ml_rec + 16 + ml_k, ml_c);
+                    ml_k = ml_k + 1;
+                }
+                ml_n = ml_n + 1;
+                ml_i = ml_i + 1;
+            }
+        }
+        stack_canary_check(canary);
+        return ml_n;
     }
     # GPU compute dispatch (#82) — the ring-3 dispatch seam (#82) ring-3 seam: run the proven 8x8 integer matmul on the caller's
     # A,B (64 i32 each) and write C=A*B to c_uva. The path mabda/tentib consume for GPU inference. -> 0 ok / <0 err.
@@ -10120,7 +10183,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # bugs in two different repos. Costs one line per boot.
         if (ptrscan_called == 0) {
             ptrscan_called = 1;
-            kprintln("ptrscan: first call from ring 3", 31);
+            # Same re-route as proclist below, for the same reason and by the same filing — #98 has
+            # the identical one-shot and any ring-3 tool that pipes its output has the identical problem.
+            klug_append("ptrscan: first call from ring 3\n", 32);
         }
         # ⛔⛔ 16, NOT 2. FUNCTION-LOCAL `var X[N]` IS N **BYTES** in Cyrius (module-scope is N*8), and
         # this was `var pscr[2]` with a comment confidently asserting "2 * 8 = 16 bytes" — the module-scope
@@ -10180,7 +10245,18 @@ fn ksyscall(num, arg1, arg2, arg3) {
         #   +8   u64 state      1=ready · 2=running · 3=claiming (0=dead is skipped)
         #   +16  u64 ppid       0 = init
         #   +24  u8  name[32]   NUL-terminated basename, from proc_set_name at ELF load
-        #   +56  u64 reserved   always 0 — room to add rss/utime without a new number
+        #   +56  u64 reserved   always 0 today. ⛔ SPLIT AS TWO u32 HALVES, DECIDED 1.56.59:
+        #                        low  32 bits (+56) = cpu ticks   (telemetry filing §4)
+        #                        high 32 bits (+60) = rss pages   (telemetry filing §5)
+        # ⛔⛔ THIS LINE PROMISED "room to add rss/utime" — TWO FIELDS FOR ONE SLOT. The record is
+        # exactly 64 bytes with name[32] spanning +24..+55, so +56 IS the final 8 bytes; there is no
+        # second slot to grow into, and whichever field shipped first would have taken the whole u64
+        # and forced the other to a NEW SYSCALL NUMBER. Split now, while the value is still 0 and
+        # NOTHING reads it, because after one consumer reads it as a u64 this is an ABI break.
+        # ⚠ A u64 zero-check still means "neither field present", so a consumer written against the
+        # old wording keeps working — that compatibility is why the split is free TODAY and not later.
+        # ⚠ u32 halves are deliberate and sufficient: 2^32 ticks at 100 Hz is ~1.36 years of CPU time,
+        # and 2^32 pages is 16 TiB of RSS. Neither is a ceiling this kernel can reach.
         #
         # ⭐ WHY THIS EXISTS. AGNOS had no procfs and no enumeration primitive at all —
         # the ring-3 surface offered getpid/spawn/waitpid/kill and nothing that could
@@ -10210,7 +10286,16 @@ fn ksyscall(num, arg1, arg2, arg3) {
 
         if (proclist_called == 0) {
             proclist_called = 1;
-            kprintln("proclist: first call from ring 3", 32);
+            # ⛔ klug_append, NOT kprintln — THE CONSOLE IS SOMEBODY ELSE`S STDOUT. Filed by chakshu
+            # (the AGNOS system monitor) 2026-09-02: this one-shot landed INSIDE the monitor`s output,
+            # between its header and its process table. `shu -p` is its pipe-safe mode, so it corrupted
+            # any consumer parsing that stream and would scribble over a TUI frame. Since 1.56.58 it is
+            # worse, not better — the line now carries a `[   37.727698] ` uptime prefix too.
+            # ⚠ THE DIAGNOSTIC INTENT IS KEPT IN FULL, which is why this is a re-route and not a delete:
+            # the comment below still holds, and the line is still in the log ring, reachable with
+            # `run /bin/klug`. It just is not on the console any more. klug_append is the exact
+            # "emit to the kernel log ring rather than the console" the filing asked for.
+            klug_append("proclist: first call from ring 3\n", 33);
         }
 
         preempt_disable();

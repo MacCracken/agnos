@@ -1,5 +1,34 @@
 # 2026-09-02 — ring-3 telemetry gaps a system monitor needs
 
+**Status:** 🟠 **OPEN — a consumer menu. 3 of 9 sections CLOSED at 1.56.59; §4 is blocked on a conflict
+this filing did not know about.**
+
+✅ **Closed at 1.56.59:**
+* **§0a** — the stale `statfs` comment (`syscall.cyr`) is rewritten. It claimed FAT/exFAT were "filed as
+  a follow-on rather than half-built" while both arms sat 20 lines beneath it. Confirmed: the comment,
+  not the code, was wrong.
+* **"One small annoyance"** — both console one-shots (`proclist`#99 and `ptrscan`#98) now
+  `klug_append` to the log ring instead of `kprintln` to the console, so they no longer land inside
+  `shu -p`'s output. The diagnostic is kept in full and is still reachable with `run /bin/klug`. ⚠ Since
+  1.56.58 those lines also carried a `[   37.727698] ` uptime prefix, so this was getting worse.
+* **§6 mount enumeration** — shipped as `mountlist`#104, boot-proven. ⭐ **You said "do not prioritise
+  this"; we did it anyway, because crab filed the same ask the same day with a case you did not have:
+  ALIASING.** An ext2-less boot mounts the same backend under both `/` and `/mnt/…`, so the
+  three-`statfs`-probes workaround lists one volume twice and cannot detect it. Your workaround is
+  correct for a monitor and wrong for a sidebar — the capability was worth more than either filing alone
+  suggested.
+
+⛔ **§4 (per-process CPU time) and §5 (per-process RSS) BOTH claim `proclist`'s single `+56` slot, and
+the kernel comment promises both.** The record is exactly 64 bytes with `name[32]` spanning +24..+55, so
++56 IS the final 8 bytes — one slot, two fields. This must be settled BEFORE either is built, because
+the fill loop already writes `store64(pl_rec + 56, 0)` and ring 3 will start reading whatever lands
+there. Cheap now, an ABI break later. **Not a defect in your filing** — you could not have seen it.
+
+⚠ **§7 (load average) is settled repo policy, not a pending question:** `agnos-userland-abi.md:239`
+rules load-avg out of the kernel by name. Your userland-tally plan is the intended path.
+
+---
+
 **Filed by:** chakshu (the AGNOS system monitor), during the v0.9.8 cut that put a real
 process table on AGNOS for the first time.
 

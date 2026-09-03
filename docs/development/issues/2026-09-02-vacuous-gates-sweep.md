@@ -18,11 +18,25 @@ each fix mutation-proven against its own empty-input case and then adversarially
    `check/*.sh`, `harness/*.py`, `probe/*`, `tool/*` and `ktest.sh`. It did **NOT** cover
    `.github/workflows/*.yml`, `scripts/burn/*`, or the `tests/*/` per-project harnesses. Closing this
    file requires sweeping those.
-3. ⛔ **Two fixes moved the vacuity one level up rather than removing it, and adversarial verification
-   caught both.** `scripts/harness/agnsh-kvm-test.py` GATE 2 scores `if new.strip()` over serial
-   growth — but the kernel log writes to the SAME COM1 asynchronously, so ordinary kernel chatter
-   inside the ~5 s typing window satisfies it with **zero keystrokes delivered**. A floor that any
-   unrelated producer can satisfy is not a floor. Re-verify before trusting that gate.
+3. ⛔ **Two fixes moved the vacuity one level up rather than removing it — and this header named only
+   ONE of them until 1.56.59, which is itself the failure mode this folder exists to prevent.**
+   * `scripts/harness/agnsh-kvm-test.py` GATE 2 scores `if new.strip()` over serial growth — but the
+     kernel log writes the SAME COM1 asynchronously, so ordinary kernel chatter inside the ~5 s typing
+     window satisfies it with **zero keystrokes delivered**. A floor any unrelated producer can satisfy
+     is not a floor. ⚠ Do not read the in-file comment at `:99-104` as covering this: it records a
+     MEASURED reason to reject asserting the *echoed* text (two KVM runs echoed `elp` for `help`), which
+     is a different gate. The correct fix is the sibling's ANSWERS oracle (`agnsh-type-test.py:148-158`),
+     which rejects echo-counting too.
+   * `scripts/probe/rbp-repro.sh` — the second one, unnamed here until now. The 1.56.58 pass DID add
+     both vacuity floors (`:154-160`, `:161-166`) and a caveat line. What remains is a headline whose
+     denominator is the REQUESTED boot count while its floors are aggregates, and a `blind` counter
+     computed at `:79`/`:123` and printed at `:138` that is never asserted.
+
+⛔ **AND A FINDING ABOUT THIS FILE ITSELF.** Its 1.56.58 status header was rewritten to say "39 fixed"
+while the **273-line body below it is the unedited original text**, still describing all 33 findings as
+open and unfixed. A reader who trusts the header archives it; a reader who trusts the body re-does the
+work. Both are wrong. The body is left as the historical record of what was found — that is deliberate
+— but nothing in it should be read as current state. **Current state is this header only.**
 
 **What shipped alongside.** Six more vacuities were found *while proving* the assigned ones and fixed
 in the same pass — `modeset-latch-smoke.sh` had 4 of the same shape, `check-carveout.sh` 3,

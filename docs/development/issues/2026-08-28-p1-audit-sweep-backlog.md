@@ -8,10 +8,31 @@ type: issue
 
 **Opened** 2026-08-28, at the close of the 1.56.51 audit/hardening sweep.
 
-## ⭐⭐ STATUS — 1.56.54 (2026-08-30): THIS IS NOW A TWO-ITEM aarch64 TAIL
+## ⭐⭐ STATUS — 1.56.59 (2026-09-02): RE-DERIVED, AND THE TALLY WAS WRONG
 
-**Swept 2026-08-30. Re-counted against the code 2026-08-31 (1.56.55).** P0 **2/2**, P2 **29/29**, P1 **23/26** — ⚠ **not 21**: `iommu.cyr:176` (fixed 1.56.51, by refusing to enable translation at all when devices sit off bus 0) and `msc.cyr:690` (fixed 1.56.52, with a fault-injected gate in `sweep.sh`) were both fixed and never ticked. This file carried **three different tallies at once** — this block said 21, the P1 section header said 16, and the marker count was 21. All three now agree at 23. ⇒ **If a tally and a marker disagree, re-count against the code; do not carry either forward.**
-⚠ **SPLIT RECOMMENDED, NOT YET DONE.** At 92 KB this file is 24 closed items of narrative wrapped around a 2-item live tail. The tail (both aarch64) belongs in its own record and the bulk belongs in `archived/`. ⛔ **A blanket archive would bury five things**: the items in *"Also carried out of the sweep"* are in no table, are still true, and have no other home. Whoever splits this must move them, not just the tables. The genuinely-open remainder is **two aarch64 items**: `timer.cyr`'s inline asm addressing `[sp,#0]` (frame padding, not the intended local) and `klug.cyr`'s cross-arch leak — and the second is *why* `build.sh --aarch64` does not compile at all, so neither can be verified until the port builds. That makes the aarch64 arc, not this file, the thing to slot.
+**P0 2/2 · P2 29/29 · P1 21/26 — NOT 23.** Re-verified item-by-item against live code 2026-09-02.
+Two items this file marks FIXED are not:
+
+* **`nvme.cyr` 4Kn LBA overrun** — the check was added at the site named in the finding's *title* but
+  NOT at the sites its own *Mechanism* and *Suggested fix* paragraphs enumerate (`nvme.cyr:1139`,
+  `:1169`, `block.cyr:333` remain unconverted). ⚠ **LATENT, NOT LIVE**: the overrun needs a device
+  reporting 4096 B/LBA, which `blk_lba_bytes_ok` admits (`block.cyr:94-96`) but no QEMU substrate
+  produces — so no gate can go red on it and no smoke will confirm a fix. Whoever takes it is fixing
+  by reading, not by measuring, and should say so rather than implying a repro.
+* **virtio-net BAR guard** — `virtio_net.cyr:333` is unguarded while both `pci.cyr:264-265` and
+  `:310-311` carry the guard the finding asked for.
+
+⭐ **THE PRINCIPLE, because both failed the same way:** a checkmark that fixes the line in a finding's
+TITLE but not the sites the finding's own body enumerates is a **stale header** by this folder's
+definition. Re-derive from the Mechanism paragraph, not the heading.
+
+⛔ **THIS FILE WOULD HAVE ARCHIVED CLEANLY ON ITS OWN STATUS TEXT.** At 23/26 with a "two-item aarch64
+tail" it reads nearly done. It is not, and the two extra open items are x86, not aarch64 — so the
+"aarch64 tail" framing was itself hiding them.
+
+⚠ **SPLIT STILL RECOMMENDED, STILL NOT DONE.** At 92 KB this is ~24 closed items of narrative around a
+live tail. The split is deferred deliberately rather than forgotten: it must not happen until the tally
+above is settled in code, or the split would carry the wrong tally into two files instead of one.
 ⚠ Two further items are deliberately deferred WITH REASONS ON RECORD, not forgotten: the `blk` RW magic-constant gate (the proposed arm reorder is a **measured ABI break** — every caller passes tag 0, implemented and reverted) and `#92` op 0x0C's SMP-safety (shared prep slot + global latches, pre-existing and iron-only).
 ⛔ **Read every severity label here as a LEAD, not a grade — they were wrong in the dangerous direction five times.** `proc.cyr:1830` (filed P2) was a P0; `proc.cyr:1781` (filed P1) could not be fixed as filed, because its suggested fix would itself have been a ring-3 kernel-write primitive; and three filed P2s were not P2 (a remote ring-0 stack read in the DHCP option parser, unauthenticated remote parse-confusion from unhandled IPv4 fragments, and a release CI gate that had never booted a kernel).
 
@@ -423,7 +444,7 @@ Listed as one line each; the full mechanism is recoverable by re-reading the sit
 
 ## Also carried out of the sweep, not in the tables above
 
-- **aarch64 does not compile** — 30 reachable undefined functions + 18 undefined variables in the
+- **aarch64 does not compile** — **32** reachable undefined functions + **46** undefined variables (re-measured 1.56.59 — the surface GREW; the trace above is the 2026-08-28 measurement, kept as the historical record) in the
   `arch/aarch64/stubs.cyr` surface. `test.sh --all` is now honestly RED because of it.
 - **`ring3-smoke` has 4 real failures** (preempt gate, parent spawn+wait, stress, yield), PRE-EXISTING
   and unexplained — measured identical against `ffdb611`. Visible only since the virtio-blk smoke

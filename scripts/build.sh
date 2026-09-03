@@ -439,6 +439,20 @@ else
         # only way to exercise the "re-arm even when the report is unusable" path, since QEMU never
         # emits a rejected completion code on its own. ⛔ Never flash a kernel built with this.
         [ -n "$HID_CC_INJECT" ]      && echo '#define HID_CC_INJECT'
+        # HID_CC_INJECT_HALT=1 — TEST ONLY, and it exercises a DIFFERENT path from the flag above.
+        # HID_CC_INJECT forces ccode 2, which is deliberately NOT a halting code, so it can never set
+        # hid_ep_needs_reset and can never reach hid_recover_halted. This one injects **6 (Stall)**,
+        # which does set the flag — so the recovery path runs and the 1.56.59 halt-tally oracle is
+        # exercisable in-tree for the first time.
+        # ⚠ IT DOES NOT FAKE A HALT, AND THAT DISTINCTION IS THE WHOLE POINT. The completion code is
+        # software-injected but `xhci_ep_state()` still reads the CONTROLLER's real Output EP Context,
+        # and under QEMU the controller never actually halted — so the state comes back Running and
+        # recovery correctly DECLINES. That decline is precisely the branch that used to be silent.
+        # ⇒ Under QEMU this proves the ORACLE (the burn can distinguish its three outcomes). It does
+        # NOT prove the Reset/Set-TR-Dequeue sequence, which still needs a real stall on real silicon.
+        # ⛔ This is NOT the build-gated stub seam withdrawn at 1.56.57: nothing here fabricates the
+        # controller's verdict, which is the thing that ruling forbade.
+        [ -n "$HID_CC_INJECT_HALT" ] && echo '#define HID_CC_INJECT_HALT'
         # HDMI_DCCG=1 — apply the DCCG symbol-clock re-prime (SYMCLKA on) in gpu_hdmi_audio_enable: the
         # host-visible DCCG writes amdgpu makes for HDMI (abs 0x159-0x15c, 0x176) that agnos omitted, replicated
         # from the amdgpu modeset capture (ground truth). No PHY power-cycle ⇒ display-safe. Requires HDA_HDMI.
