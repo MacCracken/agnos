@@ -20,6 +20,24 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.56.60] — 2026-09-03 — cyrius 6.5.45, and both withdrawals landed upstream in one release
+
+### Changed — cyrius pin 6.5.44 -> 6.5.45
+
+- All **12** manifests plus sibling **klug** (37/37). `toolchain-pin-check.sh` 12/12.
+- ⭐ **BOTH 1.56.59 ASKS LANDED IN ONE UPSTREAM RELEASE, WHICH IS THE POINT.** They were filed as a
+  single cross-referenced piece of work rather than dripped one per capability:
+  * **`SYS_BLKSTATS` #105 WITHDRAWN** — the peer now carries a tombstone comment where the enum row
+    was. agnos removed the arm at 1.56.59 after an audit found that a closed 5-value tag enum over
+    flat by-tag arrays is a fixed-size tail block, not a syscall.
+  * **`sys_sysinfo_n(out, len)` ADDED** — the length-taking overload. `fn sys_sysinfo(out)` hardcodes
+    40, so without it no wrapper consumer could reach either `sysinfo` tail band.
+- ⇒ **`syscall ABI` is GREEN again: `kernel 105 · abi-doc 105 · cyrius 105`.** The 31/1 that closed
+  1.56.59 was precisely the withdrawal being outstanding, and it cleared as intended.
+- ⚠ **chakshu can now read both tail bands through the wrapper** rather than by raw `syscall(35, …)`:
+  per-core user/kernel ticks at `+40`, per-device sectors at `+104`, via `sys_sysinfo_n(buf, 200)`.
+
+
 ## [1.56.59] — 2026-09-02 — two consumers asked for the same thing, and the one told not to prioritise it was right
 
 ### Added — `mountlist` #104: the mount table, enumerated

@@ -161,7 +161,7 @@ try:
     elif code is None:
         p("INCONCLUSIVE: mlist never ran or never reported"); p(out[-1200:]); rc = 2
     elif code == 95:
-        p("PASS: every 1.56.59 telemetry counter is LIVE and MONOTONIC under real load —")
+        p("PASS: every telemetry counter is LIVE and MONOTONIC under real load —")
         p("      §4 per-process CPU ticks advanced, §1/§2 network packets+bytes advanced on real")
         p("      wire traffic (and bytes outpaced packets), §3 per-device disk sectors are counted")
         p("      and out-of-range tags refused. None of this is provable by reading a counter once:")

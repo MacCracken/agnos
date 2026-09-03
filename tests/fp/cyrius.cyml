@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "agnos ring-3 f64 first-touch exerciser (1.53.x FP/SIMD arc, bite B4) — real f64 arithmetic in ring 3; exits 84 iff correct, proving the B1→B3 FP stack end to end."
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.5.44"
+cyrius = "6.5.45"
 
 [build]
 src = "fpex.cyr"

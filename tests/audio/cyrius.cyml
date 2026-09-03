@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "agnos audio-path test — clean generated waveforms (sine/square/saw/triangle/sweep) streamed through the snd_* band with BLOCKING writes."
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.5.44"
+cyrius = "6.5.45"
 
 [build]
 src = "tonegen.cyr"

@@ -122,8 +122,16 @@ rc=0
 # image, which is exactly the quantity f_bfree claims — the FAT analogue of the ext2 gate's
 # `debugfs -R stats`. ⚠ Compared BEFORE the boot writes anything, against the kernel's FIRST reading.
 strings "$LOG" | grep -E "^(\[[^]]*\] )?fatw: Wstatfs (bsize|free after)" | sed 's/^/  /'
-K_BS=$(strings "$LOG" | sed -n 's/^fatw: Wstatfs bsize=\([0-9]*\) .*/\1/p' | head -1)
-K_FB=$(strings "$LOG" | sed -n 's/^fatw: Wstatfs .*free=\([0-9]*\) .*/\1/p' | head -1)
+# ⛔ THE OPTIONAL UPTIME PREFIX MUST BE MATCHED HERE TOO, AND THIS IS THE ONE PLACE THE 1.56.58
+# MIGRATION MISSED. That pass rewrote 110 `grep "^..."` patterns to tolerate the new
+# `[    4.123456] ` field, but these are `sed -n 's/^...'` EXTRACTIONS, not greps, so the sweep
+# never touched them. Result: the display line at :124 (a grep, migrated) printed the values fine
+# while these two returned EMPTY, and the gate failed with `kernel='' host='127016'` — a CORRECT
+# kernel scoring a red because the parser, not the code, was stale.
+# ⚠ THE CAPTURE GROUP RENUMBERS. Adding `\(\[[^]]*\] \)\{0,1\}` makes the value group \2, not \1.
+# Leaving it at \1 would silently substitute the PREFIX instead of the number.
+K_BS=$(strings "$LOG" | sed -n 's/^\(\[[^]]*\] \)\{0,1\}fatw: Wstatfs bsize=\([0-9]*\) .*/\2/p' | head -1)
+K_FB=$(strings "$LOG" | sed -n 's/^\(\[[^]]*\] \)\{0,1\}fatw: Wstatfs .*free=\([0-9]*\) .*/\2/p' | head -1)
 H_FREE="$BASE_FREE_FAT"
 if [ -n "$K_FB" ] && [ -n "$H_FREE" ]; then
     # ⚠ The kernel reads AFTER the selftest's earlier writes, so its count is <= the pristine host

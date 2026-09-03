@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "agnos ring-3 exerciser for the 1.56.59 telemetry counters — proves per-process CPU ticks (#99 +56), network packet/byte counters (#61 fields 8-11) and per-device disk sectors (#105) are LIVE and MONOTONIC, not merely present; exits 95 iff every counter moved under load."
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.5.44"
+cyrius = "6.5.45"
 
 [build]
 src = "tlm.cyr"

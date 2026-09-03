@@ -194,6 +194,24 @@ stage_one agnos/tests/audio tonegen.cyr tonegen || rc=1
 # in the rootfs faults on purpose, so every one of those burns could only observe the absence of a
 # fault it never caused. That is the same shape as a stale oracle: it does not fail, it agrees.
 stage_one agnos/tests/fault faulter.cyr faulter || rc=1
+
+# ⭐ TELEMETRY EXERCISER — the ONLY reader of the 1.56.59 counters on an iron image, which is why it
+# is staged rather than left as a QEMU-only gate. `run /bin/tlm` -> exit 95 confirms, on real
+# hardware and in one command: per-process CPU ticks and RSS (`proclist`#99 `+56`), network
+# packet+byte counters (`net_config`#61 fields 8-11), per-device disk sectors and per-core user/kernel
+# split (`sysinfo`#35 tail at +104 / +40). Any other code is diagnostic — the 60..97 table lives in
+# scripts/harness/telemetry-test.py.
+# ⛔ chakshu, the consumer these were built for, is NOT staged (no agnos build — its TUI is on the
+# Linux signalfd/epoll model), and `iam` calls the OLD 40-byte `sys_sysinfo`, so without this row the
+# new bands have no reader on iron at all and the burn cannot confirm them.
+# ⭐ AND IT MEASURES SOMETHING QEMU STRUCTURALLY CANNOT: archaemenid runs FOUR CPUs (agnos parks APIC
+# id >= 4). The per-core band's four slots have only ever had one real core behind them.
+stage_one agnos/tests/telemetry tlm.cyr tlm || rc=1
+
+# Mount-table enumerator (`mountlist`#104). `run /bin/mlist` -> exit 95. On an ext2-present boot this
+# is also the only on-iron look at the ALIASING case the syscall exists for — an ext2-less boot maps
+# one backend under both "/" and its "/mnt/..." prefix, which a `statfs` probe cannot distinguish.
+stage_one agnos/tests/mountlist mlist.cyr mlist || rc=1
 # 1.56.54 — the fork#96 ring-3 oracle. fork's contract is entirely about the CALLER's resume context,
 # so it cannot be tested from kernel context (sys_fork refuses a kernel-CR3 caller by design).
 stage_one agnos/tests/fork forker.cyr forker || rc=1
