@@ -405,21 +405,21 @@ fn power_sys(magic1, magic2, cmd, arg) {
     if (magic1 != PWR_MAGIC1) { return 0 - 1; }
     if (magic2 != PWR_MAGIC2) { return 0 - 1; }
 
-# ⭐ 1.56.60 — REJECT AN UNKNOWN cmd HERE, BEFORE ANYTHING IS TORN DOWN. Until now the three
-# cmd tests were the only ones and everything else FELL THROUGH to the halt terminus at the
-# bottom — so a correctly-magicked call with cmd=0 or cmd=99 disarmed the modeset latch, flushed,
-# quiesced every device including the USB keyboard, and then wedged the box. A caller that asked
-# for something this kernel does not implement deserves -1 and a live machine, which is what
-# Linux reboot(2) does with -EINVAL.
-# ⚠ THE DISTINCTION IS "cmd 1 IS halt" (keep) vs "anything unknown IS halt" (reject). PWR_HALT
-# reaching arch_halt() below is a live, documented agnsh verb — agnoshi/src/commands.cyr:36
-# "Stop the machine without powering off", matching Linux's LINUX_REBOOT_CMD_HALT — and is NOT a
-# fall-through. Do not collapse the two.
-if (cmd != PWR_HALT) {
-if (cmd != PWR_OFF) {
-if (cmd != PWR_REBOOT) { return 0 - 1; }
-}
-}
+    # ⭐ 1.56.60 — REJECT AN UNKNOWN cmd HERE, BEFORE ANYTHING IS TORN DOWN. Until now the three
+    # cmd tests were the only ones and everything else FELL THROUGH to the halt terminus at the
+    # bottom — so a correctly-magicked call with cmd=0 or cmd=99 disarmed the modeset latch, flushed,
+    # quiesced every device including the USB keyboard, and then wedged the box. A caller that asked
+    # for something this kernel does not implement deserves -1 and a live machine, which is what
+    # Linux reboot(2) does with -EINVAL.
+    # ⚠ THE DISTINCTION IS "cmd 1 IS halt" (keep) vs "anything unknown IS halt" (reject). PWR_HALT
+    # reaching arch_halt() below is a live, documented agnsh verb — agnoshi/src/commands.cyr:36
+    # "Stop the machine without powering off", matching Linux's LINUX_REBOOT_CMD_HALT — and is NOT a
+    # fall-through. Do not collapse the two.
+    if (cmd != PWR_HALT) {
+        if (cmd != PWR_OFF) {
+            if (cmd != PWR_REBOOT) { return 0 - 1; }
+        }
+    }
 
     # ⭐ 1.56.38 — THE MODESET LATCH IS RELEASED HERE, AND NOWHERE ELSE THE OPERATOR CAN REACH.
     #

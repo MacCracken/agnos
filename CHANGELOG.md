@@ -90,6 +90,12 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   rather than `touch`, which the recovery shell does not have.
 - ⚠ A green poweroff arm under QEMU proves **plumbing only** — QEMU's `_S5_` package is all zeroes,
   so `SLP_TYP=0` is what it wants and a broken decode passes by construction.
+- ⭐ **`scripts/check.sh` gains a 33rd gate: `kernel source formatting`.** `scripts/check/fmt-check.sh`
+  existed and was correct, and `check.sh` never called it — `.github/workflows/ci.yml` runs the
+  equivalent sweep, so drift was caught only at CI, after a push. A local `sh scripts/check.sh` could
+  therefore report **32/32 over an unformatted tree**, which is exactly what it did on 2026-09-03 with
+  `kernel/core/power.cyr` unformatted. Verified to discriminate: deliberate drift → exit 1, clean →
+  exit 0. Fix drift with `sh scripts/check/fmt-fix.sh`.
 
 ### Documentation
 

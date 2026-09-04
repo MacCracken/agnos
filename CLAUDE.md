@@ -51,7 +51,7 @@ sh scripts/ktest.sh                     # in-kernel test suite under the same gn
 sh scripts/test.sh                      # x86_64 (default)
 sh scripts/test.sh --aarch64            # aarch64 (compile test) — ⛔ RED as of 1.56.51, see below
 sh scripts/test.sh --all                # both
-sh scripts/check.sh                     # 32-gate project validation
+sh scripts/check.sh                     # 33-gate project validation
 ```
 
 ⛔ **aarch64 does not currently compile.** `sh scripts/build.sh --aarch64` fails with **32** reachable
@@ -131,7 +131,7 @@ Release flow: `version-bump.sh` → fill CHANGELOG entries → commit → `git t
 
 Ship as the last patch of the current minor (e.g., `1.27.2` before `1.28.0`).
 
-1. **Full test sweep** — `scripts/check.sh` **32/32**, `scripts/test.sh` (x86) **4/4**.
+1. **Full test sweep** — `scripts/check.sh` **33/33**, `scripts/test.sh` (x86) **4/4**. ⭐ The 33rd is the `kernel source formatting` gate, wired at 1.56.60: `scripts/check/fmt-check.sh` had existed all along and check.sh never ran it, so a local full-green was reachable over an unformatted tree while CI (`ci.yml` Format check) would reject the push. Fix drift with `sh scripts/check/fmt-fix.sh`.
    ⚠ These counts were "11/11" and "`--all` 7/7" until 1.56.51 and neither was reachable: check.sh
    has grown to 30 gates, and `--all` tops out at 5 checks of which the aarch64 one is currently a
    FAIL. Re-read the tallies from a real run when you touch this list; do not copy them forward.

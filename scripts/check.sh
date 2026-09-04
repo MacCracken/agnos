@@ -91,6 +91,22 @@ sh "$ROOT/scripts/check/kprint-len-check.sh" > /tmp/kprint-len-check.log 2>&1 &&
 check "kprint literal lengths" $rc
 [ "$rc" = "0" ] || cat /tmp/kprint-len-check.log
 
+# ⭐ 1.56.60 — FORMAT. scripts/check/fmt-check.sh HAS EXISTED ALL ALONG AND check.sh NEVER RAN IT.
+# .github/workflows/ci.yml:156-211 runs the equivalent `cyrius fmt <f> --check` sweep, so format
+# drift was caught — but only at CI, after a push. A local `sh scripts/check.sh` could report a full
+# green over an unformatted tree, which is exactly what happened on 2026-09-03: check.sh said 32/32
+# with kernel/core/power.cyr unformatted, and the operator had to say so by hand. A gate that exists,
+# is correct, and is wired into only one of the two places people run gates is a gate with a hole in
+# it — the same shape as shutdown-smoke.sh being invoked by nothing (fixed in this cut).
+# ⚠ fmt-check.sh keeps ci.yml's SKIP list (kernel/user/shell.cyr) in parity — that file carries a
+# `cyrius` token at column 0 inside a string and false-positives the formatter. Do not diverge them.
+# ⚠ Formatting is TOOLCHAIN-VERSION-DEPENDENT. This gate is only meaningful when the active cyrius
+# matches the `cyrius` pin in cyrius.cyml; toolchain-pin-check.sh above is what holds that true.
+# Fix a failure with: sh scripts/check/fmt-fix.sh
+sh "$ROOT/scripts/check/fmt-check.sh" > /tmp/fmt-check.log 2>&1 && rc=0 || rc=$?
+check "kernel source formatting" $rc
+[ "$rc" = "0" ] || cat /tmp/fmt-check.log
+
 # Syscall ABI three-way consistency: kernel dispatch == ABI doc == the cyrius SysNrAgnos peer.
 # agnos redefines the syscall numbers (exit is #0, not Linux's 60), so a wrong number COMPILES CLEAN
 # and calls a different arm — confirmed shipping in jalwa as `poll`(7) -> `open` PER FRAME and
