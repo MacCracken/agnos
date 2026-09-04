@@ -80,10 +80,14 @@ EXT2_SMOKE_FEATURES="${EXT2_SMOKE_FEATURES:-^resize_inode,^dir_index,^metadata_c
 # Seed from the staged rootfs, never by copying ../agnoshi/build/agnsh directly:
 # that path is the HOST (Linux-ABI) build, and deploying it makes /bin/agnsh die on
 # its first ring-3 syscall ("alloc_init: mmap failed"), after which kybernet falls
-# through to the in-kernel recovery REPL. That REPL reads keystrokes via
-# kb_has_key() (PS/2 IRQ1) while hid_poll() — the xHCI USB-HID drain — is on
-# agnsh's read path, so on a USB-only QEMU keyboard the recovery shell is deaf and
-# the smoke cannot drive it. stage-agnsh.sh --build produces the agnos-ABI binary.
+# through to the in-kernel recovery REPL. stage-agnsh.sh --build produces the agnos-ABI binary.
+#
+# ⚠ 1.56.60 — THIS COMMENT USED TO CLAIM THE RECOVERY REPL IS DEAF ON A USB-ONLY KEYBOARD
+# ("reads keystrokes via kb_has_key() (PS/2 IRQ1) ... the smoke cannot drive it"). THAT IS FALSE
+# and it argued against the one capability this smoke most needs. kb_has_key() calls hid_poll()
+# directly (arch/x86_64/keyboard.cyr:87-97), the PS/2 path was DELETED on 2026-08-08
+# (core/boot_finish.cyr:11-13), and this script's own recovery-shell arm already drives that REPL
+# by sendkey. Do not restore the claim.
 ROOTFS="$ROOT/build/rootfs"
 [ -f "$ROOTFS/bin/agnsh" ] || { echo "ERROR: $ROOTFS/bin/agnsh missing — run scripts/burn/stage-agnsh.sh --build"; exit 1; }
 [ -e "$ROOTFS/bin/touch" ] || { echo "ERROR: $ROOTFS/bin/touch missing — run scripts/burn/stage-tools.sh --build"; exit 1; }
@@ -95,6 +99,19 @@ echo "shutdown smoke seed" > "$SEED/hello.txt"
 # stays pristine, and the control run passes e2fsck with the barrier REMOVED,
 # which is how this gate was caught being a tautology. -a preserves the symlinks.
 cp -a "$ROOTFS/bin/." "$SEED/bin/"
+
+# ⭐ 1.56.60 — SHUTDOWN_SMOKE_NO_AGNSH=1 DRIVES THE IN-KERNEL RECOVERY SHELL INSTEAD OF agnsh.
+# Omitting /bin/agnsh makes kybernet_exec_agnsh() fail and kybernet fall through to the recovery
+# REPL — the exact state an operator lands in when the userland shell will not start, and the
+# state the 2026-09-03 archaemenid report came from. Without this knob the recovery shell's stop
+# verbs had NO gate at all: every arm of this smoke drove agnsh, so `halt` in the kernel shell
+# could be (and was) a loop-exit sentinel that never touched the power subsystem while every
+# gate stayed green. Reproduces the operator's console signature exactly:
+#     kybernet: emergency shell (exec rc=-1)
+if [ "${SHUTDOWN_SMOKE_NO_AGNSH:-0}" = "1" ]; then
+    rm -f "$SEED/bin/agnsh"
+    echo "  SHUTDOWN_SMOKE_NO_AGNSH=1: /bin/agnsh omitted — kybernet must fall to the recovery REPL"
+fi
 
 dd if=/dev/zero of="$IMG" bs=1M count=128 status=none
 parted -s "$IMG" mklabel gpt \
@@ -180,13 +197,33 @@ def wait_for(needle, timeout, what):
 # so either is a valid driver. The verb differs: agnsh takes 'exit', the recovery
 # shell takes 'halt'.
 verb = None
+in_recovery = False
 t0 = time.time()
 while time.time() - t0 < 120:
     txt = logtext()
     if '[ASSIST]' in txt:
         verb = want_verb; print('  ok: agnsh reached its prompt'); break
     if 'agnos>' in txt:
-        verb = 'halt'; print('  ok: recovery shell reached its prompt (agnsh did not start)'); break
+        # ⭐ 1.56.60 — HONOUR want_verb HERE. This line used to be an unconditional
+        # `verb = 'halt'`, which SILENTLY DISCARDED a requested reboot/poweroff and
+        # replaced it with the one verb whose oracle asserts nothing. Combined with the
+        # halt arm's flush-only assertions, that made this smoke report PASS on exactly
+        # the defect the 2026-09-03 operator report describes: a recovery-shell `halt`
+        # that flushed, quiesced and then spin-halted a fully powered box. The recovery
+        # shell now has real reboot/poweroff/halt builtins (kernel/user/shell.cyr), so
+        # pass the request through. It has no `exit` verb — `halt` is its equivalent
+        # stop — and any OTHER verb it cannot deliver is a hard FAIL, never a silent
+        # substitution: a gate that quietly runs something else than it was asked to
+        # is not a gate.
+        in_recovery = True
+        if want_verb in ('halt', 'poweroff', 'reboot'):
+            verb = want_verb
+        elif want_verb == 'exit':
+            verb = 'halt'
+        else:
+            print(f'  FAIL: recovery shell cannot deliver verb {want_verb!r}')
+            sys.exit(2)
+        print(f'  ok: recovery shell reached its prompt (agnsh did not start); driving {verb!r}'); break
     time.sleep(0.5)
 if verb is None:
     print('  TIMEOUT: neither agnsh nor the recovery shell reached a prompt')
@@ -219,7 +256,7 @@ def drain():
 # HMP sendkey takes key NAMES, not characters — a bare space or slash is rejected
 # silently, which reads as "the guest ignored the keyboard".
 KM = {' ': 'spc', '\n': 'ret', '-': 'minus', '.': 'dot', '/': 'slash',
-      '_': 'shift-minus', ':': 'shift-semicolon'}
+      '_': 'shift-minus', ':': 'shift-semicolon', '>': 'shift-dot'}
 
 def key(name):
     # A SUCCESSFUL reboot kills the monitor socket underneath us — QEMU exits the
@@ -263,9 +300,16 @@ def type_verified(word, settle, label):
 # anything flushed it, so barrier-present and barrier-absent runs are
 # indistinguishable. Proven the hard way — the first control run passed e2fsck
 # with the barrier removed. Only the write makes the oracle discriminate.
-if verb == 'exit':
+# ⭐ 1.56.60 — DIRTY FROM THE RECOVERY SHELL TOO. This was `if verb == 'exit':`, so a
+# recovery-shell run reached the e2fsck arm over a filesystem nothing had written — exactly
+# the vacuity the comment above says the write exists to prevent, reintroduced for the one
+# shell whose stop path had no gate. ⚠ agnsh has `touch`; the recovery REPL does NOT — it has
+# `echo >` redirect (kernel/user/shell.cyr:549). Type whichever the DRIVING shell owns, or the
+# write silently fails and the gate goes vacuous again in a way that reads as a pass.
+if verb == 'exit' or in_recovery:
+    write_cmd = 'echo x > /shutmark' if in_recovery else 'touch /shutmark'
     mark = len(logtext())
-    if not type_verified('touch /shutmark', 3.0, 'a filesystem write'):
+    if not type_verified(write_cmd, 3.0, 'a filesystem write'):
         sys.exit(2)
     # Echoing the command is NOT evidence the write happened — a missing binary
     # echoes fine and then fails. That is precisely how this gate was vacuous.
@@ -321,6 +365,34 @@ if verb == 'reboot' or verb == 'poweroff':
 # flush line truncates the log before any of it lands and the absence looks like
 # dead code. Not fatal on its own — a box with no NVMe/AHCI still shuts down.
 wait_for('power: storage quiesced', 30, 'storage quiesce completed')
+
+# ⭐ 1.56.60 — A REAL STOP ORACLE FOR THE ARMS WHERE QEMU DOES NOT EXIT.
+#
+# QEMU does not exit on a `hlt` loop, so qemu_gone() above cannot serve these arms and
+# until now they asserted NOTHING about the machine stopping — only 'filesystems flushed'
+# and 'storage quiesced'. THE BUGGY PATH EMITTED BOTH. A recovery-shell `halt` that
+# flushed, quiesced and then spin-halted a powered box with a dead USB keyboard scored a
+# clean PASS here, which is why five months of green gates never caught the defect the
+# 2026-09-03 archaemenid burn found in one try. That is the "oracle derived from the
+# artifact under test" shape the vacuous-gates sweep catalogues.
+#
+# The fix is to assert a terminus string that ONLY the correct path can emit:
+#   'power: halted'   — printed by power_sys (core/power.cyr:428) and NOWHERE else, so it
+#                       is positive evidence the verb reached the power subsystem rather
+#                       than merely exiting a REPL.
+#   'power: stopped --' — printed by power_stop_final (core/power.cyr) on the boot_finish
+#                       tail that agnsh `exit` unwinds to. Also unique.
+# Neither can be produced by the flush/quiesce pair, which is exactly the point.
+if verb == 'halt':
+    term = 'power: halted'
+    what = 'power_sys reached its halt terminus (the verb entered the power subsystem)'
+else:
+    term = 'power: stopped --'
+    what = 'boot_finish reached power_stop_final (named terminus, latch disarmed)'
+if not wait_for(term, 30, what):
+    print(f'  FAIL: the machine never reached a named stop terminus ({term!r}) -- it may have '
+          f'flushed and quiesced and then simply wedged, which is what this arm used to pass on')
+    sys.exit(5)
 sys.exit(0)
 PY
 PYRC=$?

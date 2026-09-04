@@ -83,7 +83,13 @@ fi
 # the exact-count check rejects a tree that is fine.
 # ⚠ power_quiesce_devices() is PRESERVED across the rewrite, for the same reason ktest.sh preserves
 # it: the bench path must quiesce exactly as production does, or bench measures a different shutdown.
-BFIN_LAUNCH='kybernet(); power_quiesce_devices(); arch_halt();'
+# ⭐ 1.56.60 — CONTRACT CHANGED, DELIBERATELY, AND THIS SCRIPT WAS UPDATED WITH IT. The tail was
+# `kybernet(); power_quiesce_devices(); arch_halt();` until 1.56.60, when it became the named
+# terminus power_stop_final() (core/power.cyr) so the non-syscall stop path also disarms the
+# modeset latch and prints a line saying the box is stopped. power_stop_final() CONTAINS the
+# power_quiesce_devices() this script preserved by name, so bench still quiesces exactly as
+# production does. ⛔ Change scripts/ktest.sh in the SAME commit if this line moves again.
+BFIN_LAUNCH='kybernet(); power_stop_final();'
 BFIN_MATCHES=$(grep -c "$BFIN_LAUNCH" "$BFIN_CYR" || true)
 if [ "$BFIN_MATCHES" -ne 1 ]; then
     echo "ERROR: bench.sh expected exactly 1 '$BFIN_LAUNCH' launch site in $BFIN_CYR, found $BFIN_MATCHES" >&2
@@ -91,11 +97,11 @@ if [ "$BFIN_MATCHES" -ne 1 ]; then
     rm -f "$BFIN_BAK" "$TPROC_BAK"
     exit 1
 fi
-sed -i 's/kybernet(); power_quiesce_devices(); arch_halt();/bench_run_all(); power_quiesce_devices(); arch_halt();/' "$BFIN_CYR"
+sed -i 's/kybernet(); power_stop_final();/bench_run_all(); power_stop_final();/' "$BFIN_CYR"
 # ⭐ ASSERT THE REWRITE LANDED. The count check above proves the pattern was PRESENT; it does not
 # prove the sed replaced it. A guard that only checks the precondition is how the 2026-07-19 break
 # stayed invisible for six weeks in the first place.
-grep -q 'bench_run_all(); power_quiesce_devices(); arch_halt();' "$BFIN_CYR" || {
+grep -q 'bench_run_all(); power_stop_final();' "$BFIN_CYR" || {
     echo "ERROR: bench.sh's entry-point rewrite did not land in $BFIN_CYR" >&2
     exit 1
 }

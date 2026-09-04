@@ -118,7 +118,14 @@ fn kybernet() {
     kprintln("kybernet: exec /bin/agnsh", 25);
     var rc = kybernet_exec_agnsh();
     if (rc != 0) {
-        kprintln("kybernet: emergency shell", 25);
+        # ⛔ SAY WHY. This printed a bare "emergency shell" and DISCARDED `rc` — so the one line that
+        # could distinguish "no rootfs" from "missing file" from "not an ELF" from "the loader refused
+        # the segment permissions" was thrown away at the exact moment it was needed. Measured on
+        # archaemenid 2026-09-03: a 1.56.60 boot fell here on every attempt after the first and the
+        # console said nothing about the cause.
+        kprint("kybernet: emergency shell (exec rc=", 35);
+        kprint_num(rc);
+        kprintln(")", 1);
         shell();
     }
     kprintln("kybernet: shell exited", 22);

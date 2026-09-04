@@ -247,6 +247,19 @@ fn acpi_find_fadt() {
         xa = acpi_load64(f + 140);
         if (xa != 0) { acpi_dsdt_addr = xa; }
     }
+    # ⭐ 1.56.60 — X_PM1a_EVT_BLK (148). This was the ONE PM register never promoted to its X-form
+    # while X_DSDT, X_PM1a_CNT_BLK and X_PM1b_CNT_BLK all were. Consequence on firmware that zeroes
+    # the legacy 32-bit field: acpi_pm1a_evt stays 0, and power_off's WAK_STS clear is then silently
+    # skipped by its own `!= 0` guard — a step that vanishes rather than failing. Latent today
+    # (archaemenid populates the legacy field: `acpi: power control pm1a 804 ... width 2`), which is
+    # exactly why it went unnoticed.
+    # ⚠ SAME "in range AND non-zero" RULE as the three below, via acpi_fadt_has() as the length
+    # guard. QEMU's i440fx rev-1 FADT is 116 bytes and has no X fields at all; a blind read at 148
+    # returns adjacent firmware bytes that look like a perfectly plausible I/O port.
+    if (acpi_fadt_has(148, 12) == 1) {
+        xa = acpi_gas_addr(148);
+        if (xa != 0) { acpi_pm1a_evt = xa; }
+    }
     # X_PM1a_CNT_BLK (172) / X_PM1b_CNT_BLK (184).
     if (acpi_fadt_has(172, 12) == 1) {
         xa = acpi_gas_addr(172);

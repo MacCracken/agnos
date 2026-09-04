@@ -1,4 +1,21 @@
-# `sys_reboot()` is nullary but agnos syscall #13 now takes four arguments — OPEN
+# `sys_reboot()` is nullary but agnos syscall #13 now takes four arguments — RESOLVED
+
+**Status:** RESOLVED — landed in **cyrius 6.4.68**. `lib/syscalls_x86_64_agnos.cyr:745-756` now
+exports `PWR_MAGIC1`/`PWR_MAGIC2`/`PWR_HALT`/`PWR_OFF`/`PWR_REBOOT` and
+`fn sys_reboot(magic1, magic2, cmd, arg): i64` — verbatim what the "Proposed fix" below asked for.
+Verified 2026-09-03 against the **cyrius repo itself**, not a sibling's vendored `lib/`: per the
+sibling-toolchain-pin hazard, any `cyrius build` in a sibling rewrites that sibling's vendored `lib/`
+to the ACTIVE toolchain, so a vendored copy proves what is *installed*, not what cyrius *shipped*.
+
+**Follow-up still open (not this issue):** agnoshi has NOT migrated. `agnoshi/src/agnsh.cyr:348-362`
+still issues the raw `syscall(13, 0x50575231, 0x50575232, cmd, 0)` three times, and the comment at
+`:340-347` ("a cyrius issue is filed to widen the wrapper; until it lands this is the correct call
+shape") is now stale — the wrapper landed. ⚠ The raw form is the **iron-validated** one; migrating to
+`sys_reboot()` must verify the emitted register order first rather than assuming it matches.
+
+**Status header rewritten before this file was consulted, per CLAUDE.md** — the recorded failure mode
+here is stale headers on archived issues (`#98` read "DESIGNED, UNBUILT" eleven cuts after it
+shipped), not missing files. This one still read "OPEN" on 2026-09-03.
 
 **Discovered:** 2026-07-19 while building the **agnos** 1.55.x shutdown arc (orderly
 filesystem flush + device quiesce + platform reset / ACPI S5 soft-off, both iron-validated

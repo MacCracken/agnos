@@ -65,21 +65,38 @@ trap restore_sources EXIT INT TERM
 # claim in that window rests on nothing. The guard fired correctly; nobody ran it.
 # That is the same defect class as host-gpu-oracles.sh being absent from CI.
 #
-# ⚠ Match the FULL launch line, not a substring. `arch_halt();` alone appears TWICE
-# in boot_finish.cyr (the second is the no-shell fallback at :31), so a loosened
-# pattern would double-match and the exact-count check below would reject a tree
-# that is actually fine — or worse, a `kybernet();`-only pattern would rewrite the
-# call while leaving the guard's own error text describing a line that no longer
-# exists. ⚠ power_quiesce_devices() is PRESERVED across the rewrite: the test path
-# should quiesce exactly as production does, or ktest measures a different shutdown.
-BFIN_LAUNCH='kybernet(); power_quiesce_devices(); arch_halt();'
+# ⚠ Match the FULL launch line, not a substring. `arch_halt();` alone still appears in
+# boot_finish.cyr (the no-shell fallback at :31), so a loosened pattern would double-match
+# and the exact-count check below would reject a tree that is actually fine — or worse, a
+# `kybernet();`-only pattern would rewrite the call while leaving the guard's own error text
+# describing a line that no longer exists.
+# ⚠ power_stop_final() is PRESERVED across the rewrite: the test path must stop exactly as
+# production does, or ktest measures a different shutdown.
+#
+# ⭐ 1.56.60 — THIS CONTRACT CHANGED, DELIBERATELY, AND THIS SCRIPT WAS UPDATED WITH IT.
+# boot_finish.cyr:27 was `kybernet(); power_quiesce_devices(); arch_halt();` until 1.56.60,
+# when the bare quiesce+halt tail became the named terminus power_stop_final() (core/power.cyr)
+# so that the non-syscall stop path also disarms the modeset latch and prints a line saying the
+# box is stopped. power_stop_final() CONTAINS the power_quiesce_devices() this script used to
+# preserve by name, so the test path still quiesces exactly as production does — it now also
+# gets the disarm, which no-ops silently when no latch is armed (modeset_latch.cyr:391).
+# ⛔ IF YOU CHANGE boot_finish.cyr's LAUNCH LINE AGAIN, CHANGE scripts/bench.sh IN THE SAME
+# COMMIT. That line has silently killed this script for three weeks and bench.sh for six.
+BFIN_LAUNCH='kybernet(); power_stop_final();'
 BFIN_MATCHES=$(grep -c "$BFIN_LAUNCH" "$BFIN_CYR" || true)
 if [ "$BFIN_MATCHES" -ne 1 ]; then
     echo "ERROR: ktest.sh expected exactly 1 '$BFIN_LAUNCH' launch site in $BFIN_CYR, found $BFIN_MATCHES" >&2
     echo "       the test entry-point rewrite would no-op — boot_finish.cyr's launch site diverged from ktest.sh's contract." >&2
     exit 1
 fi
-sed -i 's/kybernet(); power_quiesce_devices(); arch_halt();/sh_cmd_test(); power_quiesce_devices(); arch_halt();/' "$BFIN_CYR"
+sed -i 's/kybernet(); power_stop_final();/sh_cmd_test(); power_stop_final();/' "$BFIN_CYR"
+# ⭐ ASSERT THE REWRITE LANDED, mirroring bench.sh. The count check above proves the pattern was
+# PRESENT; it does not prove the sed replaced it, and a guard that only checks its precondition is
+# how the 2026-07-19 break stayed invisible for three weeks.
+grep -q 'sh_cmd_test(); power_stop_final();' "$BFIN_CYR" || {
+    echo "ERROR: ktest.sh's entry-point rewrite did not land in $BFIN_CYR" >&2
+    exit 1
+}
 
 # Build the PRODUCTION ELF64 kernel (kybernet→sh_cmd_test already rewritten).
 # scripts/build.sh owns the kashi font-data prepend + the ELF64/multiboot2

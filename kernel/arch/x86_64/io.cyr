@@ -163,3 +163,17 @@ fn clflush(addr) {
 
 fn arch_wait() { asm { hlt; } return 0; }
 fn arch_halt() { asm { cli; hlt; 0xEB; 0xFE; } return 0; }
+
+# ⭐ 1.56.60 — MASK INTERRUPTS ON THIS CORE, WITHOUT STOPPING IT.
+#
+# asm contract: no inputs, no outputs, no clobbers. `cli` clears RFLAGS.IF and touches
+# nothing else — not CF/ZF, not a GPR — so it is safe to drop in front of any call.
+#
+# WHY IT EXISTS: power_off's bounded-spin rationale (core/power.cyr:335-339) is written
+# assuming "interrupts are off and the filesystem is already quiesced". That held only
+# because power_sys was reachable from exactly ONE place — the SYSCALL path, where SFMASK
+# 0xC0000084 = 0x40700 clears IF on entry. Anything ELSE that calls into the power path
+# must establish the same environment by hand, or the teardown runs preemptible: the
+# 100 Hz tick calls hid_poll() then do_context_switch() on every CPU (pic.cyr:127-129),
+# which would poll a USB controller across the xhci_stop that is halting it.
+fn arch_cli() { asm { cli; } return 0; }

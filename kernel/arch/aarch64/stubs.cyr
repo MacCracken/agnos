@@ -259,3 +259,12 @@ fn rdrand_u64() {
 
 fn arch_wait() { wfi(); return 0; }
 fn arch_halt() { wfi(); return 0; }
+
+# ⭐ 1.56.60 — stubs for the recovery shell's stop verbs. kernel/user/shell.cyr is included
+# UNCONDITIONALLY (agnos.cyr:72) but core/power.cyr lives inside #ifdef ARCH_X86_64 (:117),
+# so the shell's reboot/poweroff/halt arms reference symbols this port does not have. PSCI is
+# the real aarch64 answer (SYSTEM_OFF 0x84000008 / SYSTEM_RESET 0x84000009 via SMC); until
+# that is written, refuse rather than pretend: returning -1 is exactly what power_sys returns
+# on a magic mismatch, which the callers already treat as "did not stop the machine".
+fn arch_cli() { return 0; }
+fn power_sys(magic1, magic2, cmd, arg) { return 0 - 1; }

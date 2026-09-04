@@ -20,7 +20,93 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
-## [1.56.60] — 2026-09-03 — cyrius 6.5.45, and both withdrawals landed upstream in one release
+## [1.56.60] — 2026-09-03 — cyrius 6.5.45, and the recovery shell can finally stop the machine
+
+### Fixed — the emergency shell's `halt` was never a power operation
+
+- ⭐ **`halt` in the in-kernel recovery shell was a loop-exit sentinel, not a shutdown.**
+  `kernel/user/shell.cyr` returned `-99`, the REPL cleared `sh_running`, `shell()` returned through
+  `kybernet()`, and the machine landed on `core/boot_finish.cyr`'s fixed tail
+  (`power_quiesce_devices(); arch_halt();`). It flushed and quiesced correctly but **never wrote
+  PM1a_CNT** — the box stayed fully powered with a spin-halted CPU and, because
+  `power_quiesce_devices()` runs `xhci_stop` last, a dead USB keyboard. `power_sys`, `power_off` and
+  `power_reset` were unreachable from that shell: a grep for every power symbol over `shell.cyr`
+  returned two hits, the help string and the sentinel. The sentinel dated to 2026-04-06, predating
+  both the 1.41.8/9 shell split and the entire 1.55.x power subsystem.
+- **The recovery shell gains `reboot` and `poweroff`, and `halt` now routes through `power_sys`.**
+  All three call `power_sys(0x50575231, 0x50575232, cmd, 0)` with cmd **3 / 2 / 1**, the same
+  iron-validated shape agnsh uses, so they inherit the modeset-latch disarm, the shared teardown and
+  the named terminus. Magic values are passed as **literals**, not the `PWR_*` gvars: `core/power.cyr`
+  is included after `kernel/user/shell.cyr`, and a forward gvar read would resolve to 0 and fail the
+  gate at `power.cyr:382`.
+- **Each arm executes `cli` first** via the new `arch_cli()` (`arch/x86_64/io.cyr`). `power_off`'s
+  bounded-spin rationale assumes IF=0, which previously held only because `power_sys` was reachable
+  solely from the SYSCALL path, where SFMASK `0x40700` clears IF. The REPL runs with IF=1.
+- **`kernel/user/shell.cyr` help text corrected.** `halt` no longer reads "shutdown"; `run`, `rm`,
+  `mv`, `sync` and `klug` were dispatched but never advertised; the `test` row is now inside
+  `#ifdef TEST`, matching its dispatch arm.
+- ⚠ `docs/architecture/overview.md` has claimed the recovery REPL owns `reboot` since 1.41.9 — a
+  design that was written down and never built. It is now true.
+
+### Fixed — shutdown/reboot defects found in the same review
+
+- **`power_sys` rejects an unrecognised `cmd` with -1 before any teardown.** Every value other than
+  1/2/3 previously fell through to the halt terminus *after* disarming the latch, flushing and
+  quiescing every device including USB. `cmd == PWR_HALT` reaching `arch_halt()` is unchanged — that
+  is a documented agnsh verb, not a fall-through.
+- **`core/boot_finish.cyr`'s tail is now the named terminus `power_stop_final()`** (`core/power.cyr`),
+  which disarms the modeset latch and prints `power: stopped -- hold the power button to remove
+  power`. `modeset_disarm_on_shutdown()` previously had exactly one caller tree-wide (`power_sys`), so
+  a deliberate stop through this path left `/.modeset-armed` set and the next boot skipped the
+  modeset. `scripts/ktest.sh` and `scripts/bench.sh` pin this line by exact-count sed and were updated
+  in the same change; both verified green.
+- **The modeset transmit watchdog now calls `power_flush()` before `power_reset()`**
+  (`core/syscall.cyr`). It was the only `power_reset()` caller with no durability barrier, so the
+  `klug_spill()` immediately above it — written through `ext2_write_at_dma`, which issues no
+  `blk_flush_on`/`ext2_sync`/`ext2_write_superblock` — never reached stable media, and every watchdog
+  reboot left a dirty ext2 superblock.
+- **`nvme_shutdown()`'s 5-second budget is TSC-paced** (`klog_uptime_us()`) instead of `timer_ticks`.
+  On every syscall-13 shutdown SFMASK `0x40700` clears IF and `timer_ticks` only advances in the
+  timer ISR, so the entire time budget was dead and only the 200,000,000-iteration MMIO spin bounded
+  the loop. The spin backstop is retained for the uncalibrated-TSC case.
+- **`X_PM1a_EVT_BLK` (FADT offset 148) is now promoted** like X_DSDT/X_PM1a_CNT/X_PM1b_CNT
+  (`core/acpi.cyr`), under the same `acpi_fadt_has()` length guard. On firmware that zeroes the legacy
+  32-bit field, `power_off`'s WAK_STS clear was silently skipped by its own `!= 0` guard.
+- **`power_off`'s unused `done` variable removed** and the comment that claimed a post-write status
+  poll corrected — step 5 is a bounded delay and never read PM1a_STS.
+
+### Fixed — gates that could not observe any of this
+
+- ⭐ **`scripts/smoke/shutdown-smoke.sh` was invoked by nothing** — not `check.sh`, not `sweep.sh`, not
+  CI. It is now a `sweep.sh` gate.
+- **It reported PASS on the exact defect above.** Its recovery-shell arm force-substituted
+  `verb = 'halt'`, discarding a requested reboot/poweroff, and the halt arm asserted only
+  `power: filesystems flushed` and `power: storage quiesced` — **both of which the buggy spin-halt
+  path emitted**. Arms where QEMU does not exit now assert a terminus only the correct path can
+  produce: `power: halted` (from `power_sys`) or `power: stopped --` (from `power_stop_final`).
+- **`SHUTDOWN_SMOKE_NO_AGNSH=1` drives the in-kernel recovery shell** by omitting `/bin/agnsh`,
+  reproducing `kybernet: emergency shell (exec rc=-1)`. The recovery shell's stop verbs had no gate
+  of any kind before this. Its filesystem-dirtying step now also runs on that path, via `echo >`
+  rather than `touch`, which the recovery shell does not have.
+- ⚠ A green poweroff arm under QEMU proves **plumbing only** — QEMU's `_S5_` package is all zeroes,
+  so `SLP_TYP=0` is what it wants and a broken decode passes by construction.
+
+### Documentation
+
+- **`docs/development/agnos-userland-abi.md` row 13 rewritten.** It documented the pre-1.55.25 stub
+  (`— | — | — | (halts)`) five minors after the kernel changed. Now: a1 = `0x50575231`, a2 =
+  `0x50575232`, a3 = cmd (1 halt / 2 power off / 3 reboot), a4 = arg (unused); returns **-1** on a
+  magic mismatch or unknown cmd. ⚠ `syscall-abi-check.sh` checks number sets and names only, so
+  argument/semantics drift is invisible to it — the "ABI GREEN 105/105/105" count was passing over
+  wrong content.
+- **`docs/development/issues/archived/2026-07-19-sys-reboot-nullary-vs-agnos-4arg-abi.md` marked
+  RESOLVED** — `sys_reboot(magic1, magic2, cmd, arg)` shipped in **cyrius 6.4.68**, verified against
+  the cyrius repo itself rather than a sibling's vendored `lib/`.
+- **New:** `docs/development/issues/2026-09-03-agnoshi-power-builtins-history-audit-archguard.md` —
+  agnoshi-side findings (no history save, no audit record, unguarded `syscall(13)` that maps to Linux
+  `rt_sigaction` on a host build, dead `is_privileged_command`).
+
+### Changed — cyrius pin 6.5.44 -> 6.5.45
 
 ### Changed — cyrius pin 6.5.44 -> 6.5.45
 

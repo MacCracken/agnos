@@ -187,6 +187,25 @@ run_gate "1.53.x naad-ring3 (real DSP library f64 in ring 3, arc end-proof)" "NA
 # ⚠ Plain production build (no selftest env): the stimulus is a real USB mouse one-shot, not a hook.
 run_gate "1.56.45 console live line (async log vs. the typed prompt, FB oracle)" "" "console-line-smoke.sh"
 
+# ⭐ 1.56.60 — SHUTDOWN. THIS SMOKE EXISTED SINCE THE 1.55.x ARC AND NOTHING HAS EVER RUN IT:
+# `grep -rn shutdown-smoke` over scripts/, scripts/check.sh and .github/workflows/ returned exactly
+# one hit tree-wide, inside a docs issue. So even its working arms — the dirty-then-flush barrier
+# and the post-shutdown e2fsck — had never gated a release. It is registered now because it finally
+# has a real STOP oracle: before 1.56.60 the non-exiting arms asserted only "filesystems flushed"
+# and "storage quiesced", both of which the BUGGY spin-halt path emitted, so this smoke reported
+# PASS on precisely the defect the 2026-09-03 archaemenid burn found by hand.
+# ⚠ THIS ROW DRIVES THE DEFAULT ARM ONLY (agnsh `exit` -> boot_finish -> power_stop_final).
+# run_gate passes $buildenv to build.sh, NOT to the smoke, so the reboot/poweroff arms — which are
+# the ones QEMU's process-exit oracle covers — cannot be selected from this table as it stands.
+# Run those by hand until run_gate can carry smoke-time env:
+#     SHUTDOWN_SMOKE_VERB=poweroff sh scripts/smoke/shutdown-smoke.sh
+#     SHUTDOWN_SMOKE_VERB=reboot   sh scripts/smoke/shutdown-smoke.sh
+# ⛔ A GREEN poweroff ARM UNDER QEMU PROVES PLUMBING ONLY — QEMU's _S5_ package is all zeroes, so
+# SLP_TYP=0 is what it wants and a totally broken decode passes by construction. The S5 decode's
+# only ground truth is real firmware: agnosticos prior-art/acpi-s5-known-good-archaemenid-0719.txt
+# and an iron burn. Do not let a green sweep be read as decode coverage.
+run_gate "1.55.x shutdown (flush barrier, named stop terminus, post-shutdown e2fsck)" "" "shutdown-smoke.sh"
+
 # --- Restore the plain production build as the working artifact ---
 echo ""
 echo "Restoring plain production build..."

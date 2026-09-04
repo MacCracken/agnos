@@ -5,38 +5,38 @@
 
 | | Current |
 |---|---|
-| **Date** | `2026-06-27T23:47:30Z` |
-| **Commit** | `9014d5f` |
-| **Version** | 1.47.6 |
+| **Date** | `2026-09-03T18:53:09Z` |
+| **Commit** | `df787cd` |
+| **Version** | 1.56.60 |
 | **Environment** | QEMU x86_64, rdtsc cycles |
 
 ## core
 
-| Benchmark | `9014d5f` |
+| Benchmark | `df787cd` |
 |---|---|
-| pmm_alloc_free | 11043 cycles/op |
-| heap_32B | 213 cycles/op |
-| heap_256B | 565 cycles/op |
-| heap_4096B | 4404 cycles/op |
-| memwrite_1MB | 1185 Kcycles |
-| memset_1MB | 34172 Kcycles |
-| block_read_amp | multi=1 single=8 nvme submits/4KB |
-| block_write_amp | multi=1 single=8 nvme submits/4KB |
-| block_coalesce_amp | multi=1 perblk=16 nvme submits/64KB |
-| block_coalesce_write_amp | multi=1 perblk=16 nvme submits/64KB |
+| [8.666437]pmm_alloc_free | 459 cycles/op |
+| [9.192430]heap_32B | 160 cycles/op |
+| [9.789967]heap_256B | 508 cycles/op |
+| [10.311626]heap_4096B | 3705 cycles/op |
+| [10.834869]memwrite_1MB | 666 Kcycles |
+| [11.351898]memset_1MB | 1178 Kcycles |
+| [11.892200]block_read_amp | multi=1 single=8 nvme submits/4KB |
+| [12.412825]block_write_amp | multi=1 single=8 nvme submits/4KB |
+| [12.947805]block_coalesce_amp | multi=1 perblk=16 nvme submits/64KB |
+| [13.467441]block_coalesce_write_amp | multi=1 perblk=16 nvme submits/64KB |
 
 ## subsystems
 
-| Benchmark | `9014d5f` |
+| Benchmark | `df787cd` |
 |---|---|
-| syscall_getpid | 32 cycles/op |
-| syscall_getuid | 63 cycles/op |
-| syscall_write1 | 246361 cycles/op |
-| vfs_open_read_close | 880 cycles/op |
+| [14.490469]syscall_getpid | 39 cycles/op |
+| [15.029046]syscall_getuid | 47 cycles/op |
+| [19.675760]syscall_write1 | 11555613 cycles/op |
+| [20.174146]vfs_open_read_close | 980 cycles/op |
 
 ## integration
 
-| Benchmark | `9014d5f` |
+| Benchmark | `df787cd` |
 |---|---|
-| serial_putc | 252326 cycles/op |
+| [25.612793]serial_putc | 12266919 cycles/op |
 

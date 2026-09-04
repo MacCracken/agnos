@@ -196,8 +196,29 @@ fn sh_cmd_help() {
     kprintln("  cd      - change directory", 28);
     kprintln("  pwd     - print working dir", 29);
     kprintln("  disk    - disk info", 21);
+    # ⚠ 1.56.60 — `test` is dispatched inside #ifdef TEST (sh_exec), so a production build was
+    # telling the operator to type a verb that answers "unknown: test". Guard the row to match.
+    # (#ifdef at column 0: the preprocessor needs it there, which is why this file is on CI's
+    # format-skip list — see CLAUDE.md Architecture Notes.)
+#ifdef TEST
     kprintln("  test    - run test suite", 26);
-    kprintln("  halt    - shutdown", 20);
+#endif
+    # ⭐ 1.56.60 — THESE FIVE WERE DISPATCHED BUT NEVER ADVERTISED. `sync` matters most: it is the
+    # only verb in this shell that makes writes durable before an operator pulls power, and it was
+    # invisible to anyone who typed `help`.
+    kprintln("  run     - exec a program from disk", 36);
+    kprintln("  rm      - delete a file", 25);
+    kprintln("  mv      - rename a file", 25);
+    kprintln("  sync    - flush writes to disk", 32);
+    kprintln("  klug    - dump the kernel log ring", 36);
+    # ⭐ 1.56.60 — `halt` read "shutdown" and delivered a CPU spin-halt on a fully powered box.
+    # THAT STRING IS WHAT GENERATED THE 2026-09-03 OPERATOR REPORT: the verb was honestly named
+    # for a machine that had no power subsystem when it was written, and nobody re-read it when
+    # 1.55.x gave the kernel one. It now says what it does, and the two verbs that actually stop
+    # the machine exist alongside it.
+    kprintln("  halt    - stop the CPU (stays powered)", 40);
+    kprintln("  poweroff - power off via ACPI S5", 34);
+    kprintln("  reboot  - reset the platform", 30);
     return 0;
 }
 
@@ -501,6 +522,21 @@ fn sh_exec(buf, len) {
     var arglen = len - cmd_end;
 
     if (sh_streq(buf, clen, "help", 4) == 1) { return sh_cmd_help(); }
+    # ⭐⭐ `klug` AS A BUILTIN, NOT `run /bin/klug` — AND THE DIFFERENCE IS THE WHOLE POINT.
+    # This shell is the EMERGENCY path: kybernet drops here precisely when `exec /bin/agnsh` FAILED.
+    # In that state the exec path is the thing under suspicion, so a diagnostic that needs exec to work
+    # is a diagnostic you cannot reach exactly when you need it. Measured on archaemenid 2026-09-03: a
+    # 1.56.60 iron boot fell to this shell on every attempt after the first, and the operator had no way
+    # to read the log that would say why.
+    # ⚠ `klug_dump` emits through serial_print/fb_print DIRECTLY, never kprint — so unlike the ring-3
+    # tool it does NOT re-append its own output to the ring it is reading. On this path that matters
+    # more than usual: the ring holds the only record of the failed boot.
+    if (sh_streq(buf, clen, "klug", 4) == 1) {
+        if (klug_count == 0) { kprintln("klug: ring is empty -- nothing captured", 39); return 0; }
+        kprintln("klug: dumping the in-kernel log ring (no exec needed)", 53);
+        klug_dump();
+        return 0;
+    }
     if (sh_streq(buf, clen, "uptime", 6) == 1) {
         kprint_num(timer_ticks);
         kprintln(" ticks", 6);
@@ -787,7 +823,65 @@ fn sh_exec(buf, len) {
     #ifdef TEST
     if (sh_streq(buf, clen, "test", 4) == 1) { return sh_cmd_test(); }
     #endif
-    if (sh_streq(buf, clen, "halt", 4) == 1) { return 0 - 99; }
+    # ⭐ 1.56.60 — THE RECOVERY SHELL'S STOP VERBS ROUTE THROUGH power_sys, LIKE agnsh's.
+    #
+    # ⛔ UNTIL NOW `halt` HERE WAS NOT A POWER OPERATION AT ALL. It was a loop-exit SENTINEL:
+    # `return 0 - 99` -> :846 clears sh_running -> shell() returns -> kybernet() returns -> the
+    # machine lands on core/boot_finish.cyr:27's fixed tail, `power_quiesce_devices(); arch_halt();`.
+    # That flushed and quiesced correctly but NEVER wrote PM1a_CNT, so the box sat fully powered
+    # with a dead CPU and — because power_quiesce_devices() runs xhci_stop LAST (power.cyr:141),
+    # and that is the keyboard — no way to interact with it. Operator report, archaemenid iron burn
+    # 2026-09-03: "halt doesn't shutdown completely." It never could.
+    #
+    # `git blame` dates the sentinel to 2026-04-06: it predates the 1.41.8/9 shell split AND the
+    # entire 1.55.x power subsystem (2026-07-19), so no decision ever recorded it as a CPU halt.
+    # It was pre-power-subsystem residue that sh_cmd_help called "shutdown".
+    #
+    # ⭐ `reboot` AND `poweroff` ARE A RESTORATION, NOT AN EXPANSION. agnosticos
+    # `docs/development/shell-separation-prior-art.md:95-96` already assigns `reboot` to THIS shell
+    # ("`ls`/`cat`/`run`/`reboot` for recovery"), and docs/architecture/overview.md:172 already
+    # claims the recovery REPL owns it — a design that was written down and never built. The shipped
+    # tree was the exact inverse of the recorded boundary in both directions. Operator ruling
+    # 2026-09-03 confirmed the verb set: reboot + poweroff + a halt that means what it says.
+    #
+    # ⚠ `cli` FIRST, ON EVERY ARM. power_off's bounded-spin rationale (power.cyr:335-339) assumes
+    # "interrupts are off", which held only because power_sys was reachable ONLY from the SYSCALL
+    # path (syscall.cyr:8667), where SFMASK 0x40700 clears IF. This REPL runs with IF=1 — its reader
+    # parks on a bare `hlt` at :822, which can only wake with IF=1 — and the 100 Hz tick runs
+    # hid_poll() then do_context_switch() on EVERY CPU (pic.cyr:127-129). Without the cli the whole
+    # teardown would be preemptible and would poll HID across the xhci_stop halting that controller.
+    #
+    # ⚠ MAGIC AS LITERALS, not the PWR_* gvars. core/power.cyr is included at agnos.cyr:117; this
+    # file at :72. Forward-calling a FUNCTION across that boundary is long-established here
+    # (ext2_sync, ext2_open, elf_load_from_file — 15 of them), but a forward gvar READ is the exact
+    # kmode init-order trap version.cyr's header documents, where the reference resolves before the
+    # gvar inits have run and silently reads 0. A zeroed magic fails the gate at power.cyr:382 and
+    # the verb becomes a no-op. These literals are the iron-validated agnsh call shape
+    # (agnoshi/src/agnsh.cyr:348-362): 0x50575231 "PWR1", 0x50575232 "PWR2", cmd 1/2/3.
+    #
+    # ⚠ THE -99 FALL-THROUGH IS DELIBERATE BELT-AND-BRACES. power_sys returns ONLY on a magic
+    # mismatch; every valid cmd ends in a platform stop or arch_halt() and does not come back. If a
+    # future magic change ever breaks the gate, degrading to the old exit-the-REPL behaviour is far
+    # better than wedging inside sh_exec with the prompt gone.
+    if (sh_streq(buf, clen, "reboot", 6) == 1) {
+        arch_cli();
+        power_sys(0x50575231, 0x50575232, 3, 0);
+        return 0 - 99;
+    }
+    if (sh_streq(buf, clen, "poweroff", 8) == 1) {
+        arch_cli();
+        power_sys(0x50575231, 0x50575232, 2, 0);
+        return 0 - 99;
+    }
+    # cmd 1 is halt in the decided sense — stop the CPU, leave the box powered — matching
+    # agnsh's `halt` (agnoshi/src/commands.cyr:36 "Stop the machine without powering off") and
+    # Linux's LINUX_REBOOT_CMD_HALT. Unlike the old sentinel it now goes through the full
+    # power_sys teardown, so it disarms the modeset latch and prints "power: halted".
+    if (sh_streq(buf, clen, "halt", 4) == 1) {
+        arch_cli();
+        power_sys(0x50575231, 0x50575232, 1, 0);
+        return 0 - 99;
+    }
     kprint("unknown: ", 9);
     kprint(buf, clen);
     kprintln("", 0);

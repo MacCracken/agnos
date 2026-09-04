@@ -24,7 +24,7 @@ klug_dump();
 # kybernet returns when the shell exits. Until 1.55.x that fell straight into an
 # unrecoverable spin with the ext2 superblock still marked dirty — exiting the
 # shell corrupted the mount. Flush before stopping, on BOTH stop paths.
-kybernet(); power_quiesce_devices(); arch_halt();
+kybernet(); power_stop_final();
 
 kprintln("Halted.", 7);
 power_quiesce_devices();

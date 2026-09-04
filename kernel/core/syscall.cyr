@@ -7502,6 +7502,21 @@ fn mdo_transmit_run(arm) {
         # highest-value failure in the arc (dark panel AND the re-run failed) and it was the one path that
         # would have lost its log. Latent until now only because the guard above was on the wrong flag.
         klug_spill();
+        # ⭐ 1.56.60 — FLUSH, OR THE SPILL ABOVE NEVER REACHES THE PLATTER. klug_spill writes through
+        # ext2_write_at_dma (core/klug.cyr:179/:199/:202/:206) and that path contains no blk_flush_on,
+        # no ext2_sync and no ext2_write_superblock — the bytes land in the drive's write cache and a
+        # reset throws them away. This was the ONE power_reset() caller with no durability barrier (the
+        # other, power.cyr:413, is preceded by power_quiesce_devices() at :410), so it also left a dirty
+        # ext2 superblock behind on every watchdog reboot — precisely the class power.cyr:1-7 was
+        # written to eliminate. And it defeated this site's OWN stated goal two comments up, "the
+        # evidence outlives every exit". It did not.
+        # ⚠ power_flush ONLY. NOT power_quiesce_devices(): this runs mid-modeset, and quiescing the GPU
+        # here would reorder a teardown into a display-recovery path.
+        # ⛔ NOT modeset_disarm_on_shutdown() either. The whole safety argument for this reset (comment
+        # block above) is that the H2 latch SURVIVES, so the next boot skips the modeset and the reboot
+        # is self-disabling. Disarming here would re-arm the boot loop this guard exists to prevent.
+        # ⚠ Do not wrap this — power_flush takes fs_lock itself (power.cyr:42).
+        power_flush();
         power_reset();
         #endif
         return MDO_E_NORESUME;

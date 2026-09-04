@@ -6,7 +6,51 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-09-02 (**1.56.58 — the klug line format became contract; see the 1.56.58 block**). Prior: 2026-08-31 (**1.56.56 — a CHANGELOG correction and the issues folder 7 → 4; see the 1.56.56 block**). Prior: 1.56.55 (the open-issue re-audit). Prior: 2026-08-29 (**1.56.52 — both audit P0s closed** — see the 2026-08-29 block; the 2026-08-28 block below it records the sweep that produced the backlog). **⛔ THE MULTI-MINOR LAG HAPPENED A THIRD TIME, AND THIS FILE PREDICTED IT TWICE.** The ledger sat at **v1.44.9** from 2026-06-10 to 2026-08-28 — **~12 minors** (1.45.x net/server, 1.46.x SMP, 1.47.x-1.49.x, 1.50.x-1.53.x, the 1.54.x-1.56.x GPU/display/shader arcs) — with state.md/roadmap/CHANGELOG kept per-cut and the body docs un-swept, which is verbatim the failure the two notes below describe. The stated fix ("fold a doc-health touch into the cycle-OPEN sweep") was never adopted. ⚠ **This refresh is NOT that catch-up sweep** — it records only what 1.56.51 actually touched. The body docs (`README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`) remain unswept since 1.44.9 and their syscall counts, sizes and subsystem tables should be assumed stale — the surface has since grown to **0-101**.
+> **Last refresh**: 2026-09-03 (**1.56.60 — the shutdown/reboot review; see the 1.56.60 block**). Prior: 2026-09-02 (**1.56.58 — the klug line format became contract; see the 1.56.58 block**). Prior: 2026-08-31 (**1.56.56 — a CHANGELOG correction and the issues folder 7 → 4; see the 1.56.56 block**). Prior: 1.56.55 (the open-issue re-audit). Prior: 2026-08-29 (**1.56.52 — both audit P0s closed** — see the 2026-08-29 block; the 2026-08-28 block below it records the sweep that produced the backlog). **⛔ THE MULTI-MINOR LAG HAPPENED A THIRD TIME, AND THIS FILE PREDICTED IT TWICE.** The ledger sat at **v1.44.9** from 2026-06-10 to 2026-08-28 — **~12 minors** (1.45.x net/server, 1.46.x SMP, 1.47.x-1.49.x, 1.50.x-1.53.x, the 1.54.x-1.56.x GPU/display/shader arcs) — with state.md/roadmap/CHANGELOG kept per-cut and the body docs un-swept, which is verbatim the failure the two notes below describe. The stated fix ("fold a doc-health touch into the cycle-OPEN sweep") was never adopted. ⚠ **This refresh is NOT that catch-up sweep** — it records only what 1.56.51 actually touched. The body docs (`README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`) remain unswept since 1.44.9 and their syscall counts, sizes and subsystem tables should be assumed stale — the surface has since grown to **0-101**.
+>
+> ### 1.56.60 (2026-09-03) — the shutdown review, and two docs that described a design nobody built
+>
+> ✅ **`agnos-userland-abi.md`** row 13 — rewritten. It documented the **pre-1.55.25 stub**
+> (`| 13 | reboot | — | — | — | (halts) | serial_println + arch_halt |`) **five minors** after the
+> kernel became `power_sys(magic1, magic2, cmd, arg)`. Now carries the magic pair, the cmd values
+> (1 halt / 2 power off / 3 reboot), the a4 slot, and the -1 return.
+> ⛔ **THIS CLASS OF DRIFT IS STRUCTURALLY INVISIBLE TO `check.sh`.** By its own header,
+> `scripts/check/syscall-abi-check.sh` checks (A) number sets, (B) doc==cyrius names, (C) kernel
+> dispatch-comment names. **Argument and semantics columns are out of scope by design** — so
+> `state.md`'s "syscall ABI GREEN: kernel 105 · abi-doc 105 · cyrius 105" is a *count* passing over
+> wrong *content*, and no amount of green there covers this. `roadmap.md:32` had already filed the
+> identical sentence as FALSIFIED/STALE and fixed only the roadmap. **Open question: nothing gates
+> the argument columns of 105 rows.**
+>
+> ✅ **`architecture/overview.md`** — the recovery-REPL verb list. This file has said since **1.41.9**
+> that the in-kernel shell "owns just enough (`…`/`sync`/`reboot` + non-write diagnostics)". ⛔ **It
+> never owned `reboot`.** This was not a doc error inventing a verb: agnosticos
+> `docs/development/shell-separation-prior-art.md:95-96` assigns `reboot` to the emergency shell in
+> the recorded boundary decision, and :90 assigns `halt` to agnsh — **the shipped tree was the exact
+> inverse in both directions**. The doc described a design that was written down and never built, so
+> the fix was to the CODE (1.56.60), after which the sentence became true. Now also lists `klug`,
+> `poweroff` and `halt`.
+> ⚠ Note this is the SECOND named instance of "the doc is right, the code is wrong" in this repo.
+> Do not reflexively treat an unmatched doc claim as stale prose — check the boundary record first.
+>
+> ✅ **`issues/archived/2026-07-19-sys-reboot-nullary-vs-agnos-4arg-abi.md`** — header rewritten
+> **OPEN → RESOLVED** with the landing version (**cyrius 6.4.68**) and the still-open agnoshi
+> follow-up. It had sat in `archived/` carrying an OPEN header, which is precisely the failure mode
+> CLAUDE.md names (`#98` read "DESIGNED, UNBUILT" eleven cuts after shipping). ⚠ Verified against the
+> **cyrius repo itself**, not agnoshi's vendored `lib/` — a sibling's vendored copy proves what is
+> *installed*, not what cyrius *shipped*.
+>
+> ✅ **NEW: `issues/2026-09-03-agnoshi-power-builtins-history-audit-archguard.md`** — the agnoshi half
+> of the review, filed rather than fixed (cross-repo work means switching repos). Records what is
+> **not** wrong first: agnsh's `reboot`/`poweroff` are iron-validated and its `halt` semantics are a
+> recorded decision.
+>
+> ⛔ **GATE-COVERAGE FINDING, recorded here because it is a doc-currency fact too:**
+> `scripts/smoke/shutdown-smoke.sh` had **never been run by anything** — absent from `check.sh`,
+> `sweep.sh` and CI, with its only tree-wide mention inside a docs issue. It is now a `sweep.sh` gate,
+> but only after being given a stop oracle: its halt arm asserted `power: filesystems flushed` and
+> `power: storage quiesced`, **both emitted by the broken path**, so it scored PASS on the very defect
+> this cut fixes.
 >
 > ### 1.56.58 (2026-09-02) — the log line becomes contract, and a doc that was wrong in three places
 >

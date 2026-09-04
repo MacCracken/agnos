@@ -254,7 +254,6 @@ fn power_reset() {
 fn power_off() {
     var cnt = 0;
     var spins = 0;
-    var done = 0;
     var base = 0;
 
     if (acpi_fadt_addr == 0) {
@@ -281,9 +280,32 @@ fn power_off() {
         kprintln("acpi: sleep type out of range -- refusing to write", 50);
         return 0;
     }
+    # ⭐ 1.56.60 — THE PARSED PM1_CNT_LEN IS NOW LOAD-BEARING INSTEAD OF DECORATIVE. It was parsed
+    # (acpi.cyr, FADT offset 89) and printed and used for NOTHING: every access below hardcodes
+    # inw/outw, i.e. 16 bits. That is correct for the spec-mandated width of 2, but the kernel was
+    # asserting nothing and would have driven a 16-bit write at a differently-sized register while
+    # printing the real width to the console.
+    # ⚠ REFUSE ONLY ON A PRESENT-AND-WRONG VALUE. A zero means the field was absent or unparsed, in
+    # which case this gate must not fire — refusing there would stop a box that powers off correctly
+    # today, and "no measurement" is not "a bad measurement".
+    # ⚠ MEASURED BEFORE SHIPPING, on both platforms this tree can verify: archaemenid iron reports
+    # `acpi: power control pm1a 804 pm1b 0 width 2`, and QEMU/OVMF reports `... pm1a 604 pm1b 0
+    # width 2`. Neither can trip this gate. Re-measure before tightening it further.
+    if (acpi_pm1_cnt_len != 0) {
+        if (acpi_pm1_cnt_len != 2) {
+            kprintln("acpi: PM1_CNT_LEN is not 2 -- refusing a 16-bit soft-off write", 62);
+            return 0;
+        }
+    }
 
-    # 1. Clear WAK_STS (PM1a_STS bit15, write-1-clear) so the post-write poll below
-    #    means something. Without this a stale bit reads as "already woken".
+    # 1. Clear WAK_STS (PM1a_STS bit15, write-1-clear) — status hygiene before the sleep write,
+    #    so the platform does not enter S5 with a stale "already woken" bit latched.
+    # ⚠ 1.56.60 — THIS COMMENT USED TO SAY "so the post-write poll below means something". THERE IS
+    #    NO POST-WRITE POLL. Step 5 is a bare bounded counter that never reads PM1a_STS, and the
+    #    `var done = 0;` this function declared for that poll had exactly one occurrence in the whole
+    #    body — its own declaration — so it has been removed. The clear itself is kept because it is
+    #    correct on its own terms; only the claim about it was false. If a real poll is ever written,
+    #    keep it BOUNDED for the reason step 5 states.
     if (acpi_pm1a_evt != 0) { outw(acpi_pm1a_evt, 0x8000); }
 
     # 2. Make sure we are actually in ACPI mode. If SCI_EN is clear the firmware is
@@ -332,7 +354,8 @@ fn power_off() {
         outw(acpi_pm1b_cnt, baseb | (acpi_slp_typb << 10) | 0x2000);
     }
 
-    # 5. Wait for the platform to go. ⚠ ACPICA's equivalent poll is UNBOUNDED; ours
+    # 5. Wait for the platform to go. This is a bounded DELAY, not a status poll — see step 1.
+    #    ⚠ ACPICA's equivalent poll is UNBOUNDED; ours
     #    must not be — interrupts are off and the filesystem is already quiesced, so
     #    an infinite spin here is a silently bricked session with no console output.
     #    A machine that is going to power off does so in microseconds; this budget is
@@ -382,6 +405,22 @@ fn power_sys(magic1, magic2, cmd, arg) {
     if (magic1 != PWR_MAGIC1) { return 0 - 1; }
     if (magic2 != PWR_MAGIC2) { return 0 - 1; }
 
+# ⭐ 1.56.60 — REJECT AN UNKNOWN cmd HERE, BEFORE ANYTHING IS TORN DOWN. Until now the three
+# cmd tests were the only ones and everything else FELL THROUGH to the halt terminus at the
+# bottom — so a correctly-magicked call with cmd=0 or cmd=99 disarmed the modeset latch, flushed,
+# quiesced every device including the USB keyboard, and then wedged the box. A caller that asked
+# for something this kernel does not implement deserves -1 and a live machine, which is what
+# Linux reboot(2) does with -EINVAL.
+# ⚠ THE DISTINCTION IS "cmd 1 IS halt" (keep) vs "anything unknown IS halt" (reject). PWR_HALT
+# reaching arch_halt() below is a live, documented agnsh verb — agnoshi/src/commands.cyr:36
+# "Stop the machine without powering off", matching Linux's LINUX_REBOOT_CMD_HALT — and is NOT a
+# fall-through. Do not collapse the two.
+if (cmd != PWR_HALT) {
+if (cmd != PWR_OFF) {
+if (cmd != PWR_REBOOT) { return 0 - 1; }
+}
+}
+
     # ⭐ 1.56.38 — THE MODESET LATCH IS RELEASED HERE, AND NOWHERE ELSE THE OPERATOR CAN REACH.
     #
     # The latch arms before a risky modeset so a write that blanks the panel cannot repeat on the next
@@ -426,6 +465,42 @@ fn power_sys(magic1, magic2, cmd, arg) {
     }
 
     kprintln("power: halted", 13);
+    arch_halt();
+    return 0;
+}
+
+# === The non-syscall stop terminus ===========================================
+#
+# ⭐ 1.56.60 — WHERE THE MACHINE ENDS UP WHEN NOBODY ASKED IT TO STOP.
+#
+# core/boot_finish.cyr's tail is reached whenever kybernet() RETURNS: agnsh `exit`/`quit`, the
+# emergency shell falling out of its loop, or agnsh failing to exec at all. It is not a power
+# request — halting is the recorded intent (agnosticos iron-nuc-zen-log.md:3429, "the machine is
+# deliberately unusable after `exit` until a power cycle — that is the intended new behavior") —
+# but until now that tail was a bare `power_quiesce_devices(); arch_halt();` with two defects:
+#
+#   1. IT NEVER DISARMED THE MODESET LATCH. modeset_disarm_on_shutdown() had exactly ONE caller
+#      tree-wide, power_sys():406, so a deliberate stop through this path left /.modeset-armed set
+#      and the NEXT boot printed "last session did not end cleanly -- modeset SKIPPED this boot".
+#      Backwards: reaching a shell and typing a stop verb IS the display-worked oracle the latch
+#      design depends on. CHANGELOG.md:5088 claimed the disarm "covers reboot, poweroff and halt
+#      alike" — true only of agnsh's cmd-1 halt, and false here.
+#   2. IT SAID NOTHING. The operator's last console line was "power: devices quiesced", a normal
+#      progress line, on a box that was already dead and still powered. Every power_sys terminus
+#      names itself ("power: halted", ":415", ":423"); this one did not, which is a large part of
+#      why "halt doesn't shutdown completely" read as a mystery rather than as a state.
+#
+# ⚠ NOT a power_sys() call. power_sys validates a magic pair meant for a ring-3 caller and would
+# route cmd 1 through the same teardown — but this path must stay callable with no arguments,
+# because scripts/ktest.sh and scripts/bench.sh rewrite boot_finish's launch line by sed and a
+# nullary terminus is what keeps that rewrite a one-token substitution.
+# ⚠ ORDER IS LOAD-BEARING: disarm BEFORE quiesce. The disarm unlinks and FLUSHES the filesystem,
+# so the block device must still be live — quiescing first would leave the write nowhere to go.
+# Same constraint power_sys:404-405 documents.
+fn power_stop_final() {
+    modeset_disarm_on_shutdown();
+    power_quiesce_devices();
+    kprintln("power: stopped -- hold the power button to remove power", 55);
     arch_halt();
     return 0;
 }

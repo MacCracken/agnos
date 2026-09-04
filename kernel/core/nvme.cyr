@@ -244,9 +244,27 @@ fn nvme_disable() {
 # take SECONDS. nvme_disable()'s 1,000,000-iteration ceiling is roughly 250 ms, and
 # reusing it here would false-time-out exactly the drives that most need the wait —
 # and continuing to power off after a false timeout is the same outcome as never
-# having sent the notification at all. So pace on the 100 Hz timer (this runs
-# post-sti, before the shutdown path disables interrupts), with a spin backstop for
-# any context where the timer is not advancing.
+# having sent the notification at all.
+#
+# ⭐ 1.56.60 — PACE ON THE TSC, NOT timer_ticks, AND THE OLD COMMENT HERE WAS FALSE.
+# It read "pace on the 100 Hz timer (this runs post-sti, before the shutdown path
+# disables interrupts)". True of the boot_finish stop path; FALSE of every syscall-#13
+# shutdown, which is the only one agnsh can reach. SYSCALL entry loads SFMASK
+# 0xC0000084 = 0x40700 (arch/x86_64/syscall_hw.cyr:327-333), which CLEARS IF, and
+# nothing re-enables it between core/syscall.cyr:8667 and core/power.cyr:410.
+# timer_ticks advances only in the timer ISR under `if (pcpu_cpu() == 0)`
+# (arch/x86_64/pic.cyr:90) — so with IF=0 the 100 Hz arm never fired, the entire
+# 5-second budget was structurally dead, and the ONLY thing bounding this loop was the
+# 200M-iteration MMIO spin: a duration that is a property of bus speed, not of time.
+# The recovery shell's stop verbs (user/shell.cyr) cli before calling power_sys, so
+# they are IF=0 as well. rdtsc keeps counting with interrupts masked; klog_uptime_us()
+# is the calibrated TSC-to-microseconds reader (arch/x86_64/io.cyr:88) and is in scope
+# here (io.cyr is agnos.cyr:24, this file :94).
+# ⚠ KEEP THE BUDGET GENEROUS for the reason stated just above — a false timeout is the
+# same outcome as never having sent the notification.
+# ⚠ The spin backstop STAYS and is now load-bearing, not decorative: klog_uptime_us()
+# returns 0 when the TSC timebase was never calibrated (lapic_calibrate did not run),
+# and that is exactly when a time-based bound cannot be trusted.
 fn nvme_shutdown() {
     var cc = 0;
     var t0 = 0;
@@ -269,15 +287,17 @@ fn nvme_shutdown() {
     cc = (cc & 0xFFFF3FFF) | 0x4000;
     nvme_mmio_write32(NVME_REG_CC, cc);
 
-    t0 = timer_ticks;
+    t0 = klog_uptime_us();
     while (done == 0) {
         shst = (nvme_mmio_read32(NVME_REG_CSTS) >> 2) & 0x03;
         if (shst == 2) {
             done = 1;
         } else {
             spins = spins + 1;
-            if ((timer_ticks - t0) > 500) { done = 2; }        # ~5 s at 100 Hz
-            if (spins > 200000000) { done = 2; }               # timer-not-running backstop
+            if (t0 > 0) {
+                if ((klog_uptime_us() - t0) > 5000000) { done = 2; }   # 5 s, TSC-paced (IF-independent)
+            }
+            if (spins > 200000000) { done = 2; }               # backstop: TSC uncalibrated or stalled
         }
     }
     if (done == 2) {
