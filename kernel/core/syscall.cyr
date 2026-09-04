@@ -8288,7 +8288,14 @@ fn blk_info_sys(h, out) {
     var capv = 0;
     if (h == blk_active) { capv = blk_capacity; }
     store64(out + 0, capv);
-    store64(out + 8, blk_lba_bytes);
+    # ⛔ 1.56.60 — THIS HANDLE'S STRIDE, NOT THE ACTIVE BACKEND'S. `blk_lba_bytes` is the global for
+    # whichever backend is live, so blk_info on a SECONDARY device reported the wrong sector size.
+    # Both agnos-userland-abi.md §4.4 and the cyrius peer tell a consumer to multiply sectors by this
+    # field — so with an active NVMe at 4096 and a registered virtio at 512, following the documented
+    # recipe produced an 8x BYTE-RATE ERROR. And 512 is not a safe consumer default either:
+    # blk_lba_bytes_ok admits 4096, and only virtio hardcodes 512. The 1.56.52 per-tag sweep reached
+    # blk_read_sys, blk_write_sys and blk_enum_sys and missed this one. Reported by chakshu v0.9.9.
+    store64(out + 8, blk_lba_bytes_for(h));
     return 0;
 }
 

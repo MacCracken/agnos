@@ -62,9 +62,41 @@ fn timer_handler(rsp_after_push) {
     # yields just before the tick is undercounted. Over a monitor's sampling window that is noise, and
     # the alternative — reading the TSC on every context switch — puts an rdtsc + divide in the
     # scheduler's hot path to sharpen a number nobody reads at that resolution.
+    # ⭐ 1.56.60 — DO NOT CHARGE A TICK THAT PAID FOR A HALT. `cpu_in_halt[cpu]` is set around the
+    # `hlt` in arch_wait() (arch/x86_64/io.cyr), which is where every blocking wait in the kernel
+    # parks. Without this the counter measured WALL time, not CPU time: sleep_ms#41 halts with the
+    # caller still current (preempt_disable, so do_context_switch early-returns), so a process
+    # blocked in a syscall accrued at wall-clock rate and a monitor rendered it at 100% while asleep.
+    # Measured and reported by chakshu v0.9.9, which built the CPU% column and backed it out.
+    # ⚠ THIS DOES NOT RE-CHARGE THE TICK ELSEWHERE. Halted time belongs to no process — it is the
+    # box being idle — and inventing an owner for it is what produced the wrong number.
+    # ⚠ Read for THIS cpu only. tk_c below recomputes pcpu_cpu() for the per-core band; both calls
+    # are `if (cpu_count < 2) return 0;` cheap, and keeping them separate leaves that band's
+    # carefully-argued shape untouched.
+    # ⛔⛔ THE ISR *CONSUMES* THE FLAG — READ THEN CLEAR — AND THAT IS NOT AN OPTIMISATION.
+    # MEASURED 2026-09-03: clearing it only in arch_wait() after the `hlt` WEDGED THE COUNTER FOR
+    # THE WHOLE BOOT (telemetry §4 exit 84, "ticks never moved"). The wake path does not reliably
+    # return through arch_wait's tail: this ISR calls do_context_switch a few lines below, which on
+    # a tick that woke a halt switches to a DIFFERENT process — so the post-hlt store never runs,
+    # the flag stays 1, and EVERY subsequent tick on that core is suppressed forever. The idle loop
+    # (core/sched.cyr) parks in arch_wait, so this happens almost immediately on any real boot.
+    # ⇒ Consuming it here makes the suppression ONE-SHOT: one `hlt` cancels exactly the one tick
+    # that woke it, which is the correct accounting anyway. A long wait re-arms it on every loop
+    # iteration (sleep_ms#41 does ~30 hlts for 300 ms, cancelling ~30 ticks).
+    # ⚠ arch_wait's post-hlt clear is STILL REQUIRED and is not redundant: a wait woken by a
+    # NON-timer interrupt leaves the flag armed with no ISR here to consume it, and it would then
+    # eat the next unrelated tick.
+    var tk_hc = pcpu_cpu();
+    var tk_halted = 0;
+    if (tk_hc < 4) {
+        tk_halted = load64(&cpu_in_halt + tk_hc * 8);
+        if (tk_halted != 0) { store64(&cpu_in_halt + tk_hc * 8, 0); }
+    }
     var tk_p = proc_current_get();
-    if (tk_p >= 0) {
-        if (tk_p < 16) { store64(&proc_ticks + tk_p * 8, load64(&proc_ticks + tk_p * 8) + 1); }
+    if (tk_halted == 0) {
+        if (tk_p >= 0) {
+            if (tk_p < 16) { store64(&proc_ticks + tk_p * 8, load64(&proc_ticks + tk_p * 8) + 1); }
+        }
     }
     # ⭐ PER-CORE user/kernel split (telemetry §8) — decided by the PRIVILEGE OF THE INTERRUPTED
     # CONTEXT, not by which process is scheduled. `proc_current_get()` above says who would run next;

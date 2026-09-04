@@ -161,7 +161,30 @@ fn clflush(addr) {
     return 0;
 }
 
-fn arch_wait() { asm { hlt; } return 0; }
+# ⭐ 1.56.60 — THE ONE CHOKEPOINT FOR "THIS CORE IS BLOCKED, NOT WORKING".
+#
+# Every blocking wait in the kernel parks here: sleep_ms#41's loop, kbd_read_blocking, the idle loop
+# (core/sched.cyr), and the dozen net polls (dhcp/dns/ntp/icmp/tcp, core/devs.cyr). That is exactly
+# why the flag goes HERE and not at each caller — a per-site flag is a list that rots, and the sites
+# are the same ~dozen arch_wait() callers that made a per-core `idle` field undecidable.
+#
+# asm contract: `hlt` — no inputs, no outputs, no clobbers. Halts until the next unmasked interrupt.
+# ⛔ REQUIRES IF=1. An IF=0 hlt never wakes (the waitpid hard-hang); callers own that — sleep_ms#41
+# does `sti` before its loop for exactly this reason. Unchanged by this edit.
+#
+# ⚠ THE FLAG IS SET BEFORE THE hlt AND CLEARED AFTER, so the timer ISR that WAKES us observes it
+# still set — which is the whole point: that tick paid for halted time, not for work.
+# ⚠ The few instructions of window on either side (flag set → hlt, and wake → flag clear) can
+# mis-attribute at most one tick per wait, in the conservative direction. Charging the whole tick to
+# whoever is current is already the standard sampling model (see timer_handler); this does not make
+# it exact, it removes a systematic bias that made a blocked process read 100%.
+fn arch_wait() {
+    var aw_c = pcpu_cpu();
+    if (aw_c < 4) { store64(&cpu_in_halt + aw_c * 8, 1); }
+    asm { hlt; }
+    if (aw_c < 4) { store64(&cpu_in_halt + aw_c * 8, 0); }
+    return 0;
+}
 fn arch_halt() { asm { cli; hlt; 0xEB; 0xFE; } return 0; }
 
 # ⭐ 1.56.60 — MASK INTERRUPTS ON THIS CORE, WITHOUT STOPPING IT.

@@ -211,6 +211,34 @@ fn blk_read(sector, buf) {
 var blk_reads_by_tag[6];    # cumulative sectors READ, indexed by tag
 var blk_writes_by_tag[6];   # cumulative sectors WRITTEN, indexed by tag
 
+# ⭐ 1.56.60 — COUNTING HELPERS. Added because the multi-sector paths had to start counting too and
+# four more copies of the clamp is four more places to get the bounds wrong.
+#
+# ⛔ WHY THE MULTI-SECTOR PATHS WERE MISSING, and it made the whole band useless: the only increment
+# sites were blk_read_on/blk_write_on — the SINGLE-sector calls. Every multi-sector path bypasses
+# them, and ext2_read_block/ext2_write_block (the universal FS block primitives) call exactly those
+# bypassing paths. chakshu's harness builds a 4096-byte-block ext2 root on NVMe, so every FS block
+# is 8 sectors and takes nvme's single-command fast path: BOTH COUNTERS STAYED FROZEN AT THEIR
+# BOOT-PROBE VALUE FOR THE LIFE OF THE BOOT. A monitor differencing them showed 0 B/s through a
+# heavy copy — a confident wrong number, which is worse than no number. Reported by chakshu v0.9.9,
+# which is keeping `disk: n/a` until this moves.
+#
+# ⚠ SECTORS, NOT REQUESTS — `n` is the sector count, matching the single-sector sites' `+ 1`.
+# ⚠ COUNT ONLY A COMPLETED TRANSFER, same rule blk_read_on states: counting a failed transfer makes
+# the number a request count wearing a throughput count's name.
+# ⛔ CALL THESE ONLY WHERE THE PATH ACTUALLY BYPASSES blk_read_on/blk_write_on. blk_write_sectors_on
+# loops through blk_write_on for every NON-NVMe tag, and blk_*_sectors_direct falls back to
+# blk_*_sectors_on for every non-NVMe tag — counting at the top of those would DOUBLE-COUNT. The
+# call sites below are placed per-branch for exactly this reason; do not "simplify" them upward.
+fn blk_count_reads(tag, n) {
+    if (tag >= 1) { if (tag <= 5) { store64(&blk_reads_by_tag + tag * 8, load64(&blk_reads_by_tag + tag * 8) + n); } }
+    return 0;
+}
+fn blk_count_writes(tag, n) {
+    if (tag >= 1) { if (tag <= 5) { store64(&blk_writes_by_tag + tag * 8, load64(&blk_writes_by_tag + tag * 8) + n); } }
+    return 0;
+}
+
 fn blk_read_on(tag, sector, buf) {
     if ((blk_registered & (1 << tag)) == 0) { return 0 - 1; }
     # ⚠ COUNT ONLY A COMPLETED TRANSFER. Every driver arm returns <0 on failure; counting a failed
@@ -312,12 +340,18 @@ fn blk_read_sectors(start, count, buf) {
 # sectors; this brings NVMe to parity. Same registered-bit gate as blk_read_on.
 fn blk_read_sectors_on(tag, start, count, buf) {
     if ((blk_registered & (1 << tag)) == 0) { return 0 - 1; }
-    if (tag == BLK_VIRTIO)  { return vblk_blk_read_sectors(start, count, buf); }
-    if (tag == BLK_NVME)    { return nvme_blk_read_sectors(start, count, buf); }
-    if (tag == BLK_AHCI)    { return ahci_blk_read_sectors(start, count, buf); }
-    if (tag == BLK_USB_MS)  { return msc_blk_read_sectors(start, count, buf); }
-    if (tag == BLK_RAMDISK) { return ramdisk_blk_read_sectors(start, count, buf); }
-    return 0 - 1;
+    # 1.56.60 — capture instead of returning inline, so the transfer can be counted on success.
+    # ⚠ ALL FIVE arms dispatch straight to a backend and NONE goes through blk_read_on, so a single
+    # count here is correct and cannot double-count. This is the read side's mainline: ext2_read_block
+    # calls exactly this function for every filesystem block read.
+    var brs = 0 - 1;
+    if (tag == BLK_VIRTIO)  { brs = vblk_blk_read_sectors(start, count, buf); }
+    if (tag == BLK_NVME)    { brs = nvme_blk_read_sectors(start, count, buf); }
+    if (tag == BLK_AHCI)    { brs = ahci_blk_read_sectors(start, count, buf); }
+    if (tag == BLK_USB_MS)  { brs = msc_blk_read_sectors(start, count, buf); }
+    if (tag == BLK_RAMDISK) { brs = ramdisk_blk_read_sectors(start, count, buf); }
+    if (brs >= 0) { blk_count_reads(tag, count); }
+    return brs;
 }
 
 # 1.47.6 perf — no-bounce multi-sector READ for callers that guarantee `buf` is DMA-safe
@@ -330,8 +364,12 @@ fn blk_read_sectors_on(tag, start, count, buf) {
 # blk_read_sectors_on (the bounce path) instead.
 fn blk_read_sectors_direct(tag, start, count, buf) {
     if ((blk_registered & (1 << tag)) == 0) { return 0 - 1; }
+    # ⛔ 1.56.60 — NVMe BRANCH ONLY. nvme_read_sectors is a THIRD bypass — it reaches the device
+    # without passing through blk_read_on OR blk_read_sectors_on, so it needs its own count. The
+    # fallback below goes through blk_read_sectors_on, which counts as of 1.56.60; counting here as
+    # well would double it.
     if (tag == BLK_NVME) {
-        if (nvme_read_sectors(start, count, buf) == 1) { return 0; }
+        if (nvme_read_sectors(start, count, buf) == 1) { blk_count_reads(tag, count); return 0; }
         return 0 - 1;
     }
     return blk_read_sectors_on(tag, start, count, buf);
@@ -343,8 +381,10 @@ fn blk_read_sectors_direct(tag, start, count, buf) {
 # src→scratch copy and the bounce. Other backends fall back to blk_write_sectors_on.
 fn blk_write_sectors_direct(tag, start, count, buf) {
     if ((blk_registered & (1 << tag)) == 0) { return 0 - 1; }
+    # ⛔ 1.56.60 — NVMe BRANCH ONLY, mirroring blk_read_sectors_direct. The fallback goes through
+    # blk_write_sectors_on, whose own NVMe branch counts and whose loop path counts via blk_write_on.
     if (tag == BLK_NVME) {
-        if (nvme_write_sectors(start, count, buf) == 1) { return 0; }
+        if (nvme_write_sectors(start, count, buf) == 1) { blk_count_writes(tag, count); return 0; }
         return 0 - 1;
     }
     return blk_write_sectors_on(tag, start, count, buf);
@@ -357,7 +397,15 @@ fn blk_write_sectors_direct(tag, start, count, buf) {
 # backend if a bench shows it matters). Used by ext2_write_block for <= 8-sector (4 KB) blocks.
 fn blk_write_sectors_on(tag, start, count, buf) {
     if ((blk_registered & (1 << tag)) == 0) { return 0 - 1; }
-    if (tag == BLK_NVME) { return nvme_blk_write_sectors(start, count, buf); }
+    # ⛔ 1.56.60 — COUNT ON THE NVMe BRANCH ONLY. This is the branch that bypasses blk_write_on and
+    # therefore the one the counter was blind to; ext2_write_block on a 4 KB-block NVMe root lands
+    # here every time. The loop below calls blk_write_on, which ALREADY counts one sector per
+    # iteration, so counting at the top of this function would double every non-NVMe write.
+    if (tag == BLK_NVME) {
+        var bws = nvme_blk_write_sectors(start, count, buf);
+        if (bws >= 0) { blk_count_writes(tag, count); }
+        return bws;
+    }
     var i = 0;
     while (i < count) {
         if (blk_write_on(tag, start + i, buf + i * 512) != 0) { return 0 - 1; }

@@ -48,6 +48,61 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 - ⚠ `docs/architecture/overview.md` has claimed the recovery REPL owns `reboot` since 1.41.9 — a
   design that was written down and never built. It is now true.
 
+### Fixed — the two telemetry defects chakshu reported by consuming 1.56.59
+
+- ⭐ **Per-process CPU ticks no longer include HALTED time** (`proclist`#99 record `+56` low u32).
+  The tick is skipped when the core is parked in `arch_wait()` — the single `hlt` every blocking wait
+  funnels through (`sleep_ms`#41's loop, `kbd_read_blocking`, the idle loop, the net polls) — tracked
+  per-CPU in the new `cpu_in_halt[4]`. Before this the quantity was *"share of wall-clock ticks while
+  this slot was current, INCLUDING halted"*: `sleep_ms`#41 halts with the caller still current
+  (`preempt_disable`, so `do_context_switch` early-returns), so a process asleep in a syscall accrued
+  at wall-clock rate. chakshu v0.9.9 built its CPU% column on it, rendered a **sleeping process at
+  100%**, and backed the column out. Halted time is charged to **nobody** — it is the box being idle.
+  ⚠ **No new ABI field and no new syscall**: this changes what the existing counter *means*, which is
+  what the consumer's column head (`utime+stime`, shared with their Linux build) already claimed.
+  ⛔ **The ISR CONSUMES the flag (read-then-clear); clearing it only in `arch_wait` after the `hlt`
+  WEDGES THE COUNTER FOR THE WHOLE BOOT.** Measured during implementation (telemetry exit 84): the
+  wake path does not reliably return through `arch_wait`'s tail, because the same ISR calls
+  `do_context_switch` and switches to another process, so the post-`hlt` store never runs and every
+  later tick on that core is suppressed. One `hlt` now cancels exactly the one tick that woke it.
+- ⭐ **The `sysinfo`#35 block band (+104) counts the mainline I/O path.** The only increment sites were
+  `blk_read_on`/`blk_write_on` — the **single-sector** calls. `blk_read_sectors_on`,
+  `blk_write_sectors_on` and both `*_sectors_direct` fast paths bypassed them, and
+  `ext2_read_block`/`ext2_write_block` — the universal FS block primitives — call exactly those. On a
+  4096-byte-block ext2 root over NVMe every FS block is 8 sectors and takes the single-command fast
+  path, so **both counters stayed frozen at their boot-probe value for the life of the boot** and a
+  monitor differencing them showed 0 B/s through a heavy copy. chakshu held `disk: n/a` rather than
+  render it. ⚠ Counting is placed **per-branch at each bypassing path**, never at the top of a
+  function whose fallback loops through `blk_*_on` — that would double every non-NVMe transfer.
+- **`blk_info`#79 reports the queried handle's `lba_bytes`, not the active backend's.** It stored the
+  module-global `blk_lba_bytes`, so with an active NVMe at 4096 and a registered virtio at 512, a
+  consumer following the documented recipe (multiply sectors by this field, ABI §4.4) got an **8x
+  byte-rate error**. The 1.56.52 per-tag sweep reached `blk_read_sys`/`blk_write_sys`/`blk_enum_sys`
+  and missed this arm.
+
+### Fixed — the telemetry gate that let both ship
+
+- ⛔ **`tests/telemetry/tlm.cyr` §3 asserted the block band STATICALLY — "some tag > 0" — which the
+  boot probe alone satisfies.** Every other band in the same file already used the two-sample
+  *"the counter MOVED"* oracle. §3b now samples, does a real file read (`open`#7 is mount-routed to
+  ext2 and there is no block cache, so it is guaranteed device traffic), and samples again.
+- ⛔ **§4's busy-loop oracle CANNOT see wall-clock-vs-CPU time** — a counter advancing at wall-clock
+  rate for a process doing nothing passes it identically, which is exactly how the halted-time defect
+  shipped. New §4b blocks in `sleep_ms`#41 for ~30 ticks and asserts the counter does **not** move.
+- **Mutation-proven, and the one that is NOT is labelled as such.** Re-introducing each defect and
+  REBUILDING reddens the gate that covers it: dropping the multi-sector counts → **99**; charging
+  halted ticks again → **74**. Restored → **95**. ⚠ The wedge arm (§4c) does **not** bite: reverting
+  the ISR to read-without-consume still exits 95, because the wedge needs a context switch out of a
+  halt and this harness runs essentially one ring-3 process. The hazard is real — observed once as
+  exit 84 — but §4c catches it only opportunistically, and the test says so in place.
+- ⛔ **THE FIRST TWO MUTATION CAMPAIGNS WERE FICTION, AND THAT IS ITS OWN FINDING.**
+  `scripts/harness/telemetry-test.py` resolved BOTH the exerciser (`tests/telemetry/build/tlm`) and
+  the kernel (`build/agnos`) as prebuilt PATHS and rebuilt neither, so eight consecutive runs — a
+  baseline plus mutants that deliberately re-introduced each defect — all reported **exit 95 / PASS**
+  against artifacts that predated every edit. The harness now refuses to run when either binary is
+  older than its sources. Filed for the other 26 harnesses with the same shape:
+  `docs/development/issues/2026-09-03-harness-exercisers-never-rebuilt.md`.
+
 ### Fixed — shutdown/reboot defects found in the same review
 
 - **`power_sys` rejects an unrecognised `cmd` with -1 before any teardown.** Every value other than

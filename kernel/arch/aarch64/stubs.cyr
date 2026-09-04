@@ -257,7 +257,15 @@ fn rdrand_u64() {
     return rdtsc();
 }
 
-fn arch_wait() { wfi(); return 0; }
+# 1.56.60 — mirror of the x86_64 halt-exclusion bracket (arch/x86_64/io.cyr). `wfi` is the same
+# parked state as `hlt`: the core is blocked, not working, so the tick must not be charged.
+fn arch_wait() {
+    var aw_c = pcpu_cpu();
+    if (aw_c < 4) { store64(&cpu_in_halt + aw_c * 8, 1); }
+    wfi();
+    if (aw_c < 4) { store64(&cpu_in_halt + aw_c * 8, 0); }
+    return 0;
+}
 fn arch_halt() { wfi(); return 0; }
 
 # ⭐ 1.56.60 — stubs for the recovery shell's stop verbs. kernel/user/shell.cyr is included

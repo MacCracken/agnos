@@ -97,6 +97,23 @@ var sched_active = 0;
 # reap and hand it a live process with 0 ticks — indistinguishable from a process that just started.
 var proc_ticks[16];     # per-slot 100 Hz tick count — the process's accumulated CPU time
 
+# ⭐ 1.56.60 — IS THIS CPU PARKED IN A BLOCKING WAIT RIGHT NOW? Set around the `hlt` in arch_wait()
+# (arch/x86_64/io.cyr) and read by timer_handler (arch/x86_64/pic.cyr) so a halted core does not
+# charge the tick to whoever happens to be `current`.
+#
+# WHY: chakshu built a CPU% column on proc_ticks, measured it, and BACKED IT OUT. sleep_ms#41 halts
+# with the caller still current (preempt_disable, so do_context_switch early-returns), so a process
+# blocked in a syscall accrued ticks at WALL-CLOCK rate — their monitor rendered a sleeping process
+# at 100%. The quantity was "share of wall-clock ticks while this slot was current, INCLUDING
+# halted", which equals CPU utilisation only for a process that never blocks. Their column head is
+# shared with their Linux build where it means utime+stime, so one name meant two things.
+#
+# ⚠ PER-CPU, indexed by pcpu_cpu(), NOT a single global. Each core parks independently; a global
+# would let one core's idle suppress another core's real work — the failure mode that looks like
+# "the monitor says the box is idle while it is busy", which is the hardest kind to trace back.
+# ⚠ 4 entries to match cpu_user_ticks/cpu_kern_ticks above; pcpu_cpu() already clamps >= 4 to 0.
+var cpu_in_halt[4];
+
 
 var proc_signals[128];  # 16 processes x 8 bytes
 var proc_sigmask[128];  # 16 processes x 8 bytes

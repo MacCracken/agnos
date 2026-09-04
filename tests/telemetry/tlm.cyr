@@ -44,6 +44,68 @@ fn tlm_main(): i64 {
     if (t1 < t0) { return 83; }                 # went BACKWARDS — reset somewhere, unusable as a rate
     if (t1 == t0) { return 84; }                # never moved — the counter is declared but dead
 
+    # ---- §4b: HALTED TIME IS NOT CPU TIME ----
+    # ⛔ §4 ABOVE CANNOT CATCH THIS AND SHIPPED WITHOUT IT. Its load is a BUSY LOOP, so it proves the
+    # counter advances for a process that is genuinely running — and a counter that advances at
+    # WALL-CLOCK rate for a process doing nothing passes it identically. That is exactly what shipped
+    # in 1.56.59: sleep_ms#41 halts with the caller still current (preempt_disable, so
+    # do_context_switch early-returns), the timer ISR charged the tick anyway, and chakshu v0.9.9
+    # rendered a SLEEPING process at 100% CPU. They built the column, measured it, and backed it out.
+    # ⇒ The oracle for "this is CPU time, not wall time" is to BLOCK and assert the counter does NOT
+    # move. Without this assertion the 1.56.60 halt-exclusion fix has no gate and can rot silently.
+    # ⚠ SLOP IS DELIBERATE, NOT LAZINESS. cpu_in_halt is set just BEFORE the `hlt` and cleared just
+    # AFTER it (arch/x86_64/io.cyr), so a tick landing in either window is charged — at most one per
+    # wait, plus the wake tick itself. 300 ms is ~30 ticks of wall time; a threshold of 5 fails hard
+    # on the old wall-clock behaviour (~30) while tolerating that bounded window.
+    var s0 = 0 - 1;
+    n = syscall(99, &buf, 16);
+    i = 0;
+    while (i < n) {
+        if (load64(&buf + i * 64) == me) { s0 = load64(&buf + i * 64 + 56) & 0xFFFFFFFF; }
+        i = i + 1;
+    }
+    if (s0 < 0) { return 64; }
+    syscall(41, 300);                           # sleep_ms — block ~30 ticks in a halt
+    var s1 = 0 - 1;
+    n = syscall(99, &buf, 16);
+    i = 0;
+    while (i < n) {
+        if (load64(&buf + i * 64) == me) { s1 = load64(&buf + i * 64 + 56) & 0xFFFFFFFF; }
+        i = i + 1;
+    }
+    if (s1 < 0) { return 65; }
+    if (s1 < s0) { return 66; }                 # went backwards across a sleep
+    if ((s1 - s0) > 5) { return 74; }           # ⛔ HALTED TIME IS BEING CHARGED AS CPU TIME
+
+    # ---- §4c: A SLEEP MUST NOT WEDGE THE COUNTER ----
+    # ⛔ THE HALT-EXCLUSION FIX HAS ITS OWN FAILURE MODE AND THIS IS THE ORACLE FOR IT. If the
+    # per-CPU `cpu_in_halt` flag is set before the `hlt` but never cleared, EVERY later tick on that
+    # core is suppressed and the counter is dead for the rest of the boot. That is not hypothetical:
+    # it is what the first 1.56.60 implementation did, because the timer ISR calls do_context_switch
+    # and a tick that wakes a halt can switch to a different process, so arch_wait's post-hlt clear
+    # never runs. The ISR therefore CONSUMES the flag. Assert the consequence: after blocking, a
+    # busy loop must still accrue ticks.
+    var w0 = s1;
+    var spin3 = 0;
+    while (spin3 < 40000000) { spin3 = spin3 + 1; }
+    var w1 = 0 - 1;
+    n = syscall(99, &buf, 16);
+    i = 0;
+    while (i < n) {
+        if (load64(&buf + i * 64) == me) { w1 = load64(&buf + i * 64 + 56) & 0xFFFFFFFF; }
+        i = i + 1;
+    }
+    if (w1 < 0) { return 67; }
+    if (w1 == w0) { return 68; }                # ⛔ THE SLEEP WEDGED THE COUNTER — flag never cleared
+    # ⚠ THIS ARM IS NOT MUTATION-PROVEN AND MUST NOT BE READ AS COVERAGE FOR THE WEDGE.
+    # Measured 2026-09-03: reverting the ISR to READ the flag without consuming it still exits 95
+    # here. The wedge needs a context switch to happen OUT of a halt, and this harness runs
+    # essentially one ring-3 process, so do_context_switch has nobody to switch to. The hazard is
+    # real — it was observed once, as exit 84, on a boot where the switch did occur — but this
+    # assertion catches it only opportunistically. Stated plainly for the same reason the §8 note
+    # above states which of its exits cannot fire: an assertion that does not bite must never be
+    # mistaken for one that does. Making it deterministic needs a second runnable process.
+
     # ---- §5: per-process RSS, proclist(#99) record +56 HIGH u32, in 4 KiB pages ----
     # ⚠ SAMPLED FROM THE SAME RECORDS AS §4 — the high half of the slot whose low half was just proven
     # live. Reading the whole u64 and shifting is what a real consumer does, so a kernel that wrote the
@@ -163,6 +225,52 @@ fn tlm_main(): i64 {
         if (tag < 6) { tag = tag + 1; }
     }
     if (found < 0) { return 90; }                       # no device reports ANY sector read
+
+    # ---- §3b: THE BAND MUST MOVE UNDER REAL I/O ----
+    # ⛔ THE STATIC CHECK ABOVE IS NOT AN ORACLE FOR THIS BAND, and shipping it as one cost a
+    # consumer a whole panel. "Some tag > 0" is satisfied by the BOOT PROBE alone, so it passed over
+    # a kernel whose counters were frozen from boot: the only increment sites were blk_read_on /
+    # blk_write_on (the SINGLE-sector calls), and every multi-sector path bypassed them — including
+    # ext2_read_block, which is how all filesystem I/O actually reaches the disk. chakshu v0.9.9 read
+    # this band, saw 0 B/s through a heavy copy, and is keeping `disk: n/a` because of it.
+    # ⇒ Use the SAME two-sample "the counter MOVED" oracle §4, §8 and §1/§2 already use. Their own
+    # filing named this as the right oracle and this band was the one place it was not applied.
+    #
+    # ⚠ THE LOAD MUST BE A REAL DISK READ, not a syscall that merely touches the block layer. open#7
+    # is mount-routed to ext2 (1.41.3) and there is NO block cache between ext2_read_block and the
+    # backend, so reading a file is guaranteed device traffic. /bin/tlm is this binary itself —
+    # the harness copies it into the seeded rootfs, so it is present by construction rather than by
+    # assumption about image contents.
+    # ⛔ A MAGNITUDE THRESHOLD, NOT "IT MOVED" — AND THAT DISTINCTION IS THE WHOLE GATE.
+    # MEASURED 2026-09-03: a "delta > 0" version of this arm PASSED with the multi-sector counting
+    # deliberately removed. Opening a file also performs SINGLE-sector reads (ext2_blk_read ->
+    # blk_read_on, e.g. the superblock and inode table), and those were counted all along — so the
+    # counter moves a little whether or not the path this arm exists to cover is wired. The
+    # discriminator has to be the SIZE of the delta: 12 passes over this ~22 KB binary is ~260 KB of
+    # file data, which can only be ~500+ sectors if ext2_read_block's multi-sector path is counting.
+    # A few dozen single-sector metadata reads cannot reach 256.
+    var r0 = load64(&si200 + 104 + found * 16 + 0);
+    var rdbuf[2048];
+    var pass = 0;
+    var gotany = 0;
+    while (pass < 12) {
+        var fd = syscall(7, "/bin/tlm", 8, 0);
+        if (fd < 0) { return 79; }                      # could not open our own binary
+        var got = 1;
+        while (got > 0) {
+            got = syscall(5, fd, &rdbuf, 2048);
+            if (got > 0) { gotany = gotany + got; }
+        }
+        syscall(6, fd);
+        pass = pass + 1;
+    }
+    if (gotany < 65536) { return 91; }                  # far less data than expected — load never ran
+    sj = 0;
+    while (sj < 200) { store8(&si200 + sj, 0); sj = sj + 1; }
+    if (syscall(35, &si200, 200) != 0) { return 92; }
+    var r1 = load64(&si200 + 104 + found * 16 + 0);
+    if (r1 < r0) { return 98; }                         # went BACKWARDS — unusable as a rate
+    if ((r1 - r0) < 256) { return 99; }                 # ⛔ THE ASSERTION THAT WOULD HAVE CAUGHT IT
 
     return 95;
 }

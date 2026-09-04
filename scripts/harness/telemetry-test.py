@@ -33,6 +33,48 @@ EXT2_FEATURES = "^resize_inode,^dir_index,^ext_attr,^huge_file,^64bit,^metadata_
 def p(*a): print(*a, flush=True)
 def sh(c): subprocess.run(c, shell=True, check=True)
 
+# ⛔⛔ REFUSE A STALE tlm BINARY. MEASURED 2026-09-03: this harness only ever CHECKED THAT
+# tests/telemetry/build/tlm EXISTS — it does not build it. So editing tlm.cyr and re-running scored
+# a confident PASS against a binary compiled hours earlier, and four consecutive mutation runs
+# (each deliberately re-introducing a kernel defect) all reported exit 95 because the assertions
+# meant to catch them were not in the binary under test. A gate that silently tests yesterday's
+# artifact is worse than no gate: it actively certifies the change you did not run.
+# ⚠ Build with: (cd tests/telemetry && cyrius build)
+def _newest(paths):
+    best = 0.0
+    for p in paths:
+        try:
+            m = os.path.getmtime(p)
+            if m > best: best = m
+        except OSError:
+            pass
+    return best
+
+def _refuse_stale(binary, sources, what, howto):
+    if not os.path.exists(binary): return
+    newest = _newest(sources)
+    if newest and os.path.getmtime(binary) < newest:
+        print(f"FAIL: {binary} is OLDER than its {what} — it was edited but never rebuilt.")
+        print("      The assertions/behaviour you just changed are ABSENT from what this would boot.")
+        print(f"      Rebuild with: {howto}")
+        sys.exit(2)
+
+TLM_SRC = os.path.join(ROOT, "tests/telemetry/tlm.cyr")
+_refuse_stale(TLM, [TLM_SRC], "source (tlm.cyr)",
+              "(cd tests/telemetry && cyrius build --agnos tlm.cyr build/tlm)")
+
+# ⛔ AND THE KERNEL, WHICH IS THE BIGGER HALF. `AGNOS` is likewise a PATH to a prebuilt artifact —
+# this harness never runs scripts/build.sh either. MEASURED 2026-09-03: a mutation campaign that
+# deliberately re-introduced two kernel defects (dropping the multi-sector block counts; charging
+# halted ticks) reported exit 95 / PASS on EVERY mutant, because none of the edits to
+# kernel/core/block.cyr or kernel/arch/x86_64/pic.cyr was ever compiled into build/agnos. Every
+# harness here tests KERNEL behaviour, so a stale kernel makes the entire result a fiction.
+_kernel_srcs = []
+for _d, _sub, _f in os.walk(os.path.join(ROOT, "kernel")):
+    for _n in _f:
+        if _n.endswith(".cyr"): _kernel_srcs.append(os.path.join(_d, _n))
+_refuse_stale(AGNOS, _kernel_srcs, "kernel sources (kernel/**/*.cyr)", "sh scripts/build.sh")
+
 for need in (AGNOS, GNOBOOT, ROOTFS, TLM):
     if not os.path.exists(need):
         p(f"FAIL: missing {need}"); sys.exit(1)
@@ -148,6 +190,21 @@ try:
         77: "§3 sysinfo(#35) at len=200 failed — the disk band is not implemented",
         78: "§3 tag slot 0 (BLK_NONE) is non-zero — the tag indexing is off by one",
         90: "§3 no block device reports ANY sector read — the disk counters are dead",
+        64: "§4b our pid vanished before the pre-sleep tick sample",
+        65: "§4b our pid vanished after the sleep",
+        66: "§4b per-process ticks went BACKWARDS across a sleep",
+        74: "§4b HALTED TIME IS CHARGED AS CPU TIME — a process blocked in sleep_ms#41 accrued ticks at "
+            "wall-clock rate, so a monitor renders a sleeping process at 100%. This is the defect "
+            "chakshu v0.9.9 reported and backed its CPU% column out over; §4's busy-loop oracle cannot "
+            "see it, because a wall-clock counter passes that test identically.",
+        79: "§3b could not open /bin/tlm — the harness did not seed this binary, so the I/O load never ran",
+        91: "§3b read() of /bin/tlm returned nothing — no disk I/O was generated, so the oracle is void",
+        92: "§3b the second sysinfo(200) sample failed",
+        98: "§3b block counters went BACKWARDS across the I/O — unusable as a rate",
+        99: "§3b block counters did NOT MOVE across a real file read — the multi-sector paths "
+            "(blk_read_sectors_on / *_direct, which ext2_read_block uses) are not counting. This is "
+            "the exact defect chakshu v0.9.9 reported; the old static 'some tag > 0' check passed on it "
+            "because the boot probe alone satisfied it.",
         93: "§5 our pid vanished before the RSS sample",
         94: "§5 per-process RSS is 0 for a RUNNING process — the counter is dead",
         96: "§5 RSS is not a multiple of 512 pages — unit and 2 MB mapping granularity disagree",
