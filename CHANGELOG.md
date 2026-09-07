@@ -20,7 +20,22 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
-## [1.57.0] — 2026-09-07
+## [1.57.0] — 2026-09-07 — onto the cyrius 6.6 line
+
+### Changed — cyrius pin 6.5.45 -> 6.6.0
+
+- **First move onto the 6.6 line**; the tree had been on 6.5.x since that line opened.
+- **All 12 agnos manifests raised together** — root plus `tests/{audio,blk,chan,fault,fork,fp,gpu,mountlist,readdir,symlink,telemetry}`. `scripts/check/toolchain-pin-check.sh`: **12 manifests, all pin 6.6.0**.
+- **Sibling `klug` raised to 6.6.0 and released as 0.1.7** in the same cut, matching the 1.56.60 precedent of moving it with agnos — manifest pin **and** vendored `lib/` (see Notes).
+- **Kernel builds clean on 6.6.0 with no source changes**, and the binary is **8,128 bytes smaller**: `build/agnos` **2,005,088 -> 1,996,960**. Dead-code note moved 184 -> **191 unreachable fns** (106,137 -> 172,684 bytes reported), so the shrink is the compiler emitting less for identical input, not a source edit.
+- **`scripts/check.sh` 33/33**, `scripts/test.sh` (x86) **4/4**.
+
+### Notes
+
+- **`klug`'s vendored `lib/` re-synced to the 6.6.0 snapshot** with `cyrius lib sync` — vendored **from the pin**, not taken as a side effect of a build. All **23** `lib/*.cyr` now byte-match `~/.cyrius/versions/6.6.0/lib`. Host and `--agnos` targets build clean; `cyrius test` **37/37**.
+- ⛔ **klug's `[deps].stdlib` was UNDER-DECLARED and that is what left it stale.** It named 8 modules; `result`, `atomic` and `fnptr` are included transitively (`lib/io.cyr` includes `lib/result.cyr`) but were not declared, so `lib sync` skipped them and they were vendored-by-accident. **`result.cyr` had genuinely diverged**: 6.6.0 makes `Result` a **value type** (declared `: stack`, so `Ok(v)`/`Err(e)` return values), while klug carried the v5.8.28 form — a stale `Result` underneath a 6.6.0 `io`. All three are now declared, so the sync copies **23** files instead of 20 and is reproducible.
+- ⚠ **The exercisers under `tests/*/build/` were compiled by 6.5.45.** `scripts/harness/telemetry-test.py`'s staleness guard (1.56.60) compares a binary against its **source** mtime, not against the toolchain, so a pin raise alone does not trip it. Rebuild before treating any exerciser result as evidence for this cut.
+
 
 ## [1.56.60] — 2026-09-03 — cyrius 6.5.45, and the recovery shell can finally stop the machine
 
