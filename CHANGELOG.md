@@ -20,6 +20,8 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.0] — 2026-09-07
+
 ## [1.56.60] — 2026-09-03 — cyrius 6.5.45, and the recovery shell can finally stop the machine
 
 ### Fixed — the emergency shell's `halt` was never a power operation
