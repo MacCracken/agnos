@@ -1,0 +1,39 @@
+# blkleak — arm the raw-disk write gate and EXIT WITHOUT CLOSING.
+#
+# ⛔ THIS PROGRAM IS DELIBERATELY "BADLY BEHAVED", AND THAT IS THE ENTIRE POINT.
+# `blk_rw_armed` is the capability gate on blk_write#78. It is cleared by blk_close_sys — so any
+# exerciser that politely closes its handle disarms the gate on its way out and can NEVER detect a
+# leak. `tests/blk/blkwr.cyr` closes at its step 5, which is why running blkwr twice does NOT gate
+# the exit path: measured 2026-09-08, a kernel with the proc_reap disarm REMOVED still produced two
+# clean `run: exit 96` lines. That first attempt at a gate could not fail, which is exactly the
+# defect class this tree keeps paying for.
+#
+# ⇒ The only way to observe the leak is a process that ARMS and then DIES without closing — a
+# crashed installer, a killed flasher, or simply a program that forgets. This is that process.
+#
+# It is meaningless alone. The gate is the SEQUENCE, wired in kernel/core/main.cyr under
+# BLK_WRITE_SELFTEST:
+#     1. /bin/blkleak   — arms, does not close, exits 94
+#     2. /bin/blkwr     — whose FIRST assertion is "blk_write while UNARMED must be REJECTED"
+# With the exit-disarm present, blkwr sees a closed gate and exits 96.
+# Without it, blkwr finds the gate still open from step 1 and exits **83 GATE BROKEN**.
+#
+# ⚠ Exits 94, not 96: a distinct code so a log carrying it can never be mistaken for blkwr's verdict.
+# ⚠ Arms on tag 0 exactly as blkwr does; the arm is a global with no per-handle state, so no disk is
+#   touched and nothing is written. This program cannot corrupt anything — it only sets a flag.
+
+fn blkleak_main(): i64 {
+    var ebuf[192];
+    var n = sys_blk_enum(&ebuf, 192);
+    if (n < 1) { return 81; }                  # no disk — same code blkwr uses, same meaning
+
+    # The deliberate arm. Identical call to blkwr's step 3.
+    sys_blk_open(0, 0x424C4B5F5257);           # blk_open(_, BLK_RW_ARM_MAGIC)
+
+    # ⛔ NO sys_blk_close() HERE. Adding one would disarm the gate and silently turn this gate back
+    # into the one that could not fail. If you are "tidying up a leaked handle" in this file, stop:
+    # the leak IS the test.
+    return 94;
+}
+
+fn main(): i64 { return blkleak_main(); }

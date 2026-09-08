@@ -27,6 +27,7 @@ done
 
 echo "[1/4] Building blkwr (--agnos) + the BLK_WRITE_SELFTEST kernel..."
 ( cd "$BLK_ROOT" && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius build blkwr.cyr build/blkwr --agnos ) >/tmp/blkwr-build.log 2>&1 || { echo "  BUILD-FAIL (blkwr)"; tail -8 /tmp/blkwr-build.log; exit 1; }
+( cd "$BLK_ROOT" && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius build blkleak.cyr build/blkleak --agnos ) >/tmp/blkleak-build.log 2>&1 || { echo "  BUILD-FAIL (blkleak)"; tail -8 /tmp/blkleak-build.log; exit 1; }
 if ! env BLK_WRITE_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/blkwr-kbuild.log 2>&1; then
     echo "  BUILD-FAIL (kernel, see /tmp/blkwr-kbuild.log)"; tail -8 /tmp/blkwr-kbuild.log; exit 1
 fi
@@ -34,8 +35,12 @@ fi
 GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"
 AGNOS="$ROOT/build/agnos"
 BLKWR="$BLK_ROOT/build/blkwr"
+# 1.57.1 — /bin/blkleak is the exit-disarm gate's first half: it arms the raw-write capability and
+# exits WITHOUT closing, so the blkwr run after it can observe whether the arm survived process exit.
+BLKLEAK="$BLK_ROOT/build/blkleak"
 [ -f "$GNOBOOT" ] || { echo "ERROR: gnoboot not built at $GNOBOOT"; exit 1; }
 [ -f "$BLKWR" ]   || { echo "ERROR: blkwr not built at $BLKWR"; exit 1; }
+[ -f "$BLKLEAK" ] || { echo "ERROR: blkleak not built at $BLKLEAK"; exit 1; }
 echo "  build/agnos $(stat -c %s "$AGNOS") B   /bin/blkwr $(stat -c %s "$BLKWR") B"
 
 WORK="$ROOT/build/blk-write-smoke"; rm -rf "$WORK"; mkdir -p "$WORK"
@@ -45,6 +50,7 @@ EXT2_FEATURES="^resize_inode,^dir_index,^metadata_csum,^64bit,^uninit_bg"
 
 echo "[2/4] Seeding a GPT disk (parted) with /bin/blkwr..."
 SEED="$WORK/seed"; mkdir -p "$SEED/bin"; cp "$BLKWR" "$SEED/bin/blkwr"
+cp "$BLKLEAK" "$SEED/bin/blkleak"
 dd if=/dev/zero of="$IMG" bs=1M count=256 status=none
 parted -s "$IMG" mklabel gpt mkpart ESP fat32 1MiB 33MiB set 1 esp on mkpart agnos-fs ext2 33MiB 240MiB
 sgdisk -t 2:8300 "$IMG" >/dev/null
@@ -67,7 +73,11 @@ QPID=$!; trap 'kill $QPID 2>/dev/null' EXIT
 i=0
 while [ $i -lt $HARD ]; do
     sleep 1; i=$((i+1))
-    if grep -aq "exec: blkwr returned" "$SLOG" 2>/dev/null; then sleep 1; break; fi
+    # ⛔ 1.57.1 — WAIT FOR THE **SECOND** RETURN. This matched "exec: blkwr returned", which the
+    # FIRST run prints, so the dwell ended before the exit-disarm sequence (blkleak, then blkwr again)
+    # could finish — the log stopped mid-gate and the smoke scored a FAIL on its own impatience
+    # rather than on the kernel. Measured: the third exec had started and never got to print.
+    if grep -aq "exec: blkwr returned (2nd)" "$SLOG" 2>/dev/null; then sleep 1; break; fi
     kill -0 $QPID 2>/dev/null || break
 done
 kill $QPID 2>/dev/null; trap - EXIT; wait $QPID 2>/dev/null; sync
@@ -79,8 +89,21 @@ rc=0
 strings "$SLOG" | grep -q "exec: running /bin/blkwr" \
     && echo "  PASS: /bin/blkwr dispatched (exec'd from disk in ring 3)" \
     || { echo "  FAIL: blkwr never dispatched"; rc=1; }
-if strings "$SLOG" | grep -q "run: exit 96"; then
-    echo "  PASS: run: exit 96 — write-path + gate OK (unarmed write/RW-open REJECTED; armed write#78 to scratch LBA read back byte-identical)"
+# ⛔⛔ 1.57.1 — TWO exit-96 LINES ARE REQUIRED, NOT ONE. The kernel runs /bin/blkwr TWICE under this
+# selftest, and the second run is the gate for the EXIT-DISARM of blk_rw_armed: run 1 ARMS the raw
+# write gate and exits, and blkwr's FIRST assertion is "blk_write while UNARMED must be REJECTED".
+# So if the arm survives process exit, run 2 finds the gate already open and exits **83 GATE BROKEN**.
+# ⇒ Counting only ONE 96 would score the leak as a pass, which is the vacuity this whole gate family
+# exists to prevent. `grep -c` is the assertion; do not weaken it back to `grep -q`.
+BLKWR96="$(strings "$SLOG" | grep -c 'run: exit 96' || true)"
+if [ "${BLKWR96:-0}" -ge 2 ]; then
+    echo "  PASS: run: exit 96 TWICE — write-path + gate OK, and the raw-write arm did NOT survive"
+    echo "        the first process's exit (unarmed write/RW-open REJECTED on the second run too)"
+elif [ "${BLKWR96:-0}" -eq 1 ]; then
+    echo "  FAIL: only ONE 'run: exit 96'. If the second run exited 83, blk_rw_armed SURVIVED process"
+    echo "        exit — a raw disk-write gate left open for whatever runs next (proc_reap regression)."
+    strings "$SLOG" | grep -E 'run: exit [0-9]+' | head -4 | sed 's/^/        /'
+    rc=1
 elif strings "$SLOG" | grep -qE "run: exit 83|run: exit 84"; then
     echo "  FAIL[SECURITY]: an UNARMED raw write/RW-open SUCCEEDED — THE CAPABILITY GATE IS BROKEN"; rc=1
 elif strings "$SLOG" | grep -q "run: exit 81"; then

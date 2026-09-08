@@ -784,6 +784,39 @@ fn main(): i64 {
     if (md11b == 0) { ps("** NOT CONNECTED **"); nl(); bad = bad + 1; }
 
     nl();
+    # ==============================================================================================
+    # ⛔ NON-VACUITY FLOOR — ASSERTED BEFORE PASS, BECAUSE `bad == 0` IS SATISFIED BY DOING NOTHING
+    # ==============================================================================================
+    # ⭐ WHAT THE EXTERNAL FLOOR CANNOT SEE, AND IT IS D8. scripts/check/host-gpu-oracles.sh weighs
+    # this oracle's OUTPUT VOLUME (floor 20 lines) because that is the only thing observable from
+    # outside. D8's verdict is `cmax == fmax` AND `cmax < 2^31`, and BOTH are true of two zeros --
+    # so a `dg_absmax_at` that stops evaluating prints
+    #     "D8  corner bound 0 == brute-force whole-rect maximum 0, both under 2^31: PASS"
+    # which is a line, in the count, saying it measured nothing. ⛔ MEASURED: stub dg_absmax_at to
+    # return 0 and NOT ONE gate in this file goes red -- every D and every M line still prints its
+    # green verdict, exit is 95, and the log is 30 non-blank lines against a floor of 20 (re-measured 1.57.1 against the PRE-floor file; an earlier draft quoted 29, the POST-floor mutant count). D8 is also
+    # the one gate here with no mutation arm of its own, so nothing else was watching it.
+    # ⚠ SCOPE, HONESTLY: the second floor (dg_px) is belt and braces, not a hole being closed --
+    # gutting `dc_render` outright already reds D0c/D2/D4/D0d/D5/D9/D10/D11b. But D1, D3, D6, D0b and
+    # D0e all still print PASS on it, and those are the rung's headline oracle; asserting that the
+    # renderer wrote a full frame costs one line and stops them being read off an empty one.
+    # ⚠ Both minima are DERIVED from this file, not chosen. `dc_render` returns its written-pixel
+    # count and the frame is DC_W x DC_H, so a render that ran must return exactly that. And the
+    # corner bound of a real triangle over a 32x32 rect cannot be zero.
+    if (cmax == 0) {
+        ps("depthgate: ** VACUOUS -- D8's corner bound is 0, so dg_absmax_at evaluated nothing."); nl();
+        ps("  `cmax == fmax` and `cmax < 2^31` are both true of two zeros, so D8 printed PASS at"); nl();
+        ps("  exactly the line count a real measurement prints. D8 has no mutation arm either."); nl();
+        return 89;
+    }
+    var dg_px = dg_render_order(0);
+    if (dg_px != DC_W * DC_H) {
+        ps("depthgate: ** VACUOUS -- dc_render wrote "); pn(dg_px); ps(" of "); pn(DC_W * DC_H);
+        ps(" pixels."); nl();
+        ps("  D1/D3/D6/D0b/D0e all diff two buffers this loop fills and print PASS outside it, so"); nl();
+        ps("  an empty render satisfies them. Do not read them."); nl();
+        return 89;
+    }
     if (bad == 0) {
         ps("depthgate: PASS -- depth-tested rasterisation is ORDER-INDEPENDENT on a corpus proven"); nl();
         ps("           fair (no z-ties), truly interpenetrating, and non-empty; the co-planar"); nl();

@@ -72,6 +72,17 @@ var hexb[8];
 
 var pass_n = 0;
 var fail_n = 0;
+# ⛔ THE CLASS TABLE'S OWN LENGTH -- the number of `agree(...)` call sites in main() below, which is
+# the minimum this run must have encoded and compared. Spent by the non-vacuity floor at the end of
+# main(), where the reason it exists is written down. Re-count it with:
+#     grep -c '^    agree(' asmagree.cyr
+# ⚠ THE '^' IS LOAD-BEARING. Without it the pattern also matches THIS COMMENT LINE and reads 66 for
+# a 65-class file; follow that on the next addition and you set AG_NCLASSES one too high and REDDEN
+# a healthy oracle -- the mirror image of the hole this floor closes. A call site starts at column
+# 4; a comment starts with '#', so the anchor cannot count the instructions.
+# ⚠ COUNT AND TABLE TRAVEL TOGETHER: add a class below and raise this in the SAME edit, exactly as
+# host-gpu-oracles.sh pairs its oracle name list with ORACLE_FLOOR_TOTAL.
+var AG_NCLASSES = 65;
 
 # ⚠ Compare, report, and NAME the class. A bare count of failures would tell the next person
 # that the encoder is untrustworthy without telling them which encoding to distrust.
@@ -277,6 +288,22 @@ fn main(): i64 {
         puts("   hand-assembly is. The class is named above; resolve it with a third opinion");
         puts("   (llvm-mc -mcpu=gfx90c, as a ONE-OFF investigation -- D-1 rejected llvm-mc as a");
         puts("   BUILD GATE, not as a tool) before any rung authors a kernel with this encoder.");
+        return 90;
+    }
+    # ⛔ IN-ORACLE NON-VACUITY FLOOR. WHAT IT CATCHES: `fail_n == 0` -- the entire success condition
+    # above -- is satisfied by a run that compared NOTHING. Compile the class list out, return
+    # early, or edit `agree()` so it stops incrementing, and this file reports 95 while asserting
+    # that mabda's encoder reproduces zero of agnos's iron-proven dwords.
+    # ⛔ WHY THE EXTERNAL FLOOR CANNOT SEE IT: scripts/check/host-gpu-oracles.sh weighs this oracle
+    # by how many lines it printed (asmagree:52), and `agree()` PRINTS its class name and both
+    # dwords on the same pass that COUNTS -- so a helper edited to keep printing while no longer
+    # counting leaves the line count untouched and the runner scores it green. Only a count taken
+    # where the comparison happens sees that. cpuref.cyr's cases_ok / lit_fail pair is the model.
+    if (pass_n + fail_n < AG_NCLASSES) {
+        ps("** VACUOUS: "); pnum(pass_n + fail_n); ps(" of "); pnum(AG_NCLASSES);
+        puts(" encoding classes were actually encoded and compared.");
+        puts("   A class that never ran is a class with NO evidence, not a class that agrees, and");
+        puts("   this file's only claim is per-class agreement. Nothing may cite this run.");
         return 90;
     }
     puts("AGREE across every encoding class exercised.");

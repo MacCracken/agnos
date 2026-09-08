@@ -59,6 +59,11 @@ fn bg_fill_flat(v): i64 {
 fn main(): i64 {
     var bad = 0;
 
+    # ⛔ IN-ORACLE NON-VACUITY COUNTERS. Each gate below counts what it actually EXAMINED, not only
+    # what it found wrong. They are spent by the floor at the bottom of main(), which is where the
+    # reason they exist is written down.
+    var n1 = 0; var n1b = 0; var n2 = 0; var n2b = 0; var n34 = 0; var n5 = 0; var n6 = 0;
+
     # ---- G1: WEIGHT SUM. Exhaustive over all 65,536 (fx,fy) pairs. -------------------------------
     var g1 = 0;
     var fx = 0;
@@ -67,6 +72,7 @@ fn main(): i64 {
         while (fy < 256) {
             var s = (256 - fx) * (256 - fy) + fx * (256 - fy) + (256 - fx) * fy + fx * fy;
             if (s != 65536) { g1 = g1 + 1; }
+            n1 = n1 + 1;
             fy = fy + 1;
         }
         fx = fx + 1;
@@ -84,6 +90,7 @@ fn main(): i64 {
         while (u < 65536 * 3) {
             var got = bi_sample(&bg_tex, BG_TW, BG_TH, u, u + 12345, 1);
             if ((got & 0xFF) != vv) { g1b = g1b + 1; }
+            n1b = n1b + 1;
             u = u + 4099;                    # a prime-ish stride: hits many distinct fx/fy pairs
         }
         vv = vv + 17;
@@ -116,6 +123,7 @@ fn main(): i64 {
             var got  = bi_sample(&bg_tex, BG_TW, BG_TH,
                                  tx * 65536 + BI_HALF, ty * 65536 + BI_HALF, 1);
             if (got != want) { g2 = g2 + 1; }
+            n2 = n2 + 1;
             tx = tx + 1;
         }
         ty = ty + 1;
@@ -136,6 +144,7 @@ fn main(): i64 {
             var t = load32(&bg_tex + (by2 * BG_TW + bx2) * 4) & 0xFFFFFFFF;
             var g  = bi_sample(&bg_tex, BG_TW, BG_TH, bx2 * 65536, by2 * 65536, 1);
             if (g == t) { g2b = g2b + 1; }
+            n2b = n2b + 1;
             bx2 = bx2 + 1;
         }
         by2 = by2 + 1;
@@ -163,6 +172,7 @@ fn main(): i64 {
             var acc = 255 * ((256 - a) * (256 - b)) + 255 * (a * (256 - b))
                     + 255 * ((256 - a) * b)         + 255 * (a * b);
             if (acc > 4294967295) { g4 = g4 + 1; }
+            n34 = n34 + 1;
             b = b + 1;
         }
         a = a + 1;
@@ -183,6 +193,7 @@ fn main(): i64 {
             var p = bi_lerp4(11, 200, 37, 250, s1, s2);
             var q = bi_lerp4(250, 37, 200, 11, 256 - s1, 256 - s2);
             if (p != q) { g5 = g5 + 1; }
+            n5 = n5 + 1;
             s2 = s2 + 17;
         }
         s1 = s1 + 17;
@@ -206,6 +217,7 @@ fn main(): i64 {
             var bot = t01 * (256 - d1) + t11 * d1;      # scaled by 256
             var sep = (top * (256 - d2) + bot * d2) >> BI_WSHIFT;
             if (four != sep) { g6 = g6 + 1; }
+            n6 = n6 + 1;
             d2 = d2 + 11;
         }
         d1 = d1 + 11;
@@ -215,6 +227,40 @@ fn main(): i64 {
     nl();
 
     nl();
+    # ⛔ IN-ORACLE NON-VACUITY FLOOR. WHAT IT CATCHES: a gate that reports PASS having EXAMINED
+    # NOTHING. Every gate above passes by finding ZERO counter-examples, so a loop whose body is
+    # #ifdef'd out, whose bound is edited to 0, or whose helper stops being called leaves its
+    # failure counter at 0, `bad` at 0, and prints exactly the same "Gn ...: PASS" line as a
+    # healthy run. cpuref.cyr's cases_ok / lit_fail pair is the model: count what was DONE, not
+    # only what was WRONG, and refuse to report success over an empty count.
+    # ⛔ WHY THE EXTERNAL FLOOR CANNOT SEE IT: scripts/check/host-gpu-oracles.sh weighs this oracle
+    # by how many lines it printed (bigate:7). Every "Gn ...: PASS" above is printed OUTSIDE the
+    # loop that computes it, so gutting a loop leaves the printed line count UNTOUCHED and the
+    # runner scores the vacuous run green -- its own header says so and names this file. Only a
+    # count taken INSIDE the loop can see it, which is why this floor lives here and not there.
+    # ⚠ THE MINIMA ARE THIS FILE'S OWN TRIP COUNTS, not chosen numbers: G1 and G3/G4 sweep the full
+    # 256x256 fraction space (the 65536 G1's own label claims), G2 visits every texel of the
+    # BG_TW x BG_TH texture, G2b every interior boundary of it. G1b/G5/G6 are floored at "examined
+    # something" ONLY, because their trip counts follow strides a later edit may legitimately
+    # change and a floor that fires on a healthy oracle is worse than no floor. `<`, never `!=`,
+    # so widening a sweep is never a failure.
+    var vac = 0;
+    if (n1 < 256 * 256)                  { ps("G1  ** VACUOUS: examined "); pn(n1);  ps(" (fx,fy) pairs, not 65536"); nl(); vac = vac + 1; }
+    if (n1b == 0)                        { ps("G1b ** VACUOUS: not one flat-texture sample was taken"); nl(); vac = vac + 1; }
+    if (n2 < BG_TW * BG_TH)              { ps("G2  ** VACUOUS: examined "); pn(n2);  ps(" texel centres, not BG_TW*BG_TH"); nl(); vac = vac + 1; }
+    if (n2b < (BG_TW - 1) * (BG_TH - 1)) { ps("G2b ** VACUOUS: examined "); pn(n2b); ps(" interior boundaries"); nl(); vac = vac + 1; }
+    if (n34 < 256 * 256)                 { ps("G3/G4 ** VACUOUS: examined "); pn(n34); ps(" (a,b) pairs, not 65536"); nl(); vac = vac + 1; }
+    if (n5 == 0)                         { ps("G5  ** VACUOUS: not one symmetry pair was compared"); nl(); vac = vac + 1; }
+    if (n6 == 0)                         { ps("G6  ** VACUOUS: not one separability pair was compared"); nl(); vac = vac + 1; }
+    if (vac != 0) {
+        ps("bigate: FAIL -- "); pn(vac); ps(" gate(s) reported PASS having examined NOTHING.");
+        nl();
+        ps("        A gate that finds no counter-example because it looked at none is not a gate,");
+        nl();
+        ps("        and the line-count floor outside cannot tell the two apart.");
+        nl();
+        return 90;
+    }
     if (bad == 0) {
         ps("bigate: PASS -- the INTEGER bilinear is exact. No float, no rounding question,");
         nl();

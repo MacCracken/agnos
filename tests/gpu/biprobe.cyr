@@ -101,6 +101,33 @@ fn main(): i64 {
     ps("  AS SHIPPED: bilinear differs from nearest in "); pn(diff); ps(" of "); pn(cov);
     ps(" samples at a 1:1 mapping"); nl();
 
+    # ⛔ IN-ORACLE NON-VACUITY FLOOR. WHAT IT CATCHES: this probe reports success by measuring
+    # `diff == 0`, and an EMPTY measurement loop yields exactly that. #ifdef the body out, edit a
+    # bound so it never iterates, or break tex_uv_at's caller, and `diff` stays 0, the "AS SHIPPED"
+    # line above still prints (it reads "0 of 0"), the regression branch below is skipped, and the
+    # probe returns 95 having compared no samples at all.
+    # ⛔ WHY AN EXTERNAL LINE-COUNT FLOOR CANNOT SEE IT: every line this probe prints -- the census,
+    # the "AS SHIPPED" verdict, the closing note -- is printed OUTSIDE the loops that compute them,
+    # so gutting a loop leaves the printed line count UNTOUCHED. Only a count taken INSIDE the loop
+    # can tell a clean run from an empty one. cpuref.cyr's cases_ok / lit_fail pair is the model.
+    # ⚠ NO MAGIC MINIMUM. `cov` is floored at "something", not at 64, because the block size is a
+    # literal in both loops and a later edit may legitimately change it. The second test is the
+    # file's own cross-check instead: the census loop and the comparison loop walk the SAME 8x8
+    # block, so their counts must agree; if one is gutted and the other is not, they will not.
+    var census = fx0 + fx128 + fxother;
+    if (cov == 0) {
+        ps("  ** VACUOUS: 0 samples were compared. `diff == 0` here means NOTHING WAS MEASURED,"); nl();
+        ps("     not that bilinear reproduces nearest. Check the px2/py2 loop bounds."); nl();
+        return 90;
+    }
+    if (census != cov) {
+        ps("  ** VACUOUS: the census walked "); pn(census); ps(" samples but the comparison walked ");
+        pn(cov); nl();
+        ps("     -- the two loops no longer cover the same block, so the census no longer names"); nl();
+        ps("     WHY the comparison came out as it did."); nl();
+        return 90;
+    }
+
     # ---- ⭐ INVERTED INTO A REGRESSION GATE, 2026-07-28 -----------------------------------------
     # This probe was written to DIAGNOSE the defect and originally carried a second measurement that
     # passed `tx_u_out - 32768` by hand to demonstrate the fix. That arm is now WRONG: BI_HALF is

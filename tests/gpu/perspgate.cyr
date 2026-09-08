@@ -103,7 +103,9 @@ fn main(): i64 {
 
     # ---- P4: the widths, re-measured here rather than trusted from perspbits -------------------
     pc_corpus_floor();
-    pc_render();
+    var cov4 = pc_render();                # ⚠ CAPTURED, not discarded: the widths below are maxima
+                                           # over the covered pixels, and a render that covered none
+                                           # reports max D = 0, which passes "D fits a lane".
     ps("P4  max N "); pn(pc_max_N); ps("  max D "); pn(pc_max_D);
     ps("  divide iterations per pixel "); pn(pc_iters / (pc_covered * 2)); nl();
     ps("    D fits a 32-bit lane (needs <= 2147483647): ");
@@ -132,9 +134,13 @@ fn main(): i64 {
     var C = pc_corpus_constattr();
     var cov3 = pc_render();
     var p5bad = 0;
+    var n5 = 0;                 # ⛔ covered px actually COMPARED against C -- spent by the floor at
+    var n5scan = 0;             #    the bottom of main(), where the reason is written down
     var i5 = 0;
     while (i5 < PC_W * PC_H) {
+        n5scan = n5scan + 1;
         if (load64(&pc_cov + i5 * 8) == 1) {
+            n5 = n5 + 1;
             if (load64(&pc_u + i5 * 8) != C) { p5bad = p5bad + 1; }
             if (load64(&pc_v + i5 * 8) != C) { p5bad = p5bad + 1; }
         }
@@ -152,7 +158,8 @@ fn main(): i64 {
 
     # ---- P6: the divide obligation, on REAL render data, by multiplication only -----------------
     pc_corpus_floor();
-    pc_render();
+    var cov6 = pc_render();                # ⚠ CAPTURED: pc_obl_bad == 0 is exactly what a render
+                                           # that drew NOTHING also reports. See the floor below.
     ps("P6  q*D <= N < (q+1)*D on every drawn pixel (by MULTIPLICATION, never a second divide): ");
     if (pc_obl_bad == 0) { ps("PASS"); nl(); }
     if (pc_obl_bad != 0) { ps("FAIL "); pn(pc_obl_bad); ps(" violations"); nl(); bad = bad + 1; }
@@ -163,8 +170,10 @@ fn main(): i64 {
     pg_checker();
     var texdiff = 0;
     var n7 = 0;
+    var n7scan = 0;
     var i7 = 0;
     while (i7 < PC_W * PC_H) {
+        n7scan = n7scan + 1;
         if (load64(&pc_cov + i7 * 8) == 1) {
             n7 = n7 + 1;
             var tp = pg_fetch(load64(&pc_u + i7 * 8), load64(&pc_v + i7 * 8));
@@ -186,6 +195,75 @@ fn main(): i64 {
     ps("    the checkerboard cell size, and mistaking one for the other misreads a correct burn."); nl();
 
     nl();
+    # ⛔ IN-ORACLE NON-VACUITY FLOOR. WHAT IT CATCHES: a gate that reports PASS having examined
+    # NOTHING. Every property above passes by finding ZERO counter-examples -- `ad2 == 0` at P3,
+    # `p5bad == 0` at P5, `pc_obl_bad == 0` at P6 -- and zero is precisely what an EMPTY gate
+    # reports. Zero a corpus so it draws no pixel, edit a loop bound to 0, #ifdef a body out, or
+    # let a shared helper stop storing coverage, and every one of those counters stays 0, `bad`
+    # stays 0, and this file prints the same "Pn ... PASS" lines it prints on a healthy run.
+    # cpuref.cyr's cases_ok / lit_fail pair is the model: count what was DONE, not only what was
+    # WRONG, and refuse to report success over an empty count.
+    # ⛔ WHY THE EXTERNAL FLOOR CANNOT SEE IT: scripts/check/host-gpu-oracles.sh weighs this oracle
+    # by how many lines it printed (perspgate:12 against 18 healthy). Every "Pn" verdict above is
+    # printed OUTSIDE the render or the loop that computes it, so gutting the work leaves the
+    # printed line count UNTOUCHED and the runner scores the vacuous run green -- its own header
+    # says so and names this file among the still-unfloored. Measured: gutting P5's comparison
+    # loop left the output at all 18 lines and exit 95. Only a count taken where the work happens
+    # sees that, which is why this floor lives here and not there.
+    # ⚠ THE MINIMA ARE THIS FILE'S OWN MEASUREMENTS, NOT CHOSEN NUMBERS. P3/P4/P5/P6/P7 all
+    # re-render a corpus whose SCREEN GEOMETRY is identical to P1's floor quad -- pc_corpus_flat,
+    # pc_corpus_constattr and pc_corpus_floor carry the same four vertices (0,63) (63,63) (40,24)
+    # (24,24) and differ only in w and the attributes -- so each must cover AT LEAST the `cov` P1
+    # measured, and P1 already gates `cov` above at > 800. The scan floors are the loop bounds
+    # themselves. `<`, never `!=`, so a widened corpus can never false-fire.
+    # ⚠ P1/P2/P7's own verdicts are already self-flooring and are NOT repeated here: P1 demands
+    # cov > 800, P2 demands ad > cov/2 (so > 400 real divergences), and P7's `texdiff > n7/4` is
+    # false at n7 == 0. P3, P4, P5 and P6 had no such floor, and P5's is the hole with no second
+    # line of defence at all.
+    var vac = 0;
+    if (cov2 < cov) {
+        ps("P3  ** VACUOUS: covered "); pn(cov2); ps(" px, not the "); pn(cov);
+        ps(" P1 measured on the SAME screen geometry -- 'affine and perspective agree exactly'");
+        nl(); ps("    is what two empty images also report."); nl(); vac = vac + 1;
+    }
+    if (cov4 < cov) {
+        ps("P4  ** VACUOUS: covered "); pn(cov4); ps(" px, not the "); pn(cov);
+        ps(" P1 measured -- max D and max N are maxima over the drawn pixels, and"); nl();
+        ps("    'D fits a 32-bit lane' is trivially true of a D that was never computed."); nl();
+        vac = vac + 1;
+    }
+    if (n5scan < PC_W * PC_H) {
+        ps("P5  ** VACUOUS: walked "); pn(n5scan); ps(" pixels, not PC_W*PC_H = ");
+        pn(PC_W * PC_H); nl(); vac = vac + 1;
+    }
+    if (n5 < cov3) {
+        ps("P5  ** VACUOUS: compared "); pn(n5); ps(" of the "); pn(cov3);
+        ps(" covered px against the constant attribute --"); nl();
+        ps("    the EXTERNAL invariant is the strongest claim in this file and it checked nothing.");
+        nl(); vac = vac + 1;
+    }
+    if (cov6 < cov) {
+        ps("P6  ** VACUOUS: covered "); pn(cov6); ps(" px, not the "); pn(cov);
+        ps(" P1 measured -- the divide obligation was discharged on no pixel."); nl();
+        vac = vac + 1;
+    }
+    if (n7scan < PC_W * PC_H) {
+        ps("P7  ** VACUOUS: walked "); pn(n7scan); ps(" pixels, not PC_W*PC_H = ");
+        pn(PC_W * PC_H); nl(); vac = vac + 1;
+    }
+    if (n7 < cov7) {
+        ps("P7  ** VACUOUS: fetched "); pn(n7); ps(" of the "); pn(cov7);
+        ps(" covered px through the checkerboard."); nl(); vac = vac + 1;
+    }
+    if (vac != 0) {
+        ps("perspgate: FAIL -- "); pn(vac); ps(" gate(s) reported PASS having examined NOTHING.");
+        nl();
+        ps("           A gate that finds no counter-example because it looked at none is not a");
+        nl();
+        ps("           gate, and the line-count floor outside cannot tell the two apart.");
+        nl();
+        return 90;
+    }
     if (bad == 0) {
         ps("perspgate: PASS -- the figure DISCRIMINATES perspective from affine ("); pn(ad);
         ps(" px, worst "); pn(adworst); ps("),"); nl();

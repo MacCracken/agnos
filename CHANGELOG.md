@@ -22,7 +22,61 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.57.1] — 2026-09-08 — backlog closeout: 21 items across six issue files
 
+### Fixed — vacuous-gates CLOSED: all 18 host GPU oracles floored
+
+- ⭐ **ALL EIGHTEEN host GPU oracles now carry an in-oracle non-vacuity floor**, plus four more
+  outside the runner's list. The external line-count floor **cannot see a gutted oracle**: these files
+  print each gate's label OUTSIDE the loop that computes it, so emptying the loop leaves the printed
+  volume untouched and the gate still reports PASS.
+- ⭐ **Every floor was falsified by mutation, and every hole was real.** In each case the PRE-floor
+  mutant still cleared the external floor at full volume: `depthgate` stubbing `dg_absmax_at` → exit
+  **95 over 30 lines** (floor 20), with gate D8 printing *"corner bound 0 == brute-force maximum 0:
+  PASS"*; `depthmodel` neutering one peak-tracking line → **95 over the full 38** (floor 25);
+  `asmagree` deleting a single `pass_n = pass_n + 1` → **75 lines** (floor 52); `edgeasm` gate 6 →
+  **95 over 30** (floor 20), on the one gate whose ten SGPR rules have **no other witness in the
+  tree**. Minima come from each file's own loop bounds or table lengths and use `<`, so widening a
+  sweep cannot false-fire.
+- ⛔ **The sweep found a defect it was itself introducing.** A new vacuity branch in
+  `asmlib.ea_vgpr_check` **inverted `edgeasm`'s own gate-5 falsification arm**: gate 5 reads
+  `ea_vgpr_check(1, "MUTANT") == 0` as "the guard fired", and the new branch returned 0 for a *dead
+  tracker* too — a mutation arm satisfied by the exact vacuity it exists to rule out. Caught in
+  verification and fixed with a discriminator.
+- ⚠ **Three comments recorded the POST-floor mutant line counts while describing the PRE-floor
+  state** (`depthdiv` 15 vs 19, `depthgate` 29 vs 30, `depthmodel` 29 vs 38). All understated the
+  gap, but a written measurement is load-bearing here. Corrected.
+- ⛔ **THE SWEEP CAUGHT THREE FLOORS THAT DID NOT BITE — the same defect one level up.**
+  `moderaster` counted at function ENTRY rather than at the comparison, so a helper stubbed to always
+  pass still scored "53 of 53" and exit 95 — an oversold floor, which its own comment denied.
+  `texgate` gate 9 caught only a totally dead gate, missing a 58% coverage loss. And `asmlib`'s new
+  vacuity branch **inverted `edgeasm`'s own gate-5 mutation arm**. All three found in verification
+  and fixed. ⚠ Four "recount with this grep" recipes matched their own comment lines and would have
+  set a constant HIGH, reddening a healthy oracle on the next addition — this sweep's defect in
+  reverse, latent inside the fix itself. All anchored.
+- **`docs/development/issues/2026-09-02-vacuous-gates-sweep.md` is CLOSED and archived.** Residuals
+  named in it rather than implied: the ring-3 `tests/gpu` programs cannot be floored from the host
+  (their oracle is a burn), `texgate` gate 2's IDX8 arm needs a counter in `texmodel.cyr`, and the
+  `tests/*/` surface beyond `tests/gpu/` is a smaller separate job.
+
+### Added — gates for the 1.57.1 fixes that had none
+
+
+- ⭐ **`tests/blk/blkleak.cyr` + a three-exec sequence: the exit-disarm of `blk_rw_armed` is now
+  MUTATION-PROVEN.** The obvious gate — run `blkwr` twice — was tried first and **measured useless**:
+  `blkwr` closes its handle, and `blk_close_sys` already disarms, so a kernel with the `proc_reap`
+  exit-disarm REMOVED still produced two clean `exit 96` lines. Observing the leak requires a process
+  that arms and dies WITHOUT closing, which is all `blkleak` is. The gate is the sequence
+  `blkwr (96) → blkleak (94) → blkwr (96)`; with the fix reverted the third run returns
+  **83 GATE BROKEN**, measured. ⚠ The smoke's dwell also had to move off `exec: blkwr returned` —
+  the first run prints that, so it ended the boot mid-gate and scored a FAIL on its own impatience.
+- ⚠ **The 4Kn stride fix is still ungated, and now for a KNOWN reason rather than a vague one.**
+  QEMU *does* offer `-device nvme,logical_block_size=4096`, so the earlier "no gate is possible" was
+  wrong. What actually blocks it: the boot image's GPT/ESP are laid out for 512-byte sectors, so on a
+  4096 device UEFI cannot find the boot partition at all (measured: `BdsDxe: failed to load Boot0002
+  … Not Found`, then PXE). A real gate needs a **4Kn-native image** — GPT and ESP built at 4096 —
+  which is scoped work, not an impossibility.
+
 ### Fixed — three more issue files closed (six → three open)
+
 
 - ⭐ **agnoshi's power builtins — all six items, fixed IN agnoshi (1.9.11), not from this tree.**
   History save and audit record now happen *before* the syscall that does not return; the three raw

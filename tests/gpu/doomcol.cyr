@@ -31,6 +31,23 @@ var dc_pal[512];                # pal_xrgb: the 256-entry ARGB palette
 var dc_cmap[4096];              # colormap: 34 light levels x 256 = 8704 B
 var dc_out[512];                # what the quad path produced, one column of ARGB
 
+# ⛔ IN-ORACLE NON-VACUITY FLOOR. `dc_rows_want` accumulates the rows each case was ASKED to compare;
+# `dc_rows_cmp` counts the rows its compare loop ACTUALLY compared. main() asserts they are equal
+# before it prints a success verdict.
+# ⭐ WHY AN EXTERNAL LINE-COUNT FLOOR (the shape scripts/check/host-gpu-oracles.sh applies) CANNOT DO
+# THIS, MEASURED. Every line here is printed OUTSIDE the `while (y < rows)` loop: the per-case
+# "EXACT" comes after it and the mutation verdicts after that. ⛔ Narrow the loop by ONE row --
+# `while (y < rows - 1)`, the off-by-one in fixup arithmetic this repo's closeout list names by name
+# -- and all seven cases still print EXACT, all three mutation arms still fire, `fail` and `dead`
+# both stay 0, exit is 95, and the log is 28 non-blank lines, the SAME as a healthy run. The last row
+# of every case simply stopped being checked and nothing said so.
+# ⚠ SCOPE, HONESTLY: a fully gutted loop is already caught, because the three mutation arms then
+# break 0 rows and `dead` fires. What is uncaught is the PARTIAL loop, and that is what this floors.
+# ⚠ The minimum is derived from the file, not chosen: `rows` is the case's own argument, so a case
+# that reaches its loop must compare exactly that many rows.
+var dc_rows_cmp = 0;
+var dc_rows_want = 0;
+
 fn ph8(v): i64 {
     var d = 28;
     while (d >= 0) {
@@ -151,10 +168,12 @@ fn dc_case(name, nlen, th, rows, tex_y_start, tex_y_step, light): i64 {
         ps("  "); print(name, nlen); ps("  REFUSED by tri_prep/tex_prep"); nl();
         return 1;
     }
+    dc_rows_want = dc_rows_want + rows;
     var bad = 0;
     var shown = 0;
     var y = 0;
     while (y < rows) {
+        dc_rows_cmp = dc_rows_cmp + 1;
         var w = load32(&want + y * 4) & 0xFFFFFFFF;
         var g = load32(&dc_out + y * 4) & 0xFFFFFFFF;
         if (w != g) {
@@ -235,6 +254,23 @@ fn main(): i64 {
         ps("  as an op 0x0B quad under the current mapping. Rung 14 cannot proceed on this"); nl();
         ps("  path until the mapping is exact: a wall that merely LOOKS right is not the gate."); nl();
         return 86;
+    }
+    # ---- ⛔ NON-VACUITY FLOOR, ASSERTED BEFORE THE SUCCESS VERDICT ------------------------------
+    # `fail` above is satisfied by rows that were never compared. Every "EXACT" and every mutation
+    # count prints OUTSIDE the `while (y < rows)` loop, so a loop that stops one row short leaves
+    # the verdicts green AND the line count identical -- see dc_rows_cmp's block for the measured
+    # run. An external floor weighs output volume and cannot see that; this counts the rows.
+    # ⚠ Derived, not invented: `rows` is each case's own argument, so the two counters must agree.
+    if (dc_rows_want == 0) {
+        ps("doomcol: ** VACUOUS -- no case reached its compare loop; nothing was measured."); nl();
+        return 89;
+    }
+    if (dc_rows_cmp != dc_rows_want) {
+        ps("doomcol: ** VACUOUS -- cases asked for "); pn(dc_rows_want); ps(" row comparisons and only ");
+        pn(dc_rows_cmp); ps(" ran."); nl();
+        ps("  Every line above is printed outside that loop, so the output volume is the same"); nl();
+        ps("  whether it ran or not. The EXACT verdicts above mean nothing; ignore them."); nl();
+        return 89;
     }
     ps("doomcol: ⭐ every case EXACT — a DOOM wall column IS an op 0x0B quad, bit for bit."); nl();
     ps("  The colormap and palette compose into one IDX8 LUT; WRAP supplies the tiling;"); nl();

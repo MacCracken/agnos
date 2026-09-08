@@ -87,6 +87,21 @@ fn dd_shortfall(zn, area, R): i64 {
 var dd_over = 0;
 var dd_under = 0;
 var dd_cases = 0;
+# ⛔ IN-ORACLE NON-VACUITY FLOOR. Divisors from `dd_areas` that were swept and contributed ZERO
+# probes to `dd_cases`. main() asserts this is 0 -- and that `dd_cases` itself is not 0 -- before it
+# prints PASS.
+# ⭐ WHY THE EXTERNAL LINE-COUNT FLOOR (scripts/check/host-gpu-oracles.sh, floor 12 lines) CANNOT SEE
+# THIS, MEASURED RATHER THAN ARGUED. G1's verdict is `dd_over + dd_under == 0`, which is exactly what
+# a sweep that probed NOTHING yields, and G1 PRINTS `dd_cases` without ever asserting it. Delete only
+# the `dd_cases = dd_cases + 1` line -- the probes still run, so nothing else moves -- and the run
+# prints "G1 obligation holds over 0 boundary cases x 24 divisors: PASS", G2/G2b still PASS (they key
+# on dd_max_short and dd_corr_fires, not on the case count), all three MUT arms still go RED, exit is
+# 95, and the log is 19 non-blank lines against a floor of 12 (re-measured 1.57.1 against the PRE-floor file — an earlier draft of this comment quoted 15, which was the POST-floor mutant count and understated the gap). Every gate green, the count of what was
+# checked printed as ZERO on the face of the output, and the only thing the runner can weigh -- output
+# volume -- unmoved. That is the whole defect class, reproduced in one deleted increment.
+# ⚠ Derived from the file, not chosen: the minimum is that EVERY admissible entry of this file's own
+# `dd_areas` table moved the counter at all. No magic threshold is asserted.
+var dd_dead_areas = 0;
 
 fn dd_one(zn, area, R): i64 {
     if (zn < 0) { return 0; }
@@ -145,10 +160,18 @@ fn dd_areas_init(): i64 {
 fn dd_sweep_all(): i64 {
     dd_over = 0; dd_under = 0; dd_cases = 0;
     dd_max_short = 0; dd_corr_fires = 0;
+    dd_dead_areas = 0;
     var i = 0;
     while (i < DD_NAREA) {
         var a = load64(&dd_areas + i * 8);
-        if (a >= 4) { dd_sweep_area(a); }
+        if (a >= 4) {
+            # ⛔ the non-vacuity witness: how far dd_cases moved for THIS divisor. A divisor that is
+            # swept and probes nothing contributes nothing to G1's verdict while still being counted
+            # in the "x 24 divisors" that G1 prints.
+            var before = dd_cases;
+            dd_sweep_area(a);
+            if (dd_cases == before) { dd_dead_areas = dd_dead_areas + 1; }
+        }
         i = i + 1;
     }
     return dd_over + dd_under;
@@ -232,6 +255,26 @@ fn main(): i64 {
 
     dd_sweep_all();
     nl();
+    # ---- ⛔ NON-VACUITY FLOOR, ASSERTED BEFORE PASS -----------------------------------------------
+    # `bad` is a failure counter compared to zero, and zero is exactly what a sweep that probed
+    # NOTHING yields for G1 -- see dd_dead_areas' block for the measured reproduction: one deleted
+    # increment leaves every gate in this file green over "0 boundary cases", at a line count the
+    # external floor still clears. G1 is the obligation itself, so it gets the assertion directly.
+    # ⚠ SCOPE, STATED HONESTLY: a TOTALLY dead sweep is already caught -- G2 (max shortfall 0) and
+    # G2b (correction never fired) go red on it. What was uncaught, and is caught here, is a sweep
+    # that still computes while no longer COUNTING, and one that silently stops covering the table.
+    if (dd_cases == 0) {
+        ps("depthdiv: ** VACUOUS -- G1's obligation was checked on ZERO cases. The sweep ran no"); nl();
+        ps("  probes, so `q*area <= zn < (q+1)*area` was never evaluated once. PASS above is empty."); nl();
+        return 89;
+    }
+    if (dd_dead_areas != 0) {
+        ps("depthdiv: ** VACUOUS -- "); pn(dd_dead_areas); ps(" of this file's own dd_areas divisors");
+        ps(" contributed NO probes."); nl();
+        ps("  G1 reports the divisor count from DD_NAREA, the table LENGTH, not from what actually"); nl();
+        ps("  ran -- so its line reads the same either way. Fix the sweep before reading G1."); nl();
+        return 89;
+    }
     if (bad == 0) {
         ps("depthdiv: PASS -- the R2 quotient is EXACT over every boundary the ABI admits, the"); nl();
         ps("          one-sided correction is both LIVE and SUFFICIENT (max shortfall exactly 1),"); nl();

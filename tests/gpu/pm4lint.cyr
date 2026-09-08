@@ -96,6 +96,22 @@ var E_ALIGN       = 8;   # PGM_LO not 256-byte aligned
 var lint_err = 0;
 var lint_at = 0;
 
+# ⛔ IN-ORACLE NON-VACUITY COUNTER. `lint_pkts` counts every packet header pm4_check actually
+# DECODED, across the whole run, and it is deliberately NOT reset per call — the total is the point.
+# Spent by the floor at the bottom of main(), where the reason it exists is written down.
+var lint_pkts = 0;
+# ⛔ THE TWO MINIMA, BOTH DERIVED FROM THIS FILE, NEITHER CHOSEN.
+# PM4_GOOD_PKTS — the number of packets in the known-good stream, which is the count of header
+#   dwords the table above mutate() enumerates by offset: dw 0, 7, 11, 15, 20, 24, 28, 31, 36, 38,
+#   45. Eleven. ⚠ That list and this number travel together: the mutations index those dwords by
+#   hand, so a packet added to or dropped from build_good() must move both in the same edit.
+# PM4_NMUT — the mutation loop's own bound in main(), and the number of `if (k == N)` arms in
+#   mutate() and mut_name(). Recount with `grep -c '^    if (k == ' pm4lint.cyr` — anchored at
+#   column 4 so this very comment does not count itself — which sees each mutation twice (once per
+#   table) and must read 2 x PM4_NMUT = 24.
+var PM4_GOOD_PKTS = 11;
+var PM4_NMUT = 12;
+
 fn lint_fail(code, idx): i64 {
     lint_err = code;
     lint_at = idx;
@@ -117,6 +133,9 @@ fn pm4_check(buf, n): i64 {
     var last_op = 0;
     while (i < n) {
         var h = load32(buf + i * 4) & 0xFFFFFFFF;
+        # ⛔ Non-vacuity: count every header this walk actually reached, BEFORE any invariant can
+        # reject it, so a stream refused at its first packet still scores the one packet it decoded.
+        lint_pkts = lint_pkts + 1;
         if (pm4_type(h) != 3) { return lint_fail(E_TYPE, i); }
         var w = pm4_words(h);
         if (i + w > n) { return lint_fail(E_TRUNC, i); }
@@ -288,6 +307,7 @@ fn main(): i64 {
     puts("");
     puts("[1] the KNOWN-GOOD stream (transcribed from gpu_matmul_run) must PASS");
     var ok = pm4_check(&GOOD, GOOD_N);
+    var good_pkts = lint_pkts;      # first call of the run, so the cumulative total IS this walk's
     ps("    dwords: "); print_num(GOOD_N); puts("");
     if (ok != 1) {
         ps("    FAIL -- rejected the good stream with ");
@@ -325,6 +345,47 @@ fn main(): i64 {
     if (missed != 0) {
         ps("NOT CALIBRATED: "); print_num(missed);
         puts(" mutation(s) passed. This tool is DECORATION and no rung may cite it.");
+        return 90;
+    }
+    # ⛔ IN-ORACLE NON-VACUITY FLOOR. WHAT IT CATCHES: `missed == 0` — the entire success condition
+    # above — is satisfied by a run in which pm4_check WAS NEVER CALLED. Put a constant in place of
+    # the loop's `pm4_check(&MUT, n)`, #ifdef the checker's walk out, or return early from it, and
+    # every mutant reports "caught", `missed` stays 0, and this file prints "CALIBRATED -- all 12
+    # mutants rejected" over a validator that decoded nothing. Every counter this oracle already
+    # kept (`missed`, `lint_err`, `lint_at`) records an OUTCOME; none of them recorded WORK.
+    # ⛔ WHY THE EXTERNAL FLOOR CANNOT SEE IT: scripts/check/host-gpu-oracles.sh weighs this oracle
+    # by how many lines it printed (pm4lint:13). Every "m<k>  caught (...)" line is printed by the
+    # LOOP, not by the checker, so bypassing the checker leaves the output volume EXACTLY unchanged.
+    # MEASURED 2026-09-08: `var r = 0;` in place of the pm4_check call exits 95 over 20 lines — the
+    # EXACT line count this file printed before this floor was added, seven clear of the runner's
+    # floor of 13, not one line of difference for it to weigh — and the runner scores it PASS.
+    # ⚠ `<`, never `!=`: adding packets to the good stream, or mutations to the table, must never
+    # trip this. Only losing the work may.
+    ps("packets decoded: "); print_num(lint_pkts);
+    ps("  (good stream "); print_num(good_pkts); ps(" of "); print_num(PM4_GOOD_PKTS);
+    ps(", run floor "); print_num(PM4_GOOD_PKTS + PM4_NMUT); puts(")");
+    var vac = 0;
+    if (good_pkts < PM4_GOOD_PKTS) {
+        ps("** VACUOUS: the good stream decoded "); print_num(good_pkts);
+        ps(" packets, not the "); print_num(PM4_GOOD_PKTS);
+        puts(" its own mutation table indexes by hand.");
+        vac = vac + 1;
+    }
+    if (lint_pkts < PM4_GOOD_PKTS + PM4_NMUT) {
+        ps("** VACUOUS: "); print_num(lint_pkts);
+        ps(" packet headers decoded in the entire run, floor ");
+        print_num(PM4_GOOD_PKTS + PM4_NMUT);
+        ps(" -- the good stream's "); print_num(PM4_GOOD_PKTS);
+        ps(" plus one per mutant, since each of the "); print_num(PM4_NMUT);
+        puts(" must be walked at least one packet deep before it can be rejected.");
+        vac = vac + 1;
+    }
+    if (vac != 0) {
+        puts("");
+        puts("NOT CALIBRATED: a mutant 'caught' by a checker that never ran is not evidence that the");
+        puts("invariant is enforced -- it is evidence that nothing looked. This tool is DECORATION");
+        puts("and no rung may cite it. The line-count floor outside cannot tell the two apart, since");
+        puts("the loop prints its verdict whether or not the checker was called.");
         return 90;
     }
     puts("CALIBRATED -- good stream passes, all 12 mutants rejected.");

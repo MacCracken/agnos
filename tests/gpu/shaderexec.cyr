@@ -72,6 +72,8 @@ var sx_exec = 1;
 var sx_scc = 0;
 var sx_scci = 0;
 var sx_mem[16];              # 128 bytes: src pixel at +0, dst pixel at +8
+# 1.57.1 — instructions retired across the WHOLE run; the floor before the success return.
+var sx_retired_total = 0;
 var sx_fault = 0;
 var sx_fcode = 0;
 var sx_fpc = 0;
@@ -382,6 +384,10 @@ fn sx_run(buf, nbytes): i64 {
         if (sx_fault != 0) { return 0 - 1; }
         pc = pc + adv;
         retired = retired + 1;
+        # 1.57.1 — cumulative across every sx_run in the whole program, never reset. This is the
+        # quantity the file's own verdict line claims ("the bytes were EXECUTED, not merely
+        # encoded"), and until now nothing asserted it. See the floor before the success return.
+        sx_retired_total = sx_retired_total + 1;
         }
     }
     if (ended == 0) { sx_fail(SXF_NOEND, nbytes); return 0 - 1; }
@@ -685,6 +691,30 @@ fn main(): i64 {
 
     nl();
     if (ok == 0) { puts("shaderexec: FAIL"); return 90; }
+    # ⛔ 1.57.1 — IN-ORACLE NON-VACUITY FLOOR. This file's verdict claims the bytes were EXECUTED and
+    # nothing asserted that any were. Every gate here passes by finding no counter-example, so an
+    # interpreter that retires zero instructions satisfies all of them: `tiebad != 0` is false over
+    # zero ties, a fault that never happens reads as "did not fault", and the PASS line still prints.
+    # ⚠ THE EXTERNAL FLOOR IN scripts/check/host-gpu-oracles.sh CANNOT SEE THIS: every gate label and
+    # every witness line is printed by the GATE, not by the interpreter, so gutting sx_run leaves the
+    # output volume untouched (7 lines, floor 6).
+    # ⚠ Minimum derived from the file, not invented: `ties` is gate 4's own loop count and must be at
+    # least 1 for its tie witness to mean anything, and a single blend_alpha run retires far more than
+    # one instruction — so `< ties` is a floor no healthy run can approach and a gutted one cannot
+    # clear. `<`, never `!=`, so adding gates or witnesses can never trip it.
+    if (ties < 1) {
+        puts("shaderexec: ** VACUOUS -- gate 4 evaluated ZERO tie witnesses");
+        return 90;
+    }
+    if (sx_retired_total < ties) {
+        ps("shaderexec: ** VACUOUS -- the interpreter retired ");
+        pnum(sx_retired_total);
+        ps(" instructions across the whole run (at least ");
+        pnum(ties);
+        puts(" required). The gates passed by finding no counter-example in code that never ran.");
+        return 90;
+    }
+    ps("  instructions retired across the run: "); pnum(sx_retired_total); nl();
     puts("shaderexec: PASS -- the bytes were executed, not merely encoded.");
     return 95;
 }

@@ -6,29 +6,58 @@ type: issue
 
 # Vacuous gates — 77 fixed across 1.56.58 and 1.56.59
 
-**Status: 🟠 OPEN. All 33 FILED findings are resolved — re-verified item-by-item at 1.57.1, not
-taken from this banner. ⛔ BUT "Every named surface swept" IS FALSE and must not be read as coverage.**
+**Status: RESOLVED in agnos 1.57.1.** All 33 filed findings were already fixed (re-verified item by
+item, not taken from a banner), and the `tests/gpu/` surface this file was wrong to call swept is now
+**genuinely swept: 18 of 18 host oracles carry an in-oracle non-vacuity floor.**
 
-⛔ **`tests/*/` WAS NEVER SWEPT — 67 exercisers across 11 projects.** The 1.56.59 header silently
-substituted "host GPU oracles" for it and then declared every named surface done. That the class
-lives there is not speculation: `tests/telemetry/tlm.cyr` §3 was asserting the block band STATICALLY
-("some tag > 0", which the boot probe alone satisfies), and **two telemetry defects shipped to a
-downstream consumer under that green gate** — found by the chakshu work, not by any sweep. 18 of the
-67 have an external line-count floor; the remaining ~49 have no floor of any kind.
+## Why an in-oracle floor was needed at all
 
-✅ **1.57.1 — the false "filed as one" claim is corrected in `host-gpu-oracles.sh`, and the work is
-now genuinely tracked HERE.** A comment asserting something is tracked, when nothing tracks it, is
-worse than silence: it stops the next reader from filing it. 🟠 **STILL OPEN:** the in-oracle
-`n_pass == 0` floor for the other **17** GPU oracles. `tests/gpu/cpuref.cyr` is the only one that has
-it. The external line-count floors this script applies cannot see a helper that keeps PRINTING each
-gate label while no longer COUNTING anything — only an in-oracle floor sees that. 17 files, each
-structured differently; this is part of the `tests/*/` surface below, not separable from it.
+⛔ **THE EXTERNAL LINE-COUNT FLOOR IN `host-gpu-oracles.sh` CANNOT SEE A GUTTED ORACLE.** These
+oracles print each gate's label and its witness lines from OUTSIDE the loop that computes them, so
+emptying the loop leaves the printed volume untouched and the gate still reports PASS.
 
-✅ **1.57.1 closed the three llvm-mc skip paths** (`texl-body-identity.sh`, `texbi-body-identity.sh`,
-`texl-cm-derive.py`): all three exited 0 with the dword-comparison stage never run, so an LLVM-less
-host scored full coverage having proven only the source-text half. Now exit 2 (VOID), matching
-`shader-crossasm.sh`. ⚠ Verified BOTH ways — success still exits 0, and a PATH without llvm-mc now
-yields rc=2 on all three.
+⭐ **EVERY FLOOR WAS FALSIFIED BY MUTATION, AND EVERY HOLE WAS REAL** — in each case the *pre-floor*
+mutant cleared the external floor at full healthy volume:
+
+| oracle | mutant | pre-floor result |
+|---|---|---|
+| `rtaudit` | comparison stubbed to always pass | exit 95, **output byte-identical** to healthy (13 lines, floor 8) |
+| `pm4lint` | validator bypassed | exit 95, **exact healthy volume**, printing "all 12 mutants rejected" over zero decoding |
+| `perspdiv` | one boundary case dropped | exit 95 at full volume — **34% of coverage gone**, and its own mutation gates missed it too |
+| `depthgate` | `dg_absmax_at` stubbed | exit 95/30 (floor 20), D8 printing *"corner bound 0 == brute-force maximum 0: PASS"* |
+| `depthmodel` | one peak-tracking line | exit 95 over the full 38 (floor 25) |
+| `asmagree` | one `pass_n = pass_n + 1` deleted | 75 lines against floor 52 |
+| `texlist` | screen sweep gutted | exit 95 at healthy count; the file's own `mut != 5` gate missed it |
+| `shaderexec` | retire counter neutered | exit 90 now; mutant still prints 14 lines against floor 6 |
+
+## ⛔ The sweep caught three floors that DID NOT BITE — the same defect one level up
+
+- **`moderaster` counted at function ENTRY, not at the comparison.** A helper stubbed to always pass
+  still scored *"assertions executed: 53 of 53"* and exit 95. Its own comment claimed that case was
+  caught — an oversold floor, which is precisely what this file exists to find.
+- **`texgate` gate 9's floor caught only a totally dead gate**, missing a 58% coverage loss.
+- **`asmlib`'s new vacuity branch INVERTED `edgeasm`'s own gate-5 mutation arm** — the arm reads
+  `ea_vgpr_check(1, "MUTANT") == 0` as "the guard fired", and the new branch returned 0 for a dead
+  tracker too: a mutation arm satisfied by the exact vacuity it exists to rule out.
+
+⚠ **Four "recount with this grep" recipes matched their own comment lines** and would have set a
+constant HIGH — reddening a healthy oracle on the next addition. That is this sweep's defect in
+reverse, and it was latent in the fix itself. All anchored now.
+
+⚠ **Three comments recorded POST-floor mutant line counts while describing the PRE-floor state.** All
+understated the gap, but a written measurement is load-bearing here. Corrected.
+
+## Residuals, named rather than implied
+
+- **The ring-3 `tests/gpu/` programs cannot be floored from the host** — `gpublit`, `gpublend`,
+  `gpucov`, `gpucopy` do not build here (they call `sys_gpu_*`), and `gpudepth` builds but exits 90
+  on the host by design. Their oracle is a burn; inventing a floor that only ever executes during one
+  is how iron burns get lost. `gpucopy` is the best candidate if a host stub ever lands.
+- **`texgate` gate 2's IDX8 arm** needs a counter inside `texmodel.cyr`. Written into the file.
+- **`asmlib.ea_sgpr_check`'s floor is unreachable** — zero callers; every site uses `ea_sgpr_exact`.
+  Harmless, and live the moment anything calls it.
+- **The `tests/*/` surface beyond `tests/gpu/`** is not swept. `tests/gpu` was the 50-file bulk of it
+  and the one with a worked example of what the gap costs; the rest is a smaller, separate job.
 
 **Two residual limits below are genuinely "cannot be executed here", not "not done".**
 

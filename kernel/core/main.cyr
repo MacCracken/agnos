@@ -3655,6 +3655,28 @@ kprintln("exec: blkprobe returned", 23);
 kprintln("exec: running /bin/blkwr", 24);
 sh_exec("run /bin/blkwr", 14);
 kprintln("exec: blkwr returned", 20);
+# ⛔⛔ 1.57.1 — RUN IT A SECOND TIME, AND THAT IS THE WHOLE GATE FOR THE EXIT-DISARM.
+# `blk_rw_armed` is cleared by blk_close_sys but was NOT cleared when a process DIED, so a program
+# that armed raw disk write and then exited left the gate OPEN for whatever ran next. Fixed in
+# proc_reap at 1.57.1 — and this second run is what makes that falsifiable, for free:
+# blkwr's FIRST assertion is "blk_write while UNARMED must be REJECTED" (it returns 83 otherwise),
+# and its run above ARMS the gate and then exits. So if the arm survives exit, this second run finds
+# the gate already open and returns **83 GATE BROKEN** instead of 96.
+# ⇒ TWO `run: exit 96` lines is the pass condition; one 96 followed by an 83 is precisely the defect.
+# ⚠ Costs one extra ring-3 exec in a compile-gated selftest build and nothing in production.
+# ⛔⛔ THE EXIT-DISARM GATE, AND THE FIRST VERSION OF IT COULD NOT FAIL.
+# Running blkwr twice was tried first and MEASURED USELESS: blkwr closes its handle at step 5, and
+# blk_close_sys already disarms — so a kernel with the proc_reap exit-disarm REMOVED still produced
+# two clean `run: exit 96` lines. Observing the leak REQUIRES a process that arms and dies WITHOUT
+# closing, which is what /bin/blkleak exists to be.
+# ⇒ blkleak arms and exits 94; blkwr then runs, and its FIRST assertion is "blk_write while UNARMED
+# must be REJECTED". Gate intact -> 96. Arm leaked past exit -> **83 GATE BROKEN**.
+kprintln("exec: running /bin/blkleak (arms the gate, exits WITHOUT closing)", 65);
+sh_exec("run /bin/blkleak", 16);
+kprintln("exec: blkleak returned -- the gate must now be CLOSED again", 59);
+kprintln("exec: running /bin/blkwr (2nd -- the arm must NOT have survived exit)", 69);
+sh_exec("run /bin/blkwr", 14);
+kprintln("exec: blkwr returned (2nd)", 26);
 #endif
 
 #ifdef GPT_WRITE_SELFTEST

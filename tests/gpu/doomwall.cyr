@@ -33,6 +33,22 @@ var dw_ref[8192];
 var DW_COLS = 64;
 var DW_ROWS = 64;
 
+# ⛔ IN-ORACLE NON-VACUITY FLOOR. `dw_cases` counts the cases whose compare loop actually RAN;
+# `dw_cmp` counts the pixel comparisons that loop actually MADE. Both are asserted in main() before
+# any verdict is printed.
+# ⭐ WHY AN EXTERNAL LINE-COUNT FLOOR (the shape scripts/check/host-gpu-oracles.sh applies) CANNOT DO
+# THIS, MEASURED. Every line here is printed by `dw_case` OUTSIDE its per-pixel loop, and by main()
+# after the four cases return. ⛔ Narrow the column sweep to `while (x < 1)` -- one column of 64 --
+# and the verdict still holds: e1 is still 0 (a constant-depth wall is exact in column 0 too) and e2
+# is still non-zero, so main() prints the whole ⭐/⛔ VERDICT block and returns 95, over the same
+# four rows, at the same line count. 63 of the 64 columns were never looked at and nothing said so.
+# ⚠ SCOPE, HONESTLY: a TOTALLY empty compare loop is already caught -- e2 would come back 0 and the
+# `if (e2 == 0)` arm returns 86. What is uncaught is the PARTIAL sweep, and that is what this floors.
+# ⚠ The minimum is derived, not chosen: a case that reaches its compare loop must make exactly
+# DW_COLS * DW_ROWS comparisons, so the whole run must make dw_cases * DW_COLS * DW_ROWS.
+var dw_cases = 0;
+var dw_cmp = 0;
+
 fn ph8(v): i64 {
     var d = 28;
     while (d >= 0) {
@@ -124,6 +140,7 @@ fn dw_case(label, llen, near, far): i64 {
     if (dw_affine(near, far) != 1) {
         ps("  "); print(label, llen); ps("  REFUSED"); nl(); return 0 - 1;
     }
+    dw_cases = dw_cases + 1;
     var bad = 0;
     var worstcol = 0;
     var worstn = 0;
@@ -133,6 +150,7 @@ fn dw_case(label, llen, near, far): i64 {
         var y = 0;
         while (y < DW_ROWS) {
             var i = (y * DW_COLS + x) * 4;
+            dw_cmp = dw_cmp + 1;
             if ((load32(&dw_ref + i) & 0xFFFFFFFF) != (load32(&dw_out + i) & 0xFFFFFFFF)) {
                 cn = cn + 1; bad = bad + 1;
             }
@@ -159,6 +177,24 @@ fn main(): i64 {
     var e4 = dw_case("  4.0x (sharp oblique)         ", 32, 65536, 262144);
 
     nl();
+    # ---- ⛔ NON-VACUITY FLOOR, ASSERTED BEFORE ANY VERDICT IS PRINTED ---------------------------
+    # Every row above is printed by `dw_case` OUTSIDE its per-pixel loop, so a sweep that covers one
+    # column instead of DW_COLS prints the SAME ROWS at the SAME LINE COUNT and still reaches the
+    # verdict -- see dw_cases' block for the measured run. An external line-count floor cannot tell
+    # the two apart. This can: it asserts how many comparisons the loop actually made.
+    # ⚠ Both numbers come from this file, not from a chosen constant: four cases were submitted, and
+    # a case that reaches its loop compares exactly DW_COLS * DW_ROWS pixels.
+    if (dw_cases == 0) {
+        ps("doomwall: ** VACUOUS -- no case ever reached its compare loop. Nothing was measured."); nl();
+        return 89;
+    }
+    if (dw_cmp != dw_cases * DW_COLS * DW_ROWS) {
+        ps("doomwall: ** VACUOUS -- "); pn(dw_cases); ps(" case(s) ran but only "); pn(dw_cmp);
+        ps(" of "); pn(dw_cases * DW_COLS * DW_ROWS); ps(" pixel comparisons executed."); nl();
+        ps("  The rows above are printed outside the compare loop, so their line count is the same"); nl();
+        ps("  whether that loop ran or not. Do not read the verdict below."); nl();
+        return 89;
+    }
     # ⛔ THE ONLY CASE AN AFFINE QUAD GETS RIGHT IS THE ONE WHERE THERE IS NO PERSPECTIVE.
     if (e1 != 0) {
         ps("doomwall: UNEXPECTED — even a constant-depth wall differs. The affine frame or the"); nl();

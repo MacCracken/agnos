@@ -70,6 +70,28 @@ var tlm_shift0 = 0;                # force tile_shift = 0 regardless of width
 var tlm_nowinp = 0;                # window P not applied: bounds stay row-major under COLMAJOR
 var tlm_nowinb = 0;                # window B not applied: address stays row-major under COLMAJOR
 
+# ---- EVIDENCE COUNTERS, spent by the non-vacuity floor at the bottom of main() ------------------
+# ⛔ These count what a run actually EXAMINED, not what it found wrong. Read tl_case() with an empty
+# rect list in mind: tl_n = 0 makes tl_total 0, so tl_verify compares nothing and returns 0, the
+# screen map is all zeros against a `want` of 0 everywhere, and writes == want == 0 — so the case
+# prints "EXACT", returns 0, and `fails` never moves. Every counter below is the quantity that
+# distinguishes that from a case that did the work.
+var tl_cases_ran = 0;              # tl_case() invocations that ran to a verdict
+var tl_lchecked = 0;               # local-map pixels actually compared, summed over cases
+var tl_schecked = 0;               # screen-map pixels actually compared, summed over cases
+var tl_writes_seen = 0;            # stores the modelled grid actually issued, summed over cases
+# ⛔ THE CASE TABLE'S OWN LENGTH — the number of `tl_case("...")` call sites in main(), which is the
+# minimum this run must have graded. Re-count with:
+#     grep -cE '^[^#]*tl_case\("' texlist.cyr
+# ⚠ THE ^[^#]* IS LOAD-BEARING, NOT DECORATION. A bare `grep -c 'tl_case("'` also matches the two
+# COMMENT lines above and below it — including the recipe itself — and reads 19 for a 17-case file.
+# Follow that on the next addition and you raise TL_NCASES two too high and REDDEN a healthy oracle,
+# which is this floor's own defect class in reverse. The anchor refuses any line whose first
+# character is '#', so no comment and no future prose can count itself.
+# ⚠ COUNT AND CASES TRAVEL TOGETHER: add a case below and raise this in the SAME edit, exactly as
+# host-gpu-oracles.sh pairs its oracle name list with ORACLE_FLOOR_TOTAL.
+var TL_NCASES = 17;
+
 fn tl_reset(): i64 {
     var i = 0;
     while (i < 262144) { store8(&tl_hit + i, 0); i = i + 1; }
@@ -212,6 +234,9 @@ fn tl_verify(): i64 {
     var bad = 0;
     var i = 0;
     while (i < tl_total) {
+        # ⚠ Counted INSIDE the loop, beside the comparison — a bound edited to 0 leaves `bad` at 0,
+        # which is indistinguishable from perfect coverage anywhere but here.
+        tl_lchecked = tl_lchecked + 1;
         if ((load8(&tl_hit + i) & 0xFF) != 1) { bad = bad + 1; }
         i = i + 1;
     }
@@ -244,6 +269,7 @@ fn tl_screen_bad(): i64 {
             var si = y * TL_SCRW + x;
             var got = 0;
             if (si < 65536) { got = load8(&tl_scr + si) & 0xFF; }
+            tl_schecked = tl_schecked + 1;
             if (got != want) { bad = bad + 1; }
             x = x + 1;
         }
@@ -258,6 +284,8 @@ fn tl_case(label, llen): i64 {
     var writes = tl_run();
     var lbad = tl_verify();
     var sbad = tl_screen_bad();
+    tl_cases_ran = tl_cases_ran + 1;
+    tl_writes_seen = tl_writes_seen + writes;
     var want = 0;
     var i = 0;
     while (i < tl_n) {
@@ -474,7 +502,58 @@ fn main(): i64 {
     ps("⭐ All 5 mutations RED: the ph guard, the pw exec mask, the tile shift and BOTH col-major"); nl();
     ps("  edit windows are each load-bearing, and this file would have caught any going missing."); nl();
     nl();
+    # ⛔ IN-ORACLE NON-VACUITY FLOOR. WHAT IT CATCHES: a case that reports EXACT having MODELLED
+    # NOTHING. tl_case's verdict is `lbad == 0 && sbad == 0 && writes == want`, and an empty case
+    # satisfies all three IDENTICALLY: with tl_n = 0 the prefix sum makes tl_total 0, so tl_verify
+    # compares no local pixel and returns 0; the screen map is all zeros against a `want` of 0 at
+    # every pixel, so tl_screen_bad returns 0; and writes == want == 0. The case prints "EXACT",
+    # `fails` stays 0, and the mutation arms below go red just as loudly on a gutted model as on a
+    # working one — a mutation of nothing still differs from nothing... except that it does not, and
+    # `mut != 5` would then fire. Which is why THIS floor is about the twelve HEALTHY cases, the
+    # ones whose whole claim is "no counter-example was found".
+    # ⛔ WHY THE EXTERNAL FLOOR CANNOT SEE IT: scripts/check/host-gpu-oracles.sh weighs this oracle
+    # by how many lines it printed (texlist:16). Every per-case line is printed by tl_case AFTER the
+    # loops, from values it was handed — so emptying tl_run, tl_verify or a case builder leaves the
+    # printed line count at its healthy 25, exit stays 95, and the runner scores it green. Measured,
+    # not assumed: the pre-floor mutant of this file printed 25 lines and exited 95. Only a count
+    # taken INSIDE the loops sees it, which is why this floor lives here and not there.
+    # ⚠ THE MINIMA ARE THIS FILE'S OWN QUANTITIES, not chosen numbers. TL_NCASES is the tl_case()
+    # call-site count (the grep is at its declaration). The other three are floored PER CASE ACTUALLY
+    # RUN, so they cannot go stale when a case is added or a shape changes: every case must compare
+    # at least one local pixel, must issue at least one store, and must sweep the WHOLE screen map,
+    # whose size is tl_screen_bad's own TL_SCRH x TL_SCRW loop bound. `<`, never `!=`, so a wider
+    # sweep or an extra case can never false-fire this.
+    var vac = 0;
+    if (tl_cases_ran < TL_NCASES) {
+        ps("  ** VACUOUS: "); pn(tl_cases_ran); ps(" of "); pn(TL_NCASES);
+        ps(" cases actually ran to a verdict"); nl(); vac = vac + 1;
+    }
+    if (tl_lchecked < tl_cases_ran) {
+        ps("  ** VACUOUS: "); pn(tl_lchecked); ps(" local-map pixels compared across ");
+        pn(tl_cases_ran); ps(" case(s) -- a case whose rect list is empty checks nothing"); nl();
+        vac = vac + 1;
+    }
+    if (tl_writes_seen < tl_cases_ran) {
+        ps("  ** VACUOUS: the modelled grid issued "); pn(tl_writes_seen); ps(" store(s) across ");
+        pn(tl_cases_ran); ps(" case(s) -- coverage was graded over a grid that never dispatched");
+        nl(); vac = vac + 1;
+    }
+    if (tl_schecked < tl_cases_ran * TL_SCRH * TL_SCRW) {
+        ps("  ** VACUOUS: "); pn(tl_schecked); ps(" screen pixels compared, not ");
+        pn(tl_cases_ran * TL_SCRH * TL_SCRW);
+        ps(" -- the dst_off half of the oracle did not sweep the frame"); nl(); vac = vac + 1;
+    }
+    if (vac != 0) {
+        ps("texlist: FAIL -- "); pn(vac); ps(" quantit(ies) report EXACT having examined NOTHING.");
+        nl();
+        ps("  An empty case is EXACT by construction: no local pixel is wrong because none exists,"); nl();
+        ps("  no screen pixel is wrong because every rect demands zero. The line-count floor in"); nl();
+        ps("  host-gpu-oracles.sh cannot tell that run from this one; these counters can."); nl();
+        return 86;
+    }
     ps("texlist: PASS -- op 0x0C's grid mapping is exact and its guards are proven necessary."); nl();
+    ps("  evidence: "); pn(tl_cases_ran); ps(" cases, "); pn(tl_writes_seen); ps(" modelled stores, ");
+    pn(tl_lchecked); ps(" local + "); pn(tl_schecked); ps(" screen pixels compared"); nl();
     return 95;
 }
 

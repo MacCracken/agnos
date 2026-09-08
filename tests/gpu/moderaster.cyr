@@ -59,9 +59,32 @@ var IRON_VTG0        = 2244214784;  # rd 1320  (0x0528)  VTG0_CONTROL        = 0
 
 var mr_fails = 0;
 
+# ⛔ IN-ORACLE NON-VACUITY COUNTER. `mr_checks` counts assertions actually EXECUTED — every
+# mrk / mrk_ne / mrk_refuse increments it on BOTH the pass and the fail path, so it measures how
+# much of this file ran, not how much of it agreed. Spent by the floor at the bottom of main(),
+# where the reason it exists is written down.
+# ⚠ MR_NCHECKS IS THIS FILE'S OWN CALL-SITE COUNT, not a chosen number. Recount it with:
+#     grep -c '^    mrk' moderaster.cyr
+# (anchored at column 4 so this very comment line, and the increments below, do not inflate it —
+# asmagree.cyr carried an unanchored `grep -c '    agree('` that counted itself and read 66 for a
+# 65-class file; anchored 2026-09-08 in the same sweep that verified these floors).
+# ⚠ COUNT AND CHECK LIST TRAVEL TOGETHER: add or drop an assertion in main() and move this number in
+# the SAME edit, exactly as host-gpu-oracles.sh pairs its oracle name list with ORACLE_FLOOR_TOTAL.
+var mr_checks = 0;
+var MR_NCHECKS = 53;
+
+# ⚠ EVERY INCREMENT BELOW SITS INSIDE A COMPARISON ARM, NOT AT FUNCTION ENTRY, AND THE DIFFERENCE
+# IS MEASURED. With `mr_checks = mr_checks + 1;` on the first line of each helper, stubbing the
+# comparison to `if (1 == 1)` while the helper keeps printing "PASS" scored 53 of 53 and exit 95
+# over the full 67 lines — the floor read as healthy, the runner read as healthy, and not one
+# register had been compared (2026-09-08). Bound to the arms, an edit that deletes the comparison
+# has to carry the counter across deliberately to keep the count whole. That is not a proof — a
+# determined edit can — but it is the difference between a floor a careless edit walks past and one
+# it has to step over. Same idiom as rtaudit.cyr's ra_check().
 fn mrk(name, nlen, got, want): i64 {
     ps("  "); print(name, nlen); ps(": ");
-    if (got == want) { ps("PASS ("); pn(got); ps(")"); nl(); return 0; }
+    if (got == want) { mr_checks = mr_checks + 1; ps("PASS ("); pn(got); ps(")"); nl(); return 0; }
+    mr_checks = mr_checks + 1;
     ps("FAIL (got "); pn(got); ps(", want "); pn(want); ps(")"); nl();
     mr_fails = mr_fails + 1;
     return 1;
@@ -70,7 +93,8 @@ fn mrk(name, nlen, got, want): i64 {
 # mrk_ne — a mutation must MOVE the value. A gate that cannot fail has not passed.
 fn mrk_ne(name, nlen, got, was): i64 {
     ps("  "); print(name, nlen); ps(": ");
-    if (got != was) { ps("PASS (moved to "); pn(got); ps(")"); nl(); return 0; }
+    if (got != was) { mr_checks = mr_checks + 1; ps("PASS (moved to "); pn(got); ps(")"); nl(); return 0; }
+    mr_checks = mr_checks + 1;
     ps("FAIL (unchanged at "); pn(got); ps(") -- the mutation is not connected"); nl();
     mr_fails = mr_fails + 1;
     return 1;
@@ -78,7 +102,8 @@ fn mrk_ne(name, nlen, got, was): i64 {
 
 fn mrk_refuse(name, nlen, rc): i64 {
     ps("  "); print(name, nlen); ps(": ");
-    if (rc == 0 - 1) { ps("PASS (refused)"); nl(); return 0; }
+    if (rc == 0 - 1) { mr_checks = mr_checks + 1; ps("PASS (refused)"); nl(); return 0; }
+    mr_checks = mr_checks + 1;
     ps("FAIL (accepted, rc "); pn(rc); ps(") -- an illegal description built a raster"); nl();
     mr_fails = mr_fails + 1;
     return 1;
@@ -272,6 +297,31 @@ fn main(): i64 {
     mrk("R8 bad mode is -1  ", 19, mr_program_build(&mode, &dml, &prog), 0 - 1);
     nl();
 
+    # ⛔ IN-ORACLE NON-VACUITY FLOOR. WHAT IT CATCHES: `mr_fails == 0` — the entire success condition
+    # below — is satisfied by a run that ASSERTED NOTHING. #ifdef a section out, return early, lose a
+    # block to a bad merge resolution, or drop the arm mrk() compares on, and mr_fails stays 0,
+    # this file prints "ALL PASS ... bit for bit vs iron" and exits 95 having compared not one
+    # register against the iron capture at the top of the file.
+    # ⛔ WHY THE EXTERNAL FLOOR CANNOT SEE IT: scripts/check/host-gpu-oracles.sh weighs this oracle
+    # by how many lines it printed (moderaster:44) against a healthy 67, so TWENTY-THREE of these 53
+    # assertions can vanish before the runner notices — and each one prints from INSIDE the helper
+    # that checks it, so a helper edited to keep printing while no longer checking costs no lines at
+    # all. MEASURED 2026-09-08: deleting C1's ten iron comparisons — the whole "reproduces the
+    # firmware's raster, register for register" claim — exits 95 over 56 lines, twelve clear of the
+    # floor, and the runner scores it PASS. Only a count taken where the comparison happens sees it.
+    # cpuref.cyr's cases_ok / lit_fail pair is the model: count what was DONE, not only what was
+    # WRONG, and refuse to report success over a short count.
+    # ⚠ `<`, never `!=`: adding assertions to this file must never trip the floor. Only
+    # losing them may.
+    ps("assertions executed: "); pn(mr_checks); ps(" of "); pn(MR_NCHECKS); nl();
+    if (mr_checks < MR_NCHECKS) {
+        ps("moderaster: ** VACUOUS -- only "); pn(mr_checks); ps(" of "); pn(MR_NCHECKS);
+        ps(" assertions ran."); nl();
+        ps("  A register that was never compared is a register with NO evidence, not a register that"); nl();
+        ps("  agrees with iron — and per-register agreement is this file's only claim. Nothing may"); nl();
+        ps("  cite this run, and the line-count floor outside cannot tell the two apart."); nl();
+        return 90;
+    }
     if (mr_fails == 0) {
         ps("moderaster: ALL PASS -- the full 14-register program reproduces the inherited pipe."); nl();
         ps("  10 COMPUTED from the published CVT-RB 2560x1440 timing, bit for bit vs iron."); nl();

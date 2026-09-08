@@ -333,6 +333,17 @@ fn main(): i64 {
     }
     ps("  -> "); pnum(g1); ps(" of "); pnum(RR_NCASES); puts(" cases byte-identical");
     if (g1 != RR_NCASES) { ok = 0; }
+    # ⛔ ...and that comparison is satisfied by 0 == 0. RR_NCASES lives in refraster.cyr, not here,
+    # so an emptied corpus table -- or a rr_case_load that refuses every index -- leaves g1 and
+    # RR_NCASES agreeing at zero and this gate green over nothing diffed at all.
+    # ⚠ Invisible to the external line-count floor for the same reason as gate 2's: the "-> N of N"
+    # line is printed OUTSIDE the loop and prints whether or not N is zero, so the line count the
+    # runner weighs does not move.
+    if (g1 == 0) {
+        puts("  ** VACUOUS: zero corpus cases were diffed against refraster.cyr.");
+        puts("     '0 of 0 byte-identical' is agreement about nothing, not agreement.");
+        ok = 0;
+    }
 
     # ---- GATE 1b: random triangles and 3-triangle meshes -----------------------------------
     puts("[gate 1b] random triangles + 3-triangle meshes");
@@ -417,6 +428,24 @@ fn main(): i64 {
     }
     ps("  -> "); pnum(n2); ps(" divider cases, "); pnum(bad2); puts(" wrong");
     if (bad2 != 0) { ok = 0; }
+    # ⛔ IN-ORACLE NON-VACUITY FLOOR. `bad2 != 0` is this gate's ENTIRE verdict, and bad2 only moves
+    # when a case is EVALUATED AND WRONG -- so a sweep that evaluates nothing scores bad2 == 0 and
+    # reports exactness over zero divisions.
+    # ⚠ THE EXTERNAL FLOOR CANNOT SEE THIS. scripts/check/host-gpu-oracles.sh weighs how many lines
+    # the oracle printed, and the "-> N divider cases, 0 wrong" line is printed OUTSIDE the sweep:
+    # gut the loop and the printed line count is untouched, main() still returns 95, and the runner
+    # still scores it PASS. Only a count checked HERE, against the work the sweep is supposed to
+    # have done, catches a loop that stopped counting while it kept printing.
+    # ⚠ THE MINIMUM IS THE SWEEP'S OWN SHAPE, NOT A NUMBER CHOSEN HERE: d runs 1..399, and for every
+    # d >= 1 all 6 M-values x 5 u-values clear the `uv >= 0 && uv <= di` guard (u = d-1 is >= 0 and
+    # u = d/2 is <= d for every d >= 1), so a whole sweep is exactly (400-1)*6*5 evaluations.
+    # `<` rather than `!=` so widening the sweep stays free while narrowing or emptying it does not.
+    if (n2 < (400 - 1) * 6 * 5) {
+        ps("  ** VACUOUS: gate 2 evaluated "); pnum(n2); ps(" of the ");
+        pnum((400 - 1) * 6 * 5); puts(" cases its own loop bounds describe.");
+        puts("     0 wrong out of nothing is not exactness -- the divider sweep did not run.");
+        ok = 0;
+    }
 
     # ---- GATE 3: ⭐ THE FALSIFICATION ARM ---------------------------------------------------
     # The domain claim is |bx-ax| < 2^31. If nothing breaks ABOVE it, the bound is not a

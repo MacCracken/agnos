@@ -164,22 +164,31 @@ fn main(): i64 {
     # ⚠ BOTH MODES ARE SWEPT, and CLAMP is the one that matters: under mask-WRAP the pre-clamp-floor
     # trap is invisible, so a wrap-only sweep would pass over a reference that is wrong exactly where
     # the shader it validates is most likely to be wrong.
+    # ⚠ THE SWEEP'S THREE PARAMETERS ARE NAMED SO THE VACUITY FLOOR CAN BE DERIVED FROM THEM RATHER
+    # THAN GUESSED. Floored at a bare `g9n < 2` this gate was as good as unfloored: narrowing the
+    # sweep to `uu < 0` cut it from 2178 samples to 924 — 58% of the coverage gone — and the run
+    # still exited 95 (measured 2026-09-08). With the bounds and the stride named, the floor below
+    # computes the EXACT trip count the loop must make, so a WIDENED stride lowers the floor with it
+    # and cannot false-fire, while a NARROWED span is caught.
+    var TG_G9_LO   = 65536 * 2;      # sweep starts two texels BELOW the texture
+    var TG_G9_HI   = 65536 * 3;      # ... and ends three above it
+    var TG_G9_STEP = 9973;           # a prime-ish stride, deliberately not a texel multiple
     var g9 = 0;
     var g9n = 0;
     var wm = 0;
     while (wm < 2) {
         tx_wrap = wm;
-        var uu = 0 - (65536 * 2);
-        while (uu < 65536 * 3) {
-            var vv = 0 - (65536 * 2);
-            while (vv < 65536 * 3) {
+        var uu = 0 - TG_G9_LO;
+        while (uu < TG_G9_HI) {
+            var vv = 0 - TG_G9_LO;
+            while (vv < TG_G9_HI) {
                 var a = tex_fetch_bilin(&tg_tex, &tg_lut, 8, 8, uu, vv, 0);
                 var bq = bi_sample(&tg_tex, 8, 8, uu, vv, wm);
                 g9n = g9n + 1;
                 if (a != bq) { g9 = g9 + 1; }
-                vv = vv + 9973;
+                vv = vv + TG_G9_STEP;
             }
-            uu = uu + 9973;
+            uu = uu + TG_G9_STEP;
         }
         wm = wm + 1;
     }
@@ -210,6 +219,7 @@ fn main(): i64 {
     #        separates ⇒ bilinear must DIFFER from nearest. Interior boundaries only, so clamping
     #        cannot collapse the pair and hide the property.
     var g10a = 0;
+    var g10an = 0;                      # centres actually probed -- see the floor at the bottom
     var g10b = 0;
     var g10bn = 0;
     var ty = 0;
@@ -219,6 +229,7 @@ fn main(): i64 {
             # 10a — texel CENTRE: interpolating, must agree with nearest
             var c1 = tex_fetch(&tg_tex, &tg_lut, 8, 8, tx2 * 65536 + 32768, ty * 65536 + 32768, 0);
             var c2 = tex_fetch_bilin(&tg_tex, &tg_lut, 8, 8, tx2 * 65536 + 32768, ty * 65536 + 32768, 0);
+            g10an = g10an + 1;
             if (c1 != c2) { g10a = g10a + 1; }
             # 10b — texel BOUNDARY, interior only: must blend, i.e. must NOT match nearest
             if (tx2 > 0) {
@@ -336,6 +347,70 @@ fn main(): i64 {
         ps("texgate: "); pn(fail); ps(" GATE(S) FAILED"); nl();
         return 86;
     }
+
+    # ⛔ IN-ORACLE NON-VACUITY FLOOR. WHAT IT CATCHES: the gates above split cleanly in two, and only
+    # one half can be vacuous. The FALSIFICATION gates (3, 4, 6, 8, 12) demand a NONZERO count -- a
+    # mutation that breaks nothing is already a failure here -- so a gutted sweep reddens them by
+    # construction and they need no floor. The AGREEMENT gates are the exposed half: gate 9 passes on
+    # `g9 == 0`, gate 10a on `g10a == 0`, gate 10b on `g10b == g10bn` (which 0 == 0 satisfies
+    # perfectly), gate 11 on `g11 == 0`. Empty any of those loops -- an edited bound, an #ifdef, a
+    # helper that stops being called -- and every counter stays 0, `fail` stays 0, and this file
+    # reports "all gates green" over four gates that compared NOTHING.
+    # ⛔ WHY THE EXTERNAL FLOOR CANNOT SEE IT: scripts/check/host-gpu-oracles.sh weighs this oracle
+    # by how many lines it printed (texgate:22), and every "gate N GREEN" line above is printed
+    # OUTSIDE the loop that computes it, from a counter it is handed -- so emptying a loop leaves the
+    # printed line count at its healthy 33 and the runner scores the vacuous run green. Measured, not
+    # assumed: the pre-floor mutant of this file printed 33 lines and exited 95. Only a count taken
+    # where the comparison happens sees it, which is why this floor lives here and not there.
+    # ⚠ THE MINIMA ARE THIS FILE'S OWN LOOP BOUNDS, not chosen numbers: gates 10a and 11 walk the
+    # 8x8 texture (`ty < 8`/`tx2 < 8`, `qy < 8`/`qx < 8`), and 10b its 7x7 INTERIOR, the corners
+    # excluded so clamping cannot collapse the pair. ⭐ Gate 9's floor was `g9n < 2` -- "each wrap
+    # mode compared something" -- on the reasoning that its 9973 stride is one a later edit may
+    # legitimately widen, and a floor that fires on a healthy oracle is worse than no floor. That
+    # reasoning was sound and the floor it produced was not: narrowing the sweep to `uu < 0` dropped
+    # gate 9 from 2178 samples to 924 and the run still exited 95 (measured 2026-09-08). The stride
+    # and both bounds are now NAMED at the loop, so the floor computes the exact trip count from
+    # them -- a widened stride lowers the floor with it and still cannot false-fire, which is what
+    # the original reasoning actually wanted. `<`, never `!=`.
+    # ⚠ WHAT THIS FLOOR DOES NOT COVER, STATED RATHER THAN IMPLIED: gates 1 and 2 grade txm_sweep,
+    # whose per-sample counter would have to live in texmodel.cyr, not here. Gate 1's RGBA8 sweep is
+    # covered transitively -- gates 3 and 4 mutate the SAME sweep and demand it break a nonzero
+    # number of samples, so a gutted txm_diff_case reddens them. The IDX8 arm of gate 2 has no such
+    # mutation, so it remains floored by nothing; closing that means a counter in texmodel.cyr.
+    var vac = 0;
+    # Gate 9's trip count, derived from the loop's OWN named bounds rather than pinned: the uu and
+    # vv sweeps each run ceil((LO + HI) / STEP) times, over 2 wrap modes. Widen TG_G9_STEP and this
+    # falls with it, so a legitimately coarser sweep cannot false-fire; narrow the SPAN and it
+    # bites, which is correct — that is coverage lost, not a stride choice.
+    var g9per = (TG_G9_LO + TG_G9_HI + TG_G9_STEP - 1) / TG_G9_STEP;
+    if (g9n < 2 * g9per * g9per) {
+        ps("  ** VACUOUS: gate 9 compared "); pn(g9n); ps(" samples, not the ");
+        pn(2 * g9per * g9per); ps(" its own bounds and stride name ("); pn(g9per);
+        ps(" steps per axis, 2 wrap modes) --"); nl();
+        ps("     and CLAMP is the mode where the pre-clamp-floor trap is visible at all"); nl();
+        vac = vac + 1;
+    }
+    if (g10an < 8 * 8) {
+        ps("  ** VACUOUS: gate 10a probed "); pn(g10an); ps(" of the 64 texel centres"); nl();
+        vac = vac + 1;
+    }
+    if (g10bn < 7 * 7) {
+        ps("  ** VACUOUS: gate 10b probed "); pn(g10bn); ps(" of the 49 interior boundaries --");
+        ps(" and `g10b == g10bn` is satisfied by 0 == 0"); nl(); vac = vac + 1;
+    }
+    if (g11n < 8 * 8) {
+        ps("  ** VACUOUS: gate 11 sampled "); pn(g11n); ps(" of the 64 texels at 1:1 -- the ONE");
+        ps(" absolute oracle here, and it graded nothing"); nl(); vac = vac + 1;
+    }
+    if (vac != 0) {
+        ps("texgate: FAIL -- "); pn(vac); ps(" agreement gate(s) reported GREEN having compared");
+        ps(" NOTHING."); nl();
+        ps("  A gate that finds no disagreement because it looked for none is not a gate, and the"); nl();
+        ps("  line-count floor in host-gpu-oracles.sh cannot tell that run from a healthy one."); nl();
+        return 86;
+    }
+    ps("  evidence: gate 9 "); pn(g9n); ps(" samples, gate 10a "); pn(g10an); ps(" centres, 10b ");
+    pn(g10bn); ps(" boundaries, gate 11 "); pn(g11n); ps(" texels at 1:1"); nl();
     ps("texgate: all gates green."); nl();
     ps("⇒ The UV path is proven at register widths BEFORE one instruction is assembled."); nl();
     ps("⇒ If the iron burn is red, the fault is in the EMISSION, not the algorithm."); nl();

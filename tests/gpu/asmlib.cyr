@@ -90,6 +90,24 @@ fn ea_vgpr_reset(): i64 { ea_vgpr_max = 0 - 1; return 0; }
 
 # declared = the .amdhsa_next_free_vgpr the blob ships with. Highest legal index is declared-1.
 fn ea_vgpr_check(declared, name): i64 {
+    # ⛔ NON-VACUITY: `<` PASSES MOST EASILY WHEN THE TRACKER IS DEAD. ea_vgpr_max is reset to -1
+    # and only ea_vtrack raises it, so instrumentation that stops being called reports -1 -- below
+    # EVERY declaration -- and sails through the guard below. A shader whose descriptor declares
+    # VGPRs uses VGPRs, so a high-water still sitting at the reset sentinel means the TRACKER did
+    # not run, not that the emit list touched no register.
+    # ⚠ Only when declared > 0: an emit list that genuinely uses no VGPR would declare 0, and a
+    # floor that fires on a healthy caller is worse than no floor at all.
+    # ⛔ The line-count floor in scripts/check/host-gpu-oracles.sh cannot see this either -- the
+    # caller prints its PASS line whether the tracker counted or not.
+    if (declared > 0) {
+        if (ea_vgpr_max < 0) {
+            ps("  ** asmlib: "); ps(name);
+            ps(" declares "); pnum(declared);
+            puts(" VGPRs but the tracker recorded NONE -- VACUOUS, the instrumentation did not run");
+            ea_fault = 1;
+            return 0;
+        }
+    }
     if (ea_vgpr_max < declared) { return 1; }
     ps("  ** asmlib: "); ps(name);
     ps(" declares "); pnum(declared); ps(" VGPRs but uses v");
@@ -193,6 +211,21 @@ fn ea_sgpr_reset(): i64 { ea_sgpr_max = 0 - 1; return 0; }
 
 # UNDER-declaration guard, the exact peer of ea_vgpr_check.
 fn ea_sgpr_check(declared, name): i64 {
+    # ⛔ NON-VACUITY, the exact peer of the one in ea_vgpr_check: ea_sgpr_max resets to -1, so a
+    # tracker that stopped being called reports -1, which is below every declaration and passes
+    # this `<` guard trivially. `next_free_sgpr > 0` is the shader's own statement that it
+    # allocates SGPRs; a high-water still at the sentinel contradicts it. (ea_sgpr_exact is immune
+    # by construction -- equality cannot be satisfied by a dead tracker -- which is why the file
+    # header above recommends it wherever the shipped declaration is exact.)
+    if (declared > 0) {
+        if (ea_sgpr_max < 0) {
+            ps("  ** asmlib: "); ps(name);
+            ps(" declares "); pnum(declared);
+            puts(" SGPRs but the tracker recorded NONE -- VACUOUS, the instrumentation did not run");
+            ea_fault = 1;
+            return 0;
+        }
+    }
     if (ea_sgpr_max < declared) { return 1; }
     ps("  ** asmlib: "); ps(name);
     ps(" declares "); pnum(declared); ps(" SGPRs but uses s");
@@ -474,6 +507,23 @@ fn ea_fixup(): i64 {
 # worse, a future rewrite "fixes" the expectation to match the sign-extended value and pins the bug.
 fn ea_compare(emitted_bytes, want, want_n, name): i64 {
     var got_n = emitted_bytes / 4;
+    # ⛔ IN-ORACLE NON-VACUITY FLOOR. WHAT IT CATCHES: `want_n == 0` walks the content loop below
+    # ZERO times and returns 1 -- a clean PASS over nothing compared. It is reachable without
+    # anyone noticing, because the count check just below agrees when BOTH sides are empty: an
+    # expectation table that came back empty and an emit list that emitted nothing satisfy
+    # `0 == 0`, and the caller then prints "0 of 0 dwords byte-identical". Both halves failing
+    # together is exactly how a two-artifact oracle fails.
+    # ⛔ WHY AN EXTERNAL LINE-COUNT FLOOR CANNOT SEE IT: the caller's PASS line is printed by the
+    # caller, OUTSIDE this loop, so a comparison that examines nothing prints exactly as many
+    # lines as one that examines sixty dwords. host-gpu-oracles.sh weighs shaderasm by that line
+    # count and would score it green. Only a count taken where the dwords are compared tells them
+    # apart -- the in-oracle floor cpuref.cyr models with its cases_ok / lit_fail pair.
+    if (want_n <= 0) {
+        ps("  ** "); ps(name); ps(": VACUOUS -- "); pnum(want_n);
+        puts(" dwords to compare. A comparison of nothing is not agreement.");
+        ea_fault = 1;
+        return 0;
+    }
     if (got_n != want_n) {
         ps("  ** "); ps(name); ps(": emitted "); pnum(got_n);
         ps(" dwords, committed hex has "); pnum(want_n); nl();

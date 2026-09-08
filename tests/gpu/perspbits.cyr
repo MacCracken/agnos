@@ -58,6 +58,16 @@ var pb_probeQ = 0;      # the quotient at one fixed inside pixel, for the conver
 var pb_over = 0;        # pixels where N exceeded 62 bits -- the reference is undefined there
 var pb_q[480000];       # the WHOLE frame's quotients, so convergence is not judged from one pixel
 
+# ⛔ IN-ORACLE NON-VACUITY COUNTERS. Each records what this run actually DID, not what it found
+# wrong. They are spent by the floor at the bottom of main(), which is where the reason they exist
+# is written down.
+var pb_probes = 0;      # pb_probe calls that actually ran
+var pb_pxtot = 0;       # pixels at which N and D were actually evaluated
+var pb_qtot = 0;        # of those, pixels where a quotient N/D was actually computed and stored
+var pb_ksteps = 0;      # K values pb_sweep actually walked
+var pb_snapn = 0;       # trips of the snapshot loop
+var pb_convn = 0;       # trips of the whole-frame comparison loop
+
 # pb_probe — a floor quad in STRONG perspective, the exact figure the rung's oracle calls for, and
 # evaluate N and D at every pixel of the draw rect (not just inside: the shader is PREDICATED and runs
 # every lane, which is the lesson rung 17's corner bound was written from).
@@ -84,6 +94,7 @@ fn pb_probe(w, h, wnear, wfar, tex): i64 {
     var Uc = 0;
 
     pb_maxN = 0; pb_maxD = 0; pb_maxQ = 0; pb_minD = 0;
+    pb_probes = pb_probes + 1;
     var first = 1;
     var py = 0;
     while (py < h) {
@@ -97,6 +108,7 @@ fn pb_probe(w, h, wnear, wfar, tex): i64 {
             var e2 = (bx - ax) * (qy - ay) - (by - ay) * (qx - ax);
             var area = e0 + e1 + e2;
             if (area < 0) { e0 = 0 - e0; e1 = 0 - e1; e2 = 0 - e2; area = 0 - area; }
+            pb_pxtot = pb_pxtot + 1;   # ⛔ non-vacuity: this is where N and D actually get evaluated
             var D = e0 * Wa + e1 * Wb + e2 * Wc;
             # ⚠ W_i * a_i is a PER-VERTEX product, computed once on the CPU -- it is what makes N affine
             # ⚠ FULL 16.16, NOT divided back down. The shader must EMIT a 16.16 texture coordinate, so the
@@ -111,6 +123,7 @@ fn pb_probe(w, h, wnear, wfar, tex): i64 {
             if (e0 >= 0) { if (e1 >= 0) { if (e2 >= 0) { inside = 1; } } }
             if (inside == 1) {
                 if (D > 0) {
+                    pb_qtot = pb_qtot + 1;   # ⛔ non-vacuity: a quotient was actually computed
                     var Q = N / D;
                     if (pb_bits(Q) > pb_maxQ) { pb_maxQ = pb_bits(Q); }
                     if (first == 1) { pb_minD = D; first = 0; }
@@ -144,6 +157,7 @@ fn pb_sweep(): i64 {
     var k = 12;
     while (k <= 34) {
         pb_K = k;
+        pb_ksteps = pb_ksteps + 1;
         pb_probe(800, 600, 4096, 256, 4096);
         ps("  "); pn(k);
         ps("    "); pn(pb_maxN);
@@ -171,7 +185,11 @@ fn pb_sweep(): i64 {
     pb_K = 12;
     pb_probe(800, 600, 4096, 256, 4096);
     var i = 0;
-    while (i < 480000) { store64(&pb_snap + i * 8, load64(&pb_q + i * 8)); i = i + 1; }
+    while (i < 480000) {
+        store64(&pb_snap + i * 8, load64(&pb_q + i * 8));
+        pb_snapn = pb_snapn + 1;
+        i = i + 1;
+    }
     pb_K = 24;
     pb_probe(800, 600, 4096, 256, 4096);
     var moved = 0;
@@ -182,6 +200,7 @@ fn pb_sweep(): i64 {
         if (d < 0) { d = 0 - d; }
         if (d != 0) { moved = moved + 1; }
         if (d > worst) { worst = d; }
+        pb_convn = pb_convn + 1;
         i = i + 1;
     }
     ps("WHOLE-FRAME convergence K=12 vs K=24: "); pn(moved);
@@ -219,6 +238,74 @@ fn main(): i64 {
         ps("  ⇒ rung 18 is a 64-bit numerator over a 32-bit divisor, with the divisor VARYING per"); nl();
         ps("     pixel (rung 17's was constant per triangle and precomputed on the CPU). None of"); nl();
         ps("     rung 17's divide carries over; only the affine hoist does."); nl();
+    }
+    # ⛔ IN-ORACLE NON-VACUITY FLOOR. WHAT IT CATCHES: this file's success condition is `bestK != 0`,
+    # and bestK is awarded to the first K whose PROBE PIXEL stopped moving while no pixel overflowed
+    # 62 bits. A probe that evaluated NOTHING satisfies both: pb_probeQ never changes from its
+    # initial 0, so `moved 0` at every K, pb_over stays 0, and bestK is handed to k = 14 on the
+    # strength of two identical measurements OF NOTHING. Empty the pixel loop, zero its bound,
+    # #ifdef the body out, and this file reports "USABLE WINDOW EXISTS" and exits 95 having measured
+    # no numerator, no denominator and no quotient at all.
+    # ⛔ WHY THE EXTERNAL FLOOR CANNOT SEE IT: scripts/check/host-gpu-oracles.sh weighs this oracle
+    # by how many lines it printed (perspbits:18 against 27 healthy). Every one of pb_sweep's 12 K
+    # rows, the whole-frame convergence line, and all three pb_row strength rows are printed OUTSIDE
+    # the pixel loop that computes them, so gutting that loop leaves 23 of the 27 lines standing --
+    # measured -- which clears the floor of 18 with room to spare and the runner scores the vacuous
+    # run green. Its own header says so and names this file among the still-unfloored. Only a count
+    # taken where the arithmetic happens sees it. cpuref.cyr's cases_ok / lit_fail pair is the model.
+    # ⚠ THE MINIMA ARE THIS FILE'S OWN LOOP BOUNDS AND CALL SITES, not chosen numbers, and every one
+    # uses `<` so a wider sweep can never false-fire.
+    var vac = 0;
+    if (pb_ksteps < (34 - 12) / 2 + 1) {
+        ps("** VACUOUS: pb_sweep walked "); pn(pb_ksteps); ps(" K values, not the ");
+        pn((34 - 12) / 2 + 1); ps(" its own k = 12..34 step 2 loop names."); nl();
+        ps("   Convergence is a comparison between CONSECUTIVE K; fewer than two is not one.");
+        nl(); vac = vac + 1;
+    }
+    if (pb_probes < pb_ksteps + 5) {
+        ps("** VACUOUS: pb_probe ran "); pn(pb_probes); ps(" times, not the "); pn(pb_ksteps + 5);
+        ps(" this file calls for"); nl();
+        ps("   (one per swept K, plus the two whole-frame convergence renders, plus the three");
+        nl(); ps("   pb_row perspective strengths)."); nl(); vac = vac + 1;
+    }
+    if (pb_pxtot < 800 * 600) {
+        ps("** VACUOUS: N and D were evaluated at "); pn(pb_pxtot);
+        ps(" pixels, fewer than the 800x600 = "); pn(800 * 600); nl();
+        ps("   of a SINGLE pb_probe frame -- and this run makes "); pn(pb_probes);
+        ps(" of them, so the floor is one"); nl();
+        ps("   frame with the rest as slack. Every bit width this file reports is a maximum over");
+        nl(); ps("   those pixels, and a maximum over none is 0, which overflows nothing."); nl();
+        vac = vac + 1;
+    }
+    if (pb_qtot < pb_pxtot / 4) {
+        ps("** VACUOUS: a quotient was computed at "); pn(pb_qtot); ps(" of "); pn(pb_pxtot);
+        ps(" pixels."); nl();
+        ps("   pb_probe's triangle is the bottom-left, bottom-right and top-left CORNERS of the");
+        nl();
+        ps("   w x h draw rect, so it covers HALF of it by construction; a quarter is the floor,");
+        nl();
+        ps("   with 2x slack. Both the probe-pixel convergence and pb_maxQ live inside that half.");
+        nl(); vac = vac + 1;
+    }
+    if (pb_snapn < 480000) {
+        ps("** VACUOUS: the K=12 snapshot copied "); pn(pb_snapn);
+        ps(" quotients, not the 480000 its loop bound names."); nl(); vac = vac + 1;
+    }
+    if (pb_convn < 480000) {
+        ps("** VACUOUS: the whole-frame convergence compared "); pn(pb_convn);
+        ps(" quotients, not the 480000 its loop"); nl();
+        ps("   bound names -- and 'moved 0 of 480000' is what comparing none also prints. That");
+        nl();
+        ps("   line exists precisely because the one-pixel probe was too insensitive to trust.");
+        nl(); vac = vac + 1;
+    }
+    if (vac != 0) {
+        ps("perspbits: FAIL -- "); pn(vac);
+        ps(" measurement(s) were reported over work that did not happen."); nl();
+        ps("           A bit width measured on no pixels is not a small width, it is NO width, and");
+        nl();
+        ps("           the line-count floor outside cannot tell the two apart."); nl();
+        return 90;
     }
     if (bestK == 0) { return 90; }
     return 95;

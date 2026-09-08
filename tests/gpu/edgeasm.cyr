@@ -1130,11 +1130,13 @@ fn tri_check(): i64 {
     tri_want();
     var n = tri_emit() / 4;
     var bad = 0;
+    var tri_cmp = 0;
     var first = 0 - 1;
     var i = 0;
     while (i < n) {
         var got = load32(&isa + i * 4) & 0xFFFFFFFF;
         var wnt = load64(&want + i * 8);
+        tri_cmp = tri_cmp + 1;
         if (got != wnt) {
             bad = bad + 1;
             if (first < 0) { first = i; }
@@ -1170,6 +1172,20 @@ fn tri_check(): i64 {
         puts(" -- LENGTH MISMATCH (a short emit is not a partial pass)");
         return 0;
     }
+    # ⛔ IN-ORACLE NON-VACUITY FLOOR, AND THIS FILE ALREADY NARRATES WHY IT IS NEEDED. The exemption
+    # documented above passed a SHORT emit precisely because "the loop above is `while (i < n)`, so
+    # a short emit simply checked fewer dwords, found no divergence". The length assertion closed
+    # the SHORT case; it does not close the EMPTY one -- gut the diff loop and `n` is still 269, the
+    # length check still passes, `bad` is still 0, and this returns 1 having compared nothing.
+    # ⚠ THE EXTERNAL FLOOR CANNOT SEE IT EITHER. The "269 of 269 dwords re-emitted" line above is
+    # printed OUTSIDE the loop, so emptying the loop leaves the printed line count -- and the exit
+    # code scripts/check/host-gpu-oracles.sh reads -- exactly as they were.
+    # The minimum is the table's own length, TRI_N_TOTAL, not a number chosen here.
+    if (tri_cmp != TRI_N_TOTAL) {
+        ps("  ** tri_rgba: VACUOUS -- compared "); pnum(tri_cmp); ps(" of ");
+        pnum(TRI_N_TOTAL); puts(" dwords; agreement over nothing is not agreement");
+        return 0;
+    }
     if (bad != 0) { return 0; }
     return 1;
 }
@@ -1182,10 +1198,12 @@ fn blob_check(name, nlen, n, emitted): i64 {
         return 0;
     }
     var bad = 0;
+    var cmp = 0;
     var i = 0;
     while (i < n) {
         var got = load32(&isa + i * 4) & 0xFFFFFFFF;
         var wnt = load64(&want + i * 8);
+        cmp = cmp + 1;
         if (got != wnt) {
             bad = bad + 1;
             if (bad < 6) {
@@ -1194,6 +1212,19 @@ fn blob_check(name, nlen, n, emitted): i64 {
             }
         }
         i = i + 1;
+    }
+    # ⛔ IN-ORACLE NON-VACUITY FLOOR, for both callers of this helper (edge_setup, edge_cov). The
+    # length check above proves the blob EMITTED n dwords; it says nothing about how many were
+    # COMPARED. `bad` is a failure counter, so `bad == 0` holds just as well over an empty loop, and
+    # this helper would return 1 -- "byte-identical" -- having read no dword at all.
+    # ⚠ THE EXTERNAL FLOOR CANNOT SEE IT. The "N of N byte-identical" line below is printed OUTSIDE
+    # this loop, so a gutted loop leaves the printed line count untouched and the oracle still exits
+    # 95; scripts/check/host-gpu-oracles.sh weighs only that volume. The minimum is the caller's own
+    # llvm-mc dword count `n`, already asserted against the emit above -- nothing invented here.
+    if (cmp != n) {
+        ps("  ** "); print(name, nlen); ps("  VACUOUS: compared "); pnum(cmp);
+        ps(" of "); pnum(n); puts(" dwords -- the diff loop did not run");
+        return 0;
     }
     ps("  "); print(name, nlen); ps("  "); pnum(n - bad); ps(" of "); pnum(n);
     if (bad == 0) { puts(" byte-identical"); return 1; }
@@ -1215,10 +1246,12 @@ fn main(): i64 {
         ok = 0;
     }
     var bad = 0;
+    var bc_cmp = 0;
     var i = 0;
     while (i < 67) {
         var got = load32(&isa + i * 4) & 0xFFFFFFFF;
         var wnt = load64(&bc_want + i * 8);
+        bc_cmp = bc_cmp + 1;
         if (got != wnt) {
             bad = bad + 1;
             if (bad < 6) {
@@ -1226,6 +1259,20 @@ fn main(): i64 {
             }
         }
         i = i + 1;
+    }
+    # ⛔ IN-ORACLE NON-VACUITY FLOOR. `bad` is a FAILURE counter, so `bad == 0` is equally true of a
+    # loop that compared all 67 dwords and one that compared none -- and this gate carries the whole
+    # headline claim of the tool, "reproduces a shipped iron-proven shader byte-for-byte". Empty the
+    # loop and that claim is asserted by nothing.
+    # ⚠ THE EXTERNAL FLOOR CANNOT SEE IT. The "-> 67 of 67 byte-identical" line below is printed
+    # OUTSIDE this loop, so gutting the loop leaves the printed line count -- the only thing
+    # scripts/check/host-gpu-oracles.sh can weigh -- exactly as it was, and main() still returns 95.
+    # The minimum is the blob's own length: the same 67 asserted against `n` above and standing as
+    # this loop's own bound, not a number invented for the floor.
+    if (bc_cmp != 67) {
+        ps("  ** VACUOUS: compared "); pnum(bc_cmp);
+        puts(" of 67 dwords -- the diff loop did not run, so nothing was reproduced.");
+        ok = 0;
     }
     if (bad == 0) { puts("  -> 67 of 67 byte-identical"); }
     if (bad != 0) {
@@ -1364,6 +1411,19 @@ fn main(): i64 {
     var saved = ea_fault;
     ea_fault = 0;
     var fired = 0;
+    # ⛔ THIS ARM MUST NOT BE SATISFIABLE BY A DEAD TRACKER — the exact defect the floors added at
+    # 1.57.1 exist to close, reintroduced here by one of them. asmlib's ea_vgpr_check now ALSO
+    # returns 0 when ea_vgpr_max is still at its -1 reset sentinel, so "returned 0" no longer means
+    # "the under-declaration guard fired"; it can equally mean the instrumentation never ran.
+    # ⛔ MEASURED: with `ea_vtrack`'s high-water assignment neutered, this arm printed
+    #     "the gate refuses a 1-VGPR declaration, as it must"
+    # while every blob's high-water read v-1 on the line above. Before the floor it correctly went
+    # red here. Sample the high-water first, so the arm proves the GUARD and not the FLOOR.
+    if (ea_vgpr_max < 1) {
+        puts("  ** the VGPR tracker sits at its reset sentinel -- a 0 from ea_vgpr_check below is");
+        puts("  ** asmlib's vacuity floor, NOT the under-declaration guard. This arm proves nothing.");
+        ok = 0;
+    }
     if (ea_vgpr_check(1, "MUTANT") == 0) { fired = 1; }
     ea_fault = saved;
     if (fired == 0) {
@@ -1424,6 +1484,24 @@ fn main(): i64 {
 
     ps("  -> "); pnum(g6); puts(" of 10 unwitnessed rules verified");
     if (g6bad != 0) { ok = 0; }
+    # ⛔ IN-ORACLE NON-VACUITY FLOOR. `g6bad != 0` is the whole verdict here, and g6bad only moves
+    # when a rule is CHECKED AND WRONG. Compile the ten checks out, return early, or edit the
+    # tracker so ea_sgpr_max stops moving at all, and g6 == 0, g6bad == 0, this gate prints its one
+    # line and main() returns 95 -- ten rules "verified" by nothing.
+    # ⚠ THE EXTERNAL FLOOR CANNOT SEE THIS. scripts/check/host-gpu-oracles.sh weighs how many lines
+    # the oracle printed; the "-> N of 10" line above is printed OUTSIDE the checks, so gutting them
+    # leaves the printed line count untouched and the runner still scores PASS. Only the counter
+    # checked HERE distinguishes "ten rules held" from "ten rules were never asked".
+    # ⚠ And this is the gate where it matters most: by its own header these ten rules have NO
+    # witness among the shipped shaders, so if they are not checked here they are checked nowhere.
+    # The minimum is not chosen -- it is the ten rules enumerated by name above and named in this
+    # gate's own "of 10" line. `<` so an eleventh rule can be added without touching the floor.
+    if (g6 + g6bad < 10) {
+        ps("  ** VACUOUS: "); pnum(g6); puts(" of the 10 unwitnessed rules actually verified.");
+        puts("  ** 0 bad out of 0 checked is not a pass, and nothing else in the corpus checks");
+        puts("  ** these rules -- a silent mis-encoding would ship with the tool's blessing.");
+        ok = 0;
+    }
     ea_sgpr_reset(); ea_vgpr_reset();
 
     puts("");

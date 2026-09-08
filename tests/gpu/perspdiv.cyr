@@ -49,6 +49,18 @@ var pd_under = 0;      # N   >= (q+1)*D    -- one correction was not enough
 var pd_iters = 0;      # restoring-divide iterations actually consumed
 var pd_cases = 0;
 
+# ⛔ IN-ORACLE NON-VACUITY COUNTERS. pd_cases already existed and is already PRINTED ("730 cases")
+# and never ASSERTED, which is the cheapest kind of hole: a number the reader trusts and no code
+# checks. These add the two counts above it -- what the sweep NAMED before the domain filter had a
+# say -- and a per-sweep minimum, so one narrowed sweep among seven cannot hide behind six wide
+# ones. All of them are spent by the floor at the bottom of main().
+var pd_pairs = 0;      # (D, Q) pairs this sweep visited        -- trips of the `qi < 12` loop
+var pd_offs  = 0;      # candidate cases this sweep NAMED       -- trips of the `off <= 1` loop
+var pd_nsweeps   = 0;  # pd_run_sweep calls that actually ran
+var pd_min_pairs = 0;  # ... and the fewest of each any ONE of them managed
+var pd_min_offs  = 0;
+var pd_min_cases = 0;
+
 # ---- mutations --------------------------------------------------------------------------------
 var pd_mut_short  = 0;   # stop the restoring divide one iteration early
 var pd_mut_nocorr = 0;   # drop candidate B's correction entirely
@@ -201,15 +213,32 @@ fn pd_dset(): i64 {
     return pd_nD;
 }
 
+# pd_note_sweep -- called from pd_run_sweep's ONE exit, so no call site can forget it and no new
+# sweep can be added without being counted. Tracks the MINIMUM rather than the total: seven sweeps
+# summed would let a single gutted one disappear into the pile.
+fn pd_note_sweep(): i64 {
+    pd_nsweeps = pd_nsweeps + 1;
+    if (pd_nsweeps == 1) {
+        pd_min_pairs = pd_pairs; pd_min_offs = pd_offs; pd_min_cases = pd_cases;
+    }
+    if (pd_pairs < pd_min_pairs) { pd_min_pairs = pd_pairs; }
+    if (pd_offs  < pd_min_offs)  { pd_min_offs  = pd_offs; }
+    if (pd_cases < pd_min_cases) { pd_min_cases = pd_cases; }
+    return pd_nsweeps;
+}
+
 # pd_run_sweep(mode, sgn) -- mode 0 = candidate A, 1 = candidate B. Returns violations.
 fn pd_run_sweep(mode, sgn): i64 {
     var bad = 0;
     pd_dset();
+    pd_pairs = 0;
+    pd_offs = 0;
     var di = 0;
     while (di < pd_nD) {
         var D = load64(&pd_Ds + di * 8);
         var qi = 0;
         while (qi < 12) {
+            pd_pairs = pd_pairs + 1;
             # quotients across the whole 16.16 range, including 0 and the ceiling
             var Q = 0;
             if (qi == 0)  { Q = 0; }
@@ -219,6 +248,7 @@ fn pd_run_sweep(mode, sgn): i64 {
             if (Q > PD_Q_MAX) { Q = PD_Q_MAX; }
             var off = 0 - 1;
             while (off <= 1) {
+                pd_offs = pd_offs + 1;
                 var N = Q * D + off;
                 var skip = 0;
                 if (N < 0) { skip = 1; }
@@ -235,6 +265,7 @@ fn pd_run_sweep(mode, sgn): i64 {
         }
         di = di + 1;
     }
+    pd_note_sweep();   # ⛔ the ONE exit, so every sweep is measured whether or not it found anything
     return bad;
 }
 
@@ -305,6 +336,88 @@ fn main(): i64 {
     if (m3 == 0) { ps("** NOT CONNECTED **"); nl(); bad = bad + 1; }
 
     nl();
+    # ⛔ IN-ORACLE NON-VACUITY FLOOR. WHAT IT CATCHES: A1 and both B gates pass by finding ZERO
+    # violations -- `bad == 0` over pd_over/pd_under -- and zero is exactly what a sweep that
+    # checked NOTHING reports. Narrow pd_dset's divisor range, shrink the `qi < 12` quotient loop,
+    # widen the domain filter until it discards everything, or #ifdef a loop body out, and the
+    # obligation is "discharged" over an empty set while every gate line above still prints PASS.
+    # ⭐ M1/M2/M3 are a PARTIAL backstop and it is worth naming exactly how far it reaches: each
+    # demands its mutation go RED, so a totally dead sweep reports "NOT CONNECTED" and this file
+    # already fails. What they do NOT catch is a NARROWED sweep -- keep the handful of boundary
+    # cases the three mutations happen to trip and delete the rest, and all three still fire while
+    # coverage collapses. That is the hole these counters close.
+    # ⚠ A1's `pd_iters / pd_cases` divides by pd_cases and would trap at zero -- an accident, not a
+    # gate, and it protects only candidate A. The three B sweeps and the three M sweeps divide by
+    # nothing.
+    # ⛔ WHY THE EXTERNAL FLOOR CANNOT SEE IT: scripts/check/host-gpu-oracles.sh weighs this oracle
+    # by how many lines it printed (perspdiv:21 against 32 healthy). "730 cases" is printed by a
+    # ps/pn pair OUTSIDE the sweep that computes it, so the same line prints whether the number is
+    # 730 or 35, and every gate verdict, every eps row and the whole DECISION block are printed
+    # outside the sweeps too. Shrinking the divisor table leaves the line count UNTOUCHED at 32 --
+    # measured -- and the runner scores it green. Its own header says so and names this file among
+    # the still-unfloored. cpuref.cyr's cases_ok / lit_fail pair is the model.
+    # ⚠ THE MINIMA ARE THIS FILE'S OWN LOOP BOUNDS AND CALL SITES, not chosen numbers, and every
+    # comparison is `<` so a widened sweep can never false-fire.
+    var vac = 0;
+    if (pd_nsweeps < 7) {
+        ps("** VACUOUS: pd_run_sweep ran "); pn(pd_nsweeps);
+        ps(" times, not the 7 this file calls it -- candidate A,"); nl();
+        ps("   the three eps signs, and M1/M2/M3 -- FIVE call sites, one of them inside the"); nl();
+        ps("   s = -1..1 eps loop, so 4 + 3 = 7 RUNS. List them with `grep -n pd_run_sweep"); nl();
+        ps("   perspdiv.cyr` and add the loop trips: a count of matching LINES is not the number"); nl();
+        ps("   of RUNS. ⚠ The recipe printed here until 2026-09-08 said to count `pd_run_sweep(`"); nl();
+        ps("   unanchored and subtract the definition; that read 7 only by coincidence, the"); nl();
+        ps("   comment line and this message's own text making up exactly the two trips the eps"); nl();
+        ps("   loop adds. It would have drifted on the next edit in either direction."); nl();
+        ps("   COUNT AND CALL SITES TRAVEL TOGETHER: add a sweep above and raise the 7 in the SAME");
+        nl();
+        ps("   edit, exactly as host-gpu-oracles.sh pairs its oracle name list with its total.");
+        nl(); vac = vac + 1;
+    }
+    if (pd_nD < (29 - 23 + 1) * 3 + 3) {
+        ps("** VACUOUS: pd_dset built "); pn(pd_nD); ps(" divisors, not the ");
+        pn((29 - 23 + 1) * 3 + 3); ps(" its own loop names"); nl();
+        ps("   (b = 23..29, each contributing 2^b-1, 2^b and 2^b+1, plus the three named odd");
+        nl();
+        ps("   divisors). Every floor below is stated RELATIVE to pd_nD, so this one has to come");
+        nl(); ps("   first: a shrunken table would otherwise shrink its own floor with it."); nl();
+        vac = vac + 1;
+    }
+    if (pd_min_pairs < pd_nD * 12) {
+        ps("** VACUOUS: the thinnest of the "); pn(pd_nsweeps); ps(" sweeps visited ");
+        pn(pd_min_pairs); ps(" (D,Q) pairs, not "); pn(pd_nD * 12); nl();
+        ps("   = pd_nD * 12. The `qi < 12` loop is unconditional and has no break, so that product");
+        nl(); ps("   is EXACT, not an estimate with slack in it."); nl(); vac = vac + 1;
+    }
+    if (pd_min_offs < pd_nD * 12 * 3) {
+        ps("** VACUOUS: the thinnest sweep NAMED "); pn(pd_min_offs); ps(" candidate cases, not ");
+        pn(pd_nD * 12 * 3); nl();
+        ps("   = pd_nD * 12 * 3. The `off <= 1` boundary loop is unconditional too -- and off is");
+        nl();
+        ps("   the whole point here: one-ULP errors live AT the multiples of D, so losing the");
+        nl(); ps("   -1/0/+1 triple is losing the only place the obligation can be tight."); nl();
+        vac = vac + 1;
+    }
+    if (pd_min_cases < pd_nD * 12) {
+        ps("** VACUOUS: the thinnest sweep actually CHECKED "); pn(pd_min_cases);
+        ps(" cases, fewer than pd_nD * 12 = "); pn(pd_nD * 12); nl();
+        ps("   -- a third of the "); pn(pd_nD * 12 * 3);
+        ps(" it named. Unlike the two above this one is post-filter and so"); nl();
+        ps("   carries measured slack rather than being exact: N < 0 and N > 2^51 are discarded,");
+        nl();
+        ps("   and 730 of 864 survive on this tree. The floor sits 442 below that and far above");
+        nl();
+        ps("   the 0 a sweep whose domain filter rejects everything would report."); nl();
+        vac = vac + 1;
+    }
+    if (vac != 0) {
+        ps("perspdiv: FAIL -- "); pn(vac);
+        ps(" sweep measurement(s) report success over work that did not happen."); nl();
+        ps("          An obligation discharged over an empty set is not discharged, and the");
+        nl();
+        ps("          line-count floor outside cannot tell the two apart."); nl();
+        return 90;
+    }
     if (bad == 0) {
         ps("perspdiv: PASS -- the obligation holds by multiplication over the measured domain, and"); nl();
         ps("          every mutation breaks it."); nl(); nl();

@@ -215,8 +215,22 @@ rc=0
 #   one" AND IT WAS NOT: no issue named it, so the claim itself was the only record, and a claim that
 #   something is tracked is worse than silence — it stops the next reader from filing it. It is now
 #   genuinely tracked, under the tests/*/ vacuity surface in
-#   docs/development/issues/2026-09-02-vacuous-gates-sweep.md. Only `tests/gpu/cpuref.cyr` carries
-#   the in-oracle floor today; the other seventeen do not.
+#   docs/development/issues/2026-09-02-vacuous-gates-sweep.md.
+#   ⭐ 1.57.1 — ALL EIGHTEEN NOW CARRY AN IN-ORACLE FLOOR. This surface is swept.
+#   Every floor was falsified by mutation, and in EVERY case the pre-floor mutant still cleared the
+#   external floor below at full healthy line count — so the holes were real, not theoretical.
+#   The sharpest: rtaudit stubbed to compare nothing printed output BYTE-IDENTICAL to a healthy run
+#   (13 lines, floor 8); pm4lint with the validator bypassed printed "all 12 mutants rejected" at
+#   its exact healthy volume (20 lines, floor 13); perspdiv losing 34% of its cases still exited 95
+#   at full volume AND its own mutation gates missed it too; depthgate's D8 printed
+#   "corner bound 0 == brute-force maximum 0: PASS".
+#   ⚠ THE SWEEP ALSO CAUGHT THREE FLOORS THAT DID NOT BITE, which is the same defect one level up:
+#   moderaster counted at function ENTRY rather than at the comparison (a helper stubbed to always
+#   pass still scored 53 of 53); texgate gate 9's floor caught only a totally dead gate, missing a
+#   58% coverage loss; and asmlib's new vacuity branch INVERTED edgeasm's own gate-5 mutation arm.
+#   ⚠ Four "recount with this grep" recipes matched their own comment lines and would have set a
+#   constant HIGH, reddening a healthy oracle on the next addition — the false-fire class, this
+#   sweep's defect in reverse. All anchored (^) now. If you add a recipe here, anchor it.
 #
 # ⚠ THE NUMBERS ARE MEASURED, NOT CHOSEN. Each floor is two-thirds of the non-blank output its oracle
 #   emitted on this tree on 2026-09-02, freshly built by this very loop — a third of the volume left

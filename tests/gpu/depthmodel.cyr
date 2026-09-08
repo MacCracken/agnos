@@ -213,6 +213,23 @@ var dm_ties = 0;
 var dm_peak = 0;          # largest TRUE |zn| over EVERY LANE -- A4 checks it against a 32-bit lane
 var dm_lane_bad = 0;      # lanes where the 32-bit residue path != the true i64 value  (A5)
 var dm_sum_bad = 0;       # lanes where (w0 + w1 + w2) != area at lane width           (A6)
+# ⛔ IN-ORACLE NON-VACUITY FLOOR: lanes the model ACTUALLY EVALUATED on the last render. main()
+# asserts it, together with `dm_peak != 0`, before it prints PASS.
+# ⭐ THE HOLE THIS CLOSES IS A4, AND IT IS MEASURED. A4/A5/A6 are all `counter == 0 => PASS` gates
+# over counters this loop is the sole writer of, and all three verdicts print OUTSIDE it -- but A5
+# and A6 have mutation arms (M5, M6) that would report them dead, and A4 HAS NONE. Neuter the one
+# line `if (mag > dm_peak) { dm_peak = mag; }` -- the render is otherwise untouched, so the image is
+# still right -- and NOT ONE gate in this file goes red: A4 prints
+#     "A4 depth numerator peaks at 0 over EVERY lane (signed lane holds 2147483647): PASS"
+# exit is 95, and the log is 38 non-blank lines (re-measured 1.57.1 against the PRE-floor file; an earlier draft quoted 29, the POST-floor mutant count) against scripts/check/host-gpu-oracles.sh's floor of
+# 25. The runner weighs output volume and volume did not move; the bound A4 exists to establish was
+# simply not taken. `dm_peak != 0` is the assertion that was missing.
+# ⚠ SCOPE, HONESTLY: `dm_lanes` itself is belt and braces -- gutting `dm_render` outright already
+# reds A1/A2/A7a-c/A12/A10/A9/M5/M6/M2a/M2b. It is here because A4/A5/A6 still print PASS on that
+# run too, and a lane count says outright how much the model did.
+# ⚠ The expected value is derived, not chosen: the shader is PREDICATED and every lane evaluates,
+# so a render over w x h pixels and `dc_n` triangles must evaluate exactly w * h * dc_n lanes.
+var dm_lanes = 0;
 
 fn dm_render(w, h, zclear, bg): i64 {
     dm_ties = 0;
@@ -222,6 +239,7 @@ fn dm_render(w, h, zclear, bg): i64 {
     dm_wind_flips = 0;
     dm_clamp_fires = 0;
     dm_clamp_inside = 0;
+    dm_lanes = 0;
     # ⭐ The far value is held as an UNSIGNED 32-bit word, because the depth compare is unsigned.
     var zclr = zclear & DM_MASK32;
     var py = 0;
@@ -239,6 +257,7 @@ fn dm_render(w, h, zclear, bg): i64 {
             var pc = bg;
             var t = 0;
             while (t < dc_n) {
+                dm_lanes = dm_lanes + 1;      # ⛔ the non-vacuity witness -- see dm_lanes' block
                 dm_hoist(t);
                 # ---- ⭐ EVERY LANE EVALUATES, INSIDE OR NOT --------------------------------------
                 # The shader is PREDICATED, never branched (plan 4.4): it computes w0/w1/w2 and zn on
@@ -689,6 +708,33 @@ fn main(): i64 {
     pn(uref); ps(" -- the ORACLE is ~200x less sensitive than the reference diff."); nl();
 
     nl();
+    # ==============================================================================================
+    # ⛔ NON-VACUITY FLOOR — ASSERTED BEFORE PASS, BECAUSE `bad == 0` IS TRUE OF A MODEL THAT RAN
+    #    NO LANES AT ALL
+    # ==============================================================================================
+    # ⭐ WHAT THE EXTERNAL FLOOR CANNOT SEE. scripts/check/host-gpu-oracles.sh can only weigh this
+    # oracle's OUTPUT VOLUME (floor 25 lines), and A4's line is in that count whether it measured
+    # anything or not: `dm_peak <= 2147483647` is true of zero. See dm_lanes' block for the measured
+    # reproduction -- one neutered assignment, every gate in the file still green, 29 lines over a
+    # floor of 25, and the 32-bit-lane bound the whole rung rests on never actually taken.
+    # ⚠ Derived from the file, not chosen: the shader is predicated so every lane evaluates, hence a
+    # render of DC_W x DC_H pixels over `dc_n` triangles must evaluate exactly that many lanes. And
+    # `dm_peak` is the largest |zn| over those lanes; on a corpus that draws, it cannot be zero.
+    dm_order(0);
+    dm_render(DC_W, DC_H, DC_FAR, DC_BG);
+    if (dm_lanes != DC_W * DC_H * dc_n) {
+        ps("depthmodel: ** VACUOUS -- the model evaluated "); pn(dm_lanes); ps(" of ");
+        pn(DC_W * DC_H * dc_n); ps(" lanes."); nl();
+        ps("  A4/A5/A6 are counter-is-zero gates over counters only that loop writes, and their"); nl();
+        ps("  PASS lines print outside it -- so an empty render passes them at full line count."); nl();
+        return 89;
+    }
+    if (dm_peak == 0) {
+        ps("depthmodel: ** VACUOUS -- A4's peak |zn| is 0 over every lane, which no real corpus"); nl();
+        ps("  produces. The peak is no longer being taken, and `dm_peak <= 2147483647` is true of"); nl();
+        ps("  zero, so A4 prints PASS on a measurement that stopped happening."); nl();
+        return 89;
+    }
     if (bad == 0) {
         ps("depthmodel: PASS -- the hoisted, 32-bit-lane model is byte-identical to the reference in"); nl();
         ps("            colour AND z, is order-independent, and every mutation breaks it."); nl();

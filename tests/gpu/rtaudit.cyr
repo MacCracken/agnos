@@ -28,6 +28,31 @@ var K_VM_ARENA_OFF   = 2147483648;   # 0x80000000
 var K_ARENA_SIZE     = 2097152;      # 0x200000 = 2 MB
 var K_VRAM_MB        = 3072;         # archaemenid, from the boot log: "gpu: 3072MB VRAM"
 
+# ---- EVIDENCE COUNTERS, spent by the non-vacuity floor at the bottom of main() ------------------
+# ⛔ These count what this run actually EXAMINED, not what it found wrong. Every verdict in this
+# file is "no failure was found", and a run that examined NOTHING satisfies that perfectly.
+var ra_ran = 0;                      # checks whose got/want comparison was actually evaluated
+var ra_mut_n = 0;                    # mutations actually evaluated
+# ⛔ THE CHECK TABLE'S OWN LENGTH: the six `ra_check(...)` call sites in main(), plus the one inline
+# C7 that counts itself. Re-count with:
+#     echo $(( $(grep -c '^    bad = bad + ra_check(' rtaudit.cyr) + 1 ))
+# ⚠ ANCHORED AT COLUMN 4 ON PURPOSE. The obvious pattern `ra_check("` also matches THIS COMMENT
+# LINE, so the recipe counted itself and read 8 for a seven-check file — follow it on the next
+# addition and you set the floor one too high and redden a healthy oracle, which is this fix's own
+# defect class wearing the fix's clothes. A call site starts with four spaces; a comment starts
+# with '#', so the anchor cannot count the instructions.
+# ⚠ COUNT AND CHECKS TRAVEL TOGETHER: add a check below and raise this in the SAME edit, exactly as
+# host-gpu-oracles.sh pairs its oracle name list with ORACLE_FLOOR_TOTAL.
+var RA_NCHECKS = 7;
+# ⛔ Likewise the mutation table: the five M-lines, each written `mut = mut + ra_mut(...)`. Recount:
+#     grep -c '^    mut = mut + ra_mut(' rtaudit.cyr        # anchored, per the note above
+var RA_NMUTS = 5;
+
+# ra_mut(missed) — record that one mutation was EVALUATED, and pass its verdict through unchanged.
+# ⚠ The counting happens HERE, at the site where the guard is actually exercised, because that is
+# the only place that can tell "every guard fired" apart from "no guard was ever tried".
+fn ra_mut(missed): i64 { ra_mut_n = ra_mut_n + 1; return missed; }
+
 fn ra_overlaps(a, la, b, lb): i64 {
     if (a >= b + lb) { return 0; }
     if (b >= a + la) { return 0; }
@@ -37,7 +62,11 @@ fn ra_overlaps(a, la, b, lb): i64 {
 # ra_check(name, nlen, got, want) — got must equal want.
 fn ra_check(name, nlen, got, want): i64 {
     ps("  "); print(name, nlen); ps(": ");
-    if (got == want) { ps("PASS"); nl(); return 0; }
+    # ⚠ COUNTED ON BOTH ARMS, at the comparison itself and not at entry: a stub that printed the
+    # label and returned 0 without ever comparing leaves `bad` at 0 — which is this file's whole
+    # success condition — and leaves this counter at 0, which the floor below can see.
+    if (got == want) { ra_ran = ra_ran + 1; ps("PASS"); nl(); return 0; }
+    ra_ran = ra_ran + 1;
     ps("FAIL (got "); pn(got); ps(", want "); pn(want); ps(")"); nl();
     return 1;
 }
@@ -80,8 +109,11 @@ fn main(): i64 {
     # if the claim is false the whole region size is wrong rather than merely tight.
     var need = 2560 * 1440 * 4 * 2;
     ps("  C7 a handle holds 2560x1440x4 colour+depth: ");
-    if (K_RT_HANDLE_SIZE >= need) { ps("PASS ("); pn(K_RT_HANDLE_SIZE); ps(" >= "); pn(need); ps(")"); nl(); }
+    # ⚠ C7 does not go through ra_check(), so it counts itself on both arms — otherwise RA_NCHECKS
+    # below would be flooring six checks while the file claims seven.
+    if (K_RT_HANDLE_SIZE >= need) { ra_ran = ra_ran + 1; ps("PASS ("); pn(K_RT_HANDLE_SIZE); ps(" >= "); pn(need); ps(")"); nl(); }
     if (K_RT_HANDLE_SIZE < need) {
+        ra_ran = ra_ran + 1;
         ps("FAIL ("); pn(K_RT_HANDLE_SIZE); ps(" < "); pn(need); ps(")"); nl();
         bad = bad + 1;
     }
@@ -92,21 +124,56 @@ fn main(): i64 {
     # way to move the TMR to see the guard fire. Here they can be moved, and a guard nobody has seen
     # fail is a guard nobody knows is wired.
     var mut = 0;
+    # ⚠ EACH PREDICATE IS UNCHANGED; it now passes through ra_mut(), which counts the EVALUATION.
+    # `mut` counts guards that did not fire, so `mut == 0` — the pass condition below — is equally
+    # satisfied by five guards firing and by five mutations that were never run.
     # M1 -- slide the region down onto the command arena.
-    if (ra_overlaps(K_VM_ARENA_OFF, K_RT_REGION_SIZE, K_VM_ARENA_OFF, K_ARENA_SIZE) != 1) { mut = mut + 1; }
+    mut = mut + ra_mut(ra_overlaps(K_VM_ARENA_OFF, K_RT_REGION_SIZE, K_VM_ARENA_OFF, K_ARENA_SIZE) != 1);
     # M2 -- slide it down onto the PSP TMR.
-    if (ra_overlaps(K_PSP_TMR_OFF, K_RT_REGION_SIZE, K_PSP_TMR_OFF, K_PSP_TMR_SIZE) != 1) { mut = mut + 1; }
+    mut = mut + ra_mut(ra_overlaps(K_PSP_TMR_OFF, K_RT_REGION_SIZE, K_PSP_TMR_OFF, K_PSP_TMR_SIZE) != 1);
     # M3 -- start it at 0, inside the framebuffer window.
-    if (ra_overlaps(0, K_RT_REGION_SIZE, 0, K_FB_BACK_LIMIT) != 1) { mut = mut + 1; }
+    mut = mut + ra_mut(ra_overlaps(0, K_RT_REGION_SIZE, 0, K_FB_BACK_LIMIT) != 1);
     # M4 -- a region that does NOT end at the carveout top must be caught by C2.
-    if ((K_RT_REGION_OFF - 65536) + K_RT_REGION_SIZE == carve) { mut = mut + 1; }
+    mut = mut + ra_mut(((K_RT_REGION_OFF - 65536) + K_RT_REGION_SIZE) == carve);
     # M5 -- a handle table that does not tile the region must be caught by C6.
-    if (7 * K_RT_HANDLE_SIZE == K_RT_REGION_SIZE) { mut = mut + 1; }
+    mut = mut + ra_mut((7 * K_RT_HANDLE_SIZE) == K_RT_REGION_SIZE);
     ps("  M1-M5 every guard fires when its region is moved onto a claimed window: ");
     if (mut == 0) { ps("PASS"); nl(); }
     if (mut != 0) { ps("FAIL "); pn(mut); ps(" guard(s) did not fire"); nl(); bad = bad + mut; }
 
     nl();
+    # ⛔ IN-ORACLE NON-VACUITY FLOOR. WHAT IT CATCHES: every verdict above passes by finding ZERO
+    # counter-examples — `bad == 0` for C1-C7, `mut == 0` for M1-M5 — and both are satisfied by a
+    # run that examined NOTHING. #ifdef the check block out, return early, stub ra_check() to a bare
+    # `return 0`, or delete the mutation lines, and both counters stay at 0, main() returns 95, and
+    # TD-3's placement is reported "sound and every guard connected" on no evidence at all.
+    # ⛔ WHY THE EXTERNAL FLOOR CANNOT SEE IT: scripts/check/host-gpu-oracles.sh weighs this oracle
+    # by how many lines it printed (rtaudit:8), and the labels are printed on the SAME arms that
+    # compare — so a ra_check() edited to keep printing "PASS" while no longer comparing leaves the
+    # line count untouched at its healthy 13 and the runner scores it green. That runner's own
+    # header says so and names this class. Only a count taken where the comparison happens sees it.
+    # ⚠ THE MINIMA ARE THIS FILE'S OWN TABLE LENGTHS, not chosen numbers: RA_NCHECKS is the six
+    # ra_check() call sites plus the inline C7, RA_NMUTS the five M-lines, each re-countable by the
+    # grep printed at its declaration. `<`, never `!=`, so adding a check or a mutation can never
+    # false-fire this floor.
+    var vac = 0;
+    if (ra_ran < RA_NCHECKS) {
+        ps("rtaudit: ** VACUOUS -- "); pn(ra_ran); ps(" of "); pn(RA_NCHECKS);
+        ps(" checks actually compared a got against a want."); nl();
+        vac = vac + 1;
+    }
+    if (ra_mut_n < RA_NMUTS) {
+        ps("rtaudit: ** VACUOUS -- "); pn(ra_mut_n); ps(" of "); pn(RA_NMUTS);
+        ps(" mutations were actually evaluated, so 'every guard fires' is a claim about"); nl();
+        ps("         guards nobody moved. On iron these can only ever be seen PASSING; the"); nl();
+        ps("         mutation block is the ONLY place they are ever seen to fail."); nl();
+        vac = vac + 1;
+    }
+    if (vac != 0) {
+        ps("rtaudit: FAIL -- a check that finds no counter-example because it looked at none is"); nl();
+        ps("         not a check, and the line-count floor outside cannot tell the two apart."); nl();
+        return 90;
+    }
     if (bad == 0) {
         ps("rtaudit: PASS -- TD-3's placement arithmetic is sound and every guard is connected."); nl();
         ps("⚠ This proves the ARITHMETIC only. Check 7 -- the live DCN scanout address -- is the"); nl();

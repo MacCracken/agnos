@@ -150,8 +150,18 @@ fn bm_fill(): i64 {
 }
 
 # Sweep model vs reference over a UV range that INCLUDES NEGATIVES and multiple tiles.
+# ⛔ IN-ORACLE NON-VACUITY INSTRUMENTATION. `bm_cmp` is every (u,v) pair this file has actually
+# COMPARED; `bm_last` is the count for the most recent sweep, which is the one whose verdict
+# bm_gate is about to print; `bm_gates` is how many gates were reached at all. Every verdict in
+# this file -- green ones AND the mutations' red ones -- is a statement about a sweep, so a sweep
+# that compared nothing cannot support either. See the floors in bm_gate and at the end of main().
+var bm_cmp = 0;
+var bm_last = 0;
+var bm_gates = 0;
+
 fn bm_sweep_mode(wrap): i64 {
     var diff = 0;
+    var n = 0;
     var u = 0 - (65536 * 2);
     while (u < 65536 * 3) {
         var v = 0 - (65536 * 2);
@@ -159,10 +169,13 @@ fn bm_sweep_mode(wrap): i64 {
             var want = bi_sample(&bm_tex, BM_TW, BM_TH, u, v, wrap);
             var got  = bm_sample(&bm_tex, BM_TW, BM_TH, u, v, wrap);
             if (want != got) { diff = diff + 1; }
+            n = n + 1;
             v = v + 9973;
         }
         u = u + 9973;
     }
+    bm_last = n;
+    bm_cmp = bm_cmp + n;
     return diff;
 }
 fn bm_sweep(): i64 { return bm_sweep_mode(1); }
@@ -170,6 +183,21 @@ fn bm_sweep_clamp(): i64 { return bm_sweep_mode(0); }
 
 fn bm_gate(name, d, want_red): i64 {
     ps(name);
+    bm_gates = bm_gates + 1;
+    # ⛔ THE PER-GATE NON-VACUITY FLOOR. `d` is a DIFF COUNT over a sweep, and 0 means "no pair
+    # disagreed" -- which is also what an EMPTY sweep returns. A sweep whose loop body was
+    # #ifdef'd out, or whose bounds no longer admit an iteration, hands this function a 0 and it
+    # would report PASS for an agreement gate having compared nothing at all.
+    # ⛔ THE EXTERNAL FLOOR CANNOT SEE THIS. scripts/check/host-gpu-oracles.sh weighs bimodel by
+    # its printed line count (floor 10), and this label is printed HERE -- outside the sweep --
+    # so gutting bm_sweep_mode leaves every line of output in place and the runner scores it
+    # green. Only the count taken INSIDE the loop distinguishes them. cpuref.cyr does the same
+    # with cases_ok / lit_fail.
+    if (bm_last == 0) {
+        ps(" ** VACUOUS: the sweep compared 0 (u,v) pairs -- this verdict is about nothing **");
+        nl();
+        return 1;
+    }
     if (want_red == 0) {
         if (d == 0) { ps(" PASS"); nl(); return 0; }
         ps(" FAIL diff="); pn(d); nl(); return 1;
@@ -217,6 +245,23 @@ fn main(): i64 {
     bm_mut_nohalf = 0;
 
     nl();
+    # ⛔ THE WHOLE-RUN FLOOR, the peer of the per-gate one in bm_gate. It catches the case that
+    # floor cannot: main() returning early, or the gate calls themselves being compiled out. `bad`
+    # would then still be 0 and this function would print its PASS banner over ZERO gates.
+    # ⚠ THE MINIMUM IS THIS FILE'S OWN GATE LIST: the ten bm_gate calls above -- W, C, and the
+    # eight mutation arms (M1, M2 x2, M3, M4, M5, M6 x2). `<`, so adding a gate is never a
+    # failure; removing one is meant to be noticed. Keep this number and that list in one edit.
+    if (bm_gates < 10) {
+        ps("bimodel: FAIL -- VACUOUS: only "); pn(bm_gates);
+        ps(" of the 10 gates ran. A run that reaches no gate reports no failures.");
+        nl();
+        return 90;
+    }
+    if (bm_cmp == 0) {
+        ps("bimodel: FAIL -- VACUOUS: 0 (u,v) pairs were compared across every sweep.");
+        nl();
+        return 90;
+    }
     if (bad == 0) {
         ps("bimodel: PASS -- the 32-bit-lane model is byte-identical to the reference, and all SIX");
         nl();
