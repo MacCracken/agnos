@@ -1,40 +1,43 @@
-# 29 of 30 ring-3 test harnesses boot a PREBUILT exerciser and never check it is current — OPEN
+# Ring-3 test harnesses booted prebuilt artifacts and never checked they were current — RESOLVED
 
-**Status:** OPEN. ⚠ **The count in the title was 26 and is 29** — `puka-child-stdout` and `puka-terminal`
-only existence-check a sibling binary, which is not a freshness check. Measured at 1.57.1:
-`grep -l getmtime scripts/harness/*.py` matches ONE file out of 30.
+**Status:** RESOLVED in agnos **1.57.1**. **30 of 30 harnesses now carry a freshness guard** — the
+count was 1 of 30 when this was filed and when it was re-measured at 1.57.1.
 
-✅ **1.57.1 fixed five instances and widened the template:** `console-line-smoke.sh` (⭐ a SCORED
-SWEEP GATE that booted a fossil — `run_gate` rebuilds `build/agnos` and then the gate scored an image
-built from a different kernel; measured live at a full day of drift), `chan-ring3-smoke.sh` (now
-builds its own kernel), `launcher-panel-test.py` (copied its base image ONCE, then never again —
-21 days behind), and freshness guards for `mountlist-test.py` and `readdir-at-test.py`, **the two
-harnesses that produced ship evidence for 1.56.59/1.56.60**.
+## What shipped
 
-⭐ **AND THE TEMPLATE CHANGED, which matters more than the five:** `telemetry-test.py`s guard
-watched `tlm.cyr` ALONE. A toolchain pin change rewrites the vendored `lib/`, so a binary from a
-different compiler scored as fresh. Every guard now watches **all build inputs** — `*.cyr`,
-`lib/*.cyr` and `cyrius.cyml`. ⛔ Any of the remaining ~24 guards written with the one-`.cyr` shape
-inherits the hole.
+- ⭐ **`scripts/harness/_freshness.py`** — the shared helper the issue's own "needs no shared
+  infrastructure" line was wrong about. That was true at one instance and the wrong call at thirty:
+  hand-rolling it 29 more times is how 29 guards get built with the same hole.
+- **`refuse_stale_kernel()` on 24 harnesses.** ⛔ THE BIGGER HALF: every one of these exists to test
+  KERNEL behaviour and resolved `build/agnos` as a bare path, so a stale kernel made the whole result
+  a fiction — measured, when four consecutive mutation runs each re-introducing a real kernel defect
+  all reported `exit 95`.
+- **Exerciser guards** watching **every build input** (`*.cyr`, `lib/*.cyr`, `cyrius.cyml`), not just
+  the one `.cyr`. The first guard written (1.56.60) watched `tlm.cyr` alone, and a toolchain pin
+  change rewrites the vendored `lib/` — so a binary from a *different compiler* scored as fresh.
+- ⭐ **The prebuilt-IMAGE class, which this file never named and which is the worst of them** — six
+  harnesses boot a frozen image carrying kernel, agnsh and every staged tool at once, with measured
+  drift of 1, 21 and 38 days. Neither an exerciser nor a kernel check touches it; they now compare
+  the image against `build/agnos` directly.
+- **Five specific fossils fixed**, including `console-line-smoke.sh` — a **scored sweep gate** that
+  built its image only when ABSENT, so `run_gate` rebuilt the kernel and then scored an image made
+  from a different one.
 
-⛔ **THE PREBUILT-IMAGE SUB-CLASS, WHICH THIS FILE NEVER NAMED AND IS THE WORST:** six harnesses boot
-a whole frozen image — kernel, agnsh and every staged tool together — with measured drift of 1, 21
-and 38 days. An exerciser guard does not touch it.
+## Verified both ways, not asserted
 
-⚠ **The 10 rootfs-staged harnesses need an operator design decision before they can be written:** this
-files own rule forbids auto-building siblings, while `scripts/burn/burn-prep.sh` already implements
-the right staleness derivation and no harness calls it. Decide the shape first — 10 harnesses inherit
-it. ⛔ And "needs no shared infrastructure" was true at one instance and is the wrong call at 29: a
-`scripts/harness/_freshness.py` helper is the right shape.
+- **No false fire:** with the tree fresh, `mountlist-test.py` runs to `exit 95`.
+- **It bites:** `touch kernel/core/proc.cyr` without rebuilding, and `mountlist`, `readdir-at`,
+  `telemetry`, `hid-halt-oracle` and `sweep` all refuse with `is OLDER than its kernel sources`;
+  `agnsh-type` and `doom-input` refuse on the image path.
 
-⛔ **AND IT IS NOT JUST THE EXERCISER — IT IS THE KERNEL.** Every harness here also resolves
-`AGNOS = ROOT/build/agnos` as a prebuilt path and never runs `scripts/build.sh`. A second mutation
-campaign, run after fixing the exerciser staleness, re-introduced two KERNEL defects and still got
-`exit 95 / PASS` on every mutant — because the edits to `kernel/core/block.cyr` and
-`kernel/arch/x86_64/pic.cyr` were never compiled. **Every one of these harnesses exists to test
-kernel behaviour, so a stale `build/agnos` makes the whole result a fiction.** The 1.56.60 fix now
-guards both: the exerciser against its own source, and `build/agnos` against the newest mtime under
-`kernel/**/*.cyr`.
+## ⚠ What was deliberately NOT built, and why it needs no ruling after all
+
+The issue said the rootfs-staged harnesses were **blocked on an operator design decision** about
+auto-building siblings. ⭐ **That blocker dissolves once you separate refusing from building.**
+`refuse_stale()` never compiles anything — so it is safe for *every* harness including sibling-built
+artifacts, because it cannot compile a sibling against a toolchain that repo never declared (the
+hazard `stage_one` in `scripts/burn/stage-tools.sh` documents at length). Auto-building remains a
+convenience question and an open one; **correctness is closed.**
 
 **Found:** 2026-09-03, the hard way, while repairing the two telemetry defects chakshu reported.
 I edited `tests/telemetry/tlm.cyr` to add two new assertions, ran the harness **four times** — once

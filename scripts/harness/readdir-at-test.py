@@ -23,6 +23,14 @@ IMG    = os.path.join(WORK, "agnos-rdat.img")
 SER    = os.path.join(WORK, "serial.log")
 MON    = "/tmp/agnos-rdat.sock"
 AGNOS  = os.path.join(ROOT, "build/agnos")
+
+# ⛔ 1.57.1 — REFUSE A STALE KERNEL. This harness resolved build/agnos as a PATH and never
+# checked it was current, so an edited-but-not-rebuilt kernel scored green having asserted
+# nothing new. Every harness here exists to test KERNEL behaviour, so this is the half that
+# matters most. See scripts/harness/_freshness.py for the measurement that produced it.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _freshness import refuse_stale_kernel
+refuse_stale_kernel(ROOT)
 GNOBOOT= os.path.join(ROOT, "../gnoboot/build/BOOTX64.EFI")
 RDAT   = os.path.join(ROOT, "tests/readdir/build/rdat")
 DISK_MB, PART_OFFSET, PART_BLOCKS = 512, 34603008, 122880

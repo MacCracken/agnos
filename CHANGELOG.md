@@ -22,7 +22,34 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.57.1] — 2026-09-08 — backlog closeout: 21 items across six issue files
 
+### Fixed — three more issue files closed (six → three open)
+
+- ⭐ **agnoshi's power builtins — all six items, fixed IN agnoshi (1.9.11), not from this tree.**
+  History save and audit record now happen *before* the syscall that does not return; the three raw
+  `syscall(13,…)` sites are arch-guarded (**verified: the host binary carries zero of them, the agnos
+  target keeps all three**); the banners no longer advertise the verbs on host builds; and
+  `agnsh -c "poweroff"` works at all, which is what made the agnsh half of the shutdown path
+  untestable. ⛔ The "widen the wrapper" migration was NOT performed — `sys_reboot` has different
+  arity per target, and adopting the host's 1-arg form would fire genuine `0xFEE1DEAD` at Linux
+  `SYS_REBOOT` and **actually reboot a developer's workstation**. The tidier-looking change is the
+  dangerous one.
+- ⭐ **Harness freshness: 30 of 30, up from 1 of 30.** New `scripts/harness/_freshness.py`; kernel
+  guards on 24 harnesses (the bigger half — every one tests kernel behaviour and resolved
+  `build/agnos` as a bare path); exerciser guards watching **every** build input; and the
+  prebuilt-**image** class the issue never named, where six harnesses boot a frozen image with
+  measured drift of 1, 21 and 38 days. ⭐ The "blocked on an operator ruling" framing dissolved:
+  **refusing** a stale artifact needs no ruling, only auto-*building* a sibling does.
+  **Verified both ways** — clean tree runs to exit 95; `touch kernel/core/proc.cyr` and seven
+  harnesses refuse.
+- **HID residual #2 — the torn `hid_row_idx`/`hid_row_cycle` read.** The ISR resets idx and flips
+  cycle in the same breath, so two unlocked loads could point Set-TR-Dequeue at a wrong-cycle TRB and
+  re-kill the endpoint the recovery exists to save. Bounded seqlock-style retry.
+- **`host-gpu-oracles.sh` claimed the 17 missing in-oracle floors were "filed as one". Nothing filed
+  them.** A comment asserting something is tracked, when nothing tracks it, is worse than silence —
+  it stops the next reader from filing it. Corrected, and now genuinely tracked.
+
 ### Changed — cyrius pin 6.6.0 -> 6.6.1
+
 
 - All **12** manifests plus sibling **klug**; `toolchain-pin-check` 12/12. Kernel builds clean.
 

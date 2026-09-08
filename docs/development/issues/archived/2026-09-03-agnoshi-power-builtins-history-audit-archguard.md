@@ -1,4 +1,41 @@
-# agnoshi's three power builtins: no history save, no audit record, no arch guard, and a dead privilege classifier — OPEN
+# agnoshi's three power builtins: no history save, no audit record, no arch guard — RESOLVED
+
+**Status:** RESOLVED in **agnoshi 1.9.11** (2026-09-08), alongside agnos 1.57.1. Fixed **in agnoshi**,
+not from the agnos tree — cross-repo means switching repos, which is what was done.
+
+| # | Item | Outcome |
+|---|------|---------|
+| 1 | power builtins discard session history | **FIXED** — saved before the syscall, via one helper so the three sites cannot drift |
+| 2 | no audit record for the three verbs | **FIXED** — `audit_exec_ctx(verb, "launched", …)`, ordered *before* the history save |
+| 3 | "dead privilege classifier" | ⛔ **THE ITEM WAS WRONG** — see the correction below. A policy question survives; it needs a ruling |
+| 4 | raw `syscall(13,…)` not arch-guarded | **FIXED** — and the banners that advertised the verbs on host builds too |
+| 5 | stale "wrapper not yet widened" comment | **FIXED** — and it turned out to be pointing at a real hazard |
+| 6a | verbs absent from the `-c` one-shot path | **FIXED** — `agnsh -c "poweroff"` is now a power operation |
+| 6b | shutdown-smoke should assert the agnsh half | 🟠 **UNBLOCKED BUT NOT DONE** — needs a sudo mount; see below |
+
+**VERIFIED, not asserted:** the host binary now carries **zero** of the three `syscall(13,…)` sites
+(it carried three) while the agnos target keeps all three; `./build/agnsh -c "poweroff"` on the host
+prints `power control is AGNOS-only`; `cyrius test` 26/26.
+
+⛔ **ITEM 5 WAS POINTING AT A LIVE HAZARD, AND THE "FIX" IT INVITED IS THE DANGEROUS ONE.**
+`sys_reboot` has **different arity per target**: `lib/syscalls_linux_common.cyr` is
+`sys_reboot(cmd)` — one argument, hardcoding the REAL `LINUX_REBOOT_MAGIC1/2` — while the agnos peer
+is `sys_reboot(magic1, magic2, cmd, arg)`. A 4-arg call cannot compile on host; "fixing" that by
+adopting the host's 1-arg form would fire genuine `0xFEE1DEAD` at Linux `SYS_REBOOT` and **actually
+reboot a developer's workstation** under `CAP_SYS_BOOT`. Today's unguarded call was inert on host
+only **by accident** (Linux #13 is `rt_sigaction`). The comment now says all of this; the migration
+was NOT performed.
+
+🟠 **6b — WHY IT IS STILL OPEN, AND IT IS NOT A DEFERRAL OF CONVENIENCE.** The sequencing trap is
+now half-cleared: 6a has landed, so the verbs *can* be driven non-interactively. What remains is that
+asserting the two new records means reading `/var/log`-equivalent state **out of the guest image
+after shutdown**, and `shutdown-smoke.sh` only ever runs `dumpe2fs`/`e2fsck` against the image — it
+does not mount it. A mount needs **sudo**, which makes this the same shape as the exFAT seeded-lane
+question already awaiting an operator ruling: does the release sweep acquire a sudo-capable lane, or
+is a visible SKIP the accepted answer? ⛔ Until that is ruled, an assertion written here would either
+require sudo in the sweep or be a silent skip — and a silent skip is the exact class this repo keeps
+paying for.
+
 
 **Status:** OPEN — **agnoshi-side work, filed from agnos.** Cross-repo work means switching repos,
 not blurring boundaries (CLAUDE.md), so nothing here was edited from this tree.

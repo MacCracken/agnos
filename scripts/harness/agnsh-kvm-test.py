@@ -7,6 +7,19 @@ import socket, subprocess, sys, time, os
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WORK = os.path.join(ROOT, "build/agnsh-smoke")
 IMG  = os.path.join(WORK, "agnos-agnsh.img")
+
+# ⛔⛔ 1.57.1 — THE PREBUILT-IMAGE CLASS, which the harness-staleness issue never named and
+# which is the WORST of them: this boots a whole FROZEN image carrying the kernel, agnsh and
+# every staged tool at once. Measured drift across this group was 1, 21 and 38 days against a
+# same-day build/agnos. An exerciser freshness check does not touch it, and neither does a
+# kernel check — the kernel inside the IMAGE is what runs, not build/agnos.
+# ⚠ REFUSES, does not rebuild: the image is produced by another smoke, so the honest action is
+# to name the command rather than silently regenerate someone else's artifact.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _freshness import refuse_stale
+refuse_stale(IMG, [os.path.join(ROOT, 'build', 'agnos')],
+             'kernel (build/agnos is newer than this baked image)',
+             'rm -rf ' + WORK + '   # then re-run the smoke that builds this image')
 SER  = os.path.join(WORK, "serial-kvm.log")
 MON  = "/tmp/agnos-kvm.sock"
 for c in ("/usr/share/edk2/x64/OVMF_CODE.4m.fd", "/usr/share/OVMF/OVMF_CODE.fd"):

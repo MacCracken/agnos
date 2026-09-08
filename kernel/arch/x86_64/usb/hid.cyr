@@ -1109,8 +1109,31 @@ fn hid_recover_halted() {
                     # on a cycle mismatch, halted again at once). Keyboard halt recovery is the one
                     # caller of this path, and so the one place the decoy could do damage.
                     var ring = load64(&hid_ep_ring + i * 8);
+                    # ⛔⛔ 1.57.1 — SEQLOCK-STYLE RETRY, BECAUSE THESE TWO ARE ONE VALUE READ TWICE.
+                    # The ISR's ring wrap resets idx to 0 and FLIPS cycle in the same breath. Reading
+                    # them as two unlocked loads can therefore catch a TORN PAIR — the pre-wrap idx
+                    # with the post-wrap cycle, or the reverse — and Set-TR-Dequeue would then point
+                    # the controller at a wrong-cycle TRB and RE-KILL the very endpoint this recovery
+                    # was called to save. Re-read until two consecutive samples agree, which is the
+                    # cheapest correct thing available here: this runs in thread context with no lock
+                    # to take against an ISR, and a bounded retry cannot deadlock against one.
+                    # ⚠ BOUNDED, not `while (1)`. If the ring is being hammered hard enough that the
+                    # pair never settles, proceeding with the LAST consistent-looking sample is no
+                    # worse than the unguarded read this replaces, and a spin here would hang a
+                    # recovery path. 64 is far above any real wrap rate at 8 ms polling.
                     var idx  = hid_row_idx(i);
                     var cyc  = hid_row_cycle(i);
+                    var tries = 0;
+                    while (tries < 64) {
+                        var idx2 = hid_row_idx(i);
+                        var cyc2 = hid_row_cycle(i);
+                        if (idx2 == idx) {
+                            if (cyc2 == cyc) { tries = 64; }
+                            else { idx = idx2; cyc = cyc2; tries = tries + 1; }
+                        } else {
+                            idx = idx2; cyc = cyc2; tries = tries + 1;
+                        }
+                    }
                     if (xhci_cmd_set_tr_dequeue(slot, dci, ring + idx * 16, cyc & 0x1) == 0) {
                         kprintln("hid: an endpoint reset but its dequeue pointer would not move", 61);
                     } else {

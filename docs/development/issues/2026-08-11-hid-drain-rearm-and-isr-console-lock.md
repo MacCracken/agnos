@@ -27,7 +27,13 @@ against an ordinary kernel, as its own header admitted); the dead `hid_mouse_seq
 MSI-X arm was moved below `msc_enumerate()`; and `hid-halt-oracle-test.py` was added to the harness
 README, where its absence made it undiscoverable.
 
-🟠 **STILL OPEN — 13 items, and the headline one is a HARDWARE PROCEDURE, not code.** The
+✅ **1.57.1 ALSO FIXED RESIDUAL #2 — the torn `hid_row_idx`/`hid_row_cycle` read.** The ISR resets
+idx and flips cycle in the same breath, so two unlocked loads could catch a torn pair and point
+Set-TR-Dequeue at a wrong-cycle TRB — re-killing the endpoint the recovery was called to save. Now a
+bounded seqlock-style retry (64 attempts, then proceed on the last sample: no worse than the
+unguarded read it replaces, and a spin would hang a recovery path).
+
+🟠 **WHAT IS LEFT IS THE BURN AND ITS PREREQUISITE, and neither is a deferral of convenience.** The
 Reset-Endpoint / Set-TR-Dequeue pair has still never executed anywhere, and the burn that would
 exercise it has now slipped **three cuts** (1.56.58, .59, .60, 1.57.0 all shipped without it).
 ⛔ Two unfixed things sit directly in that untested path: residual #2's torn `hid_row_idx` /

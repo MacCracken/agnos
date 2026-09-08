@@ -211,7 +211,12 @@ rc=0
 #   catch a helper that keeps PRINTING each gate's label while no longer COUNTING anything, because
 #   bigate prints "G1 ...: PASS" outside the loop that computes it, so emptying the loop leaves the
 #   line count untouched. Only an `n_pass == 0` floor INSIDE the oracle sees that one; putting it in
-#   the other seventeen .cyr files is a separate bite and is filed as one.
+#   the other seventeen .cyr files is a separate bite. ⛔ 1.57.1 — THIS LINE SAID IT WAS "filed as
+#   one" AND IT WAS NOT: no issue named it, so the claim itself was the only record, and a claim that
+#   something is tracked is worse than silence — it stops the next reader from filing it. It is now
+#   genuinely tracked, under the tests/*/ vacuity surface in
+#   docs/development/issues/2026-09-02-vacuous-gates-sweep.md. Only `tests/gpu/cpuref.cyr` carries
+#   the in-oracle floor today; the other seventeen do not.
 #
 # ⚠ THE NUMBERS ARE MEASURED, NOT CHOSEN. Each floor is two-thirds of the non-blank output its oracle
 #   emitted on this tree on 2026-09-02, freshly built by this very loop — a third of the volume left

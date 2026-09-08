@@ -29,6 +29,14 @@ import os, subprocess, sys, time, socket, tempfile, shutil
 ROOT    = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 GNOBOOT = os.path.join(ROOT, "../gnoboot/build/BOOTX64.EFI")
 AGNOS   = os.path.join(ROOT, "build/agnos")
+
+# ⛔ 1.57.1 — REFUSE A STALE KERNEL. This harness resolved build/agnos as a PATH and never
+# checked it was current, so an edited-but-not-rebuilt kernel scored green having asserted
+# nothing new. Every harness here exists to test KERNEL behaviour, so this is the half that
+# matters most. See scripts/harness/_freshness.py for the measurement that produced it.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _freshness import refuse_stale_kernel
+refuse_stale_kernel(ROOT)
 LOG     = os.path.join(ROOT, "build/hid-halt-oracle.log")
 MON     = "/tmp/agnos-hidhalt.sock"
 

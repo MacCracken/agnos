@@ -16,9 +16,13 @@ lives there is not speculation: `tests/telemetry/tlm.cyr` §3 was asserting the 
 downstream consumer under that green gate** — found by the chakshu work, not by any sweep. 18 of the
 67 have an external line-count floor; the remaining ~49 have no floor of any kind.
 
-⚠ **`host-gpu-oracles.sh` claims the in-oracle `n_pass == 0` floor for 17 GPU oracles is "filed as
-one". It is filed NOWHERE.** Either add the floors (mirroring `tests/gpu/cpuref.cyr`, the only one
-that has it) or delete the false claim from that comment.
+✅ **1.57.1 — the false "filed as one" claim is corrected in `host-gpu-oracles.sh`, and the work is
+now genuinely tracked HERE.** A comment asserting something is tracked, when nothing tracks it, is
+worse than silence: it stops the next reader from filing it. 🟠 **STILL OPEN:** the in-oracle
+`n_pass == 0` floor for the other **17** GPU oracles. `tests/gpu/cpuref.cyr` is the only one that has
+it. The external line-count floors this script applies cannot see a helper that keeps PRINTING each
+gate label while no longer COUNTING anything — only an in-oracle floor sees that. 17 files, each
+structured differently; this is part of the `tests/*/` surface below, not separable from it.
 
 ✅ **1.57.1 closed the three llvm-mc skip paths** (`texl-body-identity.sh`, `texbi-body-identity.sh`,
 `texl-cm-derive.py`): all three exited 0 with the dword-comparison stage never run, so an LLVM-less
