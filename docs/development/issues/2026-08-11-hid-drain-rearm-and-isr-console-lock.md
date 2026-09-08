@@ -33,7 +33,11 @@ Set-TR-Dequeue at a wrong-cycle TRB — re-killing the endpoint the recovery was
 bounded seqlock-style retry (64 attempts, then proceed on the last sample: no worse than the
 unguarded read it replaces, and a spin would hang a recovery path).
 
-🟠 **WHAT IS LEFT IS THE BURN AND ITS PREREQUISITE, and neither is a deferral of convenience.** The
+🟠 **WHAT IS LEFT IS THE BURN — AND ONLY THE BURN. Its prerequisites are done.**
+⚠ **This paragraph previously said the prerequisites were outstanding, and a cut shipped while it
+still did.** Residual #2 (the torn `hid_row_idx`/`hid_row_cycle` read) landed at 1.57.1 and residual #3
+(the owed==16 / KBD-branch / Link-wrap coverage) landed after it, mutation-proven four ways. Do not
+read the paragraph below as a live blocker; it is kept for the history of what the burn is for. The
 Reset-Endpoint / Set-TR-Dequeue pair has still never executed anywhere, and the burn that would
 exercise it has now slipped **three cuts** (1.56.58, .59, .60, 1.57.0 all shipped without it).
 ⛔ Two unfixed things sit directly in that untested path: residual #2's torn `hid_row_idx` /
@@ -46,7 +50,8 @@ command sequence and an unfixed race at the same moment.
 ⛔ **THE 1.56.58 IRON SLOT PASSED WITHOUT THE BURN.** That CHANGELOG section carries no HID entry, so
 the gate is **UNSLOTTED at 1.56.59**, not scheduled. This file said "roadmapped for 1.56.58".
 
-⭐ **THREE RESIDUALS ARE ACTIONABLE IN-TREE, AND NONE IS THE WITHDRAWN STUB SEAM:**
+⭐ **THREE RESIDUALS WERE ACTIONABLE IN-TREE — ALL THREE ARE NOW CLOSED (#1 at 1.56.59, #2 and #3
+post-1.57.1). NOTHING IN-TREE REMAINS; what is left is the burn itself.** None was the withdrawn stub seam:
 1. ✅ **THE SILENT EARLY-OUT — CLOSED AT 1.56.59. THE BURN NOW HAS AN ORACLE.** `hid_recover_halted`
    cleared `hid_ep_needs_reset` before the EP-state check with no else branch, so a provoked halt whose
    state read came back non-Halted left **zero trace** — and "no stall reached us" and "a stall did and
@@ -80,9 +85,27 @@ the gate is **UNSLOTTED at 1.56.59**, not scheduled. This file said "roadmapped 
    `hid_row_idx`/`hid_row_cycle` as two UNLOCKED loads from thread context, while the ISR's wrap resets
    idx to 0 and flips cycle in the same breath (`hid.cyr:148-149`, `:890-905`) — an interleaving hands
    `xhci_cmd_set_tr_dequeue` a torn (idx, cycle) pair and the endpoint stays dead.
-3. **The gate covers less than this file claims.** `hid_reclaim_selftest` registers a MOUSE row
-   (`hid.cyr:1303`) and asserts owed==1 (`:1332-1350`). The 1.56.56 fix owes **16** on what is in
-   practice a KEYBOARD row, so neither the owed==16 loop nor the KBD branch is exercised anywhere.
+3. ✅ **CLOSED — the gate now covers what this file claims.** It registered a MOUSE row and asserted
+   owed==1, while the 1.56.56 fix owes **16** on a KEYBOARD row — so neither the owed==16 loop nor the
+   KBD branch ran anywhere. Two new arms in `hid_reclaim_selftest`:
+   * **ARM 5 — owed==16 on the KBD branch.** ⛔ And the KBD branch is a DIFFERENT CODE PATH, which is
+     the trap that made a first attempt at this arm wrong: `hid_row_arm` dispatches on kind, and a KBD
+     row goes to `hid_arm_xfer_trb()`, which writes the **kbd globals**, not `hid_ep_ring[i]`. A test
+     asserting on the ROW state passes a kernel that armed nothing — the same decoy that had
+     `hid_recover_halted` reading `hid_ep_idx` on a keyboard row and seeing 0/1 forever. The arm now
+     asserts on the kbd globals AND that the row index did NOT move, checks all 16 TRBs for IOC/type
+     (so "armed 1 and looped 16 times over one slot" cannot pass), and saves/restores every kbd global.
+   * **ARM 6 — the Link-TRB wrap, BOTH paths.** The old ring holds 32 TRBs and both paths wrap at
+     idx==255, so the branch was PHYSICALLY unreachable; a new 256-TRB scratch ring reaches it. The two
+     paths wrap DIFFERENTLY and both are covered: `hid_arm_row_trb` (mouse) writes the Link TRB itself
+     with type + Toggle Cycle; `hid_arm_xfer_trb` (kbd) only aligns the cycle bit of a Link TRB
+     `hid_kbd_configure` already placed. Testing one would have left the other unproven.
+   * ⭐ **MUTATION-PROVEN, four ways.** `hid_service_rearms` arming 1 instead of `owed` → *"did not arm
+     all 16 TRBs"*; `hid_row_arm` losing its KBD branch → *"used the row ring, not the kbd ring"*;
+     the mouse wrap disabled → *"mouse path: the ring did not wrap to index 0"* + no Link TRB written;
+     the kbd wrap disabled → *"kbd path: the ring did not wrap"* + the Link cycle did not follow.
+     Baseline and restored both PASS.
+   * ⚠ Costs a 4 KB scratch ring, present only in `HID_RECLAIM_SELFTEST` builds.
 
 ✅ **FIXED 1.56.56 — both defects, by one change.** `hid_recover_halted` no longer arms inline. It bumps
 `hid_ep_rearm[i]` by **16** and lets `hid_service_rearms` do the ring work under `hid_poll_lock`:

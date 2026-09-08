@@ -1419,6 +1419,15 @@ fn hid_poll() {
 var hidrcl_evt[8];     # synthetic event ring: 64 B = 4 TRBs; the test posts 1 and stops on the 2nd
 var hidrcl_ring[64];   # synthetic transfer ring: 512 B = 32 TRBs; the arm walks idx 0 -> 1 only
 var hidrcl_buf[8];     # report-buffer address the arm writes into the TRB; never DMAed
+# 1.57.1 — ARM 5/6 scratch. Separate rows and rings so the owed==16 and wrap arms cannot disturb the
+# idx/cycle state arms 1-4 assert on.
+var hidrcl_kring[64];  # KBD row's ring: 512 B = 32 TRBs — enough to hold all 16 the fix owes
+var hidrcl_kbuf[8];
+# ⛔ 256 TRBs (4096 B), and the SIZE IS THE POINT: hid_arm_row_trb wraps at idx == 255, so the 32-TRB
+# ring above is PHYSICALLY TOO SMALL to ever reach the Link TRB. That is exactly why the wrap has
+# never been exercised anywhere. Only present in HID_RECLAIM_SELFTEST builds.
+var hidrcl_wring[512];
+var hidrcl_wbuf[8];
 var hidrcl_db[8];      # doorbell landing pad — see the bias note above
 fn hid_reclaim_selftest() {
     var fail = 0;
@@ -1539,9 +1548,139 @@ fn hid_reclaim_selftest() {
         fail = 1;
     }
 
+    # --- ARM 5: owed == 16 ON THE KBD BRANCH — the depth AND the branch recovery actually uses ---
+    # ⛔ WITHOUT THIS THE GATE COVERED LESS THAN THE RECORD CLAIMED. Arms 1-4 register a MOUSE row and
+    # assert owed == 1. The 1.56.56 fix owes **16** — hid_recover_halted bumps by 16 precisely because
+    # a 1-deep interrupt-IN ring goes empty the moment polling pauses — and it does so on what is in
+    # practice a KEYBOARD row. So neither the owed==16 loop nor the KBD branch ran anywhere.
+    # ⛔⛔ AND THE KBD BRANCH IS A DIFFERENT CODE PATH, WHICH IS THE WHOLE TRAP. hid_row_arm dispatches
+    # on kind: a KBD row goes to hid_arm_xfer_trb(), which writes the **kbd globals**
+    # (hid_kbd_xfer_ring/_idx/_cycle), NOT hid_ep_ring[i]/hid_ep_idx[i]. A test that asserted on the
+    # ROW state would pass a kernel that armed nothing at all — the same decoy that had
+    # hid_recover_halted reading hid_ep_idx on a keyboard row and seeing 0/1 forever.
+    # ⚠ Safe to borrow the kbd globals here: this selftest runs BEFORE USB init (core/main.cyr), so
+    # they are still at their declared defaults, and every one is saved and restored below.
+    var sv_kring = hid_kbd_xfer_ring;
+    var sv_kbuf  = hid_kbd_report_buf;
+    var sv_kidx  = hid_kbd_xfer_idx;
+    var sv_kcyc  = hid_kbd_xfer_cycle;
+    var sv_kmps  = hid_kbd_ep_mps;
+    var krow = hid_ep_register(slot, 0x81, HidKind.HID_KIND_KBD, &hidrcl_kring, &hidrcl_kbuf, 8);
+    if (krow < 0) {
+        kprintln("hidrcl: could not register the synthetic KBD row - VOID, not a pass", 67);
+        fail = 1;
+    } else {
+        hid_kbd_xfer_ring  = &hidrcl_kring;
+        hid_kbd_report_buf = &hidrcl_kbuf;
+        hid_kbd_xfer_idx   = 0;
+        hid_kbd_xfer_cycle = 1;
+        hid_kbd_ep_mps     = 8;
+        store64(&hid_ep_rearm + krow * 8, 16);
+        hid_service_rearms();
+        if (load64(&hid_ep_rearm + krow * 8) != 0) {
+            kprintln("hidrcl: owed 16 was not paid off on the KBD row", 47);
+            fail = 1;
+        }
+        if (hid_kbd_xfer_idx != 16) {
+            kprintln("hidrcl: the KBD branch did not arm all 16 TRBs", 46);
+            fail = 1;
+        }
+        # ⚠ The ROW index must stay 0: if it moved, hid_row_arm took the MOUSE path for a KBD row and
+        # the real keyboard's ring would never have been armed at all.
+        if (load64(&hid_ep_idx + krow * 8) != 0) {
+            kprintln("hidrcl: the KBD arm used the row ring, not the kbd ring", 55);
+            fail = 1;
+        }
+        # ⚠ EVERY one of the 16, not just the first: "armed 16" and "armed 1 and looped over the same
+        # slot 16 times" are different bugs and an index check alone cannot separate them.
+        var k = 0;
+        var kbad = 0;
+        while (k < 16) {
+            var kc = load32(&hidrcl_kring + k * 16 + 12);
+            if ((kc & 0x20) == 0) { kbad = kbad + 1; }
+            if (((kc >> 10) & 0x3F) != XHCI_TRB_NORMAL) { kbad = kbad + 1; }
+            k = k + 1;
+        }
+        if (kbad != 0) {
+            kprintln("hidrcl: some of the 16 KBD TRBs are malformed (IOC/type)", 56);
+            fail = 1;
+        }
+    }
+
+    # --- ARM 6: THE LINK-TRB WRAP, BOTH PATHS — never reached by any test before 1.57.1 ----------
+    # Both arming paths wrap at idx == 255, and the selftest ring above holds 32 TRBs, so that branch
+    # was PHYSICALLY unreachable. A ring that fails to toggle stalls the endpoint the moment it wraps
+    # — the same dead-input symptom this whole arc is about, just 255 reports later.
+    # ⚠ THE TWO PATHS WRAP DIFFERENTLY and both are covered: hid_arm_row_trb (mouse) WRITES the Link
+    # TRB itself, type + Toggle Cycle + cycle; hid_arm_xfer_trb (kbd) only adjusts the cycle bit of a
+    # Link TRB hid_kbd_configure already placed. Testing one would leave the other unproven.
+    var wrow = hid_ep_register(slot, 0x82, HidKind.HID_KIND_MOUSE, &hidrcl_wring, &hidrcl_wbuf, 8);
+    if (wrow < 0) {
+        kprintln("hidrcl: could not register the wrap row - VOID, not a pass", 58);
+        fail = 1;
+    } else {
+        # 6a — MOUSE path. Start at 254 owing ONE: that single arm writes the last data TRB, trips the
+        # wrap, and lands at idx 0 with the cycle flipped — the exact transition, nothing else moving.
+        store64(&hid_ep_idx + wrow * 8, 254);
+        store64(&hid_ep_cycle + wrow * 8, 1);
+        store64(&hid_ep_rearm + wrow * 8, 1);
+        hid_service_rearms();
+        if (load64(&hid_ep_idx + wrow * 8) != 0) {
+            kprintln("hidrcl: mouse path: the ring did not wrap to index 0", 52);
+            fail = 1;
+        }
+        if (load64(&hid_ep_cycle + wrow * 8) != 0) {
+            kprintln("hidrcl: mouse path: the cycle bit did not flip at the wrap", 58);
+            fail = 1;
+        }
+        var lctl = load32(&hidrcl_wring + 255 * 16 + 12);
+        if (((lctl >> 10) & 0x3F) != XHCI_TRB_LINK) {
+            kprintln("hidrcl: mouse path: no Link TRB was written at slot 255", 55);
+            fail = 1;
+        }
+        if ((lctl & 0x2) == 0) {
+            kprintln("hidrcl: mouse path: the Link TRB has no Toggle Cycle bit", 56);
+            fail = 1;
+        }
+
+        # 6b — KBD path, on the same 256-TRB ring. It does NOT write the Link TRB; it expects one to
+        # exist and only aligns its cycle bit with the producer. Seed the Link TRB as
+        # hid_kbd_configure would, with cycle 0, and require the arm to flip it to 1.
+        hid_kbd_xfer_ring  = &hidrcl_wring;
+        hid_kbd_report_buf = &hidrcl_wbuf;
+        hid_kbd_xfer_idx   = 254;
+        hid_kbd_xfer_cycle = 1;
+        store32(&hidrcl_wring + 255 * 16 + 12, (XHCI_TRB_LINK << 10) | 0x2);
+        store64(&hid_ep_rearm + krow * 8, 1);
+        hid_service_rearms();
+        if (hid_kbd_xfer_idx != 0) {
+            kprintln("hidrcl: kbd path: the ring did not wrap to index 0", 50);
+            fail = 1;
+        }
+        if (hid_kbd_xfer_cycle != 0) {
+            kprintln("hidrcl: kbd path: the cycle bit did not flip at the wrap", 56);
+            fail = 1;
+        }
+        if ((load32(&hidrcl_wring + 255 * 16 + 12) & 0x1) != 1) {
+            kprintln("hidrcl: kbd path: the Link TRB cycle did not follow the producer", 64);
+            fail = 1;
+        }
+    }
+    hid_kbd_xfer_ring  = sv_kring;
+    hid_kbd_report_buf = sv_kbuf;
+    hid_kbd_xfer_idx   = sv_kidx;
+    hid_kbd_xfer_cycle = sv_kcyc;
+    hid_kbd_ep_mps     = sv_kmps;
+
     # --- teardown: pay off the debt, drop the row, restore every swapped global ----------------
     store64(&hid_ep_rearm + row * 8, 0);
-    hid_ep_count = hid_ep_count - 1;
+    # ⛔ 1.57.1 — THREE ROWS NOW, NOT ONE. Arms 5 and 6 each register their own row (KBD-owed-16 and
+    # the wrap ring), so leaving hid_ep_count at -1 would strand two synthetic rows in the live table
+    # and the real keyboard would bind at index 3 with two phantom endpoints polled ahead of it.
+    # Clear their owed counters too — hid_service_rearms would otherwise arm into freed scratch.
+    if (krow >= 0) { store64(&hid_ep_rearm + krow * 8, 0); }
+    if (wrow >= 0) { store64(&hid_ep_rearm + wrow * 8, 0); }
+    hid_ep_count = hid_ep_count - 3;
     hid_stolen_events   = saved_stolen;
     xhci_mmio_base      = saved_mmio;
     xhci_evt_ring_phys  = saved_phys;
