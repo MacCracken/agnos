@@ -597,15 +597,6 @@ for (var s = 1; s <= 64; s = s + 1) {
 # mouse binder skips SET_CONFIGURATION instead of resetting the keyboard's endpoint out from under it.
 hid_mouse_enumerate();
 
-# 1.53.7 — the keyboard is now enumerated + configured, so ARM the xHCI RX MSI-X vector
-# (0x51) for interrupt-driven input. Deferred to here (post hid_kbd_configure) so the
-# xhci_rx_handler's hid_poll can't steal EP0 Transfer Events from xhci_wait_transfer_event
-# during the control transfers above. No-op if no keyboard was found — the box then stays
-# on the 100 Hz tick drain (timer_handler's fallback hid_poll).
-if (hid_kbd_slot_id != 0) {
-    pci_msix_arm_vector0(xhci_pci_idx, 0x51);
-}
-
 # USB Mass Storage Phase 1 (1.31.2 storage arc — discovery only). Walks
 # every addressed xHCI slot, matches the MSC-BBB class triple
 # (0x08/0x06/0x50) on each interface, captures bulk-IN + bulk-OUT
@@ -614,6 +605,23 @@ if (hid_kbd_slot_id != 0) {
 # CAPACITY) + Phase 4 (READ(10) / WRITE(10) + block-layer registration)
 # follow under the same 1.31.2 cycle.
 msc_enumerate();
+
+# 1.53.7 — the keyboard is enumerated + configured, so ARM the xHCI RX MSI-X vector (0x51) for
+# interrupt-driven input. No-op if no keyboard was found — the box then stays on the 100 Hz tick
+# drain (timer_handler's fallback hid_poll).
+#
+# ⛔ 1.57.1 — MOVED BELOW msc_enumerate(), AND THE OLD COMMENT WAS WRONG ABOUT WHY IT SAT ABOVE IT.
+# It read "deferred to here ... so xhci_rx_handler's hid_poll can't steal EP0 Transfer Events from
+# xhci_wait_transfer_event DURING THE CONTROL TRANSFERS ABOVE" — but msc_enumerate() ran BELOW the
+# arm and issues its own xHCI commands, so the very window the comment claimed to close was left
+# open on the other side. Arming after every boot-time enumeration closes it for real.
+# ⚠ The PERMANENT half of that hazard is separately fixed: all four event-ring waiters now hand HID
+# Transfer Events back via hid_reclaim_event (the fourth, xhci_cmd.cyr's, was corrected in 1.57.1),
+# so a stolen event no longer costs an armed TRB forever. What this move removes is the residue — a
+# keystroke dropped inside the boot-probe window.
+if (hid_kbd_slot_id != 0) {
+    pci_msix_arm_vector0(xhci_pci_idx, 0x51);
+}
 
 # Initialize IOMMU if DMAR table found (S10: restrict DMA)
 if (acpi_iommu_base != 0) {
@@ -3455,9 +3463,12 @@ fn fork_disk_selftest() {
     proc_set_ring3(fpid);
     proc_set_state(fpid, 1);
     var fsp = 0;
+    # 1.57.1 — arch_wait() per iteration (sti hoisted): this blocks waiting on a child, so its
+    # halts are not this process's CPU time. Same treatment as smp_wait_ticks.
+    asm { sti; }
     while (fsp < 4000) {
         if (proc_get_state(fpid) == 0) { break; }
-        asm { sti; hlt; }
+        arch_wait();
         fsp = fsp + 1;
     }
     if (proc_get_state(fpid) != 0) { kprintln("fork: /bin/forker never exited (timeout)", 40); return 0; }

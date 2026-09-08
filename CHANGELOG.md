@@ -20,6 +20,125 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.1] — 2026-09-08 — backlog closeout: 21 items across six issue files
+
+### Changed — cyrius pin 6.6.0 -> 6.6.1
+
+- All **12** manifests plus sibling **klug**; `toolchain-pin-check` 12/12. Kernel builds clean.
+
+### Fixed — chakshu's AP-idle report (issue closed and archived)
+
+- ⭐ **The AP idle park was the one halt site outside `arch_wait()`**, so `cpu_in_halt` was never set
+  for cores 1..3 and the 1.56.60 halt guard could not fire for them. Every idle tick on those cores
+  was charged to that core's idle kthread: a wholly idle 4-core box rendered as **three rows at ~33%
+  and ~75% aggregate busy**. Now `while (1 == 1) { arch_wait(); }`.
+- **The suggested sweep found two more**, both genuine timed blocks: `smp_wait_ticks()` and the
+  fork-selftest's wait-for-child loop. `sti` hoisted out of each loop so the enter-and-exit-with-IF=1
+  contract survives.
+- ⛔ **Two sites deliberately left as bare `hlt`, one of which must NEVER be "fixed":** the
+  out-of-range APIC-id park — `pcpu_cpu()` clamps ids ≥ 4 to **0**, so routing it through
+  `arch_wait()` would set and clear **the BSP's** flag and suppress tick charging on the boot
+  processor — and the two dying-process tails, which are terminal and mis-charge at most one tick to
+  a slot about to be reaped. Both now carry ⛔ comments so the next sweep does not complete them.
+- **New `tlm.cyr` §4d, mutation-proven**: sums ticks across every slot that is not the caller across a
+  block, and requires the delta under 15. Baseline **95** → mutant **69** → restored **95**.
+  ⚠ **Correction to the filing:** `telemetry-test.py` was never single-vCPU — it has passed `-smp 4`
+  all along. The gate was blind because no assertion looked at the other cores.
+- ⛔ **No idle field or halted-tick counter was added**, as requested. The residue between the two
+  existing halt-asymmetric counters already is idle time; a third counter would carry information the
+  first two encode.
+
+### Fixed — kernel defects from the P-1 audit backlog
+
+- ⭐ **`virtio_net` computed an MSI-X table base from an unchecked `pci_bar_64`**, then did four
+  `store32`s into it. With `bar == 0` that collapses to a device-chosen offset as an absolute
+  physical address — where **0x1000/0x2000/0x3000 are the boot PML4/PDPT/PD**. Guarded, matching
+  `pci.cyr`. (Filed under `pci.cyr`'s name, which is why two prior passes re-derived it here.)
+- ⭐ **`xhci_cmd_wait` — the FOURTH event-ring waiter — discarded HID Transfer Events** with no
+  `hid_reclaim_event`, so the owning interrupt-IN ring was never re-armed; sixteen swallowed
+  completions empty the 16-deep ring and input freezes with the CPU alive. **Live, not theoretical:**
+  `main.cyr` calls `msc_enumerate()` through this waiter with the keyboard already armed. The false
+  comment that made it look intentional ("later phases will route") is deleted.
+- **exFAT had NO chain guard at all** — no range check, no self-reference check — so a malformed
+  volume walked to an arbitrary cluster and every caller turned that into an out-of-range LBA read.
+  Given the two guards FAT already had. ⚠ Multi-node cycles remain unguarded on both filesystems.
+- **NVMe/block 4Kn stride**: three multi-sector loops still strode a hardcoded 512, so on a 4096 B/LBA
+  device the second iteration overwrote 3584 bytes of the first.
+- **`blk_rw_armed` is now cleared on process exit.** `blk_close_sys` disarmed; the exit path did not,
+  so a process that armed raw disk write and then died left the gate open for whatever ran next.
+- **`msc.cyr` and `virtio_blk.cyr` took no lock anywhere** while reachable concurrently under SMP —
+  one virtqueue, one bulk ring, one shared bounce buffer. Added `vblk_lock`/`msc_lock` as sibling
+  leaves at nvme/ahci rank, recorded in the lock-order table. ⚠ `vblk_blk_read_sectors` is
+  deliberately unlocked: it composes `vblk_blk_read`, and a same-CPU re-acquire deadlocks.
+- **The MSI-X arm moved below `msc_enumerate()`** — its old comment justified the ordering with
+  "during the control transfers above" while `msc_enumerate` ran below it, leaving open the very
+  window the comment claimed to close. Dead `hid_mouse_seq` deleted (advertised a ring-3 capability
+  present in no syscall).
+
+### Fixed — gates that could not fail
+
+- ⭐ **`console-line-smoke.sh`, a SCORED SWEEP GATE, booted a fossil.** It built its image only when
+  ABSENT, so `run_gate` rebuilt `build/agnos` and then scored an image made from a different kernel —
+  a full day of drift, measured. Now rebuilds when the kernel is newer.
+- **Three llvm-mc skip paths exited 0**, degrading the dword-comparison stage to an invisible skip on
+  an LLVM-less host while reporting full coverage. Now exit 2 (VOID), matching `shader-crossasm.sh`.
+  ⚠ Verified both ways: success still exits 0, and a PATH without llvm-mc yields rc=2 on all three.
+- **`chan-ring3-smoke.sh` inherited whatever was in `build/agnos`** — its existence check caught
+  ABSENT, never STALE. Now builds its own kernel.
+- **`launcher-panel-test.py` copied its base image once and never again** — 21 days stale. Now
+  re-copies on staleness; the bogus second path clause is dropped.
+- **`mountlist-test.py` and `readdir-at-test.py` — the two harnesses that produced ship evidence for
+  1.56.59/1.56.60 — had no freshness guard at all.** Added.
+- ⭐ **The freshness template changed**: `telemetry-test.py`'s guard watched `tlm.cyr` alone, so a pin
+  change (which rewrites the vendored `lib/`) left a binary from a different compiler scoring fresh.
+  All guards now watch **every build input** — `*.cyr`, `lib/*.cyr`, `cyrius.cyml`.
+- **`hid-cc-inject-test.py` never asserted it got the flag-gated kernel** it requires — its own header
+  said a green run against a normal kernel means nothing. It now witnesses a new `CC INJECTION ARMED`
+  banner (a *different* string from the one it asserts) and exits 2 without it.
+- **`HID_CC_INJECT` and `HID_CC_INJECT_HALT` are now mutually exclusive** in `scripts/build.sh`. Both
+  wrote `hid_cc_inject_left`; the non-halting one ran second and silently overwrote ccode 6 with 2,
+  neutering the halt injection while "HALT INJECTION ARMED" still printed.
+
+### Documentation — five documents were describing this backlog wrongly
+
+- **The in-source banner above `hid_recover_halted` told the next author the capability did not exist**
+  and to hand-modify a line number — while `HID_CC_INJECT_HALT` ships 190 lines below it in the same
+  file. Corrected; rotted line references replaced with function names.
+- **`agnos-userland-abi.md` §4.4 said a length-taking `sysinfo` overload was pending upstream.** It
+  shipped in **cyrius 6.5.45**; `sys_sysinfo_n(out, len)` plus the named band accessors have existed
+  since, and `lib/sys.cyr` is byte-identical 6.5.45 → 6.6.1. As written it sent consumers to hand-roll
+  a raw syscall and compute band offsets by hand.
+- **`state.md` said "TWO OPEN ISSUES"** while the folder held six, and called the HID fix "UNGATED"
+  when its oracle shipped at 1.56.59. **`roadmap.md`** carried a `▶ 1.56.58 — item #1` heading four
+  cuts in the past, plus a duplicate row with line refs rotted by ~60 lines. **`doc-health.md`**
+  repeated the UNGATED claim. All corrected.
+- **`hid-halt-oracle-test.py` was absent from the harness README** — the gate that closed HID
+  residual #1 and the instrument that makes the roadmapped burn falsifiable, undiscoverable from the
+  index. Added.
+- ⛔⛔ **SAFETY-CRITICAL ISSUE CORRECTION.** The agnoshi filing claimed `is_privileged_command` was
+  dead code and implied deleting it. **That symbol never existed** — the real classifier is
+  `is_admin_command`, and it is fully live. Acting on the issue's authority would have deleted the
+  power-verb entries and silently downgraded `reboot`/`shutdown`/`poweroff`/`halt` from ADMIN to the
+  USER_WRITE fallthrough on the paths that *do* classify them. Corrected in place.
+- **All five remaining issue files had status text that would let them archive cleanly with live
+  items under them** — the inverse of the `#98` failure, and more dangerous because they read nearly
+  done. Headers rewritten with honest open-counts; the p1-audit tally, which disagreed with itself in
+  two places, reconciled to one number.
+
+### Known-unfixed, stated plainly
+
+- ⛔ **Eleven of these fixes have NO GATE and can get none from the current substrate** (no zero-BAR
+  device, no 4Kn device, no malformed FAT/exFAT image, no second USB controller path, and so on).
+  Those were **fixed by reading, not by measurement**, and are marked as such.
+- **Genuinely large and NOT done:** the aarch64 port (32 undefined fns + 46 vars and growing — the
+  `arch_wait` stub added at 1.56.60 itself calls an undefined `pcpu_cpu`); FAT/exFAT multi-node cycle
+  counters (31 walk sites); the HID iron burn (a hardware procedure, now slipped three cuts); the
+  `tests/*/` vacuity sweep (67 exercisers, never swept); harness freshness across the remaining ~24.
+- **Cross-repo, filed not fixed:** five agnoshi items. That tree is clean at a commit predating the
+  filing — nothing there could have been fixed by the agnos-side shutdown work, and nothing was.
+- **Eight items need an operator ruling** and are named in their issue files rather than guessed at.
+
+
 ## [1.57.0] — 2026-09-07 — onto the cyrius 6.6 line
 
 ### Changed — cyrius pin 6.5.45 -> 6.6.0

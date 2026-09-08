@@ -1526,19 +1526,30 @@ fn msc_write_lba(slot_id, lun, lba, count, buf_phys) {
 # registration — out of Phase 4 scope; the typical archaemenid topology
 # is one USB device at a time during bring-up.
 
+# ⛔ 1.57.1 — msc_lock BRACKETS THE BULK RING AND THE PER-SLOT ROW SCRATCH. USB-MS took NO LOCK
+# ANYWHERE while reachable concurrently under SMP: every entry point drives the SINGLE bulk ring and
+# writes the same per-slot row scratch, so two CPUs interleaved CBW/data/CSW phases on one endpoint
+# pair — a torn transfer, not merely a slow one. Rank is nvme's (lock-order table in
+# arch/x86_64/smp.cyr): a leaf under fs_lock.
+# ⚠ These four entry points do NOT call each other — msc_blk_read_sectors goes straight to
+# msc_read_lba, not through msc_blk_read — so every one can lock without a same-CPU re-acquire.
+# Verified before writing; if that ever changes, the composing one must drop its lock (see the
+# vblk_blk_read_sectors note in core/virtio_blk.cyr).
 fn msc_blk_read(sector, buf) {
     if (msc_first_slot == 0) { return 0 - 1; }
-    if (msc_read_lba(msc_first_slot, 0, sector, 1, buf) == 0) {
-        return 0 - 1;
-    }
+    msc_spin_lock();
+    var rr = msc_read_lba(msc_first_slot, 0, sector, 1, buf);
+    msc_spin_unlock();
+    if (rr == 0) { return 0 - 1; }
     return 0;
 }
 
 fn msc_blk_write(sector, buf) {
     if (msc_first_slot == 0) { return 0 - 1; }
-    if (msc_write_lba(msc_first_slot, 0, sector, 1, buf) == 0) {
-        return 0 - 1;
-    }
+    msc_spin_lock();
+    var wr = msc_write_lba(msc_first_slot, 0, sector, 1, buf);
+    msc_spin_unlock();
+    if (wr == 0) { return 0 - 1; }
     return 0;
 }
 
@@ -1558,9 +1569,10 @@ fn msc_blk_flush() {
     var k = 0;
     while (k < 16) { store8(cdb_p + k, 0); k = k + 1; }
     store8(cdb_p + 0, 0x35);                            # SYNCHRONIZE CACHE(10)
-    if (msc_scsi_exec(msc_first_slot, 0, cdb_p, 10, 0, 0, 0, 1) == 0) {
-        return 0 - 1;
-    }
+    msc_spin_lock();
+    var fe = msc_scsi_exec(msc_first_slot, 0, cdb_p, 10, 0, 0, 0, 1);
+    msc_spin_unlock();
+    if (fe == 0) { return 0 - 1; }
     return 0;
 }
 
@@ -1577,16 +1589,22 @@ fn msc_blk_read_sectors(start, count, buf) {
     var remaining = count;
     var cur_lba   = start;
     var cur_buf   = buf;
+    # ⚠ ONE LOCK ACROSS THE WHOLE CHUNK LOOP, not per chunk: the chunks are one logical transfer
+    # sequence on one bulk ring, and releasing between them would let another CPU interleave a CBW
+    # mid-run. Every failure exit inside the loop must unlock — there is one, below.
+    msc_spin_lock();
     while (remaining > 0) {
         var n = remaining;
         if (n > max_per_call) { n = max_per_call; }
         if (msc_read_lba(msc_first_slot, 0, cur_lba, n, cur_buf) == 0) {
+            msc_spin_unlock();
             return 0 - 1;
         }
         remaining = remaining - n;
         cur_lba   = cur_lba + n;
         cur_buf   = cur_buf + n * blk;
     }
+    msc_spin_unlock();
     return 0;
 }
 

@@ -4,13 +4,38 @@
 **Status:** 🟠 **OPEN — #1/#2 FIXED AND MEASURED. #3's two 1.56.56 defects ARE fixed in the tree, but its
 Reset-Endpoint / Set-TR-Dequeue body HAS STILL NEVER EXECUTED — and it is worse than "no stall has happened".**
 
-⛔⛔ **NO IN-TREE BUILD CAN EVEN SET THE FLAG.** Re-derived 2026-09-02 at 1.56.59: the shipped
-`HID_CC_INJECT` block forces `ccode = 2` and its own comment calls that "NOT a halting code"
-(`hid.cyr:1177`), while `hid_ep_needs_reset` is set only for 4/6/8 (`hid.cyr:1189-1192`). So the
-"proven reachable" evidence at `hid.cyr:1016-1017` rests on a **hand-modified build this tree does not
-contain**, and that in-code comment — which reads as if `HID_CC_INJECT=1` does it — will send the next
-author to run a flag that provably cannot reach the code they are testing. They will read the silence
-as "no stall occurred". That is a trap, not a stale line.
+⛔ **THAT "NO IN-TREE BUILD CAN EVEN SET THE FLAG" HEADER WAS TRUE WHEN WRITTEN AND IS NOW FALSE —
+struck 1.57.1.** It was contradicted by this file's own residual #1 fifteen lines below it *and* by
+the tree. `HID_CC_INJECT_HALT=1` ships: it injects **6**, DOES reach `hid_recover_halted`, is wired
+in `scripts/build.sh`, and its gate — `scripts/harness/hid-halt-oracle-test.py` — is mutation-proven
+and refuses to run against a kernel without the injector. The old header is preserved in the 1.56.59
+history below; do not restore it.
+
+*(For the record, the original claim: the shipped `HID_CC_INJECT` block forces `ccode = 2`, which is
+not a halting code, while `hid_ep_needs_reset` is set only for 4/6/8 — so that flag alone cannot
+reach the body. That half is still true, and is exactly why the second flag exists.)*
+
+✅ **1.57.1 also fixed the in-source trap this header was about**: the comment above
+`hid_recover_halted` still instructed the reader to hand-modify a line number for a capability that
+ships 190 lines below it. Corrected, with the rotted line references replaced by function names.
+
+✅ **1.57.1 further closed:** `HID_CC_INJECT` + `HID_CC_INJECT_HALT` are now mutually exclusive in
+`scripts/build.sh` (both wrote `hid_cc_inject_left`; the non-halting one ran second and silently
+neutered the halt injection while "HALT INJECTION ARMED" still printed); `hid-cc-inject-test.py` now
+witnesses a new `CC INJECTION ARMED` banner and exits 2 without it (it previously scored green
+against an ordinary kernel, as its own header admitted); the dead `hid_mouse_seq` was deleted; the
+MSI-X arm was moved below `msc_enumerate()`; and `hid-halt-oracle-test.py` was added to the harness
+README, where its absence made it undiscoverable.
+
+🟠 **STILL OPEN — 13 items, and the headline one is a HARDWARE PROCEDURE, not code.** The
+Reset-Endpoint / Set-TR-Dequeue pair has still never executed anywhere, and the burn that would
+exercise it has now slipped **three cuts** (1.56.58, .59, .60, 1.57.0 all shipped without it).
+⛔ Two unfixed things sit directly in that untested path: residual #2's torn `hid_row_idx` /
+`hid_row_cycle` read (the ISR resets idx and flips cycle in the same breath, so a torn pair resumes
+on a wrong-cycle TRB and RE-KILLS the device the recovery was called to save), and the Link-TRB wrap
+that the selftest's 32-TRB ring is physically too small to reach. **Fix residual #2 (small) and
+extend the selftest (medium) BEFORE the burn** — otherwise the first real stall exercises an unproven
+command sequence and an unfixed race at the same moment.
 
 ⛔ **THE 1.56.58 IRON SLOT PASSED WITHOUT THE BURN.** That CHANGELOG section carries no HID entry, so
 the gate is **UNSLOTTED at 1.56.59**, not scheduled. This file said "roadmapped for 1.56.58".

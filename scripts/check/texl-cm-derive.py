@@ -233,6 +233,10 @@ if have == text:
             shutil.rmtree(wd, ignore_errors=True)
     else:
         print("texl-cm-derive: (dword stage skipped -- llvm-mc/llvm-objcopy absent)")
+        # ⛔ 1.57.1 — VOID HERE, INSIDE THE SKIP BRANCH ONLY. Falling through to the success exit
+        # below scored a skipped dword stage as a green tick. Same reasoning as
+        # texl-body-identity.sh and texbi-body-identity.sh.
+        sys.exit(2)
     sys.exit(0)
 
 print("texl-cm-derive: FAIL -- tex_list_cm.s is NOT the declared derivation of tex_list.s")

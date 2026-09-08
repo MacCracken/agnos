@@ -87,6 +87,7 @@ type: state
 >
 > ✅ **`issues/`** — `open-ao-excl-flag` and `no-statfs-for-volume-capacity` both SHIPPED and archived
 > with resolution headers carrying their measured numbers and their mutation results.
+> ⚠ **1.57.1 CORRECTION — this block's "UNGATED" reading is wrong and was repeated downstream.** The halting-path oracle shipped at 1.56.59 (`HID_CC_INJECT_HALT=1` + `scripts/harness/hid-halt-oracle-test.py`, mutation-proven). What HID `#3` still lacks is an IRON BURN with a provoked stall, which is a hardware procedure. 13 items in that issue remain genuinely open — see its rewritten header.
 > ✅ **`issues/2026-08-11-hid-drain-rearm`** — both defects fixed; header records that the fix ships
 > **UNGATED** and why the cheap gate was refused. That is the honest state, not a hedge.
 >

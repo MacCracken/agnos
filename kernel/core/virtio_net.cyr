@@ -330,7 +330,19 @@ fn vnet_msix_enable_rx(idx) {
     var tob = pci_read32(bus, slot, func, msix_off + 4);
     var bir = tob & 0x07;
     var tbl_off = tob & 0xFFFFFFF8;
-    var tbl = pci_bar_64(idx, bir) + tbl_off;
+    # ⛔ 1.57.1 — GUARD THE BAR. `pci_bar_64` returns 0 for an unimplemented/unmapped BAR, and with
+    # bar == 0 this collapses to a DEVICE-CHOSEN OFFSET treated as an absolute physical address in
+    # the identity window — where physical 0x1000/0x2000/0x3000 are the boot PML4/PDPT/PD. The four
+    # store32s below would then rewrite the page tables the kernel is executing on.
+    # ⚠ The failure path already exists and is safe: this function returns -1 at the "no MSI-X cap"
+    # arm above and the caller falls back to the timer-tick drain.
+    # ⚠ Same check, same words, as core/pci.cyr's pci_msix_arm_vector0 — this is the THIRD site of
+    # that pattern and the audit filed it under pci.cyr's name, which is why two prior passes
+    # re-derived it here instead of finding it. The three sites are core/pci.cyr,
+    # core/virtio_net.cyr (this one) and the xHCI arm; fix them together or name all three.
+    var vnbar = pci_bar_64(idx, bir);
+    if (vnbar == 0) { return 0 - 1; }
+    var tbl = vnbar + tbl_off;
     store32(tbl + 0,  0xFEE00000);   # msg addr low — LAPIC, BSP, physical delivery
     store32(tbl + 4,  0);            # msg addr high
     store32(tbl + 8,  0x50);         # msg data — IDT vector 0x50, fixed delivery

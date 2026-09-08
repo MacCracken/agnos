@@ -266,7 +266,8 @@ fn net_rx_unlock() {
 # INERT single-core (the xchg always wins uncontended → byte-identical boot).
 #
 # GLOBAL LOCK ORDER (acquire low->high, never backwards):
-#   fs_lock < vfs_lock < proctab_lock < console_lock < nvme_lock < ahci_lock < heap_lock < pmm_lock
+#   fs_lock < vfs_lock < proctab_lock < console_lock < {nvme_lock, ahci_lock, vblk_lock, msc_lock} < heap_lock < pmm_lock
+#   (the four backend locks are SIBLING LEAVES at one rank — never take two at once; nothing does)
 # fs_lock is the OUTERMOST FS lock: an FS op that reads a block takes fs_lock, then
 # (inside, via blk_read_on) nvme_lock/ahci_lock, then (via kmalloc) heap_lock then
 # pmm_lock — all forward (fs < nvme/ahci < heap < pmm). console_lock sits between
@@ -298,6 +299,16 @@ var fs_lock = 0;
 var console_lock = 0;
 var nvme_lock = 0;
 var ahci_lock = 0;
+# ⛔ 1.57.1 — vblk_lock and msc_lock are LEAVES AT THE SAME RANK AS nvme_lock/ahci_lock. Both
+# backends were reachable concurrently under SMP through the same block-layer path the nvme audit
+# traced, and both took NO LOCK ANYWHERE: virtio_blk shares one virtqueue and msc shares the single
+# bulk ring plus its per-slot row scratch, so two CPUs in the block layer interleaved descriptor
+# writes and completion polls on one queue.
+# ⚠ RANK, NOT ALPHABETICAL ORDER: they sit above console_lock and below heap_lock, exactly like the
+# two above, so an FS op takes fs_lock then (inside blk_read_on) one of these, then heap/pmm — all
+# forward. Never acquire two backend locks at once; nothing does, and nothing should.
+var vblk_lock = 0;
+var msc_lock  = 0;
 fn fs_spin_lock() {
     var old = 1;
     while (old == 1) {
@@ -387,6 +398,53 @@ fn ahci_spin_unlock() {
     return 0;
 }
 
+# 1.57.1 — virtio_blk + USB-MS backend locks. Byte-identical to the ahci pair above (same xchg
+# spin, same frame offsets); the register contract is documented there.
+fn vblk_spin_lock() {
+    var old = 1;
+    while (old == 1) {
+        var addr = &vblk_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn vblk_spin_unlock() {
+    var addr = &vblk_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    return 0;
+}
+fn msc_spin_lock() {
+    var old = 1;
+    while (old == 1) {
+        var addr = &msc_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn msc_spin_unlock() {
+    var addr = &msc_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    return 0;
+}
+
 # AP entry point — called after the trampoline transitions to long mode.
 # AP entry — 1.44.18 originally WOKE + PARKED the AP (HISTORICAL; superseded by the
 # STEP-2 block below): it came online, reported in, and PARKED (no APIC timer, no sti) so a
@@ -426,6 +484,14 @@ fn ap_entry() {
     # state below, and pull REAL ready procs from sched_next (STEP-2). The 1.53.x FP arc B1 also
     # enables SSE per-AP here (fpu_enable() below). NOT inert — a live boot path on multi-core Zen.
     # ====================================================================================
+    # ⛔⛔ 1.57.1 — THIS ONE STAYS A BARE `hlt`. DO NOT "finish the sweep" by routing it through
+    # arch_wait() like the idle park below. `pcpu_cpu()` CLAMPS any cpu id >= 4 to **0**
+    # (arch/x86_64/syscall_hw.cyr), so a core parking here would set and clear `cpu_in_halt[0]` —
+    # the BSP's slot — and suppress tick charging on the boot processor for as long as it lived.
+    # That converts a harmless park into a silent, machine-wide accounting fault, which is strictly
+    # worse than the mis-attribution the guard exists to fix.
+    # ⚠ It is also unnecessary: this core has no per-CPU slot, is never scheduled, and parks here
+    # BEFORE the `sti` below — a bare IF=0 `hlt` never wakes, which is exactly the intent.
     if (my_id >= 4) { while (1 == 1) { asm { hlt; } } }   # out-of-range APIC id: park (no per-CPU slot)
     # TPR=0: accept all interrupt priorities on this AP's LAPIC.
     apic_write(0x80, 0);
@@ -464,7 +530,19 @@ fn ap_entry() {
     # sti + idle-yield loop. STEP-1 (smp_sched_aps==0): sched_next on this CPU returns only this
     # AP's own idle, so the AP idles forever (never picks a real proc). STEP-2 flips that.
     asm { sti; }
-    while (1 == 1) { asm { hlt; } }
+    # ⭐ 1.57.1 — arch_wait(), NOT a bare `hlt`. This is an AP's idle park and it was the ONE idle
+    # site outside arch_wait(), so `cpu_in_halt` was never set for cores 1..3 and pic.cyr's halt
+    # guard could not fire for them. Every idle tick on those cores was charged to whichever slot
+    # proc_current_get() named there — that core's idle kthread — so a wholly idle 4-core box
+    # rendered as three rows at ~33% and ~75% aggregate busy. Reported by chakshu v0.10.1, which
+    # works around it by summing only NAMED slots (the ELF loader names a slot; kernel threads and
+    # idle parks have none) — a workaround for a bug, not a design, and it stops working the day a
+    # kernel thread does real work worth reporting.
+    # ⚠ It also breaks chakshu's machine-wide busy% derivation, which is
+    #   Sum(per-process tick deltas) / (pooled per-core band delta), exploiting that the two
+    # counters are halt-asymmetric in opposite directions. AP idle time injected into the NUMERATOR
+    # makes that ratio wrong, so this line is load-bearing for a consumer that ships today.
+    while (1 == 1) { arch_wait(); }
     return 0;
 }
 
@@ -625,8 +703,14 @@ fn smp_wait_ticks(n) {
     # (hlt) on the timer, so leaving here with IF=0 would sleep them forever. (A trailing cli
     # was tried and did exactly that: ring3/thread smokes hung at their first arch_wait.)
     var t0 = timer_ticks;
+    # 1.57.1 — sti ONCE, then arch_wait() per iteration. This is a genuine timed block, the same
+    # class as sleep_ms#41, so its halts must be excluded from per-process CPU time too. Hoisting
+    # the sti preserves this function's documented contract of ENTERING and EXITING with IF=1
+    # (a trailing cli was tried once and hung every smoke at its first arch_wait); the timer ISR
+    # returns via iretq, which restores IF=1, so one sti covers every iteration.
+    asm { sti; }
     while (timer_ticks < t0 + n) {
-        asm { sti; hlt; }
+        arch_wait();
     }
     return 0;
 }

@@ -59,8 +59,16 @@ def _refuse_stale(binary, sources, what, howto):
         print(f"      Rebuild with: {howto}")
         sys.exit(2)
 
-TLM_SRC = os.path.join(ROOT, "tests/telemetry/tlm.cyr")
-_refuse_stale(TLM, [TLM_SRC], "source (tlm.cyr)",
+# ⛔ 1.57.1 — ALL BUILD INPUTS, NOT JUST THE ONE .cyr. This guard originally watched tlm.cyr alone,
+# so a toolchain PIN CHANGE (cyrius.cyml) or a re-vendored lib/ — which a pin change rewrites — left
+# a binary that is genuinely from a different compiler scoring as fresh. Any freshness guard added to
+# the other harnesses must use this same set, or 29 new guards get built with the same hole.
+import glob as _glob
+TLM_DIR = os.path.join(ROOT, "tests/telemetry")
+TLM_SRCS = (_glob.glob(os.path.join(TLM_DIR, "*.cyr"))
+            + _glob.glob(os.path.join(TLM_DIR, "lib", "*.cyr"))
+            + [os.path.join(TLM_DIR, "cyrius.cyml")])
+_refuse_stale(TLM, TLM_SRCS, "sources (tests/telemetry/*.cyr, lib/*.cyr, cyrius.cyml)",
               "(cd tests/telemetry && cyrius build --agnos tlm.cyr build/tlm)")
 
 # ⛔ AND THE KERNEL, WHICH IS THE BIGGER HALF. `AGNOS` is likewise a PATH to a prebuilt artifact —
@@ -197,6 +205,10 @@ try:
             "wall-clock rate, so a monitor renders a sleeping process at 100%. This is the defect "
             "chakshu v0.9.9 reported and backed its CPU% column out over; §4's busy-loop oracle cannot "
             "see it, because a wall-clock counter passes that test identically.",
+        69: "§4d IDLE CORES ARE ACCRUING CPU TIME — ticks charged to slots on cores that are parked. "
+            "The AP idle loop (arch/x86_64/smp.cyr) halted OUTSIDE arch_wait(), so cpu_in_halt was never "
+            "set for cores 1..3 and pic.cyr's halt guard could not fire for them; a wholly idle 4-core box "
+            "then renders as three rows at ~33%. Reported by chakshu v0.10.1; fixed 1.57.1.",
         79: "§3b could not open /bin/tlm — the harness did not seed this binary, so the I/O load never ran",
         91: "§3b read() of /bin/tlm returned nothing — no disk I/O was generated, so the oracle is void",
         92: "§3b the second sysinfo(200) sample failed",

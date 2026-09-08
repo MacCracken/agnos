@@ -225,6 +225,21 @@ fn exfat_next_cluster(c) {
     }
     var v = exfat_rd32(&exfat_fat_buf, o);
     if (v >= 0xFFFFFFF7) { return 0; }     # 0xFFFFFFF7 bad + 0xFFFFFFF8.. EOC/reserved
+    # ⛔ 1.57.1 — THE TWO CHEAP CHAIN GUARDS, which exFAT had NONE of while FAT has had them since
+    # the fatfs audit. Without these a malformed volume walks to an ARBITRARY cluster number, and
+    # every caller converts that straight into an LBA — an out-of-range read off the end of the
+    # partition. That is the actually-dangerous half of the chain-cycle finding and it is four lines.
+    # ⚠ Below 2 is reserved (0 = free, 1 = reserved), and a cluster past the volume's count cannot
+    # be addressed at all.
+    if (v < 2) { return 0; }
+    if (exfat_cluster_count < 1) { return 0; }
+    if (v > exfat_cluster_count + 1) { return 0; }
+    # A self-referencing entry (A -> A) is the one cycle shape a single step can see, and the
+    # cheapest to craft. End the chain rather than spin on it.
+    # ⚠ MULTI-NODE CYCLES (A -> B -> A) ARE STILL UNGUARDED HERE, exactly as in fatfs.cyr — that
+    # needs a per-walk step budget at each of the 31 walk sites across both filesystems and is
+    # tracked as its own item. Do not read these three lines as closing that.
+    if (v == c) { return 0; }
     return v;
 }
 

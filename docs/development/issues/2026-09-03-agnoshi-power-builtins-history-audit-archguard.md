@@ -54,14 +54,33 @@ documents is exactly right for a call that does not return.
 
 **Fix:** `audit_exec_ctx(..., "launched", ...)` before each `syscall(13, ...)`.
 
-## 3. The privilege classifier for these verbs is dead code — P2
+## 3. ⛔ CORRECTED 1.57.1 — THIS ITEM WAS WRONG, AND ACTING ON IT WOULD HAVE CAUSED A REGRESSION
 
-`grep -rn is_privileged_command src/ tests/` returns **nothing**, yet `src/permissions.cyr:76-79`
-lists `reboot`/`shutdown`/`poweroff`/`halt`. It is a safety control that is inert. `cur_mode` is read
-at `:322` and passed to every other launcher, and is not consulted by the power arms.
+**What this section originally said:** *"`grep -rn is_privileged_command src/ tests/` returns nothing,
+yet `src/permissions.cyr:76-79` lists reboot/shutdown/poweroff/halt. It is a safety control that is
+inert. Fix: wire it up **or delete it**."*
 
-**Fix:** wire it up **or delete it**. An inert safety control is worse than an absent one, because it
-reads as coverage.
+⛔ **THAT NAME NEVER EXISTED.** `is_privileged_command` has no definition and no caller anywhere in
+agnoshi — the grep returned nothing because the symbol is invented, not because a control is dead.
+The real classifier is **`is_admin_command`** (`src/permissions.cyr:56`), and it is **FULLY LIVE**:
+called from `analyze_command_permission` (`:195`), reached from `approval.cyr` and `translate.cyr`,
+and directly asserted by the test suite.
+
+⛔ **THE DANGER THIS TEXT CREATED, which is why it is corrected in place rather than quietly edited:**
+the next reader would either dismiss the whole issue as stale, or act on its authority and **delete
+the power-verb entries at `permissions.cyr:76-79`** — silently downgrading `reboot`/`shutdown`/
+`poweroff`/`halt` from ADMIN to the USER_WRITE fallthrough on the NL and approval paths that *do*
+classify them. A genuine safety regression, invited by a mistaken issue file.
+
+**The residual real gap, restated correctly:** the three power builtins are matched by exact `streq`
+in `interactive_loop` **before** any classification runs, so a literally-typed `poweroff` never
+reaches `is_admin_command` at all. Only the NL/approval paths classify it.
+
+⚠ **That is a POLICY question, not a dead-code cleanup** — should a literally-typed power verb
+require a mode confirm the way `run /bin/foo` does? Both readings are defensible (it is strictly more
+destructive than launching a program; but an explicitly typed verb is already unambiguous intent, and
+a reflexive confirm trains people to hit "y"). **Needs an operator ruling. Do not "fix" it either way
+from a triage.**
 
 ## 4. The three raw `syscall(13, ...)` sites are not arch-guarded — P3
 

@@ -80,8 +80,15 @@ def longest_uniform_run(w, data, x, y, rw):
     return best
 
 os.makedirs(WORK, exist_ok=True)
-if not os.path.exists(os.path.join(SRC, "agnos-launcher.img")) and not os.path.exists(IMG):
-    src_img = os.path.join(SRC, "agnos-puka-term.img")
+# ⛔ 1.57.1 — RE-COPY WHEN THE BASE IMAGE IS NEWER, not only when ours is absent. This copied once
+# and never again, so after the first run the image was a PERMANENT fossil — measured 21 days behind
+# build/agnos. The old condition also gated on SRC/agnos-launcher.img, a path this harness never
+# creates or reads, so the clause could only ever be true by accident; dropped.
+src_img = os.path.join(SRC, "agnos-puka-term.img")
+_need_copy = not os.path.exists(IMG)
+if not _need_copy and os.path.exists(src_img):
+    _need_copy = os.path.getmtime(src_img) > os.path.getmtime(IMG)
+if _need_copy:
     if not os.path.exists(src_img):
         p(f"SKIP: no base image at {src_img} — run puka-terminal-test.py first"); sys.exit(2)
     subprocess.run(["cp", src_img, IMG], check=True)

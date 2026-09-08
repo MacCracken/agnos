@@ -438,6 +438,18 @@ else
         # (non-halting Data Buffer Error), which is more than the 16 TRBs armed at init. This is the
         # only way to exercise the "re-arm even when the report is unusable" path, since QEMU never
         # emits a rejected completion code on its own. ⛔ Never flash a kernel built with this.
+        # ⛔ 1.57.1 — THE TWO INJECT FLAGS ARE MUTUALLY EXCLUSIVE. Both declare `hid_cc_inject_left`
+        # and both write the same path with no guard between them, and the non-halting block runs
+        # SECOND — so with both set it overwrites ccode=6 with ccode=2 and silently neuters the halt
+        # injection while "HALT INJECTION ARMED" still prints. The author considered each flag alone
+        # (hid.cyr says "either may be defined alone") and not both at once. Fail at the operator
+        # here rather than emit source that lies about what it is testing.
+        if [ -n "${HID_CC_INJECT:-}" ] && [ -n "${HID_CC_INJECT_HALT:-}" ]; then
+            echo "build.sh: ERROR — HID_CC_INJECT and HID_CC_INJECT_HALT are mutually exclusive." >&2
+            echo "          Both inject into the same path; the non-halting one wins and silently" >&2
+            echo "          neuters the halt injection. Set exactly one." >&2
+            exit 1
+        fi
         [ -n "$HID_CC_INJECT" ]      && echo '#define HID_CC_INJECT'
         # HID_CC_INJECT_HALT=1 — TEST ONLY, and it exercises a DIFFERENT path from the flag above.
         # HID_CC_INJECT forces ccode 2, which is deliberately NOT a halting code, so it can never set

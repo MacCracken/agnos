@@ -45,6 +45,22 @@ OVMF_VARS = None
 for c in ("/usr/share/edk2/x64/OVMF_VARS.4m.fd", "/usr/share/OVMF/OVMF_VARS.fd"):
     if os.path.exists(c): OVMF_VARS = c; break
 
+# ⛔ 1.57.1 — REFUSE A STALE EXERCISER. This harness produced SHIP EVIDENCE for 1.56.59/1.56.60 and
+# had no freshness check of any kind: it booted whatever binary was on disk, so an edited-but-not-
+# rebuilt exerciser scored green having asserted nothing new. Watches ALL build inputs (*.cyr,
+# lib/*.cyr, cyrius.cyml) — a pin change rewrites the vendored lib/, so the .cyr alone is not enough.
+# ⚠ In-tree agnos/tests/* row, so building under agnos's own pin is correct scoping. Do NOT widen
+# this shape to sibling repos: each sibling pins its own cyrius.
+import glob as _glob
+_ex_dir = os.path.join(ROOT, "tests/mountlist")
+_ex_srcs = (_glob.glob(os.path.join(_ex_dir, "*.cyr")) + _glob.glob(os.path.join(_ex_dir, "lib", "*.cyr"))
+            + [os.path.join(_ex_dir, "cyrius.cyml")])
+_ex_newest = max([os.path.getmtime(f) for f in _ex_srcs if os.path.exists(f)] or [0])
+if os.path.exists(MLIST) and _ex_newest and os.path.getmtime(MLIST) < _ex_newest:
+    print(f"FAIL: {MLIST} is OLDER than its sources — the exerciser was edited but never rebuilt.")
+    print("      Rebuild with: (cd tests/mountlist && cyrius build --agnos mlist.cyr build/mlist)")
+    sys.exit(2)
+
 subprocess.run(["rm", "-rf", WORK]); os.makedirs(WORK, exist_ok=True)
 subprocess.run(["cp", "-a", ROOTFS, SEED])
 subprocess.run(["cp", MLIST, os.path.join(SEED, "bin", "mlist")])

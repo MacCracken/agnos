@@ -868,6 +868,12 @@ fn fault_kill_current(vector) {
     # RPL==3, so the faulter was in ring 3, never mid kernel critical-section) — so
     # do_context_switch is not preempt-gated and WILL switch. Mirrors the smp.cyr:586 /
     # kernel_idle_loop idle pattern (sti;hlt) until that switch fires.
+    # ⚠ 1.57.1 — LEFT AS A BARE `hlt` DELIBERATELY, unlike the idle parks. This is a TERMINAL tail
+    # for a process that is already state-0 and dying; the very next timer tick switches away, so at
+    # most one tick is mis-charged, and it lands on a slot about to be reaped. Routing it through
+    # arch_wait() would buy nothing and would edit a fault-kill path whose IF/preempt reasoning is
+    # written out immediately above. Reconsider only if a switch here is ever observed to take
+    # multiple ticks.
     while (1) { asm { sti; hlt; } }
     return 0;                             # unreachable — kept for the type checker
 }

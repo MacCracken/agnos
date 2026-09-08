@@ -159,6 +159,12 @@ PYEOF
         [ $rc2 -eq 0 ] || exit 1
     else
         echo "texl-body-identity: (dword stage skipped -- llvm-mc/llvm-objcopy absent)"
+        # ⛔ 1.57.1 — VOID HERE, INSIDE THE SKIP BRANCH ONLY. check.sh scores this gate on exit
+        # status, so falling through to the `exit 0` below rendered "the dword comparison never ran"
+        # as a green tick: on an LLVM-less host the gate proved only the source-text half while
+        # reporting full coverage. Same V3 vacuity shape the chan-semantics SKIP was fixed for, and
+        # scripts/check/shader-crossasm.sh already exits 2 on this identical condition.
+        exit 2
     fi
     exit 0
 fi

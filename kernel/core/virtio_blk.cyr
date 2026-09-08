@@ -562,22 +562,34 @@ fn vblk_do_flush() {
 # Same signatures, same semantics, same return codes. block.cyr dispatch
 # layer and main.cyr init order are byte-compatible across the rewrite.
 
+# ⛔ 1.57.1 — vblk_lock BRACKETS SUBMIT+POLL AND THE SHARED DMA BUFFER. virtio_blk took NO LOCK
+# ANYWHERE while being reachable concurrently under SMP through the same block-layer path the nvme
+# audit traced: one virtqueue and one `vblk_dma_buf` shared by every caller, so two CPUs interleaved
+# descriptor writes and completion polls on a single queue. Rank is nvme's (see the lock-order table
+# in arch/x86_64/smp.cyr) — a leaf under fs_lock.
+# ⚠ THE COPY IS INSIDE THE LOCK, not just the request: `vblk_dma_buf` is the shared bounce, so
+# releasing before the copy would let the next CPU's request overwrite the bytes being read out.
 fn vblk_blk_read(sector, buf) {
+    vblk_spin_lock();
     var r = vblk_do_request(VBLK_T_IN, sector, &vblk_dma_buf);
     if (r == 0) {
         for (var i = 0; i < 64; i = i + 1) {
             store64(buf + i * 8, load64(&vblk_dma_buf + i * 8));
         }
     }
+    vblk_spin_unlock();
     return r;
 }
 
 fn vblk_blk_write(sector, buf) {
-    if (vblk_readonly == 1) { return 0 - 1; }
+    if (vblk_readonly == 1) { return 0 - 1; }    # no shared state touched yet — refuse before locking
+    vblk_spin_lock();
     for (var i = 0; i < 64; i = i + 1) {
         store64(&vblk_dma_buf + i * 8, load64(buf + i * 8));
     }
-    return vblk_do_request(VBLK_T_OUT, sector, &vblk_dma_buf);
+    var wr = vblk_do_request(VBLK_T_OUT, sector, &vblk_dma_buf);
+    vblk_spin_unlock();
+    return wr;
 }
 
 # VirtIO FLUSH. No-op success when VIRTIO_BLK_F_FLUSH wasn't negotiated
@@ -585,9 +597,17 @@ fn vblk_blk_write(sector, buf) {
 fn vblk_blk_flush() {
     if (vblk_active == 0) { return 0 - 1; }
     if (vblk_flush_supported == 0) { return 0; }
-    return vblk_do_flush();
+    vblk_spin_lock();
+    var fr = vblk_do_flush();
+    vblk_spin_unlock();
+    return fr;
 }
 
+# ⛔ DELIBERATELY UNLOCKED — vblk_blk_read composes it and ALREADY takes vblk_lock, so locking here
+# too is a same-CPU re-acquire, which this spin lock does not survive (see the RE-ENTRY PROOFS block
+# in arch/x86_64/smp.cyr). Each sector is individually protected; the multi-sector run is not atomic
+# as a unit, which matches nvme's per-sector fallback and is sufficient — the invariant being
+# protected is the single shared queue, not the caller's read spanning sectors.
 fn vblk_blk_read_sectors(start, count, buf) {
     for (var i = 0; i < count; i = i + 1) {
         var r = vblk_blk_read(start + i, buf + i * 512);

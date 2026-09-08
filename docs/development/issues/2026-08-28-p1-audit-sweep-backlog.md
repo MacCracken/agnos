@@ -8,7 +8,31 @@ type: issue
 
 **Opened** 2026-08-28, at the close of the 1.56.51 audit/hardening sweep.
 
-## ⭐⭐ STATUS — 1.56.59 (2026-09-02): RE-DERIVED, AND THE TALLY WAS WRONG
+## ⭐⭐ STATUS — 1.57.1 (2026-09-08): SIX MORE CLOSED, AND THE TALLY RECONCILED
+
+⛔ **DO NOT ARCHIVE THIS FILE.** It would archive cleanly on its own header text and it has live
+items under it — the inverse of the `#98` failure CLAUDE.md cites, and more dangerous, because it
+reads nearly done.
+
+**1.57.1 CLOSED SIX:** the virtio_net unchecked-BAR store (it could rewrite the boot PML4/PDPT/PD);
+`xhci_cmd_wait` — the FOURTH event-ring waiter — now reclaims HID Transfer Events, closing a LIVE
+input-death path (`main.cyr` calls `msc_enumerate()` through that waiter with the keyboard armed);
+the two cheap exFAT chain guards, closing the arbitrary-LBA read; the three NVMe/block 4Kn stride
+sites; `blk_rw_armed` cleared on process exit; and the msc/virtio_blk backend locks.
+
+⚠ **STILL OPEN AND HONESTLY SIZED:** the aarch64 port (LARGE, and GROWING — the `arch_wait` stub
+added at 1.56.60 itself calls an undefined `pcpu_cpu`); the aarch64 timer `[sp,#0]` frame-padding
+defect (small, but UNVERIFIABLE until the port compiles — do not batch them); the FAT/exFAT
+multi-node cycle counters (31 walk sites, differing loop shapes); `#92` op 0x0C SMP (deferred by
+ruling — `gpu_present == 0` under QEMU so no smoke can go red on it); the raw-disk capability gate
+and the W^X hard refusal (both operator rulings — W^Xs precondition is NOT met, the stale RWX
+binaries are still in the tree).
+
+⛔ **THE TALLY DISAGREED WITH ITSELF IN TWO PLACES AND IS NOW ONE NUMBER.** The block below said
+"P1 21/26 — NOT 23" while the P1 section header still said "23 FIXED + 1 PARTIAL + 2 OPEN". Both
+were in the file, neither reconciled, in a file already re-derived once to fix exactly this.
+
+## STATUS — 1.56.59 (2026-09-02): RE-DERIVED, AND THE TALLY WAS WRONG
 
 **P0 2/2 · P2 29/29 · P1 21/26 — NOT 23.** Re-verified item-by-item against live code 2026-09-02.
 Two items this file marks FIXED are not:

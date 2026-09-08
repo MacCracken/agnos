@@ -20,8 +20,13 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 # The harness needs the agnsh disk image. agnsh-smoke.sh builds it and boots once; reuse it rather than
 # duplicating the parted/mformat/mkfs recipe (same move agnsh-hiram-smoke.sh makes).
-if [ ! -f "$ROOT/build/agnsh-smoke/agnos-agnsh.img" ]; then
-    echo "console-line: building the agnsh image first..."
+# ⛔ 1.57.1 — REBUILD WHEN THE KERNEL IS NEWER, NOT ONLY WHEN THE IMAGE IS ABSENT. This is a SCORED
+# sweep gate (scripts/sweep.sh), and run_gate rebuilds build/agnos before running it — so with an
+# absent-only test the sweep built a kernel and then scored an image made from a DIFFERENT one.
+# Measured live at 1.57.1: build/agnos was 09-08, the image 09-07 02:09 — a fossil inside release
+# evidence, which is the exact shape the harness-staleness issue was filed about.
+if [ ! -f "$ROOT/build/agnsh-smoke/agnos-agnsh.img" ] || [ "$ROOT/build/agnos" -nt "$ROOT/build/agnsh-smoke/agnos-agnsh.img" ]; then
+    echo "console-line: building the agnsh image first (absent or older than build/agnos)..."
     if ! sh "$ROOT/scripts/smoke/agnsh-smoke.sh" >/dev/null 2>&1; then
         echo "console-line: FAILED -- could not build the agnsh image"
         exit 1

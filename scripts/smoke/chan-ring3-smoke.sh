@@ -46,6 +46,17 @@ for tool in qemu-system-x86_64 parted mformat mmd mcopy sgdisk mkfs.ext2 dd stri
     command -v "$tool" >/dev/null 2>&1 || { echo "  ERROR: $tool not found — this gate measured NOTHING"; exit 1; }
 done
 [ -f "$GNOBOOT" ] || { echo "  ERROR: gnoboot not built at $GNOBOOT — this gate measured NOTHING"; exit 1; }
+# ⛔ 1.57.1 — BUILD THE KERNEL, don't inherit whatever is lying in build/agnos. The existence check
+# below catches ABSENT, never STALE, so run standalone this gate scored a kernel from some earlier
+# session. (Inside scripts/sweep.sh run_gate rebuilds first, so the sweep path was already fresh —
+# this closes the standalone path, which is how this smoke is normally run while iterating.)
+# ⛔⛔ BUILD WITH CHAN_RING3_SELFTEST=1 — A BARE BUILD HERE DESTROYS THE GATE. Measured 1.57.1: a
+# plain `sh build.sh` was added here and the smoke went RED, because sweep.sh passes
+# CHAN_RING3_SELFTEST=1 as run_gate's $buildenv and a bare rebuild OVERWRITES that kernel with one
+# that never execs /bin/chanx. The boot then falls to the emergency shell and the gate measures
+# nothing. Setting it here makes the smoke correct standalone AND idempotent under the sweep.
+echo "Building the kernel under test (CHAN_RING3_SELFTEST=1)..."
+CHAN_RING3_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/dev/null 2>&1 || { echo "  ERROR: kernel build failed — this gate measured NOTHING"; exit 1; }
 [ -f "$AGNOS" ]   || { echo "  ERROR: build/agnos missing — run scripts/build.sh — this gate measured NOTHING"; exit 1; }
 
 echo "Building chanx exerciser (cyrius build --agnos)..."

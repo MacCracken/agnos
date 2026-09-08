@@ -406,9 +406,13 @@ fn blk_write_sectors_on(tag, start, count, buf) {
         if (bws >= 0) { blk_count_writes(tag, count); }
         return bws;
     }
+    # ⛔ 1.57.1 — THIS TAG's LBA size, not a hardcoded 512. blk_lba_bytes_for() is defined ~350
+    # lines above and admits 4096; this loop covers USB_MS, which genuinely can be 4Kn.
+    var wlb = blk_lba_bytes_for(tag);
+    if (wlb < 512) { wlb = 512; }
     var i = 0;
     while (i < count) {
-        if (blk_write_on(tag, start + i, buf + i * 512) != 0) { return 0 - 1; }
+        if (blk_write_on(tag, start + i, buf + i * wlb) != 0) { return 0 - 1; }
         i = i + 1;
     }
     return 0;

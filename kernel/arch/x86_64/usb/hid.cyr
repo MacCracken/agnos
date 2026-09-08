@@ -310,7 +310,6 @@ var hid_mouse_dx = 0;        # accumulated since the last drain by ring 3
 var hid_mouse_dy = 0;
 var hid_mouse_btn = 0;       # current button bitmap (bit0 left, bit1 right, bit2 middle)
 var hid_mouse_btn_seen = 0;  # OR of every bitmap seen since the last drain — catches a click in a gap
-var hid_mouse_seq = 0;       # bumps on every accepted report; ring 3 can tell "no motion" from "no poll"
 var hid_mouse_first = 0;     # one-shot marker latch
 # ⭐⭐ THE WHEEL (1.56.49). Byte [3] of the boot-mouse report, summed like dx/dy since the last drain.
 # ⛔ IT WAS DOCUMENTED IN THE LAYOUT COMMENT AND NEVER READ — "wheel (s8, optional)" sat above a
@@ -380,7 +379,6 @@ fn hid_process_mouse_report(report_phys, bi, resid) {
     }
     hid_mouse_btn = uni;
     hid_mouse_btn_seen = hid_mouse_btn_seen | uni;
-    hid_mouse_seq = hid_mouse_seq + 1;
     # ⚠ FLAG, DO NOT PRINT — hid_process_mouse_report is reached from hid_poll in ISR context, and this
     # one-shot is the LIVE hazard of the pair: unlike the keyboard's (which cannot coincide with the echo
     # of a previous key), it fires at an arbitrary later instant and can land inside the kputc window.
@@ -600,6 +598,15 @@ fn hid_kbd_init() {
     # of. This banner is a SEPARATE marker, so removing the decline line now reddens the gate.
     # ⚠ Also serves the operator: a kernel that prints this must never be flashed.
     kprintln("hid: HALT INJECTION ARMED -- test build, never flash this", 57);
+    #endif
+    #ifdef HID_CC_INJECT
+    # ⛔ 1.57.1 — THE SAME INDEPENDENT WITNESS, FOR THE OTHER INJECTOR. HID_CC_INJECT had no banner
+    # at all, so scripts/harness/hid-cc-inject-test.py could not tell a flag-gated kernel from an
+    # ordinary one and scored green either way — its own header already admitted a green run against
+    # a normal kernel means nothing. This is a SEPARATE marker from anything that harness asserts, so
+    # deleting an asserted line reddens the gate instead of excusing it.
+    # ⚠ Also serves the operator: a kernel that prints this must never be flashed.
+    kprintln("hid: CC INJECTION ARMED -- test build, never flash this", 55);
     #endif
     return 0;
 }
@@ -1053,13 +1060,22 @@ fn hid_flush_oneshots() {
 # State Error abort on a wrong-state reset is its own failure mode (msc.cyr records one that bricked a
 # boot). If the state has already moved on, clear the flag and leave the endpoint alone.
 # ⚠⚠ PROVEN REACHABLE, NOT PROVEN CORRECT — AND THE DIFFERENCE MATTERS FOR WHOEVER TOUCHES THIS NEXT.
-# ⛔⛔ AND READ THIS BEFORE REACHING FOR THE FLAG: `HID_CC_INJECT` AS SHIPPED **CANNOT** DO IT.
-# This comment used to say "HID_CC_INJECT with ccode 6" as though the build flag reproduced the state.
-# It does not, and never has in-tree: the shipped inject block forces `ccode = 2` (:1177, "Data Buffer
-# Error: rejected, but NOT a halting code"), while `hid_ep_needs_reset` is set only for 4/6/8
-# (:1189-1192). ⇒ Turning on `HID_CC_INJECT=1` and seeing nothing happen is the EXPECTED result, not
-# evidence that no stall occurred. The reachability claim below rests on a HAND-MODIFIED build that
-# changed that 2 to a 6; if you want to repeat it, change :1177 yourself and say so in the record.
+# ⛔⛔ AND READ THIS BEFORE REACHING FOR THE FLAG — THERE ARE TWO, AND ONLY ONE REACHES THIS BODY.
+# `HID_CC_INJECT` forces `ccode = 2` ("Data Buffer Error": rejected, but NOT a halting code), while
+# `hid_ep_needs_reset` is set only for 4/6/8. ⇒ Turning on `HID_CC_INJECT=1` and seeing nothing
+# happen is the EXPECTED result, not evidence that no stall occurred.
+# ⭐ USE `HID_CC_INJECT_HALT=1 sh scripts/build.sh` INSTEAD. It injects 6 and DOES reach this body,
+# and it ships — it is declared a few lines below the other flag in this same file and is wired in
+# scripts/build.sh. Its gate is scripts/harness/hid-halt-oracle-test.py, which is mutation-proven
+# and refuses to run against a kernel that lacks the injector.
+# ⛔ 1.57.1 — THIS PARAGRAPH USED TO SAY THE CAPABILITY DID NOT EXIST and instruct the reader to
+# "change :1177 yourself and say so in the record". That was written before HID_CC_INJECT_HALT
+# landed and was never updated, so the comment actively routed the next author AWAY from the fix
+# sitting in the same file — the precise trap this backlog exists to catch. Its line references had
+# rotted too (:1177 and :1189-1192 both moved), which is why they are gone: name FUNCTIONS, not line
+# numbers, because only one of those two survives an edit.
+# ⚠ The two flags are MUTUALLY EXCLUSIVE — scripts/build.sh now refuses both at once, because they
+# share `hid_cc_inject_left` and the non-halting one runs second and silently wins.
 # Injecting a halting completion code shows the flag is set, this function
 # is called from thread context, and the system survives. It does NOT show the reset sequence works,
 # because an injected code is fabricated by software: the CONTROLLER never actually halted, so

@@ -1,4 +1,54 @@
-# 2026-09-07 — the AP idle park bypasses the halt guard, and one thing you can now NOT build
+# 2026-09-07 — the AP idle park bypasses the halt guard, and one thing you can now NOT build — RESOLVED
+
+**Status:** RESOLVED in agnos **1.57.1**. All three items closed. No new syscall, no new ABI field,
+no cyrius change.
+
+| # | Ask | Outcome |
+|---|-----|---------|
+| 1 | AP idle park bypasses `cpu_in_halt` | **FIXED** — `while (1 == 1) { arch_wait(); }`, plus **two more halt sites** the sweep found, plus a **mutation-proven** multi-core gate. |
+| 2 | ⛔ do NOT build an idle / halted-tick counter | **HONOURED — nothing built.** The asymmetry stays as-is precisely so your derivation keeps working. |
+| 3 | ABI doc says `sysinfo_n` is pending | **FIXED** — §4.4 now says the wrapper shipped in 6.5.45 and tells consumers not to hand-roll the raw call. |
+
+**1 — and your sweep suggestion found two more.** `grep -n 'hlt' kernel/` turned up five candidates
+beyond the idle park. Three now route through `arch_wait()`:
+- `arch/x86_64/smp.cyr` — **the AP idle park** (your report);
+- `arch/x86_64/smp.cyr` `smp_wait_ticks()` — a genuine timed block, the same class as `sleep_ms`#41;
+- `core/main.cyr` — the fork-selftest's wait-for-child loop.
+In each, the `sti` is hoisted out of the loop so the documented enter-and-exit-with-IF=1 contract is
+preserved (a trailing `cli` was tried once historically and hung every smoke at its first `arch_wait`).
+
+⛔ **TWO SITES DELIBERATELY LEFT AS BARE `hlt`, AND ONE OF THEM MUST NEVER BE "FIXED":**
+- `smp.cyr`'s **out-of-range APIC-id park** (`my_id >= 4`). `pcpu_cpu()` **clamps any id >= 4 to 0**,
+  so a core parking there through `arch_wait()` would set and clear `cpu_in_halt[0]` — *the BSP's
+  slot* — and suppress tick charging on the boot processor for as long as it lived. That turns a
+  harmless park into a silent machine-wide accounting fault. It is also unnecessary: that core has no
+  per-CPU slot, is never scheduled, and parks before `sti`, so its IF=0 `hlt` never wakes by design.
+- The two **dying-process tails** in `core/syscall.cyr`. Terminal paths for an already-state-0 slot
+  that the next tick switches away from: at most one tick, charged to something about to be reaped.
+Both now carry ⛔ comments in place so the next sweep does not "complete" them.
+
+**⚠ ONE CORRECTION TO THE FILING, because it changes where the gap actually was.** You wrote that
+this was *"invisible in both our harnesses — chakshu's QEMU boot is single-vCPU and so, I believe, is
+`telemetry-test.py`"*. **`telemetry-test.py` has passed `-smp 4` all along.** The harness was never
+single-core; it was blind because **no assertion looked at the other cores**. That is a better problem
+to have — it needed an arm, not a harness rewrite.
+
+⇒ New **`tlm.cyr` §4d**: sum ticks across every slot that is NOT the caller, across a 300 ms block, and
+require the delta under 15. On an idle box a correct kernel charges neighbours nothing; with the park
+unguarded three cores accrue ~30 ticks each (~90). **Mutation-proven, not assumed** — reverting the
+one-line fix and rebuilding reddens it: baseline **95**, mutant **69**, restored **95**.
+
+**2 — we built nothing, and the reasoning is now recorded in the tree** so a later cut does not
+"helpfully" add the field you asked us not to add. Your derivation
+(`Σ per-process deltas / pooled band delta`) depends on the two counters staying halt-asymmetric in
+opposite directions; that asymmetry is deliberate and stays.
+
+**3 — the doc was worse than stale.** It told consumers a length-taking overload was still pending
+upstream. `sys_sysinfo_n(out, len)` and the named band accessors have shipped since **6.5.45**, and
+`lib/sys.cyr` is byte-identical 6.5.45 → 6.6.1. §4.4 now says so and warns against hand-rolling the
+raw call. `blk_info`#79's `capacity_lbas` remains active-only and documented as a known gap — noted,
+not changed; say the word if you need it per-tag.
+
 
 **Filed by:** chakshu (the AGNOS system monitor), during v0.10.1.
 **Checked against:** agnos **1.57.0**, `HEAD` `4914e5b`.

@@ -106,6 +106,44 @@ fn tlm_main(): i64 {
     # above states which of its exits cannot fire: an assertion that does not bite must never be
     # mistaken for one that does. Making it deterministic needs a second runnable process.
 
+    # ---- §4d: IDLE CORES MUST NOT ACCRUE CPU TIME ----
+    # ⛔ THIS IS THE ASSERTION THAT WOULD HAVE CAUGHT THE AP IDLE PARK. §4b proves OUR OWN slot is
+    # halt-excluded; it says nothing about the other three cores. Until 1.57.1 the AP idle loop
+    # (arch/x86_64/smp.cyr) was a bare `hlt` OUTSIDE arch_wait(), so `cpu_in_halt` was never set for
+    # cores 1..3 and every idle tick there was charged to that core's idle kthread. A wholly idle
+    # 4-core box rendered as three rows at ~33% and ~75% aggregate busy. Reported by chakshu v0.10.1.
+    #
+    # ⚠ chakshu believed this harness was single-vCPU and therefore structurally blind. IT IS NOT —
+    # scripts/harness/telemetry-test.py has passed `-smp 4` all along (its QEMU line). The gate was
+    # blind because NO ASSERTION LOOKED AT THE OTHER CORES, which is a different and more fixable
+    # problem than the one that was reported. Hence this arm rather than a harness change.
+    #
+    # THE ORACLE: sum ticks over every slot that is NOT us, across a block. Every other process on
+    # this box is idle or blocked (agnsh waits on the keyboard; init and the idle kthreads park), so
+    # a correct kernel charges them nothing. With the AP park unguarded, three idle cores accrue at
+    # wall-clock rate: ~30 ticks each over 300 ms, ~90 total. A threshold of 15 sits far below that
+    # and far above the handful a legitimately-woken neighbour could take.
+    var o0 = 0;
+    n = syscall(99, &buf, 16);
+    i = 0;
+    while (i < n) {
+        if (load64(&buf + i * 64) != me) { o0 = o0 + (load64(&buf + i * 64 + 56) & 0xFFFFFFFF); }
+        i = i + 1;
+    }
+    syscall(41, 300);                           # block ~30 ticks; the box is otherwise idle
+    var o1 = 0;
+    n = syscall(99, &buf, 16);
+    i = 0;
+    while (i < n) {
+        if (load64(&buf + i * 64) != me) { o1 = o1 + (load64(&buf + i * 64 + 56) & 0xFFFFFFFF); }
+        i = i + 1;
+    }
+    # A slot that exited and was recycled can make the sum drop; that is not what this arm tests,
+    # so clamp rather than spend the last free exit code on it.
+    var od = 0;
+    if (o1 > o0) { od = o1 - o0; }
+    if (od > 15) { return 69; }                 # ⛔ IDLE CORES ARE ACCRUING CPU TIME
+
     # ---- §5: per-process RSS, proclist(#99) record +56 HIGH u32, in 4 KiB pages ----
     # ⚠ SAMPLED FROM THE SAME RECORDS AS §4 — the high half of the slot whose low half was just proven
     # live. Reading the whole u64 and shifting is what a real consumer does, so a kernel that wrote the

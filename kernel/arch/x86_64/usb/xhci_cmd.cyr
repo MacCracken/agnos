@@ -252,7 +252,21 @@ fn xhci_cmd_wait(cmd_trb_phys) {
                 }
             } else {
                 # Non-cmd-completion event (PortStatusChange, etc.).
-                # Phase 3 consumes and discards; later phases will route.
+                # ⛔⛔ 1.57.1 — HAND A HID TRANSFER EVENT BACK BEFORE CONSUMING IT. This is the
+                # FOURTH waiter on the shared event ring; the three in xhci.cyr all reclaim and this
+                # one did not. A keystroke landing while an xHCI command is in flight arrives here,
+                # and consuming it without telling the HID layer costs that interrupt-IN endpoint one
+                # of its 16 armed TRBs FOREVER. Sixteen of them empty the ring, the controller stalls
+                # the endpoint, and input freezes with the CPU alive and nothing in the log.
+                # ⚠ THIS IS LIVE, NOT THEORETICAL: core/main.cyr arms the xHCI RX MSI-X vector and
+                # then calls msc_enumerate(), which issues xHCI commands through this exact waiter
+                # with the keyboard already armed.
+                # ⛔ The comment here used to read "Phase 3 consumes and discards; later phases will
+                # route" — a false comment that made the omission look intentional and survived a
+                # re-derivation that was explicitly hunting this pattern. There is no later phase.
+                if (evt_type == XHCI_TRB_TRANSFER_EVENT) {
+                    hid_reclaim_event((evt_dw3 >> 24) & 0xFF, (evt_dw3 >> 16) & 0x1F);
+                }
                 xhci_evt_ring_idx = xhci_evt_ring_idx + 1;
                 if (xhci_evt_ring_idx == XHCI_EVT_RING_SEGMENT_SIZE) {
                     xhci_evt_ring_idx = 0;

@@ -1214,6 +1214,18 @@ fn proc_reap(pid) {
     # belongs to the exited proc" exact — no risk of touching the parent's fds (the very reason
     # proc_reap_child historically never swept). Replaces the old fd-3..31 vfs_close loop.
     proc_destroy_fd_table(pid, 1);
+    # ⛔ 1.57.1 — DISARM RAW DISK WRITE ON EXIT. `blk_rw_armed` (core/syscall.cyr) gates
+    # blk_write#78; blk_close_sys clears it, but a process that armed the gate and then DIED —
+    # faulted, killed, or simply exited without closing — left it OPEN for whatever ran next. The
+    # arm is a global with no owner, so exit is the only other place its lifetime can end.
+    # ⚠ CLEARING ON ANY EXIT IS DELIBERATE AND CONSERVATIVE. There is no per-process ownership to
+    # consult, so this fails CLOSED: an installer that is still running simply re-arms, which is one
+    # syscall, whereas the alternative leaves a raw-disk write gate open across process boundaries.
+    # ⛔ This is the codeable half ONLY. It does not make the arm a real privilege check —
+    # BLK_RW_ARM_MAGIC is still a compile-time constant any ring-3 process can send, and replacing
+    # it needs the per-process capability model agnos does not have. That half is an operator ruling,
+    # not a fix; do not treat this line as closing it.
+    blk_rw_armed = 0;
     var cr3 = proc_get_cr3(pid);
     proc_set_state(pid, 0);                 # dead — scheduler skips it (set before free)
     if (proc_current_get() == pid) { proc_current_set(0); }

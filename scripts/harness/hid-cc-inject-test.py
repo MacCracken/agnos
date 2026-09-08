@@ -30,6 +30,16 @@ IMG = os.path.join(WORK, "agnos-hidinject.img")
 SEED = os.path.join(WORK, "seed")
 SER = os.path.join(WORK, "serial-hidinject.log")
 MON = "/tmp/agnos-hidinject.sock"
+
+# ⛔ 1.57.1 — WITNESS THAT THIS IS THE FLAG-GATED KERNEL. This harness requires HID_CC_INJECT=1 and
+# never checked, so a run against an ordinary kernel proved nothing while scoring green — its own
+# header says as much. Same shape as scripts/harness/hid-halt-oracle-test.py.
+# ⚠ THE WITNESS MUST BE A DIFFERENT STRING FROM THE ONE ASSERTED, or deleting the asserted line
+# would excuse the gate instead of reddening it; the arming banner is emitted by a separate #ifdef.
+if os.path.exists(AGNOS) and b"CC INJECTION ARMED" not in open(AGNOS, "rb").read():
+    print("SKIP: build/agnos was not built with HID_CC_INJECT=1 — this run would prove nothing.")
+    print("      Build it with:  HID_CC_INJECT=1 sh scripts/build.sh")
+    sys.exit(2)
 PART_OFFSET = 33 * 1048576
 PART_BLOCKS = (67 * 1048576) // 4096
 EXT2_FEATURES = os.environ.get("EXT2_SMOKE_FEATURES",

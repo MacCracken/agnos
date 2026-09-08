@@ -83,7 +83,10 @@ fi
 
 command -v llvm-mc >/dev/null 2>&1 && command -v llvm-objcopy >/dev/null 2>&1 || {
     echo "texbi-body-identity: SKIP S3/S4 (no llvm-mc) -- source stages above still ran"
-    exit "$fail"; }
+    # ⛔ 1.57.1 — VOID, not the source-stage verdict. `exit "$fail"` reports 0 whenever the source
+    # stages passed, so an LLVM-less host scored a full green having never run S3/S4. Match
+    # scripts/check/shader-crossasm.sh: a missing tool is exit 2.
+    exit 2; }
 
 WD="$(mktemp -d)"
 trap 'rm -f "$T1" "$T2" "$T3" "$T4"; rm -rf "$WD"' EXIT

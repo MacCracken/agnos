@@ -6,8 +6,27 @@ type: issue
 
 # Vacuous gates — 77 fixed across 1.56.58 and 1.56.59
 
-**Status: ✅ ALL FILED FINDINGS RESOLVED. Every named surface swept. STAYS OPEN only for the two
-residual limits below, both of which are "cannot be executed here", not "not done".**
+**Status: 🟠 OPEN. All 33 FILED findings are resolved — re-verified item-by-item at 1.57.1, not
+taken from this banner. ⛔ BUT "Every named surface swept" IS FALSE and must not be read as coverage.**
+
+⛔ **`tests/*/` WAS NEVER SWEPT — 67 exercisers across 11 projects.** The 1.56.59 header silently
+substituted "host GPU oracles" for it and then declared every named surface done. That the class
+lives there is not speculation: `tests/telemetry/tlm.cyr` §3 was asserting the block band STATICALLY
+("some tag > 0", which the boot probe alone satisfies), and **two telemetry defects shipped to a
+downstream consumer under that green gate** — found by the chakshu work, not by any sweep. 18 of the
+67 have an external line-count floor; the remaining ~49 have no floor of any kind.
+
+⚠ **`host-gpu-oracles.sh` claims the in-oracle `n_pass == 0` floor for 17 GPU oracles is "filed as
+one". It is filed NOWHERE.** Either add the floors (mirroring `tests/gpu/cpuref.cyr`, the only one
+that has it) or delete the false claim from that comment.
+
+✅ **1.57.1 closed the three llvm-mc skip paths** (`texl-body-identity.sh`, `texbi-body-identity.sh`,
+`texl-cm-derive.py`): all three exited 0 with the dword-comparison stage never run, so an LLVM-less
+host scored full coverage having proven only the source-text half. Now exit 2 (VOID), matching
+`shader-crossasm.sh`. ⚠ Verified BOTH ways — success still exits 0, and a PATH without llvm-mc now
+yields rc=2 on all three.
+
+**Two residual limits below are genuinely "cannot be executed here", not "not done".**
 
 * **1.56.58** — 39 fixed / 1 declined across 30 files (`scripts/smoke`, `check.sh`, `check/`,
   `harness/`, `probe/`, `tool/`, `ktest.sh`).

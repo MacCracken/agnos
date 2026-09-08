@@ -1,6 +1,31 @@
-# 26 of 30 ring-3 test harnesses boot a PREBUILT exerciser and never check it is current — OPEN
+# 29 of 30 ring-3 test harnesses boot a PREBUILT exerciser and never check it is current — OPEN
 
-**Status:** OPEN. One instance fixed (`scripts/harness/telemetry-test.py`, 1.56.60); the class is not.
+**Status:** OPEN. ⚠ **The count in the title was 26 and is 29** — `puka-child-stdout` and `puka-terminal`
+only existence-check a sibling binary, which is not a freshness check. Measured at 1.57.1:
+`grep -l getmtime scripts/harness/*.py` matches ONE file out of 30.
+
+✅ **1.57.1 fixed five instances and widened the template:** `console-line-smoke.sh` (⭐ a SCORED
+SWEEP GATE that booted a fossil — `run_gate` rebuilds `build/agnos` and then the gate scored an image
+built from a different kernel; measured live at a full day of drift), `chan-ring3-smoke.sh` (now
+builds its own kernel), `launcher-panel-test.py` (copied its base image ONCE, then never again —
+21 days behind), and freshness guards for `mountlist-test.py` and `readdir-at-test.py`, **the two
+harnesses that produced ship evidence for 1.56.59/1.56.60**.
+
+⭐ **AND THE TEMPLATE CHANGED, which matters more than the five:** `telemetry-test.py`s guard
+watched `tlm.cyr` ALONE. A toolchain pin change rewrites the vendored `lib/`, so a binary from a
+different compiler scored as fresh. Every guard now watches **all build inputs** — `*.cyr`,
+`lib/*.cyr` and `cyrius.cyml`. ⛔ Any of the remaining ~24 guards written with the one-`.cyr` shape
+inherits the hole.
+
+⛔ **THE PREBUILT-IMAGE SUB-CLASS, WHICH THIS FILE NEVER NAMED AND IS THE WORST:** six harnesses boot
+a whole frozen image — kernel, agnsh and every staged tool together — with measured drift of 1, 21
+and 38 days. An exerciser guard does not touch it.
+
+⚠ **The 10 rootfs-staged harnesses need an operator design decision before they can be written:** this
+files own rule forbids auto-building siblings, while `scripts/burn/burn-prep.sh` already implements
+the right staleness derivation and no harness calls it. Decide the shape first — 10 harnesses inherit
+it. ⛔ And "needs no shared infrastructure" was true at one instance and is the wrong call at 29: a
+`scripts/harness/_freshness.py` helper is the right shape.
 
 ⛔ **AND IT IS NOT JUST THE EXERCISER — IT IS THE KERNEL.** Every harness here also resolves
 `AGNOS = ROOT/build/agnos` as a prebuilt path and never runs `scripts/build.sh`. A second mutation
