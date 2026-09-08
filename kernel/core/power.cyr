@@ -138,6 +138,30 @@ fn power_quiesce_devices() {
     r8169_quiesce();
     power_storage_quiesce();
     xhci_stop();
+    # ⭐ REPORT THE HID HALT TALLY ON EVERY STOP PATH. Until now `hid_halt_flagged` was printed ONLY
+    # from the DECLINED branch in hid_recover_halted — so an operator trying to PROVOKE an endpoint
+    # stall on iron got silence when the provocation missed, and silence is indistinguishable from
+    # "a stall happened and something swallowed it". That made the roadmapped HID burn unfalsifiable
+    # in the one way that matters: you could not tell a failed attempt from a failed driver.
+    # ⇒ Printing it here, after xhci_stop and before the quiesce line, means ANY deliberate stop
+    # (`poweroff`, `reboot`, `halt`, or agnsh `exit`) answers the burn's first question — did a
+    # halting completion code EVER reach the driver this boot — with a number instead of an absence.
+    # ⚠ Thread context, post-teardown: kprint is legal here. The ISR only ever increments.
+    # ⚠ flagged 0 on a burn attempt means THE PROVOCATION FAILED, not that recovery is broken. That
+    #   is a VOID result and must be recorded as one.
+    kprint("power: hid halt tally (flagged/confirmed/declined) ", 51);
+    kprint_num(hid_halt_flagged);
+    kprint("/", 1);
+    kprint_num(hid_halt_confirmed);
+    kprint("/", 1);
+    kprint_num(hid_halt_declined);
+    kprintln("", 0);
+    # The stolen-event counter answers the OTHER half — whether any HID Transfer Event was consumed
+    # by a synchronous xHCI waiter and handed back. 0 means the reclaim path never ran, so a clean
+    # keyboard proves nothing about it.
+    kprint("power: hid stolen-event reclaims ", 33);
+    kprint_num(hid_stolen_events);
+    kprintln("", 0);
     kprintln("power: devices quiesced", 23);
     return 0;
 }
