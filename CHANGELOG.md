@@ -22,7 +22,42 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 
 ## [1.57.1] — 2026-09-08 — backlog closeout: 21 items across six issue files
 
+### Fixed — HID residual #3: the gate now covers what the record claimed
+
+- ⛔ **`hid_reclaim_selftest` covered less than this repo believed, and a cut shipped saying otherwise.**
+  It registered a MOUSE row and asserted `owed == 1`, while the 1.56.56 fix owes **16** on a KEYBOARD
+  row — so neither the owed==16 loop nor the KBD branch ran anywhere.
+- **ARM 5 — owed==16 on the KBD branch.** ⛔ And the KBD branch is a *different code path*, which is
+  the trap that made a first attempt at this arm wrong: `hid_row_arm` dispatches on kind, and a KBD row
+  goes to `hid_arm_xfer_trb()`, which writes the **keyboard globals**, not `hid_ep_ring[i]`. A test
+  asserting on the row state passes a kernel that armed nothing — the same decoy that had
+  `hid_recover_halted` reading `hid_ep_idx` on a keyboard row and seeing 0/1 forever. The arm asserts
+  on the kbd globals **and** that the row index did not move, and checks all 16 TRBs for IOC/type so
+  "armed 1 and looped 16 times over one slot" cannot pass.
+- **ARM 6 — the Link-TRB wrap, BOTH paths.** The old scratch ring holds 32 TRBs and both paths wrap at
+  `idx == 255`, so the branch was **physically unreachable**. A 256-TRB ring reaches it. The paths wrap
+  differently — `hid_arm_row_trb` (mouse) writes the Link TRB with type + Toggle Cycle;
+  `hid_arm_xfer_trb` (kbd) only aligns the cycle of one `hid_kbd_configure` already placed — so testing
+  one would have left the other unproven.
+- ⭐ **Mutation-proven four ways**: `hid_service_rearms` arming 1 instead of `owed` → *did not arm all
+  16*; `hid_row_arm` losing its KBD branch → *used the row ring, not the kbd ring*; the mouse wrap
+  disabled → *did not wrap* + no Link TRB written; the kbd wrap disabled → *did not wrap* + the Link
+  cycle did not follow. Baseline and restored both PASS.
+- ⚠ Costs a 4 KB scratch ring, present only in `HID_RECLAIM_SELFTEST` builds.
+- ⇒ **All three in-tree HID residuals are now closed** (#1 at 1.56.59, #2 and #3 here). Nothing in-tree
+  remains; what is left is the burn.
+
+### Added — the HID halt tally, so the iron burn is falsifiable
+
+- ⛔ **`hid_halt_flagged` was printed ONLY from the declined branch**, so an operator trying to provoke
+  an endpoint stall got **silence** when the provocation missed — indistinguishable from "a stall
+  happened and something swallowed it". That made the roadmapped burn unfalsifiable in the one way that
+  matters. Every stop path (`poweroff`/`reboot`/`halt`/agnsh `exit`) now prints:
+  `power: hid halt tally (flagged/confirmed/declined) N/N/N` and `power: hid stolen-event reclaims N`.
+- ⚠ **flagged 0 on a burn attempt means the PROVOCATION failed — a VOID result, not a broken driver.**
+
 ### Fixed — vacuous-gates CLOSED: all 18 host GPU oracles floored
+
 
 - ⭐ **ALL EIGHTEEN host GPU oracles now carry an in-oracle non-vacuity floor**, plus four more
   outside the runner's list. The external line-count floor **cannot see a gutted oracle**: these files

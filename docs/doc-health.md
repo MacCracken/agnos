@@ -6,9 +6,43 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-09-03 (**1.56.60 — the shutdown/reboot review; see the 1.56.60 block**). Prior: 2026-09-02 (**1.56.58 — the klug line format became contract; see the 1.56.58 block**). Prior: 2026-08-31 (**1.56.56 — a CHANGELOG correction and the issues folder 7 → 4; see the 1.56.56 block**). Prior: 1.56.55 (the open-issue re-audit). Prior: 2026-08-29 (**1.56.52 — both audit P0s closed** — see the 2026-08-29 block; the 2026-08-28 block below it records the sweep that produced the backlog). **⛔ THE MULTI-MINOR LAG HAPPENED A THIRD TIME, AND THIS FILE PREDICTED IT TWICE.** The ledger sat at **v1.44.9** from 2026-06-10 to 2026-08-28 — **~12 minors** (1.45.x net/server, 1.46.x SMP, 1.47.x-1.49.x, 1.50.x-1.53.x, the 1.54.x-1.56.x GPU/display/shader arcs) — with state.md/roadmap/CHANGELOG kept per-cut and the body docs un-swept, which is verbatim the failure the two notes below describe. The stated fix ("fold a doc-health touch into the cycle-OPEN sweep") was never adopted. ⚠ **This refresh is NOT that catch-up sweep** — it records only what 1.56.51 actually touched. The body docs (`README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`) remain unswept since 1.44.9 and their syscall counts, sizes and subsystem tables should be assumed stale — the surface has since grown to **0-101**.
+> **Last refresh**: 2026-09-08 (**1.57.1 — the backlog closeout: six issue files to two, 30/30 harness freshness guards, 18/18 GPU oracle floors, and the iron burn at `#tracker-iron-v4`; see the 1.57.1 block**). Prior: 2026-09-03 (**1.56.60 — the shutdown/reboot review; see the 1.56.60 block**). Prior: 2026-09-02 (**1.56.58 — the klug line format became contract; see the 1.56.58 block**). Prior: 2026-08-31 (**1.56.56 — a CHANGELOG correction and the issues folder 7 → 4; see the 1.56.56 block**). Prior: 1.56.55 (the open-issue re-audit). Prior: 2026-08-29 (**1.56.52 — both audit P0s closed** — see the 2026-08-29 block; the 2026-08-28 block below it records the sweep that produced the backlog). **⛔ THE MULTI-MINOR LAG HAPPENED A THIRD TIME, AND THIS FILE PREDICTED IT TWICE.** The ledger sat at **v1.44.9** from 2026-06-10 to 2026-08-28 — **~12 minors** (1.45.x net/server, 1.46.x SMP, 1.47.x-1.49.x, 1.50.x-1.53.x, the 1.54.x-1.56.x GPU/display/shader arcs) — with state.md/roadmap/CHANGELOG kept per-cut and the body docs un-swept, which is verbatim the failure the two notes below describe. The stated fix ("fold a doc-health touch into the cycle-OPEN sweep") was never adopted. ⚠ **This refresh is NOT that catch-up sweep** — it records only what 1.56.51 actually touched. The body docs (`README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`) remain unswept since 1.44.9 and their syscall counts, sizes and subsystem tables should be assumed stale — the surface has since grown to **0-101**.
+>
+> ### 1.57.1 (2026-09-08) — the backlog closeout, and four documents that were describing it wrongly
+>
+> ✅ **`issues/` — SIX FILES TO TWO.** Archived with rewritten RESOLVED headers: the chakshu AP-idle
+> filing, `agnoshi-power-builtins` (fixed **in agnoshi**, shipped as 1.9.11 — cross-repo means
+> switching repos, which is what was done), `harness-exercisers-never-rebuilt` (**30/30** guards, was
+> 1/30), and `vacuous-gates-sweep` (**18/18** host GPU oracles floored, every floor mutation-falsified).
+> ⛔ **None was archived on its own header text** — each was re-verified item by item first, which is
+> the failure mode CLAUDE.md names.
+>
+> ✅ **`state.md`** — the kernel-head row said "1.57.1 — OPEN" and described the **6.6.0** pin move
+> while the tree was on **6.6.1** and the cut was released. Both corrected, plus the burn result.
+> ⚠ The `Cyrius pin` row still read 6.6.0 as well; a pin row that lags the manifests is exactly the
+> drift `toolchain-pin-check` exists to catch, and no gate covers the *prose*.
+>
+> ✅ **`agnos-userland-abi.md` §4.4** — told consumers a length-taking `sysinfo` overload was pending
+> upstream. It shipped in **cyrius 6.5.45**; as written it sent the next consumer to hand-roll a raw
+> syscall and compute band offsets by hand. Row 79 (`blk_info`) was also filled in — it was **empty**
+> while being the row §4.4 tells a consumer to multiply by.
+>
+> ✅ **`roadmap.md`** carried a `▶ 1.56.58 — item #1` heading four cuts in the past, plus a duplicate
+> row with line refs rotted by ~60 lines. **`doc-health.md`** (this file) repeated a stale "UNGATED"
+> claim about HID whose oracle had shipped at 1.56.59.
+>
+> ⛔ **SAFETY-CRITICAL ISSUE CORRECTION.** The agnoshi filing claimed `is_privileged_command` was dead
+> code and implied deleting it. **That symbol never existed** — the real classifier is
+> `is_admin_command` and it is fully live. Acting on the issue's authority would have downgraded
+> `reboot`/`poweroff`/`halt` from ADMIN. Corrected in place. ⚠ An issue file is not evidence; verify
+> its symbols against the tree before acting on one.
+>
+> ⚠ **`host-gpu-oracles.sh` claimed 17 missing floors were "filed as one". Nothing filed them.** A
+> comment asserting something is tracked, when nothing tracks it, is worse than silence — it stops the
+> next reader from filing it.
 >
 > ### 1.56.60 (2026-09-03) — the shutdown review, and two docs that described a design nobody built
+
 >
 > ✅ **`agnos-userland-abi.md`** row 13 — rewritten. It documented the **pre-1.55.25 stub**
 > (`| 13 | reboot | — | — | — | (halts) | serial_println + arch_halt |`) **five minors** after the

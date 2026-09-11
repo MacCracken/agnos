@@ -34,6 +34,31 @@ bounded seqlock-style retry (64 attempts, then proceed on the last sample: no wo
 unguarded read it replaces, and a spin would hang a recovery path).
 
 🟠 **WHAT IS LEFT IS THE BURN — AND ONLY THE BURN. Its prerequisites are done.**
+
+## ⛔ BURN ATTEMPT 2026-09-08 (agnos 1.57.1) — VOID, and read this before the next one
+
+The stall was **not provoked**. No `hid: an endpoint halted…` line. That is a VOID result, not a
+failed driver. Two procedural causes, both now understood — full record at
+`agnosticos/docs/development/iron-nuc-zen-log.md#tracker-iron-v4`:
+
+1. ⛔ **"Type while a USB disk does bulk I/O" IS NOT PERFORMABLE.** MSC is enumerate-only; there is no
+   way to drive disk traffic from the shell. Do not write that instruction again.
+2. ⛔ **The USB stick was never enumerated.** agnos binds **ONE** xHCI controller (first PCI match,
+   6 ports) and archaemenid has **two** (`04:00.3`, `04:00.4`). A device on the other controller is
+   invisible. For any MSC-adjacent test the stick must sit on the **same controller as the keyboard**
+   (the keyboard enumerated on port 2 of the bound one).
+
+✅ **The burn is now falsifiable, which it was not before.** `hid_halt_flagged` was printed ONLY from
+the declined branch, so a missed provocation gave silence — indistinguishable from a swallowed stall.
+Every stop path now prints `power: hid halt tally (flagged/confirmed/declined) N/N/N` plus
+`power: hid stolen-event reclaims N`. ⚠ **flagged 0 = the provocation failed. Record VOID.**
+
+**Procedure for the next attempt.** There is no software trigger — the flag is set only by a Transfer
+Event with cc **4** / **6** / **8**, and `XHCI_TRB_PORT_STATUS_CHG` is defined but never consumed, so
+there is no hot-plug path to lean on. Provoke it **physically on the keyboard link**: yank mid-typing,
+a marginal/long cable, or a flaky unpowered hub. Then `poweroff`, read the tally, and assert **input
+RESUMES** after the reset — a printed line is not the result.
+
 ⚠ **This paragraph previously said the prerequisites were outstanding, and a cut shipped while it
 still did.** Residual #2 (the torn `hid_row_idx`/`hid_row_cycle` read) landed at 1.57.1 and residual #3
 (the owed==16 / KBD-branch / Link-wrap coverage) landed after it, mutation-proven four ways. Do not
