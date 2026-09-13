@@ -198,10 +198,10 @@ try:
     p("sequence under test:", SEQ)
     if "f6" in SEQ:
         for _ in range(6):
-            s.sendall(b"sendkey f6\n"); time.sleep(0.7); drain()   # minimize
+            s.sendall(b"sendkey ctrl-f6 400\n"); time.sleep(0.7); drain()   # minimize
     if "f5" in SEQ:
         for _ in range(6):
-            s.sendall(b"sendkey f5\n"); time.sleep(0.7); drain()   # maximize
+            s.sendall(b"sendkey ctrl-f5 400\n"); time.sleep(0.7); drain()   # maximize
     mon("mouse_button 0", 0.5)          # release at last
     time.sleep(4.0)
 

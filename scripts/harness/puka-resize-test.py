@@ -144,7 +144,7 @@ try:
     rmark = len(ser())
     # F5 = maximize the focused window. Repeat: same HID-drain race as the spawn.
     for _ in range(10):
-        s.sendall(b"sendkey f5\n"); time.sleep(0.7); drain()
+        s.sendall(b"sendkey ctrl-f5 400\n"); time.sleep(0.7); drain()
     time.sleep(8.0)
     out = ser()[rmark:]
 

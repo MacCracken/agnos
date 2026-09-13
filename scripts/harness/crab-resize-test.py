@@ -175,22 +175,41 @@ try:
     # ⭐ LAUNCH CRAB SPECIFICALLY: F2 opens the launcher with the selection reset to index 0 (puka),
     # DOWN moves to index 1 (crab), Enter spawns it. ⚠ RETRY — a fixed burst sometimes never reaches
     # Enter, and a run with no crab cannot exercise a resize at all.
+    # ⛔⛔ ONE ENTER, ONE DOWN, EACH HELD — AND THE OUTCOME READ (2026-09-13, from crab-pointer-test).
+    # This used to send DOWN x6 and Enter x8 as bursts. Since crab 0.7.6 its Enter on a file SPAWNS it,
+    # and crab starts in /bin whose first row is `aethersafha`: every Enter past the one the launcher
+    # ate reached crab and started ANOTHER compositor — measured on this tree: three `desktop up`
+    # lines, two `crab: open` lines, and every key arm after it scored 0 against the wrong desktop.
+    # A DOWN burst is also a coin flip: the launcher wraps, so an even count lands back on puka.
+    # `sendkey <key> 400` holds the press across the compositor's per-frame drains, which is why one
+    # of each now suffices; the outcome is read from crab's own `presented` line vs the probe's.
+    desktops0 = ser().count("desktop up")
     launched = False
-    for attempt in range(6):
+    for attempt in range(10):
         lmark = len(ser())
-        for _ in range(8):
-            key("f2", 0.6)
-        time.sleep(1.0)
         for _ in range(6):
-            key("down", 0.6)                    # index 0 (puka) -> index 1 (crab)
-        time.sleep(1.0)
-        for _ in range(8):
-            key("ret", 0.6)
-        time.sleep(8.0)
-        if "presented over setu" in ser()[lmark:]:
+            key("f2 400", 0.8)
+            if "launcher opened" in ser()[lmark:]: break
+        if "launcher opened" not in ser()[lmark:]:
+            p(f"  launch attempt {attempt+1}: F2 never opened the launcher — retrying"); continue
+        dmark = len(ser())
+        key("down 400", 0.8)                    # index 0 (puka) -> index 1 (crab); ONE, held
+        key("ret 400", 0.8)
+        got = None
+        for _w in range(20):
+            seg = ser()[dmark:]
+            if "crab: dual-pane file-manager UI presented over setu" in seg: got = "crab"; break
+            if "present_probe: surface established" in seg: got = "probe"; break
+            time.sleep(0.5)
+        if got == "crab":
             launched = True; break
-        p(f"  launch attempt {attempt+1} did not present — retrying")
+        p(f"  launch attempt {attempt+1}: " + ("the DOWN was lost — the probe launched; retrying" if got == "probe" else "nothing presented — retrying"))
     p("crab launched and presented:", launched)
+    if launched and ser().count("desktop up") > desktops0:
+        p("INCONCLUSIVE: a SECOND compositor came up after launch — a stray Enter opened /bin/aethersafha")
+        try: s.sendall(b"quit\n")
+        except Exception: pass
+        qemu.terminate(); sys.exit(2)
     if not launched:
         p("INCONCLUSIVE: crab never presented — F5 had nothing to resize, verdict withheld")
         try: s.sendall(b"quit\n")
@@ -204,7 +223,7 @@ try:
     resized = False
     for burst in range(3):
         for _ in range(8):
-            key("f5", 0.7)
+            key("ctrl-f5 400", 0.7)              # aethersafha 0.16.25: chrome keys are Ctrl chords; bare F5 is the client's
         time.sleep(4.0)
         if "crab: resized" in ser()[rmark:] or "cannot back a surface" in ser()[rmark:]:
             break

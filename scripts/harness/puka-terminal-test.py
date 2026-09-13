@@ -616,9 +616,10 @@ try:
         # gate measures ONE thing. The delivery count above stays in the output either way, so the
         # underlying loss can never hide behind it.
         _hold_ms = int(os.environ.get("PUKA_KEY_HOLD_MS", "500"))
-        # ⛔ `tab` is CONSUMED by the compositor (it cycles focus and is deliberately not forwarded), so
-        # the number puka should see is every other key plus the Enters — never len(_typed).
-        _expect_at_puka = (len(_typed) - 1) + _enters
+        # ⭐ `tab` is FORWARDED as of aethersafha 0.16.25 — the compositor's focus key is Ctrl+Tab now, and a
+        # bare Tab is the client's (puka types it as 0x09). Before 0.16.25 it was consumed and this line read
+        # `len(_typed) - 1`; a harness that still expected that would score the new contract as one lost key.
+        _expect_at_puka = len(_typed) + _enters
         for _k in _typed:
             s.sendall((f"sendkey {_k} {_hold_ms}\n").encode()); time.sleep(_hold_ms / 1000.0 + 0.3); drain()
         time.sleep(0.5)

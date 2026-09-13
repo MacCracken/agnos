@@ -474,14 +474,14 @@ try:
         # ⚠ TAB FIRST so focus is on a real client window. With the seeded placeholder gone (0.12.8)
         # the list is {puka, crab} and focus already sits on the last one to present — but TAB is the
         # one compositor key iron-proven to cycle focus, and starting from a known state costs one key.
-        rl_key("tab")
-        rl_key("f4")                                # close the focused window
-        rl_key("f4")                                # focus advances on close; close the other
+        rl_key("ctrl-tab")
+        rl_key("ctrl-f4")                                # close the focused window
+        rl_key("ctrl-f4")                                # focus advances on close; close the other
         time.sleep(2.0)
         closed_seg = ser()[mark34:]
         rl_closes = closed_seg.count("SETU_CLOSE") + closed_seg.count("closing the focused window") \
                     + closed_seg.count("close")
-        rl_key("esc")
+        rl_key("ctrl-q")
         time.sleep(4.0)
         quit_seg = ser()[mark34:]
         rl_quit = ("frame loop ok" in quit_seg) or ("at exit — frames" in quit_seg)
@@ -545,7 +545,7 @@ try:
                 p(f"  ⭐ BROKE AT RELAUNCH #{_n} — leaving it in this state for the record.")
                 break
             # Quit it the way the operator does, so the next iteration starts from the same shape.
-            rl_key("esc")
+            rl_key("ctrl-q")
             time.sleep(3.0)
     if MODE == "desktop":
         # ⛔ THE ONLY TEST THAT CAN SHOW A DESKTOP. `--clients` STOPS as soon as both clients
@@ -624,8 +624,8 @@ try:
         p(f"=== F1-F4 WINDOW MOVE (USB HID on xHCI, {AE_KEY_HOLD_MS} ms hold) ===")
         # TAB first: focus must land on a window before a move means anything, and TAB is the one
         # compositor key proven to work on iron (it cycled focus four times in the 08-08 burn).
-        key_raw("tab")
-        MOVE_KEYS = ["f7", "f7", "f7", "f8", "f8", "f9", "f9", "f10", "f10", "f10"]
+        key_raw("ctrl-tab")
+        MOVE_KEYS = ["ctrl-f7", "ctrl-f7", "ctrl-f7", "ctrl-f8", "ctrl-f8", "ctrl-f9", "ctrl-f9", "ctrl-f10", "ctrl-f10", "ctrl-f10"]
         for _mk in MOVE_KEYS:
             key_raw(_mk)
         # ⭐⭐ LETTERS, BECAUSE FUNCTION KEYS CANNOT TEST THE FORWARD. Every key above is a COMPOSITOR
@@ -642,7 +642,7 @@ try:
         # reported `focused window has none, usage 11, focus index 0` — the forward was working and the
         # gate was aimed at the one window that cannot receive. A second TAB moves 0 -> 1 = puka, which
         # is the client the 2026-08-08 burn was actually about.
-        key_raw("tab")
+        key_raw("ctrl-tab")
         FWD_KEYS = ["h", "i"]
         for _fk in FWD_KEYS:
             key_raw(_fk)
@@ -963,9 +963,9 @@ try:
         # failure that was really a focus-order mistake in the harness.
         # ⚠ Two more TABs walk 0 -> 1 (puka) -> 2 (crab). Read the compositor's own
         # "closed a window ... " line rather than inferring the case from silence.
-        key_raw("tab")
-        key_raw("tab")
-        key_raw("f4")
+        key_raw("ctrl-tab")
+        key_raw("ctrl-tab")
+        key_raw("ctrl-f4")
         time.sleep(3.0)
         cl = ser()[cl_mark:]
         crab_gone = "crab: compositor closed the window -- exiting" in cl
@@ -1003,7 +1003,7 @@ try:
         rl_mark = len(ser())
         p("")
         p("=== RELAUNCH AFTER TEARDOWN (esc out, then run it again) ===")
-        key_raw("esc", hold_ms=200)
+        key_raw("ctrl-q", hold_ms=200)
         time.sleep(3.0); drain()
         typ("aethersafha\n", settle=2.0)
         time.sleep(25.0); drain()

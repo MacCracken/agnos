@@ -644,8 +644,9 @@ try:
             s.sendall((f"screendump {PPM}\n").encode()); time.sleep(3.0); drain()
             return glyphs()
 
-        # ⛔ TAB FIRST — the compositor focuses the LAST client added (crab). Consumed, not forwarded.
-        _send("tab")
+        # ⛔ Ctrl+TAB FIRST — the compositor focuses the LAST client added (crab). As of aethersafha 0.16.25 the
+        # focus key is the Ctrl chord; a bare Tab is forwarded to the client and would move nothing here.
+        _send("ctrl-tab")
         base = _shot(1.0)
 
         def run_cmd(text):
