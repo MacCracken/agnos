@@ -35,15 +35,19 @@ bytes; the name is the provenance). Everything below is a consequence of one of 
 behaves as if 1.57.2 had never shipped — and prints `kfont: face verify FAILED - not exposed` so a bad
 embed is a **visible boot fact**, not a garbled glyph an hour later in some client.
 
-⛔ **The reason this is not merely defensive:** while generating `face_data.cyr`, rekha found that
-**cyrius 6.6.3 emits a string literal of even length ≥ 65536 shifted by one byte on every alternate
-literal** — silently: `rc=0`, the byte *count* is intact, only the *content* is wrong, and the wrong
-content is a plausible one-byte shift of the right content. Nothing short of hashing detects it. It is
-filed in the compiler repo as
+⛔ **The reason this is not merely defensive — it has already caught one:** while generating
+`face_data.cyr`, rekha found that **cyrius 6.6.3 emitted a string literal of ≥ 65536 bytes read from
+its SECOND byte on alternate literals** — silently: `rc=0`, the byte *count* intact, only the *content*
+wrong, and the wrong content a plausible one-byte shift of the right content. Nothing short of hashing
+detects it. ✅ **Fixed in cyrius 6.6.4** (the lexer packed `(pool offset << 16) | length`, so a length
+≥ 65536 OR-ed into its own offset — the "even length / alternate literal" shape was the pool layout, not
+the mechanism; widened to `<< 32`) and **re-measured at 1.57.4: a single 410,820-byte literal of the face
+compiles byte-exact.** The 4 KB chunks and the verify stay. It was filed in the compiler repo as
 [`cyrius/docs/development/issues/2026-09-13-agnos-large-string-literal-loses-first-byte.md`](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-09-13-agnos-large-string-literal-loses-first-byte.md)
-(reproduced on 6.6.0 / 6.6.1 / 6.6.3; the repro proves itself). The kernel is downstream of a compiler
-that has been *measured* corrupting exactly this class of data, so **the kernel never exposes bytes it
-has not hashed** — and the build being green says nothing about the bytes being right.
+(reproduced on 6.6.0 / 6.6.1 / 6.6.3; the repro proves itself, and exits 0 on 6.6.4). The kernel is
+downstream of a compiler that has been *measured* corrupting exactly this class of data once, so **the
+kernel never exposes bytes it has not hashed** — the build being green says nothing about the bytes
+being right, and the next defect of this class will be caught the same way.
 
 ⚠ **The hash does not protect the serving path — the ring-3 gate does.** The boot line proves the
 kernel can see the bytes under *its* CR3. A memfile serving the wrong region under a *caller's* CR3

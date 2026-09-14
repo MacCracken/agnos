@@ -363,7 +363,7 @@ Access mode in the low 2 bits; modifiers above. **These are AGNOS values, not Li
 | `AO_APPEND` | `0x400` | seek to end on each write. ⛔ **DECLARED IN THE ABI, HONOURED BY NO BACKEND** — the ext2 open path never tests `0x400` and the FAT/exFAT arm says so outright (`syscall.cyr`: *"AO_TRUNC is implicit (whole-file replace); AO_APPEND TODO"*). ⚠ **THE BIT IS NEVERTHELESS TAKEN AND IS SET AT RUNTIME TODAY**: cyrius `lib/io.cyr` bridges Linux `O_APPEND` to `0x400` on every append-open, and `lib/io.cyr` compensates for the missing kernel half with an explicit `lseek(SEEK_END)`. ⇒ **Do not mint a new flag on `0x400`.** A 2026-08-31 request proposed exactly that for `AO_EXCL`, reading the kernel (where nothing tests the bit) rather than this table; it would have turned every existing append-open into `EEXIST`. Next free bit is **`0x2000`**. |
 | `AO_DIRECTORY` | `0x800` | must be a directory (for `getdents`) |
 | `AO_EXCL` | `0x2000` | ⭐ **with `AO_CREAT`, refuse a final component that ALREADY resolves** (1.56.56) — POSIX `O_EXCL`, completing the check-then-write pair `AO_NOFOLLOW` opened. ⛔ **Returns -1, NOT -17**: §1`s return convention has no `-errno`; a caller wanting `EEXIST` translates in its own wrapper. Without `AO_CREAT` the bit is ignored, as POSIX leaves it undefined there. ⚠ **Evaluated BEFORE `AO_TRUNC`** — this is load-bearing, not an implementation detail: checked afterwards, an `AO_CREAT\|AO_TRUNC\|AO_EXCL` open would zero the file and *then* refuse it, destroying exactly what the flag protects. The selftest asserts the surviving size, not just the refusal. ⚠ Routes to `ext2_path_lookup_ex(..., follow_last=0)`, so a symlink at the final component is a refusal **even when it dangles**. FAT/exFAT answer it too, via `fatfs_create`/`exfat_create`s existing-name refusal — whose return value is discarded without this flag, because `touch <existing>` depends on that. **Consumer: crab** (copy/move overwrite guard). |
-| `AO_NOFOLLOW` | `0x1000` | ⭐ **refuse if the FINAL component is a symlink** (1.56.53) — returns -1 rather than following it, closing the check-then-write TOCTOU that `readlink`#70 could only detect. Routes to `ext2_path_lookup_ex(..., follow_last=0)`. Mid-path symlinks still resolve, matching POSIX `O_NOFOLLOW` and `#70`. ext2 only in effect: FAT/exFAT cannot represent a symlink, so the flag is trivially satisfied there. ⚠ **This row was missing until 1.56.55** — the flag shipped two cuts earlier and reached no doc and no cyrius constant, so ring 3 could not name the thing that had been built for it. The cyrius peer is still owed. |
+| `AO_NOFOLLOW` | `0x1000` | ⭐ **refuse if the FINAL component is a symlink** (1.56.53) — returns -1 rather than following it, closing the check-then-write TOCTOU that `readlink`#70 could only detect. Routes to `ext2_path_lookup_ex(..., follow_last=0)`. Mid-path symlinks still resolve, matching POSIX `O_NOFOLLOW` and `#70`. ext2 only in effect: FAT/exFAT cannot represent a symlink, so the flag is trivially satisfied there. ⚠ **This row was missing until 1.56.55** — the flag shipped two cuts earlier and reached no doc and no cyrius constant, so ring 3 could not name the thing that had been built for it. ✅ The cyrius peer shipped in **6.6.4** (`lib/syscalls_x86_64_agnos.cyr` `AO_NOFOLLOW = 0x1000` / `AO_EXCL = 0x2000`; `lib/io.cyr` maps `O_NOFOLLOW`/`O_EXCL`/`O_DIRECTORY` onto them). |
 
 ### 3.5 🔒 Kernel-owned paths — the `/fonts` namespace (1.57.2)
 
@@ -427,11 +427,13 @@ outcome leaves all three arms answering **-1** as if the feature had never shipp
 | `kfont: no 2 MB region - face not exposed` | `pmm_alloc_2mb_run(1)` returned 0 — closed |
 | *(no line)* | a `BOOTCR3_KEEP_GNOBOOT_CR3` build never calls `kfont_init` (no direct map in its boot context) — closed |
 
-⛔ **Why the verify is load-bearing rather than defensive:** cyrius 6.6.3 emits a string literal of
-**even length ≥ 65536 shifted by one byte on every alternate literal**, silently (`rc=0`, byte count
-intact, content wrong) — found by exactly this hash while generating the face, filed as cyrius
+⛔ **Why the verify is more than defensive — it has already caught one compiler defect:** cyrius 6.6.3
+emitted a string literal of **≥ 65536 bytes read from its second byte on alternate literals**, silently
+(`rc=0`, byte count intact, content wrong) — found by exactly this hash while generating the face,
+**fixed in cyrius 6.6.4** (a 16-bit length packed into the literal's pool offset; re-measured at 1.57.4:
+a single 410,820-byte literal compiles byte-exact), filed as cyrius
 [`issues/2026-09-13-agnos-large-string-literal-loses-first-byte.md`](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-09-13-agnos-large-string-literal-loses-first-byte.md).
-rekha chunks at 4 KB to stay clear of it; the kernel still refuses to hand out bytes it has not hashed.
+rekha keeps its 4 KB chunks; the kernel still refuses to hand out bytes it has not hashed — the next defect of this class is caught the same way.
 
 ⭐ **What a client does.** `open` one of the two names read-only; on **-1, fall back to the bitmap
 face (kashi)** and carry on — the guard shape crab's issue already recommended (`if (flen > 0) { … }`)

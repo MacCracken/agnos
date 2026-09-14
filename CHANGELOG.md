@@ -20,6 +20,41 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.4] — 2026-09-14 — cyrius 6.6.4: the literal defect is fixed upstream
+
+### Changed — cyrius pin 6.6.3 -> 6.6.4, all four repos together
+
+- **All 13 agnos manifests raised**; `toolchain-pin-check` 13/13; **129/129** vendored `tests/*/lib`
+  files byte-match the 6.6.4 snapshot. **The kernel is byte-identical** under 6.6.3 and 6.6.4 from the
+  same source (`build/agnos` 2,419,216 B).
+- **Siblings travel with it:** **klug 0.1.10** (both shipped binaries CHANGED this time — 6.6.4's
+  `lib/io.cyr` maps `O_DIRECTORY`/`O_NOFOLLOW`/`O_EXCL` onto the agnos `AO_*` bits and routes `flock`
+  through `SYS_FLOCK`: `klug_agnos` 134,928 → 139,056 B; tests pass), **kashi 1.0.8** (49 + 1 tests,
+  `vet` still dependency-free for the freestanding face), **rekha 0.3.9** (eight RUN suites, the
+  regenerate-and-diff gate green — `face_data.cyr` is byte-identical outside its header comment).
+  `KASHI_REF=1.0.8` / `REKHA_REF=0.3.9` in `build.sh`/`test.sh`/`bench.sh` — cut those two tags before
+  pushing agnos, or the CI clone fallback fails.
+- ✅ **The compiler defect 1.57.2 filed is FIXED in 6.6.4 and re-measured here.** The lexer packed
+  every string token as `(pool offset << 16) | length`, so a literal of ≥ 65,536 bytes OR-ed its
+  length's high bits into its own pool offset and read back from its second byte — the "even length /
+  alternate literal" shape in the filing was the pool layout, not the mechanism. Under 6.6.4 the
+  self-proving repro exits 0 and a **single 410,820-byte literal of the face compiles byte-exact**
+  (65,536 / 131,072 / 410,820 all OK on the same bisection harness). The archived filing in cyrius
+  carries the correction. ⚠ **Nothing structural changes on our side:** rekha keeps its 4 KB chunks and
+  `kfont_init` keeps `rekha_face_default_verify` — that check *found* the last defect, and it is the
+  only thing that would find the next one. `kfont.cyr`, `docs/architecture/kernel-font-namespace.md`
+  and ABI §3.5 now record the defect as history rather than as a live constraint.
+- ✅ **`AO_NOFOLLOW` / `AO_EXCL` have their cyrius peer** — 6.6.4's `lib/syscalls_x86_64_agnos.cyr`
+  declares both and `lib/io.cyr` maps the POSIX `O_*` names onto them; ABI §3.3's "the cyrius peer is
+  still owed" (1.56.53 / 1.56.56) is closed.
+- ⚠ **Measured side finding:** the 6.6.4 wrapper HONOURS a manifest's pin — a scratch project pinned
+  at 6.6.3 built with `cycc 6.6.3` while 6.6.4 was active (`cyrius --version` → `cyrius 6.6.3 ·
+  manifest-pin: 6.6.3`), which is how the first re-measurement of the fix falsely said "still
+  corrupt". The 1.56.59-era note that the wrapper never pins `cycc` is stale; the memory of it is
+  corrected.
+- **Closeout:** `check.sh` 34/34 · `test.sh` 4/4 · `sweep.sh` **30/30** (no VOID this time; the exFAT read gate that lost the 1.57.3 sweep to the EBS flake passed first try) · plain kernel on disk.
+
+
 ## [1.57.3] — 2026-09-13 — the AP stacks leave the kernel image
 
 ### Fixed — the AP1-3 boot/TSS stacks moved out of kernel `.rodata` into the region-7 kstack pool

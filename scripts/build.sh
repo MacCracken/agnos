@@ -16,7 +16,7 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # with a sibling-checkout default — works on a local devbox where both
 # repos live under ~/Repos/ AND in CI where actions/checkout only fetches
 # this repo. When the sibling is absent we clone the pinned tag (override
-# via KASHI_REF=<tag-or-branch>). Pinned at 1.0.6 — a real tag, matching ../kashi/VERSION as of
+# via KASHI_REF=<tag-or-branch>). Pinned at 1.0.8 — matching ../kashi/VERSION as of 2026-09-14 (tag cut with agnos 1.57.4; was 1.0.6 as of
 # 2026-08-28. Bump it as kashi cuts new 1.x releases. Affects ONLY the clone fallback: cyrius.cyml
 # declares `[deps.kashi] path`, and the path wins, so a box with the sibling checkout never reads
 # this value. That is exactly why it rots unnoticed.
@@ -25,7 +25,7 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # (The freestanding font_data.cyr has been byte-identical across the 1.0.x bumps, which is what
 # has kept the divergence from producing a visible symptom — not a reason to tolerate it.)
 KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
-KASHI_REF="${KASHI_REF:-1.0.6}"
+KASHI_REF="${KASHI_REF:-1.0.8}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
     # ⛔ Same guard as the rekha block below (2026-09-13): the fallback replaces an ABSENT sibling
     # only, never a checkout that happens to lack the file — see the note there.
@@ -45,13 +45,13 @@ fi
 # rekha freestanding default-face data (1.57.2 — the kernel-embedded TrueType face behind
 # /fonts, core/kfont.cyr). SAME contract as kashi above, mirrored line for line: sibling checkout
 # by default, clone the pinned tag when absent (override via REKHA_REF=<tag-or-branch>). Pinned at
-# 0.3.8 — the tag that carries fonts/face_data.cyr, matching ../rekha/VERSION as of 2026-09-13.
+# 0.3.9 — matching ../rekha/VERSION as of 2026-09-14 (0.3.8 was the first tag carrying fonts/face_data.cyr).
 # ⚠ scripts/test.sh AND scripts/bench.sh carry the same default and MUST move with it — the kashi
 # triple diverged three times before 1.56.51 for exactly this reason, and the same failure mode
 # applies here: `[deps.rekha] path` wins locally, so a stale default is invisible until a clean CI
 # checkout builds against a different face than the one that was tested.
 REKHA_DIR="${REKHA_DIR:-$ROOT/../rekha}"
-REKHA_REF="${REKHA_REF:-0.3.8}"
+REKHA_REF="${REKHA_REF:-0.3.9}"
 if [ ! -f "$REKHA_DIR/fonts/face_data.cyr" ]; then
     # ⛔ NEVER rm -rf A GIT CHECKOUT (2026-09-13). The sentinel probed above is UNTRACKED in a rekha
     # working tree that has not committed fonts/ yet, so ordinary hygiene in the sibling — `git

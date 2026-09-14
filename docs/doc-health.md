@@ -6,7 +6,25 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-09-13 (**1.57.3 — the AP stacks left the kernel image for region 7, the tolerance gate went with them, and the filing was archived the day the decision was taken; see the 1.57.3 block**). Prior: 2026-09-13 (**1.57.2 — the kernel-embedded default TrueType face: a new architecture note, ABI §3.5, and the crab filing archived the day it was filed; see the 1.57.2 block**). Prior: 2026-09-08 (**1.57.1 — the backlog closeout: six issue files to two, 30/30 harness freshness guards, 18/18 GPU oracle floors, and the iron burn at `#tracker-iron-v4`; see the 1.57.1 block**). Prior: 2026-09-03 (**1.56.60 — the shutdown/reboot review; see the 1.56.60 block**). Prior: 2026-09-02 (**1.56.58 — the klug line format became contract; see the 1.56.58 block**). Prior: 2026-08-31 (**1.56.56 — a CHANGELOG correction and the issues folder 7 → 4; see the 1.56.56 block**). Prior: 1.56.55 (the open-issue re-audit). Prior: 2026-08-29 (**1.56.52 — both audit P0s closed** — see the 2026-08-29 block; the 2026-08-28 block below it records the sweep that produced the backlog). **⛔ THE MULTI-MINOR LAG HAPPENED A THIRD TIME, AND THIS FILE PREDICTED IT TWICE.** The ledger sat at **v1.44.9** from 2026-06-10 to 2026-08-28 — **~12 minors** (1.45.x net/server, 1.46.x SMP, 1.47.x-1.49.x, 1.50.x-1.53.x, the 1.54.x-1.56.x GPU/display/shader arcs) — with state.md/roadmap/CHANGELOG kept per-cut and the body docs un-swept, which is verbatim the failure the two notes below describe. The stated fix ("fold a doc-health touch into the cycle-OPEN sweep") was never adopted. ⚠ **This refresh is NOT that catch-up sweep** — it records only what 1.56.51 actually touched. The body docs (`README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`) remain unswept since 1.44.9 and their syscall counts, sizes and subsystem tables should be assumed stale — the surface has since grown to **0-101**.
+> **Last refresh**: 2026-09-14 (**1.57.4 — cyrius 6.6.4 across all four repos; the literal defect 1.57.2 filed is fixed upstream and the docs that called it live now call it history; see the 1.57.4 block**).
+>
+> ### 1.57.4 (2026-09-14) — a defect turned into history, and a peer that stopped being owed
+>
+> ✅ **`core/kfont.cyr` header, `architecture/kernel-font-namespace.md`, `agnos-userland-abi.md` §3.5** —
+> all three described the cyrius string-literal defect as a LIVE constraint ("cyrius 6.6.3 silently
+> corrupts…", "chunks at 4 KB to stay clear of it"). 6.6.4 fixed it (a 16-bit length packed into the
+> literal's pool offset — the filing's parity narrative was the pool layout, not the mechanism) and it
+> was re-measured here: a single 410,820-byte literal compiles byte-exact. The three now record it as
+> the defect the verify CAUGHT, and say why the chunks and the verify stay. ⚠ The first re-measurement
+> said "still corrupt" because the scratch manifest still pinned 6.6.3 and the 6.6.4 wrapper honoured it
+> — a doc-currency lesson in its own right: measure on the compiler the manifest selects.
+>
+> ✅ **`agnos-userland-abi.md` §3.3** — `AO_NOFOLLOW`'s row said "the cyrius peer is still owed" since
+> 1.56.53; 6.6.4's `lib/syscalls_x86_64_agnos.cyr` declares both it and `AO_EXCL`, and `lib/io.cyr` maps
+> the POSIX `O_*` names onto them. Closed with the version that shipped it.
+>
+> ✅ **`state.md` / `CHANGELOG.md` 1.57.4 / `scripts/{build,test,bench}.sh` refs** — pin rows and the
+> `KASHI_REF=1.0.8` / `REKHA_REF=0.3.9` clone fallbacks re-derived; sibling versions named.
 >
 > ### 1.57.3 (2026-09-13) — the AP stacks left the image, and the accommodation that described them went with them
 >

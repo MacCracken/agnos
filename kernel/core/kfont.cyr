@@ -33,11 +33,12 @@
 # `ls /fonts` on a root with no such directory lists nothing while open("/fonts/default.ttf")
 # succeeds — that is the contract, not a bug: a client that wants the face opens it BY NAME.
 #
-# ⛔ VERIFY BEFORE EXPOSE — LOAD-BEARING, NOT DEFENSIVE. cyrius 6.6.3 silently corrupts string
-# literals of EVEN length >= 65536 (every alternate literal emitted shifted by one byte; rc=0,
-# count intact, content wrong — found by bisection while generating face_data.cyr, filed against
-# cyrius). rekha chunks at 4 KB to stay clear of it, but the kernel must NEVER hand out bytes it
-# has not checked: kfont_init runs rekha_face_default_verify (FNV-1a-64 of the assembled buffer
+# ⛔ VERIFY BEFORE EXPOSE. This check FOUND a compiler defect and is kept for the next one: cyrius
+# 6.6.3 emitted a string literal of >= 65536 bytes read from its SECOND byte on alternate literals
+# (rc=0, count intact, content wrong — the lexer packed a 16-bit length into the pool offset; found
+# by bisection while generating face_data.cyr, filed, FIXED in cyrius 6.6.4 and re-measured at 1.57.4:
+# a single 410,820-byte literal now compiles byte-exact). The 4 KB chunks stay, and the kernel still
+# NEVER hands out bytes it has not checked: kfont_init runs rekha_face_default_verify (FNV-1a-64 of the assembled buffer
 # against the generator's hash of the source .ttf) and only a 1 sets kfont_ready. A 0 leaves the
 # namespace closed — open/stat return -1 exactly as if this arc had never shipped — and prints
 # the FAILED line so a corrupt literal is a visible boot fact, not a garbled glyph an hour later.
