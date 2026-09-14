@@ -5980,6 +5980,88 @@ if (smp_wake_enabled != 0) {
     kprintln("smp: AP wake gated (MVP single-core)", 36);
 }
 
+#ifdef SMP_STACK_SELFTEST
+# 1.57.3 SMP_STACK_SELFTEST — the RUNTIME half of the AP-stack relocation (the 1.57.2 embedded face
+# put the fixed region-1 AP windows [0x310000, 0x340000) inside kernel .rodata; 1.57.3 moved them to
+# region 7 — docs/development/issues/archived/2026-09-13-ap-stacks-inside-kernel-rodata.md). Driven by
+# scripts/smoke/ap-stack-smoke.sh (-smp 4). Runs HERE — after smp_start_aps has waited on every
+# pcpu_ap_ready, and before sched_active=1 so smp_wait_ticks is still valid — plus a further 5 ticks
+# so the woken APs (LAPIC timer armed + sti in ap_entry) have taken IF=1 timer frames on their stacks.
+# Three oracles:
+#   (1) WHERE each BOOT stack is: pcpu_ap_rsp[n], sampled in ap_entry right after tss_init_cpu
+#       (smp.cyr), must lie inside the region-7 AP window [DIRECTMAP_BASE + 0xFC0000, DIRECTMAP_BASE +
+#       0x1000000) — the DIRECT-MAP alias, never the identity VA (gdt.cyr tss_get_cpu_stack carries the
+#       map and the VA rule). Printed as `smpstk: ap N rsp=0x...` then the verdict. This sees the
+#       TRAMPOLINE half of the relocation only.
+#   (1b) WHERE each TSS.RSP0 is: load64(&tss_array + n*104 + 4), read while it still holds what
+#       tss_init_cpu stored from tss_get_cpu_stack (sched_active == 0 here, so no do_context_switch
+#       has run tss_set_rsp0 yet), must EQUAL DIRECTMAP_BASE + 0xFD0000 + n*0x10000 — the exact top
+#       the trampoline computes, so boot stack and RSP0 are one window. ⚠ 1.57.3 review: this value
+#       is functionally DEAD (an AP idles at CPL0, its timer frames go on the live stack, and the first
+#       real switch overwrites RSP0 via proc_rsp0_top before any ring-3 code lands there), so neither
+#       (1) nor (2) can see the gdt.cyr half regress — a tss_get_cpu_stack put back on region 1
+#       passed both. The same "no signal until it fires" shape tss_ist_selftest asserts for IST1.
+#       Printed as `smpstk: ap N rsp0=0x...` then its own verdict literal.
+#   (2) WHAT they no longer overwrite: the rekha chunk literals — the .rodata the old windows sat on —
+#       re-hashed IN PLACE, FNV-1a-64 over every chunk in order, exactly as rekha_face_default_verify
+#       computes it over the assembled copy, against rekha_face_default_fnv1a(). This is the
+#       load-bearing oracle: a stack that is anywhere in the image scribbles frames here on every
+#       tick, and the 1.57.2 tree passed every -smp 1 gate while doing exactly that.
+# ⛔ THE IN-PLACE READ OF rekha_face_default_chunk(i) IS ALLOWED ONLY UNDER THIS #ifdef. The
+# production kernel reads the literals exactly once — kfont_init, thousands of lines before any AP
+# wakes — and the served face is the verified direct-map copy. This reader exists to PROVE the stacks
+# are not on the literals any more; it is not a second consumer of the face and must not become one.
+# ⚠ smp_stack_selftest is also the reason the image gate (scripts/check/image-layout-check.sh) can
+# stay about the IMAGE alone: it gates LOAD end <= 0x370000 (the BSP boot stack's budget) and knows
+# nothing about where an AP stack IS. Static greps of the trampoline's hex are brittle; this is not.
+# Mutation-proven at 1.57.3 (ap-stack-smoke.sh header): (a) the trampoline back on `add eax, 0x310000`
+# without the direct-map add + tss_get_cpu_stack back on 0x300000 + cpu*0x10000 + 0x10000 trips
+# OUT OF WINDOW on all three APs AND CORRUPTED; (b) tss_get_cpu_stack ALONE reverted trips ONLY the
+# three `rsp0 NOT the region-7 top` lines (rsp0=0x320000/0x330000/0x340000) — rsp OK, rodata intact,
+# kybernet up — which is why oracle (1b) exists. The restored tree prints the six OKs and `intact`.
+fn smp_stack_selftest() {
+    smp_wait_ticks(5);
+    var n = 1;
+    while (n < 4) {
+        if ((ap_online_mask & (1 << n)) != 0) {
+            var rsp = load64(&pcpu_ap_rsp + n * 8);
+            kprint("smpstk: ap ", 11); kprint_num(n); kprint(" rsp=0x", 7); kprint_hex(rsp); kprintln("", 0);
+            if (rsp >= DIRECTMAP_BASE + 0xFC0000 && rsp < DIRECTMAP_BASE + 0x1000000) {
+                kprint("smpstk: ap ", 11); kprint_num(n); kprintln(" in region-7 window OK", 22);
+            } else {
+                kprint("smpstk: ap ", 11); kprint_num(n); kprintln(" OUT OF WINDOW", 14);
+            }
+            # (1b) TSS.RSP0 — the gdt.cyr half. Exact equality, not a range: it must be THE top the
+            # trampoline set, or boot stack and RSP0 have drifted into two windows.
+            var rsp0 = load64(&tss_array + n * 104 + 4);
+            kprint("smpstk: ap ", 11); kprint_num(n); kprint(" rsp0=0x", 8); kprint_hex(rsp0); kprintln("", 0);
+            if (rsp0 == DIRECTMAP_BASE + 0xFD0000 + n * 0x10000) {
+                kprint("smpstk: ap ", 11); kprint_num(n); kprintln(" rsp0 at region-7 window top OK", 31);
+            } else {
+                kprint("smpstk: ap ", 11); kprint_num(n); kprintln(" rsp0 NOT the region-7 top", 26);
+            }
+        }
+        n = n + 1;
+    }
+    var h = 0xcbf29ce484222325;
+    var i = 0;
+    while (i < rekha_face_default_chunk_count()) {
+        var p = rekha_face_default_chunk(i);
+        var l = rekha_face_default_chunk_len(i);
+        var j = 0;
+        while (j < l) { h = (h ^ load8(p + j)) * 0x100000001b3; j = j + 1; }
+        i = i + 1;
+    }
+    if (h == rekha_face_default_fnv1a()) {
+        kprintln("smpstk: rodata intact after AP wake", 35);
+    } else {
+        kprintln("smpstk: rodata CORRUPTED by AP stacks", 37);
+    }
+    return 0;
+}
+smp_stack_selftest();
+#endif
+
 sched_active = 1;
 
 #ifdef FORK_SELFTEST

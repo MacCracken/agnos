@@ -383,6 +383,10 @@ else
         [ -n "$BLK_RING3_SELFTEST" ] && echo '#define BLK_RING3_SELFTEST'
         # KFONT_RING3_SELFTEST=1 — 1.57.2: /bin/kfont opens the kernel-embedded face from ring 3 (scripts/smoke/kfont-smoke.sh).
         [ -n "$KFONT_RING3_SELFTEST" ] && echo '#define KFONT_RING3_SELFTEST'
+        # SMP_STACK_SELFTEST=1 — 1.57.3: after the AP wake, print each AP's live RSP + whether it lies in
+        # the region-7 window, then re-hash the rekha chunk literals IN PLACE (the .rodata the 1.57.2
+        # region-1 AP windows sat on) against the generator FNV-1a. scripts/smoke/ap-stack-smoke.sh (-smp 4).
+        [ -n "$SMP_STACK_SELFTEST" ] && echo '#define SMP_STACK_SELFTEST'
         [ -n "$BLK_WRITE_SELFTEST" ] && echo '#define BLK_WRITE_SELFTEST'
         [ -n "$GPT_WRITE_SELFTEST" ] && echo '#define GPT_WRITE_SELFTEST'
         [ -n "$AGNOVA_INSTALL_SELFTEST" ] && echo '#define AGNOVA_INSTALL_SELFTEST'

@@ -140,6 +140,14 @@ run_gate "1.56.55 fork#96 + waitpid wait-any"          ""                       
 # (KFONT_RING3_SELFTEST) and seeds /bin/kfont like the blk-ring3 smoke, so it needs no buildenv here.
 # ⚠ There is no blk-ring3 row in this table to sit beside — that smoke is one of the ~68 still unlisted.
 run_gate "1.57.2 kernel-embedded face (/fonts/default.ttf, rekha)" ""                             "kfont-smoke.sh"
+# 1.57.3 — the AP1-3 boot/TSS stacks relocated OUT of kernel .rodata (the 1.57.2 face put the fixed
+# region-1 windows [0x310000, 0x340000) inside the chunk literals) into region 7 via the direct map.
+# The runtime half: an SMP_STACK_SELFTEST kernel under -smp 4 prints each AP's live RSP (sampled in
+# ap_entry) against [DIRECTMAP_BASE + 0xFC0000, +0x40000) and re-hashes the rekha chunk literals IN
+# PLACE after the wake (the load-bearing oracle — a stack anywhere in the image scribbles there on every
+# tick, invisible to every -smp 1 gate). Mutation-proven: the old placement trips both. Builds its own
+# kernel, so it needs no buildenv here; the image-side bound (LOAD end <= 0x370000) is check.sh gate 34.
+run_gate "1.57.3 AP stacks in region 7 (-smp 4, rodata intact after wake)" ""                     "ap-stack-smoke.sh"
 run_gate "1.39.x exFAT write (+ subdir)"             "EXFAT_WRITE_SELFTEST=1"                   "exfat-write-smoke.sh"
 
 # --- ext2/jbd2 write regression bar (the iron-validated path must stay green) ---

@@ -43,9 +43,9 @@ fn gdt_init() {
 # 4 TSS structures, 104 bytes each (RSP0 at offset 4, IOPB at offset 100).
 # Each CPU gets its own TSS with its own RSP0 (kernel stack).
 #   CPU 0 (BSP): RSP0 = 0x3C0000  (was 0x200000 — relocated, see note below)
-#   CPU 1:       RSP0 = 0x320000
-#   CPU 2:       RSP0 = 0x330000
-#   CPU 3:       RSP0 = 0x340000
+#   CPU 1:       RSP0 = DIRECTMAP_BASE + 0xFE0000   (1.57.3 — region 7 via the direct map;
+#   CPU 2:       RSP0 = DIRECTMAP_BASE + 0xFF0000    was 0x320000/0x330000/0x340000 in region 1,
+#   CPU 3:       RSP0 = DIRECTMAP_BASE + 0x1000000   see the resolution note below)
 
 var tss_array[416];  # 4 CPUs x 104 bytes each
 # BSP kernel interrupt stack (TSS.RSP0) — the ring-0 stack the CPU switches to on a
@@ -58,30 +58,52 @@ var tss_array[416];  # 4 CPUs x 104 bytes each
 # pushes the 5-word frame + 15-GPR ISR save + the whole do_context_switch call tree
 # DOWN from RSP0 into live kernel globals -> corrupt switch -> triple fault -> the
 # "locks up right after the agnoshi banner" iron symptom. 0x3C0000 is above the image
-# end (0x2334E8 when this was written — 0x35E770 at 1.57.2, see the ⛔ below), below the
-# syscall kstacks (0x3D0000/0x3F0000), clear of the AP RSP0
-# stacks (0x320000-0x340000), and in PD[1] (mirrored identity-supervisor-writable into
-# every per-proc CR3) — the same reserved-region-1 placement the syscall kstack uses.
-# ⛔ THE AP STACKS ARE NO LONGER ABOVE THE IMAGE (2026-09-13, 1.57.2). The kernel-embedded
-# default face (core/kfont.cyr) added ~410 KB of .rodata string literals and the LOAD end
-# moved ~0x2FA2xx -> 0x35E770, so the CPU 1-3 windows below — boot stack AND TSS.RSP0, both
-# [0x310000, 0x340000) — now sit INSIDE .rodata, over rekha's chunk literals 52..100. Every
-# AP frame (the trampoline's push/lretq, ap_entry, the idle's CPL0 timer frames, the initial
-# RSP0) lands in the loaded kernel image through the RW 2 MB identity pages: no fault, no
-# signal, the exact class this note's own 1.44.x story is about. Tolerated for 1.57.2 only
-# because those literals are dead after kfont_init (read once, before smp_start_aps) and the
-# first live kernel byte above CPU3's stack top is 275 B away — both locked by
-# scripts/check/image-layout-check.sh (check.sh gate), NOT by anything in this file. The fix
-# is to move these three windows above the image — the region-7 kstack pool the syscall
-# kstacks already use is the natural home — and it is the operator's call:
-# docs/development/issues/2026-09-13-ap-stacks-inside-kernel-rodata.md. Until then, do not
-# add a reader of rekha_face_default_chunk, and re-run the gate after anything that shrinks
-# .text/.bss or re-orders .rodata.
+# end (0x2334E8 when this was written — 0x35E770 at 1.57.2), below the legacy syscall kstack
+# VAs (0x3D0000/0x3F0000, region-7 direct-map since 1.51.x), and in PD[1] (mirrored
+# identity-supervisor-writable into every per-proc CR3) — the reserved-region-1 placement the
+# syscall kstack used to share. Since 1.57.3 it is the image's ONLY region-1 neighbour besides
+# the BSP boot stack (top 0x380000, boot_shim.cyr): the invariant is LOAD end <= 0x370000
+# (that stack's 64 KB budget), enforced by scripts/check/image-layout-check.sh (check.sh gate).
+# ⭐ 1.57.3 — THE AP STACKS LEFT REGION 1 FOR REGION 7 (resolution of
+# docs/development/issues/archived/2026-09-13-ap-stacks-inside-kernel-rodata.md). WHAT MOVED: the CPU 1-3
+# boot stack (smp.cyr trampoline) AND TSS.RSP0 (tss_get_cpu_stack below — the same window, as
+# they always were), from the fixed identity windows [0x310000, 0x340000) to the region-7 slots
+# [0xFD0000 + (cpu-1)*0x10000, +0x10000), tops 0xFD0000 + cpu*0x10000. WHY: the 1.57.2
+# kernel-embedded face (core/kfont.cyr) grew .rodata to a LOAD end of 0x35E770, which put all
+# three region-1 windows INSIDE the loaded image, on rekha's chunk literals 52..100 — every AP
+# frame (the trampoline's push/lretq, ap_entry, the idle's CPL0 timer frames) landed in kernel
+# .rodata through the RW 2 MB identity pages with no fault and no signal. It was harmless only by
+# accident (the literals are dead after kfont_init, 275 B of dead-chunk margin) and 1.57.2 shipped
+# it under a gate. This is the THIRD instance of "pick a number above the image end of the day":
+#   · this very note's 1.44.x story — BSP RSP0 at 0x200000 sat ~210 KB inside live .bss, the first
+#     IF=1 ring-3 proc's timer tick corrupted the scheduler, triple fault on iron;
+#   · boot_shim.cyr step 12 — the 0x200000 BSP boot stack grew into .rodata and overwrote
+#     "exfatu: upcase-checksum OK", found only by a gdb watchpoint.
+# Region 7 (phys 0xE00000-0x1000000) is pmm-reserved by pmm_init and never in the image, so the
+# stacks can no longer meet the image however it grows — a placement, not a number.
+# ⛔ WHY DIRECT-MAP AND NEVER THE IDENTITY VA: region 7's identity VA (14-16 MB) is inside the
+# user-segment range, and a large binary (ark, segments to ~20 MB) overrides PD[7] in its own
+# per-proc CR3 — the hazard syscall_kstack_reserve (syscall_hw.cyr) and the IST1 note below both
+# document. An AP idle's stack OUTLIVES the boot CR3 (the scheduler resumes it under whatever CR3
+# is live), so it takes the same rule: DIRECTMAP_BASE + phys, which every per-proc CR3 mirrors
+# (PDPT[8..511]) and no segment ever overrides. The trampoline computes the identical VA
+# (`add eax, 0xFD0000` then `add rax, DIRECTMAP_BASE`), so boot stack and RSP0 stay one window.
+# The BSP is untouched: its RSP0 stays at 0x3C0000 and its boot stack (top 0x380000) stays in
+# region 1, because that stack is LIVE FROM THE SHIM'S FIRST INSTRUCTION under gnoboot's CR3 —
+# UEFI's identity map — before any kernel page table exists: the direct map (the only VA this rule
+# allows for a region-7 stack) is built by pmm_setup_directmap and becomes live at cr3_load(0x1000)
+# thousands of lines into main.cyr, and region 7's identity VA is forbidden by the ⛔ rule above
+# (kmain is proc 0 and is switched out on that very stack under per-proc CR3s). Region 1 (PD[1]) is
+# UEFI-mapped AND mirrored into every per-proc CR3, so it is the one place the boot stack can live
+# from power-on through every later CR3. (The legacy multiboot1 shim adds a second reason on its
+# own path: its hand-built page tables map only 0-4 MB — boot_shim.cyr step 4 — but the production
+# ELF64 shim builds no page tables at all, so "0-4 MB" is NOT the reason there.)
+# Region 7 is now FULL — see the map at IST1 below.
 var tss_kernel_stack = 0x3C0000;
 
 fn tss_get_cpu_stack(cpu_id) {
     if (cpu_id == 0) { return 0x3C0000; }   # BSP — relocated out of live .bss (see tss_kernel_stack note)
-    return 0x300000 + cpu_id * 0x10000 + 0x10000;   # ⛔ 0x320000/0x330000/0x340000 — inside .rodata at 1.57.2, see above
+    return DIRECTMAP_BASE + 0xFD0000 + cpu_id * 0x10000;   # 1.57.3 — region-7 window via the direct map; the SAME VA the trampoline set as this AP's boot stack, so boot stack and RSP0 remain one window
 }
 
 # Initialize TSS for a specific CPU and load its task register.
@@ -112,12 +134,19 @@ fn tss_init_cpu(cpu_id) {
     # like ark (segments to ~20 MB) overrides PD[7] in its own per-proc CR3 and would take the #DF
     # stack with it. The direct map is PDPT[8..511], mirrored into every per-proc CR3 and never
     # segment-overridden.
-    # ⚠ PLACEMENT IS EXACT AND THE GAP IS FULL. Region 7 (0xE00000-0x1000000) is reserved by pmm_init
-    # and already carries: proc_rsp0 pool 0xE00000-0xF00000, the PRIMARY syscall kstacks (tops
-    # 0xF10000 + cpu*0x10000 ⇒ 0xF00000-0xF40000) and the SECOND/nested ones (tops 0xF90000 +
-    # cpu*0x10000 ⇒ 0xF80000-0xFC0000). The free window is [0xF40000, 0xF80000) — 256 KB, which is
-    # 4 CPUs x 64 KB with nothing left over. Tops are 0xF50000 + cpu*0x10000. Do not add a fifth
-    # consumer here without re-deriving the map.
+    # ⚠ PLACEMENT IS EXACT AND REGION 7 IS FULL (re-derived 1.57.3, when the AP stacks moved in).
+    # Region 7 (phys 0xE00000-0x1000000, 2 MB, PD[7]) is reserved by pmm_init, identity-mapped under
+    # the kernel CR3 0x1000, and reached by EVERY consumer through its direct-map alias
+    # (DIRECTMAP_BASE + phys). The five consumers, in address order:
+    #   0xE00000-0xF00000   proc_rsp0 pool — 16 x 64 KB (proc.cyr KSTACK_POOL_BASE / KSTACK_SLOT)
+    #   0xF00000-0xF40000   PRIMARY syscall kstacks — tops 0xF10000 + cpu*0x10000 (syscall_hw.cyr)
+    #   0xF40000-0xF80000   IST1 (#DF) stacks — tops 0xF50000 + cpu*0x10000 (this line)
+    #   0xF80000-0xFC0000   SECOND/nested syscall kstacks — tops 0xF90000 + cpu*0x10000 (syscall_hw.cyr)
+    #   0xFC0000-0x1000000  AP boot/TSS stacks — tops 0xFD0000 + cpu*0x10000 for cpu 1-3
+    #                       (tss_get_cpu_stack + smp.cyr's trampoline); slot 0 [0xFC0000, 0xFD0000)
+    #                       is UNUSED — the BSP keeps its region-1 stacks (0x380000 / 0x3C0000).
+    # 2 MB = 32 x 64 KB = 16 + 4 + 4 + 4 + 4, nothing left over. There is NO sixth slot: a new
+    # per-CPU stack needs a new reserved region and its own map, not a squeeze into this one.
     store64(tss_addr + 36, DIRECTMAP_BASE + 0xF50000 + cpu_id * 0x10000);   # 0x24 = IST1
 
     # ⛔⛔ 1.56.52 — THE I/O-MAP BASE IS AT TSS OFFSET 102 (0x66), NOT 100, AND WRITING IT TO 100 GAVE

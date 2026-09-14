@@ -64,7 +64,7 @@ byte-exact.
    ~0.3 s, the APs wake at ~5.2 s; an extra `-smp 4` boot confirmed it) and locked by a new check.sh gate
    34 (`scripts/check/image-layout-check.sh`: dead-bytes-only under the AP window, single reader chain,
    `LOAD` end ≤ `0x370000`, 275 B margin reported). Relocating the stacks is the operator's decision:
-   `issues/2026-09-13-ap-stacks-inside-kernel-rodata.md`.
+   `issues/archived/2026-09-13-ap-stacks-inside-kernel-rodata.md` (resolved 1.57.3).
 4. **aarch64: no worse.** 33 reachable undefined functions / 46 undefined variables both before and
    after; no `kfont_*`/`rekha_*` diagnostics.
 5. **CI cannot clone rekha 0.3.8 until the operator cuts the tag** — `../rekha` is at `VERSION` 0.3.8

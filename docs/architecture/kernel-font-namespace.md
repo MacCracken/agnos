@@ -1,6 +1,6 @@
 # The kernel-owned `/fonts` namespace — invariants behind the embedded TrueType face
 
-> **Last Updated**: 2026-09-13 (1.57.2 — the cut that shipped it)
+> **Last Updated**: 2026-09-13 (1.57.3 — Invariant 5 rewritten for the AP-stack relocation; first written at 1.57.2, the cut that shipped the face)
 >
 > Code: [`kernel/core/kfont.cyr`](../../kernel/core/kfont.cyr) (the whole kernel half, ~150 lines) · the
 > three intercepts in [`kernel/core/syscall.cyr`](../../kernel/core/syscall.cyr) (`open`#7, `stat`#33,
@@ -9,9 +9,12 @@
 > Ring-3 contract: [`../development/agnos-userland-abi.md` §3.5](../development/agnos-userland-abi.md).
 > Origin: crab's filing, archived at
 > [`../development/issues/archived/2026-09-13-no-proportional-face-on-the-target.md`](../development/issues/archived/2026-09-13-no-proportional-face-on-the-target.md).
+> The layout finding this face triggered, and its 1.57.3 resolution:
+> [`../development/issues/archived/2026-09-13-ap-stacks-inside-kernel-rodata.md`](../development/issues/archived/2026-09-13-ap-stacks-inside-kernel-rodata.md).
 >
 > This note records *why the world is shaped this way*, for the things reading `kfont.cyr` alone will not
-> tell you. The measured numbers are from the 1.57.2 build; re-measure them, do not copy them forward.
+> tell you. The measured numbers are from the 1.57.2 build except where a figure is labelled 1.57.3
+> (Invariant 5's resolution); re-measure them, do not copy them forward.
 
 ## What it is, in one paragraph
 
@@ -52,11 +55,15 @@ ring-3 hash caught the corruption).
 
 rekha chunks the face at 4,096 bytes **to stay clear of the defect above** (the failure needs even
 length ≥ 65,536). `rekha_face_default_copy` walks the 101 chunks into the caller's buffer;
-`rekha_face_default_chunk(i)` is the only accessor and `kfont_init` is its only kernel caller.
+`rekha_face_default_chunk(i)` is the accessor and `kfont_init` is its only *production* kernel caller.
 
-⛔ **That "read once, at boot, before the APs wake" is now a locked invariant, not a description** —
-see Invariant 5. What ring 3 gets through `/fonts` is the **verified direct-map copy**, never the
-`.rodata` literals. Do not add a re-verify, a second copy, or any later reader of the chunks.
+What ring 3 gets through `/fonts` is the **verified direct-map copy**, never the `.rodata` literals — so
+the literals are read once, at boot. ⚠ At 1.57.2 that "read once, before the APs wake" was briefly a
+*locked* invariant with a "do not add a second reader" rule, because the AP stacks sat on the literals
+(Invariant 5). **That rule is retired at 1.57.3**: the literals are ordinary `.rodata` again, and the
+one other reader in the tree — `smp_stack_selftest` in `main.cyr`, under `#ifdef SMP_STACK_SELFTEST`
+only — re-hashes them in place *to prove nothing is stacked on them*. Still do not add a re-verify or a
+second copy to the production path; there is no reason to.
 
 ## Invariant 3 — one 2 MB region, addressed through the direct map, allocated after the CR3 switch
 
@@ -109,10 +116,12 @@ Two consequences a client must know: the fd is a `VFS_MEMFILE`, so **`write`#1 i
 arm in `vfs_write`) and **`lseek`#58 is -1** (`#58` repositions `VFS_EXT2_FILE` only) — the face is
 read front-to-back in one pass, and a rewind is a re-open. `read`#5 returns 0 at EOF, never -2.
 
-## Invariant 5 — the image grew 410 KB, and "under the 4 MB identity map" was the wrong fit check
+## Invariant 5 — the image grew 410 KB, the AP stacks were under it, and 1.57.3 moved them out
 
-The boot shim identity-maps `0x0–0x400000` with 2 MB pages and the image loads at `0x100000`, so the
-design's stated bound was "image + bss end under `0x400000`". Measured at 1.57.2 (`readelf -lW`):
+The legacy multiboot1 shim identity-maps `0x0–0x400000` with 2 MB pages (its step 4; the production
+ELF64 shim builds no tables and runs under gnoboot's, which cover the same window) and the image loads at
+`0x100000`, so the design's stated bound was "image + bss end under `0x400000`". Measured at 1.57.2
+(`readelf -lW`; the 1.57.3 tree is 320 B longer, LOAD end `0x35E8B0`, `build/agnos` 2,419,216 B):
 
 | thing | before 1.57.2 | at 1.57.2 |
 |---|---|---|
@@ -124,31 +133,58 @@ design's stated bound was "image + bss end under `0x400000`". Measured at 1.57.2
 | rekha chunk literals (101 × 4096 B, stride 4097) | — | 0x2DBBEB..0x340113 |
 | first live kernel literal above them (`"fb: mode="`) | — | 0x340114 |
 
-`0x35E770 < 0x400000` — the stated bound holds. ⛔ **But the window `0x300000–0x400000` is not empty.**
-PMM region 1 holds the kernel's *fixed* stacks, each placed by reading an image end off a build at the
-time and picking a number above it — and nothing re-checked them since: AP1–3 boot/TSS stacks at **`0x310000–0x340000`**
-(`smp.cyr` trampoline, `gdt.cyr` `tss_get_cpu_stack` = `0x300000 + cpu*0x10000 + 0x10000`), the BSP boot
-stack top at `0x380000` (`boot_shim.cyr` step 12), TSS RSP0 at `0x3C0000`, syscall kstacks at
-`0x3D0000`/`0x3F0000`. **The AP windows now sit inside `.rodata`, on rekha chunks ~52..100.** On any
-`-smp ≥ 2` boot, CPUs 1–3 push their frames into the loaded kernel image through the RW identity pages —
-no fault, no signal.
+`0x35E770 < 0x400000` — the stated bound held. ⛔ **But the window `0x300000–0x400000` was not empty.**
+PMM region 1 held the kernel's *fixed* stacks, each placed by reading an image end off a build at the
+time and picking a number above it, and nothing re-checked them since. At 1.57.2 the AP1–3 boot/TSS
+stacks were at `0x310000–0x340000` (`smp.cyr` trampoline `add eax, 0x310000`; `gdt.cyr`
+`tss_get_cpu_stack` = `0x300000 + cpu*0x10000 + 0x10000`) — **inside `.rodata`, on rekha chunks
+~52..100**: on any `-smp ≥ 2` boot CPUs 1–3 pushed their frames into the loaded kernel image through
+the RW identity pages, no fault, no signal, and every `-smp 1` gate stayed green. It was inert only
+because the chunks are read once in `kfont_init` (~5,500 lines before `smp_start_aps`) and 275 B of
+dead chunk lay above CPU3's top. 1.57.2 shipped it under a tolerance gate that decoded the chunk bytes
+under the window and locked the single reader chain; that was the accommodation, not the fix, and the
+filing is archived at
+[`../development/issues/archived/2026-09-13-ap-stacks-inside-kernel-rodata.md`](../development/issues/archived/2026-09-13-ap-stacks-inside-kernel-rodata.md).
+(The same paragraph used to list the syscall kstacks at `0x3D0000`/`0x3F0000`; those left region 1 for
+region-7 direct-map VAs at 1.46.x/1.51.x — `syscall_hw.cyr` — and were stale even then.)
 
-It is **inert today** for exactly two reasons, and `scripts/check/image-layout-check.sh` (check.sh
-gate 34, "kernel image vs fixed kernel stacks") now locks both:
+**1.57.3 — the resolution (operator decision 2026-09-13): the AP stacks moved to region 7.** AP *n*
+(1..3) now owns phys `[0xFC0000 + n*0x10000, +0x10000)` in the region-7 kstack pool (`0xE00000–0x1000000`,
+pmm-reserved by `pmm_init`, which the image can never reach), reached through its **direct-map alias**
+— top `DIRECTMAP_BASE + 0xFD0000 + n*0x10000`. Both placement sites hand the AP the same VA: the
+trampoline's 64-bit section does `add eax, 0xFD0000; mov rcx, imm64 DIRECTMAP_BASE; add rax, rcx;
+mov rsp, rax` (section 92 → 105 B; its comment had read "77" since the 1.46.x lretq block's +15 went
+uncounted — re-derived in place), and `tss_get_cpu_stack` returns the identical expression for RSP0.
+Never the identity VA: region 7's identity range (14–16 MB) is inside the user-segment range and ark's
+per-proc CR3 overrides PD[7], while an AP idle's stack outlives the boot CR3 — the rule the syscall
+kstacks and IST1 already follow. Region 7 is now **full** (`gdt.cyr`'s IST1 note carries the five-consumer
+map); `smp_start_aps` allocates nothing and refuses to send INIT-SIPI unless both the identity PD entry
+and the direct-map PDPT[8] entry (the one the AP's first push actually walks) are present.
 
-1. the chunks are read **once**, in `kfont_init` (~0.3 s), and the APs are woken by `smp_start_aps`
-   ~5,500 lines of `main.cyr` later (~5.2 s) — confirmed with an extra `-smp 4` boot: `kfont … OK`,
-   `smp: cpus online: 4`, agnsh banner. The gate locks the single reader chain
-   (`rekha_face_default_copy` has one kernel caller; `rekha_face_default_chunk` one module caller) and
-   proves every byte of `[0x310000, 0x340000)` is a dead chunk byte or NUL;
-2. the first **live** kernel byte above CPU3's stack top is at `0x340114` — a margin of **0x113 = 275 B**.
-   Any `.text`/`.bss` shrink or literal re-ordering over that slides `kprint` strings under an AP stack.
-   The gate hard-fails a `LOAD` end above `0x370000` (the BSP boot stack's 64 KB budget; headroom at
-   1.57.2 is `0x21890` = 137 KB, not the ~1.4 MB `boot_shim.cyr` used to claim) and reports the margin.
+The BSP is untouched — boot stack top `0x380000`, RSP0 `0x3C0000` — because its boot stack is live from
+the shim's first instruction under gnoboot's CR3, before any kernel page table (and so the direct map)
+exists; region 1 is the one window every CR3 from power-on onward maps. So the image's **only** region-1
+neighbour is the BSP boot stack, and the one invariant left is:
 
-The real fix — relocating the AP stacks above the image (the region-7 kstack pool is the suggestion) —
-is a layout redesign and the operator's decision:
-[`../development/issues/2026-09-13-ap-stacks-inside-kernel-rodata.md`](../development/issues/2026-09-13-ap-stacks-inside-kernel-rodata.md).
+> **`LOAD end <= 0x370000`** — the BSP boot stack's 64 KB budget. `scripts/check/image-layout-check.sh`
+> (check.sh gate 34, *"kernel image vs BSP boot stack (LOAD end <= 0x370000)"*) parses the ELF, hard-fails
+> above that, and prints the headroom (`0x11750` = 71,504 B at 1.57.3). It no longer decodes chunks or
+> counts readers — that branch is gone with the layout it described. Mutation: `p_memsz` → `0x370001` FAILs.
+
+**Where an AP stack actually is** is proven at runtime, not by a static grep of the trampoline's hex:
+`SMP_STACK_SELFTEST` (`scripts/build.sh` define; `smp_stack_selftest` in `main.cyr`, run after
+`smp_start_aps` and 5 further ticks, before `sched_active = 1`) prints, per online AP, (1) the live RSP
+sampled in `ap_entry` — must lie in `[DIRECTMAP_BASE + 0xFC0000, DIRECTMAP_BASE + 0x1000000)`; (1b) the
+TSS.RSP0 read back from `tss_array` — must *equal* the trampoline's top (that RSP0 is dead until a
+ring-3 proc lands on the AP and is overwritten by the first real switch, so this read is the only
+observer of the `gdt.cyr` half); and (2) the rekha chunk literals re-hashed **in place** (FNV-1a-64, as
+`rekha_face_default_verify`) against the generator hash — the load-bearing oracle for "no stack is in
+the image". `scripts/smoke/ap-stack-smoke.sh` (sweep.sh row *"1.57.3 AP stacks in region 7"*, `-smp 4`)
+builds that kernel and gates all three plus `smp: cpus online: 4` and `kybernet:`. Mutations, restored
+byte-exact: both sites back on the 1.57.2 placement → `rsp=0x31ffa8/0x32ffa8/0x33ffa8` OUT OF WINDOW ×3 +
+`rodata CORRUPTED by AP stacks`, still booting to kybernet (the corruption is silent — the finding);
+`gdt.cyr` alone reverted → `rsp0 NOT the region-7 top` ×3 with the boot stacks and rodata still clean
+(evidence lines in the smoke header).
 
 ⚠ **The 2 MiB size gates did not move.** `scripts/check.sh` `binary size` and `scripts/test.sh`
 `x86 size reasonable` both cap the kernel at 2,097,152 B and both went red at 2,418,896 B. The comment
@@ -209,7 +245,8 @@ the OFL permits bundling with GPL-3.0 software and does not permit dropping the 
 |---|---|---|
 | boot line `kfont: /fonts/default.ttf 410820 bytes OK` | the kernel assembled and hashed the face under its own CR3 | every boot; `kprint-len-check` covers the literal lengths |
 | `scripts/smoke/kfont-smoke.sh` + `tests/kfont/kfont.cyr` — **exit 95** | a real ring-3 process, exec'd from disk, opens by name, reads all 410,820 bytes, **hashes them** (the oracle), parses the sfnt header, probes each refused flag bit, both non-names, `stat`#33 and `lstat`#102 field-for-field, the alias; a `run: exit 128+vector` arm catches a fault-killed exerciser | `scripts/sweep.sh` row "1.57.2 kernel-embedded face"; six mutants recorded in the smoke header |
-| `scripts/check/image-layout-check.sh` — check.sh gate 34 | the AP stack window holds only dead chunk bytes; the single reader chain; `LOAD` end ≤ `0x370000` | mutation-tested (flipped chunk byte, patched byte under CPU1's stack top, `p_memsz` past `0x370000`) |
+| `scripts/check/image-layout-check.sh` — check.sh gate 34 *"kernel image vs BSP boot stack (LOAD end <= 0x370000)"* | `LOAD` end ≤ `0x370000` — the image stays under the BSP boot stack, the only region-1 neighbour left (1.57.3; the 1.57.2 chunk-decode / single-reader branch is gone) | mutation-tested (`p_memsz` past `0x370000`); prints the headroom |
+| `scripts/smoke/ap-stack-smoke.sh` + `SMP_STACK_SELFTEST` — **-smp 4** | each AP's live RSP in the region-7 direct-map window, each AP's TSS.RSP0 equal to the trampoline's top, the rekha chunk literals hash-intact **in place** after the wake, `smp: cpus online: 4`, kybernet | `scripts/sweep.sh` row "1.57.3 AP stacks in region 7"; two mutants in the smoke header (1.57.2 placement; `gdt.cyr`-only revert) |
 | `binary size` / `x86 size reasonable` | kernel-minus-face under the unchanged 2 MiB grant | check.sh / test.sh, lockstep |
 
 **Not changed, and checked before the crab issue was archived:** `vfs.cyr` (`vfs_mount_init`,

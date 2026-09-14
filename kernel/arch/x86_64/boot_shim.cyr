@@ -142,10 +142,24 @@ asm {
     #     PMM-reserved region 1 (0x200000-0x400000), above the image top
     #     (~0x210000 when written; 0x35E770 at 1.57.2, so the downward headroom is
     #     0x21890 = 137 KB, NOT the ~1.4 MB this note used to claim), and below the
-    #     fixed syscall kstack at 0x3F0000 — clear of both. ⛔ The AP stacks at
-    #     0x310000-0x340000 are NOT clear any more: see gdt.cyr's tss_kernel_stack
-    #     note and scripts/check/image-layout-check.sh, which hard-fails an image
-    #     end above 0x370000 (this stack's 64 KB budget) and reports the headroom.
+    #     BSP TSS.RSP0 window (bottom 0x3B0000, top 0x3C0000, gdt.cyr) — clear of
+    #     both. ⭐ 1.57.3: this stack is the image's ONLY region-1 neighbour. The AP
+    #     boot/TSS stacks that used to sit at 0x310000-0x340000 (inside .rodata since
+    #     the 1.57.2 embedded face) moved to region 7 (gdt.cyr tss_get_cpu_stack,
+    #     smp.cyr's trampoline); the BSP stack stays HERE because it is live from
+    #     the shim's first instruction, before any kernel page table exists — the
+    #     direct map (the only VA the gdt.cyr ⛔ rule allows for a region-7 stack)
+    #     is built by pmm_setup_directmap and live only from cr3_load(0x1000) in
+    #     main.cyr, region 7's identity VA is forbidden by that rule (kmain is
+    #     proc 0, switched out on this stack under per-proc CR3s), and region 1
+    #     (PD[1]) is the window every CR3 from power-on onward maps. On THIS legacy
+    #     multiboot1 path there is a second reason too: these page tables map only
+    #     0-4 MB (step 4 above) and region 7 is 14-16 MB — but that is not the
+    #     reason on the production ELF64 path below, which builds no page tables
+    #     and runs on UEFI's identity map. So the invariant
+    #     is LOAD end <= 0x370000 (this stack's 64 KB budget), enforced by
+    #     scripts/check/image-layout-check.sh — it hard-fails above that and prints
+    #     the headroom. Nothing else in region 1 can meet the image any more.
     0x48; 0xBC; 0x00; 0x00; 0x38; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x380000
     0x48; 0x89; 0xE5;                                      # mov rbp, rsp
 }
@@ -228,11 +242,21 @@ asm {
     # 1. 64-bit stack at 0x380000 (NOT 0x200000 — see the legacy path's step 12
     #    note: the >2 MB kernel image's .rodata sits just below 0x200000, so a
     #    stack there grows down into the string literals. 0x380000 is in the
-    #    PMM-reserved region 1, above the image, below the 0x3F0000 syscall kstack).
+    #    PMM-reserved region 1, above the image, below the BSP TSS.RSP0 window
+    #    [0x3B0000, 0x3C0000) (gdt.cyr tss_kernel_stack) — NOT "below the 0x3F0000
+    #    syscall kstack", which this note said until 1.57.3: the syscall kstacks
+    #    left region 1 for region-7 direct-map VAs (0xF10000 + cpu*0x10000,
+    #    syscall_hw.cyr) at 1.46.x/1.51.x, and nothing lives at 0x3F0000 now).
+    #    ⚠ This shim builds NO page tables (UEFI's identity map carries the boot);
+    #    the stack stays in region 1 because it is live from the first instruction
+    #    here, before the direct map — the only VA allowed for a region-7 stack —
+    #    exists, and region 1 is mapped by every CR3 from power-on onward (the
+    #    step-12 note above spells this out; its "0-4 MB" reason is legacy-only).
     #    ⚠ "Above the image" is 137 KB of headroom at 1.57.2 (LOAD end 0x35E770 with
-    #    the embedded face), gated by scripts/check/image-layout-check.sh; the AP
-    #    stacks below it are already INSIDE .rodata — see the step-12 note above and
-    #    gdt.cyr.
+    #    the embedded face). ⭐ 1.57.3: this is the image's ONLY region-1 neighbour —
+    #    the AP stacks moved to region 7 (gdt.cyr tss_get_cpu_stack) — so the one
+    #    invariant is LOAD end <= 0x370000, this stack's 64 KB budget, hard-failed
+    #    by scripts/check/image-layout-check.sh. See the step-12 note above.
     0x48; 0xBC; 0x00; 0x00; 0x38; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x380000
     0x48; 0x89; 0xE5;                                      # mov rbp, rsp
 

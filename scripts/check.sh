@@ -497,19 +497,22 @@ SZK=$((SZ - FACE))
 check "binary size ($SZ bytes; $SZK weighed = size minus the $FACE-byte embedded face)" $rc
 [ -z "$SZWHY" ] || echo "    VACUOUS: $SZWHY"
 
-# 1.57.2 — the kernel image vs the FIXED kernel stacks in region 1 (scripts/check/image-layout-check.sh).
-# The face's +410 KB of .rodata carried the LOAD end from ~0x2FA2xx to 0x35E770, across the AP1-3
-# boot/TSS stack window [0x310000, 0x340000) — a placement class this tree has paid for twice on
-# iron (gdt.cyr's RSP0-in-.bss triple fault, boot_shim.cyr's boot stack over the exfat literals) and
-# that no gate had ever measured; the arc's own fit check bounded the wrong address (0x400000).
-# Tolerated at 1.57.2 ONLY because the bytes under the window are rekha's dead-after-init chunk
-# literals; the gate proves that byte for byte, locks the literals' single reader chain, hard-fails
-# above 0x370000 (the BSP boot stack's 64 KB budget), and reports the 275 B margin to the first live
-# byte. The real fix — relocating the AP stacks — is the operator's call, filed in
-# docs/development/issues/2026-09-13-ap-stacks-inside-kernel-rodata.md. Same vacuity guard as the
-# size gate: a fossil binary describes a different tree. Mutation-tested (see the script header).
+# 1.57.2 -> 1.57.3 — the kernel image vs the BSP boot stack (scripts/check/image-layout-check.sh).
+# The 1.57.2 face's +410 KB of .rodata carried the LOAD end from ~0x2FA2xx to 0x35E770, across the
+# AP1-3 boot/TSS stack window [0x310000, 0x340000) — a placement class this tree has paid for twice
+# on iron (gdt.cyr's RSP0-in-.bss triple fault, boot_shim.cyr's boot stack over the exfat literals)
+# and that no gate had ever measured; the arc's own fit check bounded the wrong address (0x400000).
+# 1.57.2 tolerated the overlap through this gate (dead rekha chunk bytes, single reader chain);
+# 1.57.3 RELOCATED the AP stacks into region 7 (direct-map VAs, gdt.cyr tss_get_cpu_stack's map),
+# so the tolerated-overlap branch is gone and the gate is one number: LOAD end <= 0x370000, the BSP
+# boot stack's 64 KB budget below its top 0x380000 — the image's only remaining region-1 neighbour.
+# ⚠ WHERE the AP stacks ARE is a runtime fact: scripts/smoke/ap-stack-smoke.sh (SMP_STACK_SELFTEST,
+# -smp 4; a sweep.sh gate) samples each AP's RSP against the region-7 window and re-hashes the chunk
+# literals in place after the wake. docs/development/issues/archived/2026-09-13-ap-stacks-inside-kernel-rodata.md.
+# Same vacuity guard as the size gate: a fossil binary describes a different tree. Mutation-tested
+# (p_memsz past 0x370000 -> FAIL; see the script header).
 [ -z "$SZWHY" ] && sh "$ROOT/scripts/check/image-layout-check.sh" "$ROOT/build/agnos" > /tmp/image-layout-check.log 2>&1 && rc=0 || rc=$?
-check "kernel image vs fixed kernel stacks (AP window / BSP boot stack)" $rc
+check "kernel image vs BSP boot stack (LOAD end <= 0x370000)" $rc
 [ -z "$SZWHY" ] || echo "    VACUOUS: $SZWHY"
 [ "$rc" = "0" ] || cat /tmp/image-layout-check.log
 

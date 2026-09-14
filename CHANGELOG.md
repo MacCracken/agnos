@@ -20,6 +20,56 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.3] — 2026-09-13 — the AP stacks leave the kernel image
+
+### Fixed — the AP1-3 boot/TSS stacks moved out of kernel `.rodata` into the region-7 kstack pool
+
+- ⭐ **The layout invariant 1.57.2 broke is restored, by relocation rather than by a bigger number.**
+  The three AP windows lived at fixed region-1 addresses `[0x310000, 0x340000)` chosen by reading an
+  image end off a build (the third such placement in this tree, per the filing); the embedded face
+  carried the LOAD end to `0x35E770` and put every AP frame inside rekha's chunk literals. They now
+  occupy the last unclaimed 256 KB of region 7 — phys `[0xFC0000 + cpu·64 KB, +64 KB)`, tops
+  `0xFD0000 + cpu·0x10000` (`0xFE0000` / `0xFF0000` / `0x1000000`), slot 0 unused because the BSP
+  keeps its region-1 stacks (the boot shim's page tables map only 0–4 MB). **Region 7 is now full**
+  — `gdt.cyr` carries the re-derived five-consumer map.
+- ⛔ **Both the trampoline's RSP and `TSS.RSP0` are the DIRECT-MAP alias** (`DIRECTMAP_BASE + top`),
+  never region 7's identity VA — the same rule the syscall kstacks and IST1 already follow, because
+  PD[7]'s identity VA is exactly what a large ELF (ark, segments to ~20 MB) overrides under its own
+  CR3, and an AP idle's stack is resumed by the scheduler under whatever CR3 is live. The trampoline's
+  64-bit section gained `mov rcx, DIRECTMAP_BASE; add rax, rcx` (the section is **92 → 105 bytes** — its "(77 bytes)" comment had been stale since the 1.46.x `lretq` block; it now ends at `0x8129`, 87 B under the GDT16 pointer, and the derivation is written out); `smp_start_aps`
+  no longer allocates anything for the windows (pmm-reserved, identity-mapped by `pt_init`) and
+  refuses to wake APs if the window is unmapped.
+- **Gate 34 is simple again** — `image-layout-check.sh` PASSes iff `LOAD end ≤ 0x370000` (the BSP
+  boot stack's 64 KB budget); the tolerated-overlap branch, the chunk decoding and the single-reader
+  lock are gone, and the "do not add a reader of `rekha_face_default_chunk`" rule is retired.
+- **Proven the only way it can go red:** a new `SMP_STACK_SELFTEST` records each AP's live RSP in
+  `ap_entry`, and after the wake re-hashes the rekha chunk literals **in place** — the bytes the old
+  windows sat on. `scripts/smoke/ap-stack-smoke.sh` (-smp 4, in `sweep.sh`) requires
+  `smp: cpus online: 4`, three `smpstk: ap N in region-7 window OK` lines and
+  `smpstk: rodata intact after AP wake`, plus — after a reviewer showed the first two oracles were blind to
+  the `TSS.RSP0` half — each AP's `TSS.RSP0` read back equal to `DIRECTMAP_BASE + 0xFD0000 + cpu·0x10000`.
+  **Mutation-proven twice:** the 1.57.2 placement restored wholesale → `rsp=0x31ffa8 … OUT OF WINDOW` ×3
+  and `rodata CORRUPTED by AP stacks` (the boot still printed `cpus online: 4` and every kybernet line —
+  the corruption is silent, which is the finding); `tss_get_cpu_stack` alone reverted →
+  `rsp0=0x320000 … NOT the region-7 top` ×3 while everything else passed. Both restored byte-exact.
+- ⛔ **A review finding against this cut's own first draft:** the wake guard `vmm_is_mapped(0xFC0000)`
+  probed the *identity* page directory (`PD@0x3000[7]`), which the direct-map stack never walks through.
+  It now also requires the direct-map PDPT entry (`PDPT@0x2000[8]`, the walk the trampoline's first push
+  actually takes) to be present — the identity probe stays as the `pt_init` sanity check.
+- The BSP boot stack (`0x380000`) and BSP `TSS.RSP0` (`0x3C0000`) stay in region 1 — and the reason
+  every note gave ("the boot shim maps only 0–4 MB") was corrected to the true one: the stack is live
+  from the shim's first instruction under gnoboot's CR3 before any kernel page table or the direct map
+  exists, and kmain (proc 0) is switched out on it under per-proc CR3s, so region 7's identity VA is
+  forbidden for it too. `build/agnos` 2,418,896 → **2,419,216 B**; LOAD end `0x35E8B0`, 71,504 B under
+  the `0x370000` invariant.
+- Filed as `issues/2026-09-13-ap-stacks-inside-kernel-rodata.md`; resolved and archived.
+- **Closeout:** `check.sh` 34/34 · `test.sh` 4/4 · `sweep.sh` **29/30 + 1 VOID** — `1.39.x exFAT read`
+  never left OVMF (`gnoboot: fail @ EBS`) on the sweep run and once more standalone, then PASSed; the
+  sweep scores a VOID as a fail, which is right, but `exfat-smoke.sh` is one of ~12 smokes that detect
+  VOID (`qemu_assert_booted`) without the banner-gated retry (`qemu_dwell_kernel`) the 1.56.52 fix gave
+  the gates that were failing then. A harness residual, noted on the roadmap's harness row.
+
+
 ## [1.57.2] — 2026-09-13 — the kernel-embedded face, the P-1 backlog closed, cyrius 6.6.3
 
 ### Added — the kernel-embedded default face: `/fonts/default.ttf` (rekha kernel support, half two)
