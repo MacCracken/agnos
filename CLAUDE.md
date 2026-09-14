@@ -51,11 +51,11 @@ sh scripts/ktest.sh                     # in-kernel test suite under the same gn
 sh scripts/test.sh                      # x86_64 (default)
 sh scripts/test.sh --aarch64            # aarch64 (compile test) — ⛔ RED as of 1.56.51, see below
 sh scripts/test.sh --all                # both
-sh scripts/check.sh                     # 33-gate project validation
+sh scripts/check.sh                     # 34-gate project validation
 ```
 
-⛔ **aarch64 does not currently compile.** `sh scripts/build.sh --aarch64` fails with **32** reachable
-undefined functions and **46** undefined variables (re-measured 1.56.59; the surface has GROWN) — `arch/aarch64/stubs.cyr` has not kept up with
+⛔ **aarch64 does not currently compile.** `sh scripts/build.sh --aarch64` fails with **33** reachable
+undefined functions and **46** undefined variables (re-measured 1.57.2 — 33, not the 32 that was copied forward since 1.56.59) — `arch/aarch64/stubs.cyr` has not kept up with
 `core/`. It went unnoticed because `test.sh`'s cross-compiler probe named `cc5_aarch64`, a binary
 dropped at cyrius v6.1.0, so the aarch64 half of `--all` took an early return on every run and
 scored nothing. Both the probe and the silent-skip are fixed at 1.56.51; the port itself is not.
@@ -131,7 +131,7 @@ Release flow: `version-bump.sh` → fill CHANGELOG entries → commit → `git t
 
 Ship as the last patch of the current minor (e.g., `1.27.2` before `1.28.0`).
 
-1. **Full test sweep** — `scripts/check.sh` **33/33**, `scripts/test.sh` (x86) **4/4**. ⭐ The 33rd is the `kernel source formatting` gate, wired at 1.56.60: `scripts/check/fmt-check.sh` had existed all along and check.sh never ran it, so a local full-green was reachable over an unformatted tree while CI (`ci.yml` Format check) would reject the push. Fix drift with `sh scripts/check/fmt-fix.sh`.
+1. **Full test sweep** — `scripts/check.sh` **34/34**, `scripts/test.sh` (x86) **4/4**. ⭐ The 34th (1.57.2) is `kernel image vs fixed kernel stacks` — `scripts/check/image-layout-check.sh`, because the embedded face put the LOAD end over the AP stack window and no gate had ever measured that address. The 33rd is the `kernel source formatting` gate, wired at 1.56.60: `scripts/check/fmt-check.sh` had existed all along and check.sh never ran it, so a local full-green was reachable over an unformatted tree while CI (`ci.yml` Format check) would reject the push. Fix drift with `sh scripts/check/fmt-fix.sh`.
    ⚠ These counts were "11/11" and "`--all` 7/7" until 1.56.51 and neither was reachable: check.sh
    has grown to 30 gates, and `--all` tops out at 5 checks of which the aarch64 one is currently a
    FAIL. Re-read the tallies from a real run when you touch this list; do not copy them forward.
@@ -155,6 +155,9 @@ These are *how the world is*, not *what we chose*. Reading the code alone won't 
 - **`proc.cyr`'s `proc_create_address_space` / `proc_get_user_cr3` / `proc_map_page` / `proc_unmap_page` are x86-specific** (PML4 → PDPT → PD walk, hardcoded `0x3000` kernel-PD address, KPTI entry-511 stash). They're guarded by `#ifdef ARCH_X86_64`; the aarch64 build uses no-op stubs from `arch/aarch64/stubs.cyr`. Pre-1.27.0 they were unguarded and "won" over the stubs under last-definition-wins. Don't drop the guard.
 - **Memory-isolation test uses `stac`/`clac` brackets** around its user-page accesses. `proc_map_page` writes US=1 (`0x87`) per-process PD entries because the pages must be reachable from CPL=3; SMAP traps CPL=0 access to US=1 pages. If you write more kernel-mode code that touches per-process user pages, you need the same bracket discipline (or factor it into a `with_user_access(closure)` helper once there are 3+ sites).
 - **`kernel/user/shell.cyr` is on the format-skip list** (CI `Format check` step). It carries `#ifdef` *inside function bodies*, which can't satisfy both the formatter (wants indentation) and the preprocessor (needs column 0). If you write more code with that shape, add it to the SKIP list; don't try to make the formatter happy.
+- **`pmm_kva_for_access` (the direct-map alias) works only after `cr3_load(0x1000)`, not merely after `pmm_setup_directmap`.** Under gnoboot's boot CR3, `8 GB + phys` maps an unrelated identity GB, so a store through the alias lands nowhere at `-m 512M` and in someone else's RAM on a big box — `kfont_init` (1.57.2) measured exactly that (literals hashed clean in place, buffer read back all zeros) when slotted beside `fb_shadow_init`, which gets away with the early slot only because it uses the identity VA. Callers go after `pmm_bitmap_use_directmap()`.
+- **The kernel image must end below `0x310000`, or it sits under the fixed AP1-3 boot/TSS stacks at `0x310000–0x340000` (`gdt.cyr` `tss_get_cpu_stack`, `smp.cyr` trampoline); the BSP boot stack tops at `0x380000`.** "Under the 4 MB identity map" is the WRONG fit check. The 1.57.2 embedded face carried the LOAD end to `0x35E770`; it is tolerated only because the overlapped bytes are rekha's dead-after-init chunk literals, which `scripts/check/image-layout-check.sh` (check.sh gate 34) proves byte for byte. Do not add a second reader of `rekha_face_default_chunk`; the relocation is `docs/development/issues/2026-09-13-ap-stacks-inside-kernel-rodata.md`.
+- **The kernel-embedded face is folded in by `build.sh`/`test.sh`/`bench.sh` (`REKHA_DIR`/`REKHA_REF`), exactly like kashi, and `/fonts` is a prefix intercept in `open`/`stat`/`lstat`, NOT a mount** — `mlist.cyr:33` refuses backend ids > 3 and crab's volumes sidebar reads `mountlist`#104. See [`docs/architecture/kernel-font-namespace.md`](docs/architecture/kernel-font-namespace.md).
 - **The boot shim must be the first top-level statement emitted under x86_64** — cyrius v5.7.19+ enforces this via `kmode==1` emit order (PARSE_PROG before EMIT_GVAR_INITS); regression locked by cyrius's `check.sh` gate 4ab. See the `include` ordering in `kernel/agnos.cyr` and the comment above the `arch/x86_64/boot_shim.cyr` include.
 
 ## Docs Pointers

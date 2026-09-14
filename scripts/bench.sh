@@ -18,11 +18,39 @@ KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
 # 1.0.0, invisible locally because [deps.kashi] path wins over any of them.
 KASHI_REF="${KASHI_REF:-1.0.6}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
+    # ⛔ Refuse to delete a git checkout (2026-09-13) — see the rekha block in scripts/build.sh.
+    if [ -d "$KASHI_DIR/.git" ]; then
+        echo "ERROR: $KASHI_DIR is a git checkout without src/font_data.cyr — refusing to delete it." >&2
+        echo "  Regenerate/commit the file there or check out a ref that carries it (KASHI_REF=$KASHI_REF); the clone fallback only replaces an ABSENT sibling." >&2
+        exit 1
+    fi
     echo "  kashi not at $KASHI_DIR — cloning $KASHI_REF for bench build..." >&2
     rm -rf "$KASHI_DIR"
     git clone --quiet --depth 1 --branch "$KASHI_REF" \
         https://github.com/MacCracken/kashi.git "$KASHI_DIR" >&2 || {
         echo "ERROR: kashi clone failed (ref=$KASHI_REF)" >&2
+        exit 1
+    }
+fi
+# rekha default-face data (1.57.2): core/kfont.cyr calls rekha_face_default_*, so EVERY kernel
+# build — this bench build included — must prepend rekha's fonts/face_data.cyr next to kashi's.
+# Resolution mirrors scripts/build.sh; REKHA_REF kept in step with build.sh and test.sh (see the
+# ⛔ note at test.sh's KASHI_REF for why the three defaults must never diverge).
+REKHA_DIR="${REKHA_DIR:-$ROOT/../rekha}"
+REKHA_REF="${REKHA_REF:-0.3.8}"
+if [ ! -f "$REKHA_DIR/fonts/face_data.cyr" ]; then
+    # ⛔ Refuse to delete a git checkout — the untracked-sentinel hazard is written up at the same
+    # block in scripts/build.sh; this guard MUST stay in step with build.sh's and bench.sh's.
+    if [ -d "$REKHA_DIR/.git" ]; then
+        echo "ERROR: $REKHA_DIR is a git checkout without fonts/face_data.cyr — refusing to delete it." >&2
+        echo "  Regenerate/commit the file there or check out a ref that carries it (REKHA_REF=$REKHA_REF); the clone fallback only replaces an ABSENT sibling." >&2
+        exit 1
+    fi
+    echo "  rekha not at $REKHA_DIR — cloning $REKHA_REF for bench build..." >&2
+    rm -rf "$REKHA_DIR"
+    git clone --quiet --depth 1 --branch "$REKHA_REF" \
+        https://github.com/MacCracken/rekha.git "$REKHA_DIR" >&2 || {
+        echo "ERROR: rekha clone failed (ref=$REKHA_REF)" >&2
         exit 1
     }
 fi
@@ -125,7 +153,7 @@ fi
 # validation. The bench kernel must take the SAME ELF64 path the real kernel
 # does: the legacy `qemu -kernel` ELF32 entry hangs in apic_init under modern
 # QEMU, so bench (like every smoke test) boots via gnoboot + OVMF below.
-KASHI_DIR="$KASHI_DIR" sh "$ROOT/scripts/build.sh" >&2
+KASHI_DIR="$KASHI_DIR" REKHA_DIR="$REKHA_DIR" sh "$ROOT/scripts/build.sh" >&2
 cp "$ROOT/build/agnos" "$ROOT/build/agnos_bench"
 
 # Sources restored — undo the trap so a later non-build failure doesn't try to

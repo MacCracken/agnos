@@ -140,8 +140,12 @@ asm {
     #     silently corrupts them (caught via a gdb watchpoint: `push` at rsp=
     #     0x1ffbf8 overwrote "exfatu: upcase-checksum OK"). 0x380000 sits in the
     #     PMM-reserved region 1 (0x200000-0x400000), above the image top
-    #     (~0x210000) with ~1.4 MB of downward headroom, and below the fixed
-    #     syscall kstack at 0x3F0000 — clear of both.
+    #     (~0x210000 when written; 0x35E770 at 1.57.2, so the downward headroom is
+    #     0x21890 = 137 KB, NOT the ~1.4 MB this note used to claim), and below the
+    #     fixed syscall kstack at 0x3F0000 — clear of both. ⛔ The AP stacks at
+    #     0x310000-0x340000 are NOT clear any more: see gdt.cyr's tss_kernel_stack
+    #     note and scripts/check/image-layout-check.sh, which hard-fails an image
+    #     end above 0x370000 (this stack's 64 KB budget) and reports the headroom.
     0x48; 0xBC; 0x00; 0x00; 0x38; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x380000
     0x48; 0x89; 0xE5;                                      # mov rbp, rsp
 }
@@ -225,6 +229,10 @@ asm {
     #    note: the >2 MB kernel image's .rodata sits just below 0x200000, so a
     #    stack there grows down into the string literals. 0x380000 is in the
     #    PMM-reserved region 1, above the image, below the 0x3F0000 syscall kstack).
+    #    ⚠ "Above the image" is 137 KB of headroom at 1.57.2 (LOAD end 0x35E770 with
+    #    the embedded face), gated by scripts/check/image-layout-check.sh; the AP
+    #    stacks below it are already INSIDE .rodata — see the step-12 note above and
+    #    gdt.cyr.
     0x48; 0xBC; 0x00; 0x00; 0x38; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x380000
     0x48; 0x89; 0xE5;                                      # mov rbp, rsp
 

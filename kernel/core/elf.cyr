@@ -195,6 +195,25 @@ fn elf_load(elf_addr, elf_size) {
             # Do not silently trade one for the other by editing this number.
             if (p_vaddr + p_memsz > 0x10000000) { return elf_bail(new_cr3); }
 
+            # ⛔ 1.57.2 W^X CLOSED — A PT_LOAD ASKING FOR BOTH PF_W AND PF_X IS REFUSED, HARD.
+            # 1.56.51 left this as report-and-map-RWX because refusing regressed ring3-smoke
+            # 4 PASS -> 0, and blamed "stale RWX binaries from an older cyrius". MEASURED 1.57.2:
+            # that diagnosis was wrong. `readelf -lW` over build/rootfs/bin: 48 binaries, 48 `R E`
+            # + 48 `RW` PT_LOADs, **0 RWX**. The only RWX images either loader ever saw were the two
+            # HAND-BUILT selftest ELFs in main.cyr (ring3_elf_fill + spawn_parent_fill's inline
+            # child) carrying p_flags = 0x07 on CODE-ONLY segments — and ring3-smoke is what loads
+            # them, which is why the refusal took its tally to zero. Both are 0x05 now; the tally
+            # is unchanged (8 PASS / 0 FAIL) and the report line is gone from the log. Nothing in
+            # the tree needs RWX, so nothing gets it. The serial line stays as the operator-visible
+            # reason; the refusal is mutation-locked by ring3-smoke's `wx:` gate (ring3_wx_check).
+            # ⚠ SITED HERE, BEFORE THE PAGE LOOP, NOT INSIDE IT (where the 1.56.51 report lived): a
+            # refusal after pmm_alloc_2mb but before proc_map_page would leak the fresh 2 MB frame —
+            # elf_bail reclaims only what is MAPPED in new_cr3. Same shape as the bounds checks above.
+            if ((p_flags & 3) == 3) {
+                serial_println("elf: W^X violation - RWX segment refused", 40);
+                return elf_bail(new_cr3);
+            }
+
             # 1.44.8: populate each 2 MB page via its PHYSICAL (kernel-identity) address —
             # NOT by switching CR3 and writing the USER vaddr. The old form (pmm_alloc 4 KB;
             # mov cr3, new_cr3; memcpy to p_vaddr) was doubly broken (latent — spawn #3 was
@@ -214,26 +233,9 @@ fn elf_load(elf_addr, elf_size) {
                 # raw-phys #PF fix as sys_mmap + elf_load_from_file. proc_map_page still stores raw `phys`.
                 var kva = pmm_kva_for_access(phys);
                 # 1.56.51 W^X, both halves. PF_X -> read-only + executable (proc_map_page_rx);
-                # everything else -> writable + NX. A segment asking for BOTH (PF_W|PF_X) cannot be
-                # honoured under W^X, so it is refused rather than silently granted RWX — which is
-                # what proc_map_page did for every text page before this.
-                if ((p_flags & 1) != 0) {
-                    # ⚠ MEASURED 1.56.51: REFUSING RWX HERE REGRESSED ring3-smoke FROM 4 PASS TO 0.
-                    # A/B against the pre-change tree isolated it to the REFUSAL, not the read-only
-                    # mapping — "RWX allowed + R-X read-only" scores identically to the pre-W^X
-                    # baseline (4 PASS / 4 FAIL), so making text read-only costs nothing while the
-                    # refusal costs the test. The tree still holds stale RWX binaries from an older
-                    # cyrius; every binary the CURRENT toolchain emits is R-X + RW-. So W^X is
-                    # enforced where it can be, and a violation is REPORTED rather than either
-                    # silently granted (the pre-1.56.51 behaviour) or fatally refused.
-                    # ⛔ Make this a hard refusal once the stale binaries are rebuilt — the line
-                    # below is exactly what tells you when that has happened.
-                    if ((p_flags & 2) != 0) {
-                        serial_println("elf: W^X violation - RWX segment mapped writable+executable", 59);
-                        proc_map_page(new_cr3, pg, phys);
-                    }
-                    else { proc_map_page_rx(new_cr3, pg, phys); }
-                }
+                # everything else -> writable + NX. PF_W|PF_X never reaches here — refused above
+                # the loop (1.57.2), so this arm has exactly two shapes and neither is RWX.
+                if ((p_flags & 1) != 0) { proc_map_page_rx(new_cr3, pg, phys); }
                 else { proc_map_page_nx(new_cr3, pg, phys); }                   # 1.50.6: non-PF_X data segment -> NX (W^X)
                 memset(kva, 0, 0x200000);            # zero whole page (BSS + slack)
                 var lo = p_vaddr;  if (pg > lo) { lo = pg; }
@@ -446,6 +448,15 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
             # 1.41.5: keep the segment below the mmap arena base (0x10000000) — a
             # crafted on-disk p_vaddr must not alias the process's mmap arena.
             if (p_vaddr + p_memsz > 0x10000000) { return elf_bail(new_cr3); }
+            # ⛔ 1.57.2 W^X CLOSED — twin of the elf_load refusal above; the full rationale lives
+            # there. An on-disk PT_LOAD with PF_W|PF_X is refused before any page is allocated
+            # (measured 1.57.2: build/rootfs/bin holds 0/48 RWX binaries; the RWX images that made
+            # 1.56.51 back off were the hand-built selftest ELFs in main.cyr, now R|X). Sited before
+            # the loop so elf_bail's reclaim covers everything this call has touched.
+            if ((p_flags & 3) == 3) {
+                serial_println("elf: W^X violation - RWX segment refused", 40);
+                return elf_bail(new_cr3);
+            }
 
             # Map + populate 2 MB pages WITHOUT a CR3 switch. Each page is
             # pmm_alloc'd and identity-mapped in the kernel (vmm_map phys→phys),
@@ -470,27 +481,11 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
                 if (phys == 0) { return elf_bail(new_cr3); }
                 var kva = pmm_kva_for_access(phys);   # 1.49.9: kernel access handle — identity <=256 MB, direct-map above
                 # 1.50.6 W^X: PF_X segments stay executable; non-executable (data-only) segments are NX.
-                # NOTE: cyrius/cyrld currently emits ONE RWE PT_LOAD per binary (code+data+bss together), so
-                # this segment IS PF_X → executable (no change); true segment W^X needs cyrius to emit
-                # separate RX-code / RW-data segments. The STACK NX below is the live W^X win for now.
-                # 1.56.51 W^X — see the twin site in elf_load above.
-                if ((p_flags & 1) != 0) {
-                    # ⚠ MEASURED 1.56.51: REFUSING RWX HERE REGRESSED ring3-smoke FROM 4 PASS TO 0.
-                    # A/B against the pre-change tree isolated it to the REFUSAL, not the read-only
-                    # mapping — "RWX allowed + R-X read-only" scores identically to the pre-W^X
-                    # baseline (4 PASS / 4 FAIL), so making text read-only costs nothing while the
-                    # refusal costs the test. The tree still holds stale RWX binaries from an older
-                    # cyrius; every binary the CURRENT toolchain emits is R-X + RW-. So W^X is
-                    # enforced where it can be, and a violation is REPORTED rather than either
-                    # silently granted (the pre-1.56.51 behaviour) or fatally refused.
-                    # ⛔ Make this a hard refusal once the stale binaries are rebuilt — the line
-                    # below is exactly what tells you when that has happened.
-                    if ((p_flags & 2) != 0) {
-                        serial_println("elf: W^X violation - RWX segment mapped writable+executable", 59);
-                        proc_map_page(new_cr3, pg, phys);
-                    }
-                    else { proc_map_page_rx(new_cr3, pg, phys); }
-                }
+                # 1.56.51: PF_X -> read-only + executable (proc_map_page_rx). The 1.50.6 note that
+                # "cyrius/cyrld emits ONE RWE PT_LOAD per binary" is long stale — measured 1.57.2 the
+                # toolchain emits `R E` @0x400000 + `RW` @0x800000, and PF_W|PF_X is refused above the
+                # loop, so this arm has exactly two shapes and neither is RWX.
+                if ((p_flags & 1) != 0) { proc_map_page_rx(new_cr3, pg, phys); }
                 else { proc_map_page_nx(new_cr3, pg, phys); }
                 elf_pde_probe(new_cr3, pg, phys, 0);   # ELF_PDE_PROBE: did this PDE actually land?
                 # Zero the whole page first (covers BSS + any slack), then copy

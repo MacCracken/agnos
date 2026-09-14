@@ -20,6 +20,153 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.2] — 2026-09-13 — the kernel-embedded face, the P-1 backlog closed, cyrius 6.6.3
+
+### Added — the kernel-embedded default face: `/fonts/default.ttf` (rekha kernel support, half two)
+
+- ⭐ **AGNOS ships a proportional TrueType face a client can `open()`, at a path it can know.** Filed by
+  crab 2026-09-13 (*no proportional face on the target*): stack-wide there was no `.ttf` in any
+  first-party repo, and rekha — the outline-font library, kashi's scalable sibling — had never had
+  kernel support. Operator ruling: rekha is the answer, and the face is **kernel-embedded**, kashi-style.
+- **What ships:** Liberation Sans Regular 2.1.5, **410,820 bytes, embedded UNMODIFIED** (glyf outlines +
+  format-4 BMP cmap — the two things `rekha_font_open` requires), SIL OFL 1.1 with the licence text
+  vendored beside the source face in rekha. Exposed read-only at **`/fonts/default.ttf`** (the stable
+  contract) and **`/fonts/LiberationSans-Regular.ttf`** (provenance). `open`#7 with any write/create/trunc
+  flag → −1; `read`#5 to EOF returns exactly 410,820 bytes; `stat`#33 / `lstat`#102 fill the size.
+- ⚠ **`/fonts` is NOT a mount and does not appear in `mountlist`#104.** A font namespace is not a
+  volume: `tests/mountlist/mlist.cyr:33` refuses backend ids > 3 and crab's volumes sidebar consumes
+  that table. The path is resolved in `open`/`stat` *before* the mount table, so it shadows an on-disk
+  `/fonts` for those two verbs only; `readdir`/`mkdir`/`unlink` still route by mount.
+- **Mechanism:** `../rekha/fonts/face_data.cyr` is a freestanding generated module (no stdlib; 101
+  string literals of 4,096 bytes + `load8`/`store8`) folded into the kernel source by `build.sh`
+  exactly as kashi's `font_data.cyr` is (`REKHA_DIR`/`REKHA_REF`, mirrored in `test.sh` and `bench.sh`;
+  `[deps.rekha]` documents the contract). `kfont_init` takes one 2 MB region (`pmm_alloc_2mb_run`, the
+  fb-shadow precedent), assembles the chunks at its direct-map VA, and **verifies the FNV‑1a‑64 of the
+  whole face against the generator's hash before anything can open it** — `kfont: face verify FAILED -
+  not exposed` leaves the namespace absent rather than serving corrupt bytes.
+- ⛔ **That verify is load-bearing because of a cyrius compiler defect found while building this**: a
+  string literal of EVEN length ≥ 65,536 is emitted **shifted by one byte** (its first byte lost) on
+  every alternate literal — `rc=0`, byte count intact, content wrong; odd lengths and every length
+  below 64 KB are byte-exact (bisected 4,096…131,072 against the file's hash; reproduces on 6.6.0,
+  6.6.1, 6.6.3). Filed in cyrius as `issues/2026-09-13-agnos-large-string-literal-loses-first-byte.md`
+  with a self-proving repro. The generator chunks at 4 KB and rekha's own `face_test` runs the same
+  copy+verify on the host, so the trap fails there before the bytes reach a target.
+- **Gate:** `scripts/smoke/kfont-smoke.sh` (in `sweep.sh`) boots a `KFONT_RING3_SELFTEST` kernel that
+  runs `/bin/kfont` (`tests/kfont/`) from ring 3: open, read to EOF, hash, sfnt magic, `glyf`+`cmap`
+  present, write-open refused, unknown name refused, `stat` size, the alias — **exit 95**.
+  Mutation-proven: a skipped verify + one corrupt byte → exit 83; a dropped write-flag check → exit 87.
+- **Cost, measured:** `build/agnos` **1,999,616 -> 2,418,896 B** (+419,280); LOAD end `0x35E770`; one 2 MB
+  region at boot. ⚠ **The 2 MiB size gates did not move** — `check.sh`'s `binary size` and `test.sh`'s
+  `x86 size reasonable` now weigh `size − face` (the face length read live from the module the build
+  consumed, fail-closed to 0), so kernel code + tables + kashi is what sits under the unchanged grant:
+  **2,008,076 B weighed**, 89 KB under, the same headroom as before the face. Raising the number would
+  have been the reactive move the gate's own comment forbids; this is a re-derivation, and it is the
+  operator's to override.
+- ⛔ **A layout invariant broke and is TOLERATED by a gate, not fixed — operator decision filed.** The
+  +410 KB of `.rodata` carried the image across the AP1-3 boot/TSS stack window `[0x310000, 0x340000)`
+  (`gdt.cyr` `tss_get_cpu_stack`, `smp.cyr`'s trampoline): on any `-smp >= 2` boot CPUs 1-3 push their
+  frames into rekha's chunk literals 52..100, silently, through the RW identity pages. Harmless today for
+  two measured reasons — the chunks are read ONCE in `kfont_init` (~0.3 s) before `smp_start_aps`
+  (~5.2 s) and the served face is the verified direct-map COPY; and the first live kernel byte above
+  CPU3's stack top is 275 B away — and **new `scripts/check/image-layout-check.sh` (gate 34) locks
+  both**: it decodes the chunk literals from the face module and proves every byte under the window is
+  a dead chunk byte, locks the single reader chain, hard-fails a LOAD end above `0x370000` (the BSP boot
+  stack's budget), and is mutation-tested. The real fix — relocating the three AP windows above the
+  image, the region-7 kstack pool being the natural home — is
+  [`issues/2026-09-13-ap-stacks-inside-kernel-rodata.md`](docs/development/issues/2026-09-13-ap-stacks-inside-kernel-rodata.md).
+  ⛔ Do not add a second reader of `rekha_face_default_chunk`.
+- ⛔ **`kfont_init` cannot run where `fb_shadow_init` runs.** First slotted beside it (before
+  `cr3_load(0x1000)`) it MEASURED a verify failure on an all-zero buffer while the literals hashed clean
+  in place: the direct map is installed in `0x1000`'s PDPT but gnoboot's boot CR3 maps `8 GB + phys` to an
+  unrelated identity GB, so every store into the alias landed nowhere at `-m 512M` (and in someone else's
+  RAM on a big box). It runs after `pmm_bitmap_use_directmap()` inside the same
+  `#ifndef BOOTCR3_KEEP_GNOBOOT_CR3`; `pmm_kva_for_access`'s caller list was extended to say so.
+- ⛔ **The clone fallback could have deleted the operator's uncommitted rekha work.** The sentinel it
+  probes (`fonts/face_data.cyr`) is UNTRACKED until rekha commits it, so `git stash -u` / `git clean -fd`
+  in the sibling would have made `build.sh` `rm -rf ../rekha` — `.git` and any stash included — and then
+  fail to clone a tag that does not exist. All three scripts now refuse to delete a directory that
+  contains `.git`, for the rekha AND the kashi blocks (kashi was safe only because its file is committed
+  on every tag; that precondition does not copy with the lines).
+- crab needs nothing but the load, as its filing predicted; the **second** blocker on its item —
+  dhancha's per-call full-surface allocation outside the frame arena — is dhancha's and remains.
+  The filing is archived with its resolution.
+
+### Fixed — the P-1 audit backlog is CLOSED and archived (P0 2/2 · P2 29/29 · P1 23/26 + 1 partial-by-ruling + 2 aarch64-gated)
+
+- ⭐ **FAT multi-node chain cycles (`A -> B -> A`) no longer hang a walk.** Every EOC-terminated walk in
+  `fatfs.cyr` carries a per-WALK fetch budget through `fat_chain_overrun` (strictly `>` the volume's
+  cluster count — a valid chain may be exactly that long): 9 sites in the staged `steps`/`clus = 0`
+  form; the two slot-extend walks and the two `fatfs_truncate` walks **refuse (−1)** instead, because
+  a cycle has no tail to append after. The truncate pair was found by the coverage refuter, not the
+  survey: their bound was the dirent's 32-bit size — mounted-media data, up to 2³²/bpc fetches — not
+  the volume. 8 further call sites were already volume-bounded (`fatfs_read` since 1.41.5,
+  `fat_free_chain`, `fat_dir_end_index`, `fat_root_cluster_for_index`) or single-step.
+- ⭐ **exFAT never had the hang.** Every cursor-terminated walk in `exfat.cyr` has carried a
+  function-local `guard` at `cluster_count + 2` since the 1.34.x series; the 1.57.1 note inside
+  `exfat_next_cluster` counting it among "31 unguarded walk sites" was wrong (17 real + 14 already
+  bounded). Those guards now route through the new `exfat_chain_overrun`, one bound for both filesystems.
+- **Gate:** `scripts/smoke/fat-cycle-smoke.sh` (in `sweep.sh`) patches a real FAT32 ESP so a
+  100%-populated subdirectory chain is `A -> B -> A` (and the exFAT root chain likewise), boots
+  `FATFS_SELFTEST`+`EXFAT_SELFTEST`, and requires the post-walk markers plus the predicates' off-by-one
+  contract (`count` → 0, `count+1` → 1). **Mutation-proven on both predicates**: stubbing
+  `fat_chain_overrun` hung the boot at `fatc: cycle-walk start`; stubbing `exfat_chain_overrun` hung it
+  before `exfat: mounted`. ⚠ The FATTEST.BIN read could NOT serve as the hook — `fatfs_read` is capped
+  by `maxlen` and its own guard, so a cyclic FILE returns with or without the budget; the gate walks a
+  DIRECTORY for a name that is not there.
+- ⭐ **W^X is a hard refusal at both ELF loader sites.** ⛔ The 1.56.51 diagnosis — "stale RWX binaries
+  from an older cyrius" — was wrong: `readelf -lW` over `build/rootfs/bin` measures 48 binaries,
+  48 `R E` + 48 `RW` PT_LOADs, **0 RWX**. The only RWX images either loader ever saw were the two
+  HAND-BUILT selftest ELFs in `main.cyr` (`p_flags = 0x07` on code-only segments), which is exactly
+  why refusing took `ring3-smoke` to zero. Both are `0x05` now; the smoke tally is identical before
+  and after the flip. The refusal sits **before the page loop** — a refusal after `pmm_alloc_2mb` but
+  before `proc_map_page` would leak the fresh 2 MB frame, since `elf_bail` reclaims only mapped PDEs —
+  and the serial line reads `elf: W^X violation - RWX segment refused`. `proc_map_page` has no caller
+  left in `elf.cyr`. **Gate:** `ring3_wx_check` hands `elf_load` an R|W|X twin of the selftest ELF;
+  `ring3-smoke` requires `wx: RWX segment refused` and forbids `wx: RWX segment LOADED` — 9 passed /
+  0 failed; reverting one refusal site turns it red.
+- ⛔ **Three carried notes in the backlog were stale in the "worse than it is" direction** — the 31-site
+  count, the RWX diagnosis, and "`ring3-smoke` has 4 real failures": measured **8/8** on the untouched
+  tree, and it has been since the 1.56.55 dwell fix recorded in the smoke's own header. A carried note
+  rots exactly like a status header. `ring3-smoke` now uses the banner-gated `qemu_dwell_kernel` (two of
+  three baseline runs died in firmware and scored 0/8 against an EMPTY log) and prints a tally line.
+- **The four residuals are re-homed, not forgotten**: the aarch64 pair (the port itself, and
+  `timer.cyr:12`'s `[sp,#0]` frame-padding asm that zeroes `rdtsc()` and with it KASLR entropy on that
+  arch) → the roadmap's *aarch64 does not compile* row; the raw-disk `BLK_RW_ARM_MAGIC` gate (ruling:
+  the reorder is a measured ABI break) → *Native sandbox-confinement primitives*; `#92` op 0x0C SMP
+  (ruling: iron-only) → the *`#92` ABI table* row. `ext2-smoke`'s non-booting ESP recipe got its own row.
+  The file is archived with a closing STATUS block that says all of this.
+
+### Changed — cyrius pin 6.6.1 -> 6.6.3, and the vendored stdlibs were stale under the OLD pin
+
+- **All 12 existing manifests raised together, plus the new `tests/kfont` born at 6.6.3**; `toolchain-pin-check` **13/13**. Sibling **klug 0.1.9** and
+  **rekha 0.3.8** travel with it (both re-synced from the pin; klug's two shipped binaries are
+  byte-identical to 0.1.8's).
+- ⭐ **The kernel is BYTE-IDENTICAL under 6.6.1 and 6.6.3 from the same source** — the cheapest proof
+  that 6.6.3's nested-`continue` binding fix touches no kernel loop.
+- ⛔ **Four `tests/*/lib` snapshots were stale under the 6.6.1 pin already** (`audio`, `chan`, `fault`,
+  `symlink`: files matching 6.6.0 or no installed toolchain at all) — `cyrius lib sync` copies only
+  what `[deps].stdlib` DECLARES, and `tests/chan` pulled `result`, `atomic` and `fnptr` transitively
+  (io → result; alloc → atomic, fnptr) without declaring them, so `result.cyr` sat at the 6.6.0 copy
+  under a 6.6.1 pin. Same under-declaration klug had at 1.57.0. All three declared; **122/122 vendored
+  files now byte-match the 6.6.3 snapshot.**
+- ⭐ **`naad-ring3` is GREEN again** — 6.6.3 fixes the `#inline`-poisons-a-later-`#derive` parser bug that
+  had it RED in the sweep since 1.57.0 (not ours; reproduced in 7 lines then). Measured: `run: exit 88`,
+  `naad-ring3-smoke: PASS`, no source change on either side.
+- **aarch64 re-measured: 33 reachable undefined functions + 46 undefined variables** (was recorded as
+  32/46; the 33rd predates this cut — the count is re-derived, not copied). Still RED, unchanged by
+  the face: `kfont.cyr` sits in the unconditional core block, so `face_data.cyr` now rides the aarch64
+  prep in `build.sh` and `test.sh` too, and its only x86-only callee (`pmm_kva_for_access`) was already
+  undefined there.
+- **Boot sweep: `scripts/sweep.sh` 29/29 PASS** (the two new gates — `1.57.2 FAT/exFAT chain-cycle
+  budget`, `1.57.2 kernel-embedded face` — and `naad-ring3` all green); `agnsh-smoke` PASS.
+- `check.sh` is **34 gates** (`kernel image vs fixed kernel stacks` is the 34th); `test.sh` 4/4;
+  `ring3-smoke` prints a tally and is 9/9; `ktest.sh` **107 passed / 3 failed** (the 3 are the
+  documented environmental initrd cases — no initramfs is loaded). ⚠ `ktest.sh` still runs a bare
+  40 s `timeout` with no banner-gated retry, and one run this cut took a gnoboot hand-off flake as
+  "test output not found"; `QEMU_TIMEOUT=90` on the re-run reached the suite. It is the last harness
+  on the unguarded `qemu_dwell` shape.
+
+
 ## [1.57.1] — 2026-09-08 — backlog closeout: 21 items across six issue files
 
 ### Fixed — HID residual #3: the gate now covers what the record claimed

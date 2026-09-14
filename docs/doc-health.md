@@ -6,7 +6,76 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-09-08 (**1.57.1 — the backlog closeout: six issue files to two, 30/30 harness freshness guards, 18/18 GPU oracle floors, and the iron burn at `#tracker-iron-v4`; see the 1.57.1 block**). Prior: 2026-09-03 (**1.56.60 — the shutdown/reboot review; see the 1.56.60 block**). Prior: 2026-09-02 (**1.56.58 — the klug line format became contract; see the 1.56.58 block**). Prior: 2026-08-31 (**1.56.56 — a CHANGELOG correction and the issues folder 7 → 4; see the 1.56.56 block**). Prior: 1.56.55 (the open-issue re-audit). Prior: 2026-08-29 (**1.56.52 — both audit P0s closed** — see the 2026-08-29 block; the 2026-08-28 block below it records the sweep that produced the backlog). **⛔ THE MULTI-MINOR LAG HAPPENED A THIRD TIME, AND THIS FILE PREDICTED IT TWICE.** The ledger sat at **v1.44.9** from 2026-06-10 to 2026-08-28 — **~12 minors** (1.45.x net/server, 1.46.x SMP, 1.47.x-1.49.x, 1.50.x-1.53.x, the 1.54.x-1.56.x GPU/display/shader arcs) — with state.md/roadmap/CHANGELOG kept per-cut and the body docs un-swept, which is verbatim the failure the two notes below describe. The stated fix ("fold a doc-health touch into the cycle-OPEN sweep") was never adopted. ⚠ **This refresh is NOT that catch-up sweep** — it records only what 1.56.51 actually touched. The body docs (`README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`) remain unswept since 1.44.9 and their syscall counts, sizes and subsystem tables should be assumed stale — the surface has since grown to **0-101**.
+> **Last refresh**: 2026-09-13 (**1.57.2 — the kernel-embedded default TrueType face: a new architecture note, ABI §3.5, and the crab filing archived the day it was filed; see the 1.57.2 block**). Prior: 2026-09-08 (**1.57.1 — the backlog closeout: six issue files to two, 30/30 harness freshness guards, 18/18 GPU oracle floors, and the iron burn at `#tracker-iron-v4`; see the 1.57.1 block**). Prior: 2026-09-03 (**1.56.60 — the shutdown/reboot review; see the 1.56.60 block**). Prior: 2026-09-02 (**1.56.58 — the klug line format became contract; see the 1.56.58 block**). Prior: 2026-08-31 (**1.56.56 — a CHANGELOG correction and the issues folder 7 → 4; see the 1.56.56 block**). Prior: 1.56.55 (the open-issue re-audit). Prior: 2026-08-29 (**1.56.52 — both audit P0s closed** — see the 2026-08-29 block; the 2026-08-28 block below it records the sweep that produced the backlog). **⛔ THE MULTI-MINOR LAG HAPPENED A THIRD TIME, AND THIS FILE PREDICTED IT TWICE.** The ledger sat at **v1.44.9** from 2026-06-10 to 2026-08-28 — **~12 minors** (1.45.x net/server, 1.46.x SMP, 1.47.x-1.49.x, 1.50.x-1.53.x, the 1.54.x-1.56.x GPU/display/shader arcs) — with state.md/roadmap/CHANGELOG kept per-cut and the body docs un-swept, which is verbatim the failure the two notes below describe. The stated fix ("fold a doc-health touch into the cycle-OPEN sweep") was never adopted. ⚠ **This refresh is NOT that catch-up sweep** — it records only what 1.56.51 actually touched. The body docs (`README.md`, `architecture/overview.md`, `syscall-additions.md`, `build.md`, `kybernet-bridge.md`) remain unswept since 1.44.9 and their syscall counts, sizes and subsystem tables should be assumed stale — the surface has since grown to **0-101**.
+>
+> ### 1.57.2 (2026-09-13) — the embedded face, and a filing that was answered by a shape it did not anticipate
+>
+> ✅ **NEW: `architecture/kernel-font-namespace.md`** — the invariants behind `/fonts` that reading
+> `core/kfont.cyr` alone will not give you: **verify-before-expose is load-bearing** (cyrius 6.6.3
+> silently shifts even-length string literals ≥ 64 KB by one byte — filed in cyrius as
+> `issues/2026-09-13-agnos-large-string-literal-loses-first-byte.md`; the FNV-1a-64 of the assembled
+> face is what found it), the 4 KB chunking and the read-ONCE rule, the 2 MB region reached through
+> the **direct-map alias and only after `cr3_load(0x1000)`** (the design's "beside `fb_shadow_init`"
+> slot was MEASURED failing: literals hashed clean in place, buffer read back all zeros under gnoboot's
+> CR3), why it is a **prefix intercept and not a mount** (`mlist.cyr:33` refuses backend ids > 3;
+> crab's sidebar draws a capacity bar per row), the kashi-style fold-in through `build.sh`/`test.sh`/
+> `bench.sh` with `REKHA_REF=0.3.8`, and the fit check that was **wrong**: `LOAD` end `0x35E770` is under
+> the 4 MB identity map, but the AP1–3 stacks at `0x310000–0x340000` now sit inside `.rodata` on rekha
+> chunks ~52..100 (275 B margin; locked by check.sh gate 34, relocation filed as
+> `issues/2026-09-13-ap-stacks-inside-kernel-rodata.md`). ⚠ Every number in it is a 1.57.2 measurement
+> and says so; re-measure before copying forward.
+>
+> ✅ **`agnos-userland-abi.md` §3.5 (new)** — the `/fonts` path contract, placed with the `open`#7
+> flags rather than as a syscall row because **no number was minted**: two exact-byte names, the
+> `0xB03` refusal mask bit by bit, `read`#5 to EOF = 410,820 then 0 (never -2), **`write`#1 and
+> `lseek`#58 are -1** on the memfile fd (one pass, no rewind — a fact a client would otherwise learn
+> from a -1), `stat`/`lstat` field values, `statfs`#103 NOT intercepted, `mountlist`#104 absence and
+> why, the shadowing caveat stated as contract, the four boot lines and what each closes, provenance
+> (Liberation Sans Regular **2.1.5**, unmodified, SIL OFL 1.1, sha256 + FNV recorded, the licence file
+> that must travel), the client fallback (bitmap face on -1 — with the warning that the same guard is
+> what makes a missing face quiet, so measure on QEMU), and the gate (`kfont-smoke.sh`, exit 95).
+> §3.1's `open` bullet gained a one-line pointer.
+>
+> ✅ **`issues/2026-09-13-no-proportional-face-on-the-target.md` → `archived/`**, header rewritten
+> OPEN → **RESOLVED 1.57.2** with what shipped, the two names, what crab needs to do (nothing but the
+> load, as it predicted), and the dhancha per-call allocation blocker that is **not ours and remains
+> open** — recorded so "face shipped" is not read as "item unblocked". ⛔ **Checked what the change
+> BROKE before archiving**, per the folder rule: `mountlist`#104 unchanged (`vfs.cyr`, `mlist.cyr`
+> byte-unchanged, `be > 3` rule still passes); the two 2 MiB size gates went red and were re-derived
+> (face weighed out), not raised; the AP-stack layout hazard filed; aarch64 no worse (33/46 both
+> sides); CI cannot clone rekha 0.3.8 until the tag is cut. Filed and resolved the same day — the
+> operator's ruling was on the filing itself.
+> ⚠ `core/kfont.cyr`'s header comment named the pre-archive path; repointed (comment only, cyim,
+> `fmt-check` clean) so the source does not send the next reader to a file that moved.
+>
+> ✅ **`issues/2026-08-28-p1-audit-sweep-backlog.md` → `archived/`** — CLOSED with a 1.57.2 STATUS block
+> (P0 2/2 · P2 29/29 · P1 23/26 + 1 partial-by-ruling + 2 aarch64-gated). ⛔ **Three of its own carried
+> notes were stale in the "worse than it is" direction** and are corrected in place: "31 unguarded walk
+> sites" (17 real + 14 exFAT walks guarded since 1.34.x), "stale RWX binaries" (rootfs 0/48 — the RWX
+> images were two hand-built selftest ELFs), and "`ring3-smoke` has 4 real failures" (8/8 since the
+> 1.56.55 dwell fix). A carried note rots exactly like a status header. The four residuals are re-homed
+> to named `roadmap.md` rows (aarch64 pair; raw-disk `BLK_RW_ARM_MAGIC` gate → *Native
+> sandbox-confinement primitives*; `#92` op 0x0C SMP → *`#92` ABI table*) and `ext2-smoke`'s non-booting
+> recipe got its own row, so nothing lives only in the archive.
+>
+> ✅ **`roadmap.md`** — the audit row rewritten as shipped; the three rows above gained their residuals;
+> the Built-with trailer re-synced to 6.6.3 by `version-bump.sh`.
+>
+> ✅ **`state.md`** — Kernel head / Previous cut / on-disk size / Cyrius pin rows re-derived (the pin row
+> now carries the `lib sync` declares-only trap; the size row carries the `size − face` weighing);
+> the aarch64 count corrected **32 → 33** (every doc had copied 32 since 1.56.59); the ring3-smoke
+> "4 real failures" and "FIVE OPEN ISSUE FILES" bullets corrected (9/9; TWO open files).
+>
+> ✅ **`CLAUDE.md`** — Quick Start and Closeout tallies re-read from real runs: `check.sh` **34** gates
+> (the 34th is `kernel image vs fixed kernel stacks`), aarch64 **33**/46.
+>
+> ✅ **`CHANGELOG.md` 1.57.2** — three sections (Added: the face; Fixed: the backlog closed; Changed:
+> the 6.6.3 pin + the stale vendored libs); every size, count and exit code is a measurement from this
+> cut and the two workflow runs that produced it.
+>
+> ⚠ **Left for the release doc sync (the operator's, per the kernel-half report):** `CHANGELOG.md`,
+> `state.md` (kernel size 1,999,616 → 2,418,896 B; check.sh is **34** gates), `roadmap.md`, and
+> CLAUDE.md's "33/33" tallies — now stale by one gate.
 >
 > ### 1.57.1 (2026-09-08) — the backlog closeout, and four documents that were describing it wrongly
 >
@@ -373,6 +442,7 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Sma
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
+| `architecture/kernel-font-namespace.md` | 2026-09-13 | ✅ Fresh | **NEW at 1.57.2.** The kernel-owned `/fonts` namespace (`core/kfont.cyr`): verify-before-expose and the cyrius even-length ≥ 64 KB literal defect that makes it load-bearing; 4 KB chunks read once; the 2 MB direct-map region and why it is allocated after `cr3_load(0x1000)`; prefix intercept, not a mount; the kashi-style `build.sh`/`test.sh`/`bench.sh` fold-in + `REKHA_REF`; the measured layout (`LOAD` end `0x35E770`, AP stacks inside `.rodata`, gate 34). Companion to ABI §3.5. Numbers are 1.57.2 measurements — re-measure, do not copy forward. |
 | `architecture/overview.md` | 2026-06-10 | ✅ Fresh | **1.44.9 catch-up sweep (current)**: 34→43 (0-42) everywhere; the cooperative→**preemptive ring-3** process-model rewrite (kthread_create + preempt gate, per-proc CS/SS, timer-sliced, concurrent exec+exit, ELF spawn); new sysinfo/graphics/timing/input syscall subsections; size 1,123,864 B; SMAP/memory-map notes intact. **Earlier 1.41.11**: header cyrius 6.0.3→6.0.56, 28→34 syscalls (0-33); boot/process model rewritten for the shell-separation (kybernet execs `/bin/agnsh` ring 3, in-kernel `shell()` = recovery REPL), exec-from-disk (`elf_load_from_file`→`exec_and_wait`→`proc_reap`, iron-validated 1.40.x), the mount-routed VFS (ext2 at `/`, FAT/exFAT at `/mnt/*`), and the `VFS_SEC_WFILE` write-fd (1.41.7); load-bearing memory-map + SMAP `stac`/`clac` notes kept intact. **Earlier 2026-05-26 (v1.35.0)**: header to 40+ subsystems + cyrius 6.0.1 + iron-validation status; boot sequence + subsystem diagram + Block-I/O and Networking prose rewritten for the storage stack (5-backend block layer + GPT), the r8169/DHCP networking stack, and read+write filesystems; "FAT16 read-only" retired; shell count 19 → 28. Memory-map table + Process Model SMAP/stac/clac notes left intact (still load-bearing). |
 
 ## Tier 3 — `docs/audit/`
@@ -388,6 +458,7 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Sma
 | `development/roadmap.md` | 2026-06-04 | ✅ Fresh | Kept current **per-cut**: the 1.41.x bite ladder (§ 1.41.x Shell Separation Arc) is maintained through 1.41.11 (arc software-complete, iron burn staged at agnosticos `#tracker-141x-cycle`); the "Current" pointer + arc summary bumped each cut. **Earlier 2026-05-26**: restructured to forward-facing (per user directive): removed the completed "Shipped" arc ledger, the 1.30.x recap, all ✅-closed "Next cycle" rows, and the completed Security-Hardening / Multi-Architecture / Planned tables (history now lives in CHANGELOG). Retained: Current pointer + 1.35.x active theme, the active/near-term table, slotted-future minors (1.37–1.45), deferred items, the platform decade map, and the cyrius-PIE-gated KASLR section. |
 | `development/state.md` | 2026-06-10 | ✅ Fresh | Kept current **per-cut** through 1.44.20 (Version table, build size 1,193,072 B, the giant arc-narrative head rolled each cut; the 1.41.x shell-separation arc's per-bite history is in the narrative). **Earlier 2026-05-26**: body un-frozen from its 1.31.1 shape: Build artifacts (475,096 B → 798,936 B; cyrius 5.11.59 → 6.0.1; per-cut trajectory trimmed to a CHANGELOG pointer), source rollup (66 → 71 files, core 22 → 26, usb 8 → 9), subsystem table (added r8169 / DHCP / USB-MS / RAM-disk / ext2-4 / FAT / exFAT / FS-write-guard rows; fixed multiboot label + AHCI iron status + shell count + 5-backend block layer), In-flight + Recently-closed sections, headline to the 1.35.x catchup-tidbits theme. |
 | `development/build.md` | 2026-06-10 | ✅ Fresh | **1.44.9 catch-up sweep (current)**: added the gates accreted across 1.42.x-1.44.x — `THREAD_SELFTEST`/`RING3_SELFTEST` (1.44.x), `DOOM_SELFTEST` (1.43.x), `KLUG_SELFTEST` (1.42.x), `FB_ANSI_SELFTEST`, `HARDENING_SELFTEST`. **Earlier 1.41.11**: added the gates `scripts/build.sh` accreted across 1.40.x/1.41.x — `EXEC_SELFTEST` (1.40.x exec-from-disk), `FS_SYSCALL_SELFTEST` (1.41.3 FS-syscall selftest, `fssys: ALL PASS`), `SYSCALL_HARDEN_SELFTEST` (1.41.6 ingress-hardening regression, `shsys: ALL PASS`) — confirmed the documented list now matches build.sh. **Earlier 2026-05-26**: flag table completed: was current through the storage arc (`AHCI_RW_DEMO` / `MSC_RW_DEMO` / `RAMDISK_ENABLE`) but missing the 7 networking/FS gates `scripts/build.sh` accreted since — added `NET_VERBOSE` (1.32.x) + `EXT2_WRITE_SELFTEST` (1.33.x) + `FATFS_SELFTEST` / `FATFS_WRITE_SELFTEST` / `EXFAT_SELFTEST` / `EXFAT_WRITE_SELFTEST` / `FAT_ALLOW_ESP_WRITE` (1.34.x), plus FS-selftest enabling examples. All 13 build.sh gates now documented. |
+| `development/agnos-userland-abi.md` | 2026-09-13 | ✅ Fresh | **1.57.2**: §3.5 `/fonts` path contract added (no syscall row — no number minted; `syscall-abi-check` unaffected) + a §3.1 `open` pointer. Earlier per-cut corrections are in the dated blocks above (1.57.1 §4.4, 1.56.60 row 13, 1.56.58 §4.5, 1.56.56 rows 103/104, 1.56.55 row 96, 1.56.54 four rows). ⚠ This row did not exist until 1.57.2 although the file is the most-corrected doc in the repo; §2 row 7 (`open`) still carries the pre-1.41.3 "initrd_open ONLY" text and is owed a rewrite. |
 | `development/kybernet-bridge.md` | 2026-06-10 | ✅ Fresh | **1.44.9 catch-up sweep**: surface ref 0-33→0-42. **1.41.11 sweep — the stale notes corrected.** The "26-syscall interface" framing now says the kernel surface grew to 0-33 (kybernet's bridge still uses its original 26-call subset). The `open`/`mkdir`/`rmdir`/`sync` "Noop" rows are FIXED — all made real at v1.41.3 (mount-routed). Added a "post-kybernet additions (26-33)" table (mmap/munmap + the v1.41.3 FS group) marked NOT part of the bridge. The bridge *design* (agnosys dual backend) is genuinely unchanged since v1.21.0. |
 | `development/security-hardening.md` | 2026-06-04 | ✅ Fresh | **1.41.11 sweep**: the S1-S13 v1.28.0 framework is a HISTORICAL doc (kept verbatim — accurate for what it covers), but it predated the 1.41.x ring-3-ingress hardening. Added a **"Since this was written"** note cross-referencing the second hardening front (1.41.5 type-confusion/ceiling/bounds, 1.41.6 regression net, 1.41.10 write-fd) → agnosticos `kernel-1415-hardening-audit.md`. The S7 Option-A PIE-KASLR deferral still lives in roadmap.md (cyrius v6.1.x). |
 | `development/syscall-additions.md` | 2026-06-10 | ✅ Fresh | **1.44.9 catch-up sweep (current)**: surface 38/34 → 0-42 (43); added per-slot rows 34=uname/35=sysinfo/36=klog (1.42.x) + 37=execwait/38=fbinfo/39=blit/40=uptime_ms/41=sleep_ms/42=kbscan (1.43.x); `waitpid`#4 non-blocking note. **Earlier 1.41.11 — the "still 26" claim CORRECTED.** Surface is **0-33 (34)**: mmap(27)/munmap(28) at 1.35.3/.4, then the 1.41.3 FS buildout — getdents(29)/unlink(30)/rename(31)/link(32)/stat(33) + the `open`(7) mount-route + `mkdir`(9)/`rmdir`(10)/`sync`(12) made-real + the **a4=r10** 4th-arg ABI extension (the syscalls userland agnsh needs now that the shell is in ring 3). Full per-slot table with landing versions, derived from the live `ksyscall` dispatcher + cross-checked vs `agnos-userland-abi.md`. (The 2026-05-26 "still 26" was already stale then — mmap/munmap had landed at 1.35.3/.4; the body table is now the canonical-pointer-backed truth.) |
@@ -397,6 +468,8 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Sma
 | File | Last touched | Status | Notes |
 |---|---|---|---|
 | `issues/2026-05-15-cyrius-nonzero-gvar-init-not-honored.md` | 2026-05-15 | 🟢 Live | **NEW since v1.28.4 sweep**. Upstream cyrius bug surfaced via the v1.30.x Path-C kernel/version.cyr design — kmode `var` globals with non-zero initializers don't honor those initializers because PARSE_PROG runs before EMIT_GVAR_INITS, so the kernel program body executes before globals get their non-zero values. Worked around in agnos by wrapping banner literals in `fn` bodies (rodata pointer baked in at compile time, no runtime init dependency). Upstream fix is a cyrius v5.12.x+ concern; agnos workaround is durable. |
+| `issues/archived/2026-09-13-no-proportional-face-on-the-target.md` | 2026-09-13 | 📦 Archive | **Closed at 1.57.2, same day as filed.** crab's ask for an `open()`-able TrueType face; operator ruling → rekha, kernel-embedded. Resolution header: what shipped (`/fonts/default.ttf` + provenance alias, verify-gated), what crab does (the load only), what the change broke (mountlist unchanged; size gates re-derived; AP-stack hazard filed; aarch64 no worse; rekha tag uncut), and the **dhancha** blocker that remains and is not ours. Original filing verbatim below the rule. |
+| `issues/2026-09-13-ap-stacks-inside-kernel-rodata.md` | 2026-09-13 | 🟢 Live | **OPEN — operator decision.** Filed from the 1.57.2 review: the AP1–3 boot/TSS stacks at `0x310000–0x340000` sit inside kernel `.rodata` since the face embed (rekha chunks ~52..100, 275 B margin to the first live byte). Tolerated by check.sh gate 34 (`image-layout-check.sh`); the fix is relocating the stacks (region-7 pool suggested), a layout redesign. |
 | `issues/archived/2026-04-27-serial-putc-cc5-regression.md` | 2026-05-11 | 📦 Archive | **Closed at v1.28.1**. Resolution section (matched-conditions re-measurement under cyrius 5.10.44 / QEMU 11.0 / Ryzen 7 5800H / TCG; bench delta table showing cc5 broadly equal-or-better than cc3; `serial_putc` outlier explained by QEMU UART-emulation latency, not codegen) prepended to the original body. Frozen. |
 | `issues/archived/2026-04-27-memory-isolation-deep.md` | 2026-05-11 | 📦 Archive | **Closed at v1.27.1**. Resolution section (SMAP root cause + observation-to-mechanism table + process note on the hypothesis class that misled triage) prepended to the original body. Frozen — refer back but do not edit. |
 | `issues/archived/2026-04-27-cr3-load-helper.md` | 2026-05-11 | 📦 Archive | Closed alongside the memory-isolation fix at v1.27.1 — the v1.26.0 helper was a real fix, just not the whole one. |

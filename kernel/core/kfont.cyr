@@ -1,0 +1,152 @@
+# === kfont — the kernel-embedded default TrueType face (1.57.2) =============
+#
+# WHAT: the one proportional face on AGNOS, and the first thing a client can open() to get one.
+# rekha (../rekha, the first-party outline-font library; kashi is the bitmap sibling) generates
+# fonts/face_data.cyr — Liberation Sans Regular, UNMODIFIED, 410,820 bytes, SIL OFL 1.1 — as a
+# FREESTANDING module of 101 string-literal chunks of 4 KB, and scripts/build.sh cats it into
+# the prepped kernel source exactly as it cats kashi's src/font_data.cyr (the `[deps.rekha]`
+# block in cyrius.cyml documents the contract; the cat is the mechanism). The licence text,
+# ../rekha/fonts/LICENSE-LiberationFonts, MUST travel with any redistribution of these bytes.
+# This file is the kernel half: at boot it assembles the chunks into one contiguous 2 MB region,
+# verifies them, and serves the result read-only under a kernel-owned namespace. Filed by crab
+# as docs/development/issues/archived/2026-09-13-no-proportional-face-on-the-target.md; operator ruling
+# 2026-09-13: rekha is the answer and the face is KERNEL-EMBEDDED, kashi-style.
+#
+# THE /fonts NAMESPACE CONTRACT (ring 3):
+#   /fonts/default.ttf                 — the stable name; what a client codes against
+#   /fonts/LiberationSans-Regular.ttf  — the SAME bytes; the real name documents provenance
+# Both open() read-only (any write / create / trunc / directory flag → -1) and stat()/lstat() as
+# a regular file, st_mode 0100444, st_size 410820. The match is an EXACT byte compare on the
+# ABSOLUTE path: no wildcard, no trailing garbage, and "/fonts" / "/fonts/" themselves are NOT
+# names — -1 for both, so nothing here answers as a directory.
+#
+# ⛔ NOT A MOUNT, ON PURPOSE. vfs_mount_init / FsBackend are untouched and /fonts never appears
+# in mountlist#104: tests/mountlist/mlist.cyr:33 refuses backend ids > 3, and crab's VOLUMES
+# sidebar consumes that table with a capacity bar per row — a font namespace is not a volume,
+# and giving it a backend id would put a phantom disk in every client's sidebar. It is a PREFIX
+# INTERCEPT in the syscall arms instead: open#7 / stat#33 / lstat#102 ask kfont_path_index()
+# right AFTER their sc_path_ok / is_user_range validation and BEFORE vfs_resolve_mount, and
+# short-circuit into kfont_open / kfont_stat on a hit.
+# ⚠ SHADOWING CAVEAT, which follows from that: an on-disk /fonts directory on the root FS is
+# shadowed for open/stat/lstat of those TWO names ONLY. readdir / getdents / mkdir / unlink /
+# rename / statfs / everything else still routes through the mount table and sees the disk. So
+# `ls /fonts` on a root with no such directory lists nothing while open("/fonts/default.ttf")
+# succeeds — that is the contract, not a bug: a client that wants the face opens it BY NAME.
+#
+# ⛔ VERIFY BEFORE EXPOSE — LOAD-BEARING, NOT DEFENSIVE. cyrius 6.6.3 silently corrupts string
+# literals of EVEN length >= 65536 (every alternate literal emitted shifted by one byte; rc=0,
+# count intact, content wrong — found by bisection while generating face_data.cyr, filed against
+# cyrius). rekha chunks at 4 KB to stay clear of it, but the kernel must NEVER hand out bytes it
+# has not checked: kfont_init runs rekha_face_default_verify (FNV-1a-64 of the assembled buffer
+# against the generator's hash of the source .ttf) and only a 1 sets kfont_ready. A 0 leaves the
+# namespace closed — open/stat return -1 exactly as if this arc had never shipped — and prints
+# the FAILED line so a corrupt literal is a visible boot fact, not a garbled glyph an hour later.
+#
+# COST: one 2 MB region (pmm_alloc_2mb_run(1) — the fb_shadow precedent in fb_console.cyr:
+# allocated once at boot, never freed; the face uses 20% of it) plus ~410 KB of kernel .rodata
+# for the chunks. ⛔ THAT .rodata IS NOT FREE, AND "under the 4 MB identity map" WAS THE WRONG
+# FIT CHECK (2026-09-13 review). Measured at the 1.57.2 build: LOAD end 0x35E770, .rodata
+# 0x2DBBD0..0x34E769, chunk 0 at 0x2DBBEB and chunk 100 ending 0x340113 — which puts the AP1-3
+# boot/TSS stacks [0x310000, 0x340000) (gdt.cyr tss_get_cpu_stack, smp.cyr's trampoline) INSIDE
+# the chunk literals 52..100. On any -smp >= 2 boot CPUs 1-3 push their frames into kernel
+# .rodata through the 2 MB RW identity pages — no fault, no signal. It is harmless TODAY for
+# exactly two reasons, both of which scripts/check/image-layout-check.sh now locks: (1) the
+# chunks are read ONCE, here in kfont_init (rekha_face_default_copy), ~5,500 lines of main.cyr
+# before smp_start_aps, and the face served through /fonts is the verified direct-map COPY, never
+# the literals — so a re-verify, a second copy, or any later reader of rekha_face_default_chunk
+# would read AP stack garbage on iron while every -smp 1 gate stayed green: DO NOT ADD ONE; (2)
+# the first LIVE kernel byte above CPU3's stack top is at 0x340114, a margin of 0x113 = 275 B —
+# any .text/.bss shrink or literal re-ordering over that slides kprint strings under an AP stack.
+# The real fix (relocating the AP stacks above the image, e.g. into the region-7 kstack pool) is
+# the operator's decision: docs/development/issues/2026-09-13-ap-stacks-inside-kernel-rodata.md.
+# The region is reached through its
+# DIRECT-MAP alias (pmm_kva_for_access = DIRECTMAP_BASE + phys), NOT an identity VA: every
+# per-process CR3 mirrors the kernel direct map, and vfs_read's memcpy out of a memfile runs
+# under the CALLER's CR3, where the low identity window is the user image. proc.cyr's ptw_pd_kva
+# header and heap.cyr slab_grow's 1.56.51 note are the two precedents that moved off identity
+# for exactly this reason; this file starts there.
+# ⛔ ORDERING: pmm_kva_for_access needs the direct map INSTALLED (pmm_setup_directmap) AND ACTIVE
+# (cr3_load(0x1000) — gnoboot's boot CR3 maps 8 GB + phys to an unrelated identity GB, so before the
+# switch every store into the alias lands nowhere at -m 512M and in someone else's RAM on a big
+# box). kfont_init is called from core/main.cyr AFTER that switch, next to pmm_bitmap_use_directmap
+# and inside the same #ifndef BOOTCR3_KEEP_GNOBOOT_CR3 — a KEEP_GNOBOOT boot gets no face. It was
+# first slotted beside fb_shadow_init (before the switch) and MEASURED failing the verify with an
+# all-zero buffer while the literals hashed clean in place; do not move it back.
+
+var kfont_ready = 0;    # 1 only after rekha_face_default_verify said 1 — gates every arm below
+var kfont_phys = 0;     # 2 MB-aligned physical base of the region (0 = none allocated)
+var kfont_va = 0;       # its direct-map alias — what the memfile hands vfs_read
+var kfont_len = 0;      # verified byte length (== rekha_face_default_len() once ready)
+
+# Boot: allocate, assemble, verify, expose. Every failure path leaves kfont_ready == 0, prints
+# one line naming why, and returns — the kernel boots without a face rather than not at all.
+fn kfont_init() {
+    var n = rekha_face_default_len();
+    var phys = pmm_alloc_2mb_run(1);
+    if (phys == 0) {
+        kprintln("kfont: no 2 MB region - face not exposed", 40);
+        return 0;
+    }
+    kfont_phys = phys;
+    var va = pmm_kva_for_access(phys);
+    var got = rekha_face_default_copy(va, 0x200000);
+    if (got != n || rekha_face_default_verify(va, n) != 1) {
+        # ⚠ The region stays allocated: pmm_alloc_2mb_run has no free twin (fb_shadow never frees
+        # either), and a 2 MB hole at the top of the pool is a smaller cost than a second
+        # allocator path exercised only by a compiler defect. kfont_phys keeps the address so a
+        # later dump can still look at what went wrong.
+        kprintln("kfont: face verify FAILED - not exposed", 39);
+        return 0;
+    }
+    kfont_va = va;
+    kfont_len = n;
+    kfont_ready = 1;
+    # The number is the VERIFIED length, printed live rather than as a literal, so this line
+    # cannot rot if rekha ever regenerates the face at a different size.
+    kprint("kfont: /fonts/default.ttf ", 26);
+    kprint_num(n);
+    kprintln(" bytes OK", 9);
+    return 0;
+}
+
+# The namespace: 0 for either of the two face names, -1 for everything else. Called with the
+# ABSOLUTE path (open#7 has already normalised a relative name by the time it asks). Exact
+# length + byte compare — a longer path with the name as a prefix, a shorter one, or the bare
+# "/fonts" / "/fonts/" all miss. Answers regardless of kfont_ready: the arms use it purely as
+# "is this ours?", and kfont_open / kfont_stat apply the ready gate themselves.
+fn kfont_path_index(path, len) {
+    if (path == 0) { return 0 - 1; }
+    if (len == 18) { if (memeq(path, "/fonts/default.ttf", 18) == 1) { return 0; } }
+    if (len == 33) { if (memeq(path, "/fonts/LiberationSans-Regular.ttf", 33) == 1) { return 0; } }
+    return 0 - 1;
+}
+
+# open#7 backend. Read-only by construction: AO_WRONLY/AO_RDWR (low 2 bits), AO_CREAT (0x100),
+# AO_TRUNC (0x200) and AO_DIRECTORY (0x800) each refuse — see open#7's flag comment in
+# core/syscall.cyr. The fd is a VFS_MEMFILE over the verified region (vfs_create_memfile):
+# vfs_read's VFS_MEMFILE arm bounds pos/count against kfont_len, write() has no memfile arm,
+# and close() just frees the slot — the face itself is never touched after kfont_init.
+fn kfont_open(path, len, flags) {
+    if (kfont_ready != 1) { return 0 - 1; }
+    if (kfont_path_index(path, len) != 0) { return 0 - 1; }
+    if ((flags & 0xB03) != 0) { return 0 - 1; }
+    return vfs_create_memfile(kfont_va, kfont_len);
+}
+
+# stat#33 / lstat#102 backend — fills the 48-byte agnos stat struct (agnos-userland-abi.md
+# §4.1) field-for-field as ext2_fill_stat does: st_mode / st_nlink / st_size / st_ino /
+# st_blocks / st_mtime at 0/8/16/24/32/40. Regular file, 0444 (0100444 octal = 0x8124), one
+# link, the verified size; ino / blocks / mtime are 0 — there is no inode and no disk. lstat is
+# identical because nothing here is a symlink. `statbuf` is the caller's is_user_range'd ptr.
+fn kfont_stat(path, len, statbuf) {
+    if (kfont_ready != 1) { return 0 - 1; }
+    if (kfont_path_index(path, len) != 0) { return 0 - 1; }
+    if (statbuf == 0) { return 0 - 1; }
+    store64(statbuf + 0, 0x8124);
+    store64(statbuf + 8, 1);
+    store64(statbuf + 16, kfont_len);
+    store64(statbuf + 24, 0);
+    store64(statbuf + 32, 0);
+    store64(statbuf + 40, 0);
+    return 0;
+}

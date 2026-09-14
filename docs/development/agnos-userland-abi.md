@@ -150,7 +150,9 @@ mirror-able; both agents code to it, and each row **moves to 🔒 FROZEN (update
   echoed after the `14114` stuck-shift collapse.)* Other fds keep the `vfs_read` path.
 - **`open`(7) → mount-routed** (1.41.3). Re-route from `initrd_open`-only to `vfs_resolve_mount` →
   `ext2_open` (inode-wise) or `vfs_open_on` (FAT/exFAT), with `initrd` as the bare-name fallback. **Gains a
-  flags arg** (a3) — see 3.3. Opening a **directory** returns a dir-fd usable by `getdents` (29).
+  flags arg** (a3) — see 3.3. Opening a **directory** returns a dir-fd usable by `getdents` (29). ⭐ **Two
+  kernel-owned names are intercepted BEFORE the mount table** — `/fonts/default.ttf` and its provenance alias,
+  the embedded TrueType face (1.57.2): see **§3.5**.
 - **`mkdir`(9) / `rmdir`(10) / `sync`(12) → real** (1.41.3): wire to `vfs_mkdir_on`/`vfs_rmdir_on` (mount-routed)
   and `vfs_sync`. Signatures unchanged (`mkdir`/`rmdir` take `path`,`pathlen`; `sync` takes none).
 
@@ -362,6 +364,90 @@ Access mode in the low 2 bits; modifiers above. **These are AGNOS values, not Li
 | `AO_DIRECTORY` | `0x800` | must be a directory (for `getdents`) |
 | `AO_EXCL` | `0x2000` | ⭐ **with `AO_CREAT`, refuse a final component that ALREADY resolves** (1.56.56) — POSIX `O_EXCL`, completing the check-then-write pair `AO_NOFOLLOW` opened. ⛔ **Returns -1, NOT -17**: §1`s return convention has no `-errno`; a caller wanting `EEXIST` translates in its own wrapper. Without `AO_CREAT` the bit is ignored, as POSIX leaves it undefined there. ⚠ **Evaluated BEFORE `AO_TRUNC`** — this is load-bearing, not an implementation detail: checked afterwards, an `AO_CREAT\|AO_TRUNC\|AO_EXCL` open would zero the file and *then* refuse it, destroying exactly what the flag protects. The selftest asserts the surviving size, not just the refusal. ⚠ Routes to `ext2_path_lookup_ex(..., follow_last=0)`, so a symlink at the final component is a refusal **even when it dangles**. FAT/exFAT answer it too, via `fatfs_create`/`exfat_create`s existing-name refusal — whose return value is discarded without this flag, because `touch <existing>` depends on that. **Consumer: crab** (copy/move overwrite guard). |
 | `AO_NOFOLLOW` | `0x1000` | ⭐ **refuse if the FINAL component is a symlink** (1.56.53) — returns -1 rather than following it, closing the check-then-write TOCTOU that `readlink`#70 could only detect. Routes to `ext2_path_lookup_ex(..., follow_last=0)`. Mid-path symlinks still resolve, matching POSIX `O_NOFOLLOW` and `#70`. ext2 only in effect: FAT/exFAT cannot represent a symlink, so the flag is trivially satisfied there. ⚠ **This row was missing until 1.56.55** — the flag shipped two cuts earlier and reached no doc and no cyrius constant, so ring 3 could not name the thing that had been built for it. The cyrius peer is still owed. |
+
+### 3.5 🔒 Kernel-owned paths — the `/fonts` namespace (1.57.2)
+
+> **Not a syscall row — a PATH contract on three existing rows.** `open`#7, `stat`#33 and `lstat`#102
+> each ask `kfont_path_index()` (`kernel/core/kfont.cyr`) *after* their pointer/length validation and
+> the relative→absolute normalisation, and *before* `vfs_resolve_mount` — so two names never reach the
+> mount table. No number was minted, so the cyrius peer needs nothing and `syscall-abi-check` stays
+> green. **Filed by crab** ([`issues/archived/2026-09-13-no-proportional-face-on-the-target.md`](issues/archived/2026-09-13-no-proportional-face-on-the-target.md));
+> operator ruling 2026-09-13: **rekha** is the answer and the face is **kernel-embedded, kashi-style**.
+> Invariants behind the contract: [`../architecture/kernel-font-namespace.md`](../architecture/kernel-font-namespace.md).
+
+| Name (absolute, exact bytes) | len | What it is |
+|---|---|---|
+| `/fonts/default.ttf` | 18 | **the stable name — code against this one** |
+| `/fonts/LiberationSans-Regular.ttf` | 33 | the SAME bytes; the real name documents provenance |
+
+**Matching is an exact length + byte compare on the absolute path.** No wildcard, no trailing garbage,
+no prefix match: `/fonts/nope.ttf`, `/fonts/default.ttf/`, `/fonts` and `/fonts/` are all **-1** —
+⛔ **nothing here answers as a directory**, so `open(AO_DIRECTORY)` + `getdents` on `/fonts` do not
+enumerate the face. A client opens it **by name**.
+
+| Verb | On either name | Notes |
+|---|---|---|
+| `open`#7 | fd / **-1** | `a3` must carry **none** of `AO_WRONLY` `0x1` · `AO_RDWR` `0x2` · `AO_CREAT` `0x100` · `AO_TRUNC` `0x200` · `AO_DIRECTORY` `0x800` (kernel mask `0xB03`) — any one set is **-1**, no fallthrough to disk. Bits outside the mask (`AO_APPEND`, `AO_NOFOLLOW`, `AO_EXCL`) are not tested: `AO_RDONLY` with them set still opens; `AO_EXCL` only means something with `AO_CREAT`, which refuses. The fd is a **`VFS_MEMFILE`** over the kernel's verified copy — O(1), no per-open copy, one of the 32 fd slots like any other. |
+| `read`#5 | bytes / **0** | Sequential from offset 0. Returns `min(len, remaining)`; **`0` at EOF** (never `-2` — this is not a pipe). The whole face is **410,820 bytes** (`= 6 × 65536 + 17604`); a 64 KB-request loop sees six full reads, one short one, then 0. ⚠ **A pre-1.57.2 kernel, or one whose verify failed, never gets here: `open` is already -1.** |
+| `write`#1 | **-1** | `vfs_write` has no memfile arm. |
+| `lseek`#58 | **-1** | `#58` repositions `VFS_EXT2_FILE` only. ⇒ **No rewind, no random access**: read the face front-to-back in one pass; to start over, `close` and `open` again. |
+| `close`#6 | 0 | frees the slot; the face is untouched. |
+| `stat`#33 / `lstat`#102 | 0 / **-1** | §4.1 struct: `st_mode` **`0x8124`** (regular file, `0100444` octal — read-only for everyone), `st_nlink` **1**, `st_size` **410820**, `st_ino` / `st_blocks` / `st_mtime` **0** (no inode, no disk). `lstat` is identical: nothing here is a symlink. |
+| `statfs`#103 | **-1** on a root without the file | ⚠ **NOT intercepted** — routes to the mount table like every other verb, and `#103` requires the path to resolve on its backend. It says nothing about the face. |
+| `mountlist`#104 | — | ⛔ **`/fonts` is NOT a mount and never appears here.** `vfs_mount_init` / `FsBackend` are untouched. `tests/mountlist/mlist.cyr:33` refuses backend ids `> 3`, and crab's VOLUMES sidebar draws a capacity bar per row — a font namespace is not a volume, and giving it a backend id would put a phantom disk in every client's sidebar. |
+
+⚠ **SHADOWING, and it is the contract, not a bug.** The intercept covers `open`/`stat`/`lstat` of the
+**two names only**. `getdents`#29, `readdir`#81/`#101`, `mkdir`#9, `unlink`#30, `rename`#31,
+`statfs`#103 and everything else still route through the mount table and see the disk. So on a root
+filesystem with no `/fonts` directory, listing `/fonts` fails while `open("/fonts/default.ttf")`
+succeeds — and on a root that *does* carry a `/fonts/default.ttf`, the kernel's face wins for those
+three verbs and the on-disk file is reachable only through the verbs that are not intercepted.
+
+**Provenance (what the bytes are).** **Liberation Sans Regular, version 2.1.5, UNMODIFIED** —
+410,820 bytes, sha256 `baccc64becc3eb7d104b7c84d99f5314a0a1f896e2b3ea6c2f22fc08d2003bee`, FNV-1a-64
+`0xbb32949696578ce6`, `sfntVersion 0x00010000`, 19 tables including `glyf` and `cmap` (`glyf`
+outlines, which is what `rekha_font_open` accepts; the format-4 BMP `cmap` requirement is rekha's to
+assert). Licensed **SIL Open Font License 1.1** (Copyright (c) 2012 Red Hat, Inc., Reserved Font Name
+*Liberation*; digitized data copyright (c) 2010 Google Corporation). The licence text is
+`../rekha/fonts/LICENSE-LiberationFonts` and **MUST travel with any redistribution of these bytes** —
+the OFL permits bundling with GPL software; it does not permit dropping the notice. The bytes reach the
+kernel as rekha 0.3.8's generated `fonts/face_data.cyr` (101 string-literal chunks of 4 KB), cat'd into
+the prepped source by `scripts/build.sh` exactly as kashi's `src/font_data.cyr` is.
+
+**The face is exposed ONLY after a boot-time hash check, and `open` returning -1 is a real state.**
+`kfont_init` (called from `core/main.cyr` after `cr3_load(0x1000)`, inside the own-PML4 build) copies
+the chunks into one 2 MB region and runs `rekha_face_default_verify` — FNV-1a-64 of the assembled
+buffer against the generator's hash of the source `.ttf`. Only a match sets `kfont_ready`; every other
+outcome leaves all three arms answering **-1** as if the feature had never shipped, and prints why:
+
+| Boot line | Meaning |
+|---|---|
+| `kfont: /fonts/default.ttf 410820 bytes OK` | verified; the namespace is open (the number is the verified length, printed live) |
+| `kfont: face verify FAILED - not exposed` | the assembled bytes do not hash to the source — **closed**; the 2 MB region stays allocated |
+| `kfont: no 2 MB region - face not exposed` | `pmm_alloc_2mb_run(1)` returned 0 — closed |
+| *(no line)* | a `BOOTCR3_KEEP_GNOBOOT_CR3` build never calls `kfont_init` (no direct map in its boot context) — closed |
+
+⛔ **Why the verify is load-bearing rather than defensive:** cyrius 6.6.3 emits a string literal of
+**even length ≥ 65536 shifted by one byte on every alternate literal**, silently (`rc=0`, byte count
+intact, content wrong) — found by exactly this hash while generating the face, filed as cyrius
+[`issues/2026-09-13-agnos-large-string-literal-loses-first-byte.md`](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-09-13-agnos-large-string-literal-loses-first-byte.md).
+rekha chunks at 4 KB to stay clear of it; the kernel still refuses to hand out bytes it has not hashed.
+
+⭐ **What a client does.** `open` one of the two names read-only; on **-1, fall back to the bitmap
+face (kashi)** and carry on — the guard shape crab's issue already recommended (`if (flen > 0) { … }`)
+is the right one, *provided the client then measures on QEMU rather than observing that the host build
+compiles*: the same guard is what makes a missing face **quiet**. Read to EOF in one pass (no `lseek`),
+`close`, and hand the buffer to `rekha_font_open`. A client that wants its own proof hashes what it got
+against `0xbb32949696578ce6`, as the gate does. Do not `statfs` the path, do not list `/fonts`, and do
+not expect it in `mountlist`.
+
+**Gate:** `scripts/smoke/kfont-smoke.sh` (in `scripts/sweep.sh`) + `tests/kfont/kfont.cyr` — a real
+ring-3 process exec'd from disk opens the face by name, reads all 410,820 bytes through `read`#5,
+requires FNV-1a-64 `== 0xbb32949696578ce6` (⭐ **the oracle is the hash, not the length**), checks the
+sfnt header and `glyf`+`cmap`, probes **each** refused flag bit individually, refuses `/fonts/nope.ttf`
+and `/fonts`, checks `stat`#33 and `lstat`#102 field-for-field, and confirms the alias name serves the
+same bytes. **Exit 95**; 80–94 / 96–97 name the failing step. Six mutants (corrupted copy, dropped and
+narrowed flag mask, wrong `st_mode`, deleted `lstat` intercept, a ring-3 `#PF`) each fail it.
 
 ## 4. ✅ Struct layouts (agnos-native — mirror exactly)
 

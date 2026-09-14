@@ -270,15 +270,13 @@ fn fat_next_cluster(cluster) {
     return n;
 }
 
-# ⚠⚠ PART 2 IS NOT DONE, AND THIS IS THE HONEST STATE OF IT. The wrapper above ends a chain on an
+# ⚠ PART 2 — MULTI-NODE CYCLES. APPLIED at 1.57.2, per site. The wrapper above ends a chain on an
 # out-of-range next cluster and on a SELF-reference, but a MULTI-NODE cycle (A -> B -> A, both in
-# range) is invisible from one step and still spins forever. There are THIRTEEN
-# `clus = fat_next_cluster(...)` walk sites in this file and their loop shapes differ — some carry a
-# `last`/`last_clus` cursor, some return, some break, some fall through to post-loop work — so a
-# blanket transform is not safe and each needs its own step counter.
-# ⭐ THE PREDICATE IS READY FOR THAT WORK: a chain cannot legitimately be longer than the volume has
-# clusters, so exceeding that count IS the cycle detector — no extra state and no second pass. The
-# per-site form is:
+# range) is invisible from one step. Every EOC-terminated walk in this file therefore carries its
+# own per-WALK fetch budget: a chain cannot legitimately be longer than the volume has clusters, so
+# exceeding that count IS the cycle detector — no extra state and no second pass. The reference
+# shape (a fresh local per loop, incremented once per fetch, overrun exiting via the loop's OWN
+# condition so post-loop work still sees the cursor state it expects) is:
 #     var steps = 0;
 #     while (clus >= 2) {
 #         ...
@@ -286,6 +284,17 @@ fn fat_next_cluster(cluster) {
 #         if (fat_chain_overrun(steps) == 1) { clus = 0; }      # `clus = 0` exits via the loop's own
 #         else { clus = fat_next_cluster(clus); }               # condition, preserving post-loop work
 #     }
+# ⚠ OFF-BY-ONE CONTRACT: the counter counts FETCHES and the predicate is strictly `>`. The k-th fetch
+# sees steps == k, so a valid N-cluster chain (N <= count) does its last fetch at steps == N and gets
+# EOC — never overrun. Two sites deviate from `clus = 0` on purpose: the slot-extend walks
+# (fatfs_find_free_slot_in_dir / fatfs_find_free_root_slot) REFUSE (-1) instead, because a cycle has
+# no tail to append a fresh cluster after — the precedent is fat_root_cluster_for_index, which also
+# errors rather than extends when its guard fires. Walks that were already bounded by the VOLUME
+# (fatfs_read, fat_free_chain, fat_dir_end_index, fat_root_cluster_for_index by their `guard`) and
+# the single-step reads are untouched. ⚠ The two fatfs_truncate walks are NOT in that set: their
+# bound (cur_clus / keep) is the dirent's 32-bit size — mounted-media data, up to 2^32/bpc fetches
+# (8,388,608 at spc=1, ~128x a minimum FAT32 volume, each an uncached FAT read when the cycle's two
+# nodes straddle FAT sectors) — so they budget on their existing gi / idx counter and REFUSE (-1).
 # ⛔ DO NOT route this through a module-global counter reset at each loop head instead. A walk that
 # forgets its reset would inherit the previous walk's count and terminate EARLY — silent truncation
 # of a valid file, which is worse than the hang it replaces.
@@ -410,6 +419,12 @@ fn fatfs_ls() {
     if (fatfs_type == 32) {
         # FAT32 root is a cluster chain at fatfs_root_cluster.
         var clus = fatfs_root_cluster;
+        # 1.57.2 — per-walk chain budget: a multi-node FAT cycle (A -> B -> A, both in range) is
+        # invisible to fat_next_cluster, so every EOC-terminated walk counts its fetches and bails
+        # once they exceed the volume's cluster count (fat_chain_overrun). Fresh local per loop —
+        # never shared, never global. Same 4-line shape at every walk below; rationale + off-by-one
+        # contract live in the block after fat_next_cluster.
+        var steps = 0;
         while (clus >= 2) {
             var base = fatfs_first_sector_of_cluster(clus);
             for (var s = 0; s < fatfs_sectors_per_cluster; s = s + 1) {
@@ -417,7 +432,9 @@ fn fatfs_ls() {
                 var done = fatfs_ls_sector(entries_per_sector, &count);
                 if (done < 0) { return count; }
             }
-            clus = fat_next_cluster(clus);
+            steps = steps + 1;
+            if (fat_chain_overrun(steps) == 1) { clus = 0; }
+            else { clus = fat_next_cluster(clus); }
         }
         return count;
     }
@@ -505,6 +522,7 @@ fn fatfs_find_root(name, namelen, result_ptr) {
     var entries_per_sector = 512 / 32;
     if (fatfs_type == 32) {
         var clus = fatfs_root_cluster;
+        var steps = 0;
         while (clus >= 2) {
             var base = fatfs_first_sector_of_cluster(clus);
             for (var s = 0; s < fatfs_sectors_per_cluster; s = s + 1) {
@@ -512,7 +530,9 @@ fn fatfs_find_root(name, namelen, result_ptr) {
                 if (f == 1) { return 1; }
                 if (f < 0) { return 0; }     # end-of-dir marker
             }
-            clus = fat_next_cluster(clus);
+            steps = steps + 1;
+            if (fat_chain_overrun(steps) == 1) { clus = 0; }
+            else { clus = fat_next_cluster(clus); }
         }
         return 0;
     }
@@ -545,6 +565,7 @@ fn fatfs_find_in_dir(dir_clus, name, namelen, result_ptr) {
     if (dir_clus < 2) { return fatfs_find_root(name, namelen, result_ptr); }
     var eps = 512 / 32;
     var clus = dir_clus;
+    var steps = 0;
     while (clus >= 2) {
         var base = fatfs_first_sector_of_cluster(clus);
         for (var s = 0; s < fatfs_sectors_per_cluster; s = s + 1) {
@@ -552,7 +573,9 @@ fn fatfs_find_in_dir(dir_clus, name, namelen, result_ptr) {
             if (f == 1) { return 1; }
             if (f < 0) { return 0; }         # end-of-dir marker
         }
-        clus = fat_next_cluster(clus);
+        steps = steps + 1;
+        if (fat_chain_overrun(steps) == 1) { clus = 0; }
+        else { clus = fat_next_cluster(clus); }
     }
     return 0;
 }
@@ -565,6 +588,7 @@ fn fatfs_find_free_slot_in_dir(dir_clus) {
     var eps = 512 / 32;
     var clus = dir_clus;
     var last_clus = clus;
+    var steps = 0;
     while (clus >= 2) {
         last_clus = clus;
         var base = fatfs_first_sector_of_cluster(clus);
@@ -577,6 +601,8 @@ fn fatfs_find_free_slot_in_dir(dir_clus) {
                 if (fb == 0xE5) { fatfs_slot_sec = sec; fatfs_slot_idx = e; return 0; }
             }
         }
+        steps = steps + 1;
+        if (fat_chain_overrun(steps) == 1) { return 0 - 1; }   # cycle: no tail to extend after — refuse, don't link into corrupt metadata
         clus = fat_next_cluster(clus);
     }
     var nc = fat_root_extend(last_clus);
@@ -932,6 +958,7 @@ fn fatfs_find_free_root_slot() {
     if (fatfs_type == 32) {
         var clus = fatfs_root_cluster;
         var last_clus = clus;
+        var steps = 0;
         while (clus >= 2) {
             last_clus = clus;
             var base = fatfs_first_sector_of_cluster(clus);
@@ -944,6 +971,8 @@ fn fatfs_find_free_root_slot() {
                     if (fb == 0xE5) { fatfs_slot_sec = sec; fatfs_slot_idx = e; return 0; }
                 }
             }
+            steps = steps + 1;
+            if (fat_chain_overrun(steps) == 1) { return 0 - 1; }   # cycle: no tail to extend after — refuse, don't link into corrupt metadata
             clus = fat_next_cluster(clus);
         }
         # root chain is 100% full (no 0x00/0xE5) → extend by a fresh cluster
@@ -1153,6 +1182,7 @@ fn fatfs_dir_is_empty(first_cluster) {
     var eps = 512 / 32;
     var clus = first_cluster;
     var max_c = fatfs_count_of_clusters + 2;
+    var steps = 0;
     while (clus >= 2) {
         if (clus >= max_c) { return 1; }                 # corrupt-chain guard
         var base = fatfs_first_sector_of_cluster(clus);
@@ -1170,7 +1200,9 @@ fn fatfs_dir_is_empty(first_cluster) {
                 return 0;                                # a live entry → not empty
             }
         }
-        clus = fat_next_cluster(clus);
+        steps = steps + 1;
+        if (fat_chain_overrun(steps) == 1) { clus = 0; }   # cycle → falls through to 1, same as the corrupt-chain arm above
+        else { clus = fat_next_cluster(clus); }
     }
     return 1;
 }
@@ -1359,6 +1391,13 @@ fn fatfs_truncate(name, namelen, newlen) {
             last = first;
             var gi = 1;
             while (gi < cur_clus) {
+                # 1.57.2 — cycle budget on the walk's own counter (k-th fetch sees gi == k: the
+                # `steps` contract, see the block after fat_next_cluster). cur_clus is the dirent's
+                # 32-bit size — mounted-media data, up to 2^32/bpc0 fetches — NOT a volume bound.
+                # On a non-cyclic chain the `gn == 0` arm below fires first (at most N <= count
+                # fetches), so this trips ONLY on a cycle. REFUSE like the slot-extend walks: the
+                # tail we would link a fresh cluster after is an in-cycle node.
+                if (fat_chain_overrun(gi) == 1) { return 0 - 1; }
                 var gn = fat_next_cluster(last);
                 if (gn == 0) { return 0 - 1; }          # chain shorter than size — corrupt
                 last = gn;
@@ -1427,6 +1466,8 @@ fn fatfs_truncate(name, namelen, newlen) {
     var c = first;
     var idx = 1;
     while (idx < keep) {
+        # 1.57.2 — same cycle budget as the grow walk (keep <= cur_clus: dirent-bounded, not volume).
+        if (fat_chain_overrun(idx) == 1) { return 0 - 1; }
         var nxt = fat_next_cluster(c);
         if (nxt == 0) { return 0 - 1; }                # chain shorter than size says — corrupt
         c = nxt;
@@ -1491,6 +1532,7 @@ fn fatfs_alias_exists(alias11) {
     var eps = 512 / 32;
     if (fatfs_type == 32) {
         var clus = fatfs_root_cluster;
+        var steps = 0;
         while (clus >= 2) {
             var base = fatfs_first_sector_of_cluster(clus);
             for (var s = 0; s < fatfs_sectors_per_cluster; s = s + 1) {
@@ -1504,7 +1546,9 @@ fn fatfs_alias_exists(alias11) {
                     if (memeq(ep, alias11, 11) == 1) { return 1; }
                 }
             }
-            clus = fat_next_cluster(clus);
+            steps = steps + 1;
+            if (fat_chain_overrun(steps) == 1) { clus = 0; }
+            else { clus = fat_next_cluster(clus); }
         }
         return 0;
     }
@@ -1579,6 +1623,7 @@ fn fatfs_find_free_run(need) {
     var eps = 512 / 32;
     if (fatfs_type == 32) {
         var clus = fatfs_root_cluster;
+        var steps = 0;
         while (clus >= 2) {
             var base = fatfs_first_sector_of_cluster(clus);
             for (var s = 0; s < fatfs_sectors_per_cluster; s = s + 1) {
@@ -1594,7 +1639,9 @@ fn fatfs_find_free_run(need) {
                     if (run >= need) { fatfs_slot_sec = sec; fatfs_slot_idx = start; return 0; }
                 }
             }
-            clus = fat_next_cluster(clus);
+            steps = steps + 1;
+            if (fat_chain_overrun(steps) == 1) { clus = 0; }
+            else { clus = fat_next_cluster(clus); }
         }
         return 0 - 1;
     }
@@ -2034,6 +2081,7 @@ fn fatfs_find_lfn(name, namelen, result_ptr) {
     store64(&st, 0); store64(&st + 8, 0 - 1);
     if (fatfs_type == 32) {
         var clus = fatfs_root_cluster;
+        var steps = 0;
         while (clus >= 2) {
             var base = fatfs_first_sector_of_cluster(clus);
             for (var s = 0; s < fatfs_sectors_per_cluster; s = s + 1) {
@@ -2041,7 +2089,9 @@ fn fatfs_find_lfn(name, namelen, result_ptr) {
                 if (r == 1) { return 1; }
                 if (r < 0) { return 0; }
             }
-            clus = fat_next_cluster(clus);
+            steps = steps + 1;
+            if (fat_chain_overrun(steps) == 1) { clus = 0; }
+            else { clus = fat_next_cluster(clus); }
         }
         return 0;
     }

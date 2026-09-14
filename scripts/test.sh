@@ -18,11 +18,39 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
 KASHI_REF="${KASHI_REF:-1.0.6}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
+    # ⛔ Refuse to delete a git checkout (2026-09-13) — see the rekha block in scripts/build.sh.
+    if [ -d "$KASHI_DIR/.git" ]; then
+        echo "ERROR: $KASHI_DIR is a git checkout without src/font_data.cyr — refusing to delete it." >&2
+        echo "  Regenerate/commit the file there or check out a ref that carries it (KASHI_REF=$KASHI_REF); the clone fallback only replaces an ABSENT sibling." >&2
+        exit 1
+    fi
     echo "  kashi not at $KASHI_DIR — cloning $KASHI_REF for test..." >&2
     rm -rf "$KASHI_DIR"
     git clone --quiet --depth 1 --branch "$KASHI_REF" \
         https://github.com/MacCracken/kashi.git "$KASHI_DIR" >&2 || {
         echo "ERROR: kashi clone failed (ref=$KASHI_REF)" >&2
+        exit 1
+    }
+fi
+# rekha sibling/fetch handling (1.57.2) — same contract as kashi above and as scripts/build.sh
+# (see the comment there). REKHA_REF MUST match build.sh's and bench.sh's default: the kashi
+# triple's drift history above is the warning, and a face verified by the smoke but built from a
+# different tag in CI is the exact silent failure it describes.
+REKHA_DIR="${REKHA_DIR:-$ROOT/../rekha}"
+REKHA_REF="${REKHA_REF:-0.3.8}"
+if [ ! -f "$REKHA_DIR/fonts/face_data.cyr" ]; then
+    # ⛔ Refuse to delete a git checkout — the untracked-sentinel hazard is written up at the same
+    # block in scripts/build.sh; this guard MUST stay in step with build.sh's and bench.sh's.
+    if [ -d "$REKHA_DIR/.git" ]; then
+        echo "ERROR: $REKHA_DIR is a git checkout without fonts/face_data.cyr — refusing to delete it." >&2
+        echo "  Regenerate/commit the file there or check out a ref that carries it (REKHA_REF=$REKHA_REF); the clone fallback only replaces an ABSENT sibling." >&2
+        exit 1
+    fi
+    echo "  rekha not at $REKHA_DIR — cloning $REKHA_REF for test..." >&2
+    rm -rf "$REKHA_DIR"
+    git clone --quiet --depth 1 --branch "$REKHA_REF" \
+        https://github.com/MacCracken/rekha.git "$REKHA_DIR" >&2 || {
+        echo "ERROR: rekha clone failed (ref=$REKHA_REF)" >&2
         exit 1
     }
 fi
@@ -79,7 +107,8 @@ test_x86() {
     if [ -x "$CYRB" ]; then
         PREPPED="$ROOT/build/agnos_prepped.cyr"
         (echo '#define ARCH_X86_64' && echo '#define ELF64_KERNEL' \
-            && cat "$KASHI_DIR/src/font_data.cyr" && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED"
+            && cat "$KASHI_DIR/src/font_data.cyr" && cat "$REKHA_DIR/fonts/face_data.cyr" \
+            && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED"
         (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" $ROOT/build/agnos_test) 2>&1
         rm -f "$PREPPED"
     else
@@ -150,10 +179,21 @@ exit(0)
 # gating is "growth attributable to something other than new subsystems" — a runaway-bloat detector
 # rather than a high-water mark chased upward. Re-derive it before the 3D arc closes; do not simply
 # move it again.
-if [ "$SZ" -gt 50000 ] && [ "$SZ" -lt 2097152 ]; then
-        check "x86 size reasonable (${SZ}B)" "0" "0"
+# ⭐ 1.57.2 (2026-09-13): THE CEILING DID NOT MOVE — THE EMBEDDED FACE IS TAKEN OUT OF THE WEIGHING.
+# core/kfont.cyr embeds rekha's Liberation Sans Regular verbatim (410,820 B of .rodata literals);
+# agnos_test went ~1.99 M -> ~2.42 M and this gate went red, and with it CI's `test` job and the
+# release workflow. Not a raise: the weighed figure is SZ minus the face length read live from the
+# face module this very build cat'd in (`fn rekha_face_default_len() { return N; }`), so what sits
+# under the 2 MiB grant is kernel code + tables + kashi — what the grant was measured against. Fails
+# closed (FACE=0 -> raw size weighed) if the module cannot be read. ⚠ scripts/check.sh's "binary
+# size" gate carries the identical subtraction; the two MUST move together, like the ceiling itself.
+    FACE=$(sed -n 's/^fn rekha_face_default_len() { return \([0-9][0-9]*\); }.*/\1/p' "$REKHA_DIR/fonts/face_data.cyr" 2>/dev/null | head -1)
+    [ -n "$FACE" ] || FACE=0
+    SZK=$((SZ - FACE))
+    if [ "$SZK" -gt 50000 ] && [ "$SZK" -lt 2097152 ]; then
+        check "x86 size reasonable (${SZ}B; ${SZK}B weighed = size minus the ${FACE}B embedded face)" "0" "0"
     else
-        check "x86 size reasonable (${SZ}B)" "0" "1"
+        check "x86 size reasonable (${SZ}B; ${SZK}B weighed = size minus the ${FACE}B embedded face)" "0" "1"
     fi
 
     # Build kernel_hello via cyrius (cc5 wants a managed entry, not raw stdin)
@@ -195,7 +235,8 @@ test_aarch64() {
     # kernel/ so relative `include "arch/..."` paths resolve.
     mkdir -p $ROOT/build
     PREPPED_ARM="$ROOT/build/agnos_arm_prepped.cyr"
-    (echo '#define ARCH_AARCH64' && cat "$KASHI_DIR/src/font_data.cyr" && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED_ARM"
+    (echo '#define ARCH_AARCH64' && cat "$KASHI_DIR/src/font_data.cyr" && cat "$REKHA_DIR/fonts/face_data.cyr" \
+        && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED_ARM"
     (cd "$ROOT/kernel" && "$CYRB" build --aarch64 --no-deps "$PREPPED_ARM" /tmp/agnos_arm_test >/dev/null 2>&1)
     rc=$?
     rm -f "$PREPPED_ARM"

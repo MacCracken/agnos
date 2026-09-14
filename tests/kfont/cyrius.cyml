@@ -1,0 +1,19 @@
+[package]
+name = "kfont"
+version = "0.1.0"
+description = "agnos ring-3 kernel-embedded-face exerciser (1.57.2) — open#7 / read#5 / close#6 / stat#33 / lstat#102 on /fonts/default.ttf, FNV-1a-64 against rekha's generator hash, sfnt header + table directory, the read-only gate (one probe per mask bit), stat/lstat st_mode+st_nlink+st_size and the two-name contract; exits 95 iff the whole contract holds."
+license = "GPL-3.0-only"
+language = "cyrius"
+cyrius = "6.6.3"
+
+[build]
+src = "kfont.cyr"
+output = "build/kfont"
+
+# `syscalls` gives SYS_EXIT and the SysNrAgnos numbers. kfont.cyr issues open/read/close/stat/lstat
+# through the raw `syscall()` ON PURPOSE: this is the ABI exerciser for the kernel's /fonts
+# prefix intercept (core/kfont.cyr), and routing it through the stdlib wrappers would make it
+# test the wrapper's agreement with itself rather than the kernel's arms. The result IS the
+# exit code, read via the exec path's "run: exit N" (95 = pass; 80-94 / 96-97 name the failing step).
+[deps]
+stdlib = ["syscalls"]

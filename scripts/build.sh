@@ -27,11 +27,52 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
 KASHI_REF="${KASHI_REF:-1.0.6}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
+    # ⛔ Same guard as the rekha block below (2026-09-13): the fallback replaces an ABSENT sibling
+    # only, never a checkout that happens to lack the file — see the note there.
+    if [ -d "$KASHI_DIR/.git" ]; then
+        echo "ERROR: $KASHI_DIR is a git checkout without src/font_data.cyr — refusing to delete it." >&2
+        echo "  Regenerate/commit the file there or check out a ref that carries it (KASHI_REF=$KASHI_REF); the clone fallback only replaces an ABSENT sibling." >&2
+        exit 1
+    fi
     echo "  kashi not at $KASHI_DIR — cloning $KASHI_REF for build..." >&2
     rm -rf "$KASHI_DIR"
     git clone --quiet --depth 1 --branch "$KASHI_REF" \
         https://github.com/MacCracken/kashi.git "$KASHI_DIR" >&2 || {
         echo "ERROR: kashi clone failed (ref=$KASHI_REF)" >&2
+        exit 1
+    }
+fi
+# rekha freestanding default-face data (1.57.2 — the kernel-embedded TrueType face behind
+# /fonts, core/kfont.cyr). SAME contract as kashi above, mirrored line for line: sibling checkout
+# by default, clone the pinned tag when absent (override via REKHA_REF=<tag-or-branch>). Pinned at
+# 0.3.8 — the tag that carries fonts/face_data.cyr, matching ../rekha/VERSION as of 2026-09-13.
+# ⚠ scripts/test.sh AND scripts/bench.sh carry the same default and MUST move with it — the kashi
+# triple diverged three times before 1.56.51 for exactly this reason, and the same failure mode
+# applies here: `[deps.rekha] path` wins locally, so a stale default is invisible until a clean CI
+# checkout builds against a different face than the one that was tested.
+REKHA_DIR="${REKHA_DIR:-$ROOT/../rekha}"
+REKHA_REF="${REKHA_REF:-0.3.8}"
+if [ ! -f "$REKHA_DIR/fonts/face_data.cyr" ]; then
+    # ⛔ NEVER rm -rf A GIT CHECKOUT (2026-09-13). The sentinel probed above is UNTRACKED in a rekha
+    # working tree that has not committed fonts/ yet, so ordinary hygiene in the sibling — `git
+    # stash -u`, `git clean -fd`, `git checkout 0.3.7` — makes this branch fire against a LIVE
+    # checkout. The unconditional `rm -rf` that used to sit here then deleted the whole sibling
+    # INCLUDING .git (and any stash inside it) BEFORE the clone, and the clone cannot succeed on a
+    # tag that has not been cut, so the entire uncommitted arc was gone with no recovery path — and
+    # silently, because check.sh/sweep.sh run this script with output to /dev/null. The kashi block
+    # this mirrors was safe only because kashi's src/font_data.cyr is committed on every tag; that
+    # precondition does not carry over by copying the lines. The fallback exists for an ABSENT
+    # sibling (a clean CI checkout); a checkout that lacks the file is the operator's to fix.
+    if [ -d "$REKHA_DIR/.git" ]; then
+        echo "ERROR: $REKHA_DIR is a git checkout without fonts/face_data.cyr — refusing to delete it." >&2
+        echo "  Regenerate/commit the file there or check out a ref that carries it (REKHA_REF=$REKHA_REF); the clone fallback only replaces an ABSENT sibling." >&2
+        exit 1
+    fi
+    echo "  rekha not at $REKHA_DIR — cloning $REKHA_REF for build..." >&2
+    rm -rf "$REKHA_DIR"
+    git clone --quiet --depth 1 --branch "$REKHA_REF" \
+        https://github.com/MacCracken/rekha.git "$REKHA_DIR" >&2 || {
+        echo "ERROR: rekha clone failed (ref=$REKHA_REF)" >&2
         exit 1
     }
 fi
@@ -131,7 +172,11 @@ if [ "$ARCH" = "aarch64" ]; then
     # already refuses to allow for x86_64 ("absence is the only reliable failure mode"); the
     # cross-compile had no such discipline.
     rm -f "$ROOT/build/agnos-aarch64"
-    (echo '#define ARCH_AARCH64' && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED_ARM"
+    # 1.57.2 — rekha's face_data.cyr rides the aarch64 prep too: core/kfont.cyr sits in the
+    # UNCONDITIONAL core block of agnos.cyr (next to vfs/devs), so its rekha_face_default_* calls
+    # exist on every arch. kashi is NOT cat'd here because its only consumer (fb_console.cyr) is
+    # x86-only; test.sh's aarch64 prep cats both. REKHA_DIR resolved above.
+    (echo '#define ARCH_AARCH64' && cat "$REKHA_DIR/fonts/face_data.cyr" && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED_ARM"
     (cd "$ROOT/kernel" && "$CYRB" build --aarch64 --no-deps "$PREPPED_ARM" "$ROOT/build/agnos-aarch64")
     rm -f "$PREPPED_ARM"
     chmod +x "$ROOT/build/agnos-aarch64"
@@ -336,6 +381,8 @@ else
         [ -n "$FP_CTXSW_SELFTEST" ]  && echo '#define FP_CTXSW_SELFTEST'
         [ -n "$NAAD_RING3_SELFTEST" ] && echo '#define NAAD_RING3_SELFTEST'
         [ -n "$BLK_RING3_SELFTEST" ] && echo '#define BLK_RING3_SELFTEST'
+        # KFONT_RING3_SELFTEST=1 — 1.57.2: /bin/kfont opens the kernel-embedded face from ring 3 (scripts/smoke/kfont-smoke.sh).
+        [ -n "$KFONT_RING3_SELFTEST" ] && echo '#define KFONT_RING3_SELFTEST'
         [ -n "$BLK_WRITE_SELFTEST" ] && echo '#define BLK_WRITE_SELFTEST'
         [ -n "$GPT_WRITE_SELFTEST" ] && echo '#define GPT_WRITE_SELFTEST'
         [ -n "$AGNOVA_INSTALL_SELFTEST" ] && echo '#define AGNOVA_INSTALL_SELFTEST'
@@ -702,6 +749,12 @@ else
         # contract; this cat is the mechanism. Zero-stdlib by construction.
         # KASHI_DIR resolved above (sibling checkout locally, auto-clone in CI).
         cat "$KASHI_DIR/src/font_data.cyr"
+        # Freestanding rekha default-face data (1.57.2) — the 101 x 4 KB literal chunks that
+        # core/kfont.cyr assembles + verifies into /fonts/default.ttf at boot. Same mechanism as
+        # kashi's line above and for the same reason; the `[deps.rekha]` block in cyrius.cyml
+        # documents it. REKHA_DIR resolved above. ⛔ It MUST precede agnos.cyr — kfont.cyr calls
+        # rekha_face_default_* by name and nothing else defines them.
+        cat "$REKHA_DIR/fonts/face_data.cyr"
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")

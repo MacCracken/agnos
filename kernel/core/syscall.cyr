@@ -8601,6 +8601,12 @@ fn ksyscall(num, arg1, arg2, arg3) {
             op_path = oabs;
             op_len  = opi + 1;
         }
+        # 1.57.2 — the kernel-owned /fonts namespace (core/kfont.cyr) is a PREFIX INTERCEPT, not a
+        # mount: asked here, AFTER sc_path_ok + the relative→absolute normalisation and BEFORE
+        # vfs_resolve_mount, so the two face names never reach the mount table (and never appear in
+        # mountlist#104 — crab's volumes sidebar reads that). kfont_open applies the read-only flag
+        # gate and the verified-ready gate itself; -1 from it is final, no fallthrough to disk.
+        if (kfont_path_index(op_path, op_len) >= 0) { return kfont_open(op_path, op_len, arg3); }
         var be7 = vfs_resolve_mount(op_path, op_len);
         if (be7 == FS_EXT2) {
             # SMP sub-bite 5 (fs_lock): the ext2 open/create arm — lookup + (optional)
@@ -9035,6 +9041,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # ino=0+size/type fill is a follow-on). (1.41.3)
         if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
         if (is_user_range(arg3, 48) == 0) { stack_canary_check(canary); return 0 - 1; }
+        # 1.57.2 — /fonts prefix intercept (core/kfont.cyr), before the mount table; same shape as open#7.
+        if (kfont_path_index(arg1, arg2) >= 0) { var kr33 = kfont_stat(arg1, arg2, arg3); stack_canary_check(canary); return kr33; }
         var be33 = vfs_resolve_mount(arg1, arg2);
         if (be33 != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
         # 1.46.x SMP sub-bite 5: ext2_path_lookup + ext2_fill_stat use the shared ext2 scratch.
@@ -9339,6 +9347,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # POSIX lstat and `readlink`#70, which introduced this exact lookup mode.
         if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
         if (is_user_range(arg3, 48) == 0) { stack_canary_check(canary); return 0 - 1; }
+        # 1.57.2 — /fonts prefix intercept (core/kfont.cyr). The face is a regular file, never a
+        # symlink, so lstat and stat answer identically for it; before the mount table, as in #33.
+        if (kfont_path_index(arg1, arg2) >= 0) { var kr102 = kfont_stat(arg1, arg2, arg3); stack_canary_check(canary); return kr102; }
         var be102 = vfs_resolve_mount(arg1, arg2);
         # ⚠ FAT/exFAT cannot represent a symlink, so lstat there would be identical to stat — but #33
         # already returns -1 for them, and quietly succeeding here would be a surface #33 does not have.

@@ -1,6 +1,6 @@
 ---
 name: 1.56.51 P-1 audit sweep — unfixed backlog
-description: Findings that survived adversarial verification in the 1.56.51 sweep — with what has since been fixed marked inline (see the STATUS block).
+description: Findings that survived adversarial verification in the 1.56.51 sweep — CLOSED 1.57.2; every x86-actionable item landed, the four residuals are re-homed to roadmap rows (see the STATUS block).
 type: issue
 ---
 
@@ -8,11 +8,51 @@ type: issue
 
 **Opened** 2026-08-28, at the close of the 1.56.51 audit/hardening sweep.
 
+## ✅ STATUS — 1.57.2 (2026-09-13): CLOSED AND ARCHIVED — the x86 tail landed, the residuals are re-homed
+
+**Final tally: P0 2/2 · P2 29/29 · P1 23/26 + 1 PARTIAL-by-ruling + 2 aarch64-gated.** Nothing that
+can be fixed and verified on x86 remains in this file. Each item below was re-derived from its
+Mechanism paragraph against live code (the rule the 1.56.59 block established), not from a heading.
+
+**1.57.2 CLOSED TWO, and both closures corrected this file's own record:**
+- **FAT/exFAT multi-node chain cycles** — per-walk fetch budgets at every EOC-terminated `fatfs.cyr`
+  walk (13 sites budgeted, 4 of them REFUSING because a cycle has no tail to extend after; 8 more
+  were already volume-bounded or single-step). ⭐ **exFAT never had the hang**: every one of its
+  cursor-terminated walks carried a function-local `guard` since 1.34.x — the "31 walk sites" count
+  this file and `exfat_next_cluster`'s 1.57.1 note carried was 17 real + 14 already guarded. Its
+  guards now route through `exfat_chain_overrun`, one strict-`>` bound for both filesystems.
+  Gated by `fat-cycle-smoke.sh`, mutation-proven on both predicates (see the carried list).
+- **W^X hard refusal** at both ELF loader sites. ⛔ The 1.56.51 "stale RWX binaries" diagnosis was
+  wrong — `build/rootfs/bin` is 0/48 RWX; the RWX images were the two hand-built selftest ELFs.
+  Gated by `ring3_wx_check` in `ring3-smoke` (9/9), mutation-proven.
+
+⛔ **A THIRD RECORD IN THIS FILE WAS STALE**: "`ring3-smoke` has 4 real failures" — the tree measures
+8/8 and has since the 1.56.55 dwell fix. Three wrong statements about the tree in one file, all in
+the direction of "worse than it is". The lesson generalises the 1.56.59 one: a *carried* note rots
+exactly like a status header, and nobody re-derives a note that says something is broken.
+
+**RE-HOMED, NOT FORGOTTEN — the four residuals and where they now live:**
+| residual | ruling / blocker | now tracked at |
+|---|---|---|
+| `arch/aarch64/timer.cyr:12` `[sp,#0]` frame padding (P1) | unverifiable until the port compiles; `rdtsc()` = 0 ⇒ zero KASLR entropy on that arch | roadmap *aarch64 does not compile* row (mechanism preserved below) |
+| `core/klug.cyr:166` cross-arch leak = the port itself (P1) | LARGE, 32 fns / 46 vars undefined, growing | same row |
+| `syscall.cyr` raw-disk `BLK_RW_ARM_MAGIC` gate (P1 PARTIAL) | operator ruling 1.56.51: the reorder is a measured ABI break; needs per-process capabilities | roadmap *Native sandbox-confinement primitives* row |
+| `#92` op 0x0C SMP-safety (shared prep slot + global latches) | ruling: iron-only, `gpu_present == 0` under QEMU so no smoke can go red on it | roadmap *`#92` ABI table* row |
+
+⚠ **Also carried, not an audit finding:** `ext2-smoke` still uses the 64 MB / `1MiB..100%` ESP recipe
+that cannot boot (its scenario 1); it is not in `sweep.sh`. Named in the roadmap's harness note.
+
+⇒ **Archived on the strength of the above, not of its header** — CLAUDE.md's rule. What the shipped
+changes BROKE was checked before archiving: `ring3-smoke` 9/9, `fat-smoke` / `exfat-smoke` /
+`exfat-write-smoke` green on their own single-flag kernels, `agnsh-smoke` PASS, kernel builds
+byte-identical across the 6.6.1 -> 6.6.3 toolchain move that shipped in the same cut.
+
 ## ⭐⭐ STATUS — 1.57.1 (2026-09-08): SIX MORE CLOSED, AND THE TALLY RECONCILED
 
-⛔ **DO NOT ARCHIVE THIS FILE.** It would archive cleanly on its own header text and it has live
-items under it — the inverse of the `#98` failure CLAUDE.md cites, and more dangerous, because it
-reads nearly done.
+⛔ **DO NOT ARCHIVE THIS FILE.** *(1.57.1 text, superseded — archived at 1.57.2 once every live item
+was landed or re-homed; see the block above.)* It would archive cleanly on its own header text and it
+has live items under it — the inverse of the `#98` failure CLAUDE.md cites, and more dangerous, because
+it reads nearly done.
 
 **1.57.1 CLOSED SIX:** the virtio_net unchecked-BAR store (it could rewrite the boot PML4/PDPT/PD);
 `xhci_cmd_wait` — the FOURTH event-ring waiter — now reclaims HID Transfer Events, closing a LIVE
@@ -469,21 +509,52 @@ Listed as one line each; the full mechanism is recoverable by re-reading the sit
 ## Also carried out of the sweep, not in the tables above
 
 - **aarch64 does not compile** — **32** reachable undefined functions + **46** undefined variables (re-measured 1.56.59 — the surface GREW; the trace above is the 2026-08-28 measurement, kept as the historical record) in the
-  `arch/aarch64/stubs.cyr` surface. `test.sh --all` is now honestly RED because of it.
-- **`ring3-smoke` has 4 real failures** (preempt gate, parent spawn+wait, stress, yield), PRE-EXISTING
-  and unexplained — measured identical against `ffdb611`. Visible only since the virtio-blk smoke
-  conversion made that gate runnable.
+  `arch/aarch64/stubs.cyr` surface. `test.sh --all` is now honestly RED because of it. **Re-homed at
+  1.57.2** to the roadmap's *aarch64 does not compile* row together with the `timer.cyr:12` `[sp,#0]`
+  frame-padding defect (P1 above, mechanism preserved in this file) — both are one item: the timer
+  fix is unverifiable until the port compiles.
+- ✅ **`ring3-smoke`'s "4 real failures" were STALE by 1.57.2** — measured on the untouched tree
+  2026-09-13: **8 PASS / 0 FAIL**. They were the 40 s dwell truncating the selftest's tail, fixed at
+  1.56.55 (`QEMU_TIMEOUT` 40 -> 120, recorded in the smoke's own header); this line and `state.md`'s
+  copy of it were never re-read. ⚠ Two of three baseline runs died in firmware (`gnoboot: fail @ EBS`)
+  and reported 0/8 against an EMPTY log — the smoke now uses the banner-gated `qemu_dwell_kernel` and
+  prints a `N passed, M failed` tally. (Original text: preempt gate, parent spawn+wait, stress, yield,
+  "PRE-EXISTING and unexplained — measured identical against `ffdb611`".)
 - **`ext2-smoke` still uses the ESP recipe that cannot boot** (multi-partition + ext2 overlay, so it
   was excluded from the blanket conversion of the other 24).
-- **FAT multi-node cluster cycles** (`A -> B -> A`) still hang. The `fat_chain_overrun()` predicate and
-  the exact per-site loop form are staged at `fat_next_cluster`'s header for whoever does the 13 sites.
+- ✅ **CLOSED 1.57.2 — FAT multi-node cluster cycles** (`A -> B -> A`). Every EOC-terminated walk in
+  `fatfs.cyr` now carries a per-WALK fetch budget through `fat_chain_overrun` (9 walk sites in the staged
+  `steps`/`clus = 0` form; the two slot-extend walks and the two `fatfs_truncate` walks REFUSE (-1)
+  instead, because a cycle has no tail to append after — the truncate pair was found by the coverage
+  refuter: their bound was the dirent's 32-bit size, mounted-media data, not the volume). 8 other call
+  sites were already volume-bounded (`fatfs_read` since 1.41.5, `fat_free_chain`, `fat_dir_end_index`,
+  `fat_root_cluster_for_index`) or single-step. ⭐ **exFAT was NEVER unguarded** — every
+  cursor-terminated walk had a function-local `guard` at `cluster_count + 2` since the 1.34.x series;
+  the 1.57.1 note inside `exfat_next_cluster` counting it among the 31 was wrong. Those guards now
+  route through the new `exfat_chain_overrun` so both filesystems share ONE strict-`>` bound.
+  **Gate:** `scripts/smoke/fat-cycle-smoke.sh` (in `sweep.sh`) patches a real FAT32 ESP so a
+  100%-populated subdirectory chain is `A -> B -> A` and an exFAT root chain likewise, then requires
+  the post-walk markers; **mutation-proven both ways** — stubbing `fat_chain_overrun` hung the boot at
+  `fatc: cycle-walk start`, stubbing `exfat_chain_overrun` hung it before `exfat: mounted`. ⚠ The
+  FATTEST.BIN read could NOT serve as the hook: `fatfs_read` is capped by `maxlen` and its own guard,
+  so a cyclic FILE returns with or without the budget — the gate walks a DIRECTORY for a name that is
+  not there.
 - ✅ **`ktest.sh` now runs** — it had been booting nothing (64 MB ESP, outside the measured cell).
   97 passed / 6 failed; the 6 are pre-existing and measured identical on a clean tree.
 - ✅ **`agnsh-smoke` now has a real ring-3 oracle** — it used to pass a kernel that wedged at agnsh's
   first syscall, because its gates only checked that kybernet ATTEMPTED the exec.
-- **W^X is enforced but not closed**: an RWX segment is reported, not refused, because refusing it
-  regressed `ring3-smoke` 4 PASS -> 0. The loader prints
-  `elf: W^X violation - RWX segment mapped writable+executable`; when that line stops appearing, the
-  refusal can be turned on.
+- ✅ **CLOSED 1.57.2 — W^X is a hard refusal at both loader sites.** ⛔ **The 1.56.51 diagnosis was
+  wrong**: there were no "stale RWX binaries from an older cyrius" — `readelf -lW` over
+  `build/rootfs/bin` measured 48 binaries, 48 `R E` + 48 `RW` PT_LOADs, **0 RWX**. The only RWX images
+  either loader ever saw were the two HAND-BUILT selftest ELFs in `main.cyr` (`ring3_elf_fill` and
+  `spawn_parent_fill`'s inline child, `p_flags = 0x07` on code-only segments) — which is exactly why
+  refusing took `ring3-smoke` to zero. Both are `0x05` now; the tally is unchanged before and after the
+  flip. The refusal sits BEFORE the page loop (a refusal after `pmm_alloc_2mb` but before
+  `proc_map_page` would leak the fresh 2 MB frame — `elf_bail` reclaims only mapped PDEs), and the
+  serial line now reads `elf: W^X violation - RWX segment refused`. **Gate:** `ring3_wx_check` hands
+  `elf_load` an R|W|X twin of the selftest ELF; `ring3-smoke` requires `wx: RWX segment refused` and
+  forbids `wx: RWX segment LOADED` — 9 passed / 0 failed, and reverting one refusal site turns it red.
 - **The raw-block write gate is a plain magic constant** — deliberate, pending per-process
-  capabilities; the seam is named in `syscall.cyr` at `BLK_RW_ARM_MAGIC`.
+  capabilities; the seam is named in `syscall.cyr` at `BLK_RW_ARM_MAGIC`. **Operator ruling on
+  record** (1.56.51: the arm reorder is a measured ABI break); re-homed at 1.57.2 to the roadmap's
+  *Native sandbox-confinement primitives* row, which is where per-process capabilities would land.

@@ -10,6 +10,11 @@
 #   "ring3: preempt OK" — proc A stayed live + preemptible through B's exit (counter > 0).
 #   "ring3: gate held"  — under preempt_disable() proc A's counter FREEZES => the
 #                          1.44.0 preempt gate covers ring-3 too.
+#   "wx: RWX segment refused" — 1.57.2 W^X CLOSED. ring3_wx_check hands elf_load a copy of the
+#                          proc-B ELF re-flagged p_flags = R|W|X; the loader must refuse it
+#                          (elf.cyr, the `(p_flags & 3) == 3` arm). "wx: RWX segment LOADED" is
+#                          the mutation marker and is FORBIDDEN. Proven 1.57.2: reverting one
+#                          refusal site turns this red; restoring it turns it green.
 #
 # Build first:  RING3_SELFTEST=1 ./scripts/build.sh
 # Requires: qemu-system-x86_64, OVMF firmware, mtools, parted, gnoboot built.
@@ -67,7 +72,11 @@ LOG="$LOGS/ring3.log"
 # ⭐ THE TELL WAS IN THE LOG THE WHOLE TIME: `ring3: Y=54 A=38284` satisfies `A > Y*10` by 70x, and the
 # very next statement is the `yield OK` kprintln. A missing marker whose PRECONDITION is visible in the
 # line above it is a truncated log, not a failed assertion.
-qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-120}" \
+# ⚠ 1.57.2 — qemu_dwell_kernel, NOT qemu_dwell. Two consecutive baseline runs of this smoke died in
+# the firmware ("gnoboot: fail @ EBS", then the OVMF boot menu) before the kernel ran once, and each
+# reported 0 PASS / 8 FAIL against an EMPTY log — the exact void-run-read-as-regression the helper's
+# header documents. Retries are banner-gated, so a kernel that boots and then fails gets no second try.
+qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-120}" "$WORK/vars.fd" "$OVMF_VARS" \
     qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
@@ -75,14 +84,21 @@ qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-120}" \
     -drive "file=$ESP,format=raw,if=none,id=esp0" -device "nvme,drive=esp0,serial=AGNOS-SMOKE" \
     -serial stdio -display none -no-reboot
 
-echo "--- serial (ring3 lines) ---"; strings "$LOG" | grep "ring3:" | sed 's/^/  /'
-rc=0
-if strings "$LOG" | grep -q "ring3: child exited"; then echo "PASS: a scheduled ring-3 proc (real ELF via elf_load) ran to completion + exit()ed cleanly while another stayed live"; else echo "FAIL: 'ring3: child exited' not found — concurrent exec / exit() regression"; rc=1; fi
-if strings "$LOG" | grep -q "ring3: preempt OK"; then echo "PASS: the surviving ring-3 proc stayed live + preemptible through the child's exit"; else echo "FAIL: 'ring3: preempt OK' not found — the live proc never advanced (or triple-faulted)"; rc=1; fi
-if strings "$LOG" | grep -q "ring3: gate held"; then echo "PASS: the preempt gate freezes ring-3 procs too"; else echo "FAIL: 'ring3: gate held' not found — preempt gate regression for ring-3"; rc=1; fi
-if strings "$LOG" | grep -q "ring3: parent spawn+wait OK"; then echo "PASS: a ring-3 PARENT spawn(#3)ed a child ELF + poll-waitpid(#4)ed it to exit — entirely from ring 3 (spawn#3 kernel-CR3 fix end-to-end)"; else echo "FAIL: 'ring3: parent spawn+wait OK' not found — ring-3 spawn+waitpid regression (child #UD / mis-wired tables under parent CR3)"; rc=1; fi
-if strings "$LOG" | grep -q "ring3: stress OK"; then echo "PASS: >=8 concurrent ring-3 procs (code/stack in PD[8..63]) all stayed live — the page-table VA-collision fix holds (pre-fix this triple-faults in proc_get_user_cr3's PML4 load64)"; else echo "FAIL: 'ring3: stress OK' not found — page-table VA-collision (a context switch SMAP-faulted on a user-flagged PML4, or a stress proc died)"; rc=1; fi
-if strings "$LOG" | grep -q "ring3: nonlifo reuse OK"; then echo "PASS: a NON-TOP reaped proc-table slot was REUSED by the next spawn (non-LIFO reclaim) — out-of-order background-job exits no longer leak proc_table slots"; else echo "FAIL: 'ring3: nonlifo reuse OK' not found — out-of-order reap leaks its proc_table slot (append-only allocation regression)"; rc=1; fi
-if strings "$LOG" | grep -q "ring3: nonlifo signal clear OK"; then echo "PASS: a recycled proc-table slot does not inherit the prior occupant's pending signals/mask (proc_alloc_slot clears them)"; else echo "FAIL: 'ring3: nonlifo signal clear OK' not found — recycled slot inherited stale signal state"; rc=1; fi
-if strings "$LOG" | grep -q "ring3: yield OK"; then echo "PASS: sched_yield #44 — the yielder resumed at the post-SYSCALL RIP with rax=0 AND donated its slice (non-yielder counter >> 10x yielder)"; else echo "FAIL: 'ring3: yield OK' not found — yield round-trip broke or the slice was not donated (see 'ring3: Y= A=' line)"; rc=1; fi
+echo "--- serial (ring3 lines) ---"; strings "$LOG" | grep -E "ring3:|wx:|elf:" | sed 's/^/  /'
+rc=0; np=0; nf=0
+pass_() { echo "PASS: $1"; np=$((np+1)); }
+fail_() { echo "FAIL: $1"; nf=$((nf+1)); rc=1; }
+# 1.57.2 W^X refusal gate — BOTH halves: the refused marker must be present AND the loaded marker absent.
+if strings "$LOG" | grep -q "wx: RWX segment refused"; then pass_ "elf_load REFUSED a PT_LOAD flagged R|W|X (W^X closed, 1.57.2)"; else fail_ "'wx: RWX segment refused' not found — the W^X refusal in elf.cyr is gone, or ring3_wx_check no longer runs"; fi
+if strings "$LOG" | grep -q "wx: RWX segment LOADED"; then fail_ "'wx: RWX segment LOADED' present — elf_load MAPPED an R|W|X segment (W^X refusal regressed)"; fi
+if strings "$LOG" | grep -q "ring3: child exited"; then pass_ "a scheduled ring-3 proc (real ELF via elf_load) ran to completion + exit()ed cleanly while another stayed live"; else fail_ "'ring3: child exited' not found — concurrent exec / exit() regression"; fi
+if strings "$LOG" | grep -q "ring3: preempt OK"; then pass_ "the surviving ring-3 proc stayed live + preemptible through the child's exit"; else fail_ "'ring3: preempt OK' not found — the live proc never advanced (or triple-faulted)"; fi
+if strings "$LOG" | grep -q "ring3: gate held"; then pass_ "the preempt gate freezes ring-3 procs too"; else fail_ "'ring3: gate held' not found — preempt gate regression for ring-3"; fi
+if strings "$LOG" | grep -q "ring3: parent spawn+wait OK"; then pass_ "a ring-3 PARENT spawn(#3)ed a child ELF + poll-waitpid(#4)ed it to exit — entirely from ring 3 (spawn#3 kernel-CR3 fix end-to-end)"; else fail_ "'ring3: parent spawn+wait OK' not found — ring-3 spawn+waitpid regression (child #UD / mis-wired tables under parent CR3)"; fi
+if strings "$LOG" | grep -q "ring3: stress OK"; then pass_ ">=8 concurrent ring-3 procs (code/stack in PD[8..63]) all stayed live — the page-table VA-collision fix holds (pre-fix this triple-faults in proc_get_user_cr3's PML4 load64)"; else fail_ "'ring3: stress OK' not found — page-table VA-collision (a context switch SMAP-faulted on a user-flagged PML4, or a stress proc died)"; fi
+if strings "$LOG" | grep -q "ring3: nonlifo reuse OK"; then pass_ "a NON-TOP reaped proc-table slot was REUSED by the next spawn (non-LIFO reclaim) — out-of-order background-job exits no longer leak proc_table slots"; else fail_ "'ring3: nonlifo reuse OK' not found — out-of-order reap leaks its proc_table slot (append-only allocation regression)"; fi
+if strings "$LOG" | grep -q "ring3: nonlifo signal clear OK"; then pass_ "a recycled proc-table slot does not inherit the prior occupant's pending signals/mask (proc_alloc_slot clears them)"; else fail_ "'ring3: nonlifo signal clear OK' not found — recycled slot inherited stale signal state"; fi
+if strings "$LOG" | grep -q "ring3: yield OK"; then pass_ "sched_yield #44 — the yielder resumed at the post-SYSCALL RIP with rax=0 AND donated its slice (non-yielder counter >> 10x yielder)"; else fail_ "'ring3: yield OK' not found — yield round-trip broke or the slice was not donated (see 'ring3: Y= A=' line)"; fi
+echo ""
+echo "=== ring3-smoke: $np passed, $nf failed ==="
 exit $rc

@@ -1533,8 +1533,9 @@ fn proc_map_page(cr3, virt, phys) {
 # both pass with text read-only.
 # ⚠ Measured before landing: across 166 agnos-target binaries the toolchain emits `R-X @0x400000`
 # and `RW- @0x600000` (or 0x800000) — segment permissions never share a 2 MB page, which is what
-# makes this enforceable at PDE granularity at all. The RWX binaries in the tree are stale builds
-# from an older cyrius; the loaders now REFUSE that shape rather than quietly granting it.
+# makes this enforceable at PDE granularity at all. 1.57.2, measured: build/rootfs/bin holds 0/48 RWX
+# binaries — the only RWX PT_LOADs ever loaded were main.cyr's two hand-built selftest ELFs (now R|X),
+# and both loaders REFUSE that shape outright (elf.cyr, mutation-locked by ring3-smoke's `wx:` gate).
 fn proc_map_page_rx(cr3, virt, phys) {
     var pd_kva = ptw_pd_kva(cr3);                 # 1.56.51: direct-map walk (see ptw_pd_kva header)
     if (pd_kva == 0) { return 0 - 1; }

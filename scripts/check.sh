@@ -476,9 +476,42 @@ fi
 # gating is "growth attributable to something other than new subsystems" — a runaway-bloat detector
 # rather than a high-water mark chased upward. Re-derive it before the 3D arc closes; do not simply
 # move it again.
-[ -z "$SZWHY" ] && test "$SZ" -gt 50000 && test "$SZ" -lt 2097152 && rc=0 || rc=$?
-check "binary size ($SZ bytes)" $rc
+# ⭐ 1.57.2 (2026-09-13): THE CEILING DID NOT MOVE — THE EMBEDDED FACE IS TAKEN OUT OF THE WEIGHING.
+# The kernel-embedded default TrueType face (core/kfont.cyr) carries rekha's Liberation Sans Regular
+# VERBATIM as 410,820 bytes of .rodata string literals; build/agnos went 1,997,536 -> 2,418,896 B and
+# the 2 MiB grant above went red in BOTH copies of this gate (here and scripts/test.sh) and therefore
+# in CI. Raising the number to ~2.5 M would have been exactly the reactive move the comment forbids.
+# Instead the gate weighs SZ minus the face's byte length — read live from the SAME face module the
+# build cat'd in (its `fn rekha_face_default_len() { return N; }`), never a constant here — so the
+# figure under the ceiling is kernel code + tables + kashi, i.e. what the 2 MiB grant was measured
+# against (kashi was already inside it; subtracting kashi too would be a hidden raise). At 1.57.2
+# the weighed figure is 2,008,076 B: 89 KB under, the same headroom the tree had before the face.
+# ⚠ Fail-closed: if the face module cannot be read, FACE=0, the raw 2.4 MB is weighed, and the gate
+# goes red rather than quietly measuring less. scripts/test.sh:x86 size carries the identical
+# subtraction and the two MUST move together, exactly as the ceiling number itself must.
+REKHA_DIR="${REKHA_DIR:-$ROOT/../rekha}"
+FACE=$(sed -n 's/^fn rekha_face_default_len() { return \([0-9][0-9]*\); }.*/\1/p' "$REKHA_DIR/fonts/face_data.cyr" 2>/dev/null | head -1)
+[ -n "$FACE" ] || { FACE=0; [ -n "$SZWHY" ] || SZWHY="could not read rekha_face_default_len() from $REKHA_DIR/fonts/face_data.cyr — weighing the raw size, face included"; }
+SZK=$((SZ - FACE))
+[ -z "$SZWHY" ] && test "$SZK" -gt 50000 && test "$SZK" -lt 2097152 && rc=0 || rc=$?
+check "binary size ($SZ bytes; $SZK weighed = size minus the $FACE-byte embedded face)" $rc
 [ -z "$SZWHY" ] || echo "    VACUOUS: $SZWHY"
+
+# 1.57.2 — the kernel image vs the FIXED kernel stacks in region 1 (scripts/check/image-layout-check.sh).
+# The face's +410 KB of .rodata carried the LOAD end from ~0x2FA2xx to 0x35E770, across the AP1-3
+# boot/TSS stack window [0x310000, 0x340000) — a placement class this tree has paid for twice on
+# iron (gdt.cyr's RSP0-in-.bss triple fault, boot_shim.cyr's boot stack over the exfat literals) and
+# that no gate had ever measured; the arc's own fit check bounded the wrong address (0x400000).
+# Tolerated at 1.57.2 ONLY because the bytes under the window are rekha's dead-after-init chunk
+# literals; the gate proves that byte for byte, locks the literals' single reader chain, hard-fails
+# above 0x370000 (the BSP boot stack's 64 KB budget), and reports the 275 B margin to the first live
+# byte. The real fix — relocating the AP stacks — is the operator's call, filed in
+# docs/development/issues/2026-09-13-ap-stacks-inside-kernel-rodata.md. Same vacuity guard as the
+# size gate: a fossil binary describes a different tree. Mutation-tested (see the script header).
+[ -z "$SZWHY" ] && sh "$ROOT/scripts/check/image-layout-check.sh" "$ROOT/build/agnos" > /tmp/image-layout-check.log 2>&1 && rc=0 || rc=$?
+check "kernel image vs fixed kernel stacks (AP window / BSP boot stack)" $rc
+[ -z "$SZWHY" ] || echo "    VACUOUS: $SZWHY"
+[ "$rc" = "0" ] || cat /tmp/image-layout-check.log
 
 echo ""
 echo "=========================="

@@ -102,6 +102,15 @@ run_gate "baseline check.sh (build/test/version/size)" "" "CHECK"
 run_gate "1.39.x FAT read (cat/ls reach FAT)"       "FATFS_SELFTEST=1"                         "fat-smoke.sh"
 run_gate "1.39.x FAT write (touch/echo/rm/mkdir/mv + subdir)" "FATFS_WRITE_SELFTEST=1 FAT_ALLOW_ESP_WRITE=1" "fat-write-smoke.sh"
 run_gate "1.39.x exFAT read"                         "EXFAT_SELFTEST=1"                         "exfat-smoke.sh"
+# 1.57.2 — the ONLY gate that presents a MULTI-NODE FAT chain cycle (A -> B -> A, both in range):
+# fat-smoke / exfat-smoke prove GOOD chains read, and nothing else in the tree ever hands the kernel
+# a chain that never ends. One kernel carries both selftests and one disk carries both cycles (a
+# cyclic FAT32 subdir on the ESP + a cyclic exFAT root on p2); the smoke aborts before booting unless
+# fsck.fat AND fsck.exfat see the cycles, and it exits 2 (VOID) when the kernel never ran. Mutation-
+# proven: it goes RED with either predicate stubbed (see the smoke header for the exact lines).
+# ⚠ ~45 s to PASS (the FAT32 budget is 129k fetches of uncached NVMe reads under TCG); a kernel that
+# hangs burns the full 180 s dwell, twice, because run_gate retries — that is the RED path, not slack.
+run_gate "1.57.2 FAT/exFAT chain-cycle budget"       "FATFS_SELFTEST=1 EXFAT_SELFTEST=1"         "fat-cycle-smoke.sh"
 # 1.56.52 — the tree's FIRST usb-storage coverage. The MSC transport had none: no QEMU invocation
 # anywhere under scripts/ attached one, so every gate passed regardless of what msc.cyr did. This
 # smoke builds BOTH arms itself (injected + plain), so it needs no buildenv from here.
@@ -123,6 +132,14 @@ run_gate "1.56.52 DHCP option length vs reader"        ""                       
 # gets a PRIVATE copy of its memory, and the parent reaps it via waitpid wait-any. Builds its own
 # kernel (FORK_SELFTEST) and seeds /bin/forker, so it needs no buildenv here.
 run_gate "1.56.55 fork#96 + waitpid wait-any"          ""                                         "fork-smoke.sh"
+# 1.57.2 — the kernel-embedded default TrueType face (core/kfont.cyr, rekha's Liberation Sans) proven
+# FROM RING 3: /bin/kfont opens /fonts/default.ttf by name, pulls every byte through read#5 and hashes
+# what it got against rekha's generator FNV-1a-64, then the sfnt header, the read-only gate, the exact
+# namespace, stat#33 + lstat#102 and the provenance alias (exit 95; 80-94 / 96-97 name the step). The kernel's own boot
+# line proves only that the KERNEL sees the bytes under its CR3. Builds its own kernel
+# (KFONT_RING3_SELFTEST) and seeds /bin/kfont like the blk-ring3 smoke, so it needs no buildenv here.
+# ⚠ There is no blk-ring3 row in this table to sit beside — that smoke is one of the ~68 still unlisted.
+run_gate "1.57.2 kernel-embedded face (/fonts/default.ttf, rekha)" ""                             "kfont-smoke.sh"
 run_gate "1.39.x exFAT write (+ subdir)"             "EXFAT_WRITE_SELFTEST=1"                   "exfat-write-smoke.sh"
 
 # --- ext2/jbd2 write regression bar (the iron-validated path must stay green) ---

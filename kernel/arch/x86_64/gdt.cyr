@@ -58,14 +58,30 @@ var tss_array[416];  # 4 CPUs x 104 bytes each
 # pushes the 5-word frame + 15-GPR ISR save + the whole do_context_switch call tree
 # DOWN from RSP0 into live kernel globals -> corrupt switch -> triple fault -> the
 # "locks up right after the agnoshi banner" iron symptom. 0x3C0000 is above the image
-# end (0x2334E8), below the syscall kstacks (0x3D0000/0x3F0000), clear of the AP RSP0
+# end (0x2334E8 when this was written — 0x35E770 at 1.57.2, see the ⛔ below), below the
+# syscall kstacks (0x3D0000/0x3F0000), clear of the AP RSP0
 # stacks (0x320000-0x340000), and in PD[1] (mirrored identity-supervisor-writable into
 # every per-proc CR3) — the same reserved-region-1 placement the syscall kstack uses.
+# ⛔ THE AP STACKS ARE NO LONGER ABOVE THE IMAGE (2026-09-13, 1.57.2). The kernel-embedded
+# default face (core/kfont.cyr) added ~410 KB of .rodata string literals and the LOAD end
+# moved ~0x2FA2xx -> 0x35E770, so the CPU 1-3 windows below — boot stack AND TSS.RSP0, both
+# [0x310000, 0x340000) — now sit INSIDE .rodata, over rekha's chunk literals 52..100. Every
+# AP frame (the trampoline's push/lretq, ap_entry, the idle's CPL0 timer frames, the initial
+# RSP0) lands in the loaded kernel image through the RW 2 MB identity pages: no fault, no
+# signal, the exact class this note's own 1.44.x story is about. Tolerated for 1.57.2 only
+# because those literals are dead after kfont_init (read once, before smp_start_aps) and the
+# first live kernel byte above CPU3's stack top is 275 B away — both locked by
+# scripts/check/image-layout-check.sh (check.sh gate), NOT by anything in this file. The fix
+# is to move these three windows above the image — the region-7 kstack pool the syscall
+# kstacks already use is the natural home — and it is the operator's call:
+# docs/development/issues/2026-09-13-ap-stacks-inside-kernel-rodata.md. Until then, do not
+# add a reader of rekha_face_default_chunk, and re-run the gate after anything that shrinks
+# .text/.bss or re-orders .rodata.
 var tss_kernel_stack = 0x3C0000;
 
 fn tss_get_cpu_stack(cpu_id) {
     if (cpu_id == 0) { return 0x3C0000; }   # BSP — relocated out of live .bss (see tss_kernel_stack note)
-    return 0x300000 + cpu_id * 0x10000 + 0x10000;
+    return 0x300000 + cpu_id * 0x10000 + 0x10000;   # ⛔ 0x320000/0x330000/0x340000 — inside .rodata at 1.57.2, see above
 }
 
 # Initialize TSS for a specific CPU and load its task register.

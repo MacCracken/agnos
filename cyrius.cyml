@@ -5,7 +5,7 @@ description = "A General Networked Operating System - Sovereign System Kernel"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/agnos"
 language = "cyrius"
-cyrius = "6.6.1"
+cyrius = "6.6.3"
 
 [build]
 entry = "kernel/agnos.cyr"
@@ -19,3 +19,11 @@ stdlib = []
 [deps.kashi]
 path    = "../kashi"
 modules = ["src/font_data.cyr"]
+
+# rekha freestanding default-face data (1.57.2). Same contract as kashi above: this block
+# DOCUMENTS the dependency; scripts/build.sh's `cat "$REKHA_DIR/fonts/face_data.cyr"` into the
+# prepped source is the MECHANISM (the path wins locally, REKHA_REF is the CI clone fallback).
+# Liberation Sans Regular, unmodified, SIL OFL 1.1 — licence in ../rekha/fonts/LICENSE-LiberationFonts.
+[deps.rekha]
+path    = "../rekha"
+modules = ["fonts/face_data.cyr"]

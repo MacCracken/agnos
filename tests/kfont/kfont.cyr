@@ -1,0 +1,155 @@
+# kfont — agnos ring-3 exerciser for the kernel-embedded default TrueType face (1.57.2).
+#
+# ⭐ THE GATE THIS PROVES. core/kfont.cyr assembles rekha's Liberation Sans Regular into a 2 MB
+# region at boot, verifies it, and serves it under the kernel-owned /fonts namespace as a PREFIX
+# INTERCEPT in open#7 / stat#33 / lstat#102 (not a mount). The boot line `kfont: /fonts/default.ttf
+# 410820 bytes OK` proves only that the KERNEL can see the bytes under ITS CR3; this program is the
+# other half — a real ring-3 process, exec'd from disk, opening the face BY NAME and pulling every
+# byte through read#5 (vfs_read's VFS_MEMFILE arm, memcpy from the direct-map alias under the
+# CALLER's CR3) into its own memory, then hashing what it got.
+#
+# ⛔ THE ORACLE IS THE HASH, NOT THE LENGTH. A memfile that returned 410,820 bytes of the WRONG
+# region — a stale identity alias, a page the kernel never filled, a literal shifted by one byte
+# (the cyrius 6.6.3 even-length literal defect that made verify-before-expose load-bearing) —
+# would pass a byte count and fail here: FNV-1a-64 over the bytes must equal the generator's hash
+# of the source .ttf, 0xbb32949696578ce6, computed exactly as rekha_face_default_verify does.
+# The sfnt header + table directory checks are the SEMANTIC oracle on top of that: the bytes
+# must be a TrueType face a client can parse, with 'glyf' and 'cmap' tables present.
+#
+# Raw `syscall()` with the SysNrAgnos numbers ON PURPOSE (open 7, read 5, close 6, stat 33,
+# lstat 102, exit 0): this is the ABI exerciser; the stdlib wrappers would only agree with
+# themselves.
+#
+# Exit 95 iff the whole contract holds; 80-94 / 96-97 pinpoint where it broke:
+#   80 open("/fonts/default.ttf") failed            88 open("/fonts/nope.ttf") was NOT refused
+#   81 read#5 returned an error                     89 open("/fonts") was NOT refused (not a name)
+#   82 total bytes != 410820                        90 stat#33 failed, or st_mode/st_nlink/st_size wrong
+#   83 FNV-1a-64 mismatch (bytes are WRONG)         91 the alias name does not open to the same bytes
+#   84 sfntVersion != 0x00010000                    92 lstat#102 failed or disagrees with stat#33
+#   85 'glyf' or 'cmap' missing from the directory  93 open(..., AO_RDWR) was NOT refused
+#   86 close(fd) != 0                               94 open(..., AO_CREAT) was NOT refused
+#   87 open(..., AO_WRONLY) was NOT refused         96 open(..., AO_TRUNC) was NOT refused
+#                                                   97 open(..., AO_DIRECTORY) was NOT refused
+# (2026-09-13 review: the flag gate had ONE probe of five mask bits, lstat#102 had none, and
+# stat#33 was checked on size alone — a kernel with mask 0x1, no #102 hook, or st_mode 0x4000
+# scored 95. 92-94 / 96-97 close those; 90 now covers the whole record.)
+
+var kf_buf[131072];              # module-global ⇒ N x u64 = 1 MB landing buffer (410,820 needed)
+
+# Big-endian u32 at p (sfnt/OpenType is big-endian throughout).
+fn kf_be32(p): i64 {
+    return ((load8(p) & 0xFF) << 24) | ((load8(p + 1) & 0xFF) << 16) | ((load8(p + 2) & 0xFF) << 8) | (load8(p + 3) & 0xFF);
+}
+
+fn kfont_main(): i64 {
+    # ---- 1. open by the stable name, read-only ----
+    var fd = syscall(SYS_OPEN, "/fonts/default.ttf", 18, 0);
+    if (fd < 0) { return 80; }
+
+    # ---- 2. pull every byte through read#5 in 64 KB requests until a short read ----
+    # 410,820 = 6 x 65,536 + 17,604, so the 7th read is the short one; a memfile that never
+    # shortens would run into the 1 MB cap below and score 82, not hang.
+    var total = 0;
+    var iters = 0;
+    while (total + 65536 <= 1048576) {
+        var r = syscall(SYS_READ, fd, &kf_buf + total, 65536);
+        if (r < 0) { syscall(SYS_CLOSE, fd); return 81; }
+        if (r == 0) { break; }
+        total = total + r;
+        if (r < 65536) { break; }
+        iters = iters + 1;
+        if (iters > 32) { break; }                      # anti-hang; 82 catches it below
+    }
+    if (total != 410820) { syscall(SYS_CLOSE, fd); return 82; }
+
+    # ---- 3. FNV-1a-64 over the bytes, exactly as rekha_face_default_verify computes it ----
+    var h = 0xcbf29ce484222325;
+    var j = 0;
+    while (j < total) { h = (h ^ (load8(&kf_buf + j) & 0xFF)) * 0x100000001b3; j = j + 1; }
+    if (h != 0xbb32949696578ce6) { syscall(SYS_CLOSE, fd); return 83; }
+
+    # ---- 4. it is a TrueType face: sfntVersion 0x00010000 ----
+    if (kf_be32(&kf_buf) != 0x00010000) { syscall(SYS_CLOSE, fd); return 84; }
+
+    # ---- 5. table directory: numTables at +4 (u16 BE), 16-byte records from +12; need glyf + cmap ----
+    var nt = ((load8(&kf_buf + 4) & 0xFF) << 8) | (load8(&kf_buf + 5) & 0xFF);
+    if (nt < 1 || nt > 64) { syscall(SYS_CLOSE, fd); return 85; }
+    if (12 + nt * 16 > total) { syscall(SYS_CLOSE, fd); return 85; }
+    var have_glyf = 0;
+    var have_cmap = 0;
+    var ti = 0;
+    while (ti < nt) {
+        var tag = kf_be32(&kf_buf + 12 + ti * 16);
+        if (tag == 0x676c7966) { have_glyf = 1; }      # 'glyf'
+        if (tag == 0x636d6170) { have_cmap = 1; }      # 'cmap'
+        ti = ti + 1;
+    }
+    if (have_glyf == 0 || have_cmap == 0) { syscall(SYS_CLOSE, fd); return 85; }
+
+    # ---- 6. close returns 0 ----
+    if (syscall(SYS_CLOSE, fd) != 0) { return 86; }
+
+    # ---- 7. the read-only gate: EVERY write-class flag bit is refused, ONE PROBE PER BIT ----
+    # kfont_open's mask is 0xB03 = AO_WRONLY 1 | AO_RDWR 2 | AO_CREAT 0x100 | AO_TRUNC 0x200 |
+    # AO_DIRECTORY 0x800 (open#7's flag comment in core/syscall.cyr). A lone WRONLY probe proved
+    # one bit of five: a mask shrunk to 0x1 (or 0x3) still scored 95 while RDWR / CREAT / TRUNC /
+    # DIRECTORY opens handed out fds. Distinct codes so the serial line names the bit that leaked.
+    var wfd = syscall(SYS_OPEN, "/fonts/default.ttf", 18, 1);
+    if (wfd != (0 - 1)) { syscall(SYS_CLOSE, wfd); return 87; }
+    var rwfd = syscall(SYS_OPEN, "/fonts/default.ttf", 18, 2);
+    if (rwfd != (0 - 1)) { syscall(SYS_CLOSE, rwfd); return 93; }
+    var cfd = syscall(SYS_OPEN, "/fonts/default.ttf", 18, 0x100);
+    if (cfd != (0 - 1)) { syscall(SYS_CLOSE, cfd); return 94; }
+    var tfd = syscall(SYS_OPEN, "/fonts/default.ttf", 18, 0x200);
+    if (tfd != (0 - 1)) { syscall(SYS_CLOSE, tfd); return 96; }
+    var ddfd = syscall(SYS_OPEN, "/fonts/default.ttf", 18, 0x800);
+    if (ddfd != (0 - 1)) { syscall(SYS_CLOSE, ddfd); return 97; }
+
+    # ---- 8. the namespace is exact: a sibling name and the bare prefix are NOT names ----
+    var nfd = syscall(SYS_OPEN, "/fonts/nope.ttf", 15, 0);
+    if (nfd != (0 - 1)) { syscall(SYS_CLOSE, nfd); return 88; }
+    var dfd = syscall(SYS_OPEN, "/fonts", 6, 0);
+    if (dfd != (0 - 1)) { syscall(SYS_CLOSE, dfd); return 89; }
+
+    # ---- 9. stat#33 fills the 48-byte record (agnos-userland-abi.md §4.1): st_mode 0100444 =
+    #         0x8124 at +0, st_nlink 1 at +8, st_size 410820 at +16. The mode is what clients
+    #         classify by — crab's crab_fs_isdir tests (st_mode & 0xF000) == 0x4000 — so a filler
+    #         that stored 0 or 0x4000 there must not pass on size alone. ----
+    var st[48];
+    var si = 0;
+    while (si < 48) { store8(&st + si, 0); si = si + 1; }
+    if (syscall(SYS_STAT, "/fonts/default.ttf", 18, &st) != 0) { return 90; }
+    if (load64(&st + 0) != 0x8124) { return 90; }
+    if (load64(&st + 8) != 1) { return 90; }
+    if (load64(&st + 16) != 410820) { return 90; }
+
+    # ---- 9b. lstat#102 is the THIRD intercepted arm (kriya's rm/ls classify through it) and must
+    #          answer identically: rc 0, same mode, same nlink, same size. A fresh zeroed record,
+    #          so a missing/misplaced #102 hook — which falls through to an ext2 lookup of a name
+    #          that is not on disk and returns -1 — cannot hide behind step 9's result. ----
+    var lst[48];
+    var li = 0;
+    while (li < 48) { store8(&lst + li, 0); li = li + 1; }
+    if (syscall(SYS_LSTAT, "/fonts/default.ttf", 18, &lst) != 0) { return 92; }
+    if (load64(&lst + 0) != 0x8124) { return 92; }
+    if (load64(&lst + 8) != 1) { return 92; }
+    if (load64(&lst + 16) != 410820) { return 92; }
+
+    # ---- 10. the provenance alias opens and is the SAME bytes (first 12 = header + 1 record tag) ----
+    var afd = syscall(SYS_OPEN, "/fonts/LiberationSans-Regular.ttf", 33, 0);
+    if (afd < 0) { return 91; }
+    var hd[16];
+    var ar = syscall(SYS_READ, afd, &hd, 12);
+    syscall(SYS_CLOSE, afd);
+    if (ar != 12) { return 91; }
+    var ci = 0;
+    while (ci < 12) {
+        if ((load8(&hd + ci) & 0xFF) != (load8(&kf_buf + ci) & 0xFF)) { return 91; }
+        ci = ci + 1;
+    }
+
+    return 95;                                          # ALL PASS — the face is reachable from ring 3
+}
+
+fn _entry(): i64 { var r = kfont_main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

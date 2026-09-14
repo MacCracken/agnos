@@ -236,11 +236,30 @@ fn exfat_next_cluster(c) {
     if (v > exfat_cluster_count + 1) { return 0; }
     # A self-referencing entry (A -> A) is the one cycle shape a single step can see, and the
     # cheapest to craft. End the chain rather than spin on it.
-    # ⚠ MULTI-NODE CYCLES (A -> B -> A) ARE STILL UNGUARDED HERE, exactly as in fatfs.cyr — that
-    # needs a per-walk step budget at each of the 31 walk sites across both filesystems and is
-    # tracked as its own item. Do not read these three lines as closing that.
+    # ⚠ MULTI-NODE CYCLES (A -> B -> A) are invisible from one step — each walk's own `guard` + exfat_chain_overrun (below) end those.
     if (v == c) { return 0; }
     return v;
+}
+
+# ⚠ PART 2 — MULTI-NODE CYCLES: the exFAT mirror of fatfs.cyr's fat_chain_overrun. The wrapper above
+# ends a chain on an out-of-range next cluster and on a SELF-reference, but a MULTI-NODE cycle
+# (A -> B -> A, both in range) is invisible from one step. Every cursor-terminated walk in this file
+# therefore counts its fetches in a function-local `guard` and bails through this predicate: a chain
+# cannot legitimately be longer than the volume has clusters, so exceeding that count IS the cycle
+# detector — no extra state and no second pass. (The `guard` locals predate 1.57.2 — the 1.34.x
+# series bounded them at `max_c = cluster_count + 2`; 1.57.2 routes them here so both filesystems
+# share ONE bound.)
+# ⚠ OFF-BY-ONE CONTRACT: the counter counts FETCHES and the predicate is strictly `>`. The k-th fetch
+# leaves guard == k, so a valid N-cluster chain (N <= count) does its last fetch at guard == N and
+# gets EOC — never overrun. Walks that terminate on an index that is not the cursor
+# (exfat_count_free_clusters, exfat_bitmap_load_byte, exfat_read's contiguous-run scan) carry no
+# budget: a cycle there mis-addresses, it cannot spin.
+# ⛔ DO NOT route this through a module-global counter reset at each loop head instead. A walk that
+# forgets its reset would inherit the previous walk's count and terminate EARLY — silent truncation
+# of a valid file, which is worse than the hang it replaces.
+fn exfat_chain_overrun(steps) {
+    if (steps > exfat_cluster_count) { return 1; }
+    return 0;
 }
 
 # Try to mount an exFAT volume on (backend, partition base LBA). Sets the
@@ -288,8 +307,14 @@ fn exfat_locate_system_files() {
             }
         }
         clus = exfat_next_cluster(clus);
+        # 1.57.2 — per-walk chain budget: a multi-node FAT cycle (A -> B -> A, both in range) is
+        # invisible to exfat_next_cluster, so every EOC-terminated walk counts its fetches in a
+        # function-local `guard` (here since 1.34.x) and bails once they exceed the volume's cluster
+        # count — the bound is now exfat_chain_overrun, shared with fatfs, instead of the
+        # two-looser `max_c`. Fresh local per loop — never shared, never global. Same shape at every
+        # walk below; rationale + off-by-one contract live in the block after exfat_next_cluster.
         guard = guard + 1;
-        if (guard > max_c) { return 0 - 1; }         # loop guard
+        if (exfat_chain_overrun(guard) == 1) { return 0 - 1; }   # loop guard
     }
     return 0;
 }
@@ -418,7 +443,7 @@ fn exfat_read(first_cluster, no_fat_chain, buf, maxlen) {
         if (no_fat_chain == 1) { clus = clus + run; }   # contiguous run advanced en bloc
         else { clus = exfat_next_cluster(last); }
         guard = guard + 1;
-        if (guard > max_c) { return total; }          # loop guard
+        if (exfat_chain_overrun(guard) == 1) { return total; }   # loop guard
     }
     return total;
 }
@@ -460,7 +485,7 @@ fn exfat_verify_upcase() {
         }
         clus = exfat_next_cluster(clus);
         guard = guard + 1;
-        if (guard > max_c) { return 0 - 1; }
+        if (exfat_chain_overrun(guard) == 1) { return 0 - 1; }
     }
     if (cks == exfat_upcase_checksum) { return 1; }
     return 0;
@@ -517,7 +542,7 @@ fn exfat_load_upcase() {
         }
         clus = exfat_next_cluster(clus);
         guard = guard + 1;
-        if (guard > max_c) { return 0; }
+        if (exfat_chain_overrun(guard) == 1) { return 0; }
     }
     exfat_upcase_loaded = 1;
     return 0;
@@ -670,7 +695,7 @@ fn exfat_find_in_dir(start_clus, name, namelen, result_ptr) {
         }
         clus = exfat_next_cluster(clus);
         guard = guard + 1;
-        if (guard > max_c) { return 0 - 1; }
+        if (exfat_chain_overrun(guard) == 1) { return 0 - 1; }
     }
     return 0;
 }
@@ -757,7 +782,7 @@ fn exfat_ls() {
         }
         clus = exfat_next_cluster(clus);
         guard = guard + 1;
-        if (guard > max_c) { return count; }
+        if (exfat_chain_overrun(guard) == 1) { return count; }
     }
     return count;
 }
@@ -833,7 +858,7 @@ fn exfat_print_dir() {
         }
         clus = exfat_next_cluster(clus);
         guard = guard + 1;
-        if (guard > max_c) { return count; }
+        if (exfat_chain_overrun(guard) == 1) { return count; }
     }
     return count;
 }
@@ -934,7 +959,6 @@ fn exfat_dir_cluster_for_index_in(start_clus, lin) {
     if (clus < 2) { clus = exfat_root_cluster; }
     var i = 0;
     var guard = 0;
-    var max_c = exfat_cluster_count + 2;
     while (i < cidx) {
         var nxt = exfat_next_cluster(clus);
         if (nxt < 2) {                                  # chain end → extend
@@ -955,7 +979,7 @@ fn exfat_dir_cluster_for_index_in(start_clus, lin) {
         clus = nxt;
         i = i + 1;
         guard = guard + 1;
-        if (guard > max_c) { return 0; }
+        if (exfat_chain_overrun(guard) == 1) { return 0; }
     }
     return clus;
 }
@@ -985,7 +1009,7 @@ fn exfat_dir_end_index_in(start_clus) {
         }
         clus = exfat_next_cluster(clus);
         guard = guard + 1;
-        if (guard > max_c) { return lin; }
+        if (exfat_chain_overrun(guard) == 1) { return lin; }
     }
     return lin;
 }
@@ -1322,7 +1346,7 @@ fn exfat_free_clusters(first, len, nfc) {
         if (exfat_bitmap_set(c, 0) != 0) { return 0 - 1; }
         c = nxt;
         guard = guard + 1;
-        if (guard > max_c) { return 0 - 1; }
+        if (exfat_chain_overrun(guard) == 1) { return 0 - 1; }
     }
     return 0;
 }
@@ -1662,7 +1686,7 @@ fn exfat_update_percent_in_use() {
         }
         clus = exfat_next_cluster(clus);
         guard = guard + 1;
-        if (guard > max_c) { return 0 - 1; }
+        if (exfat_chain_overrun(guard) == 1) { return 0 - 1; }
     }
     var pct = (used * 100) / exfat_cluster_count;
     if (pct > 100) { pct = 100; }

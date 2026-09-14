@@ -419,6 +419,21 @@ kprintln("kernel CR3: own PML4 (0x1000)", 29);
 # identity is unshadowed). No-op if RAM <=256 MB (bitmap stayed in .bss). Only inside the own-PML4
 # build: a BOOTCR3_KEEP_GNOBOOT_CR3 boot never gets the direct-map in its boot/idle context.
 pmm_bitmap_use_directmap();
+
+# 1.57.2 — assemble + verify + expose the kernel-embedded default TrueType face (core/kfont.cyr,
+# rekha's Liberation Sans). Same allocator as fb_shadow_init above (pmm_alloc_2mb_run, one region,
+# never freed) but NOT the same placement, and the difference was MEASURED, not assumed: the region
+# is filled and read through its DIRECT-MAP alias (pmm_kva_for_access), and the direct map is only
+# ACTIVE under 0x1000. Called from beside fb_shadow_init — i.e. before the cr3_load(0x1000) above —
+# every store went to gnoboot's identity view of 8 GB + phys (nothing, at -m 512M; someone else's RAM
+# on a 64 GB box), the buffer read back all zeros and the verify FAILED while the literals themselves
+# hashed clean in place. fb_shadow gets away with the early slot because it uses the IDENTITY VA;
+# this cannot (vfs_read serves the buffer under the caller's CR3, where identity is the user image).
+# So it sits here: after the switch, after the bitmap rebase, inside the own-PML4 build — a
+# BOOTCR3_KEEP_GNOBOOT_CR3 boot never has the direct map in its boot context and simply gets no
+# face (kfont_ready stays 0; /fonts answers -1). A failed allocation or a failed verify prints its
+# own line and leaves /fonts closed the same way; the boot continues either way.
+kfont_init();
 #endif
 
 # 1.50.10 hardening — guard the 1.50.9 bitmap-VA-shadow fix on EVERY boot (cheap; mirrors the always-on
@@ -1634,6 +1649,38 @@ if (fatfs_active == 1) {
     } else {
         kprintln("fatr: FATTEST.BIN not found", 27);
     }
+    # 1.57.2 — chain-cycle budget gate (scripts/smoke/fat-cycle-smoke.sh). The smoke stages a
+    # subdir CYC whose two clusters are 100% populated (no 0x00 end-of-dir marker anywhere on the
+    # ring) and patches the FAT so its chain is A -> B -> A: a MULTI-NODE cycle, invisible to the
+    # one-step guards in fat_next_cluster. Searching it for a name that is NOT there forces
+    # fatfs_find_in_dir to walk until fat_chain_overrun trips; the marker printed AFTER the call is
+    # the gate — it never appears on a kernel whose budget is stubbed (proven by mutation, see the
+    # smoke header). ⚠ The FATTEST.BIN read above is NOT the hook: fatfs_read has carried its own
+    # volume-bounded guard since 1.41.5 and is capped by maxlen, so a cyclic FILE chain returns
+    # there with or without fat_chain_overrun. Also pins the predicate's off-by-one contract
+    # (strictly `>`: a chain may be EXACTLY count_of_clusters long), which a hang cannot express.
+    # Absent CYC (fat-smoke's media) the lane says so and moves on.
+    var fcy_ok = 1;
+    if (fat_chain_overrun(fatfs_count_of_clusters) != 0) { fcy_ok = 0; }
+    if (fat_chain_overrun(fatfs_count_of_clusters + 1) != 1) { fcy_ok = 0; }
+    if (fcy_ok == 1) { kprintln("fatc: predicate count->0 count+1->1 OK", 38); }
+    else { kprintln("fatc: predicate off-by-one FAIL", 31); }
+    var fcy_dir = "CYC";
+    var fcy_res[16];
+    if (fatfs_find_root(fcy_dir, 3, &fcy_res) == 1) {
+        var fcy_cl = load64(&fcy_res);
+        var fcy_none = "NOSUCH.BIN";
+        var fcy_res2[16];
+        kprint("fatc: cycle-walk start dir_clus=", 32);
+        kprint_num(fcy_cl);
+        kprintln("", 0);
+        var fcy_rc = fatfs_find_in_dir(fcy_cl, fcy_none, 10, &fcy_res2);
+        kprint("fatc: cycle-walk returned rc=", 29);
+        kprint_num(fcy_rc);
+        kprintln("", 0);
+    } else {
+        kprintln("fatc: no CYC dir (cycle lane not staged)", 40);
+    }
     # 1.40.13 mount-namespace: drive the real shell `cat` verb against the FAT
     # mount. sh_cmd_cat -> vfs_resolve_mount -> FS_FAT -> vfs_open_on -> fatfs_open.
     # The file's content ("VFS-CAT-FAT-OK") proves the shell read path reaches
@@ -2006,6 +2053,17 @@ if (exfat_active == 1) {
     kprint(" upcase_len=", 12);
     kprint_num(exfat_upcase_length);
     kprintln("", 0);
+    # 1.57.2 — chain-cycle budget gate (scripts/smoke/fat-cycle-smoke.sh). The smoke cycles the
+    # ROOT chain (root -> B -> root, both clusters 100% populated with not-in-use entries), which
+    # exfat_init's exfat_locate_system_files already walked BEFORE it printed "exfat: mounted" —
+    # that line is the post-walk marker — and exfat_ls above / exfat_find below / the shell ls at
+    # the end cross the same ring. Pin the predicate's off-by-one contract here (strictly `>`: a
+    # chain may be EXACTLY cluster_count long), which a hang cannot express.
+    var ecy_ok = 1;
+    if (exfat_chain_overrun(exfat_cluster_count) != 0) { ecy_ok = 0; }
+    if (exfat_chain_overrun(exfat_cluster_count + 1) != 1) { ecy_ok = 0; }
+    if (ecy_ok == 1) { kprintln("exfatc: predicate count->0 count+1->1 OK", 40); }
+    else { kprintln("exfatc: predicate off-by-one FAIL", 33); }
     # Multi-cluster FAT-chain read validated against the upcase TableChecksum.
     var ex_uc = exfat_verify_upcase();
     if (ex_uc == 1) { kprintln("exfatu: upcase-checksum OK", 26); }
@@ -3647,6 +3705,21 @@ sh_exec("run /bin/blkprobe", 17);
 kprintln("exec: blkprobe returned", 23);
 #endif
 
+#ifdef KFONT_RING3_SELFTEST
+# 1.57.2: kernel-embedded default face, the RING-3 half. Runs /bin/kfont (tests/kfont/, built
+# --agnos) — opens /fonts/default.ttf by name, pulls all 410,820 bytes through read#5 into its
+# own memory, and requires the FNV-1a-64 of what it GOT to equal rekha's generator hash, then a
+# TrueType sfnt header + 'glyf'/'cmap' in the table directory, close, the read-only gate (one
+# probe per mask bit: WRONLY/RDWR/CREAT/TRUNC/DIRECTORY -> -1), two non-names (-1), stat#33 AND
+# lstat#102 (st_mode 0x8124 / st_nlink 1 / st_size 410820), and the provenance alias. Exits 95
+# iff all hold; 80-94 / 96-97 name the step. The boot line above (`kfont: ... bytes OK`) proves the KERNEL
+# sees the bytes under its CR3; only this proves a CLIENT does, through the memfile memcpy out of
+# the direct-map alias under the caller's page tables. scripts/smoke/kfont-smoke.sh gates on it.
+kprintln("exec: running /bin/kfont", 24);
+sh_exec("run /bin/kfont", 14);
+kprintln("exec: kfont returned", 20);
+#endif
+
 #ifdef BLK_WRITE_SELFTEST
 # 1.53.10 Phase 2: raw block-device WRITE-PATH + capability-gate proof. Runs /bin/blkwr
 # (blk-test/, built --agnos) — asserts blk_write#78 is REJECTED while unarmed (the gate),
@@ -5162,7 +5235,11 @@ fn ring3_elf_fill() {
     store8(&ring3_elf + 56, 0x01);  # e_phnum = 1
     # --- Program header PT_LOAD (56 bytes at offset 64) ---
     store8(&ring3_elf + 64, 0x01);  # p_type = PT_LOAD
-    store8(&ring3_elf + 68, 0x07);  # p_flags = R|W|X
+    # 1.57.2 — p_flags 0x07 -> 0x05. The segment is CODE ONLY (the counter write goes to 0x2000000,
+    # a page the selftest maps separately), so it never needed W. Its RWX form — and the twin child
+    # ELF in spawn_parent_fill — were the ONLY RWX PT_LOADs the loaders ever saw (rootfs: 0/48), and
+    # the last thing standing between elf.cyr's W^X report and its hard refusal.
+    store8(&ring3_elf + 68, 0x05);  # p_flags = R|X
     # p_offset = 0 (offset 72, already zero)
     store8(&ring3_elf + 82, 0x40);  # p_vaddr  = 0x400000  (byte 80+2)
     store8(&ring3_elf + 90, 0x40);  # p_paddr  = 0x400000  (byte 88+2)
@@ -5314,7 +5391,7 @@ fn spawn_parent_fill() {
     store8(&spawn_parent_payload + 312, 0x01);
     # phdr (offset 64 within the child → payload 320):
     store8(&spawn_parent_payload + 320, 0x01);
-    store8(&spawn_parent_payload + 324, 0x07);
+    store8(&spawn_parent_payload + 324, 0x05);   # p_flags = R|X (1.57.2: was R|W|X — see ring3_elf_fill)
     store8(&spawn_parent_payload + 338, 0x40);
     store8(&spawn_parent_payload + 346, 0x40);
     store8(&spawn_parent_payload + 352, 0x83);
@@ -5558,8 +5635,30 @@ fn ring3_nonlifo_check() {
     }
     return 0;
 }
+# 1.57.2 — W^X REFUSAL GATE, mutation-locked. Builds a copy of ring3_elf with p_flags = 0x07 (R|W|X,
+# exactly the shape ring3_elf itself carried until 1.57.2) and hands it to elf_load. The loader must
+# REFUSE it — elf.cyr's `(p_flags & 3) == 3` arm, sited before the page loop. If it LOADS instead, a
+# ready proc now exists; it is reaped here (never run — it would #PF at its unmapped 0x2000000) so the
+# rest of the selftest still starts on a dense table, and the smoke goes RED on the LOADED marker.
+# ⚠ Two markers, not one: "refused" ABSENT and "LOADED" PRESENT are both asserted by ring3-smoke, so a
+# refactor that drops this call entirely reads as red, not as a silently vanished gate.
+# ⭐ PROVEN 1.57.2 by reverting the elf_load refusal site with cyim: the smoke went RED on
+# `wx: RWX segment LOADED`; restored, GREEN. Runs right after ring3_nonlifo_check (which cleans up after
+# itself) so a refusal leaves the table exactly as dense as it found it.
+var ring3_wx_elf[24];           # the R|W|X twin of ring3_elf (159 bytes used)
+fn ring3_wx_check() {
+    ring3_elf_fill();                                # the R|X original ...
+    memcpy(&ring3_wx_elf, &ring3_elf, 159);          # ... copied ...
+    store8(&ring3_wx_elf + 68, 0x07);                # ... and re-flagged p_flags = R|W|X
+    var wpid = elf_load(&ring3_wx_elf, 159);
+    if (wpid < 0) { kprintln("wx: RWX segment refused", 23); return 0; }
+    kprintln("wx: RWX segment LOADED", 22);
+    proc_set_state(wpid, 0); proc_reap_child(wpid);  # retire it unrun; the smoke is already red
+    return 0;
+}
 fn ring3_selftest_setup() {
     ring3_nonlifo_check();                            # non-LIFO slot-reuse proof on a dense table (cleans up after)
+    ring3_wx_check();                                 # 1.57.2: the loader must refuse an R|W|X PT_LOAD (mutation-locked)
     ring3_counter_a = pmm_alloc_2mb();               # 2 MB-aligned — proc_map_page maps a 2 MB page
     ring3_counter_b = pmm_alloc_2mb();
     if (ring3_counter_a == 0) { return 0; }
