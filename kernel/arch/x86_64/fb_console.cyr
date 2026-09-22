@@ -1028,7 +1028,7 @@ fn fb_defer_rescue() {
 # ⭐⭐ THE LIVE LINE — so an asynchronous log never eats what the operator is typing
 # ============================================================================================
 # ⛔⛔ THIS WAS RULED "WORKING AS INTENDED" AND THAT RULING WAS WRONG.
-# `issues/2026-08-11-hid-drain-rearm-and-isr-console-lock.md` explained why a one-shot lands mid-prompt
+# `issues/archived/2026-08-11-hid-drain-rearm-and-isr-console-lock.md` explained why a one-shot lands mid-prompt
 # and then closed the question: *"This is working as intended and should not be fixed: a boot-phase mute
 # would hide exactly the lines you need when a session goes wrong."* ⚠ THE MUTE WAS A STRAW MAN — it was
 # never the only alternative, and the operator had already said so. What the operator actually sees is

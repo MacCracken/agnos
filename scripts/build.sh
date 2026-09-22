@@ -16,7 +16,7 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # with a sibling-checkout default — works on a local devbox where both
 # repos live under ~/Repos/ AND in CI where actions/checkout only fetches
 # this repo. When the sibling is absent we clone the pinned tag (override
-# via KASHI_REF=<tag-or-branch>). Pinned at 1.0.10 — matching ../kashi/VERSION as of 2026-09-21 (tag cut with agnos 1.57.5; 1.0.8 at 1.57.4, 1.0.6 as of
+# via KASHI_REF=<tag-or-branch>). Pinned at 1.0.10 — matching ../kashi/VERSION and its 1.0.10 tag as of 2026-09-21 (agnos 1.57.5; 1.0.8 at 1.57.4, 1.0.6 as of
 # 2026-08-28. Bump it as kashi cuts new 1.x releases. Affects ONLY the clone fallback: cyrius.cyml
 # declares `[deps.kashi] path`, and the path wins, so a box with the sibling checkout never reads
 # this value. That is exactly why it rots unnoticed.

@@ -70,9 +70,11 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   are rebuilt on 6.6.6 there), **kashi 1.0.10**, **rekha 0.9.0** (the hint machine + zones arc
   0.4 -> 0.9; `fonts/face_data.cyr` is BYTE-IDENTICAL to 0.3.9's, as is kashi's `src/font_data.cyr`
   to 1.0.8's — the embedded face and the VGA font did not move). `KASHI_REF=1.0.10` /
-  `REKHA_REF=0.9.0` in `build.sh`/`test.sh`/`bench.sh`. ⚠ **kashi has no `1.0.10` tag yet** (HEAD is
-  one commit past `1.0.9`; `VERSION` says 1.0.10) — cut it before pushing agnos, or the CI clone
-  fallback fails. rekha `0.9.0` and klug `0.2.0` are tagged at HEAD.
+  `REKHA_REF=0.9.0` in `build.sh`/`test.sh`/`bench.sh`; all three refs are tags that exist (kashi
+  `1.0.10` at `f8f9c97`, one comment-only commit behind its HEAD, with `src/font_data.cyr` identical at
+  the tag; rekha `0.9.0` and klug `0.2.0` at their HEADs). ⚠ Read sibling tags with
+  `git tag --sort=v:refname` — a plain `git tag | tail` sorts `1.0.10` between `1.0.1` and `1.0.2`,
+  which is how the first draft of this entry reported the kashi tag missing.
 - **Checked against the 6.6.6 language changes and found clean:** the 21 `selftests.cyr` flag blocks
   (16 top-level bare blocks, now BLOCK-SCOPED for their `var`s; `main.cyr` has 56 more) all compile —
   built in two batches of 11 + 10 under the preprocessor's **16-define cap**; a scope walk over the
@@ -132,6 +134,21 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
   attempt, so the ~1-in-4 OVMF ExitBootServices flake scored it VOID-then-FAIL — it cost the 1.57.3 sweep
   its 30/30 and did the same to this one (see Closeout). The retry caught the flake LIVE on the re-run
   ("firmware never handed off — retrying 1/5", then 4/4).
+
+### Removed — by operator ruling
+
+- **The HID halted-endpoint iron burn is no longer a work item** (ruling 2026-09-21). It had been carried
+  as "1.56.58 — item #1", its slot expired at 1.57.1, and it was never re-slotted — because its
+  precondition, a PROVOKED xHCI endpoint stall, cannot be produced on demand: a software-injected
+  completion code leaves `xhci_ep_state()` Running, and no burn in six weeks stalled. The code it would
+  have validated shipped at 1.56.56 (16-deep re-arm, deferral under `hid_poll_lock`, the `hid_row_*`
+  routing from 1.56.52) and stays in the kernel as the fail-safe it is; the only reachable oracle
+  (`HID_CC_INJECT_HALT=1` + `hid-halt-oracle-test.py`, mutation-proven) stays too. If a real stall ever
+  happens, its markers are in the log and get recorded then. The roadmap heading and its duplicate row
+  are gone, the ruling sits in the roadmap's FALSIFIED/closed list so it is not re-derived, and the issue
+  file is archived with its status header rewritten
+  (`issues/archived/2026-08-11-hid-drain-rearm-and-isr-console-lock.md`). **`docs/development/issues/`
+  is empty for the first time since 2026-08-11.**
 
 - **Closeout:** `check.sh` **35/35** · `test.sh` 4/4 · `ktest` **107/3** (the 3 `[initrd]` environmentals,
   unchanged tally) · `sweep.sh` **29/30 + 1 VOID** on the 30-row table (the exFAT-read row: OVMF never handed

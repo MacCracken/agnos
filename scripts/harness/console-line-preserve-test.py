@@ -9,7 +9,7 @@
 #
 # The `a` of `aethersafha` is stranded before the log and the rest resumes on the next row. ⚠ In the
 # SERIAL transcript those are simply two writes in order and look perfectly fine — which is exactly how
-# the defect survived: `issues/2026-08-11-hid-drain-rearm-and-isr-console-lock.md` diagnosed it from a
+# the defect survived: `issues/archived/2026-08-11-hid-drain-rearm-and-isr-console-lock.md` diagnosed it from a
 # serial log and ruled it *"working as intended"*. **The corruption exists only on the framebuffer,
 # because only the framebuffer has a cursor.** So the oracle has to be the framebuffer.
 #

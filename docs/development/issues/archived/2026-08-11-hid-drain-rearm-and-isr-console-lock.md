@@ -1,8 +1,26 @@
 # HID input path — three defects found while explaining a log line at the shell prompt
 
 **Found**: 2026-08-11, investigating an operator report of a "mouse notification on the shell."
-**Status:** 🟠 **OPEN — #1/#2 FIXED AND MEASURED. #3's two 1.56.56 defects ARE fixed in the tree, but its
-Reset-Endpoint / Set-TR-Dequeue body HAS STILL NEVER EXECUTED — and it is worse than "no stall has happened".**
+**Status:** ✅ **CLOSED BY OPERATOR RULING 2026-09-21 (agnos 1.57.5).** #1/#2 fixed and measured (1.56.48 /
+1.56.52 / 1.56.56, fault-injected, mutation-tested). #3's two 1.56.56 defects are fixed in the tree; its
+Reset-Endpoint / Set-TR-Dequeue body has never executed on real silicon **and there is no way to make it** —
+a controller halt cannot be provoked on demand (a software-injected completion code leaves `xhci_ep_state()`
+Running, and no burn in six weeks produced a stall). **Ruling: stop carrying it.** The recovery path stays in
+the kernel as the fail-safe it is; its markers (`hid: an endpoint halted and was reset; input from it should
+resume` / the two named refusals) are in the log the day a real stall happens, and THAT is the validation —
+recorded when it occurs, not scheduled. The roadmap heading that carried this since "1.56.58 — item #1"
+(slot expired three cuts later, re-slotted never) and its duplicate row are removed.
+
+**Resolution (2026-09-21):** what shipped — the 16-deep re-arm and the deferral through `hid_ep_rearm`
+under `hid_poll_lock` (1.56.56); the decoy keyboard idx/cycle routed through `hid_row_*` (1.56.52);
+`HID_CC_INJECT_HALT=1` + `scripts/harness/hid-halt-oracle-test.py` (1.56.59, mutation-proven) as the only
+reachable oracle. What did NOT ship and is not owed: a burn with a provoked stall. Nothing in this file
+was found broken by a later change (checked before archiving: `hid_recover_halted` is reachable in the
+default build, the harness still refuses a kernel without the injector, 1.57.5 `check.sh` 35/35).
+
+*(Original header, kept for the record:)* 🟠 OPEN — #1/#2 FIXED AND MEASURED. #3's two 1.56.56 defects ARE
+fixed in the tree, but its Reset-Endpoint / Set-TR-Dequeue body HAS STILL NEVER EXECUTED — and it is worse
+than "no stall has happened".
 
 ⛔ **THAT "NO IN-TREE BUILD CAN EVEN SET THE FLAG" HEADER WAS TRUE WHEN WRITTEN AND IS NOW FALSE —
 struck 1.57.1.** It was contradicted by this file's own residual #1 fifteen lines below it *and* by

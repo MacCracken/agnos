@@ -33,8 +33,9 @@ type: state
 > un-buildable `FS_SYSCALL_SELFTEST` gate). `version-bump.sh` minted the header.
 >
 > ✅ **`scripts/{build,test,bench}.sh` refs** — `KASHI_REF=1.0.10` / `REKHA_REF=0.9.0`; the build.sh
-> comments carry the dates. ⚠ kashi's `1.0.10` tag is NOT cut at the time of writing (HEAD is one commit
-> past `1.0.9`) — the CI clone fallback needs it.
+> comments carry the dates; all three refs are existing tags. ⛔ The first draft of this block and of the
+> CHANGELOG said kashi's `1.0.10` tag was not cut — false: `git tag | tail` sorts lexically and put `1.0.10`
+> between `1.0.1` and `1.0.2`. Use `git tag --sort=v:refname` when checking a sibling's tags.
 >
 > ✅ **`build.md`** — the `FS_SYSCALL_SELFTEST` row claimed "gated by `scripts/sweep.sh`"; no sweep row, smoke
 > or harness sets the flag (grepped). The cell now says so and names the consequence (an un-buildable gate
@@ -52,6 +53,15 @@ type: state
 > define never had a `#ifdef`; the burn profile verified a marker no kernel printed), `ATOM_MATH_SELFTEST` /
 > `ATOM_INSTR_SELFTEST` refuse without `HDMI_ATOM`, `DHCP_STATIC_IP` emitted. Every one measured
 > byte-identical on the default build.
+>
+> ✅ **`issues/2026-08-11-hid-drain-rearm-and-isr-console-lock.md` → `archived/`**, status header rewritten
+> OPEN → **CLOSED BY OPERATOR RULING 2026-09-21** before the move (the rule this folder learned the hard
+> way), Resolution block names what shipped and what is not owed. `roadmap.md` loses the expired
+> "▶ HID iron burn" heading + table AND its duplicate row (the 1.57.1 comment had flagged both) and gains
+> one FALSIFIED/closed line so the item is not re-derived; `state.md` row 100 says ZERO open issue files and
+> the 1,261-char "previous text" narrative that still scheduled the burn is retired; row 80 drops the
+> `hid_recover_halted` clause. Two comment links (`fb_console.cyr`, `console-line-preserve-test.py`) now
+> point at the archived path.
 >
 > ✅ **`tests/{audio,fault,fork,gpu}/cyrius.cyml`** — `[deps].stdlib` now declares the `alloc`/`atomic`/
 > `fnptr` closure, so `cyrius lib sync` vendors what the build actually includes (5 files were stale after
