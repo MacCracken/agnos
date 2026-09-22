@@ -16,7 +16,7 @@ KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
 # ⛔ 1.56.51: kept in step with scripts/build.sh and scripts/test.sh — see the measured note at
 # test.sh's KASHI_REF. The three had drifted to 1.0.6 / 1.0.4 / 1.0.4 with a comment naming
 # 1.0.0, invisible locally because [deps.kashi] path wins over any of them.
-KASHI_REF="${KASHI_REF:-1.0.8}"
+KASHI_REF="${KASHI_REF:-1.0.10}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
     # ⛔ Refuse to delete a git checkout (2026-09-13) — see the rekha block in scripts/build.sh.
     if [ -d "$KASHI_DIR/.git" ]; then
@@ -37,7 +37,7 @@ fi
 # Resolution mirrors scripts/build.sh; REKHA_REF kept in step with build.sh and test.sh (see the
 # ⛔ note at test.sh's KASHI_REF for why the three defaults must never diverge).
 REKHA_DIR="${REKHA_DIR:-$ROOT/../rekha}"
-REKHA_REF="${REKHA_REF:-0.3.9}"
+REKHA_REF="${REKHA_REF:-0.9.0}"
 if [ ! -f "$REKHA_DIR/fonts/face_data.cyr" ]; then
     # ⛔ Refuse to delete a git checkout — the untracked-sentinel hazard is written up at the same
     # block in scripts/build.sh; this guard MUST stay in step with build.sh's and bench.sh's.

@@ -51,7 +51,7 @@ sh scripts/ktest.sh                     # in-kernel test suite under the same gn
 sh scripts/test.sh                      # x86_64 (default)
 sh scripts/test.sh --aarch64            # aarch64 (compile test) — ⛔ RED as of 1.56.51, see below
 sh scripts/test.sh --all                # both
-sh scripts/check.sh                     # 34-gate project validation
+sh scripts/check.sh                     # 35-gate project validation
 ```
 
 ⛔ **aarch64 does not currently compile.** `sh scripts/build.sh --aarch64` fails with **33** reachable
@@ -131,9 +131,9 @@ Release flow: `version-bump.sh` → fill CHANGELOG entries → commit → `git t
 
 Ship as the last patch of the current minor (e.g., `1.27.2` before `1.28.0`).
 
-1. **Full test sweep** — `scripts/check.sh` **34/34**, `scripts/test.sh` (x86) **4/4**. ⭐ The 34th (1.57.2, simplified 1.57.3) is `kernel image vs BSP boot stack (LOAD end <= 0x370000)` — `scripts/check/image-layout-check.sh`, because the embedded face put the LOAD end over the then-fixed AP stack window and no gate had ever measured that address; the AP stacks live in region 7 since 1.57.3. The 33rd is the `kernel source formatting` gate, wired at 1.56.60: `scripts/check/fmt-check.sh` had existed all along and check.sh never ran it, so a local full-green was reachable over an unformatted tree while CI (`ci.yml` Format check) would reject the push. Fix drift with `sh scripts/check/fmt-fix.sh`.
+1. **Full test sweep** — `scripts/check.sh` **35/35**, `scripts/test.sh` (x86) **4/4**, `scripts/sweep.sh` **31 gates**. ⭐ The 35th (1.57.5) is `preprocessor directives balanced (kernel/)` — `scripts/check/pp-balance-check.sh`, a pure text walk, because `main.cyr` carried a depth-0 `#endif` for months that cycc drops without a diagnostic (an upstream "unbalanced #endif" refusal would stop the whole kernel build there). The 34th (1.57.2, simplified 1.57.3) is `kernel image vs BSP boot stack (LOAD end <= 0x370000)` — `scripts/check/image-layout-check.sh`, because the embedded face put the LOAD end over the then-fixed AP stack window and no gate had ever measured that address; the AP stacks live in region 7 since 1.57.3. The 33rd is the `kernel source formatting` gate, wired at 1.56.60: `scripts/check/fmt-check.sh` had existed all along and check.sh never ran it, so a local full-green was reachable over an unformatted tree while CI (`ci.yml` Format check) would reject the push. Fix drift with `sh scripts/check/fmt-fix.sh`. ⛔ The sweep's 31st row (1.57.5) is `FS_SYSCALL_SELFTEST` → `fssys-smoke.sh`: `build.md` had called that flag "gated by sweep.sh" since 1.41.3 while nothing ran it, and the flag build had been un-buildable since cyrius 6.5.1. **A documented gate that nothing runs reads as coverage** — when a doc names a runner, grep for the row.
    ⚠ These counts were "11/11" and "`--all` 7/7" until 1.56.51 and neither was reachable: check.sh
-   has grown to 30 gates, and `--all` tops out at 5 checks of which the aarch64 one is currently a
+   had grown to 30 gates (35 at 1.57.5), and `--all` tops out at 5 checks of which the aarch64 one is currently a
    FAIL. Re-read the tallies from a real run when you touch this list; do not copy them forward.
 2. **Boot sweep** — boot via gnoboot + OVMF (`scripts/smoke/agnsh-smoke.sh`, or `scripts/ktest.sh`
    for the in-kernel suite) and confirm every named checkpoint (banner / `Memory isolation: PASS` /

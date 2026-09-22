@@ -20,6 +20,126 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.5] — 2026-09-21 — cyrius 6.6.6: the kernel is NOT byte-identical this time, and here is every byte
+
+### Changed — cyrius pin 6.6.4 -> 6.6.6, all four repos together
+
+- **All 13 agnos manifests raised**; `toolchain-pin-check` 13/13; **134/134** vendored `tests/*/lib`
+  files byte-match the 6.6.6 snapshot. ⚠ The first `cyrius lib sync` left **5 stale** — `fnptr.cyr`
+  in `audio`/`fault`/`fork`/`gpu` and `alloc.cyr` in `gpu` — the 1.57.2 trap again: 6.6.6's
+  `lib/alloc.cyr` includes `atomic` and `fnptr` unconditionally and `string`/`args` include `alloc`,
+  and `lib sync` copies only what `[deps].stdlib` DECLARES. Those four manifests now declare the
+  closure (`alloc`, `atomic`, `fnptr`), the way `tests/chan` has since 1.57.2.
+- ⛔ **The kernel is NOT byte-identical across this pin move — `build/agnos` 2,419,216 -> 2,419,952 B
+  (+736 B), and the roadmap section that planned the move said it would be.** Measured as a 2x2
+  (untouched / fixed tree × 6.6.4 / 6.6.6) and then attributed instruction-by-instruction (both
+  disassemblies aligned under an explicit address map; 314,980 non-address instructions, 29,616 branch
+  targets, 12,190 `.bss` and 2,671 `.rodata` references all identical modulo relocation; `.rodata`
+  byte-identical by `cmp`; boot shim identical but for one shifted `rel32`). The delta is exactly three
+  things: **(1) 372 call sites gained 6.6.5's 2-byte `push rax` / `pop rcx` pad** (+744 B) — `rsp` was
+  8 off 16-byte alignment at every call emitted INSIDE AN EXPRESSION, one `push rax` per pending value
+  and nothing re-aligning; 325 pads in live fns, 41 in dead fns (= the +82 B in the dead-code note,
+  173,116 -> 173,198), 6 in top-level code; none in any ISR/syscall/AP entry (those stubs are byte-built
+  at runtime and reach handlers via `mov rax, imm64; call rax`); every compiler-emitted call in the 6.6.6
+  binary is now at even push depth (6.6.4: 372 were odd). **(2) One 18-byte deferred global-init store
+  removed** — see the next bullet. **(3) +2 B `.text` tail padding and +8 B in the file-backed globals
+  span** (two unreferenced zero slots in, one out). `.text` 0x123378 -> 0x123650 (+728); LOAD end
+  `0x35E8B0` -> `0x35EB90`, 66,672 B under gate 34's `0x370000`. The only `rsp` read that reaches
+  cyrius code (`dm_read_rsp`, `vmm.cyr`) is a depth-0 call compared against 256 MB; the flag-gated AP
+  sample in `SMP_STACK_SELFTEST` moves 8 B lower against a 256 KB window. Boot-verified below.
+- ⛔ **`GPU_AZ_IX_AUDIO_DESCRIPTOR0` was declared TWICE (`gpu_regs.cyr:756` and `:792`, both `= 0x28`,
+  since 2026-07-15) — and through cyrius 6.6.4 the kernel READ 0.** The pre-move analysis said "both
+  spellings say 0x28, so the value is the same either way"; the 6.6.4 binary says otherwise. 6.6.4 gave
+  the redeclaration its own slot, image value 0, initialised only by a store in the deferred global-init
+  replay that the compiler emits AFTER the top-level program — and the kernel's top level ends in
+  `arch_halt()`, so that replay never runs (the kmode emit-order invariant `version.cyr` documents; 641
+  stores sit in that unreachable run). The sole read (`gpu_az_write_ord(ir, dr,
+  GPU_AZ_IX_AUDIO_DESCRIPTOR0, GPU_AZ_AUDIO_DESCRIPTOR0_VAL)` in `gpu_hdmi_audio_enable`) bound to THAT
+  slot, so **every `HDA_HDMI` / `GPU_AUDIO_PROBE` / `MODESET_AUDIO` build wrote the audio descriptor to
+  AZ ordinal 0, not 0x28** — the old `:792` comment's own words: "if it reads 0 the endpoint believes the
+  sink supports no format at all". 6.6.6 folds a redeclared global to one definition (its changelog names
+  this agnos ordinal verbatim: "every read of it in the kernel saw 0; it now reads 0x28"). The second
+  declaration is removed and the comment at `:756` now says what the binaries measured. Unreachable in
+  the default kernel (the caller chain is HDMI-audio-gated; QEMU has no AMD GPU), so no smoke can see it
+  — **the AZ audio path needs an iron re-burn, because the endpoint write lands on a new ordinal for the
+  first time** (roadmap residual). Measured: under 6.6.4 the collapse changes the binary by 16 B
+  (2,419,216 -> 2,419,200); under 6.6.6 it is byte-identical before and after. No other top-level name is
+  co-declared in the default x86_64 build or under any single build flag (one under the
+  `HID_CC_INJECT` + `HID_CC_INJECT_HALT` pair, which `build.sh` refuses).
+- **Siblings travel with it:** **klug 0.2.0** (host-side `/dev/kmsg` lens; its two shipped binaries
+  are rebuilt on 6.6.6 there), **kashi 1.0.10**, **rekha 0.9.0** (the hint machine + zones arc
+  0.4 -> 0.9; `fonts/face_data.cyr` is BYTE-IDENTICAL to 0.3.9's, as is kashi's `src/font_data.cyr`
+  to 1.0.8's — the embedded face and the VGA font did not move). `KASHI_REF=1.0.10` /
+  `REKHA_REF=0.9.0` in `build.sh`/`test.sh`/`bench.sh`. ⚠ **kashi has no `1.0.10` tag yet** (HEAD is
+  one commit past `1.0.9`; `VERSION` says 1.0.10) — cut it before pushing agnos, or the CI clone
+  fallback fails. rekha `0.9.0` and klug `0.2.0` are tagged at HEAD.
+- **Checked against the 6.6.6 language changes and found clean:** the 21 `selftests.cyr` flag blocks
+  (16 top-level bare blocks, now BLOCK-SCOPED for their `var`s; `main.cyr` has 56 more) all compile —
+  built in two batches of 11 + 10 under the preprocessor's **16-define cap**; a scope walk over the
+  default, all-flags and per-`#ifndef` define sets finds 0 reads of any block `var` outside its block
+  (297 block vars; the one name that coincides with a true top-level global, `p0` in
+  `selftests.cyr:437` vs `main.cyr:4587`, is value-neutral and needs `KTEST` + `MMAP_HIMUNMAP_SELFTEST`
+  together, which nothing sets). A static arity scan over all 147 flags (1,800 fns, 16,172 checked call
+  sites, 3,993 of them flag-gated) finds **zero** mismatches beyond the four fixed below — validated by
+  running it on HEAD, where it reports exactly those four. The Windows `O_APPEND`/`O_TRUNC` fix, the
+  `SYS_STATFS` stub (yukti's), the typed-param/`async`/`operator` refusals, struct-by-value deep copy
+  and the `regression_*` / `vec_*` renames have no site in `kernel/`.
+
+### Added — what the flag audit turned up, run instead of filed
+
+- **`scripts/smoke/fssys-smoke.sh` + `sweep.sh` row 31** (`FS_SYSCALL_SELFTEST=1`): the 1.41.3 FS-syscall
+  self-test finally has a runner. Six assertions: `fssys: ALL PASS`, no per-step `FAIL`, boot reaches the
+  shell, and the on-disk half from a SECOND ext2 implementation — host `debugfs` still finds the seed file,
+  does NOT find `/fss` after the mkdir→create→rename→unlink→rmdir sequence, and `e2fsck -fn` is clean.
+  Mutation-checked (a `/fss` injected with `debugfs -w` turns the disk assertion red). Banner-gated
+  (`qemu_dwell_kernel`), so a firmware hand-off failure is VOID, never a verdict. **6/6** on 6.6.6.
+- **`scripts/check/pp-balance-check.sh` = `check.sh` gate 35** (`preprocessor directives balanced`): a pure
+  text walk that refuses a depth-0 `#endif`/`#else` or an unclosed `#ifdef` in any `kernel/**/*.cyr`.
+  Never invokes cyrius — a gate whose verdict depended on the installed compiler's tolerance would be
+  green exactly as long as the defect is invisible. Mutation-checked (orphan `#else`, unclosed `#ifdef`).
+
+### Fixed
+
+- **`FS_SYSCALL_SELFTEST=1` did not build, at any pin since cyrius 6.5.1 made a wrong argument count
+  a hard error.** `fs_syscall_selftest()` (`core/main.cyr`) called the 4-parameter `ksyscall` with 3
+  arguments at four sites — `mkdir`#9, `unlink`#30, `rmdir`#10, `sync`#12 (`arg3` unused by those
+  handlers). One `, 0` each; the gated build is back (**2,422,904 B**). It hid because the gate was
+  documented in `docs/development/build.md` as "gated by `scripts/sweep.sh`" while no sweep row, smoke or
+  harness set the flag — a documented gate that nothing runs reads as coverage. Row 31 above is the run.
+- **`kernel/core/main.cyr` carried an orphan `#endif` at depth 0** (line 3130, the tail of a removed
+  `#ifdef TSC_SELFTEST … tsc_selftest();` block whose explanatory comment stayed) — the ONLY unbalanced
+  directive in 93 kernel files. cycc's `PP_IFDEF_PASS` decrements only above depth 0, so 6.6.4, 6.6.5 and
+  6.6.6 all dropped it without a diagnostic; an upstream "unbalanced `#endif`" refusal would have stopped
+  the whole kernel build there. Found because the pin audit's preprocessor model had to special-case it.
+  Removed; gate 35 above keeps it out. Default binary byte-identical before/after.
+- **`SCANOUT_MATCHGEOM` — a build flag, a burn-prep profile and a marker check for a define NO kernel
+  source ever tested** — tombstoned (the EDGE_CAP_PROBE shape from 1.56.25, and older). The 2026-07-20
+  commit shipped `gpu_scanout_matchgeom()` UNCONDITIONALLY (the P4 fix is the default since 1.55.28) and
+  added the flag machinery beside it in the same commit, so `SCANOUT_MATCHGEOM=1` built a byte-identical
+  kernel while `burn-prep.sh` called it "the P4 MATCHGEOM kernel" and then demanded a serial marker
+  (`scanout matchgeom armed`) no kernel has ever printed. Fail-closed at least — `verify_marker` exits 1 —
+  so it could never have flashed. Measured: `SCANOUT_MATCHGEOM=1` and the default build are `cmp`-identical.
+- **`DHCP_STATIC_IP` was unreachable through `build.sh` for 25 minors.** The `#ifdef DHCP_STATIC_IP` arm
+  in `dhcp_init` (`core/net_dhcp.cyr`, 1.32.4 item 9) says "when build defines DHCP_STATIC_IP=1" — and no
+  `build.sh` line ever emitted the define; a flag-vs-`#ifdef` set difference over all 147 flags found it
+  as the one name tested in source and emitted by nothing. Wired; `DHCP_STATIC_IP=1` builds (2,420,192 B)
+  and carries `dhcp: STATIC ip=`. Documented in `build.md`.
+- **`ATOM_MATH_SELFTEST=1` / `ATOM_INSTR_SELFTEST=1` alone died two minutes into a build** with "N
+  reachable undefined functions" — both call helpers that live inside `#ifdef HDMI_ATOM` (27 + 5 sites),
+  their comments say so, the two smokes pass `HDMI_ATOM=1`, but only `ATOM_RUN_PIXCLK`'s dependency was
+  checked. `build.sh` now refuses both by name with the fix in the message, like its sibling.
+- **`exfat-smoke.sh` gets the banner-gated retry** (`qemu_dwell_kernel`). It was a single `timeout … qemu`
+  attempt, so the ~1-in-4 OVMF ExitBootServices flake scored it VOID-then-FAIL — it cost the 1.57.3 sweep
+  its 30/30 and did the same to this one (see Closeout). The retry caught the flake LIVE on the re-run
+  ("firmware never handed off — retrying 1/5", then 4/4).
+
+- **Closeout:** `check.sh` **35/35** · `test.sh` 4/4 · `ktest` **107/3** (the 3 `[initrd]` environmentals,
+  unchanged tally) · `sweep.sh` **29/30 + 1 VOID** on the 30-row table (the exFAT-read row: OVMF never handed
+  off on the sweep run — the 1.57.3 flake again; standalone re-run with the new retry PASSed 4/4 on its
+  second firmware try) **+ the new 31st row 6/6** · every flag change above measured byte-identical on the
+  default build (`cmp` against the pre-edit 1.57.5 binary) · plain kernel on disk (`5b73d81c…`,
+  2,419,952 B; the size gates weigh `size − face` = **2,009,132 B**).
+
 ## [1.57.4] — 2026-09-14 — cyrius 6.6.4: the literal defect is fixed upstream
 
 ### Changed — cyrius pin 6.6.3 -> 6.6.4, all four repos together

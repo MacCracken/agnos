@@ -579,15 +579,15 @@ elif [ -n "${BURN_SDMA_PROBE:-}" ]; then
     echo "[2/2] Building the P9.0 SDMA-probe kernel (SDMA_PROBE: read-only SDMA0 register dump; capture klug > sdma.txt)."
     BUILD_ENV="SDMA_PROBE=1"
     BUILD_TAG="SDMA_PROBE"
-elif [ -n "${BURN_SCANOUT_MATCHGEOM:-}" ]; then
-    # P4 — THE FIX (regdump-confirmed). The firmware scans an 800x600 surface upscaled to 2560x1440; boot_info
-    # reports the 2560x1440 output, so fb_console writes 2560-wide and bands. This reads the REAL viewport+pitch
-    # (0x5EA/0x607) and overrides fb_console to render 800x600, then redraws. NO register writes — pure reads +
-    # a software geometry switch — cannot hang/black. ⚠ ORACLE = the CONSOLE: legible (blocky but CLEAN, no
-    # bands)? Yes ⟹ P4 closed. Needs BIOS quiet-boot ON (the banded/scaled condition).
-    echo "[2/2] Building the P4 MATCHGEOM kernel (SCANOUT_MATCHGEOM: render at the real 800x600 surface; LOOK at legibility; quiet-boot ON)."
-    BUILD_ENV="SCANOUT_MATCHGEOM=1"
-    BUILD_TAG="SCANOUT_MATCHGEOM"
+# ⛔ REMOVED 1.57.5 — the BURN_SCANOUT_MATCHGEOM / SCANOUT_MATCHGEOM profile ("the P4 MATCHGEOM kernel").
+# The EDGE_CAP_PROBE shape again (see the tombstone above), and it was dead FROM BIRTH: the 2026-07-20
+# commit that added this branch shipped gpu_scanout_matchgeom() UNCONDITIONALLY (main.cyr / gpu.cyr call
+# it on every boot since 1.55.28) — no kernel source has ever carried `#ifdef SCANOUT_MATCHGEOM`, so the
+# build was byte-identical to the default, and the verify_marker below it demanded a serial string
+# ('scanout matchgeom armed') that no kernel has ever printed. Fail-closed, at least: verify_marker exits
+# 1, so this profile could never have flashed — it could only have cost the operator a confused hour.
+# The P4 fix it described IS the shipped default; there is nothing to arm. Found by the flag-vs-#ifdef
+# audit of the 6.6.6 pin move.
 elif [ -n "${BURN_SCANOUT_REGDUMP:-}" ]; then
     # P4 — READ-ONLY HUBP register dump. The surface is scaled (~800x600 → 2560x1440); the derived HUBP offsets
     # are unreliable, so dump the live-pipe HUBP block to klug to re-anchor the real pitch/viewport offsets.
@@ -1658,7 +1658,6 @@ case "$BUILD_TAG" in *ATOM_TX_CYCLE*)
         verify_absent "ENABLE only (negative control"
         ;;
 esac
-case "$BUILD_TAG" in *SCANOUT_MATCHGEOM*) verify_marker "scanout matchgeom armed" ;; esac
 case "$BUILD_TAG" in *SDMA_PROBE*)       verify_marker "sdma probe armed" ;; esac
 case "$BUILD_TAG" in *SDMA_RING*)        verify_marker "sdma ring bringup armed" ;; esac
 case "$BUILD_TAG" in *SDMA_COPY*)        verify_marker "sdma ring bringup armed" ;; esac

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "agnos ring-3 kernel-embedded-face exerciser (1.57.2) — open#7 / read#5 / close#6 / stat#33 / lstat#102 on /fonts/default.ttf, FNV-1a-64 against rekha's generator hash, sfnt header + table directory, the read-only gate (one probe per mask bit), stat/lstat st_mode+st_nlink+st_size and the two-name contract; exits 95 iff the whole contract holds."
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.6.4"
+cyrius = "6.6.6"
 
 [build]
 src = "kfont.cyr"

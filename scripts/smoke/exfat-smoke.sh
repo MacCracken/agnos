@@ -172,14 +172,22 @@ dd if="$EXPART" of="$IMG" bs=512 seek="$P2_FIRST" conv=notrunc status=none
 echo "Booting EXFAT_SELFTEST kernel (NVMe + GPT, exFAT MSFT-Basic p2)..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/exfat-selftest.log"
-. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # qemu_assert_booted
-timeout "${QEMU_TIMEOUT:-30}" qemu-system-x86_64 \
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # qemu_dwell_kernel + qemu_assert_booted
+# ⛔ BANNER-GATED RETRY (1.57.5). This smoke was a single `timeout … qemu` attempt, so the ~1-in-4
+# OVMF ExitBootServices flake (`gnoboot: fail @ EBS`) scored it VOID-then-FAIL in the sweep: it lost
+# the 1.57.3 sweep (VOID on the run AND a standalone re-run, PASS on the third) and the 1.57.5 sweep the
+# same way, both times on a kernel that had not changed since the gate last passed. qemu_dwell_kernel
+# re-runs the firmware hand-off (fresh vars.fd each try, QEMU_TRIES default 6) until the kernel banner
+# appears, and only THEN does the assertion block below see a log. A firmware run that never hands off
+# is still reported by qemu_assert_booted — as VOID, after every try, never as an exFAT verdict.
+qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-30}" "$WORK/vars.fd" "$OVMF_VARS_SRC" \
+    qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$IMG,format=raw,if=none,id=disk0" \
     -device "nvme,drive=disk0,serial=AGNOS-EXFATTEST" \
-    -serial stdio -display none -no-reboot 2>/dev/null > "$LOG"
+    -serial stdio -display none -no-reboot
 # ⛔ DID THE KERNEL RUN AT ALL? Without this, an OVMF hand-off failure makes every assertion
 # below evaluate against an empty log and print a wall of failures naming real properties.
 # See qemu_assert_booted in the lib for the measured rate and the log signature.

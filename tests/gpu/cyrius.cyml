@@ -13,7 +13,7 @@ language = "cyrius"
 # Raised 6.5.21 -> 6.5.27 -> 6.5.28 -> 6.5.36 with the root at 1.56.51. Since 1.56.49 this is a
 # GATE, not a convention: scripts/check/toolchain-pin-check.sh compares every manifest's pin
 # string against the root's and fails the build on any disagreement.
-cyrius = "6.6.4"
+cyrius = "6.6.6"
 
 [build]
 src = "gpufill.cyr"
@@ -25,4 +25,4 @@ output = "build/gpufill"
 # file-level `#ifdef CYRIUS_TARGET_AGNOS` gate, so an off-agnos build fails to COMPILE rather than emitting
 # Linux rmdir/creat. The result IS the exit code, read via the exec path's "run: exit N".
 [deps]
-stdlib = ["syscalls", "string", "args"]
+stdlib = ["syscalls", "string", "args", "alloc", "atomic", "fnptr"]

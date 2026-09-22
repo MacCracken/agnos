@@ -3127,7 +3127,8 @@ de_selftest();
 # ran first, read tsc_per_us == 0, got -1 from #95 twice, and reported "the clock does not
 # advance" — indicting the clock for what was purely a call-ordering mistake. The boot log said
 # so outright: `run: exit 0` printed BEFORE `tsc: 3193 cycles per microsecond`.
-#endif
+# (1.57.5: the `#endif` that used to follow this comment was the tail of that removed call's `#ifdef`
+# block — an orphan at depth 0 that cycc dropped silently; scripts/check/pp-balance-check.sh now refuses it.)
 
 #ifdef SYMLINK_SELFTEST
 # 1.51.x — symlink#63 round-trip self-test (compile-gated, SYMLINK_SELFTEST=1).
@@ -3855,7 +3856,7 @@ fn fs_syscall_selftest() {
     var ok = 1;
 
     # mkdir("/fss") + verify it exists on disk.
-    if (ksyscall(9, u + 0, 4) != 0)        { kprintln("fssys: mkdir FAIL", 17); ok = 0; }
+    if (ksyscall(9, u + 0, 4, 0) != 0)     { kprintln("fssys: mkdir FAIL", 17); ok = 0; }
     if (ext2_path_lookup(u + 0, 4) <= 0)   { kprintln("fssys: mkdir verify FAIL", 24); ok = 0; }
 
     # open("/fss/a", AO_CREAT) -> fd, close; verify the file exists.
@@ -3897,14 +3898,14 @@ fn fs_syscall_selftest() {
     }
 
     # unlink("/fss/b") + verify gone.
-    if (ksyscall(30, u + 128, 6) != 0)     { kprintln("fssys: unlink FAIL", 18); ok = 0; }
+    if (ksyscall(30, u + 128, 6, 0) != 0)  { kprintln("fssys: unlink FAIL", 18); ok = 0; }
     if (ext2_path_lookup(u + 128, 6) > 0)  { kprintln("fssys: unlink-left FAIL", 23); ok = 0; }
 
     # rmdir("/fss") + verify gone.
-    if (ksyscall(10, u + 0, 4) != 0)       { kprintln("fssys: rmdir FAIL", 17); ok = 0; }
+    if (ksyscall(10, u + 0, 4, 0) != 0)    { kprintln("fssys: rmdir FAIL", 17); ok = 0; }
     if (ext2_path_lookup(u + 0, 4) > 0)    { kprintln("fssys: rmdir-left FAIL", 22); ok = 0; }
 
-    ksyscall(12, 0, 0);   # sync
+    ksyscall(12, 0, 0, 0);   # sync
 
     pmm_free_2mb(u);
     if (ok == 1) { kprintln("fssys: ALL PASS", 15); }

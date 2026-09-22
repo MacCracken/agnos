@@ -107,6 +107,14 @@ sh "$ROOT/scripts/check/fmt-check.sh" > /tmp/fmt-check.log 2>&1 && rc=0 || rc=$?
 check "kernel source formatting" $rc
 [ "$rc" = "0" ] || cat /tmp/fmt-check.log
 
+# ⭐ 1.57.5 — PREPROCESSOR BALANCE. main.cyr carried a depth-0 `#endif` (the tail of a removed
+# `#ifdef TSC_SELFTEST` block) that cycc drops WITHOUT A DIAGNOSTIC on 6.6.4-6.6.6, found only because
+# the 6.6.6 pin audit built a preprocessor model and had to special-case the line. An upstream
+# "unbalanced #endif" refusal would stop the whole kernel build there. Pure text walk — never builds.
+sh "$ROOT/scripts/check/pp-balance-check.sh" > /tmp/pp-balance-check.log 2>&1 && rc=0 || rc=$?
+check "preprocessor directives balanced (kernel/)" $rc
+[ "$rc" = "0" ] || cat /tmp/pp-balance-check.log
+
 # Syscall ABI three-way consistency: kernel dispatch == ABI doc == the cyrius SysNrAgnos peer.
 # agnos redefines the syscall numbers (exit is #0, not Linux's 60), so a wrong number COMPILES CLEAN
 # and calls a different arm — confirmed shipping in jalwa as `poll`(7) -> `open` PER FRAME and

@@ -153,6 +153,14 @@ run_gate "1.39.x exFAT write (+ subdir)"             "EXFAT_WRITE_SELFTEST=1"   
 # --- ext2/jbd2 write regression bar (the iron-validated path must stay green) ---
 run_gate "ext2 WRITE regression (W1-W5)"             "EXT2_WRITE_SELFTEST=1"                    "ext2-write-smoke.sh"
 
+# --- 1.41.3 FS syscalls through ksyscall(), on-disk effects checked by host debugfs + e2fsck ---
+# ⛔ FS_SYSCALL_SELFTEST shipped at 1.41.3 with NO RUNNER while docs/development/build.md said "gated by
+# scripts/sweep.sh" — the same shape as SYSCALL_HARDEN_SELFTEST below, and it cost more: cyrius 6.5.1 made
+# a wrong argument count a hard error, four 3-arg ksyscall() calls in the selftest made the flag build
+# refuse to emit a binary, and nothing ran it for the next 25 pins. Found by a static arity scan in the
+# 6.6.6 pin audit (1.57.5), fixed there, and this row is what keeps the next one from hiding.
+run_gate "1.41.3 FS syscalls (mkdir/open/stat/rename/getdents/unlink/rmdir/sync via ksyscall)" "FS_SYSCALL_SELFTEST=1" "fssys-smoke.sh"
+
 # --- 1.40.x exec-from-disk: load + ring-3 run + ENOEXEC + subdir + clean return ---
 run_gate "1.40.x exec-from-disk (run /bin/prog2 + ENOEXEC)" "EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1" "exec-smoke.sh"
 

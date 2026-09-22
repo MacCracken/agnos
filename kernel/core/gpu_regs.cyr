@@ -753,7 +753,16 @@ var GPU_AZ_MULTICHANNEL_STEREO    = 0x1;
 # Values are amdgpu's MEASURED known-good for this panel (prior-art capture 2026-07-15, panel audibly
 # playing). Hardcoding the sink-derived ones is a deliberate, honest interim: the general form is an ELD
 # read, which agnos does not have yet. Panel-specific by construction — see the ELD note at the write site.
-var GPU_AZ_IX_AUDIO_DESCRIPTOR0 = 0x28;  # amdgpu 0x07070701: LPCM, 2ch, 32/44.1/48k, 16/20/24-bit
+var GPU_AZ_IX_AUDIO_DESCRIPTOR0 = 0x28;  # amdgpu 0x07070701: LPCM, 2ch, 32/44.1/48k, 16/20/24-bit — WRITTEN by
+# dce_aud_az_configure from the sink's ELD; agnos writes GPU_AZ_AUDIO_DESCRIPTOR0_VAL at the AZ configure site
+# (gpu.cyr). ⛔ Declared ONCE, and that is a VALUE fix, not tidiness. A second `var` of this name sat in the
+# read-for-the-corpus block below from 2026-07-15 until 1.57.5, and through cyrius 6.6.4 the only read
+# (`gpu_az_write_ord` in `gpu_hdmi_audio_enable`) bound to that SECOND slot: image value 0, sole store in the
+# deferred global-init replay emitted after the top-level `arch_halt()` — never executed in kernel mode (the
+# kmode emit-order invariant `version.cyr` documents). So every HDMI-audio build in that window wrote the
+# descriptor to AZ ordinal 0, not 0x28 — measured on the 6.6.4 binary (1.57.5). cyrius 6.6.6 folds a
+# redeclared global to one definition, so the read sees 0x28 for the first time; this collapse makes the source
+# say what the binary does. The AZ path needs an iron re-burn: the endpoint write lands somewhere new.
 var GPU_AZ_IX_AUDIO_DESCRIPTOR1 = 0x29;  # amdgpu 0x00000000
 var GPU_AZ_IX_AUDIO_DESCRIPTOR2 = 0x2A;  # amdgpu 0x00000000
 var GPU_AZ_IX_RESPONSE_LIPSYNC  = 0x37;  # amdgpu 0x00000000
@@ -789,9 +798,7 @@ var GPU_AZ_IX_CONV_DIGITAL_CONVERTER = 0x04; # amdgpu=0x00000001 (DIGEN as the E
 var GPU_AZ_IX_PIN_CAPS              = 0x21; # amdgpu=0x00000094
 var GPU_AZ_IX_PIN_SENSE             = 0x23; # amdgpu=0x7fffffff
 var GPU_AZ_IX_PIN_WIDGET_CONTROL    = 0x24; # amdgpu=0x00000040 (PINCTL_OUT_EN, mirrored from the codec)
-var GPU_AZ_IX_AUDIO_DESCRIPTOR0     = 0x28; # amdgpu=0x07070701 — WRITTEN by dce_aud_az_configure from the
-# sink's ELD. agnos writes NOTHING here; if it reads 0 the
-# endpoint believes the sink supports no format at all.
+# GPU_AZ_IX_AUDIO_DESCRIPTOR0 (0x28) is declared ONCE, above with the configure-path values (1.57.5).
 var GPU_AZ_IX_RESPONSE_HBR          = 0x38; # amdgpu=0x00000001
 var GPU_AZ_IX_SINK_INFO0            = 0x3A; # amdgpu=0x07757204 — the ELD amdgpu pushes into the endpoint
 var GPU_AZ_IX_MULTICHANNEL_MODE     = 0x58; # amdgpu=0x00000001 — a CONTROL agnos never writes

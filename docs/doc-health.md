@@ -6,7 +6,56 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-09-14 (**1.57.4 — cyrius 6.6.4 across all four repos; the literal defect 1.57.2 filed is fixed upstream and the docs that called it live now call it history; see the 1.57.4 block**).
+> **Last refresh**: 2026-09-21 (**1.57.5 — cyrius 6.6.6 across all four repos; the kernel is NOT byte-identical this time and the docs say why to the byte; see the 1.57.5 block**).
+>
+> ### 1.57.5 (2026-09-21) — a pin move that changed the binary, and the plan that said it would not
+>
+> ✅ **`roadmap.md`** — the 68-line "Moving the cyrius pin to 6.6.6" pre-move analysis (uncommitted at the
+> start of the cut) is REPLACED by a two-row residual table: the AZ audio re-burn (the duplicate
+> `GPU_AZ_IX_AUDIO_DESCRIPTOR0` is collapsed; only iron can prove the endpoint write) and the
+> `FS_SYSCALL_SELFTEST` sweep gap. Everything the analysis predicted and everything it got wrong went to
+> the CHANGELOG. ⚠ It was wrong TWICE in the safe-sounding direction: "a default kernel build is
+> byte-identical to the 6.6.4 one" (FALSE — +736 B, 6.6.5's nested-call `rsp` pad, 372 sites) and "both
+> spellings say 0x28, so the value is the same either way" (FALSE — through 6.6.4 the kernel read **0**
+> from the duplicate, because the redeclaration's only store sat in the post-`arch_halt()` init replay
+> that kernel mode never runs; the 6.6.6 changelog even named the agnos ordinal). A pre-move analysis
+> is a hypothesis; the 2x2 build and a disassembly diff are what test it. ⛔ The first cut of THIS
+> release's `gpu_regs.cyr` comment and CHANGELOG repeated the second falsehood; both were corrected
+> from the binaries before ship. The file is 131 lines against its ~120 guideline; the OPEN tables are
+> the bulk.
+>
+> ✅ **`state.md`** — Kernel head / on-disk size / Cyrius pin rows re-derived: 2,419,952 B, pin 6.6.6,
+> klug 0.2.0 / kashi 1.0.10 / rekha 0.9.0, 134/134 vendored files, the size gates' `size − face` =
+> 2,009,132 B. The 1.57.4 head text is folded into the "Previous head" chain. Still 120 lines.
+>
+> ✅ **`CHANGELOG.md` 1.57.5** — Changed (the pin move as a 2x2 with every byte accounted for; the
+> duplicate global; siblings; the 6.6.6 language changes checked and found clean) + Fixed (the
+> un-buildable `FS_SYSCALL_SELFTEST` gate). `version-bump.sh` minted the header.
+>
+> ✅ **`scripts/{build,test,bench}.sh` refs** — `KASHI_REF=1.0.10` / `REKHA_REF=0.9.0`; the build.sh
+> comments carry the dates. ⚠ kashi's `1.0.10` tag is NOT cut at the time of writing (HEAD is one commit
+> past `1.0.9`) — the CI clone fallback needs it.
+>
+> ✅ **`build.md`** — the `FS_SYSCALL_SELFTEST` row claimed "gated by `scripts/sweep.sh`"; no sweep row, smoke
+> or harness sets the flag (grepped). The cell now says so and names the consequence (an un-buildable gate
+> for every pin since 6.5.1).
+>
+> ✅ **`CLAUDE.md` closeout step 1** — tallies re-read from real runs: `check.sh` **35/35** (gate 35 =
+> `pp-balance-check`, named with its reason), `sweep.sh` **31 rows** (row 31 = `fssys-smoke`), and the
+> lesson that a documented gate nothing runs reads as coverage. The Quick Start comment says 35-gate.
+>
+> ✅ **`build.md`** — the `FS_SYSCALL_SELFTEST` row now names its runner (`fssys-smoke.sh`, six assertions)
+> and keeps the history of the false "gated by sweep.sh" claim; a `DHCP_STATIC_IP` row is added for the arm
+> `build.sh` could not reach until this cut.
+>
+> ✅ **`scripts/build.sh` / `scripts/burn/burn-prep.sh`** — `SCANOUT_MATCHGEOM` tombstoned in both (the
+> define never had a `#ifdef`; the burn profile verified a marker no kernel printed), `ATOM_MATH_SELFTEST` /
+> `ATOM_INSTR_SELFTEST` refuse without `HDMI_ATOM`, `DHCP_STATIC_IP` emitted. Every one measured
+> byte-identical on the default build.
+>
+> ✅ **`tests/{audio,fault,fork,gpu}/cyrius.cyml`** — `[deps].stdlib` now declares the `alloc`/`atomic`/
+> `fnptr` closure, so `cyrius lib sync` vendors what the build actually includes (5 files were stale after
+> the first sync at this pin).
 >
 > ### 1.57.4 (2026-09-14) — a defect turned into history, and a peer that stopped being owed
 >

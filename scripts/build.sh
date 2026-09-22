@@ -16,7 +16,7 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # with a sibling-checkout default — works on a local devbox where both
 # repos live under ~/Repos/ AND in CI where actions/checkout only fetches
 # this repo. When the sibling is absent we clone the pinned tag (override
-# via KASHI_REF=<tag-or-branch>). Pinned at 1.0.8 — matching ../kashi/VERSION as of 2026-09-14 (tag cut with agnos 1.57.4; was 1.0.6 as of
+# via KASHI_REF=<tag-or-branch>). Pinned at 1.0.10 — matching ../kashi/VERSION as of 2026-09-21 (tag cut with agnos 1.57.5; 1.0.8 at 1.57.4, 1.0.6 as of
 # 2026-08-28. Bump it as kashi cuts new 1.x releases. Affects ONLY the clone fallback: cyrius.cyml
 # declares `[deps.kashi] path`, and the path wins, so a box with the sibling checkout never reads
 # this value. That is exactly why it rots unnoticed.
@@ -25,7 +25,7 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # (The freestanding font_data.cyr has been byte-identical across the 1.0.x bumps, which is what
 # has kept the divergence from producing a visible symptom — not a reason to tolerate it.)
 KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
-KASHI_REF="${KASHI_REF:-1.0.8}"
+KASHI_REF="${KASHI_REF:-1.0.10}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
     # ⛔ Same guard as the rekha block below (2026-09-13): the fallback replaces an ABSENT sibling
     # only, never a checkout that happens to lack the file — see the note there.
@@ -45,13 +45,13 @@ fi
 # rekha freestanding default-face data (1.57.2 — the kernel-embedded TrueType face behind
 # /fonts, core/kfont.cyr). SAME contract as kashi above, mirrored line for line: sibling checkout
 # by default, clone the pinned tag when absent (override via REKHA_REF=<tag-or-branch>). Pinned at
-# 0.3.9 — matching ../rekha/VERSION as of 2026-09-14 (0.3.8 was the first tag carrying fonts/face_data.cyr).
+# 0.9.0 — matching ../rekha/VERSION as of 2026-09-21 (0.3.9 at 1.57.4; 0.3.8 was the first tag carrying fonts/face_data.cyr).
 # ⚠ scripts/test.sh AND scripts/bench.sh carry the same default and MUST move with it — the kashi
 # triple diverged three times before 1.56.51 for exactly this reason, and the same failure mode
 # applies here: `[deps.rekha] path` wins locally, so a stale default is invisible until a clean CI
 # checkout builds against a different face than the one that was tested.
 REKHA_DIR="${REKHA_DIR:-$ROOT/../rekha}"
-REKHA_REF="${REKHA_REF:-0.3.9}"
+REKHA_REF="${REKHA_REF:-0.9.0}"
 if [ ! -f "$REKHA_DIR/fonts/face_data.cyr" ]; then
     # ⛔ NEVER rm -rf A GIT CHECKOUT (2026-09-13). The sentinel probed above is UNTRACKED in a rekha
     # working tree that has not committed fonts/ yet, so ordinary hygiene in the sibling — `git
@@ -407,6 +407,12 @@ else
         # width its caller is about to read. Hermetic: pure function over an in-memory blob, which is
         # the only way to test an attack that otherwise needs a hostile DHCP server on the boot exchange.
         [ -n "$DHCP_OPT_SELFTEST" ] && echo '#define DHCP_OPT_SELFTEST'
+        # DHCP_STATIC_IP=1 — 1.32.4 item 9: skip the wire-DHCP exchange and take net_ip/gateway/netmask from
+        # the DHCP_STATIC_*_VAL constants at the top of core/net_dhcp.cyr (192.168.1.42/24 via .1). The arm
+        # (`#ifdef DHCP_STATIC_IP`, net_dhcp.cyr dhcp_init) has been in the tree since 1.32.4 and its comment
+        # says "when build defines DHCP_STATIC_IP=1" — but NO line here ever emitted the define, so the arm
+        # was unreachable through scripts/build.sh for 25 minors. Wired 1.57.5 (the flag-vs-#ifdef audit).
+        [ -n "$DHCP_STATIC_IP" ] && echo '#define DHCP_STATIC_IP'
         [ -n "$PMM_FULLRAM_SELFTEST" ] && echo '#define PMM_FULLRAM_SELFTEST'
         [ -n "$PMM_HIRAM_SELFTEST" ] && echo '#define PMM_HIRAM_SELFTEST'
         [ -n "$PMM_RAMSTRESS_SELFTEST" ] && echo '#define PMM_RAMSTRESS_SELFTEST'
@@ -562,11 +568,14 @@ else
         # past its own stated removal trigger (P3b, landed 1.55.12). Still useful for the remaining HDMI-audio
         # candidates (cut 1.56.32) — arm it deliberately, do not restore it to the default boot path.
         [ -n "$GPU_AUDIO_PROBE" ]    && echo '#define GPU_AUDIO_PROBE'
-        # SCANOUT_MATCHGEOM=1 — THE P4 FIX: read the real surface geometry (viewport 0x5EA + pitch 0x607) and
-        # override fb_console to render at it (800x600 scaled), instead of boot_info's 2560x1440 output. Pure
-        # reads + software geometry switch + console redraw — NO register writes, cannot hang/black. Oracle: the
-        # console is LEGIBLE (blocky but clean, bands gone).
-        [ -n "$SCANOUT_MATCHGEOM" ]  && echo '#define SCANOUT_MATCHGEOM'
+        # ⛔ SCANOUT_MATCHGEOM removed 1.57.5 — the same trap as EDGE_CAP_PROBE (1.56.25), and older than it:
+        # the 2026-07-20 commit that shipped gpu_scanout_matchgeom() shipped it UNCONDITIONALLY (main.cyr and
+        # gpu.cyr call it on every boot since 1.55.28) and, in the same commit, added this define, a burn-prep
+        # profile and a marker check for it. NO kernel source ever carried `#ifdef SCANOUT_MATCHGEOM`, so
+        # `SCANOUT_MATCHGEOM=1` produced a kernel BYTE-IDENTICAL to the default while burn-prep offered it as
+        # "the P4 MATCHGEOM kernel" and then verified a serial marker ('scanout matchgeom armed') that no kernel
+        # has ever printed — the profile could not have flashed. Found by a static flag-vs-#ifdef set difference
+        # during the 6.6.6 pin audit. The feature is the default; there is nothing to arm.
         # SDMA_PROBE=1 — P9.0 read-only SDMA0 register-discovery dump (anchor the ring/status/ucode offsets +
         # report ucode residency before any SDMA write). Read-only; small hang risk if SDMA's clock is gated.
         [ -n "$SDMA_PROBE" ]         && echo '#define SDMA_PROBE'
@@ -745,6 +754,21 @@ else
         # NON-ZERO, by executing four synthetic in-RAM command tables (clean EOT / reserved opcode /
         # out-of-range opcode / impossible header). No real VBIOS, no MMIO reachable, no PHY — safe
         # anywhere, QEMU is the venue. Requires HDMI_ATOM (the interpreter lives inside that gate).
+        # ⚠ Both selftests call helpers that exist only inside `#ifdef HDMI_ATOM` (atom.cyr:30-1173):
+        # atom_div64_32 / atom_mul32_split (17 + 10 sites) and atom_init_mem / atom_execute_table. Their
+        # comments say so and the two smokes pass HDMI_ATOM=1 — but until 1.57.5 only ATOM_RUN_PIXCLK's
+        # dependency was CHECKED (above), so `ATOM_MATH_SELFTEST=1 sh scripts/build.sh` alone died two minutes
+        # in with "N reachable undefined functions". Checked here by name, like its sibling.
+        if [ -n "$ATOM_MATH_SELFTEST" ] && [ -z "$HDMI_ATOM" ]; then
+            echo "ERROR: ATOM_MATH_SELFTEST=1 requires HDMI_ATOM=1 (atom_div64_32/atom_mul32_split live inside that gate)." >&2
+            echo "       Use: HDMI_ATOM=1 ATOM_MATH_SELFTEST=1 sh scripts/build.sh" >&2
+            exit 1
+        fi
+        if [ -n "$ATOM_INSTR_SELFTEST" ] && [ -z "$HDMI_ATOM" ]; then
+            echo "ERROR: ATOM_INSTR_SELFTEST=1 requires HDMI_ATOM=1 (the interpreter lives inside that gate)." >&2
+            echo "       Use: HDMI_ATOM=1 ATOM_INSTR_SELFTEST=1 sh scripts/build.sh" >&2
+            exit 1
+        fi
         [ -n "$ATOM_INSTR_SELFTEST" ] && echo '#define ATOM_INSTR_SELFTEST'
         # Freestanding kashi font-data core (1.37.5 fold-in). Inlined here
         # rather than via cyrius dep resolution because `cyrius build` looks

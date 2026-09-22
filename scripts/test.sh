@@ -16,7 +16,7 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # ⚠ Keep them in step and re-verify against kashi's own VERSION at every cut. This has now
 # re-diverged twice; it is a recurring failure, not an incident.
 KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
-KASHI_REF="${KASHI_REF:-1.0.8}"
+KASHI_REF="${KASHI_REF:-1.0.10}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
     # ⛔ Refuse to delete a git checkout (2026-09-13) — see the rekha block in scripts/build.sh.
     if [ -d "$KASHI_DIR/.git" ]; then
@@ -37,7 +37,7 @@ fi
 # triple's drift history above is the warning, and a face verified by the smoke but built from a
 # different tag in CI is the exact silent failure it describes.
 REKHA_DIR="${REKHA_DIR:-$ROOT/../rekha}"
-REKHA_REF="${REKHA_REF:-0.3.9}"
+REKHA_REF="${REKHA_REF:-0.9.0}"
 if [ ! -f "$REKHA_DIR/fonts/face_data.cyr" ]; then
     # ⛔ Refuse to delete a git checkout — the untracked-sentinel hazard is written up at the same
     # block in scripts/build.sh; this guard MUST stay in step with build.sh's and bench.sh's.

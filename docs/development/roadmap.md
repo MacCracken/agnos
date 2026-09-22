@@ -3,7 +3,7 @@
 <!-- TOOLING ANCHOR: scripts/version-bump.sh seds ONLY the version numbers in `> **Current**: vX.Y.Z`
      and `Built with cyrius X.Y.Z`. Delete either anchor and that sed becomes a silent no-op. -->
 
-> **Current**: v1.57.4 — live state (kernel head, cyrius pin, active burn, sweeps, sizes) lives in [`state.md`](state.md).
+> **Current**: v1.57.5 — live state (kernel head, cyrius pin, active burn, sweeps, sizes) lives in [`state.md`](state.md).
 
 Forward-only. Shipped work is not narrated here: history is [`../../CHANGELOG.md`](../../CHANGELOG.md), live state is [`state.md`](state.md), the normative syscall contract is [`agnos-userland-abi.md`](agnos-userland-abi.md). **All GPU/display/HDMI work is one open release (1.56.x) and lives entirely in [`planning/gpu.md`](planning/gpu.md)** — plan, register facts, falsified record, remaining ladder. Do not re-narrate it here and do not open a second GPU doc. Ship milestones (beta/GA/maturity arc) live in the agnosticos roadmap. Language roadmap: `../../../cyrius/docs/development/roadmap.md`.
 
@@ -116,8 +116,15 @@ both needing a boot **with the mouse attached** — the 2026-08-11 burn ran with
 
 Not a burn question: whether `BENCHMARKS.md` and `bench-history.csv` are git-tracked (`git ls-files`).
 
+
+## Residual of the cyrius 6.6.6 move (shipped 1.57.5 — the move itself is CHANGELOG history)
+
+| Item | Why it is needed | Target | Blocked on |
+|---|---|---|---|
+| ⛔ **Re-burn the AZ audio path on iron — the descriptor write lands on a NEW ordinal** | 1.57.5 collapsed the duplicate `GPU_AZ_IX_AUDIO_DESCRIPTOR0` (`gpu_regs.cyr:756`; the `:792` copy, there since 2026-07-15, is gone). Measured on the binaries: through cyrius 6.6.4 the only read bound to the second slot, image value 0, whose sole store sat in the post-`arch_halt()` init replay the kernel never runs — so every HDMI-audio build wrote the descriptor to **AZ ordinal 0**; under 6.6.6 (and now the source) it is **0x28**, for the first time. QEMU has no AZ endpoint, so no smoke can see it. Assert on iron: `AZ_AUDIO_DESCRIPTOR0` reads back `0x07070701` after configure (the `gpu_az_dump_ord` row), ordinal 0 no longer carries it, and the panel is audibly playing — and record whether audio behaved differently from the 2026-07-15 prior-art capture, since that burn ran the 0-ordinal write. | next burn | a burn (archaemenid) |
+
 ---
 
-*Built with cyrius 6.6.4 · `VERSION` is the single source of truth for the kernel version; the Current line
+*Built with cyrius 6.6.6 · `VERSION` is the single source of truth for the kernel version; the Current line
 is maintained by `scripts/version-bump.sh`. At each arc close: delete the arc's forward-facing rows, let the
 CHANGELOG carry the history, and keep this file under ~120 lines. Per-cut prose does not belong here.*
