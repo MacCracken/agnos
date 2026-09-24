@@ -56,9 +56,13 @@ cp "$OVMF_VARS" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 echo "=== AGNOS 1.44.x multi-threading opening smoke ==="
 LOG="$LOGS/thread.log"
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
+# 1.57.6 (S3): SMOKE_SMP=N boots with -smp N (default 1 = unchanged); see smoke_accel in qemu-dwell.sh.
+SMOKE_SMP="${SMOKE_SMP:-1}"
+ACCEL="$(smoke_accel "$SMOKE_SMP")"
+echo "accel: $ACCEL (-smp $SMOKE_SMP)"
 qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
     qemu-system-x86_64 \
-    -machine q35 -m 512M -cpu max \
+    -machine q35 -m 512M $ACCEL -smp "$SMOKE_SMP" \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$ESP,format=raw,if=none,id=esp0" -device "nvme,drive=esp0,serial=AGNOS-SMOKE" \
@@ -68,4 +72,6 @@ echo "--- serial (thread lines) ---"; strings "$LOG" | grep "thr:" | sed 's/^/  
 rc=0
 if strings "$LOG" | grep -q "thr: preempt OK"; then echo "PASS: preemptive kernel-thread time-slicing (kthread_create + timer preemption)"; else echo "FAIL: 'thr: preempt OK' not found — preemption/round-robin regression"; rc=1; fi
 if strings "$LOG" | grep -q "thr: gate held"; then echo "PASS: preempt gate (preempt_disable freezes the scheduler)"; else echo "FAIL: 'thr: gate held' not found — preempt-gate regression"; rc=1; fi
+# ⛔ 1.57.6 (S3-fix): the kernel's latched invariant lines (SMOKE_INVARIANT_DENY, qemu-dwell.sh) change no exit code.
+if strings "$LOG" | grep -qE "$SMOKE_INVARIANT_DENY"; then echo "FAIL: a latched kernel invariant line fired:"; strings "$LOG" | grep -E "$SMOKE_INVARIANT_DENY" | head -3 | sed 's/^/        /'; rc=1; else echo "PASS: no latched kernel invariant line (non-ready pick, out-of-band asserts, kstack_check_entry, #DF)"; fi
 exit $rc

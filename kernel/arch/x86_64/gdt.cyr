@@ -98,7 +98,7 @@ var tss_array[416];  # 4 CPUs x 104 bytes each
 # from power-on through every later CR3. (The legacy multiboot1 shim adds a second reason on its
 # own path: its hand-built page tables map only 0-4 MB — boot_shim.cyr step 4 — but the production
 # ELF64 shim builds no page tables at all, so "0-4 MB" is NOT the reason there.)
-# Region 7 is now FULL — see the map at IST1 below.
+# Region 7's map is at IST1 below (1.57.6: rewritten for Path 2's per-process kernel stacks).
 var tss_kernel_stack = 0x3C0000;
 
 fn tss_get_cpu_stack(cpu_id) {
@@ -134,19 +134,24 @@ fn tss_init_cpu(cpu_id) {
     # like ark (segments to ~20 MB) overrides PD[7] in its own per-proc CR3 and would take the #DF
     # stack with it. The direct map is PDPT[8..511], mirrored into every per-proc CR3 and never
     # segment-overridden.
-    # ⚠ PLACEMENT IS EXACT AND REGION 7 IS FULL (re-derived 1.57.3, when the AP stacks moved in).
-    # Region 7 (phys 0xE00000-0x1000000, 2 MB, PD[7]) is reserved by pmm_init, identity-mapped under
-    # the kernel CR3 0x1000, and reached by EVERY consumer through its direct-map alias
-    # (DIRECTMAP_BASE + phys). The five consumers, in address order:
-    #   0xE00000-0xF00000   proc_rsp0 pool — 16 x 64 KB (proc.cyr KSTACK_POOL_BASE / KSTACK_SLOT)
-    #   0xF00000-0xF40000   PRIMARY syscall kstacks — tops 0xF10000 + cpu*0x10000 (syscall_hw.cyr)
+    # ⚠ THE REGION-7 MAP (re-derived 1.57.6 for Path 2's per-process kernel stacks, S3.3). Region 7 (phys
+    # 0xE00000-0x1000000, 2 MB, PD[7]) is reserved by pmm_init, identity-mapped under the kernel CR3 0x1000,
+    # and reached by EVERY consumer through its direct-map alias (DIRECTMAP_BASE + phys) — never the identity
+    # VA. 32 slots of 64 KB; since 1.57.6 the LOWEST 4 KB OF EVERY SLOT IS A NOT-PRESENT GUARD PAGE (vmm.cyr
+    # kstack_guard_init replaces the direct map's 2 MB entry with a 4 KB table), so each has 60 KB usable:
+    #   0xE00000-0xF00000   PER-PROCESS KERNEL STACKS — 16 x 64 KB, slot = pid, top = proc_rsp0[pid]
+    #                       (proc.cyr KSTACK_POOL_BASE / KSTACK_SLOT). SYSCALL entry AND CPL3 interrupts;
+    #                       kstack_install (syscall_hw.cyr) points TSS.RSP0 and the syscall top here.
+    #   0xF00000-0xF40000   kthread stacks — 4 x 64 KB (proc.cyr KTHREAD_STACK_POOL; the BSP idle's
+    #                       included). Until 1.57.6 these were the per-CPU PRIMARY syscall stacks.
     #   0xF40000-0xF80000   IST1 (#DF) stacks — tops 0xF50000 + cpu*0x10000 (this line)
-    #   0xF80000-0xFC0000   SECOND/nested syscall kstacks — tops 0xF90000 + cpu*0x10000 (syscall_hw.cyr)
+    #   0xF80000-0xFC0000   FREE — was the per-CPU SECOND (#37 nested) syscall stacks; reserved for a
+    #                       future NMI / #MC IST, the natural next per-CPU stack.
     #   0xFC0000-0x1000000  AP boot/TSS stacks — tops 0xFD0000 + cpu*0x10000 for cpu 1-3
     #                       (tss_get_cpu_stack + smp.cyr's trampoline); slot 0 [0xFC0000, 0xFD0000)
     #                       is UNUSED — the BSP keeps its region-1 stacks (0x380000 / 0x3C0000).
-    # 2 MB = 32 x 64 KB = 16 + 4 + 4 + 4 + 4, nothing left over. There is NO sixth slot: a new
-    # per-CPU stack needs a new reserved region and its own map, not a squeeze into this one.
+    # 2 MB = 32 x 64 KB = 16 + 4 + 4 + 4 + 4. One 256 KB range is free again; beyond it, a new stack needs
+    # a new reserved region and its own map, not a squeeze into this one.
     store64(tss_addr + 36, DIRECTMAP_BASE + 0xF50000 + cpu_id * 0x10000);   # 0x24 = IST1
 
     # ⛔⛔ 1.56.52 — THE I/O-MAP BASE IS AT TSS OFFSET 102 (0x66), NOT 100, AND WRITING IT TO 100 GAVE

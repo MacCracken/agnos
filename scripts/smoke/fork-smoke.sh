@@ -102,13 +102,17 @@ echo "Booting FORK_SELFTEST kernel (NVMe + ext2 with /bin/forker)..."
 # is retryable. Gating on the banner keeps a REAL regression from being retried away — which is
 # exactly the risk in sweep.sh's unconditional double-run, where a genuine failure gets two chances
 # to look like a flake. If the banner is present, whatever the assertions say is the verdict.
+# 1.57.6 (S3): SMOKE_SMP=N boots with -smp N (default 1 = unchanged); see smoke_accel in qemu-dwell.sh.
+SMOKE_SMP="${SMOKE_SMP:-1}"
+ACCEL="$(smoke_accel "$SMOKE_SMP")"
+echo "accel: $ACCEL (-smp $SMOKE_SMP)"
 QEMU_TRIES="${QEMU_TRIES:-3}"
 qtry=1
 while [ "$qtry" -le "$QEMU_TRIES" ]; do
     cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
     qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
         qemu-system-x86_64 \
-        -machine q35 -m 512M -cpu max \
+        -machine q35 -m 512M $ACCEL -smp "$SMOKE_SMP" \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
         -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
         -drive "file=$IMG,format=raw,if=none,id=disk0" \
@@ -150,6 +154,13 @@ if strings "$LOG" | grep -q "fork: SURVIVED back in kernel"; then
     echo "  PASS: kernel resumed after the forked run"
 else
     echo "  FAIL: never returned from the forked run (hang or fault)"; rc=1
+fi
+# ⛔ 1.57.6 (S3-fix): the kernel's latched invariant lines (SMOKE_INVARIANT_DENY, qemu-dwell.sh) fire once to klug +
+# COM1 and change no exit code — this gate scored PASS with them firing until it grepped for them.
+if strings "$LOG" | grep -qE "$SMOKE_INVARIANT_DENY"; then
+    echo "  FAIL: a latched kernel invariant line fired:"; strings "$LOG" | grep -E "$SMOKE_INVARIANT_DENY" | head -5 | sed 's/^/        /'; rc=1
+else
+    echo "  PASS: no latched kernel invariant line (non-ready pick, out-of-band asserts, kstack_check_entry, #DF)"
 fi
 [ "$rc" = "0" ] && echo "fork-smoke: PASS" || echo "fork-smoke: FAIL"
 exit $rc

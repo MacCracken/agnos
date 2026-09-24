@@ -749,3 +749,592 @@ ext2_jbd2_crash_selftest();
     }
 }
 #endif
+
+#ifdef SPAWN_SELFTEST
+# ── 1.57.6 — spawn_path#43 / execwait#37 / exec_redirect#62 / CH_ENDOW / pipe-lifetime: the PURE checks ──
+# (issues 2026-09-23-child-inherits-every-fd-and-spawn-arms-leak, -spawn-path-args-cannot-contain-spaces,
+#  -spawn-path-failure-gives-no-reason). The RING-3 half — children that actually run concurrently, capture,
+# CLEANFD, argv round trips, the table-full code, pipe crosstalk — is tests/spawn/spawnx.cyr seeded as
+# /bin/agnsh on a PLAIN kernel; both are driven by scripts/smoke/spawn-smoke.sh.
+# ⛔ RUNS HERE, AFTER THE PROC-TABLE BOOTSTRAP, AND THAT IS LOAD-BEARING: before it, the boot context is
+# pid 0 and proc_alloc_slot hands the first slot out as 0 too (the degenerate case the slot-reuse guard
+# exists for), so "per-process isolation" could not be told from "one pid". Here proc 0 is registered and
+# a freshly allocated slot is >= 1.
+# ⚠ The scheduler is live (sched_active = 1) and APs may be scheduling under -smp > 1. The pipe-lifetime
+# checks therefore run with interrupts OFF on this CPU and assert on the SPECIFIC freed addresses (walking
+# the slab free list), never on a global free counter another CPU could move.
+# ⚠ ksyscall from kernel context runs under the boot CR3, where is_user_range takes its documented
+# exemption and proc_copy_from_user (which requires USER pages) refuses — so the SPAWN_F_ARGV positive
+# path is ring 3's to prove; here only the refusals that precede the copy are driven.
+fn spk(s) { kprintln(s, strlen(s)); return 0; }
+fn spk_num(s, n) { kprint(s, strlen(s)); kprint_num(n); kprintln("", 0); return 0; }
+# How many times does `ptr` appear on the slab free list of `size`'s class? 0 = not freed, 1 = freed once,
+# anything more = a DOUBLE FREE (the second push makes the block point at itself; the walk is bounded).
+fn spawnk_fl_count(ptr, size) {
+    var fcls = slab_class_for(size);
+    if (fcls < 0) { return 0 - 1; }
+    heap_spin_lock();
+    var fp = load64(&slab_free + fcls * 8);
+    var fcount = 0;
+    var fsteps = 0;
+    while (fp != 0) {
+        if (fsteps >= 100000) { break; }
+        if (fp == ptr) { fcount = fcount + 1; }
+        fp = load64(fp);
+        fsteps = fsteps + 1;
+    }
+    heap_spin_unlock();
+    return fcount;
+}
+fn spawnk_arms_empty(pid) {
+    if (redir_n_get(pid) != 0) { return 0; }
+    if (endow_arm_get(pid) >= 0) { return 0; }
+    if (endow_stdio_get(pid) != 0) { return 0; }
+    return 1;
+}
+# Arm pid 0 with a redirect (1 <- 2) AND an endowment of `fb` (PTY mode when stdio != 0). -> 1 armed.
+fn spawnk_arm(fb, stdio) {
+    ksyscall(62, 0x200, 0, 0);                         # REDIR_CLEAR first — start from a known set
+    ksyscall_a4_set(0);
+    if (stdio != 0) { ksyscall_a4_set(CH_ENDOW_STDIO); }
+    var af = ksyscall(97, CH_ENDOW, fb, 0);
+    ksyscall_a4_set(0);
+    if (af < 3) { return 0; }
+    if (ksyscall(62, 1, 2, 0) != 0) { return 0; }
+    if (redir_n_get(0) != 1) { return 0; }
+    if (endow_arm_get(0) < 0) { return 0; }
+    return 1;
+}
+# Copy a literal into the user-window scratch so the arm's sc_path_ok sees a real window address.
+fn spawnk_put(dst, s) {
+    var pl = strlen(s);
+    var pi = 0;
+    while (pi < pl) { store8(dst + pi, load8(s + pi)); pi = pi + 1; }
+    return pl;
+}
+# #43 from kernel context with a4 (the env length) zeroed. -> the arm's return value.
+fn spawnk_43(p, a2) {
+    ksyscall_a4_set(0);
+    return ksyscall(43, p, a2, 0);
+}
+# Release a slot proc_alloc_slot handed out and that NEVER RAN, the way the critique requires: state 0,
+# ppid 0, cr3 0x1000 (proc_alloc_slot never writes the CR3 cell, so proc_reap_child would free garbage),
+# then the LIFO collapse under proctab_spin_lock.
+fn spawnk_release(s) {
+    store64(&proc_table + s * 176 + 160, 0x1000);
+    store64(&proc_ppid + s * 8, 0);
+    store64(&proc_table + s * 176 + 8, 0);
+    proctab_spin_lock();
+    if (s == proc_count - 1) { proc_count = proc_count - 1; }
+    proctab_spin_unlock();
+    return 0;
+}
+
+fn spawn_kernel_selftest() {
+    var all = 1;
+    var u = pmm_alloc_2mb();
+    if (u == 0) { spk("spawnk: VOID -- no 2 MB scratch"); return 0; }
+    var line = u + 4096;                                # line / blob staging (sc_path_ok'd user-window VA)
+    var ok = 1;
+
+    # ── (1) elf_load_from_file's codes. The smoke seeds /bin/notelf (200 B of text) + /bin/tiny (10 B).
+    var r = elf_load_from_file("/bin/nonexistent", 16, "/bin/nonexistent", 16);
+    if (r != 0 - SPAWN_E_NOENT) { spk_num("spawnk: FAIL /bin/nonexistent rc=", r); ok = 0; }
+    r = elf_load_from_file("/bin/notelf", 11, "/bin/notelf", 11);
+    if (r != 0 - SPAWN_E_NOEXEC) { spk_num("spawnk: FAIL /bin/notelf rc=", r); ok = 0; }
+    r = elf_load_from_file("/bin/tiny", 9, "/bin/tiny", 9);
+    if (r != 0 - SPAWN_E_NOEXEC) { spk_num("spawnk: FAIL /bin/tiny rc=", r); ok = 0; }
+    r = elf_load_from_file("/bin", 4, "/bin", 4);       # a DIRECTORY: vfs_file_size says -1 -> NOENT
+    if (r != 0 - SPAWN_E_NOENT) { spk_num("spawnk: FAIL /bin (dir) rc=", r); ok = 0; }
+    if (ok == 1) { spk("spawnk: elf codes OK"); } else { all = 0; }
+
+    # ── (2) #43's own refusal codes, and EVERY failure kind clears BOTH arms (redirect + endowment,
+    # PTY flag included). Channels minted as pid 0 in the user-window scratch.
+    ok = 1;
+    if (ksyscall(97, CH_MINT, u, 0) != 0) { spk("spawnk: VOID -- CH_MINT failed"); return 0; }
+    var ca = load64(u);
+    var cb = load64(u + 8);
+    var k = 0;
+    while (k < 200) { store8(line + k, 97); k = k + 1; }                     # 200 x 'a'
+    var codes = 0;
+    var ncase = 0;
+    while (ncase < 11) {
+        var stdio = 0;
+        if (ncase == 3) { stdio = 1; }                                        # one case arms PTY mode
+        if (spawnk_arm(cb, stdio) == 0) { spk_num("spawnk: FAIL could not arm, case ", ncase); ok = 0; }
+        if (stdio == 1) { if (endow_stdio_get(0) != 1) { spk("spawnk: FAIL PTY flag not armed"); ok = 0; } }
+        var want = 0 - SPAWN_E_ARGS;
+        var got = 0;
+        if (ncase == 0) { got = spawnk_43(line, 200); }                      # line > SPAWN_LINE_MAX
+        if (ncase == 1) { got = spawnk_43(line, 0x40000 | 10); }             # unknown flag bit 18
+        if (ncase == 2) { got = spawnk_43(line, 0 - 1); }                    # negative a2
+        if (ncase == 3) { got = spawnk_43(line, SPAWN_F_ARGV | 1); }         # ARGV blob < 2 B
+        if (ncase == 4) { got = spawnk_43(line, SPAWN_F_ARGV | 1025); }      # ARGV blob > SPAWN_ARGV_MAX
+        if (ncase == 5) { got = spawnk_43(0x1000, 8); }                      # path below the user window
+        if (ncase == 6) {                                                     # all-spaces line: empty path
+            store8(line, 32); store8(line + 1, 32); store8(line + 2, 32);
+            got = spawnk_43(line, 3);
+        }
+        if (ncase == 7) {                                                     # 17 tokens in 50 B
+            var tl = spawnk_put(line, "/bin/spawnx a b c d e f g h i j k l m n o p");
+            got = spawnk_43(line, tl);
+        }
+        if (ncase == 8) {
+            var nl = spawnk_put(line, "/bin/nonexistent");
+            want = 0 - SPAWN_E_NOENT;                                          # fails AFTER the CR3 switch
+            got = spawnk_43(line, nl);
+        }
+        if (ncase == 9) {
+            var xl = spawnk_put(line, "/bin/notelf x");
+            want = 0 - SPAWN_E_NOEXEC;
+            got = spawnk_43(line, xl);
+        }
+        if (ncase == 10) {                                                    # CLEANFD + bad env blob -> strict
+            var cl = spawnk_put(line, "/bin/tiny");
+            store8(line + 64, 88); store8(line + 65, 0);                      # "X\0": no '=' -> invalid
+            ksyscall_a4_set(2);
+            got = ksyscall(43, line, SPAWN_F_CLEANFD | cl, line + 64);
+            ksyscall_a4_set(0);
+        }
+        if (got != want) { spk_num("spawnk: FAIL #43 code, case ", ncase); spk_num("spawnk:   got ", got); ok = 0; }
+        if (spawnk_arms_empty(0) == 0) { spk_num("spawnk: FAIL arms survived #43 refusal, case ", ncase); ok = 0; }
+        k = 0;
+        while (k < 200) { store8(line + k, 97); k = k + 1; }             # re-fill: cases 6-10 wrote paths
+        codes = codes + 1;
+        ncase = ncase + 1;
+    }
+    if (ok == 1) { spk("spawnk: #43 refusal codes + arm clear OK"); } else { all = 0; }
+
+    # ── (3) #37: every refusal clears the caller's arms (none did before 1.57.6), incl. D9's 17 tokens.
+    ok = 1;
+    var c37 = 0;
+    while (c37 < 3) {
+        if (spawnk_arm(cb, 0) == 0) { spk("spawnk: FAIL could not arm for #37"); ok = 0; }
+        var g37 = 0;
+        if (c37 == 0) { ksyscall_a4_set(0); g37 = ksyscall(37, line, 200, 0); }
+        if (c37 == 1) { ksyscall_a4_set(0); g37 = ksyscall(37, 0x1000, 8, 0); }
+        if (c37 == 2) {
+            var t37 = spawnk_put(line, "/bin/spawnx a b c d e f g h i j k l m n o p");
+            ksyscall_a4_set(0);
+            g37 = ksyscall(37, line, t37, 0);
+        }
+        if (g37 != 0 - 1) { spk_num("spawnk: FAIL #37 refusal rc=", g37); ok = 0; }
+        if (spawnk_arms_empty(0) == 0) { spk_num("spawnk: FAIL arms survived #37 refusal, case ", c37); ok = 0; }
+        c37 = c37 + 1;
+    }
+    if (ok == 1) { spk("spawnk: #37 refusal clears arms OK"); } else { all = 0; }
+
+    # ── (4) #62 ops: replace / ADD (append, re-point by src, cap 4) / CLEAR / refusals.
+    ok = 1;
+    if (ksyscall(62, 1, 5, 0) != 0) { ok = 0; }
+    if (ksyscall(62, 0x100 | 2, 1, 0) != 0) { ok = 0; }
+    if (redir_n_get(0) != 2) { ok = 0; }
+    if (ksyscall(62, 0x100 | 2, 6, 0) != 0) { ok = 0; }                      # re-point src 2
+    if (redir_n_get(0) != 2) { ok = 0; }
+    if (redir_dst_get(0, 1) != 6) { ok = 0; }
+    if (ksyscall(62, 0x100 | 3, 7, 0) != 0) { ok = 0; }
+    if (ksyscall(62, 0x100 | 4, 7, 0) != 0) { ok = 0; }
+    if (ksyscall(62, 0x100 | 8, 7, 0) != 0 - 1) { ok = 0; }                  # a 5th pair: full
+    if (redir_n_get(0) != 4) { ok = 0; }
+    if (ksyscall(62, 0x300, 0, 0) != 0 - 1) { ok = 0; }                      # op 3
+    if (ksyscall(62, 0x201, 0, 0) != 0 - 1) { ok = 0; }                      # CLEAR with src bits
+    if (ksyscall(62, 32, 1, 0) != 0 - 1) { ok = 0; }
+    if (ksyscall(62, 1, 32, 0) != 0 - 1) { ok = 0; }
+    if (ksyscall(62, 0 - 1, 1, 0) != 0 - 1) { ok = 0; }
+    if (ksyscall(62, 0x100 | 40, 1, 0) != 0 - 1) { ok = 0; }
+    if (redir_n_get(0) != 4) { ok = 0; }                                      # refusals left the set alone
+    if (ksyscall(62, 1, 9, 0) != 0) { ok = 0; }                              # op 0 REPLACES the whole set
+    if (redir_n_get(0) != 1) { ok = 0; }
+    if (ksyscall(62, 0x200, 0, 0) != 0) { ok = 0; }
+    if (redir_n_get(0) != 0) { ok = 0; }
+    if (ok == 1) { spk("spawnk: #62 ops OK"); } else { spk("spawnk: FAIL #62 ops"); all = 0; }
+
+    # ── (5) endowment <-> redirect collisions, CH_ENDOW(-1), CH_CLOSE of the armed end.
+    ok = 1;
+    ksyscall_a4_set(0);
+    var ef = ksyscall(97, CH_ENDOW, cb, 0);
+    if (ef < 3) { spk_num("spawnk: FAIL CH_ENDOW rc=", ef); ok = 0; }
+    if (ksyscall(62, 0x100 | ef, 1, 0) != 0 - 1) { spk("spawnk: FAIL ADD onto the endowed fd accepted"); ok = 0; }
+    else { spk("spawnk: redirect onto endowed fd refused OK"); }
+    if (ksyscall(97, CH_ENDOW, 0 - 1, 0) != 0) { ok = 0; }
+    if (endow_arm_get(0) >= 0) { spk("spawnk: FAIL CH_ENDOW(-1) left the arm"); ok = 0; }
+    else { spk("spawnk: CH_ENDOW(-1) disarms OK"); }
+    # the stale endow_fd must not refuse a now-legitimate ADD (critique)
+    if (ksyscall(62, 0x100 | ef, 1, 0) != 0) { spk("spawnk: FAIL stale endow fd refused an ADD"); ok = 0; }
+    # ...and CH_ENDOW must not pick an fd that is an armed redirect SRC
+    var ef2 = ksyscall(97, CH_ENDOW, cb, 0);
+    if (ef2 == ef) { spk("spawnk: FAIL CH_ENDOW picked an armed redirect src"); ok = 0; }
+    if (ef2 < 3) { ok = 0; }
+    ksyscall(62, 0x200, 0, 0);
+    if (ksyscall(97, CH_CLOSE, cb, 0) != 0) { spk("spawnk: FAIL CH_CLOSE"); ok = 0; }
+    if (endow_arm_get(0) >= 0) { spk("spawnk: FAIL CH_CLOSE of the armed end left the arm"); ok = 0; }
+    else { spk("spawnk: CH_CLOSE of the armed end disarms OK"); }
+    ksyscall(97, CH_CLOSE, ca, 0);
+    if (ok == 0) { all = 0; }
+
+    # ── (6) placement RE-CHECKS owner + channel epoch (the "P arms e, e is re-minted to Q" theft).
+    ok = 1;
+    var t15 = 0;
+    if (proc_count > 15) { spk("spawnk: VOID -- slot 15 in use"); ok = 0; }
+    if (proc_fd_base_get(15) != 0) { spk("spawnk: VOID -- slot 15 has a table"); ok = 0; }
+    if (ok == 1) {
+        if (ksyscall(97, CH_MINT, u, 0) != 0) { spk("spawnk: FAIL CH_MINT 2"); ok = 0; }
+        var pa = load64(u);
+        var pb = load64(u + 8);
+        var pe = kpayload(vfs_fd_table() + pb * 32, 0);
+        vfs_fd_inherit(15, 0);
+        t15 = proc_fd_base_get(15);
+        ksyscall_a4_set(0);                             # a4 == CH_ENDOW_STDIO would arm PTY mode
+        # (a) owner changed under the arm
+        var pf = ksyscall(97, CH_ENDOW, pb, 0);
+        store64(&chan_end_owner + pe * 8, 7);
+        if (chan_place_into_child(15) != 0 - 1) { spk("spawnk: FAIL placed a stolen endpoint"); ok = 0; }
+        if (load64(&chan_end_owner + pe * 8) != 7) { ok = 0; }
+        store64(&chan_end_owner + pe * 8, 0);
+        # (b) channel re-minted under the arm
+        pf = ksyscall(97, CH_ENDOW, pb, 0);
+        var ep0 = load64(&chan_epoch + (pe >> 1) * 8);
+        store64(&chan_epoch + (pe >> 1) * 8, ep0 + 1000);
+        if (chan_place_into_child(15) != 0 - 1) { spk("spawnk: FAIL placed a re-minted channel"); ok = 0; }
+        store64(&chan_epoch + (pe >> 1) * 8, ep0);
+        # (c) the honest case still places, and records the placement for the fd shaping
+        pf = ksyscall(97, CH_ENDOW, pb, 0);
+        if (chan_place_into_child(15) != pf) { spk("spawnk: FAIL honest placement refused"); ok = 0; }
+        if (load64(&chan_end_owner + pe * 8) != 15) { ok = 0; }
+        if (endow_placed_get(0) != pf + 1) { spk("spawnk: FAIL placement not recorded"); ok = 0; }
+        if (ktag(t15 + pf * 32) != VFS_CHAN) { ok = 0; }
+        # give the endpoint back to pid 0 (current incarnation) so it can be closed normally
+        store64(&chan_end_owner + pe * 8, 0);
+        store64(&chan_end_oepoch + pe * 8, proc_epoch_get(0));
+        ktag_clear(t15 + pf * 32, 32);
+        proc_destroy_fd_table(15, 0);
+        ksyscall(97, CH_CLOSE, pb, 0);
+        ksyscall(97, CH_CLOSE, pa, 0);
+        endow_placed_set(0, 0);
+    }
+    if (ok == 1) { spk("spawnk: placement re-checks owner + epoch OK"); } else { all = 0; }
+
+    # ── (7) CLEANFD shaping: refused on the global table; on a private table the child keeps exactly
+    # 0/1/2 (after redirects), the armed redirect srcs and nothing else — and the PARENT's entries are
+    # untouched (a raw scrub, never vfs_close).
+    ok = 1;
+    ksyscall(62, 1, 2, 0);
+    if (spawn_fd_shape(0, 0, 1) != 0 - 1) { ok = 0; }
+    if (redir_n_get(0) != 0) { ok = 0; }
+    if (ok == 1) { spk("spawnk: clean shape refused on global table OK"); } else { spk("spawnk: FAIL clean shape on global table"); all = 0; }
+    ok = 1;
+    if (vfs_create_pipe(u + 64) != 0) { spk("spawnk: VOID -- pipe"); ok = 0; }
+    if (vfs_create_pipe(u + 80) != 0) { spk("spawnk: VOID -- pipe 2"); ok = 0; }
+    if (ok == 1) {
+        var qr = load64(u + 64);
+        var qw = load64(u + 72);
+        var xr = load64(u + 80);
+        var xw = load64(u + 88);
+        var gtab = vfs_fd_table();
+        vfs_fd_inherit(15, 0);
+        var ct = proc_fd_base_get(15);
+        ksyscall(62, 1, qw, 0);                         # 1 <- qw
+        ksyscall(62, 0x100 | 2, 1, 0);                  # 2 <- 1   (2>&1)
+        ksyscall(62, 0x100 | 9, xw, 0);                 # 9 <- xw  (an explicitly passed fd)
+        if (spawn_fd_shape(15, 0, 1) != 0) { ok = 0; }
+        var kk = 0;
+        while (kk < 32) {
+            if (load64(ct + 1 * 32 + kk) != load64(gtab + qw * 32 + kk)) { ok = 0; }
+            if (load64(ct + 2 * 32 + kk) != load64(gtab + qw * 32 + kk)) { ok = 0; }
+            if (load64(ct + 9 * 32 + kk) != load64(gtab + xw * 32 + kk)) { ok = 0; }
+            kk = kk + 8;
+        }
+        var sf = 3;
+        while (sf < 32) {
+            if (sf != 9) { if (ktag(ct + sf * 32) != VFS_FREE) { spk_num("spawnk: FAIL CLEANFD kept fd ", sf); ok = 0; } }
+            sf = sf + 1;
+        }
+        if (ktag(gtab + qr * 32) != VFS_PIPE) { ok = 0; }   # the parent still holds all four ends
+        if (ktag(gtab + qw * 32) != VFS_PIPE) { ok = 0; }
+        if (ktag(gtab + xr * 32) != VFS_PIPE) { ok = 0; }
+        if (ktag(gtab + xw * 32) != VFS_PIPE) { ok = 0; }
+        if (redir_n_get(0) != 0) { ok = 0; }
+        proc_destroy_fd_table(15, 0);
+        # placed-endowment skip: pretend the endowment landed on fd 3, then an op-0 REPLACE onto 3
+        vfs_fd_inherit(15, 0);
+        ct = proc_fd_base_get(15);
+        var before3 = load64(ct + 3 * 32);
+        var before3b = load64(ct + 3 * 32 + 8);
+        endow_placed_set(0, 3 + 1);
+        ksyscall(62, 3, qw, 0);
+        spawn_fd_shape(15, 0, 0);
+        if (load64(ct + 3 * 32) != before3) { spk("spawnk: FAIL redirect overwrote the placed endowment fd"); ok = 0; }
+        if (load64(ct + 3 * 32 + 8) != before3b) { ok = 0; }
+        endow_placed_set(0, 0);
+        proc_destroy_fd_table(15, 0);
+        vfs_close(qr); vfs_close(qw); vfs_close(xr); vfs_close(xw);
+    }
+    if (ok == 1) { spk("spawnk: clean shape + 2>&1 + fd pass + endowed-fd skip OK"); } else { all = 0; }
+
+    # ── (8) the argv blob validator and the line-token counter.
+    ok = 1;
+    spawnk_put(line, "a_bXc__");                        # 'a' NUL 'b' ' ' 'c' NUL NUL — built below
+    store8(line + 1, 0); store8(line + 3, 32); store8(line + 5, 0); store8(line + 6, 0);
+    if (sc_argv_blob_ok(line, 7) != 1) { spk("spawnk: FAIL argv: 3 entries (one empty) rejected"); ok = 0; }
+    var e16 = 0;
+    while (e16 < 32) { store8(line + e16, 120); store8(line + e16 + 1, 0); e16 = e16 + 2; }   # 16 x "x\0"
+    if (sc_argv_blob_ok(line, 32) != 1) { spk("spawnk: FAIL argv: 16 entries rejected"); ok = 0; }
+    store8(line + 32, 120); store8(line + 33, 0);                                           # 17th
+    if (sc_argv_blob_ok(line, 34) != 0) { spk("spawnk: FAIL argv: 17 entries accepted"); ok = 0; }
+    if (sc_argv_blob_ok(line, 33) != 0) { spk("spawnk: FAIL argv: no trailing NUL accepted"); ok = 0; }
+    store8(line, 0);
+    if (sc_argv_blob_ok(line, 4) != 0) { spk("spawnk: FAIL argv: empty argv[0] accepted"); ok = 0; }
+    var e255 = 0;
+    while (e255 < 255) { store8(line + e255, 112); e255 = e255 + 1; }
+    store8(line + 255, 0);
+    if (sc_argv_blob_ok(line, 256) != 255) { spk("spawnk: FAIL argv: 255 B argv[0] rejected"); ok = 0; }
+    store8(line + 255, 112); store8(line + 256, 0);
+    if (sc_argv_blob_ok(line, 257) != 0) { spk("spawnk: FAIL argv: 256 B argv[0] accepted"); ok = 0; }
+    store8(line + 1024, 0);
+    if (sc_argv_blob_ok(line, 1025) != 0) { spk("spawnk: FAIL argv: 1025 B accepted"); ok = 0; }
+    if (sc_argv_blob_ok(line, 1) != 0) { ok = 0; }
+    var tk = spawnk_put(line, "  a   b  ");
+    if (spawn_line_tokens(line, tk) != 2) { ok = 0; }
+    if (spawn_line_tokens(line, 0) != 0) { ok = 0; }
+    tk = spawnk_put(line, "/bin/x a b c d e f g h i j k l m n o");
+    if (spawn_line_tokens(line, tk) != 16) { spk("spawnk: FAIL 16-token line miscounted"); ok = 0; }
+    tk = spawnk_put(line, "/bin/x a b c d e f g h i j k l m n o p");
+    if (spawn_line_tokens(line, tk) != 17) { spk("spawnk: FAIL 17-token line miscounted"); ok = 0; }
+    if (ok == 1) { spk("spawnk: argv blob validator OK"); } else { all = 0; }
+
+    # ── (9) PER-PROCESS isolation, and the slot-recycle reset.
+    ok = 1;
+    ksyscall(62, 1, 2, 0);                              # pid 0 armed
+    if (redir_n_get(5) != 0) { ok = 0; }
+    # asm contract: `cli` — no inputs, no outputs, clobbers only RFLAGS.IF. No tick on this CPU while the
+    # hand-allocated slots below exist (they never run); the matching `sti` restores IF=1.
+    asm { cli; }
+    var s1 = proc_alloc_slot();
+    if (s1 < 1) { ok = 0; }
+    if (s1 >= 1) {
+        redir_arm_replace(s1, 1, 2);
+        endow_arm_set(s1, 3);
+        endow_placed_set(s1, 4);
+        if (redir_n_get(0) != 1) { ok = 0; }            # a different pid's arm is untouched
+        spawnk_release(s1);
+        var s2 = proc_alloc_slot();
+        if (s2 != s1) { spk_num("spawnk: VOID -- slot not reused, got ", s2); ok = 0; }
+        if (spawnk_arms_empty(s2) == 0) { spk("spawnk: FAIL recycled slot inherited arms"); ok = 0; }
+        if (endow_placed_get(s2) != 0) { ok = 0; }
+        if (redir_n_get(0) != 1) { ok = 0; }
+        spawnk_release(s2);
+    }
+    asm { sti; }                                        # asm contract: `sti` — no inputs/outputs, sets RFLAGS.IF
+    if (ok == 1) { spk("spawnk: per-process arms isolated + reset on slot reuse OK"); } else { all = 0; }
+    # The degenerate case the guard exists for: the CALLER is handed its own (dead) slot — the boot
+    # context before the bootstrap. Its arms must survive until its placement consumes them.
+    ok = 1;
+    asm { cli; }                                        # contract as above: IF only — current is rewritten below
+    var s3 = proc_alloc_slot();
+    if (s3 >= 1) {
+        spawnk_release(s3);
+        proc_current_set(s3);
+        redir_arm_replace(s3, 1, 2);
+        var s4 = proc_alloc_slot();
+        proc_current_set(0);
+        if (s4 != s3) { spk_num("spawnk: VOID -- degenerate slot not reused, got ", s4); ok = 0; }
+        if (redir_n_get(s3) != 1) { spk("spawnk: FAIL the caller's own slot lost its arms"); ok = 0; }
+        redir_clear(s3);
+        spawnk_release(s4);
+    }
+    if (s3 < 1) { ok = 0; }
+    asm { sti; }                                        # asm contract: `sti` — no inputs/outputs, sets RFLAGS.IF
+    ksyscall(62, 0x200, 0, 0);
+    if (ok == 1) { spk("spawnk: caller's own slot keeps its arms OK"); } else { all = 0; }
+
+    # ── (10) PIPE LIFETIME: the last reference anywhere frees the buffer, exactly once.
+    ok = 1;
+    if (proc_count > 15) { ok = 0; }
+    if (proc_fd_base_get(15) != 0) { ok = 0; }
+    if (ok == 0) { spk("spawnk: VOID -- slot 15 busy for the pipe checks"); }
+    if (ok == 1) {
+        # asm contract: `cli` — no inputs/outputs, clears RFLAGS.IF: no ISR and no preemption on this CPU
+        # can allocate or free between a close and the free-list probe that follows it.
+        asm { cli; }
+        vfs_create_pipe(u + 96);
+        var lr = load64(u + 96);
+        var lw = load64(u + 104);
+        var lpb = kpayload(vfs_fd_table() + lr * 32, 2);
+        vfs_fd_inherit(15, 0);                          # "a child" holding copies of both ends
+        var ltab = proc_fd_base_get(15);
+        vfs_close(lr);
+        vfs_close(lw);                                  # the OWNER's last close — the 1.47.x free point
+        if (spawnk_fl_count(lpb, 4096) != 0) { spk("spawnk: FAIL pipe buffer freed while a child still held it"); ok = 0; }
+        proc_destroy_fd_table(15, 0);                   # the child's table goes: last reference
+        if (spawnk_fl_count(lpb, 4096) != 1) { spk_num("spawnk: FAIL pipe buffer free count ", spawnk_fl_count(lpb, 4096)); ok = 0; }
+        if (spawnk_fl_count(ltab, 1024) != 1) { spk("spawnk: FAIL child table not freed exactly once"); ok = 0; }
+        if (ok == 1) { spk("spawnk: pipe outlives owner close OK"); }
+        # the other order: the child's table first, then the owner's two closes
+        vfs_create_pipe(u + 96);
+        lr = load64(u + 96);
+        lw = load64(u + 104);
+        lpb = kpayload(vfs_fd_table() + lr * 32, 2);
+        vfs_fd_inherit(15, 0);
+        proc_destroy_fd_table(15, 0);
+        if (spawnk_fl_count(lpb, 4096) != 0) { spk("spawnk: FAIL child reap freed a buffer the owner holds"); ok = 0; }
+        vfs_close(lr);
+        if (spawnk_fl_count(lpb, 4096) != 0) { ok = 0; }
+        vfs_close(lw);
+        if (spawnk_fl_count(lpb, 4096) != 1) { spk("spawnk: FAIL last close did not free exactly once"); ok = 0; }
+        # vfs_create_pipe's wfd-failure path: rfd is the only reference, vfs_close(rfd) frees it — the
+        # explicit free that followed was a DOUBLE free. Fill the table to exactly one free fd.
+        var gt = vfs_fd_table();
+        var nfree = 0;
+        var fz = 1;
+        while (fz < 32) { if (ktag(gt + fz * 32) == VFS_FREE) { nfree = nfree + 1; } fz = fz + 1; }
+        var filled = 0;
+        while (nfree > 1) {
+            var mf = vfs_create_memfile(u, 1);
+            if (mf < 0) { nfree = 0; }
+            if (mf >= 0) { store64(u + 256 + filled * 8, mf); filled = filled + 1; nfree = nfree - 1; }
+        }
+        if (nfree == 1) {
+            var hf0 = heap_frees;
+            var cr = vfs_create_pipe(u + 96);
+            var fcls = slab_class_for(4096);
+            var fhead = load64(&slab_free + fcls * 8);
+            if (cr != 0 - 1) { spk("spawnk: FAIL pipe create with one free fd succeeded"); ok = 0; }
+            if (heap_frees != hf0 + 1) { spk_num("spawnk: FAIL create-failure frees ", heap_frees - hf0); ok = 0; }
+            if (spawnk_fl_count(fhead, 4096) != 1) { spk("spawnk: FAIL create-failure double free"); ok = 0; }
+        }
+        if (nfree != 1) { spk("spawnk: VOID -- could not fill the fd table to one slot"); ok = 0; }
+        while (filled > 0) { filled = filled - 1; vfs_close(load64(u + 256 + filled * 8)); }
+        asm { sti; }                                    # asm contract: `sti` — no inputs/outputs, sets RFLAGS.IF
+    }
+    if (ok == 1) { spk("spawnk: pipe freed by its last reference, exactly once OK"); } else { all = 0; }
+
+    # ── (11) #37's restore DROPS a child-made sole pipe reference through pipe_buf_put, exactly once.
+    # The #37 child owns its redirected slot while it runs; if it closes that fd and a pipe of its own
+    # lands there, the restore's overwrite removes that pipe's last reference. Emulated on slot 15: apply
+    # (1 <- a creator pipe), then the slot is made to name a fresh buffer nothing else references.
+    # ⚠ The SMP half of this — the slot overwrite and the scan share ONE fs_lock hold, so a concurrent last
+    # close on another CPU cannot also free the buffer — is not something a single-CPU block can race; it is
+    # argued at exec_redirect_restore and at the lifetime banner in vfs.cyr. This checks the drop itself.
+    ok = 1;
+    if (proc_count > 15) { ok = 0; }
+    if (proc_fd_base_get(15) != 0) { ok = 0; }
+    if (ok == 0) { spk("spawnk: VOID -- slot 15 busy for the #37 restore check"); }
+    if (ok == 1) {
+        # asm contract: `cli` — no inputs/outputs, clears RFLAGS.IF: nothing on this CPU allocates or frees
+        # between the restore and the free-list probes that follow it.
+        asm { cli; }
+        vfs_create_pipe(u + 128);
+        var ar = load64(u + 128);
+        var aw = load64(u + 136);
+        var abuf = kpayload(vfs_fd_table() + ar * 32, 2);
+        vfs_fd_inherit(15, 0);
+        var rtab = proc_fd_base_get(15);
+        var rw0 = load64(rtab + 32);                    # the child's ORIGINAL fd 1 (the console device)
+        var rw1 = load64(rtab + 40);
+        var rw2 = load64(rtab + 48);
+        var rw3 = load64(rtab + 56);
+        ksyscall(62, 1, aw, 0);                         # 1 <- aw
+        exec_redirect_apply(0, 15);
+        if (ktag(rtab + 32) != VFS_PIPE) { ok = 0; }
+        if (kpayload(rtab + 32, 2) != abuf) { spk("spawnk: FAIL #37 apply did not repoint fd 1"); ok = 0; }
+        var bbuf = kmalloc(4096);
+        if (bbuf == 0) { spk("spawnk: VOID -- kmalloc(4096)"); ok = 0; }
+        # the child "closed fd 1 and its own pipe landed there" — a raw overwrite drops only a duplicate of
+        # the creator's aw, which the creator still holds
+        ktag_clear(rtab + 32, 32);
+        ktag_set(rtab + 32, VFS_PIPE);
+        kpayload_set(rtab + 32, 1, 1);
+        kpayload_set(rtab + 32, 2, bbuf);
+        exec_redirect_restore(0, 15);
+        if (spawnk_fl_count(bbuf, 4096) != 1) { spk_num("spawnk: FAIL #37 restore freed the child's sole pipe this many times: ", spawnk_fl_count(bbuf, 4096)); ok = 0; }
+        if (spawnk_fl_count(abuf, 4096) != 0) { spk("spawnk: FAIL #37 restore freed the creator's pipe"); ok = 0; }
+        if (load64(rtab + 32) != rw0) { ok = 0; }
+        if (load64(rtab + 40) != rw1) { ok = 0; }
+        if (load64(rtab + 48) != rw2) { ok = 0; }
+        if (load64(rtab + 56) != rw3) { spk("spawnk: FAIL #37 restore did not put fd 1 back"); ok = 0; }
+        if (redir_n_get(0) != 0) { spk("spawnk: FAIL #37 restore left the redirect set armed"); ok = 0; }
+        var rb = 0;
+        while (rb < 16) {
+            if (ktag(&pcpu_redir_backup + rb * 32) != VFS_FREE) { spk("spawnk: FAIL #37 restore left a backup"); ok = 0; }
+            rb = rb + 1;
+        }
+        proc_destroy_fd_table(15, 0);
+        vfs_close(ar);
+        vfs_close(aw);
+        if (spawnk_fl_count(abuf, 4096) != 1) { spk("spawnk: FAIL the creator's pipe was not freed exactly once"); ok = 0; }
+        asm { sti; }                                    # asm contract: `sti` — no inputs/outputs, sets RFLAGS.IF
+    }
+    if (ok == 1) { spk("spawnk: #37 restore drops a child-made sole pipe exactly once OK"); } else { all = 0; }
+
+    # ── (12) an ORPHAN ZOMBIE's fd table is destroyed when its slot is handed out again, not leaked.
+    # proc_alloc_slot reuses such a slot without touching its table; vfs_fd_inherit must sweep it (and the
+    # pipe buffers only it still names) before giving the slot a fresh copy. Slot 15 plays the orphan.
+    ok = 1;
+    if (proc_count > 15) { ok = 0; }
+    if (proc_fd_base_get(15) != 0) { ok = 0; }
+    if (ok == 0) { spk("spawnk: VOID -- slot 15 busy for the orphan-table check"); }
+    if (ok == 1) {
+        # asm contract: `cli` — no inputs/outputs, clears RFLAGS.IF (boot A is -smp 1, so with IF=0 nothing
+        # else can move heap_frees between the two reads below).
+        asm { cli; }
+        vfs_create_pipe(u + 144);
+        var zr = load64(u + 144);
+        var zw = load64(u + 152);
+        var zbuf = kpayload(vfs_fd_table() + zr * 32, 2);
+        vfs_fd_inherit(15, 0);                          # the orphan's table: copies of both ends
+        vfs_close(zr);
+        vfs_close(zw);                                  # now the orphan's table is the ONLY holder
+        if (spawnk_fl_count(zbuf, 4096) != 0) { spk("spawnk: FAIL pipe freed while the orphan's table named it"); ok = 0; }
+        var zf0 = heap_frees;
+        vfs_fd_inherit(15, 0);                          # slot 15 handed to a new child
+        # ⚠ The table's own free is counted, not probed: kmalloc(1024) right after the destroy pops that
+        # very block back off the free list for the new table (LIFO), so its free-list count reads 0.
+        if (heap_frees != zf0 + 2) { spk_num("spawnk: FAIL orphan table reuse freed ", heap_frees - zf0); ok = 0; }
+        if (spawnk_fl_count(zbuf, 4096) != 1) { spk("spawnk: FAIL the orphan's sole pipe leaked (or double-freed)"); ok = 0; }
+        if (proc_fd_base_get(15) == 0) { spk("spawnk: FAIL no fresh table after the orphan's"); ok = 0; }
+        proc_destroy_fd_table(15, 0);
+        asm { sti; }                                    # asm contract: `sti` — no inputs/outputs, sets RFLAGS.IF
+    }
+    if (ok == 1) { spk("spawnk: orphan zombie's fd table + sole pipe released on slot reuse OK"); } else { all = 0; }
+
+    # ── (13) #43 step (f): a CLEANFD child on the global-table fallback is TORN DOWN (-SPAWN_E_NOMEM), a
+    # legacy one is not. vfs_fd_inherit's kmalloc failure is what produces the fallback in the field; the
+    # allocator has no fault injection, so a really-loaded child's table is destroyed to force it.
+    ok = 1;
+    ksyscall(97, CH_ENDOW, 0 - 1, 0);
+    var tc = elf_load_from_file("/bin/spawnx", 11, "/bin/spawnx", 11);
+    if (tc < 1) { spk_num("spawnk: VOID -- could not load /bin/spawnx for the teardown check, rc=", tc); ok = 0; }
+    if (tc >= 1) {
+        var tcr3 = load64(&proc_table + tc * 176 + 160);
+        var tpc = proc_count;
+        if (tcr3 == 0x1000) { spk("spawnk: VOID -- loaded child has no address space"); ok = 0; }
+        proc_destroy_fd_table(tc, 0);                   # the fallback: proc_fd_base == 0 -> the global table
+        ksyscall(62, 1, 2, 0);                          # an armed redirect the refusal must clear too
+        var tr = spawn_shape_or_teardown(tc, 0, 1);
+        if (tr != 0 - SPAWN_E_NOMEM) { spk_num("spawnk: FAIL CLEANFD teardown rc=", tr); ok = 0; }
+        if (load64(&proc_table + tc * 176 + 8) != 0) { spk("spawnk: FAIL torn-down child is not dead"); ok = 0; }
+        if (load64(&proc_table + tc * 176 + 160) != 0x1000) { spk("spawnk: FAIL torn-down child kept its address space"); ok = 0; }
+        if (load64(&proc_ppid + tc * 8) != 0) { ok = 0; }
+        if (tc == tpc - 1) { if (proc_count != tpc - 1) { spk("spawnk: FAIL torn-down top slot not collapsed"); ok = 0; } }
+        if (redir_n_get(0) != 0) { spk("spawnk: FAIL CLEANFD refusal left the redirect armed"); ok = 0; }
+        # the legacy form on the same fallback runs unredirected: shaped "successfully", NOT torn down
+        var lc = elf_load_from_file("/bin/spawnx", 11, "/bin/spawnx", 11);
+        if (lc < 1) { spk("spawnk: VOID -- second load"); ok = 0; }
+        if (lc >= 1) {
+            proc_destroy_fd_table(lc, 0);
+            if (spawn_shape_or_teardown(lc, 0, 0) != 0) { spk("spawnk: FAIL legacy child on the global table refused"); ok = 0; }
+            if (load64(&proc_table + lc * 176 + 8) != 3) { spk("spawnk: FAIL legacy child was torn down"); ok = 0; }
+            proc_reap_child(lc);
+        }
+    }
+    if (ok == 1) { spk("spawnk: CLEANFD child on the global table torn down (-3), legacy kept OK"); } else { all = 0; }
+
+    ksyscall(62, 0x200, 0, 0);
+    ksyscall(97, CH_ENDOW, 0 - 1, 0);
+    pmm_free_2mb(u);
+    if (all == 1) { spk("spawnk: ALL PASS"); } else { spk("spawnk: FAIL"); }
+    spk("spawnk: done");
+    return 0;
+}
+spawn_kernel_selftest();
+#endif

@@ -23,6 +23,7 @@
 # stale read is benign (the key is seen on the next poll).
 var input_lock = 0;
 fn input_spin_lock() {
+    preempt_disable();                                  # 1.57.6 (S3.2): a held plain spinlock is NON-PREEMPTIBLE (see smp.cyr's lock banner)
     var old = 1;
     while (old == 1) {
         var addr = &input_lock;
@@ -42,6 +43,7 @@ fn input_spin_unlock() {
         0x48; 0x31; 0xC9;              # xor rcx, rcx
         0x48; 0x87; 0x08;              # xchg [rax], rcx
     }
+    preempt_enable();                                   # 1.57.6 (S3.2): pairs the preempt_disable in the lock
     return 0;
 }
 # IRQ-save/restore (sole-local frame shape, like pmm_spin_unlock's addr). kbd_irq_save

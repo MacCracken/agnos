@@ -1,5 +1,6 @@
 # 2026-09-23 — `flock`#59 never waits, and nothing above it spins: contended locks proceed unlocked
 
+**Status:** 🟡 **OPEN** — fixed by step **S3c** (Path 2 bite S3.5: a contended `flock`#59 without `LOCK_NB` blocks in-kernel; `LOCK_NB` keeps -1; new -2 = lock table full; a blocking conversion drops the caller's old lock first). In 1.57.6 `#59` is still non-blocking only. The Path 2 foundation this step builds on — per-process syscall kernel stacks, the deferred `on_cpu` release, preempt-disabling spinlocks, region-7 guard pages (bites S3.1–S3.3) — landed in **1.57.6**; see `docs/development/planning/blocking-syscall-concurrency.md` § Path 2 plan and the roadmap's 1.57.x table.
 **Filed by:** patra (the sovereign database), during its 1.15.0 cut. patra takes a whole-file
 `flock` around every statement: `LOCK_EX` for writes, `LOCK_SH` for reads.
 **Checked against:** agnos **1.57.5**: the `#59` arm in `kernel/core/syscall.cyr` (at line 10950)

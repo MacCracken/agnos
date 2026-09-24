@@ -1,5 +1,6 @@
 # 2026-09-23 — no per-process resource limits: a parent cannot cap a child's memory or CPU time
 
+**Status:** 🟡 **OPEN** — fixed by step **S8** (a new `spawn_limits`#107 — specced, not minted — arms a per-child memory cap (mmap and both loaders refuse) and CPU cap (SIGXCPU death, wait status 280), consumed by the caller's next #3/#37/#43). Needs S7's death chain. Not in 1.57.6. The Path 2 foundation this step builds on — per-process syscall kernel stacks, the deferred `on_cpu` release, preempt-disabling spinlocks, region-7 guard pages (bites S3.1–S3.3) — landed in **1.57.6**; see `docs/development/planning/blocking-syscall-concurrency.md` § Path 2 plan and the roadmap's 1.57.x table.
 **Filed by:** daimon (the AGNOS agent orchestrator). Every agent it starts runs under a memory cap and
 a CPU-time cap. This is daimon's VULN-010 fix; the defaults are 1 GiB and 1 hour.
 **Checked against:** agnos **1.57.5**, `kernel/`, read in the working tree.

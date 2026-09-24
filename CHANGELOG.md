@@ -20,6 +20,194 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.6] — 2026-09-24 — per-process kernel stacks (Path 2, bites S3.1–S3.3), a `spawn_path` that says why, and a clock a throttled host cannot stop
+
+Three of the nine steps planned for the 1.57.x line: S1 (`uptime_us`#95 on the ACPI PM timer), S2 (`spawn_path`#43 flags, codes and per-process arms), and Path 2 bites S3.1–S3.3. The other steps are roadmap § 1.57.x. **Built, gated, NOT burned.**
+
+### Breaking — `spawn_path`#43 / `execwait`#37 (migration inline)
+
+- **A line with more than 16 tokens is REFUSED**: `#43` returns −6 (`SPAWN_E_ARGS`), `#37` returns −1.
+  Through 1.57.5 the 17th and later tokens were silently dropped and the child ran. Counted in each arm
+  before any per-CPU loader cell is set. *Migration:* split the line, or use `SPAWN_F_ARGV` (below), which
+  refuses more than 16 entries the same way. agnoshi's `run_agnos.cyr` comment "#37 has no such cap" is now
+  wrong.
+- **`#43` failures are no longer all −1** — it returns a negated `SPAWN_E_*` code (Added, below); `#37` folds
+  every code to −1. *Migration:* none for a caller that tests `pid < 0` (every consumer surveyed: daimon,
+  agnoshi, aethersafha, crab, puka, mishran, mirshi, `tests/chan`); a failed pid passed to `waitpid`#4 lands
+  in the same wait-any arm for −2..−6 as for −1.
+- **Spawn arms are per-PROCESS, not per-CPU.** The `exec_redirect`#62 pairs and the `CH_ENDOW`#97 endowment
+  are armed by, and consumed only by, the arming process's next child creation. **Every `#43` and `#37`
+  return clears the caller's whole arm state, success or refusal**; `spawn`#3 consumes the endowment and
+  clears it on every return, and never consumes `#62` pairs; `CH_CLOSE` of the armed endpoint disarms it;
+  placement re-checks the owner and `chan_epoch`; recycled slots and `fork`#96 children start with none.
+  *Migration:* none for a process that arms and spawns itself (every in-tree consumer). An arm set by one
+  process and consumed by another on the same CPU no longer crosses (the 1.57.5 control:
+  `SPAWNX-ARM-CROSSED-PROCESSES`).
+- **Flagged `#43` forms refuse a bad env blob (−6).** The unflagged line form keeps its default-env fallback
+  (2-arg callers leave garbage in a3/a4). *Migration:* a caller that wants env errors reported must use a
+  flagged form.
+
+### Added — `spawn_path`#43 flags and codes, `#62` ops, `CH_ENDOW` disarm (ABI §4.8)
+
+- **a2 = len | flags** (every a2 ≥ 65536 returned −1 before, so no working call changes meaning):
+  - `SPAWN_F_ARGV` = **`0x10000`** — a1 is `argv0\0argv1\0…argvN\0`, 2..1024 B (`SPAWN_ARGV_MAX`), 1..16
+    entries (`SPAWN_ARGC_MAX`); argv[0] (1..255 B) is the path opened; entries may contain spaces or be
+    empty; copied with the fault-proof page-walking copy.
+  - `SPAWN_F_CLEANFD` = **`0x20000`** — the child's fd table is fds 0/1/2 (after redirects) + every armed
+    `#62` redirect source + the placed endowment; every other slot is zeroed on the child's copy before it
+    is READY. A CLEANFD child that cannot get a private fd table is torn down unrun (−3). Combines with
+    `SPAWN_F_ARGV`.
+  - bits ≥ 18 → −6. The line form is unchanged: ≤ 127 B (`SPAWN_LINE_MAX`), ≤ 16 tokens.
+- **Return: pid, or −`SPAWN_E_*`:** −2 `NOPROC` (16-slot table full — agnos's WOULD_BLOCK value; found after
+  the ELF is loaded, so back off) · −3 `NOMEM` · −4 `NOENT` · −5 `NOEXEC` (size, magic/class, entry, phdrs,
+  PT_LOAD bounds, W^X) · −6 `ARGS`. −1 (`SPAWN_E_OTHER`) is reserved; no 1.57.6 path produces it. An exited,
+  unreaped child holds its slot but is not listed by `proclist`#99, so −2 — not a `#99` count — is the
+  authoritative "table full".
+- **`exec_redirect`#62 op in a1 bits 8+:** `0` = replace (the legacy one-pair form) · `0x100|src` =
+  `REDIR_ADD` (up to 4 pairs; re-points an existing src; refused onto the armed endowment fd) · exactly
+  `0x200` = `REDIR_CLEAR` (`0x201` etc. → −1).
+- **`chan_op`#97 `CH_ENDOW(-1)`** disarms the pending endowment and its PTY flag → 0 (was −`CH_E_BADFD`).
+- Recipes in ABI §4.8: capture stdout + stderr of a child that sees nothing else, `2>&1`, hand the child one
+  specific fd, the error-path disarm (`#62(0x200, 0)` + `CH_ENDOW(-1)`). Invariants:
+  `docs/architecture/spawn-and-fd-lifetime.md` (new).
+
+### Fixed — pipes, spawn and the scheduler
+
+- **Pipe-buffer use-after-free — a ring-3 cross-process data leak and heap corruption.** A 4 KB pipe buffer
+  was freed on the creator's second close while a child still held an inherited or redirected end, so a
+  later pipe reused the block (1.57.5: `SPAWNX-PIPE-CROSSTALK bytes=63` — a scribbler's writes landed in the
+  parent's next pipe). A buffer now lives until the **last reference anywhere** drops: `pipe_buf_referenced`
+  scans the global table, every process table (dead ones included) and the `#37` redirect backups, and the
+  reap sweep in `proc_destroy_fd_table` covers all 32 slots. Every dropper of a possibly-sole reference runs
+  under one `preempt_disable` + `fs_lock` hold. `pipe_rc_*` retired.
+- **`#37`'s redirect restore double-freed** a pipe the child had handed to a still-running `#43` grandchild —
+  restore now drops under that same one-hold rule. **`vfs_create_pipe`'s create-failure path double-freed**
+  its buffer. **Reaped `#43` children never released their pipe references.** **An orphan zombie's fd table**
+  (and pipe buffers only it named) leaked when its slot was reused — `vfs_fd_inherit` now destroys it, and
+  zeroes the child's fd base BEFORE its `kmalloc` so a failure lands on the documented global-table fallback;
+  CLEANFD refuses the global table (−3).
+- **`-smp 4` triple fault**: `do_context_switch` could leave an AP running on a reaped process's freed page
+  tables (the reaper had already rewritten the slot CR3 to `0x1000`, so a switch to an idle skipped the CR3
+  load → `#PF` fetch at a kernel RIP → `#DF` → triple fault). A dead `old` now hands the CPU to the boot CR3
+  before `on_cpu` is released, and the tail compares against the LOADED CR3. Measured: 7 of 8 `-smp 4` spawn
+  boots triple-faulted before, 8/8 clean after.
+- **Ring-0 frame overruns** (a function-local `var x[N]` is N bytes): `spawn_redirect_selftest`'s `snap[4]`
+  (28 B over), the recovery shell's `pipe` command and two ktest pipe tests (`pfds[2]` → `[16]`, 14 B over).
+- `sc_env_blob_ok`'s comment said "argc<=8" (16 since 1.46.x); ABI §4.6 said "≤ 8" and `0x3008`-era offsets.
+
+### Changed — `uptime_us`#95: the TSC is calibrated against the ACPI PM timer
+
+- **Reference**: the PM timer — port from the FADT (`PM_TMR_BLK`@76 when `PM_TMR_LEN`@91 == 4;
+  `X_PM_TMR_BLK`@208 overrides when it is system-I/O; both only on a non-hardware-reduced FADT; a value >
+  `0xFFFF` gives none), bracketed `rdtsc`/`inl`/`rdtsc` samples (the tightest of 4), the **median of 5
+  windows, 3 of which must agree within 0.5%**. No PM timer → a hardened live-tick tier (lost-tick and burst
+  tests, IF=0-safe aborts, gated on a measured LAPIC reload).
+- **One retry**, immediately before `sched_active = 1`. After it, **−1 from `#95` is PERMANENT for the
+  boot** (ABI row 95) — a latched fallback and a per-call one are equally correct.
+- **Messages**: `acpi: pm timer port <hex>, <24|32>-bit`; `tsc: N cycles per microsecond (acpi-pm timer, K
+  of 5 windows agree)`; a refusal prints `… REFUSED -- K of N windows usable; measured LO..HI cycles/us`,
+  then `tsc: calibration REFUSED -- one more attempt before userland` and, if that fails too,
+  `tsc: calibration REFUSED -- uptime_us#95 returns -1 for the rest of this boot` (1.57.5 printed "will
+  report 0" while the arm returned −1).
+- **Measured** (q35, QEMU TCG under `systemd-run --scope -p CPUQuota`, `cpu.max` read inside QEMU's own scope
+  as the positive control): **3193 cycles/µs at 25% and at 50%**; the live-tick reference refuses at 25%
+  (measured 12275..19163) and reads 7898..11267 at 50%. The unmodified 1.57.5 kernel under the same smoke
+  reproduces the filed refusal (`uptime_us will report 0`, `run: exit 0`). KVM 3193 (1.57.5: 3192–3193);
+  `-machine pc` (rev-1 FADT) decodes port `b008` and reads 3193.
+- **Fixed, pre-existing:** `tsc-smoke` was RED at 1.57.5 (5 passed, 2 failed — it fed the klog timestamp
+  prefix to its calibration extraction), and the `TSC_SELFTEST` boot hung after `run /bin/tscp` (the probe
+  returns to kmain with IF=0 and the next `arch_wait` halted forever) — an `sti` after the probe, register
+  contract documented.
+- ⚠ **Known, not fixed in 1.57.6 (roadmap step S1b):** `lapic_calibrate` still counts PIT wraps by polling,
+  so under a host throttle the LAPIC 100 Hz reload and the klog timebase are inflated
+  (`klog: TIMEBASE DISAGREES -- early=8769 late=3193` at 25%) and `uptime_ms`#40 runs slow for that boot.
+- New `docs/architecture/kernel-clocks.md`.
+
+### Changed — Path 2, bites S3.1–S3.3: every process runs its syscalls on its OWN kernel stack
+
+- **Per-process syscall kernel stacks.** Slot `pid` owns 64 KB of region 7 at phys `0xE00000 + pid·0x10000`,
+  addressed through the direct map; SYSCALL entry AND CPL3→CPL0 interrupts land on it. `kstack_install(pid)`
+  (TSS.RSP0 + the per-CPU syscall top) runs on every path that makes a process current. The SYSCALL stub
+  builds a frame at the stack top — `SCF_URSP` 8 · `SCF_RBP` 16 · `SCF_RIP` 24 · `SCF_RFL` 32 · rbx, r12–r15
+  at 40–72 — and the exit pops the SYSRET state from it, so a syscall switched out or resumed on another CPU
+  returns on its own state. Stub **280 of 2048 B** at `ibrs=0`, built once at boot and never rewritten. The
+  per-CPU shared syscall stacks and `#37`'s second stacks are retired.
+- **Region-7 map** (`gdt.cyr`; `docs/architecture/kernel-stacks-and-preemption.md`, new):
+  `[0xE00000,0xF00000)` 16 per-process stacks · `[0xF00000,0xF40000)` 4 kthread stacks (the 16 KB `.bss`
+  kthread pool left the image) · `[0xF40000,0xF80000)` IST1 `#DF` · `[0xF80000,0xFC0000)` FREE, reserved for
+  an NMI/#MC IST · `[0xFC0000,0x1000000)` AP boot/TSS stacks. **The lowest 4 KB of every 64 KB slot is a
+  not-present guard page** (60 KB usable; `kstack_guard_init` splits the direct map's 2 MB entry for region 7
+  in the PD every CR3 shares). `BOOTCR3_KEEP_GNOBOOT_CR3` builds keep the `.bss` pool and get no guard pages.
+- **Switch tail.** `on_cpu(old) = −1` is published only by `sched_frame_iretq`, after RSP has left old's
+  stack and the new CR3 + kernel stack are installed; `do_context_switch` returns `old + 1` and its caller
+  finishes through `sched_leave_old`. A tripwire refuses a non-READY pick (`sched: refused non-ready pick`);
+  `sched_next`'s fallback returns the CPU's idle (or current), never kmain's stale slot; the revive guard
+  touches only states 1–3; `proc_alloc_slot` reuses only a state-0 slot with `on_cpu == −1`; an AP's idle is
+  created CLAIMING and first published by `ap_entry`, and `proc_create_full` publishes READY as its last
+  store; the `#44` yield tail sets `SPEC_CTRL` from the target frame's CPL.
+- **Locks.** Every plain spinlock disables preemption for its hold (13 locks), ISR bodies are
+  non-preemptible, and `preempt_disable` itself is IRQ-saved. ⚠ Behaviour change: a kmain or kthread holding
+  any spinlock is no longer preemptible.
+- **Fail-stop, and loud.** The per-CPU syscall top is seeded 0, so a SYSCALL before any install faults
+  rather than share a stack; the `#DF` stub now prints `PANIC: Double Fault (#DF, IST1) rip=… rsp=… cr2=…`
+  on COM1 (`exc_df_report`; it also covers a stack that runs into its guard page); `kstack_check_entry`
+  latches `syscall: kernel stack is not the caller's (a switch path missed kstack_install)`. Every
+  production-path smoke and the run37 / agnsh-bg-smp4 / multijob harnesses deny both
+  (`SMOKE_INVARIANT_DENY`).
+- **Measured syscall depth** (`KSTACK_HW=1`, a lower bound): **0x11F0 = 4,592 B** of 61,440 usable, through
+  agnsh's pipe-stream run.
+- **Bench** (`scripts/bench-ring3.sh`, KVM `-cpu host`, ns/op, `-smp 1` / `-smp 4`; post-S2 base in
+  brackets): `getpid` 11,783 / 18,080 (11,103 / 19,918) · pipe write + read 8 B 21,201 / 41,828 (21,597 /
+  44,939). Neutral.
+- ⚠ **Not in 1.57.6:** the waits still hold their CPU (`preempt_disable` windows) — the voluntary switch,
+  the BLOCKED state and blocking `#41`/`#59`/`#4`/keyboard/sound waits are steps S3c/S3d, and `#37`'s child
+  becoming a scheduled process is S3b (roadmap § 1.57.x; plan in
+  `docs/development/planning/blocking-syscall-concurrency.md` § Path 2 plan).
+
+### Added — gates, flags, harness
+
+- **`scripts/smoke/kstack-smoke.sh`** (`KSTACK_SELFTEST`; `-smp 1` TCG + `-smp 4` KVM in one row): 38 checks
+  — CPL0 switch windows and migrations, lock holders, the fence (no CPU switches in a process another CPU is
+  still leaving), the slot-reuse storm, guard pages 32/32, ISR bodies, coverage floors that turn low coverage
+  into VOID. Sweep row.
+- **`scripts/smoke/spawn-smoke.sh`**: 129 checks — a `SPAWN_SELFTEST` kernel block (18) + `tests/spawn/spawnx`
+  seeded as `/bin/agnsh` (46 ring-3 checks at `-smp 1` and at `-smp 4`). Sweep row. The 1.57.5 kernel scores
+  7/46. `exec-redirect-smoke` gains the multi-pair `2>&1` check and its first sweep row.
+- **`tsc-smoke.sh` rewritten** (static message checks, PM decode / tier / cross-tier / predicate arms,
+  `TSC_QUOTA` / `TSC_SMP` / `TSC_MACHINE` knobs, banner-gated); sweep row under `TSC_SELFTEST=1`. The
+  `TSC_QUOTA=25` run stays a manual closeout gate (needs systemd user cpu delegation).
+- **`scripts/smoke/lib/ring3-seed.sh`**: seed a ring-3 test program as `/bin/agnsh` on a plain kernel (128 MB
+  GPT: ESP 1–33 MiB + ext2 33–100 MiB) and boot it with a fast VOID retry. **`scripts/bench-ring3.sh`** +
+  `tests/scbench/`.
+- **`qemu-dwell.sh`**: opt-in `QEMU_DWELL_VOID=<ERE>` (a failed firmware hand-off retries in seconds, not at
+  the end of the dwell) and the shared `SMOKE_INVARIANT_DENY` pattern. `fault-kill-smoke` and `doom-smoke`
+  now retry a firmware VOID and exit 2 on it.
+- **Build flags** (`build.md`): `KSTACK_SELFTEST` (implies `KSTACK_HW` — 2 of the 16 define slots),
+  `KSTACK_HW`, `SPAWN_SELFTEST`, `PIPE_RC_SELFTEST` (its first runner), `EXEC_REDIRECT_SELFTEST`.
+  `check-initstack.sh` parses `SPAWN_ARGV_MAX` / `SPAWN_ARGC_MAX` / `SPAWN_LINE_MAX` (string region 3584 B,
+  worst case 2048).
+
+### Closeout
+
+- `build/agnos` **2,431,480 B** (1.57.5: 2,419,952 B; +11,528 B — S3 alone is −10,472 B: the `.bss` kthread
+  pool left the image); the size gates weigh `size − face` = **2,020,660 B**; LOAD end **`0x361898`**, 59,240 B
+  under gate 34's `0x370000`; 193 unreachable fns. aarch64 still does not compile, names unchanged: 33
+  undefined functions, 17 undefined variables at 47 sites (46 → 47 is one more `DIRECTMAP_BASE` site).
+- **Gates on the final tree** (2026-09-24): `sweep.sh` **34/35 + 1 VOID** on the 35-row table — `naad-ring3` scored FAIL, and its surviving attempt's log is a firmware VOID (`UEFI never handed off … Treat this run as VOID`; that smoke has no banner-gated retry, and `sweep.sh` overwrites the first attempt's log); standalone re-run: VOID, then PASS (`run: exit 88`). `fork-smoke` passed on the sweep's retry and PASSed 2/2 standalone. The rows new or first run in 1.57.6: `tsc-smoke` 18/0, `spawn-smoke` 132/0/0, `exec-redirect-smoke` PASS, `kstack-smoke` 38/0/0; `ring3-smoke` 10/0. `check.sh` **35/35** · `test.sh` **4/4** · `ktest` **107/3** (the three environmental `[initrd]` checks; two runs before it produced no output — a log-keeping re-run caught that shape at the OVMF boot menu with no banner) · `agnsh-smoke` PASS on the gated bytes and again on the bumped kernel. The released kernel differs from the gated one in 3 bytes, the version digits.
+- **No new syscall number** — the ABI gate stays green (kernel 105 · abi-doc 105 · cyrius 105). `#106
+  sock_peer`, `#107 spawn_limits` and `waitpid` `WAIT_BLOCK` are specced for later 1.57.x steps, not minted.
+  The spawn constants and wrappers are filed with cyrius as
+  `docs/development/issues/2026-09-24-agnos-spawn-flags-redirect-ops-and-uptime-us-peer.md` (there).
+- **Issues:** four closed and archived (TSC refusal; `#43` args with spaces; `#43` failure reasons; fd
+  inheritance + spawn arms); nine carry a Status header naming the 1.57.x step that closes them; one filed
+  (`2026-09-24-msc-cdb-buffer-is-two-bytes.md`: seven 2-byte `cdb_buf`s in `usb/msc.cyr` take a 16-byte CDB).
+- **Built, gated, NOT burned.** The iron-only risk classes QEMU cannot show: the torn (CS,SS) frame class on
+  the new CPL0 resume paths (`sched_leave_old` → `sched_frame_iretq`, and the `sys_sched_yield` tail, which
+  now also runs `sched_fix_live_frame`); `SPEC_CTRL` in the switch tail (inert on both test substrates,
+  `ibrs=0`); the region-7 4 KB guard pages under real paging and TLB behaviour; the hand-built 280-byte
+  SYSCALL stub; `exc_df_report` running under a faulting CR3; the PM-timer tier on the AMD FCH (expected
+  `acpi: pm timer port 808, 32-bit`). An iron burn is the operator's call.
+
 ## [1.57.5] — 2026-09-21 — cyrius 6.6.6: the kernel is NOT byte-identical this time, and here is every byte
 
 ### Changed — cyrius pin 6.6.4 -> 6.6.6, all four repos together

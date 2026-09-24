@@ -105,10 +105,18 @@ fn lapic_calibrate() {
     var start_lapic = apic_read(0x390);          # LAPIC current-count at the aligned start
     # ⭐ 1.56.58 — THE KERNEL LOG TIMEBASE RIDES THIS WINDOW FOR FREE. The loop below already measures
     # a known wall interval (8 ch0 periods) against a free-running PIT, needs NO interrupts, and runs
-    # at main.cyr ~line 128. Two rdtsc reads convert it into cycles-per-microsecond ~4,400 statements
-    # before `tsc_calibrate()` (main.cyr:4565) produces the same number — which matters because `sti`
-    # is at main.cyr:4532, so a timer_ticks-derived clock reads 0 for essentially the whole boot log,
-    # and `timer_ticks` additionally FREEZES inside a foreground `run` (ring 3 executes IF=0).
+    # near the top of main.cyr's boot body. Two rdtsc reads convert it into cycles-per-microsecond
+    # ~4,400 statements before `tsc_calibrate()` (main.cyr, the call right after the boot body's `sti`)
+    # produces the same number — which matters because a timer_ticks-derived clock reads 0 until that
+    # `sti`, i.e. for essentially the whole boot log, and `timer_ticks` additionally FREEZES inside a
+    # foreground `run` (ring 3 executes IF=0).
+    # ⚠ 1.57.6 — THIS WINDOW IS POLLED, SO A HOST CPU QUOTA CAN INFLATE IT. The loop below counts ch0
+    # wraps by polling; a vCPU descheduled for longer than one 10 ms period misses a wrap, and then
+    # BOTH the LAPIC reload (the 100 Hz tick, so uptime_ms#40) and klog_tsc_per_us come out high by
+    # the same factor. tsc_calibrate no longer depends on either when the FADT advertises an ACPI PM
+    # timer (its reference since 1.57.6). This window itself is still polled HERE; ⚠ S1b — the
+    # 1.57.6 follow-up step (operator decision 2026-09-23) — fixes it by measuring the LAPIC reload and
+    # klog_tsc_per_us against the PM timer, and rewrites this note when it lands.
     # ⚠ Writes klog_tsc_per_us, NOT tsc_per_us — see the note in arch/x86_64/boot_data.cyr for why
     # those must stay distinct (uptime_us#95`s meaning, and hda/gpu`s documented pre-calibration
     # fallback both depend on tsc_per_us staying 0 until main.cyr).
@@ -154,9 +162,24 @@ fn lapic_calibrate() {
 # (that would run during gvar-init, before apic_init — the doom-argv gvar-init trap).
 # `r` is function-local, so no gvar-init concern. On a bad/absent measure calibrate
 # returns 0 -> fall back to the QEMU-proven 10000000 literal (never bricks boot).
+#
+# 1.57.6: lapic_reload_measured records WHICH of the two it returned. tsc_calibrate's fallback tier
+# (live ticks, main.cyr) derives cycles-per-microsecond from "one tick = 10 ms", which is true only
+# when the reload was measured against the PIT; on the 10000000-literal fallback the tick rate is a
+# guess, and a divisor built on it would be silently wrong, so that tier refuses to run.
+# ⚠ 1 does NOT prove a true 100 Hz: lapic_calibrate's polled window can be inflated by a host CPU
+# quota (see the note above its loop), and then the tick is uniformly slow — uniform enough to pass
+# the tick tier's lost-tick test. Every QEMU x86 machine, and every ACPI PC with a fixed-hardware PM
+# timer, takes the PM-timer tier instead and never reads this flag.
+var lapic_reload_measured = 0;   # 1 = the LAPIC 100 Hz reload came from the PIT window, 0 = the 10000000 literal fallback
+
 fn lapic_reload_100hz() {
     var r = lapic_calibrate();
-    if (r == 0) { return 10000000; }
+    if (r == 0) {
+        lapic_reload_measured = 0;
+        return 10000000;
+    }
+    lapic_reload_measured = 1;
     return r;
 }
 
@@ -282,6 +305,7 @@ fn tlb_pending_take() {
 }
 
 fn tlb_shoot_spin_lock() {
+    preempt_disable();                                  # 1.57.6 (S3.2): a held plain spinlock is NON-PREEMPTIBLE (see smp.cyr's lock banner)
     var old = 1;
     while (old == 1) {
         var addr = &tlb_shoot_lock;
@@ -302,6 +326,7 @@ fn tlb_shoot_spin_unlock() {
         0x48; 0x31; 0xC9;            # xor rcx, rcx
         0x48; 0x87; 0x08;            # xchg [rax], rcx
     }
+    preempt_enable();                                   # 1.57.6 (S3.2): pairs the preempt_disable in the lock
     return 0;
 }
 
@@ -420,11 +445,18 @@ fn tlb_isr_build() {
 # box with more than 4 cores — archaemenid is 8c/16t — a broadcast reaches those parked APs too, and
 # what they do with an unexpected vector is not something to discover during an iron burn. Targeting
 # only the CPUs agnos actually runs makes the question moot.
+# ⭐ 1.57.6 (Path 2, S3.2): IRQ-SAVED. The ICR is written as TWO registers (destination high, then command
+# low — the low write sends), and from S3.8 on IPIs are also sent from interrupt context (the reschedule
+# kick). A same-CPU ISR landing between a non-ISR sender's high and low writes would re-point the high half
+# and misdirect that sender's IPI (tlb_shootdown_all's, say). Masking for the two writes + the delivery wait
+# closes it; the caller gets its own IF back.
 fn apic_send_ipi_one(target, vector) {
+    var ipf = kbd_irq_save();
     apic_write(0x310, target << 24);
     apic_write(0x300, 0x004000 | vector);
     var w = 0;
     while ((apic_read(0x300) & 0x1000) != 0) { if (w >= ICR_DELIVERY_WAIT) { break; } w = w + 1; }
+    kbd_irq_restore(ipf);
     return 0;
 }
 

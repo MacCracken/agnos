@@ -25,7 +25,9 @@ fn exec_cr3_g_get() { return load64(&pcpu_exec_cr3_g + pcpu_cpu() * 8); }
 # the iron-validated FOREGROUND exec path (execwait#37 / `run /bin/X`, DOOM) stays IF=0 byte-for-byte.
 # SAFE because: agnsh is preempted in RING 3 (between syscalls), NOT mid-handler — the 1.44.6 IF=0
 # syscall invariant still holds, so the shared syscall kstack stays serial (a bg proc's syscalls
-# never clobber agnsh's frame); agnsh's CR3 maps the APIC so the timer ISR EOIs cleanly; and the
+# never clobber agnsh's frame) [1.57.6, Path 2 S3.3: there is no shared syscall kstack any more —
+# every process runs its syscalls on its own kernel stack, so this reason is now structural];
+# agnsh's CR3 maps the APIC so the timer ISR EOIs cleanly; and the
 # FIRST preemption's proc_save_context captures agnsh's real ring-3 CS=0x23/SS=0x1B (sched.cyr:94),
 # so no proc_set_ring3 is needed and the resume iretq lands in ring 3. (NOT the rejected in-handler
 # yield, which WOULD break the kstack-serial invariant.)
@@ -85,6 +87,11 @@ fn exec_and_wait(entry, rsp, cr3) {
         0x48; 0x8B; 0x55; 0x08;       # mov rdx, [rbp+8]    (return addr)
         0x48; 0x89; 0x50; 0x38;       # mov [rax+56], rdx
     }
+    # ⭐ 1.57.6 (Path 2, S3.3): the out-of-band entry's invariants, asserted (latched, klug + COM1): IF must be 0
+    # (every caller brackets with kbd_irq_save; a tick between its proc_current_set(child) and the pin below
+    # would save the CALLER's registers into the child's slot) and preempt_count must be 0 (a process only
+    # leaves or arrives at 0). After the snapshot asm, which must stay first — it reads the caller's rbx/r12-r15.
+    sched_assert_oob(1);
     kernel_return_rsp_set(1);   # nonzero = "a kernel resume context is armed" (ksyscall exit checks this)
     kernel_return_rip_set(0);
     # 1.44.14: remember WHICH proc this resume context belongs to (the foreground proc being
@@ -106,18 +113,35 @@ fn exec_and_wait(entry, rsp, cr3) {
     # BEFORE enter_ring3 so the proc is excluded the moment it can be scheduled. Inert single-core
     # (pcpu_cpu()==0; sched_idx_pickable's io==pcpu_cpu() branch keeps the BSP picking it).
     idle_owner_set(proc_current_get(), pcpu_cpu());
+    # ⭐ 1.57.6 (Path 2, S3.3) — FG-1: THE OUT-OF-BAND CHILD IS RUNNING HERE, AND SAYS SO. A foreground child
+    # used to sit at state 3 (execwait#37, elf_load_from_file's CLAIMING) or 1 with on_cpu == -1 while it
+    # ran, so "on_cpu == -1 ⇔ nobody is on its stack or CR3" (INV-11) and INV-RUN (the proc current on a
+    # CPU is state 2 with on_cpu == that CPU) were false for exactly these processes — kept safe only by the
+    # pin above. Now they hold by construction. The reap fence's self-owned path clears on_cpu at the
+    # kernel_resume exit; a real switch-out (an IF=1 agnsh) publishes it in the switch tail as for anyone.
+    proc_set_state(proc_current_get(), 2);
+    on_cpu_set(proc_current_get(), pcpu_cpu());
+    kst_note_switch_in(proc_current_get());   # KSTACK_SELFTEST: the underfoot witness (no-op twin)
 
     # Pass params to enter_ring3 via globals (avoid param clobber in asm).
     exec_entry_g_set(entry);
     exec_rsp_g_set(rsp);
     exec_cr3_g_set(cr3);
 
-    # 1.40.3: re-run syscall_init right before ring 3. Ring 3 had never executed,
+    # 1.40.3: re-assert the SYSCALL MSRs right before ring 3. Ring 3 had never executed,
     # so the SYSCALL MSRs (STAR / LSTAR / SFMASK / EFER.SCE) set at boot were
     # never exercised — at the first real SYSCALL, SCE read clear (#UD) and RIP
-    # landed at 0x1000 (a bad LSTAR). Re-asserting them here (idempotent; also
-    # rebuilds the entry stub) guarantees SYSCALL vectors to our stub. Safe after
-    # the frame-save asm above (which already stashed the return point).
+    # landed at 0x1000 (a bad LSTAR). Re-asserting them here (idempotent) guarantees
+    # SYSCALL vectors to our stub. Safe after the frame-save asm above.
+    # ⛔ 1.57.6 (Path 2, S3.3): syscall_init used to REBUILD the shared entry stub on every exec, on whichever
+    # CPU ran it, while other CPUs could be executing those very bytes (cross-modifying code). It is
+    # once-guarded now (syscall_hw.cyr): the stub is built by the FIRST call and never rewritten, and every
+    # later call only reprograms this CPU's MSRs. ⚠ It must stay syscall_init here and not
+    # syscall_msr_init: a boot selftest can exec BEFORE main.cyr's own syscall_init (DOOM_SELFTEST's
+    # `run /bin/doom` does), and then THIS call is the one that builds the stub — measured at S3.3: with
+    # syscall_msr_init here, doom's first SYSCALL vectored into an empty entry buffer and the boot died
+    # silently after "exec: running /bin/doom". That first build always precedes the AP wake (smp_start_aps
+    # runs after main.cyr's syscall_init), so no other CPU can be executing the stub while it is written.
     syscall_init();
 
     # 1.40.3: run ring 3 AND the SYSCALL stub under the SAME full per-process
@@ -152,7 +176,11 @@ fn exec_and_wait(entry, rsp, cr3) {
     # at IF=0 (foreground run-to-completion takes no timer interrupt); forward-correct
     # for when exec_preempt=1 makes agnsh preemptible. Kept BEFORE the CR3 switch (the
     # APIC-read rule above).
-    tss_set_rsp0(proc_rsp0_top(proc_current_get()));
+    # ⭐ 1.57.6 (Path 2, S3.3): kstack_install — TSS.RSP0 AND this CPU's syscall top: the child's syscalls run
+    # on the child's OWN kernel stack, so an execwait#37 child can no longer grow down through its parent's
+    # suspended #37 frame (the old "H2" hazard, which needed a second per-CPU stack). Still BEFORE the CR3
+    # switch — tss_set_rsp0 reads the LAPIC.
+    kstack_install(proc_current_get());
 
     # Switch CR3 and enter ring 3 (use user CR3 for KPTI). After the switch
     # enter_ring3 only writes the iretq frame at 0x7000 + cpu*0x40 (in the 0-2 MB

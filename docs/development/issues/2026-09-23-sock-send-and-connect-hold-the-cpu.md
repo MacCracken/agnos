@@ -1,5 +1,6 @@
 # 2026-09-23 — `sock_send`#48 and `sock_connect`#47 hold the CPU while they wait: a send over 2 KB to a local process never finishes
 
+**Status:** 🟡 **OPEN** — fixed by step **S6** (`sock_connect`#47 / `sock_send`#48 — and `icmp_echo`#55/#100 — block only their caller on the Path 2 wait primitive, woken by the RX demux; one segment in flight; after ~8 s without ACK progress `#48` returns the committed count). Needs S3c/S3d/S3b, S4 and S5 first. Not in 1.57.6. The Path 2 foundation this step builds on — per-process syscall kernel stacks, the deferred `on_cpu` release, preempt-disabling spinlocks, region-7 guard pages (bites S3.1–S3.3) — landed in **1.57.6**; see `docs/development/planning/blocking-syscall-concurrency.md` § Path 2 plan and the roadmap's 1.57.x table.
 **Filed by:** daimon (the AGNOS agent orchestrator). Its HTTP API answers clients on the same
 machine, and it calls MCP servers there.
 **Checked against:** agnos **1.57.5**: the `#47` and `#48` arms in `kernel/core/syscall.cyr` (`:10629`,

@@ -1,5 +1,6 @@
 # 2026-09-23 — inbound TCP: a SYN drained in interrupt context is dropped, so ring-3 servers rarely accept
 
+**Status:** 🟡 **OPEN** — fixed by step **S4** (the passive open served in interrupt context through an IRQ-save `tcp_slot_claim`, a boot-time per-slot pool, the TX/loopback locks that make the `-smp 4` net path gated, half-close kept until accept). Not in 1.57.6. The Path 2 foundation this step builds on — per-process syscall kernel stacks, the deferred `on_cpu` release, preempt-disabling spinlocks, region-7 guard pages (bites S3.1–S3.3) — landed in **1.57.6**; see `docs/development/planning/blocking-syscall-concurrency.md` § Path 2 plan and the roadmap's 1.57.x table.
 **Filed by:** daimon (the AGNOS agent orchestrator), while mapping its agent lifecycle onto agnos
 for daimon 2.4.0. daimon's HTTP API is its only control surface, so on agnos it is unreachable.
 **Checked against:** agnos **1.57.5**: the prebuilt `build/agnos` of 2026-09-21, and the source in

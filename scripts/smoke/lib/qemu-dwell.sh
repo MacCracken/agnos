@@ -35,7 +35,15 @@
 # `2>/dev/null > "$LOG"` form the smokes already use. Returns 0 always (like the `|| true` the
 # synchronous form carried): the smoke's own assertions decide pass/fail, never this helper.
 #
-# Env: QEMU_DWELL_DEBUG=1 prints why the wait ended (marker / self-exit / timeout) and how long it took.
+# Env: QEMU_DWELL_DEBUG=1 prints why the wait ended (marker / self-exit / timeout / void) and how long it took.
+# Env: QEMU_DWELL_VOID=<ERE> (1.57.6, OPT-IN, unset = unchanged behaviour for every other caller) ends the
+#      wait EARLY when the log matches it — for a firmware hand-off that has already failed. ⛔ WHY: the
+#      dwell is sized for the SLOWEST successful boot, and a failed hand-off (`gnoboot: fail @ EBS` ->
+#      `BootManagerMenuApp`) is terminal, so it used to burn the whole budget before qemu_dwell_kernel could
+#      retry. tsc-smoke's CPU-quota mode needs a 900 s budget (TCG at 25% of a CPU), and its first run
+#      sat at the OVMF boot menu for ten minutes (of a 15-minute budget) before it was killed by hand. Pass only a pattern that can NEVER appear in a run
+#      where the kernel started — the retry is still gated on the banner, so a match after the banner
+#      merely stops the wait early and the caller's assertions decide.
 
 qemu_dwell() {
     _qd_log="$1"; _qd_marker="$2"; _qd_max="$3"; shift 3
@@ -53,6 +61,7 @@ qemu_dwell() {
         if ! kill -0 "$_qd_pid" 2>/dev/null; then _qd_why="self-exit"; break; fi
         # -a: the serial log carries NUL bytes and grep would otherwise call it binary and stay silent.
         if grep -qa -- "$_qd_marker" "$_qd_log" 2>/dev/null; then _qd_why="marker"; break; fi
+        if [ -n "${QEMU_DWELL_VOID:-}" ] && grep -qaE -- "$QEMU_DWELL_VOID" "$_qd_log" 2>/dev/null; then _qd_why="void"; break; fi
         sleep 0.25
         _qd_i=$(( _qd_i + 1 ))
     done
@@ -170,4 +179,36 @@ qemu_assert_booted() {
         echo "  (gnoboot: fail @ EBS — the firmware ExitBootServices hand-off, the known ~1-in-4 flake)"
     fi
     return 1
+}
+
+# SMOKE_INVARIANT_DENY (1.57.6, agnos S3-fix) — the kernel's LATCHED invariant lines. Each prints once per boot to
+# klug + COM1 (lock-free) and never to a failing exit code, so a gate that does not grep for them scores PASS while
+# they fire. Every production-path smoke denies them (agnsh, exec, fork, spawn, kstack) and so do the run37 /
+# agnsh-bg-smp4 / agnsh-multijob harnesses (which carry their own copy of the pattern — Python, not sourced):
+#   sched: refused non-ready pick            do_context_switch's tripwire (sched.cyr)
+#   sched: exec_and_wait entered with ...    sched_assert_oob (preempt_count != 0, or IF=1)
+#   sched: kernel_resume with ...            sched_assert_oob (preempt_count != 0)
+#   syscall: kernel stack is not the caller  kstack_check_entry: a switch path missed kstack_install
+#   PANIC: Double Fault                      exc_df_report: the #DF stub (a kernel stack is gone)
+SMOKE_INVARIANT_DENY="sched: refused non-ready pick|sched: exec_and_wait entered with|sched: kernel_resume with|syscall: kernel stack is not the caller|PANIC: Double Fault"
+
+# smoke_accel <smp> — the QEMU accelerator + CPU model for a boot at `-smp <smp>` (1.57.6, agnos S3).
+#
+# ⛔ A -smp 4 GATE UNDER SINGLE-THREADED TCG PROVES NOTHING ABOUT PARALLELISM. The races the Path-2
+# kernel-stack work closes (a CPU resuming a process whose frame another CPU is still popping, a slot
+# reused under a CPU still on it) need the vCPUs to really run at once. So a multi-CPU boot prefers
+# KVM (`-enable-kvm -cpu host` — the fp-ctxsw-smoke.sh precedent; this AMD host keeps
+# ibrs_supported=0 under KVM, so the `syscall: stub` size oracle is unchanged) and otherwise asks for
+# MULTI-threaded TCG explicitly. ⚠ -smp 1 keeps `-cpu max` (TCG), byte-for-byte what every caller used
+# before, so a single-CPU verdict is comparable with its history.
+# ⚠ The caller MUST print what it got (the `accel:` line) — a green multi-CPU mutant is only evidence
+# when the log says which accelerator produced it.
+# Env: SMOKE_KVM=0 forces the TCG form even when /dev/kvm is writable.
+smoke_accel() {
+    if [ "${1:-1}" -gt 1 ]; then
+        if [ -w /dev/kvm ] && [ "${SMOKE_KVM:-1}" = "1" ]; then echo "-enable-kvm -cpu host"; return 0; fi
+        echo "-accel tcg,thread=multi -cpu max"; return 0
+    fi
+    echo "-cpu max"
+    return 0
 }

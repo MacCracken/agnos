@@ -169,7 +169,27 @@ fn vfs_fd_table_of(pid) {
 # proc_create_user (proc_current == parent), under boot CR3 in the #37 path; both src + the
 # kmalloc'd dst are kernel-heap (PMM pool, PD[8..63]) mirrored into every per-proc CR3.
 fn vfs_fd_inherit(child_pid, parent_pid) {
-    var src = vfs_fd_table_of(parent_pid);
+    var src = vfs_fd_table_of(parent_pid);                  # resolved BEFORE the detach below: in the boot
+    # degenerate case child == parent == 0, and the copy must come from the table pid 0 is using NOW.
+    # ⛔ 1.57.6 — AN ORPHAN ZOMBIE'S TABLE IS DESTROYED HERE, NOT LEAKED. proc_alloc_slot reuses the slot of
+    # a process whose parent died unreaping (nothing reaps an orphan) WITHOUT touching its fd table, so the
+    # table — and, under the last-reference-anywhere rule, every pipe buffer only it still names — used to
+    # become unreachable the moment this function repointed the base. proc_destroy_fd_table sweeps it under
+    # fs_lock (dropping its pipe references through pipe_buf_put) and detaches the base.
+    # ⚠ ONLY a private table of a DIFFERENT slot: child == parent is the boot degenerate case (pid 0's own
+    # live table), and &vfs_table is the global one, never freed. Callers are proc_create_user and fork on a
+    # freshly claimed slot, and the kernel selftests on a slot they verified empty — none holds fs_lock
+    # (proc_destroy_fd_table takes it, and it does not nest).
+    if (child_pid != parent_pid) {
+        var old_t = proc_fd_base_get(child_pid);
+        if (old_t != 0) {
+            if (old_t != &vfs_table) { proc_destroy_fd_table(child_pid, 0); }
+        }
+    }
+    # ⛔ 1.57.6 — DETACH THE CHILD SLOT BEFORE THE kmalloc, so a kmalloc failure lands on the documented
+    # global-table fallback (proc_fd_base == 0), which chan_place_into_child and spawn_fd_shape DO detect —
+    # never on a stale table no caller's `== &vfs_table` test can recognise.
+    proc_fd_base_set(child_pid, 0);
     var dst = kmalloc(1024);                                # 32 entries x 32 B
     if (dst == 0) { return 0; }
     var i = 0;
@@ -180,8 +200,9 @@ fn vfs_fd_inherit(child_pid, parent_pid) {
 # Free `pid`'s fd table at reap. do_flush=1 (proc_reap, the synchronous run-to-completion
 # path) mirrors the old fd-3..31 sweep — flush VFS_SEC_WFILE write-backs + release flocks
 # before freeing, so a program that exits with an open write-fd still persists its data.
-# do_flush=0 (proc_reap_child) matches that path's prior no-sweep behavior. Never frees the
-# static global (proc 0) — just detaches it.
+# do_flush=0 (proc_reap_child) skips the flush + flock release. BOTH values release every pipe
+# reference in the table (1.57.6 — see proc_destroy_fd_table). Never frees the static global
+# (proc 0) — just detaches it.
 # Flush EVERY dirty secondary-write buffer in the system, whoever owns it.
 #
 # proc_destroy_fd_table(pid, 1) below already does this per-process, but only on
@@ -237,26 +258,44 @@ fn proc_destroy_fd_table(pid, do_flush) {
     var t = proc_fd_base_get(pid);
     if (t == 0) { return 0; }                               # used the global — nothing to free
     if (t == &vfs_table) { proc_fd_base_set(pid, 0); return 0; }
-    if (do_flush == 1) {
-        var fd = 3;
-        while (fd < 32) {
-            var base = t + fd * 32;
-            if (kis_tag(base, VFS_FREE) == 0) {
-                if (ktag(base) == VFS_EXT2_FILE) { flock_release_inode(kpayload(base, 2), pid); }
-                if (ktag(base) == VFS_SEC_WFILE) { vfs_sec_wfile_flush(base); }
-                if (ktag(base) == VFS_PIPE) {     # 2c: free the OWNER's pipe buffer if still open at exit
-                    var pb2 = kpayload(base, 2);
-                    # bite 11: a dying proc's WRITE end is a closed writer — a reader blocked on it
-                    # must see EOF, not wait forever on a producer that will never write again.
-                    if (kpayload(base, 1) == 1) { pipe_rc_wclose(pb2, pid); }
-                    if (pipe_rc_release(pb2, pid) == 1) { kfree_sized(pb2, 4096); }
-                }
+    # ⛔ 1.57.6 — THE PIPE SWEEP RUNS FOR BOTH do_flush VALUES, OVER ALL 32 SLOTS. do_flush=0
+    # (proc_reap_child: every `spawn_path`#43 child, every waitpid reap) used to skip pipes entirely, so a
+    # reaped child's pipe references were simply dropped with its table; and fds 0-2 are exactly where a
+    # redirected pipe end lives. Each pipe slot is cleared FIRST and then pipe_buf_put frees the buffer only
+    # if no other slot anywhere names it — see the lifetime banner at pipe_buf_referenced.
+    # ⚠ The SEC_WFILE flush and the flock release stay do_flush==1 and fd >= 3 only, as before.
+    # ⚠ fs_spin_lock is a plain xchg spinlock that does NOT nest. proc 0 (kybernet, the kernel shell) runs
+    # IF=1-preemptible and reaps through here, and do_context_switch preempts ring 0 whenever preempt_count
+    # == 0 — so a switch while holding the lock would let the next proc on this CPU spin on it forever.
+    # Hence the preempt_disable bracket (written before 1.57.6 S3.2 made every plain spinlock raise the count
+    # itself; kept — the count nests, and the bracket also covers the scan between the lock calls). No caller
+    # holds fs_lock on entry (proc_reap, proc_reap_child — waitpid#4, execwait#37, #43's CLEANFD teardown —
+    # and the selftests).
+    preempt_disable();
+    fs_spin_lock();
+    var fd = 0;
+    while (fd < 32) {
+        var base = t + fd * 32;
+        var btag = ktag(base);
+        if (do_flush == 1) {
+            if (fd >= 3) {
+                if (btag == VFS_EXT2_FILE) { flock_release_inode(kpayload(base, 2), pid); }
+                if (btag == VFS_SEC_WFILE) { vfs_sec_wfile_flush(base); }
             }
-            fd = fd + 1;
         }
+        if (btag == VFS_PIPE) {
+            var pb2 = kpayload(base, 2);
+            ktag_clear(base, 32);
+            pipe_buf_put(pb2);
+        }
+        fd = fd + 1;
     }
-    kfree_sized(t, 1024);
+    # Detach BEFORE the free, still under the lock: a concurrent pipe_buf_referenced (also under fs_lock)
+    # must never walk a table block that is already back on the slab free list.
     proc_fd_base_set(pid, 0);
+    kfree_sized(t, 1024);
+    fs_spin_unlock();
+    preempt_enable();
     return 0;
 }
 
@@ -999,64 +1038,108 @@ fn vfs_write(fd_idx, buf, count) {
     return 0 - 1;
 }
 
-# 1.47.x pipe buffer refcount (bite 2, sub-bite 2c) — frees the shared 4 KB pipe buffer (kills
-# the prior leak: vfs_close had no VFS_PIPE arm, so every pipeline leaked one kmalloc'd 4 KB
-# buffer). With per-proc fd tables (2b) a child inherits transient COPIES of the pipe ends and
-# the execwait#37 redirect DUPLICATES one over fd0/1, so a naive per-entry count would mis-count.
-# Instead each buffer is OWNED by its creator (the proc that called pipe()#25): only the OWNER's
-# two closes (rfd + wfd) decrement, and the buffer is freed at 0. A child closing an inherited
-# copy (proc_current != owner) is IGNORED — that copy just vanishes when its table is freed, and
-# children always finish + are reaped BEFORE the creator closes (store-and-forward), so there is
-# never a dangling reference. 8 concurrent pipes tracked; an untracked buffer (table full)
-# degrades to the old leak, never a crash or double-free.
-var pipe_rc_buf[8];     # tracked buffer ptr (0 = free slot)
-var pipe_rc_owner[8];   # creating proc's pid
-var pipe_rc_cnt[8];     # OWNER ends still open (starts at 2 = rfd + wfd)
-# ⭐ ipc BITE 11 — WRITE ends still open, tracked SEPARATELY from the total (starts at 1).
-# ⛔ WITHOUT THIS, "EMPTY" AND "EOF" ARE THE SAME ANSWER. `pipe_read` returned 0 for both, so a
-# consumer scheduled alongside a live producer could not tell "nothing yet" from "the writer is gone"
-# — which is precisely why pipes could only ever be run store-and-forward, one stage fully finished
-# before the next began. Streaming needs the two to be distinguishable, and nothing else does.
-var pipe_rc_wcnt[8];
-fn pipe_rc_register(buf, owner) {
-    var i = 0;
-    while (i < 8) {
-        if (load64(&pipe_rc_buf + i * 8) == 0) {
-            store64(&pipe_rc_buf + i * 8, buf);
-            store64(&pipe_rc_owner + i * 8, owner);
-            store64(&pipe_rc_cnt + i * 8, 2);
-            store64(&pipe_rc_wcnt + i * 8, 1);      # exactly one write end at creation
-            return 0;
+# ── PIPE BUFFER LIFETIME: "THE LAST REFERENCE ANYWHERE" (1.57.6) ────────────────────────────────────
+#
+# A pipe's shared 4 KB buffer is freed when the LAST fd slot that names it — in ANY table on the box —
+# is closed or destroyed. Answered by SCANNING (pipe_buf_referenced), never by a counter.
+# ⛔⛔ WHAT THIS REPLACES WAS A RING-3-REACHABLE USE-AFTER-FREE. 1.47.x's `pipe_rc_*` freed the buffer on
+# its OWNER's (the pipe() caller's) second close and ignored every other holder, on the premise written
+# here: "children always finish + are reaped BEFORE the creator closes (store-and-forward), so there is
+# never a dangling reference." That premise is false for every `spawn_path`#43 child — the parent stays
+# live and closes whenever it likes. A child still holding an inherited or redirected end then read and
+# wrote a freed slab block, which kfree_sized had pushed on the 4096 free list, so the very next
+# kmalloc(4096) — a new pipe, a TCP ring — was the SAME memory: one process's writes landed in an
+# unrelated pipe (cross-process forgery and disclosure), and the heap's own free-list word was written
+# through. The capture flow 1.57.6 ships for daimon (CLEANFD + #62 fd 1/2 into pipes) is exactly that
+# shape, so the fix is not optional. Measured by tests/spawn (`scribble` + SPAWNX-PIPE-NO-CROSSTALK).
+# ⛔ And proc_reap_child destroyed a #43 child's table with do_flush=0, which skipped pipes entirely, so
+# a child's pipe references were never released on the reap path either.
+# ⭐ WHY A SCAN AND NOT A REFCOUNT: a reference is COPIED at vfs_fd_inherit, at every redirect apply and
+# by fork, and a per-entry count needs every copy site to remember to bump it — the class of bug the
+# pipe_writers_open banner below already rejects for writers. The scan reflects reality.
+# ⛔ DEAD-BUT-UNREAPED TABLES COUNT HERE, unlike pipe_writers_open (which must skip them or streaming
+# never sees EOF): a dead table is still destroyed later, and that destroy would free the buffer again.
+# ⛔ SMP — THE RULE FOR EVERY PATH THAT CAN DROP A POSSIBLY-SOLE REFERENCE: clear the slot AND scan in ONE
+# fs_spin_lock hold (vfs_close_inner, proc_destroy_fd_table, exec_redirect_restore). Then two droppers
+# serialize and exactly one of them sees "no other reference". "Clear it lock-free, then lock and re-check"
+# is NOT equivalent: while the slot is already gone and the lock is free, another CPU's last close scans,
+# finds nothing and frees — and the late re-check finds nothing too and frees AGAIN (a double push on the
+# slab free list; exec_redirect_restore shipped that shape in the first 1.57.6 build).
+# A NEW reference is only ever copied from a live one by that reference's OWN process (inherit, redirect,
+# fork, the CLEANFD scrub's survivors), and a process runs on one CPU at a time, so a scan can never miss a
+# reference that is in flight.
+# ⚠ Paths that drop a reference WITHOUT the lock (spawn_fd_shape's CLEANFD raw scrub, a #43/#37 redirect
+# APPLY overwriting the child's copy) are allowed only because each drops a DUPLICATE of an entry its
+# creator still holds at that instant and cannot close meanwhile (the creator is the caller, inside that
+# very spawn syscall). Anything that can drop a sole reference takes the rule above. (A KERNEL creator on the
+# shared global table is the one soft spot: a kthread closing that same global fd at that instant can turn
+# the raw drop into a LEAK — never a free, since a raw drop frees nothing.)
+
+# The #37 (execwait) redirect backups: the child's original src entries, saved by exec_redirect_apply and
+# written back by exec_redirect_restore. PER-CPU because the #37 nest is per-CPU and single-level.
+# ⚠ HERE, NOT syscall.cyr: pipe_buf_referenced must scan them (a saved entry IS a live reference until it
+# is restored), and vfs.cyr is shared by both architectures while syscall.cyr is x86-only.
+# [64] = 64 u64 = 512 B: 4 CPUs x SPAWN_REDIR_MAX (4) x 32 B; cpu c, slot i at byte c*128 + i*32.
+var pcpu_redir_backup[64];
+# [16] = 4 CPUs x 4 cells: the src fd + 1 each backup slot restores into; 0 = slot unused.
+var pcpu_redir_bsrc[16];
+
+# Does ANY fd slot anywhere still name `buf` as its pipe buffer? -> 1 / 0. Caller holds fs_spin_lock.
+fn pipe_buf_referenced(buf) {
+    if (buf == 0) { return 0; }
+    var rg = 0;
+    while (rg < 32) {
+        var rgb = &vfs_table + rg * 32;
+        if (ktag(rgb) == VFS_PIPE) {
+            if (kpayload(rgb, 2) == buf) { return 1; }
         }
-        i = i + 1;
+        rg = rg + 1;
     }
-    return 0 - 1;   # table full → untracked (degrades to leak, never a crash)
-}
-# Decrement buf's count IF pid is its owner; return 1 when it hits 0 (the caller kfree's the
-# buffer), else 0. A non-owner close (an inherited child copy) OR an untracked/already-freed
-# buffer returns 0 — so a child copy and a double close never double-free.
-# Drop the WRITE-end count for `buf` (owner-only, same rule as pipe_rc_release). Called when a write
-# end is closed, so `pipe_read` can answer EOF instead of "nothing yet".
-fn pipe_rc_wclose(buf, pid) {
-    var i = 0;
-    while (i < 8) {
-        if (load64(&pipe_rc_buf + i * 8) == buf) {
-            if (load64(&pipe_rc_owner + i * 8) != pid) { return 0; }   # inherited copy → ignore
-            var w = load64(&pipe_rc_wcnt + i * 8);
-            if (w > 0) { store64(&pipe_rc_wcnt + i * 8, w - 1); }
-            return 0;
+    var rp = 0;
+    while (rp < 16) {
+        var rt = proc_fd_base_get(rp);
+        if (rt != 0) {
+            if (rt != &vfs_table) {
+                var rf = 0;
+                while (rf < 32) {
+                    var rfb = rt + rf * 32;
+                    if (ktag(rfb) == VFS_PIPE) {
+                        if (kpayload(rfb, 2) == buf) { return 1; }
+                    }
+                    rf = rf + 1;
+                }
+            }
         }
-        i = i + 1;
+        rp = rp + 1;
+    }
+    var rb = 0;
+    while (rb < 16) {
+        var rbb = &pcpu_redir_backup + rb * 32;
+        if (ktag(rbb) == VFS_PIPE) {
+            if (kpayload(rbb, 2) == buf) { return 1; }
+        }
+        rb = rb + 1;
     }
     return 0;
+}
+
+# Drop one reference to `buf` that the caller has ALREADY removed from its slot: free the buffer iff no
+# other slot anywhere names it. Returns 1 if it freed. Caller holds fs_spin_lock.
+# ⛔ THE SLOT MUST BE CLEARED FIRST — the scan would otherwise count the very reference being dropped and
+# no close could ever free anything.
+fn pipe_buf_put(buf) {
+    if (buf == 0) { return 0; }
+    if (pipe_buf_referenced(buf) != 0) { return 0; }
+    kfree_sized(buf, 4096);
+    return 1;
 }
 
 # Is ANY write end for `buf` still open, anywhere on the box? Answered by SCANNING every process's fd
 # table for a VFS_PIPE slot pointing at this buffer whose `is_write_end` payload is 1.
 #
-# ⛔ A COUNTER CANNOT ANSWER THIS, AND THAT IS WHY THIS IS A SCAN. The `pipe_rc_*` refcount is
-# deliberately OWNER-ONLY — a child closing an inherited copy must not free the shared buffer — so it
-# says nothing about references held by other processes. And the reference that matters most for
+# ⛔ A COUNTER CANNOT ANSWER THIS, AND THAT IS WHY THIS IS A SCAN. The owner-only `pipe_rc_*` count
+# (1.47.x, retired 1.57.6 — see the lifetime banner above) said nothing about references held by other
+# processes, and neither would any per-owner tally. And the reference that matters most for
 # streaming is exactly one of those: when the shell spawns stage 1 with its stdout redirected, the
 # write end lives in the CHILD's private table, not the shell's. An owner-only count would read zero
 # the moment the shell closed its own copy, and stage 2 would see EOF while the producer was still
@@ -1112,27 +1195,6 @@ fn pipe_writers_open(buf) {
     return 0;
 }
 
-fn pipe_rc_release(buf, pid) {
-    var i = 0;
-    while (i < 8) {
-        if (load64(&pipe_rc_buf + i * 8) == buf) {
-            if (load64(&pipe_rc_owner + i * 8) != pid) { return 0; }   # not the owner → ignore
-            var c = load64(&pipe_rc_cnt + i * 8) - 1;
-            if (c <= 0) {
-                store64(&pipe_rc_buf + i * 8, 0);
-                store64(&pipe_rc_owner + i * 8, 0);
-                store64(&pipe_rc_cnt + i * 8, 0);
-                store64(&pipe_rc_wcnt + i * 8, 0);
-                return 1;
-            }
-            store64(&pipe_rc_cnt + i * 8, c);
-            return 0;
-        }
-        i = i + 1;
-    }
-    return 0;
-}
-
 fn vfs_create_pipe(fds_ptr) {
     # Allocate a 4KB pipe buffer
     var pipe_buf = kmalloc(4096);
@@ -1150,14 +1212,14 @@ fn vfs_create_pipe(fds_ptr) {
     kpayload_set(rbase, 2, pipe_buf);
     # Allocate write end fd
     var wfd = vfs_alloc();
-    if (wfd < 0) { vfs_close(rfd); kfree_sized(pipe_buf, 4096); return 0 - 1; }
+    # ⛔ NO kfree_sized HERE (1.57.6): rfd is the buffer's only reference, so vfs_close(rfd) now frees it
+    # (last reference anywhere). The explicit free that used to follow was a double free.
+    if (wfd < 0) { vfs_close(rfd); return 0 - 1; }
     var wbase = vfs_fd_table() + wfd * 32;
     ktag_set(wbase, VFS_PIPE);
     kpayload_set(wbase, 0, 0);
     kpayload_set(wbase, 1, 1);       # is_write_end = 1
     kpayload_set(wbase, 2, pipe_buf);
-    # 2c: track the buffer owned by THIS proc (rfd+wfd = count 2) so its last close frees it.
-    pipe_rc_register(pipe_buf, proc_current_get());
     # Write fd numbers to user pointer
     store64(fds_ptr, rfd);
     store64(fds_ptr + 8, wfd);
@@ -1269,15 +1331,14 @@ fn vfs_close_inner(fd_idx) {
     # and the success path is unchanged (vfs_write_on returns 0 on success).
     var rc = 0;
     if (ktag(base) == VFS_SEC_WFILE) { rc = vfs_sec_wfile_flush(base); }
-    # 2c: a pipe end — drop the owner's refcount; the OWNER's last close frees the shared 4 KB
-    # buffer (kills the prior leak). A non-owner close (inherited child copy) is a no-op release.
+    # A pipe end: clear THIS slot first, then free the shared 4 KB buffer only if no other slot anywhere
+    # still names it (1.57.6 — the last reference anywhere, not the creator's second close; see the
+    # lifetime banner at pipe_buf_referenced). A closed WRITE end turns a reader's "nothing yet" into EOF
+    # by construction: pipe_writers_open simply stops finding it.
     if (ktag(base) == VFS_PIPE) {
         var pb = kpayload(base, 2);
-        # ⭐ ipc BITE 11 — a WRITE end closing is what turns a reader's "nothing yet" into EOF.
-        # ⛔ ORDER MATTERS: drop the writer count BEFORE the general release, because the release may
-        # free the slot outright (last end) and then there is nothing left to decrement.
-        if (kpayload(base, 1) == 1) { pipe_rc_wclose(pb, proc_current_get()); }
-        if (pipe_rc_release(pb, proc_current_get()) == 1) { kfree_sized(pb, 4096); }
+        ktag_clear(base, 32);
+        pipe_buf_put(pb);
     }
     if (ktag(base) == VFS_SOCK) { tcp_close(kpayload(base, 0)); }   # 1.49.4 tear down the TCP conn
     # Zero the entire slot (tag → VFS_FREE, payload all 0) so reuse

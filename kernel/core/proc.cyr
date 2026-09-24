@@ -140,6 +140,180 @@ var proc_ss[16];        # saved SS per pid (default 0x10 = ring-0 kernel data)
 # grow into pgid/sid or kill(-pgid, …); process-group semantics WOULD be Unix projection.
 var proc_ppid[16];      # saved parent pid per pid (default 0 = init)
 
+# ── 1.57.6 — PER-PROCESS SPAWN ARMS (issue 2026-09-23-child-inherits-every-fd-and-spawn-arms-leak §3) ──
+#
+# The one-shot arms a process sets up for its NEXT child: the `exec_redirect`#62 redirect set (up to
+# SPAWN_REDIR_MAX pairs) and the `chan_op`#97 CH_ENDOW endowment (endpoint, announced fd, PTY flag, the
+# channel epoch seen at arm time) — plus the fd its latest child's endowment landed on.
+# ⛔⛔ THESE WERE PER-CPU UNTIL 1.57.6, AND PER-CPU LEAKED ACROSS PROCESSES ON THE *SUCCESS* PATH. An arm
+# spans TWO syscalls issued from preemptible IF=1 ring-3 code: arm, then spawn. Between them the arming
+# process can be preempted (or migrated to an AP, smp_sched_aps=1), and whatever next created a child on
+# that CPU — an agnsh `&` job, a compositor's client spawn — consumed the arm: its child got the redirected
+# stdout, or was born OWNING an endpoint nobody endowed it with. Clearing on failure paths alone could not
+# fix that; keying by the ARMING pid makes cross-process consumption structurally impossible.
+# ⚠ NO LOCK, deliberately. A pid's cells are written only by (a) that process's own syscalls — a process
+# runs on one CPU at a time; (b) chan_place_into_child inside that same process's own spawn; (c)
+# proc_alloc_slot while the slot is dead. Nothing else names another process's cells.
+# ⚠ HERE, IN proc.cyr, NOT syscall.cyr: proc_alloc_slot (shared by both architectures) resets them, and a
+# helper defined only in the x86-only syscall.cyr would add an undefined name to the aarch64 build.
+# ⚠ Every accessor bounds-checks pid: a bad pid reads as "nothing armed" and writes nothing.
+var SPAWN_REDIR_MAX = 4;
+var proc_redir_n[16];       # armed redirect pairs per pid (0..SPAWN_REDIR_MAX)
+var proc_redir_src[64];     # [pid*4 + i] the CHILD fd that gets repointed
+var proc_redir_dst[64];     # [pid*4 + i] the fd whose entry it receives — read from the CHILD's table AT APPLY
+var proc_endow_end[16];     # armed endpoint + 1; 0 = unarmed (zero-init must mean "nothing armed")
+var proc_endow_fd[16];      # the child fd announced by CH_ENDOW (decided at arm time)
+var proc_endow_stdio[16];   # 1 = PTY mode: the endpoint also lands on the child's fd 0/1/2
+var proc_endow_epoch[16];   # chan_epoch[e >> 1] at CH_ENDOW — placement refuses a re-minted channel
+var proc_endow_placed[16];  # fd + 1 of the endowment placed into this creator's LATEST child; 0 = none
+
+fn spawn_pid_ok(pid) {
+    if (pid < 0) { return 0; }
+    if (pid >= 16) { return 0; }
+    return 1;
+}
+fn redir_n_get(pid) {
+    if (spawn_pid_ok(pid) == 0) { return 0; }
+    return load64(&proc_redir_n + pid * 8);
+}
+fn redir_src_get(pid, i) {
+    if (spawn_pid_ok(pid) == 0) { return 0 - 1; }
+    if (i < 0) { return 0 - 1; }
+    if (i >= SPAWN_REDIR_MAX) { return 0 - 1; }
+    return load64(&proc_redir_src + (pid * 4 + i) * 8);
+}
+fn redir_dst_get(pid, i) {
+    if (spawn_pid_ok(pid) == 0) { return 0 - 1; }
+    if (i < 0) { return 0 - 1; }
+    if (i >= SPAWN_REDIR_MAX) { return 0 - 1; }
+    return load64(&proc_redir_dst + (pid * 4 + i) * 8);
+}
+fn redir_clear(pid) {
+    if (spawn_pid_ok(pid) == 0) { return 0; }
+    store64(&proc_redir_n + pid * 8, 0);
+    var rci = 0;
+    while (rci < SPAWN_REDIR_MAX) {
+        store64(&proc_redir_src + (pid * 4 + rci) * 8, 0);
+        store64(&proc_redir_dst + (pid * 4 + rci) * 8, 0);
+        rci = rci + 1;
+    }
+    return 0;
+}
+# Is `f` the src of one of `pid`'s armed redirects? -> 1 / 0.
+fn redir_is_src(pid, f) {
+    var rn = redir_n_get(pid);
+    var ri = 0;
+    while (ri < rn) {
+        if (redir_src_get(pid, ri) == f) { return 1; }
+        ri = ri + 1;
+    }
+    return 0;
+}
+# #62 op 0 — REPLACE the whole set with this one pair (the pre-1.57.6 single-slot semantics exactly).
+fn redir_arm_replace(pid, s, d) {
+    if (spawn_pid_ok(pid) == 0) { return 0 - 1; }
+    redir_clear(pid);
+    store64(&proc_redir_src + (pid * 4) * 8, s);
+    store64(&proc_redir_dst + (pid * 4) * 8, d);
+    store64(&proc_redir_n + pid * 8, 1);
+    return 0;
+}
+# #62 op 1 (REDIR_ADD) — append, or replace the dst of an already-armed src in place. -1 when the set is
+# full, or when `s` is the child fd this process's ARMED endowment will land on.
+# ⚠ `endow_arm_get(pid) >= 0` FIRST: proc_endow_fd outlives a consumed arm, and a stale fd number must
+# not refuse a legitimate ADD.
+fn redir_arm_add(pid, s, d) {
+    if (spawn_pid_ok(pid) == 0) { return 0 - 1; }
+    if (endow_arm_get(pid) >= 0) {
+        if (endow_fd_get(pid) == s) { return 0 - 1; }
+    }
+    var an = redir_n_get(pid);
+    var ai = 0;
+    while (ai < an) {
+        if (redir_src_get(pid, ai) == s) {
+            store64(&proc_redir_dst + (pid * 4 + ai) * 8, d);
+            return 0;
+        }
+        ai = ai + 1;
+    }
+    if (an >= SPAWN_REDIR_MAX) { return 0 - 1; }
+    store64(&proc_redir_src + (pid * 4 + an) * 8, s);
+    store64(&proc_redir_dst + (pid * 4 + an) * 8, d);
+    store64(&proc_redir_n + pid * 8, an + 1);
+    return 0;
+}
+fn endow_arm_set(pid, e) {
+    if (spawn_pid_ok(pid) == 0) { return 0 - 1; }
+    store64(&proc_endow_end + pid * 8, e + 1);
+    return 0;
+}
+fn endow_arm_get(pid) {
+    if (spawn_pid_ok(pid) == 0) { return 0 - 1; }
+    return load64(&proc_endow_end + pid * 8) - 1;
+}
+fn endow_fd_set(pid, f) {
+    if (spawn_pid_ok(pid) == 0) { return 0 - 1; }
+    store64(&proc_endow_fd + pid * 8, f);
+    return 0;
+}
+fn endow_fd_get(pid) {
+    if (spawn_pid_ok(pid) == 0) { return 0 - 1; }
+    return load64(&proc_endow_fd + pid * 8);
+}
+fn endow_stdio_set(pid, v) {
+    if (spawn_pid_ok(pid) == 0) { return 0 - 1; }
+    store64(&proc_endow_stdio + pid * 8, v);
+    return 0;
+}
+fn endow_stdio_get(pid) {
+    if (spawn_pid_ok(pid) == 0) { return 0; }
+    return load64(&proc_endow_stdio + pid * 8);
+}
+fn endow_epoch_set(pid, v) {
+    if (spawn_pid_ok(pid) == 0) { return 0 - 1; }
+    store64(&proc_endow_epoch + pid * 8, v);
+    return 0;
+}
+fn endow_epoch_get(pid) {
+    if (spawn_pid_ok(pid) == 0) { return 0; }
+    return load64(&proc_endow_epoch + pid * 8);
+}
+fn endow_placed_set(pid, v) {
+    if (spawn_pid_ok(pid) == 0) { return 0 - 1; }
+    store64(&proc_endow_placed + pid * 8, v);
+    return 0;
+}
+fn endow_placed_get(pid) {
+    if (spawn_pid_ok(pid) == 0) { return 0; }
+    return load64(&proc_endow_placed + pid * 8);
+}
+# Disarm the endowment AND its PTY flag together — a stale PTY flag would turn the next unrelated
+# endowment's placement into a terminal (the hazard chan_place_into_child's comment names).
+fn endow_disarm(pid) {
+    if (spawn_pid_ok(pid) == 0) { return 0; }
+    store64(&proc_endow_end + pid * 8, 0);
+    store64(&proc_endow_fd + pid * 8, 0);
+    store64(&proc_endow_stdio + pid * 8, 0);
+    store64(&proc_endow_epoch + pid * 8, 0);
+    return 0;
+}
+fn spawn_arms_reset(pid) {
+    redir_clear(pid);
+    endow_disarm(pid);
+    endow_placed_set(pid, 0);
+    return 0;
+}
+# What every #43 / #37 exit calls for the CALLER: the whole arm state is spent by that call, success or
+# refusal. Same cells as the slot-recycle reset; a separate name so the two intents read apart.
+fn spawn_arms_clear(pid) { return spawn_arms_reset(pid); }
+# Proc-table bootstrap (main.cyr): proc_alloc_slot skips the CALLER's own slot (see there), so pid 0's
+# boot-context arms would otherwise survive into kybernet's runtime pid 0.
+fn spawn_arms_reset_all() {
+    var ra = 0;
+    while (ra < 16) { spawn_arms_reset(ra); ra = ra + 1; }
+    return 0;
+}
+
 # 1.56.47 — PER-PROCESS NAME, so a monitor can render a process TABLE and not just
 # a count. Nothing in the kernel recorded a name before this: `struct Process` is
 # pure register state and `proc_create_user(entry, stack_top)` never saw a path, so
@@ -229,9 +403,14 @@ fn on_cpu_set(pid, c) { store64(&proc_on_cpu + pid * 8, c); return 0; }
 # address space while another CPU is mid proc_restore_context on it (or still running it on
 # its own CR3) — that would fault the foreign CPU. Callers set state 0 FIRST (so sched_next
 # can no longer PICK it), then call this to wait out any IN-FLIGHT restore that already
-# passed the state gate: spin until on_cpu clears, which the owning CPU does on its next
-# deschedule (do_context_switch / sys_sched_yield set on_cpu=-1). Must be called AFTER
-# proc_set_state(pid,0) and BEFORE proc_free_address_space.
+# passed the state gate: spin until on_cpu clears. Must be called AFTER proc_set_state(pid,0)
+# and BEFORE proc_free_address_space.
+# ⭐ 1.57.6 (Path 2, S3.1) — INV-11: the owning CPU clears on_cpu ONLY in its switch tail
+# (sched.cyr sched_frame_iretq), after its RSP has left this proc's kernel stack and after it has
+# loaded the next proc's CR3 — no longer under sched_lock in do_context_switch, where it used to be
+# published while that CPU was still popping the ISR frame off this proc's stack. So a -1 read here
+# now means "nobody is on the stack AND nobody has the CR3": the fence got strictly stronger, and a
+# spin here is the few instructions of that tail.
 #
 # 1.50.9 SELF-OWNED FAST PATH (deadlock fix): a proc that terminates via kernel_resume — a ring-3
 # FAULT (fault_kill_current) or exit#0 on the FOREGROUND exec child — leaves the CPU WITHOUT going
@@ -263,9 +442,10 @@ fn proc_on_cpu_init() { var i = 0; while (i < 16) { store64(&proc_on_cpu + i * 8
 # the CPU switches to on a CPL3->CPL0 interrupt. Foundation for IF=1 preemptive
 # agnsh (LIVE since 1.44.14, exec_preempt=1): a preempted ring-3 proc takes its
 # timer tick on ITS OWN stack instead of the shared 0x3C0000, so two procs never
-# grow down one interrupt stack. RSP0 is consumed on a CPL3->CPL0 preemption; the
-# deep FS path still stays on the UNCHANGED shared syscall kstack (only the shallow
-# interrupt stack — ISR->do_context_switch — goes per-proc here).
+# grow down one interrupt stack. RSP0 is consumed on a CPL3->CPL0 preemption. (Until
+# 1.57.6 the deep syscall path stayed on a SHARED per-CPU syscall kstack and only this
+# shallow interrupt stack was per-proc; since Path 2 step S3.3 the syscalls run here too —
+# see KSTACK_SLOT below and docs/architecture/kernel-stacks-and-preemption.md.)
 # Pool PHYS = region 7 (14-16MB), reserved in pmm_init. **1.51.x: RSP0 points at the
 # region-7 phys via its DIRECT-MAP alias (DIRECTMAP_BASE + phys, 8 GB+), NOT its low
 # identity VA.** The identity VA (14-16MB) sits INSIDE the user-segment range — elf_load
@@ -278,7 +458,78 @@ fn proc_on_cpu_init() { var i = 0; while (i < 16) { store64(&proc_on_cpu + i * 8
 # always reachable. The phys stays reserved in region 7; only the VA the CPU loads moves up.
 var proc_rsp0[16];      # per-pid TSS.RSP0 top (0 = unassigned -> 0x3C0000 fallback)
 var KSTACK_POOL_BASE = 0xE00000;   # region 7 PHYS base (14 MB) — RSP0 = DIRECTMAP_BASE + this
-var KSTACK_SLOT = 0x10000;         # 64 KB per proc (interrupt stack is shallow)
+var KSTACK_SLOT = 0x10000;         # 64 KB per proc; the lowest 4 KB is a not-present GUARD page (vmm.cyr)
+# ⭐ 1.57.6 (Path 2, S3.3): this slot is THE process's kernel stack now — its SYSCALLs run here as well as its
+# CPL3 interrupts (kstack_install, syscall_hw.cyr), and a syscall switched out mid-flight keeps its frames
+# here while it waits. 60 KB usable (the largest single kernel frame is ~5 KB).
+# KSTACK_HW (1.57.6 S3-fix; implied by KSTACK_SELFTEST — scripts/build.sh) paints [base + 4 KB, top - 256) with 0x6B
+# when the slot is handed out, so a smoke can report how deep a stack went (a LOWER bound: a frame that never
+# writes its low locals leaves paint under it). Skipped in a KEEP_GNOBOOT build (no direct map there).
+# ⭐ S3-fix — MEASURE THE REAL SYSCALL PATHS, NOT ONLY THE PROBES. The budget went from 64 KB with no guard (the old
+# per-CPU stacks) to 60 KB with one, and until this pass only KSTACK_SELFTEST's four ~1 KB probes were ever
+# measured. Under KSTACK_HW every reap (both doors, after the off-CPU fence) and every slot hand-out scans ALL
+# painted slots and prints one COM1 line whenever the high-water mark grows:
+#   kstack-hw: max=0x... of 0xf000 usable, slot=N name=<the slot's process name>
+# so any workload (spawn-smoke, exec-smoke, agnsh-smoke, ...) run on a KSTACK_HW kernel reports its deepest
+# syscall + interrupt nest against the 60 KB budget. Lock-free (serial only), because a reap can run anywhere.
+#ifdef KSTACK_HW
+var kstack_painted[16];      # 1 = the slot was painted at its last hand-out (only painted slots are scanned)
+var kstack_hw_max = 0;
+#ifndef BOOTCR3_KEEP_GNOBOOT_CR3
+fn kstack_paint(idx) {
+    memset(DIRECTMAP_BASE + KSTACK_POOL_BASE + idx * KSTACK_SLOT + 4096, 0x6B, KSTACK_SLOT - 4096 - 256);
+    store64(&kstack_painted + idx * 8, 1);
+    return 0;
+}
+#endif
+#ifdef BOOTCR3_KEEP_GNOBOOT_CR3
+fn kstack_paint(idx) { return 0; }
+#endif
+# Depth of slot idx's stack: the first qword from the bottom that is no longer paint bounds the use.
+fn kstack_hw_of(idx) {
+    var khb = DIRECTMAP_BASE + KSTACK_POOL_BASE + idx * KSTACK_SLOT;
+    var kht = khb + KSTACK_SLOT;
+    var kha = khb + 4096;
+    while (kha < kht - 256) {
+        if (load64(kha) != 0x6B6B6B6B6B6B6B6B) { return kht - kha; }
+        kha = kha + 8;
+    }
+    return 0;
+}
+fn kstack_hw_scan() {
+    var khs_i = 0;
+    var khs_best = 0;
+    var khs_slot = 0;
+    while (khs_i < 16) {
+        if (load64(&kstack_painted + khs_i * 8) == 1) {
+            var khs_d = kstack_hw_of(khs_i);
+            if (khs_d > khs_best) { khs_best = khs_d; khs_slot = khs_i; }
+        }
+        khs_i = khs_i + 1;
+    }
+    if (khs_best <= kstack_hw_max) { return 0; }
+    kstack_hw_max = khs_best;
+    serial_print("kstack-hw: max=", 15);
+    exc_serial_hex(khs_best);
+    serial_print(" of 0xf000 usable, slot=", 24);
+    exc_serial_hex(khs_slot);
+    serial_print(" name=", 6);
+    var khs_n = proc_name_ptr(khs_slot);
+    var khs_k = 0;
+    if (khs_n != 0) {
+        while (khs_k < 32) {
+            var khs_c = load8(khs_n + khs_k);
+            if (khs_c == 0) { khs_k = 32; } else { serial_putc(khs_c); khs_k = khs_k + 1; }
+        }
+    }
+    serial_putc(13); serial_putc(10);
+    return 0;
+}
+#endif
+#ifndef KSTACK_HW
+fn kstack_paint(idx) { return 0; }
+fn kstack_hw_scan() { return 0; }
+#endif
 
 # === 1.53.x FP/SIMD arc (B2) — per-proc FP (FXSAVE) state + per-CPU FP owner ===
 # Each proc gets a 512-byte FXSAVE area (x87 + XMM + MXCSR) for the lazy #NM
@@ -359,7 +610,19 @@ fn preempt_cpu_slot() {
     return &pcpu_preempt + c * 8;
 }
 fn preempt_count_get() { return load64(preempt_cpu_slot()); }
-fn preempt_disable() { var s = preempt_cpu_slot(); store64(s, load64(s) + 1); return 0; }
+# ⛔ 1.57.6 (Path 2, S3-finish) — THE INCREMENT IS IRQ-SAVED. preempt_disable is the one call that runs at
+# count 0, i.e. while its caller is still PREEMPTIBLE, and it is a read-modify-write of a slot picked by
+# THIS CPU's id. Since S3.2 every plain spinlock calls it, and since S3.1/S3.3 a preempted context may
+# resume on ANOTHER CPU (an unpinned kthread, a switched-out syscall). A tick landing between
+# preempt_cpu_slot() and the store would migrate the caller mid-RMW: the +1 lands in the OLD CPU's slot
+# (that CPU is then non-preemptible for good) and the caller holds its lock on the new CPU at count 0 —
+# preemptible while holding it, the exact deadlock class S3.2 closes. Masking IF for the three statements
+# makes the RMW atomic with respect to the only thing that can move it (the local timer). Latent in
+# 1.57.6 — kmain is BSP-pinned and the THREAD_SELFTEST kthreads take no lock — closed before S3.4's
+# blocking waits make IF=1 CPL0 contexts routine. preempt_enable needs no mask: it runs at count >= 1,
+# where no switch can happen before its store. kbd_irq_save/restore (keyboard.cyr; no-op stubs on
+# aarch64) restore the caller's IF exactly.
+fn preempt_disable() { var pf = kbd_irq_save(); var s = preempt_cpu_slot(); store64(s, load64(s) + 1); kbd_irq_restore(pf); return 0; }
 fn preempt_enable() { var s = preempt_cpu_slot(); var v = load64(s); if (v > 0) { store64(s, v - 1); } return 0; }
 fn preempt_enabled() { if (load64(preempt_cpu_slot()) == 0) { return 1; } return 0; }
 
@@ -437,6 +700,14 @@ fn proc_alloc_slot() {
                     if (load64(&proc_table + pp * 176 + 8) == 0) { reusable = 1; }   # orphan: parent is dead too
                 }
             }
+            # ⛔ 1.57.6 (Path 2, S3.1) — AND NO CPU MAY STILL BE ON IT. A dead slot whose on_cpu is not -1
+            # belongs to a CPU that has not finished leaving it: the switch tail publishes -1 only after
+            # RSP is off the slot's kernel stack and the CR3 is gone (INV-11), and the store64 of -1
+            # further down would erase that fence while the departing CPU is still popping its frame from
+            # this very stack. STRICT form — no "the allocating CPU owns it" exemption: every non-(-1) value
+            # on a dead slot is cleared promptly, by that tail or by the reap fence's self-owned path
+            # (kernel_resume exits are reaped at once), so an exemption would buy nothing and add a case.
+            if (load64(&proc_on_cpu + i * 8) != (0 - 1)) { reusable = 0; }
             if (reusable == 1) { idx = i; i = proc_count; }
             else { i = i + 1; }
         }
@@ -479,6 +750,8 @@ fn proc_alloc_slot() {
     store64(&proc_signals + idx * 8, 0);
     store64(&proc_sigmask + idx * 8, 0);
     store64(&proc_rsp0 + idx * 8, DIRECTMAP_BASE + KSTACK_POOL_BASE + (idx + 1) * KSTACK_SLOT);  # 1.46.1 region-7 phys, 1.51.x via direct-map VA (8 GB+, clear of user segments)
+    kstack_hw_scan();                          # 1.57.6 (S3-fix): KSTACK_HW — measure the previous occupant (and every slot) before the repaint
+    kstack_paint(idx);                         # 1.57.6 (S3.3): KSTACK_HW high-water paint (a no-op twin otherwise)
     store64(&proc_on_cpu + idx * 8, 0 - 1);   # 1.46.x SMP6: recycled slot must not inherit a stale CPU id
     store64(&idle_owner + idx * 8, 0 - 1);     # 1.46.x STEP-2: recycled slot starts UNPINNED (a prior foreground proc may have left idle_owner=its launch CPU; a fresh proc must be free to migrate / not falsely pinned). Idles never reuse a slot, so their persistent pin is unaffected.
     store64(&proc_ppid + idx * 8, 0);          # 1.50.7: recycled slot must not inherit a stale parent (default init; proc_create_user sets the real creator)
@@ -496,6 +769,16 @@ fn proc_alloc_slot() {
     # back against a live pid that happens to land on the same slot" — and `cyrius build` listed it as
     # DEAD CODE. A guarantee, a function written to provide it, and no edge between them.
     proc_clear_name(idx);
+    # ⛔ 1.57.6 — A RECYCLED SLOT MUST NOT INHERIT THE PRIOR OCCUPANT'S SPAWN ARMS (redirect set, endowment,
+    # placement record): a fresh process, fork#96 children included, starts with nothing armed.
+    # ⛔⛔ BUT NEVER THE CALLER'S OWN SLOT. proc_create_user allocates the child BEFORE it places the
+    # creator's endowment, and before proc 0 is registered (main.cyr's proc-table bootstrap) the boot
+    # context IS pid 0 while the first user process it creates is ALSO handed slot 0 — main.cyr says so
+    # at the SYSCALL_HARDEN endowment check and above chan_ring3_selftest. Resetting there wiped the
+    # creator's own arm one line before its placement (shsys "endow owner not moved", CHANX-INH-ENDOWED
+    # red). The guard is exact: a LIVE caller's slot is never state 0, so equality happens only for the
+    # unregistered boot pid 0 — and spawn_arms_reset_all() at the bootstrap covers that slot instead.
+    if (idx != proc_current_get()) { spawn_arms_reset(idx); }
     # 1.56.40 bite 2: a slot handed out is a NEW incarnation, whether it is a fresh row or a recycled
     # one — so the bump belongs here, at the single point every user proc is born through, and not on
     # the death path (a slot that is never reused must still not alias the proc that last held it).
@@ -571,12 +854,23 @@ fn proc_count_by_state(st) {
 }
 
 # Extended process creation with stack
+# ⛔ 1.57.6 (S3-fix) — THE READY PUBLISH IS THE LAST STORE, NOT THE FIRST. This used to write state 1 right
+# after the pid and THEN the RSP, RIP, flags and CR3, so under a live scheduler another CPU could see a READY
+# slot whose context was still the previous occupant's (x86-TSO orders the stores, but the READY store came
+# first). proc_create_kclaim does all of the writing and leaves the slot CLAIMING (proc_alloc_slot's 3);
+# proc_create_full publishes it READY afterwards. A caller that must publish under its own lock (ap_entry's
+# idle) calls proc_create_kclaim directly.
 fn proc_create_full(entry, stack_top) {
-    var idx = proc_alloc_slot();         # 1.44.x: non-LIFO slot reuse (else append, cap 16)
+    var idx = proc_create_kclaim(entry, stack_top);
+    if (idx < 0) { return 0 - 1; }
+    store64(&proc_table + idx * 176 + 8, 1);   # state: 1=ready — published LAST
+    return idx;
+}
+fn proc_create_kclaim(entry, stack_top) {
+    var idx = proc_alloc_slot();         # 1.44.x: non-LIFO slot reuse (else append, cap 16) — returns it CLAIMING (3)
     if (idx < 0) { return 0 - 1; }
     var p = &proc_table + idx * 176;
-    store64(p, idx);          # pid
-    store64(p + 8, 1);        # state: 1=ready
+    store64(p, idx);          # pid (state stays 3 = CLAIMING: the caller publishes it)
     store64(p + 16, stack_top); # rsp
     store64(p + 24, entry);   # rip
     # Zero all register fields
@@ -644,14 +938,30 @@ fn proc_create_user(entry, stack_top) {
 # Stacks come from a static pool so the create path takes no PMM/heap allocation
 # (scheduler-path-safe). `entry` is a `fn(): i64` that loops forever — a kthread
 # does not return; it is retired via proc_set_state(pid, 0). Returns pid / -1.
+# ⭐ 1.57.6 (Path 2, S3.3) — THE STACKS ARE 64 KB REGION-7 SLOTS WITH A GUARD PAGE, NOT 4 KB OF .bss. The
+# range [0xF00000, 0xF40000) held the per-CPU primary SYSCALL stacks until syscalls moved onto per-process
+# stacks; it is the kthread pool now (gdt.cyr's region-7 map). The BSP idle runs every switch path (the
+# timer ISR chain, the switch tail) on its kthread stack, which was 4 KB with nothing under it but other
+# .bss — an overflow would have corrupted a neighbour silently; now it has 60 KB and a not-present page
+# below (vmm.cyr kstack_guard_init). Addressed through the DIRECT MAP (DIRECTMAP_BASE + phys) like every
+# region-7 stack. It also takes 16 KB out of the image's LOAD segment.
+# ⚠ BOOTCR3_KEEP_GNOBOOT_CR3 builds keep the .bss pool: their kmain context has no direct map (the
+# kfont_init exclusion), and they get no guard pages either.
 var KTHREAD_MAX = 4;
-var KTHREAD_STACK_U64 = 512;           # 4 KB per kthread kernel stack (= the idle stack)
-var kthread_stacks[2048];              # KTHREAD_MAX x KTHREAD_STACK_U64 (= 16 KB)
+var KTHREAD_STACK_POOL = 0xF00000;     # region 7 PHYS base of the pool: 4 x 64 KB slots
 var kthread_next = 0;
+#ifdef BOOTCR3_KEEP_GNOBOOT_CR3
+var KTHREAD_STACK_U64 = 512;           # 4 KB per kthread kernel stack (the pre-1.57.6 pool)
+var kthread_stacks[2048];              # KTHREAD_MAX x KTHREAD_STACK_U64 (= 16 KB)
+fn kthread_stack_top(n) { return &kthread_stacks + (n + 1) * KTHREAD_STACK_U64 * 8; }
+#endif
+#ifndef BOOTCR3_KEEP_GNOBOOT_CR3
+fn kthread_stack_top(n) { return DIRECTMAP_BASE + KTHREAD_STACK_POOL + (n + 1) * 0x10000; }
+#endif
 fn kthread_create(entry) {
     if (kthread_next >= KTHREAD_MAX) { return 0 - 1; }
-    # Stacks grow down: top = base of this slot + 8 KB.
-    var stack_top = &kthread_stacks + (kthread_next + 1) * KTHREAD_STACK_U64 * 8;
+    # Stacks grow down: top = the top of this kthread's slot.
+    var stack_top = kthread_stack_top(kthread_next);
     kthread_next = kthread_next + 1;
     return proc_create_full(entry, stack_top);   # CR3 0x1000, IF=1, state=ready
 }
@@ -1231,6 +1541,7 @@ fn proc_reap(pid) {
     if (proc_current_get() == pid) { proc_current_set(0); }
     proc_set_cr3(pid, 0x1000);              # detach the stale per-process CR3
     proc_reap_off_cpu_fence(pid);           # GAP-C: wait out any in-flight restore before freeing
+    kstack_hw_scan();                       # 1.57.6 (S3-fix): KSTACK_HW — no CPU is on pid's stack now (a no-op twin otherwise)
     if (cr3 != 0x1000) { proc_free_address_space(cr3); }
     # 1.56.55 — the second reap door. See the long banner in proc_reap_child: a reaped slot must
     # stop being its parent's child, or the parent's next `waitpid(-1)` re-matches this dead row
@@ -1285,6 +1596,7 @@ fn proc_reap_child(pid) {
     proc_set_state(pid, 0);                 # dead — scheduler skips it (set before free)
     proc_set_cr3(pid, 0x1000);              # detach the stale per-process CR3
     proc_reap_off_cpu_fence(pid);           # GAP-C: wait out any in-flight restore before freeing
+    kstack_hw_scan();                       # 1.57.6 (S3-fix): KSTACK_HW — no CPU is on pid's stack now (a no-op twin otherwise)
     if (cr3 != 0x1000) { proc_free_address_space(cr3); }
     # ⛔⛔ 1.56.55 — A REAPED SLOT MUST STOP BEING ITS PARENT'S CHILD, AND UNTIL NOW IT DID NOT.
     # `proc_ppid` was cleared in exactly ONE place — proc_alloc_slot's recycle scrub (the 1.50.7

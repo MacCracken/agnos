@@ -35,7 +35,9 @@ var ELF_INIT_BLOCK = 0x1FF000;      # SysV control block: [argc][argv..][NULL][e
 #   slots            = (ELF_INIT_STR - ELF_INIT_BLOCK - 8) / 8      = (0x200 - 8) / 8 = 63
 #   worst top index  = argc + 3 + envc                              = 16 + 3 + 16    = 35
 #   string region    = ELF_STACK_SIZE - ELF_INIT_STR                = 0x200000 - 0x1FF200 = 3584 B
-#   worst string use = argv (<=127 payload + <=16 NULs) + env (<=1024) = 1167 B      ⇒ 3584 is ample
+#   worst string use = argv + env (<=1024), argv being the LARGER of the two forms (1.57.6):
+#                      line form <=127 payload + <=16 NULs = 143 B; SPAWN_F_ARGV blob <=1024 B, its NULs
+#                      included (SPAWN_ARGV_MAX, syscall.cyr)  ⇒ 1024 + 1024 = 2048 B  ⇒ 3584 is ample
 # rsp = stack_base + ELF_INIT_BLOCK is UNCHANGED, so the SysV entry contract and its 16-byte
 # alignment are untouched. ⚠ Anyone raising argc (the tokenizer cap) or envc (the env-loop cap) must
 # recheck the slot count above — those two are this window's only consumers.
@@ -62,6 +64,14 @@ var ELF_INIT_STR   = 0x1FF200;      # argv/envp string region: ELF_INIT_STR .. E
 fn elf_bail(cr3) {
     proc_free_address_space(cr3);
     return 0 - 1;
+}
+# 1.57.6 — elf_bail for elf_load_from_file, which answers a DISTINCT reason (`e` is a SPAWN_E_* value,
+# syscall.cyr) instead of -1. The in-memory elf_load keeps elf_bail, so spawn#3 is byte-for-byte unchanged.
+# ⚠ After 1.57.6, `grep 'elf_bail(new_cr3)'` must match only inside elf_load: a site in
+# elf_load_from_file that kept the plain form would silently answer the reserved -1.
+fn elf_bail_code(cr3, e) {
+    proc_free_address_space(cr3);
+    return 0 - e;
 }
 
 fn elf_load(elf_addr, elf_size) {
@@ -321,7 +331,8 @@ fn elf_load(elf_addr, elf_size) {
 # memcpy'd into the mapped process pages under the process CR3 (chunked at the
 # 8 KB scratch size, so no large contiguous buffer is needed). ext2 only
 # (vfs_read_file_at is ext2-only; FAT/exFAT exec is a follow-on). Returns pid
-# or -1. CR3-switch idiom mirrors elf_load: assign the target to a var (lands
+# or, since 1.57.6, -SPAWN_E_* (-2 no slot · -3 no memory · -4 no such file / unreadable ·
+# -5 not a loadable ELF64). CR3-switch idiom mirrors elf_load: assign the target to a var (lands
 # in rax) immediately before `asm { mov cr3, rax; }`.
 # 1.44.19: per-process env arrives via the exec_env_src/exec_env_len GLOBALS — a KERNEL-buffer
 # copy of the caller's flat NUL-separated "KEY=V\0KEY=V\0" blob (already validated by
@@ -343,36 +354,66 @@ fn exec_env_src_get() { return load64(&pcpu_exec_env_src + pcpu_cpu() * 8); }
 var pcpu_exec_env_len[4];
 fn exec_env_len_set(v) { store64(&pcpu_exec_env_len + pcpu_cpu() * 8, v); return 0; }
 fn exec_env_len_get() { return load64(&pcpu_exec_env_len + pcpu_cpu() * 8); }
+# 1.57.6: argv SEPARATOR mode for the next load on this CPU — 1 = the #43 SPAWN_F_ARGV NUL-separated blob,
+# 0 = the space-split line every other caller uses. Set by spawn_path#43 immediately before the load,
+# CONSUMED at elf_load_from_file entry like the env pair, so #37, init and the recovery shell always see 0.
+# ⚠ Per-CPU is sound for the same reason the env pair is: set and consume happen inside one IF=0 syscall.
+var pcpu_exec_argv_nul[4];
+fn exec_argv_nul_set(v) { store64(&pcpu_exec_argv_nul + pcpu_cpu() * 8, v); return 0; }
+fn exec_argv_nul_get() { return load64(&pcpu_exec_argv_nul + pcpu_cpu() * 8); }
+# ⭐ 1.57.6 (Path 2, S3.3) — THE LOADER IS A NON-PREEMPTIBLE SECTION FOR EVERY CALLER. Its scratch is PER-CPU
+# and live across the whole load: the env / argv-mode cells consumed at entry, and pcpu_elf_hdr_buf, which is
+# filled under fs_lock but PARSED lock-free through the segment loop. Syscall callers (#3/#37/#43) run IF=0,
+# but kmain's callers (kybernet's agnsh launch, the recovery `run`, the selftest hooks) run IF=1 now that
+# kmain is an ordinary preemptible context: a tick mid-load could run a process whose own #43 refills the
+# same per-CPU header buffer under kmain's parse. So the whole load holds preempt_count (it nests with any
+# caller's own bracket). Never add a blocking wait inside the body — this is exactly a scratch-live span.
 fn elf_load_from_file(path, namelen, argv_src, argv_len) {
+    preempt_disable();
+    var ef_r = elf_load_from_file_body(path, namelen, argv_src, argv_len);
+    preempt_enable();
+    return ef_r;
+}
+fn elf_load_from_file_body(path, namelen, argv_src, argv_len) {
     var canary = stack_canary_secret;
     var env_src = exec_env_src_get();     # consume-at-entry: no stale env can survive ANY exit path
     var env_len = exec_env_len_get();
     exec_env_src_set(0);
     exec_env_len_set(0);
+    # 1.57.6: the argv SEPARATOR mode (#43 SPAWN_F_ARGV) is consumed here too, on the same rule — a
+    # leftover 1 would make the next #37 / init / recovery-shell load split its line on NUL and hand the
+    # child argc = 1. Every path through this function, every early reject included, clears it.
+    var argv_nul = exec_argv_nul_get();
+    exec_argv_nul_set(0);
+    # ⭐ 1.57.6 — EVERY FAILURE BELOW RETURNS A DISTINCT -SPAWN_E_* CODE (syscall.cyr), not a bare -1:
+    # spawn_path#43 hands it to ring 3 unchanged (daimon could not tell a full process table from a
+    # missing binary). execwait#37 and every kernel caller still test `< 0` and fold it.
     var fsize = vfs_file_size(path, namelen);
-    if (fsize < 64) { return 0 - 1; }                 # too small for an ELF64 header
-    if (fsize > 0x1000000) { return 0 - 1; }          # E2BIG — cap binaries at 16 MB (1.40.4)
+    # vfs_file_size answers -1 for missing, not-a-regular-file, or a name > 255 B: the file is not THERE.
+    if (fsize < 0) { return 0 - SPAWN_E_NOENT; }
+    if (fsize < 64) { return 0 - SPAWN_E_NOEXEC; }                 # too small for an ELF64 header
+    if (fsize > 0x1000000) { return 0 - SPAWN_E_NOEXEC; }          # E2BIG — cap binaries at 16 MB (1.40.4)
     var hdr = elf_hdr_buf_base();
     var hcap = 4096;
     if (fsize < hcap) { hcap = fsize; }
     var hgot = vfs_read_file_at(path, namelen, 0, hdr, hcap);
-    if (hgot < 64) { return 0 - 1; }
+    if (hgot < 64) { return 0 - SPAWN_E_NOENT; }            # it exists, but its header could not be read
     # ELF magic + 64-bit class
-    if (load8(hdr) != 0x7F) { return 0 - 1; }
-    if (load8(hdr + 1) != 0x45) { return 0 - 1; }
-    if (load8(hdr + 2) != 0x4C) { return 0 - 1; }
-    if (load8(hdr + 3) != 0x46) { return 0 - 1; }
-    if (load8(hdr + 4) != 2) { return 0 - 1; }
+    if (load8(hdr) != 0x7F) { return 0 - SPAWN_E_NOEXEC; }
+    if (load8(hdr + 1) != 0x45) { return 0 - SPAWN_E_NOEXEC; }
+    if (load8(hdr + 2) != 0x4C) { return 0 - SPAWN_E_NOEXEC; }
+    if (load8(hdr + 3) != 0x46) { return 0 - SPAWN_E_NOEXEC; }
+    if (load8(hdr + 4) != 2) { return 0 - SPAWN_E_NOEXEC; }
     var entry = load64(hdr + 24);
-    if (entry < 0x400000) { return 0 - 1; }               # 1.56.39: PD[1] is not userspace
+    if (entry < 0x400000) { return 0 - SPAWN_E_NOEXEC; }               # 1.56.39: PD[1] is not userspace
     var phoff = load64(hdr + 32);
     var phentsize = load16(hdr + 54);
     var phnum = load16(hdr + 56);
-    if (phentsize < 56) { return 0 - 1; }
-    if (phnum > 64) { return 0 - 1; }
+    if (phentsize < 56) { return 0 - SPAWN_E_NOEXEC; }
+    if (phnum > 64) { return 0 - SPAWN_E_NOEXEC; }
     # The phdr table must lie within the bytes we staged into the 4 KB buffer.
-    if (phoff >= hgot) { return 0 - 1; }
-    if (phoff + phnum * phentsize > hgot) { return 0 - 1; }
+    if (phoff >= hgot) { return 0 - SPAWN_E_NOEXEC; }
+    if (phoff + phnum * phentsize > hgot) { return 0 - SPAWN_E_NOEXEC; }
 
     # 1.41.6 (#11): pre-pass-validate every PT_LOAD segment BEFORE allocating the
     # address space, so a malformed on-disk ELF is rejected with zero allocations
@@ -393,13 +434,13 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
             # BELOW the image and delivers it into a page the child maps at ring 3 — an arbitrary
             # kernel-memory disclosure through spawn#3, with the attacker choosing the offset.
             # All four check sites (both loaders, pre-pass and mapping loop) get the same floor.
-            if (v_offset < 0) { return 0 - 1; }
-            if (v_filesz < 0) { return 0 - 1; }
-            if (v_offset >= fsize) { return 0 - 1; }
-            if (v_filesz > fsize) { return 0 - 1; }
-            if (v_offset + v_filesz > fsize) { return 0 - 1; }
-            if (v_memsz < v_filesz) { return 0 - 1; }
-            if (v_vaddr + v_memsz < v_vaddr) { return 0 - 1; }
+            if (v_offset < 0) { return 0 - SPAWN_E_NOEXEC; }
+            if (v_filesz < 0) { return 0 - SPAWN_E_NOEXEC; }
+            if (v_offset >= fsize) { return 0 - SPAWN_E_NOEXEC; }
+            if (v_filesz > fsize) { return 0 - SPAWN_E_NOEXEC; }
+            if (v_offset + v_filesz > fsize) { return 0 - SPAWN_E_NOEXEC; }
+            if (v_memsz < v_filesz) { return 0 - SPAWN_E_NOEXEC; }
+            if (v_vaddr + v_memsz < v_vaddr) { return 0 - SPAWN_E_NOEXEC; }
             # ⛔ 1.56.39: the floor is 0x400000 (PD[2]), raised from 0x200000 (PD[1]).
             # PD[1] covers 2-4 MB and holds the boot TSS RSP0 seeds (gdt.cyr:45-48), so a
             # crafted on-disk p_vaddr in that range could have proc_map_page'd a USER page
@@ -408,14 +449,14 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
             # PT_LOAD at 0x400000 with e_entry 0x4000b0 — measured across all 44 staged
             # binaries at 1.56.39, zero exceptions. Retires the class rather than the instance.
             # The same floor is applied at all four sites (both loaders' entry + PT_LOAD checks).
-            if (v_vaddr < 0x400000) { return 0 - 1; }
-            if (v_memsz > 0x2000000) { return 0 - 1; }
-            if (v_vaddr + v_memsz > 0x10000000) { return 0 - 1; }
+            if (v_vaddr < 0x400000) { return 0 - SPAWN_E_NOEXEC; }
+            if (v_memsz > 0x2000000) { return 0 - SPAWN_E_NOEXEC; }
+            if (v_vaddr + v_memsz > 0x10000000) { return 0 - SPAWN_E_NOEXEC; }
         }
     }
 
     var new_cr3 = proc_create_address_space();
-    if (new_cr3 == 0) { return 0 - 1; }
+    if (new_cr3 == 0) { return 0 - SPAWN_E_NOMEM; }
 
     for (var phi = 0; phi < phnum; phi = phi + 1) {
         var ph = hdr + phoff + phi * phentsize;
@@ -436,18 +477,18 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
             # BELOW the image and delivers it into a page the child maps at ring 3 — an arbitrary
             # kernel-memory disclosure through spawn#3, with the attacker choosing the offset.
             # All four check sites (both loaders, pre-pass and mapping loop) get the same floor.
-            if (p_offset < 0) { return elf_bail(new_cr3); }
-            if (p_filesz < 0) { return elf_bail(new_cr3); }
-            if (p_offset >= fsize) { return elf_bail(new_cr3); }
-            if (p_filesz > fsize) { return elf_bail(new_cr3); }
-            if (p_offset + p_filesz > fsize) { return elf_bail(new_cr3); }
-            if (p_memsz < p_filesz) { return elf_bail(new_cr3); }
-            if (p_vaddr + p_memsz < p_vaddr) { return elf_bail(new_cr3); }
-            if (p_vaddr < 0x400000) { return elf_bail(new_cr3); }         # 1.56.39: PD[1] is not userspace
-            if (p_memsz > 0x2000000) { return elf_bail(new_cr3); }
+            if (p_offset < 0) { return elf_bail_code(new_cr3, SPAWN_E_NOEXEC); }
+            if (p_filesz < 0) { return elf_bail_code(new_cr3, SPAWN_E_NOEXEC); }
+            if (p_offset >= fsize) { return elf_bail_code(new_cr3, SPAWN_E_NOEXEC); }
+            if (p_filesz > fsize) { return elf_bail_code(new_cr3, SPAWN_E_NOEXEC); }
+            if (p_offset + p_filesz > fsize) { return elf_bail_code(new_cr3, SPAWN_E_NOEXEC); }
+            if (p_memsz < p_filesz) { return elf_bail_code(new_cr3, SPAWN_E_NOEXEC); }
+            if (p_vaddr + p_memsz < p_vaddr) { return elf_bail_code(new_cr3, SPAWN_E_NOEXEC); }
+            if (p_vaddr < 0x400000) { return elf_bail_code(new_cr3, SPAWN_E_NOEXEC); }         # 1.56.39: PD[1] is not userspace
+            if (p_memsz > 0x2000000) { return elf_bail_code(new_cr3, SPAWN_E_NOEXEC); }
             # 1.41.5: keep the segment below the mmap arena base (0x10000000) — a
             # crafted on-disk p_vaddr must not alias the process's mmap arena.
-            if (p_vaddr + p_memsz > 0x10000000) { return elf_bail(new_cr3); }
+            if (p_vaddr + p_memsz > 0x10000000) { return elf_bail_code(new_cr3, SPAWN_E_NOEXEC); }
             # ⛔ 1.57.2 W^X CLOSED — twin of the elf_load refusal above; the full rationale lives
             # there. An on-disk PT_LOAD with PF_W|PF_X is refused before any page is allocated
             # (measured 1.57.2: build/rootfs/bin holds 0/48 RWX binaries; the RWX images that made
@@ -455,7 +496,7 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
             # the loop so elf_bail's reclaim covers everything this call has touched.
             if ((p_flags & 3) == 3) {
                 serial_println("elf: W^X violation - RWX segment refused", 40);
-                return elf_bail(new_cr3);
+                return elf_bail_code(new_cr3, SPAWN_E_NOEXEC);
             }
 
             # Map + populate 2 MB pages WITHOUT a CR3 switch. Each page is
@@ -478,7 +519,7 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
                 # hazard pmm.cyr documents). This is what made the loaded code
                 # read as #UD in ring 3 at 1.40.3.
                 var phys = pmm_alloc_2mb();
-                if (phys == 0) { return elf_bail(new_cr3); }
+                if (phys == 0) { return elf_bail_code(new_cr3, SPAWN_E_NOMEM); }
                 var kva = pmm_kva_for_access(phys);   # 1.49.9: kernel access handle — identity <=256 MB, direct-map above
                 # 1.50.6 W^X: PF_X segments stay executable; non-executable (data-only) segments are NX.
                 # 1.56.51: PF_X -> read-only + executable (proc_map_page_rx). The 1.50.6 note that
@@ -502,7 +543,7 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
                         var chunk = copy_len - done;
                         if (chunk > 65536) { chunk = 65536; }
                         var rn = vfs_read_file_at(path, namelen, file_off + done, kva + phys_off + done, chunk);
-                        if (rn != chunk) { return elf_bail(new_cr3); }
+                        if (rn != chunk) { return elf_bail_code(new_cr3, SPAWN_E_NOENT); }
                         done = done + chunk;
                     }
                 }
@@ -523,7 +564,7 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     # 0x10000000 with a ceiling (0x3FA00000) below this stack + its guard page.
     var stack_base = 0x3FC00000;
     var stack_phys = pmm_alloc_2mb();
-    if (stack_phys == 0) { return elf_bail(new_cr3); }
+    if (stack_phys == 0) { return elf_bail_code(new_cr3, SPAWN_E_NOMEM); }
     var stack_kva = pmm_kva_for_access(stack_phys);   # 1.49.9: kernel access handle — identity <=256 MB, direct-map above
     proc_map_page_nx(new_cr3, stack_base, stack_phys);   # 1.50.6 W^X: the user stack is data -> NX (blocks stack shellcode; no signal trampoline runs there)
     elf_pde_probe(new_cr3, stack_base, stack_phys, 1);   # ELF_PDE_PROBE: PD[510] is one of the two observed victims
@@ -549,8 +590,16 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     var argc = 0;
     var str_o = ELF_INIT_STR;
     var ai = 0;
+    # 1.57.6: the token SEPARATOR. 32 (space) for the line form every caller has always used; 0 (NUL) for
+    # spawn_path#43's SPAWN_F_ARGV blob `argv0\0argv1\0...argvN\0`, whose entries may contain spaces and
+    # may be EMPTY. The syscall arm validates the blob first (sc_argv_blob_ok: trailing NUL, 1..16
+    # entries, argv[0] 1..255 B), so the argc cap below cannot fire in NUL mode — it refuses instead.
+    var asep = 32;
+    if (argv_nul != 0) { asep = 0; }
     while (ai < argv_len) {
-        while (ai < argv_len) { if (load8(argv_src + ai) != 32) { break; } ai = ai + 1; }   # skip spaces
+        if (asep == 32) {
+            while (ai < argv_len) { if (load8(argv_src + ai) != 32) { break; } ai = ai + 1; }   # skip spaces (line form only)
+        }
         if (ai >= argv_len) { break; }
         if (argc >= 16) { break; }   # 1.46.x: raised 8->16. The argv pointer array
         # ⚠ 1.56.52: this used to justify itself with "plus the 2-entry envp hold ~27 ptr slots".
@@ -560,9 +609,15 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
         # headroom for longer positional command lines (e.g. `anuenue <sentence>` —
         # agnos has no working shell pipes yet, so positional argv is the only text
         # path); the str_o < ELF_STACK_SIZE cap below still bounds total command length.
+        # ⛔ 1.57.6: A BACKSTOP ONLY. The #43 and #37 arms count the tokens BEFORE loading and REFUSE a
+        # 17th (SPAWN_ARGC_MAX, syscall.cyr) — this line used to be where a 17th arg silently vanished.
+        # scripts/check/check-initstack.sh greps it verbatim and requires it to equal SPAWN_ARGC_MAX.
         var ts = ai;
-        while (ai < argv_len) { if (load8(argv_src + ai) == 32) { break; } ai = ai + 1; }    # to next space
+        while (ai < argv_len) { if (load8(argv_src + ai) == asep) { break; } ai = ai + 1; }    # to the next separator
         var tl = ai - ts;
+        # NUL form: step past this entry's own terminator, so `\0\0` is an EMPTY argument rather than
+        # nothing. (The line form lands on a space here and the skip above eats it.)
+        if (asep == 0) { ai = ai + 1; }
         # 1.40.8: keep the arg strings within the reserved stack top
         # (ELF_INIT_STR..ELF_STACK_SIZE) — a long command line can't write past the stack region.
         if (str_o + tl + 1 >= ELF_STACK_SIZE) { break; }
@@ -658,7 +713,9 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     var new_pid = proc_create_user(entry, stack_top);
     # ⛔ 1.56.52 — see the matching note in elf_load: a full process table made this drop the whole
     # populated address space with no pid to reap it. stack_canary_check still runs on the way out.
-    if (new_pid < 0) { proc_free_address_space(new_cr3); stack_canary_check(canary); return new_pid; }
+    # ⛔ proc_create_user's only failure is proc_alloc_slot's full 16-slot table -> NOPROC (-2, the WOULD_BLOCK
+    # value: the same call may succeed once a slot is reaped).
+    if (new_pid < 0) { proc_free_address_space(new_cr3); stack_canary_check(canary); return 0 - SPAWN_E_NOPROC; }
     if (new_pid >= 0) {
         proc_set_cr3(new_pid, new_cr3);
         # 1.56.47: record the basename so `proclist #99` can name this process.

@@ -522,6 +522,11 @@ fn power_sys(magic1, magic2, cmd, arg) {
 # so the block device must still be live — quiescing first would leave the write nowhere to go.
 # Same constraint power_sys:404-405 documents.
 fn power_stop_final() {
+    # ⛔ 1.57.6 (Path 2, S3.3): interrupts OFF first. kmain now reaches this terminus IF=1 (every exec_and_wait
+    # caller hands kmain its own IF back), and the teardown below assumes the SYSCALL environment power_sys
+    # runs in — IF=0, so the tick's hid_poll / do_context_switch cannot run across the xhci_stop and the
+    # final flush (io.cyr arch_cli's banner). Contract: arch_cli touches only RFLAGS.IF.
+    arch_cli();
     modeset_disarm_on_shutdown();
     power_quiesce_devices();
     kprintln("power: stopped -- hold the power button to remove power", 55);

@@ -60,6 +60,11 @@ cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/agnsh.log"
 echo "Booting production kernel (NVMe + ext2 with /bin/agnsh)..."
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
+# 1.57.6 (S3): SMOKE_SMP=N boots with -smp N (default 1 = unchanged). A multi-CPU boot takes smoke_accel's
+# KVM / multi-threaded-TCG accelerator (qemu-dwell.sh) and says which, so a -smp 4 verdict is attributable.
+SMOKE_SMP="${SMOKE_SMP:-1}"
+ACCEL="$(smoke_accel "$SMOKE_SMP")"
+echo "accel: $ACCEL (-smp $SMOKE_SMP)"
 
 # ⛔⛔ 1.56.51: RETRY ONLY WHEN THE KERNEL NEVER RAN — AND NEVER WHEN IT DID.
 # Measured 2026-08-28: this smoke fails roughly 1 run in 4 on an otherwise idle box, and far more
@@ -80,7 +85,7 @@ while [ "$qtry" -le "$QEMU_TRIES" ]; do
     cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
     qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
         qemu-system-x86_64 \
-        -machine q35 -m 512M -cpu max \
+        -machine q35 -m 512M $ACCEL -smp "$SMOKE_SMP" \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
         -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
         -drive "file=$IMG,format=raw,if=none,id=disk0" \
@@ -124,6 +129,13 @@ if strings "$LOG" | grep -q "agnoshi "; then
     echo "  PASS: agnsh reached ring 3 and printed its own banner"
 else
     echo "  FAIL: no agnsh banner — it exec'd but produced no output (wedged before its first write)"; rc=1
+fi
+# ⛔ 1.57.6 (S3-fix): the kernel's latched invariant lines (SMOKE_INVARIANT_DENY, qemu-dwell.sh) fire once to klug +
+# COM1 and change no exit code — this gate scored PASS with them firing until it grepped for them.
+if strings "$LOG" | grep -qE "$SMOKE_INVARIANT_DENY"; then
+    echo "  FAIL: a latched kernel invariant line fired:"; strings "$LOG" | grep -E "$SMOKE_INVARIANT_DENY" | head -5 | sed 's/^/        /'; rc=1
+else
+    echo "  PASS: no latched kernel invariant line (non-ready pick, out-of-band asserts, kstack_check_entry, #DF)"
 fi
 echo ""
 if [ "$rc" -eq 0 ]; then echo "agnsh-smoke: PASS"; else echo "agnsh-smoke: FAIL"; fi

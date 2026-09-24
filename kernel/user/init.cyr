@@ -21,9 +21,15 @@ fn kybernet_exec_agnsh() {
     store8(&kyb_env + 7, 80);  store8(&kyb_env + 8, 87);
     store8(&kyb_env + 9, 68);  store8(&kyb_env + 10, 61);
     store8(&kyb_env + 11, 47); store8(&kyb_env + 12, 0);
+    # ⭐ 1.57.6 (Path 2, S3.3): the env cells are PER-CPU and consumed at the loader's entry, and kmain runs IF=1
+    # here: a tick between the set and the load could hand the BSP to a process whose own #43 sets (and
+    # consumes) the same cells. preempt_disable over set + load (elf_load_from_file brackets itself too;
+    # the count nests).
+    preempt_disable();
     exec_env_src_set(&kyb_env);         # 1.46.8: per-CPU, consumed-at-entry by the loader (BSP=slot 0)
     exec_env_len_set(13);
     var pid = elf_load_from_file("/bin/agnsh", 10, "/bin/agnsh", 10);
+    preempt_enable();
     if (pid < 0) { return 0 - 1; }
     var ep = &proc_table + pid * 176;
     var e = load64(ep + 24);      # entry
@@ -38,7 +44,10 @@ fn kybernet_exec_agnsh() {
     # launch path do the same. enter_ring3's iretq restores IF=1 for agnsh (rflags_start=0x202), so
     # agnsh still runs PREEMPTIBLE — only the setup gap is masked. (No sti needed on the post-exit
     # path: kernel_resume already returns here IF=0 from the exit#0 handler.)
-    asm { 0xFA; }   # cli — mask the timer for the unpinned setup gap (mirrors the IF=0 #37 path)
+    # ⭐ 1.57.6 (Path 2, S3.3): kbd_irq_save instead of the bare cli — the same mask, plus the caller's IF comes
+    # back after the reap (kybernet continues IF=1, as it entered; the S3.2 preempt-disabling locks are what
+    # make its console prints safe to preempt).
+    var rf = kbd_irq_save();
     proc_current_set(pid);
     # 1.46.x BITE 2 — RE-ENABLE preemptive agnsh (IF=1) on the per-proc RSP0 foundation (bite 1).
     # HISTORY: 1.44.14 launched agnsh IF=1 so the timer time-slices its prompt against #43 background
@@ -79,6 +88,7 @@ fn kybernet_exec_agnsh() {
     exec_and_wait(e, r, c);
     var code = proc_get_exit_code(pid);
     proc_reap(pid);
+    kbd_irq_restore(rf);
     return code;
 }
 
@@ -101,10 +111,11 @@ fn kybernet() {
         var nstp = elf_load_from_file("/bin/dig", 8, "/bin/dig @10.0.2.3 example.com", 30);
         if (nstp >= 0) {
             var nste = &proc_table + nstp * 176;
-            asm { 0xFA; }   # 1.46.8 (#2): cli the unpinned setup gap (see the agnsh launch above)
+            var nrf = kbd_irq_save();   # 1.46.8 (#2) + 1.57.6: mask the unpinned setup gap; IF back after the reap
             proc_current_set(nstp);
             exec_and_wait(load64(nste + 24), load64(nste + 16), load64(nste + 160));
             proc_reap(nstp);
+            kbd_irq_restore(nrf);
             kprintln("kybernet: NET_SELFTEST dig done", 31);
         } else {
             kprintln("kybernet: NET_SELFTEST dig load FAIL", 36);

@@ -490,6 +490,13 @@ fn sh_cmd_run(arg, arglen) {
     # (proc_set_exit_code(proc_current_get(), …)) records the code on THIS pid — without
     # it, a second sequential `run` left proc_current_get() on the prior pid and the
     # exit code came back 0.
+    # ⭐ 1.57.6 (Path 2, S3.3) — exec_and_wait IS ENTERED IF=0, AND THIS CALLER GETS ITS OWN IF BACK. The shell
+    # loop runs IF=1 (its idle wait is arch_wait), so a tick between proc_current_set(pid) and exec_and_wait's
+    # pin would save kmain's registers into the child's slot and revive it unpinned (kybernet's launch closed
+    # the same gap with a bare cli). And the restore after the reap is what the old code never did: `run`
+    # returned to the shell IF=0 (exit#0 enters with IF masked), and the shell's next arch_wait halted with
+    # interrupts off — forever (measured at 1.57.6 S1 with /bin/tscp).
+    var rf = kbd_irq_save();
     proc_current_set(pid);
     exec_and_wait(e, r, c);
     kprint("run: exit ", 10);
@@ -501,6 +508,7 @@ fn sh_cmd_run(arg, arglen) {
     # every `run` permanently consumed 2 of the 6 usable 2 MB regions, so the
     # 4th run failed with pmm_alloc_2mb exhaustion; now `run` is unbounded.
     proc_reap(pid);
+    kbd_irq_restore(rf);
     return 0;
 }
 
@@ -632,7 +640,7 @@ fn sh_exec(buf, len) {
         return 0;
     }
     if (sh_streq(buf, clen, "pipe", 4) == 1) {
-        var pfds[2];
+        var pfds[16];                  # BYTES (function-local): vfs_create_pipe stores two u64
         var pr = vfs_create_pipe(&pfds);
         if (pr < 0) { kprintln("pipe: failed", 12); return 0; }
         var rfd = load64(&pfds);

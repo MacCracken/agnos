@@ -1,5 +1,6 @@
 # 2026-09-23 — `spawn_path`#43 answers -1 for every failure: a full process table and a missing or broken executable look the same
 
+**Status:** ✅ **RESOLVED 1.57.6 (2026-09-24)** — `spawn_path`#43 returns `pid` or a negated `SPAWN_E_*` code: −2 `NOPROC` (process table full), −3 `NOMEM`, −4 `NOENT`, −5 `NOEXEC`, −6 `ARGS`; −1 is reserved for "anything else" and no 1.57.6 path produces it. `execwait`#37 folds every code to −1. Gate: `scripts/smoke/spawn-smoke.sh` (sweep row; kernel block `spawnk: elf codes OK`, ring 3 `SPAWNX-ENOENT-OK`, `-ENOEXEC-OK`, `-ENOEXEC-TINY-OK`, `-ENOPROC-OK`, `-EARGS-LINE-OK` at `-smp 1` and `-smp 4`). Built, gated, NOT burned. See § Resolution.
 **Filed by:** daimon (the AGNOS agent orchestrator). It starts agents with `#43`, and when a start
 fails it has to tell its operator why.
 **Checked against:** agnos **1.57.5**: the `#43` arm in `kernel/core/syscall.cyr` (`:10487`),
@@ -52,3 +53,32 @@ Distinct negative codes, as `#97` already has with `CH_E_*`. At least:
   audited (`agent.spawn.fail`). The agent is marked failed and can be started again.
 - A full channel table is already distinct (`CH_MINT` answers `-CH_E_FULL`). daimon answers that one
   precisely: 503, "no room for another agent" (daimon 2.4.1).
+
+---
+
+## Resolution (1.57.6, 2026-09-24)
+
+**What shipped** (ABI §4.8 code table, normative): the codes come from `elf_load_from_file`
+(`elf_bail_code`) and from the `#43` body, which now lives in `spawn_path_sys` with ONE wrapper exit.
+
+| code | name | meaning |
+|---|---|---|
+| −2 | `SPAWN_E_NOPROC` | the 16-slot table is full — deliberately agnos's WOULD_BLOCK value; found only after the ELF is loaded, so back off |
+| −3 | `SPAWN_E_NOMEM` | page tables / 2 MB pages exhausted, or a `SPAWN_F_CLEANFD` child got no private fd table |
+| −4 | `SPAWN_E_NOENT` | missing, not a regular file, short read, or no ext2 root |
+| −5 | `SPAWN_E_NOEXEC` | not an ELF64 agnos loads (size, magic/class, entry, phdrs, PT_LOAD bounds, W^X) |
+| −6 | `SPAWN_E_ARGS` | bad a2, a path range the caller does not own, empty path, bad argv blob, > 16 tokens/entries, or (flagged forms only) a bad env blob |
+
+Every consumer surveyed tests `pid < 0`, so existing callers keep working; a failed pid passed to
+`waitpid`#4 lands in the same wait-any arm for −2..−6 as for −1.
+
+**The `#99` observation (zombies not listed):** documented, not changed (lead decision D10) — ABI row 99
+and §4.8 say that an exited, unreaped child holds its slot but is not listed, and that **−2 from `#43`, not
+a `#99` count, is the authoritative "table full" answer**. Listing unreaped children with a distinct state
+is part of roadmap step S7.
+
+**What the change broke — checked before archiving:** nothing observed (sweep, `ktest`, `agnsh-smoke`, the
+spawn/#37 harnesses). The 1.57.5 control reads −1 for every kind. The "argc<=8" comment is fixed.
+
+**Consumer notes:** daimon can map −2/−3 to capacity and −4/−5 to precise errors. cyrius peer constants are
+filed in cyrius `docs/development/issues/2026-09-24-agnos-spawn-flags-redirect-ops-and-uptime-us-peer.md`.

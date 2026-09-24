@@ -214,7 +214,15 @@ try:
     p("  ... and before the job finished (concurrency):", ver_before_done, "(job done in launch seg:", done_before_version, ")")
     p("bg job ran to completion (SLEEPER-DONE):", sleeper_ran)
     p("agnsh reaped the bg job ([1] Done):", reaped)
-    if launched and ver_live and sleeper_ran and reaped:
+    # ⛔ 1.57.6 (S3-fix): the kernel's LATCHED invariant lines (scripts/smoke/lib/qemu-dwell.sh SMOKE_INVARIANT_DENY —
+    # keep the two patterns identical) print once to klug + COM1 and change nothing else, so this harness scored PASS
+    # with them firing until it grepped for them.
+    import re as _re_inv
+    INV_DENY = r"sched: refused non-ready pick|sched: exec_and_wait entered with|sched: kernel_resume with|syscall: kernel stack is not the caller|PANIC: Double Fault"
+    inv_hits = [ln for ln in ser().splitlines() if _re_inv.search(INV_DENY, ln)]
+    inv_ok = not inv_hits
+    p("no latched kernel invariant line:", inv_ok, ("" if inv_ok else " -- " + " | ".join(inv_hits[:5])))
+    if launched and ver_live and sleeper_ran and reaped and inv_ok:
         p("agnsh-bg-test: PASS — `sleeper &` launched non-blocking via #43, prompt stayed live, job reaped with [1] Done")
         rc = 0
     else:

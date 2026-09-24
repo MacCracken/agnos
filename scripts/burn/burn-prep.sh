@@ -509,7 +509,9 @@ elif [ -n "${BURN_EDGE_COV:-}" ]; then
     #
     # ⭐ FIXED AND PROVEN AT ZERO BURNS: `uptime_us`#95 — rdtsc-backed (needs no interrupts),
     # calibrated at boot against 50 ms of live ticks, returns -1 rather than a plausible 0 when
-    # calibration is refused. scripts/smoke/tsc-smoke.sh is a DIFFERENTIAL proof: a ring-3 probe samples
+    # calibration is refused. (As of 1.57.6 the reference is the ACPI PM timer, live ticks only where
+    # the FADT advertises none, and -1 is permanent for the boot: docs/architecture/kernel-clocks.md.)
+    # scripts/smoke/tsc-smoke.sh is a DIFFERENTIAL proof: a ring-3 probe samples
     # #95 around a busy loop with interrupts off and it ADVANCES (3/3, `run: exit 1`) — exactly
     # where #40 cannot. Calibration on archaemenid measured 3194 cycles/us, so the long-assumed
     # GPU_TSC_PER_US = 3000 is 6.5% low (not retuned here — that is its own bite).

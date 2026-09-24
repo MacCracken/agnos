@@ -336,6 +336,10 @@ else
         # staged (scripts/burn/stage-tools.sh) — fork cannot be tested from kernel context at all.
         [ -n "$FORK_SELFTEST" ]      && echo '#define FORK_SELFTEST'
         [ -n "$PIPE_RC_SELFTEST" ]   && echo '#define PIPE_RC_SELFTEST'
+        # SPAWN_SELFTEST=1 — 1.57.6: spawn_path#43 codes, per-process #62/CH_ENDOW arms, CLEANFD shaping,
+        # the argv-blob validator and the pipe last-reference lifetime (core/selftests.cyr, after the
+        # proc-table bootstrap). Driven by scripts/smoke/spawn-smoke.sh, which also runs PIPE_RC_SELFTEST.
+        [ -n "$SPAWN_SELFTEST" ]     && echo '#define SPAWN_SELFTEST'
         [ -n "$DOOM_SELFTEST" ]      && echo '#define DOOM_SELFTEST'
         [ -n "$DOOM_DIRECTMAP" ]     && echo '#define DOOM_DIRECTMAP'
         [ -n "$AETHERSAFHA_SELFTEST" ] && echo '#define AETHERSAFHA_SELFTEST'
@@ -452,6 +456,13 @@ else
         [ -n "$JBD2_NO_REPLAY" ]     && echo '#define JBD2_NO_REPLAY'
         [ -n "$THREAD_SELFTEST" ]    && echo '#define THREAD_SELFTEST'
         [ -n "$RING3_SELFTEST" ]     && echo '#define RING3_SELFTEST'
+        # KSTACK_SELFTEST=1 — 1.57.6 (Path 2, S3.3): per-process kernel stacks, CPL0 switch windows, the lock-holder /
+        # storm / fallback phases and the region-7 guard walk (scripts/smoke/kstack-smoke.sh).
+        [ -n "$KSTACK_SELFTEST" ]    && echo '#define KSTACK_SELFTEST'
+        # KSTACK_HW=1 — 1.57.6 (S3-fix): paint every per-process kernel stack when its slot is handed out and print
+        # "kstack-hw: max=..." on COM1 whenever a reap / hand-out finds a deeper one (core/proc.cyr). DERIVED from
+        # KSTACK_SELFTEST too (its probes read the paint), so that flag now costs two define slots.
+        { [ -n "$KSTACK_SELFTEST" ] || [ -n "$KSTACK_HW" ]; } && echo '#define KSTACK_HW'
         [ -n "$SCHED_STRESS_SELFTEST" ] && echo '#define SCHED_STRESS_SELFTEST'
         [ -n "$FLOCK_SELFTEST" ]     && echo '#define FLOCK_SELFTEST'
         [ -n "$WINSIZE_SELFTEST" ]   && echo '#define WINSIZE_SELFTEST'

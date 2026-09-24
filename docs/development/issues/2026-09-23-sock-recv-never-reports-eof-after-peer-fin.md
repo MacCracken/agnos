@@ -1,5 +1,6 @@
 # 2026-09-23 — `sock_recv`#49 never reports the end of a stream the peer has closed
 
+**Status:** 🟡 **OPEN** — fixed by step **S4** (`tcp_conn_eof`: CLOSE_WAIT with a drained ring answers -1; `tcp_send` allowed in CLOSE_WAIT; `tcp_close` from CLOSE_WAIT sends our FIN). Not in 1.57.6. The Path 2 foundation this step builds on — per-process syscall kernel stacks, the deferred `on_cpu` release, preempt-disabling spinlocks, region-7 guard pages (bites S3.1–S3.3) — landed in **1.57.6**; see `docs/development/planning/blocking-syscall-concurrency.md` § Path 2 plan and the roadmap's 1.57.x table.
 **Filed by:** daimon (the AGNOS agent orchestrator), testing its HTTP API inside the guest with a
 client that reads each response until the server closes.
 **Checked against:** agnos **1.57.5**: `kernel/core/net_tcp.cyr` (`net_handle_tcp`'s FIN handling,

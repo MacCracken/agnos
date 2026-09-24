@@ -62,6 +62,10 @@ cp "$OVMF_VARS" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 echo "=== AGNOS 1.44.x preemptive ring-3 smoke ==="
 LOG="$LOGS/ring3.log"
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
+# 1.57.6 (S3): SMOKE_SMP=N boots with -smp N (default 1 = unchanged); see smoke_accel in qemu-dwell.sh.
+SMOKE_SMP="${SMOKE_SMP:-1}"
+ACCEL="$(smoke_accel "$SMOKE_SMP")"
+echo "accel: $ACCEL (-smp $SMOKE_SMP)"
 # ⛔⛔ 1.56.55 — 40 s WAS TOO SHORT AND THE TAIL OF THE SELFTEST FELL OFF THE END. RING3_SELFTEST
 # runs ~10 sub-tests, and the last three markers (`ring3: yield OK`, `ring3: gate held`, `ring3: done`)
 # landed after the dwell expired, so the smoke reported them "not found". That read as two defects that
@@ -78,7 +82,7 @@ LOG="$LOGS/ring3.log"
 # header documents. Retries are banner-gated, so a kernel that boots and then fails gets no second try.
 qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-120}" "$WORK/vars.fd" "$OVMF_VARS" \
     qemu-system-x86_64 \
-    -machine q35 -m 512M -cpu max \
+    -machine q35 -m 512M $ACCEL -smp "$SMOKE_SMP" \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$ESP,format=raw,if=none,id=esp0" -device "nvme,drive=esp0,serial=AGNOS-SMOKE" \
@@ -98,6 +102,8 @@ if strings "$LOG" | grep -q "ring3: parent spawn+wait OK"; then pass_ "a ring-3 
 if strings "$LOG" | grep -q "ring3: stress OK"; then pass_ ">=8 concurrent ring-3 procs (code/stack in PD[8..63]) all stayed live — the page-table VA-collision fix holds (pre-fix this triple-faults in proc_get_user_cr3's PML4 load64)"; else fail_ "'ring3: stress OK' not found — page-table VA-collision (a context switch SMAP-faulted on a user-flagged PML4, or a stress proc died)"; fi
 if strings "$LOG" | grep -q "ring3: nonlifo reuse OK"; then pass_ "a NON-TOP reaped proc-table slot was REUSED by the next spawn (non-LIFO reclaim) — out-of-order background-job exits no longer leak proc_table slots"; else fail_ "'ring3: nonlifo reuse OK' not found — out-of-order reap leaks its proc_table slot (append-only allocation regression)"; fi
 if strings "$LOG" | grep -q "ring3: nonlifo signal clear OK"; then pass_ "a recycled proc-table slot does not inherit the prior occupant's pending signals/mask (proc_alloc_slot clears them)"; else fail_ "'ring3: nonlifo signal clear OK' not found — recycled slot inherited stale signal state"; fi
+# ⛔ 1.57.6 (S3-fix): the kernel's latched invariant lines (SMOKE_INVARIANT_DENY, qemu-dwell.sh) change no exit code.
+if strings "$LOG" | grep -qE "$SMOKE_INVARIANT_DENY"; then fail_ "a latched kernel invariant line fired: $(strings "$LOG" | grep -E "$SMOKE_INVARIANT_DENY" | head -3 | tr '\n' ' ')"; else pass_ "no latched kernel invariant line (non-ready pick, out-of-band asserts, kstack_check_entry, #DF)"; fi
 if strings "$LOG" | grep -q "ring3: yield OK"; then pass_ "sched_yield #44 — the yielder resumed at the post-SYSCALL RIP with rax=0 AND donated its slice (non-yielder counter >> 10x yielder)"; else fail_ "'ring3: yield OK' not found — yield round-trip broke or the slice was not donated (see 'ring3: Y= A=' line)"; fi
 echo ""
 echo "=== ring3-smoke: $np passed, $nf failed ==="

@@ -191,7 +191,7 @@ fn test_vfs() {
     test_assert_eq(vfs_close(32), 0 - 1, "close fd=32 rejected", 20);
 
     # Pipe create, write, read
-    var pfds[2];
+    var pfds[16];                     # BYTES (function-local): the pipe writes two u64 (rfd@0, wfd@8)
     var pr = vfs_create_pipe(&pfds);
     test_assert_eq(pr, 0, "pipe create ok", 14);
     var rfd = load64(&pfds);
@@ -320,7 +320,7 @@ fn test_syscall() {
     }
 
     # pipe syscall
-    var pfds[2];
+    var pfds[16];                     # BYTES (function-local): the pipe writes two u64 (rfd@0, wfd@8)
     var pr = ksyscall(25, &pfds, 0, 0);
     test_assert_eq(pr, 0, "pipe syscall returns 0", 22);
     var rpfd = load64(&pfds);

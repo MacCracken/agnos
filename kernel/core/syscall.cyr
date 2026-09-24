@@ -85,9 +85,8 @@ fn ew37_kr_rsp_get() { return load64(&pcpu_ew37_kr_rsp + pcpu_cpu() * 8); }
 var pcpu_ew37_kr_rip[4];      # kernel_return_rip
 fn ew37_kr_rip_set(v) { store64(&pcpu_ew37_kr_rip + pcpu_cpu() * 8, v); return 0; }
 fn ew37_kr_rip_get() { return load64(&pcpu_ew37_kr_rip + pcpu_cpu() * 8); }
-var pcpu_ew37_rsp_save[4];    # kernel_rsp_save — agnsh's user RSP (the exit stub reloads it pre-SYSRET)
-fn ew37_rsp_save_set(v) { store64(&pcpu_ew37_rsp_save + pcpu_cpu() * 8, v); return 0; }
-fn ew37_rsp_save_get() { return load64(&pcpu_ew37_rsp_save + pcpu_cpu() * 8); }
+# (1.57.6 S3.3: pcpu_ew37_rsp_save is GONE — the caller's user RSP is in its own syscall frame, [ktop-8],
+# and the exit stub loads it from there; nothing per-CPU needs saving across the nested run.)
 var pcpu_ew37_a4[4];          # ksyscall_a4 (defense-in-depth)
 fn ew37_a4_set(v) { store64(&pcpu_ew37_a4 + pcpu_cpu() * 8, v); return 0; }
 fn ew37_a4_get() { return load64(&pcpu_ew37_a4 + pcpu_cpu() * 8); }
@@ -106,6 +105,31 @@ fn ew37_cpid_get() { return load64(&pcpu_ew37_cpid + pcpu_cpu() * 8); }
 var pcpu_ew37_code[4];        # child exit code captured post-resume
 fn ew37_code_set(v) { store64(&pcpu_ew37_code + pcpu_cpu() * 8, v); return 0; }
 fn ew37_code_get() { return load64(&pcpu_ew37_code + pcpu_cpu() * 8); }
+# 1.57.6 (Path 2, S3.3) — EXEC_SELFTEST witness for #37's step (h): right after the resume, TSS.RSP0 AND this CPU's
+# syscall top must both be the CALLER's kernel-stack top again (TSS.RSP0 used to be left on the reaped child's
+# slot). exec-smoke gates on it.
+# ⚠ At caller pid 0 the witness is VACUOUS: kernel_resume parks both on slot 0 (kstack_install(0)), which IS a
+# pid-0 caller's stack, so (h)'s re-install and its absence read the same — mutation M-B6 (delete (h)'s install)
+# measured exactly that, 'restored' twice, before the selftest ran /bin/exwv at a non-zero pid. It says so
+# instead of passing.
+#ifdef EXEC_SELFTEST
+fn ew37_rsp0_check() {
+    var rc_c = tss_get_current_cpu_id();
+    if (rc_c >= 4) { rc_c = 0; }
+    var rc_p = ew37_pid_get();
+    if (rc_p == 0) { kprintln("exec: rsp0 check VACUOUS (caller pid 0)", 39); return 0; }
+    var rc_ok = 0;
+    if (load64(&tss_array + rc_c * 104 + 4) == proc_rsp0_top(rc_p)) {
+        if (load64(&pcpu_syscall_kstack_top + pcpu_cpu() * 8) == proc_rsp0_top(rc_p)) { rc_ok = 1; }
+    }
+    if (rc_ok == 1) { kprintln("exec: rsp0 restored", 19); }
+    else { kprintln("exec: RSP0 STALE", 16); }
+    return 0;
+}
+#endif
+#ifndef EXEC_SELFTEST
+fn ew37_rsp0_check() { return 0; }
+#endif
 # 1.46.x SMP sub-bite 4d: the #37 re-entrancy guard goes PER-CPU (was a single global `ew37_busy`).
 # Each CPU tracks its OWN nested-exec state so a #37 in flight on CPU N does not block CPU M. Capped
 # via pcpu_cpu() (syscall_hw.cyr); single-core fast path = slot 0 → byte-for-byte the old global.
@@ -136,14 +160,45 @@ fn ew37_path_base() { return &pcpu_ew37_path + pcpu_cpu() * 128; }   # kernel co
 var pcpu_spawn_elf_buf[8192];
 fn spawn_elf_buf_base() { return &pcpu_spawn_elf_buf + pcpu_cpu() * 16384; }
 
-# 1.44.11: spawn_path(#43) path/argv staging buffer ([16] = 16 u64 = 128 B, exactly like
-# ew37_path — a module-global var X[N] is N*u64 = 8N bytes). Holds the caller's "PATH
-# [args..]" line (capped ≤127 by the arg2>127 guard) for the NON-BLOCKING from-disk spawn —
+# 1.44.11: spawn_path(#43) path/argv staging buffer (128 B per CPU until 1.57.6 — see below; a
+# module-global var X[N] is N*u64 = 8N bytes). Holds the caller's "PATH [args..]" line (capped at
+# SPAWN_LINE_MAX) or its SPAWN_F_ARGV blob for the NON-BLOCKING from-disk spawn —
 # copied here under the caller CR3 BEFORE the boot-CR3 switch (the user VA won't resolve once
 # CR3 is the NVMe-BAR-mapping boot CR3). A DEDICATED buffer (not ew37_path) so a #43 from a
 # bg proc can never collide with agnsh's in-flight #37 frame.
-var pcpu_spawn_path_buf[64];   # 1.46.x STEP-2 (#3): PER-CPU. 16 u64 (128 B) per CPU × 4; cpu c at byte c*128.
-fn spawn_path_buf_base() { return &pcpu_spawn_path_buf + pcpu_cpu() * 128; }
+# ⭐ 1.57.6: WIDENED 128 -> 1024 B per CPU — it now also stages spawn_path#43's SPAWN_F_ARGV blob (up to
+# SPAWN_ARGV_MAX bytes, NULs included). The line form still uses at most SPAWN_LINE_MAX of it.
+# [512] = 512 u64 = 4096 B = 4 CPUs x 1024; cpu c at byte c*1024. (The 8N module-global rule.)
+var pcpu_spawn_path_buf[512];
+fn spawn_path_buf_base() { return &pcpu_spawn_path_buf + pcpu_cpu() * 1024; }
+
+# ── 1.57.6 — spawn_path#43 / execwait#37 LIMITS, #43 FLAGS, #62 OPS, #43 ERROR CODES ──────────────────
+# (issues 2026-09-23-spawn-path-args-cannot-contain-spaces, -spawn-path-failure-gives-no-reason,
+#  -child-inherits-every-fd-and-spawn-arms-leak). The ABI is in agnos-userland-abi.md §4.8.
+# ⚠ scripts/check/check-initstack.sh parses SPAWN_LINE_MAX / SPAWN_ARGV_MAX / SPAWN_ARGC_MAX from THIS
+# file as mandatory inputs: keep each `var NAME = <decimal>;` on one line.
+var SPAWN_LINE_MAX = 127;           # the space-split line form (#43 flags==0, #37): payload bytes
+var SPAWN_ARGV_MAX = 1024;          # the #43 SPAWN_F_ARGV blob: total bytes, NULs included
+var SPAWN_ARGC_MAX = 16;            # entries / tokens, both forms — MUST equal elf.cyr's tokenizer cap
+# #43 a2 = len (bits 0-15) | flags. Bits >= 18 are refused (-SPAWN_E_ARGS): every a2 >= 65536 failed
+# with -1 before 1.57.6 (`arg2 > 127`), so no previously-successful value changes meaning.
+var SPAWN_F_ARGV    = 0x10000;      # bit 16: a1 is `argv0\0argv1\0...argvN\0` (argv[0] is the path)
+var SPAWN_F_CLEANFD = 0x20000;      # bit 17: the child's table is 0/1/2 + armed redirect srcs + the endowment
+# #62 a1 = src | op << 8 (op 0 = replace the set with this pair — every pre-1.57.6 call).
+var REDIR_OP_ADD   = 1;             # 0x100 | src: add, or re-point an armed src; max SPAWN_REDIR_MAX (proc.cyr)
+var REDIR_OP_CLEAR = 2;             # 0x200: empty the caller's set
+# #43 failure codes, returned NEGATED (the CH_E_* convention): pid >= 0, or -SPAWN_E_*.
+# elf.cyr's elf_load_from_file returns them too (defined here, referenced there — globals resolve late).
+# ⚠ -2 is deliberately agnos's WOULD_BLOCK value (#4/#5): "the same call may succeed later".
+# ⚠ execwait#37 FOLDS every one of these to -1 — its success value is the child's exit code, and a
+# child may exit(-2). spawn#3 is unchanged (-1).
+var SPAWN_E_OTHER  = 1;             # reserved: -1 still means "anything else"; no 1.57.6 path produces it
+var SPAWN_E_NOPROC = 2;             # the 16-slot process table is full (retry once a slot is reaped)
+var SPAWN_E_NOMEM  = 3;             # out of page-table / 2 MB pages, or a CLEANFD child got no private table
+var SPAWN_E_NOENT  = 4;             # executable missing, not a regular file, unreadable, or no ext2 root
+var SPAWN_E_NOEXEC = 5;             # not an ELF64 this kernel will load (magic/class/entry/phdr/segment, W^X, size)
+var SPAWN_E_ARGS   = 6;             # bad a2 (flags/length), bad path range, empty path, bad argv blob,
+# > SPAWN_ARGC_MAX tokens, or (flagged forms only) a bad env blob
 # 1.44.19: per-process env staging — kernel copies of the caller's flat "KEY=V\0KEY=V\0"
 # blob (a3=ptr, a4=len on #37/#43; <=1024 B, <=16 entries). DEDICATED buffers per the
 # spawn_path_buf rationale above (a bg-proc #43 must never collide with agnsh's in-flight
@@ -157,103 +212,188 @@ fn ew37_env_base() { return &pcpu_ew37_env + pcpu_cpu() * 1024; }
 # 1.46.x (fd-redirect for output capture) — issue 2026-06-15-cyrius-stdlib-missing-syscalls
 # group 1 ("the high-value one": an fd-redirect primitive for capturing subprocess helpers;
 # consumers: cyrius's regression test-runner (run-a-tool-and-read-its-stdout), shakti session
-# logging). A ONE-SHOT redirect consumed by the NEXT execwait#37: route the child's writes to
-# `redir_src_fd` (e.g. 1=stdout) to `redir_dst_fd`'s backend (an open writable file or pipe).
-# Works because #37 is run-to-completion (the parent is suspended while the child runs), so we
-# save the src fd's vfs_table entry, copy the dst entry over it for the child's run, and restore
-# on resume — no per-proc fd table needed. NOT applied to the non-blocking spawn#3 (the child
-# runs later → a per-proc redirect is the follow-on). vfs_table entry = 32 B (4 u64).
-# 1.46.x SMP STEP-2 (#3): PER-CPU. The redirect spans TWO syscalls (exec_redirect#62 arms, the
-# next execwait#37 consumes) — both run on the SAME CPU (each CPU's agnsh/bg-proc arms then execs
-# on itself), so per-CPU state keeps one CPU's armed redirect from leaking into another CPU's #37.
-var pcpu_redir_pending[4];   # 1 = a redirect is armed for the next execwait#37
-fn redir_pending_set(v) { store64(&pcpu_redir_pending + pcpu_cpu() * 8, v); return 0; }
-fn redir_pending_get() { return load64(&pcpu_redir_pending + pcpu_cpu() * 8); }
-var pcpu_redir_src_fd[4];    # the fd the child writes to (gets repointed)
-fn redir_src_fd_set(v) { store64(&pcpu_redir_src_fd + pcpu_cpu() * 8, v); return 0; }
-fn redir_src_fd_get() { return load64(&pcpu_redir_src_fd + pcpu_cpu() * 8); }
-var pcpu_redir_dst_fd[4];    # the backend the writes go to
-fn redir_dst_fd_set(v) { store64(&pcpu_redir_dst_fd + pcpu_cpu() * 8, v); return 0; }
-fn redir_dst_fd_get() { return load64(&pcpu_redir_dst_fd + pcpu_cpu() * 8); }
-var pcpu_redir_backup[16];   # 4 u64 (32-byte vfs_table entry save) per CPU × 4; cpu c at byte c*32.
-fn redir_backup_base() { return &pcpu_redir_backup + pcpu_cpu() * 32; }
+# logging). `exec_redirect`#62 arms redirects for the caller's NEXT child: the child's writes to a src
+# fd (e.g. 1 = stdout) route to a dst fd's backend (an open writable file or pipe). vfs_table entry = 32 B.
+#
+# ⭐ 1.57.6 — THE ARM IS PER-PROCESS AND HOLDS UP TO SPAWN_REDIR_MAX PAIRS (proc.cyr, proc_redir_*).
+# ⛔ It was a single per-CPU (src, dst) pair. Per-CPU let ANOTHER process on the same CPU consume an arm
+# (an arm spans two syscalls from preemptible IF=1 ring-3 code — see the proc.cyr banner), and one pair
+# could not capture stdout AND stderr. Keyed by the arming pid, only that process's own next child
+# creation reads it; `#62` op 1 (REDIR_ADD) appends pairs, op 2 (REDIR_CLEAR) empties the set.
+# ⭐ PAIRS APPLY IN ARM ORDER AND EACH dst IS READ FROM THE CHILD'S *CURRENT* TABLE, so
+# ADD(2 <- 1) after (1 <- w) is shell `2>&1`: fd 2 receives what fd 1 has just become.
+# ⚠ A pair whose src is the fd the creator's channel endowment was just placed on is SKIPPED (with a
+# line): overwriting it would leave the child owning an endpoint that no fd refers to. REDIR_ADD and
+# chan_endow_pick_fd keep the two apart in either arm order; this covers an op-0 REPLACE.
+# ⚠ Every #43 and #37 return clears the caller's WHOLE arm state (spawn_arms_clear), success or not.
+#
+# The per-CPU half that remains is the #37 BACKUP (the child's original src entries, restored when the
+# child exits). #37 is run-to-completion and its nest is per-CPU and single-level, so per-CPU is exact.
+# The arrays live in vfs.cyr (pcpu_redir_backup / pcpu_redir_bsrc) because pipe_buf_referenced must
+# see a saved pipe entry as a live reference; only these accessors (x86-only) index them by CPU.
+fn redir_backup_base() { return &pcpu_redir_backup + pcpu_cpu() * 128; }   # SPAWN_REDIR_MAX x 32 B per CPU
+fn redir_bsrc_base() { return &pcpu_redir_bsrc + pcpu_cpu() * 32; }        # SPAWN_REDIR_MAX x u64 per CPU
 
-# Apply the armed redirect: save vfs_table[src] into redir_backup, copy vfs_table[dst] over it.
-# Called by execwait#37 right before running the child (under boot CR3 — vfs_table is kernel
-# memory, identity-mapped). No-op when nothing is armed (so #37 stays byte-identical by default).
-fn exec_redirect_apply() {
-    if (redir_pending_get() == 0) { return 0; }
-    var rsrc = vfs_fd_table_of(ew37_cpid_get()) + redir_src_fd_get() * 32;
-    var rdst = vfs_fd_table_of(ew37_cpid_get()) + redir_dst_fd_get() * 32;
+# execwait#37: apply `creator`'s armed redirects to `child`'s table, saving each src entry in this CPU's
+# backup. Called right before the child runs (under boot CR3 — fd tables are kernel heap).
+# ⛔ #37 MUST PASS BOTH PIDS: after kernel_resume proc_current_get() is 0, so the restore keyed by it
+# would silently skip — harmless on a private child table, but on the global-table fallback it would
+# leave proc 0's fd permanently repointed (exec-redirect-smoke's global snapshot catches exactly that).
+# ⚠ LOCK-FREE ON PURPOSE, unlike the restore: every entry this overwrites or copies is a DUPLICATE of one the
+# creator still holds (the child's table was copied from the creator's and the child has not run yet), and
+# the creator is suspended in this #37 until the restore — so no pipe buffer can lose its last reference
+# here, and a concurrent scan that catches a half-copied slot still finds the creator's own entry.
+fn exec_redirect_apply(creator, child) {
+    var ran = redir_n_get(creator);
+    if (ran == 0) { return 0; }
+    var rtbl = vfs_fd_table_of(child);
+    var rplaced = endow_placed_get(creator) - 1;          # -1 = no endowment was placed
     var rbk = redir_backup_base();
-    var k = 0;
-    while (k < 32) {
-        store64(rbk + k, load64(rsrc + k));   # save src entry
-        store64(rsrc + k, load64(rdst + k));             # src <- dst (child's writes now route to dst)
-        k = k + 8;
+    var rbs = redir_bsrc_base();
+    var ri = 0;
+    while (ri < ran) {
+        var rs = redir_src_get(creator, ri);
+        var rd = redir_dst_get(creator, ri);
+        store64(rbs + ri * 8, 0);
+        if (rs == rplaced) {
+            kprintln("spawn: redirect onto the endowed fd skipped", 43);
+        } else {
+            var rk = 0;
+            while (rk < 32) {
+                store64(rbk + ri * 32 + rk, load64(rtbl + rs * 32 + rk));   # save the src entry
+                store64(rtbl + rs * 32 + rk, load64(rtbl + rd * 32 + rk));  # src <- dst, from the CURRENT table
+                rk = rk + 8;
+            }
+            store64(rbs + ri * 8, rs + 1);
+        }
+        ri = ri + 1;
     }
     return 0;
 }
-# Restore the src fd entry after the child run; clears the one-shot.
-fn exec_redirect_restore() {
-    if (redir_pending_get() == 0) { return 0; }
-    var rsrc = vfs_fd_table_of(ew37_cpid_get()) + redir_src_fd_get() * 32;
-    var k = 0;
-    var rbk = redir_backup_base();
-    while (k < 32) { store64(rsrc + k, load64(rbk + k)); k = k + 8; }
-    redir_pending_set(0);
+# Restore after the child exits: REVERSE arm order (a later pair may have read an earlier pair's
+# result), zero each backup (a stale backup would otherwise pin a pipe buffer in pipe_buf_referenced),
+# then clear the creator's redirect set.
+# ⛔ THE ENTRY BEING OVERWRITTEN CAN BE A SOLE PIPE REFERENCE. The child owned its slot while it ran; if it
+# closed the redirected fd and made a pipe that landed there, the restore drops that pipe's last
+# reference in THIS table — so it is dropped through pipe_buf_put instead of silently leaked.
+# ⛔⛔ AND THE OVERWRITE, THE BACKUP ZEROING AND THAT pipe_buf_put ARE ONE fs_lock HOLD, NEVER "overwrite, then
+# lock and re-check". The child may have handed the same buffer to a #43 grandchild that is still running
+# on another CPU. Overwriting the slot lock-free made the reference vanish while the lock was free: the
+# grandchild's last close (vfs_close_inner, under fs_lock) then scanned, found nothing, and freed the
+# buffer — and the restore's own later pipe_buf_put scanned, found nothing either, and freed it AGAIN: a
+# double push on the 4096 slab free list, so two later kmalloc(4096)s (pipes, TCP rings) alias. With the
+# slot cleared and the scan in one hold (the rule vfs_close_inner and proc_destroy_fd_table already keep),
+# the two droppers serialize and exactly one of them sees "no other reference" — see the lifetime banner
+# at pipe_buf_referenced (vfs.cyr).
+# ⚠ preempt_disable brackets it because fs_spin_lock is a plain xchg that does not nest (written before 1.57.6
+# S3.2 made every plain spinlock raise preempt_count itself; kept — the count nests). No caller holds fs_lock:
+# #37's resume point and exec_redirect_selftest both run lock-free.
+# ⚠ Nothing in the loop takes another lock except pipe_buf_put -> kfree_sized (heap), the fs -> heap order
+# every close already uses.
+fn exec_redirect_restore(creator, child) {
+    var qtbl = vfs_fd_table_of(child);
+    var qbk = redir_backup_base();
+    var qbs = redir_bsrc_base();
+    preempt_disable();
+    fs_spin_lock();
+    var qi = SPAWN_REDIR_MAX - 1;
+    while (qi >= 0) {
+        var qs1 = load64(qbs + qi * 8);
+        if (qs1 != 0) {
+            var qsb = qtbl + (qs1 - 1) * 32;
+            var qdrop = 0;
+            if (ktag(qsb) == VFS_PIPE) { qdrop = kpayload(qsb, 2); }
+            var qk = 0;
+            while (qk < 32) {
+                store64(qsb + qk, load64(qbk + qi * 32 + qk));
+                store64(qbk + qi * 32 + qk, 0);
+                qk = qk + 8;
+            }
+            store64(qbs + qi * 8, 0);
+            if (qdrop != 0) { pipe_buf_put(qdrop); }
+        }
+        qi = qi - 1;
+    }
+    fs_spin_unlock();
+    preempt_enable();
+    redir_clear(creator);
     return 0;
 }
 
-# 1.56.39 — the spawn_path#43 arm of the SAME one-shot redirect #62 arms. Until now #43 never
-# consumed it: only #37 did (exec_redirect_apply above), so a BACKGROUND child's stdout could not
-# be pointed anywhere and every concurrent proc wrote to the console at once. That is not cosmetic
-# — three interleaved desktop procs already corrupted a verdict on 2026-08-02, landing
-# `a11y nodes synced:run: exit 142` mid-line and costing the boot that carried the evidence.
-#
-# APPLY-ONLY, deliberately: #37 needs the save/restore pair because it is run-to-completion — the
-# parent is suspended, the child runs on the parent's own table entry, and the entry has to go
-# back. #43 is the opposite shape. The child is created holding its OWN private fd table (
-# vfs_fd_inherit, from proc_create_user), the parent stays live and never blocks, and there is no
-# later moment at which "restore" would mean anything. The swap is written into the child's copy,
-# is private to that child for its whole life, and dies with the table at reap. No backup slot is
-# taken, so this cannot collide with a #37 redirect armed on another CPU.
-#
-# ⛔ REFUSES when the target's table IS the global `vfs_table`. Writing the redirect there would
-# repoint fd 1 for proc 0, every kthread and every later global-table user, permanently, with
-# nothing anywhere to restore it. A skipped redirect is an interleaved console line; a corrupted
-# global table is the box. Refuse, say so, and move on.
-#
-# ⛔ THE TEST IS THE RESOLVED TABLE, NOT `proc_fd_base_get(pid) == 0`. Two DIFFERENT states mean
-# "this proc uses the global table" and only one of them is a zero base:
-#   - `proc_fd_base[pid] == 0` — the implicit fallback, which is what vfs_fd_inherit leaves behind
-#     when its kmalloc fails (it returns 0 on success AND on that failure, so no caller can tell);
-#   - `proc_fd_base[pid] == &vfs_table` — set EXPLICITLY for proc 0 at `vfs.cyr:264`
-#     (*"proc 0 (kmain/kybernet) owns the static global table"*).
-# A `== 0` guard passes the second one straight through and writes the global table. That is not
-# hypothetical: it is what the first build of this function did, and the boot selftest caught it on
-# proc 0 (`spawnredir: FAIL global not refused`). `vfs_fd_table_of` folds both states into one
-# answer, which is why the comparison belongs on its result — the same shape `proc_destroy_fd_table`
-# already uses at `vfs.cyr:234-235`.
-#
-# Clears the one-shot on BOTH paths — a refusal that left it armed would silently apply to the
-# next spawn instead, which is the wrong child.
-fn spawn_redirect_apply(pid) {
-    if (redir_pending_get() == 0) { return 0; }
-    redir_pending_set(0);
-    var stbl = vfs_fd_table_of(pid);
-    if (stbl == &vfs_table) {
-        kprintln("spawn: child is on the global fd table -- redirect skipped", 58);
+# spawn_path#43's fd shaping (1.57.6; replaces 1.56.39's spawn_redirect_apply). Runs after
+# elf_load_from_file succeeds and proc_set_ring3, BEFORE the child is made READY — once it is READY an
+# AP may run it, and a redirect applied after its first write has lost the line it existed to capture.
+#   1. Apply `creator`'s redirects to the child's table, in arm order (skipping the placed endowment fd).
+#   2. clean != 0 (SPAWN_F_CLEANFD): for fd 3..31 keep ONLY the placed endowment fd and armed redirect
+#      srcs; every other slot is RAW-ZEROED. The child ends up with {0,1,2 after redirects} + {explicitly
+#      passed fds (#62 `f|ADD, x` = "give the child my fd x as its fd f")} + {the channel endowment}.
+#   3. Clear the creator's redirect set.
+# ⛔⛔ THE SCRUB IS ktag_clear, NEVER vfs_close. The child's slots are COPIES of the parent's: vfs_close_inner
+# would tcp_close the PARENT's connection for a VFS_SOCK and flush + release the PARENT's pool block for a
+# VFS_SEC_WFILE. A raw zero drops only this copy; the parent's entries are untouched and still hold every
+# reference (so no pipe buffer can lose its last reference here — see pipe_buf_referenced's banner).
+# ⛔ REFUSES WHEN THE CHILD IS ON THE GLOBAL vfs_table (vfs_fd_inherit's kmalloc fallback, or proc 0's
+# explicit base): a redirect there would repoint fd N for proc 0 and every global-table user, forever, and
+# a CLEANFD scrub there would close proc 0's fds. -1; the #43 caller tears a CLEANFD child down
+# (-SPAWN_E_NOMEM) and lets a legacy one run unredirected, as 1.56.39 did.
+# ⛔ THE TEST IS THE RESOLVED TABLE, NOT `proc_fd_base_get(pid) == 0` — proc 0's base is set EXPLICITLY
+# to &vfs_table (vfs_init), and a `== 0` guard passed straight through it; the 1.56.39 selftest caught
+# exactly that (`spawnredir: FAIL global not refused`).
+fn spawn_fd_shape(child, creator, clean) {
+    var fsn = redir_n_get(creator);
+    var ftbl = vfs_fd_table_of(child);
+    if (ftbl == &vfs_table) {
+        if (clean != 0) {
+            kprintln("spawn: CLEANFD child is on the global fd table -- refused", 57);
+        } else {
+            if (fsn > 0) { kprintln("spawn: child is on the global fd table -- redirect skipped", 58); }
+        }
+        redir_clear(creator);
         return 0 - 1;
     }
-    var ssrc = stbl + redir_src_fd_get() * 32;
-    var sdst = stbl + redir_dst_fd_get() * 32;
-    var sk = 0;
-    while (sk < 32) {
-        store64(ssrc + sk, load64(sdst + sk));
-        sk = sk + 8;
+    var fplaced = endow_placed_get(creator) - 1;           # -1 = no endowment was placed
+    var fi = 0;
+    while (fi < fsn) {
+        var fsrc = redir_src_get(creator, fi);
+        var fdst = redir_dst_get(creator, fi);
+        if (fsrc == fplaced) {
+            kprintln("spawn: redirect onto the endowed fd skipped", 43);
+        } else {
+            var fk = 0;
+            while (fk < 32) {
+                store64(ftbl + fsrc * 32 + fk, load64(ftbl + fdst * 32 + fk));
+                fk = fk + 8;
+            }
+        }
+        fi = fi + 1;
     }
+    if (clean != 0) {
+        var ff = 3;
+        while (ff < 32) {
+            var fkeep = 0;
+            if (ff == fplaced) { fkeep = 1; }
+            if (redir_is_src(creator, ff) == 1) { fkeep = 1; }
+            if (fkeep == 0) { ktag_clear(ftbl + ff * 32, 32); }
+            ff = ff + 1;
+        }
+    }
+    redir_clear(creator);
     return 0;
+}
+# #43's step (f): shape the child's table, and TEAR DOWN a CLEANFD child that cannot be shaped.
+# -> 0 (make it READY) or -SPAWN_E_NOMEM (the child is gone; return that code).
+# ⛔ A CLEANFD child must never run on the GLOBAL table (vfs_fd_inherit's kmalloc fallback): it is torn
+# down unrun. It is state 3 and never scheduled, so proc_reap_child's off-cpu fence returns at once;
+# placement already refused on the same test, so any endowment stayed with the parent. The address
+# space, the fd base, the slot (LIFO collapse) and the ppid are released as for a reap. A LEGACY child
+# (clean == 0) runs unredirected on the global table, as 1.56.39 did.
+# ⚠ A function of its own so SPAWN_SELFTEST can drive exactly this sequence on a loaded child whose table
+# was forced to the global fallback — the allocator has no fault injection to reach it through #43.
+fn spawn_shape_or_teardown(child, creator, clean) {
+    if (spawn_fd_shape(child, creator, clean) >= 0) { return 0; }
+    if (clean == 0) { return 0; }
+    proc_reap_child(child);
+    return 0 - SPAWN_E_NOMEM;
 }
 var pcpu_spawn_env_buf[512];   # 1.46.x STEP-2 (#3): PER-CPU spawn_path(#43) env staging. 128 u64 (1024 B) per CPU × 4; cpu c at byte c*1024.
 fn spawn_env_buf_base() { return &pcpu_spawn_env_buf + pcpu_cpu() * 1024; }
@@ -581,11 +721,14 @@ fn sc_path_ok(ptr, len) {
 
 # 1.44.19: validate a KERNEL COPY of a caller env blob — flat NUL-separated "KEY=V\0KEY=V\0".
 # Rules: the last byte MUST be NUL; every NUL-split entry must be non-empty with '=' (61) at
-# index >= 1 (a KEY exists); 1..16 entries. The 16-entry cap is LOAD-BEARING, not stylistic:
-# the SysV envp pointer array ends at stack offset 0x3008+(argc+3+envc)*8 and must stay below
-# the 0x3100 string base (elf.cyr) — with argc<=8, envc=16 tops out at 0x30E0; envc>=20 would
-# overwrite the first string bytes. Enforced HERE on the kernel copy, never trusted from
-# caller-side counts. Returns 1 ok / 0 reject (the callers fall back to the default env).
+# index >= 1 (a KEY exists); 1..16 entries. The 16-entry cap is LOAD-BEARING, not stylistic: the SysV
+# pointer array [ELF_INIT_BLOCK+8, ELF_INIT_STR) (0x1FF008..0x1FF200, elf.cyr) must hold argc (<= 16,
+# SPAWN_ARGC_MAX) + 3 + envc slots, and this function runs BEFORE argv is tokenized so it cannot know
+# argc — the COMBINED bound is enforced in elf_load_from_file's env loop and gated statically by
+# scripts/check/check-initstack.sh. (1.57.6: this comment said "argc<=8" and "0x3008 / 0x3100 / 0x30E0";
+# argc has been 16 since 1.46.x and the block moved to the top of the stack page at 1.56.x.) Enforced HERE
+# on the kernel copy, never trusted from caller-side counts. Returns 1 ok / 0 reject — the unflagged
+# #37/#43 forms then fall back to the default env; #43 with any SPAWN_F_* flag refuses (-SPAWN_E_ARGS).
 fn sc_env_blob_ok(buf, len) {
     if (len < 1) { return 0; }
     if (load8(buf + len - 1) != 0) { return 0; }     # must end on a NUL
@@ -608,6 +751,48 @@ fn sc_env_blob_ok(buf, len) {
     }
     if (entries < 1) { return 0; }
     return 1;
+}
+
+# 1.57.6 — validate a KERNEL COPY of a spawn_path#43 SPAWN_F_ARGV blob: `argv0\0argv1\0...argvN\0`.
+# Rules: total length 2..SPAWN_ARGV_MAX bytes, NULs included; the LAST byte is NUL; 1..SPAWN_ARGC_MAX
+# entries (entry count == NUL count); argv[0] — the path the kernel opens — is 1..255 bytes
+# (vfs_sec_name_ok's cap). Later entries may be EMPTY or contain spaces: that is the point.
+# ⛔ MORE THAN SPAWN_ARGC_MAX ENTRIES IS REFUSED, never truncated (the line form used to drop the 17th
+# argument silently at the tokenizer). Returns argv[0]'s length (>= 1), or 0 to reject.
+fn sc_argv_blob_ok(buf, len) {
+    if (len < 2) { return 0; }
+    if (len > SPAWN_ARGV_MAX) { return 0; }
+    if (load8(buf + len - 1) != 0) { return 0; }     # must end on a NUL
+    var aentries = 0;
+    var ap0 = 0;
+    var ai = 0;
+    while (ai < len) {
+        var aes = ai;
+        while (ai < len) { if (load8(buf + ai) == 0) { break; } ai = ai + 1; }
+        if (aentries == 0) { ap0 = ai - aes; }
+        aentries = aentries + 1;
+        if (aentries > SPAWN_ARGC_MAX) { return 0; }
+        ai = ai + 1;                                  # step past this entry's NUL
+    }
+    if (ap0 < 1) { return 0; }
+    if (ap0 > 255) { return 0; }
+    return ap0;
+}
+
+# 1.57.6 — how many argv tokens will the loader's space-split tokenizer (elf.cyr) make of this line?
+# Exactly its rule: runs of spaces separate, leading/trailing spaces make nothing. #43 and #37 REFUSE a
+# line with more than SPAWN_ARGC_MAX tokens BEFORE loading anything (operator 2026-09-23: refuse, never
+# drop) — the tokenizer's own cap stays only as a backstop.
+fn spawn_line_tokens(buf, len) {
+    var tn = 0;
+    var ti = 0;
+    while (ti < len) {
+        while (ti < len) { if (load8(buf + ti) != 32) { break; } ti = ti + 1; }
+        if (ti >= len) { break; }
+        tn = tn + 1;
+        while (ti < len) { if (load8(buf + ti) == 32) { break; } ti = ti + 1; }
+    }
+    return tn;
 }
 
 # Resume kernel execution after a user process exits, by performing
@@ -642,6 +827,13 @@ fn kernel_resume() {
     # and the exit code was already stamped before kernel_resume was called. During
     # the boot exec selftest sched_active=0 (no scheduling) so this is a no-op there.
     proc_current_set(0);
+    # ⭐ 1.57.6 (Path 2, S3.3): move TSS.RSP0 and this CPU's syscall top OFF the dead child's kernel stack, onto
+    # kmain's own slot — kmain takes no CPL3 interrupt and makes no SYSCALL, so it is only a safe parking
+    # value until the next install. They used to stay on the child's slot until the next switch, while the
+    # reaper below can hand that slot to a new process on another CPU. (We are still ON the child's stack
+    # here, IF=0, until the longjmp below — nothing uses RSP0 or the syscall top before then.)
+    kstack_install(0);
+    sched_assert_oob(2);
     # 1.53.x B3b: arm #NM for the resumed context — the foreground-exec-return longjmps
     # back to the parent WITHOUT passing through enter_ring3 or the scheduler, so its
     # next SSE op must fault to FXRSTOR its FP area rather than run on the reaped child's
@@ -5683,10 +5875,10 @@ var CH_MINT   = 0x01;               # (out_uva) -> 0; writes two fds — a chann
 var CH_SEND   = 0x02;               # (fd, buf, len<=64) -> len / -CH_E_*
 var CH_RECV   = 0x03;               # (fd, buf, cap) -> len / -CH_E_WOULDBLOCK / -CH_E_PEERGONE
 var CH_CLOSE  = 0x04;               # (fd) -> 0
-var CH_ENDOW  = 0x05;               # (fd) -> 0; arm THIS endpoint for placement into the next #43 child
+var CH_ENDOW  = 0x05;               # (fd) -> fd; arm THIS endpoint for this process's next child (#43/#37/#3). fd -1 disarms.
 
 # ⭐ ENDOWMENT (bite 5) — the mechanism that lets a child be BORN holding a channel instead of dialling
-# for one. A parent arms an endpoint; the next `spawn_path #43` child is created owning it.
+# for one. A parent arms an endpoint; the next child IT creates (#43, #37 or #3) is born owning it.
 #
 # ⛔ THIS IS WHAT MAKES THE WHOLE AUTHORITY MODEL USABLE RATHER THAN MERELY SAFE. Inert-by-construction
 # (bite 4) means an inherited fd does nothing — which, without placement, would mean a child can never
@@ -5694,29 +5886,25 @@ var CH_ENDOW  = 0x05;               # (fd) -> 0; arm THIS endpoint for placement
 # of endowments) rather than CARVED (a list of denials), and kavach's agnos backend needs no close-loop
 # because there is no ambient reach to revoke.
 #
-# Per-CPU and one-shot, mirroring `exec_redirect #62`'s arm — the arm and its consumption span two
-# syscalls on the same CPU, and a stale arm leaking into somebody else's spawn would hand a channel to
-# a process nobody endowed.
+# ⭐ 1.57.6 — PER-PROCESS AND ONE-SHOT. The arm lives in proc.cyr (proc_endow_*), keyed by the ARMING pid,
+# and is consumed by that process's NEXT child creation — `spawn_path`#43, `execwait`#37 or `spawn`#3,
+# because placement runs inside proc_create_user, which all three reach. (The comments here said "the next
+# #43 child"; #37 and #3 consumed it too.) ⛔ Until 1.57.6 the arm was PER-CPU "mirroring #62", on the
+# premise that arm and spawn run on the same CPU. They do not have to: the arming process can be
+# preempted or migrated between its two syscalls, and then ANOTHER process's child on that CPU was born
+# OWNING an endpoint nobody endowed it with — a channel handed to a stranger on a SUCCESS path.
+# ⚠ Every #43 / #37 return clears the caller's whole arm state, and #3 clears the endowment on every
+# return; `CH_ENDOW` with fd -1 disarms explicitly; `CH_CLOSE` of the armed endpoint disarms it.
 # ⛔ STORED AS endpoint+1, SO 0 MEANS UNARMED. Module-scope globals zero-init, so a -1 sentinel would
 # require an explicit boot-time init — and until that ran, `endow_arm_get()` would answer 0 and the hook
 # would read it as "endpoint 0 is armed" on the FIRST spawn in the system, placing a channel nobody
 # endowed into init. Biasing by one removes the init-order dependency entirely rather than adding a
 # boot step that a future reorder could move.
-var pcpu_endow_end[4];              # armed endpoint id + 1; 0 = nothing armed
-var pcpu_endow_fd[4];               # the fd index the placement will use, decided at ARM time
-fn endow_arm_set(v) { store64(&pcpu_endow_end + pcpu_cpu() * 8, v + 1); return 0; }
-fn endow_arm_clear() { store64(&pcpu_endow_end + pcpu_cpu() * 8, 0); return 0; }
-fn endow_arm_get() { return load64(&pcpu_endow_end + pcpu_cpu() * 8) - 1; }
-fn endow_fd_set(v) { store64(&pcpu_endow_fd + pcpu_cpu() * 8, v); return 0; }
-fn endow_fd_get() { return load64(&pcpu_endow_fd + pcpu_cpu() * 8); }
 # ⭐ PTY MODE (ipc bite 9). When armed, the endowed endpoint is ALSO installed at the child's fd
 # 0, 1 and 2 — which is what makes it a terminal rather than a side channel: the child's stdin,
 # stdout and stderr ARE the channel, so a program that has never heard of `#97` (agnsh reads fd 0
 # with a plain `SYS_READ`) works unmodified. That is the whole difference between a PTY and an API.
 # ⚠ One endpoint behind four fds is CORRECT here and mirrors a real tty, where 0/1/2 are one device.
-var pcpu_endow_stdio[4];
-fn endow_stdio_set(v) { store64(&pcpu_endow_stdio + pcpu_cpu() * 8, v); return 0; }
-fn endow_stdio_get() { return load64(&pcpu_endow_stdio + pcpu_cpu() * 8); }
 
 # ⭐ ANNOUNCEMENT: THE PARENT DOES IT, WHICH IS WHY `CH_ENDOW` RETURNS THE FD INSTEAD OF 0.
 #
@@ -5735,11 +5923,15 @@ fn endow_stdio_get() { return load64(&pcpu_endow_stdio + pcpu_cpu() * 8); }
 # table is a byte copy of it, so the same slot is free there — normally. If the parent opens something
 # into that slot between arming and spawning, placement REFUSES rather than overwriting a live fd; see
 # chan_place_into_child.
-fn chan_endow_pick_fd() {
+# ⚠ 1.57.6: an fd that is the SRC of one of the caller's armed #62 redirects is skipped — the redirect
+# would overwrite the endowed slot in the child (REDIR_ADD refuses the other order, redir_arm_add).
+fn chan_endow_pick_fd(me) {
     var tbl = vfs_fd_table();
     var f = 3;
     while (f < 32) {
-        if (ktag(tbl + f * 32) == VFS_FREE) { return f; }
+        if (ktag(tbl + f * 32) == VFS_FREE) {
+            if (redir_is_src(me, f) == 0) { return f; }
+        }
         f = f + 1;
     }
     return 0 - 1;
@@ -5766,15 +5958,39 @@ var chan_endow_enabled = 1;
 # resolved-table test (not `proc_fd_base_get(pid) == 0`) is used because proc 0's base is set
 # EXPLICITLY to `&vfs_table` — the same trap that bit `spawn_redirect_apply` at 1.56.39.
 fn chan_place_into_child(child_pid) {
+    # ⭐ 1.57.6 — the CREATOR is the caller of the spawn: #43/#37/#3's own process (still current here —
+    # none of them switches proc_current before the load), or proc 0 for kernel sh_exec / init. Its arm
+    # is per-process (proc.cyr).
+    var creator = proc_current_get();
+    # FIRST, before any early return: this cell must describe THIS creation, so spawn_fd_shape /
+    # exec_redirect_apply never skip a redirect because of a previous child's placement.
+    endow_placed_set(creator, 0);
     if (chan_endow_enabled == 0) { return 0; }
-    var e = endow_arm_get();
+    var e = endow_arm_get(creator);
     if (e < 0) { return 0; }
-    endow_arm_clear();                          # one-shot: consumed whether or not it lands
-    var pty_mode = endow_stdio_get();
-    endow_stdio_set(0);                         # ⛔ cleared WITH the arm — a stale flag would silently
-    # turn the NEXT unrelated spawn's stdio into a channel, which is a very hard bug to see.
+    var pty_mode = endow_stdio_get(creator);
+    var f = endow_fd_get(creator);
+    var aep = endow_epoch_get(creator);
+    endow_disarm(creator);                      # one-shot: consumed whether or not it lands. ⛔ The PTY
+    # flag goes WITH the arm — a stale flag would silently turn the NEXT unrelated spawn's stdio into a
+    # channel, which is a very hard bug to see.
     if (e >= CHAN_ENDS) { return 0 - 1; }
     if (load64(&chan_end_open + e * 8) != 1) { return 0 - 1; }
+    # ⛔⛔ 1.57.6 — RE-CHECK OWNERSHIP AT PLACEMENT, NOT ONLY AT CH_ENDOW. CH_CLOSE zeroes the owner, and
+    # CH_MINT reuses a channel slot once both its ends are closed (bumping chan_epoch), so "P arms e, P's
+    # e is closed, Q mints and is handed e, P spawns" used to MOVE Q's endpoint into P's child. Require
+    # that the creator still owns it AND that the channel is the same incarnation it armed.
+    # ⚠ The owner's incarnation is deliberately NOT compared against proc_epoch_get(creator): in the boot
+    # degenerate case (creator and child are both slot 0) proc_alloc_slot has just bumped pid 0's epoch,
+    # and that check would refuse the two gates that endow from boot context (shsys, chan-ring3).
+    if (load64(&chan_end_owner + e * 8) != creator) {
+        kprintln("chan: endow REFUSED -- the spawner no longer owns the endpoint", 62);
+        return 0 - 1;
+    }
+    if (load64(&chan_epoch + (e >> 1) * 8) != aep) {
+        kprintln("chan: endow REFUSED -- the channel was re-minted since CH_ENDOW", 63);
+        return 0 - 1;
+    }
     var tbl = vfs_fd_table_of(child_pid);
     if (tbl == &vfs_table) {
         kprintln("chan: endow REFUSED -- child is on the global fd table", 54);
@@ -5784,7 +6000,6 @@ fn chan_place_into_child(child_pid) {
     # Re-scanning here would let the placement silently land somewhere other than the fd already
     # announced to the child in its env — the child would then look at the wrong slot and find nothing,
     # which is far harder to diagnose than a refusal.
-    var f = endow_fd_get();
     if (f < 3) { return 0 - 1; }
     if (f >= 32) { return 0 - 1; }
     if (ktag(tbl + f * 32) != VFS_FREE) {
@@ -5821,10 +6036,11 @@ fn chan_place_into_child(child_pid) {
             sfd = sfd + 1;
         }
     }
-    chan_placed_fd = f;
+    # The placement record the #43 fd shaping (and #37's redirect apply) read: fd + 1, 0 = none.
+    # (Replaces the global `chan_placed_fd`, which claimed "read by #43 to announce it" and was never read.)
+    endow_placed_set(creator, f + 1);
     return f;
 }
-var chan_placed_fd = 0 - 1;         # the fd the last placement used — read by #43 to announce it
 var CH_E_BADOP  = 2;                # unknown, reserved, or not implemented in this kernel
 var CH_E_BADFD  = 5;                # not a channel fd, or authority failed (incl. an INHERITED claim)
 var CH_E_ARG    = 6;                # bad buffer / length
@@ -8320,6 +8536,137 @@ fn blk_close_sys(h) {
 }
 
 
+# ── spawn_path#43 — the body of the ksyscall arm (moved here 1.57.6 so the arm has ONE exit) ────────────
+# NON-BLOCKING from-disk spawn. STATUS (1.44.22): LIVE PRODUCTION PATH — kybernet/agnsh drive it for `&`
+# background jobs; aethersafha, daimon, crab and puka launch with it. The from-disk analog of spawn(#3):
+# load a static ELF64 from the ext2 root (with argv + envp) and create a READY ring-3 proc the SCHEDULER
+# picks up, returning its pid IMMEDIATELY — the caller stays live and reaps it via the non-blocking
+# waitpid(#4). spawn(#3)'s shape (copy -> boot CR3 -> load -> restore caller CR3 -> return pid) with the
+# in-memory copy + elf_load swapped for execwait(#37)'s path staging + elf_load_from_file, and NONE of
+# #37's blocking machinery — proc_current_get() STAYS the caller, and reaping is waitpid(#4)'s job. Like
+# every handler it runs IF=0 with NVMe completion polled, so the shared FS scratch cannot be raced mid-load.
+#
+# ⭐ 1.57.6 (issues 2026-09-23-spawn-path-args-cannot-contain-spaces, -spawn-path-failure-gives-no-reason,
+# -child-inherits-every-fd-and-spawn-arms-leak). a2 = len (bits 0-15) | flags:
+#   flags == 0          the line form, unchanged: "PATH arg arg", <= SPAWN_LINE_MAX bytes, split on spaces.
+#                       ⛔ MORE THAN SPAWN_ARGC_MAX TOKENS IS NOW REFUSED (-SPAWN_E_ARGS), never dropped.
+#   SPAWN_F_ARGV    (bit 16) a1 = `argv0\0argv1\0...argvN\0`, 2..SPAWN_ARGV_MAX bytes: entries may contain
+#                       spaces or be empty; argv[0] is the path. Validated by sc_argv_blob_ok.
+#   SPAWN_F_CLEANFD (bit 17) the child's fd table is 0/1/2 (after redirects) + armed redirect srcs + the
+#                       placed endowment — nothing else it did not ask for (spawn_fd_shape).
+#   bits >= 18          refused (-SPAWN_E_ARGS).
+# Env (a3 = blob, a4 = len): flags == 0 keeps the FALLBACK-ONLY contract (a bad or garbage blob means the
+# default env, never an error — 2-arg callers leave garbage in rdx/r10). With ANY flag set the caller has
+# opted into the new ABI, so a non-zero a3 whose blob fails the gate is refused (-SPAWN_E_ARGS).
+# Returns pid >= 0, or -SPAWN_E_* (-2 NOPROC · -3 NOMEM · -4 NOENT · -5 NOEXEC · -6 ARGS); ABI §4.8.
+# ⛔ ORDERING: every refusal happens BEFORE exec_env_src/_len and exec_argv_nul are set. Those per-CPU
+# cells are consumed only at elf_load_from_file's entry, so a refusal that returned after setting them
+# would hand a stale env — or NUL-split argv mode — to the next #37 / init load on this CPU.
+fn spawn_path_sys(sp_a1, sp_a2, sp_a3, sp_a4) {
+    var canary = stack_canary_secret;
+    # (a) a2 = len | flags.
+    if (sp_a2 < 0) { stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
+    var sp_fl = sp_a2 >> 16;
+    if (sp_fl > 3) { stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }     # unknown flag bits
+    var sp_argv = sp_fl & 1;
+    var sp_clean = (sp_fl >> 1) & 1;
+    var sp_len = sp_a2 & 0xFFFF;
+    if (sc_path_ok(sp_a1, sp_len) == 0) { stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
+    if (sp_argv == 0) {
+        if (sp_len > SPAWN_LINE_MAX) { stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
+    } else {
+        if (sp_len < 2) { stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
+        if (sp_len > SPAWN_ARGV_MAX) { stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
+    }
+    if (ext2_active == 0) { stack_canary_check(canary); return 0 - SPAWN_E_NOENT; }
+    var sp_me = proc_current_get();
+    var spcr3 = proc_get_cr3(sp_me);
+    # (b) copy the caller's line / argv blob into this CPU's staging buffer NOW, while the caller CR3
+    # resolves the user VA and SMAP AC=1 — BEFORE the boot-CR3 switch (under boot CR3 the user VA does not
+    # resolve; the per-proc CR3 does not map the NVMe BAR).
+    # ⚠ The ARGV blob goes through proc_copy_from_user, the fault-proof page-table walk the env blob uses:
+    # up to 1024 caller-chosen bytes are far likelier to straddle an unmapped page than a 127-byte line.
+    var spp = spawn_path_buf_base();
+    if (sp_argv == 0) {
+        var spi = 0;
+        while (spi < sp_len) { store8(spp + spi, load8(sp_a1 + spi)); spi = spi + 1; }
+    } else {
+        if (proc_copy_from_user(spcr3, spp, sp_a1, sp_len) != 1) { stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
+    }
+    # (c) validate the KERNEL copy and find the path (the open name) inside it.
+    var sp_ps = 0;
+    var sp_plen = 0;
+    if (sp_argv == 0) {
+        # The path TOKEN (up to the first space) is the open name; the WHOLE line is argv — mirrors
+        # execwait#37 / sh_cmd_run. The leading-space skip matches the tokenizer's own.
+        while (sp_ps < sp_len) { if (load8(spp + sp_ps) != 32) { break; } sp_ps = sp_ps + 1; }
+        var sp_pe = sp_ps;
+        while (sp_pe < sp_len) { if (load8(spp + sp_pe) == 32) { break; } sp_pe = sp_pe + 1; }
+        sp_plen = sp_pe - sp_ps;
+        if (sp_plen < 1) { stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
+        if (spawn_line_tokens(spp, sp_len) > SPAWN_ARGC_MAX) { stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
+    } else {
+        sp_plen = sc_argv_blob_ok(spp, sp_len);             # argv[0]'s length, or 0
+        if (sp_plen < 1) { stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
+    }
+    # 1.44.19 per-process env — the #37 gate's twin: fault-proof page-walking copy into the DEDICATED
+    # spawn_env_buf. FALLBACK-ONLY in the unflagged form (see the header); STRICT when any flag is set.
+    var sp_eptr = sp_a3;
+    var sp_elen = sp_a4;
+    var sp_env = 0;
+    if (sp_eptr != 0) {
+        if (sp_elen >= 1) {
+            if (sp_elen <= 1024) {
+                if (is_user_range(sp_eptr, sp_elen) == 1) {
+                    if (proc_copy_from_user(spcr3, spawn_env_buf_base(), sp_eptr, sp_elen) == 1) {
+                        if (sc_env_blob_ok(spawn_env_buf_base(), sp_elen) == 1) { sp_env = spawn_env_buf_base(); }
+                    }
+                }
+            }
+        }
+    }
+    if (sp_fl != 0) {
+        if (sp_eptr != 0) {
+            if (sp_env == 0) { stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
+        }
+    }
+    # (d) boot CR3 for the disk I/O, the per-CPU loader cells (consumed at elf_load_from_file entry), load.
+    # elf_load_from_file builds the per-proc address space + SysV argc/argv/envp stack and returns the proc
+    # at state 3 (NOT schedulable), or -SPAWN_E_*.
+    cr3_load(0x1000);
+    exec_env_src_set(sp_env);                    # 1.46.8: per-CPU, consumed-at-entry by the loader
+    exec_env_len_set(sp_elen);
+    exec_argv_nul_set(sp_argv);                  # 1.57.6: same rule — NUL-split only for SPAWN_F_ARGV
+    var sp_pid = elf_load_from_file(spp + sp_ps, sp_plen, spp, sp_len);
+    if (sp_pid < 0) {
+        # (restore the caller CR3 on EVERY path so the handler tail + SYSRET run under the caller's
+        # mappings — skipping it reproduces the spawn#3 1.44.9 #UD/arena-fault class)
+        cr3_load(spcr3);
+        stack_canary_check(canary);
+        return sp_pid;
+    }
+    # (e) elf_load_from_file does NOT set ring-3 selectors (unlike in-memory elf_load) — it was only ever
+    # hand-run by execwait's own ring-3 frame. The SCHEDULER restores this proc, so it MUST carry
+    # CS=0x23/SS=0x1B or the iretq lands a user RIP under ring-0 CS=0x08 -> fault.
+    proc_set_ring3(sp_pid);
+    # (f) shape the child's fd table — the creator's armed redirects, and the CLEANFD scrub — BEFORE the
+    # proc is READY: once it is, an AP may run it, and a redirect applied after its first write has lost
+    # the line it existed to capture. Still under boot CR3 (fd tables are kernel heap), so its refusal
+    # lines print safely.
+    if (spawn_shape_or_teardown(sp_pid, sp_me, sp_clean) < 0) {
+        cr3_load(spcr3);
+        stack_canary_check(canary);
+        return 0 - SPAWN_E_NOMEM;
+    }
+    # 1.46.x #2: flip it READY — under smp_sched_aps=1 this is the FIRST moment a woken AP may
+    # legitimately pick it. Ordered AFTER proc_set_ring3 so no AP can ever observe it ready-but-ring-0.
+    pd_audit(proc_get_cr3(sp_pid), 2);          # tag 2 = spawn_path, just before READY
+    proc_set_state(sp_pid, 1);
+    cr3_load(spcr3);
+    stack_canary_check(canary);
+    return sp_pid;
+}
+
 # `ptrscan #98` reachability latches — see the arm for why.
 var ptrscan_called = 0;
 var proclist_called = 0;
@@ -8430,8 +8777,12 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # Returns new pid or -1. 1.41.5: the ELF image is a USER buffer — validate
         # the whole (addr,size) range so elf_load's load8/load64 can't be aimed at
         # kernel memory (a ring-3 caller passing a kernel addr would disclose it).
-        if (arg2 < 1) { return 0 - 1; }
-        if (is_user_range(arg1, arg2) == 0) { return 0 - 1; }
+        # ⚠ 1.57.6: spawn#3 CONSUMES THE CALLER'S CH_ENDOW ENDOWMENT (placement runs inside
+        # proc_create_user, which elf_load reaches) — and clears it on every failure path below, so an
+        # arm can never survive a failed #3 into the caller's next child. It does NOT consume #62
+        # redirects: those stay armed for the caller's next #43 / #37.
+        if (arg2 < 1) { endow_disarm(proc_current_get()); return 0 - 1; }
+        if (is_user_range(arg1, arg2) == 0) { endow_disarm(proc_current_get()); return 0 - 1; }
         # 1.44.10: bound by the staging buffer, then run elf_load under the KERNEL CR3.
         # A ring-3 parent's CR3 mirrors only 0-256 MB + the GB ranges, so the child's
         # fresh page-table pages can land in the 256 MB-1 GB gap (the 1.44.9 #UD-at-child
@@ -8442,7 +8793,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # kstack swap / resume-ctx since spawn does not block. From a KERNEL caller (the
         # RING3_SELFTEST loads its B proc via elf_load directly, not this path) this code
         # is not reached.
-        if (arg2 > 16384) { return 0 - 1; }
+        if (arg2 > 16384) { endow_disarm(proc_current_get()); return 0 - 1; }
         var sp_caller_cr3 = proc_get_cr3(proc_current_get());
         var sp_dst = spawn_elf_buf_base();
         var sp_i = 0;
@@ -8454,6 +8805,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
             # Mark as ready; will be scheduled on next timer tick
             proc_set_state(new_pid, 1);
         }
+        # A failed load may have stopped before proc_create_user placed the endowment; a successful one
+        # already consumed it. Either way it is spent (1.57.6).
+        endow_disarm(proc_current_get());
         return new_pid;
     }
     if (num == 4) {
@@ -9222,10 +9576,18 @@ fn ksyscall(num, arg1, arg2, arg3) {
             stack_canary_check(canary);
             return rr2;
         }
-        # ENDOW(fd) -> 0. Arms this endpoint for the next `#43` child. ⛔ Authority is re-derived first:
+        # ENDOW(fd) -> fd. Arms this endpoint for THIS PROCESS's next child — #43, #37 or #3 (1.57.6:
+        # per-process, see the ENDOWMENT banner; it said "the next #43 child"). ⛔ Authority is re-derived first:
         # you can only endow what you currently own, so an inherited (inert) claim cannot be used to
         # hand a channel onward — otherwise inert-by-construction would leak through the grant path.
         if (arg1 == CH_ENDOW) {
+            # ⭐ 1.57.6: ENDOW(-1) DISARMS the caller's pending endowment and its PTY flag -> 0 (was
+            # -CH_E_BADFD). A caller whose spawn fails between arm and spawn can drop the arm itself.
+            if (arg2 == 0 - 1) {
+                endow_disarm(proc_current_get());
+                stack_canary_check(canary);
+                return 0;
+            }
             if (arg2 < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
             if (arg2 >= 32) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
             var nb = vfs_fd_table() + arg2 * 32;
@@ -9238,13 +9600,16 @@ fn ksyscall(num, arg1, arg2, arg3) {
             # silently lose its own stdin/stdout. That is the exact hazard the banner above this block
             # already names ("you can only endow what you currently own"); the PTY arm would have
             # quietly widened it from a use-right into a transfer-right.
-            if (load64(&chan_end_owner + ne * 8) != proc_current_get()) {
+            var nme = proc_current_get();
+            if (load64(&chan_end_owner + ne * 8) != nme) {
                 stack_canary_check(canary); return 0 - CH_E_BADFD;
             }
-            var tfd = chan_endow_pick_fd();
+            var tfd = chan_endow_pick_fd(nme);
             if (tfd < 0) { stack_canary_check(canary); return 0 - CH_E_FULL; }
-            endow_arm_set(ne);
-            endow_fd_set(tfd);
+            endow_arm_set(nme, ne);
+            endow_fd_set(nme, tfd);
+            # 1.57.6: the channel's incarnation NOW — placement refuses if the channel was re-minted.
+            endow_epoch_set(nme, load64(&chan_epoch + (ne >> 1) * 8));
             # ⛔ AN EXACT SENTINEL, NOT `a4 != 0`. `ksyscall_a4` is shared staging: SEND and RECV use
             # it as a LENGTH, and it is not cleared between ops. The first cut of this read `a4 != 0`
             # and a selftest that had just done `ksyscall_a4_set(8)` for a SEND silently endowed in
@@ -9252,7 +9617,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
             # CH_ENDOW_STDIO is deliberately > CHAN_REC_BYTES so no legal length can ever collide.
             var emode = 0;
             if (ksyscall_a4_get() == CH_ENDOW_STDIO) { emode = 1; }
-            endow_stdio_set(emode);
+            endow_stdio_set(nme, emode);
             stack_canary_check(canary);
             return tfd;                          # the fd the child will hold — announce it in its env
         }
@@ -9262,6 +9627,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
             var cb = vfs_fd_table() + arg2 * 32;
             var ce = chan_auth(cb);
             if (ce < 0) { stack_canary_check(canary); return 0 - CH_E_BADFD; }
+            # ⭐ 1.57.6: closing the endpoint the CALLER has armed for endowment disarms that arm — a
+            # closed endpoint can be re-minted to somebody else, and the arm must not follow the number.
+            # (Placement also re-checks owner + epoch; this makes the common case refuse nothing at all.)
+            if (endow_arm_get(proc_current_get()) == ce) { endow_disarm(proc_current_get()); }
             store64(&chan_end_open + ce * 8, 0);
             store64(&chan_end_pty + ce * 8, 0);
             store64(&chan_end_owner + ce * 8, 0);
@@ -9636,31 +10005,41 @@ fn ksyscall(num, arg1, arg2, arg3) {
         return kl_w;
     }
     if (num == 62) {
-        # exec_redirect(src_fd=arg1, dst_fd=arg2) — arm a ONE-SHOT fd redirect for the
-        # NEXT exec: the child's writes to src_fd (e.g. 1=stdout) route to dst_fd's
-        # backend (output capture). dst_fd should be an open writable file/pipe the caller
-        # then reads back. Both fds in [0,32). Returns 0, or -1 on a bad fd. AGNOS-native
-        # (a one-shot exec-time dup, not a persistent dup2). See the redir_* helpers.
-        #
-        # 1.56.39: "the next exec" now means execwait#37 OR spawn_path#43, whichever the
-        # caller reaches first — #43 ignored the arm entirely before, so a background job's
-        # output could not be captured and every concurrent proc shared the console. The two
-        # consume it differently and the difference is structural, not incidental:
-        #   #37 — apply + RESTORE around a run-to-completion child (exec_redirect_apply /
-        #         exec_redirect_restore), because the parent is suspended and the entry must
-        #         go back afterwards.
-        #   #43 — apply ONLY, into the child's own private fd table (spawn_redirect_apply),
-        #         because the parent stays live and there is no "afterwards" to restore at.
-        # Either consumer clears the one-shot, including on its own refusal/failure paths, so
-        # an arm never survives into a later exec it was not meant for.
+        # exec_redirect(src | op << 8, dst) — arm fd redirects for THIS PROCESS's next child: the child's
+        # writes to src (e.g. 1 = stdout) route to dst's backend (output capture). AGNOS-native (a one-shot
+        # spawn-time dup, not a persistent dup2). Returns 0, or -1. See the redir_* helpers (proc.cyr) and
+        # exec_redirect_apply / spawn_fd_shape above.
+        #   op 0 (a1 in [0,32) — every pre-1.57.6 caller): REPLACE the caller's set with this one pair.
+        #   op 1 REDIR_ADD (0x100 | src): add a pair, or re-point an already-armed src; at most
+        #        SPAWN_REDIR_MAX (4). -1 when full, or when src is the fd the caller's ARMED endowment
+        #        will land on in the child.
+        #   op 2 REDIR_CLEAR (exactly 0x200; dst ignored): empty the set -> 0.
+        #   any other a1: -1. (Every a1 >= 32 returned -1 before 1.57.6, so no working call changes.)
+        # src and dst are CHILD fd numbers, and pairs apply IN ARM ORDER against the child's CURRENT
+        # table: `(1 <- w)` then `ADD(2 <- 1)` is shell `2>&1`.
+        # ⭐ 1.57.6 — PER-PROCESS, AND ACTUALLY ONE-SHOT. "The next exec" is the caller's next child
+        # creation by `execwait`#37 (apply + restore around the run-to-completion child) or
+        # `spawn_path`#43 (applied into the child's private table, which is then its own). `spawn`#3 does
+        # NOT consume redirects. Every #43 and #37 return clears the caller's whole set, success or
+        # refusal. ⛔ This comment promised that ("either consumer clears the one-shot, including on its
+        # own refusal/failure paths") for releases in which it was FALSE for every #37 refusal and four
+        # #43 refusals — and the arm was PER-CPU, so a preempted caller's redirect could be consumed by
+        # an unrelated process's spawn on the same CPU.
         if (arg1 < 0) { return 0 - 1; }
-        if (arg1 >= 32) { return 0 - 1; }
+        var rop = arg1 >> 8;
+        var rsrc = arg1 & 0xFF;
+        var rme = proc_current_get();
+        if (rop == REDIR_OP_CLEAR) {
+            if (rsrc != 0) { return 0 - 1; }
+            redir_clear(rme);
+            return 0;
+        }
+        if (rop > REDIR_OP_ADD) { return 0 - 1; }
+        if (rsrc >= 32) { return 0 - 1; }
         if (arg2 < 0) { return 0 - 1; }
         if (arg2 >= 32) { return 0 - 1; }
-        redir_src_fd_set(arg1);
-        redir_dst_fd_set(arg2);
-        redir_pending_set(1);
-        return 0;
+        if (rop == 0) { return redir_arm_replace(rme, rsrc, arg2); }
+        return redir_arm_add(rme, rsrc, arg2);
     }
     if (num == 37) {
         # execwait(path=arg1, pathlen=arg2) — load a static ELF64 from the active
@@ -9674,22 +10053,28 @@ fn ksyscall(num, arg1, arg2, arg3) {
         #       (exec_ctx + kernel_return_* + kpti_* + kernel_rsp_save) that hold
         #       KYBERNET's armed frame — the frame agnsh's OWN exit() longjmps into.
         #       We snapshot them before, restore them after.
-        #  (H2) the child's syscalls reuse the shared SYSCALL kstack (0x3F0000) and
-        #       would smash agnsh's suspended #37 frame AND its stub-pushed SYSRET
-        #       rcx/r11/rbp cells. We run the child on the DISJOINT second kstack
-        #       (syscall_kstack_top2) by swapping syscall_kstack_top before the call
-        #       — exec_and_wait's own syscall_init() bakes the swap into the child's
-        #       stub — then restore + rebuild for agnsh on resume.
+        #  (H2) GONE (1.57.6, Path 2 S3.3). The child's syscalls used to reuse the shared
+        #       per-CPU SYSCALL kstack and would have smashed agnsh's suspended #37 frame
+        #       and its stub-pushed SYSRET cells, so this arm swapped in a second per-CPU
+        #       stack for the child's run. Every process now runs its syscalls on its OWN
+        #       kernel stack (exec_and_wait's kstack_install(child)), and agnsh's SYSRET
+        #       state is in agnsh's frame — there is nothing to swap or to save.
 
         # (a) validate path arg + length + ext2-root guard (elf_load_from_file is
         # ext2-only) + re-entrancy guard. The single-slot save block holds ONE level:
         # a child that itself calls execwait would clobber agnsh's saved frame and
         # reuse syscall_kstack_top2 recursively — refuse cleanly (recursive exec is
         # out of scope until the multithreading arc).
-        if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
-        if (arg2 > 127) { stack_canary_check(canary); return 0 - 1; }
-        if (ext2_active == 0) { stack_canary_check(canary); return 0 - 1; }
-        if (pcpu_ew37_busy_get() != 0) { stack_canary_check(canary); return 0 - 1; }
+        # ⭐ 1.57.6: EVERY refusal below also clears the caller's spawn arms (#62 redirect set, CH_ENDOW
+        # endowment) — this arm consumes them whether or not it runs a child. None of these returns
+        # cleared anything before, and the arms were per-CPU, so a refused #37 left its redirect for
+        # whatever next spawned on that CPU (agnoshi probed binaries before arming to dodge it).
+        # ⚠ #37 keeps folding every launch failure to -1: its success value is the child's exit code,
+        # and a child may exit(-2), so the -SPAWN_E_* codes #43 returns cannot be told apart here.
+        if (sc_path_ok(arg1, arg2) == 0) { spawn_arms_clear(proc_current_get()); stack_canary_check(canary); return 0 - 1; }
+        if (arg2 > SPAWN_LINE_MAX) { spawn_arms_clear(proc_current_get()); stack_canary_check(canary); return 0 - 1; }
+        if (ext2_active == 0) { spawn_arms_clear(proc_current_get()); stack_canary_check(canary); return 0 - 1; }
+        if (pcpu_ew37_busy_get() != 0) { spawn_arms_clear(proc_current_get()); stack_canary_check(canary); return 0 - 1; }
 
         # (b) COPY the user path into the kernel buffer NOW, while CR3 is still the
         # caller's (so the user VA resolves) and SMAP AC=1 (the entry stub's STAC).
@@ -9699,6 +10084,14 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var pdst = ew37_path_base();
         var pi = 0;
         while (pi < arg2) { store8(pdst + pi, load8(arg1 + pi)); pi = pi + 1; }
+        # ⛔ 1.57.6 — MORE THAN SPAWN_ARGC_MAX TOKENS IS REFUSED, NOT DROPPED (operator 2026-09-23). The
+        # loader's tokenizer silently stopped at the 16th, so a 17th argument vanished. Counted on the
+        # kernel copy, BEFORE any snapshot or per-CPU loader cell is touched.
+        if (spawn_line_tokens(pdst, arg2) > SPAWN_ARGC_MAX) {
+            spawn_arms_clear(proc_current_get());
+            stack_canary_check(canary);
+            return 0 - 1;
+        }
 
         # (c) snapshot agnsh's resume context (H1) BEFORE the nested exec_and_wait
         # clobbers it. proc_current_get() is still agnsh here.
@@ -9708,7 +10101,6 @@ fn ksyscall(num, arg1, arg2, arg3) {
         while (si < 64) { store64(s37 + si, load64(es + si)); si = si + 8; }
         ew37_kr_rsp_set(kernel_return_rsp_get());          # == 1 (kybernet frame armed)
         ew37_kr_rip_set(kernel_return_rip_get());
-        ew37_rsp_save_set(load64(&pcpu_kernel_rsp_save + pcpu_cpu() * 8));   # agnsh's user RSP (per-CPU 4b)
         ew37_a4_set(ksyscall_a4_get());
         ew37_pid_set(proc_current_get());               # agnsh's pid
         ew37_resume_pid_set(exec_resume_pid_get());          # 1.44.14: save agnsh's resume-pid; the nested
@@ -9742,6 +10134,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (ew_plen < 1) {                          # empty / all-spaces path token
             cr3_load(ew37_cr3_get());
             pcpu_ew37_busy_set(0);
+            spawn_arms_clear(ew37_pid_get());
             stack_canary_check(canary);
             return 0 - 1;
         }
@@ -9770,67 +10163,61 @@ fn ksyscall(num, arg1, arg2, arg3) {
         exec_env_len_set(ew_elen);
         var cpid = elf_load_from_file(pdst + ew_ps, ew_plen, pdst, arg2);
         if (cpid < 0) {
+            # ⚠ 1.57.6: elf_load_from_file now answers -SPAWN_E_*; FOLDED to -1 here on purpose (see the
+            # refusal note at the top of this arm). The endowment may already be spent — or not, if the
+            # load failed before proc_create_user — so the whole arm state is cleared either way.
             cr3_load(ew37_cr3_get());
             pcpu_ew37_busy_set(0);
+            spawn_arms_clear(ew37_pid_get());
             stack_canary_check(canary);
             return 0 - 1;
         }
 
         # (e) stash the child pid in a GLOBAL + pull entry/rsp/cr3 from its proc_table
         # row (176-B stride: entry@+24, rsp@+16, cr3@+160 — same offsets sh_cmd_run
-        # uses, shell.cyr:460-463). 1.46.x #2: the child stays at state=3 (elf_load_from_file
-        # leaves it NOT-ready) for the WHOLE foreground run — it is entered out-of-band via
-        # exec_and_wait/enter_ring3 below (never via sched), then exit#0 flips it state=0. Never
-        # being state==1 means no woken AP can sched-pick (double-run) it; exec_and_wait's pin is
-        # the second guard. So there is deliberately NO proc_set_state(cpid,1) on this path.
+        # uses, shell.cyr:460-463). 1.46.x #2: the child is NEVER made READY (state 1) on this
+        # path — it is entered out-of-band via exec_and_wait/enter_ring3 below (never via sched),
+        # then exit#0 flips it state=0. So there is deliberately NO proc_set_state(cpid,1) here.
+        # ⭐ 1.57.6 (S3.3): exec_and_wait now marks it state 2 with on_cpu = this CPU (FG-1) — RUNNING,
+        # FENCED and PINNED (idle_owner) — so no other CPU can pick it and INV-11 holds for it too.
         ew37_cpid_set(cpid);
         var cep = &proc_table + cpid * 176;
         var ce  = load64(cep + 24);
         var cr  = load64(cep + 16);
         var cc  = load64(cep + 160);
 
-        # (f) SWITCH the SYSCALL kstack to the disjoint second top (H2) for the
-        # nested run. 1.46.x 4b: the stub no longer BAKES the kstack value (it reads
-        # pcpu_syscall_kstack_top at runtime via r8*8+disp32), so NO syscall_init() rebuild
-        # is needed — just point THIS CPU's primary slot at its nested top. The child's
-        # syscalls then grow down 0xF90000+cpu*0x10000 and never touch agnsh's suspended
-        # #37 frame on the primary 0xF10000+cpu. NO-MID-SYSCALL-MIGRATION (IF=0/serial)
-        # guarantees pcpu_cpu() here == the stub's entry/exit cpu for both agnsh and child.
-        store64(&pcpu_syscall_kstack_top + pcpu_cpu() * 8, load64(&pcpu_syscall_kstack_top2 + pcpu_cpu() * 8));
+        # (f) (1.57.6, S3.3: the second-kstack swap that lived here is gone with hazard H2 — see the header.)
 
-        # (f2) 1.46.x fd-redirect: if a redirect was armed via exec_redirect#62, repoint
-        # the src fd (e.g. stdout) to the dst backend for the child's run. No-op otherwise,
-        # so the default path is byte-identical. Restored at (h2) after the child exits.
-        exec_redirect_apply();
+        # (f2) 1.46.x fd-redirect: if redirects were armed via exec_redirect#62, repoint each src
+        # fd (e.g. stdout) to its dst backend for the child's run, in arm order (1.57.6: up to
+        # SPAWN_REDIR_MAX pairs, keyed by the CALLER's pid). No-op otherwise, so the default path is
+        # byte-identical. Restored at (h2) after the child exits.
+        exec_redirect_apply(ew37_pid_get(), cpid);
 
         # (g) make the child current (so ITS exit() stamps the code on ITS pid),
         # then run to completion. The child's exit() -> kernel_resume longjmps back
         # to the line after this call with CR3=boot 0x1000, proc_current_get()=0,
-        # kernel_return_*=0, kpti_*=child, this CPU's pcpu_kernel_rsp_save slot=child's last user RSP.
+        # kernel_return_*=0, kpti_*=child, and TSS.RSP0 + the syscall top on kmain's slot (1.57.6).
         proc_current_set(cpid);
         exec_and_wait(ce, cr, cc);
         # ===== RESUME POINT (child exited) =====
 
-        # (h2) 1.46.x fd-redirect: restore the redirected src fd to its original backend
-        # (e.g. stdout back to the console) + clear the one-shot. Under boot CR3 here
-        # (vfs_table is identity-mapped kernel memory). No-op if nothing was armed.
-        exec_redirect_restore();
+        # (h2) 1.46.x fd-redirect: restore the redirected src fds to their original backends
+        # (e.g. stdout back to the console), in reverse arm order, + clear the one-shot. Under
+        # boot CR3 here (fd tables are kernel memory). No-op if nothing was armed.
+        # ⛔ BOTH PIDS FROM THE PER-CPU ew37 CELLS: proc_current_get() is 0 after kernel_resume, and
+        # keying by it would silently skip the restore (see exec_redirect_apply's header).
+        exec_redirect_restore(ew37_pid_get(), ew37_cpid_get());
+        spawn_arms_clear(ew37_pid_get());          # 1.57.6: #37 spends the caller's whole arm state
 
-        # (h) restore THIS CPU's PRIMARY SYSCALL kstack top so agnsh's own subsequent
-        # syscalls go back on its primary top. 1.46.x 4b: the stub reads
-        # pcpu_syscall_kstack_top at runtime (r8*8+disp32), so NO syscall_init() stub
-        # rebuild is needed — just re-point this CPU's slot at its primary top. (The MSR
-        # programming syscall_init also did is unchanged from boot; nothing here
-        # invalidates it, and exec_and_wait's own syscall_init already re-ran it.)
-        # ⛔ MUST be the DIRECT-MAP VA, matching syscall_kstack_reserve (syscall_hw.cyr) and
-        # step (f)'s copy from pcpu_syscall_kstack_top2 — NOT the raw identity VA. Region 7's
-        # identity VA (14-16 MB) sits INSIDE the user-segment range (elf_load maps PT_LOADs to
-        # 256 MB), so a large binary's segments override that PD entry in its own per-proc CR3
-        # and the next SYSCALL loads RSP into a page the image clobbered -> #PF at CPL0. This
-        # line wrote the raw form, so every completed foreground #37 silently reverted the CPU
-        # to the pre-1.51.x address and re-armed the "ark won't run" fault for any large proc
-        # that ran afterwards.
-        store64(&pcpu_syscall_kstack_top + pcpu_cpu() * 8, DIRECTMAP_BASE + 0xF10000 + pcpu_cpu() * 0x10000);
+        # (h) ⭐ 1.57.6 (Path 2, S3.3): re-install the CALLER's kernel stack — TSS.RSP0 AND this CPU's syscall
+        # top (kstack_install). This used to restore only the per-CPU PRIMARY syscall top (the direct-map
+        # 0xF10000 + cpu*64 KB) and never TSS.RSP0, which exec_and_wait had pointed at the CHILD's slot: agnsh
+        # then took its CPL3 interrupts on the reaped child's stack until its next switch — a slot proc_alloc_slot
+        # can hand to a new process. Both now point at agnsh's own stack, where its #37 frame and its SYSRET
+        # state already are.
+        kstack_install(ew37_pid_get());
+        ew37_rsp0_check();                         # EXEC_SELFTEST: 'exec: rsp0 restored' (a no-op twin otherwise)
 
         # (i) read the child's exit code (from the GLOBAL pid) BEFORE reaping (reap
         # collapses the slot), then reap: proc_reap_child frees the child's address
@@ -9851,7 +10238,6 @@ fn ksyscall(num, arg1, arg2, arg3) {
         kernel_return_rip_set(ew37_kr_rip_get());
         store64(&pcpu_kpti_kernel_cr3 + pcpu_cpu() * 8, ew37_cr3_get());   # agnsh's CR3 (kernel-side); 4c per-CPU
         store64(&pcpu_kpti_user_cr3 + pcpu_cpu() * 8, ew37_cr3_get());      # the value the exit stub reloads into CR3 pre-SYSRET
-        store64(&pcpu_kernel_rsp_save + pcpu_cpu() * 8, ew37_rsp_save_get());   # the exit stub reloads rsp from this CPU's pcpu_kernel_rsp_save slot pre-SYSRET (per-CPU 4b)
         ksyscall_a4_set(ew37_a4_get());
         proc_current_set(ew37_pid_get());                # agnsh's pid (its write/exit attribute to agnsh)
         exec_resume_pid_set(ew37_resume_pid_get());         # 1.44.14: agnsh is the resume target again, so
@@ -10165,6 +10551,18 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # Returns microseconds since calibration, or -1 if calibration was REFUSED — never a
         # plausible-looking zero, because a tool that cannot tell "no clock" from "0 us elapsed"
         # is exactly what burned two flashes on the rung-10 gate.
+        #
+        # ⭐ 1.57.6 — THE REFERENCE, AND -1 IS PERMANENT. tsc_calibrate (main.cyr) measures against the
+        # ACPI PM timer when the FADT advertises one (3.579545 MHz, needs no interrupt delivery, so a
+        # host CPU quota lengthens a window but cannot bias it — the daimon report's 25% refusal and
+        # 50% 2.6x-slow clock were both the old live-tick reference losing ticks), else against live
+        # PIT-calibrated ticks, as the MEDIAN of several windows. It runs once right after `sti` and
+        # once more immediately before `sched_active = 1`, and never again: so -1 is PERMANENT once
+        # production ring 3 (kybernet onward) can observe it — only a TSC_SELFTEST build's /bin/tscp
+        # probe reads this arm between the two attempts — and a consumer may latch its fallback
+        # (uptime_ms#40 — BSP-tick-driven, frozen while the BSP runs IF=0, slow when ticks are lost; a
+        # degraded fallback, not an equivalent clock) without ever seeing this clock start later on a
+        # different epoch.
         stack_canary_check(canary);
         if (tsc_per_us == 0) { return 0 - 1; }
         return (rdtsc() - tsc_base) / tsc_per_us;
@@ -10485,98 +10883,17 @@ fn ksyscall(num, arg1, arg2, arg3) {
         return pl_n;
     }
     if (num == 43) {
-        # spawn_path(path=arg1, len=arg2) — NON-BLOCKING from-disk spawn.
-        # STATUS (1.44.22): LIVE PRODUCTION PATH — kybernet/agnsh drive it for `&` background jobs.
-        # Validated end-to-end at 1.44.13 (a ring-3 parent #43s a from-disk ELF + poll-waitpid#4s
-        # it to exit) and wired into agnsh `&` at 1.44.14-15 (agnsh-bg-test / agnsh-multijob-test
-        # PASS). Both original blockers are CLEARED: the elf_load per-pid VA collision that
-        # SMAP-faulted on context switch (de-striped to fixed 0x400000/0x3FC00000 at 1.44.11,
-        # ring3-smoke's >=8-proc stress assert) and the LIFO-only proc_reap_child (proc_alloc_slot's
-        # non-LIFO slot reuse at 1.44.12). The prompt poll drops preempt_disable via the non-blocking
-        # read (kbd_read_nonblock) so bg jobs aren't frozen at the prompt (1.44.13-14).
-        #
-        # The from-disk analog of spawn(#3): load a static ELF64 from the ext2 root (with
-        # argv) + create a READY ring-3 proc the SCHEDULER picks up, returning its pid
-        # IMMEDIATELY — so the caller (agnsh) stays live and reaps it via the non-blocking
-        # waitpid(#4). This is spawn(#3)'s exact shape (copy → boot CR3 → load → restore
-        # caller CR3 → return pid) with the in-memory copy+elf_load swapped for
-        # execwait(#37)'s path-staging + elf_load_from_file. It DROPS all of #37's blocking
-        # machinery (the H1 resume-ctx snapshot/restore, the H2 disjoint-kstack swap +
-        # syscall_init, proc_current_get()=child, exec_and_wait run-to-completion, the in-handler
-        # reap) — there is no nested run to protect, so proc_current_get() STAYS the caller and
-        # reaping is waitpid(#4)'s job. Like every handler it runs IF=0 and NVMe completion
-        # POLLS (no sti window), so the shared FS scratch (spawn_path_buf / elf_hdr_buf /
-        # VFS) can't be raced mid-load — the serial invariant spawn(#3)/execwait(#37) rely on.
-        if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
-        if (arg2 > 127) { stack_canary_check(canary); return 0 - 1; }
-        if (ext2_active == 0) { stack_canary_check(canary); return 0 - 1; }
-        # (a) copy the user (path + argv) line into the kernel buffer NOW, while the caller
-        # CR3 resolves the user VA + SMAP AC=1 — BEFORE the boot-CR3 switch (under boot CR3
-        # the user VA won't resolve; the per-proc CR3 does not map the NVMe BAR).
-        var spp = spawn_path_buf_base();
-        var spi = 0;
-        while (spi < arg2) { store8(spp + spi, load8(arg1 + spi)); spi = spi + 1; }
-        # (b) switch to boot CR3 (maps the NVMe BAR) for the disk I/O, then split the path
-        # TOKEN (open name, up to the first space) from the WHOLE line (argv) — mirrors
-        # execwait#37 / sh_cmd_run. elf_load_from_file builds the per-proc address space +
-        # SysV argc/argv/envp stack and returns a READY pid (proc_create_full: state=1/IF=1)
-        # or -1.
-        var spcr3 = proc_get_cr3(proc_current_get());
-        cr3_load(0x1000);
-        var sp_ps = 0;
-        while (sp_ps < arg2) { if (load8(spp + sp_ps) != 32) { break; } sp_ps = sp_ps + 1; }   # skip leading spaces
-        var sp_pe = sp_ps;
-        while (sp_pe < arg2) { if (load8(spp + sp_pe) == 32) { break; } sp_pe = sp_pe + 1; }     # to first space
-        var sp_plen = sp_pe - sp_ps;
-        if (sp_plen < 1) { cr3_load(spcr3); stack_canary_check(canary); return 0 - 1; }
-        # 1.44.19 per-process env — the #37 gate's twin (see there): a3/a4 = blob ptr/len,
-        # FALLBACK-ONLY (garbage a3/a4 from legacy callers → default env, never -1),
-        # fault-proof page-walking copy into the DEDICATED spawn_env_buf.
-        var sp_eptr = arg3;
-        var sp_elen = ksyscall_a4_get();
-        var sp_env = 0;
-        if (sp_eptr != 0) {
-            if (sp_elen >= 1) {
-                if (sp_elen <= 1024) {
-                    if (is_user_range(sp_eptr, sp_elen) == 1) {
-                        if (proc_copy_from_user(spcr3, spawn_env_buf_base(), sp_eptr, sp_elen) == 1) {
-                            if (sc_env_blob_ok(spawn_env_buf_base(), sp_elen) == 1) { sp_env = spawn_env_buf_base(); }
-                        }
-                    }
-                }
-            }
-        }
-        exec_env_src_set(sp_env);                    # 1.46.8: per-CPU, consumed-at-entry by the loader
-        exec_env_len_set(sp_elen);
-        var sp_pid = elf_load_from_file(spp + sp_ps, sp_plen, spp, arg2);
-        # (c) restore the caller CR3 on EVERY path (incl. the load-failure path) so the
-        # handler tail + SYSRET run under the caller's mappings (skipping this reproduces
-        # the spawn#3 1.44.9 #UD/arena-fault class).
-        cr3_load(spcr3);
-        if (sp_pid >= 0) {
-            # (d) elf_load_from_file does NOT set ring-3 selectors (unlike in-memory
-            # elf_load) — it was only ever hand-run by execwait's own ring-3 frame. The
-            # SCHEDULER restores this proc, so it MUST carry CS=0x23/SS=0x1B or the iretq
-            # lands a user RIP under ring-0 CS=0x08 → fault.
-            proc_set_ring3(sp_pid);
-            # 1.56.39: consume an armed #62 redirect into the CHILD's private fd table. MUST sit
-            # before proc_set_state below — once the proc is READY an AP may pick it up and run it,
-            # and a redirect applied after the child's first write has already lost the line it
-            # existed to capture. See spawn_redirect_apply: apply-only, refuses the global table.
-            spawn_redirect_apply(sp_pid);
-            # 1.46.x #2: elf_load_from_file returns the proc at state=3 (NOT schedulable). It is now
-            # fully wired (per-proc CR3 + ring-3 selectors), so flip it READY — under smp_sched_aps=1
-            # this is the FIRST moment a woken AP may legitimately pick it. Ordered AFTER proc_set_ring3
-            # so no AP can ever observe it ready-but-ring-0.
-            pd_audit(proc_get_cr3(sp_pid), 2);      # tag 2 = spawn_path, just before READY
-            proc_set_state(sp_pid, 1);
-        }
-        # 1.56.39: the load FAILED, so there is no child to redirect — but the arm is one-shot and
-        # would otherwise survive to the next exec and repoint a fd for a proc nobody armed it for.
-        # The caller armed it for THIS spawn; the spawn is over either way.
-        if (sp_pid < 0) { redir_pending_set(0); }
+        # spawn_path(path, len | flags, env, envlen in r10) — NON-BLOCKING from-disk spawn -> pid / -SPAWN_E_*.
+        # The body is spawn_path_sys (above ksyscall), which carries the history, the flags and the codes.
+        # ⭐ 1.57.6 — ONE EXIT, AND IT CLEARS THE CALLER'S SPAWN ARMS. The defect was five returns and one
+        # partial clear: the four argument refusals cleared nothing, the load-failure path cleared only the
+        # redirect, and the CH_ENDOW endowment survived every failure to land in the caller's NEXT child
+        # (issue 2026-09-23-child-inherits-every-fd-and-spawn-arms-leak §3). With the body in a function
+        # returning to this single point, no refusal can skip the clear.
+        var sp_r = spawn_path_sys(arg1, arg2, arg3, ksyscall_a4_get());
+        spawn_arms_clear(proc_current_get());
         stack_canary_check(canary);
-        return sp_pid;
+        return sp_r;
     }
     if (num == 45) {
         # getrandom(buf=arg1, len=arg2, flags=arg3) — fill the user buffer with

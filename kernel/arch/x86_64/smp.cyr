@@ -52,6 +52,7 @@ var heap_lock = 0;
 var vfs_lock = 0;
 var proctab_lock = 0;
 fn heap_spin_lock() {
+    preempt_disable();                                  # 1.57.6 (S3.2): a held plain spinlock is NON-PREEMPTIBLE (see smp.cyr's lock banner)
     var old = 1;
     while (old == 1) {
         var addr = &heap_lock;
@@ -71,9 +72,11 @@ fn heap_spin_unlock() {
         0x48; 0x31; 0xC9;              # xor rcx, rcx
         0x48; 0x87; 0x08;              # xchg [rax], rcx
     }
+    preempt_enable();                                   # 1.57.6 (S3.2): pairs the preempt_disable in the lock
     return 0;
 }
 fn vfs_spin_lock() {
+    preempt_disable();                                  # 1.57.6 (S3.2): a held plain spinlock is NON-PREEMPTIBLE (see smp.cyr's lock banner)
     var old = 1;
     while (old == 1) {
         var addr = &vfs_lock;
@@ -93,6 +96,7 @@ fn vfs_spin_unlock() {
         0x48; 0x31; 0xC9;              # xor rcx, rcx
         0x48; 0x87; 0x08;              # xchg [rax], rcx
     }
+    preempt_enable();                                   # 1.57.6 (S3.2): pairs the preempt_disable in the lock
     return 0;
 }
 # proctab_lock guards proc_alloc_slot's scan/claim/proc_count-bump + the reap-path proc_count
@@ -107,6 +111,7 @@ fn vfs_spin_unlock() {
 # Same fixed-global shape as the locks above (no parameter, so the [rbp-N] offsets are exact).
 var mmap_lock = 0;
 fn mmap_spin_lock() {
+    preempt_disable();                                  # 1.57.6 (S3.2): a held plain spinlock is NON-PREEMPTIBLE (see smp.cyr's lock banner)
     var old = 1;
     while (old == 1) {
         var addr = &mmap_lock;
@@ -126,10 +131,12 @@ fn mmap_spin_unlock() {
         0x48; 0x31; 0xC9;            # xor rcx, rcx
         0x48; 0x87; 0x08;            # xchg [rax], rcx
     }
+    preempt_enable();                                   # 1.57.6 (S3.2): pairs the preempt_disable in the lock
     return 0;
 }
 
 fn proctab_spin_lock() {
+    preempt_disable();                                  # 1.57.6 (S3.2): a held plain spinlock is NON-PREEMPTIBLE (see smp.cyr's lock banner)
     var old = 1;
     while (old == 1) {
         var addr = &proctab_lock;
@@ -149,6 +156,7 @@ fn proctab_spin_unlock() {
         0x48; 0x31; 0xC9;              # xor rcx, rcx
         0x48; 0x87; 0x08;              # xchg [rax], rcx
     }
+    preempt_enable();                                   # 1.57.6 (S3.2): pairs the preempt_disable in the lock
     return 0;
 }
 
@@ -158,8 +166,16 @@ fn proctab_spin_unlock() {
 # old@[rbp-0x08]/addr@[rbp-0x10]; a parameterized variant DEADLOCKED kmalloc, smp.cyr:38-46).
 # sched_lock serializes do_context_switch + sys_sched_yield (the pick+save+state-flips+on_cpu
 # fence). The protected section does NO FS/alloc/console/nvme/ahci I/O and NEVER calls
-# proc_alloc_slot/proc_create/kthread_create (which take proctab_lock), so sched_lock never
-# nests under any subsystem lock — it is the OUTERMOST/non-leaf scheduler lock.
+# proc_alloc_slot/proc_create/kthread_create (which take proctab_lock) — and acquires NOTHING.
+# ⭐ 1.57.6 (Path 2, S3.1): sched_lock is the INNERMOST LEAF, taken only with IF=0 (this block used to call
+# it "OUTERMOST/non-leaf", which was true only because nothing ever nested it). Any subsystem lock may be
+# held while taking it; nothing may be acquired under it, and nothing prints under it (a latched flag is
+# emitted after the unlock).
+# INV-6 (reworded 1.57.6): on_cpu(new) = this CPU is the LAST under-lock mutation of a switch.
+# INV-11 (1.57.6): on_cpu(old) = -1 is NOT an under-lock mutation any more — it is the lock-free release
+# store in the switch tail (sched.cyr sched_frame_iretq), after RSP has left old's kernel stack and after
+# cr3_load(new). on_cpu == -1 ⇔ no CPU is on that proc's stack and none has its CR3; every reader that
+# sees a stale non-(-1) value (sched_next's skip, the reap fence, proc_alloc_slot's reuse scan) only waits.
 # RE-ENTRY SAFETY (load-bearing): both holders run IF=0. do_context_switch runs from the
 # timer ISR (IF=0, the ISR gate clears IF). sys_sched_yield runs IF=0 because SFMASK MSR
 # 0xC0000084 = 0x40700 INCLUDES IF (0x200) so SYSCALL entry clears it (syscall_hw.cyr:179) —
@@ -255,6 +271,7 @@ fn net_rx_trylock() {
         0x48; 0x87; 0x08;                            # xchg [rax], rcx  (atomic: rcx<-old, [addr]<-1)
         0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
     }
+    if (old == 0) { preempt_disable(); }              # 1.57.6 (S3.2): only a WON try-lock is a held lock
     return old;                                       # 0 = we acquired; 1 = already held (skip)
 }
 fn net_rx_unlock() {
@@ -264,6 +281,7 @@ fn net_rx_unlock() {
         0x48; 0x31; 0xC9;              # xor rcx, rcx
         0x48; 0x87; 0x08;              # xchg [rax], rcx
     }
+    preempt_enable();                                   # 1.57.6 (S3.2): pairs the preempt_disable in the lock
     return 0;
 }
 
@@ -275,9 +293,31 @@ fn net_rx_unlock() {
 # fault handler touches any of these), so they are PLAIN spinlocks (NO cli/sti) and
 # INERT single-core (the xchg always wins uncontended → byte-identical boot).
 #
-# GLOBAL LOCK ORDER (acquire low->high, never backwards):
+# GLOBAL LOCK ORDER (acquire low->high, never backwards) — rewritten 1.57.6 (Path 2, S3.2):
 #   fs_lock < vfs_lock < proctab_lock < console_lock < {nvme_lock, ahci_lock, vblk_lock, msc_lock} < heap_lock < pmm_lock
 #   (the four backend locks are SIBLING LEAVES at one rank — never take two at once; nothing does)
+#   mmap_lock < pmm_lock (sys_mmap's cursor, then the 2 MB allocator). tlb_shoot_lock takes nothing under
+#   it (IPIs + an ack wait). input_lock is IRQ-saved (kbd_irq_save first) and takes nothing under it.
+#   net_rx_lock and hid_poll_lock are TRY-locks: they never spin, so they sit outside the order (a failed
+#   try simply means another context is draining). sched_lock is the INNERMOST LEAF: taken only with IF=0,
+#   any lock above may be held while taking it, nothing is taken under it (see its banner).
+# ⭐⭐ 1.57.6 (Path 2, S3.2) — EVERY PLAIN SPINLOCK DISABLES PREEMPTION FOR ITS HOLD. Each *_spin_lock
+# below calls preempt_disable() as its first statement and each *_spin_unlock calls preempt_enable() as its
+# last; a try-lock disables only when it wins. WHY: these are PLAIN spinlocks (no cli), and until now
+# only syscalls — which run IF=0 — ever held them, so "nobody is preempted holding one" was true by
+# accident. kmain and the kthreads run IF=1 alongside runnable ring-3 procs: a tick that switched kmain out
+# while it held console_lock (every kprint) handed the CPU to a process whose write(1) then spun on that
+# lock at IF=0 forever — a same-CPU deadlock at -smp 1, with kmain pinned to the BSP so it could never
+# release. With the count raised, do_context_switch refuses to switch the holder (preempt_count > 0), so
+# "no lock is held at a preempt point" is enforced, not a convention. Proven by KSTACK_SELFTEST's
+# lock-holder phase (scripts/smoke/kstack-smoke.sh) and its mutation M-A4.
+# ⚠ Adding the call adds NO local, so the hand-asm frame slots (old @ [rbp-0x08], addr @ [rbp-0x10]) do not
+# move — objdump-checked at 1.57.6. ⚠ EXCLUDED: spin_lock/spin_unlock (smp_lock). Its only user is
+# ap_entry, which runs while cpu_count flips 1 -> 2: preempt_cpu_slot's cpu_count < 2 fast path would
+# charge the +1 to slot 0 (the BSP's) and the -1 to the AP's own slot, leaving the BSP permanently
+# non-preemptible. And sched_spin_lock/unlock — the leaf is taken only with IF=0 inside the scheduler.
+# ⚠ COST: preempt_cpu_slot reads the LAPIC id (one MMIO load) per lock and per unlock once cpu_count >= 2;
+# scripts/bench-ring3.sh measures it. The per-CPU GS base that would remove it is a separate arc.
 # fs_lock is the OUTERMOST FS lock: an FS op that reads a block takes fs_lock, then
 # (inside, via blk_read_on) nvme_lock/ahci_lock, then (via kmalloc) heap_lock then
 # pmm_lock — all forward (fs < nvme/ahci < heap < pmm). console_lock sits between
@@ -320,6 +360,7 @@ var ahci_lock = 0;
 var vblk_lock = 0;
 var msc_lock  = 0;
 fn fs_spin_lock() {
+    preempt_disable();                                  # 1.57.6 (S3.2): a held plain spinlock is NON-PREEMPTIBLE (see smp.cyr's lock banner)
     var old = 1;
     while (old == 1) {
         var addr = &fs_lock;
@@ -339,9 +380,11 @@ fn fs_spin_unlock() {
         0x48; 0x31; 0xC9;              # xor rcx, rcx
         0x48; 0x87; 0x08;              # xchg [rax], rcx
     }
+    preempt_enable();                                   # 1.57.6 (S3.2): pairs the preempt_disable in the lock
     return 0;
 }
 fn console_spin_lock() {
+    preempt_disable();                                  # 1.57.6 (S3.2): a held plain spinlock is NON-PREEMPTIBLE (see smp.cyr's lock banner)
     var old = 1;
     while (old == 1) {
         var addr = &console_lock;
@@ -361,9 +404,11 @@ fn console_spin_unlock() {
         0x48; 0x31; 0xC9;              # xor rcx, rcx
         0x48; 0x87; 0x08;              # xchg [rax], rcx
     }
+    preempt_enable();                                   # 1.57.6 (S3.2): pairs the preempt_disable in the lock
     return 0;
 }
 fn nvme_spin_lock() {
+    preempt_disable();                                  # 1.57.6 (S3.2): a held plain spinlock is NON-PREEMPTIBLE (see smp.cyr's lock banner)
     var old = 1;
     while (old == 1) {
         var addr = &nvme_lock;
@@ -383,9 +428,11 @@ fn nvme_spin_unlock() {
         0x48; 0x31; 0xC9;              # xor rcx, rcx
         0x48; 0x87; 0x08;              # xchg [rax], rcx
     }
+    preempt_enable();                                   # 1.57.6 (S3.2): pairs the preempt_disable in the lock
     return 0;
 }
 fn ahci_spin_lock() {
+    preempt_disable();                                  # 1.57.6 (S3.2): a held plain spinlock is NON-PREEMPTIBLE (see smp.cyr's lock banner)
     var old = 1;
     while (old == 1) {
         var addr = &ahci_lock;
@@ -405,12 +452,14 @@ fn ahci_spin_unlock() {
         0x48; 0x31; 0xC9;              # xor rcx, rcx
         0x48; 0x87; 0x08;              # xchg [rax], rcx
     }
+    preempt_enable();                                   # 1.57.6 (S3.2): pairs the preempt_disable in the lock
     return 0;
 }
 
 # 1.57.1 — virtio_blk + USB-MS backend locks. Byte-identical to the ahci pair above (same xchg
 # spin, same frame offsets); the register contract is documented there.
 fn vblk_spin_lock() {
+    preempt_disable();                                  # 1.57.6 (S3.2): a held plain spinlock is NON-PREEMPTIBLE (see smp.cyr's lock banner)
     var old = 1;
     while (old == 1) {
         var addr = &vblk_lock;
@@ -430,9 +479,11 @@ fn vblk_spin_unlock() {
         0x48; 0x31; 0xC9;              # xor rcx, rcx
         0x48; 0x87; 0x08;              # xchg [rax], rcx
     }
+    preempt_enable();                                   # 1.57.6 (S3.2): pairs the preempt_disable in the lock
     return 0;
 }
 fn msc_spin_lock() {
+    preempt_disable();                                  # 1.57.6 (S3.2): a held plain spinlock is NON-PREEMPTIBLE (see smp.cyr's lock banner)
     var old = 1;
     while (old == 1) {
         var addr = &msc_lock;
@@ -452,6 +503,7 @@ fn msc_spin_unlock() {
         0x48; 0x31; 0xC9;              # xor rcx, rcx
         0x48; 0x87; 0x08;              # xchg [rax], rcx
     }
+    preempt_enable();                                   # 1.57.6 (S3.2): pairs the preempt_disable in the lock
     return 0;
 }
 
@@ -531,13 +583,17 @@ fn ap_entry() {
     # proctab_lock, so it MUST run ABOVE sched_spin_lock — sched_lock never nests proctab_lock.
     # Only the idle's state/owner/current flips go under sched_lock (so the BSP scheduler never
     # observes a half-registered state==1/on_cpu==-1 transient idle).
-    var ap_idle = ap_idle_create();   # wrapper in sched.cyr (forward-call resolves; a forward &fn does not)
+    # ⛔ 1.57.6 (S3-fix): that parenthesis was only TRUE from here on. ap_idle_create used proc_create_full, which
+    # published the idle READY and unpinned before this block — with its RSP on the stack this code is running
+    # on. It now returns the slot CLAIMING (state 3, invisible to every scheduler), and the state store below is
+    # the idle's first publish: running, owned, pinned, all under one sched_lock hold.
+    var ap_idle = ap_idle_create(my_id);   # wrapper in sched.cyr (forward-call resolves; a forward &fn does not) — 1.57.6: no kthread slot
     sched_spin_lock();
     sched_idle_pid_set(ap_idle);                 # per-CPU idle slot (sched_idle_cpu_slot folds my_id)
     proc_current_set(ap_idle);
     idle_owner_set(ap_idle, my_id);              # PERSISTENT owner → foreign CPUs never pick it (INV-9)
     on_cpu_set(ap_idle, my_id);                  # this AP owns its idle
-    proc_set_state(ap_idle, 2);                  # running
+    proc_set_state(ap_idle, 2);                  # running — the FIRST publish (it was CLAIMING until here)
     sched_spin_unlock();
     # Arm this AP's LAPIC timer (vector 32 = the timer ISR). 1.46.x SMP sub-bite 7 (#1):
     # inherit the EXACT reload count the BSP configured (lapic_timer_count, captured in

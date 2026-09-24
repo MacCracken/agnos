@@ -12,10 +12,92 @@ re-proving over `anu`.
 > byte-scans the kernel and hard-exits if it carries any selftest hook). Do not read anything
 > here as "two procs can't run concurrently on agnos." They can.
 
-Path 2 (per-proc syscall kstacks) TRACKED, deferred. Opened 2026-07-10 out of the mishran
-two-proc audio bring-up.
+Path 2 (per-proc syscall kstacks + real in-kernel blocking) IN FLIGHT since 1.57.6 — the operator chose it
+2026-09-23 (decision D20); bites S3.1–S3.3 SHIPPED in 1.57.6, the rest is the 1.57.x ladder in § Path 2 plan
+below. Opened 2026-07-10 out of the mishran two-proc audio bring-up.
 
-## The invariant (why this is hard)
+> ⭐ **1.57.6 — PATH 2 IS IN FLIGHT (operator decision D20, 2026-09-23), AND THE INVARIANT BELOW IS HISTORY
+> FROM S3.3 ON.** Bites S3.1–S3.3 landed: every process runs its syscalls on its OWN region-7 kernel stack
+> (the per-CPU syscall stacks are gone), the SYSRET state lives in that process's frame, a switch releases
+> `on_cpu` only after the CPU has left the old stack and CR3, spinlocks and ISR bodies are non-preemptible,
+> and region 7 has guard pages — see [`../../architecture/kernel-stacks-and-preemption.md`](../../architecture/kernel-stacks-and-preemption.md).
+> The waits themselves still hold their CPU (`preempt_disable` windows) until the voluntary switch + BLOCKED
+> state land (S3.4+); this document is rewritten when they do.
+
+## Path 2 plan (1.57.x) — the design record
+
+Operator decision D20 (2026-09-23) chose Path 2 over restartable waits: **a syscall runs on its own
+process's kernel stack, can block in place (a real BLOCKED state + wakeups) and be preempted at designated
+points; no restart machinery.** The binding plan is the lead's integration of three designs and their
+adversarial critiques (stacks, blocking, foreground), 2026-09-23/24. This section is its durable summary
+and is what the roadmap cites. Design record only (per-bite code sketches, byte-level stub layouts, mutation
+lists — not normative, not maintained): `~/.claude/projects/-home-macro-Repos-agnos/handoff-1.57.6/design/`
+(`path2-integration.json` and the `design-path2-*` / `crit-path2-*` pairs).
+
+### Contracts every step builds on
+
+- **C1 stack map** (region 7, always addressed through the direct map): `[0xE00000,0xF00000)` 16 × 64 KB
+  per-process kernel stacks (slot = pid; SYSCALL entry AND CPL3→CPL0 interrupts) · `[0xF00000,0xF40000)` 4
+  kthread stacks · `[0xF40000,0xF80000)` IST1 `#DF` · `[0xF80000,0xFC0000)` FREE, reserved for an NMI/#MC
+  IST · `[0xFC0000,0x1000000)` AP boot/TSS stacks. The lowest 4 KB of every 64 KB slot is a not-present
+  guard page. kmain stays on the BSP boot stack in region 1; AP idles stay on their AP boot stacks.
+- **C2 syscall frame** at the stack top: user RSP/RBP/RIP/RFLAGS, rbx, r12–r15 (`SCF_*` 8..72); the exit
+  pops SYSRET state from it, so a syscall may resume on any CPU.
+- **C3 exactly two switch paths, one save format:** (T) timer → `do_context_switch` → `sched_leave_old`;
+  (V) `sched_switch_vol` → `int 0xE0` → `resched_handler` → `do_context_switch` → `sched_leave_old`.
+  `exec_and_wait`/`enter_ring3` and `kernel_resume` are the only out-of-band entries and become boot-only
+  in S3b.
+- **C4 (INV-11):** `on_cpu(old) = −1` is written only by `sched_frame_iretq`, after RSP has left old's
+  stack and the new CR3 + kernel stack are installed.
+- **C5 states:** 0 dead · 1 ready · 2 running · 3 claiming · 4 DYING (S7) · 5 STOPPED (S7) · 6 BLOCKED.
+  `sched_next` picks only 1; `proc_alloc_slot` reuses only state 0 with `on_cpu == −1`.
+- **C6 preempt points (R1–R6):** arm → re-check → sleep|cancel with IF=0; preempt_count 0; ISRs only
+  wake; never carry a per-CPU cell across a wait; the live CR3 equals the slot CR3; the `#3`/`#37`/`#43`
+  loaders contain no wait.
+- **C7 locks:** every plain spinlock disables preemption; `sched_lock` is the innermost leaf. Order: fs <
+  vfs < proctab < console < {nvme,ahci,vblk,msc} < heap < pmm; `flock_lock` a leaf under fs; input and
+  S4's tcp/tx/lo locks below `sched_lock`.
+- **C9 API** (the only names later steps may use): `wq_can_block`, `wq_arm(key, deadline_us)`,
+  `wq_cancel`, `wq_sleep`, `wq_wake(key)`, `wq_interrupt[_locked]`, `wq_tick`, `wq_signal_pending`,
+  `wq_signal_point`, `sched_clock_us`, `wq_deadline_after_us`, `sched_yield_kernel`,
+  `sched_switch_vol(intent)`, `sched_exit_tail`, `kstack_install`, `sc_frame_get`. Wait keys `WK_*`
+  (SLEEP/FLOCK/CHILD/KBD/KBD_OWNER/SND/TCP/ICMP/TEST), reasons `WR_*` (NONE/EVENT/TIMEOUT/SIGNAL).
+
+### The ladder
+
+| Step | Bites | What lands | Status |
+|---|---|---|---|
+| S3 | S3.1 | switch tail + scheduler safety: deferred `on_cpu` release, READY-only tripwire, `sched_next` fallback, revive guard | ✅ **1.57.6** |
+| | S3.2 | preempt-disabling spinlocks, non-preemptible ISR bodies | ✅ **1.57.6** |
+| | S3.3 | per-process kernel stacks (stub bite B, 280 B), guard pages, foreground hygiene, `KSTACK_SELFTEST` + `kstack-smoke` | ✅ **1.57.6** |
+| S3c | S3.4 | voluntary switch (`int 0xE0`), BLOCKED state, the wq primitive, `#44`/`#14`/`#96` off the per-CPU captures, stub bite C (174 B), `sched_exit_tail` | 1.57.x |
+| | S3.5 | `sleep_ms`#41 blocks only its caller; `waitpid`#4 `WAIT_BLOCK` (`arg1 = 0x100\|pid`, `0x1FF` = any; no new number); child-exit wakes; `flock`#59 blocks (−2 = table full; NB keeps −1; a blocking conversion drops the old lock) | 1.57.x |
+| S3d | S3.6 | keep-current (a lone runner keeps its CPU: ~50% → ~100%), its own gate | 1.57.x |
+| | S3.7 | keyboard read (one blocking reader per line; the NB reader −2 while it is owned) and sound waits `#66`/`#68` | 1.57.x |
+| | S3.8 | wake latency: idle step + reschedule kick IPI (vector `0xE1`) | 1.57.x |
+| | S3.9 | docs (this file rewritten as SHIPPED; `blocking-waits.md`), sweep rows, bench | 1.57.x |
+| S3b | F1–F5 | `execwait`#37 becomes "load an ordinary scheduled IF=1 child, block until it exits"; kybernet's `/bin/agnsh`, NET dig and the recovery `run` become `kernel_run_child` (BSP-pinned); `exec_and_wait` refused post-scheduler; no IF=0 ring 3 after `sched_active = 1`. F2 is a legal stopping point | 1.57.x |
+| S6 | — | `sock_connect`#47 / `sock_send`#48 / `icmp_echo`#55/#100 block only their caller, woken by the RX demux (after S4 + S5) | 1.57.x |
+| S7/S8 | — | kill/stop/continue build on `sched_switch_vol`, the wq hooks and `sched_exit_tail`; limits on the tick path | 1.57.x |
+
+Every bite is boot-verified at `-smp 1` AND `-smp 4` before the next starts (agnsh-smoke at both, the stub
+size oracle, the aarch64 name lists, LOAD end ≤ `0x370000`), with the accelerator pinned (KVM when
+`/dev/kvm` is writable, else `tcg,thread=multi`) — a GREEN mutant under single-threaded TCG proves nothing.
+
+### Risks the plan names (the iron-only ones are why 1.57.6 says "NOT burned")
+
+- The torn (CS,SS) frame class on the CPL0 resume paths (`sched_leave_old` → `sched_frame_iretq`, the
+  `#44` tail; S3b adds agnsh's first ring-3 entry through the scheduler tail) — QEMU cannot show it.
+- `SPEC_CTRL` in the switch tail is inert on both test substrates (`ibrs=0`); the 4 KB guard pages under
+  real paging/TLB behaviour; the hand-built SYSCALL stub (one wrong byte bricks userland).
+- Behaviour: a kmain or kthread holding any spinlock is no longer preemptible; keep-current changes a lone
+  runner's share; a READY process on a busy CPU waits for its next tick (the kick targets halted CPUs only).
+- NMI is not configured (pre-existing); `[0xF80000,0xFC0000)` is its natural IST home.
+- `BOOTCR3_KEEP_GNOBOOT_CR3` builds get no guard pages and keep the `.bss` kthread pool; no smoke covers them.
+- `flock` has no FIFO fairness; until S7 a two-lock cycle parks both processes BLOCKED (the rest of the
+  machine keeps running).
+
+## The invariant (why this is hard) — HISTORY: true through 1.57.5
 
 Every proc on a CPU enters syscall handlers on ONE **shared per-CPU** syscall kernel
 stack (`pcpu_syscall_kstack_top` = `0xF10000 + cpu*0x10000`, `syscall_hw.cyr`), NOT a
@@ -111,7 +193,7 @@ workaround):
 The `msh_client_write` API should also internally chunk large writes ≤ window + yield on
 agnos, so real clients (jalwa) get correct pacing for free.
 
-## Path 2 — per-proc syscall kstacks (DEFERRED, the real general fix)
+## Path 2 — the original sketch (2026-07-10; superseded by § Path 2 plan above)
 
 Give each proc its OWN syscall entry stack (the `proc_rsp0` pool already gives every pid
 a region-7 stack; repoint `pcpu_syscall_kstack_top` per-proc on context switch, exactly

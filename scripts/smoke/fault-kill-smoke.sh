@@ -12,6 +12,10 @@
 #   run: exit 142                      (128 + 14 = the #PF kill code; kernel_resume carried it)
 #   fault: SURVIVED back in kernel     (exec_and_wait resumed after the ring-3 fault)
 # FAIL (exit 1): no SURVIVED marker — the box halted on the ring-3 fault (canary path).
+# VOID (exit 2, 1.57.6 S3-fix): the firmware never handed off in QEMU_TRIES attempts (qemu_dwell_kernel's
+#   banner-gated retry). Until S3-fix this smoke booted ONCE through the bare qemu_dwell, so the ~1-in-4 OVMF
+#   hand-off failure printed "FAIL: faulter never dispatched" — the S3-finish matrix scored exactly that as a
+#   kernel red before a re-run passed.
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -43,11 +47,12 @@ mcopy -i "$IMG"@@1048576 "$GNOBOOT" ::EFI/BOOT/BOOTX64.EFI
 mcopy -i "$IMG"@@1048576 "$AGNOS" ::boot/agnos
 mkfs.ext2 -F -q -L AGNOS-FAULT -b 4096 -m 0 -O "$EXT2_SMOKE_FEATURES" -d "$SEED" -E offset=$PART_OFFSET "$IMG" $PART_BLOCKS
 
-cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$WORK/fault.log"
 echo "Booting FAULT_SELFTEST kernel (ring-3 #PF → expect kill + survive)..."
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
-qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
+QEMU_DWELL_VOID="${QEMU_DWELL_VOID:-gnoboot: fail @ EBS|BootManagerMenuApp|Please select boot device}"
+export QEMU_DWELL_VOID
+qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" "$WORK/vars.fd" "$OVMF_VARS_SRC" \
     qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
@@ -56,6 +61,7 @@ qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
     -device "nvme,drive=disk0,serial=AGNOS-FAULT" \
     -serial stdio -display none -no-reboot
 
+qemu_assert_booted "$LOG" || { echo "fault-kill-smoke: VOID"; exit 2; }
 echo ""
 echo "  --- fault / run lines ---"
 strings "$LOG" | grep -E "^(\[[^]]*\] )?fault:|^run:" | sed 's/^/  /'

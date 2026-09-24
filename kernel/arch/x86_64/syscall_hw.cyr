@@ -9,11 +9,15 @@ var syscall_entry_buf[256];  # Enlarged for IBRS instructions
 # at each consumer (r8/rax * 8 + &array), so each CPU has its own slot/stack with NO register
 # assumed to survive `call syscall_handler`. module-global `var X[4]` = 4*u64 = 32 bytes each.
 #
-# PD[0..127]-RESIDENCY (checkable): all three arrays live in kernel .bss (<16 MB, PD[0..7]) and the
-# baked kstack tops 0xF10000 / 0xF90000 are region-7 (PD[7], 14-16 MB) — both copied into every
-# per-proc CR3 by the proc.cyr PD[0..127] copy, so the stub (running under the still-user CR3 while
-# KPTI is collapsed) reaches them. region 7 is pmm-reserved (pmm.cyr), so the tops are never alloc'd.
-var pcpu_kernel_rsp_save[4];      # per-CPU user-RSP save slot (was global kernel_rsp_save)
+# PD[0..127]-RESIDENCY (checkable): all three arrays live in kernel .bss (<16 MB, PD[0..7]), copied into
+# every per-proc CR3 by the proc.cyr PD[0..127] copy, so the stub (running under the still-user CR3 while
+# KPTI is collapsed) reaches them. The kernel stacks themselves are region-7 slots reached through the
+# DIRECT MAP (PDPT[8], mirrored into every per-proc CR3), never their identity VA.
+# ⭐ 1.57.6 (Path 2, S3.3): pcpu_kernel_rsp_save is ENTRY SCRATCH ONLY now — the stub saves the user RSP
+# here, immediately pushes it into the calling process's own frame ([ktop-8]), and the exit loads RSP from
+# that frame. Nothing reads the cell after the entry window (IF=0), so a later syscall on this CPU
+# overwriting it can no longer misdirect a SYSRET. The "kernel-stack top" is per-PROCESS (below).
+var pcpu_kernel_rsp_save[4];      # per-CPU user-RSP entry scratch (was global kernel_rsp_save)
 # ⭐ 1.56.54 — `fork`#96 NEEDS THE USER RETURN CONTEXT, AND IT IS ALREADY CAPTURED. A first draft
 # added `pcpu_user_rip`/`pcpu_user_rflags` here plus two more stores in the entry stub — all of it
 # redundant. `sched_yield`#44 already made the stub capture exactly this set per-CPU at entry:
@@ -25,21 +29,28 @@ var pcpu_kernel_rsp_save[4];      # per-CPU user-RSP save slot (was global kerne
 # every syscall in the system runs through.
 # ⚠ Valid ONLY inside a syscall arm reached from the ring-3 stub, and overwritten by the next
 # syscall on this CPU — the same contract #44 documents. It is not a per-process save area.
-# per-CPU PRIMARY SYSCALL kernel-stack top. Was global syscall_kstack_top (single 0x3F0000). Now
-# region-7 tops 0xF10000 + cpu*0x10000 (0xF10000/0xF20000/0xF30000/0xF40000) — above the proc_rsp0
-# 0xF00000 ceiling, below 0x1000000, 64 KB apart so the four CPUs' stacks never overlap. Init in
-# syscall_kstack_reserve(); each CPU's stub bakes &pcpu_syscall_kstack_top + cpu*8 via r8*8+disp32.
+# ⭐⭐ 1.57.6 (Path 2, S3.3) — pcpu_syscall_kstack_top[cpu] = THIS CPU's CURRENT PROC's KERNEL-STACK TOP: a
+# mirror of TSS.RSP0 the stub can index with r8*8 (the TSS stride of 104 is not a SIB scale).
+# ⛔ WHAT IT WAS: a per-CPU PRIMARY syscall stack (region 7, 0xF10000 + cpu*0x10000) that every process on
+# the CPU shared, plus a SECOND one (0xF90000 + cpu*0x10000, `pcpu_syscall_kstack_top2`) that execwait#37
+# swapped in so its child's syscalls could not grow down through the parent's suspended #37 frame and
+# SYSRET cells. Both are gone. A syscall now runs on the CALLING PROCESS'S OWN kernel stack — the per-proc
+# region-7 slot TSS.RSP0 already pointed at (proc.cyr proc_rsp0 / KSTACK_POOL_BASE) — so its SYSRET state
+# lives in that process's frame (SCF_* below) whichever CPU finishes the syscall, and a #37 child's
+# syscalls grow down the child's stack by construction.
+# Written ONLY by kstack_install (below) — on every path that makes a proc current before ring 3 can run:
+# do_context_switch, sys_sched_yield's tail, exec_and_wait, execwait#37's resume, kernel_resume.
+# syscall_kstack_reserve seeds every slot with 0, so a SYSCALL that arrives before ANY install on its CPU faults on
+# its first push instead of silently sharing some other process's stack.
+# ⛔ 1.57.6 (S3-fix) — THAT IS FAIL-STOP, AND THIS LINE USED TO CALL IT "FAIL-LOUD". The push faults, the #PF
+# cannot be pushed on the same RSP either, and it escalates to #DF on IST1. Mutation M-B2 (the top store skipped)
+# measured the result under QEMU: a silent wedge, no serial line at all — the vector-8 stub reached only CMOS 0x54
+# and the FB bar. The #DF stub now prints one COM1 line first ("PANIC: Double Fault ...", exc_df_report, idt.cyr).
+# ⚠ AND A ZERO TOP COVERS ONLY THE FIRST ENTRY ON A CPU. The likely regression — a new switch path that forgets
+# kstack_install — leaves the top naming the PREVIOUS process's stack, which is valid memory: nothing faults and
+# the syscall runs on someone else's frames. kstack_check_entry (sched.cyr), the first call in syscall_handler, is
+# what catches that one.
 var pcpu_syscall_kstack_top[4];
-# per-CPU SECOND, disjoint SYSCALL kstack top for the nested exec_and_wait(child) (execwait #37).
-# Was global syscall_kstack_top2 (single 0x3D0000). execwait is the first exec_and_wait invoked FROM
-# a live ring-3 SYSCALL frame (agnsh): while agnsh's #37 handler is suspended, the child's OWN
-# syscalls re-enter the stub and reload rsp from pcpu_syscall_kstack_top — if that still pointed at
-# the primary 0xF10000+cpu they'd grow down through agnsh's suspended #37 frame AND the stub-pushed
-# SYSRET rcx/r11/rbp cells (no global mirror), so agnsh would resume on smashed control state. The
-# #37 handler points THIS cpu's primary slot at its nested top (0xF90000 + cpu*0x10000) for the
-# child run — NO stub rebuild — so the child grows down a DIFFERENT page and never touches agnsh's
-# frame; restored to the primary on resume. region-7 tops, 64 KB apart, pmm-reserved (see above).
-var pcpu_syscall_kstack_top2[4];
 # 1.46.x 4b: idempotency guard for syscall_kstack_reserve (was the old `syscall_kstack_top != 0`
 # self-check, which the per-CPU arrays can't double as — slot 0 being 0 is now a valid mid-init state).
 var syscall_kstack_reserved = 0;
@@ -112,7 +123,11 @@ fn sc_scr_base() {
 # C-level handler called from the syscall entry stub.
 # user_rsp = the caller's RSP (saved before switching to kernel stack)
 fn syscall_handler(user_rsp, sc_num, sc_arg1, sc_arg2, sc_arg3, sc_arg4) {
-    ksyscall_a4_set(sc_arg4);
+    # 1.57.6 (S3-fix): ONE cpu-id read serves both entry duties (it is a LAPIC MMIO read once cpu_count >= 2 — a VM
+    # exit under KVM; a second one here measured +20% on getpid at -smp 4). IF=0 until the arm runs: no migration.
+    var sh_cpu = pcpu_cpu();
+    store64(&pcpu_ksyscall_a4 + sh_cpu * 8, sc_arg4);  # = ksyscall_a4_set(sc_arg4), with the id already in hand
+    kstack_check_entry(sh_cpu);                        # is this CPU's syscall top the CALLER's stack? (sched.cyr)
     # 1.44.16: sched_yield(#44) dispatches HERE, not in ksyscall — syscall_handler is
     # reachable ONLY via the ring-3 entry stub, so the sc_entry_regs captures are valid
     # by construction. In-kernel code (bench, recovery shell) calls ksyscall directly
@@ -133,7 +148,9 @@ fn syscall_handler(user_rsp, sc_num, sc_arg1, sc_arg2, sc_arg3, sc_arg4) {
     # returns 0 and we fall to ksyscall(14)'s SAFE sti-window hlt (so device IRQs — e.g.
     # the NIC RX — still get a wake window; a pure yield would busy-spin a lone blocking
     # read and never open one).
-    if (sc_num == 14) { sys_sched_yield(); return ksyscall(sc_num, sc_arg1, sc_arg2, sc_arg3); }
+    # 1.57.6 (S3.3): sys_pause (sched.cyr) — KSTACK_SELFTEST's probe hook first (a no-op twin in production),
+    # then exactly the old body: the abandon-frame yield, else ksyscall(14)'s safe hlt.
+    if (sc_num == 14) { return sys_pause(sc_arg1, sc_arg2, sc_arg3); }
     var result = ksyscall(sc_num, sc_arg1, sc_arg2, sc_arg3);
     return result;
 }
@@ -253,11 +270,45 @@ fn syscall_kstack_reserve() {
     # the kstack is always reachable. The stub's load is `mov rsp, [r8*8 + &table]` (a 64-bit load), so
     # storing 8 GB+ VAs here needs NO stub change. Phys stays region-7-reserved (same determinism as the
     # old fixed tops, no pmm_alloc_2mb next-free flake; 1.40.9).
+    # ⛔ 1.57.6 (Path 2, S3.3) — EVERYTHING ABOVE IS HISTORY: the tops start at 0 (fail-STOP — see
+    # pcpu_syscall_kstack_top for what a zero top does and does not catch). There is no
+    # shared per-CPU syscall stack any more (see pcpu_syscall_kstack_top); every ring-3 entry is preceded by
+    # kstack_install(pid), which points this CPU's slot at the entering proc's own region-7 stack. The old
+    # fixed tops' phys (0xF00000-0xF40000 and 0xF80000-0xFC0000) are the kthread pool and a FREE range now —
+    # gdt.cyr carries the region-7 map. The direct-map rule above still holds for every stack in region 7.
     for (var c = 0; c < 4; c = c + 1) {
-        store64(&pcpu_syscall_kstack_top + c * 8, DIRECTMAP_BASE + 0xF10000 + c * 0x10000);
-        store64(&pcpu_syscall_kstack_top2 + c * 8, DIRECTMAP_BASE + 0xF90000 + c * 0x10000);
+        store64(&pcpu_syscall_kstack_top + c * 8, 0);
     }
     syscall_kstack_reserved = 1;
+    return 0;
+}
+
+# ═══════════════ 1.57.6 (Path 2, S3.3) — THE SYSCALL FRAME: per-PROCESS, at the top of its kernel stack ═══════════════
+# Live only while that proc is inside a SYSCALL from ring 3 (the stub builds it; ktop = proc_rsp0_top(pid)):
+#   [ktop-8]  user RSP      [ktop-16] user RBP      [ktop-24] user RIP (rcx)      [ktop-32] user RFLAGS (r11)
+#   [ktop-40] rbx   [ktop-48] r12   [ktop-56] r13   [ktop-64] r14   [ktop-72] r15
+# The exit POPS rbx/r12-r15, r11, rcx, rbp and loads RSP from [ktop-8], so SYSRET state belongs to the
+# process, not to whichever CPU ends the syscall. (The IBRS-set block between push rbp and push rcx is
+# push/pop balanced, so it never moves a slot.)
+var SCF_URSP = 8;
+var SCF_RBP  = 16;
+var SCF_RIP  = 24;
+var SCF_RFL  = 32;
+var SCF_RBX  = 40;
+var SCF_R12  = 48;
+var SCF_R13  = 56;
+var SCF_R14  = 64;
+var SCF_R15  = 72;
+fn sc_frame_get(pid, off) { return load64(proc_rsp0_top(pid) - off); }
+
+# Make `pid`'s kernel stack THE kernel stack of this CPU: TSS.RSP0 (CPL3 interrupts) and the syscall top
+# (SYSCALL entry) — one stack for both, because a proc is either in ring 3 (an interrupt frame starts at the
+# top) or in a syscall (the frame starts at the top and any interrupt nests below it), never both at once.
+# ⚠ Call it under a CR3 that maps the LAPIC (every CR3 this kernel builds does): tss_set_rsp0 reads the id.
+fn kstack_install(pid) {
+    var top = proc_rsp0_top(pid);
+    tss_set_rsp0(top);
+    store64(&pcpu_syscall_kstack_top + pcpu_cpu() * 8, top);
     return 0;
 }
 
@@ -352,9 +403,16 @@ fn syscall_msr_init() {
 # BSP boot entry: reserve the syscall kstack, program this CPU's MSRs, detect IBRS, then build the
 # shared SYSCALL entry stub ONCE. `cpuid_edx` is the SOLE local here so it lands at [rbp-0x08] —
 # the offset the IBRS-capture asm hardcodes (the spin_unlock sole-local pattern; objdump-verified).
+# ⭐ 1.57.6 (Path 2, S3.3) — THE STUB IS BUILT ONCE AND IS IMMUTABLE AFTERWARDS. syscall_init used to rebuild
+# it on EVERY call: main.cyr calls it at 13 selftest sites (one of them, fork_disk_selftest, after
+# sched_active = 1 with the APs executing the stub) and exec_and_wait called it on every exec — rewriting
+# bytes another CPU may be executing is cross-modifying code. Now the MSRs are (re)programmed every call and
+# the IBRS probe + stub build run once; the per-exec caller (exec_and_wait) calls syscall_msr_init directly.
+var syscall_stub_built = 0;
 fn syscall_init() {
     syscall_kstack_reserve();   # no-op if already reserved early in boot
     syscall_msr_init();
+    if (syscall_stub_built != 0) { return 0; }
 
     # S9: Check CPUID for IBRS support (leaf 7, subleaf 0, EDX bit 26)
     ibrs_supported = 0;
@@ -369,6 +427,7 @@ fn syscall_init() {
         ibrs_supported = 1;
     }
     syscall_stub_build();
+    syscall_stub_built = 1;
     return 0;
 }
 
@@ -385,14 +444,14 @@ fn syscall_stub_build() {
     #   RDI = arg1, RSI = arg2, RDX = arg3
     #   RSP = still user RSP (SYSCALL doesn't switch stack!)
     #
-    # We need to:
-    #   1. Save user RSP to kernel_rsp_save
-    #   2. Switch to kernel stack
-    #   3. Push RCX (user RIP) and R11 (user RFLAGS) for later SYSRET
-    #   4. Push user RSP
-    #   5. Call syscall_handler(user_rsp, num, arg1, arg2, arg3)
-    #   6. Restore user RSP, RCX, R11
-    #   7. SYSRET
+    # We need to (1.57.6, Path 2 S3.3 — THE FRAME IS PER-PROCESS; the SCF_* block above has the layout):
+    #   1. Save user RSP into this CPU's pcpu_kernel_rsp_save (the entry scratch the off-100 consumer reads)
+    #   2. Switch to THIS PROCESS's kernel stack (pcpu_syscall_kstack_top[cpu], written by kstack_install)
+    #   3. Build the frame: push user RSP [ktop-8], rbp [-16], (IBRS, balanced), rcx = user RIP [-24],
+    #      r11 = user RFLAGS [-32], rbx [-40], r12 [-48], r13 [-56], r14 [-64], r15 [-72]
+    #   4. Call syscall_handler(user_rsp, num, arg1, arg2, arg3, a4)
+    #   5. Pop r15..r12, rbx, r11, rcx, rbp; load RSP from the frame's [ktop-8] (mov rsp,[rsp])
+    #   6. User CR3; SYSRET
 
     var ep = &syscall_entry_buf;
     var eoff = 0;
@@ -522,6 +581,14 @@ fn syscall_stub_build() {
     # DISP32-EMIT-WIDTH: store32(+4), NOT store64(+8).
     store32(ep + eoff, kst_base); eoff = eoff + 4;
 
+    # ⭐ 1.57.6 (Path 2, S3.3): push qword [r8*8 + &pcpu_kernel_rsp_save] — the user RSP saved just above,
+    # now [ktop-8] of THIS PROCESS's frame (SCF_URSP), which the exit loads RSP from. r8 is still the capped
+    # cpu (R8-AS-CPU holds until the arg shuffle's `mov r8,rdx`). 42 FF 34 C5 <disp32>: REX.X (the index
+    # is r8), FF /6 = push r/m64, ModRM 00 110 100 (SIB), SIB scale 8 / index r8 / no base (disp32).
+    # DISP32-EMIT-WIDTH: store32(+4), NOT store64(+8).
+    store8(ep + eoff, 0x42); store8(ep + eoff + 1, 0xFF); store8(ep + eoff + 2, 0x34); store8(ep + eoff + 3, 0xC5); eoff = eoff + 4;
+    store32(ep + eoff, krs_base); eoff = eoff + 4;
+
     # 1.42.x (RBP smash, CR2=0x37fed8): preserve the user's RBP across the
     # kstack switch. SYSCALL doesn't save RBP, and the C-ABI syscall_handler
     # (and its ksyscall callees) use RBP as a frame pointer
@@ -562,6 +629,18 @@ fn syscall_stub_build() {
     store8(ep + eoff, 0x51); eoff = eoff + 1;
     # push r11 (user RFLAGS) — 41 53
     store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x53); eoff = eoff + 2;
+    # ⭐ 1.57.6 (Path 2, S3.3): push rbx, r12, r13, r14, r15 — the caller's callee-saved set, [ktop-40..-72]
+    # (SCF_RBX..SCF_R15). syscall_handler (cyrius #regalloc) preserves them, so the exit's pops are
+    # value-identical on a normal return; what the pushes buy is a frame that is AUTHORITATIVE for this
+    # process — a syscall switched out mid-flight (a CPL0 preemption window, S3.4's blocking waits) and
+    # fork read the caller's resume registers from HERE, not from a per-CPU capture the next syscall on
+    # that CPU overwrites. RSP at `call syscall_handler` is now ktop-72 ≡ 8 (mod 16): the same parity the
+    # three pushes (ktop-24) gave. 53 / 41 54 / 41 55 / 41 56 / 41 57.
+    store8(ep + eoff, 0x53); eoff = eoff + 1;                                         # push rbx
+    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x54); eoff = eoff + 2;           # push r12
+    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x55); eoff = eoff + 2;           # push r13
+    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x56); eoff = eoff + 2;           # push r14
+    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x57); eoff = eoff + 2;           # push r15
 
     # Set up args for syscall_handler(user_rsp, sc_num, sc_arg1, sc_arg2, sc_arg3)
     # Current regs: rax=syscall#, rdi=arg1, rsi=arg2, rdx=arg3
@@ -625,6 +704,13 @@ fn syscall_stub_build() {
     store8(ep + eoff, 0x0F); store8(ep + eoff + 1, 0x01); store8(ep + eoff + 2, 0xCA); eoff = eoff + 3;  # clac
 
     # rax now has return value
+    # ⭐ 1.57.6 (Path 2, S3.3): pop r15, r14, r13, r12, rbx — the frame's callee-saved set, reverse order.
+    # 41 5F / 41 5E / 41 5D / 41 5C / 5B. Nothing here writes rax (the return value).
+    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x5F); eoff = eoff + 2;           # pop r15
+    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x5E); eoff = eoff + 2;           # pop r14
+    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x5D); eoff = eoff + 2;           # pop r13
+    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x5C); eoff = eoff + 2;           # pop r12
+    store8(ep + eoff, 0x5B); eoff = eoff + 1;                                         # pop rbx
 
     # Restore r11 (saved RFLAGS) and rcx (return RIP)
     # pop r11 — 41 5B
@@ -699,8 +785,8 @@ fn syscall_stub_build() {
         store8(ep + eoff, 0x58); eoff = eoff + 1;  # pop rax
     }
 
-    # 1.46.x 4b exit reload — restore the caller RSP from THIS CPU's pcpu_kernel_rsp_save slot.
-    # rax holds the syscall RETURN VALUE here, so we re-read the APIC into r8 (EXIT-R8-FREE: r8 is
+    # 1.46.x 4b exit APIC block (1.57.6: it no longer feeds the RSP reload — see the ⭐ below — only the
+    # user-CR3 load after it). rax holds the syscall RETURN VALUE here, so we re-read the APIC into r8 (EXIT-R8-FREE: r8 is
     # dead post-handler — the arg shuffle's `mov r8,rdx` value died inside the call) — NOT rax.
     # APIC-UNDER-KERNEL-CR3: this runs BEFORE the kernel→user CR3 switch below, so the 0xFEE00020
     # MMIO read resolves under the kernel CR3. Same 7-instruction entry-form block, then a based load.
@@ -722,10 +808,13 @@ fn syscall_stub_build() {
     store8(ep + eoff, 0x72); store8(ep + eoff + 1, 0x03); eoff = eoff + 2;
     # xor r8d, r8d — 45 31 C0
     store8(ep + eoff, 0x45); store8(ep + eoff + 1, 0x31); store8(ep + eoff + 2, 0xC0); eoff = eoff + 3;
-    # mov rsp, [r8*8+disp32] — 4A 8B 24 C5 <disp32>
-    store8(ep + eoff, 0x4A); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x24); store8(ep + eoff + 3, 0xC5); eoff = eoff + 4;
-    # DISP32-EMIT-WIDTH: store32(+4), NOT store64(+8).
-    store32(ep + eoff, krs_base); eoff = eoff + 4;
+    # ⭐⭐ 1.57.6 (Path 2, S3.3): mov rsp, [rsp] — 48 8B 24 24. The pops above (r15..rbx, r11, rcx, rbp) and the
+    # balanced IBRS-clear block leave RSP at [ktop-8], this process's saved user RSP (SCF_URSP). This was
+    # `mov rsp, [r8*8 + &pcpu_kernel_rsp_save]` — a PER-CPU cell the next syscall on this CPU overwrites, so a
+    # syscall switched out mid-flight, or resumed on another CPU, would have SYSRET'd on another process's
+    # stack (M-B1 puts it back and KSTACK_SELFTEST's distinct-RSP probes go red). r8 is not written between
+    # the APIC block above and the user-CR3 load below.
+    store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x24); store8(ep + eoff + 3, 0x24); eoff = eoff + 4;
 
     # S8 (KPTI): Switch from kernel CR3 back to user CR3 before SYSRET.
     # 1.46.x 4c POINT 6: load THIS CPU's user CR3 from pcpu_kpti_user_cr3, install it. r8 was RE-READ by
@@ -765,6 +854,9 @@ fn syscall_stub_build() {
     # ⭐ Print the size unconditionally. A number in the boot log is what makes the next growth`s headroom
     # a fact rather than an assumption, and it costs one line on a path that runs once.
     kprint("syscall: stub ", 14); kprint_num(eoff); kprintln(" bytes of 2048", 14);
+    # 1.57.6 (S3.3): the size ORACLE is keyed on this — 280 bytes with ibrs=0 (258 + 8 + 9 + 9 - 4); the IBRS
+    # blocks add bytes on a host whose CPUID leaf-7 EDX[26] is set, so a size check must read this line too.
+    kprint("syscall: ibrs=", 14); kprint_num(ibrs_supported); kprintln("", 0);
     if (eoff > 2048) {
         kprintln("syscall: STUB OVERFLOWED ITS BUFFER - .bss past syscall_entry_buf is CORRUPT", 76);
         arch_halt();

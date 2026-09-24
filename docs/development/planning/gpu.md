@@ -364,9 +364,11 @@ fixed 512 B while `ws_count` is a u8 (max 255), so a table with `ws_count > 128`
     on DCN a readback is also a *shadow*.
 - **Timebase**: `pit_ch0_read()` is a non-destructive latch read of PIT ch0, left free-running by `pic_init()` as a **mode-2 rate generator,
     divisor 11932**. Mode 3 steps by TWO and breaks the wrap math. **CPUID 0x15/0x16 return zeros on this exact part**, so the TSC route is
-    closed for the display timebase. Ring-3 timing uses `#95 uptime_us` (rdtsc, calibrated at boot against 50 ms of live ticks, returning −1
-    rather than a plausible 0 when calibration is refused) — **`#40 uptime_ms` is FROZEN inside a foreground `run`**, because such a program
-    starts with IF cleared so the timer ISR never fires. That cost two burns.
+    closed for the display timebase. Ring-3 timing uses `#95 uptime_us` (rdtsc, calibrated at boot against the ACPI PM
+    timer since 1.57.6 — live ticks only where the FADT advertises none — returning −1 rather than a plausible 0 when
+    calibration is refused, and that −1 is permanent for the boot; `docs/architecture/kernel-clocks.md`) —
+    **`#40 uptime_ms` is FROZEN inside a foreground `run`**, because such a program starts with IF cleared so the timer
+    ISR never fires. That cost two burns.
 
 ## 1.10 Iron-proven reference — HDMI audio (PARKED by operator decision 2026-07-31)
 

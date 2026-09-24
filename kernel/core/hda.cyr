@@ -309,7 +309,8 @@ fn hda_write32(off, val) {
 # This was `var HDA_TSC_MHZ = 3000;` — a round 3 GHz, justified in its comment by the TSC being
 # invariant and by xhci_port.cyr:558 already spinning on the same number. The premise was right
 # (invariant TSC = ~constant per box) and the VALUE was never measured. tsc_calibrate() (main.cyr,
-# right after `sti`) times rdtsc against 50 ms of live 100 Hz ticks, and archaemenid reports
+# right after `sti`) times rdtsc against the ACPI PM timer (live ticks where the FADT has none; it
+# was 50 ms of live 100 Hz ticks until 1.57.6), and archaemenid reports
 # 3193-3194. So every hda_udelay() was ~6.5% SHORTER than the microseconds it named: the
 # codec-discovery settle asking for 1500 us really waited ~1409 us.
 #

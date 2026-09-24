@@ -70,24 +70,51 @@ mkfs.ext2 -F -q -L AGNOS-DOOM -b 4096 -m 0 -O "$EXT2_FEATURES" \
     -d "$SEED" -E offset=$PART_OFFSET "$IMG" $PART_BLOCKS
 
 echo "[3/4] Booting (gnoboot+OVMF+NVMe) and running /bin/doom..."
-cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
-SLOG="$LOGS/serial.log"; : > "$SLOG"
-qemu-system-x86_64 \
-    -machine q35 -m 512M -cpu max \
-    -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
-    -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
-    -drive "file=$IMG,format=raw,if=none,id=disk0" \
-    -device "nvme,drive=disk0,serial=AGNOS-DOOM" \
-    -vnc "unix:$WORK/vnc.sock" \
-    -monitor "unix:$WORK/mon.sock,server,nowait" \
-    -serial "file:$SLOG" -no-reboot &
-QPID=$!
-trap 'kill $QPID 2>/dev/null' EXIT
-
-# Wait for doom to start, then give it time to slurp the 4 MB WAD + render.
-for i in $(seq 1 30); do
-    sleep 1
-    grep -aq "exec: running /bin/doom" "$SLOG" 2>/dev/null && break
+SLOG="$LOGS/serial.log"
+# ⛔ 1.57.6 (S3-fix): BANNER-GATED RETRY. This boot is backgrounded (the screendump needs the live monitor), so it
+# cannot use qemu_dwell_kernel, and until S3-fix it booted exactly once: the ~1-in-4 OVMF hand-off failure then
+# printed "doom never started" and scored a kernel red (the S3-finish matrix re-ran one by hand, and the log that
+# would have shown the boot menu was overwritten by the passing re-run). Now an attempt whose serial log never
+# shows the kernel banner is killed, its log kept as serial.voidN.log, and re-booted (QEMU_TRIES, default 6); a
+# boot that printed the banner stands whatever happens next. No banner in any attempt → VOID (exit 2).
+DOOM_TRIES="${QEMU_TRIES:-6}"
+dtry=1
+while :; do
+    cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
+    : > "$SLOG"
+    rm -f "$WORK/vnc.sock" "$WORK/mon.sock"
+    qemu-system-x86_64 \
+        -machine q35 -m 512M -cpu max \
+        -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
+        -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
+        -drive "file=$IMG,format=raw,if=none,id=disk0" \
+        -device "nvme,drive=disk0,serial=AGNOS-DOOM" \
+        -vnc "unix:$WORK/vnc.sock" \
+        -monitor "unix:$WORK/mon.sock,server,nowait" \
+        -serial "file:$SLOG" -no-reboot &
+    QPID=$!
+    trap 'kill $QPID 2>/dev/null' EXIT
+    # Wait for doom to start (or for the firmware to give up), then give it time to slurp the 4 MB WAD + render.
+    dvoid=0
+    for i in $(seq 1 30); do
+        sleep 1
+        grep -aq "exec: running /bin/doom" "$SLOG" 2>/dev/null && break
+        if ! grep -aq "AGNOS kernel v" "$SLOG" 2>/dev/null; then
+            if grep -aqE "gnoboot: fail @ EBS|BootManagerMenuApp|Please select boot device" "$SLOG" 2>/dev/null; then dvoid=1; break; fi
+        fi
+    done
+    grep -aq "AGNOS kernel v" "$SLOG" 2>/dev/null || dvoid=1
+    if [ "$dvoid" = "1" ]; then
+        kill $QPID 2>/dev/null; wait $QPID 2>/dev/null; trap - EXIT
+        cp "$SLOG" "$LOGS/serial.void$dtry.log"
+        if [ "$dtry" -lt "$DOOM_TRIES" ]; then
+            echo "  (firmware never handed off — kernel did not start; retrying $dtry/$((DOOM_TRIES - 1)))"
+            dtry=$((dtry + 1)); continue
+        fi
+        echo "  UEFI never handed off to the kernel in $DOOM_TRIES attempts — INFRASTRUCTURE, not the kernel."
+        echo "doom-smoke: VOID"; exit 2
+    fi
+    break
 done
 sleep "${DOOM_RENDER_WAIT:-10}"
 

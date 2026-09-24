@@ -26,6 +26,10 @@ fn klog_uptime_us() { return 0; }
 # a later arc.
 fn kbd_irq_enable()  { return 0; }
 fn kbd_irq_disable() { return 0; }
+# 1.57.6 (Path 2, S3.3): shell.cyr and init.cyr (shared) bracket their exec_and_wait launches with the x86
+# IRQ save/restore pair (keyboard.cyr). No-ops here, like the pair above.
+fn kbd_irq_save() { return 0; }
+fn kbd_irq_restore(f) { return 0; }
 
 # Context switch stubs (x86-specific register save/restore)
 fn proc_save_context(pid, isr_rsp) { return 0; }

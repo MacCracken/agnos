@@ -1,5 +1,6 @@
 # 2026-09-23 — TCP connection ids have no owner: any process can read, write or close any connection
 
+**Status:** 🟡 **OPEN** — fixed by step **S5** (owner tag pid+1 and epoch stamped inside `tcp_slot_claim`; `tcp_auth` on #48/#49/#50/#57; release at death; the same stamp for UDP ids #51/#53/#54). Builds on S4. Not in 1.57.6. The Path 2 foundation this step builds on — per-process syscall kernel stacks, the deferred `on_cpu` release, preempt-disabling spinlocks, region-7 guard pages (bites S3.1–S3.3) — landed in **1.57.6**; see `docs/development/planning/blocking-syscall-concurrency.md` § Path 2 plan and the roadmap's 1.57.x table.
 **Filed by:** daimon (the AGNOS agent orchestrator). It serves an HTTP API and starts agent processes
 beside it on the same box.
 **Checked against:** agnos **1.57.5**: the `#48`, `#49` and `#50` arms in `kernel/core/syscall.cyr`,

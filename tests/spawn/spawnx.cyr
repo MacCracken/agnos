@@ -1,0 +1,944 @@
+# spawnx — the RING-3 half of the agnos 1.57.6 spawn repairs.
+#
+# Issues (closed 1.57.6): docs/development/issues/archived/2026-09-23-spawn-path-failure-gives-no-reason.md,
+#         2026-09-23-spawn-path-args-cannot-contain-spaces.md,
+#         2026-09-23-child-inherits-every-fd-and-spawn-arms-leak.md.
+#
+# ⛔ WHY RING 3, AND WHY AS /bin/agnsh ON A PLAIN KERNEL. Every property here needs children that RUN
+# CONCURRENTLY with their parent: a redirect that must NOT be consumed by another process's spawn, a
+# sleeper that must see EOF, a scribbler still writing into a pipe its parent has closed. A foreground
+# `run` (sh_exec) is IF=0 run-to-completion, so a #43 child never runs while its parent lives. kybernet
+# launches /bin/agnsh IF=1 time-sliced, so this program's #43 children are ordinary scheduled procs —
+# exactly the context daimon and agnsh spawn from. scripts/smoke/spawn-smoke.sh seeds this binary as
+# /bin/agnsh (the parent) AND /bin/spawnx (every child role), plus /bin/notelf and /bin/tiny.
+#
+# ⚠ Every check prints a named marker (PASS) or a named line with the observed values (FAIL). The
+# program ALWAYS exits 0 after `SPAWNX-DONE` — a non-zero exit drops kybernet into the emergency shell,
+# which would bury the verdict; the smoke scores the markers.
+#
+# Raw `syscall(N, a1, a2, a3, a4)` throughout, with explicit zeros: #43's flags/codes, #62's ops and the
+# CH_ENDOW(-1) disarm are 1.57.6 surface the cyrius peer does not wrap yet.
+
+var SPX_PASS = 0;
+var SPX_FAIL = 0;
+
+# Module-scope `var X[N]` is N u64 = 8N BYTES.
+var spx_buf[512];       # 4096 B: pipe drains
+var spx_big[256];       # 2048 B: long lines / argv blobs
+var spx_line[64];       # 512 B: short lines
+var spx_env[32];        # 256 B: env blobs
+var spx_pids[32];       # sleeper pids
+
+var SPX_TOK17 = "/bin/spawnx hello a b c d e f g h i j k l m n o";      # 17 space tokens
+var SPX_TOK16 = "/bin/spawnx argc16 b c d e f g h i j k l m n o";      # 16 space tokens
+
+fn spx_out(s) { syscall(1, 1, s, strlen(s), 0); return 0; }
+fn spx_num(n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { spx_out("-"); n = 0 - n; }
+    if (n == 0) { spx_out("0"); return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; syscall(1, 1, &b + i, 1, 0); }
+    return 0;
+}
+fn spx_pass(m) { spx_out(m); spx_out("\n"); SPX_PASS = SPX_PASS + 1; return 0; }
+fn spx_fail(m) { spx_out(m); spx_out("\n"); SPX_FAIL = SPX_FAIL + 1; return 0; }
+fn spx_failn(m, n) { spx_out(m); spx_num(n); spx_out("\n"); SPX_FAIL = SPX_FAIL + 1; return 0; }
+fn spx_info(m, n) { spx_out(m); spx_num(n); spx_out("\n"); return 0; }
+
+fn spx_eq(a, b) {
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
+    var i = 0;
+    while (1) {
+        var ca = load8(a + i);
+        if (ca != load8(b + i)) { return 0; }
+        if (ca == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn spx_atoi(s) {
+    var v = 0;
+    var i = 0;
+    if (s == 0) { return 0 - 1; }
+    while (load8(s + i) >= 48) {
+        if (load8(s + i) > 57) { return v; }
+        v = v * 10 + (load8(s + i) - 48);
+        i = i + 1;
+    }
+    return v;
+}
+# Copy s (no NUL) to dst + off; return the new offset.
+fn spx_cat(dst, off, s) {
+    var l = strlen(s);
+    var i = 0;
+    while (i < l) { store8(dst + off + i, load8(s + i)); i = i + 1; }
+    return off + l;
+}
+# Copy s AND its NUL (an argv-blob / env entry); return the new offset.
+fn spx_bput(dst, off, s) {
+    var o = spx_cat(dst, off, s);
+    store8(dst + o, 0);
+    return o + 1;
+}
+fn spx_catnum(dst, off, n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { store8(dst + off, 45); off = off + 1; n = 0 - n; }
+    if (n == 0) { store8(dst + off, 48); return off + 1; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; store8(dst + off, load8(&b + i)); off = off + 1; }
+    return off;
+}
+
+fn spx_ms() { return syscall(40, 0, 0, 0, 0); }                  # uptime_ms#40
+fn spx_yield() { syscall(44, 0, 0, 0, 0); return 0; }            # sched_yield#44
+fn spx_close(fd) { return syscall(6, fd, 0, 0, 0); }
+fn spx_pipe(fds) { return syscall(25, fds, 0, 0, 0); }           # fds: [0] read end, [8] write end
+fn spx_43(s) { return syscall(43, s, strlen(s), 0, 0); }         # the legacy line form
+fn spx_62(a1, a2) { return syscall(62, a1, a2, 0, 0); }
+fn spx_mint(out) { return syscall(97, 1, out, 0, 0); }           # CH_MINT: writes two fds
+fn spx_endow(fd) { return syscall(97, 5, fd, 0, 0); }            # CH_ENDOW (a4 = 0: not PTY mode)
+fn spx_chclose(fd) { return syscall(97, 4, fd, 0, 0); }          # CH_CLOSE
+fn spx_chsend(fd, b, n) { return syscall(97, 2, fd, b, n); }     # CH_SEND (len in a4)
+fn spx_chrecv(fd, b, n) { return syscall(97, 3, fd, b, n); }     # CH_RECV (cap in a4)
+
+# Poll waitpid#4 for one child, donating the slice while it lives. -998 = timed out, -999 = no pid.
+fn spx_wait(pid, ms) {
+    if (pid < 0) { return 0 - 999; }
+    var t0 = spx_ms();
+    while (1) {
+        var r = syscall(4, pid, 0, 0, 0);
+        if (r != 0 - 2) { return r; }
+        if (spx_ms() - t0 > ms) { return 0 - 998; }
+        spx_yield();
+    }
+    return 0;
+}
+# Read a pipe to EOF (0). -2 means "nothing yet, a writer is open": yield and retry. -998 = still open
+# after `ms` (some writer never closed), -1 = error.
+fn spx_drain(fd, buf, cap, ms) {
+    var tot = 0;
+    var t0 = spx_ms();
+    while (tot < cap) {
+        var r = syscall(5, fd, buf + tot, cap - tot, 0);
+        if (r > 0) { tot = tot + r; }
+        else {
+            if (r == 0) { return tot; }
+            if (r != 0 - 2) { return 0 - 1; }
+            if (spx_ms() - t0 > ms) { return 0 - 998; }
+            spx_yield();
+        }
+    }
+    return tot;
+}
+# Does [buf, buf+n) equal the literal s exactly?
+fn spx_is(buf, n, s) {
+    if (n != strlen(s)) { return 0; }
+    var i = 0;
+    while (i < n) { if (load8(buf + i) != load8(s + i)) { return 0; } i = i + 1; }
+    return 1;
+}
+# Is fd `f` open in THIS process? read(f, buf, 0) or write(f, buf, 0) != -1. An owned CHANNEL fd reads
+# -1 on both (a zero-length record is -CH_E_ARG), so channels are deliberately NOT counted.
+fn spx_fd_open(f) {
+    var z[8];
+    if (syscall(5, f, &z, 0, 0) != 0 - 1) { return 1; }
+    if (syscall(1, f, &z, 0, 0) != 0 - 1) { return 1; }
+    return 0;
+}
+fn spx_count_open(skip) {
+    var n = 0;
+    var f = 3;
+    while (f < 32) {
+        if (f != skip) { if (spx_fd_open(f) == 1) { n = n + 1; } }
+        f = f + 1;
+    }
+    return n;
+}
+# envp lookup on the SysV init stack (args_agnos's r15-parked base): "KEY=VALUE" -> VALUE, or 0.
+fn spx_getenv(name) {
+    var base = _agnos_argv_base();
+    if (base == 0) { return 0; }
+    var ac = load64(base);
+    var nl = strlen(name);
+    var j = 0;
+    while (j < 64) {
+        var ep = load64(base + 8 + (ac + 1 + j) * 8);
+        if (ep == 0) { return 0; }
+        var m = 1;
+        var ci = 0;
+        while (ci < nl) {
+            if (load8(ep + ci) != load8(name + ci)) { m = 0; break; }
+            ci = ci + 1;
+        }
+        if (m == 1) { if (load8(ep + nl) == 61) { return ep + nl + 1; } }
+        j = j + 1;
+    }
+    return 0;
+}
+
+# ═════════════════════════════════════ CHILD ROLES ═════════════════════════════════════
+fn spx_child(role): i64 {
+    if (spx_eq(role, "hello") == 1) {
+        # ONE write(2) for the whole line: spawn-smoke scores `SPAWNX-HELLO-c1` as an exact LINE, and three
+        # writes could be split by another process's console output under -smp 4.
+        var hl[64];
+        var ho = spx_cat(&hl, 0, "SPAWNX-HELLO-");
+        ho = spx_cat(&hl, ho, argv(2));
+        store8(&hl + ho, 10);
+        syscall(1, 1, &hl, ho + 1, 0);
+        return 0;
+    }
+    if (spx_eq(role, "exit") == 1) { return spx_atoi(argv(2)); }
+    if (spx_eq(role, "chanprobe") == 1) {
+        # Send on the fd the parent's (supposedly CLEARED) endowment would have landed on. Refused
+        # (-CH_E_BADFD = -5) means no endowment was placed: exit 0. Accepted means a stale arm moved the
+        # parent's endpoint into THIS unrelated child: exit 1.
+        var pf = spx_atoi(argv(2));
+        var pr = spx_chsend(pf, "PROBE!!!", 8);
+        if (pr == 0 - 5) { spx_out("SPAWNX-CHANPROBE-REFUSED\n"); return 0; }
+        spx_out("SPAWNX-CHANPROBE-ACCEPTED rc="); spx_num(pr); spx_out("\n");
+        return 1;
+    }
+    if (spx_eq(role, "helper") == 1) {
+        # stdin is the parent's g pipe: wait for 'G', then spawn c1 — which must NOT consume the
+        # redirect the PARENT armed for its own next spawn in the meantime.
+        var hb[8];
+        var ht0 = spx_ms();
+        var hgot = 0;
+        while (hgot == 0) {
+            var hr = syscall(5, 0, &hb, 1, 0);
+            if (hr == 1) { hgot = 1; }
+            else {
+                if (hr != 0 - 2) { return 2; }
+                if (spx_ms() - ht0 > 20000) { return 3; }
+                spx_yield();
+            }
+        }
+        var c1 = spx_43("/bin/spawnx hello c1");
+        if (c1 < 0) { return 4; }
+        if (spx_wait(c1, 20000) != 0) { return 5; }
+        return 0;
+    }
+    if (spx_eq(role, "capture") == 1) {
+        syscall(1, 1, "SPAWNX-OUT\n", 11, 0);
+        syscall(1, 2, "SPAWNX-ERR\n", 11, 0);
+        return spx_count_open(0 - 1);
+    }
+    if (spx_eq(role, "both") == 1) {
+        syscall(1, 1, "SPAWNX-OUT\n", 11, 0);
+        syscall(1, 2, "SPAWNX-ERR\n", 11, 0);
+        return 0;
+    }
+    if (spx_eq(role, "probe") == 1) { return spx_count_open(0 - 1); }
+    if (spx_eq(role, "fdpass") == 1) {
+        if (syscall(1, 5, "SPAWNX-FD5\n", 11, 0) != 11) { return 90; }
+        return spx_count_open(5);
+    }
+    if (spx_eq(role, "argv") == 1) {
+        if (argc() != 5) { return 1; }
+        if (spx_eq(argv(2), "has space") == 0) { return 2; }
+        if (spx_eq(argv(3), "") == 0) { return 3; }
+        if (spx_eq(argv(4), "x") == 0) { return 4; }
+        return 0;
+    }
+    if (spx_eq(role, "argvlong") == 1) {
+        if (argc() != 4) { return 1; }
+        if (strlen(argv(2)) != 700) { return 2; }
+        if (strlen(argv(3)) != 177) { return 3; }
+        var li = 0;
+        while (li < 700) { if (load8(argv(2) + li) != 76) { return 4; } li = li + 1; }
+        return 0;
+    }
+    if (spx_eq(role, "lineargs") == 1) {
+        # a LINE-form child: the space split must hold (a stale SPAWN_F_ARGV cell would NUL-split it and
+        # hand this child argc 1 — it would then have no role at all; see main)
+        if (argc() != 4) { return 100 + argc(); }
+        if (spx_eq(argv(2), "x") == 0) { return 2; }
+        if (spx_eq(argv(3), "y") == 0) { return 3; }
+        return 0;
+    }
+    if (spx_eq(role, "pty") == 1) {
+        # PTY-MODE endowment: fd 0/1/2 ARE the channel. a4 = 1 makes a CONSOLE fd 0 answer -2 instead of
+        # blocking on the keyboard, so a missing PTY placement fails in bounded time instead of hanging.
+        var yb[64];
+        var yt0 = spx_ms();
+        var yn = 0;
+        while (yn == 0) {
+            var yr = syscall(5, 0, &yb, 64, 1);
+            if (yr > 0) { yn = yr; }
+            else {
+                if (yr != 0 - 2) { return 2; }
+                if (spx_ms() - yt0 > 10000) { return 3; }
+                spx_yield();
+            }
+        }
+        if (spx_is(&yb, yn, "PING") == 0) { return 4; }
+        if (syscall(1, 1, "PTY-OUT!", 8, 0) != 8) { return 5; }
+        if (syscall(1, 2, "PTY-ERR!", 8, 0) != 8) { return 6; }
+        return 0;
+    }
+    if (spx_eq(role, "argc16") == 1) {
+        if (argc() != 16) { return 100 + argc(); }
+        if (spx_eq(argv(15), "o") == 0) { return 99; }
+        return 0;
+    }
+    if (spx_eq(role, "envchk") == 1) {
+        if (spx_eq(spx_getenv("HOME"), "/") == 0) { return 1; }
+        return 0;
+    }
+    if (spx_eq(role, "envfoo") == 1) {
+        if (spx_eq(spx_getenv("FOO"), "bar") == 0) { return 1; }
+        return 0;
+    }
+    if (spx_eq(role, "scribble") == 1) {
+        var sw = spx_atoi(argv(2));
+        var si = 0;
+        while (si < 64) { syscall(1, sw, "Z", 1, 0); spx_yield(); si = si + 1; }
+        return 0;
+    }
+    if (spx_eq(role, "sleeper") == 1) {
+        var sb[8];
+        var st0 = spx_ms();
+        while (1) {
+            var sr = syscall(5, 0, &sb, 1, 0);
+            if (sr == 0) { return 0; }                   # EOF: every writer is gone
+            if (sr != 0 - 2) { if (sr < 0) { return 2; } }
+            if (spx_ms() - st0 > 60000) { return 3; }
+            spx_yield();
+        }
+        return 4;
+    }
+    if (spx_eq(role, "daimon") == 1) {
+        # daimon's real shape: ARGV + CLEANFD + an endowment announced in the env, stdout+stderr captured.
+        var dfd = spx_atoi(argv(2));
+        var dr = spx_chsend(dfd, "DAIMONOK", 8);
+        if (dr != 8) { spx_out("SPAWNX-DAIMON-CHILD-SEND-FAILED rc="); spx_num(dr); spx_out("\n"); return 1; }
+        if (spx_eq(spx_getenv("AGNOS_CHAN"), argv(2)) == 0) { spx_out("SPAWNX-DAIMON-CHILD-NO-ENV\n"); return 2; }
+        var dn = spx_count_open(0 - 1);
+        if (dn != 0) { spx_out("SPAWNX-DAIMON-CHILD-EXTRA-FDS n="); spx_num(dn); spx_out("\n"); return 3; }
+        spx_out("SPAWNX-DAIMON-CHILD-OK\n");
+        return 0;
+    }
+    spx_out("SPAWNX-UNKNOWN-ROLE\n");
+    return 64;
+}
+
+# ═════════════════════════════════════ PARENT PHASES ═════════════════════════════════════
+
+# (1) distinct codes on the LEGACY call shapes (so this binary runs unchanged against 1.57.5 as a control)
+fn spx_phase_codes() {
+    var r = spx_43("/bin/nonexistent");
+    if (r == 0 - 4) { spx_pass("SPAWNX-ENOENT-OK"); } else { spx_failn("SPAWNX-ENOENT-BAD rc=", r); }
+    r = spx_43("/bin/notelf");
+    if (r == 0 - 5) { spx_pass("SPAWNX-ENOEXEC-OK"); } else { spx_failn("SPAWNX-ENOEXEC-BAD rc=", r); }
+    r = spx_43("/bin/tiny");
+    if (r == 0 - 5) { spx_pass("SPAWNX-ENOEXEC-TINY-OK"); } else { spx_failn("SPAWNX-ENOEXEC-TINY-BAD rc=", r); }
+    r = syscall(43, &spx_big, 200, 0, 0);
+    if (r == 0 - 6) { spx_pass("SPAWNX-EARGS-LINE-OK"); } else { spx_failn("SPAWNX-EARGS-LINE-BAD rc=", r); }
+    r = spx_43(SPX_TOK17);
+    if (r == 0 - 6) { spx_pass("SPAWNX-EARGS-17TOK-OK"); } else { spx_failn("SPAWNX-EARGS-17TOK-BAD rc=", r); }
+    r = syscall(37, SPX_TOK17, strlen(SPX_TOK17), 0, 0);
+    if (r == 0 - 1) { spx_pass("SPAWNX-37-17TOK-OK"); } else { spx_failn("SPAWNX-37-17TOK-BAD rc=", r); }
+    var p16 = spx_43(SPX_TOK16);
+    var c16 = spx_wait(p16, 20000);
+    if (c16 == 0) { spx_pass("SPAWNX-16TOK-OK"); } else { spx_failn("SPAWNX-16TOK-BAD code=", c16); }
+    return 0;
+}
+
+# (2) EVERY failure kind clears BOTH arms. Arm a redirect (1 <- w) AND an endowment (b -> fd f), fail a
+# spawn, then spawn `chanprobe f` legacy-style: its stdout must reach the CONSOLE (the pipe drains 0
+# bytes), its CH_SEND on f must be refused (no endowment was placed), and the parent must still own b.
+# ⚠ spawn#3 kinds (>= 9) consume the ENDOWMENT only — the ABI promises they never touch #62 redirects — so
+# for them the redirect must SURVIVE into the chanprobe spawn: its stdout is the captured text instead.
+fn spx_arms_case(kind, name) {
+    var pf[16];
+    var cf[16];
+    if (spx_pipe(&pf) != 0) { spx_fail("SPAWNX-VOID pipe"); return 0; }
+    var pr = load64(&pf);
+    var pw = load64(&pf + 8);
+    if (spx_mint(&cf) != 0) { spx_fail("SPAWNX-VOID mint"); return 0; }
+    var ca = load64(&cf);
+    var cb = load64(&cf + 8);
+    var ef = spx_endow(cb);
+    var ar = spx_62(1, pw);
+    var want = 0;
+    var rc = 0;
+    if (kind == 0) { want = 0 - 6; rc = syscall(43, &spx_big, 200, 0, 0); }
+    if (kind == 1) { want = 0 - 6; rc = spx_43(SPX_TOK17); }
+    if (kind == 2) { want = 0 - 6; rc = syscall(43, "/bin/spawnx", 11 | 0x40000, 0, 0); }
+    if (kind == 3) { want = 0 - 4; rc = spx_43("/bin/nonexistent"); }
+    if (kind == 4) { want = 0 - 5; rc = spx_43("/bin/notelf"); }
+    if (kind == 5) { want = 0 - 1; rc = syscall(37, &spx_big, 200, 0, 0); }
+    if (kind == 6) { want = 0 - 1; rc = syscall(37, SPX_TOK17, strlen(SPX_TOK17), 0, 0); }
+    # #37 failures AFTER its H1 snapshot — the two clears keyed by the saved caller pid (ew37_pid)
+    if (kind == 7) { want = 0 - 1; rc = syscall(37, "/bin/nonexistent", 16, 0, 0); }   # load fails: NOENT
+    if (kind == 8) { want = 0 - 1; rc = syscall(37, "   ", 3, 0, 0); }                  # all spaces: no path
+    # spawn#3 (in-memory ELF): every failure return disarms the endowment
+    if (kind == 9) { want = 0 - 1; rc = syscall(3, 0, 0, 0, 0); }                       # size < 1
+    if (kind == 10) { want = 0 - 1; rc = syscall(3, 0x10, 64, 0, 0); }                  # not a user range
+    if (kind == 11) { want = 0 - 1; rc = syscall(3, &spx_big, 20000, 0, 0); }           # > the 16 KB staging cap
+    if (kind == 12) { want = 0 - 1; rc = syscall(3, &spx_env, 64, 0, 0); }              # no ELF magic: elf_load fails
+    var keep_redir = 0;
+    if (kind >= 9) { keep_redir = 1; }
+    var pl = spx_cat(&spx_line, 0, "/bin/spawnx chanprobe ");
+    pl = spx_catnum(&spx_line, pl, ef);
+    var pid = syscall(43, &spx_line, pl, 0, 0);
+    var code = spx_wait(pid, 20000);
+    spx_close(pw);
+    var n = spx_drain(pr, &spx_buf, 256, 5000);
+    var cc = spx_chclose(cb);
+    spx_chclose(ca);
+    spx_close(pr);
+    var ok = 1;
+    if (rc != want) { ok = 0; }
+    if (ef < 3) { ok = 0; }
+    if (ar != 0) { ok = 0; }
+    if (pid < 0) { ok = 0; }
+    if (code != 0) { ok = 0; }
+    if (keep_redir == 0) { if (n != 0) { ok = 0; } }
+    if (keep_redir == 1) { if (spx_is(&spx_buf, n, "SPAWNX-CHANPROBE-REFUSED\n") == 0) { ok = 0; } }
+    if (cc != 0) { ok = 0; }
+    if (ok == 1) { spx_out("SPAWNX-ARMS-CLEARED-"); spx_pass(name); return 1; }
+    spx_out("SPAWNX-ARMS-LEAKED-"); spx_out(name);
+    spx_out(" rc="); spx_num(rc); spx_out(" want="); spx_num(want);
+    spx_out(" endow_fd="); spx_num(ef); spx_out(" probe_exit="); spx_num(code);
+    spx_out(" captured="); spx_num(n); spx_out(" parent_close_b="); spx_num(cc);
+    spx_fail("");
+    return 0;
+}
+fn spx_phase_arms() {
+    spx_arms_case(0, "ARGS-LONG-OK");
+    spx_arms_case(1, "ARGS-17TOK-OK");
+    spx_arms_case(2, "ARGS-FLAG-OK");
+    spx_arms_case(3, "NOENT-OK");
+    spx_arms_case(4, "NOEXEC-OK");
+    spx_arms_case(5, "37-LONG-OK");
+    spx_arms_case(6, "37-17TOK-OK");
+    spx_arms_case(7, "37-NOENT-OK");
+    spx_arms_case(8, "37-EMPTY-OK");
+    spx_arms_case(9, "3-SIZE0-ENDOW-ONLY-OK");
+    spx_arms_case(10, "3-RANGE-ENDOW-ONLY-OK");
+    spx_arms_case(11, "3-TOOBIG-ENDOW-ONLY-OK");
+    spx_arms_case(12, "3-NOTELF-ENDOW-ONLY-OK");
+    return 0;
+}
+
+# (3) PER-PROCESS arms under preemption. The parent arms #62(1, o_w) for ITS next spawn while a helper
+# child H, released by 'G', spawns c1 in between. c1 must print to the console; only c2 (the parent's
+# own next child) may land in o.
+fn spx_phase_perprocess() {
+    var gf[16];
+    var of[16];
+    if (spx_pipe(&gf) != 0) { spx_fail("SPAWNX-VOID pipe g"); return 0; }
+    if (spx_pipe(&of) != 0) { spx_fail("SPAWNX-VOID pipe o"); return 0; }
+    var gr = load64(&gf);
+    var gw = load64(&gf + 8);
+    var orr = load64(&of);
+    var ow = load64(&of + 8);
+    spx_62(0, gr);                                        # H's stdin <- g read end
+    var h = spx_43("/bin/spawnx helper");
+    spx_62(1, ow);                                        # arm OUR next child: stdout -> o
+    syscall(1, gw, "G", 1, 0);                            # release H: it spawns c1 now
+    var hc = spx_wait(h, 30000);
+    var c2 = spx_43("/bin/spawnx hello c2");
+    var c2c = spx_wait(c2, 20000);
+    spx_close(gw); spx_close(gr); spx_close(ow);
+    var n = spx_drain(orr, &spx_buf, 256, 5000);
+    spx_close(orr);
+    if (hc != 0) { spx_failn("SPAWNX-PERPROC-HELPER-BAD exit=", hc); return 0; }
+    if (c2c != 0) { spx_failn("SPAWNX-PERPROC-C2-BAD exit=", c2c); return 0; }
+    if (spx_is(&spx_buf, n, "SPAWNX-HELLO-c2\n") == 1) { spx_pass("SPAWNX-ARM-PER-PROCESS-OK"); return 1; }
+    spx_out("SPAWNX-ARM-CROSSED-PROCESSES captured="); spx_num(n);
+    # ⚠ The captured text is echoed with every '-' turned into '_', so this failure line can never contain
+    # the literal `SPAWNX-HELLO-c1` that spawn-smoke looks for on the console as proof c1 was NOT captured.
+    if (n > 0) {
+        spx_out(" text=");
+        var xi = 0;
+        while (xi < n) {
+            if (load8(&spx_buf + xi) == 45) { store8(&spx_buf + xi, 95); }
+            if (load8(&spx_buf + xi) == 10) { store8(&spx_buf + xi, 32); }
+            xi = xi + 1;
+        }
+        syscall(1, 1, &spx_buf, n, 0);
+    }
+    spx_fail("");
+    return 0;
+}
+
+# (3b) a PTY-MODE endowment (CH_ENDOW a4 = CH_ENDOW_STDIO = 1000) + CLEANFD: the child's fd 0/1/2 ARE the
+# channel. Its stdin is a record queued before the spawn; its fd 1 and fd 2 writes arrive as records on our
+# end. The PTY flag lives in the per-process arm with the endowment (1.57.6), so this is its positive test.
+fn spx_phase_pty() {
+    var cf[16];
+    var rb[16];
+    if (spx_mint(&cf) != 0) { spx_fail("SPAWNX-VOID mint"); return 0; }
+    var ca = load64(&cf);
+    var cb = load64(&cf + 8);
+    var sr = spx_chsend(ca, "PING", 4);                   # lands in cb's inbox: the child's stdin
+    var ef = syscall(97, 5, cb, 0, 1000);                 # CH_ENDOW, PTY mode
+    var p = syscall(43, "/bin/spawnx pty", 15 | 0x20000, 0, 0);
+    var got = 0;
+    var ok1 = 0;
+    var ok2 = 0;
+    var t0 = spx_ms();
+    var done = 0;
+    while (done == 0) {
+        var r = spx_chrecv(ca, &rb, 16);
+        if (r > 0) {
+            got = got + 1;
+            if (got == 1) { ok1 = spx_is(&rb, r, "PTY-OUT!"); }
+            if (got == 2) { ok2 = spx_is(&rb, r, "PTY-ERR!"); done = 1; }
+        } else {
+            if (r != 0 - 8) { done = 1; }                 # peer gone with nothing queued, or an error
+            if (spx_ms() - t0 > 20000) { done = 1; }
+            if (done == 0) { spx_yield(); }
+        }
+    }
+    var c = spx_wait(p, 20000);
+    spx_chclose(ca);
+    spx_close(cb);                                        # the endpoint moved to the child; drop our stale fd
+    var ok = 1;
+    if (sr != 4) { ok = 0; }
+    if (ef < 3) { ok = 0; }
+    if (p < 0) { ok = 0; }
+    if (c != 0) { ok = 0; }
+    if (ok1 != 1) { ok = 0; }
+    if (ok2 != 1) { ok = 0; }
+    if (ok == 1) { spx_pass("SPAWNX-PTY-ENDOW-OK"); return 1; }
+    spx_out("SPAWNX-PTY-ENDOW-BAD send="); spx_num(sr); spx_out(" endow_fd="); spx_num(ef);
+    spx_out(" pid="); spx_num(p); spx_out(" exit="); spx_num(c); spx_out(" records="); spx_num(got);
+    spx_out(" out_ok="); spx_num(ok1); spx_failn(" err_ok=", ok2);
+    return 0;
+}
+
+# (4) SPAWN_F_ARGV: spaces, empty entries, long arguments; refusals; env strictness.
+fn spx_phase_argv() {
+    var b = &spx_big;
+    var o = spx_bput(b, 0, "/bin/spawnx");
+    o = spx_bput(b, o, "argv");
+    o = spx_bput(b, o, "has space");
+    o = spx_bput(b, o, "");
+    o = spx_bput(b, o, "x");
+    var p = syscall(43, b, o | 0x10000, 0, 0);
+    var c = spx_wait(p, 20000);
+    if (c == 0) { spx_pass("SPAWNX-ARGV-OK"); } else { spx_failn("SPAWNX-ARGV-BAD code=", c); }
+
+    o = spx_bput(b, 0, "/bin/spawnx");
+    o = spx_bput(b, o, "argvlong");
+    var li = 0;
+    while (li < 700) { store8(b + o + li, 76); li = li + 1; }
+    store8(b + o + 700, 0);
+    o = o + 701;
+    li = 0;
+    while (li < 177) { store8(b + o + li, 80); li = li + 1; }
+    store8(b + o + 177, 0);
+    o = o + 178;
+    if (o != 900) { spx_failn("SPAWNX-VOID long blob len=", o); }
+    p = syscall(43, b, o | 0x10000, 0, 0);
+    c = spx_wait(p, 20000);
+    if (c == 0) { spx_pass("SPAWNX-ARGV-LONG-OK"); } else { spx_failn("SPAWNX-ARGV-LONG-BAD code=", c); }
+
+    o = spx_bput(b, 0, "/bin/spawnx");
+    var e = 0;
+    while (e < 16) { o = spx_bput(b, o, "x"); e = e + 1; }
+    p = syscall(43, b, o | 0x10000, 0, 0);
+    if (p == 0 - 6) { spx_pass("SPAWNX-ARGV-REFUSE-17-OK"); } else { spx_failn("SPAWNX-ARGV-REFUSE-17-BAD rc=", p); }
+
+    o = spx_bput(b, 0, "/bin/spawnx");
+    o = spx_cat(b, o, "argv");                            # no trailing NUL
+    p = syscall(43, b, o | 0x10000, 0, 0);
+    if (p == 0 - 6) { spx_pass("SPAWNX-ARGV-REFUSE-NONUL-OK"); } else { spx_failn("SPAWNX-ARGV-REFUSE-NONUL-BAD rc=", p); }
+
+    o = spx_bput(b, 0, "");
+    o = spx_bput(b, o, "x");
+    p = syscall(43, b, o | 0x10000, 0, 0);
+    if (p == 0 - 6) { spx_pass("SPAWNX-ARGV-REFUSE-EMPTY0-OK"); } else { spx_failn("SPAWNX-ARGV-REFUSE-EMPTY0-BAD rc=", p); }
+
+    p = syscall(43, "/bin/spawnx", 11 | 0x40000, 0, 0);
+    if (p == 0 - 6) { spx_pass("SPAWNX-FLAG-REFUSE-OK"); } else { spx_failn("SPAWNX-FLAG-REFUSE-BAD rc=", p); }
+
+    var env = &spx_env;
+    var eo = spx_bput(env, 0, "NOEQUALS");                # an entry with no '=': invalid
+    o = spx_bput(b, 0, "/bin/spawnx");
+    o = spx_bput(b, o, "envfoo");
+    p = syscall(43, b, o | 0x10000, env, eo);
+    if (p == 0 - 6) { spx_pass("SPAWNX-ENV-STRICT-OK"); } else { spx_failn("SPAWNX-ENV-STRICT-BAD rc=", p); if (p >= 0) { spx_wait(p, 20000); } }
+    # ...and that refusal must NOT have set the per-CPU loader cells: it is the one refusal that comes after
+    # the argv / env are known, and exec_argv_nul (consumed only at the next elf_load_from_file on this CPU)
+    # set before it would NUL-split the next load that does NOT set the cell itself — an execwait#37 (a #43
+    # re-sets it on its own way in, which is why a #43 here proved nothing: measured, the reorder mutation
+    # stayed green against it). So the very next call is a #37 LINE form whose child checks argc/argv.
+    # (Deterministic at -smp 1; under -smp 4 the parent may migrate between the two calls.)
+    c = syscall(37, "/bin/spawnx lineargs x y", 24, 0, 0);
+    if (c == 0) { spx_pass("SPAWNX-LOADER-CELLS-CLEAN-OK"); } else { spx_failn("SPAWNX-LOADER-CELLS-STALE-BAD code=", c); }
+
+    eo = spx_bput(env, 0, "FOO=bar");
+    p = syscall(43, b, o | 0x10000, env, eo);
+    c = spx_wait(p, 20000);
+    if (c == 0) { spx_pass("SPAWNX-ENV-ARGV-OK"); } else { spx_failn("SPAWNX-ENV-ARGV-BAD code=", c); }
+
+    # the LEGACY line form keeps its fallback-only env contract: a bad blob means the default env
+    eo = spx_bput(env, 0, "NOEQUALS");
+    p = syscall(43, "/bin/spawnx envchk", 18, env, eo);
+    c = spx_wait(p, 20000);
+    if (c == 0) { spx_pass("SPAWNX-ENV-LEGACY-FALLBACK-OK"); } else { spx_failn("SPAWNX-ENV-LEGACY-FALLBACK-BAD code=", c); }
+    return 0;
+}
+
+# (5) SPAWN_F_CLEANFD capture: stdout AND stderr into two pipes, nothing else inherited; the legacy
+# control; an explicitly passed fd; `2>&1`; and daimon's full shape (ARGV + CLEANFD + endowment + env).
+fn spx_phase_capture() {
+    var of[16];
+    var ef[16];
+    var df[16];
+    if (spx_pipe(&of) != 0) { spx_fail("SPAWNX-VOID pipe o"); return 0; }
+    if (spx_pipe(&ef) != 0) { spx_fail("SPAWNX-VOID pipe e"); return 0; }
+    if (spx_pipe(&df) != 0) { spx_fail("SPAWNX-VOID pipe d"); return 0; }
+    var orr = load64(&of);
+    var ow = load64(&of + 8);
+    var er = load64(&ef);
+    var ew = load64(&ef + 8);
+    var dr = load64(&df);
+    var dw = load64(&df + 8);
+    var xf = syscall(7, "/bin/spawnx", 11, 0, 0);          # an O_RDONLY ext2 fd the child must NOT get
+    var b = &spx_big;
+    spx_62(1, ow);
+    spx_62(0x100 | 2, ew);
+    var o = spx_bput(b, 0, "/bin/spawnx");
+    o = spx_bput(b, o, "capture");
+    var p = syscall(43, b, o | 0x30000, 0, 0);
+    var c = spx_wait(p, 20000);
+    spx_close(ow); spx_close(ew);
+    var no = spx_drain(orr, &spx_buf, 256, 5000);
+    if (spx_is(&spx_buf, no, "SPAWNX-OUT\n") == 1) { spx_pass("SPAWNX-CAPTURE-STDOUT-OK"); } else { spx_failn("SPAWNX-CAPTURE-STDOUT-BAD n=", no); }
+    var ne = spx_drain(er, &spx_buf, 256, 5000);
+    if (spx_is(&spx_buf, ne, "SPAWNX-ERR\n") == 1) { spx_pass("SPAWNX-CAPTURE-STDERR-OK"); } else { spx_failn("SPAWNX-CAPTURE-STDERR-BAD n=", ne); }
+    if (c == 0) { spx_pass("SPAWNX-CLEAN-OK"); } else { spx_failn("SPAWNX-CLEAN-BAD open_fds=", c); }
+    spx_close(orr); spx_close(er);
+
+    # control: the legacy form still inherits everything (d's two ends + the ext2 fd at least)
+    p = spx_43("/bin/spawnx probe");
+    c = spx_wait(p, 20000);
+    if (c >= 3) { spx_info("SPAWNX-LEGACY-INHERITS n=", c); SPX_PASS = SPX_PASS + 1; } else { spx_failn("SPAWNX-LEGACY-INHERITS-BAD n=", c); }
+
+    # explicit fd pass: "give the child my fd dw as ITS fd 5", CLEANFD
+    spx_62(0x100 | 5, dw);
+    o = spx_bput(b, 0, "/bin/spawnx");
+    o = spx_bput(b, o, "fdpass");
+    p = syscall(43, b, o | 0x30000, 0, 0);
+    c = spx_wait(p, 20000);
+    spx_close(dw);
+    var nd = spx_drain(dr, &spx_buf, 256, 5000);
+    if (c == 0) {
+        if (spx_is(&spx_buf, nd, "SPAWNX-FD5\n") == 1) { spx_pass("SPAWNX-FDPASS-OK"); }
+        else { spx_failn("SPAWNX-FDPASS-BAD captured=", nd); }
+    } else { spx_failn("SPAWNX-FDPASS-BAD exit=", c); }
+    spx_close(dr);
+    spx_close(xf);
+
+    # 2>&1: (1 <- w) then ADD (2 <- 1): fd 2 receives what fd 1 has just become
+    var tf[16];
+    if (spx_pipe(&tf) != 0) { spx_fail("SPAWNX-VOID pipe t"); return 0; }
+    var tr = load64(&tf);
+    var tw = load64(&tf + 8);
+    spx_62(1, tw);
+    spx_62(0x100 | 2, 1);
+    o = spx_bput(b, 0, "/bin/spawnx");
+    o = spx_bput(b, o, "both");
+    p = syscall(43, b, o | 0x30000, 0, 0);
+    c = spx_wait(p, 20000);
+    spx_close(tw);
+    var nt = spx_drain(tr, &spx_buf, 256, 5000);
+    spx_close(tr);
+    if (spx_is(&spx_buf, nt, "SPAWNX-OUT\nSPAWNX-ERR\n") == 1) { spx_pass("SPAWNX-DUP21-OK"); } else { spx_failn("SPAWNX-DUP21-BAD n=", nt); }
+
+    # daimon's shape: ARGV + CLEANFD + a channel endowment announced as AGNOS_CHAN, stdout+stderr captured
+    var cf[16];
+    var yf[16];
+    if (spx_mint(&cf) != 0) { spx_fail("SPAWNX-VOID mint"); return 0; }
+    if (spx_pipe(&yf) != 0) { spx_fail("SPAWNX-VOID pipe y"); return 0; }
+    var ca = load64(&cf);
+    var cb = load64(&cf + 8);
+    var yr = load64(&yf);
+    var yw = load64(&yf + 8);
+    var ed = spx_endow(cb);
+    spx_62(1, yw);
+    spx_62(0x100 | 2, yw);
+    var env = &spx_env;
+    var eo = spx_cat(env, 0, "AGNOS_CHAN=");
+    eo = spx_catnum(env, eo, ed);
+    store8(env + eo, 0);
+    eo = eo + 1;
+    o = spx_bput(b, 0, "/bin/spawnx");
+    o = spx_bput(b, o, "daimon");
+    o = spx_catnum(b, o, ed);
+    store8(b + o, 0);
+    o = o + 1;
+    p = syscall(43, b, o | 0x30000, env, eo);
+    var rb[16];
+    var rgot = 0;
+    var rt0 = spx_ms();
+    while (rgot == 0) {
+        var rr = spx_chrecv(ca, &rb, 16);
+        if (rr > 0) { rgot = rr; }
+        else {
+            if (rr != 0 - 8) { rgot = 0 - 100 + rr; }
+            if (spx_ms() - rt0 > 20000) { rgot = 0 - 998; }
+            if (rgot == 0) { spx_yield(); }
+        }
+    }
+    c = spx_wait(p, 20000);
+    spx_close(yw);
+    var ny = spx_drain(yr, &spx_buf, 256, 5000);
+    spx_close(yr);
+    spx_chclose(ca);
+    spx_close(cb);                                        # the endpoint moved to the child; drop our stale fd
+    var dok = 1;
+    if (ed < 3) { dok = 0; }
+    if (rgot != 8) { dok = 0; }
+    if (rgot == 8) { if (spx_is(&rb, 8, "DAIMONOK") == 0) { dok = 0; } }
+    if (c != 0) { dok = 0; }
+    if (spx_is(&spx_buf, ny, "SPAWNX-DAIMON-CHILD-OK\n") == 0) { dok = 0; }
+    if (dok == 1) { spx_pass("SPAWNX-DAIMON-SHAPE-OK"); }
+    else {
+        spx_out("SPAWNX-DAIMON-SHAPE-BAD endow_fd="); spx_num(ed); spx_out(" recv="); spx_num(rgot);
+        spx_out(" exit="); spx_num(c); spx_failn(" captured=", ny);
+    }
+    return 0;
+}
+
+# (6) explicit disarms: CH_ENDOW(-1) and #62 REDIR_CLEAR (0x200).
+fn spx_phase_disarm() {
+    var cf[16];
+    if (spx_mint(&cf) != 0) { spx_fail("SPAWNX-VOID mint"); return 0; }
+    var ca = load64(&cf);
+    var cb = load64(&cf + 8);
+    var f = spx_endow(cb);
+    var dr = syscall(97, 5, 0 - 1, 0, 0);
+    var pl = spx_cat(&spx_line, 0, "/bin/spawnx chanprobe ");
+    pl = spx_catnum(&spx_line, pl, f);
+    var p = syscall(43, &spx_line, pl, 0, 0);
+    var c = spx_wait(p, 20000);
+    var cc = spx_chclose(cb);
+    spx_chclose(ca);
+    if (dr == 0) {
+        if (c == 0) {
+            if (cc == 0) { spx_pass("SPAWNX-ENDOW-DISARM-OK"); }
+            else { spx_failn("SPAWNX-ENDOW-DISARM-BAD parent_close_b=", cc); }
+        } else { spx_failn("SPAWNX-ENDOW-DISARM-BAD probe_exit=", c); }
+    } else { spx_failn("SPAWNX-ENDOW-DISARM-BAD rc=", dr); }
+
+    var pf[16];
+    if (spx_pipe(&pf) != 0) { spx_fail("SPAWNX-VOID pipe"); return 0; }
+    var pr = load64(&pf);
+    var pw = load64(&pf + 8);
+    spx_62(1, pw);
+    var cr = spx_62(0x200, 0);
+    p = spx_43("/bin/spawnx hello redirclear");
+    c = spx_wait(p, 20000);
+    spx_close(pw);
+    var n = spx_drain(pr, &spx_buf, 256, 5000);
+    spx_close(pr);
+    if (cr == 0) {
+        if (n == 0) { spx_pass("SPAWNX-REDIR-CLEAR-OK"); }
+        else { spx_failn("SPAWNX-REDIR-CLEAR-BAD captured=", n); }
+    } else { spx_failn("SPAWNX-REDIR-CLEAR-BAD rc=", cr); }
+    return 0;
+}
+
+# (7) execwait#37 with TWO redirects (stdout and stderr to separate pipes), restored after the child.
+fn spx_phase_37multi() {
+    var of[16];
+    var ef[16];
+    if (spx_pipe(&of) != 0) { spx_fail("SPAWNX-VOID pipe"); return 0; }
+    if (spx_pipe(&ef) != 0) { spx_fail("SPAWNX-VOID pipe"); return 0; }
+    var orr = load64(&of);
+    var ow = load64(&of + 8);
+    var er = load64(&ef);
+    var ew = load64(&ef + 8);
+    spx_62(1, ow);
+    spx_62(0x100 | 2, ew);
+    var c = syscall(37, "/bin/spawnx both", 16, 0, 0);
+    spx_out("SPAWNX-37-PARENT-STDOUT-OK\n");                  # the parent's own fd 1 is untouched
+    spx_close(ow); spx_close(ew);
+    var no = spx_drain(orr, &spx_buf, 256, 5000);
+    var okout = spx_is(&spx_buf, no, "SPAWNX-OUT\n");
+    var ne = spx_drain(er, &spx_buf, 256, 5000);
+    var okerr = spx_is(&spx_buf, ne, "SPAWNX-ERR\n");
+    spx_close(orr); spx_close(er);
+    if (c == 0) {
+        if (okout == 1) {
+            if (okerr == 1) { spx_pass("SPAWNX-37-MULTI-OK"); }
+            else { spx_failn("SPAWNX-37-MULTI-BAD stderr n=", ne); }
+        } else { spx_failn("SPAWNX-37-MULTI-BAD stdout n=", no); }
+    } else { spx_failn("SPAWNX-37-MULTI-BAD exit=", c); }
+    return 0;
+}
+
+# (8) PIPE LIFETIME: a child still writing into a pipe its parent has closed must NOT write into the
+# next pipe the parent creates (1.57.5 freed the buffer on the parent's close, and kmalloc handed the
+# same block straight back).
+fn spx_phase_crosstalk() {
+    var pf[16];
+    var qf[16];
+    if (spx_pipe(&pf) != 0) { spx_fail("SPAWNX-VOID pipe"); return 0; }
+    var pr = load64(&pf);
+    var pw = load64(&pf + 8);
+    var pl = spx_cat(&spx_line, 0, "/bin/spawnx scribble ");
+    pl = spx_catnum(&spx_line, pl, pw);
+    var p = syscall(43, &spx_line, pl, 0, 0);
+    spx_close(pr);
+    spx_close(pw);
+    if (p < 0) { spx_failn("SPAWNX-PIPE-SCRIBBLER-SPAWN-BAD rc=", p); return 0; }
+    if (spx_pipe(&qf) != 0) { spx_fail("SPAWNX-VOID pipe 2"); return 0; }
+    var qr = load64(&qf);
+    var qw = load64(&qf + 8);
+    var zs = 0;
+    var last = 0;
+    var t0 = spx_ms();
+    var done = 0;
+    while (done == 0) {
+        spx_yield();
+        last = syscall(5, qr, &spx_buf, 64, 0);
+        if (last > 0) { zs = zs + last; }
+        if (syscall(4, p, 0, 0, 0) != 0 - 2) { done = 1; }        # the scribbler exited (and is reaped)
+        if (spx_ms() - t0 > 20000) { done = 2; }
+    }
+    last = syscall(5, qr, &spx_buf, 64, 0);
+    if (last > 0) { zs = zs + last; }
+    spx_close(qr);
+    spx_close(qw);
+    if (done != 1) { spx_fail("SPAWNX-PIPE-SCRIBBLER-TIMEOUT"); return 0; }
+    if (zs == 0) {
+        if (last == 0 - 2) { spx_pass("SPAWNX-PIPE-NO-CROSSTALK"); return 1; }
+        spx_failn("SPAWNX-PIPE-CROSSTALK-BAD final_read=", last);
+        return 0;
+    }
+    spx_failn("SPAWNX-PIPE-CROSSTALK bytes=", zs);
+    return 0;
+}
+
+# (9) the full table: CLEANFD sleepers (stdin = s_r) until #43 fails. Must be exactly -2. Then the
+# NOPROC failure kind must clear both arms too, and closing s_w must end every sleeper (CLEANFD dropped
+# their copies of it).
+fn spx_phase_full() {
+    var sf[16];
+    if (spx_pipe(&sf) != 0) { spx_fail("SPAWNX-VOID pipe s"); return 0; }
+    var sr = load64(&sf);
+    var sw = load64(&sf + 8);
+    var b = &spx_big;
+    var o = spx_bput(b, 0, "/bin/spawnx");
+    o = spx_bput(b, o, "sleeper");
+    var k = 0;
+    var last = 0;
+    while (k < 20) {
+        spx_62(0, sr);
+        last = syscall(43, b, o | 0x30000, 0, 0);
+        if (last < 0) { k = k + 100; }
+        else { store64(&spx_pids + k * 8, last); k = k + 1; }
+    }
+    if (k >= 100) { k = k - 100; }
+    if (last == 0 - 2) { spx_info("SPAWNX-ENOPROC-OK n=", k); SPX_PASS = SPX_PASS + 1; }
+    else { spx_out("SPAWNX-ENOPROC-BAD rc="); spx_num(last); spx_failn(" n=", k); }
+    # the NOPROC failure kind, with the table still full
+    spx_arms_case_full(sw, k);
+    spx_close(sr);
+    return 0;
+}
+# NOPROC arm-clear: armed while the table is full, the spawn fails with -2; after the sleepers are
+# released and reaped, `chanprobe` must find neither arm.
+fn spx_arms_case_full(sw, k) {
+    var pf[16];
+    var cf[16];
+    if (spx_pipe(&pf) != 0) { spx_fail("SPAWNX-VOID pipe"); return 0; }
+    var pr = load64(&pf);
+    var pw = load64(&pf + 8);
+    if (spx_mint(&cf) != 0) { spx_fail("SPAWNX-VOID mint"); return 0; }
+    var ca = load64(&cf);
+    var cb = load64(&cf + 8);
+    var ef = spx_endow(cb);
+    spx_62(1, pw);
+    var rc = spx_43("/bin/spawnx hello full");
+    # release every sleeper: the only write end of s is ours
+    spx_close(sw);
+    var got = 0;
+    var bad = 0;
+    var t0 = spx_ms();
+    while (got < k) {
+        var wr = syscall(4, 0 - 1, 0, 0, 0);
+        if (wr >= 0) { got = got + 1; if (wr != 0) { bad = bad + 1; } }
+        else {
+            if (wr == 0 - 1) { k = got; }
+            if (spx_ms() - t0 > 30000) { k = got; bad = bad + 1000; }
+            spx_yield();
+        }
+    }
+    if (got == 0) { bad = bad + 2000; }                  # no sleeper ever ran: nothing was proven
+    if (bad == 0) { spx_info("SPAWNX-SLEEPERS-REAPED n=", got); SPX_PASS = SPX_PASS + 1; }
+    else {
+        if (bad >= 2000) { spx_fail("SPAWNX-SLEEPERS-NONE-BAD (the table-full phase spawned no sleeper)"); }
+        else {
+            if (bad >= 1000) { spx_failn("SPAWNX-SLEEPERS-TIMEOUT reaped=", got); }
+            else { spx_failn("SPAWNX-SLEEPERS-BAD-EXIT count=", bad); }
+        }
+    }
+    var pl = spx_cat(&spx_line, 0, "/bin/spawnx chanprobe ");
+    pl = spx_catnum(&spx_line, pl, ef);
+    var pid = syscall(43, &spx_line, pl, 0, 0);
+    var code = spx_wait(pid, 20000);
+    spx_close(pw);
+    var n = spx_drain(pr, &spx_buf, 256, 5000);
+    var cc = spx_chclose(cb);
+    spx_chclose(ca);
+    spx_close(pr);
+    if (rc == 0 - 2) {
+        if (code == 0) {
+            if (n == 0) {
+                if (cc == 0) { spx_pass("SPAWNX-ARMS-CLEARED-NOPROC-OK"); return 1; }
+            }
+        }
+    }
+    spx_out("SPAWNX-ARMS-LEAKED-NOPROC rc="); spx_num(rc); spx_out(" probe_exit="); spx_num(code);
+    spx_out(" captured="); spx_num(n); spx_failn(" parent_close_b=", cc);
+    return 0;
+}
+
+fn spx_parent(): i64 {
+    spx_out("SPAWNX-BEGIN pid="); spx_num(syscall(2, 0, 0, 0, 0)); spx_out("\n");
+    var i = 0;
+    while (i < 200) { store8(&spx_big + i, 97); i = i + 1; }   # 200 x 'a' (the > 127 B line)
+    spx_phase_codes();
+    i = 0;
+    while (i < 200) { store8(&spx_big + i, 97); i = i + 1; }
+    spx_phase_arms();
+    spx_phase_perprocess();
+    spx_phase_pty();
+    spx_phase_argv();
+    spx_phase_capture();
+    spx_phase_disarm();
+    spx_phase_37multi();
+    spx_phase_crosstalk();
+    spx_phase_full();
+    spx_out("SPAWNX-DONE pass="); spx_num(SPX_PASS); spx_out(" fail="); spx_num(SPX_FAIL); spx_out("\n");
+    return 0;
+}
+
+fn main(): i64 {
+    if (argc() >= 2) {
+        if (spx_eq(argv(1), "parent") == 0) { return spx_child(argv(1)); }
+    }
+    # ⛔ Only /bin/agnsh (kybernet's launch) is the parent. A CHILD that arrives with no role — its argv was
+    # mangled, e.g. a line NUL-split into one entry — must NOT re-run the whole parent program.
+    if (spx_eq(argv(0), "/bin/agnsh") == 0) {
+        spx_out("SPAWNX-CHILD-NO-ROLE argc="); spx_num(argc()); spx_out("\n");
+        return 99;
+    }
+    return spx_parent();
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

@@ -1,0 +1,17 @@
+[package]
+name = "scbench"
+version = "0.1.0"
+description = "agnos ring-3 SYSCALL round-trip bench (1.57.6 S3): getpid#2, an 8-byte pipe write#1+read#5 pair, and sched_yield#44 alone and against a yielding peer, timed with uptime_us#95. Seeded as /bin/agnsh by scripts/bench-ring3.sh; the before/after numbers for the per-process kernel-stack work."
+license = "GPL-3.0-only"
+language = "cyrius"
+# The VALUE must EQUAL the root manifest's pin (scripts/check/toolchain-pin-check.sh enforces it).
+cyrius = "6.6.6"
+
+[build]
+entry = "scbench.cyr"
+output = "build/scbench"
+
+# AGNOS ONLY — build with `cyrius build --agnos scbench.cyr build/scbench`.
+[deps]
+# ⚠ The FULL closure, transitives included (the 1.57.2 / 1.57.5 lesson): string and args -> alloc; alloc -> atomic, fnptr.
+stdlib = ["syscalls", "string", "args", "alloc", "atomic", "fnptr"]

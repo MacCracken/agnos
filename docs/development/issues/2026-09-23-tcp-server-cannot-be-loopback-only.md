@@ -1,5 +1,6 @@
 # 2026-09-23 — a TCP server cannot be loopback-only: `sock_listen` takes no address, TCP to 127.0.0.1 is dropped, and accept gives no peer address
 
+**Status:** 🟡 **OPEN** — fixed by step **S5** (`sock_listen`#56 address class in arg1 bits 32-39, 127/8 admitted at the TCP dst gate, a wire martian filter, and a new `sock_peer`#106 — specced, not minted). Not in 1.57.6. The Path 2 foundation this step builds on — per-process syscall kernel stacks, the deferred `on_cpu` release, preempt-disabling spinlocks, region-7 guard pages (bites S3.1–S3.3) — landed in **1.57.6**; see `docs/development/planning/blocking-syscall-concurrency.md` § Path 2 plan and the roadmap's 1.57.x table.
 **Filed by:** daimon (the AGNOS agent orchestrator). Its HTTP API is unauthenticated until daimon's
 2.5.x, so it listens on 127.0.0.1 by default (daimon's VULN-011). A local client reaches it there,
 and nothing on the network can.

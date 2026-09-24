@@ -1010,7 +1010,7 @@ fn hid_poll_trylock(): i64 {
         0x48; 0x87; 0x08;                          # xchg [rax], rcx
         0x48; 0x89; 0x4D; 0xF8;                    # mov [rbp-0x08], rcx (old)
     }
-    if (old == 0) { return 1; }                    # we took it
+    if (old == 0) { preempt_disable(); return 1; }   # we took it — 1.57.6 (S3.2): a won try-lock is a held lock
     return 0;                                      # someone else is draining
 }
 fn hid_poll_unlock() {
@@ -1020,6 +1020,7 @@ fn hid_poll_unlock() {
         0x48; 0x31; 0xC9;                          # xor rcx, rcx
         0x48; 0x87; 0x08;                          # xchg [rax], rcx
     }
+    preempt_enable();                                   # 1.57.6 (S3.2): pairs the preempt_disable in the lock
     return 0;
 }
 

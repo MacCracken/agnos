@@ -1,5 +1,6 @@
 # 2026-09-23 — `sleep_ms`#41 holds the CPU: nothing else runs while a process sleeps
 
+**Status:** 🟡 **OPEN** — fixed by step **S3c** (Path 2 bite S3.5: `sleep_ms`#41 blocks only its caller, on the wq wait/wake primitive of bite S3.4). In 1.57.6 the wait still holds its CPU (`preempt_disable` window). The Path 2 foundation this step builds on — per-process syscall kernel stacks, the deferred `on_cpu` release, preempt-disabling spinlocks, region-7 guard pages (bites S3.1–S3.3) — landed in **1.57.6**; see `docs/development/planning/blocking-syscall-concurrency.md` § Path 2 plan and the roadmap's 1.57.x table.
 **Filed by:** daimon (the AGNOS agent orchestrator). A supervisor sleeps between polls of its children.
 **Checked against:** agnos **1.57.5**: the `#41` arm in `kernel/core/syscall.cyr`, the `#14` path in
 `kernel/arch/x86_64/syscall_hw.cyr` and `sys_sched_yield` in `kernel/core/sched.cyr`, read in the

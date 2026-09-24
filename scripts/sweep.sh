@@ -148,6 +148,29 @@ run_gate "1.57.2 kernel-embedded face (/fonts/default.ttf, rekha)" ""           
 # tick, invisible to every -smp 1 gate). Mutation-proven: the old placement trips both. Builds its own
 # kernel, so it needs no buildenv here; the image-side bound (LOAD end <= 0x370000) is check.sh gate 34.
 run_gate "1.57.3 AP stacks in region 7 (-smp 4, rodata intact after wake)" ""                     "ap-stack-smoke.sh"
+# 1.57.6 — the microsecond clock ring 3 uses (uptime_us#95). tsc-smoke existed since 1.56.18 and NO row ran
+# it: when it was finally run for 1.57.6 it was RED on a healthy tree (the klog timestamp prefix fed the
+# timestamp's seconds to its calibration extraction) and its boot HUNG after the IF=0 ring-3 probe — both
+# unseen for months. The plain mode runs here: the FADT PM timer decoded, calibration on the acpi-pm tier,
+# the live-tick tier agreeing within 2%, the lost-tick / agreement predicates on synthetic windows AND on
+# one live window with a 25 ms IF=0 stall inside it (the call-site wiring), the probe's `run: exit 1` (#95
+# advances with interrupts off), both accessors == calibration, the boot going on to the shell, and the
+# corrected refusal texts (first attempt and final) in the binary. ⚠ Its TSC_QUOTA=<pct> mode (the daimon
+# CPU-quota reproduction, TCG, ~1-2 min, needs systemd user cpu delegation) stays a MANUAL closeout gate.
+run_gate "1.57.6 TSC calibration (acpi-pm tier + tick cross-check, uptime_us#95 advances IF=0)" "TSC_SELFTEST=1" "tsc-smoke.sh"
+# 1.57.6 — spawn_path#43: distinct failure codes, the per-process #62 / CH_ENDOW arms cleared on EVERY
+# failure kind (they were per-CPU and leaked into other processes' children), SPAWN_F_ARGV,
+# SPAWN_F_CLEANFD capture (stdout+stderr, 2>&1, an explicitly passed fd, daimon's full shape), execwait#37
+# multi-redirect, the table-full code, and the pipe buffer's last-reference lifetime (a ring-3 UAF before).
+# Three banner-gated boots: the SPAWN_SELFTEST + PIPE_RC_SELFTEST kernel block (PIPE_RC_SELFTEST's first
+# runner ever), then tests/spawn seeded as /bin/agnsh on a PLAIN kernel at -smp 1 AND -smp 4 — both gated;
+# the -smp 4 boot is what caught do_context_switch leaving an AP on a reaped proc's freed page tables.
+# Builds its own kernels, so no buildenv here.
+run_gate "1.57.6 spawn: #43 codes, per-process arms, ARGV/CLEANFD, pipe lifetime (-smp 1 + 4)" "" "spawn-smoke.sh"
+# 1.57.6 — exec-redirect-smoke has existed since 1.46.x (extended 1.56.39) and NO row ran it, so the #62/#37
+# apply/restore and the #43 global-table refusal were exercised by nothing. It now also proves the
+# two-pair `2>&1` apply + byte-identical reverse restore. Builds its own kernel (EXEC_REDIRECT_SELFTEST).
+run_gate "1.46.x exec_redirect#62 apply/restore (+1.57.6 multi-pair), #43 global-table refusal" "" "exec-redirect-smoke.sh"
 run_gate "1.39.x exFAT write (+ subdir)"             "EXFAT_WRITE_SELFTEST=1"                   "exfat-write-smoke.sh"
 
 # --- ext2/jbd2 write regression bar (the iron-validated path must stay green) ---
@@ -176,6 +199,15 @@ run_gate "1.41.5 syscall hardening + epoll no-hang"  "SYSCALL_HARDEN_SELFTEST=1"
 # was in NO sweep row — so the 1.56.55 allocator change had to be verified by hand. It was also red
 # for a harness reason (a 40 s dwell that truncated its own tail); fixed in the smoke, 8/8 now.
 run_gate "1.44.x ring-3 procs, preempt gate, slot reuse, yield#44" "RING3_SELFTEST=1"           "ring3-smoke.sh"
+# 1.57.6 (Path 2, S3.3) — per-process kernel stacks. A KSTACK_SELFTEST kernel, booted -smp 1 THEN -smp 4 (KVM
+# `-cpu host` when /dev/kvm is writable, else multi-threaded TCG — the log names it), both gated: the SYSRET
+# frame is per-process (four probes with distinct RSP / sentinels / XMM survive >= 20 probe syscalls each), a
+# syscall can be switched out MID-FLIGHT at CPL0 and resumed — on another CPU at -smp 4 — the deferred on_cpu
+# release holds under a retire-while-running storm, a console_lock holder at IF=1 is not preempted into a
+# same-CPU deadlock, sched_next's nothing-ready fallback answers the idle and never kmain's stale slot, every
+# timer ISR body runs non-preemptible, and region 7 carries 32 not-present guard pages. Also the stub-size
+# oracle (280 bytes, ibrs=0). Builds its own kernel and leaves a plain one, so no buildenv here.
+run_gate "1.57.6 per-process kernel stacks, CPL0 switch windows, lock holders, guard pages (-smp 1 + 4)" "" "kstack-smoke.sh"
 
 # --- 1.56.40 channel band (#97): the RING-3 half, and the only place §9.9's kill criteria can be met ---
 # ⛔ The boot selftest structurally cannot close either: it runs under the KERNEL's CR3 (so it says

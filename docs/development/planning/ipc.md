@@ -144,7 +144,9 @@ the child's table at the same index**.
 
 ⛔ **What is actually missing is not transfer — it is placement and announcement.** The child does not
 know *which* index it holds. `exec_redirect #62` is the narrower *placement* mechanism, and it is
-genuinely one-shot and `execwait #37`-only. Announcement can ride the env blob `spawn_path #43`
+genuinely one-shot (it was `execwait #37`-only when this was written; since 1.56.39 `#43` applies it too, and
+since 1.57.6 it is a per-process set of up to 4 pairs that every `#43`/`#37` return clears — see
+`docs/architecture/spawn-and-fd-lifetime.md`). Announcement can ride the env blob `spawn_path #43`
 already accepts and validates (flat `KEY=VALUE`, ≤1024 B, 1..16 entries, staged onto the child's SysV
 init stack) — which is precisely Wayland's `WAYLAND_SOCKET` trick, and the cheapest high-value steal
 available.

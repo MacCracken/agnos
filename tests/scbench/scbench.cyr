@@ -1,0 +1,119 @@
+# scbench — the RING-3 SYSCALL round trip, measured from ring 3 (agnos 1.57.6, Path-2 step S3).
+#
+# ⭐ WHY THIS EXISTS. scripts/bench.sh times `ksyscall(2)` from KERNEL context (core/bench.cyr): it never
+# executes the SYSCALL entry stub, the kernel-stack switch, the CR3 pair or SYSRET — exactly the code the
+# per-process kernel-stack work rewrites (syscall_hw.cyr syscall_stub_build). This program runs as
+# /bin/agnsh on a PLAIN kernel (scripts/bench-ring3.sh, via scripts/smoke/lib/ring3-seed.sh), so every
+# number below is a full ring-3 -> ring-0 -> ring-3 trip through the stub the kernel actually ships.
+#
+# What each row costs:
+#   getpid   #2  — the bare stub + dispatcher (the floor)
+#   pipe     #1+#5 — an 8-byte write then an 8-byte read on a pipe: two trips plus the fs/vfs lock path
+#   yield_idle  #44 with no other process ready: the only other READY proc is the CPU's idle, so each
+#                yield hands the CPU to the idle until the next 10 ms tick (a tick-bound number — what a
+#                lone yielder pays today; S3.6 keep-current changes it)
+#   yield_peer  #44 against a second copy of this program spawned by spawn_path#43 that also yields in a
+#                loop: at -smp 1 each yield is a direct process-to-process switch, so ns_per is two
+#                switches (there and back). At -smp 4 the peer may run on another CPU and the number is
+#                a mix — read it as a measurement, not a switch cost.
+# ⚠ Clock: uptime_us#95 (rdtsc / calibrated cycles). -1 means the calibration was refused; the program
+# says so (SCBENCH-NOCLOCK) instead of printing numbers it cannot have measured.
+# ⚠ It ALWAYS exits 0 after SCBENCH-DONE — a non-zero exit drops kybernet into the emergency shell.
+
+var SCB_N = 20000;
+var scb_fds[2];
+var scb_buf[4];
+
+fn scb_out(s) { syscall(1, 1, s, strlen(s), 0); return 0; }
+fn scb_num(n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { scb_out("-"); n = 0 - n; }
+    if (n == 0) { scb_out("0"); return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; syscall(1, 1, &b + i, 1, 0); }
+    return 0;
+}
+fn scb_row(name, t0, t1, n) {
+    # nanoseconds per iteration, from a microsecond clock over n iterations
+    scb_out("SCBENCH "); scb_out(name); scb_out(" n="); scb_num(n);
+    scb_out(" us="); scb_num(t1 - t0);
+    scb_out(" ns_per="); scb_num(((t1 - t0) * 1000) / n); scb_out("\n");
+    return 0;
+}
+
+var SCB_PEER_N = 2000;
+var SCB_ME = "/bin/agnsh yieldpeer";
+
+# The peer role: yield SCB_PEER_N + 64 times (a little more than the parent, so the parent never runs out
+# of partner), then exit 0.
+fn scb_peer(): i64 {
+    var i = 0;
+    while (i < SCB_PEER_N + 64) { syscall(44, 0, 0, 0, 0); i = i + 1; }
+    return 0;
+}
+
+fn main(): i64 {
+    if (argc() >= 2) { return scb_peer(); }
+    scb_out("SCBENCH-BEGIN pid="); scb_num(syscall(2, 0, 0, 0, 0)); scb_out("\n");
+    var t0 = syscall(95, 0, 0, 0, 0);
+    if (t0 < 0) { scb_out("SCBENCH-NOCLOCK\nSCBENCH-DONE\n"); return 0; }
+    var r = 0;
+    # warm-up (fills the TLB / caches the stub touches)
+    var i = 0;
+    while (i < 1000) { syscall(2, 0, 0, 0, 0); i = i + 1; }
+
+    t0 = syscall(95, 0, 0, 0, 0);
+    i = 0;
+    while (i < SCB_N) { syscall(2, 0, 0, 0, 0); i = i + 1; }
+    var t1 = syscall(95, 0, 0, 0, 0);
+    scb_row("getpid", t0, t1, SCB_N);
+
+    if (syscall(25, &scb_fds, 0, 0, 0) != 0) { scb_out("SCBENCH-NOPIPE\nSCBENCH-DONE\n"); return 0; }
+    var rfd = load64(&scb_fds);
+    var wfd = load64(&scb_fds + 8);
+    store64(&scb_buf, 0x4843424E45424353);
+    var np = SCB_N / 4;
+    t0 = syscall(95, 0, 0, 0, 0);
+    i = 0;
+    while (i < np) {
+        if (syscall(1, wfd, &scb_buf, 8, 0) != 8) { scb_out("SCBENCH-PIPE-WRITE-SHORT\n"); i = np; }
+        if (syscall(5, rfd, &scb_buf, 8, 0) != 8) { scb_out("SCBENCH-PIPE-READ-SHORT\n"); i = np; }
+        i = i + 1;
+    }
+    t1 = syscall(95, 0, 0, 0, 0);
+    scb_row("pipe_wr_rd8", t0, t1, np);
+    syscall(6, rfd, 0, 0, 0);
+    syscall(6, wfd, 0, 0, 0);
+
+    # yield with nothing else ready (tick-bound: the idle runs until the next tick)
+    var ny = 100;
+    t0 = syscall(95, 0, 0, 0, 0);
+    i = 0;
+    while (i < ny) {
+        r = syscall(44, 0, 0, 0, 0);
+        if (r != 0) { scb_out("SCBENCH-YIELD-NONZERO rc="); scb_num(r); scb_out("\n"); i = ny; }
+        i = i + 1;
+    }
+    t1 = syscall(95, 0, 0, 0, 0);
+    scb_row("yield_idle", t0, t1, ny);
+
+    # yield against a peer that also yields
+    var peer = syscall(43, SCB_ME, strlen(SCB_ME), 0, 0);
+    if (peer < 0) { scb_out("SCBENCH-NOPEER rc="); scb_num(peer); scb_out("\n"); }
+    if (peer >= 0) {
+        t0 = syscall(95, 0, 0, 0, 0);
+        i = 0;
+        while (i < SCB_PEER_N) { syscall(44, 0, 0, 0, 0); i = i + 1; }
+        t1 = syscall(95, 0, 0, 0, 0);
+        scb_row("yield_peer", t0, t1, SCB_PEER_N);
+        var w = syscall(4, peer, 0, 0, 0);
+        while (w == (0 - 2)) { syscall(44, 0, 0, 0, 0); w = syscall(4, peer, 0, 0, 0); }
+        scb_out("SCBENCH peer exit="); scb_num(w); scb_out("\n");
+    }
+    scb_out("SCBENCH-DONE\n");
+    return 0;
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

@@ -294,6 +294,18 @@ fn dm_read_cr2() {
     return result;
 }
 
+# 1.57.6 (Path 2, S3.3): read the live RFLAGS (IF, AC). Single-local frame -> result at [rbp-8], the
+# dm_read_cr3 idiom. REGISTER CONTRACT: pushfq; pop rax; mov [rbp-8], rax — clobbers rax only.
+fn dm_read_rflags() {
+    var result = 0;
+    asm {
+        0x9C;                      # pushfq
+        0x58;                      # pop rax
+        0x48; 0x89; 0x45; 0xF8;    # mov [rbp-8], rax
+    }
+    return result;
+}
+
 # Diagnostic: read the live RSP. Single-local frame -> result at [rbp-8].
 fn dm_read_rsp() {
     var result = 0;
@@ -361,6 +373,50 @@ fn pmm_setup_directmap(top_phys) {
 # call site at 1.56.39.
 fn pmm_kva_for_access(phys) {
     return DIRECTMAP_BASE + phys;
+}
+
+# ═══════════════ 1.57.6 (Path 2, S3.3) — REGION-7 GUARD PAGES ═══════════════
+# Region 7 (phys [0xE00000, 0x1000000)) holds every kernel stack that is not the BSP's boot stack: the 16
+# per-process kernel stacks (syscalls AND CPL3 interrupts since S3.3), the 4 kthread stacks, the IST1 (#DF)
+# stacks and the AP boot/TSS stacks — 32 slots of 64 KB, always addressed through the DIRECT MAP (gdt.cyr has
+# the map). The direct map for GB 0 is ONE page directory, dm_pd, installed at the kernel PDPT[8] and copied
+# BY POINTER into every per-process CR3 (proc_create_address_space copies PDPT[1..511]), so replacing its
+# 2 MB entry 7 with a 4 KB page table reaches every address space at once. The lowest 4 KB of each slot is
+# left NOT PRESENT: a stack that overflows its 60 KB faults at CPL0 -> #DF on IST1 — whose own stack is in
+# this map too, but in a different slot, well above its guard — instead of silently writing the top of the
+# slot below it (another process's SYSRET frame). The present pages keep the same phys, so nothing that is
+# on a stack right now moves.
+# Called once from main.cyr right after pmm_bitmap_use_directmap(): after cr3_load(0x1000) (the direct map
+# is only live there), before any per-proc CR3 exists and before smp_start_aps, while the BSP runs on its
+# region-1 boot stack. NOT in a BOOTCR3_KEEP_GNOBOOT_CR3 build (no direct map in kmain's context — the
+# kfont_init exclusion). Idempotent: an entry that is already a table is left alone.
+# ⚠ NX on the 4 KB entries: EFER.NXE is set on every CPU (boot shim 0x900, the AP trampoline 0x900), which
+# per-proc NX user pages already rely on. Nothing executes from region 7.
+var kstack_guard_pt = 0;
+fn kstack_guard_init() {
+    var gi_pd = load64(0x2000 + 8 * 8) & 0x000FFFFFFFFFF000;
+    if (gi_pd == 0) { kprintln("kstack: guard pages NOT installed (no direct map)", 49); return 0; }
+    var gi_pdk = pmm_kva_for_access(gi_pd);
+    if ((load64(gi_pdk + 7 * 8) & 0x80) == 0) { return 0; }       # already a 4 KB table (idempotent)
+    var gi_pt = pmm_alloc();
+    if (gi_pt == 0) { kprintln("kstack: guard pages NOT installed (no page)", 43); return 0; }
+    var gi_ptk = pmm_kva_for_access(gi_pt);
+    var k = 0;
+    while (k < 512) {
+        if ((k & 15) == 0) { store64(gi_ptk + k * 8, 0); }            # a slot bottom: NOT PRESENT
+        else { store64(gi_ptk + k * 8, (0xE00000 + k * 0x1000) | 0x8000000000000003); }   # P|RW|NX, WB
+        k = k + 1;
+    }
+    store64(gi_pdk + 7 * 8, gi_pt | 0x3);
+    # Flush: the direct-map entries are non-global, so a CR3 reload drops the old 2 MB translation.
+    # REGISTER CONTRACT: no inputs, no outputs; clobbers rax (one block, so nothing can be scheduled into it).
+    asm {
+        0x0F; 0x20; 0xD8;          # mov rax, cr3
+        0x0F; 0x22; 0xD8;          # mov cr3, rax
+    }
+    kstack_guard_pt = gi_pt;
+    kprintln("kstack: region-7 guard pages installed (32 slots)", 49);
+    return 1;
 }
 
 fn vmm_unmap(virt) {

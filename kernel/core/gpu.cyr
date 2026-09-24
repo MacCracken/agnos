@@ -274,7 +274,8 @@ fn gpu_reg32_write(base_seg, off, val) {
 # This file used to hardcode `gpu_tsc_per_us() = 3000` with a comment explaining that it could not be
 # calibrated, because GPU init runs BEFORE `sti` and the 100 Hz tick is the only other time source. That
 # was true of GPU INIT. It was never true of the ring-3 dispatch path, which runs long after
-# tsc_calibrate() has measured the real number against live ticks — and on archaemenid the real number is
+# tsc_calibrate() has measured the real number (against the ACPI PM timer since 1.57.6; live ticks where the
+# FADT has none) — and on archaemenid the real number is
 # 3194, not 3000. The consequence was a "100 ms" dispatch watchdog that actually expired at ~93.9 ms.
 #
 # So the number is no longer a constant, it is a QUERY. gpu_tsc_per_us() returns the calibrated value once

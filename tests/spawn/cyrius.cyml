@@ -1,0 +1,18 @@
+[package]
+name = "spawnx"
+version = "0.1.0"
+description = "agnos 1.57.6 spawn_path#43 / execwait#37 / exec_redirect#62 / CH_ENDOW ring-3 exerciser — distinct failure codes, per-process spawn arms cleared on every failure kind, SPAWN_F_ARGV (spaces, empty, long, refusals), SPAWN_F_CLEANFD capture with 2>&1 and explicit fd passing, the table-full code, and the pipe last-reference lifetime (no cross-process crosstalk). Seeded as /bin/agnsh AND /bin/spawnx by scripts/smoke/spawn-smoke.sh."
+license = "GPL-3.0-only"
+language = "cyrius"
+# The VALUE must EQUAL the root manifest's pin (scripts/check/toolchain-pin-check.sh enforces it).
+cyrius = "6.6.6"
+
+[build]
+entry = "spawnx.cyr"
+output = "build/spawnx"
+
+# AGNOS ONLY — build with `cyrius build --agnos spawnx.cyr build/spawnx`.
+[deps]
+# ⚠ The FULL closure, transitives included (the 1.57.2 / 1.57.5 lesson): alloc -> atomic, fnptr;
+# string and args -> alloc. An undeclared transitive is vendored by accident and goes stale.
+stdlib = ["syscalls", "string", "alloc", "args", "atomic", "fnptr"]

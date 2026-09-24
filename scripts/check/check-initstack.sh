@@ -31,6 +31,9 @@ SYS="$ROOT/kernel/core/syscall.cyr"
 [ -f "$SYS" ] || { echo "FAIL: $SYS not found — the init-stack gate has no source to re-derive from"; exit 1; }
 
 hexval() { sed -n "s/^var $1 *= *\(0x[0-9A-Fa-f]*\);.*/\1/p" "$2" | head -1; }
+# 1.57.6: the spawn limits are DECIMAL (`var SPAWN_ARGV_MAX = 1024;`), which hexval cannot read — and a
+# parser that silently matched nothing would retire the argv assertions below without a word.
+decval() { sed -n "s/^var $1 *= *\([0-9][0-9]*\);.*/\1/p" "$2" | head -1; }
 
 BLOCK=$(hexval ELF_INIT_BLOCK "$ELF")
 STR=$(hexval ELF_INIT_STR "$ELF")
@@ -56,6 +59,16 @@ BLOB=$(grep -oE 'if \(entries > [0-9]+\) \{ return 0; \}' "$SYS" | grep -oE '[0-
 [ -n "$ARGC" ] || { echo "FAIL: could not read the argc cap ('if (argc >= N) { break; }' in $ELF)"; exit 1; }
 [ -n "$ENVC" ] || { echo "FAIL: could not read the envc cap ('if (envc >= N) { break; }' in $ELF)"; exit 1; }
 [ -n "$BLOB" ] || { echo "FAIL: could not read sc_env_blob_ok's entry cap ('if (entries > N) { return 0; }' in $SYS)"; exit 1; }
+# ⭐ 1.57.6 — THE spawn_path#43 LIMITS ARE MANDATORY INPUTS TOO (same vacuity floor as BLOB). The line
+# form's payload cap used to be a hardcoded 127 here; the SPAWN_F_ARGV blob (up to SPAWN_ARGV_MAX bytes,
+# NULs included) is now the larger argv source, and SPAWN_ARGC_MAX is what the #43/#37 arms REFUSE above —
+# it must equal the tokenizer's own cap or the refusal and the backstop disagree about "16".
+LINEMAX=$(decval SPAWN_LINE_MAX "$SYS")
+ARGVMAX=$(decval SPAWN_ARGV_MAX "$SYS")
+ARGCMAX=$(decval SPAWN_ARGC_MAX "$SYS")
+[ -n "$LINEMAX" ] || { echo "FAIL: could not read 'var SPAWN_LINE_MAX = N;' in $SYS"; exit 1; }
+[ -n "$ARGVMAX" ] || { echo "FAIL: could not read 'var SPAWN_ARGV_MAX = N;' in $SYS"; exit 1; }
+[ -n "$ARGCMAX" ] || { echo "FAIL: could not read 'var SPAWN_ARGC_MAX = N;' in $SYS"; exit 1; }
 
 SLOTS=$(( ( $STR - $BLOCK - 8 ) / 8 ))
 TOPIDX=$(( $ARGC + 3 + $ENVC ))
@@ -68,10 +81,17 @@ if [ "$TOPIDX" -gt $(( $SLOTS - 1 )) ]; then
     echo "      widen ELF_INIT_STR, or lower a cap — see the derivation at elf.cyr's ELF_INIT_STR"
     rc=1
 fi
-# argv payload <=127 B + <=argc NULs, env blob <=1024 B (already NUL-separated)
-NEED=$(( 127 + $ARGC + 1024 ))
+# argv = the LARGER of the line form (<= SPAWN_LINE_MAX payload + <= argc NULs) and the SPAWN_F_ARGV blob
+# (<= SPAWN_ARGV_MAX, NULs included), plus the env blob (<= 1024 B, already NUL-separated).
+ARGVNEED=$(( $LINEMAX + $ARGC ))
+[ "$ARGVMAX" -gt "$ARGVNEED" ] && ARGVNEED=$ARGVMAX
+NEED=$(( $ARGVNEED + 1024 ))
 if [ "$STRREGION" -lt "$NEED" ]; then
     echo "FAIL: init-stack string region too small: have $STRREGION B, worst case needs $NEED B"
+    rc=1
+fi
+if [ "$ARGCMAX" -ne "$ARGC" ]; then
+    echo "FAIL: SPAWN_ARGC_MAX=$ARGCMAX (what #43/#37 refuse above) != the tokenizer cap $ARGC (elf.cyr)"
     rc=1
 fi
 if [ "$BLOB" -gt "$ENVC" ]; then
@@ -82,5 +102,5 @@ fi
 # enumeration broke is reporting it: this gate's only inputs are four numbers scraped out of two
 # source files, and the failure mode above was one of them going missing without a word. A green line
 # naming argc=16 / envc=16 / blob cap 16 is evidence the three assertions ran against real values.
-[ "$rc" -eq 0 ] && echo "  init-stack: $SLOTS slots, worst top index $TOPIDX (argc<=$ARGC + 3 + envc<=$ENVC), string region $STRREGION B, blob cap $BLOB"
+[ "$rc" -eq 0 ] && echo "  init-stack: $SLOTS slots, worst top index $TOPIDX (argc<=$ARGC + 3 + envc<=$ENVC), string region $STRREGION B (worst $NEED), blob cap $BLOB, line cap $LINEMAX, argv cap $ARGVMAX, argc cap $ARGCMAX"
 exit $rc

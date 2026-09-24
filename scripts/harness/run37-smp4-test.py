@@ -228,7 +228,15 @@ try:
     # the #37→resume path (you cannot type/launch the next command without a returned prompt).
     prompt_ok = prompt_back1 or prompt_back2
     p("agnsh resume intact post-#37 (version works OR 2 renders):", resume_intact, f"(version={ver_live})")
-    if rendered_any and prompt_ok and resume_intact and dint_ok:
+    # ⛔ 1.57.6 (S3-fix): the kernel's LATCHED invariant lines (scripts/smoke/lib/qemu-dwell.sh SMOKE_INVARIANT_DENY —
+    # keep the two patterns identical) print once to klug + COM1 and change nothing else, so this harness scored PASS
+    # with them firing until it grepped for them.
+    import re as _re_inv
+    INV_DENY = r"sched: refused non-ready pick|sched: exec_and_wait entered with|sched: kernel_resume with|syscall: kernel stack is not the caller|PANIC: Double Fault"
+    inv_hits = [ln for ln in ser().splitlines() if _re_inv.search(INV_DENY, ln)]
+    inv_ok = not inv_hits
+    p("no latched kernel invariant line:", inv_ok, ("" if inv_ok else " -- " + " | ".join(inv_hits[:5])))
+    if rendered_any and prompt_ok and resume_intact and dint_ok and inv_ok:
         # ⚠ the census verdict goes onto the PASS line VERBATIM (it was the fixed literal "0 SMP-fault
         # exceptions" until 1.56.58) so the record count that earned it travels with the claim.
         p("run37-smp4-test: PASS — foreground execwait#37 rendered + agnsh resumed intact across two #37s (per-CPU ew37 OK)" + (f" + {dint_report} (-d int)" if DINT else ""))

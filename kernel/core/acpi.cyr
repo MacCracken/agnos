@@ -193,6 +193,15 @@ var acpi_reset_space = 0;   # GAS address-space id: 0 = system memory, 1 = syste
 var acpi_reset_addr  = 0;
 var acpi_reset_value = 0;
 var acpi_reset_ok    = 0;   # 1 = FADT advertises RESET_REG (flags bit10) and revision >= 2
+# ⭐ 1.57.6 — THE ACPI PM TIMER, tsc_calibrate's reference (main.cyr). A free-running counter at
+# 3.579545 MHz in fixed hardware: it needs NO interrupt delivery, so a host CPU quota that coalesces
+# LAPIC ticks (the daimon report: one 50 ms tick window refused at 25% and accepted a value 2.6x too
+# large at 50%) lengthens a PM window but cannot bias it. Decoded from PM_TMR_BLK (76, when
+# PM_TMR_LEN at 91 is 4) with X_PM_TMR_BLK (208, system-I/O GAS only) overriding; 0 = none usable.
+# ⚠ EVERY READER MASKS TO 24 BITS (`inl(port) & 0xFFFFFF`), which is correct for both widths, so
+# the TMR_VAL_EXT flag below is informational only (the boot report prints it).
+var acpi_pm_tmr_port = 0;   # I/O port of the PM timer; 0 = not advertised, hw-reduced, MMIO-only or > 0xFFFF
+var acpi_pm_tmr_ext  = 0;   # FADT flags bit 8 (TMR_VAL_EXT): 1 = 32-bit counter, 0 = 24-bit
 
 # Is [off, off+size) inside the table the firmware actually gave us?
 fn acpi_fadt_has(off, size) {
@@ -282,6 +291,31 @@ fn acpi_find_fadt() {
             }
         }
     }
+
+    # ⭐ 1.57.6 — PM TIMER (tsc_calibrate's reference). PM_TMR_BLK (76, 32-bit port) counts only when
+    # PM_TMR_LEN (91) is 4; X_PM_TMR_BLK (208) overrides it when it is in range, non-zero AND in
+    # system-I/O space (space id 1) — an MMIO-space X form is ignored, because every reader uses inl.
+    # ⛔ acpi_hw_reduced GATES BOTH FORMS: a hardware-reduced platform has no fixed PM hardware, and a
+    # value in either field there is not a timer. Same "in range" rule as the X fields above, via
+    # acpi_fadt_has(): QEMU's i440fx rev-1 FADT is 116 bytes and has no field at 208.
+    acpi_pm_tmr_port = 0;
+    acpi_pm_tmr_ext  = (acpi_fadt_flags >> 8) & 1;
+    if (acpi_hw_reduced == 0) {
+        if (acpi_fadt_has(91, 1) == 1) {
+            if (acpi_load8(f + 91) == 4) {
+                if (acpi_fadt_has(76, 4) == 1) { acpi_pm_tmr_port = acpi_load32(f + 76); }
+            }
+        }
+        if (acpi_fadt_has(208, 12) == 1) {
+            xa = acpi_gas_addr(208);
+            if (xa != 0) {
+                if (acpi_gas_space(208) == 1) { acpi_pm_tmr_port = xa; }
+            }
+        }
+    }
+    # An x86 I/O port is 16 bits; anything above is a mis-decode, never a port.
+    if (acpi_pm_tmr_port > 0xFFFF) { acpi_pm_tmr_port = 0; }
+    if (acpi_pm_tmr_port < 0) { acpi_pm_tmr_port = 0; }
     return f;
 }
 
@@ -439,6 +473,15 @@ fn acpi_fadt_report() {
     kprint(" width ", 7);                    kprint_num(acpi_pm1_cnt_len);
     kprintln("", 0);
 
+    # 1.57.6: the PM timer tsc_calibrate measures against. tsc-smoke checks this line.
+    if (acpi_pm_tmr_port != 0) {
+        kprint("acpi: pm timer port ", 20); kprint_hex(acpi_pm_tmr_port);
+        if (acpi_pm_tmr_ext == 1) { kprintln(", 32-bit", 8); }
+        if (acpi_pm_tmr_ext != 1) { kprintln(", 24-bit", 8); }
+    } else {
+        kprintln("acpi: no pm timer advertised", 28);
+    }
+
     if (acpi_reset_ok == 1) {
         kprint("acpi: reset register space ", 27); kprint_num(acpi_reset_space);
         kprint(" address ", 9);                    kprint_hex(acpi_reset_addr);
@@ -469,6 +512,8 @@ fn acpi_init() {
     acpi_dmar_addr = 0;
     acpi_iommu_base = 0;
     acpi_rsdp_via_bootinfo = 0;
+    acpi_pm_tmr_port = 0;       # 1.57.6: no RSDP / no FADT must mean no PM timer, not a stale one
+    acpi_pm_tmr_ext = 0;
 
     # Find RSDP
     var rsdp = acpi_find_rsdp();

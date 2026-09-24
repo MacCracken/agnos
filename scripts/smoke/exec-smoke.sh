@@ -222,6 +222,22 @@ if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}run: exit 50"; then
 else
     echo "  FAIL: no 'run: exit 50' (timing syscalls didn't dispatch, or sleep_ms didn't advance the clock)"; rc=1
 fi
+# 1.57.6 (Path 2, S3.3): after each execwait#37 (exwv, envprop) the kernel re-installs the CALLER's kernel
+# stack as TSS.RSP0 and the syscall top (step (h), kstack_install). It used to leave TSS.RSP0 on the reaped
+# child's slot until the caller's next switch. The EXEC_SELFTEST twin prints the verdict at the resume point.
+if strings "$LOG" | grep -q "exec: rsp0 restored"; then
+    echo "  PASS: execwait #37 re-installed the caller's kernel stack as TSS.RSP0 ('exec: rsp0 restored')"
+else
+    echo "  FAIL: no 'exec: rsp0 restored' (#37 step (h) did not re-install the caller's kernel stack, or never ran)"; rc=1
+fi
+if strings "$LOG" | grep -q "exec: RSP0 STALE"; then
+    echo "  FAIL: 'exec: RSP0 STALE' — TSS.RSP0 or the syscall top still pointed away from the #37 caller's own kernel stack"; rc=1
+fi
+# A pid-0 caller makes the witness vacuous (kernel_resume's park on slot 0 IS its stack) — the selftest must run
+# the #37 callers at a non-zero pid, as production's agnsh always is. Mutation M-B6 passed until this row existed.
+if strings "$LOG" | grep -q "exec: rsp0 check VACUOUS"; then
+    echo "  FAIL: 'exec: rsp0 check VACUOUS' — a #37 caller ran at pid 0, where step (h) cannot be told from its absence"; rc=1
+fi
 # Clean return after ALL runs — "selftest done" proves exec_and_wait returned
 # into its caller frame each time (multi-run + shell-loop shape).
 if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}exec: selftest done"; then
@@ -318,6 +334,14 @@ else
     else
         echo "  FAIL: EXEC-DISK-OK count $EXEC_OK_N < 2 (the #43-spawned prog2's write(1) never reached the console)"; rc=1
     fi
+fi
+
+# ⛔ 1.57.6 (S3-fix): the kernel's latched invariant lines (SMOKE_INVARIANT_DENY, qemu-dwell.sh) fire once to klug +
+# COM1 and change no exit code — this gate scored PASS with them firing until it grepped for them.
+if strings "$LOG" | grep -qE "$SMOKE_INVARIANT_DENY"; then
+    echo "  FAIL: a latched kernel invariant line fired:"; strings "$LOG" | grep -E "$SMOKE_INVARIANT_DENY" | head -5 | sed 's/^/        /'; rc=1
+else
+    echo "  PASS: no latched kernel invariant line (non-ready pick, out-of-band asserts, kstack_check_entry, #DF)"
 fi
 
 # Post-boot fsck: the writes (/bin/prog2 + /notelf) must leave the FS clean.

@@ -117,6 +117,38 @@ fn idt_init() {
 # (no ring-3 proc runs that early anyway).
 var exc_ring3_kill_fn = 0;
 
+# ⭐ 1.57.6 (Path 2, S3-fix) — A #DF SAYS SO ON COM1. The vector-8 stub (below) calls this after its CMOS stamps
+# and before the FB bar + halt. Until now a #DF reached only CMOS 0x54 and the framebuffer, so under a serial-only
+# harness it was a silent wedge (mutation M-B2 measured exactly that), and on iron the FB bar's own write can
+# fault under the faulting CR3 and overwrite the CMOS vector with a #PF. In this kernel a #DF is almost always a
+# KERNEL STACK THAT IS GONE: a SYSCALL on a zero top (syscall_hw.cyr pcpu_syscall_kstack_top), a stack that ran
+# into its region-7 guard page (vmm.cyr kstack_guard_init — the #PF cannot be pushed on the same RSP), a bad RSP0.
+# Runs on IST1 (a known-good stack), IF=0, under whatever CR3 faulted: kernel text, .rodata and COM1 port I/O are
+# reachable under every CR3 this kernel builds. LOCK-FREE — serial_putc only, never kprint, whose console lock the
+# faulting CPU may hold. Returns; the stub then paints the bar and halts.
+# frame = the #DF frame the CPU pushed on IST1: [0] error code (0) · [8] RIP · [16] CS · [24] RFLAGS · [32] RSP · [40] SS.
+# cr2 = CR2 at #DF entry: the address whose #PF escalated, when one did (a guard page, or 0 - 8 for a zero top).
+fn exc_serial_hex(v) {
+    serial_print("0x", 2);
+    var xh_s = 60;
+    while (xh_s >= 0) {
+        var xh_d = (v >> xh_s) & 15;
+        if (xh_d < 10) { serial_putc(48 + xh_d); } else { serial_putc(87 + xh_d); }
+        xh_s = xh_s - 4;
+    }
+    return 0;
+}
+fn exc_df_report(frame, cr2) {
+    serial_print("PANIC: Double Fault (#DF, IST1) rip=", 36);
+    exc_serial_hex(load64(frame + 8));
+    serial_print(" rsp=", 5);
+    exc_serial_hex(load64(frame + 32));
+    serial_print(" cr2=", 5);
+    exc_serial_hex(cr2);
+    serial_println(" -- a kernel stack is gone? (zero syscall top, guard page, bad RSP0) -- halting", 79);
+    return 0;
+}
+
 fn exc_handlers_init() {
     var base = &exc_stub;
     var nvec = 9;   # 1.56.18: +v=0 (#DE) — was 8; 1.53.x B3 added v=19 (#XM)
@@ -547,6 +579,33 @@ fn exc_handlers_init() {
             store8(stub + tail + 35, 0xFF); store8(stub + tail + 36, 0xD0);
             tail = tail + 37;
         }
+        # ⭐ 1.57.6 (S3-fix): #DF (v == 8) calls exc_df_report (above) for its one COM1 line, then falls into the
+        # canary + halt like every other vector. 22 bytes; the stub does no push/pop before this, so rsp IS the
+        # #DF frame. REGISTER CONTRACT: in — rsp = the #DF frame; out — rdi = frame, rsi = CR2 (the SysV args);
+        # clobbers rax and every caller-saved register (the frame is abandoned: the canary below halts).
+        if (v == 8) {
+            var dfr = &exc_df_report;
+            # mov rdi, rsp                  48 89 E7   (arg1: the #DF frame)
+            store8(stub + tail + 0, 0x48); store8(stub + tail + 1, 0x89); store8(stub + tail + 2, 0xE7);
+            # mov rsi, cr2                  0F 20 D6   (arg2: CR2)
+            store8(stub + tail + 3, 0x0F); store8(stub + tail + 4, 0x20); store8(stub + tail + 5, 0xD6);
+            # and rsp, ~15                  48 83 E4 F0   (16-align the call; IST1 is a fresh stack)
+            store8(stub + tail + 6, 0x48); store8(stub + tail + 7, 0x83);
+            store8(stub + tail + 8, 0xE4); store8(stub + tail + 9, 0xF0);
+            # mov rax, imm64(&exc_df_report)  48 B8 <addr64 LE>
+            store8(stub + tail + 10, 0x48); store8(stub + tail + 11, 0xB8);
+            store8(stub + tail + 12, dfr & 0xFF);
+            store8(stub + tail + 13, (dfr >> 8) & 0xFF);
+            store8(stub + tail + 14, (dfr >> 16) & 0xFF);
+            store8(stub + tail + 15, (dfr >> 24) & 0xFF);
+            store8(stub + tail + 16, (dfr >> 32) & 0xFF);
+            store8(stub + tail + 17, (dfr >> 40) & 0xFF);
+            store8(stub + tail + 18, (dfr >> 48) & 0xFF);
+            store8(stub + tail + 19, (dfr >> 56) & 0xFF);
+            # call rax                      FF D0
+            store8(stub + tail + 20, 0xFF); store8(stub + tail + 21, 0xD0);
+            tail = tail + 22;
+        }
         # 1.45.16 fault canary — paint a wide FB bar before halting so a CAUGHT CPU
         # exception is visible ON THE FRAMEBUFFER (photo-readable), not only in CMOS
         # 0x54/0x55. The CMOS stamp(s) above are written FIRST, so even if this FB
@@ -599,5 +658,8 @@ fn exc_handlers_init() {
         if (v == 8) { idt_set_ist(8, 1); }
         off = off + tail + 35;
     }
+    # ⚠ 1.57.6 (S3-fix): nine stubs share exc_stub[160] = 1280 B (boot_data.cyr) and nothing ever checked the sum
+    # (1154 B before the #DF call, 1176 B with it). Too late to prevent — the stores above already ran — but loud.
+    if (off > 1280) { serial_println("exc: STUB OVERFLOWED exc_stub (1280 B) -- the fault stubs overran their buffer", 78); }
     return 0;
 }

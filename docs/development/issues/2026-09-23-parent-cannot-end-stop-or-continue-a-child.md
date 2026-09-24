@@ -1,5 +1,6 @@
 # 2026-09-23 — a parent cannot end, stop or continue its child: signals are pending bits with no default action
 
+**Status:** 🟡 **OPEN** — fixed by step **S7** (SIGKILL ends, SIGSTOP stops, SIGCONT continues; one death chain; `waitpid`/`execwait` report death by signal as `0x100 | sig`; `kill`#16 `sig | 0x100` = KILL_TREE, approved 2026-09-23). Not in 1.57.6. The Path 2 foundation this step builds on — per-process syscall kernel stacks, the deferred `on_cpu` release, preempt-disabling spinlocks, region-7 guard pages (bites S3.1–S3.3) — landed in **1.57.6**; see `docs/development/planning/blocking-syscall-concurrency.md` § Path 2 plan and the roadmap's 1.57.x table.
 **Filed by:** daimon (the AGNOS agent orchestrator). It supervises agent processes and has to stop,
 pause and resume them.
 **Checked against:** agnos **1.57.5**: `kernel/core/syscall.cyr`, `kernel/core/proc.cyr`,
