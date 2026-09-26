@@ -641,18 +641,22 @@ fn pmm_alloc_2mb() {
 # pmm_alloc's top-down 4 KB scan). Returns the 2 MB-aligned physical base of the
 # LOWEST region in the run, or 0 if no free run of `n` regions exists.
 #
-# CEILING = region 128 (256 MB), NOT pmm_2mb_top_region. The caller (fb_shadow_init)
-# addresses the run phys==VA under BOTH the kernel boot CR3 (0-4 GB via pt_init /
-# 0x1000) AND every per-process CR3 — and the per-proc identity window is only PD
-# [0..127] = 0-256 MB (proc.cyr:549). Regions above 256 MB are unmapped in per-proc
-# context, so a shadow there would #PF in the syscall-path fb_putc. Clamp lower if
-# the live bitmap is smaller (a <256 MB machine). A region counts as free only when
-# all 512 pages are free, which the pmm's reserved/unbacked-page marking guarantees
-# is backed usable RAM (the same invariant sys_mmap's pmm_alloc_2mb relies on), so a
-# free run is always physically present. Allocated once at boot; never freed.
+# CEILING = region 128 (256 MB), NOT pmm_2mb_top_region. ⚠ 1.57.9 (CPUVA): the REASON this
+# comment gave is gone. It said the caller (fb_shadow_init) addresses the run phys == VA under
+# every per-process CR3 "because the per-proc identity window is PD[0..127]" — that was the
+# defect, not a guarantee: a per-proc CR3 gives PD[2..127] to the ring-3 image, so phys == VA
+# there is the PROCESS's page. Both callers (fb_shadow_init, kfont_init) now store the run's
+# DIRECT-MAP pointer (dma_kva / pmm_kva_for_access), which every CR3 reaches for all RAM, so
+# the ceiling no longer buys addressability. It is KEPT only because lifting it moves the
+# console shadow and the kfont region into the top-of-RAM 2 MB pool sys_mmap's pmm_alloc_2mb
+# draws from — an operator call, not taken in this cut. Clamp lower if the live bitmap is
+# smaller (a <256 MB machine). A region counts as free only when all 512 pages are free,
+# which the pmm's reserved/unbacked-page marking guarantees is backed usable RAM (the same
+# invariant sys_mmap's pmm_alloc_2mb relies on), so a free run is always physically present.
+# Allocated once at boot; never freed. ⛔ A caller must never dereference the returned phys.
 fn pmm_alloc_2mb_run(n) {
     if (n < 1) { return 0; }
-    var ceil = 128;                                  # 256 MB per-proc identity ceiling
+    var ceil = 128;                                  # 256 MB: historical, see the banner (no longer an addressability bound)
     if (pmm_2mb_top_region < ceil) { ceil = pmm_2mb_top_region; }
     pmm_spin_lock();
     # `top` = highest region of a candidate run; try the top-most window first.

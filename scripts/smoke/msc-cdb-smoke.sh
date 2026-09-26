@@ -18,9 +18,16 @@
 # A WRITE(10)+SYNC+READ(10) round-trip at LBA 100 of the scratch stick is the control that the instrument
 # does not break a transfer.
 #
-# BOOTS: the canary kernel at -smp 1 and -smp 4 (GATED — ${MSC_CDB_SMP:-1 4}), then boot P: an
-# MSC_RW_DEMO kernel (no canary) that runs the FIXED PRODUCTION frames through READ(10) and a
-# WRITE(10)/READ(10) round-trip. ⚠ The -smp 4 boot proves the same frames under a 4-CPU topology and boot
+# BOOTS: the canary kernel at -smp 1 and -smp 4 (GATED — ${MSC_CDB_SMP:-1 4}), then boot P at the same SMP
+# counts: an MSC_RW_DEMO + MSC_BOUNCE_SELFTEST kernel (no canary) that runs the FIXED PRODUCTION frames through
+# READ(10) and a WRITE(10)/READ(10) round-trip, and then the [bounce] arm.
+#
+# ⛔ 1.57.9 [bounce] (issue 2026-09-25-msc-puts-the-caller-buffer-in-a-data-trb): msc_blk_read/_write/_read_sectors
+# used to store the CALLER'S buffer pointer in the bulk data TRB — a CPU VA taken by the xHC as a PHYSICAL
+# address. msc_bounce_selftest drives all three with kmalloc and direct-map buffers (rows A-C, each checked
+# against the phys-taking reference primitive) plus a .bss control (row D, identity VA == phys, GREEN on the old
+# code too, so a RED in A-C is the buffer class). A row passes only on err=0 AND bad=0; a FAIL line prints both.
+# Measured on the pre-fix msc_blk_* (the key hunk reverted): see the 1.57.9 MSCBUF report. ⚠ The -smp 4 boot proves the same frames under a 4-CPU topology and boot
 # path; the driver runs on the BSP before smp_start_aps, so it says nothing about concurrent MSC I/O.
 #
 # ⚠ Kernel lines on COM1 carry the klog prefix `[    s.uuuuuu] ` (kprint.cyr); `wantk` strips it before an
@@ -76,12 +83,12 @@ deny()   { if strings "$LOG" | grep -qE -- "$1"; then bad "$2"; strings "$LOG" |
 echo "=== MSC CDB canary smoke (16-byte CDB at all 7 SCSI builders; usb-storage on qemu-xhci) ==="
 
 # ---- 1. builds (copies isolate every boot from the later builds; the last build leaves the tree plain)
-echo "[build] MSC_CDB_CANARY=1, MSC_RW_DEMO=1, plain"
+echo "[build] MSC_CDB_CANARY=1, MSC_RW_DEMO=1 MSC_BOUNCE_SELFTEST=1, plain"
 MSC_CDB_CANARY=1 sh "$ROOT/scripts/build.sh" > "$LOGS/build-canary.log" 2>&1 \
     || { echo "ERROR: MSC_CDB_CANARY build failed ($LOGS/build-canary.log) — this gate measured NOTHING"; exit 1; }
 cp "$ROOT/build/agnos" "$WORK/agnos-canary"
-MSC_RW_DEMO=1 sh "$ROOT/scripts/build.sh" > "$LOGS/build-rwdemo.log" 2>&1 \
-    || { echo "ERROR: MSC_RW_DEMO build failed ($LOGS/build-rwdemo.log) — this gate measured NOTHING"; exit 1; }
+MSC_RW_DEMO=1 MSC_BOUNCE_SELFTEST=1 sh "$ROOT/scripts/build.sh" > "$LOGS/build-rwdemo.log" 2>&1 \
+    || { echo "ERROR: MSC_RW_DEMO+MSC_BOUNCE_SELFTEST build failed ($LOGS/build-rwdemo.log) — this gate measured NOTHING"; exit 1; }
 cp "$ROOT/build/agnos" "$WORK/agnos-rwdemo"
 sh "$ROOT/scripts/build.sh" > "$LOGS/build-plain.log" 2>&1 \
     || { echo "ERROR: plain build failed ($LOGS/build-plain.log) — this gate measured NOTHING"; exit 1; }
@@ -97,6 +104,16 @@ if strings "$ROOT/build/agnos" | grep -qE 'msc-cdb:|CDCANARY'; then
     bad "the PLAIN production kernel carries the canary instrument"
 else
     ok "the canary instrument is compiled out of production"
+fi
+if strings "$WORK/agnos-rwdemo" | grep -qF 'msc-bounce:'; then
+    ok "the boot-P kernel carries the [bounce] instrument (msc-bounce: strings) — the probe can see it"
+else
+    bad "the boot-P kernel does NOT carry the [bounce] instrument — MSC_BOUNCE_SELFTEST never reached the source"
+fi
+if strings "$ROOT/build/agnos" | grep -qF 'msc-bounce:'; then
+    bad "the PLAIN production kernel carries the [bounce] instrument"
+else
+    ok "the [bounce] instrument is compiled out of production"
 fi
 # C3: the canary's placement in the SOURCE (A8). Each `var cdb_canary = ..;` must be followed by exactly its
 # `#endif` and then the site's `var cdb_buf[..]` — nothing may be declared between them — and every note
@@ -171,14 +188,25 @@ for SMP in ${MSC_CDB_SMP:-1 4}; do
     fi
 done
 
-echo "[prod] MSC_RW_DEMO kernel (no canary), -smp 1 — the fixed production frames move real data"
-if boot "$WORK/agnos-rwdemo" 1 "prod"; then
-    want  "mass-storage device(s) detected"              "[prod] the usb-storage stick enumerated"
-    wantkre "msc: slot [0-9]+ LBA0 first 8 bytes: 77 83 67 76 66 65 48 33" "[prod] production READ(10) of LBA 0 returned the seeded bytes (the MSC line, not nvme/ahci's)"
-    wantk "msc: LBA100 write-then-read round-trip PASS"  "[prod] production WRITE(10) + READ(10) round-trip at LBA 100"
-    deny  "msc-cdb:"                                     "[prod] the canary instrument is absent from this boot"
-    deny  "$SMOKE_INVARIANT_DENY"                        "[prod] no latched kernel invariant fired (whole boot)"
-fi
+for SMP in ${MSC_CDB_SMP:-1 4}; do
+    echo "[prod-smp$SMP] MSC_RW_DEMO + MSC_BOUNCE_SELFTEST kernel (no canary), -smp $SMP — production frames move real data; msc_blk_* bounce"
+    if boot "$WORK/agnos-rwdemo" "$SMP" "prod-smp$SMP"; then
+        want  "mass-storage device(s) detected"              "[prod-smp$SMP] the usb-storage stick enumerated"
+        wantkre "msc: slot [0-9]+ LBA0 first 8 bytes: 77 83 67 76 66 65 48 33" "[prod-smp$SMP] production READ(10) of LBA 0 returned the seeded bytes (the MSC line, not nvme/ahci's)"
+        wantk "msc: LBA100 write-then-read round-trip PASS"  "[prod-smp$SMP] production WRITE(10) + READ(10) round-trip at LBA 100"
+        wantk "msc-bounce: A kmalloc blk_read PASS"          "[bounce-smp$SMP] A: msc_blk_read into a kmalloc block (direct-map VA) returns the sector"
+        wantk "msc-bounce: B direct-map blk_read_sectors(16) PASS" "[bounce-smp$SMP] B: msc_blk_read_sectors(16) into an unaligned direct-map buffer (2 bounce chunks)"
+        wantk "msc-bounce: C direct-map blk_write(x8) PASS"  "[bounce-smp$SMP] C: msc_blk_write from an unaligned direct-map buffer lands on the stick"
+        wantk "msc-bounce: D control .bss blk_write+blk_read PASS" "[bounce-smp$SMP] D: control — .bss buffers (identity VA == phys) still round-trip"
+        wantk "msc-bounce: PASS rows=4"                      "[bounce-smp$SMP] all four rows passed"
+        wantk "msc-bounce: done"                             "[bounce-smp$SMP] the [bounce] driver completed"
+        wantk "smp: cpus online: $SMP"                       "[prod-smp$SMP] all $SMP CPU(s) came online"
+        deny  "msc-bounce: FAIL"                             "[bounce-smp$SMP] no msc-bounce FAIL line"
+        deny  "msc-cdb:"                                     "[prod-smp$SMP] the canary instrument is absent from this boot"
+        deny  "$SMOKE_INVARIANT_DENY"                        "[prod-smp$SMP] no latched kernel invariant fired (whole boot)"
+        klines "$LOG" | grep -E '^msc-bounce: ' | sed 's/^/        /'
+    fi
+done
 
 echo "=== msc-cdb-smoke: $pass passed, $fail failed$( [ "$void" = 1 ] && echo ', VOID boot(s)') — logs in $LOGS ==="
 if [ "$fail" -gt 0 ]; then echo "msc-cdb-smoke: FAIL"; exit 1; fi

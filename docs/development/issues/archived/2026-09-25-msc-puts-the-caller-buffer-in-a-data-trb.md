@@ -1,7 +1,6 @@
 # 2026-09-25 — USB MSC: `msc_blk_*` put the caller's buffer pointer straight into a data TRB as a DMA address
 
-**Status:** 🟡 **OPEN**, unslotted. Found by 1.57.8 step XHCI while it converted MSC's own DMA pages to the direct map.
-This is a different class (a CPU pointer used as a physical address), and it predates 1.57.8.
+**Status:** ✅ **RESOLVED 1.57.9 (2026-09-26)** — `msc_blk_read` / `_write` / `_read_sectors` bounce through a driver-owned pmm page (`msc_ensure_data_buf`, iommu-registered, reached through `dma_kva`); a READ copies out only after a complete transfer, a WRITE settles before copying in; the caller's pointer never reaches a TRB. Gate: `msc-cdb-smoke` 49/0 at `-smp 1` and `-smp 4`, including a caller buffer outside the identity window. See § Resolution.
 **Filed by:** agnos, from the 1.57.8 XHCI step report (`open_problems[0]`) and the XHCI end review.
 **Checked against:** agnos **1.57.8**, `kernel/arch/x86_64/usb/msc.cyr` `msc_blk_read` (~:1752),
 `msc_blk_write` (~:1761) and `msc_blk_read_sectors` (~:1804).
@@ -28,3 +27,12 @@ RED on today's code. Also run `msc-short` and `msc-cdb` at `-smp 1` and `-smp 4`
 ## Evidence (operator-local)
 
 `~/.claude/projects/-home-macro-Repos-agnos/handoff-1.57.8/steps/XHCI-report.json`, `~/.claude/projects/-home-macro-Repos-agnos/handoff-1.57.8/steps/XHCI-endreview.json`.
+
+## Resolution (1.57.9, 2026-09-26)
+
+Prior art followed: Linux usb-storage/SCSI map buffers through the DMA API and bounce through swiotlb when memory is not
+DMA-addressable; FreeBSD `busdma` bounce pages. TRB data pointers are only ever physical addresses the driver owns.
+
+What it broke: throughput — `msc_blk_read_sectors` now issues one READ(10) per 4 KB (was up to 65,024 B per command); an ext2 4 KB
+block is still one command. The settle-before-copy hunk on WRITE is not discriminated by a test (QEMU usb-storage cannot produce a
+late data-phase DMA). The same defect class remains in AHCI's PRDT — filed as `2026-09-26-ahci-puts-the-caller-buffer-in-the-prdt.md`.

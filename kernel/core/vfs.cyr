@@ -863,6 +863,18 @@ var PIPE_RING = 4080;   # 4096 - 8 (write head) - 8 (read tail)
 # syscall.cyr). Woken (wq_wake, after the condition store) by pipe_write, by every pipe-end close (vfs_close_inner)
 # and by a writer's death (proc_death_finish wakes the WK_PIPE class). docs/architecture/blocking-waits.md.
 fn pipe_key(pb) { return WK_PIPE | (pb & 0x00FFFFFFFFFFFFFF); }
+# ⭐ 1.57.9 (PIPEW) — THE WRITER'S KEY: a write#1 (a4 == 0) that finds no room with a live reader BLOCKS on it
+# (wr1_wait, syscall.cyr). A separate key, as Linux's rd_wait/wr_wait and FreeBSD's PIPE_WANTR/PIPE_WANTW, so the
+# writer's own wq_wake(pipe_key) after every copy never wakes the other writers. Bit 0 is free because the buffer is
+# a kmalloc(4096), a whole slab page (block 0 of a one-block page — heap.cyr slab_grow), so no new WK class byte.
+# Woken by pipe_read (after the tail store), by every pipe-end close (vfs_close_inner wakes both keys: msk ~1) and by
+# a reader's death (proc_death_finish's WK_PIPE class wake already matches it).
+fn pipe_wkey(pb) { return pipe_key(pb) | 1; }
+# POSIX PIPE_BUF: a write of <= 512 bytes is all-or-nothing (it waits — or, O_NONBLOCK, returns 0 — until the whole of
+# it fits, and lands in ONE pipe_lock hold, so it never interleaves with another writer's). 512 is the POSIX minimum
+# (_POSIX_PIPE_BUF), not Linux's 4096: the agnos ring is 4 KB, not 64 KB, and an atomic unit near the ring size would
+# make every small message wait for a nearly empty ring. Larger writes go in whatever fits (FreeBSD's rule).
+var PIPE_BUF = 512;
 
 fn pipe_read(base, buf, count) {
     var pipe_buf = load64(base + 24);
@@ -886,9 +898,13 @@ fn pipe_read(base, buf, count) {
     # Layout: [0..8) write head · [8..16) read tail · [16..4096) data ring (PIPE_RING bytes).
     # ⚠ Capacity is 4080, not 4088 — eight bytes bought the tail. A pipe that silently loses data is
     # not worth eight bytes of capacity.
+    # 1.57.9 (PIPEW): the tail read-modify-write and the copy run under pipe_lock (two readers no longer take the same
+    # bytes); the writer wake and the pipe_writers_open scan run after the unlock.
+    pipe_spin_lock();
     var write_head = load64(pipe_buf);
     var read_tail = load64(pipe_buf + 8);
     if (write_head == read_tail) {
+        pipe_spin_unlock();
         # ⭐ ipc BITE 11 — EMPTY IS NOT EOF WHILE A WRITER IS STILL OPEN.
         # ⛔ Returning 0 for both is what confined pipes to store-and-forward: a consumer running
         # CONCURRENTLY with its producer saw "0" the first time it out-ran the writer and quit,
@@ -912,6 +928,10 @@ fn pipe_read(base, buf, count) {
     }
     store64(pipe_buf + 8, read_tail);
     store64(base + 8, read_tail);          # kept in sync: this fd's payload 0 is still "pos"
+    pipe_spin_unlock();
+    # 1.57.9 (PIPEW): AFTER the tail store — a writer blocked for room re-checks (wr1_wait). Unconditional on a copy,
+    # not Linux's `was_full`: that flag is only sound under the lock, and the saving is one 16-slot scan.
+    if (copied > 0) { wq_wake(pipe_wkey(pipe_buf)); }
     return copied;
 }
 
@@ -927,19 +947,48 @@ fn pipe_write(base, buf, count) {
     # two 3000-byte writes wrapped and corrupted, and each call individually looked in-range.
     # A short return is the contract — the caller sees fewer bytes accepted than offered and can act
     # on it. Silence cannot be acted on.
+    # ⭐ 1.57.9 (PIPEW): a write of <= PIPE_BUF bytes needs room for ALL of it (else it takes 0); a larger one takes
+    # what fits. ⛔ NO READER + NOTHING TAKEN = -1 (EPIPE): a pipe nobody can ever read used to accept 4080 bytes and
+    # then answer 0 forever, so a count-looping writer spun. Scanned only here, on the refused path (the scan is 512
+    # tag checks; a readerless pipe with room still takes bytes, so the -1 arrives at most one ring later).
+    var need = 1;
+    if (count <= PIPE_BUF) { need = count; }
+    var written = pipe_write_n(pipe_buf, buf, count, need);
+    if (written == 0) { if (count > 0) { if (pipe_ends_open(pipe_buf, 0) == 0) { return 0 - 1; } } }
+    return written;
+}
+
+# The copy: take up to `count` bytes iff the ring has >= `need` free (need 0 or 1 = whatever fits), under pipe_lock;
+# wake the readers after the head store and the unlock. Returns the count taken (0 = refused).
+fn pipe_write_n(pipe_buf, buf, count, need) {
+    pipe_spin_lock();
     var write_head = load64(pipe_buf);
     var read_tail = load64(pipe_buf + 8);
     var written = 0;
-    while (written < count) {
-        if ((write_head - read_tail) >= PIPE_RING) { break; }   # full — refuse, do NOT overwrite
-        var byte_off = (write_head % PIPE_RING) + 16;
-        store8(pipe_buf + byte_off, load8(buf + written));
-        write_head = write_head + 1;
-        written = written + 1;
+    if ((PIPE_RING - (write_head - read_tail)) >= need) {
+        while (written < count) {
+            if ((write_head - read_tail) >= PIPE_RING) { break; }   # full — refuse, do NOT overwrite
+            var byte_off = (write_head % PIPE_RING) + 16;
+            store8(pipe_buf + byte_off, load8(buf + written));
+            write_head = write_head + 1;
+            written = written + 1;
+        }
+        store64(pipe_buf, write_head);
     }
-    store64(pipe_buf, write_head);
+    pipe_spin_unlock();
     if (written > 0) { wq_wake(pipe_key(pipe_buf)); }   # 1.57.8: AFTER the head store — a blocked reader re-checks
     return written;
+}
+
+# fd -> its pipe buffer when `fd` is a pipe WRITE end in the caller's table, else 0 (wr1_wait re-derives it on every
+# pass instead of keeping a pointer across a sleep).
+fn pipe_wbuf(fd) {
+    if (fd < 0) { return 0; }
+    if (fd >= 32) { return 0; }
+    var wb = vfs_fd_table() + fd * 32;
+    if (ktag(wb) != VFS_PIPE) { return 0; }
+    if (kpayload(wb, 1) != 1) { return 0; }
+    return kpayload(wb, 2);
 }
 
 fn vfs_read(fd_idx, buf, count) {
@@ -1163,7 +1212,12 @@ fn pipe_buf_put(buf) {
 # when a reader finds nothing to read. A pipe with data never reaches here.
 # ⚠ Reflects reality rather than accounting, so no spawn/inherit/close site has to remember to keep a
 # tally in step — the class of bug that makes refcounts wrong.
-fn pipe_writers_open(buf) {
+# ⭐ 1.57.9 (PIPEW): the same scan answers "is ANY READ end open?" (wend 0) for the writer — pipe_write's EPIPE and
+# wr1_key's block condition — with the SAME two rules: a dead (state 0) table is skipped, or a writer blocked beside a
+# dead-but-unreaped reader waits for the shell that is waiting for it (the `grep . cert.pem | wc` hang, mirrored), and
+# pid 0 is never skipped. Paid only on the refused (full) path.
+fn pipe_writers_open(buf) { return pipe_ends_open(buf, 1); }
+fn pipe_ends_open(buf, wend) {
     var pid = 0;
     while (pid < 16) {
         var tbl = proc_fd_base_get(pid);
@@ -1187,7 +1241,7 @@ fn pipe_writers_open(buf) {
                 var b = tbl + f * 32;
                 if (ktag(b) == VFS_PIPE) {
                     if (kpayload(b, 2) == buf) {
-                        if (kpayload(b, 1) == 1) { return 1; }
+                        if (kpayload(b, 1) == wend) { return 1; }
                     }
                 }
                 f = f + 1;
@@ -1201,7 +1255,7 @@ fn pipe_writers_open(buf) {
         var gb = &vfs_table + g * 32;
         if (ktag(gb) == VFS_PIPE) {
             if (kpayload(gb, 2) == buf) {
-                if (kpayload(gb, 1) == 1) { return 1; }
+                if (kpayload(gb, 1) == wend) { return 1; }
             }
         }
         g = g + 1;
@@ -1398,7 +1452,9 @@ fn vfs_close_inner(fd_idx) {
         var pb = kpayload(base, 2);
         ktag_clear(base, 32);
         pipe_buf_put(pb);
-        wq_wake(pipe_key(pb));      # 1.57.8: a closed write end may be the last — its blocked readers re-check (EOF)
+        # 1.57.8: a closed write end may be the last — its blocked readers re-check (EOF). 1.57.9 (PIPEW): msk ~1 wakes
+        # BOTH keys (pipe_key and pipe_wkey) — a closed READ end may be the last, and its blocked writers re-check (EPIPE).
+        wq_wake_m(pipe_key(pb), 0 - 2);
     }
     # 1.49.4 tear down the TCP conn. 1.57.7 (S5): only for its owner (or a kernel-owned conn) — a non-owner
     # closing its inherited copy of an owned conn is a no-op release, like pipes; the fd slot is cleared anyway.

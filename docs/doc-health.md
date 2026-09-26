@@ -6,7 +6,30 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-09-25 (**1.57.8 — blocking pipe/channel reads, the `#44`-only kick, driver DMA on the direct map, late completions settled, the KVM console fix; five issue files closed, six filed; see the 1.57.8 block**).
+> **Last refresh**: 2026-09-26 (**1.57.9 — a quiet `#44` + `sched_yield_to`#108, blocking pipe writes, AHCI recovery, CPU-only buffers and MSC on the direct map, the parallel sweep, the weighed-size tripwire; six issue files closed, three filed; see the 1.57.9 block**).
+>
+>
+> ### 1.57.9 (2026-09-26) — six issues + two operator asks; every step began with a prior-art note
+>
+> ✅ **`CHANGELOG.md` 1.57.9** — Breaking (`#44` quiet again; `write`#1 on a pipe blocks — EPIPE partial/−1, `PIPE_BUF` 512, the
+> agnsh pipeline consequence), Added (`#108`, the parallel sweep with measured 4,297 → 1,328 s, `AHCI_SELFTEST`, pipeline-smoke,
+> weighed-size-check.sh), Changed (the weighed gate as a tripwire at `0x220000`, AHCI budgets + recovery, direct-map buffers, the
+> MSC bounce), Fixed, Closeout (2,507,728 B; weighed 2,096,908 B; LOAD end `0x374270`), each with a one-line prior-art citation.
+>
+> ✅ **`state.md`** — Kernel head, on-disk row (new grant), carried-work bullet, open-issue bullet (three open, six archived), the
+> direct-map bullet (fb_shadow/ramdisk/VT-d/MSC done; AHCI PRDT open). Held at the 120-line cap.
+>
+> ✅ **`roadmap.md`** — section "After 1.57.9"; the six shipped rows removed; rows for AHCI PRDT, VT-d, the harness backlog and
+> the 256 MB `pmm_alloc_2mb_run` ceiling; the iron-burn row extended with 1.57.9's classes.
+>
+> ✅ **Issues** — six archived with rewritten Status headers and Resolution blocks (what shipped, the gate, the prior art, what it
+> broke). Filed: `2026-09-26-ahci-puts-the-caller-buffer-in-the-prdt`, `-vt-d-xhci-never-granted-and-iommu-never-booted`,
+> `-harness-backlog-after-1-57-9`. Sibling filings: agnoshi (pipeline read end, with the tested patch; poll+`#44` loops), kriya
+> (`k_write` bound), cyrius (`#108` peer).
+>
+> ✅ **Written by the steps:** `docs/architecture/ahci-command-recovery.md` (NEW), `blocking-waits.md` (pipe writes, `#108`, the
+> handoff), `dma-cpu-pointers.md` (status), ABI rows 1 / 5 / 44 / 108, `build.md` (`AHCI_SELFTEST`, the parallel sweep, the weighed
+> tripwire). Prior-art notes live in the operator's `handoff-1.57.9/steps/*-prior-art.md`.
 >
 > ### 1.57.8 (2026-09-25) — the five 2026-09-25 issues ship; the release pass adds no code (D24)
 >

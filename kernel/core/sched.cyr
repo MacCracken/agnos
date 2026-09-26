@@ -54,6 +54,35 @@ fn sched_idx_pickable(idx) {
     return 1;
 }
 
+# ⭐ 1.57.9 ENDFIX (end review YIELD-R1) — THE DIRECTED-YIELD HANDOFF: a per-CPU, one-shot "run this next" hint.
+# sched_yield_to#108(t) must run t NEXT when t is READY and this CPU may take it — the defining semantics of every
+# directed yield in its prior art: Linux yield_to_task_fair() -> set_next_buddy(cfs_rq, se) ("Tell the scheduler that
+# we'd really like se to run next"; pick_eevdf() returns cfs_rq->next first, "will affect latency but not fairness",
+# and clear_buddies() drops it once picked), Mach thread_switch()'s handoff, L4 ThreadSwitch(dest)'s donation. Until
+# this, #108's first sched_yield_kernel() took the ordinary round-robin pick and ignored t: with t and a busy third
+# process both READY here, "yield to t" ran whichever came first in slot order (ipcw yield-handoff, ~10 ms per round
+# at -smp 1). Slot = t + 1 (0 = no hint). WRITTEN only by sched_yield_kernel_to (the one context current on this CPU,
+# IF=0 — a syscall arm — around its own int 0xE0) and cleared by it after the switch returns; CONSUMED (cleared) on read
+# by sched_next under sched_lock. DEPARTURES (docs/architecture/blocking-waits.md "directed yield" (7)): no Linux
+# entity_eligible() test — round-robin has no lag to be eligible against; fairness to third processes is kept by the
+# timer tick, which never carries a hint — and no Mach-style migration (a t current or pinned elsewhere gets the kick).
+var pcpu_yield_to[4];
+# The hinted pid if it may run here NOW (READY, off every CPU, not this CPU's idle, sched_idx_pickable), else -1. The
+# hint is consumed either way. Raw loads (called first thing in sched_next, under sched_lock).
+fn sched_take_yield_to() {
+    var ty_c = pcpu_cpu();
+    if (ty_c >= 4) { return 0 - 1; }
+    var ty_t = load64(&pcpu_yield_to + ty_c * 8) - 1;
+    if (ty_t < 0) { return 0 - 1; }
+    store64(&pcpu_yield_to + ty_c * 8, 0);                         # one-shot (Linux clear_buddies on pick)
+    if (ty_t >= proc_count) { return 0 - 1; }
+    if (load64(&proc_table + ty_t * 176 + 8) != 1) { return 0 - 1; }
+    if (on_cpu_get(ty_t) != (0 - 1)) { return 0 - 1; }            # still being left by another CPU (INV-11)
+    if (ty_t == sched_idle_pid_get()) { return 0 - 1; }             # set_next_buddy skips idle entities too
+    if (sched_idx_pickable(ty_t) == 0) { return 0 - 1; }
+    return ty_t;
+}
+
 fn sched_next() {
     # 1.47.8 — single-pass round-robin (collapses the former two-pass idle-deprio scan, the
     # behavior-preserving cleanup flagged in the 1.44.22 audit). ONE scan from `start`: the FIRST
@@ -67,6 +96,9 @@ fn sched_next() {
     # ⭐ 1.57.7 (Path 2, S3.6) KEEP-CURRENT: when the scan finds only this CPU's idle READY, a current proc that is
     # still RUNNING (state 2) is returned itself and do_context_switch's new == old early-out keeps it — see the
     # branch below. So sched_next returns: a READY (state 1) non-idle pick, this CPU's idle, or `current` in state 2.
+    # ⭐ 1.57.9 ENDFIX YIELD-R1: a #108 handoff hint wins over the round-robin scan (sched_take_yield_to, above).
+    var yt_pick = sched_take_yield_to();
+    if (yt_pick >= 0) { return yt_pick; }
     var start = proc_current_get() + 1;
     var idle = sched_idle_pid_get();
     var idle_pick = 0 - 1;
@@ -791,11 +823,15 @@ fn sched_ready_for_me(me) {
 # scan, THEN sti;hlt. Scanning first and setting the flag after loses a kick: a waker that makes a proc READY between
 # the scan and the flag store reads kickable == 0 and sends nothing, and this CPU sleeps a full tick.
 # Returns 0 = found work without halting (the caller's trailing yield takes it); 1 = halted once.
-# hw_k = the cpu_kickable value this park publishes (proc.cyr): 2 = a #44 sched_yield park, which also sends the
-# directed kick (sched_kick_parker) and is its only target; 1 = every other park (#14 pause, in-kernel ksyscall(14)):
-# it sleeps a whole interrupt unless a WAKE makes work READY for it (sched_kick_for), and it never sends or draws a
-# directed kick (ENDFIX PIPE-R1).
-fn sched_halt_window(hw_k) {
+# hw_k = the cpu_kickable value this park publishes (proc.cyr): 2 = a yield park (#44 sched_yield, #108
+# sched_yield_to), the only kind a directed kick may target; 1 = every other park (#14 pause, in-kernel ksyscall(14)):
+# it sleeps a whole interrupt unless a WAKE makes work READY for it (sched_kick_for), and it never draws a directed
+# kick (ENDFIX PIPE-R1).
+# hw_t = the directed-yield TARGET pid (#108 sched_yield_to, 1.57.9), or -1 (#44, #14, every in-kernel park). Only a
+# park with a target sends a kick, and only toward that target's CPU (sched_kick_target). ⭐ 1.57.9: #44 sends NOTHING
+# (issue 2026-09-25-any-two-sched-yield-loops-kick-each-other; Linux do_sched_yield / FreeBSD sched_relinquish touch
+# only the local runqueue) — 1.57.8's undirected sched_kick_parker made any two #44 loops on two CPUs wake each other.
+fn sched_halt_window(hw_k, hw_t) {
     var hw_f = kbd_irq_save();                               # IF=0 (already 0 in a syscall; defensive)
     var hw_c = pcpu_cpu();
     var hw_me = proc_current_get();
@@ -806,7 +842,7 @@ fn sched_halt_window(hw_k) {
         kbd_irq_restore(hw_f);
         return 0;
     }
-    if (hw_k == 2) { sched_kick_parker(hw_c); }              # 1.57.8: the #44 directed kick (below) — AFTER our publish
+    if (hw_t >= 0) { sched_kick_target(hw_t, hw_c); }        # 1.57.9: #108 only — AFTER our publish + mfence + scan
     arch_sti_hlt();                                          # the preempt point: the tick may switch us out here
     asm { 0xFA; }                                            # cli — contract: no inputs/outputs; clears IF
     var hw_c2 = pcpu_cpu();                                  # R4: RE-READ — we may have resumed on another CPU
@@ -815,13 +851,37 @@ fn sched_halt_window(hw_k) {
     return 1;
 }
 
+# ⭐ 1.57.9 ENDFIX YIELD-R1 — sched_yield_kernel with a directed-yield HANDOFF hint: yt < 0 is exactly
+# sched_yield_kernel() (#44, #14, every in-kernel yield). yt >= 0 (#108's authorized target) publishes this CPU's
+# pcpu_yield_to slot right before the voluntary switch, so sched_next runs yt next when it is READY and pickable here
+# (see pcpu_yield_to above sched_next). The caller is a syscall arm with IF=0 (SFMASK), so no tick lands between the
+# store and sched_switch_vol's int 0xE0. Afterwards the slot of the CPU we are on NOW is cleared (R4: we may have
+# resumed elsewhere; the original CPU's sched_next consumed its copy): a switch REFUSED before sched_next ran (preempt
+# held, a borrowed CR3) must not leave a stale hint for a later tick. No other context can own a hint on this CPU while
+# we are current on it, so the clear never erases someone else's.
+fn sched_yield_kernel_to(yt) {
+    if (yt < 0) { return sched_yield_kernel(); }
+    var yk_c = pcpu_cpu();
+    if (yk_c < 4) { store64(&pcpu_yield_to + yk_c * 8, yt + 1); }
+    var yk_r = sched_yield_kernel();
+    var yk_c2 = pcpu_cpu();
+    if (yk_c2 < 4) { store64(&pcpu_yield_to + yk_c2 * 8, 0); }
+    return yk_r;
+}
+
 # 1 = switched to another READY process and back; 2 = parked (then offered the CPU once more);
-# 0 = refused (pre-scheduler / preempt-held / borrowed CR3): the caller keeps its legacy path. yh_k: sched_halt_window's.
-fn sched_yield_or_halt(yh_k) {
-    if (sched_yield_kernel() == 1) { return 1; }
+# 0 = refused (pre-scheduler / preempt-held / borrowed CR3): the caller keeps its legacy path. yh_k, yh_t:
+# sched_halt_window's (yh_t = -1 except #108's authorized target). ⭐ 1.57.9 ENDFIX YIELD-R1: both voluntary switches
+# carry yh_t as the HANDOFF hint (sched_yield_kernel_to), so a READY target this CPU may take runs NEXT — before
+# ENDFIX the first switch was the ordinary round-robin pick and "yield to t" ran whoever came first in slot order.
+# A switch to another READY process (1) sends no kick: the caller is not parking, and a READY target was either taken
+# here (the handoff) or already kicked by the wake that readied it.
+fn sched_yield_or_halt(yh_k, yh_t) {
+    if (sched_yield_kernel_to(yh_t) == 1) { return 1; }
     if (wq_can_block() == 0) { return 0; }
-    sched_halt_window(yh_k);
-    sched_yield_kernel();     # hand the CPU to whatever that interrupt (a wake, a kick) made READY — no tick wait
+    sched_halt_window(yh_k, yh_t);
+    sched_yield_kernel_to(yh_t);   # hand the CPU to whatever that interrupt (a wake, a kick) made READY — no tick wait;
+    # a target that became READY here runs first (the handoff)
     return 2;
 }
 
@@ -829,8 +889,50 @@ fn sched_yield_or_halt(yh_k) {
 # READY; with nothing else READY it parks the CPU for one hlt (≤ one interrupt period, NOT charged — cpu_in_halt) and
 # offers the CPU once more, so a poll+yield loop does not spin a core. A REFUSED caller (pre-scheduler, preempt-held —
 # never a ring-3 process after S3b-F2) keeps the old no-op. rdx/rsi/rdi/r8-r10 carry handler leftovers, as after
-# every syscall.
-fn sys_sched_yield_k() { sched_yield_or_halt(2); return 0; }
+# every syscall. ⭐ 1.57.9: a QUIET yield — it sends no cross-CPU kick (Linux do_sched_yield, FreeBSD
+# sched_relinquish, Win32 SwitchToThread: an undirected yield is a local runqueue decision). It still publishes
+# cpu_kickable = 2 for its park, so a peer's #108 sched_yield_to can find it, and wakes (sched_kick_for) reach it.
+fn sys_sched_yield_k() { sched_yield_or_halt(2, 0 - 1); return 0; }
+
+# ⭐ 1.57.9 — sched_yield_to#108 AUTHORITY (issue 2026-09-25-any-two-sched-yield-loops-kick-each-other). 1 = `t` may be
+# named by `me`: t is a live USER process (not pid 0/kmain, an idle or a kthread — proc_is_user; not dead/zombie (0),
+# claiming (3) or dying (4)) and it is an epoch-valid direct CHILD of me OR me's epoch-valid direct PARENT. Prior art
+# (docs/architecture/blocking-waits.md "directed yield"): a directed yield reaches only a trust group — Linux yield_to
+# the thread group, KVM the VM, Mach the task/port — and agnos's only trust group is the spawn edge. It DEPARTS from
+# kill#16's child-only rule (sig_auth_ok) by adding the parent direction: both sides of a spinning pair must name
+# each other, and every real pair is parent<->child. Safe because the effect is advisory — at worst a spurious wake of
+# a CPU the target itself parked "run me asap". No init override, no sibling or descendant reach.
+fn yt_auth_ok(me, t) {
+    if (t < 0) { return 0; }
+    if (t >= 16) { return 0; }
+    if (t >= proc_count) { return 0; }
+    if (proc_is_user(t) == 0) { return 0; }
+    var ya_st = load64(&proc_table + t * 176 + 8);
+    if (ya_st == 0) { return 0; }
+    if (ya_st == 3) { return 0; }
+    if (ya_st == 4) { return 0; }
+    if (proc_is_child_of(t, me) == 1) { return 1; }
+    if (proc_is_child_of(me, t) == 1) { return 1; }
+    return 0;
+}
+
+# sched_yield_to#108(pid) — a DIRECTED yield: the #44 yield-or-park with pid as the HANDOFF hint (1.57.9 ENDFIX YIELD-R1:
+# a READY pid this CPU may take runs NEXT, ahead of the round-robin pick — Linux yield_to/set_next_buddy, Mach
+# thread_switch), and when it parks, ONE 0xE1 kick toward the CPU where the named peer is parked in a yield
+# (sched_kick_target) — so two processes spinning on each other alternate
+# at IPI rate, and nobody else is woken. 0 = yielded (whether or not a kick went out: the kick is not reported — a
+# "boosted" bit would only leak scheduling state; sched_kicks, sysinfo#35 +200, counts them). Self = a plain #44, 0
+# (Mach thread_switch / L4 ThreadSwitch treat self like "no target"). -1 = refused (yt_auth_ok) — AFTER the same
+# quiet yield/park #44 does (a bad target degrades to a plain yield, as in Mach and L4): a `while (!flag)
+# sched_yield_to(peer)` loop whose peer died must not spin a core at 100%. An IN-KERNEL caller (not a user process:
+# ksyscall(108) from kmain / a kthread) gets -1 and nothing else, as ksyscall(44) does. me = the caller's pid.
+fn sys_sched_yield_to(me, t) {
+    if (proc_is_user(me) == 0) { return 0 - 1; }
+    if (t == me) { sched_yield_or_halt(2, 0 - 1); return 0; }
+    if (yt_auth_ok(me, t) == 0) { sched_yield_or_halt(2, 0 - 1); return 0 - 1; }
+    sched_yield_or_halt(2, t);
+    return 0;
+}
 
 # pause#14 as dispatched from syscall_handler (ring-3 SYSCALLs only). The KSTACK_SELFTEST probe hook runs first
 # (a no-op twin in production returns -1 = "not a probe"). Then the yield-or-park: cyrius _agnos_sock_recv_block's
@@ -841,7 +943,7 @@ fn sys_pause(a1, a2, a3) {
     var sp_r = kst_probe_hook(a1, a2, a3);
     if (sp_r != (0 - 1)) { return sp_r; }
     if (lifecycle_pending_self() == 1) { return 0; }     # 1.57.7 (S7): a kill / stop is pending — B1 acts now, not after a hlt
-    if (sched_yield_or_halt(1) != 0) { return 0; }       # 1: a pause park never sends or draws the directed kick
+    if (sched_yield_or_halt(1, 0 - 1) != 0) { return 0; }   # 1, -1: a pause park never sends or draws a directed kick
     return ksyscall(14, a1, a2, a3);
 }
 
@@ -975,37 +1077,43 @@ fn sched_kick_mask(m, from_tick) {
     return 0;
 }
 
-# ⭐ 1.57.8 — THE DIRECTED KICK (issue 2026-09-25-cross-cpu-poll-and-yield-loops-are-tick-bound). A parker's peer that
-# is RUNNING on another CPU is not READY here, so two poll+#44 loops on two CPUs used to park each other a whole tick
-# per round (yield_peer -smp 4: 9.9 ms). A #44 park now kicks ONE other CPU that is itself parked IN #44 —
-# cpu_kickable == 2 (an idle step or a #14 park publishes 1) — so that yielder re-runs its poll. Sent after this CPU
-# published its own cpu_kickable = 2 + mfence, so the woken yielder's next park sees THIS CPU and kicks back: two #44
-# yielders on two CPUs trade one IPI per round instead of a tick. ⚠ THE SCOPE (ENDFIX PIPE-R1): the kernel cannot tell
-# a yielder waiting for its peer from one waiting for anything else, so ANY two #44 yielders on two CPUs ping-pong at
-# IPI rate for as long as both yield — #44 is sched_yield, "run me again as soon as possible", a spin by contract.
-# #14 pause is NOT: it neither sends nor draws this kick (until 1.57.8's end review it did both, so crab's #14 idle
-# beside a cyrius sock_recv #14 backoff — or agnsh's #44 bg poll beside it — woke each other at ~10 kHz forever, and
-# _agnos_sock_recv_block's 6000-pause backstop, sized for 10 ms pauses, expired in under a second). A #44 park beside
-# a BUSY process (never parks), a BLOCKED one (not current anywhere) or a #14 pauser sends nothing: agnsh's prompt poll
-# beside a busy job still halts a whole interrupt (waitx P2c). The cure for a pair that polls each other is a blocking
-# read (rd5_wait). EOI-only target (resched_kick_handler).
-fn sched_kick_parker(kp_me) {
+# ⭐ 1.57.9 — THE DIRECTED KICK, NOW TARGETED (issue 2026-09-25-any-two-sched-yield-loops-kick-each-other, OPERATOR
+# RULING 2026-09-25 option 1). History: 1.57.8 gave every #44 park an UNDIRECTED kick (sched_kick_parker: one 0xE1 to
+# the first other CPU parked in #44), so a pair spinning on each other stopped paying a tick per round — and ANY two
+# #44 loops on two CPUs, related or not, woke each other ~10k times a second for as long as both yielded. Only the
+# caller knows whom it waits for, so #108 sched_yield_to(t) names it and #44 is quiet again.
+# Prior art (Linux yield_to → resched_curr(p_rq)): one signal, ONLY to the target's own CPU, and only when that CPU
+# can act on it. agnos's states: t READY but only pickable elsewhere (pinned) → sched_kick_for(t) (Linux's
+# resched_curr case; a READY t this CPU could take was taken by the caller's own yield — the ENDFIX handoff hint makes
+# that switch pick t itself — or found by its scan, and never reaches here);
+# t CURRENT on another CPU that is parked in a YIELD (cpu_kickable == 2 and pcpu_curproc == t; cpu_in_halt, the
+# accounting flag, is not read — proc.cyr) → one
+# 0xE1 so its park ends and it re-runs its poll (an agnos addition: Linux has no "current but halted"); t busy on
+# another CPU, BLOCKED, STOPPED, or parked in #14 (cpu_kickable 1 — PIPE-R1 holds) → nothing, the caller just parks.
+# Sent after the caller published its own cpu_kickable = 2 + mfence + scan (sched_halt_window), so the woken peer's
+# next #108 sees the caller's CPU and kicks back: the pair trades one IPI per round. No KVM-style dy_eligible damper:
+# KVM guesses its target; here both sides asked by name — a #108 pair costs ~10k IPIs/s BY REQUEST.
+# Races are benign: every read is lock-free; a stale answer is a spurious wake (the target's park is "run me asap")
+# or a missed kick (≤ 1 tick, today's fallback). Takes no lock (runs after sched_lock is released, IF=0). EOI-only
+# target (resched_kick_handler). t is bounds-checked against the 16-slot table; kt_me is the caller's CPU.
+fn sched_kick_target(t, kt_me) {
     if (cpu_count < 2) { return 0; }
     if (apic_enabled == 0) { return 0; }
-    var kp_mask = cpu_online_mask();
-    var kp_k = 1;
-    while (kp_k < 4) {
-        var kp_t = (kp_me + kp_k) & 3;
-        if (((kp_mask >> kp_t) & 1) == 1) {
-            if (load64(&cpu_kickable + kp_t * 8) == 2) {
-                apic_send_ipi_one(kp_t, RESCHED_KICK_VECTOR);
-                sched_kicks = sched_kicks + 1;
-                return 1;
-            }
-        }
-        kp_k = kp_k + 1;
-    }
-    return 0;
+    if (t < 0) { return 0; }
+    if (t >= 16) { return 0; }
+    var kt_st = load64(&proc_table + t * 176 + 8);
+    if (kt_st == 1) { sched_kick_for(t, 0); return 1; }
+    if (kt_st != 2) { return 0; }
+    var kt_c = on_cpu_get(t);
+    if (kt_c < 0) { return 0; }
+    if (kt_c >= 4) { return 0; }
+    if (kt_c == kt_me) { return 0; }
+    if (((cpu_online_mask() >> kt_c) & 1) == 0) { return 0; }
+    if (load64(&pcpu_curproc + kt_c * 8) != t) { return 0; }
+    if (load64(&cpu_kickable + kt_c * 8) != 2) { return 0; }       # a YIELD park (never #14 = 1, never busy = 0)
+    apic_send_ipi_one(kt_c, RESCHED_KICK_VECTOR);
+    sched_kicks = sched_kicks + 1;
+    return 1;
 }
 
 # ═══════════════ 1.57.6 (Path 2, S3.1) — THE SWITCH TAIL: old stays fenced until this CPU is off it ═══════════════

@@ -73,13 +73,14 @@ second copy to the production path; there is no reason to.
 
 `kfont_init` takes one `pmm_alloc_2mb_run(1)` region — the `fb_shadow_init` precedent in
 `arch/x86_64/fb_console.cyr`: allocated once, never freed (`pmm_alloc_2mb_run` has no free twin), from
-the top of the ≤ 256 MB window down (the 1.57.2 boot landed at phys `0xEC00000`, region 118). The face
+the top of the ≤ 256 MB window down (the 1.57.2 boot landed at phys `0xEC00000`, region 118; since 1.57.9
+kfont_init allocates BEFORE fb_shadow_init, so it takes the topmost free region and the shadow sits below it). The face
 uses 20 % of it. On a verify failure the region **stays allocated** and `kfont_phys` keeps the address
 so a later dump can look at what went wrong; a 2 MB hole is a smaller cost than a second allocator
 path exercised only by a compiler defect.
 
 ⭐ **The region is filled and served through its DIRECT-MAP alias** (`pmm_kva_for_access(phys)` =
-`DIRECTMAP_BASE 0x200000000 + phys`), **not the identity VA** that `fb_shadow` uses. The reason is
+`DIRECTMAP_BASE 0x200000000 + phys`), **not the identity VA** that `fb_shadow` used until 1.57.9. The reason is
 where `vfs_read` runs: its `VFS_MEMFILE` arm does `memcpy(buf, data + pos, count)` **under the
 caller's CR3**, and in a per-process address space the low identity window is the *user image*, not
 the kernel's view of physical memory. Every per-process PML4 mirrors kernel PDPT[8..] (the direct map),
@@ -93,8 +94,9 @@ design slotted `kfont_init` "right after `fb_shadow_init()`", and the first boot
 `0xbb32949696578ce6` *in place* while the buffer at `0x20EC00000` read back **all zeros**. At that
 point the direct map is *installed* in the kernel PDPT but the CPU is still on gnoboot's boot CR3,
 whose PDPT[8] maps an unrelated identity GB — so every store landed nowhere at `-m 512M` and would
-land in someone else's RAM on a big box. `fb_shadow` gets away with the early slot because it uses the
-identity VA. `kfont_init` therefore runs **after** the switch, next to `pmm_bitmap_use_directmap`, and
+land in someone else's RAM on a big box. (`fb_shadow` "got away with" the early slot only because it used the
+identity VA — which was itself the bug: 1.57.9 moved it onto the direct map and to after the switch too,
+[`dma-cpu-pointers.md`](dma-cpu-pointers.md).) `kfont_init` therefore runs **after** the switch, next to `pmm_bitmap_use_directmap`, and
 **inside `#ifndef BOOTCR3_KEEP_GNOBOOT_CR3`**: a keep-gnoboot build never has the direct map in its boot
 context and simply gets no face (no line printed, `/fonts` answers -1). Do not move it back.
 
@@ -214,6 +216,13 @@ cat'd in** (`fn rekha_face_default_len() { return N; }`, fail-closed to 0 if unr
 under the grant is kernel code + tables + kashi — what the grant was measured against (kashi was already
 inside it). Weighed figure at 1.57.2: **2,008,076 B**, the same ~89 KB headroom the tree had before the
 face. The two subtractions must move together, like the ceiling itself. check.sh is 34 gates now.
+⭐ **1.57.9 (SIZEGATE): the grant was then re-derived, not raised by feel.** The subtraction and the number
+now live once, in `scripts/check/weighed-size-check.sh` (both rows call it): `GRANT = 0x220000` = 2,228,224 B,
+placed 17,252 B above the weighed size at which the plain image reaches the image-layout wall (LOAD end
+`0x390000`; 2,210,972 B at 1.57.8), so the layout gate, the real limit, binds first. The helper recomputes that
+wall live and FAILs if it ever reaches the grant. **This is face-sensitive**: a smaller face raises the wall
+(at today's grant, any face of 393,568 B or less), which the helper reports as an ordering FAIL instead of letting the
+size row fire before the layout gate. Arithmetic: `docs/development/build.md` *Weighed-size tripwire*.
 
 ## Invariant 6 — how the bytes reach the kernel: the kashi mechanism, mirrored line for line
 
@@ -267,7 +276,7 @@ the OFL permits bundling with GPL-3.0 software and does not permit dropping the 
 | `scripts/smoke/kfont-smoke.sh` + `tests/kfont/kfont.cyr` — **exit 95** | a real ring-3 process, exec'd from disk, opens by name, reads all 410,820 bytes, **hashes them** (the oracle), parses the sfnt header, probes each refused flag bit, both non-names, `stat`#33 and `lstat`#102 field-for-field, the alias; a `run: exit 128+vector` arm catches a fault-killed exerciser | `scripts/sweep.sh` row "1.57.2 kernel-embedded face"; six mutants recorded in the smoke header |
 | `scripts/check/image-layout-check.sh` — check.sh gate 34 *"kernel image vs BSP boot stack (LOAD end <= 0x390000)"*; `scripts/build.sh` after every x86_64 build (1.57.7; fatal for flag builds) and CI | `LOAD` end ≤ `0x390000` (`0x370000` until 1.57.7) — the image stays under the BSP boot stack, the only region-1 neighbour left (1.57.3; the 1.57.2 chunk-decode / single-reader branch is gone); the three shim immediates and the image's `mov rsp` equal the gate's `BSP_BOOT_TOP` (1.57.7) | mutation-tested (1.57.3: `p_memsz` past the bound; 1.57.7: M1 plain pad, M2 flag pad (re-run on the shipped guard at IMG-fix), M3 each immediate, A4 an RSP0 site — script header); prints the headroom |
 | `scripts/smoke/ap-stack-smoke.sh` + `SMP_STACK_SELFTEST` — **-smp 4** | each AP's live RSP in the region-7 direct-map window, each AP's TSS.RSP0 equal to the trampoline's top, the rekha chunk literals hash-intact **in place** after the wake, `smp: cpus online: 4`, kybernet | `scripts/sweep.sh` row "1.57.3 AP stacks in region 7"; two mutants in the smoke header (1.57.2 placement; `gdt.cyr`-only revert) |
-| `binary size` / `x86 size reasonable` | kernel-minus-face under the unchanged 2 MiB grant | check.sh / test.sh, lockstep |
+| `binary size` / `x86 size reasonable` | kernel-minus-face under the grant (2 MiB until 1.57.8; `0x220000` from 1.57.9, derived to sit above the layout wall, which the helper re-checks live) | check.sh / test.sh, both via `scripts/check/weighed-size-check.sh` |
 
 **Not changed, and checked before the crab issue was archived:** `vfs.cyr` (`vfs_mount_init`,
 `FsBackend`), `tests/mountlist/mlist.cyr` and `scripts/harness/mountlist-test.py` are byte-unchanged;

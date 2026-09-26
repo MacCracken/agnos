@@ -20,6 +20,101 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.9] — 2026-09-26 — a quiet `sched_yield` and a directed one, pipe writes that block, AHCI that recovers, and a sweep that runs in parallel
+
+The six 2026-09-25 issues, plus two operator asks: run the local sweep in parallel, and treat the weighed-size gate as a
+tripwire, not a hard limit. Eight steps: YIELD, PIPEW, AHCI, CPUVA, MSCBUF, SMOKES3, PSWEEP and SIZEGATE, plus the end-review
+fixes (ENDFIX). Every step started from a prior-art note (vidya + other kernels). One syscall number minted (`#108`). Six issue
+files closed. **Built, gated, NOT burned.**
+
+### Breaking (migration inline)
+
+- **`sched_yield`#44 no longer wakes another CPU** (YIELD; operator ruling 2026-09-25). 1.57.8's undirected kick — sent to
+  whichever other CPU was parked in `#44` — is withdrawn: it made any two `#44` loops on two CPUs wake each other ~10,000 times
+  a second. `#44` is a quiet, local yield again, as Linux `sched_yield` and FreeBSD `sched_relinquish` are. *Migration:* a pair
+  that spins on EACH OTHER names its peer with `sched_yield_to`#108; anything that waits for another process uses `read`#5 with
+  a4 = 0 (blocking since 1.57.8) or `waitpid` `WAIT_BLOCK` (`0x100 | pid`, since 1.57.7). A `#44` poll loop beside a peer running
+  on another CPU costs up to one timer tick per round again. agnoshi's two such loops are filed there.
+- **`write`#1 on a pipe now BLOCKS when `a4 == 0`** (PIPEW). A write that does not fit waits until a reader makes room and returns
+  `len`. With no read end open anywhere it returns **the partial count** if some bytes were taken, else **`−1`**; there is no
+  SIGPIPE (agnos has default actions for 9/18/19 only). **`PIPE_BUF` = 512**: a write of ≤ 512 bytes lands whole, never
+  interleaved with another writer's. **`a4 != 0` is O_NONBLOCK** and keeps the short write. A SIGKILL ends a blocked writer (wait
+  status 265); a STOP parks it inside the wait. *Migration:* pass a4 explicitly (a 3-argument `syscall(1, …)` passes whatever
+  `r10` holds); a producer must act on `−1`/a short count itself; a shell must close every pipe end it does not use. agnsh keeps
+  its read end while it reaps a pipeline, so `grep . file | echo x` now never returns to the prompt — filed in agnoshi with a tested
+  patch (`docs/development/issue/2026-09-26-pipeline-keeps-read-end-and-hangs.md` there). ABI row 1.
+
+### Added
+
+- **`sched_yield_to`#108** (`pid`) → `0` / `−1` (YIELD, ENDFIX YIELD-R1). The `#44` yield-or-park, except that `pid`, when READY
+  on the caller's CPU, is the process switched to (a one-shot per-CPU next-pick hint, as Linux `yield_to` → `set_next_buddy`),
+  and a park sends ONE reschedule IPI (`0xE1`) toward the CPU where `pid` is parked in a yield — nobody else is woken. Authority:
+  self (a plain `#44`), an epoch-valid direct child, or the epoch-valid direct parent. `−1` for anything else, returned after the
+  same yield/park. Kicks are counted at `sysinfo`#35 +200. Probe: `#108(getpid())` is `0` from 1.57.9, `−1` before. ABI row 108.
+  Measured at `-smp 4`: two processes yielding to each other 0.13 ms per round (9.9 ms with `#44`); `yield-handoff` 148 µs; two
+  UNRELATED `#44` loops for 300 ms send 0 kicks (4,679 with the old kick restored).
+- **The parallel sweep** (PSWEEP, ENDFIX PSWEEP-R1). `sh scripts/sweep.sh` spreads its rows over `SWEEP_JOBS` (default **4**)
+  worker copies of the current tree (uncommitted changes included, each with its own `build/`). Rows that share a resource are
+  pinned to one worker; `tsc` and `kvm-net-boot` run alone after the parallel phase (`SWEEP_EXCLUSIVE=0` pools them). Output comes
+  back in row order in the old summary format. A row that fails in parallel is re-run once, serially, in the main tree and
+  reported "passed on serial retry" — never silently. Workers die with their controller (a per-run queue plus a lifeline) and
+  their copies are removed. `SWEEP_JOBS=1` is the old serial sweep, byte-identical. `SWEEP_ONLY`, `SWEEP_ROW_TIMEOUT` (1500 s).
+  Measured on this box: **4,297 s serial → 1,328 s parallel (3.2×)**; `fg-smoke` (~830 s) now bounds the wall-clock.
+  `scripts/check/sweep-orphan-test.sh` (no QEMU) proves the orphan handling. Prior art: GNU make `-j -O`, GNU parallel
+  `--keep-order`, pytest-xdist `loadgroup`, pytest-rerunfailures, Bazel `exclusive`, LAVA/KernelCI per-job workdirs.
+- **`AHCI_SELFTEST`** + `scripts/smoke/ahci-late-smoke.sh` (stamp / reuse / shift / tfes / lost, `-smp 1` and `-smp 4`);
+  **`pipeline-smoke.sh`** (real agnsh, an early-exiting consumer); `ipc-wait-smoke` gains the pipe-write, yield-pair and
+  yield-handoff phases; `dma-shadow-smoke` builds with `RAMDISK_ENABLE=1` and covers fb_shadow / ramdisk / iommu; `msc-cdb-smoke`
+  gains a caller buffer outside the identity window. New sweep rows: `ahci-late`, `pipeline`.
+- `scripts/check/weighed-size-check.sh` — the one home of the weighed-size rule, called by `check.sh` and `test.sh`.
+
+### Changed
+
+- **The weighed-size gate is a tripwire** (SIZEGATE, operator ruling "not a hard limit"). The grant is derived from the real hard
+  limit: **`0x220000` = 2,228,224 B**, 17,252 B above the weighed size (2,210,972 B) at which the plain image's LOAD end reaches
+  `0x390000`. Gate 34 (image layout) therefore always fails first on growth; the weighed row reports it. Prior art: Linux
+  `vmlinux.lds.S` `ASSERT`s (hard) vs `bloat-o-meter` (reported).
+- **AHCI command polls have a wall-time budget and a recovery** (AHCI): 5 s for R/W and IDENTIFY, 30 s for FLUSH, a spin backstop
+  before the TSC is calibrated. A timeout or error (`PxIS` TFES/HBFS/HBDS/IFS; the stale `PxTFD.ERR` is no longer trusted) runs
+  AHCI 1.3.1 §6.2.2.1 recovery (`ahci_port_recover`: stop, COMRESET, restart) before the issue path returns, under the same
+  `ahci_lock`; a port that does not recover goes offline. `nvme_admin_poll` takes `nvme_io_poll_n`'s shape (5 s budget, consume by
+  CID, discard strays; a timeout disables the controller). Prior art: Linux libata EH, FreeBSD `ahci(4)`.
+  `docs/architecture/ahci-command-recovery.md`.
+- **fb_console's shadow, the ramdisk and `iommu.cyr`'s tables are reached through the direct map** (CPUVA): each holds a stored
+  `dma_kva` pointer; the physical address stays only in hardware registers and PTEs. `fb_shadow_init` moved after
+  `cr3_load(0x1000)` + `pmm_bitmap_use_directmap`. The ramdisk's pointer array shrank from 8 KB to 1 KB. Prior art: Linux
+  `phys_to_virt` / `page_address`, FreeBSD `PHYS_TO_DMAP`.
+- **MSC bounces the caller's buffer** (MSCBUF): `msc_blk_read` / `_write` / `_read_sectors` use a driver-owned, iommu-registered
+  pmm page (`msc_ensure_data_buf`); the caller's pointer never reaches a TRB. One READ(10) per 4 KB (was up to 65,024 B per
+  command). Prior art: Linux DMA API + swiotlb, FreeBSD `busdma` bounce pages.
+
+### Fixed
+
+- AHCI abandoned a timed-out command whose slot, CT and bounce page were then reused while the HBA could still DMA into them.
+- fb_shadow, the ramdisk and the VT-d tables were written through identity VAs that a ring-3 PT_LOAD can shadow.
+- MSC put the caller's buffer pointer in a bulk data TRB.
+- `blk-write-smoke` and `ext2-smoke` scored a firmware VOID as FAIL; ext2's arm 1 used a recipe OVMF cannot boot; `msc-short-smoke`
+  never ran `-smp 4`. Eight comments pointed at archived issue files.
+
+### Closeout
+
+- `build/agnos` **2,507,728 B** (+4,456 B over 1.57.8's 2,503,272 B). Weighed **2,096,908 B** against the new 2,228,224 B grant
+  (131,316 B headroom). LOAD end **`0x374270`**, 114,064 B under gate 34's `0x390000`.
+- **Gates on the final tree:** `check.sh` **34/35** (sole FAIL = the by-design `syscall ABI` gate: `#106`/`#107`/`#108` absent from cyrius) · `test.sh` (x86) **4/4** · `ktest` **367/370** (the 3 known `[initrd]` checks) · `agnsh-smoke` PASS at `-smp 1` and `-smp 4` · aarch64 32 fns / 17 vars, no new name · `sweep.sh` (PARALLEL, 4 workers) **57/59**: the two reds are row 1 (`baseline check.sh`, the same by-design ABI gate) and row 45 `pipeline-smoke` (the agnoshi read-end bug, filed there — a known sibling red, not a kernel failure); the sweep's serial retry of those two known reds was stopped. Parallel phase ~36 min on this run (`pipeline-smoke` alone 957 s of prompt timeouts; `fg-smoke` 822 s).
+- **ABI gate red BY DESIGN:** `#106`, `#107`, `#108` are absent from cyrius (kernel 108 · abi-doc 108 · cyrius 105). Filed with
+  cyrius as `docs/development/issues/2026-09-26-agnos-sched-yield-to-108-and-pipe-write-blocking-peer.md` (there).
+- aarch64: 32 undefined functions / 17 variables, no new name.
+- **Issues:** six closed and archived (any-two-sched-yield-loops, pipe-writes-do-not-block, ahci-timeout, cpu-only-pmm-buffers,
+  msc-caller-buffer, three-smokes). Filed here: `2026-09-26-ahci-puts-the-caller-buffer-in-the-prdt`,
+  `2026-09-26-vt-d-xhci-never-granted-and-iommu-never-booted`, `2026-09-26-harness-backlog-after-1-57-9`. Filed in siblings:
+  agnoshi `2026-09-26-pipeline-keeps-read-end-and-hangs` (tested patch) and `2026-09-26-poll-and-yield-loops-should-block`; kriya
+  `2026-09-26-k-write-stall-bound-is-200-seconds-on-agnos`.
+- **Built, gated, NOT burned.** Iron-only risk classes QEMU cannot show: AHCI port recovery (stop / COMRESET / HBA reset) on a
+  real HBA; the MSC bounce page on the Cezanne xHC; the `#108` `0xE1` kick on a Zen LAPIC; fb_shadow and VT-d table writes through
+  the direct map (VT-d is off on every QEMU boot). The Path 2 burn owed since 1.57.6 is still owed; an iron burn is the operator's
+  call.
+
+
 ## [1.57.8] — 2026-09-25 — pipe and channel reads block, driver DMA structures move to the direct map, and a late completion can no longer shift a queue
 
 The five 2026-09-25 issues. The work ran in six steps: PIPE (with its end-review fix, ENDFIX), NVME, DMA1, XHCI,

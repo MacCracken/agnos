@@ -447,6 +447,8 @@ check "version in changelog" $rc
 # #92 descriptor validation layer, and the plan-S3 coherence harness — note DCE is
 # OFF by default here, so every *_test fn ships whether or not its #ifdef is set.
 # Matches scripts/test.sh (bumped in lockstep).
+# ⭐ SUPERSEDED 1.57.9: the reactive raise-by-arc history above ends here. The grant is now derived from
+# the image-layout wall (gate 34) in scripts/check/weighed-size-check.sh, shared with scripts/test.sh.
 echo ""
 echo "--- Binary ---"
 # ⚠ VACUITY FLOOR, 2026-09-02. THIS GATE MEASURED WHATEVER FILE HAPPENED TO BE ON DISK, AND NOTHING
@@ -477,36 +479,35 @@ else
     [ "$ARITY_BUILD_RC" = "0" ] \
         || SZWHY="the build that writes build/agnos exited $ARITY_BUILD_RC above, and build.sh does not remove the old x86_64 artifact first — this $SZ-byte file is a fossil from an earlier run, not this run's output"
 fi
-# ⚠ 2 MB, RAISED 2026-07-26 AS DELIBERATE TEMPORARY HEADROOM — NOT a derived bound.
-# Every raise above was reactive: an arc closed a few hundred bytes over the line and the ceiling
-# moved just past it. That pattern makes the gate a rubber stamp — it can only ever fire once per
-# arc, at which point it is raised. The attribute-interpolation rung landed at 1,791,168 B (under
-# 9 KB of the old 1.8M), and the next rung adds another shader blob, so it would have tripped again
-# within the same release for the same non-reason.
-# ⛔ THIS IS A GRANT, NOT A MEASUREMENT, AND IT EXPIRES. The bound that would actually be worth
-# gating is "growth attributable to something other than new subsystems" — a runaway-bloat detector
-# rather than a high-water mark chased upward. Re-derive it before the 3D arc closes; do not simply
-# move it again.
-# ⭐ 1.57.2 (2026-09-13): THE CEILING DID NOT MOVE — THE EMBEDDED FACE IS TAKEN OUT OF THE WEIGHING.
-# The kernel-embedded default TrueType face (core/kfont.cyr) carries rekha's Liberation Sans Regular
-# VERBATIM as 410,820 bytes of .rodata string literals; build/agnos went 1,997,536 -> 2,418,896 B and
-# the 2 MiB grant above went red in BOTH copies of this gate (here and scripts/test.sh) and therefore
-# in CI. Raising the number to ~2.5 M would have been exactly the reactive move the comment forbids.
-# Instead the gate weighs SZ minus the face's byte length — read live from the SAME face module the
-# build cat'd in (its `fn rekha_face_default_len() { return N; }`), never a constant here — so the
-# figure under the ceiling is kernel code + tables + kashi, i.e. what the 2 MiB grant was measured
-# against (kashi was already inside it; subtracting kashi too would be a hidden raise). At 1.57.2
-# the weighed figure is 2,008,076 B: 89 KB under, the same headroom the tree had before the face.
-# ⚠ Fail-closed: if the face module cannot be read, FACE=0, the raw 2.4 MB is weighed, and the gate
-# goes red rather than quietly measuring less. scripts/test.sh:x86 size carries the identical
-# subtraction and the two MUST move together, exactly as the ceiling number itself must.
+# ⭐⭐ 1.57.9 (SIZEGATE) — THE GRANT IS RE-DERIVED FROM THE LAYOUT WALL, AND IT LIVES IN ONE PLACE NOW:
+# scripts/check/weighed-size-check.sh (read its header for the arithmetic and the prior art). Operator
+# ruling: this row "is NOT A HARD LIMIT — it can be expanded"; the hard limit is gate 34 below (LOAD end
+# <= 0x390000). History of what it replaced: 2 MiB (2,097,152) raised 2026-07-26 as "deliberate
+# temporary headroom — a grant, not a measurement, and it expires"; at 1.57.2 the embedded face was
+# weighed out rather than raised over (SZK = SZ - rekha_face_default_len(), read live from the face
+# module the build cat'd in). At 1.57.8 that grant sat 4,700 B above the weighed image while gate 34 still
+# had 118,520 B — the taste number bound first. GRANT is now 0x220000 = 2,228,224 B, 17,252 B ABOVE the
+# weighed size at which the plain image hits the wall (2,210,972 B), so gate 34 fires first by
+# construction, and the helper FAILS this row if a live re-derivation of that wall (CEIL parsed from
+# image-layout-check.sh, zero-fill and trailer from the ELF, FACE from rekha) ever reaches the grant —
+# the inversion cannot return silently. ⛔ 1.57.9 ENDFIX SG-1: for GROWTH this row is therefore REPORT-ONLY —
+# with GRANT > WALL, a weight at the grant is already past the wall, so gate 34 goes red first, always; the
+# row enforces the readable face, the floor and the ORDERING re-derivation, and prints headroom + wall (the
+# bloat-o-meter line). Early toolchain-bloat detection would need a stored per-change delta (Chromium);
+# not in 1.57.x. The helper fails closed on an unreadable face. The fossil guard
+# (SZWHY/ARITY_BUILD_RC) stays HERE: the helper weighs whatever image it is handed.
+# scripts/test.sh "x86 size reasonable" calls the same helper — no second copy of the number.
 REKHA_DIR="${REKHA_DIR:-$ROOT/../rekha}"
-FACE=$(sed -n 's/^fn rekha_face_default_len() { return \([0-9][0-9]*\); }.*/\1/p' "$REKHA_DIR/fonts/face_data.cyr" 2>/dev/null | head -1)
-[ -n "$FACE" ] || { FACE=0; [ -n "$SZWHY" ] || SZWHY="could not read rekha_face_default_len() from $REKHA_DIR/fonts/face_data.cyr — weighing the raw size, face included"; }
-SZK=$((SZ - FACE))
-[ -z "$SZWHY" ] && test "$SZK" -gt 50000 && test "$SZK" -lt 2097152 && rc=0 || rc=$?
-check "binary size ($SZ bytes; $SZK weighed = size minus the $FACE-byte embedded face)" $rc
+SZOUT="not weighed, see VACUOUS"
+if [ -z "$SZWHY" ]; then
+    SZOUT=$(REKHA_DIR="$REKHA_DIR" sh "$ROOT/scripts/check/weighed-size-check.sh" "$ROOT/build/agnos" 2>&1) && rc=0 || rc=$?
+else
+    rc=1
+fi
+check "binary size (weighed-size tripwire: ${SZOUT%%
+*})" $rc
 [ -z "$SZWHY" ] || echo "    VACUOUS: $SZWHY"
+[ "$rc" = "0" ] || [ -n "$SZWHY" ] || echo "$SZOUT" | sed -n '2,$s/^/    /p'
 
 # 1.57.2 -> 1.57.3 — the kernel image vs the BSP boot stack (scripts/check/image-layout-check.sh).
 # The 1.57.2 face's +410 KB of .rodata carried the LOAD end from ~0x2FA2xx to 0x35E770, across the

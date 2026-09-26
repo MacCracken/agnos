@@ -35,6 +35,14 @@
 # own 3-try loop that exited 1 on VOID (~34% all-VOID arms at the measured ~30% hand-off rate, vs ~12% at
 # 6). Exit: 1 on any FAIL; else 2 if an arm was VOID; else 0. sweep.sh still scores exit 2 as FAIL, by
 # design (sweep.sh run_gate: a VOID must not hide a real failure there).
+#
+# ⚠ 1.57.9 (SMOKES3 — issue archived/2026-09-25-three-smokes-score-void-as-fail-or-skip-smp4.md) — BOTH ARMS
+# RUN AT EACH OF ${MSC_SHORT_SMP:-1 4} (GATED: the -smp 4 half scores like the -smp 1 half), with smoke_accel
+# (-smp 1: `-cpu max` TCG, as before; -smp 4: KVM when /dev/kvm is writable, else MT-TCG — the `accel:` line
+# says which), and every variant asserts `smp: cpus online: N` (msc-cdb measured a forced-1-CPU -smp 4 run
+# scoring all-PASS without it). Each SMP value prints its own verdict. ⚠ The LBA-0 READ(10) runs on the BSP
+# before smp_start_aps, so -smp 4 proves the MSC path under a 4-CPU topology and boot path, NOT concurrent
+# MSC I/O (the msc-cdb caveat). QEMU_DWELL_VOID ends a failed hand-off at once instead of dwelling the budget.
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT" || exit 1
@@ -55,19 +63,20 @@ for t in qemu-system-x86_64 parted mformat mmd mcopy strings; do
 done
 LOGS="$ROOT/build/msc-short-logs"; rm -rf "$LOGS"; mkdir -p "$LOGS"
 
-rc=0; void=0
+rc=0; void=0; nfail=0
 ok()  { echo "  PASS: $1"; }
-bad() { echo "  FAIL: $1"; rc=1; }
+bad() { echo "  FAIL: $1"; rc=1; nfail=$((nfail+1)); }
 want() { if strings "$LOG" | grep -qF -- "$1"; then ok "$2"; else bad "$2 (missing: $1)"; fi; }
 klines() { strings "$1" | tr -d '\r' | sed -E 's/^\[ *[0-9]+\.[0-9]+\] //'; }   # strip the klog prefix
 wantkre() { if klines "$LOG" | grep -qxE -- "$1"; then ok "$2"; else bad "$2 (no kernel line that is exactly: $1)"; fi; }
+wantk() { if klines "$LOG" | grep -qxF -- "$1"; then ok "$2"; else bad "$2 (no kernel line that is exactly: $1)"; fi; }
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT INT TERM
 die() { echo "ERROR: $1 — a harness fault, not the kernel; this gate measured NOTHING"; exit 1; }
 deny() { if strings "$LOG" | grep -qE -- "$1"; then bad "$2"; strings "$LOG" | grep -E -- "$1" | head -5 | sed 's/^/        /'; else ok "$2"; fi; }
 
 # One arm: the image and the stick are built ONCE (outside the retry); qemu_dwell_kernel refreshes
 # vars.fd on every attempt and retries only while the kernel banner is absent.
-boot_arm() {    # $1 = log path, $2 = label, $3 = kernel copy; sets LOG; returns 1 on VOID
+boot_arm() {    # $1 = log path, $2 = label, $3 = kernel copy, $4 = -smp; sets LOG; returns 1 on VOID
     LOG="$1"
     W="$WORK/$2"; mkdir -p "$W"
     IMG="$W/d.img"; USB="$W/usb.img"
@@ -87,8 +96,12 @@ boot_arm() {    # $1 = log path, $2 = label, $3 = kernel copy; sets LOG; returns
     # removed from msc_build_rw10_cdb — the zero assertion stayed green). "MSCLBA0!" = 77 83 67 76 66 65 48 33.
     printf 'MSCLBA0!' | dd of="$USB" bs=1 conv=notrunc status=none                   || die "[$2] stick: seeding LBA 0 failed"
     [ "$(head -c 8 "$USB")" = "MSCLBA0!" ] || die "[$2] stick: LBA 0 does not read back as the MSCLBA0! seed"
-    qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-60}" "$W/vars.fd" "$OVMF_VARS" \
-        qemu-system-x86_64 -machine q35 -m 512M -cpu max \
+    ACC=$(smoke_accel "$4")
+    echo "  accel: $ACC -smp $4"
+    # shellcheck disable=SC2086
+    QEMU_DWELL_VOID="${QEMU_DWELL_VOID:-gnoboot: fail @|BootManagerMenuApp|Please select boot device}" \
+    qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-90}" "$W/vars.fd" "$OVMF_VARS" \
+        qemu-system-x86_64 -machine q35 -m 512M $ACC -smp "$4" \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
         -drive "if=pflash,format=raw,file=$W/vars.fd" \
         -drive "file=$IMG,format=raw,if=none,id=d0" \
@@ -98,7 +111,7 @@ boot_arm() {    # $1 = log path, $2 = label, $3 = kernel copy; sets LOG; returns
         -device "usb-storage,bus=xhci.0,drive=stick" \
         -serial stdio -display none -no-reboot
     rm -rf "$W"
-    if ! qemu_assert_booted "$LOG"; then echo "  VOID: [$2] the kernel never ran — no assertion scored"; void=1; return 1; fi
+    if ! qemu_assert_booted "$LOG"; then echo "  VOID: [$2] the kernel never ran ($(qemu_void_why "$LOG")) — no assertion scored"; void=1; return 1; fi
     return 0
 }
 
@@ -116,33 +129,44 @@ cp "$ROOT/build/agnos" "$WORK/agnos-injected"
 sh "$ROOT/scripts/build.sh" > "$LOGS/build-plain.log" 2>&1 || { echo "  BUILD FAILED (plain, $LOGS/build-plain.log)"; exit 1; }
 cp "$ROOT/build/agnos" "$WORK/agnos-plain"
 
-echo "[1/2] injected kernel (MSC_SHORT_INJECT=1) — READ(10) must be REFUSED..."
-if boot_arm "$LOGS/injected.log" injected "$WORK/agnos-injected"; then
-    if strings "$LOG" | grep -q 'mass-storage device(s) detected'; then
-        echo "  PASS: the usb-storage device enumerated (MSC transport is exercised at all)"
-    else
-        bad "no MSC device enumerated — the stick never attached, so nothing below is measured"
+verdicts=""
+for SMP in ${MSC_SHORT_SMP:-1 4}; do
+    T="[smp$SMP]"; nfail_before=$nfail; void_before=$void; void=0
+    echo "[1/2] $T injected kernel (MSC_SHORT_INJECT=1) — READ(10) must be REFUSED..."
+    if boot_arm "$LOGS/injected-smp$SMP.log" "injected-smp$SMP" "$WORK/agnos-injected" "$SMP"; then
+        if strings "$LOG" | grep -q 'mass-storage device(s) detected'; then
+            ok "$T the usb-storage device enumerated (MSC transport is exercised at all)"
+        else
+            bad "$T no MSC device enumerated — the stick never attached, so nothing below is measured"
+        fi
+        if strings "$LOG" | grep -q 'READ(10) short data phase'; then
+            ok "$T a short data phase is REFUSED, and reports both counts + the device residue"
+        else
+            bad "$T short data phase NOT refused — a short read would be reported as success"
+        fi
+        wantk "smp: cpus online: $SMP"             "$T all $SMP CPU(s) came online (the topology this variant exists for)"
+        deny "$SMOKE_INVARIANT_DENY" "$T no latched kernel invariant fired (whole boot)"
     fi
-    if strings "$LOG" | grep -q 'READ(10) short data phase'; then
-        echo "  PASS: a short data phase is REFUSED, and reports both counts + the device residue"
-    else
-        bad "short data phase NOT refused — a short read would be reported as success"
-    fi
-    deny "$SMOKE_INVARIANT_DENY" "no latched kernel invariant fired (whole boot)"
-fi
 
-echo "[2/2] plain kernel — the same READ(10) must SUCCEED..."
-if boot_arm "$LOGS/plain.log" plain "$WORK/agnos-plain"; then
-    if strings "$LOG" | grep -q 'READ(10) short data phase'; then
-        bad "healthy device refused — the check fires unconditionally and would break every stick"
-    else
-        echo "  PASS: a healthy device is NOT refused (the control that makes arm 1 meaningful)"
+    echo "[2/2] $T plain kernel — the same READ(10) must SUCCEED..."
+    if boot_arm "$LOGS/plain-smp$SMP.log" "plain-smp$SMP" "$WORK/agnos-plain" "$SMP"; then
+        if strings "$LOG" | grep -q 'READ(10) short data phase'; then
+            bad "$T healthy device refused — the check fires unconditionally and would break every stick"
+        else
+            ok "$T a healthy device is NOT refused (the control that makes arm 1 meaningful)"
+        fi
+        want "mass-storage device(s) detected"     "$T the usb-storage device enumerated in the plain arm"
+        wantkre "msc: slot [0-9]+ LBA0 first 8 bytes: 77 83 67 76 66 65 48 33"  "$T a production READ(10) SUCCEEDED and returned the seeded LBA 0 bytes (the MSC line, not nvme/ahci's)"
+        wantk "smp: cpus online: $SMP"             "$T all $SMP CPU(s) came online (the topology this variant exists for)"
+        deny "READ(10) LBA0 failed"                "$T the production READ(10) of LBA 0 did not fail"
+        deny "$SMOKE_INVARIANT_DENY"               "$T no latched kernel invariant fired (whole boot)"
     fi
-    want "mass-storage device(s) detected"     "the usb-storage device enumerated in the plain arm"
-    wantkre "msc: slot [0-9]+ LBA0 first 8 bytes: 77 83 67 76 66 65 48 33"  "a production READ(10) SUCCEEDED and returned the seeded LBA 0 bytes (the MSC line, not nvme/ahci's)"
-    deny "READ(10) LBA0 failed"                "the production READ(10) of LBA 0 did not fail"
-    deny "$SMOKE_INVARIANT_DENY"               "no latched kernel invariant fired (whole boot)"
-fi
+    if [ "$nfail" != "$nfail_before" ]; then v=FAIL; elif [ "$void" = 1 ]; then v=VOID; else v=PASS; fi
+    echo "  verdict $T: $v"
+    verdicts="$verdicts $T=$v"
+    [ "$void_before" = 1 ] && void=1
+done
+echo "  verdicts:$verdicts"
 
 if [ "$rc" != "0" ]; then echo "msc-short-smoke: FAIL"; exit 1; fi
 if [ "$void" = "1" ]; then echo "msc-short-smoke: VOID"; exit 2; fi

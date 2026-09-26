@@ -17,9 +17,27 @@
 
 var iommu_base = 0;       # MMIO base address (virtual = physical, identity-mapped)
 var iommu_active = 0;
-var iommu_root_table = 0; # Physical address of root entry table
-var iommu_ctx_table = 0;  # Physical address of context entry table (bus 0)
-var iommu_iot_l2 = 0;     # Level-2 IO page table (like PD)
+# ⛔ 1.57.9 (CPUVA) — every table is held TWICE, the Linux intel-iommu way (iommu->root_entry is a KVA,
+# virt_to_phys() only at the register): *_phys goes ONLY into what the hardware walks — RTADDR, the root
+# entry's context-table pointer, the context entry's ASR — and *_kva (dma_kva, the direct map) is the only
+# address the CPU memsets, loads or stores. Until 1.57.9 the CPU wrote these pmm pages at phys == VA.
+# CR3 AUDIT (1.57.9): every writer in this file runs at boot on the kernel CR3 0x1000, before any per-proc
+# CR3 or AP exists — iommu_init (main.cyr, the acpi_iommu_base block) and, through it, iommu_map_mmio,
+# iommu_set_context and iommu_allow_dma_2mb; iommu_register_dma from xhci_rings_init (BEFORE iommu_init,
+# so iommu_active == 0 and it is a no-op) and from r8169_init_rx/tx (after it). So the identity writes were
+# safe BY CALL-SITE PLACEMENT, not by construction; the KVA makes a later runtime caller (a hot-plugged
+# device's iommu_register_dma under a process's CR3) safe too. A BOOTCR3_KEEP_GNOBOOT_CR3 build gets
+# phys == VA from dma_kva under gnoboot's CR3, as before.
+var iommu_root_phys = 0;  # root entry table (bus 0..255) — physical, for RTADDR
+var iommu_root_kva = 0;   #   ... its direct-map CPU pointer
+var iommu_ctx_phys = 0;   # context entry table for bus 0 — physical, for root entry [0]
+var iommu_ctx_kva = 0;    #   ... its direct-map CPU pointer
+var iommu_l2_phys = 0;    # level-2 IO page table (like a PD) — physical, for the context ASR
+var iommu_l2_kva = 0;     #   ... its direct-map CPU pointer
+# ECAP.C (Extended Capability bit 0, "Coherency"): 1 = the remapping hardware snoops the CPU caches when it
+# walks these tables; 0 = it reads memory, so every table write must be clflushed out first (Linux
+# __iommu_flush_cache). Read before the first table write; 0 (the safe answer) until then.
+var iommu_coherent = 0;
 
 # VT-d register read/write (32-bit MMIO)
 fn iommu_read32(off) {
@@ -65,7 +83,6 @@ fn iommu_map_mmio(phys_base) {
 
     # Check if PDPT entry exists for this region
     var pdpte = load64(0x2000 + pdpt_idx * 8);
-    var pd_addr = 0;
     # ⛔⛔ 1.56.52 — A PRESENT PDPT ENTRY MAY BE A 1 GB PAGE, NOT A POINTER TO A PD. This tested only
     # the present bit and then took `pdpte & 0xFFFFFFFFF000` as a page-directory address. pt_init
     # installs PDPT[3] as a 1 GB PAGE — `store64(0x2000 + 3 * 8, 0xC0000000 | 0x83)`, PS set — and
@@ -80,19 +97,26 @@ fn iommu_map_mmio(phys_base) {
     # (translation never enabled); a shatter here would be new untested page-table surgery on a path
     # no test can reach.
     if ((pdpte & 0x80) != 0) { return 0 - 1; }   # 1 GB page — not a PD; refuse, never write through it
+    # ⛔ 1.57.9 (CPUVA) — walk to the PD by phys_to_virt of the entry (Linux pmd_page_vaddr = __va(pmd &
+    # PTE_PFN_MASK)), never by treating the entry's phys as a pointer. The PDPT itself (0x2000) is in the
+    # kernel image, identity in every CR3; the PD under it is a pmm page (or an image page) — reach it
+    # through the direct map, and put only its PHYS into the PDPT entry the MMU walks.
+    var pd_kva = 0;
     if ((pdpte & 1) != 0) {
-        pd_addr = pdpte & 0xFFFFFFFFF000;
+        pd_kva = dma_kva(pdpte & 0xFFFFFFFFF000);
     } else {
         # Allocate a new PD for this PDPT entry
-        pd_addr = pmm_alloc();
-        if (pd_addr == 0) { return 0 - 1; }
-        memset(pd_addr, 0, 4096);
-        store64(0x2000 + pdpt_idx * 8, pd_addr | 0x03);
+        var pd_phys = pmm_alloc();
+        if (pd_phys == 0) { return 0 - 1; }
+        pd_kva = dma_kva(pd_phys);
+        if (dma_kva_ok(pd_kva) == 0) { return 0 - 1; }
+        memset(pd_kva, 0, 4096);
+        store64(0x2000 + pdpt_idx * 8, pd_phys | 0x03);
     }
 
     # Map the 2MB region containing the IOMMU registers
     var phys_2mb = phys_base & 0xFFFFFFFFFFE00000;
-    store64(pd_addr + pd_idx * 8, phys_2mb | 0x83);  # Present + Writable + 2MB
+    store64(pd_kva + pd_idx * 8, phys_2mb | 0x83);  # Present + Writable + 2MB
 
     # Flush TLB
     asm { mov rax, cr3; }
@@ -124,13 +148,32 @@ fn iommu_map_mmio(phys_base) {
 # ⭐ A REFUSAL, matching the pattern this file`s other two 1.56.52 fixes chose. Silently mapping the
 # wrong thing is worse than telling the caller no.
 fn iommu_allow_dma_2mb(phys) {
-    if (iommu_iot_l2 == 0) { return 0 - 1; }
+    if (iommu_l2_kva == 0) { return 0 - 1; }
     if (phys < 0) { return 0 - 1; }
     if (phys >= 0x40000000) { return 0 - 1; }   # past the single 1 GB second-level table
     var idx = (phys >> 21) & 0x1FF;
     var phys_2mb = phys & 0xFFFFFFFFFFE00000;
     # Second-level PDE: Read(0x01) + Write(0x02) + SuperPage(0x80) = 0x83
-    store64(iommu_iot_l2 + idx * 8, phys_2mb | 0x83);
+    store64(iommu_l2_kva + idx * 8, phys_2mb | 0x83);
+    iommu_flush_cache(iommu_l2_kva + idx * 8, 8);
+    return 0;
+}
+
+# 1.57.9 — Linux __iommu_flush_cache: on remapping hardware that does NOT snoop (ECAP.C == 0) its table
+# walk reads memory, so a table store still sitting dirty in a CPU cache is invisible to it. Write back
+# every cache line of [kva, kva + len) — clflush(addr) is io.cyr's documented single-line helper — then
+# mfence so the write-backs are globally visible before the caller's next register write (RTADDR, the
+# SRTP/TE command, an invalidation). A no-op on coherent hardware. Until 1.57.9 nothing here flushed and
+# ECAP.C was never read: on a non-coherent VT-d unit, SRTP/TE latched tables the hardware saw as stale.
+fn iommu_flush_cache(kva, len) {
+    if (iommu_coherent != 0) { return 0; }
+    var a = kva & (0 - 64);
+    var end = kva + len;
+    while (a < end) {
+        clflush(a);
+        a = a + 64;
+    }
+    arch_mfence();
     return 0;
 }
 
@@ -139,24 +182,25 @@ fn iommu_allow_dma_2mb(phys) {
 #   Lo: Present(1) + FPD(1) + Translation Type(2) + reserved + ASR(address space root)
 #   Hi: Address Width(3) + Avail(4) + reserved + Domain ID(16)
 fn iommu_set_context(bus, slot, func) {
-    if (iommu_ctx_table == 0) { return 0 - 1; }
+    if (iommu_ctx_kva == 0) { return 0 - 1; }
     if (bus != 0) { return 0 - 1; }  # Only bus 0 supported for now
     var devfn = (slot << 3) | func;
-    var ctx_entry = iommu_ctx_table + devfn * 16;
+    var ctx_entry = iommu_ctx_kva + devfn * 16;   # the CPU's pointer; the hardware finds it via iommu_ctx_phys
 
     # Lo: Present=1, Translation Type=0 (full translation), ASR = IO page table
     # The ASR points to the second-level PML4-equivalent. For a 3-level walk
     # (39-bit AGAW), ASR points to a "PML4" which has a single entry pointing
-    # to our iommu_iot_l2 (the "PD" level).
+    # to our level-2 table (the "PD" level).
     # We use a 2-level walk (30-bit, AGAW=1) for simplicity with 2MB pages.
     # Lo = ASR | Present(1)
-    # ASR is the 4KB-aligned physical address of the second-level page table root.
-    var asr = iommu_iot_l2;
+    # ASR is the 4KB-aligned PHYSICAL address of the second-level page table root (the hardware walks it).
+    var asr = iommu_l2_phys;
     store64(ctx_entry, (asr & 0xFFFFFFFFF000) | 0x01);
 
     # Hi: Address Width = 1 (30-bit AGAW, 2-level page table), Domain ID = 1
     # Bits [2:0] = Address Width (1 = 30-bit), Bits [23:8] = Domain ID
     store64(ctx_entry + 8, 0x0101);  # AW=1, DomainID=1
+    iommu_flush_cache(ctx_entry, 16);
 
     return 0;
 }
@@ -176,25 +220,36 @@ fn iommu_init() {
 
     # Read capabilities
     var cap = iommu_read64(0x08);
+    # 1.57.9 — ECAP.C (bit 0) BEFORE the first table write: it decides whether iommu_flush_cache must
+    # clflush the tables out of the CPU caches for the hardware walk to see them.
+    iommu_coherent = iommu_read64(0x10) & 1;
 
+    # 1.57.9 (CPUVA) — each table: pmm_alloc gives the PHYS (kept for the hardware), dma_kva the CPU's
+    # pointer (memset/store go through it only), and the boot assert refuses a KVA outside the direct map.
     # Allocate root entry table (4KB, 256 entries x 16 bytes)
-    iommu_root_table = pmm_alloc();
-    if (iommu_root_table == 0) { return 0 - 1; }
-    memset(iommu_root_table, 0, 4096);
+    iommu_root_phys = pmm_alloc();
+    if (iommu_root_phys == 0) { return 0 - 1; }
+    iommu_root_kva = dma_kva(iommu_root_phys);
+    if (dma_kva_ok(iommu_root_kva) == 0) { return 0 - 1; }
+    memset(iommu_root_kva, 0, 4096);
 
     # Allocate context entry table for bus 0 (4KB, 256 entries x 16 bytes)
-    iommu_ctx_table = pmm_alloc();
-    if (iommu_ctx_table == 0) { return 0 - 1; }
-    memset(iommu_ctx_table, 0, 4096);
+    iommu_ctx_phys = pmm_alloc();
+    if (iommu_ctx_phys == 0) { return 0 - 1; }
+    iommu_ctx_kva = dma_kva(iommu_ctx_phys);
+    if (dma_kva_ok(iommu_ctx_kva) == 0) { return 0 - 1; }
+    memset(iommu_ctx_kva, 0, 4096);
 
-    # Root entry [0] (bus 0): Present + pointer to context table
-    store64(iommu_root_table, (iommu_ctx_table & 0xFFFFFFFFF000) | 0x01);
-    store64(iommu_root_table + 8, 0);
+    # Root entry [0] (bus 0): Present + PHYSICAL pointer to the context table
+    store64(iommu_root_kva, (iommu_ctx_phys & 0xFFFFFFFFF000) | 0x01);
+    store64(iommu_root_kva + 8, 0);
 
     # Allocate second-level IO page table (like a PD for 2MB pages)
-    iommu_iot_l2 = pmm_alloc();
-    if (iommu_iot_l2 == 0) { return 0 - 1; }
-    memset(iommu_iot_l2, 0, 4096);
+    iommu_l2_phys = pmm_alloc();
+    if (iommu_l2_phys == 0) { return 0 - 1; }
+    iommu_l2_kva = dma_kva(iommu_l2_phys);
+    if (dma_kva_ok(iommu_l2_kva) == 0) { return 0 - 1; }
+    memset(iommu_l2_kva, 0, 4096);
 
     # By default, allow DMA to the first 16MB (kernel identity-mapped region).
     # This covers all static VirtIO DMA buffers in kernel BSS.
@@ -234,8 +289,14 @@ fn iommu_init() {
         return 0 - 1;
     }
 
-    # Program root table address register
-    iommu_write64(0x20, iommu_root_table & 0xFFFFFFFFF000);
+    # 1.57.9 — every table write above reaches memory before the hardware is pointed at the tables
+    # (whole pages: the memsets touched all of them). No-op when ECAP.C == 1.
+    iommu_flush_cache(iommu_root_kva, 4096);
+    iommu_flush_cache(iommu_ctx_kva, 4096);
+    iommu_flush_cache(iommu_l2_kva, 4096);
+
+    # Program root table address register — the PHYS; the only place the root table's address leaves the CPU
+    iommu_write64(0x20, iommu_root_phys & 0xFFFFFFFFF000);
 
     # Set root table type in GCMD and flush
     # GCMD: bit 30 = SRTP (Set Root Table Pointer)

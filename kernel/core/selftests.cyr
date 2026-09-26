@@ -2372,7 +2372,7 @@ spawn_kernel_selftest();
 
 #ifdef DMA_SHADOW_SELFTEST
 # ═══ 1.57.8 DMA_SHADOW_SELFTEST — block + HDA DMA survives a SHADOWED identity window ═══
-# (docs/development/issues/2026-09-25-dma-cpu-pointers-still-use-identity-vas.md; docs/architecture/dma-cpu-pointers.md)
+# (docs/development/issues/archived/2026-09-25-dma-cpu-pointers-still-use-identity-vas.md; docs/architecture/dma-cpu-pointers.md)
 # pmm_alloc draws from [0x400000, 0x10000000). Under a per-process CR3 the loader writes a ring-3 PT_LOAD's PDEs over
 # exactly that window, so a driver that reaches a DMA ring through phys == VA reads and writes the PROCESS's page. This
 # test builds that CR3 by hand: a copy of the kernel's PML4/PDPT/PD with PD[2..127] (every 2 MB of [4 MB, 256 MB)) all
@@ -2384,6 +2384,9 @@ spawn_kernel_selftest();
 # dereferences a pmm page's phys: its SQE/descriptor/CORB entry goes into the shadow, the device never sees it.
 # DESTRUCTIVE: writes sectors 64..95 on virtio/AHCI and nsze/2.. on NVMe — QEMU scratch disks only.
 # Buffers are .bss (kernel image: identity == phys, mapped in every CR3), so they serve AHCI's buf-is-DMA-address API too.
+# 1.57.9 (CPUVA) adds the CPU-only pmm buffers — fb_console's shadow (arm 6, "dmash: fb") and, in a RAMDISK_ENABLE
+# build, the ramdisk (arm 5) — checked ACROSS the switch, plus "dmash: window": the 0xA5 region must be untouched after
+# every arm (a CPU store through an identity VA is exactly a store into the ring-3 process's page).
 var dsh_a[512];            # 4 KB write pattern
 var dsh_b[512];            # 4 KB read-back
 var dsh_big[4096];         # 32 KB: two page-aligned 12 KB windows (NVMe PRP list)
@@ -2478,6 +2481,95 @@ fn dsh_verdict(name, nlen, arm) {
     kprintln("", 0);
     return 0;
 }
+# ─── 1.57.9 (CPUVA) — the CPU-only pmm buffers: fb_console's shadow and the ramdisk ─────────────────────────────
+# (docs/development/issues/2026-09-25-cpu-only-pmm-buffers-still-use-identity-vas.md). Neither is DMA, so the
+# arms above cannot see them: a device never reads them, and a store-then-load of the SAME identity VA under the
+# shadow CR3 reads back what it wrote (both hit the one 0xA5 region), which is why these arms cross the CR3
+# switch. Every check below reads, on the kernel CR3, what was written under the shadow (or the reverse).
+# dsh_dirty: words of the shadow region that are no longer 0xA5 — each one a CPU store that went to an identity
+# VA inside [4 MB, 256 MB) under the shadow CR3, i.e. a store a ring-3 PT_LOAD there would have received.
+fn dsh_dirty() {
+    var dk = dma_kva(dsh_s);
+    var nd = 0;
+    for (var i = 0; i < 262144; i = i + 1) { if (load64(dk + i * 8) != 0xA5A5A5A5A5A5A5A5) { nd = nd + 1; } }
+    return nd;
+}
+var DSH_FB_INK = 0x00A1B2C3;   # a colour nothing else paints: its presence in a shadow cell is this arm's glyph
+var dsh_fb_cx = 0;             # the cell fb_putc painted (column, row), recorded under the shadow
+var dsh_fb_cy = 0;
+# fb arm, UNDER the shadow CR3: paint one '#' in DSH_FB_INK through the real console painter (fb_putc — the
+# write(1,..) path's painter, which mirrors every pixel into fb_shadow). Held under console_lock so an AP's
+# kprint cannot interleave; nothing in here prints.
+fn dsh_fb_paint() {
+    if (fb_shadow == 0) { return 0; }
+    if (fb_console_ready == 0) { return 0; }
+    if (fb_defer != 0) { return 0; }
+    if (fb_draw_base() == 0) { return 0; }
+    store64(&dsh_ran + 6 * 8, 1);
+    console_spin_lock();
+    var ink = fb_fg_color;
+    fb_fg_color = DSH_FB_INK;
+    fb_putc(35);
+    fb_fg_color = ink;
+    dsh_fb_cx = fb_cur_x - 1;
+    dsh_fb_cy = fb_cur_y;
+    console_spin_unlock();
+    return 0;
+}
+# fb arm, back on the kernel CR3: the shadow cell must equal the FB cell pixel for pixel and hold the ink. A
+# shadow reached by identity VA took the glyph into the 0xA5 region instead, so its real cell keeps whatever it
+# held before — never DSH_FB_INK. Returns the bad-pixel count (+100000 when no ink reached the shadow).
+fn dsh_fb_check() {
+    var fs = 1;
+    if (fb_height() > 1200) { fs = 2; }
+    var fpitch = fb_pitch();
+    var foff = (FB_CONSOLE_Y0 + dsh_fb_cy * 16 * fs) * fpitch + dsh_fb_cx * 8 * fs * 4;
+    var ffb = fb_draw_base();
+    var nink = 0;
+    var nbad = 0;
+    for (var fy = 0; fy < 16 * fs; fy = fy + 1) {
+        for (var fx = 0; fx < 8 * fs; fx = fx + 1) {
+            var fa = foff + fy * fpitch + fx * 4;
+            var sv = load32(fb_shadow + fa);
+            if (sv != load32(ffb + fa)) { nbad = nbad + 1; }
+            if (sv == DSH_FB_INK) { nink = nink + 1; }
+        }
+    }
+    if (nink == 0) { nbad = nbad + 100000; }
+    return nbad;
+}
+# ramdisk arm (RAMDISK_ENABLE), in three phases across the switch. PRE (kernel CR3): sector 64 := pattern 21.
+# UNDER: sector 64 must read back pattern 21 (an identity-VA ramdisk reads the 0xA5 region: +bad), then sectors
+# 72..79 := pattern 29 and FLUSH. POST (kernel CR3): 72..79 must read pattern 29 (an identity-VA ramdisk wrote
+# them into the 0xA5 region, so the real pages still hold zeros: +bad). Weights as dsh_blk.
+fn dsh_rd_pre() {
+    if (blk_is_registered(BLK_RAMDISK) == 0) { return 0; }
+    store64(&dsh_ran + 5 * 8, 1);
+    dsh_fill(&dsh_a, 4096, 21);
+    if (blk_write_on(BLK_RAMDISK, 64, &dsh_a) != 0) { store64(&dsh_res + 5 * 8, 1000); }
+    return 0;
+}
+fn dsh_rd_under() {
+    if (load64(&dsh_ran + 5 * 8) == 0) { return 0; }
+    var rb = 0;
+    dsh_poison(&dsh_b, 4096);
+    if (blk_read_on(BLK_RAMDISK, 64, &dsh_b) != 0) { rb = rb + 2000; }
+    rb = rb + dsh_bad(&dsh_b, 512, 21);
+    dsh_fill(&dsh_a, 4096, 29);
+    if (blk_write_sectors_on(BLK_RAMDISK, 72, 8, &dsh_a) != 0) { rb = rb + 4000; }
+    if (blk_flush_on(BLK_RAMDISK) != 0) { rb = rb + 16000; }
+    store64(&dsh_res + 5 * 8, load64(&dsh_res + 5 * 8) + rb);
+    return 0;
+}
+fn dsh_rd_post() {
+    if (load64(&dsh_ran + 5 * 8) == 0) { return 0; }
+    var rp = 0;
+    dsh_poison(&dsh_b, 4096);
+    if (blk_read_sectors_on(BLK_RAMDISK, 72, 8, &dsh_b) != 0) { rp = rp + 8000; }
+    rp = rp + dsh_bad(&dsh_b, 4096, 29);
+    store64(&dsh_res + 5 * 8, load64(&dsh_res + 5 * 8) + rp);
+    return 0;
+}
 fn dma_shadow_selftest() {
     if (dsh_build() == 0) { kprintln("dmash: FAIL no memory for the shadow", 36); kprintln("dmash: done", 11); return 0; }
     var probe = pmm_alloc();
@@ -2490,12 +2582,15 @@ fn dma_shadow_selftest() {
     var v0 = 0;
     if (hda_on == 1) { v0 = dsh_hda_vendor(); }
     var nsec = nvme_ns1_nsze / 2;
+    dsh_rd_pre();                                 # 1.57.9: ramdisk sector 64 written on the kernel CR3
     var old = dm_read_cr3();
     var fl = kbd_irq_save();                      # IF=0 for the whole window: no ISR, no preemption, no CR3 switch
     cr3_load(dsh_cr3);
-    # ---- under the shadow: no kprint (the console path is not what is under test) ----
+    # ---- under the shadow: no kprint (the console path is not what is under test — the fb arm calls the
+    #      painter directly, under console_lock) ----
     var id_v = load64(probe);                     # the identity VA of a pmm page: MUST read the shadow
     var dm_v = load64(pk);                        # its direct-map alias: MUST read the real page
+    var dz0 = dsh_dirty();                        # 1.57.9: the shadow region before any arm (0: nothing ran yet)
     dsh_blk(BLK_VIRTIO, 0, 64);
     dsh_blk(BLK_NVME, 1, nsec);
     dsh_prp(2, nsec + 64);
@@ -2503,10 +2598,18 @@ fn dma_shadow_selftest() {
     var v1 = 0;
     var v2 = 0;
     if (hda_on == 1) { v1 = dsh_hda_vendor(); v2 = dsh_hda_vendor(); }
+    var dz1 = dsh_dirty();
+    dsh_fb_paint();
+    var dz2 = dsh_dirty();
+    dsh_rd_under();
+    var dz3 = dsh_dirty();
     cr3_load(old);
     kbd_irq_restore(fl);
     hda_active_ctl = hsave;
     # ---- back on the caller's CR3 ----
+    if (load64(&dsh_ran + 6 * 8) != 0) { store64(&dsh_res + 6 * 8, dsh_fb_check() + (dz2 - dz1)); }
+    dsh_rd_post();
+    store64(&dsh_res + 5 * 8, load64(&dsh_res + 5 * 8) + (dz3 - dz2));
     var shok = 0;
     if (id_v == 0xA5A5A5A5A5A5A5A5) { shok = 1; }
     if (dm_v != 0x5A5A5A5A5A5A5A5A) { shok = 2; }
@@ -2526,6 +2629,17 @@ fn dma_shadow_selftest() {
         kprint(" shadowed=", 10); kprint_hex(v1);
         kprintln("", 0);
     }
+    # 1.57.9 — the CPU-only buffers (bad = mismatches + shadow-region words the arm dirtied), and the whole window:
+    # no arm, DMA or CPU-only, may have stored through an identity VA (dz0 must be 0 too — nothing ran before it).
+    dsh_verdict("fb", 2, 6);
+    dsh_verdict("ramdisk", 7, 5);
+    kprint("dmash: window", 13);
+    if (dz3 == 0) { kprint(" PASS", 5); } else { kprint(" FAIL", 5); }
+    kprint(" dirty=", 7); kprint_num(dz3);
+    kprint(" (dma ", 6); kprint_num(dz1 - dz0);
+    kprint(" fb ", 4); kprint_num(dz2 - dz1);
+    kprint(" ramdisk ", 9); kprint_num(dz3 - dz2);
+    kprintln(")", 1);
     kprintln("dmash: done", 11);
     return 0;
 }

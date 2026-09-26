@@ -74,7 +74,7 @@
 # switch every store into the alias lands nowhere at -m 512M and in someone else's RAM on a big
 # box). kfont_init is called from core/main.cyr AFTER that switch, next to pmm_bitmap_use_directmap
 # and inside the same #ifndef BOOTCR3_KEEP_GNOBOOT_CR3 — a KEEP_GNOBOOT boot gets no face. It was
-# first slotted beside fb_shadow_init (before the switch) and MEASURED failing the verify with an
+# first slotted at fb_shadow_init's pre-1.57.9 slot (before the switch) and MEASURED failing the verify with an
 # all-zero buffer while the literals hashed clean in place; do not move it back.
 
 var kfont_ready = 0;    # 1 only after rekha_face_default_verify said 1 — gates every arm below

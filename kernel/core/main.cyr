@@ -407,15 +407,7 @@ pdpt_guard_selftest();
 # differently from the first.
 vmm_remap_wc_range(fb_fb_phys(), fb_size_or_fallback());
 fb_verify_wc();
-
-# 1.53.7 — allocate the WB RAM console shadow buffer (kills the WC framebuffer
-# read-back on every scroll). Post-pmm + post-WC-remap so the one-time FB→shadow
-# sync copies the real (WC) console image. Falls back to direct-paint (today's
-# behavior) if the FB is absent or the contiguous 2 MB-region run can't be had.
-# Placed BEFORE the boot-CR3 switch below, but the shadow is in the 0-256 MB
-# identity window that every CR3 (gnoboot's, 0x1000's, and per-proc) maps, so the
-# ordering is immaterial to its addressability.
-fb_shadow_init();
+# (fb_shadow_init sat here until 1.57.9; it now runs after the CR3 switch below — see its call site.)
 
 #ifndef BOOTCR3_KEEP_GNOBOOT_CR3
 # 1.50.x (RAM full-usage arc, bite 2) — switch the kernel onto its OWN complete PML4 (0x1000) instead of
@@ -479,20 +471,32 @@ hid_reclaim_selftest();
 #endif
 
 # 1.57.2 — assemble + verify + expose the kernel-embedded default TrueType face (core/kfont.cyr,
-# rekha's Liberation Sans). Same allocator as fb_shadow_init above (pmm_alloc_2mb_run, one region,
-# never freed) but NOT the same placement, and the difference was MEASURED, not assumed: the region
-# is filled and read through its DIRECT-MAP alias (pmm_kva_for_access), and the direct map is only
-# ACTIVE under 0x1000. Called from beside fb_shadow_init — i.e. before the cr3_load(0x1000) above —
-# every store went to gnoboot's identity view of 8 GB + phys (nothing, at -m 512M; someone else's RAM
-# on a 64 GB box), the buffer read back all zeros and the verify FAILED while the literals themselves
-# hashed clean in place. fb_shadow gets away with the early slot because it uses the IDENTITY VA;
-# this cannot (vfs_read serves the buffer under the caller's CR3, where identity is the user image).
+# rekha's Liberation Sans). Same allocator as fb_shadow_init below (pmm_alloc_2mb_run, one region,
+# never freed), and the placement was MEASURED, not assumed: the region is filled and read through
+# its DIRECT-MAP alias (pmm_kva_for_access), and the direct map is only ACTIVE under 0x1000. Called
+# from fb_shadow_init's old slot — i.e. before the cr3_load(0x1000) above — every store went to
+# gnoboot's identity view of 8 GB + phys (nothing, at -m 512M; someone else's RAM on a 64 GB box),
+# the buffer read back all zeros and the verify FAILED while the literals themselves hashed clean in
+# place. The identity VA is no answer either (vfs_read serves the buffer under the caller's CR3,
+# where identity is the user image — and 1.57.9 found fb_shadow had exactly that bug).
 # So it sits here: after the switch, after the bitmap rebase, inside the own-PML4 build — a
 # BOOTCR3_KEEP_GNOBOOT_CR3 boot never has the direct map in its boot context and simply gets no
 # face (kfont_ready stays 0; /fonts answers -1). A failed allocation or a failed verify prints its
 # own line and leaves /fonts closed the same way; the boot continues either way.
 kfont_init();
 #endif
+
+# 1.53.7 — allocate the WB RAM console shadow buffer (kills the WC framebuffer read-back on every
+# scroll). Post-pmm + post-WC-remap so the one-time FB→shadow sync copies the real (WC) console image;
+# falls back to direct-paint if the FB is absent or the contiguous 2 MB-region run can't be had.
+# ⛔ 1.57.9 (CPUVA) — HERE, after cr3_load(0x1000) + pmm_bitmap_use_directmap(), not before the switch
+# where it sat: fb_shadow is now the run's DIRECT-MAP pointer, and that alias is live only under 0x1000
+# (the kfont rule above). Its old slot was justified by "the 0-256 MB identity window that every CR3
+# maps", which was false — a per-process CR3 gives that window to the ring-3 image (fb_console.cyr's
+# fb_shadow banner). Outside the #ifndef on purpose: a BOOTCR3_KEEP_GNOBOOT_CR3 build keeps a shadow at
+# phys == VA under gnoboot's CR3 (dma_kva returns phys there), exactly as before. Everything painted
+# between the old slot and here went straight to the FB and is picked up by the one-time sync.
+fb_shadow_init();
 
 # 1.50.10 hardening — guard the 1.50.9 bitmap-VA-shadow fix on EVERY boot (cheap; mirrors the always-on
 # directmap probe). When the bitmap migrated (RAM > 256 MB) it MUST now be reached via the direct-map
@@ -969,6 +973,11 @@ if (ahci_probe() == 1) {
         ahci_write_demo();
         #endif
         ahci_register_block_dev();
+        # 1.57.9 — AHCI timed-out-command fault injection (core/ahci.cyr ahci_late_selftest; scripts/smoke/ahci-late-smoke.sh).
+        # Its last arm takes every AHCI port offline on purpose; the smoke stops at its done line.
+        #ifdef AHCI_SELFTEST
+        ahci_late_selftest();
+        #endif
     }
 }
 
@@ -986,6 +995,10 @@ msc_write_demo();
 # 1.57.7 — test-only: drives all seven SCSI CDB builders with a canary beside cdb_buf (scripts/smoke/msc-cdb-smoke.sh).
 #ifdef MSC_CDB_CANARY
 msc_cdb_canary_run();
+#endif
+# 1.57.9 — test-only: msc_blk_* with kmalloc / direct-map / .bss buffers (msc.cyr msc_bounce_selftest; msc-cdb-smoke.sh).
+#ifdef MSC_BOUNCE_SELFTEST
+msc_bounce_selftest();
 #endif
 # 1.57.8 — test-only: the xHCI command / EP0 / MSC bulk / HID paths under a CR3 whose whole pool window is
 # shadowed (msc.cyr's xhci_shadow_selftest banner; scripts/smoke/xhci-shadow-smoke.sh). After the MSC read demo,
@@ -4686,6 +4699,10 @@ fn syscall_harden_selftest() {
             j = j + 1;
         }
 
+        # 1.57.9 (PIPEW): 8 bytes free, a 9-byte write (<= PIPE_BUF) is all-or-nothing — it must take NONE of it.
+        var w9 = pipe_write(wb, pbuf, 9);
+        if (w9 != 0) { kprintln("shsys: pipe split a PIPE_BUF write", 34); ok = 0; }
+
         # Space freed by that read must now be accepted — a refusal that never un-refuses is a hang.
         var w3 = pipe_write(wb, pbuf, 8);
         if (w3 != 8) { kprintln("shsys: pipe did not accept after the reader drained", 51); ok = 0; }
@@ -4693,6 +4710,9 @@ fn syscall_harden_selftest() {
         kfree_sized(pbuf, 4096);
         kfree_sized(chk, 256);
         vfs_close(prfd);
+        # 1.57.9 (PIPEW): the only read end is gone and the ring is full — -1 (EPIPE), not 0 forever.
+        var w4 = pipe_write(wb, &w9, 8);
+        if (w4 != 0 - 1) { kprintln("shsys: pipe write with no reader not EPIPE", 42); ok = 0; }
         vfs_close(pwfd);
     }
     else { kprintln("shsys: pipe create failed", 25); ok = 0; }

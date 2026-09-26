@@ -134,8 +134,10 @@ var cpu_in_halt[4];
 # the halted context out; a flag left at 1 on a CPU now running another process would draw kicks it cannot serve).
 # `cpu_in_halt` above stays the ACCOUNTING flag (every arch_wait sets it, including preempt-held waits that cannot take
 # work); kick targeting never reads it. Shared file, x86-only readers: no aarch64 name is added.
-# ⭐ 1.57.8 (ENDFIX PIPE-R1): a #44 sched_yield park publishes 2 instead of 1. sched_kick_for treats any non-zero value
-# alike; sched_kick_parker (the #44 directed kick) targets ONLY 2, so an idle step or a #14 pause park is never its target.
+# ⭐ 1.57.8 (ENDFIX PIPE-R1): a YIELD park (#44, and #108 since 1.57.9) publishes 2 instead of 1. sched_kick_for treats
+# any non-zero value alike; sched_kick_target (#108's directed kick, 1.57.9 — it replaced 1.57.8's undirected
+# sched_kick_parker) targets ONLY 2, and only on the CPU where the named pid is current, so an idle step or a #14 pause
+# park is never its target.
 var cpu_kickable[4];
 
 
@@ -257,7 +259,7 @@ var WK_KBD_OWNER = 0x0500000000000000;
 var WK_SND = 0x0600000000000000;
 var WK_TCP = 0x0700000000000000;
 var WK_ICMP = 0x0800000000000000;
-var WK_PIPE = 0x0900000000000000;       # 1.57.8: | the pipe buffer (pipe_key, vfs.cyr) — a blocking pipe read#5
+var WK_PIPE = 0x0900000000000000;       # 1.57.8: | the pipe buffer (pipe_key, vfs.cyr) — a blocking pipe read#5; 1.57.9: | 1 (pipe_wkey) — a blocking write#1
 var WK_CHAN = 0x0A00000000000000;       # 1.57.8: | the reading endpoint — a blocking channel read#5
 var WK_TEST = 0x7F00000000000000;
 var WR_NONE = 0;

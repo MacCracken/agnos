@@ -35,6 +35,10 @@ fn kbd_irq_restore(f) { return 0; }
 fn flock_spin_lock() { return 0; }
 fn flock_spin_unlock() { return 0; }
 fn wq_wake(k) { return 0; }
+# 1.57.9 (PIPEW): vfs.cyr's pipe ring runs under pipe_lock (smp.cyr) and a pipe-end close wakes both keys (wq_wake_m).
+fn pipe_spin_lock() { return 0; }
+fn pipe_spin_unlock() { return 0; }
+fn wq_wake_m(k, m) { return 0; }
 
 # Context switch stubs (x86-specific register save/restore)
 fn proc_save_context(pid, isr_rsp) { return 0; }

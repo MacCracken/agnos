@@ -685,6 +685,40 @@ fn flock_spin_unlock() {
     preempt_enable();                                   # pairs the preempt_disable in the lock
     return 0;
 }
+# ⭐ 1.57.9 (PIPEW) — pipe_lock: EVERY pipe ring's head/tail read-modify-write and its byte copy (vfs.cyr pipe_write_n /
+# pipe_read). One GLOBAL lock, not one per buffer: a parameterized lock fn is the broken spin_lock_at shape (banner
+# above), and 16 procs do not contend a 4 KB copy. It is a LEAF below sched_lock: nothing is acquired under it — the
+# reader/writer wakes (wq_wake) and the pipe_ends_open scans run AFTER the unlock (Linux's order). Never held across
+# wq_arm/wq_sleep; never taken in an interrupt body. What it buys: two writers (`2>&1`, grandchildren sharing stdout)
+# no longer load the same head and write the same slots, and a write of <= PIPE_BUF bytes lands in one hold (the
+# POSIX atomicity rule). A byte-for-byte copy of flock_spin_lock / flock_spin_unlock with the global renamed.
+# REGISTER CONTRACT (both asm blocks): in — addr from its slot; out — lock: old from the xchg into [rbp-0x08];
+# clobbers rax, rcx. Slots: lock `old` [rbp-0x08], `addr` [rbp-0x10]; unlock `addr` [rbp-0x08].
+var pipe_lock = 0;
+fn pipe_spin_lock() {
+    preempt_disable();                                  # a held plain spinlock is NON-PREEMPTIBLE (see the lock banner)
+    var old = 1;
+    while (old == 1) {
+        var addr = &pipe_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn pipe_spin_unlock() {
+    var addr = &pipe_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    preempt_enable();                                   # pairs the preempt_disable in the lock
+    return 0;
+}
 fn console_spin_lock() {
     preempt_disable();                                  # 1.57.6 (S3.2): a held plain spinlock is NON-PREEMPTIBLE (see smp.cyr's lock banner)
     var old = 1;

@@ -842,27 +842,41 @@ fn msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in) {
 # through this single retry shell.
 #
 # Linux reference: drivers/usb/storage/transport.c usb_stor_invoke_transport.
-fn msc_scsi_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in, max_retries) {
+# Settle the slot's bulk pair: if a prior command left the transport wedged (row+69 sticky — a CBW/data/CSW
+# timeout, a Phase Error, a bad CSW), run Reset Recovery now. Returns 1 when the slot is clean (or was already),
+# 0 if recovery failed (or the slot is out of range).
+# ⛔ 1.57.9 — FACTORED OUT OF msc_scsi_exec SO THE BLOCK LAYER CAN SETTLE BEFORE IT TOUCHES THE BOUNCE PAGE.
+# A data-phase timeout returns with the TRB STILL LIVE on the ring: nothing stops the endpoint until this runs
+# (Stop Endpoint x2 + Set TR Dequeue inside msc_reset_recovery). If that TRB was an IN aimed at the row's data
+# page, the device may still DMA into the page, so msc_blk_write must not copy the caller's sector into it until
+# the endpoint is stopped — the nvme_io_settle / vblk_settle rule from 1.57.8. msc_scsi_exec's entry guard is
+# this same call, unchanged in behaviour.
+fn msc_settle(slot_id) {
     var row = msc_row_addr(slot_id);
+    if (row == 0) { return 0; }
+    if (load8(row + 69) != 1) { return 1; }
+    kprint("msc: slot ", 10);
+    kprint_num(slot_id);
+    kprintln(" transport wedged, attempting Reset Recovery", 44);
+    if (msc_reset_recovery(slot_id) == 0) {
+        kprint("msc: slot ", 10);
+        kprint_num(slot_id);
+        kprintln(" Reset Recovery failed", 22);
+        return 0;
+    }
+    # Inter-retry settle (~5-10ms on Zen-class silicon).
+    var sd = 0;
+    while (sd < 5000000) { sd = sd + 1; }
+    return 1;
+}
+
+fn msc_scsi_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in, max_retries) {
     var attempt = 0;
     while (attempt <= max_retries) {
         # Entry guard: if transport wedged from a prior failure, recover
         # BEFORE issuing. The wedge may carry an in-flight pinned TRB
         # that would poison this exec too.
-        if (load8(row + 69) == 1) {
-            kprint("msc: slot ", 10);
-            kprint_num(slot_id);
-            kprintln(" transport wedged, attempting Reset Recovery", 44);
-            if (msc_reset_recovery(slot_id) == 0) {
-                kprint("msc: slot ", 10);
-                kprint_num(slot_id);
-                kprintln(" Reset Recovery failed", 22);
-                return 0;
-            }
-            # Inter-retry settle (~5-10ms on Zen-class silicon).
-            var sd = 0;
-            while (sd < 5000000) { sd = sd + 1; }
-        }
+        if (msc_settle(slot_id) == 0) { return 0; }
         var r = msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len,
           data_phys, data_len, dir_in);
         if (r != 0) { return 1; }
@@ -1254,6 +1268,151 @@ fn msc_cdb_canary_run() {
 }
 #endif
 
+#ifdef MSC_BOUNCE_SELFTEST
+# ⛔ 1.57.9 TEST INSTRUMENT (MSC_BOUNCE_SELFTEST; scripts/smoke/msc-cdb-smoke.sh [bounce]) — never in a production
+# build. It WRITES sectors 200..224 of the stick: QEMU scratch sticks only (the MSC_RW_DEMO posture).
+# Proves the msc_blk_* layer never hands a CPU pointer to the xHC (issue 2026-09-25-msc-puts-the-caller-buffer-in-a-
+# data-trb). Four rows, each isolating ONE direction of ONE entry point against a reference path that was always
+# correct (msc_read_lba / msc_write_lba on a driver-owned pmm page, by phys):
+#   A  msc_blk_read        into a kmalloc(512) block    (direct-map VA, 0x2_0000_0000+)
+#   B  msc_blk_read_sectors(16) into a direct-map buffer at +100 bytes (NOT sector- or page-aligned; 2 bounce chunks)
+#   C  msc_blk_write x8    from a direct-map buffer at +36 bytes, verified by a reference READ(10) into a pmm page
+#   D  CONTROL: msc_blk_write + msc_blk_read on .bss buffers (kernel image: identity VA == phys). GREEN on the old
+#      code too — it is what shows a RED in A-C comes from the BUFFER CLASS, not a broken stick or transport.
+# Every destination is pre-filled with the pattern's complement, so "the device moved nothing" mismatches every byte.
+# A row PASSes only on err=0 AND bad=0; a FAIL prints both, which names the RED: err=1 (the transfer was refused
+# or errored) or err=0 bad>0 (it "succeeded" and the bytes went somewhere else).
+# Runs from main.cyr after msc_write_demo / msc_cdb_canary_run: BSP, before smp_start_aps and the scheduler, so the
+# unlocked reference primitives cannot race the locked msc_blk_* calls (the msc_read_demo posture).
+var msc_bst_bss_w[64];         # MODULE scope: 64 u64 = 512 bytes — row D's .bss source
+var msc_bst_bss_r[64];         # row D's .bss destination
+
+fn msc_bst_byte(sector, i) { return (sector * 31 + i * 7 + 0x5A) & 0xFF; }
+
+# Fill n bytes at p with the pattern of consecutive 512 B sectors from `sector`; inv=1 writes its complement.
+fn msc_bst_fill(p, sector, n, inv) {
+    var i = 0;
+    while (i < n) {
+        var v = msc_bst_byte(sector + (i >> 9), i & 511);
+        if (inv == 1) { v = v ^ 0xFF; }
+        store8(p + i, v);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Count the bytes of n at p that differ from the pattern of consecutive sectors from `sector`.
+fn msc_bst_bad(p, sector, n) {
+    var bad = 0;
+    var i = 0;
+    while (i < n) {
+        if (load8(p + i) != msc_bst_byte(sector + (i >> 9), i & 511)) { bad = bad + 1; }
+        i = i + 1;
+    }
+    return bad;
+}
+
+# Print one row; returns 1 on PASS.
+fn msc_bst_row(which, err, bad) {
+    if (which == 0) { kprint("msc-bounce: A kmalloc blk_read ", 31); }
+    if (which == 1) { kprint("msc-bounce: B direct-map blk_read_sectors(16) ", 46); }
+    if (which == 2) { kprint("msc-bounce: C direct-map blk_write(x8) ", 39); }
+    if (which == 3) { kprint("msc-bounce: D control .bss blk_write+blk_read ", 46); }
+    if (err == 0 && bad == 0) { kprintln("PASS", 4); return 1; }
+    kprint("FAIL err=", 9);
+    kprint_num(err);
+    kprint(" bad=", 5);
+    kprint_num(bad);
+    kprintln("", 0);
+    return 0;
+}
+
+fn msc_bounce_selftest() {
+    var bs = msc_first_slot;
+    if (bs == 0) {
+        kprintln("msc-bounce: FAIL no usb-storage slot enumerated", 47);
+        kprintln("msc-bounce: done", 16);
+        return 0;
+    }
+    if (load32(msc_row_addr(bs) + 80) != 512) {
+        kprintln("msc-bounce: FAIL the instrument needs a 512 B/LBA stick", 55);
+        kprintln("msc-bounce: done", 16);
+        return 0;
+    }
+    var ref = pmm_alloc();
+    var run = pmm_alloc_2mb();
+    var km = kmalloc(512);
+    if (ref == 0 || run == 0 || km == 0) {
+        kprintln("msc-bounce: FAIL no memory for the buffers", 42);
+        kprintln("msc-bounce: done", 16);
+        return 0;
+    }
+    if (vmm_is_mapped(ref) == 0) { vmm_map(ref, ref, 0x83); }
+    iommu_register_dma(ref);
+    var refk = dma_kva(ref);             # reference DMA page: `ref` (phys) goes in the TRB, the CPU uses refk
+    var runk = dma_kva(run);             # 2 MB direct-map run: contiguous CPU VAs for rows B and C (never DMAed)
+
+    # Reference WRITE of sectors 200..215 through the phys primitive (correct before and after the fix).
+    msc_bst_fill(refk, 200, 4096, 0);
+    var rw1 = msc_write_lba(bs, 0, 200, 8, ref);
+    msc_bst_fill(refk, 208, 4096, 0);
+    var rw2 = msc_write_lba(bs, 0, 208, 8, ref);
+    if (rw1 != 1 || rw2 != 1) { kprintln("msc-bounce: FAIL the reference WRITE(10) of 200..215 failed", 59); }
+    msc_blk_flush();
+
+    var passed = 0;
+    # A — one sector into a kmalloc block.
+    msc_bst_fill(km, 203, 512, 1);
+    var a_err = 0;
+    if (msc_blk_read(203, km) != 0) { a_err = 1; }
+    passed = passed + msc_bst_row(0, a_err, msc_bst_bad(km, 203, 512));
+
+    # B — sixteen sectors (two 8-sector bounce chunks) into an unaligned direct-map buffer.
+    var bdst = runk + 65536 + 100;
+    msc_bst_fill(bdst, 200, 8192, 1);
+    var b_err = 0;
+    if (msc_blk_read_sectors(200, 16, bdst) != 0) { b_err = 1; }
+    passed = passed + msc_bst_row(1, b_err, msc_bst_bad(bdst, 200, 8192));
+
+    # C — eight sectors written from an unaligned direct-map buffer, read back by the reference primitive.
+    var csrc = runk + 131072 + 36;
+    msc_bst_fill(csrc, 216, 4096, 0);
+    var c_err = 0;
+    var cs = 0;
+    while (cs < 8) {
+        if (msc_blk_write(216 + cs, csrc + cs * 512) != 0) { c_err = 1; }
+        cs = cs + 1;
+    }
+    msc_blk_flush();
+    msc_bst_fill(refk, 216, 4096, 1);
+    if (msc_read_lba(bs, 0, 216, 8, ref) != 1) {
+        kprintln("msc-bounce: FAIL the reference READ(10) of 216..223 failed", 58);
+        c_err = 1;
+    }
+    passed = passed + msc_bst_row(2, c_err, msc_bst_bad(refk, 216, 4096));
+
+    # D — control: .bss source and destination (identity VA == phys; worked before the fix too).
+    msc_bst_fill(&msc_bst_bss_w, 224, 512, 0);
+    msc_bst_fill(&msc_bst_bss_r, 224, 512, 1);
+    var d_err = 0;
+    if (msc_blk_write(224, &msc_bst_bss_w) != 0) { d_err = 1; }
+    if (msc_blk_read(224, &msc_bst_bss_r) != 0) { d_err = 1; }
+    passed = passed + msc_bst_row(3, d_err, msc_bst_bad(&msc_bst_bss_r, 224, 512));
+
+    kfree_sized(km, 512);
+    pmm_free_2mb(run);
+    pmm_free(ref);
+    if (passed == 4) { kprintln("msc-bounce: PASS rows=4", 23); }
+    if (passed != 4) {
+        kprint("msc-bounce: FAIL passed=", 24);
+        kprint_num(passed);
+        kprintln(" of 4", 5);
+    }
+    kprintln("msc-bounce: done", 16);
+    return 0;
+}
+#endif
+
 # ⛔ 1.57.7 — EVERY SCSI CDB BUFFER HERE IS `var cdb_buf[16]`, AND WAS `[2]` AT ALL SEVEN SITES UNTIL THIS CUT.
 # A function-local `var x[N]` is N BYTES (module scope is N u64). `[2]` got ONE 8-byte frame slot, and each of the
 # seven builders zeroes 16 bytes into it (msc_build_rw10_cdb included), so bytes 8-15 landed on the local
@@ -1330,7 +1489,8 @@ fn msc_test_unit_ready(slot_id, lun) {
 
 # Allocate a per-row data scratch page on first use. Used for both
 # INQUIRY (36 B) + READ CAPACITY (8 B) IN data phases; one page per
-# row is plenty.
+# row is plenty. ⛔ 1.57.9: it is also the msc_blk_* BOUNCE page — the only address that layer ever puts in a data
+# TRB — so it holds up to 4096 bytes of sector data between block commands (under msc_lock).
 fn msc_ensure_data_buf(row) {
     var existing = load64(row + 136);
     if (existing != 0) { return existing; }
@@ -1657,6 +1817,8 @@ fn msc_build_rw10_cdb(cdb_p, opcode, lba, count) {
 
 # Issue SCSI READ(10) against (lba, count) into buf_phys. Caller owns
 # buf_phys (must be IOMMU-registered + at least count*lba_bytes large).
+# ⛔ buf_phys is a PHYSICAL address of a driver-owned pmm page — it goes into the data TRB verbatim. Never pass a
+# CPU pointer (kmalloc, direct map, stack): the block layer bounces those (see the banner above msc_blk_read).
 # Returns 1 on success, 0 on transport / CSW failure.
 fn msc_read_lba(slot_id, lun, lba, count, buf_phys) {
     var row = msc_row_addr(slot_id);
@@ -1704,7 +1866,8 @@ fn msc_read_lba(slot_id, lun, lba, count, buf_phys) {
     return 1;
 }
 
-# Issue SCSI WRITE(10) from buf_phys to (lba, count). Returns 1 / 0.
+# Issue SCSI WRITE(10) from buf_phys to (lba, count). Returns 1 / 0. buf_phys: a driver-owned pmm page PHYS, as
+# for msc_read_lba — never a CPU pointer.
 fn msc_write_lba(slot_id, lun, lba, count, buf_phys) {
     var row = msc_row_addr(slot_id);
     if (load8(row + 68) == 0) { return 0; }
@@ -1749,19 +1912,66 @@ fn msc_write_lba(slot_id, lun, lba, count, buf_phys) {
 # msc_read_lba, not through msc_blk_read — so every one can lock without a same-CPU re-acquire.
 # Verified before writing; if that ever changes, the composing one must drop its lock (see the
 # vblk_blk_read_sectors note in core/virtio_blk.cyr).
+#
+# ⛔⛔ 1.57.9 — THE CALLER'S `buf` IS A CPU POINTER AND NEVER GOES INTO A TRB. Until this cut all three data entry
+# points handed `buf` straight to msc_read_lba/_write_lba, which stored it in the bulk Normal TRB's Data Buffer
+# Pointer: the xHC took a VIRTUAL address as a PHYSICAL one. It worked only because every in-tree caller happened
+# to pass a `.bss` buffer (kernel image, identity-mapped, VA == phys). A kmalloc or direct-map buffer
+# (DIRECTMAP_BASE + phys, 0x2_0000_0000+) made the controller DMA at that value taken as a phys — above RAM
+# under QEMU, someone else's memory on a large box — and a data-phase timeout left that TRB live on the ring,
+# aimed at caller memory, until the next command's msc_settle stopped the endpoint.
+# Now (issue 2026-09-25-msc-puts-the-caller-buffer-in-a-data-trb; the swiotlb / usb-storage `us->iobuf` posture,
+# and what nvme_blk_* / vblk_blk_* already do): the only address that reaches a TRB is the row's data page
+# (msc_ensure_data_buf — a pmm page, iommu-registered, whose phys the driver owns), and the CPU copies through its
+# direct-map alias (dma_kva):
+#   · READ: DMA into the page, and copy OUT to `buf` only after msc_read_lba returned 1 — which already includes
+#     its `got == bytes` short-data-phase reject — so a failed or short IN never exposes the page's stale bytes.
+#   · WRITE: msc_settle FIRST (a wedged earlier IN may still DMA into the page), then copy IN, then WRITE(10).
+#   · The copy is inside msc_lock: the page is one per row, shared by every block command on that row.
+#   · At most 4096 bytes per command (one page), which also keeps every data TRB inside one 64 KB boundary
+#     (xHCI 1.2 §4.11.7.1) by construction — the old multi-sector path ran up to 65024 B from an arbitrary
+#     caller address, one TRB, with no boundary split.
+# ⚠ The page is SHARED with INQUIRY / READ CAPACITY / REQUEST SENSE, all of which zero it first; they run at
+# enumeration (before block registration) and in the BSP-only selftests, never concurrently with this layer.
+# ⚠ msc_read_lba / msc_write_lba stay PHYS-taking primitives (the demos, the CDB canary and the xHCI shadow
+# selftest pass their own pmm pages, as nvme_read_lba does). The `*_lba` layer is where a phys is legal; the
+# `msc_blk_*` layer is where a CPU pointer is.
+# Gate: MSC_BOUNCE_SELFTEST → scripts/smoke/msc-cdb-smoke.sh [bounce] (kmalloc + direct-map buffers, .bss control).
+
+# The row's bounce page for a block command of `bytes`, or 0 if it cannot be used (no page, or a transfer that
+# would not fit it). Caller holds msc_lock.
+fn msc_blk_bounce(row, bytes) {
+    if (bytes < 1) { return 0; }
+    if (bytes > 4096) { return 0; }
+    return msc_ensure_data_buf(row);
+}
+
 fn msc_blk_read(sector, buf) {
     if (msc_first_slot == 0) { return 0 - 1; }
+    var row = msc_row_addr(msc_first_slot);
+    if (row == 0) { return 0 - 1; }
     msc_spin_lock();
-    var rr = msc_read_lba(msc_first_slot, 0, sector, 1, buf);
+    var rb_blk = load32(row + 80);
+    var rb_pg = msc_blk_bounce(row, rb_blk);
+    if (rb_pg == 0) { msc_spin_unlock(); return 0 - 1; }
+    if (msc_read_lba(msc_first_slot, 0, sector, 1, rb_pg) == 0) { msc_spin_unlock(); return 0 - 1; }
+    memcpy(buf, dma_kva(rb_pg), rb_blk);       # only after success: a failed/short IN is never copied out
     msc_spin_unlock();
-    if (rr == 0) { return 0 - 1; }
     return 0;
 }
 
 fn msc_blk_write(sector, buf) {
     if (msc_first_slot == 0) { return 0 - 1; }
+    var row = msc_row_addr(msc_first_slot);
+    if (row == 0) { return 0 - 1; }
     msc_spin_lock();
-    var wr = msc_write_lba(msc_first_slot, 0, sector, 1, buf);
+    var wb_blk = load32(row + 80);
+    var wb_pg = msc_blk_bounce(row, wb_blk);
+    if (wb_pg == 0) { msc_spin_unlock(); return 0 - 1; }
+    # Settle BEFORE the copy, not merely before the submit: a timed-out IN still on the ring may DMA into wb_pg.
+    if (msc_settle(msc_first_slot) == 0) { msc_spin_unlock(); return 0 - 1; }
+    memcpy(dma_kva(wb_pg), buf, wb_blk);
+    var wr = msc_write_lba(msc_first_slot, 0, sector, 1, wb_pg);
     msc_spin_unlock();
     if (wr == 0) { return 0 - 1; }
     return 0;
@@ -1798,30 +2008,36 @@ fn msc_blk_flush() {
     return 0;
 }
 
-# Multi-sector read. Chunks into 128-sector calls (64 KB at 512 B LBA —
-# the single-Normal-TRB bulk transfer cap). Caller's buffer is contiguous
-# physical (existing virtio/nvme/ahci convention).
+# Multi-sector read into a CPU buffer. ⛔ 1.57.9: bounced one PAGE at a time through the row's data page (see the
+# banner above msc_blk_read) — 4096 / blk sectors per READ(10): 8 at 512 B, 1 at 4096 B, so a 4 KB ext2 block is
+# still ONE command. It used to chunk up to 65535 / blk sectors (65024 B) straight into `buf`, taking the caller's
+# pointer as a contiguous PHYSICAL buffer; that "convention" was never true of a kmalloc or direct-map buffer.
 fn msc_blk_read_sectors(start, count, buf) {
     if (msc_first_slot == 0) { return 0 - 1; }
     var row = msc_row_addr(msc_first_slot);
+    if (row == 0) { return 0 - 1; }
     var blk = load32(row + 80);
     if (blk == 0) { return 0 - 1; }
-    var max_per_call = 128;
-    if (blk > 0) { max_per_call = 65535 / blk; }
+    if (blk > 4096) { return 0 - 1; }
+    var max_per_call = 4096 / blk;
     var remaining = count;
     var cur_lba   = start;
     var cur_buf   = buf;
     # ⚠ ONE LOCK ACROSS THE WHOLE CHUNK LOOP, not per chunk: the chunks are one logical transfer
     # sequence on one bulk ring, and releasing between them would let another CPU interleave a CBW
-    # mid-run. Every failure exit inside the loop must unlock — there is one, below.
+    # mid-run. Every failure exit inside the loop must unlock — there are two, below.
     msc_spin_lock();
+    var rs_pg = msc_blk_bounce(row, max_per_call * blk);
+    if (rs_pg == 0) { msc_spin_unlock(); return 0 - 1; }
+    var rs_kva = dma_kva(rs_pg);
     while (remaining > 0) {
         var n = remaining;
         if (n > max_per_call) { n = max_per_call; }
-        if (msc_read_lba(msc_first_slot, 0, cur_lba, n, cur_buf) == 0) {
+        if (msc_read_lba(msc_first_slot, 0, cur_lba, n, rs_pg) == 0) {
             msc_spin_unlock();
             return 0 - 1;
         }
+        memcpy(cur_buf, rs_kva, n * blk);      # only after success (msc_read_lba's got == bytes included)
         remaining = remaining - n;
         cur_lba   = cur_lba + n;
         cur_buf   = cur_buf + n * blk;

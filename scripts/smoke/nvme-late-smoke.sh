@@ -1,6 +1,6 @@
 #!/bin/bash
 # nvme-late-smoke.sh — NVMe late-completion fault injection (NVME_SELFTEST=1), 1.57.8.
-# Issue: docs/development/issues/2026-09-25-nvme-poll-timeout-leaves-the-cq-one-behind.md
+# Issue: docs/development/issues/archived/2026-09-25-nvme-poll-timeout-leaves-the-cq-one-behind.md
 #
 # nvme_late_selftest (core/nvme.cyr) forces a LATE completion — a read polled with a ZERO budget, so the poll gives
 # up before looking — and then checks, on a fresh scratch NVMe disk (the arms WRITE LBAs at nsze/2):
@@ -10,6 +10,8 @@
 #                         STALE entry's status): wrong data, "CID mismatch" lines, the CQ one entry behind.
 #   "nvmest: reuse PASS"  8x a late read into the bounce scratch, then at once a write of a different pattern through
 #                         the SAME scratch: the read-back is the written pattern (the late one is reaped before the copy).
+#   "nvmest: admin PASS"  (1.57.9) two admin IDENTIFYs polled out of order: the stray is discarded by CID (one
+#                         "nvme: admin stray CID" line) and no admin CQE is left over. RED on the pre-1.57.9 admin poll.
 #   "nvmest: lost PASS"   a completion that never comes: the next I/O fails, CSTS.RDY=0, nvme_io_ready=0.
 # plus "nvme: late completion reaped" (settle consumed the late CID by its own CID) and no stray/mismatch line.
 #
@@ -91,16 +93,20 @@ for SMP in ${NVME_SMP:-1 4}; do
         -serial stdio -display none -no-reboot
     if ! qemu_assert_booted "$LOG"; then echo "VOID: -smp $SMP never booted"; void=$((void + 1)); continue; fi
     echo "--- serial log (nvme/nvmest lines) ---"
-    grep -aE "nvmest:|nvme: (late|I/O|controller disabled)|CID mismatch" "$LOG" | head -30 || echo "(no nvmest lines captured)"
+    grep -aE "nvmest:|nvme: (late|I/O|admin|controller disabled)|CID mismatch" "$LOG" | head -30 || echo "(no nvmest lines captured)"
     echo "--------------------------------------"
     check "nvmest: stamp PASS"            "8 LBAs stamped (setup)"                                               "a stamp write failed"
     check "nvmest: shift PASS"            "a late completion does not shift the CQ: 16 reads exact, no leftover" "CID shift (stale status / wrong data / CQ one behind)"
     check "nvmest: reuse PASS"            "a late read's buffer is not reused before its completion is reaped"   "late DMA landed in reused scratch"
+    check "nvmest: admin PASS"            "admin CQ consumed by CID: the stray discarded, nothing left over"     "admin CID shift (pre-1.57.9 poll returned the first CQE)"
     check "nvmest: lost PASS"             "a lost completion disables the controller; the I/O fails"             "lost completion handling"
     check "nvme: late completion reaped"  "settle consumed the late CID by its own CID"                          "late CID never reaped"
     check "nvmest: done"                  "the selftest ran to its last line"                                    "the selftest did not finish"
     deny "nvmest: [a-z]+ FAIL|nvmest: SKIP" "an arm printed FAIL or SKIP" "no arm printed FAIL or SKIP"
-    deny "CID mismatch|stray CID"         "a completion was matched to the wrong command" "no CID mismatch / stray CID"
+    # 1.57.9: the admin arm submits two IDENTIFYs and polls the second first, so ONE "nvme: admin stray CID" line is
+    # expected (the discard is the behaviour under test). An I/O stray or a CID mismatch is still a failure.
+    check "nvme: admin stray CID"         "the admin poll discarded the out-of-order CQE by CID"                  "admin stray never seen"
+    deny "CID mismatch|I/O stray CID"     "a completion was matched to the wrong command" "no CID mismatch / I/O stray CID"
     deny "$SMOKE_INVARIANT_DENY" "a latched kernel invariant fired" "no latched invariant"
 done
 

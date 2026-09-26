@@ -56,9 +56,12 @@ var fb_console_ready = 0;
 # original direct-to-WC-FB path). When set (fb_shadow_init succeeds post-pmm), each
 # writer MIRRORS its pixels here at the SAME byte offset (shadow uses the FB pitch),
 # so fb_scroll_up becomes a pure RAM memmove + one WRITE-ONLY flush instead of
-# reading the WC framebuffer back (~1M uncached WC loads/newline at 1080p). Backing
-# is one contiguous 2 MB-region run in the 0-256 MB identity window, so phys==VA
-# under both the kernel and per-process CR3s. See fb_shadow_init.
+# reading the WC framebuffer back (~1M uncached WC loads/newline at 1080p).
+# ⛔ 1.57.9 (CPUVA) — fb_shadow is the run's DIRECT-MAP pointer (dma_kva), never its phys.
+# It was phys == VA "because every CR3 maps the 0-256 MB identity window", and that was
+# the false premise: under a per-process CR3, PD[2..127] is where the loader puts the
+# ring-3 PT_LOADs, so fb_putc on the write(1,..) path painted into the process's pages
+# and scrolled the process's bytes onto the screen. See fb_shadow_init.
 var fb_shadow = 0;
 var fb_shadow_size = 0;  # bytes reserved (n * 2 MB); 0 until fb_shadow_init succeeds
 
@@ -320,16 +323,25 @@ fn fb_verify_wc() {
 }
 
 # 1.53.7 — allocate the kernel-private WB RAM shadow buffer that backs the text
-# console, killing the WC framebuffer READ-BACK on every scroll. Called from
-# kernel/core/main.cyr AFTER pmm_init + the post-pmm WC-remap retry + fb_verify_wc
-# (pmm must be live; the FB must already be WC so the one-time read-back sync below
-# copies the real console image, not a stale WB view).
+# console, killing the WC framebuffer READ-BACK on every scroll. Called ONCE from
+# kernel/core/main.cyr, after pmm_init + the post-pmm WC-remap retry + fb_verify_wc
+# (the one-time read-back sync below must copy the real WC console image).
 #
 # Model: Linux simpledrm / BSD rasops CPU-shadow. Sized to pitch*height rounded up
 # to whole 2 MB regions and allocated as one contiguous top-down run
-# (pmm_alloc_2mb_run) inside the 0-256 MB identity window, so it is addressable
-# phys==VA under both the kernel boot CR3 and every per-process CR3 (the syscall
-# path's fb_putc runs under the latter) — no vmm_map needed.
+# (pmm_alloc_2mb_run).
+#
+# ⛔ 1.57.9 (CPUVA) — THE STORED POINTER IS THE DIRECT-MAP ALIAS (dma_kva), not the phys.
+# fb_putc runs on the syscall path under the CALLER's CR3, and a per-process CR3 gives
+# PD[2..127] = [4 MB, 256 MB) — the whole pool this run comes from — to the ring-3 image
+# (elf.cyr). The phys == VA shadow was therefore the PROCESS's page there: glyph stores
+# corrupted it (and leaked console text into it), the scroll copied its bytes onto the
+# screen, and with the loader's US=1 PDEs a CPL0 access was a SMAP #PF ring 3 could
+# trigger. The direct map (kernel PDPT[8+]) is mirrored into every CR3 and no user
+# mapping reaches it (Linux page_address / FreeBSD PHYS_TO_DMAP). The phys is kept
+# nowhere: nothing but the CPU ever touches this buffer. ⚠ ORDERING: the alias is live
+# only after cr3_load(0x1000) + pmm_bitmap_use_directmap() (CLAUDE.md) — main.cyr calls
+# this after them; a KEEP_GNOBOOT build gets phys == VA from dma_kva, as it always did.
 #
 # FALLBACK: FB absent, paint-disabled, or alloc failure (headless / low-RAM /
 # fragmented pool) leaves fb_shadow = 0 and every writer keeps its original
@@ -349,21 +361,31 @@ fn fb_shadow_init() {
         serial_println("fb: shadow alloc failed, direct-paint (scroll reads WC FB)", 58);
         return 0;
     }
+    # Boot assert (1.57.9): the stored pointer must lie in the direct map, the only alias
+    # every CR3 shares. Refuse the shadow rather than store an address a per-proc CR3 can own.
+    var kva = dma_kva(base);
+    if (dma_kva_ok(kva) == 0) {
+        serial_println("fb: shadow KVA outside the direct map, direct-paint", 51);
+        return 0;
+    }
     # One-time sync: copy the current FB image (boot log already painted) into the
     # shadow so the first post-init scroll's flush is consistent with what's on
     # screen. This is the ONLY WC read-back the shadow ever performs — one frame, at
     # boot. u64 block copy (2 px/cycle); ceil to cover a non-8-aligned frame tail
-    # (the extra <=7 B stay within the FB's 2 MB-aligned WC region).
+    # (the extra <=7 B stay within the FB's 2 MB-aligned WC region). The FB side is
+    # device memory at its identity VA (PDPT[2..3], mirrored into every CR3).
     var words = (need + 7) / 8;
     for (var i = 0; i < words; i = i + 1) {
-        store64(base + i * 8, load64(phys + i * 8));
+        store64(kva + i * 8, load64(phys + i * 8));
     }
-    fb_shadow = base;
+    fb_shadow = kva;
     fb_shadow_size = n * 0x200000;
     serial_print("fb: shadow ", 11);
     kfmt_int(n * 2);
     serial_print(" MB @ ", 6);
     kfmt_hex0x(base);
+    serial_print(" kva ", 5);
+    kfmt_hex0x(kva);
     serial_println(" (scroll WC read-back eliminated)", 33);
     return 0;
 }

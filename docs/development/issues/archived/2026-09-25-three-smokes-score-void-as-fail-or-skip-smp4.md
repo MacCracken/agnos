@@ -1,7 +1,6 @@
 # 2026-09-25 — harness: blk-write and ext2 (arm 1) score a firmware VOID as a FAIL; msc-short has no `-smp 4` variant
 
-**Status:** 🟡 **OPEN**, unslotted. These are pre-existing harness defects that the 1.57.8 steps found. Under the
-gate-budget rule they were not fixed inside those steps.
+**Status:** ✅ **RESOLVED 1.57.9 (2026-09-26)** — `blk-write-smoke` and `ext2-smoke` boot through `qemu_dwell_kernel` + `qemu_assert_booted` (a firmware VOID exits 2 with its reason; per-run log paths); ext2's arm 1 uses the NVMe ESP recipe; `msc-short-smoke` loops `${MSC_SHORT_SMP:-1 4}` with the `-smp 4` half gated; the 8 stale issue-path comments are fixed. Gate: blk-write PASS at `-smp 1` and `-smp 4`, ext2 7/0/0, msc-short PASS at both. See § Resolution.
 **Filed by:** agnos, from the 1.57.8 `steps/HARNESS-BACKLOG.md` (NVME, XHCI and DMA1 rows).
 **Checked against:** agnos **1.57.8**, `scripts/smoke/blk-write-smoke.sh` (~:56-75),
 `scripts/smoke/ext2-smoke.sh` (arm `1-baseline`) and `scripts/smoke/msc-short-smoke.sh`.
@@ -32,3 +31,11 @@ both SMP verdicts.
 ## Evidence (operator-local)
 
 `~/.claude/projects/-home-macro-Repos-agnos/handoff-1.57.8/steps/HARNESS-BACKLOG.md`; `~/.claude/projects/-home-macro-Repos-agnos/handoff-1.57.8/logs/DMA1/reg-ext2.log`; `~/.claude/projects/-home-macro-Repos-agnos/handoff-1.57.8/logs/XHCI/msc-short-smp4.log`.
+
+## Resolution (1.57.9, 2026-09-26)
+
+Prior art followed: Linux kselftest (distinct PASS / FAIL / SKIP / timeout results), LAVA / KernelCI (infrastructure failure is not
+a test failure), xfstests' `notrun`.
+
+What it broke: nothing. Left for the harness issue `2026-09-26-harness-backlog-after-1-57-9.md`: blk-write and ext2 are still not
+sweep rows, 53 older dangling issue-path comments, `ktest.sh` leaves a TEST kernel in `build/agnos`, the fixed `/tmp/sweep-gate.log`.

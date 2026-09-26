@@ -1,7 +1,8 @@
 # Blocking waits — the BLOCKED state and the wait/wake primitive (invariants)
 
-> **Last Updated**: 2026-09-25 (1.57.8 — blocking pipe / channel reads, `WK_PIPE`/`WK_CHAN`, `wq_wake_m`, the `#44`
-> directed park kick. 1.57.7 — Path 2 step S3d, bites S3.6–S3.9: keep-current, the `#44`/`#14` park, the
+> **Last Updated**: 2026-09-26 (1.57.9 ENDFIX — the #108 handoff; pipeline fd hygiene. Before: 1.57.9 — `#44` is a quiet local yield again; the directed yield `sched_yield_to`#108
+> kicks only its named peer's CPU; pipe WRITES block too — `wr1_wait`, `pipe_wkey`, `pipe_lock`, PIPE_BUF 512, EPIPE. 1.57.8 — blocking pipe / channel reads, `WK_PIPE`/`WK_CHAN`, `wq_wake_m`, the `#44`
+> directed park kick (withdrawn 1.57.9). 1.57.7 — Path 2 step S3d, bites S3.6–S3.9: keep-current, the `#44`/`#14` park, the
 > halt protocol and `cpu_kickable`, the idle step, the 0xE1 reschedule kick, the keyboard's one-reader-per-line wait,
 > the sound waits. S3c (S3.4–S3.5) wrote the primitive and its first users. Later Path 2 steps extend this document:
 > S3b (foreground exec: the #37 child and kmain's `run` are scheduled children, the waiter blocks on `WK_CHILD` — see
@@ -237,32 +238,76 @@ With keep-current a yield with only the idle READY is a no-op — so every poll 
 interrupt (IF=1 at preempt_count 0: a designated CPL0 preempt point, **not charged** — `cpu_in_halt`), then offered
 the CPU once more (`sched_yield_kernel`) so whatever that interrupt made READY runs at once · **0** refused
 (pre-scheduler, preempt held, a borrowed CR3): the caller keeps its legacy path.
-`#44` = `sched_yield_or_halt(2)`; `#14` = `sched_yield_or_halt(1)`, then `ksyscall(14)`'s legacy hlt only when
-refused; the `#14` arm's own window (an in-kernel `ksyscall(14)`) is `sched_halt_window(1)` followed by the yield when the window found work.
+`#44` = `sched_yield_or_halt(2, -1)`; `#108` = `sched_yield_or_halt(2, pid)` for an authorized target;
+`#14` = `sched_yield_or_halt(1, -1)`, then `ksyscall(14)`'s legacy hlt only when refused; the `#14` arm's own window
+(an in-kernel `ksyscall(14)`) is `sched_halt_window(1, -1)` followed by the yield when the window found work.
 ⛔ `sched_ready_for_me(me)` — the park's scan — excludes `me` AND **this CPU's idle**: the idle is READY whenever a
 parker is current, and finding it would bounce through keep-current and never halt (M-D4). Measured: a `#44` loop
 for 300 ms beside a sleeping child is charged 0 ticks (P2c; M-D2 — the park removed — 30); bench `yield_idle` ≈ one
 interrupt period (a ~µs reading is the M-D2 signature). A yield toward a peer RUNNING on another CPU parks too (it is
 not READY here) — which made `yield_peer` at `-smp 4` a tick-bound ping-pong (9.9 ms per round) until 1.57.8's
-directed kick (below).
+directed kick, now the directed yield `#108` (below).
 
-⭐ **The directed kick (1.57.8) — `#44` only.** A park takes `hw_k`, the `cpu_kickable` value it publishes: **2** for
-a `#44` park (`sys_sched_yield_k`), **1** for every other park (`#14` pause, an in-kernel `ksyscall(14)`) and for the
-idle step. After its scan found nothing, a `#44` park sends one 0xE1 kick (`sched_kick_parker`) to the first other
-online CPU whose `cpu_kickable == 2` — another `#44` parker — then halts. It is sent after this CPU published its own
-`2` + `mfence`, so the woken yielder's next park sees this CPU and kicks back: two `#44` yielders on two CPUs trade
-one IPI per round instead of a tick. Measured (`-smp 4`, KVM): `yield_peer` 113–122 µs per round (9.75 ms with the
-kick removed, mutation M2; 531 µs before S3d); `-smp 1` unchanged (11.5 µs); `yield_idle` still one interrupt period.
-⚠ **The scope, and the accepted price:** the kernel cannot tell a yielder waiting for its peer from one waiting for
-anything else, so **any two `#44` yielders on two CPUs** ping-pong at IPI rate for as long as both yield — `#44` is
-`sched_yield`, "run me again as soon as possible", a spin by contract; the cure for such a pair is a blocking read
-(below). ⛔ **`#14` pause neither sends nor draws the directed kick** (1.57.8 end review, PIPE-R1): until then every
-park did both, so crab's `#14` idle beside a cyrius `_agnos_sock_recv_block` `#14` backoff — or agnsh's `#44` bg poll
-beside either — woke each other every ~100–200 µs forever, and the sock_recv backstop of 6000 pauses (sized for
-~10 ms pauses) expired in under a second. `ipc-wait-smoke`'s `pause-pair` (`#14` beside an unrelated `#14` pauser)
-and `mixed-pair` (`#44` beside a `#14` pauser) gate ≥ 1 ms per call at `-smp > 1` (measured ~9.7 ms; pre-fix
-~118–210 µs). A `#44` park beside a BUSY process (it never parks), a BLOCKED one (current nowhere) or a `#14` pauser
-kicks nothing, so agnsh's prompt poll beside a busy job still halts (P2c).
+⭐ **The directed yield (1.57.9) — `sched_yield_to`#108; `#44` is quiet.** A park takes `hw_k`, the `cpu_kickable`
+value it publishes — **2** for a YIELD park (`#44`, `#108`), **1** for every other park (`#14` pause, an in-kernel
+`ksyscall(14)`) and for the idle step — and `hw_t`, the directed-yield target (-1 for everything but `#108`). After
+its scan found nothing, a park with a target calls `sched_kick_target(t)`, then halts. **Only the target's CPU is ever
+kicked:** t READY but pickable only elsewhere (pinned) → `sched_kick_for(t)`; t CURRENT on another CPU that is parked
+in a yield (`cpu_kickable == 2` and `pcpu_curproc == t`) → one 0xE1; t busy, BLOCKED, STOPPED or in a `#14` park →
+nothing. The kick goes out after this CPU published its own `2` + `mfence` + scan, so the woken peer's next `#108`
+sees this CPU and kicks back: a pair that names each other trades one IPI per round. **Authority:** self (a plain
+`#44`, 0) · an epoch-valid direct child · the epoch-valid direct PARENT (`yt_auth_ok`, sched.cyr); never pid 0 / kmain,
+an idle or a kthread (`proc_is_user`), never dead / zombie / claiming / dying. **-1 on a refusal, AFTER the same quiet
+yield/park `#44` does** — a `while (!flag) sched_yield_to(peer)` loop whose peer died must not spin a core. An
+in-kernel `ksyscall(108)` returns -1 with no effect (as `ksyscall(44)` does).
+- **Prior art** (the handoff note `YIELD-prior-art.md`, from the Linux, KVM, XNU and FreeBSD sources): an UNDIRECTED yield
+  never touches another CPU — Linux `do_sched_yield` (local rq, no IPI), FreeBSD `sched_relinquish`, Win32
+  `SwitchToThread` ("will not switch execution to another processor, even if that processor is idle"), L4
+  `ThreadSwitch(nilthread)`. So `#44` is quiet. Where a DIRECTED yield exists its reach is a trust group or a capability
+  (Linux `yield_to`: the thread group; KVM: the VM; Mach `thread_switch`: a port / the task), and only Linux `yield_to`
+  signals across CPUs — `resched_curr(p_rq)`, one IPI to the target's own CPU. `#108` follows that targeting; agnos's
+  only trust group is the spawn edge (no threads, no process groups).
+- ⭐ **The HANDOFF (1.57.9 end review YIELD-R1).** Every directed yield in that table first makes its target run NEXT
+  when it can run where the caller is: Linux `yield_to_task_fair()` → `set_next_buddy()` ("we'd really like se to run
+  next"; `pick_eevdf()` returns `cfs_rq->next` first — "will affect latency but not fairness" — and `clear_buddies()`
+  drops it once picked), Mach `thread_switch` hands off, L4 `ThreadSwitch` donates. As first shipped, `#108`'s
+  voluntary switch was the ordinary round-robin pick and ignored the target: with the target and a busy third process
+  both READY on the caller's CPU, "yield to t" ran whichever came first in slot order (ipcw `yield-handoff`, `-smp 1`:
+  **10.0 ms per round**, one leg of every round through the busy process until its tick). Now `#108` publishes a
+  per-CPU one-shot hint (`pcpu_yield_to`, sched.cyr, written by `sched_yield_kernel_to` with IF=0 around its own
+  `int 0xE0`) that `sched_next()` consumes first, under `sched_lock`, and returns the target iff it is READY, off every
+  CPU, not this CPU's idle and pickable here; else the round-robin pick runs unchanged. Measured: `yield-handoff`
+  **148 µs per round at `-smp 1` and `-smp 4`**. `#44` / `#14` / every in-kernel yield carry no hint.
+- **Departures, on purpose:** (1) `#44` still PARKS for one interrupt with nothing READY where Linux returns at once — the
+  "poll + yield must not spin a core" rule above. (2) `#108` adds the PARENT direction to kill#16's child-only rule —
+  both sides of a spinning pair must name each other, and every real pair is parent↔child; it is advisory (the worst
+  case is a spurious wake of a CPU its target parked "run me asap"). (3) Returns 0 / -1, not Linux's >0 / 0 / -ESRCH:
+  no "boosted" bit is exposed (it would only leak scheduling state); the kicks are counted in `sysinfo`#35 +200.
+  (4) A bad target degrades to a plain yield and returns -1 (Mach/L4 degrade and return success; the -1 tells the
+  caller its peer is gone). (5) No KVM `dy_eligible` damper: KVM guesses its target, here both sides asked by name —
+  a `#108` pair costs ~10k IPIs/s **by request**. (6) Kicking a CURRENT-but-halted target is an agnos addition:
+  Linux has no "current but halted" state. (7) The handoff has no eligibility test (Linux's `entity_eligible()`):
+  round-robin keeps no lag to be eligible against; fairness to a third process is kept by the timer tick, which never
+  carries a hint, so a busy process still gets every tick that lands while the pair runs. (8) No migration (Mach pulls
+  the target onto the caller's processor) and no timeslice donation (L4; agnos has no per-process slice): a target
+  current or pinned on another CPU gets the directed kick instead.
+- **Why (issue 2026-09-25-any-two-sched-yield-loops-kick-each-other, OPERATOR RULING 2026-09-25 option 1):** 1.57.8
+  gave every `#44` park an undirected kick (`sched_kick_parker`: one 0xE1 to the first other CPU parked in `#44`). The
+  kernel cannot tell whom a yielder waits for, so ANY two `#44` loops on two CPUs woke each other every ~100 µs for as
+  long as both yielded (agnsh's bg poll beside a yielding job; agnoshi `run_agnos` beside a yielding child).
+- **Measured** (`ipc-wait-smoke`, `-smp 4`, KVM): `yield-peer` (`#108` both ways) ~127 µs per round (8.95 ms with the
+  `#108` kick removed, mutation M2); `yield-pair` (`#44` beside an unrelated `#44` yielder, the issue's gate) **0**
+  kicks in a 300 ms window and ~10 ms per call — 4679 kicks and 127 µs per call with 1.57.8's `#44` kick restored
+  (M1); a refused `#108` ~10 ms per call (9.8 µs when the refusal skipped the park, M4). `-smp 1`: the pairs alternate
+  by direct switches (~85–99 µs), 0 kicks.
+- ⛔ **`#14` pause neither sends nor draws a directed kick** (1.57.8 end review, PIPE-R1): until then every park did
+  both, so crab's `#14` idle beside a cyrius `_agnos_sock_recv_block` `#14` backoff — or agnsh's `#44` bg poll beside
+  either — woke each other every ~100–200 µs forever, and the sock_recv backstop of 6000 pauses (sized for ~10 ms
+  pauses) expired in under a second. `ipc-wait-smoke`'s `pause-pair`, `mixed-pair` and `yield-pair` gate ≤ 30 kicks per
+  300 ms at every `-smp` and ≥ 1 ms per call at `-smp > 1`. A park beside a BUSY process (it never parks), a BLOCKED
+  one (current nowhere) or a `#14` pauser kicks nothing, so agnsh's prompt poll beside a busy job still halts (P2c).
+- The cure for a pair that polls each other is still a blocking read (`#5` a4 = 0) or `WAIT_BLOCK` (below); `#108` is
+  for the pairs that really do spin.
 
 ## The halt protocol and `cpu_kickable` (S3.6/S3.8)
 
@@ -336,13 +381,60 @@ dead tables, and an orphan's table is already gone, so the pipes cannot be named
 backstop deadline re-checks anyway: a writer dropped by a path with no wake costs latency, never a hang. **Kill
 (S7 boundary D):** a SIGKILL's `WR_SIGNAL`, or a kill pending at the arm, ABORTs with −1, which never reaches ring 3
 (B1 ends the process); a STOP parks inside `wq_signal_point` and the loop re-arms. `CH_RECV`#97 stays non-blocking
-(its a4 is the capacity, and it is the batch op a compositor polls across every channel it holds). Pipe WRITES do not
-block (a full ring still short-writes; the caller retries). Gate: `scripts/smoke/ipc-wait-smoke.sh` (tests/ipcw,
+(its a4 is the capacity, and it is the batch op a compositor polls across every channel it holds). Pipe WRITES block too
+since 1.57.9 (next section). Gate: `scripts/smoke/ipc-wait-smoke.sh` (tests/ipcw,
 `-smp 1` and `-smp 4`): pipe and channel ping-pongs 35–175 µs per round (< 1 ms gated), EOF by close ≈ the child's
 own 30 ms, EOF by death ≈ 32 ms, a kill of a reader in state 6 reaped 265 in < 1 ms. Mutations: the writer wake
 dropped → pipe-pp 210 ms per round (backstop-bound, RED); the sender wake dropped → chan-pp 108 ms (RED); the death
 class wake dropped → eof-death 110 ms (RED). `bench-ring3` `pipe_wr_rd8` pays the writer's `wq_wake` (sched_lock + a
 16-slot scan): 6.9 → 7.1 µs at `-smp 1`, 15.4 → 16.4 µs at `-smp 4`.
+
+## Pipe writes (1.57.9)
+
+`write`#1 on a pipe write end that took fewer bytes than asked **blocks its caller when `a4 == 0`** (`wr1_wait`,
+syscall.cyr — `rd5_wait`'s mirror, the canonical C9 loop); `a4 != 0` is O_NONBLOCK and keeps the short write, as does
+a context that cannot block (kernel callers). The writer sleeps on its **own** key, `pipe_wkey = pipe_key | 1`
+(vfs.cyr; Linux `wr_wait`, FreeBSD `PIPE_WANTW`) — bit 0 is free because the buffer is a whole 4 KB slab page — so a
+writer's `wq_wake(pipe_key)` after each copy never wakes the other writers. `wr1_key(fd, need)` is the pre-check and
+the side-effect-free re-check after the arm: `pipe_wkey` while the ring has fewer than `need` free bytes **and**
+`pipe_ends_open(buf, 0)` finds a read end (the `pipe_writers_open` scan with the same two rules: a dead state-0
+table does not count, pid 0 always does), else 0. `need` is the whole write for ≤ `PIPE_BUF` (512) bytes — a small
+write lands whole, in ONE `pipe_lock` hold, never interleaved — and 1 above it (FreeBSD's rule). **Wakers, each
+AFTER its condition store:** `pipe_read` (the tail, after `pipe_lock` is dropped — unconditional on a copy, not Linux's
+`was_full`, which is only sound under the lock), `vfs_close_inner` (`wq_wake_m(pipe_key, ~1)` wakes both keys: a
+closed read end may be the last), `proc_death_finish` (its `WK_PIPE` class wake already matches `pipe_wkey`: a dying
+reader's table stops counting at state 0). The 100 ms backstop deadline re-checks anyway. **Returns:** `len`; the
+**partial count** when the last reader went away after some bytes were taken (Linux `if (!ret)`, FreeBSD "don't
+return EPIPE if any byte was written"); **-1** when no reader is left and nothing was taken (EPIPE — no SIGPIPE: D3).
+`pipe_write` itself returns -1 for a refused write with no reader, so the O_NONBLOCK and kernel paths see EPIPE too
+(scanned only on the refused path — a readerless pipe with room still takes bytes until full). **Kill (S7 boundary
+D):** ABORT → -1, never reaching ring 3 (B1); a STOP parks in `wq_signal_point` and the loop re-arms. **`pipe_lock`**
+(smp.cyr, one global leaf below `sched_lock`, nothing acquired under it) covers every ring's head/tail
+read-modify-write and byte copy in `pipe_write_n` and `pipe_read`: before 1.57.9 two writers on two CPUs could load
+the same head and write the same slots. The user copy under it cannot fault once `is_user_range` has passed (user
+pages are never CoW). ⚠ Hazards that are the caller's: a process holding the only read end that writes into its own
+full pipe waits until killed (Linux too). ⛔ **agnsh pipelines whose consumer stops early hang** (1.57.9 end review
+PIPEW-E1, measured by `scripts/smoke/pipeline-smoke.sh`): `sh_run_pipeline` (agnoshi `run_agnos.cyr`) keeps its own
+`rfd` through both reaps (and reaps stage 1 holding it when stage 2 fails to spawn), and spawns stage 1 WITHOUT
+`SPAWN_F_CLEANFD`, so stage 1 inherits the read end of its own pipe — bash's `execute_pipeline` names this exact case
+("the read end of the pipe (fildes[0]) stays open in the first process, so that process will never get a SIGPIPE") and
+closes it through `fds_to_close`. With a read end open anywhere, a full pipe blocks its writer forever (Linux and
+FreeBSD agree), so `grep . /etc/ssl/cert.pem | echo x` and the stage-2-spawn-failure case never return to the prompt:
+RED at `-smp 1` and `-smp 4` with the staged agnsh and with agnoshi's head build. The PIPEW note's "a hang either way"
+is right for the shipped tools and wrong in general: kriya's `k_write` retries a short write up to 20,000 `#44` passes
+(≥ 200 s per stalled write), so with PIPEW reverted the same smoke still found no prompt in 40 s; but a cyrius stdlib
+producer that makes ONE `sys_write` (`file_write`, `println`) took the 0, dropped the rest and exited before PIPEW —
+for it PIPEW turns a completed (lossy) pipeline into a hang whenever the 3-argument `sys_write`'s leftover r10 (a4) is
+0. The kernel keeps POSIX semantics (a live read end is a reader); the fix is the shell's: spawn each stage with
+`SPAWN_F_CLEANFD`, close `rfd` once stage 2 exists and before reaping stage 1 on the failure paths — GREEN at both
+`-smp` with that patch (handoff-1.57.9/steps/ENDFIX-report.json) — plus cyrius passing a4 = 0. Gate: `scripts/smoke/ipc-wait-smoke.sh`
+phases `pipe-bulk` (one 64 KB write to a reader that sleeps 2 ms per 8 KB: the write returns within the reader's own
+sleep time + 30 ms — measured 68–71 ms against 66–74 ms asleep), `wr-epipe-close` / `wr-epipe-death` (4180 then -1,
+46–55 ms), `wr-kill` (state 6 → 265 in < 1 ms), `two-writer` (2 × 64 records of 512 B, none mixed), `wr-nb`, at
+`-smp 1` and `-smp 4`. Mutations (each RED alone at `-smp 4`): `pipe_read`'s writer wake dropped → pipe-bulk 1.68 s;
+the close wake back to readers-only → wr-epipe-close 139 ms; the death class wake masked to readers only →
+wr-epipe-death 121 ms (eof-death stays green); the PIPE_BUF all-or-nothing rule dropped → two-writer 36 mixed
+records and wr-nb.
 
 ## Keyboard line ownership (S3.7)
 

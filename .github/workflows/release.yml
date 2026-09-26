@@ -82,13 +82,13 @@ jobs:
             exit 1
           fi
           # ⛔ CEILING DELIBERATELY NOT ENFORCED — see the twin note in ci.yml. The 50000 floor above is
-          # the anti-vacuity assertion (a kernel was actually produced); the 2 MiB bound is check.sh
+          # the anti-vacuity assertion (a kernel was actually produced); the size grant (0x220000 since 1.57.9) is check.sh
           # gate 32's BUDGET, and enforcing it on the release path would block a tag over a number
           # whose own comment says it is a grant that expires. Measured at the revert: 4% headroom.
           echo "  (size ceiling is check.sh gate 32's, deliberately not enforced here — see ci.yml)" 
 
       - name: Kernel image vs BSP boot stack (image-layout-check.sh)
-        # ⭐ 1.57.7 (IMG-fix, review A5). NOT the size ceiling's case (above): gate 32's 2 MiB is a BUDGET;
+        # ⭐ 1.57.7 (IMG-fix, review A5). NOT the size ceiling's case (above): the weighed-size row's grant (scripts/check/weighed-size-check.sh) is a BUDGET;
         # this bound is a CORRECTNESS fact — past LOAD end 0x390000 the BSP boot stack (top 0x3A0000, live from
         # the shim's first instruction) grows down into the image's .rodata with no fault. build.sh only WARNS
         # for a plain image (so check.sh gate 34 can score it locally) and CI does not run check.sh, so without

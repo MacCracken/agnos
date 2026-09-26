@@ -396,6 +396,11 @@ else
         # the late command's buffer is not reused, and a lost completion disables the controller. DESTRUCTIVE (writes
         # LBAs at nsze/2) and leaves NVMe OFF: QEMU scratch disks only. scripts/smoke/nvme-late-smoke.sh.
         [ -n "$NVME_SELFTEST" ] && echo '#define NVME_SELFTEST'
+        # AHCI_SELFTEST=1 — 1.57.9: force one timed-out AHCI command (zero poll budget) and prove the port is recovered
+        # before its buffer / slot 0 / CT is reused, a PxIS error does not wedge the port, and an engine that will not
+        # stop ends in an HBA reset with every port offline. DESTRUCTIVE (writes sectors at capacity/2 of the SATA disk)
+        # and leaves AHCI OFF: QEMU scratch disks only. scripts/smoke/ahci-late-smoke.sh.
+        [ -n "$AHCI_SELFTEST" ] && echo '#define AHCI_SELFTEST'
         # DMA_SHADOW_SELFTEST=1 — 1.57.8: under a hand-built CR3 whose PD[2..127] (the whole pmm identity window) all
         # map ONE 0xA5 region — what a ring-3 PT_LOAD over that window does — every block backend (virtio-blk, NVMe incl.
         # its PRP list, AHCI) must transfer byte-exact and an HDA verb must round-trip. DESTRUCTIVE (virtio/AHCI sectors
@@ -455,6 +460,8 @@ else
         [ -n "$MMAP_SELFTEST" ]  && echo '#define MMAP_SELFTEST'
         [ -n "$MSC_SHORT_INJECT" ] && echo '#define MSC_SHORT_INJECT'
         [ -n "$MSC_CDB_CANARY" ] && echo '#define MSC_CDB_CANARY'
+        # MSC_BOUNCE_SELFTEST=1 — 1.57.9: msc_blk_* with kmalloc / direct-map / .bss buffers (scripts/smoke/msc-cdb-smoke.sh [bounce]).
+        [ -n "$MSC_BOUNCE_SELFTEST" ] && echo '#define MSC_BOUNCE_SELFTEST'
         # XHCI_SHADOW_SELFTEST=1 — 1.57.8: the xHCI command / EP0 / MSC bulk / HID paths under a CR3 whose whole pool
         # window is shadowed by junk (msc.cyr xhci_shadow_selftest; scripts/smoke/xhci-shadow-smoke.sh). Test-only.
         [ -n "$XHCI_SHADOW_SELFTEST" ] && echo '#define XHCI_SHADOW_SELFTEST'

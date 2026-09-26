@@ -858,6 +858,8 @@ fn proc_death_finish(pid, sig, via) {
     }
     # 1.57.8: its write ends stopped counting (pipe_writers_open skips state 0; an orphan's table is gone) — every
     # blocked pipe reader re-checks for EOF. A CLASS wake: the table that named the pipes may already be freed.
+    # 1.57.9 (PIPEW): the same wake matches every blocked WRITER (pipe_wkey = pipe_key | 1 is in the class): its read
+    # ends stopped counting too, so a writer beside a dying reader re-checks and gets its partial count / EPIPE.
     wq_wake_m(WK_PIPE, 0xFF00000000000000);
     return 0;
 }
@@ -9230,6 +9232,56 @@ fn rd5_wait(fd, buf, n) {
     return 0 - 1;
 }
 
+# ═══════════════ 1.57.9 (PIPEW) — THE BLOCKING PIPE WRITE, rd5_wait's mirror (blocking-waits.md "pipe writes") ═══════════════
+# The key a write needing `need` free bytes on `fd` would sleep on, or 0 = it would not block NOW (room, no reader
+# left — EPIPE, or not a pipe write end). Side-effect free: it is also the C9 re-check after the arm.
+fn wr1_key(fd, need) {
+    var kp = pipe_wbuf(fd);
+    if (kp == 0) { return 0; }
+    if ((PIPE_RING - (load64(kp) - load64(kp + 8))) >= need) { return 0; }
+    if (pipe_ends_open(kp, 0) == 0) { return 0; }
+    return pipe_wkey(kp);
+}
+# The write#1 arm calls this when vfs_write took `done` < n bytes with a4 == 0. Waits on pipe_wkey until the rest
+# fits (a write of <= PIPE_BUF all at once), re-deriving the buffer from the fd on every pass. Returns n; or the
+# PARTIAL count when the last reader went away after some bytes were taken (Linux `if (!ret)`, FreeBSD "don't return
+# EPIPE if any byte was written"); or -1 when no reader is left and nothing was taken (EPIPE — there is no SIGPIPE:
+# agnos has no default action for any signal but 9/18/19, D3). Wakers, each AFTER its condition store: pipe_read (the
+# tail), vfs_close_inner (a read end — it may be the last), proc_death_finish (the WK_PIPE class, after the reader's
+# state 0). The 100 ms backstop deadline re-checks anyway (a reader dropped by a path with no wake costs latency, never
+# a hang). ABORT (S7 boundary D: SIGKILL) -> -1, which never reaches ring 3 (B1); a STOP parks in wq_signal_point and
+# the loop re-arms. A context that cannot block keeps the short write (kernel callers — the rd5 precedent).
+fn wr1_wait(fd, buf, n, done) {
+    if (pipe_wbuf(fd) == 0) { return done; }                            # a device / file / socket short write: as-is
+    if (wq_can_block() == 0) { return done; }
+    while (done < n) {
+        var need = 1;
+        if (n <= PIPE_BUF) { need = n - done; }
+        var wk = wr1_key(fd, need);
+        if (wk != 0) {
+            var wa = wq_arm(wk, wq_deadline_after_us(100000));
+            if (wa == 2) { return done; }
+            if (wa == 1) {
+                if (wq_signal_point() == 1) { return 0 - 1; }
+            } else {
+                if (wr1_key(fd, need) != wk) { wq_cancel(); }               # the RE-CHECK after the arm
+                else { if (wq_sleep() == WR_SIGNAL) { if (wq_signal_point() == 1) { return 0 - 1; } } }
+            }
+        }
+        var wp = pipe_wbuf(fd);
+        if (wp == 0) { return done; }
+        var wn = pipe_write_n(wp, buf + done, n - done, need);
+        if (wn == 0) {
+            if (pipe_ends_open(wp, 0) == 0) {
+                if (done > 0) { return done; }
+                return 0 - 1;
+            }
+        }
+        done = done + wn;
+    }
+    return done;
+}
+
 fn flock_wait(fw_ino, fw_me, fw_op, fw_blk) {
     while (1) {
         flock_spin_lock();
@@ -9399,7 +9451,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
             if (wr < 0) { return 0 - 1; }        # peer gone / bad buffer — EPIPE-shaped
             return wr;
         }
-        return vfs_write(arg1, arg2, arg3);
+        # ⭐ 1.57.9 (PIPEW): a pipe write that took less than asked BLOCKS its caller when a4 == 0 (wr1_wait — the mirror
+        # of read#5's rd5_wait, woken by the reader's tail advance, a read end's close and the reader's death); a4 != 0
+        # is O_NONBLOCK and keeps the short write (0 when a <= PIPE_BUF write does not fit whole). Until 1.57.9 a full
+        # ring always short-wrote, so a producer beside a blocked reader retried at one timer tick per round.
+        var w1 = vfs_write(arg1, arg2, arg3);
+        if (w1 >= 0) { if (w1 < arg3) { if (ksyscall_a4_get() == 0) { w1 = wr1_wait(arg1, arg2, arg3, w1); } } }
+        return w1;
     }
     if (num == 2) { return proc_current_get(); }   # getpid() -> pid
     if (num == 3) {
@@ -9629,7 +9687,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # any CPU). When its scan finds a READY process it returns 0 WITHOUT halting — its contract is that the
         # caller's trailing yield takes that work — so the yield below hands the CPU over at once.
         if (wq_can_block() == 1) {
-            if (sched_halt_window(1) == 0) { sched_yield_kernel(); }
+            if (sched_halt_window(1, 0 - 1) == 0) { sched_yield_kernel(); }
             return 0;
         }
         # The legacy preempt-held sti window (sleep_ms#41's pre-1.57.7 body) for a context that may not block:
@@ -10454,6 +10512,22 @@ fn ksyscall(num, arg1, arg2, arg3) {
         stack_canary_check(canary);
         return 0;
     }
+    if (num == 108) {
+        # sched_yield_to(pid=arg1) -> 0 / -1 — a DIRECTED yield (1.57.9, issue 2026-09-25-any-two-sched-yield-loops-kick-each-other).
+        # The #44 yield-or-park, plus ONE 0xE1 kick toward the CPU where `pid` is parked in a yield (sched.cyr
+        # sys_sched_yield_to / sched_kick_target — Linux yield_to's resched_curr(p_rq), not an undirected wake). pid:
+        # self (= a plain #44, 0), an epoch-valid direct child, or the epoch-valid direct parent (yt_auth_ok). -1 = pid
+        # out of range, pid 0 / kmain / an idle / a kthread, dead / zombie / dying, or a stranger — returned AFTER the
+        # same quiet yield/park, so a loop naming a dead peer does not spin. a2..a4 never read. An in-kernel
+        # ksyscall(108) returns -1 with no effect (like ksyscall(44)). Dispatched HERE (the "arm after #107" ABI
+        # convention), not in the entry stub: the INV-FG-1 tripwire the stub runs for #44/#14 is called below for a
+        # user caller — the frame at the top of its kernel stack is its own ring-3 SYSCALL frame.
+        var yt_me = proc_current_get();
+        if (proc_is_user(yt_me) == 1) { fg_if0_tripwire(yt_me); }
+        var yt_r = sys_sched_yield_to(yt_me, arg1);
+        stack_canary_check(canary);
+        return yt_r;
+    }
     # GPU compute dispatch (#82) — the ring-3 dispatch seam (#82) ring-3 seam: run the proven 8x8 integer matmul on the caller's
     # A,B (64 i32 each) and write C=A*B to c_uva. The path mabda/tentib consume for GPU inference. -> 0 ok / <0 err.
     if (num == 82) { stack_canary_check(canary); return gpu_dispatch_sys(arg1, arg2, arg3); }                # gpu_dispatch(a, b, c)
@@ -10493,6 +10567,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var si_len = 40;
         if (arg2 >= 104) { si_len = 104; }
         if (arg2 >= 200) { si_len = 200; }
+        if (arg2 >= 208) { si_len = 208; }
         if (is_user_range(arg1, si_len) == 0) { stack_canary_check(canary); return 0 - 1; }
         store64(arg1 +  0, timer_ticks / 100);            # uptime seconds (100 Hz)
         store64(arg1 +  8, pmm_total * 4096);             # total RAM bytes (4 KB pages)
@@ -10583,6 +10658,14 @@ fn ksyscall(num, arg1, arg2, arg3) {
                 si_t = si_t + 1;
             }
         }
+        # ── RESCHEDULE IPIs, appended at +200 (1.57.9) ─────────────────────────────────────────────────
+        #   +200  u64  sched_kicks — 0xE1 reschedule kicks SENT since boot, all CPUs (sched.cyr: sched_kick_for's
+        #              wakes + sched_kick_target's #108 directed kicks). Linux's /proc/interrupts "RES" row is the
+        #              prior art (per CPU received there; one global sent-count here). A racy increment: diagnostic,
+        #              may under-count by a lost update, never over-counts. Monotonic, never reset.
+        # Why: the issue's gate ("two unrelated #44 idle loops ... sched_kicks must stay bounded") is measured from
+        # ring 3 (tests/ipcw); a 200-byte caller stays byte-identical (the tier rule above).
+        if (si_len >= 208) { store64(arg1 + 200, sched_kicks); }
         stack_canary_check(canary);
         return 0;
     }

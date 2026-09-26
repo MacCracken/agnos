@@ -1,8 +1,6 @@
 # 2026-09-25 — any two `sched_yield`#44 loops on two CPUs keep each other awake at IPI rate
 
-**Status:** 🟡 **OPEN, FOR AN OPERATOR RULING.** This is the accepted residual of 1.57.8's `#44` directed kick, and
-it is documented in ABI row 44 and `docs/architecture/blocking-waits.md`. It is not a defect of the change: the issue
-that change closed requires it (its `yield_peer < 1 ms` gate).
+**Status:** ✅ **RESOLVED 1.57.9 (2026-09-26)** — operator ruling option 1 (directed yield). `sched_yield`#44 is a quiet, local yield again (no cross-CPU kick); the new `sched_yield_to`#108 hands off to, and kicks only the CPU of, a NAMED peer (self, an epoch-valid child or parent). Gate: `ipc-wait-smoke` (two unrelated `#44` loops at `-smp 4` for 300 ms: 0 kicks — with the kick restored, mutation M1: 4,679; `yield-peer` through `#108`: ~0.13 ms per round at `-smp 4`; `yield-handoff`: 148 µs). See § Resolution.
 **Filed by:** agnos, from the 1.57.8 ENDFIX step report (`open_problems[0]`, "The operator may want to rule on
 it").
 **Checked against:** agnos **1.57.8**, `kernel/core/sched.cyr` `sched_halt_window` and `sched_kick_parker`
@@ -36,3 +34,15 @@ Under option 1, the agnoshi loops must be converted and measured with `bench-rin
 ## Evidence (operator-local)
 
 `~/.claude/projects/-home-macro-Repos-agnos/handoff-1.57.8/steps/ENDFIX-report.json`, `~/.claude/projects/-home-macro-Repos-agnos/handoff-1.57.8/steps/PIPE-endreview.json` (PIPE-R1).
+
+## Resolution (1.57.9, 2026-09-26)
+
+Shipped as the operator's option 1. Prior art followed: Linux `sched_yield` (`do_sched_yield`, local runqueue only, and its
+man-page warning against waiting with it), Linux `yield_to` → `set_next_buddy` (the handoff) and KVM's directed yield, Mach
+`thread_switch`, FreeBSD `sched_relinquish`. `#44` sends no IPI; `#108` hands off when the peer is READY on the caller's CPU and
+kicks the peer's CPU only when the peer is parked in a yield. ABI rows 44 and 108; `docs/architecture/blocking-waits.md`.
+
+What it broke: by the ruling, a `#44` poll loop beside a peer RUNNING on another CPU costs up to one timer tick per round again.
+The two such loops in agnoshi (the background-job prompt poll, `run`/pipeline reaping) are filed in agnoshi as
+`docs/development/issue/2026-09-26-poll-and-yield-loops-should-block.md` (move them to `read` a4 = 0 / `WAIT_BLOCK`).
+cyrius needs `SYS_SCHED_YIELD_TO` = 108 (peer filing); the ABI gate is red for #106/#107/#108 until then.

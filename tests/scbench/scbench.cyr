@@ -13,10 +13,12 @@
 #                PARKS the CPU for one hlt (a designated preempt point, not charged), so each yield costs
 #                about ONE INTERRUPT PERIOD (~10 ms at 100 Hz). A ~µs reading means the park is gone and a
 #                poll+yield loop spins its core (mutation M-D2); before 1.57.7 it was the idle round trip
-#   yield_peer  #44 against a second copy of this program spawned by spawn_path#43 that also yields in a
-#                loop: at -smp 1 each yield is a direct process-to-process switch, so ns_per is two
-#                switches (there and back). At -smp 4 the peer may run on another CPU and the number is
-#                a mix — read it as a measurement, not a switch cost.
+#   yield_peer  (1.57.9) sched_yield_to#108(peer) against a second copy of this program spawned by
+#                spawn_path#43 that loops #108(parent): at -smp 1 each yield is a direct process-to-process
+#                switch, so ns_per is two switches (there and back). At -smp 4 the peer may run on another CPU
+#                and each park kicks only the CPU where its NAMED peer is parked — read it as a measurement,
+#                not a switch cost. (Until 1.57.8 this row used #44, whose undirected kick woke ANY other #44
+#                parker; #44 is quiet since 1.57.9 — issue 2026-09-25-any-two-sched-yield-loops-kick-each-other.)
 # ⚠ Clock: uptime_us#95 (rdtsc / calibrated cycles). -1 means the calibration was refused; the program
 # says so (SCBENCH-NOCLOCK) instead of printing numbers it cannot have measured.
 # ⚠ It ALWAYS exits 0 after SCBENCH-DONE — a non-zero exit drops kybernet into the emergency shell.
@@ -44,13 +46,31 @@ fn scb_row(name, t0, t1, n) {
 }
 
 var SCB_PEER_N = 2000;
-var SCB_ME = "/bin/agnsh yieldpeer";
-
-# The peer role: yield SCB_PEER_N + 64 times (a little more than the parent, so the parent never runs out
-# of partner), then exit 0.
-fn scb_peer(): i64 {
+var scb_line[8];         # 64 B: "/bin/agnsh yieldpeer <parent pid>"
+var SCB_LN = 0;
+fn scb_ln_s(s) { var i = 0; while (load8(s + i) != 0) { store8(&scb_line + SCB_LN, load8(s + i)); SCB_LN = SCB_LN + 1; i = i + 1; } return 0; }
+fn scb_ln_n(n) {
+    var b[24];
     var i = 0;
-    while (i < SCB_PEER_N + 64) { syscall(44, 0, 0, 0, 0); i = i + 1; }
+    if (n == 0) { store8(&scb_line + SCB_LN, 48); SCB_LN = SCB_LN + 1; return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; store8(&scb_line + SCB_LN, load8(&b + i)); SCB_LN = SCB_LN + 1; }
+    return 0;
+}
+fn scb_atoi(s) {
+    var v = 0;
+    var i = 0;
+    while (load8(s + i) >= 48) { if (load8(s + i) > 57) { break; } v = v * 10 + (load8(s + i) - 48); i = i + 1; }
+    return v;
+}
+
+# The peer role: sched_yield_to#108(parent) SCB_PEER_N + 64 times (a little more than the parent, so the parent never
+# runs out of partner), then exit 0.
+fn scb_peer(): i64 {
+    var pp = 0;
+    if (argc() >= 3) { pp = scb_atoi(argv(2)); }
+    var i = 0;
+    while (i < SCB_PEER_N + 64) { syscall(108, pp, 0, 0, 0); i = i + 1; }
     return 0;
 }
 
@@ -99,13 +119,16 @@ fn main(): i64 {
     t1 = syscall(95, 0, 0, 0, 0);
     scb_row("yield_idle", t0, t1, ny);
 
-    # yield against a peer that also yields
-    var peer = syscall(43, SCB_ME, strlen(SCB_ME), 0, 0);
+    # directed yield (#108) against a peer that directs its yields back at us
+    SCB_LN = 0;
+    scb_ln_s("/bin/agnsh yieldpeer "); scb_ln_n(syscall(2, 0, 0, 0, 0));
+    store8(&scb_line + SCB_LN, 0);
+    var peer = syscall(43, &scb_line, SCB_LN, 0, 0);
     if (peer < 0) { scb_out("SCBENCH-NOPEER rc="); scb_num(peer); scb_out("\n"); }
     if (peer >= 0) {
         t0 = syscall(95, 0, 0, 0, 0);
         i = 0;
-        while (i < SCB_PEER_N) { syscall(44, 0, 0, 0, 0); i = i + 1; }
+        while (i < SCB_PEER_N) { syscall(108, peer, 0, 0, 0); i = i + 1; }
         t1 = syscall(95, 0, 0, 0, 0);
         scb_row("yield_peer", t0, t1, SCB_PEER_N);
         var w = syscall(4, peer, 0, 0, 0);

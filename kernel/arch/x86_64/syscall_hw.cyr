@@ -96,7 +96,8 @@ fn syscall_handler(user_rsp, sc_num, sc_arg1, sc_arg2, sc_arg3, sc_arg4) {
     # (klug_spill_owed) runs here too. Fast path: 3 loads + 1 call. syscall_hw.cyr is parsed before proc.cyr, so the
     # lifecycle arrays are read inside proc_b1_check.
     var result = 0;
-    # sched_yield(#44): the in-kernel yield-or-park — see above. The INV-FG-1 tripwire stays (PLAN S7-E1).
+    # sched_yield(#44): the in-kernel yield-or-park — see above. The INV-FG-1 tripwire stays (PLAN S7-E1). ⭐ 1.57.9:
+    # QUIET — no cross-CPU kick; the DIRECTED yield is sched_yield_to#108, an ordinary ksyscall arm (syscall.cyr).
     if (sc_num == 44) { fg_if0_tripwire(sh_me); result = sys_sched_yield_k(); }
     else {
         # ⛔ fork#96 dispatches HERE: it needs `user_rsp`, which only this function is handed, and the child's resume

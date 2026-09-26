@@ -25,31 +25,44 @@
 
 # Configuration -------------------------------------------------------
 # Number of 4 KB backing pages = 64 (256 KB at 8 sectors/page = 512 sectors).
-# To tune, edit RAMDISK_NPAGES_DEFAULT below AND ramdisk_pages[] array size
-# (8 bytes per phys-addr entry, must be >= RAMDISK_NPAGES_DEFAULT * 8).
+# To tune, edit RAMDISK_NPAGES_DEFAULT below (ramdisk_page_kva[] is dimensioned
+# for RAMDISK_NPAGES_MAX pointers).
 # Capped at 128 (512 KB) by audit recommendation — see prior-art doc § 3.5.
 
 var RAMDISK_NPAGES_DEFAULT = 64;   # 256 KB default; matches OpenBSD MINIROOTSIZE
 var RAMDISK_NPAGES_MAX     = 128;  # 512 KB ceiling; audit § 3.5
 
 # State ----------------------------------------------------------------
-# Phys addresses of the N backing pages, indexed by `sector >> 3` (8 sectors
-# per 4 KB page). Sized at 128 entries × 8 bytes = 1024 bytes max footprint
-# regardless of runtime N (allows tuning RAMDISK_NPAGES_DEFAULT without
-# changing the array dim, up to the MAX bound).
-var ramdisk_pages[1024];
+# DIRECT-MAP pointers (dma_kva) to the N backing pages, indexed by `sector >> 3`
+# (8 sectors per 4 KB page). Sized at 128 entries × 8 bytes = 1024 bytes max
+# footprint regardless of runtime N (allows tuning RAMDISK_NPAGES_DEFAULT
+# without changing the array dim, up to the MAX bound).
+# ⚠ 1.57.9 — a MODULE-scope `var x[N]` is N u64, not N bytes (RULES trap 8; dsh_a[512] is
+# 4 KB), so the old `[1024]` was 8 KB of .bss — in every build, since this file is always
+# compiled — for the 1 KB this comment promised. [128] is the 1 KB, one pointer per MAX page.
+# ⛔ 1.57.9 (CPUVA) — a KVA, never the phys. ramdisk_blk_read/write run from the fs
+# syscalls under the CALLER's CR3, where a pmm page's identity VA ([4 MB, 256 MB),
+# PD[2..127]) is the ring-3 image's page: the phys == VA ramdisk read the process's
+# bytes as disk contents and wrote disk writes into the process. No phys is kept —
+# nothing but the CPU touches these pages; if a free path is ever added,
+# `kva - DIRECTMAP_BASE` is the phys (FreeBSD DMAP_TO_PHYS).
+var ramdisk_page_kva[128];
 
 var ramdisk_active   = 0;   # 1 if init succeeded and pages are allocated
 var ramdisk_npages   = 0;   # actual allocated count; 0 if init bailed
 var ramdisk_capacity = 0;   # in 512-B sectors = ramdisk_npages * 8
 
 # Initialization ------------------------------------------------------
-# Allocates RAMDISK_NPAGES_DEFAULT pages from pmm_alloc, identity-maps each
-# (matches the nvme.cyr DMA-buffer pattern at line 317), records phys in
-# ramdisk_pages[]. On any pmm_alloc failure mid-loop, leaves ramdisk_active=0
-# and ramdisk_npages=0 so the register path skips; allocated pages stay
-# leaked (pmm has no free path today — matches the NVMe / AHCI / xHCI
-# pattern of unwind-by-abandon).
+# Allocates RAMDISK_NPAGES_DEFAULT pages from pmm_alloc, records each page's
+# direct-map pointer in ramdisk_page_kva[] and zeroes the page through it. Runs
+# from main.cyr after cr3_load(0x1000) (the alias is live only there). On any
+# pmm_alloc failure (or a pointer outside the direct map — the boot assert) mid-
+# loop, leaves ramdisk_active=0 and ramdisk_npages=0 so the register path skips;
+# pages allocated so far are abandoned (unwind-by-abandon, matching the NVMe /
+# AHCI / xHCI init paths; pmm_free exists but a boot-time 256 KB leak on a
+# flag build is not worth a second unwind path).
+# (1.57.9: the per-page `vmm_map(p, p, 0x83)` identity map is gone — it mapped
+# into whatever CR3 was live and served only the phys == VA access it existed for.)
 fn ramdisk_init() {
     var n = RAMDISK_NPAGES_DEFAULT;
     if (n > RAMDISK_NPAGES_MAX) { return 0 - 1; }
@@ -65,15 +78,18 @@ fn ramdisk_init() {
             kprintln(" pages -- disabled", 18);
             return 0 - 1;
         }
-        # Identity-map the page for kernel access (same posture as nvme.cyr's
-        # admin-queue / IDENTIFY-scratch allocations at lines 317-319).
-        if (vmm_is_mapped(p) == 0) { vmm_map(p, p, 0x83); }
-        # Zero the page (64 × 8-byte stores = 512 bytes per iteration; loop
-        # 8 times to cover the full 4 KB page).
-        for (var k = 0; k < 512; k = k + 1) {
-            store64(p + k * 8, 0);
+        var pk = dma_kva(p);
+        if (dma_kva_ok(pk) == 0) {
+            ramdisk_npages = 0;
+            ramdisk_active = 0;
+            kprintln("ramdisk: page KVA outside the direct map -- disabled", 52);
+            return 0 - 1;
         }
-        store64(&ramdisk_pages + i * 8, p);
+        # Zero the page (512 × 8-byte stores = the full 4 KB page).
+        for (var k = 0; k < 512; k = k + 1) {
+            store64(pk + k * 8, 0);
+        }
+        store64(&ramdisk_page_kva + i * 8, pk);
     }
 
     ramdisk_npages   = n;
@@ -90,11 +106,11 @@ fn ramdisk_init() {
 fn ramdisk_blk_read(sector, buf) {
     if (ramdisk_active == 0) { return 0 - 1; }
     # ⛔ 1.56.52 — A LOWER BOUND TOO. Cyrius comparisons are SIGNED, so a NEGATIVE sector passed
-    # `sector >= ramdisk_capacity` and then indexed `&ramdisk_pages + (sector >> 3) * 8` at a negative
+    # `sector >= ramdisk_capacity` and then indexed `&ramdisk_page_kva + (sector >> 3) * 8` at a negative
     # displacement — an out-of-bounds load of a page pointer, followed by a 512-byte copy through it.
     if (sector < 0) { return 0 - 1; }
     if (sector >= ramdisk_capacity) { return 0 - 1; }
-    var page = load64(&ramdisk_pages + (sector >> 3) * 8);
+    var page = load64(&ramdisk_page_kva + (sector >> 3) * 8);
     var off  = (sector & 7) * 512;
     for (var i = 0; i < 64; i = i + 1) {
         store64(buf + i * 8, load64(page + off + i * 8));
@@ -105,11 +121,11 @@ fn ramdisk_blk_read(sector, buf) {
 fn ramdisk_blk_write(sector, buf) {
     if (ramdisk_active == 0) { return 0 - 1; }
     # ⛔ 1.56.52 — A LOWER BOUND TOO. Cyrius comparisons are SIGNED, so a NEGATIVE sector passed
-    # `sector >= ramdisk_capacity` and then indexed `&ramdisk_pages + (sector >> 3) * 8` at a negative
+    # `sector >= ramdisk_capacity` and then indexed `&ramdisk_page_kva + (sector >> 3) * 8` at a negative
     # displacement — an out-of-bounds load of a page pointer, followed by a 512-byte copy through it.
     if (sector < 0) { return 0 - 1; }
     if (sector >= ramdisk_capacity) { return 0 - 1; }
-    var page = load64(&ramdisk_pages + (sector >> 3) * 8);
+    var page = load64(&ramdisk_page_kva + (sector >> 3) * 8);
     var off  = (sector & 7) * 512;
     for (var i = 0; i < 64; i = i + 1) {
         store64(page + off + i * 8, load64(buf + i * 8));

@@ -1,5 +1,6 @@
-# ipcw — agnos 1.57.8: BLOCKING pipe and channel reads, and the #44 directed park kick, from ring 3.
-# Issue: docs/development/issues/2026-09-25-cross-cpu-poll-and-yield-loops-are-tick-bound.md (its Gate section).
+# ipcw — agnos 1.57.8: BLOCKING pipe and channel reads, and (1.57.9) the DIRECTED yield sched_yield_to#108, from ring 3.
+# Issues: docs/development/issues/archived/2026-09-25-cross-cpu-poll-and-yield-loops-are-tick-bound.md (its Gate section) and
+# 2026-09-25-any-two-sched-yield-loops-kick-each-other.md (1.57.9: #44 is quiet again; its gate is `yield-pair`).
 #
 # The driver (no arguments; seeded as /bin/agnsh) runs every phase and prints one `IPCW-OK <phase> ...` or
 # `IPCW-FAIL <phase> ...` line each, then `IPCW-DONE pass=N fail=M` and `IPCW-EXIT 0`. Child roles are this same
@@ -9,13 +10,27 @@
 #             writes them into pipe B, the driver's blocking read takes them back. GATE: < 1 ms per round (at -smp 4
 #             the two sides run on different CPUs; before 1.57.8 a poll+#44 loop paid one 10 ms tick per round).
 #   chan-pp   the same through a #97 channel pair, read#5 / write#1 on the channel fds. GATE: < 1 ms per round.
-#   yield-peer  #44 against a child that also loops #44 (bench-ring3's yield_peer shape). GATE: < 1 ms per yield.
-#   pause-pair  (ENDFIX PIPE-R1) #14 pause against an UNRELATED child that also loops #14: neither sends nor draws the
-#             directed kick, so at -smp > 1 each pause is a whole interrupt again. GATE (sysinfo cpus > 1): >= 1 ms per
-#             pause (the review's defect: two pausers on two CPUs woke each other at ~100 us, forever). -smp 1: the
-#             two alternate by direct switches, which is not this gate's subject — reported, not gated.
-#   mixed-pair  #44 against a child looping #14 (agnsh's bg poll beside a sock_recv backoff): a #44 park kicks only
-#             another #44 parker, so the yielder halts a whole interrupt. GATE (cpus > 1): >= 1 ms per yield.
+#   yield-peer  (1.57.9) sched_yield_to#108(child) against a child looping #108(parent) (bench-ring3's yield_peer
+#             shape): each park kicks only the CPU where its NAMED peer is parked. GATE: < 1 ms per yield, every
+#             call returns 0.
+#   yield-handoff  (1.57.9 ENDFIX YIELD-R1) the same pair beside a BUSY sibling that never yields: #108(t) must run t
+#             NEXT when t is READY here (Linux yield_to -> set_next_buddy, Mach thread_switch handoff). Round-robin
+#             alone routes one leg of every round through the busy sibling (~10 ms per round at -smp 1). GATE: < 1 ms
+#             per round at every -smp, every call returns 0.
+#   pause-pair  (ENDFIX PIPE-R1) #14 pause against an UNRELATED child that also loops #14: neither sends nor draws a
+#             directed kick, so at -smp > 1 each pause is a whole interrupt again (the review's defect: two pausers on
+#             two CPUs woke each other at ~100 us, forever).
+#   mixed-pair  #44 against a child looping #14 (agnsh's bg poll beside a sock_recv backoff).
+#   yield-pair  (1.57.9, THE ISSUE'S GATE) #44 against a child that also loops #44 — two yield loops that do not
+#             name each other. 1.57.8's undirected kick made them wake each other every ~100 us; #44 is quiet now.
+#             Each *-pair phase loops for a 300 ms window after a 40 ms warm-up and reads sched_kicks (sysinfo#35
+#             +200, len 208) around the window. GATES: kicks sent in the window <= IP_KICK_MAX (all -smp), and
+#             (sysinfo cpus > 1) >= 1 ms per call. -smp 1: the two alternate by direct switches, which is not the
+#             per-call gate's subject — reported, not gated.
+#   yield-to-refused  (1.57.9) #108 on self -> 0; on -1, 16 (out of range) and pid 0 (kmain, not a user process),
+#             on a reaped child and — from a child — on a SIBLING (a stranger) -> -1; the same child's #108 on its
+#             PARENT -> 0 (the parent direction is authorized). A refusal still yields/parks: 20 x #108(0) with
+#             nothing else READY take >= 1 ms each (a ~us reading = a refusal that returns at once and would spin).
 #   nb        read#5 a4 = 1 (O_NONBLOCK) on an empty pipe with a live writer and on an empty channel: -2, at once.
 #   eof-close the child sleeps 30 ms, writes one byte, sleeps 30 ms, CLOSES its write end, then sleeps 400 ms: the
 #             driver's second blocking read (entered while the child still holds the end) returns 0 (EOF) within
@@ -25,6 +40,23 @@
 #   kill      a child blocks reading an empty pipe (its own inherited write end keeps it live: it would wait
 #             forever); #99 shows it BLOCKED (state 6); kill(9) ends it and WAIT_BLOCK returns 265 within 50 ms
 #             (S7 boundary D: the kill interrupts the wait; the backstop alone would take up to 100 ms).
+#   ── 1.57.9 (PIPEW): THE BLOCKING PIPE WRITE (docs/development/issues/2026-09-25-pipe-writes-do-not-block.md) ──
+#   pipe-bulk ONE blocking write#1 (a4 = 0) of 64 KB into a pipe whose child reader takes 700 B per read and sleeps
+#             2 ms per 8 KB (tick-granular), checking every byte and reporting its time ASLEEP on a result pipe.
+#             GATE: the write returns 65536 within the reader's time asleep + 30 ms (each refill waits for pipe_read's
+#             writer wake; the 100 ms backstop alone would add ~16 x 100 ms), and the reader saw every byte (exit 0).
+#   wr-epipe-close  the driver drops its read end; the child reader sleeps 20 ms, reads 100 B, sleeps 20 ms and CLOSES
+#             its read end — the last one. The driver's 8192-byte blocking write (entered on an empty ring) returns
+#             the PARTIAL count 4180 (4080 + the 100 freed) within 90 ms (the close wake at ~40 ms; the backstop alone
+#             ~120 ms), and the next write is -1 (EPIPE) at once.
+#   wr-epipe-death  the same, but the child EXITS holding its read end (the reader's death wake, proc_death_finish).
+#   wr-kill   a child blocks WRITING a full pipe (it holds a read end itself, so it would wait forever); #99 shows it
+#             BLOCKED (state 6); kill(9) ends it and WAIT_BLOCK returns 265 within 50 ms (S7 boundary D).
+#   two-writer  two children each write 64 framed 512-byte records (every byte the writer's id) with blocking writes;
+#             the driver reads them back 512 B at a time. GATE: 64 + 64 whole records, none mixed (a <= PIPE_BUF write
+#             lands whole, under pipe_lock — 4080 is not a multiple of 512, so a split record is otherwise certain).
+#   wr-nb     a4 = 1 (O_NONBLOCK): a 0-byte write is 0; a full ring takes 0 at once; with 100 B free a 200-byte write
+#             (<= PIPE_BUF) takes 0 and a 100-byte one takes 100; with no reader left, NB and blocking writes are -1.
 # ⚠ It ALWAYS exits 0 after IPCW-DONE — a non-zero exit drops kybernet into the emergency shell.
 
 var PP_N = 2000;
@@ -38,6 +70,14 @@ var ip_pass = 0;
 var ip_fail = 0;
 var ip_ob[64];
 var IP_ON = 0;
+var ip_si[26];           # 208 B sysinfo#35 (sched_kicks at +200)
+# The *-pair kick bound over one 300 ms window. The defect (1.57.8's undirected #44 kick) sends one kick per round,
+# ~100-120 us -> ~2500-3000 per window; the background (timer-driven wakes, kybernet) is a handful. 30 = 100/s.
+var IP_KICK_MAX = 30;
+var ip_big[8192];        # 64 KB: pipe-bulk's source (driver) / sink (reader child)
+var IP_BULK = 65536;
+var IP_REC = 512;        # the kernel's PIPE_BUF
+var IP_NREC = 64;
 
 fn o_flush() { if (IP_ON > 0) { syscall(1, 1, &ip_ob, IP_ON, 0); } IP_ON = 0; return 0; }
 fn o_putc(ch) { store8(&ip_ob + IP_ON, ch); IP_ON = IP_ON + 1; if (ch == 10) { o_flush(); } if (IP_ON >= 500) { o_flush(); } return 0; }
@@ -118,6 +158,24 @@ fn c_pp(r, w, n) {
     return 0;
 }
 fn c_yield(n) { var i = 0; while (i < n) { syscall(44, 0, 0, 0, 0); i = i + 1; } return 0; }
+# #108 toward the parent (pid pp) n times; exit 5 if any call did not return 0.
+fn c_yield_to(pp, n) {
+    var i = 0; var bad_n = 0;
+    while (i < n) { if (syscall(108, pp, 0, 0, 0) != 0) { bad_n = bad_n + 1; } i = i + 1; }
+    if (bad_n != 0) { return 5; }
+    return 0;
+}
+# The stranger row: 5 x #108(sib) must be -1 (a sibling is neither child nor parent); #108(pp) must be 0 (the parent
+# direction). 0 = both held; 1 = a sibling call was not -1; 2 = the parent call was not 0.
+fn c_stranger(sib, pp) {
+    var i = 0;
+    while (i < 5) { if (syscall(108, sib, 0, 0, 0) != (0 - 1)) { return 1; } i = i + 1; }
+    if (syscall(108, pp, 0, 0, 0) != 0) { return 2; }
+    return 0;
+}
+# ENDFIX YIELD-R1: a BUSY sibling that never yields, parks or blocks (it is preempted only by the tick); the driver
+# kills it. Its us() calls are plain syscalls that return at once.
+fn c_busy() { var t = 0; while (1) { t = t + us(); } return 0; }
 fn c_pause(n) { var i = 0; while (i < n) { syscall(14, 0, 0, 0, 0); i = i + 1; } return 0; }
 fn c_eofc(w) {
     syscall(41, 30, 0, 0, 0); wr(w, "x", 1);
@@ -127,6 +185,49 @@ fn c_eofc(w) {
 }
 fn c_eofd() { syscall(41, 30, 0, 0, 0); return 0; }
 fn c_blk(r) { rd(r, &ip_msg, 8, 0); return 9; }
+# 1.57.9: byte i of the bulk stream.
+fn bulk_b(i) { return (i * 7 + 3) & 255; }
+# pipe-bulk's reader: `total` bytes, 700 per read, 2 ms asleep per 8 KB; 0 = every byte in order, 7 = a wrong byte,
+# 8 = EOF / an error before `total`. It reports the time it spent ASLEEP (8 bytes, us) on the result pipe `rp`: that is
+# the reader's own time the writer must track (#41 sleeps are tick-granular, so "2 ms" is not a constant).
+fn c_sr(r, total, rp) {
+    var got = 0;
+    var nap = 8192;
+    var slept = 0;
+    while (got < total) {
+        var want = total - got;
+        if (want > 700) { want = 700; }
+        var n = rd(r, &ip_big, want, 0);
+        if (n <= 0) { return 8; }
+        var i = 0;
+        while (i < n) { if (load8(&ip_big + i) != bulk_b(got + i)) { return 7; } i = i + 1; }
+        got = got + n;
+        if (got >= nap) { var s0 = us(); syscall(41, 2, 0, 0, 0); slept = slept + (us() - s0); nap = nap + 8192; }
+    }
+    store64(&ip_msg, slept);
+    wr(rp, &ip_msg, 8);
+    return 0;
+}
+# wr-epipe-*'s reader: take 100 B at 20 ms, then (mode 0) close the read end at 40 ms and linger, or (mode 1) exit
+# holding it at 40 ms.
+fn c_rc(r, mode) {
+    syscall(41, 20, 0, 0, 0);
+    if (rd(r, &ip_big, 100, 0) != 100) { return 3; }
+    syscall(41, 20, 0, 0, 0);
+    if (mode == 1) { return 0; }
+    cls(r);
+    syscall(41, 300, 0, 0, 0);
+    return 0;
+}
+fn c_wb(w) { wr(w, &ip_big, 8192); return 9; }
+# two-writer's writer: n records of IP_REC bytes, every byte = id; 4 = a record was not taken whole.
+fn c_tw(w, id, n) {
+    var i = 0;
+    while (i < IP_REC) { store8(&ip_big + i, id); i = i + 1; }
+    var k = 0;
+    while (k < n) { if (wr(w, &ip_big, IP_REC) != IP_REC) { return 4; } k = k + 1; }
+    return 0;
+}
 
 fn child(): i64 {
     var role = argv(1);
@@ -136,11 +237,19 @@ fn child(): i64 {
     if (argc() > 4) { c = ip_atoi(argv(4)); }
     if (eq(role, "pp") == 1) { return c_pp(a, b, c); }
     if (eq(role, "cp") == 1) { return c_pp(a, a, c); }
-    if (eq(role, "yp") == 1) { return c_yield(c); }
+    if (eq(role, "yp") == 1) { return c_yield_to(a, c); }
+    if (eq(role, "y4") == 1) { return c_yield(c); }
+    if (eq(role, "st") == 1) { return c_stranger(a, b); }
+    if (eq(role, "ex") == 1) { return 0; }
+    if (eq(role, "bz") == 1) { return c_busy(); }
     if (eq(role, "ps") == 1) { return c_pause(c); }
     if (eq(role, "eofc") == 1) { return c_eofc(a); }
     if (eq(role, "eofd") == 1) { return c_eofd(); }
     if (eq(role, "blk") == 1) { return c_blk(a); }
+    if (eq(role, "sr") == 1) { return c_sr(a, c, b); }
+    if (eq(role, "rc") == 1) { return c_rc(a, b); }
+    if (eq(role, "wb") == 1) { return c_wb(a); }
+    if (eq(role, "tw") == 1) { return c_tw(a, b, c); }
     return 99;
 }
 
@@ -208,24 +317,76 @@ fn ph_chan_pp() {
 }
 
 fn ph_yield_peer() {
-    var pid = spawn3("yp", 0, 0, PP_N + 64);
+    var me = syscall(2, 0, 0, 0, 0);
+    var pid = spawn3("yp", me, 0, PP_N + 64);
     if (pid < 0) { bad("yield-peer"); o_kv("spawn", pid); o_out("\n"); return 0; }
     var t0 = us();
     var i = 0;
-    while (i < PP_N) { syscall(44, 0, 0, 0, 0); i = i + 1; if ((us() - t0) > 5000000) { break; } }
+    var nz = 0;
+    while (i < PP_N) {
+        if (syscall(108, pid, 0, 0, 0) != 0) { nz = nz + 1; }
+        i = i + 1;
+        if ((us() - t0) > 5000000) { break; }
+    }
     var t1 = us();
     syscall(16, pid, 9, 0, 0);                                   # a capped run leaves the peer yielding
-    reap(pid);
-    round_gate("yield-peer", t0, t1, i, i);
+    var st = reap(pid);
+    var dv = i;
+    if (dv < 1) { dv = 1; }
+    var nsr = ((t1 - t0) * 1000) / dv;
+    verdict(i == PP_N && nsr < 1000000 && nz == 0 && (st == 0 || st == 265), "yield-peer");
+    o_kv("n", PP_N); o_kv("got", i); o_kv("us", t1 - t0); o_kv("ns_per_round", nsr); o_kv("nonzero", nz);
+    o_kv("child_status", st); o_out("\n");
     return 0;
 }
 
-# ENDFIX PIPE-R1: a park beside an unrelated parker on another CPU must sleep, not ping-pong. The driver loops
-# syscall `num` (14 or 44) 30 times beside a child looping #14; per-call time >= 1 ms when cpus > 1.
-fn ph_idle_pair(ph, num) {
+# ENDFIX YIELD-R1 — THE HANDOFF: #108(t) must run t NEXT when t is READY on the caller's CPU (Linux yield_to_task_fair ->
+# set_next_buddy; Mach thread_switch handoff; L4 ThreadSwitch donation). The pair of yield-peer, plus a BUSY sibling
+# that is always READY. Round-robin alone sends one leg of every round through the busy sibling, which then runs until
+# the tick (~10 ms per round at -smp 1, where all three share one CPU); the handoff makes the pair alternate directly.
+# GATE (every -smp): every #108 returns 0 and < 1 ms per round.
+fn ph_yield_handoff() {
+    var me = syscall(2, 0, 0, 0, 0);
+    var bz = spawn3("bz", 0, 0, 0);
+    if (bz < 0) { bad("yield-handoff"); o_kv("spawn_busy", bz); o_out("\n"); return 0; }
+    var pid = spawn3("yp", me, 0, 1000000);
+    if (pid < 0) { syscall(16, bz, 9, 0, 0); reap(bz); bad("yield-handoff"); o_kv("spawn", pid); o_out("\n"); return 0; }
+    var t0 = us();
+    var i = 0;
+    var nz = 0;
+    while (i < 400) {
+        if (syscall(108, pid, 0, 0, 0) != 0) { nz = nz + 1; }
+        i = i + 1;
+        if ((us() - t0) > 5000000) { break; }
+    }
+    var t1 = us();
+    syscall(16, pid, 9, 0, 0);
+    syscall(16, bz, 9, 0, 0);
+    var st = reap(pid);
+    var bst = reap(bz);
+    var dv = i;
+    if (dv < 1) { dv = 1; }
+    var nsr = ((t1 - t0) * 1000) / dv;
+    verdict(i == 400 && nsr < 1000000 && nz == 0 && (st == 0 || st == 265) && bst == 265, "yield-handoff");
+    o_kv("n", 400); o_kv("got", i); o_kv("us", t1 - t0); o_kv("ns_per_round", nsr); o_kv("nonzero", nz);
+    o_kv("child_status", st); o_kv("busy_status", bst); o_out("\n");
+    return 0;
+}
+
+# sched_kicks (sysinfo#35 +200, len 208), or -1 on a kernel without the field.
+
+fn kicks() {
+    if (syscall(35, &ip_si, 208, 0, 0) != 0) { return 0 - 1; }
+    return load64(&ip_si + 200);
+}
+
+# ENDFIX PIPE-R1 + 1.57.9: a park beside an unrelated parker on another CPU must sleep, not ping-pong. The driver loops
+# syscall `num` (14 or 44) for a 300 ms window beside a child `crole` ("ps" loops #14, "y4" loops #44) and counts the
+# 0xE1 kicks sent meanwhile. Per-call time >= 1 ms when cpus > 1; kicks <= IP_KICK_MAX always.
+fn ph_idle_pair(ph, num, crole) {
     var cpus = 0;
     if (syscall(35, &ip_pl, 40, 0, 0) == 0) { cpus = load64(&ip_pl + 32); }
-    var pid = spawn3("ps", 0, 0, 1000000);
+    var pid = spawn3(crole, 0, 0, 1000000);
     if (pid < 0) { bad(ph); o_kv("spawn", pid); o_out("\n"); return 0; }
     syscall(41, 50, 0, 0, 0);
     # WARM-UP, 40 ms of the same calls: the two may start on ONE CPU (a wake taken by the sleeper's own CPU), where
@@ -233,17 +394,64 @@ fn ph_idle_pair(ph, num) {
     # steals the READY one within ~10 ms, and keep-current then keeps each parker on its own CPU.
     var t0 = us();
     while ((us() - t0) < 40000) { syscall(num, 0, 0, 0, 0); }
+    var k0 = kicks();
     t0 = us();
     var i = 0;
-    while (i < 30) { syscall(num, 0, 0, 0, 0); i = i + 1; }
+    while ((us() - t0) < 300000) { syscall(num, 0, 0, 0, 0); i = i + 1; }
     var t1 = us();
+    var k1 = kicks();
     syscall(16, pid, 9, 0, 0);
     reap(pid);
-    var nsp = ((t1 - t0) * 1000) / 30;
+    if (i < 1) { i = 1; }
+    var nsp = ((t1 - t0) * 1000) / i;
     var gated = 0;
     if (cpus > 1) { gated = 1; }
-    verdict(gated == 0 || nsp >= 1000000, ph);
-    o_kv("cpus", cpus); o_kv("gated", gated); o_kv("us", t1 - t0); o_kv("ns_per_call", nsp); o_out("\n");
+    var kd = k1 - k0;
+    verdict(k0 >= 0 && kd <= IP_KICK_MAX && (gated == 0 || nsp >= 1000000), ph);
+    o_kv("cpus", cpus); o_kv("gated", gated); o_kv("calls", i); o_kv("us", t1 - t0); o_kv("ns_per_call", nsp);
+    o_kv("kicks", kd); o_kv("kick_max", IP_KICK_MAX); o_out("\n");
+    return 0;
+}
+
+# 1.57.9: who #108 refuses (-1), who it accepts, and that a refusal still yields/parks.
+fn ph_yield_to_refused() {
+    var me = syscall(2, 0, 0, 0, 0);
+    var r_self = syscall(108, me, 0, 0, 0);
+    var r_neg = syscall(108, 0 - 1, 0, 0, 0);
+    var r_big = syscall(108, 16, 0, 0, 0);
+    var r_k = syscall(108, 0, 0, 0, 0);
+    # a refusal parks: nothing else is READY here, so each call is one interrupt (~10 ms), never ~us
+    var t0 = us();
+    var i = 0;
+    var nr = 0;
+    while (i < 20) { if (syscall(108, 0, 0, 0, 0) == (0 - 1)) { nr = nr + 1; } i = i + 1; }
+    var t1 = us();
+    var nsp = ((t1 - t0) * 1000) / 20;
+    # a reaped child: its slot is dead (state 0)
+    var dp = spawn3("ex", 0, 0, 0);
+    var dst = reap(dp);
+    var r_dead = syscall(108, dp, 0, 0, 0);
+    # a sibling: child "st" names its sibling (a #14 pauser) -> -1, and its parent (us) -> 0
+    var sib = spawn3("ps", 0, 0, 1000000);
+    var sp = spawn3("st", sib, me, 0);
+    var sst = reap(sp);
+    syscall(16, sib, 9, 0, 0);
+    reap(sib);
+    var okc = 1;
+    if (r_self != 0) { okc = 0; }
+    if (r_neg != (0 - 1)) { okc = 0; }
+    if (r_big != (0 - 1)) { okc = 0; }
+    if (r_k != (0 - 1)) { okc = 0; }
+    if (nr != 20) { okc = 0; }
+    if (nsp < 1000000) { okc = 0; }
+    if (dp < 0) { okc = 0; }
+    if (dst != 0) { okc = 0; }
+    if (r_dead != (0 - 1)) { okc = 0; }
+    if (sib < 0) { okc = 0; }
+    if (sst != 0) { okc = 0; }
+    verdict(okc, "yield-to-refused");
+    o_kv("self", r_self); o_kv("neg", r_neg); o_kv("big", r_big); o_kv("pid0", r_k); o_kv("refused20", nr);
+    o_kv("ns_per_refusal", nsp); o_kv("dead", r_dead); o_kv("stranger_child_status", sst); o_out("\n");
     return 0;
 }
 
@@ -310,6 +518,120 @@ fn ph_kill() {
     return 0;
 }
 
+# ── 1.57.9 (PIPEW): the blocking pipe write ──
+fn ph_pipe_bulk() {
+    syscall(25, &ip_fds, 0, 0, 0);
+    var r = load64(&ip_fds); var w = load64(&ip_fds + 8);
+    var i = 0;
+    while (i < IP_BULK) { store8(&ip_big + i, bulk_b(i)); i = i + 1; }
+    syscall(25, &ip_fds2, 0, 0, 0);                           # the reader's result pipe (its time asleep)
+    var rr = load64(&ip_fds2); var rw = load64(&ip_fds2 + 8);
+    var pid = spawn3("sr", r, rw, IP_BULK);
+    cls(r); cls(rw);
+    var t0 = us();
+    var n = wr(w, &ip_big, IP_BULK);
+    var t1 = us();
+    var st = reap(pid);
+    store64(&ip_msg, 0 - 1);
+    var g = rd(rr, &ip_msg, 8, 1);
+    var slept = load64(&ip_msg);
+    cls(w); cls(rr);
+    verdict(n == IP_BULK && st == 0 && g == 8 && slept >= 0 && (t1 - t0) < slept + 30000, "pipe-bulk");
+    o_kv("bytes", IP_BULK); o_kv("wrote", n); o_kv("reader_status", st); o_kv("us", t1 - t0);
+    o_kv("reader_asleep_us", slept); o_kv("slack_us", 30000); o_out("\n");
+    return 0;
+}
+
+fn ph_wr_epipe(ph, mode) {
+    syscall(25, &ip_fds, 0, 0, 0);
+    var r = load64(&ip_fds); var w = load64(&ip_fds + 8);
+    var pid = spawn3("rc", r, mode, 0);
+    cls(r);                                                   # the child's copy is now the only read end
+    var t0 = us();
+    var n1 = wr(w, &ip_big, 8192);
+    var t1 = us();
+    var n2 = wr(w, &ip_big, 8);
+    var t2 = us();
+    var st = reap(pid);
+    cls(w);
+    verdict(n1 == 4180 && n2 == (0 - 1) && (t1 - t0) < 90000 && (t2 - t1) < 5000 && st == 0, ph);
+    o_kv("first", n1); o_kv("second", n2); o_kv("epipe_us", t1 - t0); o_kv("second_us", t2 - t1);
+    o_kv("reader_status", st); o_out("\n");
+    return 0;
+}
+
+fn ph_wr_kill() {
+    syscall(25, &ip_fds, 0, 0, 0);
+    var r = load64(&ip_fds); var w = load64(&ip_fds + 8);
+    var pid = spawn3("wb", w, 0, 0);
+    syscall(41, 60, 0, 0, 0);
+    var st = pstate(pid);
+    var t0 = us();
+    var k = syscall(16, pid, 9, 0, 0);
+    var ws = reap(pid);
+    var t1 = us();
+    cls(r); cls(w);
+    verdict(st == 6 && k == 0 && ws == 265 && (t1 - t0) < 50000, "wr-kill");
+    o_kv("state_before", st); o_kv("kill", k); o_kv("status", ws); o_kv("kill_to_reap_us", t1 - t0); o_out("\n");
+    return 0;
+}
+
+fn ph_two_writer() {
+    syscall(25, &ip_fds, 0, 0, 0);
+    var r = load64(&ip_fds); var w = load64(&ip_fds + 8);
+    var pa = spawn3("tw", w, 65, IP_NREC);
+    var pb = spawn3("tw", w, 66, IP_NREC);
+    cls(w);                                                   # the children's copies are the only write ends
+    var ca = 0; var cb = 0; var mixed = 0; var eof = 0;
+    var t0 = us();
+    while (eof == 0) {
+        var got = 0;
+        while (got < IP_REC) {
+            var n = rd(r, &ip_big + got, IP_REC - got, 0);
+            if (n <= 0) { eof = 1; break; }
+            got = got + n;
+        }
+        if (got == IP_REC) {
+            var id = load8(&ip_big);
+            var j = 1;
+            while (j < IP_REC) { if (load8(&ip_big + j) != id) { mixed = mixed + 1; break; } j = j + 1; }
+            if (id == 65) { ca = ca + 1; } else { if (id == 66) { cb = cb + 1; } else { mixed = mixed + 1; } }
+        } else { if (got > 0) { mixed = mixed + 1; } }
+        if ((us() - t0) > 5000000) { break; }
+    }
+    var sa = reap(pa); var sb = reap(pb);
+    cls(r);
+    verdict(ca == IP_NREC && cb == IP_NREC && mixed == 0 && sa == 0 && sb == 0, "two-writer");
+    o_kv("a", ca); o_kv("b", cb); o_kv("mixed", mixed); o_kv("status_a", sa); o_kv("status_b", sb);
+    o_kv("us", us() - t0); o_out("\n");
+    return 0;
+}
+
+fn ph_wr_nb() {
+    syscall(25, &ip_fds, 0, 0, 0);
+    var r = load64(&ip_fds); var w = load64(&ip_fds + 8);
+    var n0 = syscall(1, w, &ip_big, 0, 1);
+    var f = wr(w, &ip_big, 4080);
+    var t0 = us();
+    var nb1 = syscall(1, w, &ip_big, 100, 1);
+    var t1 = us();
+    var rr = rd(r, &ip_msg, 8, 1);
+    var rr2 = rd(r, &ip_big, 92, 1);
+    var nb2 = syscall(1, w, &ip_big, 200, 1);
+    var nb3 = syscall(1, w, &ip_big, 100, 1);
+    cls(r);
+    var nb4 = syscall(1, w, &ip_big, 10, 1);
+    var t2 = us();
+    var b5 = wr(w, &ip_big, 10);
+    var t3 = us();
+    cls(w);
+    verdict(n0 == 0 && f == 4080 && nb1 == 0 && (t1 - t0) < 5000 && rr == 8 && rr2 == 92 && nb2 == 0 && nb3 == 100
+            && nb4 == (0 - 1) && b5 == (0 - 1) && (t3 - t2) < 5000, "wr-nb");
+    o_kv("zero", n0); o_kv("fill", f); o_kv("full", nb1); o_kv("full_us", t1 - t0); o_kv("atomic200", nb2);
+    o_kv("fit100", nb3); o_kv("noreader_nb", nb4); o_kv("noreader_blk", b5); o_kv("noreader_us", t3 - t2); o_out("\n");
+    return 0;
+}
+
 fn main(): i64 {
     if (argc() >= 2) { return child(); }
     o_out("IPCW-BEGIN pid="); o_num(syscall(2, 0, 0, 0, 0)); o_out("\n");
@@ -317,12 +639,21 @@ fn main(): i64 {
     ph_pipe_pp();
     ph_chan_pp();
     ph_yield_peer();
-    ph_idle_pair("pause-pair", 14);
-    ph_idle_pair("mixed-pair", 44);
+    ph_yield_handoff();
+    ph_idle_pair("pause-pair", 14, "ps");
+    ph_idle_pair("mixed-pair", 44, "ps");
+    ph_idle_pair("yield-pair", 44, "y4");
+    ph_yield_to_refused();
     ph_nb();
     ph_eof_close();
     ph_eof_death();
     ph_kill();
+    ph_pipe_bulk();
+    ph_wr_epipe("wr-epipe-close", 0);
+    ph_wr_epipe("wr-epipe-death", 1);
+    ph_wr_kill();
+    ph_two_writer();
+    ph_wr_nb();
     o_out("IPCW-DONE"); o_kv("pass", ip_pass); o_kv("fail", ip_fail); o_out("\n");
     o_out("IPCW-EXIT 0\n");
     return 0;

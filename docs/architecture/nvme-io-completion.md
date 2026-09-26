@@ -32,6 +32,14 @@ live; that prints `nvme: disable timeout` and is not otherwise contained.
 
 Gate: `NVME_SELFTEST` → `scripts/smoke/nvme-late-smoke.sh` (build.md row).
 
+## The admin queue has the same shape (1.57.9)
+
+`nvme_admin_poll(cid)` (init only: IDENTIFY, CREATE IO CQ/SQ) now works like the I/O poll: a 5 s wall-time budget
+checked before the CQ, every CQE consumed and matched by CID, and strays logged and discarded
+(`nvme: admin stray CID N discarded`). Before 1.57.9 it returned the first CQE's status whatever its CID. A timeout
+disables the controller, as Linux does for any admin timeout. Gate: `nvmest: admin`. The AHCI counterpart of this
+document is `ahci-command-recovery.md`.
+
 ## virtio-blk has the same shape (1.57.8 DMA1)
 
 `kernel/core/virtio_blk.cyr` keeps one request in flight on its single virtqueue, and until 1.57.8 both of its polls

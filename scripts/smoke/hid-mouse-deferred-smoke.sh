@@ -1,6 +1,6 @@
 #!/bin/sh
 # hid-mouse-deferred-smoke.sh — 1.57.8: mouse reports that complete while NOBODY drains are all delivered by the one
-# drain that follows (issue docs/development/issues/2026-09-25-hid-mouse-reports-share-one-buffer.md).
+# drain that follows (issue docs/development/issues/archived/2026-09-25-hid-mouse-reports-share-one-buffer.md).
 #
 # The defect: every interrupt-IN TRB on a mouse row DMAed into ONE report buffer, so when two reports completed before
 # the drain ran, each Transfer Event folded the LAST report — the first report's motion and button edge were lost and

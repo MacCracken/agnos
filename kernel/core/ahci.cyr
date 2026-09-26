@@ -350,48 +350,125 @@ var ahci_port_fis_phys[256];    # 32 ports × 8 bytes per u64
 var ahci_port_inited[32];       # 32 × u8 flag
 var ahci_ports_inited_count = 0;
 
-# Timeouts — same 1M-iter ceiling NVMe + xhci use. ~250ms wall on Zen.
+# Init-time register waits (ahci_port_init's bring-up) keep the 1M-iteration ceiling NVMe + xhci use.
 var AHCI_TIMEOUT_SPINS = 1000000;
-# Flush uses a far larger ceiling than a single-PRDT transfer: FLUSH
-# CACHE EXT can take seconds while the drive commits its write cache
-# (ATA8-ACS budgets ~30s). ~30x the transfer ceiling. 1.33.5 fsync barrier.
-var AHCI_FLUSH_TIMEOUT_SPINS = 30000000;
+
+# ⛔ 1.57.9 — A COMMAND THAT TIMES OUT IS NOT OVER UNTIL THE PORT'S ENGINE IS PROVEN STOPPED.
+# (docs/development/issues/2026-09-25-ahci-timeout-abandons-an-in-flight-command.md; docs/architecture/ahci-command-recovery.md)
+# Until 1.57.9 each command poll was an ITERATION count (1M MMIO spins, FLUSH 30M) and on a stuck PxCI or a PxTFD.ERR it
+# returned 0 with ST=1 and PxCI still set. The PRDT points at the CALLER's buffer, so the device could DMA into memory
+# the caller had already reused, and the next command rewrote slot 0's header and the CT under a command the HBA still
+# owned. After a TFES the HBA halts with CI set, so every later issue failed ahci_port_wait_idle for the rest of the boot.
+# Now: (1) the budgets are WALL TIME on klog_uptime_us() (a spin backstop of budget*64 while the TSC is uncalibrated,
+# as nvme_io_poll_n): 5 s per R/W and IDENTIFY, 30 s per FLUSH (Linux's ATA_EH_CMD_DFL_TIMEOUT and FLUSH retry budget).
+# (2) A timeout or an error runs AHCI 1.3.1 §6.2.2.1 BEFORE the issue path returns (ahci_port_recover: ST=0 and wait
+# CR=0, so the HBA clears PxCI and its DMA engine is idle; clear SERR/IS; COMRESET if BSY/DRQ; ST=1), inside the same
+# ahci_lock hold, so no caller ever gets a buffer back from a live command. (3) If the engine will not stop, a COMRESET
+# and then an HBA reset (GHC.HR) end its DMA and the ports go OFFLINE (ahci_port_dead): every later issue fails fast
+# before it touches slot 0, the CT or a buffer. That flag is the only "late" record: unlike NVMe, AHCI can cancel a
+# command from the host, so a timed-out command is settled synchronously instead of being reaped later.
+var AHCI_IO_BUDGET_US    = 5000000;     # 5 s per READ/WRITE DMA EXT and per IDENTIFY
+var AHCI_FLUSH_BUDGET_US = 30000000;    # 30 s per FLUSH CACHE EXT (a large write cache; ATA8-ACS)
+var AHCI_STOP_BUDGET_US  = 500000;      # PxCMD.CR / FR follow ST / FRE within 500 ms (§10.1.2; Linux ahci_stop_engine)
+var AHCI_IDLE_BUDGET_US  = 1000000;     # the pre-issue gate (BSY/DRQ, PxCI, PxSACT clear)
+var AHCI_LINK_BUDGET_US  = 1000000;     # PxSSTS.DET=3 after a COMRESET; GHC.HR clear after an HBA reset (§10.4)
+var AHCI_IS_ERR          = 0x78000000;  # PxIS TFES(30) | HBFS(29) | HBDS(28) | IFS(27): the command failed
+var ahci_port_dead[4];                  # 32 x u8: 1 = port OFFLINE (engine would not restart / link lost / HBA reset)
+# Recovery events: recorded under ahci_lock, printed by the lock wrappers AFTER unlock (no kprint under ahci_lock).
+var AHCI_N_TIMEOUT  = 1;     # the budget ran out with PxCI still set
+var AHCI_N_ERROR    = 2;     # PxIS reported an error (TFES / HBFS / HBDS / IFS)
+var AHCI_N_NOTIDLE  = 4;     # the port was not idle before an issue
+var AHCI_N_COMRESET = 8;     # a COMRESET was sent (BSY/DRQ stuck, or the engine would not stop)
+var AHCI_N_OFFLINE  = 16;    # the port was taken offline
+var AHCI_N_HBA      = 32;    # the engine would not stop even after a COMRESET: GHC.HR, every port offline
+var AHCI_N_HBASTUCK = 64;    # ... and GHC.HR did not clear: the HBA's DMA is NOT proven stopped
+var AHCI_N_LATEOK   = 128;   # the budget ran out, but a last look found the command complete
+var AHCI_N_RECOVERED = 256;  # ahci_port_recover brought the port back (engine stopped, PxCI clear, restarted)
+var ahci_note       = 0;     # events of the current lock hold
+var ahci_last_note  = 0;     # the events of the last completed wrapper call (read by AHCI_SELFTEST)
+var ahci_test_stuck = 0;     # AHCI_SELFTEST 'lost' arm ONLY: ahci_engine_stop really stops, then REPORTS "still running"
+
+# 1 once `budget_us` has passed since t0 (a klog_uptime_us() reading). t0 == 0 means the TSC is not calibrated yet,
+# and then `spins` (the caller's loop count, one MMIO read per spin) is the bound: budget*64, nvme_io_poll_n's backstop.
+fn ahci_expired(t0, spins, budget_us) {
+    if (t0 > 0) {
+        if ((klog_uptime_us() - t0) >= budget_us) { return 1; }
+        return 0;
+    }
+    if (spins >= budget_us * 64) { return 1; }
+    return 0;
+}
+
+# Poll the 32-bit register at ABAR+off until (value & mask) == want, for up to budget_us of wall time. 1 = seen,
+# 0 = not seen. One last read after the deadline, so a register that settled right at it is not reported stuck.
+fn ahci_wait_reg(off, mask, want, budget_us) {
+    var wt0 = klog_uptime_us();
+    var wsp = 0;
+    while (ahci_expired(wt0, wsp, budget_us) == 0) {
+        if ((ahci_mmio_read32(off) & mask) == want) { return 1; }
+        wsp = wsp + 1;
+    }
+    if ((ahci_mmio_read32(off) & mask) == want) { return 1; }
+    return 0;
+}
+
+# Wait at least `us` microseconds. One PxSSTS read per spin, so the uncalibrated backstop is paced by the bus.
+fn ahci_delay_us(port_off, us) {
+    var dt0 = klog_uptime_us();
+    var dsp = 0;
+    while (ahci_expired(dt0, dsp, us) == 0) {
+        ahci_mmio_read32(port_off + AHCI_P_SSTS);
+        dsp = dsp + 1;
+    }
+    return 0;
+}
+
+# ST=0, then wait for CR (the command-list DMA engine) to clear. QUIET (recovery calls it under ahci_lock; the shutdown
+# path's ahci_port_stop prints its own result). 1 = stopped: the HBA has cleared PxCI (§3.3.14) and does no more DMA for
+# this port. 0 = CR still set, or the register reads all-ones (the HBA is gone). Already stopped (ST and CR clear)
+# returns at once, like Linux's ahci_stop_engine.
+fn ahci_engine_stop(port_off, budget_us) {
+    var cmd = ahci_mmio_read32(port_off + AHCI_P_CMD);
+    if (cmd == 0xFFFFFFFF) { return 0; }
+    var stopped = 1;
+    if ((cmd & 0x8001) != 0) {
+        ahci_mmio_write32(port_off + AHCI_P_CMD, cmd & 0xFFFFFFFE);
+        stopped = ahci_wait_reg(port_off + AHCI_P_CMD, 0x8000, 0, budget_us);
+    }
+    if (ahci_test_stuck != 0) { stopped = 0; }   # AHCI_SELFTEST 'lost': the stop is REAL, the report says it failed
+    return stopped;
+}
 
 # CAP fields not previously cached — needed in Phase 2 logic.
 fn ahci_cap_sss() { return (ahci_cap >> 27) & 0x01; }
 
 # --- HBA reset --------------------------------------------------------
 
+# The HBA reset itself, QUIET (1.57.9: ahci_port_recover escalates to it under ahci_lock, where nothing may kprint).
+# 1. GHC.AE=1 before the reset (§10.1.2 step 1). 2. GHC.HR=1; the HBA clears it when the reset is done — within 1 s
+# (§10.4.3), on wall time. 3. Re-assert AE (the reset clears it). 1 = reset done, 0 = GHC.HR stuck.
+fn ahci_hba_reset_quiet() {
+    var ghc = ahci_mmio_read32(AHCI_REG_GHC);
+    ahci_mmio_write32(AHCI_REG_GHC, ghc | 0x80000000);
+    ghc = ahci_mmio_read32(AHCI_REG_GHC);
+    ahci_mmio_write32(AHCI_REG_GHC, ghc | 0x01);
+    if (ahci_wait_reg(AHCI_REG_GHC, 0x01, 0, AHCI_LINK_BUDGET_US) == 0) { return 0; }
+    ghc = ahci_mmio_read32(AHCI_REG_GHC) | 0x80000000;
+    ahci_mmio_write32(AHCI_REG_GHC, ghc);
+    ahci_ghc = ghc;
+    return 1;
+}
+
 fn ahci_hba_reset() {
     if (ahci_present == 0) { return 0; }
-
-    # 1. Ensure GHC.AE=1 BEFORE reset (spec §10.1.2 step 1).
-    var ghc = ahci_mmio_read32(AHCI_REG_GHC);
-    ghc = ghc | 0x80000000;
-    ahci_mmio_write32(AHCI_REG_GHC, ghc);
-
-    # 2. Trigger HBA reset (GHC.HR=1). HW clears the bit when reset
-    #    completes.
-    ghc = ahci_mmio_read32(AHCI_REG_GHC);
-    ghc = ghc | 0x01;
-    ahci_mmio_write32(AHCI_REG_GHC, ghc);
-
-    var spins = 0;
-    while (spins < AHCI_TIMEOUT_SPINS) {
-        var cur = ahci_mmio_read32(AHCI_REG_GHC);
-        if ((cur & 0x01) == 0) {
-            # 3. Re-assert AHCI mode after reset (reset clears AE).
-            cur = cur | 0x80000000;
-            ahci_mmio_write32(AHCI_REG_GHC, cur);
-            ahci_ghc = cur;
-            # CMOS kcp = 0x4D (HBA reset cleared, AE re-asserted).
-            asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x4D; 0xE6; 0x71; }
-            kprintln("ahci: HBA reset complete, AE=1", 30);
-            return 1;
-        }
-        spins = spins + 1;
+    if (ahci_hba_reset_quiet() == 1) {
+        # CMOS kcp = 0x4D (HBA reset cleared, AE re-asserted).
+        # asm contract: no inputs, no outputs; mov al,0x50 / out 0x70,al (CMOS index) / mov al,0x4D / out 0x71,al
+        # (CMOS data). Clobbers al only.
+        asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x4D; 0xE6; 0x71; }
+        kprintln("ahci: HBA reset complete, AE=1", 30);
+        return 1;
     }
-
     kprintln("ahci: HBA reset timeout (GHC.HR stuck)", 38);
     return 0;
 }
@@ -413,12 +490,11 @@ fn ahci_hba_reset() {
 # whatever lands there next is exactly the class of corruption that is impossible to
 # diagnose afterwards. Returns 1 = stopped, 0 = still running (caller must NOT
 # reclaim the buffers).
+# 1.57.9: both waits are the shared wall-time ones (500 ms each, AHCI §10.1.2), and the ST/CR half is
+# ahci_engine_stop, the same quiet helper error recovery uses under ahci_lock.
 fn ahci_port_stop(port) {
     var port_off = 0;
     var cmd = 0;
-    var spins = 0;
-    var stopped = 0;
-    var c = 0;
 
     if (ahci_present == 0) { return 0; }
     if (port < 0) { return 0; }
@@ -426,31 +502,16 @@ fn ahci_port_stop(port) {
     port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
 
     # ST=0, then wait for CR (command-list running) to clear.
-    cmd = ahci_mmio_read32(port_off + AHCI_P_CMD);
-    ahci_mmio_write32(port_off + AHCI_P_CMD, cmd & 0xFFFFFFFE);
-    spins = 0;
-    while (spins < AHCI_TIMEOUT_SPINS) {
-        c = ahci_mmio_read32(port_off + AHCI_P_CMD);
-        if (((c >> 15) & 0x01) == 0) { stopped = 1; spins = AHCI_TIMEOUT_SPINS; }
-        else { spins = spins + 1; }
-    }
-    if (stopped == 0) {
+    if (ahci_engine_stop(port_off, AHCI_STOP_BUDGET_US) == 0) {
         kprint("ahci: port ", 11); kprint_num(port);
         kprintln(" command engine still running", 29);
         return 0;
     }
 
     # FRE=0, then wait for FR (FIS receive running) to clear.
-    stopped = 0;
     cmd = ahci_mmio_read32(port_off + AHCI_P_CMD);
     ahci_mmio_write32(port_off + AHCI_P_CMD, cmd & 0xFFFFFFEF);
-    spins = 0;
-    while (spins < AHCI_TIMEOUT_SPINS) {
-        c = ahci_mmio_read32(port_off + AHCI_P_CMD);
-        if (((c >> 14) & 0x01) == 0) { stopped = 1; spins = AHCI_TIMEOUT_SPINS; }
-        else { spins = spins + 1; }
-    }
-    if (stopped == 0) {
+    if (ahci_wait_reg(port_off + AHCI_P_CMD, 0x4000, 0, AHCI_STOP_BUDGET_US) == 0) {
         kprint("ahci: port ", 11); kprint_num(port);
         kprintln(" fis receive still running", 26);
         return 0;
@@ -706,8 +767,9 @@ fn ahci_port_wait_idle(port) {
     if (port < 0) { return 0; }
     if (port >= AHCI_MAX_PORTS) { return 0; }
     var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
+    var it0 = klog_uptime_us();                      # 1.57.9: a wall-time budget, not an iteration count
     var spins = 0;
-    while (spins < AHCI_TIMEOUT_SPINS) {
+    while (ahci_expired(it0, spins, AHCI_IDLE_BUDGET_US) == 0) {
         var tfd  = ahci_mmio_read32(port_off + AHCI_P_TFD);
         var ci   = ahci_mmio_read32(port_off + AHCI_P_CI);
         var sact = ahci_mmio_read32(port_off + AHCI_P_SACT);
@@ -719,6 +781,165 @@ fn ahci_port_wait_idle(port) {
         }
         spins = spins + 1;
     }
+    return 0;
+}
+
+# --- 1.57.9: error / timeout recovery (AHCI 1.3.1 §6.2.2.1, §10.4) -----
+#
+# Everything here runs under ahci_lock (a preempt-disabled spinlock; the HBA is polled, PxIE is never written) and is
+# QUIET: events go into ahci_note and the lock wrappers print them after unlock. A long stall on a failing disk is the
+# accepted trade (1.57.8's NVMe rule): it is better than a buffer handed back to a live DMA engine.
+
+# COMRESET (§10.4.2): stop the engine first ("may assume the interface is in a hung condition and may continue" if CR
+# sticks), PxSCTL.DET=1 for at least 1 ms, DET=0, wait for PxSSTS.DET=3 (device present, PHY up), clear PxSERR, then
+# wait for BSY/DRQ to clear (the device's signature FIS). SPD (bits 4-7) is kept and IPM=3 (no partial/slumber), as
+# Linux's sata_link_hardreset writes it. 1 = link up and device ready, 0 = not.
+fn ahci_comreset(port_off) {
+    ahci_engine_stop(port_off, AHCI_STOP_BUDGET_US);
+    var sctl = ahci_mmio_read32(port_off + AHCI_P_SCTL) & 0x0F0;
+    ahci_mmio_write32(port_off + AHCI_P_SCTL, sctl | 0x301);      # IPM=3, DET=1: send COMRESET
+    ahci_delay_us(port_off, 1000);                                 # >= 1 ms
+    ahci_mmio_write32(port_off + AHCI_P_SCTL, sctl | 0x300);      # DET=0: release it
+    if (ahci_wait_reg(port_off + AHCI_P_SSTS, 0x0F, 3, AHCI_LINK_BUDGET_US) == 0) { return 0; }
+    ahci_mmio_write32(port_off + AHCI_P_SERR, 0xFFFFFFFF);
+    return ahci_wait_reg(port_off + AHCI_P_TFD, 0x88, 0, AHCI_IO_BUDGET_US);
+}
+
+# FRE on (wait FR=1), then ST=1 and wait CR=1 (§3.3.7: ST may be set only while FRE is set). 1 = running.
+fn ahci_engine_start(port_off) {
+    var cmd = ahci_mmio_read32(port_off + AHCI_P_CMD);
+    if ((cmd & 0x10) == 0) { ahci_mmio_write32(port_off + AHCI_P_CMD, cmd | 0x10); }
+    if (ahci_wait_reg(port_off + AHCI_P_CMD, 0x4000, 0x4000, AHCI_STOP_BUDGET_US) == 0) { return 0; }
+    cmd = ahci_mmio_read32(port_off + AHCI_P_CMD);
+    ahci_mmio_write32(port_off + AHCI_P_CMD, cmd | 0x01);
+    return ahci_wait_reg(port_off + AHCI_P_CMD, 0x8000, 0x8000, AHCI_STOP_BUDGET_US);
+}
+
+# The engine will not stop even after a COMRESET, so it may still be DMAing: only an HBA reset ends that (§10.4.3,
+# "staggered reset", least intrusive first). GHC.HR resets EVERY port, so every port goes offline. If HR itself sticks
+# the HBA's DMA is NOT proven stopped: AHCI_N_HBASTUCK is printed, and the ports stay offline either way.
+fn ahci_hba_escalate() {
+    ahci_note = ahci_note | AHCI_N_HBA | AHCI_N_OFFLINE;
+    if (ahci_hba_reset_quiet() == 0) { ahci_note = ahci_note | AHCI_N_HBASTUCK; }
+    var ep = 0;
+    while (ep < AHCI_MAX_PORTS) { store8(&ahci_port_dead + ep, 1); ep = ep + 1; }
+    return 0;
+}
+
+# AHCI 1.3.1 §6.2.2.1 non-queued error recovery, run by the issue path that timed out or failed BEFORE it returns.
+# 1 = the port runs again with PxCI clear. 0 = the port is OFFLINE. Either way its DMA engine is proven stopped (or the
+# HBA was reset) before this returns, so the caller's buffer, slot 0's header and the CT are free to reuse. The order is
+# Linux's EH (freeze, reset, THEN finish the command), not FreeBSD's finish-then-reset: here the return value itself
+# hands the buffer back.
+#   1. ST=0, wait CR=0: the HBA clears PxCI. CR sticks: COMRESET and stop again; still stuck: HBA reset.
+#   2. Clear PxSERR and PxIS AFTER the stop (a late D2H FIS of the failed command may still arrive, §10.4.1).
+#   3. BSY or DRQ still set: COMRESET (§6.2.2.1 step 5). A link that does not come back: port offline.
+#   4. ST=1 (FRE first), wait CR=1. An engine that will not restart: port offline.
+fn ahci_port_recover(port) {
+    var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
+    if (ahci_engine_stop(port_off, AHCI_STOP_BUDGET_US) == 0) {
+        ahci_note = ahci_note | AHCI_N_COMRESET;
+        ahci_comreset(port_off);
+        if (ahci_engine_stop(port_off, AHCI_STOP_BUDGET_US) == 0) {
+            ahci_hba_escalate();
+            return 0;
+        }
+    }
+    ahci_mmio_write32(port_off + AHCI_P_SERR, 0xFFFFFFFF);
+    ahci_mmio_write32(port_off + AHCI_P_IS,   0xFFFFFFFF);
+    if ((ahci_mmio_read32(port_off + AHCI_P_TFD) & 0x88) != 0) {
+        ahci_note = ahci_note | AHCI_N_COMRESET;
+        if (ahci_comreset(port_off) == 0) {
+            ahci_note = ahci_note | AHCI_N_OFFLINE;
+            store8(&ahci_port_dead + port, 1);
+            return 0;
+        }
+        ahci_mmio_write32(port_off + AHCI_P_SERR, 0xFFFFFFFF);
+        ahci_mmio_write32(port_off + AHCI_P_IS,   0xFFFFFFFF);
+    }
+    if (ahci_engine_start(port_off) == 0) {
+        if (ahci_engine_stop(port_off, AHCI_STOP_BUDGET_US) == 0) {
+            ahci_hba_escalate();
+            return 0;
+        }
+        ahci_note = ahci_note | AHCI_N_OFFLINE;
+        store8(&ahci_port_dead + port, 1);
+        return 0;
+    }
+    ahci_note = ahci_note | AHCI_N_RECOVERED;
+    return 1;
+}
+
+# The settle-equivalent at the top of every issue path: an OFFLINE port never touches slot 0, the CT or a buffer again,
+# and a port that is not idle (a halted engine, a device stuck BSY) is recovered once before the issue. 1 = go.
+fn ahci_port_ready(port) {
+    if (load8(&ahci_port_dead + port) != 0) { return 0; }
+    if (ahci_port_wait_idle(port) == 1) { return 1; }
+    ahci_note = ahci_note | AHCI_N_NOTIDLE;
+    if (ahci_port_recover(port) == 0) { return 0; }
+    return ahci_port_wait_idle(port);
+}
+
+# Wait for slot 0: 1 = PxCI bit 0 clear with no error, 0 = PxIS reports an error (AHCI_IS_ERR), -1 = the budget ran
+# out. PxIS, not PxTFD.ERR, is the error signal: PxTFD is a copy of the LAST D2H FIS, so after one failed command its
+# ERR bit stays set until the device sends another, and the pre-1.57.9 poll read that stale ERR and failed the next
+# command while it was still running. PxCI is read BEFORE PxIS, so an error that clears CI is still seen. The budget is
+# checked BEFORE the reads: a zero budget gives up without looking (the AHCI_SELFTEST fault injection).
+fn ahci_poll_slot0(port_off, budget_us) {
+    var pt0 = klog_uptime_us();
+    var psp = 0;
+    while (ahci_expired(pt0, psp, budget_us) == 0) {
+        psp = psp + 1;
+        var pci = ahci_mmio_read32(port_off + AHCI_P_CI);
+        if ((ahci_mmio_read32(port_off + AHCI_P_IS) & AHCI_IS_ERR) != 0) { return 0; }
+        if ((pci & 0x01) == 0) { return 1; }
+    }
+    return 0 - 1;
+}
+
+# Issue slot 0 (its header and CT already built) and see it through. On an error or a timeout the port is recovered
+# BEFORE this returns (ahci_port_recover), so the command's buffer, slot 0 and the CT are never handed back while the
+# HBA still owns them. 1 = the command completed, 0 = it failed (the port is idle again, or offline).
+fn ahci_run_slot0(port, port_off, budget_us) {
+    ahci_mmio_write32(port_off + AHCI_P_IS,   0xFFFFFFFF);     # fresh error state (W1C)
+    ahci_mmio_write32(port_off + AHCI_P_SERR, 0xFFFFFFFF);
+    ahci_mmio_write32(port_off + AHCI_P_CI, 1);                 # issue slot 0
+    var rr = ahci_poll_slot0(port_off, budget_us);
+    if (rr == 1) { return 1; }
+    if (rr < 0) {
+        # §6.2.2.1 step 1: read PxCI. A command that finished in the window is a completion, not a timeout.
+        var lci = ahci_mmio_read32(port_off + AHCI_P_CI) & 0x01;
+        if ((ahci_mmio_read32(port_off + AHCI_P_IS) & AHCI_IS_ERR) != 0) {
+            ahci_note = ahci_note | AHCI_N_ERROR;
+        } else {
+            if (lci == 0) {
+                ahci_note = ahci_note | AHCI_N_LATEOK;
+                return 1;
+            }
+            ahci_note = ahci_note | AHCI_N_TIMEOUT;
+        }
+    } else {
+        ahci_note = ahci_note | AHCI_N_ERROR;
+    }
+    ahci_port_recover(port);
+    return 0;
+}
+
+# Print a wrapper's recovery events (after ahci_spin_unlock), e.g. "ahci: port 0 timeout - recovered".
+fn ahci_print_note(port, note) {
+    if (note == 0) { return 0; }
+    kprint("ahci: port ", 11);
+    kprint_num(port);
+    if ((note & AHCI_N_TIMEOUT) != 0)  { kprint(" timeout", 8); }
+    if ((note & AHCI_N_ERROR) != 0)    { kprint(" error", 6); }
+    if ((note & AHCI_N_NOTIDLE) != 0)  { kprint(" not-idle", 9); }
+    if ((note & AHCI_N_LATEOK) != 0)   { kprint(" completed-late", 15); }
+    if ((note & AHCI_N_COMRESET) != 0) { kprint(" comreset", 9); }
+    if ((note & AHCI_N_HBA) != 0)      { kprint(" hba-reset", 10); }
+    if ((note & AHCI_N_HBASTUCK) != 0) { kprint(" hba-reset-stuck (DMA not proven stopped)", 41); }
+    if ((note & AHCI_N_OFFLINE) != 0)   { kprint(" - port offline", 15); }
+    if ((note & AHCI_N_RECOVERED) != 0) { kprint(" - recovered", 12); }
+    kprintln("", 0);
     return 0;
 }
 
@@ -769,10 +990,17 @@ fn ahci_print_id_string(id_buf, off, len) {
 # Runs ONLY at single-core boot probe (before APs exist), so the success-path kprint
 # under ahci_lock (console < ahci backward) is a boot-only residual with no cycle
 # (console-lock holders never do device I/O). Polling-only HBA (never writes PxIE).
+# 1.57.9: failures (timeout, PxIS error, not idle, offline) are recovered inside and printed by this wrapper after
+# unlock (ahci_print_note); only the boot-time success lines still print under the lock.
 fn ahci_identify_device(port) {
     ahci_spin_lock();
+    ahci_note = 0;
     var r = ahci_identify_device_inner(port);
+    var note = ahci_note;
+    ahci_note = 0;
+    ahci_last_note = note;
     ahci_spin_unlock();
+    ahci_print_note(port, note);
     return r;
 }
 fn ahci_identify_device_inner(port) {
@@ -781,12 +1009,7 @@ fn ahci_identify_device_inner(port) {
     if (port >= AHCI_MAX_PORTS) { return 0; }
     if (load8(&ahci_port_inited + port) != 1) { return 0; }
 
-    if (ahci_port_wait_idle(port) == 0) {
-        kprint("ahci: port ", 11);
-        kprint_num(port);
-        kprintln(" not idle pre-IDENTIFY", 22);
-        return 0;
-    }
+    if (ahci_port_ready(port) == 0) { return 0; }
 
     var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
     var cl_kva   = load64(&ahci_port_cl_kva + port * 8);
@@ -845,40 +1068,9 @@ fn ahci_identify_device_inner(port) {
     store32(cl_kva + 24, 0);
     store32(cl_kva + 28, 0);
 
-    # --- Clear PxIS + PxSERR so we can see fresh error state ---
-    ahci_mmio_write32(port_off + AHCI_P_IS,   0xFFFFFFFF);
-    ahci_mmio_write32(port_off + AHCI_P_SERR, 0xFFFFFFFF);
-
-    # --- Issue: PxCI bit 0 = 1 ---
-    ahci_mmio_write32(port_off + AHCI_P_CI, 1);
-
-    # --- Poll PxCI bit 0 to clear (command complete) ---
-    var spins = 0;
-    while (spins < AHCI_TIMEOUT_SPINS) {
-        var ci = ahci_mmio_read32(port_off + AHCI_P_CI);
-        if ((ci & 0x01) == 0) { spins = AHCI_TIMEOUT_SPINS; }
-        else {
-            # Check for task-file error mid-poll — fast failure path
-            # rather than waiting the full 1M iterations on a wedged cmd.
-            var tfd = ahci_mmio_read32(port_off + AHCI_P_TFD);
-            if ((tfd & 0x01) == 1) {           # ERR bit in STS
-                kprint("ahci: port ", 11);
-                kprint_num(port);
-                kprintln(" IDENTIFY: task-file ERR", 24);
-                return 0;
-            }
-            spins = spins + 1;
-        }
-    }
-
-    # --- Sanity gate: PxCI must actually have cleared (no timeout) ---
-    var ci_final = ahci_mmio_read32(port_off + AHCI_P_CI);
-    if ((ci_final & 0x01) == 1) {
-        kprint("ahci: port ", 11);
-        kprint_num(port);
-        kprintln(" IDENTIFY: timeout (PxCI stuck)", 31);
-        return 0;
-    }
+    # --- Issue slot 0 and see it through: clear PxIS/PxSERR, PxCI bit 0 = 1, poll it clear on a 5 s wall-time
+    #     budget. A PxIS error or a timeout recovers the port (§6.2.2.1) before this returns (1.57.9). ---
+    if (ahci_run_slot0(port, port_off, AHCI_IO_BUDGET_US) == 0) { return 0; }
 
     # --- Decode IDENTIFY data ---
     # LBA48 sector count: u64 at offset 200 (words 100-103). LBA bytes
@@ -1015,13 +1207,23 @@ fn ahci_build_rw_fis(ct_kva, opcode, lba, count) {    # ct_kva: the CT's CPU poi
 # state. Polling-only HBA (never writes PxIE, no MSI/IDT vector → no ISR contends).
 # fs_lock is held ABOVE this when FS reads/writes a block (fs < ahci, forward order).
 # No kprint inside → no console-order concern.
-fn ahci_issue_rw(port, opcode, lba, count, data_phys, is_write) {
+# 1.57.9: recovery events are printed by the wrapper AFTER unlock (ahci_print_note), so the "no kprint inside" rule
+# holds. ahci_issue_rw_n takes the poll budget: AHCI_SELFTEST passes 0 to force a timed-out, still-running command.
+fn ahci_issue_rw_n(port, opcode, lba, count, data_phys, is_write, budget_us) {
     ahci_spin_lock();
-    var r = ahci_issue_rw_inner(port, opcode, lba, count, data_phys, is_write);
+    ahci_note = 0;
+    var r = ahci_issue_rw_inner(port, opcode, lba, count, data_phys, is_write, budget_us);
+    var note = ahci_note;
+    ahci_note = 0;
+    ahci_last_note = note;
     ahci_spin_unlock();
+    ahci_print_note(port, note);
     return r;
 }
-fn ahci_issue_rw_inner(port, opcode, lba, count, data_phys, is_write) {
+fn ahci_issue_rw(port, opcode, lba, count, data_phys, is_write) {
+    return ahci_issue_rw_n(port, opcode, lba, count, data_phys, is_write, AHCI_IO_BUDGET_US);
+}
+fn ahci_issue_rw_inner(port, opcode, lba, count, data_phys, is_write, budget_us) {
     if (ahci_present == 0) { return 0; }
     if (port < 0) { return 0; }
     if (port >= AHCI_MAX_PORTS) { return 0; }
@@ -1029,9 +1231,7 @@ fn ahci_issue_rw_inner(port, opcode, lba, count, data_phys, is_write) {
     if (count <= 0) { return 0; }
     if (count > 128) { return 0; }      # cap per-cmd at 64 KB (128 sectors)
 
-    if (ahci_port_wait_idle(port) == 0) {
-        return 0;
-    }
+    if (ahci_port_ready(port) == 0) { return 0; }
 
     var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
     var cl_kva   = load64(&ahci_port_cl_kva + port * 8);
@@ -1072,29 +1272,8 @@ fn ahci_issue_rw_inner(port, opcode, lba, count, data_phys, is_write) {
     store32(cl_kva + 24, 0);
     store32(cl_kva + 28, 0);
 
-    # Clear any pending IS / SERR before issue.
-    ahci_mmio_write32(port_off + AHCI_P_IS,   0xFFFFFFFF);
-    ahci_mmio_write32(port_off + AHCI_P_SERR, 0xFFFFFFFF);
-
-    # Issue.
-    ahci_mmio_write32(port_off + AHCI_P_CI, 1);
-
-    # Poll completion (CI bit 0 → 0) with task-file error escape hatch.
-    var spins = 0;
-    while (spins < AHCI_TIMEOUT_SPINS) {
-        var ci = ahci_mmio_read32(port_off + AHCI_P_CI);
-        if ((ci & 0x01) == 0) { spins = AHCI_TIMEOUT_SPINS; }
-        else {
-            var tfd = ahci_mmio_read32(port_off + AHCI_P_TFD);
-            if ((tfd & 0x01) == 1) { return 0; }
-            spins = spins + 1;
-        }
-    }
-
-    var ci_final = ahci_mmio_read32(port_off + AHCI_P_CI);
-    if ((ci_final & 0x01) == 1) { return 0; }     # stuck
-
-    return 1;
+    # Issue and see it through; a PxIS error or a timeout recovers the port before this returns (1.57.9).
+    return ahci_run_slot0(port, port_off, budget_us);
 }
 
 # --- Public READ / WRITE primitives ----------------------------------
@@ -1120,8 +1299,13 @@ fn ahci_write_lba(port, lba, count, buf) {
 # rationale as ahci_issue_rw). No kprint inside → no console-order concern.
 fn ahci_issue_nodata(port, opcode) {
     ahci_spin_lock();
+    ahci_note = 0;
     var r = ahci_issue_nodata_inner(port, opcode);
+    var note = ahci_note;
+    ahci_note = 0;
+    ahci_last_note = note;
     ahci_spin_unlock();
+    ahci_print_note(port, note);
     return r;
 }
 fn ahci_issue_nodata_inner(port, opcode) {
@@ -1130,9 +1314,7 @@ fn ahci_issue_nodata_inner(port, opcode) {
     if (port >= AHCI_MAX_PORTS) { return 0; }
     if (load8(&ahci_port_inited + port) != 1) { return 0; }
 
-    if (ahci_port_wait_idle(port) == 0) {
-        return 0;
-    }
+    if (ahci_port_ready(port) == 0) { return 0; }
 
     var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
     var cl_kva   = load64(&ahci_port_cl_kva + port * 8);
@@ -1163,28 +1345,8 @@ fn ahci_issue_nodata_inner(port, opcode) {
     store32(cl_kva + 24, 0);
     store32(cl_kva + 28, 0);
 
-    # Clear any pending IS / SERR before issue.
-    ahci_mmio_write32(port_off + AHCI_P_IS,   0xFFFFFFFF);
-    ahci_mmio_write32(port_off + AHCI_P_SERR, 0xFFFFFFFF);
-
-    # Issue.
-    ahci_mmio_write32(port_off + AHCI_P_CI, 1);
-
-    # Poll completion (CI bit 0 → 0) with task-file error escape hatch.
-    var spins = 0;
-    while (spins < AHCI_FLUSH_TIMEOUT_SPINS) {
-        var ci = ahci_mmio_read32(port_off + AHCI_P_CI);
-        if ((ci & 0x01) == 0) { spins = AHCI_FLUSH_TIMEOUT_SPINS; }
-        else {
-            var tfd = ahci_mmio_read32(port_off + AHCI_P_TFD);
-            if ((tfd & 0x01) == 1) { return 0; }
-            spins = spins + 1;
-        }
-    }
-
-    var ci_final = ahci_mmio_read32(port_off + AHCI_P_CI);
-    if ((ci_final & 0x01) == 1) { return 0; }     # stuck
-    return 1;
+    # Issue and see it through on the 30 s FLUSH budget; an error or a timeout recovers the port first (1.57.9).
+    return ahci_run_slot0(port, port_off, AHCI_FLUSH_BUDGET_US);
 }
 
 # --- Boot-time demos -------------------------------------------------
@@ -1409,3 +1571,177 @@ fn ahci_register_block_dev() {
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x50; 0xE6; 0x71; }
     return 1;
 }
+
+#ifdef AHCI_SELFTEST
+# ═══ 1.57.9 AHCI_SELFTEST — a timed-out command's buffer, slot 0 and CT are never reused while the HBA owns them ═══
+# Fault injection: ahst_inject issues a READ through ahci_issue_rw_n with a ZERO budget, so the poll gives up before
+# looking and the command is still in flight — the timeout the issue describes. The smoke throttles the SATA disk
+# (100 IOPS) and ahst_prime fills QEMU's throttle bucket first, so the injected read really is ~10 ms late.
+# Arms (DESTRUCTIVE: sectors at capacity/2 of a blank QEMU scratch disk):
+#   stamp  8 LBAs at cap/2 get a per-LBA, per-word pattern (setup).
+#   reuse  8x: a late read into page B, then at once the caller stamps B; 50 ms later B must still hold the stamp, and a
+#          normal read of the same LBA into B is byte-exact. RED on the pre-1.57.9 abandon (the late DMA lands on the
+#          caller's stamp). The discriminating arm.
+#   shift  one late read, then 16 reads of known LBAs byte-exact and a FLUSH: slot 0 and the CT are reused cleanly.
+#   tfes   a read past capacity fails with a PxIS error; the next read succeeds byte-exact with the port idle (no
+#          not-idle recovery). RED on the pre-1.57.9 poll, which read the stale PxTFD.ERR and failed the next command.
+#   lost   ahci_test_stuck makes the engine "refuse" to stop: COMRESET, then GHC.HR, every port offline. B is not
+#          written after the return, the next I/O fails at once, GHC.HR has cleared and the port's ST/CR are clear.
+#          This leaves AHCI OFF for the rest of the boot; the smoke stops at "ahcist: done".
+fn ahst_word(lba, i) { return 0x4148000000000000 | ((lba & 0xFFFFFFFF) << 16) | i; }
+fn ahst_stamp(buf, lba) {
+    for (var i = 0; i < 64; i = i + 1) { store64(buf + i * 8, ahst_word(lba, i)); }
+    return 0;
+}
+fn ahst_bad(buf, lba) {
+    var nbad = 0;
+    for (var i = 0; i < 64; i = i + 1) {
+        if (load64(buf + i * 8) != ahst_word(lba, i)) { nbad = nbad + 1; }
+    }
+    return nbad;
+}
+fn ahst_fill(buf, v) {
+    for (var i = 0; i < 64; i = i + 1) { store64(buf + i * 8, v); }
+    return 0;
+}
+fn ahst_diff(buf, v) {
+    var nd = 0;
+    for (var i = 0; i < 64; i = i + 1) {
+        if (load64(buf + i * 8) != v) { nd = nd + 1; }
+    }
+    return nd;
+}
+fn ahst_wait_ms(ms) {
+    var t0 = klog_uptime_us();
+    var sp = 0;
+    while (sp < 50000000) {
+        sp = sp + 1;
+        if (t0 > 0) { if ((klog_uptime_us() - t0) > ms * 1000) { sp = 50000000; } }
+    }
+    return 0;
+}
+# Fill QEMU's throttle bucket (burst = iops/10) so the next command waits its ~10 ms turn.
+fn ahst_prime(port, lba, phys) {
+    for (var i = 0; i < 12; i = i + 1) { ahci_read_lba(port, lba, 1, phys); }
+    return 0;
+}
+# 1 = the read was really left in flight (the zero-budget poll timed out; the port was recovered).
+fn ahst_inject(port, lba, phys) {
+    if (ahci_issue_rw_n(port, 0x25, lba, 1, phys, 0, 0) == 1) {
+        kprintln("ahcist: inject FAIL (the command was not late)", 46);
+        return 0;
+    }
+    if ((ahci_last_note & AHCI_N_TIMEOUT) == 0) {
+        kprintln("ahcist: inject FAIL (no timeout recorded)", 41);
+        return 0;
+    }
+    return 1;
+}
+fn ahst_verdict(name, nlen, ok, a, b) {
+    kprint("ahcist: ", 8);
+    kprint(name, nlen);
+    if (ok == 1) { kprint(" PASS", 5); } else { kprint(" FAIL", 5); }
+    kprint(" bad=", 5); kprint_num(a);
+    kprint(" aux=", 5); kprint_num(b);
+    kprintln("", 0);
+    return 0;
+}
+
+fn ahci_late_selftest() {
+    if (ahci_blk_port < 0) { kprintln("ahcist: SKIP no AHCI port", 25); kprintln("ahcist: done", 12); return 0; }
+    var port = ahci_blk_port;
+    var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
+    var cap = ahci_id_lba48;
+    var base = cap / 2;
+    var pa = pmm_alloc();                   # PRDT (phys) values
+    var pb = pmm_alloc();
+    var pc = pmm_alloc();
+    if (pa == 0) { kprintln("ahcist: SKIP no memory", 22); kprintln("ahcist: done", 12); return 0; }
+    if (pb == 0) { kprintln("ahcist: SKIP no memory", 22); kprintln("ahcist: done", 12); return 0; }
+    if (pc == 0) { kprintln("ahcist: SKIP no memory", 22); kprintln("ahcist: done", 12); return 0; }
+    var ka = dma_kva(pa);                   # CPU pointers: the direct map (1.57.8 DMA1)
+    var kb = dma_kva(pb);
+    var kc = dma_kva(pc);
+
+    # stamp
+    var wf = 0;
+    for (var k = 0; k < 8; k = k + 1) {
+        ahst_stamp(ka, base + k);
+        if (ahci_write_lba(port, base + k, 1, pa) == 0) { wf = wf + 1; }
+    }
+    var wok = 0;
+    if (wf == 0) { wok = 1; }
+    ahst_verdict("stamp", 5, wok, wf, base);
+
+    # reuse
+    var ubad = 0;
+    var uinj = 0;
+    for (var u = 0; u < 8; u = u + 1) {
+        ahst_prime(port, base + 7, pc);
+        uinj = uinj + ahst_inject(port, base + 1, pb);
+        var q = 0x5155000000000000 | u;
+        ahst_fill(kb, q);
+        ahst_wait_ms(50);
+        ubad = ubad + ahst_diff(kb, q);
+        ahst_fill(kb, 0xEEEEEEEEEEEEEEEE);
+        if (ahci_read_lba(port, base + 1, 1, pb) == 0) { ubad = ubad + 1; }
+        ubad = ubad + ahst_bad(kb, base + 1);
+    }
+    var uok = 0;
+    if (uinj == 8) { if (ubad == 0) { uok = 1; } }
+    ahst_verdict("reuse", 5, uok, ubad, uinj);
+
+    # shift
+    ahst_prime(port, base + 7, pc);
+    var sinj = ahst_inject(port, base + 2, pb);
+    var sbad = 0;
+    var sf = 0;
+    for (var r = 0; r < 16; r = r + 1) {
+        var kk = (r * 5 + 3) & 7;
+        ahst_fill(kc, 0xEEEEEEEEEEEEEEEE);
+        if (ahci_read_lba(port, base + kk, 1, pc) == 0) { sf = sf + 1; }
+        sbad = sbad + ahst_bad(kc, base + kk);
+    }
+    if (ahci_blk_flush() != 0) { sf = sf + 1; }
+    var sok = 0;
+    if (sinj == 1) { if (sbad == 0) { if (sf == 0) { sok = 1; } } }
+    ahst_verdict("shift", 5, sok, sbad + sf, sinj);
+
+    # tfes
+    var te = ahci_read_lba(port, cap + 16, 1, pc);
+    var tnote = ahci_last_note;
+    ahst_fill(kc, 0xEEEEEEEEEEEEEEEE);
+    var tg = ahci_read_lba(port, base + 3, 1, pc);
+    var tgn = ahci_last_note;
+    var tbad = ahst_bad(kc, base + 3);
+    var tok = 0;
+    if (te == 0) { if ((tnote & AHCI_N_ERROR) != 0) { if (tg == 1) { if (tgn == 0) { if (tbad == 0) { tok = 1; } } } } }
+    ahst_verdict("tfes", 4, tok, tbad + 1 - tg, tnote * 256 + tgn);
+
+    # lost
+    ahst_prime(port, base + 7, pc);
+    ahci_test_stuck = 1;
+    var lr = ahci_issue_rw_n(port, 0x25, base + 4, 1, pb, 0, 0);
+    var lnote = ahci_last_note;
+    ahci_test_stuck = 0;
+    ahst_fill(kb, 0x4C4F535400000000);
+    ahst_wait_ms(50);
+    var lbad = ahst_diff(kb, 0x4C4F535400000000);
+    var lnext = ahci_read_lba(port, base, 1, pc);
+    var lcmd = ahci_mmio_read32(port_off + AHCI_P_CMD) & 0x8001;
+    var lhr = ahci_mmio_read32(AHCI_REG_GHC) & 0x01;
+    var ldead = load8(&ahci_port_dead + port);
+    var lok = 1;
+    if (lr != 0) { lok = 0; }
+    if ((lnote & AHCI_N_HBA) == 0) { lok = 0; }
+    if ((lnote & AHCI_N_HBASTUCK) != 0) { lok = 0; }
+    if (lbad != 0) { lok = 0; }
+    if (lnext != 0) { lok = 0; }
+    if (lcmd != 0) { lok = 0; }
+    if (lhr != 0) { lok = 0; }
+    if (ldead != 1) { lok = 0; }
+    ahst_verdict("lost", 4, lok, lbad + lnext + lcmd + lhr, lnote);
+    kprintln("ahcist: done", 12);
+    return 0;
+}
+#endif

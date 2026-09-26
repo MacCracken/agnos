@@ -168,33 +168,23 @@ exit(0)
     # The arc's growth is register tables (OTG timing, the HDMI/AFMT/ACR block) plus
     # their derivations, not bloat: those tables are the compressed form of what the
     # burns proved, and losing them costs another burn to re-learn.
-    SZ=$(wc -c < $ROOT/build/agnos_test 2>/dev/null || echo 0)
-    # ⚠ 2 MB, RAISED 2026-07-26 AS DELIBERATE TEMPORARY HEADROOM — NOT a derived bound.
-# Every raise above was reactive: an arc closed a few hundred bytes over the line and the ceiling
-# moved just past it. That pattern makes the gate a rubber stamp — it can only ever fire once per
-# arc, at which point it is raised. The attribute-interpolation rung landed at 1,791,168 B (under
-# 9 KB of the old 1.8M), and the next rung adds another shader blob, so it would have tripped again
-# within the same release for the same non-reason.
-# ⛔ THIS IS A GRANT, NOT A MEASUREMENT, AND IT EXPIRES. The bound that would actually be worth
-# gating is "growth attributable to something other than new subsystems" — a runaway-bloat detector
-# rather than a high-water mark chased upward. Re-derive it before the 3D arc closes; do not simply
-# move it again.
-# ⭐ 1.57.2 (2026-09-13): THE CEILING DID NOT MOVE — THE EMBEDDED FACE IS TAKEN OUT OF THE WEIGHING.
-# core/kfont.cyr embeds rekha's Liberation Sans Regular verbatim (410,820 B of .rodata literals);
-# agnos_test went ~1.99 M -> ~2.42 M and this gate went red, and with it CI's `test` job and the
-# release workflow. Not a raise: the weighed figure is SZ minus the face length read live from the
-# face module this very build cat'd in (`fn rekha_face_default_len() { return N; }`), so what sits
-# under the 2 MiB grant is kernel code + tables + kashi — what the grant was measured against. Fails
-# closed (FACE=0 -> raw size weighed) if the module cannot be read. ⚠ scripts/check.sh's "binary
-# size" gate carries the identical subtraction; the two MUST move together, like the ceiling itself.
-    FACE=$(sed -n 's/^fn rekha_face_default_len() { return \([0-9][0-9]*\); }.*/\1/p' "$REKHA_DIR/fonts/face_data.cyr" 2>/dev/null | head -1)
-    [ -n "$FACE" ] || FACE=0
-    SZK=$((SZ - FACE))
-    if [ "$SZK" -gt 50000 ] && [ "$SZK" -lt 2097152 ]; then
-        check "x86 size reasonable (${SZ}B; ${SZK}B weighed = size minus the ${FACE}B embedded face)" "0" "0"
-    else
-        check "x86 size reasonable (${SZ}B; ${SZK}B weighed = size minus the ${FACE}B embedded face)" "0" "1"
-    fi
+    # ⭐⭐ 1.57.9 (SIZEGATE) — superseded: the raise history above ended at a 2 MiB grant (2026-07-26,
+    # "a grant, not a measurement, and it expires"), and 1.57.2 weighed the embedded face out of it. This
+    # copy then carried its own number and subtraction "in lockstep" with check.sh — and had drifted: its
+    # unreadable-face path set FACE=0 and passed only because the raw size exceeded the grant. The number,
+    # the face subtraction and the derivation now live ONLY in scripts/check/weighed-size-check.sh (read
+    # its header): GRANT 0x220000 = 2,228,224 B, placed above the weighed size at which the plain image
+    # hits the image-layout wall (LOAD end 0x390000, 2,210,972 B at 1.57.8), so the layout gate binds
+    # first; the helper fails closed on an unreadable face and on a wall that has risen to the grant.
+    # Operator ruling: this row "is NOT A HARD LIMIT — it can be expanded" — but only by re-deriving it.
+    # ⛔ 1.57.9 ENDFIX SG-1: for GROWTH it is REPORT-ONLY (GRANT > WALL, so a weight at the grant is past the
+    # wall and build.sh's own image-layout run refuses the flag build first); it enforces the readable face,
+    # the floor and the ORDERING re-derivation, and prints the headroom.
+    SZOUT=$(REKHA_DIR="$REKHA_DIR" sh "$ROOT/scripts/check/weighed-size-check.sh" "$ROOT/build/agnos_test" 2>&1)
+    SZRC=$?
+    check "x86 size reasonable (weighed-size tripwire: ${SZOUT%%
+*})" "0" "$SZRC"
+    [ "$SZRC" = "0" ] || echo "$SZOUT" | sed -n '2,$s/^/    /p'
 
     # Build kernel_hello via cyrius (cc5 wants a managed entry, not raw stdin)
     if [ -f "$ROOT/kernel/kernel_hello.cyr" ]; then

@@ -61,7 +61,8 @@ jobs:
             echo "FAIL: build/agnos is $SZ bytes — too small to be a kernel (floor 50000, cf. check.sh gate 32)"
             exit 1
           fi
-          # ⛔ THE 2 MiB CEILING IS DELIBERATELY *NOT* ENFORCED HERE — it belongs to check.sh gate 32,
+          # ⛔ THE SIZE CEILING (2 MiB until 1.57.8; 0x220000 since 1.57.9, derived to sit above the image-layout
+          # wall — scripts/check/weighed-size-check.sh) IS DELIBERATELY *NOT* ENFORCED HERE — it belongs to check.sh gate 32,
           # and importing it into CI was scope creep caught in review at 1.56.59. The 50000 floor above
           # is an ANTI-VACUITY floor: it asserts the build produced a kernel at all, which is what this
           # step is for. The ceiling is a BUDGET, and a different thing entirely.
@@ -74,7 +75,7 @@ jobs:
           echo "  (size ceiling is check.sh gate 32's, deliberately not enforced here — see above)" 
 
       - name: Kernel image vs BSP boot stack (image-layout-check.sh)
-        # ⭐ 1.57.7 (IMG-fix, review A5). NOT the size ceiling's case (above): gate 32's 2 MiB is a BUDGET;
+        # ⭐ 1.57.7 (IMG-fix, review A5). NOT the size ceiling's case (above): the weighed-size row's grant (scripts/check/weighed-size-check.sh) is a BUDGET;
         # this bound is a CORRECTNESS fact — past LOAD end 0x390000 the BSP boot stack (top 0x3A0000, live from
         # the shim's first instruction) grows down into the image's .rodata with no fault. build.sh only WARNS
         # for a plain image (so check.sh gate 34 can score it locally) and CI does not run check.sh, so without

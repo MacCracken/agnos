@@ -121,11 +121,24 @@ var vnet_tx_full_said = 0;
 # load/store whose address comes from a pmm page goes through the direct map. Device registers and descriptor
 # address FIELDS keep phys; .bss DMA buffers (vnet_rx_buf) are fine as they are (the kernel image is
 # identity-mapped in every CR3). A BOOTCR3_KEEP_GNOBOOT_CR3 build has no direct map in kmain's context.
+#
+# 1.57.9 (CPUVA) — also THE CPU pointer for every CPU-only pmm buffer that a syscall or ISR can touch: fb_console's
+# shadow, the ramdisk's pages, iommu.cyr's root/context/second-level tables. Not DMA, same hazard, same fix.
+# dma_kva_ok(kva) is the boot assert those stored-pointer sites run once, at allocation (FreeBSD's PHYS_TO_DMAP
+# KASSERT, without an assertion framework): 1 iff kva lies inside the direct map pmm_setup_directmap actually
+# installed, [DIRECTMAP_BASE, (directmap_pdpt_top + 1) GB). A KEEP_GNOBOOT build has no direct map and hands out
+# phys == VA on purpose, so there it always answers 1.
 #ifdef BOOTCR3_KEEP_GNOBOOT_CR3
 fn dma_kva(ndk_phys) { return ndk_phys; }
+fn dma_kva_ok(dko_kva) { return 1; }
 #endif
 #ifndef BOOTCR3_KEEP_GNOBOOT_CR3
 fn dma_kva(ndk_phys) { return pmm_kva_for_access(ndk_phys); }
+fn dma_kva_ok(dko_kva) {
+    if (dko_kva < DIRECTMAP_BASE) { return 0; }
+    if (dko_kva >= (directmap_pdpt_top + 1) * 0x40000000) { return 0; }
+    return 1;
+}
 #endif
 
 # ---------------------------------------------------------------------

@@ -1,6 +1,6 @@
 #!/bin/bash
 # dma-shadow-smoke.sh — block + HDA DMA under a SHADOWED identity window (DMA_SHADOW_SELFTEST=1), 1.57.8.
-# Issue: docs/development/issues/2026-09-25-dma-cpu-pointers-still-use-identity-vas.md
+# Issue: docs/development/issues/archived/2026-09-25-dma-cpu-pointers-still-use-identity-vas.md
 # Invariant: docs/architecture/dma-cpu-pointers.md
 #
 # Two halves:
@@ -17,10 +17,24 @@
 #                          the self-check that the window really is shadowed (without it the test proves nothing).
 #   "dmash: virtio PASS" / "nvme PASS" / "nvme-prp PASS" / "ahci PASS" / "hda PASS", then "dmash: done".
 #
+# 1.57.9 (CPUVA — issue 2026-09-25-cpu-only-pmm-buffers-still-use-identity-vas) adds the CPU-only pmm buffers:
+#   STATIC  the same grep (now also memset/memcpy, and digits in the name: `iommu_l2_phys` slipped the old class)
+#           over iommu.cyr / ramdisk.cyr / fb_console.cyr too; every `*_kva =` assignment in iommu.cyr / ramdisk.cyr
+#           goes through dma_kva / pmm_kva_for_access; and main.cyr calls fb_shadow_init AFTER
+#           pmm_bitmap_use_directmap (the direct map is live only from there). iommu.cyr has no boot arm — every
+#           writer runs at boot on the kernel CR3 (its CR3 audit banner) and no QEMU config here publishes a DMAR —
+#           so the static half is its gate.
+#   BOOT    "dmash: fb PASS"      fb_putc paints a '#' in a unique ink under the shadow; back on the kernel CR3 the
+#                                 fb_shadow cell must equal the FB cell and hold the ink, and the 0xA5 region untouched.
+#           "dmash: ramdisk PASS" (RAMDISK_ENABLE) a sector written on the kernel CR3 reads back under the shadow, and
+#                                 8 sectors written under the shadow read back on the kernel CR3.
+#           "dmash: window PASS"  after EVERY arm the 0xA5 region is untouched (dirty=0): no CPU store, DMA driver or
+#                                 CPU-only buffer, went through an identity VA of the pmm window.
+#
 # Banner-gated retry (qemu_dwell_kernel; exit 2 on a firmware VOID), PASS/FAIL per check, the shared latched-invariant
 # deny ($SMOKE_INVARIANT_DENY), two boots: -smp 1 (TCG) and a GATED -smp 4 (smoke_accel). DSH_SMP overrides ("1 4").
-# Gated by scripts/sweep.sh (DMA_SHADOW_SELFTEST=1). Requires: a kernel built with DMA_SHADOW_SELFTEST=1, qemu, OVMF,
-# mtools, parted, gnoboot. DESTRUCTIVE on its own scratch disks only (fresh per boot).
+# Gated by scripts/sweep.sh (DMA_SHADOW_SELFTEST=1 RAMDISK_ENABLE=1). Requires: a kernel built with exactly those two
+# flags, qemu, OVMF, mtools, parted, gnoboot. DESTRUCTIVE on its own scratch disks only (fresh per boot).
 set -u
 
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
@@ -35,11 +49,33 @@ void=0
 # ---- STATIC: no CPU dereference of a *_phys value in the four drivers ----
 echo "=== AGNOS DMA shadow smoke ==="
 DRV="kernel/core/virtio_blk.cyr kernel/core/nvme.cyr kernel/core/ahci.cyr kernel/core/hda.cyr"
-HITS=$(cd "$ROOT" && grep -nE '(load|store)(8|16|32|64) *\( *[A-Za-z_]*_phys\b' $DRV | grep -vE '^[^:]+:[0-9]+: *#')
+CPUONLY="kernel/arch/x86_64/iommu.cyr kernel/core/ramdisk.cyr kernel/arch/x86_64/fb_console.cyr"
+HITS=$(cd "$ROOT" && grep -nE '(load(8|16|32|64)|store(8|16|32|64)|memset|memcpy) *\( *[A-Za-z0-9_]*_phys\b' $DRV $CPUONLY \
+    | grep -vE '^[^:]+:[0-9]+: *#')
 if [ -z "$HITS" ]; then
-    echo "PASS: [static] no load/store takes a *_phys address in virtio_blk/nvme/ahci/hda"; pass=$((pass + 1))
+    echo "PASS: [static] no load/store/memset/memcpy takes a *_phys address in virtio_blk/nvme/ahci/hda/iommu/ramdisk/fb_console"
+    pass=$((pass + 1))
 else
     echo "FAIL: [static] a CPU dereference of a *_phys value:"; echo "$HITS" | head -10 | sed 's/^/        /'; fail=$((fail + 1))
+fi
+# 1.57.9 — a `*_kva` pointer that is not computed from the direct map is a phys wearing the wrong name (the
+# allocation-site revert the grep above cannot see). `var x_kva = 0;` initialisers are fine.
+KHITS=$(cd "$ROOT" && grep -nE '\b[A-Za-z0-9_]*_kva *= *[^=]' kernel/arch/x86_64/iommu.cyr kernel/core/ramdisk.cyr \
+    | grep -vE '^[^:]+:[0-9]+: *(#|var [A-Za-z0-9_]+ *= *0;)' | grep -vE '(dma_kva|pmm_kva_for_access)\(')
+if [ -z "$KHITS" ]; then
+    echo "PASS: [static] every *_kva in iommu/ramdisk is assigned from dma_kva / pmm_kva_for_access"; pass=$((pass + 1))
+else
+    echo "FAIL: [static] a *_kva assigned without the direct map:"; echo "$KHITS" | head -10 | sed 's/^/        /'; fail=$((fail + 1))
+fi
+# 1.57.9 — the shadow's direct-map pointer is valid only after cr3_load(0x1000) + pmm_bitmap_use_directmap().
+FSI=$(cd "$ROOT" && grep -nE '^fb_shadow_init\(\);' kernel/core/main.cyr | cut -d: -f1 | head -1)
+PBU=$(cd "$ROOT" && grep -nE '^pmm_bitmap_use_directmap\(\);' kernel/core/main.cyr | cut -d: -f1 | head -1)
+NFSI=$(cd "$ROOT" && grep -cE '^fb_shadow_init\(\);' kernel/core/main.cyr)
+if [ -n "$FSI" ] && [ -n "$PBU" ] && [ "$NFSI" = 1 ] && [ "$FSI" -gt "$PBU" ]; then
+    echo "PASS: [static] main.cyr calls fb_shadow_init once, after pmm_bitmap_use_directmap (line $FSI > $PBU)"; pass=$((pass + 1))
+else
+    echo "FAIL: [static] fb_shadow_init must be called exactly once, after pmm_bitmap_use_directmap (fb_shadow_init at '${FSI:-none}' x${NFSI}, pmm_bitmap_use_directmap at '${PBU:-none}')"
+    fail=$((fail + 1))
 fi
 
 OVMF_CODE=""
@@ -60,7 +96,7 @@ GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"
 AGNOS="${SMOKE_KERNEL:-$ROOT/build/agnos}"
 [ -f "$GNOBOOT" ] || { echo "ERROR: gnoboot not built at $GNOBOOT" >&2; exit 1; }
 [ -f "$AGNOS" ]   || { echo "ERROR: agnos kernel not built at $AGNOS" >&2; exit 1; }
-[ -n "${SMOKE_KERNEL:-}" ] || smoke_require_image "$AGNOS" "DMA_SHADOW_SELFTEST"
+[ -n "${SMOKE_KERNEL:-}" ] || smoke_require_image "$AGNOS" "DMA_SHADOW_SELFTEST RAMDISK_ENABLE"
 
 WORK="$ROOT/build/dma-shadow-smoke"
 LOGS="$ROOT/build/dma-shadow-smoke-logs"
@@ -110,7 +146,7 @@ for SMP in ${DSH_SMP:-1 4}; do
         -serial stdio -display none -no-reboot
     if ! qemu_assert_booted "$LOG"; then echo "VOID: -smp $SMP never booted"; void=$((void + 1)); continue; fi
     echo "--- serial log (dmash lines) ---"
-    grep -aE "dmash:|nvme: (late|I/O)|virtio_blk|vblk" "$LOG" | head -20 || echo "(no dmash lines captured)"
+    grep -aE "dmash:|fb: shadow|ramdisk:|nvme: (late|I/O)|virtio_blk|vblk" "$LOG" | head -24 || echo "(no dmash lines captured)"
     echo "--------------------------------"
     check "dmash: shadow PASS"   "the identity window is shadowed and the direct map is intact (self-check)" "the test proves nothing"
     check "dmash: virtio PASS"   "virtio-blk: 1 + 8 sectors + FLUSH byte-exact under the shadow"   "virtio-blk rings reached by identity VA"
@@ -118,6 +154,9 @@ for SMP in ${DSH_SMP:-1 4}; do
     check "dmash: nvme-prp PASS" "NVMe: 24-sector PRP-list transfer byte-exact under the shadow"    "NVMe PRP list written by identity VA"
     check "dmash: ahci PASS"     "AHCI: 1 + 8 sectors + FLUSH byte-exact under the shadow"          "AHCI CL/CT reached by identity VA"
     check "dmash: hda PASS"      "HDA: CORB/RIRB verb round-trip under the shadow"                  "CORB/RIRB reached by identity VA"
+    check "dmash: fb PASS"       "fb_console shadow: glyph lands in fb_shadow, not the identity window" "fb_shadow reached by identity VA"
+    check "dmash: ramdisk PASS"  "ramdisk: sectors cross the CR3 switch byte-exact"                "ramdisk pages reached by identity VA"
+    check "dmash: window PASS"   "no arm stored through an identity VA (0xA5 region untouched)"    "a CPU store reached the shadowed window"
     check "dmash: done"          "the selftest ran to its last line"                                "the selftest did not finish"
     deny "dmash: [a-z-]+ (FAIL|SKIP)" "an arm printed FAIL or SKIP" "no arm printed FAIL or SKIP"
     deny "$SMOKE_INVARIANT_DENY" "a latched kernel invariant fired" "no latched invariant"

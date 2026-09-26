@@ -2,7 +2,7 @@
 # xhci-shadow-smoke.sh — 1.57.8: the xHCI / HID / MSC drivers reach their DMA pages through the DIRECT MAP,
 # never through the identity VA a ring-3 PT_LOAD can shadow.
 #
-# The class (docs/development/issues/2026-09-25-dma-cpu-pointers-still-use-identity-vas.md, xHCI half): pmm_alloc
+# The class (docs/development/issues/archived/2026-09-25-dma-cpu-pointers-still-use-identity-vas.md, xHCI half): pmm_alloc
 # draws from [0x400000, 0x10000000), which is exactly the window a ring-3 ELF's PT_LOAD may map under its own CR3,
 # and hid_poll runs from the 0x51 MSI-X ISR / BSP tick and msc_blk_* from syscalls under whatever CR3 is live. A
 # driver that uses a DMA page's PHYS as a CPU pointer then reads or writes the process's page, not its ring.

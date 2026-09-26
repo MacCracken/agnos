@@ -504,20 +504,38 @@ fn nvme_admin_submit(opcode, nsid, prp1, cdw10, cdw11) {
     return cid;
 }
 
-# Poll the admin CQ for the next completion. Returns the 15-bit status
-# field (0 = success) or -1 on timeout. Phase-tag tracked per spec:
-# zero-initialized CQ memory means controller writes new entry with
-# P=1, then P=0 after wrap, then P=1 again, etc.
+# Poll the admin CQ for `expected_cid`'s completion. Returns its 15-bit status field (0 = success) or -1 on timeout.
+# Phase-tag tracked per spec: zero-initialized CQ memory means the controller writes a new entry with P=1, then P=0
+# after the wrap, then P=1 again, etc.
+#
+# ⛔ 1.57.9 — nvme_io_poll_n's shape on the admin queue (issue 2026-09-25-ahci-timeout-abandons-an-in-flight-command,
+# "NVMe admin"). Until 1.57.9 this spun a fixed 10M ITERATIONS, returned the FIRST CQE's status whatever its CID (a
+# "CID mismatch" line, then the stale status as this command's answer, and this command's own CQE left for the next
+# poll), and recorded nothing on a timeout. Now: (1) a WALL-TIME budget (klog_uptime_us; budget*64 spins while the TSC
+# is uncalibrated), checked BEFORE the CQ. (2) Every CQE is consumed and matched by CID: the expected one returns its
+# status, any other is a stray, logged and discarded. (3) A timeout disables the controller (CC.EN=0 ends every
+# outstanding command, so the late one can never DMA into the IDENTIFY page or a queue page handed back): Linux's
+# nvme_timeout resets the controller on ANY admin timeout. Admin commands run only at init, where that leaves NVMe
+# not ready, which is what a failed IDENTIFY / queue create already meant.
+var NVME_ADMIN_BUDGET_US = 5000000;     # 5 s per admin command (IDENTIFY, CREATE IO CQ/SQ)
+
 fn nvme_admin_poll(expected_cid) {
+    return nvme_admin_poll_n(expected_cid, NVME_ADMIN_BUDGET_US);
+}
+
+fn nvme_admin_poll_n(expected_cid, budget_us) {
     if (nvme_admin_ready == 0) { return 0 - 1; }
-    var wait = 0;
-    while (wait < 10000000) {
-        var slot = nvme_acq_kva + nvme_acq_head * NVME_CQE_SIZE;
-        var dw3 = load32(slot + 12);
-        var p = (dw3 >> 16) & 0x01;
-        if (p == nvme_acq_phase) {
-            var status  = (dw3 >> 17) & 0x7FFF;
-            var got_cid = dw3 & 0xFFFF;
+    var t0 = klog_uptime_us();
+    var spins = 0;
+    while (spins >= 0) {
+        if (t0 > 0) {
+            if ((klog_uptime_us() - t0) >= budget_us) { break; }
+        } else {
+            if (spins >= budget_us * 64) { break; }
+        }
+        spins = spins + 1;
+        var dw3 = load32(nvme_acq_kva + nvme_acq_head * NVME_CQE_SIZE + 12);
+        if (((dw3 >> 16) & 0x01) == nvme_acq_phase) {
             nvme_acq_head = nvme_acq_head + 1;
             if (nvme_acq_head >= NVME_ADMIN_Q_ENTRIES) {
                 nvme_acq_head = 0;
@@ -525,18 +543,16 @@ fn nvme_admin_poll(expected_cid) {
             }
             # Ring CQ head doorbell so the controller can reuse the slot.
             store32(nvme_db_admin_cq(), nvme_acq_head);
-            if (got_cid != expected_cid) {
-                kprint("nvme: admin CID mismatch expected=", 34);
-                kprint_num(expected_cid);
-                kprint(" got=", 5);
-                kprint_num(got_cid);
-                kprintln("", 0);
-            }
-            return status;
+            if ((dw3 & 0xFFFF) == expected_cid) { return (dw3 >> 17) & 0x7FFF; }
+            kprint("nvme: admin stray CID ", 22);
+            kprint_num(dw3 & 0xFFFF);
+            kprintln(" discarded", 10);
         }
-        wait = wait + 1;
     }
-    kprintln("nvme: admin poll timeout", 24);
+    kprintln("nvme: admin poll timeout - controller disabled", 46);
+    nvme_admin_ready = 0;
+    nvme_io_ready = 0;
+    nvme_disable();
     return 0 - 1;
 }
 
@@ -792,7 +808,7 @@ fn nvme_io_submit(opcode, nsid, prp1, prp2, cdw10, cdw11, cdw12) {
 }
 
 # ⛔ 1.57.8 — CONSUME BY CID, ON A TIME BUDGET, AND NEVER HAND A TIMED-OUT COMMAND'S BUFFER BACK.
-# (docs/development/issues/2026-09-25-nvme-poll-timeout-leaves-the-cq-one-behind.md)
+# (docs/development/issues/archived/2026-09-25-nvme-poll-timeout-leaves-the-cq-one-behind.md)
 # Until 1.57.8 this gave up after a fixed 10M ITERATIONS (tens of ms under KVM) without consuming the late
 # completion, and a CID mismatch returned the STALE entry's status as the current command's. One slow
 # completion (1.57.7 S8, a loaded host) left the CQ one entry behind for the rest of the boot: every later
@@ -1283,6 +1299,7 @@ fn nvme_register_block_dev() {
 #          poll (stale status returned on a CID mismatch): wrong data, "CID mismatch" lines, left=1.
 #   reuse  8x: a late read into the scratch, then at once nvme_blk_write of a different pattern through the SAME
 #          scratch; read back — the late read's DMA must not land in the copied data (settle before the copy).
+#   admin  (1.57.9) two admin commands polled out of order: the stray is discarded by CID, nothing is left over.
 #   lost   a CID that will never complete is recorded late: the next I/O must fail, the controller must be
 #          disabled (CSTS.RDY=0) and nvme_io_ready cleared — never a buffer handed back to a live device. This
 #          leaves NVMe off for the rest of the boot; the smoke stops at "nvmest: done".
@@ -1371,6 +1388,28 @@ fn nvme_late_selftest() {
     var uok = 0;
     if (uinj == 8) { if (ubad == 0) { if (nvme_io_late == 0) { uok = 1; } } }
     nvst_verdict("reuse", 5, uok, ubad, uinj);
+
+    # admin (1.57.9): two admin commands in flight, polled for the SECOND first. The first's CQE is a stray, discarded by
+    # CID; the poll returns the second's own status, no admin CQE is left over 50 ms later, and a third command's poll
+    # finds its own. RED on the pre-1.57.9 admin poll: it returned whatever came first ("CID mismatch") and left the
+    # second's CQE behind for the next poll.
+    var aph = pmm_alloc();                  # a fresh 4 KB page for the IDENTIFY data (PRP value = phys)
+    var ac1 = nvme_admin_submit(0x06, 0, aph, 0x01, 0);
+    var ac2 = nvme_admin_submit(0x06, 0, aph, 0x01, 0);
+    var ast2 = nvme_admin_poll(ac2);
+    var at0 = klog_uptime_us();
+    var asp = 0;
+    while (asp < 50000000) {
+        asp = asp + 1;
+        if (at0 > 0) { if ((klog_uptime_us() - at0) > 50000) { asp = 50000000; } }
+    }
+    var aleft = 0;
+    if (((load32(nvme_acq_kva + nvme_acq_head * NVME_CQE_SIZE + 12) >> 16) & 0x01) == nvme_acq_phase) { aleft = 1; }
+    var ac3 = nvme_admin_submit(0x06, 0, aph, 0x01, 0);
+    var ast3 = nvme_admin_poll(ac3);
+    var aok = 0;
+    if (aph != 0) { if (ac1 >= 0) { if (ast2 == 0) { if (ast3 == 0) { if (aleft == 0) { aok = 1; } } } } }
+    nvst_verdict("admin", 5, aok, aleft, ast2 + ast3);
 
     # lost
     nvme_io_late = 1;
