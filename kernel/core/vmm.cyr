@@ -64,8 +64,17 @@ fn vmm_map(virt, phys, flags) {
 #              0xC000000000 (768 GB); real iron has put BARs in the 32-bit
 #              hole so far, but the gate is identical for any high BAR.
 #
-# Returns 1 on success, 0 on pmm_alloc failure.
+# Returns 1 on success, 0 on pmm_alloc failure or a refused low-4 MB phys.
 fn vmm_remap_uc_2mb(phys) {
+    # ⛔ 1.57.8 — NEVER the low 4 MB: PD[0..1] hold the boot page tables, the kernel image (<= 0x370000) and the BSP
+    # boot stacks; no device BAR lives there. An I/O port base handed in as a "phys" (virtio's PCI_CFG cap names the
+    # legacy I/O BAR0) made chunk 0 UC and ran the kernel's first megabyte of code uncached under KVM (~1.45 s per
+    # console line). pci_bar_64 now answers 0 for an I/O BAR; this is the backstop for every other caller, and the
+    # line is in SMOKE_INVARIANT_DENY (qemu-dwell.sh) so a regression fails every production smoke.
+    if (phys < 0x400000) {
+        kprintln("vmm: UC remap of the kernel low 4 MB refused", 44);
+        return 0;
+    }
     var chunk = phys & 0xFFFFFFFFFFE00000;
     if (phys < 0x40000000) {
         var pd_idx = (phys >> 21) & 0x1FF;

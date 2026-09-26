@@ -337,9 +337,15 @@ var NVME_SQE_SIZE        = 64;   # bytes per submission entry (NVMe 1.4)
 var NVME_CQE_SIZE        = 16;   # bytes per completion entry
 
 # Admin queue state (populated by nvme_admin_init)
-var nvme_asq_phys     = 0;   # Admin SQ base (4 KB page, page-aligned)
-var nvme_acq_phys     = 0;   # Admin CQ base (4 KB page, page-aligned)
-var nvme_ident_phys   = 0;   # IDENTIFY data scratch (4 KB page)
+# ⛔ 1.57.8 (DMA1) — EVERY CPU POINTER INTO A pmm DMA PAGE IS ITS DIRECT-MAP ALIAS (`*_kva`, dma_kva), and a
+# `*_phys` value only ever goes into a device register, an SQE PRP field or a PRP-list entry. pmm_alloc draws from
+# [0x400000, 0x10000000): under a per-process CR3 a ring-3 PT_LOAD can shadow that identity VA, and block I/O runs
+# from fs syscalls under the caller's CR3 — the SQE would be written into the process's page and the CQE read
+# from it. (Issue 2026-09-25-dma-cpu-pointers-still-use-identity-vas; gate: DMA_SHADOW_SELFTEST.)
+var nvme_asq_kva      = 0;   # Admin SQ CPU pointer (direct map; phys only in ASQ)
+var nvme_acq_kva      = 0;   # Admin CQ CPU pointer (direct map; phys only in ACQ)
+var nvme_ident_phys   = 0;   # IDENTIFY data scratch (4 KB page) — the PRP1 value
+var nvme_ident_kva    = 0;   # ... and its CPU pointer (direct map)
 var nvme_asq_tail     = 0;   # next SQ slot to write
 var nvme_acq_head     = 0;   # next CQ slot to consume
 var nvme_acq_phase    = 1;   # expected Phase Tag on next new CQE
@@ -367,8 +373,9 @@ fn nvme_db_admin_cq() { return nvme_mmio_base + 0x1000 + (4 << nvme_dstrd); }
 # state and to scrub the IDENTIFY scratch between commands so stale
 # bytes from a prior IDENTIFY can't be misread.
 fn nvme_zero_page(phys) {
+    var zk = dma_kva(phys);             # 1.57.8 (DMA1): takes a PHYS, writes through the direct map
     for (var i = 0; i < 512; i = i + 1) {
-        store64(phys + i * 8, 0);
+        store64(zk + i * 8, 0);
     }
     return 0;
 }
@@ -412,9 +419,10 @@ fn nvme_admin_init() {
     nvme_zero_page(acq);
     nvme_zero_page(ident);
 
-    nvme_asq_phys   = asq;
-    nvme_acq_phys   = acq;
+    nvme_asq_kva    = dma_kva(asq);
+    nvme_acq_kva    = dma_kva(acq);
     nvme_ident_phys = ident;
+    nvme_ident_kva  = dma_kva(ident);
 
     # 5. AQA = (ACQS << 16) | ASQS, both zero-based (63 = 64 entries).
     nvme_mmio_write32(NVME_REG_AQA, (63 << 16) | 63);
@@ -467,7 +475,7 @@ fn nvme_admin_init() {
 fn nvme_admin_submit(opcode, nsid, prp1, cdw10, cdw11) {
     if (nvme_admin_ready == 0) { return 0 - 1; }
 
-    var slot = nvme_asq_phys + nvme_asq_tail * NVME_SQE_SIZE;
+    var slot = nvme_asq_kva + nvme_asq_tail * NVME_SQE_SIZE;
     # Zero the 64-byte SQE. Required because we ring the tail doorbell
     # before all fields are explicitly set — any stale bytes from a
     # prior submission in this slot would be read by the controller as
@@ -504,7 +512,7 @@ fn nvme_admin_poll(expected_cid) {
     if (nvme_admin_ready == 0) { return 0 - 1; }
     var wait = 0;
     while (wait < 10000000) {
-        var slot = nvme_acq_phys + nvme_acq_head * NVME_CQE_SIZE;
+        var slot = nvme_acq_kva + nvme_acq_head * NVME_CQE_SIZE;
         var dw3 = load32(slot + 12);
         var p = (dw3 >> 16) & 0x01;
         if (p == nvme_acq_phase) {
@@ -555,14 +563,14 @@ fn nvme_identify_ctrl() {
     #   64..71 FR  — 8 ASCII bytes
     #   77     MDTS — log2 of max transfer in CAP.MPSMIN-page units
     #   516..519 NN — Number of Namespaces (u32)
-    nvme_ctrl_vid  = load16(nvme_ident_phys + 0);
-    nvme_ctrl_mdts = load8 (nvme_ident_phys + 77);
-    nvme_ctrl_nn   = load32(nvme_ident_phys + 516);
+    nvme_ctrl_vid  = load16(nvme_ident_kva + 0);
+    nvme_ctrl_mdts = load8 (nvme_ident_kva + 77);
+    nvme_ctrl_nn   = load32(nvme_ident_kva + 516);
 
     kprint("nvme: VID=", 10);
     kprint_num(nvme_ctrl_vid);
     kprint(" SSVID=", 7);
-    kprint_num(load16(nvme_ident_phys + 2));
+    kprint_num(load16(nvme_ident_kva + 2));
     kprint(" NN=", 4);
     kprint_num(nvme_ctrl_nn);
     kprint(" MDTS=", 6);
@@ -572,13 +580,13 @@ fn nvme_identify_ctrl() {
     # SN/MN/FR are space-padded ASCII; kprint with explicit length emits
     # them verbatim. Trailing spaces are fine for an iron post-mortem.
     kprint("nvme: model='", 13);
-    kprint(nvme_ident_phys + 24, 40);
+    kprint(nvme_ident_kva + 24, 40);
     kprintln("'", 1);
     kprint("nvme: serial='", 14);
-    kprint(nvme_ident_phys + 4, 20);
+    kprint(nvme_ident_kva + 4, 20);
     kprintln("'", 1);
     kprint("nvme: firmware='", 16);
-    kprint(nvme_ident_phys + 64, 8);
+    kprint(nvme_ident_kva + 64, 8);
     kprintln("'", 1);
 
     return 1;
@@ -602,10 +610,10 @@ fn nvme_identify_ns(nsid) {
     # NSZE at offset 0 (u64). FLBAS at offset 26 (u8); bits [3:0] select
     # which LBAF entry (offset 128 + idx*4) is active. LBADS at bits
     # [23:16] of the LBAF entry = log2 bytes per LBA (9 → 512B, 12 → 4KB).
-    var nsze       = load64(nvme_ident_phys + 0);
-    var flbas      = load8 (nvme_ident_phys + 26);
+    var nsze       = load64(nvme_ident_kva + 0);
+    var flbas      = load8 (nvme_ident_kva + 26);
     var lba_idx    = flbas & 0x0F;
-    var lbaf_entry = load32(nvme_ident_phys + 128 + lba_idx * 4);
+    var lbaf_entry = load32(nvme_ident_kva + 128 + lba_idx * 4);
     var lbads      = (lbaf_entry >> 16) & 0xFF;
     var lba_bytes  = 1 << lbads;
 
@@ -651,10 +659,12 @@ fn nvme_identify_ns(nsid) {
 var NVME_IO_Q_ENTRIES = 64;        # 64-entry I/O queues (same as admin)
 var NVME_IO_QID       = 1;         # single I/O queue, qid=1
 
-var nvme_iosq_phys     = 0;
-var nvme_iocq_phys     = 0;
-var nvme_read_scratch  = 0;         # 4 KB DMA buffer for read/write demo (Phase 3+4)
-var nvme_prp_list_phys = 0;         # 4 KB PRP list page (Phase 4 multi-page transfers)
+var nvme_iosq_kva      = 0;         # I/O SQ CPU pointer (direct map; 1.57.8 DMA1 — see nvme_asq_kva)
+var nvme_iocq_kva      = 0;         # I/O CQ CPU pointer (direct map)
+var nvme_read_scratch  = 0;         # 4 KB DMA buffer (bounce) — PHYS: PRP values only
+var nvme_scratch_kva   = 0;         # ... its CPU pointer (direct map): every copy in/out goes through this
+var nvme_prp_list_phys = 0;         # 4 KB PRP list page (Phase 4 multi-page transfers) — PRP2 value
+var nvme_prp_list_kva  = 0;         # ... its CPU pointer (direct map)
 var nvme_iosq_tail     = 0;
 var nvme_iocq_head     = 0;
 var nvme_iocq_phase    = 1;
@@ -696,10 +706,12 @@ fn nvme_io_queue_init() {
     nvme_zero_page(sc);
     nvme_zero_page(pl);
 
-    nvme_iosq_phys     = sq;
-    nvme_iocq_phys     = cq;
+    nvme_iosq_kva      = dma_kva(sq);
+    nvme_iocq_kva      = dma_kva(cq);
     nvme_read_scratch  = sc;
+    nvme_scratch_kva   = dma_kva(sc);
     nvme_prp_list_phys = pl;
+    nvme_prp_list_kva  = dma_kva(pl);
 
     # 2. Create I/O CQ first (must precede SQ create — see header note).
     #    NVMe 1.4 §5.3:
@@ -760,7 +772,7 @@ var nvme_io_submit_count = 0;
 fn nvme_io_submit(opcode, nsid, prp1, prp2, cdw10, cdw11, cdw12) {
     if (nvme_io_ready == 0) { return 0 - 1; }
     nvme_io_submit_count = nvme_io_submit_count + 1;
-    var slot = nvme_iosq_phys + nvme_iosq_tail * NVME_SQE_SIZE;
+    var slot = nvme_iosq_kva + nvme_iosq_tail * NVME_SQE_SIZE;
     for (var i = 0; i < 8; i = i + 1) { store64(slot + i * 8, 0); }
 
     nvme_io_cmd_id = nvme_io_cmd_id + 1;
@@ -779,45 +791,78 @@ fn nvme_io_submit(opcode, nsid, prp1, prp2, cdw10, cdw11, cdw12) {
     return cid;
 }
 
-# Poll the I/O CQ for the next completion. Same phase-tag logic as
-# admin_poll. 10M-iter ceiling — disk transfers can be slower than
-# IDENTIFY metadata reads, especially on real silicon.
-fn nvme_io_poll_n(expected_cid, max_iters) {
+# ⛔ 1.57.8 — CONSUME BY CID, ON A TIME BUDGET, AND NEVER HAND A TIMED-OUT COMMAND'S BUFFER BACK.
+# (docs/development/issues/2026-09-25-nvme-poll-timeout-leaves-the-cq-one-behind.md)
+# Until 1.57.8 this gave up after a fixed 10M ITERATIONS (tens of ms under KVM) without consuming the late
+# completion, and a CID mismatch returned the STALE entry's status as the current command's. One slow
+# completion (1.57.7 S8, a loaded host) left the CQ one entry behind for the rest of the boot: every later
+# poll returned the PREVIOUS command's status, before its own data had landed (1,704 mismatch lines).
+# Now: (1) the budget is WALL TIME (klog_uptime_us: TSC, calibrated before nvme init against the PM timer or
+# the PIT; before that — a box with neither — a spin count of budget*64). It is checked BEFORE the CQ, so a
+# zero budget gives up without looking (the NVME_SELFTEST injection). (2) Every CQE is consumed and matched
+# by CID: the expected one returns its status; any other CID is a stray, logged and discarded — its status is
+# never anyone's answer. (3) A timeout records the CID as LATE: the device may still DMA into that command's
+# buffer, so nvme_io_settle() reaps it (a poll FOR the late CID) before any buffer is reused or any new
+# command is submitted. Hence at most ONE command is ever outstanding, and a CQE is only ever the expected
+# one or a stray — the late one is always consumed by its own CID, never by the next command's poll.
+var NVME_IO_BUDGET_US    = 5000000;     # 5 s per transfer (Linux's default I/O timeout is 30 s)
+var NVME_FLUSH_BUDGET_US = 30000000;    # 30 s per FLUSH (a large dirty cache; cf. ATA8-ACS FLUSH)
+var nvme_io_late         = 0;           # 1 while a timed-out command's completion is outstanding
+var nvme_io_late_cid     = 0;           # ... and its CID
+
+fn nvme_io_poll_n(expected_cid, budget_us) {
     if (nvme_io_ready == 0) { return 0 - 1; }
-    var wait = 0;
-    while (wait < max_iters) {
-        var slot = nvme_iocq_phys + nvme_iocq_head * NVME_CQE_SIZE;
-        var dw3 = load32(slot + 12);
-        var p = (dw3 >> 16) & 0x01;
-        if (p == nvme_iocq_phase) {
-            var status  = (dw3 >> 17) & 0x7FFF;
-            var got_cid = dw3 & 0xFFFF;
+    var t0 = klog_uptime_us();
+    var spins = 0;
+    while (spins >= 0) {
+        if (t0 > 0) {
+            if ((klog_uptime_us() - t0) >= budget_us) { break; }
+        } else {
+            if (spins >= budget_us * 64) { break; }
+        }
+        spins = spins + 1;
+        var dw3 = load32(nvme_iocq_kva + nvme_iocq_head * NVME_CQE_SIZE + 12);
+        if (((dw3 >> 16) & 0x01) == nvme_iocq_phase) {
             nvme_iocq_head = nvme_iocq_head + 1;
             if (nvme_iocq_head >= NVME_IO_Q_ENTRIES) {
                 nvme_iocq_head = 0;
                 nvme_iocq_phase = 1 - nvme_iocq_phase;
             }
             store32(nvme_db_io_cq(), nvme_iocq_head);
-            if (got_cid != expected_cid) {
-                kprint("nvme: I/O CID mismatch expected=", 32);
-                kprint_num(expected_cid);
-                kprint(" got=", 5);
-                kprint_num(got_cid);
-                kprintln("", 0);
-            }
-            return status;
+            if ((dw3 & 0xFFFF) == expected_cid) { return (dw3 >> 17) & 0x7FFF; }
+            kprint("nvme: I/O stray CID ", 20);
+            kprint_num(dw3 & 0xFFFF);
+            kprintln(" discarded", 10);
         }
-        wait = wait + 1;
     }
     kprintln("nvme: I/O poll timeout", 22);
+    nvme_io_late = 1;
+    nvme_io_late_cid = expected_cid;
     return 0 - 1;
 }
 
-# Default-ceiling wrapper — transfers use the 10M-iter budget tuned for
-# single-LBA reads/writes. Flush uses nvme_io_poll_n directly with a far
-# larger ceiling (see nvme_blk_flush). 1.33.5 fsync barrier.
 fn nvme_io_poll(expected_cid) {
-    return nvme_io_poll_n(expected_cid, 10000000);
+    return nvme_io_poll_n(expected_cid, NVME_IO_BUDGET_US);
+}
+
+# Reap a timed-out command's completion before ANY DMA buffer (the bounce scratch, the PRP list, a caller's
+# direct buffer) is reused. Called under nvme_lock at the top of every submit path and before a caller-buffer
+# path returns a failure. Returns 0 when nothing is outstanding. If the completion does not arrive within a
+# further transfer budget, the only way to guarantee the device will not DMA into a buffer we hand back is to
+# stop the controller: CC.EN=0 (a controller reset ends all outstanding commands), nvme_io_ready=0, and every
+# later NVMe I/O fails fast with -1 instead of reading a buffer the device may still be writing.
+fn nvme_io_settle() {
+    if (nvme_io_late == 0) { return 0; }
+    if (nvme_io_poll_n(nvme_io_late_cid, NVME_IO_BUDGET_US) >= 0) {
+        nvme_io_late = 0;
+        kprintln("nvme: late completion reaped", 28);
+        return 0;
+    }
+    kprintln("nvme: late completion lost", 26);
+    nvme_io_late = 0;
+    nvme_io_ready = 0;
+    nvme_disable();
+    return 0 - 1;
 }
 
 # Internal R/W dispatch — builds PRP1 / PRP2 / PRP list per NVMe 1.4
@@ -836,6 +881,8 @@ fn nvme_io_poll(expected_cid) {
 #               64-bit physical address; the page boundary at 4 KB
 #               gives 512 entries → up to 2 MB total transfer.
 fn nvme_rw_internal(opcode, lba, nlb_zb, buf_phys, byte_count) {
+    # 1.57.8: a timed-out command still owns the PRP list and its buffer until its completion is reaped.
+    if (nvme_io_settle() != 0) { return 0 - 1; }
     var page_size    = 4096;
     var pages_needed = (byte_count + page_size - 1) / page_size;
     var prp1 = buf_phys;
@@ -850,7 +897,7 @@ fn nvme_rw_internal(opcode, lba, nlb_zb, buf_phys, byte_count) {
         # only consumes the count of entries dictated by byte_count.
         var entries = pages_needed - 1;
         for (var i = 0; i < entries; i = i + 1) {
-            store64(nvme_prp_list_phys + i * 8, buf_phys + (i + 1) * page_size);
+            store64(nvme_prp_list_kva + i * 8, buf_phys + (i + 1) * page_size);
         }
         prp2 = nvme_prp_list_phys;
     }
@@ -908,6 +955,7 @@ fn nvme_read_sectors(lba, count, buf) {
     var bytes = count * nvme_ns1_lba_bytes;
     var st = nvme_rw_internal(0x02, lba, count - 1, buf, bytes);
     if (st != 0) {
+        nvme_io_settle();          # 1.57.8: `buf` is the CALLER's — reap (or reset) before handing it back
         nvme_spin_unlock();
         kprint("nvme: read_sectors LBA ", 23);
         kprint_num(lba);
@@ -931,6 +979,7 @@ fn nvme_write_sectors(lba, count, buf) {
     # under nvme_lock (was unlocked). Unlock BEFORE the error kprint (console < nvme order).
     nvme_spin_lock();
     var st = nvme_rw_internal(0x01, lba, count - 1, buf, bytes);
+    if (st != 0) { nvme_io_settle(); }    # 1.57.8: the caller's buffer, as in nvme_read_sectors
     nvme_spin_unlock();
     if (st != 0) {
         kprint("nvme: write_sectors LBA ", 24);
@@ -974,7 +1023,7 @@ fn nvme_rw_demo() {
     kprint("nvme: ns1 LBA0 first 8 bytes:", 29);
     for (var i = 0; i < 8; i = i + 1) {
         kprint(" ", 1);
-        kprint_num(load8(nvme_read_scratch + i));
+        kprint_num(load8(nvme_scratch_kva + i));
     }
     kprintln("", 0);
     # CMOS kcp = 0x45 (first NVMe read completed — Phase 3 carry-forward)
@@ -984,26 +1033,26 @@ fn nvme_rw_demo() {
     # --- 2. LBA 5 write-then-read round-trip (DESTRUCTIVE, gated) ---
     nvme_zero_page(nvme_read_scratch);
     # Pattern "CYRIUS!!" = bytes 67, 89, 82, 73, 85, 83, 33, 33.
-    store8(nvme_read_scratch + 0, 67);
-    store8(nvme_read_scratch + 1, 89);
-    store8(nvme_read_scratch + 2, 82);
-    store8(nvme_read_scratch + 3, 73);
-    store8(nvme_read_scratch + 4, 85);
-    store8(nvme_read_scratch + 5, 83);
-    store8(nvme_read_scratch + 6, 33);
-    store8(nvme_read_scratch + 7, 33);
+    store8(nvme_scratch_kva + 0, 67);
+    store8(nvme_scratch_kva + 1, 89);
+    store8(nvme_scratch_kva + 2, 82);
+    store8(nvme_scratch_kva + 3, 73);
+    store8(nvme_scratch_kva + 4, 85);
+    store8(nvme_scratch_kva + 5, 83);
+    store8(nvme_scratch_kva + 6, 33);
+    store8(nvme_scratch_kva + 7, 33);
     if (nvme_write_lba(5, nvme_read_scratch) == 0) { return 0; }
     nvme_zero_page(nvme_read_scratch);
     if (nvme_read_lba(5, nvme_read_scratch) == 0) { return 0; }
     var single_ok = 1;
-    if (load8(nvme_read_scratch + 0) != 67) { single_ok = 0; }
-    if (load8(nvme_read_scratch + 1) != 89) { single_ok = 0; }
-    if (load8(nvme_read_scratch + 2) != 82) { single_ok = 0; }
-    if (load8(nvme_read_scratch + 3) != 73) { single_ok = 0; }
-    if (load8(nvme_read_scratch + 4) != 85) { single_ok = 0; }
-    if (load8(nvme_read_scratch + 5) != 83) { single_ok = 0; }
-    if (load8(nvme_read_scratch + 6) != 33) { single_ok = 0; }
-    if (load8(nvme_read_scratch + 7) != 33) { single_ok = 0; }
+    if (load8(nvme_scratch_kva + 0) != 67) { single_ok = 0; }
+    if (load8(nvme_scratch_kva + 1) != 89) { single_ok = 0; }
+    if (load8(nvme_scratch_kva + 2) != 82) { single_ok = 0; }
+    if (load8(nvme_scratch_kva + 3) != 73) { single_ok = 0; }
+    if (load8(nvme_scratch_kva + 4) != 85) { single_ok = 0; }
+    if (load8(nvme_scratch_kva + 5) != 83) { single_ok = 0; }
+    if (load8(nvme_scratch_kva + 6) != 33) { single_ok = 0; }
+    if (load8(nvme_scratch_kva + 7) != 33) { single_ok = 0; }
     if (single_ok == 1) {
         kprintln("nvme: LBA5 single-LBA write-then-read PASS", 42);
         # CMOS kcp = 0x46 (single-LBA write round-trip)
@@ -1016,14 +1065,14 @@ fn nvme_rw_demo() {
     # --- 3. LBA 20-27 multi-LBA (DESTRUCTIVE, gated) ---
     # Fill the 4 KB scratch with a ramp: byte[i] = i & 0xFF.
     for (var j = 0; j < 4096; j = j + 1) {
-        store8(nvme_read_scratch + j, j & 0xFF);
+        store8(nvme_scratch_kva + j, j & 0xFF);
     }
     if (nvme_write_sectors(20, 8, nvme_read_scratch) == 0) { return 0; }
     nvme_zero_page(nvme_read_scratch);
     if (nvme_read_sectors(20, 8, nvme_read_scratch) == 0) { return 0; }
     var multi_ok = 1;
     for (var k = 0; k < 4096; k = k + 1) {
-        if (load8(nvme_read_scratch + k) != (k & 0xFF)) {
+        if (load8(nvme_scratch_kva + k) != (k & 0xFF)) {
             multi_ok = 0;
         }
     }
@@ -1078,7 +1127,7 @@ fn nvme_blk_read(sector, buf) {
     if (nvme_read_lba(sector, nvme_read_scratch) == 0) { nvme_spin_unlock(); return 0 - 1; }
     # Copy LBA bytes from scratch into caller's buffer. 8-byte stride mirrors virtio_blk's loop.
     for (var i = 0; i < nw; i = i + 1) {
-        store64(buf + i * 8, load64(nvme_read_scratch + i * 8));
+        store64(buf + i * 8, load64(nvme_scratch_kva + i * 8));
     }
     nvme_spin_unlock();
     return 0;
@@ -1092,9 +1141,11 @@ fn nvme_blk_write(sector, buf) {
     if (nb > 4096) { nb = 4096; }
     var nw = nb / 8;
     nvme_spin_lock();
+    # 1.57.8: a late READ may still DMA into the scratch — reap it BEFORE the copy, not merely before submit.
+    if (nvme_io_settle() != 0) { nvme_spin_unlock(); return 0 - 1; }
     # Copy caller's buffer into page-aligned scratch first.
     for (var i = 0; i < nw; i = i + 1) {
-        store64(nvme_read_scratch + i * 8, load64(buf + i * 8));
+        store64(nvme_scratch_kva + i * 8, load64(buf + i * 8));
     }
     if (nvme_write_lba(sector, nvme_read_scratch) == 0) { nvme_spin_unlock(); return 0 - 1; }
     nvme_spin_unlock();
@@ -1103,7 +1154,7 @@ fn nvme_blk_write(sector, buf) {
 
 # NVMe FLUSH (NVM Command Set opcode 0x00) — commit the controller's
 # volatile write cache to non-volatile media. Non-data: no PRP, no
-# CDWs, NSID 1. The poll ceiling is ~30x the transfer budget: a cache
+# CDWs, NSID 1. The poll budget is 6x the transfer one (30 s, NVME_FLUSH_BUDGET_US): a cache
 # flush can take seconds on a drive committing a large dirty cache
 # (NVMe base spec; cf. ATA8-ACS's ~30s FLUSH budget), where a single-LBA
 # transfer never does — reusing the transfer ceiling would false-timeout
@@ -1116,15 +1167,16 @@ fn nvme_blk_write(sector, buf) {
 # lock at all. Under smp_sched_aps=1 a flush on one CPU and a read on another interleave their SQ
 # tail advance and, worse, either may reap the OTHER's completion out of the shared CQ: the read
 # returns "done" for a flush's CQE and hands the filesystem a buffer the controller never filled.
-# ⚠ The lock is held across a poll whose ceiling is ~30x the transfer budget, by design — a cache
+# ⚠ The lock is held across a poll whose budget is 6x the transfer one, by design — a cache
 # flush legitimately takes seconds on a drive committing a large dirty cache, and a flush that
 # overlapped other I/O would not be a barrier. fsync is meant to be a stall.
 fn nvme_blk_flush() {
     if (nvme_io_ready == 0) { return 0 - 1; }
     nvme_spin_lock();
+    if (nvme_io_settle() != 0) { nvme_spin_unlock(); return 0 - 1; }
     var cid = nvme_io_submit(0x00, 1, 0, 0, 0, 0, 0);
     if (cid < 0) { nvme_spin_unlock(); return 0 - 1; }
-    if (nvme_io_poll_n(cid, 300000000) != 0) { nvme_spin_unlock(); return 0 - 1; }
+    if (nvme_io_poll_n(cid, NVME_FLUSH_BUDGET_US) != 0) { nvme_spin_unlock(); return 0 - 1; }
     nvme_spin_unlock();
     return 0;
 }
@@ -1150,7 +1202,7 @@ fn nvme_blk_read_sectors(start, count, buf) {
             nvme_spin_lock();
             var fst = nvme_rw_internal(0x02, start, count - 1, nvme_read_scratch, bytes);
             if (fst != 0) { nvme_spin_unlock(); return 0 - 1; }
-            memcpy(buf, nvme_read_scratch, bytes);
+            memcpy(buf, nvme_scratch_kva, bytes);
             nvme_spin_unlock();
             return 0;
         }
@@ -1184,7 +1236,8 @@ fn nvme_blk_write_sectors(start, count, buf) {
     if (count >= 1) {
         if (bytes <= 4096) {
             nvme_spin_lock();
-            memcpy(nvme_read_scratch, buf, bytes);
+            if (nvme_io_settle() != 0) { nvme_spin_unlock(); return 0 - 1; }    # 1.57.8: before the copy
+            memcpy(nvme_scratch_kva, buf, bytes);
             var st = nvme_rw_internal(0x01, start, count - 1, nvme_read_scratch, bytes);
             nvme_spin_unlock();
             if (st != 0) { return 0 - 1; }
@@ -1219,3 +1272,115 @@ fn nvme_register_block_dev() {
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x48; 0xE6; 0x71; }
     return 1;
 }
+
+#ifdef NVME_SELFTEST
+# ═══ 1.57.8 NVME_SELFTEST — a forced late completion must not shift the CQ, and its buffer must not be reused ═══
+# Fault injection: nvst_inject submits a READ into nvme_read_scratch and polls it with a ZERO budget, so the poll
+# gives up before looking and the completion arrives LATE — exactly what a loaded host did to 1.57.7 S8. Then:
+#   stamp  8 LBAs at nsze/2 get a per-LBA, per-word pattern (DESTRUCTIVE: QEMU scratch disks only, like KTEST's).
+#   shift  after one late read, 16 reads of known LBAs: every word must be that LBA's pattern, and 50 ms after the
+#          last one the CQ head must hold NO leftover entry (the old code left one: the CID shift). RED on the old
+#          poll (stale status returned on a CID mismatch): wrong data, "CID mismatch" lines, left=1.
+#   reuse  8x: a late read into the scratch, then at once nvme_blk_write of a different pattern through the SAME
+#          scratch; read back — the late read's DMA must not land in the copied data (settle before the copy).
+#   lost   a CID that will never complete is recorded late: the next I/O must fail, the controller must be
+#          disabled (CSTS.RDY=0) and nvme_io_ready cleared — never a buffer handed back to a live device. This
+#          leaves NVMe off for the rest of the boot; the smoke stops at "nvmest: done".
+fn nvst_word(lba, i) { return 0x4E56000000000000 | ((lba & 0xFFFFFFFF) << 16) | i; }
+fn nvst_stamp(buf, lba) {
+    for (var i = 0; i < nvme_ns1_lba_bytes / 8; i = i + 1) { store64(buf + i * 8, nvst_word(lba, i)); }
+    return 0;
+}
+fn nvst_bad(buf, lba) {
+    var nbad = 0;
+    for (var i = 0; i < nvme_ns1_lba_bytes / 8; i = i + 1) {
+        if (load64(buf + i * 8) != nvst_word(lba, i)) { nbad = nbad + 1; }
+    }
+    return nbad;
+}
+fn nvst_poison(buf) {
+    for (var i = 0; i < 512; i = i + 1) { store64(buf + i * 8, 0xEEEEEEEEEEEEEEEE); }
+    return 0;
+}
+fn nvst_inject(lba) {
+    var cid = nvme_io_submit(0x02, 1, nvme_read_scratch, 0, lba & 0xFFFFFFFF, (lba >> 32) & 0xFFFFFFFF, 0);
+    if (nvme_io_poll_n(cid, 0) == 0 - 1) { return 1; }
+    kprintln("nvmest: inject FAIL (the completion was not late)", 49);
+    return 0;
+}
+fn nvst_verdict(name, nlen, ok, a, b) {
+    kprint("nvmest: ", 8);
+    kprint(name, nlen);
+    if (ok == 1) { kprint(" PASS", 5); } else { kprint(" FAIL", 5); }
+    kprint(" bad=", 5); kprint_num(a);
+    kprint(" aux=", 5); kprint_num(b);
+    kprintln("", 0);
+    return 0;
+}
+
+fn nvme_late_selftest() {
+    if (nvme_io_ready == 0) { kprintln("nvmest: SKIP no NVMe I/O queue", 30); kprintln("nvmest: done", 12); return 0; }
+    if (nvme_ns1_lba_bytes > 4096) { kprintln("nvmest: SKIP LBA > 4096", 23); kprintln("nvmest: done", 12); return 0; }
+    var sc = nvme_read_scratch;             # PRP value
+    var sck = nvme_scratch_kva;             # CPU pointer (1.57.8 DMA1)
+    var base = nvme_ns1_nsze / 2;
+    var wf = 0;
+    for (var k = 0; k < 8; k = k + 1) {
+        nvst_stamp(sck, base + k);
+        if (nvme_write_lba(base + k, sc) == 0) { wf = wf + 1; }
+    }
+    var wok = 0;
+    if (wf == 0) { wok = 1; }
+    nvst_verdict("stamp", 5, wok, wf, base);
+
+    # shift
+    var inj = nvst_inject(base);
+    var sbad = 0;
+    var rf = 0;
+    for (var r = 0; r < 16; r = r + 1) {
+        var kk = (r * 5 + 3) & 7;
+        nvst_poison(sck);
+        if (nvme_read_lba(base + kk, sc) == 0) { rf = rf + 1; }
+        sbad = sbad + nvst_bad(sck, base + kk);
+    }
+    var t0 = klog_uptime_us();
+    var sp = 0;
+    while (sp < 50000000) {
+        sp = sp + 1;
+        if (t0 > 0) { if ((klog_uptime_us() - t0) > 50000) { sp = 50000000; } }
+    }
+    var left = 0;
+    if (((load32(nvme_iocq_kva + nvme_iocq_head * NVME_CQE_SIZE + 12) >> 16) & 0x01) == nvme_iocq_phase) { left = 1; }
+    var sok = 0;
+    if (inj == 1) { if (sbad == 0) { if (rf == 0) { if (left == 0) { if (nvme_io_late == 0) { sok = 1; } } } } }
+    nvst_verdict("shift", 5, sok, sbad + rf, left);
+
+    # reuse
+    var src = dma_kva(pmm_alloc());     # CPU buffers (nvme_blk_* bounce them): direct map
+    var dst = dma_kva(pmm_alloc());
+    var ubad = 0;
+    var uinj = 0;
+    for (var u = 0; u < 8; u = u + 1) {
+        nvst_stamp(src, base + 100 + u);
+        uinj = uinj + nvst_inject(base + 1);
+        if (nvme_blk_write(base + 6, src) != 0) { ubad = ubad + 1; }
+        nvst_poison(dst);
+        if (nvme_blk_read(base + 6, dst) != 0) { ubad = ubad + 1; }
+        ubad = ubad + nvst_bad(dst, base + 100 + u);
+    }
+    var uok = 0;
+    if (uinj == 8) { if (ubad == 0) { if (nvme_io_late == 0) { uok = 1; } } }
+    nvst_verdict("reuse", 5, uok, ubad, uinj);
+
+    # lost
+    nvme_io_late = 1;
+    nvme_io_late_cid = (nvme_io_cmd_id + 1000) & 0xFFFF;
+    var lr = nvme_read_lba(base, sc);
+    var rdy = nvme_mmio_read32(NVME_REG_CSTS) & 0x01;
+    var lok = 0;
+    if (lr == 0) { if (rdy == 0) { if (nvme_io_ready == 0) { if (nvme_io_late == 0) { lok = 1; } } } }
+    nvst_verdict("lost", 4, lok, lr, rdy);
+    kprintln("nvmest: done", 12);
+    return 0;
+}
+#endif

@@ -199,8 +199,11 @@ var hda_mmio_base[2];         # [per-instance] controller MMIO base — steers e
 var hda_codec_mask[2];        # [per-instance] STATESTS codec-present bitmask (set by hda_reset, B1)
 
 # --- B2 verb-ring state ---
-var hda_corb_phys[2];         # [per-instance] CORB ring phys
-var hda_rirb_phys[2];         # [per-instance] RIRB ring phys
+# 1.57.8 (DMA1): the CPU pointers to the CORB/RIRB pmm pages are their DIRECT-MAP aliases (dma_kva), not
+# the phys: hda_verb can run under a per-process CR3, where a ring-3 PT_LOAD may shadow the identity VA of a
+# pmm page. The phys goes only into CORBLBASE/RIRBLBASE (hda_ring_init).
+var hda_corb_kva[2];          # [per-instance] CORB ring CPU pointer (direct map)
+var hda_rirb_kva[2];          # [per-instance] RIRB ring CPU pointer (direct map)
 var hda_corb_wp[2];           # [per-instance] software CORB write index (0..255)
 var hda_rirb_rp[2];           # [per-instance] software RIRB read index  (0..255)
 var hda_codec0[2];            # [per-instance] first present codec address
@@ -631,10 +634,12 @@ fn hda_ring_init() {
     if (vmm_is_mapped(rirb) == 0) { vmm_map(rirb, rirb, 0x83); }
     iommu_register_dma(corb);
     iommu_register_dma(rirb);
-    hda_zero_page(corb);
-    hda_zero_page(rirb);
-    store64(&hda_corb_phys + hda_active_ctl * 8, corb);
-    store64(&hda_rirb_phys + hda_active_ctl * 8, rirb);
+    var corb_kva = dma_kva(corb);
+    var rirb_kva = dma_kva(rirb);
+    hda_zero_page(corb_kva);
+    hda_zero_page(rirb_kva);
+    store64(&hda_corb_kva + hda_active_ctl * 8, corb_kva);
+    store64(&hda_rirb_kva + hda_active_ctl * 8, rirb_kva);
 
     # Stop both rings before reprogramming their bases.
     hda_write8(HDA_CORBCTL, 0);
@@ -686,7 +691,7 @@ fn hda_verb(codec, nid, verb20) {
     var cmd = (codec << 28) | (nid << 20) | (verb20 & 0xFFFFF);
     var wp0 = (load64(&hda_corb_wp + ci * 8) + 1) & 0xFF;
     store64(&hda_corb_wp + ci * 8, wp0);
-    store32(load64(&hda_corb_phys + ci * 8) + wp0 * 4, cmd);
+    store32(load64(&hda_corb_kva + ci * 8) + wp0 * 4, cmd);
     hda_write16(HDA_CORBWP, wp0);             # doorbell (SQ-tail twin)
     # ~100 ms budget: real HW drains the CORB immediately on the doorbell, but
     # QEMU's intel-hda drains it from a periodic timer, so the poll must span a
@@ -697,7 +702,7 @@ fn hda_verb(codec, nid, verb20) {
         if (wp != load64(&hda_rirb_rp + ci * 8)) {
             var rp0 = (load64(&hda_rirb_rp + ci * 8) + 1) & 0xFF;
             store64(&hda_rirb_rp + ci * 8, rp0);
-            var resp = load32(load64(&hda_rirb_phys + ci * 8) + rp0 * 8);   # dword0 = response
+            var resp = load32(load64(&hda_rirb_kva + ci * 8) + rp0 * 8);   # dword0 = response
             # ack RINTFL+overrun (W1C) → resets QEMU's rirb_count so corb_run
             # keeps draining the CORB (the RINTCNT gate, see hda_ring_init).
             hda_write8(HDA_RIRBSTS, 0x5);

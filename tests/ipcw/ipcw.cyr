@@ -1,0 +1,332 @@
+# ipcw — agnos 1.57.8: BLOCKING pipe and channel reads, and the #44 directed park kick, from ring 3.
+# Issue: docs/development/issues/2026-09-25-cross-cpu-poll-and-yield-loops-are-tick-bound.md (its Gate section).
+#
+# The driver (no arguments; seeded as /bin/agnsh) runs every phase and prints one `IPCW-OK <phase> ...` or
+# `IPCW-FAIL <phase> ...` line each, then `IPCW-DONE pass=N fail=M` and `IPCW-EXIT 0`. Child roles are this same
+# program spawned by spawn_path#43 as "/bin/agnsh <role> <args>" (the child inherits the driver's fd table, so the
+# pipe fds keep their numbers; a channel end is handed over by CH_ENDOW).
+#   pipe-pp   N rounds: the driver writes 8 bytes into pipe A, the child's BLOCKING read (a4 = 0) takes them and
+#             writes them into pipe B, the driver's blocking read takes them back. GATE: < 1 ms per round (at -smp 4
+#             the two sides run on different CPUs; before 1.57.8 a poll+#44 loop paid one 10 ms tick per round).
+#   chan-pp   the same through a #97 channel pair, read#5 / write#1 on the channel fds. GATE: < 1 ms per round.
+#   yield-peer  #44 against a child that also loops #44 (bench-ring3's yield_peer shape). GATE: < 1 ms per yield.
+#   pause-pair  (ENDFIX PIPE-R1) #14 pause against an UNRELATED child that also loops #14: neither sends nor draws the
+#             directed kick, so at -smp > 1 each pause is a whole interrupt again. GATE (sysinfo cpus > 1): >= 1 ms per
+#             pause (the review's defect: two pausers on two CPUs woke each other at ~100 us, forever). -smp 1: the
+#             two alternate by direct switches, which is not this gate's subject — reported, not gated.
+#   mixed-pair  #44 against a child looping #14 (agnsh's bg poll beside a sock_recv backoff): a #44 park kicks only
+#             another #44 parker, so the yielder halts a whole interrupt. GATE (cpus > 1): >= 1 ms per yield.
+#   nb        read#5 a4 = 1 (O_NONBLOCK) on an empty pipe with a live writer and on an empty channel: -2, at once.
+#   eof-close the child sleeps 30 ms, writes one byte, sleeps 30 ms, CLOSES its write end, then sleeps 400 ms: the
+#             driver's second blocking read (entered while the child still holds the end) returns 0 (EOF) within
+#             70 ms (the close wake at ~30 ms; the 100 ms backstop alone would miss the gate).
+#   eof-death the child holds the only other write end, sleeps 30 ms and exits WITHOUT closing it: the driver's
+#             blocking read returns 0 within 80 ms (the death wake; the backstop alone: >= 100 ms).
+#   kill      a child blocks reading an empty pipe (its own inherited write end keeps it live: it would wait
+#             forever); #99 shows it BLOCKED (state 6); kill(9) ends it and WAIT_BLOCK returns 265 within 50 ms
+#             (S7 boundary D: the kill interrupts the wait; the backstop alone would take up to 100 ms).
+# ⚠ It ALWAYS exits 0 after IPCW-DONE — a non-zero exit drops kybernet into the emergency shell.
+
+var PP_N = 2000;
+var ip_fds[2];
+var ip_fds2[2];
+var ip_msg[2];
+var ip_line[32];         # 256 B spawn line
+var ip_pl[128];          # 1024 B #99 records (16 x 64)
+var IP_LN = 0;
+var ip_pass = 0;
+var ip_fail = 0;
+var ip_ob[64];
+var IP_ON = 0;
+
+fn o_flush() { if (IP_ON > 0) { syscall(1, 1, &ip_ob, IP_ON, 0); } IP_ON = 0; return 0; }
+fn o_putc(ch) { store8(&ip_ob + IP_ON, ch); IP_ON = IP_ON + 1; if (ch == 10) { o_flush(); } if (IP_ON >= 500) { o_flush(); } return 0; }
+fn o_out(s) { var i = 0; while (load8(s + i) != 0) { o_putc(load8(s + i)); i = i + 1; } return 0; }
+fn o_num(n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { o_putc(45); n = 0 - n; }
+    if (n == 0) { o_putc(48); return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; o_putc(load8(&b + i)); }
+    return 0;
+}
+fn o_kv(k, v) { o_out(" "); o_out(k); o_out("="); o_num(v); return 0; }
+fn ok(ph) { o_out("IPCW-OK "); o_out(ph); ip_pass = ip_pass + 1; return 0; }
+fn bad(ph) { o_out("IPCW-FAIL "); o_out(ph); ip_fail = ip_fail + 1; return 0; }
+fn verdict(c, ph) { if (c == 1) { ok(ph); } else { bad(ph); } return 0; }
+
+fn eq(a, b) {
+    var i = 0;
+    while (1 == 1) {
+        var ca = load8(a + i);
+        if (ca != load8(b + i)) { return 0; }
+        if (ca == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn ip_atoi(s) {
+    var v = 0;
+    var i = 0;
+    while (load8(s + i) >= 48) { if (load8(s + i) > 57) { break; } v = v * 10 + (load8(s + i) - 48); i = i + 1; }
+    return v;
+}
+fn us() { return syscall(95, 0, 0, 0, 0); }
+fn rd(fd, buf, n, a4) { return syscall(5, fd, buf, n, a4); }
+fn wr(fd, buf, n) { return syscall(1, fd, buf, n, 0); }
+fn cls(fd) { return syscall(6, fd, 0, 0, 0); }
+
+# The spawn line "/bin/agnsh <role> <a> <b> <c>" in ip_line.
+fn ln_s(s) { var i = 0; while (load8(s + i) != 0) { store8(&ip_line + IP_LN, load8(s + i)); IP_LN = IP_LN + 1; i = i + 1; } return 0; }
+fn ln_n(n) {
+    var b[24];
+    var i = 0;
+    if (n == 0) { store8(&ip_line + IP_LN, 48); IP_LN = IP_LN + 1; return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; store8(&ip_line + IP_LN, load8(&b + i)); IP_LN = IP_LN + 1; }
+    return 0;
+}
+fn spawn3(role, a, b, c) {
+    IP_LN = 0;
+    ln_s("/bin/agnsh "); ln_s(role);
+    ln_s(" "); ln_n(a); ln_s(" "); ln_n(b); ln_s(" "); ln_n(c);
+    store8(&ip_line + IP_LN, 0);
+    return syscall(43, &ip_line, IP_LN, 0, 0);
+}
+fn reap(pid) { return syscall(4, 0x100 | pid, 0, 0, 0); }
+
+# #99: the state of `pid`, or -1 when it is not listed.
+fn pstate(pid) {
+    var n = syscall(99, &ip_pl, 16, 0, 0);
+    var i = 0;
+    while (i < n) {
+        if (load64(&ip_pl + i * 64) == pid) { return load64(&ip_pl + i * 64 + 8); }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# ── child roles ──
+fn c_pp(r, w, n) {
+    var i = 0;
+    while (i < n) {
+        if (rd(r, &ip_msg, 8, 0) != 8) { return 3; }
+        if (wr(w, &ip_msg, 8) != 8) { return 4; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn c_yield(n) { var i = 0; while (i < n) { syscall(44, 0, 0, 0, 0); i = i + 1; } return 0; }
+fn c_pause(n) { var i = 0; while (i < n) { syscall(14, 0, 0, 0, 0); i = i + 1; } return 0; }
+fn c_eofc(w) {
+    syscall(41, 30, 0, 0, 0); wr(w, "x", 1);
+    syscall(41, 30, 0, 0, 0); cls(w);                       # the driver is blocked in its second read by now
+    syscall(41, 400, 0, 0, 0);
+    return 0;
+}
+fn c_eofd() { syscall(41, 30, 0, 0, 0); return 0; }
+fn c_blk(r) { rd(r, &ip_msg, 8, 0); return 9; }
+
+fn child(): i64 {
+    var role = argv(1);
+    var a = 0; var b = 0; var c = 0;
+    if (argc() > 2) { a = ip_atoi(argv(2)); }
+    if (argc() > 3) { b = ip_atoi(argv(3)); }
+    if (argc() > 4) { c = ip_atoi(argv(4)); }
+    if (eq(role, "pp") == 1) { return c_pp(a, b, c); }
+    if (eq(role, "cp") == 1) { return c_pp(a, a, c); }
+    if (eq(role, "yp") == 1) { return c_yield(c); }
+    if (eq(role, "ps") == 1) { return c_pause(c); }
+    if (eq(role, "eofc") == 1) { return c_eofc(a); }
+    if (eq(role, "eofd") == 1) { return c_eofd(); }
+    if (eq(role, "blk") == 1) { return c_blk(a); }
+    return 99;
+}
+
+# ── driver phases ──
+fn round_gate(ph, t0, t1, n, got) {
+    var dv = got;
+    if (dv < 1) { dv = 1; }
+    var nsr = ((t1 - t0) * 1000) / dv;
+    verdict(got == n && nsr < 1000000, ph);
+    o_kv("n", n); o_kv("got", got); o_kv("us", t1 - t0); o_kv("ns_per_round", nsr); o_out("\n");
+    return 0;
+}
+
+fn ph_pipe_pp() {
+    if (syscall(25, &ip_fds, 0, 0, 0) != 0) { bad("pipe-pp"); o_out(" pipe#25 failed\n"); return 0; }
+    if (syscall(25, &ip_fds2, 0, 0, 0) != 0) { bad("pipe-pp"); o_out(" pipe#25 failed\n"); return 0; }
+    var ar = load64(&ip_fds); var aw = load64(&ip_fds + 8);
+    var br = load64(&ip_fds2); var bw = load64(&ip_fds2 + 8);
+    var pid = spawn3("pp", ar, bw, PP_N);
+    if (pid < 0) { bad("pipe-pp"); o_kv("spawn", pid); o_out("\n"); return 0; }
+    store64(&ip_msg, 0x5050494E47504F4E);
+    var got = 0;
+    var t0 = us();
+    while (got < PP_N) {
+        if (wr(aw, &ip_msg, 8) != 8) { break; }
+        if (rd(br, &ip_msg, 8, 0) != 8) { break; }
+        got = got + 1;
+        if ((us() - t0) > 5000000) { break; }                   # a tick-bound kernel (a mutation) reports, not hangs
+    }
+    var t1 = us();
+    if (got < PP_N) { syscall(16, pid, 9, 0, 0); }             # a capped (RED) run: the child still waits
+    var st = reap(pid);
+    round_gate("pipe-pp", t0, t1, PP_N, got);
+    o_out("IPCW pipe-pp child_status="); o_num(st); o_out("\n");
+    cls(ar); cls(aw); cls(br); cls(bw);
+    return 0;
+}
+
+fn ph_chan_pp() {
+    if (syscall(97, 1, &ip_fds, 0, 0) != 0) { bad("chan-pp"); o_out(" CH_MINT failed\n"); return 0; }
+    var fa = load64(&ip_fds); var fb = load64(&ip_fds + 8);
+    var tfd = syscall(97, 5, fb, 0, 0);                          # CH_ENDOW: the next child owns fb at tfd
+    if (tfd < 0) { bad("chan-pp"); o_kv("endow", tfd); o_out("\n"); return 0; }
+    var pid = spawn3("cp", tfd, 0, PP_N);
+    if (pid < 0) { bad("chan-pp"); o_kv("spawn", pid); o_out("\n"); return 0; }
+    store64(&ip_msg, 0x4348414E50494E47);
+    var got = 0;
+    var t0 = us();
+    while (got < PP_N) {
+        if (wr(fa, &ip_msg, 8) != 8) { break; }
+        if (rd(fa, &ip_msg, 8, 0) != 8) { break; }
+        got = got + 1;
+        if ((us() - t0) > 5000000) { break; }
+    }
+    var t1 = us();
+    if (got < PP_N) { syscall(16, pid, 9, 0, 0); }
+    var st = reap(pid);
+    round_gate("chan-pp", t0, t1, PP_N, got);
+    o_out("IPCW chan-pp child_status="); o_num(st); o_out("\n");
+    # after the child's death its endpoint is released: our read is EOF (0), at once, even blocking
+    var eo = rd(fa, &ip_msg, 8, 0);
+    verdict(eo == 0, "chan-eof"); o_kv("read_after_peer_death", eo); o_out("\n");
+    syscall(97, 4, fa, 0, 0);
+    return 0;
+}
+
+fn ph_yield_peer() {
+    var pid = spawn3("yp", 0, 0, PP_N + 64);
+    if (pid < 0) { bad("yield-peer"); o_kv("spawn", pid); o_out("\n"); return 0; }
+    var t0 = us();
+    var i = 0;
+    while (i < PP_N) { syscall(44, 0, 0, 0, 0); i = i + 1; if ((us() - t0) > 5000000) { break; } }
+    var t1 = us();
+    syscall(16, pid, 9, 0, 0);                                   # a capped run leaves the peer yielding
+    reap(pid);
+    round_gate("yield-peer", t0, t1, i, i);
+    return 0;
+}
+
+# ENDFIX PIPE-R1: a park beside an unrelated parker on another CPU must sleep, not ping-pong. The driver loops
+# syscall `num` (14 or 44) 30 times beside a child looping #14; per-call time >= 1 ms when cpus > 1.
+fn ph_idle_pair(ph, num) {
+    var cpus = 0;
+    if (syscall(35, &ip_pl, 40, 0, 0) == 0) { cpus = load64(&ip_pl + 32); }
+    var pid = spawn3("ps", 0, 0, 1000000);
+    if (pid < 0) { bad(ph); o_kv("spawn", pid); o_out("\n"); return 0; }
+    syscall(41, 50, 0, 0, 0);
+    # WARM-UP, 40 ms of the same calls: the two may start on ONE CPU (a wake taken by the sleeper's own CPU), where
+    # they alternate by direct switches (~100 us, the -smp 1 shape, not this gate's subject); an idle CPU's tick
+    # steals the READY one within ~10 ms, and keep-current then keeps each parker on its own CPU.
+    var t0 = us();
+    while ((us() - t0) < 40000) { syscall(num, 0, 0, 0, 0); }
+    t0 = us();
+    var i = 0;
+    while (i < 30) { syscall(num, 0, 0, 0, 0); i = i + 1; }
+    var t1 = us();
+    syscall(16, pid, 9, 0, 0);
+    reap(pid);
+    var nsp = ((t1 - t0) * 1000) / 30;
+    var gated = 0;
+    if (cpus > 1) { gated = 1; }
+    verdict(gated == 0 || nsp >= 1000000, ph);
+    o_kv("cpus", cpus); o_kv("gated", gated); o_kv("us", t1 - t0); o_kv("ns_per_call", nsp); o_out("\n");
+    return 0;
+}
+
+fn ph_nb() {
+    syscall(25, &ip_fds, 0, 0, 0);
+    var r = load64(&ip_fds); var w = load64(&ip_fds + 8);
+    var t0 = us();
+    var p = rd(r, &ip_msg, 8, 1);
+    var t1 = us();
+    cls(r); cls(w);
+    syscall(97, 1, &ip_fds, 0, 0);
+    var fa = load64(&ip_fds); var fb = load64(&ip_fds + 8);
+    var c = rd(fa, &ip_msg, 8, 1);
+    syscall(97, 4, fa, 0, 0); syscall(97, 4, fb, 0, 0);
+    verdict(p == 0 - 2 && c == 0 - 2 && (t1 - t0) < 5000, "nb");
+    o_kv("pipe", p); o_kv("chan", c); o_kv("pipe_us", t1 - t0); o_out("\n");
+    return 0;
+}
+
+fn ph_eof_close() {
+    syscall(25, &ip_fds, 0, 0, 0);
+    var r = load64(&ip_fds); var w = load64(&ip_fds + 8);
+    var pid = spawn3("eofc", w, 0, 0);
+    cls(w);                                                   # the child's copy is now the only write end
+    var a = rd(r, &ip_msg, 8, 0);
+    var t0 = us();
+    var b = rd(r, &ip_msg, 8, 0);
+    var t1 = us();
+    reap(pid);
+    cls(r);
+    verdict(a == 1 && b == 0 && (t1 - t0) < 70000, "eof-close");
+    o_kv("first", a); o_kv("second", b); o_kv("eof_us", t1 - t0); o_out("\n");
+    return 0;
+}
+
+fn ph_eof_death() {
+    syscall(25, &ip_fds, 0, 0, 0);
+    var r = load64(&ip_fds); var w = load64(&ip_fds + 8);
+    var pid = spawn3("eofd", 0, 0, 0);
+    cls(w);
+    var t0 = us();
+    var b = rd(r, &ip_msg, 8, 0);
+    var t1 = us();
+    reap(pid);
+    cls(r);
+    verdict(b == 0 && (t1 - t0) < 80000, "eof-death");
+    o_kv("read", b); o_kv("eof_us", t1 - t0); o_out("\n");
+    return 0;
+}
+
+fn ph_kill() {
+    syscall(25, &ip_fds, 0, 0, 0);
+    var r = load64(&ip_fds); var w = load64(&ip_fds + 8);
+    var pid = spawn3("blk", r, 0, 0);
+    syscall(41, 60, 0, 0, 0);
+    var st = pstate(pid);
+    var t0 = us();
+    var k = syscall(16, pid, 9, 0, 0);
+    var ws = reap(pid);
+    var t1 = us();
+    cls(r); cls(w);
+    verdict(st == 6 && k == 0 && ws == 265 && (t1 - t0) < 50000, "kill");
+    o_kv("state_before", st); o_kv("kill", k); o_kv("status", ws); o_kv("kill_to_reap_us", t1 - t0); o_out("\n");
+    return 0;
+}
+
+fn main(): i64 {
+    if (argc() >= 2) { return child(); }
+    o_out("IPCW-BEGIN pid="); o_num(syscall(2, 0, 0, 0, 0)); o_out("\n");
+    if (us() < 0) { o_out("IPCW-FAIL clock (uptime_us#95 refused)\nIPCW-DONE pass=0 fail=1\nIPCW-EXIT 0\n"); return 0; }
+    ph_pipe_pp();
+    ph_chan_pp();
+    ph_yield_peer();
+    ph_idle_pair("pause-pair", 14);
+    ph_idle_pair("mixed-pair", 44);
+    ph_nb();
+    ph_eof_close();
+    ph_eof_death();
+    ph_kill();
+    o_out("IPCW-DONE"); o_kv("pass", ip_pass); o_kv("fail", ip_fail); o_out("\n");
+    o_out("IPCW-EXIT 0\n");
+    return 0;
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

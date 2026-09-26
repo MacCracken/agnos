@@ -89,14 +89,17 @@ fn xhci_slot_tables_init() {
     # Lay out 8 arrays of 65 u64 entries within the one page (520 bytes
     # each, 8 * 520 = 4160 bytes, fits in 4 KB with 32 bytes padding).
     var stride = 520;  # 65 entries * 8 bytes, rounded
-    xhci_slot_input_ctx   = page + 0;
-    xhci_slot_dev_ctx     = page + stride;
-    xhci_slot_xfer_ring   = page + stride * 2;
-    xhci_slot_xfer_cycle  = page + stride * 3;
-    xhci_slot_xfer_idx    = page + stride * 4;
-    xhci_slot_port_num    = page + stride * 5;
-    xhci_slot_speed       = page + stride * 6;
-    xhci_slot_max_packet  = page + stride * 7;
+    # 1.57.8: the table BASES are CPU pointers, so they are the page's direct-map alias (xhci_ring.cyr
+    # header); the ctx / ring VALUES stored in them stay PHYS.
+    var pk = dma_kva(page);
+    xhci_slot_input_ctx   = pk + 0;
+    xhci_slot_dev_ctx     = pk + stride;
+    xhci_slot_xfer_ring   = pk + stride * 2;
+    xhci_slot_xfer_cycle  = pk + stride * 3;
+    xhci_slot_xfer_idx    = pk + stride * 4;
+    xhci_slot_port_num    = pk + stride * 5;
+    xhci_slot_speed       = pk + stride * 6;
+    xhci_slot_max_packet  = pk + stride * 7;
     xhci_slot_table_ready = 1;
     return 1;
 }
@@ -138,7 +141,7 @@ fn xhci_ep0_mps_for_speed(speed) {
 #   [0x040 .. 0x080)  Slot Context
 #   [0x080 .. 0x0C0)  Endpoint Context 0 (EP0 bidirectional)
 #
-# Returns the input context phys (also virt) on success, 0 on alloc fail.
+# Returns the input context PHYS on success (CPU access: dma_kva), 0 on alloc fail.
 # Also allocates the EP0 transfer ring (one page) and stashes its phys
 # in the Slot table.
 fn xhci_alloc_input_ctx(port_num, speed) {
@@ -147,13 +150,14 @@ fn xhci_alloc_input_ctx(port_num, speed) {
     if (vmm_is_mapped(ictx) == 0) { vmm_map(ictx, ictx, 0x83); }
     iommu_register_dma(ictx);
     xhci_zero_page(ictx);
+    var ik = dma_kva(ictx);     # 1.57.8: CPU writes via the direct map; `ictx` (phys) is returned
 
     # Input Control Context (xHCI 1.2 §6.2.5):
     #   dword 0 — Drop Context Flags (D0/D1 reserved, D2..D31 = drop EP[2..31])
     #   dword 1 — Add Context Flags  (A0 = Slot, A1 = EP0, A2..A31 = EP[2..31])
     # For Address Device we need A0 + A1 set (per §4.6.5).
-    store32(ictx + 0,  0);          # Drop = 0 (nothing to drop yet)
-    store32(ictx + 4,  0x3);        # Add  = A0 | A1 (Slot + EP0)
+    store32(ik + 0,  0);            # Drop = 0 (nothing to drop yet)
+    store32(ik + 4,  0x3);          # Add  = A0 | A1 (Slot + EP0)
     # dwords 2..7 reserved/Configuration Value/Interface Number/Alternate
     # Setting — all zero for Phase 3.
 
@@ -165,7 +169,7 @@ fn xhci_alloc_input_ctx(port_num, speed) {
     #     bit 25       MTT                    = 0
     #     bit 26       Hub                    = 0
     #     bits [31:27] Context Entries        = 1 (Slot + EP0 only)
-    var slot = ictx + xhci_slot_ctx_off();
+    var slot = ik + xhci_slot_ctx_off();
     var slot_dw0 = (1 << 27) | ((speed & 0xF) << 20);
     store32(slot + 0, slot_dw0);
     # dword 1:
@@ -188,7 +192,7 @@ fn xhci_alloc_input_ctx(port_num, speed) {
     iommu_register_dma(xfer);
     xhci_zero_page(xfer);
 
-    var ep0 = ictx + xhci_ep0_ctx_off();
+    var ep0 = ik + xhci_ep0_ctx_off();
     # EP0 context dword 0:
     #   bits [2:0]   EP State            = 0 (Disabled — HW will set to Running)
     #   bits [9:8]   Mult                = 0
@@ -217,7 +221,7 @@ fn xhci_alloc_input_ctx(port_num, speed) {
 }
 
 # Allocate the Device Context page. HW writes; SW must not touch.
-# Returns phys (= virt) on success, 0 on alloc fail.
+# Returns phys (CPU access: dma_kva) on success, 0 on alloc fail.
 fn xhci_alloc_device_ctx() {
     var dctx = pmm_alloc();
     if (dctx == 0) { kprintln("xhci: dev ctx alloc failed", 26); return 0; }
@@ -230,7 +234,7 @@ fn xhci_alloc_device_ctx() {
 # Install the Device Context phys at DCBAA[slot_id]. Caller has already
 # confirmed slot_id is valid (1..MaxSlots).
 fn xhci_dcbaa_install(slot_id, dev_ctx_phys) {
-    store64(xhci_dcbaa_phys + slot_id * 8, dev_ctx_phys);
+    store64(xhci_dcbaa_kva + slot_id * 8, dev_ctx_phys);
     return 1;
 }
 
@@ -246,7 +250,7 @@ fn xhci_dcbaa_install(slot_id, dev_ctx_phys) {
 fn xhci_ep_state(slot_id, dci) {
     var dev_ctx = xhci_slot_get(xhci_slot_dev_ctx, slot_id);
     if (dev_ctx == 0) { return XHCI_EP_STATE_DISABLED; }
-    var ep_ctx  = dev_ctx + xhci_ep_ctx_off(dci);
+    var ep_ctx  = dma_kva(dev_ctx) + xhci_ep_ctx_off(dci);
     return load32(ep_ctx + 0) & 0x7;
 }
 
@@ -338,12 +342,13 @@ fn xhci_input_ctx_add_interrupt_in(ictx_phys, ep_addr, mps,
     # removal pass, not our concern here. QEMU surfaced this 2026-05-18
     # Attempt 64: A1 carried forward caused Configure Endpoint ccode=5
     # (TRB Error) because Input EP0's TR DQ Ptr was stale.
-    store32(ictx_phys + 4, (1 << dci) | 0x1);
+    var ik = dma_kva(ictx_phys);   # 1.57.8: CPU writes through the direct map
+    store32(ik + 4, (1 << dci) | 0x1);
 
     # Slot Context dword 0: bump Context Entries (bits 31:27) to cover
     # the new DCI. CE = max(existing, dci). We re-derive from the field
     # to preserve speed / hub bits / route string.
-    var slot = ictx_phys + xhci_slot_ctx_off();
+    var slot = ik + xhci_slot_ctx_off();
     var slot_dw0 = load32(slot);
     var cur_ce = (slot_dw0 >> 27) & 0x1F;
     if (dci > cur_ce) {
@@ -354,7 +359,7 @@ fn xhci_input_ctx_add_interrupt_in(ictx_phys, ep_addr, mps,
     # EP context at offset (dci + 1) * ctx_size.
     #   CSZ=0 (32B): DCI=2 → 0x60,  DCI=3 → 0x80,  DCI=4 → 0xA0
     #   CSZ=1 (64B): DCI=2 → 0xC0,  DCI=3 → 0x100, DCI=4 → 0x140
-    var ep_ctx = ictx_phys + xhci_ep_ctx_off(dci);
+    var ep_ctx = ik + xhci_ep_ctx_off(dci);
 
     # dword 0 — Interval at bits 23:16.
     var interval = xhci_interrupt_interval(b_interval, speed);
@@ -408,11 +413,12 @@ fn xhci_input_ctx_add_bulk_pair(ictx_phys, in_ep_addr, in_mps,
     # Endpoint won't re-load EP0 from stale Input EP0 context (HW has been
     # advancing Device EP0 DQ ptr during enumeration). Drop Flags at
     # offset 0 left untouched.
-    store32(ictx_phys + 4, (1 << in_dci) | (1 << out_dci) | 0x1);
+    var bk = dma_kva(ictx_phys);   # 1.57.8: CPU writes through the direct map
+    store32(bk + 4, (1 << in_dci) | (1 << out_dci) | 0x1);
 
     # Slot Context dword 0: bump Context Entries (bits 31:27) to cover
     # the highest DCI we're adding.
-    var slot = ictx_phys + xhci_slot_ctx_off();
+    var slot = bk + xhci_slot_ctx_off();
     var slot_dw0 = load32(slot);
     var cur_ce = (slot_dw0 >> 27) & 0x1F;
     var new_ce = cur_ce;
@@ -424,7 +430,7 @@ fn xhci_input_ctx_add_bulk_pair(ictx_phys, in_ep_addr, in_mps,
     }
 
     # Bulk-IN EP context (EP Type 6).
-    var in_ctx = ictx_phys + xhci_ep_ctx_off(in_dci);
+    var in_ctx = bk + xhci_ep_ctx_off(in_dci);
     store32(in_ctx + 0, 0);                        # no Interval for bulk
     var in_dw1 = (3 << 1) | (6 << 3) | ((in_mps & 0xFFFF) << 16);
     store32(in_ctx + 4, in_dw1);
@@ -432,7 +438,7 @@ fn xhci_input_ctx_add_bulk_pair(ictx_phys, in_ep_addr, in_mps,
     store32(in_ctx + 16, in_mps & 0xFFFF);         # Avg TRB Length = mps
 
     # Bulk-OUT EP context (EP Type 2).
-    var out_ctx = ictx_phys + xhci_ep_ctx_off(out_dci);
+    var out_ctx = bk + xhci_ep_ctx_off(out_dci);
     store32(out_ctx + 0, 0);
     var out_dw1 = (3 << 1) | (2 << 3) | ((out_mps & 0xFFFF) << 16);
     store32(out_ctx + 4, out_dw1);

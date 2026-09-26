@@ -6,7 +6,47 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-09-25 (**1.57.7 — the blocking model, the lifecycle, limits and socket ownership; ten issue files closed, five filed for 1.57.8; see the 1.57.7 block**).
+> **Last refresh**: 2026-09-25 (**1.57.8 — blocking pipe/channel reads, the `#44`-only kick, driver DMA on the direct map, late completions settled, the KVM console fix; five issue files closed, six filed; see the 1.57.8 block**).
+>
+> ### 1.57.8 (2026-09-25) — the five 2026-09-25 issues ship; the release pass adds no code (D24)
+>
+> ✅ **`CHANGELOG.md` 1.57.8** — Breaking (`read`#5 a4 = 0 blocks on a pipe / channel endpoint, the r10 caveat,
+> `#25`/`#97` notes, each with a migration note) · Changed (the `#44` directed kick with its price, the wait
+> mechanics, the `dma_kva` rename, lifecycle-smoke on KVM, `hid_reclaim_selftest` placement) · Fixed (KVM+virtio UC
+> PD[0], `chan_region_reserve` under gnoboot's CR3, NVMe one-behind, virtio-blk abandoned FLUSH, DMA identity VAs,
+> HID mouse slots, cross-CPU tick-bound rounds, ENDFIX PIPE-R1) · gates/flags · closeout with sizes (2,503,272 B;
+> weighed 2,092,452 B, 4,700 B headroom; LOAD end `0x373108`) and the iron-only risk list. Gate tallies left as
+> `{GATES}` for the final-gates run.
+>
+> ✅ **`state.md`** — Kernel head row rewritten for 1.57.8 (the bump had stamped 1.57.8 over 1.57.7's text), on-disk
+> row, the carried-work bullet, the open-issue bullet (six open, five archived), the direct-map bullet (every driver
+> DMA structure; what is still identity), aarch64 no-new-names. Held at the 120-line cap.
+>
+> ✅ **`roadmap.md`** — the five shipped rows removed; the section is now "After 1.57.8"; new rows for the six
+> filings plus the fb console blit (not a defect); reparenting marked carried; the iron-burn row extended with
+> 1.57.8's iron-only classes.
+>
+> ✅ **`CLAUDE.md`** — closeout sweep row count 57 (`grep -c '^run_gate "'`), the six 1.57.8 rows named, tallies as
+> `{CHECK}`/`{SWEEP}` for the final-gates run; the `pmm_kva_for_access` note gains `chan_region_reserve` and `dma_kva`.
+>
+> ✅ **Issues** — five → `archived/` with rewritten Status headers (RESOLVED 1.57.8 + what shipped + the proving gate)
+> and a Resolution block naming what the change broke: cross-cpu-poll-and-yield (the spawnx a4 = 0 hang, the
+> first-form kick on `#14`), dma-cpu-pointers (virtio-blk FLUSH found and fixed), hid-mouse, kvm-virtio-net-console,
+> nvme-poll-timeout. NEW, OPEN: `2026-09-25-any-two-sched-yield-loops-kick-each-other.md` (operator ruling),
+> `-pipe-writes-do-not-block.md`, `-ahci-timeout-abandons-an-in-flight-command.md`,
+> `-msc-puts-the-caller-buffer-in-a-data-trb.md`, `-cpu-only-pmm-buffers-still-use-identity-vas.md`,
+> `-three-smokes-score-void-as-fail-or-skip-smp4.md`. ⚠ **Stale path comments left for a code pass** (this pass may
+> not touch `kernel/` or `scripts/`): `scripts/smoke/{ipc-wait,dma-shadow,xhci-shadow,nvme-late,hid-mouse-deferred}-smoke.sh`,
+> `tests/ipcw/ipcw.cyr:2`, `kernel/core/{nvme.cyr:795,selftests.cyr:2375}` name `docs/development/issues/2026-09-25-*.md`
+> paths that are now under `archived/`.
+>
+> ✅ **cyrius peer** filed in cyrius `docs/development/issues/2026-09-25-agnos-read-blocks-on-pipes-and-channels-and-the-44-kick.md`
+> (`sys_read` must pass a4; the pipe/channel blocking contract; `CH_RECV` unchanged; `#44` kick and `#14` backstop
+> semantics). The two earlier filings there are still open.
+>
+> ✅ **Written by the steps (not re-audited here):** NEW `docs/architecture/dma-cpu-pointers.md`,
+> `nvme-io-completion.md`; updated `blocking-waits.md`, `kernel-clocks.md`, `net-concurrency.md`, `overview.md`,
+> `agnos-userland-abi.md` (rows 5/14/25/44/97), `build.md` (four flags).
 >
 > ### 1.57.7 (2026-09-25) — the rest of the 1.57.x plan ships; the release pass itself adds no code (D24)
 >

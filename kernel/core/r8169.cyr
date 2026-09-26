@@ -523,11 +523,11 @@ fn r8169_init_rx() {
     # S10 contract — every DMA region is declared before any device
     # read/write touches it. The NIC reads descriptors out of this ring.
     iommu_register_dma(r8169_rx_ring_phys);
-    # 1.57.7 (S4, N-6): every CPU access to a pmm page goes through net_dma_kva (the direct-map alias) —
+    # 1.57.7 (S4, N-6): every CPU access to a pmm page goes through dma_kva (the direct-map alias) —
     # an identity VA of a pmm page can be shadowed by a ring-3 PT_LOAD under that process's CR3, and the
     # ISR drain / ISR-time TX touch these pages under whatever CR3 is live. Registers and descriptor
     # address FIELDS keep phys.
-    var rxr_kva = net_dma_kva(r8169_rx_ring_phys);
+    var rxr_kva = dma_kva(r8169_rx_ring_phys);
     for (var i = 0; i < 4096; i = i + 1) {
         store8(rxr_kva + i, 0);
     }
@@ -589,7 +589,7 @@ fn r8169_init_tx() {
     # S10 contract — declared before the chip's first descriptor fetch,
     # which the TX list addr write below (step 4) arms.
     iommu_register_dma(r8169_tx_ring_phys);
-    var txr_kva = net_dma_kva(r8169_tx_ring_phys);      # 1.57.7 (S4, N-6): CPU pointer = direct map
+    var txr_kva = dma_kva(r8169_tx_ring_phys);      # 1.57.7 (S4, N-6): CPU pointer = direct map
     for (var i = 0; i < 4096; i = i + 1) {
         store8(txr_kva + i, 0);
     }
@@ -927,7 +927,7 @@ fn r8169_rx_restart() {
     # resync our index — the chip resumes at slot 0 when RE is raised again.
     var i = 0;
     while (i < R8169_RX_RING_SIZE) {
-        r8169_rx_rearm(net_dma_kva(r8169_rx_ring_phys) + i * 16);   # 1.57.7 (S4, N-6)
+        r8169_rx_rearm(dma_kva(r8169_rx_ring_phys) + i * 16);   # 1.57.7 (S4, N-6)
         i = i + 1;
     }
     r8169_rx_idx = 0;
@@ -957,7 +957,7 @@ fn r8169_poll(buf, maxlen) {
     while (budget > 0) {
         budget = budget - 1;
 
-        var desc = net_dma_kva(r8169_rx_ring_phys) + r8169_rx_idx * 16;   # 1.57.7 (S4, N-6)
+        var desc = dma_kva(r8169_rx_ring_phys) + r8169_rx_idx * 16;   # 1.57.7 (S4, N-6)
         var status = load32(desc);
         if ((status & R8169_DESC_OWN) != 0) { return 0; }
 
@@ -985,7 +985,7 @@ fn r8169_poll(buf, maxlen) {
         if (pkt_len >= 4) { pkt_len = pkt_len - 4; }
         if (pkt_len > maxlen) { pkt_len = maxlen; }
 
-        var bufaddr = net_dma_kva(load64(&r8169_rx_bufs + r8169_rx_idx * 8));
+        var bufaddr = dma_kva(load64(&r8169_rx_bufs + r8169_rx_idx * 8));
         for (var i = 0; i < pkt_len; i = i + 1) {
             store8(buf + i, load8(bufaddr + i));
         }
@@ -1011,11 +1011,11 @@ fn r8169_send(buf, len) {
     if (r8169_tx_ring_phys == 0) { return 0 - 1; }
     if (len > 2048) { len = 2048; }
 
-    var desc = net_dma_kva(r8169_tx_ring_phys) + r8169_tx_idx * 16;   # 1.57.7 (S4, N-6)
+    var desc = dma_kva(r8169_tx_ring_phys) + r8169_tx_idx * 16;   # 1.57.7 (S4, N-6)
     var status = load32(desc);
     if ((status & R8169_DESC_OWN) != 0) { return 0 - 1; }   # ring full
 
-    var bufaddr = net_dma_kva(load64(&r8169_tx_bufs + r8169_tx_idx * 8));
+    var bufaddr = dma_kva(load64(&r8169_tx_bufs + r8169_tx_idx * 8));
     for (var i = 0; i < len; i = i + 1) {
         store8(bufaddr + i, load8(buf + i));
     }
@@ -1068,7 +1068,7 @@ fn r8169_dump_stats() {
 
     # Zero the dump buffer so a chip stall leaves us with zeros not stale data.
     for (var i = 0; i < 64; i = i + 1) {
-        store8(net_dma_kva(r8169_stats_phys) + i, 0);   # 1.57.7 (S4, N-6)
+        store8(dma_kva(r8169_stats_phys) + i, 0);   # 1.57.7 (S4, N-6)
     }
 
     var addr_lo = r8169_stats_phys & 0xFFFFFFFF;
@@ -1091,7 +1091,7 @@ fn r8169_print_stats() {
         kprintln("r8169: stats dump timeout", 25);
         return 0 - 1;
     }
-    var sb = net_dma_kva(r8169_stats_phys);             # 1.57.7 (S4, N-6)
+    var sb = dma_kva(r8169_stats_phys);             # 1.57.7 (S4, N-6)
     kprint("r8169: tx_ok=", 13);
     kprint_num(load64(sb + 0x00));
     kprint(" rx_ok=", 7);

@@ -747,6 +747,7 @@ fn xhci_start() {
 # Configuration is up to a few hundred for HID kbd) so one page is more
 # than enough. Allocated lazily on first Phase 3 entry.
 var xhci_desc_buf_phys = 0;
+var xhci_desc_buf_kva  = 0;    # 1.57.8: its direct-map alias — every CPU read of a descriptor goes through this
 
 # Phase 3 record of the first detected HID boot keyboard. Phase 4 + 5
 # pick up from here. slot_id = 0 means "none seen yet".
@@ -825,7 +826,7 @@ fn xhci_wait_transfer_for_trb(slot_id, expected_trb_phys, expected_len) {
     xhci_last_xfer_bytes = 0;
     while (wait < XHCI_BULK_TIMEOUT_SPINS) {
         var evt_off = xhci_evt_ring_idx * 16;
-        var evt     = xhci_evt_ring_phys + evt_off;
+        var evt     = xhci_evt_ring_kva + evt_off;
         var evt_dw3 = load32(evt + 12);
         var evt_cycle = evt_dw3 & 0x1;
         if (evt_cycle == xhci_evt_ring_cycle) {
@@ -916,7 +917,7 @@ fn xhci_wait_transfer_event(slot_id) {
     var wait = 0;
     while (wait < XHCI_CMD_TIMEOUT_SPINS) {
         var evt_off = xhci_evt_ring_idx * 16;
-        var evt     = xhci_evt_ring_phys + evt_off;
+        var evt     = xhci_evt_ring_kva + evt_off;
         var evt_dw3 = load32(evt + 12);
         var evt_cycle = evt_dw3 & 0x1;
         if (evt_cycle == xhci_evt_ring_cycle) {
@@ -991,7 +992,7 @@ fn xhci_drain_transfer_events(slot_id) {
     var safety  = 0;
     while (safety < XHCI_EVT_RING_SEGMENT_SIZE) {
         var evt_off = xhci_evt_ring_idx * 16;
-        var evt     = xhci_evt_ring_phys + evt_off;
+        var evt     = xhci_evt_ring_kva + evt_off;
         var evt_dw3 = load32(evt + 12);
         var evt_cycle = evt_dw3 & 0x1;
         if (evt_cycle != xhci_evt_ring_cycle) { break; }   # ring empty
@@ -1033,7 +1034,7 @@ fn xhci_ep0_enqueue(slot_id, p_lo, p_hi, status, ctrl_partial) {
     var idx   = xhci_slot_get(xhci_slot_xfer_idx,   slot_id);
     if (ring == 0) { return 0; }
 
-    var trb = ring + idx * 16;
+    var trb = dma_kva(ring) + idx * 16;   # 1.57.8: a CPU pointer (direct map), never the ring phys
     store32(trb,      p_lo);
     store32(trb + 4,  p_hi);
     store32(trb + 8,  status);
@@ -1057,7 +1058,7 @@ fn xhci_ep0_enqueue_raw(slot_id, p_lo, p_hi, status, ctrl_full) {
     var idx   = xhci_slot_get(xhci_slot_xfer_idx,   slot_id);
     if (ring == 0) { return 0; }
 
-    var trb = ring + idx * 16;
+    var trb = dma_kva(ring) + idx * 16;   # 1.57.8: a CPU pointer (direct map), never the ring phys
     store32(trb,      p_lo);
     store32(trb + 4,  p_hi);
     store32(trb + 8,  status);
@@ -1251,18 +1252,18 @@ fn xhci_find_hid_boot_endpoint(total_length, want_proto, skip,
     var cur_intf_num = 0;
     var seen = 0;
     while (off < total_length) {
-        var b_length = load8(xhci_desc_buf_phys + off);
+        var b_length = load8(xhci_desc_buf_kva + off);
         if (b_length == 0) { return 0; }   # malformed — guard against infinite loop
-        var b_type = load8(xhci_desc_buf_phys + off + 1);
+        var b_type = load8(xhci_desc_buf_kva + off + 1);
         if (b_type == 4) {
             # Interface Descriptor (USB 2.0 §9.6.5):
             #   [2] bInterfaceNumber, [3] bAlternateSetting,
             #   [4] bNumEndpoints, [5] bInterfaceClass,
             #   [6] bInterfaceSubClass, [7] bInterfaceProtocol
-            var i_class = load8(xhci_desc_buf_phys + off + 5);
-            var i_sub   = load8(xhci_desc_buf_phys + off + 6);
-            var i_proto = load8(xhci_desc_buf_phys + off + 7);
-            cur_intf_num = load8(xhci_desc_buf_phys + off + 2);
+            var i_class = load8(xhci_desc_buf_kva + off + 5);
+            var i_sub   = load8(xhci_desc_buf_kva + off + 6);
+            var i_proto = load8(xhci_desc_buf_kva + off + 7);
+            cur_intf_num = load8(xhci_desc_buf_kva + off + 2);
             in_kbd_intf = 0;
             if (i_class == 0x03) {
                 if (i_sub == 0x01) {
@@ -1285,12 +1286,12 @@ fn xhci_find_hid_boot_endpoint(total_length, want_proto, skip,
                 #   [4..5] wMaxPacketSize
                 #   [6] bInterval
                 if (in_kbd_intf != 0) {
-                    var ep_addr = load8(xhci_desc_buf_phys + off + 2);
-                    var attrs   = load8(xhci_desc_buf_phys + off + 3);
+                    var ep_addr = load8(xhci_desc_buf_kva + off + 2);
+                    var attrs   = load8(xhci_desc_buf_kva + off + 3);
                     if ((ep_addr & 0x80) != 0) {
                         if ((attrs & 0x03) == 0x03) {
-                            var mps = load16(xhci_desc_buf_phys + off + 4);
-                            var ivl = load8(xhci_desc_buf_phys + off + 6);
+                            var mps = load16(xhci_desc_buf_kva + off + 4);
+                            var ivl = load8(xhci_desc_buf_kva + off + 6);
                             store8(out_ep_addr_p, ep_addr);
                             store16(out_mps_p, mps);
                             store8(out_interval_p, ivl);
@@ -1342,7 +1343,7 @@ fn xhci_enumerate_port(port_num) {
     # 0x88 for CSZ=1, with DCS=1 in bit 0). The 1.30.4 audit found we were
     # allocating a second page here and overwriting the alloc'd one, leaking
     # page A. Mask off bit 0 (DCS) to recover bare phys.
-    var xfer = load64(ictx + xhci_ep0_ctx_off() + 8) & 0xFFFFFFFFFFFFFFFE;
+    var xfer = load64(dma_kva(ictx) + xhci_ep0_ctx_off() + 8) & 0xFFFFFFFFFFFFFFFE;
 
     xhci_slot_set(xhci_slot_input_ctx,    slot_id, ictx);
     xhci_slot_set(xhci_slot_dev_ctx,      slot_id, dctx);
@@ -1368,6 +1369,7 @@ fn xhci_enumerate_port(port_num) {
         if (vmm_is_mapped(buf) == 0) { vmm_map(buf, buf, 0x83); }
         iommu_register_dma(buf);
         xhci_desc_buf_phys = buf;
+        xhci_desc_buf_kva = dma_kva(buf);
     }
     xhci_zero_page(xhci_desc_buf_phys);
     if (xhci_get_device_descriptor(slot_id, 8) == 0) {
@@ -1391,7 +1393,7 @@ fn xhci_enumerate_port(port_num) {
     # Every subsequent control transfer longer than 9 bytes then went out under a Max Packet Size
     # the device does not implement. LS/FS/HS report a genuine byte count (8/16/32/64) and are
     # unchanged.
-    var real_mps = load8(xhci_desc_buf_phys + 7) & 0xFF;
+    var real_mps = load8(xhci_desc_buf_kva + 7) & 0xFF;
     # ⚠ THE EXPONENT IS DEVICE-SUPPLIED, so bound it before shifting: `1 << 255` is not a large
     # number, it is undefined. The spec permits exactly 09H here; accept the 3..12 (8..4096 B)
     # window and fall back to the seeded 512 for anything else rather than trusting the shift.
@@ -1408,13 +1410,14 @@ fn xhci_enumerate_port(port_num) {
     if (real_mps != cur_mps) {
         var ictx2 = xhci_slot_get(xhci_slot_input_ctx, slot_id);
         if (ictx2 != 0) {
+            var i2k = dma_kva(ictx2);   # 1.57.8: CPU writes through the direct map; ictx2 (phys) goes in the TRB
             # Input Control Context: Drop=0, Add=A0|A1 (Slot + EP0 — spec
             # requires Slot context to be present even if unchanged).
-            store32(ictx2 + 0, 0);
-            store32(ictx2 + 4, 0x3);
+            store32(i2k + 0, 0);
+            store32(i2k + 4, 0x3);
             # Patch EP0 Context dw1 — replace bits [31:16] (Max Packet Size),
             # preserving CErr / EP Type / Max Burst in bits [15:0].
-            var ep0_ctx = ictx2 + xhci_ep0_ctx_off();
+            var ep0_ctx = i2k + xhci_ep0_ctx_off();
             var ep0_dw1 = load32(ep0_ctx + 4);
             ep0_dw1 = (ep0_dw1 & 0xFFFF) | ((real_mps & 0xFFFF) << 16);
             store32(ep0_ctx + 4, ep0_dw1);
@@ -1440,9 +1443,9 @@ fn xhci_enumerate_port(port_num) {
     #   [7]  bMaxPacketSize0    (8/16/32/64 for FS; 64 for HS; 9 for SS=2^9=512)
     #   [8..9]   idVendor
     #   [10..11] idProduct
-    var dev_class = load8(xhci_desc_buf_phys + 4);
-    var vid       = load16(xhci_desc_buf_phys + 8);
-    var pid       = load16(xhci_desc_buf_phys + 10);
+    var dev_class = load8(xhci_desc_buf_kva + 4);
+    var vid       = load16(xhci_desc_buf_kva + 8);
+    var pid       = load16(xhci_desc_buf_kva + 10);
 
     # HID-boot-kbd predicate per usb-hid-keyboard-driver.md: typically
     # the class triple lives on the Interface Descriptor, not Device.
@@ -1454,8 +1457,8 @@ fn xhci_enumerate_port(port_num) {
     var is_hid = 0;
     if (dev_class == 0x03) {
         # Device-class HID — rare but legal (some keyboards do this).
-        var sub_class = load8(xhci_desc_buf_phys + 5);
-        var proto_dev = load8(xhci_desc_buf_phys + 6);
+        var sub_class = load8(xhci_desc_buf_kva + 5);
+        var proto_dev = load8(xhci_desc_buf_kva + 6);
         if (sub_class == 0x01) {
             if (proto_dev == 0x01) { is_hid = 1; }
         }

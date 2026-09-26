@@ -341,7 +341,11 @@ fn ahci_enum_ports() {
 # initialized — every DET=3+SIG=SATA port that survived port-init).
 
 var AHCI_MAX_PORTS    = 32;
-var ahci_port_cl_phys[256];     # 32 ports × 8 bytes per u64
+# ⛔ 1.57.8 (DMA1): CPU pointers into the pmm DMA pages (command list, command table, IDENTIFY buffer) are their
+# DIRECT-MAP aliases (dma_kva). ahci_issue_rw runs from fs syscalls under the caller's CR3, where a ring-3
+# PT_LOAD in [0x400000, 0x10000000) can shadow a pmm page's identity VA. A `*_phys` value only goes into PxCLB/
+# PxFB, a command header's CTBA or a PRDT's DBA. (Issue 2026-09-25-dma-cpu-pointers-still-use-identity-vas.)
+var ahci_port_cl_kva[256];      # 32 ports × 8 bytes per u64 — command list CPU pointer (direct map)
 var ahci_port_fis_phys[256];    # 32 ports × 8 bytes per u64
 var ahci_port_inited[32];       # 32 × u8 flag
 var ahci_ports_inited_count = 0;
@@ -500,13 +504,15 @@ fn ahci_port_init(port) {
 
     # g. Zero both pages. Single-byte stores in a loop — slow but
     #    used only once per port at init.
+    var cl_kva  = dma_kva(cl_phys);
+    var fis_kva = dma_kva(fis_phys);
     var i = 0;
-    while (i < 1024) { store8(cl_phys + i, 0); i = i + 1; }
+    while (i < 1024) { store8(cl_kva + i, 0); i = i + 1; }
     i = 0;
-    while (i < 256) { store8(fis_phys + i, 0); i = i + 1; }
+    while (i < 256) { store8(fis_kva + i, 0); i = i + 1; }
 
-    # Cache phys addresses by port index for later phases.
-    store64(&ahci_port_cl_phys + port * 8, cl_phys);
+    # Cache the CL's CPU pointer and the FIS phys by port index for later phases.
+    store64(&ahci_port_cl_kva + port * 8, cl_kva);
     store64(&ahci_port_fis_phys + port * 8, fis_phys);
 
     # h. Program PxCLB / PxCLBU (CL base) and PxFB / PxFBU (FIS base).
@@ -783,7 +789,7 @@ fn ahci_identify_device_inner(port) {
     }
 
     var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
-    var cl_phys  = load64(&ahci_port_cl_phys + port * 8);
+    var cl_kva   = load64(&ahci_port_cl_kva + port * 8);
 
     # Allocate Command Table + IDENTIFY data buffer on first use.
     # Cached for the port's lifetime; subsequent IDENTIFY calls reuse.
@@ -793,49 +799,51 @@ fn ahci_identify_device_inner(port) {
         if (ct_phys == 0) { return 0; }
         store64(&ahci_port_ct_phys + port * 8, ct_phys);
     }
+    var ct_kva = dma_kva(ct_phys);
     var id_phys = load64(&ahci_port_id_phys + port * 8);
     if (id_phys == 0) {
         id_phys = pmm_alloc();
         if (id_phys == 0) { return 0; }
         store64(&ahci_port_id_phys + port * 8, id_phys);
     }
+    var id_kva = dma_kva(id_phys);
 
     # Zero CT + ID buffer.
     var i = 0;
-    while (i < 128) { store8(ct_phys + i, 0); i = i + 1; }
+    while (i < 128) { store8(ct_kva + i, 0); i = i + 1; }
     i = 0;
-    while (i < 512) { store8(id_phys + i, 0); i = i + 1; }
+    while (i < 512) { store8(id_kva + i, 0); i = i + 1; }
 
     # --- Build H2D Register FIS at CT+0 ---
-    store8(ct_phys + 0,  0x27);     # FIS type = H2D Register
-    store8(ct_phys + 1,  0x80);     # C bit set, PM port 0
-    store8(ct_phys + 2,  0xEC);     # Command = IDENTIFY DEVICE
+    store8(ct_kva + 0,  0x27);     # FIS type = H2D Register
+    store8(ct_kva + 1,  0x80);     # C bit set, PM port 0
+    store8(ct_kva + 2,  0xEC);     # Command = IDENTIFY DEVICE
     # bytes 3-15 left zero (no features / no LBA / no count / no ICC)
 
     # --- Build PRDT[0] at CT+0x80 ---
-    store32(ct_phys + 0x80, id_phys & 0xFFFFFFFF);          # DBA
-    store32(ct_phys + 0x84, (id_phys >> 32) & 0xFFFFFFFF);  # DBAU
-    store32(ct_phys + 0x88, 0);                              # Reserved
-    store32(ct_phys + 0x8C, 511);                            # DBC = byte_count - 1 (no I bit)
+    store32(ct_kva + 0x80, id_phys & 0xFFFFFFFF);          # DBA
+    store32(ct_kva + 0x84, (id_phys >> 32) & 0xFFFFFFFF);  # DBAU
+    store32(ct_kva + 0x88, 0);                              # Reserved
+    store32(ct_kva + 0x8C, 511);                            # DBC = byte_count - 1 (no I bit)
 
     # --- Build Command Header in CL slot 0 ---
     # bytes 0-1: CFL=5 in bits 0-4, W=0 (read)
-    store32(cl_phys + 0,  5);
+    store32(cl_kva + 0,  5);
     # bytes 2-3: PRDTL=1 (stored at offset 2 as 16-bit, but Cyrius
     # store32 above wrote bytes 0-3; the PRDTL field needs to be in
     # bytes 2-3 of the header word. Rebuild with full 32-bit value:
     #   bits 0-4  = CFL = 5
     #   bit 6     = W   = 0
     #   bits 16-31 = PRDTL = 1
-    store32(cl_phys + 0, (1 << 16) | 5);
-    store32(cl_phys + 4, 0);                                 # PRDBC
-    store32(cl_phys + 8, ct_phys & 0xFFFFFFFF);              # CTBA
-    store32(cl_phys + 12, (ct_phys >> 32) & 0xFFFFFFFF);     # CTBAU
+    store32(cl_kva + 0, (1 << 16) | 5);
+    store32(cl_kva + 4, 0);                                 # PRDBC
+    store32(cl_kva + 8, ct_phys & 0xFFFFFFFF);              # CTBA
+    store32(cl_kva + 12, (ct_phys >> 32) & 0xFFFFFFFF);     # CTBAU
     # bytes 16-31: reserved, leave zero from the zeroing pass.
-    store32(cl_phys + 16, 0);
-    store32(cl_phys + 20, 0);
-    store32(cl_phys + 24, 0);
-    store32(cl_phys + 28, 0);
+    store32(cl_kva + 16, 0);
+    store32(cl_kva + 20, 0);
+    store32(cl_kva + 24, 0);
+    store32(cl_kva + 28, 0);
 
     # --- Clear PxIS + PxSERR so we can see fresh error state ---
     ahci_mmio_write32(port_off + AHCI_P_IS,   0xFFFFFFFF);
@@ -877,17 +885,17 @@ fn ahci_identify_device_inner(port) {
     # default 512; word 106 bit 12 = "logical sector longer than 256
     # words" → check word 117-118 for actual size. Phase 3 simple path
     # assumes 512 B/LBA (true for >99% of consumer drives).
-    ahci_id_lba48     = load64(id_phys + 200);
+    ahci_id_lba48     = load64(id_kva + 200);
     ahci_id_lba_bytes = 512;
 
     kprint("ahci: port ", 11);
     kprint_num(port);
     kprint(" model='", 8);
-    ahci_print_id_string(id_phys, 54, 40);
+    ahci_print_id_string(id_kva, 54, 40);
     kprint("' serial='", 10);
-    ahci_print_id_string(id_phys, 20, 20);
+    ahci_print_id_string(id_kva, 20, 20);
     kprint("' fw='", 6);
-    ahci_print_id_string(id_phys, 46, 8);
+    ahci_print_id_string(id_kva, 46, 8);
     kprintln("'", 1);
 
     kprint("ahci: port ", 11);
@@ -966,31 +974,31 @@ var ahci_blk_port = 0 - 1;    # -1 = not registered; set to port idx on register
 #   byte 14: ICC (0)
 #   byte 15: control (0)
 #   bytes 16-19: reserved
-fn ahci_build_rw_fis(ct_phys, opcode, lba, count) {
+fn ahci_build_rw_fis(ct_kva, opcode, lba, count) {    # ct_kva: the CT's CPU pointer (direct map)
     # Clear the FIS region (20 bytes).
     var i = 0;
-    while (i < 20) { store8(ct_phys + i, 0); i = i + 1; }
+    while (i < 20) { store8(ct_kva + i, 0); i = i + 1; }
 
-    store8(ct_phys + 0,  0x27);
-    store8(ct_phys + 1,  0x80);
-    store8(ct_phys + 2,  opcode);
+    store8(ct_kva + 0,  0x27);
+    store8(ct_kva + 1,  0x80);
+    store8(ct_kva + 2,  opcode);
 
     # LBA[23:0] → bytes 4, 5, 6
-    store8(ct_phys + 4, lba & 0xFF);
-    store8(ct_phys + 5, (lba >> 8) & 0xFF);
-    store8(ct_phys + 6, (lba >> 16) & 0xFF);
+    store8(ct_kva + 4, lba & 0xFF);
+    store8(ct_kva + 5, (lba >> 8) & 0xFF);
+    store8(ct_kva + 6, (lba >> 16) & 0xFF);
     # device byte: LBA mode (bit 6 = 1). LBA48 puts high bits in exp,
     # not in device byte's low nibble.
-    store8(ct_phys + 7, 0x40);
+    store8(ct_kva + 7, 0x40);
 
     # LBA[47:24] → bytes 8, 9, 10
-    store8(ct_phys + 8,  (lba >> 24) & 0xFF);
-    store8(ct_phys + 9,  (lba >> 32) & 0xFF);
-    store8(ct_phys + 10, (lba >> 40) & 0xFF);
+    store8(ct_kva + 8,  (lba >> 24) & 0xFF);
+    store8(ct_kva + 9,  (lba >> 32) & 0xFF);
+    store8(ct_kva + 10, (lba >> 40) & 0xFF);
 
     # count → bytes 12-13
-    store8(ct_phys + 12, count & 0xFF);
-    store8(ct_phys + 13, (count >> 8) & 0xFF);
+    store8(ct_kva + 12, count & 0xFF);
+    store8(ct_kva + 13, (count >> 8) & 0xFF);
 
     return 0;
 }
@@ -1026,42 +1034,43 @@ fn ahci_issue_rw_inner(port, opcode, lba, count, data_phys, is_write) {
     }
 
     var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
-    var cl_phys  = load64(&ahci_port_cl_phys + port * 8);
+    var cl_kva   = load64(&ahci_port_cl_kva + port * 8);
     var ct_phys  = load64(&ahci_port_ct_phys + port * 8);
     if (ct_phys == 0) {
         ct_phys = pmm_alloc();
         if (ct_phys == 0) { return 0; }
         store64(&ahci_port_ct_phys + port * 8, ct_phys);
     }
+    var ct_kva = dma_kva(ct_phys);
 
     # Zero the part of the CT we'll touch (FIS 20 B + PRDT 16 B at 0x80).
     var i = 0;
-    while (i < 20)  { store8(ct_phys + i, 0); i = i + 1; }
+    while (i < 20)  { store8(ct_kva + i, 0); i = i + 1; }
     i = 0;
-    while (i < 16)  { store8(ct_phys + 0x80 + i, 0); i = i + 1; }
+    while (i < 16)  { store8(ct_kva + 0x80 + i, 0); i = i + 1; }
 
-    ahci_build_rw_fis(ct_phys, opcode, lba, count);
+    ahci_build_rw_fis(ct_kva, opcode, lba, count);
 
     # PRDT[0]: DBA / DBAU / Reserved / DBC.
     var byte_count = count * 512;
-    store32(ct_phys + 0x80, data_phys & 0xFFFFFFFF);
-    store32(ct_phys + 0x84, (data_phys >> 32) & 0xFFFFFFFF);
-    store32(ct_phys + 0x88, 0);
-    store32(ct_phys + 0x8C, byte_count - 1);  # DBC = byte_count - 1
+    store32(ct_kva + 0x80, data_phys & 0xFFFFFFFF);
+    store32(ct_kva + 0x84, (data_phys >> 32) & 0xFFFFFFFF);
+    store32(ct_kva + 0x88, 0);
+    store32(ct_kva + 0x8C, byte_count - 1);  # DBC = byte_count - 1
 
     # Command Header slot 0: CFL=5 (H2D FIS DWORDs), W bit per direction,
     # PRDTL=1, CTBA = ct_phys.
     var ch_word0 = 5;                          # CFL = 5
     if (is_write == 1) { ch_word0 = ch_word0 | 0x40; }   # W = bit 6
     ch_word0 = ch_word0 | (1 << 16);            # PRDTL = 1
-    store32(cl_phys + 0,  ch_word0);
-    store32(cl_phys + 4,  0);                   # PRDBC
-    store32(cl_phys + 8,  ct_phys & 0xFFFFFFFF);
-    store32(cl_phys + 12, (ct_phys >> 32) & 0xFFFFFFFF);
-    store32(cl_phys + 16, 0);
-    store32(cl_phys + 20, 0);
-    store32(cl_phys + 24, 0);
-    store32(cl_phys + 28, 0);
+    store32(cl_kva + 0,  ch_word0);
+    store32(cl_kva + 4,  0);                   # PRDBC
+    store32(cl_kva + 8,  ct_phys & 0xFFFFFFFF);
+    store32(cl_kva + 12, (ct_phys >> 32) & 0xFFFFFFFF);
+    store32(cl_kva + 16, 0);
+    store32(cl_kva + 20, 0);
+    store32(cl_kva + 24, 0);
+    store32(cl_kva + 28, 0);
 
     # Clear any pending IS / SERR before issue.
     ahci_mmio_write32(port_off + AHCI_P_IS,   0xFFFFFFFF);
@@ -1126,32 +1135,33 @@ fn ahci_issue_nodata_inner(port, opcode) {
     }
 
     var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
-    var cl_phys  = load64(&ahci_port_cl_phys + port * 8);
+    var cl_kva   = load64(&ahci_port_cl_kva + port * 8);
     var ct_phys  = load64(&ahci_port_ct_phys + port * 8);
     if (ct_phys == 0) {
         ct_phys = pmm_alloc();
         if (ct_phys == 0) { return 0; }
         store64(&ahci_port_ct_phys + port * 8, ct_phys);
     }
+    var ct_kva = dma_kva(ct_phys);
 
     # Zero the FIS region (20 B). No PRDT for a non-data command.
     var i = 0;
-    while (i < 20) { store8(ct_phys + i, 0); i = i + 1; }
+    while (i < 20) { store8(ct_kva + i, 0); i = i + 1; }
 
     # FLUSH CACHE EXT ignores LBA/count; reuse the rw FIS builder with
     # lba=0 count=0 (byte2=opcode, byte7=0x40 LBA-mode, rest zero).
-    ahci_build_rw_fis(ct_phys, opcode, 0, 0);
+    ahci_build_rw_fis(ct_kva, opcode, 0, 0);
 
     # Command Header slot 0: CFL=5 (H2D FIS DWORDs), W=0 (non-data),
     # PRDTL=0 (no PRDT), CTBA = ct_phys.
-    store32(cl_phys + 0,  5);                   # CFL=5, PRDTL=0, W=0
-    store32(cl_phys + 4,  0);                   # PRDBC
-    store32(cl_phys + 8,  ct_phys & 0xFFFFFFFF);
-    store32(cl_phys + 12, (ct_phys >> 32) & 0xFFFFFFFF);
-    store32(cl_phys + 16, 0);
-    store32(cl_phys + 20, 0);
-    store32(cl_phys + 24, 0);
-    store32(cl_phys + 28, 0);
+    store32(cl_kva + 0,  5);                   # CFL=5, PRDTL=0, W=0
+    store32(cl_kva + 4,  0);                   # PRDBC
+    store32(cl_kva + 8,  ct_phys & 0xFFFFFFFF);
+    store32(cl_kva + 12, (ct_phys >> 32) & 0xFFFFFFFF);
+    store32(cl_kva + 16, 0);
+    store32(cl_kva + 20, 0);
+    store32(cl_kva + 24, 0);
+    store32(cl_kva + 28, 0);
 
     # Clear any pending IS / SERR before issue.
     ahci_mmio_write32(port_off + AHCI_P_IS,   0xFFFFFFFF);
@@ -1211,9 +1221,10 @@ fn ahci_read_demo() {
         ahci_demo_buf = pmm_alloc();
         if (ahci_demo_buf == 0) { return 0; }
     }
+    var dk = dma_kva(ahci_demo_buf);       # 1.57.8 (DMA1): CPU pointer = direct map; the phys goes to the PRDT
 
     var i = 0;
-    while (i < 512) { store8(ahci_demo_buf + i, 0); i = i + 1; }
+    while (i < 512) { store8(dk + i, 0); i = i + 1; }
     if (ahci_read_lba(port, 0, 1, ahci_demo_buf) == 0) {
         kprint("ahci: port ", 11);
         kprint_num(port);
@@ -1226,7 +1237,7 @@ fn ahci_read_demo() {
     i = 0;
     while (i < 8) {
         kprint(" ", 1);
-        kprint_num(load8(ahci_demo_buf + i));
+        kprint_num(load8(dk + i));
         i = i + 1;
     }
     kprintln("", 0);
@@ -1252,18 +1263,20 @@ fn ahci_write_demo() {
         ahci_demo_buf2 = pmm_alloc();
         if (ahci_demo_buf2 == 0) { return 0; }
     }
+    var dk = dma_kva(ahci_demo_buf);
+    var dk2 = dma_kva(ahci_demo_buf2);
 
     # 1. Sentinel at LBA 5: "AHCI-OK!" (8 bytes), rest zero.
     var i = 0;
-    while (i < 512) { store8(ahci_demo_buf2 + i, 0); i = i + 1; }
-    store8(ahci_demo_buf2 + 0, 65);    # A
-    store8(ahci_demo_buf2 + 1, 72);    # H
-    store8(ahci_demo_buf2 + 2, 67);    # C
-    store8(ahci_demo_buf2 + 3, 73);    # I
-    store8(ahci_demo_buf2 + 4, 45);    # -
-    store8(ahci_demo_buf2 + 5, 79);    # O
-    store8(ahci_demo_buf2 + 6, 75);    # K
-    store8(ahci_demo_buf2 + 7, 33);    # !
+    while (i < 512) { store8(dk2 + i, 0); i = i + 1; }
+    store8(dk2 + 0, 65);    # A
+    store8(dk2 + 1, 72);    # H
+    store8(dk2 + 2, 67);    # C
+    store8(dk2 + 3, 73);    # I
+    store8(dk2 + 4, 45);    # -
+    store8(dk2 + 5, 79);    # O
+    store8(dk2 + 6, 75);    # K
+    store8(dk2 + 7, 33);    # !
 
     if (ahci_write_lba(port, 5, 1, ahci_demo_buf2) == 0) {
         kprint("ahci: port ", 11);
@@ -1274,7 +1287,7 @@ fn ahci_write_demo() {
 
     # 2. Read back into a fresh buffer.
     i = 0;
-    while (i < 512) { store8(ahci_demo_buf + i, 0); i = i + 1; }
+    while (i < 512) { store8(dk + i, 0); i = i + 1; }
     if (ahci_read_lba(port, 5, 1, ahci_demo_buf) == 0) {
         kprint("ahci: port ", 11);
         kprint_num(port);
@@ -1284,14 +1297,14 @@ fn ahci_write_demo() {
 
     # 3. Verify the first 8 bytes match "AHCI-OK!".
     var ok = 1;
-    if (load8(ahci_demo_buf + 0) != 65) { ok = 0; }
-    if (load8(ahci_demo_buf + 1) != 72) { ok = 0; }
-    if (load8(ahci_demo_buf + 2) != 67) { ok = 0; }
-    if (load8(ahci_demo_buf + 3) != 73) { ok = 0; }
-    if (load8(ahci_demo_buf + 4) != 45) { ok = 0; }
-    if (load8(ahci_demo_buf + 5) != 79) { ok = 0; }
-    if (load8(ahci_demo_buf + 6) != 75) { ok = 0; }
-    if (load8(ahci_demo_buf + 7) != 33) { ok = 0; }
+    if (load8(dk + 0) != 65) { ok = 0; }
+    if (load8(dk + 1) != 72) { ok = 0; }
+    if (load8(dk + 2) != 67) { ok = 0; }
+    if (load8(dk + 3) != 73) { ok = 0; }
+    if (load8(dk + 4) != 45) { ok = 0; }
+    if (load8(dk + 5) != 79) { ok = 0; }
+    if (load8(dk + 6) != 75) { ok = 0; }
+    if (load8(dk + 7) != 33) { ok = 0; }
 
     kprint("ahci: port ", 11);
     kprint_num(port);

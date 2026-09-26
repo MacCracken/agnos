@@ -9,7 +9,7 @@
 # PLAIN kernel (built first), tests/lifecycle/lifex seeded as /bin/agnsh (kybernet launches it — D19) and
 # tests/lifecycle/spinner as /bin/spinner, plus /lf and /lf2 (4 KB flock targets) and, when LIFE_PHASES is set,
 # /life/phases. Boots -smp 1 (-cpu max) THEN -smp 4 (smoke_accel: KVM when /dev/kvm is writable, else multi-threaded
-# TCG — printed; LIFE_KVM=0 by default, see the boot loop); BOTH GATED. Extra QEMU args both boots: a virtio-net NIC on user networking (the PING phase's silent
+# TCG — printed; LIFE_KVM=0 forces TCG, see the boot loop); BOTH GATED. Extra QEMU args both boots: a virtio-net NIC on user networking (the PING phase's silent
 # host and the loopback TCP phases). Per boot it REQUIRES a PASS line per marker (filtered by LIFE_PHASES and -smp:
 # SIGBIT / KILLTICK / KLOGSTORM / STOPTICK are -smp 4 only, STOP-LONE -smp 1 only), `LIFEX-DONE pass=N fail=0` and
 # `kybernet: shell exited`. DENIES `-BAD`, `LIFE-KLOG-UNPARSED`, `LIFE-SELFKILL-SURVIVED`, PANIC, `emergency shell`
@@ -158,11 +158,11 @@ deny() { if strings "$LOG" | grep -qE -- "$1"; then bad "$2"; strings "$LOG" | g
 
 for smp in ${LIFE_SMP:-1 4}; do
     LOG="$LOGS/lifecycle-smp$smp.log"
-    # ⚠ -smp 4 runs MULTI-THREADED TCG by default (LIFE_KVM=1 selects smoke_accel's KVM): under KVM a boot WITH a
-    # virtio-net NIC draws every console line in ~1.45 s (pre-existing — the MERGE sock-wait -smp 4 log reaches
-    # `kybernet: exec` at 81 s; HARNESS-BACKLOG S7 row), and lifex re-prints every lifecycle line, so a KVM boot runs
-    # past any sane dwell. TCG thread=multi still runs the four vCPUs in parallel host threads.
-    if [ "$smp" -gt 1 ]; then R3_ACCEL="$(SMOKE_KVM="${LIFE_KVM:-0}" smoke_accel "$smp")"; else R3_ACCEL="-cpu max"; fi
+    # -smp 4 runs under KVM again by default (1.57.8 KVMCON; LIFE_KVM=0 forces multi-threaded TCG). 1.57.7 had to
+    # default to TCG because a KVM boot WITH a virtio-net NIC drew every console line in ~1.45 s: the virtio cap walk
+    # UC-remapped phys 0-2 MB (the kernel's own code) through an I/O BAR's port base. Fixed in pci_bar_64 /
+    # vmm_remap_uc_2mb and guarded by kvm-net-boot-smoke.sh (`kybernet: exec` within 20 s under KVM + the NIC).
+    if [ "$smp" -gt 1 ]; then R3_ACCEL="$(SMOKE_KVM="${LIFE_KVM:-1}" smoke_accel "$smp")"; else R3_ACCEL="-cpu max"; fi
     export R3_ACCEL
     echo ""
     echo "Boot -smp $smp  accel=$R3_ACCEL"

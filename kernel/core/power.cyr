@@ -85,7 +85,7 @@ fn power_storage_quiesce() {
     if (ahci_present != 0) {
         port = 0;
         while (port < AHCI_MAX_PORTS) {
-            if (load64(&ahci_port_cl_phys + port * 8) != 0) {
+            if (load64(&ahci_port_cl_kva + port * 8) != 0) {
                 if (ahci_port_stop(port) == 1) { stopped = stopped + 1; }
                 else { failed = failed + 1; }
             }

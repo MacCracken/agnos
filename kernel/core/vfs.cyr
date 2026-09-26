@@ -859,6 +859,11 @@ var pipe_tails[32];
 
 var PIPE_RING = 4080;   # 4096 - 8 (write head) - 8 (read tail)
 
+# ⭐ 1.57.8 — THE WAIT KEY OF A PIPE: a read#5 that finds the ring empty with a live writer BLOCKS on it (rd5_wait,
+# syscall.cyr). Woken (wq_wake, after the condition store) by pipe_write, by every pipe-end close (vfs_close_inner)
+# and by a writer's death (proc_death_finish wakes the WK_PIPE class). docs/architecture/blocking-waits.md.
+fn pipe_key(pb) { return WK_PIPE | (pb & 0x00FFFFFFFFFFFFFF); }
+
 fn pipe_read(base, buf, count) {
     var pipe_buf = load64(base + 24);
     if (pipe_buf == 0) { return 0; }
@@ -890,6 +895,8 @@ fn pipe_read(base, buf, count) {
         # so the only safe shape was to finish stage 1 entirely before starting stage 2.
         # -2 is the kernel's established WOULD_BLOCK value — the same one the channel band and the
         # cooked-line read use, so a caller that already handles one handles this.
+        # ⭐ 1.57.8: read#5 with a4 == 0 no longer RETURNS this -2 to ring 3 — it blocks on pipe_key (rd5_wait);
+        # a4 != 0 (O_NONBLOCK) and kernel callers still get it.
         # ⚠ THE SEQUENTIAL PATH IS UNCHANGED, BY CONSTRUCTION: once the shell closes the write end
         # (which it must, and now does), the count is 0 and this returns 0 exactly as before.
         if (pipe_writers_open(pipe_buf) > 0) { return 0 - 2; }
@@ -931,6 +938,7 @@ fn pipe_write(base, buf, count) {
         written = written + 1;
     }
     store64(pipe_buf, write_head);
+    if (written > 0) { wq_wake(pipe_key(pipe_buf)); }   # 1.57.8: AFTER the head store — a blocked reader re-checks
     return written;
 }
 
@@ -1390,6 +1398,7 @@ fn vfs_close_inner(fd_idx) {
         var pb = kpayload(base, 2);
         ktag_clear(base, 32);
         pipe_buf_put(pb);
+        wq_wake(pipe_key(pb));      # 1.57.8: a closed write end may be the last — its blocked readers re-check (EOF)
     }
     # 1.49.4 tear down the TCP conn. 1.57.7 (S5): only for its owner (or a kernel-owned conn) — a non-owner
     # closing its inherited copy of an owned conn is a no-op release, like pipes; the fd slot is cleared anyway.

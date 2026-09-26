@@ -86,7 +86,7 @@ held the try-lock. `net_poll` runs `tcp_retx_tick` before its NIC-less early ret
 Each virtio TX descriptor owns its own 2048-byte slot buffer (16, or 32 when the TX queue has ≥ 32 entries);
 reclaim is by the `used.idx` count and assumes in-order completion (true of QEMU and real devices, not guaranteed
 by the spec); a full ring refuses the frame (−1) and latches `virtio-net: TX ring full - frame dropped` (not a deny
-pattern). Every CPU access to a `pmm_alloc`'d NIC page goes through `net_dma_kva(phys)` (the direct map): a ring-3
+pattern). Every CPU access to a `pmm_alloc`'d NIC page goes through `dma_kva(phys)` (the direct map): a ring-3
 PT_LOAD can shadow the identity VA under its own CR3, and the ISR drain / TX run under whatever CR3 is live.
 Registers and descriptor address fields keep phys. r8169 is converted too — **iron-pending** (QEMU has no RTL8168
 model: built, gated by build + regressions, NOT burned).

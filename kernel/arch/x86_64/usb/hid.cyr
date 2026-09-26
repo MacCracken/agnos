@@ -160,6 +160,29 @@ fn hid_ep_slot_bound(slot_id) {
     return 0;
 }
 
+# ⛔⛔ 1.57.8 — PER-TRB REPORT SLOTS, FOR EVERY ROW. 1.57.7 (S3d) gave each KEYBOARD TRB its own 16-byte slot of the
+# report page and left the mouse rows on one shared buffer, so two mouse reports completing before one drain (a late
+# drain: an IF=0 stretch, a busy BSP tick) both folded the LAST report: the first report's motion and button edge
+# were lost and the last one's deltas counted twice (issue 2026-09-25-hid-mouse-reports-share-one-buffer; gate
+# HID_MOUSE_DEFER_SELFTEST). ⇒ TRB `idx` (0..254) DMAs into buf + idx * 16 (255 x 16 = 4080 B of the page); the drain
+# folds the slot the completed event's TRB pointer names, in completion order. mps > 16 (no boot device) or an index
+# outside the Normal TRBs falls back to the page start. `buf`/`ring` are PHYS; the fold reads through dma_kva.
+fn hid_slot_buf(buf, mps, idx) {
+    if (mps > 16) { return buf; }
+    if (idx < 0) { return buf; }
+    if (idx > 254) { return buf; }
+    return buf + idx * 16;
+}
+# The slot a completed Transfer Event on row `i` names: its TRB pointer (event dwords 0-1, PHYS) minus the row's ring
+# phys, / 16. `evt` is the event ring's kva. The keyboard row is registered with the SAME ring/buf/mps as hid_kbd_*.
+fn hid_row_evt_buf(i, evt) {
+    var rring = load64(&hid_ep_ring + i * 8);
+    var rbuf = load64(&hid_ep_buf + i * 8);
+    var tptr = load64(evt);
+    if (tptr < rring) { return rbuf; }
+    return hid_slot_buf(rbuf, load64(&hid_ep_mps + i * 8), (tptr - rring) / 16);
+}
+
 # Arm one Normal TRB on row `i`'s ring, mirroring hid_arm_xfer_trb's contract for the keyboard: IOC so
 # the completion surfaces as a Transfer Event, ISP so a short packet still completes, and a Link TRB
 # wrap at slot 255 with the cycle flipped. ⚠ The 16-deep batch discipline the keyboard needs applies
@@ -171,14 +194,15 @@ fn hid_arm_row_trb(i) {
     if (buf == 0) { return 0; }
     var idx = load64(&hid_ep_idx + i * 8);
     var cyc = load64(&hid_ep_cycle + i * 8);
-    var trb = ring + idx * 16;
-    store64(trb + 0, buf);
+    var rk  = dma_kva(ring);           # 1.57.8: CPU pointer (direct map); `ring`/`buf` stay phys for the TRB
+    var trb = rk + idx * 16;
+    store64(trb + 0, hid_slot_buf(buf, load64(&hid_ep_mps + i * 8), idx));   # 1.57.8: this TRB's own report slot
     store32(trb + 8, load64(&hid_ep_mps + i * 8) & 0x1FFFF);
     store32(trb + 12, (1 << 5) | (1 << 2) | (XHCI_TRB_NORMAL << 10) | (cyc & 0x1));
     idx = idx + 1;
     if (idx == 255) {
         # Reached the Link TRB: align its cycle with the producer, flip ours, wrap to 0.
-        var link = ring + 255 * 16;
+        var link = rk + 255 * 16;
         store32(link + 12, (XHCI_TRB_LINK << 10) | 0x2 | (cyc & 0x1));
         idx = 0;
         if (cyc == 1) { cyc = 0; } else { cyc = 1; }
@@ -297,8 +321,9 @@ fn hid_service_rearms() {
 
 # === HID-boot MOUSE — the accumulator and the binder ===
 #
-# ⛔⛔ WHY THIS ACCUMULATES INSTEAD OF LATCHING THE LAST REPORT. All 16 armed TRBs on an endpoint point
-# at ONE report buffer, and the drain re-reads that buffer per Transfer Event. The keyboard's own
+# ⛔⛔ WHY THIS ACCUMULATES INSTEAD OF LATCHING THE LAST REPORT. Until 1.57.8 all 16 armed TRBs on an endpoint
+# pointed at ONE report buffer and the drain re-read it per Transfer Event — so this "sum" added the LAST
+# report once per event (fixed: per-TRB slots, see hid_slot_buf; the sum below is now a real one). The keyboard's own
 # comment calls the consequence acceptable — "a gap that coalesces >1 report keeps only the LAST" — and
 # for a keyboard it IS: a report is idempotent STATE, so the differ sees curr == prev and nothing
 # happens. A mouse report is a **relative delta**. Keeping only the last one and applying it N times is
@@ -338,28 +363,29 @@ fn hid_s8(b) {
 #   [0] buttons bitmap   [1] dX (s8)   [2] dY (s8, POSITIVE IS DOWN)   [3] wheel (s8, optional)
 fn hid_process_mouse_report(report_phys, bi, resid) {
     if (report_phys == 0) { return 0; }
-    var btn = load8(report_phys + 0) & 0xFF;
-    hid_mouse_dx = hid_mouse_dx + hid_s8(load8(report_phys + 1));
-    hid_mouse_dy = hid_mouse_dy + hid_s8(load8(report_phys + 2));
+    var mr = dma_kva(report_phys);     # 1.57.8: read the DMAed report through the direct map (ISR, any CR3)
+    var btn = load8(mr + 0) & 0xFF;
+    hid_mouse_dx = hid_mouse_dx + hid_s8(load8(mr + 1));
+    hid_mouse_dy = hid_mouse_dy + hid_s8(load8(mr + 2));
     # ⭐ THE WHEEL, byte [3] (1.56.49). Folded exactly like dx/dy: it is a relative delta and keeping
     # only the last one of a coalescing gap would under-report a fast scroll the same way it amplified
     # motion — see this accumulator's header.
     # ⛔ READ UNCONDITIONALLY, AND HERE IS WHY THAT IS SAFE RATHER THAN SLOPPY. USB HID boot protocol
     # defines a 3-BYTE mouse report, so byte [3] is formally out of contract — but this file's own
     # SHORT_PACKET note already says the opposite in practice: *"the boot mouse's 4-byte reports on an
-    # 8-byte endpoint"*. The report page is zeroed at configure time and each row owns its own page, so
+    # 8-byte endpoint"*. The report page is zeroed at configure time and each TRB owns its own 16-byte slot, so
     # a device that genuinely sends three bytes leaves byte [3] at 0 for the life of the boot and the
     # wheel simply stays 0. The failure mode a length gate would prevent — a stale byte re-read as a
     # scroll — needs a device that alternates report lengths, which a fixed report descriptor cannot do.
     # ⚠ THE ASSUMPTION IS INSTRUMENTED, NOT ASSERTED: `resid` is recorded below so a serial log can say
     # what the controller actually reported. Tighten this to a length gate if a 3-byte device appears.
-    var wh = hid_s8(load8(report_phys + 3));
+    var wh = hid_s8(load8(mr + 3));
     hid_mouse_wheel = hid_mouse_wheel + wh;
     if (wh != 0) {
         if (hid_wheel_seen == 0) {
             hid_wheel_seen = 1;
             hid_wheel_seen_pending = 1;
-            hid_wheel_dbg_b3 = load8(report_phys + 3) & 0xFF;
+            hid_wheel_dbg_b3 = load8(mr + 3) & 0xFF;
             hid_wheel_dbg_resid = resid;
         }
     }
@@ -475,7 +501,7 @@ fn hid_mouse_configure(slot_id) {
     while (skip < 4) {
         xhci_zero_page(xhci_desc_buf_phys);
         if (xhci_get_config_descriptor(slot_id, 0, 9) == 0) { return bound; }
-        var total_len = load16(xhci_desc_buf_phys + 2);
+        var total_len = load16(xhci_desc_buf_kva + 2);
         if (total_len < 18) { return bound; }
         if (total_len > 4096) { total_len = 4096; }
         xhci_zero_page(xhci_desc_buf_phys);
@@ -495,7 +521,7 @@ fn hid_mouse_configure(slot_id) {
         # ⚠ SET_CONFIGURATION ONLY IF NOTHING IS BOUND ON THIS SLOT YET. Re-issuing it on a composite
         # device whose keyboard is already configured would reset that keyboard's endpoint.
         if (hid_ep_slot_bound(slot_id) == 0) {
-            var config_value = load8(xhci_desc_buf_phys + 5);
+            var config_value = load8(xhci_desc_buf_kva + 5);
             if (xhci_control_no_data(slot_id, 0x00, 0x09, config_value, 0) == 0) {
                 kprintln("hid: mouse SET_CONFIGURATION failed", 35);
                 return bound;
@@ -517,7 +543,7 @@ fn hid_mouse_configure(slot_id) {
         iommu_register_dma(report_buf);
         xhci_zero_page(report_buf);
         # Link TRB at slot 255, TC set — same wrap discipline as the keyboard ring.
-        var link = xfer_ring + 255 * 16;
+        var link = dma_kva(xfer_ring) + 255 * 16;
         store64(link, xfer_ring);
         store32(link + 8, 0);
         store32(link + 12, (XHCI_TRB_LINK << 10) | 0x2);
@@ -751,7 +777,7 @@ fn hid_kbd_configure(slot_id) {
         kprintln("hid: get config descriptor (9) failed", 37);
         return 0;
     }
-    var total_len = load16(xhci_desc_buf_phys + 2);
+    var total_len = load16(xhci_desc_buf_kva + 2);
     if (total_len < 18) { return 0; }   # need at least one intf + ep
     if (total_len > 4096) { total_len = 4096; } # clamp to scratch page
 
@@ -787,7 +813,7 @@ fn hid_kbd_configure(slot_id) {
     # bConfigurationValue lives at config descriptor byte 5 — Linux
     # `usb_choose_configuration()` typically picks the first config, value
     # = 1 for single-config HID-boot keyboards.
-    var config_value = load8(xhci_desc_buf_phys + 5);
+    var config_value = load8(xhci_desc_buf_kva + 5);
     if (xhci_control_no_data(slot_id, 0x00, 0x09, config_value, 0) == 0) {
         kprintln("hid: SET_CONFIGURATION failed", 29);
         return 0;
@@ -852,8 +878,9 @@ fn hid_kbd_configure(slot_id) {
     # keyboard) keeps the old shared buffer.
     var depth = 16;
     var di = 0;
+    var xrk = dma_kva(xfer_ring);      # 1.57.8: CPU writes through the direct map; TRB fields stay phys
     while (di < depth) {
-        var dtrb = xfer_ring + di * 16;
+        var dtrb = xrk + di * 16;
         if (mps <= 16) { store64(dtrb + 0, report_buf + di * 16); }
         else { store64(dtrb + 0, report_buf); }
         store32(dtrb + 8, mps & 0x1FFFF);
@@ -875,7 +902,7 @@ fn hid_kbd_configure(slot_id) {
     # hid_arm_xfer_trb aligns its cycle on the first wrap; TC (bit 1) set so
     # HW flips its Consumer Cycle State when it does. Slot 255 is reserved —
     # never armed with a Normal TRB.
-    var link = xfer_ring + 255 * 16;
+    var link = xrk + 255 * 16;
     store64(link, xfer_ring);
     store32(link + 8, 0);
     store32(link + 12, (XHCI_TRB_LINK << 10) | 0x2);
@@ -926,8 +953,9 @@ fn hid_process_report(report_phys) {
     # Snapshot the freshly-DMAed report into hid_curr_report. We work
     # off the CPU-side copy from here so the controller is free to start
     # the next IN transfer on the transfer ring.
+    var kr = dma_kva(report_phys);     # 1.57.8: the DMAed report, read through the direct map (ISR, any CR3)
     for (var i = 0; i < 8; i = i + 1) {
-        store8(&hid_curr_report + i, load8(report_phys + i));
+        store8(&hid_curr_report + i, load8(kr + i));
     }
     var curr_mods = load8(&hid_curr_report + 0);
     var prev_mods = load8(&hid_prev_report + 0);
@@ -947,23 +975,16 @@ fn hid_process_report(report_phys) {
 # 1.57.7 (S3d): the report slot keyboard TRB `idx` DMAs into — its own 16 bytes of the report page (see the ring-depth
 # banner in hid_kbd_configure: one shared buffer lost every key pressed and released inside a single IF=0 gap).
 # mps > 16, or an index outside the ring's 0..254 Normal TRBs, falls back to the page start (the old shared buffer).
+# 1.57.8: the slot arithmetic is shared with the mouse rows (hid_slot_buf); the drain picks the completed TRB's slot
+# for either kind through hid_row_evt_buf (the keyboard row carries the same ring/buf/mps as the hid_kbd_* globals).
 fn hid_kbd_slot_buf(idx) {
-    if (hid_kbd_ep_mps > 16) { return hid_kbd_report_buf; }
-    if (idx < 0) { return hid_kbd_report_buf; }
-    if (idx > 254) { return hid_kbd_report_buf; }
-    return hid_kbd_report_buf + idx * 16;
-}
-# The slot a completed keyboard Transfer Event names: its TRB pointer (event dwords 0-1, the TRB's physical address —
-# the ring page is identity-mapped) minus the ring base, / 16.
-fn hid_kbd_evt_buf(evt) {
-    var ke_ptr = load64(evt);
-    if (ke_ptr < hid_kbd_xfer_ring) { return hid_kbd_report_buf; }
-    return hid_kbd_slot_buf((ke_ptr - hid_kbd_xfer_ring) / 16);
+    return hid_slot_buf(hid_kbd_report_buf, hid_kbd_ep_mps, idx);
 }
 fn hid_arm_xfer_trb() {
     if (hid_kbd_xfer_ring == 0) { return 0; }
     if (hid_kbd_report_buf == 0) { return 0; }
-    var trb = hid_kbd_xfer_ring + hid_kbd_xfer_idx * 16;
+    var kxr = dma_kva(hid_kbd_xfer_ring);   # 1.57.8: CPU pointer (direct map); the TRB carries phys
+    var trb = kxr + hid_kbd_xfer_idx * 16;
     store64(trb + 0, hid_kbd_slot_buf(hid_kbd_xfer_idx));
     store32(trb + 8, hid_kbd_ep_mps & 0x1FFFF);
     # IOC=bit 5, ISP=bit 2 — see hid_kbd_configure for rationale.
@@ -976,7 +997,7 @@ fn hid_arm_xfer_trb() {
     # Pre-1.33.4 this wrapped at `>= 256` with no Link TRB — the controller
     # had no way to return to slot 0 and fell off the page end.
     if (hid_kbd_xfer_idx == 255) {
-        var link = hid_kbd_xfer_ring + 255 * 16;
+        var link = kxr + 255 * 16;
         var link_dw3 = load32(link + 12);
         if (hid_kbd_xfer_cycle == 1) { link_dw3 = link_dw3 | 0x1; }
         else { link_dw3 = link_dw3 & 0xFFFFFFFE; }
@@ -1277,7 +1298,7 @@ fn hid_poll() {
     var drained = 0;
     while (drained < 64) {       # bound — prevents runaway on corrupt cycle
         var evt_off = xhci_evt_ring_idx * 16;
-        var evt     = xhci_evt_ring_phys + evt_off;
+        var evt     = xhci_evt_ring_kva + evt_off;
         var evt_dw3 = load32(evt + 12);
         var evt_cycle = evt_dw3 & 0x1;
         if (evt_cycle != xhci_evt_ring_cycle) {
@@ -1306,11 +1327,14 @@ fn hid_poll() {
             # controller hits the empty ring at the next service interval and STALLS the endpoint."
             # Presents as INPUT FROZE, CPU STILL ALIVE, with nothing in the log.
             var row = hid_ep_find(evt_slot, evt_ep);
+            # The report slot the completed TRB names (1.57.7 S3d keyboard, 1.57.8 mouse — see hid_slot_buf).
+            var rslot = 0;
+            if (row >= 0) { rslot = hid_row_evt_buf(row, evt); }
             # ⛔⛔ DID THE TRANSFER ACTUALLY SUCCEED? A Transaction Error, Babble, Stall or Data Buffer
             # Error still posts a Transfer Event with IOC set — the TRB completed, it just did not carry
-            # data — and leaves the shared report page holding the PREVIOUS successful report. Folding
-            # that page again re-adds the last dX/dY as if the user had moved: a phantom cursor jump on
-            # every USB hiccup, of exactly the size of the last real motion. `xhci.cyr` checks this code
+            # data — and leaves that TRB's report slot holding an OLD successful report. Folding
+            # that slot again re-adds an old dX/dY as if the user had moved: a phantom cursor jump on
+            # every USB hiccup, of the size of a past real motion. `xhci.cyr` checks this code
             # on the command ring (`ccode` at its line 847); the HID drain never did.
             # ⚠ Completion code is dword 2, bits 31..24. 1 = SUCCESS, 13 = SHORT_PACKET — a short packet
             # is NORMAL for an interrupt-IN endpoint that sent fewer than the max-packet bytes, so it must
@@ -1389,7 +1413,7 @@ fn hid_poll() {
                     }
                     # Kbd IN report just landed in the slot the completed TRB names (1.57.7 S3d: per-TRB slots —
                     # a shared buffer kept only the LAST of the reports a gap completed and lost the keys between).
-                    hid_process_report(hid_kbd_evt_buf(evt));
+                    hid_process_report(rslot);
                     processed = processed + 1;
                 }
                 # ⚠ UNCONDITIONAL — the ring must be re-armed even when the report was unusable.
@@ -1401,7 +1425,9 @@ fn hid_poll() {
             # why keeping only the last report of a coalescing gap amplifies relative motion ~2-3x.
             if (hid_ep_kind_at(row) == HidKind.HID_KIND_MOUSE) {
                 if (cc_ok == 1) {
-                    hid_process_mouse_report(load64(&hid_ep_buf + row * 8), row, evt_dw2 & 0xFFFFFF);
+                    # 1.57.8: the slot THIS event's TRB DMAed into — never the row's page start, which folded the
+                    # last report of a coalescing gap once per event (issue 2026-09-25-hid-mouse-reports-share-one-buffer).
+                    hid_process_mouse_report(rslot, row, evt_dw2 & 0xFFFFFF);
                     processed = processed + 1;
                 }
                 # ⚠ UNCONDITIONAL — see the keyboard arm above.
@@ -1435,6 +1461,89 @@ fn hid_poll() {
 
 
 
+#ifdef HID_MOUSE_DEFER_SELFTEST
+# ⭐⭐ THE DEFERRED-DRAIN MOUSE GATE (1.57.8, issue 2026-09-25-hid-mouse-reports-share-one-buffer). Several mouse
+# reports complete while nobody drains — IF=0 on this CPU and `hid_poll_lock` held, so no tick or MSI-X on any CPU
+# can drain either — and then ONE hid_poll folds them all. Every report's deltas and button edges must arrive. The
+# harness (scripts/smoke/hid-mouse-deferred-smoke.sh) injects, over the QEMU monitor, once `window open` is printed:
+# mouse_move 5 0, mouse_move 0 7, mouse_button 1, mouse_button 0 — four reports, each completing its own TRB. On
+# the shared buffer every event folded the LAST report ({0,0,0}): dx 0, dy 0, no click. Test-only; never production.
+# Counts the posted, unconsumed Transfer Events on MOUSE rows, walking from the consumer index without consuming.
+fn hid_mdf_pending() {
+    var mn = 0;
+    var mk = 0;
+    var mix = xhci_evt_ring_idx;
+    var mcy = xhci_evt_ring_cycle;
+    while (mk < 64) {
+        var md3 = load32(xhci_evt_ring_kva + mix * 16 + 12);
+        if ((md3 & 1) != mcy) { return mn; }
+        if (((md3 >> 10) & 0x3F) == XHCI_TRB_TRANSFER_EVENT) {
+            var mrow = hid_ep_find((md3 >> 24) & 0xFF, (md3 >> 16) & 0x1F);
+            if (hid_ep_kind_at(mrow) == HidKind.HID_KIND_MOUSE) { mn = mn + 1; }
+        }
+        mix = mix + 1;
+        if (mix == XHCI_EVT_RING_SEGMENT_SIZE) { mix = 0; mcy = 1 - mcy; }
+        mk = mk + 1;
+    }
+    return mn;
+}
+fn hid_mouse_defer_selftest() {
+    var mice = 0;
+    var r = 0;
+    while (r < hid_ep_count) {
+        if (hid_ep_kind_at(r) == HidKind.HID_KIND_MOUSE) { mice = mice + 1; }
+        r = r + 1;
+    }
+    if (mice == 0) { kprintln("hidmdf: VOID - no boot-mouse row bound (needs -device usb-mouse)", 64); return 0; }
+    hid_poll();                            # drain whatever enumeration left behind, then start from zero
+    arch_cli();
+    while (hid_poll_trylock() == 0) { }    # hold the drain: no tick / MSI-X on any CPU folds inside the window
+    hid_mouse_dx = 0;
+    hid_mouse_dy = 0;
+    hid_mouse_btn = 0;
+    hid_mouse_btn_seen = 0;
+    hid_mouse_wheel = 0;
+    r = 0;
+    while (r < HID_MAX_EP) { store64(&hid_ep_btn + r * 8, 0); r = r + 1; }
+    kprintln("hidmdf: window open - IF=0 and the drain held; inject now", 57);
+    var t0 = klog_uptime_us();
+    var pend = hid_mdf_pending();
+    while (klog_uptime_us() - t0 < 30000000) {
+        pend = hid_mdf_pending();
+        if (pend >= 4) { break; }
+    }
+    kprint("hidmdf: mouse reports completed before the drain: ", 50);
+    kprint_num(pend);
+    kprintln("", 0);
+    hid_poll_unlock();
+    var folded = hid_poll();               # ONE drain, still IF=0
+    asm { 0xFB; }                          # sti — inputs: none; outputs: RFLAGS.IF=1; clobbers: none
+    kprint("hidmdf: one drain folded ", 25);
+    kprint_num(folded);
+    kprint(" - dx=", 6);
+    kprint_num(hid_mouse_dx);
+    kprint(" dy=", 4);
+    kprint_num(hid_mouse_dy);
+    kprint(" btn=", 5);
+    kprint_num(hid_mouse_btn);
+    kprint(" seen=", 6);
+    kprint_num(hid_mouse_btn_seen);
+    kprintln("", 0);
+    var ok = 1;
+    if (pend < 4) { ok = 0; kprintln("hidmdf: FAIL - fewer than 4 mouse reports completed inside the window", 69); }
+    if (hid_mouse_dx == 5) { kprintln("hidmdf: dx of the first report delivered OK", 43); }
+    else { ok = 0; kprintln("hidmdf: FAIL - dx is not 5 (the first report was lost or refolded)", 66); }
+    if (hid_mouse_dy == 7) { kprintln("hidmdf: dy of the second report delivered once OK", 49); }
+    else { ok = 0; kprintln("hidmdf: FAIL - dy is not 7 (the second report was lost or refolded)", 67); }
+    if ((hid_mouse_btn_seen & 1) == 1) { kprintln("hidmdf: the press edge inside the window delivered OK", 53); }
+    else { ok = 0; kprintln("hidmdf: FAIL - the left press inside the window was lost", 56); }
+    if (hid_mouse_btn == 0) { kprintln("hidmdf: the release edge delivered last OK", 42); }
+    else { ok = 0; kprintln("hidmdf: FAIL - the button is still held after its release", 57); }
+    if (ok == 1) { kprintln("hidmdf: PASS", 12); }
+    return ok;
+}
+#endif
+
 #ifdef HID_RECLAIM_SELFTEST
 # ⭐⭐ THE STOLEN-EVENT GATE — HERMETIC, AND IT NEEDS NO USB HARDWARE AT ALL.
 #
@@ -1445,7 +1554,7 @@ fn hid_poll() {
 # page, and a synthetic HID row it registers and then un-registers. Nothing here touches the controller.
 #
 # ⚠ THE THREE SWAPPED GLOBALS ARE THE DANGEROUS PART, and `hid_poll_lock` is what makes them safe.
-# `xhci_evt_ring_phys` and `xhci_mmio_base` are read by `hid_poll` from the 100 Hz tick and from the
+# `xhci_evt_ring_phys`/`_kva` and `xhci_mmio_base` are read by `hid_poll` from the 100 Hz tick and from the
 # MSI-X handler. Holding the lock for the whole test means every one of those callers bails at its own
 # try-lock BEFORE it reads either global (the count guard and the try-lock both precede the first read
 # — checked, and it is the reason the order in `hid_poll` matters). The synthetic row is torn down
@@ -1479,6 +1588,7 @@ fn hid_reclaim_selftest() {
         return 0;
     }
     var saved_phys  = xhci_evt_ring_phys;
+    var saved_kva   = xhci_evt_ring_kva;
     var saved_idx   = xhci_evt_ring_idx;
     var saved_cycle = xhci_evt_ring_cycle;
     var saved_mmio  = xhci_mmio_base;
@@ -1502,6 +1612,10 @@ fn hid_reclaim_selftest() {
     }
     xhci_mmio_base      = &hidrcl_db - xhci_db_off - slot * 4;
     xhci_evt_ring_phys  = &hidrcl_evt;
+    # 1.57.8: the consumers read through the kva twin. &hidrcl_evt is a kernel-image address (identity-mapped
+    # in every CR3), so it serves as its own kva; the TRB rings below go through dma_kva(&hidrcl_*), which
+    # is the same RAM via the direct map — why hid_reclaim_selftest now runs AFTER cr3_load(0x1000) (main.cyr).
+    xhci_evt_ring_kva   = &hidrcl_evt;
     xhci_evt_ring_idx   = 0;
     xhci_evt_ring_cycle = 1;
 
@@ -1722,6 +1836,7 @@ fn hid_reclaim_selftest() {
     hid_stolen_events   = saved_stolen;
     xhci_mmio_base      = saved_mmio;
     xhci_evt_ring_phys  = saved_phys;
+    xhci_evt_ring_kva   = saved_kva;
     xhci_evt_ring_idx   = saved_idx;
     xhci_evt_ring_cycle = saved_cycle;
     hid_poll_unlock();

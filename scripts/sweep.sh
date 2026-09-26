@@ -137,6 +137,15 @@ run_gate "1.56.52 MSC short data phase (usb-storage)" ""                        
 # all seven sites against QEMU usb-storage; RED (clobbered=7) on the [2] code, GREEN on [16]. -smp 1 + 4 gated,
 # plus one MSC_RW_DEMO boot of the canary-free production frames. Builds its own kernels.
 run_gate "1.57.7 MSC CDB canary: 16-byte CDB at all 7 SCSI sites (usb-storage, -smp 1 + 4)" "" "msc-cdb-smoke.sh"
+# 1.57.8 — the xHCI half of issue 2026-09-25-dma-cpu-pointers-still-use-identity-vas: an XHCI_SHADOW_SELFTEST
+# kernel runs a No-Op command, an EP0 GET_DESCRIPTOR, an MSC READ(10) and a keyboard TRB arm + report fold under a
+# CR3 whose whole pool window is shadowed by junk; each must be byte-exact and the junk untouched. RED on each
+# converted site reverted. usb-kbd + usb-storage, -smp 1 + 4 gated. Builds its own kernels.
+run_gate "1.57.8 xHCI/HID/MSC DMA pages via the direct map (shadowed pool window, -smp 1 + 4)" "" "xhci-shadow-smoke.sh"
+# 1.57.8 — issue 2026-09-25-hid-mouse-reports-share-one-buffer: a HID_MOUSE_DEFER_SELFTEST kernel holds the drain
+# (IF=0 + hid_poll_lock) while the harness injects four usb-mouse reports over the monitor; ONE drain must then see
+# dx 5, dy 7, the press and the release. RED (dx 0 dy 0, no click) on the shared report buffer. -smp 1 + 4 gated.
+run_gate "1.57.8 HID mouse per-TRB report slots (deferred drain, usb-mouse, -smp 1 + 4)" "" "hid-mouse-deferred-smoke.sh"
 # 1.56.52 — the first coverage of receive-side checksum verification. The other net gates only prove
 # GOOD frames pass; this one presents a corrupt frame, which nothing else in the tree does.
 run_gate "1.56.52 RX checksum verify (accept + drop)"  ""                                         "net-csum-smoke.sh"
@@ -198,9 +207,14 @@ run_gate "1.57.6 spawn: #43 codes, per-process arms, ARGV/CLEANFD, pipe lifetime
 # 1.57.7 (S7) — the process lifecycle (docs/architecture/process-lifecycle.md): kill#16 ends (9), stops (19) and
 # continues (18) a child and its descendants (KILL_TREE 0x100) through the claim / tick / B1 / wait boundaries; the wait
 # status; #99 states 5 and 7; orphans reap themselves. tests/lifecycle (lifex as /bin/agnsh, spinner) on a PLAIN
-# kernel, -smp 1 and -smp 4 (multi-threaded TCG by default — LIFE_KVM=1 for KVM), BOTH GATED. The label keeps
+# kernel, -smp 1 and -smp 4 (KVM when /dev/kvm is writable since 1.57.8 — LIFE_KVM=0 forces TCG), BOTH GATED. The label keeps
 # "limits": S8 extends this smoke. Builds its own kernel, so no buildenv here.
 run_gate "1.57.7 lifecycle (kill/stop/cont/tree/limits) -smp 1 + -smp 4" "" "lifecycle-smoke.sh"
+# 1.57.8 (KVMCON) — a PLAIN kernel + virtio-net under KVM reaches `kybernet: exec` within 20 s (kernel clock) at -smp 1
+# and -smp 4, with no direct-map dead air before the console. Through 1.57.7 the virtio cap walk UC-remapped the
+# kernel's own first megabyte of code (an I/O BAR's port base taken as a phys) and every console line took ~1.45 s.
+# Needs a writable /dev/kvm (an ERROR otherwise — the gate is about KVM). Builds its own kernel.
+run_gate "1.57.8 virtio-net under KVM boots at normal speed (-smp 1 + 4)" "" "kvm-net-boot-smoke.sh"
 # 1.57.7 (S4) — the TCP stack under the net lock chain (docs/architecture/net-concurrency.md). The three flagged
 # smokes existed and were never run by the sweep (D15); S4.1 gave them the banner-gated retry + the invariant deny.
 run_gate "1.57.7 TCP hermetic (ring/retx/mss/wnd + locks/lo-inplace/txslots/claim/gen/syncap/eof/halfclose + S6 net waits/graceful close; -smp 1 + -smp 4)" "TCP_SELFTEST=1" "tcp-smoke.sh"
@@ -278,12 +292,23 @@ run_gate "1.57.7 foreground exec on Path 2 (#37 blocks, kmain run) -smp 1+4 + re
 # full; a blocking conversion drops the old lock; a 4-child increment stress ends exactly at 600), sched_yield#44
 # donates, and an execwait#37 child blocks like any process (P13 `ew37`, flipped by S3b-F2).
 run_gate "1.57.7 in-kernel blocking waits: sleep_ms, waitpid WAIT_BLOCK, flock, #37 child blocks (ring 3; -smp 1 + 4)" "" "wait-ring3-smoke.sh"
+# 1.57.8 — issue 2026-09-25-nvme-poll-timeout-leaves-the-cq-one-behind: a forced late NVMe completion must not shift the
+# CQ (consume by CID), its buffer must not be reused before it is reaped, and a lost one must disable the controller.
+run_gate "1.57.8 NVMe late completion: no CQ shift, no buffer reuse, lost -> controller off (-smp 1 + -smp 4)" "NVME_SELFTEST=1" "nvme-late-smoke.sh"
+# 1.57.8 — issue 2026-09-25-dma-cpu-pointers-still-use-identity-vas: virtio-blk / NVMe / AHCI / HDA reach their pmm DMA
+# pages through the DIRECT MAP, so block I/O and HDA verbs stay byte-exact under a CR3 whose identity window is shadowed.
+run_gate "1.57.8 DMA CPU pointers: block + HDA byte-exact under a shadowed identity window (-smp 1 + -smp 4)" "DMA_SHADOW_SELFTEST=1" "dma-shadow-smoke.sh"
 # 1.57.7 (Path 2, S3d) — the KEYBOARD read blocks only its caller and ONE reader owns each cooked line (a second
 # blocking reader waits for the line; the NB prompt poll answers -2 without draining while another live process owns
 # it, and keeps the line while its partial line is live). waitx in mode `kbd` as /bin/agnsh, keys typed over HMP by
 # scripts/harness/wait-kbd-test.py (wrapped by the smoke), -smp 1 then -smp 4, both gated. It also carries the
 # per-TRB HID report slots' gate (a key pressed AND released inside one IF=0 gap used to be lost: `abc` read `bc`).
 run_gate "1.57.7 keyboard line ownership (blocking + NB readers; -smp 1 + 4)" "" "wait-kbd-smoke.sh"
+# 1.57.8 — BLOCKING pipe and channel reads (read#5 a4 = 0 waits; a4 != 0 keeps -2) and the #44 directed park kick
+# (issue 2026-09-25-cross-cpu-poll-and-yield-loops-are-tick-bound): tests/ipcw as /bin/agnsh on a PLAIN kernel, -smp 1
+# then -smp 4, both gated — pipe and channel ping-pongs and yield_peer < 1 ms per round, EOF by close and by death,
+# SIGKILL ends a reader blocked in a pipe wait (#99 state 6 -> 265).
+run_gate "1.57.8 blocking pipe/channel reads + #44-only directed kick (-smp 1 + 4)" "" "ipc-wait-smoke.sh"
 # 1.44.x (S3d: gated at last) — the NB cooked-line read's -2 / -3 / line contract, pre-scheduler, plus (1.57.7) the
 # completed line releases the keyboard line. It had no row since it was written.
 run_gate "1.44.x NB cooked-line read (-2/-3/line, line released)" "NBREAD_SELFTEST=1" "nbread-smoke.sh"

@@ -1,6 +1,7 @@
 # Blocking waits — the BLOCKED state and the wait/wake primitive (invariants)
 
-> **Last Updated**: 2026-09-25 (1.57.7 — Path 2 step S3d, bites S3.6–S3.9: keep-current, the `#44`/`#14` park, the
+> **Last Updated**: 2026-09-25 (1.57.8 — blocking pipe / channel reads, `WK_PIPE`/`WK_CHAN`, `wq_wake_m`, the `#44`
+> directed park kick. 1.57.7 — Path 2 step S3d, bites S3.6–S3.9: keep-current, the `#44`/`#14` park, the
 > halt protocol and `cpu_kickable`, the idle step, the 0xE1 reschedule kick, the keyboard's one-reader-per-line wait,
 > the sound waits. S3c (S3.4–S3.5) wrote the primitive and its first users. Later Path 2 steps extend this document:
 > S3b (foreground exec: the #37 child and kmain's `run` are scheduled children, the waiter blocks on `WK_CHILD` — see
@@ -58,7 +59,9 @@ current on a CPU is state 2 with `on_cpu` == that CPU.
 | `sched_exit_tail()` | A dead process leaves its CPU at once (below). |
 
 Keys (high byte = class, low bits = object): `WK_SLEEP | pid`, `WK_FLOCK | inode`, `WK_CHILD | ppid`, `WK_KBD`,
-`WK_KBD_OWNER`, `WK_SND` (S3d), `WK_TCP | cid`, `WK_ICMP | pid` (S6), `WK_TEST | n` (selftests). Reasons: `WR_NONE`
+`WK_KBD_OWNER`, `WK_SND` (S3d), `WK_TCP | cid`, `WK_ICMP | pid` (S6), `WK_PIPE | buffer`, `WK_CHAN | endpoint`
+(1.57.8), `WK_TEST | n` (selftests). `wq_wake_m(key, msk)` wakes `(wait key & msk) == key` — `wq_wake` is msk −1; a
+CLASS wake (msk `0xFF00…`) serves a waker that can no longer name the objects (a pipe writer's death). Reasons: `WR_NONE`
 0, `WR_EVENT` 1, `WR_TIMEOUT` 2, `WR_SIGNAL` 3. The cells are pid-indexed arrays in proc.cyr (shared, because
 vfs.cyr names `WK_FLOCK` and `proc_alloc_slot` scrubs them): `proc_wait_key`, `proc_wait_deadline`,
 `proc_wake_reason`.
@@ -234,13 +237,32 @@ With keep-current a yield with only the idle READY is a no-op — so every poll 
 interrupt (IF=1 at preempt_count 0: a designated CPL0 preempt point, **not charged** — `cpu_in_halt`), then offered
 the CPU once more (`sched_yield_kernel`) so whatever that interrupt made READY runs at once · **0** refused
 (pre-scheduler, preempt held, a borrowed CR3): the caller keeps its legacy path.
-`#44` = `sched_yield_or_halt()`; `#14` = the same, then `ksyscall(14)`'s legacy hlt only when refused; the `#14` arm's
-own window (an in-kernel `ksyscall(14)`) is `sched_halt_window()` followed by the yield when the window found work.
+`#44` = `sched_yield_or_halt(2)`; `#14` = `sched_yield_or_halt(1)`, then `ksyscall(14)`'s legacy hlt only when
+refused; the `#14` arm's own window (an in-kernel `ksyscall(14)`) is `sched_halt_window(1)` followed by the yield when the window found work.
 ⛔ `sched_ready_for_me(me)` — the park's scan — excludes `me` AND **this CPU's idle**: the idle is READY whenever a
 parker is current, and finding it would bounce through keep-current and never halt (M-D4). Measured: a `#44` loop
 for 300 ms beside a sleeping child is charged 0 ticks (P2c; M-D2 — the park removed — 30); bench `yield_idle` ≈ one
 interrupt period (a ~µs reading is the M-D2 signature). A yield toward a peer RUNNING on another CPU parks too (it is
-not READY here): `yield_peer` at `-smp 4` measures a tick-bound ping-pong.
+not READY here) — which made `yield_peer` at `-smp 4` a tick-bound ping-pong (9.9 ms per round) until 1.57.8's
+directed kick (below).
+
+⭐ **The directed kick (1.57.8) — `#44` only.** A park takes `hw_k`, the `cpu_kickable` value it publishes: **2** for
+a `#44` park (`sys_sched_yield_k`), **1** for every other park (`#14` pause, an in-kernel `ksyscall(14)`) and for the
+idle step. After its scan found nothing, a `#44` park sends one 0xE1 kick (`sched_kick_parker`) to the first other
+online CPU whose `cpu_kickable == 2` — another `#44` parker — then halts. It is sent after this CPU published its own
+`2` + `mfence`, so the woken yielder's next park sees this CPU and kicks back: two `#44` yielders on two CPUs trade
+one IPI per round instead of a tick. Measured (`-smp 4`, KVM): `yield_peer` 113–122 µs per round (9.75 ms with the
+kick removed, mutation M2; 531 µs before S3d); `-smp 1` unchanged (11.5 µs); `yield_idle` still one interrupt period.
+⚠ **The scope, and the accepted price:** the kernel cannot tell a yielder waiting for its peer from one waiting for
+anything else, so **any two `#44` yielders on two CPUs** ping-pong at IPI rate for as long as both yield — `#44` is
+`sched_yield`, "run me again as soon as possible", a spin by contract; the cure for such a pair is a blocking read
+(below). ⛔ **`#14` pause neither sends nor draws the directed kick** (1.57.8 end review, PIPE-R1): until then every
+park did both, so crab's `#14` idle beside a cyrius `_agnos_sock_recv_block` `#14` backoff — or agnsh's `#44` bg poll
+beside either — woke each other every ~100–200 µs forever, and the sock_recv backstop of 6000 pauses (sized for
+~10 ms pauses) expired in under a second. `ipc-wait-smoke`'s `pause-pair` (`#14` beside an unrelated `#14` pauser)
+and `mixed-pair` (`#44` beside a `#14` pauser) gate ≥ 1 ms per call at `-smp > 1` (measured ~9.7 ms; pre-fix
+~118–210 µs). A `#44` park beside a BUSY process (it never parks), a BLOCKED one (current nowhere) or a `#14` pauser
+kicks nothing, so agnsh's prompt poll beside a busy job still halts (P2c).
 
 ## The halt protocol and `cpu_kickable` (S3.6/S3.8)
 
@@ -299,6 +321,29 @@ are clustered, so the BSP's own tick is the first after a deadline and PINNED-SL
 | a deadline (`wq_tick`) of a proc pinned to a remote idle/parked CPU | one IPI (when another CPU's tick expires it first) |
 | tick-mode clock (TSC refused) | BSP ticks (10 ms) |
 
+## Pipe and channel reads (1.57.8)
+
+`read`#5 on a pipe read end or an owned channel endpoint that would answer −2 (WOULD_BLOCK: empty with a live
+writer / a live peer) **blocks its caller when `a4 == 0`** (`rd5_wait`, syscall.cyr — the canonical C9 loop);
+`a4 != 0` is O_NONBLOCK and keeps −2, as do a zero-length read and a context that cannot block. `rd5_key(fd)` is both
+the pre-check and the side-effect-free re-check after the arm: `WK_PIPE | buffer` (`pipe_key`, vfs.cyr) while the
+ring is empty and `pipe_writers_open` finds a writer, `WK_CHAN | endpoint` while `chan_w == chan_r` and the peer end
+is open, else 0 (data, EOF or an error — the read itself decides). **Wakers, each AFTER its condition store:**
+`pipe_write` (the head), `vfs_close_inner` (every pipe-end close — it may be the last writer), `proc_death_finish`
+(a CLASS wake of every `WK_PIPE` reader after the writer's state 0 or its orphan teardown: `pipe_writers_open` skips
+dead tables, and an orphan's table is already gone, so the pipes cannot be named), `chan_queue` (the sender's
+`chan_w`; both `CH_SEND`#97 and `write`#1), `CH_CLOSE` and `chan_release_pid` (the peer's `chan_end_open`). A 100 ms
+backstop deadline re-checks anyway: a writer dropped by a path with no wake costs latency, never a hang. **Kill
+(S7 boundary D):** a SIGKILL's `WR_SIGNAL`, or a kill pending at the arm, ABORTs with −1, which never reaches ring 3
+(B1 ends the process); a STOP parks inside `wq_signal_point` and the loop re-arms. `CH_RECV`#97 stays non-blocking
+(its a4 is the capacity, and it is the batch op a compositor polls across every channel it holds). Pipe WRITES do not
+block (a full ring still short-writes; the caller retries). Gate: `scripts/smoke/ipc-wait-smoke.sh` (tests/ipcw,
+`-smp 1` and `-smp 4`): pipe and channel ping-pongs 35–175 µs per round (< 1 ms gated), EOF by close ≈ the child's
+own 30 ms, EOF by death ≈ 32 ms, a kill of a reader in state 6 reaped 265 in < 1 ms. Mutations: the writer wake
+dropped → pipe-pp 210 ms per round (backstop-bound, RED); the sender wake dropped → chan-pp 108 ms (RED); the death
+class wake dropped → eof-death 110 ms (RED). `bench-ring3` `pipe_wr_rd8` pays the writer's `wq_wake` (sched_lock + a
+16-slot scan): 6.9 → 7.1 µs at `-smp 1`, 15.4 → 16.4 µs at `-smp 4`.
+
 ## Keyboard line ownership (S3.7)
 
 `read`#5 on fd 0 (still the console) BLOCKS ONLY ITS CALLER: `kbd_read_line_waiting` arms `WK_KBD` (a 100 ms backstop)
@@ -326,7 +371,12 @@ CPU-holding read, which takes the line when it is free and otherwise proceeds UN
 **HID report slots (a defect the wait-kbd gate found):** every keyboard transfer TRB used to DMA into ONE report
 buffer, so two reports completed before the drain kept only the last — a key pressed and released inside one IF=0
 stretch was lost (`abc` read `bc`). Each TRB now has its own 16-byte slot and the drain folds the slot the event's TRB
-pointer names (hid.cyr `hid_kbd_slot_buf` / `hid_kbd_evt_buf`; mutation M-HID).
+pointer names (mutation M-HID). 1.57.8 extends the same slots to the MOUSE rows, which had kept the shared buffer —
+there it lost the first report's motion and button edge and counted the last one's deltas once per event. Both kinds
+now share `hid_slot_buf` (arm: TRB `idx` → `buf + idx*16` when mps ≤ 16) and `hid_row_evt_buf` (drain: the event's
+TRB pointer → slot, read through the direct map); gate `hid-mouse-deferred-smoke.sh` (HID_MOUSE_DEFER_SELFTEST: four
+QEMU mouse reports complete while IF=0 and `hid_poll_lock` hold the drain, then one drain must see dx 5, dy 7, the
+press and the release).
 Handoff notes for S7: a STOPPED (5) owner is live and freezes the keyboard until SIGCONT (S7 chooses and documents);
 `kbd_line_waiters` is decremented by the waiter itself — S7's death path must fix it for a proc killed inside the
 `WK_KBD_OWNER` wait (or recount); `kbd_line_release_pid` lives in x86-only syscall.cyr — an aarch64 stub is needed if

@@ -108,23 +108,24 @@ var vnet_rx_buf[3072];      # 24576 B (16 × 1536 B per-RX-descriptor)
 # read it (frame 1 lost, frame 2 sent twice) — on one CPU, no race needed: a data segment then a FIN, or a
 # SYN-ACK and an ARP reply out of one drain. Now: vnet_tx_slots (16, or 32 when the TX queue has >= 32
 # entries; a power of two) 2048-byte halves of pmm pages, their PHYS in vnet_tx_bufs[] (descriptor address
-# field), CPU access through net_dma_kva.
+# field), CPU access through dma_kva.
 var vnet_tx_bufs[32];       # phys of each 2048-byte TX slot buffer
 var vnet_tx_slots = 16;
 var vnet_tx_full = 0;       # frames refused because every slot was in flight (diagnostic)
 var vnet_tx_full_said = 0;
 
-# net_dma_kva(phys) — THE CPU pointer for a pmm_alloc'd DMA page (1.57.7 S4, N-6). pmm_alloc draws from
+# dma_kva(phys) — THE CPU pointer for a pmm_alloc'd DMA page (1.57.7 S4, N-6; every DMA driver since 1.57.8, when it
+# was renamed from net_dma_kva — docs/architecture/dma-cpu-pointers.md). pmm_alloc draws from
 # [0x400000, 0xFFFF000], a window a ring-3 PT_LOAD can SHADOW under its own CR3 (heap.cyr's 1.56.51 slab
 # banner explains the class), and the ISR drain + ISR-time TX run under whatever CR3 is live. So every CPU
 # load/store whose address comes from a pmm page goes through the direct map. Device registers and descriptor
 # address FIELDS keep phys; .bss DMA buffers (vnet_rx_buf) are fine as they are (the kernel image is
 # identity-mapped in every CR3). A BOOTCR3_KEEP_GNOBOOT_CR3 build has no direct map in kmain's context.
 #ifdef BOOTCR3_KEEP_GNOBOOT_CR3
-fn net_dma_kva(ndk_phys) { return ndk_phys; }
+fn dma_kva(ndk_phys) { return ndk_phys; }
 #endif
 #ifndef BOOTCR3_KEEP_GNOBOOT_CR3
-fn net_dma_kva(ndk_phys) { return pmm_kva_for_access(ndk_phys); }
+fn dma_kva(ndk_phys) { return pmm_kva_for_access(ndk_phys); }
 #endif
 
 # ---------------------------------------------------------------------
@@ -275,12 +276,12 @@ fn vnet_setup_queue(q_idx, qsize_out, desc_out, avail_out, used_out, notify_out)
     if (p2 == 0) { return 0 - 1; }
     if (p3 == 0) { return 0 - 1; }
 
-    # 1.57.7 (S4, N-6): the rings are addressed by the CPU through the DIRECT MAP (net_dma_kva); the device
+    # 1.57.7 (S4, N-6): the rings are addressed by the CPU through the DIRECT MAP (dma_kva); the device
     # gets phys. The three identity `vmm_map(pN, pN, 0x83)` lines that stood here are gone (the heap.cyr
     # 1.56.51 precedent: they wrote only the boot PD and were a no-op in practice).
-    var k1 = net_dma_kva(p1);
-    var k2 = net_dma_kva(p2);
-    var k3 = net_dma_kva(p3);
+    var k1 = dma_kva(p1);
+    var k2 = dma_kva(p2);
+    var k3 = dma_kva(p3);
     for (var i = 0; i < 512; i = i + 1) { store64(k1 + i * 8, 0); }
     for (var i = 0; i < 512; i = i + 1) { store64(k2 + i * 8, 0); }
     for (var i = 0; i < 512; i = i + 1) { store64(k3 + i * 8, 0); }
@@ -473,7 +474,7 @@ fn virtio_net_send(buf, len) {
     }
     var s = vnet_tx_idx & (vnet_tx_slots - 1);
     var tphys = load64(&vnet_tx_bufs + s * 8);
-    var tkva = net_dma_kva(tphys);
+    var tkva = dma_kva(tphys);
 
     # Zero the 12-byte header.
     for (var i = 0; i < hdr_len; i = i + 1) {

@@ -287,12 +287,6 @@ idt_set_gate(&idt + 240 * 16, &tlb_isr, 0x08, 0x8E);
 # function header in apic.cyr for the two precedents that make this worth a boot-time check.
 if (tlb_lock_selftest() == 1) { kprintln("tlb: handshake primitives OK", 28); }
 else { kprintln("tlb: HANDSHAKE PRIMITIVES BROKEN - shootdown serialisation is INERT", 67); }
-#ifdef HID_RECLAIM_SELFTEST
-# 1.56.52 — the stolen-event reclaim. Hermetic, so it deliberately runs HERE rather than after USB
-# init: it swaps xhci_evt_ring_phys/xhci_mmio_base for its own scratch pages under hid_poll_lock, and
-# doing that before the controller is live is strictly safer than doing it after.
-hid_reclaim_selftest();
-#endif
 #ifdef FP_NM_SELFTEST
 fpu_nm_selftest();
 #endif
@@ -332,11 +326,7 @@ kprintln("", 0);
 # (bite 2 switches consumers to direct-map pointers). Always-on; the directmap page tables are a few
 # pages from the <=256 MB pool.
 pmm_setup_directmap(pmm_memmap_ram_top);
-# 1.56.40 — reserve the channel band's 2 MB region. ⛔ MUST follow pmm_setup_directmap: the region is
-# addressed through DIRECTMAP_BASE (the only alias every per-proc CR3 mirrors), so reserving before the
-# direct map exists would stamp a VA that means something else. Failure is non-fatal — chan_op then
-# answers CH_E_NOREGION rather than the kernel refusing to boot over an IPC band nothing uses yet.
-chan_region_reserve();
+# (1.57.8: chan_region_reserve moved below, after cr3_load(0x1000) — it ZEROES through the direct map.)
 # 1.56.51 — blit#39's scaled-row staging, ONE 2 MB region sliced per-CPU. ⛔ MUST follow
 # pmm_setup_directmap: fb_scale_rowbuf_base() hands back DIRECTMAP_BASE + phys, the only alias
 # every per-process CR3 mirrors. Taken here, at boot, single-threaded, because the buffer became
@@ -471,6 +461,22 @@ pmm_bitmap_use_directmap();
 # 1.57.6 (Path 2, S3.3): the region-7 guard pages — here, the first moment the direct map is live in kmain's
 # context, and before any per-proc CR3 or AP exists (vmm.cyr kstack_guard_init's banner).
 kstack_guard_init();
+# 1.56.40 — reserve the channel band's 2 MB region (addressed through DIRECTMAP_BASE, the only alias every
+# per-proc CR3 mirrors). ⛔ 1.57.8 — HERE, after cr3_load(0x1000), not beside pmm_setup_directmap where it sat:
+# chan_region_reserve memsets the region through its direct-map alias, and under gnoboot's boot CR3 that alias is
+# an identity view of 8 GB + phys — the zeroing landed nowhere at -m 512M (under KVM each store trapped as
+# unassigned MMIO: ~2 s of boot) and in someone else's RAM on a big box, so the band was never actually zeroed.
+# The kfont_init rule. Failure is non-fatal — chan_op answers CH_E_NOREGION. A BOOTCR3_KEEP_GNOBOOT_CR3 boot has no
+# direct map in its boot context and gets no band (as with /fonts).
+chan_region_reserve();
+#ifdef HID_RECLAIM_SELFTEST
+# 1.56.52 — the stolen-event reclaim. Hermetic, so it deliberately runs BEFORE USB init: it swaps
+# xhci_evt_ring_phys/_kva and xhci_mmio_base for its own scratch pages under hid_poll_lock, and doing that
+# before the controller is live is strictly safer than doing it after. ⚠ 1.57.8 — and AFTER the cr3_load(0x1000)
+# above: the ring writes it drives go through dma_kva (the direct map), which under gnoboot's boot CR3
+# still maps an unrelated GB (CLAUDE.md, pmm_kva_for_access).
+hid_reclaim_selftest();
+#endif
 
 # 1.57.2 — assemble + verify + expose the kernel-embedded default TrueType face (core/kfont.cyr,
 # rekha's Liberation Sans). Same allocator as fb_shadow_init above (pmm_alloc_2mb_run, one region,
@@ -824,6 +830,11 @@ if (nvme_admin_init() == 1) {
         nvme_register_block_dev();
     }
 }
+# 1.57.8 — NVMe late-completion fault injection (core/nvme.cyr nvme_late_selftest; scripts/smoke/nvme-late-smoke.sh).
+# Its last arm disables the controller on purpose, so nothing after it may need NVMe; the smoke stops at its done line.
+#ifdef NVME_SELFTEST
+nvme_late_selftest();
+#endif
 # HDA audio Phase B0 (1.52.0) — locate the HD-Audio controller (if present),
 # map BAR0 UC, enable bus-master, read GCAP + version. Read-only probe — no
 # reset, no codec enum, no DMA (those are B1+). Polled posture (INTCTL stays
@@ -975,6 +986,17 @@ msc_write_demo();
 # 1.57.7 — test-only: drives all seven SCSI CDB builders with a canary beside cdb_buf (scripts/smoke/msc-cdb-smoke.sh).
 #ifdef MSC_CDB_CANARY
 msc_cdb_canary_run();
+#endif
+# 1.57.8 — test-only: the xHCI command / EP0 / MSC bulk / HID paths under a CR3 whose whole pool window is
+# shadowed (msc.cyr's xhci_shadow_selftest banner; scripts/smoke/xhci-shadow-smoke.sh). After the MSC read demo,
+# so the keyboard, the stick's endpoints and its capacity are all live.
+#ifdef XHCI_SHADOW_SELFTEST
+xhci_shadow_selftest();
+#endif
+# 1.57.8 — test-only: mouse reports completing while the drain is held must all fold in one drain (hid.cyr's
+# hid_mouse_defer_selftest banner; scripts/smoke/hid-mouse-deferred-smoke.sh). BSP, before the APs, MSI-X armed.
+#ifdef HID_MOUSE_DEFER_SELFTEST
+hid_mouse_defer_selftest();
 #endif
 
 if (gpt_init() == 1) {

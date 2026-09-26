@@ -1,0 +1,17 @@
+[package]
+name = "ipcw"
+version = "0.1.0"
+description = "agnos 1.57.8 blocking pipe / channel reads (issue 2026-09-25-cross-cpu-poll-and-yield-loops-are-tick-bound): a pipe ping-pong and a channel ping-pong with BLOCKING read#5 (a4 = 0), yield_peer (#44 against a yielding peer: the directed park kick), O_NONBLOCK (a4 != 0) keeps -2, EOF wakes (close and death), and a SIGKILL wakes a blocked reader. Seeded as /bin/agnsh by scripts/smoke/ipc-wait-smoke.sh."
+license = "GPL-3.0-only"
+language = "cyrius"
+# The VALUE must EQUAL the root manifest's pin (scripts/check/toolchain-pin-check.sh enforces it).
+cyrius = "6.6.6"
+
+[build]
+entry = "ipcw.cyr"
+output = "build/ipcw"
+
+# AGNOS ONLY — build with `cyrius build --agnos ipcw.cyr build/ipcw`.
+[deps]
+# The FULL closure, transitives included: string and args -> alloc; alloc -> atomic, fnptr.
+stdlib = ["syscalls", "string", "args", "alloc", "atomic", "fnptr"]

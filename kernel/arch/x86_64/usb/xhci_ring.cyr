@@ -28,14 +28,20 @@
 #                 bytes wasted — easier to bisect on iron than packing
 #                 ERST into the start of the event ring page).
 #
-# All four are PMM-allocated. The kernel identity-maps 0–4 GB via
-# pt_init, and pmm_alloc returns pages within the first 16 MB, so phys
-# == virt and DMA is safe without IOMMU translation. iommu_register_dma
-# is best-effort — it's a no-op when VT-d isn't active.
+# All four are PMM-allocated. The DEVICE sees physical addresses (no IOMMU translation; iommu_register_dma
+# is best-effort — a no-op when VT-d isn't active), so every TRB / context / register field holds PHYS.
+# ⛔ 1.57.8 — THE CPU NEVER USES THAT PHYS AS A POINTER. pmm_alloc draws from [0x400000, 0x10000000), the
+# window a ring-3 PT_LOAD can SHADOW under its own CR3 (heap.cyr's 1.56.51 slab banner), and hid_poll runs
+# from the 0x51 MSI-X ISR and the BSP tick under whatever CR3 is live, msc_blk_* from syscalls. So every CPU
+# load/store into an xHCI / HID / MSC DMA page goes through dma_kva (the direct-map alias, mirrored
+# into every CR3 and never user-reachable): the *_kva globals below for the fixed structures, xhci_zero_page
+# (which takes PHYS and converts), and a dma_kva(phys) at every per-slot / per-endpoint site.
+# scripts/smoke/xhci-shadow-smoke.sh (XHCI_SHADOW_SELFTEST) runs the command / EP0 / bulk / HID paths under a
+# CR3 whose whole pool window is shadowed and requires byte-exact results.
 
 # --- Module globals (consumed by xhci_init + Phase 3 cmd path) ------
 
-var xhci_dcbaa_phys     = 0;   # DCBAA page phys (= virt; 4 KB aligned)
+var xhci_dcbaa_phys     = 0;   # DCBAA page phys (4 KB aligned; CPU uses xhci_dcbaa_kva)
 var xhci_cmd_ring_phys  = 0;   # Command ring page phys
 var xhci_cmd_ring_cycle = 0;   # Producer Cycle State (PCS) for cmd ring
 var xhci_cmd_ring_idx   = 0;   # Next free TRB slot in cmd ring (0..254)
@@ -44,6 +50,9 @@ var xhci_evt_ring_cycle = 0;   # Consumer Cycle State (CCS) for event ring
 var xhci_evt_ring_idx   = 0;   # Next event TRB slot to consume
 var xhci_erst_phys      = 0;   # ERST page phys (entry 0 at offset 0)
 var xhci_rings_ready    = 0;   # 1 once all four allocations succeeded
+var xhci_dcbaa_kva      = 0;   # 1.57.8 — CPU pointers (direct map) of the DCBAA, command ring and event
+var xhci_cmd_ring_kva   = 0;   #          ring: every load/store uses these, the *_phys twins go only
+var xhci_evt_ring_kva   = 0;   #          into TRBs and registers (DCBAAP, CRCR, ERSTBA, ERDP)
 
 # Event ring segment size — 256 TRBs × 16 bytes = 4 KB (one page).
 # Bumped only when a Phase-5+ workload actually needs more than 256
@@ -67,10 +76,11 @@ enum XhciEvtRing {
 # --- Helpers --------------------------------------------------------
 
 # 4 KB / 8 B per store = 512 store64 calls. Same idiom virtio_blk uses
-# at qbase initialization.
+# at qbase initialization. 1.57.8: `page` is the PHYS of a pmm page; the stores go through the direct map.
 fn xhci_zero_page(page) {
+    var zk = dma_kva(page);
     for (var i = 0; i < 512; i = i + 1) {
-        store64(page + i * 8, 0);
+        store64(zk + i * 8, 0);
     }
     return 0;
 }
@@ -81,10 +91,11 @@ fn xhci_zero_page(page) {
 # fast with a kprintln so iron post-mortem is unambiguous (vs silent
 # triple-fault when the controller later DMAs into the page).
 fn xhci_dma_check(page) {
-    store64(page, 0x0DEADBEEFCAFE);
-    var v = load64(page);
+    var ck = dma_kva(page);
+    store64(ck, 0x0DEADBEEFCAFE);
+    var v = load64(ck);
     if (v != 0x0DEADBEEFCAFE) { return 0; }
-    store64(page, 0);
+    store64(ck, 0);
     return 1;
 }
 
@@ -104,6 +115,7 @@ fn xhci_rings_init() {
     iommu_register_dma(dcbaa);
     xhci_zero_page(dcbaa);
     xhci_dcbaa_phys = dcbaa;
+    xhci_dcbaa_kva = dma_kva(dcbaa);
 
     # 1b. Repair (AA) — Scratchpad buffer array → DCBAA[0]. xHCI 1.2 §4.20:
     # if HCSPARAMS2.MaxScratchpadBufs > 0, the OS MUST allocate that many
@@ -155,6 +167,7 @@ fn xhci_rings_init() {
         # PAGESIZE (offset 0x08) is a bitmask of supported page sizes;
         # bit 0 = 4 KB (always set on x86_64). pmm_alloc returns 4 KB
         # pages, which matches the minimum supported size.
+        var spk = dma_kva(sp_array);
         var i = 0;
         while (i < xhci_max_scratchpad) {
             var buf = pmm_alloc();
@@ -162,7 +175,7 @@ fn xhci_rings_init() {
             if (vmm_is_mapped(buf) == 0) { vmm_map(buf, buf, 0x83); }
             iommu_register_dma(buf);
             xhci_zero_page(buf);
-            store64(sp_array + i * 8, buf);
+            store64(spk + i * 8, buf);
             i = i + 1;
         }
 
@@ -170,7 +183,7 @@ fn xhci_rings_init() {
         # memory write — the controller reads DCBAA[0] when it needs
         # scratchpad backing, which is gated by R/S being set. xhci_start
         # writes DCBAAP after rings_init, then sets R/S, so order is safe.
-        store64(dcbaa, sp_array);
+        store64(xhci_dcbaa_kva, sp_array);
         xhci_scratchpad_phys = sp_array;
 
         kprint("xhci: scratchpad ready, array=", 30);
@@ -215,11 +228,13 @@ fn xhci_rings_init() {
     # though the first Enable Slot doesn't reach wrap; bugs of this
     # shape are pinpointed in Linux's commit history as the cause of
     # spurious HW cmd-ring traversal on early controllers.
+    var cmdk = dma_kva(cmd);
     var link_off = 255 * 16;
-    store64(cmd + link_off, cmd);
-    store32(cmd + link_off + 8, 0);
-    store32(cmd + link_off + 12, (XHCI_TRB_LINK << 10) | 0x2);
+    store64(cmdk + link_off, cmd);
+    store32(cmdk + link_off + 8, 0);
+    store32(cmdk + link_off + 12, (XHCI_TRB_LINK << 10) | 0x2);
 
+    xhci_cmd_ring_kva   = cmdk;
     xhci_cmd_ring_phys  = cmd;
     xhci_cmd_ring_cycle = 1;
     xhci_cmd_ring_idx   = 0;
@@ -231,6 +246,7 @@ fn xhci_rings_init() {
     if (vmm_is_mapped(evt) == 0) { vmm_map(evt, evt, 0x83); }
     iommu_register_dma(evt);
     xhci_zero_page(evt);
+    xhci_evt_ring_kva   = dma_kva(evt);
     xhci_evt_ring_phys  = evt;
     xhci_evt_ring_cycle = 1;
     xhci_evt_ring_idx   = 0;
@@ -244,8 +260,9 @@ fn xhci_rings_init() {
     if (vmm_is_mapped(erst) == 0) { vmm_map(erst, erst, 0x83); }
     iommu_register_dma(erst);
     xhci_zero_page(erst);
-    store64(erst, evt);
-    store32(erst + 8, XHCI_EVT_RING_SEGMENT_SIZE);
+    var erk = dma_kva(erst);
+    store64(erk, evt);
+    store32(erk + 8, XHCI_EVT_RING_SEGMENT_SIZE);
     xhci_erst_phys = erst;
 
     xhci_rings_ready = 1;

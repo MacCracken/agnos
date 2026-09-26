@@ -94,7 +94,7 @@ fn xhci_drain_port_change_events() {
     var safety = 0;
     while (safety < 64) {
         var evt_off = xhci_evt_ring_idx * 16;
-        var evt = xhci_evt_ring_phys + evt_off;
+        var evt = xhci_evt_ring_kva + evt_off;
         var evt_dw3 = load32(evt + 12);
         var evt_cycle = evt_dw3 & 0x1;
         if (evt_cycle != xhci_evt_ring_cycle) { break; }
@@ -191,7 +191,7 @@ fn xhci_xecp_classify_ports() {
         if (page == 0) { kprintln("xhci: port classify alloc failed", 32); return 0; }
         if (vmm_is_mapped(page) == 0) { vmm_map(page, page, 0x83); }
         xhci_zero_page(page);
-        xhci_port_proto = page;
+        xhci_port_proto = dma_kva(page);   # 1.57.8: a CPU-only byte table — keep the direct-map alias
     }
 
     if (xhci_xecp == 0) {

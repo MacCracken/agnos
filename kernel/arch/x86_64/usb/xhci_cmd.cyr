@@ -91,13 +91,16 @@ enum XhciBulkSpins {
 fn xhci_cmd_submit(p_lo, p_hi, status, ctrl_partial) {
     if (xhci_rings_ready == 0) { return 0; }
 
+    # 1.57.8: `trb` (PHYS) is what the completion event names and what this returns; the CPU writes
+    # through `tk`, the direct-map alias (xhci_ring.cyr header).
     var slot_off = xhci_cmd_ring_idx * 16;
     var trb      = xhci_cmd_ring_phys + slot_off;
+    var tk       = xhci_cmd_ring_kva + slot_off;
 
-    store32(trb,      p_lo);
-    store32(trb + 4,  p_hi);
-    store32(trb + 8,  status);
-    store32(trb + 12, ctrl_partial | xhci_cmd_ring_cycle);
+    store32(tk,      p_lo);
+    store32(tk + 4,  p_hi);
+    store32(tk + 8,  status);
+    store32(tk + 12, ctrl_partial | xhci_cmd_ring_cycle);
 
     # Repair (OO.D) 2026-05-18 — readback flush the cmd-ring TRB store.
     # Analogous to Repair HH (doorbell-side readback for posted MMIO writes)
@@ -106,7 +109,7 @@ fn xhci_cmd_submit(p_lo, p_hi, status, ctrl_partial) {
     # forces the just-written TRB into a state where the controller's
     # DMA-read is guaranteed to see it. Belt-and-suspenders against any
     # AMD FCH cmd-ring DMA-coherence gap.
-    var trb_flush = load32(trb + 12);
+    var trb_flush = load32(tk + 12);
 
     xhci_cmd_ring_idx = xhci_cmd_ring_idx + 1;
 
@@ -114,7 +117,7 @@ fn xhci_cmd_submit(p_lo, p_hi, status, ctrl_partial) {
     # Link TRB's cycle bit with current PCS so HW follows it, then flip
     # PCS and reset idx. Slot 255 itself is never used for commands.
     if (xhci_cmd_ring_idx == 255) {
-        var link = xhci_cmd_ring_phys + 255 * 16;
+        var link = xhci_cmd_ring_kva + 255 * 16;
         var link_dw3 = load32(link + 12);
         if (xhci_cmd_ring_cycle == 1) {
             link_dw3 = link_dw3 | 0x1;
@@ -149,7 +152,7 @@ fn xhci_cmd_submit(p_lo, p_hi, status, ctrl_partial) {
         kprint(" trb_phys=", 10);
         kprint_num(trb);
         kprint(" dw3=", 5);
-        kprint_num(load32(trb + 12));
+        kprint_num(load32(tk + 12));
         kprintln("", 0);
     }
     #endif
@@ -187,7 +190,7 @@ fn xhci_cmd_wait(cmd_trb_phys) {
     var wait = 0;
     while (wait < XHCI_CMD_TIMEOUT_SPINS) {
         var evt_off = xhci_evt_ring_idx * 16;
-        var evt     = xhci_evt_ring_phys + evt_off;
+        var evt     = xhci_evt_ring_kva + evt_off;
         var evt_dw3 = load32(evt + 12);
         var evt_cycle = evt_dw3 & 0x1;
 

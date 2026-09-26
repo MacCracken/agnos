@@ -392,6 +392,15 @@ else
         # the region-7 window, then re-hash the rekha chunk literals IN PLACE (the .rodata the 1.57.2
         # region-1 AP windows sat on) against the generator FNV-1a. scripts/smoke/ap-stack-smoke.sh (-smp 4).
         [ -n "$SMP_STACK_SELFTEST" ] && echo '#define SMP_STACK_SELFTEST'
+        # NVME_SELFTEST=1 — 1.57.8: force one late NVMe completion (zero poll budget) and prove the CQ does not shift,
+        # the late command's buffer is not reused, and a lost completion disables the controller. DESTRUCTIVE (writes
+        # LBAs at nsze/2) and leaves NVMe OFF: QEMU scratch disks only. scripts/smoke/nvme-late-smoke.sh.
+        [ -n "$NVME_SELFTEST" ] && echo '#define NVME_SELFTEST'
+        # DMA_SHADOW_SELFTEST=1 — 1.57.8: under a hand-built CR3 whose PD[2..127] (the whole pmm identity window) all
+        # map ONE 0xA5 region — what a ring-3 PT_LOAD over that window does — every block backend (virtio-blk, NVMe incl.
+        # its PRP list, AHCI) must transfer byte-exact and an HDA verb must round-trip. DESTRUCTIVE (virtio/AHCI sectors
+        # 64..95, NVMe nsze/2..): QEMU scratch disks only. scripts/smoke/dma-shadow-smoke.sh.
+        [ -n "$DMA_SHADOW_SELFTEST" ] && echo '#define DMA_SHADOW_SELFTEST'
         [ -n "$BLK_WRITE_SELFTEST" ] && echo '#define BLK_WRITE_SELFTEST'
         [ -n "$GPT_WRITE_SELFTEST" ] && echo '#define GPT_WRITE_SELFTEST'
         [ -n "$AGNOVA_INSTALL_SELFTEST" ] && echo '#define AGNOVA_INSTALL_SELFTEST'
@@ -446,6 +455,12 @@ else
         [ -n "$MMAP_SELFTEST" ]  && echo '#define MMAP_SELFTEST'
         [ -n "$MSC_SHORT_INJECT" ] && echo '#define MSC_SHORT_INJECT'
         [ -n "$MSC_CDB_CANARY" ] && echo '#define MSC_CDB_CANARY'
+        # XHCI_SHADOW_SELFTEST=1 — 1.57.8: the xHCI command / EP0 / MSC bulk / HID paths under a CR3 whose whole pool
+        # window is shadowed by junk (msc.cyr xhci_shadow_selftest; scripts/smoke/xhci-shadow-smoke.sh). Test-only.
+        [ -n "$XHCI_SHADOW_SELFTEST" ] && echo '#define XHCI_SHADOW_SELFTEST'
+        # HID_MOUSE_DEFER_SELFTEST=1 — 1.57.8: mouse reports completing while the drain is held (IF=0 + hid_poll_lock)
+        # must all fold in ONE drain (hid.cyr hid_mouse_defer_selftest; scripts/smoke/hid-mouse-deferred-smoke.sh).
+        [ -n "$HID_MOUSE_DEFER_SELFTEST" ] && echo '#define HID_MOUSE_DEFER_SELFTEST'
         [ -n "$MMAP_HIMEM_SELFTEST" ] && echo '#define MMAP_HIMEM_SELFTEST'
         [ -n "$MMAP_HIMEM_E2E_SELFTEST" ] && echo '#define MMAP_HIMEM_E2E_SELFTEST'
         [ -n "$MMAP_HIMUNMAP_SELFTEST" ] && echo '#define MMAP_HIMUNMAP_SELFTEST'

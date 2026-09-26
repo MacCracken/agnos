@@ -20,6 +20,175 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.8] — 2026-09-25 — pipe and channel reads block, driver DMA structures move to the direct map, and a late completion can no longer shift a queue
+
+The five 2026-09-25 issues. The work ran in six steps: PIPE (with its end-review fix, ENDFIX), NVME, DMA1, XHCI,
+MOUSE and KVMCON. Five issue files are closed. No syscall number was minted. **Built, gated, NOT burned.**
+
+### Breaking (migration inline)
+
+- **`read`#5 on a pipe or a channel now BLOCKS when `a4 == 0`** (PIPE). This applies to a pipe read end whose ring
+  is empty while a writer is live, and to an owned channel endpoint whose inbox is empty while its peer is live. The
+  caller alone blocks (`#99` state 6) until data arrives (bytes are returned) or EOF (**`0`**). EOF comes from the
+  last writer's close or death, or from the peer's `CH_CLOSE` or death. **`a4 != 0` is O_NONBLOCK and still returns
+  `−2`.** `len == 0` never waits, and a context that cannot block keeps `−2`. A SIGKILL ends a blocked reader: the
+  read never returns and the wait status is 265. A STOP parks the reader inside the wait, and it re-arms on
+  continue. Through 1.57.7 both forms answered `−2`, whatever a4 said.
+  ⚠ The kernel reads a4 from `r10` unconditionally, so a 3-argument `syscall(5, fd, buf, len)` passes whatever
+  `r10` holds. A non-zero value gets `−2`, as before; zero blocks. *Migration:* pass a4 explicitly. A loop that
+  already retries on `−2` works either way. A caller that polls with a4 = 0 **hangs** if it also holds the pipe's
+  writer or multiplexes several fds; pass a4 = 1 there. `tests/spawn/spawnx.cyr`'s crosstalk phase was such a caller
+  and now passes 1. A timed pipe poll (lifex, spinner) now waits for data instead of timing out when the writer
+  fails. Two stale comments sit in read-only sibling repos. agnoshi `agnsh.cyr:141-163` says "the kernel NEVER blocks
+  on a channel": its a4 = 0 read of a PTY channel now blocks, which is what it wanted. cyrius `sys_read` should pass
+  a4 = 0 explicitly; that request is filed with cyrius.
+- **`pipe`#25**: an empty ring returns `−2` only to an O_NONBLOCK read (a4 != 0). **`chan_op`#97 `CH_RECV` is
+  unchanged and stays non-blocking**, because its a4 is the capacity and it is the batch op. The blocking receive is
+  `read`#5 with a4 = 0 on the endpoint fd. ABI rows 5, 14, 25, 44 and 97 are updated.
+
+### Changed
+
+- **`sched_yield`#44: a park kicks a parked yielder** (PIPE, scoped by ENDFIX). Before it halts, a `#44` park
+  publishes `cpu_kickable = 2`. If nothing is READY, it then sends one `0xE1` kick IPI to the first other online CPU
+  whose `cpu_kickable == 2`. A `#14` park, in-kernel `ksyscall(14)` and the idle step publish 1: they neither send
+  the kick nor receive it.
+  `bench-ring3` `yield_peer` (KVM) at `-smp 4`: **9,912,481 → 113,323 ns** per round (a mutation that drops the kick
+  measures 9,750,662). At `-smp 1`: 10,975 → 11,496 ns. `yield_idle` is unchanged at 9.93–9.98 ms.
+  Two `#14` pausers on two CPUs, and a `#44` yielder beside a `#14` pauser, each still sleep **10.0 ms** per call
+  (`ipc-wait` phases pause-pair and mixed-pair).
+  **Price:** any two `#44` yield loops on two CPUs keep each other awake at IPI rate (~100 µs per round) for as long
+  as both of them yield. The kernel cannot tell whom a yielder waits for. This is documented in ABI row 44 and
+  `blocking-waits.md`, and is filed for an operator ruling (below).
+- **Pipe and channel wait mechanics** (PIPE). `rd5_wait` is the canonical C9 wq loop on the new keys `WK_PIPE | buffer`
+  and `WK_CHAN | endpoint`. A 100 ms backstop re-checks the condition, so a path that has no wake costs latency and
+  never hangs. Each waker stores its condition before it wakes: `pipe_write`, every pipe-end close
+  (`vfs_close_inner`), a writer's death (`proc_death_finish`, a class wake through the new
+  `wq_wake_m(WK_PIPE, 0xFF00000000000000)`; `wq_wake(key)` is msk −1), `chan_queue` (`CH_SEND` and `write`#1),
+  `CH_CLOSE` and `chan_release_pid`.
+  Ping-pong rounds at `-smp 4`: pipe 65 µs, channel 53 µs. `bench-ring3` `pipe_wr_rd8` pays the writer's wake:
+  6,852 → 7,095 ns at `-smp 1` and 15,449 → 16,393 ns at `-smp 4`. Pipe WRITES still do not block.
+- **`net_dma_kva` is renamed `dma_kva` tree-wide** (MERGE), with 110 references and no alias. It still lives in
+  `virtio_net.cyr`.
+- **`lifecycle-smoke` runs `-smp 4` under KVM by default again** (KVMCON); `LIFE_KVM=0` forces TCG. KVM takes 287 s
+  and TCG 148 s: the time is bound by the fb console's full-surface blit (a roadmap row).
+- `hid_reclaim_selftest` (`HID_RECLAIM_SELFTEST`) now runs after `cr3_load(0x1000)`, because its rings go through the
+  direct map. It therefore compiles out of a `BOOTCR3_KEEP_GNOBOOT_CR3` build.
+- `wq_interrupt`, whose only caller is `test_wq`, is fenced under `#ifdef TEST` (ENDFIX).
+
+### Fixed
+
+- **KVM with virtio-net drew each console line in ~1.45 s** (KVMCON): PD[0] (phys 0–2 MB: the boot page tables and
+  the kernel's first MB, fb console included) was mapped UC. The cause was virtio-net's `VIRTIO_PCI_CAP_PCI_CFG` cap,
+  which names BAR0 (the legacy I/O BAR) with offset = length = 0. `pci_bar_64` returned its port base `0x6060`, and
+  `vmm_remap_uc_2mb(0x6060)` rewrote PD[0] to `0x9B`. TCG ignores memory types, which is why only KVM showed it.
+  **`pci_bar_64` is now MMIO-only** (an I/O BAR records 0). **`vmm_remap_uc_2mb` refuses phys < 4 MB** and prints
+  `vmm: UC remap of the kernel low 4 MB refused`, a line that is now in `SMOKE_INVARIANT_DENY`.
+  `kybernet: exec` under KVM with the NIC: **80.40 s → 10.83–10.95 s** at `-smp 1` and 80.44 s → 10.79–10.91 s at
+  `-smp 4`. A console line takes ~1.45 s before and ~0.19 s after, the same as KVM without the NIC.
+- **`chan_region_reserve` zeroed its band through the direct map while still on gnoboot's CR3** (KVMCON). The zeroing
+  never landed, or on a box with more than 8 GB it landed in foreign RAM, and under KVM it cost ~2 s of
+  unassigned-MMIO exits. It now runs after `cr3_load(0x1000)`, the `kfont_init` rule. The window from
+  `PMM:2mb_top_region` to the kernel CR3 went from 2,040 ms to 9–10 ms.
+- **An NVMe I/O poll timeout left the CQ one entry behind for the rest of the boot** (NVME).
+  `nvme_io_poll_n` now runs on a wall-time budget from `klog_uptime_us`: **5 s per transfer, 30 s per FLUSH**, with a
+  spin backstop of budget × 64 when the TSC reads 0. The budget is checked before the CQ. The poll consumes every CQE
+  and matches it by CID. Any other CID is logged as a stray and discarded, so a stale status is never returned. A
+  timeout records its CID as late.
+  `nvme_io_settle()` reaps the late CID before a DMA buffer is reused, at five points: the top of
+  `nvme_rw_internal`, flush, both bounce copies, and the failure path of both caller-buffer paths. If the completion
+  never arrives, settle disables the controller (`CC.EN = 0`, `nvme_io_ready = 0`), so no buffer goes back to a live
+  device. `nvme_admin_poll` (init only) is unchanged.
+- **virtio-blk forgot a request whose poll outlived 2M iterations** (found by DMA1; the same class as the NVMe
+  defect). Under TCG, 2M iterations is ~20 ms, and a FLUSH (a host fsync) outlived that in 3 of 4 `-smp 1` runs. The
+  late completion was then consumed by the next request. `vblk_wait` now runs on a wall-time budget (5 s per
+  transfer, 30 s per flush) and marks a timed-out request late. `vblk_settle` reaps the late request before the next
+  request or flush, and before the `vblk_dma_buf` copy in `vblk_blk_write`. A request that never completes resets the
+  device and takes virtio-blk offline.
+- **Driver DMA structures were reached through identity VAs of pmm pages** (DMA1, XHCI). A ring-3 PT_LOAD can shadow
+  those VAs under its own CR3. Every CPU load or store now goes through `dma_kva` (the direct map), and the physical
+  value stays only in descriptors, TRBs, contexts and device registers. The structures converted, per driver:
+  - virtio-blk: desc, avail, used.
+  - NVMe: ASQ, ACQ, IDENTIFY, IOSQ, IOCQ, scratch and PRP list (`*_kva` twins); `nvme_zero_page` takes a phys.
+  - AHCI: command list (`ahci_port_cl_kva[]`), per-command CT and IDENTIFY, demo buffers.
+  - HDA: CORB and RIRB (`hda_corb_kva[]`, `hda_rirb_kva[]`). The BDL and the PCM ring were already direct-map.
+  - xHCI: DCBAA, command ring, event ring and descriptor buffer (`*_kva` twins), the slot-table bases, input and
+    device contexts, the EP0 ring and `xhci_port_proto`. `xhci_zero_page` and `xhci_dma_check` take a phys; all 46
+    callers pass one.
+  - HID: rings and report slots.
+  - MSC: bulk rings, CBW/CSW, SCSI reply page and the canary buffer. `msc_ensure_table` had passed a kva to
+    `xhci_zero_page`; it now passes a phys.
+
+  TRB addresses that are matched against events stay physical. A grep for load/store of a `*_phys` address in the
+  converted drivers is empty.
+- **HID mouse: every interrupt TRB DMA'd into one report buffer** (MOUSE). Coalesced reports lost the first report's
+  motion and button edge and counted the last report's deltas once per event. Mouse rows now get per-TRB 16-byte
+  slots, as the keyboard has had since 1.57.7. The arm goes through `hid_slot_buf` (`buf + idx*16` when mps ≤ 16;
+  otherwise the page start). The drain goes through `hid_row_evt_buf`: the event's TRB pointer selects the slot,
+  which is read through the direct map. The keyboard uses the same helpers: `hid_kbd_slot_buf` wraps `hid_slot_buf`,
+  and `hid_kbd_evt_buf` is removed.
+- **A cross-CPU poll+`#44` round cost one timer tick** (PIPE), a regression from 1.57.7 S3d. Blocking reads and the
+  directed kick above fix it.
+- **ENDFIX (PIPE-R1):** the kick as first written also fired from, and targeted, `#14` pauses. Two unrelated pausers
+  on two CPUs then ran at 118–210 µs per pause, and cyrius `_agnos_sock_recv_block`'s 6000-pause backstop (sized for
+  ~10 ms pauses) expired in under a second. The kick is now `#44`-only on both ends.
+
+### Added — gates, flags, harness
+
+- Build flags (all off; flag builds only): **`NVME_SELFTEST`**, a forced late completion with arms stamp, shift,
+  reuse and lost. **`DMA_SHADOW_SELFTEST`**: under a CR3 whose PD[2..127] all map one 2 MB region of `0xA5` at IF=0,
+  virtio-blk, NVMe (including the 24-sector PRP-list path), AHCI and HDA verbs must be byte-exact.
+  **`XHCI_SHADOW_SELFTEST`**: the same for a No-Op command, EP0 GET_DESCRIPTOR(18), an MSC READ(10) of LBA 0 and a
+  HID arm + fold. **`HID_MOUSE_DEFER_SELFTEST`**: four QEMU mouse reports complete while IF=0 and `hid_poll_lock`
+  hold the drain, and then one drain must see dx 5, dy 7, the press and the release.
+- Sweep rows: `grep -c '^run_gate "' scripts/sweep.sh` = **57** (51 at 1.57.7). The new rows are `ipc-wait-smoke`
+  (tests/ipcw), `nvme-late-smoke` (the disk throttled to 100 IOPS so that the late DMA really is late),
+  `dma-shadow-smoke` (with a static grep half), `xhci-shadow-smoke`, `hid-mouse-deferred-smoke` (an HMP injector)
+  and `kvm-net-boot-smoke` (`kybernet: exec` ≤ 20 s under KVM with virtio-net; pre-console window ≤ 500 ms). All six
+  boot `-smp 1` and `-smp 4`, and are gated.
+- Every new gate was shown RED against the unfixed code. Writer wake, sender wake and death wake dropped: pipe-pp
+  210 ms, chan-pp 108 ms, eof-death 110 ms. Kick dropped: 9.75 ms. Old NVMe poll: shift FAIL, 960 bad words. Bounce
+  settle dropped: reuse FAIL. Reverted allocation sites: virtio, NVMe, NVMe PRP and HDA FAIL; AHCI CT FAIL. xHCI cmd
+  ring, MSC bulk ring, HID report and EP0 ring: each FAIL. Mouse shared buffer: dx 0 dy 0. Old `pci_bar_64`: the deny
+  line fires, and 78.4 s without the guard. Old `chan_region_reserve` slot: 2,065 ms. ⚠ The AHCI command-list
+  conversion alone is not discriminated under QEMU, because slot 0's header is nearly constant.
+- New docs: `docs/architecture/dma-cpu-pointers.md` and `nvme-io-completion.md` (NVMe, then virtio-blk).
+
+### Closeout
+
+- `build/agnos` **2,503,272 B**: +5,360 B over 1.57.7's closeout figure of 2,497,912 B. That is +5,072 B over the
+  1.57.8 starting tree of 2,498,200 B; the 288 B difference is 1.57.7's late S6 doom fix.
+  The size gates weigh `size − face` = **2,092,452 B** against the 2 MiB grant, leaving **4,700 B** of headroom
+  (10,060 at 1.57.7). LOAD end **`0x373108`**, 118,520 B under gate 34's `0x390000`.
+  The `DMA_SHADOW_SELFTEST` flag build is 2,546,568 B with LOAD end `0x37da28` (measured at the DMA1 step, before the
+  merge).
+- **Gates on the final tree:** `check.sh` 34/35 (sole FAIL = the by-design `syscall ABI` gate: `#106 sock_peer`/`#107 spawn_limits` absent from cyrius), `test.sh` (x86) 4/4, `ktest` 367/370 (the 3 known `[initrd]` checks), `agnsh-smoke` PASS at `-smp 1` and `-smp 4`, `sweep.sh` 56/57 (sole FAIL = row 1 baseline check.sh, the same ABI gate; firmware VOIDs absorbed by retry), plain x86_64 build 2503272 B with LOAD end 0x373108 <= 0x390000, aarch64 still the known RED (32 undefined fns / 17 undefined vars, zero new names).
+- **ABI gate red BY DESIGN, unchanged:** `#106`/`#107` are absent from cyrius, and 1.57.8 mints no number. The
+  contract changes are filed with cyrius as
+  `docs/development/issues/2026-09-25-agnos-read-blocks-on-pipes-and-channels-and-the-44-kick.md` (there).
+- aarch64: the PIPE and KVMCON steps found no new undefined name. The drivers are x86-only includes.
+- **Issues:** five closed and archived: cross-cpu-poll-and-yield, dma-cpu-pointers, nvme-poll-timeout, hid-mouse,
+  kvm-virtio-net-console. Filed, found and not fixed:
+  - `2026-09-25-pipe-writes-do-not-block`
+  - `2026-09-25-any-two-sched-yield-loops-kick-each-other` (operator ruling)
+  - `2026-09-25-ahci-timeout-abandons-an-in-flight-command` (with `nvme_admin_poll`)
+  - `2026-09-25-msc-puts-the-caller-buffer-in-a-data-trb`
+  - `2026-09-25-cpu-only-pmm-buffers-still-use-identity-vas` (fb_shadow, ramdisk, iommu)
+  - `2026-09-25-three-smokes-score-void-as-fail-or-skip-smp4`
+- **Built, gated, NOT burned.** These iron-only risk classes are ones QEMU cannot show:
+  - The xHCI, HID and MSC rings, contexts and report slots through the direct map on the Cezanne xHC. The live
+    keyboard at `[ASSIST] >` is the first proof, and the mouse per-TRB slots are the carried "mouse one-shot deferred
+    flush" burn item.
+  - The NVMe wall-time budget, CID matching, settle and `CC.EN = 0` on a real controller. No late completion has been
+    seen on iron.
+  - The AHCI command list, CT and IDENTIFY through the direct map. The command list is not discriminated under QEMU.
+  - The HDA CORB/RIRB verbs on the Cezanne HDA.
+  - The `#44` directed kick (`0xE1`) on a Zen LAPIC.
+  - The MMIO-only `pci_bar_64` and the low-4 MB UC-remap refusal across the iron PCI set.
+  - `chan_region_reserve` at its new slot.
+
+  virtio-blk does not exist on iron. The Path 2 burn owed since 1.57.6 is still owed, and an iron burn is the
+  operator's call.
+
 ## [1.57.7] — 2026-09-25 — the blocking model: every wait blocks only its caller, a parent can end, stop and cap its child, and sockets have owners
 
 The rest of the 1.57.x plan — steps S3c, S3d, S3b, S1b, S4, S5, S6, S7, S8 — plus the MSC repair, the IMG

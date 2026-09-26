@@ -856,6 +856,9 @@ fn proc_death_finish(pid, sig, via) {
         proc_reap_orphan(pid);
         lifecycle_trace(LT_ORPHAN, pid, 0, 0);
     }
+    # 1.57.8: its write ends stopped counting (pipe_writers_open skips state 0; an orphan's table is gone) — every
+    # blocked pipe reader re-checks for EOF. A CLASS wake: the table that named the pipes may already be freed.
+    wq_wake_m(WK_PIPE, 0xFF00000000000000);
     return 0;
 }
 # An orphan's reap: its fd table and address space are freed, then the slot is published dead AND reaped in one
@@ -6077,6 +6080,7 @@ fn chan_queue(se, ubuf, slen): i64 {
     while (si < slen) { store8(slot + si, load8(ubuf + si)); si = si + 1; }
     store8(&chan_lens + (pe * CHAN_SLOTS + (wv % CHAN_SLOTS)), slen);
     store64(&chan_w + pe * 8, wv + 1);
+    wq_wake(WK_CHAN | pe);              # 1.57.8: after the chan_w store — a blocked read#5 on pe re-checks
     return slen;
 }
 
@@ -6135,6 +6139,7 @@ fn chan_release_pid(pid) {
                     store64(&chan_end_owner + e * 8, 0);
                     store64(&chan_end_oepoch + e * 8, 0);
                     store64(&chan_end_pty + e * 8, 0);
+                    wq_wake(WK_CHAN | (e ^ 1));  # 1.57.8: the peer's blocked read sees PEER GONE (EOF)
                 }
             }
         }
@@ -9166,6 +9171,65 @@ fn sys_waitpid_block(t) {
 # wq_arm could not take sched_exit_tail itself because flock_lock was held (preempt_count 1). Once the lock is
 # dropped the caller must LEAVE (wq_exit_if_retired), never return -1: that return SYSRETs a dead process to
 # ring 3, where it keeps running (and can make syscalls) until its next tick while a reaper spins in its fence.
+# ═══════════════ 1.57.8 — THE BLOCKING PIPE / CHANNEL READ (docs/architecture/blocking-waits.md "pipe and channel reads") ═══════════════
+# rd5_once: read#5's non-keyboard body. A channel fd -> chan_deliver (WOULDBLOCK -> -2; PEER GONE == EOF -> 0, which is
+# what makes `while (read(fd) > 0)` terminate); anything else -> vfs_read (a pipe: -2 while empty with a live writer).
+fn rd5_once(fd, buf, n) {
+    var rep = chan_fd_endpoint(fd);
+    if (rep >= 0) {
+        var cr = chan_deliver(rep, buf, n);
+        if (cr >= 0) { return cr; }
+        if (cr == 0 - CH_E_WOULDBLOCK) { return 0 - 2; }
+        if (cr == 0 - CH_E_PEERGONE) { return 0; }
+        return 0 - 1;
+    }
+    return vfs_read(fd, buf, n);
+}
+# The key a read on `fd` would sleep on, or 0 = it would not block NOW (data, EOF, an error, not a pipe read end or a
+# channel). Side-effect free: it is also the C9 re-check after the arm.
+fn rd5_key(fd) {
+    var ke = chan_fd_endpoint(fd);
+    if (ke >= 0) {
+        if (load64(&chan_w + ke * 8) != load64(&chan_r + ke * 8)) { return 0; }
+        if (chan_peer_alive(ke) == 0) { return 0; }
+        return WK_CHAN | ke;
+    }
+    if (fd < 0) { return 0; }
+    if (fd >= 32) { return 0; }
+    var kb = vfs_fd_table() + fd * 32;
+    if (ktag(kb) != VFS_PIPE) { return 0; }
+    if (kpayload(kb, 1) != 0) { return 0; }
+    var kp = kpayload(kb, 2);
+    if (kp == 0) { return 0; }
+    if (load64(kp) != load64(kp + 8)) { return 0; }
+    if (pipe_writers_open(kp) == 0) { return 0; }
+    return pipe_key(kp);
+}
+# The canonical C9 wait. Wakers store their condition first: pipe_write (the head), vfs_close_inner (a pipe end),
+# proc_death_finish (the WK_PIPE class, after the writer's state 0 / table teardown), chan_queue (chan_w), CH_CLOSE and
+# chan_release_pid (chan_end_open of the peer). A 100 ms backstop deadline re-checks anyway (a writer dropped by a path
+# with no wake costs latency, never a hang). ABORT (S7 boundary D: a SIGKILL's WR_SIGNAL, or a kill pending at the arm)
+# -> -1, which never reaches ring 3 (B1 ends the process); a STOP parks inside wq_signal_point and the loop re-arms.
+fn rd5_wait(fd, buf, n) {
+    if (wq_can_block() == 0) { return 0 - 2; }
+    while (1 == 1) {
+        var wk = rd5_key(fd);
+        if (wk != 0) {
+            var wa = wq_arm(wk, wq_deadline_after_us(100000));
+            if (wa == 2) { return 0 - 2; }
+            if (wa == 1) {
+                if (wq_signal_point() == 1) { return 0 - 1; }
+            } else {
+                if (rd5_key(fd) != wk) { wq_cancel(); }                     # the RE-CHECK after the arm
+                else { if (wq_sleep() == WR_SIGNAL) { if (wq_signal_point() == 1) { return 0 - 1; } } }
+            }
+        }
+        var wr = rd5_once(fd, buf, n);
+        if (wr != 0 - 2) { return wr; }
+    }
+    return 0 - 1;
+}
+
 fn flock_wait(fw_ino, fw_me, fw_op, fw_blk) {
     while (1) {
         flock_spin_lock();
@@ -9422,27 +9486,15 @@ fn ksyscall(num, arg1, arg2, arg3) {
                 return kbd_read_blocking(arg2, arg3);
             }
         }
-        # ⭐ ipc BITE 9 — an ordinary read(2) reaches a CHANNEL fd.
-        # ⛔ WOULD_BLOCK IS RETURNED, NOT WAITED ON — still the design, for a narrower reason than it was written with.
-        # planning/ipc.md §9.4 said "No blocking in v1, and the reason is the STACK" — one shared SYSCALL kernel stack
-        # per CPU. That reason is GONE: every process has its own kernel stack since 1.57.6 and a real BLOCKED state since
-        # 1.57.7 (the keyboard, sleep_ms, flock, waitpid, snd reads block only their caller now). A blocking channel read
-        # additionally needs its producer's wake (chan_* would wq_wake the reader's key on every deliver) and a PTY-shaped
-        # consumer survey — a design item of its own, not in 1.57.7. The `preempt_disable; sti; hlt` spin stays refused:
-        # a channel's producer is a PEER PROCESS, so holding the CPU starves the very thing the read is waiting for.
-        # Retry belongs in userland, preemptibly. -2 is the kernel's established WOULD_BLOCK value,
-        # the same one the a4 non-blocking cooked-line read returns.
-        var rep = chan_fd_endpoint(arg1);
-        if (rep >= 0) {
-            var cr = chan_deliver(rep, arg2, arg3);
-            if (cr >= 0) { return cr; }
-            if (cr == 0 - CH_E_WOULDBLOCK) { return 0 - 2; }
-            # PEER GONE == EOF. A pty whose child exited reads 0, and so does this — it is what makes
-            # `while (read(fd) > 0)` terminate instead of spinning on an error it cannot interpret.
-            if (cr == 0 - CH_E_PEERGONE) { return 0; }
-            return 0 - 1;
-        }
-        return vfs_read(arg1, arg2, arg3);
+        # ⭐ ipc BITE 9 — an ordinary read(2) reaches a CHANNEL fd (rd5_once). ⭐ 1.57.8: a pipe or channel read that
+        # would answer -2 (WOULD_BLOCK) BLOCKS its caller when a4 == 0 (rd5_wait — a real wq wait, woken by the writer /
+        # sender and by the last writer's close / the peer's close or death); a4 != 0 is O_NONBLOCK and keeps -2, as
+        # does a context that cannot block. (The `preempt_disable; sti; hlt` spin stays refused: the producer is a PEER
+        # PROCESS, so holding the CPU would starve it.) Until 1.57.8 both answered -2 whatever a4 said, and a
+        # cross-CPU poll+#44 consumer paid one timer tick per round.
+        var r5 = rd5_once(arg1, arg2, arg3);
+        if (r5 == 0 - 2) { if (arg3 > 0) { if (ksyscall_a4_get() == 0) { r5 = rd5_wait(arg1, arg2, arg3); } } }
+        return r5;
     }
     if (num == 6) { return vfs_close(arg1); }   # close(fd) -> 0 / -1
     if (num == 7) {
@@ -9577,7 +9629,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # any CPU). When its scan finds a READY process it returns 0 WITHOUT halting — its contract is that the
         # caller's trailing yield takes that work — so the yield below hands the CPU over at once.
         if (wq_can_block() == 1) {
-            if (sched_halt_window() == 0) { sched_yield_kernel(); }
+            if (sched_halt_window(1) == 0) { sched_yield_kernel(); }
             return 0;
         }
         # The legacy preempt-held sti window (sleep_ms#41's pre-1.57.7 body) for a context that may not block:
@@ -10162,6 +10214,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
             store64(&chan_end_pty + ce * 8, 0);
             store64(&chan_end_owner + ce * 8, 0);
             store64(&chan_end_oepoch + ce * 8, 0);
+            wq_wake(WK_CHAN | (ce ^ 1));         # 1.57.8: the peer's blocked read sees PEER GONE (EOF)
             vfs_close(arg2);
             stack_canary_check(canary);
             return 0;

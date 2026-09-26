@@ -31,10 +31,11 @@ var pci_class[1024];    # 128 entries x 8 bytes; packed (class<<16 | subclass<<8
 # Layout: idx*48 + slot*8 where slot ∈ {0..5}. For a 64-bit memory BAR
 # at slot N, slot N is the full resolved phys (lo & 0xFFFFFFF0 | hi<<32)
 # and slot N+1 is stored as 0 (consumed — N+1 holds the high half of
-# BAR(N), not an independent BAR). 32-bit memory BARs and I/O BARs
-# store their low value masked of the 4 flag bits. Unimplemented BARs
-# store 0. Consumers should call pci_bar_64(idx, bir) which understands
-# this layout; pci_bar0_64(idx) is the legacy shortcut for slot 0.
+# BAR(N), not an independent BAR). 32-bit memory BARs store their
+# low value masked of the 4 flag bits. I/O BARs and unimplemented BARs
+# store 0 (1.57.8 — see pci_bar_64: this table holds MMIO addresses only).
+# Consumers should call pci_bar_64(idx, bir) which understands this
+# layout; pci_bar0_64(idx) is the legacy shortcut for slot 0.
 var pci_bar_phys[6144]; # 128 entries x 6 BARs x 8 bytes
 # v1.30.1: full PCIe-addressing — packed (bus<<8 | func) per entry.
 # Legacy consumers (virtio_net/blk, iommu, lspci) assume bus=0/func=0
@@ -441,8 +442,8 @@ fn pci_record(bus, slot, func) {
                     s = s + 1;
                 }
             } else {
-                # I/O BAR — bits 1:0 are flag, mask them off.
-                store64(&pci_bar_phys + pci_count * 48 + s * 8, lo & 0xFFFFFFFC);
+                # I/O BAR — recorded as 0 ("no MMIO here"): pci_bar_64 is an MMIO-only contract (below).
+                store64(&pci_bar_phys + pci_count * 48 + s * 8, 0);
                 s = s + 1;
             }
         }
@@ -527,6 +528,11 @@ fn pci_device(idx) { return PciDev_device(&pci_devs + idx * 32); }
 # high half is zero so the return is bit-equivalent to the masked low half;
 # for slots consumed as the high half of a preceding 64-bit BAR, returns 0
 # (caller error — BIR pointing at a consumed slot is a malformed cap).
+# ⛔ 1.57.8 — MMIO ONLY: an I/O BAR answers 0, exactly like an unimplemented one. Every caller hands the result to
+# vmm_remap_uc_2mb / load / store as a PHYSICAL ADDRESS; an I/O BAR used to answer its port base (virtio-net's legacy
+# BAR0 = 0x6060), and the virtio cap walks — whose PCI_CFG cap (cfg_type 5) names BAR0 with offset = length = 0 —
+# UC-remapped phys 0-2 MB: the kernel's first megabyte of code (the fb console among it) then ran UNCACHED. TCG
+# ignores memory types, so only KVM showed it: every console line took ~1.45 s (issue 2026-09-25 kvm-virtio-net).
 fn pci_bar_64(idx, bir) {
     if (bir < 0 || bir > 5) { return 0; }
     return load64(&pci_bar_phys + idx * 48 + bir * 8);

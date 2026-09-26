@@ -111,7 +111,7 @@ fn msc_ensure_table() {
     # ⚠ The `vmm_map(p, p, 0x83)` that stood here went with it: it wrote the BOOT PD at 0x3000 only,
     # so it never reached a per-process CR3, and pt_init already identity-maps the whole <=256 MB
     # window pmm_alloc draws from — it was a no-op that implied identity addressing.
-    xhci_zero_page(pmm_kva_for_access(p));
+    xhci_zero_page(p);                   # 1.57.8: xhci_zero_page takes PHYS and zeroes through the direct map
     msc_table_phys = p;
     return 1;
 }
@@ -145,22 +145,22 @@ fn xhci_find_msc_bbb_endpoints(total_length,
     var found_in    = 0;
     var found_out   = 0;
     while (off < total_length) {
-        var b_length = load8(xhci_desc_buf_phys + off);
+        var b_length = load8(xhci_desc_buf_kva + off);
         if (b_length == 0) { return 0; }   # malformed — guard infinite loop
-        var b_type = load8(xhci_desc_buf_phys + off + 1);
+        var b_type = load8(xhci_desc_buf_kva + off + 1);
         if (b_type == 4) {
             # Interface Descriptor:
             #   [2] bInterfaceNumber, [3] bAlternateSetting,
             #   [4] bNumEndpoints,    [5] bInterfaceClass,
             #   [6] bInterfaceSubClass, [7] bInterfaceProtocol
-            var i_class = load8(xhci_desc_buf_phys + off + 5);
-            var i_sub   = load8(xhci_desc_buf_phys + off + 6);
-            var i_proto = load8(xhci_desc_buf_phys + off + 7);
+            var i_class = load8(xhci_desc_buf_kva + off + 5);
+            var i_sub   = load8(xhci_desc_buf_kva + off + 6);
+            var i_proto = load8(xhci_desc_buf_kva + off + 7);
             if (i_class == 0x08) {
                 if (i_sub == 0x06) {
                     if (i_proto == 0x50) {
                         in_msc_intf = 1;
-                        store8(out_intf_p, load8(xhci_desc_buf_phys + off + 2));
+                        store8(out_intf_p, load8(xhci_desc_buf_kva + off + 2));
                         # Reset endpoint accumulators when entering the
                         # interface — alternate settings of an earlier MSC
                         # interface should not poison the bulk-EP capture.
@@ -177,9 +177,9 @@ fn xhci_find_msc_bbb_endpoints(total_length,
                 #   [4..5] wMaxPacketSize
                 #   [6] bInterval — meaningless for bulk; ignored
                 if (in_msc_intf != 0) {
-                    var ep_addr = load8(xhci_desc_buf_phys + off + 2);
-                    var attrs   = load8(xhci_desc_buf_phys + off + 3);
-                    var mps     = load16(xhci_desc_buf_phys + off + 4);
+                    var ep_addr = load8(xhci_desc_buf_kva + off + 2);
+                    var attrs   = load8(xhci_desc_buf_kva + off + 3);
+                    var mps     = load16(xhci_desc_buf_kva + off + 4);
                     if ((attrs & 0x03) == 0x02) {
                         # Bulk endpoint — classify direction
                         if ((ep_addr & 0x80) != 0) {
@@ -229,7 +229,7 @@ fn msc_get_max_lun(slot_id, interface) {
         xhci_desc_buf_phys) == 0) {
         return 0;   # STALL or other failure — single-LUN per spec
     }
-    return load8(xhci_desc_buf_phys) & 0x0F;
+    return load8(xhci_desc_buf_kva) & 0x0F;
 }
 
 
@@ -256,7 +256,7 @@ fn msc_probe_slot(slot_id) {
     # Step 1: read 9-byte config descriptor header to learn wTotalLength.
     xhci_zero_page(xhci_desc_buf_phys);
     if (xhci_get_config_descriptor(slot_id, 0, 9) == 0) { return 0; }
-    var total_len = load16(xhci_desc_buf_phys + 2);
+    var total_len = load16(xhci_desc_buf_kva + 2);
     if (total_len < 23) { return 0; }   # need at least intf(9) + 2*ep(7)
     if (total_len > 4096) { total_len = 4096; }  # clamp to scratch page
 
@@ -290,7 +290,7 @@ fn msc_probe_slot(slot_id) {
     # = 1 at config descriptor byte 5. Re-fetching the config (Step 2 zero-
     # paged the buffer) is wasteful; trust that byte 5 was preserved
     # across the walker — it walks but never writes the input buffer.
-    var config_value = load8(xhci_desc_buf_phys + 5);
+    var config_value = load8(xhci_desc_buf_kva + 5);
     if (xhci_control_no_data(slot_id, 0x00, 0x09, config_value, 0) == 0) {
         return 0;
     }
@@ -500,7 +500,7 @@ fn msc_alloc_bulk_ring() {
     # Toggle Cycle = 1 (TC bit, dword 3 bit 1). Phase 2's tiny transfers
     # never wrap to use this, but having it in place future-proofs the
     # ring.
-    var link = ring + (MSC_TRB_RING_TRBS - 1) * 16;
+    var link = dma_kva(ring) + (MSC_TRB_RING_TRBS - 1) * 16;   # 1.57.8: CPU pointer via the direct map
     store64(link + 0, ring);
     store32(link + 8, 0);
     # ⛔⛔ 1.56.52 — NO `| 0x1`. The initial Link TRB C bit must be the OPPOSITE of the producer cycle,
@@ -563,8 +563,11 @@ fn msc_bulk_enqueue(slot_id, is_in, data_phys, length) {
     # advance through the Link. Per xHCI 1.2 §4.9.2 the Link TRB's cycle
     # bit must match the *outgoing* producer cycle so HW follows it on
     # the wrap; the producer cycle then flips for the next pass.
+    # 1.57.8: `rk` is the ring's direct-map alias for the CPU stores; the returned TRB address stays PHYS
+    # (xhci_wait_transfer_for_trb matches it against the Transfer Event's TRB pointer).
+    var rk = dma_kva(ring);
     if (idx == MSC_TRB_RING_TRBS - 1) {
-        var link = ring + (MSC_TRB_RING_TRBS - 1) * 16;
+        var link = rk + (MSC_TRB_RING_TRBS - 1) * 16;
         # Rewrite Link TRB with current producer cycle (TC=1, type=Link).
         store32(link + 12, (XHCI_TRB_LINK << 10) | 0x2 | (cycle & 0x1));
         # Flip producer cycle, wrap idx to 0.
@@ -573,11 +576,12 @@ fn msc_bulk_enqueue(slot_id, is_in, data_phys, length) {
     }
 
     var trb = ring + idx * 16;
-    store64(trb + 0, data_phys);
-    store32(trb + 8, length & 0x1FFFF);
+    var tk  = rk + idx * 16;
+    store64(tk + 0, data_phys);
+    store32(tk + 8, length & 0x1FFFF);
     var trb_ctrl = (XHCI_TRB_NORMAL << 10) | (1 << 5) | (cycle & 0x1);
     if (is_in != 0) { trb_ctrl = trb_ctrl | (1 << 2); }    # ISP for IN
-    store32(trb + 12, trb_ctrl);
+    store32(tk + 12, trb_ctrl);
 
     # Advance enqueue. Write back BOTH idx and cycle (cycle changes only
     # on wraparound but writing unconditionally keeps row state consistent
@@ -667,11 +671,12 @@ fn msc_configure_endpoints(slot_id) {
 # with zeros to the fixed 16-byte CBWCB region. cdb_phys is a kernel VA read by the CPU (load8), never DMA'd.
 #
 # Returns the host tag written to dCBWTag (echoed by device in CSW).
-fn msc_build_cbw(slot_id, lun, cdb_phys, cdb_len, data_len, dir_in) {
+fn msc_build_cbw(slot_id, lun, cdb_p, cdb_len, data_len, dir_in) {   # cdb_p: a CPU pointer (stack CDB)
     var row = msc_row_addr(slot_id);
-    var cbw = load64(row + 48);
-    if (cbw == 0) { return 0; }
-    xhci_zero_page(cbw);
+    var cbwp = load64(row + 48);
+    if (cbwp == 0) { return 0; }
+    xhci_zero_page(cbwp);
+    var cbw = dma_kva(cbwp);         # 1.57.8: build the CBW through the direct map (syscall block I/O, any CR3)
     # dCBWSignature = 0x43425355 ('USBC' LE)
     store32(cbw + 0, 0x43425355);
     var tag = load32(row + 64);
@@ -687,7 +692,7 @@ fn msc_build_cbw(slot_id, lun, cdb_phys, cdb_len, data_len, dir_in) {
     store8 (cbw + 14, cdb_n & 0x1F);     # bCBWCBLength (5-bit field)
     var i = 0;
     while (i < cdb_n) {
-        store8(cbw + 15 + i, load8(cdb_phys + i));
+        store8(cbw + 15 + i, load8(cdb_p + i));
         i = i + 1;
     }
     return tag;
@@ -792,13 +797,14 @@ fn msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in) {
     }
 
     # Step 5: validate CSW.
-    var sig = load32(csw + 0);
+    var cswk = dma_kva(csw);         # 1.57.8: read the DMAed CSW through the direct map
+    var sig = load32(cswk + 0);
     if (sig != 0x53425355) {              # 'USBS' LE
         kprintln("msc: CSW signature mismatch", 27);
         store8(row + 69, 1);
         return 0;
     }
-    var csw_tag = load32(csw + 4);
+    var csw_tag = load32(cswk + 4);
     if (csw_tag != tag) {
         kprintln("msc: CSW tag mismatch", 21);
         store8(row + 69, 1);
@@ -808,8 +814,8 @@ fn msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in) {
     # residue from a healthy device is the US_FL_IGNORE_RESIDUE quirk class, and refusing on it would
     # brick sticks that merely misreport. The xHCI count above is the controller's measurement and is
     # what the check uses. Safe to read: the >= 13 guard above already proved the CSW landed.
-    store32(row + 92, load32(csw + 8));
-    var status = load8(csw + 12);
+    store32(row + 92, load32(cswk + 8));
+    var status = load8(cswk + 12);
     if (status == 0) { return 1; }        # Pass
     if (status == 1) { return 0; }        # Command Failed (caller may retry)
     # status == 2 — Phase Error: transport wedged; needs Reset Recovery.
@@ -1045,14 +1051,14 @@ fn msc_reset_recovery(slot_id) {
     var ring_out = load64(row + 24);
     if (ring_in != 0) {
         xhci_zero_page(ring_in);
-        var link_in  = ring_in + (MSC_TRB_RING_TRBS - 1) * 16;
+        var link_in  = dma_kva(ring_in) + (MSC_TRB_RING_TRBS - 1) * 16;     # 1.57.8: direct map
         store64(link_in + 0,  ring_in);
         store32(link_in + 8,  0);
         store32(link_in + 12, (XHCI_TRB_LINK << 10) | 0x2);         # C=0 — see msc_alloc_bulk_ring
     }
     if (ring_out != 0) {
         xhci_zero_page(ring_out);
-        var link_out = ring_out + (MSC_TRB_RING_TRBS - 1) * 16;
+        var link_out = dma_kva(ring_out) + (MSC_TRB_RING_TRBS - 1) * 16;   # 1.57.8: direct map
         store64(link_out + 0,  ring_out);
         store32(link_out + 8,  0);
         store32(link_out + 12, (XHCI_TRB_LINK << 10) | 0x2);        # C=0 — see msc_alloc_bulk_ring
@@ -1168,16 +1174,17 @@ fn msc_cdb_canary_run() {
     xhci_zero_page(cr_buf);
     var cr_pat = "MSCCDB16";
     var cr_j = 0;
-    while (cr_j < 8) { store8(cr_buf + cr_j, load8(cr_pat + cr_j)); cr_j = cr_j + 1; }
+    var cr_k = dma_kva(cr_buf);      # 1.57.8: cr_buf (phys) goes in the TRB; the CPU uses the direct map
+    while (cr_j < 8) { store8(cr_k + cr_j, load8(cr_pat + cr_j)); cr_j = cr_j + 1; }
     var cr_wr = msc_write_lba(cr_s, 0, 100, 1, cr_buf);
     var cr_fl = msc_blk_flush();
     cr_j = 0;
-    while (cr_j < 8) { store8(cr_buf + cr_j, 0); cr_j = cr_j + 1; }
+    while (cr_j < 8) { store8(cr_k + cr_j, 0); cr_j = cr_j + 1; }
     var cr_rd = msc_read_lba(cr_s, 0, 100, 1, cr_buf);
     var cr_same = 1;
     cr_j = 0;
     while (cr_j < 8) {
-        if (load8(cr_buf + cr_j) != load8(cr_pat + cr_j)) { cr_same = 0; }
+        if (load8(cr_k + cr_j) != load8(cr_pat + cr_j)) { cr_same = 0; }
         cr_j = cr_j + 1;
     }
     var cr_rt = 0;
@@ -1363,6 +1370,7 @@ fn msc_inquiry(slot_id, lun) {
     var data = msc_ensure_data_buf(row);
     if (data == 0) { return 0; }
     xhci_zero_page(data);
+    var dk = dma_kva(data);          # 1.57.8: `data` (phys) goes in the TRB; the CPU reads the reply via the direct map
 
     #ifdef MSC_CDB_CANARY
     var cdb_canary = 0x5952414E41434443;   # MUST stay the local declared immediately before cdb_buf
@@ -1387,17 +1395,17 @@ fn msc_inquiry(slot_id, lun) {
     }
 
     # Cache decoded fields in the row. peripheral qual / type at byte 0.
-    var pq_pt = load8(data + 0);
+    var pq_pt = load8(dk + 0);
     store8(row + 128, (pq_pt >> 5) & 0x7);
     store8(row + 129, pq_pt & 0x1F);
     # Vendor / Product / Revision — copy raw bytes into row scratch
     # without ATA-style byte-swap (SCSI INQUIRY strings are plain ASCII).
     var i = 0;
-    while (i < 8)  { store8(row + 96  + i, load8(data + 8  + i)); i = i + 1; }
+    while (i < 8)  { store8(row + 96  + i, load8(dk + 8  + i)); i = i + 1; }
     i = 0;
-    while (i < 16) { store8(row + 104 + i, load8(data + 16 + i)); i = i + 1; }
+    while (i < 16) { store8(row + 104 + i, load8(dk + 16 + i)); i = i + 1; }
     i = 0;
-    while (i < 4)  { store8(row + 120 + i, load8(data + 32 + i)); i = i + 1; }
+    while (i < 4)  { store8(row + 120 + i, load8(dk + 32 + i)); i = i + 1; }
     store8(row + 84, 1);            # inquiry_done
 
     return 1;
@@ -1434,6 +1442,7 @@ fn msc_read_capacity(slot_id, lun) {
     var data = msc_ensure_data_buf(row);
     if (data == 0) { return 0; }
     xhci_zero_page(data);
+    var dk = dma_kva(data);          # 1.57.8: `data` (phys) goes in the TRB; the CPU reads the reply via the direct map
 
     #ifdef MSC_CDB_CANARY
     var cdb_canary = 0x5952414E41434443;   # MUST stay the local declared immediately before cdb_buf
@@ -1452,14 +1461,14 @@ fn msc_read_capacity(slot_id, lun) {
     }
 
     # Decode big-endian u32 last_lba.
-    var last_lba = (load8(data + 0) << 24)
-    | (load8(data + 1) << 16)
-    | (load8(data + 2) << 8)
-    |  load8(data + 3);
-    var blk_size = (load8(data + 4) << 24)
-    | (load8(data + 5) << 16)
-    | (load8(data + 6) << 8)
-    |  load8(data + 7);
+    var last_lba = (load8(dk + 0) << 24)
+    | (load8(dk + 1) << 16)
+    | (load8(dk + 2) << 8)
+    |  load8(dk + 3);
+    var blk_size = (load8(dk + 4) << 24)
+    | (load8(dk + 5) << 16)
+    | (load8(dk + 6) << 8)
+    |  load8(dk + 7);
     store64(row + 72, last_lba);
     store32(row + 80, blk_size);
     store8 (row + 85, 1);            # capacity_done
@@ -1507,6 +1516,7 @@ fn msc_request_sense(slot_id, lun) {
     var data = msc_ensure_data_buf(row);
     if (data == 0) { return 0; }
     xhci_zero_page(data);
+    var dk = dma_kva(data);          # 1.57.8: `data` (phys) goes in the TRB; the CPU reads the reply via the direct map
 
     #ifdef MSC_CDB_CANARY
     var cdb_canary = 0x5952414E41434443;   # MUST stay the local declared immediately before cdb_buf
@@ -1528,9 +1538,9 @@ fn msc_request_sense(slot_id, lun) {
         return 0;
     }
 
-    var key  = load8(data + 2) & 0x0F;
-    var asc  = load8(data + 12);
-    var ascq = load8(data + 13);
+    var key  = load8(dk + 2) & 0x0F;
+    var asc  = load8(dk + 12);
+    var ascq = load8(dk + 13);
 
     kprint("msc: slot ", 10);
     kprint_num(slot_id);
@@ -1933,7 +1943,7 @@ fn msc_read_demo() {
     var i = 0;
     while (i < 8) {
         kprint(" ", 1);
-        kprint_num(load8(buf + i));
+        kprint_num(load8(dma_kva(buf) + i));   # 1.57.8: direct map, never the phys
         i = i + 1;
     }
     kprintln("", 0);
@@ -1960,7 +1970,8 @@ fn msc_write_demo() {
     xhci_zero_page(wbuf);
     var sentinel = "MSC-OK!\0";
     var j = 0;
-    while (j < 8) { store8(wbuf + j, load8(sentinel + j)); j = j + 1; }
+    var wk = dma_kva(wbuf);          # 1.57.8: CPU access through the direct map; wbuf/rbuf (phys) go in TRBs
+    while (j < 8) { store8(wk + j, load8(sentinel + j)); j = j + 1; }
     if (msc_write_lba(msc_first_slot, 0, 100, 1, wbuf) == 0) {
         kprintln("msc: WRITE(10) LBA100 failed", 28);
         return 0;
@@ -1976,7 +1987,7 @@ fn msc_write_demo() {
     }
     var k = 0;
     while (k < 8) {
-        if (load8(rbuf + k) != load8(wbuf + k)) {
+        if (load8(dma_kva(rbuf) + k) != load8(wk + k)) {
             kprintln("msc: LBA100 write-then-read round-trip MISMATCH", 47);
             return 0;
         }
@@ -1984,5 +1995,131 @@ fn msc_write_demo() {
     }
     kprintln("msc: LBA100 write-then-read round-trip PASS", 43);
     return 1;
+}
+#endif
+
+#ifdef XHCI_SHADOW_SELFTEST
+# ═══════════════ 1.57.8 — THE xHCI / HID / MSC PATHS UNDER A SHADOWED CR3 (scripts/smoke/xhci-shadow-smoke.sh) ═══════════════
+# The class (issue 2026-09-25-dma-cpu-pointers-still-use-identity-vas): pmm_alloc hands out [0x400000, 0x10000000), and a
+# ring-3 PT_LOAD can map its own pages over those identity VAs under its CR3 — while hid_poll runs from the MSI-X ISR / BSP
+# tick and msc_blk_* from syscalls under exactly such a CR3. A driver that dereferences a DMA page's PHYS then reads or
+# writes the process's page instead. This builds that CR3 on purpose, as bad as a PT_LOAD can make it: a fresh address
+# space whose WHOLE pool window, PD[2..127], points at ONE 2 MB junk region (supervisor, so a stray access is silently
+# redirected rather than a SMAP #PF), filled with a pattern. Under it, with interrupts off (so nothing but these calls
+# runs, and nothing prints — the console's own buffers are identity-addressed pool pages too), it drives:
+#   1. a No-Op command through the command ring and its completion through the event ring;
+#   2. an EP0 GET_DESCRIPTOR(device, 18) into the descriptor page, compared with the same read under the kernel CR3;
+#   3. an MSC READ(10) of LBA 0 through CBW / bulk rings / CSW into the MSC data page (the smoke seeds MSCLBA0!);
+#   4. a keyboard TRB arm (hid_arm_xfer_trb) and a report fold (hid_process_report of a zeroed page);
+# then restores CR3 0x1000 and requires every result byte-exact AND the junk region untouched (a CPU store through an
+# identity VA lands there). Each check is RED on the unconverted driver (mutation-proven in the 1.57.8 XHCI step).
+fn xhci_shadow_selftest() {
+    var s = msc_first_slot;
+    if (xhci_rings_ready == 0) { s = 0; }
+    if (hid_kbd_slot_id == 0) { s = 0; }
+    if (s == 0) {
+        kprintln("xshadow: VOID - needs an xHCI keyboard and a usb-storage stick", 62);
+        return 0;
+    }
+    # --- references under the kernel CR3 -----------------------------------------------------------------
+    var xs_ref[24];                          # FUNCTION-LOCAL: 24 BYTES (the 18-byte device descriptor)
+    xhci_zero_page(xhci_desc_buf_phys);
+    var xs_r0 = xhci_get_device_descriptor(s, 18);
+    var xs_i = 0;
+    while (xs_i < 18) { store8(&xs_ref + xs_i, load8(xhci_desc_buf_kva + xs_i)); xs_i = xs_i + 1; }
+    xhci_zero_page(xhci_desc_buf_phys);
+    var xs_data = msc_ensure_data_buf(msc_row_addr(s));
+    var xs_rep = pmm_alloc();
+    var xs_junk = pmm_alloc_2mb();
+    var xs_cr3 = proc_create_address_space();
+    var xs_go = 1;
+    if (xs_r0 == 0) { xs_go = 0; }
+    if (xs_data == 0) { xs_go = 0; }
+    if (xs_rep == 0) { xs_go = 0; }
+    if (xs_junk == 0) { xs_go = 0; }
+    if (xs_cr3 == 0) { xs_go = 0; }
+    if (xs_go == 0) {
+        kprintln("xshadow: VOID - reference read or allocation failed", 51);
+        return 0;
+    }
+    xhci_zero_page(xs_data);
+    xhci_zero_page(xs_rep);
+    var xs_jk = dma_kva(xs_junk);
+    xs_i = 0;
+    while (xs_i < 262144) { store64(xs_jk + xs_i * 8, 0x5AD0A5ED5AD0A5ED); xs_i = xs_i + 1; }
+    var xs_pd = ptw_pd_kva(xs_cr3);
+    xs_i = 2;
+    while (xs_i < 128) { store64(xs_pd + xs_i * 8, xs_junk | 0x83); xs_i = xs_i + 1; }
+    for (var xs_c = 0; xs_c < 8; xs_c = xs_c + 1) { store8(&hid_curr_report + xs_c, 0xEE); }
+    kprintln("xshadow: shadow CR3 built - pool window PD[2..127] -> one junk 2 MB region", 74);
+
+    # --- the shadowed window: interrupts off, nothing printed ---------------------------------------------
+    var xs_ai = hid_kbd_xfer_idx;
+    var xs_ac = hid_kbd_xfer_cycle;
+    var xs_lock = hid_poll_trylock();
+    var xs_fl = kbd_irq_save();
+    cr3_load(xs_cr3);
+    var xs_cmd = xhci_cmd_issue(0, 0, 0, 23 << 10);        # TRB type 23 = No Op Command (xHCI 1.2 §6.4.3.1)
+    var xs_dsc = xhci_get_device_descriptor(s, 18);
+    var xs_rd = msc_read_lba(s, 0, 0, 1, xs_data);
+    var xs_arm = 0;
+    if (xs_lock == 1) {
+        xs_arm = hid_arm_xfer_trb();
+        hid_process_report(xs_rep);
+    }
+    cr3_load(0x1000);
+    kbd_irq_restore(xs_fl);
+    if (xs_lock == 1) { hid_poll_unlock(); }
+
+    # --- verdicts, under the kernel CR3 ------------------------------------------------------------------
+    var xs_fail = 0;
+    if (xs_cmd == 1) { kprintln("xshadow: No-Op command + completion event under shadow OK", 57); }
+    else { kprintln("xshadow: No-Op command FAILED under shadow", 42); xs_fail = 1; }
+    var xs_dok = xs_dsc;
+    xs_i = 0;
+    while (xs_i < 18) {
+        if (load8(xhci_desc_buf_kva + xs_i) != load8(&xs_ref + xs_i)) { xs_dok = 0; }
+        xs_i = xs_i + 1;
+    }
+    if (xs_dok == 1) { kprintln("xshadow: EP0 GET_DESCRIPTOR under shadow byte-exact OK", 54); }
+    else { kprintln("xshadow: EP0 GET_DESCRIPTOR WRONG under shadow", 46); xs_fail = 1; }
+    var xs_mok = xs_rd;
+    var xs_seed = "MSCLBA0!";
+    xs_i = 0;
+    while (xs_i < 8) {
+        if (load8(dma_kva(xs_data) + xs_i) != load8(xs_seed + xs_i)) { xs_mok = 0; }
+        xs_i = xs_i + 1;
+    }
+    if (xs_mok == 1) { kprintln("xshadow: MSC READ(10) LBA0 under shadow byte-exact OK", 53); }
+    else { kprintln("xshadow: MSC READ(10) LBA0 WRONG under shadow", 45); xs_fail = 1; }
+    var xs_hok = xs_arm;
+    var xs_trb = dma_kva(hid_kbd_xfer_ring) + xs_ai * 16;
+    if (load64(xs_trb) != hid_kbd_slot_buf(xs_ai)) { xs_hok = 0; }
+    if (((load32(xs_trb + 12) >> 10) & 0x3F) != XHCI_TRB_NORMAL) { xs_hok = 0; }
+    if ((load32(xs_trb + 12) & 0x1) != (xs_ac & 0x1)) { xs_hok = 0; }
+    for (var xs_h = 0; xs_h < 8; xs_h = xs_h + 1) {
+        if (load8(&hid_curr_report + xs_h) != 0) { xs_hok = 0; }
+    }
+    if (xs_hok == 1) { kprintln("xshadow: HID TRB arm + report fold under shadow OK", 50); }
+    else { kprintln("xshadow: HID TRB arm or report fold WRONG under shadow", 54); xs_fail = 1; }
+    var xs_bad = 0;
+    xs_i = 0;
+    while (xs_i < 262144) {
+        if (load64(xs_jk + xs_i * 8) != 0x5AD0A5ED5AD0A5ED) { xs_bad = xs_bad + 1; }
+        xs_i = xs_i + 1;
+    }
+    if (xs_bad == 0) { kprintln("xshadow: shadow region untouched (no identity-VA store) OK", 58); }
+    else {
+        kprint("xshadow: shadow region WRITTEN through an identity VA, qwords=", 62);
+        kprint_num(xs_bad);
+        kprintln("", 0);
+        xs_fail = 1;
+    }
+    proc_free_address_space(xs_cr3);
+    pmm_free_2mb(xs_junk);
+    pmm_free(xs_rep);
+    if (xs_fail == 0) { kprintln("xshadow: PASS", 13); return 1; }
+    kprintln("xshadow: FAIL", 13);
+    return 0;
 }
 #endif

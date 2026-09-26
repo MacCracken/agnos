@@ -84,9 +84,13 @@ var vblk_q0_notify   = 0;
 
 # Virtqueue 0 (the only one — single requestq)
 var vblk_qsize       = 0;
-var vblk_desc        = 0;   # desc ring phys (pmm page)
-var vblk_avail       = 0;   # avail ring phys (pmm page)
-var vblk_used        = 0;   # used ring phys (pmm page)
+# 1.57.8 (DMA1): vblk_desc/avail/used are the rings' CPU pointers — the DIRECT-MAP aliases (dma_kva) of
+# their pmm pages, never the phys. vblk_do_request runs from fs syscalls under the caller's CR3, where a
+# ring-3 PT_LOAD in [0x400000, 0x10000000) can shadow a pmm page's identity VA. The phys goes only into the
+# QUEUE_DESC/DRIVER/DEVICE registers (vblk_setup_queue_0).
+var vblk_desc        = 0;   # desc ring CPU pointer (direct map of a pmm page)
+var vblk_avail       = 0;   # avail ring CPU pointer (direct map of a pmm page)
+var vblk_used        = 0;   # used ring CPU pointer (direct map of a pmm page)
 var vblk_idx         = 0;   # next avail ring slot (driver's perspective)
 var vblk_used_last   = 0;   # last consumed used ring slot
 
@@ -325,24 +329,24 @@ fn vblk_setup_queue_0() {
     if (vmm_is_mapped(p2) == 0) { vmm_map(p2, p2, 0x83); }
     if (vmm_is_mapped(p3) == 0) { vmm_map(p3, p3, 0x83); }
 
-    # Zero each page (512 × 8 = 4096 bytes)
-    for (var i = 0; i < 512; i = i + 1) { store64(p1 + i * 8, 0); }
-    for (var i = 0; i < 512; i = i + 1) { store64(p2 + i * 8, 0); }
-    for (var i = 0; i < 512; i = i + 1) { store64(p3 + i * 8, 0); }
+    vblk_desc  = dma_kva(p1);    # 1.57.8 (DMA1): CPU pointers = direct map; p1..p3 (phys) only below
+    vblk_avail = dma_kva(p2);
+    vblk_used  = dma_kva(p3);
 
-    vblk_desc  = p1;
-    vblk_avail = p2;
-    vblk_used  = p3;
+    # Zero each page (512 × 8 = 4096 bytes)
+    for (var i = 0; i < 512; i = i + 1) { store64(vblk_desc + i * 8, 0); }
+    for (var i = 0; i < 512; i = i + 1) { store64(vblk_avail + i * 8, 0); }
+    for (var i = 0; i < 512; i = i + 1) { store64(vblk_used + i * 8, 0); }
 
     # Write 64-bit phys addresses, low half first, high half second
     # (§ 4.1.3.2 — empirical convention; some emulators only latch on the
     # high-half write, so low-first ensures atomicity in the right direction).
-    store32(vblk_common_cfg + VBLK_QUEUE_DESC_LO,   vblk_desc  & 0xFFFFFFFF);
-    store32(vblk_common_cfg + VBLK_QUEUE_DESC_HI,   (vblk_desc  >> 32) & 0xFFFFFFFF);
-    store32(vblk_common_cfg + VBLK_QUEUE_DRIVER_LO, vblk_avail & 0xFFFFFFFF);
-    store32(vblk_common_cfg + VBLK_QUEUE_DRIVER_HI, (vblk_avail >> 32) & 0xFFFFFFFF);
-    store32(vblk_common_cfg + VBLK_QUEUE_DEVICE_LO, vblk_used  & 0xFFFFFFFF);
-    store32(vblk_common_cfg + VBLK_QUEUE_DEVICE_HI, (vblk_used  >> 32) & 0xFFFFFFFF);
+    store32(vblk_common_cfg + VBLK_QUEUE_DESC_LO,   p1 & 0xFFFFFFFF);
+    store32(vblk_common_cfg + VBLK_QUEUE_DESC_HI,   (p1 >> 32) & 0xFFFFFFFF);
+    store32(vblk_common_cfg + VBLK_QUEUE_DRIVER_LO, p2 & 0xFFFFFFFF);
+    store32(vblk_common_cfg + VBLK_QUEUE_DRIVER_HI, (p2 >> 32) & 0xFFFFFFFF);
+    store32(vblk_common_cfg + VBLK_QUEUE_DEVICE_LO, p3 & 0xFFFFFFFF);
+    store32(vblk_common_cfg + VBLK_QUEUE_DEVICE_HI, (p3 >> 32) & 0xFFFFFFFF);
 
     # Read queue_notify_off, compute the cached doorbell address
     # (§ 4.1.4.4: notify_addr = notify_base + queue_notify_off × multiplier)
@@ -417,13 +421,62 @@ fn virtio_blk_init() {
 # impls flag this as THE critical correctness item), rings the doorbell,
 # polls the used ring (rmb before reading entry id per § 2.7.13.4.1), reads
 # the status byte. Returns 0 on success, -1 on timeout or IOERR/UNSUPP.
+# ⛔ 1.57.8 — ONE OUTSTANDING REQUEST, WAITED FOR ON A WALL-TIME BUDGET, NEVER ABANDONED TO THE NEXT CALLER.
+# Until 1.57.8 both polls gave up after 2,000,000 ITERATIONS (~20 ms under TCG) and returned -1 with the request
+# still in flight. A FLUSH is a host fsync: on a loaded host it outlives that (measured 1.57.8, dma-shadow-smoke
+# -smp 1: `virtio FAIL bad=16000`, the flush alone, 3 runs of 4). The abandoned request then completed LATE: the
+# next poll consumed ITS used entry as its own and read the shared status byte before its own transfer had run —
+# the CQ-one-behind class the NVMe fix of this cut closes (docs/architecture/nvme-io-completion.md) — and a late
+# READ could still DMA into vblk_dma_buf after the next write had copied into it. Now: the budget is wall time
+# (klog_uptime_us; a spin backstop of budget*64 when the TSC reads 0), and a timeout marks the request LATE;
+# vblk_settle() reaps it before the shared header/status/descriptors or vblk_dma_buf are touched again, and a
+# request that never completes RESETS the device (status 0: no further DMA) and takes virtio-blk offline.
+var VBLK_IO_BUDGET_US    = 5000000;     # 5 s per transfer
+var VBLK_FLUSH_BUDGET_US = 30000000;    # 30 s per FLUSH (a host fsync of a dirty image)
+var vblk_late = 0;                      # 1 while a timed-out request still owns the header/status/vblk_dma_buf
+
+# Wait for the one outstanding request's used entry. 0 = it completed (status in vblk_req_status); -1 = the budget
+# ran out and the request is now LATE. § 2.7.13.4.1: rmb between used.idx and anything the device wrote.
+fn vblk_wait(budget_us) {
+    var t0 = klog_uptime_us();
+    var spins = 0;
+    while (spins >= 0) {
+        if (load16(vblk_used + 2) != (vblk_used_last & 0xFFFF)) {
+            asm { 0x0F; 0xAE; 0xF0; }   # mfence (rmb) — inputs: none; outputs: none; clobbers: none
+            vblk_used_last = vblk_used_last + 1;
+            vblk_late = 0;
+            return 0;
+        }
+        if (t0 > 0) {
+            if ((klog_uptime_us() - t0) >= budget_us) { spins = 0 - 1; }
+        }
+        if (t0 == 0) {
+            if (spins >= budget_us * 64) { spins = 0 - 1; }
+        }
+        if (spins >= 0) { spins = spins + 1; }
+    }
+    vblk_late = 1;
+    return 0 - 1;
+}
+
+# Reap a late request before anything it owns is reused; if it never completes, reset the device.
+fn vblk_settle() {
+    if (vblk_late == 0) { return 0; }
+    if (vblk_wait(VBLK_IO_BUDGET_US) == 0) { return 0; }
+    kprintln("vblk: late request lost - device reset", 38);
+    store8(vblk_common_cfg + VBLK_DEV_STATUS, 0);
+    vblk_active = 0;
+    vblk_late = 0;
+    return 0 - 1;
+}
+
 fn vblk_do_request(req_type, sector, buf) {
     if (vblk_active == 0) { return 0 - 1; }
+    if (vblk_settle() != 0) { return 0 - 1; }
 
     var qsz = vblk_qsize;
     var desc_base  = vblk_desc;
     var avail_base = vblk_avail;
-    var used_base  = vblk_used;
 
     # virtio_blk_req header: le32 type + le32 reserved + le64 sector = 16 bytes
     store32(&vblk_req_hdr + 0, req_type);
@@ -477,23 +530,9 @@ fn vblk_do_request(req_type, sector, buf) {
     # negotiate it), the value is the VQ index as le16.
     store16(vblk_q0_notify, 0);
 
-    # Poll used ring for completion. § 2.7.13.4.1 requires an rmb between
-    # reading used.idx and reading used.ring[].id; without it, the consumer
-    # can read a stale entry's id at the new idx.
-    var timeout = 0;
-    while (timeout < 2000000) {
-        var used_idx = load16(used_base + 2);
-        if (used_idx != (vblk_used_last & 0xFFFF)) {
-            # RMB before reading the used-ring entry
-            asm { 0x0F; 0xAE; 0xF0; }
-            vblk_used_last = vblk_used_last + 1;
-            # Check the status byte
-            var status = load8(&vblk_req_status);
-            if (status == 0) { return 0; }
-            return 0 - 1;
-        }
-        timeout = timeout + 1;
-    }
+    # Poll the used ring for completion (vblk_wait: wall-time budget, rmb, late-marking).
+    if (vblk_wait(VBLK_IO_BUDGET_US) != 0) { return 0 - 1; }
+    if (load8(&vblk_req_status) == 0) { return 0; }
     return 0 - 1;
 }
 
@@ -505,11 +544,11 @@ fn vblk_do_request(req_type, sector, buf) {
 # vblk_flush_supported. 1.33.5 fsync barrier (flush-cache-prior-art.md § 2.4).
 fn vblk_do_flush() {
     if (vblk_active == 0) { return 0 - 1; }
+    if (vblk_settle() != 0) { return 0 - 1; }
 
     var qsz = vblk_qsize;
     var desc_base  = vblk_desc;
     var avail_base = vblk_avail;
-    var used_base  = vblk_used;
 
     # Header: type=FLUSH, reserved=0, sector=0 (reserved for flush)
     store32(&vblk_req_hdr + 0, VBLK_T_FLUSH);
@@ -541,18 +580,8 @@ fn vblk_do_flush() {
 
     store16(vblk_q0_notify, 0);
 
-    var timeout = 0;
-    while (timeout < 2000000) {
-        var used_idx = load16(used_base + 2);
-        if (used_idx != (vblk_used_last & 0xFFFF)) {
-            asm { 0x0F; 0xAE; 0xF0; }
-            vblk_used_last = vblk_used_last + 1;
-            var status = load8(&vblk_req_status);
-            if (status == 0) { return 0; }
-            return 0 - 1;
-        }
-        timeout = timeout + 1;
-    }
+    if (vblk_wait(VBLK_FLUSH_BUDGET_US) != 0) { return 0 - 1; }
+    if (load8(&vblk_req_status) == 0) { return 0; }
     return 0 - 1;
 }
 
@@ -584,6 +613,8 @@ fn vblk_blk_read(sector, buf) {
 fn vblk_blk_write(sector, buf) {
     if (vblk_readonly == 1) { return 0 - 1; }    # no shared state touched yet — refuse before locking
     vblk_spin_lock();
+    # 1.57.8: a late READ may still DMA into vblk_dma_buf — reap it BEFORE the copy, not merely before submit.
+    if (vblk_settle() != 0) { vblk_spin_unlock(); return 0 - 1; }
     for (var i = 0; i < 64; i = i + 1) {
         store64(&vblk_dma_buf + i * 8, load64(buf + i * 8));
     }

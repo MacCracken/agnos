@@ -365,7 +365,7 @@ fn tcpst_arm_loinplace() {
 
 # ARM 7 — virtio TX slots (N-1) + ring KVAs (N-6).
 fn tcpst_txs_mark(slot, ch) {
-    var tk = net_dma_kva(load64(vnet_tx_desc + slot * 16)) + 12 + 42;
+    var tk = dma_kva(load64(vnet_tx_desc + slot * 16)) + 12 + 42;
     if (load8(tk) != 84) { return 0; }             # 'T'
     if (load8(tk + 1) != 88) { return 0; }         # 'X'
     if (load8(tk + 2) != 83) { return 0; }         # 'S'
@@ -2368,4 +2368,166 @@ fn spawn_kernel_selftest() {
     return 0;
 }
 spawn_kernel_selftest();
+#endif
+
+#ifdef DMA_SHADOW_SELFTEST
+# ═══ 1.57.8 DMA_SHADOW_SELFTEST — block + HDA DMA survives a SHADOWED identity window ═══
+# (docs/development/issues/2026-09-25-dma-cpu-pointers-still-use-identity-vas.md; docs/architecture/dma-cpu-pointers.md)
+# pmm_alloc draws from [0x400000, 0x10000000). Under a per-process CR3 the loader writes a ring-3 PT_LOAD's PDEs over
+# exactly that window, so a driver that reaches a DMA ring through phys == VA reads and writes the PROCESS's page. This
+# test builds that CR3 by hand: a copy of the kernel's PML4/PDPT/PD with PD[2..127] (every 2 MB of [4 MB, 256 MB)) all
+# pointing at ONE 2 MB region filled with 0xA5 — what a hostile ELF whose PT_LOADs cover the window does, except the
+# PDEs are supervisor (0x83), so an identity access lands silently in the shadow (a real US=1 PT_LOAD turns the same
+# access into a SMAP #PF at CPL0). Then, IF=0 and under that CR3: single-sector, 8-sector and FLUSH on every registered
+# block backend (virtio-blk, NVMe, AHCI), the NVMe PRP-list path (24 sectors direct), and an HDA verb round-trip. Every
+# transfer must be byte-exact and the verb must return the vendor id read before the switch. RED on a driver that still
+# dereferences a pmm page's phys: its SQE/descriptor/CORB entry goes into the shadow, the device never sees it.
+# DESTRUCTIVE: writes sectors 64..95 on virtio/AHCI and nsze/2.. on NVMe — QEMU scratch disks only.
+# Buffers are .bss (kernel image: identity == phys, mapped in every CR3), so they serve AHCI's buf-is-DMA-address API too.
+var dsh_a[512];            # 4 KB write pattern
+var dsh_b[512];            # 4 KB read-back
+var dsh_big[4096];         # 32 KB: two page-aligned 12 KB windows (NVMe PRP list)
+var dsh_res[8];            # per-arm bad counts, measured under the shadow, printed after it
+var dsh_ran[8];            # per-arm "the backend was there" flags
+var dsh_s = 0;             # the 2 MB shadow region (phys)
+var dsh_cr3 = 0;           # the shadow address space (PML4 phys)
+
+fn dsh_word(tag, i) { return 0x44534800000000 | (tag << 24) | i; }
+fn dsh_fill(p, n, tag) {
+    for (var i = 0; i < n / 8; i = i + 1) { store64(p + i * 8, dsh_word(tag, i)); }
+    return 0;
+}
+fn dsh_poison(p, n) {
+    for (var i = 0; i < n / 8; i = i + 1) { store64(p + i * 8, 0xEEEEEEEEEEEEEEEE); }
+    return 0;
+}
+fn dsh_bad(p, n, tag) {
+    var nbad = 0;
+    for (var i = 0; i < n / 8; i = i + 1) { if (load64(p + i * 8) != dsh_word(tag, i)) { nbad = nbad + 1; } }
+    return nbad;
+}
+fn dsh_build() {
+    dsh_s = pmm_alloc_2mb();
+    var pml4 = pmm_alloc();
+    var pdpt = pmm_alloc();
+    var pd = pmm_alloc();
+    if (dsh_s == 0) { return 0; }
+    if (pml4 == 0) { return 0; }
+    if (pdpt == 0) { return 0; }
+    if (pd == 0) { return 0; }
+    var sk = dma_kva(dsh_s);
+    for (var i = 0; i < 262144; i = i + 1) { store64(sk + i * 8, 0xA5A5A5A5A5A5A5A5); }
+    var k4 = dma_kva(pml4);
+    var kp = dma_kva(pdpt);
+    var kd = dma_kva(pd);
+    for (var j = 0; j < 512; j = j + 1) {
+        store64(k4 + j * 8, load64(dma_kva(0x1000) + j * 8));
+        store64(kp + j * 8, load64(dma_kva(0x2000) + j * 8));
+        store64(kd + j * 8, load64(dma_kva(0x3000) + j * 8));
+    }
+    store64(k4, pdpt | 0x03);
+    store64(kp, pd | 0x03);
+    for (var e = 2; e < 128; e = e + 1) { store64(kd + e * 8, dsh_s | 0x83); }
+    dsh_cr3 = pml4;
+    return 1;
+}
+# One backend: single sector, 8 sectors, FLUSH. A failed call adds its own weight (write 1000, read 2000, 8-sector
+# write 4000, 8-sector read 8000, flush 16000) so the verdict names the call; bad words count 1 each (max 576).
+fn dsh_blk(tag, arm, sector) {
+    if (blk_is_registered(tag) == 0) { return 0; }
+    store64(&dsh_ran + arm * 8, 1);
+    var bad = 0;
+    dsh_fill(&dsh_a, 4096, tag);
+    dsh_poison(&dsh_b, 4096);
+    if (blk_write_on(tag, sector, &dsh_a) != 0) { bad = bad + 1000; }
+    if (blk_read_on(tag, sector, &dsh_b) != 0) { bad = bad + 2000; }
+    bad = bad + dsh_bad(&dsh_b, 512, tag);
+    dsh_fill(&dsh_a, 4096, tag + 8);
+    dsh_poison(&dsh_b, 4096);
+    if (blk_write_sectors_on(tag, sector + 8, 8, &dsh_a) != 0) { bad = bad + 4000; }
+    if (blk_read_sectors_on(tag, sector + 8, 8, &dsh_b) != 0) { bad = bad + 8000; }
+    bad = bad + dsh_bad(&dsh_b, 4096, tag + 8);
+    if (blk_flush_on(tag) != 0) { bad = bad + 16000; }
+    store64(&dsh_res + arm * 8, bad);
+    return 0;
+}
+# NVMe direct 24 sectors = 3 pages: PRP1 + a PRP LIST (nvme_prp_list_kva).
+fn dsh_prp(arm, sector) {
+    if (blk_is_registered(BLK_NVME) == 0) { return 0; }
+    store64(&dsh_ran + arm * 8, 1);
+    var pa = (&dsh_big + 4095) & (0 - 4096);
+    var pb = pa + 12288;
+    var bad = 0;
+    dsh_fill(pa, 12288, 13);
+    dsh_poison(pb, 12288);
+    if (blk_write_sectors_direct(BLK_NVME, sector, 24, pa) != 0) { bad = bad + 1000; }
+    if (blk_read_sectors_direct(BLK_NVME, sector, 24, pb) != 0) { bad = bad + 2000; }
+    bad = bad + dsh_bad(pb, 12288, 13);
+    store64(&dsh_res + arm * 8, bad);
+    return 0;
+}
+fn dsh_hda_vendor() {
+    return hda_verb(load64(&hda_codec0), 0, (V_GET_PARAM << 8) | P_VENDOR);
+}
+fn dsh_verdict(name, nlen, arm) {
+    kprint("dmash: ", 7);
+    kprint(name, nlen);
+    if (load64(&dsh_ran + arm * 8) == 0) { kprintln(" SKIP (backend absent)", 22); return 0; }
+    if (load64(&dsh_res + arm * 8) == 0) { kprint(" PASS", 5); } else { kprint(" FAIL", 5); }
+    kprint(" bad=", 5); kprint_num(load64(&dsh_res + arm * 8));
+    kprintln("", 0);
+    return 0;
+}
+fn dma_shadow_selftest() {
+    if (dsh_build() == 0) { kprintln("dmash: FAIL no memory for the shadow", 36); kprintln("dmash: done", 11); return 0; }
+    var probe = pmm_alloc();
+    var pk = dma_kva(probe);
+    store64(pk, 0x5A5A5A5A5A5A5A5A);
+    var hsave = hda_active_ctl;
+    hda_active_ctl = 0;
+    var hda_on = 0;
+    if (load64(&hda_present) != 0) { if (load64(&hda_codec_mask) != 0) { hda_on = 1; } }
+    var v0 = 0;
+    if (hda_on == 1) { v0 = dsh_hda_vendor(); }
+    var nsec = nvme_ns1_nsze / 2;
+    var old = dm_read_cr3();
+    var fl = kbd_irq_save();                      # IF=0 for the whole window: no ISR, no preemption, no CR3 switch
+    cr3_load(dsh_cr3);
+    # ---- under the shadow: no kprint (the console path is not what is under test) ----
+    var id_v = load64(probe);                     # the identity VA of a pmm page: MUST read the shadow
+    var dm_v = load64(pk);                        # its direct-map alias: MUST read the real page
+    dsh_blk(BLK_VIRTIO, 0, 64);
+    dsh_blk(BLK_NVME, 1, nsec);
+    dsh_prp(2, nsec + 64);
+    dsh_blk(BLK_AHCI, 3, 64);
+    var v1 = 0;
+    var v2 = 0;
+    if (hda_on == 1) { v1 = dsh_hda_vendor(); v2 = dsh_hda_vendor(); }
+    cr3_load(old);
+    kbd_irq_restore(fl);
+    hda_active_ctl = hsave;
+    # ---- back on the caller's CR3 ----
+    var shok = 0;
+    if (id_v == 0xA5A5A5A5A5A5A5A5) { shok = 1; }
+    if (dm_v != 0x5A5A5A5A5A5A5A5A) { shok = 2; }
+    kprint("dmash: shadow", 13);
+    if (shok == 1) { kprintln(" PASS (identity VA shadowed, direct map intact)", 47); }
+    if (shok == 0) { kprintln(" FAIL the identity window was not shadowed (the test proves nothing)", 68); }
+    if (shok == 2) { kprintln(" FAIL the direct map read the shadow", 36); }
+    dsh_verdict("virtio", 6, 0);
+    dsh_verdict("nvme", 4, 1);
+    dsh_verdict("nvme-prp", 8, 2);
+    dsh_verdict("ahci", 4, 3);
+    kprint("dmash: hda", 10);
+    if (hda_on == 0) { kprintln(" SKIP (no codec)", 16); } else {
+        if (v0 != 0 - 1) { if (v1 == v0) { if (v2 == v0) { store64(&dsh_res + 4 * 8, 1); } } }
+        if (load64(&dsh_res + 4 * 8) == 1) { kprint(" PASS", 5); } else { kprint(" FAIL", 5); }
+        kprint(" vendor=", 8); kprint_hex(v0);
+        kprint(" shadowed=", 10); kprint_hex(v1);
+        kprintln("", 0);
+    }
+    kprintln("dmash: done", 11);
+    return 0;
+}
+dma_shadow_selftest();
 #endif

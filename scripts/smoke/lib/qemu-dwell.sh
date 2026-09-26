@@ -300,12 +300,14 @@ qemu_assert_booted() {
 #   net: lock overlap                        (1.57.7 S4) tcp_lock / net_tx_begin: two holders inside one net lock
 #   net: lock missing                        (1.57.7 S4) nic_send / net_lo_enqueue / tcp_send_pkt_seq reached without
 #                                            its lock (net_tx_lock / tcp_tab_lock) — best-effort witnesses
+#   vmm: UC remap of the kernel low 4 MB     (1.57.8 KVMCON) vmm_remap_uc_2mb refused a phys < 4 MB (an I/O port base
+#                                            passed as a BAR: the kernel's own code would have run uncached)
 # ⚠ NOT denied (a test requires it): "execwait: first scheduled child" (S3b's #37 witness — fg-smoke, run37-smp4);
 #   "virtio-net: TX ring full - frame dropped" (S4: a diagnostic latch, a burst
 #   may legitimately fill the ring); "wq: first cross-CPU resume from a kernel wait" (klug-only witness, waitx P8);
 #   "kbd: line owner reclaimed from a dead process" (klug-only, S3d; S7's KBDNEXT asserts its absence in its phase).
 # kstack-smoke denies this whole pattern too (1.57.7; it carried its own shorter list until then).
-SMOKE_INVARIANT_DENY="sched: refused non-ready pick|sched: exec_and_wait entered with|sched: kernel_resume with|syscall: kernel stack is not the caller|PANIC: Double Fault|boot: BSP stack window not free RAM|wq: wait primitive entered|wq: arm from a non-running|wq: current is not running|wq: sleep resumed in a non-running|PANIC: wq|sched: resched gate misconfigured|IDLE REFUSED A READY PICK|exec: exec_and_wait is boot-only|fg: IF=0 ring-3 caller|fg: kernel_run_child cannot block|fg: execwait cannot block|fg: execwait wait ended abnormally|net: lock overlap|net: lock missing|proc: orphan zombie recycled|lifecycle: park refused|lifecycle: signal point with preempt held|lifecycle: claimed a kernel continuation"
+SMOKE_INVARIANT_DENY="sched: refused non-ready pick|sched: exec_and_wait entered with|sched: kernel_resume with|syscall: kernel stack is not the caller|PANIC: Double Fault|boot: BSP stack window not free RAM|wq: wait primitive entered|wq: arm from a non-running|wq: current is not running|wq: sleep resumed in a non-running|PANIC: wq|sched: resched gate misconfigured|IDLE REFUSED A READY PICK|exec: exec_and_wait is boot-only|fg: IF=0 ring-3 caller|fg: kernel_run_child cannot block|fg: execwait cannot block|fg: execwait wait ended abnormally|net: lock overlap|net: lock missing|proc: orphan zombie recycled|lifecycle: park refused|lifecycle: signal point with preempt held|lifecycle: claimed a kernel continuation|vmm: UC remap of the kernel low 4 MB"
 
 # smoke_accel <smp> — the QEMU accelerator + CPU model for a boot at `-smp <smp>` (1.57.6, agnos S3).
 #

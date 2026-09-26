@@ -791,17 +791,22 @@ fn sched_ready_for_me(me) {
 # scan, THEN sti;hlt. Scanning first and setting the flag after loses a kick: a waker that makes a proc READY between
 # the scan and the flag store reads kickable == 0 and sends nothing, and this CPU sleeps a full tick.
 # Returns 0 = found work without halting (the caller's trailing yield takes it); 1 = halted once.
-fn sched_halt_window() {
+# hw_k = the cpu_kickable value this park publishes (proc.cyr): 2 = a #44 sched_yield park, which also sends the
+# directed kick (sched_kick_parker) and is its only target; 1 = every other park (#14 pause, in-kernel ksyscall(14)):
+# it sleeps a whole interrupt unless a WAKE makes work READY for it (sched_kick_for), and it never sends or draws a
+# directed kick (ENDFIX PIPE-R1).
+fn sched_halt_window(hw_k) {
     var hw_f = kbd_irq_save();                               # IF=0 (already 0 in a syscall; defensive)
     var hw_c = pcpu_cpu();
     var hw_me = proc_current_get();
-    if (hw_c < 4) { store64(&cpu_in_halt + hw_c * 8, 1); store64(&cpu_kickable + hw_c * 8, 1); }
+    if (hw_c < 4) { store64(&cpu_in_halt + hw_c * 8, 1); store64(&cpu_kickable + hw_c * 8, hw_k); }
     arch_mfence();                                           # ⛔ PUBLISH "halted/kickable" BEFORE THE SCAN (Dekker)
     if (sched_ready_for_me(hw_me) != 0) {
         if (hw_c < 4) { store64(&cpu_kickable + hw_c * 8, 0); store64(&cpu_in_halt + hw_c * 8, 0); }
         kbd_irq_restore(hw_f);
         return 0;
     }
+    if (hw_k == 2) { sched_kick_parker(hw_c); }              # 1.57.8: the #44 directed kick (below) — AFTER our publish
     arch_sti_hlt();                                          # the preempt point: the tick may switch us out here
     asm { 0xFA; }                                            # cli — contract: no inputs/outputs; clears IF
     var hw_c2 = pcpu_cpu();                                  # R4: RE-READ — we may have resumed on another CPU
@@ -811,11 +816,11 @@ fn sched_halt_window() {
 }
 
 # 1 = switched to another READY process and back; 2 = parked (then offered the CPU once more);
-# 0 = refused (pre-scheduler / preempt-held / borrowed CR3): the caller keeps its legacy path.
-fn sched_yield_or_halt() {
+# 0 = refused (pre-scheduler / preempt-held / borrowed CR3): the caller keeps its legacy path. yh_k: sched_halt_window's.
+fn sched_yield_or_halt(yh_k) {
     if (sched_yield_kernel() == 1) { return 1; }
     if (wq_can_block() == 0) { return 0; }
-    sched_halt_window();
+    sched_halt_window(yh_k);
     sched_yield_kernel();     # hand the CPU to whatever that interrupt (a wake, a kick) made READY — no tick wait
     return 2;
 }
@@ -825,7 +830,7 @@ fn sched_yield_or_halt() {
 # offers the CPU once more, so a poll+yield loop does not spin a core. A REFUSED caller (pre-scheduler, preempt-held —
 # never a ring-3 process after S3b-F2) keeps the old no-op. rdx/rsi/rdi/r8-r10 carry handler leftovers, as after
 # every syscall.
-fn sys_sched_yield_k() { sched_yield_or_halt(); return 0; }
+fn sys_sched_yield_k() { sched_yield_or_halt(2); return 0; }
 
 # pause#14 as dispatched from syscall_handler (ring-3 SYSCALLs only). The KSTACK_SELFTEST probe hook runs first
 # (a no-op twin in production returns -1 = "not a probe"). Then the yield-or-park: cyrius _agnos_sock_recv_block's
@@ -836,7 +841,7 @@ fn sys_pause(a1, a2, a3) {
     var sp_r = kst_probe_hook(a1, a2, a3);
     if (sp_r != (0 - 1)) { return sp_r; }
     if (lifecycle_pending_self() == 1) { return 0; }     # 1.57.7 (S7): a kill / stop is pending — B1 acts now, not after a hlt
-    if (sched_yield_or_halt() != 0) { return 0; }
+    if (sched_yield_or_halt(1) != 0) { return 0; }       # 1: a pause park never sends or draws the directed kick
     return ksyscall(14, a1, a2, a3);
 }
 
@@ -966,6 +971,39 @@ fn sched_kick_mask(m, from_tick) {
             if (km_go == 1) { km_kicked = sched_kick_for(km_i, km_kicked); }
         }
         km_i = km_i + 1;
+    }
+    return 0;
+}
+
+# ⭐ 1.57.8 — THE DIRECTED KICK (issue 2026-09-25-cross-cpu-poll-and-yield-loops-are-tick-bound). A parker's peer that
+# is RUNNING on another CPU is not READY here, so two poll+#44 loops on two CPUs used to park each other a whole tick
+# per round (yield_peer -smp 4: 9.9 ms). A #44 park now kicks ONE other CPU that is itself parked IN #44 —
+# cpu_kickable == 2 (an idle step or a #14 park publishes 1) — so that yielder re-runs its poll. Sent after this CPU
+# published its own cpu_kickable = 2 + mfence, so the woken yielder's next park sees THIS CPU and kicks back: two #44
+# yielders on two CPUs trade one IPI per round instead of a tick. ⚠ THE SCOPE (ENDFIX PIPE-R1): the kernel cannot tell
+# a yielder waiting for its peer from one waiting for anything else, so ANY two #44 yielders on two CPUs ping-pong at
+# IPI rate for as long as both yield — #44 is sched_yield, "run me again as soon as possible", a spin by contract.
+# #14 pause is NOT: it neither sends nor draws this kick (until 1.57.8's end review it did both, so crab's #14 idle
+# beside a cyrius sock_recv #14 backoff — or agnsh's #44 bg poll beside it — woke each other at ~10 kHz forever, and
+# _agnos_sock_recv_block's 6000-pause backstop, sized for 10 ms pauses, expired in under a second). A #44 park beside
+# a BUSY process (never parks), a BLOCKED one (not current anywhere) or a #14 pauser sends nothing: agnsh's prompt poll
+# beside a busy job still halts a whole interrupt (waitx P2c). The cure for a pair that polls each other is a blocking
+# read (rd5_wait). EOI-only target (resched_kick_handler).
+fn sched_kick_parker(kp_me) {
+    if (cpu_count < 2) { return 0; }
+    if (apic_enabled == 0) { return 0; }
+    var kp_mask = cpu_online_mask();
+    var kp_k = 1;
+    while (kp_k < 4) {
+        var kp_t = (kp_me + kp_k) & 3;
+        if (((kp_mask >> kp_t) & 1) == 1) {
+            if (load64(&cpu_kickable + kp_t * 8) == 2) {
+                apic_send_ipi_one(kp_t, RESCHED_KICK_VECTOR);
+                sched_kicks = sched_kicks + 1;
+                return 1;
+            }
+        }
+        kp_k = kp_k + 1;
     }
     return 0;
 }
@@ -1303,14 +1341,18 @@ fn wq_wake_one_locked(p, why) {
 # ⚠ ww_m, the woken-pid mask, is LOCAL on purpose: the S3.8 kick (sched_kick_mask) runs after sched_spin_unlock,
 # where a shared cell would already carry another CPU's concurrent wq_wake — kick it here, from ww_m, after the
 # unlock and before kbd_irq_restore. Never publish the mask through shared state.
-fn wq_wake(key) {
+# 1.57.8: wq_wake_m matches (wait key & msk) == key — msk -1 is wq_wake's exact key; msk 0xFF00000000000000 wakes a
+# whole CLASS (a writer's death wakes every WK_PIPE reader: its table may already be gone, so its pipes cannot be
+# named). A spurious wake costs the waiter one re-check.
+fn wq_wake(key) { return wq_wake_m(key, 0 - 1); }
+fn wq_wake_m(key, msk) {
     var ww_f = kbd_irq_save();
     sched_spin_lock();
     var ww_n = 0;
     var ww_m = 0;
     var ww_i = 0;
     while (ww_i < proc_count) {
-        if (load64(&proc_wait_key + ww_i * 8) == key) {
+        if ((load64(&proc_wait_key + ww_i * 8) & msk) == key) {
             if (load64(&proc_table + ww_i * 176 + 8) == 6) {
                 wq_wake_one_locked(ww_i, 1);           # WR_EVENT
                 ww_n = ww_n + 1;
@@ -1332,6 +1374,9 @@ fn wq_interrupt_locked(p) {
     if (load64(&proc_table + p * 176 + 8) == 6) { wq_wake_one_locked(p, 3); return 1; }   # WR_SIGNAL
     return 0;
 }
+# The self-locking form's only caller is test_wq (TEST); production callers hold sched_lock and use the _locked form.
+# Fenced under TEST (1.57.8 ENDFIX pays its +16 B here, weighed-size cap 0 B).
+#ifdef TEST
 fn wq_interrupt(p) {
     var wi_f = kbd_irq_save();
     sched_spin_lock();
@@ -1342,6 +1387,7 @@ fn wq_interrupt(p) {
     kbd_irq_restore(wi_f);
     return wi_r;
 }
+#endif
 
 # Deadline expiry — every CPU's timer tick (timer_handler, outside the BSP-only block, inside its preempt bracket).
 # Two unlocked reads short-circuit the common case. The rescan is AUTHORITATIVE: it recounts wq_ntimed and the

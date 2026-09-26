@@ -801,14 +801,16 @@ fn spx_phase_crosstalk() {
     var last = 0;
     var t0 = spx_ms();
     var done = 0;
+    # ⚠ 1.57.8: these reads POLL, so they pass a4 = 1 (O_NONBLOCK). With a4 = 0 a pipe read now BLOCKS while its ring
+    # is empty and a writer is open — and qw is ours, so it would never return; the -2 below is the pass criterion.
     while (done == 0) {
         spx_yield();
-        last = syscall(5, qr, &spx_buf, 64, 0);
+        last = syscall(5, qr, &spx_buf, 64, 1);
         if (last > 0) { zs = zs + last; }
         if (syscall(4, p, 0, 0, 0) != 0 - 2) { done = 1; }        # the scribbler exited (and is reaped)
         if (spx_ms() - t0 > 20000) { done = 2; }
     }
-    last = syscall(5, qr, &spx_buf, 64, 0);
+    last = syscall(5, qr, &spx_buf, 64, 1);
     if (last > 0) { zs = zs + last; }
     spx_close(qr);
     spx_close(qw);

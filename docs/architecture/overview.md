@@ -68,7 +68,21 @@ BAR5 (PCI-assigned)  AMD GPU MMIO register aperture — 512 KB (0x80000), UC-map
                      reached with ZERO page tables (no GART). Values from gpu_regs.cyr / gpu_vm_setup() in kernel/core/.
 ```
 
+**DMA pages: the device gets PHYS, the CPU gets the direct map (1.57.7 NICs, 1.57.8 xHCI/HID/MSC).** `pmm_alloc`
+draws from `[0x400000, 0x10000000)` — the window a ring-3 PT_LOAD may map over under its own CR3 — and driver code runs
+under whatever CR3 is live (hid_poll from the 0x51 MSI-X ISR and the BSP tick, block I/O from syscalls). So a DMA
+page's physical address goes only into descriptors, TRBs, contexts and device registers; every CPU load/store into it
+goes through `dma_kva(phys)` (= `DIRECTMAP_BASE + phys`, mirrored into every CR3, never user-reachable). In the
+xHCI stack that is the `xhci_{dcbaa,cmd_ring,evt_ring,desc_buf}_kva` twins, `xhci_zero_page(phys)` (which converts),
+direct-map slot-table bases (whose stored values stay phys), and a `dma_kva` at each per-slot / per-endpoint
+site; a TRB address that is COMPARED with a Transfer / Command Completion event's TRB pointer stays phys. Proven by
+`scripts/smoke/xhci-shadow-smoke.sh`, which runs the command / EP0 / MSC bulk / HID paths under a CR3 whose whole
+pool window maps junk. ⚠ The alias is only valid after `cr3_load(0x1000)` (see CLAUDE.md) — which is why
+`hid_reclaim_selftest`, whose rings now go through it, runs after that switch.
+
 Live binary size + per-cut trajectory lives in [`../development/state.md`](../development/state.md). Identity-map ceiling extended to 4 GB at v1.25.0 so QEMU's ACPI tables resolve; the per-process PD-copy loop at `proc_create_address_space` mirrors that ceiling into every address space (v1.25.1). The XHCI BAR for AMD FCH 1022:1639 sits below 4 GB and is remapped strict-UC (PWT=1+PCD=1+PAT=0) on top of the identity map per Repair (X) at v1.30.x (kernel/core/vmm.cyr `vmm_remap_uc_2mb`).
+
+**Device-BAR memory types are page-table edits, and KVM enforces them (1.57.8).** `vmm_remap_uc_2mb(phys)` rewrites the 2 MB PDE that covers `phys` to UC, so whatever else lives in that 2 MB goes UC with it. Two rules follow. (1) `pci_bar_64` / `pci_bar0_64` answer **MMIO addresses only** — an I/O BAR answers 0, like an unimplemented one (`core/pci.cyr`); until 1.57.8 an I/O BAR answered its port base, the virtio cap walks (whose `VIRTIO_PCI_CAP_PCI_CFG` cap names BAR0, virtio-net's legacy I/O BAR) handed `0x6060` to `vmm_remap_uc_2mb`, and PD[0] — the boot page tables and the kernel's first megabyte of code — went UC. (2) `vmm_remap_uc_2mb` refuses any `phys < 4 MB` (the kernel image, boot tables and BSP boot stacks; no BAR lives there) and prints `vmm: UC remap of the kernel low 4 MB refused`, which is in `SMOKE_INVARIANT_DENY`. ⚠ **TCG ignores memory types**: a wrong UC/WC mapping is invisible under `-cpu max` and costs ~10x under KVM (every console line took ~1.45 s). Likewise a direct-map access before `cr3_load(0x1000)` is merely lost under TCG but traps once per store as unassigned MMIO under KVM. `scripts/smoke/kvm-net-boot-smoke.sh` boots a PLAIN kernel + virtio-net under KVM and bounds both (`kybernet: exec` by 20 s kernel time; `PMM: 2mb_top_region` -> `kernel CR3: own PML4` by 500 ms).
 
 ## Subsystem Diagram
 
