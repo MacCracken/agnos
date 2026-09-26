@@ -86,4 +86,79 @@ fn boot_info_capture_rdi(): i64 {
     }
     return 0;
 }
+
+# ⭐ 1.57.7 (IMG-fix, review A3/B2) — IS REGION 1'S STACK SPAN FREE RAM IN THE MAP gnoboot HANDED OVER?
+# The BSP boot stack is live from the shim's FIRST instruction, before the kernel owns any memory, and
+# nothing reserves its window before that first push: pmm_init's 0-4 MB reservation is the kernel's own
+# bookkeeping, made long after. gnoboot pins only the kernel image (ET_EXEC AllocateAddress); it ALSO
+# allocates the /initramfs and /cmdline blobs with AllocateAnyPages (EfiLoaderData), and boot_info plus
+# the memory-map buffer are globals inside gnoboot's own image (EfiLoaderCode), loaded wherever the
+# firmware put BOOTX64.EFI. So the stack window's safety rests on the FIRMWARE leaving it free — on OVMF
+# it is conventional RAM, as the old [0x370000, 0x380000) window was, but on iron nothing had ever
+# looked. This makes it observable: every UEFI descriptor intersecting [BSP_BOOT_TOP - 64 KB,
+# BSP TSS.RSP0 top) = [0x390000, 0x3C0000) — boot stack, guard gap, RSP0 window — must be a type that is
+# free once ExitBootServices returns (3 BootServicesCode, 4 BootServicesData, 7 Conventional), the
+# descriptors must cover the whole span (a hole is not RAM), and the map buffer itself must lie outside
+# it. Anything else (a loader blob, gnoboot's image, runtime/ACPI/reserved/MMIO) is a region the kernel
+# has been writing its stack over since the first push. It cannot be repaired here (the stack is already
+# in use); it is REPORTED, once, and the smokes deny the line (SMOKE_INVARIANT_DENY).
+# ⚠ bsw_lo / bsw_hi are read by scripts/check/image-layout-check.sh and must equal its CEIL and
+# BSP_RSP0_TOP — move them with the stack.
+# Returns 0 = the span is free RAM, 1 = it is not (bootstack_win_type / _start name the first offender;
+# type 0xFFFF = a hole or the map buffer itself), -1 = no usable map (nothing checked).
+var bootstack_win_rc = 0;
+var bootstack_win_type = 0;
+var bootstack_win_start = 0;
+fn bootstack_window_check(bi): i64 {
+    var bsw_lo = 0x390000;    # BSP boot stack bottom = BSP_BOOT_TOP - 64 KB (image-layout-check.sh CEIL)
+    var bsw_hi = 0x3C0000;    # BSP TSS.RSP0 top (gdt.cyr tss_kernel_stack; image-layout-check.sh BSP_RSP0_TOP)
+    if (bi == 0) { return 0 - 1; }
+    var mm = load64(bi + 0x28);
+    var count = load32(bi + 0x30);
+    var entsize = load32(bi + 0x34);
+    if (mm == 0) { return 0 - 1; }
+    if (count == 0) { return 0 - 1; }
+    if (entsize < 40) { return 0 - 1; }       # EFI_MEMORY_DESCRIPTOR is >= 40 bytes (as pmm_probe_memmap)
+    if (count > 4096) { return 0 - 1; }       # a garbage count: pmm_probe_memmap's hazard, not walked here
+    if (mm < bsw_hi) {
+        if (mm + count * entsize > bsw_lo) {
+            bootstack_win_type = 0xFFFF;
+            bootstack_win_start = mm;
+            return 1;
+        }
+    }
+    var covered = 0;
+    var i = 0;
+    while (i < count) {
+        var e = mm + i * entsize;
+        var etype = load32(e);
+        var pstart = load64(e + 8);
+        var pend = pstart + load64(e + 24) * 4096;
+        if (pend > bsw_lo) {
+            if (pstart < bsw_hi) {
+                var ok = 0;
+                if (etype == 7) { ok = 1; }
+                if (etype == 3) { ok = 1; }
+                if (etype == 4) { ok = 1; }
+                if (ok == 0) {
+                    bootstack_win_type = etype;
+                    bootstack_win_start = pstart;
+                    return 1;
+                }
+                var a = pstart;
+                if (a < bsw_lo) { a = bsw_lo; }
+                var b = pend;
+                if (b > bsw_hi) { b = bsw_hi; }
+                covered = covered + (b - a);
+            }
+        }
+        i = i + 1;
+    }
+    if (covered < bsw_hi - bsw_lo) {
+        bootstack_win_type = 0xFFFF;
+        bootstack_win_start = bsw_lo;
+        return 1;
+    }
+    return 0;
+}
 #endif

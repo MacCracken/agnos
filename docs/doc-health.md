@@ -6,7 +6,52 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-09-24 (**1.57.6 — Path 2 bites S3.1–S3.3 (per-process kernel stacks), spawn flags + codes, the PM-timer TSC; four issue files closed, nine carried with step-named Status headers; see the 1.57.6 block**).
+> **Last refresh**: 2026-09-25 (**1.57.7 — the blocking model, the lifecycle, limits and socket ownership; ten issue files closed, five filed for 1.57.8; see the 1.57.7 block**).
+>
+> ### 1.57.7 (2026-09-25) — the rest of the 1.57.x plan ships; the release pass itself adds no code (D24)
+>
+> ✅ **`CHANGELOG.md` 1.57.7** — Breaking (kill#16 acts, wait status `0x100|sig`, `#99` states 4–7, blocking `#37`,
+> `#43` −3 on the global-fd fallback, the waits, `#48` D6, `#49` EOF, socket ownership, graceful close, `#56`
+> class bits, `#52`/`#54` returns, the PT_LOAD page-sharing refusal, `mmap` no-overwrite, `#40` on the TSC — each
+> with a migration note) · Added (`#106`, `#107`, `SPAWN_E_LIMIT` 7, `WAIT_BLOCK`, `KILL_TREE`, listen classes,
+> flock −2) · Changed (S3c/S3d/S3b/S1b/S4/S6/S7, IMG) · Fixed (MSC CDB, ring-3 `#GP` wedge, HID key loss, inbound
+> SYN, virtio TX, ENDFIX ×3) · gates · closeout with sizes, the red-by-design ABI gate and the iron-only risk list.
+> Gate tallies filled by the final-gates run.
+>
+> ✅ **`state.md`** — Kernel head / on-disk rows re-derived for 1.57.7 (2,497,912 B; LOAD end `0x371c18` under
+> `0x390000`); aarch64 32 fns / 17 vars; the 1.57.x plan bullet replaced by the 1.57.8 carried list; the issue
+> bullet rewritten (five open, ten archived this release). Held at the 120-line cap.
+>
+> ✅ **`roadmap.md`** — the "§ 1.57.x — the rest of the 1.57.6 plan" table (all shipped) replaced by "§ 1.57.8":
+> the five 2026-09-25 issues, reparenting (OQ-9), the dead-code audit (1.57.x closeout), per-OFD flock
+> (unslotted), the foreground keyboard owner (OQ-10, later), retiring the out-of-band exec path (OQ-11, 1.58), and
+> the Path 2 iron burn. TRUE lines: syscalls 0–107 (next free #108), "the waits still hold their CPU" (false from
+> 1.57.7), the rekha row's boot-stack number; the "Nested exec — #37 re-entry" row removed (shipped); the
+> ext2-smoke row notes IMG-fix's classified retries.
+>
+> ✅ **`CLAUDE.md`** — the image-bound note (`0x390000`, BSP boot stack top `0x3A0000`, the boot-time UEFI-map
+> check, the gate on every build); closeout sweep row count by `grep -c '^run_gate "'` (49) and the 34/35
+> by-design ABI red; aarch64 counts; check/sweep tallies left for the final-gates run.
+>
+> ✅ **Issues** — ten → `archived/` with rewritten Status headers (RESOLVED 1.57.7 + what shipped + the gate;
+> `tcp-server-cannot-be-loopback-only` RESOLVED-KERNEL) and a Resolution block that names what the change broke,
+> before the move: msc-cdb, sleep-ms, flock, inbound-tcp-syn, sock-recv-eof, socket-ids-no-owner,
+> tcp-server-loopback-only, sock-send-and-connect, parent-cannot-end-stop-continue, no-per-process-resource-limits.
+> Kept OPEN: `2026-09-25-cross-cpu-poll-and-yield-loops-are-tick-bound.md`. NEW for 1.57.8:
+> `2026-09-25-dma-cpu-pointers-still-use-identity-vas.md`, `-nvme-poll-timeout-leaves-the-cq-one-behind.md`,
+> `-hid-mouse-reports-share-one-buffer.md`, `-kvm-virtio-net-console-lines-take-1-4-s.md`.
+> `architecture/socket-ownership-and-loopback.md` and `process-lifecycle.md` now point at `archived/`.
+>
+> ✅ **cyrius peer** filed in cyrius `docs/development/issues/2026-09-25-agnos-sock-peer-spawn-limits-wait-block-kill-tree-peer.md`
+> (`#106`/`#107`, `SPAWN_E_LIMIT`, `WAIT_BLOCK`, `KILL_TREE`, the wait-status helpers, `#99` states, `#56` class
+> bits, and every comment 1.57.7 made wrong). The 1.57.6 filing there is still open.
+>
+> ✅ **Written by the steps (not re-audited here):** NEW `docs/architecture/blocking-waits.md`,
+> `foreground-exec.md`, `net-concurrency.md`, `socket-ownership-and-loopback.md`, `process-lifecycle.md`;
+> updated `kernel-clocks.md`, `kernel-stacks-and-preemption.md` (Region 1 map), `kernel-font-namespace.md`,
+> `spawn-and-fd-lifetime.md`, `overview.md`, `agnos-userland-abi.md` (rows 4/5/14/16/25/27/37/40/41/43/44/47–57/59/
+> 62/66/68/96/99/100/106/107, §4.8, §4.9), `build.md`, `security-hardening.md`, `planning/blocking-syscall-concurrency.md`,
+> `planning/ipc.md`, `scripts/harness/README.md`.
 >
 > ### 1.57.6 (2026-09-24) — three steps of a nine-step plan ship; the docs say which three
 >

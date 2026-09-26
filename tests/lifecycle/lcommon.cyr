@@ -1,0 +1,120 @@
+# lcommon — helpers shared by lifex (the driver, /bin/agnsh) and spinner (every child role, /bin/spinner).
+# agnos 1.57.7 step S7 (the process lifecycle: kill / stop / continue / KILL_TREE / orphan reaping).
+# Raw `syscall(N, a1, a2, a3, a4)` throughout (explicit zeros): #16's KILL_TREE, #95, WAIT_BLOCK and #99's state 7
+# are surface the cyrius peer does not wrap yet. Output is LINE-BUFFERED: one write(1) per line, so two processes
+# printing at once never interleave mid-line (the S4 tcpin lesson).
+
+var lo_buf[64];          # 512 B: the pending output line
+var LO_N = 0;
+fn lo_flush() { if (LO_N > 0) { syscall(1, 1, &lo_buf, LO_N, 0); } LO_N = 0; return 0; }
+fn lo_putc(ch) {
+    store8(&lo_buf + LO_N, ch);
+    LO_N = LO_N + 1;
+    if (ch == 10) { lo_flush(); return 0; }
+    if (LO_N >= 500) { lo_flush(); }
+    return 0;
+}
+fn lo_out(s) {
+    var i = 0;
+    while (load8(s + i) != 0) { lo_putc(load8(s + i)); i = i + 1; }
+    return 0;
+}
+fn lo_outn(s, n) {
+    var i = 0;
+    while (i < n) { lo_putc(load8(s + i)); i = i + 1; }
+    return 0;
+}
+fn lo_num(n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { lo_putc(45); n = 0 - n; }
+    if (n == 0) { lo_putc(48); return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; lo_putc(load8(&b + i)); }
+    return 0;
+}
+fn lo_kv(k, v) { lo_out(" "); lo_out(k); lo_out("="); lo_num(v); return 0; }
+fn lo_nl() { lo_putc(10); return 0; }
+
+fn l_eq(a, b) {
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
+    var i = 0;
+    while (1) {
+        var ca = load8(a + i);
+        if (ca != load8(b + i)) { return 0; }
+        if (ca == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn l_atoi(s) {
+    var v = 0;
+    var i = 0;
+    var neg = 0;
+    if (s == 0) { return 0; }
+    if (load8(s) == 45) { neg = 1; i = 1; }
+    while (load8(s + i) >= 48) {
+        if (load8(s + i) > 57) { break; }
+        v = v * 10 + (load8(s + i) - 48);
+        i = i + 1;
+    }
+    if (neg == 1) { return 0 - v; }
+    return v;
+}
+fn l_cat(dst, off, s) {
+    var i = 0;
+    while (load8(s + i) != 0) { store8(dst + off + i, load8(s + i)); i = i + 1; }
+    return off + i;
+}
+fn l_catnum(dst, off, n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { store8(dst + off, 45); off = off + 1; n = 0 - n; }
+    if (n == 0) { store8(dst + off, 48); return off + 1; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; store8(dst + off, load8(&b + i)); off = off + 1; }
+    return off;
+}
+
+fn l_us() { return syscall(95, 0, 0, 0, 0); }                    # uptime_us#95
+fn l_sleep(ms) { return syscall(41, ms, 0, 0, 0); }              # sleep_ms#41
+fn l_yield() { syscall(44, 0, 0, 0, 0); return 0; }              # sched_yield#44
+fn l_pause() { syscall(14, 0, 0, 0, 0); return 0; }              # pause#14
+fn l_getpid() { return syscall(2, 0, 0, 0, 0); }
+fn l_kill(p, s) { return syscall(16, p, s, 0, 0); }
+fn l_poll(p) { return syscall(4, p, 0, 0, 0); }                  # the non-blocking waitpid (-2 = alive)
+fn l_waitb(p) { return syscall(4, 0x100 | p, 0, 0, 0); }         # WAIT_BLOCK (p = 0xFF: any)
+fn l_open(p) { return syscall(7, p, strlen(p), 0, 0); }
+fn l_close(fd) { return syscall(6, fd, 0, 0, 0); }
+fn l_flock(fd, op) { return syscall(59, fd, op, 0, 0); }         # SH 1, EX 2, NB 4, UN 8
+fn l_spinto(t) { while (l_us() < t) { } return 0; }
+
+var l_line[32];          # 256 B: a #43 / #37 command line
+# Spawn "/bin/spinner <args>" (the legacy line form: the child inherits every fd). Returns pid / -SPAWN_E_*.
+fn l_spawn(args) {
+    var o = l_cat(&l_line, 0, "/bin/spinner ");
+    o = l_cat(&l_line, o, args);
+    store8(&l_line + o, 0);
+    return syscall(43, &l_line, o, 0, 0);
+}
+fn l_spawn1(mode, a) {
+    var o = l_cat(&l_line, 0, "/bin/spinner ");
+    o = l_cat(&l_line, o, mode);
+    store8(&l_line + o, 32);
+    o = l_catnum(&l_line, o + 1, a);
+    store8(&l_line + o, 0);
+    return syscall(43, &l_line, o, 0, 0);
+}
+fn l_spawn2(mode, a, b) {
+    var o = l_cat(&l_line, 0, "/bin/spinner ");
+    o = l_cat(&l_line, o, mode);
+    store8(&l_line + o, 32);
+    o = l_catnum(&l_line, o + 1, a);
+    store8(&l_line + o, 32);
+    o = l_catnum(&l_line, o + 1, b);
+    store8(&l_line + o, 0);
+    return syscall(43, &l_line, o, 0, 0);
+}
+# 32-bit LCG (a deterministic per-seed schedule for the race phases).
+fn l_lcg(s) { return (s * 1103515245 + 12345) & 0x7FFFFFFF; }

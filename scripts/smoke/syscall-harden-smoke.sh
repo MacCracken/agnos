@@ -29,7 +29,8 @@ echo "Building SYSCALL_HARDEN_SELFTEST kernel..."
 SYSCALL_HARDEN_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/dev/null 2>&1
 
 echo "Booting (via the agnsh-smoke NVMe harness)..."
-sh "$ROOT/scripts/smoke/agnsh-smoke.sh" >/dev/null 2>&1 || true
+# AGNSH_SMOKE_FLAGS (1.57.7 IMG-fix): agnsh-smoke refuses any image but the one it is told to expect.
+AGNSH_SMOKE_FLAGS=SYSCALL_HARDEN_SELFTEST sh "$ROOT/scripts/smoke/agnsh-smoke.sh" >/dev/null 2>&1 || true
 
 LOG="$ROOT/build/agnsh-smoke-logs/agnsh.log"
 rc=0

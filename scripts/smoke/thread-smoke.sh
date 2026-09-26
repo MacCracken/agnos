@@ -54,24 +54,35 @@ mcopy -i "$ESP"@@1048576 "$AGNOS" ::boot/agnos
 cp "$OVMF_VARS" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 
 echo "=== AGNOS 1.44.x multi-threading opening smoke ==="
-LOG="$LOGS/thread.log"
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
-# 1.57.6 (S3): SMOKE_SMP=N boots with -smp N (default 1 = unchanged); see smoke_accel in qemu-dwell.sh.
-SMOKE_SMP="${SMOKE_SMP:-1}"
-ACCEL="$(smoke_accel "$SMOKE_SMP")"
-echo "accel: $ACCEL (-smp $SMOKE_SMP)"
-qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
+# ⭐ 1.57.7 (S3d, S3.9): BOTH SMP BY DEFAULT — one invocation boots -smp 1 THEN -smp 4 (KVM when /dev/kvm is writable,
+# else multi-threaded TCG — printed), each through qemu_dwell_kernel (the classified, banner-gated retry) and
+# qemu_assert_booted: a boot with no "AGNOS kernel v" is VOID, never scored — the bare qemu_dwell this used before
+# scored a firmware hand-off failure as "'thr: preempt OK' not found" (HARNESS-BACKLOG row 3). SMOKE_SMP=N set
+# explicitly keeps ONE boot at -smp N. Exit 0 only when every boot passed, 1 on any FAIL, 2 when a boot was VOID.
+SMPS="${SMOKE_SMP:-1 4}"
+rc=0; nvoid=0
+for SMP in $SMPS; do
+LOG="$LOGS/thread-smp$SMP.log"
+ACCEL="$(smoke_accel "$SMP")"
+echo ""
+echo "--- boot -smp $SMP  accel: $ACCEL ---"
+qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" "$WORK/vars.fd" "$OVMF_VARS" \
     qemu-system-x86_64 \
-    -machine q35 -m 512M $ACCEL -smp "$SMOKE_SMP" \
+    -machine q35 -m 512M $ACCEL -smp "$SMP" \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$ESP,format=raw,if=none,id=esp0" -device "nvme,drive=esp0,serial=AGNOS-SMOKE" \
     -serial stdio -display none -no-reboot
+if ! qemu_assert_booted "$LOG"; then echo "VOID: [smp$SMP] the kernel never ran (not scored)"; nvoid=$((nvoid+1)); continue; fi
 
-echo "--- serial (thread lines) ---"; strings "$LOG" | grep "thr:" | sed 's/^/  /'
-rc=0
-if strings "$LOG" | grep -q "thr: preempt OK"; then echo "PASS: preemptive kernel-thread time-slicing (kthread_create + timer preemption)"; else echo "FAIL: 'thr: preempt OK' not found — preemption/round-robin regression"; rc=1; fi
-if strings "$LOG" | grep -q "thr: gate held"; then echo "PASS: preempt gate (preempt_disable freezes the scheduler)"; else echo "FAIL: 'thr: gate held' not found — preempt-gate regression"; rc=1; fi
+echo "--- serial (thread lines, -smp $SMP) ---"; strings "$LOG" | grep "thr:" | sed 's/^/  /'
+if strings "$LOG" | grep -q "thr: preempt OK"; then echo "PASS: [smp$SMP] preemptive kernel-thread time-slicing (kthread_create + timer preemption)"; else echo "FAIL: [smp$SMP] 'thr: preempt OK' not found — preemption/round-robin regression"; rc=1; fi
+if strings "$LOG" | grep -q "thr: gate held"; then echo "PASS: [smp$SMP] preempt gate (preempt_disable freezes the scheduler)"; else echo "FAIL: [smp$SMP] 'thr: gate held' not found — preempt-gate regression"; rc=1; fi
 # ⛔ 1.57.6 (S3-fix): the kernel's latched invariant lines (SMOKE_INVARIANT_DENY, qemu-dwell.sh) change no exit code.
-if strings "$LOG" | grep -qE "$SMOKE_INVARIANT_DENY"; then echo "FAIL: a latched kernel invariant line fired:"; strings "$LOG" | grep -E "$SMOKE_INVARIANT_DENY" | head -3 | sed 's/^/        /'; rc=1; else echo "PASS: no latched kernel invariant line (non-ready pick, out-of-band asserts, kstack_check_entry, #DF)"; fi
-exit $rc
+if strings "$LOG" | grep -qE "$SMOKE_INVARIANT_DENY"; then echo "FAIL: [smp$SMP] a latched kernel invariant line fired:"; strings "$LOG" | grep -E "$SMOKE_INVARIANT_DENY" | head -3 | sed 's/^/        /'; rc=1; else echo "PASS: [smp$SMP] no latched kernel invariant line (non-ready pick, out-of-band asserts, kstack_check_entry, #DF)"; fi
+done
+if [ "$rc" -ne 0 ]; then echo "thread-smoke: FAIL (smp: $SMPS)"; exit 1; fi
+if [ "$nvoid" -ne 0 ]; then echo "thread-smoke: VOID ($nvoid boot(s) never handed off)"; exit 2; fi
+echo "thread-smoke: PASS (smp: $SMPS)"
+exit 0

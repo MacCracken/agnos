@@ -625,6 +625,14 @@ fn hid_kb_push(scancode) {
     kb_head = (kb_head + 1) & 0xFF;
     input_spin_unlock();
     kbd_irq_restore(f);
+    # ⭐ 1.57.7 (Path 2, S3.7): wake a blocked keyboard reader (syscall.cyr kbd_read_line_waiting). The condition
+    # (kb_head) is written under input_lock BEFORE wq_wake takes sched_lock (the C9 waker order). This runs at ANY IF —
+    # the xHCI MSI ISR and the BSP tick's hid_poll at IF=0, the NB reader's drain at IF=1 — and wq_wake saves IF itself
+    # (kbd_irq_save), which is what R5 rests on. Cost: one sched_lock round trip + a 16-slot scan per scancode (2-4
+    # per keystroke); only the push that finds the reader still BLOCKED wakes it (and can kick) — the reader is READY
+    # for the rest of that keystroke's pushes. (hid.cyr is parsed after proc.cyr/sched.cyr: a by-value WK_KBD read and a
+    # backward call.)
+    wq_wake(WK_KBD);
     return 0;
 }
 
@@ -831,11 +839,23 @@ fn hid_kbd_configure(slot_id) {
     # key state once the user lifts off command 1) — applied once, clean, no
     # stranded keys. IOC=bit 5, ISP=bit 2 (Interrupt on Short Packet — Linux
     # always sets ISP for IN data; defensive against <mps bytes). cycle=1.
+    # ⛔⛔ 1.57.7 (S3d) — "KEEPS ONLY THE LAST" LOST EVERY KEY TYPED INSIDE A GAP, AND THE GAPS ARE NOT MILLISECONDS.
+    # With one shared buffer, two reports that complete before the drain runs overwrite each other: a key pressed
+    # AND released inside one IF=0 stretch (a press, then its release 100 ms later) leaves {} {} — both events fold
+    # the resting state and the key never reaches kb_buf. MEASURED (S3d B2, wait-kbd K1 under TCG, a scancode trace):
+    # `[R00..][R00..]` where `a`-down and `a`-up belonged, so `abc` read back as `bc`, deterministically; a write(1)
+    # that scrolls the framebuffer holds IF=0 for longer than a key's 100 ms hold. It is the same class as the
+    # agnsh-bg-smp4 "ersion" (the `v` of `version` lost) the harness backlog blamed on HMP.
+    # ⇒ EACH TRB NOW DMAs INTO ITS OWN 16-BYTE SLOT of the report page (hid_kbd_slot_buf: slot = TRB index; 255 x 16
+    # = 4080 B of the 4 KB page), and the drain folds the slot the completed TRB names (the event's TRB pointer), in
+    # completion order — so a gap that completes several reports replays every one of them. mps > 16 (no boot
+    # keyboard) keeps the old shared buffer.
     var depth = 16;
     var di = 0;
     while (di < depth) {
         var dtrb = xfer_ring + di * 16;
-        store64(dtrb + 0, report_buf);
+        if (mps <= 16) { store64(dtrb + 0, report_buf + di * 16); }
+        else { store64(dtrb + 0, report_buf); }
         store32(dtrb + 8, mps & 0x1FFFF);
         store32(dtrb + 12, (1 << 5) | (1 << 2) | (XHCI_TRB_NORMAL << 10) | 0x1);
         di = di + 1;
@@ -924,11 +944,27 @@ fn hid_process_report(report_phys) {
 # shared report buffer. Called after each Transfer Event has been
 # processed so the controller has another IN slot to fulfil. Ring is one
 # page (256 TRBs at 16 bytes each); we advance enqueue with wrap-and-toggle.
+# 1.57.7 (S3d): the report slot keyboard TRB `idx` DMAs into — its own 16 bytes of the report page (see the ring-depth
+# banner in hid_kbd_configure: one shared buffer lost every key pressed and released inside a single IF=0 gap).
+# mps > 16, or an index outside the ring's 0..254 Normal TRBs, falls back to the page start (the old shared buffer).
+fn hid_kbd_slot_buf(idx) {
+    if (hid_kbd_ep_mps > 16) { return hid_kbd_report_buf; }
+    if (idx < 0) { return hid_kbd_report_buf; }
+    if (idx > 254) { return hid_kbd_report_buf; }
+    return hid_kbd_report_buf + idx * 16;
+}
+# The slot a completed keyboard Transfer Event names: its TRB pointer (event dwords 0-1, the TRB's physical address —
+# the ring page is identity-mapped) minus the ring base, / 16.
+fn hid_kbd_evt_buf(evt) {
+    var ke_ptr = load64(evt);
+    if (ke_ptr < hid_kbd_xfer_ring) { return hid_kbd_report_buf; }
+    return hid_kbd_slot_buf((ke_ptr - hid_kbd_xfer_ring) / 16);
+}
 fn hid_arm_xfer_trb() {
     if (hid_kbd_xfer_ring == 0) { return 0; }
     if (hid_kbd_report_buf == 0) { return 0; }
     var trb = hid_kbd_xfer_ring + hid_kbd_xfer_idx * 16;
-    store64(trb + 0, hid_kbd_report_buf);
+    store64(trb + 0, hid_kbd_slot_buf(hid_kbd_xfer_idx));
     store32(trb + 8, hid_kbd_ep_mps & 0x1FFFF);
     # IOC=bit 5, ISP=bit 2 — see hid_kbd_configure for rationale.
     var ctrl = (1 << 5) | (1 << 2) | (XHCI_TRB_NORMAL << 10) | (hid_kbd_xfer_cycle & 0x1);
@@ -1351,8 +1387,9 @@ fn hid_poll() {
                         hid_first_report = 1;
                         hid_first_report_pending = 1;
                     }
-                    # Kbd IN report just landed in hid_kbd_report_buf.
-                    hid_process_report(hid_kbd_report_buf);
+                    # Kbd IN report just landed in the slot the completed TRB names (1.57.7 S3d: per-TRB slots —
+                    # a shared buffer kept only the LAST of the reports a gap completed and lost the keys between).
+                    hid_process_report(hid_kbd_evt_buf(evt));
                     processed = processed + 1;
                 }
                 # ⚠ UNCONDITIONAL — the ring must be re-armed even when the report was unusable.

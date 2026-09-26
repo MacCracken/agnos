@@ -15,6 +15,7 @@
 # service pass arms exactly one IOC-bearing Normal TRB and rings the right doorbell, and — the arm that
 # proves it is WIRED IN rather than merely present — a real waiter drives the whole path.
 set -u
+. "$(cd "$(dirname "$0")" && pwd)/lib/qemu-dwell.sh"   # qemu_attempt_verdict (1.57.7 IMG-fix)
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT" || exit 1
 GNOBOOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}/build/BOOTX64.EFI"
@@ -55,8 +56,10 @@ while [ "$a" -le 3 ]; do
         -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
         -serial stdio -display none -no-reboot 2>/dev/null | tr -d '\0' > "$LOG"
     rm -rf "$W"
-    grep -q 'AGNOS kernel v' "$LOG" && break
-    echo "  (firmware never handed off — retry $a/3)"
+    # 1.57.7 (IMG-fix, A2): classified, not banner-only — a pre-banner kernel death FAILS (exit 1); a VOID keeps
+    # its log as $LOG.attemptN and says why (scripts/smoke/lib/qemu-dwell.sh qemu_attempt_verdict).
+    qemu_attempt_verdict "$LOG" "$a" && break
+    echo "  (retry $a/3)"
     a=$((a+1))
 done
 if ! grep -q 'AGNOS kernel v' "$LOG"; then

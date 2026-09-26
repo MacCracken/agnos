@@ -1,0 +1,392 @@
+# spinner — every CHILD role of agnos 1.57.7's lifecycle gate (step S7; docs/architecture/process-lifecycle.md).
+# Seeded as /bin/spinner by scripts/smoke/lifecycle-smoke.sh; the driver is lifex (/bin/agnsh). One mode per run,
+# `spinner <mode> [args]` (the #43 / #37 line form). Modes that spin forever are ended by the driver's SIGKILL — the
+# thing under test. Every other mode ends on its own (#95 deadlines).
+
+include "lcommon.cyr"
+
+var sp_buf[8192];        # 64 KB: sendblock's payload
+var sp_kb[16];           # 128 B: kbd's read buffer
+var sp_fds[2];           # 16 B: a pipe / a channel pair
+var sp_kids[16];         # spawnloop / forkloop: live children, oldest first
+var sp_line[16];         # 128 B: a spam line
+
+fn m_spin() { while (1) { } return 0; }
+fn m_spinms(ms) { l_spinto(l_us() + ms * 1000); return 0; }
+fn m_sys() { while (1) { l_getpid(); } return 0; }
+fn m_selfkill() {
+    l_kill(l_getpid(), 9);
+    lo_out("LIFE-SELFKILL-SURVIVED\n");
+    return 1;
+}
+fn m_selfstop() {
+    var a = 0x1111222233334444;
+    var b = 0x5555666677778888;
+    var r = l_kill(l_getpid(), 19);
+    if (r != 0) { return 78; }
+    if (a != 0x1111222233334444) { return 79; }
+    if (b != 0x5555666677778888) { return 80; }
+    return 77;
+}
+fn m_sleepreport(ms) {
+    var t0 = l_us();
+    l_sleep(ms);
+    var e = (l_us() - t0) / 10000;
+    if (e > 250) { e = 250; }
+    return e;
+}
+fn m_flock_ex(path) {
+    var fd = l_open(path);
+    if (fd < 0) { return 0 - 1; }
+    if (l_flock(fd, 2) != 0) { return 0 - 1; }
+    return fd;
+}
+fn m_kbd() { syscall(5, 0, &sp_kb, 100, 0); return 0; }
+fn m_auth(pp) {
+    if (l_kill(pp, 9) != (0 - 1)) { return 1; }
+    if (l_kill(pp, 9 | 0x100) != (0 - 1)) { return 1; }
+    if (l_kill(pp, 0) != (0 - 1)) { return 1; }
+    return 0;
+}
+fn m_recycled(g) {
+    if (l_poll(0 - 1) != (0 - 1)) { return 1; }
+    if (l_poll(g) != (0 - 1)) { return 2; }
+    if (l_kill(g, 9) != (0 - 1)) { return 3; }
+    if (l_kill(g, 0) != (0 - 1)) { return 4; }
+    return 0;
+}
+# Keep <= 4 live `spin` children: spawn; at 4 live, kill the oldest and WAIT_BLOCK it; on -2 (table full), pause.
+fn m_spawnloop(usefork) {
+    var n = 0;
+    while (1) {
+        if (n >= 4) {
+            var old = load64(&sp_kids);
+            l_kill(old, 9);
+            l_waitb(old);
+            var i = 0;
+            while (i < 3) { store64(&sp_kids + i * 8, load64(&sp_kids + (i + 1) * 8)); i = i + 1; }
+            n = 3;
+        }
+        var c = 0;
+        if (usefork == 1) {
+            c = syscall(96, 0, 0, 0, 0);
+            if (c == 0) { m_spin(); }
+        } else {
+            c = l_spawn("spin");
+        }
+        if (c >= 0) { store64(&sp_kids + n * 8, c); n = n + 1; }
+        else { l_pause(); }
+    }
+    return 0;
+}
+fn m_raceparent(s) {
+    var x = l_lcg(s);
+    var u1 = x % 5001;
+    x = l_lcg(x);
+    var u2 = x % 5001;
+    x = l_lcg(x);
+    var w = x % 5001;
+    l_spawn1("exitafter", u1);
+    l_spawn1("exitafter", u2);
+    l_spinto(l_us() + w);
+    return 0;
+}
+fn m_stopchild() {
+    var c = l_spawn1("spinms", 500);
+    if (c < 0) { return 1; }
+    l_kill(c, 19);
+    # Exit only once the child is really STOPPED (a pend on a running child lands at its next tick): the driver then
+    # sees the orphan continue (`cont ... via=orphan`) deterministically.
+    var t = l_us() + 500000;
+    while (l_us() < t) {
+        var pn = syscall(99, &sp_buf, 16, 0, 0);
+        var pi = 0;
+        while (pi < pn) {
+            if (load64(&sp_buf + pi * 64) == c) { if (load64(&sp_buf + pi * 64 + 8) == 5) { return 0; } }
+            pi = pi + 1;
+        }
+        l_yield();
+    }
+    return 0;
+}
+fn m_ew37(args) {
+    var o = l_cat(&l_line, 0, "/bin/spinner ");
+    o = l_cat(&l_line, o, args);
+    store8(&l_line + o, 0);
+    return syscall(37, &l_line, o, 0, 0) & 0xFF;
+}
+fn m_sigrace(wfd) {
+    var mask[8];
+    store64(&mask, (1 << 10) | (1 << 12) | (1 << 14));
+    var sfd = syscall(18, 0 - 1, &mask, 0, 0);
+    if (sfd < 0) { return 2; }
+    var t = l_us() + 60000000;
+    var rb[8];
+    while (l_us() < t) {
+        l_kill(l_getpid(), 10);
+        var dr = 0;
+        while (dr < 4) {
+            var r = syscall(5, sfd, &rb, 4, 0);
+            if (r != 4) { break; }
+            var s = load32(&rb);
+            if (s == 12) { syscall(1, wfd, "G", 1, 0); }
+            if (s == 14) { return 0; }
+            dr = dr + 1;
+        }
+    }
+    return 3;
+}
+fn m_klugspam() {
+    var o = l_cat(&sp_line, 0, "klugspam 0123456789012345678901234567890123456789012345678901234");
+    store8(&sp_line + o, 10);
+    var nx = l_us();
+    while (1) {
+        syscall(1, 1, &sp_line, o + 1, 0);
+        nx = nx + 1000;
+        l_spinto(nx);
+    }
+    return 0;
+}
+fn m_sendblock(ip, port) {
+    var c = syscall(47, ip, port, 0, 0);
+    if (c < 0) { return 2; }
+    syscall(48, c, &sp_buf, 65536, 0);
+    return 0;
+}
+
+# ═══ 1.57.7 (S8) — the resource-limit roles. ALLOCATION-FREE (no alloc(), no allocating helper): the cyrius agnos
+# allocator mmaps a 2 MB chunk on the first alloc(), which would break every exact-cap phase. Raw #107 / #27 / #28.
+var SP_HI = 0x2000000000;             # the high arena's floor on QEMU (<= 120 GB RAM)
+fn sp_mmap() { return syscall(27, 0x200000, 0, 0, 0); }
+fn sp_munmap(a) { return syscall(28, a, 0x200000, 0, 0); }
+fn sp_arm(m, c) { return syscall(107, m, c, 0, 0); }
+# This pid's RSS (#99 +60, 4 KiB pages).
+fn sp_rss() {
+    var me = l_getpid();
+    var n = syscall(99, &sp_buf, 16, 0, 0);
+    var i = 0;
+    while (i < n) {
+        if (load64(&sp_buf + i * 64) == me) { return (load64(&sp_buf + i * 64 + 56) >> 32) & 0xFFFFFFFF; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn m_mem() {
+    var got = 0;
+    while (sp_mmap() != 0) { got = 1; }
+    if (got == 0) { return 250; }
+    var r = sp_rss() / 512;
+    if (r > 249) { r = 249; }
+    return r;
+}
+fn m_mem2() {
+    var i = 0;
+    while (i < 20) { if (sp_mmap() == 0) { return 1 + i; } i = i + 1; }
+    return 0;
+}
+fn m_mmaploop() { while (1) { var a = sp_mmap(); if (a != 0) { sp_munmap(a); } } return 0; }
+# Spawn `args` (the line form), WAIT_BLOCK it -> its status; 0x1000 on a spawn error.
+fn sp_run(args) {
+    var c = l_spawn(args);
+    if (c < 0) { return 0x1000; }
+    return l_waitb(c);
+}
+# 1 iff st == 280 (the CPU cap's SIGXCPU), 3 on a setup error, else 2.
+fn sp_280(st) {
+    if (st == 0x1000) { return 3; }
+    if (st == 280) { return 1; }
+    return 2;
+}
+fn m_forkwait(child_mode) {
+    var c = syscall(96, 0, 0, 0, 0);
+    if (c == 0) {
+        if (child_mode == 1) { return m_mem(); }
+        return m_spin();
+    }
+    if (c < 0) { return 0x1000; }
+    return l_waitb(c);
+}
+fn m_forknoarm() {
+    if (sp_arm(512, 0) != 0) { return 3; }
+    var c = syscall(96, 0, 0, 0, 0);
+    if (c == 0) {
+        var g = l_spawn("exit 7");
+        if (g < 0) { return 1; }
+        if (l_waitb(g) != 7) { return 1; }
+        return 0;
+    }
+    if (c < 0) { return 3; }
+    return l_waitb(c) & 0xFF;
+}
+fn m_armspawn() {
+    if (sp_arm(0, 500) != 0) { return 3; }
+    var i = 0;
+    while (i < 5) { l_sleep(20); i = i + 1; }
+    l_spinto(l_us() + 30000);
+    return sp_280(sp_run("spin"));
+}
+# FORKREMAP (lifex §4.3): the parent's LIFO munmap rewinds the GLOBAL low cursor onto a page the fork child still
+# holds; the child's next mmap must NOT land on it.
+fn m_forkremap() {
+    if (syscall(25, &sp_fds, 0, 0, 0) != 0) { return 30; }
+    var a = sp_mmap();
+    if (a == 0) { return 31; }
+    store8(a, 0x5A);
+    var c = syscall(96, 0, 0, 0, 0);
+    if (c == 0) {
+        var t = l_us() + 2000000;
+        var got = 0;
+        while (l_us() < t) { if (syscall(5, load64(&sp_fds), &sp_kb, 1, 0) == 1) { got = 1; break; } l_sleep(10); }
+        if (got == 0) { return 14; }
+        var r = sp_mmap();
+        if (r == 0) { return 10; }
+        if (r == a) { return 11; }
+        if (r < SP_HI) { return 12; }
+        if (load8(a) != 0x5A) { return 13; }
+        return 0;
+    }
+    if (c < 0) { return 32; }
+    sp_munmap(a);
+    var w = sp_mmap();                 # the witness: the rewind really happened
+    if (w != a) { return 20; }
+    sp_munmap(w);
+    syscall(1, load64(&sp_fds + 8), "g", 1, 0);
+    return l_waitb(c) & 0xFF;
+}
+# FORK-HIMAP (HIGH block, low arena burnt by lifex): the child continues the parent's high-arena cursor.
+fn m_forkhimap() {
+    var h = sp_mmap();
+    if (h < SP_HI) { return 22; }
+    store8(h, 0x5A);
+    var c = syscall(96, 0, 0, 0, 0);
+    if (c == 0) {
+        var r = sp_mmap();
+        if (r == 0) { return 10; }
+        if (r == h) { return 11; }
+        if (r != h + 0x200000) { return 12; }
+        if (load8(h) != 0x5A) { return 13; }
+        return 0;
+    }
+    if (c < 0) { return 32; }
+    return l_waitb(c) & 0xFF;
+}
+fn m_himap2() {
+    var r1 = sp_mmap();
+    var r2 = sp_mmap();
+    if (r1 < SP_HI) { return 255; }
+    if (r2 < SP_HI) { return 255; }
+    return (r1 >> 21) & 0xFF;
+}
+fn sp_child8(mode) {
+    if (l_eq(mode, "mem") == 1) { return m_mem(); }
+    if (l_eq(mode, "mem2") == 1) { return m_mem2(); }
+    if (l_eq(mode, "mmaploop") == 1) { return m_mmaploop(); }
+    if (l_eq(mode, "memparent") == 1) { return sp_run("mem") & 0xFF; }
+    if (l_eq(mode, "memarmhigh") == 1) { if (sp_arm(100000, 0) != 0) { return 3; } return sp_run("mem") & 0xFF; }
+    if (l_eq(mode, "parent-spin") == 1) { return sp_280(sp_run("spin")); }
+    if (l_eq(mode, "armhigh") == 1) { if (sp_arm(0, 100000) != 0) { return 3; } return sp_280(sp_run("spin")); }
+    if (l_eq(mode, "forkspin") == 1) { return sp_280(m_forkwait(0)); }
+    if (l_eq(mode, "ew37x") == 1) {
+        var eo = l_cat(&l_line, 0, "/bin/spinner spin");
+        var er = syscall(37, &l_line, eo, 0, 0);
+        if (er < 0) { er = 0x1000; }
+        return sp_280(er);
+    }
+    if (l_eq(mode, "forkmem") == 1) { return m_forkwait(1) & 0xFF; }
+    if (l_eq(mode, "forknoarm") == 1) { return m_forknoarm(); }
+    if (l_eq(mode, "armsleep") == 1) {
+        if (sp_arm(512, 0) != 0) { return 3; }
+        syscall(1, 1, "k", 1, 0);
+        l_sleep(3000);
+        return 0;
+    }
+    if (l_eq(mode, "armexit") == 1) { if (sp_arm(512, 0) != 0) { return 3; } return 0; }
+    if (l_eq(mode, "spawn7") == 1) {
+        var s7 = l_spawn("exit 7");
+        if (s7 < 0) { var e = 4 - s7; if (e > 20) { e = 20; } return e; }
+        if (l_waitb(s7) == 7) { return 0; }
+        return 1;
+    }
+    if (l_eq(mode, "armspawn") == 1) { return m_armspawn(); }
+    if (l_eq(mode, "forkremap") == 1) { return m_forkremap(); }
+    if (l_eq(mode, "forkhimap") == 1) { return m_forkhimap(); }
+    if (l_eq(mode, "himap2") == 1) { return m_himap2(); }
+    return 0 - 1;
+}
+
+fn sp_child(mode) {
+    var s8 = sp_child8(mode);
+    if (s8 != (0 - 1)) { return s8; }
+    if (l_eq(mode, "exit") == 1) { return l_atoi(argv(2)); }
+    if (l_eq(mode, "spin") == 1) { return m_spin(); }
+    if (l_eq(mode, "spinms") == 1) { return m_spinms(l_atoi(argv(2))); }
+    if (l_eq(mode, "sys") == 1) { return m_sys(); }
+    if (l_eq(mode, "selfkill") == 1) { return m_selfkill(); }
+    if (l_eq(mode, "selfstop") == 1) { return m_selfstop(); }
+    if (l_eq(mode, "sleep") == 1) { l_sleep(l_atoi(argv(2))); return 0; }
+    if (l_eq(mode, "sleepreport") == 1) { return m_sleepreport(l_atoi(argv(2))); }
+    if (l_eq(mode, "flockwait") == 1) { if (m_flock_ex("/lf") < 0) { return 1; } return 0; }
+    if (l_eq(mode, "flockhold") == 1) { if (m_flock_ex("/lf") < 0) { return 1; } return m_spin(); }
+    if (l_eq(mode, "flockab") == 1) {
+        if (m_flock_ex("/lf") < 0) { return 1; }
+        l_sleep(100);
+        if (m_flock_ex("/lf2") < 0) { return 2; }
+        return 0;
+    }
+    if (l_eq(mode, "flockba") == 1) {
+        if (m_flock_ex("/lf2") < 0) { return 1; }
+        l_sleep(100);
+        if (m_flock_ex("/lf") < 0) { return 2; }
+        return 0;
+    }
+    if (l_eq(mode, "kbd") == 1) { return m_kbd(); }
+    if (l_eq(mode, "chanhold") == 1) { return m_spin(); }
+    if (l_eq(mode, "listen") == 1) { if (syscall(56, l_atoi(argv(2)), 0, 0, 0) < 0) { return 1; } return m_spin(); }
+    if (l_eq(mode, "auth") == 1) { return m_auth(l_atoi(argv(2))); }
+    if (l_eq(mode, "spawnexitpid") == 1) { var g = l_spawn1("sleep", 3000); if (g < 0) { return 250; } return g; }
+    if (l_eq(mode, "recycled") == 1) { return m_recycled(l_atoi(argv(2))); }
+    if (l_eq(mode, "tree") == 1) { l_spawn("spin"); l_spawn("spin"); return m_spin(); }
+    if (l_eq(mode, "spawnloop") == 1) { return m_spawnloop(0); }
+    if (l_eq(mode, "forkloop") == 1) { return m_spawnloop(1); }
+    if (l_eq(mode, "orphaner") == 1) { l_spawn1("sleep", 300); return 0; }
+    if (l_eq(mode, "orphanstay") == 1) { l_spawn1("sleep", 300); return m_spin(); }
+    if (l_eq(mode, "zparent") == 1) { l_spawn1("exit", 5); return m_spin(); }
+    if (l_eq(mode, "zparentexit") == 1) { l_spawn1("exit", 5); l_sleep(100); return 0; }
+    if (l_eq(mode, "zparentspin") == 1) { l_spawn("spin"); return 0; }
+    if (l_eq(mode, "racer") == 1) { l_spawn1("raceparent", l_atoi(argv(2))); return 0; }
+    if (l_eq(mode, "raceparent") == 1) { return m_raceparent(l_atoi(argv(2))); }
+    if (l_eq(mode, "exitafter") == 1) { l_spinto(l_us() + l_atoi(argv(2))); return 0; }
+    if (l_eq(mode, "stopchild") == 1) { return m_stopchild(); }
+    if (l_eq(mode, "ew37") == 1) {
+        if (argc() >= 3) {
+            if (argc() >= 4) {
+                var eo = l_cat(&sp_line, 0, argv(2));
+                store8(&sp_line + eo, 32);
+                eo = l_cat(&sp_line, eo + 1, argv(3));
+                store8(&sp_line + eo, 0);
+                return m_ew37(&sp_line);
+            }
+            return m_ew37(argv(2));
+        }
+        return m_ew37("spin");
+    }
+    if (l_eq(mode, "stopme") == 1) { if (l_kill(l_getpid(), 19) != (0 - 1)) { return 4; } return 3; }
+    if (l_eq(mode, "fault") == 1) { store64(0, 1); return 0; }
+    if (l_eq(mode, "sigrace") == 1) { return m_sigrace(l_atoi(argv(2))); }
+    if (l_eq(mode, "klugspam") == 1) { return m_klugspam(); }
+    if (l_eq(mode, "dial") == 1) { if (syscall(47, l_atoi(argv(2)), l_atoi(argv(3)), 0, 0) == (0 - 1)) { return 0; } return 1; }
+    if (l_eq(mode, "sendblock") == 1) { return m_sendblock(l_atoi(argv(2)), l_atoi(argv(3))); }
+    if (l_eq(mode, "pingsilent") == 1) { syscall(100, l_atoi(argv(2)), 10000, 0, 0); return 0; }
+    lo_out("LIFE-SPINNER-BAD-MODE\n");
+    return 99;
+}
+
+fn main(): i64 {
+    if (argc() < 2) { lo_out("LIFE-SPINNER-NO-MODE\n"); return 99; }
+    var r = sp_child(argv(1));
+    lo_flush();
+    return r;
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

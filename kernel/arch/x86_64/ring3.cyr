@@ -6,7 +6,8 @@
 # read at the bottom; with smp_sched_aps=1 two CPUs each in exec_and_wait would clobber one
 # another's params (CPU A's enter_ring3 reading CPU B's entry → iretq into the wrong RIP). Per-CPU
 # cell (cpu c at byte c*8); pcpu_cpu()'s cpu_count<2 fast path = slot 0 → single-core byte-identical.
-# Mirrors pcpu_ksyscall_a4 (syscall_hw.cyr). All loads happen post-CR3-switch under the per-proc CR3,
+# (The same per-CPU shape the syscall a4 cell had until 1.57.7 moved it per-process, proc_sc_a4 in proc.cyr —
+# these stay per-CPU: exec_and_wait never blocks between its set and its read.) All loads happen post-CR3-switch under the per-proc CR3,
 # which maps the kernel .bss (these arrays) + the APIC (pcpu_cpu()'s id read) — same residency the
 # pre-per-CPU plain-global read already required.
 var pcpu_exec_entry_g[4];
@@ -18,27 +19,9 @@ fn exec_rsp_g_get() { return load64(&pcpu_exec_rsp_g + pcpu_cpu() * 8); }
 var pcpu_exec_cr3_g[4];
 fn exec_cr3_g_set(v) { store64(&pcpu_exec_cr3_g + pcpu_cpu() * 8, v); return 0; }
 fn exec_cr3_g_get() { return load64(&pcpu_exec_cr3_g + pcpu_cpu() * 8); }
-# 1.44.14 PREEMPTIVE AGNSH: when nonzero, enter_ring3 starts the program with IF=1 (RFLAGS bit 9)
-# so the 100 Hz timer can PREEMPT it in ring 3 -> the scheduler time-slices a #43 background job
-# alongside it (the "shell stays live while a bg job runs" goal). Set ONLY by kybernet for the
-# long-running /bin/agnsh launch (init.cyr) and consumed-then-cleared on the next enter_ring3, so
-# the iron-validated FOREGROUND exec path (execwait#37 / `run /bin/X`, DOOM) stays IF=0 byte-for-byte.
-# SAFE because: agnsh is preempted in RING 3 (between syscalls), NOT mid-handler — the 1.44.6 IF=0
-# syscall invariant still holds, so the shared syscall kstack stays serial (a bg proc's syscalls
-# never clobber agnsh's frame) [1.57.6, Path 2 S3.3: there is no shared syscall kstack any more —
-# every process runs its syscalls on its own kernel stack, so this reason is now structural];
-# agnsh's CR3 maps the APIC so the timer ISR EOIs cleanly; and the
-# FIRST preemption's proc_save_context captures agnsh's real ring-3 CS=0x23/SS=0x1B (sched.cyr:94),
-# so no proc_set_ring3 is needed and the resume iretq lands in ring 3. (NOT the rejected in-handler
-# yield, which WOULD break the kstack-serial invariant.)
-# 1.56.51: PER-CPU, joining its four siblings above. A plain global here had the same defect they
-# were converted for and one worse consequence: CPU B could CONSUME CPU A's IF=1 arm (the clear
-# below is unconditional), so a FOREGROUND run-to-completion exec that must be IF=0 — the 1.44.6
-# serial-syscall-kstack invariant — would start with RFLAGS=0x202 and become preemptible on the
-# shared syscall kstack. Set by kybernet for the /bin/agnsh launch, consumed-then-cleared here.
-var pcpu_exec_preempt[4];
-fn exec_preempt_set(v) { store64(&pcpu_exec_preempt + pcpu_cpu() * 8, v); return 0; }
-fn exec_preempt_get() { return load64(&pcpu_exec_preempt + pcpu_cpu() * 8); }
+# (1.57.7 S3b-F4: pcpu_exec_preempt / exec_preempt_set / exec_preempt_get are GONE. They were kybernet's 1.44.14 arm
+# for an IF=1 /bin/agnsh started out of band here; agnsh is a scheduled child of kmain now (kernel_run_child), and
+# every program this path still enters is a pre-scheduler boot-selftest child, which runs IF=0.)
 # 1.44.14: the proc whose exit() should fire kernel_resume (the run-to-completion FOREGROUND proc
 # exec_and_wait is waiting on). Set at exec_and_wait entry; gated in exit#0 so a preemptively-
 # scheduled #43 background job's exit() never hijacks agnsh's resume. Saved/restored by execwait#37.
@@ -63,8 +46,15 @@ fn exec_resume_pid_get() { return load64(&pcpu_exec_resume_pid + pcpu_cpu() * 8)
 var pcpu_exec_ctx[32];
 fn exec_ctx_base() { return &pcpu_exec_ctx + pcpu_cpu() * 64; }
 
-# Execute a user process and wait for it to exit.
-# Saves kernel return context so exit syscall returns here.
+# Execute a user process and wait for it to exit — OUT OF BAND (IF=0, run to completion, entered by enter_ring3's
+# iretq and left by the child's exit#0 / fault kill longjmp'ing through kernel_resume). Saves the kernel return
+# context so the exit syscall returns here.
+# ⭐ 1.57.7 (S3b-F4) — BOOT-ONLY. After `sched_active = 1` every kernel launch is a scheduled child kmain blocks for
+# (kernel_run_child, via kernel_exec_foreground) and execwait#37 is a blocking wait, so this path serves only the
+# pre-scheduler `sh_exec("run …")` selftest hooks (kernel_exec_boot), bote, and a KTEST-build kybernet. A call after
+# the scheduler starts is REFUSED (-1, the latched `exec: exec_and_wait is boot-only -- refused after sched_active`,
+# denied by every smoke) with current restored to kmain — see the check below. Retiring the path entirely (moving
+# those hooks after the scheduler) is a planned 1.58 step (OQ-11). docs/architecture/foreground-exec.md.
 fn exec_and_wait(entry, rsp, cr3) {
     # 1.40.4: FIRST thing — snapshot the full kernel resume context into exec_ctx
     # (callee-saved regs still hold the CALLER's values here; the body below may
@@ -87,6 +77,15 @@ fn exec_and_wait(entry, rsp, cr3) {
         0x48; 0x8B; 0x55; 0x08;       # mov rdx, [rbp+8]    (return addr)
         0x48; 0x89; 0x50; 0x38;       # mov [rax+56], rdx
     }
+    # ⭐ 1.57.7 (S3b-F4): BOOT-ONLY. After the scheduler starts the only kernel context that can get here is kmain
+    # (pid 0), and every caller has just set current = the child: restore it so kmain does not continue under a stale
+    # pid (the hazard kernel_resume's proc_current_set(0) exists for). Nothing else has changed yet — no FG-1, no
+    # kstack_install, no CR3 — so -1 leaves everything consistent; the caller reaps its child as on any failure.
+    if (sched_active != 0) {
+        fg_latch(16, "exec: exec_and_wait is boot-only -- refused after sched_active", 62);
+        proc_current_set(0);
+        return 0 - 1;
+    }
     # ⭐ 1.57.6 (Path 2, S3.3): the out-of-band entry's invariants, asserted (latched, klug + COM1): IF must be 0
     # (every caller brackets with kbd_irq_save; a tick between its proc_current_set(child) and the pin below
     # would save the CALLER's registers into the child's slot) and preempt_count must be 0 (a process only
@@ -101,18 +100,8 @@ fn exec_and_wait(entry, rsp, cr3) {
     # agnsh's resume (it just goes state 0 for waitpid#4). Saved/restored across execwait#37 nesting.
     exec_resume_pid_set(proc_current_get());
 
-    # 1.46.x SMP sub-bite 7 STEP-2 (2026-06-26): PIN the foreground proc to THIS CPU.
-    # A foreground (exec_and_wait / run-to-completion) proc carries a kernel resume context
-    # (exec_ctx setjmp, above) saved on THIS CPU's kernel stack, so it must never run on another
-    # CPU. It is also entered out-of-band via enter_ring3 (below) — NOT through do_context_switch —
-    # so it lives at state==1/on_cpu==-1 while running here; under smp_sched_aps=1 a woken AP's
-    # sched_next would otherwise see it (state==1, on_cpu==-1, idle_owner==-1) and DOUBLE-RUN it on
-    # the same CR3 + user stack. idle_owner is the per-proc CPU-pin (idles were its first users):
-    # sched_idx_pickable's foreign-pin skip (sched.cyr:48) makes every OTHER CPU skip this proc, while
-    # THIS CPU still re-picks it after a preemption. Cleared on slot reuse (proc_alloc_slot). Set
-    # BEFORE enter_ring3 so the proc is excluded the moment it can be scheduled. Inert single-core
-    # (pcpu_cpu()==0; sched_idx_pickable's io==pcpu_cpu() branch keeps the BSP picking it).
-    idle_owner_set(proc_current_get(), pcpu_cpu());
+    # (1.57.7 S3b-F4: the idle_owner PIN that stood here is gone — this path runs only before `sched_active = 1`,
+    # when nothing schedules, so no other CPU can pick the child; FG-1 below keeps INV-11/INV-RUN true for it.)
     # ⭐ 1.57.6 (Path 2, S3.3) — FG-1: THE OUT-OF-BAND CHILD IS RUNNING HERE, AND SAYS SO. A foreground child
     # used to sit at state 3 (execwait#37, elf_load_from_file's CLAIMING) or 1 with on_cpu == -1 while it
     # ran, so "on_cpu == -1 ⇔ nobody is on its stack or CR3" (INV-11) and INV-RUN (the proc current on a
@@ -217,24 +206,12 @@ fn enter_ring3(entry, user_rsp) {
     var fp = 0x7000 + pcpu_cpu() * 0x40;
     store64(fp + 0, entry);
     store64(fp + 8, 0x23);
-    # RFLAGS: bit 1 (reserved) always set. IF (bit 9) gates preemption in ring 3.
-    # FOREGROUND exec (exec_preempt==0) keeps IF CLEARED (0x002) — the iron-validated
-    # run-to-completion model: exec_and_wait blocks until exit()/kernel_resume, and a
-    # foreground program is not meant to be preempted. (Pre-1.40.3 a timer ISR under the
-    # MINIMAL user CR3 lacked the Local APIC and triple-faulted on EOI; SYSCALL is
-    # IF-independent so write()/exit() still work with IF=0.)
-    # 1.44.14 PREEMPTIVE AGNSH (exec_preempt!=0, set by kybernet for /bin/agnsh only): start
-    # with IF=1 (0x202) so the timer preempts agnsh in RING 3 between its prompt-poll syscalls
-    # and the scheduler hands a #43 background job a slice. Safe now (vs the 1.40.3 era) because
-    # agnsh runs under a FULL per-proc CR3 c that maps the kernel + Local APIC (proc.cyr), so the
-    # timer ISR EOIs cleanly with no CR3 swap; do_context_switch save/restore is identical to any
-    # scheduled proc (proc_current_get()==agnsh_pid, slot CR3==c). The flag is consumed-then-cleared so
-    # only THIS first entry is affected (resumes go through the normal ISR iretq); foreground #37
-    # stays IF=0.
-    var rflags_start = 0x002;
-    if (exec_preempt_get() != 0) { rflags_start = 0x202; }
-    exec_preempt_set(0);                    # consume — foreground execs after this stay IF=0
-    store64(fp + 16, rflags_start);
+    # RFLAGS: bit 1 (reserved) always set; IF (bit 9) CLEAR (0x002) — the pre-scheduler run-to-completion model:
+    # exec_and_wait blocks until exit()/kernel_resume and nothing schedules yet. SYSCALL is IF-independent, so
+    # write()/exit() still work with IF=0. (1.57.7 S3b-F4: the exec_preempt IF=1 arm kybernet used for /bin/agnsh is
+    # gone — agnsh is a scheduled child now — so this is the ONLY IF=0 ring-3 entry, and it is pre-scheduler only:
+    # INV-FG-1, whose tripwire is fg_if0_tripwire at #14/#44.)
+    store64(fp + 16, 0x002);
     store64(fp + 24, user_rsp);
     store64(fp + 32, 0x1B);
 
@@ -305,6 +282,81 @@ fn iretq_to_ring3(fp) {
         0x48; 0xCF;                # iretq
     }
     return 0;
+}
+
+# ═══════════════ 1.57.7 (S3b) — THE KMAIN FOREGROUND LAUNCH (docs/architecture/foreground-exec.md) ═══════════════
+# After `sched_active = 1` kmain (pid 0: the emergency shell's `run`, kybernet's /bin/agnsh, the post-scheduler boot
+# selftest hooks) launches a program as an ORDINARY SCHEDULED CHILD and BLOCKS until it exits — the same model
+# execwait#37 uses — instead of entering it out of band (exec_and_wait: IF=0, pinned, kmain's continuation in
+# per-CPU cells). kmain may block: it is a real proc (state 2, on_cpu = BSP) on its own region-1 stack and the boot
+# CR3, and it stays BSP-pinned (idle_owner 0) because that stack is the BSP boot stack (D22).
+# kernel_run_child_keep(pid, pin): `pid` is elf_load_from_file's state-3 child of the CURRENT kernel context (kmain).
+# Blocks until it exits; returns its RAW exit code with the child DEAD BUT UNREAPED and proc_fgwait[me] still naming
+# it (INV-FG-2: its slot cannot be reused, so its page is still mapped — the KSTACK fallback phase reads it).
+# -1 with kr_refused = 1 = refused (the child was already reaped) or a defensive abnormal end (child orphaned).
+# ⚠ kr_refused exists because a child may itself exit(-1): the caller must never mistake that code for a refusal
+# (and skip or double the reap). Only kmain calls these (BSP-pinned, one at a time), so one module cell is exact.
+var kr_refused = 0;
+fn kernel_run_child_keep(pid, pin) {
+    var kr_me = proc_current_get();
+    kr_refused = 0;
+    if (sched_active == 0) { proc_reap(pid); kr_refused = 1; return 0 - 1; }
+    if (preempt_count_get() != 0) { proc_reap(pid); kr_refused = 1; fg_latch(2, "fg: kernel_run_child cannot block here -- child reaped, -1", 58); return 0 - 1; }
+    if (wq_can_block() == 0) { proc_reap(pid); kr_refused = 1; fg_latch(2, "fg: kernel_run_child cannot block here -- child reaped, -1", 58); return 0 - 1; }
+    # Belt-and-braces, NOT load-bearing for R1 (proc_wait_child_exit brackets IF itself): keeps the BSP-pinned child
+    # off this CPU until we have parked, so CP 0x20 -> 0x21 and the first dispatch are ordered deterministically.
+    var kr_f = kbd_irq_save();
+    syscall_msr_init();                # the per-launch STAR/LSTAR/SFMASK/EFER.SCE re-assert exec_and_wait always did
+    #                                    (1.40.3 history); this CPU only — the entry stub is never rebuilt (D-34)
+    proc_set_ring3(pid);
+    if (pin >= 0) { idle_owner_set(pid, pin); }   # D22: BSP-pinned (pin 0) for every kmain launch
+    proc_fgwait_set(kr_me, pid + 1);   # INV-FG-2: before the child can run
+    fg_first_entry_pid = pid + 1;      # arm the CP 0x21 breadcrumb (sched.cyr fg_note_first_entry)
+    # CMOS CP 0x20: a kernel-launched ring-3 program is about to become runnable (was: enter_ring3's iretq).
+    # asm contract: no inputs/outputs; clobbers al only (outb 0x70 <- 0x50, outb 0x71 <- 0x20).
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x20; 0xE6; 0x71; }
+    pd_audit(proc_get_cr3(pid), 5);    # tag 5 = kernel_run_child, just before READY
+    proc_set_state(pid, 1);
+    var kr_w = proc_wait_child_exit(pid);   # kmain is never signalled (non-user); 2/3 = cannot block / collapsed
+    kbd_irq_restore(kr_f);
+    if (kr_w != 0) {                   # defensive: unreachable after the prechecks. The child is left as an orphan.
+        fg_first_entry_pid = 0;
+        proc_fgwait_set(kr_me, 0);
+        kr_refused = 1;
+        return 0 - 1;
+    }
+    return proc_get_exit_code(pid);
+}
+# The second half: reap the child kernel_run_child_keep left dead-unreaped, THEN clear the fgwait cell (INV-FG-2:
+# only after the reap). flush 1 = proc_reap's foreground door (flushes the child's write-back fds), 0 = proc_reap_child.
+fn kernel_run_child_done(pid, flush) {
+    if (flush != 0) { proc_reap(pid); } else { proc_reap_child(pid); }
+    proc_fgwait_set(proc_current_get(), 0);
+    return 0;
+}
+fn kernel_run_child(pid, pin) {
+    var krc = kernel_run_child_keep(pid, pin);
+    if (kr_refused != 0) { return 0 - 1; }       # refused paths already reaped (or orphaned); never reap twice
+    kernel_run_child_done(pid, 1);
+    return krc;
+}
+# Pre-scheduler (sched_active == 0) only: the out-of-band IF=0 run-to-completion path every boot selftest hook uses
+# (exec_and_wait -> the child's exit#0 -> kernel_resume back here). Restores the caller's IF. Returns the RAW code.
+fn kernel_exec_boot(pid) {
+    var kb_ep = &proc_table + pid * 176;
+    var kb_rf = kbd_irq_save();
+    proc_current_set(pid);
+    exec_and_wait(load64(kb_ep + 24), load64(kb_ep + 16), load64(kb_ep + 160));
+    var kb_code = proc_get_exit_code(pid);
+    proc_reap(pid);
+    kbd_irq_restore(kb_rf);
+    return kb_code;
+}
+# The ONE entry the SHARED shell.cyr / init.cyr use (aarch64 has a stub): scheduled + blocking after sched_active,
+# the boot path before it.
+fn kernel_exec_foreground(pid, pin) {
+    if (sched_active != 0) { return kernel_run_child(pid, pin); }
+    return kernel_exec_boot(pid);
 }
 
 # spawn_user_proc: create a user process from a kernel function address.

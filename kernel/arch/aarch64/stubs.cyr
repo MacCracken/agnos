@@ -30,6 +30,11 @@ fn kbd_irq_disable() { return 0; }
 # IRQ save/restore pair (keyboard.cyr). No-ops here, like the pair above.
 fn kbd_irq_save() { return 0; }
 fn kbd_irq_restore(f) { return 0; }
+# 1.57.7 (Path 2, S3.5): vfs.cyr (shared) reaches the flock table's lock and its wakes through vfs_close; the
+# wait/wake primitive and the lock are x86-only (sched.cyr, smp.cyr), so aarch64 gets no-op stand-ins.
+fn flock_spin_lock() { return 0; }
+fn flock_spin_unlock() { return 0; }
+fn wq_wake(k) { return 0; }
 
 # Context switch stubs (x86-specific register save/restore)
 fn proc_save_context(pid, isr_rsp) { return 0; }
@@ -39,6 +44,7 @@ fn do_context_switch(isr_rsp) { return 0; }
 # Ring 3 stubs
 fn enter_ring3(entry, user_rsp) { return 0; }
 fn exec_and_wait(entry, rsp, cr3) { return 0; }
+fn kernel_exec_foreground(pid, pin) { proc_reap(pid); return 0 - 1; }   # 1.57.7 (S3b): the shared launch entry (x86: ring3.cyr)
 fn spawn_user_proc(entry_fn) { return 0 - 1; }
 fn tss_set_rsp0(rsp0) { return 0; }
 
@@ -103,6 +109,11 @@ fn tcp_connect(a, b, c) { return 0 - 1; }
 fn tcp_send(a, b, c) { return 0 - 1; }
 fn tcp_recv(a, b, c) { return 0; }
 fn tcp_close(a) { return 0 - 1; }
+# 1.57.7 (S5): vfs.cyr's VFS_SOCK paths call the owned forms (no TCP on aarch64: every conn is refused).
+fn tcp_fd_owner(a) { return 0 - 1; }
+fn tcp_recv_own(a, b, c, d) { return 0; }
+fn tcp_send_own(a, b, c, d) { return 0 - 1; }
+fn tcp_close_own(a, b) { return 0 - 1; }
 
 # VirtIO-blk stubs
 var vblk_active = 0;
@@ -280,3 +291,13 @@ fn arch_halt() { wfi(); return 0; }
 # on a magic mismatch, which the callers already treat as "did not stop the machine".
 fn arch_cli() { return 0; }
 fn power_sys(magic1, magic2, cmd, arg) { return 0 - 1; }
+
+# 1.57.7 (S7) — the lifecycle names shared code reaches. The death chain, the tick path and the signal delivery live
+# in x86-only files (syscall.cyr / sched.cyr); this port has no ring-3 processes to end, stop or continue.
+# proc_create_user (shared proc.cyr) asks proc_birth_check: always "born". The klug lock is uncontended on one core
+# (trylock always wins). The signal-bit atomics are plain RMWs (no second CPU runs ring-3 code here).
+fn proc_birth_check(child, creator) { return 1; }
+fn klug_trylock() { return 0; }
+fn klug_unlock() { return 0; }
+fn atomic_or64(addr, v) { store64(addr, load64(addr) | v); return 0; }
+fn atomic_and64(addr, v) { store64(addr, load64(addr) & v); return 0; }

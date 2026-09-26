@@ -84,8 +84,6 @@ mkfs.ext2 -F -q -L AGNOS-FORKER -b 4096 -m 0 \
     -O "$EXT2_SMOKE_FEATURES" \
     -d "$SEED" -E offset=$PART_OFFSET "$IMG" $PART_BLOCKS
 
-cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
-LOG="$LOGS/agnsh.log"
 echo "Booting FORK_SELFTEST kernel (NVMe + ext2 with /bin/forker)..."
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
 
@@ -102,31 +100,28 @@ echo "Booting FORK_SELFTEST kernel (NVMe + ext2 with /bin/forker)..."
 # is retryable. Gating on the banner keeps a REAL regression from being retried away — which is
 # exactly the risk in sweep.sh's unconditional double-run, where a genuine failure gets two chances
 # to look like a flake. If the banner is present, whatever the assertions say is the verdict.
-# 1.57.6 (S3): SMOKE_SMP=N boots with -smp N (default 1 = unchanged); see smoke_accel in qemu-dwell.sh.
-SMOKE_SMP="${SMOKE_SMP:-1}"
-ACCEL="$(smoke_accel "$SMOKE_SMP")"
-echo "accel: $ACCEL (-smp $SMOKE_SMP)"
-QEMU_TRIES="${QEMU_TRIES:-3}"
-qtry=1
-while [ "$qtry" -le "$QEMU_TRIES" ]; do
-    cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
-    qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
-        qemu-system-x86_64 \
-        -machine q35 -m 512M $ACCEL -smp "$SMOKE_SMP" \
-        -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
-        -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
-        -drive "file=$IMG,format=raw,if=none,id=disk0" \
-        -device "nvme,drive=disk0,serial=AGNOS-FORKER" \
-        -serial stdio -display none -no-reboot
-    if strings "$LOG" | grep -q "AGNOS kernel v"; then break; fi
-    if [ "$qtry" -lt "$QEMU_TRIES" ]; then
-        echo "  (firmware never handed off — kernel did not start; retrying $qtry/$((QEMU_TRIES - 1)))"
-    else
-        echo "  UEFI never handed off to the kernel in $QEMU_TRIES attempts — INFRASTRUCTURE, not the kernel."
-        echo "  The assertions below therefore describe nothing; treat this run as VOID, not as a failure."
-    fi
-    qtry=$((qtry + 1))
-done
+# ⭐ 1.57.7 (S3d, S3.9): BOTH SMP BY DEFAULT — one invocation boots -smp 1 THEN -smp 4 (fork's child resumes through
+# the scheduler, and the -smp 4 boot runs it on real parallel CPUs with KVM when /dev/kvm is writable — printed).
+# Each boot goes through qemu_dwell_kernel (the classified, banner-gated retry: 6 tries) and qemu_assert_booted
+# (a boot with no banner is VOID, never scored). SMOKE_SMP=N set explicitly keeps ONE boot at -smp N.
+# Exit 0 only when every boot passed, 1 on any FAIL, 2 when a boot was VOID (and nothing failed).
+SMPS="${SMOKE_SMP:-1 4}"
+rc=0; nvoid=0
+for SMP in $SMPS; do
+LOG="$LOGS/agnsh-smp$SMP.log"
+ACCEL="$(smoke_accel "$SMP")"
+BIMG="$WORK/agnos-agnsh-smp$SMP.img"; cp "$IMG" "$BIMG"          # a fresh disk per boot (the first boot may write)
+echo ""
+echo "=== boot -smp $SMP  accel: $ACCEL ==="
+qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" "$WORK/vars.fd" "$OVMF_VARS_SRC" \
+    qemu-system-x86_64 \
+    -machine q35 -m 512M $ACCEL -smp "$SMP" \
+    -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
+    -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
+    -drive "file=$BIMG,format=raw,if=none,id=disk0" \
+    -device "nvme,drive=disk0,serial=AGNOS-FORKER" \
+    -serial stdio -display none -no-reboot
+if ! qemu_assert_booted "$LOG"; then echo "  VOID: [smp$SMP] the kernel never ran (not scored)"; nvoid=$((nvoid+1)); continue; fi
 
 echo ""
 echo "  --- boot tail (kybernet onward) ---"
@@ -139,28 +134,47 @@ rc=0
 # for every case with more than one child: a single child is the top proc slot, so the LIFO collapse
 # in proc_reap_child deleted the row and the stale-ppid phantom could not form. FORK-MULTI-OK is the
 # marker that goes red if either `store64(&proc_ppid + pid * 8, 0)` is removed from proc.cyr.
-for m in "FORKER-ALIVE" "FORK-CHILD" "FORK-CHILD-OK" "FORK-PARENT" "FORK-PARENT-OK" "FORK-MULTI-BEGIN" "FORK-MULTI-OK"; do
-    if strings "$LOG" | grep -q "$m"; then
-        echo "  PASS: $m"
+# ⭐ 1.57.7 (Path 2, S3.4): the forker runs TWICE — scheduled (kmain marks it READY; an IF=1 parent) and then in the
+# FOREGROUND (`run /bin/forker`: an exec_and_wait child, an IF=0 parent that yields between its waitpid polls). Every
+# marker must appear once per arm (exact-line count >= 2), and the phase-1 child must report IF=1 in BOTH arms:
+# sys_fork forces IF in the child's RFLAGS, so a forked child is an ordinary scheduled process whatever its
+# parent's IF (mutation M-C12 — the `| 0x200` removed — makes the foreground arm's child say FORKER-CHILD-IF=0).
+for m in "FORKER-ALIVE" "FORK-CHILD" "FORK-CHILD-OK" "FORK-PARENT" "FORK-PARENT-OK" "FORK-MULTI-BEGIN" "FORK-MULTI-OK" "FORKER-CHILD-IF=1"; do
+    mc=$(strings "$LOG" | grep -cx "\(\[[^]]*\] \)\{0,1\}$m")
+    if [ "$mc" -ge 2 ]; then
+        echo "  PASS: [smp$SMP] $m (x$mc: scheduled + foreground arms)"
     else
-        echo "  FAIL: $m absent"; rc=1
+        echo "  FAIL: [smp$SMP] $m seen $mc time(s), want >= 2 (one per arm)"; rc=1
     fi
 done
+if strings "$LOG" | grep -q "FORKER-CHILD-IF=0"; then
+    echo "  FAIL: [smp$SMP] a forked child ran with IF=0 (sys_fork must force IF in the child's RFLAGS)"; rc=1
+else
+    echo "  PASS: [smp$SMP] no forked child ran with IF=0"
+fi
+if strings "$LOG" | grep -q "fork: foreground SURVIVED back in kernel"; then
+    echo "  PASS: [smp$SMP] the foreground (IF=0 parent) arm returned to the kernel"
+else
+    echo "  FAIL: [smp$SMP] the foreground arm never returned (hang or fault)"; rc=1
+fi
 # ⛔ The named failure lines the program emits are more informative than a missing marker — print any.
-strings "$LOG" | grep -E "FORK-FAILED|FORK-COW-LEAK|FORK-WAIT-|FORK-CHILD-STACK-WRONG|FORK-CHILD-WRITE-WRONG|FORK-PARENT-STACK-CLOBBERED|FORK-MULTI-DUP|FORK-MULTI-GHOST|FORK-MULTI-TIMEOUT|FORK-MULTI-EARLY-NOCHILD|FORK-MULTI-WRONG-CODE|FORK-MULTI-NOFORK" | sed 's/^/  SAID: /'
+strings "$LOG" | grep -E "FORK-FAILED|FORK-COW-LEAK|FORK-WAIT-|FORK-CHILD-STACK-WRONG|FORK-CHILD-RSP-WRONG|FORK-CHILD-WRITE-WRONG|FORK-PARENT-STACK-CLOBBERED|FORK-MULTI-DUP|FORK-MULTI-GHOST|FORK-MULTI-TIMEOUT|FORK-MULTI-EARLY-NOCHILD|FORK-MULTI-WRONG-CODE|FORK-MULTI-NOFORK" | sed 's/^/  SAID: /'
 # ⚠ The box must SURVIVE the fork — a child resuming on a bad context would fault or hang, and the
 # selftest prints this only after sh_exec returns.
 if strings "$LOG" | grep -q "fork: SURVIVED back in kernel"; then
-    echo "  PASS: kernel resumed after the forked run"
+    echo "  PASS: [smp$SMP] kernel resumed after the forked run"
 else
-    echo "  FAIL: never returned from the forked run (hang or fault)"; rc=1
+    echo "  FAIL: [smp$SMP] never returned from the forked run (hang or fault)"; rc=1
 fi
 # ⛔ 1.57.6 (S3-fix): the kernel's latched invariant lines (SMOKE_INVARIANT_DENY, qemu-dwell.sh) fire once to klug +
 # COM1 and change no exit code — this gate scored PASS with them firing until it grepped for them.
 if strings "$LOG" | grep -qE "$SMOKE_INVARIANT_DENY"; then
-    echo "  FAIL: a latched kernel invariant line fired:"; strings "$LOG" | grep -E "$SMOKE_INVARIANT_DENY" | head -5 | sed 's/^/        /'; rc=1
+    echo "  FAIL: [smp$SMP] a latched kernel invariant line fired:"; strings "$LOG" | grep -E "$SMOKE_INVARIANT_DENY" | head -5 | sed 's/^/        /'; rc=1
 else
-    echo "  PASS: no latched kernel invariant line (non-ready pick, out-of-band asserts, kstack_check_entry, #DF)"
+    echo "  PASS: [smp$SMP] no latched kernel invariant line (non-ready pick, out-of-band asserts, kstack_check_entry, #DF)"
 fi
-[ "$rc" = "0" ] && echo "fork-smoke: PASS" || echo "fork-smoke: FAIL"
-exit $rc
+done
+if [ "$rc" != "0" ]; then echo "fork-smoke: FAIL (smp: $SMPS)"; exit 1; fi
+if [ "$nvoid" -ne 0 ]; then echo "fork-smoke: VOID ($nvoid boot(s) never handed off — infrastructure, not the kernel)"; exit 2; fi
+echo "fork-smoke: PASS (smp: $SMPS)"
+exit 0

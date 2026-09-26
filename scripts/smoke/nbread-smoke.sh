@@ -6,7 +6,9 @@
 #   "nbread: no-input WOULD_BLOCK OK" — an empty ring returns -2 (WOULD_BLOCK), NOT 0 (EOF).
 #   "nbread: partial accumulate OK"  — 'h''i' with no Enter still returns -2 + accumulates 2 bytes.
 #   "nbread: enter line OK"          — Enter flushes the 3-byte line "hi\n" + resets the accumulator.
-#   "nbread: ALL PASS"               — all three green.
+#   "nbread: line released OK"       — (1.57.7, S3d) the completed line released the cooked keyboard line: the NB
+#                                      reader owned it only while its partial line lived (NB-OWN)
+#   "nbread: ALL PASS"               — all four green.
 #
 # Build first:  NBREAD_SELFTEST=1 ./scripts/build.sh
 # Requires: qemu-system-x86_64, OVMF firmware, mtools, parted, gnoboot built.
@@ -54,18 +56,24 @@ cp "$OVMF_VARS" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 echo "=== AGNOS 1.44.x non-blocking cooked-line read smoke ==="
 LOG="$LOGS/nbread.log"
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
-qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
+# ⭐ 1.57.7 (S3d): qemu_dwell_kernel (the classified, banner-gated retry) + qemu_assert_booted — a boot with no
+# "AGNOS kernel v" is VOID (exit 2), never scored as a missing marker.
+qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" "$WORK/vars.fd" "$OVMF_VARS" \
     qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$ESP,format=raw,if=none,id=esp0" -device "nvme,drive=esp0,serial=AGNOS-SMOKE" \
     -serial stdio -display none -no-reboot
+if ! qemu_assert_booted "$LOG"; then echo "nbread-smoke: VOID (the kernel never ran)"; exit 2; fi
 
 echo "--- serial (nbread lines) ---"; strings "$LOG" | grep "nbread:" | sed 's/^/  /'
 rc=0
 if strings "$LOG" | grep -q "nbread: no-input WOULD_BLOCK OK"; then echo "PASS: an empty kb_buf returns -2/WOULD_BLOCK (distinct from Ctrl-D EOF=0) — the poll sentinel agnsh special-cases before its EOF check"; else echo "FAIL: 'nbread: no-input WOULD_BLOCK OK' not found — non-blocking read returned the wrong no-input value"; rc=1; fi
 if strings "$LOG" | grep -q "nbread: partial accumulate OK"; then echo "PASS: 'h''i' with no Enter returns -2 + accumulates across the call (kernel partial-line accumulator persists)"; else echo "FAIL: 'nbread: partial accumulate OK' not found — partial line not buffered, or returned a complete line early"; rc=1; fi
 if strings "$LOG" | grep -q "nbread: enter line OK"; then echo "PASS: Enter flushes the accumulated line 'hi\\n' (104,105,10) to the user buffer + resets the accumulator"; else echo "FAIL: 'nbread: enter line OK' not found — Enter flush / byte content / reset regression"; rc=1; fi
+if strings "$LOG" | grep -q "nbread: line released OK"; then echo "PASS: the completed NB line released the cooked keyboard line (NB-OWN held it only while the partial line lived; 1.57.7)"; else echo "FAIL: 'nbread: line released OK' not found — the NB reader kept the keyboard line after its line completed"; rc=1; fi
+if strings "$LOG" | grep -qE "$SMOKE_INVARIANT_DENY"; then echo "FAIL: a latched kernel invariant line fired: $(strings "$LOG" | grep -E "$SMOKE_INVARIANT_DENY" | head -3 | tr '\n' ' ')"; rc=1; else echo "PASS: no latched kernel invariant line (SMOKE_INVARIANT_DENY)"; fi
 if strings "$LOG" | grep -q "nbread: ALL PASS"; then echo "PASS: kbd_read_nonblock end-to-end — the kernel half of schedulable agnsh"; else echo "FAIL: 'nbread: ALL PASS' not found"; rc=1; fi
+[ "$rc" = "0" ] && echo "nbread-smoke: PASS" || echo "nbread-smoke: FAIL"
 exit $rc

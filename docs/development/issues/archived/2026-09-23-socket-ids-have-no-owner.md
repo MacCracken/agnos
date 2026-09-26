@@ -1,6 +1,6 @@
 # 2026-09-23 — TCP connection ids have no owner: any process can read, write or close any connection
 
-**Status:** 🟡 **OPEN** — fixed by step **S5** (owner tag pid+1 and epoch stamped inside `tcp_slot_claim`; `tcp_auth` on #48/#49/#50/#57; release at death; the same stamp for UDP ids #51/#53/#54). Builds on S4. Not in 1.57.6. The Path 2 foundation this step builds on — per-process syscall kernel stacks, the deferred `on_cpu` release, preempt-disabling spinlocks, region-7 guard pages (bites S3.1–S3.3) — landed in **1.57.6**; see `docs/development/planning/blocking-syscall-concurrency.md` § Path 2 plan and the roadmap's 1.57.x table.
+**Status:** ✅ **RESOLVED 1.57.7 (2026-09-25)** — step S5: every TCP connection and listener and every UDP listener is owned by the process incarnation (pid + epoch) that opened it; `#47`–`#57` and `#106` check the owner first and return −1 to anyone else; ids are released (one FIN) at the owner's exit or fault. Gate: `scripts/smoke/sock-owner-smoke.sh` (sweep row, 94/0: 30 kernel arms O0–A8, U1–U4; ring 3 `SOCK-CHILD-REFUSED`, no `-READ-LEAK`, the release markers; `-smp 1` and `-smp 4`). Built, gated, NOT burned. See § Resolution.
 **Filed by:** daimon (the AGNOS agent orchestrator). It serves an HTTP API and starts agent processes
 beside it on the same box.
 **Checked against:** agnos **1.57.5**: the `#48`, `#49` and `#50` arms in `kernel/core/syscall.cyr`,
@@ -40,3 +40,19 @@ over, an explicit transfer (like `CH_ENDOW`) keeps the rule.
 
 Nothing in ring 3 can close this. daimon's AGNOS support (2.4.0) documents it as a known exposure:
 until this is fixed, an agent on the same agnos box can interfere with daimon's API.
+
+## Resolution (1.57.7, 2026-09-25)
+
+**What shipped:** owner tag (pid+1) and epoch stamped inside `tcp_slot_claim_locked` (TCP stride 176: +152 owner,
++160 epoch, +168 local address); a passive child inherits its listener's stamp; UDP stride 64 with the same stamp
+and a boot-time buffer pool; `VFS_SOCK` read/write/close and epoll guarded by the owner; `tcp_release_pid` /
+`udp_release_pid` from the death chain. A connection that dies keeps its id until its owner closes it (operator
+OQ-3). No transfer operation (none asked).
+
+**What the change broke — checked before archiving:** an inherited tagged socket fd is inert in a fork child (cyrius
+`sys_close` on it no longer FINs the parent's connection — intended); `udp_unbind`#54 on an already-free id is now
+−1 (was 0); `udp_send`#52 returns the frame length and refuses another owner's source port. Found in the end review
+and fixed (ENDFIX S5-R1): the demux ignored the local address (+168), so two connections from one port to two 127/8
+addresses collided — `tcp_find_conn` now matches it (arm A6d).
+
+**Evidence:** `~/.claude/projects/-home-macro-Repos-agnos/handoff-1.57.7/steps/S5-report.json`, `ENDFIX-report.json`.

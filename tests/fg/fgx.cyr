@@ -1,0 +1,320 @@
+# fgx — the DRIVER of agnos 1.57.7's foreground-exec gate (step S3b; docs/architecture/foreground-exec.md).
+#
+# ⛔ WHAT IS UNDER TEST. Until S3b an execwait#37 child ran OUT OF BAND: pinned to its caller's CPU, IF=0, never
+# scheduled, its caller's continuation parked in per-CPU cells — so it could not be preempted, yield, block, nest,
+# or accrue CPU time, and every other process on that CPU starved while it ran. S3b makes #37 a real blocking wait:
+# the child is an ordinary scheduled IF=1 process and the CALLER blocks in the kernel (#99 state 6). Every phase here
+# is a property only the second model has (TICKS, SIBLING, YIELD, NEST) or one both must keep (the rest).
+#
+# Seeded as /bin/agnsh on a PLAIN kernel (D19): kybernet launches it, so it is exactly where agnsh runs its `run`
+# commands. The roles are /bin/fgc (fgc.cyr). scripts/smoke/fg-smoke.sh reads the lines:
+#   FG-PHASE <name>, then FG-<PHASE>-OK or FG-FAIL <phase> <detail>; FG-DONE pass=P fail=F; exit 0 (a non-zero exit
+#   would drop kybernet into its emergency shell and bury the verdict).
+# ⚠ BOUNDED: every role ends on its own #95 clock; every child is WAIT_BLOCK-reaped except FG-BGEXIT's deliberate
+# orphan writer (DEP-3: kill#16 has no default action before the lifecycle step, so nothing is killed here).
+# ⚠ uptime_us#95 == -1 (the TSC refused) -> `FG-FAIL clock` and nothing is timed (#40 is never used for timing).
+
+include "fgcommon.cyr"
+
+var FG_PASS = 0;
+var FG_FAIL = 0;
+var FG_NCPU = 1;
+var FG_IPMS = 0;        # fg_spinloop iterations per millisecond (calibrated once)
+var fg_fds[4];          # 32 B: pipe fds ([0] read, [8] write)
+var fg_rb[64];          # 512 B: pipe drain buffer
+var fg_env[2];          # 16 B: the "FGK=fgv\0" blob
+var fg_fpb[8];          # 64 B: FG-EW-FP's patterns + read-back + rax
+var fg_klog[1024];      # 8192 B: klug#36 tail
+
+fn fg_phase(name) { fg_out("FG-PHASE "); fg_out(name); fg_out("\n"); return 0; }
+var fg_vl[32];          # 256 B: one verdict line, written with ONE write(1) (never split by another writer)
+fn fg_ok(tag) {
+    var o = fg_cat(&fg_vl, 0, tag);
+    o = fg_cat(&fg_vl, o, "-OK\n");
+    syscall(1, 1, &fg_vl, o, 0);
+    FG_PASS = FG_PASS + 1;
+    return 0;
+}
+fn fg_fail(ph, what, v) {
+    fg_out("FG-FAIL "); fg_out(ph); fg_out(" "); fg_out(what); fg_kv("v", v); fg_out("\n");
+    FG_FAIL = FG_FAIL + 1;
+    return 0;
+}
+fn fg_verdict(ok, tag, ph, what, v) {
+    if (ok == 1) { return fg_ok(tag); }
+    return fg_fail(ph, what, v);
+}
+
+# Does klug#36's tail contain `s`?
+fn fg_klog_has(s) {
+    var n = syscall(36, &fg_klog, 8191, 0, 0);
+    if (n <= 0) { return 0; }
+    var l = strlen(s);
+    var i = 0;
+    while (i + l <= n) {
+        var j = 0;
+        while (j < l) {
+            if (load8(&fg_klog + i + j) != load8(s + j)) { break; }
+            j = j + 1;
+        }
+        if (j == l) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+# Read a pipe until EOF (0) or `cap` bytes, bounded 3 s: -2 (a writer is still open) -> yield and retry.
+fn fg_drain(fd, buf, cap) {
+    var tot = 0;
+    var t0 = fg_us();
+    while (tot < cap) {
+        var r = syscall(5, fd, buf + tot, cap - tot, 0);
+        if (r > 0) { tot = tot + r; }
+        else {
+            if (r == 0) { return tot; }
+            if (r != (0 - 2)) { return 0 - 1; }
+            if (fg_us() - t0 > 3000000) { return 0 - 998; }
+            fg_yield();
+        }
+    }
+    return tot;
+}
+fn fg_is(buf, n, s) {
+    if (n != strlen(s)) { return 0; }
+    var i = 0;
+    while (i < n) { if (load8(buf + i) != load8(s + i)) { return 0; } i = i + 1; }
+    return 1;
+}
+
+# ─── KYB: fgx itself is a kybernet-launched ring-3 process that the timer preempts ───
+# Its own #99 record: ppid 0 (kmain), state 2. Then a `spin 2000` sibling must accrue >= 5 ticks while fgx runs a
+# ~300 ms register-only loop (no syscall): an IF=0 fgx would starve it at -smp 1. ⚠ 2000, not the spec's 600: at
+# -smp 1 the two share the CPU, so fgx's 300 ms of loop takes ~600 ms of wall clock and a 600 ms spinner could be
+# dead (unlisted in #99, -1) before the second read — measured at S3b-F4 (sibling_ticks=-2).
+fn ph_kyb() {
+    fg_phase("kyb");
+    var me = fg_getpid();
+    var st = fg_state(me);
+    var pp = fg_proc(me, 16);
+    var sp = fg_spawn("spin", 2000, 0 - 1);
+    var k0 = fg_ticks(sp);
+    fg_spinloop(FG_IPMS * 300);
+    var dk = fg_ticks(sp) - k0;
+    if (sp >= 0) { fg_wait(sp); }
+    fg_out("FG-KYB state="); fg_num(st); fg_kv("ppid", pp); fg_kv("sibling_ticks", dk); fg_out("\n");
+    if (st != 2) { return fg_fail("kyb", "state", st); }
+    if (pp != 0) { return fg_fail("kyb", "ppid", pp); }
+    if (sp < 0) { return fg_fail("kyb", "spawn", sp); }
+    if (dk < 5) { return fg_fail("kyb", "sibling_ticks", dk); }
+    return fg_ok("FG-KYB");
+}
+fn ph_basic() {
+    fg_phase("ew-basic");
+    var t0 = fg_us();
+    var r = fg_ew("exit", 7, 0 - 1);
+    var dt = fg_us() - t0;
+    fg_out("FG-EW-BASIC rtt_us="); fg_num(dt); fg_out("\n");
+    return fg_verdict(r == 7, "FG-EW-BASIC", "ew-basic", "rc", r);
+}
+fn ph_latency() {
+    fg_phase("ew-latency");
+    var t0 = fg_us();
+    var r = fg_ew("exit", 0, 0 - 1);
+    var dt = fg_us() - t0;
+    fg_out("FG-EW-LATENCY rtt_us="); fg_num(dt); fg_out("\n");
+    if (r != 0) { return fg_fail("ew-latency", "rc", r); }
+    return fg_verdict(dt < 500000, "FG-EW-LATENCY", "ew-latency", "rtt_us", dt);
+}
+fn ph_ticks() {
+    fg_phase("ew-ticks");
+    var r = fg_ew("tickself", 400, 0 - 1);
+    return fg_verdict(r == 0, "FG-EW-TICKS", "ew-ticks", "rc", r);
+}
+# SIBLING: a #43 `spin 2000` must accrue >= 5 ticks across a #37 `burnms 400` AND across a #37 `loop N400`
+# (a pure register loop calibrated to ~400 ms: preemption, not a syscall, is what hands the spinner the CPU).
+fn ph_sibling() {
+    fg_phase("ew-sibling");
+    var sp = fg_spawn("spin", 2000, 0 - 1);
+    if (sp < 0) { return fg_fail("ew-sibling", "spawn", sp); }
+    var k0 = fg_ticks(sp);
+    var r1 = fg_ew("burnms", 400, 0 - 1);
+    var d1 = fg_ticks(sp) - k0;
+    var k2 = fg_ticks(sp);
+    var r2 = fg_ew("loop", FG_IPMS * 400, 0 - 1);
+    var d2 = fg_ticks(sp) - k2;
+    fg_wait(sp);
+    fg_out("FG-EW-SIBLING burn_ticks="); fg_num(d1); fg_kv("loop_ticks", d2); fg_out("\n");
+    if (r1 != 0) { return fg_fail("ew-sibling", "burn_rc", r1); }
+    if (r2 != 0) { return fg_fail("ew-sibling", "loop_rc", r2); }
+    if (d1 < 5) { return fg_fail("ew-sibling", "burn_ticks", d1); }
+    if (d2 < 5) { return fg_fail("ew-sibling", "loop_ticks", d2); }
+    return fg_ok("FG-EW-SIBLING");
+}
+fn ph_yield() {
+    fg_phase("ew-yield");
+    var r = fg_ew("spawnwait", 0 - 1, 0 - 1);
+    return fg_verdict(r == 5, "FG-EW-YIELD", "ew-yield", "rc", r);
+}
+fn ph_nest() {
+    fg_phase("ew-nest");
+    var r = fg_ew("nest", 3, 0 - 1);
+    return fg_verdict(r == 43, "FG-EW-NEST", "ew-nest", "rc", r);
+}
+fn ph_fault() {
+    fg_phase("ew-fault");
+    var r = fg_ew("fault", 0 - 1, 0 - 1);
+    return fg_verdict(r == 142, "FG-EW-FAULT", "ew-fault", "rc", r);
+}
+# REDIR: #62(1 <- w) then #37 `hello`: the child's stdout lands in the pipe. The write end is CLOSED before the drain
+# (pipe_read answers -2 while any writer is open), and after the line the read must be EOF (0). Then fgx's OWN fd 1
+# must still be the console (nothing to restore after 1.57.7: the redirect lived in the child's table).
+fn ph_redir() {
+    fg_phase("ew-redir");
+    if (fg_pipe(&fg_fds) != 0) { return fg_fail("ew-redir", "pipe", 0 - 1); }
+    var rfd = load64(&fg_fds);
+    var wfd = load64(&fg_fds + 8);
+    var a = fg_62(1, wfd);
+    var r = fg_ew("hello", 0 - 1, 0 - 1);
+    fg_close(wfd);
+    var n = fg_drain(rfd, &fg_rb, 200);
+    var e = syscall(5, rfd, &fg_rb + 256, 16, 0);
+    fg_close(rfd);
+    fg_out("FG-EW-REDIR-PARENT-STDOUT\n");
+    if (a != 0) { return fg_fail("ew-redir", "arm", a); }
+    if (r != 0) { return fg_fail("ew-redir", "rc", r); }
+    if (fg_is(&fg_rb, n, "FG-HELLO-FROM-CHILD\n") == 0) { return fg_fail("ew-redir", "captured_bytes", n); }
+    if (e != 0) { return fg_fail("ew-redir", "not_eof", e); }
+    return fg_ok("FG-EW-REDIR");
+}
+fn ph_env() {
+    fg_phase("ew-env");
+    var l = fg_mk("env", 0 - 1, 0 - 1);
+    l = fg_cat(&fg_line, l, " FGK");
+    store8(&fg_line + l, 0);
+    var o = fg_cat(&fg_env, 0, "FGK=fgv");
+    store8(&fg_env + o, 0);
+    var r = syscall(37, &fg_line, l, &fg_env, o + 1);
+    return fg_verdict(r == 61, "FG-EW-ENV", "ew-env", "rc", r);
+}
+# LAUNCHFAIL: a #37 that cannot load (-1) must still CONSUME the armed redirect, so the NEXT #37's stdout reaches
+# the console (the smoke counts FG-HELLO-FROM-CHILD on serial) and the pipe reads EOF with nothing in it.
+fn ph_launchfail() {
+    fg_phase("ew-launchfail");
+    if (fg_pipe(&fg_fds) != 0) { return fg_fail("ew-launchfail", "pipe", 0 - 1); }
+    var rfd = load64(&fg_fds);
+    var wfd = load64(&fg_fds + 8);
+    fg_62(1, wfd);
+    var o = fg_cat(&fg_line, 0, "/bin/nonexistent");
+    store8(&fg_line + o, 0);
+    var r1 = syscall(37, &fg_line, o, 0, 0);
+    var r2 = fg_ew("hello", 0 - 1, 0 - 1);
+    fg_close(wfd);
+    var n = fg_drain(rfd, &fg_rb, 200);
+    fg_close(rfd);
+    if (r1 != (0 - 1)) { return fg_fail("ew-launchfail", "missing_rc", r1); }
+    if (r2 != 0) { return fg_fail("ew-launchfail", "hello_rc", r2); }
+    if (n != 0) { return fg_fail("ew-launchfail", "captured_bytes", n); }
+    return fg_ok("FG-EW-LAUNCHFAIL");
+}
+# FP: xmm3 and xmm15 hold distinct patterns ACROSS a #37 whose child (fpthrash) loads every XMM register in a loop.
+# cyrius f64 locals live in stack slots, so the patterns must stay in REGISTERS across the syscall — one asm block.
+# REGISTER CONTRACT: in — buf at [rbp-8], path at [rbp-16], len at [rbp-24] (the parameter slots; this function
+# contains asm, so cyrius does not regalloc it — objdump-checked). The block loads xmm3 <- [buf], xmm15 <- [buf+8],
+# issues SYSCALL 37 (rdi path, rsi len, rdx 0 = no env, r10 0), then stores xmm3 -> [buf+16], xmm15 -> [buf+24],
+# rax -> [buf+32]. Clobbers rax, rcx, rdx, rsi, rdi, r10, r11 (SYSCALL takes rcx/r11), xmm3, xmm15.
+fn fg_fp_call(buf, path, plen) {
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;                     # mov rax, [rbp-8]        (buf)
+        0xF3; 0x0F; 0x7E; 0x18;                     # movq xmm3,  [rax]
+        0xF3; 0x44; 0x0F; 0x7E; 0x78; 0x08;         # movq xmm15, [rax+8]
+        0x48; 0x8B; 0x7D; 0xF0;                     # mov rdi, [rbp-16]       (path)
+        0x48; 0x8B; 0x75; 0xE8;                     # mov rsi, [rbp-24]       (len)
+        0x31; 0xD2;                                 # xor edx, edx            (a3 = 0)
+        0x45; 0x31; 0xD2;                           # xor r10d, r10d          (a4 = 0)
+        0xB8; 0x25; 0x00; 0x00; 0x00;               # mov eax, 37             (execwait)
+        0x0F; 0x05;                                 # syscall
+        0x48; 0x8B; 0x4D; 0xF8;                     # mov rcx, [rbp-8]        (buf)
+        0x66; 0x0F; 0xD6; 0x59; 0x10;               # movq [rcx+16], xmm3
+        0x66; 0x44; 0x0F; 0xD6; 0x79; 0x18;         # movq [rcx+24], xmm15
+        0x48; 0x89; 0x41; 0x20;                     # mov [rcx+32], rax
+    }
+    return 0;
+}
+fn ph_fp() {
+    fg_phase("ew-fp");
+    store64(&fg_fpb, 0x0123456789ABCDEF);
+    store64(&fg_fpb + 8, 0x7EDCBA9876543210);
+    store64(&fg_fpb + 16, 0);
+    store64(&fg_fpb + 24, 0);
+    store64(&fg_fpb + 32, 0 - 7);
+    var l = fg_mk("fpthrash", 0 - 1, 0 - 1);
+    fg_fp_call(&fg_fpb, &fg_line, l);
+    var rc = load64(&fg_fpb + 32);
+    if (rc != 0) { return fg_fail("ew-fp", "rc", rc); }
+    if (load64(&fg_fpb + 16) != 0x0123456789ABCDEF) { return fg_fail("ew-fp", "xmm3", load64(&fg_fpb + 16)); }
+    if (load64(&fg_fpb + 24) != 0x7EDCBA9876543210) { return fg_fail("ew-fp", "xmm15", load64(&fg_fpb + 24)); }
+    return fg_ok("FG-EW-FP");
+}
+# MIGRATE: an unpinned #43 intermediate runs 40 blocking #37s; its frame and stack must survive every one (the
+# waiter may resume on another CPU). The cross-CPU klug witness is REPORTED, not gated (Q-3).
+fn ph_migrate() {
+    fg_phase("ew-migrate");
+    var p = fg_spawn("ewloop", 40, 0 - 1);
+    if (p < 0) { return fg_fail("ew-migrate", "spawn", p); }
+    var r = fg_wait(p);
+    if (FG_NCPU > 1) {
+        fg_out("FG-EW-MIGRATE-WITNESS="); fg_num(fg_klog_has("wq: first cross-CPU resume")); fg_out("\n");
+    }
+    return fg_verdict(r == 0, "FG-EW-MIGRATE", "ew-migrate", "rc", r);
+}
+
+fn main(): i64 {
+    if (fg_eq(argv(0), "/bin/agnsh") == 0) { fg_out("FG-DRIVER-NOT-AGNSH\n"); return 99; }
+    fg_out("FG-BEGIN\n");
+    FG_NCPU = fg_sysinfo(32);
+    if (FG_NCPU < 1) { FG_NCPU = 1; }
+    if (fg_us() == (0 - 1)) {
+        fg_out("FG-FAIL clock uptime_us#95 is -1 (TSC refused) -- nothing timed\n");
+        fg_out("FG-DONE pass=0 fail=1\n");
+        return 0;
+    }
+    # Calibrate fg_spinloop: 10^6 iterations, timed by #95.
+    var t0 = fg_us();
+    fg_spinloop(1000000);
+    var dt = fg_us() - t0;
+    if (dt < 1) { dt = 1; }
+    FG_IPMS = 1000000 * 1000 / dt;
+    if (FG_IPMS < 1) { FG_IPMS = 1; }
+    fg_out("FG-CAL ipms="); fg_num(FG_IPMS); fg_kv("ncpu", FG_NCPU); fg_out("\n");
+    ph_kyb();
+    ph_basic();
+    ph_latency();
+    ph_ticks();
+    ph_sibling();
+    ph_yield();
+    ph_nest();
+    ph_fault();
+    ph_redir();
+    ph_env();
+    ph_launchfail();
+    ph_fp();
+    ph_migrate();
+    # FG-BGEXIT (last): a #43 writer left running, NOT reaped — agnsh exits with a live background job (DEP-3).
+    fg_phase("bgexit");
+    var bw = fg_spawn("writeloop", 2000, 0 - 1);
+    # Both lines are built whole and written with ONE write(1): the writer just spawned prints `ow\n` concurrently and
+    # would otherwise land inside them (measured at S3b-F4 -smp 4: `FG-DONE pass=13ow`).
+    var o = fg_cat(&fg_vl, 0, "FG-BGEXIT writer=");
+    o = fg_catnum(&fg_vl, o, bw);
+    store8(&fg_vl + o, 10);
+    syscall(1, 1, &fg_vl, o + 1, 0);
+    o = fg_cat(&fg_vl, 0, "FG-DONE pass=");
+    o = fg_catnum(&fg_vl, o, FG_PASS);
+    o = fg_cat(&fg_vl, o, " fail=");
+    o = fg_catnum(&fg_vl, o, FG_FAIL);
+    store8(&fg_vl + o, 10);
+    syscall(1, 1, &fg_vl, o + 1, 0);
+    return 0;
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

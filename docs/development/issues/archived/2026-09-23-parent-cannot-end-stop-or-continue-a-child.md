@@ -1,6 +1,6 @@
 # 2026-09-23 — a parent cannot end, stop or continue its child: signals are pending bits with no default action
 
-**Status:** 🟡 **OPEN** — fixed by step **S7** (SIGKILL ends, SIGSTOP stops, SIGCONT continues; one death chain; `waitpid`/`execwait` report death by signal as `0x100 | sig`; `kill`#16 `sig | 0x100` = KILL_TREE, approved 2026-09-23). Not in 1.57.6. The Path 2 foundation this step builds on — per-process syscall kernel stacks, the deferred `on_cpu` release, preempt-disabling spinlocks, region-7 guard pages (bites S3.1–S3.3) — landed in **1.57.6**; see `docs/development/planning/blocking-syscall-concurrency.md` § Path 2 plan and the roadmap's 1.57.x table.
+**Status:** ✅ **RESOLVED 1.57.7 (2026-09-25)** — step S7: `kill`#16 9 ends a child through one death chain (wait status **265**), 19 stops it (`#99` state 5), 18 continues it, 0 probes; `sig | 0x100` = `KILL_TREE` (−2 when a tree stop had to skip a member); wait status `0x100 | sig`, a fault `128 + vector` (142); `#99` lists unreaped children as state 7. Gates: `scripts/smoke/lifecycle-smoke.sh` (sweep row; KILL*, STOP*, TREE*, WSTAT, ORPHAN* at `-smp 1` and `-smp 4`) and `ktest` T-L* (109 assertions). Built, gated, NOT burned. See § Resolution.
 **Filed by:** daimon (the AGNOS agent orchestrator). It supervises agent processes and has to stop,
 pause and resume them.
 **Checked against:** agnos **1.57.5**: `kernel/core/syscall.cyr`, `kernel/core/proc.cyr`,
@@ -60,3 +60,22 @@ for the rest of the boot.
   stays *Stopping*, and daimon records that it gave up.
 - Pause and resume answer 501 on agnos.
 - Both change as soon as (1) and (2) exist.
+
+## Resolution (1.57.7, 2026-09-25)
+
+**What shipped:** ask 1 SIGKILL through the one chain (exit#0, the fault kill and SIGKILL share it; an orphan reaps
+itself, so its address space no longer leaks at slot reuse); ask 2 stop/continue (a stopped process resumes exactly
+where it stopped, a kernel wait with the same absolute deadline); ask 3 a SIGTERM default action **declined** (D3:
+any other signal stays a pending bit, now set atomically); ask 4 `KILL_TREE` (child-only authority,
+descendants-only reach, epoch-validated). A kill of a `#37` waiter also kills its foreground child. Latency:
+immediate for an off-CPU ring-3 target, ≤ one tick while it runs, at the end of its syscall, or at once in a kernel
+wait. ABI rows 4/16/37/99, §4.9; `docs/architecture/process-lifecycle.md`.
+
+**What the change broke — checked before archiving:** found in the end review and fixed (ENDFIX S7-R1): a recycled
+parent slot looked alive between its claim and its epoch bump, so an orphan dying then could publish itself as a
+zombie nobody could reap. S7 left the `RING3_SELFTEST` flag build un-buildable (fixed by S8). By design: a `#37`
+foreground child cannot be stopped while its parent waits (a tree stop returns −2, operator OQ-8); there is no
+reparenting on parent death (operator OQ-9, roadmap 1.57.8). daimon's `tests/agnos` asserts of the 1.57.5 limits
+("pause is refused", "no signal ends a process yet") are expected to go red.
+
+**Evidence:** `~/.claude/projects/-home-macro-Repos-agnos/handoff-1.57.7/steps/S7-report.json`, `ENDFIX-report.json`.

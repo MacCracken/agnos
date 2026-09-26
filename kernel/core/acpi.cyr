@@ -21,6 +21,8 @@ var acpi_rsdp_via_bootinfo = 0;  # 1 if RSDP came from gnoboot boot_info, not le
 # #PF and HALT the box — the proc-teardown-on-fault handler only catches RING-3
 # faults, never a boot-context one. (Same bug class fixed at 1.40.9 for boot_info
 # in mbi.cyr; mirror of the iommu >=4 GB skip-guard in iommu.cyr.)
+# ⭐ 1.57.7 (S1b): ONE reader runs BEFORE that switch — acpi_pm_early_probe (below acpi_find_fadt),
+# under the firmware CR3, just before apic_init, so the LAPIC tick is measured against the PM timer.
 #
 # Currently latent: archaemenid's RSDP is at 0xF0010 and all its tables sit < 4 GB
 # (AMD boxes ship no DMAR), and QEMU q35 keeps ACPI low too. But UEFI ACPI-reclaim
@@ -221,9 +223,37 @@ fn acpi_gas_addr(off) {
     return acpi_load64(acpi_fadt_addr + off + 4);
 }
 
+# ⭐ 1.57.7 (S1b) — THE FADT DECODE IS A PURE FUNCTION OF THE TABLE IT FINDS. acpi_find_fadt sets most of
+# its 18 outputs CONDITIONALLY (a field outside a short FADT is simply not written) and its early returns
+# (no FACP, a corrupt length) wrote none of them, so a second decode used to inherit the first one's
+# fields. S1b decodes TWICE — acpi_pm_early_probe before apic_init, then acpi_init — and power.cyr reads
+# these fields at shutdown, so every decode starts here: all 18 back to 0, one statement per field.
+fn acpi_fadt_clear() {
+    acpi_fadt_addr = 0;
+    acpi_fadt_len = 0;
+    acpi_fadt_rev = 0;
+    acpi_fadt_flags = 0;
+    acpi_hw_reduced = 0;
+    acpi_dsdt_addr = 0;
+    acpi_smi_cmd = 0;
+    acpi_enable_val = 0;
+    acpi_pm1a_cnt = 0;
+    acpi_pm1b_cnt = 0;
+    acpi_pm1a_evt = 0;
+    acpi_pm1_cnt_len = 0;
+    acpi_reset_space = 0;
+    acpi_reset_addr = 0;
+    acpi_reset_value = 0;
+    acpi_reset_ok = 0;
+    acpi_pm_tmr_port = 0;
+    acpi_pm_tmr_ext = 0;
+    return 0;
+}
+
 fn acpi_find_fadt() {
     var f = 0;
     var xa = 0;
+    acpi_fadt_clear();   # S1b: no field of an earlier decode survives this one, on ANY return path
     # 'FACP' — the FADT's signature is NOT "FADT".
     if (acpi_xsdt_addr != 0) { f = acpi_xsdt_find(acpi_xsdt_addr, 0x46, 0x41, 0x43, 0x50); }
     if (f == 0) {
@@ -317,6 +347,37 @@ fn acpi_find_fadt() {
     if (acpi_pm_tmr_port > 0xFFFF) { acpi_pm_tmr_port = 0; }
     if (acpi_pm_tmr_port < 0) { acpi_pm_tmr_port = 0; }
     return f;
+}
+
+# ⭐ 1.57.7 (S1b) — THE EARLY PM-TIMER PROBE: the FADT decoded BEFORE apic_init, so lapic_reload_100hz can
+# measure the 100 Hz reload (and klog_tsc_per_us) against the ACPI PM timer instead of polled PIT wraps
+# that a host CPU quota inflates. Returns the decoded PM timer port, or 0.
+# ⛔ gnoboot's boot_info RSDP ONLY — NEVER the legacy scan. acpi_find_rsdp's first read is page 0
+#   (the EBDA pointer at 0x40E), and firmware NULL-pointer detection can leave page 0 not-present under
+#   the firmware CR3 this runs on; a boot-context #PF halts the box. No boot_info RSDP -> 0 -> the tick
+#   is measured against the PIT exactly as before (no regression).
+# ⚠ EVERY GLOBAL IT SETS IS PROVISIONAL: acpi_init resets and re-derives all of them (its reset list
+#   calls acpi_fadt_clear), and main.cyr cross-checks the port it decodes against this one.
+# ⚠ Runs before apic_init, IF=0, on the BSP only, with no locks held, before any ISR is live.
+# ⚠ acpi_va takes its IDENTITY branch here: the firmware CR3 is live (not 0x1000 — pt_init writes phys
+#   0x1000/0x2000 while it is), and UEFI identity-maps every memory-map region including ACPI reclaim/NVS.
+fn acpi_pm_early_probe() {
+    acpi_rsdp_addr = 0;
+    acpi_rsdt_addr = 0;
+    acpi_xsdt_addr = 0;
+    acpi_rsdp_via_bootinfo = 0;
+    acpi_fadt_clear();
+    var ep_bi = load64(&boot_info_ptr);
+    if (ep_bi == 0) { return 0; }
+    var ep_rs = load64(ep_bi + 0x38);
+    if (ep_rs == 0) { return 0; }
+    if (acpi_check_rsdp(ep_rs) != 1) { return 0; }
+    acpi_rsdp_addr = ep_rs;
+    acpi_rsdp_via_bootinfo = 1;
+    acpi_rsdt_addr = acpi_load32(ep_rs + 16);
+    if (acpi_load8(ep_rs + 15) >= 2) { acpi_xsdt_addr = acpi_load64(ep_rs + 24); }
+    acpi_find_fadt();
+    return acpi_pm_tmr_port;
 }
 
 # === \_S5_ — the sleep-type values a power-off must write ====================
@@ -505,6 +566,10 @@ fn acpi_fadt_report() {
     return 0;
 }
 
+# S1b selftest knob (the tsc_tick_stall precedent). ⛔ Nonzero ONLY while TSC_SELFTEST's
+# acpi_fadt_reset_selftest drives acpi_init's no-RSDP path; production never sets it.
+var acpi_rsdp_suppress = 0;
+
 fn acpi_init() {
     acpi_rsdp_addr = 0;
     acpi_rsdt_addr = 0;
@@ -514,6 +579,8 @@ fn acpi_init() {
     acpi_rsdp_via_bootinfo = 0;
     acpi_pm_tmr_port = 0;       # 1.57.6: no RSDP / no FADT must mean no PM timer, not a stale one
     acpi_pm_tmr_ext = 0;
+    acpi_fadt_clear();          # 1.57.7 S1b: EVERY FADT field, so the no-RSDP return below leaves none stale
+    # (the early probe's provisional decode would otherwise survive it)
 
     # Find RSDP
     var rsdp = acpi_find_rsdp();
@@ -535,6 +602,7 @@ fn acpi_init() {
             }
         }
     }
+    if (acpi_rsdp_suppress != 0) { rsdp = 0; }   # S1b selftest only (acpi_fadt_reset_selftest arm 2)
     if (rsdp == 0) { return 0 - 1; }
     acpi_rsdp_addr = rsdp;
 

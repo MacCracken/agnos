@@ -1,0 +1,1680 @@
+# lifex — the DRIVER of agnos 1.57.7's lifecycle gate (step S7; docs/architecture/process-lifecycle.md).
+#
+# WHAT IS UNDER TEST: kill#16 ENDS (9), STOPS (19) and CONTINUES (18) a child — and, with KILL_TREE (0x100), every
+# epoch-validated descendant — through the four boundaries (claim, tick, B1 at syscall exit, a blocked wait's signal
+# point); the wait status (D2: 265 = SIGKILL, 142 = a fault, code & 0xFF = an exit); #99's state 7 (an exited,
+# unreaped child) and 5 (STOPPED); orphans that reap themselves (no leaked address space); epoch-validated authority.
+#
+# Seeded as /bin/agnsh on a PLAIN kernel (D19): kybernet launches it (pinned to the BSP, the unstoppable fg child of
+# kmain); every role is /bin/spinner (spinner.cyr). scripts/smoke/lifecycle-smoke.sh reads:
+#   LIFE-PHASE <name>, then <MARKER>-OK / <MARKER>-BAD <why> / <MARKER>-NA (a -smp-restricted marker);
+#   LIFE-KLOG <line> for every kernel `lifecycle: #<seq> ...` line (seq-deduplicated, re-printed after every phase);
+#   LIFEX-DONE pass=N fail=M; then exit 0 (a non-zero exit would drop kybernet into its emergency shell).
+# /life/phases (optional): the phases to run, one per line (absent = all).
+# ⚠ BOUNDED: every wait uses #95 deadlines (#95 == -1 is a -BAD, never a silent #40 fallback); child polls are
+# sleep_ms(5) loops; every child a phase created is killed and reaped before the phase ends.
+
+include "lcommon.cyr"
+
+var LX_PASS = 0;
+var LX_FAIL = 0;
+var LX_NCPU = 1;
+var LX_ME = 0;
+var LX_FREE0 = 0;
+var LX_KSEQ = 0 - 1;     # the highest lifecycle seq re-printed so far
+var LX_KLINES = 0;       # lifecycle lines seen
+var LX_KBAD = 0;         # ... that did not parse
+var LX_KN = 0;           # bytes in lx_kb
+var lx_pl[128];          # 1024 B: proclist#99 (16 x 64-byte records)
+var lx_si[16];           # 128 B: sysinfo#35
+var lx_kb[8192];         # 64 KB: klug#36 (the whole ring)
+var lx_ph[128];          # 1024 B: /life/phases
+var LX_PHN = 0 - 1;      # -1 = no phases file (run all)
+var lx_fds[2];           # 16 B: a pipe or a channel pair
+var lx_rb[16];           # 128 B: a read buffer
+var lx_kids[16];         # a phase's children
+var lx_pat[8];           # 64 B: a klug match pattern
+
+# ── verdicts ──
+fn lx_phase(n) { lo_out("LIFE-PHASE "); lo_out(n); lo_nl(); return 0; }
+fn lx_ok(t) { lo_out(t); lo_out("-OK\n"); LX_PASS = LX_PASS + 1; return 0; }
+fn lx_bad(t, why, v) { lo_out(t); lo_out("-BAD "); lo_out(why); lo_kv("v", v); lo_nl(); LX_FAIL = LX_FAIL + 1; return 0; }
+fn lx_na(t) { lo_out(t); lo_out("-NA\n"); return 0; }
+fn lx_v(c, t, why, v) { if (c == 1) { return lx_ok(t); } return lx_bad(t, why, v); }
+
+# ── the process table (#99) ──
+fn lx_pln() { return syscall(99, &lx_pl, 16, 0, 0); }
+fn lx_field(pid, off) {
+    var n = lx_pln();
+    var i = 0;
+    while (i < n) {
+        var r = &lx_pl + i * 64;
+        if (load64(r) == pid) {
+            if (off == 56) { return load64(r + 56) & 0xFFFFFFFF; }
+            return load64(r + off);
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+fn lx_state(pid) { return lx_field(pid, 8); }
+fn lx_ticks(pid) { return lx_field(pid, 56); }
+fn lx_is_spinner(r) {
+    if (load8(r + 24) != 115) { return 0; }          # 's'
+    if (l_eq(r + 24, "spinner") == 1) { return 1; }
+    return 0;
+}
+# The first LIVE (not 7) record whose ppid is pp (-1 = none). any7 = 1 also returns a zombie.
+fn lx_child_of(pp, any7) {
+    var n = lx_pln();
+    var i = 0;
+    while (i < n) {
+        var r = &lx_pl + i * 64;
+        if (load64(r + 16) == pp) {
+            if (load64(r) != pp) {
+                if (any7 == 1) { return load64(r); }
+                if (load64(r + 8) != 7) { return load64(r); }
+            }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+fn lx_nspinners() {
+    var n = lx_pln();
+    var c = 0;
+    var i = 0;
+    while (i < n) { if (lx_is_spinner(&lx_pl + i * 64) == 1) { c = c + 1; } i = i + 1; }
+    return c;
+}
+# Wait until pid is in state st (1 = yes within ms). st = -1 waits until it is not listed.
+fn lx_wait_state(pid, st, ms) {
+    var t = l_us() + ms * 1000;
+    while (l_us() < t) {
+        if (lx_state(pid) == st) { return 1; }
+        l_sleep(5);
+    }
+    if (lx_state(pid) == st) { return 1; }
+    return 0;
+}
+fn lx_wait_nospin(ms) {
+    var t = l_us() + ms * 1000;
+    while (l_us() < t) {
+        if (lx_nspinners() == 0) { return 1; }
+        l_sleep(10);
+    }
+    if (lx_nspinners() == 0) { return 1; }
+    return 0;
+}
+# Reap `pid` (the non-blocking poll every 5 ms, bounded): its status, or -998 when still alive after ms.
+fn lx_reap(pid, ms) {
+    if (pid < 0) { return 0 - 999; }
+    var t = l_us() + ms * 1000;
+    while (l_us() < t) {
+        var r = l_poll(pid);
+        if (r != (0 - 2)) { return r; }
+        l_sleep(5);
+    }
+    var r2 = l_poll(pid);
+    if (r2 != (0 - 2)) { return r2; }
+    return 0 - 998;
+}
+fn lx_killreap(pid, ms) { l_kill(pid, 9); return lx_reap(pid, ms); }
+fn lx_free() {
+    if (syscall(35, &lx_si, 128, 0, 0) != 0) { return 0 - 1; }
+    return load64(&lx_si + 16);
+}
+fn lx_free_ok() {
+    if (lx_free() + 1048576 >= LX_FREE0) { return 1; }
+    return 0;
+}
+
+# ── klug (#36): the lifecycle lines ──
+fn lx_kread() {
+    LX_KN = syscall(36, &lx_kb, 65536, 0, 0);
+    if (LX_KN < 0) { LX_KN = 0; }
+    return LX_KN;
+}
+fn lx_ishex(c) {
+    if (c >= 48) { if (c <= 57) { return 1; } }
+    if (c >= 97) { if (c <= 102) { return 1; } }
+    return 0;
+}
+fn lx_hexval(c) { if (c <= 57) { return c - 48; } return c - 87; }
+# Match literal s at p (bounded by e). -> p + len, or -1.
+fn lx_lit(p, e, s) {
+    var i = 0;
+    while (load8(s + i) != 0) {
+        if (p + i >= e) { return 0 - 1; }
+        if (load8(p + i) != load8(s + i)) { return 0 - 1; }
+        i = i + 1;
+    }
+    return p + i;
+}
+# hex run at p -> end, or -1 if empty.
+fn lx_hexrun(p, e) {
+    var q = p;
+    while (q < e) { if (lx_ishex(load8(q)) == 0) { break; } q = q + 1; }
+    if (q == p) { return 0 - 1; }
+    return q;
+}
+fn lx_hexparse(p, e) {
+    var v = 0;
+    var q = p;
+    while (q < e) { if (lx_ishex(load8(q)) == 0) { break; } v = v * 16 + lx_hexval(load8(q)); q = q + 1; }
+    return v;
+}
+# Does [p, e) — the text after "lifecycle: #" — parse per the S7 trace format? 1 / 0.
+fn lx_kfmt(p, e) {
+    var q = lx_hexrun(p, e);
+    if (q < 0) { return 0; }
+    var k = lx_lit(q, e, " kill pid=0x");
+    if (k > 0) {
+        k = lx_hexrun(k, e); if (k < 0) { return 0; }
+        k = lx_lit(k, e, " sig=0x"); if (k < 0) { return 0; }
+        k = lx_hexrun(k, e); if (k < 0) { return 0; }
+        k = lx_lit(k, e, " via="); if (k < 0) { return 0; }
+        if (lx_lit(k, e, "claim") == e) { return 1; }
+        if (lx_lit(k, e, "tick") == e) { return 1; }
+        if (lx_lit(k, e, "b1") == e) { return 1; }
+        return 0;
+    }
+    k = lx_lit(q, e, " stop pid=0x");
+    if (k > 0) {
+        k = lx_hexrun(k, e); if (k < 0) { return 0; }
+        k = lx_lit(k, e, " via="); if (k < 0) { return 0; }
+        if (lx_lit(k, e, "claim") == e) { return 1; }
+        if (lx_lit(k, e, "tick") == e) { return 1; }
+        if (lx_lit(k, e, "b1") == e) { return 1; }
+        if (lx_lit(k, e, "wait") == e) { return 1; }
+        return 0;
+    }
+    k = lx_lit(q, e, " cont pid=0x");
+    if (k > 0) {
+        k = lx_hexrun(k, e); if (k < 0) { return 0; }
+        k = lx_lit(k, e, " via="); if (k < 0) { return 0; }
+        if (lx_lit(k, e, "sig") == e) { return 1; }
+        if (lx_lit(k, e, "orphan") == e) { return 1; }
+        return 0;
+    }
+    k = lx_lit(q, e, " orphan pid=0x");
+    if (k > 0) {
+        k = lx_hexrun(k, e); if (k < 0) { return 0; }
+        if (lx_lit(k, e, " reaped") == e) { return 1; }
+        return 0;
+    }
+    return 0;
+}
+# Re-print every NEW lifecycle line (seq > LX_KSEQ) as `LIFE-KLOG <line>` and check its format. Returns LX_KSEQ.
+fn lx_kscan() {
+    lx_kread();
+    var b = &lx_kb;
+    var e = b + LX_KN;
+    var p = b;
+    while (p + 12 <= e) {
+        var m = lx_lit(p, e, "lifecycle: #");
+        if (m < 0) { p = p + 1; continue; }
+        var le = m;
+        while (le < e) { if (load8(le) == 10) { break; } le = le + 1; }
+        if (le >= e) { break; }                                  # an unterminated tail line: next scan
+        var sq = lx_hexparse(m, le);
+        if (lx_hexrun(m, le) > 0) {
+            if (sq > LX_KSEQ) {
+                LX_KSEQ = sq;
+                LX_KLINES = LX_KLINES + 1;
+                if (lx_kfmt(m, le) == 0) { LX_KBAD = LX_KBAD + 1; lo_out("LIFE-KLOG-UNPARSED "); }
+                else { lo_out("LIFE-KLOG "); }
+                lo_outn(p, le - p);
+                lo_nl();
+            }
+        }
+        p = le + 1;
+    }
+    return LX_KSEQ;
+}
+# The via of the first `<kind> pid=0x<pid>` line with seq > after: 1 claim · 2 tick · 3 b1 · 4 wait · 5 sig ·
+# 6 orphan · 9 (an orphan line) · 0 = none. Re-scans (and re-prints) first.
+fn lx_kvia(kind, pid, after) {
+    lx_kscan();
+    var o = l_cat(&lx_pat, 0, " ");
+    o = l_cat(&lx_pat, o, kind);
+    o = l_cat(&lx_pat, o, " pid=0x");
+    var hx[24];
+    var hn = 0;
+    var hv = pid;
+    if (hv == 0) { store8(&hx, 48); hn = 1; }
+    while (hv > 0) { var nb = hv & 15; if (nb < 10) { store8(&hx + hn, 48 + nb); } else { store8(&hx + hn, 87 + nb); } hn = hn + 1; hv = hv >> 4; }
+    while (hn > 0) { hn = hn - 1; store8(&lx_pat + o, load8(&hx + hn)); o = o + 1; }
+    store8(&lx_pat + o, 0);
+    var b = &lx_kb;
+    var e = b + LX_KN;
+    var p = b;
+    while (p + 12 <= e) {
+        var m = lx_lit(p, e, "lifecycle: #");
+        if (m < 0) { p = p + 1; continue; }
+        var le = m;
+        while (le < e) { if (load8(le) == 10) { break; } le = le + 1; }
+        if (le >= e) { break; }
+        var sq = lx_hexparse(m, le);
+        var q = lx_hexrun(m, le);
+        if (q > 0) {
+            if (sq > after) {
+                var k = lx_lit(q, le, &lx_pat);
+                if (k > 0) {
+                    if (k < le) { if (load8(k) != 32) { k = 0 - 1; } }
+                }
+                if (k > 0) {
+                    if (l_eq(kind, "orphan") == 1) { return 9; }
+                    var w = k;
+                    while (w + 4 <= le) { if (lx_lit(w, le, "via=") > 0) { break; } w = w + 1; }
+                    var v = lx_lit(w, le, "via=");
+                    if (v > 0) {
+                        if (lx_lit(v, le, "claim") == le) { return 1; }
+                        if (lx_lit(v, le, "tick") == le) { return 2; }
+                        if (lx_lit(v, le, "b1") == le) { return 3; }
+                        if (lx_lit(v, le, "wait") == le) { return 4; }
+                        if (lx_lit(v, le, "sig") == le) { return 5; }
+                        if (lx_lit(v, le, "orphan") == le) { return 6; }
+                    }
+                    return 0 - 1;
+                }
+            }
+        }
+        p = le + 1;
+    }
+    return 0;
+}
+# lx_kvia, waiting up to ms for the line to appear.
+fn lx_kvia_w(kind, pid, after, ms) {
+    var t = l_us() + ms * 1000;
+    while (1) {
+        var v = lx_kvia(kind, pid, after);
+        if (v != 0) { return v; }
+        if (l_us() >= t) { return 0; }
+        l_sleep(10);
+    }
+    return 0;
+}
+fn lx_khas(s) {
+    lx_kread();
+    var e = &lx_kb + LX_KN;
+    var p = &lx_kb;
+    while (p < e) { if (lx_lit(p, e, s) > 0) { return 1; } p = p + 1; }
+    return 0;
+}
+fn lx_kcount(s) {
+    lx_kread();
+    var e = &lx_kb + LX_KN;
+    var p = &lx_kb;
+    var c = 0;
+    while (p < e) { if (lx_lit(p, e, s) > 0) { c = c + 1; } p = p + 1; }
+    return c;
+}
+
+# ── /life/phases ──
+fn lx_phases_load() {
+    var fd = l_open("/life/phases");
+    if (fd < 0) { LX_PHN = 0 - 1; return 0; }
+    var n = syscall(5, fd, &lx_ph, 1000, 0);
+    l_close(fd);
+    if (n < 0) { n = 0; }
+    store8(&lx_ph + n, 0);
+    LX_PHN = n;
+    return 0;
+}
+fn lx_want(name) {
+    if (LX_PHN < 0) { return 1; }
+    var l = strlen(name);
+    var i = 0;
+    while (i < LX_PHN) {
+        var j = 0;
+        while (j < l) { if (load8(&lx_ph + i + j) != load8(name + j)) { break; } j = j + 1; }
+        if (j == l) {
+            var c = load8(&lx_ph + i + l);
+            if (c == 10) { return 1; }
+            if (c == 0) { return 1; }
+            if (c == 13) { return 1; }
+            if (c == 32) { return 1; }
+        }
+        while (i < LX_PHN) { if (load8(&lx_ph + i) == 10) { break; } i = i + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ═══════════════════════════════════ the phases ═══════════════════════════════════
+fn ph_setup() {
+    lx_phase("SETUP");
+    var ok = 1;
+    if (l_us() < 0) { ok = 0; }
+    if (syscall(35, &lx_si, 128, 0, 0) != 0) { ok = 0; }
+    LX_NCPU = load64(&lx_si + 32);
+    var c = l_spawn("exit 0");
+    lx_reap(c, 3000);
+    LX_FREE0 = lx_free();
+    lo_out("LIFE-SETUP ncpu="); lo_num(LX_NCPU); lo_kv("free", LX_FREE0); lo_kv("me", LX_ME); lo_nl();
+    LX_N = lx_page_count();                                # S8: /bin/spinner's distinct 2 MB PT_LOAD pages
+    lo_out("LIFE-SPINNER-PAGES "); lo_num(LX_N); lo_nl();
+    if (LX_N < 1) { ok = 0; }
+    lx_v(ok, "LIFE-SETUP", "clock_or_sysinfo", 0);
+    return 0;
+}
+fn ph_faultbg() {
+    lx_phase("FAULTBG");
+    var c = l_spawn("fault");
+    var r = lx_reap(c, 3000);
+    var n = lx_kcount("fault: pid=");
+    if (r != 142) { return lx_bad("LIFE-FAULT-BG", "status", r); }
+    if (n != 1) { return lx_bad("LIFE-FAULT-BG", "fault_lines", n); }
+    return lx_ok("LIFE-FAULT-BG");
+}
+fn ph_sigbit() {
+    lx_phase("SIGBIT");
+    if (LX_NCPU < 2) { return lx_na("LIFE-SIGBIT"); }
+    if (syscall(25, &lx_fds, 0, 0, 0) != 0) { return lx_bad("LIFE-SIGBIT", "pipe", 0); }
+    var rfd = load64(&lx_fds);
+    var wfd = load64(&lx_fds + 8);
+    var c = l_spawn1("sigrace", wfd);
+    if (c < 0) { return lx_bad("LIFE-SIGBIT", "spawn", c); }
+    l_sleep(20);
+    var i = 0;
+    var miss = 0 - 1;
+    while (i < 300) {
+        l_kill(c, 12);
+        var t = l_us() + 200000;
+        var got = 0;
+        while (l_us() < t) {
+            var r = syscall(5, rfd, &lx_rb, 1, 0);
+            if (r == 1) { got = 1; break; }
+            l_yield();
+        }
+        if (got == 0) { miss = i; break; }
+        i = i + 1;
+    }
+    l_kill(c, 14);
+    var st = lx_reap(c, 3000);
+    if (st == (0 - 998)) { st = lx_killreap(c, 2000); }
+    l_close(rfd); l_close(wfd);
+    if (miss >= 0) { return lx_bad("LIFE-SIGBIT", "lost_round", miss); }
+    if (st != 0) { return lx_bad("LIFE-SIGBIT", "status", st); }
+    return lx_ok("LIFE-SIGBIT");
+}
+fn ph_wstat() {
+    lx_phase("WSTAT");
+    var a = lx_reap(l_spawn("exit 265"), 3000);
+    var b = lx_reap(l_spawn("exit -2"), 3000);
+    var z = lx_reap(l_spawn("exit 0"), 3000);
+    if (a != 9) { return lx_bad("LIFE-WSTAT-MASK", "exit265", a); }
+    if (b != 254) { return lx_bad("LIFE-WSTAT-MASK", "exit-2", b); }
+    if (z != 0) { return lx_bad("LIFE-WSTAT-MASK", "exit0", z); }
+    return lx_ok("LIFE-WSTAT-MASK");
+}
+fn ph_zombie() {
+    lx_phase("ZOMBIE");
+    var c = l_spawn("exit 7");
+    if (lx_wait_state(c, 7, 2000) == 0) { lx_reap(c, 2000); return lx_bad("LIFE-ZOMBIE-LISTED", "no_state7", lx_state(c)); }
+    var pp = lx_field(c, 16);
+    var r = lx_reap(c, 2000);
+    var gone = lx_state(c);
+    if (pp != LX_ME) { return lx_bad("LIFE-ZOMBIE-LISTED", "ppid", pp); }
+    if (r != 7) { return lx_bad("LIFE-ZOMBIE-LISTED", "status", r); }
+    if (gone != (0 - 1)) { return lx_bad("LIFE-ZOMBIE-LISTED", "still_listed", gone); }
+    return lx_ok("LIFE-ZOMBIE-LISTED");
+}
+fn ph_auth() {
+    lx_phase("AUTH");
+    var a = l_spawn1("auth", LX_ME);
+    var ar = lx_reap(a, 3000);
+    var c = l_spawn("spin");
+    l_sleep(20);
+    var bad = 0;
+    var which = 0;
+    if (l_kill(0, 9) != (0 - 1)) { bad = 1; which = 1; }
+    if (l_kill(99, 9) != (0 - 1)) { bad = 1; which = 2; }
+    if (l_kill(c, 0x209) != (0 - 1)) { bad = 1; which = 3; }
+    if (l_kill(c, 0x300) != (0 - 1)) { bad = 1; which = 4; }
+    if (l_kill(c, 64) != (0 - 1)) { bad = 1; which = 5; }
+    if (l_kill(c, 0) != 0) { bad = 1; which = 6; }
+    if (l_kill(c, 10 | 0x100) != 0) { bad = 1; which = 7; }
+    lx_killreap(c, 2000);
+    if (ar != 0) { return lx_bad("LIFE-AUTH", "auth_child", ar); }
+    if (bad == 1) { return lx_bad("LIFE-AUTH", "check", which); }
+    return lx_ok("LIFE-AUTH");
+}
+fn ph_recycled() {
+    lx_phase("RECYCLEDPARENT");
+    var b = l_spawn("spawnexitpid");
+    var g = lx_reap(b, 3000);
+    if (g < 0) { return lx_bad("LIFE-RECYCLED-PARENT", "spawnexitpid", g); }
+    if (g >= 16) { return lx_bad("LIFE-RECYCLED-PARENT", "grandchild", g); }
+    var n = 0;
+    var hit = 0 - 1;
+    while (n < 14) {
+        var c = l_spawn1("recycled", g);
+        if (c < 0) { break; }
+        store64(&lx_kids + n * 8, c);
+        n = n + 1;
+        if (c == b) { hit = c; break; }
+    }
+    var hr = 0 - 1;
+    var i = 0;
+    var others = 0;
+    while (i < n) {
+        var k = load64(&lx_kids + i * 8);
+        var kr = lx_reap(k, 3000);
+        if (k == hit) { hr = kr; } else { if (kr != 0) { others = kr; } }
+        i = i + 1;
+    }
+    # G (sleep 3000) is an orphan now (its parent B was reaped): it must reap itself when it exits.
+    var gg = lx_wait_state(g, 0 - 1, 5000);
+    if (hit < 0) { return lx_bad("LIFE-RECYCLED-PARENT", "never_got_the_slot", n); }
+    if (hr != 0) { return lx_bad("LIFE-RECYCLED-PARENT", "recycled_check", hr); }
+    if (others != 0) { return lx_bad("LIFE-RECYCLED-PARENT", "filler", others); }
+    if (gg == 0) { return lx_bad("LIFE-RECYCLED-PARENT", "grandchild_not_reaped", lx_state(g)); }
+    return lx_ok("LIFE-RECYCLED-PARENT");
+}
+fn ph_zparentexit() {
+    lx_phase("ZPARENTEXIT");
+    var p = l_spawn("zparentexit");
+    var t = l_us() + 1000000;
+    var c = 0 - 1;
+    while (l_us() < t) { c = lx_child_of(p, 1); if (c >= 0) { break; } l_sleep(5); }
+    var r = lx_reap(p, 3000);
+    l_sleep(500);
+    if (r != 0) { return lx_bad("LIFE-ZOMBIE-OF-EXITED", "status", r); }
+    if (c < 0) { return lx_bad("LIFE-ZOMBIE-OF-EXITED", "no_child_seen", c); }
+    if (lx_state(c) != (0 - 1)) { return lx_bad("LIFE-ZOMBIE-OF-EXITED", "child_listed", lx_state(c)); }
+    if (lx_free_ok() == 0) { return lx_bad("LIFE-ZOMBIE-OF-EXITED", "free_ram", lx_free()); }
+    return lx_ok("LIFE-ZOMBIE-OF-EXITED");
+}
+fn ph_orphan() {
+    lx_phase("ORPHAN");
+    var s0 = lx_kscan();
+    var p = l_spawn("orphaner");
+    var r = lx_reap(p, 3000);
+    var g = lx_child_of(p, 0);
+    l_sleep(700);
+    if (r != 0) { return lx_bad("LIFE-ORPHAN-REAP", "status", r); }
+    if (g < 0) { return lx_bad("LIFE-ORPHAN-REAP", "no_grandchild", g); }
+    if (lx_nspinners() != 0) { return lx_bad("LIFE-ORPHAN-REAP", "spinner_left", lx_nspinners()); }
+    if (lx_kvia_w("orphan", g, s0, 500) != 9) { return lx_bad("LIFE-ORPHAN-REAP", "no_orphan_line", g); }
+    if (lx_free_ok() == 0) { return lx_bad("LIFE-ORPHAN-REAP", "free_ram", lx_free()); }
+    return lx_ok("LIFE-ORPHAN-REAP");
+}
+fn ph_orphanrace() {
+    lx_phase("ORPHANRACE");
+    var i = 0;
+    var bad = 0;
+    while (i < 50) {
+        var c = l_spawn1("racer", 1000 + i * 7919);
+        if (lx_reap(c, 3000) != 0) { bad = bad + 1; }
+        i = i + 1;
+    }
+    l_sleep(500);
+    var nsp = 0;
+    var t = l_us() + 3000000;
+    while (l_us() < t) { nsp = lx_nspinners(); if (nsp == 0) { break; } l_sleep(20); }
+    if (bad != 0) { return lx_bad("LIFE-ORPHAN-RACE", "racer_status", bad); }
+    if (nsp != 0) { return lx_bad("LIFE-ORPHAN-RACE", "spinner_left", nsp); }
+    if (lx_khas("proc: orphan zombie recycled") == 1) { return lx_bad("LIFE-ORPHAN-RACE", "tripwire", 1); }
+    if (lx_free_ok() == 0) { return lx_bad("LIFE-ORPHAN-RACE", "free_ram", lx_free()); }
+    return lx_ok("LIFE-ORPHAN-RACE");
+}
+fn ph_killsys() {
+    lx_phase("KILLSYS");
+    var c = l_spawn("sys");
+    l_sleep(50);
+    var s0 = lx_kscan();
+    var t0 = l_us();
+    var r = lx_killreap(c, 2000);
+    var dt = l_us() - t0;
+    var v = lx_kvia_w("kill", c, s0, 500);
+    if (r != 265) { return lx_bad("LIFE-KILL-SYS", "status", r); }
+    if (dt > 2000000) { return lx_bad("LIFE-KILL-SYS", "slow_us", dt); }
+    if (v < 1) { return lx_bad("LIFE-KILL-SYS", "via", v); }
+    if (v > 3) { return lx_bad("LIFE-KILL-SYS", "via", v); }
+    return lx_ok("LIFE-KILL-SYS");
+}
+fn ph_selfkill() {
+    lx_phase("SELFKILL");
+    var s0 = lx_kscan();
+    var c = l_spawn("selfkill");
+    var r = lx_reap(c, 3000);
+    var v = lx_kvia_w("kill", c, s0, 500);
+    if (r != 265) { return lx_bad("LIFE-SELFKILL", "status", r); }
+    if (v != 3) { return lx_bad("LIFE-SELFKILL", "via_not_b1", v); }
+    return lx_ok("LIFE-SELFKILL");
+}
+fn ph_zombienoop() {
+    lx_phase("ZOMBIENOOP");
+    var c = l_spawn("exit 7");
+    if (lx_wait_state(c, 7, 2000) == 0) { lx_reap(c, 2000); return lx_bad("LIFE-KILL-ZOMBIE-NOOP", "no_state7", 0); }
+    var k = l_kill(c, 9);
+    var r = lx_reap(c, 2000);
+    if (k != 0) { return lx_bad("LIFE-KILL-ZOMBIE-NOOP", "kill_ret", k); }
+    if (r != 7) { return lx_bad("LIFE-KILL-ZOMBIE-NOOP", "status", r); }
+    return lx_ok("LIFE-KILL-ZOMBIE-NOOP");
+}
+fn ph_killspin() {
+    lx_phase("KILLSPIN");
+    var c = l_spawn("spin");
+    l_sleep(50);
+    var s0 = lx_kscan();
+    var t0 = l_us();
+    var r = lx_killreap(c, 2000);
+    var dt = l_us() - t0;
+    var v = lx_kvia_w("kill", c, s0, 500);
+    if (r != 265) { return lx_bad("LIFE-KILL-SPIN", "status", r); }
+    if (dt > 2000000) { return lx_bad("LIFE-KILL-SPIN", "slow_us", dt); }
+    if (LX_NCPU < 2) { if (v != 1) { return lx_bad("LIFE-KILL-SPIN", "via_not_claim", v); } }
+    if (v < 1) { return lx_bad("LIFE-KILL-SPIN", "via", v); }
+    if (v > 2) { return lx_bad("LIFE-KILL-SPIN", "via", v); }
+    return lx_ok("LIFE-KILL-SPIN");
+}
+# Spawn `spin` and wait until #99 shows it RUNNING (state 2) on 3 consecutive polls (<= 1 s). -1 = never.
+fn lx_spin_running() {
+    var c = l_spawn("spin");
+    var t = l_us() + 1000000;
+    var run = 0;
+    while (l_us() < t) {
+        if (lx_state(c) == 2) { run = run + 1; } else { run = 0; }
+        if (run >= 3) { return c; }
+    }
+    lx_killreap(c, 2000);
+    return 0 - 1;
+}
+fn ph_killtick() {
+    lx_phase("KILLTICK");
+    if (LX_NCPU < 2) { return lx_na("LIFE-KILL-TICK"); }
+    var round = 0;
+    var last = 0;
+    while (round < 3) {
+        var c = lx_spin_running();
+        if (c >= 0) {
+            var s0 = lx_kscan();
+            var r = lx_killreap(c, 2000);
+            var v = lx_kvia_w("kill", c, s0, 500);
+            if (r != 265) { return lx_bad("LIFE-KILL-TICK", "status", r); }
+            if (v == 2) { return lx_ok("LIFE-KILL-TICK"); }
+            last = v;
+        }
+        round = round + 1;
+    }
+    return lx_bad("LIFE-KILL-TICK", "no_tick_round", last);
+}
+fn ph_sigterm() {
+    lx_phase("SIGTERM");
+    var c = l_spawn("spin");
+    l_sleep(20);
+    l_kill(c, 15);
+    l_sleep(300);
+    var st = lx_state(c);
+    var r = lx_killreap(c, 2000);
+    if (st != 1) { if (st != 2) { return lx_bad("LIFE-SIGTERM-NODEFAULT", "state", st); } }
+    if (r != 265) { return lx_bad("LIFE-SIGTERM-NODEFAULT", "status", r); }
+    return lx_ok("LIFE-SIGTERM-NODEFAULT");
+}
+fn ph_release() {
+    lx_phase("RELEASE");
+    # FLOCK: a killed holder's advisory lock is released by the death chain.
+    var fd = l_open("/lf");
+    var h = l_spawn("flockhold");
+    var t = l_us() + 2000000;
+    var held = 0;
+    while (l_us() < t) {
+        if (l_flock(fd, 2 | 4) == (0 - 1)) { held = 1; break; }
+        l_flock(fd, 8);
+        l_sleep(10);
+    }
+    var hr = lx_killreap(h, 2000);
+    var after = l_flock(fd, 2 | 4);
+    l_flock(fd, 8);
+    l_close(fd);
+    if (held == 0) { lx_bad("LIFE-KILL-RELEASE-FLOCK", "never_held", 0); }
+    else { if (hr != 265) { lx_bad("LIFE-KILL-RELEASE-FLOCK", "status", hr); }
+    else { lx_v(after == 0, "LIFE-KILL-RELEASE-FLOCK", "still_locked", after); } }
+    # CHAN: a killed endpoint owner reads as PEERGONE (-9) on the other end.
+    var cr = syscall(97, 1, &lx_fds, 0, 0);
+    var ca = load64(&lx_fds);
+    var cb = load64(&lx_fds + 8);
+    var ef = syscall(97, 5, cb, 0, 0);
+    var ch = l_spawn("chanhold");
+    l_sleep(30);
+    var before = syscall(97, 3, ca, &lx_rb, 64);
+    var chr = lx_killreap(ch, 2000);
+    var gone = syscall(97, 3, ca, &lx_rb, 64);
+    syscall(97, 4, ca, 0, 0);
+    syscall(97, 4, cb, 0, 0);
+    if (cr != 0) { lx_bad("LIFE-KILL-RELEASE-CHAN", "mint", cr); }
+    else { if (ef < 0) { lx_bad("LIFE-KILL-RELEASE-CHAN", "endow", ef); }
+    else { if (before != (0 - 8)) { lx_bad("LIFE-KILL-RELEASE-CHAN", "before", before); }
+    else { if (chr != 265) { lx_bad("LIFE-KILL-RELEASE-CHAN", "status", chr); }
+    else { lx_v(gone == (0 - 9), "LIFE-KILL-RELEASE-CHAN", "after", gone); } } } }
+    # TCP: a killed listener's port is free again.
+    var ls = l_spawn1("listen", 7777);
+    var t2 = l_us() + 2000000;
+    var busy = 0;
+    while (l_us() < t2) {
+        var lt = syscall(56, 7777, 0, 0, 0);
+        if (lt < 0) { busy = 1; break; }
+        syscall(50, lt, 0, 0, 0);
+        l_sleep(10);
+    }
+    var lr = lx_killreap(ls, 2000);
+    var l2 = syscall(56, 7777, 0, 0, 0);
+    if (l2 >= 0) { syscall(50, l2, 0, 0, 0); }
+    if (busy == 0) { return lx_bad("LIFE-KILL-RELEASE-TCP", "never_listened", 0); }
+    if (lr != 265) { return lx_bad("LIFE-KILL-RELEASE-TCP", "status", lr); }
+    return lx_v(l2 >= 0, "LIFE-KILL-RELEASE-TCP", "port_still_held", l2);
+}
+fn ph_leak() {
+    lx_phase("LEAK");
+    var f = 0;
+    while (f < 16) {
+        var c = l_spawn("spin");
+        if (c < 0) { break; }
+        store64(&lx_kids + f * 8, c);
+        f = f + 1;
+    }
+    var i = 0;
+    while (i < f) { l_kill(load64(&lx_kids + i * 8), 9); i = i + 1; }
+    i = 0;
+    while (i < f) { lx_reap(load64(&lx_kids + i * 8), 2000); i = i + 1; }
+    var bad = 0;
+    i = 0;
+    while (i < 20) {
+        var c2 = l_spawn("spin");
+        l_sleep(20);
+        if (lx_killreap(c2, 2000) != 265) { bad = bad + 1; }
+        i = i + 1;
+    }
+    var f2 = 0;
+    while (f2 < 16) {
+        var c3 = l_spawn("spin");
+        if (c3 < 0) { break; }
+        store64(&lx_kids + f2 * 8, c3);
+        f2 = f2 + 1;
+    }
+    i = 0;
+    while (i < f2) { l_kill(load64(&lx_kids + i * 8), 9); i = i + 1; }
+    i = 0;
+    while (i < f2) { lx_reap(load64(&lx_kids + i * 8), 2000); i = i + 1; }
+    if (bad != 0) { return lx_bad("LIFE-LEAK", "status", bad); }
+    if (f2 != f) { return lx_bad("LIFE-LEAK", "free_slots", f2 - f); }
+    if (lx_free_ok() == 0) { return lx_bad("LIFE-LEAK", "free_ram", lx_free()); }
+    return lx_ok("LIFE-LEAK");
+}
+fn ph_zparentkill() {
+    lx_phase("ZPARENTKILL");
+    var p = l_spawn("zparent");
+    var t = l_us() + 2000000;
+    var c = 0 - 1;
+    while (l_us() < t) {
+        c = lx_child_of(p, 1);
+        if (c >= 0) { if (lx_state(c) == 7) { break; } }
+        l_sleep(5);
+    }
+    var st = lx_state(c);
+    var r = lx_killreap(p, 2000);
+    l_sleep(50);
+    if (st != 7) { return lx_bad("LIFE-ZOMBIE-OF-KILLED", "child_not_zombie", st); }
+    if (r != 265) { return lx_bad("LIFE-ZOMBIE-OF-KILLED", "status", r); }
+    if (lx_state(c) != (0 - 1)) { return lx_bad("LIFE-ZOMBIE-OF-KILLED", "zombie_left", lx_state(c)); }
+    if (lx_free_ok() == 0) { return lx_bad("LIFE-ZOMBIE-OF-KILLED", "free_ram", lx_free()); }
+    return lx_ok("LIFE-ZOMBIE-OF-KILLED");
+}
+fn ph_killnotree() {
+    lx_phase("KILLNOTREE");
+    var s0 = lx_kscan();
+    var p = l_spawn("orphanstay");
+    var t = l_us() + 2000000;
+    var g = 0 - 1;
+    while (l_us() < t) {
+        g = lx_child_of(p, 0);
+        if (g >= 0) { if (lx_state(g) == 6) { break; } }
+        l_sleep(5);
+    }
+    var r = lx_killreap(p, 2000);
+    var gst = lx_state(g);
+    var ov = lx_kvia_w("orphan", g, s0, 2000);
+    if (g < 0) { return lx_bad("LIFE-KILL-NOTREE", "no_grandchild", g); }
+    if (r != 265) { return lx_bad("LIFE-KILL-NOTREE", "status", r); }
+    if (gst != 6) { return lx_bad("LIFE-KILL-NOTREE", "grandchild_state", gst); }
+    if (ov != 9) { return lx_bad("LIFE-KILL-NOTREE", "no_orphan_line", ov); }
+    return lx_ok("LIFE-KILL-NOTREE");
+}
+fn ph_klogstorm() {
+    lx_phase("KLOGSTORM");
+    if (LX_NCPU < 2) { return lx_na("LIFE-KLOG-STORM"); }
+    var s1 = l_spawn("klugspam");
+    var s2 = l_spawn("klugspam");
+    var s3 = l_spawn("klugspam");
+    var bad0 = LX_KBAD;
+    var i = 0;
+    var miss = 0;
+    var badst = 0;
+    while (i < 100) {
+        var c = l_spawn("spin");
+        var s0 = lx_kscan();
+        l_spinto(l_us() + 5000);
+        if (lx_killreap(c, 2000) != 265) { badst = badst + 1; }
+        if (lx_kvia_w("kill", c, s0, 200) <= 0) { miss = miss + 1; }
+        i = i + 1;
+    }
+    lx_killreap(s1, 2000); lx_killreap(s2, 2000); lx_killreap(s3, 2000);
+    lx_kscan();
+    if (badst != 0) { return lx_bad("LIFE-KLOG-STORM", "status", badst); }
+    if (miss != 0) { return lx_bad("LIFE-KLOG-STORM", "kill_lines_missing", miss); }
+    if (LX_KBAD != bad0) { return lx_bad("LIFE-KLOG-STORM", "unparsed", LX_KBAD - bad0); }
+    return lx_ok("LIFE-KLOG-STORM");
+}
+# Spawn `args`, wait for state 6, kill: status 265 within 2 s and KLOG kill via=b1. 1 = OK (else it printed -BAD).
+fn lx_killblocked(args, tag) {
+    var c = l_spawn(args);
+    if (lx_wait_state(c, 6, 3000) == 0) { var q = lx_state(c); lx_killreap(c, 2000); lx_bad(tag, "never_blocked", q); return 0; }
+    var s0 = lx_kscan();
+    var t0 = l_us();
+    var r = lx_killreap(c, 2000);
+    var dt = l_us() - t0;
+    var v = lx_kvia_w("kill", c, s0, 500);
+    if (r != 265) { lx_bad(tag, "status", r); return 0; }
+    if (dt > 2000000) { lx_bad(tag, "slow_us", dt); return 0; }
+    if (v != 3) { lx_bad(tag, "via_not_b1", v); return 0; }
+    lx_ok(tag);
+    return 1;
+}
+fn ph_killblocked() {
+    lx_phase("KILLBLOCKED");
+    lx_killblocked("sleep 60000", "LIFE-KILL-BLOCKED-SLEEP");
+    var fd = l_open("/lf");
+    l_flock(fd, 2);
+    lx_killblocked("flockwait", "LIFE-KILL-BLOCKED-FLOCK");
+    l_flock(fd, 8);
+    l_close(fd);
+    lx_killblocked("kbd", "LIFE-KILL-BLOCKED-KBD");
+    return 0;
+}
+fn ph_kbdnext() {
+    lx_phase("KBDNEXT");
+    var n0 = lx_kcount("kbd: line owner reclaimed from a dead process");
+    var c = l_spawn("kbd");
+    var ok = lx_wait_state(c, 6, 3000);
+    var n1 = lx_kcount("kbd: line owner reclaimed from a dead process");
+    var r = lx_killreap(c, 2000);
+    if (ok == 0) { return lx_bad("LIFE-KILL-BLOCKED-KBD-NEXT", "never_blocked", 0); }
+    if (n1 != n0) { return lx_bad("LIFE-KILL-BLOCKED-KBD-NEXT", "reclaim_line", n1); }
+    if (n0 != 0) { return lx_bad("LIFE-KILL-BLOCKED-KBD-NEXT", "reclaim_line_before", n0); }
+    return lx_v(r == 265, "LIFE-KILL-BLOCKED-KBD-NEXT", "status", r);
+}
+fn ph_flockcycle() {
+    lx_phase("FLOCKCYCLE");
+    var a = l_spawn("flockab");
+    l_sleep(50);
+    var b = l_spawn("flockba");
+    var ok = 0;
+    var t = l_us() + 3000000;
+    while (l_us() < t) {
+        if (lx_state(a) == 6) { if (lx_state(b) == 6) { ok = 1; break; } }
+        l_sleep(10);
+    }
+    var ar = lx_killreap(a, 2000);
+    var br = lx_reap(b, 2000);
+    if (br == (0 - 998)) { lx_killreap(b, 2000); }
+    if (ok == 0) { return lx_bad("LIFE-FLOCK-CYCLE", "no_cycle", 0); }
+    if (ar != 265) { return lx_bad("LIFE-FLOCK-CYCLE", "status_a", ar); }
+    return lx_v(br == 0, "LIFE-FLOCK-CYCLE", "status_b", br);
+}
+fn ph_netblocked() {
+    lx_phase("NETBLOCKED");
+    var i = 0;
+    var bad = 0;
+    var cbad = 0;
+    while (i < 8) {
+        var line = &lx_rb;
+        var o = l_cat(line, 0, "dial 2130706433 ");
+        o = l_catnum(line, o, 7100 + i);
+        store8(line + o, 0);
+        var c = l_spawn(line);
+        if (lx_wait_state(c, 6, 3000) == 0) { cbad = cbad + 1; }
+        var t0 = l_us();
+        if (lx_killreap(c, 2000) != 265) { bad = bad + 1; }
+        if (l_us() - t0 > 2000000) { bad = bad + 1; }
+        i = i + 1;
+    }
+    var lid = syscall(56, 7190, 0, 0, 0);
+    var cid = 0 - 1;
+    if (lid >= 0) { cid = syscall(47, 2130706433, 7190, 0, 0); }
+    if (cid >= 0) { syscall(50, cid, 0, 0, 0); }
+    if (lid >= 0) { syscall(50, lid, 0, 0, 0); }
+    if (cbad != 0) { lx_bad("LIFE-KILL-BLOCKED-CONNECT", "never_blocked", cbad); }
+    else { if (bad != 0) { lx_bad("LIFE-KILL-BLOCKED-CONNECT", "status", bad); }
+    else { if (lid < 0) { lx_bad("LIFE-KILL-BLOCKED-CONNECT", "listen_after", lid); }
+    else { lx_v(cid >= 0, "LIFE-KILL-BLOCKED-CONNECT", "connect_after", cid); } } }
+    # SEND: a peer that accepts and never reads; the sender blocks in #48.
+    var sl = syscall(56, 7191, 0, 0, 0);
+    var s = l_spawn2("sendblock", 2130706433, 7191);
+    var acc = 0 - 1;
+    var t = l_us() + 3000000;
+    while (l_us() < t) { acc = syscall(57, sl, 0, 0, 0); if (acc >= 0) { break; } l_sleep(5); }
+    var sok = lx_wait_state(s, 6, 3000);
+    var sr = lx_killreap(s, 2000);
+    if (acc >= 0) { syscall(50, acc, 0, 0, 0); }
+    if (sl >= 0) { syscall(50, sl, 0, 0, 0); }
+    if (sl < 0) { lx_bad("LIFE-KILL-BLOCKED-SEND", "listen", sl); }
+    else { if (sok == 0) { lx_bad("LIFE-KILL-BLOCKED-SEND", "never_blocked", acc); }
+    else { lx_v(sr == 265, "LIFE-KILL-BLOCKED-SEND", "status", sr); } }
+    # PING: a silent host.
+    lx_killblocked("pingsilent 3221225985", "LIFE-KILL-BLOCKED-PING");
+    return 0;
+}
+fn ph_ew37() {
+    lx_phase("EW37");
+    var c = l_spawn("ew37 sys");
+    var t = l_us() + 3000000;
+    var g = 0 - 1;
+    while (l_us() < t) { g = lx_child_of(c, 0); if (g >= 0) { break; } l_sleep(5); }
+    var t0 = l_us();
+    var r = lx_killreap(c, 2000);
+    var dt = l_us() - t0;
+    l_sleep(500);
+    if (g < 0) { return lx_bad("LIFE-KILL-EW37", "no_grandchild", g); }
+    if (r != 265) { return lx_bad("LIFE-KILL-EW37", "status", r); }
+    if (dt > 2000000) { return lx_bad("LIFE-KILL-EW37", "slow_us", dt); }
+    if (lx_state(g) != (0 - 1)) { return lx_bad("LIFE-KILL-EW37", "grandchild_left", lx_state(g)); }
+    if (lx_free_ok() == 0) { return lx_bad("LIFE-KILL-EW37", "free_ram", lx_free()); }
+    return lx_ok("LIFE-KILL-EW37");
+}
+fn ph_ew37race() {
+    lx_phase("EW37RACE");
+    var n = 30;
+    if (LX_NCPU >= 2) { n = 50; }
+    var x = 4242;
+    var i = 0;
+    var bad = 0;
+    while (i < n) {
+        var c = l_spawn("ew37 spin");
+        x = l_lcg(x);
+        l_spinto(l_us() + (x % 5001));
+        if (lx_killreap(c, 2000) != 265) { bad = bad + 1; }
+        i = i + 1;
+    }
+    var clean = lx_wait_nospin(1000);
+    if (bad != 0) { return lx_bad("LIFE-EW37-RACE", "status", bad); }
+    return lx_v(clean, "LIFE-EW37-RACE", "spinner_left", lx_nspinners());
+}
+fn ph_stop() {
+    lx_phase("STOP");
+    var c = l_spawn("spin");
+    l_sleep(50);
+    var s0 = lx_kscan();
+    var k = l_kill(c, 19);
+    var st5 = lx_wait_state(c, 5, 500);
+    var tk0 = lx_ticks(c);
+    l_sleep(300);
+    var tk1 = lx_ticks(c);
+    var wp = l_poll(c);
+    var v = lx_kvia_w("stop", c, s0, 500);
+    var k2 = l_kill(c, 18);
+    l_sleep(20);
+    var st2 = lx_state(c);
+    var tk2 = lx_ticks(c);
+    l_sleep(300);
+    var tk3 = lx_ticks(c);
+    var r = lx_killreap(c, 2000);
+    if (k != 0) { lx_bad("LIFE-STOP", "kill19", k); }
+    else { if (st5 == 0) { lx_bad("LIFE-STOP", "no_state5", lx_state(c)); }
+    else { if (tk1 != tk0) { lx_bad("LIFE-STOP", "ticks_moved", tk1 - tk0); }
+    else { if (wp != (0 - 2)) { lx_bad("LIFE-STOP", "waitpid", wp); }
+    else { if (LX_NCPU < 2) { lx_v(v == 1, "LIFE-STOP", "via_not_claim", v); }
+    else { if (v == 1) { lx_ok("LIFE-STOP"); } else { lx_v(v == 2, "LIFE-STOP", "via", v); } } } } } }
+    if (k2 != 0) { return lx_bad("LIFE-CONT", "kill18", k2); }
+    if (st2 == 5) { return lx_bad("LIFE-CONT", "still_5", st2); }
+    if (tk3 - tk2 < 5) { return lx_bad("LIFE-CONT", "ticks", tk3 - tk2); }
+    return lx_v(r == 265, "LIFE-CONT", "status", r);
+}
+fn ph_stoptick() {
+    lx_phase("STOPTICK");
+    if (LX_NCPU < 2) { return lx_na("LIFE-STOP-TICK"); }
+    var round = 0;
+    var last = 0;
+    while (round < 3) {
+        var c = lx_spin_running();
+        if (c >= 0) {
+            var s0 = lx_kscan();
+            l_kill(c, 19);
+            var ok5 = lx_wait_state(c, 5, 500);
+            var v = lx_kvia_w("stop", c, s0, 500);
+            l_kill(c, 18);
+            var r = lx_killreap(c, 2000);
+            if (ok5 == 0) { return lx_bad("LIFE-STOP-TICK", "no_state5", 0); }
+            if (r != 265) { return lx_bad("LIFE-STOP-TICK", "status", r); }
+            if (v == 2) { return lx_ok("LIFE-STOP-TICK"); }
+            last = v;
+        }
+        round = round + 1;
+    }
+    return lx_bad("LIFE-STOP-TICK", "no_tick_round", last);
+}
+fn ph_killstopped() {
+    lx_phase("KILLSTOPPED");
+    var c = l_spawn("spin");
+    l_sleep(30);
+    l_kill(c, 19);
+    var ok5 = lx_wait_state(c, 5, 500);
+    var s0 = lx_kscan();
+    var r = lx_killreap(c, 2000);
+    var v = lx_kvia_w("kill", c, s0, 500);
+    if (ok5 == 0) { return lx_bad("LIFE-KILL-STOPPED", "no_state5", 0); }
+    if (r != 265) { return lx_bad("LIFE-KILL-STOPPED", "status", r); }
+    if (LX_NCPU < 2) { if (v != 1) { return lx_bad("LIFE-KILL-STOPPED", "via_not_claim", v); } }
+    return lx_ok("LIFE-KILL-STOPPED");
+}
+fn ph_selfstop() {
+    lx_phase("SELFSTOP");
+    var s0 = lx_kscan();
+    var c = l_spawn("selfstop");
+    var t0 = l_us();
+    l_sleep(200);
+    var dt = l_us() - t0;
+    var st = lx_state(c);
+    var v = lx_kvia_w("stop", c, s0, 500);
+    l_sleep(200);
+    var st2 = lx_state(c);
+    l_kill(c, 18);
+    var r = lx_reap(c, 2000);
+    if (r == (0 - 998)) { lx_killreap(c, 2000); }
+    if (st != 5) { lx_bad("LIFE-SELFSTOP", "state", st); }
+    else { if (v != 3) { lx_bad("LIFE-SELFSTOP", "via_not_b1", v); }
+    else { if (st2 != 5) { lx_bad("LIFE-SELFSTOP", "left_5", st2); }
+    else { lx_v(r == 77, "LIFE-SELFSTOP", "status", r); } } }
+    if (LX_NCPU < 2) {
+        if (dt > 250000) { return lx_bad("LIFE-STOP-LONE", "late_us", dt); }
+        if (dt < 150000) { return lx_bad("LIFE-STOP-LONE", "early_us", dt); }
+        return lx_v(st == 5, "LIFE-STOP-LONE", "state", st);
+    }
+    return 0;
+}
+fn ph_stopblocked() {
+    lx_phase("STOPBLOCKED");
+    var s0 = lx_kscan();
+    var c = l_spawn("sleepreport 300");
+    var t0 = l_us();
+    l_spinto(t0 + 50000);
+    l_kill(c, 19);
+    var ok5 = lx_wait_state(c, 5, 500);
+    var v = lx_kvia_w("stop", c, s0, 500);
+    var tk0 = lx_ticks(c);
+    l_spinto(t0 + 700000);
+    var tk1 = lx_ticks(c);
+    l_kill(c, 18);
+    var tc = l_us();
+    var r = lx_reap(c, 2000);
+    var dr = l_us() - tc;
+    if (r == (0 - 998)) { lx_killreap(c, 2000); }
+    if (ok5 == 0) { return lx_bad("LIFE-STOP-BLOCKED", "no_state5", 0); }
+    if (v != 4) { return lx_bad("LIFE-STOP-BLOCKED", "via_not_wait", v); }
+    if (tk1 != tk0) { return lx_bad("LIFE-STOP-BLOCKED", "ticks_moved", tk1 - tk0); }
+    if (r < 65) { return lx_bad("LIFE-STOP-BLOCKED", "status", r); }
+    if (dr > 150000) { return lx_bad("LIFE-STOP-BLOCKED", "reap_late_us", dr); }
+    return lx_ok("LIFE-STOP-BLOCKED");
+}
+fn ph_killstoppedinplace() {
+    lx_phase("KILLSTOPPEDINPLACE");
+    var s0 = lx_kscan();
+    var c = l_spawn("sleep 60000");
+    var b6 = lx_wait_state(c, 6, 2000);
+    l_kill(c, 19);
+    var ok5 = lx_wait_state(c, 5, 500);
+    var v = lx_kvia_w("stop", c, s0, 500);
+    var s1 = lx_kscan();
+    var r = lx_killreap(c, 2000);
+    var kv = lx_kvia_w("kill", c, s1, 500);
+    if (b6 == 0) { return lx_bad("LIFE-KILL-STOPPED-INPLACE", "never_blocked", 0); }
+    if (ok5 == 0) { return lx_bad("LIFE-KILL-STOPPED-INPLACE", "no_state5", 0); }
+    if (v != 4) { return lx_bad("LIFE-KILL-STOPPED-INPLACE", "stop_via_not_wait", v); }
+    if (r != 265) { return lx_bad("LIFE-KILL-STOPPED-INPLACE", "status", r); }
+    return lx_v(kv == 3, "LIFE-KILL-STOPPED-INPLACE", "kill_via_not_b1", kv);
+}
+fn ph_selfunstoppable() {
+    lx_phase("SELFUNSTOPPABLE");
+    var a = l_kill(LX_ME, 19);
+    var b = l_kill(LX_ME, 0);
+    if (a != (0 - 1)) { return lx_bad("LIFE-SELF-UNSTOPPABLE", "kill19", a); }
+    return lx_v(b == 0, "LIFE-SELF-UNSTOPPABLE", "probe", b);
+}
+fn ph_stopunstoppable() {
+    lx_phase("STOPUNSTOPPABLE");
+    var r = lx_reap(l_spawn("ew37 stopme"), 3000);
+    return lx_v(r == 3, "LIFE-STOP-UNSTOPPABLE", "status", r);
+}
+fn ph_stoppedorphan() {
+    lx_phase("STOPPEDORPHAN");
+    var s0 = lx_kscan();
+    var p = l_spawn("stopchild");
+    var t = l_us() + 1000000;
+    var c = 0 - 1;
+    while (l_us() < t) { c = lx_child_of(p, 0); if (c >= 0) { break; } l_sleep(2); }
+    var r = lx_reap(p, 2000);
+    var cv = lx_kvia_w("cont", c, s0, 200);
+    var clean = lx_wait_nospin(1500);
+    if (r != 0) { return lx_bad("LIFE-STOPPED-ORPHAN", "status", r); }
+    if (c < 0) { return lx_bad("LIFE-STOPPED-ORPHAN", "no_child", c); }
+    if (cv != 6) { return lx_bad("LIFE-STOPPED-ORPHAN", "no_cont_via_orphan", cv); }
+    return lx_v(clean, "LIFE-STOPPED-ORPHAN", "spinner_left", lx_nspinners());
+}
+fn ph_race() {
+    lx_phase("RACE");
+    var n = 60;
+    if (LX_NCPU >= 2) { n = 200; }
+    var x = 777;
+    var i = 0;
+    var bad = 0;
+    var lastbad = 0;
+    while (i < n) {
+        var c = 0;
+        if (i % 3 == 0) { c = l_spawn("spin"); }
+        if (i % 3 == 1) { c = l_spawn("sleep 60000"); }
+        if (i % 3 == 2) { c = l_spawn("sys"); }
+        x = l_lcg(x);
+        var ord = x % 6;
+        var j = 0;
+        while (j < 3) {
+            var sig = 9;
+            if (ord == 0) { if (j == 0) { sig = 19; } if (j == 1) { sig = 9; } if (j == 2) { sig = 18; } }
+            if (ord == 1) { if (j == 0) { sig = 19; } if (j == 1) { sig = 18; } if (j == 2) { sig = 9; } }
+            if (ord == 2) { if (j == 0) { sig = 9; } if (j == 1) { sig = 19; } if (j == 2) { sig = 18; } }
+            if (ord == 3) { if (j == 0) { sig = 9; } if (j == 1) { sig = 18; } if (j == 2) { sig = 19; } }
+            if (ord == 4) { if (j == 0) { sig = 18; } if (j == 1) { sig = 19; } if (j == 2) { sig = 9; } }
+            if (ord == 5) { if (j == 0) { sig = 18; } if (j == 1) { sig = 9; } if (j == 2) { sig = 19; } }
+            l_kill(c, sig);
+            x = l_lcg(x);
+            l_spinto(l_us() + (x % 2001));
+            j = j + 1;
+        }
+        var r = lx_reap(c, 1000);
+        if (r != 265) { bad = bad + 1; lastbad = r; if (r == (0 - 998)) { lx_killreap(c, 2000); } }
+        i = i + 1;
+    }
+    var clean = lx_wait_nospin(1000);
+    if (bad != 0) { return lx_bad("LIFE-RACE", "status", lastbad); }
+    if (clean == 0) { return lx_bad("LIFE-RACE", "spinner_left", lx_nspinners()); }
+    return lx_v(lx_free_ok(), "LIFE-RACE", "free_ram", lx_free());
+}
+# Is every LIVE descendant of root in state st? (#99 ppid chains; state 7 = dead, skipped.) n = members counted.
+var LX_MEMBERS = 0;
+var LX_TSUM = 0;         # the live members' tick sum (lx_tree_all)
+fn lx_tree_all(root, st) {
+    var n = lx_pln();
+    var all = 1;
+    LX_MEMBERS = 0;
+    LX_TSUM = 0;
+    var i = 0;
+    while (i < n) {
+        var r = &lx_pl + i * 64;
+        var q = load64(r);
+        var hop = 0;
+        var x = load64(r + 16);
+        var desc = 0;
+        while (hop < 16) {
+            if (x == root) { desc = 1; break; }
+            if (x == 0) { break; }
+            var xi = 0;
+            var nx = 0 - 1;
+            while (xi < n) { if (load64(&lx_pl + xi * 64) == x) { nx = load64(&lx_pl + xi * 64 + 16); } xi = xi + 1; }
+            if (nx < 0) { break; }
+            x = nx;
+            hop = hop + 1;
+        }
+        if (q == root) { desc = 1; }
+        if (desc == 1) {
+            if (load64(r + 8) != 7) {
+                LX_MEMBERS = LX_MEMBERS + 1;
+                LX_TSUM = LX_TSUM + (load64(r + 56) & 0xFFFFFFFF);
+                if (load64(r + 8) != st) { all = 0; }
+            }
+        }
+        i = i + 1;
+    }
+    return all;
+}
+fn lx_tree_any(root, st) {
+    var n = lx_pln();
+    var i = 0;
+    while (i < n) {
+        var r = &lx_pl + i * 64;
+        if (load64(r + 16) == root) { if (load64(r + 8) == st) { return 1; } }
+        if (load64(r) == root) { if (load64(r + 8) == st) { return 1; } }
+        i = i + 1;
+    }
+    return 0;
+}
+fn ph_tree() {
+    lx_phase("TREE");
+    var c = l_spawn("tree");
+    var t = l_us() + 2000000;
+    while (l_us() < t) { lx_tree_all(c, 99); if (LX_MEMBERS >= 3) { break; } l_sleep(5); }
+    var vis = LX_MEMBERS;
+    var k1 = l_kill(c, 19 | 0x100);
+    var t1 = l_us() + 500000;
+    var all5 = 0;
+    while (l_us() < t1) { if (lx_tree_all(c, 5) == 1) { all5 = 1; break; } l_sleep(5); }
+    var k2 = l_kill(c, 18 | 0x100);
+    l_sleep(30);
+    var any5 = lx_tree_any(c, 5);
+    l_kill(c, 9 | 0x100);
+    var r = lx_reap(c, 2000);
+    l_sleep(500);
+    var nsp = lx_nspinners();
+    if (vis < 3) { lx_bad("LIFE-TREE-STOP", "members", vis); }
+    else { if (k1 != 0) { lx_bad("LIFE-TREE-STOP", "kill_ret", k1); }
+    else { lx_v(all5, "LIFE-TREE-STOP", "not_all_5", LX_MEMBERS); } }
+    if (k2 != 0) { lx_bad("LIFE-TREE-CONT", "kill_ret", k2); } else { lx_v(any5 == 0, "LIFE-TREE-CONT", "still_5", any5); }
+    if (r != 265) { return lx_bad("LIFE-TREE", "status", r); }
+    if (nsp != 0) { return lx_bad("LIFE-TREE", "spinner_left", nsp); }
+    return lx_v(lx_free_ok(), "LIFE-TREE", "free_ram", lx_free());
+}
+fn lx_noescape(mode) {
+    var c = l_spawn(mode);
+    l_sleep(300);
+    l_kill(c, 9 | 0x100);
+    var r = lx_reap(c, 2000);
+    var clean = lx_wait_nospin(1000);
+    if (r != 265) { return 0 - 1000 + r; }
+    if (clean == 0) { return lx_nspinners(); }
+    return 0;
+}
+fn ph_treenoescape() {
+    lx_phase("TREENOESCAPE");
+    var a = lx_noescape("spawnloop");
+    var b = lx_noescape("forkloop");
+    if (a != 0) { return lx_bad("LIFE-TREE-NOESCAPE", "spawnloop", a); }
+    return lx_v(b == 0, "LIFE-TREE-NOESCAPE", "forkloop", b);
+}
+fn ph_treestopnoescape() {
+    lx_phase("TREESTOPNOESCAPE");
+    var c = l_spawn("spawnloop");
+    l_sleep(300);
+    var k = l_kill(c, 19 | 0x100);
+    var t = l_us() + 300000;
+    var all5 = 0;
+    while (l_us() < t) { if (lx_tree_all(c, 5) == 1) { all5 = 1; break; } l_sleep(5); }
+    var m0 = LX_MEMBERS;
+    var sum0 = LX_TSUM;
+    l_sleep(300);
+    lx_tree_all(c, 5);
+    var m1 = LX_MEMBERS;
+    var sum1 = LX_TSUM;
+    l_kill(c, 18 | 0x100);
+    l_kill(c, 9 | 0x100);
+    var r = lx_reap(c, 2000);
+    var clean = lx_wait_nospin(1000);
+    if (k != 0) { return lx_bad("LIFE-TREE-STOP-NOESCAPE", "kill_ret", k); }
+    if (all5 == 0) { return lx_bad("LIFE-TREE-STOP-NOESCAPE", "not_all_5", m0); }
+    if (m1 > m0) { return lx_bad("LIFE-TREE-STOP-NOESCAPE", "new_member", m1 - m0); }
+    if (sum1 != sum0) { return lx_bad("LIFE-TREE-STOP-NOESCAPE", "ticks_moved", sum1 - sum0); }
+    if (r != 265) { return lx_bad("LIFE-TREE-STOP-NOESCAPE", "status", r); }
+    return lx_v(clean, "LIFE-TREE-STOP-NOESCAPE", "spinner_left", lx_nspinners());
+}
+fn ph_stopew37tree() {
+    lx_phase("STOPEW37TREE");
+    var c = l_spawn("ew37 spin");
+    var t = l_us() + 3000000;
+    var g = 0 - 1;
+    while (l_us() < t) { g = lx_child_of(c, 0); if (g >= 0) { break; } l_sleep(5); }
+    l_sleep(20);
+    var k = l_kill(c, 19 | 0x100);
+    var ok5 = lx_wait_state(c, 5, 500);
+    var gt0 = lx_ticks(g);
+    l_sleep(200);
+    var gt1 = lx_ticks(g);
+    var k2 = l_kill(c, 18 | 0x100);
+    l_kill(c, 9 | 0x100);
+    var r = lx_reap(c, 2000);
+    l_sleep(500);
+    var gs = lx_state(g);
+    if (g < 0) { return lx_bad("LIFE-STOP-EW37-TREE", "no_grandchild", g); }
+    if (k != (0 - 2)) { return lx_bad("LIFE-STOP-EW37-TREE", "tree_stop_not_-2", k); }
+    if (ok5 == 0) { return lx_bad("LIFE-STOP-EW37-TREE", "waiter_not_5", lx_state(c)); }
+    if (gt1 <= gt0) { return lx_bad("LIFE-STOP-EW37-TREE", "grandchild_stopped", gt1 - gt0); }
+    if (k2 != 0) { return lx_bad("LIFE-STOP-EW37-TREE", "cont_ret", k2); }
+    if (r != 265) { return lx_bad("LIFE-STOP-EW37-TREE", "status", r); }
+    return lx_v(gs == (0 - 1), "LIFE-STOP-EW37-TREE", "grandchild_left", gs);
+}
+fn ph_stopzparent() {
+    lx_phase("STOPZPARENT");
+    var p = l_spawn("zparentspin");
+    var t = l_us() + 2000000;
+    var c = 0 - 1;
+    while (l_us() < t) { c = lx_child_of(p, 0); if (c >= 0) { break; } l_sleep(2); }
+    var z = lx_wait_state(p, 7, 2000);
+    var k = l_kill(p, 19 | 0x100);
+    var got5 = 0;
+    var t1 = l_us() + 300000;
+    while (l_us() < t1) { if (lx_state(c) == 5) { got5 = 1; } l_sleep(10); }
+    var k2 = l_kill(p, 9 | 0x100);
+    var cg = lx_wait_state(c, 0 - 1, 1000);
+    var r = lx_reap(p, 2000);
+    if (c < 0) { return lx_bad("LIFE-STOP-ZPARENT", "no_child", c); }
+    if (z == 0) { return lx_bad("LIFE-STOP-ZPARENT", "parent_not_zombie", lx_state(p)); }
+    if (k != (0 - 2)) { return lx_bad("LIFE-STOP-ZPARENT", "tree_stop_not_-2", k); }
+    if (got5 == 1) { return lx_bad("LIFE-STOP-ZPARENT", "child_stopped", 5); }
+    if (k2 != 0) { return lx_bad("LIFE-STOP-ZPARENT", "tree_kill_ret", k2); }
+    if (cg == 0) { return lx_bad("LIFE-STOP-ZPARENT", "child_left", lx_state(c)); }
+    return lx_v(r == 0, "LIFE-STOP-ZPARENT", "status", r);
+}
+fn ph_klogformat() {
+    lx_phase("KLOGFORMAT");
+    lx_kscan();
+    if (LX_KLINES < 1) { return lx_bad("LIFE-KLOG-FORMAT", "no_lines", 0); }
+    return lx_v(LX_KBAD == 0, "LIFE-KLOG-FORMAT", "unparsed", LX_KBAD);
+}
+
+# ═══════════════ 1.57.7 (S8) — PER-PROCESS RESOURCE LIMITS (spawn_limits#107; process-lifecycle.md "Resource limits") ═══════════════
+# Raw #107 until cyrius wraps it. Bounded waits: memory phases 5 s, CPU phases 10 s; on expiry KILL_TREE + reap and
+# -BAD timeout. N = /bin/spinner's distinct 2 MB PT_LOAD pages (the kernel's own pre-pass formula), so an image fits a
+# cap of (N + 1) * 512 pages exactly (+1 = the user stack).
+var LX_N = 0;
+var LX_HI = 0x2000000000;
+var lx_eb[512];          # 4 KB: /bin/spinner's first bytes (the phdrs), then a hand-built ELF for #3
+var lx_kp[16];           # 128 B: a klug match pattern (the memcap line)
+fn lx_arm(m, c) { return syscall(107, m, c, 0, 0); }
+fn lx_mmap() { return syscall(27, 0x200000, 0, 0, 0); }
+# Reap pid within ms; on expiry KILL_TREE + reap and -998. A spawn error (pid < 0) passes through as pid - 1000.
+fn lx_wt(pid, ms) {
+    if (pid < 0) { return pid - 1000; }
+    var r = lx_reap(pid, ms);
+    if (r == (0 - 998)) { l_kill(pid, 9 | 0x100); lx_reap(pid, 2000); }
+    return r;
+}
+# Arm (m, c), spawn "/bin/spinner <args>", reap -> status (or the lx_wt codes).
+fn lx_as(m, c, args, ms) { lx_arm(m, c); return lx_wt(l_spawn(args), ms); }
+fn lx_st(t, r, want) {
+    if (r == (0 - 998)) { return lx_bad(t, "timeout", r); }
+    return lx_v(r == want, t, "status", r);
+}
+fn lx_page_count() {
+    var fd = l_open("/bin/spinner");
+    if (fd < 0) { return 0 - 1; }
+    var n = syscall(5, fd, &lx_eb, 4096, 0);
+    l_close(fd);
+    if (n < 64) { return 0 - 1; }
+    var phoff = load64(&lx_eb + 32);
+    var phn = load16(&lx_eb + 56);
+    var phe = load16(&lx_eb + 54);
+    if (phoff + phn * phe > n) { return 0 - 1; }
+    var m0 = 0;
+    var m1 = 0;
+    var c = 0;
+    var i = 0;
+    while (i < phn) {
+        var ph = &lx_eb + phoff + i * phe;
+        if (load32(ph) == 1) {
+            var v = load64(ph + 16);
+            var pg = v & 0xFFFFFFFFFFE00000;
+            var pe = (v + load64(ph + 40) + 0x1FFFFF) & 0xFFFFFFFFFFE00000;
+            while (pg < pe) {
+                var b = (pg >> 21) & 127;
+                if (b < 64) { if (((m0 >> b) & 1) == 0) { c = c + 1; m0 = m0 | (1 << b); } }
+                else { if (((m1 >> (b - 64)) & 1) == 0) { c = c + 1; m1 = m1 | (1 << (b - 64)); } }
+                pg = pg + 0x200000;
+            }
+        }
+        i = i + 1;
+    }
+    return c;
+}
+# The §4.3a 187-byte ELF: exit(95). ph1 = 0x401000 (`ovl`, the same 2 MB page as ph0) or 0x600000 (`ovlok`).
+fn lx_elf(ph1) {
+    memset(&lx_eb, 0, 187);
+    store32(&lx_eb, 0x464C457F);
+    store8(&lx_eb + 4, 2);
+    store8(&lx_eb + 5, 1);
+    store8(&lx_eb + 6, 1);
+    store16(&lx_eb + 16, 2);
+    store16(&lx_eb + 18, 0x3E);
+    store32(&lx_eb + 20, 1);
+    store64(&lx_eb + 24, 0x4000B0);
+    store64(&lx_eb + 32, 64);
+    store16(&lx_eb + 52, 64);
+    store16(&lx_eb + 54, 56);
+    store16(&lx_eb + 56, 2);
+    var p0 = &lx_eb + 64;
+    store32(p0, 1);
+    store32(p0 + 4, 5);
+    store64(p0 + 16, 0x400000);
+    store64(p0 + 24, 0x400000);
+    store64(p0 + 32, 0xBB);
+    store64(p0 + 40, 0xBB);
+    store64(p0 + 48, 0x200000);
+    var p1 = &lx_eb + 120;
+    store32(p1, 1);
+    store32(p1 + 4, 6);
+    store64(p1 + 16, ph1);
+    store64(p1 + 24, ph1);
+    store64(p1 + 40, 0x1000);
+    store64(p1 + 48, 0x1000);
+    var code = &lx_eb + 0xB0;
+    store8(code, 0xBF); store8(code + 1, 0x5F); store8(code + 5, 0x31); store8(code + 6, 0xC0);
+    store8(code + 7, 0x0F); store8(code + 8, 0x05); store8(code + 9, 0xEB); store8(code + 10, 0xFE);
+    return &lx_eb;
+}
+fn lx_sp3(ph1) { return syscall(3, lx_elf(ph1), 187, 0, 0); }
+fn lx_pat_hex(o, v) {
+    var hx[24];
+    var hn = 0;
+    if (v == 0) { store8(&hx, 48); hn = 1; }
+    while (v > 0) { var nb = v & 15; if (nb < 10) { store8(&hx + hn, 48 + nb); } else { store8(&hx + hn, 87 + nb); } hn = hn + 1; v = v >> 4; }
+    while (hn > 0) { hn = hn - 1; store8(&lx_kp + o, load8(&hx + hn)); o = o + 1; }
+    store8(&lx_kp + o, 0);
+    return o;
+}
+
+fn ph_limargs() {
+    lx_phase("LIMARGS");
+    var t = "LIFE-LIM-ARGS";
+    if (lx_arm(0 - 1, 0) != (0 - 1)) { return lx_bad(t, "neg_mem", 0); }
+    if (lx_arm(0, 0 - 1) != (0 - 1)) { return lx_bad(t, "neg_cpu", 0); }
+    if (lx_arm(0x1000000001, 0) != (0 - 1)) { return lx_bad(t, "mem_2^36+1", 0); }
+    if (lx_arm(0, 0x10000000001) != (0 - 1)) { return lx_bad(t, "cpu_2^40+1", 0); }
+    if (lx_arm(0x1000000000, 0) != 0) { return lx_bad(t, "mem_2^36", 0); }
+    if (lx_arm(0, 0x10000000000) != 0) { return lx_bad(t, "cpu_2^40", 0); }
+    if (lx_arm(0, 0) != 0) { return lx_bad(t, "disarm", 0); }
+    lx_arm(8192, 0);
+    if (lx_arm(0 - 1, 0) != (0 - 1)) { return lx_bad(t, "neg_mem_2", 0); }
+    return lx_st(t, lx_wt(l_spawn("mem"), 5000), 16);        # the refusal kept the (8192, 0) arm
+}
+fn ph_memexact() { lx_phase("MEMEXACT"); return lx_st("LIFE-MEM-EXACT", lx_as(8192, 0, "mem", 5000), 16); }
+fn ph_memloader() {
+    lx_phase("MEMLOADER");
+    var t = "LIFE-MEM-LOADER";
+    var need = (LX_N + 1) * 512;
+    var o = l_cat(&lx_kp, 0, "limits: memcap refused load pid=0x");
+    o = lx_pat_hex(o, LX_ME);
+    o = l_cat(&lx_kp, o, " need=0x");
+    o = lx_pat_hex(o, need);
+    o = l_cat(&lx_kp, o, " cap=0x");
+    lx_pat_hex(o, need - 512);
+    var k0 = lx_kcount(&lx_kp);
+    var a = lx_as(need - 512, 0, "exit 7", 5000);
+    var k1 = lx_kcount(&lx_kp);
+    var b = lx_as(need - 1, 0, "exit 7", 5000);
+    var c = lx_as(need, 0, "exit 7", 5000);
+    var d = lx_as(need + 512, 0, "exit 7", 5000);
+    if (a != (0 - 1007)) { return lx_bad(t, "a_not_-7", a); }
+    if (k1 <= k0) { return lx_bad(t, "no_klug_line", k1); }
+    if (b != (0 - 1007)) { return lx_bad(t, "b_not_-7", b); }
+    if (c != 7) { return lx_bad(t, "c_exact_cap", c); }
+    return lx_v(d == 7, t, "d_control", d);
+}
+fn ph_memspawn3() {
+    lx_phase("MEMSPAWN3");
+    lx_arm(1024, 0);
+    var a = lx_sp3(0x600000);
+    lx_arm(1536, 0);
+    var b = lx_wt(lx_sp3(0x600000), 5000);
+    if (a != (0 - 1)) { lx_wt(a, 2000); return lx_bad("LIFE-MEM-SPAWN3", "under_cap_loaded", a); }
+    return lx_st("LIFE-MEM-SPAWN3", b, 95);
+}
+fn lx_ew37(args) {
+    var o = l_cat(&l_line, 0, "/bin/spinner ");
+    o = l_cat(&l_line, o, args);
+    store8(&l_line + o, 0);
+    return syscall(37, &l_line, o, 0, 0);
+}
+fn ph_mem37() {
+    lx_phase("MEM37");
+    lx_arm((LX_N + 1) * 512 - 512, 0);
+    var a = lx_ew37("exit 3");
+    lx_arm(8192, 0);
+    var b = lx_ew37("mem");
+    if (a != (0 - 1)) { return lx_bad("LIFE-MEM-37", "under_cap_ran", a); }
+    return lx_v(b == 16, "LIFE-MEM-37", "status", b);
+}
+fn ph_meminherit() { lx_phase("MEMINHERIT"); return lx_st("LIFE-MEM-INHERIT", lx_as(8192, 0, "memparent", 5000), 16); }
+fn ph_memlower() { lx_phase("MEMLOWER"); return lx_st("LIFE-MEM-LOWER-ONLY", lx_as(8192, 0, "memarmhigh", 5000), 16); }
+fn ph_memfork() { lx_phase("MEMFORK"); return lx_st("LIFE-MEM-FORK", lx_as(8192, 0, "forkmem", 5000), 16); }
+# One ARM-ONESHOT kind: the armed call already ran; an UNARMED mem2 must map all 20 pages (a leftover 512-page arm
+# refuses its image with -7).
+fn lx_oneshot(kind, first, want) {
+    var r = lx_wt(l_spawn("mem2"), 5000);
+    lo_out("LIFE-ARM-ONESHOT-"); lo_out(kind);
+    if (first != want) { lo_out("-BAD first"); lo_kv("v", first); lo_nl(); return 1; }
+    if (r != 0) { lo_out("-BAD mem2"); lo_kv("v", r); lo_nl(); return 1; }
+    lo_out("-OK\n");
+    return 0;
+}
+fn ph_armoneshot() {
+    lx_phase("ARMONESHOT");
+    var f = 0;
+    lx_arm(512, 0);
+    var o = l_cat(&l_line, 0, "/bin/nope");
+    f = f + lx_oneshot("43", syscall(43, &l_line, o, 0, 0), 0 - 4);
+    lx_arm(512, 0);
+    f = f + lx_oneshot("37", syscall(37, &l_line, o, 0, 0), 0 - 1);
+    lx_arm(512, 0);
+    f = f + lx_oneshot("3", syscall(3, &lx_eb, 0, 0, 0), 0 - 1);
+    f = f + lx_oneshot("43OK", lx_as((LX_N + 1) * 512, 0, "exit 7", 5000), 7);
+    # CPU kind: a leftover (0, 100 ms) arm would end the unarmed spin at 10 ticks with 280.
+    lx_arm(0, 100);
+    syscall(43, &l_line, o, 0, 0);
+    var c = l_spawn("spin");
+    var t = l_us() + 5000000;
+    while (l_us() < t) { if (lx_ticks(c) >= 20) { break; } l_sleep(10); }
+    var tk = lx_ticks(c);
+    var r = lx_killreap(c, 2000);
+    lo_out("LIFE-ARM-ONESHOT-CPU");
+    if (tk < 20) { lo_out("-BAD ticks"); lo_kv("v", r); lo_nl(); f = f + 1; }
+    else { if (r != 265) { lo_out("-BAD status"); lo_kv("v", r); lo_nl(); f = f + 1; } else { lo_out("-OK\n"); } }
+    return lx_v(f == 0, "LIFE-ARM-ONESHOT", "kinds_bad", f);
+}
+fn ph_armperproc() {
+    lx_phase("ARMPERPROC");
+    if (syscall(25, &lx_fds, 0, 0, 0) != 0) { return lx_bad("LIFE-ARM-PER-PROCESS", "pipe", 0); }
+    syscall(62, 1, load64(&lx_fds + 8), 0, 0);
+    var k = l_spawn("armsleep");
+    var t = l_us() + 2000000;
+    var got = 0;
+    while (l_us() < t) { if (syscall(5, load64(&lx_fds), &lx_rb, 1, 0) == 1) { got = 1; break; } l_sleep(10); }
+    var r = lx_wt(l_spawn("exit 7"), 5000);
+    var kr = lx_wt(k, 5000);
+    l_close(load64(&lx_fds));
+    l_close(load64(&lx_fds + 8));
+    if (got == 0) { return lx_bad("LIFE-ARM-PER-PROCESS", "k_not_armed", k); }
+    if (kr != 0) { return lx_bad("LIFE-ARM-PER-PROCESS", "k_status", kr); }
+    return lx_st("LIFE-ARM-PER-PROCESS", r, 7);
+}
+fn ph_armrecycle() {
+    lx_phase("ARMRECYCLE");
+    var tries = 0;
+    while (tries < 3) {
+        var x = l_spawn("armexit");
+        var xr = lx_wt(x, 5000);
+        var z = l_spawn("spawn7");
+        var zr = lx_wt(z, 5000);
+        if (z == x) {
+            if (xr != 0) { return lx_bad("LIFE-ARM-RECYCLE", "x_status", xr); }
+            return lx_st("LIFE-ARM-RECYCLE", zr, 0);
+        }
+        tries = tries + 1;
+    }
+    return lx_bad("LIFE-ARM-RECYCLE", "noreuse", tries);
+}
+fn ph_forknoarm() { lx_phase("FORKNOARM"); return lx_st("LIFE-FORK-NO-ARM", lx_wt(l_spawn("forknoarm"), 5000), 0); }
+fn ph_forkremap() {
+    lx_phase("FORKREMAP");
+    lx_wt(l_spawn("forkremap"), 5000);                     # the untimed warm-up of the same shape
+    var f0 = lx_free();
+    var r = lx_wt(l_spawn("forkremap"), 5000);
+    var f1 = lx_free();
+    if (r != 0) { return lx_st("LIFE-FORK-REMAP", r, 0); }
+    return lx_v(f1 + 1048576 >= f0, "LIFE-FORK-REMAP", "free_ram_drop", f0 - f1);
+}
+fn ph_elfoverlap() {
+    lx_phase("ELFOVERLAP");
+    var t = "LIFE-ELF-OVERLAP";
+    var a = lx_wt(lx_sp3(0x600000), 5000);
+    var o = l_cat(&l_line, 0, "/bin/ovlok");
+    var c = lx_wt(syscall(43, &l_line, o, 0, 0), 5000);
+    var f0 = lx_free();
+    var b = lx_sp3(0x401000);
+    if (b >= 0) { lx_wt(b, 2000); }
+    var o2 = l_cat(&l_line, 0, "/bin/ovl");
+    var d = syscall(43, &l_line, o2, 0, 0);
+    if (d >= 0) { lx_wt(d, 2000); }
+    var f1 = lx_free();
+    if (a != 95) { return lx_bad(t, "ovlok_3", a); }
+    if (c != 95) { return lx_bad(t, "ovlok_43", c); }
+    if (b != (0 - 1)) { return lx_bad(t, "ovl_3_loaded", b); }
+    if (d != (0 - 5)) { return lx_bad(t, "ovl_43_not_-5", d); }
+    return lx_v(f1 + 1048576 >= f0, t, "free_ram_drop", f0 - f1);
+}
+fn ph_cpuxcpu() {
+    lx_phase("CPUXCPU");
+    var s0 = lx_kscan();
+    lx_arm(0, 500);
+    var c = l_spawn("spin");
+    var r = lx_wt(c, 5000);
+    var v = lx_kvia_w("kill", c, s0, 1000);
+    if (r != 280) { return lx_st("LIFE-CPU-XCPU", r, 280); }
+    return lx_v(v == 2, "LIFE-CPU-XCPU", "via_not_tick", v);
+}
+fn ph_cpusys() {
+    lx_phase("CPUSYS");
+    var a = lx_as(0, 500, "sys", 10000);
+    var b = lx_as(0, 500, "mmaploop", 10000);
+    if (a != 280) { return lx_bad("LIFE-CPU-SYSCALL", "sys", a); }
+    return lx_st("LIFE-CPU-SYSCALL", b, 280);
+}
+fn ph_cpuinherit() { lx_phase("CPUINHERIT"); return lx_st("LIFE-CPU-INHERIT", lx_as(0, 500, "parent-spin", 10000), 1); }
+fn ph_cpulower() { lx_phase("CPULOWER"); return lx_st("LIFE-CPU-LOWER-ONLY", lx_as(0, 500, "armhigh", 10000), 1); }
+fn ph_cpuew37() { lx_phase("CPUEW37"); return lx_st("LIFE-CPU-EW37-XCPU", lx_as(0, 500, "ew37x", 10000), 1); }
+fn ph_cpufork() { lx_phase("CPUFORK"); return lx_st("LIFE-CPU-FORK", lx_as(0, 500, "forkspin", 10000), 1); }
+fn ph_armmigrate() { lx_phase("ARMMIGRATE"); return lx_st("LIFE-ARM-MIGRATION", lx_wt(l_spawn("armspawn"), 10000), 1); }
+# LAST: burn the GLOBAL low arena (keep the final pair mapped until lifex exits), then the high-arena phases.
+fn ph_high() {
+    lx_phase("HIGH");
+    var i = 0;
+    var stop = 0;
+    while (i < 400) {
+        var a = lx_mmap();
+        var b = lx_mmap();
+        if (a >= LX_HI) { stop = 1; break; }
+        if (b >= LX_HI) { stop = 1; break; }
+        syscall(28, a, 0x200000, 0, 0);
+        syscall(28, b, 0x200000, 0, 0);
+        i = i + 1;
+    }
+    var p = lx_mmap();
+    syscall(28, p, 0x200000, 0, 0);
+    if (stop == 0) { lx_bad("LIFE-HIGH-BURN", "no_stop", i); }
+    else { lx_v(p >= LX_HI, "LIFE-HIGH-BURN", "probe_low", p); }
+    lx_st("LIFE-MEM-HIGH", lx_as(8192, 0, "mem", 5000), 16);
+    lx_st("LIFE-FORK-HIMAP", lx_wt(l_spawn("forkhimap"), 5000), 0);
+    var tries = 0;
+    while (tries < 3) {
+        var x = l_spawn("himap2");
+        var cx = lx_wt(x, 5000);
+        var y = l_spawn("himap2");
+        var cy = lx_wt(y, 5000);
+        if (y == x) {
+            if (cx == 255) { return lx_bad("LIFE-HIMAP-RECYCLE", "cx_low", cx); }
+            if (cy != cx) { return lx_bad("LIFE-HIMAP-RECYCLE", "cursor_inherited", cy - cx); }
+            return lx_ok("LIFE-HIMAP-RECYCLE");
+        }
+        tries = tries + 1;
+    }
+    return lx_bad("LIFE-HIMAP-RECYCLE", "noreuse", tries);
+}
+
+fn lx_run(name, fp) {
+    if (lx_want(name) == 0) { return 0; }
+    fncall0(fp);
+    lx_kscan();
+    return 0;
+}
+
+fn lx_driver() {
+    LX_ME = l_getpid();
+    lx_phases_load();
+    lo_out("LIFEX-START pid="); lo_num(LX_ME); lo_nl();
+    if (l_us() < 0) { lo_out("LIFE-SETUP-BAD clock v=-1\n"); lo_out("LIFEX-DONE pass=0 fail=1\n"); return 0; }
+    lx_kscan();
+    ph_setup();
+    lx_run("FAULTBG", &ph_faultbg);
+    lx_run("SIGBIT", &ph_sigbit);
+    lx_run("WSTAT", &ph_wstat);
+    lx_run("ZOMBIE", &ph_zombie);
+    lx_run("AUTH", &ph_auth);
+    lx_run("RECYCLEDPARENT", &ph_recycled);
+    lx_run("ZPARENTEXIT", &ph_zparentexit);
+    lx_run("ORPHAN", &ph_orphan);
+    lx_run("ORPHANRACE", &ph_orphanrace);
+    lx_run("KILLSYS", &ph_killsys);
+    lx_run("SELFKILL", &ph_selfkill);
+    lx_run("ZOMBIENOOP", &ph_zombienoop);
+    lx_run("KILLSPIN", &ph_killspin);
+    lx_run("KILLTICK", &ph_killtick);
+    lx_run("SIGTERM", &ph_sigterm);
+    lx_run("RELEASE", &ph_release);
+    lx_run("LEAK", &ph_leak);
+    lx_run("ZPARENTKILL", &ph_zparentkill);
+    lx_run("KILLNOTREE", &ph_killnotree);
+    lx_run("KLOGSTORM", &ph_klogstorm);
+    lx_run("KILLBLOCKED", &ph_killblocked);
+    lx_run("KBDNEXT", &ph_kbdnext);
+    lx_run("FLOCKCYCLE", &ph_flockcycle);
+    lx_run("NETBLOCKED", &ph_netblocked);
+    lx_run("EW37", &ph_ew37);
+    lx_run("EW37RACE", &ph_ew37race);
+    lx_run("STOP", &ph_stop);
+    lx_run("STOPTICK", &ph_stoptick);
+    lx_run("KILLSTOPPED", &ph_killstopped);
+    lx_run("SELFSTOP", &ph_selfstop);
+    lx_run("STOPBLOCKED", &ph_stopblocked);
+    lx_run("KILLSTOPPEDINPLACE", &ph_killstoppedinplace);
+    lx_run("SELFUNSTOPPABLE", &ph_selfunstoppable);
+    lx_run("STOPUNSTOPPABLE", &ph_stopunstoppable);
+    lx_run("STOPPEDORPHAN", &ph_stoppedorphan);
+    lx_run("RACE", &ph_race);
+    lx_run("TREE", &ph_tree);
+    lx_run("TREENOESCAPE", &ph_treenoescape);
+    lx_run("TREESTOPNOESCAPE", &ph_treestopnoescape);
+    lx_run("STOPEW37TREE", &ph_stopew37tree);
+    lx_run("STOPZPARENT", &ph_stopzparent);
+    lx_run("KLOGFORMAT", &ph_klogformat);
+    # 1.57.7 (S8): the resource-limit phases, after every S7 phase; HIGH (the low-arena burn) LAST.
+    lx_run("LIMARGS", &ph_limargs);
+    lx_run("MEMEXACT", &ph_memexact);
+    lx_run("MEMLOADER", &ph_memloader);
+    lx_run("MEMSPAWN3", &ph_memspawn3);
+    lx_run("MEM37", &ph_mem37);
+    lx_run("MEMINHERIT", &ph_meminherit);
+    lx_run("MEMLOWER", &ph_memlower);
+    lx_run("MEMFORK", &ph_memfork);
+    lx_run("ARMONESHOT", &ph_armoneshot);
+    lx_run("ARMPERPROC", &ph_armperproc);
+    lx_run("ARMRECYCLE", &ph_armrecycle);
+    lx_run("FORKNOARM", &ph_forknoarm);
+    lx_run("FORKREMAP", &ph_forkremap);
+    lx_run("ELFOVERLAP", &ph_elfoverlap);
+    lx_run("CPUXCPU", &ph_cpuxcpu);
+    lx_run("CPUSYS", &ph_cpusys);
+    lx_run("CPUINHERIT", &ph_cpuinherit);
+    lx_run("CPULOWER", &ph_cpulower);
+    lx_run("CPUEW37", &ph_cpuew37);
+    lx_run("CPUFORK", &ph_cpufork);
+    lx_run("ARMMIGRATE", &ph_armmigrate);
+    lx_run("HIGH", &ph_high);
+    lo_out("LIFEX-DONE pass="); lo_num(LX_PASS); lo_kv("fail", LX_FAIL); lo_nl();
+    return 0;
+}
+
+fn main(): i64 {
+    if (l_eq(argv(0), "/bin/agnsh") == 0) { lo_out("LIFEX-NOT-DRIVER\n"); return 99; }
+    lx_driver();
+    lo_flush();
+    return 0;
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

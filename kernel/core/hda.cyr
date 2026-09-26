@@ -1429,7 +1429,15 @@ fn hda_stream_service() {
         snd_last_raw = raw;
         var lp_bpf = load64(&hda_bpf + ci * 8);
         if (lp_bpf == 0) { lp_bpf = 4; }
+        var ss_prev = snd_hw_frames;
         snd_hw_frames = (snd_wrap_epochs * 65536 + raw) / lp_bpf;
+        # ⭐ 1.57.7 (Path 2, S3.7): wake a snd_write#66 / snd_drain#68 caller BLOCKED for ring space / play-out
+        # (syscall.cyr snd_write_waiting, snd_drain_waiting) when the DAC moved. ⛔ HERE, INSIDE THIS BLOCK, AND NOT AT
+        # THE END OF THE FUNCTION: the hda_stream_on early return below is ALWAYS taken for a #66 stream (snd_open#64
+        # clears hda_stream_on — the ring-3 producer writes the ring, not the refill), so a wake placed after it would
+        # never fire. BSP tick, IF=0, inside the timer ISR body's preempt bracket (R5); the condition (snd_hw_frames) is
+        # written before wq_wake takes sched_lock (the C9 waker order).
+        if (snd_hw_frames != ss_prev) { wq_wake(WK_SND); }
     }
     if (load64(&hda_stream_on + ci * 8) == 0) { return 0; }
     var lpib = hda_read32(load64(&hda_sd_base + ci * 8) + SD_LPIB);

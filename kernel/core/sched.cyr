@@ -64,6 +64,9 @@ fn sched_next() {
     # HALF the per-tick iterations in the idle-only case. SMP fences unchanged: state==1, on_cpu==-1
     # (skip a proc another CPU owns), sched_idx_pickable (6b foreign-idle + STEP-1-AP skips; a
     # descheduled AP idle's idle_owner names that AP, not this CPU, so it stays excluded).
+    # ⭐ 1.57.7 (Path 2, S3.6) KEEP-CURRENT: when the scan finds only this CPU's idle READY, a current proc that is
+    # still RUNNING (state 2) is returned itself and do_context_switch's new == old early-out keeps it — see the
+    # branch below. So sched_next returns: a READY (state 1) non-idle pick, this CPU's idle, or `current` in state 2.
     var start = proc_current_get() + 1;
     var idle = sched_idle_pid_get();
     var idle_pick = 0 - 1;
@@ -83,7 +86,26 @@ fn sched_next() {
         }
         si = si + 1;
     }
-    if (idle_pick != (0 - 1)) { return idle_pick; }    # only idle was ready
+    if (idle_pick != (0 - 1)) {                        # only idle was ready
+        # ⭐ 1.57.7 (Path 2, S3.6) KEEP-CURRENT. Only this CPU's idle is READY. If the process current here still
+        # wants the CPU (state 2 — it is not blocking (6), yielding (1), stopping (5), dying (4) or dead (0); every
+        # one of those publishes its state under sched_lock BEFORE it switches), keep it. A lone runner used to
+        # alternate with the idle every tick (~50% of a CPU). A leaving process can never be kept — the structural
+        # fix for the blocking critique's sched_suspend_current livelock. Raw load64 (the do_context_switch zone:
+        # this runs under sched_lock); kc is a unique local (nested blocks hoist vars). pinned procs are fine:
+        # sched_idx_pickable(kc) is the same test the scan applies (idle_owner doubles as kmain's/agnsh's pin).
+        var kc = proc_current_get();
+        if (kc != idle) {
+            if (kc >= 0) {
+                if (kc < proc_count) {
+                    if (load64(&proc_table + kc * 176 + 8) == 2) {
+                        if (sched_idx_pickable(kc) == 1) { return kc; }
+                    }
+                }
+            }
+        }
+        return idle_pick;
+    }
     # ⛔⛔ 1.57.6 (Path 2, S3.1) — NOTHING IS READY: RETURN THIS CPU'S IDLE, NEVER kmain.
     # The BSP fallback here was `return 0` (kmain) — the iron Attempt-14 sub-case-3b anti-starvation rule,
     # which PREDATES the idle kthread. With the idle in place the rule is backwards: the idle is READY
@@ -91,7 +113,7 @@ fn sched_next() {
     # makes do_context_switch early-out (new == old). kmain is picked only by the scan, when it is
     # genuinely READY. Returning 0 instead restores kmain's STALE slot: while kmain is parked out-of-band
     # in exec_and_wait (kybernet's agnsh, the recovery `run`) it is state 2 with a frame from whenever it
-    # was last switched out (sys_sched_yield's own note below says so), and the moment a process can leave
+    # was last switched out (the retired sys_sched_yield's own note said so), and the moment a process can leave
     # a CPU without being READY — Path 2's BLOCKED state — the idle is current with nothing ready on every
     # tick and that restore would time-travel kmain onto its own live stack. do_context_switch's tripwire
     # now refuses any non-READY pick as well, so this is the rule and that is the net.
@@ -205,7 +227,7 @@ fn proc_restore_context(pid, isr_rsp) {
     # exact fault it describes. The derivation, so it is re-checkable rather than remembered:
     # syscall_msr_init writes STAR[63:48] = 0x13, so hardware takes ring-3 CS = STAR[63:48]+16 =
     # 0x23 and ring-3 SS = STAR[63:48]+8 = 0x1B. gdt_init agrees — user DS at selector 0x18
-    # (SS 0x1B), user CS at 0x20 (CS 0x23) — and so do proc_set_ring3, sys_sched_yield and
+    # (SS 0x1B), user CS at 0x20 (CS 0x23) — and so do proc_set_ring3, the (1.57.7-retired) sys_sched_yield and
     # sel_pair_consistent below, all of which pair (0x23, 0x1B). The inverted comment told anyone
     # debugging the #GP(errcode 0x18) class that selector index 3 was a CS-load rejection when it
     # is an SS one — the opposite conclusion and the opposite half of the pair to instrument.
@@ -371,8 +393,8 @@ var fpctxsw_migrations = 0;
 # preempt_count 0 (KSTACK_SELFTEST's probes today, the blocking waits from S3.4). The switch saves the frame
 # and the resume restores the SLOT's CR3 — not whatever CR3 was live — so a context that has borrowed a
 # CR3 (cr3_load(0x1000) around a loader, a user CR3 loaded by kernel code) must not be switched out: it
-# would come back under the wrong page tables. And the child of an in-flight execwait#37 must not be,
-# because its parent's continuation lives in THIS CPU's per-CPU exec cells (INTERIM — S3b-F2 deletes it).
+# would come back under the wrong page tables. (1.57.7 S3b: the INTERIM "child of an in-flight execwait#37" clause
+# is gone — a #37 child is an ordinary scheduled process and its parent waits on its own stack.)
 
 # The CR3 a kernel-CR3 (0x1000) context really runs on: 0x1000 in the default build, gnoboot's boot CR3 in
 # a BOOTCR3_KEEP_GNOBOOT_CR3 build. Set once, right before `sched_active = 1` (main.cyr).
@@ -389,7 +411,7 @@ fn sched_live_cr3_ok(pid) {
 }
 
 # The pre-lock guard do_context_switch runs for every tick. A ring-3 frame (CPL3) is always switchable. A
-# CPL0 frame is switchable only on its own CR3 and not as the #37 child (the INTERIM clause). Enforced HERE,
+# CPL0 frame is switchable only on its own CR3 (INV-FG-5 rides on this: the load window's borrowed CR3). Enforced HERE,
 # structurally, so a future unheld sti window cannot bypass it by forgetting to ask.
 # ⛔ A DEAD current proc is ALWAYS switchable, whatever its CR3: exit#0 and fault_kill_current end in an
 # IF=1 `sti; hlt` tail at CPL0 on the dead proc's stack and CR3, and its reaper may already have detached
@@ -403,7 +425,6 @@ fn sched_cpl0_switch_ok(isr_rsp) {
     if (cs_cur >= proc_count) { return 1; }
     if (load64(&proc_table + cs_cur * 176 + 8) == 0) { return 1; }
     if (sched_live_cr3_ok(cs_cur) == 0) { return 0; }
-    if (pcpu_ew37_busy_get() != 0) { if (cs_cur == exec_resume_pid_get()) { return 0; } }   # INTERIM — deleted in S3b-F2
     return 1;
 }
 
@@ -417,21 +438,25 @@ fn do_context_switch(isr_rsp) {
     # tick after preempt_enable() drops the count to 0.
     if (preempt_count_get() > 0) { return 0; }
     if (proc_count < 2) { return 0; }
-    if (sched_cpl0_switch_ok(isr_rsp) == 0) { return 0; }      # 1.57.6 (S3.3): borrowed CR3 / #37 child at CPL0 — see above
+    if (sched_cpl0_switch_ok(isr_rsp) == 0) { return 0; }      # 1.57.6 (S3.3): a borrowed CR3 at CPL0 — see above
     # 1.46.x SMP sub-bite 6: the three cheap guards above stay BEFORE the acquire (they return
     # WITHOUT the lock — INV-1 only governs POST-acquire exits). sched_lock now serializes the
     # pick+save+state-flips+on_cpu fence; it is released BEFORE the lock-free restore tail because
     # do_context_switch RETURNS NORMALLY (the never-returning iretq is the ISR epilogue one frame
-    # up, pic.cyr:140), so a mid-fn unlock executes. INV-1: ALL THREE post-acquire exits (new_pid==old
-    # early-out; the 1.57.6 non-READY tripwire; main path) call sched_spin_unlock(). A dropped unlock here
-    # deadlocks the 2nd tick.
+    # up, pic.cyr:140), so a mid-fn unlock executes. INV-1: ALL FOUR post-acquire exits (1.57.7: the BLOCK-intent
+    # guard; new_pid==old early-out; the 1.57.6 non-READY tripwire; main path) call sched_spin_unlock(). A dropped
+    # unlock here deadlocks the 2nd tick.
     sched_spin_lock();                                          # ACQUIRE
     var old = proc_current_get();
+    # 1.57.7 (S3.4): a BLOCK-shaped voluntary switch whose wake already landed (state 1) or that published nothing
+    # does not switch — see sched_block_intent_satisfied. 0 for every timer tick and every YIELD.
+    if (sched_block_intent_satisfied(old) == 1) { sched_spin_unlock(); return 0; }   # RELEASE (INV-1)
     var new_pid = sched_next();
     if (new_pid == old) { sched_spin_unlock(); return 0; }      # RELEASE on early-out (MANDATORY — INV-1)
     # ⛔ 1.57.6 (Path 2, S3.1) — THE TRIPWIRE: ONLY A READY (state 1) PROC MAY BE SWITCHED TO. sched_next
-    # returns a state-1 pick or this CPU's idle, and when nothing is ready the idle is `old` (early-out
-    # above), so this never fires on a correct kernel. It exists so the stale-slot time-travel class —
+    # returns a state-1 pick, this CPU's idle, or (1.57.7 keep-current) `old` itself in state 2, which the early-out
+    # above takes; when nothing is ready the idle is `old` (early-out above too), so this never fires on a correct
+    # kernel. It exists so the stale-slot time-travel class —
     # restoring a parked kmain, a BLOCKED proc, a half-built CLAIMING one — is structurally impossible
     # rather than merely avoided. Raw load64, before the regalloc-sensitive save/restore zone below.
     # sched_note_refused latches ONE line AFTER the unlock (no klug/serial output under sched_lock).
@@ -574,12 +599,384 @@ fn do_context_switch(isr_rsp) {
     return old + 1;
 }
 
+# ═══════════════ 1.57.7 (Path 2, S3.4) — THE VOLUNTARY SWITCH: int 0xE0 → resched_isr → resched_handler ═══════════════
+#
+# EXACTLY TWO SWITCH PATHS, ONE SAVE FORMAT (docs/architecture/kernel-stacks-and-preemption.md, Invariant 7):
+#   (T) timer:     timer_isr  → timer_handler   → do_context_switch → EOI → sched_leave_old
+#   (V) voluntary: sched_switch_vol → `int 0xE0` → resched_isr → resched_handler → do_context_switch → sched_leave_old
+# A kernel context that wants to leave its CPU — a yield (#44, #14), a blocking wait (wq_sleep), a dying process
+# (sched_exit_tail) — raises a SOFTWARE interrupt on its own stack. resched_isr pushes the SAME 15-register frame
+# the timer stub pushes, so do_context_switch saves the leaver exactly as a tick would and the frame is resumed,
+# later and on any CPU, by an iretq back to the instruction after the `int`. Nothing about the switch itself
+# (the FXSAVE under the lock, CR3 + both KPTI cells, kstack_install, TS, SPEC_CTRL, the (CS,SS) guards, INV-11)
+# is duplicated: the voluntary path inherits all of it by construction. The abandon-frame sys_sched_yield this
+# replaces (1.44.16) wrote the yielder's slot AS IF its syscall had returned and was the one switch path that
+# re-derived every one of those steps by hand.
+#
+# THE INTENT CELL (pcpu_resched_intent[cpu]) — why a hardware 0xE0 can never switch. sched_switch_vol stores the
+# intent (1 YIELD, >= 2 BLOCK-shaped) with IF=0 on this CPU and clears nothing itself; resched_handler clears it on
+# this same CPU before anything can re-enable IF. So the cell is non-zero ONLY while IF=0 inside sched_switch_vol,
+# and a 0xE0 that arrives any other way (a misprogrammed MSI, a self-IPI — both are maskable, so they can only land
+# while IF=1) finds it 0: resched_handler EOIs and returns, the ISR epilogue resumes the interrupted context.
+# kstack-smoke's "spurious 0xE0" phase sends exactly that self-IPI (mutation M-C9: a handler that ignores the cell
+# switches away with the vector still in service and the timer never fires again on that CPU).
+var RESCHED_VECTOR = 224;
+var pcpu_resched_intent[4];
+var resched_gate_said = 0;
+
+# REVERSED-LABEL SLOT MAP (load-bearing; moved here from the retired sys_sched_yield banner, 1.57.7): the proc-slot
+# caller-saved fields restore into the REVERSE of their labels (derived from the ISR pop order, pic.cyr timer_isr_build,
+# vs proc_restore_context's writes above): p+32→r11, p+48→r10, p+56→r9, p+64→r8, p+72→rdi, p+88→rsi, p+96→rdx,
+# p+104→rcx, p+112→rax. So a value a switched-out context must find in RAX when it resumes goes to p+112 (NOT p+32).
+# Harmless for the symmetric save/restore; critical for any slot written BY HAND — resched_handler below (the
+# switched-out leaver's "1") and sys_fork (syscall_hw.cyr, the child's fork return 0).
+# Callee-saved labels are clean (p+40=rbx, p+80=rbp, p+120..144=r12-r15).
+
+# The C half of resched_isr (DEFINED BEFORE resched_isr_build: cyrius resolves a forward CALL but not a forward
+# &fn). isr_rsp = the 15-register frame on the LEAVER's own stack (CPL0 — the int came from kernel code).
+# ⚠ No preempt_disable bracket, unlike the timer body: this ISR exists to switch, and the leaver arrived with
+# preempt_count 0 (every caller checks it). No EOI on the software path: a software INT sets no in-service bit.
+fn resched_handler(isr_rsp) {
+    var rh_c = pcpu_cpu();
+    var rh_it = load64(&pcpu_resched_intent + rh_c * 8);
+    if (rh_it == 0) { apic_eoi(); return 0; }          # a HARDWARE 0xE0 (misprogrammed MSI / self-IPI): EOI, never switch
+    var rh_sw = do_context_switch(isr_rsp);
+    store64(&pcpu_resched_intent + rh_c * 8, 0);       # same CPU: IF=0 since sched_switch_vol's store
+    if (rh_sw == 0) { store64(isr_rsp + 112, 0); return 0; }   # [isr+112] pops into rax -> sched_switch_vol sees 0
+    store64(&proc_table + (rh_sw - 1) * 176 + 112, 1); # old's saved rax (reversed map): it resumes seeing 1; old is still fenced
+    sched_leave_old(isr_rsp, rh_sw - 1);               # never returns
+    return 0;
+}
+
+# Build the vector-0xE0 stub into resched_isr[64] (512 B; 66 used): clac, then byte-for-byte nm_isr_build's
+# 63-byte body (fpu.cyr) with handler = &resched_handler — push the 15 GPRs, mov rdi,rsp, call, pop 15, iretq.
+# REGISTER CONTRACT: clac — no inputs/outputs, clears RFLAGS.AC (every stub the kernel builds starts with it); the
+# body preserves every GPR it pops (the switch path replaces the whole frame instead); rdi = the frame for the call.
+fn resched_isr_build() {
+    var p = &resched_isr;
+    var handler_addr = &resched_handler;
+    var off = 0;
+    store8(p + off, 0x0F); store8(p + off + 1, 0x01); store8(p + off + 2, 0xCA); off = off + 3;  # clac
+    store8(p + off, 0x50); off = off + 1;  # push rax
+    store8(p + off, 0x51); off = off + 1;  # push rcx
+    store8(p + off, 0x52); off = off + 1;  # push rdx
+    store8(p + off, 0x56); off = off + 1;  # push rsi
+    store8(p + off, 0x57); off = off + 1;  # push rdi
+    store8(p + off, 0x41); store8(p + off + 1, 0x50); off = off + 2;  # push r8
+    store8(p + off, 0x41); store8(p + off + 1, 0x51); off = off + 2;  # push r9
+    store8(p + off, 0x41); store8(p + off + 1, 0x52); off = off + 2;  # push r10
+    store8(p + off, 0x41); store8(p + off + 1, 0x53); off = off + 2;  # push r11
+    store8(p + off, 0x53); off = off + 1;  # push rbx
+    store8(p + off, 0x55); off = off + 1;  # push rbp
+    store8(p + off, 0x41); store8(p + off + 1, 0x54); off = off + 2;  # push r12
+    store8(p + off, 0x41); store8(p + off + 1, 0x55); off = off + 2;  # push r13
+    store8(p + off, 0x41); store8(p + off + 1, 0x56); off = off + 2;  # push r14
+    store8(p + off, 0x41); store8(p + off + 1, 0x57); off = off + 2;  # push r15
+    store8(p + off, 0x48); store8(p + off + 1, 0x89); store8(p + off + 2, 0xE7); off = off + 3;  # mov rdi, rsp
+    store8(p + off, 0x48); store8(p + off + 1, 0xB8); off = off + 2;  # mov rax, imm64
+    store64(p + off, handler_addr); off = off + 8;
+    store8(p + off, 0xFF); store8(p + off + 1, 0xD0); off = off + 2;  # call rax
+    store8(p + off, 0x41); store8(p + off + 1, 0x5F); off = off + 2;  # pop r15
+    store8(p + off, 0x41); store8(p + off + 1, 0x5E); off = off + 2;  # pop r14
+    store8(p + off, 0x41); store8(p + off + 1, 0x5D); off = off + 2;  # pop r13
+    store8(p + off, 0x41); store8(p + off + 1, 0x5C); off = off + 2;  # pop r12
+    store8(p + off, 0x5D); off = off + 1;  # pop rbp
+    store8(p + off, 0x5B); off = off + 1;  # pop rbx
+    store8(p + off, 0x41); store8(p + off + 1, 0x5B); off = off + 2;  # pop r11
+    store8(p + off, 0x41); store8(p + off + 1, 0x5A); off = off + 2;  # pop r10
+    store8(p + off, 0x41); store8(p + off + 1, 0x59); off = off + 2;  # pop r9
+    store8(p + off, 0x41); store8(p + off + 1, 0x58); off = off + 2;  # pop r8
+    store8(p + off, 0x5F); off = off + 1;  # pop rdi
+    store8(p + off, 0x5E); off = off + 1;  # pop rsi
+    store8(p + off, 0x5A); off = off + 1;  # pop rdx
+    store8(p + off, 0x59); off = off + 1;  # pop rcx
+    store8(p + off, 0x58); off = off + 1;  # pop rax
+    store8(p + off, 0x48); store8(p + off + 1, 0xCF); off = off + 2;  # iretq
+    if (off > 512) { serial_println("sched: RESCHED STUB OVERFLOWED resched_isr (512 B)", 50); }
+    return 0;
+}
+
+# Leave this CPU voluntarily. intent 1 = YIELD (the leaver stays READY: do_context_switch revives 1..3);
+# intent >= 2 = BLOCK-shaped (the caller already published a non-running state — 6 BLOCKED, 0 dead, S7's 5 — and
+# sched_block_intent_satisfied honours a wake that landed before the int). Returns 1 when the context was switched
+# out and has now been resumed (possibly on ANOTHER CPU), 0 when do_context_switch declined (nothing else ready,
+# preempt_count > 0, a borrowed CR3, the BLOCK guard) — the context then simply continues.
+# ⚠ This function contains asm, so cyrius does NOT regalloc it: `intent` lives at [rbp-8] and `svf` at [rbp-16]
+# (objdump-checked, S3c report). `return intent` therefore returns the value the asm stored.
+# REGISTER CONTRACT (the asm): in — nothing (the intent cell is set in C above it); `int 0xE0` — a software
+# interrupt, NOT masked by IF; out — rax 0/1 (resched_handler's [isr+112] store, or the leaver's slot p+112 = 1 via
+# the reversed map), stored to [rbp-8]; clobbers rax. RSP, RFLAGS.IF/AC and the callee-saved registers are as they
+# were at the `int` (the frame restores them), whichever CPU resumes it.
+fn sched_switch_vol(intent) {
+    var svf = kbd_irq_save();
+    store64(&pcpu_resched_intent + pcpu_cpu() * 8, intent);
+    asm {
+        0xCD; 0xE0;                   # int 0xE0 — the voluntary switch (resched_isr)
+        0x48; 0x89; 0x45; 0xF8;       # mov [rbp-8], rax   (0 = not switched, 1 = switched and resumed)
+    }
+    kbd_irq_restore(svf);             # svf is on THIS proc's stack: correct on whichever CPU we resumed
+    return intent;
+}
+
+# do_context_switch's post-acquire guard for a BLOCK-shaped voluntary switch (called under sched_lock, right after
+# `old` is read). A waiter publishes its non-running state (6) under sched_lock and THEN raises the int; a waker
+# that ran in between made it READY (1) again. Switching the leaver out then would be harmless but pointless (it
+# would be picked right back), and — the case that matters — the switch would REVIVE nothing and the wait would be
+# repeated. So: a wake that landed before the int (state 1) is consumed here — back to RUNNING, no switch.
+# 2 / 3 (nothing published) stay put too. 0 / 4 / 5 / 6 switch. YIELD (1) and timer ticks (0) are not guarded.
+# Raw loads (the do_context_switch zone rule: this runs inside it).
+fn sched_block_intent_satisfied(old) {
+    if (load64(&pcpu_resched_intent + pcpu_cpu() * 8) < 2) { return 0; }
+    var bis_st = load64(&proc_table + old * 176 + 8);
+    if (bis_st == 1) { proc_set_state(old, 2); return 1; }   # the wake landed before the int
+    if (bis_st == 2) { return 1; }                           # nothing published
+    if (bis_st == 3) { return 1; }
+    return 0;                                                # 0 / 4 / 5 / 6 -> switch
+}
+
+# THE IN-KERNEL YIELD. 1 = switched out and resumed, 0 = not switched (refused or nothing to switch to). The CPU
+# index is read ONCE (a LAPIC read is a VM exit under KVM; the +20% getpid lesson). The idle is READY whenever it
+# is not current, so with nothing else ready this yields to the CPU's idle and resumes within one tick.
+# Refusals: scheduler not live; preempt_count != 0 (a lock or an ISR body); a context on a borrowed CR3 (its
+# resume would restore the slot's CR3). (The INTERIM #37-child refusal is gone since S3b-F2.)
+# ⚠ There is no IF=0 refusal (the abandon-frame yield refused IF=0 ring-3 callers): an IF=0 ring-3 caller is
+# switched like any other and SYSRETs later with its own R11.
+fn sched_yield_kernel() {
+    if (sched_active != 1) { return 0; }
+    var yc = pcpu_cpu();
+    if (load64(&pcpu_preempt + yc * 8) != 0) { return 0; }
+    var ycur = load64(&pcpu_curproc + yc * 8);
+    if (ycur < 0) { return 0; }
+    if (ycur >= proc_count) { return 0; }
+    if (sched_live_cr3_ok(ycur) == 0) { return 0; }
+    return sched_switch_vol(1);
+}
+
+# ═══════════════ 1.57.7 (Path 2, S3.6) — THE YIELD PARK (docs/architecture/blocking-waits.md "yield and park") ═══════════════
+# WHY. With keep-current (sched_next) a YIELD with only this CPU's idle READY is a no-op: nothing else wants the CPU,
+# so do_context_switch keeps the yielder. Every poll + #44 loop whose peers are BLOCKED (the normal state since the
+# waits block for real) would then spin its core at 100% and be charged 100 ticks/s. So #44 / #14 PARK: with nothing
+# else READY they halt the CPU for ONE interrupt, as a designated CPL0 preempt point, using the SAME
+# flag -> mfence -> scan -> sti;hlt protocol as the idle step so a 0xE1 kick (S3.8) is never lost.
+
+# Lock-free: is there a READY process this CPU may take now? Excludes `me` and THIS CPU's idle (a parked process must
+# not "find" its own CPU's idle — the idle is READY whenever a parker is current, and finding it would bounce through
+# keep-current forever; mutation M-D4). 1 = takeable now; 2 = only READY-but-fenced ones (on_cpu != -1: their old CPU
+# is still in its switch tail, a few instructions); 0 = nothing. A stale answer costs one more loop or one tick, never
+# correctness (sched_next re-decides under sched_lock).
+fn sched_ready_for_me(me) {
+    var rf_idle = sched_idle_pid_get();
+    var rf_any = 0;
+    var rf_i = 0;
+    while (rf_i < proc_count) {
+        if (rf_i != me) {
+            if (rf_i != rf_idle) {
+                if (load64(&proc_table + rf_i * 176 + 8) == 1) {
+                    if (sched_idx_pickable(rf_i) == 1) {
+                        if (on_cpu_get(rf_i) == (0 - 1)) { return 1; }
+                        rf_any = 2;
+                    }
+                }
+            }
+        }
+        rf_i = rf_i + 1;
+    }
+    return rf_any;
+}
+
+# One halt with IF=1 at preempt_count 0 — a DESIGNATED CPL0 PREEMPT POINT (the #14 window of S3.4, factored so #14 and
+# #44 share it). Caller: a syscall (IF=0 by SFMASK) or kernel context that proved wq_can_block() == 1 (R1-R6 hold: no
+# lock held, live CR3 == slot CR3, no per-CPU cell carried across the hlt).
+# ⛔ PROTOCOL (the same as sched_idle_step, and for the same reason): publish cpu_in_halt + cpu_kickable, mfence, THEN
+# scan, THEN sti;hlt. Scanning first and setting the flag after loses a kick: a waker that makes a proc READY between
+# the scan and the flag store reads kickable == 0 and sends nothing, and this CPU sleeps a full tick.
+# Returns 0 = found work without halting (the caller's trailing yield takes it); 1 = halted once.
+fn sched_halt_window() {
+    var hw_f = kbd_irq_save();                               # IF=0 (already 0 in a syscall; defensive)
+    var hw_c = pcpu_cpu();
+    var hw_me = proc_current_get();
+    if (hw_c < 4) { store64(&cpu_in_halt + hw_c * 8, 1); store64(&cpu_kickable + hw_c * 8, 1); }
+    arch_mfence();                                           # ⛔ PUBLISH "halted/kickable" BEFORE THE SCAN (Dekker)
+    if (sched_ready_for_me(hw_me) != 0) {
+        if (hw_c < 4) { store64(&cpu_kickable + hw_c * 8, 0); store64(&cpu_in_halt + hw_c * 8, 0); }
+        kbd_irq_restore(hw_f);
+        return 0;
+    }
+    arch_sti_hlt();                                          # the preempt point: the tick may switch us out here
+    asm { 0xFA; }                                            # cli — contract: no inputs/outputs; clears IF
+    var hw_c2 = pcpu_cpu();                                  # R4: RE-READ — we may have resumed on another CPU
+    if (hw_c2 < 4) { store64(&cpu_kickable + hw_c2 * 8, 0); store64(&cpu_in_halt + hw_c2 * 8, 0); }
+    kbd_irq_restore(hw_f);
+    return 1;
+}
+
+# 1 = switched to another READY process and back; 2 = parked (then offered the CPU once more);
+# 0 = refused (pre-scheduler / preempt-held / borrowed CR3): the caller keeps its legacy path.
+fn sched_yield_or_halt() {
+    if (sched_yield_kernel() == 1) { return 1; }
+    if (wq_can_block() == 0) { return 0; }
+    sched_halt_window();
+    sched_yield_kernel();     # hand the CPU to whatever that interrupt (a wake, a kick) made READY — no tick wait
+    return 2;
+}
+
+# sched_yield#44 as dispatched from syscall_handler. Always returns 0 to ring 3. It switches when anything else is
+# READY; with nothing else READY it parks the CPU for one hlt (≤ one interrupt period, NOT charged — cpu_in_halt) and
+# offers the CPU once more, so a poll+yield loop does not spin a core. A REFUSED caller (pre-scheduler, preempt-held —
+# never a ring-3 process after S3b-F2) keeps the old no-op. rdx/rsi/rdi/r8-r10 carry handler leftovers, as after
+# every syscall.
+fn sys_sched_yield_k() { sched_yield_or_halt(); return 0; }
+
+# pause#14 as dispatched from syscall_handler (ring-3 SYSCALLs only). The KSTACK_SELFTEST probe hook runs first
+# (a no-op twin in production returns -1 = "not a probe"). Then the yield-or-park: cyrius _agnos_sock_recv_block's
+# poll-backoff and every other pause loop gives its slice to whoever is READY, or parks this CPU for one interrupt
+# (a designated preempt point, not charged) and offers the CPU once more. Only when that is REFUSED (the contexts
+# sched_yield_kernel / wq_can_block list) does it fall to ksyscall(14): the legacy preempt-held sti window.
+fn sys_pause(a1, a2, a3) {
+    var sp_r = kst_probe_hook(a1, a2, a3);
+    if (sp_r != (0 - 1)) { return sp_r; }
+    if (lifecycle_pending_self() == 1) { return 0; }     # 1.57.7 (S7): a kill / stop is pending — B1 acts now, not after a hlt
+    if (sched_yield_or_halt() != 0) { return 0; }
+    return ksyscall(14, a1, a2, a3);
+}
+
+# The 0xE0 gate as installed (main.cyr, directly after the timer gate): handler == &resched_isr, selector 0x08, IST
+# 0 (a voluntary switch must run on the LEAVER's own stack — an IST would put every leaver's frame on one shared
+# stack), attr 0x8E (present, DPL 0: ring 3 cannot raise it — `int 0xE0` from CPL3 is a #GP, kstack-smoke's "resched
+# gate DPL0" phase, mutation M-C4). One line either way, both through kprintln (COM1 + console + klug); the failure
+# line is latched and denied by every smoke (SMOKE_INVARIANT_DENY). S3d extends this same function for the 0xE1 gate.
+# One installed gate against its stub: handler == stub, selector 0x08, IST 0, attr 0x8E (present, DPL 0). 1 = OK.
+fn resched_gate_ok(rq_v, rq_stub) {
+    var rq_e = &idt + rq_v * 16;
+    var rq_h = (load16(rq_e) & 0xFFFF) | ((load16(rq_e + 6) & 0xFFFF) << 16) | ((load32(rq_e + 8) & 0xFFFFFFFF) << 32);
+    if (rq_h != rq_stub) { return 0; }
+    if ((load16(rq_e + 2) & 0xFFFF) != 0x08) { return 0; }
+    if ((load8(rq_e + 4) & 0x07) != 0) { return 0; }
+    if ((load8(rq_e + 5) & 0xFF) != 0x8E) { return 0; }
+    return 1;
+}
+fn resched_gates_ok() {
+    # kprintln, like the OK lines: COM1 (the smokes deny the failure lines there) + the framebuffer console (on iron the
+    # operator sees the failure, not merely the absence of the OK line) + klug (kprintln's own tap). Boot context,
+    # outside any lock or ISR, so the console lock is legal. Latched: one line per gate per boot.
+    var rg_a = resched_gate_ok(224, &resched_isr);
+    if (rg_a == 1) { kprintln("sched: resched gate 0xE0 OK", 27); }
+    if (rg_a == 0) {
+        if ((resched_gate_said & 1) == 0) {
+            resched_gate_said = resched_gate_said | 1;
+            kprintln("sched: resched gate misconfigured (0xE0 must be DPL0 IST0)", 58);
+        }
+    }
+    # ⭐ 1.57.7 (S3.8): the 0xE1 KICK gate, installed right after 0xE0 — the same four checks against resched_kick_isr;
+    # its failure line is matched by the same SMOKE_INVARIANT_DENY alternative.
+    var rg_b = resched_gate_ok(225, &resched_kick_isr);
+    if (rg_b == 1) { kprintln("sched: resched gate 0xE1 OK", 27); }
+    if (rg_b == 0) {
+        if ((resched_gate_said & 2) == 0) {
+            resched_gate_said = resched_gate_said | 2;
+            kprintln("sched: resched gate misconfigured (0xE1 must be DPL0 IST0)", 58);
+        }
+    }
+    return rg_a & rg_b;
+}
+
+# ═══════════════ 1.57.7 (Path 2, S3.8) — THE RESCHEDULE KICK (vector 0xE1 = 225) ═══════════════
+# A wake (wq_wake / wq_interrupt / wq_tick) that makes a process READY for a CPU which is HALTED in its idle step or in
+# a #14/#44 park sends that CPU a 0xE1 IPI; the kick ends its hlt, and the woken CPU's OWN code takes the work — the
+# idle step re-scans (sched_idle_step), the park runs its trailing sched_yield_kernel (sched_yield_or_halt). Without it
+# the READY process waited for that CPU's next tick (≤ 10 ms).
+# ⭐ EOI-ONLY, NEVER SWITCHES: resched_kick_handler does nothing but EOI. No new CPL0 resume path is added (Invariant 7:
+# exactly two switch paths — the timer's and the voluntary int 0xE0). LIMITS: only a KICKABLE CPU (cpu_kickable == 1,
+# proc.cyr — halted in the idle step or a park and about to re-scan) is a target; never self; a BUSY CPU is never kicked
+# — a READY process pinned to (or only runnable on) a busy CPU waits ≤ 1 tick there: 0xE1 cannot preempt, and a hardware
+# 0xE0 is EOI-only (the intent cell), so a reschedule-capable kick would be a NEW handler (the timer's exact tail) and a
+# new CPL0 resume path — S6 must not assume one exists (PLAN OQ-5).
+# DPL 0 (a ring-3 `int 0xE1` is a #GP -> fault-kill 141, kstack-smoke's "kick gate DPL0"), IST 0 (the ISR runs on the
+# interrupted stack: it touches nothing but the EOI), clac first like every stub.
+var RESCHED_KICK_VECTOR = 225;
+var sched_kicks = 0;                    # 0xE1 IPIs sent (diagnostic; a racy increment, never a gate)
+fn resched_kick_handler() { apic_eoi(); return 0; }
+# Build the 0xE1 stub into resched_kick_isr[8] (64 B): clac, then tlb_isr_build's caller-saved shape (apic.cyr) with
+# handler = &resched_kick_handler. FIXED SIZE 3 + 40 = 43 bytes (the iretq is bytes 41-42) — stated here and verified
+# at run time by kstack-smoke's "isr clac" phase (first three bytes 0F 01 CA, bytes 41-42 48 CF); a check after the
+# stores could not prevent an overflow, so there is none. (The handler is defined ABOVE: a forward &fn does not resolve.)
+# REGISTER CONTRACT of the stub: clac — clears RFLAGS.AC; it saves and restores the nine caller-saved GPRs around the
+# call (the handler is a cyrius function and may clobber any of them); callee-saved registers are the handler's to keep.
+fn resched_kick_isr_build() {
+    isr_caller_saved_build(&resched_kick_isr, &resched_kick_handler);   # apic.cyr — the TLB stub's exact shape
+    return 0;
+}
+
+# Kick a CPU that can take READY process p. Returns `kicked` with the targeted CPU's bit set. Never IPIs self. Only a
+# CPU whose cpu_kickable is 1 is a target (it re-scans when its hlt ends). A busy CPU is never kicked: p waits ≤ 1 tick
+# there. The loop index is the physical APIC id, as tlb_shootdown_all's (cpu_online_mask); pcpu_cpu() clamps ids >= 4
+# to 0 (a pre-existing SMP assumption). Takes no lock; runs after sched_lock is released (it may run under a plain
+# condition lock, e.g. flock_lock); apic_send_ipi_one is IRQ-saved, so this is safe from ISR context and cannot
+# misdirect a concurrent tlb_shootdown_all. A kick that finds its target no longer halted is a spurious wake — harmless.
+fn sched_kick_for(p, kicked) {
+    if (cpu_count < 2) { return kicked; }
+    if (apic_enabled == 0) { return kicked; }
+    var kf_me = pcpu_cpu();
+    var kf_mask = cpu_online_mask();
+    var kf_pin = idle_owner_get(p);
+    if (kf_pin == (0 - 1)) { if (smp_sched_aps == 0) { kf_pin = 0; } }       # STEP-1: only the BSP runs real procs
+    if (kf_pin != (0 - 1)) {
+        if (kf_pin == kf_me) { return kicked; }
+        if (kf_pin >= 4) { return kicked; }
+        if (((kf_mask >> kf_pin) & 1) == 0) { return kicked; }
+        if (load64(&cpu_kickable + kf_pin * 8) != 0) {
+            apic_send_ipi_one(kf_pin, RESCHED_KICK_VECTOR);
+            sched_kicks = sched_kicks + 1;
+            kicked = kicked | (1 << kf_pin);
+        }
+        return kicked;
+    }
+    # Unpinned: if this CPU interrupted its OWN halt (an ISR wake on an idle/parked CPU), it re-scans on return — no IPI.
+    if (kf_me < 4) { if (load64(&cpu_kickable + kf_me * 8) != 0) { return kicked; } }
+    var kf_k = 1;
+    while (kf_k < 4) {                                 # spread: start after this CPU; skip CPUs already kicked
+        var kf_t = (kf_me + kf_k) & 3;
+        if (((kf_mask >> kf_t) & 1) == 1) {
+            if (((kicked >> kf_t) & 1) == 0) {
+                if (load64(&cpu_kickable + kf_t * 8) != 0) {
+                    apic_send_ipi_one(kf_t, RESCHED_KICK_VECTOR);
+                    sched_kicks = sched_kicks + 1;
+                    return kicked | (1 << kf_t);
+                }
+            }
+        }
+        kf_k = kf_k + 1;
+    }
+    return kicked;
+}
+# m = woken-pid mask. from_tick = 1 (wq_tick): only procs pinned to ANOTHER CPU — the ticking CPU's own
+# do_context_switch takes everything it can pick right after wq_tick.
+fn sched_kick_mask(m, from_tick) {
+    if (m == 0) { return 0; }
+    var km_kicked = 0;
+    var km_i = 0;
+    while (km_i < 16) {
+        if (((m >> km_i) & 1) == 1) {
+            var km_go = 1;
+            if (from_tick == 1) {
+                var km_pin = idle_owner_get(km_i);
+                if (km_pin == (0 - 1)) { km_go = 0; }
+                if (km_pin == pcpu_cpu()) { km_go = 0; }
+            }
+            if (km_go == 1) { km_kicked = sched_kick_for(km_i, km_kicked); }
+        }
+        km_i = km_i + 1;
+    }
+    return 0;
+}
+
 # ═══════════════ 1.57.6 (Path 2, S3.1) — THE SWITCH TAIL: old stays fenced until this CPU is off it ═══════════════
 #
-# Every real switch ends here — the timer's (timer_handler → do_context_switch → EOI → sched_leave_old) and,
-# until S3.4 replaces it, sys_sched_yield's. INV-11: on_cpu(old) = -1 is written ONLY by sched_frame_iretq,
+# Every real switch ends here — the timer's (timer_handler → do_context_switch → EOI → sched_leave_old) and, since
+# 1.57.7, the voluntary one's (sched_switch_vol → int 0xE0 → resched_handler → do_context_switch → sched_leave_old).
+# INV-11: on_cpu(old) = -1 is written ONLY by sched_frame_iretq,
 # after RSP has left old's stack and after cr3_load(new) and the TSS.RSP0 install ran (both inside
-# do_context_switch / the yield body). So on_cpu == -1 means "no CPU is on this proc's kernel stack and none
+# do_context_switch). So on_cpu == -1 means "no CPU is on this proc's kernel stack and none
 # has its CR3 loaded", which is what the reap fence, sched_next and proc_alloc_slot all rely on.
 # ⚠ The only other writers of -1 are proc_on_cpu_init (boot), proc_alloc_slot's recycle store (a dead slot
 # it may reuse only when on_cpu is ALREADY -1) and the reap fence's self-owned path (kernel_resume exits).
@@ -664,9 +1061,9 @@ fn sched_frame_iretq(fp, cell) {
     return 0;
 }
 
-# Finish a real switch the timer ISR started (do_context_switch returned old + 1). The 160-byte frame at
+# Finish a real switch the timer ISR or resched_isr started (do_context_switch returned old + 1). The 160-byte frame at
 # isr_rsp holds NEW's context but lives on OLD's stack; copy it into this CPU's pcpu_yield_frame slot (IF=0,
-# one CPU, never nested — the same slot sys_sched_yield's tail uses), re-validate the (CS,SS) pair on the
+# one CPU, never nested), re-validate the (CS,SS) pair on the
 # copy (sched_fix_live_frame: the true last point before the iretq now), set SPEC_CTRL for the target CPL,
 # and leave through sched_frame_iretq. Never returns. No asm here, so cyrius may regalloc it: that only
 # spills rbx & co. into this frame on old's stack, which is fine — nothing reads them back.
@@ -676,10 +1073,787 @@ fn sched_leave_old(isr_rsp, old) {
     while (i < 160) { store64(fp + i, load64(isr_rsp + i)); i = i + 8; }
     sched_fix_live_frame(fp);
     sched_spec_ctrl_for(fp);
+    fg_note_first_entry(fp);                           # 1.57.7 (S3b): CMOS CP 0x21 at a kernel-launched child's first CPL3 dispatch (one global load otherwise)
     kst_note_switch_out(old);                          # KSTACK_SELFTEST: count CPL0 switch-outs of probe procs (no-op twin)
     kst_tail_hook();                                   # KSTACK_SELFTEST: the M-A1/M-A3 window widener (no-op twin; 0 iterations)
     kst_note_leave(old);                               # KSTACK_SELFTEST: was old's slot re-allocated under this CPU? (no-op twin)
     sched_frame_iretq(fp, &proc_on_cpu + old * 8);
+    return 0;
+}
+
+# ═══════════════ 1.57.7 (Path 2, S3.4) — THE SCHEDULER CLOCK (every wq deadline is on it) ═══════════════
+# Microseconds since TSC calibration when the TSC is calibrated (tsc_per_us != 0 — final before sched_active = 1,
+# and a refusal is PERMANENT once ring 3 has run, S1), else the BSP tick clock (timer_ticks * 10 ms). In tick mode
+# the clock advances only with BSP ticks, so it STALLS while the BSP runs a long IF=0 syscall, and it has a
+# one-tick granularity: wq_deadline_after_us pads a tick-mode deadline by one tick so "sleeps at least `us`" holds
+# even when the arm lands just before a tick edge. docs/architecture/kernel-clocks.md has the row.
+fn sched_clock_us() {
+    if (tsc_per_us != 0) { return (rdtsc() - tsc_base) / tsc_per_us; }
+    return timer_ticks * 10000;
+}
+fn wq_deadline_after_us(us) {
+    var dla = sched_clock_us() + us;
+    if (tsc_per_us == 0) { dla = dla + 10000; }        # tick mode: a partial first tick must not shorten the wait
+    return dla;
+}
+
+# ═══════════════ 1.57.7 (Path 2, S3.4) — THE WAIT/WAKE PRIMITIVE (docs/architecture/blocking-waits.md) ═══════════════
+#
+# A syscall (or kmain) that must wait for an event leaves its CPU in a real BLOCKED state (6) and is made READY by
+# the event — instead of holding the CPU in a preempt-disabled sti/hlt loop. The canonical wait (C9):
+#     if cond -> done
+#     loop:  a = wq_arm(KEY, dl)
+#            a == 1 -> wq_signal_point() (ABORT -> return), continue        (S7: a lifecycle signal is pending)
+#            a == 2 -> take the legacy step (this context cannot block)
+#            if cond -> wq_cancel(); done
+#            if dl != 0 && sched_clock_us() >= dl -> wq_cancel(); timeout
+#            r = wq_sleep();  r == WR_SIGNAL -> wq_signal_point()
+#            re-check
+# THE WAKER ALWAYS MAKES cond TRUE BEFORE wq_wake. LOST-WAKEUP PROOF: the waiter publishes 6 under sched_lock (its
+# xchg is a full fence) BEFORE its condition re-check, and every waker's cond store precedes its sched_lock acquire
+# — so either the re-check sees cond, or the wake sees 6 and sets 1, which the BLOCK-intent guard
+# (sched_block_intent_satisfied) or sched_next then honours.
+# DISCIPLINE (C6 R1-R6, C7): every wq entry runs IF=0 (syscalls by SFMASK; kmain/ktest bracket arm..sleep|cancel
+# with ONE kbd_irq_save/restore) and wq_arm/wq_cancel/wq_sleep assert it; preempt_count is 0 at wq_sleep (wq_arm
+# may be called holding the condition's own lock — flock_lock — which the caller drops before sleeping); ISRs only
+# wake; sched_lock is the leaf, and nothing prints under it (latched lines are emitted after the unlock); never
+# keep pcpu_cpu(), a pcpu_* pointer or per-CPU scratch across a wait (R4 — only wq_sleep's c0 is compared); the
+# live CR3 must be the slot's (R6: the loaders' cr3_load(0x1000) windows contain no wait).
+# ⚠ R4/R6 PER-CPU SCRATCH (percpu_audit): pcpu_spawn_elf_buf, pcpu_spawn_path_buf, pcpu_spawn_env_buf,
+# pcpu_sc_open_abs, pcpu_sc_gpuop, fb_scale's row buffer, gpu_texl_stage (syscall.cyr), pcpu_elf_hdr_buf,
+# pcpu_exec_env_src/len (elf.cyr) — never add a wq_* call inside one of their live spans.
+var wq_ntimed = 0;                          # procs with a deadline (stale-HIGH allowed; wq_tick recounts exactly)
+var wq_min_deadline = 0x7FFFFFFFFFFFFFFF;   # earliest deadline (stale-LOW allowed: an early rescan)
+var wq_if1_said = 0;
+var wq_state_said = 0;
+var wq_invrun_said = 0;
+var wq_resume_said = 0;
+var wq_xcpu_said = 0;
+
+# May THIS context block? Scheduler live; nothing held (preempt_count 0 — no lock, not an ISR body); a real proc
+# (not this CPU's idle) RUNNING here (INV-RUN: state 2, on_cpu == this CPU); on its own CR3 (R6). IF-agnostic (the
+# waits run IF=0). (1.57.7 S3b-F2 deleted the INTERIM #37-child clause: a #37 child blocks like any process.)
+# The CPU index is read ONCE: this is the hot path of every flock#59 without LOCK_NB.
+fn wq_can_block() {
+    if (sched_active != 1) { return 0; }
+    var wc = pcpu_cpu();
+    if (load64(&pcpu_preempt + wc * 8) != 0) { return 0; }
+    var wcur = load64(&pcpu_curproc + wc * 8);
+    if (wcur < 0) { return 0; }
+    if (wcur >= proc_count) { return 0; }
+    if (wcur == load64(&pcpu_idle + wc * 8)) { return 0; }
+    if (load64(&proc_table + wcur * 176 + 8) != 2) { return 0; }
+    if (load64(&proc_on_cpu + wcur * 8) != wc) { wq_note_invrun(); return 0; }
+    if (sched_live_cr3_ok(wcur) == 0) { return 0; }
+    return 1;
+}
+
+fn wq_note_invrun() {
+    if (wq_invrun_said == 0) {
+        wq_invrun_said = 1;
+        klug_append("wq: current is not running on this CPU (INV-RUN)", 48); klug_putc(10);
+        serial_println("wq: current is not running on this CPU (INV-RUN)", 48);
+    }
+    return 0;
+}
+
+# R1: the wait primitive runs IF=0. A caller that forgot is reported once (latched, denied by every smoke) and
+# fixed on the spot, so the arm..sleep sequence below can still not be interrupted by a same-CPU tick.
+fn wq_assert_if0() {
+    if ((dm_read_rflags() & 0x200) != 0) {
+        if (wq_if1_said == 0) {
+            wq_if1_said = 1;
+            klug_append("wq: wait primitive entered with IF=1", 36); klug_putc(10);
+            serial_println("wq: wait primitive entered with IF=1", 36);
+        }
+        arch_cli();
+    }
+    return 0;
+}
+
+# Arm a wait on `key` with deadline `dl` (sched_clock_us; 0 = none) and publish BLOCKED (6). 0 = armed (the caller
+# re-checks its condition, then wq_sleep or wq_cancel) · 1 = a lifecycle signal is pending (S7; nothing armed) ·
+# 2 = this context may not block (nothing armed; take the legacy step).
+# ⭐ st == 0 (a remotely-retired proc — the selftest retire; the lifecycle step never zeroes a running proc): with
+# preempt_count 0 it leaves through sched_exit_tail at once (never returns); with a condition lock held (R3, e.g.
+# flock_lock) it returns 2 so the caller unwinds and drops the lock — and then the caller MUST call
+# wq_exit_if_retired() before it returns anything (flock_wait does): returning -1 would SYSRET a dead process to
+# ring 3. Exiting while holding flock_lock would spin `sti; hlt` forever at preempt_count 1 and every flock caller
+# would then spin on that lock.
+fn wq_arm(key, dl) {
+    wq_assert_if0();
+    var wa_p = proc_current_get();
+    sched_spin_lock();
+    var wa_st = load64(&proc_table + wa_p * 176 + 8);
+    if (wa_st == 0) {
+        sched_spin_unlock();
+        if (preempt_count_get() == 0) { sched_exit_tail(); }   # never returns
+        return 2;
+    }
+    if (wa_st != 2) {
+        sched_spin_unlock();
+        if (wq_state_said == 0) {
+            wq_state_said = 1;
+            klug_append("wq: arm from a non-running state", 32); klug_putc(10);
+            serial_println("wq: arm from a non-running state", 32);
+        }
+        return 2;
+    }
+    if (wq_signal_pending(wa_p) != 0) { sched_spin_unlock(); return 1; }
+    if (load64(&proc_wait_deadline + wa_p * 8) != 0) { wq_ntimed = wq_ntimed - 1; }
+    store64(&proc_wait_key + wa_p * 8, key);
+    store64(&proc_wait_deadline + wa_p * 8, dl);
+    store64(&proc_wake_reason + wa_p * 8, 0);
+    if (dl != 0) {
+        wq_ntimed = wq_ntimed + 1;
+        if (dl < wq_min_deadline) { wq_min_deadline = dl; }
+    }
+    store64(&proc_table + wa_p * 176 + 8, 6);          # PROC_ST_BLOCKED — published LAST, under the lock
+    sched_spin_unlock();
+    return 0;
+}
+
+# The second half of the wq_arm st == 0 rule, for a caller that got 2 while holding a condition lock: once it has
+# dropped every lock (preempt_count back to 0), a caller whose state is 0 leaves through sched_exit_tail (never
+# returns) instead of returning to ring 3 as a dead process. Returns 0 when the caller is alive (or a lock is still
+# held — then the dead-current clause takes it at its next switch). ktest T9b; mutation M-A7.
+fn wq_exit_if_retired() {
+    var wr_p = proc_current_get();
+    if (wr_p < 0) { return 0; }
+    if (wr_p >= proc_count) { return 0; }
+    if (load64(&proc_table + wr_p * 176 + 8) != 0) { return 0; }
+    if (preempt_count_get() != 0) { return 0; }
+    sched_exit_tail();                                  # never returns
+    return 0;
+}
+
+# Withdraw an armed wait (the condition turned out true, or the deadline passed): state 6 or 1 -> 2 (a retired
+# state-0 proc stays 0), clear the key, the deadline (fixing wq_ntimed) and the reason, and return the reason a
+# waker may already have left (WR_NONE when nobody woke it).
+fn wq_cancel() {
+    wq_assert_if0();
+    var wc_p = proc_current_get();
+    sched_spin_lock();
+    var wc_st = load64(&proc_table + wc_p * 176 + 8);
+    if (wc_st == 6) { proc_set_state(wc_p, 2); }
+    if (wc_st == 1) { proc_set_state(wc_p, 2); }
+    var wc_r = load64(&proc_wake_reason + wc_p * 8);
+    store64(&proc_wait_key + wc_p * 8, 0);
+    if (load64(&proc_wait_deadline + wc_p * 8) != 0) {
+        store64(&proc_wait_deadline + wc_p * 8, 0);
+        wq_ntimed = wq_ntimed - 1;
+    }
+    store64(&proc_wake_reason + wc_p * 8, 0);
+    sched_spin_unlock();
+    return wc_r;
+}
+
+# Leave the CPU until woken (WR_EVENT), timed out (WR_TIMEOUT) or interrupted (WR_SIGNAL); returns the reason.
+# A switch the BLOCK-intent guard declined because the wake already landed returns at once (state 2).
+# ⛔ A refusal with state 6 still published is a CALLER BUG (wq_can_block proved every pre-lock guard): it is
+# fatal and loud. A state-1 return (a pre-lock guard refused AFTER an early wake) is repaired and reported.
+# State 0 after the return is legal (a remote retire): the proc leaves at its next switch.
+fn wq_sleep() {
+    wq_assert_if0();
+    var ws_p = proc_current_get();
+    var ws_c0 = pcpu_cpu();
+    sched_switch_vol(2);
+    var ws_st = load64(&proc_table + ws_p * 176 + 8);
+    if (ws_st == 6) {
+        serial_println("PANIC: wq sleep not switched", 28);
+        klug_append("PANIC: wq sleep not switched", 28); klug_putc(10);
+        arch_halt();
+    }
+    if (ws_st == 1) {
+        sched_spin_lock();
+        if (load64(&proc_table + ws_p * 176 + 8) == 1) { proc_set_state(ws_p, 2); }
+        sched_spin_unlock();
+        if (wq_resume_said == 0) {
+            wq_resume_said = 1;
+            klug_append("wq: sleep resumed in a non-running state", 40); klug_putc(10);
+            serial_println("wq: sleep resumed in a non-running state", 40);
+        }
+    }
+    var ws_r = load64(&proc_wake_reason + ws_p * 8);
+    store64(&proc_wake_reason + ws_p * 8, 0);
+    if (pcpu_cpu() != ws_c0) {
+        if (wq_xcpu_said == 0) {                       # klug ONLY — a witness, not an invariant (waitx P8 requires it)
+            wq_xcpu_said = 1;
+            klug_append("wq: first cross-CPU resume from a kernel wait", 45); klug_putc(10);
+        }
+    }
+    return ws_r;
+}
+
+# Make BLOCKED `p` READY with reason `why`. Caller holds sched_lock. on_cpu is untouched: a still-fenced proc
+# (its CPU has not left its stack yet) stays unpickable until its switch tail publishes -1.
+fn wq_wake_one_locked(p, why) {
+    store64(&proc_wake_reason + p * 8, why);
+    store64(&proc_wait_key + p * 8, 0);
+    if (load64(&proc_wait_deadline + p * 8) != 0) {
+        store64(&proc_wait_deadline + p * 8, 0);
+        wq_ntimed = wq_ntimed - 1;
+    }
+    proc_set_state(p, 1);
+    return 0;
+}
+
+# Wake every proc BLOCKED on `key`; returns how many. IRQ-saving (sched_lock is ISR-reachable and wakers run at
+# IF=1 too). Callable from an ISR and under a condition lock (flock_lock < sched_lock).
+# ⚠ ww_m, the woken-pid mask, is LOCAL on purpose: the S3.8 kick (sched_kick_mask) runs after sched_spin_unlock,
+# where a shared cell would already carry another CPU's concurrent wq_wake — kick it here, from ww_m, after the
+# unlock and before kbd_irq_restore. Never publish the mask through shared state.
+fn wq_wake(key) {
+    var ww_f = kbd_irq_save();
+    sched_spin_lock();
+    var ww_n = 0;
+    var ww_m = 0;
+    var ww_i = 0;
+    while (ww_i < proc_count) {
+        if (load64(&proc_wait_key + ww_i * 8) == key) {
+            if (load64(&proc_table + ww_i * 176 + 8) == 6) {
+                wq_wake_one_locked(ww_i, 1);           # WR_EVENT
+                ww_n = ww_n + 1;
+                ww_m = ww_m | (1 << ww_i);
+            }
+        }
+        ww_i = ww_i + 1;
+    }
+    sched_spin_unlock();
+    sched_kick_mask(ww_m, 0);                          # 1.57.7 (S3.8): kick a halted CPU for each woken proc — after the
+    #   unlock, before the IF restore (the kick loop is not preempted)
+    kbd_irq_restore(ww_f);
+    return ww_n;
+}
+
+# Interrupt `p`'s wait (the lifecycle step's signal delivery): BLOCKED -> READY with WR_SIGNAL. 1 = it was
+# waiting, 0 = it was not. The _locked form is for a caller already holding sched_lock.
+fn wq_interrupt_locked(p) {
+    if (load64(&proc_table + p * 176 + 8) == 6) { wq_wake_one_locked(p, 3); return 1; }   # WR_SIGNAL
+    return 0;
+}
+fn wq_interrupt(p) {
+    var wi_f = kbd_irq_save();
+    sched_spin_lock();
+    var wi_r = wq_interrupt_locked(p);
+    sched_spin_unlock();
+    if (wi_r == 1) { sched_kick_for(p, 0); }           # 1.57.7 (S3.8): after the unlock (the _locked form never kicks —
+    #   its caller kicks after its own unlock)
+    kbd_irq_restore(wi_f);
+    return wi_r;
+}
+
+# Deadline expiry — every CPU's timer tick (timer_handler, outside the BSP-only block, inside its preempt bracket).
+# Two unlocked reads short-circuit the common case. The rescan is AUTHORITATIVE: it recounts wq_ntimed and the
+# minimum, and it self-heals WQ-DL (a deadline on a proc that is not BLOCKED — a remote retire, a death path, the
+# proc_alloc_slot scrub — is simply cleared), so no other path has to keep the counter exact.
+fn wq_tick() {
+    if (wq_ntimed == 0) { return 0; }
+    var wt_now = sched_clock_us();
+    if (wt_now < wq_min_deadline) { return 0; }
+    sched_spin_lock();                                 # IF=0 here (the ISR gate)
+    var wt_n = 0;
+    var wt_min = 0x7FFFFFFFFFFFFFFF;
+    var wt_m = 0;                                      # 1.57.7 (S3.8): the pids this tick woke (a local, like wq_wake's)
+    var wt_i = 0;
+    while (wt_i < proc_count) {
+        var wt_dl = load64(&proc_wait_deadline + wt_i * 8);
+        if (wt_dl != 0) {
+            if (load64(&proc_table + wt_i * 176 + 8) != 6) {
+                store64(&proc_wait_deadline + wt_i * 8, 0);          # WQ-DL self-heal
+            } else {
+                if (wt_now >= wt_dl) {
+                    wq_wake_one_locked(wt_i, 2);                     # WR_TIMEOUT
+                    wt_m = wt_m | (1 << wt_i);
+                } else {
+                    wt_n = wt_n + 1;
+                    if (wt_dl < wt_min) { wt_min = wt_dl; }
+                }
+            }
+        }
+        wt_i = wt_i + 1;
+    }
+    wq_ntimed = wt_n;
+    wq_min_deadline = wt_min;
+    sched_spin_unlock();
+    # 1.57.7 (S3.8): a sleeper PINNED to another CPU (kybernet's /bin/agnsh, kmain after S3b) expired by this CPU's tick
+    # would otherwise wait for its own CPU's tick — kick that CPU if it is halted. Unpinned expiries are taken by this
+    # CPU's own do_context_switch right after this call.
+    sched_kick_mask(wt_m, 1);
+    return 0;
+}
+
+# ⭐ THE LIFECYCLE HOOKS (filled by S7, 1.57.7). wq_signal_pending(p): non-zero when a lifecycle signal (SIGKILL /
+# SIGSTOP) is pending for p — wq_arm (which calls it UNDER sched_lock) then refuses (returns 1) instead of blocking.
+# wq_signal_point(): run at a safe point after that refusal or a WR_SIGNAL wake; 1 = ABORT the syscall (a kill: the
+# arm unwinds to its B1, which ends the process), 0 = CONTINUE (retry the wait with the SAME absolute deadline — a
+# stop parked here and was continued, or the stop no longer applies). ⛔ CONTRACT: wq_signal_point never returns
+# CONTINUE while wq_signal_pending(p) stays non-zero — lifecycle_park_or_abort clears stop_pending on every
+# non-ABORT exit, and a pending kill always ABORTs. PRECONDITION (blocking-waits.md): every signal point runs with
+# preempt_count == 0 (the canonical waits drop their condition lock first and are entered only when
+# wq_can_block() == 1); a violation latches `lifecycle: signal point with preempt held` and never spins.
+fn wq_signal_pending(p) {
+    if ((lc_kp(p) | lc_sp(p)) != 0) { return 1; }
+    return 0;
+}
+fn wq_signal_point() { return lifecycle_park_or_abort(proc_current_get(), VIA_WAIT); }
+
+# ═══════════════ 1.57.7 (S7) — THE PROCESS LIFECYCLE: DELIVERY, BOUNDARIES, THE PARK (process-lifecycle.md) ═══════════════
+# kill#16 delivers 9 (END), 19 (STOP) and 18 (CONTINUE) as TRANSITIONS, not pending bits; everything else stays a bit
+# (D3 — no default action, SIGTERM included). A kill takes effect at the first of four BOUNDARIES:
+#   (A) CLAIM — the killer's own syscall tears the target down at once when it is off-CPU (on_cpu -1, unpinned) and
+#       was saved from RING 3 (proc_cs == 0x23): no kernel frame of it exists anywhere (INV-L1), INV-11 says no CPU
+#       has its CR3, and the death chain is pid-keyed tables only.
+#   (B) TICK — proc_tick_lifecycle, from timer_handler on EVERY CPU, for a CPL3-interrupted unpinned current (INV-L2).
+#   (C) B1 — syscall_handler's single exit (proc_b1_check): the process ends (or parks) with no kernel frame left.
+#   (D) WAIT — a BLOCKED target is interrupted (wq_interrupt_locked -> WR_SIGNAL) and its wait's signal point ABORTs
+#       (to B1) or PARKs (a stop, state 5, resumed in place with the same absolute deadline).
+# LOCKS: sched_lock (IF=0 leaf) covers every state test, pending store, claim/stop/cont transition, the tree walk and
+# wq_interrupt_locked. No klug, no release, no kick under it: those run in lifecycle_after_unlock. Every S7 acquirer
+# brackets with kbd_irq_save (kmain / ktest callers are IF=1). Every transition INTO 5 re-checks the pending kill and
+# the parent's liveness under the lock and refuses when set / gone (lc_stop_action / lc_tick_action / lc_park_action).
+
+# The latched S7 invariant lines (fg_latch: klug + COM1, never under sched_lock). All three are SMOKE_INVARIANT_DENY.
+# (fg_latch bits 32 `lifecycle: claimed a kernel continuation`, 64 `lifecycle: park refused`, 128 `lifecycle: signal
+# point with preempt held` — called inline below.)
+
+# CLAIMABLE: READY or STOPPED, off every CPU, unpinned, saved from ring 3 (or never run). Caller holds sched_lock.
+fn proc_claimable_locked(t) {
+    var cl_st = lc_st(t);
+    if (cl_st != 1) { if (cl_st != 5) { return 0; } }
+    if (on_cpu_get(t) != (0 - 1)) { return 0; }
+    if (idle_owner_get(t) != (0 - 1)) { return 0; }
+    if (load64(&proc_cs + t * 8) != 0x23) { return 0; }
+    return 1;
+}
+# Record a kill (the FIRST kill wins — an S8 SIGXCPU already pending keeps its 280); a kill cancels a pending stop. No
+# transition. Also S8's tick head (the current proc). Caller holds sched_lock.
+fn proc_kill_mark_locked(t, sig) {
+    if (lc_kp(t) == 0) { store64(&proc_kill_pending + t * 8, sig); }
+    lc_sp_set(t, 0);
+    return 0;
+}
+# The lifecycle mask block `lm` is a function-local `var x[32]` (32 BYTES = 4 u64): +0 claim, +8 kick, +16 stop-claimed,
+# +24 cont; each a `1 << pid` mask.
+fn lm_or(lm, off, t) { store64(lm + off, load64(lm + off) | (1 << t)); return 0; }
+fn lm_zero(lm) { store64(lm, 0); store64(lm + 8, 0); store64(lm + 16, 0); store64(lm + 24, 0); return 0; }
+fn proc_kill_locked(t, sig, lm) {
+    var kl_a = lc_kill_action(lc_st(t), proc_is_user(t), proc_claimable_locked(t));
+    if (kl_a == 0) { return 0; }
+    if (kl_a == (0 - 1)) { return 0 - 1; }
+    proc_kill_mark_locked(t, sig);
+    if (kl_a == 1) { return 0; }                                        # a birth: it dies at its first boundary
+    if (kl_a == 2) { lc_st_set(t, 4); lm_or(lm, 0, t); return 0; }   # (A) CLAIM -> DYING
+    if (kl_a == 3) { lc_st_set(t, 1); }           # crit (a): run to a boundary and die there
+    if (kl_a == 4) { wq_interrupt_locked(t); }                          # (D) 6 -> 1, WR_SIGNAL
+    lm_or(lm, 8, t);
+    return 0;
+}
+fn proc_stop_locked(t, lm, tree) {
+    var st_a = lc_stop_action(lc_st(t), proc_is_user(t), lc_kp(t), proc_stoppable(t), proc_parent_live(t), proc_claimable_locked(t));
+    if (st_a == 0) { return 0; }
+    if (st_a == (0 - 1)) { return 0 - 1; }
+    var st_kind = 1;
+    if (tree == 1) { st_kind = 2; }
+    if (st_a == 6) { lc_sp_set(t, st_kind); return 0; }   # a birth: parks at its first boundary
+    if (st_a == 2) {                                                              # via=claim: 1 -> 5 now
+        lc_st_set(t, 5);
+        lc_sp_set(t, 0);
+        lm_or(lm, 16, t);
+        return 0;
+    }
+    lc_sp_set(t, st_kind);
+    if (st_a == 4) { wq_interrupt_locked(t); }
+    lm_or(lm, 8, t);
+    return 0;
+}
+fn proc_cont_locked(t, lm) {
+    var co_st = lc_st(t);
+    if (co_st == 0) { return 0; }
+    if (co_st == 4) { return 0; }
+    if (co_st == 3) { lc_sp_set(t, 0); atomic_or64(&proc_signals + t * 8, 1 << 18); return 0; }
+    if (proc_is_user(t) == 0) { return 0 - 1; }
+    lc_sp_set(t, 0);
+    if (co_st == 5) { lc_st_set(t, 1); lm_or(lm, 8, t); lm_or(lm, 24, t); }
+    atomic_or64(&proc_signals + t * 8, 1 << 18);                        # D3: 18 still sets its signalfd bit
+    return 0;
+}
+# A SIGKILL of a #37 waiter kills its foreground child (and that child's, while it waits too — chain <= 16).
+fn proc_fg_chain_kill_locked(t, lm) {
+    var fc_x = t;
+    var fc_i = 0;
+    while (fc_i < 16) {
+        var fc_c = proc_fgwait_get(fc_x) - 1;
+        if (fc_c < 0) { return 0; }
+        if (fc_c >= proc_count) { return 0; }
+        if (fc_c == fc_x) { return 0; }
+        proc_kill_locked(fc_c, SIG_KILL, lm);
+        fc_x = fc_c;
+        fc_i = fc_i + 1;
+    }
+    return 0;
+}
+fn proc_sig_locked(t, sig, lm, tree) {
+    if (sig == SIG_KILL) {
+        var sl_r = proc_kill_locked(t, SIG_KILL, lm);
+        if (sl_r == 0) { proc_fg_chain_kill_locked(t, lm); }
+        return sl_r;
+    }
+    if (sig == SIG_STOP) { return proc_stop_locked(t, lm, tree); }
+    if (sig == SIG_CONT) { return proc_cont_locked(t, lm); }
+    atomic_or64(&proc_signals + t * 8, 1 << sig);                       # SIGTERM & co: a bit, no default action (D3)
+    return 0;
+}
+# The kill#16 body (1 <= sig <= 63; flags 0 or KILL_TREE). Authorization is RE-CHECKED under the lock (no TOCTOU vs a
+# recycle). KILL_TREE: the root plus every epoch-validated descendant in the SAME hold — the member set and every
+# transition are one snapshot, and a birth racing it either is in the set or sees its creator's mark (proc_birth_check).
+# Returns the root's result, except a tree STOP that skipped >= 1 member (unstoppable, or no live parent) -> -2.
+fn proc_signal_deliver(caller, t, sig, flags) {
+    var sd_lm[32];
+    lm_zero(&sd_lm);
+    var sd_f = kbd_irq_save();
+    sched_spin_lock();
+    var sd_r = 0 - 1;
+    if (proc_may_signal(caller, t) == 1) {
+        var sd_tr = 0;
+        if (flags == KILL_TREE) { sd_tr = 1; }
+        sd_r = proc_sig_locked(t, sig, &sd_lm, sd_tr);
+        if (sd_tr == 1) {
+            if (sd_r == 0) {
+                var sd_skip = 0;
+                var sd_q = 0;
+                while (sd_q < proc_count) {
+                    if (sd_q != t) {
+                        if (lc_st(sd_q) != 0) {
+                            if (proc_is_descendant(sd_q, t) == 1) {
+                                if (proc_sig_locked(sd_q, sig, &sd_lm, 1) != 0) { sd_skip = sd_skip + 1; }
+                            }
+                        }
+                    }
+                    sd_q = sd_q + 1;
+                }
+                if (sig == SIG_STOP) { if (sd_skip != 0) { sd_r = 0 - 2; } }
+            }
+        }
+    }
+    sched_spin_unlock();
+    kbd_irq_restore(sd_f);
+    lifecycle_after_unlock(&sd_lm);
+    return sd_r;
+}
+# Everything a delivery defers past the unlock: the trace lines, the kicks (IPIs only halted CPUs) and the CLAIMED
+# deaths. k = the pending kill, not the delivered signal: the FIRST kill wins.
+fn lifecycle_after_unlock(lm) {
+    var au_q = 0;
+    while (au_q < 16) {
+        if (((load64(lm + 16) >> au_q) & 1) == 1) { lifecycle_trace(LT_STOP, au_q, 0, VIA_CLAIM); }
+        if (((load64(lm + 24) >> au_q) & 1) == 1) { lifecycle_trace(LT_CONT, au_q, 0, VIA_SIG); }
+        if (((load64(lm) >> au_q) & 1) == 1) {
+            if (load64(&proc_cs + au_q * 8) != 0x23) { fg_latch(32, "lifecycle: claimed a kernel continuation", 40); }   # INV-L1 tripwire (denied)
+            var au_k = lc_kp(au_q);
+            proc_death(au_q, 128 + au_k, au_k, VIA_CLAIM);
+        }
+        au_q = au_q + 1;
+    }
+    if (load64(lm + 8) != 0) { sched_kick_mask(load64(lm + 8), 0); }
+    return 0;
+}
+
+# (B) THE TICK — timer_handler on EVERY CPU, between its preempt_enable and do_context_switch, with the pid it already
+# read. ⛔ INV-L2: it acts ONLY on a CPL3-interrupted frame. That is what makes it legal for the death chain to take,
+# from the timer ISR, locks the smp.cyr banner otherwise calls non-ISR (proctab, fs via proc_destroy_fd_table, heap,
+# pmm, flock, chan/snd/shm, console if a callee kprints): a CPU interrupted in ring 3 holds no kernel lock, so no
+# same-CPU holder can exist; other-CPU holders are ordinary contention (fault_kill_current runs the same chain from a
+# CPL3 exception on the same argument). do_context_switch's early-out guards are replicated: if it would not switch, a
+# death here would iretq a dead process. Returns the action (0 none · 1 died · 2 stopped · 3 dropped a stop).
+# ⭐ 1.57.7 (S8) — THE CPU CAP (spawn_limits#107 a2, or inherited). timer_handler has already charged proc_ticks[p] on
+# this tick (halted ticks are not charged). At the cap a SIGXCPU kill is MARKED on the current proc; the lifecycle body
+# below then sees kill_pending and the proc dies at THIS tick (via=tick, wstat 280) when its guards hold, else at B1 or
+# at its wait interrupt. Its OWN lock section, taken and released BEFORE the body's: sched_spin_lock is a
+# non-reentrant xchg and nesting would deadlock this CPU in the timer ISR with IF=0. sched_lock is the innermost leaf
+# and every holder runs IF=0 (INV-5), so no holder on this CPU was interrupted. Takes no other lock, allocates nothing.
+# Per-tick cost for an uncapped proc: one load + one compare. Fires once (an earlier kill wins, proc_kill_mark_locked).
+fn lim_cpu_tick_head(p) {
+    var hc = load64(&proc_cpu_cap + p * 8);        # p bounded by the caller
+    if (hc == 0) { return 0; }
+    if (load64(&proc_ticks + p * 8) < hc) { return 0; }
+    if (load64(&proc_kill_pending + p * 8) != 0) { return 0; }
+    if (sched_active != 1) { return 0; }
+    if (proc_is_user(p) == 0) { return 0; }
+    var hf = kbd_irq_save();
+    sched_spin_lock();
+    if (proc_get_state(p) == 2) { proc_kill_mark_locked(p, SIG_XCPU); }   # re-checked under the lock
+    sched_spin_unlock();
+    kbd_irq_restore(hf);
+    return 0;
+}
+fn proc_tick_lifecycle(isr_rsp, tl_p) {
+    if (tl_p < 0) { return 0; }
+    if (tl_p >= 16) { return 0; }
+    lim_cpu_tick_head(tl_p);                                   # S8: the CPU cap (its own lock section, never nested)
+    if ((load64(&proc_kill_pending + tl_p * 8) | load64(&proc_stop_pending + tl_p * 8)) == 0) { return 0; }
+    if ((load64(isr_rsp + 128) & 3) != 3) { return 0; }        # ⛔ INV-L2: a CPL3 frame only (load-bearing)
+    if (sched_active != 1) { return 0; }
+    if (preempt_count_get() != 0) { return 0; }
+    if (proc_count < 2) { return 0; }
+    if (sched_idle_pid_get() < 0) { return 0; }
+    if (idle_owner_get(tl_p) != (0 - 1)) { return 0; }         # unpinned only
+    if (proc_is_user(tl_p) == 0) { return 0; }
+    preempt_disable();                                         # the chain runs as ISR body: wq_can_block() == 0 inside it
+    var tl_f = kbd_irq_save();
+    sched_spin_lock();
+    var tl_k = lc_kp(tl_p);
+    var tl_act = lc_tick_action(tl_k, lc_sp(tl_p), proc_stoppable(tl_p), proc_parent_live(tl_p));
+    if (tl_act == 2) { lc_sp_set(tl_p, 0); lc_st_set(tl_p, 5); }
+    if (tl_act == 3) { lc_sp_set(tl_p, 0); }
+    sched_spin_unlock();
+    kbd_irq_restore(tl_f);
+    if (tl_act == 1) { proc_death(tl_p, 128 + tl_k, tl_k, VIA_TICK); }
+    if (tl_act == 2) { lifecycle_trace(LT_STOP, tl_p, 0, VIA_TICK); }
+    preempt_enable();
+    return tl_act;
+}
+
+# (C) B1 — syscall_handler's single exit. 3 loads + 1 call per syscall on the fast path. `me` is the pid
+# kstack_check_entry returned at entry: a per-PROCESS fact, valid across a block / migration inside the dispatch.
+fn proc_b1_check(me) {
+    if (me < 0) { return 0; }
+    if (me >= 16) { return 0; }
+    if ((load64(&proc_kill_pending + me * 8) | load64(&proc_stop_pending + me * 8) | klug_spill_owed) == 0) { return 0; }
+    return proc_b1(me);
+}
+# A stop parks here with the syscall's result preserved on the process's own kernel stack; after SIGCONT the syscall
+# returns its real value (kill(self, 19) returns 0). A kill never returns.
+fn proc_b1(me) {
+    if (klug_spill_owed != 0) { klug_spill_owed_run(); }
+    if (lifecycle_park_or_abort(me, VIA_B1) == 0) { return 0; }
+    var b1_k = lc_kp(me);
+    proc_exit_current(128 + b1_k, b1_k);
+    return 0;
+}
+# THE ONE PARK — shared by B1 and every wait's signal point. 1 = ABORT (a kill is pending), 0 = CONTINUE.
+# ⛔ The PARK publishes state 5 BEFORE the int (keep-current cannot keep a leaving process) and switches with the BLOCK
+# intent: 5 is not in {1,2,3}, so it switches; a SIGCONT or a kill (WAKE_KICK: 5 -> 1) that lands between the unlock
+# and the int is honoured by the BLOCK guard (it stays, state 2), and the loop re-decides.
+fn lifecycle_park_or_abort(me, via) {
+    if (me < 0) { return 0; }
+    if (me >= 16) { return 0; }
+    while (1 == 1) {
+        var pa_f = kbd_irq_save();
+        sched_spin_lock();
+        var pa_a = lc_park_action(lc_kp(me), lc_sp(me), proc_stoppable(me), proc_parent_live(me), preempt_count_get());
+        if (pa_a == 1) { sched_spin_unlock(); kbd_irq_restore(pa_f); return 1; }            # ABORT (a kill)
+        if (pa_a == 0) { sched_spin_unlock(); kbd_irq_restore(pa_f); return 0; }            # CONTINUE
+        if (pa_a == 3) {                                                                    # DROP
+            lc_sp_set(me, 0);
+            sched_spin_unlock(); kbd_irq_restore(pa_f);
+            return 0;
+        }
+        if (pa_a == 4) {                                                                    # PREEMPT_HELD (a kernel bug)
+            sched_spin_unlock(); kbd_irq_restore(pa_f);
+            fg_latch(128, "lifecycle: signal point with preempt held", 41);
+            if (via == VIA_WAIT) { return 1; }    # never CONTINUE with a stop pending: unwind; B1 parks it (preempt 0)
+            return 0;                             # B1: stays pending; the next tick (ring 3) or B1 acts
+        }
+        lc_sp_set(me, 0);                                             # PARK
+        lc_st_set(me, 5);
+        sched_spin_unlock();
+        lifecycle_trace(LT_STOP, me, 0, via);     # after the unlock (no klug under sched_lock)
+        sched_switch_vol(2);                      # BLOCK intent
+        if (lc_st(me) == 5) {                                      # the switch was refused
+            fg_latch(64, "lifecycle: park refused", 23);
+            sched_spin_lock();
+            if (lc_st(me) == 5) { lc_st_set(me, 2); }
+            sched_spin_unlock();
+        }
+        kbd_irq_restore(pa_f);
+    }
+    return 0;
+}
+
+# BIRTHS (S7 §2.9): may `creator` create `child` now? Called by proc_create_user / sys_fork right after the child's
+# ppid + ppid_epoch stores, under sched_lock: a creator with a pending kill may not (0); a TREE-stopped creator's child
+# is born stop-pending (sp 2) — direct stops are not inherited (POSIX does not stop a stopped process's new child).
+fn proc_birth_check(child, creator) {
+    if (spawn_pid_ok(creator) == 0) { return 1; }
+    if (spawn_pid_ok(child) == 0) { return 1; }
+    var bc_f = kbd_irq_save();
+    sched_spin_lock();
+    var bc_a = lc_birth_action(lc_kp(creator), lc_sp(creator));
+    if (bc_a == 2) { lc_sp_set(child, 2); }
+    sched_spin_unlock();
+    kbd_irq_restore(bc_f);
+    if (bc_a == 0) { return 0; }
+    return 1;
+}
+# #37's publication of its foreground child (replaces proc_fgwait_set(me, c + 1)): under sched_lock, so a kill of
+# the waiter either precedes it (the waiter's pending kill is seen here -> c is marked) or follows it (the kill arm's
+# proc_fg_chain_kill_locked reads the cell). c is state 3 (CLAIMING) here: MARK only.
+fn proc_fgwait_publish(me, c) {
+    var fp_lm[32];
+    lm_zero(&fp_lm);
+    var fp_f = kbd_irq_save();
+    sched_spin_lock();
+    proc_fgwait_set(me, c + 1);
+    if (lc_kp(me) != 0) { proc_kill_locked(c, SIG_KILL, &fp_lm); }
+    sched_spin_unlock();
+    kbd_irq_restore(fp_f);
+    lifecycle_after_unlock(&fp_lm);
+    return 0;
+}
+# #37's abort path (its wait ended with a kill pending on the waiter): the foreground child gets SIGKILL. Propagation
+# always delivers SIGKILL (a waiter killed by S8's SIGXCPU kills its child with 265, not 280).
+fn proc_kill_fg_child(me) {
+    var kf_lm[32];
+    lm_zero(&kf_lm);
+    var kf_f = kbd_irq_save();
+    sched_spin_lock();
+    proc_fg_chain_kill_locked(me, &kf_lm);
+    sched_spin_unlock();
+    kbd_irq_restore(kf_f);
+    lifecycle_after_unlock(&kf_lm);
+    return 0;
+}
+
+# THE TRACE (klug only — the lifecycle smoke's oracle). ONE line per event, built in a local buffer and appended under
+# klug_lock with a monotonic sequence number taken under the same lock; the line always starts at a line boundary
+# (a `\n` first when another CPU's kprint prefix is pending). Never called under sched_lock. Format (S8 relies on it):
+#   lifecycle: #<seq> kill pid=0x<p> sig=0x<s> via=<claim|tick|b1>
+#   lifecycle: #<seq> stop pid=0x<p> via=<claim|tick|b1|wait>
+#   lifecycle: #<seq> cont pid=0x<p> via=<sig|orphan>
+#   lifecycle: #<seq> orphan pid=0x<p> reaped
+var lifecycle_seq = 0;
+# Append s RAW (the caller holds klug_lock); a word of a packed table ends at its first space (a string that
+# starts with a space is copied whole).
+fn lt_put(s) {
+    var lp_i = 0;
+    while (load8(s + lp_i) != 0) {
+        if (load8(s + lp_i) == 32) { if (lp_i > 0) { if (load8(s) != 32) { return 0; } } }
+        klug_putc_raw(load8(s + lp_i));
+        lp_i = lp_i + 1;
+    }
+    return 0;
+}
+fn lt_hex(v) { var lh_hx[24]; klug_append_raw(&lh_hx, fmt_hex_buf(v, &lh_hx)); return 0; }
+# The via names, packed at a stride of 7 (index = VIA_*).
+fn lt_via_name(via) { return "none   claim  tick   b1     wait   sig    orphan " + via * 7; }
+# The whole line is appended inside ONE klug_lock hold (so it is never torn by another CPU's append), with the
+# sequence number taken in the same hold (monotonic in ring order).
+fn lifecycle_trace(kind, pid, sig, via) {
+    var lt_t = klug_lock_acquire();
+    var lt_seq = lifecycle_seq;
+    lifecycle_seq = lifecycle_seq + 1;
+    if (klug_count > 0) {
+        if (load8(&klug_buf + ((klug_head + 0xFFFF) & 0xFFFF)) != 10) { klug_putc_raw(10); }
+    }
+    klug_append_raw("lifecycle: #", 12);
+    lt_hex(lt_seq);
+    klug_putc_raw(32);
+    lt_put("kill   stop   cont   orphan " + (kind - 1) * 7);   # LT_* 1..4, packed at a stride of 7
+    lt_put(" pid=0x");
+    lt_hex(pid);
+    if (kind == LT_KILL) { lt_put(" sig=0x"); lt_hex(sig); }
+    if (kind == LT_ORPHAN) { lt_put(" reaped"); }
+    else { lt_put(" via="); lt_put(lt_via_name(via)); }
+    klug_putc_raw(10);
+    klug_lock_release(lt_t);
+    return 0;
+}
+
+# A process that has ended (state 0 already published — exit#0, fault_kill_current) leaves its CPU AT ONCE: a
+# BLOCK-shaped voluntary switch (the BLOCK guard proceeds on state 0, do_context_switch never revives 0 and hands a
+# dead old back to the boot CR3), so its reaper's on_cpu fence spins for a few instructions instead of up to a
+# tick. The `sti; hlt` is the pre-scheduler and refused-switch fallback (the next tick switches away).
+fn sched_exit_tail() {
+    while (1) {
+        if (sched_active == 1) { sched_switch_vol(2); }
+        # REGISTER CONTRACT (sti; hlt): no inputs, no outputs, no GPR touched. Sets RFLAGS.IF and halts until
+        # the next interrupt; the tick then switches the dead proc away (do_context_switch never revives state 0).
+        asm { sti; hlt; }
+    }
+    return 0;
+}
+
+# ═══════════════ 1.57.7 (S3b) — FOREGROUND EXEC: THE CHILD WAIT (docs/architecture/foreground-exec.md) ═══════════════
+# Block the CURRENT process until its child `c` is dead (state 0). The waker is the child's death: exit#0 and
+# fault_kill_current store state 0 and THEN wq_wake(WK_CHILD | ppid) (INV-FG-3), the same key waitpid WAIT_BLOCK uses.
+# 0 = c is dead (its status is readable, its slot kept by the caller's proc_fgwait cell) · 1 = a lifecycle signal
+# aborted the wait (S7) · 2 = this context cannot block (wq_arm refused) · 3 = c's slot collapsed (defensive).
+# It brackets its own IF (R1: the wait primitive runs IF=0), so an IF=1 kmain caller is correct. NO DEADLINE (wq_arm
+# dl 0 = none): a missed wake is a hang, which is what makes a lost-wakeup mutation (M3) discriminate.
+# S3c's contract: wq_signal_point never returns CONTINUE while wq_signal_pending stays set, so the `we_a == 1`
+# continue cannot spin; before S7 wq_arm never returns 1.
+fn proc_wait_child_exit(c) {
+    var we_me = proc_current_get();
+    var we_f = kbd_irq_save();
+    var we_r = 0;
+    while (1 == 1) {
+        var we_st = proc_get_state(c);
+        if (we_st < 0) { we_r = 3; break; }
+        if (we_st == 0) { break; }
+        var we_a = wq_arm(WK_CHILD | we_me, 0);
+        if (we_a == 1) { if (wq_signal_point() == 1) { we_r = 1; break; } continue; }
+        if (we_a == 2) { we_r = 2; break; }
+        var we_st2 = proc_get_state(c);
+        if (we_st2 <= 0) { wq_cancel(); if (we_st2 < 0) { we_r = 3; } break; }
+        if (wq_sleep() == WR_SIGNAL) { if (wq_signal_point() == 1) { we_r = 1; break; } }
+    }
+    kbd_irq_restore(we_f);
+    return we_r;
+}
+
+# The foreground-exec latched lines: once per bit per boot, to klug + COM1 (lock-free, never the console — the
+# sched_assert_oob pattern), never called under sched_lock. Bits: 1 `fg: IF=0 ring-3 caller after sched_active --
+# foreground invariant broken` (72, the INV-FG-1 tripwire) · 2 `fg: kernel_run_child cannot block here -- child
+# reaped, -1` (58) · 4 `fg: execwait cannot block here -- refused` (41) · 8 `fg: execwait wait ended abnormally --
+# child orphaned` (52) · 16 `exec: exec_and_wait is boot-only -- refused after sched_active` (62). S7 takes 32 and up.
+# Every one of them is in SMOKE_INVARIANT_DENY (qemu-dwell.sh).
+var fg_said = 0;
+fn fg_latch(bit, msg, len) {
+    if ((fg_said & bit) != 0) { return 0; }
+    fg_said = fg_said | bit;
+    klug_append(msg, len); klug_putc(10);
+    serial_println(msg, len);
+    return 0;
+}
+
+# CMOS CP 0x21 — the FIRST CPL3 dispatch of a kernel_run_child child (the iron breadcrumb for the historical
+# first-entry class: CP 0x20 at READY, kernel_run_child_keep; then 0x21 here, in the switch tail, once the frame it
+# will iretq is a CPL3 frame of that child). REASONED/iron-read only: QEMU gates do not read CMOS.
+var fg_first_entry_pid = 0;                       # pid + 1 of a kernel_run_child child not yet dispatched to CPL3; 0 = none
+fn fg_note_first_entry(fp) {
+    if (fg_first_entry_pid == 0) { return 0; }    # the common case: one global load
+    if ((load64(fp + 128) & 3) != 3) { return 0; }
+    if (proc_current_get() + 1 != fg_first_entry_pid) { return 0; }
+    # asm contract: no inputs/outputs; clobbers al only (outb 0x70 <- 0x50, outb 0x71 <- 0x21).
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x21; 0xE6; 0x71; }
+    fg_first_entry_pid = 0;
+    return 0;
+}
+
+# INV-FG-1 TRIPWIRE: after `sched_active = 1` no ring-3 code runs with IF=0 (enter_ring3 — the only IF=0 source — is
+# pre-scheduler only since S3b-F4: exec_and_wait refuses after it; every other p+152 writer sets IF; IOPL 0, so ring 3
+# cannot CLI). Called from syscall_handler's #14 and #44 dispatch with the pid kstack_check_entry already returned:
+# both arms are ring-3-only, so the frame at the top of p's kernel stack is the caller's, and its saved RFLAGS (the
+# entry stub's R11 push) must have IF set. NO LAPIC read (the S3-fix measured +20% on getpid at -smp 4 under KVM for
+# one extra read): one frame load and a compare. Latched `fg: IF=0 ring-3 caller after sched_active -- foreground
+# invariant broken` (bit 1), denied by every smoke. S7's single-exit syscall_handler keeps this call (PLAN S7-E1).
+fn fg_if0_tripwire(p) {
+    if (sched_active == 0) { return 0; }
+    if (p < 0) { return 0; }
+    if (p >= 16) { return 0; }
+    if ((sc_frame_get(p, SCF_RFL) & 0x200) == 0) { fg_latch(1, "fg: IF=0 ring-3 caller after sched_active -- foreground invariant broken", 72); }
+    return 0;
+}
+
+# The #37 witness (NOT an invariant, NOT denied): proof the scheduled #37 route ran — the fixed run37-smp4 harness
+# and fg-smoke require it (mutation M-WIT). Latched once per boot; called by sys_execwait just before READY.
+var execwait_first_said = 0;
+fn execwait_note_first() {
+    if (execwait_first_said != 0) { return 0; }
+    execwait_first_said = 1;
+    klug_append("execwait: first scheduled child", 31); klug_putc(10);
+    serial_println("execwait: first scheduled child", 31);
     return 0;
 }
 
@@ -700,9 +1874,72 @@ fn sched_leave_old(isr_rsp, old) {
 # the boot path, so its stack comes from the kthread static pool — dogfooding the
 # 1.44.0 thread primitive in production; no separate idle stack to maintain.
 
+# ⭐ 1.57.7 (Path 2, S3.8) — THE IDLE STEP. The idle used to be `while (1) { arch_wait(); }`: after an interrupt made a
+# process READY (a keyboard MSI waking a reader, a wq_wake from another CPU, a 0xE1 kick) it went straight back to hlt
+# and the READY process waited for this CPU's next tick. Now every idle hlt ends in a SCAN: READY work this CPU may
+# take is taken at once through the voluntary switch (sched_yield_kernel -> int 0xE0 -> do_context_switch — the idle
+# never switches by any other path, so "exactly two switch paths" holds).
+# ⛔ PROTOCOL (the same as sched_halt_window's, and the kick depends on it): cli; publish cpu_in_halt + cpu_kickable;
+# mfence; THEN scan; THEN sti;hlt. Scanning first and setting the flag after loses a kick: a waker that makes a proc
+# READY between the scan and the flag store reads kickable == 0 and sends nothing, and this CPU sleeps a full tick.
+# DEKKER (blocking-waits.md): the waker stores state = 1 under sched_lock, releases it (xchg = full fence), then loads
+# cpu_kickable[t]; this halter stores cpu_kickable = 1, mfence, then loads the states. Either the scan sees READY or the
+# waker sees the flag and kicks — and a kick that arrives while this CPU is IF=0 stays pending and ends the hlt the
+# instant the sti shadow closes.
+# The chakshu accounting argument still holds: cpu_in_halt is set around the step's only hlt, so an idle CPU's ticks
+# are charged to nobody (the timer ISR consumes the flag).
+var sched_idle_refusals[4];   # consecutive "found READY work but the yield refused" per CPU (reset on a hlt / a yield)
+var sched_idle_refused_said = 0;
+fn sched_idle_step() {
+    asm { 0xFA; }                                      # cli — contract: no inputs/outputs; closes the check->hlt window
+    var is_c = pcpu_cpu();                             # the idle is pinned: this is its only CPU
+    if (is_c < 4) { store64(&cpu_in_halt + is_c * 8, 1); store64(&cpu_kickable + is_c * 8, 1); }
+    arch_mfence();                                     # ⛔ PUBLISH "halted/kickable" BEFORE THE SCAN (Dekker)
+    var is_r = 0;
+    if (sched_active == 1) { is_r = sched_ready_for_me(proc_current_get()); }
+    if (is_r != 0) {
+        if (is_c < 4) { store64(&cpu_kickable + is_c * 8, 0); store64(&cpu_in_halt + is_c * 8, 0); }
+    }
+    if (is_r == 1) {
+        if (sched_yield_kernel() == 1) {
+            if (is_c < 4) { store64(&sched_idle_refusals + is_c * 8, 0); }
+            return 0;
+        }
+        # The yield refused READY work. Never on a correct kernel: the idle runs at preempt_count 0 on its own CR3; a
+        # lost race (another CPU took the proc) resets on the next hlt. 1000 in a row
+        # is latched once (klug + COM1, lock-free; denied by every smoke through SMOKE_INVARIANT_DENY).
+        if (is_c < 4) {
+            store64(&sched_idle_refusals + is_c * 8, load64(&sched_idle_refusals + is_c * 8) + 1);
+            if (load64(&sched_idle_refusals + is_c * 8) >= 1000) {
+                if (sched_idle_refused_said == 0) {
+                    sched_idle_refused_said = 1;
+                    klug_append("sched: IDLE REFUSED A READY PICK 1000 TIMES", 43); klug_putc(10);
+                    serial_println("sched: IDLE REFUSED A READY PICK 1000 TIMES", 43);
+                }
+            }
+        }
+        # REGISTER CONTRACT: `sti; pause; cli` — no inputs, no outputs, no GPR touched; a one-instruction interrupt
+        # window so a refused yield never spins with IF=0.
+        asm { 0xFB; 0xF3; 0x90; 0xFA; }
+        return 0;
+    }
+    if (is_r == 2) {
+        # READY but fenced (on_cpu != -1, INV-11: its old CPU is still in its switch tail, a few instructions — up to
+        # 50 ms only in kstack-smoke's fence phase, which holds a tail on purpose): spin interruptibly, never halt.
+        # REGISTER CONTRACT: `sti; pause; cli` — no inputs, no outputs, no GPR touched.
+        asm { 0xFB; 0xF3; 0x90; 0xFA; }
+        return 0;
+    }
+    if (is_c < 4) { store64(&sched_idle_refusals + is_c * 8, 0); }
+    arch_sti_hlt();
+    var is_c2 = pcpu_cpu();                            # R4: re-read (pinned, so equal — never carry a cpu across a hlt)
+    if (is_c2 < 4) { store64(&cpu_kickable + is_c2 * 8, 0); store64(&cpu_in_halt + is_c2 * 8, 0); }
+    return 0;
+}
+
 fn kernel_idle_loop() {
-    while (1) {
-        arch_wait();   # hlt; the timer ISR preempts and the scheduler yields back
+    while (1 == 1) {
+        sched_idle_step();   # 1.57.7 (S3.8): flag -> mfence -> scan -> take READY work, else sti;hlt (see above)
     }
     return 0;
 }
@@ -729,155 +1966,17 @@ fn kernel_idle_loop() {
 # RUNNING, pinned and owned, in the one sched_lock block (smp.cyr).
 fn ap_idle_create(cpu) { return proc_create_kclaim(&kernel_idle_loop, tss_get_cpu_stack(cpu)); }
 
-# === 1.44.16 — sched_yield(#44): voluntary end-of-slice from ring 3 ===
-#
-# A ring-3 proc donates the REMAINDER of its timer slice to the next ready proc.
-# The consumer: agnsh's bg-job poll loop — instead of busy-spinning its whole 10 ms
-# slice between non-blocking polls, it polls once + yields, so background jobs get
-# nearly all the CPU while the shell idles at the prompt.
-#
-# MECHANISM — abandon-frame, NOT suspend-frame. The 1.44.6 serial-kstack invariant
-# forbids suspending a handler frame (the next proc's syscall resets rsp to
-# syscall_kstack_top and would clobber it — why the 1.44.14 in-handler yield was
-# rejected). [1.57.6, Path 2 S3.3: that invariant is gone — each process's syscalls run on its
-# OWN kernel stack, and the abandoned frame below is on the yielder's own stack. The abandon-frame
-# shape stays until the in-kernel voluntary switch replaces this body (a later Path 2 bite).] Instead the #44 handler completes the syscall "logically" BEFORE the
-# switch: it writes the yielder's proc slot AS IF the syscall had already SYSRET'd
-# (resume RIP = the post-SYSCALL rcx the entry stub captured into sc_entry_regs;
-# rax = 0 = the yield return value), then switches to the next ready proc through a
-# SYNTHESIZED ISR frame + the timer ISR's own pops+iretq epilogue. The abandoned
-# kstack frame is dead — nothing ever returns through it, so a later overwrite is
-# harmless and the serial-kstack invariant holds. When the rotation comes back, the
-# normal scheduler restore iretqs the yielder into ring 3 at the post-SYSCALL RIP
-# with rax=0 — it observes sched_yield() == 0.
-#
-# REVERSED-LABEL SLOT MAP (load-bearing): the proc-slot caller-saved fields restore
-# into the REVERSE of their labels (derived from the ISR pop order, pic.cyr:94-110,
-# vs proc_restore_context's writes above): p+32→r11, p+48→r10, p+56→r9, p+64→r8,
-# p+72→rdi, p+88→rsi, p+96→rdx, p+104→rcx, p+112→rax. So the rax=0 return value goes
-# to p+112 (NOT p+32). Harmless for the symmetric timer save/restore; critical here.
-# Callee-saved labels are clean (p+40=rbx, p+80=rbp, p+120..144=r12-r15).
-
-# The synthesized 20-slot ISR frame (160 B needed). 1.57.6 (S3.1): ALSO the frame every timer-driven switch
-# leaves through (sched_leave_old copies the ISR frame here before the on_cpu release). A DEDICATED kernel global — NOT
-# kstack-relative scratch (proc_restore_context's own call frame grows down the live
-# kstack and could overlap it). Identity-mapped supervisor under every per-proc CR3
-# (the PD[0..127] kernel mirror), so it stays readable after the cr3_load below.
-# IF=0 (SFMASK) guarantees exclusive use.
-# 1.46.x SMP sub-bite 6: PER-CPU now. Two CPUs can each run sys_sched_yield concurrently
-# (their own #44), so one shared synth frame would race. 80 u64 = 640 B = 4 CPUs x 160 B/CPU
-# (module-global `var X[N]` = N x u64 = 8N bytes — cyrius var-array units); source via
-# pcpu_yield_frame_ptr() = &pcpu_yield_frame + pcpu_cpu()*160. CPU 0's slot is byte-identical
-# to the old &yield_frame, so single-core is unchanged (INV-10).
+# The per-CPU frame every switch tail leaves through (sched_leave_old copies the 160-byte ISR frame here before the
+# on_cpu release, then sched_frame_iretq pops it). A DEDICATED kernel global — NOT kstack-relative scratch: the
+# frame it is copied from sits on the LEAVING process's stack, which another CPU may resume onto the moment on_cpu
+# says -1, so the pops must come from memory nobody else owns. Identity-mapped supervisor .bss under every
+# per-proc CR3 (the PD[0..127] kernel mirror), so it stays readable after cr3_load(new). IF=0 on the switch path
+# guarantees exclusive use per CPU. 80 u64 = 640 B = 4 CPUs x 160 B (module-global `var X[N]` = N x u64);
+# pcpu_yield_frame_ptr() = &pcpu_yield_frame + pcpu_cpu()*160. (Named for the 1.44.16 abandon-frame
+# sys_sched_yield it was built for; that function is gone since 1.57.7 — the voluntary switch goes through
+# resched_isr and the SAME tail as the timer, above.)
 var pcpu_yield_frame[80];
 fn pcpu_yield_frame_ptr() { return &pcpu_yield_frame + pcpu_cpu() * 160; }
-
-# (1.57.6 S3.1: yield_frame_iretq — the 15-pop + iretq that used to sit here — is replaced by
-# sched_frame_iretq above, which is the same epilogue with the INV-11 on_cpu release store in front of it.)
-
-# The #44 handler. Dispatched from syscall_handler (syscall_hw.cyr) ONLY — never from
-# ksyscall, which in-kernel code (bench, recovery shell) calls directly with stale
-# sc_entry_regs. Every guard returns 0 = a SUCCESSFUL NO-OP yield (plain SYSRET).
-# Raw load64/store64 throughout (the cc5-regalloc-sensitive-path convention above).
-fn sys_sched_yield() {
-    if (sched_active == 0) { return 0; }
-    if (preempt_count_get() > 0) { return 0; }
-    # Refuse during an execwait#37 nested exec: suspended agnsh sits state-1
-    # (SCHEDULABLE) with its real continuation frozen in the #37 kstack frame — a
-    # yield-switch could select its STALE slot and resume the shell incoherently.
-    if (pcpu_ew37_busy_get() != 0) { return 0; }
-    # Refuse IF=0 callers (foreground exec/execwait children): their no-context-switch
-    # model is load-bearing; yield is a no-op there, not an error.
-    if ((load64(sc_scr_base() + 8) & 0x200) == 0) { return 0; }   # 4c: THIS cpu's block (base folds pcpu_cpu()*64)
-    # 1.46.x SMP sub-bite 6: acquire sched_lock here. The FOUR pre-acquire guards above
-    # (sched_active/preempt/ew37/IF=0) return WITHOUT the lock (INV-1 governs only POST-acquire
-    # exits). NO cli/sti needed: sys_sched_yield runs IF=0 (SFMASK 0x40700 clears IF on SYSCALL
-    # entry, syscall_hw.cyr:179 — the L336 IF guard reads the CALLER's captured user RFLAGS, not
-    # the live kernel IF), so no same-CPU timer re-enters a held sched_lock (INV-5). INV-1: ALL
-    # THREE post-acquire exits (next==yp; state(next)!=1; main path) call sched_spin_unlock()
-    # before returning; the main-path unlock MUST precede sched_frame_iretq (which never returns —
-    # an unlock after it is dead code → permanent hold → next-yield deadlock, INV-2).
-    sched_spin_lock();                                 # ACQUIRE
-    var yp = proc_current_get();
-    var next = sched_next();
-    if (next == yp) { sched_spin_unlock(); return 0; }            # RELEASE on early-out (nothing else ready)
-    # sched_next's no-ready fallback returns 0 (kmain), which is state 2 with a STALE
-    # slot while suspended in exec_and_wait — restoring it would time-travel kmain.
-    # Only a genuinely READY (state 1) proc may be switched to from here.
-    if (proc_get_state(next) != 1) { sched_spin_unlock(); return 0; }   # RELEASE on early-out
-    # --- Write the yielder's slot AS IF the syscall had returned (SYSRET parity) ---
-    var p = &proc_table + yp * 176;
-    store64(p + 24, load64(sc_scr_base() + 0));        # resume RIP = post-SYSCALL rcx (4c: THIS cpu's block)
-    store64(p + 152, load64(sc_scr_base() + 8));       # RFLAGS = captured r11 (carries IF=1)
-    store64(p + 16, load64(proc_rsp0_top(yp) - SCF_URSP));            # user RSP — 1.57.6 (S3.3): from the yielder's OWN syscall frame, [ktop-8]
-    store64(p + 40, load64(sc_scr_base() + 16));       # rbx   (callee-saved: clean labels)
-    store64(p + 80, load64(sc_scr_base() + 24));       # rbp
-    store64(p + 120, load64(sc_scr_base() + 32));      # r12
-    store64(p + 128, load64(sc_scr_base() + 40));      # r13
-    store64(p + 136, load64(sc_scr_base() + 48));      # r14
-    store64(p + 144, load64(sc_scr_base() + 56));      # r15
-    store64(p + 112, 0);                               # → ring-3 RAX = 0 (the return value)
-    store64(p + 104, load64(sc_scr_base() + 0));       # → ring-3 RCX = RIP (SYSRET parity)
-    store64(p + 32, load64(sc_scr_base() + 8));        # → ring-3 R11 = RFLAGS (SYSRET parity)
-    store64(p + 48, 0);                                # → r10 (dead caller-saved: zero, don't
-    store64(p + 56, 0);                                # → r9   leak kernel register contents)
-    store64(p + 64, 0);                                # → r8
-    store64(p + 72, 0);                                # → rdi
-    store64(p + 88, 0);                                # → rsi
-    store64(p + 96, 0);                                # → rdx
-    # CS/SS as LITERALS: SYSCALL entry proves the caller is ring 3, but the arrays
-    # hold ring-0 defaults until the FIRST timer preemption persists the real ones —
-    # a first-poll yield can precede that (the #43 proc_set_ring3 bug class).
-    store64(&proc_cs + yp * 8, 0x23);
-    store64(&proc_ss + yp * 8, 0x1B);
-    # --- Switch (mirrors do_context_switch's proven order + tail) ---
-    proc_set_state(yp, 1);                             # yielder: running → ready
-    fpu_deschedule_save(yp);                           # 1.53.x B3b: eager-FXSAVE yielder's XMM (if this CPU owns it) + clear owner, UNDER lock, BEFORE the (deferred) unfence
-    # 1.57.6 (S3.1): NO on_cpu_set(yp, -1) here any more — the yielder stays fenced until the tail's
-    # sched_frame_iretq has left this stack and loaded next's CR3 (INV-11; see do_context_switch).
-    proc_current_set(next);
-    proc_set_state(next, 2);                           # next: ready → running
-    on_cpu_set(next, pcpu_cpu());                      # SMP6 FENCE: next owned by this CPU (LAST under-lock mutation — INV-6)
-    sched_spin_unlock();                               # *** RELEASE *** before the no-return tail (INV-1/INV-2)
-    kst_note_switch_in(next);                          # KSTACK_SELFTEST: the underfoot witness (no-op twin)
-    var fp = pcpu_yield_frame_ptr();                   # SMP6: per-CPU synthesized frame (was &yield_frame)
-    proc_restore_context(next, fp);                    # fill the synthesized ISR frame
-    var new_cr3 = proc_get_cr3(next);
-    var old_cr3 = proc_get_cr3(yp);
-    if (new_cr3 != old_cr3) { cr3_load(new_cr3); }
-    store64(&pcpu_kpti_kernel_cr3 + pcpu_cpu() * 8, new_cr3);                  # OMITTING these re-enters the YIELDER's
-    pd_tripwire(new_cr3, 3);     # tag 3 = scheduler dispatch — SILENT unless PD[510] is already gone
-    store64(&pcpu_kpti_user_cr3 + pcpu_cpu() * 8, proc_get_user_cr3(new_cr3)); # CR3 on next's first syscall (1.40.x class); 4c per-CPU
-    kstack_install(next);                              # 1.57.6 (S3.3): TSS.RSP0 + the syscall top = next's own kernel stack
-    fpu_set_ts();                                      # 1.53.x B3b: arm #NM for next — its first SSE op FXRSTORs its FP area
-    proc_check_pending_signals(next);
-    # CLAC: the entry stub's STAC pairs with CLAC only on the SYSRET tail we never
-    # reach (the kernel_resume precedent, 1.42.14 audit #3).
-    asm { 0x0F; 0x01; 0xCA; }
-    sched_fix_live_frame(fp);                          # 1.57.6 (S3.1): the (CS,SS) guard on the frame the iretq loads — this tail never had it
-    # ⛔ 1.57.6 (S3-fix) — SPEC_CTRL FROM THE TARGET FRAME'S CPL, NOT A BLANKET IBRS=0. This tail used to clear IBRS
-    # unconditionally ("mirrors the SYSRET tail"), which was right only while `next` was always a ring-3 proc.
-    # Since S3.1 a READY proc may be kmain, a kthread, an idle or a syscall switched out mid-flight (a CS 0x08
-    # frame), and resuming kernel code with IBRS off is exactly what the timer tail's sched_spec_ctrl_for exists
-    # to prevent. Same helper, same point (after the (CS,SS) fix, so it reads the CS the iretq will load).
-    # Inert where ibrs_supported == 0 (both test substrates and archaemenid).
-    sched_spec_ctrl_for(fp);
-    kst_tail_hook();                                   # KSTACK_SELFTEST window widener (no-op twin)
-    kst_note_leave(yp);                                # KSTACK_SELFTEST: was yp's slot re-allocated under this CPU? (no-op twin)
-    sched_frame_iretq(fp, &proc_on_cpu + yp * 8);      # publishes on_cpu(yp) = -1 off this stack, then pops + iretq; never returns
-    return 0;
-}
-
-# ⭐ 1.57.6 (Path 2, S3.3) — pause#14 as dispatched from syscall_handler (ring-3 SYSCALLs only). The
-# KSTACK_SELFTEST probe hook runs first — in production its twin returns -1 ("not a probe") and this is
-# exactly the old body: the abandon-frame yield when something else is ready, else ksyscall(14)'s safe hlt
-# window. (S3.4 replaces the yield with the in-kernel one.)
-fn sys_pause(a1, a2, a3) {
-    var sp_r = kst_probe_hook(a1, a2, a3);
-    if (sp_r != (0 - 1)) { return sp_r; }
-    sys_sched_yield();
-    return ksyscall(14, a1, a2, a3);
-}
 
 # ⭐ 1.57.6 (Path 2, S3-fix) — THE LOUD HALF OF "EVERY RING-3 ENTRY IS PRECEDED BY kstack_install". Called first
 # thing in syscall_handler (ring-3 SYSCALLs only, IF=0, before anything else runs on the stack): this CPU's syscall
@@ -886,21 +1985,23 @@ fn sys_pause(a1, a2, a3) {
 # without this the syscall would run, and SYSRET, on another process's frames in silence. One latched line to klug
 # and COM1 (lock-free, never the console), denied by the production-path smokes (agnsh/exec/fork/spawn/kstack and
 # the run37 / agnsh-bg / multijob harnesses). Diagnostic only — it does not stop the syscall.
-# Cost: two loads and a compare — kce_c is the capped cpu index syscall_handler already read for ksyscall_a4 (a
-# first version read the LAPIC id again and cost +20% on getpid at -smp 4 under KVM, where each read is a VM exit).
-# Here, not in syscall_hw.cyr: it reads pcpu_curproc (proc.cyr, parsed later than syscall_hw.cyr).
+# Cost: two loads and a compare — kce_c is the capped cpu index syscall_handler already read (a first version read
+# the LAPIC id again and cost +20% on getpid at -smp 4 under KVM, where each read is a VM exit).
+# ⭐ 1.57.7 (S3.4): RETURNS THE CALLER'S PID (the pcpu_curproc value it loads anyway), or -1 when that value is out
+# of range — syscall_handler stores the per-process a4 with it (ksyscall_a4_store), so the entry still reads the
+# LAPIC exactly once. Here, in sched.cyr, kept beside the other switch-path asserts (sched_assert_oob below).
 var kstack_top_said = 0;
 fn kstack_check_entry(kce_c) {
     var kce_p = load64(&pcpu_curproc + kce_c * 8);
-    if (kce_p < 0) { return 0; }
-    if (kce_p >= 16) { return 0; }
-    if (load64(&pcpu_syscall_kstack_top + kce_c * 8) == proc_rsp0_top(kce_p)) { return 0; }
+    if (kce_p < 0) { return 0 - 1; }
+    if (kce_p >= 16) { return 0 - 1; }
+    if (load64(&pcpu_syscall_kstack_top + kce_c * 8) == proc_rsp0_top(kce_p)) { return kce_p; }
     if (kstack_top_said == 0) {
         kstack_top_said = 1;
         klug_append("syscall: kernel stack is not the caller's (a switch path missed kstack_install)", 79); klug_putc(10);
         serial_println("syscall: kernel stack is not the caller's (a switch path missed kstack_install)", 79);
     }
-    return 0;
+    return kce_p;
 }
 
 # ⭐ 1.57.6 (Path 2, S3.3) — LATCHED ASSERTS FOR THE TWO OUT-OF-BAND SWITCH PATHS. exec_and_wait enters ring 3
@@ -939,6 +2040,525 @@ fn sched_assert_oob(tag) {
     return 0;
 }
 
+# ═══════════════ 1.57.7 (Path 2, S3.4) — ktest cases for the wait/wake primitive (TEST=1 builds only) ═══════════════
+# sh_cmd_test (user/test.cyr) calls test_wq() after test_proc(), test_flock() after it (S3.5), and
+# test_wq_latches() LAST. kmain runs the suite at IF=1 after sched_active = 1 (-smp 1), so every case brackets its
+# arm..sleep|cancel with ONE kbd_irq_save/restore (R1) and asserts only after the restore.
+#ifdef TEST
+fn test_wq() {
+    serial_println("[wq]", 4);
+    var tw_me = proc_current_get();
+    test_assert(wq_can_block() == 1, "wq can block (kmain)", 20);
+    # T2 — arm publishes BLOCKED; cancel withdraws it with no reason and clears the key.
+    var t2_f = kbd_irq_save();
+    var t2_a = wq_arm(WK_TEST | 2, 0);
+    var t2_st6 = load64(&proc_table + tw_me * 176 + 8);
+    var t2_r = wq_cancel();
+    var t2_st2 = load64(&proc_table + tw_me * 176 + 8);
+    var t2_key = load64(&proc_wait_key + tw_me * 8);
+    kbd_irq_restore(t2_f);
+    test_assert_eq(t2_a, 0, "wq arm returns 0", 16);
+    test_assert_eq(t2_st6, 6, "wq armed state is 6", 19);
+    test_assert_eq(t2_r, 0, "wq cancel returns WR_NONE", 25);
+    test_assert_eq(t2_st2, 2, "wq cancel restores state 2", 26);
+    test_assert_eq(t2_key, 0, "wq cancel clears the key", 24);
+    # T3 — a wake that lands before the sleep: the BLOCK-intent guard honours it (no switch at all).
+    var t3_f = kbd_irq_save();
+    var t3_a = wq_arm(WK_TEST | 1, 0);
+    var t3_n = wq_wake(WK_TEST | 1);
+    var t3_sw0 = g_switch_ctr;
+    var t3_r = wq_sleep();
+    var t3_sw1 = g_switch_ctr;
+    kbd_irq_restore(t3_f);
+    test_assert_eq(t3_a, 0, "wq early-wake arm returns 0", 27);
+    test_assert_eq(t3_n, 1, "wq wake woke exactly one", 24);
+    test_assert_eq(t3_r, 1, "wq early-wake sleep returns WR_EVENT", 36);
+    test_assert_eq(t3_sw1 - t3_sw0, 0, "wq early wake did not switch", 28);
+    # T4 — a wake on ANOTHER key leaves the waiter blocked.
+    var t4_f = kbd_irq_save();
+    var t4_a = wq_arm(WK_TEST | 3, sched_clock_us() + 500000);
+    var t4_n = wq_wake(WK_TEST | 4);
+    var t4_st = load64(&proc_table + tw_me * 176 + 8);
+    var t4_r = wq_cancel();
+    kbd_irq_restore(t4_f);
+    test_assert_eq(t4_a, 0, "wq keyed arm returns 0", 22);
+    test_assert_eq(t4_n, 0, "wq wake of another key wakes none", 33);
+    test_assert_eq(t4_st, 6, "wq waiter still blocked after a foreign wake", 44);
+    test_assert_eq(t4_r, 0, "wq keyed cancel returns WR_NONE", 31);
+    # T5 — a real timed sleep: switched out, woken by wq_tick at the deadline.
+    var t5_f = kbd_irq_save();
+    var t5_t0 = sched_clock_us();
+    var t5_sw0 = g_switch_ctr;
+    var t5_a = wq_arm(WK_TEST | 5, t5_t0 + 30000);
+    var t5_r = wq_sleep();
+    var t5_dt = sched_clock_us() - t5_t0;
+    var t5_sw1 = g_switch_ctr;
+    var t5_nt = wq_ntimed;
+    kbd_irq_restore(t5_f);
+    test_assert_eq(t5_a, 0, "wq timed arm returns 0", 22);
+    test_assert_eq(t5_r, 2, "wq timed sleep returns WR_TIMEOUT", 33);
+    test_assert(t5_dt >= 30000, "wq timed sleep lasted >= 30 ms", 30);
+    test_assert(t5_dt < 200000, "wq timed sleep lasted < 200 ms", 30);
+    test_assert(t5_sw1 != t5_sw0, "wq timed sleep switched out", 27);
+    test_assert_eq(t5_nt, 0, "wq_ntimed back to 0", 19);
+    # T5b — TICK MODE (tsc_per_us == 0), measured in REAL time on the TSC: the +1 tick padding keeps ">= ms".
+    var t5b_nt0 = wq_ntimed;
+    var t5b_f = kbd_irq_save();
+    var t5b_sv = tsc_per_us;
+    tsc_per_us = 0;
+    var t5b_k0 = timer_ticks;
+    var t5b_c0 = rdtsc();
+    var t5b_dl = wq_deadline_after_us(30000);
+    var t5b_a = wq_arm(WK_TEST | 7, t5b_dl);
+    var t5b_r = wq_sleep();
+    var t5b_c1 = rdtsc();
+    var t5b_k1 = timer_ticks;
+    tsc_per_us = t5b_sv;                               # restored BEFORE IF comes back
+    kbd_irq_restore(t5b_f);
+    test_assert_eq(t5b_nt0, 0, "wq tick-mode starts with no timed waiter", 40);
+    test_assert_eq(t5b_a, 0, "wq tick-mode arm returns 0", 26);
+    test_assert_eq(t5b_r, 2, "wq tick-mode sleep returns WR_TIMEOUT", 37);
+    if (t5b_sv != 0) {
+        var t5b_us = (t5b_c1 - t5b_c0) / t5b_sv;
+        test_assert(t5b_us >= 30000, "wq tick-mode sleep >= 30 ms real time", 37);
+        test_assert(t5b_us < 200000, "wq tick-mode sleep < 200 ms real time", 37);
+    } else {
+        serial_println("  (TSC refused this boot: the real-time arm of T5b did not run)", 63);
+        test_assert(t5b_k1 - t5b_k0 >= 4, "wq tick-mode sleep >= 4 ticks", 29);
+    }
+    # T6 — the scheduler clock never goes backwards.
+    var t6_ok = 1;
+    var t6_prev = sched_clock_us();
+    var t6_i = 0;
+    while (t6_i < 1000) {
+        var t6_now = sched_clock_us();
+        if (t6_now < t6_prev) { t6_ok = 0; }
+        t6_prev = t6_now;
+        t6_i = t6_i + 1;
+    }
+    test_assert(t6_ok == 1, "sched_clock_us monotone over 1000 reads", 39);
+    # T6b — wq_interrupt ends a wait with WR_SIGNAL.
+    var t6b_f = kbd_irq_save();
+    var t6b_a = wq_arm(WK_TEST | 6, sched_clock_us() + 500000);
+    var t6b_i = wq_interrupt(tw_me);
+    var t6b_r = wq_sleep();
+    kbd_irq_restore(t6b_f);
+    test_assert_eq(t6b_a, 0, "wq interrupt arm returns 0", 26);
+    test_assert_eq(t6b_i, 1, "wq_interrupt found the waiter", 29);
+    test_assert_eq(t6b_r, 3, "wq interrupted sleep returns WR_SIGNAL", 38);
+    test_kbd();                                        # T8, T8b-T8f (S3.7)
+    test_keep_current();                               # T11 (S3.6) — before test_flock's kthread exists
+    return 0;
+}
+
+# T8, T8b-T8f (1.57.7 S3.7) — the keyboard wake and the cooked-line ownership (keyboard.cyr cells, syscall.cyr
+# kbd_line_*). I = this CPU's idle (a LIVE foreign owner: it is READY or running), K = kmain. Scancodes go in through
+# hid_kb_push, the production producer (it also wakes). Every case restores owner/waiters/nbline_pos and drains
+# kb_buf at its end (t8_reset); kbd_read_nonblock ends with a bare cli (written for syscall context), so every call
+# from here (kmain runs the suite at IF=1) is bracketed by kbd_irq_save/restore.
+fn t8_reset() {
+    kbd_line_owner = 0;
+    kbd_line_ep = 0;
+    kbd_line_waiters = 0;
+    nbline_pos = 0;
+    kb_tail = kb_head;
+    return 0;
+}
+fn t8_nb(buf, n) {
+    var tn_f = kbd_irq_save();
+    var tn_r = kbd_read_nonblock(buf, n);
+    kbd_irq_restore(tn_f);
+    return tn_r;
+}
+fn test_kbd() {
+    serial_println("[kbd]", 5);
+    var tk_k = proc_current_get();
+    var tk_i = sched_idle_pid_get();
+    var tk_buf[64];
+    t8_reset();
+    # T8 — hid_kb_push WAKES a WK_KBD waiter (mutation M-F1: the wake deleted -> WR_TIMEOUT).
+    var t8_f = kbd_irq_save();
+    var t8_a = wq_arm(WK_KBD, sched_clock_us() + 500000);
+    hid_kb_push(0x1E);
+    var t8_r = wq_sleep();
+    kbd_irq_restore(t8_f);
+    t8_reset();
+    test_assert_eq(t8_a, 0, "T8 kbd arm returns 0", 20);
+    test_assert_eq(t8_r, 1, "T8 hid_kb_push wakes the reader (WR_EVENT)", 42);
+    # T8b — the NB reader answers -2 WITHOUT DRAINING while another live process owns the line (M-F3).
+    kbd_line_owner = tk_i + 1;
+    kbd_line_ep = proc_epoch_get(tk_i);
+    hid_kb_push(0x1E);
+    var t8b_tail0 = kb_tail;
+    var t8b_r1 = t8_nb(&tk_buf, 64);
+    var t8b_tail1 = kb_tail;
+    kbd_line_owner = 0;
+    var t8b_r2 = t8_nb(&tk_buf, 64);
+    var t8b_pos = nbline_pos;
+    t8_reset();
+    test_assert_eq(t8b_r1, 0 - 2, "T8b NB read under a foreign owner is -2", 39);
+    test_assert_eq(t8b_tail1, t8b_tail0, "T8b NB read under a foreign owner drains nothing", 48);
+    test_assert_eq(t8b_r2, 0 - 3, "T8b NB read of a free line accumulates (-3)", 43);
+    test_assert_eq(t8b_pos, 1, "T8b NB accumulator holds the byte", 33);
+    # T8c — the death release gives the line back (M-F5).
+    kbd_line_owner = tk_i + 1;
+    kbd_line_ep = proc_epoch_get(tk_i);
+    kbd_line_release_pid(tk_i);
+    var t8c_o = kbd_line_owner;
+    t8_reset();
+    test_assert_eq(t8c_o, 0, "T8c kbd_line_release_pid frees the line", 39);
+    # T8d — a LIVE foreign owner: acquire waits until its deadline (-2), and leaves the owner and waiters alone (M-F4).
+    kbd_line_owner = tk_i + 1;
+    kbd_line_ep = proc_epoch_get(tk_i);
+    var t8d_t0 = sched_clock_us();
+    var t8d_r = kbd_line_acquire(tk_k, t8d_t0 + 30000);
+    var t8d_dt = sched_clock_us() - t8d_t0;
+    var t8d_o = kbd_line_owner;
+    var t8d_w = kbd_line_waiters;
+    t8_reset();
+    test_assert_eq(t8d_r, 0 - 2, "T8d acquire under a live owner times out (-2)", 45);
+    test_assert(t8d_dt >= 30000, "T8d acquire waited >= 30 ms", 27);
+    test_assert_eq(t8d_o, tk_i + 1, "T8d the live owner kept the line", 32);
+    test_assert_eq(t8d_w, 0, "T8d no waiter left counted", 26);
+    # T8e — a DEAD owner (stale epoch; a collapsed slot) is reclaimed at once (M-F7: liveness ignoring the epoch).
+    kbd_line_owner = tk_i + 1;
+    kbd_line_ep = proc_epoch_get(tk_i) + 1;
+    var t8e_t0 = sched_clock_us();
+    var t8e_r = kbd_line_acquire(tk_k, t8e_t0 + 30000);
+    var t8e_dt = sched_clock_us() - t8e_t0;
+    var t8e_o = kbd_line_owner;
+    kbd_line_release(tk_k);
+    var t8e_o2 = kbd_line_owner;
+    t8_reset();
+    test_assert_eq(t8e_r, 0, "T8e acquire reclaims a stale-epoch owner", 40);
+    test_assert(t8e_dt < 5000, "T8e reclaim took < 5 ms", 23);
+    test_assert_eq(t8e_o, tk_k + 1, "T8e the reclaimer owns the line", 31);
+    test_assert_eq(t8e_o2, 0, "T8e release frees it", 20);
+    if (proc_count < 16) {
+        kbd_line_owner = proc_count + 1;
+        kbd_line_ep = 0;
+        var t8e2_t0 = sched_clock_us();
+        var t8e2_r = kbd_line_acquire(tk_k, t8e2_t0 + 30000);
+        var t8e2_dt = sched_clock_us() - t8e2_t0;
+        kbd_line_release(tk_k);
+        t8_reset();
+        test_assert_eq(t8e2_r, 0, "T8e acquire reclaims a collapsed-slot owner", 43);
+        test_assert(t8e2_dt < 5000, "T8e collapsed-slot reclaim took < 5 ms", 38);
+    }
+    # T8f — NB-OWN: a partial NB line keeps the line (sticky against the same pid's release) until its Enter (M-F6).
+    hid_kb_push(0x23);                                 # h
+    hid_kb_push(0x17);                                 # i
+    var t8f_r1 = t8_nb(&tk_buf, 64);
+    var t8f_pos = nbline_pos;
+    var t8f_o1 = kbd_line_owner;
+    var t8f_t1 = kbd_line_try_take(tk_i);
+    kbd_line_release(tk_k);
+    var t8f_o2 = kbd_line_owner;
+    hid_kb_push(0x1C);                                 # Enter
+    var t8f_r2 = t8_nb(&tk_buf, 64);
+    var t8f_line = 0;
+    if (load8(&tk_buf) == 104) { if (load8(&tk_buf + 1) == 105) { if (load8(&tk_buf + 2) == 10) { t8f_line = 1; } } }
+    var t8f_o3 = kbd_line_owner;
+    var t8f_t2 = kbd_line_try_take(tk_i);
+    t8_reset();
+    test_assert_eq(t8f_r1, 0 - 3, "T8f partial NB line is -3", 25);
+    test_assert_eq(t8f_pos, 2, "T8f NB accumulator holds 2", 26);
+    test_assert_eq(t8f_o1, tk_k + 1, "T8f the NB reader owns the line", 31);
+    test_assert_eq(t8f_t1, 0, "T8f another reader cannot take it", 33);
+    test_assert_eq(t8f_o2, tk_k + 1, "T8f a release during the partial line is sticky", 47);
+    test_assert_eq(t8f_r2, 3, "T8f Enter completes the NB line", 31);
+    test_assert(t8f_line == 1, "T8f the NB line is hi LF", 24);
+    test_assert_eq(t8f_o3, 0, "T8f the completed line released the line", 40);
+    test_assert_eq(t8f_t2, 1, "T8f another reader can take it now", 34);
+    return 0;
+}
+
+# T11 (1.57.7 S3.6, PLAN E2) — KEEP-CURRENT, deterministic: IF=0 and sched_lock held, so nothing moves under the two
+# sched_next() calls. Precondition: the only READY (state 1) proc with on_cpu == -1 is this CPU's idle — a stray
+# READY proc would be picked first and the case would prove nothing, so it FAILS naming the pid (fix the case order,
+# never skip). With kmain (K) RUNNING, sched_next() must return K itself; with K's state published as 6 (a leaving
+# proc), it must return the idle (I). Mutation M-D1 (the keep-current block deleted) -> the first assert returns I.
+fn test_keep_current() {
+    serial_println("[keep-current]", 14);
+    var kt_me = proc_current_get();
+    var kt_idle = sched_idle_pid_get();
+    var kt_f = kbd_irq_save();
+    sched_spin_lock();
+    var kt_stray = 0 - 1;
+    var kt_i = 0;
+    while (kt_i < proc_count) {
+        if (kt_i != kt_idle) {
+            if (load64(&proc_table + kt_i * 176 + 8) == 1) {
+                if (on_cpu_get(kt_i) == (0 - 1)) { if (kt_stray == (0 - 1)) { kt_stray = kt_i; } }
+            }
+        }
+        kt_i = kt_i + 1;
+    }
+    var kt_n1 = sched_next();
+    store64(&proc_table + kt_me * 176 + 8, 6);
+    var kt_n2 = sched_next();
+    store64(&proc_table + kt_me * 176 + 8, 2);
+    sched_spin_unlock();
+    kbd_irq_restore(kt_f);
+    if (kt_stray != (0 - 1)) {
+        serial_print("  T11 precondition pid=", 23); kfmt_int(kt_stray); serial_println("", 0);
+    }
+    test_assert_eq(kt_stray, 0 - 1, "T11 precondition: only the idle is READY", 40);
+    test_assert(kt_idle >= 0, "T11 this CPU has an idle", 24);
+    test_assert_eq(kt_n1, kt_me, "T11 keep-current keeps a RUNNING current", 40);
+    test_assert_eq(kt_n2, kt_idle, "T11 a leaving (state 6) current is never kept", 45);
+    return 0;
+}
+
+# T7 + T9 (S3.5) — the flock table (vfs.cyr) with fake pids and inodes. T7: every release path WAKES the inode's
+# waiters (kmain arms WK_FLOCK|ino with a 500 ms backstop, a fake pid's release runs, the sleep must say WR_EVENT —
+# a missing wake shows as WR_TIMEOUT, never a hang). T9: the table rules, including 1.57.7's codes.
+fn test_flock_wake(ino, op_kind) {
+    var tf_f = kbd_irq_save();
+    var tf_a = wq_arm(WK_FLOCK | ino, sched_clock_us() + 500000);
+    if (op_kind == 1) { flock_try(ino, 12, 8, 0); }                 # UN
+    if (op_kind == 2) { flock_try(ino, 12, 1, 0); }                 # EX -> SH downgrade
+    if (op_kind == 3) { flock_release_inode(ino, 12); }             # vfs_close's release
+    if (op_kind == 4) { flock_release_pid(12); }                    # exit's release
+    if (op_kind == 5) { flock_try(ino, 12, 2, 1); }                 # a BLOCKING conversion drops pid 12's SH
+    var tf_r = wq_sleep();
+    kbd_irq_restore(tf_f);
+    if (tf_a != 0) { return 0 - 1; }
+    return tf_r;
+}
+# T9b's kthread (S3c fix pass, review A7): a REMOTE RETIRE that lands between the #59 arm's wq_can_block and its
+# wq_arm. flock_wait is entered with fw_blk = 1 (as the arm computed it while the caller was alive) and state 0
+# (the retire), IF=0 as SFMASK gives the arm. Its EX is contended (fake pid 12 holds it), so wq_arm runs UNDER
+# flock_lock, sees state 0 and returns 2. A fixed kernel leaves through wq_exit_if_retired -> sched_exit_tail and
+# never comes back here; an unfixed one returns -1 — the SYSRET of a dead process to ring 3 — and sets the flag.
+var t9b_entered = 0;
+var t9b_returned = 0;
+fn t9b_thread() {
+    var tk_me = proc_current_get();
+    t9b_entered = 1;
+    var tk_f = kbd_irq_save();
+    proc_set_state(tk_me, 0);
+    flock_wait(0x7F0301, tk_me, 2, 1);
+    t9b_returned = 1;
+    kbd_irq_restore(tk_f);
+    sched_exit_tail();
+    return 0;
+}
+fn test_flock() {
+    serial_println("[flock]", 7);
+    # T7 — five wakes
+    flock_try(0x7F0101, 12, 2, 0);
+    test_assert_eq(test_flock_wake(0x7F0101, 1), 1, "flock UN wakes the inode", 24);
+    flock_try(0x7F0102, 12, 2, 0);
+    test_assert_eq(test_flock_wake(0x7F0102, 2), 1, "flock EX->SH downgrade wakes", 28);
+    flock_release_pid(12);
+    flock_try(0x7F0103, 12, 2, 0);
+    test_assert_eq(test_flock_wake(0x7F0103, 3), 1, "flock_release_inode wakes", 25);
+    flock_try(0x7F0104, 12, 2, 0);
+    test_assert_eq(test_flock_wake(0x7F0104, 4), 1, "flock_release_pid wakes", 23);
+    flock_try(0x7F0105, 12, 1, 0);
+    flock_try(0x7F0105, 13, 1, 0);
+    test_assert_eq(test_flock_wake(0x7F0105, 5), 1, "flock blocking conversion drop wakes", 36);
+    flock_release_pid(12);
+    flock_release_pid(13);
+    # T9 — the table rules (0 OK · 1 CONFLICT · 2 FULL · 3 INVALID)
+    test_assert_eq(flock_try(100, 2, 2, 0), 0, "flock pid2 EX ino100", 20);
+    test_assert_eq(flock_try(100, 3, 6, 0), 1, "flock pid3 EX|NB conflicts", 26);
+    test_assert_eq(flock_try(100, 3, 1, 0), 1, "flock pid3 SH conflicts with EX", 31);
+    test_assert_eq(flock_try(100, 2, 8, 0), 0, "flock pid2 UN", 13);
+    test_assert_eq(flock_try(100, 3, 2, 0), 0, "flock pid3 EX after UN", 22);
+    test_assert_eq(flock_try(200, 4, 1, 0), 0, "flock pid4 SH ino200", 20);
+    test_assert_eq(flock_try(200, 5, 1, 0), 0, "flock pid5 SH coexists", 22);
+    test_assert_eq(flock_try(200, 6, 2, 0), 1, "flock pid6 EX conflicts with SH", 31);
+    # an NB conversion KEEPS the old lock
+    test_assert_eq(flock_try(300, 2, 1, 0), 0, "flock ino300 pid2 SH", 20);
+    test_assert_eq(flock_try(300, 3, 1, 0), 0, "flock ino300 pid3 SH", 20);
+    test_assert_eq(flock_try(300, 2, 2, 0), 1, "flock NB conversion conflicts", 29);
+    test_assert_eq(flock_try(300, 3, 8, 0), 0, "flock ino300 pid3 UN", 20);
+    test_assert_eq(flock_try(300, 4, 6, 0), 1, "flock NB conversion kept its SH", 31);
+    # a BLOCKING conversion DROPS the old lock
+    test_assert_eq(flock_try(400, 2, 1, 0), 0, "flock ino400 pid2 SH", 20);
+    test_assert_eq(flock_try(400, 3, 1, 0), 0, "flock ino400 pid3 SH", 20);
+    test_assert_eq(flock_try(400, 2, 2, 1), 1, "flock blocking conversion conflicts", 35);
+    test_assert_eq(flock_try(400, 3, 8, 0), 0, "flock ino400 pid3 UN", 20);
+    test_assert_eq(flock_try(400, 5, 2, 0), 0, "flock blocking conversion dropped its SH", 40);
+    var tl_p = 2;
+    while (tl_p < 7) { flock_release_pid(tl_p); tl_p = tl_p + 1; }
+    # FULL: 16 inodes by 16 pids, the 17th is FULL (and FULL with drop_own too: the table never waits)
+    var tl_ok = 1;
+    var tl_i = 0;
+    while (tl_i < 16) { if (flock_try(1000 + tl_i, 30 + tl_i, 2, 0) != 0) { tl_ok = 0; } tl_i = tl_i + 1; }
+    test_assert(tl_ok == 1, "flock 16 slots taken", 20);
+    test_assert_eq(flock_try(1016, 46, 2, 0), 2, "flock 17th is FULL", 18);
+    test_assert_eq(flock_try(1016, 46, 2, 1), 2, "flock 17th blocking is FULL", 27);
+    tl_i = 0;
+    while (tl_i < 17) { flock_release_pid(30 + tl_i); tl_i = tl_i + 1; }
+    test_assert_eq(flock_try(500, 2, 0, 0), 3, "flock op 0 is INVALID", 21);
+    test_assert_eq(flock_try(500, 2, 4, 0), 3, "flock op NB alone is INVALID", 28);
+    test_assert_eq(flock_try(600, 2, 2, 0), 0, "flock ino600 pid2 EX", 20);
+    test_assert_eq(flock_try(600, 2, 1, 0), 0, "flock EX->SH downgrade OK", 25);
+    flock_release_pid(2);
+    var tl_empty = 1;
+    tl_i = 0;
+    while (tl_i < 16) { if (load64(&flock_inode + tl_i * 8) != 0) { tl_empty = 0; } tl_i = tl_i + 1; }
+    test_assert(tl_empty == 1, "flock table empty after the releases", 36);
+    # T9b — a retired caller whose wq_arm returned 2 under flock_lock LEAVES once the lock is dropped (never
+    # returns -1 to ring 3 as a dead process). kmain yields until the kthread is state 0 and off every CPU.
+    flock_try(0x7F0301, 12, 2, 0);
+    t9b_entered = 0;
+    t9b_returned = 0;
+    var t9b_pid = kthread_create(&t9b_thread);
+    var t9b_gone = 0;
+    if (t9b_pid >= 0) {
+        var t9b_t0 = sched_clock_us();
+        while (sched_clock_us() - t9b_t0 < 2000000) {
+            if (t9b_entered == 1) {
+                if (proc_get_state(t9b_pid) == 0) {
+                    if (load64(&proc_on_cpu + t9b_pid * 8) == (0 - 1)) { t9b_gone = 1; break; }
+                }
+            }
+            sched_yield_kernel();
+        }
+    }
+    flock_release_pid(12);
+    test_assert(t9b_pid >= 0, "flock T9b kthread created", 25);
+    test_assert(t9b_gone == 1, "flock T9b retired caller left its CPU", 37);
+    test_assert_eq(t9b_returned, 0, "flock retired caller never returns to ring 3", 44);
+    return 0;
+}
+
+# T10 — runs LAST: no latched wq/scheduler invariant line fired during the whole suite (they print once and change
+# no exit code, and ktest scores only TOTAL:, so this row is what makes them count here).
+# T12 (1.57.7 S3b) — proc_slot_reusable, the INV-FG-2 live-waiter clause, and proc_alloc_slot's fgwait scrub. Runs as
+# kmain at -smp 1 under kbd_irq_save + preempt_disable; the synthetic rows sit at indices n = proc_count .. n+3 (never
+# rows 0..n-1) with proc_count bumped for the checks and restored, and every cell a row uses (state, ppid, on_cpu,
+# fgwait — kmain's own fgwait cell for row B) saved and restored. A = dead, ppid 0 (reaped); B = dead, ppid 0,
+# fgwait[0] = B+1 (kmain's foreground child: KEPT); C = dead, ppid P = n+3 at state 3 (a live parent; never state 1 —
+# no CPU may iretq into it); then C re-parented to A (dead) = an orphan (reusable), and again with fgwait[A] = C+1 (a
+# DEAD waiter's stale cell must not pin: DEP-2). Mutations: M5 (no fgwait clause) -> B; M5b (no liveness test) -> D2;
+# M10 (no scrub in proc_alloc_slot) -> the scrub row.
+var t12_save[16];            # module scope = 16 u64: rows n..n+3 x (state, ppid, on_cpu, fgwait)
+var t12_seed[17];            # the scrub row's saved fgwait cells (index 16 = the seeded count)
+fn t12_row_save(r, k) {
+    store64(&t12_save + k * 32, load64(&proc_table + r * 176 + 8));
+    store64(&t12_save + k * 32 + 8, load64(&proc_ppid + r * 8));
+    store64(&t12_save + k * 32 + 16, load64(&proc_on_cpu + r * 8));
+    store64(&t12_save + k * 32 + 24, load64(&proc_fgwait + r * 8));
+    store64(&proc_on_cpu + r * 8, 0 - 1);
+    store64(&proc_fgwait + r * 8, 0);
+    return 0;
+}
+fn t12_row_restore(r, k) {
+    store64(&proc_table + r * 176 + 8, load64(&t12_save + k * 32));
+    store64(&proc_ppid + r * 8, load64(&t12_save + k * 32 + 8));
+    store64(&proc_on_cpu + r * 8, load64(&t12_save + k * 32 + 16));
+    store64(&proc_fgwait + r * 8, load64(&t12_save + k * 32 + 24));
+    return 0;
+}
+fn test_fgwait() {
+    serial_println("[fgwait T12]", 12);
+    var t12_f = kbd_irq_save();
+    preempt_disable();
+    var t12_n = proc_count;
+    var t12_ra = 0 - 1;
+    var t12_rb = 0 - 1;
+    var t12_rc = 0 - 1;
+    var t12_rd1 = 0 - 1;
+    var t12_rd2 = 0 - 1;
+    var t12_void = 0;
+    if (t12_n + 4 > 16) { t12_void = 1; }
+    if (t12_void == 0) {
+        var t12_fw0 = load64(&proc_fgwait);                 # kmain's own cell (row B uses it)
+        proctab_spin_lock();
+        var t12_k = 0;
+        while (t12_k < 4) { t12_row_save(t12_n + t12_k, t12_k); t12_k = t12_k + 1; }
+        proc_count = t12_n + 4;
+        var t12_A = t12_n;
+        var t12_B = t12_n + 1;
+        var t12_C = t12_n + 2;
+        var t12_P = t12_n + 3;
+        store64(&proc_table + t12_A * 176 + 8, 0); store64(&proc_ppid + t12_A * 8, 0);
+        store64(&proc_table + t12_B * 176 + 8, 0); store64(&proc_ppid + t12_B * 8, 0);
+        store64(&proc_table + t12_C * 176 + 8, 0); store64(&proc_ppid + t12_C * 8, t12_P);
+        store64(&proc_table + t12_P * 176 + 8, 3); store64(&proc_ppid + t12_P * 8, 0);
+        store64(&proc_fgwait, 0);
+        t12_ra = proc_slot_reusable(t12_A);                 # A: reaped
+        store64(&proc_fgwait, t12_B + 1);
+        t12_rb = proc_slot_reusable(t12_B);                 # B: kmain's foreground child
+        store64(&proc_fgwait, t12_fw0);
+        t12_rc = proc_slot_reusable(t12_C);                 # C: unreaped child of a live (state 3) parent
+        store64(&proc_ppid + t12_C * 8, t12_A);             # D1: its parent (A) is dead -> an orphan
+        t12_rd1 = proc_slot_reusable(t12_C);
+        store64(&proc_fgwait + t12_A * 8, t12_C + 1);       # D2: the DEAD waiter A's stale cell names C
+        t12_rd2 = proc_slot_reusable(t12_C);
+        t12_k = 0;
+        while (t12_k < 4) { t12_row_restore(t12_n + t12_k, t12_k); t12_k = t12_k + 1; }
+        proc_count = t12_n;
+        proctab_spin_unlock();
+        store64(&proc_fgwait, t12_fw0);
+    }
+    preempt_enable();
+    kbd_irq_restore(t12_f);
+    if (t12_void == 1) { serial_println("T12 VOID -- process table too full", 34); }
+    if (t12_void == 0) {
+        test_assert_eq(t12_ra, 1, "T12 reaped dead slot is reusable", 32);
+        test_assert_eq(t12_rb, 0, "T12 kmain fg child slot kept", 28);
+        test_assert_eq(t12_rc, 0, "T12 unreaped child of a live parent kept", 40);
+        test_assert_eq(t12_rd1, 1, "T12 orphan slot is reusable", 27);
+        test_assert_eq(t12_rd2, 1, "T12 dead waiter stale cell does not pin", 39);
+    }
+    # The scrub row: seed fgwait = 7 into EVERY slot the allocator could hand out (each reusable dead slot below
+    # proc_count, plus index proc_count), allocate, and the slot it returned must read 0.
+    if (proc_count >= 16) { serial_println("T12 scrub VOID -- table full", 28); return 0; }
+    var s12_f = kbd_irq_save();
+    preempt_disable();
+    proctab_spin_lock();
+    var s12_i = 0;
+    while (s12_i <= proc_count) {
+        store64(&t12_seed + s12_i * 8, load64(&proc_fgwait + s12_i * 8));
+        var s12_cand = 0;
+        if (s12_i == proc_count) { s12_cand = 1; }
+        if (s12_i < proc_count) { if (proc_slot_reusable(s12_i) == 1) { s12_cand = 1; } }
+        if (s12_cand == 1) { store64(&proc_fgwait + s12_i * 8, 7); }
+        s12_i = s12_i + 1;
+    }
+    var s12_top = proc_count;
+    proctab_spin_unlock();
+    var s12_idx = proc_alloc_slot();
+    var s12_v = 0 - 9;
+    if (s12_idx >= 0) {
+        s12_v = proc_fgwait_get(s12_idx);
+        store64(&proc_table + s12_idx * 176 + 160, 0x1000);
+        store64(&proc_ppid + s12_idx * 8, 0);
+        store64(&proc_table + s12_idx * 176 + 8, 0);
+        proctab_spin_lock();
+        if (s12_idx == proc_count - 1) { proc_count = proc_count - 1; }
+        proctab_spin_unlock();
+    }
+    s12_i = 0;
+    while (s12_i <= s12_top) {
+        if (s12_i != s12_idx) { store64(&proc_fgwait + s12_i * 8, load64(&t12_seed + s12_i * 8)); }
+        s12_i = s12_i + 1;
+    }
+    preempt_enable();
+    kbd_irq_restore(s12_f);
+    test_assert_eq(s12_v, 0, "T12 alloc scrubs the fgwait cell", 32);
+    return 0;
+}
+
+fn test_wq_latches() {
+    serial_println("[wq latches]", 12);
+    var tl_q = 1;
+    if (wq_if1_said != 0) { tl_q = 0; }
+    if (wq_state_said != 0) { tl_q = 0; }
+    if (wq_invrun_said != 0) { tl_q = 0; }
+    if (wq_resume_said != 0) { tl_q = 0; }
+    if (sched_refused_said != 0) { tl_q = 0; }
+    test_assert(tl_q == 1, "wq latches quiet", 16);
+    return 0;
+}
+#endif
+
 # ═══════════════ 1.57.6 (Path 2, S3.3) — KSTACK_SELFTEST: the scheduler-side hooks ═══════════════
 #
 # The kernel half of scripts/smoke/kstack-smoke.sh (the ring-3 payloads and the phases are in main.cyr's
@@ -948,7 +2568,7 @@ fn sched_assert_oob(tag) {
 #ifdef KSTACK_SELFTEST
 var KST_MAGIC = 0x4B53544B50524F42;   # "BORPKTSK" — a1 of a probe pause#14; anything else is an ordinary pause
 var kst_probes = 0;          # mode-1 windows opened
-var kst_window_refused = 0;  # mode-1 calls kst_window_ok refused (a probe that could not open a window)
+var kst_window_refused = 0;  # mode-1 calls wq_can_block refused (a probe that could not open a window)
 var kst_bad = 0;             # a probe-local check failed after a window (its kernel stack moved or was smashed)
 var kst_cpl0_out = 0;        # probe procs switched out with a CPL0 (in-kernel) frame — the new capability
 var kst_migrations = 0;      # a mode-1 window ended on a different CPU than it began
@@ -993,29 +2613,37 @@ var kst_holding_pid = 0 - 1;
 var kst_resume_overlap = 0;
 var kst_fence_contested = 0;
 var kst_hold_smashed = 0;
+# ⭐ 1.57.7 (Path 2, S3.4) — THE WAIT/WAKE PHASES (main.cyr kst_phase_blockwake / _pingpong / _pause / _isrclac):
+#   mode 2  BLOCK/WAKE: 3 x wq_arm(WK_TEST|me, now + 2 ms) + wq_sleep per probe syscall, each must time out; the
+#           probe's per-PROCESS a4 (set before the waits) and two salt-derived locals must survive every switch.
+#   mode 3  PING-PONG: two probes hand a turn back and forth through wq_wake; a lost wakeup shows as a 5 s
+#           watchdog expiry (kst_pp_wd).
+#   mode 5  PAUSE WINDOW: 10 x ksyscall(14) with kst_in_pause[me] set — the #14 arm's designated CPL0 preempt point
+#           must get the proc switched out (kst_pause_out) at least 5 times.
+var kst_blk_n = 0;           # mode-2 waits that returned WR_TIMEOUT
+var kst_blk_bad = 0;         # mode-2 checks that failed (a wait's reason, a local, or the per-process a4)
+var kst_blk_refused = 0;     # mode-2 syscalls wq_can_block refused
+var kst_blk_migr = 0;        # mode-2 syscalls that ended on another CPU than they began
+var kst_pp_pid[2];           # the ping-pong pair (main.cyr sets them before the probes are made READY)
+var kst_pp_turn = 0;         # whose turn: 0 = kst_pp_pid[0], 1 = kst_pp_pid[1]
+var kst_pp_rounds = 0;
+var kst_pp_wd = 0;           # watchdog expiries: a turn that was passed and never woke its owner
+var kst_pp_bad = 0;
+var kst_pp_refused = 0;
+var kst_in_pause[16];        # 1 while that pid is inside its mode-5 ksyscall(14) loop
+var kst_pause_out = 0;       # switch-outs of a pid with kst_in_pause set (kst_note_switch_out)
+var kst_pause_calls = 0;
+var kst_pause_refused = 0;
+var kst_ac_samples = 0;      # timer ISR bodies that interrupted a frame with RFLAGS.AC set
+var kst_ac_bad = 0;          # ... and ran with AC still set (no clac at the stub)
+var kst_fallback_wq = 0;     # mode-4 parks followed by a real wq wait that returned WR_TIMEOUT
 
 # Microseconds on the calibrated TSC, or the BSP tick clock when calibration was refused (0 is permanent).
-fn kst_now_us() {
-    if (tsc_per_us != 0) { return (rdtsc() - tsc_base) / tsc_per_us; }
-    return timer_ticks * 10000;
-}
+# 1.57.7 (S3.4): the production clock is sched_clock_us now; this is its KSTACK-local name.
+fn kst_now_us() { return sched_clock_us(); }
 
-# The S3.3 stand-in for S3.4's wq_can_block(): may THIS context open a CPL0 preemption window? The same
-# predicate list — scheduler live, nothing held (preempt_count 0), a real proc (not this CPU's idle)
-# that is RUNNING here (INV-RUN), on its own CR3, and not the child of an in-flight execwait#37.
-fn kst_window_ok() {
-    if (sched_active != 1) { return 0; }
-    if (preempt_count_get() != 0) { return 0; }
-    var cur = proc_current_get();
-    if (cur < 0) { return 0; }
-    if (cur >= proc_count) { return 0; }
-    if (cur == sched_idle_pid_get()) { return 0; }
-    if (load64(&proc_table + cur * 176 + 8) != 2) { return 0; }
-    if (load64(&proc_on_cpu + cur * 8) != pcpu_cpu()) { return 0; }
-    if (sched_live_cr3_ok(cur) == 0) { return 0; }
-    if (pcpu_ew37_busy_get() != 0) { if (cur == exec_resume_pid_get()) { return 0; } }   # INTERIM (S3b-F2)
-    return 1;
-}
+# (1.57.7 S3.4: kst_window_ok — S3.3's stand-in for "may this context open a CPL0 window?" — is gone; the probes ask
+# the production predicate, wq_can_block, which has the same list.)
 
 # The probe itself, reached from a ring-3 pause#14 whose a1 is KST_MAGIC (a2 = mode, a3 = the payload's
 # salt). Returns KST_MAGIC ^ 0x3C3C ^ salt, which the payload checks — so a SYSRET that landed in the
@@ -1032,7 +2660,7 @@ fn kst_probe_hook(a1, a2, a3) {
     if (a1 != KST_MAGIC) { return 0 - 1; }
     var kp_res = a1 ^ 0x3C3C ^ a3;
     if (a2 == 1) {
-        if (kst_window_ok() == 0) { kst_window_refused = kst_window_refused + 1; return kp_res; }
+        if (wq_can_block() == 0) { kst_window_refused = kst_window_refused + 1; return kp_res; }
         var kp_l1 = a3 * 7 + 0x5A5A;
         var kp_l2 = a3 ^ 0x1234567;
         var kp_c0 = pcpu_cpu();
@@ -1049,7 +2677,7 @@ fn kst_probe_hook(a1, a2, a3) {
         return kp_res;
     }
     if (a2 == 4) {
-        if (kst_window_ok() == 0) { kst_park_refused = kst_park_refused + 1; return kp_res; }
+        if (wq_can_block() == 0) { kst_park_refused = kst_park_refused + 1; return kp_res; }
         var kp_me = proc_current_get();
         sched_spin_lock();                             # IF=0 here (syscall), so the leaf lock is safe (INV-5)
         proc_set_state(kp_me, 6);
@@ -1062,6 +2690,79 @@ fn kst_probe_hook(a1, a2, a3) {
         }
         asm { cli; }
         kst_parks = kst_parks + 1;
+        # 1.57.7 (S3.4): and one REAL wait in the production primitive, by this out-of-band exec_and_wait child while
+        # kmain is parked with a stale slot — the coverage the plan's mode-2 fallback carried (S3c D-11).
+        var kp_wa = wq_arm(WK_TEST | kp_me, sched_clock_us() + 2000);
+        if (kp_wa == 0) {
+            if (wq_sleep() == 2) { kst_fallback_wq = kst_fallback_wq + 1; }   # WR_TIMEOUT
+        }
+        return kp_res;
+    }
+    if (a2 == 2) {
+        if (wq_can_block() == 0) { kst_blk_refused = kst_blk_refused + 1; return kp_res; }
+        var kb_me = proc_current_get();
+        ksyscall_a4_set(a3 ^ 0xA4A4);                  # per-PROCESS: another probe's syscall must not overwrite it
+        var kb_l1 = a3 * 7 + 0x5A5A;
+        var kb_l2 = a3 ^ 0x1234567;
+        var kb_c0 = pcpu_cpu();
+        var kb_k = 0;
+        while (kb_k < 3) {
+            var kb_a = wq_arm(WK_TEST | kb_me, sched_clock_us() + 2000);
+            if (kb_a == 0) {
+                if (wq_sleep() == 2) { kst_blk_n = kst_blk_n + 1; } else { kst_blk_bad = kst_blk_bad + 1; }
+            } else {
+                kst_blk_bad = kst_blk_bad + 1;
+            }
+            kb_k = kb_k + 1;
+        }
+        if (pcpu_cpu() != kb_c0) { kst_blk_migr = kst_blk_migr + 1; }
+        if (kb_l1 != a3 * 7 + 0x5A5A) { kst_blk_bad = kst_blk_bad + 1; }
+        if (kb_l2 != (a3 ^ 0x1234567)) { kst_blk_bad = kst_blk_bad + 1; }
+        if (ksyscall_a4_get() != (a3 ^ 0xA4A4)) { kst_blk_bad = kst_blk_bad + 1; }
+        return kp_res;
+    }
+    if (a2 == 3) {
+        if (wq_can_block() == 0) { kst_pp_refused = kst_pp_refused + 1; return kp_res; }
+        var kq_me = proc_current_get();
+        var kq_idx = 0;
+        if (kq_me == load64(&kst_pp_pid + 8)) { kq_idx = 1; }
+        var kq_peer = load64(&kst_pp_pid + (1 - kq_idx) * 8);
+        var kq_w = 1;
+        while (kq_w == 1) {                            # the canonical wait: cond = "my turn"
+            if (kst_pp_turn == kq_idx) { kq_w = 0; }
+            else {
+                # A PREEMPTIBLE GAP between the check and the arm (IF=1 for 12 ms, over a tick): the peer runs in it —
+                # at -smp 1 because the tick switches this syscall out, at -smp 4 on another CPU — and passes the turn
+                # while we are NOT armed. Only the re-check after the arm can see that pass; without it (M-C6) the
+                # wake is lost and only the 5 s watchdog ends the wait. Deterministic, not a race to be lucky in.
+                var kq_t0 = kst_now_us();
+                asm { sti; }                           # contract: IF=1 — the gap opens (no GPR touched)
+                while (kst_now_us() - kq_t0 < 12000) {
+                    asm { 0xF3; 0x90; }                # pause (no GPR touched)
+                }
+                asm { cli; }                           # contract: IF=0 — the gap closes
+                var kq_a = wq_arm(WK_TEST | 0x100 | kq_me, sched_clock_us() + 5000000);
+                if (kq_a != 0) { kst_pp_bad = kst_pp_bad + 1; kq_w = 0; }
+                else {
+                    if (kst_pp_turn == kq_idx) { wq_cancel(); kq_w = 0; }   # the re-check AFTER the arm (M-C6 moves it)
+                    else {
+                        if (wq_sleep() == 2) { kst_pp_wd = kst_pp_wd + 1; }  # WR_TIMEOUT: a passed turn never woke us
+                    }
+                }
+            }
+        }
+        kst_pp_rounds = kst_pp_rounds + 1;
+        kst_pp_turn = 1 - kq_idx;                      # the condition is made true BEFORE the wake
+        wq_wake(WK_TEST | 0x100 | kq_peer);
+        return kp_res;
+    }
+    if (a2 == 5) {
+        if (wq_can_block() == 0) { kst_pause_refused = kst_pause_refused + 1; return kp_res; }
+        var kz_me = proc_current_get();
+        store64(&kst_in_pause + kz_me * 8, 1);
+        var kz_k = 0;
+        while (kz_k < 10) { ksyscall(14, 0, 0, 0); kst_pause_calls = kst_pause_calls + 1; kz_k = kz_k + 1; }
+        store64(&kst_in_pause + kz_me * 8, 0);
         return kp_res;
     }
     return kp_res;
@@ -1078,6 +2779,7 @@ fn kst_tail_hook() {
 
 # A probe proc left its CPU with an IN-KERNEL (CS 0x08) frame: a syscall was switched out mid-flight.
 fn kst_note_switch_out(old) {
+    if (load64(&kst_in_pause + old * 8) != 0) { kst_pause_out = kst_pause_out + 1; }   # 1.57.7: the #14 preempt point
     if (kst_probe_lo < 0) { return 0; }
     if (old < kst_probe_lo) { return 0; }
     if (old > kst_probe_hi) { return 0; }
@@ -1087,10 +2789,16 @@ fn kst_note_switch_out(old) {
 
 # In the timer ISR body (after S3.2's preempt_disable): (a) the body must run with preempt_count > 0, so
 # nothing reached from it can switch the ISR frame away; (b) wake the mode-4 parked proc after a few ticks
-# — IF=0 here, so taking the leaf sched_lock is safe.
-fn kst_isr_hook() {
+# — IF=0 here, so taking the leaf sched_lock is safe; (c) 1.57.7 — when the INTERRUPTED frame had RFLAGS.AC set
+# (a syscall's CPL0 window after the entry stub's stac: mode 1, mode 5), this body must run with AC CLEAR — the
+# stub's clac (frame + 136 = RFLAGS in the 15-register timer frame).
+fn kst_isr_hook(frame) {
     kst_isr_samples = kst_isr_samples + 1;
     if (preempt_count_get() == 0) { kst_isr_bad = kst_isr_bad + 1; }
+    if ((load64(frame + 136) & 0x40000) != 0) {
+        kst_ac_samples = kst_ac_samples + 1;
+        if ((dm_read_rflags() & 0x40000) != 0) { kst_ac_bad = kst_ac_bad + 1; }
+    }
     var kpp = kst_park_pid;
     if (kpp >= 0) {
         kst_park_ticks = kst_park_ticks + 1;
@@ -1111,8 +2819,8 @@ fn kst_note_fenced(idx) {
     return 0;
 }
 
-# This CPU now runs `pid` (every path that makes a proc current AND on_cpu == this CPU: do_context_switch,
-# sys_sched_yield, exec_and_wait's FG-1). An unhooked path only leaves a stale pid, which kst_note_leave skips.
+# This CPU now runs `pid` (every path that makes a proc current AND on_cpu == this CPU: do_context_switch — both
+# switch paths — and exec_and_wait's FG-1). An unhooked path only leaves a stale pid, which kst_note_leave skips.
 # ⚠ The switch-in runs BEFORE the tail that leaves old (both inside one IF=0 switch), so it first shifts the
 # old record into kst_leave_* — the first version compared the tail against the NEW pid's record, skipped
 # every time, and let M-A3 through with underfoot=0 while the storm held the departing CPU in the window.
@@ -1161,7 +2869,7 @@ fn kst_note_leave(old) {
 fn kst_probe_hook(a1, a2, a3) { return 0 - 1; }
 fn kst_tail_hook() { return 0; }
 fn kst_note_switch_out(old) { return 0; }
-fn kst_isr_hook() { return 0; }
+fn kst_isr_hook(frame) { return 0; }
 fn kst_note_fallback() { return 0; }
 fn kst_note_fenced(idx) { return 0; }
 fn kst_note_switch_in(pid) { return 0; }

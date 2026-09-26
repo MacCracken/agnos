@@ -1,6 +1,6 @@
 # 2026-09-23 — `sock_recv`#49 never reports the end of a stream the peer has closed
 
-**Status:** 🟡 **OPEN** — fixed by step **S4** (`tcp_conn_eof`: CLOSE_WAIT with a drained ring answers -1; `tcp_send` allowed in CLOSE_WAIT; `tcp_close` from CLOSE_WAIT sends our FIN). Not in 1.57.6. The Path 2 foundation this step builds on — per-process syscall kernel stacks, the deferred `on_cpu` release, preempt-disabling spinlocks, region-7 guard pages (bites S3.1–S3.3) — landed in **1.57.6**; see `docs/development/planning/blocking-syscall-concurrency.md` § Path 2 plan and the roadmap's 1.57.x table.
+**Status:** ✅ **RESOLVED 1.57.7 (2026-09-25)** — step S4: `sock_recv`#49 returns −1 (EOF) once the peer's FIN has arrived and every byte before it has been read (CLOSE_WAIT, empty ring); data always comes first; `tcp_readable` agrees (epoll). Gates: `scripts/smoke/tcp-inbound-smoke.sh` E1/E2/A3, `tcp-smoke` `tcp: eof`, `loopback-smoke` `lo: close-wait ready`. Built, gated, NOT burned. See § Resolution.
 **Filed by:** daimon (the AGNOS agent orchestrator), testing its HTTP API inside the guest with a
 client that reads each response until the server closes.
 **Checked against:** agnos **1.57.5**: `kernel/core/net_tcp.cyr` (`net_handle_tcp`'s FIN handling,
@@ -39,3 +39,16 @@ past it), return -1, the EOF answer, as for a dead connection. This is the BSD `
 
 daimon's guest test client reads responses to their `Content-Length`. daimon's server does not
 depend on EOF: it reads a request to its own framing and closes after answering.
+
+## Resolution (1.57.7, 2026-09-25)
+
+**What shipped:** `tcp_conn_eof`; `sock_send`#48 allowed in CLOSE_WAIT (HTTP/1.0 and `shutdown(SHUT_WR)`
+clients); `sock_close`#50 from CLOSE_WAIT sends our FIN; a FIN that arrives before accept is kept and delivered;
+`sock_connect`#47 may return a conn already in CLOSE_WAIT. Falsification against 1.57.6: E1 `eof=0`, E2 `eof=0`.
+
+**What the change broke — checked before archiving:** found in the end review and fixed (ENDFIX S6-R1): closing a
+connection while a data segment was still unACKed discarded that segment, so the peer got neither the bytes nor
+EOF — the FIN is now folded into the held segment. cyrius's `_agnos_sock_recv_block` (30 s deadline) now ends at
+EOF instead.
+
+**Evidence:** `~/.claude/projects/-home-macro-Repos-agnos/handoff-1.57.7/steps/S4-report.json`, `ENDFIX-report.json`.

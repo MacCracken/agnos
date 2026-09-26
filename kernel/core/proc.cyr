@@ -26,6 +26,17 @@
 # listed below (8 bytes per field per cyrius i64 convention).
 struct Process { pid; state; rsp; rip; rax; rbx; rcx; rdx; rsi; rdi; rbp; r8; r9; r10; r11; r12; r13; r14; r15; rflags; cr3; exit_code; }
 
+# ═══════════════ 1.57.7 (Path 2, S3.4) — PROCESS STATES (field +8) ═══════════════
+# 0 dead · 1 ready · 2 running · 3 claiming · 4 DYING (reserved, the lifecycle step) · 5 STOPPED (reserved,
+# the lifecycle step) · 6 BLOCKED. sched_next picks ONLY 1; do_context_switch revives only 1..3 (a proc in
+# 4/5/6 left its CPU on purpose); proc_alloc_slot reuses only 0 with on_cpu == -1. BLOCKED means "left its
+# CPU inside a kernel wait" (docs/architecture/blocking-waits.md): ONLY wq_wake / wq_tick / wq_interrupt
+# (sched.cyr) make a BLOCKED proc READY again. Hot paths keep literals with a comment (the do_context_switch
+# zone rule: no extra call in the regalloc-sensitive save/restore path).
+var PROC_ST_DYING   = 4;
+var PROC_ST_STOPPED = 5;
+var PROC_ST_BLOCKED = 6;
+
 var proc_table[2816];  # 16 processes x 176 bytes each
 var proc_count = 0;
 # First-occurrence latch for the "process table is full" refusal in proc_alloc_slot(). ⚠ Scalar, not
@@ -49,7 +60,7 @@ var pcpu_curproc[4];     # per-CPU current-proc pid, indexed by APIC id (slot 0 
 #
 # ⛔⛔ THERE IS DELIBERATELY NO `idle` COUNTER, AND THE ABSENCE IS THE HONEST ANSWER. agnos has no
 # single idle loop to instrument: `arch_wait()` (a bare `hlt`) is called from a dozen polling waits —
-# DHCP retry, `sleep_ms`#41, `kbd_read_blocking`, the NIC drain — so a CPU halted inside a blocking
+# DHCP retry, `sleep_ms`#41's legacy loop, `kbd_read_blocking`, the NIC drain — so a CPU halted inside a blocking
 # syscall is indistinguishable at the tick boundary from a CPU doing real kernel work. Both are ring 0.
 # ⇒ A monitor gets user vs kernel, which is a real split; it does NOT get idle separated from system.
 # Inventing an idle number here (guessing from the saved RIP, or flagging one arch_wait site and not
@@ -101,7 +112,8 @@ var proc_ticks[16];     # per-slot 100 Hz tick count — the process's accumulat
 # (arch/x86_64/io.cyr) and read by timer_handler (arch/x86_64/pic.cyr) so a halted core does not
 # charge the tick to whoever happens to be `current`.
 #
-# WHY: chakshu built a CPU% column on proc_ticks, measured it, and BACKED IT OUT. sleep_ms#41 halts
+# WHY: chakshu built a CPU% column on proc_ticks, measured it, and BACKED IT OUT. sleep_ms#41 halted (until
+# 1.57.7, when it began to BLOCK its caller; only its legacy preempt-held path still halts like this)
 # with the caller still current (preempt_disable, so do_context_switch early-returns), so a process
 # blocked in a syscall accrued ticks at WALL-CLOCK rate — their monitor rendered a sleeping process
 # at 100%. The quantity was "share of wall-clock ticks while this slot was current, INCLUDING
@@ -113,6 +125,16 @@ var proc_ticks[16];     # per-slot 100 Hz tick count — the process's accumulat
 # "the monitor says the box is idle while it is busy", which is the hardest kind to trace back.
 # ⚠ 4 entries to match cpu_user_ticks/cpu_kern_ticks above; pcpu_cpu() already clamps >= 4 to 0.
 var cpu_in_halt[4];
+# ⭐ 1.57.7 (Path 2, S3.8) — IS THIS CPU A KICK TARGET? 1 = this CPU is halted (or about to halt) in the idle step
+# (sched_idle_step) or a #14/#44 park (sched_halt_window) and will RE-SCAN for READY work when its hlt ends. ONLY such
+# a CPU is a target of sched_kick_for's 0xE1 IPI — a kick to any other CPU could not be served (0xE1 never switches).
+# Rules: written ONLY by code running ON that CPU — set to 1 by sched_idle_step / sched_halt_window at IF=0 BEFORE
+# their scan (flag -> mfence -> scan -> sti;hlt, the Dekker half the waker pairs with), cleared by them after their hlt
+# (or when the scan finds work), and cleared by the timer ISR on that CPU (pic.cyr: a tick ends any halt and may switch
+# the halted context out; a flag left at 1 on a CPU now running another process would draw kicks it cannot serve).
+# `cpu_in_halt` above stays the ACCOUNTING flag (every arch_wait sets it, including preempt-held waits that cannot take
+# work); kick targeting never reads it. Shared file, x86-only readers: no aarch64 name is added.
+var cpu_kickable[4];
 
 
 var proc_signals[128];  # 16 processes x 8 bytes
@@ -138,7 +160,125 @@ var proc_ss[16];        # saved SS per pid (default 0x10 = ring-0 kernel data)
 # proc_ss, NOT a Process-struct field (that would change the 176 B stride at ~16 sites).
 # GUARDRAIL ([[project_agnos_auth_posture]]): signal-ownership hardening ONLY — must NOT
 # grow into pgid/sid or kill(-pgid, …); process-group semantics WOULD be Unix projection.
+# 1.57.7 (S7, D4): child-only AUTHORITY; descendants-only REACH via KILL_TREE (operator ruling
+# 2026-09-23); still no process-group / session reach. The parent is an INCARNATION: proc_ppid_epoch.
 var proc_ppid[16];      # saved parent pid per pid (default 0 = init)
+
+# ═══════════════ 1.57.7 (S3b) — INV-FG-2: THE FOREGROUND-WAIT CELL (docs/architecture/foreground-exec.md) ═══════════════
+# waiter pid -> its foreground child's pid + 1 while the waiter is in execwait#37 (sys_execwait) or kmain's
+# kernel_run_child; 0 = not waiting. A PARALLEL array (the 176 B stride is frozen), scrubbed in proc_alloc_slot. Single
+# writer: the waiter itself, which stores c+1 BEFORE c is READY and clears it only AFTER reaping c (S7's death chain
+# will also clear a dying waiter's cell). Readers: proc_slot_reusable (under proctab_lock), S7's proc_fg_chain_kill_locked, S7's
+# proc_stoppable. WHY: kmain's children carry ppid 0, which the reuse scan reads as "reaped" — without this cell a
+# dead-but-unread kmain child's slot could be handed to a concurrent #43 before kmain read its exit code.
+# HERE, in shared proc.cyr, because proc_alloc_slot scrubs it: an array in an x86-only file would add an aarch64
+# undefined name.
+var proc_fgwait[16];
+fn proc_fgwait_get(w) { if (w < 0) { return 0; } if (w >= 16) { return 0; } return load64(&proc_fgwait + w * 8); }
+fn proc_fgwait_set(w, v) { if (w < 0) { return 0 - 1; } if (w >= 16) { return 0 - 1; } store64(&proc_fgwait + w * 8, v); return 0; }
+
+# ═══════════════ 1.57.7 (S7) — THE PROCESS LIFECYCLE STATE (docs/architecture/process-lifecycle.md) ═══════════════
+# A parent can END (SIGKILL 9), STOP (SIGSTOP 19) and CONTINUE (SIGCONT 18) its child, and — with KILL_TREE (0x100 in
+# kill#16's arg2) — every epoch-validated descendant. Parallel pid-indexed arrays (the 176 B stride is frozen), HERE in
+# shared proc.cyr because proc_alloc_slot scrubs them (all five, for every slot, next to the proc_ppid scrub).
+# ⛔ WRITE RULE: kill/stop pending are written under sched_spin_lock, EXCEPT proc_alloc_slot's scrub of a CLAIMING slot,
+# which is program-ordered before that slot's ppid publication (so no tree-walk mark can precede it). proc_death_done is
+# written under proctab+sched (the final death hold) and by the scrub. Hot-path readers (B1, the tick's fast check) read
+# lock-free and re-check under the lock.
+#   proc_kill_pending   0, or the signal that will END the proc (9; S8: 24). The first kill wins.
+#   proc_stop_pending   0 · 1 = a direct stop · 2 = a tree stop (the only kind a newborn inherits).
+#   proc_term_sig       0 = exit#0 / fault; 1..63 = the signal that ended it (feeds the wait status, D2).
+#   proc_ppid_epoch     proc_epoch[ppid] at birth: (ppid, ppid_epoch) names the parent INCARNATION — a recycled parent
+#                       slot does not inherit its predecessor's children (every child test is proc_is_child_of).
+#   proc_death_done     1 once this incarnation's final death hold ran: its children must treat it as gone.
+var SIG_KILL = 9;
+var SIG_CHLD = 17;
+var SIG_CONT = 18;
+var SIG_STOP = 19;
+var SIG_XCPU = 24;                # S8
+var KILL_TREE = 0x100;            # kill#16 arg2 bit 8 (D4)
+var WSTAT_SIGNALED = 0x100;       # wait status of a death by signal = 0x100 | sig (D2)
+var PROC_ZOMBIE_REPORT = 7;       # #99 report-only state (an exited, unreaped child)
+var VIA_NONE = 0;
+var VIA_CLAIM = 1;
+var VIA_TICK = 2;
+var VIA_B1 = 3;
+var VIA_WAIT = 4;
+var VIA_SIG = 5;
+var VIA_ORPHAN = 6;
+var VIA_FAULT = 7;
+var LT_KILL = 1;
+var LT_STOP = 2;
+var LT_CONT = 3;
+var LT_ORPHAN = 4;
+var proc_kill_pending[16];
+var proc_stop_pending[16];
+var proc_term_sig[16];
+var proc_ppid_epoch[16];
+var proc_death_done[16];
+var proc_orphan_leak_seen = 0;    # the reuse tripwire (proc_slot_reusable): a dead slot with a live AS was recycled
+var proc_orphan_leak_said = 0;
+# Raw accessors (no bounds check — every caller has a pid in [0, 16)). They exist for IMAGE SIZE: an inline
+# `load64(&arr + t * 8)` costs ~35 bytes of this compiler's code, a call ~15, and the lifecycle code makes ~120 such
+# accesses (check.sh's 2 MB weighed-size gate). The per-syscall B1 check and the per-tick check keep raw loads.
+fn lc_st(t) { return load64(&proc_table + t * 176 + 8); }
+fn lc_st_set(t, v) { store64(&proc_table + t * 176 + 8, v); return 0; }
+fn lc_kp(t) { return load64(&proc_kill_pending + t * 8); }
+fn lc_sp(t) { return load64(&proc_stop_pending + t * 8); }
+fn lc_sp_set(t, v) { store64(&proc_stop_pending + t * 8, v); return 0; }
+fn lc_pp(t) { return load64(&proc_ppid + t * 8); }
+fn lc_pep(t) { return load64(&proc_ppid_epoch + t * 8); }
+fn lc_done(t) { return load64(&proc_death_done + t * 8); }
+
+# ═══════════════ 1.57.7 (Path 2, S3.4) — THE WAIT CELLS AND THE PER-PROCESS 4TH SYSCALL ARGUMENT ═══════════════
+# Parallel pid-indexed arrays (the 176 B struct stride is frozen), scrubbed in proc_alloc_slot. HERE, in shared
+# proc.cyr, because proc_alloc_slot scrubs them and vfs.cyr (shared) names WK_FLOCK: arrays in an x86-only file
+# would add aarch64 undefined names.
+#   proc_wait_key       WK_* | object; 0 = not waiting. Written under sched_lock only (wq_arm / wq_wake / wq_tick).
+#   proc_wait_deadline  sched_clock_us deadline, 0 = none. WQ-DL: != 0 => state 6; wq_tick's rescan self-heals a
+#                       stale one (a remote retire, a death path, this scrub) — it never has to be kept exact.
+#   proc_wake_reason    WR_* set by the waker, read and cleared by the sleeper.
+#   proc_sc_a4          the 4th syscall argument, PER PROCESS (was pcpu_ksyscall_a4 — a per-CPU cell): it must
+#                       survive a syscall that blocks and resumes on another CPU, and another process's syscall
+#                       on this CPU must not overwrite it meanwhile. syscall_handler stores it at entry.
+var proc_wait_key[16];
+var proc_wait_deadline[16];
+var proc_wake_reason[16];
+var proc_sc_a4[16];
+
+# Wait keys (the high byte names the class, the low bits the object) and wake reasons. Module-scope literals.
+var WK_SLEEP = 0x0100000000000000;
+var WK_FLOCK = 0x0200000000000000;
+var WK_CHILD = 0x0300000000000000;
+var WK_KBD = 0x0400000000000000;
+var WK_KBD_OWNER = 0x0500000000000000;
+var WK_SND = 0x0600000000000000;
+var WK_TCP = 0x0700000000000000;
+var WK_ICMP = 0x0800000000000000;
+var WK_TEST = 0x7F00000000000000;
+var WR_NONE = 0;
+var WR_EVENT = 1;
+var WR_TIMEOUT = 2;
+var WR_SIGNAL = 3;
+
+# The 4th syscall argument of `pid`'s current syscall. store: syscall_handler (the entry, with the pid it already
+# holds — no second LAPIC read) and in-kernel callers that stage an a4 before ksyscall (main.cyr/selftests.cyr,
+# through ksyscall_a4_set, which names the CALLER's own slot). A bad pid stores nothing and reads 0.
+# ⚠ In-kernel staging is still REQUIRED: ksyscall reads the current process's cell, so a caller that does not
+# set it passes whatever its own previous syscall left there.
+fn ksyscall_a4_store(pid, v) {
+    if (pid < 0) { return 0; }
+    if (pid >= 16) { return 0; }
+    store64(&proc_sc_a4 + pid * 8, v);
+    return 0;
+}
+fn ksyscall_a4_set(v) { return ksyscall_a4_store(proc_current_get(), v); }
+fn ksyscall_a4_get() {
+    var a4_p = proc_current_get();
+    if (a4_p < 0) { return 0; }
+    if (a4_p >= 16) { return 0; }
+    return load64(&proc_sc_a4 + a4_p * 8);
+}
 
 # ── 1.57.6 — PER-PROCESS SPAWN ARMS (issue 2026-09-23-child-inherits-every-fd-and-spawn-arms-leak §3) ──
 #
@@ -310,7 +450,64 @@ fn spawn_arms_clear(pid) { return spawn_arms_reset(pid); }
 # boot-context arms would otherwise survive into kybernet's runtime pid 0.
 fn spawn_arms_reset_all() {
     var ra = 0;
-    while (ra < 16) { spawn_arms_reset(ra); ra = ra + 1; }
+    while (ra < 16) {
+        spawn_arms_reset(ra);
+        lim_arm_clear(ra);    # 1.57.7 (S8): a separate call — spawn_arms_clear aliases spawn_arms_reset
+        ra = ra + 1;
+    }
+    return 0;
+}
+
+# ⭐ 1.57.7 (S8) — PER-PROCESS RESOURCE LIMITS (spawn_limits#107; process-lifecycle.md "Resource limits").
+# CAPS are the proc's own effective limits, placed at birth (proc_create_user: the creator's lim_eff) or copied by
+# fork; 0 = none. ARMS are the caller's one-shot limits for its NEXT child, set by #107 and consumed at the ONE site
+# in syscall_handler after every #3/#37/#43 return. No lock, the S2 arm argument: a pid's ARM cells are written by
+# its own #107, its own syscall exit, proc_alloc_slot (slot dead) and the death chain; CAP + cursor cells only while
+# the slot is CLAIMING (alloc, proc_create_user, sys_fork). Readers: the owner's syscalls and the tick head on the
+# owner's CPU. The 176 B struct Process stride is frozen, hence parallel arrays (module-scope [16] = 16 u64).
+var proc_mem_cap[16];       # effective memory cap, 4 KiB pages (#99's RSS unit), enforced at 2 MB granularity
+var proc_cpu_cap[16];       # effective CPU cap, 100 Hz ticks (charged in timer_handler, compared by lim_cpu_tick_head)
+var proc_arm_mem[16];       # #107 a1 for the caller's next child, pages; 0 = no memory arm
+var proc_arm_cpu[16];       # #107 ceil(a2 / 10) ticks; 0 = no CPU arm
+# 1.50.4 per-pid high-arena cursor (0 = uninit -> the floor). DECLARED HERE, in the shared region, since 1.57.7 (S8):
+# proc_alloc_slot scrubs it (a recycled slot starts at the floor) and sys_fork copies it (himmap_cursor_copy); an
+# x86-only declaration would add an undefined name to the aarch64 build. The users (himmap_reserve, sys_mmap,
+# sys_munmap) stay in the x86 block.
+var proc_himmap_next[16];
+
+# An arm can only LOWER: arm == 0 -> own; own == 0 -> arm; else min.
+fn lim_eff(own, arm) {
+    if (arm == 0) { return own; }
+    if (own == 0) { return arm; }
+    if (arm < own) { return arm; }
+    return own;
+}
+fn lim_cell(base, pid) {
+    if (spawn_pid_ok(pid) == 0) { return 0; }
+    return load64(base + pid * 8);
+}
+fn lim_child_mem(c) { return lim_eff(lim_cell(&proc_mem_cap, c), lim_cell(&proc_arm_mem, c)); }
+fn lim_child_cpu(c) { return lim_eff(lim_cell(&proc_cpu_cap, c), lim_cell(&proc_arm_cpu, c)); }
+fn lim_arm_set(pid, mem_pages, cpu_ticks) {
+    if (spawn_pid_ok(pid) == 0) { return 0; }
+    store64(&proc_arm_mem + pid * 8, mem_pages);
+    store64(&proc_arm_cpu + pid * 8, cpu_ticks);
+    return 0;
+}
+fn lim_arm_clear(pid) { return lim_arm_set(pid, 0, 0); }
+fn lim_caps_set(pid, mem, cpu) {
+    if (spawn_pid_ok(pid) == 0) { return 0; }
+    store64(&proc_mem_cap + pid * 8, mem);
+    store64(&proc_cpu_cap + pid * 8, cpu);
+    return 0;
+}
+# fork: the CAPS only, never the arm (the child's arm was reset by proc_alloc_slot).
+fn lim_copy(child, parent) { return lim_caps_set(child, lim_cell(&proc_mem_cap, parent), lim_cell(&proc_cpu_cap, parent)); }
+# fork: the child continues the parent's high-arena cursor — its copied high pages sit below it (a fresh cursor
+# would start at the floor, on those copies).
+fn himmap_cursor_copy(child, parent) {
+    if (spawn_pid_ok(child) == 0) { return 0; }
+    store64(&proc_himmap_next + child * 8, lim_cell(&proc_himmap_next, parent));
     return 0;
 }
 
@@ -645,8 +842,60 @@ fn preempt_enabled() { if (load64(preempt_cpu_slot()) == 0) { return 1; } return
 #   spawner, and FALSE the moment `fork`#96 + wait-any produced an exited-but-unreaped child that
 #   a later fork then allocated straight over. The ppid guard in the scan below is what makes the
 #   original sentence true again, by construction rather than by convention.
-#   A FUTURE consumer caching a pid across a yield (real blocking waitpid, an agnsh
-#   job table, kill-by-saved-pid) MUST re-validate the slot still names the same logical process.
+#   A consumer caching a pid across a yield or a wait MUST re-validate that the slot still names the same logical
+#   process. 1.57.7: the blocking waitpid (sys_waitpid_block, syscall.cyr) caches `t` across its wait and does so by
+#   construction — waitpid_peek re-runs proc_may_reap(me, t) on every iteration, so if some other reaper (pid 0)
+#   reaps and recycles `t`, the waiter gets -1 ("not your child") and never reaps a stranger; and the ppid guard in
+#   the scan below forbids reusing a dead child's slot while its parent is alive. (An agnsh job table or a
+#   kill-by-saved-pid still has to do its own re-validation.)
+# May dead slot `i` be handed out again? A PURE read, called by proc_alloc_slot under proctab_lock (and by ktest T12).
+# 1 = reusable, 0 = keep it. The rules, oldest first (their history is at the scan in proc_alloc_slot):
+#   · the slot is dead (state 0), AND
+#   · 1.56.55: it is nobody's unread child — ppid 0 (both reap doors clear it; also every kmain child, see INV-FG-2),
+#     the parent slot is gone (pp >= proc_count), or the parent is itself dead (an orphan);
+#   · 1.57.6 (S3.1, INV-11): no CPU is still leaving it (on_cpu == -1);
+#   · 1.57.7 (S3b, INV-FG-2): it is not the foreground child a LIVE waiter still owes a status read to
+#     (proc_fgwait[pp] == i + 1). DEP-2: only while that waiter is alive — a dead waiter's stale cell never pins a
+#     slot. kmain (pp 0) is always live, and before the lifecycle step nothing can kill a blocked waiter.
+fn proc_slot_reusable(i) {
+    if (load64(&proc_table + i * 176 + 8) != 0) { return 0; }
+    var sr_pp = load64(&proc_ppid + i * 8);
+    var sr_r = 0;
+    var sr_orph = 0;
+    if (sr_pp == 0) { sr_r = 1; }                                      # reaped (both reap doors clear ppid), or a kmain child
+    if (sr_pp >= proc_count) { sr_r = 1; sr_orph = 1; }                # parent slot gone
+    if (sr_pp > 0) { if (sr_pp < proc_count) { if (load64(&proc_table + sr_pp * 176 + 8) == 0) { sr_r = 1; sr_orph = 1; } } }   # orphan
+    # ⛔ 1.57.7 (S7) REUSE TRIPWIRE: since the lifecycle step an orphan frees its fd table and address space at its OWN
+    # death (proc_death_finish -> proc_reap_orphan), so an orphan/parent-gone slot handed out here still holding a live
+    # address space is the D-29 leak class coming back. Latched; proc_alloc_slot says it after its unlock (denied by
+    # every smoke). The decision itself is unchanged.
+    if (sr_orph == 1) {
+        var sr_cr3 = load64(&proc_table + i * 176 + 160);
+        if (sr_cr3 != 0) { if (sr_cr3 != 0x1000) { proc_orphan_leak_seen = 1; } }
+    }
+    if (load64(&proc_on_cpu + i * 8) != (0 - 1)) { sr_r = 0; }          # S3.1: a CPU is still leaving it (INV-11)
+    # INV-FG-2: a LIVE waiter's foreground child -> its status is still owed.
+    if (sr_pp >= 0) {
+        if (sr_pp < proc_count) {
+            if (load64(&proc_table + sr_pp * 176 + 8) != 0) {
+                if (load64(&proc_fgwait + sr_pp * 8) == i + 1) { sr_r = 0; }
+            }
+        }
+    }
+    return sr_r;
+}
+# (1.57.7 S7: proc_is_fg_child — S3b's never-called helper for this step — is gone: proc_stoppable reads the fgwait
+# cell itself, and orphans are reaped at their own death, not by a scan that would need to skip fg children.)
+# The reuse tripwire's latched line (klug + COM1, never the console: proc_alloc_slot's callers include the timer-free
+# boot path and ISR-free syscalls, but a lock-free emitter is the simple rule). Called after proctab_spin_unlock.
+fn proc_orphan_leak_say() {
+    if (proc_orphan_leak_seen == 0) { return 0; }
+    if (proc_orphan_leak_said != 0) { return 0; }
+    proc_orphan_leak_said = 1;
+    klug_append("proc: orphan zombie recycled unreaped", 37); klug_putc(10);
+    serial_println("proc: orphan zombie recycled unreaped", 37);
+    return 0;
+}
 fn proc_alloc_slot() {
     # 1.46.x SMP sub-bite 3: the scan-find-free + claim + proc_count-bump is a non-atomic RMW on
     # shared proc-table state. Under proctab_lock, AND set a CLAIMING sentinel (state=3) on the
@@ -658,7 +907,6 @@ fn proc_alloc_slot() {
     proctab_spin_lock();
     var i = 0;
     var idx = 0 - 1;
-    var pp = 0;
     var reusable = 0;
     while (i < proc_count) {
         if (load64(&proc_table + i * 176 + 8) == 0) {
@@ -682,24 +930,19 @@ fn proc_alloc_slot() {
             # clear it (see proc_reap / proc_reap_child), so a non-zero ppid on a dead slot means
             # PRECISELY "exited, not yet reaped". Reuse is allowed only when the row is genuinely
             # nobody's business any more.
-            # ⚠ THE ORPHAN CLAUSE IS NOT OPTIONAL — without it this leaks. Nothing in agnos reaps an
-            # orphan (see the table-full banner below, which says so), so a zombie whose parent died
+            # ⚠ THE ORPHAN CLAUSE IS NOT OPTIONAL — without it this leaks. A zombie whose parent died
             # unreaping would pin its slot until reboot and march a 16-slot table to full. If the
             # parent slot is itself dead, or no longer exists, nobody will ever collect this row and
-            # it is free.
+            # it is free. ⭐ 1.57.7 (S7): an orphan now reaps ITSELF at its death (its fd table AND its
+            # address space — proc_reap_orphan), and a dying parent reaps its zombies before it
+            # publishes, so this clause only ever meets an already-freed row; one that still holds an
+            # address space trips proc_orphan_leak_seen (proc_slot_reusable) — the D-29 leak tripwire.
             # ⚠ KNOWN, BOUNDED, AND IN THE SAFE DIRECTION: if the parent's slot has since been
             # RECYCLED by an unrelated process, that process's live state pins this zombie. That is
             # the pid-recycle hazard the banner above already flags for a future consumer; it can only
             # over-PRESERVE a row, never hand a live one away.
-            pp = load64(&proc_ppid + i * 8);
-            reusable = 0;
-            if (pp == 0) { reusable = 1; }                                 # reaped — both reap doors clear ppid
-            if (pp >= proc_count) { reusable = 1; }                        # parent slot no longer exists
-            if (pp > 0) {
-                if (pp < proc_count) {
-                    if (load64(&proc_table + pp * 176 + 8) == 0) { reusable = 1; }   # orphan: parent is dead too
-                }
-            }
+            # ⭐ 1.57.7 (S3b): the whole predicate is proc_slot_reusable (above) — this rule, the on_cpu fence below and
+            # the INV-FG-2 live-waiter clause — so ktest T12 drives exactly what the allocator decides.
             # ⛔ 1.57.6 (Path 2, S3.1) — AND NO CPU MAY STILL BE ON IT. A dead slot whose on_cpu is not -1
             # belongs to a CPU that has not finished leaving it: the switch tail publishes -1 only after
             # RSP is off the slot's kernel stack and the CR3 is gone (INV-11), and the store64 of -1
@@ -707,7 +950,7 @@ fn proc_alloc_slot() {
             # this very stack. STRICT form — no "the allocating CPU owns it" exemption: every non-(-1) value
             # on a dead slot is cleared promptly, by that tail or by the reap fence's self-owned path
             # (kernel_resume exits are reaped at once), so an exemption would buy nothing and add a case.
-            if (load64(&proc_on_cpu + i * 8) != (0 - 1)) { reusable = 0; }
+            reusable = proc_slot_reusable(i);
             if (reusable == 1) { idx = i; i = proc_count; }
             else { i = i + 1; }
         }
@@ -734,6 +977,7 @@ fn proc_alloc_slot() {
                 kprintln("proc: the process table is full and this spawn was refused", 58);
                 kprintln("proc: nothing reaps a process whose parent exited without closing it", 68);
             }
+            proc_orphan_leak_say();
             return 0 - 1;
         }
         idx = proc_count;
@@ -746,7 +990,16 @@ fn proc_alloc_slot() {
     # with 0 ticks, which is indistinguishable from one that just started. Alloc is the single moment
     # the old value provably means nothing.
     store64(&proc_ticks + idx * 8, 0);
+    # ⛔ 1.57.7 ENDFIX (S7-R1): THE NEW INCARNATION IS BORN INSIDE THIS HOLD. The epoch bump and the death_done scrub
+    # used to run AFTER the unlock (done=0 first, the bump ~40 lines later): for that stretch the recycled slot read
+    # as the OLD parent, alive (state 3, old epoch, done 0), and an orphan child dying on another CPU (its final
+    # hold takes proctab) published itself as a zombie nobody could reap, sending SIGCHLD to the newcomer. Bumping
+    # FIRST, under proctab, means every final hold sees either done==1 or a changed epoch; lc_parent_live also
+    # refuses a CLAIMING parent (belt and braces — ktest T-L12).
+    store64(&proc_epoch + idx * 8, load64(&proc_epoch + idx * 8) + 1);
+    store64(&proc_death_done + idx * 8, 0);
     proctab_spin_unlock();
+    proc_orphan_leak_say();                    # 1.57.7 (S7): the reuse tripwire's latched line, after the unlock
     store64(&proc_signals + idx * 8, 0);
     store64(&proc_sigmask + idx * 8, 0);
     store64(&proc_rsp0 + idx * 8, DIRECTMAP_BASE + KSTACK_POOL_BASE + (idx + 1) * KSTACK_SLOT);  # 1.46.1 region-7 phys, 1.51.x via direct-map VA (8 GB+, clear of user segments)
@@ -755,6 +1008,25 @@ fn proc_alloc_slot() {
     store64(&proc_on_cpu + idx * 8, 0 - 1);   # 1.46.x SMP6: recycled slot must not inherit a stale CPU id
     store64(&idle_owner + idx * 8, 0 - 1);     # 1.46.x STEP-2: recycled slot starts UNPINNED (a prior foreground proc may have left idle_owner=its launch CPU; a fresh proc must be free to migrate / not falsely pinned). Idles never reuse a slot, so their persistent pin is unaffected.
     store64(&proc_ppid + idx * 8, 0);          # 1.50.7: recycled slot must not inherit a stale parent (default init; proc_create_user sets the real creator)
+    store64(&proc_fgwait + idx * 8, 0);        # 1.57.7 (S3b, INV-FG-2): a fresh slot waits on nothing
+    # 1.57.7 (S7): nor a lifecycle state. The slot is CLAIMING and its ppid is not published yet, so no tree-walk
+    # mark can precede these stores (the one exception to the "under sched_lock" write rule).
+    store64(&proc_kill_pending + idx * 8, 0);
+    store64(&proc_stop_pending + idx * 8, 0);
+    store64(&proc_term_sig + idx * 8, 0);
+    store64(&proc_ppid_epoch + idx * 8, 0);
+    # 1.57.7 (S3.4): nor a stale wait (key, deadline, reason) or 4th syscall argument. The slot is CLAIMING and
+    # nobody arms it. wq_ntimed is NOT adjusted: wq_tick's rescan is authoritative, so a stale deadline cleared
+    # here can only leave the counter stale-HIGH (self-healing at the next rescan), never stale-low.
+    store64(&proc_wait_key + idx * 8, 0);
+    store64(&proc_wait_deadline + idx * 8, 0);
+    store64(&proc_wake_reason + idx * 8, 0);
+    store64(&proc_sc_a4 + idx * 8, 0);
+    # 1.57.7 (S8): nor the dead occupant's caps or high-arena cursor (a fresh incarnation starts uncapped at the
+    # arena floor; proc_create_user / sys_fork then place the real caps). Unconditional: the only caller-slot case
+    # is the unregistered boot pid 0, whose caps are 0, and proc_create_user read the creator's values already.
+    lim_caps_set(idx, 0, 0);
+    store64(&proc_himmap_next + idx * 8, 0);
     # ⛔⛔ 1.56.53 — proc_names WAS THE ONE MEMBER OF THIS FAMILY MISSING FROM THE SCRUB, and its
     # absence made a PUBLISHED ABI GUARANTEE FALSE. `#99 proclist`s contract — in the issue record and
     # in the userland ABI doc — reads: "the name field is NUL-padded to the full 32 bytes **so ring 3
@@ -778,11 +1050,14 @@ fn proc_alloc_slot() {
     # creator's own arm one line before its placement (shsys "endow owner not moved", CHANX-INH-ENDOWED
     # red). The guard is exact: a LIVE caller's slot is never state 0, so equality happens only for the
     # unregistered boot pid 0 — and spawn_arms_reset_all() at the bootstrap covers that slot instead.
-    if (idx != proc_current_get()) { spawn_arms_reset(idx); }
+    if (idx != proc_current_get()) {
+        spawn_arms_reset(idx);
+        lim_arm_clear(idx);   # 1.57.7 (S8): the limits arm, under the same guard
+    }
     # 1.56.40 bite 2: a slot handed out is a NEW incarnation, whether it is a fresh row or a recycled
-    # one — so the bump belongs here, at the single point every user proc is born through, and not on
+    # one — so the bump belongs in proc_alloc_slot, at the single point every user proc is born through, and not on
     # the death path (a slot that is never reused must still not alias the proc that last held it).
-    store64(&proc_epoch + idx * 8, load64(&proc_epoch + idx * 8) + 1);
+    # (1.57.7 ENDFIX S7-R1: the bump moved up, inside the proctab hold — see there.)
     fpu_area_reset(idx);                        # 1.53.x B2: recycled slot must not inherit the prior occupant's saved XMM — reset to the fninit-equivalent default (matters once B3's #NM restore is live)
     # 1.53.x B3b: belt-and-suspenders for the dangling-owner hazard — if any CPU's FP
     # owner still names this recycled pid (a death path that didn't clear it), drop it so
@@ -793,7 +1068,7 @@ fn proc_alloc_slot() {
 }
 # 1.46.1: the per-proc TSS.RSP0 top for `pid`, or the legacy shared stack (0x3C0000
 # = tss_kernel_stack, gdt.cyr) for an unassigned slot — e.g. hand-registered kmain/
-# idle that bypass proc_alloc_slot. Called by do_context_switch / sys_sched_yield /
+# idle that bypass proc_alloc_slot. Called by do_context_switch (kstack_install) /
 # exec_and_wait before a ring-3 entry. The 0-fallback keeps an uninitialized slot
 # from setting RSP0=0 (a triple fault on the next CPL3->CPL0 interrupt).
 fn proc_rsp0_top(pid) {
@@ -898,6 +1173,11 @@ fn proc_create_kclaim(entry, stack_top) {
 # flips it ready via proc_set_state(pid, 1) AFTER full wiring. Single-core inert: the same store the old
 # code did, just deferred to the caller; no scheduler runs between here and the caller's flip at slot 0.
 fn proc_create_user(entry, stack_top) {
+    # 1.57.7 (S8): the creator's effective limits for its child, read FIRST (before proc_alloc_slot). The creator is
+    # the spawner in #3/#37/#43 (P is current at load); kmain (pid 0) has no caps and never arms.
+    var lc_cr = proc_current_get();
+    var lc_m = lim_child_mem(lc_cr);
+    var lc_c = lim_child_cpu(lc_cr);
     var idx = proc_alloc_slot();
     if (idx < 0) { return 0 - 1; }
     var p = &proc_table + idx * 176;
@@ -919,6 +1199,16 @@ fn proc_create_user(entry, stack_top) {
     # per-CPU global, NOT CR3-derived, so it is still the spawner even when the #3 path has
     # cr3_load(0x1000)'d to boot CR3 for the disk read.)
     store64(&proc_ppid + idx * 8, proc_current_get());
+    # ⭐ 1.57.7 (S7): the parent is an INCARNATION (pid, epoch) — proc_is_child_of compares it, so a recycled parent
+    # slot never inherits its predecessor's children. proc_epoch_get has no bounds check: the creator is the caller.
+    store64(&proc_ppid_epoch + idx * 8, proc_epoch_get(proc_current_get()));
+    # ⛔ A DYING CREATOR CREATES NO CHILD, AND A TREE-STOPPED ONE CREATES A STOP-PENDING CHILD (S7 §2.9). The check
+    # runs under sched_lock AFTER ppid/epoch are stored, so a KILL_TREE / tree stop walk (one sched_lock hold) either
+    # saw this child (kill -> MARK, stop -> birth stop) or the check sees the creator's pending kill / tree stop. A
+    # spawning agent cannot outrun a tree kill. On refusal the slot is released unborn; the loaders' < 0 arms free the
+    # address space they built, and the dying caller never observes the code (it ends at its syscall exit).
+    if (proc_birth_check(idx, proc_current_get()) == 0) { proc_slot_release_unborn(idx); return 0 - 1; }
+    lim_caps_set(idx, lc_m, lc_c);   # 1.57.7 (S8): lim_eff inheritance (an arm can only lower)
     vfs_fd_inherit(idx, proc_current_get());
     # 1.56.40 bite 5 — place an armed channel endowment into the child (planning/ipc.md §9.6).
     # ⛔ THE HIGHEST-RISK LINE IN THE CUT: this sits on the birth path of EVERY user process, so a
@@ -998,7 +1288,8 @@ fn proc_get_exit_code(pid) {
 
 # KPTI CR3 pair: 1.46.x SMP sub-bite 4c moved this PER-CPU into pcpu_kpti_kernel_cr3 /
 # pcpu_kpti_user_cr3 (syscall_hw.cyr). The old single globals here were a single-core
-# invariant. Writers: sched.cyr (both switch paths), ring3.cyr, syscall.cyr (ew37 restore).
+# invariant. Writers: sched.cyr (both switch paths), ring3.cyr (the boot-only exec_and_wait; syscall.cyr's #37 ew37
+# restore wrote them too until 1.57.7 S3b made #37 a blocking wait).
 # Stub installs them via r8*8 per-CPU loads. KPTI is currently COLLAPSED (kernel==user==running).
 
 # Repair (J) — Attempt 23: PMM-allocation CMOS-stamp call counter.
@@ -1523,7 +1814,6 @@ fn proc_reap(pid) {
     # flocks first), instead of sweeping the global. The per-proc table makes "any open fd
     # belongs to the exited proc" exact — no risk of touching the parent's fds (the very reason
     # proc_reap_child historically never swept). Replaces the old fd-3..31 vfs_close loop.
-    proc_destroy_fd_table(pid, 1);
     # ⛔ 1.57.1 — DISARM RAW DISK WRITE ON EXIT. `blk_rw_armed` (core/syscall.cyr) gates
     # blk_write#78; blk_close_sys clears it, but a process that armed the gate and then DIED —
     # faulted, killed, or simply exited without closing — left it OPEN for whatever ran next. The
@@ -1535,25 +1825,14 @@ fn proc_reap(pid) {
     # BLK_RW_ARM_MAGIC is still a compile-time constant any ring-3 process can send, and replacing
     # it needs the per-process capability model agnos does not have. That half is an operator ruling,
     # not a fix; do not treat this line as closing it.
-    blk_rw_armed = 0;
-    var cr3 = proc_get_cr3(pid);
-    proc_set_state(pid, 0);                 # dead — scheduler skips it (set before free)
-    if (proc_current_get() == pid) { proc_current_set(0); }
-    proc_set_cr3(pid, 0x1000);              # detach the stale per-process CR3
-    proc_reap_off_cpu_fence(pid);           # GAP-C: wait out any in-flight restore before freeing
-    kstack_hw_scan();                       # 1.57.6 (S3-fix): KSTACK_HW — no CPU is on pid's stack now (a no-op twin otherwise)
-    if (cr3 != 0x1000) { proc_free_address_space(cr3); }
     # 1.56.55 — the second reap door. See the long banner in proc_reap_child: a reaped slot must
     # stop being its parent's child, or the parent's next `waitpid(-1)` re-matches this dead row
     # forever and never reaches its other children. This path is the FOREGROUND reap (agnsh `run`,
     # init's exec_and_wait), whose caller has already read the exit code — so the parent-child
     # relationship is fully discharged here too, and agnsh is itself a wait-any caller.
-    store64(&proc_ppid + pid * 8, 0);
     # LIFO slot reclaim: hand the top dead slot back to the allocator.
-    proctab_spin_lock();   # 1.46.x SMP sub-bite 3: proc_count decrement vs proc_alloc_slot's bump
-    if (pid == proc_count - 1) { proc_count = proc_count - 1; }
-    proctab_spin_unlock();
-    return 0;
+    # ⭐ 1.57.7 (S7): the two reap doors share their body (proc_reap_slot, below) — the image bytes the lifecycle step needs.
+    return proc_reap_slot(pid, 1);
 }
 
 # Reap a waited-on CHILD process (spawn / elf_load in-memory path, 1.42.x).
@@ -1591,13 +1870,6 @@ fn proc_reap_child(pid) {
     # path's prior behavior (it never swept fds — the global table was shared, so it couldn't
     # safely close the parent's; the per-proc table removes that coupling). The child's table
     # is a separate kmalloc'd copy, so freeing it never touches the parent's fds.
-    proc_destroy_fd_table(pid, 0);
-    var cr3 = proc_get_cr3(pid);
-    proc_set_state(pid, 0);                 # dead — scheduler skips it (set before free)
-    proc_set_cr3(pid, 0x1000);              # detach the stale per-process CR3
-    proc_reap_off_cpu_fence(pid);           # GAP-C: wait out any in-flight restore before freeing
-    kstack_hw_scan();                       # 1.57.6 (S3-fix): KSTACK_HW — no CPU is on pid's stack now (a no-op twin otherwise)
-    if (cr3 != 0x1000) { proc_free_address_space(cr3); }
     # ⛔⛔ 1.56.55 — A REAPED SLOT MUST STOP BEING ITS PARENT'S CHILD, AND UNTIL NOW IT DID NOT.
     # `proc_ppid` was cleared in exactly ONE place — proc_alloc_slot's recycle scrub (the 1.50.7
     # line, "recycled slot must not inherit a stale parent") — and that runs at slot REUSE, not at
@@ -1619,7 +1891,6 @@ fn proc_reap_child(pid) {
     # ⚠ The same clear is in `proc_reap` for the same reason. The invariant is "a reaped slot is
     # nobody's child", and it has to hold on BOTH reap doors or it returns through the other one:
     # agnsh reaps its foreground jobs via proc_reap and is itself a wait-any caller.
-    store64(&proc_ppid + pid * 8, 0);
     # LIFO slot reclaim: hand the top dead slot back to the allocator (same rule as proc_reap —
     # ONLY the topmost slot collapses). A non-top child that exits early keeps its slot until the
     # slots above it drain; proc_alloc_slot (1.44.12) reuses that hole so nothing leaks. The address
@@ -1628,6 +1899,21 @@ fn proc_reap_child(pid) {
     # a later reap trailed into it, so the parent's pending waitpid(pid) would find the proc gone
     # (pid >= proc_count -> -1) and its address space would leak. A proc's slot must persist until
     # ITS OWN waitpid reaps it. (Multi-background-jobs validated WITHOUT it — agnsh-multijob-test.)
+    return proc_reap_slot(pid, 0);
+}
+# THE SHARED REAP BODY (1.57.7 S7 — both doors' statements, in their order; the comments above each door explain them).
+# full = 1: proc_reap (flush the fd table's write-backs, the unconditional raw-disk disarm, the current-proc reset).
+fn proc_reap_slot(pid, full) {
+    proc_destroy_fd_table(pid, full);
+    if (full == 1) { blk_rw_armed = 0; }
+    var cr3 = proc_get_cr3(pid);
+    proc_set_state(pid, 0);                 # dead — scheduler skips it (set before free)
+    if (full == 1) { if (proc_current_get() == pid) { proc_current_set(0); } }
+    proc_set_cr3(pid, 0x1000);              # detach the stale per-process CR3
+    proc_reap_off_cpu_fence(pid);           # GAP-C: wait out any in-flight restore before freeing
+    kstack_hw_scan();                       # 1.57.6 (S3-fix): KSTACK_HW — no CPU is on pid's stack now (a no-op twin otherwise)
+    if (cr3 != 0x1000) { proc_free_address_space(cr3); }
+    store64(&proc_ppid + pid * 8, 0);       # 1.56.55: a reaped slot is nobody's child (both doors)
     proctab_spin_lock();   # 1.46.x SMP sub-bite 3: proc_count decrement vs proc_alloc_slot's bump
     if (pid == proc_count - 1) { proc_count = proc_count - 1; }
     proctab_spin_unlock();
@@ -1670,15 +1956,17 @@ fn proc_get_ppid(pid) {
 #   • a non-init caller may signal ONLY itself or its own DIRECT child (proc_get_ppid==caller).
 #   • init may be signalled ONLY by itself (subsumed by the child rule — target 0's parent is
 #     0, so a non-init caller fails it — but the explicit early-out documents the intent).
-# GUARDRAIL: must stay child-only; no process-group / session reach (that WOULD be projection).
+# GUARDRAIL: child-only AUTHORITY; descendants-only REACH via KILL_TREE (operator ruling 2026-09-23); still no
+# process-group / session reach (that WOULD be projection).
 # Behavior-preserving refactor of the prior inline ksyscall #16 gate (arg1 bounds + sig
 # validation stay at the call site — they validate syscall args, not authorization policy).
+# ⭐ 1.57.7 (S7, D-30): the child clause is EPOCH-VALIDATED (sig_auth_ok): a recycled parent slot inherits no
+# authority over its predecessor's live orphans — with SIGKILL that would be kill authority over a stranger.
 fn proc_may_signal(caller, target) {
-    if (caller == 0) { return 1; }                       # init signals anyone
-    if (target == 0) { return 0; }                       # non-init may never signal init
-    if (target == caller) { return 1; }                  # self
-    if (proc_get_ppid(target) == caller) { return 1; }   # own direct child
-    return 0;
+    if (spawn_pid_ok(caller) == 0) { return 0; }
+    if (target < 0) { return 0; }
+    if (target >= proc_count) { return 0; }
+    return sig_auth_ok(caller, target, load64(&proc_ppid + target * 8), load64(&proc_ppid_epoch + target * 8), proc_epoch_get(caller));
 }
 
 # 1.50.8: the waitpid#4 ownership predicate — sibling of proc_may_signal, same proc_ppid
@@ -1692,20 +1980,243 @@ fn proc_may_signal(caller, target) {
 # deferred at the 1.44.22 audit — while the getter stubbed 0, which would have meant "only
 # init may reap" → broke agnsh `&`-job reaping; now agnsh IS the parent of its `&` jobs, so
 # it reaps them and a stranger cannot). GUARDRAIL: child-only, no process-group reach.
+# ⭐ 1.57.7 (S7): epoch-validated like proc_may_signal (reap_auth_ok).
 fn proc_may_reap(caller, target) {
-    if (caller == 0) { return 1; }                       # init reaps orphans / anyone
-    if (proc_get_ppid(target) == caller) { return 1; }   # own direct child
-    return 0;
+    if (spawn_pid_ok(caller) == 0) { return 0; }
+    if (target < 0) { return 0; }
+    if (target >= proc_count) { return 0; }
+    return reap_auth_ok(caller, load64(&proc_ppid + target * 8), load64(&proc_ppid_epoch + target * 8), proc_epoch_get(caller));
 }
 
+#ifdef TEST
+# (1.57.7 S7: every kernel signal-bit site now ORs through atomic_or64 directly — proc_sig_locked, SIGCONT's bit 18,
+# SIGCHLD at death — so this helper's only caller is ktest's test_proc; it ships only in TEST builds.)
+# ⭐ 1.57.7 (S7, D-4): the pending-bit OR is ATOMIC (lock or) — a plain RMW here raced vfs_read_signalfd's clear.
 fn proc_send_signal(pid, sig) {
+    if (pid < 0) { return 0 - 1; }
     if (pid >= proc_count) { return 0 - 1; }
     if (sig < 0) { return 0 - 1; }
     if (sig >= 64) { return 0 - 1; }
-    var sig_pending = load64(&proc_signals + pid * 8);
-    store64(&proc_signals + pid * 8, sig_pending | (1 << sig));
+    atomic_or64(&proc_signals + pid * 8, 1 << sig);
     return 0;
 }
+#endif
+
+# ═══════════════ 1.57.7 (S7) — LIFECYCLE IDENTITY + PURE PREDICATES (docs/architecture/process-lifecycle.md) ═══════════
+# Hermetic where possible (the lc_* / *_auth_ok / desc_walk / wstat / zombie_pred forms take every input as a
+# parameter) so ktest's [lifecycle] section drives each decision row with synthetic inputs. States (proc_table +8):
+# 0 dead (reaped/free OR an exited, unreaped zombie) · 1 ready · 2 running · 3 claiming/birth · 4 DYING · 5 STOPPED ·
+# 6 BLOCKED · (7 is never stored: #99's report-only ZOMBIE).
+# A user process: in the table, with its own address space (kmain, the idles and the kthreads run on 0x1000).
+fn proc_is_user(pid) {
+    if (pid < 0) { return 0; }
+    if (pid >= proc_count) { return 0; }
+    var iu_c = proc_get_cr3(pid);
+    if (iu_c == 0) { return 0; }
+    if (iu_c == 0x1000) { return 0; }
+    return 1;
+}
+# Is c a child of THIS incarnation of p? (ppid AND the epoch it recorded at birth.)
+fn proc_is_child_of(c, p) {
+    if (c < 0) { return 0; }
+    if (p < 0) { return 0; }
+    if (c >= proc_count) { return 0; }
+    if (p >= proc_count) { return 0; }
+    if (c == p) { return 0; }
+    if (lc_pp(c) != p) { return 0; }
+    if (lc_pep(c) != proc_epoch_get(p)) { return 0; }
+    return 1;
+}
+# kill#16 authority: init -> anyone · nobody else -> init · self · an epoch-valid DIRECT child. (D4: child-only.)
+fn sig_auth_ok(caller, target, t_ppid, t_pep, caller_ep) {
+    if (caller == 0) { return 1; }
+    if (target == 0) { return 0; }
+    if (target == caller) { return 1; }
+    if (t_ppid == caller) { if (t_pep == caller_ep) { return 1; } }
+    return 0;
+}
+# waitpid#4 authority: init -> anyone · an epoch-valid direct child. (No self clause: the call sites refuse t == me.)
+fn reap_auth_ok(caller, t_ppid, t_pep, caller_ep) {
+    if (caller == 0) { return 1; }
+    if (t_ppid == caller) { if (t_pep == caller_ep) { return 1; } }
+    return 0;
+}
+# Is the parent INCARNATION (pp, my_pep) alive? kmain (pp 0) never dies. A parent whose final death hold ran
+# (pp_done) is gone even while its slot still reads 2/4 (it is reaping itself — D-32).
+# ENDFIX (S7-R1): a CLAIMING slot (state 3) is being recycled for a NEW incarnation — never an existing process's
+# parent, whatever its epoch/done cells read mid-allocation.
+fn lc_parent_live(pp, n, pp_st, pp_ep, my_pep, pp_done) {
+    if (pp == 0) { return 1; }
+    if (pp < 0) { return 0; }
+    if (pp >= n) { return 0; }
+    if (pp_st == 0) { return 0; }
+    if (pp_st == 3) { return 0; }
+    if (pp_ep != my_pep) { return 0; }
+    if (pp_done != 0) { return 0; }
+    return 1;
+}
+# Is a dying process with parent pp an orphan (nobody will read its status)? kmain's children never are (kmain reaps
+# them through fgwait — kernel_run_child).
+fn lc_orphan(pp, n, pp_st, pp_ep, my_pep, pp_done) {
+    if (pp == 0) { return 0; }
+    return 1 - lc_parent_live(pp, n, pp_st, pp_ep, my_pep, pp_done);
+}
+# lc_orphan over the live arrays (out of range -> 1: no parent anyone can name). proc_parent_live is its complement.
+fn proc_orphan_of(t) {
+    if (t < 0) { return 1; }
+    if (t >= proc_count) { return 1; }
+    var pl_pp = lc_pp(t);
+    var pl_st = 0;
+    var pl_ep = 0;
+    var pl_dn = 0;
+    if (pl_pp >= 0) {
+        if (pl_pp < 16) { pl_st = lc_st(pl_pp); pl_ep = proc_epoch_get(pl_pp); pl_dn = lc_done(pl_pp); }
+    }
+    return lc_orphan(pl_pp, proc_count, pl_st, pl_ep, lc_pep(t), pl_dn);
+}
+fn proc_parent_live(t) { return 1 - proc_orphan_of(t); }
+# BINDING (S7): a user process whose parent waits on it in the foreground (execwait#37 / kmain's kernel_run_child —
+# proc_fgwait[ppid] == t + 1) cannot be stopped. kmain waits on /bin/agnsh, so agnsh is unstoppable.
+fn proc_stoppable(t) {
+    if (proc_is_user(t) == 0) { return 0; }
+    if (proc_fgwait_get(lc_pp(t)) == t + 1) { return 0; }
+    return 1;
+}
+# Is q a (strict) descendant of root, following EPOCH-VALID links only? Bounded (16 hops — the whole table) and
+# cycle-safe. A dead-but-unreaped intermediate still links (its epoch is unchanged until its slot is recycled); a
+# reaped one has ppid 0, so its orphans are unreachable from the old root (documented; no reparenting).
+fn desc_walk(q, root, pa, pea, ea, n) {
+    if (q == root) { return 0; }
+    var dw_x = q;
+    var dw_i = 0;
+    while (dw_i < 16) {
+        if (dw_x < 0) { return 0; }
+        if (dw_x >= n) { return 0; }
+        var dw_p = load64(pa + dw_x * 8);
+        if (dw_p < 0) { return 0; }
+        if (dw_p >= n) { return 0; }
+        if (dw_p == dw_x) { return 0; }                                      # malformed self-parent
+        if (load64(pea + dw_x * 8) != load64(ea + dw_p * 8)) { return 0; }    # the link must name the CURRENT incarnation
+        if (dw_p == root) { return 1; }
+        if (dw_p == 0) { return 0; }                                         # reached init without meeting root
+        dw_x = dw_p;
+        dw_i = dw_i + 1;
+    }
+    return 0;
+}
+fn proc_is_descendant(q, root) { return desc_walk(q, root, &proc_ppid, &proc_ppid_epoch, &proc_epoch, proc_count); }
+# The wait status (D2): a death by signal -> 0x100 | sig (SIGKILL 265, SIGXCPU 280); otherwise code & 0xFF (an exit's
+# low byte; a fault keeps 128 + vector = 142). Every value is >= 0, so a reaped child never reads as -1 / -2.
+fn wstat_encode(code, sig) {
+    if (sig != 0) { return WSTAT_SIGNALED | (sig & 0xFF); }
+    return code & 0xFF;
+}
+fn proc_wait_status(pid) {
+    if (pid < 0) { return 0 - 1; }
+    if (pid >= 16) { return 0 - 1; }
+    return wstat_encode(load64(&proc_table + pid * 176 + 168), load64(&proc_term_sig + pid * 8));
+}
+# Is dead slot i an exited, UNREAPED child someone will still collect? (#99 lists it as state 7.) plive is the
+# parent incarnation's liveness (proc_parent_live: lc_parent_live over the live arrays — its rows are T-L12's).
+fn zombie_pred(st, pp, plive, fg_names_me) {
+    if (st != 0) { return 0; }
+    if (fg_names_me == 1) { return 1; }
+    if (pp > 0) { if (plive == 1) { return 1; } }
+    return 0;
+}
+fn proc_is_zombie(i) {
+    if (i < 0) { return 0; }
+    if (i >= proc_count) { return 0; }
+    var iz_pp = lc_pp(i);
+    var iz_fg = 0;
+    if (iz_pp == 0) { if (proc_fgwait_get(0) == i + 1) { iz_fg = 1; } }
+    return zombie_pred(lc_st(i), iz_pp, proc_parent_live(i), iz_fg);
+}
+# chan_auth's PTY-descendant test over explicit tables (the owner itself, or an epoch-valid descendant).
+fn chan_pty_desc_pure(owner, cur, pa, pea, ea, n) {
+    if (cur == owner) { return 1; }
+    return desc_walk(cur, owner, pa, pea, ea, n);
+}
+# ── The decision tables. Every lifecycle transition decision lives here so ktest T-L12 drives its rows. ──
+# kill: 0 NOOP (dead/dying — a zombie keeps its status) · 1 MARK (a birth: dies at its first boundary) · -1 REFUSE
+# (not a user process) · 2 CLAIM (off-CPU, saved from ring 3: torn down here) · 3 WAKE_KICK (stopped, not claimable:
+# 5 -> 1, it runs to a boundary and dies there) · 4 INTERRUPT (blocked: its wait returns WR_SIGNAL) · 5 KICK.
+fn lc_kill_action(st, user, claimable) {
+    if (st == 0) { return 0; }
+    if (st == 4) { return 0; }
+    if (st == 3) { return 1; }
+    if (user == 0) { return 0 - 1; }
+    if (claimable == 1) { return 2; }
+    if (st == 5) { return 3; }
+    if (st == 6) { return 4; }
+    return 5;
+}
+# stop: 0 NOOP · 6 PEND_BIRTH · -1 REFUSE (not user / not stoppable / no live parent — D-33) · 2 CLAIM_STOP (1 -> 5)
+# · 4 PEND_INTERRUPT · 5 PEND_KICK. A pending kill wins: a process about to die is never parked (crit (b)).
+fn lc_stop_action(st, user, kp, stoppable, plive, claimable) {
+    if (st == 0) { return 0; }
+    if (st == 4) { return 0; }
+    if (kp != 0) { return 0; }
+    if (st == 3) { return 6; }
+    if (user == 0) { return 0 - 1; }
+    if (stoppable == 0) { return 0 - 1; }
+    if (plive == 0) { return 0 - 1; }
+    if (st == 5) { return 0; }
+    if (claimable == 1) { return 2; }
+    if (st == 6) { return 4; }
+    return 5;
+}
+# tick (the CPL3-interrupted current): 1 DIE · 0 NONE · 3 DROP (the stop no longer applies: clear it) · 2 STOP.
+fn lc_tick_action(kp, sp, stoppable, plive) {
+    if (kp != 0) { return 1; }
+    if (sp == 0) { return 0; }
+    if (stoppable == 0) { return 3; }
+    if (plive == 0) { return 3; }
+    return 2;
+}
+# park (B1 / a wait's signal point): 1 ABORT · 0 CONTINUE · 3 DROP · 4 PREEMPT_HELD (a kernel bug) · 2 PARK.
+fn lc_park_action(kp, sp, stoppable, plive, preempt) {
+    if (kp != 0) { return 1; }
+    if (sp == 0) { return 0; }
+    if (stoppable == 0) { return 3; }
+    if (plive == 0) { return 3; }
+    if (preempt != 0) { return 4; }
+    return 2;
+}
+# birth: 0 REFUSE (the creator has a pending kill) · 2 OK_INHERIT_STOP (the creator is TREE-stopped) · 1 OK.
+fn lc_birth_action(ckp, csp) {
+    if (ckp != 0) { return 0; }
+    if (csp == 2) { return 2; }
+    return 1;
+}
+# Hand back a slot whose process never ran (a refused birth, fork's early failures): under proctab_lock, so the reuse
+# scan never sees a half-cleared row. on_cpu is -1 (it never ran). LIFO collapse when it is the top.
+fn proc_slot_release_unborn(idx) {
+    if (idx < 0) { return 0 - 1; }
+    if (idx >= proc_count) { return 0 - 1; }
+    proctab_spin_lock();
+    store64(&proc_ppid + idx * 8, 0);
+    store64(&proc_ppid_epoch + idx * 8, 0);
+    store64(&proc_table + idx * 176 + 160, 0x1000);
+    lc_sp_set(idx, 0);
+    store64(&proc_kill_pending + idx * 8, 0);
+    lc_st_set(idx, 0);
+    if (idx == proc_count - 1) { proc_count = proc_count - 1; }
+    proctab_spin_unlock();
+    return 0;
+}
+# Hot-path self tests (one load each): the legacy wait loops poll the first; sys_pause checks the second.
+# (kind 1: a kill pending · kind 2: a kill or a stop pending.) The legacy loops poll kind 1; sys_pause checks kind 2.
+fn lc_self_pending(kind) {
+    var kr_me = proc_current_get();
+    if (spawn_pid_ok(kr_me) == 0) { return 0; }
+    var kr_v = lc_kp(kr_me);
+    if (kind == 2) { kr_v = kr_v | lc_sp(kr_me); }
+    if (kr_v != 0) { return 1; }
+    return 0;
+}
+fn proc_kill_requested_self() { return lc_self_pending(1); }
+fn lifecycle_pending_self() { return lc_self_pending(2); }
 
 fn proc_check_pending_signals(pid) {
     if (pid >= proc_count) { return 0; }
@@ -1780,23 +2291,70 @@ fn proc_slot_of_cr3(cr3) {
 # not a guarantee, and a future allocator could hand out a page whose low bits alias P|US.
 # ⚠ COST: one 511-entry walk per process per call. `proclist`#99 is a monitor's ~1 Hz sample over <=16
 # slots, so ~8 K loads/sec worst case — below anything this kernel notices, and paid only by askers.
+# ⭐ 1.57.7 (S8): #99's RSS now INCLUDES THE HIGH ARENA (PDPT[128..511]) — it was low-arena only, so a high-arena
+# user under-reported — and it is the SAME walk the memory cap measures (proc_user_pages_cr3), so the two can never
+# disagree. Not counted (not user PDEs): shm#71 buffers, #86 GPU slots, channel rings, pipe buffers, page tables,
+# kernel stacks.
 fn proc_rss_pages(pid) {
     if (pid < 0) { return 0; }
     if (pid >= 16) { return 0; }
     if (load64(&proc_table + pid * 176 + 8) == 0) { return 0; }   # dead slot
-    var rcr3 = load64(&proc_table + pid * 176 + 160);
-    if (rcr3 == 0)      { return 0; }
-    if (rcr3 == 0x1000) { return 0; }        # the boot address space is nobody's RSS
-    var rpd = ptw_pd_kva(rcr3);
-    if (rpd == 0) { return 0; }
-    var rn = 0;
-    var rk = 0;
-    while (rk < 511) {
-        var re = load64(rpd + rk * 8);
-        if ((re & 0x1) != 0) { if ((re & 0x04) != 0) { rn = rn + 512; } }   # 2 MB == 512 x 4 KiB
-        rk = rk + 1;
+    return proc_user_pages_cr3(load64(&proc_table + pid * 176 + 160));
+}
+
+# ⭐ 1.57.7 (S8) — THE FOOTPRINT WALK. A page-table pointer the walk may follow: 4 KB aligned and inside the
+# page-table pool [0x400000, 0x10000000) that pmm_alloc draws from (pmm.cyr). #99 walks FOREIGN tables with no lock,
+# so a table freed by a concurrent reap yields a stale count, never a dereference outside the pool (pmm_page_valid
+# is not a bound: it spans all RAM, holes included). Every pointer is checked BEFORE pmm_kva_for_access.
+fn ptw_pt_ok(p) {
+    if ((p & 0xFFF) != 0) { return 0; }
+    if (p < 0x400000) { return 0; }
+    if (p >= 0x10000000) { return 0; }
+    return 1;
+}
+# The kernel VA of the table a PRESENT entry `e` names (and USER too when `u`), or 0.
+fn ptw_next(e, u) {
+    if ((e & 1) == 0) { return 0; }
+    if (u != 0) { if ((e & 4) == 0) { return 0; } }
+    var pn_t = e & 0xFFFFFFFFF000;
+    if (ptw_pt_ok(pn_t) == 0) { return 0; }
+    return pmm_kva_for_access(pn_t);
+}
+# Present+user 2 MB entries among pd[0..n) (pd = a kernel VA from ptw_next, 0 = none).
+fn ptw_pd_users(pd, n) {
+    if (pd == 0) { return 0; }
+    var pu_c = 0;
+    var pu_k = 0;
+    while (pu_k < n) {
+        if ((load64(pd + pu_k * 8) & 5) == 5) { pu_c = pu_c + 1; }
+        pu_k = pu_k + 1;
     }
-    return rn;
+    return pu_c;
+}
+# The mapped user memory of an address space in 4 KiB pages: 512 x the present+user 2 MB PDEs of the low PD
+# (PML4[0] -> PDPT[0] -> PD[0..510]; 511 is the KPTI stash) plus every present+user PDPT[128..511] PD (the high
+# arena) — the walk proc_free_address_space tears down. 0 for cr3 0 / 0x1000 (the boot space) / out of the pool.
+fn proc_user_pages_cr3(cr3) {
+    if (ptw_pt_ok(cr3) == 0) { return 0; }
+    var up_pdpt = ptw_next(load64(pmm_kva_for_access(cr3)), 0);
+    if (up_pdpt == 0) { return 0; }
+    var up_n = ptw_pd_users(ptw_next(load64(up_pdpt), 0), 511);
+    var up_h = 128;
+    while (up_h < 512) {
+        up_n = up_n + ptw_pd_users(ptw_next(load64(up_pdpt + up_h * 8), 1), 512);
+        up_h = up_h + 1;
+    }
+    return up_n * 512;
+}
+# 1 iff the 2 MB PDE mapping `va` (< 512 GB: PDPT[va >> 30] -> PD[(va >> 21) & 511]) is present in `cr3`; an absent
+# PDPT/PD entry (or one outside the pool) is 0. sys_mmap's no-overwrite rule.
+fn proc_va_present_2mb(cr3, va) {
+    if (ptw_pt_ok(cr3) == 0) { return 0; }
+    var vp_pdpt = ptw_next(load64(pmm_kva_for_access(cr3)), 0);
+    if (vp_pdpt == 0) { return 0; }
+    var vp_pd = ptw_next(load64(vp_pdpt + ((va >> 30) & 511) * 8), 0);
+    if (vp_pd == 0) { return 0; }
+    return load64(vp_pd + ((va >> 21) & 511) * 8) & 1;
 }
 
 fn proc_map_page(cr3, virt, phys) {
@@ -2494,6 +3052,8 @@ fn proc_unmap_page(cr3, virt) {
 # cursor never collides across processes. 2 MB-granular (the VMM is huge-pages
 # only) and bump-only (no reclaim on the v1 no-munmap path). See
 # agnosticos/docs/development/mmap-prior-art.md.
+# ⚠ 1.57.7 (S8): "never collides" stopped being true once fork copied low pages and munmap rewound the cursor —
+# sys_mmap's present-test (the no-overwrite rule) is what makes a collision harmless now.
 var mmap_next_vaddr = 0x10000000;
 
 # HIGH user mmap arena. [USER_HIMMAP_BASE, HIMMAP_CEILING) = [128 GB, 512 GB),
@@ -2521,7 +3081,10 @@ var mmap_next_vaddr = 0x10000000;
 # exhausts the way one shared cursor would (each proc's high VAs live in its own CR3).
 var USER_HIMMAP_BASE = 0x2000000000;    # 128 GB
 var HIMMAP_CEILING   = 0x8000000000;    # 512 GB — PML4[0] top
-var proc_himmap_next[16];                # per-pid high cursor (0 = uninit -> base)
+# proc_himmap_next[16] (the per-pid cursor, 0 = uninit -> the floor) is declared in the SHARED region beside the
+# S8 limit arrays since 1.57.7: proc_alloc_slot scrubs it and sys_fork copies it (a stale or uncopied cursor mapped
+# a fork child's first high mmap over its copied pages).
+
 
 # himmap_reserve(pid, len): reserve `len` bytes of high-arena VA for process `pid`
 # from its OWN bump cursor (lazy-init to USER_HIMMAP_BASE). Returns the base VA, or 0
@@ -2562,8 +3125,16 @@ fn sys_mmap(length) {
     var len = (length + 0x1FFFFF) & 0xFFFFFFFFFFE00000;   # round up to 2 MB
     if (len < 0x200000) { len = 0x200000; }
     var npages = len / 0x200000;
-    var cr3 = proc_get_cr3(proc_current_get());
+    var mm_me = proc_current_get();
+    var cr3 = proc_get_cr3(mm_me);
     if (cr3 == 0) { return 0; }
+    # ⭐ 1.57.7 (S8): THE MEMORY CAP (spawn_limits#107 or inherited), before the free-RAM pre-count so a cap refusal
+    # never depends on free RAM. The footprint is COMPUTED (proc_user_pages_cr3), so munmap credits back by itself.
+    # npages <= 32768 (the 64 GB cap): no overflow. One address space has one thread: no interleaving mmap.
+    var mm_cap = lim_cell(&proc_mem_cap, mm_me);
+    if (mm_cap != 0) {
+        if (proc_user_pages_cr3(cr3) + npages * 512 > mm_cap) { lim_mmap_refused_once(mm_me, mm_cap); return 0; }
+    }
     if (pmm_count_2mb_free() < npages) { return 0; }       # not enough physical (pre-count)
     # LOW arena first (the proven path) when it still fits under the stack-guard
     # ceiling (0x3FA00000, below the user stack @0x3FC00000).
@@ -2584,6 +3155,18 @@ fn sys_mmap(length) {
         mmap_next_vaddr = mmap_next_vaddr + len;    # claim the ENTIRE span before releasing
     }
     mmap_spin_unlock();
+    # ⛔ 1.57.7 (S8) — NO MAPPING EVER LANDS ON A LIVE ONE. The low cursor is GLOBAL and munmap rewinds it (LIFO), while
+    # fork copies every low page: P maps A at the top, forks C, munmaps A -> the cursor rewinds to A, and C's next mmap
+    # got A and proc_map_page_nx's blind store overwrote C's live PDE (data clobbered, frame leaked for good, and
+    # uncounted by any cap). A span with ANY present page is abandoned (the cursor already moved past it: a harmless VA
+    # hole) and the request takes the HIGH arena, exactly as for "does not fit".
+    if (base_vaddr != 0) {
+        var mo = 0;
+        while (mo < npages) {
+            if (proc_va_present_2mb(cr3, base_vaddr + mo * 0x200000) != 0) { base_vaddr = 0; mo = npages; }
+            mo = mo + 1;
+        }
+    }
     if (base_vaddr != 0) {
         for (var i = 0; i < npages; i = i + 1) {
             var phys = pmm_alloc_2mb();
@@ -2602,8 +3185,15 @@ fn sys_mmap(length) {
         return base_vaddr;
     }
     # HIGH arena: reserve the whole range from THIS process's own cursor (1.50.4).
-    var hbase = himmap_reserve(proc_current_get(), len);
+    var hbase = himmap_reserve(mm_me, len);
     if (hbase == 0) { return 0; }                    # this process's high arena is exhausted
+    # 1.57.7 (S8): the same no-overwrite rule (defence in depth: the per-incarnation cursor + fork's copy keep it
+    # unreachable).
+    var mh = 0;
+    while (mh < npages) {
+        if (proc_va_present_2mb(cr3, hbase + mh * 0x200000) != 0) { return 0; }
+        mh = mh + 1;
+    }
     for (var j = 0; j < npages; j = j + 1) {
         var hphys = pmm_alloc_2mb();
         if (hphys == 0) { return 0; }
@@ -2742,6 +3332,10 @@ fn sys_munmap(addr, length) {
     # ⭐ REQUIRING `freed == npages` is the honest test of the property the rollback assumes: that this
     # call actually owned and released the whole span it names. A caller unmapping its own most-recent
     # full mapping — the LIFO case this optimisation exists for — still rewinds exactly as before.
+    # ⛔ 1.57.7 (S8) — `freed == npages` WAS NOT ENOUGH: FORK REOPENED THE CLASS. A fork child holds COPIES of every
+    # low page, so the parent's own honest LIFO munmap rewound the global cursor onto a span still live in the child,
+    # and the child's next mmap overwrote its own PDE. The overwrite is now closed BY CONSTRUCTION in sys_mmap (a span
+    # with any present page is never mapped); this rewind stays as the VA-reuse optimisation only.
     if (freed == npages) {
         mmap_spin_lock();
         if ((addr + len) == mmap_next_vaddr) { mmap_next_vaddr = addr; }

@@ -66,6 +66,26 @@ qemu_dwell() {
         _qd_i=$(( _qd_i + 1 ))
     done
 
+    # ⛔ 1.57.7 (IMG-fix) — A MARKER IS SEEN MID-LINE, SO LET THE LINE FINISH BEFORE THE KILL. The poll above
+    # reads the log while the guest is still writing it, and a marker that is the PREFIX of the line a smoke then
+    # parses (spawn-smoke's "SPAWNX-DONE" before "pass=46 fail=0") can be matched with the rest of the line still
+    # in flight: the IMG-fix sweep's spawn row failed attempt 1 on a log ending "SPAWNX-DONE pass=" and scored
+    # "reports failures". So after a marker hit, keep QEMU running until the log has stopped growing and ends in a
+    # newline (0.2 s stable), or has stopped growing for 1 s (a prompt such as "agnos> " never ends in one), for
+    # at most QEMU_DWELL_GRACE seconds (default 2). Only the marker path pays this; timeouts and self-exits don't.
+    if [ "$_qd_why" = "marker" ]; then
+        _qd_gmax=$(( ${QEMU_DWELL_GRACE:-2} * 5 )); _qd_gi=0; _qd_still=0
+        _qd_sz=$(wc -c < "$_qd_log" 2>/dev/null || echo 0)
+        while [ "$_qd_gi" -lt "$_qd_gmax" ]; do
+            sleep 0.2
+            _qd_gi=$(( _qd_gi + 1 ))
+            _qd_nsz=$(wc -c < "$_qd_log" 2>/dev/null || echo 0)
+            if [ "$_qd_nsz" = "$_qd_sz" ]; then _qd_still=$(( _qd_still + 1 )); else _qd_still=0; _qd_sz="$_qd_nsz"; fi
+            if [ "$_qd_still" -ge 1 ] && [ "$(tail -c 1 "$_qd_log" 2>/dev/null | od -An -c | tr -d ' ')" = '\n' ]; then break; fi
+            if [ "$_qd_still" -ge 5 ]; then break; fi
+        done
+    fi
+
     # Stop it, then WAIT — this is what preserves the "log is complete once QEMU has exited" guarantee
     # the synchronous form relied on. TERM first; KILL only if it ignores that.
     if kill -0 "$_qd_pid" 2>/dev/null; then
@@ -126,6 +146,7 @@ qemu_dwell() {
 qemu_dwell_kernel() {
     _qk_log="$1"; _qk_marker="$2"; _qk_max="$3"; _qk_vars="$4"; _qk_varsrc="$5"; shift 5
     _qk_tries="${QEMU_TRIES:-6}"
+    rm -f "$_qk_log".attempt*
     _qk_i=1
     while [ "$_qk_i" -le "$_qk_tries" ]; do
         # A fresh NVRAM per attempt: a half-written vars.fd from a killed run is itself a way to
@@ -134,9 +155,11 @@ qemu_dwell_kernel() {
             cp "$_qk_varsrc" "$_qk_vars" && chmod +w "$_qk_vars"
         fi
         qemu_dwell "$_qk_log" "$_qk_marker" "$_qk_max" "$@"
-        if strings "$_qk_log" 2>/dev/null | grep -q "AGNOS kernel v"; then return 0; fi
+        # booted -> the run stands; died -> qemu_attempt_verdict exits the smoke 1 (never retried);
+        # VOID -> the attempt's log is kept as $_qk_log.attempt$_qk_i and the next attempt runs.
+        if qemu_attempt_verdict "$_qk_log" "$_qk_i"; then return 0; fi
         if [ "$_qk_i" -lt "$_qk_tries" ]; then
-            echo "  (firmware never handed off — kernel did not start; retrying $_qk_i/$((_qk_tries - 1)))" >&2
+            echo "  (retrying $_qk_i/$((_qk_tries - 1)))" >&2
         else
             echo "  UEFI never handed off to the kernel in $_qk_tries attempts — INFRASTRUCTURE, not the kernel." >&2
             echo "  Any assertion below describes an EMPTY log; treat this run as VOID, not as a failure." >&2
@@ -144,6 +167,68 @@ qemu_dwell_kernel() {
         _qk_i=$((_qk_i + 1))
     done
     return 0
+}
+
+# ⛔⛔ 1.57.7 (IMG-fix, review A2) — "NO BANNER" IS TWO DIFFERENT EVENTS, AND ONLY ONE OF THEM IS A VOID.
+# Until 1.57.7 every retry here was gated on the banner ALONE and each attempt's log was overwritten by
+# the next. So a kernel that died before its banner — a triple fault on the boot stack's first push, the
+# exact window the 1.57.7 IMG step moved — was retried as "firmware never handed off", and an
+# INTERMITTENT pre-banner death would never have shown: the seven IMG-era retries could not be told
+# apart after the fact. The serial log DOES tell them apart, because gnoboot's last act before
+# ExitBootServices is to print its hand-off line (gnoboot src/main.cyr efi_main step 12) and the only
+# things that can follow it are (a) `gnoboot: fail @ EBS` — EBS refused the map key, gnoboot returned to
+# the firmware, the boot menu comes up: the MEASURED ~1-in-4 flake, and the kernel NEVER RAN — or (b) the
+# `jmp rax` into the kernel (step 13; nothing between EBS success and the jump can print or fail). So:
+#   booted  the banner "AGNOS kernel v" is in the log;
+#   died    the hand-off line is there, NO "gnoboot: fail @" line, and no banner: the KERNEL took control
+#           and never reached its banner. That is a FAILURE of the kernel under test — never retried,
+#           never VOID. qemu_attempt_verdict exits the calling smoke 1 with the kept log's path.
+#   void    anything else — no hand-off line (OVMF never ran gnoboot, or was still in firmware when the
+#           dwell ended), a "gnoboot: fail @ XXXX" line, an empty log: the kernel never executed.
+# ⚠ Residual, stated rather than hidden: a firmware that HANGS inside ExitBootServices (never returns)
+# would read as "died". No such hang has been observed; the kept attempt log shows it if it ever happens.
+qemu_boot_class() {
+    if strings "$1" 2>/dev/null | grep -q "AGNOS kernel v"; then echo booted; return 0; fi
+    if strings "$1" 2>/dev/null | grep -q "handing off to kernel"; then
+        if ! strings "$1" 2>/dev/null | grep -q "gnoboot: fail @"; then echo died; return 0; fi
+    fi
+    echo void
+    return 0
+}
+
+# qemu_void_why <log> — the evidence for a VOID classification, as one phrase.
+qemu_void_why() {
+    _qv_f=$(strings "$1" 2>/dev/null | grep -o "gnoboot: fail @ [A-Z]*" | head -1)
+    if [ -n "$_qv_f" ]; then echo "$_qv_f"; return 0; fi
+    if [ ! -s "$1" ]; then echo "empty log — QEMU produced no output"; return 0; fi
+    if strings "$1" 2>/dev/null | grep -q "BdsDxe: failed to load"; then
+        echo "OVMF could not load the boot image (BdsDxe: failed to load) — gnoboot never ran"; return 0
+    fi
+    if strings "$1" 2>/dev/null | grep -qE "Please select boot device|BootManagerMenuApp"; then
+        echo "OVMF boot menu with no gnoboot hand-off line — gnoboot never ran"; return 0
+    fi
+    echo "no gnoboot hand-off line — still in firmware when the dwell ended"
+    return 0
+}
+
+# qemu_attempt_verdict <log> <attempt#> — one retry-loop step, for qemu_dwell_kernel AND for the smokes that
+# roll their own retry loop. Returns 0 when the kernel booted (stop retrying); returns 1 for a VOID attempt
+# (retry), after keeping its log as <log>.attempt<N> and saying WHY it is a VOID; for a "died" attempt it
+# keeps the log the same way, prints the FAIL and EXITS THE SMOKE 1 (these helpers are sourced, so `exit`
+# ends the caller) — a kernel that ran and died is never another attempt's business.
+qemu_attempt_verdict() {
+    _qa_c=$(qemu_boot_class "$1")
+    [ "$_qa_c" = "booted" ] && return 0
+    cp "$1" "$1.attempt$2" 2>/dev/null || true
+    if [ "$_qa_c" = "died" ]; then
+        echo "  FAIL: attempt $2 — gnoboot handed off (no 'fail @' line) and the kernel never printed its banner:" >&2
+        echo "        the KERNEL took control and died before 'AGNOS kernel v'. Not a firmware VOID; not retried." >&2
+        echo "        log: $1.attempt$2" >&2
+        echo "  FAIL: kernel died before its banner (attempt $2, log $1.attempt$2)"
+        exit 1
+    fi
+    echo "  (VOID attempt $2: $(qemu_void_why "$1") — the kernel never ran; log kept: $1.attempt$2)" >&2
+    return 1
 }
 
 # qemu_assert_booted <log> — did the kernel actually RUN? Call this immediately after a QEMU run and
@@ -173,7 +258,10 @@ qemu_dwell_kernel() {
 # Returns 0 if the kernel banner is present, 1 otherwise (and prints why).
 qemu_assert_booted() {
     if strings "$1" 2>/dev/null | grep -q "AGNOS kernel v"; then return 0; fi
-    echo "  UEFI never handed off to the kernel — the kernel under test DID NOT EXECUTE."
+    # 1.57.7 (IMG-fix, A2): a kernel that took control and died before its banner is a FAIL, not a VOID —
+    # qemu_attempt_verdict prints it and exits the smoke 1 (see qemu_boot_class).
+    if [ "$(qemu_boot_class "$1")" = "died" ]; then qemu_attempt_verdict "$1" "final"; fi
+    echo "  UEFI never handed off to the kernel — the kernel under test DID NOT EXECUTE ($(qemu_void_why "$1"))."
     echo "  Any assertion below would describe an EMPTY log. Treat this run as VOID, not as a failure."
     if strings "$1" 2>/dev/null | grep -q "fail @ EBS"; then
         echo "  (gnoboot: fail @ EBS — the firmware ExitBootServices hand-off, the known ~1-in-4 flake)"
@@ -183,14 +271,41 @@ qemu_assert_booted() {
 
 # SMOKE_INVARIANT_DENY (1.57.6, agnos S3-fix) — the kernel's LATCHED invariant lines. Each prints once per boot to
 # klug + COM1 (lock-free) and never to a failing exit code, so a gate that does not grep for them scores PASS while
-# they fire. Every production-path smoke denies them (agnsh, exec, fork, spawn, kstack) and so do the run37 /
-# agnsh-bg-smp4 / agnsh-multijob harnesses (which carry their own copy of the pattern — Python, not sourced):
+# they fire. Every production-path smoke denies them (agnsh, exec, fork, spawn, kstack) and so do the Python harnesses
+# (run37 / agnsh-bg-smp4 / agnsh-multijob / wait-kbd), which LOAD IT THROUGH scripts/harness/_invdeny.py (1.57.7 S3d) —
+# no pasted copy is left to drift. ⚠ Keep it ONE double-quoted assignment on ONE line: _invdeny.py extracts that
+# line's quoted value and refuses anything else (a continuation would silently drop alternatives from every harness).
 #   sched: refused non-ready pick            do_context_switch's tripwire (sched.cyr)
 #   sched: exec_and_wait entered with ...    sched_assert_oob (preempt_count != 0, or IF=1)
 #   sched: kernel_resume with ...            sched_assert_oob (preempt_count != 0)
 #   syscall: kernel stack is not the caller  kstack_check_entry: a switch path missed kstack_install
 #   PANIC: Double Fault                      exc_df_report: the #DF stub (a kernel stack is gone)
-SMOKE_INVARIANT_DENY="sched: refused non-ready pick|sched: exec_and_wait entered with|sched: kernel_resume with|syscall: kernel stack is not the caller|PANIC: Double Fault"
+#   boot: BSP stack window not free RAM      (1.57.7 IMG-fix) mbi.cyr bootstack_window_check: the UEFI map calls part
+#                                            of [0x390000, 0x3C0000) something other than free RAM
+#   wq: wait primitive entered ...           (1.57.7 S3c) sched.cyr wq_assert_if0: arm/cancel/sleep reached with IF=1
+#   wq: arm from a non-running ...           wq_arm on a proc that is not RUNNING (state != 2, != 0)
+#   wq: current is not running ...           wq_can_block: current's on_cpu is not this CPU (INV-RUN)
+#   wq: sleep resumed in a non-running ...   wq_sleep came back READY (a pre-lock guard refused after an early wake)
+#   PANIC: wq ...                            wq_sleep: the BLOCK switch was refused with state 6 published (halts)
+#   sched: resched gate misconfigured        resched_gates_ok: the 0xE0 (S3c) or 0xE1 (S3d) gate is not DPL0/IST0/0x08
+#                                            at its stub
+#   IDLE REFUSED A READY PICK                (1.57.7 S3d) sched.cyr sched_idle_step: the idle's yield refused READY
+#                                            work 1000 times in a row on one CPU (never on a correct kernel)
+#   exec: exec_and_wait is boot-only        (1.57.7 S3b) ring3.cyr: an out-of-band exec was attempted after
+#                                            `sched_active = 1` (refused, -1)
+#   fg: IF=0 ring-3 caller                   (S3b) the INV-FG-1 tripwire at #14/#44: a ring-3 process ran IF=0 after
+#                                            the scheduler started
+#   fg: kernel_run_child cannot block        (S3b) kmain's launch was refused (preempt held / cannot block)
+#   fg: execwait cannot block / fg: execwait wait ended abnormally   (S3b) sys_execwait's refusal / an abnormal wait
+#   net: lock overlap                        (1.57.7 S4) tcp_lock / net_tx_begin: two holders inside one net lock
+#   net: lock missing                        (1.57.7 S4) nic_send / net_lo_enqueue / tcp_send_pkt_seq reached without
+#                                            its lock (net_tx_lock / tcp_tab_lock) — best-effort witnesses
+# ⚠ NOT denied (a test requires it): "execwait: first scheduled child" (S3b's #37 witness — fg-smoke, run37-smp4);
+#   "virtio-net: TX ring full - frame dropped" (S4: a diagnostic latch, a burst
+#   may legitimately fill the ring); "wq: first cross-CPU resume from a kernel wait" (klug-only witness, waitx P8);
+#   "kbd: line owner reclaimed from a dead process" (klug-only, S3d; S7's KBDNEXT asserts its absence in its phase).
+# kstack-smoke denies this whole pattern too (1.57.7; it carried its own shorter list until then).
+SMOKE_INVARIANT_DENY="sched: refused non-ready pick|sched: exec_and_wait entered with|sched: kernel_resume with|syscall: kernel stack is not the caller|PANIC: Double Fault|boot: BSP stack window not free RAM|wq: wait primitive entered|wq: arm from a non-running|wq: current is not running|wq: sleep resumed in a non-running|PANIC: wq|sched: resched gate misconfigured|IDLE REFUSED A READY PICK|exec: exec_and_wait is boot-only|fg: IF=0 ring-3 caller|fg: kernel_run_child cannot block|fg: execwait cannot block|fg: execwait wait ended abnormally|net: lock overlap|net: lock missing|proc: orphan zombie recycled|lifecycle: park refused|lifecycle: signal point with preempt held|lifecycle: claimed a kernel continuation"
 
 # smoke_accel <smp> — the QEMU accelerator + CPU model for a boot at `-smp <smp>` (1.57.6, agnos S3).
 #
@@ -210,5 +325,40 @@ smoke_accel() {
         echo "-accel tcg,thread=multi -cpu max"; return 0
     fi
     echo "-cpu max"
+    return 0
+}
+
+# smoke_require_image <image> <expected flags> (1.57.7 IMG-fix, reviews A6/B6) — refuse to boot a kernel this smoke
+# was not written for. ⛔ WHY: doom-smoke leaves a DOOM_SELFTEST kernel in build/agnos, and shutdown-smoke — which
+# boots whatever build/agnos is on disk — then booted it and scored all three arms PASS (1.57.7 IMG run, set aside
+# by hand). A smoke that cannot tell which kernel it boots passes on the wrong one. scripts/build.sh records every
+# x86_64 image's provenance in <image>.flags ("flags=<the #defines beyond ARCH_X86_64/ELF64_KERNEL, space-separated>"
+# and "md5=<the image's md5>"; bench.sh marks its rewritten-source image flags=BENCH). This refuses (exit 1) when the
+# record is missing, when the image changed after build.sh wrote it (a copy from elsewhere), or when the flags differ
+# from <expected flags> ("" = the plain production build). The refusal names the fix.
+smoke_require_image() {
+    _sr_img="$1"; _sr_want="$2"; _sr_meta="$1.flags"
+    if [ ! -f "$_sr_meta" ]; then
+        echo "  REFUSED: $_sr_img has no provenance record ($_sr_meta) — rebuild it with scripts/build.sh"
+        exit 1
+    fi
+    _sr_have=$(sed -n 's/^flags=//p' "$_sr_meta" | head -1)
+    _sr_md5=$(sed -n 's/^md5=//p' "$_sr_meta" | head -1)
+    _sr_now=$(md5sum "$_sr_img" 2>/dev/null | cut -d' ' -f1)
+    if [ -z "$_sr_md5" ] || [ "$_sr_md5" != "$_sr_now" ]; then
+        echo "  REFUSED: $_sr_img is not the image scripts/build.sh recorded (md5 $_sr_now, record says ${_sr_md5:-none}) — rebuild it"
+        exit 1
+    fi
+    # compared as SETS (build.sh writes them in #define order, a caller names them in any order)
+    _sr_have=$(printf '%s\n' $_sr_have | sort | tr '\n' ' ' | sed 's/ *$//')
+    _sr_want=$(printf '%s\n' $_sr_want | sort | tr '\n' ' ' | sed 's/ *$//')
+    if [ "$_sr_have" != "$_sr_want" ]; then
+        if [ -z "$_sr_want" ]; then
+            echo "  REFUSED: this smoke boots the PLAIN production kernel, but $_sr_img was built with [$_sr_have] — run: sh scripts/build.sh"
+        else
+            echo "  REFUSED: this smoke boots a [$_sr_want] kernel, but $_sr_img was built with [${_sr_have:-plain}]"
+        fi
+        exit 1
+    fi
     return 0
 }

@@ -59,68 +59,23 @@ fn stack_canary_check(canary) {
 
 var sys_exit_code = 0;
 
-# --- execwait #37 nested-exec save block (1.43.x) ---
-# Snapshot of agnsh's kernel resume context across the nested exec_and_wait(child).
-# ALL module-global, NOT [rbp-N] locals: agnsh was itself entered via exec_and_wait
-# (by kybernet PID 1), so the resume-context GLOBALS (exec_ctx + kernel_return_* +
-# kpti_* + kernel_rsp_save) currently hold KYBERNET's armed frame — the frame
-# agnsh's OWN exit() must longjmp into. The nested exec_and_wait(child) overwrites
-# them with the #37-handler frame and kernel_resume zeroes kernel_return_*, so
-# without a save/restore agnsh's later exit() would find kernel_return_rsp=0 and
-# never resume kybernet. Single-slot: correct for one-level nesting under the
-# single-threaded run-to-completion model (agnsh runs leaf programs); a recursive
-# execwait is refused via ew37_busy. Module-global `var X[N]` = N*u64 — the 8-u64
-# exec_ctx mirror is exactly right.
-# 1.46.x SMP STEP-2 (#3, 2026-06-26): the ew37_* save block goes PER-CPU (the deferred note below,
-# now resolved). Each CPU nesting a #37 gets its OWN snapshot — two CPUs in a #37 simultaneously
-# (a bg-proc execwait on an AP while agnsh's #37 runs on the BSP) no longer collide on this scratch.
-# Scalars: pcpu_X[4] cell at byte cpu*8; the ew37_ctx mirror: pcpu_ew37_ctx[32], block for cpu c at
-# byte c*64 (ew37_ctx_base folds pcpu_cpu()*64 so the copy loop's +0..+56 read VERBATIM). pcpu_cpu()
-# cpu_count<2 fast path = slot 0 → single-core byte-identical.
-var pcpu_ew37_ctx[32];    # exec_ctx[0..7] mirror per CPU (kybernet's armed resume frame)
-fn ew37_ctx_base() { return &pcpu_ew37_ctx + pcpu_cpu() * 64; }
-var pcpu_ew37_kr_rsp[4];      # kernel_return_rsp (==1 armed)
-fn ew37_kr_rsp_set(v) { store64(&pcpu_ew37_kr_rsp + pcpu_cpu() * 8, v); return 0; }
-fn ew37_kr_rsp_get() { return load64(&pcpu_ew37_kr_rsp + pcpu_cpu() * 8); }
-var pcpu_ew37_kr_rip[4];      # kernel_return_rip
-fn ew37_kr_rip_set(v) { store64(&pcpu_ew37_kr_rip + pcpu_cpu() * 8, v); return 0; }
-fn ew37_kr_rip_get() { return load64(&pcpu_ew37_kr_rip + pcpu_cpu() * 8); }
-# (1.57.6 S3.3: pcpu_ew37_rsp_save is GONE — the caller's user RSP is in its own syscall frame, [ktop-8],
-# and the exit stub loads it from there; nothing per-CPU needs saving across the nested run.)
-var pcpu_ew37_a4[4];          # ksyscall_a4 (defense-in-depth)
-fn ew37_a4_set(v) { store64(&pcpu_ew37_a4 + pcpu_cpu() * 8, v); return 0; }
-fn ew37_a4_get() { return load64(&pcpu_ew37_a4 + pcpu_cpu() * 8); }
-var pcpu_ew37_pid[4];         # proc_current_get() (agnsh's pid)
-fn ew37_pid_set(v) { store64(&pcpu_ew37_pid + pcpu_cpu() * 8, v); return 0; }
-fn ew37_pid_get() { return load64(&pcpu_ew37_pid + pcpu_cpu() * 8); }
-var pcpu_ew37_resume_pid[4];  # 1.44.14: exec_resume_pid (agnsh) saved across the nested exec
-fn ew37_resume_pid_set(v) { store64(&pcpu_ew37_resume_pid + pcpu_cpu() * 8, v); return 0; }
-fn ew37_resume_pid_get() { return load64(&pcpu_ew37_resume_pid + pcpu_cpu() * 8); }
-var pcpu_ew37_cr3[4];         # agnsh's CR3 (kpti_user_cr3 the exit stub reloads into CR3)
-fn ew37_cr3_set(v) { store64(&pcpu_ew37_cr3 + pcpu_cpu() * 8, v); return 0; }
-fn ew37_cr3_get() { return load64(&pcpu_ew37_cr3 + pcpu_cpu() * 8); }
-var pcpu_ew37_cpid[4];        # child pid (per-CPU; a [rbp-N] local would survive the disjoint kstack
-fn ew37_cpid_set(v) { store64(&pcpu_ew37_cpid + pcpu_cpu() * 8, v); return 0; }   # too, but the slot is the contract)
-fn ew37_cpid_get() { return load64(&pcpu_ew37_cpid + pcpu_cpu() * 8); }
-var pcpu_ew37_code[4];        # child exit code captured post-resume
-fn ew37_code_set(v) { store64(&pcpu_ew37_code + pcpu_cpu() * 8, v); return 0; }
-fn ew37_code_get() { return load64(&pcpu_ew37_code + pcpu_cpu() * 8); }
-# 1.57.6 (Path 2, S3.3) — EXEC_SELFTEST witness for #37's step (h): right after the resume, TSS.RSP0 AND this CPU's
-# syscall top must both be the CALLER's kernel-stack top again (TSS.RSP0 used to be left on the reaped child's
-# slot). exec-smoke gates on it.
-# ⚠ At caller pid 0 the witness is VACUOUS: kernel_resume parks both on slot 0 (kstack_install(0)), which IS a
-# pid-0 caller's stack, so (h)'s re-install and its absence read the same — mutation M-B6 (delete (h)'s install)
-# measured exactly that, 'restored' twice, before the selftest ran /bin/exwv at a non-zero pid. It says so
-# instead of passing.
+# ⭐ 1.57.7 (S3b) — THE #37 SAVE BLOCK IS GONE. execwait#37 used to run its child OUT OF BAND through exec_and_wait
+# and snapshot the caller's kernel resume context into per-CPU ew37_* cells (ctx, kernel_return_*, pid, resume pid,
+# CR3, child pid, code), with a per-CPU re-entrancy guard (ew37_busy) and per-CPU path/env staging. #37 is now a
+# BLOCKING WAIT (sys_execwait below): the child is an ordinary scheduled process, the caller sleeps in the kernel on
+# its own stack (INV-FG-4: nothing per-CPU is read after the wait), so there is nothing to save, nothing to restore
+# and no nest limit (the 16-slot table is the only bound). docs/architecture/foreground-exec.md.
+# EXEC_SELFTEST witness (was ew37_rsp0_check, #37's old step (h)): after the wait TSS.RSP0 AND this CPU's syscall
+# top must be the CALLER's kernel-stack top — the resched switch tail's kstack_install is what put them back.
+# exec-smoke gates `exec: rsp0 restored` (count >= 2: exwv + envprop, post-scheduler, never at pid 0).
 #ifdef EXEC_SELFTEST
-fn ew37_rsp0_check() {
+fn execwait_rsp0_check(me) {
     var rc_c = tss_get_current_cpu_id();
     if (rc_c >= 4) { rc_c = 0; }
-    var rc_p = ew37_pid_get();
-    if (rc_p == 0) { kprintln("exec: rsp0 check VACUOUS (caller pid 0)", 39); return 0; }
+    if (me == 0) { kprintln("exec: rsp0 check VACUOUS (caller pid 0)", 39); return 0; }
     var rc_ok = 0;
-    if (load64(&tss_array + rc_c * 104 + 4) == proc_rsp0_top(rc_p)) {
-        if (load64(&pcpu_syscall_kstack_top + pcpu_cpu() * 8) == proc_rsp0_top(rc_p)) { rc_ok = 1; }
+    if (load64(&tss_array + rc_c * 104 + 4) == proc_rsp0_top(me)) {
+        if (load64(&pcpu_syscall_kstack_top + pcpu_cpu() * 8) == proc_rsp0_top(me)) { rc_ok = 1; }
     }
     if (rc_ok == 1) { kprintln("exec: rsp0 restored", 19); }
     else { kprintln("exec: RSP0 STALE", 16); }
@@ -128,23 +83,8 @@ fn ew37_rsp0_check() {
 }
 #endif
 #ifndef EXEC_SELFTEST
-fn ew37_rsp0_check() { return 0; }
+fn execwait_rsp0_check(me) { return 0; }
 #endif
-# 1.46.x SMP sub-bite 4d: the #37 re-entrancy guard goes PER-CPU (was a single global `ew37_busy`).
-# Each CPU tracks its OWN nested-exec state so a #37 in flight on CPU N does not block CPU M. Capped
-# via pcpu_cpu() (syscall_hw.cyr); single-core fast path = slot 0 → byte-for-byte the old global.
-# RESOLVED 1.46.x STEP-2 (#3, 2026-06-26): the ew37_* SCRATCH (ew37_cr3/_cpid/_code/_path/_env + ew37_ctx
-# + the kr/rsp_save/a4/pid/resume_pid scalars) are NOW per-CPU (above + below), joining the already-per-CPU
-# kernel_rsp_save+kpti_* (4b/4c). Two CPUs nesting #37 SIMULTANEOUSLY (reachable post-flip: a bg-proc
-# execwait on an AP while agnsh's #37 runs on the BSP) each get their own slot — no scratch collision.
-var pcpu_ew37_busy[4];
-fn pcpu_ew37_busy_get() { return load64(&pcpu_ew37_busy + pcpu_cpu() * 8); }
-fn pcpu_ew37_busy_set(v) { store64(&pcpu_ew37_busy + pcpu_cpu() * 8, v); return 0; }
-var pcpu_ew37_path[64];   # 1.46.x STEP-2 (#3): PER-CPU. 16 u64 (128 B) per CPU × 4; cpu c at byte c*128.
-fn ew37_path_base() { return &pcpu_ew37_path + pcpu_cpu() * 128; }   # kernel copy of the caller's path cstr (128 B). elf_load_from_file
-# does ext2/NVMe I/O under boot CR3 (the user VA + the NVMe BAR are
-# NOT both mapped under one CR3), so the path is copied here from the
-# user buffer BEFORE the CR3 switch — mirroring sh_cmd_run's sh_path_buf.
 
 # 1.44.10: spawn(#3) in-memory-ELF staging buffer (16 KB = 2048 u64). A ring-3
 # PARENT calling spawn runs the handler under the PARENT's CR3, which mirrors only
@@ -157,6 +97,7 @@ fn ew37_path_base() { return &pcpu_ew37_path + pcpu_cpu() * 128; }   # kernel co
 # block). 16 KB bounds an in-memory payload; real binaries load from disk (#37).
 # 1.46.x SMP STEP-2 (#3): PER-CPU. Two CPUs each in spawn#3 (e.g. a bg-proc spawn on an AP) would
 # clobber one another's staging. 2048 u64 (16 KB) per CPU × 4; cpu c at byte c*16384.
+# R4/R6 (1.57.7): never add a wq_* call inside this buffer's live span (per-CPU scratch — docs/architecture/blocking-waits.md R4).
 var pcpu_spawn_elf_buf[8192];
 fn spawn_elf_buf_base() { return &pcpu_spawn_elf_buf + pcpu_cpu() * 16384; }
 
@@ -164,11 +105,12 @@ fn spawn_elf_buf_base() { return &pcpu_spawn_elf_buf + pcpu_cpu() * 16384; }
 # module-global var X[N] is N*u64 = 8N bytes). Holds the caller's "PATH [args..]" line (capped at
 # SPAWN_LINE_MAX) or its SPAWN_F_ARGV blob for the NON-BLOCKING from-disk spawn —
 # copied here under the caller CR3 BEFORE the boot-CR3 switch (the user VA won't resolve once
-# CR3 is the NVMe-BAR-mapping boot CR3). A DEDICATED buffer (not ew37_path) so a #43 from a
-# bg proc can never collide with agnsh's in-flight #37 frame.
+# CR3 is the NVMe-BAR-mapping boot CR3). ⭐ 1.57.7 (S3b): execwait#37 stages its line here too (spawn_load_child);
+# the per-CPU span is one preempt_disable bracket with no block point in it (INV-FG-5), so #37 and #43 cannot collide.
 # ⭐ 1.57.6: WIDENED 128 -> 1024 B per CPU — it now also stages spawn_path#43's SPAWN_F_ARGV blob (up to
 # SPAWN_ARGV_MAX bytes, NULs included). The line form still uses at most SPAWN_LINE_MAX of it.
 # [512] = 512 u64 = 4096 B = 4 CPUs x 1024; cpu c at byte c*1024. (The 8N module-global rule.)
+# R4/R6 (1.57.7): never add a wq_* call inside this buffer's live span (per-CPU scratch — docs/architecture/blocking-waits.md R4).
 var pcpu_spawn_path_buf[512];
 fn spawn_path_buf_base() { return &pcpu_spawn_path_buf + pcpu_cpu() * 1024; }
 
@@ -199,15 +141,13 @@ var SPAWN_E_NOENT  = 4;             # executable missing, not a regular file, un
 var SPAWN_E_NOEXEC = 5;             # not an ELF64 this kernel will load (magic/class/entry/phdr/segment, W^X, size)
 var SPAWN_E_ARGS   = 6;             # bad a2 (flags/length), bad path range, empty path, bad argv blob,
 # > SPAWN_ARGC_MAX tokens, or (flagged forms only) a bad env blob
-# 1.44.19: per-process env staging — kernel copies of the caller's flat "KEY=V\0KEY=V\0"
-# blob (a3=ptr, a4=len on #37/#43; <=1024 B, <=16 entries). DEDICATED buffers per the
-# spawn_path_buf rationale above (a bg-proc #43 must never collide with agnsh's in-flight
-# #37 frame). No ew37-style save/restore needed: the blob is fully consumed onto the
-# child's stack page INSIDE elf_load_from_file, which returns before exec_and_wait runs
-# the child — by the time any nested syscall exists, these contents are dead.
-# [128] = 128 u64 = 1024 B each (the 8N module-global rule).
-var pcpu_ew37_env[512];   # 1.46.x STEP-2 (#3): PER-CPU execwait(#37) env staging. 128 u64 (1024 B) per CPU × 4; cpu c at byte c*1024.
-fn ew37_env_base() { return &pcpu_ew37_env + pcpu_cpu() * 1024; }
+# 1.57.7 (S8): the image does not fit the effective memory cap (spawn_limits#107 or inherited). DETERMINISTIC —
+# retrying never helps (raise the cap), unlike -3, which is back-pressure. #37 folds it to -1, #3 returns -1.
+var SPAWN_E_LIMIT  = 7;
+# 1.44.19: per-process env staging — the kernel copy of the caller's flat "KEY=V\0KEY=V\0" blob (a3=ptr, a4=len on
+# #37/#43; <=1024 B, <=16 entries) is pcpu_spawn_env_buf (below, after spawn_shape_strict), shared by both since
+# 1.57.7 (S3b: spawn_load_child). It is consumed onto the child's stack page INSIDE elf_load_from_file, within
+# spawn_load_child's preempt_disable bracket (INV-FG-5), so its contents are dead before any wait.
 
 # 1.46.x (fd-redirect for output capture) — issue 2026-06-15-cyrius-stdlib-missing-syscalls
 # group 1 ("the high-value one": an fd-redirect primitive for capturing subprocess helpers;
@@ -227,98 +167,11 @@ fn ew37_env_base() { return &pcpu_ew37_env + pcpu_cpu() * 1024; }
 # chan_endow_pick_fd keep the two apart in either arm order; this covers an op-0 REPLACE.
 # ⚠ Every #43 and #37 return clears the caller's WHOLE arm state (spawn_arms_clear), success or not.
 #
-# The per-CPU half that remains is the #37 BACKUP (the child's original src entries, restored when the
-# child exits). #37 is run-to-completion and its nest is per-CPU and single-level, so per-CPU is exact.
-# The arrays live in vfs.cyr (pcpu_redir_backup / pcpu_redir_bsrc) because pipe_buf_referenced must
-# see a saved pipe entry as a live reference; only these accessors (x86-only) index them by CPU.
-fn redir_backup_base() { return &pcpu_redir_backup + pcpu_cpu() * 128; }   # SPAWN_REDIR_MAX x 32 B per CPU
-fn redir_bsrc_base() { return &pcpu_redir_bsrc + pcpu_cpu() * 32; }        # SPAWN_REDIR_MAX x u64 per CPU
-
-# execwait#37: apply `creator`'s armed redirects to `child`'s table, saving each src entry in this CPU's
-# backup. Called right before the child runs (under boot CR3 — fd tables are kernel heap).
-# ⛔ #37 MUST PASS BOTH PIDS: after kernel_resume proc_current_get() is 0, so the restore keyed by it
-# would silently skip — harmless on a private child table, but on the global-table fallback it would
-# leave proc 0's fd permanently repointed (exec-redirect-smoke's global snapshot catches exactly that).
-# ⚠ LOCK-FREE ON PURPOSE, unlike the restore: every entry this overwrites or copies is a DUPLICATE of one the
-# creator still holds (the child's table was copied from the creator's and the child has not run yet), and
-# the creator is suspended in this #37 until the restore — so no pipe buffer can lose its last reference
-# here, and a concurrent scan that catches a half-copied slot still finds the creator's own entry.
-fn exec_redirect_apply(creator, child) {
-    var ran = redir_n_get(creator);
-    if (ran == 0) { return 0; }
-    var rtbl = vfs_fd_table_of(child);
-    var rplaced = endow_placed_get(creator) - 1;          # -1 = no endowment was placed
-    var rbk = redir_backup_base();
-    var rbs = redir_bsrc_base();
-    var ri = 0;
-    while (ri < ran) {
-        var rs = redir_src_get(creator, ri);
-        var rd = redir_dst_get(creator, ri);
-        store64(rbs + ri * 8, 0);
-        if (rs == rplaced) {
-            kprintln("spawn: redirect onto the endowed fd skipped", 43);
-        } else {
-            var rk = 0;
-            while (rk < 32) {
-                store64(rbk + ri * 32 + rk, load64(rtbl + rs * 32 + rk));   # save the src entry
-                store64(rtbl + rs * 32 + rk, load64(rtbl + rd * 32 + rk));  # src <- dst, from the CURRENT table
-                rk = rk + 8;
-            }
-            store64(rbs + ri * 8, rs + 1);
-        }
-        ri = ri + 1;
-    }
-    return 0;
-}
-# Restore after the child exits: REVERSE arm order (a later pair may have read an earlier pair's
-# result), zero each backup (a stale backup would otherwise pin a pipe buffer in pipe_buf_referenced),
-# then clear the creator's redirect set.
-# ⛔ THE ENTRY BEING OVERWRITTEN CAN BE A SOLE PIPE REFERENCE. The child owned its slot while it ran; if it
-# closed the redirected fd and made a pipe that landed there, the restore drops that pipe's last
-# reference in THIS table — so it is dropped through pipe_buf_put instead of silently leaked.
-# ⛔⛔ AND THE OVERWRITE, THE BACKUP ZEROING AND THAT pipe_buf_put ARE ONE fs_lock HOLD, NEVER "overwrite, then
-# lock and re-check". The child may have handed the same buffer to a #43 grandchild that is still running
-# on another CPU. Overwriting the slot lock-free made the reference vanish while the lock was free: the
-# grandchild's last close (vfs_close_inner, under fs_lock) then scanned, found nothing, and freed the
-# buffer — and the restore's own later pipe_buf_put scanned, found nothing either, and freed it AGAIN: a
-# double push on the 4096 slab free list, so two later kmalloc(4096)s (pipes, TCP rings) alias. With the
-# slot cleared and the scan in one hold (the rule vfs_close_inner and proc_destroy_fd_table already keep),
-# the two droppers serialize and exactly one of them sees "no other reference" — see the lifetime banner
-# at pipe_buf_referenced (vfs.cyr).
-# ⚠ preempt_disable brackets it because fs_spin_lock is a plain xchg that does not nest (written before 1.57.6
-# S3.2 made every plain spinlock raise preempt_count itself; kept — the count nests). No caller holds fs_lock:
-# #37's resume point and exec_redirect_selftest both run lock-free.
-# ⚠ Nothing in the loop takes another lock except pipe_buf_put -> kfree_sized (heap), the fs -> heap order
-# every close already uses.
-fn exec_redirect_restore(creator, child) {
-    var qtbl = vfs_fd_table_of(child);
-    var qbk = redir_backup_base();
-    var qbs = redir_bsrc_base();
-    preempt_disable();
-    fs_spin_lock();
-    var qi = SPAWN_REDIR_MAX - 1;
-    while (qi >= 0) {
-        var qs1 = load64(qbs + qi * 8);
-        if (qs1 != 0) {
-            var qsb = qtbl + (qs1 - 1) * 32;
-            var qdrop = 0;
-            if (ktag(qsb) == VFS_PIPE) { qdrop = kpayload(qsb, 2); }
-            var qk = 0;
-            while (qk < 32) {
-                store64(qsb + qk, load64(qbk + qi * 32 + qk));
-                store64(qbk + qi * 32 + qk, 0);
-                qk = qk + 8;
-            }
-            store64(qbs + qi * 8, 0);
-            if (qdrop != 0) { pipe_buf_put(qdrop); }
-        }
-        qi = qi - 1;
-    }
-    fs_spin_unlock();
-    preempt_enable();
-    redir_clear(creator);
-    return 0;
-}
+# ⭐ 1.57.7 (S3b): BOTH consumers apply into the CHILD's private table and restore nothing — the table dies with the
+# child (proc_reap_child -> proc_destroy_fd_table, under fs_lock). #43 through spawn_fd_shape; #37 through
+# spawn_shape_strict, which refuses a child on the global table (DEP-1). The #37 per-CPU BACKUP that used to live
+# here (exec_redirect_apply / exec_redirect_restore and vfs.cyr's pcpu_redir_backup / pcpu_redir_bsrc, needed while
+# #37 ran its child out of band on the CALLER's table view) is gone with the save block.
 
 # spawn_path#43's fd shaping (1.57.6; replaces 1.56.39's spawn_redirect_apply). Runs after
 # elf_load_from_file succeeds and proc_set_ring3, BEFORE the child is made READY — once it is READY an
@@ -329,13 +182,17 @@ fn exec_redirect_restore(creator, child) {
 #      passed fds (#62 `f|ADD, x` = "give the child my fd x as its fd f")} + {the channel endowment}.
 #   3. Clear the creator's redirect set.
 # ⛔⛔ THE SCRUB IS ktag_clear, NEVER vfs_close. The child's slots are COPIES of the parent's: vfs_close_inner
-# would tcp_close the PARENT's connection for a VFS_SOCK and flush + release the PARENT's pool block for a
+# would tcp_close a kernel-owned (tag 0) connection for a VFS_SOCK (an owned conn's inherited copy is inert
+# since 1.57.7 S5 — tcp_fd_owner refuses a non-owner) and flush + release the PARENT's pool block for a
 # VFS_SEC_WFILE. A raw zero drops only this copy; the parent's entries are untouched and still hold every
 # reference (so no pipe buffer can lose its last reference here — see pipe_buf_referenced's banner).
 # ⛔ REFUSES WHEN THE CHILD IS ON THE GLOBAL vfs_table (vfs_fd_inherit's kmalloc fallback, or proc 0's
 # explicit base): a redirect there would repoint fd N for proc 0 and every global-table user, forever, and
-# a CLEANFD scrub there would close proc 0's fds. -1; the #43 caller tears a CLEANFD child down
-# (-SPAWN_E_NOMEM) and lets a legacy one run unredirected, as 1.56.39 did.
+# a CLEANFD scrub there would close proc 0's fds. -1; the #43 caller tears the child down (-SPAWN_E_NOMEM).
+# ⭐ 1.57.7 (S3b, operator OQ-7): a LEGACY child is torn down too — it used to run unredirected on the global table
+# (1.56.39), sharing proc 0's fds CONCURRENTLY with kmain (its close(1) would close kmain's console): the same
+# argument as #37's DEP-1. The fallback only arises when a 1 KB kmalloc fails (D11), so failing closed costs nothing.
+# #37 reaches the same refusal through spawn_shape_strict (redirect armed or not).
 # ⛔ THE TEST IS THE RESOLVED TABLE, NOT `proc_fd_base_get(pid) == 0` — proc 0's base is set EXPLICITLY
 # to &vfs_table (vfs_init), and a `== 0` guard passed straight through it; the 1.56.39 selftest caught
 # exactly that (`spawnredir: FAIL global not refused`).
@@ -346,7 +203,7 @@ fn spawn_fd_shape(child, creator, clean) {
         if (clean != 0) {
             kprintln("spawn: CLEANFD child is on the global fd table -- refused", 57);
         } else {
-            if (fsn > 0) { kprintln("spawn: child is on the global fd table -- redirect skipped", 58); }
+            kprintln("spawn: child is on the global fd table -- refused", 49);   # 1.57.7 (OQ-7): legacy #43 too
         }
         redir_clear(creator);
         return 0 - 1;
@@ -380,21 +237,38 @@ fn spawn_fd_shape(child, creator, clean) {
     redir_clear(creator);
     return 0;
 }
-# #43's step (f): shape the child's table, and TEAR DOWN a CLEANFD child that cannot be shaped.
+# #43's step (f): shape the child's table, and TEAR DOWN a child that cannot be shaped.
 # -> 0 (make it READY) or -SPAWN_E_NOMEM (the child is gone; return that code).
-# ⛔ A CLEANFD child must never run on the GLOBAL table (vfs_fd_inherit's kmalloc fallback): it is torn
+# ⛔ A #43 child must never run on the GLOBAL table (vfs_fd_inherit's kmalloc fallback): it is torn
 # down unrun. It is state 3 and never scheduled, so proc_reap_child's off-cpu fence returns at once;
 # placement already refused on the same test, so any endowment stayed with the parent. The address
-# space, the fd base, the slot (LIFO collapse) and the ppid are released as for a reap. A LEGACY child
-# (clean == 0) runs unredirected on the global table, as 1.56.39 did.
+# space, the fd base, the slot (LIFO collapse) and the ppid are released as for a reap. ⭐ 1.57.7 (OQ-7): this
+# now holds for a LEGACY child (clean == 0) too — it ran unredirected on the global table until 1.57.6.
 # ⚠ A function of its own so SPAWN_SELFTEST can drive exactly this sequence on a loaded child whose table
 # was forced to the global fallback — the allocator has no fault injection to reach it through #43.
 fn spawn_shape_or_teardown(child, creator, clean) {
     if (spawn_fd_shape(child, creator, clean) >= 0) { return 0; }
-    if (clean == 0) { return 0; }
     proc_reap_child(child);
     return 0 - SPAWN_E_NOMEM;
 }
+# ⭐ 1.57.7 (S3b) — execwait#37's shape (spawn_load_child with strict != 0). The #37 child is an ordinary SCHEDULED
+# process that runs CONCURRENTLY with every other one (its caller blocks), so it must never run on the GLOBAL
+# vfs_table: it would share proc 0's fds, and its close(1) would close kmain's console. So the global-table fallback
+# (vfs_fd_inherit's kmalloc failure, D11) is REFUSED — redirect armed or not (DEP-1) — and the child is torn down
+# unrun (state 3, never scheduled: proc_reap_child's off-CPU fence returns at once). On a private table the armed
+# redirects apply into the CHILD's table and the set is cleared; nothing is restored afterwards — the table dies with
+# the child at its reap (proc_reap_child -> proc_destroy_fd_table). -> 0, or -SPAWN_E_NOMEM (child gone).
+fn spawn_shape_strict(child, creator) {
+    if (vfs_fd_table_of(child) == &vfs_table) {
+        redir_clear(creator);
+        kprintln("execwait: child is on the global fd table -- refused", 52);
+        proc_reap_child(child);
+        return 0 - SPAWN_E_NOMEM;
+    }
+    spawn_fd_shape(child, creator, 0);      # cannot refuse now (private table): applies the redirects, clears the set
+    return 0;
+}
+# R4/R6 (1.57.7): never add a wq_* call inside this buffer's live span (per-CPU scratch — docs/architecture/blocking-waits.md R4).
 var pcpu_spawn_env_buf[512];   # 1.46.x STEP-2 (#3): PER-CPU spawn_path(#43) env staging. 128 u64 (1024 B) per CPU × 4; cpu c at byte c*1024.
 fn spawn_env_buf_base() { return &pcpu_spawn_env_buf + pcpu_cpu() * 1024; }
 # 1.44.20: blit#39 scaled-row staging — ONE expanded src row (w*scale px, 32bpp). [4096] =
@@ -415,6 +289,7 @@ fn spawn_env_buf_base() { return &pcpu_spawn_env_buf + pcpu_cpu() * 1024; }
 # and sliced four ways. Costs zero image bytes; uses 128 KB of the 2 MB.
 # ⚠ Addressed through pmm_kva_for_access — the DIRECT MAP, never the phys==VA identity alias a
 # crafted PT_LOAD can shadow. See proc.cyr's ptw_pd_kva header.
+# R4/R6 (1.57.7): never add a wq_* call inside this buffer's live span (per-CPU scratch — docs/architecture/blocking-waits.md R4).
 var fb_scale_rowbuf_phys = 0;
 var FB_SCALE_ROWBUF_STRIDE = 32768;      # 8192 px x 4 B — exactly the w*scale <= 8192 gate below
 fn fb_scale_rowbuf_init() {
@@ -703,9 +578,11 @@ fn is_user_array(ptr, count, stride) {
 # this arm at once: CPU 0 writes "/config", CPU 1 overwrites it with "/secrets", and CPU 0 then
 # opens a path it never named — with the two procs' fd tables private, so nothing downstream
 # notices. Every sibling scratch buffer in this file was converted for SMP and says so
-# (pcpu_ew37_path, pcpu_spawn_path_buf, pcpu_ew37_env, pcpu_spawn_env_buf, pcpu_redir_backup,
-# pcpu_sc_gpuop); this one was missed, and its own comment is what stopped a reader noticing.
+# (pcpu_spawn_path_buf, pcpu_spawn_env_buf, pcpu_sc_gpuop — and #37's pcpu_ew37_path / pcpu_ew37_env /
+# pcpu_redir_backup until 1.57.7 S3b deleted them: #37 stages through spawn_load_child's buffers now); this one was
+# missed, and its own comment is what stopped a reader noticing.
 # [128] = 128 u64 = 1024 B = 256 B per CPU x 4; cpu c at byte c*256. (The 8N module-global rule.)
+# R4/R6 (1.57.7): never add a wq_* call inside this buffer's live span (per-CPU scratch — docs/architecture/blocking-waits.md R4).
 var pcpu_sc_open_abs[128];
 fn sc_open_abs_base() { return &pcpu_sc_open_abs + pcpu_cpu() * 256; }
 
@@ -795,6 +672,8 @@ fn spawn_line_tokens(buf, len) {
     return tn;
 }
 
+# ⭐ 1.57.7 (S3b-F4) — PRE-SCHEDULER ONLY: its two callers (exit#0, fault_kill_current) are gated on
+# `sched_active == 0`, because exec_and_wait — the only thing that arms it — refuses after the scheduler starts.
 # Resume kernel execution after a user process exits, by performing
 # exec_and_wait's epilogue: ret_rsp is exec_and_wait's OWN rbp, so
 # `mov rsp, ret_rsp; pop rbp; ret` restores the caller's rbp and returns into
@@ -873,6 +752,177 @@ fn kernel_resume() {
         0xFF; 0xE2;              # jmp rdx
     }
     return 0;
+}
+
+# ═══════════════ 1.57.7 (S7) — THE ONE DEATH CHAIN (docs/architecture/process-lifecycle.md) ═══════════════
+# EVERY death — exit#0, a ring-3 fault, a kill at any of the four boundaries (claim, tick, B1, a wait's ABORT) —
+# runs exactly proc_death(pid, code, sig, via): the releases (proc_death_release), one trace line for a death by
+# signal, then the publish (proc_death_finish). ⛔ REVIEW RULE: no function other than proc_death_release calls a
+# `*_release_pid` (test sources aside). The chain contains no wait (wq_arm / wq_sleep): it runs from the timer ISR on
+# a CPL3 frame (INV-L2), from a claimer's syscall, and from the dying process's own syscall / fault.
+fn proc_death_release(pid, code, sig, via) {
+    if (pid < 0) { return 0; }
+    if (pid >= proc_count) { return 0; }
+    proc_set_exit_code(pid, code);
+    store64(&proc_term_sig + pid * 8, sig);
+    flock_release_pid(pid);                       # advisory locks (a fork-per-accept worker must not strand the world)
+    snd_release_pid(pid);                         # its snd#64 audio slot (Gate 2)
+    shm_release_pid(pid);                         # 1.56.40 bite 1: shm#71/#86 slots
+    chan_release_pid(pid);                        # 1.56.40 bite 4: #97 channel endpoints
+    # 1.55.x: hand the scanout back to the console (a full-screen app that dies must not strand its last frame).
+    # From the timer ISR (D-34) the hand-back runs at once but the disk spill + its kprint are deferred to the next B1.
+    if (via == VIA_TICK) { gpu_release_pid_isr(pid); } else { gpu_release_pid(pid); }
+    tcp_release_pid(pid);                         # 1.57.7 S5: FIN/RST + release this incarnation's TCP conns, held slots included
+    udp_release_pid(pid);                         # 1.57.7 S5: this incarnation's UDP listeners
+    kbd_line_release_pid(pid);                    # 1.57.7 (S3.7): the cooked keyboard line (and its NB partial)
+    blk_rw_disarm_pid(pid);                       # 1.57.7 (S7, D-35): the raw-disk arm, only if THIS process armed it
+    spawn_arms_clear(pid);                        # S2: redirects, endowment, placement record
+    proc_fgwait_set(pid, 0);                      # S3b: a dying waiter's own foreground cell
+    lim_arm_clear(pid);                           # S8: the limits arm (the alloc reset covers a recycle too)
+    return 0;
+}
+fn proc_death(pid, code, sig, via) {
+    proc_death_release(pid, code, sig, via);
+    if (sig != 0) { lifecycle_trace(LT_KILL, pid, sig, via); }   # BEFORE any publish: the line always precedes the reap
+    proc_death_finish(pid, sig, via);
+    return 0;
+}
+# THE PUBLISH. ⛔ REAP BEFORE PUBLISH (D-31): a dying parent reaps its zombies while it still stands in the table as
+# 2/4 (not reusable), and its final scan-and-publish is ONE hold of proctab (OUTER) + sched (INNER) — a child's own
+# final hold (same locks) either precedes it (the child is in my mask) or follows it (it sees death_done[me] == 1 or
+# my state 0: it is an orphan and self-reaps — D-32). Each pass reaps >= 1, so <= 16 passes. proctab_lock also
+# serializes against proc_alloc_slot's reuse scan.
+# A zombie for a live parent (or kmain's fg child): state 0 + SIGCHLD + wq_wake(WK_CHILD|pp) after the store
+# (INV-FG-3). An ORPHAN (its parent incarnation is gone): state 4 while it frees its own fd table and address space,
+# then dead AND reaped in one proctab hold (proc_reap_orphan). Stopped children are continued (they would otherwise
+# have no live authority left that could — D-33) and every child's pending stop is dropped.
+fn proc_death_finish(pid, sig, via) {
+    var fz_pp = proc_get_ppid(pid);
+    var fz_orphan = 0;
+    var fz_kick = 0;
+    var fz_zm = 1;
+    while (fz_zm != 0) {
+        var fz_f = kbd_irq_save();
+        proctab_spin_lock();                       # proctab OUTER, sched INNER (INV-4 / ap_entry order)
+        sched_spin_lock();
+        # One scan: my zombies (to reap before I publish), and every child's pending stop dropped / STOPPED child
+        # continued — repeated each pass, so the final hold's scan is the one that counts.
+        fz_zm = 0;
+        var fz_c = 0;
+        while (fz_c < proc_count) {
+            if (proc_is_child_of(fz_c, pid) == 1) {
+                var fz_s = lc_st(fz_c);
+                if (fz_s == 0) { fz_zm = fz_zm | (1 << fz_c); }
+                if (fz_s == 5) { lc_st_set(fz_c, 1); fz_kick = fz_kick | (1 << fz_c); }
+                lc_sp_set(fz_c, 0);
+            }
+            fz_c = fz_c + 1;
+        }
+        if (fz_zm == 0) {
+            fz_orphan = proc_orphan_of(pid);                              # lc_orphan: kmain's children never are
+            store64(&proc_death_done + pid * 8, 1);
+            lc_sp_set(pid, 0);
+            if (fz_orphan == 0) {
+                lc_st_set(pid, 0);                                        # a zombie for its live parent (or kmain's fg child)
+                atomic_or64(&proc_signals + fz_pp * 8, 1 << 17);          # SIGCHLD, only to a parent validated in THIS hold
+            } else {
+                lc_st_set(pid, 4);                                        # DYING while it reaps itself
+            }
+        }
+        sched_spin_unlock();
+        proctab_spin_unlock();
+        kbd_irq_restore(fz_f);
+        var fz_z = 0;
+        while (fz_z < 16) {
+            if (((fz_zm >> fz_z) & 1) == 1) { proc_reap_child(fz_z); }   # I am still 2/4: my zombies are not reusable
+            fz_z = fz_z + 1;
+        }
+    }
+    # 1.53.x B3b: clear this CPU's FP owner if it named the dying proc (a recycled slot must not hit nm_handler's
+    # prev == cur fast path). Meaningful only on the self path; no fxsave (the dying XMM is garbage).
+    var fz_cpu = pcpu_cpu();
+    if (load64(&fpu_owner + fz_cpu * 8) == pid) { store64(&fpu_owner + fz_cpu * 8, 0 - 1); }
+    if (fz_kick != 0) {
+        sched_kick_mask(fz_kick, 0);
+        var fz_k = 0;
+        while (fz_k < 16) {
+            if (((fz_kick >> fz_k) & 1) == 1) { lifecycle_trace(LT_CONT, fz_k, 0, VIA_ORPHAN); }
+            fz_k = fz_k + 1;
+        }
+    }
+    if (fz_orphan == 0) {
+        wq_wake(WK_CHILD | fz_pp);                 # after state 0 (INV-FG-3); a spurious wake of a recycled slot is harmless
+    } else {
+        proc_reap_orphan(pid);
+        lifecycle_trace(LT_ORPHAN, pid, 0, 0);
+    }
+    return 0;
+}
+# An orphan's reap: its fd table and address space are freed, then the slot is published dead AND reaped in one
+# proctab hold. ⛔ SELF never calls proc_reap_off_cpu_fence (D-23: its self-owned path would publish on_cpu -1 while
+# this CPU is still on the slot's kernel stack); the strict on_cpu reuse rule keeps the slot out of proc_alloc_slot
+# until the switch tail publishes -1, and there is no LIFO collapse on the self path (the append path does not check
+# on_cpu). REMOTE (a claimed target): on_cpu is already -1 — the fence is a formality. The state stays 4 until the
+# publish, so neither the reuse scan nor waitpid sees a half-reaped slot, and a concurrent kill/stop of it is a no-op.
+fn proc_reap_orphan(pid) {
+    var ro_me = proc_current_get();
+    proc_destroy_fd_table(pid, 0);                        # same flush mode as proc_reap_child
+    var ro_cr3 = proc_get_cr3(pid);
+    proc_set_cr3(pid, 0x1000);
+    if (pid == ro_me) { cr3_load(0x1000); }               # SELF: leave my own tables first (INV-11: no other CPU has them)
+    else { proc_reap_off_cpu_fence(pid); kstack_hw_scan(); }
+    if (ro_cr3 != 0x1000) { if (ro_cr3 != 0) { proc_free_address_space(ro_cr3); } }
+    proctab_spin_lock();
+    store64(&proc_ppid + pid * 8, 0);                     # "reaped" ...
+    store64(&proc_ppid_epoch + pid * 8, 0);
+    lc_st_set(pid, 0);              # ... and dead, together
+    if (pid != ro_me) { if (pid == proc_count - 1) { proc_count = proc_count - 1; } }   # never collapse the slot I stand on
+    proctab_spin_unlock();
+    return 0;
+}
+# The SELF death path (exit#0; B1 with a kill pending). Never returns.
+fn proc_exit_current(code, sig) {
+    var xc_me = proc_current_get();
+    sys_exit_code = code;                          # the boot-only kernel_resume gate reads it
+    var xc_via = VIA_NONE;
+    if (sig != 0) { xc_via = VIA_B1; }
+    proc_death(xc_me, code, sig, xc_via);
+    # If we have a saved kernel return point, jump back to it — but ONLY when the EXITING
+    # proc is the one exec_and_wait is run-to-completion waiting on (exec_resume_pid). 1.44.14:
+    # a PREEMPTIVELY-scheduled #43 background job exit()s with proc_current_get() = ITS pid (the
+    # scheduler set it), which != exec_resume_pid (agnsh) — so it must NOT fire agnsh's
+    # kernel_resume (that would resume kybernet as if agnsh exited). Pre-1.44.14 this gate was just
+    # `kernel_return_rsp != 0`, which fired for ANY exit while a resume was armed.
+    # ⭐ 1.57.7 (S3b-F4) — BOOT-ONLY (exec_and_wait refuses after `sched_active = 1`). After the scheduler starts
+    # every child ends through sched_exit_tail below; its waiter was woken by the wq_wake in the chain (INV-FG-3).
+    if (sched_active == 0) {
+        if (kernel_return_rsp_get() != 0) {
+            if (xc_me == exec_resume_pid_get()) {
+                kernel_resume();
+            }
+        }
+    }
+    # ⛔⛔ EXIT MUST NOT RETURN TO RING 3. This used to `return 0` whenever the kernel_resume gate above
+    # did not fire, and that return goes back to a process already marked state 0 — with nothing left to
+    # execute. The caller is `_entry`'s `syscall(SYS_EXIT, r)`, which is the LAST instruction a Cyrius
+    # program emits, so control falls straight into the zero padding after `.text`, where `00 00` decodes
+    # as `add %al,(%rax)` with rax = 0: a write to address 0, #PF, and fault_kill_current.
+    #
+    # ⭐ AND THE DAMAGE IS NOT COSMETIC — IT DESTROYS THE EXIT CODE. proc_set_exit_code stored the real
+    # value at the top of this handler; the spurious #PF then runs fault_kill_current, which overwrites
+    # it with 128 + 14 = **142**. Every tool taking this path reported 142 no matter what it returned.
+    # MEASURED ON IRON 2026-08-03: `modeset --native` and `--pan` both completed their work, printed
+    # every line, returned 95 — and were recorded as `run: exit 142`, faulting at the two padding bytes
+    # immediately after their own `syscall` instruction (rip 0x407e96, `.text` end 0x407e98).
+    #
+    # The fix is the tail fault_kill_current also ends in (a proc dying with no armed kernel_resume): never
+    # return through the abandoned syscall frame.
+    # ⭐ 1.57.7 (Path 2, S3.4): sched_exit_tail (sched.cyr) — a BLOCK-shaped VOLUNTARY switch, so the dead
+    # proc leaves this CPU at once (do_context_switch never revives state 0 and hands a dead old back to the
+    # boot CR3) and its reaper's on_cpu fence spins for a few instructions, not up to a tick. `sti; hlt` is
+    # still its fallback before the scheduler runs or when the switch is refused. preempt_count is 0 here.
+    sched_exit_tail();
+    return 0;                         # unreachable — kept for the type checker
 }
 
 # === proc-teardown-on-fault (1.47.x fault-resilience arc) ===
@@ -1014,37 +1064,28 @@ fn fault_kill_current(vector) {
     fk_n = fmt_hex_buf((dm_read_cr2() >> 21) & 0x1FF, &fk_hex);  klug_append(&fk_hex, fk_n);
     klug_putc(10);
     sys_exit_code = code;
-    proc_set_exit_code(pid, code);
-    flock_release_pid(pid);                       # release advisory locks (mirror exit#0)
-    snd_release_pid(pid);                         # release any snd#64 audio slot (Gate 2)
-    shm_release_pid(pid);                         # 1.56.40 bite 1: release shm#71/#86 slots (mirror exit#0)
-    chan_release_pid(pid);                        # 1.56.40 bite 4: release #97 channel endpoints (mirror exit#0)
-    gpu_release_pid(pid);                         # 1.55.x: hand the scanout back to the console. Without
-    # this a full-screen app that FAULTS would strand its last
-    # frame on the panel forever while the console scrolled
-    # invisibly — the crash path must mirror exit#0 exactly.
-    if (pid < proc_count) {
-        proc_set_state(pid, 0);                   # mark dead — sched_next won't pick it
-        # 1.53.x B3b: clear this CPU's FP owner if it named the dying proc, so a recycled
-        # slot (same pid) doesn't hit nm_handler's prev==cur fast-path and SKIP the restore
-        # (a silent XMM leak into the new occupant). No fxsave — the dying XMM is garbage.
-        var _fkc = pcpu_cpu();
-        if (load64(&fpu_owner + _fkc * 8) == pid) { store64(&fpu_owner + _fkc * 8, 0 - 1); }
-        var ppid = proc_get_ppid(pid);
-        if (ppid >= 0) { proc_send_signal(ppid, 17); }   # SIGCHLD to parent
-    }
-    # Foreground exec child → resume agnsh's exec_and_wait as a clean exit would.
+    # ⭐ 1.57.7 (S7): THE ONE DEATH CHAIN — the releases (the scanout hand-back included: a full-screen app that faults
+    # must not strand its last frame), the FP-owner clear, the zombie / orphan publish, SIGCHLD and the WK_CHILD wake.
+    proc_death(pid, code, 0, VIA_FAULT);
+    # Foreground exec child → resume its exec_and_wait caller as a clean exit would.
     # kernel_resume restores boot CR3 + the saved continuation and NEVER returns.
-    if (kernel_return_rsp_get() != 0) {
-        if (pid == exec_resume_pid_get()) {
-            kernel_resume();
+    # ⭐ 1.57.7 (S3b-F4) — BOOT-ONLY: exec_and_wait runs only before `sched_active = 1` (it refuses after), so this
+    # gate can only be armed then. After the scheduler starts every child ends through sched_exit_tail below and its
+    # waiter (kmain's kernel_run_child, a #37 caller, a WAIT_BLOCK parent) is woken by the wq_wake above.
+    if (sched_active == 0) {
+        if (kernel_return_rsp_get() != 0) {
+            if (pid == exec_resume_pid_get()) {
+                kernel_resume();
+            }
         }
     }
     # 1.50.7 bg-job fault teardown: a BACKGROUND (`&`) proc faulted — it is NOT the
     # foreground exec child (no armed kernel_resume for it), so control reached here
     # instead of the kernel_resume() above. The proc is already torn down (state 0 +
     # SIGCHLD to its parent), so the box must NOT halt: a server running concurrent bg
-    # services has to survive one service's ring-3 fault. Yield to the scheduler via the
+    # services has to survive one service's ring-3 fault. [Until 1.57.7 the text below was the whole story;
+    # since then the tail is sched_exit_tail, a voluntary switch through the same do_context_switch — see the
+    # ⭐ note at the tail.] Yield to the scheduler via the
     # PROVEN timer-preemption path — enable interrupts and halt; the next timer tick's
     # do_context_switch saves this now-dead slot (harmless), declines to revive it
     # (state 0, sched.cyr:336 guard), and context-switches to the next ready proc
@@ -1060,53 +1101,275 @@ fn fault_kill_current(vector) {
     # RPL==3, so the faulter was in ring 3, never mid kernel critical-section) — so
     # do_context_switch is not preempt-gated and WILL switch. Mirrors the smp.cyr:586 /
     # kernel_idle_loop idle pattern (sti;hlt) until that switch fires.
-    # ⚠ 1.57.1 — LEFT AS A BARE `hlt` DELIBERATELY, unlike the idle parks. This is a TERMINAL tail
-    # for a process that is already state-0 and dying; the very next timer tick switches away, so at
-    # most one tick is mis-charged, and it lands on a slot about to be reaped. Routing it through
-    # arch_wait() would buy nothing and would edit a fault-kill path whose IF/preempt reasoning is
-    # written out immediately above. Reconsider only if a switch here is ever observed to take
-    # multiple ticks.
-    while (1) { asm { sti; hlt; } }
+    # ⭐ 1.57.7 (Path 2, S3.4): the terminal tail is sched_exit_tail (sched.cyr) — the dead proc raises a
+    # BLOCK-shaped voluntary switch and leaves this CPU at once instead of waiting up to a tick in `sti; hlt`
+    # (which remains its fallback when the switch is refused). preempt_count is 0 (only a CPL3 fault
+    # reaches this function) and the fault stub gave us IF=0, as sched_switch_vol expects.
+    sched_exit_tail();
     return 0;                             # unreachable — kept for the type checker
 }
 
-# === Blocking keyboard stdin (1.41.1 — shell-separation arc; line discipline 1.41.15) ===
-# read(fd=0) for a ring-3 process: block, read a WHOLE LINE in ONE continuous
-# interrupts-enabled window, echo as we go, return when Enter (newline) is seen
-# or the caller's buffer fills. Canonical-lite line discipline (ABI O1, revised
-# 1.41.15): kernel echoes printable bytes + handles backspace + terminates on
-# newline — the userland shell consumes a ready-made line. This is a deliberate
-# move AWAY from the original RAW per-byte design, for the reason below.
+# === Keyboard stdin: the cooked-line read (1.41.1 shell-separation arc; line discipline 1.41.15; Path 2 1.57.7) ===
+# read(fd=0) for a ring-3 process returns a WHOLE LINE: the kernel echoes printable bytes, handles backspace and
+# terminates on newline (canonical-lite, ABI O1 revised 1.41.15); Ctrl-D at line start returns 0 (EOF), mid-line it
+# delivers the bytes typed so far. Keys arrive one way on both substrates: xHCI HID -> hid_poll -> hid_kb_push ->
+# kb_buf (keyboard.cyr) — hid_poll runs from the xHCI MSI-X ISR (vector 0x51), the BSP tick, and every kb_has_key().
 #
-# WHY THE PER-BYTE RAW DESIGN BROKE ON IRON (the 1.41.14 `14114` "Command: D"
-# burn): keystrokes on archaemenid arrive via IRQ1 -> kb_isr -> kb_buf (the UEFI
-# USB-legacy i8042 emulation; hid_poll's xHCI ring stays empty on that box). The
-# in-kernel recovery shell types correctly there because it holds IF=1 across the
-# ENTIRE line in one loop, so every scancode — including the SHIFT-RELEASE break
-# (0xAA) — is processed in-window and kb_shift is cleared. The old userland path
-# returned after the FIRST char, and ring 3 runs with IF=0 between syscalls
-# (ring3.cyr:108 sets RFLAGS=0x002; SYSRET restores it via R11). In that IF=0
-# inter-byte gap IRQ1 is masked, so a shift-release landing there was DROPPED:
-# kb_shift latched at 1, and scancode 0x20 ('d') resolved through sc_shifted to
-# 'D'=68 — every typed line collapsed to a stuck shift+d. The fix is to stop
-# diverging from the proven reference: drain the whole line under one continuous
-# sti window, exactly like shell.cyr's input loop.
-#
-# Why `sti` is safe in a ring-3 syscall: the only unsafe interrupt mid-syscall
-# is the TIMER (its handler calls do_context_switch; the kernel is not reentrant
-# across a switch on the syscall stack). We clear sched_active for the duration:
-# the timer ISR still fires (EOIs + advances timer_ticks, so net/NTP timing keeps
-# moving) but do_context_switch early-returns. Held across the whole line, same
-# regime the in-kernel shell runs in.
-#
-# kb_has_key() also calls hid_poll() to drain the xHCI USB-HID event ring (how
-# QEMU's usb-kbd delivers — events DMA in regardless of any interrupt). One loop
-# serves both substrates identically now: kb_buf is filled by hid_poll's xHCI drain. We
-# busy-poll (no hlt) so the QEMU path needs no wake interrupt. Echo uses kputc
-# (serial + GOP framebuffer mirror) — the same fb path write(1) uses from a
-# ring-3 syscall since 1.41.12, so it renders under the unified exec CR3 on iron.
+# ⭐ 1.57.7 (Path 2, S3.7) — THE READ BLOCKS ONLY ITS CALLER (kbd_read_line_waiting). With nothing in kb_buf the
+# reader arms a wq wait on WK_KBD (a 100 ms backstop deadline) and leaves its CPU BLOCKED; hid_kb_push wakes it
+# after it appends a scancode (the MSI ISR, the BSP tick's drain, or another reader's drain). IF=0 throughout: no
+# preempt_disable, no sti window — the CPU runs everything else while the operator types. The whole make/break
+# stream is still drained in order inside the line, so a modifier cannot strand across a syscall boundary (the
+# 1.41.14 "stuck shift" was the deleted IRQ1 path losing a break in an IF=0 gap; the xHCI ring queues every event).
+# ⭐ ONE BLOCKING READER PER LINE (kbd_line_*, keyboard.cyr's owner cells): a second blocking reader waits (WK_KBD_OWNER)
+# until the first has returned its line, so two readers never interleave keystrokes. The NB reader (agnsh's prompt
+# poll) answers -2 without draining while another LIVE process owns the line, and itself owns the line while its
+# partial line (-3) is live (NB-OWN). A dead owner is reclaimed (a latched klug-only line) — every death path
+# releases, so that is belt and braces.
+# ⚠ REFUSED CONTEXTS keep the CPU-holding read (kbd_read_blocking_held — the pre-1.57.7 body verbatim): before the
+# scheduler and preempt-held kernel callers (the child of an in-flight execwait#37 was one until 1.57.7 S3b-F2; it
+# blocks like any process now). It takes the line
+# when free and otherwise proceeds UNOWNED (the legacy interleave; documented). The held read's iron rationale is
+# kept above its loop: hlt-park (never a busy spin — real Zen's SMM USB-legacy emulation needs the pipeline), IF=1
+# for the whole line, the timer ISR ticks+EOIs but never switches (preempt_count > 0).
+# kbd_read_blocking returns -1 ONLY when an S7 lifecycle signal aborts the wait (never today): agnsh treats any other
+# r <= 0 as EOF, so a refusal here must fall back to the held read, never to -1.
+
+var kbd_reclaim_pending = 0;   # a claim reclaimed a dead owner's line (said once, after the unlock)
+var kbd_reclaim_said = 0;
+
+# Caller holds input_lock. 1 = kbd_line_owner names a LIVE process (state >= 1 and the recorded epoch), 0 = free or
+# dead. proc_get_state is -1 for a collapsed slot (p >= proc_count); proc_epoch_get has no bounds check, so p < 16
+# is tested first.
+fn kbd_line_owner_live_locked() {
+    var lo_o = kbd_line_owner;
+    if (lo_o <= 0) { return 0; }
+    var lo_p = lo_o - 1;
+    if (lo_p >= 16) { return 0; }
+    if (proc_get_state(lo_p) < 1) { return 0; }
+    if (proc_epoch_get(lo_p) != kbd_line_ep) { return 0; }
+    return 1;
+}
+
+# Caller holds input_lock. Take the line for `me` (0..15) if it is free, already mine, or its owner is dead (then the
+# dead owner's partial NB line dies with it). 1 = mine now, 0 = another LIVE process owns it.
+fn kbd_line_claim_locked(me) {
+    var cl_o = kbd_line_owner;
+    if (cl_o == me + 1) { return 1; }
+    if (cl_o != 0) {
+        if (kbd_line_owner_live_locked() == 1) { return 0; }
+        nbline_pos = 0;                                # NB-OWN: a dead owner's partial line dies with it
+        kbd_reclaim_pending = 1;
+    }
+    kbd_line_owner = me + 1;
+    kbd_line_ep = proc_epoch_get(me);
+    return 1;
+}
+
+# The reclaim line, latched, klug ONLY (not denied: S7's KBDNEXT asserts its absence in its own phase). Called after
+# input_lock is dropped — never print under a spinlock the ISR path takes.
+fn kbd_line_say_reclaimed() {
+    if (kbd_reclaim_pending == 0) { return 0; }
+    kbd_reclaim_pending = 0;
+    if (kbd_reclaim_said == 0) {
+        kbd_reclaim_said = 1;
+        klug_append("kbd: line owner reclaimed from a dead process", 45); klug_putc(10);
+    }
+    return 0;
+}
+
+# Take the line without waiting: 1 = taken or already mine (or `me` out of range: an unowned legacy read), 0 = another
+# live process owns it.
+fn kbd_line_try_take(me) {
+    if (me < 0) { return 1; }
+    if (me >= 16) { return 1; }
+    var tt_f = kbd_irq_save();
+    input_spin_lock();
+    var tt_r = kbd_line_claim_locked(me);
+    input_spin_unlock();
+    kbd_irq_restore(tt_f);
+    kbd_line_say_reclaimed();
+    return tt_r;
+}
+
+fn kbd_line_waiter_done() {
+    var wd_f = kbd_irq_save();
+    input_spin_lock();
+    if (kbd_line_waiters > 0) { kbd_line_waiters = kbd_line_waiters - 1; }
+    input_spin_unlock();
+    kbd_irq_restore(wd_f);
+    return 0;
+}
+
+# Wait until the line is mine. 0 = owned · -1 = a lifecycle signal ABORTED the wait (S7; unreachable before it) ·
+# -2 = deadline `dl` (sched_clock_us; 0 = none — production passes 0, ktest T8d/T8e pass one) passed · -3 = this
+# context may not block after all (wq_arm returned 2: the caller takes the held read).
+# ⛔ THE ARM IS NOT TAKEN UNDER input_lock (the canonical C9 loop: arm -> re-check under the condition's lock -> cancel
+# or sleep). input_lock stays a lock that takes nothing under it (smp.cyr GLOBAL LOCK ORDER), and wq_arm's
+# "state 0 -> sched_exit_tail" path can never run holding it.
+# LOST-WAKEUP PROOF (blocking-waits.md): a release between "waiters++" and the arm finds no state-6 waiter, but the
+# post-arm re-check sees the line free; a release after the arm wakes the waiter (state 1) and the BLOCK-intent guard
+# makes the wq_sleep return at once; the releaser reads kbd_line_waiters under input_lock AFTER clearing the owner, so
+# it cannot miss a waiter that saw the line busy.
+fn kbd_line_acquire(me, dl) {
+    if (me < 0) { return 0; }
+    if (me >= 16) { return 0; }
+    while (1 == 1) {
+        var ka_f = kbd_irq_save();
+        input_spin_lock();
+        if (kbd_line_claim_locked(me) == 1) {
+            input_spin_unlock();
+            kbd_irq_restore(ka_f);
+            kbd_line_say_reclaimed();
+            return 0;
+        }
+        kbd_line_waiters = kbd_line_waiters + 1;
+        input_spin_unlock();
+        var ka_a = wq_arm(WK_KBD_OWNER, dl);           # IF=0 still (ka_f not yet restored): R1
+        if (ka_a == 2) { kbd_line_waiter_done(); kbd_irq_restore(ka_f); return 0 - 3; }
+        if (ka_a == 1) {
+            kbd_line_waiter_done();
+            kbd_irq_restore(ka_f);
+            if (wq_signal_point() == 1) { return 0 - 1; }
+            continue;
+        }
+        input_spin_lock();                             # the re-check AFTER the arm, under the condition's lock
+        var ka_free = 0;
+        if (kbd_line_owner == 0) { ka_free = 1; }
+        if (ka_free == 0) { if (kbd_line_owner_live_locked() == 0) { ka_free = 1; } }
+        input_spin_unlock();
+        if (ka_free == 1) { wq_cancel(); kbd_line_waiter_done(); kbd_irq_restore(ka_f); continue; }
+        if (dl != 0) {
+            if (sched_clock_us() >= dl) { wq_cancel(); kbd_line_waiter_done(); kbd_irq_restore(ka_f); return 0 - 2; }
+        }
+        var ka_r = wq_sleep();
+        kbd_line_waiter_done();
+        kbd_irq_restore(ka_f);
+        if (ka_r == WR_TIMEOUT) { if (dl != 0) { if (sched_clock_us() >= dl) { return 0 - 2; } } }
+        if (ka_r == WR_SIGNAL) { if (wq_signal_point() == 1) { return 0 - 1; } }
+    }
+    return 0;
+}
+
+# Give the line back. A no-op unless `me` owns it AND no NB partial line is live (NB-OWN: while nbline_pos > 0 the NB
+# reader's hold wins over any release by the same pid — mutation M-F6). Wakes the owner waiters (after the unlock)
+# only when it really released and someone is waiting.
+fn kbd_line_release(me) {
+    if (me < 0) { return 0; }
+    if (me >= 16) { return 0; }
+    var kr_f = kbd_irq_save();
+    input_spin_lock();
+    var kr_rel = 0;
+    if (kbd_line_owner == me + 1) {
+        if (nbline_pos == 0) { kbd_line_owner = 0; kr_rel = 1; }
+    }
+    var kr_w = kbd_line_waiters;
+    input_spin_unlock();
+    if (kr_rel == 1) { if (kr_w != 0) { wq_wake(WK_KBD_OWNER); } }
+    kbd_irq_restore(kr_f);
+    return 0;
+}
+
+# Death release (exit#0, fault_kill_current; S7's chain later): a dying owner gives the line back and its partial NB
+# line dies with it. Same wake rule.
+fn kbd_line_release_pid(pid) {
+    if (pid < 0) { return 0; }
+    if (pid >= 16) { return 0; }
+    var kp_f = kbd_irq_save();
+    input_spin_lock();
+    var kp_rel = 0;
+    if (kbd_line_owner == pid + 1) { kbd_line_owner = 0; nbline_pos = 0; kp_rel = 1; }
+    var kp_w = kbd_line_waiters;
+    input_spin_unlock();
+    if (kp_rel == 1) { if (kp_w != 0) { wq_wake(WK_KBD_OWNER); } }
+    kbd_irq_restore(kp_f);
+    return 0;
+}
+
+# #5 fd 0 with a4 == 0 (the dispatch in ksyscall's #5 arm). The waiting read when this context may block, else the
+# held read. Never -1 except for an S7 signal abort (agnsh reads any other r <= 0 as EOF).
 fn kbd_read_blocking(buf, count) {
     if (count <= 0) { return 0; }
+    if (wq_can_block() == 0) { return kbd_read_blocking_held(buf, count); }
+    var kb_me = proc_current_get();
+    var kb_a = kbd_line_acquire(kb_me, 0);
+    if (kb_a == (0 - 3)) { return kbd_read_blocking_held(buf, count); }   # refused after all: the legacy read, never -1
+    if (kb_a != 0) { return 0 - 1; }                                     # S7 signal ABORT only
+    var kb_r = kbd_read_line_waiting(buf, count);
+    kbd_line_release(kb_me);
+    return kb_r;
+}
+
+fn kbd_abort_ret(n) {
+    if (n > 0) { return n; }
+    return 0 - 1;
+}
+
+# One legacy wait step for a context whose wq_arm refused (it may not block after all): one IF=1 hlt with preemption
+# held, exactly the held read's step. REGISTER CONTRACT: kbd_irq_enable/disable are bare sti/cli (no GPR touched).
+fn kbd_wait_held_once() {
+    preempt_disable();
+    kbd_irq_enable();
+    arch_wait();
+    kbd_irq_disable();
+    preempt_enable();
+    return 0;
+}
+
+# THE WAITING READ (1.57.7, S3.7) — the caller owns the line. IF=0 throughout; every sleep is at preempt_count 0.
+# kb_has_key drains the xHCI ring and the deferred HID work at IF=0 (xhci_cmd_wait and hid_kbd_kick are MMIO + spin
+# counts, never a tick-based wait — re-verified 1.57.7). The user buffer is re-read after a resume: the switch restores
+# the slot CR3 (R6) and the int 0xE0 frame's saved RFLAGS.AC = 1 (the syscall's stac), which iretq restores.
+fn kbd_read_line_waiting(buf, count) {
+    # ⛔ The operator's line is LIVE from the moment something is reading it (see the NB twin's banner).
+    fb_line_live = 1;
+    kb_shift = 0; kb_ctrl = 0;                         # a clean start: no stranded modifier from a prior partial read
+    hid_kbd_kick();                                    # re-kick the kbd EP in case it stalled (no-op without a HID kbd)
+    var lw_n = 0;
+    while (lw_n < count) {
+        if (kb_has_key() == 0) {
+            var lw_a = wq_arm(WK_KBD, wq_deadline_after_us(100000));   # 100 ms backstop: the MSI and the BSP tick both wake
+            if (lw_a == 1) { if (wq_signal_point() == 1) { return kbd_abort_ret(lw_n); } continue; }
+            if (lw_a == 2) { kbd_wait_held_once(); continue; }        # not blockable after all: one legacy step
+            if (kbd_ring_nonempty() == 1) { wq_cancel(); continue; }  # the re-check AFTER the arm (no side effects)
+            var lw_r = wq_sleep();
+            if (lw_r == WR_SIGNAL) { if (wq_signal_point() == 1) { return kbd_abort_ret(lw_n); } }
+            continue;
+        }
+        var lw_sc = kb_read_scancode();
+        var lw_ch = scancode_to_ascii(lw_sc);
+        if (lw_ch == 10) {                 # Enter: terminate the line. Echo newline, store it as the terminator.
+            kputc(10);
+            store8(buf + lw_n, 10);
+            lw_n = lw_n + 1;
+            return lw_n;
+        }
+        if (lw_ch == 4) {                  # Ctrl-D: EOF at line start (0), else the bytes typed so far, no LF
+            return lw_n;
+        }
+        if (lw_ch == 8) {                  # Backspace: erase one cell + drop one byte (BS SP BS)
+            if (lw_n > 0) {
+                lw_n = lw_n - 1;
+                kputc(8); kputc(32); kputc(8);
+            }
+        } elif (lw_ch > 31) {              # Printable: store + echo
+            store8(buf + lw_n, lw_ch);
+            lw_n = lw_n + 1;
+            kputc(lw_ch);
+        }
+        # lw_ch == 0 (modifier/release) or another control: consumed in order, never stored.
+    }
+    return lw_n;                           # buffer filled before a newline: the partial line
+}
+
+# THE HELD READ (refused contexts): the pre-1.57.7 body VERBATIM, plus the line: taken at entry when free (and given
+# back on every return); when another live process owns it this read proceeds UNOWNED (the legacy interleave).
+# Why `sti` is safe here: preempt_disable holds the timer's do_context_switch off for the whole line (it still EOIs
+# and ticks), the same regime the in-kernel shell runs in.
+fn kbd_read_blocking_held(buf, count) {
+    if (count <= 0) { return 0; }
+    var kh_me = proc_current_get();
+    var kh_took = kbd_line_try_take(kh_me);
     # ⛔ SAME RULE AS THE NON-BLOCKING TWIN (see its entry banner): the operator's line is LIVE from the
     # moment something is reading it, not from the first echo. The one-shot that corrupts a prompt fires
     # before the first key is echoed, so a flag set at the echo is always too late.
@@ -1132,12 +1395,16 @@ fn kbd_read_blocking(buf, count) {
     # EP if one ever happens anyway. No-op if no HID kbd (slot 0) / already Running.
     var n = 0;
     while (n < count) {
-        while (kb_has_key() == 0) { arch_wait(); }   # hlt-park until timer/kbd IRQ — NOT a busy-spin.
+        while (kb_has_key() == 0) {                   # hlt-park until timer/kbd IRQ — NOT a busy-spin.
+            if (proc_kill_requested_self() == 1) { break; }   # 1.57.7 (S7): defence in depth — B1 ends the caller
+            arch_wait();
+        }
+        if (kb_has_key() == 0) { break; }             # (only after a kill: bail like a full buffer, through the tail below)
         # A continuous IF=1 ring-0 CPU busy-spin starves the firmware's SMM USB-legacy keyboard
         # emulation on real Zen (it injects i8042 scancodes via periodic SMIs, which a never-yielding
         # spin can't let run) -> keyboard dies after the first line; invisible in QEMU (no SMM legacy
         # emulation). hlt yields the pipeline so SMM runs, and is the proven-on-iron recipe used by
-        # sleep_ms#41 (DOOM frame pacing) + kbscan#42 (DOOM input). IF=1 (sti above) so the 100 Hz
+        # the legacy sleep_ms#41 loop (DOOM frame pacing — pre-scheduler, so still legacy after 1.57.7) + kbscan#42 (DOOM input). IF=1 (sti above) so the 100 Hz
         # timer guarantees a wake even with no key; the xHCI MSI-X on vector 0x51 wakes hlt on a key.
         # preempt_count>0 (preempt_disable above) so the timer ISR ticks+EOIs but never switches.
         var sc = kb_read_scancode();
@@ -1148,6 +1415,7 @@ fn kbd_read_blocking(buf, count) {
             n = n + 1;
             kbd_irq_disable();
             preempt_enable();
+            if (kh_took == 1) { kbd_line_release(kh_me); }
             return n;
         }
         if (ch == 4) {                  # Ctrl-D (EOF). Canonical tty semantics:
@@ -1159,6 +1427,7 @@ fn kbd_read_blocking(buf, count) {
             # second Ctrl-D at the fresh line start then yields EOF. Not echoed.
             kbd_irq_disable();
             preempt_enable();
+            if (kh_took == 1) { kbd_line_release(kh_me); }
             return n;
         }
         if (ch == 8) {                  # Backspace: erase one cell + drop one byte
@@ -1178,6 +1447,7 @@ fn kbd_read_blocking(buf, count) {
     # Buffer filled before a newline arrived — return the partial line.
     kbd_irq_disable();
     preempt_enable();
+    if (kh_took == 1) { kbd_line_release(kh_me); }
     return n;
 }
 
@@ -1190,8 +1460,15 @@ fn kbd_read_blocking(buf, count) {
 # agnsh polls this between bg-job waitpid(#4) polls; bg jobs time-slice in the preemptible RING-3
 # gap between agnsh's polls. CRITICAL: the preempt_disable window is SHORT (drain-what's-there,
 # NEVER spin) and released before every return, so the scheduler can run bg procs between calls.
+# ⭐ 1.57.7 (Path 2, S3.7) — THE LINE (keyboard.cyr owner cells): while another LIVE process owns the cooked line (a
+# blocking reader waiting for its line) this call does not drain and answers -2 ("nothing buffered") — the keystrokes
+# are that reader's. It takes the line itself at entry and gives it back on the way out, which is a no-op while its
+# own partial line is live (nbline_pos > 0, invariant NB-OWN): the NB reader keeps the line exactly while it would
+# answer -3, so a line is never split between readers. The -2/-3 semantics and the 1.44.21 clamps are unchanged.
 fn kbd_read_nonblock(buf, count) {
     if (count <= 0) { return 0; }
+    var nb_me = proc_current_get();
+    if (kbd_line_try_take(nb_me) == 0) { return 0 - 2; }   # another live process owns the line: do not drain
     preempt_disable();             # SHORT window — drain only, never spin (see header).
     kbd_irq_enable();              # IF=1 so the xHCI MSI-X (vector 0x51) / 100 Hz tick can drive hid_poll.
     if (nbline_pos == 0) { kb_shift = 0; kb_ctrl = 0; }   # clean modifiers ONLY at a fresh line
@@ -1276,6 +1553,7 @@ fn kbd_read_nonblock(buf, count) {
     if (ret == 0 - 2) {
         if (nbline_pos > 0) { ret = 0 - 3; }
     }
+    kbd_line_release(nb_me);       # NB-OWN: a no-op while nbline_pos > 0 (the partial line keeps the line)
     return ret;
 }
 
@@ -1820,7 +2098,9 @@ fn gpu_blit_bb_sys(srcxy, wh, dstxy) {
 # silently under-allocates by 8x). 2048 x 8 = 16384 B = 4 CPUs x 4096 B.
 #
 # PER-CPU, not one shared buffer. A single global staging cell is precisely what corrupted an FS operation
-# under SMP at 1.46.x, where `rename` ran with another CPU's length. Same shape as pcpu_ksyscall_a4[4].
+# under SMP at 1.46.x, where `rename` ran with another CPU's length. (The 4th syscall argument had the same
+# per-CPU shape until 1.57.7, when blocking syscalls made it per-process: proc_sc_a4, proc.cyr.)
+# R4/R6 (1.57.7): never add a wq_* call inside this buffer's live span (per-CPU scratch — docs/architecture/blocking-waits.md R4).
 var pcpu_sc_gpuop[2048];             # 16384 B total = GPU_OP_CPUS x GPU_OP_BUF_BYTES
 var GPU_OP_CPUS      = 4;            # matches pcpu_cpu()'s `if (c >= 4) { c = 0; }` clamp
 var GPU_OP_BUF_BYTES = 4096;         # per-CPU share
@@ -2311,6 +2591,7 @@ var GPO_E_RACE     = 36;             # op    — slot mutated between validate a
 # compositor's fast path by arranging one unlucky moment. Boot time is single-threaded, so there is
 # no init race and nothing to latch.
 var GPU_TEXL_STAGE_STRIDE = 65536;   # per-CPU window; 512 * 96 = 49,152 rounded up
+# R4/R6 (1.57.7): never add a wq_* call inside this buffer's live span (per-CPU scratch — docs/architecture/blocking-waits.md R4).
 var gpu_texl_stage_kva = 0;          # direct-map VA of the staging region, 0 = unavailable
 
 fn gpu_texl_stage_init() {
@@ -5722,18 +6003,10 @@ fn chan_page(e) { return chan_region_kva + e * 4096; }
 # ⛔ BOUNDED AND CYCLE-GUARDED. `proc_ppid` is a 16-slot pid-indexed array that is REUSED as pids
 # recycle, so a malformed chain is reachable and an unbounded walk here would hang the kernel inside
 # a syscall with interrupts off. 16 steps is the whole table: no legal chain is longer.
+# ⭐ 1.57.7 (S7): EPOCH-VALIDATED links only (chan_pty_desc_pure -> desc_walk, proc.cyr): a recycled intermediate slot
+# no longer splices a stranger into the owner's tree.
 fn chan_pty_descendant(owner, cur) {
-    var p = cur;
-    var steps = 0;
-    while (steps < 16) {
-        if (p == owner) { return 1; }
-        if (p == 0) { return 0; }              # reached init without meeting the owner
-        var np = proc_get_ppid(p);
-        if (np == p) { return 0; }             # self-parent: malformed, refuse rather than spin
-        p = np;
-        steps = steps + 1;
-    }
-    return 0;
+    return chan_pty_desc_pure(owner, cur, &proc_ppid, &proc_ppid_epoch, &proc_epoch, proc_count);
 }
 
 fn chan_auth(base) {
@@ -5962,8 +6235,8 @@ fn chan_place_into_child(child_pid) {
     # none of them switches proc_current before the load), or proc 0 for kernel sh_exec / init. Its arm
     # is per-process (proc.cyr).
     var creator = proc_current_get();
-    # FIRST, before any early return: this cell must describe THIS creation, so spawn_fd_shape /
-    # exec_redirect_apply never skip a redirect because of a previous child's placement.
+    # FIRST, before any early return: this cell must describe THIS creation, so spawn_fd_shape (#43, and #37 through
+    # spawn_shape_strict) never skips a redirect because of a previous child's placement.
     endow_placed_set(creator, 0);
     if (chan_endow_enabled == 0) { return 0; }
     var e = endow_arm_get(creator);
@@ -8349,6 +8622,21 @@ var blk_sc_bounce[512];   # 4096 B — one-LBA bounce (backends DMA into kernel 
 # ⇒ The placeholder is still correct and still default-off; only its successor was misnamed.
 var blk_rw_armed     = 0;
 var BLK_RW_ARM_MAGIC = 0x424C4B5F5257;   # "BLK_RW" — deliberate-arm token (not a plausible mode value)
+# ⭐ 1.57.7 (S7, D-35) — THE ARM HAS AN OWNER: pid + 1 of the process that armed it (0 = none). The one death chain
+# (proc_death_release) disarms only when the ARMING process dies — killed, orphaned and #43 children included, which
+# used to leave it armed (only proc_reap and blk_close_sys cleared it). An unrelated death never disarms a
+# still-running installer. proc_reap keeps its unconditional disarm (the boot door). A FUNCTION defined next to the
+# variable, because a module-scope variable referenced before its declaration does not resolve.
+var blk_rw_arm_pid   = 0;
+fn blk_rw_disarm_pid(pid) {
+    if (blk_rw_arm_pid == pid + 1) { blk_rw_armed = 0; blk_rw_arm_pid = 0; }
+    return 0;
+}
+#ifdef TEST
+fn blk_rw_test_armed() { return blk_rw_armed; }
+fn blk_rw_test_owner() { return blk_rw_arm_pid; }
+fn blk_rw_test_set(a, o) { blk_rw_armed = a; blk_rw_arm_pid = o; return 0; }
+#endif
 
 # blk_enum(buf, cap) -> registered-device count / -1. Writes {tag, capacity_lbas,
 # lba_bytes} (3xu64 = 24 B) per registered backend into the user buf, bounded by cap.
@@ -8390,7 +8678,7 @@ fn blk_open_sys(tag, mode) {
     # constant any ring-3 process can send. THAT is the deliberate placeholder (see the banner and
     # BLK_RW_ARM_MAGIC); the honest hardening available without capabilities was bounding the
     # window, which blk_close_sys now does.
-    if (mode == BLK_RW_ARM_MAGIC) { blk_rw_armed = 1; return 0; }   # deliberate RW arm
+    if (mode == BLK_RW_ARM_MAGIC) { blk_rw_armed = 1; blk_rw_arm_pid = proc_current_get() + 1; return 0; }   # deliberate RW arm (S7: + its owner)
     if (tag < 1) { return 0 - 1; }
     if (tag > 5) { return 0 - 1; }
     if (blk_is_registered(tag) == 0) { return 0 - 1; }
@@ -8532,6 +8820,7 @@ fn blk_close_sys(h) {
     # Close is the natural end of the window an installer needs. A caller that wants to keep
     # writing simply does not close, which is the same lifetime any handle already has.
     blk_rw_armed = 0;
+    blk_rw_arm_pid = 0;
     return 0;
 }
 
@@ -8542,9 +8831,11 @@ fn blk_close_sys(h) {
 # load a static ELF64 from the ext2 root (with argv + envp) and create a READY ring-3 proc the SCHEDULER
 # picks up, returning its pid IMMEDIATELY — the caller stays live and reaps it via the non-blocking
 # waitpid(#4). spawn(#3)'s shape (copy -> boot CR3 -> load -> restore caller CR3 -> return pid) with the
-# in-memory copy + elf_load swapped for execwait(#37)'s path staging + elf_load_from_file, and NONE of
-# #37's blocking machinery — proc_current_get() STAYS the caller, and reaping is waitpid(#4)'s job. Like
-# every handler it runs IF=0 with NVMe completion polled, so the shared FS scratch cannot be raced mid-load.
+# in-memory copy + elf_load swapped for the path staging + elf_load_from_file — proc_current_get() STAYS the
+# caller, and reaping is waitpid(#4)'s job. ⭐ 1.57.7 (S3b): the load half is spawn_load_child (below), which
+# execwait#37 shares — #37 differs only after it (strict shape, the fgwait cell, and a blocking wait instead of
+# returning the pid). Like every handler it runs IF=0 with NVMe completion polled, inside ONE preempt_disable
+# bracket (INV-FG-5), so the shared FS scratch cannot be raced mid-load.
 #
 # ⭐ 1.57.6 (issues 2026-09-23-spawn-path-args-cannot-contain-spaces, -spawn-path-failure-gives-no-reason,
 # -child-inherits-every-fd-and-spawn-arms-leak). a2 = len (bits 0-15) | flags:
@@ -8562,7 +8853,14 @@ fn blk_close_sys(h) {
 # ⛔ ORDERING: every refusal happens BEFORE exec_env_src/_len and exec_argv_nul are set. Those per-CPU
 # cells are consumed only at elf_load_from_file's entry, so a refusal that returned after setting them
 # would hand a stale env — or NUL-split argv mode — to the next #37 / init load on this CPU.
-fn spawn_path_sys(sp_a1, sp_a2, sp_a3, sp_a4) {
+# ⭐ 1.57.7 (S3b) — spawn_load_child(a1, a2, a3, a4, strict): the LOAD HALF shared by spawn_path#43 and execwait#37
+# (factored out of spawn_path_sys): flags, the D9 token pre-count, the line/ARGV copy, the env copy, boot CR3, the
+# loader cells, elf_load_from_file, the ring-3 selectors and the fd-table shape. It returns the child at STATE 3
+# (CLAIMING — not READY, shaped) or -SPAWN_E_*, and restores the caller's CR3 on EVERY path. The caller publishes
+# READY: spawn_path_sys at once; sys_execwait after it has recorded proc_fgwait (INV-FG-2).
+# #43's flag/env rules are the header above; #37 passes its (path, len <= SPAWN_LINE_MAX, env) with
+# no flags, so it gets the line form and the FALLBACK-ONLY env contract, exactly as its own arm did.
+fn spawn_load_child(sp_a1, sp_a2, sp_a3, sp_a4, strict) {
     var canary = stack_canary_secret;
     # (a) a2 = len | flags.
     if (sp_a2 < 0) { stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
@@ -8586,12 +8884,17 @@ fn spawn_path_sys(sp_a1, sp_a2, sp_a3, sp_a4) {
     # resolve; the per-proc CR3 does not map the NVMe BAR).
     # ⚠ The ARGV blob goes through proc_copy_from_user, the fault-proof page-table walk the env blob uses:
     # up to 1024 caller-chosen bytes are far likelier to straddle an unmapped page than a 127-byte line.
+    # ⭐ 1.57.7 (S3b, INV-FG-5): from the first staging write to the final cr3_load(spcr3), ONE preempt_disable bracket
+    # — the per-CPU staging buffers (path/argv, env), the loader cells and the borrowed boot CR3 all live in this
+    # window, and a #37 caller may block right after it: nothing here may be switched out or migrate (the loader
+    # brackets itself too; the count nests). Every return below re-enables it.
+    preempt_disable();
     var spp = spawn_path_buf_base();
     if (sp_argv == 0) {
         var spi = 0;
         while (spi < sp_len) { store8(spp + spi, load8(sp_a1 + spi)); spi = spi + 1; }
     } else {
-        if (proc_copy_from_user(spcr3, spp, sp_a1, sp_len) != 1) { stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
+        if (proc_copy_from_user(spcr3, spp, sp_a1, sp_len) != 1) { preempt_enable(); stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
     }
     # (c) validate the KERNEL copy and find the path (the open name) inside it.
     var sp_ps = 0;
@@ -8603,11 +8906,11 @@ fn spawn_path_sys(sp_a1, sp_a2, sp_a3, sp_a4) {
         var sp_pe = sp_ps;
         while (sp_pe < sp_len) { if (load8(spp + sp_pe) == 32) { break; } sp_pe = sp_pe + 1; }
         sp_plen = sp_pe - sp_ps;
-        if (sp_plen < 1) { stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
-        if (spawn_line_tokens(spp, sp_len) > SPAWN_ARGC_MAX) { stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
+        if (sp_plen < 1) { preempt_enable(); stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
+        if (spawn_line_tokens(spp, sp_len) > SPAWN_ARGC_MAX) { preempt_enable(); stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
     } else {
         sp_plen = sc_argv_blob_ok(spp, sp_len);             # argv[0]'s length, or 0
-        if (sp_plen < 1) { stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
+        if (sp_plen < 1) { preempt_enable(); stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
     }
     # 1.44.19 per-process env — the #37 gate's twin: fault-proof page-walking copy into the DEDICATED
     # spawn_env_buf. FALLBACK-ONLY in the unflagged form (see the header); STRICT when any flag is set.
@@ -8627,7 +8930,7 @@ fn spawn_path_sys(sp_a1, sp_a2, sp_a3, sp_a4) {
     }
     if (sp_fl != 0) {
         if (sp_eptr != 0) {
-            if (sp_env == 0) { stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
+            if (sp_env == 0) { preempt_enable(); stack_canary_check(canary); return 0 - SPAWN_E_ARGS; }
         }
     }
     # (d) boot CR3 for the disk I/O, the per-CPU loader cells (consumed at elf_load_from_file entry), load.
@@ -8642,6 +8945,7 @@ fn spawn_path_sys(sp_a1, sp_a2, sp_a3, sp_a4) {
         # (restore the caller CR3 on EVERY path so the handler tail + SYSRET run under the caller's
         # mappings — skipping it reproduces the spawn#3 1.44.9 #UD/arena-fault class)
         cr3_load(spcr3);
+        preempt_enable();
         stack_canary_check(canary);
         return sp_pid;
     }
@@ -8653,24 +8957,336 @@ fn spawn_path_sys(sp_a1, sp_a2, sp_a3, sp_a4) {
     # proc is READY: once it is, an AP may run it, and a redirect applied after its first write has lost
     # the line it existed to capture. Still under boot CR3 (fd tables are kernel heap), so its refusal
     # lines print safely.
-    if (spawn_shape_or_teardown(sp_pid, sp_me, sp_clean) < 0) {
+    # ⭐ 1.57.7 (S3b): `strict` (execwait#37) takes spawn_shape_strict — the child is REFUSED on the global table,
+    # redirect armed or not (DEP-1); the #43 form keeps spawn_shape_or_teardown.
+    var sp_sh = 0;
+    if (strict != 0) { sp_sh = spawn_shape_strict(sp_pid, sp_me); }
+    else { sp_sh = spawn_shape_or_teardown(sp_pid, sp_me, sp_clean); }
+    if (sp_sh < 0) {
         cr3_load(spcr3);
+        preempt_enable();
         stack_canary_check(canary);
         return 0 - SPAWN_E_NOMEM;
     }
-    # 1.46.x #2: flip it READY — under smp_sched_aps=1 this is the FIRST moment a woken AP may
-    # legitimately pick it. Ordered AFTER proc_set_ring3 so no AP can ever observe it ready-but-ring-0.
-    pd_audit(proc_get_cr3(sp_pid), 2);          # tag 2 = spawn_path, just before READY
-    proc_set_state(sp_pid, 1);
+    # The child is at state 3 (CLAIMING: never picked, never reused), ring-3 selectors, fd table shaped — the caller
+    # publishes READY. ⚠ STATED ORDER CHANGE (1.57.7, DEP-5): READY is now published AFTER the caller's CR3 is back
+    # (it used to precede this cr3_load). Safe: pd_audit walks through the direct map, not the live CR3; every child
+    # field is stored before the caller's proc_set_state(c, 1) (x86-TSO; the picker takes sched_lock); and the
+    # caller's CR3 is private to the caller.
     cr3_load(spcr3);
+    preempt_enable();
     stack_canary_check(canary);
     return sp_pid;
+}
+
+# ═══════════════ 1.57.7 (S3b) — execwait#37 IS A BLOCKING WAIT (docs/architecture/foreground-exec.md) ═══════════════
+# Load the child exactly as #43 does (spawn_load_child, strict: refused on the global fd table — DEP-1), record it in
+# the caller's proc_fgwait cell BEFORE it can run (INV-FG-2), publish it READY (unpinned, IF=1: proc_create_user's
+# p+152 = 0x200 — any CPU may run it), then BLOCK until it is dead (proc_wait_child_exit: WK_CHILD|me, woken by the
+# child's death after its state-0 store, INV-FG-3), read its status, reap it under MY CR3 (the reap walks through
+# the direct map) and only then clear the cell. `me` is cached before any block point and a4 arrives as a parameter
+# (INV-FG-4): nothing per-CPU is read after the wait — the caller may resume on another CPU.
+# Returns the child's exit code, or -1: before the scheduler runs (the boot selftests' out-of-band callers), a bad
+# length, a caller that cannot block (latched `fg: execwait cannot block here -- refused`), any launch failure (the
+# -SPAWN_E_* codes fold to -1: a child may itself exit(-2)), or an abnormal wait end. Every return clears the caller's
+# whole spawn-arm state (S2). Nesting is bounded only by the 16-slot table.
+# [S7] hooks, fixed here (path2-integration S7_assumptions §5; S7-draft §2.10): (a) the ONE status read below becomes
+# proc_wait_status(ew_c) (D2); (b) in the ew_r != 0 branch, ew_r == 1 (a kill pending on me) gets
+# proc_kill_fg_child(ew_me) BEFORE the clear + return -1 (C gets SIGKILL and, as an orphan, self-reaps at its death);
+# (c) proc_fgwait_publish(me, c) may replace the plain store — the store-before-READY order is what this guarantees.
+fn sys_execwait(uptr, ulen, eptr, elen) {
+    var ew_me = proc_current_get();                                   # INV-FG-4
+    if (sched_active == 0) { spawn_arms_clear(ew_me); return 0 - 1; } # boot-time out-of-band caller (ABI: -1)
+    if (ulen < 0) { spawn_arms_clear(ew_me); return 0 - 1; }
+    if (ulen > SPAWN_LINE_MAX) { spawn_arms_clear(ew_me); return 0 - 1; }   # also keeps #43's flag bits out of #37
+    if (wq_can_block() == 0) { spawn_arms_clear(ew_me); fg_latch(4, "fg: execwait cannot block here -- refused", 41); return 0 - 1; }
+    var ew_c = spawn_load_child(uptr, ulen, eptr, elen, 1);           # strict; brackets its own staging (INV-FG-5)
+    spawn_arms_clear(ew_me);                                          # S2: every #37 return clears the whole arm state
+    if (ew_c < 0) { return 0 - 1; }                                   # all launch failures fold to -1 (S2 rule)
+    proc_fgwait_publish(ew_me, ew_c);                                 # INV-FG-2: before c can run (S7: under sched_lock; a kill pending on me marks c)
+    pd_audit(proc_get_cr3(ew_c), 4);                                  # tag 4 = execwait#37, just before READY
+    execwait_note_first();                                            # 'execwait: first scheduled child' (latched once)
+    proc_set_state(ew_c, 1);                                          # READY: unpinned, IF=1 (p+152 = 0x200), any CPU
+    var ew_r = proc_wait_child_exit(ew_c);                            # BLOCK
+    if (ew_r != 0) {
+        if (ew_r != 1) { fg_latch(8, "fg: execwait wait ended abnormally -- child orphaned", 52); }
+        # 1.57.7 (S7): ew_r == 1 (a kill is pending on me): C gets SIGKILL, then this clear + return -1; B1 ends me at
+        # syscall exit and C dies at its own boundary — as my zombie (reaped by my death chain) or, if it outlives me,
+        # as an orphan that self-reaps (INV-FG-2 as amended in foreground-exec.md).
+        if (ew_r == 1) { proc_kill_fg_child(ew_me); }
+        proc_fgwait_set(ew_me, 0);
+        return 0 - 1;
+    }
+    execwait_rsp0_check(ew_me);                                       # EXEC_SELFTEST witness; a no-op twin otherwise
+    var ew_code = proc_wait_status(ew_c);                             # 1.57.7 (S7, D2): the wait status — the ONE site
+    proc_reap_child(ew_c);                                            # under MY CR3 (direct-map walks)
+    proc_fgwait_set(ew_me, 0);                                        # after the reap (INV-FG-2)
+    return ew_code;
+}
+
+# spawn_path#43: load (spawn_load_child), then READY. The caller gets the pid at once; the SCHEDULER runs the child.
+fn spawn_path_sys(sp_a1, sp_a2, sp_a3, sp_a4) {
+    var sp_c = spawn_load_child(sp_a1, sp_a2, sp_a3, sp_a4, 0);
+    if (sp_c < 0) { return sp_c; }
+    # 1.46.x #2: flip it READY — under smp_sched_aps=1 this is the FIRST moment a woken AP may legitimately pick it.
+    pd_audit(proc_get_cr3(sp_c), 2);            # tag 2 = spawn_path, just before READY
+    proc_set_state(sp_c, 1);
+    return sp_c;
 }
 
 # `ptrscan #98` reachability latches — see the arm for why.
 var ptrscan_called = 0;
 var proclist_called = 0;
 var ptrscan_gave = 0;
+
+# ═══════════════ 1.57.7 (Path 2, S3.5) — waitpid#4: the poll, the peek and WAIT_BLOCK ═══════════════
+# waitpid_poll(me, t) is the #4 poll body as it shipped (1.44.9 / 1.56.54 wait-any / 1.50.8 ownership), moved out of the
+# arm unchanged so the blocking form reaps through the SAME code: it is THE single home of the return encoding (the
+# lifecycle step's status encoding lands here). `me` is the caller, `t` the target pid (< 0 = any child).
+fn waitpid_poll(me, t) {
+    # ⭐ 1.57.7 (S7): THE POLL IS THE PEEK PLUS THE REAP. The two scans were byte-for-byte the same rules (wait-any:
+    # the LOWEST-pid dead child, -2 while children live, -1 with none; single: -1 for a bad pid / itself / a target
+    # proc_may_reap refuses, -2 while alive), so the poll now asks waitpid_peek which child to reap and only adds the
+    # read + reap — one scan to keep epoch-validated (proc_is_child_of / proc_may_reap) instead of two, and the image
+    # bytes the lifecycle step needs (check.sh's weighed-size gate). The history of each rule is at waitpid_peek.
+    # ⚠ Status FIRST (proc_reap_child may collapse the slot), then reap: the in-memory path is leak-symmetric with the
+    # from-disk run/reap (1.42.x). The status is the wait status (D2): 0x100 | sig for a death by signal (SIGKILL
+    # 265), else code & 0xFF (a fault 142) — every value >= 0, so it never reads as -1 / -2.
+    var wp_c = waitpid_peek(me, t);
+    if (wp_c < 0) { return wp_c; }
+    var wp_code = proc_wait_status(wp_c);
+    proc_reap_child(wp_c);
+    return wp_code;
+}
+
+# ── the rules waitpid_peek (and so waitpid_poll) applies — their history, moved here from the poll at 1.57.7 (S7) ──
+# ⭐⭐ 1.56.54 — WAIT-ANY (`arg1 < 0`). This case was rejected outright, and it is the
+# prerequisite every fork-model server needs: a parent that forks per connection does not know
+# which child will finish first, so polling a specific pid is the wrong shape — it either
+# blocks behind a long-lived child while a short one goes unreaped, or forces the parent to
+# keep its own child table and poll each one, which is the kernel's job.
+# Semantics, deliberately the SAME SHAPE as the single-pid arm below so one caller handles both:
+#   a dead child exists      -> reap the LOWEST such pid and return its exit code
+#   children exist, none dead -> -2 (WOULD_BLOCK), the same "still alive" answer
+#   no children at all        -> -1, distinguishable from both
+# ⚠ -2 vs -1 IS THE WHOLE CONTRACT. A parent loops while it gets -2 and stops on -1; collapsing
+# them would make "all my children are still running" indistinguishable from "I have none", and
+# a fork-per-connection server would leave its accept loop the first time no child had finished.
+# ⚠ LOWEST pid first, deliberately: this scans a slot table whose indices RECYCLE, so "first
+# found" is the only order stable across calls. It is not FIFO by exit time and does not claim
+# to be; POSIX promises no order either.
+# ⛔ `proc_may_reap` is NOT re-checked here, and that is not a hole: the scan only ever selects a
+# pid that proc_is_child_of the caller, which is the test `proc_may_reap` applies. Calling it
+# would re-look-up a fact the loop just established.
+# ⭐ 1.57.7 (S7): children are EPOCH-VALIDATED (proc_is_child_of, D-30) — a recycled parent slot does not inherit
+# its predecessor's orphans — and the status is the wait status (D2, proc_wait_status: 0x100 | sig for a death by
+# signal, else code & 0xFF). -2 also covers DYING (4) and STOPPED (5).
+# Same order as the single-pid arm: exit code FIRST, because
+# proc_reap_child may collapse the slot out from under us.
+# Never wait on (and never reap) the caller itself.
+# 1.50.8: ownership — only the parent (or init) may reap, else -1 (not your child).
+# Stops a non-parent from stealing the exit code + collapsing the slot out from under
+# the real parent's pending waitpid. BEFORE the alive/dead check so a non-child gets
+# -1 regardless of state. Unblocked by 1.50.7's real proc_get_ppid (inert while it
+# stubbed 0 → the 1.44.22 audit deferral). agnsh IS the parent of its `&` jobs (set at
+# proc_create_user), so this preserves bg-job reaping; ring3-smoke parent-spawn+wait
+# + agnsh-bg/multijob exercise it. (proc_may_reap: proc.cyr.)
+# 1.42.x: reap the in-memory-spawned child here — the symmetric point to
+# the from-disk path's "read exit code in sh_cmd_run, then proc_reap".
+# Read the exit code FIRST (proc_reap_child may collapse the slot), then
+# reclaim the child's address space (ELF + stack + ANY un-munmap'd mmap
+# huge pages) and proc_table slot. Without this, every spawn()ed child
+# leaked its whole address space for the boot; with it the in-memory
+# path is leak-symmetric with elf_load_from_file's run/reap. Safe: the
+# child is confirmed dead (loop above) and is not me (guarded),
+# so its distinct CR3 is not the one the CPU is walking.
+# The same question WITHOUT the reap: any (t < 0) -> the first dead child's pid, -2 = children but none dead, -1 = no
+# children; single -> t when it is a dead child of the caller, -2 = alive, -1 = not reapable by the caller (bad pid,
+# itself, or proc_may_reap refuses). It re-runs proc_may_reap on EVERY call, so a target reaped and recycled by
+# somebody else while we waited answers -1 ("not your child"), never a stranger's status.
+fn waitpid_peek(me, t) {
+    if (t < 0) {
+        var wp_any = 0;
+        var wp_i = 0;
+        while (wp_i < proc_count) {
+            if (wp_i != me) {
+                if (proc_is_child_of(wp_i, me) == 1) {        # 1.57.7 (S7): epoch-validated
+                    wp_any = 1;
+                    if (proc_get_state(wp_i) == 0) { return wp_i; }
+                }
+            }
+            wp_i = wp_i + 1;
+        }
+        if (wp_any == 1) { return 0 - 2; }
+        return 0 - 1;
+    }
+    if (t >= proc_count) { return 0 - 1; }
+    if (t == me) { return 0 - 1; }
+    if (proc_may_reap(me, t) == 0) { return 0 - 1; }
+    if (proc_get_state(t) != 0) { return 0 - 2; }
+    return t;
+}
+
+# WAIT_BLOCK: block until the target (t < 0: any child) has exited, then reap it through waitpid_poll. The canonical
+# wait (sched.cyr): arm WK_CHILD|me FIRST, then peek — every exit path stores state 0 BEFORE it wakes WK_CHILD|ppid,
+# so a child that exits between the peek and the sleep is caught by the wake (the BLOCK guard honours it). A caller
+# that cannot block gets the poll's non-blocking answer (-2) instead of a spin. wq_can_block is recomputed on every
+# iteration, so no per-CPU fact is kept across the wait (R4). No deadline: a child that never exits keeps its
+# parent waiting (the lifecycle step's SIGKILL is the answer to that, via the signal point).
+fn sys_waitpid_block(t) {
+    var wb_me = proc_current_get();
+    while (1) {
+        var wb_can = wq_can_block();
+        var wb_armed = 2;
+        if (wb_can == 1) { wb_armed = wq_arm(WK_CHILD | wb_me, 0); }
+        var wb_pk = waitpid_peek(wb_me, t);
+        if (wb_pk != (0 - 2)) {
+            if (wb_armed == 0) { wq_cancel(); }
+            return waitpid_poll(wb_me, t);
+        }
+        if (wb_armed == 2) { return 0 - 2; }            # cannot block: the non-blocking answer (never spin IF=0)
+        if (wb_armed == 1) {
+            if (wq_signal_point() == 1) { return 0 - 2; }
+        } else {
+            var wb_r = wq_sleep();
+            if (wb_r == WR_SIGNAL) { if (wq_signal_point() == 1) { return 0 - 2; } }
+        }
+    }
+    return 0 - 2;
+}
+
+# flock#59's wait loop (the #59 arm validates the fd, computes fw_blk = "NB clear AND wq_can_block()" ONCE, and
+# returns what this returns): 0 locked · -1 contended with LOCK_NB / a caller that cannot block / a bad op ·
+# -2 the lock table is full (never waits). The canonical wq loop on WK_FLOCK|inode: arm UNDER flock_lock (R3),
+# drop the lock, sleep, retry. fw_blk doubles as flock_try_locked's drop_own: a BLOCKING conversion drops the
+# caller's old lock first (flock(2)); a failed LOCK_NB conversion keeps it. A separate function (not inline in the
+# arm) so ktest T9b can drive it with fw_blk fixed — the retired-caller window below sits between the arm's
+# wq_can_block and the wq_arm, which no ring-3 caller can hit on demand.
+# ⭐ wq_arm == 2 WITH THE CALLER RETIRED (state 0 — a remote retire; S7's death paths never zero a running proc):
+# wq_arm could not take sched_exit_tail itself because flock_lock was held (preempt_count 1). Once the lock is
+# dropped the caller must LEAVE (wq_exit_if_retired), never return -1: that return SYSRETs a dead process to
+# ring 3, where it keeps running (and can make syscalls) until its next tick while a reaper spins in its fence.
+fn flock_wait(fw_ino, fw_me, fw_op, fw_blk) {
+    while (1) {
+        flock_spin_lock();
+        var fw_r = flock_try_locked(fw_ino, fw_me, fw_op, fw_blk);
+        var fw_a = 0 - 1;
+        if (fw_r == 1) { if (fw_blk == 1) { fw_a = wq_arm(WK_FLOCK | fw_ino, 0); } }   # armed UNDER flock_lock (R3)
+        flock_spin_unlock();
+        if (fw_r == 0) { return 0; }
+        if (fw_r == 2) { return 0 - 2; }                                    # table full: never waits
+        if (fw_r == 3) { return 0 - 1; }                                    # bad op
+        if (fw_blk == 0) { return 0 - 1; }                                  # contended, LOCK_NB semantics
+        if (fw_a == 2) { wq_exit_if_retired(); return 0 - 1; }              # could not block after all
+        if (fw_a == 1) {
+            if (wq_signal_point() == 1) { return 0 - 1; }
+        } else {
+            var fw_w = wq_sleep();                                          # flock_lock already dropped
+            if (fw_w == WR_SIGNAL) { if (wq_signal_point() == 1) { return 0 - 1; } }
+        }
+        # retry — a blocking conversion's own old lock was already dropped by flock_try_locked
+    }
+    return 0 - 1;
+}
+
+# ═══════════════ 1.57.7 (Path 2, S3.7) — THE SOUND WAITS (#66 snd_write blocking form, #68 snd_drain) ═══════════════
+# A caller that may block (wq_can_block) waits in a real BLOCKED state woken by hda_stream_service (BSP tick) when the
+# DAC consumes (WK_SND); a refused context (pre-scheduler or preempt-held; no ring-3 process since S3b-F2) keeps the held
+# loop verbatim. Re-reading the user buffer after a resume is valid: the switch restores the slot CR3 (R6) and the
+# int 0xE0 frame's saved RFLAGS.AC = 1 (the syscall's stac), which iretq restores. snd_appl has ONE writer — the single
+# open stream (#64 refuses a second) — and snd_hw_frames one, the ISR.
+# The held loops' sti/cli: REGISTER CONTRACT — no inputs, no outputs, no GPR touched; they only set / clear RFLAGS.IF.
+fn snd_write_held(buf, frames, n0) {
+    var sh_written = n0;
+    var sh_start = timer_ticks;
+    var sh_cap = frames / 480 + 300;                                             # bounded DMA-stall deadline
+    preempt_disable();
+    asm { sti; }                                                                 # contract: IF=1 (no GPR touched)
+    while (sh_written < frames) {
+        if (snd_hw_frames > snd_appl) { snd_appl = snd_hw_frames; }
+        var sh_fr = 16384 - (snd_appl - snd_hw_frames) - 1;
+        if (sh_fr > 0) {
+            var sh_c = frames - sh_written; if (sh_c > sh_fr) { sh_c = sh_fr; }
+            snd_copy_frames(buf + sh_written * 4, sh_c);
+            sh_written = sh_written + sh_c;
+        }
+        if (sh_written >= frames) { break; }
+        if ((timer_ticks - sh_start) > sh_cap) { break; }
+        arch_wait();
+    }
+    asm { cli; }                                                                 # contract: IF=0 (no GPR touched)
+    preempt_enable();
+    return sh_written;
+}
+# The waiting form: copy what fits, and BLOCK (WK_SND) until the DAC frees ring space. The cap is the held loop's
+# (frames / 480 + 300 ticks), in µs on sched_clock_us. Returns the frames written (< frames at the cap or on a signal).
+fn snd_write_waiting(buf, frames) {
+    var ww_n = 0;
+    var ww_dl = wq_deadline_after_us((frames / 480 + 300) * 10000);             # the old tick cap, in µs
+    while (1 == 1) {
+        if (snd_hw_frames > snd_appl) { snd_appl = snd_hw_frames; }             # underrun resync (unchanged)
+        var ww_fr = 16384 - (snd_appl - snd_hw_frames) - 1;
+        if (ww_fr > 0) {
+            var ww_c = frames - ww_n;
+            if (ww_c > ww_fr) { ww_c = ww_fr; }
+            snd_copy_frames(buf + ww_n * 4, ww_c);
+            ww_n = ww_n + ww_c;
+        }
+        if (ww_n >= frames) { break; }
+        if (sched_clock_us() >= ww_dl) { break; }
+        var ww_a = wq_arm(WK_SND, ww_dl);
+        if (ww_a == 1) { if (wq_signal_point() == 1) { break; } continue; }
+        if (ww_a == 2) { return snd_write_held(buf, frames, ww_n); }           # cannot block after all: the held loop
+        if ((16384 - (snd_appl - snd_hw_frames) - 1) > 0) { wq_cancel(); continue; }   # the re-check AFTER the arm
+        var ww_r = wq_sleep();
+        if (ww_r == WR_SIGNAL) { if (wq_signal_point() == 1) { break; } }
+    }
+    return ww_n;
+}
+# #68's held loop (verbatim): until snd_hw_frames reaches `target`, ~1 s cap (a full ring plays in ~34 ticks).
+fn snd_drain_held(target) {
+    var dh_start = timer_ticks;
+    preempt_disable();
+    asm { sti; }                                                                 # contract: IF=1 (no GPR touched)
+    while ((timer_ticks - dh_start) < 100) {
+        if (snd_hw_frames >= target) { break; }
+        arch_wait();
+    }
+    asm { cli; }                                                                 # contract: IF=0 (no GPR touched)
+    preempt_enable();
+    return 0;
+}
+# #68's waiting form: BLOCK (WK_SND) until the DAC has played `target`, 1 s cap.
+fn snd_drain_waiting(target) {
+    var dw_dl = wq_deadline_after_us(1000000);
+    while (1 == 1) {
+        if (snd_hw_frames >= target) { break; }
+        if (sched_clock_us() >= dw_dl) { break; }
+        var dw_a = wq_arm(WK_SND, dw_dl);
+        if (dw_a == 1) { if (wq_signal_point() == 1) { break; } continue; }
+        if (dw_a == 2) { snd_drain_held(target); break; }                      # cannot block after all: the held loop
+        if (snd_hw_frames >= target) { wq_cancel(); break; }                    # the re-check AFTER the arm
+        var dw_r = wq_sleep();
+        if (dw_r == WR_SIGNAL) { if (wq_signal_point() == 1) { break; } }
+    }
+    return 0;
+}
+
+# ⭐ 1.57.7 (S1b B5) — THE uptime_ms#40 CLOCK, shared by the #40 arm and sleep_ms#41's legacy loop (which must
+# last >= ms AS #40 MEASURES IT). Once tsc_calibrate succeeded: uptime_ms_base (timer_ticks * 10 AT the
+# calibration instant) + the calibrated-TSC milliseconds since tsc_base — continuous with the tick clock it
+# returned before, and it ADVANCES while the BSP runs IF=0 and while a throttled host coalesces ticks.
+# tsc_calibrate publishes base-ms, base-TSC, then the rate, so a nonzero rate always pairs with both bases.
+# Where calibration refused (tsc_per_us == 0): timer_ticks * 10 (the 100 Hz tick, PM-measured since S1b on a
+# PM-timer box). Monotonic non-decreasing in both forms; the switch happens once, pre-userland.
+fn uptime_ms_now() {
+    if (tsc_per_us != 0) {
+        var un_d = rdtsc() - tsc_base;
+        if (un_d < 0) { un_d = 0; }
+        return uptime_ms_base + un_d / (tsc_per_us * 1000);
+    }
+    return timer_ticks * 10;
+}
 
 fn ksyscall(num, arg1, arg2, arg3) {
     # Stack-canary backstop: snapshot at entry, re-checked before returning on the
@@ -8684,62 +9300,12 @@ fn ksyscall(num, arg1, arg2, arg3) {
     # critical dispatcher with no clean Cyrius idiom, for a non-vuln cosmetic gain.
     var canary = stack_canary_secret;
     if (num == 0) {
-        # exit — halt current process, return to kernel if context saved
-        sys_exit_code = arg1;
-        proc_set_exit_code(proc_current_get(), arg1);
-        # flock#59: release every advisory lock held by the exiting proc (so a
-        # fork-per-accept worker that dies mid-turn can't strand the shared world).
-        flock_release_pid(proc_current_get());
-        snd_release_pid(proc_current_get());      # release any snd#64 audio slot (Gate 2)
-        shm_release_pid(proc_current_get());      # 1.56.40 bite 1: release shm#71/#86 slots (mirror fault-kill)
-        chan_release_pid(proc_current_get());     # 1.56.40 bite 4: release #97 channel endpoints (mirror fault-kill)
-        gpu_release_pid(proc_current_get());      # 1.55.x: if it owned the scanout, hand the screen back
-        # to the console (else a full-screen app quitting would
-        # leave its last frame up while console text scrolled
-        # invisibly into a buffer nothing is scanning)
-        if (proc_current_get() < proc_count) {
-            proc_set_state(proc_current_get(), 0);
-            # 1.53.x B3b: clear this CPU's FP owner if it named the exiting proc (same
-            # recycled-slot prev==cur hazard as fault_kill). No fxsave (exiting XMM garbage).
-            var _xc = pcpu_cpu();
-            if (load64(&fpu_owner + _xc * 8) == proc_current_get()) { store64(&fpu_owner + _xc * 8, 0 - 1); }
-            # Send SIGCHLD (signal 17) to parent process
-            var ppid = proc_get_ppid(proc_current_get());
-            if (ppid >= 0) {
-                proc_send_signal(ppid, 17);
-            }
-        }
-        # If we have a saved kernel return point, jump back to it — but ONLY when the EXITING
-        # proc is the one exec_and_wait is run-to-completion waiting on (exec_resume_pid). 1.44.14:
-        # a PREEMPTIVELY-scheduled #43 background job exit()s with proc_current_get() = ITS pid (the
-        # scheduler set it), which != exec_resume_pid (agnsh) — so it must NOT fire agnsh's
-        # kernel_resume (that would resume kybernet as if agnsh exited). It already went state 0
-        # above, so its parent's waitpid#4 reaps it. Pre-1.44.14 this gate was just
-        # `kernel_return_rsp != 0`, which fired for ANY exit while a resume was armed.
-        if (kernel_return_rsp_get() != 0) {
-            if (proc_current_get() == exec_resume_pid_get()) {
-                kernel_resume();
-            }
-        }
-        # ⛔⛔ EXIT MUST NOT RETURN TO RING 3. This used to `return 0` whenever the kernel_resume gate above
-        # did not fire, and that return goes back to a process already marked state 0 — with nothing left to
-        # execute. The caller is `_entry`'s `syscall(SYS_EXIT, r)`, which is the LAST instruction a Cyrius
-        # program emits, so control falls straight into the zero padding after `.text`, where `00 00` decodes
-        # as `add %al,(%rax)` with rax = 0: a write to address 0, #PF, and fault_kill_current.
-        #
-        # ⭐ AND THE DAMAGE IS NOT COSMETIC — IT DESTROYS THE EXIT CODE. proc_set_exit_code stored the real
-        # value at the top of this handler; the spurious #PF then runs fault_kill_current, which overwrites
-        # it with 128 + 14 = **142**. Every tool taking this path reported 142 no matter what it returned.
-        # MEASURED ON IRON 2026-08-03: `modeset --native` and `--pan` both completed their work, printed
-        # every line, returned 95 — and were recorded as `run: exit 142`, faulting at the two padding bytes
-        # immediately after their own `syscall` instruction (rip 0x407e96, `.text` end 0x407e98).
-        #
-        # The fix is the tail fault_kill_current already uses for exactly this case (a proc dying with no
-        # armed kernel_resume): enable interrupts and halt, and let the next timer tick's do_context_switch
-        # decline to revive this state-0 slot and switch away through the timer ISR's own pop+iretq epilogue.
-        # We never return through the abandoned syscall frame. preempt_count is 0 here — this handler holds
-        # no lock by this point — so do_context_switch is not preempt-gated and WILL switch.
-        while (1) { asm { sti; hlt; } }
+        # exit — end the calling process through the ONE death chain (1.57.7 S7: proc_exit_current -> proc_death):
+        # every release (flock, snd, shm, chan, the scanout, tcp/udp, the keyboard line, the raw-disk arm, the spawn
+        # arms, the fg cell), then the zombie / orphan publish, SIGCHLD and the WK_CHILD wake; the boot-only
+        # kernel_resume gate; sched_exit_tail. The raw arg1 is stored; the parent's wait sees `code & 0xFF` (D2).
+        # ⛔⛔ EXIT MUST NOT RETURN TO RING 3 — see the banner in proc_exit_current (it never returns).
+        proc_exit_current(arg1, 0);
         return 0;                         # unreachable — kept for the type checker
     }
     if (num == 1) {
@@ -8811,77 +9377,24 @@ fn ksyscall(num, arg1, arg2, arg3) {
         return new_pid;
     }
     if (num == 4) {
-        # waitpid(pid) — NON-BLOCKING poll (1.44.9). Returns the child's exit code if it
-        # has exited (state 0), or -2 (WOULD_BLOCK) if it is still alive. A ring-3 parent
-        # polls this FROM RING 3 — between calls it holds no kernel state, so the child's
-        # syscalls can't clobber a blocked-in-kernel waitpid frame on the shared syscall
-        # kstack. (The classic BLOCKING form, which sleeps the parent in the kernel, needs
-        # per-proc kernel stacks first — deferred.) Was a busy-wait `while(state!=0) hlt`,
-        # which would hang anyway: the handler runs IF=0, so the hlt never wakes.
-        # ⭐⭐ 1.56.54 — WAIT-ANY (`arg1 < 0`). This case was rejected outright, and it is the
-        # prerequisite every fork-model server needs: a parent that forks per connection does not know
-        # which child will finish first, so polling a specific pid is the wrong shape — it either
-        # blocks behind a long-lived child while a short one goes unreaped, or forces the parent to
-        # keep its own child table and poll each one, which is the kernel's job.
-        # Semantics, deliberately the SAME SHAPE as the single-pid arm below so one caller handles both:
-        #   a dead child exists      -> reap the LOWEST such pid and return its exit code
-        #   children exist, none dead -> -2 (WOULD_BLOCK), the same "still alive" answer
-        #   no children at all        -> -1, distinguishable from both
-        # ⚠ -2 vs -1 IS THE WHOLE CONTRACT. A parent loops while it gets -2 and stops on -1; collapsing
-        # them would make "all my children are still running" indistinguishable from "I have none", and
-        # a fork-per-connection server would leave its accept loop the first time no child had finished.
-        # ⚠ LOWEST pid first, deliberately: this scans a slot table whose indices RECYCLE, so "first
-        # found" is the only order stable across calls. It is not FIFO by exit time and does not claim
-        # to be; POSIX promises no order either.
-        # ⛔ `proc_may_reap` is NOT re-checked here, and that is not a hole: the scan only ever selects a
-        # pid whose `proc_get_ppid` IS the caller, which is the test `proc_may_reap` applies. Calling it
-        # would re-look-up a fact the loop just established.
-        if (arg1 < 0) {
-            var wa_me = proc_current_get();
-            var wa_any = 0;                                   # did we see ANY child at all?
-            var wa_i = 0;
-            while (wa_i < proc_count) {
-                if (wa_i != wa_me) {
-                    if (proc_get_ppid(wa_i) == wa_me) {
-                        wa_any = 1;
-                        if (proc_get_state(wa_i) == 0) {      # dead -> reap it
-                            # Same order as the single-pid arm: exit code FIRST, because
-                            # proc_reap_child may collapse the slot out from under us.
-                            var wa_code = proc_get_exit_code(wa_i);
-                            proc_reap_child(wa_i);
-                            return wa_code;
-                        }
-                    }
-                }
-                wa_i = wa_i + 1;
+        # waitpid(pid) — a NON-BLOCKING poll (1.44.9): the child's exit code if it has exited (state 0, and the
+        # child is reaped), -2 (WOULD_BLOCK) while it is alive, -1 if it is not the caller's child. `arg1 < 0`
+        # = WAIT-ANY (1.56.54): the lowest-pid dead child, -2 while children live, -1 with no children at all.
+        # The body is waitpid_poll (above), the single home of the encoding.
+        # ⭐ 1.57.7 (Path 2, S3.5) — WAIT_BLOCK: `arg1 = 0x100 | pid` (pid 0..15) BLOCKS the caller until that child
+        # exits, `0x1FF` = any child, with the poll's return values; -1 at once when the target is not the caller's
+        # child or it has none; -2 only when the caller cannot block (before the scheduler; since S3b a #37 child blocks
+        # like any process). The range was free: `arg1 >= proc_count` (<= 16) has always answered -1.
+        # (The comment here used to say the blocking form was "deferred" until per-process kernel stacks existed —
+        # they do since 1.57.6, and this is it.)
+        if (arg1 >= 0x100) {
+            if (arg1 <= 0x1FF) {
+                var wb_t = arg1 & 0xFF;
+                if (wb_t == 0xFF) { wb_t = 0 - 1; }
+                return sys_waitpid_block(wb_t);
             }
-            if (wa_any == 1) { return 0 - 2; }                # children, none finished yet
-            return 0 - 1;                                     # no children at all
         }
-        if (arg1 >= proc_count) { return 0 - 1; }
-        # Never wait on (and never reap) the caller itself.
-        if (arg1 == proc_current_get()) { return 0 - 1; }
-        # 1.50.8: ownership — only the parent (or init) may reap, else -1 (not your child).
-        # Stops a non-parent from stealing the exit code + collapsing the slot out from under
-        # the real parent's pending waitpid. BEFORE the alive/dead check so a non-child gets
-        # -1 regardless of state. Unblocked by 1.50.7's real proc_get_ppid (inert while it
-        # stubbed 0 → the 1.44.22 audit deferral). agnsh IS the parent of its `&` jobs (set at
-        # proc_create_user), so this preserves bg-job reaping; ring3-smoke parent-spawn+wait
-        # + agnsh-bg/multijob exercise it. (proc_may_reap: proc.cyr.)
-        if (proc_may_reap(proc_current_get(), arg1) == 0) { return 0 - 1; }
-        if (proc_get_state(arg1) != 0) { return 0 - 2; }   # still alive → WOULD_BLOCK
-        # 1.42.x: reap the in-memory-spawned child here — the symmetric point to
-        # the from-disk path's "read exit code in sh_cmd_run, then proc_reap".
-        # Read the exit code FIRST (proc_reap_child may collapse the slot), then
-        # reclaim the child's address space (ELF + stack + ANY un-munmap'd mmap
-        # huge pages) and proc_table slot. Without this, every spawn()ed child
-        # leaked its whole address space for the boot; with it the in-memory
-        # path is leak-symmetric with elf_load_from_file's run/reap. Safe: the
-        # child is confirmed dead (loop above) and is not proc_current_get() (guarded),
-        # so its distinct CR3 is not the one the CPU is walking.
-        var wcode = proc_get_exit_code(arg1);
-        proc_reap_child(arg1);
-        return wcode;
+        return waitpid_poll(proc_current_get(), arg1);
     }
     if (num == 5) {
         # read(fd=arg1, buf=arg2, len=arg3)
@@ -8910,14 +9423,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
             }
         }
         # ⭐ ipc BITE 9 — an ordinary read(2) reaches a CHANNEL fd.
-        # ⛔ WOULD_BLOCK IS RETURNED, NOT WAITED ON, AND THAT IS THE DESIGN — NOT A SHORTCUT.
-        # planning/ipc.md §9.4: "No blocking in v1, and the reason is the STACK, not a policy" — each
-        # CPU has ONE shared SYSCALL kernel stack, so N blocked waiters would need N disjoint kernel
-        # stacks. Both escape hatches are refused there: the `preempt_disable; sti; hlt` spin is the
-        # poison that made TCP toxic, and it is *especially* wrong here — a channel's producer is a
-        # PEER PROCESS, so disabling preemption starves the very thing the read is waiting for.
-        # (That is exactly why `kbd_read_blocking` may spin and this may not: the keyboard's producer
-        # is an IRQ, not a schedulable peer.)
+        # ⛔ WOULD_BLOCK IS RETURNED, NOT WAITED ON — still the design, for a narrower reason than it was written with.
+        # planning/ipc.md §9.4 said "No blocking in v1, and the reason is the STACK" — one shared SYSCALL kernel stack
+        # per CPU. That reason is GONE: every process has its own kernel stack since 1.57.6 and a real BLOCKED state since
+        # 1.57.7 (the keyboard, sleep_ms, flock, waitpid, snd reads block only their caller now). A blocking channel read
+        # additionally needs its producer's wake (chan_* would wq_wake the reader's key on every deliver) and a PTY-shaped
+        # consumer survey — a design item of its own, not in 1.57.7. The `preempt_disable; sti; hlt` spin stays refused:
+        # a channel's producer is a PEER PROCESS, so holding the CPU starves the very thing the read is waiting for.
         # Retry belongs in userland, preemptibly. -2 is the kernel's established WOULD_BLOCK value,
         # the same one the a4 non-blocking cooked-line read returns.
         var rep = chan_fd_endpoint(arg1);
@@ -9054,11 +9566,22 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # garbage-argument callers the old nullary ABI left behind fail closed.
         return power_sys(arg1, arg2, arg3, ksyscall_a4_get());
     }
-    if (num == 14) {                          # pause — no-ready-proc FALLBACK (safe hlt)
-        # Ring-3 pause is normally handled in syscall_handler (#14): it yields to a ready
-        # proc first, and only falls through to HERE when nothing else is ready (also the
-        # path for any in-kernel ksyscall(14)). Do ONE SAFE (IF=1) hlt so a device IRQ
-        # (e.g. NIC RX) or the 100 Hz timer wakes it. A BARE arch_wait() would be a hlt
+    if (num == 14) {                          # pause — the refused-yield fallback (one hlt)
+        # Ring-3 pause is handled in syscall_handler (#14 → sys_pause → sched_yield_or_halt, 1.57.7). It falls
+        # through to HERE only when that was REFUSED — every refusal (scheduler not live, preempt held, a borrowed
+        # CR3) also makes wq_can_block() refuse, so from ring 3 only the legacy branch below
+        # is reached. The first branch serves an in-kernel ksyscall(14) (KSTACK_SELFTEST mode 5 tests it that way).
+        # ⭐ 1.57.7 (Path 2, S3.4/S3.6) — THE DESIGNATED CPL0 PREEMPT POINT, one body with #44's park:
+        # sched_halt_window halts ONCE with IF=1 and preempt_count 0 (flag -> mfence -> scan -> sti;hlt, so a 0xE1
+        # kick is never lost), and the tick that ends the hlt may switch the context out at CPL0 (and resume it on
+        # any CPU). When its scan finds a READY process it returns 0 WITHOUT halting — its contract is that the
+        # caller's trailing yield takes that work — so the yield below hands the CPU over at once.
+        if (wq_can_block() == 1) {
+            if (sched_halt_window() == 0) { sched_yield_kernel(); }
+            return 0;
+        }
+        # The legacy preempt-held sti window (sleep_ms#41's pre-1.57.7 body) for a context that may not block:
+        # ONE SAFE (IF=1) hlt so a device IRQ (e.g. NIC RX) or the 100 Hz timer wakes it. A BARE arch_wait() would be a hlt
         # with IF=0 (SYSCALL clears IF via SFMASK 0x40700) = the "IF=0 hlt hard-hang" the
         # sleep_ms#41 recipe warns about — it deadlocked the single core (the two-proc
         # setu-present freeze, 1.53.9). preempt_disable keeps the timer ticking+EOIing
@@ -9073,19 +9596,22 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     # Tier 3: signals
     if (num == 16) {
-        # kill(pid=arg1, sig=arg2)
+        # kill(pid=arg1, sig=arg2 [| KILL_TREE 0x100]) — 1.57.7 (S7): 9 ENDS, 19 STOPS, 18 CONTINUES (and sets bit 18),
+        # 0 PROBES (authorization only, no bit); any other 1..63 sets a pending bit (no default action, SIGTERM
+        # included — D3). KILL_TREE reaches the root and every epoch-validated descendant (D4); a tree STOP that had to
+        # skip a member returns -2. Any other bit above the signal byte -> -1 (every sig >= 64 or < 0 returned -1
+        # before, so no call that ever succeeded had such a bit). Security (1.50.7): authorization = proc_may_signal
+        # (init -> anyone; otherwise self or an epoch-valid direct child), re-checked under sched_lock by the delivery.
         if (arg1 < 0) { return 0 - 1; }
         if (arg1 >= proc_count) { return 0 - 1; }
-        if (arg2 < 0) { return 0 - 1; }
-        if (arg2 >= 64) { return 0 - 1; }
-        # Security (1.50.7): authorization = proc_may_signal (proc.cyr) — init signals anyone;
-        # a non-init caller may signal only itself or its own direct child. Now a REAL gate:
-        # proc_get_ppid returns the actual parent (was stubbed 0, leaving this inert). Arg
-        # bounds (above) stay here; the ownership policy is the extracted, selftested predicate.
-        if (proc_may_signal(proc_current_get(), arg1) == 0) { return 0 - 1; }
-        var sig_pending = load64(&proc_signals + arg1 * 8);
-        store64(&proc_signals + arg1 * 8, sig_pending | (1 << arg2));
-        return 0;
+        var kl_flags = arg2 & (0 - 256);                     # every bit above the signal byte (a negative arg2 -> nonzero)
+        if (kl_flags != 0) { if (kl_flags != KILL_TREE) { return 0 - 1; } }
+        var kl_sig = arg2 & 0xFF;
+        if (kl_sig >= 64) { return 0 - 1; }
+        var kl_me = proc_current_get();                      # ONE LAPIC read
+        if (proc_may_signal(kl_me, arg1) == 0) { return 0 - 1; }
+        if (kl_sig == 0) { return 0; }                       # D3: a probe — authorization only, NO bit
+        return proc_signal_deliver(kl_me, arg1, kl_sig, kl_flags);
     }
     if (num == 17) {
         # sigprocmask(how=arg1, set=arg2, oldset=arg3)
@@ -9199,7 +9725,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
                         if (timer_ticks >= kpayload(wbase, 1)) { rdy = 1; }
                     }
                     if (wtype == VFS_SOCK) {        # 1.49.5 socket readiness -> EPOLLIN when readable
-                        if (tcp_readable(kpayload(wbase, 0)) == 1) { rdy = 1; }
+                        if (tcp_fd_owner(kpayload(wbase, 0)) >= 0) {       # 1.57.7 S5: owner (or kernel-owned) only
+                            if (tcp_readable(kpayload(wbase, 0)) == 1) { rdy = 1; }
+                        }
                     }
                 }
             }
@@ -9222,12 +9750,11 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # it is the normal not-ready return.
         #
         # The fix is to delete it and fall through. `epoll_wait` here is a **poll**, not a sleep: it
-        # returns `found == 0` and ring 3 loops. That matches every other agnos "not ready" answer
-        # (`waitpid #4`, `sock_recv #49`, `sock_accept #57`, `flock #59` all return rather than block),
-        # and it is the ONLY shape available — a real blocked state needs a new proc state, a
-        # `sched_next` that skips it, a ready-edge, and a relaxation of `do_context_switch`'s
-        # unconditional ready-reset. That is a scheduler arc, and it must be named as one rather than
-        # smuggled in behind a `hlt`. See `planning/ipc.md` §9.4.
+        # returns `found == 0` and ring 3 loops (the ABI row says so since 1.57.7).
+        # ⭐ 1.57.7: the scheduler arc this used to name — a real BLOCKED state, a sched_next that skips it, a ready
+        # edge — now EXISTS (Path 2: wq_arm / wq_sleep / wq_wake, docs/architecture/blocking-waits.md), and waitpid#4
+        # (WAIT_BLOCK) and flock#59 block for real. A blocking epoll_wait still needs a wake from every watched fd type
+        # (timerfd, signalfd, sockets, pipes) — its own design item; until then it stays a poll, never a `hlt`.
         return found;
     }
     if (num == 22) {
@@ -9848,6 +10375,32 @@ fn ksyscall(num, arg1, arg2, arg3) {
         stack_canary_check(canary);
         return ml_n;
     }
+    if (num == 106) {
+        # sock_peer(conn_id=arg1) — the remote (ip, port) of a connection the CALLER owns, packed (peer_ip << 16) | peer_port (ip in the ip4() form, port host order); -1 when not yours / CLOSED / LISTEN / bad id. A NEW NUMBER, not a widening of #57 (a2 is a stale register in every shipped 1-arg caller). a2..a4 never read.
+        # 1.57.7 (S5). Because net_wire_frame drops 127/8 and our own address as a wire SOURCE,
+        # `ip >> 24 == 127` or `ip == net_config#61(0)` identifies a local client unforgeably. One packed return:
+        # no torn (ip, port) pair; a live peer is always >= 0x10000.
+        if (tcp_auth(arg1) < 0) { stack_canary_check(canary); return 0 - 1; }
+        var sp_r = tcp_peer_own(arg1, tcp_caller_tag());
+        stack_canary_check(canary);
+        return sp_r;
+    }
+    if (num == 107) {
+        # spawn_limits(mem_pages, cpu_ms) -> 0 / -1 — one-shot caps for the caller's NEXT child (#3 / #37 / #43).
+        # 1.57.7 (S8). a1 mem_pages: 0 = none; else the child's mapped user memory in 4 KiB pages (#99's RSS unit),
+        # enforced at 2 MB = 512-page granularity; 0 <= a1 <= 2^36. a2 cpu_ms: 0 = none; else the child's CPU budget,
+        # stored as ceil(ms / 10) 100 Hz ticks; 0 <= a2 <= 2^40. a3 IGNORED. BOTH are validated before any store (a
+        # refused call leaves the earlier arm UNCHANGED); otherwise it REPLACES the arm (both fields), (0, 0) disarms.
+        # Consumed by syscall_handler after EVERY #3/#37/#43 return. No authority check: lim_eff lets an arm only
+        # lower, and it restricts only the caller's own future children (never the caller itself).
+        if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
+        if (arg1 > 0x1000000000) { stack_canary_check(canary); return 0 - 1; }
+        if (arg2 < 0) { stack_canary_check(canary); return 0 - 1; }
+        if (arg2 > 0x10000000000) { stack_canary_check(canary); return 0 - 1; }
+        lim_arm_set(proc_current_get(), arg1, (arg2 + 9) / 10);
+        stack_canary_check(canary);
+        return 0;
+    }
     # GPU compute dispatch (#82) — the ring-3 dispatch seam (#82) ring-3 seam: run the proven 8x8 integer matmul on the caller's
     # A,B (64 i32 each) and write C=A*B to c_uva. The path mabda/tentib consume for GPU inference. -> 0 ok / <0 err.
     if (num == 82) { stack_canary_check(canary); return gpu_dispatch_sys(arg1, arg2, arg3); }                # gpu_dispatch(a, b, c)
@@ -9933,7 +10486,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # rather than an ABI break, and it is the one thing to preserve if this is ever touched again.
         #
         # ⛔⛔ NO `idle` FIELD, AND THE ABSENCE IS THE HONEST ANSWER. agnos has no single idle loop:
-        # `arch_wait()` (a bare `hlt`) is called from ~a dozen polling waits — DHCP retry, `sleep_ms`#41,
+        # `arch_wait()` (a bare `hlt`) is called from ~a dozen polling waits — DHCP retry, `sleep_ms`#41's legacy loop,
         # `kbd_read_blocking`, the NIC drain — so a CPU halted inside a blocking syscall is
         # INDISTINGUISHABLE at the tick boundary from one doing real kernel work. Both are ring 0.
         # ⇒ The kernel field means "system + halted", NOT "busy-system". Compute utilisation as
@@ -10008,7 +10561,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # exec_redirect(src | op << 8, dst) — arm fd redirects for THIS PROCESS's next child: the child's
         # writes to src (e.g. 1 = stdout) route to dst's backend (output capture). AGNOS-native (a one-shot
         # spawn-time dup, not a persistent dup2). Returns 0, or -1. See the redir_* helpers (proc.cyr) and
-        # exec_redirect_apply / spawn_fd_shape above.
+        # spawn_fd_shape / spawn_shape_strict above.
         #   op 0 (a1 in [0,32) — every pre-1.57.6 caller): REPLACE the caller's set with this one pair.
         #   op 1 REDIR_ADD (0x100 | src): add a pair, or re-point an already-armed src; at most
         #        SPAWN_REDIR_MAX (4). -1 when full, or when src is the fd the caller's ARMED endowment
@@ -10018,7 +10571,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # src and dst are CHILD fd numbers, and pairs apply IN ARM ORDER against the child's CURRENT
         # table: `(1 <- w)` then `ADD(2 <- 1)` is shell `2>&1`.
         # ⭐ 1.57.6 — PER-PROCESS, AND ACTUALLY ONE-SHOT. "The next exec" is the caller's next child
-        # creation by `execwait`#37 (apply + restore around the run-to-completion child) or
+        # creation by `execwait`#37 (1.57.7: applied into the child's private table, which dies with the child —
+        # nothing is restored; refused when the child could only get the global table) or
         # `spawn_path`#43 (applied into the child's private table, which is then its own). `spawn`#3 does
         # NOT consume redirects. Every #43 and #37 return clears the caller's whole set, success or
         # refusal. ⛔ This comment promised that ("either consumer clears the one-shot, including on its
@@ -10041,219 +10595,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (rop == 0) { return redir_arm_replace(rme, rsrc, arg2); }
         return redir_arm_add(rme, rsrc, arg2);
     }
-    if (num == 37) {
-        # execwait(path=arg1, pathlen=arg2) — load a static ELF64 from the active
-        # ext2 root, run it to completion in ring 3, return its exit code (or -1).
-        # The ring-3 BLOCKING-exec primitive (1.43.x; roadmap "no preemption
-        # needed"). This is the FIRST exec_and_wait invoked from a live ring-3
-        # SYSCALL frame (agnsh, itself entered by kybernet's exec_and_wait), so it
-        # carries two hazards the from-kernel callers (sh_cmd_run / kybernet) never
-        # had — both handled below:
-        #  (H1) the nested exec_and_wait OVERWRITES the resume-context globals
-        #       (exec_ctx + kernel_return_* + kpti_* + kernel_rsp_save) that hold
-        #       KYBERNET's armed frame — the frame agnsh's OWN exit() longjmps into.
-        #       We snapshot them before, restore them after.
-        #  (H2) GONE (1.57.6, Path 2 S3.3). The child's syscalls used to reuse the shared
-        #       per-CPU SYSCALL kstack and would have smashed agnsh's suspended #37 frame
-        #       and its stub-pushed SYSRET cells, so this arm swapped in a second per-CPU
-        #       stack for the child's run. Every process now runs its syscalls on its OWN
-        #       kernel stack (exec_and_wait's kstack_install(child)), and agnsh's SYSRET
-        #       state is in agnsh's frame — there is nothing to swap or to save.
-
-        # (a) validate path arg + length + ext2-root guard (elf_load_from_file is
-        # ext2-only) + re-entrancy guard. The single-slot save block holds ONE level:
-        # a child that itself calls execwait would clobber agnsh's saved frame and
-        # reuse syscall_kstack_top2 recursively — refuse cleanly (recursive exec is
-        # out of scope until the multithreading arc).
-        # ⭐ 1.57.6: EVERY refusal below also clears the caller's spawn arms (#62 redirect set, CH_ENDOW
-        # endowment) — this arm consumes them whether or not it runs a child. None of these returns
-        # cleared anything before, and the arms were per-CPU, so a refused #37 left its redirect for
-        # whatever next spawned on that CPU (agnoshi probed binaries before arming to dodge it).
-        # ⚠ #37 keeps folding every launch failure to -1: its success value is the child's exit code,
-        # and a child may exit(-2), so the -SPAWN_E_* codes #43 returns cannot be told apart here.
-        if (sc_path_ok(arg1, arg2) == 0) { spawn_arms_clear(proc_current_get()); stack_canary_check(canary); return 0 - 1; }
-        if (arg2 > SPAWN_LINE_MAX) { spawn_arms_clear(proc_current_get()); stack_canary_check(canary); return 0 - 1; }
-        if (ext2_active == 0) { spawn_arms_clear(proc_current_get()); stack_canary_check(canary); return 0 - 1; }
-        if (pcpu_ew37_busy_get() != 0) { spawn_arms_clear(proc_current_get()); stack_canary_check(canary); return 0 - 1; }
-
-        # (b) COPY the user path into the kernel buffer NOW, while CR3 is still the
-        # caller's (so the user VA resolves) and SMAP AC=1 (the entry stub's STAC).
-        # elf_load_from_file below runs under BOOT CR3 (it needs the NVMe BAR, which
-        # the per-process CR3 does not map — the same reason kernel_resume reverts to
-        # 0x1000), where the user VA would NOT resolve — hence the copy up front.
-        var pdst = ew37_path_base();
-        var pi = 0;
-        while (pi < arg2) { store8(pdst + pi, load8(arg1 + pi)); pi = pi + 1; }
-        # ⛔ 1.57.6 — MORE THAN SPAWN_ARGC_MAX TOKENS IS REFUSED, NOT DROPPED (operator 2026-09-23). The
-        # loader's tokenizer silently stopped at the 16th, so a 17th argument vanished. Counted on the
-        # kernel copy, BEFORE any snapshot or per-CPU loader cell is touched.
-        if (spawn_line_tokens(pdst, arg2) > SPAWN_ARGC_MAX) {
-            spawn_arms_clear(proc_current_get());
-            stack_canary_check(canary);
-            return 0 - 1;
-        }
-
-        # (c) snapshot agnsh's resume context (H1) BEFORE the nested exec_and_wait
-        # clobbers it. proc_current_get() is still agnsh here.
-        var s37 = ew37_ctx_base();
-        var es  = exec_ctx_base();
-        var si = 0;
-        while (si < 64) { store64(s37 + si, load64(es + si)); si = si + 8; }
-        ew37_kr_rsp_set(kernel_return_rsp_get());          # == 1 (kybernet frame armed)
-        ew37_kr_rip_set(kernel_return_rip_get());
-        ew37_a4_set(ksyscall_a4_get());
-        ew37_pid_set(proc_current_get());               # agnsh's pid
-        ew37_resume_pid_set(exec_resume_pid_get());          # 1.44.14: save agnsh's resume-pid; the nested
-        # exec_and_wait(child) overwrites exec_resume_pid = child, restored below post-resume.
-        ew37_cr3_set(proc_get_cr3(proc_current_get())); # agnsh's CR3 (robust source)
-        pcpu_ew37_busy_set(1);
-
-        # (d) switch to the BOOT CR3 (maps all phys incl. the NVMe BAR) for the disk
-        # I/O, then load the child ELF from the kernel path copy (own address space;
-        # argv[0] = the path, matches sh_cmd_run). On failure nothing else was
-        # clobbered (no exec_and_wait, no kstack swap) — restore the caller CR3,
-        # clear the guard, return -1.
-        #
-        # 1.43.x argv: the caller's buffer pdst[0..arg2) is the WHOLE command line
-        # ("PATH arg1 arg2 .."). elf_load_from_file opens the file by (path,namelen)
-        # but tokenizes argv from a SEPARATE (argv_src,argv_len) — so the file open
-        # must use the PATH TOKEN ONLY (up to the first space) while the WHOLE line is
-        # passed as argv_src for the elf.cyr space-tokenizer. This mirrors the proven
-        # recovery shell sh_cmd_run (user/shell.cyr:447-455): plen-to-first-space for
-        # the open, whole tail for argv. Before this split the open name was the entire
-        # "PATH arg" string, so `run /bin/bnrmr AGNOS` ENOENT'd on the literal 16-byte
-        # "/bin/bnrmr AGNOS" while bare `run /bin/bnrmr` (no space) worked — exactly the
-        # 1436-burn symptom. Leading-space skip matches the tokenizer's own (elf.cyr:303)
-        # so argv[0] stays the path token regardless of where the open pointer starts.
-        cr3_load(0x1000);
-        var ew_ps = 0;
-        while (ew_ps < arg2) { if (load8(pdst + ew_ps) != 32) { break; } ew_ps = ew_ps + 1; }   # skip leading spaces
-        var ew_pe = ew_ps;
-        while (ew_pe < arg2) { if (load8(pdst + ew_pe) == 32) { break; } ew_pe = ew_pe + 1; }     # to first space
-        var ew_plen = ew_pe - ew_ps;
-        if (ew_plen < 1) {                          # empty / all-spaces path token
-            cr3_load(ew37_cr3_get());
-            pcpu_ew37_busy_set(0);
-            spawn_arms_clear(ew37_pid_get());
-            stack_canary_check(canary);
-            return 0 - 1;
-        }
-        # 1.44.19 per-process env: a3 = caller env-blob VA, a4 = blob len ("KEY=V\0KEY=V\0",
-        # <=1024 B, <=16 entries). FALLBACK-ONLY semantics — any gate failure means "no env"
-        # (the uniform default), NEVER -1: legacy 3-arg callers (agnoshi <=1.6.1 — the NORMAL
-        # ESP-only deployment) deliver GARBAGE a3/a4 (cyrius syscall() pops exactly N arg
-        # regs), so proc_copy_from_user is the fault-PROOF page-walking copy (a blind deref
-        # of a garbage in-range VA would #PF the handler). Runs under boot CR3 (identity),
-        # walking the CALLER's tables via ew37_cr3.
-        var ew_eptr = arg3;
-        var ew_elen = ksyscall_a4_get();
-        var ew_env = 0;
-        if (ew_eptr != 0) {
-            if (ew_elen >= 1) {
-                if (ew_elen <= 1024) {
-                    if (is_user_range(ew_eptr, ew_elen) == 1) {
-                        if (proc_copy_from_user(ew37_cr3_get(), ew37_env_base(), ew_eptr, ew_elen) == 1) {
-                            if (sc_env_blob_ok(ew37_env_base(), ew_elen) == 1) { ew_env = ew37_env_base(); }
-                        }
-                    }
-                }
-            }
-        }
-        exec_env_src_set(ew_env);                    # 1.46.8: per-CPU, consumed-at-entry by the loader
-        exec_env_len_set(ew_elen);
-        var cpid = elf_load_from_file(pdst + ew_ps, ew_plen, pdst, arg2);
-        if (cpid < 0) {
-            # ⚠ 1.57.6: elf_load_from_file now answers -SPAWN_E_*; FOLDED to -1 here on purpose (see the
-            # refusal note at the top of this arm). The endowment may already be spent — or not, if the
-            # load failed before proc_create_user — so the whole arm state is cleared either way.
-            cr3_load(ew37_cr3_get());
-            pcpu_ew37_busy_set(0);
-            spawn_arms_clear(ew37_pid_get());
-            stack_canary_check(canary);
-            return 0 - 1;
-        }
-
-        # (e) stash the child pid in a GLOBAL + pull entry/rsp/cr3 from its proc_table
-        # row (176-B stride: entry@+24, rsp@+16, cr3@+160 — same offsets sh_cmd_run
-        # uses, shell.cyr:460-463). 1.46.x #2: the child is NEVER made READY (state 1) on this
-        # path — it is entered out-of-band via exec_and_wait/enter_ring3 below (never via sched),
-        # then exit#0 flips it state=0. So there is deliberately NO proc_set_state(cpid,1) here.
-        # ⭐ 1.57.6 (S3.3): exec_and_wait now marks it state 2 with on_cpu = this CPU (FG-1) — RUNNING,
-        # FENCED and PINNED (idle_owner) — so no other CPU can pick it and INV-11 holds for it too.
-        ew37_cpid_set(cpid);
-        var cep = &proc_table + cpid * 176;
-        var ce  = load64(cep + 24);
-        var cr  = load64(cep + 16);
-        var cc  = load64(cep + 160);
-
-        # (f) (1.57.6, S3.3: the second-kstack swap that lived here is gone with hazard H2 — see the header.)
-
-        # (f2) 1.46.x fd-redirect: if redirects were armed via exec_redirect#62, repoint each src
-        # fd (e.g. stdout) to its dst backend for the child's run, in arm order (1.57.6: up to
-        # SPAWN_REDIR_MAX pairs, keyed by the CALLER's pid). No-op otherwise, so the default path is
-        # byte-identical. Restored at (h2) after the child exits.
-        exec_redirect_apply(ew37_pid_get(), cpid);
-
-        # (g) make the child current (so ITS exit() stamps the code on ITS pid),
-        # then run to completion. The child's exit() -> kernel_resume longjmps back
-        # to the line after this call with CR3=boot 0x1000, proc_current_get()=0,
-        # kernel_return_*=0, kpti_*=child, and TSS.RSP0 + the syscall top on kmain's slot (1.57.6).
-        proc_current_set(cpid);
-        exec_and_wait(ce, cr, cc);
-        # ===== RESUME POINT (child exited) =====
-
-        # (h2) 1.46.x fd-redirect: restore the redirected src fds to their original backends
-        # (e.g. stdout back to the console), in reverse arm order, + clear the one-shot. Under
-        # boot CR3 here (fd tables are kernel memory). No-op if nothing was armed.
-        # ⛔ BOTH PIDS FROM THE PER-CPU ew37 CELLS: proc_current_get() is 0 after kernel_resume, and
-        # keying by it would silently skip the restore (see exec_redirect_apply's header).
-        exec_redirect_restore(ew37_pid_get(), ew37_cpid_get());
-        spawn_arms_clear(ew37_pid_get());          # 1.57.6: #37 spends the caller's whole arm state
-
-        # (h) ⭐ 1.57.6 (Path 2, S3.3): re-install the CALLER's kernel stack — TSS.RSP0 AND this CPU's syscall
-        # top (kstack_install). This used to restore only the per-CPU PRIMARY syscall top (the direct-map
-        # 0xF10000 + cpu*64 KB) and never TSS.RSP0, which exec_and_wait had pointed at the CHILD's slot: agnsh
-        # then took its CPL3 interrupts on the reaped child's stack until its next switch — a slot proc_alloc_slot
-        # can hand to a new process. Both now point at agnsh's own stack, where its #37 frame and its SYSRET
-        # state already are.
-        kstack_install(ew37_pid_get());
-        ew37_rsp0_check();                         # EXEC_SELFTEST: 'exec: rsp0 restored' (a no-op twin otherwise)
-
-        # (i) read the child's exit code (from the GLOBAL pid) BEFORE reaping (reap
-        # collapses the slot), then reap: proc_reap_child frees the child's address
-        # space + LIFO slot only (NOT proc_reap, which sweeps fds). Safe: child is
-        # dead, proc_current_get()==0 (!=cpid) so its guard passes, CPU is on boot CR3.
-        ew37_code_set(proc_get_exit_code(ew37_cpid_get()));
-        proc_reap_child(ew37_cpid_get());
-
-        # (j) rebuild agnsh's resume world from the snapshot (H1) so agnsh's own
-        # later exit() resumes kybernet, and so the exit stub reloads agnsh's CR3 +
-        # user RSP (not the child's leftovers). &ew37_ctx/&exec_ctx are fresh global
-        # addresses (not carried locals).
-        var r37 = ew37_ctx_base();
-        var er  = exec_ctx_base();
-        var ri  = 0;
-        while (ri < 64) { store64(er + ri, load64(r37 + ri)); ri = ri + 8; }
-        kernel_return_rsp_set(ew37_kr_rsp_get());             # re-arm (==1): agnsh's exit() resumes kybernet
-        kernel_return_rip_set(ew37_kr_rip_get());
-        store64(&pcpu_kpti_kernel_cr3 + pcpu_cpu() * 8, ew37_cr3_get());   # agnsh's CR3 (kernel-side); 4c per-CPU
-        store64(&pcpu_kpti_user_cr3 + pcpu_cpu() * 8, ew37_cr3_get());      # the value the exit stub reloads into CR3 pre-SYSRET
-        ksyscall_a4_set(ew37_a4_get());
-        proc_current_set(ew37_pid_get());                # agnsh's pid (its write/exit attribute to agnsh)
-        exec_resume_pid_set(ew37_resume_pid_get());         # 1.44.14: agnsh is the resume target again, so
-        # agnsh's later exit() (proc_current_get()==exec_resume_pid) fires kernel_resume to kybernet
-
-        # (k) reload the LIVE CR3 to agnsh now (kernel_resume left boot 0x1000) so
-        # this handler tail + the exit stub run under agnsh's mappings. cr3_load
-        # (proc.cyr:153) is the robust param-based idiom.
-        cr3_load(ew37_cr3_get());
-
-        pcpu_ew37_busy_set(0);
-        # (l) NO post-resume canary check: the entry `canary` local was legitimately
-        # handed to exec_and_wait's longjmp; ksyscall's canary guards CALLEE overruns
-        # and there are no callees after this point (syscall.cyr:250-258). Return the
-        # child code from the GLOBAL.
-        return ew37_code_get();
+    if (num == 37) {   # execwait(path, pathlen, env, envlen=a4) — run a program as an ordinary scheduled child; block until it exits
+        # ⭐ 1.57.7 (S3b): the whole call is sys_execwait (above spawn_path_sys's caller, next to it). The child is an
+        # ordinary scheduled IF=1 process (time-sliced, any CPU; it may yield, fork, spawn, wait, block and nest) and
+        # this caller BLOCKS in the kernel (#99 state 6) until it exits. a4 is read HERE, at dispatch (INV-FG-4).
+        var ew_rv = sys_execwait(arg1, arg2, arg3, ksyscall_a4_get());
+        stack_canary_check(canary);          # re-enabled: the arm returns normally now (no longjmp through it)
+        return ew_rv;
     }
     if (num == 38) {
         # fbinfo(buf=arg1, len=arg2) — write the 24-byte framebuffer geometry
@@ -10555,14 +10903,16 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # ⭐ 1.57.6 — THE REFERENCE, AND -1 IS PERMANENT. tsc_calibrate (main.cyr) measures against the
         # ACPI PM timer when the FADT advertises one (3.579545 MHz, needs no interrupt delivery, so a
         # host CPU quota lengthens a window but cannot bias it — the daimon report's 25% refusal and
-        # 50% 2.6x-slow clock were both the old live-tick reference losing ticks), else against live
-        # PIT-calibrated ticks, as the MEDIAN of several windows. It runs once right after `sti` and
+        # 50% 2.6x-slow clock were both the old live-tick reference losing ticks), else (no usable PM
+        # timer) against live LAPIC ticks, whose 100 Hz reload is itself measured against the PM timer
+        # when the early probe found one (1.57.7 S1b), or against the PIT — as the MEDIAN of several
+        # windows. It runs once right after `sti` and
         # once more immediately before `sched_active = 1`, and never again: so -1 is PERMANENT once
         # production ring 3 (kybernet onward) can observe it — only a TSC_SELFTEST build's /bin/tscp
         # probe reads this arm between the two attempts — and a consumer may latch its fallback
-        # (uptime_ms#40 — BSP-tick-driven, frozen while the BSP runs IF=0, slow when ticks are lost; a
-        # degraded fallback, not an equivalent clock) without ever seeing this clock start later on a
-        # different epoch.
+        # (uptime_ms#40 — since 1.57.7 the same calibrated TSC on its own since-boot epoch, and
+        # BSP-tick-driven only when calibration refused; a degraded fallback there, not an equivalent
+        # clock) without ever seeing this clock start later on a different epoch.
         stack_canary_check(canary);
         if (tsc_per_us == 0) { return 0 - 1; }
         return (rdtsc() - tsc_base) / tsc_per_us;
@@ -10580,32 +10930,60 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 40) {
         # uptime_ms() — monotonic milliseconds since boot, returned in rax (no
-        # buffer, like getpid#2). timer_ticks is the 100 Hz tick counter (10 ms/
-        # tick, pic.cyr), so ms = timer_ticks * 10. Monotonic non-decreasing (the
-        # counter only ever increments). The ring-3 frame clock for cyrius-doom
+        # buffer, like getpid#2). The ring-3 frame clock for cyrius-doom
         # (DG_GetTicksMs). a1..a3 unused.
+        # ⭐ 1.57.7 (S1b B5) — BACKED BY THE CALIBRATED TSC once tsc_calibrate succeeded (uptime_ms_now,
+        # above ksyscall): continuous with the timer_ticks * 10 it returned before calibration, and it
+        # ADVANCES while the BSP runs IF=0 and while a throttled host coalesces ticks. timer_ticks * 10
+        # only where calibration refused.
         stack_canary_check(canary);
-        return timer_ticks * 10;
+        return uptime_ms_now();
     }
     if (num == 41) {
-        # sleep_ms(ms=arg1) — block the caller ~ms ms by halting until the 100 Hz
-        # timer advances timer_ticks to the target. In the no-preempt ring-3 model
-        # user code runs IF=0 (ring3.cyr) so the clock only moves inside a kernel
-        # sti window — this is therefore ALSO the only way a ring-3 loop lets time
-        # pass (the pacing primitive, DG_SleepMs). Mirrors kbd_read_blocking's
-        # proven recipe: sched_active=0 so the timer ISR still ticks+EOIs but
-        # do_context_switch early-returns (we can't be preempted off mid-sleep on
-        # this single core); sti BEFORE the hlt (an IF=0 hlt is the waitpid hard-
-        # hang); cli on the way out. SYSRET restores the user's IF=0 from R11
-        # regardless, so the cli is just handler-tail hygiene. ms rounds UP to whole
-        # ticks (sleep >= ms). a2..a3 unused.
+        # sleep_ms(ms=arg1) — block ONLY the caller for at least ms milliseconds (1.57.7, Path 2 S3.5).
+        # ⭐ The caller leaves its CPU in a real BLOCKED state (wq_arm(WK_SLEEP|pid, deadline) + wq_sleep) and
+        # wq_tick makes it READY at the deadline, so every other process — and the CPU's idle, which halts IF=1
+        # so the tick and device IRQs keep their window — runs meanwhile. The deadline is on sched_clock_us: the
+        # calibrated TSC (the sleep lasts >= ms as #95 measures it), or the BSP tick clock with one tick of
+        # padding when calibration was refused. `ms < 0` -> -1, 0 -> 0 at once, capped at 1 h. a2..a3 unused.
+        # ⚠ A context that may NOT block (wq_can_block: before the scheduler runs — DOOM's pacing, exec-smoke's
+        # timetest; preempt-held kernel code — never a ring-3 process after S3b-F2) keeps the legacy
+        # loop below VERBATIM: the timer ISR still ticks+EOIs but do_context_switch refuses the preempt-held
+        # context; sti BEFORE the hlt (an IF=0 hlt is the waitpid hard-hang); cli on the way out. There is NO
+        # "pace without yielding" call — a caller that must hold its CPU spins on uptime_us#95.
         if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }   # reject negative
         var sl_ms = arg1;
         if (sl_ms > 3600000) { sl_ms = 3600000; }                    # cap 1 h (sanity)
-        var sl_target = timer_ticks + (sl_ms + 9) / 10;              # round ms up to ticks
+        if (sl_ms == 0) { stack_canary_check(canary); return 0; }
+        # The legacy loop's target is a DEADLINE IN uptime_ms#40 (uptime_ms_now), so it lasts >= ms as #40
+        # measures it — the clock its callers pace in (DOOM, exec-smoke's timetest). ⛔ 1.57.7 (S1b B5): it used
+        # to count ceil(ms/10) tick EDGES from a partial first tick; that was ">= ms in #40" only while #40 WAS
+        # ticks x 10. Once #40 became the calibrated TSC the same loop ended up to one tick EARLY in #40 (the
+        # wait-ring3 interim #37 phase asks for >= 300 in #40). In tick mode (calibration refused) the deadline
+        # is the same ceil(ms/10) whole ticks as before, byte-for-byte in effect (timetest's `exit 50`).
+        var sl_mdl = uptime_ms_now() + sl_ms;
+        if (wq_can_block() == 1) {
+            var sl_me = proc_current_get();
+            var sl_dl = wq_deadline_after_us(sl_ms * 1000);
+            var sl_legacy = 0;
+            while (sched_clock_us() < sl_dl) {                       # the canonical wait; cond = "the deadline passed"
+                var sl_a = wq_arm(WK_SLEEP | sl_me, sl_dl);
+                if (sl_a == 1) { if (wq_signal_point() == 1) { break; } continue; }
+                if (sl_a == 2) { sl_legacy = 1; break; }             # cannot block after all: the legacy loop for the rest
+                if (sched_clock_us() >= sl_dl) { wq_cancel(); break; }
+                var sl_r = wq_sleep();
+                if (sl_r == WR_SIGNAL) { if (wq_signal_point() == 1) { break; } }
+            }
+            if (sl_legacy == 0) { stack_canary_check(canary); return 0; }
+            # the remaining time, rounded up to whole milliseconds, in the legacy loop
+            var sl_left = sl_dl - sched_clock_us();
+            if (sl_left < 0) { sl_left = 0; }
+            sl_mdl = uptime_ms_now() + (sl_left + 999) / 1000;
+        }
         preempt_disable();               # suspend preemption (timer still ticks+EOIs)
         asm { sti; }                     # IF=1 so the timer IRQ fires + wakes the hlt
-        while (timer_ticks < sl_target) {
+        while (uptime_ms_now() < sl_mdl) {
+            if (proc_kill_requested_self() == 1) { break; }   # 1.57.7 (S7): defence in depth — B1 ends a killed caller
             arch_wait();                 # hlt until the next IRQ (timer @ 100 Hz)
         }
         asm { cli; }                     # restore IF=0 for the handler tail
@@ -10626,7 +11004,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # same kb_buf the shell drains, so it can't strand a modifier across calls.
         #
         # The window: ring-3 runs IF=0 (ring3.cyr), so a brief kernel sti window is opened here — the
-        # same sched_active=0 + sti recipe as sleep_ms#41, but BOUNDED (no hlt) so a poll never stalls a
+        # same sched_active=0 + sti recipe as the legacy preempt-held sti window (sleep_ms#41's pre-1.57.7 body), but BOUNDED (no hlt) so a poll never stalls a
         # frame. `hid_poll()` drains the xHCI USB-HID ring synchronously; the sti lets a pending xHCI
         # MSI-X (vector 0x51) be taken as well. Then cli and copy whatever landed.
         #
@@ -10762,7 +11140,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
         #
         # Record (64 B, little-endian), one per live slot:
         #   +0   u64 pid
-        #   +8   u64 state      1=ready · 2=running · 3=claiming (0=dead is skipped)
+        #   +8   u64 state      1=ready · 2=running · 3=claiming · 6=blocked in a kernel wait (1.57.7;
+        #                        4/5 are reserved for the lifecycle step) (0=dead is skipped)
         #   +16  u64 ppid       0 = init
         #   +24  u8  name[32]   NUL-terminated basename, from proc_set_name at ELF load
         #   +56  u64 reserved   always 0 today. ⛔ SPLIT AS TWO u32 HALVES, DECIDED 1.56.59:
@@ -10825,6 +11204,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
             if (pl_n >= arg2) { pl_i = 16; }
             else {
                 var pl_st = load64(&proc_table + pl_i * 176 + 8);
+                # ⭐ 1.57.7 (S7): an exited, UNREAPED child is listed as state 7 (report-only; the table cell stays 0),
+                # with its name, ppid and final ticks; RSS 0 (it no longer runs).
+                if (pl_st == 0) { if (proc_is_zombie(pl_i) == 1) { pl_st = PROC_ZOMBIE_REPORT; } }
                 if (pl_st != 0) {
                     var pl_pid = load64(&proc_table + pl_i * 176);
                     var pl_rec = arg1 + pl_n * 64;
@@ -10856,7 +11238,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
                     # pre-split wording does.
                     # ⚠ BOTH CLAMPED, NOT MASKED. Past 2^32 a mask WRAPS, and a monitor differencing
                     # across a wrap computes a NEGATIVE delta. Saturating is wrong-but-monotonic.
-                    var pl_rs = proc_rss_pages(pl_i);
+                    var pl_rs = 0;
+                    if (pl_st != PROC_ZOMBIE_REPORT) { pl_rs = proc_rss_pages(pl_i); }
                     if (pl_rs > 4294967295) { pl_rs = 4294967295; }
                     store64(pl_rec + 56, (pl_rs << 32) | pl_tk);
                     # name: copy 32 bytes, NUL-padding the tail so ring 3 never reads
@@ -10945,67 +11328,50 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 47) {
         # sock_connect(dst_ip=arg1, dst_port=arg2, src_port=arg3) — open a
-        # client TCP connection over the polled r8169/IPv4 stack (1.32.x) and
-        # return the kernel conn_id (0..7) in rax, or -1 on failure (conn table
-        # full, SYN-ACK timeout ~8 s, or RST). The third of the three 1.45.x TLS
-        # prereqs — the transport tls_native's send/recv bind to. dst_ip is the
-        # IPv4 packed as (oct1<<24)|(oct2<<16)|(oct3<<8)|oct4 (the kernel ip4()
-        # form); the userland/cyrius peer supplies it post-DNS. src_port<=0 (or
-        # out of range) auto-assigns an ephemeral port (49152 + a 14-bit timer-
-        # derived offset). dst_port must be 1..65535.
-        #
-        # tcp_connect BLOCKS up to ~8 s polling net_poll() for the SYN-ACK and
-        # arch_wait()s (hlt) between polls — so it needs the timer advancing +
-        # an IF=1 hlt-wake. Open the proven sleep_ms#41 window: preempt_disable
-        # (sched suspended, so the timer ISR ticks+EOIs but never switches us
-        # off mid-handshake — the serial-kstack invariant holds) + sti, run the
-        # blocking connect, then cli + preempt_enable. The NIC is IRQ-less
-        # (IMR=0, pure poll), so the only IRQ in the window is the timer. No
-        # other proc is scheduled while connecting (preempt held) — acceptable
-        # in the cooperative-iron model; true overlap waits on the 1.46.x kstacks.
+        # client TCP connection over the IPv4 stack and return the kernel conn_id (0..7) in rax, or -1 (RST, the
+        # ~8 s timeout, conn table full, or a duplicate EXPLICIT 4-tuple). The transport tls_native's send/recv
+        # bind to. dst_ip is the IPv4 packed as (oct1<<24)|(oct2<<16)|(oct3<<8)|oct4 (the kernel ip4() form).
+        # src_port<=0 (or out of range) auto-assigns a unique ephemeral port per connect (tcp_ephemeral_next,
+        # 1.51.4/1.57.7 S4; an auto port that collides with a live 4-tuple tries the next). dst_port must be 1..65535.
+        # ⭐ 1.57.7 (S6): BLOCKS ONLY THE CALLER — tcp_connect_ex arms a real wait on WK_TCP|cid (woken by the
+        # SYN-ACK, a RST, or retransmit exhaustion); other processes run on this CPU meanwhile. The ~8 s ceiling is
+        # measured ONCE from entry and never reset by a wake. The preempt-held sti window this arm carried is gone for
+        # every caller that can block; a PRE-SCHEDULER caller (a boot-selftest `run`, IF=0) gets it back through
+        # net_sys_window_open, or its legacy hlt never ends (net_tcp.cyr; doom-smoke's setu dial hung there).
+        # 1.57.7 (S5): the connection is OWNED by the caller's incarnation (pid + epoch, stamped in the claim); any
+        # 127/8 destination works (source 127.0.0.1, reply from the address dialled); every -1 exit after the claim
+        # releases the slot (no held slot is left behind).
         if (arg2 <= 0) { stack_canary_check(canary); return 0 - 1; }      # dst_port low
         if (arg2 > 65535) { stack_canary_check(canary); return 0 - 1; }   # dst_port high
-        var sc_sport = arg3;
-        # src_port<=0/out-of-range → auto-assign a UNIQUE ephemeral port PER CONNECT.
-        # 1.51.4: the old `49152 + (timer_ticks & 0x3FFF)` only varied per 100 Hz tick;
-        # once the 1.51.3 busy-poll fix made connects sub-ms, many complete within one
-        # tick and got the SAME port → the 4-tuple was still in the peer's TIME_WAIT →
-        # dropped SYN → 8 s timeout (intermittent rapid-reconnect failures). A per-connect
-        # counter (seeded by timer_ticks so it doesn't always start the same) gives each
-        # rapid reconnect a fresh port; (ctr + timer_ticks) is strictly increasing, so no
-        # collision until the 14-bit range wraps (16384 connects — the ephemeral ceiling,
-        # as on any host).
-        if (sc_sport <= 0 || sc_sport > 65535) {
-            sc_sport = 49152 + ((tcp_ephemeral_ctr + timer_ticks) & 0x3FFF);
-            tcp_ephemeral_ctr = tcp_ephemeral_ctr + 1;
-        }
         fb_dbg_beacon(3);                    # 1.45.16 canary: TCP connect stage
-        preempt_disable();
-        asm { sti; }
-        var sc_cid = tcp_connect(arg1, arg2, sc_sport);
-        asm { cli; }
-        preempt_enable();
+        var sc_w = net_sys_window_open();   # pre-scheduler callers only (net_tcp.cyr)
+        var sc_cid = tcp_connect_owned(arg1, arg2, arg3, tcp_caller_tag());
+        net_sys_window_close(sc_w);
         stack_canary_check(canary);
         return sc_cid;
     }
     if (num == 48) {
         # sock_send(conn_id=arg1, buf=arg2, len=arg3) — send len bytes from the
-        # user buffer over an ESTABLISHED conn; returns bytes accepted (may be <
-        # len if the conn drops mid-send) or -1 (bad user range). tcp_send
-        # segments to the effective MSS and BLOCKS for each chunk's ACK (one in
-        # flight, ~8 s ceiling) — same IF=1 + preempt-held window as #47. The
-        # user range is validated before the window; tcp_send reads `buf`
-        # directly under the caller CR3 (mapped in the handler, like getrandom
-        # #45's stores). a4 unused.
+        # user buffer over an ESTABLISHED or CLOSE_WAIT conn. a4 unused.
+        # ⭐ 1.57.7 (S6): BLOCKS ONLY THE CALLER (tcp_send_ex waits on WK_TCP|id for each segment's ACK) and is
+        # STREAM-CORRECT: one segment in flight at every entry — a call that finds an earlier segment still unACKed
+        # waits for it first, and each segment is sent from the kernel's held copy. Returns `len` when every byte is
+        # ACKed; the COMMITTED count (possibly 0) after ~8 s with no ACK progress (D6 — a caller must treat 0 as "no
+        # progress yet", not as fatal); the committed count if the conn dies after something was committed; -1 when
+        # nothing was committed and the conn is gone, on a bad range, when the caller is not the owner, or when the
+        # conn is not ESTABLISHED/CLOSE_WAIT. The copy runs AC=1 (syscall entry STAC) on this process's own stack and
+        # CR3, also after a wake. The preempt-held sti window this arm carried is gone (a pre-scheduler caller gets it
+        # back through net_sys_window_open — see #47).
+        # 1.57.7 (S5): -1 when the id is not the caller's (kernel-owned conns included) — checked FIRST, before
+        # the len <= 0 shortcut and the range check. tcp_send_ex re-checks under the lock.
+        if (tcp_auth(arg1) < 0) { stack_canary_check(canary); return 0 - 1; }
         if (arg3 <= 0) { stack_canary_check(canary); return 0; }
         if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
         if (is_user_range(arg2, arg3) == 0) { stack_canary_check(canary); return 0 - 1; }
         fb_dbg_beacon(4);                    # 1.45.16 canary: TCP send (TLS/HTTP) stage
-        preempt_disable();
-        asm { sti; }
-        var ss_n = tcp_send(arg1, arg2, arg3);
-        asm { cli; }
-        preempt_enable();
+        var ss_w = net_sys_window_open();   # pre-scheduler callers only (net_tcp.cyr)
+        var ss_n = tcp_send_own(arg1, arg2, arg3, tcp_caller_tag());
+        net_sys_window_close(ss_w);
         stack_canary_check(canary);
         return ss_n;
     }
@@ -11019,18 +11385,20 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # window. The TLS record layer polls this against its own time_unix#46 /
         # uptime#40 timeout; the 0-vs-(-1) split lets it tell a slow peer from a
         # closed one (tcp_recv alone returns 0 for both). a4 unused.
+        # -1 = EOF: the conn is dead, OR the peer's FIN has been received and every byte before it has been
+        # read (CLOSE_WAIT, ring empty; 1.57.7). Data always drains before EOF.
+        # 1.57.7 (S5): -1 when the id is not the caller's — checked FIRST (fail-closed: reads as EOF).
+        if (tcp_auth(arg1) < 0) { stack_canary_check(canary); return 0 - 1; }
         if (arg3 <= 0) { stack_canary_check(canary); return 0; }
         if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
-        # 1.45.2: out-of-range conn_id is an ERROR (-1), not WOULD_BLOCK. tcp_recv
-        # AND tcp_conn_dead both return 0 for conn_id >= tcp_conn_count, so without
-        # this guard a bogus id would read as WOULD_BLOCK (0) forever, breaking the
-        # WOULD_BLOCK-vs-EOF contract (sock_send/#50 are already safe — tcp_send/
-        # tcp_close bounds-check internally and return -1).
+        # 1.45.2: out-of-range conn_id is an ERROR (-1), not WOULD_BLOCK (tcp_auth refuses it first since
+        # 1.57.7; kept as the belt). tcp_recv_own decides data / would-block / EOF / not-yours in ONE hold, so the
+        # WOULD_BLOCK-vs-EOF contract holds without a second lookup.
         if (arg1 >= tcp_conn_count) { stack_canary_check(canary); return 0 - 1; }
         if (is_user_range(arg2, arg3) == 0) { stack_canary_check(canary); return 0 - 1; }
-        var sr_n = tcp_recv(arg1, arg2, arg3);
+        var sr_n = tcp_recv_own(arg1, arg2, arg3, tcp_caller_tag());
         if (sr_n > 0) { stack_canary_check(canary); return sr_n; }
-        if (tcp_conn_dead(arg1) != 0) { stack_canary_check(canary); return 0 - 1; }   # EOF
+        if (sr_n < 0) { stack_canary_check(canary); return 0 - 1; }     # EOF (dead, or CLOSE_WAIT drained) or not yours
         stack_canary_check(canary);
         return 0;                                                        # WOULD_BLOCK
     }
@@ -11040,8 +11408,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # -1 on a bad conn_id. Non-blocking: tcp_close sends one FIN + arms its
         # (flag-only) retransmit and frees buffers without polling, so no sti
         # window. a2..a4 unused.
+        # 1.57.7 (S5): the op's owner check is the refusal — -1 when not the caller's (a second close too).
         if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
-        var scl_r = tcp_close(arg1);
+        var scl_r = tcp_close_own(arg1, tcp_caller_tag());
         stack_canary_check(canary);
         return scl_r;
     }
@@ -11054,9 +11423,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # udp_unbind#54 — the 1.45.3 listener-slot reclaim lets a per-query
         # bind/unbind loop reuse slots instead of exhausting the 8-listener table.
         # a2..a4 unused.
+        # 1.57.7 (S5): owned by the caller's incarnation; released at exit or fault.
         if (arg1 <= 0) { stack_canary_check(canary); return 0 - 1; }
         if (arg1 > 65535) { stack_canary_check(canary); return 0 - 1; }
-        var ub_id = udp_bind(arg1);
+        var ub_id = udp_bind_owned(arg1, tcp_caller_tag());
         stack_canary_check(canary);
         return ub_id;
     }
@@ -11081,6 +11451,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (is_user_range(arg3, us_len) == 0) { stack_canary_check(canary); return 0 - 1; }
         var us_sport = (arg2 >> 16) & 0xFFFF;
         var us_dport = arg2 & 0xFFFF;
+        # 1.57.7 (S5): a source port bound by ANOTHER owner (kernel ports included) is refused (EADDRINUSE
+        # semantics — no spoofing a listener's port). Returns the frame length on both the wire and the
+        # loopback path (the loopback path returned 0 before 1.57.7).
+        if (udp_sport_ok(us_sport, tcp_caller_tag()) == 0) { stack_canary_check(canary); return 0 - 1; }
         fb_dbg_beacon(2);                    # 1.45.16 canary: DNS/UDP tx stage
         var us_r = udp_send(arg1, us_sport, us_dport, arg3, us_len);
         stack_canary_check(canary);
@@ -11099,15 +11473,20 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg3 <= 0) { stack_canary_check(canary); return 0; }
         if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
         if (arg1 >= udp_listener_count) { stack_canary_check(canary); return 0 - 1; }
+        # 1.57.7 (S5): -1 for a listener that is not the caller's (before the range checks and the poll).
+        if (udp_auth(arg1) < 0) { stack_canary_check(canary); return 0 - 1; }
         if (is_user_range(arg2, arg3) == 0) { stack_canary_check(canary); return 0 - 1; }
+        var ur_own = tcp_caller_tag();
         var ur_addr = ksyscall_a4_get();
         if (ur_addr != 0) {
             if (is_user_range(ur_addr, 16) == 0) { stack_canary_check(canary); return 0 - 1; }
-            var ur_n = udp_recv_from(arg1, arg2, arg3, ur_addr, ur_addr + 8);
+            var ur_n = udp_recv_from_own(arg1, arg2, arg3, ur_addr, ur_addr + 8, ur_own);
+            if (ur_n < 0) { ur_n = 0 - 1; }
             stack_canary_check(canary);
             return ur_n;
         }
-        var ur_n2 = udp_recv_from(arg1, arg2, arg3, 0, 0);
+        var ur_n2 = udp_recv_from_own(arg1, arg2, arg3, 0, 0, ur_own);
+        if (ur_n2 < 0) { ur_n2 = 0 - 1; }
         stack_canary_check(canary);
         return ur_n2;
     }
@@ -11119,22 +11498,19 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # a2..a4 unused.
         if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
         if (arg1 >= udp_listener_count) { stack_canary_check(canary); return 0 - 1; }
-        var uu_r = udp_unbind(arg1);
+        # 1.57.7 (S5): -1 for a listener that is not the caller's, and for an already-free id (was 0).
+        var uu_r = udp_unbind_own(arg1, tcp_caller_tag());
         stack_canary_check(canary);
         return uu_r;
     }
     if (num == 55) {
         # icmp_echo(dst_ip=arg1) — send one ICMP echo request (ping) to dst_ip and
-        # block (~3 s bounded) for the matching reply; returns the round-trip time
-        # in MILLISECONDS (>= 0) or -1 (timeout / NIC down). The ring-3 ping hook
-        # for `yo` (the Phase-A net-tool). dst_ip is the ip4() packed form. Like
-        # sock_connect#47, icmp_ping polls net_poll() + arch_wait()s on a
-        # timer_ticks deadline, so it runs in the proven sleep_ms#41 sti-window:
-        # preempt_disable (timer ISR ticks+EOIs but never context-switches mid-
-        # ping — the serial-kstack invariant) + sti (IF=1 so timer_ticks advances
-        # + the hlt wakes) + cli + preempt_enable. The NIC is IRQ-less (IMR=0,
-        # pure poll), so the only in-window IRQ is the timer. RTT resolution is the
-        # 100 Hz tick (10 ms); a sub-10 ms reply returns 0. a2..a4 unused.
+        # wait up to ~3 s for ITS reply; returns the round-trip time in MILLISECONDS (>= 0) or -1 (timeout / NIC
+        # down). The ring-3 ping hook for `yo`. dst_ip is the ip4() packed form. a2..a4 unused.
+        # ⭐ 1.57.7 (S6): BLOCKS ONLY THE CALLER (icmp_ping_us sleeps on WK_ICMP|pid); concurrent pingers each get
+        # their own reply (per-process reply slots). The RTT is measured on the µs clock (#95) and returned at 1 ms
+        # resolution (10 ms when #95 is -1). The preempt-held sti window this arm carried is gone (a pre-scheduler
+        # caller gets it back through net_sys_window_open — see #47).
         #
         # ⛔ #55's ARITY IS FROZEN AT ONE ARGUMENT. The configurable timeout this
         # comment used to promise lives at #100 (icmp_echo_ex) instead, and NOT by
@@ -11146,19 +11522,17 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # sometimes a few milliseconds, never reproducible. Widening a live
         # syscall's arity is not backward compatible on this ABI.
         fb_dbg_beacon(5);                    # 1.45.16 canary: ICMP echo (ping) stage
-        preempt_disable();
-        asm { sti; }
-        var ie_ticks = icmp_ping(arg1, 0);
-        asm { cli; }
-        preempt_enable();
-        if (ie_ticks < 0) { stack_canary_check(canary); return 0 - 1; }
+        var ie_w = net_sys_window_open();   # pre-scheduler callers only (net_tcp.cyr)
+        var ie_us = icmp_ping_us(arg1, 0);
+        net_sys_window_close(ie_w);
+        if (ie_us < 0) { stack_canary_check(canary); return 0 - 1; }
         stack_canary_check(canary);
-        return ie_ticks * 10;          # 100 Hz ticks -> milliseconds
+        return ie_us / 1000;           # µs -> milliseconds
     }
     if (num == 100) {
         # icmp_echo_ex(dst_ip=arg1, timeout_ms=arg2) — #55 with a caller-chosen
-        # deadline. Same contract otherwise: sends one echo request, blocks for the
-        # matching reply, returns the round-trip time in MILLISECONDS (>= 0) or -1
+        # deadline. Same contract otherwise: sends one echo request, waits for ITS
+        # reply, returns the round-trip time in MILLISECONDS (>= 0) or -1
         # (timeout / NIC down). arg2 <= 0 means "kernel default" (~3 s), so the two
         # arms agree when the caller expresses no preference.
         #
@@ -11166,50 +11540,36 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # the #55 arm. Unused syscall argument registers are not zeroed by the
         # compiler, so arity is part of a syscall's ABI here.
         #
-        # Resolution is the 100 Hz tick, so the effective bound is rounded DOWN to
-        # whole ticks and a request under 10 ms becomes 1 tick, not 0 — a zero bound
-        # would mean "never wait", which no caller asking for 1 ms means. Clamped to
-        # 60 s so a bad value cannot park a ring-3 process in the sti-window for an
-        # unbounded stretch.
-        #
-        # Unblocks `yo -W` on AGNOS: yo accepts -W on every backend but could not
-        # honour it here, because the bound lived in the kernel and took no argument.
-        # Same sti-window discipline as #55 — preempt_disable + sti + cli +
-        # preempt_enable — because icmp_ping polls net_poll() and arch_wait()s on a
-        # timer_ticks deadline, which only advances with IF=1.
+        # ⭐ 1.57.7 (S6): BLOCKS ONLY THE CALLER, like #55. The bound is NEVER EARLY and expires at the first timer
+        # tick at or after it (<= ~10 ms late plus wake latency); clamped to 60 s. The RTT is at 1 ms resolution.
+        # Unblocks `yo -W` on AGNOS. A pre-scheduler caller gets the old window back (net_sys_window_open — see #47).
         var ee_ms = arg2;
         if (ee_ms > 60000) { ee_ms = 60000; }
-        var ee_ticks = 0;
-        if (ee_ms > 0) {
-            ee_ticks = ee_ms / 10;
-            if (ee_ticks < 1) { ee_ticks = 1; }   # sub-tick request still waits one tick
-        }
+        if (ee_ms < 0) { ee_ms = 0; }
         fb_dbg_beacon(5);                    # same stage marker as #55
-        preempt_disable();
-        asm { sti; }
-        var ex_ticks = icmp_ping(arg1, ee_ticks);
-        asm { cli; }
-        preempt_enable();
-        if (ex_ticks < 0) { stack_canary_check(canary); return 0 - 1; }
+        var ex_w = net_sys_window_open();   # pre-scheduler callers only (net_tcp.cyr)
+        var ex_us = icmp_ping_us(arg1, ee_ms * 1000);
+        net_sys_window_close(ex_w);
+        if (ex_us < 0) { stack_canary_check(canary); return 0 - 1; }
         stack_canary_check(canary);
-        return ex_ticks * 10;          # 100 Hz ticks -> milliseconds
+        return ex_us / 1000;           # µs -> milliseconds
     }
     if (num == 56) {
-        # sock_listen(port=arg1) — bind + listen on a local TCP port and return
-        # the listen_id (0..7) in rax, or -1 (port already bound / conn table
-        # full). **Phase-B — the inbound unlock**: lets a ring-3 server (agora /
-        # descent / sandhi / web) ACCEPT connections, i.e. BE a network service —
-        # the prerequisite for AGNOS container usage ("sockets are the major
-        # hurdle to container usage"). AGNOS merges bind+listen: tcp_listen
-        # creates the LISTEN-state slot on net_ip (the kernel's tcp_bind is just
-        # tcp_listen, ip unused), so BSD bind()+listen() both fold onto this one
-        # call (a separate sock_bind is deferred until a bind-without-listen
-        # consumer surfaces). Pair with sock_accept#57; the accepted conn_id
-        # reuses sock_send#48 / sock_recv#49 / sock_close#50. Non-blocking. a2..a4
-        # unused.
-        if (arg1 <= 0) { stack_canary_check(canary); return 0 - 1; }
-        if (arg1 > 65535) { stack_canary_check(canary); return 0 - 1; }
-        var sl_id = tcp_listen(arg1);
+        # sock_listen(port=arg1 | class<<32) — bind + listen on a local TCP port and return
+        # the listen_id (0..7) in rax, or -1 (bad port / reserved bit / class > 1 / port already
+        # bound in either class / conn table full). **Phase-B — the inbound unlock**: lets a ring-3
+        # server (agora / descent / sandhi / web) ACCEPT connections. AGNOS merges bind+listen, so BSD
+        # bind()+listen() both fold onto this one call. 1.57.7 (S5) ADDRESS CLASSES in arg1 bits 32-39
+        # (sock_listen_decode): 0 = ANY — SYNs addressed to net_ip AND 127/8; 1 = LOOPBACK — only SYNs
+        # addressed to 127/8, which can only originate on this host (net_wire_frame drops wire 127/8), the
+        # bind(127.0.0.1) equivalent (peer constant SOCK_LISTEN_LOOPBACK = 0x100000000). Bits 16-31 and 40-63
+        # MUST be 0; every pre-1.57.7 value decodes to class 0 byte-for-byte, and the flagged form fails closed
+        # (-1) on an older kernel. The listener and every connection it accepts are OWNED by the caller's
+        # incarnation. Pair with sock_accept#57; the accepted conn_id reuses sock_send#48 / sock_recv#49 /
+        # sock_close#50 / sock_peer#106. Non-blocking. a2..a4 unused.
+        var sl_d = sock_listen_decode(arg1);
+        if (sl_d < 0) { stack_canary_check(canary); return 0 - 1; }
+        var sl_id = tcp_listen_owned(sl_d & 0xFFFF, tcp_caller_tag(), (sl_d >> 16) & 0xFF);
         stack_canary_check(canary);
         return sl_id;
     }
@@ -11220,11 +11580,14 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # (WOULD_BLOCK — the server poll-loops) / listen_id is bad / it is not a
         # LISTEN slot. 1.49.4: the returned fd is a uniform VFS handle — read#5 -> tcp_recv,
         # write -> tcp_send, close#6 -> tcp_close (epoll next bite); the legacy conn_id-based
-        # sock_send#48 / sock_recv#49 / sock_close#50 stay for raw-conn_id code. We net_poll() FIRST so the
-        # passive-open handshake actually progresses (SYN -> SYN_RCVD -> ESTABLISHED
-        # all run inside net_handle_tcp under net_poll; tcp_accept itself only
-        # scans + marks the slot accepted, bit 10). The NIC is polled so net_poll
-        # is IF=0-safe (same as sock_recv#49) — no sti-window. a2..a4 unused.
+        # sock_send#48 / sock_recv#49 / sock_close#50 stay for raw-conn_id code. 1.57.7 (S4, critic C14):
+        # wire handshakes complete in INTERRUPT CONTEXT (the timer/NIC drain serves the SYN, its ACK and any
+        # data — no poller needed); #57's net_poll drives the loopback queue, which no interrupt drains, and
+        # the retransmit timer. tcp_accept scans + marks the slot accepted (bit 10) and returns ESTABLISHED
+        # or CLOSE_WAIT children. net_poll is IF=0-safe (same as sock_recv#49) — no sti-window. a2..a4 unused.
+        # 1.57.7 (S5): -1 also when the listener is not the caller's (checked BEFORE the poll); the accepted
+        # connection is owned by the listener's owner (see #106 for the peer address).
+        if (tcp_auth(arg1) < 0) { stack_canary_check(canary); return 0 - 1; }
         if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
         net_poll();                     # drive the inbound SYN handshake to ESTABLISHED
         # Return the RAW conn_id (0..7), NOT a VFS_SOCK fd. The 1.49.4 "socket-as-VFS-fd"
@@ -11232,13 +11595,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # net.cyr's sock_accept — the ONLY #57 consumer — treats this return as a conn_id
         # and drives the accepted conn via sock_send#48 / sock_recv#49 / sock_close#50
         # (the tagged-fd band). vfs_create_sock handed back a VFS fd INDEX instead, so #49
-        # received a VFS-fd number as its "conn_id" → tcp_conn_dead on a CLOSED slot → -1
+        # received a VFS-fd number as its "conn_id" → the dead-conn test on a CLOSED slot → -1
         # (EOF) → every server-side read failed (the on-device setu compositor could never
         # read a client's CREATE_SURFACE frame; broken since 1.49.4). Nothing consumes the
         # VFS-fd return — the loopback selftest calls tcp_accept + vfs_create_sock directly,
         # not via #57 — so returning the conn_id restores the working contract. A read#5-style
         # VFS-fd-from-accept model, if ever needed, should ride a distinct call. Fixed 1.53.9.
-        var sa_cid = tcp_accept(arg1);
+        var sa_cid = tcp_accept_own(arg1, tcp_caller_tag());
         stack_canary_check(canary);
         return sa_cid;                  # raw conn_id (0..7), or -1 when none pending yet
     }
@@ -11267,20 +11630,27 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 59) {
         # flock(fd=arg1, op=arg2) — advisory whole-file lock (BSD flock(2)). op:
         # LOCK_SH=1 / LOCK_EX=2 / LOCK_UN=8, OR'd with LOCK_NB=4. Keyed by the file's
-        # inode (VFS_EXT2_FILE payload[2]) in a 16-slot lock table; the holder is
-        # proc_current_get(). NON-BLOCKING at the kernel boundary — single-core run-to-
-        # completion can't sleep, so a contended SH/EX returns -1 (WOULD_BLOCK) and
-        # the ring-3 caller poll-spins (yielding so the holder can release). Released
-        # in vfs_close#6 and on proc exit (flock_release_pid). Added (1.45.13) for the
-        # shared-world serialization agora's door games need + libro/patra crash-safety.
-        # a3/a4 unused.
+        # inode (VFS_EXT2_FILE payload[2]) in a 16-slot lock table (vfs.cyr); the holder is
+        # the calling PID (not the open file: no OFD layer — see the #59 ABI row). Released in
+        # vfs_close#6 and on exit / fault kill (flock_release_pid); every release wakes waiters.
+        # Added (1.45.13) for agora's shared-world serialization + libro/patra crash-safety.
+        # ⭐ 1.57.7 (Path 2, S3.5) — A CONTENDED SH/EX WITHOUT LOCK_NB WAITS (only the caller; no timeout; no FIFO
+        # fairness; broadcast wakes): the canonical wq loop on WK_FLOCK|inode — arm under flock_lock, drop the lock,
+        # sleep, retry. A BLOCKING conversion (SH<->EX) drops the caller's old lock first, as flock(2) does; a failed
+        # LOCK_NB conversion keeps it. Returns 0 · -1 (contended with LOCK_NB, a caller that cannot block — before
+        # the scheduler — a bad fd / not an ext2 file / a bad op)
+        # · -2 = the lock table is full (never waits). Until 1.57.7 every contended call returned -1 and the comment
+        # here promised a ring-3 caller that poll-spins; nothing did (the issue this closes). a3/a4 unused.
         if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
         if (arg1 >= 32) { stack_canary_check(canary); return 0 - 1; }
         var fl_base = vfs_fd_table() + arg1 * 32;
         if (ktag(fl_base) != VFS_EXT2_FILE) { stack_canary_check(canary); return 0 - 1; }
         var fl_ino = kpayload(fl_base, 2);
         if (fl_ino == 0) { stack_canary_check(canary); return 0 - 1; }
-        var fl_rc = flock_apply(fl_ino, proc_current_get(), arg2);
+        var fl_me = proc_current_get();
+        var fl_blk = 0;
+        if ((arg2 & 4) == 0) { if (wq_can_block() == 1) { fl_blk = 1; } }
+        var fl_rc = flock_wait(fl_ino, fl_me, arg2, fl_blk);                # the canonical wait loop (above ksyscall)
         stack_canary_check(canary);
         return fl_rc;
     }
@@ -11419,27 +11789,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
             stack_canary_check(canary);
             return sw_n0;                                                             # may be 0 = WOULD_BLOCK
         }
-        var sw_written = 0;
-        var sw_start = timer_ticks;
-        var sw_cap = arg3 / 480 + 300;                                               # bounded DMA-stall deadline
-        preempt_disable();
-        asm { sti; }
-        while (sw_written < arg3) {
-            if (snd_hw_frames > snd_appl) { snd_appl = snd_hw_frames; }
-            var sw_fr = 16384 - (snd_appl - snd_hw_frames) - 1;
-            if (sw_fr > 0) {
-                var sw_c = arg3 - sw_written; if (sw_c > sw_fr) { sw_c = sw_fr; }
-                snd_copy_frames(arg2 + sw_written * 4, sw_c);
-                sw_written = sw_written + sw_c;
-            }
-            if (sw_written >= arg3) { break; }
-            if ((timer_ticks - sw_start) > sw_cap) { break; }
-            arch_wait();
-        }
-        asm { cli; }
-        preempt_enable();
+        # 1.57.7 (Path 2, S3.7): the blocking form BLOCKS ONLY THE CALLER (snd_write_waiting, woken by the DAC); a context
+        # that may not block keeps the held loop (snd_write_held — the pre-1.57.7 body verbatim).
+        var sw_r = 0;
+        if (wq_can_block() == 1) { sw_r = snd_write_waiting(arg2, arg3); }
+        else { sw_r = snd_write_held(arg2, arg3, 0); }
         stack_canary_check(canary);
-        return sw_written;
+        return sw_r;
     }
     if (num == 67) {
         # snd_close(slot=a1) -> 0 / -1. Free the slot; if it owned the stream, ZERO
@@ -11467,16 +11823,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg1 < 0 || arg1 >= 4) { stack_canary_check(canary); return 0 - 1; }
         if (load64(&snd_slot_used + arg1 * 8) == 0) { stack_canary_check(canary); return 0 - 1; }
         if (load64(&snd_slot_pid + arg1 * 8) != proc_current_get()) { stack_canary_check(canary); return 0 - 1; }
+        # 1.57.7 (Path 2, S3.7): blocks only the caller until play-out (snd_drain_waiting); the held loop otherwise.
         var sd_target = snd_appl;
-        var sd_start = timer_ticks;
-        preempt_disable();
-        asm { sti; }
-        while ((timer_ticks - sd_start) < 100) {                                     # ~1s cap (full ring ~34 ticks)
-            if (snd_hw_frames >= sd_target) { break; }
-            arch_wait();
-        }
-        asm { cli; }
-        preempt_enable();
+        if (wq_can_block() == 1) { snd_drain_waiting(sd_target); }
+        else { snd_drain_held(sd_target); }
         stack_canary_check(canary);
         return 0;
     }

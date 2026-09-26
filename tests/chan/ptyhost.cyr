@@ -62,7 +62,8 @@ fn main(): i64 {
     # not by a total count, so a slow child is tolerated but a dead one cannot hang us.
     # ⛔ THE RETRY IS A PREEMPTIBLE SPIN, NOT `sys_sleep_ms` AND NOT `sched_yield`. planning/ipc.md §9.4:
     # sleep_ms is `preempt_disable; sti; hlt` — it would starve the very child we are waiting for — and
-    # sched_yield is a documented silent no-op under a foreground run. The kernel never blocks on a
+    # sched_yield is a documented silent no-op under a foreground run. [1.57.7: both are true only for the INTERIM
+    # execwait#37 child now; elsewhere #41 blocks only its caller and #44 switches in the kernel.] The kernel never blocks on a
     # channel (one SYSCALL stack per CPU), so waiting is userland's job and must stay preemptible.
     var rbuf = alloc(128);
     var lines = 0;

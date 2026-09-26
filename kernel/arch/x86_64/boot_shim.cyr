@@ -22,8 +22,8 @@
 # docs/development/proposals/2026-04-27-cc5-kernel-boot-shim-regression.md.
 #
 # Sequence:
-#   1. Set up 32-bit stack at 0x380000 (NOT 0x200000 — the >2 MB kernel's
-#      .rodata sits just below 0x200000; see step 12).
+#   1. Set up 32-bit stack at 0x3A0000 (NOT 0x200000 — the >2 MB kernel's
+#      .rodata sits just below 0x200000; see step 12. 0x380000 until 1.57.7).
 #   2. Init COM1 UART (0x3F8) so the kernel can print before paging.
 #   3. Zero 12 KB of page tables at 0x1000–0x4000.
 #   4. Build PML4 / PDPT / PD entries identity-mapping 0x0–0x400000
@@ -43,14 +43,19 @@
 #   9. Build a 24-byte GDT at 0x4000 (null + 64-bit CS + DS).
 #   10. Far-jump through the 64-bit CS to switch to true long mode.
 #   11. Reload DS/ES/SS with 0x10 (64-bit data selector).
-#   12. Set up 64-bit stack at 0x380000, fall through to kernel code.
+#   12. Set up 64-bit stack at 0x3A0000, fall through to kernel code.
 
 asm {
-    # 1. 32-bit stack at 0x380000 (see the 64-bit step 12 below for why NOT
+    # 1. 32-bit stack at 0x3A0000 (see the 64-bit step 12 below for why NOT
     #    0x200000 — the kernel image crossed 2 MB and its .rodata now sits
     #    immediately below 0x200000, so a downward-growing stack there stomps
-    #    string literals).
-    0xBC; 0x00; 0x00; 0x38; 0x00;                          # mov esp, 0x380000
+    #    string literals — and why 0x3A0000, not the 0x380000 of 1.57.3-1.57.6).
+    #    ⚠ All three boot-stack immediates in this file (this one, step 12, and
+    #    the ELF64 step 1) must equal BSP_BOOT_TOP in
+    #    scripts/check/image-layout-check.sh, which decodes them and fails on any
+    #    mismatch (this legacy one is not in the ELF64 image, so only that
+    #    source check can see it drift).
+    0xBC; 0x00; 0x00; 0x3A; 0x00;                          # mov esp, 0x3A0000
 
     # 2. COM1 UART init (port 0x3F8)
     0xBA; 0xF9; 0x03; 0x00; 0x00; 0xB0; 0x00; 0xEE;        # mov edx, 0x3F9; mov al, 0; out dx, al   ; IER  = 0 (mask all UART IRQs)
@@ -133,23 +138,35 @@ asm {
     0x8E; 0xC0;                                            # mov es, ax
     0x8E; 0xD0;                                            # mov ss, ax
 
-    # 12. 64-bit stack at 0x380000; mov rbp, rsp so callees see a stable frame.
+    # 12. 64-bit stack at 0x3A0000; mov rbp, rsp so callees see a stable frame.
     #     NOT 0x200000: the kernel image grew past 2 MB, so .rodata (string
     #     literals) now lives at ~0x1faee8-0x1fff4c, immediately below 0x200000.
     #     A stack based at 0x200000 grows DOWN straight into those literals and
     #     silently corrupts them (caught via a gdb watchpoint: `push` at rsp=
-    #     0x1ffbf8 overwrote "exfatu: upcase-checksum OK"). 0x380000 sits in the
+    #     0x1ffbf8 overwrote "exfatu: upcase-checksum OK"). 0x3A0000 sits in the
     #     PMM-reserved region 1 (0x200000-0x400000), above the image top
-    #     (~0x210000 when written; 0x35E770 at 1.57.2, so the downward headroom is
-    #     0x21890 = 137 KB, NOT the ~1.4 MB this note used to claim), and below the
-    #     BSP TSS.RSP0 window (bottom 0x3B0000, top 0x3C0000, gdt.cyr) — clear of
-    #     both. ⭐ 1.57.3: this stack is the image's ONLY region-1 neighbour. The AP
-    #     boot/TSS stacks that used to sit at 0x310000-0x340000 (inside .rodata since
-    #     the 1.57.2 embedded face) moved to region 7 (gdt.cyr tss_get_cpu_stack,
-    #     smp.cyr's trampoline); the BSP stack stays HERE because it is live from
-    #     the shim's first instruction, before any kernel page table exists — the
-    #     direct map (the only VA the gdt.cyr ⛔ rule allows for a region-7 stack)
-    #     is built by pmm_setup_directmap and live only from cr3_load(0x1000) in
+    #     (~0x210000 when this stack was first moved; 0x361898 at 1.57.7), and below
+    #     the BSP TSS.RSP0 window (bottom 0x3B0000, top 0x3C0000, gdt.cyr) — clear of
+    #     both. ⭐ 1.57.7 (IMG): the top moved 0x380000 -> 0x3A0000 to give the image
+    #     128 KB more room (the 1.57.7 plan needed ~59 KB against 59,240 B of
+    #     headroom, and three flag builds the smokes boot — RING3_SELFTEST,
+    #     EDGE_ABI_SELFTEST, EXEC+EXT2_WRITE+RING3 — were ALREADY past 0x370000).
+    #     Region-1 map above the image: [0x390000, 0x3A0000) this stack's 64 KB
+    #     budget; [0x3A0000, 0x3B0000) an UNUSED 64 KB guard gap nothing references;
+    #     [0x3B0000, 0x3C0000) the BSP TSS.RSP0 window. NOTHING reserves the window
+    #     before this push: pmm_init's 0-4 MB reservation comes long after, and gnoboot
+    #     pins only the kernel image (AllocateAddress) — its /initramfs and /cmdline
+    #     blobs are AllocateAnyPages, and boot_info + the memory map live in gnoboot's
+    #     own image wherever the firmware put it. The window is free because the
+    #     FIRMWARE left it free (OVMF: conventional RAM, as the old window was); kmain
+    #     checks that against the UEFI map (mbi.cyr bootstack_window_check, 1.57.7
+    #     IMG-fix) and says so on COM1/klug/fb. ⭐ 1.57.3: this stack is the
+    #     image's ONLY region-1 neighbour. The AP boot/TSS stacks that used to sit
+    #     at 0x310000-0x340000 (inside .rodata since the 1.57.2 embedded face) moved
+    #     to region 7 (gdt.cyr tss_get_cpu_stack, smp.cyr's trampoline); the BSP
+    #     stack stays HERE because it is live from the shim's first instruction,
+    #     before any kernel page table exists — the direct map (the only VA the
+    #     gdt.cyr ⛔ rule allows for a region-7 stack) is built by pmm_setup_directmap and live only from cr3_load(0x1000) in
     #     main.cyr, region 7's identity VA is forbidden by that rule (kmain is
     #     proc 0, switched out on this stack under per-proc CR3s), and region 1
     #     (PD[1]) is the window every CR3 from power-on onward maps. On THIS legacy
@@ -157,10 +174,11 @@ asm {
     #     0-4 MB (step 4 above) and region 7 is 14-16 MB — but that is not the
     #     reason on the production ELF64 path below, which builds no page tables
     #     and runs on UEFI's identity map. So the invariant
-    #     is LOAD end <= 0x370000 (this stack's 64 KB budget), enforced by
-    #     scripts/check/image-layout-check.sh — it hard-fails above that and prints
-    #     the headroom. Nothing else in region 1 can meet the image any more.
-    0x48; 0xBC; 0x00; 0x00; 0x38; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x380000
+    #     is LOAD end <= 0x390000 (this stack's 64 KB budget; 0x370000 until 1.57.7),
+    #     enforced by scripts/check/image-layout-check.sh (check.sh gate 34 on the
+    #     plain build, scripts/build.sh on every flag build) — it hard-fails above
+    #     that and prints the headroom. Nothing else in region 1 can meet the image.
+    0x48; 0xBC; 0x00; 0x00; 0x3A; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x3A0000
     0x48; 0x89; 0xE5;                                      # mov rbp, rsp
 }
 #endif
@@ -182,7 +200,8 @@ asm {
 # entirely; gnoboot is the only thing between UEFI firmware and us.
 #
 # Sequence (minimal — just what's needed before kernel main can run):
-#   1. Install our 64-bit stack at 0x200000. Done first because the
+#   1. Install our 64-bit stack at 0x3A0000 (this line said 0x200000 until
+#      1.57.7 — two relocations stale; step 1 below is the truth). Done first because the
 #      `boot_info_capture_rdi()` call after this asm block uses the
 #      stack (call pushes return addr).
 #   2. Init COM1 UART (port I/O — verbatim from legacy step 2).
@@ -239,9 +258,9 @@ asm {
     # = 2 ("past canary") — is gone too. Existing CP labels >= 3 are kept
     # at their current numeric values so read-boot-log keeps reading.)
 
-    # 1. 64-bit stack at 0x380000 (NOT 0x200000 — see the legacy path's step 12
+    # 1. 64-bit stack at 0x3A0000 (NOT 0x200000 — see the legacy path's step 12
     #    note: the >2 MB kernel image's .rodata sits just below 0x200000, so a
-    #    stack there grows down into the string literals. 0x380000 is in the
+    #    stack there grows down into the string literals. 0x3A0000 is in the
     #    PMM-reserved region 1, above the image, below the BSP TSS.RSP0 window
     #    [0x3B0000, 0x3C0000) (gdt.cyr tss_kernel_stack) — NOT "below the 0x3F0000
     #    syscall kstack", which this note said until 1.57.3: the syscall kstacks
@@ -252,12 +271,14 @@ asm {
     #    here, before the direct map — the only VA allowed for a region-7 stack —
     #    exists, and region 1 is mapped by every CR3 from power-on onward (the
     #    step-12 note above spells this out; its "0-4 MB" reason is legacy-only).
-    #    ⚠ "Above the image" is 137 KB of headroom at 1.57.2 (LOAD end 0x35E770 with
-    #    the embedded face). ⭐ 1.57.3: this is the image's ONLY region-1 neighbour —
-    #    the AP stacks moved to region 7 (gdt.cyr tss_get_cpu_stack) — so the one
-    #    invariant is LOAD end <= 0x370000, this stack's 64 KB budget, hard-failed
-    #    by scripts/check/image-layout-check.sh. See the step-12 note above.
-    0x48; 0xBC; 0x00; 0x00; 0x38; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x380000
+    #    ⭐ 1.57.3: this is the image's ONLY region-1 neighbour — the AP stacks moved
+    #    to region 7 (gdt.cyr tss_get_cpu_stack) — so the one invariant is LOAD end
+    #    <= this stack's top - 64 KB, hard-failed by scripts/check/image-layout-check.sh.
+    #    ⭐ 1.57.7 (IMG): top 0x380000 -> 0x3A0000, bound 0x370000 -> 0x390000,
+    #    [0x3A0000, 0x3B0000) left as an unused guard gap below the TSS.RSP0 window.
+    #    The gate also decodes this immediate (source AND built image) against its
+    #    BSP_BOOT_TOP. See the step-12 note above.
+    0x48; 0xBC; 0x00; 0x00; 0x3A; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x3A0000
     0x48; 0x89; 0xE5;                                      # mov rbp, rsp
 
     # === Checkpoint 3 (past stack setup) ===

@@ -1,0 +1,17 @@
+[package]
+name = "sockown"
+version = "0.1.0"
+description = "agnos 1.57.7 (S5) ring-3 socket-ownership exerciser — owned TCP/UDP ids (a fork child is a stranger; exit and fault release), held dead-connection slots, the loopback-only listen class, 127/8 + net_ip admission and sock_peer#106. Seeded as /bin/agnsh by scripts/smoke/sock-owner-smoke.sh."
+license = "GPL-3.0-only"
+language = "cyrius"
+# The VALUE must EQUAL the root manifest's pin (scripts/check/toolchain-pin-check.sh enforces it).
+cyrius = "6.6.6"
+
+[build]
+src = "sockown.cyr"
+output = "build/sockown"
+
+# AGNOS ONLY — build with `cyrius build --agnos sockown.cyr build/sockown`.
+[deps]
+# ⚠ The FULL closure, transitives included (D19): alloc -> atomic, fnptr (the tests/fork closure).
+stdlib = ["syscalls", "alloc", "atomic", "fnptr"]

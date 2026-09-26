@@ -12,8 +12,9 @@
 #   A  SPAWN_SELFTEST=1 PIPE_RC_SELFTEST=1 kernel — the kernel-side PURE checks (core/selftests.cyr,
 #      after the proc-table bootstrap): codes, arm clears, #62 ops, placement re-checks, CLEANFD shaping,
 #      the argv validator, per-process isolation + slot reuse, pipe lifetime with address-specific free
-#      checks, #37's restore dropping a child-made sole pipe once, an orphan zombie's table released on
-#      slot reuse, the CLEANFD global-table teardown, and PIPE_RC_SELFTEST. Dwells on `spawnk: done`.
+#      checks, a #37 child's table dropping a child-made sole pipe once at its reap (11'), an orphan zombie's table
+#      released on slot reuse, the global-table teardown (CLEANFD and, since 1.57.7, legacy), #37's strict shape
+#      refusing the global table (14), and PIPE_RC_SELFTEST. Dwells on `spawnk: done`.
 #   B  PLAIN kernel, -smp 1 — tests/spawn/spawnx.cyr seeded as /bin/agnsh (kybernet runs it IF=1
 #      time-sliced, so its #43 children really run concurrently). Dwells on `SPAWNX-DONE`. Also the
 #      only deterministic run of SPAWNX-LOADER-CELLS-CLEAN (a stale per-CPU cell needs the same CPU).
@@ -86,9 +87,10 @@ if [ -z "${SPAWN_KERNEL:-}" ]; then
         want "spawnk: caller's own slot keeps its arms OK"            "the boot degenerate case (caller handed its own slot) keeps its arms"
         want "spawnk: pipe outlives owner close OK"                   "a pipe buffer outlives its owner's closes while a child holds it"
         want "spawnk: pipe freed by its last reference, exactly once OK" "every order frees exactly once; create-failure no longer double-frees"
-        want "spawnk: #37 restore drops a child-made sole pipe exactly once OK" "#37 restore frees a pipe only the child's redirected slot named, once"
+        want "spawnk: #37 child table drops a child-made sole pipe exactly once OK" "(11') a #37 child's table, destroyed at its reap, frees a pipe only its redirected slot named, once"
         want "spawnk: orphan zombie's fd table + sole pipe released on slot reuse OK" "an orphan zombie's table and its sole pipe are freed when its slot is reused"
-        want "spawnk: CLEANFD child on the global table torn down (-3), legacy kept OK" "#43 step (f): CLEANFD child on the global fallback torn down (-3); legacy kept"
+        want "spawnk: CLEANFD and legacy children on the global table torn down (-3) OK" "#43 step (f): CLEANFD AND legacy children on the global fallback torn down (-3) (1.57.7 OQ-7)"
+        want "spawnk: #37 strict shape refuses a child on the global table OK" "(14) #37's strict shape refuses the global table, redirect armed or not (1.57.7 DEP-1)"
         want "spawnk: ALL PASS"                                       "kernel block verdict"
         deny "spawnk: FAIL"                                           "no kernel-block FAIL line"
         want "piperc: buffer FREED OK"                                "PIPE_RC_SELFTEST (first runner): the last close frees exactly once"
@@ -150,7 +152,7 @@ for smp in ${SPAWN_SMP:-1 4}; do
     want "SPAWNX-DAIMON-SHAPE-OK"         "[smp$smp] daimon's shape: ARGV + CLEANFD + endowment + env + capture"
     want "SPAWNX-ENDOW-DISARM-OK"         "[smp$smp] CH_ENDOW(-1) disarms from ring 3"
     want "SPAWNX-REDIR-CLEAR-OK"          "[smp$smp] #62 REDIR_CLEAR from ring 3"
-    want "SPAWNX-37-MULTI-OK"             "[smp$smp] #37 applies two redirects and restores them"
+    want "SPAWNX-37-MULTI-OK"             "[smp$smp] #37 applies two redirects into the child's private table (no restore since 1.57.7)"
     want "SPAWNX-37-PARENT-STDOUT-OK"     "[smp$smp] #37's caller keeps its own stdout"
     want "SPAWNX-PIPE-NO-CROSSTALK"       "[smp$smp] a child writing into a closed pipe cannot reach the parent's next pipe"
     want "SPAWNX-ENOPROC-OK"              "[smp$smp] a full process table -> exactly -2 NOPROC"

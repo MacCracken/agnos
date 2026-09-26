@@ -19,16 +19,31 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 pass=0; fail=0; results=""
+# ⭐ 1.57.7 (IMG-fix, review B3) — EVERY ATTEMPT'S LOG IS KEPT. Both attempts used to go to the one
+# /tmp/sweep-gate.log, so a row that "passed on retry" had its first failure overwritten and nobody could say
+# whether it was a firmware VOID or a real failure (the IMG sweep's ext2 WRITE row was exactly that). Now each
+# attempt is also copied to build/sweep-logs/<NN>-<label>.attempt<K>.log (cleared per sweep) and a failed
+# attempt names its log. Scoring is unchanged: a non-zero exit is still a failed attempt (see run_gate).
+SWEEP_LOGS="$ROOT/build/sweep-logs"; rm -rf "$SWEEP_LOGS"; mkdir -p "$SWEEP_LOGS"
+gate_n=0; skipped=0
+# SWEEP_ONLY=<ERE> (1.57.7 IMG-fix) runs only the rows whose label matches — for reproducing ONE row with this
+# exact harness. A filtered run is never a sweep verdict: it ends "SWEEP_ONLY … NOT A SWEEP VERDICT" and exits 3
+# when nothing failed (1 when something did), so it cannot be mistaken for ARC SWEEP: PASS.
+SWEEP_ONLY="${SWEEP_ONLY:-}"
 
 # run_gate "<label>" "<build env>" "<smoke script | CHECK>"
 # Each smoke runs ONCE per attempt (captured to a log); a single retry covers
 # transient host-load / QEMU-timing flakes (a real failure fails both attempts).
 run_gate() {
     label="$1"; buildenv="$2"; smoke="$3"
+    if [ -n "$SWEEP_ONLY" ] && ! printf '%s' "$label" | grep -qE -- "$SWEEP_ONLY"; then skipped=$((skipped+1)); return; fi
+    gate_n=$((gate_n+1))
+    gate_slug=$(printf '%02d-%s' "$gate_n" "$label" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)
     printf '\n=== %s ===\n' "$label"
     ok=0
     if [ "$smoke" = "CHECK" ]; then
         if sh "$ROOT/scripts/check.sh" > "/tmp/sweep-gate.log" 2>&1; then ok=1; tail -1 /tmp/sweep-gate.log; else tail -3 /tmp/sweep-gate.log; fi
+        cp /tmp/sweep-gate.log "$SWEEP_LOGS/$gate_slug.attempt1.log"
     else
         # ⛔ MEASURED 2026-08-28 (1.56.51): A FAILED BUILD USED TO BE PRINTED AND THEN IGNORED.
         # The old form was `… || { echo "  BUILD FAILED"; }` — the `||` consumed the status, `ok`
@@ -67,10 +82,12 @@ run_gate() {
             # assertion against the exact trap above — a smoke that exits 0 while printing
             # "N passed, M failed" with M>0 is itself broken, and must not be scored a pass.
             sh "$SMOKE_PATH" > "/tmp/sweep-gate.log" 2>&1 && smoke_rc=0 || smoke_rc=$?
+            cp /tmp/sweep-gate.log "$SWEEP_LOGS/$gate_slug.attempt$attempt.log"
             if [ "$smoke_rc" = 0 ] \
                && ! grep -qE 'passed, [1-9][0-9]* failed' "/tmp/sweep-gate.log"; then
                 ok=1; break
             fi
+            echo "  (attempt $attempt: rc=$smoke_rc — log kept: $SWEEP_LOGS/$gate_slug.attempt$attempt.log)"
         done
         # ⛔ MEASURED 2026-08-29 (1.56.52): THIS FILTER HID THE ONE LINE THAT LOCALISES A FAILURE.
         # It was `grep -iE "PASS:|FAIL:|smoke:"`, and several smokes report a LAUNCH failure with a
@@ -115,6 +132,11 @@ run_gate "1.57.2 FAT/exFAT chain-cycle budget"       "FATFS_SELFTEST=1 EXFAT_SEL
 # anywhere under scripts/ attached one, so every gate passed regardless of what msc.cyr did. This
 # smoke builds BOTH arms itself (injected + plain), so it needs no buildenv from here.
 run_gate "1.56.52 MSC short data phase (usb-storage)" ""                                         "msc-short-smoke.sh"
+# 1.57.7 — the 16-byte CDB at all seven SCSI builders (issue 2026-09-24-msc-cdb-buffer-is-two-bytes). A
+# MSC_CDB_CANARY kernel puts an address-taken canary in the slot a too-small cdb_buf overflows into and drives
+# all seven sites against QEMU usb-storage; RED (clobbered=7) on the [2] code, GREEN on [16]. -smp 1 + 4 gated,
+# plus one MSC_RW_DEMO boot of the canary-free production frames. Builds its own kernels.
+run_gate "1.57.7 MSC CDB canary: 16-byte CDB at all 7 SCSI sites (usb-storage, -smp 1 + 4)" "" "msc-cdb-smoke.sh"
 # 1.56.52 — the first coverage of receive-side checksum verification. The other net gates only prove
 # GOOD frames pass; this one presents a corrupt frame, which nothing else in the tree does.
 run_gate "1.56.52 RX checksum verify (accept + drop)"  ""                                         "net-csum-smoke.sh"
@@ -131,7 +153,7 @@ run_gate "1.56.52 DHCP option length vs reader"        ""                       
 # 1.56.55 — fork#96 end to end from ring 3: the child resumes at the parent's fork site with rax=0,
 # gets a PRIVATE copy of its memory, and the parent reaps it via waitpid wait-any. Builds its own
 # kernel (FORK_SELFTEST) and seeds /bin/forker, so it needs no buildenv here.
-run_gate "1.56.55 fork#96 + waitpid wait-any"          ""                                         "fork-smoke.sh"
+run_gate "1.56.55 fork#96 + waitpid wait-any (-smp 1 + 4)" ""                                     "fork-smoke.sh"
 # 1.57.2 — the kernel-embedded default TrueType face (core/kfont.cyr, rekha's Liberation Sans) proven
 # FROM RING 3: /bin/kfont opens /fonts/default.ttf by name, pulls every byte through read#5 and hashes
 # what it got against rekha's generator FNV-1a-64, then the sfnt header, the read-only gate, the exact
@@ -146,7 +168,9 @@ run_gate "1.57.2 kernel-embedded face (/fonts/default.ttf, rekha)" ""           
 # ap_entry) against [DIRECTMAP_BASE + 0xFC0000, +0x40000) and re-hashes the rekha chunk literals IN
 # PLACE after the wake (the load-bearing oracle — a stack anywhere in the image scribbles there on every
 # tick, invisible to every -smp 1 gate). Mutation-proven: the old placement trips both. Builds its own
-# kernel, so it needs no buildenv here; the image-side bound (LOAD end <= 0x370000) is check.sh gate 34.
+# kernel, so it needs no buildenv here; the image-side bound (LOAD end <= 0x390000 since 1.57.7 moved the
+# BSP boot stack top 0x380000 -> 0x3A0000; 0x370000 before) is check.sh gate 34 for the plain image and
+# scripts/build.sh's flag-build guard for every buildenv row here (an over-bound flag image is a BUILD FAILED).
 run_gate "1.57.3 AP stacks in region 7 (-smp 4, rodata intact after wake)" ""                     "ap-stack-smoke.sh"
 # 1.57.6 — the microsecond clock ring 3 uses (uptime_us#95). tsc-smoke existed since 1.56.18 and NO row ran
 # it: when it was finally run for 1.57.6 it was RED on a healthy tree (the klog timestamp prefix fed the
@@ -157,7 +181,11 @@ run_gate "1.57.3 AP stacks in region 7 (-smp 4, rodata intact after wake)" ""   
 # advances with interrupts off), both accessors == calibration, the boot going on to the shell, and the
 # corrected refusal texts (first attempt and final) in the binary. ⚠ Its TSC_QUOTA=<pct> mode (the daimon
 # CPU-quota reproduction, TCG, ~1-2 min, needs systemd user cpu delegation) stays a MANUAL closeout gate.
-run_gate "1.57.6 TSC calibration (acpi-pm tier + tick cross-check, uptime_us#95 advances IF=0)" "TSC_SELFTEST=1" "tsc-smoke.sh"
+# 1.57.7 (S1b): one invocation boots the MATRIX q35 -smp 1, q35 -smp 4 (KVM, else multi-threaded TCG) and pc -smp 1
+# (the i440fx rev-1 FADT through the early probe) and scores T1-T10 on each — the spawn/kstack precedent, so run_gate
+# needs no env column. `DE_NO_KVM=1 TSC_QUOTA=25|50 sh scripts/smoke/tsc-smoke.sh` (A/B reload within 1% + the halted
+# tick-rate checks in B) stays the MANUAL closeout gate: it needs a systemd user manager with cpu delegated.
+run_gate "1.57.6/1.57.7 TSC + LAPIC tick on the ACPI PM timer (acpi-pm tiers, tick rate BSP+AP, FADT purity, uptime_us#95 IF=0; q35 -smp 1 + 4, pc)" "TSC_SELFTEST=1" "tsc-smoke.sh"
 # 1.57.6 — spawn_path#43: distinct failure codes, the per-process #62 / CH_ENDOW arms cleared on EVERY
 # failure kind (they were per-CPU and leaked into other processes' children), SPAWN_F_ARGV,
 # SPAWN_F_CLEANFD capture (stdout+stderr, 2>&1, an explicitly passed fd, daimon's full shape), execwait#37
@@ -167,10 +195,34 @@ run_gate "1.57.6 TSC calibration (acpi-pm tier + tick cross-check, uptime_us#95 
 # the -smp 4 boot is what caught do_context_switch leaving an AP on a reaped proc's freed page tables.
 # Builds its own kernels, so no buildenv here.
 run_gate "1.57.6 spawn: #43 codes, per-process arms, ARGV/CLEANFD, pipe lifetime (-smp 1 + 4)" "" "spawn-smoke.sh"
+# 1.57.7 (S7) — the process lifecycle (docs/architecture/process-lifecycle.md): kill#16 ends (9), stops (19) and
+# continues (18) a child and its descendants (KILL_TREE 0x100) through the claim / tick / B1 / wait boundaries; the wait
+# status; #99 states 5 and 7; orphans reap themselves. tests/lifecycle (lifex as /bin/agnsh, spinner) on a PLAIN
+# kernel, -smp 1 and -smp 4 (multi-threaded TCG by default — LIFE_KVM=1 for KVM), BOTH GATED. The label keeps
+# "limits": S8 extends this smoke. Builds its own kernel, so no buildenv here.
+run_gate "1.57.7 lifecycle (kill/stop/cont/tree/limits) -smp 1 + -smp 4" "" "lifecycle-smoke.sh"
+# 1.57.7 (S4) — the TCP stack under the net lock chain (docs/architecture/net-concurrency.md). The three flagged
+# smokes existed and were never run by the sweep (D15); S4.1 gave them the banner-gated retry + the invariant deny.
+run_gate "1.57.7 TCP hermetic (ring/retx/mss/wnd + locks/lo-inplace/txslots/claim/gen/syncap/eof/halfclose + S6 net waits/graceful close; -smp 1 + -smp 4)" "TCP_SELFTEST=1" "tcp-smoke.sh"
+run_gate "1.57.7 loopback lo (UDP/ICMP/TCP/sockfd/epoll/close-wait)" "LOOPBACK_SELFTEST=1" "loopback-smoke.sh"
+run_gate "1.57.7 tcp_listen accept-one (TCP_LISTEN_SMOKE)" "TCP_LISTEN_SMOKE=1" "tcp-listen-smoke.sh"
+# 1.57.7 (S4) — inbound TCP served in interrupt context, #49 EOF after the peer's FIN, FIN-before-accept half-close,
+# and a cross-CPU loopback mix: tests/tcpin as /bin/agnsh on a PLAIN kernel, three GATED variants.
+run_gate "1.57.7 inbound TCP in interrupt context (+ #49 EOF, half-close; -smp 1 msix/vectors0 + -smp 4)" "" "tcp-inbound-smoke.sh"
+run_gate "1.57.7 socket ownership (TCP+UDP), loopback-only listen, 127/8, sock_peer#106 (kernel arms + ring 3 -smp 1/4)" "" "sock-owner-smoke.sh"
+run_gate "1.57.7 sock/icmp waits block only the caller (ring 3; -smp 1 + -smp 4)" "" "sock-wait-smoke.sh"
+run_gate "ICMP echo (hermetic slots + wake; -smp 1 + -smp 4)" "ICMP_SELFTEST=1" "icmp-smoke.sh"
+# 1.57.7 — ADDED AFTER S6 BROKE IT UNSEEN. doom-smoke had no row, so S6 (the net waits) shipped with /bin/doom hung
+# forever in #47: its setu probe dials 127.0.0.1:7700, nobody answers, and a PRE-SCHEDULER caller (DOOM_SELFTEST
+# runs doom before sched_active = 1, IF=0) had lost the arm's sti window — the legacy hlt never ended, the screendump
+# read 3 colours. This is also the only row that runs a real app's #47 against an unanswered port before the
+# scheduler. Builds its own DOOM_SELFTEST kernel and restores a plain one (needs ../cyrius-doom built + its WAD).
+run_gate "1.43.x cyrius-doom renders from disk (pre-scheduler ring 3; #47 to an unanswered port times out)" "" "doom-smoke.sh"
 # 1.57.6 — exec-redirect-smoke has existed since 1.46.x (extended 1.56.39) and NO row ran it, so the #62/#37
-# apply/restore and the #43 global-table refusal were exercised by nothing. It now also proves the
-# two-pair `2>&1` apply + byte-identical reverse restore. Builds its own kernel (EXEC_REDIRECT_SELFTEST).
-run_gate "1.46.x exec_redirect#62 apply/restore (+1.57.6 multi-pair), #43 global-table refusal" "" "exec-redirect-smoke.sh"
+# apply and the #43 global-table refusal were exercised by nothing. It also proves the two-pair `2>&1` shape. 1.57.7
+# (S3b): #37 applies into the child's private table exactly as #43 does (no restore), so the selftest drives a
+# scratch child and checks the parent's table is untouched. Builds its own kernel (EXEC_REDIRECT_SELFTEST).
+run_gate "1.46.x exec_redirect#62 apply into the child's private table (+ multi-pair), #43 global-table refusal" "" "exec-redirect-smoke.sh"
 run_gate "1.39.x exFAT write (+ subdir)"             "EXFAT_WRITE_SELFTEST=1"                   "exfat-write-smoke.sh"
 
 # --- ext2/jbd2 write regression bar (the iron-validated path must stay green) ---
@@ -187,6 +239,12 @@ run_gate "1.41.3 FS syscalls (mkdir/open/stat/rename/getdents/unlink/rmdir/sync 
 # --- 1.40.x exec-from-disk: load + ring-3 run + ENOEXEC + subdir + clean return ---
 run_gate "1.40.x exec-from-disk (run /bin/prog2 + ENOEXEC)" "EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1" "exec-smoke.sh"
 
+# --- 1.47.x ring-3 fault kills the process, the box survives (1.57.7 HAR: a row at last) ---
+# fault-kill-smoke builds its OWN FAULT_SELFTEST+EXT2_WRITE_SELFTEST kernel (smoke_require_image refuses any other)
+# and restores a plain build/agnos on exit, so the row's build env is empty. Before 1.57.7 it was no row and booted
+# whatever build/agnos was on disk (S7 scored a plain kernel as "faulter never dispatched").
+run_gate "1.47.x ring-3 #PF kills the proc (exit 142), box survives" "" "fault-kill-smoke.sh"
+
 # --- 1.41.5 syscall hardening + the 1.56.40 epoll no-hang lock ---
 # ⛔ SYSCALL_HARDEN_SELFTEST shipped in 1.41.5 with NO RUNNER — it appeared only in build.sh's
 # compile-gate list, so nothing in check.sh or sweep.sh ever built or ran it. Two consequences went
@@ -198,7 +256,7 @@ run_gate "1.41.5 syscall hardening + epoll no-hang"  "SYSCALL_HARDEN_SELFTEST=1"
 # (`ring3: nonlifo reuse OK`), plus the ring-3 preempt gate and `sched_yield`#44 slice donation, and it
 # was in NO sweep row — so the 1.56.55 allocator change had to be verified by hand. It was also red
 # for a harness reason (a 40 s dwell that truncated its own tail); fixed in the smoke, 8/8 now.
-run_gate "1.44.x ring-3 procs, preempt gate, slot reuse, yield#44" "RING3_SELFTEST=1"           "ring3-smoke.sh"
+run_gate "1.44.x ring-3 procs, preempt gate, slot reuse, yield#44 park (-smp 1 + 4)" "RING3_SELFTEST=1" "ring3-smoke.sh"
 # 1.57.6 (Path 2, S3.3) — per-process kernel stacks. A KSTACK_SELFTEST kernel, booted -smp 1 THEN -smp 4 (KVM
 # `-cpu host` when /dev/kvm is writable, else multi-threaded TCG — the log names it), both gated: the SYSRET
 # frame is per-process (four probes with distinct RSP / sentinels / XMM survive >= 20 probe syscalls each), a
@@ -206,8 +264,32 @@ run_gate "1.44.x ring-3 procs, preempt gate, slot reuse, yield#44" "RING3_SELFTE
 # release holds under a retire-while-running storm, a console_lock holder at IF=1 is not preempted into a
 # same-CPU deadlock, sched_next's nothing-ready fallback answers the idle and never kmain's stale slot, every
 # timer ISR body runs non-preemptible, and region 7 carries 32 not-present guard pages. Also the stub-size
-# oracle (280 bytes, ibrs=0). Builds its own kernel and leaves a plain one, so no buildenv here.
-run_gate "1.57.6 per-process kernel stacks, CPL0 switch windows, lock holders, guard pages (-smp 1 + 4)" "" "kstack-smoke.sh"
+# oracle (174 bytes since the 1.57.7 stub bite C, ibrs=0). Builds its own kernel and leaves a plain one, so no buildenv here.
+run_gate "1.57.6 per-process kernel stacks, CPL0 switch windows, lock holders, guard pages; 1.57.7 voluntary switch, block/wake, clac (-smp 1 + 4)" "" "kstack-smoke.sh"
+# 1.57.7 (Path 2, S3b) — FOREGROUND EXEC: execwait#37 is a blocking wait (the child an ordinary scheduled IF=1
+# process: ticks, siblings, yield, nesting, fault, redirect, env, FP, migration) and kmain's `run` is a scheduled
+# child (recovery mode: tickself, fault, an orphan writer, spawn storms, free RAM). PLAIN kernel, tests/fg seeded as
+# /bin/agnsh; -smp 1 then -smp 4, both gated; the default mode also checks agnsh-exit-with-a-live-bg-job + dumpe2fs.
+run_gate "1.57.7 foreground exec on Path 2 (#37 blocks, kmain run) -smp 1+4 + recovery" "" "fg-smoke.sh"
+
+# 1.57.7 (Path 2, S3c) — the in-kernel blocking waits FROM RING 3 (tests/waits/waitx.cyr seeded as /bin/agnsh on a
+# PLAIN kernel; -smp 1 then -smp 4, both gated): sleep_ms#41 blocks only its caller (spinners get the CPU, a child
+# runs during the sleep), waitpid#4 WAIT_BLOCK (0x100|pid, 0x1FF any), flock#59 waits without LOCK_NB (-2 = table
+# full; a blocking conversion drops the old lock; a 4-child increment stress ends exactly at 600), sched_yield#44
+# donates, and an execwait#37 child blocks like any process (P13 `ew37`, flipped by S3b-F2).
+run_gate "1.57.7 in-kernel blocking waits: sleep_ms, waitpid WAIT_BLOCK, flock, #37 child blocks (ring 3; -smp 1 + 4)" "" "wait-ring3-smoke.sh"
+# 1.57.7 (Path 2, S3d) — the KEYBOARD read blocks only its caller and ONE reader owns each cooked line (a second
+# blocking reader waits for the line; the NB prompt poll answers -2 without draining while another live process owns
+# it, and keeps the line while its partial line is live). waitx in mode `kbd` as /bin/agnsh, keys typed over HMP by
+# scripts/harness/wait-kbd-test.py (wrapped by the smoke), -smp 1 then -smp 4, both gated. It also carries the
+# per-TRB HID report slots' gate (a key pressed AND released inside one IF=0 gap used to be lost: `abc` read `bc`).
+run_gate "1.57.7 keyboard line ownership (blocking + NB readers; -smp 1 + 4)" "" "wait-kbd-smoke.sh"
+# 1.44.x (S3d: gated at last) — the NB cooked-line read's -2 / -3 / line contract, pre-scheduler, plus (1.57.7) the
+# completed line releases the keyboard line. It had no row since it was written.
+run_gate "1.44.x NB cooked-line read (-2/-3/line, line released)" "NBREAD_SELFTEST=1" "nbread-smoke.sh"
+# 1.44.0 (S3d: gated at last) — kernel threads: timer preemption round-robins two never-yielding kthreads, and the
+# preempt gate freezes them. Boots -smp 1 then -smp 4 in one invocation, banner-gated (it had no row since 1.44.0).
+run_gate "1.44.0 kernel threads: preempt + gate (-smp 1 + 4)" "THREAD_SELFTEST=1" "thread-smoke.sh"
 
 # --- 1.56.40 channel band (#97): the RING-3 half, and the only place §9.9's kill criteria can be met ---
 # ⛔ The boot selftest structurally cannot close either: it runs under the KERNEL's CR3 (so it says
@@ -280,5 +362,10 @@ echo "  build/agnos: $(stat -c%s "$ROOT/build/agnos" 2>/dev/null || wc -c < "$RO
 echo ""
 echo "=========================================="
 printf ' SWEEP RESULTS  (%d passed, %d failed)%b\n' "$pass" "$fail" "$results"
+echo "  per-attempt logs: $SWEEP_LOGS"
 echo "=========================================="
+if [ -n "$SWEEP_ONLY" ]; then
+    echo "SWEEP_ONLY='$SWEEP_ONLY' — $skipped rows skipped: NOT A SWEEP VERDICT"
+    [ "$fail" = 0 ] && exit 3 || exit 1
+fi
 [ "$fail" = 0 ] && { echo "ARC SWEEP: PASS"; exit 0; } || { echo "ARC SWEEP: FAIL"; exit 1; }

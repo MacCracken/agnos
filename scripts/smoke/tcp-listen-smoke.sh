@@ -1,98 +1,35 @@
 #!/bin/bash
-# TCP server-side primitives smoke test for the AGNOS kernel.
-# Validates 1.32.0 bite A — tcp_listen / tcp_accept / passive-open SYN
-# handler + SYN_RCVD state branch.
+# TCP server-side smoke (TCP_LISTEN_SMOKE=1): the persistent HTTP server in selftests.cyr listens on :8080; the
+# host connects through a SLIRP hostfwd and must receive the version banner, and the kernel must log
+# `tcp_accept: conn_id=` and `http: served conn=1` (the dwell marker).
 #
-# Boots the agnos kernel under qemu-system-x86_64 + OVMF + gnoboot with
-# the TCP_LISTEN_SMOKE=1 boot-hook that:
-#   1. tcp_listen(8080)         — bind the listener
-#   2. poll up to ~2000 iters   — call net_poll + tcp_accept each round
-#   3. on accept: send "AGNOS 1.32.0 tcp_listen smoke\n" + tcp_close
-#   4. on timeout: log a 'no connection within timeout' line
-#
-# Host-side: after a ~2s delay (to let qemu boot past net_init), `nc`
-# connects to the qemu-forwarded port, reads the banner, closes. The log
-# is then grepped for the kernel-side `tcp_accept: conn_id=` line AND
-# the host-side received-banner content.
-#
-# Scenarios:
-#   1. accept-one        — single host nc connection; expect both ends.
-#   2. listen-no-connect — no host probe; expect 'no connection within
-#                          timeout' (proves the listener is alive but
-#                          isn't spuriously accepting).
-#   3. duplicate-listen  — kernel tries tcp_listen(8080) twice (the
-#                          second call should return -1). Validated by
-#                          a separate boot whose smoke hook attempts a
-#                          second bind. (DEFERRED — needs a separate
-#                          TCP_LISTEN_SMOKE_DUP=1 flag; for now skip.)
-#
-# Tested under: qemu 9+, edk2 OVMF (2024+).
-# Requires: qemu-system-x86_64, OVMF firmware, nc (netcat), gnoboot built.
-#
-# Exit 0 if all selected scenarios pass; 1 if any fail.
-# Logs preserved under build/tcp-listen-smoke-logs/.
+# 1.57.7 (S4.1): scenario 1 (accept-one) is converted to the banner-gated retry (qemu_dwell_kernel; exit 2 on a
+# firmware VOID), prints a PASS/FAIL line per check and denies $SMOKE_INVARIANT_DENY. Its host probe runs in the
+# background, polls the serial log for `http: serving :8080` and RESETS its read offset whenever the log shrinks
+# (qemu_dwell truncates it on every VOID retry), then connects. Scenario 2 (listen-no-connect) is DELETED: it
+# grepped `tcp_listen smoke: no connection within timeout`, a line the persistent server never prints and which
+# exists nowhere in kernel/. Gated by scripts/sweep.sh (TCP_LISTEN_SMOKE=1) since 1.57.7.
 
 set -u
-
-# ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
 GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
-
-# OVMF discovery — same as ext2-smoke.sh
-OVMF_CODE_CANDIDATES="
-    /usr/share/edk2/x64/OVMF_CODE.4m.fd
-    /usr/share/edk2/x64/OVMF_CODE.fd
-    /usr/share/OVMF/OVMF_CODE.fd
-    /usr/share/OVMF/OVMF_CODE_4M.fd
-    /usr/share/qemu/OVMF_CODE.fd
-"
-OVMF_VARS_CANDIDATES="
-    /usr/share/edk2/x64/OVMF_VARS.4m.fd
-    /usr/share/edk2/x64/OVMF_VARS.fd
-    /usr/share/OVMF/OVMF_VARS.fd
-    /usr/share/OVMF/OVMF_VARS_4M.fd
-    /usr/share/qemu/OVMF_VARS.fd
-"
-
 OVMF_CODE=""
-for c in $OVMF_CODE_CANDIDATES; do
-    [ -f "$c" ] && { OVMF_CODE="$c"; break; }
-done
+for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd \
+         /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/qemu/OVMF_CODE.fd; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
 OVMF_VARS_SRC=""
-for c in $OVMF_VARS_CANDIDATES; do
-    [ -f "$c" ] && { OVMF_VARS_SRC="$c"; break; }
-done
-
-if [ -z "$OVMF_CODE" ] || [ -z "$OVMF_VARS_SRC" ]; then
-    echo "ERROR: OVMF firmware not found. Install edk2-ovmf (Arch) or ovmf (Debian/Ubuntu)." >&2
-    exit 1
-fi
-
+for c in /usr/share/edk2/x64/OVMF_VARS.4m.fd /usr/share/edk2/x64/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd \
+         /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/qemu/OVMF_VARS.fd; do [ -f "$c" ] && { OVMF_VARS_SRC="$c"; break; }; done
+[ -n "$OVMF_CODE" ] && [ -n "$OVMF_VARS_SRC" ] || { echo "ERROR: OVMF firmware not found — this gate measured NOTHING" >&2; exit 1; }
 for tool in qemu-system-x86_64 python3 mformat mmd mcopy parted; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-        echo "ERROR: required tool '$tool' not on PATH" >&2
-        exit 1
-    fi
+    command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: required tool '$tool' not on PATH" >&2; exit 1; }
 done
-
 GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"
-AGNOS="$ROOT/build/agnos"
-
-if [ ! -f "$GNOBOOT" ]; then
-    echo "ERROR: gnoboot not built at $GNOBOOT" >&2
-    exit 1
-fi
-if [ ! -f "$AGNOS" ]; then
-    echo "ERROR: agnos kernel not built at $AGNOS" >&2
-    echo "       cd $ROOT && TCP_LISTEN_SMOKE=1 scripts/build.sh" >&2
-    exit 1
-fi
-
-# Verify the kernel was built with TCP_LISTEN_SMOKE — grep for the banner
-# literal that only the smoke hook emits.
+AGNOS="${SMOKE_KERNEL:-$ROOT/build/agnos}"
+[ -f "$GNOBOOT" ] || { echo "ERROR: gnoboot not built at $GNOBOOT" >&2; exit 1; }
+[ -f "$AGNOS" ]   || { echo "ERROR: agnos kernel not built at $AGNOS" >&2; exit 1; }
 if ! strings "$AGNOS" | grep -q "tcp_listen(8080)"; then
-    echo "ERROR: kernel was not built with TCP_LISTEN_SMOKE=1" >&2
-    echo "       rebuild: TCP_LISTEN_SMOKE=1 sh scripts/build.sh" >&2
+    echo "ERROR: kernel was not built with TCP_LISTEN_SMOKE=1 — rebuild: TCP_LISTEN_SMOKE=1 sh scripts/build.sh" >&2
     exit 1
 fi
 
@@ -100,157 +37,81 @@ WORK="$ROOT/build/tcp-listen-smoke"
 LOGS="$ROOT/build/tcp-listen-smoke-logs"
 rm -rf "$WORK" "$LOGS"
 mkdir -p "$WORK" "$LOGS"
-
-# Build minimal ESP-only boot image (no fs scenarios — we only care about
-# kernel reaching net_init + smoke hook).
 ESP="$WORK/esp.img"
-# ⛔⛔ 1.56.51 — THIS SMOKE'S ESP RECIPE COULD NOT BOOT, AND THE FAILURE LOOKED LIKE THE KERNEL.
-# Isolated by a 2x2 over {ESP geometry} x {block device}, one QEMU run per cell: ONLY
-# {1MiB..33MiB on a 128 MB disk} x {nvme} hands off. The old `mkpart ESP fat32 1MiB 100%` on a 64 MB
-# disk yields a 63 MiB FAT32 at 1 sector/cluster (129024 clusters) that OVMF's FAT driver will not
-# boot, and virtio-blk does not boot on this box under EITHER geometry. Both had to change.
-# ⚠ The visible symptom was NOT "no boot" — it was the smoke's own assertions grepping an empty log
-# and reporting a wall of red naming real regression guards. 25 smokes shared this copy-pasted
-# recipe, four of them gates in sweep.sh. See scripts/smoke/edge-abi-smoke.sh for the measurement.
 dd if=/dev/zero of="$ESP" bs=1M count=128 status=none
 parted -s "$ESP" mklabel gpt mkpart ESP fat32 1MiB 33MiB set 1 esp on
 mformat -i "$ESP"@@1048576 -F
-mmd -i "$ESP"@@1048576 ::EFI
-mmd -i "$ESP"@@1048576 ::EFI/BOOT
+mmd -i "$ESP"@@1048576 ::EFI ::EFI/BOOT ::boot
 mcopy -i "$ESP"@@1048576 "$GNOBOOT" ::EFI/BOOT/BOOTX64.EFI
-mmd -i "$ESP"@@1048576 ::boot
 mcopy -i "$ESP"@@1048576 "$AGNOS" ::boot/agnos
 
-echo "=== AGNOS TCP listen-accept smoke ==="
-echo "  agnos:      $AGNOS ($(stat -c %s "$AGNOS") B)"
-echo "  gnoboot:    $GNOBOOT ($(stat -c %s "$GNOBOOT") B)"
-echo "  OVMF code:  $OVMF_CODE"
-echo "  ESP image:  $ESP"
-echo "  log dir:    $LOGS"
-echo ""
-
-QEMU_TIMEOUT="${QEMU_TIMEOUT:-30}"
-HOST_PORT="${HOST_PORT:-15555}"
-pass=0
-fail=0
-
-# --- Scenario 1: accept-one ----------------------------------------------
-# Boot qemu with hostfwd, sleep to let kernel reach net_init+listen, run
-# `nc` against the hostfwd port, expect the kernel to log accept-success
-# AND nc to receive the smoke banner.
-echo "Scenario 1: accept-one"
-cp "$OVMF_VARS_SRC" "$WORK/vars-1.fd"
-chmod +w "$WORK/vars-1.fd"
+HOST_PORT="${HOST_PORT:-$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')}"
 LOG_1="$LOGS/1-accept-one.log"
-NC_OUT_1="$LOGS/1-accept-one.nc-output"
-
-(
-    timeout "$QEMU_TIMEOUT" qemu-system-x86_64 \
-        -machine q35 -m 512M -cpu max \
-        -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
-        -drive "if=pflash,format=raw,file=$WORK/vars-1.fd" \
-        -drive "file=$ESP,format=raw,if=none,id=esp0" \
-        -device "nvme,drive=esp0,serial=AGNOS-SMOKE" \
-        -netdev "user,id=u1,hostfwd=tcp::$HOST_PORT-:8080" \
-        -device "virtio-net-pci,netdev=u1" \
-        -serial stdio -display none -no-reboot 2>/dev/null > "$LOG_1"
-) &
-QEMU_PID=$!
-
-# Wait for the kernel to reach the listen hook. Boot through OVMF +
-# gnoboot + kernel-init to the post-scheduler smoke point takes ~4-5s
-# of wall time. After that the kernel polls for connections over ~8s.
-# So poll the qemu hostfwd port from ~3s to ~20s after qemu start.
+NC_OUT_1="$LOGS/1-accept-one.host-output"
 PROBE_LOG="$LOGS/1-accept-one.probe-log"
-> "$PROBE_LOG"
-for ws in 3 5 7 9 11 13 15 17; do
-    sleep 2
-    PY_OUT=$(python3 -c "
-import socket, sys
-try:
-    s = socket.socket()
-    s.settimeout(3)
-    s.connect(('localhost', $HOST_PORT))
-    data = s.recv(256)
-    sys.stdout.buffer.write(data)
-    s.close()
-    sys.exit(0 if data else 11)
-except ConnectionRefusedError:
-    sys.exit(12)
-except socket.timeout:
-    sys.exit(13)
-except Exception as e:
-    sys.stderr.write(str(e))
-    sys.exit(14)
-" 2>>"$PROBE_LOG")
-    rc=$?
-    echo "  probe ws=$ws rc=$rc bytes=${#PY_OUT}" >> "$PROBE_LOG"
-    if [ "$rc" = "0" ]; then
-        printf '%s' "$PY_OUT" > "$NC_OUT_1"
-        break
-    fi
-done
+: > "$LOG_1"
+echo "=== AGNOS TCP listen-accept smoke (host port $HOST_PORT) ==="
+echo "  agnos: $AGNOS ($(stat -c %s "$AGNOS") B)"
 
-# Wait for qemu to finish (timeout will fire if not).
-wait $QEMU_PID 2>/dev/null
+# Host probe: follow the serial log (offset reset on truncation), connect once the server says it is serving.
+python3 - "$LOG_1" "$HOST_PORT" "$NC_OUT_1" > "$PROBE_LOG" 2>&1 <<'PY' &
+import socket, sys, time, os
+log, port, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+off = 0; buf = b""; t0 = time.time()
+while time.time() - t0 < 300:
+    try: sz = os.path.getsize(log)
+    except OSError: sz = 0
+    if sz < off: off = 0; buf = b""; print("log shrank: offset reset", flush=True)
+    if sz > off:
+        with open(log, "rb") as f: f.seek(off); buf += f.read(sz - off)
+        off = sz
+    if b"http: serving :8080" in buf:
+        for attempt in range(10):
+            try:
+                s = socket.create_connection(("127.0.0.1", port), timeout=5)
+                s.settimeout(10); data = b""
+                while True:
+                    d = s.recv(4096)
+                    if not d: break
+                    data += d
+                s.close()
+                open(out, "wb").write(data)
+                print("got %d bytes on attempt %d" % (len(data), attempt), flush=True)
+                if data: sys.exit(0)
+            except Exception as e:
+                print("attempt %d: %s" % (attempt, e), flush=True)
+            time.sleep(1)
+        buf = b""
+    time.sleep(0.2)
+print("probe gave up", flush=True)
+sys.exit(1)
+PY
+PROBE_PID=$!
 
-# Check both kernel-side log + host-side nc output.
-ok_kernel=0
-ok_host=0
-if strings "$LOG_1" | grep -qE "tcp_accept: conn_id="; then
-    ok_kernel=1
-fi
-if [ -f "$NC_OUT_1" ] && grep -q "tcp_listen smoke" "$NC_OUT_1"; then
-    ok_host=1
-fi
-if [ "$ok_kernel" = "1" ] && [ "$ok_host" = "1" ]; then
-    echo "  PASS: accept-one (kernel logged accept + host received banner)"
-    pass=$((pass + 1))
-else
-    echo "  FAIL: accept-one"
-    [ "$ok_kernel" = "0" ] && echo "        - kernel log missing 'tcp_accept: conn_id='"
-    [ "$ok_host" = "0" ] && echo "        - host did not receive banner string"
-    echo "        --- last 20 lines of kernel log ---"
-    strings "$LOG_1" | tail -20 | sed 's/^/        /'
-    if [ -f "$NC_OUT_1" ]; then
-        echo "        --- host nc output ---"
-        cat "$NC_OUT_1" | sed 's/^/        /'
-    fi
-    fail=$((fail + 1))
-fi
-echo ""
-
-# --- Scenario 2: listen-no-connect ---------------------------------------
-# Same boot but no host-side probe. Expect 'tcp_listen smoke: no
-# connection within timeout' line (proves the listener didn't
-# spuriously accept).
-echo "Scenario 2: listen-no-connect"
-cp "$OVMF_VARS_SRC" "$WORK/vars-2.fd"
-chmod +w "$WORK/vars-2.fd"
-LOG_2="$LOGS/2-listen-no-connect.log"
-
-timeout "$QEMU_TIMEOUT" qemu-system-x86_64 \
-    -machine q35 -m 512M -cpu max \
+qemu_dwell_kernel "$LOG_1" "http: served conn=1" "${QEMU_TIMEOUT:-60}" "$WORK/vars.fd" "$OVMF_VARS_SRC" \
+    qemu-system-x86_64 -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
-    -drive "if=pflash,format=raw,file=$WORK/vars-2.fd" \
+    -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$ESP,format=raw,if=none,id=esp0" \
     -device "nvme,drive=esp0,serial=AGNOS-SMOKE" \
-    -netdev "user,id=u2" \
-    -device "virtio-net-pci,netdev=u2" \
-    -serial stdio -display none -no-reboot 2>/dev/null > "$LOG_2"
+    -netdev "user,id=u1,hostfwd=tcp:127.0.0.1:$HOST_PORT-:8080" \
+    -device "virtio-net-pci,netdev=u1" \
+    -serial stdio -display none -no-reboot
+kill "$PROBE_PID" 2>/dev/null; wait "$PROBE_PID" 2>/dev/null
+qemu_assert_booted "$LOG_1" || exit 2
 
-if strings "$LOG_2" | grep -qE "tcp_listen smoke: no connection within timeout"; then
-    echo "  PASS: listen-no-connect (timeout line emitted as expected)"
-    pass=$((pass + 1))
-else
-    echo "  FAIL: listen-no-connect (timeout line not emitted)"
-    echo "        --- last 20 lines of kernel log ---"
-    strings "$LOG_2" | tail -20 | sed 's/^/        /'
-    fail=$((fail + 1))
-fi
-echo ""
-
-# --- Summary ------------------------------------------------------------
-
-echo "=== summary: $pass passed, $fail failed ==="
-[ "$fail" -eq 0 ]
+pass=0
+fail=0
+if strings "$LOG_1" | grep -q "tcp_accept: conn_id="; then echo "PASS: kernel logged tcp_accept"; pass=$((pass + 1));
+else echo "FAIL: kernel log missing 'tcp_accept: conn_id='"; fail=$((fail + 1)); fi
+if strings "$LOG_1" | grep -q "http: served conn=1"; then echo "PASS: kernel served conn 1"; pass=$((pass + 1));
+else echo "FAIL: kernel log missing 'http: served conn=1'"; fail=$((fail + 1)); fi
+if [ -f "$NC_OUT_1" ] && grep -q "tcp_listen smoke" "$NC_OUT_1"; then echo "PASS: host received the banner"; pass=$((pass + 1));
+else echo "FAIL: host did not receive the banner (probe log below)"; sed 's/^/        /' "$PROBE_LOG"; fail=$((fail + 1)); fi
+if strings "$LOG_1" | grep -qE "$SMOKE_INVARIANT_DENY"; then
+    echo "FAIL: a latched kernel invariant fired"; strings "$LOG_1" | grep -E "$SMOKE_INVARIANT_DENY" | head -3; fail=$((fail + 1))
+else echo "PASS: no latched invariant (incl. net: lock overlap/missing)"; pass=$((pass + 1)); fi
+[ "$fail" -eq 0 ] || { echo "        --- last 20 lines of kernel log ---"; strings "$LOG_1" | tail -20 | sed 's/^/        /'; }
+echo "=== tcp-listen-smoke: $pass passed, $fail failed ==="
+[ "$fail" -eq 0 ] && exit 0
+exit 1

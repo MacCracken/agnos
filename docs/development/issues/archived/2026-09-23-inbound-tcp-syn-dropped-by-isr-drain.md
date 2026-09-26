@@ -1,6 +1,6 @@
 # 2026-09-23 — inbound TCP: a SYN drained in interrupt context is dropped, so ring-3 servers rarely accept
 
-**Status:** 🟡 **OPEN** — fixed by step **S4** (the passive open served in interrupt context through an IRQ-save `tcp_slot_claim`, a boot-time per-slot pool, the TX/loopback locks that make the `-smp 4` net path gated, half-close kept until accept). Not in 1.57.6. The Path 2 foundation this step builds on — per-process syscall kernel stacks, the deferred `on_cpu` release, preempt-disabling spinlocks, region-7 guard pages (bites S3.1–S3.3) — landed in **1.57.6**; see `docs/development/planning/blocking-syscall-concurrency.md` § Path 2 plan and the roadmap's 1.57.x table.
+**Status:** ✅ **RESOLVED 1.57.7 (2026-09-25)** — step S4: the passive open is served in interrupt context with no allocation (a boot-time conn pool) through an IRQ-saving `tcp_slot_claim_locked`; a SYN, its ACK and any data are handled by the timer/NIC drain with no poller, and the next `sock_accept`#57 sees the connection. Gate: `scripts/smoke/tcp-inbound-smoke.sh` (sweep row; A1 ISR-only accept, A2/A2b `fast=12`, variants msix, vectors0 and `-smp 4`). Built, gated, NOT burned. See § Resolution.
 **Filed by:** daimon (the AGNOS agent orchestrator), while mapping its agent lifecycle onto agnos
 for daimon 2.4.0. daimon's HTTP API is its only control surface, so on agnos it is unreachable.
 **Checked against:** agnos **1.57.5**: the prebuilt `build/agnos` of 2026-09-21, and the source in
@@ -141,3 +141,20 @@ it inside the guest, where no inbound TCP is needed. Its HTTP API on agnos waits
 
 daimon has a separate problem of its own on agnos, not counted above: sandhi's sync loop waits up to
 30 s on a connection that sends nothing. daimon will fix that on its side.
+
+## Resolution (1.57.7, 2026-09-25)
+
+**What shipped:** the net lock chain `tcp_tab < net_tx < lo_q` (UDP a sibling leaf) with IRQ-save wrappers, the TX
+lock at all 7 frame builds, an in-place loopback drain, a per-slot generation, SYN_RCVD capped at 4 of 8 with one
+slot reserved for a non-passive claim, and the `-smp 4` net variants GATED. Falsification against the 1.57.6 tag
+(msix): A1 FAIL, A2 served 0/12, A2B 1/12 (2.9 s), A3 0/10, X inbound 0/12; 1.57.7: all green, A2/A2B 12/12 fast.
+
+**What the change broke — checked before archiving:** a listener's close now sends RST to un-accepted
+ESTABLISHED/CLOSE_WAIT children (new wire behaviour). S4's "FIN sent once" was superseded by S6's graceful close.
+Found on the way and fixed: virtio-net TX shared one buffer across descriptors (two back-to-back frames overwrote
+each other) — one buffer per descriptor now; and (S6) `virtio_net_send` refused every frame over 1500 bytes, so a
+full-MSS segment never left the guest — the bound is 1514. The r8169 direct-map conversion is built, not burned (no
+RTL8168 model in QEMU). The DMA identity-VA audit S4 ran (S4.8b) stopped at its size rule; the remainder is filed
+for 1.57.8 as `2026-09-25-dma-cpu-pointers-still-use-identity-vas.md`.
+
+**Evidence:** `~/.claude/projects/-home-macro-Repos-agnos/handoff-1.57.7/steps/S4-report.json` (`falsification`), `logs/S4/`.

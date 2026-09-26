@@ -12,11 +12,14 @@ re-proving over `anu`.
 > byte-scans the kernel and hard-exits if it carries any selftest hook). Do not read anything
 > here as "two procs can't run concurrently on agnos." They can.
 
-Path 2 (per-proc syscall kstacks + real in-kernel blocking) IN FLIGHT since 1.57.6 — the operator chose it
-2026-09-23 (decision D20); bites S3.1–S3.3 SHIPPED in 1.57.6, the rest is the 1.57.x ladder in § Path 2 plan
-below. Opened 2026-07-10 out of the mishran two-proc audio bring-up.
+**Path 2 core SHIPPED: S3.1–S3.3 in 1.57.6, S3.4–S3.9 in 1.57.7** (S3b, S6, S7 follow in 1.57.7) — the operator
+chose per-proc syscall kstacks + real in-kernel blocking on 2026-09-23 (decision D20); the ladder is in § Path 2 plan
+below, and the invariants live in [`../../architecture/kernel-stacks-and-preemption.md`](../../architecture/kernel-stacks-and-preemption.md)
+and [`../../architecture/blocking-waits.md`](../../architecture/blocking-waits.md). Opened 2026-07-10 out of the mishran
+two-proc audio bring-up.
 
-> ⭐ **1.57.6 — PATH 2 IS IN FLIGHT (operator decision D20, 2026-09-23), AND THE INVARIANT BELOW IS HISTORY
+> *(History — the 1.57.6 in-flight note, kept as it was written; S3.4–S3.9 landed in 1.57.7 and the waits no longer
+> hold their CPU:)* ⭐ **1.57.6 — PATH 2 IS IN FLIGHT (operator decision D20, 2026-09-23), AND THE INVARIANT BELOW IS HISTORY
 > FROM S3.3 ON.** Bites S3.1–S3.3 landed: every process runs its syscalls on its OWN region-7 kernel stack
 > (the per-CPU syscall stacks are gone), the SYSRET state lives in that process's frame, a switch releases
 > `on_cpu` only after the CPU has left the old stack and CR3, spinlocks and ISR bodies are non-preemptible,
@@ -70,18 +73,19 @@ lists — not normative, not maintained): `~/.claude/projects/-home-macro-Repos-
 | S3 | S3.1 | switch tail + scheduler safety: deferred `on_cpu` release, READY-only tripwire, `sched_next` fallback, revive guard | ✅ **1.57.6** |
 | | S3.2 | preempt-disabling spinlocks, non-preemptible ISR bodies | ✅ **1.57.6** |
 | | S3.3 | per-process kernel stacks (stub bite B, 280 B), guard pages, foreground hygiene, `KSTACK_SELFTEST` + `kstack-smoke` | ✅ **1.57.6** |
-| S3c | S3.4 | voluntary switch (`int 0xE0`), BLOCKED state, the wq primitive, `#44`/`#14`/`#96` off the per-CPU captures, stub bite C (174 B), `sched_exit_tail` | 1.57.x |
-| | S3.5 | `sleep_ms`#41 blocks only its caller; `waitpid`#4 `WAIT_BLOCK` (`arg1 = 0x100\|pid`, `0x1FF` = any; no new number); child-exit wakes; `flock`#59 blocks (−2 = table full; NB keeps −1; a blocking conversion drops the old lock) | 1.57.x |
-| S3d | S3.6 | keep-current (a lone runner keeps its CPU: ~50% → ~100%), its own gate | 1.57.x |
-| | S3.7 | keyboard read (one blocking reader per line; the NB reader −2 while it is owned) and sound waits `#66`/`#68` | 1.57.x |
-| | S3.8 | wake latency: idle step + reschedule kick IPI (vector `0xE1`) | 1.57.x |
-| | S3.9 | docs (this file rewritten as SHIPPED; `blocking-waits.md`), sweep rows, bench | 1.57.x |
-| S3b | F1–F5 | `execwait`#37 becomes "load an ordinary scheduled IF=1 child, block until it exits"; kybernet's `/bin/agnsh`, NET dig and the recovery `run` become `kernel_run_child` (BSP-pinned); `exec_and_wait` refused post-scheduler; no IF=0 ring 3 after `sched_active = 1`. F2 is a legal stopping point | 1.57.x |
-| S6 | — | `sock_connect`#47 / `sock_send`#48 / `icmp_echo`#55/#100 block only their caller, woken by the RX demux (after S4 + S5) | 1.57.x |
+| S3c | S3.4 | voluntary switch (`int 0xE0`), BLOCKED state, the wq primitive, `#44`/`#14`/`#96` off the per-CPU captures, stub bite C (174 B), `sched_exit_tail` | ✅ 1.57.7 — [`../../architecture/blocking-waits.md`](../../architecture/blocking-waits.md) |
+| | S3.5 | `sleep_ms`#41 blocks only its caller; `waitpid`#4 `WAIT_BLOCK` (`arg1 = 0x100\|pid`, `0x1FF` = any; no new number); child-exit wakes; `flock`#59 blocks (−2 = table full; NB keeps −1; a blocking conversion drops the old lock) | ✅ 1.57.7 (the #37 child keeps the legacy behaviour until S3b-F2) |
+| S3d | S3.6 | keep-current (a lone runner keeps its CPU: ~50% → ~100%), its own gate; `#44`/`#14` PARK instead of spinning | ✅ **1.57.7** |
+| | S3.7 | keyboard read (one blocking reader per line; the NB reader −2 while it is owned; per-TRB HID report slots) and sound waits `#66`/`#68` | ✅ **1.57.7** |
+| | S3.8 | wake latency: idle step + reschedule kick IPI (vector `0xE1`, EOI-only) | ✅ **1.57.7** |
+| | S3.9 | docs (this file; `blocking-waits.md`), sweep rows (thread, nbread, wait-kbd), bench | ✅ **1.57.7** |
+| S3b | F1–F5 | `execwait`#37 becomes "load an ordinary scheduled IF=1 child, block until it exits"; kybernet's `/bin/agnsh`, NET dig and the recovery `run` become `kernel_run_child` (BSP-pinned); `exec_and_wait` refused post-scheduler; no IF=0 ring 3 after `sched_active = 1`. F2 is a legal stopping point | ✅ 1.57.7 (`docs/architecture/foreground-exec.md`, `fg-smoke.sh`) |
+| S6 | — | `sock_connect`#47 / `sock_send`#48 / `icmp_echo`#55/#100 block only their caller, woken by the RX demux and `net_tick` (after S4 + S5); #48 stream-correct (D6); graceful close | ✅ **1.57.7** |
 | S7/S8 | — | kill/stop/continue build on `sched_switch_vol`, the wq hooks and `sched_exit_tail`; limits on the tick path | 1.57.x |
 
 Every bite is boot-verified at `-smp 1` AND `-smp 4` before the next starts (agnsh-smoke at both, the stub
-size oracle, the aarch64 name lists, LOAD end ≤ `0x370000`), with the accelerator pinned (KVM when
+size oracle, the aarch64 name lists, LOAD end ≤ the `image-layout-check.sh` bound — `0x370000` through 1.57.6,
+`0x390000` from 1.57.7's IMG step, which moved the BSP boot stack top `0x380000` → `0x3A0000`), with the accelerator pinned (KVM when
 `/dev/kvm` is writable, else `tcg,thread=multi`) — a GREEN mutant under single-threaded TCG proves nothing.
 
 ### Risks the plan names (the iron-only ones are why 1.57.6 says "NOT burned")
@@ -91,7 +95,8 @@ size oracle, the aarch64 name lists, LOAD end ≤ `0x370000`), with the accelera
 - `SPEC_CTRL` in the switch tail is inert on both test substrates (`ibrs=0`); the 4 KB guard pages under
   real paging/TLB behaviour; the hand-built SYSCALL stub (one wrong byte bricks userland).
 - Behaviour: a kmain or kthread holding any spinlock is no longer preemptible; keep-current changes a lone
-  runner's share; a READY process on a busy CPU waits for its next tick (the kick targets halted CPUs only).
+  runner's share, and `#44` parks instead of spinning; a READY process on a busy CPU waits for its next tick (the
+  kick targets halted CPUs only).
 - NMI is not configured (pre-existing); `[0xF80000,0xFC0000)` is its natural IST home.
 - `BOOTCR3_KEEP_GNOBOOT_CR3` builds get no guard pages and keep the `.bss` kthread pool; no smoke covers them.
 - `flock` has no FIFO fairness; until S7 a two-lock cycle parks both processes BLOCKED (the rest of the
@@ -118,9 +123,10 @@ This is why:
   one case (agnsh → child) where two syscall frames must be live at once.
 
 **Consequence:** any blocking, preempt-held syscall starves every other proc on the
-CPU for its whole duration. Confirmed preempt-held blockers: `sleep_ms` #41,
-`snd_write` #66 (blocking mode), `snd_drain` #68, `sock_connect` #47, `sock_send` #48,
-`icmp_echo` #55, `kbd_read_blocking`.
+CPU for its whole duration. Confirmed preempt-held blockers after 1.57.7's S6: **none** (#47/#48/#55/#100 block only
+their caller since S6) — only, in the REFUSED contexts (before the scheduler, preempt-held kernel
+code; the #37 child was one until S3b-F2), the `_held` fallbacks of `sleep_ms` #41, the keyboard read, `snd_write` #66 and
+`snd_drain` #68. Everywhere else those four block only their caller (1.57.7).
 
 ## Path 1 — userland cooperative yield (SHIPPED)
 
@@ -164,6 +170,10 @@ Four things were required together, worth recording:
    TCP-wire section below for the constraint it was working around. Items 1-3 stand.
 
 ## The TCP-wire constraint (`sock_send` #48)
+
+> ✅ **RESOLVED in 1.57.7 (S6):** #48 blocks only its caller and is stream-correct (one segment in flight at every
+> entry; the committed count after ~8 s with no progress, D6); a stalled reader keeps its connection (persist). The
+> history below is kept for the record.
 
 > ⛔ **This section describes a constraint on the NETWORK stack, not a local-IPC design.**
 > Everything below about chunking payloads under the loopback window was written while

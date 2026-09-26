@@ -63,6 +63,11 @@ GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"
 AGNOS="$ROOT/build/agnos"
 [ -f "$GNOBOOT" ] || { echo "ERROR: gnoboot not built at $GNOBOOT"; exit 1; }
 [ -f "$AGNOS" ]   || { echo "ERROR: agnos not built — run sh scripts/build.sh"; exit 1; }
+# ⭐ 1.57.7 (IMG-fix, reviews A6/B6): this smoke boots build/agnos as found and its verdict is about the PLAIN
+# production kernel — the IMG run booted doom-smoke's leftover DOOM_SELFTEST image here and scored PASS. Refuse any
+# image scripts/build.sh did not record as a plain build (smoke_require_image, scripts/smoke/lib/qemu-dwell.sh).
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
+smoke_require_image "$AGNOS" ""
 
 WORK="$ROOT/build/shutdown-smoke"
 LOGS="$ROOT/build/shutdown-smoke-logs"
@@ -146,15 +151,40 @@ KVM_ARGS=""
 [ -w /dev/kvm ] && KVM_ARGS="-enable-kvm -cpu host"
 [ -z "$KVM_ARGS" ] && KVM_ARGS="-cpu max"
 
-qemu-system-x86_64 -machine q35 -m 512M $KVM_ARGS \
-    -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
-    -drive "if=pflash,format=raw,file=$WORK/OVMF_VARS.fd" \
-    -drive "file=$IMG,format=raw,if=none,id=disk0" \
-    -device "nvme,drive=disk0,serial=AGNOS-SHUT" \
-    -device "qemu-xhci,id=xhci" -device "usb-kbd,bus=xhci.0" \
-    -serial "file:$LOG" -display none -no-reboot \
-    -monitor "unix:$MON,server,nowait" &
-QPID=$!
+# ⛔ 1.57.7 (IMG-fix, D15/B3 class) — BANNER-CLASSIFIED RETRY BEFORE THE DRIVER. This smoke booted ONCE, so the
+# ~1-in-4 firmware hand-off flake (`gnoboot: fail @ EBS`, the kernel never ran) reached the driver as a 120 s prompt
+# TIMEOUT and scored FAIL. Each attempt now waits for the kernel banner, a firmware-failure line, or QEMU's exit; an
+# attempt with no banner is killed and classified (qemu_attempt_verdict: a VOID keeps its log as $LOG.attemptN and
+# is retried with fresh NVRAM — the disk is untouched, the kernel never ran; a kernel that took control and died
+# before its banner FAILS at once). No banner in QEMU_TRIES (default 6) attempts -> VOID, exit 2.
+_try=1
+while :; do
+    cp "$OVMF_VARS_SRC" "$WORK/OVMF_VARS.fd"; chmod +w "$WORK/OVMF_VARS.fd"; : > "$LOG"; rm -f "$MON"
+    qemu-system-x86_64 -machine q35 -m 512M $KVM_ARGS \
+        -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
+        -drive "if=pflash,format=raw,file=$WORK/OVMF_VARS.fd" \
+        -drive "file=$IMG,format=raw,if=none,id=disk0" \
+        -device "nvme,drive=disk0,serial=AGNOS-SHUT" \
+        -device "qemu-xhci,id=xhci" -device "usb-kbd,bus=xhci.0" \
+        -serial "file:$LOG" -display none -no-reboot \
+        -monitor "unix:$MON,server,nowait" &
+    QPID=$!
+    _w=0
+    while [ "$_w" -lt 240 ]; do
+        sleep 0.5; _w=$((_w + 1))
+        grep -aq "AGNOS kernel v" "$LOG" 2>/dev/null && break
+        grep -aqE "gnoboot: fail @|BootManagerMenuApp|BdsDxe: failed to load" "$LOG" 2>/dev/null && break
+        kill -0 "$QPID" 2>/dev/null || break
+    done
+    grep -aq "AGNOS kernel v" "$LOG" 2>/dev/null && break
+    kill "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true
+    if qemu_attempt_verdict "$LOG" "$_try"; then break; fi
+    if [ "$_try" -ge "${QEMU_TRIES:-6}" ]; then
+        qemu_assert_booted "$LOG" || true
+        echo "  SHUTDOWN SMOKE: VOID"; exit 2
+    fi
+    _try=$((_try + 1))
+done
 # shellcheck disable=SC2064
 trap "kill $QPID 2>/dev/null || true" EXIT INT TERM
 

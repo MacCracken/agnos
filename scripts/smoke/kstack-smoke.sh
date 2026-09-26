@@ -23,6 +23,19 @@
 #                                    (every held CPU came back), underfoot == 0; held < 4 is a coverage VOID
 #   kstack: fallback OK              the nothing-ready fallback answers the idle, never kmain's stale slot
 #   kstack: isr cannot block OK      every timer ISR body ran with preempt_count > 0
+#   1.57.7 (S3.4) — the voluntary switch (int 0xE0) and the wait/wake primitive:
+#   kstack: block/wake OK            mode-2 probes: >= 10 real wq_arm/wq_sleep blocks timed out; locals + per-process a4 intact
+#   kstack: pingpong OK              mode-3 probes hand a turn back and forth via wq_wake: >= 50 rounds, 0 watchdog expiries
+#   kstack: pause window OK          mode 5: ksyscall(14)'s preempt point switched the caller out >= 5 times
+#   kstack: fallback OK              (extended) each park is followed by one real wq wait (wq= equals the park count)
+#   kstack: resched gate DPL0 OK     a ring-3 `int 0xE0` is a #GP (exit 141), never a switch
+#   kstack: spurious 0xE0 OK         a self-IPI on 0xE0 is EOI'd; the timer keeps ticking
+#   kstack: isr clac OK              AC sampled clear in ISR bodies that interrupted a stac window + every gate's first 3 bytes are clac
+#   kstack: preempt rmw OK           -smp 4: two migrating lock-takers never strand a CPU's preempt count ("n/a (1 cpu)" at -smp 1)
+#   sched: resched gate 0xE0 OK      the 0xE0 gate check at boot
+#   kstack: spurious 0xE1 OK         (1.57.7 S3.8) a self-IPI on the 0xE1 kick vector is EOI'd; the timer keeps ticking
+#   kstack: kick gate DPL0 OK        (1.57.7 S3.8) a ring-3 `int 0xE1` is a #GP (exit 141)
+#   sched: resched gate 0xE1 OK      (1.57.7 S3.8) the 0xE1 gate check at boot (and isr clac checks its iretq at 41-42)
 #   kstack: accel=... / kstack: done
 # Denied anywhere: `kstack: FAIL`, `fault:`, `PANIC`, `#GP`, `#PF`, `Double Fault`, `sched: refused non-ready
 # pick`, and sched_assert_oob's latched lines (`sched: exec_and_wait entered with ...`, `sched: kernel_resume with ...`),
@@ -106,8 +119,10 @@ for smp in ${KSTACK_SMP:-1 4}; do
     fi
     strings "$LOG" | grep -E "kstack:|kstack-hw:|sched: refused|sched: exec_and_wait entered|sched: kernel_resume with|syscall: stub|syscall: ibrs|syscall: kernel stack|Double Fault|smp: cpus online" | grep -v "^\.*$" | sed 's/^/    /'
     echo "  -- -smp $smp verdicts --"
-    want "syscall: stub 280 bytes of 2048"  "[smp$smp] the SYSCALL stub is the S3.3 size (258 + 8 + 9 + 9 - 4; ibrs=0)"
+    want "syscall: stub 174 bytes of 2048"  "[smp$smp] the SYSCALL stub is the S3.4 bite-C size (280 - 63 - 5 - 6 - 32; ibrs=0)"
     want "syscall: ibrs=0"                  "[smp$smp] ibrs_supported = 0 on this host (the stub-size oracle is keyed on it)"
+    want "sched: resched gate 0xE0 OK"      "[smp$smp] the voluntary-switch gate 0xE0 is DPL0 / IST0 at resched_isr (1.57.7)"
+    want "sched: resched gate 0xE1 OK"      "[smp$smp] the reschedule-kick gate 0xE1 is DPL0 / IST0 at resched_kick_isr (1.57.7 S3.8)"
     want "kstack: accel="                   "[smp$smp] the accelerator is named"
     want "kstack: guard pages OK (32/32)"   "[smp$smp] region 7 has 32 not-present slot-bottom guard pages"
     want "kstack: frame OK"                 "[smp$smp] every probe's SYSRET frame, sentinels, RSP and XMM survived (>= 20 each)"
@@ -127,11 +142,26 @@ for smp in ${KSTACK_SMP:-1 4}; do
     want "kstack: storm OK"                 "[smp$smp] retire-while-running + immediate respawn: no slot handed out under a departing CPU"
     want "kstack: fallback OK"              "[smp$smp] nothing-ready fallback returns the idle; the parked child resumed 5 times"
     want "kstack: isr cannot block OK"      "[smp$smp] every timer ISR body ran with preemption disabled"
+    # ⭐ 1.57.7 (Path 2, S3.4) — the voluntary switch and the wait/wake primitive (main.cyr kst_phase_* after fallback)
+    want "kstack: block/wake OK"            "[smp$smp] 36 real wq blocks timed out and resumed; locals and the per-process a4 survived"
+    want "kstack: pingpong OK"              "[smp$smp] two probes passed a turn 60 times through wq_wake with no watchdog expiry (no lost wakeup)"
+    want "kstack: pause window OK"          "[smp$smp] the #14 designated preempt point switched the caller out at CPL0 (>= 5 times)"
+    want "kstack: resched gate DPL0 OK"     "[smp$smp] ring 3 cannot raise 0xE0: the probe #GP'd (exit 141)"
+    want "kstack: spurious 0xE0 OK"         "[smp$smp] a hardware 0xE0 (self-IPI) is EOI'd and never switches; the timer kept ticking"
+    want "kstack: spurious 0xE1 OK"         "[smp$smp] a self-IPI on the 0xE1 kick vector is EOI'd; the timer kept ticking (1.57.7 S3.8)"
+    want "kstack: kick gate DPL0 OK"        "[smp$smp] ring 3 cannot raise 0xE1: the probe #GP'd (exit 141) (1.57.7 S3.8)"
+    want "kstack: isr clac OK"              "[smp$smp] every ISR body ran with AC clear, and every non-default gate begins with clac"
+    if [ "$smp" -gt 1 ]; then
+        want "kstack: preempt rmw OK"       "[smp$smp] preempt_disable's RMW is IRQ-saved: every CPU's preempt count returned to 0"
+    else
+        want "kstack: preempt rmw n/a (1 cpu)" "[smp$smp] single CPU: preempt rmw not applicable"
+    fi
     want "kstack: done"                     "[smp$smp] the selftest ran to its end (no hang)"
     deny "kstack: FAIL"                     "[smp$smp] no kstack FAIL line"
     deny "sched: refused non-ready pick"    "[smp$smp] the scheduler never picked a non-READY proc"
     deny "sched: exec_and_wait entered with|sched: kernel_resume with" "[smp$smp] the out-of-band switch asserts stayed quiet (preempt_count 0, IF=0 at exec_and_wait)"
     deny "syscall: kernel stack is not the caller" "[smp$smp] every ring-3 syscall entered on its own kernel stack (kstack_check_entry)"
+    deny "$SMOKE_INVARIANT_DENY"             "[smp$smp] no latched kernel invariant line (the shared SMOKE_INVARIANT_DENY, qemu-dwell.sh; 1.57.7)"
     deny "fault: pid=|PANIC|#GP|#PF|Double Fault|STUB OVERFLOWED" "[smp$smp] no fault, panic or stub overflow"
 done
 

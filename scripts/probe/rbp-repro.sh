@@ -1,20 +1,30 @@
 #!/bin/sh
 # rbp-repro.sh — boot the agnsh-smoke image N times under `-d int` and scan for
 # the SYSCALL-path RBP smash: a ring-3 #PF (v=0e) whose CR2 (== smashed user RBP)
-# sits in the SYSCALL kstack window 0x37f000-0x37ffff (just under kstack top
-# 0x3F0000), the signature of the user RBP being clobbered with a kernel-stack
-# frame value across the mmap syscall. NOT part of the build; harness only.
+# is a KERNEL STACK address — the signature of the user RBP being clobbered with a
+# kernel-stack frame value across the mmap syscall. NOT part of the build; harness only.
+# ⭐ 1.57.7 (IMG-fix, review A7) — THE WINDOWS ARE DERIVED, NOT REMEMBERED. Until 1.57.7 this probe keyed on
+# the fixed page 0x37f000-0x37ffff, the top page under the old stack top 0x380000 (the 1.42.x smash's kernel
+# frames lived there). The syscall kstacks left region 1 for region-7 direct-map VAs at 1.46.x/1.51.x, and
+# the IMG step moved the BSP boot stack to top 0x3A0000 — so the old page matched no stack at all, named image
+# headroom that flag builds already reach (a #PF on future .rodata there would read as a "smash"), and a
+# leaked kmain frame (0x39fxxx) would have scored clean. Two windows now, both computed at run time:
+#   W1 the BSP boot stack's 64 KB budget [BSP_BOOT_TOP - 64 KB, BSP_BOOT_TOP), BSP_BOOT_TOP read out of
+#      scripts/check/image-layout-check.sh (the one place the tree states it, gated against the shim's bytes),
+#      so the next stack move cannot strand this probe again — kmain's frames;
+#   W2 the region-7 per-process kernel-stack pool through the direct map, DIRECTMAP_BASE + [0xE00000,
+#      0x1000000) (DIRECTMAP_BASE from kernel/core/vmm.cyr) — where a syscall-path frame lives today.
 #
 # QEMU -d int prints each exception/interrupt as a block:
 #   N: v=XX e=.... i=. cpl=Y IP=... ...
 #   ...register dump...
 #   CR0=.. CR2=<faulting-addr> CR3=.. CR4=..
 # A #PF is v=0e; its CR2 is the faulting linear address. A clean boot takes
-# zero v=0e events. The RBP smash shows as a v=0e at cpl=3 with CR2 in 0x37fxxx.
+# zero v=0e events. The RBP smash shows as a v=0e at cpl=3 with CR2 in W1 or W2.
 #
 # ⚠⚠ VACUITY FLOOR. THIS PROBE MAKES A NEGATIVE CLAIM, AND A NEGATIVE CLAIM OVER AN EMPTY LOG IS
 # WORTH NOTHING. Until 1.56.58 the verdict was one line — `[ "$smash" -eq 0 ] && echo "RESULT: NO
-# RBP smash across $boots boots"` — with nothing standing between "the awk found no 0x37fxxx CR2"
+# RBP smash across $boots boots"` — with nothing standing between "the awk found no smash-window CR2"
 # and "the smash is gone". The awk finds nothing over an EMPTY file too: on a missing or zero-byte `$INT` its
 # `END { printf("PFTOTAL=%d SMASHTOTAL=%d") }` emits `0 0`, the `${sm_n:-0}` default below launders
 # a failed awk into the same 0, and the script announces "NO RBP smash across 50 boots" having
@@ -72,6 +82,13 @@ OVMF_CODE="${OVMF_CODE:-/usr/share/edk2/x64/OVMF_CODE.4m.fd}"
 OVMF_VARS_SRC="${OVMF_VARS_SRC:-/usr/share/edk2/x64/OVMF_VARS.4m.fd}"
 [ -f "$IMG" ] || { echo "ERROR: image $IMG not built — run agnsh-smoke.sh first"; exit 1; }
 
+BSP_BOOT_TOP=$(sed -n 's/^BSP_BOOT_TOP = \(0x[0-9A-Fa-f]*\).*/\1/p' "$ROOT/scripts/check/image-layout-check.sh" | head -1)
+DM_BASE=$(sed -n 's/^var DIRECTMAP_BASE = \(0x[0-9A-Fa-f]*\);.*/\1/p' "$ROOT/kernel/core/vmm.cyr" | head -1)
+[ -n "$BSP_BOOT_TOP" ] || { echo "ERROR: cannot read BSP_BOOT_TOP from scripts/check/image-layout-check.sh — no smash window"; exit 2; }
+[ -n "$DM_BASE" ] || { echo "ERROR: cannot read DIRECTMAP_BASE from kernel/core/vmm.cyr — no smash window"; exit 2; }
+W1_LO=$(printf '0x%x' $((BSP_BOOT_TOP - 0x10000))); W1_HI=$(printf '0x%x' $((BSP_BOOT_TOP - 1)))
+W2_LO=$(printf '0x%x' $((DM_BASE + 0xE00000)));    W2_HI=$(printf '0x%x' $((DM_BASE + 0xFFFFFF)))
+echo "smash windows: W1 kmain boot stack [$W1_LO, $W1_HI]  W2 region-7 kstack pool (direct map) [$W2_LO, $W2_HI]"
 smash=0; reached=0; pf_total=0; boots=0; ev_total=0; blind=0; evidenced=0
 LOGD="$WORK/rbp-repro"; rm -rf "$LOGD"; mkdir -p "$LOGD"
 i=1
@@ -107,8 +124,8 @@ while [ "$i" -le "$N" ]; do
 
     # awk pass: walk each event block. Remember the v= header (vector + cpl),
     # and when we hit the CR2= line inside a v=0e block, test the CR2 value.
-    # Emit a line per #PF and flag RBP-smash CR2 (0x37f000-0x37ffff).
-    res=$(awk '
+    # Emit a line per #PF and flag RBP-smash CR2 (W1 or W2, computed above).
+    res=$(awk -v w1lo="$W1_LO" -v w1hi="$W1_HI" -v w2lo="$W2_LO" -v w2hi="$W2_HI" '
         /v=[0-9a-fA-F]+/ {
             # ev is the ENUMERATION COUNT for the assertion below — every event record this pass
             # actually saw. Reported, not implied: a boot that says 0 records is reporting that the
@@ -127,7 +144,7 @@ while [ "$i" -le "$N" ]; do
                     cr2=substr($0,RSTART+4,RLENGTH-4);
                     # strip leading zeros for range test
                     v=strtonum("0x" cr2);
-                    if (v>=0x37f000 && v<=0x37ffff) {
+                    if ((v>=strtonum(w1lo) && v<=strtonum(w1hi)) || (v>=strtonum(w2lo) && v<=strtonum(w2hi))) {
                         smash++;
                         printf("SMASH cpl=%s IP=%s CR2=0x%x\n", cur_cpl, cur_ip, v);
                     }
@@ -152,7 +169,7 @@ while [ "$i" -le "$N" ]; do
     pf_total=$((pf_total + pf_n))
     if [ "$sm_n" -gt 0 ]; then
         smash=$((smash + sm_n))
-        echo "  [boot $i] RBP-SMASH #PF x$sm_n (CR2 in 0x37fxxx):"
+        echo "  [boot $i] RBP-SMASH #PF x$sm_n (CR2 in a kernel-stack window):"
         printf '%s\n' "$res" | grep '^SMASH' | head -3 | sed 's/^/      /'
     fi
     i=$((i+1))
@@ -165,7 +182,7 @@ echo "  boots with a readable log : $((boots - blind)) / $boots"
 echo "  boots that did BOTH       : $evidenced / $boots   <- the evidence this verdict may spend"
 echo "  exception records scanned : $ev_total"
 echo "  total ring-any #PF (v=0e) : $pf_total"
-echo "  RBP-SMASH faults (0x37fxx): $smash"
+echo "  RBP-SMASH faults (W1/W2)  : $smash"
 echo ""
 
 # ⭐ A DETECTED SMASH NEEDS NO FLOOR — finding the thing is its own evidence. Report and get out

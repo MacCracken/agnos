@@ -141,6 +141,11 @@ fn nm_isr_build() {
     var p = &nm_isr;
     var handler_addr = &nm_handler;
     var off = 0;
+    # 1.57.7 (S3.4) — clac FIRST: no inputs/outputs; clears RFLAGS.AC. Hardware does not clear AC on interrupt
+    # delivery, so without it this ISR body would run with SMAP OFF whenever it lands on ring 3 that set AC with
+    # popf, or inside a syscall after the entry stub's stac. The saved RFLAGS keeps the interrupted AC; iretq
+    # restores it. (kstack-smoke's "isr clac" phase checks every gate's first three bytes.)
+    store8(p + off, 0x0F); store8(p + off + 1, 0x01); store8(p + off + 2, 0xCA); off = off + 3;   # clac
     store8(p + off, 0x50); off = off + 1;  # push rax
     store8(p + off, 0x51); off = off + 1;  # push rcx
     store8(p + off, 0x52); off = off + 1;  # push rdx

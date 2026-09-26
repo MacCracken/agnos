@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
-# run37-smp4-test (1.46.7 STEP-2 #3) — exercise the execwait#37 ew37 save/restore path under -smp 4.
-# A FOREGROUND `run /bin/bnrmr AGNOS` is the ring-3 execwait#37 primitive (NOT #43): agnsh, itself
-# entered via kybernet's exec_and_wait, calls execwait#37 → the kernel snapshots agnsh's resume frame
-# into the PER-CPU ew37_* block (1.46.7 #3), runs the child (bnrmr renders an ASCII banner + exits),
-# then restores ew37_* so agnsh resumes and can run MORE commands. If the per-CPU ew37 conversion
-# corrupted the save/restore, agnsh would die after the first child exits and the follow-up `version`
-# would produce nothing. Two runs (AGNOS, then OS) prove the save/restore survives a repeat.
-# PASS = both bnrmr runs render output + the prompt returns + `version` prints a fresh "agnoshi 1.7.0"
-#        AFTER the #37s (agnsh's resume context intact). Builds its own image from build/rootfs.
+# run37-smp4-test (1.46.7 STEP-2 #3; REWRITTEN 1.57.7 S3b-F0) — agnsh's FOREGROUND execwait#37 under -smp 4.
+# ⭐ WHAT IT DRIVES (1.57.7). agnoshi >= 1.9.x runs a plain `run X` through spawn_path#43 + a poll, so typing it no
+# longer reaches #37 at all (this harness typed `run /bin/bnrmr X` and so tested #43 for a whole release). Pipelines and
+# `>` redirects STAY on #37 in both 1.9.11 and 2.0.0 (agnoshi src/run_agnos.cyr), so this drives
+#     bnrmr AGNOS > /r37a    owl -p /r37a    bnrmr OS > /r37b    owl -p /r37b    version
+# (agnsh has no `cat`: "AGNOS reads files with owl" — `owl -p` is the plain read-back.)
+# i.e. #62 arms (1 <- the file) and #37 runs bnrmr with its stdout in the file. Since S3b the #37 child is an ordinary
+# scheduled IF=1 process and agnsh BLOCKS in the kernel until it exits; the redirect is applied into the child's
+# private fd table (strict shape — refused if the child could only get the global table) and dies with it.
+# PASS = BOTH read-backs (`owl -p`) print the banner art (the capture really landed in each file: >= 8 art chars in each read-back),
+#        both prompts return, `version` prints the STAGED agnsh's version string (read from build/rootfs/bin/agnsh,
+#        never hard-coded — the old check waited for a stale "agnoshi 1.7.0" and could never see it), the kernel witness
+#        `execwait: first scheduled child` is on serial (the #37 route was really taken — S3b-F2+; set
+#        RUN37_WITNESS=optional only for a pre-conversion run, which then says so), and no SMOKE_INVARIANT_DENY line.
+# ⚠ HMP `sendkey` drops keystrokes on long lines: every command is typed with type_verified (re-typed until its echo
+# is seen, shutdown-smoke's recipe). Builds its own image from build/rootfs (stage-agnsh.sh first; never re-staged
+# here — that builds inside ../agnoshi, a read-only sibling).
 import socket, subprocess, sys, time, os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -38,6 +46,16 @@ def need(*paths):
         if not os.path.exists(p):
             print("FAIL: missing", p, "(build the kernel + stage-agnsh.sh first)"); sys.exit(1)
 need(GNOBOOT, AGNOS, os.path.join(ROOTFS, "bin/agnsh"), os.path.join(ROOTFS, "bin/bnrmr"))
+# The version string `version` must print: read from the STAGED binary (1.9.11 at 1.57.7), never hard-coded.
+STAGED_VER = ""
+try:
+    _sv = subprocess.run(["strings", os.path.join(ROOTFS, "bin/agnsh")], stdout=subprocess.PIPE).stdout.decode("latin1")
+    for _ln in _sv.splitlines():
+        if _ln.startswith("agnoshi ") and len(_ln) > 8 and _ln[8].isdigit():
+            STAGED_VER = _ln.split()[0] + " " + _ln.split()[1]; break
+except OSError:
+    pass
+print("staged agnsh:", STAGED_VER or "(unknown)")
 
 OVMF_CODE = OVMF_VARS = None
 for c in ("/usr/share/edk2/x64/OVMF_CODE.4m.fd", "/usr/share/edk2/x64/OVMF_CODE.fd",
@@ -69,7 +87,7 @@ subprocess.run(["chmod", "+w", os.path.join(WORK, "vars.fd")])
 open(SER, "w").close()
 try: os.unlink(MON)
 except FileNotFoundError: pass
-print(f"built run37 image: {IMG} (-smp {NCPU}, foreground execwait#37 via /bin/bnrmr)")
+print(f"built run37 image: {IMG} (-smp {NCPU}, foreground execwait#37 via `bnrmr X > /file`)")
 
 DINT = os.environ.get("RUN37_DINT", "") == "1"
 QLOG = os.path.join(WORK, "qint.log")
@@ -105,23 +123,39 @@ try:
     def ser():
         try: return open(SER, "rb").read().decode("latin1")
         except OSError: return ""
-    km = {' ': 'spc', '\n': 'ret', '-': 'minus', '.': 'dot', '/': 'slash'}
-    def typ(word, settle=2.0):
+    km = {' ': 'spc', '\n': 'ret', '-': 'minus', '.': 'dot', '/': 'slash', '>': 'shift-dot'}
+    def key(k):
+        s.sendall(("sendkey " + k + "\n").encode()); time.sleep(0.15); drain()
+    def typ(word):
+        key('ret')                                  # prime: the first sendkey after an idle gap can be dropped
         for ch in word:
-            key = km.get(ch, ch)
-            if ch.isupper(): key = "shift-" + ch.lower()
-            s.sendall(("sendkey " + key + "\n").encode())
-            time.sleep(0.15); drain()
-        time.sleep(settle)
+            k = km.get(ch, ch)
+            if ch.isupper(): k = "shift-" + ch.lower()
+            key(k)
+        key('ret')
+    def type_verified(word, settle=1.5):
+        for attempt in range(4):
+            m = len(ser()); typ(word); time.sleep(settle)
+            if word in ser()[m:]: return m
+            p(f"  retry: {word!r} did not echo cleanly (attempt {attempt + 1}, dropped key)")
+        return -1
+    # The text AFTER the command's echo (the prime `ret` prints a prompt of its own, so the marker is searched only
+    # past the echo). "" when the command never echoed.
+    def after(seg, cmd):
+        i = seg.find(cmd)
+        return seg[i + len(cmd):] if i >= 0 else ""
     def run_wait(cmd, marker, timeout=30):
-        time.sleep(1.2); drain()   # let any prior render fully settle so no leading keystroke drops
-        m = len(ser()); typ(cmd, settle=1.0)
+        time.sleep(1.2); drain()
+        m = type_verified(cmd)
+        if m < 0: return ""
         deadline = time.time() + timeout
         while time.time() < deadline:
             seg = ser()[m:]
-            if marker is None or marker in seg: return seg
+            if marker in after(seg, cmd): return seg
             time.sleep(0.5)
         return ser()[m:]
+    def art(seg, cmd):
+        return sum(after(seg, cmd).count(c) for c in "#_|\\")
 
     ok = False
     for _ in range(480):
@@ -131,35 +165,24 @@ try:
     if not ok: p("FAIL: no agnsh banner"); sys.exit(1)
     time.sleep(1.0)
 
-    # 1) FOREGROUND execwait#37 — run bnrmr (renders an ASCII banner of "AGNOS" + exits).
-    seg1 = run_wait("run /bin/bnrmr AGNOS\n", "[ASSIST]", timeout=30)
-    # bnrmr's figlet output is made of art chars; "rendered" = the segment carries banner glyphs
-    # beyond the echoed command. Count art chars (#,_,|,/,\) as the render signal.
-    art1 = sum(seg1.count(c) for c in "#_|/\\")
-    rendered1 = art1 >= 8
-    prompt_back1 = seg1.count("[ASSIST]") >= 1
+    # 1) FOREGROUND execwait#37 with a `>` redirect, then read the capture back.
+    segw1 = run_wait("bnrmr AGNOS > /r37a", "[ASSIST]", timeout=30)
+    segc1 = run_wait("owl -p /r37a", "[ASSIST]", timeout=20)
+    art1 = art(segc1, "owl -p /r37a"); rendered1 = art1 >= 8
+    prompt_back1 = "[ASSIST]" in after(segw1, "bnrmr AGNOS > /r37a") and "[ASSIST]" in after(segc1, "owl -p /r37a")
+    # 2) a SECOND #37 — agnsh must have come back intact from the first wait.
+    segw2 = run_wait("bnrmr OS > /r37b", "[ASSIST]", timeout=30)
+    segc2 = run_wait("owl -p /r37b", "[ASSIST]", timeout=20)
+    art2 = art(segc2, "owl -p /r37b"); rendered2 = art2 >= 8
+    prompt_back2 = "[ASSIST]" in after(segw2, "bnrmr OS > /r37b") and "[ASSIST]" in after(segc2, "owl -p /r37b")
+    # 3) agnsh still answers — `version` prints the STAGED binary's version string.
+    ver_seg = run_wait("version", STAGED_VER if STAGED_VER else "agnoshi", timeout=20)
+    ver_live = bool(STAGED_VER) and STAGED_VER in after(ver_seg, "version")
 
-    # 2) SECOND execwait#37 — proves ew37 save/restore survived the first resume cleanly.
-    seg2 = run_wait("run /bin/bnrmr OS\n", "[ASSIST]", timeout=30)
-    art2 = sum(seg2.count(c) for c in "#_|/\\")
-    rendered2 = art2 >= 8
-    prompt_back2 = seg2.count("[ASSIST]") >= 1
-
-    # 3) agnsh's resume context intact AFTER both #37s — version prints a fresh "agnoshi 1.7.0".
-    ver_seg = run_wait("version\n", "agnoshi 1.7.0", timeout=20)
-    ver_live = "agnoshi 1.7.0" in ver_seg
-
-    p("=========== run /bin/bnrmr AGNOS segment ==========="); p(seg1 if seg1.strip() else "(empty)")
-    p("=========== run /bin/bnrmr OS segment ==========="); p(seg2 if seg2.strip() else "(empty)")
-    p("=========== version segment ==========="); p(ver_seg if ver_seg.strip() else "(empty)")
+    for title, seg in (("bnrmr AGNOS > /r37a", segw1), ("owl -p /r37a", segc1), ("bnrmr OS > /r37b", segw2),
+                       ("owl -p /r37b", segc2), ("version", ver_seg)):
+        p(f"=========== {title} segment ==========="); p(seg if seg.strip() else "(empty)")
     p("==========================================")
-    # NOTE: HMP `sendkey` to usb-kbd drops a keystroke intermittently on the longer `run /bin/bnrmr X`
-    # lines (one of the two commands per run typically loses one char → that #37 launches the wrong path
-    # name and agnsh cleanly reports "failed to launch"). That is a TEST-HARNESS input flake, NOT a kernel
-    # fault — both runs exercise the SAME per-CPU ew37 path, so ONE clean render is conclusive proof, and
-    # a failed-launch attempt still validates the ew37 error-path restore (prompt returns). PASS therefore
-    # requires: >=1 of the two #37s rendered + BOTH prompts returned (agnsh survived both #37 attempts) +
-    # version works after (resume context fully intact).
     # -d int exception census: count CPU exception vectors (v=00..1f) in the QEMU int log. The
     # SMP-fault signatures STEP-2 must produce ZERO of: #UD(06) #DF(08) #TS(0a) #NP(0b) #SS(0c)
     # #GP(0d) #PF(0e). (IRQs are v=20+, not counted.) A clean -smp 4 boot+#37s = 0 of these.
@@ -211,35 +234,32 @@ try:
             dint_ok = True
             dint_report = f"0 SMP-fault exceptions in {len(vecs)} v= records"
 
-    rendered_any = rendered1 or rendered2
-    # agnsh's resume context is proven intact by EITHER `version` working after the #37s OR by the
-    # 2nd #37 rendering — launching a 2nd execwait#37 REQUIRES the 1st #37's ew37 save/restore to have
-    # resumed agnsh cleanly, so two renders is itself proof (and robust to the `version` keystroke flake).
-    resume_intact = ver_live or (rendered1 and rendered2)
     p("-d int SMP-fault exception census:", dint_report)
-    p("1st execwait#37 rendered (art chars):", rendered1, f"({art1})")
-    p("   ... prompt returned after it:", prompt_back1)
-    p("2nd execwait#37 rendered (art chars):", rendered2, f"({art2})")
-    p("   ... prompt returned after it:", prompt_back2)
-    p(">=1 #37 rendered (ew37 success path):", rendered_any)
-    p("agnsh survived both #37 attempts (prompts returned):", prompt_back1 and prompt_back2)
-    # prompt-return is tolerant of the USB-kbd HMP-sendkey keystroke loss that mangles ~one command's
-    # input per run under slow TCG: a single returned prompt + a render + resume-intact already proves
-    # the #37→resume path (you cannot type/launch the next command without a returned prompt).
-    prompt_ok = prompt_back1 or prompt_back2
-    p("agnsh resume intact post-#37 (version works OR 2 renders):", resume_intact, f"(version={ver_live})")
+    p("staged agnsh version:", STAGED_VER or "(none found in build/rootfs/bin/agnsh)")
+    p("1st #37 capture read back by owl -p (art chars):", rendered1, f"({art1})")
+    p("2nd #37 capture read back by owl -p (art chars):", rendered2, f"({art2})")
+    p("prompts returned after both #37s and both read-backs:", prompt_back1 and prompt_back2)
+    p("version prints the staged version after the #37s:", ver_live)
+    wit = "execwait: first scheduled child" in ser()
+    wit_req = os.environ.get("RUN37_WITNESS", "required") != "optional"
+    p("kernel witness 'execwait: first scheduled child' (the scheduled #37 route):", wit,
+      "" if wit_req else "(OPTIONAL for this run — a pre-conversion kernel has no such line; scored on the rest)")
+    wit_ok = wit or not wit_req
     # ⛔ 1.57.6 (S3-fix): the kernel's LATCHED invariant lines (scripts/smoke/lib/qemu-dwell.sh SMOKE_INVARIANT_DENY —
-    # keep the two patterns identical) print once to klug + COM1 and change nothing else, so this harness scored PASS
+    # loaded below through _invdeny.py since 1.57.7, never copied) print once to klug + COM1 and change nothing else, so this harness scored PASS
     # with them firing until it grepped for them.
     import re as _re_inv
-    INV_DENY = r"sched: refused non-ready pick|sched: exec_and_wait entered with|sched: kernel_resume with|syscall: kernel stack is not the caller|PANIC: Double Fault"
+    # 1.57.7 (S3d): loaded from scripts/smoke/lib/qemu-dwell.sh through _invdeny.py — no pasted copy left to drift.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from _invdeny import smoke_invariant_deny
+    INV_DENY = smoke_invariant_deny()
     inv_hits = [ln for ln in ser().splitlines() if _re_inv.search(INV_DENY, ln)]
     inv_ok = not inv_hits
     p("no latched kernel invariant line:", inv_ok, ("" if inv_ok else " -- " + " | ".join(inv_hits[:5])))
-    if rendered_any and prompt_ok and resume_intact and dint_ok and inv_ok:
+    if rendered1 and rendered2 and prompt_back1 and prompt_back2 and ver_live and wit_ok and dint_ok and inv_ok:
         # ⚠ the census verdict goes onto the PASS line VERBATIM (it was the fixed literal "0 SMP-fault
         # exceptions" until 1.56.58) so the record count that earned it travels with the claim.
-        p("run37-smp4-test: PASS — foreground execwait#37 rendered + agnsh resumed intact across two #37s (per-CPU ew37 OK)" + (f" + {dint_report} (-d int)" if DINT else ""))
+        p("run37-smp4-test: PASS — two redirected foreground execwait#37s captured into their files and agnsh answered after both" + ("" if wit else " (witness optional: pre-conversion kernel)") + (f" + {dint_report} (-d int)" if DINT else ""))
         rc = 0
     else:
         p("run37-smp4-test: FAIL")

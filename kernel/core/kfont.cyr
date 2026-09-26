@@ -55,9 +55,10 @@
 # ⭐ 1.57.3 — RESOLVED BY RELOCATION, NOT BY MARGIN: the AP windows now live in region 7 (phys
 # [0xFD0000, 0x1000000), direct-map VAs — gdt.cyr tss_get_cpu_stack carries the map, smp.cyr's
 # trampoline computes the same VA), which pmm_init reserves and the image can never reach. The
-# image's ONLY remaining region-1 neighbour is the BSP boot stack (top 0x380000, boot_shim.cyr),
-# so the fit check that matters is LOAD end <= 0x370000 — that stack's 64 KB budget — and
-# scripts/check/image-layout-check.sh (check.sh gate) hard-fails anything above it. The 1.57.2
+# image's ONLY remaining region-1 neighbour is the BSP boot stack (top 0x3A0000, boot_shim.cyr;
+# 0x380000 until 1.57.7), so the fit check that matters is LOAD end <= 0x390000 (0x370000 until
+# 1.57.7) — that stack's 64 KB budget — and scripts/check/image-layout-check.sh (check.sh gate 34,
+# and scripts/build.sh on every flag build) hard-fails anything above it. The 1.57.2
 # "do not add a reader of rekha_face_default_chunk" rule is RETIRED with the overlap: the
 # literals are ordinary .rodata again, and the SMP_STACK_SELFTEST re-hashes them in place after
 # the AP wake precisely to prove nothing is stacked on them any more. History:

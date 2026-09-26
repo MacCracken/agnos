@@ -2,7 +2,8 @@
 
 # 1.41.4: load + run the userland shell /bin/agnsh from the ext2 rootfs in
 # ring 3. Mirrors the shell's `run` verb (sh_cmd_run): elf_load_from_file →
-# exec_and_wait → read exit code → reap. argv[0] = "/bin/agnsh" (no args).
+# kernel_exec_foreground (1.57.7: a scheduled child kmain waits for; reaped inside) → the exit code.
+# argv[0] = "/bin/agnsh" (no args).
 # Returns agnsh's exit code (>=0) if it ran, or -1 if it couldn't be launched
 # (no rootfs / missing / not an ELF). The path is absolute so no sh_abspath
 # is needed.
@@ -31,65 +32,13 @@ fn kybernet_exec_agnsh() {
     var pid = elf_load_from_file("/bin/agnsh", 10, "/bin/agnsh", 10);
     preempt_enable();
     if (pid < 0) { return 0 - 1; }
-    var ep = &proc_table + pid * 176;
-    var e = load64(ep + 24);      # entry
-    var r = load64(ep + 16);      # rsp
-    var c = load64(ep + 160);     # cr3
-    # 1.46.8 (#2, pre-burn review): CLI before making agnsh the current proc. kybernet (proc 0) runs
-    # IF=1-preemptibly, so without this a BSP timer tick in the proc_current_set..exec_and_wait gap
-    # would run do_context_switch with old==agnsh (state==3, NOT YET pinned — exec_and_wait sets the
-    # idle_owner pin) → sched.cyr:348 flips agnsh state 3→1 + on_cpu=-1, and a woken AP's sched_next
-    # then STEALS the half-set-up agnsh (proc_cs still 0x08) and runs kybernet's gap continuation on
-    # the AP. The #37 path is immune because the whole #37 handler runs IF=0; this makes the kernel
-    # launch path do the same. enter_ring3's iretq restores IF=1 for agnsh (rflags_start=0x202), so
-    # agnsh still runs PREEMPTIBLE — only the setup gap is masked. (No sti needed on the post-exit
-    # path: kernel_resume already returns here IF=0 from the exit#0 handler.)
-    # ⭐ 1.57.6 (Path 2, S3.3): kbd_irq_save instead of the bare cli — the same mask, plus the caller's IF comes
-    # back after the reap (kybernet continues IF=1, as it entered; the S3.2 preempt-disabling locks are what
-    # make its console prints safe to preempt).
-    var rf = kbd_irq_save();
-    proc_current_set(pid);
-    # 1.46.x BITE 2 — RE-ENABLE preemptive agnsh (IF=1) on the per-proc RSP0 foundation (bite 1).
-    # HISTORY: 1.44.14 launched agnsh IF=1 so the timer time-slices its prompt against #43 background
-    # jobs. That froze archaemenid at the banner (burn 1442x: .22 banner-then-freeze, .23 freeze
-    # before the banner) because the first-ever CPL3->CPL0 timer tick took its ISR frame on the
-    # SHARED RSP0=0x3C0000 — which, at 1.44.23, sat in LIVE kernel .bss (the root cause) — so 1.44.23
-    # reverted to IF=0 cooperative (the iron-proven 14115/1439 model). BITE 1 (1.46.x) moved RSP0
-    # PER-PROC into region 7 (14-16 MB, clear of .bss AND mapped supervisor under the boot CR3 +
-    # every per-proc CR3), so agnsh's first timer tick now lands on agnsh's OWN stack — the
-    # hypothesized fix for the banner freeze. exec_preempt=1 makes THIS launch IF=1 (enter_ring3
-    # consumes the flag, so ONLY agnsh's launch is preemptive; foreground execwait#37 / `run /bin/X`
-    # stay IF=0). IRON-PENDING: QEMU can't reproduce the Zen freeze, so the next burn is the real
-    # test — boot-to-shell + multi-command + a live `&` background job on real Zen.
-    #
-    # 2026-06-25 SHIP DECISION (user: "Both — ship + diagnose"): the 1.46.1/1.46.2 IF=1 burns BOTH
-    # #GP'd at the timer-ISR iretq right after the agnsh banner (errcode 0x18 = user SS / GDT[3]).
-    # Root-caused (two independent diagnosis workflows) to a TORN LIVE iretq frame on the first
-    # cross-CR3 CPL0->CPL3 ISR resume on real Zen — the proc_cs/proc_ss ARRAY guard
-    # (sched_fix_torn_selector) is blind to it, so the 1.46.2 fix never fired (no 0x59=0x7C stamp).
-    # SMP wake itself WORKS on iron (`cpus online: 4`). To unblock boot-to-shell NOW we launch agnsh
-    # IF=0 cooperative — the iron-proven 14115/1439 model that dodges the inter-privilege ISR iretq
-    # entirely (resumes go through sysret, register-only). The IF=1 hardening track lives in
-    # sched_fix_live_frame (sched.cyr): flip this back to 1 for a DIAGNOSTIC burn and the live-frame
-    # stamp (CMOS 0x63-0x65) disambiguates a cross-CR3 frame-tear (repairable) from a hardware
-    # rejection of a valid frame ([[project_agnsh_if1_preempt_iron_blocker]]). See state.md 1.46.x.
-    #
-    # 2026-06-26 — SUPERSEDES the IF=0 stopgap above (which was NEVER user-authorized; the user
-    # repeatedly DENIED the IF=0 fallback). A 16-agent root-cause workflow resolved the ambiguity
-    # DECISIVELY to the repairable (a): the decoded fault frame is CS=0x08 + SS=0x1B (a TORN pair),
-    # not a valid (0x23,0x1B) one — so "hardware rejects a valid frame" (b) is refuted by the very
-    # datum it relied on. The cure is sched_fix_live_frame (sched.cyr): it runs AFTER cr3_load, under
-    # the SAME CR3 the iretq uses, and force-writes the consistent (CS,SS) pair into the exact frame
-    # bytes the iretq loads, with nothing between it and the return -> store-to-load forwarding makes
-    # it correct by construction. That cure has been in the binary since 1.46.3 but was NEVER burned
-    # at IF=1. This flip runs the STEP-1-at-IF=1 burn that confirms it (smp_sched_aps stays 0; the
-    # same cure covers STEP-2 since it lives in the shared do_context_switch path).
-    exec_preempt_set(1);   # IF=1 PREEMPTIVE agnsh — load-bearing cure active (sched_fix_live_frame). Revert to 0 only for the IF=0 stopgap.
-    exec_and_wait(e, r, c);
-    var code = proc_get_exit_code(pid);
-    proc_reap(pid);
-    kbd_irq_restore(rf);
-    return code;
+    # ⭐ 1.57.7 (S3b) — /bin/agnsh is a SCHEDULED, BSP-pinned child of kmain, and kmain BLOCKS until it exits
+    # (kernel_exec_foreground -> kernel_run_child; docs/architecture/foreground-exec.md). Its first CPL3 entry goes
+    # through the scheduler's switch tail (sched_leave_old: sched_fix_live_frame, kstack_install, fpu_set_ts; CMOS CP
+    # 0x20 at READY, then 0x21 at that first dispatch) — no longer enter_ring3's out-of-band iretq with the
+    # exec_preempt IF=1 arm (the 1.44.14 → 1.46.x history of that arm is in git and in foreground-exec.md). In a
+    # KTEST build kybernet runs before the scheduler, so the boot branch runs agnsh IF=0 like any pre-scheduler child.
+    return kernel_exec_foreground(pid, 0);
 }
 
 fn kybernet() {
@@ -110,12 +59,7 @@ fn kybernet() {
     if (ext2_active != 0) {
         var nstp = elf_load_from_file("/bin/dig", 8, "/bin/dig @10.0.2.3 example.com", 30);
         if (nstp >= 0) {
-            var nste = &proc_table + nstp * 176;
-            var nrf = kbd_irq_save();   # 1.46.8 (#2) + 1.57.6: mask the unpinned setup gap; IF back after the reap
-            proc_current_set(nstp);
-            exec_and_wait(load64(nste + 24), load64(nste + 16), load64(nste + 160));
-            proc_reap(nstp);
-            kbd_irq_restore(nrf);
+            kernel_exec_foreground(nstp, 0);   # 1.57.7 (S3b): a scheduled child kmain waits for (reaped inside)
             kprintln("kybernet: NET_SELFTEST dig done", 31);
         } else {
             kprintln("kybernet: NET_SELFTEST dig load FAIL", 36);

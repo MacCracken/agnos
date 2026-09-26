@@ -23,12 +23,14 @@
 #                               host has working DNS.
 #
 # Requires: qemu-system-x86_64, OVMF firmware, mtools (mformat/mmd/mcopy),
-# parted, gnoboot built. Exit 0 if both gates pass; 1 otherwise.
+# parted, gnoboot built. Exit 0 if every gate passes; 1 otherwise; 2 = VOID (the firmware never handed off
+# in QEMU_TRIES attempts — the kernel never ran; 1.57.7 HAR).
 
 set -u
 
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"     # qemu_dwell_kernel, qemu_assert_booted, SMOKE_INVARIANT_DENY
 GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
 
 # --- OVMF discovery (same as ext2-smoke.sh / tcp-listen-smoke.sh) ----------
@@ -69,7 +71,7 @@ AGNOS="$ROOT/build/agnos"
 
 # Verify the kernel was built with DNS_SELFTEST — grep for a literal only the
 # selftest hook emits.
-if ! strings "$AGNOS" | grep -q "dns: parse PASS"; then
+if ! strings "$AGNOS" | grep -qa "dns: parse PASS"; then
     echo "ERROR: kernel was not built with DNS_SELFTEST=1" >&2
     echo "       rebuild: DNS_SELFTEST=1 sh scripts/build.sh" >&2
     exit 1
@@ -106,7 +108,7 @@ echo "  OVMF code: $OVMF_CODE"
 echo "  log dir:   $LOGS"
 echo ""
 
-QEMU_TIMEOUT="${QEMU_TIMEOUT:-30}"
+QEMU_TIMEOUT="${QEMU_TIMEOUT:-90}"
 LOG="$LOGS/dns.log"
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"
 chmod +w "$WORK/vars.fd"
@@ -114,7 +116,11 @@ chmod +w "$WORK/vars.fd"
 # SLIRP user-mode networking: built-in DHCP (10.0.2.15 / gw 10.0.2.2 / dns
 # 10.0.2.3) + DNS forwarding to the host resolver. virtio-net-pci is the
 # modern path the kernel drives in QEMU (r8169 is iron-only).
-timeout "$QEMU_TIMEOUT" qemu-system-x86_64 \
+# 1.57.7 (HAR): banner-gated retry (qemu_dwell_kernel) — a firmware hand-off that never happened is retried
+# and, if it never happens, scored VOID (exit 2) instead of a wall of FAILs against an empty log. The dwell ends
+# on `dns: live` (the selftest's last line), so the budget below is a ceiling, not a wait.
+qemu_dwell_kernel "$LOG" "dns: live" "$QEMU_TIMEOUT" "$WORK/vars.fd" "$OVMF_VARS_SRC" \
+    qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
@@ -122,16 +128,21 @@ timeout "$QEMU_TIMEOUT" qemu-system-x86_64 \
     -device "nvme,drive=esp0,serial=AGNOS-SMOKE" \
     -netdev "user,id=u1" \
     -device "virtio-net-pci,netdev=u1" \
-    -serial stdio -display none -no-reboot 2>/dev/null > "$LOG"
+    -serial stdio -display none -no-reboot
+if ! qemu_assert_booted "$LOG"; then
+    echo ""
+    echo "=== dns-smoke: VOID (the kernel never executed) ==="
+    exit 2
+fi
 
 echo "--- serial log (DNS lines) ---"
-grep -E "dhcp: ACK|dns:" "$LOG" || echo "(no dhcp/dns lines captured)"
+grep -aE "dhcp: ACK|dns:" "$LOG" || echo "(no dhcp/dns lines captured)"
 echo "------------------------------"
 
 pass=0
 fail=0
 
-if grep -q "dns: parse PASS" "$LOG"; then
+if grep -qa "dns: parse PASS" "$LOG"; then
     echo "PASS: hermetic RFC 1035 parse (compression-pointer answer -> 93.184.216.34)"
     pass=$((pass + 1))
 else
@@ -139,7 +150,7 @@ else
     fail=$((fail + 1))
 fi
 
-if grep -q "dns: cache PASS" "$LOG"; then
+if grep -qa "dns: cache PASS" "$LOG"; then
     echo "PASS: TTL extraction + positive cache (put/find hit, miss, expiry gate)"
     pass=$((pass + 1))
 else
@@ -147,7 +158,7 @@ else
     fail=$((fail + 1))
 fi
 
-if grep -q "dns: resolver=10.0.2.3" "$LOG"; then
+if grep -qa "dns: resolver=10.0.2.3" "$LOG"; then
     echo "PASS: DHCP option 6 captured (resolver=10.0.2.3)"
     pass=$((pass + 1))
 else
@@ -156,9 +167,19 @@ else
     fail=$((fail + 1))
 fi
 
+# 1.57.7 (HAR): the shared latched-invariant deny — those lines never fail an exit code, so a gate that does not
+# grep for them scores PASS while they fire.
+if grep -qaE "$SMOKE_INVARIANT_DENY" "$LOG"; then
+    echo "FAIL: a latched kernel invariant fired:"; grep -aE "$SMOKE_INVARIANT_DENY" "$LOG" | head -3 | sed 's/^/        /'
+    fail=$((fail + 1))
+else
+    echo "PASS: no latched kernel invariant"
+    pass=$((pass + 1))
+fi
+
 # Informational only — does not affect exit status.
-if grep -q "dns: live=" "$LOG"; then
-    echo "INFO: live lookup succeeded — $(grep -m1 'dns: live=' "$LOG")"
+if grep -qa "dns: live=" "$LOG"; then
+    echo "INFO: live lookup succeeded — $(grep -am1 'dns: live=' "$LOG")"
 else
     echo "INFO: live lookup skipped/failed (host DNS unavailable — not required)"
 fi

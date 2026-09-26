@@ -18,6 +18,7 @@
 # Requires: qemu-system-x86_64, OVMF, mtools, parted, gnoboot built.
 
 set -u
+. "$(cd "$(dirname "$0")" && pwd)/lib/qemu-dwell.sh"   # qemu_attempt_verdict (1.57.7 IMG-fix)
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
@@ -79,8 +80,9 @@ boot_once() {   # $1 = extra qemu args (e.g. "-smp 4"), $2 = log path
             -drive "file=$ESP,format=raw,if=none,id=esp0" \
             -device "nvme,drive=esp0,serial=AGNOS-SMOKE" \
             -serial stdio -display none -no-reboot 2>/dev/null > "$2"
-        if strings "$2" 2>/dev/null | grep -q "AGNOS kernel v"; then return 0; fi
-        echo "  (firmware never handed off — kernel did not start; retrying $_bo_i)"
+        # 1.57.7 (IMG-fix, A2): classified — a pre-banner kernel death FAILS (exit 1); a VOID keeps its log.
+        if qemu_attempt_verdict "$2" "$_bo_i"; then return 0; fi
+        echo "  (retrying $_bo_i)"
         _bo_i=$((_bo_i + 1))
     done
     echo "  UEFI never handed off to the kernel in ${QEMU_TRIES:-6} attempts — INFRASTRUCTURE, not the kernel."

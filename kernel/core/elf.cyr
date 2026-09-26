@@ -13,6 +13,7 @@
 # Two CPUs in elf_load_from_file at once (#37 on the BSP + #43 on an AP) would let CPU B's header read
 # overwrite the phdrs CPU A is still parsing (TOCTOU on the segment bounds). Per-CPU: 512 u64 (4 KB) per
 # CPU × 4; cpu c at byte c*4096. pcpu_cpu() cpu_count<2 fast path = single-core byte-identical.
+# R4/R6 (1.57.7): never add a wq_* call inside this buffer's live span (per-CPU scratch — docs/architecture/blocking-waits.md R4).
 var pcpu_elf_hdr_buf[2048];
 fn elf_hdr_buf_base() { return &pcpu_elf_hdr_buf + pcpu_cpu() * 4096; }
 
@@ -72,6 +73,73 @@ fn elf_bail(cr3) {
 fn elf_bail_code(cr3, e) {
     proc_free_address_space(cr3);
     return 0 - e;
+}
+
+# ⭐ 1.57.7 (S8) — THE LOADERS' PRE-PASS. The number of DISTINCT 2 MB pages the PT_LOADs map (the mapping loop's own
+# formula: [vaddr & ~2MB, roundup(vaddr + memsz)) per segment), or -1 when two PT_LOADs share a page. The mapping loop
+# stores each page's PDE BLINDLY, so a shared page orphaned the first segment's frame — 2 MB leaked per spawn, from
+# ring 3 with a crafted ELF on ext2, and invisible to any cap. Mapping the page once with the union of the permissions
+# is excluded: text+data in one page would be W+X, which the loaders refuse (1.57.2). Runs after the validation
+# pre-pass, so every PT_LOAD lies in [0x400000, 0x10000000): page index < 128. Pure.
+fn elf_load_pages(ph0, phnum, phentsize) {
+    var em[16];                    # 16 BYTES = two u64: bit (pg >> 21), pages 0..127
+    store64(&em, 0);
+    store64(&em + 8, 0);
+    var en = 0;
+    var ei = 0;
+    while (ei < phnum) {
+        var eph = ph0 + ei * phentsize;
+        if (load32(eph) == 1) {
+            var ev = load64(eph + 16);
+            var epg = ev & 0xFFFFFFFFFFE00000;
+            var ee = (ev + load64(eph + 40) + 0x1FFFFF) & 0xFFFFFFFFFFE00000;
+            while (epg < ee) {
+                var ew = &em + ((epg >> 27) & 1) * 8;
+                var eb = 1 << ((epg >> 21) & 63);
+                if ((load64(ew) & eb) != 0) { return 0 - 1; }   # an EARLIER segment holds this page
+                store64(ew, load64(ew) | eb);
+                en = en + 1;
+                epg = epg + 0x200000;
+            }
+        }
+        ei = ei + 1;
+    }
+    return en;
+}
+# 1 when an image of `n` distinct pages (+1: the user stack; the guard page is unmapped) does not fit the effective
+# memory cap of the CURRENT proc's next child (lim_child_mem: the creator is the spawner, P is current at load, and
+# this runs inside the syscall / elf_load_from_file's preempt bracket). After a successful load the child's
+# footprint is exactly (n + 1) * 512.
+fn elf_cap_refuses(n) {
+    var cr_cap = lim_child_mem(proc_current_get());
+    if (cr_cap == 0) { return 0; }
+    if ((n + 1) * 512 <= cr_cap) { return 0; }
+    lim_klug_refused((n + 1) * 512, cr_cap);
+    return 1;
+}
+# The memory-cap refusal lines, each appended inside ONE klug_lock hold (lifecycle_trace's discipline, S7), units
+# 4 KiB pages:  `limits: memcap refused load pid=0x<creator> need=0x<need> cap=0x<cap>`  and (latched once per boot)
+# `limits: memcap refused mmap pid=0x<p> cap=0x<c> (first per boot)`.
+fn lim_klug(what, pid, need, cap) {
+    var lk_t = klug_lock_acquire();
+    klug_append_raw("limits: memcap refused ", 23);
+    lt_put(what);
+    lt_put(" pid=0x");
+    lt_hex(pid);
+    if (need != 0) { lt_put(" need=0x"); lt_hex(need); }
+    lt_put(" cap=0x");
+    lt_hex(cap);
+    if (need == 0) { lt_put(" (first per boot)"); }
+    klug_putc_raw(10);
+    klug_lock_release(lk_t);
+    return 0;
+}
+fn lim_klug_refused(need, cap) { return lim_klug("load", proc_current_get(), need, cap); }
+var lim_mmap_latched = 0;
+fn lim_mmap_refused_once(pid, cap) {
+    if (lim_mmap_latched != 0) { return 0; }
+    lim_mmap_latched = 1;
+    return lim_klug("mmap", pid, 0, cap);
 }
 
 fn elf_load(elf_addr, elf_size) {
@@ -139,6 +207,11 @@ fn elf_load(elf_addr, elf_size) {
             if (v_vaddr + v_memsz > 0x10000000) { return 0 - 1; }
         }
     }
+
+    # 1.57.7 (S8): the overlap refusal and the memory cap, before anything is allocated (see elf_load_pages).
+    var ld_n = elf_load_pages(elf_addr + phoff, phnum, phentsize);
+    if (ld_n < 0) { return 0 - 1; }
+    if (elf_cap_refuses(ld_n) != 0) { return 0 - 1; }
 
     # Create per-process address space
     var new_cr3 = proc_create_address_space();
@@ -309,6 +382,7 @@ fn elf_load(elf_addr, elf_size) {
     # PT_LOAD page plus the 2 MB user stack plus the three table pages — was simply dropped: no pid
     # ever referenced it, so no reap can ever reclaim it. That is the cheapest form of the leak,
     # needing no crafted binary at all: fill the table with spinning children, then loop spawn.
+    # 1.57.7 (S7): also a creator with a pending kill (proc_birth_check) — the dying caller never observes the -1.
     if (new_pid < 0) { proc_free_address_space(new_cr3); return new_pid; }
     if (new_pid >= 0) {
         proc_set_cr3(new_pid, new_cr3);
@@ -348,9 +422,11 @@ fn elf_load(elf_addr, elf_size) {
 # smp_sched_aps=1 two CPUs in #37/#43 concurrently would clobber the shared pair (CPU A's loader reads
 # CPU B's env / CPU B's child loses env); the buffers they point to (ew37_env/spawn_env_buf) are already
 # per-CPU (1.46.7), so these pointer globals must be too. pcpu_cpu() cpu_count<2 fast path = single-core identical.
+# R4/R6 (1.57.7): never add a wq_* call inside this buffer's live span (per-CPU scratch — docs/architecture/blocking-waits.md R4).
 var pcpu_exec_env_src[4];
 fn exec_env_src_set(v) { store64(&pcpu_exec_env_src + pcpu_cpu() * 8, v); return 0; }
 fn exec_env_src_get() { return load64(&pcpu_exec_env_src + pcpu_cpu() * 8); }
+# R4/R6 (1.57.7): never add a wq_* call inside this buffer's live span (per-CPU scratch — docs/architecture/blocking-waits.md R4).
 var pcpu_exec_env_len[4];
 fn exec_env_len_set(v) { store64(&pcpu_exec_env_len + pcpu_cpu() * 8, v); return 0; }
 fn exec_env_len_get() { return load64(&pcpu_exec_env_len + pcpu_cpu() * 8); }
@@ -455,6 +531,10 @@ fn elf_load_from_file_body(path, namelen, argv_src, argv_len) {
         }
     }
 
+    # 1.57.7 (S8): two PT_LOADs sharing a 2 MB page -> NOEXEC; an image over the effective memory cap -> LIMIT.
+    var ld_n = elf_load_pages(hdr + phoff, phnum, phentsize);
+    if (ld_n < 0) { return 0 - SPAWN_E_NOEXEC; }
+    if (elf_cap_refuses(ld_n) != 0) { return 0 - SPAWN_E_LIMIT; }
     var new_cr3 = proc_create_address_space();
     if (new_cr3 == 0) { return 0 - SPAWN_E_NOMEM; }
 
@@ -713,8 +793,9 @@ fn elf_load_from_file_body(path, namelen, argv_src, argv_len) {
     var new_pid = proc_create_user(entry, stack_top);
     # ⛔ 1.56.52 — see the matching note in elf_load: a full process table made this drop the whole
     # populated address space with no pid to reap it. stack_canary_check still runs on the way out.
-    # ⛔ proc_create_user's only failure is proc_alloc_slot's full 16-slot table -> NOPROC (-2, the WOULD_BLOCK
-    # value: the same call may succeed once a slot is reaped).
+    # ⛔ proc_create_user's failures: proc_alloc_slot's full 16-slot table -> NOPROC (-2, the WOULD_BLOCK value: the
+    # same call may succeed once a slot is reaped), and (1.57.7 S7) a creator with a PENDING KILL, which may create no
+    # child — it also reads NOPROC here, but the dying caller never observes it (it ends at its syscall exit).
     if (new_pid < 0) { proc_free_address_space(new_cr3); stack_canary_check(canary); return 0 - SPAWN_E_NOPROC; }
     if (new_pid >= 0) {
         proc_set_cr3(new_pid, new_cr3);

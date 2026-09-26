@@ -98,12 +98,34 @@ var vnet_mac[8];            # 6-byte device MAC (read from DEVICE_CFG)
 var vnet_active = 0;        # 1 after init completes
 
 # Per-frame DMA buffers (identity-mapped via BSS; module-global = N×u64).
-# vnet_tx_buf:  12-byte virtio-net header + 1500-byte MTU + slack = 1536 B
-# vnet_rx_buf:  same shape, 16 buffers worth (one per RX descriptor slot)
+# vnet_rx_buf:  12-byte virtio-net header + 1500-byte MTU + slack = 1536 B per slot, 16 slots
+#               (one per RX descriptor). TX uses pmm slot buffers since 1.57.7 (vnet_tx_bufs below).
 # Modern uses 12-byte hdr (struct virtio_net_hdr_mrg_rxbuf) even when
 # MRG_RXBUF is not negotiated — § 5.1.6.1.
-var vnet_tx_buf[192];       # 1536 B
 var vnet_rx_buf[3072];      # 24576 B (16 × 1536 B per-RX-descriptor)
+# 1.57.7 (S4, N-1) — ONE TX BUFFER PER TX DESCRIPTOR. Until 1.57.7 every TX descriptor pointed at a single
+# `vnet_tx_buf[192]`; QEMU consumes TX in a bottom half, so a second send overwrote frame 1 before the device
+# read it (frame 1 lost, frame 2 sent twice) — on one CPU, no race needed: a data segment then a FIN, or a
+# SYN-ACK and an ARP reply out of one drain. Now: vnet_tx_slots (16, or 32 when the TX queue has >= 32
+# entries; a power of two) 2048-byte halves of pmm pages, their PHYS in vnet_tx_bufs[] (descriptor address
+# field), CPU access through net_dma_kva.
+var vnet_tx_bufs[32];       # phys of each 2048-byte TX slot buffer
+var vnet_tx_slots = 16;
+var vnet_tx_full = 0;       # frames refused because every slot was in flight (diagnostic)
+var vnet_tx_full_said = 0;
+
+# net_dma_kva(phys) — THE CPU pointer for a pmm_alloc'd DMA page (1.57.7 S4, N-6). pmm_alloc draws from
+# [0x400000, 0xFFFF000], a window a ring-3 PT_LOAD can SHADOW under its own CR3 (heap.cyr's 1.56.51 slab
+# banner explains the class), and the ISR drain + ISR-time TX run under whatever CR3 is live. So every CPU
+# load/store whose address comes from a pmm page goes through the direct map. Device registers and descriptor
+# address FIELDS keep phys; .bss DMA buffers (vnet_rx_buf) are fine as they are (the kernel image is
+# identity-mapped in every CR3). A BOOTCR3_KEEP_GNOBOOT_CR3 build has no direct map in kmain's context.
+#ifdef BOOTCR3_KEEP_GNOBOOT_CR3
+fn net_dma_kva(ndk_phys) { return ndk_phys; }
+#endif
+#ifndef BOOTCR3_KEEP_GNOBOOT_CR3
+fn net_dma_kva(ndk_phys) { return pmm_kva_for_access(ndk_phys); }
+#endif
 
 # ---------------------------------------------------------------------
 # Cap-list scan (identical shape to vblk_scan_caps in virtio_blk.cyr)
@@ -253,13 +275,15 @@ fn vnet_setup_queue(q_idx, qsize_out, desc_out, avail_out, used_out, notify_out)
     if (p2 == 0) { return 0 - 1; }
     if (p3 == 0) { return 0 - 1; }
 
-    if (vmm_is_mapped(p1) == 0) { vmm_map(p1, p1, 0x83); }
-    if (vmm_is_mapped(p2) == 0) { vmm_map(p2, p2, 0x83); }
-    if (vmm_is_mapped(p3) == 0) { vmm_map(p3, p3, 0x83); }
-
-    for (var i = 0; i < 512; i = i + 1) { store64(p1 + i * 8, 0); }
-    for (var i = 0; i < 512; i = i + 1) { store64(p2 + i * 8, 0); }
-    for (var i = 0; i < 512; i = i + 1) { store64(p3 + i * 8, 0); }
+    # 1.57.7 (S4, N-6): the rings are addressed by the CPU through the DIRECT MAP (net_dma_kva); the device
+    # gets phys. The three identity `vmm_map(pN, pN, 0x83)` lines that stood here are gone (the heap.cyr
+    # 1.56.51 precedent: they wrote only the boot PD and were a no-op in practice).
+    var k1 = net_dma_kva(p1);
+    var k2 = net_dma_kva(p2);
+    var k3 = net_dma_kva(p3);
+    for (var i = 0; i < 512; i = i + 1) { store64(k1 + i * 8, 0); }
+    for (var i = 0; i < 512; i = i + 1) { store64(k2 + i * 8, 0); }
+    for (var i = 0; i < 512; i = i + 1) { store64(k3 + i * 8, 0); }
 
     store32(vnet_common_cfg + VNET_QUEUE_DESC_LO,   p1 & 0xFFFFFFFF);
     store32(vnet_common_cfg + VNET_QUEUE_DESC_HI,   (p1 >> 32) & 0xFFFFFFFF);
@@ -274,9 +298,9 @@ fn vnet_setup_queue(q_idx, qsize_out, desc_out, avail_out, used_out, notify_out)
     store16(vnet_common_cfg + VNET_QUEUE_ENABLE, 1);
 
     store64(qsize_out,  qsz);
-    store64(desc_out,   p1);
-    store64(avail_out,  p2);
-    store64(used_out,   p3);
+    store64(desc_out,   k1);        # CPU pointers: direct-map KVAs (1.57.7 S4)
+    store64(avail_out,  k2);
+    store64(used_out,   k3);
     store64(notify_out, notify_addr);
     return 0;
 }
@@ -389,6 +413,18 @@ fn virtio_net_init() {
         &vnet_tx_qsize, &vnet_tx_desc, &vnet_tx_avail, &vnet_tx_used,
         &vnet_txq_notify) < 0) { return 0 - 1; }
 
+    # 1.57.7 (S4, N-1): per-descriptor TX buffers — 2048-byte halves of pmm pages.
+    vnet_tx_slots = 16;
+    if (vnet_tx_qsize >= 32) { vnet_tx_slots = 32; }
+    var vts = 0;
+    while (vts < vnet_tx_slots) {
+        var vtp = pmm_alloc();
+        if (vtp == 0) { return 0 - 1; }
+        store64(&vnet_tx_bufs + vts * 8, vtp);
+        store64(&vnet_tx_bufs + (vts + 1) * 8, vtp + 2048);
+        vts = vts + 2;
+    }
+
     vnet_rx_prime();
 
     # 1.51.5 — enable RX MSI-X (→ IDT vector 0x50) so the device wakes a blocked hlt
@@ -409,32 +445,57 @@ fn virtio_net_init() {
 # Builds a 12-byte modern virtio-net header (all zeros for plain Ethernet
 # frames; flags=0, gso_type=0, hdr_len=0, gso_size=0, csum_start=0,
 # csum_offset=0, num_buffers=1 — § 5.1.6.1).
+#
+# 1.57.7 (S4): called ONLY under net_tx_lock (through nic_send). Each in-flight frame owns its own TX slot
+# buffer (N-1). Reclaim is by the used.idx COUNT and assumes in-order TX completion — QEMU's virtio-net and
+# every real device do this in practice; the spec does not guarantee it. A full ring refuses the frame
+# (-1; TCP's retransmit / the peer's recovers it) and latches one diagnostic line — NOT a deny pattern,
+# because a burst can legitimately fill the ring.
 fn virtio_net_send(buf, len) {
     if (vnet_active == 0) { return 0 - 1; }
-    if (len > 1500) { return 0 - 1; }
+    # ⛔ 1.57.7 (S6, D21): `len` is the whole Ethernet frame (14-byte header + up to the 1500-byte MTU = 1514; no
+    # FCS). The bound read `len > 1500` until 1.57.7 — the MTU, not the frame — so every full-MSS TCP segment (a
+    # 1460-byte payload = a 1514-byte frame) was DROPPED here and retransmitted into the same drop until the conn
+    # died: an agnos sender on virtio could never push a chunk larger than 1446 bytes (sock-wait-smoke N8 found it;
+    # the TX slot is 2048 bytes, so 12 + 1514 fits).
+    if (len > 1514) { return 0 - 1; }
     var hdr_len = 12;
+
+    var inflight = (vnet_tx_idx - load16(vnet_tx_used + 2)) & 0xFFFF;
+    if (inflight >= vnet_tx_slots) {
+        vnet_tx_full = vnet_tx_full + 1;
+        if (vnet_tx_full_said == 0) {
+            vnet_tx_full_said = 1;
+            klug_append("virtio-net: TX ring full - frame dropped", 40); klug_putc(10);
+            serial_println("virtio-net: TX ring full - frame dropped", 40);
+        }
+        return 0 - 1;
+    }
+    var s = vnet_tx_idx & (vnet_tx_slots - 1);
+    var tphys = load64(&vnet_tx_bufs + s * 8);
+    var tkva = net_dma_kva(tphys);
 
     # Zero the 12-byte header.
     for (var i = 0; i < hdr_len; i = i + 1) {
-        store8(&vnet_tx_buf + i, 0);
+        store8(tkva + i, 0);
     }
     # num_buffers field (le16 at offset 10) = 1 even without MRG_RXBUF.
-    store16(&vnet_tx_buf + 10, 1);
+    store16(tkva + 10, 1);
     # Copy the Ethernet frame after the header.
     for (var i = 0; i < len; i = i + 1) {
-        store8(&vnet_tx_buf + hdr_len + i, load8(buf + i));
+        store8(tkva + hdr_len + i, load8(buf + i));
     }
 
-    # Single TX descriptor — device-readable; no chain.
-    var slot = vnet_tx_idx % vnet_tx_qsize;
-    var desc_off = vnet_tx_desc + slot * 16;
-    store64(desc_off + 0,  &vnet_tx_buf);
+    # Single TX descriptor s — device-readable; no chain; addr = the slot's PHYS.
+    var desc_off = vnet_tx_desc + s * 16;
+    store64(desc_off + 0,  tphys);
     store32(desc_off + 8,  hdr_len + len);
     store16(desc_off + 12, 0);
     store16(desc_off + 14, 0);
 
-    # avail.ring[slot] = desc index = slot (1:1).
-    store16(vnet_tx_avail + 4 + slot * 2, slot);
+    # avail.ring[idx % qsize] = descriptor s.
+    var slot = vnet_tx_idx % vnet_tx_qsize;
+    store16(vnet_tx_avail + 4 + slot * 2, s);
 
     # WMB between slot write and avail.idx increment (§ 2.7.13.3.1).
     asm { 0x0F; 0xAE; 0xF0; }

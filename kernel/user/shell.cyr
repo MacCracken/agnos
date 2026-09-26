@@ -479,36 +479,17 @@ fn sh_cmd_run(arg, arglen) {
     if (sh_abspath(av, plen) < 0) { kprintln("run: bad path", 13); return 0; }
     var pid = elf_load_from_file(&sh_path_buf, sh_path_len, av, avlen);
     if (pid < 0) { kprintln("run: not an executable", 22); return 0; }
-    # 1.40.3 — wire ring-3 execution: enter the loaded program in ring 3 via
-    # exec_and_wait (saves the kernel return point; the program's exit() syscall
-    # resumes here), then report the exit code.
-    var ep = &proc_table + pid * 176;
-    var e = load64(ep + 24);
-    var r = load64(ep + 16);
-    var c = load64(ep + 160);
-    # 1.40.6: make this the current process so the program's exit() syscall
-    # (proc_set_exit_code(proc_current_get(), …)) records the code on THIS pid — without
-    # it, a second sequential `run` left proc_current_get() on the prior pid and the
-    # exit code came back 0.
-    # ⭐ 1.57.6 (Path 2, S3.3) — exec_and_wait IS ENTERED IF=0, AND THIS CALLER GETS ITS OWN IF BACK. The shell
-    # loop runs IF=1 (its idle wait is arch_wait), so a tick between proc_current_set(pid) and exec_and_wait's
-    # pin would save kmain's registers into the child's slot and revive it unpinned (kybernet's launch closed
-    # the same gap with a bare cli). And the restore after the reap is what the old code never did: `run`
-    # returned to the shell IF=0 (exit#0 enters with IF masked), and the shell's next arch_wait halted with
-    # interrupts off — forever (measured at 1.57.6 S1 with /bin/tscp).
-    var rf = kbd_irq_save();
-    proc_current_set(pid);
-    exec_and_wait(e, r, c);
+    # ⭐ 1.57.7 (S3b) — kernel_exec_foreground (ring3.cyr; an aarch64 stub): after `sched_active = 1` the program is an
+    # ORDINARY SCHEDULED CHILD (IF=1, BSP-pinned, accrues ticks, may yield/block/nest) and kmain BLOCKS until it
+    # exits (kernel_run_child: the INV-FG-2 fgwait cell keeps its slot until the status is read, then the reap);
+    # before it (the compile-gated boot selftest hooks) the out-of-band IF=0 run-to-completion path
+    # (kernel_exec_boot -> exec_and_wait), which also restores this caller's IF. Either way the child is reaped
+    # before this returns, so `run: exit N` now prints AFTER the reap (a KSTACK_HW reap line can precede it).
+    # docs/architecture/foreground-exec.md.
+    var rc = kernel_exec_foreground(pid, 0);
     kprint("run: exit ", 10);
-    kprint_num(proc_get_exit_code(pid));
+    kprint_num(rc);
     kprintln("", 0);
-    # 1.40.14: reap the exited process — free its address space (ELF + stack
-    # huge pages + the 3 page-table pages) and hand its proc_table slot back.
-    # Read the exit code FIRST (above) — proc_reap clears the slot. Without this
-    # every `run` permanently consumed 2 of the 6 usable 2 MB regions, so the
-    # 4th run failed with pmm_alloc_2mb exhaustion; now `run` is unbounded.
-    proc_reap(pid);
-    kbd_irq_restore(rf);
     return 0;
 }
 

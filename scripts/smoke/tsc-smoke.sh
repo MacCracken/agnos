@@ -14,6 +14,14 @@
 #     `run: exit 0` is the failure that cost two iron burns on the rung-10 gate;
 #   · gpu_tsc_per_us() / hda_tsc_per_us() report the calibrated value (accessor == calibration);
 #   · the boot goes ON past the probe to the shell (see THE IF=0 HANG below);
+#   · ⭐ 1.57.7 (S1b) — THE 100 Hz TICK AND THE LOG TIMEBASE ON THE PM TIMER. An early FADT probe (boot_info
+#     RSDP only, before apic_init) finds the PM timer (`acpi: early pm timer port N (boot_info RSDP)`, T1: equal
+#     to acpi_init's late decode, no `lapic: WARNING`); the LAPIC reload is measured against it (`lapic: 100 Hz
+#     reload measured against the acpi pm timer`, T2); in a HALTED window the tick tracks PM time — uptime_ms#40
+#     within 3% (T3) and the median tick period is 10 ms within 1% (T4); the klog timebase agrees within 1%
+#     (T5 strict everywhere, T8 the 1% band); the FADT decode is pure (`acpi-fadt:` 3 arms, T7); the lowest AP's
+#     tick is 10 ms within 3% (`ap-tickrate:`, T9, -smp > 1); uptime_ms#40 advances across a 200 ms IF=0
+#     busy window (B5, T10 — it is backed by the calibrated TSC). No latched invariant line fires.
 #   · statically: the old, wrong refusal text (`uptime_us will report 0` — the arm returns -1) is gone
 #     from the binary, and both corrected ones are present — the first attempt's (`one more attempt before
 #     userland`) and the final one's (`uptime_us#95 returns -1 for the rest of this boot`).
@@ -25,7 +33,11 @@
 # at 25%. The ACPI PM timer needs no interrupt delivery; a throttle only lengthens its window.
 #
 # MODES / KNOBS
-#   (default)          one boot, q35, KVM when /dev/kvm is usable, -smp 1.
+#   (default)          THE MATRIX (1.57.7 S1b): TSC_BOOTS (default "q35:1 q35:4 pc:1"), one fresh image +
+#                      vars + log (tsc-<machine>-<smp>.log) per boot, each scored; the one sweep row gates all.
+#                      -smp 1: `-enable-kvm -cpu host` when /dev/kvm is WRITABLE, else `-cpu max`;
+#                      -smp > 1: smoke_accel (KVM, else multi-threaded TCG). Each boot prints its `accel:` line.
+#   TSC_BOOTS="m:n ..." override the matrix.
 #   TSC_QUOTA=<pct>    THE daimon REPRODUCTION. Boot A unthrottled, then boot B with QEMU inside
 #                      `systemd-run --user --scope -p CPUQuota=<pct>%`. Requires systemd-run and a user
 #                      manager with the cpu controller delegated — it FAILS, never skips, without them.
@@ -36,9 +48,11 @@
 #                      In B the tick-oracle lines (gpu/hda arm D, ticks-tsc, the klog cross-check) are
 #                      INFO: their ORACLE is the lossy tick, and disturbing it is the point.
 #                      QEMU_TIMEOUT defaults to 900 here. Pair with DE_NO_KVM=1 for TCG, as reported.
-#   TSC_SMP=<n>        -smp n (default 1) — the pre-userland retry runs after the APs are woken.
-#   TSC_MACHINE=<m>    -machine m (default q35). `pc` (i440fx) exercises the FADT's LEGACY PM_TMR_BLK path.
-#   DE_NO_KVM=1        force TCG (-cpu max).
+#                      1.57.7: B is ALSO where the S1b fix is proven — T3/T4/T5 strict in B, and B's
+#                      `LAPIC: reload=` must be within 1% of A's (T6; the polled-PIT reload came out 2.2-2.8x).
+#   TSC_SMP=<n>        -smp n — with TSC_MACHINE (and no TSC_BOOTS): ONE legacy boot on ${TSC_MACHINE:-q35}
+#   TSC_MACHINE=<m>    -smp ${TSC_SMP:-1}. `pc` (i440fx) exercises the FADT's LEGACY PM_TMR_BLK path (b008).
+#   DE_NO_KVM=1        force TCG (-cpu max; -smp > 1: -accel tcg,thread=multi -cpu max).
 # Exit: 0 all PASS · 1 any FAIL · 2 VOID (UEFI never handed off, so nothing below describes the kernel).
 #
 # ⛔ 1.57.6 — THE IF=0 HANG THIS SMOKE NEVER SAW. /bin/tscp is the boot body's only post-`sti` foreground
@@ -81,6 +95,19 @@
 #   (e4) median_agree's sort skipped       -> only `pred-tsc: FAIL outlier moved the median ...`.
 #   (f) the `asm { sti; }` after the probe deleted -> the log ENDS at `run: exit 1`; only the
 #       "boot went ON" check RED (15/1), after the full 120 s dwell.
+#
+# ⭐ S1b MUTATION RECORD (1.57.7; each applied by hand with cyim, TSC_SELFTEST rebuilt, booted, restored byte-exact
+# against a sha256; KVM unless marked TCG). Healthy matrix: 75 passed, 0 failed — q35 early port 608, pc b008, reload
+# 9999754..10000098, median tick period 9999-10000 us, ap-tickrate cpu 1 100 ticks / 999 ms (-smp 4).
+# TSC_QUOTA=25 (TCG): 52/0, cpu.max `25000 100000`, reload A 10000236 / B 10000220, klog 3193 within 1% in both.
+#   M1  lapic_reload_100hz `if (pm_port != 0)` -> `if (0 == 1)`, TSC_QUOTA=25 (TCG): 43/8 — B reload 36252819 vs A
+#       10001009 (T6), B tick period 36252 us (T4/T3), B `klog: NO LOG TIMEBASE` (T5/T8), T2 in A and B, T8 in A (12%).
+#   M2  lapic_calibrate_pm returns `lc_mr * 2`, q35 -smp 4: 23/4 — tick period 20000 us (T4, T3), ticks-tsc DIFFERS,
+#       ap-tickrate cpu 1 100 ticks / 2000 ms (T9).
+#   M3  acpi_pm_early_probe returns 0 at its top: 24/3 — `found none`, the PIT source line (T1, T2), klog 12% (T8).
+#   M5b acpi_init's acpi_fadt_clear() removed: 26/1 — `acpi-fadt: FAIL acpi_init with no RSDP left a stale FADT field` (T7).
+#   M11 the #40 arm back to `return timer_ticks * 10;`: 25/2 — `#40 advanced 0 ms across a 200 ms IF=0 busy window` (T10, T3).
+#   Not run (lean budget): M4, M5a, M6 (+control), M7, M8, M9, M10, M1 plain / TSC_QUOTA=50.
 #
 # Build first:  TSC_SELFTEST=1 sh scripts/build.sh
 set -u
@@ -135,9 +162,22 @@ else
     DWELL="${QEMU_TIMEOUT:-120}"
 fi
 
-KVM_ARGS="-enable-kvm -cpu host"
-[ -n "${DE_NO_KVM:-}" ] && KVM_ARGS="-cpu max"
-[ -e /dev/kvm ] || { echo "  (no /dev/kvm — falling back to TCG; the 16 MB load will be slow)"; KVM_ARGS="-cpu max"; }
+# 1.57.7 (S1b): the boot matrix. TSC_BOOTS wins; else TSC_SMP/TSC_MACHINE ask for the single legacy boot; else
+# the three-boot default. Quota mode always boots A/B on ${TSC_MACHINE:-q35} -smp ${TSC_SMP:-1}.
+if [ -n "${TSC_BOOTS:-}" ]; then BOOTS="$TSC_BOOTS"
+elif [ -n "${TSC_SMP:-}" ] || [ -n "${TSC_MACHINE:-}" ]; then BOOTS="$MACHINE:$SMP"
+else BOOTS="q35:1 q35:4 pc:1"; fi
+
+# accel_for <smp> — RULES 4: -smp 1 keeps KVM (-cpu host) when /dev/kvm is WRITABLE, else -cpu max (TCG);
+# -smp > 1 takes smoke_accel (KVM, else multi-threaded TCG). DE_NO_KVM=1 forces TCG in both.
+accel_for() {
+    if [ "$1" -gt 1 ]; then
+        if [ -n "${DE_NO_KVM:-}" ]; then echo "-accel tcg,thread=multi -cpu max"; else smoke_accel "$1"; fi
+        return 0
+    fi
+    if [ -n "${DE_NO_KVM:-}" ]; then echo "-cpu max"; return 0; fi
+    if [ -w /dev/kvm ]; then echo "-enable-kvm -cpu host"; else echo "-cpu max"; fi
+}
 
 WORK="$ROOT/build/tsc-smoke"
 LOGS="$ROOT/build/tsc-smoke-logs"
@@ -174,10 +214,12 @@ else
     bad "the first attempt's refusal text ('one more attempt before userland') is missing from the binary"
 fi
 
-# boot_once <name> [prefix...] — build a fresh image (the TSC hook writes /bin/tscp into ext2, so every
-# boot starts from a pristine disk) and boot it with the given command prefix (empty, or the quota scope).
+# boot_once <name> <machine> <smp> [prefix...] — build a fresh image (the TSC hook writes /bin/tscp into ext2,
+# so every boot starts from a pristine disk) and boot it with the given command prefix (empty, or the quota scope).
 boot_once() {
-    _bn="$1"; shift
+    _bn="$1"; _bm="$2"; _bs="$3"; shift 3
+    _acc=$(accel_for "$_bs")
+    echo "accel: $_acc (-machine $_bm -smp $_bs)"
     _img="$WORK/agnos-tsc-$_bn.img"
     _seed="$WORK/seed-$_bn"
     rm -rf "$_seed"; mkdir -p "$_seed/bin" "$_seed/etc"
@@ -198,13 +240,13 @@ boot_once() {
     mkfs.ext2 -F -q -L AGNOS-ARK -b 4096 -m 0 \
         -O "$EXT2_SMOKE_FEATURES" \
         -d "$_seed" -E offset=$PART_OFFSET "$_img" $PART_BLOCKS
-    echo "Booting TSC_SELFTEST kernel [$_bn] (-machine $MACHINE -smp $SMP $KVM_ARGS${QUOTA:+, boot $_bn}) ..."
+    echo "Booting TSC_SELFTEST kernel [$_bn] (-machine $_bm -smp $_bs $_acc${QUOTA:+, boot $_bn}) ..."
     # ⚠ The marker is the emergency shell's prompt (no /bin/agnsh is seeded, so kybernet falls back to
     # it). Every assertion below is printed before kybernet runs, and reaching the prompt is itself a
     # check: the 1.57.5 boot never did (see the 1.57.6 note after tsc_selftest's `run /bin/tscp`, main.cyr).
     qemu_dwell_kernel "$LOGS/tsc-$_bn.log" "agnos>" "$DWELL" "$WORK/vars-$_bn.fd" "$OVMF_VARS_SRC" \
         "$@" qemu-system-x86_64 \
-        -machine "$MACHINE" -m 1G -smp "$SMP" $KVM_ARGS \
+        -machine "$_bm" -m 1G -smp "$_bs" $_acc \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
         -drive "if=pflash,format=raw,file=$WORK/vars-$_bn.fd" \
         -drive "file=$_img,format=raw,if=none,id=disk0" \
@@ -219,9 +261,9 @@ boot_once() {
 plain() { strings "$1" | sed -E 's/^\[[^]]*\] //'; }
 cal_of() { plain "$1" | grep -oE '^tsc: [0-9]+ cycles per microsecond' | head -1 | grep -oE '[0-9]+'; }
 
-# score_boot <log> <role>   role = plain | A | B (B = the throttled boot: tick-oracle lines are INFO)
+# score_boot <log> <role> <smp>   role = plain | A | B (B = the throttled boot: the busy tick-oracle lines are INFO)
 score_boot() {
-    _log="$1"; _role="$2"
+    _log="$1"; _role="$2"; _smp="${3:-1}"
     if ! qemu_assert_booted "$_log"; then
         echo "=== tsc-smoke: VOID [$_role] -- the kernel under test never ran ==="
         exit 2
@@ -230,10 +272,10 @@ score_boot() {
     echo "  --- tsc lines from the [$_role] boot log ---"
     # ⛔ `[a-z-]*tsc:`, NOT `tsc:` — gpu-tsc:/hda-tsc:/ticks-tsc:/pred-tsc: carry a prefix, and a dump that
     # filters out the arm lines leaves a red gate with no evidence (it cost a fresh boot once already).
-    plain "$_log" | grep -E "^[a-z-]*tsc:|^run: exit|^acpi: (pm timer|no pm timer)|^klog: (log timebase|TIMEBASE|NO LOG)|^Timer ticks before sched|^smp: cpus online|agnos>" | sed 's/^/  /'
+    plain "$_log" | grep -E "^[a-z-]*tsc:|^run: exit|^acpi: (pm timer|no pm timer|early)|^acpi-fadt:|^klog: (log timebase|TIMEBASE|NO LOG)|^lapic:|^LAPIC: reload=|^tickrate:|^ap-tickrate:|^Timer ticks before sched|^smp: cpus online|agnos>" | sed 's/^/  /'
     echo ""
     _cal=$(cal_of "$_log")
-    _sfx=" [$_role]"
+    _sfx=" [$_role${4:+ $4}]"
 
     if [ -n "$_cal" ]; then ok "the TSC calibrated: $_cal cycles per microsecond$_sfx"
     else bad "no calibration succeeded -- uptime_us#95 returns -1 for this whole boot$_sfx"; fi
@@ -282,12 +324,14 @@ score_boot() {
         ok "the lost-tick test is wired into the live tick window (a 25 ms IF=0 stall inside one is rejected)$_sfx"
     else bad "the live lost-tick arm did not pass ($(plain "$_log" | grep -E '^ticks-tsc: (PASS|FAIL|SKIP)' | head -1))$_sfx"; fi
 
-    # Tick-oracle lines: strict unthrottled, INFO under the quota (their oracle is what the quota breaks).
+    # Tick-oracle lines measured in BUSY windows: strict unthrottled, INFO under the quota (a throttled QEMU
+    # still coalesces ticks while the guest spins — the busy-guest residual, not a reload error).
     _tk=bad; [ "$_role" = B ] && _tk=note
     if plain "$_log" | grep -q "^ticks-tsc: within 2% OK"; then ok "the live-tick tier agrees with the calibration within 2%$_sfx"
     else $_tk "the live-tick tier did not agree within 2% ($(plain "$_log" | grep -E '^ticks-tsc:' | tail -1))$_sfx"; fi
-    if plain "$_log" | grep -q "^klog: log timebase OK"; then ok "the early klog timebase agrees with the calibration$_sfx"
-    else $_tk "the early klog timebase does not agree ($(plain "$_log" | grep -E '^klog:' | head -1))$_sfx"; fi
+    # T5 (1.57.7 S1b): STRICT in every role — the early timebase is PM-measured now, so B must agree too.
+    if plain "$_log" | grep -q "^klog: log timebase OK"; then ok "T5 the early klog timebase agrees with the calibration$_sfx"
+    else bad "T5 the early klog timebase does not agree ($(plain "$_log" | grep -E '^klog:' | head -1))$_sfx"; fi
     if plain "$_log" | grep -q "^gpu-tsc: PASS"; then ok "gpu_tsc_per_us(): all 4 arms$_sfx"
     else $_tk "gpu_tsc_per_us() selftest did not pass -- see the gpu-tsc: lines (arm D is timed on ticks)$_sfx"; fi
     if plain "$_log" | grep -q "^hda-tsc: PASS"; then ok "hda_tsc_per_us(): all 4 arms$_sfx"
@@ -304,20 +348,68 @@ score_boot() {
             bad "${_t%-tsc} accessor reports '$_got' but calibration measured '$_cal' -- its timing paths do not track the clock$_sfx"
         fi
     done
+
+    # ---- 1.57.7 (S1b) ----------------------------------------------------------------------------------------
+    # T1: the early probe (boot_info RSDP, before apic_init) found the same PM port acpi_init decodes later.
+    _ep=$(plain "$_log" | grep -oE '^acpi: early pm timer port [0-9a-f]+ \(boot_info RSDP\)' | head -1 | awk '{print $6}')
+    _lp=$(plain "$_log" | grep -oE '^acpi: pm timer port [0-9a-f]+,' | head -1 | awk '{print $5}' | tr -d ,)
+    if [ -n "$_ep" ] && [ "$_ep" = "$_lp" ] && ! plain "$_log" | grep -q '^lapic: WARNING'; then
+        ok "T1 the early PM probe found port $_ep, the same port acpi_init decoded, and no lapic WARNING$_sfx"
+    else bad "T1 early PM port '$_ep' vs late '$_lp' ($(plain "$_log" | grep -E '^(acpi: early|lapic: WARNING)' | tr '\n' ' '))$_sfx"; fi
+    # T2: the reload was measured against the PM timer (a TRUE 100 Hz), and reported.
+    if plain "$_log" | grep -qE '^lapic: 100 Hz reload measured against the acpi pm timer \([0-9]+ of [0-9]+ windows agree\)' \
+       && plain "$_log" | grep -qE '^LAPIC: reload=[0-9]+'; then
+        ok "T2 the LAPIC reload was measured against the ACPI PM timer ($(plain "$_log" | grep -oE '^LAPIC: reload=[0-9]+' | head -1))$_sfx"
+    else bad "T2 the reload was NOT PM-measured ($(plain "$_log" | grep -E '^lapic:' | tr '\n' ' '))$_sfx"; fi
+    # T3/T4/T10: the tick against PM time in a HALTED window — strict in every role (B is the quota proof).
+    if plain "$_log" | grep -q '^tickrate: PASS uptime_ms#40 tracks real time within 3%' && ! plain "$_log" | grep -q '^tickrate: FAIL'; then
+        ok "T3 uptime_ms#40 tracks ACPI PM time within 3% in a halted window$_sfx"
+    else bad "T3 uptime_ms#40 vs PM time ($(plain "$_log" | grep -E '^tickrate: (FAIL|[0-9])' | tr '\n' ' '))$_sfx"; fi
+    if plain "$_log" | grep -q '^tickrate: PASS the tick period is 10 ms within 1%'; then
+        ok "T4 the median tick period is 10 ms within 1% ($(plain "$_log" | grep -oE '^tickrate: tick period [0-9]+ us' | head -1))$_sfx"
+    else bad "T4 the tick period is not 10 ms within 1% ($(plain "$_log" | grep -E '^tickrate: tick period' | head -1))$_sfx"; fi
+    if plain "$_log" | grep -q '^tickrate: PASS uptime_ms#40 advanced across a 200 ms IF=0 busy window'; then
+        ok "T10 uptime_ms#40 advanced across a 200 ms IF=0 busy window (TSC-backed)$_sfx"
+    else bad "T10 uptime_ms#40 did not advance with IF=0 ($(plain "$_log" | grep -E '^tickrate: uptime_ms#40 advanced' | head -1))$_sfx"; fi
+    note "tickrate: $(plain "$_log" | grep -oE '^tickrate: [0-9]+ ticks over .*' | head -1 | sed 's/^tickrate: //')$_sfx"
+    # T7: the FADT decode is pure — 3 arms.
+    _f3=$(plain "$_log" | grep -c '^acpi-fadt: PASS')
+    if [ "$_f3" = 3 ] && ! plain "$_log" | grep -q '^acpi-fadt: FAIL'; then ok "T7 FADT purity: 3/3 acpi-fadt arms$_sfx"
+    else bad "T7 FADT purity: $_f3/3 acpi-fadt arms PASS ($(plain "$_log" | grep -E '^acpi-fadt: FAIL' | tr '\n' ' '))$_sfx"; fi
+    # T8: both timebases PM-derived, so the klog band is 1%.
+    if plain "$_log" | grep -qE '^klog: log timebase OK -- [0-9]+ cycles/us, agrees with tsc within 1%$'; then
+        ok "T8 the klog timebase agrees within the 1% PM-pair band$_sfx"
+    else bad "T8 no 1% klog agreement ($(plain "$_log" | grep -E '^klog:' | head -1))$_sfx"; fi
+    # T9: every CPU's tick — the lowest AP at -smp > 1, a SKIP at -smp 1.
+    if [ "$_smp" -gt 1 ]; then
+        if plain "$_log" | grep -q '^ap-tickrate: PASS'; then ok "T9 the AP tick is 10 ms within 3% ($(plain "$_log" | grep -E '^ap-tickrate: cpu' | head -1))$_sfx"
+        else bad "T9 the AP tick check did not pass ($(plain "$_log" | grep -E '^ap-tickrate:' | tr '\n' ' '))$_sfx"; fi
+    else
+        if plain "$_log" | grep -q '^ap-tickrate: SKIP -- no AP online'; then ok "T9 -smp 1: ap-tickrate SKIP (no AP online)$_sfx"
+        else bad "T9 -smp 1 should SKIP ap-tickrate ($(plain "$_log" | grep -E '^ap-tickrate:' | tr '\n' ' '))$_sfx"; fi
+    fi
+    # Latched kernel invariant lines (SMOKE_INVARIANT_DENY, qemu-dwell.sh) change no exit code; grep for them.
+    if strings "$_log" | grep -qE "$SMOKE_INVARIANT_DENY"; then
+        bad "a latched kernel invariant line fired:$_sfx"; strings "$_log" | grep -E "$SMOKE_INVARIANT_DENY" | head -5 | sed 's/^/        /'
+    else ok "no latched kernel invariant line$_sfx"; fi
 }
+reload_of() { plain "$1" | grep -oE '^LAPIC: reload=[0-9]+' | head -1 | grep -oE '[0-9]+$'; }
 
 if [ -z "$QUOTA" ]; then
-    boot_once plain
-    score_boot "$LOGS/tsc-plain.log" plain
+    for _b in $BOOTS; do
+        _m="${_b%%:*}"; _n="${_b##*:}"
+        boot_once "$_m-$_n" "$_m" "$_n"
+        score_boot "$LOGS/tsc-$_m-$_n.log" plain "$_n" "$_m-$_n"
+    done
 else
     # Positive control, captured from INSIDE the scope QEMU runs in, just before exec.
     CPUMAX="$WORK/cpu.max-B"
-    boot_once A
-    score_boot "$LOGS/tsc-A.log" A
+    boot_once A "$MACHINE" "$SMP"
+    score_boot "$LOGS/tsc-A.log" A "$SMP"
     CAL_A=$(cal_of "$LOGS/tsc-A.log")
-    boot_once B systemd-run --user --scope --quiet -p "CPUQuota=${QUOTA}%" \
+    boot_once B "$MACHINE" "$SMP" systemd-run --user --scope --quiet -p "CPUQuota=${QUOTA}%" \
         sh -c 'cat "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/cpu.max" > "$0" 2>&1; exec "$@"' "$CPUMAX"
-    score_boot "$LOGS/tsc-B.log" B
+    score_boot "$LOGS/tsc-B.log" B "$SMP"
     CAL_B=$(cal_of "$LOGS/tsc-B.log")
     echo ""
     _want="$(( QUOTA * 1000 )) 100000"
@@ -334,6 +426,13 @@ else
     else
         bad "throttled comparison impossible -- a boot did not calibrate (A='$CAL_A' B='$CAL_B')"
     fi
+    # T6 (1.57.7 S1b): the reload is PM-measured, so the throttle must not move it (the polled PIT: 2.2-2.8x).
+    RL_A=$(reload_of "$LOGS/tsc-A.log"); RL_B=$(reload_of "$LOGS/tsc-B.log")
+    if [ -n "$RL_A" ] && [ -n "$RL_B" ]; then
+        _d=$(( RL_B - RL_A )); [ "$_d" -lt 0 ] && _d=$(( 0 - _d ))
+        if [ $(( _d * 100 )) -le "$RL_A" ]; then ok "⭐ T6 throttled to ${QUOTA}%: LAPIC reload $RL_B vs unthrottled $RL_A -- within 1%"
+        else bad "T6 throttled to ${QUOTA}%: LAPIC reload $RL_B vs unthrottled $RL_A -- more than 1% apart"; fi
+    else bad "T6 reload comparison impossible (A='$RL_A' B='$RL_B')"; fi
     # INFO: was the OLD reference actually disturbed in B? (Evidence the throttle bit, not a gate.)
     if plain "$LOGS/tsc-B.log" | grep -q "^ticks-tsc: within 2% OK"; then
         note "the live-tick oracle was NOT disturbed in B (the cpu.max control above is the gate)"

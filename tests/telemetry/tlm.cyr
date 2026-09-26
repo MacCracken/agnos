@@ -48,7 +48,9 @@ fn tlm_main(): i64 {
     # ⛔ §4 ABOVE CANNOT CATCH THIS AND SHIPPED WITHOUT IT. Its load is a BUSY LOOP, so it proves the
     # counter advances for a process that is genuinely running — and a counter that advances at
     # WALL-CLOCK rate for a process doing nothing passes it identically. That is exactly what shipped
-    # in 1.56.59: sleep_ms#41 halts with the caller still current (preempt_disable, so
+    # in 1.56.59: sleep_ms#41 halted with the caller still current (preempt_disable, so
+    # [1.57.7: #41 now BLOCKS a caller that can block; tlm runs as an execwait#37 child, the INTERIM case that keeps
+    # the legacy loop until S3b-F2, so this row still measures the halt-exclusion path.]
     # do_context_switch early-returns), the timer ISR charged the tick anyway, and chakshu v0.9.9
     # rendered a SLEEPING process at 100% CPU. They built the column, measured it, and backed it out.
     # ⇒ The oracle for "this is CPU time, not wall time" is to BLOCK and assert the counter does NOT
@@ -195,14 +197,32 @@ fn tlm_main(): i64 {
     # Now the extension itself.
     si_k = 0;
     while (si_k < 104) { store8(&si104 + si_k, 0); si_k = si_k + 1; }
+    # ⭐ 1.57.7 (S3d) — SUMMED OVER THE FOUR CORES, NOT cpu0 ALONE. This read cpu0's pair only, which held while a
+    # lone runner alternated with its CPU's idle every tick and so wandered over every core, the BSP included. Since
+    # keep-current (1.57.7 S3.6) a lone runner STAYS on the core it is on, and under the harness's -smp 4 that is
+    # often an AP: cpu0 then honestly reads 0 user ticks while this process burns ring-3 time elsewhere, and exit 73
+    # fired on a correct kernel (measured, S3d B1b). The sum is the same oracle for the ring test — a kernel that
+    # charged everything to kernel leaves the USER sum flat — without assuming which core ran us.
     if (syscall(35, &si104, 104) != 0) { return 70; }
-    var u0 = load64(&si104 + 40 + 0 * 16 + 0);             # cpu0 user
-    var k0 = load64(&si104 + 40 + 0 * 16 + 8);             # cpu0 kernel
+    var u0 = 0;
+    var k0 = 0;
+    var ci = 0;
+    while (ci < 4) {
+        u0 = u0 + load64(&si104 + 40 + ci * 16 + 0);       # cpu ci user
+        k0 = k0 + load64(&si104 + 40 + ci * 16 + 8);       # cpu ci kernel
+        ci = ci + 1;
+    }
     var spin2 = 0;
     while (spin2 < 40000000) { spin2 = spin2 + 1; }
     if (syscall(35, &si104, 104) != 0) { return 70; }
-    var u1 = load64(&si104 + 40 + 0 * 16 + 0);
-    var k1 = load64(&si104 + 40 + 0 * 16 + 8);
+    var u1 = 0;
+    var k1 = 0;
+    ci = 0;
+    while (ci < 4) {
+        u1 = u1 + load64(&si104 + 40 + ci * 16 + 0);
+        k1 = k1 + load64(&si104 + 40 + ci * 16 + 8);
+        ci = ci + 1;
+    }
     if (u1 < u0) { return 71; }                            # user ticks went backwards
     if (k1 < k0) { return 72; }                            # kernel ticks went backwards
     # ⛔ THE ASSERTION THAT CATCHES A WRONG RING TEST. We just burned wall time in RING 3, so the USER

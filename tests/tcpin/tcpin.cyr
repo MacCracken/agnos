@@ -1,0 +1,424 @@
+# tcpin — the RING-3 half of agnos 1.57.7 step S4 (inbound TCP in interrupt context + #49 EOF + half-close).
+#
+# Issues: docs/development/issues/2026-09-23-inbound-tcp-syn-dropped-by-isr-drain.md,
+#         docs/development/issues/2026-09-23-sock-recv-never-reports-eof-after-peer-fin.md.
+#
+# Seeded as /bin/agnsh (the orchestrator, launched by kybernet on a PLAIN kernel — D19) AND /bin/tcpin (the X
+# phase's children, selected by argv). The host half is scripts/smoke/tcp-inbound-smoke.sh's helper, keyed on the
+# markers below. Every wait uses pause#14 / sleep_ms#41 / uptime_ms#40 — never a net syscall as a delay — and
+# every accept loop has a 20 s guest cap, so a RED shows as a FAIL marker, not a dwell timeout. The orchestrator
+# ALWAYS ends `TCPIN-DONE` and exits 0 (a non-zero exit drops kybernet into the emergency shell).
+# Raw `syscall(N, a1, a2, a3, a4)`; explicit zeros for unused args. #61 field 0 = net_ip, 9 = net_rx_packets
+# (a pure global read: no net_poll).
+
+# Module-scope `var X[N]` is N u64 = 8N BYTES.
+var t_buf[256];         # 2048 B: receive accumulator
+var t_line[64];         # 512 B: #43 command lines
+var t_pat[128];         # 1024 B: X pattern out
+var t_rb[128];          # 1024 B: X receive
+var T_IP = 0;
+
+# Output is LINE-BUFFERED and each line is ONE write(1): the X phase's children print concurrently with the
+# orchestrator (on other CPUs at -smp 4), and piecewise writes interleaved mid-marker ("TCPX-SRV-OK n=8TCPX-CLI-OK").
+var t_lb[32];           # 256 B: the current output line
+var T_LN = 0;
+fn t_flush() { if (T_LN > 0) { syscall(1, 1, &t_lb, T_LN, 0); } T_LN = 0; return 0; }
+fn t_putc(ch) {
+    if (T_LN >= 250) { t_flush(); }
+    store8(&t_lb + T_LN, ch);
+    T_LN = T_LN + 1;
+    if (ch == 10) { t_flush(); }
+    return 0;
+}
+fn t_out(s) {
+    var l = strlen(s);
+    var i = 0;
+    while (i < l) { t_putc(load8(s + i)); i = i + 1; }
+    return 0;
+}
+fn t_num(n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { t_putc(45); n = 0 - n; }
+    if (n == 0) { t_putc(48); return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; t_putc(load8(&b + i)); }
+    return 0;
+}
+fn t_kv(k, v) { t_out(" "); t_out(k); t_out("="); t_num(v); return 0; }
+fn t_nl() { t_out("\n"); return 0; }
+fn t_eq(a, b) {
+    var i = 0;
+    while (1) {
+        var ca = load8(a + i);
+        if (ca != load8(b + i)) { return 0; }
+        if (ca == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn t_atoi(s) {
+    var v = 0;
+    var i = 0;
+    while (load8(s + i) >= 48) {
+        if (load8(s + i) > 57) { break; }
+        v = v * 10 + (load8(s + i) - 48);
+        i = i + 1;
+    }
+    return v;
+}
+fn t_cat(dst, off, s) {
+    var l = strlen(s);
+    var i = 0;
+    while (i < l) { store8(dst + off + i, load8(s + i)); i = i + 1; }
+    return off + l;
+}
+fn t_catnum(dst, off, n) {
+    var b[24];
+    var i = 0;
+    if (n == 0) { store8(dst + off, 48); return off + 1; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; store8(dst + off, load8(&b + i)); off = off + 1; }
+    return off;
+}
+# Does buf[0..n) contain the NUL-terminated string s?
+fn t_has(buf, n, s) {
+    var l = strlen(s);
+    var i = 0;
+    while (i + l <= n) {
+        var j = 0;
+        while (j < l) {
+            if (load8(buf + i + j) != load8(s + j)) { break; }
+            j = j + 1;
+        }
+        if (j == l) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn t_ms() { return syscall(40, 0, 0, 0, 0); }                    # uptime_ms#40
+fn t_pause() { syscall(14, 0, 0, 0, 0); return 0; }              # pause#14 (a preempt point; wakes on any IRQ)
+fn t_sleep(ms) { return syscall(41, ms, 0, 0, 0); }              # sleep_ms#41
+fn t_listen(p) { return syscall(56, p, 0, 0, 0); }
+fn t_accept(l) { return syscall(57, l, 0, 0, 0); }
+fn t_connect(ip, p, sp) { return syscall(47, ip, p, sp, 0); }
+fn t_send(c, b, n) { return syscall(48, c, b, n, 0); }
+fn t_recv(c, b, n) { return syscall(49, c, b, n, 0); }
+fn t_close(c) { return syscall(50, c, 0, 0, 0); }
+fn t_netcfg(f) { return syscall(61, f, 0, 0, 0); }
+
+
+# Accept with a 20 s guest cap; busy = 0 pauses between polls, 1 busy-polls (issue §1 row 3). -1 = none.
+fn t_accept_wait(lid, busy) {
+    var t0 = t_ms();
+    while (t_ms() - t0 < 20000) {
+        var c = t_accept(lid);
+        if (c >= 0) { return c; }
+        if (busy == 0) { t_pause(); }
+    }
+    return 0 - 1;
+}
+# Read a request until its blank line (or EOF / 10 s); returns the bytes read into t_buf.
+fn t_read_req(c) {
+    var got = 0;
+    var t0 = t_ms();
+    while (t_ms() - t0 < 10000) {
+        var r = t_recv(c, &t_buf + got, 2000 - got);
+        if (r > 0) {
+            got = got + r;
+            if (t_has(&t_buf, got, "\r\n\r\n") == 1) { return got; }
+        } elif (r < 0) {
+            return got;
+        } else {
+            t_pause();
+        }
+    }
+    return got;
+}
+fn t_reply(c) {
+    var rp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    t_send(c, rp, strlen(rp));
+    t_close(c);
+    return 0;
+}
+
+# A2 / A2b / X's inbound half: serve n sequential host clients on lid. Returns the number served.
+fn t_serve_n(lid, n, busy, tag) {
+    var served = 0;
+    var k = 0;
+    var t0 = t_ms();
+    while (k < n) {
+        var c = t_accept_wait(lid, busy);
+        if (c < 0) {
+            t_out("TCPIN-"); t_out(tag); t_out("-FAIL noaccept"); t_kv("n", k); t_nl();
+            return served;
+        }
+        t_read_req(c);
+        t_reply(c);
+        served = served + 1;
+        t_out("TCPIN-ACC #"); t_num(k + 1); t_kv("dt", t_ms() - t0); t_nl();
+        k = k + 1;
+    }
+    return served;
+}
+
+# E1 — EOF over LOOPBACK: the FIN is demuxed in syscall context (the client's own #49 net_poll).
+fn ph_e1() {
+    var la = t_listen(18901);
+    var c = t_connect(T_IP, 18901, 0);
+    var s = 0 - 1;
+    if (la >= 0 && c >= 0) { s = t_accept_wait(la, 0); }
+    var r0 = 0 - 9;
+    var got = 0;
+    var eof = 0;
+    var polls = 0;
+    var t0 = t_ms();
+    if (s >= 0) {
+        r0 = t_recv(c, &t_buf, 64);
+        t_send(s, "BYE", 3);
+        t_close(s);
+        while (polls < 400) {
+            var r = t_recv(c, &t_buf + got, 64);
+            polls = polls + 1;
+            if (r > 0) { got = got + r; }
+            elif (r < 0) { eof = 1; break; }
+            else { t_pause(); }
+        }
+    }
+    var dt = t_ms() - t0;
+    var after = 0;
+    if (c >= 0) { t_close(c); after = t_recv(c, &t_rb, 8); }
+    if (la >= 0) { t_close(la); }
+    var ok = 1;
+    if (r0 != 0) { ok = 0; }
+    if (got != 3) { ok = 0; }
+    if (got == 3) { if (t_has(&t_buf, 3, "BYE") == 0) { ok = 0; } }
+    if (eof != 1) { ok = 0; }
+    if (after != (0 - 1)) { ok = 0; }
+    if (ok == 1) { t_out("TCPIN-EOF-LO-OK"); t_kv("polls", polls); t_kv("dt", dt); t_nl(); }
+    else { t_out("TCPIN-EOF-LO-FAIL"); t_kv("r0", r0); t_kv("got", got); t_kv("eof", eof); t_kv("after", after); t_nl(); }
+    return ok;
+}
+
+# E2 — EOF over the WIRE: the peer's FIN arrives through the NIC and is demuxed by the ISR drain.
+fn ph_e2() {
+    var c2 = t_connect(0x0A000264, 18903, 0);                    # 10.0.2.100 (QEMU guestfwd)
+    if (c2 < 0) { t_out("TCPIN-EOF-WIRE-NOCONN\n"); return 0; }
+    var got = 0;
+    var eof = 0;
+    var t0 = t_ms();
+    while (t_ms() - t0 < 10000) {
+        var r = t_recv(c2, &t_buf + got, 256);
+        if (r > 0) { got = got + r; }
+        elif (r < 0) { eof = 1; break; }
+        else { t_pause(); }
+    }
+    var dt = t_ms() - t0;
+    t_close(c2);
+    var ok = 1;
+    if (eof != 1) { ok = 0; }
+    if (t_has(&t_buf, got, "BYE-WIRE") == 0) { ok = 0; }
+    if (ok == 1) { t_out("TCPIN-EOF-WIRE-OK"); t_kv("dt", dt); t_nl(); }
+    else { t_out("TCPIN-EOF-WIRE-FAIL"); t_kv("got", got); t_kv("eof", eof); t_nl(); }
+    return ok;
+}
+
+# A1 — ISR-ONLY ACCEPT (dispositive): in the window this program makes NO net syscall (only pause#14 and the pure
+# #61 read), and nothing else calls net_poll, so the SYN, its ACK and the GET can only be demuxed by the timer/MSI
+# drain. ONE #57 that finds an ESTABLISHED conn with data queued proves an interrupt-context passive open.
+fn ph_a1(lid) {
+    var rx0 = t_netcfg(9);                                        # sampled BEFORE the marker: the host connects on it
+    t_out("TCPIN-ISR-WINDOW\n");
+    var t0 = t_ms();
+    var last = rx0;
+    var tl = t_ms();
+    while (t_ms() - t0 < 15000) {
+        var rx = t_netcfg(9);
+        if (rx != last) { last = rx; tl = t_ms(); }
+        if (last - rx0 >= 2) { if (t_ms() - tl >= 500) { break; } }
+        t_pause();
+    }
+    var cid = t_accept(lid);
+    var got = 0 - 1;
+    if (cid >= 0) {
+        got = t_recv(cid, &t_buf, 2000);
+        t_reply(cid);
+    }
+    if (cid >= 0 && got > 0) { t_out("TCPIN-ISR-ACCEPT-OK"); }
+    else { t_out("TCPIN-ISR-ACCEPT-FAIL"); }
+    t_kv("cid", cid); t_kv("got", got); t_kv("rx", last - rx0); t_nl();
+    return 0;
+}
+
+# A3 — FIN BEFORE ACCEPT (D12(ii)): 10 concurrent host clients each send GET + shutdown(SHUT_WR) while nobody
+# accepts for 3 s; every one must be served — accepted in CLOSE_WAIT, data then EOF, reply sent IN CLOSE_WAIT.
+fn ph_a3(lid) {
+    t_out("TCPIN-A3-HOLD\n");
+    t_sleep(3000);
+    t_out("TCPIN-A3-SERVE\n");
+    var served = 0;
+    var bad = 0;
+    var t00 = t_ms();
+    while (served < 10) {
+        if (t_ms() - t00 > 90000) { t_out("TCPIN-A3-FAIL cap"); t_kv("served", served); t_nl(); bad = 1; break; }
+        var c = t_accept_wait(lid, 0);
+        if (c < 0) { t_out("TCPIN-A3-FAIL noaccept"); t_kv("n", served); t_nl(); bad = 1; break; }
+        var got = 0;
+        var eof = 0;
+        var tl = t_ms();
+        while (t_ms() - tl < 5000) {
+            var r = t_recv(c, &t_buf + got, 2000 - got);
+            if (r > 0) { got = got + r; tl = t_ms(); }
+            elif (r < 0) { eof = 1; break; }
+            else { t_pause(); }
+        }
+        if (eof == 0) { t_out("TCPIN-A3-FAIL noeof"); t_kv("cid", c); t_nl(); bad = 1; }
+        if (t_has(&t_buf, got, "GET ") == 0) { t_out("TCPIN-A3-FAIL noget"); t_kv("cid", c); t_kv("got", got); t_nl(); bad = 1; }
+        t_reply(c);
+        served = served + 1;
+    }
+    if (bad == 0) { t_out("TCPIN-A3-OK"); t_kv("served", served); t_nl(); }
+    return 0;
+}
+
+# X — cross-CPU mix: an echo server child + two auto-port client children on loopback (unpinned #43 children run
+# on the APs at -smp 4) while the orchestrator serves 12 inbound host connections.
+fn t_spawn(role, a, b) {
+    var o = t_cat(&t_line, 0, "/bin/tcpin ");
+    o = t_cat(&t_line, o, role);
+    store8(&t_line + o, 32); o = t_catnum(&t_line, o + 1, a);
+    if (b >= 0) { store8(&t_line + o, 32); o = t_catnum(&t_line, o + 1, b); }
+    store8(&t_line + o, 0);
+    return syscall(43, &t_line, o, 0, 0);
+}
+fn t_reap(pid) {
+    if (pid < 0) { return 0 - 999; }
+    var r = syscall(4, 0x100 | pid, 0, 0, 0);                     # waitpid WAIT_BLOCK
+    if (r >= 0) { return r; }
+    var t0 = t_ms();
+    while (t_ms() - t0 < 120000) {                                 # fallback: the plain poll (-2 = alive)
+        r = syscall(4, pid, 0, 0, 0);
+        if (r != (0 - 2)) { return r; }
+        t_pause();
+    }
+    return 0 - 998;
+}
+fn ph_x(lid) {
+    var ps = t_spawn("xsrv", 18950, 0 - 1);
+    t_sleep(200);
+    var pc1 = t_spawn("xcli", 18950, 1);
+    var pc2 = t_spawn("xcli", 18950, 2);
+    t_out("TCPIN-X-GO\n");
+    var served = t_serve_n(lid, 12, 0, "X");
+    var rs = t_reap(ps);
+    var r1 = t_reap(pc1);
+    var r2 = t_reap(pc2);
+    if (rs == 0 && r1 == 0 && r2 == 0 && served == 12) { t_out("TCPIN-X-OK"); }
+    else { t_out("TCPIN-X-FAIL"); }
+    t_kv("srv", rs); t_out(" cli="); t_num(r1); t_out(","); t_num(r2); t_kv("served", served); t_nl();
+    return 0;
+}
+
+fn role_xsrv(port) {
+    var l = 0 - 1;
+    var tries = 0;
+    while (l < 0 && tries < 50) { l = t_listen(port); if (l < 0) { t_sleep(20); } tries = tries + 1; }
+    if (l < 0) { t_out("TCPX-SRV-FAIL nolisten\n"); return 1; }
+    var n = 0;
+    var bad = 0;
+    while (n < 80) {
+        var t0 = t_ms();
+        var c = 0 - 1;
+        while (c < 0 && t_ms() - t0 < 60000) { c = t_accept(l); if (c < 0) { t_pause(); } }
+        if (c < 0) { t_out("TCPX-SRV-FAIL noaccept"); t_kv("n", n); t_nl(); t_close(l); return 1; }
+        var got = 0;
+        var t1 = t_ms();
+        while (got < 1024 && t_ms() - t1 < 20000) {
+            var r = t_recv(c, &t_rb + got, 1024 - got);
+            if (r > 0) { got = got + r; } elif (r < 0) { break; } else { t_pause(); }
+        }
+        if (got != 1024) { bad = bad + 1; }
+        var sent = 0;
+        if (got > 0) { sent = t_send(c, &t_rb, got); }
+        if (sent != got) { bad = bad + 1; }
+        t_close(c);
+        n = n + 1;
+    }
+    t_close(l);
+    if (bad == 0) { t_out("TCPX-SRV-OK"); t_kv("n", n); t_nl(); return 0; }
+    t_out("TCPX-SRV-FAIL"); t_kv("bad", bad); t_nl();
+    return 1;
+}
+
+fn role_xcli(port, k) {
+    var cyc = 0;
+    var retries = 0;
+    var bad = 0;
+    while (cyc < 40) {
+        var c = t_connect(T_IP, port, 0);
+        if (c < 0) {
+            retries = retries + 1;
+            if (retries > 200) { t_out("TCPX-CLI-FAIL retries"); t_kv("k", k); t_kv("cyc", cyc); t_nl(); return 1; }
+            t_pause();
+            continue;
+        }
+        var i = 0;
+        while (i < 1024) { store8(&t_pat + i, (k * 31 + cyc * 7 + i) & 0xFF); i = i + 1; }
+        var s = t_send(c, &t_pat, 1024);
+        var got = 0;
+        var t0 = t_ms();
+        while (got < 1024 && t_ms() - t0 < 20000) {
+            var r = t_recv(c, &t_rb + got, 1024 - got);
+            if (r > 0) { got = got + r; } elif (r < 0) { break; } else { t_pause(); }
+        }
+        var ok = 1;
+        if (s != 1024 || got != 1024) { ok = 0; }
+        i = 0;
+        while (ok == 1 && i < 1024) { if (load8(&t_rb + i) != load8(&t_pat + i)) { ok = 0; } i = i + 1; }
+        if (ok == 0) { bad = bad + 1; }
+        t_close(c);
+        cyc = cyc + 1;
+    }
+    if (bad == 0) { t_out("TCPX-CLI-OK"); t_kv("k", k); t_kv("n", cyc); t_nl(); return 0; }
+    t_out("TCPX-CLI-FAIL"); t_kv("k", k); t_kv("bad", bad); t_nl();
+    return 1;
+}
+
+fn t_driver() {
+    T_IP = t_netcfg(0);
+    t_out("TCPIN-ALIVE"); t_kv("ip", T_IP); t_nl();
+    ph_e1();
+    ph_e2();
+    var lid = t_listen(8090);                                     # kept to the end (A1, A2, A2b, A3, X)
+    if (lid < 0) { t_out("TCPIN-LISTEN-FAIL\n"); }
+    else {
+        ph_a1(lid);
+        t_out("TCPIN-SERVING\n");
+        var s2 = t_serve_n(lid, 12, 0, "A2");
+        t_out("TCPIN-A2-DONE"); t_kv("served", s2); t_nl();
+        t_out("TCPIN-SERVING-BUSY\n");
+        var s3 = t_serve_n(lid, 12, 1, "A2B");
+        t_out("TCPIN-A2B-DONE"); t_kv("served", s3); t_nl();
+        ph_a3(lid);
+        ph_x(lid);
+    }
+    t_out("TCPIN-DONE\n");
+    return 0;
+}
+
+fn main(): i64 {
+    T_IP = t_netcfg(0);
+    if (argc() >= 3) {
+        if (t_eq(argv(1), "xsrv") == 1) { return role_xsrv(t_atoi(argv(2))); }
+        if (argc() >= 4) { if (t_eq(argv(1), "xcli") == 1) { return role_xcli(t_atoi(argv(2)), t_atoi(argv(3))); } }
+        t_out("TCPIN-CHILD-BAD-ROLE\n");
+        return 98;
+    }
+    # ⛔ Only /bin/agnsh (kybernet's launch) is the orchestrator; a child with no role must not re-run it.
+    if (t_eq(argv(0), "/bin/agnsh") == 0) { t_out("TCPIN-CHILD-NO-ROLE\n"); return 99; }
+    return t_driver();
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

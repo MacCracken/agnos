@@ -63,18 +63,52 @@ var klug_buf[8192];        # 64 KB (8192 * 8)
 var klug_head = 0;         # next write offset, 0..65535
 var klug_count = 0;        # total bytes captured, saturates at 65536 (wrap flag)
 
+# ⭐ 1.57.7 (S7) — THE KLUG LOCK. Every append is serialized by klug_lock_word (smp.cyr): until now two CPUs appending
+# at once interleaved BYTES (klug_head is a plain RMW), so a lifecycle trace line — the smoke's oracle — could be torn
+# by a concurrent kprint. klug_putc / klug_append take the lock around the raw copy; lifecycle_trace (sched.cyr) takes
+# it once around a whole line (acquire + klug_append_raw). A LEAF below everything, IRQ-saved, BOUNDED:
+# KLUG_LOCK_SPIN_MAX pause iterations (tens of ms), then it proceeds LOCK-FREE and counts klug_lock_timeouts — a fault
+# inside a copy (a bad pointer) re-enters klug from the fault path on the same CPU, and an unbounded spin would turn
+# the post-mortem into a silent hang. The token: bit 0 = held, the rest = kbd_irq_save's RFLAGS (non-negative).
+# kprint's separate appends (prefix / body / newline) stay separate calls, serialized with each other by console_lock.
+# aarch64: klug_trylock returns 0 (the stub), so the lock is always "won".
+var KLUG_LOCK_SPIN_MAX = 1000000;
+var klug_lock_timeouts = 0;
+fn klug_lock_acquire() {
+    var kl_f = kbd_irq_save();
+    var kl_n = 0;
+    while (klug_trylock() != 0) {
+        kl_n = kl_n + 1;
+        if (kl_n >= KLUG_LOCK_SPIN_MAX) { klug_lock_timeouts = klug_lock_timeouts + 1; return kl_f * 2; }
+        asm { 0xF3; 0x90; }            # pause — contract: no inputs/outputs, no register touched
+    }
+    return kl_f * 2 + 1;
+}
+fn klug_lock_release(tok) {
+    if ((tok & 1) == 1) { klug_unlock(); }
+    kbd_irq_restore(tok >> 1);
+    return 0;
+}
+
 # Append one byte. The whole capture path is pure store8 + integer math — it must
 # never call kprint/serial/fb (that would recurse through the tap), so it can run
 # safely from the earliest boot, before any console backend is up.
-fn klug_putc(ch) {
+# _raw: the caller holds klug_lock (or is the boot path before any second CPU exists).
+fn klug_putc_raw(ch) {
     store8(&klug_buf + klug_head, ch & 0xFF);
     klug_head = (klug_head + 1) & 0xFFFF;
     if (klug_count < 65536) { klug_count = klug_count + 1; }
     return 0;
 }
+fn klug_putc(ch) {
+    var kp_t = klug_lock_acquire();
+    klug_putc_raw(ch);
+    klug_lock_release(kp_t);
+    return 0;
+}
 
 # Append a (buf, len) run.
-fn klug_append(buf, len) {
+fn klug_append_raw(buf, len) {
     var i = 0;
     while (i < len) {
         store8(&klug_buf + klug_head, load8(buf + i));
@@ -82,6 +116,26 @@ fn klug_append(buf, len) {
         if (klug_count < 65536) { klug_count = klug_count + 1; }
         i = i + 1;
     }
+    return 0;
+}
+fn klug_append(buf, len) {
+    var ka_t = klug_lock_acquire();
+    klug_append_raw(buf, len);
+    klug_lock_release(ka_t);
+    return 0;
+}
+
+# ⭐ 1.57.7 (S7, D-34) — THE DEFERRED COVERED-CONSOLE SPILL. A process killed at the TIMER TICK (the lifecycle tick
+# path) that owned the scanout hands the display back in the ISR itself (gpu_release_pid_isr — ownership never leaks
+# to a recycled pid) but may not write the disk or kprint there, so it sets klug_spill_owed and the spill runs at the
+# next B1 (syscall exit) of ANY process — syscall context, IF=0, exactly the context exit#0's spill ran in.
+var klug_spill_owed = 0;
+fn klug_spill_owed_run() {
+    var so_t = klug_lock_acquire();
+    var so_v = klug_spill_owed;
+    klug_spill_owed = 0;
+    klug_lock_release(so_t);
+    if (so_v != 0) { klug_spill_covered_console(); }
     return 0;
 }
 

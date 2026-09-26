@@ -163,14 +163,16 @@ fn clflush(addr) {
 
 # ⭐ 1.56.60 — THE ONE CHOKEPOINT FOR "THIS CORE IS BLOCKED, NOT WORKING".
 #
-# Every blocking wait in the kernel parks here: sleep_ms#41's loop, kbd_read_blocking, the idle loop
-# (core/sched.cyr), and the dozen net polls (dhcp/dns/ntp/icmp/tcp, core/devs.cyr). That is exactly
+# Every PREEMPT-HELD wait in the kernel parks here: the legacy sti windows the refused contexts keep (sleep_ms#41's,
+# the keyboard's kbd_read_blocking_held, snd_write_held / snd_drain_held — since 1.57.7 each of those blocks its caller
+# in the wq primitive whenever it can), and the dozen net polls (dhcp/dns/ntp/icmp/tcp, core/devs.cyr). (The idle and
+# the #14/#44 park halt through sched_idle_step / sched_halt_window + arch_sti_hlt, which set the same flag.) That is exactly
 # why the flag goes HERE and not at each caller — a per-site flag is a list that rots, and the sites
 # are the same ~dozen arch_wait() callers that made a per-core `idle` field undecidable.
 #
 # asm contract: `hlt` — no inputs, no outputs, no clobbers. Halts until the next unmasked interrupt.
-# ⛔ REQUIRES IF=1. An IF=0 hlt never wakes (the waitpid hard-hang); callers own that — sleep_ms#41
-# does `sti` before its loop for exactly this reason. Unchanged by this edit.
+# ⛔ REQUIRES IF=1. An IF=0 hlt never wakes (the waitpid hard-hang); callers own that — the legacy sleep_ms#41
+# loop does `sti` before its loop for exactly this reason. Unchanged by this edit.
 #
 # ⚠ THE FLAG IS SET BEFORE THE hlt AND CLEARED AFTER, so the timer ISR that WAKES us observes it
 # still set — which is the whole point: that tick paid for halted time, not for work.
@@ -178,14 +180,28 @@ fn clflush(addr) {
 # mis-attribute at most one tick per wait, in the conservative direction. Charging the whole tick to
 # whoever is current is already the standard sampling model (see timer_handler); this does not make
 # it exact, it removes a systematic bias that made a blocked process read 100%.
+# ⭐ 1.57.7 (Path 2, S3.4) — THE hlt IS A MIGRATION POINT NOW. A process halted here with IF=1 and preempt_count 0
+# (a kmain wait, a kthread, the #14 preempt point) can be switched out by the tick that wakes it and resumed on
+# ANOTHER CPU, so the post-hlt clear re-reads the CPU index instead of reusing aw_c — clearing the old CPU's flag
+# would eat an unrelated tick there and leave this CPU's armed.
 fn arch_wait() {
     var aw_c = pcpu_cpu();
     if (aw_c < 4) { store64(&cpu_in_halt + aw_c * 8, 1); }
     asm { hlt; }
-    if (aw_c < 4) { store64(&cpu_in_halt + aw_c * 8, 0); }
+    var aw_c2 = pcpu_cpu();
+    if (aw_c2 < 4) { store64(&cpu_in_halt + aw_c2 * 8, 0); }
     return 0;
 }
 fn arch_halt() { asm { cli; hlt; 0xEB; 0xFE; } return 0; }
+
+# ⭐ 1.57.7 (Path 2, S3.6/S3.8) — THE HALT PROTOCOL'S TWO PRIMITIVES (sched_halt_window, sched_idle_step).
+# asm contract: `sti; hlt` — no inputs, no outputs, no clobbers; leaves IF=1. The STI shadow covers the HLT, so an
+# interrupt that became pending while the caller ran with IF=0 (a 0xE1 kick sent after the caller's flag store) ends
+# the hlt at once instead of being taken before it. Caller runs IF=0 and publishes its flags first.
+fn arch_sti_hlt() { asm { 0xFB; 0xF4; } return 0; }
+# asm contract: `mfence` — no inputs, no outputs, no clobbers; orders every earlier store before every later load
+# (the halter half of the Dekker pair with sched_kick_for: cpu_kickable store -> mfence -> READY scan).
+fn arch_mfence() { asm { 0x0F; 0xAE; 0xF0; } return 0; }
 
 # ⭐ 1.56.60 — MASK INTERRUPTS ON THIS CORE, WITHOUT STOPPING IT.
 #

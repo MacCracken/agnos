@@ -43,6 +43,13 @@ if ! env DOOM_SELFTEST=1 DOOM_DIRECTMAP="${DOOM_DIRECTMAP:-}" sh "$ROOT/scripts/
     echo "  BUILD-FAIL (see /tmp/doom-smoke-build.log)"; tail -5 /tmp/doom-smoke-build.log; exit 1
 fi
 echo "  build/agnos $(stat -c %s "$AGNOS") B"
+# ⭐ 1.57.7 (IMG-fix, reviews A6/B6): LEAVE A PLAIN PRODUCTION BUILD BEHIND on every exit from here on, as
+# dhcp-opt/userwin/net-csum do. This smoke used to leave its DOOM_SELFTEST kernel in build/agnos, and the IMG run's
+# next smoke (shutdown-smoke, which boots whatever is there) booted it and scored all three arms PASS. The trap
+# rebuilds plain at exit (the disk image below already carries the DOOM_SELFTEST kernel it boots).
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # qemu_boot_class / qemu_attempt_verdict
+doom_restore_plain() { sh "$ROOT/scripts/build.sh" >/dev/null 2>&1 || echo "  WARN: could not restore the plain build (sh scripts/build.sh)"; }
+trap doom_restore_plain EXIT
 
 WORK="$ROOT/build/doom-smoke"; LOGS="$ROOT/build/doom-smoke-logs"
 rm -rf "$WORK" "$LOGS"; mkdir -p "$WORK" "$LOGS"
@@ -66,6 +73,10 @@ mformat -i "$IMG"@@1048576 -F
 mmd -i "$IMG"@@1048576 ::EFI ::EFI/BOOT ::boot
 mcopy -i "$IMG"@@1048576 "$GNOBOOT" ::EFI/BOOT/BOOTX64.EFI
 mcopy -i "$IMG"@@1048576 "$AGNOS" ::boot/agnos
+# 1.57.7 (HAR): record WHICH kernel this image carries — build.sh's provenance (flags + md5) copied beside the image,
+# written NOW (its mtime = bake time). doom-input-test.py checks staleness against THIS record and the kernel inside the
+# image, not build/agnos (which the EXIT trap below rebuilds plain, so it is always newer than the image).
+cp "$ROOT/build/agnos.flags" "$IMG.kernel.flags"
 mkfs.ext2 -F -q -L AGNOS-DOOM -b 4096 -m 0 -O "$EXT2_FEATURES" \
     -d "$SEED" -E offset=$PART_OFFSET "$IMG" $PART_BLOCKS
 
@@ -93,7 +104,7 @@ while :; do
         -monitor "unix:$WORK/mon.sock,server,nowait" \
         -serial "file:$SLOG" -no-reboot &
     QPID=$!
-    trap 'kill $QPID 2>/dev/null' EXIT
+    trap 'kill $QPID 2>/dev/null; doom_restore_plain' EXIT
     # Wait for doom to start (or for the firmware to give up), then give it time to slurp the 4 MB WAD + render.
     dvoid=0
     for i in $(seq 1 30); do
@@ -105,8 +116,16 @@ while :; do
     done
     grep -aq "AGNOS kernel v" "$SLOG" 2>/dev/null || dvoid=1
     if [ "$dvoid" = "1" ]; then
-        kill $QPID 2>/dev/null; wait $QPID 2>/dev/null; trap - EXIT
+        kill $QPID 2>/dev/null; wait $QPID 2>/dev/null; trap doom_restore_plain EXIT
         cp "$SLOG" "$LOGS/serial.void$dtry.log"
+        # 1.57.7 (IMG-fix, A2): "no banner" is two events. gnoboot's hand-off line with no "fail @" after it
+        # means the KERNEL took control and died before its banner — a FAIL, never another attempt.
+        if [ "$(qemu_boot_class "$SLOG")" = "died" ]; then
+            echo "  FAIL: attempt $dtry — gnoboot handed off (no 'fail @' line) and the kernel never printed its banner"
+            echo "        (the kernel died pre-banner; not a firmware VOID). log: $LOGS/serial.void$dtry.log"
+            echo "doom-smoke: FAIL"; exit 1
+        fi
+        echo "  (VOID attempt $dtry: $(qemu_void_why "$SLOG"))"
         if [ "$dtry" -lt "$DOOM_TRIES" ]; then
             echo "  (firmware never handed off — kernel did not start; retrying $dtry/$((DOOM_TRIES - 1)))"
             dtry=$((dtry + 1)); continue
@@ -130,7 +149,7 @@ s.sendall(("screendump %s\n" % out).encode()); time.sleep(2.0)
 s.close()
 PY
 
-kill $QPID 2>/dev/null; trap - EXIT
+kill $QPID 2>/dev/null; trap doom_restore_plain EXIT
 
 echo ""
 echo "  --- doom serial lines ---"

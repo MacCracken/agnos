@@ -22,7 +22,8 @@ fn pic_init() {
     # forever. QEMU's q35 always has a real i8042 that can assert it, so this line is what keeps an
     # unowned interrupt from wedging the chip.
     # ⚠ The PIT COUNTER still free-runs below (mode-2 rate generator): masking the IRQ does not stop the
-    # counter, and `pit_ch0_read()` still feeds lapic_calibrate and the GPU timebase.
+    # counter, and `pit_ch0_read()` still feeds the GPU timebase and lapic_calibrate — since 1.57.7 (S1b)
+    # only the PM-LESS fallback of the LAPIC reload (the ACPI PM timer measures it when the early probe finds one).
     asm { 0xB0; 0xFF; 0xBA; 0x21; 0x00; 0x00; 0x00; 0xEE; }  # out 0x21, 0xFF (all master lines masked)
     asm { 0xB0; 0xFF; 0xBA; 0xA1; 0x00; 0x00; 0x00; 0xEE; }  # out 0xA1, 0xFF
     # Program PIT channel 0: mode 2 (rate generator), ~100 Hz
@@ -54,7 +55,7 @@ fn timer_handler(rsp_after_push) {
     # CPU would keep the timer vector in service and lose its tick). The net effect on the interrupted
     # context's count is zero.
     preempt_disable();
-    kst_isr_hook();                                    # 1.57.6 (S3.3) KSTACK_SELFTEST: ISR-body preempt sample + the park wake (no-op twin)
+    kst_isr_hook(rsp_after_push);                      # 1.57.6 (S3.3) KSTACK_SELFTEST: ISR-body preempt sample + the park wake + (1.57.7) the AC sample (no-op twin)
     pd510_tick_watch();
     # ⭐ CHARGE THIS TICK TO THE RUNNING PROCESS (1.56.59, telemetry §4) — the per-process CPU time a
     # monitor's CPU% column is built from.
@@ -73,9 +74,12 @@ fn timer_handler(rsp_after_push) {
     # scheduler's hot path to sharpen a number nobody reads at that resolution.
     # ⭐ 1.56.60 — DO NOT CHARGE A TICK THAT PAID FOR A HALT. `cpu_in_halt[cpu]` is set around the
     # `hlt` in arch_wait() (arch/x86_64/io.cyr), which is where every blocking wait in the kernel
-    # parks. Without this the counter measured WALL time, not CPU time: sleep_ms#41 halts with the
+    # parks. Without this the counter measured WALL time, not CPU time: sleep_ms#41 halted with the
     # caller still current (preempt_disable, so do_context_switch early-returns), so a process
     # blocked in a syscall accrued at wall-clock rate and a monitor rendered it at 100% while asleep.
+    # (1.57.7: #41 now BLOCKS its caller — a blocked process is not current and accrues no ticks. The
+    # legacy preempt-held sti window (sleep_ms#41's pre-1.57.7 body) still halts with the caller current,
+    # for the contexts that cannot block, and the other preempt-held waits still use the same shape.)
     # Measured and reported by chakshu v0.9.9, which built the CPU% column and backed it out.
     # ⚠ THIS DOES NOT RE-CHARGE THE TICK ELSEWHERE. Halted time belongs to no process — it is the
     # box being idle — and inventing an owner for it is what produced the wrong number.
@@ -91,7 +95,7 @@ fn timer_handler(rsp_after_push) {
     # (core/sched.cyr) parks in arch_wait, so this happens almost immediately on any real boot.
     # ⇒ Consuming it here makes the suppression ONE-SHOT: one `hlt` cancels exactly the one tick
     # that woke it, which is the correct accounting anyway. A long wait re-arms it on every loop
-    # iteration (sleep_ms#41 does ~30 hlts for 300 ms, cancelling ~30 ticks).
+    # iteration (the legacy sleep_ms#41 loop does ~30 hlts for 300 ms, cancelling ~30 ticks).
     # ⚠ arch_wait's post-hlt clear is STILL REQUIRED and is not redundant: a wait woken by a
     # NON-timer interrupt leaves the flag armed with no ISR here to consume it, and it would then
     # eat the next unrelated tick.
@@ -100,6 +104,11 @@ fn timer_handler(rsp_after_push) {
     if (tk_hc < 4) {
         tk_halted = load64(&cpu_in_halt + tk_hc * 8);
         if (tk_halted != 0) { store64(&cpu_in_halt + tk_hc * 8, 0); }
+        # ⭐ 1.57.7 (Path 2, S3.8): the tick ends any halt on this CPU and may switch the halted context out (the same
+        # reason this ISR consumes cpu_in_halt above), so the kick-target flag is cleared here too: a flag left at 1 on
+        # a CPU that now runs another process would draw 0xE1 kicks it cannot serve. (Forward &var into proc.cyr — the
+        # &cpu_in_halt precedent.) The idle step / park set it again before their next hlt.
+        store64(&cpu_kickable + tk_hc * 8, 0);
     }
     var tk_p = proc_current_get();
     if (tk_halted == 0) {
@@ -122,7 +131,8 @@ fn timer_handler(rsp_after_push) {
     }
     # 1.46.x SMP sub-bite 6b: the BSP owns the wall clock + the single NIC ring. An AP's
     # timer tick must NOT bump timer_ticks (one global clock) nor re-enter net_rx_drain (one
-    # shared r8169 ring, single-consumer). Gate both behind pcpu_cpu()==0. ALWAYS-TRUE
+    # shared r8169 ring, single-consumer). Gate both behind pcpu_cpu()==0. (1.57.7: wq_tick, the wait-deadline
+    # expiry, is deliberately OUTSIDE this gate — below — every CPU runs it.) ALWAYS-TRUE
     # single-core (pcpu_cpu()==0), so this is byte-identical there; LOAD-BEARING on multi-core since
     # sub-bite 7 — a woken AP arms its own APIC timer (smp.cyr) and takes ticks, and this gate keeps
     # that AP tick off the BSP-owned wall clock + single NIC ring. do_context_switch runs on EVERY
@@ -135,11 +145,10 @@ fn timer_handler(rsp_after_push) {
         # replies (the iron 50%-loss; QEMU's quiet point-to-point SLIRP never showed
         # it). The drain is self-guarded (net_rx_lock atomic try-lock, 1.46.x #5), so it no-ops
         # (trylock fails) rather than re-enter a tool's in-flight drain — now correct cross-CPU.
-        # ⛔ 1.56.51 — THIS SAID "RX-only ... issues no TX from interrupt context" AND IT WAS FALSE.
-        # net_demux_frame dispatches to net_handle_arp, which builds and nic_send()s an ARP reply,
-        # and to net_handle_tcp, whose passive open calls kmalloc (heap_spin_lock) — a same-CPU
-        # deadlock if the tick lands inside the heap critical section. Hence net_rx_drain_isr(),
-        # which latches interrupt context so the allocating path declines instead of hanging. Runs before the context switch so it executes in the kernel context
+        # ⭐ 1.57.7 (S4): net_rx_drain_isr() is the named interrupt-context seam into the RX demux. It
+        # TRANSMITS (ARP/ICMP replies, TCP ACK/SYN-ACK/FIN/RST) and serves passive opens, and everything it
+        # reaches takes only IRQ-saved net locks or try-locks and never allocates (the TCP conn pool is
+        # kmalloc'd at boot) — see its header in net_ingress.cyr. Runs before the context switch so it executes in the kernel context
         # established at ISR entry (pre-CR3-swap); nic_ready() gates it to a no-op
         # until the NIC is up, so early-boot ticks are safe.
         net_rx_drain_isr();
@@ -167,12 +176,25 @@ fn timer_handler(rsp_after_push) {
         # protection out.
         hid_poll();
     }
+    # ⭐ 1.57.7 (Path 2, S3.4): expire wait deadlines — on EVERY CPU, deliberately OUTSIDE the BSP-only block above.
+    # A deadline is a property of a waiter, not of the wall clock, and a waiter pinned to or halted on an AP must
+    # time out even while the BSP runs a long IF=0 syscall (in TSC mode the deadlines are on sched_clock_us, which
+    # every CPU can read). Inside the preempt bracket: wq_tick only wakes, never switches (sched.cyr).
+    wq_tick();
+    # ⭐ 1.57.7 (S6): the timer-driven half of the net stack — retransmits for BLOCKED senders, the held-FIN-slot
+    # timers, and the loopback drain — on EVERY CPU (net_ingress.cyr; one CPU runs its body at a time, a busy tick
+    # skips). Inside the preempt bracket: it only wakes (wq_wake), never switches.
+    net_tick();
     preempt_enable();                                  # 1.57.6 (S3.2): end of the ISR body — the switch decision sees the interrupted count
     # 1.57.6 (Path 2, S3.1): do_context_switch returns 0 (no switch — the stub's own epilogue resumes the
     # interrupted context) or old + 1 (a real switch: the frame holds NEW's context but sits on OLD's
     # stack, so this handler must leave through sched_leave_old, which moves off that stack, publishes
     # on_cpu(old) = -1 and iretqs into new — it never returns here). The EOI stays BEFORE the tail, so
     # the LAPIC in-service bit is clear whichever way this tick leaves.
+    # ⭐ 1.57.7 (S7) — THE LIFECYCLE TICK (boundary B): a kill or stop pending on a CPL3-interrupted, unpinned current
+    # takes effect here, on every CPU, before the switch decision (INV-L2 — sched.cyr proc_tick_lifecycle). Per tick:
+    # 1 call + 2 loads (the pid is tk_p, read above: no second LAPIC read).
+    proc_tick_lifecycle(rsp_after_push, tk_p);
     var tk_sw = do_context_switch(rsp_after_push);
     # EOI: APIC if enabled, otherwise legacy PIC
     if (apic_enabled == 1) {
@@ -196,6 +218,11 @@ fn timer_isr_build() {
     var p = &timer_isr;
     var handler_addr = &timer_handler;
     var off = 0;
+    # 1.57.7 (S3.4) — clac FIRST: no inputs/outputs; clears RFLAGS.AC. Hardware does not clear AC on interrupt
+    # delivery, so without it this ISR body would run with SMAP OFF whenever it lands on ring 3 that set AC with
+    # popf, or inside a syscall after the entry stub's stac. The saved RFLAGS keeps the interrupted AC; iretq
+    # restores it. (kstack-smoke's "isr clac" phase checks every gate's first three bytes.)
+    store8(p + off, 0x0F); store8(p + off + 1, 0x01); store8(p + off + 2, 0xCA); off = off + 3;   # clac
 
     # Caller-saved: rax rcx rdx rsi rdi r8 r9 r10 r11
     store8(p + off, 0x50); off = off + 1;  # push rax
@@ -268,10 +295,11 @@ var nic_rx_irq_printed = 0;
 # 1.51.5 — NIC RX MSI-X interrupt handler. Same body the 100 Hz timer tick runs
 # (net_rx_drain), but triggered by the NIC on packet arrival so a blocked hlt wakes
 # immediately instead of on the next tick — the proper fix for the tick-paced net
-# latency floor (obsoletes the 1.51.3 busy-poll for the common case). RX-only,
-# self-guarded (net_rx_lock trylock), issues no TX, and NEVER schedules — so it is
-# safe in the preempt-held connect/recv window (the serial-kstack invariant holds,
-# exactly as the timer ISR's drain already does). nic_ready() gates net_rx_drain to
+# latency floor (obsoletes the 1.51.3 busy-poll for the common case). Self-guarded
+# (net_rx_lock trylock); it may TRANSMIT replies under the IRQ-saved net locks (1.57.7 S4 —
+# net_rx_drain_isr's contract), and NEVER schedules — it only WAKES: since 1.57.7 (S6) a
+# demuxed ACK / SYN-ACK / RST / echo reply wakes the #47/#48/#55/#100 caller BLOCKED on it
+# (wq_wake after the net locks are released; the kick reaches a halted CPU). nic_ready() gates net_rx_drain to
 # a no-op before the NIC is up. LAPIC-EOI (MSI-X delivers via the LAPIC).
 fn nic_rx_handler() {
     preempt_disable();                                 # 1.57.6 (S3.2): an ISR body is non-preemptible (see timer_handler)
@@ -294,6 +322,11 @@ fn nic_rx_isr_build() {
     var p = &nic_rx_isr;
     var handler_addr = &nic_rx_handler;
     var off = 0;
+    # 1.57.7 (S3.4) — clac FIRST: no inputs/outputs; clears RFLAGS.AC. Hardware does not clear AC on interrupt
+    # delivery, so without it this ISR body would run with SMAP OFF whenever it lands on ring 3 that set AC with
+    # popf, or inside a syscall after the entry stub's stac. The saved RFLAGS keeps the interrupted AC; iretq
+    # restores it. (kstack-smoke's "isr clac" phase checks every gate's first three bytes.)
+    store8(p + off, 0x0F); store8(p + off + 1, 0x01); store8(p + off + 2, 0xCA); off = off + 3;   # clac
     # caller-saved: rax rcx rdx rsi rdi r8 r9 r10 r11
     store8(p + off, 0x50); off = off + 1;  # push rax
     store8(p + off, 0x51); off = off + 1;  # push rcx
@@ -367,6 +400,11 @@ fn xhci_rx_isr_build() {
     var p = &xhci_rx_isr;
     var handler_addr = &xhci_rx_handler;
     var off = 0;
+    # 1.57.7 (S3.4) — clac FIRST: no inputs/outputs; clears RFLAGS.AC. Hardware does not clear AC on interrupt
+    # delivery, so without it this ISR body would run with SMAP OFF whenever it lands on ring 3 that set AC with
+    # popf, or inside a syscall after the entry stub's stac. The saved RFLAGS keeps the interrupted AC; iretq
+    # restores it. (kstack-smoke's "isr clac" phase checks every gate's first three bytes.)
+    store8(p + off, 0x0F); store8(p + off + 1, 0x01); store8(p + off + 2, 0xCA); off = off + 3;   # clac
     # caller-saved: rax rcx rdx rsi rdi r8 r9 r10 r11
     store8(p + off, 0x50); off = off + 1;  # push rax
     store8(p + off, 0x51); off = off + 1;  # push rcx

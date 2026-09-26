@@ -1,0 +1,658 @@
+# sockw — the RING-3 half of agnos 1.57.7 step S6 (sock_connect#47, sock_send#48, icmp_echo#55/#100 block ONLY
+# their caller; #48 is stream-correct; a stalled reader keeps its connection).
+#
+# Issue: docs/development/issues/2026-09-23-sock-send-and-connect-hold-the-cpu.md.
+#
+# Seeded as /bin/agnsh (the driver, launched by kybernet on a PLAIN kernel — D19) AND /bin/sockw (every child role,
+# selected by argv). scripts/smoke/sock-wait-smoke.sh seeds /sw/mode ("all" | "wire" | "d" = N6 only), /sw/hostport (a host sink on
+# 127.0.0.1, reached as 10.0.2.2) and /sw/closedport (a host port nothing listens on: SLIRP answers with RST).
+# The driver prints `SOCKW-PHASE <name>` before each phase, CONTINUES after a FAIL (the verdict is the full list),
+# ends `SOCKW-DONE` then `SOCKW-EXIT 0` and exits 0 (a non-zero exit drops kybernet into the emergency shell).
+# Children are reaped with WAIT_BLOCK (#4 0x100|pid). Every timing is on uptime_us#95; #95 == -1 -> SOCKW-FAIL.
+# "Share" = the spinners' own #99 tick delta over a window, per mille of K x (window in ticks): a waiter that holds
+# its CPU (the pre-1.57.7 preempt-held window) starves the spinner on that CPU.
+# Raw `syscall(N, a1, a2, a3, a4)`; explicit zeros for unused args. Output is line-buffered, one write(1) per line.
+
+# Module-scope `var X[N]` is N u64 = 8N BYTES.
+var s_big[2048];        # 16384 B: the send pattern
+var s_rb[64];           # 512 B: receive chunk
+var s_pl[128];          # 1024 B: proclist#99 (16 x 64-byte records)
+var s_si[16];           # 128 B: sysinfo#35
+var s_line[64];         # 512 B: #43 command lines
+var s_f[8];             # 64 B: file scratch
+var s_lb[32];           # 256 B: the current output line
+var s_pids[8];          # the spinners of the current phase
+var s_rtt[128];         # 1024 B: 128 u64 RTT samples
+var S_LN = 0;
+var S_IP = 0;
+var S_NCPU = 1;
+var S_HP = 0;
+var S_CP = 0;
+var S_WIRE = 0;         # /sw/mode "wire": N0 + N8 only
+var S_CLOSED = 18999;   # a local port nothing listens on (agnos sends no RST: the dial is silent)
+
+fn s_flush() { if (S_LN > 0) { syscall(1, 1, &s_lb, S_LN, 0); } S_LN = 0; return 0; }
+fn s_putc(ch) {
+    if (S_LN >= 250) { s_flush(); }
+    store8(&s_lb + S_LN, ch);
+    S_LN = S_LN + 1;
+    if (ch == 10) { s_flush(); }
+    return 0;
+}
+fn s_out(s) {
+    var l = strlen(s);
+    var i = 0;
+    while (i < l) { s_putc(load8(s + i)); i = i + 1; }
+    return 0;
+}
+fn s_num(n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { s_putc(45); n = 0 - n; }
+    if (n == 0) { s_putc(48); return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; s_putc(load8(&b + i)); }
+    return 0;
+}
+fn s_kv(k, v) { s_out(" "); s_out(k); s_out("="); s_num(v); return 0; }
+fn s_nl() { s_out("\n"); return 0; }
+fn s_eq(a, b) {
+    var i = 0;
+    while (1) {
+        var ca = load8(a + i);
+        if (ca != load8(b + i)) { return 0; }
+        if (ca == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn s_atoi(s) {
+    var v = 0;
+    var i = 0;
+    var neg = 0;
+    if (load8(s) == 45) { neg = 1; i = 1; }
+    while (load8(s + i) >= 48) {
+        if (load8(s + i) > 57) { break; }
+        v = v * 10 + (load8(s + i) - 48);
+        i = i + 1;
+    }
+    if (neg == 1) { return 0 - v; }
+    return v;
+}
+fn s_cat(dst, off, s) {
+    var l = strlen(s);
+    var i = 0;
+    while (i < l) { store8(dst + off + i, load8(s + i)); i = i + 1; }
+    return off + l;
+}
+fn s_catnum(dst, off, n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { store8(dst + off, 45); off = off + 1; n = 0 - n; }
+    if (n == 0) { store8(dst + off, 48); return off + 1; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; store8(dst + off, load8(&b + i)); off = off + 1; }
+    return off;
+}
+
+fn s_us() { return syscall(95, 0, 0, 0, 0); }                     # uptime_us#95
+fn s_sleep(ms) { return syscall(41, ms, 0, 0, 0); }               # sleep_ms#41 (blocks since S3c)
+fn s_pause() { syscall(14, 0, 0, 0, 0); return 0; }               # pause#14
+fn s_listen(p) { return syscall(56, p, 0, 0, 0); }
+fn s_accept(l) { return syscall(57, l, 0, 0, 0); }
+fn s_connect(ip, p, sp) { return syscall(47, ip, p, sp, 0); }
+fn s_send(c, b, n) { return syscall(48, c, b, n, 0); }
+fn s_recv(c, b, n) { return syscall(49, c, b, n, 0); }
+fn s_close(c) { return syscall(50, c, 0, 0, 0); }
+fn s_netcfg(f) { return syscall(61, f, 0, 0, 0); }
+fn s_ping(ip, ms) { return syscall(100, ip, ms, 0, 0); }          # icmp_echo_ex#100
+fn s_pat(i) { return (i * 7 + 3) & 0xFF; }
+
+# #99 cpu ticks (low 32 bits of +56) of `pid`, -1 if not listed.
+fn s_ticks(pid) {
+    var n = syscall(99, &s_pl, 16, 0, 0);
+    var i = 0;
+    while (i < n) {
+        var r = &s_pl + i * 64;
+        if (load64(r) == pid) { return load64(r + 56) & 0xFFFFFFFF; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+fn s_readnum(path) {
+    var fd = syscall(7, path, strlen(path), 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    var n = syscall(5, fd, &s_f, 60, 0);
+    syscall(6, fd, 0, 0, 0);
+    if (n <= 0) { return 0 - 1; }
+    store8(&s_f + n, 0);
+    return s_atoi(&s_f);
+}
+fn s_readmode() {
+    var fd = syscall(7, "/sw/mode", 8, 0, 0);
+    if (fd < 0) { return 0; }
+    var n = syscall(5, fd, &s_f, 60, 0);
+    syscall(6, fd, 0, 0, 0);
+    if (n > 0) { if (load8(&s_f) == 119) { S_WIRE = 1; } }            # 'w'
+    if (n > 0) { if (load8(&s_f) == 100) { S_WIRE = 2; } }            # 'd': N6 only (a debugging knob)
+    return 0;
+}
+
+# Spawn "/bin/sockw <role> <a> [<b> [<c>]]" (line form). -999999 = omitted.
+fn s_spawn(role, a, b, c) {
+    var o = s_cat(&s_line, 0, "/bin/sockw ");
+    o = s_cat(&s_line, o, role);
+    store8(&s_line + o, 32); o = s_catnum(&s_line, o + 1, a);
+    if (b != (0 - 999999)) { store8(&s_line + o, 32); o = s_catnum(&s_line, o + 1, b); }
+    if (c != (0 - 999999)) { store8(&s_line + o, 32); o = s_catnum(&s_line, o + 1, c); }
+    store8(&s_line + o, 0);
+    return syscall(43, &s_line, o, 0, 0);
+}
+fn s_reap(pid) {
+    if (pid < 0) { return 0 - 999; }
+    var r = syscall(4, 0x100 | pid, 0, 0, 0);                     # WAIT_BLOCK
+    if (r >= 0) { return r; }
+    var t0 = s_us();
+    while (s_us() - t0 < 120000000) {                               # fallback: the plain poll (-2 = alive)
+        r = syscall(4, pid, 0, 0, 0);
+        if (r != (0 - 2)) { return r; }
+        s_sleep(10);
+    }
+    return 0 - 998;
+}
+fn s_ok(tag) { s_out("SOCKW-"); s_out(tag); return 0; }
+fn s_fail(tag) { s_out("SOCKW-FAIL "); s_out(tag); return 0; }
+fn s_phase(name) { s_out("SOCKW-PHASE "); s_out(name); s_nl(); return 0; }
+
+# K = ncpu spinners, each spinning for dur_ms from ITS OWN start (a spawn can take several ticks: an absolute end
+# computed before the spawns measured spinners that had already exited at -smp 4). Returns K.
+fn s_spinners(dur_ms) {
+    var k = 0;
+    while (k < S_NCPU) { store64(&s_pids + k * 8, s_spawn("spin", dur_ms, 0 - 999999, 0 - 999999)); k = k + 1; }
+    return k;
+}
+fn s_spin_ticks(k) {
+    var t = 0;
+    var i = 0;
+    while (i < k) { var v = s_ticks(load64(&s_pids + i * 8)); if (v > 0) { t = t + v; } i = i + 1; }
+    return t;
+}
+fn s_spin_reap(k) {
+    var i = 0;
+    while (i < k) { s_reap(load64(&s_pids + i * 8)); i = i + 1; }
+    return 0;
+}
+# Measure the spinners' share (per mille) over a sleep of `ms` (the driver blocks in #41).
+fn s_share(k, ms) {
+    var a = s_spin_ticks(k);
+    var t0 = s_us();
+    s_sleep(ms);
+    var w = s_us() - t0;
+    var b = s_spin_ticks(k);
+    var wt = w / 10000;
+    if (wt < 1) { wt = 1; }
+    s_out("SOCKW-SHARE-RAW"); s_kv("a", a); s_kv("b", b); s_kv("w_us", w); s_kv("k", k);
+    var i = 0;
+    while (i < k) { s_kv("pid", load64(&s_pids + i * 8)); s_kv("t", s_ticks(load64(&s_pids + i * 8))); i = i + 1; }
+    s_nl();
+    return ((b - a) * 1000) / (k * wt);
+}
+
+# Accept on `l` with a 10 s cap; -1 = none.
+fn s_accept_wait(l) {
+    var t0 = s_us();
+    while (s_us() - t0 < 10000000) {
+        var c = s_accept(l);
+        if (c >= 0) { return c; }
+        s_sleep(2);
+    }
+    return 0 - 1;
+}
+# Read the whole 16384-byte pattern stream from `c`, verifying every byte. `slow` = 1: 512 B per read + a 20 ms
+# sleep (the issue's slow reader); 0: read as fast as it arrives. `cap_us` bounds it. Returns the verified count
+# (a mismatch stops the count at the first bad byte).
+fn s_read_verify(c, slow, cap_us) {
+    var got = 0;
+    var bad = 0;
+    var t0 = s_us();
+    while (got < 16384 && bad == 0) {
+        if (s_us() - t0 > cap_us) { break; }
+        var want = 512;
+        var r = s_recv(c, &s_rb, want);
+        if (r > 0) {
+            var i = 0;
+            while (i < r) {
+                if (load8(&s_rb + i) != s_pat(got + i)) { bad = 1; got = got + i; i = r; }
+                i = i + 1;
+            }
+            if (bad == 0) { got = got + r; }
+            if (slow == 1) { s_sleep(20); }
+        } elif (r < 0) {
+            break;
+        } else {
+            s_sleep(1);
+        }
+    }
+    return got;
+}
+
+# ═════════════════════════════════════ CHILD ROLES ═════════════════════════════════════
+fn role_spin(dur_ms) { var end_us = s_us() + dur_ms * 1000; while (s_us() < end_us) { } return 0; }
+fn s_fill() { var i = 0; while (i < 16384) { store8(&s_big + i, s_pat(i)); i = i + 1; } return 0; }
+# send <ip> <port> <len>: one #48 of len. Exit bits: 1 = not everything sent, 2 = slower than 4 s.
+fn role_send(ip, port, len) {
+    s_fill();
+    var c = s_connect(ip, port, 0);
+    if (c < 0) { s_out("SOCKW-SEND-NOCONN\n"); return 1; }
+    var t0 = s_us();
+    var n = s_send(c, &s_big, len);
+    var t = s_us() - t0;
+    s_out("SOCKW-SEND-RET="); s_num(n); s_kv("US", t); s_nl();
+    s_close(c);
+    var e = 0;
+    if (n != len) { e = e | 1; }
+    if (t > 4000000) { e = e | 2; }
+    return e;
+}
+# stall <ip> <port> <len>: the first #48 returns the committed count after ~8 s with no progress (D6); the second
+# #48 sends the rest, waiting first for the segment still in flight. Exit bits: 1 = ret1 out of [2048, len),
+# 2 = the first call's time out of [7 s, 12 s], 4 = ret2 != len - ret1.
+fn role_stall(ip, port, len) {
+    s_fill();
+    var c = s_connect(ip, port, 0);
+    if (c < 0) { s_out("SOCKW-STALL-NOCONN\n"); return 7; }
+    var t0 = s_us();
+    var n1 = s_send(c, &s_big, len);
+    var t1 = s_us() - t0;
+    s_out("SOCKW-STALL-RET1="); s_num(n1); s_kv("US", t1); s_nl();
+    var n2 = 0 - 1;
+    if (n1 >= 0 && n1 < len) { n2 = s_send(c, &s_big + n1, len - n1); }
+    s_out("SOCKW-STALL-RET2="); s_num(n2); s_nl();
+    s_close(c);
+    var e = 0;
+    if (n1 < 2048 || n1 >= len) { e = e | 1; }
+    if (t1 < 7000000 || t1 > 12000000) { e = e | 2; }
+    if (n2 != len - n1) { e = e | 4; }
+    return e;
+}
+# persist <ip> <port> <len>: #48 the remainder in a loop until done or -1. Exit 0 iff everything was sent.
+fn role_persist(ip, port, len) {
+    s_fill();
+    var c = s_connect(ip, port, 0);
+    if (c < 0) { s_out("SOCKW-PERSIST-NOCONN\n"); return 1; }
+    var sent = 0;
+    var calls = 0;
+    while (sent < len) {
+        var n = s_send(c, &s_big + sent, len - sent);
+        calls = calls + 1;
+        if (n < 0) { break; }
+        sent = sent + n;
+    }
+    s_out("SOCKW-PERSIST-SENT="); s_num(sent); s_kv("calls", calls); s_nl();
+    s_close(c);
+    if (sent == len) { return 0; }
+    return 1;
+}
+# dial <ip> <port>: exit 0 iff -1 within [7 s, 12 s] (a silent port: the deadline, computed once).
+fn role_dial(ip, port) {
+    var t0 = s_us();
+    var r = s_connect(ip, port, 0);
+    var t = s_us() - t0;
+    s_out("SOCKW-DIAL-RET="); s_num(r); s_kv("US", t); s_nl();
+    if (r >= 0) { s_close(r); return 1; }
+    if (t < 7000000 || t > 12000000) { return 2; }
+    return 0;
+}
+# ping <ip> <count> <ms>: exit 0 iff every #100 answered.
+fn role_ping(ip, count, ms) {
+    var ok = 0;
+    var t0 = s_us();
+    var i = 0;
+    while (i < count) { if (s_ping(ip, ms) >= 0) { ok = ok + 1; } i = i + 1; }
+    s_out("SOCKW-PING-CHILD"); s_kv("ok", ok); s_kv("of", count); s_kv("US", s_us() - t0); s_nl();
+    if (ok == count) { return 0; }
+    return 1;
+}
+# pingsilent <ip> <ms>: exit 0 iff -1 within [1.4 s, 2.5 s] for a 1500 ms bound.
+fn role_pingsilent(ip, ms) {
+    var t0 = s_us();
+    var r = s_ping(ip, ms);
+    var t = s_us() - t0;
+    s_out("SOCKW-PING-SILENT"); s_kv("us", t); s_kv("ret", r); s_nl();
+    if (r != (0 - 1)) { return 1; }
+    if (t < 1400000 || t > 2500000) { return 2; }
+    return 0;
+}
+
+# ═════════════════════════════════════ DRIVER PHASES ═════════════════════════════════════
+fn s_ipname(ip) { if (ip == 0x7F000001) { return "LO"; } return "IP"; }
+
+# N1 — a loopback handshake still completes in the caller's own poll (no tick paid).
+fn ph_n1(ip, port) {
+    var l = s_listen(port);
+    var t0 = s_us();
+    var c = s_connect(ip, port, 0);
+    var t = s_us() - t0;
+    var a = 0 - 1;
+    if (c >= 0) { a = s_accept_wait(l); }
+    if (c >= 0 && a >= 0 && t <= 200000) { s_ok("CONNECT-FAST-"); s_out(s_ipname(ip)); s_kv("us", t); s_nl(); }
+    else { s_fail("CONNECT-FAST-"); s_out(s_ipname(ip)); s_kv("c", c); s_kv("a", a); s_kv("us", t); s_nl(); }
+    if (a >= 0) { s_close(a); }
+    if (c >= 0) { s_close(c); }
+    if (l >= 0) { s_close(l); }
+    return 0;
+}
+
+# N2 — the issue's repro: a 16 KB one-shot to a slow local reader, byte-verified, fast.
+fn ph_n2(ip, port) {
+    var l = s_listen(port);
+    var p = s_spawn("send", ip, port, 16384);
+    var a = s_accept_wait(l);
+    var got = 0;
+    if (a >= 0) {
+        s_sleep(300);
+        got = s_read_verify(a, 1, 10000000);
+        s_close(a);
+    }
+    var e = s_reap(p);
+    if (l >= 0) { s_close(l); }
+    if (got == 16384 && (e & 1) == 0 && e >= 0) { s_ok("SEND-OK-"); s_out(s_ipname(ip)); s_kv("bytes", got); s_nl(); }
+    else { s_fail("SEND-OK-"); s_out(s_ipname(ip)); s_kv("bytes", got); s_kv("exit", e); s_nl(); }
+    if (e >= 0 && (e & 2) == 0) { s_ok("SEND-FAST-"); s_out(s_ipname(ip)); s_nl(); }
+    else { s_fail("SEND-FAST-"); s_out(s_ipname(ip)); s_kv("exit", e); s_nl(); }
+    return 0;
+}
+
+# N3 — #48 does not hold the CPU: the reader pauses 2 s with the sender blocked on a full window.
+fn ph_n3(ip, port) {
+    var l = s_listen(port);
+    var p = s_spawn("send", ip, port, 16384);
+    var a = s_accept_wait(l);
+    var sh = 0 - 1;
+    var got = 0;
+    if (a >= 0) {
+        s_sleep(200);                                               # the sender fills the window and blocks
+        var k = s_spinners(4000);
+        s_sleep(100);
+        sh = s_share(k, 2000);
+        s_spin_reap(k);
+        got = s_read_verify(a, 0, 10000000);
+        s_close(a);
+    }
+    s_reap(p);
+    if (l >= 0) { s_close(l); }
+    if (sh >= 800 && got == 16384) { s_ok("SEND-YIELDS-"); s_out(s_ipname(ip)); s_kv("share", sh); s_nl(); }
+    else { s_fail("SEND-YIELDS-"); s_out(s_ipname(ip)); s_kv("share", sh); s_kv("bytes", got); s_nl(); }
+    return 0;
+}
+
+# N4 — D6 + one segment in flight at entry: the reader reads nothing for 10 s, then everything.
+fn ph_n4(ip, port) {
+    var l = s_listen(port);
+    var p = s_spawn("stall", ip, port, 16384);
+    var a = s_accept_wait(l);
+    var got = 0;
+    if (a >= 0) {
+        s_sleep(10000);
+        got = s_read_verify(a, 0, 20000000);
+        s_close(a);
+    }
+    var e = s_reap(p);
+    if (l >= 0) { s_close(l); }
+    if (e >= 0 && (e & 3) == 0) { s_ok("STALL-"); s_out(s_ipname(ip)); s_kv("exit", e); s_nl(); }
+    else { s_fail("STALL-"); s_out(s_ipname(ip)); s_kv("exit", e); s_nl(); }
+    if (e >= 0 && (e & 4) == 0 && got == 16384) { s_ok("STALL-ONEFLIGHT-"); s_out(s_ipname(ip)); s_kv("bytes", got); s_nl(); }
+    else { s_fail("STALL-ONEFLIGHT-"); s_out(s_ipname(ip)); s_kv("bytes", got); s_kv("exit", e); s_nl(); }
+    return 0;
+}
+
+# N5 — the reader stalls 55 s (past the old ~47 s retransmit exhaustion); the persist cap keeps the connection.
+fn ph_n5(port) {
+    var l = s_listen(port);
+    var p = s_spawn("persist", 0x7F000001, port, 16384);
+    var a = s_accept_wait(l);
+    var got = 0;
+    if (a >= 0) {
+        s_sleep(55000);
+        got = s_read_verify(a, 0, 20000000);
+        s_close(a);
+    }
+    var e = s_reap(p);
+    if (l >= 0) { s_close(l); }
+    if (e == 0 && got == 16384) { s_ok("PERSIST-OK"); s_kv("bytes", got); s_nl(); }
+    else { s_fail("PERSIST-OK"); s_kv("bytes", got); s_kv("exit", e); s_nl(); }
+    return 0;
+}
+
+# N6 — #47 blocks only the caller; the deadline is computed once (a silent local port).
+fn ph_n6(ip) {
+    var p = s_spawn("dial", ip, S_CLOSED, 0 - 999999);
+    s_sleep(200);
+    var k = s_spinners(4000);
+    s_sleep(100);
+    var sh = s_share(k, 2000);
+    s_spin_reap(k);
+    var e = s_reap(p);
+    if (e == 0) { s_ok("DIAL-DEADLINE-"); s_out(s_ipname(ip)); s_nl(); }
+    else { s_fail("DIAL-DEADLINE-"); s_out(s_ipname(ip)); s_kv("exit", e); s_nl(); }
+    if (sh >= 800) { s_ok("CONNECT-YIELDS-"); s_out(s_ipname(ip)); s_kv("share", sh); s_nl(); }
+    else { s_fail("CONNECT-YIELDS-"); s_out(s_ipname(ip)); s_kv("share", sh); s_nl(); }
+    return 0;
+}
+
+# N7 — #55/#100 block only the caller; concurrent pingers each get their own reply.
+fn ph_n7() {
+    var t0 = s_us();
+    var p1 = s_spawn("ping", S_IP, 100, 1000);
+    var p2 = s_spawn("ping", S_IP, 100, 1000);
+    var e1 = s_reap(p1);
+    var e2 = s_reap(p2);
+    var t = s_us() - t0;
+    if (e1 == 0 && e2 == 0 && t <= 20000000) { s_ok("PING-CONCURRENT ok=200/200"); s_kv("us", t); s_nl(); }
+    else { s_fail("PING-CONCURRENT"); s_kv("e1", e1); s_kv("e2", e2); s_kv("us", t); s_nl(); }
+    var ps = s_spawn("pingsilent", 0xC0000201, 1500, 0 - 999999);
+    s_sleep(100);
+    var k = s_spinners(3000);
+    s_sleep(50);
+    var sh = s_share(k, 1000);
+    s_spin_reap(k);
+    var es = s_reap(ps);
+    if (es == 0) { s_ok("PING-SILENT-OK"); s_nl(); } else { s_fail("PING-SILENT"); s_kv("exit", es); s_nl(); }
+    if (sh >= 800) { s_ok("PING-YIELDS"); s_kv("share", sh); s_nl(); } else { s_fail("PING-YIELDS"); s_kv("share", sh); s_nl(); }
+    var tb = s_us();
+    var rb = s_ping(0xC0000201, 1);
+    var tbd = s_us() - tb;
+    if (rb == (0 - 1) && tbd >= 1000 && tbd <= 60000) { s_ok("PING-BOUND"); s_kv("us", tbd); s_nl(); }
+    else { s_fail("PING-BOUND"); s_kv("ret", rb); s_kv("us", tbd); s_nl(); }
+    return 0;
+}
+
+fn s_sort(n) {
+    var i = 1;
+    while (i < n) {
+        var v = load64(&s_rtt + i * 8);
+        var j = i - 1;
+        while (j >= 0) {
+            if (load64(&s_rtt + j * 8) <= v) { break; }
+            store64(&s_rtt + (j + 1) * 8, load64(&s_rtt + j * 8));
+            j = j - 1;
+        }
+        store64(&s_rtt + (j + 1) * 8, v);
+        i = i + 1;
+    }
+    return 0;
+}
+# 100 x (64 B send + 64 B echo); fills s_rtt and sorts it. Returns the number of good round trips.
+fn s_rtt_run(c) {
+    var n = 0;
+    var i = 0;
+    while (i < 100) {
+        var t0 = s_us();
+        if (s_send(c, &s_big, 64) != 64) { return n; }
+        var got = 0;
+        var tl = s_us();
+        while (got < 64 && s_us() - tl < 2000000) {
+            var r = s_recv(c, &s_rb + got, 64 - got);
+            if (r > 0) { got = got + r; } elif (r < 0) { return n; } else { s_pause(); }
+        }
+        if (got != 64) { return n; }
+        store64(&s_rtt + n * 8, s_us() - t0);
+        n = n + 1;
+        i = i + 1;
+    }
+    s_sort(n);
+    return n;
+}
+# N8 — the wire: 16 KB to the host sink, then 64 B echo round trips, idle and with K spinners.
+fn ph_n8() {
+    if (S_HP <= 0) { s_fail("WIRE nohostport"); s_nl(); return 0; }
+    s_fill();
+    var t0 = s_us();
+    var c = s_connect(0x0A000202, S_HP, 0);
+    var cus = s_us() - t0;
+    if (c < 0) { s_fail("WIRE noconn"); s_kv("us", cus); s_nl(); return 0; }
+    var t1 = s_us();
+    var n = s_send(c, &s_big, 16384);
+    var sus = s_us() - t1;
+    var got = 0;
+    var tl = s_us();
+    while (got < 9 && s_us() - tl < 5000000) {
+        var r = s_recv(c, &s_rb + got, 9 - got);
+        if (r > 0) { got = got + r; } elif (r < 0) { break; } else { s_pause(); }
+    }
+    var okr = 0;
+    if (got == 9 && load8(&s_rb) == 79 && load8(&s_rb + 3) == 49 && load8(&s_rb + 8) == 10) { okr = 1; }   # "OK 16384\n"
+    if (n == 16384 && okr == 1) { s_ok("WIRE-OK bytes=16384"); s_nl(); }
+    else { s_fail("WIRE-OK"); s_kv("sent", n); s_kv("got", got); s_nl(); }
+    var n1 = s_rtt_run(c);
+    var med = 0 - 1;
+    var p90 = 0 - 1;
+    if (n1 > 0) { med = load64(&s_rtt + (n1 / 2) * 8); p90 = load64(&s_rtt + ((n1 * 9) / 10) * 8); }
+    var k = s_spinners(5000);                                    # a busy run is ~100 x one tick at worst
+    s_sleep(50);
+    var n2 = s_rtt_run(c);
+    var bmed = 0 - 1;
+    var bp90 = 0 - 1;
+    if (n2 > 0) { bmed = load64(&s_rtt + (n2 / 2) * 8); bp90 = load64(&s_rtt + ((n2 * 9) / 10) * 8); }
+    s_close(c);
+    s_out("SOCKW-WIRE-LAT"); s_kv("connect_us", cus); s_kv("send16k_us", sus); s_kv("rtt64_med_us", med);
+    s_kv("rtt64_p90_us", p90); s_kv("busy_rtt64_med_us", bmed); s_kv("busy_rtt64_p90_us", bp90);
+    s_kv("n", n1); s_kv("busy_n", n2); s_nl();
+    s_spin_reap(k);
+    if (sus <= 4000000 && med >= 0 && med < 50000 && n1 == 100) { s_ok("WIRE-LAT-OK"); s_nl(); }
+    else { s_fail("WIRE-LAT"); s_kv("send16k_us", sus); s_kv("med", med); s_kv("n", n1); s_nl(); }
+    return 0;
+}
+
+# N9 — the RST path end to end: nine dials to a closed host port, each -1 within 500 ms.
+fn ph_n9() {
+    if (S_CP <= 0) { s_fail("DIAL-RST noclosedport"); s_nl(); return 0; }
+    var worst = 0;
+    var bad = 0;
+    var i = 0;
+    while (i < 9) {
+        var t0 = s_us();
+        var r = s_connect(0x0A000202, S_CP, 0);
+        var t = s_us() - t0;
+        if (t > worst) { worst = t; }
+        if (r >= 0) { bad = bad + 1; s_close(r); }
+        if (t > 500000) { bad = bad + 1; }
+        i = i + 1;
+    }
+    if (bad == 0) { s_ok("DIAL-RST"); s_kv("us", worst); s_nl(); } else { s_fail("DIAL-RST"); s_kv("bad", bad); s_kv("us", worst); s_nl(); }
+    return 0;
+}
+
+# N10 — no slot leaks after the refused dials: three full loopback conversations in this live process.
+fn ph_n10(port) {
+    var good = 0;
+    var i = 0;
+    while (i < 3) {
+        var l = s_listen(port + i);
+        var c = 0 - 1;
+        var a = 0 - 1;
+        if (l >= 0) { c = s_connect(0x7F000001, port + i, 0); }
+        if (c >= 0) { a = s_accept_wait(l); }
+        var ok = 0;
+        if (a >= 0) {
+            if (s_send(c, "hello", 5) == 5) {
+                var got = 0;
+                var t0 = s_us();
+                while (got < 5 && s_us() - t0 < 2000000) {
+                    var r = s_recv(a, &s_rb + got, 5 - got);
+                    if (r > 0) { got = got + r; } else { s_sleep(1); }
+                }
+                if (got == 5) { ok = 1; }
+            }
+        }
+        if (a >= 0) { s_close(a); }
+        if (c >= 0) { s_close(c); }
+        if (l >= 0) { s_close(l); }
+        good = good + ok;
+        i = i + 1;
+    }
+    if (good == 3) { s_ok("SLOTS-OK"); s_nl(); } else { s_fail("SLOTS"); s_kv("good", good); s_nl(); }
+    return 0;
+}
+
+fn s_driver() {
+    s_readmode();
+    S_HP = s_readnum("/sw/hostport");
+    S_CP = s_readnum("/sw/closedport");
+    if (syscall(35, &s_si, 128, 0, 0) == 0) { S_NCPU = load64(&s_si + 32); }
+    if (S_NCPU < 1) { S_NCPU = 1; }
+    if (S_NCPU > 4) { S_NCPU = 4; }
+    s_phase("N0");
+    var t0 = s_us();
+    if (t0 < 0) { s_fail("no us clock"); s_nl(); }
+    else { s_ok("CLOCK-OK"); s_nl(); }
+    while (s_netcfg(0) <= 0 && s_us() - t0 < 10000000) { s_sleep(50); }
+    S_IP = s_netcfg(0);
+    if (S_IP <= 0) { s_fail("no net_ip"); s_nl(); }
+    s_out("SOCKW-NETIP"); s_kv("ip", S_IP); s_kv("ncpu", S_NCPU); s_kv("hp", S_HP); s_kv("cp", S_CP); s_nl();
+    if (S_WIRE == 1) {
+        s_phase("N8"); ph_n8();
+    } elif (S_WIRE == 2) {
+        s_phase("N6"); ph_n6(0x7F000001);
+    } else {
+        s_phase("N1"); ph_n1(0x7F000001, 19101); ph_n1(S_IP, 19102);
+        s_phase("N2"); ph_n2(0x7F000001, 19111); ph_n2(S_IP, 19112);
+        s_phase("N3"); ph_n3(0x7F000001, 19121); ph_n3(S_IP, 19122);
+        s_phase("N4"); ph_n4(0x7F000001, 19131); ph_n4(S_IP, 19132);
+        s_phase("N5"); ph_n5(19141);
+        s_phase("N6"); ph_n6(0x7F000001); ph_n6(S_IP);
+        s_phase("N7"); ph_n7();
+        s_phase("N8"); ph_n8();
+        s_phase("N9"); ph_n9();
+        s_phase("N10"); ph_n10(19151);
+    }
+    s_out("SOCKW-DONE\n");
+    s_out("SOCKW-EXIT 0\n");
+    return 0;
+}
+
+fn main(): i64 {
+    if (argc() >= 3) {
+        var r = argv(1);
+        var a = s_atoi(argv(2));
+        var b = 0;
+        var c = 0;
+        if (argc() >= 4) { b = s_atoi(argv(3)); }
+        if (argc() >= 5) { c = s_atoi(argv(4)); }
+        if (s_eq(r, "spin") == 1) { return role_spin(a); }
+        if (s_eq(r, "send") == 1) { return role_send(a, b, c); }
+        if (s_eq(r, "stall") == 1) { return role_stall(a, b, c); }
+        if (s_eq(r, "persist") == 1) { return role_persist(a, b, c); }
+        if (s_eq(r, "dial") == 1) { return role_dial(a, b); }
+        if (s_eq(r, "ping") == 1) { return role_ping(a, b, c); }
+        if (s_eq(r, "pingsilent") == 1) { return role_pingsilent(a, b); }
+        s_out("SOCKW-CHILD-BAD-ROLE\n");
+        return 98;
+    }
+    # ⛔ Only /bin/agnsh (kybernet's launch) is the driver; a child with no role must not re-run it.
+    if (s_eq(argv(0), "/bin/agnsh") == 0) { s_out("SOCKW-CHILD-NO-ROLE\n"); return 99; }
+    return s_driver();
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

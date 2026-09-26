@@ -38,6 +38,46 @@ var net_udp_buf_len = 0;
 var net_gateway_mac[8];
 var net_gateway_mac_valid = 0;
 
+# ═══ 1.57.7 (S4) — net lock wrappers (docs/architecture/net-concurrency.md; smp.cyr GLOBAL LOCK ORDER) ═══
+# The ONLY way to take net_tx_lock / lo_q_lock / udp_lock: kbd_irq_save() FIRST (the holder runs IF=0, so the
+# timer/NIC ISR drain on this CPU can never spin on a lock this CPU holds), then the xchg. net_tx_begin keeps
+# the overlap witness (net_tx_inside, declared in r8169.cyr above nic_send). Chain: tcp_tab < net_tx < lo_q;
+# udp_lock is a sibling leaf never held with another net lock. Under any of them: no net_poll, no
+# heap/pmm/console/fs lock, no kmalloc/kfree, no kprint.
+fn net_tx_begin() {
+    var ntb_f = kbd_irq_save();
+    net_tx_spin_lock();
+    net_tx_inside = net_tx_inside + 1;
+    if (net_tx_inside != 1) { net_lk_latch(1, "net: lock overlap - two CPUs inside one net lock", 48); }
+    return ntb_f;
+}
+fn net_tx_end(nte_f) {
+    net_tx_inside = net_tx_inside - 1;
+    net_tx_spin_unlock();
+    kbd_irq_restore(nte_f);
+    return 0;
+}
+fn lo_q_begin() {
+    var lqb_f = kbd_irq_save();
+    lo_q_spin_lock();
+    return lqb_f;
+}
+fn lo_q_end(lqe_f) {
+    lo_q_spin_unlock();
+    kbd_irq_restore(lqe_f);
+    return 0;
+}
+fn udp_begin() {
+    var ub_f = kbd_irq_save();
+    udp_spin_lock();
+    return ub_f;
+}
+fn udp_end(ue_f) {
+    udp_spin_unlock();
+    kbd_irq_restore(ue_f);
+    return 0;
+}
+
 fn net_init(ip, gw, mask) {
     net_ip = ip;
     net_gateway = gw;
@@ -78,6 +118,9 @@ var net_csum_drop_udp  = 0;
 var net_csum_drop_tcp  = 0;
 # 1.56.52 — IPv4 fragments, neither reassembled nor (until now) rejected. See net_demux_frame.
 var net_drop_ip_frag   = 0;
+# 1.57.7 (S5) — wire martians dropped by net_wire_frame (127/8 source or destination, a >= 224 source, our own
+# address as a source). Diagnostic only, written from ISR and thread context (same rationale as above).
+var net_drop_martian   = 0;
 
 # l4_pseudo_csum — one's-complement checksum over the IPv4 pseudo-header + an L4 segment.
 # ⚠ A DELIBERATE NEAR-DUPLICATE of tcp_checksum_compute (net_tcp.cyr), which hardcodes proto = 6 and
@@ -155,6 +198,7 @@ fn udp_build(pkt, src_port, dst_port, data, data_len) {
 
 fn arp_request(target_ip) {
     if (nic_ready() == 0) { return 0 - 1; }
+    var ar_f = net_tx_begin();                 # 1.57.7 (S4): net_pkt + arp_pending_ip + nic_send under net_tx_lock
     # Security: record pending request BEFORE sending (avoid race with fast reply)
     arp_pending_ip = target_ip;
     var p = &net_pkt;
@@ -182,7 +226,9 @@ fn arp_request(target_ip) {
     store8(p + off + 25, (target_ip >> 16) & 0xFF);
     store8(p + off + 26, (target_ip >> 8) & 0xFF);
     store8(p + off + 27, target_ip & 0xFF);
-    return nic_send(p, off + 28);
+    var ar_r = nic_send(p, off + 28);
+    net_tx_end(ar_f);
+    return ar_r;
 }
 
 # Minimal route lookup. Returns 0 on success (out_mac filled with the L2
@@ -272,34 +318,63 @@ fn net_src_for(dst_ip) {
 }
 
 # Copy a fully-framed eth frame into the loopback queue (drop + count on full). 1.49.0 loopback bite 1.
+# 1.57.7 (S4): the caller holds net_tx_lock (net_tx is only reached from inside a TX bracket); the queue
+# itself is lo_q_lock's (chain order net_tx < lo_q).
 fn net_lo_enqueue(buf, len) {
-    if (lo_count >= 8) { lo_dropped = lo_dropped + 1; return 0 - 1; }
-    if (len > 1536) { len = 1536; }
-    var slot = &lo_ring + lo_tail * 1536;
-    memcpy(slot, buf, len);
-    store64(&lo_lens + lo_tail * 8, len);
-    lo_tail = (lo_tail + 1) & 7;
-    lo_count = lo_count + 1;
-    return 0;
+    if (net_tx_inside != 1) { net_lk_latch(2, "net: lock missing - frame sent without net_tx_lock", 50); }
+    var le_f = lo_q_begin();
+    var le_r = 0;
+    if (lo_count >= 8) {
+        lo_dropped = lo_dropped + 1;
+        le_r = 0 - 1;
+    } else {
+        var le_len = len;
+        if (le_len > 1536) { le_len = 1536; }
+        var slot = &lo_ring + lo_tail * 1536;
+        memcpy(slot, buf, le_len);
+        store64(&lo_lens + lo_tail * 8, le_len);
+        lo_tail = (lo_tail + 1) & 7;
+        lo_count = lo_count + 1;
+    }
+    lo_q_end(le_f);
+    return le_r;
 }
 
 # Drain the loopback queue through net_demux_frame (the SAME demux the NIC ring uses). Bounded budget;
 # the loop also processes frames the demux just enqueued (a TCP SYN's SYN-ACK, etc.), so a full
 # handshake completes here without net_tx ever recursing. 1.49.0 loopback bite 1.
+# ⛔ 1.57.7 (S4, N-2) — THE SLOT IS FREED AFTER ITS DEMUX, NOT BEFORE. The old body advanced lo_head and
+# decremented lo_count BEFORE net_demux_frame(slot), so any enqueue during the demux — a reply the demux itself
+# sends when the queue was full, or another CPU's net_tx — could land in the very slot being parsed. Now the
+# demux runs IN PLACE while the slot still counts as occupied, and lo_drain_lock (a TRY-lock) makes this the
+# single consumer. DRAIN-UNLOCK-RECHECK: a frame enqueued while we held the try-lock (whose own drainer lost
+# the try) is picked up by the re-check after the unlock, so nothing is stranded.
 fn net_lo_drain() {
-    var drained = 0;
-    var budget = 64;
-    while (budget > 0) {
-        budget = budget - 1;
-        if (lo_count == 0) { return drained; }
-        var slot = &lo_ring + lo_head * 1536;
-        var slen = load64(&lo_lens + lo_head * 8);
-        lo_head = (lo_head + 1) & 7;
-        lo_count = lo_count - 1;
-        net_demux_frame(slot, slen);
-        drained = drained + 1;
+    if (lo_count == 0) { return 0; }               # lock-free pre-check (a racing enqueue: the re-check or the next poll)
+    var ld_total = 0;
+    var ld_pass = 0;
+    while (ld_pass < 2) {
+        ld_pass = ld_pass + 1;
+        if (lo_drain_trylock() != 0) { return ld_total; }   # another context drains; its post-unlock re-check delivers
+        var ld_budget = 64;
+        while (ld_budget > 0) {
+            ld_budget = ld_budget - 1;
+            var ld_f = lo_q_begin();
+            if (lo_count == 0) { lo_q_end(ld_f); break; }
+            var slot = &lo_ring + lo_head * 1536;
+            var slen = load64(&lo_lens + lo_head * 8);
+            lo_q_end(ld_f);
+            net_demux_frame(slot, slen);           # IN PLACE: the slot still counts as occupied
+            var ld_g = lo_q_begin();
+            lo_head = (lo_head + 1) & 7;           # free AFTER the demux (N-2)
+            lo_count = lo_count - 1;
+            lo_q_end(ld_g);
+            ld_total = ld_total + 1;
+        }
+        lo_drain_unlock();
+        if (lo_count == 0) { return ld_total; }
     }
-    return drained;
+    return ld_total;
 }
 
 # net_tx — the TX chokepoint. An IPv4 frame whose dst is loopback (net_is_loopback) is queued for the
@@ -310,7 +385,14 @@ fn net_tx(buf, len) {
         var ethertype = (load8(buf + 12) << 8) | load8(buf + 13);
         if (ethertype == 0x0800) {
             var dst = (load8(buf + 30) << 24) | (load8(buf + 31) << 16) | (load8(buf + 32) << 8) | load8(buf + 33);
-            if (net_is_loopback(dst) == 1) { return net_lo_enqueue(buf, len); }
+            # 1.57.7 (S5, D21): the loopback path returns the FRAME LENGTH like both drivers (virtio_net/r8169
+            # return the length they queued) — it returned 0, so udp_send#52 to 127.x read as "0 bytes". A full
+            # lo queue still returns -1 (dropped).
+            if (net_is_loopback(dst) == 1) {
+                var lo_r = net_lo_enqueue(buf, len);
+                if (lo_r < 0) { return lo_r; }
+                return len;
+            }
         }
     }
     return nic_send(buf, len);
@@ -329,11 +411,14 @@ fn udp_send(dst_ip, src_port, dst_port, data, data_len) {
     }
     var kmac[8];
     nic_mac(&kmac);   # FIX #1
+    var us_f = net_tx_begin();                 # 1.57.7 (S4): build + send in one net_tx_lock hold
     var p = &net_pkt;
     var off = eth_build(p, &dst_mac, &kmac, 0x0800);
     var udp_len = udp_build(p + off + 20, src_port, dst_port, data, data_len);
     ip_build(p + off, net_src_for(dst_ip), dst_ip, 17, udp_len);   # route-derived source (see net_src_for)
-    return net_tx(p, off + 20 + udp_len);
+    var us_r = net_tx(p, off + 20 + udp_len);
+    net_tx_end(us_f);
+    return us_r;
 }
 
 # Send a UDP datagram with an explicit src_ip override (for DHCP, where
@@ -345,28 +430,76 @@ fn udp_send_from(src_ip, dst_ip, src_port, dst_port, data, data_len) {
     memset(&dst_mac, 0xFF, 6);
     var kmac[8];
     nic_mac(&kmac);   # FIX #1
+    var usf_f = net_tx_begin();                # 1.57.7 (S4): build + send in one net_tx_lock hold
     var p = &net_pkt;
     var off = eth_build(p, &dst_mac, &kmac, 0x0800);
     var udp_len = udp_build(p + off + 20, src_port, dst_port, data, data_len);
     ip_build(p + off, src_ip, dst_ip, 17, udp_len);
-    return nic_send(p, off + 20 + udp_len);
+    var usf_r = nic_send(p, off + 20 + udp_len);
+    net_tx_end(usf_f);
+    return usf_r;
 }
 
 # === UDP listener table (1.32.0 bite F — server-side UDP) ===
-# 8 listeners × 48 bytes per entry. Layout per entry:
+# 8 listeners × 64 bytes per entry (1.57.7 S5: 48 → 64 for the owner fields). Layout per entry:
 #   offset 0:  state (0=free, 1=bound)
 #   offset 8:  local_port (u16 effective; stored as u64)
-#   offset 16: buf_ptr (heap-allocated 256-byte recv buffer)
+#   offset 16: buf_ptr — the slot's 1024-byte BOOT-POOL buffer (udp_pool_buf[id]; 1.57.7 S5: never freed)
 #   offset 24: buf_len (0 if no datagram pending; else bytes received)
 #   offset 32: peer_ip (src ip of most-recent received datagram)
 #   offset 40: peer_port (src port of most-recent received datagram)
+#   offset 48: owner tag (1.57.7 S5) — pid+1 of the binding incarnation; 0 = kernel (DHCP 68, the DNS and NTP
+#              client ports) or free
+#   offset 56: owner epoch — proc_epoch[tag-1] at bind time; 0 when the tag is 0
 # Module-global `var X[N]` = N×u64 = 8N bytes per [[feedback_cyrius_var_array_u64_units]]
-# → var udp_listeners[48] = 48*8 = 384 bytes = 8 × 48 byte entries. ✓
-var udp_listeners[48];
+# → var udp_listeners[64] = 64*8 = 512 bytes = 8 × 64 byte entries. ✓
+var udp_listeners[64];
 var udp_listener_count = 0;
+# 1.57.7 (S5) — the UDP BOOT POOL: slot i's 1024-byte receive buffer, kmalloc'd ONCE by udp_pool_init (main.cyr,
+# after tcp_pool_init, before dhcp_init's bind). bind/unbind/udp_release_pid never touch the heap, so the death
+# release is legal from any context (S7's ring-3-tick ISR included) and no listener buffer is ever freed under
+# an ISR copy.
+var udp_pool_buf[8];
+var udp_pool_ready = 0;
 
 fn udp_listener_base(listener_id) {
-    return &udp_listeners + listener_id * 48;
+    return &udp_listeners + listener_id * 64;
+}
+
+fn udp_pool_init() {
+    if (udp_pool_ready == 1) { return 0; }
+    var up_ok = 1;
+    for (var upi = 0; upi < 8; upi = upi + 1) {
+        var up_b = kmalloc(1024);
+        store64(&udp_pool_buf + upi * 8, up_b);
+        if (up_b == 0) { up_ok = 0; }
+    }
+    if (up_ok == 0) {
+        for (var upj = 0; upj < 8; upj = upj + 1) {
+            var up_c = load64(&udp_pool_buf + upj * 8);
+            if (up_c != 0) { kfree_sized(up_c, 1024); }
+            store64(&udp_pool_buf + upj * 8, 0);
+        }
+        return 0 - 1;
+    }
+    udp_pool_ready = 1;
+    return 0;
+}
+
+# 1.57.7 (S5, D13) — UDP listener ownership: tcp_owner_is's shape over +48/+56. Lock-free = prefilter only.
+fn udp_owner_is(uo_lid, uo_own) {
+    if (uo_lid < 0) { return 0; }
+    if (uo_lid >= udp_listener_count) { return 0; }
+    var uo_lb = udp_listener_base(uo_lid);
+    if (load64(uo_lb + 48) != uo_own) { return 0; }
+    if (uo_own == 0) { return 1; }
+    if (uo_own > 16) { return 0; }
+    if (load64(uo_lb + 56) != proc_epoch_get(uo_own - 1)) { return 0; }
+    return 1;
+}
+fn udp_auth(ua_lid) {
+    if (udp_owner_is(ua_lid, proc_current_get() + 1) == 1) { return ua_lid; }
+    return 0 - 1;
 }
 
 fn udp_find_listener(port) {
@@ -394,70 +527,128 @@ fn udp_alloc_listener_slot() {
     return id;
 }
 
-fn udp_bind(port) {
-    if (udp_find_listener(port) >= 0) { return 0 - 1; }  # already bound
-    var listener_id = udp_alloc_listener_slot();
-    if (listener_id < 0) { return 0 - 1; }
-    var lb = udp_listener_base(listener_id);
-    # (1.32.2 FIX #8 per dhcp-end-to-end-audit.md FINDING #8) 1024-byte
-    # per-listener recv buffer. Pre-fix kmalloc(256) was too small for
-    # full DHCP OFFER/ACK (240 BOOTP header + ~30-60 bytes of options =
-    # ~270-300 bytes UDP payload). At 256-byte buf + the prior 248-byte
-    # cap in net_handle_udp, server-id (opt 54) + subnet (opt 1) +
-    # gateway (opt 3) were getting truncated past byte 248 — REQUEST
-    # would carry zero `server_id` → server NAK or ignore → ACK timeout
-    # downstream. 1024 bytes carries any realistic DHCP message + most
-    # other UDP traffic this kernel needs.
-    var buf = kmalloc(1024);
-    if (buf == 0) {
-        store64(lb, 0);        # leave slot free/reclaimable (do NOT shrink the water-mark)
-        return 0 - 1;
+# 1.57.7 (S4): the listener table is udp_lock's; the dup check, the slot claim and the field stores (state LAST)
+# are one hold, so two CPUs cannot bind one port. 1.57.7 (S5): owned by `ub_own` (0 = kernel, else pid+1 —
+# the epoch is stamped in the same hold) and the 1024-byte receive buffer is the slot's BOOT-POOL buffer (no
+# heap on bind/unbind). (1.32.2 FIX #8: 1024 bytes carries any realistic DHCP OFFER/ACK — the old 256 truncated
+# server-id / subnet / gateway.)
+fn udp_bind_owned(ub_port, ub_own) {
+    if (udp_pool_ready != 1) { return 0 - 1; }
+    if (ub_own < 0 || ub_own > 16) { return 0 - 1; }
+    var ub_ep = 0;
+    if (ub_own != 0) { ub_ep = proc_epoch_get(ub_own - 1); }
+    var ubd_f = udp_begin();
+    var listener_id = 0 - 1;
+    if (udp_find_listener(ub_port) < 0) {      # not already bound
+        listener_id = udp_alloc_listener_slot();
     }
-    store64(lb, 1);            # bound
-    store64(lb + 8, port);
-    store64(lb + 16, buf);
-    store64(lb + 24, 0);       # no pending datagram
-    store64(lb + 32, 0);
-    store64(lb + 40, 0);
+    if (listener_id >= 0) {
+        var lb = udp_listener_base(listener_id);
+        store64(lb + 8, ub_port);
+        store64(lb + 16, load64(&udp_pool_buf + listener_id * 8));
+        store64(lb + 24, 0);       # no pending datagram
+        store64(lb + 32, 0);
+        store64(lb + 40, 0);
+        store64(lb + 48, ub_own);  # owner stamp (S5), before the publish
+        store64(lb + 56, ub_ep);
+        store64(lb, 1);            # bound — published LAST
+    }
+    udp_end(ubd_f);
     return listener_id;
 }
+fn udp_bind(port) { return udp_bind_owned(port, 0); }   # in-kernel callers (DHCP, DNS, NTP)
 
-# Drain the most-recent datagram from the listener's buffer. Returns
-# bytes_read (0 if no datagram pending). On success, src_ip_out + src_port_out
-# get the peer's addressing. Both out-params may be 0 to skip writing.
-fn udp_recv_from(listener_id, buf, maxlen, src_ip_out, src_port_out) {
-    if (listener_id < 0) { return 0; }
-    if (listener_id >= udp_listener_count) { return 0; }
-    net_poll();   # absorb any pending packets first
-    var lb = udp_listener_base(listener_id);
-    if (load64(lb) != 1) { return 0; }
-    var rx_len = load64(lb + 24);
-    if (rx_len == 0) { return 0; }
-    var rx_buf = load64(lb + 16);
-    var copy_len = rx_len;
-    if (copy_len > maxlen) { copy_len = maxlen; }
-    net_copy_buf(buf, rx_buf, copy_len);
-    if (src_ip_out != 0) { store64(src_ip_out, load64(lb + 32)); }
-    if (src_port_out != 0) { store64(src_port_out, load64(lb + 40)); }
-    store64(lb + 24, 0);  # consumed
+# Drain the most-recent datagram from the listener's buffer. CALLER HOLDS udp_lock (1.57.7 S5); no poll. -2 when
+# `tk_own` does not own it; else the bytes copied (0 if none pending). On success the out-params (either may
+# be 0 to skip) get the peer's addressing. buf/ipo/po: kernel memory or ranges #53 validated (mapped).
+fn udp_take_own(tk_lid, buf, maxlen, src_ip_out, src_port_out, tk_own) {
+    if (udp_owner_is(tk_lid, tk_own) == 0) { return 0 - 2; }
+    var lb = udp_listener_base(tk_lid);
+    var copy_len = 0;
+    if (load64(lb) == 1) {
+        var rx_len = load64(lb + 24);
+        if (rx_len > 0) {
+            var rx_buf = load64(lb + 16);
+            copy_len = rx_len;
+            if (copy_len > maxlen) { copy_len = maxlen; }
+            net_copy_buf(buf, rx_buf, copy_len);
+            if (src_ip_out != 0) { store64(src_ip_out, load64(lb + 32)); }
+            if (src_port_out != 0) { store64(src_port_out, load64(lb + 40)); }
+            store64(lb + 24, 0);  # consumed
+        }
+    }
     return copy_len;
 }
+# The polling receive (1.57.7 S5: owned): the lock-free owner prefilter BEFORE net_poll, then the check + copy +
+# consume in one udp_lock hold (S4). Returns n, 0 (none / bad id), or -2 (not `ur_own`'s).
+fn udp_recv_from_own(listener_id, buf, maxlen, src_ip_out, src_port_out, ur_own) {
+    if (listener_id < 0) { return 0; }
+    if (listener_id >= udp_listener_count) { return 0; }
+    if (udp_owner_is(listener_id, ur_own) == 0) { return 0 - 2; }
+    net_poll();   # absorb any pending packets first — OUTSIDE udp_lock (a demux under it would self-deadlock)
+    var urf_f = udp_begin();
+    var urf_n = udp_take_own(listener_id, buf, maxlen, src_ip_out, src_port_out, ur_own);
+    udp_end(urf_f);
+    return urf_n;
+}
+fn udp_recv_from(listener_id, buf, maxlen, src_ip_out, src_port_out) {   # in-kernel callers (own 0)
+    var urk = udp_recv_from_own(listener_id, buf, maxlen, src_ip_out, src_port_out, 0);
+    if (urk < 0) { return 0; }
+    return urk;
+}
 
-# Release a UDP listener (1.45.3): free its 1024-byte recv buffer and mark the
-# slot free so udp_alloc_listener_slot can reuse it. Returns 0, or -1 for a bad
-# listener_id; idempotent on an already-free slot. The reclaim pair for
-# udp_bind — a ring-3 consumer that binds an ephemeral port per query (dig)
-# must unbind after each, or the 8-listener table exhausts.
-fn udp_unbind(listener_id) {
-    if (listener_id < 0) { return 0 - 1; }
-    if (listener_id >= udp_listener_count) { return 0 - 1; }
-    var lb = udp_listener_base(listener_id);
-    if (load64(lb) == 0) { return 0; }            # already free (idempotent)
-    var buf = load64(lb + 16);
-    if (buf != 0) { kfree_sized(buf, 1024); store64(lb + 16, 0); }
-    store64(lb, 0);            # state = free (reclaimable)
-    store64(lb + 24, 0);       # drop any pending datagram
+# Release a UDP listener (1.45.3): mark the slot free so udp_alloc_listener_slot can reuse it (the reclaim pair
+# for udp_bind — dig binds an ephemeral port per query). 1.57.7 (S5): owned — 0 when `uu_own` owned the bound
+# slot (pending datagram dropped, owner unstamped, state 0 LAST; +16 stays bound to the pool), 0 for a kernel
+# re-unbind of an already-free tag-0 slot (idempotent), else -1.
+fn udp_unbind_own(uu_lid, uu_own) {
+    if (uu_lid < 0) { return 0 - 1; }
+    if (uu_lid >= udp_listener_count) { return 0 - 1; }
+    var lb = udp_listener_base(uu_lid);
+    var uub_f = udp_begin();
+    var uu_r = 0 - 1;
+    if (load64(lb) == 1 && udp_owner_is(uu_lid, uu_own) == 1) {
+        store64(lb + 24, 0);       # drop any pending datagram
+        store64(lb + 48, 0);
+        store64(lb + 56, 0);
+        store64(lb, 0);            # state = free (reclaimable) — LAST
+        uu_r = 0;
+    } elif (uu_own == 0 && load64(lb) == 0 && load64(lb + 48) == 0) {
+        uu_r = 0;
+    }
+    udp_end(uub_f);
+    return uu_r;
+}
+fn udp_unbind(listener_id) { return udp_unbind_own(listener_id, 0); }   # in-kernel callers
+
+# Both death sites (S7: proc_death_release). Heap-free, IRQ-safe; one hold per slot. Idempotent.
+fn udp_release_pid(ur_pid) {
+    if (ur_pid < 0) { return 0; }
+    if (ur_pid >= 16) { return 0; }
+    for (var uri = 0; uri < udp_listener_count; uri = uri + 1) {
+        var ur_f = udp_begin();
+        if (load64(udp_listener_base(uri)) == 1 && udp_owner_is(uri, ur_pid + 1) == 1) {
+            var urb = udp_listener_base(uri);
+            store64(urb + 24, 0);
+            store64(urb + 48, 0);
+            store64(urb + 56, 0);
+            store64(urb, 0);       # LAST
+        }
+        udp_end(ur_f);
+    }
     return 0;
+}
+
+# #52's source-port rule (1.57.7 S5, EADDRINUSE semantics): 1 when `ss_sport` is unbound or bound by `ss_own`;
+# 0 when another owner (a kernel port included) holds it.
+fn udp_sport_ok(ss_sport, ss_own) {
+    var ss_f = udp_begin();
+    var ss_r = 0;
+    var ss_lid = udp_find_listener(ss_sport);
+    if (ss_lid < 0) { ss_r = 1; }
+    elif (udp_owner_is(ss_lid, ss_own) == 1) { ss_r = 1; }
+    udp_end(ss_f);
+    return ss_r;
 }
 
 # === per-protocol + ingress + TCP split into siblings (1.36.x net.cyr refactor) ===

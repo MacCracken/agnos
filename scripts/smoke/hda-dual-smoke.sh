@@ -52,7 +52,6 @@ mmd -i "$IMG"@@1048576 ::EFI ::EFI/BOOT ::boot
 mcopy -i "$IMG"@@1048576 "$GNOBOOT" ::EFI/BOOT/BOOTX64.EFI
 mcopy -i "$IMG"@@1048576 "$AGNOS" ::boot/agnos
 
-cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"; : > "$SER"
 
 KVM_ARGS=""; [ -e /dev/kvm ] && KVM_ARGS="-enable-kvm -cpu host"
 [ -z "$KVM_ARGS" ] && KVM_ARGS="-cpu max"
@@ -60,21 +59,33 @@ KVM_ARGS=""; [ -e /dev/kvm ] && KVM_ARGS="-enable-kvm -cpu host"
 DWELL=30; [ -e /dev/kvm ] || DWELL=60
 echo "=== booting QEMU with TWO -device intel-hda ($( [ -e /dev/kvm ] && echo KVM || echo TCG ), ${DWELL}s dwell) ==="
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # qemu_assert_booted
-timeout "$DWELL" qemu-system-x86_64 -machine q35 -m 512M $KVM_ARGS \
-    -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
-    -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
-    -drive "file=$IMG,format=raw,if=none,id=disk0" \
-    -device "nvme,drive=disk0,serial=AGNOS-HDA" \
-    -audiodev "none,id=snd0" \
-    -device "intel-hda,id=hda0" \
-    -device "hda-duplex,bus=hda0.0,audiodev=snd0" \
-    -device "intel-hda,id=hda1" \
-    -device "hda-duplex,bus=hda1.0,audiodev=snd0" \
-    -serial "file:$SER" -display none -no-reboot >/dev/null 2>&1 || true
+# ⛔ 1.57.7 (IMG-fix, D15/B3 class) — BANNER-CLASSIFIED RETRY. This smoke booted ONCE, so the ~1-in-4 firmware
+# hand-off flake (`gnoboot: fail @ EBS`, the kernel never ran) failed its sweep row outright: the IMG-fix sweep lost
+# this row on two EBS VOIDs in a row (logs/IMG-fix/sweep-logs). Now a VOID attempt is retried (QEMU_TRIES, default
+# 6) with its log kept as <log>.attemptN, a kernel that died before its banner FAILS at once (qemu_attempt_verdict),
+# and a run with no banner in any attempt is VOID (exit 2), never scored.
+_try=1
+while :; do
+    cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"; : > "$SER"
+    timeout "$DWELL" qemu-system-x86_64 -machine q35 -m 512M $KVM_ARGS \
+        -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
+        -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
+        -drive "file=$IMG,format=raw,if=none,id=disk0" \
+        -device "nvme,drive=disk0,serial=AGNOS-HDA" \
+        -audiodev "none,id=snd0" \
+        -device "intel-hda,id=hda0" \
+        -device "hda-duplex,bus=hda0.0,audiodev=snd0" \
+        -device "intel-hda,id=hda1" \
+        -device "hda-duplex,bus=hda1.0,audiodev=snd0" \
+        -serial "file:$SER" -display none -no-reboot >/dev/null 2>&1 || true
+    qemu_attempt_verdict "$SER" "$_try" && break
+    [ "$_try" -ge "${QEMU_TRIES:-6}" ] && break
+    _try=$((_try + 1))
+done
 # ⛔ DID THE KERNEL RUN AT ALL? Without this, an OVMF hand-off failure makes every assertion
 # below evaluate against an empty log and print a wall of failures naming real properties.
 # See qemu_assert_booted in the lib for the measured rate and the log signature.
-qemu_assert_booted "$SER" || exit 1
+qemu_assert_booted "$SER" || { echo "hda-dual-smoke: VOID"; exit 2; }
 sync
 
 echo ""

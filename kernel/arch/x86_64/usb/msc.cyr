@@ -664,7 +664,7 @@ fn msc_configure_endpoints(slot_id) {
 
 # Build the 31-byte CBW at the row's CBW scratch buffer. Per USB MSC BBB
 # §5.1. CDB is copied byte-by-byte from cdb_phys (caller-owned); pads
-# with zeros to the fixed 16-byte CBWCB region.
+# with zeros to the fixed 16-byte CBWCB region. cdb_phys is a kernel VA read by the CPU (load8), never DMA'd.
 #
 # Returns the host tag written to dCBWTag (echoed by device in CSW).
 fn msc_build_cbw(slot_id, lun, cdb_phys, cdb_len, data_len, dir_in) {
@@ -1091,6 +1091,171 @@ fn msc_reset_recovery(slot_id) {
 
 # --- Phase 2 SCSI command — TEST UNIT READY (0x00) -------------------
 
+#ifdef MSC_CDB_CANARY
+# ⛔ 1.57.7 TEST INSTRUMENT (MSC_CDB_CANARY; scripts/smoke/msc-cdb-smoke.sh) — never in a production build. Each of
+# the seven CDB builders declares `cdb_canary` IMMEDIATELY BEFORE `cdb_buf` (so it takes the next slot toward rbp,
+# exactly where a too-small cdb_buf overflows), takes its address (so cycc cannot promote it to a register), and
+# calls msc_cdb_canary_note right after the CDB is complete. The value is "CDCANARY" little-endian.
+# ⚠ The note RECORDS ONLY — no print, no lock — because it runs inside msc_lock-held paths (msc_blk_read ->
+# msc_read_lba) and, after the APs start, on any CPU. One byte per site, so concurrent notes never lose an update.
+# Site index: 0 tur, 1 inquiry, 2 readcap, 3 sense, 4 read10, 5 write10, 6 flush.
+# ⛔ 1.57.7 fix pass — THE NOTE ALSO CHECKS THAT THE CANARY IS WHERE AN OVERRUN LANDS. The canary proves
+# nothing unless it sits in the slot a too-small cdb_buf overflows into, and nothing checked that: with a
+# local inserted between `cdb_canary` and a regressed `var cdb_buf[2]` (measured on inquiry), the 14-byte
+# overrun landed on the inserted local and this smoke printed `PASS sites=7 clobbered=0`. So the note takes
+# cdb_p and records the gap `&cdb_canary - cdb_p`. It must be 8..24: 8 = the next slot above a 1-slot
+# buffer, 16 = the next slot above [16], 24 = [16] plus cycc's 16-byte-alignment filler (parse_decl.cyr:
+# v6.3.15, one anonymous slot between the previous local and a >= 16 B array). A canary BELOW cdb_buf
+# (negative gap), or more than one slot away, is MISPLACED and the run FAILs. ⚠ Residual, stated plainly:
+# one local inserted above a [16] at a site whose canary is 8 mod 16 is byte-identical to the filler (gap
+# 24) and no run-time check can tell them apart — msc-cdb-smoke.sh's static source-adjacency check (C3)
+# covers the source side, and check-array-sizing.sh the buffer size.
+var msc_cdb_seen[1];           # MODULE scope: 1 u64 = 8 bytes; byte i = 1 once site i built a CDB
+var msc_cdb_bad[1];            # byte i = 1 once site i's canary did not survive the build
+var msc_cdb_misplaced[1];      # byte i = 1 once site i's canary was not 8..24 bytes above cdb_buf
+var msc_cdb_gap[1];            # byte i = site i's gap &cdb_canary - cdb_p (255 = negative or > 255)
+fn msc_cdb_canary_note(cp, cdbp, site) {
+    store8(&msc_cdb_seen + site, 1);
+    if (load64(cp) != 0x5952414E41434443) { store8(&msc_cdb_bad + site, 1); }
+    var gap = cp - cdbp;
+    if (gap < 8) { store8(&msc_cdb_misplaced + site, 1); }
+    if (gap > 24) { store8(&msc_cdb_misplaced + site, 1); }
+    var gb = gap;
+    if (gb < 0) { gb = 255; }
+    if (gb > 255) { gb = 255; }
+    store8(&msc_cdb_gap + site, gb);
+    return 0;
+}
+
+fn msc_cdb_site_print(site) {
+    if (site == 0) { kprintln("tur", 3); }
+    if (site == 1) { kprintln("inquiry", 7); }
+    if (site == 2) { kprintln("readcap", 7); }
+    if (site == 3) { kprintln("sense", 5); }
+    if (site == 4) { kprintln("read10", 6); }
+    if (site == 5) { kprintln("write10", 7); }
+    if (site == 6) { kprintln("flush", 5); }
+    return 0;
+}
+
+# The driver — called from main.cyr after msc_read_demo (and the MSC_RW_DEMO block), BSP only, before
+# smp_start_aps and the scheduler. It runs UNLOCKED exactly like msc_read_demo/msc_write_demo: no other CPU
+# is online, no ISR drives MSC (the transfer paths poll the event ring), and the four locked entry points
+# are reachable only from blk syscalls and fs code that has not run yet. msc_blk_flush takes msc_lock
+# itself, so this must not hold it. It drives all seven builders once more (the enumeration-time
+# TUR/INQUIRY/READ CAPACITY in msc_probe_slot and msc_read_demo's READ(10) have already noted theirs),
+# with a WRITE(10)+SYNC+READ(10) round-trip at LBA 100 of the smoke's zero-filled scratch stick as the
+# control that the instrument does not break a transfer (the MSC_RW_DEMO posture: QEMU scratch only).
+fn msc_cdb_canary_run() {
+    var cr_s = msc_first_slot;
+    if (cr_s == 0) {
+        kprintln("msc-cdb: FAIL no usb-storage slot enumerated", 44);
+        kprintln("msc-cdb: done", 13);
+        return 0;
+    }
+    var cr_tur = msc_test_unit_ready(cr_s, 0);
+    var cr_inq = msc_inquiry(cr_s, 0);
+    var cr_cap = msc_read_capacity(cr_s, 0);
+    var cr_sns = msc_request_sense(cr_s, 0);
+    var cr_buf = pmm_alloc();
+    if (cr_buf == 0) {
+        kprintln("msc-cdb: FAIL no page for the round-trip", 40);
+        kprintln("msc-cdb: done", 13);
+        return 0;
+    }
+    if (vmm_is_mapped(cr_buf) == 0) { vmm_map(cr_buf, cr_buf, 0x83); }
+    iommu_register_dma(cr_buf);
+    xhci_zero_page(cr_buf);
+    var cr_pat = "MSCCDB16";
+    var cr_j = 0;
+    while (cr_j < 8) { store8(cr_buf + cr_j, load8(cr_pat + cr_j)); cr_j = cr_j + 1; }
+    var cr_wr = msc_write_lba(cr_s, 0, 100, 1, cr_buf);
+    var cr_fl = msc_blk_flush();
+    cr_j = 0;
+    while (cr_j < 8) { store8(cr_buf + cr_j, 0); cr_j = cr_j + 1; }
+    var cr_rd = msc_read_lba(cr_s, 0, 100, 1, cr_buf);
+    var cr_same = 1;
+    cr_j = 0;
+    while (cr_j < 8) {
+        if (load8(cr_buf + cr_j) != load8(cr_pat + cr_j)) { cr_same = 0; }
+        cr_j = cr_j + 1;
+    }
+    var cr_rt = 0;
+    if (cr_wr == 1 && cr_fl == 0 && cr_rd == 1 && cr_same == 1) { cr_rt = 1; }
+    if (cr_rt == 1) { kprintln("msc-cdb: WRITE(10)+SYNC+READ(10) round-trip PASS", 48); }
+    if (cr_rt == 0) { kprintln("msc-cdb: WRITE(10)+SYNC+READ(10) round-trip FAIL", 48); }
+    var cr_flok = 0;
+    if (cr_fl == 0) { cr_flok = 1; }
+    kprint("msc-cdb: results tur=", 21);
+    kprint_num(cr_tur);
+    kprint(" inq=", 5);
+    kprint_num(cr_inq);
+    kprint(" cap=", 5);
+    kprint_num(cr_cap);
+    kprint(" sense=", 7);
+    kprint_num(cr_sns);
+    kprint(" write=", 7);
+    kprint_num(cr_wr);
+    kprint(" flush=", 7);
+    kprint_num(cr_flok);
+    kprint(" read=", 6);
+    kprint_num(cr_rd);
+    kprintln("", 0);
+    var cr_sites = 0;
+    var cr_clob = 0;
+    var cr_i = 0;
+    while (cr_i < 7) {
+        if (load8(&msc_cdb_seen + cr_i) == 1) { cr_sites = cr_sites + 1; }
+        if (load8(&msc_cdb_bad + cr_i) == 1) {
+            cr_clob = cr_clob + 1;
+            kprint("msc-cdb: canary CLOBBERED at ", 29);
+            msc_cdb_site_print(cr_i);
+        }
+        cr_i = cr_i + 1;
+    }
+    var cr_mis = 0;
+    cr_i = 0;
+    while (cr_i < 7) {
+        if (load8(&msc_cdb_misplaced + cr_i) == 1) {
+            cr_mis = cr_mis + 1;
+            kprint("msc-cdb: canary MISPLACED at ", 29);
+            msc_cdb_site_print(cr_i);
+        }
+        cr_i = cr_i + 1;
+    }
+    kprint("msc-cdb: canary gaps (tur inquiry readcap sense read10 write10 flush):", 70);
+    cr_i = 0;
+    while (cr_i < 7) {
+        kprint(" ", 1);
+        kprint_num(load8(&msc_cdb_gap + cr_i));
+        cr_i = cr_i + 1;
+    }
+    kprintln("", 0);
+    if (cr_sites == 7 && cr_clob == 0 && cr_mis == 0) {
+        kprintln("msc-cdb: PASS sites=7 clobbered=0", 33);
+    } else {
+        kprint("msc-cdb: FAIL sites=", 20);
+        kprint_num(cr_sites);
+        kprint(" clobbered=", 11);
+        kprint_num(cr_clob);
+        kprint(" misplaced=", 11);
+        kprint_num(cr_mis);
+        kprintln("", 0);
+    }
+    kprintln("msc-cdb: done", 13);
+    return 0;
+}
+#endif
+
+# ⛔ 1.57.7 — EVERY SCSI CDB BUFFER HERE IS `var cdb_buf[16]`, AND WAS `[2]` AT ALL SEVEN SITES UNTIL THIS CUT.
+# A function-local `var x[N]` is N BYTES (module scope is N u64). `[2]` got ONE 8-byte frame slot, and each of the
+# seven builders zeroes 16 bytes into it (msc_build_rw10_cdb included), so bytes 8-15 landed on the local
+# declared just before cdb_buf. Measured under cycc 6.6.6: that victim was dead in all seven frames (a
+# register-promoted local's home slot, or `row` after its last read), which is the ONLY reason nothing broke.
+# An `asm {}` in any of these bodies (cycc then skips regalloc) would have made INQUIRY DMA into phys 0 and
+# READ(10) ask for count & 0xFF bytes. Gated now: check-array-sizing.sh follows the alias, the loop bound
+# and the callee (msc_build_rw10_cdb), and msc-cdb-smoke.sh runs a canary beside all seven buffers.
+
 # Issue SCSI TEST UNIT READY (SPC-4 §6.34). 6-byte CDB, no data phase.
 # Returns 1 if the device returned CSW.bCSWStatus = 0 (Pass), 0 otherwise.
 #
@@ -1111,14 +1276,20 @@ fn msc_test_unit_ready(slot_id, lun) {
     var row = msc_row_addr(slot_id);
     if (load8(row + 68) == 0) { return 0; }       # endpoints not ready
 
-    # Build the 6-byte CDB inline in the CBW scratch (we'll overwrite
-    # CBW + CDB in build_cbw immediately — but we need a stable phys
-    # to pass to msc_build_cbw). Use a 16-byte stack buffer for the CDB.
-    var cdb_buf[2];                # 16 bytes
+    # The CDB lives in a 16-byte stack buffer. msc_build_cbw CPU-copies it into the CBW page (row+48),
+    # which is the only DMA buffer, so a stack VA is correct here; the `cdb_phys` parameter name
+    # downstream is historical.
+    #ifdef MSC_CDB_CANARY
+    var cdb_canary = 0x5952414E41434443;   # MUST stay the local declared immediately before cdb_buf
+    #endif
+    var cdb_buf[16];               # FUNCTION-LOCAL: 16 BYTES = the CBW's CBWCB field (msc_build_cbw copies <= 16)
     var cdb_p = &cdb_buf;
     var k = 0;
     while (k < 16) { store8(cdb_p + k, 0); k = k + 1; }
     # All zeros = TEST UNIT READY (opcode 0x00, control 0x00).
+    #ifdef MSC_CDB_CANARY
+    msc_cdb_canary_note(&cdb_canary, cdb_p, 0);   # site 0 = tur
+    #endif
 
     # Up to 3 retries with Reset Recovery between failed attempts —
     # canonical SCSI spin-up pattern (Linux sd_spinup_disk + usb_stor_TUR).
@@ -1193,13 +1364,19 @@ fn msc_inquiry(slot_id, lun) {
     if (data == 0) { return 0; }
     xhci_zero_page(data);
 
-    var cdb_buf[2];
+    #ifdef MSC_CDB_CANARY
+    var cdb_canary = 0x5952414E41434443;   # MUST stay the local declared immediately before cdb_buf
+    #endif
+    var cdb_buf[16];               # FUNCTION-LOCAL: 16 BYTES = the CBW's CBWCB field (msc_build_cbw copies <= 16)
     var cdb_p = &cdb_buf;
     var k = 0;
     while (k < 16) { store8(cdb_p + k, 0); k = k + 1; }
     store8(cdb_p + 0, 0x12);
     store8(cdb_p + 3, 0);          # AllocationLength high byte
     store8(cdb_p + 4, 36);         # AllocationLength low byte
+    #ifdef MSC_CDB_CANARY
+    msc_cdb_canary_note(&cdb_canary, cdb_p, 1);   # site 1 = inquiry
+    #endif
 
     # INQUIRY is the first SCSI command after Configure Endpoint; real-iron
     # sticks (Silicon Motion / Realtek / etc.) can NAK bulk-IN for 50-200ms
@@ -1258,11 +1435,17 @@ fn msc_read_capacity(slot_id, lun) {
     if (data == 0) { return 0; }
     xhci_zero_page(data);
 
-    var cdb_buf[2];
+    #ifdef MSC_CDB_CANARY
+    var cdb_canary = 0x5952414E41434443;   # MUST stay the local declared immediately before cdb_buf
+    #endif
+    var cdb_buf[16];               # FUNCTION-LOCAL: 16 BYTES = the CBW's CBWCB field (msc_build_cbw copies <= 16)
     var cdb_p = &cdb_buf;
     var k = 0;
     while (k < 16) { store8(cdb_p + k, 0); k = k + 1; }
     store8(cdb_p + 0, 0x25);
+    #ifdef MSC_CDB_CANARY
+    msc_cdb_canary_note(&cdb_canary, cdb_p, 2);   # site 2 = readcap
+    #endif
 
     if (msc_scsi_exec(slot_id, lun, cdb_p, 10, data, 8, 1, 2) == 0) {
         return 0;
@@ -1325,12 +1508,18 @@ fn msc_request_sense(slot_id, lun) {
     if (data == 0) { return 0; }
     xhci_zero_page(data);
 
-    var cdb_buf[2];                                # 16 bytes
+    #ifdef MSC_CDB_CANARY
+    var cdb_canary = 0x5952414E41434443;   # MUST stay the local declared immediately before cdb_buf
+    #endif
+    var cdb_buf[16];               # FUNCTION-LOCAL: 16 BYTES = the CBW's CBWCB field (msc_build_cbw copies <= 16)
     var cdb_p = &cdb_buf;
     var k = 0;
     while (k < 16) { store8(cdb_p + k, 0); k = k + 1; }
     store8(cdb_p + 0, 0x03);                       # opcode
     store8(cdb_p + 4, 18);                         # allocation length
+    #ifdef MSC_CDB_CANARY
+    msc_cdb_canary_note(&cdb_canary, cdb_p, 3);   # site 3 = sense
+    #endif
 
     # REQUEST SENSE is a diagnostic itself — only one shot. If the
     # transport is still wedged after the upstream command's recovery
@@ -1441,6 +1630,8 @@ fn msc_print_pdt_label(pdt) {
 #   [6]  Group Number (0)
 #   [7..8] Transfer Length (big-endian u16) — number of LBAs to xfer
 #   [9]  Control (0)
+# Writes ALL 16 bytes of cdb_p (zero fill + 10-byte CDB). The caller's buffer must be `var x[16]`.
+# check-array-sizing.sh rule 4 enforces this at every call site.
 fn msc_build_rw10_cdb(cdb_p, opcode, lba, count) {
     var k = 0;
     while (k < 16) { store8(cdb_p + k, 0); k = k + 1; }
@@ -1465,9 +1656,15 @@ fn msc_read_lba(slot_id, lun, lba, count, buf_phys) {
     if (blk == 0) { return 0; }
     var bytes = count * blk;
     if (bytes > 65535) { return 0; }              # single-TRB cap
-    var cdb_buf[2];
+    #ifdef MSC_CDB_CANARY
+    var cdb_canary = 0x5952414E41434443;   # MUST stay the local declared immediately before cdb_buf
+    #endif
+    var cdb_buf[16];               # FUNCTION-LOCAL: 16 BYTES = the CBW's CBWCB field (msc_build_cbw copies <= 16)
     var cdb_p = &cdb_buf;
     msc_build_rw10_cdb(cdb_p, 0x28, lba, count);
+    #ifdef MSC_CDB_CANARY
+    msc_cdb_canary_note(&cdb_canary, cdb_p, 4);   # site 4 = read10
+    #endif
     # 1 retry — block-level I/O failures should surface fast (callers
     # like fatfs / GPT expect prompt errors), but a single transient
     # NAK-storm shouldn't lose the request.
@@ -1506,9 +1703,15 @@ fn msc_write_lba(slot_id, lun, lba, count, buf_phys) {
     if (blk == 0) { return 0; }
     var bytes = count * blk;
     if (bytes > 65535) { return 0; }
-    var cdb_buf[2];
+    #ifdef MSC_CDB_CANARY
+    var cdb_canary = 0x5952414E41434443;   # MUST stay the local declared immediately before cdb_buf
+    #endif
+    var cdb_buf[16];               # FUNCTION-LOCAL: 16 BYTES = the CBW's CBWCB field (msc_build_cbw copies <= 16)
     var cdb_p = &cdb_buf;
     msc_build_rw10_cdb(cdb_p, 0x2A, lba, count);
+    #ifdef MSC_CDB_CANARY
+    msc_cdb_canary_note(&cdb_canary, cdb_p, 5);   # site 5 = write10
+    #endif
     # ⚠ 1.56.52 — NO SHORT-TRANSFER CHECK ON THE WRITE PATH, DELIBERATELY. Short packet is not a
     # device-driven condition on a bulk-OUT: msc_bulk_enqueue sets ISP only for IN, and the host
     # controller transmits exactly `length`. A failing OUT surfaces as Transaction/Stall/Babble, which
@@ -1530,7 +1733,8 @@ fn msc_write_lba(slot_id, lun, lba, count, buf_phys) {
 # ANYWHERE while reachable concurrently under SMP: every entry point drives the SINGLE bulk ring and
 # writes the same per-slot row scratch, so two CPUs interleaved CBW/data/CSW phases on one endpoint
 # pair — a torn transfer, not merely a slow one. Rank is nvme's (lock-order table in
-# arch/x86_64/smp.cyr): a leaf under fs_lock.
+# arch/x86_64/smp.cyr): a sibling leaf above console_lock; this file's diagnostic kprints take console_lock
+# under msc_lock, which the table's note permits.
 # ⚠ These four entry points do NOT call each other — msc_blk_read_sectors goes straight to
 # msc_read_lba, not through msc_blk_read — so every one can lock without a same-CPU re-acquire.
 # Verified before writing; if that ever changes, the composing one must drop its lock (see the
@@ -1559,16 +1763,24 @@ fn msc_blk_write(sector, buf) {
 # the good CSW means the flush is done. A cacheless stick may answer CHECK
 # CONDITION / INVALID OPCODE — msc_scsi_exec surfaces that as failure (-1),
 # benign (nothing to flush). 1.33.5 fsync barrier (flush-cache-prior-art.md
-# § 2.3). cdb_buf[2] matches msc_read_lba's proven 10-byte-CDB allocation.
+# § 2.3). cdb_buf[16]: a CBW carries a 16-byte CDB field and the zero loop below writes all 16. (This line
+# used to call the [2] allocation 'proven'. It was a 14-byte overrun at every site; see the banner above
+# msc_test_unit_ready.)
 fn msc_blk_flush() {
     if (msc_first_slot == 0) { return 0 - 1; }
     var row = msc_row_addr(msc_first_slot);
     if (load8(row + 68) == 0) { return 0 - 1; }        # endpoints not ready
-    var cdb_buf[2];
+    #ifdef MSC_CDB_CANARY
+    var cdb_canary = 0x5952414E41434443;   # MUST stay the local declared immediately before cdb_buf
+    #endif
+    var cdb_buf[16];               # FUNCTION-LOCAL: 16 BYTES = the CBW's CBWCB field (msc_build_cbw copies <= 16)
     var cdb_p = &cdb_buf;
     var k = 0;
     while (k < 16) { store8(cdb_p + k, 0); k = k + 1; }
     store8(cdb_p + 0, 0x35);                            # SYNCHRONIZE CACHE(10)
+    #ifdef MSC_CDB_CANARY
+    msc_cdb_canary_note(&cdb_canary, cdb_p, 6);   # site 6 = flush
+    #endif
     msc_spin_lock();
     var fe = msc_scsi_exec(msc_first_slot, 0, cdb_p, 10, 0, 0, 0, 1);
     msc_spin_unlock();

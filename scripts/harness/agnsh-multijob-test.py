@@ -42,8 +42,9 @@ def need(*paths):
             print("FAIL: missing", p, "(build the kernel + stage-agnsh.sh first)"); sys.exit(1)
 need(GNOBOOT, AGNOS, os.path.join(ROOTFS, "bin/agnsh"))
 
-# minimal static ELF64: busy-count N, write MSG, exit(0), spin. Busy-loop (NOT sleep_ms#41 — that
-# sets sched_active=0 and freezes the scheduler); a ring-3 busy loop stays preemptible.
+# minimal static ELF64: busy-count N, write MSG, exit(0), spin. Busy-loop (NOT sleep_ms#41 — the old comment said it
+# "sets sched_active=0 and freezes the scheduler", which was never true: it held the CPU preempt-disabled until 1.57.7 and
+# blocks only its caller since); a ring-3 busy loop is what this harness means to measure.
 def build_sleeper(path, MSG, N):
     code = b""
     code += b"\x48\xC7\xC1" + struct.pack("<I", N)             # mov rcx, N
@@ -181,10 +182,13 @@ try:
     p("job 2 ran + reaped ([2] Done):", j2)
     p("reap order [1] before [2]:", order_ok)
     # ⛔ 1.57.6 (S3-fix): the kernel's LATCHED invariant lines (scripts/smoke/lib/qemu-dwell.sh SMOKE_INVARIANT_DENY —
-    # keep the two patterns identical) print once to klug + COM1 and change nothing else, so this harness scored PASS
+    # loaded below through _invdeny.py since 1.57.7, never copied) print once to klug + COM1 and change nothing else, so this harness scored PASS
     # with them firing until it grepped for them.
     import re as _re_inv
-    INV_DENY = r"sched: refused non-ready pick|sched: exec_and_wait entered with|sched: kernel_resume with|syscall: kernel stack is not the caller|PANIC: Double Fault"
+    # 1.57.7 (S3d): loaded from scripts/smoke/lib/qemu-dwell.sh through _invdeny.py — no pasted copy left to drift.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from _invdeny import smoke_invariant_deny
+    INV_DENY = smoke_invariant_deny()
     inv_hits = [ln for ln in ser().splitlines() if _re_inv.search(INV_DENY, ln)]
     inv_ok = not inv_hits
     p("no latched kernel invariant line:", inv_ok, ("" if inv_ok else " -- " + " | ".join(inv_hits[:5])))

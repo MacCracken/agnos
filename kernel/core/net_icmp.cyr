@@ -10,9 +10,42 @@
 # across every stack (Linux / *BSD / lwIP / iPXE); no wire subtleties, so no
 # standalone audit doc (cf. the DNS bite's compression/resolver nuances).
 var icmp_id = 0x4147;        # "AG" — our echo identifier
-var icmp_seq = 0;            # incrementing echo sequence
-var icmp_reply_seen = 0;     # set when an echo reply matching icmp_id AND icmp_seq arrives
-var icmp_reply_from = 0;     # src ip of that reply
+var icmp_seq = 0;            # incrementing echo sequence (icmp_lock's)
+
+# ⭐ 1.57.7 (S6) — PER-PROCESS REPLY SLOTS (issue 2026-09-23-sock-send-and-connect-hold-the-cpu). Slot = the pinging
+# pid (one thread per process; kmain is pid 0), so concurrent pingers on several CPUs each get THEIR OWN reply and a
+# blocked pinger sleeps on WK_ICMP|pid. Every field below is icmp_lock's. A late reply to an expired ping matches
+# nothing (its slot was cleared or re-sequenced) — the 1.56.48 "id AND sequence" rule, per request.
+# ⚠ MODULE SCOPE: var x[16] = 16 u64 (one per pid).
+var icmp_slot_seq[16];       # 0 = idle; else 0x10000 | seq
+var icmp_slot_t0[16];        # sched_clock_us() at arm time
+var icmp_slot_rtt[16];       # -1 = no reply yet; else µs (stamped by the demux: wake latency is not counted)
+var icmp_slot_from[16];      # src ip of the matched reply
+fn icmp_begin() {
+    var ib_f = kbd_irq_save();
+    icmp_spin_lock();
+    return ib_f;
+}
+fn icmp_end(ie_f) {
+    icmp_spin_unlock();
+    kbd_irq_restore(ie_f);
+    return 0;
+}
+# Arm pid `me`'s slot for sequence `s` (BEFORE the request is sent, so a fast wire reply on another CPU matches).
+fn icmp_slot_arm(me, s) {
+    var sa_f = icmp_begin();
+    store64(&icmp_slot_seq + me * 8, 0x10000 | s);
+    store64(&icmp_slot_rtt + me * 8, 0 - 1);
+    store64(&icmp_slot_t0 + me * 8, sched_clock_us());
+    icmp_end(sa_f);
+    return 0;
+}
+fn icmp_slot_clear(me) {
+    var sc_f = icmp_begin();
+    store64(&icmp_slot_seq + me * 8, 0);
+    icmp_end(sc_f);
+    return 0;
+}
 
 # --- ICMP counters (1.56.48) -------------------------------------------------
 # Readable from ring 3 via net_config#61 fields 4..7. They exist because a ring-3
@@ -20,11 +53,9 @@ var icmp_reply_from = 0;     # src ip of that reply
 # "we transmitted and nothing answered" — yo's --diag could report the DHCP lease
 # and the icmp_echo return, and no more. Counters split that fork.
 #
-# Free-running u64, never reset, wrapping is not a concern at 100 Hz. Written only
-# from icmp_ping (thread context) and net_handle_icmp (reachable from the timer
-# ISR via net_rx_drain). A ++ on an aligned u64 is a single store on x86_64 and
-# these are diagnostics, not accounting — a torn read across an ISR boundary would
-# cost one count, so no lock is taken. Do not build control flow on them.
+# Free-running u64, never reset. Written only from icmp_ping_us and net_handle_icmp (reachable from the timer ISR
+# and the NIC MSI via net_rx_drain, and from every CPU's net_poll). 1.57.7 (S6): every ++ is under icmp_lock, so
+# the counts are consistent across CPUs (#61 fields 4-7). Still diagnostics: do not build control flow on them.
 var icmp_tx = 0;             # echo requests WE sent (icmp_ping)
 var icmp_rx = 0;             # echo replies that matched our id+seq
 var icmp_replies_sent = 0;   # inbound echo requests we answered (we were pinged)
@@ -39,6 +70,7 @@ fn icmp_send_echo_reply(src_ip, icmp_msg, icmp_len) {
     if (src_ip != 0xFFFFFFFF) { route_next_hop_mac(src_ip, &dst_mac); }
     var kmac[8];
     nic_mac(&kmac);
+    var er_f = net_tx_begin();                 # 1.57.7 (S4): build + send in one net_tx_lock hold
     var p = &net_pkt;
     var off = eth_build(p, &dst_mac, &kmac, 0x0800);
     memcpy(p + off + 20, icmp_msg, icmp_len);
@@ -49,7 +81,9 @@ fn icmp_send_echo_reply(src_ip, icmp_msg, icmp_len) {
     store8(p + off + 20 + 2, (ck >> 8) & 0xFF);
     store8(p + off + 20 + 3, ck & 0xFF);
     ip_build(p + off, net_src_for(src_ip), src_ip, 1, icmp_len);   # reply source matches the requester (see net_src_for)
-    return net_tx(p, off + 20 + icmp_len);           # 1.49.0 loopback bite 2: echo reply loops too
+    var er_r = net_tx(p, off + 20 + icmp_len);       # 1.49.0 loopback bite 2: echo reply loops too
+    net_tx_end(er_f);
+    return er_r;
 }
 
 # IP demux hook for proto 1. icmp_off = offset of the ICMP message in pkt.
@@ -83,14 +117,21 @@ fn net_handle_icmp(pkt, icmp_off, icmp_len, src_ip, dst_ip) {
         # the segment, source spoofed to the victim. The narrower rule below is not a loss: the only
         # in-tree ICMP loopback consumer is `icmp_ping(net_ip, 0)` (net_ingress.cyr), which targets
         # net_ip and is admitted by the unicast test.
+        # ⚠ 1.57.7 (S5): net_wire_frame now drops every wire frame with a 127/8 source or destination, so the
+        # amplifier above is also closed at the wire entry; this arm stays narrow ON PURPOSE (defence in depth,
+        # and no consumer needs echo on 127/8).
         var mine = 0;
         if (net_ip != 0 && dst_ip == net_ip) { mine = 1; }
         if (mine == 0) {
+            var hb_f = icmp_begin();
             icmp_bcast_ignored = icmp_bcast_ignored + 1;
+            icmp_end(hb_f);
             return 0;
         }
         icmp_send_echo_reply(src_ip, pkt + icmp_off, icmp_len);
+        var hr_f = icmp_begin();                   # 1.57.7 (S6): after the reply's net_tx hold (a sibling leaf)
         icmp_replies_sent = icmp_replies_sent + 1;
+        icmp_end(hr_f);
         return 0;
     }
     if (t == 0) {
@@ -107,14 +148,29 @@ fn net_handle_icmp(pkt, icmp_off, icmp_len, src_ip, dst_ip) {
         # kernel-wide, and a stale reply carrying 0x4147 satisfies whatever wait is
         # currently open"). Matching the sequence closes it: a reply is ours only if
         # it answers the request we are actually waiting on.
+        # 1.57.7 (S6): matched against the PER-PID slots (M-S8), under icmp_lock; the waiter is woken after the unlock.
         var id  = (load8(pkt + icmp_off + 4) << 8) | load8(pkt + icmp_off + 5);
         var seq = (load8(pkt + icmp_off + 6) << 8) | load8(pkt + icmp_off + 7);
         if (id == icmp_id) {
-            if (seq == icmp_seq) {
-                icmp_reply_seen = 1;
-                icmp_reply_from = src_ip;
-                icmp_rx = icmp_rx + 1;
+            var hm_i = 0 - 1;
+            var hm_f = icmp_begin();
+            var hm_k = 0;
+            while (hm_k < 16) {
+                if (load64(&icmp_slot_seq + hm_k * 8) == (0x10000 | seq)) {
+                    if (load64(&icmp_slot_rtt + hm_k * 8) == 0 - 1) {
+                        var hm_d = sched_clock_us() - load64(&icmp_slot_t0 + hm_k * 8);
+                        if (hm_d < 0) { hm_d = 0; }
+                        store64(&icmp_slot_rtt + hm_k * 8, hm_d);
+                        store64(&icmp_slot_from + hm_k * 8, src_ip);
+                        icmp_rx = icmp_rx + 1;
+                        hm_i = hm_k;
+                        hm_k = 16;
+                    }
+                }
+                hm_k = hm_k + 1;
             }
+            icmp_end(hm_f);
+            if (hm_i >= 0) { wq_wake(WK_ICMP | hm_i); }
         }
         return 0;
     }
@@ -131,26 +187,55 @@ fn net_handle_icmp(pkt, icmp_off, icmp_len, src_ip, dst_ip) {
     return 0;
 }
 
-# Send one echo request to dst_ip and wait for the matching reply. Returns
-# elapsed timer_ticks (>= 0) on success, 0-1 on timeout/no-NIC.
-#
-# `timeout_ticks` bounds the wait, in 100 Hz ticks. Pass 0 for the historical
-# ~3 s default (300 ticks) — every pre-1.56.48 caller behaved that way, and the
-# comment on syscall #55 named a configurable timeout as "a future enhancement
-# that would parameterise icmp_ping". This is that enhancement; #55 keeps the
-# default and the new #100 (icmp_echo_ex) exposes the parameter to ring 3.
-fn icmp_ping(dst_ip, timeout_ticks) {
-    var bound = timeout_ticks;
-    if (bound <= 0) { bound = 300; }        # ~3 s at the 100 Hz timer
+# icmp_block — the tcp_block shape on WK_ICMP|me (arm -> re-check -> sleep | cancel, one IF=0 bracket). The
+# predicate (lock-free prefilter): a reply stamped my slot, or the slot is no longer this request's. Returns 0 =
+# re-evaluate, 1 = lifecycle ABORT (S7), 2 = cannot block.
+fn icmp_block(ib_me, ib_s, ib_dl) {
+    var ib_f = kbd_irq_save();
+    var ib_a = wq_arm(WK_ICMP | ib_me, ib_dl);
+    if (ib_a == 2) { kbd_irq_restore(ib_f); return 2; }
+    if (ib_a == 1) {
+        kbd_irq_restore(ib_f);
+        if (wq_signal_point() == 1) { return 1; }
+        return 0;
+    }
+    var ib_done = 0;
+    if (load64(&icmp_slot_rtt + ib_me * 8) >= 0) { ib_done = 1; }
+    if (load64(&icmp_slot_seq + ib_me * 8) != (0x10000 | ib_s)) { ib_done = 1; }
+    if (sched_clock_us() >= ib_dl) { ib_done = 1; }
+    if (ib_done == 1) { wq_cancel(); kbd_irq_restore(ib_f); return 0; }
+    var ib_r = wq_sleep();
+    kbd_irq_restore(ib_f);
+    if (ib_r == WR_SIGNAL) {
+        if (wq_signal_point() == 1) { return 1; }
+    }
+    return 0;
+}
+
+# ⭐ icmp_ping_us — send one echo request to dst_ip and wait for ITS reply (1.57.7 S6). Returns the round trip in
+# µs (>= 0; stamped by the demux, so wake latency is not counted) or -1 (timeout, NIC down, send failed, lifecycle
+# ABORT). `timeout_us` <= 0 = the historical ~3 s. BLOCKS ONLY THE CALLER (WK_ICMP|pid); a context that cannot block
+# takes net_legacy_step. The timeout is never early and fires at the first timer tick at or after the bound. The rtt
+# check comes before the deadline check in the same hold, so a reply that landed is never counted as a timeout.
+fn icmp_ping_us(dst_ip, timeout_us) {
+    var pu_to = timeout_us;
+    if (pu_to <= 0) { pu_to = 3000000; }
     # 1.49.0 loopback bite 2: a loopback dst (our own net_ip / 127.x) needs no NIC up.
     if (nic_ready() == 0 && net_is_loopback(dst_ip) == 0) { return 0 - 1; }
+    var me = proc_current_get();
+    if (me < 0 || me >= 16) { return 0 - 1; }
+    var pu_f = icmp_begin();
     icmp_seq = (icmp_seq + 1) & 0xFFFF;
+    var pu_s = icmp_seq;
+    icmp_end(pu_f);
+    icmp_slot_arm(me, pu_s);
 
     var dst_mac[8];
     memset(&dst_mac, 0xFF, 6);
     if (dst_ip != 0xFFFFFFFF) { route_next_hop_mac(dst_ip, &dst_mac); }
     var kmac[8];
     nic_mac(&kmac);
+    var ip_f = net_tx_begin();                 # 1.57.7 (S4): the request build + net_tx in one net_tx_lock hold
     var p = &net_pkt;
     var off = eth_build(p, &dst_mac, &kmac, 0x0800);
     var m = p + off + 20;               # ICMP message start
@@ -158,22 +243,57 @@ fn icmp_ping(dst_ip, timeout_ticks) {
     store8(m + 0, 8); store8(m + 1, 0);                       # type 8, code 0
     store8(m + 2, 0); store8(m + 3, 0);                       # checksum (zeroed)
     store8(m + 4, (icmp_id >> 8) & 0xFF); store8(m + 5, icmp_id & 0xFF);
-    store8(m + 6, (icmp_seq >> 8) & 0xFF); store8(m + 7, icmp_seq & 0xFF);
+    store8(m + 6, (pu_s >> 8) & 0xFF); store8(m + 7, pu_s & 0xFF);
     for (var i = 0; i < 32; i = i + 1) { store8(m + 8 + i, 0x41 + (i & 0x0F)); }
     var ck = ip_checksum(m, icmp_len);
     store8(m + 2, (ck >> 8) & 0xFF); store8(m + 3, ck & 0xFF);
     ip_build(p + off, net_src_for(dst_ip), dst_ip, 1, icmp_len);   # route-derived source (see net_src_for)
+    var ip_r = net_tx(p, off + 20 + icmp_len);
+    net_tx_end(ip_f);
+    if (ip_r < 0) { icmp_slot_clear(me); return 0 - 1; }
+    var pt_f = icmp_begin();
+    icmp_tx = icmp_tx + 1;              # still counts only SENT requests
+    icmp_end(pt_f);
 
-    icmp_reply_seen = 0;
-    var start = timer_ticks;
-    if (net_tx(p, off + 20 + icmp_len) < 0) { return 0 - 1; }
-    icmp_tx = icmp_tx + 1;
-    while ((timer_ticks - start) < bound) {
+    var pu_dl = wq_deadline_after_us(pu_to);
+    var pu_blk = wq_can_block();
+    var pu_spins = 0;
+    while (1) {
         net_poll();
-        if (icmp_reply_seen == 1) { return timer_ticks - start; }
-        arch_wait();
+        var pw_f = icmp_begin();
+        var pu_rtt = 0 - 1;
+        var pu_out = 0;
+        if (load64(&icmp_slot_seq + me * 8) == (0x10000 | pu_s)) {
+            var pu_v = load64(&icmp_slot_rtt + me * 8);
+            if (pu_v >= 0) { pu_rtt = pu_v; pu_out = 1; }
+        } else {
+            pu_out = 2;                                     # our slot was overwritten: nothing to wait for
+        }
+        if (pu_out == 0 && sched_clock_us() >= pu_dl) { pu_out = 3; icmp_timeouts = icmp_timeouts + 1; }
+        if (pu_out != 0) { store64(&icmp_slot_seq + me * 8, 0); }
+        icmp_end(pw_f);
+        if (pu_out == 1) { return pu_rtt; }
+        if (pu_out != 0) { return 0 - 1; }
+        if (pu_spins < NET_BLOCK_SPINS) {
+            pu_spins = pu_spins + 1;
+        } elif (pu_blk == 1) {
+            var pu_r = icmp_block(me, pu_s, pu_dl);
+            if (pu_r == 1) { icmp_slot_clear(me); return 0 - 1; }   # lifecycle ABORT (S7)
+            if (pu_r == 2) { pu_blk = 0; }
+        } else {
+            net_legacy_step(pu_spins);
+            pu_spins = pu_spins + 1;
+        }
     }
-    icmp_timeouts = icmp_timeouts + 1;
     return 0 - 1;
 }
 
+# The in-kernel form (shell `ping`, ICMP_SELFTEST, loopback_selftest): the pre-1.57.7 signature and TICK return
+# (`timeout_ticks` <= 0 = the ~3 s default). Returns elapsed 100 Hz ticks (>= 0) or -1.
+fn icmp_ping(dst_ip, timeout_ticks) {
+    var ip_us = 0;
+    if (timeout_ticks > 0) { ip_us = timeout_ticks * 10000; }
+    var ip_rt = icmp_ping_us(dst_ip, ip_us);
+    if (ip_rt < 0) { return 0 - 1; }
+    return ip_rt / 10000;
+}

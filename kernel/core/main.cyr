@@ -78,6 +78,24 @@ kprint("MB top=", 7);
 kprint_hex(pmm_memmap_top);
 kprintln("", 0);
 
+#ifdef ELF64_KERNEL
+# ⭐ 1.57.7 (IMG-fix, review A3/B2) — the BSP boot stack has been live since the shim's first push; say
+# whether the UEFI map gnoboot handed over calls its span free RAM (mbi.cyr bootstack_window_check has
+# the why). The violation line is in SMOKE_INVARIANT_DENY (scripts/smoke/lib/qemu-dwell.sh), and the OK
+# line is what an iron burn's klug/fb transcript shows for the one risk QEMU cannot exercise. Statements,
+# not a `var x = f()` initialiser: a module-scope expression initialiser never runs in kmode.
+bootstack_win_rc = bootstack_window_check(load64(&boot_info_ptr));
+if (bootstack_win_rc == 0) { kprintln("boot: BSP stack span 0x390000-0x3C0000 is free RAM in the UEFI map OK", 69); }
+if (bootstack_win_rc == 1) {
+    kprint("boot: BSP stack window not free RAM in the UEFI map - type 0x", 61);
+    kprint_hex(bootstack_win_type);
+    kprint(" at 0x", 6);
+    kprint_hex(bootstack_win_start);
+    kprintln("", 0);
+}
+if (bootstack_win_rc < 0) { kprintln("boot: BSP stack window unchecked - no usable UEFI map", 53); }
+#endif
+
 # Per-stage CMOS stamps survive hangs and are decoded by
 # agnosticos/scripts/read-boot-log.sh. Slot map: 0x50 = kernel CP,
 # 0x51 = kernel magic, 0x52/0x53 = gnoboot. cp_fb() visual cells were
@@ -121,6 +139,17 @@ timer_ticks = 0;
 timer_isr_build();
 idt_set_gate(&idt + 32 * 16, &timer_isr, 0x08, 0x8E);
 kprintln("Timer ISR installed", 19);
+# ⭐ 1.57.7 (Path 2, S3.4) — THE VOLUNTARY-SWITCH GATE (vector 0xE0 = 224), installed HERE, right after the timer
+# gate and BEFORE tss_ist_selftest below, which asserts its IST is 0 (a check placed before its gate is no check —
+# the banner below). DPL0 (0x8E): ring 3 cannot raise it. resched_gates_ok re-reads the installed entry and says
+# so in one line either way (the failure line is denied by every smoke). sched.cyr has the mechanism.
+resched_isr_build();
+idt_set_gate(&idt + 224 * 16, &resched_isr, 0x08, 0x8E);
+# ⭐ 1.57.7 (Path 2, S3.8) — THE RESCHEDULE-KICK GATE (vector 0xE1 = 225), right after 0xE0 and above tss_ist_selftest
+# (which asserts its IST is 0). DPL0 (0x8E). EOI-only: it ends a remote hlt and never switches (sched.cyr).
+resched_kick_isr_build();
+idt_set_gate(&idt + 225 * 16, &resched_kick_isr, 0x08, 0x8E);
+resched_gates_ok();                                     # checks BOTH gates: one line each
 # ⛔⛔ 1.56.52 — #DF GETS ITS OWN STACK. THE PLACEMENT OF THIS CALL IS LOAD-BEARING AND IT WAS WRONG
 # TWICE. It reads THREE gates, and each must already be installed or its arm silently cannot fail:
 #   vector 8  — installed by exc_handlers_init (above). Placed next to the other TSS selftest at first,
@@ -136,16 +165,35 @@ kprintln("Timer ISR installed", 19);
 if (tss_ist_selftest(0) == 1) { kprintln("tss: #DF has IST1 on the direct map OK", 38); }
 else { kprintln("tss: #DF HAS NO IST - a bad RSP0 will triple-fault silently", 59); }
 
+# ⭐ 1.57.7 (S1b) — THE EARLY PM-TIMER PROBE, HERE, immediately before apic_init. The IDT and the exception
+# stubs are live (a fault here is REPORTED, not a silent triple fault), and the FIRMWARE CR3 is still active,
+# so acpi_pm_early_probe takes the RSDP from gnoboot's boot_info ONLY (never the legacy scan, which reads
+# page 0 — acpi.cyr). It must precede lapic_reload_100hz below, which measures the 100 Hz reload and the
+# klog timebase against the port it finds (the polled PIT window when it finds none). CMOS CP 0x83
+# attributes a hang inside the probe (the first ACPI reads of the boot, under firmware page tables).
+# Register contract (CP 0x83): mov al,0x50; out 0x70,al; mov al,0x83; out 0x71,al. In: none. Out: none.
+# Clobbers: AL (the low byte of RAX) only.
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x83; 0xE6; 0x71; }
+var ep_port = 0;
+ep_port = acpi_pm_early_probe();
+if (ep_port != 0) {
+    kprint("acpi: early pm timer port ", 26); kprint_hex(ep_port);
+    kprintln(" (boot_info RSDP)", 17);
+} else {
+    kprintln("acpi: early pm timer probe found none -- the LAPIC tick falls back to the PIT", 77);
+}
+
 # Initialize Local APIC. ⚠ The 8259 is now fully masked (pic_init writes 0xFF) — nothing is delivered
 # through it. The PIT COUNTER still free-runs for pit_ch0_read()/lapic_calibrate; only its IRQ is masked.
 apic_init();
-# Start APIC timer on vector 32 (same as PIT). CALIBRATE the div1 LAPIC input
-# against PIT ch0 (still free-running here, pre-pic_mask_pit) for a TRUE 100Hz.
+# Start APIC timer on vector 32 (same as PIT). CALIBRATE the div1 LAPIC input for a TRUE 100Hz:
+# since 1.57.7 (S1b) against the ACPI PM timer the early probe found (lapic_calibrate_pm), else against
+# PIT ch0 (still free-running here) by polling — the PM-less fallback a host CPU quota can inflate.
 # On real Zen the LAPIC input is ~12x below QEMU's ~1GHz, so the old hardcoded 10M
 # gave ~8.3Hz -> 12x-slow uptime + a starved 100Hz audio servicer (found via a
 # 6h soak + tonegen). Called INLINE (boot-sequence order, not a gvar-init var);
 # lapic_reload_100hz falls back to 10M on an implausible measure.
-apic_timer_init(32, lapic_reload_100hz());
+apic_timer_init(32, lapic_reload_100hz(ep_port));
 # ⛔ `pic_mask_pit()` IS DELETED. It existed solely to keep the 8259's IRQ1 (the PS/2 keyboard)
 # deliverable by masking IRQ0 so a PIT tick could not wedge the in-service register. With no IRQ1
 # consumer there is no lower-priority line to protect, so `pic_init` now masks ALL 8259 lines outright.
@@ -160,6 +208,7 @@ kprintln(" timer active", 13);
 kprint("LAPIC: reload=", 14);
 kprint_num(lapic_timer_count);
 kprintln("", 0);
+lapic_reload_report();   # 1.57.7 S1b: which reference measured it (acpi pm timer / PIT / the literal)
 
 # === CMOS kernel checkpoint 7 (APIC + timer live) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x07; 0xE6; 0x71; }
@@ -222,7 +271,7 @@ fpu_area_selftest();
 # ⛔ 1.56.51 — NOT INERT, AND HAS NOT BEEN SINCE B3b. This comment said "INERT until B3b sets
 # CR0.TS on the switch paths — production never #NMs today (TS is only ever set by the
 # FP_NM_SELFTEST probe below)". B3b LANDED: four PRODUCTION paths call fpu_set_ts() on every
-# switch or entry — sched.cyr:456 (do_context_switch), sched.cyr:649 (sys_sched_yield),
+# switch or entry — sched.cyr do_context_switch (both switch paths; 1.57.7 retired sys_sched_yield's copy),
 # ring3.cyr:198 (enter_ring3, the out-of-band exec entry) and syscall.cyr:425 — so vector 7 is
 # live on every boot and the fp-#NM / fp-ctxsw / naad-ring3 gates depend on it firing. Reading
 # this handler as dead code is how a real vector gets treated as removable.
@@ -544,6 +593,16 @@ if (acpi_rsdp_addr != 0) {
 } else {
     kprintln("ACPI: no RSDP found", 19);
 }
+# 1.57.7 (S1b): the tick was measured on the EARLY probe's port; acpi_init has just re-derived the FADT from
+# scratch (legacy scan first). A mismatch — including a late "no pm timer" — is a DIAGNOSTIC, not a
+# recalibration: a port that passed tsc_pm_alive and the agreement test is a live PM timer. Silent on a match.
+if (lapic_reload_src == 1) {
+    if (acpi_pm_tmr_port != lapic_cal_port) {
+        kprint("lapic: WARNING the tick was measured on pm timer port ", 54); kprint_hex(lapic_cal_port);
+        kprint(" but acpi_init decoded port ", 28); kprint_hex(acpi_pm_tmr_port);
+        kprintln("", 0);
+    }
+}
 
 pci_scan();
 kprint("PCI: ", 5);
@@ -692,6 +751,13 @@ if (nic_ready() == 1) {
         net_init(0, 0, 0);
     }
 }
+# 1.57.7 (S4, D12) — the TCP conn pool: 8 rx rings + 8 retx hold buffers, kmalloc'd ONCE here so no TCP path
+# (the interrupt-context passive open included) ever allocates or frees. UNCONDITIONAL: loopback TCP needs no
+# NIC. After cr3_load(0x1000), the direct map and heap_init; before loopback_selftest and every TCP user.
+if (tcp_pool_init() != 0) { kprintln("tcp: conn pool FAIL - TCP disabled", 34); }
+# 1.57.7 (S5) — the UDP listener pool: 8 × 1024 B receive buffers, kmalloc'd ONCE here (before dhcp_init's
+# udp_bind(68), the first binder) so bind/unbind/udp_release_pid never touch the heap.
+if (udp_pool_init() != 0) { kprintln("udp: listener pool FAIL - UDP listeners disabled", 48); }
 # RTC boot clock (1.35.5) — seed the wall clock locally from the CMOS RTC so the
 # kernel knows the time with no network. Independent of the NIC; the timer has
 # been live since checkpoint 7. A later `ntp <server>` refines/overrides it.
@@ -905,6 +971,10 @@ msc_register_block_dev();
 msc_read_demo();
 #ifdef MSC_RW_DEMO
 msc_write_demo();
+#endif
+# 1.57.7 — test-only: drives all seven SCSI CDB builders with a canary beside cdb_buf (scripts/smoke/msc-cdb-smoke.sh).
+#ifdef MSC_CDB_CANARY
+msc_cdb_canary_run();
 #endif
 
 if (gpt_init() == 1) {
@@ -1614,6 +1684,12 @@ loopback_selftest();
 # DROP path works at all.
 #ifdef NET_CSUM_SELFTEST
 net_csum_selftest();
+#endif
+
+# 1.57.7 (S5) — socket ownership, the wire martian filter, the 127/8 + net_ip TCP gate, lo-only listeners,
+# sock_peer, UDP ownership: IF=0 kernel arms (tcpaddr: / udpown: lines). scripts/smoke/sock-owner-smoke.sh boot A.
+#ifdef TCP_ADDR_SELFTEST
+tcp_addr_selftest();
 #endif
 
 # FAT read self-test (1.34.x bite 2, compile-gated via FATFS_SELFTEST).
@@ -2593,8 +2669,10 @@ fn tsc_selftest() {
     if (tz > 0) { ext2_write_at(tz, 0, eb, 200); }
     ext2_sync();
     kprintln("tsc: ring-3 probe -- exit 1 = uptime_us#95 ADVANCED, 0 = frozen", 63);
-    kprintln("tsc: this is the clock uptime_ms#40 CANNOT be on a foreground run", 65);
+    kprintln("tsc: uptime_ms#40 rides this clock too since 1.57.7 (a tick-driven #40 froze here)", 82);
     sh_exec("run /bin/tscp", 13);
+    # ⭐ 1.57.7 (S3b): this `run` is pre-scheduler, so it takes kernel_exec_boot, which restores the caller's IF after
+    # the reap — the `sti` below is belt-and-braces now. The history it was written for:
     # ⛔ 1.57.6 — RE-ENABLE INTERRUPTS: THIS `run` CAME BACK WITH IF=0. A foreground program runs IF=0
     # and returns to the kernel through its exit syscall, which is entered with IF masked, so the boot
     # body resumed here with interrupts OFF. The kmain `run` selftests before the `sti` (exec, divz) sit
@@ -2933,19 +3011,18 @@ fn exec_disk_selftest() {
 
     # 1.43.x — execwait #37 ring-3 validator (/bin/exwv). exwv is a ring-3 program
     # that calls execwait(37) on "/bin/argv Z" — a child WITH an argument — and exits
-    # with the code execwait returns. Because exwv runs in ring 3, its execwait(37) is
-    # a REAL SYSCALL, so /bin/argv's own syscalls nest UNDER exwv's live #37 frame —
-    # exercising the full ring-3-caller path: H1 (the #37 handler preserves exwv's
-    # kernel resume context across the nested exec, so exwv's OWN exit() still resumes
-    # sh_cmd_run) AND H2 (the child runs on the disjoint second kstack 0x3D0000, so it
-    # cannot smash exwv's suspended #37 frame / SYSRET cells on 0x3F0000). Passing
-    # "/bin/argv Z" (not the no-arg /bin/prog2) ALSO validates the 1436-burn argv fix:
-    # the #37 handler must open the PATH TOKEN ("/bin/argv") while staging the WHOLE
-    # line as argv, so /bin/argv sees argv[1]="Z" and exits argv[1][0]='Z'=0x5A=90.
-    # If H1/H2 OR the argv split were broken, exwv could not resume to exit 90.
-    # exec-smoke gates on a SECOND "run: exit 90" (the direct "run /bin/argv Z" above
-    # is the first). No register is held across a 2nd syscall (the kernel handler
-    # clobbers caller-saved r8-r11) — exwv just propagates rax straight into exit.
+    # with the code execwait returns. Passing "/bin/argv Z" (not the no-arg /bin/prog2)
+    # validates the 1436-burn argv fix: #37 must open the PATH TOKEN ("/bin/argv") while
+    # staging the WHOLE line as argv, so /bin/argv sees argv[1]="Z" and exits
+    # argv[1][0]='Z'=0x5A=90. exec-smoke gates on a SECOND "run: exit 90" (the direct
+    # "run /bin/argv Z" above is the first). No register is held across a 2nd syscall
+    # (the kernel handler clobbers caller-saved r8-r11) — exwv just propagates rax into exit.
+    # ⭐ 1.57.7 (S3b): exwv (and envprop below) are only WRITTEN here; they RUN after `sched_active = 1` (main.cyr,
+    # the EXEC_SELFTEST block right after it), because #37 is a blocking wait now and returns -1 before the
+    # scheduler runs. There exwv blocks in the kernel while /bin/argv runs as an ordinary scheduled child, and the
+    # rsp0 witness (`exec: rsp0 restored`) checks the caller's kernel stack came back through the switch tail. The
+    # old H1/H2 hazards (the nested exec_and_wait's resume context, the shared syscall stack) are gone with the
+    # out-of-band #37; so is the slot-0 hold these callers needed (after the scheduler starts pid 0 is kmain).
     var xi = 0;
     while (xi < 200) { store8(eb + xi, 0); xi = xi + 1; }
     store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
@@ -2973,14 +3050,6 @@ fn exec_disk_selftest() {
     var xvino = 0;
     if (bino > 0) { xvino = ext2_create(bino, "exwv", 4); }
     if (xvino > 0) { ext2_write_at(xvino, 0, eb, 171); ext2_sync(); }
-    # ⭐ 1.57.6 (Path 2, S3.3): HOLD SLOT 0 across the two #37 callers (exwv, envprop) so they run at a non-zero
-    # pid, as production's agnsh always does. At pid 0 the rsp0 witness is vacuous — kernel_resume parks
-    # TSS.RSP0 and the syscall top on slot 0, which would BE the caller's own stack — and deleting #37's step (h)
-    # re-install (mutation M-B6) passed this smoke. proc_alloc_slot leaves the slot CLAIMING (state 3), which the
-    # scan and the scheduler both skip; nothing schedules yet (sched_active is 0). Released after envprop.
-    var xhold = proc_alloc_slot();
-    kprintln("exec: running /bin/exwv", 23);
-    sh_exec("run /bin/exwv", 13);
 
     # 1.43.2 — envp validator (/bin/envtest). A ring-3 program run with NO extra
     # args (argc=1: argv[0]=path), so its stack is [rsp]=1, [rsp+8]=argv0,
@@ -3018,6 +3087,8 @@ fn exec_disk_selftest() {
     # default's 'H' = 72, which the run above keeps asserting as the fallback gate).
     # "run: exit 81" therefore proves the WHOLE chain: ring-3 a3/a4 → fault-proof copy →
     # blob validation → elf.cyr staging → child getenv-visible envp. Sequential, no jumps.
+    # ⭐ 1.57.7 (S3b): RUN after `sched_active = 1` with exwv (see there). exec-smoke reads the result of THIS run (the
+    # first `run: exit` after `exec: running /bin/envprop`) — a bare grep for 81 could match another program's code.
     var pi2 = 0;
     while (pi2 < 200) { store8(eb + pi2, 0); pi2 = pi2 + 1; }
     store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
@@ -3049,9 +3120,6 @@ fn exec_disk_selftest() {
     var ppino = 0;
     if (bino > 0) { ppino = ext2_create(bino, "envprop", 7); }
     if (ppino > 0) { ext2_write_at(ppino, 0, eb, 196); ext2_sync(); }
-    kprintln("exec: running /bin/envprop", 26);
-    sh_exec("run /bin/envprop", 16);
-    if (xhold >= 0) { proc_set_state(xhold, 0); }   # release the slot-0 hold (reaped shape: ppid 0, on_cpu -1)
 
     # 1.43.4 — framebuffer fbinfo(38) + blit(39) validator (/bin/fbtest). Queries
     # geometry into a stack buffer, then blits a 4x4 block from the stack to FB
@@ -3226,7 +3294,9 @@ fn chan_ring3_selftest() {
     # ⛔ THE EARLIER SHAPE — parent spawns child, parent waits — COULD NOT WORK, and the design document
     # says why three separate times: `sched_yield` is a no-op under a foreground `run` (§9.4),
     # `waitpid #4` answers 0 for "not yet" so a `>= 0` loop exits instantly, and `sleep_ms` holds
-    # preempt disabled and starves the very child it waits for. Minting here removes the need for the
+    # preempt disabled and starves the very child it waits for (all three were true until 1.57.7; since then #44 and
+    # #41 switch in the kernel and #4 has WAIT_BLOCK — this is history now, and minting here still removes the
+    # concurrency requirement). Minting here removes the need for the
     # parent and child to be concurrent at all.
     # ⛔ 1.56.51 — USER-WINDOW SCRATCH, NOT kmalloc. `#97 CH_MINT`/`CH_SEND` validate their buffer
     # with is_user_range; a kernel heap pointer passed only because pmm_alloc's [4 MB, 256 MB) window
@@ -3562,6 +3632,15 @@ fn fork_disk_selftest() {
     kprint_num(proc_get_exit_code(fpid));
     kprintln("", 0);
     kprintln("fork: SURVIVED back in kernel", 29);
+    # ⭐ 1.57.7 (Path 2, S3.4) — AND NOW THE FOREGROUND PARENT the banner above calls unusable: `run /bin/forker`
+    # makes the forker an exec_and_wait child, which runs IF=0 and is never preempted. It CAN fork usefully now —
+    # the forker yields (sched_yield#44, the in-kernel voluntary switch) between its waitpid polls, and sys_fork
+    # forces IF=1 in the child's RFLAGS, so the child is an ordinary scheduled process whatever its parent's IF.
+    # The child prints FORKER-CHILD-IF=1 (or =0: the mutation M-C12, a child that inherited the parent's IF=0).
+    # fork-smoke requires every forker line TWICE (both arms) and denies FORKER-CHILD-IF=0.
+    kprintln("fork: running /bin/forker (foreground, IF=0 parent)", 51);
+    sh_exec("run /bin/forker", 15);
+    kprintln("fork: foreground SURVIVED back in kernel", 40);
     return 0;
 }
 #endif
@@ -3953,91 +4032,146 @@ fs_syscall_selftest();
 # 1.46.x — fd-redirect (exec_redirect#62) capture self-test (compile-gated, EXEC_REDIRECT_SELFTEST=1).
 # Validates the capture mechanism end-to-end WITHOUT a child ELF: create a pipe, arm a redirect of
 # fd 20 -> the pipe write end, apply it, write "HI" to fd 20 (must route to the pipe, NOT the
-# console), restore, then read the pipe's read end and assert "HI". The execwait#37 hook uses the
-# SAME exec_redirect_apply/restore around the child run, so this proves a redirected fd's writes
-# land in the dst backend. fd 20 avoids the pipe's own freshly-allocated fds.
-# ⭐ 1.57.6: the arm is per-PROCESS (proc.cyr) and holds up to SPAWN_REDIR_MAX pairs, so this drives it
-# as pid 0 (the boot context) with creator == child == 0 — the table both resolve to here is the one the
-# old per-CPU slot-0 form wrote. The MULTI-PAIR case below is the `2>&1` shape: (20 <- w) then ADD
-# (21 <- 20), both captured, both slots restored byte-identical in reverse order.
+# console), then read the pipe's read end and assert "HI" — a redirected fd's writes land in the dst
+# backend. fd 20 avoids the pipe's own freshly-allocated fds. (1.57.6: the arm is per-PROCESS and holds up
+# to SPAWN_REDIR_MAX pairs; 1.57.7 S3b: applied into a scratch CHILD's private table — see below.)
 #ifdef EXEC_REDIRECT_SELFTEST
+# ⭐ 1.57.7 (S3b) — PORTED: #37 no longer applies redirects on the CALLER's table view and restores them afterwards
+# (exec_redirect_apply / exec_redirect_restore are gone); like #43 it applies them into the CHILD's private table,
+# which dies with the child. So the selftest drives a SCRATCH child slot `c`, the way #37 now works:
+#   create the pipe(s) in kmain's table -> vfs_fd_inherit(c, 0) (c gets a private COPY) -> arm (pid 0) ->
+#   spawn_fd_shape(c, 0, 0) (the apply) -> "run" as c (proc_current_set(c): sched_active is 0, nothing schedules)
+#   -> back to 0 -> proc_destroy_fd_table(c, 0) (what the reap does) -> close the write end -> drain.
+# ORDER IS LOAD-BEARING: the shape copies WITHIN the child's table (ftbl + dst*32 -> ftbl + src*32), so the pipe must
+# exist before the inherit. The drain comes after the child's table is destroyed and the parent's write end is
+# closed (pipe_read answers -2 while any writer is open). Four markers: `redir: capture OK`, `redir: stdin-pipe OK`,
+# `redir: multi capture OK` (the `2>&1` shape: (20 <- w3) then ADD (21 <- 20)), and `redir: parent table untouched OK`
+# (kmain's — the global table's — slots 0/20/21 byte-identical and proc_fd_base[0] unchanged: nothing was restored
+# because nothing of the parent's was ever touched).
+var ers_snap[12];            # module scope = 12 u64: kmain's slots 0 / 20 / 21 (32 B each)
+fn ers_snap_eq(mt) {
+    var q = 0;
+    while (q < 32) {
+        if (load64(mt + q) != load64(&ers_snap + q)) { return 0; }
+        if (load64(mt + 20 * 32 + q) != load64(&ers_snap + 32 + q)) { return 0; }
+        if (load64(mt + 21 * 32 + q) != load64(&ers_snap + 64 + q)) { return 0; }
+        q = q + 8;
+    }
+    return 1;
+}
+# Release the scratch slot (never ran; its table is destroyed): the reaped shape, then the LIFO collapse.
+fn ers_release(c) {
+    proc_destroy_fd_table(c, 0);
+    store64(&proc_table + c * 176 + 160, 0x1000);
+    proc_reap_child(c);
+    return 0;
+}
 fn exec_redirect_selftest() {
+    var c = proc_alloc_slot();
+    if (c == 0) {                                            # before the proc-table bootstrap slot 0 IS the boot context:
+        var c2 = proc_alloc_slot();                          # never alias kmain — take the next one, release slot 0
+        store64(&proc_table + 8, 0);
+        c = c2;
+    }
+    if (c <= 0) { kprintln("redir: VOID -- no scratch slot", 30); return 0; }
+    store64(&proc_table + c * 176 + 160, 0x1000);            # a clean row for the release (proc_alloc_slot never writes it)
+    store64(&proc_ppid + c * 8, 0);
+    var b0 = proc_fd_base_get(0);
+    var mt = vfs_fd_table_of(0);
+    var si = 0;
+    while (si < 32) {
+        store64(&ers_snap + si, load64(mt + si));
+        store64(&ers_snap + 32 + si, load64(mt + 20 * 32 + si));
+        store64(&ers_snap + 64 + si, load64(mt + 21 * 32 + si));
+        si = si + 8;
+    }
+    # (1) capture: the child's fd 20 <- the pipe's write end.
     var fds[16];
-    if (vfs_create_pipe(&fds) != 0) { kprintln("redir: FAIL pipe", 16); return 0; }
+    if (vfs_create_pipe(&fds) != 0) { kprintln("redir: FAIL pipe", 16); ers_release(c); return 0; }
     var rfd = load64(&fds);
     var wfd = load64(&fds + 8);
-    var msg[8]; store8(&msg, 72); store8(&msg + 1, 73);    # "HI"
-    redir_arm_replace(0, 20, wfd);                           # 1.57.6: per-process arm, pid 0 at boot
-    exec_redirect_apply(0, 0);
-    vfs_write(20, &msg, 2);                                  # routes to the pipe write end via slot 20
-    exec_redirect_restore(0, 0);
-    if (redir_n_get(0) != 0) { kprintln("redir: FAIL arm survived restore", 32); return 0; }
+    vfs_fd_inherit(c, 0);
+    if (vfs_fd_table_of(c) == &vfs_table) {
+        kprintln("redir: FAIL scratch on the global table", 39);
+        vfs_close(rfd); vfs_close(wfd); ers_release(c); return 0;
+    }
+    redir_arm_replace(0, 20, wfd);
+    if (spawn_fd_shape(c, 0, 0) != 0) { kprintln("redir: FAIL shape", 17); vfs_close(rfd); vfs_close(wfd); ers_release(c); return 0; }
+    if (redir_n_get(0) != 0) { kprintln("redir: FAIL arm survived the shape", 34); }
+    var msg[8]; store8(&msg, 72); store8(&msg + 1, 73);      # "HI"
+    proc_current_set(c);
+    vfs_write(20, &msg, 2);                                  # c's fd 20 routes to the pipe
+    proc_current_set(0);
+    proc_destroy_fd_table(c, 0);                             # the child's table dies (the reap's job)
+    vfs_close(wfd);
     var got[8]; store64(&got, 0);
     var n = vfs_read(rfd, &got, 8);
+    vfs_close(rfd);
     var stdout_ok = 0;
     if (n == 2) { if (load8(&got) == 72) { if (load8(&got + 1) == 73) { stdout_ok = 1; } } }
-    if (stdout_ok == 0) { kprintln("redir: FAIL capture", 19); return 0; }
+    if (stdout_ok == 0) { kprintln("redir: FAIL capture", 19); ers_release(c); return 0; }
     kprintln("redir: capture OK", 17);
 
-    # stdin-from-pipe (the read#5 VFS_DEVICE tag guard — the `cmd2` side of a pipe):
-    # write "PI" into a fresh pipe, redirect fd 0 -> the pipe READ end, then drive the
-    # ACTUAL read syscall ksyscall(5, fd=0, ...). With the tag guard, fd 0's tag is now
-    # VFS_PIPE (not VFS_DEVICE), so read(0) must reach pipe_read and return "PI" instead
-    # of blocking on the keyboard. fd 0 is restored to the console on exec_redirect_restore.
+    # (2) stdin-from-pipe (the read#5 VFS_DEVICE tag guard — the `cmd2` side of a pipe): the child's fd 0 <- a pipe
+    # read end holding "PI"; the ACTUAL read syscall ksyscall(5, 0, ...) as the child must reach pipe_read, not kbd.
     var fds2[16];
-    if (vfs_create_pipe(&fds2) != 0) { kprintln("redir: FAIL pipe2", 17); return 0; }
+    if (vfs_create_pipe(&fds2) != 0) { kprintln("redir: FAIL pipe2", 17); ers_release(c); return 0; }
     var rfd2 = load64(&fds2);
     var wfd2 = load64(&fds2 + 8);
     var msg2[8]; store8(&msg2, 80); store8(&msg2 + 1, 73);   # "PI"
     vfs_write(wfd2, &msg2, 2);                               # fill the pipe buffer first
-    redir_arm_replace(0, 0, rfd2);                           # fd 0 <- pipe read end
-    exec_redirect_apply(0, 0);
+    vfs_fd_inherit(c, 0);
+    redir_arm_replace(0, 0, rfd2);                           # the child's fd 0 <- the pipe read end
+    spawn_fd_shape(c, 0, 0);
     var sin[8]; store64(&sin, 0);
+    proc_current_set(c);
     var sn = ksyscall(5, 0, &sin, 8);                        # read(0) — must hit pipe_read, not kbd
-    exec_redirect_restore(0, 0);
+    proc_current_set(0);
+    proc_destroy_fd_table(c, 0);
+    vfs_close(rfd2);
+    vfs_close(wfd2);
     var sin_ok = 0;
     if (sn == 2) { if (load8(&sin) == 80) { if (load8(&sin + 1) == 73) { sin_ok = 1; } } }
-    if (sin_ok == 0) { kprintln("redir: FAIL stdin-pipe", 22); return 0; }
+    if (sin_ok == 0) { kprintln("redir: FAIL stdin-pipe", 22); ers_release(c); return 0; }
     kprintln("redir: stdin-pipe OK", 20);
 
-    # ⭐ 1.57.6 — TWO PAIRS, THE `2>&1` SHAPE. (20 <- w3) then ADD (21 <- 20): the second pair reads fd 20
-    # AFTER the first rewrote it, so both land in pipe 3. Then the restore must put BOTH slots back
-    # byte-identical — in reverse order, from this CPU's two backup cells.
+    # (3) TWO PAIRS, THE `2>&1` SHAPE: (20 <- w3) then ADD (21 <- 20). The second pair reads fd 20 of the child's
+    # CURRENT table (after the first rewrote it), so both land in pipe 3, in order.
     var fds3[16];
-    if (vfs_create_pipe(&fds3) != 0) { kprintln("redir: FAIL pipe3", 17); return 0; }
+    if (vfs_create_pipe(&fds3) != 0) { kprintln("redir: FAIL pipe3", 17); ers_release(c); return 0; }
     var rfd3 = load64(&fds3);
     var wfd3 = load64(&fds3 + 8);
-    var mt = vfs_fd_table_of(0);
-    var snap20[32];                                           # function-local var x[N] is N BYTES
-    var snap21[32];
-    var si = 0;
-    while (si < 32) { store64(&snap20 + si, load64(mt + 20 * 32 + si)); store64(&snap21 + si, load64(mt + 21 * 32 + si)); si = si + 8; }
+    vfs_fd_inherit(c, 0);
     redir_arm_replace(0, 20, wfd3);
-    if (redir_arm_add(0, 21, 20) != 0) { kprintln("redir: FAIL multi add", 21); return 0; }
-    if (redir_n_get(0) != 2) { kprintln("redir: FAIL multi count", 23); return 0; }
-    exec_redirect_apply(0, 0);
+    if (redir_arm_add(0, 21, 20) != 0) { kprintln("redir: FAIL multi add", 21); }
+    if (redir_n_get(0) != 2) { kprintln("redir: FAIL multi count", 23); }
+    spawn_fd_shape(c, 0, 0);
     var mab[8]; store8(&mab, 65); store8(&mab + 1, 66);      # "AB" via fd 20
     var mcd[8]; store8(&mcd, 67); store8(&mcd + 1, 68);      # "CD" via fd 21 (2>&1 shape)
+    proc_current_set(c);
     vfs_write(20, &mab, 2);
     vfs_write(21, &mcd, 2);
-    exec_redirect_restore(0, 0);
-    var mok = 1;
-    var sj = 0;
-    while (sj < 32) {
-        if (load64(mt + 20 * 32 + sj) != load64(&snap20 + sj)) { mok = 0; }
-        if (load64(mt + 21 * 32 + sj) != load64(&snap21 + sj)) { mok = 0; }
-        sj = sj + 8;
-    }
-    if (mok == 0) { kprintln("redir: FAIL multi restore not byte-identical", 44); return 0; }
+    proc_current_set(0);
+    proc_destroy_fd_table(c, 0);
+    vfs_close(wfd3);
     var mgot[8]; store64(&mgot, 0);
     var mn = vfs_read(rfd3, &mgot, 8);
-    if (mn != 4) { kprintln("redir: FAIL multi capture", 25); return 0; }
+    vfs_close(rfd3);
+    var mok = 1;
+    if (mn != 4) { mok = 0; }
     if (load8(&mgot) != 65) { mok = 0; }
     if (load8(&mgot + 1) != 66) { mok = 0; }
     if (load8(&mgot + 2) != 67) { mok = 0; }
     if (load8(&mgot + 3) != 68) { mok = 0; }
-    if (mok == 0) { kprintln("redir: FAIL multi capture order", 31); return 0; }
+    if (mok == 0) { kprintln("redir: FAIL multi capture", 25); ers_release(c); return 0; }
     kprintln("redir: multi capture OK", 23);
+
+    # (4) the PARENT (kmain, on the global table) was never touched: slots 0/20/21 byte-identical, same fd base.
+    var pok = ers_snap_eq(vfs_fd_table_of(0));
+    if (proc_fd_base_get(0) != b0) { pok = 0; }
+    if (pok == 1) { kprintln("redir: parent table untouched OK", 32); }
+    else { kprintln("redir: FAIL parent table changed", 32); }
+    ers_release(c);
     return 0;
 }
 exec_redirect_selftest();
@@ -4143,6 +4277,9 @@ fn nbread_selftest() {
             } else { kprintln("nbread: FAIL byte1", 18); ok = 0; }
         } else { kprintln("nbread: FAIL byte0", 18); ok = 0; }
     } else { kprintln("nbread: FAIL enter ret", 22); ok = 0; }
+    # (4) 1.57.7 (S3.7): the completed line released the cooked line (NB-OWN held it only while (2)'s partial lived).
+    if (kbd_line_owner == 0) { kprintln("nbread: line released OK", 24); }
+    else { kprintln("nbread: FAIL line still owned", 29); ok = 0; }
     pmm_free_2mb(u);
     if (ok == 1) { kprintln("nbread: ALL PASS", 16); } else { kprintln("nbread: FAIL", 12); }
     return 0;
@@ -4156,7 +4293,7 @@ nbread_selftest();
 # columns mapping to src col 0; (3) scale>16 and w*scale>8192 must reject -1 (the rowbuf
 # memory-safety gate). DISCIPLINE (per the adversarial review): ksyscall is 3-arg, so
 # ksyscall_a4 MUST be staged explicitly before each call (stale-a4 hazard — the
-# fs_syscall_selftest rename precedent); ALL fb_phys read-backs land in locals BEFORE any
+# fs_syscall_selftest rename precedent; per-process since 1.57.7, and still stale when unstaged); ALL fb_phys read-backs land in locals BEFORE any
 # kprint (console output can scroll/rewrite the whole FB); skip cleanly with no FB.
 #ifdef FBSCALE_SELFTEST
 fn fbscale_selftest() {
@@ -4221,6 +4358,8 @@ fbscale_selftest();
 # `ksyscall_a4_set`. main.cyr:3537 already records the hazard this creates — "ksyscall_a4 MUST be staged
 # explicitly before each call (stale-a4)" — so the staging lives in one helper rather than being
 # repeated at ten call sites where one omission would silently reuse the previous call's length.
+# (1.57.7: the cell is per-PROCESS now — proc_sc_a4, the caller's own slot — which changes nothing here: an
+# unstaged call still reuses the previous call's value, so explicit staging is still required.)
 fn chan_call4(op, a, b, len) {
     ksyscall_a4_set(len);
     return ksyscall(97, op, a, b);
@@ -4781,8 +4920,10 @@ kprintln("Interrupts enabled", 18);
 # ⇒ Live ticks are the FALLBACK tier (no PM timer, or one that does not count), hardened: a
 # window whose tick intervals are not uniform (one > 1.25x another, or a tick seen to advance by
 # 2) is rejected as a lost-tick window, every wait aborts after ~2^32 cycles with no tick (an
-# IF=0 caller used to hang here), and the tier runs only when lapic_calibrate MEASURED the tick
-# (lapic_reload_measured) — on the 10000000-literal fallback "one tick = 10 ms" is a guess.
+# IF=0 caller used to hang here), and the tier runs only when the tick rate was MEASURED
+# (lapic_reload_measured) — on the 10000000-literal fallback "one tick = 10 ms" is a guess. Since
+# 1.57.7 (S1b) the tick is measured against the PM timer too (the polled PIT only on a PM-less box),
+# and only lapic_reload_src == 1 proves a true 100 Hz.
 # ⛔ -1 IS PERMANENT ONCE PRODUCTION RING 3 RUNS (kybernet onward). When every tier refuses,
 # tsc_per_us stays 0 and #95 returns -1. The boot body makes exactly ONE more attempt, immediately
 # before `sched_active = 1` (before kybernet, before any production ring 3), and none after: a clock
@@ -4800,7 +4941,7 @@ var tsc_cal_smp_w   = 0;   # tsc_pm_sample: that bracket's width in cycles
 var tsc_cal_win_bad = 0;   # the last window's endpoints were too uncertain / its ticks not uniform
 var tsc_cal_seen    = 0;   # tier: windows that completed (nonzero), usable or not
 var tsc_cal_ok      = 0;   # tier: windows that were usable (clean and inside the band)
-var tsc_cal_agree   = 0;   # tsc_cal_median_agree: usable windows within tolerance of the median
+# tsc_cal_agree (tsc_cal_median_agree's count) lives in boot_data.cyr since 1.57.7: apic.cyr reads it.
 var tsc_cal_lo      = 0;   # tier: lowest completed window, cycles per MILLIsecond
 var tsc_cal_hi      = 0;   # tier: highest completed window, cycles per MILLIsecond
 var tsc_tick_stall  = 0;   # cycles; nonzero ONLY while tsc_ticks_selftest's lost-tick arm runs one window
@@ -5099,7 +5240,7 @@ fn tsc_calibrate(tc_last) {
             if (tc_cpms == 0) { tsc_cal_report_refused("live ticks", 10); }
             if (tc_cpms != 0) { tc_src = 2; }
         } else {
-            kprintln("tsc: live ticks unusable -- the LAPIC tick was never measured against the PIT", 77);
+            kprintln("tsc: live ticks unusable -- the LAPIC tick rate was never measured", 66);
         }
     }
     if (tc_cpms == 0) {
@@ -5115,6 +5256,10 @@ fn tsc_calibrate(tc_last) {
     # means no reader can pair a nonzero rate with a stale base. Belt and braces — no ring-3 reader
     # exists at either call site — but it costs nothing. tsc_base keeps its shipped meaning: rdtsc at
     # the END of calibration (boot_data.cyr).
+    # 1.57.7 (S1b B5): uptime_ms#40 reads the same pair, plus uptime_ms_base — so the order is base-ms,
+    # base-TSC, THEN the rate: #40 pairs a nonzero rate only with both bases, and is continuous with the
+    # timer_ticks * 10 it returned until this instant.
+    uptime_ms_base = timer_ticks * 10;
     tsc_base = rdtsc();
     tsc_per_us = tc_cpms / 1000;
     kprint("tsc: ", 5); kprint_num(tsc_per_us);
@@ -5124,32 +5269,46 @@ fn tsc_calibrate(tc_last) {
     kprint(", ", 2); kprint_num(tsc_cal_agree);
     kprint(" of ", 4); kprint_num(tsc_cal_ok);
     kprintln(" windows agree)", 15);
+    # 1.57.7 (S1b, D-17): the live-tick tier stands on "one tick = 10 ms", and a PIT-measured reload (a
+    # PM-less box) can be inflated by a host CPU quota uniformly enough to pass the lost-tick test. Say so.
+    if (tc_src == 2) {
+        if (lapic_reload_src == 2) {
+            kprintln("tsc:   the live-tick tier trusted a PIT-measured reload -- a host CPU quota can bias it", 87);
+        }
+    }
     # ⭐ 1.56.58 — CROSS-CHECK THE LOG TIMEBASE AGAINST THIS ONE. klog_tsc_per_us was measured ~4,400
-    # statements ago by lapic_calibrate, against 8 free-running PIT periods POLLED with interrupts OFF;
-    # this one (1.57.6) against the ACPI PM timer — or, on a box with no PM timer, against live ticks.
-    # Two independent references, same physical quantity — so a disagreement is real evidence, and
-    # agreement is the only proof the early number is sound. Without this the log would render a
-    # plausible timestamp built on an unverified divisor, which is the failure this tree keeps
-    # re-learning.
-    # ⚠ Band is ±12%, kept from 1.56.58: the early window is ~80 ms of PIT against a 15 ppm-slow tick,
-    # and on a boosting CPU the two windows genuinely sample different clock states. The late number
-    # is now tighter than it was (PM windows agree within 0.5%, tick windows within 2%), but the band
-    # is sized for the early one. ⚠ Under a host CPU quota the EARLY number is the suspect one — its
-    # PIT wraps are polled and can be missed (apic.cyr) — so a DISAGREES line there indicts klog.
+    # statements ago, before apic_init — since 1.57.7 (S1b) against the ACPI PM timer by lapic_calibrate_pm
+    # (median of 5 x 10 ms windows), on a PM-less box against 8 PIT periods POLLED with interrupts OFF;
+    # this one against the ACPI PM timer again — or, on a box with no PM timer, against live ticks. Without
+    # this the log would render a plausible timestamp built on an unverified divisor, which is the failure
+    # this tree keeps re-learning.
+    # ⭐ BAND. When BOTH numbers are PM-derived (lapic_reload_src 1 and tc_src 1) they are two medians of
+    # the same reference taken seconds apart, so the band is 1%, and a DISAGREES line is a real finding
+    # (a wrong early divisor, or a TSC that changed rate). Otherwise the 1.56.58 ±12% band stands: the
+    # early PIT window is ~80 ms against a 15 ppm-slow tick, a boosting CPU samples different clock states,
+    # and under a host CPU quota the polled PIT number is the suspect one — a DISAGREES line there indicts klog.
+    var tc_kband = 12;
+    if (lapic_reload_src == 1) {
+        if (tc_src == 1) { tc_kband = 1; }
+    }
     if (klog_tsc_per_us == 0) {
-        kprintln("klog: NO LOG TIMEBASE -- lapic_calibrate refused; every timestamp reads 0.000000", 80);
+        kprintln("klog: NO LOG TIMEBASE -- the early window refused; every timestamp reads 0.000000", 81);
     }
     if (klog_tsc_per_us != 0) {
         var kdiff = klog_tsc_per_us - tsc_per_us;
         if (kdiff < 0) { kdiff = 0 - kdiff; }
-        if (kdiff * 100 > tsc_per_us * 12) {
+        if (kdiff * 100 > tsc_per_us * tc_kband) {
             kprint("klog: TIMEBASE DISAGREES -- early=", 34); kprint_num(klog_tsc_per_us);
             kprint(" late=", 6); kprint_num(tsc_per_us);
             kprintln(" cycles/us; log timestamps are skewed", 37);
         }
-        if (kdiff * 100 <= tsc_per_us * 12) {
+        if (kdiff * 100 <= tsc_per_us * tc_kband) {
             kprint("klog: log timebase OK -- ", 25); kprint_num(klog_tsc_per_us);
-            kprintln(" cycles/us, agrees with tsc within 12%", 38);
+            if (tc_kband == 1) {
+                kprintln(" cycles/us, agrees with tsc within 1%", 37);
+            } else {
+                kprintln(" cycles/us, agrees with tsc within 12%", 38);
+            }
         }
     }
     return 0;
@@ -5159,13 +5318,14 @@ fn tsc_calibrate(tc_last) {
 # ⭐ 1.57.6 — TWO INDEPENDENT TIERS CROSS-CHECKING EACH OTHER ON EVERY SMOKE. On a PM-timer box
 # tsc_calibrate took tier 1; this runs tier 2 (live ticks) directly and compares. Needs live ticks,
 # so it runs BEFORE tsc_selftest's IF=0 ring-3 excursion, exactly like the gpu/hda arm D.
-# ⚠ SKIPS when lapic_calibrate fell back to the 10000000 literal — the same gate tsc_calibrate
-# applies to the tick tier, so the selftest never scores a divisor built on a guessed tick rate.
+# ⚠ SKIPS when the LAPIC reload fell back to the 10000000 literal (lapic_reload_measured == 0: neither the
+# PM timer nor the PIT measured it) — the same gate tsc_calibrate applies to the tick tier, so the
+# selftest never scores a divisor built on a guessed tick rate.
 # ⚠ Under a CPU quota the tick tier is EXPECTED to refuse or disagree (that is the bug the PM tier
 # fixed); tsc-smoke's TSC_QUOTA mode scores this line as INFO for exactly that reason.
 fn tsc_ticks_selftest() {
     if (lapic_reload_measured == 0) {
-        kprintln("ticks-tsc: SKIP -- the LAPIC tick was never measured against the PIT", 68);
+        kprintln("ticks-tsc: SKIP -- the LAPIC tick rate was never measured", 57);
         return 0;
     }
     if (tsc_per_us == 0) {
@@ -5262,6 +5422,257 @@ fn tsc_cal_pred_selftest() {
     kprint("pred-tsc: ", 10); kprint_num(pp_pass); kprintln("/5 arms", 7);
     return 0;
 }
+
+# ⭐ 1.57.7 (S1b) — THE 100 Hz TICK, AND SO uptime_ms#40, AGAINST REAL TIME. Measured in a HALTED window:
+# a halted guest does not use its quota, so the host does not coalesce ticks, and the window measures the
+# RELOAD rather than the throttle. Settles first (10 consecutive single-step intervals, each within 25% of
+# the one before — absorbs any throttle left by the busy selftests just before; independent of the reload,
+# so a wrong reload still settles and is caught below), then 200 ticks against the PM timer. Check 1: the
+# #40 delta tracks PM time within 3%. Check 2: the MEDIAN tick interval is 10 ms within 1% — the median
+# discards both halves of a coalescing event (the long interval and the short re-gridded one after it).
+# B5: #40 must also advance across a 200 ms IF=0 busy window (the calibrated-TSC backing).
+# Preconditions: BSP, IF=1, sched_active == 0, APs not woken (arch_wait, no lock). Clobbers tsc_cal_agree.
+fn tick_rate_selftest() {
+    var tr_iv[1600];   # ⛔ FUNCTION-LOCAL: 1600 BYTES = 200 u64 slots, indexed by the window loop variable (< 200)
+    var tr_port = acpi_pm_tmr_port;
+    if (tr_port == 0) {
+        kprintln("tickrate: SKIP -- no acpi pm timer to measure the tick against", 62);
+        return 0;
+    }
+    var tr_t = timer_ticks;
+    while (timer_ticks == tr_t) { arch_wait(); }
+    var tr_prev_tick = timer_ticks;
+    var tr_prev_p = tsc_pm_read(tr_port);
+    var tr_prev_c = rdtsc();
+    var tr_prev_d = 0;
+    var tr_run = 0;
+    var tr_settle = 0;
+    while (tr_run < 10) {
+        if (tr_settle >= 300) {
+            kprintln("tickrate: FAIL the tick never settled (no 10 uniform intervals in 300 ticks)", 76);
+            return 0;
+        }
+        var tr_s0 = timer_ticks;
+        while (timer_ticks == tr_s0) { arch_wait(); }
+        var tr_sn = timer_ticks;
+        var tr_sp = tsc_pm_read(tr_port);
+        tr_settle = tr_settle + 1;
+        var tr_sd = (tr_sp - tr_prev_p) & 0xFFFFFF;
+        var tr_sok = 0;
+        if ((tr_sn - tr_prev_tick) == 1) {
+            if (tr_prev_d != 0) {
+                if ((tr_sd * 4) <= (tr_prev_d * 5)) {
+                    if ((tr_prev_d * 4) <= (tr_sd * 5)) { tr_sok = 1; }
+                }
+            }
+            tr_prev_d = tr_sd;
+        } else {
+            tr_prev_d = 0;
+        }
+        if (tr_sok == 1) { tr_run = tr_run + 1; } else { tr_run = 0; }
+        tr_prev_tick = tr_sn;
+        tr_prev_p = tr_sp;
+    }
+    var tr_um0 = ksyscall(40, 0, 0, 0);
+    tr_prev_c = rdtsc();
+    var tr_k = 0;
+    var tr_acc = 0;
+    var tr_n = 0;
+    while (tr_k < 200) {
+        var tr_w0 = timer_ticks;
+        while (timer_ticks == tr_w0) { arch_wait(); }
+        var tr_now = timer_ticks;
+        var tr_p = tsc_pm_read(tr_port);
+        var tr_c = rdtsc();
+        var tr_step = tr_now - tr_prev_tick;
+        var tr_d = (tr_p - tr_prev_p) & 0xFFFFFF;
+        store64(&tr_iv + tr_k * 8, tr_d);
+        tr_acc = tr_acc + tr_d;
+        tr_n = tr_n + tr_step;
+        tr_k = tr_k + 1;
+        if (tsc_per_us != 0) {
+            if ((tr_c - tr_prev_c) > 4000000 * tsc_per_us) {
+                kprintln("tickrate: FAIL one tick took longer than 4 s -- the pm count may have wrapped", 77);
+                return 0;
+            }
+        }
+        tr_prev_tick = tr_now;
+        tr_prev_p = tr_p;
+        tr_prev_c = tr_c;
+    }
+    var tr_um1 = ksyscall(40, 0, 0, 0);
+    var tr_real = tr_acc * 1000 / 3579545;
+    var tr_um = tr_um1 - tr_um0;
+    var tr_med = tsc_cal_median_agree(&tr_iv, 200, 100);
+    var tr_agree = tsc_cal_agree;
+    var tr_late = 0;
+    var tr_j = 0;
+    while (tr_j < 200) {
+        var tr_x = load64(&tr_iv + tr_j * 8) - tr_med;
+        if (tr_x < 0) { tr_x = 0 - tr_x; }
+        if ((tr_x * 4) > tr_med) { tr_late = tr_late + 1; }
+        tr_j = tr_j + 1;
+    }
+    kprint("tickrate: ", 10); kprint_num(tr_n);
+    kprint(" ticks over ", 12); kprint_num(tr_real);
+    kprint(" ms of acpi pm time; uptime_ms#40 advanced ", 43); kprint_num(tr_um);
+    kprint(" ms; settle ", 12); kprint_num(tr_settle);
+    kprint(" ticks; late ", 13); kprint_num(tr_late);
+    kprintln("", 0);
+    var tr_e = tr_um - tr_real;
+    if (tr_e < 0) { tr_e = 0 - tr_e; }
+    if ((tr_e * 100) <= (tr_real * 3)) {
+        kprintln("tickrate: PASS uptime_ms#40 tracks real time within 3% (halted window)", 70);
+    } else {
+        kprintln("tickrate: FAIL uptime_ms#40 is off real time by more than 3% (halted window)", 76);
+    }
+    if (tr_med == 0) {
+        kprintln("tickrate: FAIL fewer than 3 tick intervals agree with their median", 66);
+    } else {
+        var tr_pus = tr_med * 1000000 / 3579545;
+        kprint("tickrate: tick period ", 22); kprint_num(tr_pus);
+        kprint(" us (median of ", 15); kprint_num(200);
+        kprint(" intervals, ", 12); kprint_num(tr_agree);
+        kprintln(" within 1%)", 11);
+        var tr_pe = tr_pus - 10000;
+        if (tr_pe < 0) { tr_pe = 0 - tr_pe; }
+        if ((tr_pe * 100) <= 10000) {
+            kprintln("tickrate: PASS the tick period is 10 ms within 1% (the reload is true)", 70);
+        } else {
+            kprintln("tickrate: FAIL the tick period is not 10 ms within 1% (the reload is wrong)", 75);
+        }
+    }
+    # ⭐ B5 — uptime_ms#40 IS BACKED BY THE CALIBRATED TSC: it must advance across a 200 ms busy window run
+    # with INTERRUPTS MASKED, where the tick (and the pre-1.57.7 #40) is frozen. Both samples are taken
+    # inside the IF=0 window, so no tick can be delivered between them.
+    # Register contract: `cli` / `sti` read and write no GPR; each changes RFLAGS.IF only. IF=1 on entry
+    # (see the preconditions above), so the closing `sti` restores the state it found.
+    if (tsc_per_us != 0) {
+        var tr_bgoal = tsc_per_us * 200000;
+        asm { cli; }
+        var tr_b0 = ksyscall(40, 0, 0, 0);
+        var tr_bs = rdtsc();
+        var tr_bc = rdtsc();
+        while ((tr_bc - tr_bs) < tr_bgoal) { tr_bc = rdtsc(); }
+        var tr_b1 = ksyscall(40, 0, 0, 0);
+        asm { sti; }
+        var tr_bd = tr_b1 - tr_b0;
+        var tr_bms = (tr_bc - tr_bs) / (tsc_per_us * 1000);
+        kprint("tickrate: uptime_ms#40 advanced ", 32); kprint_num(tr_bd);
+        kprint(" ms across a ", 13); kprint_num(tr_bms);
+        kprintln(" ms IF=0 busy window", 20);
+        var tr_be = tr_bd - 200;
+        if (tr_be < 0) { tr_be = 0 - tr_be; }
+        if ((tr_be * 100) <= 600) {
+            kprintln("tickrate: PASS uptime_ms#40 advanced across a 200 ms IF=0 busy window", 69);
+        } else {
+            kprintln("tickrate: FAIL uptime_ms#40 did not advance across a 200 ms IF=0 busy window", 76);
+        }
+    }
+    return 0;
+}
+
+# 1.57.7 (S1b) — FADT PURITY (D-16). acpi_fadt_poison_st writes a nonzero value into all 18 FADT outputs;
+# acpi_fadt_all_zero_st returns 1 iff all 18 are 0. Shared by arms 1 and 2 of acpi_fadt_reset_selftest.
+fn acpi_fadt_poison_st() {
+    acpi_fadt_addr = 0x5A5A;
+    acpi_fadt_len = 0x5A5B;
+    acpi_fadt_rev = 0x5A5C;
+    acpi_fadt_flags = 0x5A5D;
+    acpi_hw_reduced = 0x5A5E;
+    acpi_dsdt_addr = 0x5A5F;
+    acpi_smi_cmd = 0x5A60;
+    acpi_enable_val = 0x5A61;
+    acpi_pm1a_cnt = 0x5A62;
+    acpi_pm1b_cnt = 0x5A63;
+    acpi_pm1a_evt = 0x5A64;
+    acpi_pm1_cnt_len = 0x5A65;
+    acpi_reset_space = 0x5A66;
+    acpi_reset_addr = 0x5A67;
+    acpi_reset_value = 0x5A68;
+    acpi_reset_ok = 0x5A69;
+    acpi_pm_tmr_port = 0x5A6A;
+    acpi_pm_tmr_ext = 0x5A6B;
+    return 0;
+}
+
+fn acpi_fadt_all_zero_st() {
+    if (acpi_fadt_addr != 0) { return 0; }
+    if (acpi_fadt_len != 0) { return 0; }
+    if (acpi_fadt_rev != 0) { return 0; }
+    if (acpi_fadt_flags != 0) { return 0; }
+    if (acpi_hw_reduced != 0) { return 0; }
+    if (acpi_dsdt_addr != 0) { return 0; }
+    if (acpi_smi_cmd != 0) { return 0; }
+    if (acpi_enable_val != 0) { return 0; }
+    if (acpi_pm1a_cnt != 0) { return 0; }
+    if (acpi_pm1b_cnt != 0) { return 0; }
+    if (acpi_pm1a_evt != 0) { return 0; }
+    if (acpi_pm1_cnt_len != 0) { return 0; }
+    if (acpi_reset_space != 0) { return 0; }
+    if (acpi_reset_addr != 0) { return 0; }
+    if (acpi_reset_value != 0) { return 0; }
+    if (acpi_reset_ok != 0) { return 0; }
+    if (acpi_pm_tmr_port != 0) { return 0; }
+    if (acpi_pm_tmr_ext != 0) { return 0; }
+    return 1;
+}
+
+# Three arms, one PASS/FAIL line each: (1) a decode that finds no FACP leaves no stale field (the clear at
+# the top of acpi_find_fadt); (2) acpi_init with no RSDP (acpi_rsdp_suppress) leaves no stale field (the
+# clear in acpi_init's reset list — the no-RSDP return comes BEFORE acpi_find_fadt, so arm 1 cannot see
+# it); (3) a real acpi_init restores the live decode (and leaves it restored for the rest of the boot).
+# ⛔ Briefly zeroes FADT/ACPI globals: safe only because no ISR reads them and power.cyr reads them only at
+# shutdown — so this runs pre-AP, pre-scheduler, IF=1, on the BSP, and NEVER after sched_active = 1.
+fn acpi_fadt_reset_selftest() {
+    var af_rsdp = acpi_rsdp_addr;
+    var af_rsdt = acpi_rsdt_addr;
+    var af_xsdt = acpi_xsdt_addr;
+    var af_via = acpi_rsdp_via_bootinfo;
+    var af_dmar = acpi_dmar_addr;
+    var af_iommu = acpi_iommu_base;
+    var af_fadt = acpi_fadt_addr;
+    var af_port = acpi_pm_tmr_port;
+    acpi_fadt_poison_st();
+    acpi_xsdt_addr = 0;
+    acpi_rsdt_addr = 0;
+    acpi_find_fadt();
+    if (acpi_fadt_all_zero_st() == 1) {
+        kprintln("acpi-fadt: PASS a FADT decode that finds no table leaves no stale field", 71);
+    } else {
+        kprintln("acpi-fadt: FAIL a FADT decode that finds no table left a stale field", 68);
+    }
+    acpi_fadt_poison_st();
+    acpi_rsdp_suppress = 1;
+    acpi_init();
+    acpi_rsdp_suppress = 0;
+    var af_ok2 = 0;
+    if (acpi_fadt_all_zero_st() == 1) {
+        if (acpi_rsdp_addr == 0) { af_ok2 = 1; }
+    }
+    if (af_ok2 == 1) {
+        kprintln("acpi-fadt: PASS acpi_init with no RSDP leaves no stale FADT field", 65);
+    } else {
+        kprintln("acpi-fadt: FAIL acpi_init with no RSDP left a stale FADT field", 62);
+    }
+    acpi_init();
+    var af_ok3 = 0;
+    if (acpi_rsdp_addr == af_rsdp) {
+        if (acpi_pm_tmr_port == af_port) {
+            if (acpi_fadt_addr == af_fadt) {
+                if (acpi_dmar_addr == af_dmar) {
+                    if (acpi_iommu_base == af_iommu) { af_ok3 = 1; }
+                }
+            }
+        }
+    }
+    if (af_ok3 == 1) {
+        kprintln("acpi-fadt: PASS the re-decode restored the pm timer port and the FADT", 69);
+    } else {
+        kprintln("acpi-fadt: FAIL the re-decode did not restore the pm timer port and the FADT", 76);
+    }
+    return 0;
+}
 #endif
 
 tsc_calibrate(0);
@@ -5285,6 +5696,9 @@ hda_tsc_selftest();
 # 1.57.6: the live-tick tier against the calibration — needs live ticks, so the same IF=1 reason.
 tsc_ticks_selftest();
 tsc_cal_pred_selftest();
+# 1.57.7 (S1b): the tick against real time, then FADT purity. BSP, IF=1, sched_active == 0, APs not woken.
+tick_rate_selftest();
+acpi_fadt_reset_selftest();
 tsc_selftest();
 #endif
 
@@ -6165,7 +6579,9 @@ fn ring3_nonlifo_check() {
     while (w < 3000) {
         if (proc_get_state(pidA) == 0) { w = 3000; } else { arch_wait(); w = w + 1; }
     }
-    proc_send_signal(pidA, 10);                        # stamp a pending signal on A's (dead) slot
+    # 1.57.7 (S8, D21): the pending-bit OR inline — S7 moved proc_send_signal under #ifdef TEST, which left this
+    # RING3_SELFTEST build with a reachable undefined function (found by S8's ring3-smoke regression).
+    atomic_or64(&proc_signals + pidA * 8, 1 << 10);    # stamp a pending signal on A's (dead) slot
     proc_reap_child(pidA);                             # NON-TOP reap (B above) → A's slot is a hole
     var pc1 = proc_count;                              # high-water mark AFTER the non-top reap
     var pidC = spawn_user_proc(&ring3_exit_payload);   # C: must REUSE A's hole (created, not run)
@@ -6347,8 +6763,9 @@ fn ring3_selftest_verify() {
     var srp = 0;
     while (srp < ring3_stress_count) { proc_set_state(ring3_stress_first + srp, 0); srp = srp + 1; }
     # 1.44.16 sched_yield(#44): the YIELDER Y donated every slice. (i) cy > 0 proves the
-    # abandon-frame round trip — Y was resumed in ring 3 at the post-SYSCALL RIP with
-    # rax==0 AND its callee-saved/RSP state intact (any breakage spins, faults, or freezes
+    # in-kernel voluntary switch round trip (since 1.57.7: #44 -> int 0xE0 -> do_context_switch ->
+    # sched_leave_old, Invariant 7; the 1.44.16 abandon-frame is retired) — Y was resumed in ring 3 at the
+    # post-SYSCALL RIP with rax==0 AND its callee-saved/RSP state intact (any breakage spins, faults, or freezes
     # the counter). (ii) ca >> cy (10x) proves the yield actually ENDS the slice — a
     # silently-non-switching yield (all guards refusing) would make Y a busy increment
     # loop with cy ~= ca and FAIL the ratio. The RATIO is TCG-speed-independent.
@@ -6890,39 +7307,371 @@ fn kst_phase_storm() {
     return 0;
 }
 
-# PHASE 4 — sched_next's nothing-is-ready fallback (S3.1). kmain runs the NOT-READY child C out-of-band
-# (exec_and_wait, IF=0 as every launch site now is), so kmain sits at state 2 with a STALE slot. C parks
-# five times (mode 4): each time it leaves the CPU in state 6, the idle is current and nothing is READY —
-# the fallback runs on every tick and must answer the idle; `return 0` there would pick kmain's stale slot
-# (the tripwire then refuses it: 'sched: refused non-ready pick' — M-A2). C exits with its count (5).
+# PHASE 4 — sched_next's nothing-is-ready fallback (S3.1). kmain runs the NOT-READY child C as a scheduled child
+# (1.57.7 S3b: kernel_run_child_keep) and is itself BLOCKED (state 6) while C runs — so C and kmain are both
+# unpickable whenever C parks. C parks five times (mode 4): each time it leaves the CPU in state 6, the idle is
+# current and nothing is READY — the fallback runs on every tick and must answer the idle. Under M-A2 (`return 0`)
+# the pick is the BLOCKED kmain, which the READY-only tripwire refuses ('sched: refused non-ready pick'); without
+# the tripwire it would be a benign spurious wake (kmain's genuine int-0xE0 frame: wq_sleep returns and
+# proc_wait_child_exit re-arms), no longer the old stale-slot time-travel. C exits with its count (5).
+# ⚠ WHY THE keep/done SPLIT: C's data page (cn, cf) lives in C's address space, which dies at the reap — so the
+# counters are read between kernel_run_child_keep (C dead, UNREAPED, its slot held by kmain's fgwait cell) and
+# kernel_run_child_done (the reap, then the cell clear). S3c's per-park real wq wait (the `wq=` field) is unchanged.
 fn kst_phase_fallback() {
     var h0 = kst_fallback_hits;
     var r0 = sched_refused_n;
     var p0 = kst_parks;
-    var cep = &proc_table + kst_c_pid * 176;
-    var ce = load64(cep + 24);
-    var cr = load64(cep + 16);
-    var cc = load64(cep + 160);
-    var rf = kbd_irq_save();
-    proc_current_set(kst_c_pid);
-    exec_and_wait(ce, cr, cc);
-    var code = proc_get_exit_code(kst_c_pid);
+    var fw0 = kst_fallback_wq;                          # 1.57.7: one real wq wait after each park (sched.cyr mode 4)
+    var code = kernel_run_child_keep(kst_c_pid, 0);
+    if (kr_refused != 0) { kprintln("kstack: FAIL fallback (refused)", 31); return 0; }
     var cn = load64(kst_pg(kst_c_page));
     var cf = load64(kst_pg(kst_c_page) + 8);
-    proc_reap_child(kst_c_pid);
-    kbd_irq_restore(rf);
+    kernel_run_child_done(kst_c_pid, 0);
     kprint("kstack: fallback parks=", 23); kprint_num(kst_parks - p0);
     kprint(" refused=", 9); kprint_num(kst_park_refused);
     kprint(" hits=", 6); kprint_num(kst_fallback_hits - h0);
     kprint(" exit=", 6); kprint_num(code);
     kprint(" n=", 3); kprint_num(cn);
     kprint(" fail=", 6); kprint_num(cf);
+    kprint(" wq=", 4); kprint_num(kst_fallback_wq - fw0);
     kprintln("", 0);
-    if (kst_parks - p0 >= 5 && kst_fallback_hits > h0 && code == 5 && cf == 0 && sched_refused_n == r0) {
+    if (kst_parks - p0 >= 5 && kst_fallback_hits > h0 && code == 5 && cf == 0 && sched_refused_n == r0 && kst_fallback_wq - fw0 == kst_parks - p0) {
         kprintln("kstack: fallback OK", 19);
     } else {
         kprintln("kstack: FAIL fallback", 21);
     }
+    return 0;
+}
+
+# ═══════════════ 1.57.7 (Path 2, S3.4) — THE VOLUNTARY-SWITCH AND WAIT/WAKE PHASES ═══════════════
+# All run after the S3.3 phases, on fresh probes of the SAME payload P (its mode word selects the kernel hook,
+# sched.cyr kst_probe_hook), spawned READY at run time. A probe with a limit exits(counter) once counter reaches
+# it, so a phase that ends in time proves every probe syscall returned to ring 3 with the right rax and intact
+# sentinels (P checks both after every syscall).
+var kst_x_pid[8];            # this block's probes (8: the pause phase adds up to 4 competitors, 1.57.7 S3d)
+var kst_x_page[8];
+var kst_payload_g[512];      # the DPL0 probe: CD E0 EB FE (int 0xE0; jmp $) — 4096 B because kst_spawn copies a page
+var kst_rmw_run = 0;         # the preempt-rmw kthreads loop while 1
+var kst_rmw_iter[2];
+var kst_rmw_pid[2];
+
+# Spawn probe k of this block with mode/limit, READY or CLAIMING. -1 on failure (a FAIL line is the caller's).
+fn kst_x_spawn(k, mode, limit, ready) {
+    var xs_pg = kst_page_new();
+    if (xs_pg == 0) { return 0 - 1; }
+    var xs_pid = kst_spawn(&kst_payload_p, xs_pg, (k + 1) * 0x0001010101010060 + mode, mode, limit, ready);
+    if (xs_pid < 0) { return 0 - 1; }
+    store64(&kst_x_pid + k * 8, xs_pid);
+    store64(&kst_x_page + k * 8, xs_pg);
+    return xs_pid;
+}
+# Wait (IF=1, kmain parks) until probes 0..n-1 of this block are dead, at most `ticks`. 1 = all dead.
+fn kst_x_wait_dead(n, ticks) {
+    var xw_t0 = timer_ticks;
+    while (timer_ticks - xw_t0 < ticks) {
+        var xw_live = 0;
+        var xw_i = 0;
+        while (xw_i < n) {
+            if (proc_get_state(load64(&kst_x_pid + xw_i * 8)) != 0) { xw_live = xw_live + 1; }
+            xw_i = xw_i + 1;
+        }
+        if (xw_live == 0) { return 1; }
+        arch_wait();
+    }
+    return 0;
+}
+# Retire whatever is still alive, let every CPU leave it, reap. Returns the summed probe fail flags.
+fn kst_x_reap(n) {
+    var xr_i = 0;
+    var xr_f = 0;
+    while (xr_i < n) {
+        var xr_p = load64(&kst_x_pid + xr_i * 8);
+        if (proc_get_state(xr_p) != 0) { proc_set_state(xr_p, 0); }
+        xr_f = xr_f + load64(kst_pg(load64(&kst_x_page + xr_i * 8)) + 8);
+        xr_i = xr_i + 1;
+    }
+    kst_wait_ticks(3);
+    xr_i = 0;
+    while (xr_i < n) { proc_reap_child(load64(&kst_x_pid + xr_i * 8)); xr_i = xr_i + 1; }
+    return xr_f;
+}
+
+# PHASE 5 — BLOCK/WAKE (mode 2): two probes, 6 syscalls each, 3 timed waits per syscall = 36 real blocks in the
+# production primitive; each wait must come back WR_TIMEOUT, and each probe's per-PROCESS a4 (set before the waits,
+# while the OTHER probe also sets its own) must survive (mutation M-S1: one shared cell -> kst_blk_bad).
+fn kst_phase_blockwake() {
+    var bw_n0 = kst_blk_n;
+    if (kst_x_spawn(0, 2, 6, 1) < 0 || kst_x_spawn(1, 2, 6, 1) < 0) { kprintln("kstack: FAIL block/wake: spawn", 30); return 0; }
+    var bw_dead = kst_x_wait_dead(2, 500);
+    var bw_e0 = proc_get_exit_code(load64(&kst_x_pid));
+    var bw_e1 = proc_get_exit_code(load64(&kst_x_pid + 8));
+    var bw_f = kst_x_reap(2);
+    kprint("kstack: block/wake blocks=", 26); kprint_num(kst_blk_n - bw_n0);
+    kprint(" bad=", 5); kprint_num(kst_blk_bad);
+    kprint(" refused=", 9); kprint_num(kst_blk_refused);
+    kprint(" migr=", 6); kprint_num(kst_blk_migr);
+    kprint(" exits=", 7); kprint_num(bw_e0); kprint(",", 1); kprint_num(bw_e1);
+    kprint(" fail=", 6); kprint_num(bw_f);
+    kprintln("", 0);
+    if (bw_dead == 1 && kst_blk_n - bw_n0 >= 10 && kst_blk_bad == 0 && kst_blk_refused == 0 && bw_e0 == 6 && bw_e1 == 6 && bw_f == 0) {
+        kprintln("kstack: block/wake OK", 21);
+    } else {
+        kprintln("kstack: FAIL block/wake", 23);
+    }
+    return 0;
+}
+
+# PHASE 6 — PING-PONG (mode 3): two probes hand a turn back and forth through wq_arm / re-check / wq_sleep and
+# wq_wake — 30 syscalls each, 60 rounds. A lost wakeup (mutation M-C6: the re-check moved BEFORE the arm) leaves a
+# passed turn unnoticed until the 5 s watchdog deadline (kst_pp_wd).
+fn kst_phase_pingpong() {
+    kst_pp_turn = 0;
+    var pp_r0 = kst_pp_rounds;
+    var pp_w0 = kst_pp_wd;
+    var pp_a = kst_x_spawn(0, 3, 30, 0);                # CLAIMING until both pids are published
+    var pp_b = kst_x_spawn(1, 3, 30, 0);
+    if (pp_a < 0 || pp_b < 0) { kprintln("kstack: FAIL pingpong: spawn", 28); return 0; }
+    store64(&kst_pp_pid, pp_a);
+    store64(&kst_pp_pid + 8, pp_b);
+    proc_set_state(pp_a, 1);
+    proc_set_state(pp_b, 1);
+    var pp_dead = kst_x_wait_dead(2, 1500);
+    var pp_e0 = proc_get_exit_code(pp_a);
+    var pp_e1 = proc_get_exit_code(pp_b);
+    var pp_f = kst_x_reap(2);
+    kprint("kstack: pingpong rounds=", 24); kprint_num(kst_pp_rounds - pp_r0);
+    kprint(" watchdog=", 10); kprint_num(kst_pp_wd - pp_w0);
+    kprint(" bad=", 5); kprint_num(kst_pp_bad);
+    kprint(" refused=", 9); kprint_num(kst_pp_refused);
+    kprint(" exits=", 7); kprint_num(pp_e0); kprint(",", 1); kprint_num(pp_e1);
+    kprint(" fail=", 6); kprint_num(pp_f);
+    kprintln("", 0);
+    if (pp_dead == 1 && kst_pp_rounds - pp_r0 >= 50 && kst_pp_wd == pp_w0 && kst_pp_bad == 0 && kst_pp_refused == 0 && pp_e0 == 30 && pp_e1 == 30 && pp_f == 0) {
+        kprintln("kstack: pingpong OK", 19);
+    } else {
+        kprintln("kstack: FAIL pingpong", 21);
+    }
+    return 0;
+}
+
+# PHASE 7 — THE #14 PREEMPT POINT (mode 5): 2 syscalls x 10 in-kernel ksyscall(14). With wq_can_block() true the
+# #14 arm runs sched_halt_window (IF=1, preempt_count 0) and, when work is READY for its CPU, the yield after it:
+# either way the probe is switched out at CPL0 inside the arm (kst_pause_out). Mutation M-C16 (the arm without its
+# wq_can_block branch: the legacy preempt-held hlt) -> 0 switch-outs. These windows also feed the AC sample.
+# ⭐ 1.57.7 (S3d, R24) — THE COMPETITORS. Until keep-current the idle was READY whenever it was not current, so every
+# tick that landed in the hlt switched the probe out. Now a RUNNING probe with only the idle READY is KEPT, and at
+# -smp 4 (probe on an AP, kmain pinned to the BSP) the phase measured switch_outs=1 of the >= 5 it needs: the
+# coverage fell, not the property. So the phase now runs cpu_count mode-0 probes beside it (payload P, pause#14
+# with mode 0 returns at once — CPU-bound ring-3 loops): with one more unpinned proc than CPUs there is always READY
+# work, so every #14 the probe makes is a real CPL0 switch-out through the preempt point. The floor is unchanged.
+fn kst_phase_pause() {
+    var pz_o0 = kst_pause_out;
+    var pz_c0 = kst_pause_calls;
+    var pz_nc = cpu_count;
+    if (pz_nc < 1) { pz_nc = 1; }
+    if (pz_nc > 4) { pz_nc = 4; }
+    var pz_p = kst_x_spawn(0, 5, 2, 0);                # CLAIMING until the competitors exist
+    if (pz_p < 0) { kprintln("kstack: FAIL pause window: spawn", 32); return 0; }
+    var pz_k = 1;
+    while (pz_k <= pz_nc) {
+        if (kst_x_spawn(pz_k, 0, 0, 1) < 0) { kprintln("kstack: FAIL pause window: competitor spawn", 43); proc_set_state(pz_p, 1); kst_x_reap(pz_k); return 0; }
+        pz_k = pz_k + 1;
+    }
+    proc_set_state(pz_p, 1);                           # the mode-5 probe goes READY last
+    var pz_dead = kst_x_wait_dead(1, 500);
+    var pz_e = proc_get_exit_code(load64(&kst_x_pid));
+    var pz_f = kst_x_reap(pz_nc + 1);
+    kprint("kstack: pause window calls=", 27); kprint_num(kst_pause_calls - pz_c0);
+    kprint(" switch_outs=", 13); kprint_num(kst_pause_out - pz_o0);
+    kprint(" refused=", 9); kprint_num(kst_pause_refused);
+    kprint(" exit=", 6); kprint_num(pz_e);
+    kprint(" fail=", 6); kprint_num(pz_f);
+    kprint(" competitors=", 13); kprint_num(pz_nc);
+    kprintln("", 0);
+    if (pz_dead == 1 && kst_pause_out - pz_o0 >= 5 && kst_pause_refused == 0 && pz_e == 2 && pz_f == 0) {
+        kprintln("kstack: pause window OK", 23);
+    } else {
+        kprintln("kstack: FAIL pause window", 25);
+    }
+    return 0;
+}
+
+# PHASE 8 — THE 0xE0 GATE IS DPL0: a ring-3 `int 0xE0` must #GP (fault_kill_current: exit 128 + 13 = 141, then
+# sched_exit_tail) within 2 s. Mutation M-C4 (attr 0xEE, DPL3): the int enters resched_isr, the intent cell is 0,
+# the handler EOIs and returns, and the payload's `jmp $` spins forever.
+fn kst_phase_dpl0() {
+    store8(&kst_payload_g, 0xCD); store8(&kst_payload_g + 1, 0xE0);   # int 0xE0
+    store8(&kst_payload_g + 2, 0xEB); store8(&kst_payload_g + 3, 0xFE);   # jmp $
+    var dg_pg = kst_page_new();
+    if (dg_pg == 0) { kprintln("kstack: FAIL resched gate DPL0: page", 36); return 0; }
+    var dg_pid = kst_spawn(&kst_payload_g, dg_pg, 0, 0, 0, 1);
+    if (dg_pid < 0) { kprintln("kstack: FAIL resched gate DPL0: spawn", 37); return 0; }
+    store64(&kst_x_pid, dg_pid);
+    store64(&kst_x_page, dg_pg);
+    var dg_dead = kst_x_wait_dead(1, 200);
+    var dg_e = proc_get_exit_code(dg_pid);
+    kst_x_reap(1);
+    kprint("kstack: resched gate dead=", 26); kprint_num(dg_dead);
+    kprint(" exit=", 6); kprint_num(dg_e);
+    kprintln("", 0);
+    if (dg_dead == 1 && dg_e == 141) { kprintln("kstack: resched gate DPL0 OK", 28); }
+    else { kprintln("kstack: FAIL resched gate DPL0 (ring 3 raised 0xE0 without a #GP)", 65); }
+    return 0;
+}
+
+# PHASE 9 — A SPURIOUS HARDWARE 0xE0: kmain (IF=1) sends itself vector 0xE0 through the LAPIC. The intent cell is 0,
+# so resched_handler must EOI and return; the timer keeps ticking. Mutation M-C9 (the handler ignores the cell):
+# it switches away with 0xE0 still in service, which masks the timer on this CPU for good.
+fn kst_phase_spurious() {
+    var sq_t0 = timer_ticks;
+    apic_send_ipi_one(tss_get_current_cpu_id(), 0xE0);
+    kst_spin_us(50000);
+    var sq_dt = timer_ticks - sq_t0;
+    kprint("kstack: spurious 0xE0 ticks=", 28); kprint_num(sq_dt); kprintln("", 0);
+    if (sq_dt >= 4) { kprintln("kstack: spurious 0xE0 OK", 24); }
+    else { kprintln("kstack: FAIL spurious 0xE0 (the timer stopped)", 46); }
+    return 0;
+}
+
+# PHASE 9b (1.57.7 S3.8) — A SPURIOUS 0xE1: kmain (IF=1) sends itself the kick vector. resched_kick_handler EOIs and
+# returns; the timer keeps ticking. Mutation M-G3 (the handler without apic_eoi): 0xE1 stays in service, masking the
+# timer on this CPU (lower priority class) — timer_ticks stops.
+fn kst_phase_spurious_kick() {
+    var sk_t0 = timer_ticks;
+    apic_send_ipi_one(tss_get_current_cpu_id(), 225);
+    kst_spin_us(50000);
+    var sk_dt = timer_ticks - sk_t0;
+    kprint("kstack: spurious 0xE1 ticks=", 28); kprint_num(sk_dt); kprintln("", 0);
+    if (sk_dt >= 4) { kprintln("kstack: spurious 0xE1 OK", 24); }
+    else { kprintln("kstack: FAIL spurious 0xE1", 26); }
+    return 0;
+}
+
+# PHASE 9c (1.57.7 S3.8) — THE 0xE1 GATE IS DPL0: a ring-3 `int 0xE1` must #GP (fault_kill_current: exit 141) within
+# 2 s. Mutation M-G4 (attr 0xEE, DPL3): the int enters the kick stub, which EOIs and returns, and `jmp $` spins forever.
+fn kst_phase_kickdpl0() {
+    store8(&kst_payload_g, 0xCD); store8(&kst_payload_g + 1, 0xE1);   # int 0xE1
+    store8(&kst_payload_g + 2, 0xEB); store8(&kst_payload_g + 3, 0xFE);   # jmp $
+    var kd_pg = kst_page_new();
+    if (kd_pg == 0) { kprintln("kstack: FAIL kick gate DPL0: page", 33); return 0; }
+    var kd_pid = kst_spawn(&kst_payload_g, kd_pg, 0, 0, 0, 1);
+    if (kd_pid < 0) { kprintln("kstack: FAIL kick gate DPL0: spawn", 34); return 0; }
+    store64(&kst_x_pid, kd_pid);
+    store64(&kst_x_page, kd_pg);
+    var kd_dead = kst_x_wait_dead(1, 200);
+    var kd_e = proc_get_exit_code(kd_pid);
+    kst_x_reap(1);
+    kprint("kstack: kick gate dead=", 23); kprint_num(kd_dead);
+    kprint(" exit=", 6); kprint_num(kd_e);
+    kprintln("", 0);
+    if (kd_dead == 1 && kd_e == 141) { kprintln("kstack: kick gate DPL0 OK", 25); }
+    else { kprintln("kstack: FAIL kick gate DPL0", 27); }
+    return 0;
+}
+
+# PHASE 10 — clac AT EVERY STUB. (a) the timer ISR sampled frames that interrupted a syscall's CPL0 window (AC set
+# by the entry stub's stac — the mode-1 and mode-5 windows): the body ran with AC CLEAR every time. (b) THE GENERIC
+# IDT BYTE CHECK: every vector whose gate handler is not idt_init's bare-iretq isr_stub must begin with 0F 01 CA.
+# Mutation M-C7 (timer clac removed) -> (a) and (b); M-C7b (the exception-stub builder's clac dropped) -> (b).
+fn kst_phase_isrclac() {
+    var ic_n = 0;
+    var ic_bad = 0;
+    var ic_v = 0;
+    while (ic_v < 256) {
+        var ic_e = &idt + ic_v * 16;
+        var ic_h = (load16(ic_e) & 0xFFFF) | ((load16(ic_e + 6) & 0xFFFF) << 16) | ((load32(ic_e + 8) & 0xFFFFFFFF) << 32);
+        if (ic_h != &isr_stub) {
+            ic_n = ic_n + 1;
+            var ic_ok = 1;
+            if ((load8(ic_h) & 0xFF) != 0x0F) { ic_ok = 0; }
+            if ((load8(ic_h + 1) & 0xFF) != 0x01) { ic_ok = 0; }
+            if ((load8(ic_h + 2) & 0xFF) != 0xCA) { ic_ok = 0; }
+            if (ic_ok == 0) {
+                ic_bad = ic_bad + 1;
+                kprint("kstack: isr clac MISSING at vector ", 35); kprint_num(ic_v); kprintln("", 0);
+            }
+        }
+        ic_v = ic_v + 1;
+    }
+    # 1.57.7 (S3.8): the 0xE1 kick stub is FIXED at 43 bytes (sched.cyr resched_kick_isr_build, no runtime size check):
+    # its first three bytes are covered by the generic check above; its iretq must be exactly bytes 41-42.
+    var ic_kick = 0;
+    if ((load8(&resched_kick_isr + 41) & 0xFF) == 0x48) { if ((load8(&resched_kick_isr + 42) & 0xFF) == 0xCF) { ic_kick = 1; } }
+    if (ic_kick == 0) { ic_bad = ic_bad + 1; kprintln("kstack: isr clac: the 0xE1 stub's iretq is not at bytes 41-42", 61); }
+    kprint("kstack: isr clac ac_samples=", 28); kprint_num(kst_ac_samples);
+    kprint(" ac_bad=", 8); kprint_num(kst_ac_bad);
+    kprint(" gates n=", 9); kprint_num(ic_n);
+    kprint(" no_clac=", 9); kprint_num(ic_bad);
+    kprint(" kick_iretq=", 12); kprint_num(ic_kick);
+    kprintln("", 0);
+    if (kst_ac_samples >= 1 && kst_ac_bad == 0 && ic_bad == 0 && ic_n >= 16) { kprintln("kstack: isr clac OK", 19); }
+    else { kprintln("kstack: FAIL isr clac", 21); }
+    return 0;
+}
+
+# PHASE 11 (-smp > 1) — preempt_disable's RMW IS IRQ-SAVED. Two unpinned kthreads take and drop mmap_lock in a tight
+# loop for 2 s, migrating at every tick; then they stop and kmain samples every CPU's pcpu_preempt slot for 200 ms:
+# each must read 0 at least once. Mutation M-A5 (no IRQ save): a tick between the slot read and the store migrates
+# the caller mid-RMW, the +1 lands in the old CPU's slot, and that slot stays >= 1 forever (probabilistic, rate).
+fn kst_rmw_thread_a() {
+    while (1) {
+        if (kst_rmw_run == 1) {
+            mmap_spin_lock();
+            mmap_spin_unlock();
+            store64(&kst_rmw_iter, load64(&kst_rmw_iter) + 1);
+        } else {
+            arch_wait();
+        }
+    }
+    return 0;
+}
+fn kst_rmw_thread_b() {
+    while (1) {
+        if (kst_rmw_run == 1) {
+            mmap_spin_lock();
+            mmap_spin_unlock();
+            store64(&kst_rmw_iter + 8, load64(&kst_rmw_iter + 8) + 1);
+        } else {
+            arch_wait();
+        }
+    }
+    return 0;
+}
+fn kst_phase_rmw() {
+    if (cpu_count < 2) { kprintln("kstack: preempt rmw n/a (1 cpu)", 31); return 0; }
+    var rm_free0 = KTHREAD_MAX - kthread_next;
+    kst_rmw_run = 1;
+    store64(&kst_rmw_pid, kthread_create(&kst_rmw_thread_a));
+    store64(&kst_rmw_pid + 8, kthread_create(&kst_rmw_thread_b));
+    if (load64(&kst_rmw_pid) < 0 || load64(&kst_rmw_pid + 8) < 0) {
+        kst_rmw_run = 0;
+        kprint("kstack: FAIL preempt rmw: no kthread slot (free=", 48); kprint_num(rm_free0); kprintln(")", 1);
+        return 0;
+    }
+    kst_wait_ticks(200);
+    kst_rmw_run = 0;
+    kst_wait_ticks(2);
+    var rm_seen = 0;
+    var rm_ncpu = cpu_count;
+    if (rm_ncpu > 4) { rm_ncpu = 4; }
+    var rm_t0 = kst_now_us();
+    while (kst_now_us() - rm_t0 < 200000) {
+        var rm_c = 0;
+        while (rm_c < rm_ncpu) {
+            if (load64(&pcpu_preempt + rm_c * 8) == 0) { rm_seen = rm_seen | (1 << rm_c); }
+            rm_c = rm_c + 1;
+        }
+        asm { 0xF3; 0x90; }                            # pause (no GPR touched)
+    }
+    proc_set_state(load64(&kst_rmw_pid), 0);            # retired (a kthread's stack is the pool's: never reaped)
+    proc_set_state(load64(&kst_rmw_pid + 8), 0);
+    kprint("kstack: preempt rmw iters=", 26); kprint_num(load64(&kst_rmw_iter) + load64(&kst_rmw_iter + 8));
+    kprint(" seen0_mask=", 12); kprint_num(rm_seen);
+    kprint(" cpus=", 6); kprint_num(rm_ncpu);
+    kprint(" kthread_free_before=", 21); kprint_num(rm_free0);
+    kprintln("", 0);
+    if (rm_seen == (1 << rm_ncpu) - 1) { kprintln("kstack: preempt rmw OK", 22); }
+    else { kprintln("kstack: FAIL preempt rmw (a CPU's preempt count stuck above 0)", 62); }
     return 0;
 }
 
@@ -6934,6 +7683,15 @@ fn kstack_selftest_verify() {
     kst_phase_lockholder();
     kst_phase_storm();
     kst_phase_fallback();
+    kst_phase_blockwake();                              # 1.57.7 (S3.4): the wait/wake + voluntary-switch phases
+    kst_phase_pingpong();
+    kst_phase_pause();
+    kst_phase_dpl0();
+    kst_phase_spurious();
+    kst_phase_spurious_kick();                          # 1.57.7 (S3.8): the 0xE1 kick vector — EOI-only, DPL0
+    kst_phase_kickdpl0();
+    kst_phase_isrclac();                                # after frame (mode 1) and pause (mode 5): the AC samples
+    kst_phase_rmw();
     kprint("kstack: isr samples=", 20); kprint_num(kst_isr_samples);
     kprint(" bad=", 5); kprint_num(kst_isr_bad); kprintln("", 0);
     if (kst_isr_samples > 0 && kst_isr_bad == 0) { kprintln("kstack: isr cannot block OK", 27); } else { kprintln("kstack: FAIL isr body preemptible", 33); }
@@ -7083,6 +7841,9 @@ idle_owner_set(sched_idle_pid_get(), 0);
 # AP enters kputc and its corrupted console scroll overruns the framebuffer (#PF->#DF). Same class as
 # the BSP-idle + foreground-proc steals; idle_owner is the per-proc CPU-pin. MUST be after
 # proc_on_cpu_init() (which zeroes idle_owner). Inert single-core (sched_idx_pickable io==0==pcpu_cpu()).
+# ⭐ 1.57.7 (S3b): kmain no longer parks a continuation in exec_ctx for its launches — it BLOCKS in kernel_run_child
+# (state 6) and is woken by the child's death. It stays BSP-pinned because its stack IS the BSP boot stack in region
+# 1 (live under gnoboot's CR3 from the shim's first instruction): it must never be resumed on another CPU (D22).
 idle_owner_set(0, 0);
 # ⭐ 1.57.6 (Path 2, S3.1) — INV-RUN FOR kmain: the proc current on a CPU is state 2 with on_cpu == that CPU.
 # proc_on_cpu_init() above reset kmain's on_cpu to -1 right after proc_set_state(0, 2) made it running, so
@@ -7152,7 +7913,8 @@ if (smp_wake_enabled != 0) {
 # wakes — and the served face is the verified direct-map copy. This reader exists to PROVE the stacks
 # are not on the literals any more; it is not a second consumer of the face and must not become one.
 # ⚠ smp_stack_selftest is also the reason the image gate (scripts/check/image-layout-check.sh) can
-# stay about the IMAGE alone: it gates LOAD end <= 0x370000 (the BSP boot stack's budget) and knows
+# stay about the IMAGE alone: it gates LOAD end <= 0x390000 (the BSP boot stack's budget; 0x370000
+# until 1.57.7 moved that stack's top 0x380000 -> 0x3A0000) and knows
 # nothing about where an AP stack IS. Static greps of the trampoline's hex are brittle; this is not.
 # Mutation-proven at 1.57.3 (ap-stack-smoke.sh header): (a) the trampoline back on `add eax, 0x310000`
 # without the direct-map add + tss_get_cpu_stack back on 0x300000 + cpu*0x10000 + 0x10000 trips
@@ -7202,6 +7964,60 @@ fn smp_stack_selftest() {
 smp_stack_selftest();
 #endif
 
+#ifdef TSC_SELFTEST
+# ⭐ 1.57.7 (S1b, T9) — EVERY CPU's TICK, which S8's CPU cap charges (cpu_user_ticks/cpu_kern_ticks). The
+# APs inherit the BSP's measured reload (apic_timer_init(32, lapic_timer_count), smp.cyr); this proves the
+# lowest online AP takes 100 ticks per second of ACPI PM time (within 3%). BSP, IF=1, APs woken,
+# sched_active == 0. -smp 1: SKIP (no AP online).
+fn ap_tick_rate_selftest() {
+    var at_port = acpi_pm_tmr_port;
+    if (at_port == 0) {
+        kprintln("ap-tickrate: SKIP -- no acpi pm timer", 37);
+        return 0;
+    }
+    var at_n = 0;
+    var at_i = 3;
+    while (at_i >= 1) {
+        if ((ap_online_mask & (1 << at_i)) != 0) { at_n = at_i; }
+        at_i = at_i - 1;
+    }
+    if (at_n == 0) {
+        kprintln("ap-tickrate: SKIP -- no AP online", 33);
+        return 0;
+    }
+    var at_t = timer_ticks;
+    while (timer_ticks == at_t) { arch_wait(); }
+    var at_k0 = load64(&cpu_user_ticks + at_n * 8) + load64(&cpu_kern_ticks + at_n * 8);
+    var at_pp = tsc_pm_read(at_port);
+    var at_acc = 0;
+    var at_j = 0;
+    while (at_j < 100) {
+        var at_w = timer_ticks;
+        while (timer_ticks == at_w) { arch_wait(); }
+        var at_p = tsc_pm_read(at_port);
+        at_acc = at_acc + ((at_p - at_pp) & 0xFFFFFF);
+        at_pp = at_p;
+        at_j = at_j + 1;
+    }
+    var at_k1 = load64(&cpu_user_ticks + at_n * 8) + load64(&cpu_kern_ticks + at_n * 8);
+    var at_ms = at_acc * 1000 / 3579545;
+    var at_ak = at_k1 - at_k0;
+    kprint("ap-tickrate: cpu ", 17); kprint_num(at_n);
+    kprint(" took ", 6); kprint_num(at_ak);
+    kprint(" ticks over ", 12); kprint_num(at_ms);
+    kprintln(" ms of acpi pm time", 19);
+    var at_e = at_ak * 10 - at_ms;
+    if (at_e < 0) { at_e = 0 - at_e; }
+    if ((at_e * 100) <= (at_ms * 3)) {
+        kprintln("ap-tickrate: PASS the AP tick is 10 ms within 3% (it inherits the measured reload)", 82);
+    } else {
+        kprintln("ap-tickrate: FAIL the AP tick is not 10 ms within 3%", 52);
+    }
+    return 0;
+}
+ap_tick_rate_selftest();
+#endif
+
 # ⛔ 1.57.6 — THE ONE CALIBRATION RETRY, HERE, AND WHY THERE IS NO THIRD. tsc_calibrate ran right
 # after the `sti`; if every tier refused then (a PM-less box whose tick windows a transient host load
 # spoiled), this is the last point before any PRODUCTION ring 3 exists: kybernet is launched after
@@ -7222,6 +8038,19 @@ if (tsc_per_us == 0) {
 # BOOTCR3_KEEP_GNOBOOT_CR3 build. sched_live_cr3_ok (sched.cyr) compares against it before a CPL0 switch.
 sched_home_cr3 = dm_read_cr3() & 0x000FFFFFFFFFF000;
 sched_active = 1;
+
+#ifdef EXEC_SELFTEST
+# ⭐ 1.57.7 (S3b) — the two execwait#37 callers run HERE, after `sched_active = 1`: #37 is a blocking wait and returns
+# -1 before the scheduler runs. exec_disk_selftest (pre-scheduler) wrote /bin/exwv and /bin/envprop. Each is a
+# kmain `run` whose child calls #37: the caller blocks in the kernel (state 6) while its own child runs as an
+# ordinary scheduled process, then `exec: rsp0 restored` checks the caller's TSS.RSP0 + syscall top came back
+# through the switch tail (never at pid 0 now: pid 0 is kmain). exec-smoke counts `run: exit 90` >= 2 (argv, exwv),
+# reads envprop's own result (81) and counts `exec: rsp0 restored` >= 2, and denies STALE and VACUOUS.
+kprintln("exec: running /bin/exwv", 23);
+sh_exec("run /bin/exwv", 13);
+kprintln("exec: running /bin/envprop", 26);
+sh_exec("run /bin/envprop", 16);
+#endif
 
 #ifdef FORK_SELFTEST
 # ⛔ DELIBERATELY HERE, AFTER `sched_active = 1`, AND NOT WITH THE OTHER SELFTESTS. A forked child is
@@ -7657,16 +8486,10 @@ sh_exec("run /bin/modeset --native", 25);
 # on iron by eye; no kernel instrument can see a torn or duplicated console row.
 kprintln("modeset: running /bin/modeset --pan", 35);
 sh_exec("run /bin/modeset --pan", 22);
-# ⛔ 1.57.6 — RESTORE IF. Every `run` above returned to kmain with IF=0 (the exit syscall is entered with
-# IF masked; see the note after tsc_selftest's `run /bin/tscp`), and these are the boot body's only runs
-# after `sched_active = 1`. They handed boot_finish IF=0: harmless for the agnsh launch
-# (kybernet_exec_agnsh masks anyway, and enter_ring3's iretq sets IF=1), but this smoke seeds no
-# /bin/agnsh, so kybernet's emergency-shell fallback ran its arch_wait() hlt with interrupts off, and a
-# hlt with IF=0 wakes only on NMI/SMI/INIT: its key-poll loop never ran again (read from the code, not
-# typed at). docs/architecture/kernel-clocks.md, Invariant 3.
-# Register contract: `sti` reads and writes no GPR; it sets RFLAGS.IF only — the state the boot body
-# was in before the first run above.
-asm { sti; }
+# (1.57.7 S3b: the trailing `sti` that stood here is GONE. Every `run` above used to return to kmain with IF=0 — the
+# exit syscall is entered with IF masked and kernel_resume longjmp'd straight back — so this block had to restore IF
+# before boot_finish. After `sched_active = 1` a `run` is a scheduled child kmain BLOCKS for, and kernel_run_child
+# returns with the caller's own IF. docs/architecture/kernel-clocks.md, Invariant 3.)
 #endif
 
 # === Boot self-tests + kybernet launch split out (1.36.2 refactor) ===

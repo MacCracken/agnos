@@ -1,0 +1,17 @@
+[package]
+name = "waitx"
+version = "0.1.0"
+description = "agnos 1.57.7 in-kernel blocking waits (Path 2, S3c) ring-3 exerciser — sleep_ms#41 blocks only its caller, waitpid#4 WAIT_BLOCK, flock#59 waits without LOCK_NB (-2 = table full, blocking conversions drop the old lock), sched_yield#44 donates, and the interim execwait#37 child contract. Seeded as /bin/agnsh AND /bin/waitx by scripts/smoke/wait-ring3-smoke.sh."
+license = "GPL-3.0-only"
+language = "cyrius"
+# The VALUE must EQUAL the root manifest's pin (scripts/check/toolchain-pin-check.sh enforces it).
+cyrius = "6.6.6"
+
+[build]
+entry = "waitx.cyr"
+output = "build/waitx"
+
+# AGNOS ONLY — build with `cyrius build --agnos waitx.cyr build/waitx`.
+[deps]
+# ⚠ The FULL closure, transitives included (D19): alloc -> atomic, fnptr; string and args -> alloc.
+stdlib = ["syscalls", "string", "alloc", "args", "atomic", "fnptr"]

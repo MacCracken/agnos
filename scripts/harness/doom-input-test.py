@@ -27,10 +27,35 @@ IMG  = os.path.join(WORK, "agnos-doom.img")
 # ⚠ REFUSES, does not rebuild: the image is produced by another smoke, so the honest action is
 # to name the command rather than silently regenerate someone else's artifact.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _freshness import refuse_stale
-refuse_stale(IMG, [os.path.join(ROOT, 'build', 'agnos')],
-             'kernel (build/agnos is newer than this baked image)',
-             'rm -rf ' + WORK + '   # then re-run the smoke that builds this image')
+from _freshness import refuse_stale, kernel_sources
+# ⛔ 1.57.7 (HAR) — COMPARE AGAINST THE KERNEL BAKED INTO THE IMAGE, NOT build/agnos. doom-smoke.sh restores a PLAIN
+# build/agnos on exit (IMG-fix), so build/agnos is ALWAYS newer than the image it just baked and the old
+# `refuse_stale(IMG, [build/agnos])` refused every run ("OLDER than its kernel") — the two could no longer run in
+# sequence. doom-smoke now writes the baked kernel's build.sh provenance beside the image (<img>.kernel.flags:
+# flags= / md5=, mtime = bake time). Here: (1) the kernel INSIDE the image (mcopy'd out of the ESP) must be the one
+# that record describes, (2) it must be a DOOM_SELFTEST build, (3) no kernel source may be newer than the bake.
+REC = IMG + ".kernel.flags"
+REBAKE = 'rm -rf ' + WORK + '   # then re-run scripts/smoke/doom-smoke.sh'
+if os.path.exists(IMG):
+    if not os.path.exists(REC):
+        print("REFUSED: %s has no baked-kernel record (%s) — %s" % (IMG, REC, REBAKE)); sys.exit(2)
+    rec = dict(l.split("=", 1) for l in open(REC).read().splitlines() if "=" in l)
+    import hashlib, tempfile
+    with tempfile.TemporaryDirectory() as td:
+        kp = os.path.join(td, "agnos")
+        r = subprocess.run(["mcopy", "-n", "-i", IMG + "@@1048576", "::boot/agnos", kp],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        baked_md5 = hashlib.md5(open(kp, "rb").read()).hexdigest() if r.returncode == 0 and os.path.exists(kp) else ""
+    if not baked_md5 or baked_md5 != rec.get("md5", ""):
+        print("REFUSED: the kernel in %s (md5 %s) is not the one its record names (%s) — %s"
+              % (IMG, baked_md5 or "<unreadable>", rec.get("md5", "none"), REBAKE)); sys.exit(2)
+    if "DOOM_SELFTEST" not in rec.get("flags", "").split():
+        print("REFUSED: the kernel in %s was built with [%s], not DOOM_SELFTEST — %s"
+              % (IMG, rec.get("flags", ""), REBAKE)); sys.exit(2)
+    print("  baked kernel: md5 %s flags [%s]" % (baked_md5, rec.get("flags", "")))
+refuse_stale(REC, kernel_sources(ROOT) + [os.path.join(ROOT, 'cyrius.cyml')],
+             'kernel (a kernel source is newer than the kernel baked into this image)',
+             REBAKE)
 SER  = os.path.join(WORK, "serial-input.log")
 MON  = "/tmp/agnos-doom-input.sock"
 PPM_A = os.path.join(WORK, "doom-input-a.ppm")  # title

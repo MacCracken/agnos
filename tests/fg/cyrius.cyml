@@ -1,0 +1,17 @@
+[package]
+name = "fg"
+version = "0.1.0"
+description = "agnos 1.57.7 foreground exec on Path 2 (S3b) ring-3 exerciser — execwait#37 is a blocking wait (the child is an ordinary scheduled IF=1 process: ticks, siblings, yield, nesting, faults, redirects, env, FP state, migration) and kmain's `run` is a scheduled child (tickself, fault, orphan writer, spawn storms, free RAM). fgx is seeded as /bin/agnsh and fgc as /bin/fgc by scripts/smoke/fg-smoke.sh."
+license = "GPL-3.0-only"
+language = "cyrius"
+# The VALUE must EQUAL the root manifest's pin (scripts/check/toolchain-pin-check.sh enforces it).
+cyrius = "6.6.6"
+
+[build]
+entry = "fgx.cyr"
+output = "build/fgx"
+
+# AGNOS ONLY — build with `cyrius build --agnos fgx.cyr build/fgx` and `cyrius build --agnos fgc.cyr build/fgc`.
+[deps]
+# ⚠ The FULL closure, transitives included (D19): alloc -> atomic, fnptr; string and args -> alloc.
+stdlib = ["syscalls", "string", "alloc", "args", "atomic", "fnptr"]

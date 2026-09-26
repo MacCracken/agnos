@@ -174,8 +174,11 @@ check "init-stack pointer array holds argc+envc" $rc
 [ "$rc" = "0" ] || cat /tmp/check-initstack.log
 # The Cyrius var X[N] units trap: function-local is N BYTES, module-scope is N x u64. Cost the
 # rung-10 burn its exit code (a 40-byte stack smash that left every printed number correct).
-sh "$ROOT/scripts/check/check-array-sizing.sh" >/dev/null 2>&1 && rc=0 || rc=$?
+# 1.57.7: logged and printed on failure — until then this discarded the output, so a red run showed no site
+# lines (the gate's own header documented the discard as its only channel being the exit code).
+sh "$ROOT/scripts/check/check-array-sizing.sh" > /tmp/check-array-sizing.log 2>&1 && rc=0 || rc=$?
 check "no function-local array overruns" $rc
+[ "$rc" = "0" ] || cat /tmp/check-array-sizing.log
 
 # ⛔ THE RELEASE GATE THAT NEVER BOOTED A KERNEL. release.yml gates every release on a job it calls
 # "CI Gate (must pass before release)", but under workflow_call the called workflow sees the CALLER's
@@ -512,15 +515,21 @@ check "binary size ($SZ bytes; $SZK weighed = size minus the $FACE-byte embedded
 # and that no gate had ever measured; the arc's own fit check bounded the wrong address (0x400000).
 # 1.57.2 tolerated the overlap through this gate (dead rekha chunk bytes, single reader chain);
 # 1.57.3 RELOCATED the AP stacks into region 7 (direct-map VAs, gdt.cyr tss_get_cpu_stack's map),
-# so the tolerated-overlap branch is gone and the gate is one number: LOAD end <= 0x370000, the BSP
-# boot stack's 64 KB budget below its top 0x380000 — the image's only remaining region-1 neighbour.
+# so the tolerated-overlap branch is gone and the gate is one number: LOAD end <= 0x390000, the BSP
+# boot stack's 64 KB budget below its top 0x3A0000 — the image's only remaining region-1 neighbour.
+# ⭐ 1.57.7 (IMG): the stack moved UP 0x380000 -> 0x3A0000 (still region 1; [0x3A0000, 0x3B0000) is an
+# unused guard gap below the BSP TSS.RSP0 window) and the bound with it, 0x370000 -> 0x390000 — the
+# plan's image estimates had 4 B of margin and three flag builds the sweep boots were already past
+# 0x370000. The gate now also decodes boot_shim.cyr's three boot-stack immediates (source) and the
+# image's `mov rsp` against its BSP_BOOT_TOP, and scripts/build.sh runs it after every FLAG build (this
+# row covers the plain one).
 # ⚠ WHERE the AP stacks ARE is a runtime fact: scripts/smoke/ap-stack-smoke.sh (SMP_STACK_SELFTEST,
 # -smp 4; a sweep.sh gate) samples each AP's RSP against the region-7 window and re-hashes the chunk
 # literals in place after the wake. docs/development/issues/archived/2026-09-13-ap-stacks-inside-kernel-rodata.md.
 # Same vacuity guard as the size gate: a fossil binary describes a different tree. Mutation-tested
-# (p_memsz past 0x370000 -> FAIL; see the script header).
+# (p_memsz past the bound -> FAIL; a shim immediate off BSP_BOOT_TOP -> FAIL; see the script header).
 [ -z "$SZWHY" ] && sh "$ROOT/scripts/check/image-layout-check.sh" "$ROOT/build/agnos" > /tmp/image-layout-check.log 2>&1 && rc=0 || rc=$?
-check "kernel image vs BSP boot stack (LOAD end <= 0x370000)" $rc
+check "kernel image vs BSP boot stack (LOAD end <= 0x390000)" $rc
 [ -z "$SZWHY" ] || echo "    VACUOUS: $SZWHY"
 [ "$rc" = "0" ] || cat /tmp/image-layout-check.log
 

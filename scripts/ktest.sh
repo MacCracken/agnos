@@ -3,7 +3,13 @@
 # Boots agnos in QEMU (gnoboot + OVMF) with core/boot_finish.cyr rewritten to
 # run sh_cmd_test() — the in-kernel `test` shell verb (user/test.cyr) — in place
 # of the kybernet launch, then parses the serial PASS/FAIL/TOTAL output.
-# Exit code: 0 = all passed, 1 = failures / harness error.
+# Exit code: 0 = all passed, 1 = failures / harness error / the kernel died, 2 = VOID (the firmware never
+# handed off to the kernel in QEMU_TRIES attempts — the suite never executed; re-run, it is not a kernel verdict).
+# ⭐ 1.57.7 (HAR): the boot goes through qemu_dwell_kernel (scripts/smoke/lib/qemu-dwell.sh) — a banner-gated
+# retry that classifies each attempt booted / died / VOID. Until 1.57.7 a firmware hand-off that never happened
+# (`gnoboot: fail @ EBS`, no "AGNOS kernel v" line) printed "ERROR: test output not found (kernel may have
+# crashed …)" and exited 1 — indistinguishable from a kernel that died; S3c's M-E3/M-E5 runs hit exactly that.
+# The serial log is kept at build/ktest-logs/ktest.log (and each VOID attempt as ktest.log.attemptN).
 #
 # History (why this is a rewrite, not the original): pre-1.36.2 this script
 # sed-patched core/main.cyr + user/test_procs.cyr and booted the ELF32 kernel
@@ -116,7 +122,7 @@ cp "$ROOT/build/agnos" "$ROOT/build/agnos_ktest"
 restore_sources
 trap - EXIT INT TERM
 
-echo "Booting test kernel via gnoboot + OVMF (${QEMU_TIMEOUT:-40}s timeout)..."
+echo "Booting test kernel via gnoboot + OVMF (${QEMU_TIMEOUT:-90}s dwell per attempt, banner-gated retry)..."
 # gnoboot is the only ELF64 entry path (QEMU rejects the ELF64 kernel on its
 # Linux `-kernel` protocol — no PVH note). Build a minimal GPT/ESP image with
 # gnoboot + /boot/agnos; the kernel reaches core/boot_finish.cyr, runs
@@ -162,15 +168,29 @@ cp "$OVMF_VARS_SRC" "$KWORK/vars.fd"; chmod +w "$KWORK/vars.fd"
 # Prefer KVM when available; fall back to -cpu max (TCG). KTEST_KVM=0 forces TCG.
 KTEST_ACCEL="-cpu max"
 if [ -r /dev/kvm ] && [ "${KTEST_KVM:-1}" = "1" ]; then KTEST_ACCEL="-enable-kvm -cpu host"; fi
-OUTPUT=$(timeout "${QEMU_TIMEOUT:-40}" qemu-system-x86_64 \
+KLOGS="$ROOT/build/ktest-logs"
+rm -rf "$KLOGS"; mkdir -p "$KLOGS"
+KLOG="$KLOGS/ktest.log"
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # qemu_dwell_kernel, qemu_assert_booted
+# End a failed firmware hand-off early (it is terminal, not slow); the retry itself stays banner-gated.
+QEMU_DWELL_VOID="${QEMU_DWELL_VOID:-gnoboot: fail @ EBS|BootManagerMenuApp|Please select boot device}"
+export QEMU_DWELL_VOID
+# Marker `TOTAL:` — the suite's last reporter line (qemu_dwell lets the line finish before the kill).
+qemu_dwell_kernel "$KLOG" "TOTAL:" "${QEMU_TIMEOUT:-90}" "$KWORK/vars.fd" "$OVMF_VARS_SRC" \
+    qemu-system-x86_64 \
     -machine q35 -m 512M $KTEST_ACCEL \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$KWORK/vars.fd" \
     -drive "file=$IMG,format=raw,if=none,id=disk0" \
     -device "nvme,drive=disk0,serial=AGNOS-KTEST" \
-    -serial stdio -display none -no-reboot 2>/dev/null | tr -d '\0' || true)
+    -serial stdio -display none -no-reboot
 rm -rf "$KWORK"
 rm -f "$ROOT/build/agnos_ktest"
+if ! qemu_assert_booted "$KLOG"; then
+    echo "RESULT: VOID — the test kernel never executed (log: $KLOG)"
+    exit 2
+fi
+OUTPUT=$(tr -d '\0' < "$KLOG")
 
 # Parse results
 echo ""
@@ -179,7 +199,9 @@ echo ""
 
 TOTAL_LINE=$(echo "$OUTPUT" | grep "TOTAL:" | head -1)
 if [ -z "$TOTAL_LINE" ]; then
-    echo "ERROR: test output not found (kernel may have crashed or not reached boot_finish)"
+    # The banner IS in the log (qemu_assert_booted above), so this is the kernel's own failure: it booted and
+    # never reached the suite's reporter. Never a VOID.
+    echo "ERROR: test output not found — the kernel booted but crashed or never reached boot_finish (log: $KLOG)"
     exit 1
 fi
 

@@ -1,0 +1,1752 @@
+# waitx — the RING-3 half of agnos 1.57.7's in-kernel blocking waits (Path 2, step S3c).
+#
+# Issues: docs/development/issues/2026-09-23-sleep-ms-holds-the-cpu.md,
+#         docs/development/issues/2026-09-23-flock-never-waits-and-no-caller-spins.md.
+#
+# ⛔ WHY RING 3, AND WHY AS /bin/agnsh ON A PLAIN KERNEL (D19). Every property here is about OTHER processes
+# running while one waits: spinners that must get the CPU while the driver sleeps, a child that must run during
+# a sleep, a flock holder that must be able to release while a waiter blocks. kybernet launches /bin/agnsh IF=1
+# time-sliced, so this program's #43 children are ordinary scheduled procs — the context daimon and agnsh run
+# in. scripts/smoke/wait-ring3-smoke.sh seeds this binary as /bin/agnsh (the driver) AND /bin/waitx (every
+# child role), plus the /wx/* files.
+#
+# ⚠ kybernet passes no argv, so the driver reads its phase list from /wx/mode ("all", or phase names / P-ids
+# separated by spaces). Every phase prints `WAITX-PHASE <name>`, then `WAITX-OK <name> <values>` or
+# `WAITX-FAIL <name> <values>`. The driver ends `WAITX-DONE pass=P fail=F`, `WAITX-EXIT 0` and exits 0 (a
+# non-zero exit drops kybernet into the emergency shell, which would bury the verdict). If uptime_us#95 is -1
+# (TSC refused) it says `WAITX-FAIL clock` and runs nothing (#40 is never used for timing).
+# ⚠ BOUNDED EVERYWHERE (kill#16 ends nothing until the lifecycle step): every sleep/spin role ends at an absolute
+# #95 deadline or on EOF of a stop pipe; every flock phase releases (UN + close) every lock the driver holds on
+# every path before it reaps; the reap helper wx_reap is a #4 poll + #44 yield with an 8 s deadline (a child still
+# alive then is its own WAITX-FAIL and the phase moves on — a hung child never hangs the driver). WAIT_BLOCK is
+# used only where it is itself the thing under test (P4, P4f, P7 via wx_reap_block, P9): there a lost wake shows as
+# a hang (dwell timeout), which is the RED shape those phases are specified with.
+#
+# Raw `syscall(N, a1, a2, a3, a4)` throughout: WAIT_BLOCK (#4 0x100|pid, 0x1FF), flock's -2 and #95 are 1.57.7 /
+# 1.57.6 surface the cyrius peer does not wrap yet.
+
+var WX_PASS = 0;
+var WX_FAIL = 0;
+var WX_NCPU = 1;
+
+# Module-scope `var X[N]` is N u64 = 8N BYTES.
+var wx_mode[32];        # 256 B: /wx/mode
+var wx_pl[128];         # 1024 B: proclist#99 (16 x 64-byte records)
+var wx_si[16];          # 128 B: sysinfo#35
+var wx_line[64];        # 512 B: #43 / #37 command lines
+var wx_klog[1024];      # 8192 B: klug#36 tail
+var wx_pids[16];        # children of the current phase
+var wx_fds[8];          # 64 B: pipe fds / scratch
+var wx_fl[32];          # 256 B: P5c's 17 lock fds
+
+fn wx_out(s) { syscall(1, 1, s, strlen(s), 0); return 0; }
+fn wx_num(n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { wx_out("-"); n = 0 - n; }
+    if (n == 0) { wx_out("0"); return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; syscall(1, 1, &b + i, 1, 0); }
+    return 0;
+}
+fn wx_kv(k, v) { wx_out(" "); wx_out(k); wx_out("="); wx_num(v); return 0; }
+fn wx_phase(name) { wx_out("WAITX-PHASE "); wx_out(name); wx_out("\n"); return 0; }
+fn wx_verdict(ok, name) {
+    if (ok == 1) { wx_out("WAITX-OK "); WX_PASS = WX_PASS + 1; }
+    else { wx_out("WAITX-FAIL "); WX_FAIL = WX_FAIL + 1; }
+    wx_out(name);
+    return 0;
+}
+fn wx_end() { wx_out("\n"); return 0; }
+
+fn wx_eq(a, b) {
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
+    var i = 0;
+    while (1) {
+        var ca = load8(a + i);
+        if (ca != load8(b + i)) { return 0; }
+        if (ca == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn wx_atoi(s) {
+    var v = 0;
+    var i = 0;
+    var neg = 0;
+    if (s == 0) { return 0 - 1; }
+    if (load8(s) == 45) { neg = 1; i = 1; }
+    while (load8(s + i) >= 48) {
+        if (load8(s + i) > 57) { break; }
+        v = v * 10 + (load8(s + i) - 48);
+        i = i + 1;
+    }
+    if (neg == 1) { return 0 - v; }
+    return v;
+}
+# Copy s (no NUL) to dst + off; return the new offset.
+fn wx_cat(dst, off, s) {
+    var l = strlen(s);
+    var i = 0;
+    while (i < l) { store8(dst + off + i, load8(s + i)); i = i + 1; }
+    return off + l;
+}
+fn wx_catnum(dst, off, n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { store8(dst + off, 45); off = off + 1; n = 0 - n; }
+    if (n == 0) { store8(dst + off, 48); return off + 1; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; store8(dst + off, load8(&b + i)); off = off + 1; }
+    return off;
+}
+
+fn wx_us() { return syscall(95, 0, 0, 0, 0); }                   # uptime_us#95
+fn wx_sleep(ms) { return syscall(41, ms, 0, 0, 0); }             # sleep_ms#41
+fn wx_yield() { syscall(44, 0, 0, 0, 0); return 0; }             # sched_yield#44
+fn wx_close(fd) { return syscall(6, fd, 0, 0, 0); }
+fn wx_pipe(fds) { return syscall(25, fds, 0, 0, 0); }            # fds: [0] read end, [8] write end
+fn wx_open(p) { return syscall(7, p, strlen(p), 0, 0); }
+fn wx_flock(fd, op) { return syscall(59, fd, op, 0, 0); }        # SH 1, EX 2, NB 4, UN 8
+fn wx_spinto(t) { while (wx_us() < t) { } return 0; }
+fn wx_poll(pid) { return syscall(4, pid, 0, 0, 0); }             # the non-blocking poll (-2 = alive)
+
+# #99 field of `pid`: which 8 = state, 56 = cpu ticks (low 32 bits). -1 when pid is not listed.
+fn wx_proc(pid, which) {
+    var n = syscall(99, &wx_pl, 16, 0, 0);
+    var i = 0;
+    while (i < n) {
+        var r = &wx_pl + i * 64;
+        if (load64(r) == pid) {
+            if (which == 56) { return load64(r + 56) & 0xFFFFFFFF; }
+            return load64(r + which);
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+fn wx_ticks(pid) { return wx_proc(pid, 56); }
+fn wx_state(pid) { return wx_proc(pid, 8); }
+fn wx_sysinfo(off) {
+    if (syscall(35, &wx_si, 128, 0, 0) != 0) { return 0 - 1; }
+    return load64(&wx_si + off);
+}
+
+# Spawn "/bin/waitx <role> <a> <b> <c>" (legacy line form: the child inherits every fd). -1 args are omitted.
+fn wx_spawn(role, a, b, c) {
+    var o = wx_cat(&wx_line, 0, "/bin/waitx ");
+    o = wx_cat(&wx_line, o, role);
+    if (a != (0 - 1)) { store8(&wx_line + o, 32); o = wx_catnum(&wx_line, o + 1, a); }
+    if (b != (0 - 1)) { store8(&wx_line + o, 32); o = wx_catnum(&wx_line, o + 1, b); }
+    if (c != (0 - 1)) { store8(&wx_line + o, 32); o = wx_catnum(&wx_line, o + 1, c); }
+    store8(&wx_line + o, 0);
+    return syscall(43, &wx_line, o, 0, 0);
+}
+
+# Reap a known child, BOUNDED (D-28): a #4 poll + #44 until it is gone or 8 s pass. #44 gives the child the CPU on
+# both kernels (1.57.7's voluntary switch; 1.57.6's abandon-frame yield), and with nothing READY it parks <= 1 tick
+# on the idle, so this is no busy burn. A child still alive at the deadline is a WAITX-FAIL line of its own (the
+# phase moves on; its verdict usually fails too) and -998. -999 = no pid (the spawn failed).
+fn wx_reap(pid) {
+    if (pid < 0) { return 0 - 999; }
+    var t0 = wx_us();
+    while (wx_us() - t0 < 8000000) {
+        var r = wx_poll(pid);
+        if (r != (0 - 2)) { return r; }
+        wx_yield();
+    }
+    wx_verdict(0, "reap"); wx_kv("pid", pid); wx_out(" (still alive after 8 s: a hung child; the phase moved on)"); wx_end();
+    return 0 - 998;
+}
+# Reap through WAIT_BLOCK (#4 0x100|pid) — ONLY where the blocking reap is itself under test (P7). A kernel without
+# WAIT_BLOCK answers -1 at once (0x100|pid >= proc_count) and a caller that cannot block gets -2: both fall back to
+# the bounded poll.
+fn wx_reap_block(pid) {
+    if (pid < 0) { return 0 - 999; }
+    var r = syscall(4, 0x100 | pid, 0, 0, 0);
+    if (r != (0 - 1)) { if (r != (0 - 2)) { return r; } }
+    return wx_reap(pid);
+}
+
+# Does klug#36's tail contain `s`?
+fn wx_klog_has(s) {
+    var n = syscall(36, &wx_klog, 8191, 0, 0);
+    if (n <= 0) { return 0; }
+    var l = strlen(s);
+    var i = 0;
+    while (i + l <= n) {
+        var j = 0;
+        while (j < l) {
+            if (load8(&wx_klog + i + j) != load8(s + j)) { break; }
+            j = j + 1;
+        }
+        if (j == l) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# /wx/mode: "all" (or empty / missing) runs every phase; otherwise run a phase when its name or its P-id is one of
+# the space-separated tokens.
+fn wx_mode_load() {
+    var fd = wx_open("/wx/mode");
+    store8(&wx_mode, 0);
+    if (fd < 0) { return 0; }
+    var n = syscall(5, fd, &wx_mode, 255, 0);
+    wx_close(fd);
+    if (n < 0) { n = 0; }
+    store8(&wx_mode + n, 0);
+    var i = 0;
+    while (i < n) {                                     # newlines / tabs -> spaces
+        var c = load8(&wx_mode + i);
+        if (c == 10 || c == 13 || c == 9) { store8(&wx_mode + i, 32); }
+        i = i + 1;
+    }
+    return 0;
+}
+fn wx_mode_tok(t) {
+    var l = strlen(t);
+    var i = 0;
+    while (load8(&wx_mode + i) != 0) {
+        while (load8(&wx_mode + i) == 32) { i = i + 1; }
+        var s = i;
+        while (load8(&wx_mode + i) != 0) {
+            if (load8(&wx_mode + i) == 32) { break; }
+            i = i + 1;
+        }
+        if (i - s == l) {
+            var j = 0;
+            while (j < l) {
+                if (load8(&wx_mode + s + j) != load8(t + j)) { break; }
+                j = j + 1;
+            }
+            if (j == l) { return 1; }
+        }
+    }
+    return 0;
+}
+fn wx_want(name, pid) {
+    if (load8(&wx_mode) == 0) { return 1; }
+    if (wx_mode_tok("all") == 1) { return 1; }
+    if (wx_mode_tok(name) == 1) { return 1; }
+    if (wx_mode_tok(pid) == 1) { return 1; }
+    return 0;
+}
+
+# ═════════════════════════════════════ CHILD ROLES ═════════════════════════════════════
+
+# spin <t0> <t1>: spin until #95 >= t0, then report this process's OWN #99 tick delta over [t0, t1] as the exit
+# code (0 when it first runs after t1; capped 255).
+fn role_spin(t0, t1) {
+    wx_spinto(t0);
+    if (wx_us() >= t1) { return 0; }
+    var me = syscall(2, 0, 0, 0, 0);
+    var k0 = wx_ticks(me);
+    wx_spinto(t1);
+    var d = wx_ticks(me) - k0;
+    if (d < 0) { d = 0; }
+    if (d > 255) { d = 255; }
+    return d;
+}
+# spinp <t1> <rfd> <wfd>: close the inherited write end, spin until #95 >= t1 or the stop pipe reads EOF (the driver
+# closed its write end). Exit code = own tick delta (capped 255).
+fn role_spinp(t1, rfd, wfd) {
+    wx_close(wfd);
+    var me = syscall(2, 0, 0, 0, 0);
+    var k0 = wx_ticks(me);
+    var z[8];
+    while (wx_us() < t1) {
+        if (syscall(5, rfd, &z, 1, 0) == 0) { break; }
+    }
+    var d = wx_ticks(me) - k0;
+    if (d < 0) { d = 0; }
+    if (d > 255) { d = 255; }
+    return d;
+}
+# nap <ms> <code>: sleep_ms(ms), exit code.
+fn role_nap(ms, code) { wx_sleep(ms); return code; }
+# marker <t_start> <wfd>: spin until t_start, write one byte to the inherited pipe write end, exit 0.
+fn role_marker(ts, wfd) {
+    wx_spinto(ts);
+    var m[8];
+    store8(&m, 77);
+    syscall(1, wfd, &m, 1, 0);
+    return 0;
+}
+# late <t0> <code>: spin until #95 >= t0, then exit code. P3: the child needs the CPU AFTER the parent's sleep loop
+# has begun (a `nap` child finished at spawn time on a CPU-holding kernel, so the phase could not discriminate).
+fn role_late(t0, code) { wx_spinto(t0); return code; }
+# hop <n> <rfd> <wfd>: close the inherited write end; up to n x { ring-3 spin 0..9.9 ms (varied per round), then
+# sleep_ms(2) }, stopping at EOF on the stop pipe (the cross-CPU resume witness, P8 — the driver closes its write end
+# once it has the witness, so the reap is prompt).
+# ⭐ WHY THE VARIED SPIN (S3d B1b). With keep-current (1.57.7 S3.6) a lone runner stays on its CPU, so a sleeper is
+# woken — and resumed — by whichever CPU's tick first follows its deadline, and it then sleeps again on THAT CPU. When
+# the CPUs' LAPIC tick phases are clustered (KVM starts the three AP timers within ~1 ms of each other, and the image
+# size moves the BSP's phase relative to them), a fixed 2 ms sleep started right after a tick always expires at the
+# same CPU's next tick: the hop never migrates and P8 went RED on a build 48 bytes larger (measured, B1b). Spreading
+# the sleep's START over one whole tick period puts its deadline in every CPU's phase window in turn.
+fn role_hop(n, rfd, wfd) {
+    wx_close(wfd);
+    var z[8];
+    var i = 0;
+    while (i < n) {
+        if (syscall(5, rfd, &z, 1, 0) == 0) { break; }
+        wx_spinto(wx_us() + (i * 3700) % 9900);
+        wx_sleep(2);
+        i = i + 1;
+    }
+    return 0;
+}
+# lock <mode> <wfd>: open /wx/lock; mode 0 = blocking EX (P5b: write t_got to wfd, then UN), mode 1 = EX|NB, must
+# be -1 within 20 ms (P5a). Exit 0 on the expected outcome.
+fn role_lock(mode, wfd) {
+    var fd = wx_open("/wx/lock");
+    if (fd < 0) { return 20; }
+    if (mode == 1) {
+        var t0 = wx_us();
+        var r = wx_flock(fd, 6);
+        var dt = wx_us() - t0;
+        wx_close(fd);
+        if (r != (0 - 1)) { return 21; }
+        if (dt >= 20000) { return 22; }
+        return 0;
+    }
+    var rb = wx_flock(fd, 2);
+    var tg = wx_us();
+    var v[8];
+    store64(&v, tg);
+    syscall(1, wfd, &v, 8, 0);
+    if (rb != 0) { wx_close(fd); return 23; }
+    wx_flock(fd, 8);
+    wx_close(fd);
+    return 0;
+}
+# sh2ex <wfd>: SH on /wx/lock, then 'S' to the inherited pipe (the handshake: this child HOLDS its SH now), then a
+# BLOCKING EX — which must drop the SH first (flock(2)) and wait for the driver's SH to go — then UN. Exit 0 iff both
+# flocks returned 0.
+fn role_sh2ex(wfd) {
+    var fd = wx_open("/wx/lock");
+    if (fd < 0) { return 30; }
+    if (wx_flock(fd, 1) != 0) { wx_close(fd); return 31; }
+    var s[8];
+    store8(&s, 83);
+    syscall(1, wfd, &s, 1, 0);
+    var r = wx_flock(fd, 2);
+    wx_flock(fd, 8);
+    wx_close(fd);
+    if (r != 0) { return 32; }
+    return 0;
+}
+# stress <n>: n rounds of { EX /wx/ctr.lock; read /wx/ctr; #44; write ctr+1; UN; sleep_ms(1) every 10th }.
+# Exit code = the number of unexpected results (capped 255).
+fn role_stress(n) {
+    var lf = wx_open("/wx/ctr.lock");
+    var cf = wx_open("/wx/ctr");
+    if (lf < 0 || cf < 0) { return 250; }
+    var bad = 0;
+    var i = 0;
+    var v[8];
+    while (i < n) {
+        if (wx_flock(lf, 2) != 0) { bad = bad + 1; }
+        syscall(58, cf, 0, 0, 0);                       # lseek SET 0
+        store64(&v, 0);
+        if (syscall(5, cf, &v, 8, 0) != 8) { bad = bad + 1; }
+        wx_yield();
+        store64(&v, load64(&v) + 1);
+        syscall(58, cf, 0, 0, 0);
+        if (syscall(1, cf, &v, 8, 0) != 8) { bad = bad + 1; }
+        wx_flock(lf, 8);
+        if ((i % 10) == 9) { wx_sleep(1); }
+        i = i + 1;
+    }
+    wx_close(cf);
+    wx_close(lf);
+    if (bad > 255) { bad = 255; }
+    return bad;
+}
+# holdlock <ms> <wfd>: EX on /wx/lock, write 'H' to wfd, sleep ms, UN, exit 0.
+fn role_holdlock(ms, wfd) {
+    var fd = wx_open("/wx/lock");
+    if (fd < 0) { return 40; }
+    var r = wx_flock(fd, 2);
+    var h[8];
+    store8(&h, 72);
+    syscall(1, wfd, &h, 1, 0);
+    wx_sleep(ms);
+    wx_flock(fd, 8);
+    wx_close(fd);
+    if (r != 0) { return 41; }
+    return 0;
+}
+# ewsleep <ms> [lo_ms] [clk]: a #37 child measures its own sleep_ms(ms); exit 0 iff d >= lo_ms in clock `clk` AND
+# d < ms + 100 ms by #95. lo_ms defaults to ms, clk to 95 (uptime_us, the TSC).
+# ⚠ clk 40 (uptime_ms) is the INTERIM contract's clock: the interim #37 child keeps the LEGACY loop, which waits for
+# a deadline IN #40 — >= ms in #40 by construction. (1.57.7 S1b: #40 is the calibrated TSC once calibrated, and the
+# loop's deadline moved from ceil(ms/10) tick edges to #40 itself; before S1b, 30 tick edges measured 282.5 ms by
+# #95 under TCG.) The driver passes `300 300 40`; the blocking path (the TSC deadline, S3b's flip) passes lo = ms by #95.
+fn role_ewsleep(ms, lo, clk) {
+    var t0 = wx_us();
+    var m0 = syscall(40, 0, 0, 0, 0);
+    wx_sleep(ms);
+    var d = wx_us() - t0;
+    var dm = syscall(40, 0, 0, 0, 0) - m0;
+    wx_out("WAITX-EW37 sleep_d="); wx_num(d); wx_out(" sleep_ms40="); wx_num(dm); wx_out(" clk="); wx_num(clk); wx_out("\n");
+    if (clk == 40) { if (dm < lo) { return 1; } }
+    else { if (d < lo * 1000) { return 1; } }
+    if (d >= (ms + 100) * 1000) { return 2; }
+    return 0;
+}
+# crash <ppid>: spin until the parent is BLOCKED (#99 state 6: it is inside its WAIT_BLOCK on this child), bounded
+# 2 s, then take a ring-3 #PF (a store to address 0): fault_kill_current must store state 0 and THEN wake
+# WK_CHILD|ppid, and the parent's WAIT_BLOCK returns 128 + 14 = 142 (P4f). A parent never seen blocked -> exit 60:
+# the fault wake would not have been exercised, so the phase fails instead of passing vacuously.
+fn role_crash(pp) {
+    var t = wx_us();
+    var seen = 0;
+    while (wx_us() - t < 2000000) {
+        if (wx_state(pp) == 6) { seen = 1; break; }
+    }
+    if (seen == 0) { return 60; }
+    store64(0, 1);
+    return 61;
+}
+# ewlockb <rfd>: the BLOCKING #37 child (S3b-F2's flipped P13). EX (NB clear) on /wx/lock while the `holdlockw`
+# helper holds it: the call must BLOCK (the helper sees this process in #99 state 6), return 0 >= 100 ms after this
+# child started, and within 50 ms of the helper's t_unlock (read from the inherited pipe `rfd`, 8 bytes, bounded 2 s).
+# Exit 0 iff so; 1 = flock returned -1 (the interim NB semantics); 2 = it returned early (< 100 ms); 3 = late or no
+# t_unlock.
+fn role_ewlockb(rfd) {
+    var ts = wx_us();
+    var fd = wx_open("/wx/lock");
+    if (fd < 0) { return 50; }
+    var r = wx_flock(fd, 2);
+    var tr = wx_us();
+    if (r == 0) { wx_flock(fd, 8); }
+    wx_close(fd);
+    var tu[8];
+    store64(&tu, 0);
+    var got = 0;
+    var tw = wx_us();
+    while (wx_us() - tw < 2000000) {
+        var n = syscall(5, rfd, &tu + got, 8 - got, 0);
+        if (n > 0) { got = got + n; }
+        if (got >= 8) { break; }
+        if (n == 0) { break; }
+        wx_sleep(1);
+    }
+    var tul = load64(&tu);
+    wx_out("WAITX-EW37 lock="); wx_num(r); wx_out(" dt="); wx_num(tr - ts); wx_out(" after_unlock="); wx_num(tr - tul); wx_out("\n");
+    if (r != 0) { return 1; }
+    if (tr - ts < 100000) { return 2; }
+    if (got < 8) { return 3; }
+    if (tr - tul > 50000) { return 3; }
+    if (tul - tr > 50000) { return 3; }
+    return 0;
+}
+# holdlockw <wfd>: EX on /wx/lock, write 'H' to wfd; then poll #99 (bounded 2 s) until a SIBLING (same parent, not
+# me) is BLOCKED (state 6) — the #37 child waiting in flock; hold at least 400 ms in all; take t_unlock by #95, UN,
+# write t_unlock (8 bytes) to wfd. Exit 0 iff the sibling was seen blocked (the driver's `blocked=1`), else 1.
+fn role_holdlockw(wfd) {
+    var fd = wx_open("/wx/lock");
+    if (fd < 0) { return 40; }
+    var tl = wx_us();
+    var r = wx_flock(fd, 2);
+    var h[8];
+    store8(&h, 72);
+    syscall(1, wfd, &h, 1, 0);
+    var me = syscall(2, 0, 0, 0, 0);
+    var pp = wx_proc(me, 16);
+    var seen = 0;
+    var tp = wx_us();
+    while (wx_us() - tp < 2000000) {
+        var n = syscall(99, &wx_pl, 16, 0, 0);
+        var i = 0;
+        while (i < n) {
+            var rec = &wx_pl + i * 64;
+            if (load64(rec) != me) {
+                if (load64(rec + 16) == pp) { if (load64(rec + 8) == 6) { seen = 1; } }
+            }
+            i = i + 1;
+        }
+        if (seen == 1) { break; }
+        wx_sleep(2);
+    }
+    var left = (tl + 400000 - wx_us()) / 1000;
+    if (left > 0) { wx_sleep(left); }
+    var tu[8];
+    store64(&tu, wx_us());
+    wx_flock(fd, 8);
+    wx_close(fd);
+    syscall(1, wfd, &tu, 8, 0);
+    if (r != 0) { return 41; }
+    if (seen == 0) { return 1; }
+    return 0;
+}
+
+# ═════════════════════════════ KEYBOARD (S3d B2, mode `kbd`; driven by scripts/harness/wait-kbd-test.py) ═════════════════════════════
+var wx_kb[64];          # 512 B: a keyboard line
+var wx_kb2[64];
+
+fn wx_hexdig(d) { if (d < 10) { return 48 + d; } return 87 + d; }
+var wx_ob[160];         # 1280 B: one whole WXK output line, written with ONE write(1)
+# Emit `<head> <hex of n bytes>\n` (lower-case, two digits each) in ONE write(1): the keyboard echo of a concurrent
+# reader is kputc'd under console_lock, so it can land BETWEEN two writes but never inside one — a line built from
+# many small writes came back as `6f6e65t0a` (another child's echoed `t` inside the hex, S3d B2 -smp 4).
+# n < 0 writes `R<n>` instead of hex; n == 0 writes `EOF`.
+fn wx_hexline(head, p, n) {
+    var o = wx_cat(&wx_ob, 0, head);
+    store8(&wx_ob + o, 32); o = o + 1;
+    if (n > 0) {
+        var i = 0;
+        while (i < n) {
+            if (o > 1270) { break; }
+            var c = load8(p + i);
+            store8(&wx_ob + o, wx_hexdig((c >> 4) & 15));
+            store8(&wx_ob + o + 1, wx_hexdig(c & 15));
+            o = o + 2;
+            i = i + 1;
+        }
+    }
+    if (n == 0) { o = wx_cat(&wx_ob, o, "EOF"); }
+    if (n < 0) { store8(&wx_ob + o, 82); o = wx_catnum(&wx_ob, o + 1, n); }
+    store8(&wx_ob + o, 10); o = o + 1;
+    syscall(1, 1, &wx_ob, o, 0);
+    return 0;
+}
+# Does the n-byte line at p equal s + "\n"?
+fn wx_line_is(p, n, s) {
+    var l = strlen(s);
+    if (n != l + 1) { return 0; }
+    var i = 0;
+    while (i < l) {
+        if (load8(p + i) != load8(s + i)) { return 0; }
+        i = i + 1;
+    }
+    if (load8(p + l) != 10) { return 0; }
+    return 1;
+}
+# kbdblk <phase> <a> [<b>]: ONE blocking read of fd 0 (a4 = 0); prints `WXK-CHILD <phase> <hex>`; exit 1 when the
+# line is "<a>\n", 2 when it is "<b>\n", 9 for any other line, 8 when the read returned <= 0.
+fn role_kbdblk() {
+    var r = syscall(5, 0, &wx_kb, 255, 0);
+    var ho = wx_cat(&wx_kb2, 0, "WXK-CHILD ");
+    ho = wx_cat(&wx_kb2, ho, argv(2));
+    store8(&wx_kb2 + ho, 0);
+    wx_hexline(&wx_kb2, &wx_kb, r);
+    if (r <= 0) { return 8; }
+    if (wx_line_is(&wx_kb, r, argv(3)) == 1) { return 1; }
+    if (argc() >= 5) { if (wx_line_is(&wx_kb, r, argv(4)) == 1) { return 2; } }
+    return 9;
+}
+
+# ═════════════════════════════ HANDOFF (S3d B5: the 0xE1 kick; phases P12 / P12b) ═════════════════════════════
+var wx_hw[128];         # 1024 B: hand-w's (round, t_got) pairs  — 50 rounds x 16 B
+var wx_hh[128];         # 1024 B: hand-h's (round, t_unlock) pairs
+fn wx_seq_put(fd, v) { var sv[8]; store64(&sv, v); syscall(58, fd, 0, 0, 0); syscall(1, fd, &sv, 8, 0); return 0; }
+fn wx_seq_get(fd) { var sg[8]; store64(&sg, 0 - 1); syscall(58, fd, 0, 0, 0); syscall(5, fd, &sg, 8, 0); return load64(&sg); }
+# hand-w <R>: for r in 0..R-1 { seq := r; flock(EX) on /wx/hand.lock (it BLOCKS: hand-h holds EX); t_got[r] = #95; UN;
+# spin 30 ms in ring 3 (state 2 — never sleep_ms, so its only state-6 wait is the flock) }; writes (r, t_got) to /wx/hand.w.
+fn role_hand_w(nr) {
+    var lf = wx_open("/wx/hand.lock");
+    var sf = wx_open("/wx/hand.seq");
+    if (lf < 0 || sf < 0) { return 70; }
+    var r = 0;
+    while (r < nr) {
+        wx_seq_put(sf, r);
+        var fr = wx_flock(lf, 2);
+        var tg = wx_us();
+        wx_flock(lf, 8);
+        store64(&wx_hw + r * 16, r); store64(&wx_hw + r * 16 + 8, tg);
+        if (fr != 0) { store64(&wx_hw + r * 16 + 8, 0 - 1); }
+        wx_spinto(wx_us() + 30000);
+        r = r + 1;
+    }
+    var of = wx_open("/wx/hand.w");
+    if (of >= 0) { syscall(1, of, &wx_hw, nr * 16, 0); wx_close(of); }
+    wx_close(sf); wx_close(lf);
+    return 0;
+}
+# hand-h <wpid> <R>: for each round { flock(EX) (taken at the start of every round); poll <= 2 s until hand.seq >= the
+# expected round AND #99 says W is BLOCKED (6: W is inside flock(EX) for that round — it has no other state-6 wait);
+# t_unlock = #95; UN (the wake); spin 20 ms }; writes (seq, t_unlock) to /wx/hand.h. A round whose W never showed up
+# blocked is written as t_unlock = -1 (unpaired).
+fn role_hand_h(wpid, nr) {
+    var lf = wx_open("/wx/hand.lock");
+    var sf = wx_open("/wx/hand.seq");
+    if (lf < 0 || sf < 0) { return 71; }
+    var want = 0;
+    var k = 0;
+    while (k < nr) {
+        wx_flock(lf, 2);
+        var ok = 0;
+        var s = 0 - 1;
+        var tp = wx_us();
+        while (wx_us() - tp < 2000000) {
+            s = wx_seq_get(sf);
+            if (s >= want) { if (wx_state(wpid) == 6) { ok = 1; break; } }
+            if (wx_state(wpid) == (0 - 1)) { break; }
+        }
+        var tu = wx_us();
+        wx_flock(lf, 8);
+        store64(&wx_hh + k * 16, s);
+        if (ok == 1) { store64(&wx_hh + k * 16 + 8, tu); want = s + 1; }
+        else { store64(&wx_hh + k * 16 + 8, 0 - 1); }
+        if (ok == 0) { if (wx_state(wpid) == (0 - 1)) { k = k + 1; break; } }
+        wx_spinto(wx_us() + 20000);
+        k = k + 1;
+    }
+    var of = wx_open("/wx/hand.h");
+    if (of >= 0) { syscall(1, of, &wx_hh, k * 16, 0); wx_close(of); }
+    wx_close(sf); wx_close(lf);
+    return 0;
+}
+# park <t_end>: loop #44 until #95 >= t_end — with nothing else READY each #44 PARKS its CPU (one hlt, kickable).
+fn role_park(te) {
+    while (wx_us() < te) { syscall(44, 0, 0, 0, 0); }
+    return 0;
+}
+
+fn wx_child(role) {
+    if (wx_eq(role, "kbdblk") == 1) { return role_kbdblk(); }
+    if (wx_eq(role, "hand-w") == 1) { return role_hand_w(wx_atoi(argv(2))); }
+    if (wx_eq(role, "hand-h") == 1) { return role_hand_h(wx_atoi(argv(2)), wx_atoi(argv(3))); }
+    if (wx_eq(role, "park") == 1) { return role_park(wx_atoi(argv(2))); }
+    if (wx_eq(role, "spin") == 1) { return role_spin(wx_atoi(argv(2)), wx_atoi(argv(3))); }
+    if (wx_eq(role, "spinp") == 1) { return role_spinp(wx_atoi(argv(2)), wx_atoi(argv(3)), wx_atoi(argv(4))); }
+    if (wx_eq(role, "nap") == 1) { return role_nap(wx_atoi(argv(2)), wx_atoi(argv(3))); }
+    if (wx_eq(role, "exit7") == 1) { return 7; }
+    if (wx_eq(role, "marker") == 1) { return role_marker(wx_atoi(argv(2)), wx_atoi(argv(3))); }
+    if (wx_eq(role, "late") == 1) { return role_late(wx_atoi(argv(2)), wx_atoi(argv(3))); }
+    if (wx_eq(role, "hop") == 1) { return role_hop(wx_atoi(argv(2)), wx_atoi(argv(3)), wx_atoi(argv(4))); }
+    if (wx_eq(role, "crash") == 1) { return role_crash(wx_atoi(argv(2))); }
+    if (wx_eq(role, "lock") == 1) { return role_lock(wx_atoi(argv(2)), wx_atoi(argv(3))); }
+    if (wx_eq(role, "sh2ex") == 1) { return role_sh2ex(wx_atoi(argv(2))); }
+    if (wx_eq(role, "stress") == 1) { return role_stress(wx_atoi(argv(2))); }
+    if (wx_eq(role, "holdlock") == 1) { return role_holdlock(wx_atoi(argv(2)), wx_atoi(argv(3))); }
+    if (wx_eq(role, "ewsleep") == 1) {
+        var es_ms = wx_atoi(argv(2));
+        var es_lo = es_ms;
+        var es_clk = 95;
+        if (argc() >= 4) { es_lo = wx_atoi(argv(3)); }
+        if (argc() >= 5) { es_clk = wx_atoi(argv(4)); }
+        return role_ewsleep(es_ms, es_lo, es_clk);
+    }
+    if (wx_eq(role, "ewlockb") == 1) { return role_ewlockb(wx_atoi(argv(2))); }
+    if (wx_eq(role, "holdlockw") == 1) { return role_holdlockw(wx_atoi(argv(2))); }
+    wx_out("WAITX-CHILD-UNKNOWN-ROLE\n");
+    return 99;
+}
+
+# ═════════════════════════════════════ DRIVER PHASES ═════════════════════════════════════
+
+# P1 sleep-basic: -1 for a negative ms, 0 returns at once, 250 ms lasts [250, 320) ms by #95, ten 1 ms sleeps each >= 1 ms.
+fn ph_sleep_basic() {
+    wx_phase("sleep-basic");
+    var rneg = wx_sleep(0 - 1);
+    var t = wx_us();
+    wx_sleep(0);
+    var d0 = wx_us() - t;
+    t = wx_us();
+    wx_sleep(250);
+    var d250 = wx_us() - t;
+    var min1 = 999999999;
+    var i = 0;
+    while (i < 10) {
+        t = wx_us();
+        wx_sleep(1);
+        var d1 = wx_us() - t;
+        if (d1 < min1) { min1 = d1; }
+        i = i + 1;
+    }
+    var ok = 1;
+    if (rneg != (0 - 1)) { ok = 0; }
+    if (d0 >= 2000) { ok = 0; }
+    if (d250 < 250000) { ok = 0; }
+    if (d250 >= 320000) { ok = 0; }
+    if (min1 < 1000) { ok = 0; }
+    wx_verdict(ok, "sleep-basic"); wx_kv("neg", rneg); wx_kv("d0", d0); wx_kv("d250", d250); wx_kv("min1", min1); wx_end();
+    return 0;
+}
+
+# P2 sleep-yields: K = ncpu + 1 `spin t0 t1` children (t0 = now + 100 ms, t1 = t0 + 1 s); the driver sleep_ms's
+# across the whole window. The spinners' own tick deltas must sum to >= 0.8 x 100 x ncpu.
+fn ph_sleep_yields() {
+    wx_phase("sleep-yields");
+    var k = WX_NCPU + 1;
+    var t0 = wx_us() + 100000;
+    var t1 = t0 + 1000000;
+    var i = 0;
+    while (i < k) { store64(&wx_pids + i * 8, wx_spawn("spin", t0, t1, 0 - 1)); i = i + 1; }
+    wx_sleep((t1 - wx_us()) / 1000 + 30);
+    var sum = 0;
+    var bad = 0;
+    i = 0;
+    while (i < k) {
+        var r = wx_reap(load64(&wx_pids + i * 8));
+        if (r < 0) { bad = bad + 1; } else { sum = sum + r; }
+        i = i + 1;
+    }
+    var need = 80 * WX_NCPU;
+    var ok = 1;
+    if (bad != 0) { ok = 0; }
+    if (sum < need) { ok = 0; }
+    wx_verdict(ok, "sleep-yields"); wx_kv("sum", sum); wx_kv("need", need); wx_kv("k", k); wx_kv("bad", bad); wx_end();
+    return 0;
+}
+
+# P2b share-full (S3d B1a, keep-current): K = ncpu `spin t0 t1` children (t0 = now + 100 ms, t1 = t0 + 1 s); the
+# driver reaps them with WAIT_BLOCK (it is BLOCKED, never READY, for the whole window). Each spinner must report
+# >= 0.85 x W ticks of its own (W = the window in ticks): a lone runner is KEPT on its CPU while only the CPU's idle
+# is READY. Mutation M-D1 (keep-current deleted): each spinner alternates with its CPU's idle every tick, ~0.5 x W.
+fn ph_share_full() {
+    wx_phase("share-full");
+    var k = WX_NCPU;
+    var t0 = wx_us() + 100000;
+    var t1 = t0 + 1000000;
+    var w = (t1 - t0) / 10000;
+    var need = (85 * w) / 100;
+    var i = 0;
+    while (i < k) { store64(&wx_pids + i * 8, wx_spawn("spin", t0, t1, 0 - 1)); i = i + 1; }
+    var mn = 999;
+    var bad = 0;
+    i = 0;
+    while (i < k) {
+        var r = syscall(4, 0x100 | load64(&wx_pids + i * 8), 0, 0, 0);
+        if (r == (0 - 1)) { r = wx_reap(load64(&wx_pids + i * 8)); }
+        if (r < 0) { bad = bad + 1; } else { if (r < mn) { mn = r; } }
+        wx_out("WAITX-SHARE child="); wx_num(i); wx_out(" ticks="); wx_num(r); wx_out("\n");
+        i = i + 1;
+    }
+    var ok = 1;
+    if (bad != 0) { ok = 0; }
+    if (mn < need) { ok = 0; }
+    wx_verdict(ok, "share-full"); wx_kv("min", mn); wx_kv("need", need); wx_kv("w", w); wx_kv("k", k); wx_kv("bad", bad); wx_end();
+    return 0;
+}
+
+# P2c yield-parks (S3d B1b, the #44 park): one `nap 2000` child (BLOCKED in sleep_ms — seen as #99 state 6 first); the
+# driver loops #44 for 300 ms by #95. With nothing else READY each #44 halts the CPU for one interrupt (not charged),
+# so the driver's own #99 tick delta must be <= 5. Mutation M-D2 (#44 without the park): keep-current makes the yield
+# a no-op and the loop spins, charged ~30 ticks; M-D4 (the scan finds this CPU's idle): the park never halts, same.
+fn ph_yield_parks() {
+    wx_phase("yield-parks");
+    var me = syscall(2, 0, 0, 0, 0);
+    var np = wx_spawn("nap", 2000, 0, 0 - 1);
+    var seen6 = 0;
+    var tw = wx_us();
+    while (wx_us() - tw < 1000000) {
+        if (wx_state(np) == 6) { seen6 = 1; break; }
+        wx_sleep(5);
+    }
+    var k0 = wx_ticks(me);
+    var t0 = wx_us();
+    var n = 0;
+    while (wx_us() - t0 < 300000) { syscall(44, 0, 0, 0, 0); n = n + 1; }
+    var kd = wx_ticks(me) - k0;
+    var st = wx_state(np);
+    var code = wx_reap(np);
+    wx_out("WAITX-PARK ticks="); wx_num(kd); wx_out(" yields="); wx_num(n); wx_out("\n");
+    var ok = 1;
+    if (seen6 == 0) { ok = 0; }
+    if (st != 6) { ok = 0; }
+    if (kd > 5) { ok = 0; }
+    if (code != 0) { ok = 0; }
+    wx_verdict(ok, "yield-parks"); wx_kv("ticks", kd); wx_kv("yields", n); wx_kv("seen6", seen6); wx_kv("nap_state", st);
+    wx_kv("child", code); wx_end();
+    return 0;
+}
+
+# P2d yield-donates (S3d B1b): one `spin t0 t1` child (t0 = now + 20 ms, t1 = t0 + 500 ms); the driver loops #44
+# until t1. Every #44 hands the CPU to the READY spinner, which must report >= 0.85 x W ticks. Mutation M-C1
+# (sched_yield_kernel returns 0): the park's scan finds the spinner, returns without halting, and the driver spins
+# against it tick for tick (~0.5 x W at -smp 1). At -smp 4 the spinner has its own CPU (gated, not discriminating).
+fn ph_yield_donates() {
+    wx_phase("yield-donates");
+    var t0 = wx_us() + 20000;
+    var t1 = t0 + 500000;
+    var w = (t1 - t0) / 10000;
+    var need = (85 * w) / 100;
+    var sp = wx_spawn("spin", t0, t1, 0 - 1);
+    var n = 0;
+    while (wx_us() < t1) { syscall(44, 0, 0, 0, 0); n = n + 1; }
+    var code = wx_reap(sp);
+    var ok = 1;
+    if (code < need) { ok = 0; }
+    wx_verdict(ok, "yield-donates"); wx_kv("spinner", code); wx_kv("need", need); wx_kv("w", w); wx_kv("yields", n); wx_end();
+    return 0;
+}
+
+var wx_snd[24000];      # 192000 B: 48000 frames of 16-bit stereo silence (P10/P11)
+
+# P10 snd-yields (S3d B3): #64 open + #65 (48 kHz, 16-bit, 2 ch); K = ncpu `spin t0 t1` children (t0 = now + 50 ms,
+# t1 = t0 + 500 ms); then at once a BLOCKING #66 of 48000 frames (~0.70 s: 33,665 of them wait for play-out). It must
+# return 48000, span the window (t_ret >= t1) and take <= 1.3 s, and every spinner must get >= 0.8 x W: the writer
+# held no CPU while it waited for ring space (M-F2: no WK_SND wake -> the write runs to its cap; M-F2b: the held loop).
+fn ph_snd_yields() {
+    wx_phase("snd-yields");
+    var slot = syscall(64, 0, 0, 0, 0);
+    if (slot < 0) { wx_verdict(0, "snd-yields"); wx_kv("open", slot); wx_end(); return 0; }
+    var rc = syscall(65, slot, 48000, 0x1002, 0);
+    var k = WX_NCPU;
+    var t0 = wx_us() + 50000;
+    var t1 = t0 + 500000;
+    var w = (t1 - t0) / 10000;
+    var need = (8 * w) / 10;
+    var i = 0;
+    while (i < k) { store64(&wx_pids + i * 8, wx_spawn("spin", t0, t1, 0 - 1)); i = i + 1; }
+    var tb = wx_us();
+    var r = syscall(66, slot, &wx_snd, 48000, 0);
+    var te = wx_us();
+    syscall(67, slot, 0, 0, 0);
+    var mn = 999;
+    i = 0;
+    while (i < k) {
+        var sr = wx_reap(load64(&wx_pids + i * 8));
+        if (sr < mn) { mn = sr; }
+        i = i + 1;
+    }
+    var ok = 1;
+    if (rc != 0) { ok = 0; }
+    if (r != 48000) { ok = 0; }
+    if (te < t1) { ok = 0; wx_out("WAITX-FAIL P10 window (the write returned before the spinners' window closed)\n"); }
+    if (te - tb > 1300000) { ok = 0; }
+    if (mn < need) { ok = 0; }
+    wx_verdict(ok, "snd-yields"); wx_kv("r", r); wx_kv("dt_us", te - tb); wx_kv("late_us", te - t1); wx_kv("min", mn);
+    wx_kv("need", need); wx_kv("k", k); wx_end();
+    return 0;
+}
+
+# P11 snd-drain (S3d B3): K = ncpu `spin t0 t0 + 150 ms` children; then fill the ring with NB #66 (~14k frames after
+# the open's 2048-frame lead: ~0.34 s of audio) and at once #68: it must return 0 after the window (t_ret >= t1) and
+# within 0.6 s, and every spinner must get >= 0.8 x W (M-F2: no wake -> the drain runs to its 1 s cap; M-F2c: held).
+# ⚠ t0 = now + 50 ms + 20 ms per spinner, and the spinners are spawned BEFORE the fill: with the spec's t0 = now + 30 ms
+# after the fill, the 4th spinner at -smp 4 (KVM) first ran ~40 ms into its 150 ms window (a #43 spawn is ~10 ms) and
+# reported 11 of the 12 needed ticks on every run (15/15/13/11 — spawn order, not the drain). The window still lies
+# inside the drain: the fill happens after the spawns, well before t0.
+fn ph_snd_drain() {
+    wx_phase("snd-drain");
+    var slot = syscall(64, 0, 0, 0, 0);
+    if (slot < 0) { wx_verdict(0, "snd-drain"); wx_kv("open", slot); wx_end(); return 0; }
+    var rc = syscall(65, slot, 48000, 0x1002, 0);
+    var k = WX_NCPU;
+    var t0 = wx_us() + 50000 + 20000 * k;
+    var t1 = t0 + 150000;
+    var w = (t1 - t0) / 10000;
+    var need = (8 * w) / 10;
+    var i = 0;
+    while (i < k) { store64(&wx_pids + i * 8, wx_spawn("spin", t0, t1, 0 - 1)); i = i + 1; }
+    var nb = syscall(66, slot, &wx_snd, 48000, 1);
+    var tf = wx_us();
+    if (tf >= t0) { wx_out("WAITX-FAIL P11 window (the fill ran into the spinners' window)\n"); }
+    var tb = wx_us();
+    var r = syscall(68, slot, 0, 0, 0);
+    var te = wx_us();
+    syscall(67, slot, 0, 0, 0);
+    var mn = 999;
+    i = 0;
+    while (i < k) {
+        var sr = wx_reap(load64(&wx_pids + i * 8));
+        if (sr < mn) { mn = sr; }
+        wx_out("WAITX-SND11 child="); wx_num(i); wx_out(" ticks="); wx_num(sr); wx_out("\n");
+        i = i + 1;
+    }
+    var ok = 1;
+    if (rc != 0) { ok = 0; }
+    if (nb < 10000) { ok = 0; }
+    if (tf >= t0) { ok = 0; }
+    if (r != 0) { ok = 0; }
+    if (te < t1) { ok = 0; }
+    if (te - tb > 600000) { ok = 0; }
+    if (mn < need) { ok = 0; }
+    wx_verdict(ok, "snd-drain"); wx_kv("nb_frames", nb); wx_kv("r", r); wx_kv("dt_us", te - tb); wx_kv("late_us", te - t1);
+    wx_kv("min", mn); wx_kv("need", need); wx_kv("k", k); wx_end();
+    return 0;
+}
+
+# Is this a KVM guest? The smoke says so: /wx/accel holds `kvm` or `tcg` — the accelerator smoke_accel picks for the
+# MULTI-CPU boot (wait-ring3-smoke.sh seeds it once; the -smp 1 boot never runs the phases that read it).
+fn wx_is_kvm() {
+    var fd = wx_open("/wx/accel");
+    if (fd < 0) { return 0; }
+    var b[8];
+    store8(&b, 0);
+    syscall(5, fd, &b, 3, 0);
+    wx_close(fd);
+    if (load8(&b) == 107) { return 1; }                 # 'k'
+    return 0;
+}
+var wx_lat[64];         # 512 B: up to 64 handoff latencies (µs)
+# P12 handoff (S3d B5) / P12b handoff-parked. A `hand-w` waiter BLOCKED in flock(EX) and a `hand-h` holder that
+# releases it every round; the latency t_got - t_unlock is the wake -> run time of a process woken for ANOTHER CPU.
+# P12: the other CPUs are idle (the idle step, kickable); P12b: K = ncpu - 1 `park` children loop #44 so the CPUs that
+# are not running H are PARKED in #44 (kickable) — see the phase note. Median gated: KVM < 500 µs (a TCG run < 2000 µs
+# is a regression guard only). Mutations: M-G1 (no kick) and M-G2 (the idle re-halts) -> P12 median >= a tick share;
+# M-G5 (the park never sets cpu_kickable) -> P12b. At -smp 1: n/a.
+# ⚠ P12b uses ncpu - 1 parkers, not the spec's ncpu: with ncpu parkers plus H there is ALWAYS a READY process, every
+# #44 then yields to it instead of parking, and W is picked up by a parker's yield within microseconds whether or not
+# a parked CPU is kickable — the phase would not exercise the kick to a parked CPU at all. The driver reaps with
+# WAIT_BLOCK so it is not a runnable parker itself.
+fn ph_handoff(parked) {
+    var nm = "handoff";
+    if (parked == 1) { nm = "handoff-parked"; }
+    wx_phase(nm);
+    if (WX_NCPU == 1) { wx_verdict(1, nm); wx_out(" n/a (1 cpu)"); wx_end(); return 0; }
+    var nr = 50;
+    var np = 0;
+    if (parked == 1) { np = WX_NCPU - 1; }
+    var te = wx_us() + 8000000;
+    var i = 0;
+    while (i < np) { store64(&wx_pids + (2 + i) * 8, wx_spawn("park", te, 0 - 1, 0 - 1)); i = i + 1; }
+    var wp = wx_spawn("hand-w", nr, 0 - 1, 0 - 1);
+    var hp = wx_spawn("hand-h", wp, nr, 0 - 1);
+    var ew = syscall(4, 0x100 | wp, 0, 0, 0);
+    var eh = syscall(4, 0x100 | hp, 0, 0, 0);
+    i = 0;
+    while (i < np) { syscall(4, 0x100 | load64(&wx_pids + (2 + i) * 8), 0, 0, 0); i = i + 1; }
+    var wf = wx_open("/wx/hand.w");
+    var hf = wx_open("/wx/hand.h");
+    var nw = 0;
+    var nh = 0;
+    if (wf >= 0) { nw = syscall(5, wf, &wx_hw, 800, 0); wx_close(wf); }
+    if (hf >= 0) { nh = syscall(5, hf, &wx_hh, 800, 0); wx_close(hf); }
+    var npair = 0;
+    var neg = 0;
+    var k = 0;
+    while (k * 16 < nh) {
+        var hs = load64(&wx_hh + k * 16);
+        var hu = load64(&wx_hh + k * 16 + 8);
+        if (hu > 0) {
+            if (hs >= 0) {
+                if (hs * 16 < nw) {
+                    var wg = load64(&wx_hw + hs * 16 + 8);
+                    if (wg > 0) {
+                        var d = wg - hu;
+                        if (d < 0) { neg = neg + 1; }
+                        else { if (npair < 64) { store64(&wx_lat + npair * 8, d); npair = npair + 1; } }
+                    }
+                }
+            }
+        }
+        k = k + 1;
+    }
+    # insertion sort, then the median and p90
+    var a = 1;
+    while (a < npair) {
+        var v = load64(&wx_lat + a * 8);
+        var b = a - 1;
+        while (b >= 0) {
+            if (load64(&wx_lat + b * 8) <= v) { break; }
+            store64(&wx_lat + (b + 1) * 8, load64(&wx_lat + b * 8));
+            b = b - 1;
+        }
+        store64(&wx_lat + (b + 1) * 8, v);
+        a = a + 1;
+    }
+    var med = 0 - 1;
+    var p90 = 0 - 1;
+    if (npair > 0) { med = load64(&wx_lat + (npair / 2) * 8); p90 = load64(&wx_lat + ((npair * 9) / 10) * 8); }
+    var kvm = wx_is_kvm();
+    var lim = 2000;
+    if (kvm == 1) { lim = 500; }
+    wx_out("WAITX-HANDOFF phase="); wx_out(nm); wx_out(" median="); wx_num(med); wx_out(" p90="); wx_num(p90);
+    wx_out(" pairs="); wx_num(npair); wx_out(" accel=");
+    if (kvm == 1) { wx_out("kvm"); } else { wx_out("tcg"); }
+    wx_out("\n");
+    var ok = 1;
+    if (ew != 0) { ok = 0; }
+    if (eh != 0) { ok = 0; }
+    if (npair < 40) { ok = 0; }
+    if (neg != 0) { ok = 0; }
+    if (med < 0) { ok = 0; }
+    if (med >= lim) { ok = 0; }
+    wx_verdict(ok, nm); wx_kv("median_us", med); wx_kv("p90_us", p90); wx_kv("pairs", npair); wx_kv("neg", neg);
+    wx_kv("limit_us", lim); wx_kv("parkers", np); wx_end();
+    return 0;
+}
+
+# PINNED-SLEEP (S3d B5, report-only): the driver (/bin/agnsh — BSP-pinned) does 50 x sleep_ms(3); its deadline is
+# expired by whichever CPU's tick comes first, and wq_tick kicks the halted BSP for it (M-G8 removes that kick).
+fn ph_pinned_sleep() {
+    wx_phase("pinned-sleep");
+    var i = 0;
+    var n = 0;
+    while (i < 50) {
+        var t = wx_us();
+        wx_sleep(3);
+        var over = wx_us() - t - 3000;
+        if (over < 0) { over = 0; }
+        if (n < 64) { store64(&wx_lat + n * 8, over); n = n + 1; }
+        i = i + 1;
+    }
+    var a = 1;
+    while (a < n) {
+        var v = load64(&wx_lat + a * 8);
+        var b = a - 1;
+        while (b >= 0) {
+            if (load64(&wx_lat + b * 8) <= v) { break; }
+            store64(&wx_lat + (b + 1) * 8, load64(&wx_lat + b * 8));
+            b = b - 1;
+        }
+        store64(&wx_lat + (b + 1) * 8, v);
+        a = a + 1;
+    }
+    var med = load64(&wx_lat + (n / 2) * 8);
+    wx_out("WAITX-PSLEEP median="); wx_num(med); wx_out(" p90="); wx_num(load64(&wx_lat + ((n * 9) / 10) * 8)); wx_out(" n="); wx_num(n); wx_out("\n");
+    wx_verdict(1, "pinned-sleep"); wx_kv("median_overshoot_us", med); wx_out(" (report-only)"); wx_end();
+    return 0;
+}
+
+# P3 sleep-reap: a `late t0 7` child (it spins until t0 = now + 30 ms, then exits 7) is reaped with 7 within 300 ms by
+# a sleep_ms(10) + #4 poll loop (daimon's shape). The child needs the CPU AFTER the parent's loop has begun, so a
+# kernel whose sleep holds the CPU starves it at -smp 1 (1.57.6: RED); until the S3c fix pass the child was `nap 50 7`,
+# which finished at spawn time and passed on the control kernel too (review B3).
+fn ph_sleep_reap() {
+    wx_phase("sleep-reap");
+    var tl = wx_us() + 30000;
+    var pid = wx_spawn("late", tl, 7, 0 - 1);
+    var t = wx_us();
+    var code = 0 - 2;
+    while (wx_us() - t < 300000) {
+        wx_sleep(10);
+        var r = wx_poll(pid);
+        if (r != (0 - 2)) { code = r; break; }
+    }
+    var dt = wx_us() - t;
+    if (code == (0 - 2)) { wx_reap(pid); }
+    var ok = 0;
+    if (code == 7) { ok = 1; }
+    wx_verdict(ok, "sleep-reap"); wx_kv("code", code); wx_kv("dt", dt); wx_end();
+    return 0;
+}
+
+# P3b sleep-child-runs: a `marker t_start` child (spins to t_start = now + 60 ms, then writes 1 byte to the pipe)
+# and IMMEDIATELY sleep_ms(200). A single read afterwards must return the byte: the child ran DURING the sleep.
+# The child cannot write before t_start, so a tick between the spawn and the sleep cannot pass a kernel that
+# holds the CPU for the whole sleep.
+fn ph_sleep_child_runs() {
+    wx_phase("sleep-child-runs");
+    if (wx_pipe(&wx_fds) != 0) { wx_verdict(0, "sleep-child-runs"); wx_out(" pipe"); wx_end(); return 0; }
+    var rfd = load64(&wx_fds);
+    var wfd = load64(&wx_fds + 8);
+    var ts = wx_us() + 60000;
+    var pid = wx_spawn("marker", ts, wfd, 0 - 1);
+    wx_sleep(200);
+    var b[8];
+    var n = syscall(5, rfd, &b, 1, 0);
+    wx_close(wfd);
+    wx_close(rfd);
+    var code = wx_reap(pid);
+    var ok = 0;
+    if (n == 1) { if (code == 0) { ok = 1; } }
+    wx_verdict(ok, "sleep-child-runs"); wx_kv("read", n); wx_kv("code", code); wx_end();
+    return 0;
+}
+
+# P6 yield: #44 with nothing else READY returns in < 15 ms (it parks on the CPU's idle for at most a tick). At -smp 1
+# a spinner must accrue >= 50 ticks over 100 x #44 by the driver (every yield donates the slice); report-only at -smp 4.
+fn ph_yield() {
+    wx_phase("yield");
+    var t = wx_us();
+    wx_yield();
+    var d = wx_us() - t;
+    var t0 = wx_us() + 20000;
+    var t1 = t0 + 1500000;
+    var pid = wx_spawn("spin", t0, t1, 0 - 1);
+    wx_spinto(t0);
+    var k0 = wx_ticks(pid);
+    var i = 0;
+    while (i < 100) { wx_yield(); i = i + 1; }
+    var acc = wx_ticks(pid) - k0;
+    var code = wx_reap(pid);
+    var ok = 1;
+    if (d >= 15000) { ok = 0; }
+    if (WX_NCPU == 1) { if (acc < 50) { ok = 0; } }
+    if (code < 0) { ok = 0; }
+    wx_verdict(ok, "yield"); wx_kv("idle_us", d); wx_kv("spinner_ticks", acc); wx_kv("ncpu", WX_NCPU);
+    if (WX_NCPU > 1) { wx_out(" (spinner share report-only at -smp > 1)"); }
+    wx_end();
+    return 0;
+}
+
+# P4 waitpid-block: WAIT_BLOCK (#4 0x100|pid) on `nap 300 9` returns 9 after >= 290 ms, the child seen in state 6
+# (#99) first, while K = ncpu + 1 spinners get >= 0.8 of the CPU the driver gave up; 0x1FF on `nap 100 3` +
+# `nap 200 4` -> 3 then 4; with no children 0x1FF -> -1 in < 5 ms; a non-child (pid 0, kmain) -> -1 in < 5 ms.
+fn ph_waitpid_block() {
+    wx_phase("waitpid-block");
+    var k = WX_NCPU + 1;
+    var st0 = wx_us() + 10000;
+    var st1 = st0 + 700000;
+    var i = 0;
+    while (i < k) { store64(&wx_pids + i * 8, wx_spawn("spin", st0, st1, 0 - 1)); i = i + 1; }
+    var ts = wx_us();
+    var p9 = wx_spawn("nap", 300, 9, 0 - 1);
+    var seen6 = 0;
+    var tw = wx_us();
+    while (wx_us() - tw < 200000) {
+        if (wx_state(p9) == 6) { seen6 = 1; break; }
+        wx_sleep(5);
+    }
+    var ks = 0;
+    i = 0;
+    while (i < k) { ks = ks + wx_ticks(load64(&wx_pids + i * 8)); i = i + 1; }
+    var tb = wx_us();
+    var r9 = syscall(4, 0x100 | p9, 0, 0, 0);
+    var te = wx_us();
+    var ke = 0;
+    i = 0;
+    while (i < k) { ke = ke + wx_ticks(load64(&wx_pids + i * 8)); i = i + 1; }
+    if (r9 == (0 - 1)) { r9 = wx_reap(p9); }                # a kernel without WAIT_BLOCK: reap by poll, still RED
+    var got = ke - ks;
+    var wticks = (te - tb) / 10000;
+    var need = (8 * wticks * WX_NCPU) / 10;
+    i = 0;
+    while (i < k) { wx_reap(load64(&wx_pids + i * 8)); i = i + 1; }
+    var p3 = wx_spawn("nap", 100, 3, 0 - 1);
+    var p4 = wx_spawn("nap", 200, 4, 0 - 1);
+    var ra = syscall(4, 0x1FF, 0, 0, 0);
+    var rb = syscall(4, 0x1FF, 0, 0, 0);
+    if (ra == (0 - 1)) { wx_reap(p3); wx_reap(p4); }
+    var tn = wx_us();
+    var rn = syscall(4, 0x1FF, 0, 0, 0);
+    var dn = wx_us() - tn;
+    var tk = wx_us();
+    var rk = syscall(4, 0x100 | 0, 0, 0, 0);
+    var dk = wx_us() - tk;
+    var ok = 1;
+    if (r9 != 9) { ok = 0; }
+    if (te - ts < 290000) { ok = 0; }
+    if (seen6 == 0) { ok = 0; }
+    if (got < need) { ok = 0; }
+    if (ra != 3) { ok = 0; }
+    if (rb != 4) { ok = 0; }
+    if (rn != (0 - 1)) { ok = 0; }
+    if (dn >= 5000) { ok = 0; }
+    if (rk != (0 - 1)) { ok = 0; }
+    if (dk >= 5000) { ok = 0; }
+    wx_verdict(ok, "waitpid-block"); wx_kv("r9", r9); wx_kv("dt", te - ts); wx_kv("seen6", seen6);
+    wx_kv("spin_got", got); wx_kv("need", need); wx_kv("any1", ra); wx_kv("any2", rb);
+    wx_kv("none", rn); wx_kv("none_us", dn); wx_kv("nonchild", rk); wx_kv("nonchild_us", dk); wx_end();
+    return 0;
+}
+
+# P8 migrate (-smp > 1): an unpinned `hop` child loops sleep_ms(2) under K = ncpu spinners until the klug line
+# `wq: first cross-CPU resume from a kernel wait` exists (a blocked wait resumed on another CPU).
+# ⚠ ATTRIBUTION: that line is LATCHED once per boot, and every other phase's children wait in the kernel too, so the
+# driver runs this phase FIRST and scans klug BEFORE it spawns anything (`pre=`). Only pre=0 then found=1 proves
+# THIS phase's hop migrated (the driver itself, kybernet's /bin/agnsh, is BSP-pinned and never resumes elsewhere);
+# pre=1 is a FAIL ("not attributable"), never a pass. `found_ms` is the time from the spawn to the witness.
+fn ph_migrate() {
+    wx_phase("migrate");
+    if (WX_NCPU == 1) { wx_verdict(1, "migrate n/a (1 cpu)"); wx_end(); return 0; }
+    var pre = wx_klog_has("wq: first cross-CPU resume from a kernel wait");
+    if (wx_pipe(&wx_fds) != 0) { wx_verdict(0, "migrate"); wx_out(" pipe"); wx_end(); return 0; }
+    var rfd = load64(&wx_fds);
+    var wfd = load64(&wx_fds + 8);
+    var k = WX_NCPU;
+    var tend = wx_us() + 20000000;
+    var i = 0;
+    while (i < k) { store64(&wx_pids + i * 8, wx_spawn("spinp", tend, rfd, wfd)); i = i + 1; }
+    var t = wx_us();
+    var hop = wx_spawn("hop", 500, rfd, wfd);
+    var found = 0;
+    while (wx_us() - t < 8000000) {
+        if (wx_klog_has("wq: first cross-CPU resume from a kernel wait") == 1) { found = 1; break; }
+        wx_sleep(20);
+    }
+    var fms = (wx_us() - t) / 1000;
+    wx_close(wfd);                                      # EOF: the spinners and the hop stop
+    wx_close(rfd);
+    i = 0;
+    while (i < k) { wx_reap(load64(&wx_pids + i * 8)); i = i + 1; }
+    var hc = wx_reap(hop);
+    if (found == 1) { wx_out("WAITX-KLOG wq: first cross-CPU resume from a kernel wait\n"); }
+    var ok = 1;
+    if (pre != 0) { ok = 0; }
+    if (found == 0) { ok = 0; }
+    if (hc != 0) { ok = 0; }
+    wx_verdict(ok, "migrate"); wx_kv("pre", pre); wx_kv("found", found); wx_kv("found_ms", fms); wx_kv("hop", hc);
+    if (pre != 0) { wx_out(" (the witness was latched BEFORE this phase: not attributable to its hop)"); }
+    wx_end();
+    return 0;
+}
+
+# P9 storm: 3 x 50 `exit7` children (waves of 4), each reaped by WAIT_BLOCK any, under K = ncpu + 1 spinners; every
+# code 7, no `fault:` in klug, free RAM afterwards >= the baseline - 256 KB.
+fn ph_storm() {
+    wx_phase("storm");
+    var free0 = wx_sysinfo(16);
+    if (wx_pipe(&wx_fds) != 0) { wx_verdict(0, "storm"); wx_out(" pipe"); wx_end(); return 0; }
+    var rfd = load64(&wx_fds);
+    var wfd = load64(&wx_fds + 8);
+    var k = WX_NCPU + 1;
+    var tend = wx_us() + 120000000;
+    var i = 0;
+    while (i < k) { store64(&wx_pids + i * 8, wx_spawn("spinp", tend, rfd, wfd)); i = i + 1; }
+    var ts = wx_us();
+    var reaped = 0;
+    var wrong = 0;
+    var spawnfail = 0;
+    var w = 0;
+    while (w < 38) {                                    # 37 waves of 4 + 1 of 2 = 150
+        var nw = 4;
+        if (w == 37) { nw = 2; }
+        var j = 0;
+        var got = 0;
+        while (j < nw) { if (wx_spawn("exit7", 0 - 1, 0 - 1, 0 - 1) >= 0) { got = got + 1; } else { spawnfail = spawnfail + 1; } j = j + 1; }
+        j = 0;
+        while (j < got) {
+            var r = syscall(4, 0x1FF, 0, 0, 0);
+            if (r == 7) { reaped = reaped + 1; } else { wrong = wrong + 1; }
+            j = j + 1;
+        }
+        w = w + 1;
+    }
+    var dt = wx_us() - ts;
+    wx_close(wfd);
+    wx_close(rfd);
+    i = 0;
+    while (i < k) { wx_reap(load64(&wx_pids + i * 8)); i = i + 1; }
+    var free1 = wx_sysinfo(16);
+    var fault = wx_klog_has("fault: pid=");
+    var ok = 1;
+    if (reaped != 150) { ok = 0; }
+    if (wrong != 0) { ok = 0; }
+    if (fault != 0) { ok = 0; }
+    if (free1 < free0 - 262144) { ok = 0; }
+    wx_verdict(ok, "storm"); wx_kv("reaped", reaped); wx_kv("wrong", wrong); wx_kv("spawnfail", spawnfail);
+    wx_kv("fault", fault); wx_kv("free0", free0); wx_kv("free1", free1); wx_kv("wall_us", dt); wx_end();
+    return 0;
+}
+
+# P5a flock-nb: the driver holds EX; a `lock 1` child's EX|NB is -1 within 20 ms. Also the mean cost of 1000
+# uncontended EX + UN round trips (NB clear: the wq_can_block hot path), report-only.
+fn ph_flock_nb() {
+    wx_phase("flock-nb");
+    var fd = wx_open("/wx/lock");
+    if (fd < 0) { wx_verdict(0, "flock-nb"); wx_out(" open"); wx_end(); return 0; }
+    var t = wx_us();
+    var i = 0;
+    var rtbad = 0;
+    while (i < 1000) {
+        if (wx_flock(fd, 2) != 0) { rtbad = rtbad + 1; }
+        wx_flock(fd, 8);
+        i = i + 1;
+    }
+    var ns = (wx_us() - t) * 1000 / 1000;
+    var rex = wx_flock(fd, 2);
+    var pid = wx_spawn("lock", 1, 0, 0 - 1);
+    var t0 = wx_us();
+    var code = 0 - 2;
+    while (wx_us() - t0 < 3000000) {                    # poll: the child must NOT be blocked by our EX
+        code = wx_poll(pid);
+        if (code != (0 - 2)) { break; }
+        wx_sleep(2);
+    }
+    wx_flock(fd, 8);
+    wx_close(fd);
+    if (code == (0 - 2)) { code = wx_reap(pid); }
+    var ok = 1;
+    if (rex != 0) { ok = 0; }
+    if (code != 0) { ok = 0; }
+    if (rtbad != 0) { ok = 0; }
+    wx_verdict(ok, "flock-nb"); wx_kv("child", code); wx_kv("rtbad", rtbad); wx_kv("flock_ex_ns", ns); wx_end();
+    return 0;
+}
+
+# P5b flock-wait: the driver holds EX; a `lock 0` child's EX (NB clear) BLOCKS (state 6 via #99 within 2 s); the
+# driver sleeps 500 ms, takes t_unlock and UNs; the child's t_got (through the pipe) satisfies
+# t_unlock <= t_got < t_unlock + 50 ms, and the child exits 0. Bounded by a 3 s budget.
+fn ph_flock_wait() {
+    wx_phase("flock-wait");
+    var fd = wx_open("/wx/lock");
+    if (fd < 0) { wx_verdict(0, "flock-wait"); wx_out(" open"); wx_end(); return 0; }
+    if (wx_pipe(&wx_fds) != 0) { wx_close(fd); wx_verdict(0, "flock-wait"); wx_out(" pipe"); wx_end(); return 0; }
+    var rfd = load64(&wx_fds);
+    var wfd = load64(&wx_fds + 8);
+    var rex = wx_flock(fd, 2);
+    var pid = wx_spawn("lock", 0, wfd, 0 - 1);
+    var seen6 = 0;
+    var tw = wx_us();
+    while (wx_us() - tw < 2000000) {
+        if (wx_state(pid) == 6) { seen6 = 1; break; }
+        if (wx_state(pid) == (0 - 1)) { break; }
+        wx_sleep(5);
+    }
+    wx_sleep(500);
+    var tu = wx_us();
+    wx_flock(fd, 8);
+    wx_close(fd);
+    var v[8];
+    store64(&v, 0);
+    var got = 0;
+    var t0 = wx_us();
+    while (wx_us() - t0 < 3000000) {
+        var n = syscall(5, rfd, &v, 8, 0);
+        if (n == 8) { got = 1; break; }
+        if (n == 0) { break; }
+        wx_sleep(2);
+    }
+    wx_close(wfd);
+    wx_close(rfd);
+    var code = wx_reap(pid);
+    var tg = load64(&v);
+    var ok = 1;
+    if (rex != 0) { ok = 0; }
+    if (seen6 == 0) { ok = 0; }
+    if (got == 0) { ok = 0; }
+    if (tg < tu) { ok = 0; }
+    if (tg >= tu + 50000) { ok = 0; }
+    if (code != 0) { ok = 0; }
+    wx_verdict(ok, "flock-wait"); wx_kv("seen6", seen6); wx_kv("got", got); wx_kv("wake_us", tg - tu); wx_kv("child", code); wx_end();
+    return 0;
+}
+
+# P5c flock-full: EX (NB clear) on /wx/f00 .. /wx/f15 -> 16 x 0; the 17th (/wx/f16) -> -2 in < 20 ms (the table is
+# full, and a full table never waits); then UN + close all.
+fn ph_flock_full() {
+    wx_phase("flock-full");
+    var ok16 = 0;
+    var i = 0;
+    var nm[16];
+    while (i < 17) {
+        store8(&nm, 47); store8(&nm + 1, 119); store8(&nm + 2, 120); store8(&nm + 3, 47); store8(&nm + 4, 102);  # "/wx/f"
+        store8(&nm + 5, 48 + i / 10); store8(&nm + 6, 48 + i % 10); store8(&nm + 7, 0);
+        store64(&wx_fl + i * 8, wx_open(&nm));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 16) {
+        if (wx_flock(load64(&wx_fl + i * 8), 2) == 0) { ok16 = ok16 + 1; }
+        i = i + 1;
+    }
+    var t = wx_us();
+    var r17 = wx_flock(load64(&wx_fl + 16 * 8), 2);
+    var dt = wx_us() - t;
+    i = 0;
+    while (i < 17) {
+        wx_flock(load64(&wx_fl + i * 8), 8);
+        wx_close(load64(&wx_fl + i * 8));
+        i = i + 1;
+    }
+    var ok = 1;
+    if (ok16 != 16) { ok = 0; }
+    if (r17 != (0 - 2)) { ok = 0; }
+    if (dt >= 20000) { ok = 0; }
+    wx_verdict(ok, "flock-full"); wx_kv("taken", ok16); wx_kv("r17", r17); wx_kv("dt", dt); wx_end();
+    return 0;
+}
+
+# P5d flock-convert: the driver takes SH; a `sh2ex` child takes SH, says 'S' through an inherited pipe (bounded 2 s),
+# then does a BLOCKING EX — which must drop the child's SH first (flock(2)). The driver waits until #99 shows the child
+# BLOCKED (state 6, bounded 2 s: it is inside that EX), and only then issues ONE EX|NB: it returns 0 iff the child's
+# SH is gone. The driver UNs; the child gets EX and exits 0.
+# ⛔ DETERMINISTIC BY HANDSHAKE (S3c fix pass, reviews A1/B2). Until then the driver polled EX|NB right after the
+# spawn: when that first poll ran before the child had taken its SH (at -smp 4 always — `after_us=23`), the driver
+# upgraded trivially, the child just queued behind it, and the conversion drop never ran — GREEN on 1.57.6 too.
+# Now: drop_own ignored (M-E4) or the #59 arm passing 0 for it (M-E4a) keeps the child's SH -> the one EX|NB is -1.
+fn ph_flock_convert() {
+    wx_phase("flock-convert");
+    var fd = wx_open("/wx/lock");
+    if (fd < 0) { wx_verdict(0, "flock-convert"); wx_out(" open"); wx_end(); return 0; }
+    if (wx_pipe(&wx_fds) != 0) { wx_close(fd); wx_verdict(0, "flock-convert"); wx_out(" pipe"); wx_end(); return 0; }
+    var rfd = load64(&wx_fds);
+    var wfd = load64(&wx_fds + 8);
+    var rsh = wx_flock(fd, 1);
+    var pid = wx_spawn("sh2ex", wfd, 0 - 1, 0 - 1);
+    var gs = 0;
+    var sb[8];
+    var ts = wx_us();
+    while (wx_us() - ts < 2000000) {                   # (1) 'S': the child holds its SH
+        var n = syscall(5, rfd, &sb, 1, 0);
+        if (n == 1) { gs = 1; break; }
+        if (n == 0) { break; }
+        wx_sleep(2);
+    }
+    var seen6 = 0;
+    var tw = wx_us();
+    while (gs == 1) {                                   # (2) the child is inside its blocking EX
+        if (wx_us() - tw >= 2000000) { break; }
+        if (wx_state(pid) == 6) { seen6 = 1; break; }
+        if (wx_state(pid) == (0 - 1)) { break; }
+        wx_sleep(2);
+    }
+    var rup = 0 - 9;
+    var t = wx_us();
+    if (seen6 == 1) { rup = wx_flock(fd, 6); }          # (3) ONE EX|NB — 0 only if the child's SH was dropped
+    var dt = wx_us() - t;
+    wx_flock(fd, 8);                                    # (4) release on every path, then reap (bounded)
+    wx_close(fd);
+    wx_close(wfd);
+    wx_close(rfd);
+    var code = wx_reap(pid);
+    var ok = 1;
+    if (rsh != 0) { ok = 0; }
+    if (gs == 0) { ok = 0; }
+    if (seen6 == 0) { ok = 0; }
+    if (rup != 0) { ok = 0; }
+    if (code != 0) { ok = 0; }
+    wx_verdict(ok, "flock-convert"); wx_kv("sh_held", gs); wx_kv("seen6", seen6); wx_kv("exnb", rup);
+    wx_kv("exnb_us", dt); wx_kv("child", code); wx_end();
+    return 0;
+}
+
+# P4f waitpid-fault: the FAULT half of the child-exit wake (review B1). A `crash` child waits until the driver is
+# BLOCKED in WAIT_BLOCK on it (#99 state 6), then takes a ring-3 #PF: fault_kill_current stores state 0 and wakes
+# WK_CHILD|ppid, so (a) #4(0x100|pid) returns 142 (128 + 14) and (b) the same through 0x1FF (any). Each must return
+# within 3 s. Mutation M-E2f (fault_kill_current's wake dropped) leaves the driver blocked for good: a hang. Runs
+# after P9 storm, whose check is "no `fault:` line in klug" — this phase writes two.
+fn ph_waitpid_fault() {
+    wx_phase("waitpid-fault");
+    var me = syscall(2, 0, 0, 0, 0);
+    var p1 = wx_spawn("crash", me, 0 - 1, 0 - 1);
+    var t1 = wx_us();
+    var r1 = syscall(4, 0x100 | p1, 0, 0, 0);
+    var d1 = wx_us() - t1;
+    if (r1 == (0 - 1)) { r1 = wx_reap(p1); }            # a kernel without WAIT_BLOCK: reap by poll, still RED
+    var p2 = wx_spawn("crash", me, 0 - 1, 0 - 1);
+    var t2 = wx_us();
+    var r2 = syscall(4, 0x1FF, 0, 0, 0);
+    var d2 = wx_us() - t2;
+    if (r2 == (0 - 1)) { r2 = wx_reap(p2); }
+    var ok = 1;
+    if (p1 < 0) { ok = 0; }
+    if (p2 < 0) { ok = 0; }
+    if (r1 != 142) { ok = 0; }
+    if (r2 != 142) { ok = 0; }
+    if (d1 >= 3000000) { ok = 0; }
+    if (d2 >= 3000000) { ok = 0; }
+    wx_verdict(ok, "waitpid-fault"); wx_kv("pid_rc", r1); wx_kv("pid_us", d1); wx_kv("any_rc", r2); wx_kv("any_us", d2);
+    wx_end();
+    return 0;
+}
+
+# P7 stress: 4 `stress 150` children increment /wx/ctr under EX on /wx/ctr.lock (read, #44, write); blocking
+# waitpid; the final value must be exactly 600 (no lost update, no lost wakeup).
+fn ph_stress() {
+    wx_phase("stress");
+    var cf = wx_open("/wx/ctr");
+    var v[8];
+    store64(&v, 0);
+    if (cf >= 0) { syscall(1, cf, &v, 8, 0); wx_close(cf); }
+    var i = 0;
+    while (i < 4) { store64(&wx_pids + i * 8, wx_spawn("stress", 150, 0 - 1, 0 - 1)); i = i + 1; }
+    var bad = 0;
+    var t = wx_us();
+    i = 0;
+    while (i < 4) {
+        var r = wx_reap_block(load64(&wx_pids + i * 8));   # the blocking reap is part of P7's contract
+        if (r != 0) { bad = bad + 1; }
+        i = i + 1;
+    }
+    var dt = wx_us() - t;
+    cf = wx_open("/wx/ctr");
+    store64(&v, 0);
+    if (cf >= 0) { syscall(5, cf, &v, 8, 0); wx_close(cf); }
+    var fin = load64(&v);
+    var ok = 1;
+    if (fin != 600) { ok = 0; }
+    if (bad != 0) { ok = 0; }
+    wx_verdict(ok, "stress"); wx_kv("final", fin); wx_kv("bad_children", bad); wx_kv("wall_us", dt); wx_end();
+    return 0;
+}
+
+# P13 ew37 — FLIPPED by S3b-F2 (it was S3c's INTERIM contract: the #37 child kept the legacy CPU-holding sleep and
+# LOCK_NB flock because it ran out of band). The #37 child is an ordinary scheduled process now, so P13 runs the
+# blocking expectations below (ph_ew37_block): its sleep BLOCKS and its flock WAITS. S3c's two issues archive on this.
+fn ph_ew37() { return ph_ew37_block("ew37 block"); }
+
+# P13 BLOCKING (S3b, docs/architecture/foreground-exec.md): the #37 child is an ordinary scheduled IF=1 process, so
+# it blocks like any other. (a) SLEEP: K = ncpu + 1 `spin t0 t1` spinners (t1 = t0 + 400 ms) around a #37 on
+# `ewsleep 400 400 95` started at t0 — the child's sleep_ms(400) must last [400, 500) ms by #95 and #37 returns 0, and
+# the spinners' summed ticks over the window must be >= 0.8 x 40 x ncpu (the child's sleep BLOCKS, it does not hold
+# its CPU) at -smp 1 AND -smp 4. (b) FLOCK: a #43 `holdlockw` helper takes EX and writes 'H'; after 'H' (bounded
+# 2 s) the driver runs #37 on `ewlockb <rfd>`: the child's EX (NB clear) must block (the helper sees it in #99 state
+# 6: blocked=1), return 0 >= 100 ms after it started and within 50 ms of the helper's unlock. `tag` names the
+# verdict line ("ew37 block"; S3b-F0 ran it as the pre-conversion mode "ew37b block", RED there by design).
+fn ph_ew37_block(tag) {
+    wx_phase(tag);
+    var k = WX_NCPU + 1;
+    var t0 = wx_us() + 50000;
+    var t1 = t0 + 400000;
+    var i = 0;
+    while (i < k) { store64(&wx_pids + i * 8, wx_spawn("spin", t0, t1, 0 - 1)); i = i + 1; }
+    wx_spinto(t0);
+    var o = wx_cat(&wx_line, 0, "/bin/waitx ewsleep 400 400 95");
+    var ra = syscall(37, &wx_line, o, 0, 0);
+    var sum = 0;
+    var bad = 0;
+    i = 0;
+    while (i < k) {
+        var r = wx_reap(load64(&wx_pids + i * 8));
+        if (r < 0) { bad = bad + 1; } else { sum = sum + r; }
+        i = i + 1;
+    }
+    var need = (80 * 40 * WX_NCPU) / 100;
+    var sa = 1;
+    if (ra != 0) { sa = 0; }
+    if (bad != 0) { sa = 0; }
+    if (sum < need) { sa = 0; }
+    # (b)
+    var lb = 0 - 9;
+    var hb = 0;
+    var blk = 0 - 9;
+    if (wx_pipe(&wx_fds) == 0) {
+        var rfd = load64(&wx_fds);
+        var wfd = load64(&wx_fds + 8);
+        var hp = wx_spawn("holdlockw", wfd, 0 - 1, 0 - 1);
+        var hbuf[8];
+        var th = wx_us();
+        while (wx_us() - th < 2000000) {
+            var n = syscall(5, rfd, &hbuf, 1, 0);
+            if (n == 1) { hb = 1; break; }
+            if (n == 0) { break; }
+            wx_sleep(2);
+        }
+        if (hb == 1) {
+            o = wx_cat(&wx_line, 0, "/bin/waitx ewlockb ");
+            o = wx_catnum(&wx_line, o, rfd);
+            lb = syscall(37, &wx_line, o, 0, 0);
+        }
+        wx_close(wfd);
+        wx_close(rfd);
+        blk = wx_reap(hp);
+    }
+    var ok = 1;
+    if (sa == 0) { ok = 0; }
+    if (hb == 0) { ok = 0; }
+    if (lb != 0) { ok = 0; }
+    if (blk != 0) { ok = 0; }
+    wx_verdict(ok, tag); wx_kv("sleep_rc", ra); wx_kv("share", sum); wx_kv("need", need); wx_kv("lock", lb);
+    var blk1 = 0;
+    if (blk == 0) { blk1 = 1; }
+    wx_kv("blocked", blk1); wx_kv("ncpu", WX_NCPU);
+    wx_end();
+    return 0;
+}
+
+# The driver's blocking read of fd 0 and its WXK-LINE line: `WXK-LINE <tag> <hex>` / `WXK-LINE <tag> EOF` (0) /
+# `WXK-LINE <tag> R<rc>` (< 0). Returns the read's result.
+fn wxk_read(tag) {
+    var r = syscall(5, 0, &wx_kb, 255, 0);
+    var ho = wx_cat(&wx_kb2, 0, "WXK-LINE ");
+    ho = wx_cat(&wx_kb2, ho, tag);
+    store8(&wx_kb2 + ho, 0);
+    wx_hexline(&wx_kb2, &wx_kb, r);
+    return r;
+}
+fn wxk_verdict(ok, tag) {
+    if (ok == 1) { wx_out("WXK-OK "); WX_PASS = WX_PASS + 1; }
+    else { wx_out("WXK-FAIL "); WX_FAIL = WX_FAIL + 1; }
+    wx_out(tag);
+    return 0;
+}
+# The NB read (a4 = 1): -2 nothing buffered, -3 a partial line is buffered here, > 0 a line.
+fn wxk_nb(p) { return syscall(5, 0, p, 255, 1); }
+# Wait until `pid` reads #99 state 6 on two samples >= 50 ms apart (it is blocked in its read); budget 3 s.
+fn wxk_settle(pid) {
+    var t = wx_us();
+    var seen = 0;
+    while (wx_us() - t < 3000000) {
+        if (wx_state(pid) == 6) {
+            if (seen == 1) { return 1; }
+            seen = 1;
+            wx_sleep(60);
+        } else {
+            seen = 0;
+            wx_sleep(10);
+        }
+    }
+    return 0;
+}
+# Poll-reap with a budget (ms) — the children are self-terminating once the harness types their line.
+fn wxk_reap(pid, ms) {
+    var t = wx_us();
+    while (wx_us() - t < ms * 1000) {
+        var r = wx_poll(pid);
+        if (r != (0 - 2)) { return r; }
+        wx_sleep(10);
+    }
+    return 0 - 998;
+}
+
+# mode `kbd` — K0..K5 (docs: scripts/harness/wait-kbd-test.py). Each phase prints `WXK-READY <k>` when the harness
+# may type, and `WXK-OK <k> ...` / `WXK-FAIL <k> ...` with its own verdict; the harness adds the line checks.
+fn ph_kbd() {
+    wx_phase("kbd");
+    # K0 warm: a blocking read that the harness answers with Enter (retried: the first key of a session is swallowed)
+    wx_out("WXK-READY k0\n");
+    var r0 = wxk_read("k0");
+    var ok0 = 0;
+    if (r0 > 0) { ok0 = 1; }
+    wxk_verdict(ok0, "k0"); wx_kv("r", r0); wx_end();
+    # K1 lines: three blocking reads (abc / Hello World with shift / x BS y), then Ctrl-D at line start -> 0
+    wx_out("WXK-READY k1\n");
+    var r1a = wxk_read("k1.0");
+    var ok1 = wx_line_is(&wx_kb, r1a, "abc");
+    var r1b = wxk_read("k1.1");
+    if (wx_line_is(&wx_kb, r1b, "Hello World") == 0) { ok1 = 0; }
+    var r1c = wxk_read("k1.2");
+    if (wx_line_is(&wx_kb, r1c, "xy") == 0) { ok1 = 0; }
+    var r1d = wxk_read("k1.3");
+    if (r1d != 0) { ok1 = 0; }
+    wxk_verdict(ok1, "k1"); wx_kv("abc", r1a); wx_kv("hello", r1b); wx_kv("xy", r1c); wx_kv("eof", r1d); wx_end();
+    # K2 yields: K = ncpu spinners over [t0, t0 + 800 ms]; the blocking read must span the window (t_ret >= t1) and
+    # every spinner must get >= 0.8 x W of its own ticks — the reader held NO CPU while it waited (M-F0: the held
+    # read -> ~0 at -smp 1).
+    var k = WX_NCPU;
+    var t0 = wx_us() + 100000;
+    var t1 = t0 + 800000;
+    var w = (t1 - t0) / 10000;
+    var need = (8 * w) / 10;
+    var i = 0;
+    while (i < k) { store64(&wx_pids + i * 8, wx_spawn("spin", t0, t1, 0 - 1)); i = i + 1; }
+    wx_out("WXK-READY k2\n");
+    var r2 = wxk_read("k2");
+    var tr = wx_us();
+    var ok2 = wx_line_is(&wx_kb, r2, "k2");
+    if (tr < t1) { ok2 = 0; }
+    var mn = 999;
+    i = 0;
+    while (i < k) {
+        var sr = wx_reap(load64(&wx_pids + i * 8));
+        if (sr < mn) { mn = sr; }
+        i = i + 1;
+    }
+    if (mn < need) { ok2 = 0; }
+    wxk_verdict(ok2, "k2"); wx_kv("min", mn); wx_kv("need", need); wx_kv("late_us", tr - t1); wx_kv("k", k); wx_end();
+    # K3 NB yields to the owner: the driver owns nothing (its NB read says -2), a `kbdblk` child blocks in its read;
+    # the driver's NB polls must then all be -2 (never data, never -3) while the harness types the child's line.
+    var r3n = wxk_nb(&wx_kb2);
+    var c3 = 0 - 1;
+    var o3 = wx_cat(&wx_line, 0, "/bin/waitx kbdblk k3 zz");
+    c3 = syscall(43, &wx_line, o3, 0, 0);
+    var s3 = wxk_settle(c3);
+    wx_out("WXK-READY k3\n");
+    var n3 = 0;
+    var bad3 = 0;
+    var cc3 = 0 - 2;
+    var tz = wx_us();
+    while (wx_us() - tz < 10000000) {
+        var rn = wxk_nb(&wx_kb2);
+        n3 = n3 + 1;
+        if (rn != (0 - 2)) { bad3 = bad3 + 1; }
+        cc3 = wx_poll(c3);
+        if (cc3 != (0 - 2)) { break; }
+        wx_yield();
+    }
+    if (cc3 == (0 - 2)) { cc3 = wxk_reap(c3, 2000); }
+    var ok3 = 1;
+    if (r3n != (0 - 2)) { ok3 = 0; }
+    if (s3 == 0) { ok3 = 0; }
+    if (bad3 != 0) { ok3 = 0; }
+    if (cc3 != 1) { ok3 = 0; }
+    wxk_verdict(ok3, "k3"); wx_kv("nb0", r3n); wx_kv("settled", s3); wx_kv("polls", n3); wx_kv("nb_not_minus2", bad3);
+    wx_kv("child", cc3); wx_end();
+    # K4 one line each: two `kbdblk` children (the second waits for the LINE, not for a key); the harness types
+    # `one\n`, then `two\n`: each child gets exactly one whole line and the two lines differ (exit codes {1, 2}).
+    o3 = wx_cat(&wx_line, 0, "/bin/waitx kbdblk k4 one two");
+    var c4a = syscall(43, &wx_line, o3, 0, 0);
+    var s4a = wxk_settle(c4a);
+    var c4b = syscall(43, &wx_line, o3, 0, 0);
+    var s4b = wxk_settle(c4b);
+    wx_out("WXK-READY k4\n");
+    var e4a = wxk_reap(c4a, 10000);
+    var e4b = wxk_reap(c4b, 10000);
+    var ok4 = 0;
+    if (e4a == 1) { if (e4b == 2) { ok4 = 1; } }
+    if (e4a == 2) { if (e4b == 1) { ok4 = 1; } }
+    if (s4a == 0) { ok4 = 0; }
+    if (s4b == 0) { ok4 = 0; }
+    wxk_verdict(ok4, "k4"); wx_kv("a", e4a); wx_kv("b", e4b); wx_kv("settled_a", s4a); wx_kv("settled_b", s4b); wx_end();
+    # K5 NB keeps a partial line: the driver NB-polls until -3 (the harness typed `ab`), then a `kbdblk` child blocks
+    # WAITING FOR THE LINE; the harness types `c\n` and the DRIVER's NB read completes `abc\n` (never split); then the
+    # harness types `d\n` and the child gets it.
+    wx_out("WXK-READY k5a\n");
+    var r5 = 0 - 2;
+    var t5 = wx_us();
+    while (wx_us() - t5 < 10000000) {
+        r5 = wxk_nb(&wx_kb2);
+        if (r5 != (0 - 2)) { break; }
+        wx_yield();
+    }
+    var got3 = 0;
+    if (r5 == (0 - 3)) { got3 = 1; }
+    o3 = wx_cat(&wx_line, 0, "/bin/waitx kbdblk k5 d");
+    var c5 = syscall(43, &wx_line, o3, 0, 0);
+    var s5 = wxk_settle(c5);
+    wx_out("WXK-READY k5b\n");
+    var r5b = 0 - 2;
+    t5 = wx_us();
+    while (wx_us() - t5 < 10000000) {
+        r5b = wxk_nb(&wx_kb2);
+        if (r5b >= 0) { break; }
+        wx_yield();
+    }
+    wx_hexline("WXK-LINE k5", &wx_kb2, r5b);
+    var nbline = wx_line_is(&wx_kb2, r5b, "abc");
+    wx_out("WXK-READY k5c\n");
+    var e5 = wxk_reap(c5, 10000);
+    var ok5 = 1;
+    if (got3 == 0) { ok5 = 0; }
+    if (s5 == 0) { ok5 = 0; }
+    if (nbline == 0) { ok5 = 0; }
+    if (e5 != 1) { ok5 = 0; }
+    wxk_verdict(ok5, "k5"); wx_kv("partial", r5); wx_kv("settled", s5); wx_kv("nb_line", r5b); wx_kv("child", e5); wx_end();
+    wx_out("WXK-DONE pass="); wx_num(WX_PASS); wx_out(" fail="); wx_num(WX_FAIL); wx_out("\n");
+    return 0;
+}
+
+fn wx_driver() {
+    wx_out("WAITX-BEGIN\n");
+    wx_mode_load();
+    wx_out("WAITX-MODE "); wx_out(&wx_mode); wx_out("\n");
+    WX_NCPU = wx_sysinfo(32);
+    if (WX_NCPU < 1) { WX_NCPU = 1; }
+    if (wx_us() == (0 - 1)) {
+        wx_verdict(0, "clock"); wx_out(" uptime_us#95 is -1 (TSC refused) — nothing timed"); wx_end();
+    } elif (wx_mode_tok("kbd") == 1) {
+        ph_kbd();                                       # S3d B2: the keyboard phases only (wait-kbd-test.py types)
+    } else {
+        # P8 FIRST: its klug witness is latched once per boot, so it must run before any other phase's waits
+        if (wx_want("migrate", "P8") == 1) { ph_migrate(); }
+        if (wx_want("sleep-basic", "P1") == 1) { ph_sleep_basic(); }
+        if (wx_want("sleep-yields", "P2") == 1) { ph_sleep_yields(); }
+        if (wx_want("share-full", "P2b") == 1) { ph_share_full(); }
+        if (wx_want("yield-parks", "P2c") == 1) { ph_yield_parks(); }
+        if (wx_want("yield-donates", "P2d") == 1) { ph_yield_donates(); }
+        if (wx_want("snd-yields", "P10") == 1) { ph_snd_yields(); }
+        if (wx_want("snd-drain", "P11") == 1) { ph_snd_drain(); }
+        if (wx_want("sleep-reap", "P3") == 1) { ph_sleep_reap(); }
+        if (wx_want("sleep-child-runs", "P3b") == 1) { ph_sleep_child_runs(); }
+        if (wx_want("waitpid-block", "P4") == 1) { ph_waitpid_block(); }
+        if (wx_want("flock-nb", "P5a") == 1) { ph_flock_nb(); }
+        if (wx_want("flock-wait", "P5b") == 1) { ph_flock_wait(); }
+        if (wx_want("flock-full", "P5c") == 1) { ph_flock_full(); }
+        if (wx_want("flock-convert", "P5d") == 1) { ph_flock_convert(); }
+        if (wx_want("yield", "P6") == 1) { ph_yield(); }
+        if (wx_want("stress", "P7") == 1) { ph_stress(); }
+        if (wx_want("storm", "P9") == 1) { ph_storm(); }
+        if (wx_want("waitpid-fault", "P4f") == 1) { ph_waitpid_fault(); }     # after P9 (see the phase)
+        if (wx_want("ew37", "P13") == 1) { ph_ew37(); }
+        if (wx_want("handoff", "P12") == 1) { ph_handoff(0); }
+        if (wx_want("handoff-parked", "P12b") == 1) { ph_handoff(1); }
+        if (wx_want("pinned-sleep", "PSLEEP") == 1) { ph_pinned_sleep(); }
+    }
+    wx_out("WAITX-DONE pass="); wx_num(WX_PASS); wx_out(" fail="); wx_num(WX_FAIL); wx_out("\n");
+    wx_out("WAITX-EXIT 0\n");
+    return 0;
+}
+
+fn main(): i64 {
+    if (argc() >= 2) { return wx_child(argv(1)); }
+    # ⛔ Only /bin/agnsh (kybernet's launch) is the driver. A child that arrives with no role must NOT re-run it.
+    if (wx_eq(argv(0), "/bin/agnsh") == 0) {
+        wx_out("WAITX-CHILD-NO-ROLE\n");
+        return 99;
+    }
+    return wx_driver();
+}
+
+fn _entry(): i64 { args_init(); var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

@@ -165,15 +165,31 @@ kstacks and IST1 already follow. Region 7 is now **full** (`gdt.cyr`'s IST1 note
 map); `smp_start_aps` allocates nothing and refuses to send INIT-SIPI unless both the identity PD entry
 and the direct-map PDPT[8] entry (the one the AP's first push actually walks) are present.
 
-The BSP is untouched — boot stack top `0x380000`, RSP0 `0x3C0000` — because its boot stack is live from
+The BSP is untouched — boot stack top `0x380000` (moved **within region 1** to `0x3A0000` at 1.57.7, see
+below), RSP0 `0x3C0000` — because its boot stack is live from
 the shim's first instruction under gnoboot's CR3, before any kernel page table (and so the direct map)
 exists; region 1 is the one window every CR3 from power-on onward maps. So the image's **only** region-1
 neighbour is the BSP boot stack, and the one invariant left is:
 
-> **`LOAD end <= 0x370000`** — the BSP boot stack's 64 KB budget. `scripts/check/image-layout-check.sh`
-> (check.sh gate 34, *"kernel image vs BSP boot stack (LOAD end <= 0x370000)"*) parses the ELF, hard-fails
-> above that, and prints the headroom (`0x11750` = 71,504 B at 1.57.3). It no longer decodes chunks or
-> counts readers — that branch is gone with the layout it described. Mutation: `p_memsz` → `0x370001` FAILs.
+> **`LOAD end <= 0x390000`** (`0x370000` until 1.57.7) — the BSP boot stack's 64 KB budget.
+> `scripts/check/image-layout-check.sh` (check.sh gate 34, *"kernel image vs BSP boot stack (LOAD end <=
+> 0x390000)"*) parses the ELF, hard-fails above that, and prints the headroom (`0x11750` = 71,504 B at 1.57.3;
+> `0x2E768` = 190,312 B at 1.57.7). It no longer decodes chunks or counts readers — that branch is gone with
+> the layout it described. Mutation: `p_memsz` → `0x370001` FAILed at 1.57.3.
+>
+> **1.57.7 (IMG step): the boot stack moved up, `0x380000` → `0x3A0000`, and the bound with it.** The 1.57.7
+> plan's image estimates left 4 B of headroom, and three flag builds the smokes boot (`RING3_SELFTEST`,
+> `EDGE_ABI_SELFTEST`, `EXEC+EXT2_WRITE+RING3`) were already past `0x370000` because only the plain image was
+> ever measured. Region 1 above the image is now: `[0x390000, 0x3A0000)` BSP boot stack · `[0x3A0000,
+> 0x3B0000)` an unused guard gap nothing references · `[0x3B0000, 0x3C0000)` BSP TSS.RSP0. The stack never
+> left region 1, so every reason above still holds; the ceiling was re-derived from a moved stack, not raised.
+> The gate also decodes `boot_shim.cyr`'s three boot-stack immediates (source) and the image's `mov rsp`
+> against its `BSP_BOOT_TOP`, and `scripts/build.sh` runs it after **every flag build** (an over-bound flag
+> image fails the build and is moved aside rather than booted). IMG-fix widened that to **every x86_64 build**
+> (a plain over-bound image WARNS and is kept for gate 34 to score; CI runs the gate after its plain build),
+> made the gate check every BSP TSS.RSP0 site against its map, and added a boot-time check that the UEFI map
+> calls `[0x390000, 0x3C0000)` free RAM (`mbi.cyr` `bootstack_window_check`; the violation line is denied by
+> the smokes). Iron: built, gated, NOT burned — the boot stack is live from the shim's first instruction.
 
 **Where an AP stack actually is** is proven at runtime, not by a static grep of the trampoline's hex:
 `SMP_STACK_SELFTEST` (`scripts/build.sh` define; `smp_stack_selftest` in `main.cyr`, run after
@@ -249,7 +265,7 @@ the OFL permits bundling with GPL-3.0 software and does not permit dropping the 
 |---|---|---|
 | boot line `kfont: /fonts/default.ttf 410820 bytes OK` | the kernel assembled and hashed the face under its own CR3 | every boot; `kprint-len-check` covers the literal lengths |
 | `scripts/smoke/kfont-smoke.sh` + `tests/kfont/kfont.cyr` — **exit 95** | a real ring-3 process, exec'd from disk, opens by name, reads all 410,820 bytes, **hashes them** (the oracle), parses the sfnt header, probes each refused flag bit, both non-names, `stat`#33 and `lstat`#102 field-for-field, the alias; a `run: exit 128+vector` arm catches a fault-killed exerciser | `scripts/sweep.sh` row "1.57.2 kernel-embedded face"; six mutants recorded in the smoke header |
-| `scripts/check/image-layout-check.sh` — check.sh gate 34 *"kernel image vs BSP boot stack (LOAD end <= 0x370000)"* | `LOAD` end ≤ `0x370000` — the image stays under the BSP boot stack, the only region-1 neighbour left (1.57.3; the 1.57.2 chunk-decode / single-reader branch is gone) | mutation-tested (`p_memsz` past `0x370000`); prints the headroom |
+| `scripts/check/image-layout-check.sh` — check.sh gate 34 *"kernel image vs BSP boot stack (LOAD end <= 0x390000)"*; `scripts/build.sh` after every x86_64 build (1.57.7; fatal for flag builds) and CI | `LOAD` end ≤ `0x390000` (`0x370000` until 1.57.7) — the image stays under the BSP boot stack, the only region-1 neighbour left (1.57.3; the 1.57.2 chunk-decode / single-reader branch is gone); the three shim immediates and the image's `mov rsp` equal the gate's `BSP_BOOT_TOP` (1.57.7) | mutation-tested (1.57.3: `p_memsz` past the bound; 1.57.7: M1 plain pad, M2 flag pad (re-run on the shipped guard at IMG-fix), M3 each immediate, A4 an RSP0 site — script header); prints the headroom |
 | `scripts/smoke/ap-stack-smoke.sh` + `SMP_STACK_SELFTEST` — **-smp 4** | each AP's live RSP in the region-7 direct-map window, each AP's TSS.RSP0 equal to the trampoline's top, the rekha chunk literals hash-intact **in place** after the wake, `smp: cpus online: 4`, kybernet | `scripts/sweep.sh` row "1.57.3 AP stacks in region 7"; two mutants in the smoke header (1.57.2 placement; `gdt.cyr`-only revert) |
 | `binary size` / `x86 size reasonable` | kernel-minus-face under the unchanged 2 MiB grant | check.sh / test.sh, lockstep |
 

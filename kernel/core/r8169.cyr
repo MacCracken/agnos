@@ -523,8 +523,13 @@ fn r8169_init_rx() {
     # S10 contract — every DMA region is declared before any device
     # read/write touches it. The NIC reads descriptors out of this ring.
     iommu_register_dma(r8169_rx_ring_phys);
+    # 1.57.7 (S4, N-6): every CPU access to a pmm page goes through net_dma_kva (the direct-map alias) —
+    # an identity VA of a pmm page can be shadowed by a ring-3 PT_LOAD under that process's CR3, and the
+    # ISR drain / ISR-time TX touch these pages under whatever CR3 is live. Registers and descriptor
+    # address FIELDS keep phys.
+    var rxr_kva = net_dma_kva(r8169_rx_ring_phys);
     for (var i = 0; i < 4096; i = i + 1) {
-        store8(r8169_rx_ring_phys + i, 0);
+        store8(rxr_kva + i, 0);
     }
 
     for (var i = 0; i < R8169_RX_RING_SIZE; i = i + 1) {
@@ -536,7 +541,7 @@ fn r8169_init_rx() {
         iommu_register_dma(buf);
         store64(&r8169_rx_bufs + i * 8, buf);
 
-        var desc = r8169_rx_ring_phys + i * 16;
+        var desc = rxr_kva + i * 16;
         # cmdstat = OWN | BUF_SIZE (length field = how much room is here).
         # EOR set on the last slot so the NIC wraps to slot 0.
         var status = R8169_DESC_OWN | 2048;
@@ -584,8 +589,9 @@ fn r8169_init_tx() {
     # S10 contract — declared before the chip's first descriptor fetch,
     # which the TX list addr write below (step 4) arms.
     iommu_register_dma(r8169_tx_ring_phys);
+    var txr_kva = net_dma_kva(r8169_tx_ring_phys);      # 1.57.7 (S4, N-6): CPU pointer = direct map
     for (var i = 0; i < 4096; i = i + 1) {
-        store8(r8169_tx_ring_phys + i, 0);
+        store8(txr_kva + i, 0);
     }
 
     for (var i = 0; i < 16; i = i + 1) {
@@ -597,7 +603,7 @@ fn r8169_init_tx() {
         iommu_register_dma(buf);
         store64(&r8169_tx_bufs + i * 8, buf);
 
-        var desc = r8169_tx_ring_phys + i * 16;
+        var desc = txr_kva + i * 16;
         var status = 0;
         if (i == 15) { status = R8169_DESC_EOR; }
         store32(desc + 0,  status);
@@ -921,7 +927,7 @@ fn r8169_rx_restart() {
     # resync our index — the chip resumes at slot 0 when RE is raised again.
     var i = 0;
     while (i < R8169_RX_RING_SIZE) {
-        r8169_rx_rearm(r8169_rx_ring_phys + i * 16);
+        r8169_rx_rearm(net_dma_kva(r8169_rx_ring_phys) + i * 16);   # 1.57.7 (S4, N-6)
         i = i + 1;
     }
     r8169_rx_idx = 0;
@@ -951,7 +957,7 @@ fn r8169_poll(buf, maxlen) {
     while (budget > 0) {
         budget = budget - 1;
 
-        var desc = r8169_rx_ring_phys + r8169_rx_idx * 16;
+        var desc = net_dma_kva(r8169_rx_ring_phys) + r8169_rx_idx * 16;   # 1.57.7 (S4, N-6)
         var status = load32(desc);
         if ((status & R8169_DESC_OWN) != 0) { return 0; }
 
@@ -979,7 +985,7 @@ fn r8169_poll(buf, maxlen) {
         if (pkt_len >= 4) { pkt_len = pkt_len - 4; }
         if (pkt_len > maxlen) { pkt_len = maxlen; }
 
-        var bufaddr = load64(&r8169_rx_bufs + r8169_rx_idx * 8);
+        var bufaddr = net_dma_kva(load64(&r8169_rx_bufs + r8169_rx_idx * 8));
         for (var i = 0; i < pkt_len; i = i + 1) {
             store8(buf + i, load8(bufaddr + i));
         }
@@ -1005,11 +1011,11 @@ fn r8169_send(buf, len) {
     if (r8169_tx_ring_phys == 0) { return 0 - 1; }
     if (len > 2048) { len = 2048; }
 
-    var desc = r8169_tx_ring_phys + r8169_tx_idx * 16;
+    var desc = net_dma_kva(r8169_tx_ring_phys) + r8169_tx_idx * 16;   # 1.57.7 (S4, N-6)
     var status = load32(desc);
     if ((status & R8169_DESC_OWN) != 0) { return 0 - 1; }   # ring full
 
-    var bufaddr = load64(&r8169_tx_bufs + r8169_tx_idx * 8);
+    var bufaddr = net_dma_kva(load64(&r8169_tx_bufs + r8169_tx_idx * 8));
     for (var i = 0; i < len; i = i + 1) {
         store8(bufaddr + i, load8(buf + i));
     }
@@ -1062,7 +1068,7 @@ fn r8169_dump_stats() {
 
     # Zero the dump buffer so a chip stall leaves us with zeros not stale data.
     for (var i = 0; i < 64; i = i + 1) {
-        store8(r8169_stats_phys + i, 0);
+        store8(net_dma_kva(r8169_stats_phys) + i, 0);   # 1.57.7 (S4, N-6)
     }
 
     var addr_lo = r8169_stats_phys & 0xFFFFFFFF;
@@ -1085,7 +1091,7 @@ fn r8169_print_stats() {
         kprintln("r8169: stats dump timeout", 25);
         return 0 - 1;
     }
-    var sb = r8169_stats_phys;
+    var sb = net_dma_kva(r8169_stats_phys);             # 1.57.7 (S4, N-6)
     kprint("r8169: tx_ok=", 13);
     kprint_num(load64(sb + 0x00));
     kprint(" rx_ok=", 7);
@@ -1159,6 +1165,25 @@ var net_tx_bytes   = 0;   # their total length
 var net_rx_packets = 0;   # frames taken off the wire
 var net_rx_bytes   = 0;   # their total length
 
+# 1.57.7 (S4) — net lock WITNESSES + the lock-free diagnostic latch. Declared HERE, above nic_send, because
+# r8169.cyr is included before net.cyr (module vars must precede their first use). net_tx_inside is the
+# net_tx_lock holder count kept by net_tx_begin/end (net.cyr); tcp_tab_inside lives in net_tcp.cyr. They are
+# BEST-EFFORT (plain RMWs): with a working lock the holder always sees exactly 1 and they never fire; a frame
+# built outside its lock is caught deterministically at -smp 1; a cross-CPU overlap only when the counters
+# interleave. Both lines are SMOKE_INVARIANT_DENY patterns (scripts/smoke/lib/qemu-dwell.sh).
+var net_tx_inside = 0;
+var net_lk_said = 0;
+# Print once per bit, lock-free (klug_append + serial_println, the sched.cyr kstack_check_entry pattern): it
+# runs under net locks at IF=0, where kprint (console_lock) is forbidden.
+fn net_lk_latch(nl_bit, nl_msg, nl_len) {
+    if ((net_lk_said & nl_bit) == 0) {
+        net_lk_said = net_lk_said | nl_bit;
+        klug_append(nl_msg, nl_len); klug_putc(10);
+        serial_println(nl_msg, nl_len);
+    }
+    return 0;
+}
+
 fn nic_ready() {
     if (r8169_present != 0) {
         if (r8169_tx_ring_phys != 0) { return 1; }
@@ -1167,7 +1192,10 @@ fn nic_ready() {
     return 0;
 }
 
+# Called only under net_tx_lock (net_tx_begin/end — 1.57.7 S4): the lock serialises net_pkt, the driver's
+# TX ring/index and the counters below across every CPU and the ISR drain.
 fn nic_send(buf, len) {
+    if (net_tx_inside != 1) { net_lk_latch(2, "net: lock missing - frame sent without net_tx_lock", 50); }
     # ⚠ COUNT ONLY WHAT THE DRIVER ACCEPTED. Both send paths return <0 on refusal (ring full, no link),
     # and counting a refused frame would make tx_packets drift above what the wire ever carried — the
     # one thing a rate line must not do.

@@ -306,6 +306,16 @@ fn test_syscall() {
     # close invalid fd
     var cn = ksyscall(6, 99, 0, 0);
     test_assert_eq(cn, 0 - 1, "close(99) = -1", 14);
+    # 1.57.7 (S5): #56's address-class decode and #106's packing (pure functions).
+    test_assert_eq(sock_listen_decode(7070), 7070, "sock_listen_decode(7070)", 24);
+    test_assert_eq(sock_listen_decode(7070 | (1 << 32)), 0x10000 | 7070, "decode(7070|1<<32) = LOOPBACK", 29);
+    test_assert_eq(sock_listen_decode(7070 | (1 << 16)), 0 - 1, "decode(bit 16) = -1", 19);
+    test_assert_eq(sock_listen_decode(0x100000000), 0 - 1, "decode(class 1, port 0) = -1", 28);
+    test_assert_eq(sock_listen_decode(7070 | (2 << 32)), 0 - 1, "decode(class 2) = -1", 20);
+    test_assert_eq(sock_listen_decode(7070 | (1 << 40)), 0 - 1, "decode(bit 40) = -1", 19);
+    test_assert_eq(sock_listen_decode(0), 0 - 1, "decode(0) = -1", 14);
+    test_assert_eq(sock_listen_decode(0 - 1), 0 - 1, "decode(-1) = -1", 15);
+    test_assert_eq(tcp_peer_pack(0x7F000001, 7072), 0x7F0000011BA0, "tcp_peer_pack(127.0.0.1, 7072)", 30);
 
     # open + read + close via initrd
     var fd = ksyscall(7, "hello.txt", 9, 0);
@@ -446,6 +456,315 @@ fn test_initrd() {
     return 0;
 }
 
+# ═══════════════ 1.57.7 (S7) — ktest [lifecycle] (docs/architecture/process-lifecycle.md) ═══════════════
+# The pure decision rows (wstat, authority, desc_walk, zombie_pred, the lc_* tables) with synthetic inputs, the kill#16
+# arm's argument validation from kmain (init), the atomics, the unborn-slot release, the birth check through
+# proc_create_user's real call site (T-L10), the klug lock's bound, the deferred spill, and the raw-disk arm owner.
+# T-L2 / T-L7 carry the retired PPID_SELFTEST's assertions (a hand-run gate is not a gate).
+fn tl_row3(tp, tpe, i, p, pe) { store64(tp + i * 8, p); store64(tpe + i * 8, pe); return 0; }
+# 1.57.7 (S8): [limits] — K1 lim_eff, K2 spawn_limits#107 validation + cells, K3 elf_load_pages, K4 the footprint walk
+# over a synthetic address space (low + high arena, two PDPT entries), K5 ptw_pt_ok. (K6 = T-L1 wstat(152,24)=280.)
+fn tk_ph(ph, i, ty, va, msz) {
+    var tp_p = ph + i * 56;
+    memset(tp_p, 0, 56);
+    store32(tp_p, ty);
+    store64(tp_p + 16, va);
+    store64(tp_p + 40, msz);
+    return 0;
+}
+fn tk_arm(k2, a, b, want, m, c, name, nlen) {
+    var ka_r = ksyscall(107, a, b, 0);
+    var ka_ok = 0;
+    if (ka_r == want) { if (load64(&proc_arm_mem + k2 * 8) == m) { if (load64(&proc_arm_cpu + k2 * 8) == c) { ka_ok = 1; } } }
+    test_assert(ka_ok, name, nlen);
+    return 0;
+}
+fn test_limits() {
+    serial_println("[limits]", 8);
+    test_assert_eq(lim_eff(0, 0), 0, "K1 lim_eff(0,0)=0", 17);
+    test_assert_eq(lim_eff(0, 5), 5, "K1 lim_eff(0,5)=5", 17);
+    test_assert_eq(lim_eff(7, 0), 7, "K1 lim_eff(7,0)=7", 17);
+    test_assert_eq(lim_eff(7, 5), 5, "K1 lim_eff(7,5)=5", 17);
+    test_assert_eq(lim_eff(5, 7), 5, "K1 lim_eff(5,7)=5 (an arm only lowers)", 38);
+    var k2 = proc_current_get();
+    lim_arm_clear(k2);
+    tk_arm(k2, 512, 0, 0, 512, 0, "K2 arm (512,0) -> 0", 19);
+    tk_arm(k2, 0 - 1, 0, 0 - 1, 512, 0, "K2 (-1,0) refused, arm unchanged", 32);
+    tk_arm(k2, 0, 0 - 1, 0 - 1, 512, 0, "K2 (0,-1) refused, arm unchanged", 32);
+    tk_arm(k2, 0x1000000001, 0, 0 - 1, 512, 0, "K2 (2^36+1,0) refused", 21);
+    tk_arm(k2, 0, 0x10000000001, 0 - 1, 512, 0, "K2 (0,2^40+1) refused", 21);
+    tk_arm(k2, 512, 1, 0, 512, 1, "K2 (512,1) -> cells 512/1", 25);
+    tk_arm(k2, 0, 10, 0, 0, 1, "K2 (0,10) -> cells 0/1 (replaces both)", 38);
+    tk_arm(k2, 0, 11, 0, 0, 2, "K2 (0,11) -> 2 ticks (ceil)", 27);
+    tk_arm(k2, 0x1000000000, 0x10000000000, 0, 0x1000000000, 0x199999999A, "K2 (2^36,2^40) accepted", 23);
+    tk_arm(k2, 0, 0, 0, 0, 0, "K2 (0,0) disarms", 16);
+    lim_arm_clear(k2);
+    var ph[512];                                   # 512 BYTES: up to 9 phdrs of 56
+    tk_ph(&ph, 0, 1, 0x400000, 0x1000);
+    test_assert_eq(elf_load_pages(&ph, 1, 56), 1, "K3 one page", 11);
+    tk_ph(&ph, 1, 1, 0x800000, 0x3000);
+    test_assert_eq(elf_load_pages(&ph, 2, 56), 2, "K3 text + data -> 2", 19);
+    tk_ph(&ph, 0, 1, 0x5FF000, 0x2000);
+    test_assert_eq(elf_load_pages(&ph, 1, 56), 2, "K3 straddling segment -> 2", 26);
+    tk_ph(&ph, 0, 1, 0x400000, 0);
+    test_assert_eq(elf_load_pages(&ph, 1, 56), 0, "K3 aligned memsz 0 -> 0", 23);
+    tk_ph(&ph, 0, 1, 0x400800, 0);
+    test_assert_eq(elf_load_pages(&ph, 1, 56), 1, "K3 unaligned memsz 0 -> 1", 25);
+    tk_ph(&ph, 0, 0, 0x400000, 0x1000);
+    tk_ph(&ph, 1, 1, 0x400000, 0x1000);
+    test_assert_eq(elf_load_pages(&ph, 2, 56), 1, "K3 PT_NULL ignored", 18);
+    tk_ph(&ph, 0, 1, 0x400000, 0x1000);
+    tk_ph(&ph, 1, 1, 0x401000, 0x1000);
+    test_assert_eq(elf_load_pages(&ph, 2, 56), 0 - 1, "K3 two segments in one page -> -1", 33);
+    tk_ph(&ph, 0, 1, 0x400000, 0xBB);
+    tk_ph(&ph, 1, 1, 0x401000, 0x1000);
+    test_assert_eq(elf_load_pages(&ph, 2, 56), 0 - 1, "K3 ovl phdrs -> -1", 18);
+    tk_ph(&ph, 1, 1, 0x600000, 0x1000);
+    test_assert_eq(elf_load_pages(&ph, 2, 56), 2, "K3 ovlok phdrs -> 2", 19);
+    test_assert_eq(ptw_pt_ok(0x400000), 1, "K5 ptw_pt_ok(0x400000)=1", 24);
+    test_assert_eq(ptw_pt_ok(0x3FF000), 0, "K5 ptw_pt_ok(0x3FF000)=0", 24);
+    test_assert_eq(ptw_pt_ok(0xFFFF000), 1, "K5 ptw_pt_ok(0xFFFF000)=1", 25);
+    test_assert_eq(ptw_pt_ok(0x10000000), 0, "K5 ptw_pt_ok(0x10000000)=0", 26);
+    test_assert_eq(ptw_pt_ok(0x400800), 0, "K5 ptw_pt_ok(0x400800)=0", 24);
+    test_assert_eq(ptw_pt_ok(0), 0, "K5 ptw_pt_ok(0)=0", 17);
+    test_assert_eq(ptw_pt_ok(0 - 4096), 0, "K5 ptw_pt_ok(-4096)=0", 21);
+    # K4 — needs 5 frames + page tables; too little RAM is a FAILURE, never a pass.
+    if (pmm_count_2mb_free() < 6) { test_assert(0, "K4 SKIP: < 6 free 2 MB pages", 28); return 0; }
+    var k4_f2 = pmm_count_2mb_free();
+    var k4_f4 = pmm_free_count();
+    var k4_cr3 = proc_create_address_space();
+    if (k4_cr3 == 0) { test_assert(0, "K4 address space", 16); return 0; }
+    var k4_hf = himmap_floor();
+    var k4_ok = 1;
+    if (proc_map_page_nx(k4_cr3, 0x10000000, pmm_alloc_2mb()) != 0) { k4_ok = 0; }
+    if (proc_map_page_nx(k4_cr3, 0x10200000, pmm_alloc_2mb()) != 0) { k4_ok = 0; }
+    if (proc_map_page_hi(k4_cr3, k4_hf, pmm_alloc_2mb()) != 0) { k4_ok = 0; }
+    if (proc_map_page_hi(k4_cr3, k4_hf + 0x200000, pmm_alloc_2mb()) != 0) { k4_ok = 0; }
+    if (proc_map_page_hi(k4_cr3, k4_hf + 0x40000000, pmm_alloc_2mb()) != 0) { k4_ok = 0; }
+    test_assert(k4_ok, "K4 five pages mapped", 20);
+    test_assert_eq(proc_user_pages_cr3(k4_cr3), 5 * 512, "K4 footprint = 5 x 512 (2 low + 3 high, 2 PDPTEs)", 49);
+    test_assert_eq(proc_va_present_2mb(k4_cr3, 0x10200000), 1, "K4 low page present", 19);
+    test_assert_eq(proc_va_present_2mb(k4_cr3, 0x10400000), 0, "K4 next low page absent", 23);
+    test_assert_eq(proc_va_present_2mb(k4_cr3, k4_hf + 0x40000000), 1, "K4 high page present", 20);
+    test_assert_eq(proc_va_present_2mb(k4_cr3, k4_hf + 0x80000000), 0, "K4 absent PDPT entry -> 0", 25);
+    test_assert_eq(proc_user_pages_cr3(0x1000), 0, "K4 boot cr3 -> 0", 16);
+    proc_free_address_space(k4_cr3);
+    test_assert_eq(pmm_count_2mb_free(), k4_f2, "K4 2 MB pages restored", 22);
+    test_assert_eq(pmm_free_count(), k4_f4, "K4 4 KB pages restored", 22);
+    return 0;
+}
+
+fn test_lifecycle() {
+    serial_println("[lifecycle]", 11);
+    test_assert_eq(wstat_encode(0, 0), 0, "T-L1 wstat(0,0)=0", 17);
+    test_assert_eq(wstat_encode(7, 0), 7, "T-L1 wstat(7,0)=7", 17);
+    test_assert_eq(wstat_encode(265, 0), 9, "T-L1 wstat(265,0)=9", 19);
+    test_assert_eq(wstat_encode(0 - 2, 0), 254, "T-L1 wstat(0-2,0)=254", 21);
+    test_assert_eq(wstat_encode(0 - 1, 0), 255, "T-L1 wstat(0-1,0)=255", 21);
+    test_assert_eq(wstat_encode(142, 0), 142, "T-L1 wstat(142,0)=142", 21);
+    test_assert_eq(wstat_encode(256, 0), 0, "T-L1 wstat(256,0)=0", 19);
+    test_assert_eq(wstat_encode(137, 9), 265, "T-L1 wstat(137,9)=265", 21);
+    test_assert_eq(wstat_encode(152, 24), 280, "T-L1 wstat(152,24)=280", 22);
+    test_assert(sig_auth_ok(0, 5, 3, 1, 9) == 1, "T-L2 init signals anyone", 24);
+    test_assert(sig_auth_ok(4, 0, 0, 0, 1) == 0, "T-L2 non-init never signals 0", 29);
+    test_assert(sig_auth_ok(4, 4, 2, 1, 1) == 1, "T-L2 self", 9);
+    test_assert(sig_auth_ok(3, 5, 3, 7, 7) == 1, "T-L2 child with matching epoch", 30);
+    test_assert(sig_auth_ok(3, 5, 3, 6, 7) == 0, "T-L2 child with STALE epoch refused", 35);
+    test_assert(sig_auth_ok(2, 5, 3, 7, 7) == 0, "T-L2 stranger refused", 21);
+    test_assert(reap_auth_ok(0, 3, 7, 9) == 1, "T-L2 init reaps anyone", 22);
+    test_assert(reap_auth_ok(3, 3, 7, 7) == 1, "T-L2 parent reaps child", 23);
+    test_assert(reap_auth_ok(3, 3, 6, 7) == 0, "T-L2 stale-epoch reap refused", 29);
+    test_assert(reap_auth_ok(2, 3, 7, 7) == 0, "T-L2 stranger reap refused", 26);
+    var tp[128];
+    var tpe[128];
+    var te[128];
+    var tl_i = 0;
+    while (tl_i < 16) { store64(&te + tl_i * 8, 100 + tl_i); store64(&tp + tl_i * 8, 0); store64(&tpe + tl_i * 8, 100); tl_i = tl_i + 1; }
+    tl_row3(&tp, &tpe, 1, 0, 100);
+    tl_row3(&tp, &tpe, 3, 1, 101);
+    tl_row3(&tp, &tpe, 4, 3, 103);
+    tl_row3(&tp, &tpe, 5, 4, 104);
+    tl_row3(&tp, &tpe, 6, 6, 106);
+    tl_row3(&tp, &tpe, 7, 0, 100);
+    tl_row3(&tp, &tpe, 8, 9, 109);
+    tl_row3(&tp, &tpe, 9, 8, 108);
+    test_assert_eq(desc_walk(4, 3, &tp, &tpe, &te, 16), 1, "T-L3 child 4 of root 3", 22);
+    test_assert_eq(desc_walk(5, 3, &tp, &tpe, &te, 16), 1, "T-L3 grandchild 5 (dead intermediate links)", 43);
+    store64(&tpe + 4 * 8, 999);
+    test_assert_eq(desc_walk(5, 3, &tp, &tpe, &te, 16), 0, "T-L3 stale link refused", 23);
+    store64(&tpe + 4 * 8, 103);
+    test_assert_eq(desc_walk(6, 3, &tp, &tpe, &te, 16), 0, "T-L3 self-parent refused", 24);
+    test_assert_eq(desc_walk(7, 3, &tp, &tpe, &te, 16), 0, "T-L3 ppid 0 never meets root", 28);
+    test_assert_eq(desc_walk(3, 3, &tp, &tpe, &te, 16), 0, "T-L3 q == root is 0", 19);
+    test_assert_eq(desc_walk(8, 3, &tp, &tpe, &te, 16), 0, "T-L3 2-cycle terminates 0", 25);
+    test_assert_eq(chan_pty_desc_pure(3, 3, &tp, &tpe, &te, 16), 1, "T-L11 owner itself", 18);
+    test_assert_eq(chan_pty_desc_pure(3, 5, &tp, &tpe, &te, 16), 1, "T-L11 grandchild with valid links", 33);
+    store64(&tpe + 5 * 8, 999);
+    test_assert_eq(chan_pty_desc_pure(3, 5, &tp, &tpe, &te, 16), 0, "T-L11 stale link refused", 24);
+    store64(&tpe + 5 * 8, 104);
+    test_assert_eq(chan_pty_desc_pure(4, 3, &tp, &tpe, &te, 16), 0, "T-L11 swapped owner/cur refused", 31);
+    var tl_s0 = load64(&proc_signals);
+    test_assert_eq(ksyscall(16, 0, 0, 0), 0, "T-L4 kill(0,0) probe = 0", 24);
+    test_assert_eq(load64(&proc_signals), tl_s0, "T-L4 probe sets no bit", 22);
+    test_assert_eq(ksyscall(16, 0, 0x209, 0), 0 - 1, "T-L4 kill(0,0x209) = -1", 23);
+    test_assert_eq(ksyscall(16, 0, 64, 0), 0 - 1, "T-L4 kill(0,64) = -1", 20);
+    test_assert_eq(ksyscall(16, 0, 0 - 1, 0), 0 - 1, "T-L4 kill(0,-1) = -1", 20);
+    test_assert_eq(ksyscall(16, proc_count, 9, 0), 0 - 1, "T-L4 kill(proc_count,9) = -1", 28);
+    test_assert_eq(ksyscall(16, 0, 10, 0), 0, "T-L4 kill(0,10) = 0", 19);
+    test_assert((load64(&proc_signals) & (1 << 10)) != 0, "T-L4 bit 10 set", 15);
+    atomic_and64(&proc_signals, 0 - 1 - (1 << 10));
+    test_assert_eq(ksyscall(16, 0, 9, 0), 0 - 1, "T-L4 kill(0,9) = -1 (not a user process)", 40);
+    test_assert_eq(ksyscall(16, 0, 9 | 0x100, 0), 0 - 1, "T-L4 kill(0,9|TREE) = -1", 24);
+    test_assert_eq(ksyscall(16, 0, 19, 0), 0 - 1, "T-L4 kill(0,19) = -1", 20);
+    test_assert_eq(ksyscall(16, 0, 18, 0), 0 - 1, "T-L4 kill(0,18) = -1", 20);
+    test_assert_eq(proc_is_user(0), 0, "T-L5 kmain is not a user process", 32);
+    test_assert_eq(proc_stoppable(0), 0, "T-L5 kmain is not stoppable", 27);
+    test_assert_eq(proc_is_user(proc_count), 0, "T-L5 proc_is_user(proc_count) = 0", 33);
+    test_assert_eq(proc_parent_live(proc_count), 0, "T-L5 proc_parent_live(proc_count) = 0", 37);
+    test_assert_eq(zombie_pred(0, 3, 1, 0), 1, "T-L6 live-parent zombie", 23);
+    test_assert_eq(zombie_pred(0, 3, 0, 0), 0, "T-L6 parent gone (dead/recycled/done) -> not a zombie", 53);
+    test_assert_eq(zombie_pred(2, 3, 1, 0), 0, "T-L6 alive child is not a zombie", 32);
+    test_assert_eq(zombie_pred(0, 0, 1, 1), 1, "T-L6 kmain fg child is a zombie", 31);
+    test_assert_eq(zombie_pred(0, 0, 1, 0), 0, "T-L6 reaped slot is not a zombie", 32);
+    test_assert_eq(lc_parent_live(3, 8, 0, 5, 5, 0), 0, "T-L6 parent_live: dead parent gone", 34);
+    test_assert_eq(lc_parent_live(3, 8, 2, 5, 5, 1), 0, "T-L6 parent_live: done parent gone", 34);
+    test_assert_eq(proc_get_ppid(proc_count), 0 - 1, "T-L7 proc_get_ppid(proc_count) = -1", 35);
+    if (proc_count < 16) {
+        var tl7_f = kbd_irq_save();
+        var tl7_r = proc_count;
+        var tl7_c = load64(&proc_on_cpu + tl7_r * 8);
+        store64(&proc_on_cpu + tl7_r * 8, pcpu_cpu());
+        proc_reap_off_cpu_fence(tl7_r);
+        var tl7_ok = 0;
+        if (on_cpu_get(tl7_r) == (0 - 1)) { tl7_ok = 1; }
+        store64(&proc_on_cpu + tl7_r * 8, tl7_c);
+        kbd_irq_restore(tl7_f);
+        test_assert(tl7_ok == 1, "T-L7 reap fence self-owned fast path", 36);
+    }
+    var tl8[8];
+    store64(&tl8, 0x5);
+    atomic_or64(&tl8, 0x100);
+    test_assert_eq(load64(&tl8), 0x105, "T-L8 atomic_or64 sets, keeps the rest", 37);
+    atomic_and64(&tl8, 0 - 1 - 1);
+    test_assert_eq(load64(&tl8), 0x104, "T-L8 atomic_and64 clears, keeps the rest", 40);
+    var tl9 = proc_alloc_slot();
+    if (tl9 >= 0) {
+        store64(&proc_ppid + tl9 * 8, 3);
+        store64(&proc_ppid_epoch + tl9 * 8, 7);
+        store64(&proc_kill_pending + tl9 * 8, 9);
+        store64(&proc_stop_pending + tl9 * 8, 1);
+        var tl9_pc = proc_count;
+        proc_slot_release_unborn(tl9);
+        var tl9_ok = 1;
+        if (load64(&proc_table + tl9 * 176 + 8) != 0) { tl9_ok = 0; }
+        if (load64(&proc_ppid + tl9 * 8) != 0) { tl9_ok = 0; }
+        if (load64(&proc_ppid_epoch + tl9 * 8) != 0) { tl9_ok = 0; }
+        if (load64(&proc_kill_pending + tl9 * 8) != 0) { tl9_ok = 0; }
+        if (load64(&proc_stop_pending + tl9 * 8) != 0) { tl9_ok = 0; }
+        if (load64(&proc_table + tl9 * 176 + 160) != 0x1000) { tl9_ok = 0; }
+        if (tl9 < proc_count) {
+            if (proc_is_zombie(tl9) != 0) { tl9_ok = 0; }
+        }
+        if (proc_slot_reusable(tl9) != 1) { tl9_ok = 0; }
+        test_assert(tl9_ok == 1, "T-L9 release_unborn clears the whole row", 40);
+    }
+    var tl10_pc = proc_count;
+    var tl10_f = kbd_irq_save();
+    sched_spin_lock(); store64(&proc_kill_pending, 9); sched_spin_unlock();
+    var tl10_r = proc_create_user(0, 0);
+    sched_spin_lock(); store64(&proc_kill_pending, 0); sched_spin_unlock();
+    var tl10_three = 0;
+    var tl10_i = 0;
+    while (tl10_i < proc_count) { if (load64(&proc_table + tl10_i * 176 + 8) == 3) { tl10_three = tl10_three + 1; } tl10_i = tl10_i + 1; }
+    kbd_irq_restore(tl10_f);
+    test_assert_eq(tl10_r, 0 - 1, "T-L10 a creator with a pending kill creates no child", 52);
+    test_assert_eq(tl10_three, 0, "T-L10 no CLAIMING slot left behind", 34);
+    test_assert_eq(proc_count, tl10_pc, "T-L10 proc_count restored", 25);
+    var tl10b_f = kbd_irq_save();
+    sched_spin_lock(); store64(&proc_stop_pending, 2); sched_spin_unlock();
+    var tl10b = proc_create_user(0, 0);
+    sched_spin_lock(); store64(&proc_stop_pending, 0); sched_spin_unlock();
+    var tl10b_sp = 0 - 1;
+    if (tl10b >= 0) { tl10b_sp = load64(&proc_stop_pending + tl10b * 8); proc_destroy_fd_table(tl10b, 0); proc_slot_release_unborn(tl10b); }
+    sched_spin_lock(); store64(&proc_stop_pending, 1); sched_spin_unlock();
+    var tl10c = proc_create_user(0, 0);
+    sched_spin_lock(); store64(&proc_stop_pending, 0); sched_spin_unlock();
+    var tl10c_sp = 0 - 1;
+    if (tl10c >= 0) { tl10c_sp = load64(&proc_stop_pending + tl10c * 8); proc_destroy_fd_table(tl10c, 0); proc_slot_release_unborn(tl10c); }
+    kbd_irq_restore(tl10b_f);
+    test_assert_eq(tl10b_sp, 2, "T-L10b a tree-stopped creator bears a stop-pending child", 56);
+    test_assert_eq(tl10c_sp, 0, "T-L10b a direct stop is not inherited", 37);
+    test_assert_eq(lc_kill_action(0, 1, 1), 0, "T-L12 kill st0 NOOP", 19);
+    test_assert_eq(lc_kill_action(4, 1, 1), 0, "T-L12 kill st4 NOOP", 19);
+    test_assert_eq(lc_kill_action(3, 0, 0), 1, "T-L12 kill birth MARK", 21);
+    test_assert_eq(lc_kill_action(2, 0, 0), 0 - 1, "T-L12 kill non-user REFUSE", 26);
+    test_assert_eq(lc_kill_action(1, 1, 1), 2, "T-L12 kill claimable CLAIM", 26);
+    test_assert_eq(lc_kill_action(5, 1, 0), 3, "T-L12 kill st5 not claimable WAKE_KICK", 38);
+    test_assert_eq(lc_kill_action(6, 1, 0), 4, "T-L12 kill blocked INTERRUPT", 28);
+    test_assert_eq(lc_kill_action(2, 1, 0), 5, "T-L12 kill running KICK", 23);
+    test_assert_eq(lc_stop_action(0, 1, 0, 1, 1, 1), 0, "T-L12 stop st0 NOOP", 19);
+    test_assert_eq(lc_stop_action(1, 1, 9, 1, 1, 1), 0, "T-L12 stop with kp pending NOOP", 31);
+    test_assert_eq(lc_stop_action(3, 1, 0, 1, 1, 0), 6, "T-L12 stop birth PEND_BIRTH", 27);
+    test_assert_eq(lc_stop_action(1, 0, 0, 1, 1, 1), 0 - 1, "T-L12 stop non-user REFUSE", 26);
+    test_assert_eq(lc_stop_action(1, 1, 0, 0, 1, 1), 0 - 1, "T-L12 stop unstoppable REFUSE", 29);
+    test_assert_eq(lc_stop_action(1, 1, 0, 1, 0, 1), 0 - 1, "T-L12 stop no live parent REFUSE", 32);
+    test_assert_eq(lc_stop_action(5, 1, 0, 1, 1, 1), 0, "T-L12 stop st5 NOOP", 19);
+    test_assert_eq(lc_stop_action(1, 1, 0, 1, 1, 1), 2, "T-L12 stop claimable CLAIM_STOP", 31);
+    test_assert_eq(lc_stop_action(6, 1, 0, 1, 1, 0), 4, "T-L12 stop blocked PEND_INTERRUPT", 33);
+    test_assert_eq(lc_stop_action(2, 1, 0, 1, 1, 0), 5, "T-L12 stop running PEND_KICK", 28);
+    test_assert_eq(lc_tick_action(9, 1, 1, 1), 1, "T-L12 tick kp DIE (never STOP)", 30);
+    test_assert_eq(lc_tick_action(0, 0, 1, 1), 0, "T-L12 tick nothing NONE", 23);
+    test_assert_eq(lc_tick_action(0, 1, 0, 1), 3, "T-L12 tick unstoppable DROP", 27);
+    test_assert_eq(lc_tick_action(0, 1, 1, 0), 3, "T-L12 tick no live parent DROP", 30);
+    test_assert_eq(lc_tick_action(0, 2, 1, 1), 2, "T-L12 tick STOP", 15);
+    test_assert_eq(lc_park_action(9, 1, 1, 1, 0), 1, "T-L12 park kp ABORT (never PARK)", 32);
+    test_assert_eq(lc_park_action(0, 0, 1, 1, 0), 0, "T-L12 park nothing CONTINUE", 27);
+    test_assert_eq(lc_park_action(0, 1, 0, 1, 0), 3, "T-L12 park unstoppable DROP", 27);
+    test_assert_eq(lc_park_action(0, 1, 1, 0, 0), 3, "T-L12 park no live parent DROP", 30);
+    test_assert_eq(lc_park_action(0, 1, 1, 1, 1), 4, "T-L12 park preempt held PREEMPT_HELD", 36);
+    test_assert_eq(lc_park_action(0, 1, 1, 1, 0), 2, "T-L12 park PARK", 15);
+    test_assert_eq(lc_birth_action(9, 0), 0, "T-L12 birth kp REFUSE", 21);
+    test_assert_eq(lc_birth_action(0, 2), 2, "T-L12 birth tree stop INHERIT", 29);
+    test_assert_eq(lc_birth_action(0, 1), 1, "T-L12 birth direct stop OK", 26);
+    test_assert_eq(lc_orphan(3, 8, 2, 5, 5, 1), 1, "T-L12 orphan: parent done -> orphan", 35);
+    test_assert_eq(lc_orphan(3, 8, 2, 5, 5, 0), 0, "T-L12 orphan: live parent -> not", 32);
+    test_assert_eq(lc_orphan(0, 8, 0, 0, 0, 0), 0, "T-L12 orphan: kmain child never", 31);
+    test_assert_eq(lc_orphan(3, 8, 0, 5, 5, 0), 1, "T-L12 orphan: dead parent -> orphan", 35);
+    test_assert_eq(lc_parent_live(3, 8, 4, 5, 5, 0), 1, "T-L12 parent_live: dying parent (not done) live", 47);
+    test_assert_eq(lc_parent_live(3, 8, 2, 6, 5, 0), 0, "T-L12 parent_live: recycled parent gone", 39);
+    test_assert_eq(lc_parent_live(9, 8, 2, 5, 5, 0), 0, "T-L12 parent_live: out of range gone", 36);
+    # 1.57.7 ENDFIX (S7-R1): a slot being RECYCLED (state 3, CLAIMING) still carries the dead parent's epoch and a
+    # scrubbed done=0 until proc_alloc_slot finishes — it is never an existing process's parent.
+    test_assert_eq(lc_parent_live(3, 8, 3, 5, 5, 0), 0, "T-L12 parent_live: CLAIMING slot (a recycle in flight) gone", 59);
+    test_assert_eq(lc_orphan(3, 8, 3, 5, 5, 0), 1, "T-L12 orphan: CLAIMING parent slot, old epoch, done 0 -> orphan", 63);
+    var tl13_t1 = klug_lock_acquire();
+    var tl13_to = klug_lock_timeouts;
+    var tl13_t2 = klug_lock_acquire();
+    var tl13_held2 = tl13_t2 & 1;
+    var tl13_rose = klug_lock_timeouts - tl13_to;
+    klug_lock_release(tl13_t2);
+    klug_lock_release(tl13_t1);
+    test_assert_eq(tl13_held2, 0, "T-L13 a nested acquire gives a not-held token after the bound", 61);
+    test_assert(tl13_rose >= 1, "T-L13 klug_lock_timeouts counted the bound", 42);
+    klug_spill_owed = 1;
+    klug_spill_owed_run();
+    test_assert_eq(klug_spill_owed, 0, "T-L13 klug_spill_owed_run clears the debt", 41);
+    test_assert_eq(gpu_release_pid_isr(99), 0, "T-L13 gpu_release_pid_isr non-owner = 0", 39);
+    test_assert_eq(klug_spill_owed, 0, "T-L13 non-owner leaves no spill debt", 36);
+    var tl14_a = blk_rw_test_armed();
+    var tl14_o = blk_rw_test_owner();
+    blk_rw_test_set(1, 5 + 1);
+    blk_rw_disarm_pid(7);
+    var tl14_keep = blk_rw_test_armed();
+    blk_rw_disarm_pid(5);
+    var tl14_gone = blk_rw_test_armed() + blk_rw_test_owner();
+    blk_rw_test_set(tl14_a, tl14_o);
+    test_assert_eq(tl14_keep, 1, "T-L14 an unrelated death keeps the arm", 38);
+    test_assert_eq(tl14_gone, 0, "T-L14 the arming death clears arm + owner", 41);
+    return 0;
+}
+
+
 # === Main Test Runner ===
 fn sh_cmd_test() {
     serial_println("=== AGNOS Kernel Test Suite ===", 31);
@@ -456,9 +775,15 @@ fn sh_cmd_test() {
     test_heap();
     test_vfs();
     test_proc();
+    test_lifecycle();       # 1.57.7 (S7): [lifecycle] — the decision rows, kill#16 validation, births, klug lock, spill, blk arm
+    test_limits();          # 1.57.7 (S8): [limits] K1-K5 — spawn_limits#107, the loader pre-pass, the footprint walk
+    test_fgwait();          # 1.57.7 (S3b): T12 — proc_slot_reusable + the INV-FG-2 fgwait cell (sched.cyr #ifdef TEST)
+    test_wq();              # 1.57.7 (S3.4): the wait/wake primitive (sched.cyr #ifdef TEST)
+    test_flock();           # 1.57.7 (S3.5): the flock table's wakes (T7) and rules (T9)
     test_syscall();
     test_kstdlib();
     test_initrd();
+    test_wq_latches();      # 1.57.7 (S3.4): LAST — no latched wq/scheduler invariant fired during the suite
 
     serial_println("===", 3);
     serial_print("TOTAL: ", 7);

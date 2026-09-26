@@ -1,0 +1,364 @@
+# sockown — the RING-3 half of agnos 1.57.7 step S5 (socket ownership, held slots, the loopback-only listen
+# class, 127/8 + net_ip admission, sock_peer#106, UDP ownership).
+#
+# Issues: docs/development/issues/2026-09-23-socket-ids-have-no-owner.md,
+#         docs/development/issues/2026-09-23-tcp-server-cannot-be-loopback-only.md.
+#
+# Seeded as /bin/agnsh on a PLAIN kernel (D19) by scripts/smoke/sock-owner-smoke.sh, which maps the markers
+# below. Raw `syscall(N, a1, a2, a3, a4)` with explicit zeros; #52 passes the length as a4. Every poll loop is
+# bounded by uptime_ms#40 and yields with #44. Every check prints its raw values; a failure prints
+# `SOCK-FAIL-<name> v=...`, a check whose precondition failed prints `SOCK-FAIL-PRECOND-<name>` and never its OK
+# marker. The program ALWAYS ends `SOCKOWN-DONE` and exits 0 (a non-zero exit drops kybernet into the
+# emergency shell).
+
+# Module-scope `var X[N]` is N u64 = 8N BYTES.
+var s_buf[64];          # 512 B receive buffer
+var s_ub[16];           # 128 B UDP receive + addr out (+64 ip, +72 port)
+var s_lb[32];           # 256 B the current output line
+var S_LN = 0;
+var S_LO = 0x7F000001;
+var S_NIP = 0;
+
+# Output is LINE-BUFFERED, one write(1) per line (a fork child prints while the parent runs).
+fn s_flush() { if (S_LN > 0) { syscall(1, 1, &s_lb, S_LN, 0); } S_LN = 0; return 0; }
+fn s_putc(ch) {
+    if (S_LN >= 250) { s_flush(); }
+    store8(&s_lb + S_LN, ch);
+    S_LN = S_LN + 1;
+    if (ch == 10) { s_flush(); }
+    return 0;
+}
+fn s_out(s) {
+    var i = 0;
+    while (load8(s + i) != 0) { s_putc(load8(s + i)); i = i + 1; }
+    return 0;
+}
+fn s_num(n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { s_putc(45); n = 0 - n; }
+    if (n == 0) { s_putc(48); return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; s_putc(load8(&b + i)); }
+    return 0;
+}
+fn s_kv(k, v) { s_out(" "); s_out(k); s_out("="); s_num(v); return 0; }
+fn s_nl() { s_out("\n"); return 0; }
+fn s_ok(m) { s_out(m); s_nl(); return 0; }
+fn s_fail(m, v) { s_out("SOCK-FAIL-"); s_out(m); s_kv("v", v); s_nl(); return 0; }
+fn s_pre(m, v) { s_out("SOCK-FAIL-PRECOND-"); s_out(m); s_kv("v", v); s_nl(); return 0; }
+fn s_is(buf, s, n) {                      # 1 when buf[0..n) == s[0..n)
+    var i = 0;
+    while (i < n) { if (load8(buf + i) != load8(s + i)) { return 0; } i = i + 1; }
+    return 1;
+}
+
+fn s_ms() { return syscall(40, 0, 0, 0, 0); }
+fn s_yield() { syscall(44, 0, 0, 0, 0); return 0; }
+fn s_listen(a) { return syscall(56, a, 0, 0, 0); }
+fn s_accept(l) { return syscall(57, l, 0, 0, 0); }
+fn s_connect(ip, p, sp) { return syscall(47, ip, p, sp, 0); }
+fn s_send(c, b, n) { return syscall(48, c, b, n, 0); }
+fn s_recv(c, b, n) { return syscall(49, c, b, n, 0); }
+fn s_close(c) { return syscall(50, c, 0, 0, 0); }
+fn s_peer(c) { return syscall(106, c, 0, 0, 0); }
+fn s_ubind(p) { return syscall(51, p, 0, 0, 0); }
+fn s_usend(ip, ports, b, n) { return syscall(52, ip, ports, b, n); }
+fn s_urecv(l, b, n, a) { return syscall(53, l, b, n, a); }
+fn s_uunbind(l) { return syscall(54, l, 0, 0, 0); }
+
+fn s_accept_wait(l) {
+    var t0 = s_ms();
+    while (s_ms() - t0 < 2000) {
+        var c = s_accept(l);
+        if (c >= 0) { return c; }
+        s_yield();
+    }
+    return 0 - 1;
+}
+# Poll #49 until it answers -1 (EOF / not yours). 1 = saw -1 within 2 s.
+fn s_until_eof(c) {
+    var t0 = s_ms();
+    while (s_ms() - t0 < 2000) {
+        if (s_recv(c, &s_buf, 64) < 0) { return 1; }
+        s_yield();
+    }
+    return 0;
+}
+# Read exactly n bytes (2 s); returns the count gathered into s_buf.
+fn s_read_n(c, n) {
+    var got = 0;
+    var t0 = s_ms();
+    while (s_ms() - t0 < 2000) {
+        var r = s_recv(c, &s_buf + got, n - got);
+        if (r > 0) { got = got + r; if (got >= n) { return got; } }
+        elif (r < 0) { return got; }
+        else { s_yield(); }
+    }
+    return got;
+}
+fn s_wait(pid) {
+    var t0 = s_ms();
+    while (s_ms() - t0 < 20000) {
+        var r = syscall(4, pid, 0, 0, 0);
+        if (r != 0 - 2) { return r; }
+        s_yield();
+    }
+    return 0 - 3;
+}
+
+# ═══ Phase H — a failed connect releases its slot (a held SYN_SENT would fill the table) [B3] ═══
+fn ph_h() {
+    var norst = 1;
+    var allneg = 1;
+    var k = 0;
+    while (k < 9) {
+        var t0 = s_ms();
+        var c = s_connect(0x0A000202, 1, 40020 + k);   # SLIRP answers a closed host port with RST
+        var dt = s_ms() - t0;
+        if (c >= 0) { allneg = 0; s_close(c); }
+        if (dt < 3000) { norst = 0; }
+        s_out("SOCK-H"); s_kv("k", k); s_kv("c", c); s_kv("dt", dt); s_nl();
+        k = k + 1;
+    }
+    if (norst == 1) { s_pre("CONNFAIL norst", 0); return 0; }
+    var p = s_listen(7076);
+    if (allneg == 1 && p >= 0) { s_ok("SOCK-CONNFAIL-RELEASED-OK"); }
+    else { s_fail("CONNFAIL", p); }
+    if (p >= 0) { s_close(p); }
+    return 0;
+}
+
+# ═══ Phase HELD — a conn that dies by RST keeps its id until its owner closes it [B3] ═══
+fn ph_held() {
+    var lr = s_listen(7077);
+    var c = s_connect(S_LO, 7077, 40030);
+    if (lr < 0 || c < 0) { s_pre("HELD", lr); if (c >= 0) { s_close(c); } if (lr >= 0) { s_close(lr); } return 0; }
+    s_recv(c, &s_buf, 1);                              # flush: the final ACK makes the server child ESTABLISHED
+    var r50 = s_close(lr);                             # reaps the unaccepted child: RST|ACK to c
+    var eof = s_until_eof(c);
+    var r48 = s_send(c, "X", 1);
+    var lr2 = s_listen(7078);
+    var c2 = s_connect(S_LO, 7078, 40031);
+    var cl1 = s_close(c);
+    var cl2 = s_close(c);
+    s_out("SOCK-HELD"); s_kv("r50", r50); s_kv("eof", eof); s_kv("r48", r48); s_kv("c", c); s_kv("c2", c2);
+    s_kv("cl1", cl1); s_kv("cl2", cl2); s_nl();
+    if (r50 == 0 && eof == 1 && r48 == 0 - 1 && lr2 >= 0 && c2 >= 0 && c2 != c && cl1 == 0 && cl2 == 0 - 1) { s_ok("SOCK-HELD-OK"); }
+    else { s_fail("HELD", c2); }
+    if (c2 >= 0) { s_close(c2); }
+    if (lr2 >= 0) { s_close(lr2); }
+    return 0;
+}
+
+# ═══ Phase 0 — an ANY listener: 127.0.0.1, 127.0.0.2 and net_ip [B2; peers B4] ═══
+fn ph_0() {
+    var peers = 1;
+    var l0 = s_listen(7072);
+    if (l0 < 0) { s_pre("ANY", l0); return 0; }
+    var c0 = s_connect(S_LO, 7072, 40001);
+    if (c0 >= 0) { s_ok("SOCK-ANY-LO-OK"); } else { s_fail("ANY-LO", c0); }
+    if (c0 >= 0) {
+        var a0 = s_accept_wait(l0);
+        var w = s_send(c0, "PING", 4);
+        var n = 0;
+        if (a0 >= 0) { n = s_read_n(a0, 4); }
+        if (a0 >= 0 && w == 4 && n == 4 && s_is(&s_buf, "PING", 4) == 1) { s_ok("SOCK-DATA-OK"); }
+        else { s_fail("DATA", n); }
+        var p1 = s_peer(c0);
+        var p2 = s_peer(a0);
+        var p3 = s_peer(l0);
+        s_out("SOCK-PEER0"); s_kv("c0", p1); s_kv("a0", p2); s_kv("l0", p3); s_nl();
+        if (p1 != ((S_LO << 16) | 7072)) { peers = 0; }
+        if (p2 != ((S_LO << 16) | 40001)) { peers = 0; }
+        if (p3 != 0 - 1) { peers = 0; }
+        if (a0 >= 0) {
+            var ca = s_close(a0);
+            if (ca == 0 && s_until_eof(c0) == 1) { s_ok("SOCK-CLOSE-FIN-OK"); } else { s_fail("CLOSE-FIN", ca); }
+        }
+        s_close(c0);
+    } else { peers = 0; }
+    var c5 = s_connect(0x7F000002, 7072, 40005);
+    if (c5 >= 0) {
+        var a5 = s_accept_wait(l0);
+        var w5 = s_send(c5, "Q", 1);
+        var n5 = 0;
+        if (a5 >= 0) { n5 = s_read_n(a5, 1); }
+        if (a5 >= 0 && w5 == 1 && n5 == 1 && load8(&s_buf) == 81) { s_ok("SOCK-LO8-OK"); } else { s_fail("LO8", n5); }
+        var p4 = s_peer(c5);
+        var p5 = s_peer(a5);
+        s_out("SOCK-PEER5"); s_kv("c5", p4); s_kv("a5", p5); s_nl();
+        if (p4 != ((0x7F000002 << 16) | 7072)) { peers = 0; }
+        if (p5 != ((S_LO << 16) | 40005)) { peers = 0; }
+        if (a5 >= 0) { s_close(a5); }
+        s_close(c5);
+    } else { s_fail("LO8-CONNECT", c5); peers = 0; }
+    var c6 = s_connect(S_NIP, 7072, 40006);
+    var a6 = 0 - 1;
+    if (c6 >= 0) { a6 = s_accept_wait(l0); }
+    if (c6 >= 0 && a6 >= 0) { s_ok("SOCK-ANY-NETIP-OK"); } else { s_fail("ANY-NETIP", c6); }
+    var p6 = s_peer(a6);
+    s_out("SOCK-PEER6"); s_kv("a6", p6); s_nl();
+    if (p6 != ((S_NIP << 16) | 40006)) { peers = 0; }
+    if (c6 >= 0) { s_close(c6); }
+    if (a6 >= 0) { s_close(a6); }
+    s_close(l0);
+    if (peers == 1) { s_ok("SOCK-PEER-OK"); } else { s_fail("PEER", 0); }
+    return 0;
+}
+
+# ═══ Phase LO — the loopback-only class [B2] ═══
+fn ph_lo() {
+    var ll = s_listen(7080 | (1 << 32));
+    if (ll < 0) {
+        s_pre("DUP-REFUSED", ll); s_pre("LISTEN-BITS", ll); s_pre("LISTEN-LO", ll); s_pre("LO-REFUSES-NETIP", ll);
+        return 0;
+    }
+    var dup = s_listen(7080);
+    if (dup == 0 - 1) { s_ok("SOCK-DUP-REFUSED-OK"); } else { s_fail("DUP-REFUSED", dup); s_close(dup); }
+    var b1 = s_listen(7081 | (2 << 32));
+    var b2 = s_listen(7081 | (1 << 16));
+    var b3 = s_listen(7081 | (1 << 40));
+    var b4 = s_listen(0x100000000);
+    s_out("SOCK-BITS"); s_kv("b1", b1); s_kv("b2", b2); s_kv("b3", b3); s_kv("b4", b4); s_nl();
+    if (b1 == 0 - 1 && b2 == 0 - 1 && b3 == 0 - 1 && b4 == 0 - 1) { s_ok("SOCK-LISTEN-BITS-OK"); } else { s_fail("LISTEN-BITS", 0); }
+    var cl = s_connect(S_LO, 7080, 40010);
+    var al = 0 - 1;
+    if (cl >= 0) { al = s_accept_wait(ll); }
+    if (cl >= 0 && al >= 0) { s_ok("SOCK-LISTEN-LO-OK"); } else { s_fail("LISTEN-LO", cl); }
+    var t0 = s_ms();
+    var c9 = s_connect(S_NIP, 7080, 40011);
+    s_out("SOCK-LO-NETIP"); s_kv("c9", c9); s_kv("dt", s_ms() - t0); s_nl();
+    if (c9 == 0 - 1) { s_ok("SOCK-LO-REFUSES-NETIP-OK"); } else { s_fail("LO-REFUSES-NETIP", c9); s_close(c9); }
+    if (cl >= 0) { s_close(cl); }
+    if (al >= 0) { s_close(al); }
+    s_close(ll);
+    return 0;
+}
+
+# ═══ Phase 1 — a fork child is a STRANGER to its parent's TCP and UDP ids [TCP B3; #106 B4; UDP B5] ═══
+fn ph_1(l) {
+    var c1 = s_connect(S_NIP, 7070, 40002);
+    var a1 = s_accept_wait(l);
+    var w1 = s_send(c1, "SECRET", 6);                  # left unread on a1
+    var c2 = s_connect(S_NIP, 7070, 40003);            # left UNACCEPTED
+    var u = s_ubind(7090);
+    var us = s_usend(S_NIP, (7095 << 16) | 7090, "UDPX", 4);   # left in the lo queue
+    # ⛔ PRE-FORK FLUSH: this #49's net_poll drains the lo queue — c2's final ACK (its server child becomes
+    # ESTABLISHED) and UDPX (delivered to u). It is what makes the child's #57 refusal DISCRIMINATING (a pending
+    # ESTABLISHED child exists). Do not remove it, and do not add a net_poll to the child's checks.
+    var fl = s_recv(c1, &s_buf, 1);
+    s_out("SOCK-P1"); s_kv("c1", c1); s_kv("a1", a1); s_kv("w1", w1); s_kv("c2", c2); s_kv("u", u); s_kv("us", us);
+    s_kv("fl", fl); s_nl();
+    if (c1 < 0 || a1 < 0 || c2 < 0 || w1 != 6 || fl < 0 || u < 0 || us <= 0) {
+        s_pre("CHILD-REFUSED", 0);
+        if (u >= 0) { s_uunbind(u); }
+        return 0;
+    }
+    var pid = syscall(96, 0, 0, 0, 0);
+    if (pid == 0) {
+        # ═ THE CHILD — a stranger to every id above.
+        var r49 = s_recv(a1, &s_buf, 16);
+        if (r49 == 6) { s_out("SOCK-CHILD-READ-LEAK n=6\n"); }
+        var r48 = s_send(a1, "X", 1);
+        var r57 = s_accept(l);
+        var r50a = s_close(a1);
+        var r50l = s_close(l);
+        var r50c = s_close(c1);
+        s_out("SOCK-CHILD"); s_kv("r49", r49); s_kv("r48", r48); s_kv("r57", r57); s_kv("r50a", r50a);
+        s_kv("r50l", r50l); s_kv("r50c", r50c); s_nl();
+        if (r49 == 0 - 1 && r48 == 0 - 1 && r57 == 0 - 1 && r50a == 0 - 1 && r50l == 0 - 1 && r50c == 0 - 1) { s_ok("SOCK-CHILD-REFUSED-OK"); }
+        else { s_fail("CHILD-REFUSED", r49); }
+        var rp = s_peer(a1);
+        if (rp == 0 - 1) { s_ok("SOCK-CHILD-PEER-REFUSED-OK"); } else { s_fail("CHILD-PEER-REFUSED", rp); }
+        var r53 = s_urecv(u, &s_ub, 64, 0);
+        var r54 = s_uunbind(u);
+        var r52 = s_usend(S_NIP, (7090 << 16) | 7096, "EVIL", 4);   # spoofing the parent's bound port
+        s_out("SOCK-CHILD-UDP"); s_kv("r53", r53); s_kv("r54", r54); s_kv("r52", r52); s_nl();
+        if (r53 == 0 - 1 && r54 == 0 - 1 && r52 == 0 - 1) { s_ok("SOCK-CHILD-UDP-REFUSED-OK"); } else { s_fail("CHILD-UDP-REFUSED", r53); }
+        var l2 = s_listen(7071);
+        if (l2 >= 0) { s_ok("SOCK-CHILD-OWN-TCP-OK"); } else { s_fail("CHILD-OWN-TCP", l2); }
+        var u2 = s_ubind(7091);
+        if (u2 >= 0) { s_ok("SOCK-CHILD-OWN-UDP-OK"); } else { s_fail("CHILD-OWN-UDP", u2); }
+        s_flush();
+        syscall(0, 13, 0, 0, 0);                        # exit(13) WITHOUT closing l2 / u2
+    }
+    if (pid < 0) { s_pre("FORK1", pid); return 0; }
+    var wc = s_wait(pid);
+    s_out("SOCK-P1-WAIT"); s_kv("code", wc); s_nl();
+    var n = s_read_n(a1, 6);
+    var r0 = s_recv(c1, &s_buf + 64, 8);
+    var wok = s_send(c1, "OK", 2);
+    if (wc == 13 && n == 6 && s_is(&s_buf, "SECRET", 6) == 1 && r0 == 0 && wok == 2) { s_ok("SOCK-PARENT-INTACT-OK"); }
+    else { s_fail("PARENT-INTACT", n); }
+    var a2 = s_accept_wait(l);
+    var p2 = s_peer(a2);
+    s_out("SOCK-P1-PEND"); s_kv("a2", a2); s_kv("peer", p2); s_nl();
+    if (a2 >= 0 && p2 == ((S_NIP << 16) | 40003)) { s_ok("SOCK-PENDING-KEPT-OK"); } else { s_fail("PENDING-KEPT", a2); }
+    var l2p = s_listen(7071);
+    if (l2p >= 0) { s_ok("SOCK-RELEASE-TCP-OK"); s_close(l2p); } else { s_fail("RELEASE-TCP", l2p); }
+    store64(&s_ub + 64, 0);
+    store64(&s_ub + 72, 0);
+    var un = s_urecv(u, &s_ub, 64, &s_ub + 64);
+    s_out("SOCK-P1-UDP"); s_kv("n", un); s_kv("port", load64(&s_ub + 72)); s_nl();
+    if (un == 4 && s_is(&s_ub, "UDPX", 4) == 1 && load64(&s_ub + 72) == 7095) { s_ok("SOCK-UDP-INTACT-OK"); } else { s_fail("UDP-INTACT", un); }
+    var u2p = s_ubind(7091);
+    if (u2p >= 0) { s_ok("SOCK-RELEASE-UDP-OK"); s_uunbind(u2p); } else { s_fail("RELEASE-UDP", u2p); }
+    s_close(a1);
+    s_close(c1);
+    if (a2 >= 0) { s_close(a2); }
+    s_close(c2);
+    s_uunbind(u);
+    return 0;
+}
+
+# ═══ Phase 2 — a FAULTING child's ids are released and its connection FINs [TCP B3; UDP B5] ═══
+fn ph_2(l) {
+    var pid = syscall(96, 0, 0, 0, 0);
+    if (pid == 0) {
+        var c8 = s_connect(S_NIP, 7070, 40008);        # to the parent's listener
+        var l8 = s_listen(7073);
+        var u8 = s_ubind(7093);
+        s_out("SOCK-P2-CHILD"); s_kv("c8", c8); s_kv("l8", l8); s_kv("u8", u8); s_nl();
+        store64(0, 1);                                  # #PF -> fault_kill_current
+        syscall(0, 77, 0, 0, 0);
+    }
+    if (pid < 0) { s_pre("FORK2", pid); return 0; }
+    var wc = s_wait(pid);
+    var a8 = s_accept_wait(l);
+    var eof = 0;
+    if (a8 >= 0) { eof = s_until_eof(a8); }
+    s_out("SOCK-P2"); s_kv("code", wc); s_kv("a8", a8); s_kv("eof", eof); s_nl();
+    if (wc == 142 && a8 >= 0 && eof == 1) { s_ok("SOCK-DEATH-FIN-OK"); } else { s_fail("DEATH-FIN", wc); }
+    var l3 = s_listen(7073);
+    if (wc == 142 && l3 >= 0) { s_ok("SOCK-FAULT-RELEASE-TCP-OK"); } else { s_fail("FAULT-RELEASE-TCP", l3); }
+    var u3 = s_ubind(7093);
+    if (wc == 142 && u3 >= 0) { s_ok("SOCK-FAULT-RELEASE-UDP-OK"); } else { s_fail("FAULT-RELEASE-UDP", u3); }
+    if (l3 >= 0) { s_close(l3); }
+    if (u3 >= 0) { s_uunbind(u3); }
+    if (a8 >= 0) { s_close(a8); }
+    return 0;
+}
+
+fn main(): i64 {
+    s_ok("SOCKOWN-ALIVE");
+    S_NIP = syscall(61, 0, 0, 0, 0);
+    s_out("SOCKOWN-NIP"); s_kv("nip", S_NIP); s_nl();
+    ph_h();
+    ph_held();
+    ph_0();
+    ph_lo();
+    var l = s_listen(7070);
+    if (l < 0) { s_pre("L7070", l); }
+    else {
+        ph_1(l);
+        ph_2(l);
+        s_close(l);
+    }
+    s_ok("SOCKOWN-DONE");
+    s_flush();
+    return 0;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

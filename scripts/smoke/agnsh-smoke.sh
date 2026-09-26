@@ -35,6 +35,12 @@ AGNSH="${AGNSH_BIN:-$AGNOSHI/build/agnsh_agnos}"
 
 WORK="$ROOT/build/agnsh-smoke"; LOGS="$ROOT/build/agnsh-smoke-logs"
 rm -rf "$WORK" "$LOGS"; mkdir -p "$WORK" "$LOGS"
+# ⭐ 1.57.7 (IMG-fix, reviews A6/B6): this smoke's verdict is about the PRODUCTION kernel — refuse any other.
+# The wrappers that boot a flagged kernel through this harness (exec-redirect-smoke, syscall-harden-smoke) name
+# the flags they built with in AGNSH_SMOKE_FLAGS. The check sits AFTER the log dir is cleared, so a refused run
+# leaves no stale agnsh.log for a wrapper to read as if this boot had produced it.
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
+smoke_require_image "$AGNOS" "${AGNSH_SMOKE_FLAGS:-}"
 IMG="$WORK/agnos-agnsh.img"
 PART_OFFSET=$(( 33 * 1048576 )); PART_BYTES=$(( 67 * 1048576 )); PART_BLOCKS=$(( PART_BYTES / 4096 ))
 EXT2_SMOKE_FEATURES="${EXT2_SMOKE_FEATURES:-^resize_inode,^dir_index,^metadata_csum,^64bit,^uninit_bg}"
@@ -79,27 +85,21 @@ echo "accel: $ACCEL (-smp $SMOKE_SMP)"
 # is retryable. Gating on the banner keeps a REAL regression from being retried away — which is
 # exactly the risk in sweep.sh's unconditional double-run, where a genuine failure gets two chances
 # to look like a flake. If the banner is present, whatever the assertions say is the verdict.
+# ⭐ 1.57.7 (IMG-fix, review A2): the hand-rolled retry loop that stood here became qemu_dwell_kernel. It retried on the
+# banner alone and overwrote each attempt's log, so a kernel that died before its banner (the boot-stack
+# window IMG moved) read as a firmware VOID and was retried away. qemu_dwell_kernel keeps every non-booted
+# attempt as $LOG.attemptN, says why it is a VOID, and FAILS (exit 1) a kernel that took control and died.
+# Default tries 3, as this smoke always had.
 QEMU_TRIES="${QEMU_TRIES:-3}"
-qtry=1
-while [ "$qtry" -le "$QEMU_TRIES" ]; do
-    cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
-    qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
-        qemu-system-x86_64 \
-        -machine q35 -m 512M $ACCEL -smp "$SMOKE_SMP" \
-        -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
-        -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
-        -drive "file=$IMG,format=raw,if=none,id=disk0" \
-        -device "nvme,drive=disk0,serial=AGNOS-AGNSH" \
-        -serial stdio -display none -no-reboot
-    if strings "$LOG" | grep -q "AGNOS kernel v"; then break; fi
-    if [ "$qtry" -lt "$QEMU_TRIES" ]; then
-        echo "  (firmware never handed off — kernel did not start; retrying $qtry/$((QEMU_TRIES - 1)))"
-    else
-        echo "  UEFI never handed off to the kernel in $QEMU_TRIES attempts — INFRASTRUCTURE, not the kernel."
-        echo "  The assertions below therefore describe nothing; treat this run as VOID, not as a failure."
-    fi
-    qtry=$((qtry + 1))
-done
+qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" "$WORK/vars.fd" "$OVMF_VARS_SRC" \
+    qemu-system-x86_64 \
+    -machine q35 -m 512M $ACCEL -smp "$SMOKE_SMP" \
+    -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
+    -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
+    -drive "file=$IMG,format=raw,if=none,id=disk0" \
+    -device "nvme,drive=disk0,serial=AGNOS-AGNSH" \
+    -serial stdio -display none -no-reboot
+qemu_assert_booted "$LOG" || { echo "agnsh-smoke: VOID"; exit 2; }
 
 echo ""
 echo "  --- boot tail (kybernet onward) ---"
@@ -129,6 +129,27 @@ if strings "$LOG" | grep -q "agnoshi "; then
     echo "  PASS: agnsh reached ring 3 and printed its own banner"
 else
     echo "  FAIL: no agnsh banner — it exec'd but produced no output (wedged before its first write)"; rc=1
+fi
+# ⭐ 1.57.7 (IMG-fix, A3): the BSP boot stack's span must be free RAM in the UEFI map the firmware handed over
+# (mbi.cyr bootstack_window_check). The violation line is denied below; the OK line is REQUIRED here, so a kernel
+# that stops running the check (or never reaches it) cannot pass by printing nothing.
+if strings "$LOG" | grep -q "boot: BSP stack span 0x390000-0x3C0000 is free RAM in the UEFI map OK"; then
+    echo "  PASS: BSP boot-stack span [0x390000, 0x3C0000) is free RAM in the UEFI map"
+else
+    echo "  FAIL: no 'boot: BSP stack span ... free RAM ... OK' line — the window check did not pass (or did not run)"; rc=1
+fi
+# ⭐ 1.57.7 (Path 2, S3.4): the voluntary-switch gate (vector 0xE0) must be installed DPL0 / IST0 / selector 0x08 at
+# &resched_isr (sched.cyr resched_gates_ok). The misconfigured line is denied below; the OK line is REQUIRED here.
+if strings "$LOG" | grep -q "sched: resched gate 0xE0 OK"; then
+    echo "  PASS: the voluntary-switch gate 0xE0 is DPL0 / IST0 at resched_isr"
+else
+    echo "  FAIL: no 'sched: resched gate 0xE0 OK' line — the 0xE0 gate check did not pass (or did not run)"; rc=1
+fi
+# ⭐ 1.57.7 (Path 2, S3.8): the reschedule-KICK gate (vector 0xE1) the same way — DPL0 / IST0 / 0x08 at &resched_kick_isr.
+if strings "$LOG" | grep -q "sched: resched gate 0xE1 OK"; then
+    echo "  PASS: the reschedule-kick gate 0xE1 is DPL0 / IST0 at resched_kick_isr"
+else
+    echo "  FAIL: no 'sched: resched gate 0xE1 OK' line — the 0xE1 gate check did not pass (or did not run)"; rc=1
 fi
 # ⛔ 1.57.6 (S3-fix): the kernel's latched invariant lines (SMOKE_INVARIANT_DENY, qemu-dwell.sh) fire once to klug +
 # COM1 and change no exit code — this gate scored PASS with them firing until it grepped for them.

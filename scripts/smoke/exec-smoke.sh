@@ -85,9 +85,10 @@ LOG="$LOGS/exec-selftest.log"
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
 # 1.56.51: banner-gated retry — a run OVMF never handed off is VOID, not a failure of the exec
 # path. See qemu_dwell_kernel in scripts/smoke/lib/qemu-dwell.sh for the measurement.
+EXEC_MEM_MB=512    # QEMU -m; the /bin/sysi row derives its expected totalram window from it (1.57.7 HAR)
 qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-90}" "$WORK/vars.fd" "$OVMF_VARS_SRC" \
     qemu-system-x86_64 \
-    -machine q35 -m 512M -cpu max \
+    -machine q35 -m "${EXEC_MEM_MB}M" -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$IMG,format=raw,if=none,id=disk0" \
@@ -146,14 +147,29 @@ else
 fi
 # 1.42.10: sysinfo syscalls (uname#34 + sysinfo#35) — /bin/sysi is exec #3 (the
 # 1.42.4 reap work lifted the old 2-exec-per-boot cap). It calls both new syscalls into a user-stack
-# buffer and exits sysname[0]('A'=0x41=65) + totalram byte3. totalram = pmm_total*4096; since 1.49.6
-# the PMM bitmap is 256 MB (pmm_total=65536) so totalram=0x10000000, byte3=0x10=16, exit = 65+16 = 81.
-# (Tracks the PMM-pool size — bump as the RAM arc grows the bitmap: 1 GB -> byte3 0x40 -> exit 129.)
-# Proves both syscalls dispatch from ring 3, pass is_user_range, and write the right struct bytes.
-if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}run: exit 81"; then
-    echo "  PASS: sysinfo syscalls — /bin/sysi uname#34 + sysinfo#35 wrote correct struct bytes (exit 81, 256 MB pool)"
+# buffer and exits sysname[0]('A'=0x41=65) + totalram byte3 (bits 24-31).
+# ⛔ 1.57.7 (HAR) — THIS ROW WAS VACUOUS. It grepped for ANY "run: exit 81" (81 = the old 256 MB bootstrap pool,
+# byte3 0x10), but since the >256 MB bitmap (pmm.cyr: pmm_total = ram_pages = the top of CONVENTIONAL RAM / 4 KB)
+# sysi exits 95 at -m 512M (byte3 0x1E) — and the row was satisfied by /bin/envprop's own 81 instead, verifying
+# nothing about sysi. Now: sysi's OWN result (the first `run: exit N` after `exec: running /bin/sysi`), bounded by
+# the booted pool: totalram = the conventional-RAM top, which lies in [the boot line's "RAM: usable=<U>MB", the
+# QEMU -m size], so N must be in [65 + U/16, 65 + SYSI_MEM_MB/16]. 'A' proves uname#34 wrote sysname; the window
+# proves sysinfo#35 wrote totalram from the live pool (81 — the bootstrap pool, a directmap expansion that never
+# happened — is below it). The kernel prints no exact ram top, so the window is the tightest derivation the log allows.
+SYSI_MEM_MB=$EXEC_MEM_MB
+SYSI_RC=$(strings "$LOG" | sed -n '/exec: running \/bin\/sysi/,$p' | grep -m1 -o "run: exit -\{0,1\}[0-9]*" | sed 's/run: exit //')
+SYSI_USABLE_MB=$(strings "$LOG" | grep -m1 -o "RAM: usable=[0-9]*MB" | sed 's/[^0-9]//g')
+if [ -z "$SYSI_USABLE_MB" ]; then
+    echo "  FAIL: no 'RAM: usable=<n>MB' boot line — cannot derive sysi's expected totalram window"; rc=1
+elif [ -z "$SYSI_RC" ]; then
+    echo "  FAIL: /bin/sysi never reported a 'run: exit' (not run, or its run line is missing)"; rc=1
 else
-    echo "  FAIL: no 'run: exit 81' (uname#34 / sysinfo#35 didn't write the expected struct bytes for the 256 MB PMM pool)"; rc=1
+    SYSI_LO=$(( 65 + SYSI_USABLE_MB / 16 )); SYSI_HI=$(( 65 + SYSI_MEM_MB / 16 ))
+    if [ "$SYSI_RC" -ge "$SYSI_LO" ] && [ "$SYSI_RC" -le "$SYSI_HI" ]; then
+        echo "  PASS: sysinfo syscalls — /bin/sysi exit $SYSI_RC = 'A' + totalram byte3 $((SYSI_RC - 65)) (window [$SYSI_LO,$SYSI_HI] from usable=${SYSI_USABLE_MB}MB .. -m ${SYSI_MEM_MB}M)"
+    else
+        echo "  FAIL: /bin/sysi exit $SYSI_RC, want [$SYSI_LO,$SYSI_HI] ('A' + totalram byte3 for a ${SYSI_USABLE_MB}..${SYSI_MEM_MB} MB pool) — uname#34/sysinfo#35 wrote the wrong bytes"; rc=1
+    fi
 fi
 # 1.42.12: klug#36 — /bin/klug is exec #4; it calls klug(buf, 200) and exits with
 # the byte count returned. The boot log is >> 200 B by now, so klug returns 200,
@@ -199,10 +215,16 @@ fi
 # a caller env blob "Q=1\0" via (a3=ptr, a4=len); the caller env REPLACES the default, so the
 # child's envp[0] = "Q=1" and envtest exits 'Q'=81. The exit-72 gate above stays as the
 # permanent default/fallback regression gate (env-less + garbage-a3/a4 callers keep HOME=/).
-if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}run: exit 81"; then
-    echo "  PASS: per-process env — caller blob propagated through #37 a3/a4 to the child's envp[0] (exit 81='Q')"
+# ⛔ 1.57.7 (S3b, D-17) — THE RESULT OF THE envprop RUN ITSELF, not "some run: exit 81 anywhere": a bare grep -q could
+# be satisfied by another program's 81 (the spec's D-17 named /bin/sysi, which exited 81 on a 256 MB pool; on this
+# tree sysi exits 95 — and ITS row above matches envprop's 81 instead: a pre-existing vacuity recorded in
+# HARNESS-BACKLOG). So: the first `run: exit N` line AFTER `exec: running /bin/envprop` must be N = 81. envprop runs
+# after `sched_active = 1` since S3b (#37 is a blocking wait); mutation M-X81 (envprop left pre-scheduler) gives -1.
+ENVPROP_RC=$(strings "$LOG" | sed -n '/exec: running \/bin\/envprop/,$p' | grep -m1 -o "run: exit -\{0,1\}[0-9]*" | sed 's/run: exit //')
+if [ "$ENVPROP_RC" = "81" ]; then
+    echo "  PASS: per-process env — caller blob propagated through #37 a3/a4 to the child's envp[0] (envprop's run: exit 81='Q')"
 else
-    echo "  FAIL: no 'run: exit 81' (caller env blob did not reach the child — gate chain or elf staging broke)"; rc=1
+    echo "  FAIL: envprop's run ended 'run: exit ${ENVPROP_RC:-<none>}', want 81 (the #37 env blob did not reach its child, or envprop never ran)"; rc=1
 fi
 # 1.43.4 — framebuffer fbinfo(38)+blit(39). /bin/fbtest queries geometry, blits a
 # 4x4 block to FB(0,0), exits bpp(32)+blit_rc(0)+56 = 88. Proves BOTH new syscalls
@@ -222,19 +244,21 @@ if strings "$LOG" | grep -q "^\(\[[^]]*\] \)\{0,1\}run: exit 50"; then
 else
     echo "  FAIL: no 'run: exit 50' (timing syscalls didn't dispatch, or sleep_ms didn't advance the clock)"; rc=1
 fi
-# 1.57.6 (Path 2, S3.3): after each execwait#37 (exwv, envprop) the kernel re-installs the CALLER's kernel
-# stack as TSS.RSP0 and the syscall top (step (h), kstack_install). It used to leave TSS.RSP0 on the reaped
-# child's slot until the caller's next switch. The EXEC_SELFTEST twin prints the verdict at the resume point.
-if strings "$LOG" | grep -q "exec: rsp0 restored"; then
-    echo "  PASS: execwait #37 re-installed the caller's kernel stack as TSS.RSP0 ('exec: rsp0 restored')"
+# 1.57.6 (Path 2, S3.3) / 1.57.7 (S3b): after each execwait#37 (exwv, envprop — post-scheduler since S3b) the
+# CALLER's kernel stack must be TSS.RSP0 and the syscall top again. Since S3b the caller wakes from a blocking wait
+# and comes back through the resched switch tail, whose kstack_install is what the EXEC_SELFTEST witness
+# (execwait_rsp0_check) checks. COUNT >= 2 — one per caller (a single grep -q was satisfied by either alone).
+RSP0_N=$(strings "$LOG" | grep -c "exec: rsp0 restored")
+if [ "$RSP0_N" -ge 2 ]; then
+    echo "  PASS: both execwait #37 callers came back on their own kernel stack as TSS.RSP0 ('exec: rsp0 restored' x$RSP0_N)"
 else
-    echo "  FAIL: no 'exec: rsp0 restored' (#37 step (h) did not re-install the caller's kernel stack, or never ran)"; rc=1
+    echo "  FAIL: only $RSP0_N 'exec: rsp0 restored' (want 2: exwv + envprop — a caller resumed off its own kernel stack, or never ran)"; rc=1
 fi
 if strings "$LOG" | grep -q "exec: RSP0 STALE"; then
     echo "  FAIL: 'exec: RSP0 STALE' — TSS.RSP0 or the syscall top still pointed away from the #37 caller's own kernel stack"; rc=1
 fi
-# A pid-0 caller makes the witness vacuous (kernel_resume's park on slot 0 IS its stack) — the selftest must run
-# the #37 callers at a non-zero pid, as production's agnsh always is. Mutation M-B6 passed until this row existed.
+# A pid-0 caller makes the witness vacuous (pid 0's stack is kmain's) — the #37 callers must run at a non-zero pid,
+# as production's agnsh always is (after the scheduler starts pid 0 is kmain, so they always do since S3b).
 if strings "$LOG" | grep -q "exec: rsp0 check VACUOUS"; then
     echo "  FAIL: 'exec: rsp0 check VACUOUS' — a #37 caller ran at pid 0, where step (h) cannot be told from its absence"; rc=1
 fi

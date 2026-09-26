@@ -88,6 +88,81 @@
 #endif
 
 #ifdef ICMP_SELFTEST
+# ═══ 1.57.7 (S6) — the per-process reply slots (icmp: slots, M-S8) and the WK_ICMP wake (icmp: wake, M-S11).
+# ⚠ MODULE SCOPE: icst_buf[16] = 128 B (a 50-byte eth + IPv4 + ICMP echo-reply frame).
+var icst_buf[16];
+# Build an echo REPLY net_ip -> net_ip with id icmp_id and sequence `seq` into icst_buf; returns the frame length.
+fn icst_frame(seq) {
+    var f = &icst_buf;
+    var i = 0;
+    while (i < 128) { store8(f + i, 0); i = i + 1; }
+    store8(f + 12, 0x08); store8(f + 13, 0x00);
+    store8(f + 14, 0x45); store8(f + 16, 0); store8(f + 17, 36);
+    store8(f + 22, 64); store8(f + 23, 1);
+    store8(f + 26, (net_ip >> 24) & 0xFF); store8(f + 27, (net_ip >> 16) & 0xFF);
+    store8(f + 28, (net_ip >> 8) & 0xFF); store8(f + 29, net_ip & 0xFF);
+    store8(f + 30, (net_ip >> 24) & 0xFF); store8(f + 31, (net_ip >> 16) & 0xFF);
+    store8(f + 32, (net_ip >> 8) & 0xFF); store8(f + 33, net_ip & 0xFF);
+    store8(f + 34, 0);                                           # type 0 = echo reply
+    store8(f + 38, (icmp_id >> 8) & 0xFF); store8(f + 39, icmp_id & 0xFF);
+    store8(f + 40, (seq >> 8) & 0xFF); store8(f + 41, seq & 0xFF);
+    var ck = ip_checksum(f + 34, 16);
+    store8(f + 36, (ck >> 8) & 0xFF); store8(f + 37, ck & 0xFF);
+    var ick = ip_checksum(f + 14, 20);
+    store8(f + 24, (ick >> 8) & 0xFF); store8(f + 25, ick & 0xFF);
+    return 50;
+}
+fn icst_arm_slots() {
+    net_tick_pause();
+    var ok = 1;
+    var rx0 = icmp_rx;
+    icmp_slot_arm(14, 0x7101);
+    icmp_slot_arm(15, 0x7102);
+    icst_frame(0x7102);
+    net_handle_icmp(&icst_buf, 34, 16, 0x0A000202, net_ip);
+    if (load64(&icmp_slot_rtt + 15 * 8) < 0 || load64(&icmp_slot_rtt + 14 * 8) != 0 - 1) { ok = 0; }
+    icst_frame(0x7101);
+    net_handle_icmp(&icst_buf, 34, 16, 0x0A000203, net_ip);
+    if (load64(&icmp_slot_rtt + 14 * 8) < 0) { ok = 0; }
+    if (load64(&icmp_slot_from + 14 * 8) != 0x0A000203 || load64(&icmp_slot_from + 15 * 8) != 0x0A000202) { ok = 0; }
+    icst_frame(0x7100);
+    net_handle_icmp(&icst_buf, 34, 16, 0x0A000202, net_ip);
+    if (icmp_rx != rx0 + 2) { ok = 0; }
+    icmp_slot_clear(14);
+    icmp_slot_clear(15);
+    net_tick_resume();
+    if (ok == 1) { kprintln("icmp: slots PASS", 16); } else { kprintln("icmp: slots FAIL", 16); }
+    return ok;
+}
+# A pinger BLOCKED directly in icmp_block (no loop-top poll) is woken by the reply net_tick delivers from lo (M-S11).
+fn icst_arm_wake() {
+    if (net_ip == 0) { kprintln("icmp: wake SKIP (net_ip=0)", 26); return 0; }
+    net_tick_pause();
+    var ok = 1;
+    var me = proc_current_get();
+    if (me < 0 || me >= 16) { me = 0; }
+    icmp_slot_arm(me, 0x7201);
+    var len = icst_frame(0x7201);
+    var tf = net_tx_begin();
+    net_lo_enqueue(&icst_buf, len);
+    net_tx_end(tf);
+    var sf = kbd_irq_save();
+    net_tick_resume();
+    var t0 = sched_clock_us();
+    var r = icmp_block(me, 0x7201, t0 + 2000000);
+    var el = sched_clock_us() - t0;
+    net_tick_pause();
+    kbd_irq_restore(sf);
+    if (r != 0 || el >= 500000 || load64(&icmp_slot_rtt + me * 8) < 0) { ok = 0; }
+    icmp_slot_clear(me);
+    net_tick_resume();
+    kprint("icmp: wake us=", 14); kprint_num(el); kprint(" r=", 3); kprint_num(r); kprintln("", 0);
+    if (ok == 1) { kprintln("icmp: wake PASS", 15); } else { kprintln("icmp: wake FAIL", 15); }
+    return ok;
+}
+#endif
+
+#ifdef ICMP_SELFTEST
 # ICMP echo self-test (1.35.x, compile-gated via ICMP_SELFTEST).
 #   (1) HERMETIC: build an echo request, store its checksum, then re-checksum
 #       the whole message — a correct ICMP checksum makes the message sum to
@@ -115,6 +190,1001 @@
     } else {
         kprint("icmp: gw reply ticks=", 21); kprint_num(grtt); kprintln("", 0);
     }
+    icst_arm_slots();
+    icst_arm_wake();
+    kprintln("icmp: selftest done", 19);
+}
+#endif
+
+#ifdef TCP_SELFTEST
+# ═══ 1.57.7 (S4) — TCP_SELFTEST helpers + arms (scripts/smoke/tcp-smoke.sh; docs/architecture/net-concurrency.md).
+# Every arm is IF-independent (nothing reaches net_wait_backoff's hlt: every wait below uses an EXPIRED deadline).
+# Frames are injected through the REAL demux (net_demux_frame, which takes tcp_lock itself); replies to net_ip loop
+# into the lo queue and match no conn, so the next drain drops them. Lo assertions use deltas of lo_count/lo_dropped.
+# ⚠ MODULE SCOPE: `var tcpst_buf[16]` is 16 u64 = 128 BYTES (a function-local var[16] would be 16 bytes).
+var tcpst_buf[16];
+var tcpst_gen0[8];
+
+fn tcpst_be16(p, v) { store8(p, (v >> 8) & 0xFF); store8(p + 1, v & 0xFF); return 0; }
+fn tcpst_be32(p, v) {
+    store8(p, (v >> 24) & 0xFF); store8(p + 1, (v >> 16) & 0xFF);
+    store8(p + 2, (v >> 8) & 0xFF); store8(p + 3, v & 0xFF);
+    return 0;
+}
+
+# Build eth + IPv4 (net_ip -> net_ip) + TCP (window 0x2000; a SYN carries MSS 1460) into tcpst_buf; returns the
+# frame length. Checksums per critic C13: zero first, then the IP header sum and the TCP pseudo-header sum.
+fn tcpst_frame(sport, dport, seq, ack, flags, data, dlen) {
+    var f = &tcpst_buf;
+    var i = 0;
+    while (i < 128) { store8(f + i, 0); i = i + 1; }
+    var hl = 20;
+    if ((flags & 0x02) != 0) { hl = 24; }
+    var tl = hl + dlen;
+    store8(f + 12, 0x08); store8(f + 13, 0x00);
+    store8(f + 14, 0x45);
+    tcpst_be16(f + 16, 20 + tl);
+    store8(f + 22, 64); store8(f + 23, 6);
+    tcpst_be32(f + 26, net_ip); tcpst_be32(f + 30, net_ip);
+    tcpst_be16(f + 34, sport); tcpst_be16(f + 36, dport);
+    tcpst_be32(f + 38, seq); tcpst_be32(f + 42, ack);
+    store8(f + 46, (hl / 4) << 4);
+    store8(f + 47, flags);
+    store8(f + 48, 0x20); store8(f + 49, 0x00);
+    if (hl == 24) { store8(f + 54, 2); store8(f + 55, 4); store8(f + 56, 0x05); store8(f + 57, 0xB4); }
+    var j = 0;
+    while (j < dlen) { store8(f + 34 + hl + j, load8(data + j)); j = j + 1; }
+    tcpst_be16(f + 24, ip_checksum(f + 14, 20));
+    tcpst_be16(f + 50, tcp_checksum_compute(net_ip, net_ip, f + 34, tl));
+    return 14 + 20 + tl;
+}
+
+# An ICMP echo request net_ip -> net_ip, id 0x5354 (never icmp_id), 8 payload bytes.
+fn tcpst_echo(seq) {
+    var f = &tcpst_buf;
+    var i = 0;
+    while (i < 128) { store8(f + i, 0); i = i + 1; }
+    store8(f + 12, 0x08); store8(f + 13, 0x00);
+    store8(f + 14, 0x45); tcpst_be16(f + 16, 36);
+    store8(f + 22, 64); store8(f + 23, 1);
+    tcpst_be32(f + 26, net_ip); tcpst_be32(f + 30, net_ip);
+    store8(f + 34, 8);
+    tcpst_be16(f + 38, 0x5354); tcpst_be16(f + 40, seq);
+    var k = 0;
+    while (k < 8) { store8(f + 42 + k, 0x61 + k); k = k + 1; }
+    tcpst_be16(f + 36, ip_checksum(f + 34, 16));
+    tcpst_be16(f + 24, ip_checksum(f + 14, 20));
+    return 50;
+}
+
+fn tcpst_inject(len) { return net_demux_frame(&tcpst_buf, len); }
+fn tcpst_lo(len) {
+    var tf = net_tx_begin();
+    var tr = net_lo_enqueue(&tcpst_buf, len);
+    net_tx_end(tf);
+    return tr;
+}
+fn tcpst_drain() {
+    var n = 0;
+    while (n < 4 && lo_count != 0) { net_poll(); n = n + 1; }
+    return 0;
+}
+fn tcpst_lo_byte(k, off) { return load8(&lo_ring + ((lo_tail - 1 - k) & 7) * 1536 + off); }
+fn tcpst_seq32(k) {
+    return (tcpst_lo_byte(k, 38) << 24) | (tcpst_lo_byte(k, 39) << 16) | (tcpst_lo_byte(k, 40) << 8) | tcpst_lo_byte(k, 41);
+}
+fn tcpst_find(sport, dport) {
+    var ff = tcp_lock();
+    var fc = tcp_find_conn(sport, dport, net_ip, 0);
+    tcp_unlock(ff);
+    return fc;
+}
+fn tcpst_set_state(id, st) {
+    var sf = tcp_lock();
+    store64(tcp_conn_base(id), st);
+    tcp_unlock(sf);
+    return 0;
+}
+fn tcpst_gen(id) { return load64(&tcp_conn_gen + id * 8); }
+
+# ARM 5 helper — one wrapper (w: 0 tcp_lock, 1 net_tx_begin, 2 lo_q_begin, 3 udp_begin). Inside: IF=0, the
+# lock GLOBAL is 1 (the xchg hit the real global), preempt count = entry + 1. After: global 0, count back,
+# IF equal to the entry IF.
+fn tcpst_lk_one(w) {
+    var e_if = dm_read_rflags() & 0x200;
+    var pc0 = preempt_count_get();
+    var ok = 1;
+    var f = 0;
+    if (w == 0) { f = tcp_lock(); }
+    if (w == 1) { f = net_tx_begin(); }
+    if (w == 2) { f = lo_q_begin(); }
+    if (w == 3) { f = udp_begin(); }
+    if ((dm_read_rflags() & 0x200) != 0) { ok = 0; }
+    var g = 0;
+    if (w == 0) { g = tcp_tab_lock; }
+    if (w == 1) { g = net_tx_lock; }
+    if (w == 2) { g = lo_q_lock; }
+    if (w == 3) { g = udp_lock; }
+    if (g != 1) { ok = 0; }
+    if (preempt_count_get() != pc0 + 1) { ok = 0; }
+    if (w == 0) { tcp_unlock(f); }
+    if (w == 1) { net_tx_end(f); }
+    if (w == 2) { lo_q_end(f); }
+    if (w == 3) { udp_end(f); }
+    g = 1;
+    if (w == 0) { g = tcp_tab_lock; }
+    if (w == 1) { g = net_tx_lock; }
+    if (w == 2) { g = lo_q_lock; }
+    if (w == 3) { g = udp_lock; }
+    if (g != 0) { ok = 0; }
+    if (preempt_count_get() != pc0) { ok = 0; }
+    if ((dm_read_rflags() & 0x200) != e_if) { ok = 0; }
+    return ok;
+}
+
+fn tcpst_arm_locks() {
+    var ok = 1;
+    var was_if = dm_read_rflags() & 0x200;
+    if (was_if == 0) {
+        asm { 0xFB; }                  # sti — inputs: none; outputs: RFLAGS.IF=1; clobbers: none
+    }
+    var w = 0;
+    while (w < 4) {
+        if (tcpst_lk_one(w) != 1) { ok = 0; }          # with IF=1 at entry
+        var sf = kbd_irq_save();
+        if (tcpst_lk_one(w) != 1) { ok = 0; }          # inside kbd_irq_save (IF=0 at entry)
+        kbd_irq_restore(sf);
+        w = w + 1;
+    }
+    if (was_if == 0) {
+        asm { 0xFA; }                  # cli — inputs: none; outputs: RFLAGS.IF=0; clobbers: none
+    }
+    if (ok == 1) { kprintln("tcp: locks PASS", 15); } else { kprintln("tcp: locks FAIL", 15); }
+    return ok;
+}
+
+# ARM 6 — the lo drain demuxes IN PLACE (N-2): with the queue full, the head frame's echo reply finds no room
+# because its own slot is still occupied (exactly one drop); every later reply takes a freed slot.
+fn tcpst_arm_loinplace() {
+    if (net_ip == 0) { kprintln("net: lo-inplace SKIP (net_ip=0)", 31); return 0; }
+    var ok = 1;
+    tcpst_drain();
+    if (lo_count != 0) { ok = 0; }
+    var k = 0;
+    while (k < 8) { tcpst_lo(tcpst_echo(k)); k = k + 1; }
+    if (lo_count != 8) { ok = 0; }
+    var d0 = lo_dropped;
+    var r0 = icmp_replies_sent;
+    net_lo_drain();
+    if (lo_dropped != d0 + 1) { ok = 0; }
+    if (icmp_replies_sent != r0 + 8) { ok = 0; }
+    if (lo_count != 0) { ok = 0; }
+    if (ok == 1) { kprintln("net: lo-inplace PASS", 20); } else { kprintln("net: lo-inplace FAIL", 20); }
+    return ok;
+}
+
+# ARM 7 — virtio TX slots (N-1) + ring KVAs (N-6).
+fn tcpst_txs_mark(slot, ch) {
+    var tk = net_dma_kva(load64(vnet_tx_desc + slot * 16)) + 12 + 42;
+    if (load8(tk) != 84) { return 0; }             # 'T'
+    if (load8(tk + 1) != 88) { return 0; }         # 'X'
+    if (load8(tk + 2) != 83) { return 0; }         # 'S'
+    if (load8(tk + 3) != 45) { return 0; }         # '-'
+    if (load8(tk + 4) != ch) { return 0; }
+    return 1;
+}
+fn tcpst_arm_txslots() {
+    if (vnet_active == 0) { kprintln("net: txslots SKIP (no virtio-net)", 33); return 0; }
+    var ok = 1;
+    if (vnet_rx_desc < DIRECTMAP_BASE || vnet_rx_avail < DIRECTMAP_BASE || vnet_rx_used < DIRECTMAP_BASE) { ok = 0; }
+    if (vnet_tx_desc < DIRECTMAP_BASE || vnet_tx_avail < DIRECTMAP_BASE || vnet_tx_used < DIRECTMAP_BASE) { ok = 0; }
+    var sf = kbd_irq_save();
+    var ia = vnet_tx_idx;
+    var ra = udp_send(ip4(10, 0, 2, 2), 40100, 9, "TXS-A-MARK", 10);
+    var ib = vnet_tx_idx;
+    var rb = udp_send(ip4(10, 0, 2, 2), 40100, 9, "TXS-B-MARK", 10);
+    var ic = vnet_tx_idx;
+    kbd_irq_restore(sf);
+    if (ra <= 0 || rb <= 0) { ok = 0; }
+    if (ib != ia + 1 || ic != ib + 1) { ok = 0; }
+    var sa = ia & (vnet_tx_slots - 1);
+    var sb = ib & (vnet_tx_slots - 1);
+    if (load64(vnet_tx_desc + sa * 16) == load64(vnet_tx_desc + sb * 16)) { ok = 0; }
+    if (load64(vnet_tx_desc + sa * 16) != load64(&vnet_tx_bufs + sa * 8)) { ok = 0; }
+    if (tcpst_txs_mark(sa, 65) != 1) { ok = 0; }   # 'A'
+    if (tcpst_txs_mark(sb, 66) != 1) { ok = 0; }   # 'B'
+    if (ok == 1) { kprintln("net: txslots PASS", 17); } else { kprintln("net: txslots FAIL", 17); }
+    return ok;
+}
+
+# ARM 8 — the pool, the claim (gen bump, publish last), hardening (a), C11, a SYN_RCVD close, C7(a).
+fn tcpst_arm_claim() {
+    if (net_ip == 0) { kprintln("tcp: claim SKIP (net_ip=0)", 26); return 0; }
+    var ok = 1;
+    if (tcp_pool_ready != 1) { ok = 0; }
+    var pa = 0;
+    while (pa < 16) {
+        var pv = load64(&tcp_pool_rx + pa * 8);
+        if (pa >= 8) { pv = load64(&tcp_pool_retx + (pa - 8) * 8); }
+        if (pv == 0 || pv < DIRECTMAP_BASE) { ok = 0; }
+        var pb = pa + 1;
+        while (pb < 16) {
+            var pw = load64(&tcp_pool_rx + pb * 8);
+            if (pb >= 8) { pw = load64(&tcp_pool_retx + (pb - 8) * 8); }
+            if (pv == pw) { ok = 0; }
+            pb = pb + 1;
+        }
+        pa = pa + 1;
+    }
+    var l = tcp_listen(7778);
+    if (l < 0) { ok = 0; }
+    if (tcp_listen(7778) != 0 - 1) { ok = 0; }
+    var gi = 0;
+    while (gi < 8) { store64(&tcpst_gen0 + gi * 8, tcpst_gen(gi)); gi = gi + 1; }
+    tcpst_inject(tcpst_frame(40001, 7778, 0x11223344, 0, 0x02, 0, 0));
+    var c = tcpst_find(40001, 7778);
+    if (c < 0 || l < 0) {
+        ok = 0;
+    } else {
+        var cb = tcp_conn_base(c);
+        if (load64(cb) != 6) { ok = 0; }
+        if (load64(cb + 48) != load64(&tcp_pool_rx + c * 8)) { ok = 0; }
+        if (load64(cb + 136) != load64(&tcp_pool_retx + c * 8)) { ok = 0; }
+        if (load64(cb + 128) != 0x12) { ok = 0; }
+        if (load64(cb + 144) != 1460) { ok = 0; }
+        if (load64(cb + 72) != (0x200 | (l << 16))) { ok = 0; }
+        if (tcpst_gen(c) != load64(&tcpst_gen0 + c * 8) + 1) { ok = 0; }
+        var isn = load64(cb + 56);
+        if (load64(cb + 32) != ((isn + 1) & 0xFFFFFFFF)) { ok = 0; }
+        # (a) a retransmitted SYN re-sends the SYN-ACK at the held ISN, SND.NXT untouched.
+        tcpst_drain();
+        var q0 = lo_count;
+        var nx0 = load64(cb + 32);
+        tcpst_inject(tcpst_frame(40001, 7778, 0x11223344, 0, 0x02, 0, 0));
+        if (lo_count != q0 + 1) { ok = 0; }
+        if (tcpst_lo_byte(0, 47) != 0x12) { ok = 0; }
+        if (tcpst_seq32(0) != isn) { ok = 0; }
+        if (load64(cb + 32) != nx0) { ok = 0; }
+        # C11: RST in SYN_RCVD -> CLOSED with the retransmit DISARMED.
+        tcpst_inject(tcpst_frame(40001, 7778, 0x11223345, 0, 0x04, 0, 0));
+        if (load64(cb) != 0) { ok = 0; }
+        if (load64(cb + 128) != 0) { ok = 0; }
+    }
+    tcpst_drain();
+    tcpst_inject(tcpst_frame(40003, 7778, 0x5000, 0, 0x02, 0, 0));
+    var d = tcpst_find(40003, 7778);
+    if (d < 0) {
+        ok = 0;
+    } else {
+        var db = tcp_conn_base(d);
+        tcp_close(d);
+        if (load64(db) != 0 || load64(db + 48) != 0 || load64(db + 128) != 0) { ok = 0; }
+        if (load64(db + 136) != load64(&tcp_pool_retx + d * 8)) { ok = 0; }
+    }
+    # C7(a): once the listener is closed, a state-6 claim naming it as parent is refused.
+    if (l >= 0) {
+        tcp_close(l);
+        var cf = tcp_lock();
+        var stale = tcp_slot_claim_locked(6, 7778, 40004, net_ip, 1, 1, 0x200 | (l << 16), 536, 0, net_ip);
+        if (stale >= 0) { ok = 0; tcp_slot_release_locked(stale); }
+        tcp_unlock(cf);
+    }
+    tcpst_drain();
+    if (ok == 1) { kprintln("tcp: claim PASS", 15); } else { kprintln("tcp: claim FAIL", 15); }
+    return ok;
+}
+
+# ARM 9 — the generation (N-4) and tcp_connect_wait's 2|4 / release_if rules (N-8). Expired deadlines only.
+fn tcpst_arm_gen() {
+    var ok = 1;
+    var g = tcp_slot_claim(1, 0xEEE2, 0xEEE2, 0, 1, 0, 0, 536, 0, net_ip);
+    if (g < 0) {
+        ok = 0;
+    } else {
+        var gb = tcp_conn_base(g);
+        var g0 = tcpst_gen(g);
+        if (tcp_conn_check(g, g0) != 1) { ok = 0; }
+        var dl = sched_clock_us() - 1;                             # 1.57.7 (S6): deadlines are µs
+        tcpst_set_state(g, 4);                                     # (1) N-8: CLOSE_WAIT counts as connected
+        if (tcp_connect_wait(g, 0, 0, g0, dl) != g) { ok = 0; }      # 1.57.7 S5: (tag, epoch, gen) snapshot; g is tag 0
+        if (load64(gb) != 4) { ok = 0; }
+        var gf = tcp_lock();                                       # (2) recycled: state 2, gen bumped
+        store64(gb, 2);
+        store64(&tcp_conn_gen + g * 8, tcpst_gen(g) + 1);
+        tcp_unlock(gf);
+        if (tcp_conn_check(g, g0) != 0 - 1) { ok = 0; }
+        if (tcp_connect_wait(g, 0, 0, g0, dl) != 0 - 1) { ok = 0; }
+        if (load64(gb) != 2) { ok = 0; }                           # not released: someone else's now
+        var g1 = tcpst_gen(g);                                     # (3) still SYN_SENT + ours -> released
+        tcpst_set_state(g, 1);
+        if (tcp_connect_wait(g, 0, 0, g1, dl) != 0 - 1) { ok = 0; }
+        if (load64(gb) != 0 || load64(gb + 48) != 0 || load64(gb + 128) != 0) { ok = 0; }
+        if (load64(gb) != 0) { tcp_close(g); }
+    }
+    if (ok == 1) { kprintln("tcp: gen PASS", 13); } else { kprintln("tcp: gen FAIL", 13); }
+    return ok;
+}
+
+# ARM 10 — the passive backlog: at most TCP_SYNRCVD_MAX (4) SYN_RCVD, and passive children never take the last
+# free slot (TCP_PASSIVE_RESERVE); a LISTEN close RSTs its un-accepted ESTABLISHED children.
+fn tcpst_arm_syncap() {
+    if (net_ip == 0) { kprintln("tcp: syncap SKIP (net_ip=0)", 27); return 0; }
+    var ok = 1;
+    var l = tcp_listen(7780);
+    if (l < 0) { kprintln("tcp: syncap FAIL", 16); return 0; }
+    var sf = tcp_lock();
+    var free0 = tcp_free_slots_locked();
+    tcp_unlock(sf);
+    var want = free0 - 1;
+    if (want > 4) { want = 4; }
+    var n = 0;
+    var k = 0;
+    while (k < 8) {
+        tcpst_inject(tcpst_frame(40010 + k, 7780, 0x1000 * (k + 1), 0, 0x02, 0, 0));
+        tcpst_drain();
+        if (tcpst_find(40010 + k, 7780) < 0) { break; }
+        n = n + 1;
+        k = k + 1;
+    }
+    if (n != want) { ok = 0; }
+    var h = 0;
+    while (h < n) {                                                # complete the handshakes -> ESTABLISHED
+        var hc = tcpst_find(40010 + h, 7780);
+        if (hc >= 0) {
+            var hisn = load64(tcp_conn_base(hc) + 56);
+            tcpst_inject(tcpst_frame(40010 + h, 7780, 0x1000 * (h + 1) + 1, (hisn + 1) & 0xFFFFFFFF, 0x10, 0, 0));
+            if (load64(tcp_conn_base(hc)) != 2) { ok = 0; }
+        }
+        h = h + 1;
+    }
+    tcpst_drain();
+    var m = 0;
+    while (m < 8) {                                                # keep offering SYNs: the reserve stops them
+        tcpst_inject(tcpst_frame(40020 + m, 7780, 0x9000 + m, 0, 0x02, 0, 0));
+        tcpst_drain();
+        m = m + 1;
+    }
+    var kids = 0;
+    var est = 0;
+    var ci = 0;
+    while (ci < tcp_conn_count) {
+        var cm = load64(tcp_conn_base(ci) + 72);
+        var cs = load64(tcp_conn_base(ci));
+        if (cs != 0 && (cm & 0x200) != 0 && ((cm >> 16) & 0xFF) == l) {
+            kids = kids + 1;
+            if (cs == 2 || cs == 4) { est = est + 1; }
+        }
+        ci = ci + 1;
+    }
+    if (kids != free0 - 1) { ok = 0; }
+    sf = tcp_lock();
+    if (tcp_free_slots_locked() != 1) { ok = 0; }
+    tcp_unlock(sf);
+    tcpst_drain();
+    var q0 = lo_count + lo_dropped;
+    tcp_close(l);
+    ci = 0;
+    while (ci < tcp_conn_count) {
+        var cm2 = load64(tcp_conn_base(ci) + 72);
+        if ((cm2 & 0x200) != 0 && ((cm2 >> 16) & 0xFF) == l) {
+            if (load64(tcp_conn_base(ci)) != 0) { ok = 0; }
+        }
+        ci = ci + 1;
+    }
+    if (lo_count + lo_dropped - q0 != est) { ok = 0; }
+    tcpst_drain();
+    if (ok == 1) { kprintln("tcp: syncap PASS", 16); } else { kprintln("tcp: syncap FAIL", 16); }
+    return ok;
+}
+
+# ARM 11 — the EOF rule (issue 2026-09-23-sock-recv-never-reports-eof-after-peer-fin): {dead} ∪ {CLOSE_WAIT with
+# an empty ring}; data always drains before EOF.
+fn tcpst_arm_eof() {
+    var ok = 1;
+    var e = tcp_slot_claim(2, 0xEEED, 0xEEED, 0, 0, 0, 0, 536, 0, net_ip);
+    if (e < 0) {
+        ok = 0;
+    } else {
+        var eb = tcp_conn_base(e);
+        if (tcp_conn_eof(e) != 0) { ok = 0; }                     # live + empty: not EOF
+        tcpst_set_state(e, 4);
+        if (tcp_conn_eof(e) != 1) { ok = 0; }                     # CLOSE_WAIT + empty: EOF
+        var ef = tcp_lock();
+        tcp_rx_append(eb, "HELLO", 5);
+        tcp_unlock(ef);
+        if (tcp_conn_eof(e) != 0) { ok = 0; }                     # data before EOF
+        if (tcp_recv(e, &tcpst_buf, 16) != 5) { ok = 0; }
+        if (tcp_conn_eof(e) != 1) { ok = 0; }
+        ef = tcp_lock();
+        tcp_slot_release_locked(e);
+        tcp_unlock(ef);
+        if (tcp_conn_eof(e) != 1) { ok = 0; }                     # dead: EOF
+    }
+    if (ok == 1) { kprintln("tcp: eof PASS", 13); } else { kprintln("tcp: eof FAIL", 13); }
+    return ok;
+}
+
+# ARM 12 — half-close (D12(ii)): a FIN before accept keeps the child (CLOSE_WAIT, not reaped), accept returns it,
+# its data then EOF are delivered, it can SEND in CLOSE_WAIT, a re-sent FIN is re-ACKed (N-5), our close from
+# CLOSE_WAIT sends one FIN|ACK at SND.NXT, and a RST in CLOSE_WAIT closes it (N-5).
+fn tcpst_arm_halfclose() {
+    if (net_ip == 0) { kprintln("tcp: halfclose SKIP (net_ip=0)", 30); return 0; }
+    var ok = 1;
+    var l = tcp_listen(7779);
+    if (l < 0) { kprintln("tcp: halfclose FAIL", 19); return 0; }
+    var S = 0x7000;
+    tcpst_inject(tcpst_frame(40002, 7779, S, 0, 0x02, 0, 0));
+    var c = tcpst_find(40002, 7779);
+    if (c < 0) {
+        ok = 0;
+    } else {
+        var cb = tcp_conn_base(c);
+        var isn = load64(cb + 56);
+        tcpst_inject(tcpst_frame(40002, 7779, S + 1, isn + 1, 0x10, 0, 0));
+        if (load64(cb) != 2) { ok = 0; }
+        tcpst_inject(tcpst_frame(40002, 7779, S + 1, isn + 1, 0x18, "GET", 3));
+        if (load64(cb + 64) - load64(cb + 80) != 3) { ok = 0; }
+        var gc = tcpst_gen(c);
+        tcpst_inject(tcpst_frame(40002, 7779, S + 4, isn + 1, 0x11, 0, 0));
+        if (load64(cb) != 4) { ok = 0; }                           # kept, NOT reaped
+        if (tcpst_gen(c) != gc) { ok = 0; }
+        if (tcp_accept(l) != c) { ok = 0; }
+        if ((load64(cb + 72) & 0x400) == 0) { ok = 0; }
+        var rb = &tcpst_gen0;                                      # 64-byte module scratch (gens are done)
+        if (tcp_recv(c, rb, 8) != 3) { ok = 0; }
+        if (load8(rb) != 71 || load8(rb + 1) != 69 || load8(rb + 2) != 84) { ok = 0; }   # "GET"
+        if (tcp_conn_eof(c) != 1) { ok = 0; }
+        # SEND IN CLOSE_WAIT: the peer's ACK for our 2 bytes is pre-queued; tcp_send's first net_poll drains it.
+        tcpst_drain();
+        tcpst_lo(tcpst_frame(40002, 7779, S + 5, (isn + 3) & 0xFFFFFFFF, 0x10, 0, 0));
+        var t0 = lo_tail;
+        var dq0 = lo_dropped;
+        if (tcp_send(c, "OK", 2) != 2) { ok = 0; }
+        if (((lo_tail - t0) & 7) != 1 || lo_dropped != dq0) { ok = 0; }   # exactly one data frame
+        # N-5: a re-sent FIN in CLOSE_WAIT is re-ACKed.
+        tcpst_drain();
+        var q0 = lo_count;
+        tcpst_inject(tcpst_frame(40002, 7779, S + 4, (isn + 3) & 0xFFFFFFFF, 0x11, 0, 0));
+        if (lo_count != q0 + 1) { ok = 0; }
+        if (tcpst_lo_byte(0, 47) != 0x10) { ok = 0; }
+        # Close from CLOSE_WAIT: one FIN|ACK at SND.NXT. 1.57.7 (S6, graceful close): the slot is now a kernel-held
+        # LAST_ACK (state 3, PEER_FIN, the FIN ARMED, ring unbound) until the peer ACKs the FIN — then released.
+        tcpst_drain();
+        var lo0 = lo_count;
+        var nxt = load64(cb + 32);
+        tcp_close(c);
+        if (lo_count != lo0 + 1) { ok = 0; }
+        if (tcpst_lo_byte(0, 47) != 0x11) { ok = 0; }
+        if (tcpst_seq32(0) != nxt) { ok = 0; }
+        if (load64(cb) != 3 || load64(cb + 48) != 0 || load64(cb + 128) != 0x11) { ok = 0; }
+        if ((load64(cb + 72) & TCP_META_PEER_FIN) == 0) { ok = 0; }
+        tcpst_drain();
+        tcpst_inject(tcpst_frame(40002, 7779, S + 5, (nxt + 1) & 0xFFFFFFFF, 0x10, 0, 0));   # the peer ACKs our FIN
+        if (load64(cb) != 0 || load64(cb + 48) != 0) { ok = 0; }
+        if (load64(cb + 136) != load64(&tcp_pool_retx + c * 8)) { ok = 0; }
+    }
+    # N-5: RST in CLOSE_WAIT (an un-accepted child).
+    tcpst_drain();
+    var S2 = 0x8000;
+    tcpst_inject(tcpst_frame(40005, 7779, S2, 0, 0x02, 0, 0));
+    var c2 = tcpst_find(40005, 7779);
+    if (c2 < 0) {
+        ok = 0;
+    } else {
+        var c2b = tcp_conn_base(c2);
+        var isn2 = load64(c2b + 56);
+        tcpst_inject(tcpst_frame(40005, 7779, S2 + 1, isn2 + 1, 0x10, 0, 0));
+        tcpst_inject(tcpst_frame(40005, 7779, S2 + 1, isn2 + 1, 0x11, 0, 0));
+        if (load64(c2b) != 4) { ok = 0; }
+        tcpst_inject(tcpst_frame(40005, 7779, S2 + 2, isn2 + 1, 0x04, 0, 0));
+        if (load64(c2b) != 0 || load64(c2b + 128) != 0) { ok = 0; }
+    }
+    tcp_close(l);
+    tcpst_drain();
+    if (ok == 1) { kprintln("tcp: halfclose PASS", 19); } else { kprintln("tcp: halfclose FAIL", 19); }
+    return ok;
+}
+
+# ═══ 1.57.7 (S6) — the net-wait arms (docs/architecture/blocking-waits.md § Network waits). The whole TCP_SELFTEST
+# block runs between net_tick_pause() and net_tick_resume(); the arms that exist to prove net_tick (tickretx, ticklo,
+# ackwake, rstwake) resume it for their own window and pause again. Fake slots are net_ip <-> net_ip (crafted frames
+# from tcpst_frame match them; our own looped frames go to ports nothing listens on and are dropped) or 127.0.0.2
+# (resends that must be dropped). ⚠ MODULE SCOPE: tcpst_pat[16] = 128 B, tcpst_ls[8] = 8 ids.
+var tcpst_pat[16];
+var tcpst_ls[8];
+fn tcpst_rel(id) {
+    var rf = tcp_lock();
+    tcp_slot_release_locked(id);
+    tcp_unlock(rf);
+    return 0;
+}
+fn tcpst_fake(lp, rp, own) { return tcp_slot_claim(2, lp, rp, net_ip, 0x1000, 0x2000, 0, 536, own, net_ip); }
+fn tcpst_st(id) { return load64(tcp_conn_base(id)); }
+# Rewrite the window of the frame in tcpst_buf (length `len`) and recompute its TCP checksum; returns len.
+fn tcpst_setwnd(len, wnd) {
+    var f = &tcpst_buf;
+    tcpst_be16(f + 48, wnd);
+    tcpst_be16(f + 50, 0);
+    tcpst_be16(f + 50, tcp_checksum_compute(net_ip, net_ip, f + 34, len - 34));
+    return len;
+}
+fn tcpst_verdict(ok, name, nlen) {
+    kprint("tcp: ", 5);
+    kprint(name, nlen);
+    if (ok == 1) { kprintln(" PASS", 5); } else { kprintln(" FAIL", 5); }
+    return ok;
+}
+fn tcpst_find_lr(lp, rp) {
+    var fi = 0;
+    while (fi < tcp_conn_count) {
+        var fb = tcp_conn_base(fi);
+        if (load64(fb + 8) == lp && load64(fb + 16) == rp) { return fi; }
+        fi = fi + 1;
+    }
+    return 0 - 1;
+}
+
+# rebase — a stamp in the future (the tsc_calibrate step) is reset to now and becomes due one RTO later (M-REBASE).
+fn tcpst_arm_rebase() {
+    var ok = 1;
+    var c = tcpst_fake(0xEE10, 0xEE11, 0);
+    if (c < 0) { return tcpst_verdict(0, "rebase", 6); }
+    var cb = tcp_conn_base(c);
+    var f = tcp_lock();
+    tcp_arm_retx(cb, 0x1000, 0x18, "X", 1);
+    var now = sched_clock_us();
+    store64(cb + 112, now + 5000000);
+    var r1 = tcp_retx_due(cb, now);
+    var st = load64(cb + 112);
+    var r2 = tcp_retx_due(cb, now + 1000000);
+    tcp_unlock(f);
+    if (r1 != 0 || st != now || r2 != 1) { ok = 0; }
+    tcpst_rel(c);
+    return tcpst_verdict(ok, "rebase", 6);
+}
+
+# tickretx — a due segment is retransmitted by net_tick alone (no net_poll): a BLOCKED sender's resend (M-S5).
+fn tcpst_arm_tickretx() {
+    if ((dm_read_rflags() & 0x200) == 0) { kprintln("tcp: tickretx FAIL if0", 22); return 0; }
+    var ok = 1;
+    var c = tcp_slot_claim(2, 0xEE12, 0xEE13, 0x7F000002, 0x3000, 0x4000, 0, 536, 0, 0x7F000001);
+    if (c < 0) { return tcpst_verdict(0, "tickretx", 8); }
+    var cb = tcp_conn_base(c);
+    var f = tcp_lock();
+    tcp_arm_retx(cb, 0x3000, 0x18, "T", 1);
+    store64(cb + 32, 0x3001);
+    store64(cb + 112, sched_clock_us() - 2000000);
+    tcp_unlock(f);
+    net_tick_resume();
+    var k = 0;
+    while (k < 5 && load64(cb + 120) < 1) { arch_wait(); k = k + 1; }
+    net_tick_pause();
+    if (load64(cb + 120) < 1) { ok = 0; }
+    tcpst_rel(c);
+    return tcpst_verdict(ok, "tickretx", 8);
+}
+
+# ticklo — a loopback datagram nobody polls for is delivered by net_tick's lo drain (M-S6).
+fn tcpst_arm_ticklo() {
+    if ((dm_read_rflags() & 0x200) == 0) { kprintln("tcp: ticklo FAIL if0", 20); return 0; }
+    var ok = 1;
+    var lid = udp_bind(0xEE20);
+    if (lid < 0) { return tcpst_verdict(0, "ticklo", 6); }
+    net_tick_resume();
+    udp_send(0x7F000001, 0xEE21, 0xEE20, "TICKLO", 6);
+    var k = 0;
+    while (k < 5 && load64(udp_listener_base(lid) + 24) == 0) { arch_wait(); k = k + 1; }
+    net_tick_pause();
+    if (load64(udp_listener_base(lid) + 24) != 6) { ok = 0; }
+    udp_unbind(lid);
+    return tcpst_verdict(ok, "ticklo", 6);
+}
+
+# wndopen — an ACK that opens a zero window makes the held probe due now with count 0 (M-S4).
+fn tcpst_arm_wndopen() {
+    var ok = 1;
+    var c = tcpst_fake(0xEE30, 0xEE31, 0);
+    if (c < 0) { return tcpst_verdict(0, "wndopen", 7); }
+    var cb = tcp_conn_base(c);
+    var f = tcp_lock();
+    tcp_arm_retx(cb, 0x1000, 0x18, "P", 1);
+    store64(cb + 32, 0x1001);
+    store64(cb + 88, 0);
+    store64(cb + 120, 3);
+    tcp_unlock(f);
+    tcpst_inject(tcpst_setwnd(tcpst_frame(0xEE31, 0xEE30, 0x2000, 0x1000, 0x10, 0, 0), 1000));
+    f = tcp_lock();
+    var cnt = load64(cb + 120);
+    var due = tcp_retx_due(cb, sched_clock_us());
+    var w = load64(cb + 88);
+    var armed = load64(cb + 128);
+    tcp_unlock(f);
+    if (cnt != 0 || due != 1 || w != 1000 || armed != 0x18) { ok = 0; }
+    tcpst_rel(c);
+    return tcpst_verdict(ok, "wndopen", 7);
+}
+
+# persist — a zero-window ACK that does not cover the held data segment caps the retry count (M-S7).
+fn tcpst_arm_persist() {
+    var ok = 1;
+    var c = tcpst_fake(0xEE32, 0xEE33, 0);
+    if (c < 0) { return tcpst_verdict(0, "persist", 7); }
+    var cb = tcp_conn_base(c);
+    var f = tcp_lock();
+    tcp_arm_retx(cb, 0x1000, 0x18, "PERSIST!", 8);
+    store64(cb + 32, 0x1008);
+    store64(cb + 120, 5);
+    tcp_unlock(f);
+    tcpst_inject(tcpst_setwnd(tcpst_frame(0xEE33, 0xEE32, 0x2000, 0x1000, 0x10, 0, 0), 0));
+    if (load64(cb + 120) != 4 || load64(cb + 128) != 0x18) { ok = 0; }
+    tcpst_rel(c);
+    return tcpst_verdict(ok, "persist", 7);
+}
+
+# partack — a partial ACK trims the held segment to the unACKed tail (M-TRIM).
+fn tcpst_arm_partack() {
+    var ok = 1;
+    var c = tcpst_fake(0xEE34, 0xEE35, 0);
+    if (c < 0) { return tcpst_verdict(0, "partack", 7); }
+    var cb = tcp_conn_base(c);
+    var i = 0;
+    while (i < 100) { store8(&tcpst_pat + i, (i * 7 + 3) & 0xFF); i = i + 1; }
+    var f = tcp_lock();
+    tcp_arm_retx(cb, 0x1000, 0x18, &tcpst_pat, 100);
+    store64(cb + 32, 0x1064);
+    store64(cb + 88, 8192);
+    tcp_unlock(f);
+    tcpst_inject(tcpst_frame(0xEE35, 0xEE34, 0x2000, 0x1028, 0x10, 0, 0));
+    var rb = load64(cb + 136);
+    if (load64(cb + 96) != 0x1028 || load64(cb + 104) != 60 || load64(cb + 56) != 0x1028) { ok = 0; }
+    if (load64(cb + 128) != 0x18) { ok = 0; }
+    if (load8(rb) != ((40 * 7 + 3) & 0xFF) || load8(rb + 59) != ((99 * 7 + 3) & 0xFF)) { ok = 0; }
+    tcpst_inject(tcpst_frame(0xEE35, 0xEE34, 0x2000, 0x1064, 0x10, 0, 0));
+    if (load64(cb + 128) != 0) { ok = 0; }
+    tcpst_rel(c);
+    return tcpst_verdict(ok, "partack", 7);
+}
+
+# wndstale — a reordered ACK older than SND.UNA does not overwrite the window (M-WSTALE).
+fn tcpst_arm_wndstale() {
+    var ok = 1;
+    var c = tcpst_fake(0xEE36, 0xEE37, 0);
+    if (c < 0) { return tcpst_verdict(0, "wndstale", 8); }
+    var cb = tcp_conn_base(c);
+    var f = tcp_lock();
+    store64(cb + 56, 0x1064);
+    store64(cb + 32, 0x1064);
+    store64(cb + 88, 100);
+    tcp_unlock(f);
+    tcpst_inject(tcpst_setwnd(tcpst_frame(0xEE37, 0xEE36, 0x2000, 0x1000, 0x10, 0, 0), 5000));
+    if (load64(cb + 88) != 100) { ok = 0; }
+    tcpst_inject(tcpst_setwnd(tcpst_frame(0xEE37, 0xEE36, 0x2000, 0x1064, 0x10, 0, 0), 5000));
+    if (load64(cb + 88) != 5000) { ok = 0; }
+    tcpst_rel(c);
+    return tcpst_verdict(ok, "wndstale", 8);
+}
+
+# ackwake — a sender BLOCKED directly in tcp_block (no loop-top poll) is woken by the ACK net_tick delivers, well
+# before its 2 s deadline (M-S1). The covering ACK is PRE-ENQUEUED in lo; IF=0 from before the resume to the arm, so
+# at -smp 1 no tick can deliver it early.
+fn tcpst_arm_ackwake() {
+    var ok = 1;
+    var c = tcpst_fake(0xEE38, 0xEE39, 0);
+    if (c < 0) { return tcpst_verdict(0, "ackwake", 7); }
+    var cb = tcp_conn_base(c);
+    var f = tcp_lock();
+    store64(cb + 88, 1000);
+    tcp_arm_retx(cb, 0x1000, 0x18, "A", 1);
+    store64(cb + 32, 0x1001);
+    var g = tcp_conn_gen_get(c);
+    tcp_unlock(f);
+    tcpst_drain();
+    tcpst_lo(tcpst_frame(0xEE39, 0xEE38, 0x2000, 0x1001, 0x10, 0, 0));
+    var sf = kbd_irq_save();
+    net_tick_resume();
+    var t0 = sched_clock_us();
+    var r = tcp_block(c, 2, 0, 0, g, t0 + 2000000);
+    var el = sched_clock_us() - t0;
+    net_tick_pause();
+    kbd_irq_restore(sf);
+    if (r != 0 || el >= 500000 || load64(cb + 128) != 0) { ok = 0; }
+    kprint("tcp: ackwake us=", 16); kprint_num(el); kprint(" r=", 3); kprint_num(r); kprintln("", 0);
+    tcpst_rel(c);
+    return tcpst_verdict(ok, "ackwake", 7);
+}
+
+# rstwake — a #47 waiter blocked in SYN_SENT is woken by the RST (M-RSTWAKE).
+fn tcpst_arm_rstwake() {
+    var ok = 1;
+    var c = tcp_slot_claim(1, 0xEE3A, 0xEE3B, net_ip, 0x5000, 0, 0, 536, 0, net_ip);
+    if (c < 0) { return tcpst_verdict(0, "rstwake", 7); }
+    var cb = tcp_conn_base(c);
+    var f = tcp_lock();
+    tcp_arm_retx(cb, 0x5000, 0x02, 0, 0);
+    store64(cb + 32, 0x5001);
+    var g = tcp_conn_gen_get(c);
+    tcp_unlock(f);
+    tcpst_drain();
+    tcpst_lo(tcpst_frame(0xEE3B, 0xEE3A, 0, 0, 0x04, 0, 0));
+    var sf = kbd_irq_save();
+    net_tick_resume();
+    var t0 = sched_clock_us();
+    var r = tcp_block(c, 1, 0, 0, g, t0 + 2000000);
+    var el = sched_clock_us() - t0;
+    net_tick_pause();
+    kbd_irq_restore(sf);
+    if (r != 0 || el >= 500000 || tcpst_st(c) != 0) { ok = 0; }
+    kprint("tcp: rstwake us=", 16); kprint_num(el); kprintln("", 0);
+    tcpst_rel(c);
+    return tcpst_verdict(ok, "rstwake", 7);
+}
+
+# legacyif — net_legacy_step leaves IF exactly as it found it, post-scheduler, both ways (M-LEGIF).
+fn tcpst_arm_legacyif() {
+    var ok = 1;
+    var sf = kbd_irq_save();
+    net_legacy_step(NET_BUSY_SPINS);
+    if ((dm_read_rflags() & 0x200) != 0) { ok = 0; }
+    kbd_irq_restore(sf);
+    if ((dm_read_rflags() & 0x200) == 0) { ok = 0; }          # the block runs IF=1
+    net_legacy_step(NET_BUSY_SPINS);
+    if ((dm_read_rflags() & 0x200) == 0) { ok = 0; }
+    return tcpst_verdict(ok, "legacyif", 8);
+}
+
+# finretx — graceful close: the close body holds a kernel-owned FIN slot with the FIN armed and retransmitted, and it
+# is released on (FIN ACKed + peer FIN), at once from LAST_ACK, on exhaustion, and TCP_FINWAIT2_US after the ACK
+# (M-FIN1).
+fn tcpst_arm_finretx() {
+    var ok = 1;
+    tcpst_drain();
+    var c = tcpst_fake(0xEE40, 0xEE41, 16);                     # owned by the synthetic tag 16 (pid 15)
+    if (c < 0) { return tcpst_verdict(0, "finretx", 7); }
+    var cb = tcp_conn_base(c);
+    var q0 = lo_count + lo_dropped;
+    var nx = load64(cb + 32);
+    if (tcp_close_own(c, 16) != 0) { ok = 0; }
+    if (tcpst_st(c) != 3 || load64(cb + 152) != 0 || load64(cb + 48) != 0 || load64(cb + 128) != 0x11) { ok = 0; }
+    if (load64(cb + 32) != ((nx + 1) & 0xFFFFFFFF)) { ok = 0; }
+    if (lo_count + lo_dropped != q0 + 1) { ok = 0; }
+    if (tcp_close_own(c, 16) != 0 - 1) { ok = 0; }             # the caller's id is dead at once
+    var f = tcp_lock();
+    store64(cb + 112, sched_clock_us() - 2000000);
+    tcp_unlock(f);
+    tcp_retx_tick();
+    if (load64(cb + 120) != 1 || tcpst_st(c) != 3) { ok = 0; }
+    tcpst_drain();
+    tcpst_inject(tcpst_frame(0xEE41, 0xEE40, load64(cb + 40), (nx + 1) & 0xFFFFFFFF, 0x10, 0, 0));
+    if (tcpst_st(c) != 3 || load64(cb + 128) != 0) { ok = 0; }  # FIN_WAIT_2
+    var q1 = lo_count;
+    tcpst_inject(tcpst_frame(0xEE41, 0xEE40, load64(cb + 40), (nx + 1) & 0xFFFFFFFF, 0x11, 0, 0));
+    if (lo_count != q1 + 1 || tcpst_lo_byte(0, 47) != 0x10) { ok = 0; }   # the peer's FIN is ACKed
+    if (tcpst_st(c) != 0) { ok = 0; }
+    tcpst_drain();
+    # From CLOSE_WAIT (LAST_ACK): the ACK of our FIN releases at once.
+    var c2 = tcpst_fake(0xEE42, 0xEE43, 0);
+    if (c2 < 0) { ok = 0; } else {
+        var cb2 = tcp_conn_base(c2);
+        tcpst_set_state(c2, 4);
+        var nx2 = load64(cb2 + 32);
+        tcp_close(c2);
+        if (tcpst_st(c2) != 3 || (load64(cb2 + 72) & TCP_META_PEER_FIN) == 0) { ok = 0; }
+        tcpst_inject(tcpst_frame(0xEE43, 0xEE42, load64(cb2 + 40), (nx2 + 1) & 0xFFFFFFFF, 0x10, 0, 0));
+        if (tcpst_st(c2) != 0) { ok = 0; }
+    }
+    tcpst_drain();
+    # Retransmit exhaustion.
+    var c3 = tcpst_fake(0xEE44, 0xEE45, 0);
+    if (c3 < 0) { ok = 0; } else {
+        var cb3 = tcp_conn_base(c3);
+        tcp_close(c3);
+        f = tcp_lock();
+        store64(cb3 + 120, TCP_RTO_RETRIES);
+        store64(cb3 + 112, sched_clock_us() - 20000000);
+        tcp_unlock(f);
+        tcp_retx_tick();
+        if (tcpst_st(c3) != 0 || load64(cb3 + 128) != 0) { ok = 0; }
+    }
+    tcpst_drain();
+    # FIN_WAIT_2 timeout.
+    var c4 = tcpst_fake(0xEE46, 0xEE47, 0);
+    if (c4 < 0) { ok = 0; } else {
+        var cb4 = tcp_conn_base(c4);
+        var nx4 = load64(cb4 + 32);
+        tcp_close(c4);
+        tcpst_inject(tcpst_frame(0xEE47, 0xEE46, load64(cb4 + 40), (nx4 + 1) & 0xFFFFFFFF, 0x10, 0, 0));
+        if (tcpst_st(c4) != 3 || load64(cb4 + 128) != 0) { ok = 0; }
+        tcp_retx_tick();
+        if (tcpst_st(c4) != 3) { ok = 0; }                     # not yet
+        f = tcp_lock();
+        store64(cb4 + 112, sched_clock_us() - 9000000);
+        tcp_unlock(f);
+        tcp_retx_tick();
+        if (tcpst_st(c4) != 0) { ok = 0; }
+    }
+    tcpst_drain();
+    return tcpst_verdict(ok, "finretx", 7);
+}
+
+# finfold — (1.57.7 ENDFIX, S6-R1) a close with a DATA segment still held (D6's return with the chunk in flight, a
+# lifecycle ABORT, a kill blocked in #48) FOLDS the FIN into that segment (0x19): retx_seq, retx_len and SND.UNA are
+# kept, SND.NXT gains the FIN's phantom byte. Re-arming a flag-only FIN over it treated the unACKed bytes as ACKed:
+# never resent, the peer's RCV.NXT stuck below the FIN, no EOF. Then a partial ACK trims the data+FIN segment, the
+# ACK of the data alone leaves the FIN held, the ACK of the FIN disarms, and the peer's FIN releases the slot.
+fn tcpst_arm_finfold() {
+    var ok = 1;
+    tcpst_drain();
+    var c = tcpst_fake(0xEE4A, 0xEE4B, 0);
+    if (c < 0) { return tcpst_verdict(0, "finfold", 7); }
+    var cb = tcp_conn_base(c);
+    var i = 0;
+    while (i < 100) { store8(&tcpst_pat + i, (i * 5 + 1) & 0xFF); i = i + 1; }
+    var f = tcp_lock();
+    tcp_arm_retx(cb, 0x1000, 0x18, &tcpst_pat, 100);
+    store64(cb + 32, 0x1064);
+    store64(cb + 88, 8192);
+    tcp_unlock(f);
+    var q0 = lo_count + lo_dropped;
+    tcp_close(c);
+    if (tcpst_st(c) != 3 || load64(cb + 128) != 0x19) { ok = 0; }
+    if (load64(cb + 96) != 0x1000 || load64(cb + 104) != 100 || load64(cb + 56) != 0x1000) { ok = 0; }
+    if (load64(cb + 32) != 0x1065) { ok = 0; }
+    if (lo_count + lo_dropped != q0 + 1) { ok = 0; }            # the data+FIN segment went out
+    tcpst_drain();
+    tcpst_inject(tcpst_frame(0xEE4B, 0xEE4A, load64(cb + 40), 0x1028, 0x10, 0, 0));
+    if (load64(cb + 96) != 0x1028 || load64(cb + 104) != 60 || load64(cb + 128) != 0x19) { ok = 0; }
+    if (load8(load64(cb + 136)) != ((40 * 5 + 1) & 0xFF)) { ok = 0; }
+    tcpst_inject(tcpst_frame(0xEE4B, 0xEE4A, load64(cb + 40), 0x1064, 0x10, 0, 0));
+    if (load64(cb + 128) != 0x19 || load64(cb + 104) != 0 || load64(cb + 96) != 0x1064) { ok = 0; }   # FIN still held
+    tcpst_inject(tcpst_frame(0xEE4B, 0xEE4A, load64(cb + 40), 0x1065, 0x10, 0, 0));
+    if (load64(cb + 128) != 0 || tcpst_st(c) != 3) { ok = 0; }  # FIN ACKed: FIN_WAIT_2
+    tcpst_inject(tcpst_frame(0xEE4B, 0xEE4A, load64(cb + 40), 0x1065, 0x11, 0, 0));
+    if (tcpst_st(c) != 0) { ok = 0; }                           # the peer's FIN: released
+    if (tcpst_st(c) != 0) { tcpst_rel(c); }
+    tcpst_drain();
+    return tcpst_verdict(ok, "finfold", 7);
+}
+
+# finboth — a real loopback pair closes from both sides: the second FIN is ACKed and both slots are released with no
+# retransmit (M-FW2: releasing on any ACK leaves the server's FIN un-ACKed).
+fn tcpst_arm_finboth() {
+    var ok = 1;
+    tcpst_drain();
+    var l = tcp_listen(0xEE50);
+    var c = 0 - 1;
+    var a = 0 - 1;
+    if (l >= 0) { c = tcp_connect(net_ip, 0xEE50, 0xEE51); }
+    if (c >= 0) { a = tcp_accept(l); }
+    if (a < 0) {
+        ok = 0;
+        if (c >= 0) { tcp_close(c); }
+    } else {
+        var cbc = tcp_conn_base(c);
+        var cba = tcp_conn_base(a);
+        tcp_close(c);
+        net_poll();
+        if (tcpst_st(a) != 4) { ok = 0; }
+        if (tcpst_st(c) != 3 || load64(cbc + 128) != 0) { ok = 0; }
+        tcp_close(a);
+        var k = 0;
+        while (k < 5 && (tcpst_st(c) != 0 || tcpst_st(a) != 0)) { net_poll(); k = k + 1; }
+        if (tcpst_st(c) != 0 || tcpst_st(a) != 0) { ok = 0; }
+        if (load64(cbc + 120) != 0 || load64(cba + 120) != 0) { ok = 0; }
+    }
+    if (l >= 0) { tcp_close(l); }
+    tcpst_drain();
+    return tcpst_verdict(ok, "finboth", 7);
+}
+
+# orphan — a held FIN slot never blocks a claim (M-ORPHAN), and the free count uses the claim's predicates: the
+# orphan counts, an owned HELD state-0 slot does not (M-FREECOUNT).
+fn tcpst_arm_orphan() {
+    var ok = 1;
+    tcpst_drain();
+    var o = tcpst_fake(0xEE60, 0xEE61, 0);
+    if (o < 0) { return tcpst_verdict(0, "orphan", 6); }
+    tcp_close(o);
+    tcpst_drain();
+    var n = 0;
+    var fr = 0;
+    while (n < 8) {
+        var lf = tcp_lock();
+        fr = tcp_free_slots_locked();
+        tcp_unlock(lf);
+        if (fr <= 1) { break; }
+        var ln = tcp_listen(0xEE70 + n);
+        if (ln < 0) { break; }
+        store64(&tcpst_ls + n * 8, ln);
+        n = n + 1;
+    }
+    if (fr != 1 || tcpst_st(o) != 3) { ok = 0; }
+    var nl = tcp_listen(0xEE7F);
+    if (nl < 0 || nl != o) { ok = 0; }
+    var h = 0 - 1;
+    if (n > 0) {
+        tcp_close(load64(&tcpst_ls + (n - 1) * 8));
+        n = n - 1;
+        h = tcp_slot_claim(2, 0xEE62, 0xEE63, net_ip, 1, 1, 0, 536, 16, net_ip);
+        if (h < 0) { ok = 0; } else {
+            tcpst_set_state(h, 0);                                  # an owned dead conn: HELD (S5 Q1)
+            var hf = tcp_lock();
+            fr = tcp_free_slots_locked();
+            tcp_unlock(hf);
+            if (fr != 0) { ok = 0; }
+            tcpst_rel(h);
+        }
+    } else { ok = 0; }
+    while (n > 0) { n = n - 1; tcp_close(load64(&tcpst_ls + n * 8)); }
+    if (nl >= 0) { tcp_close(nl); }
+    tcpst_drain();
+    return tcpst_verdict(ok, "orphan", 6);
+}
+
+# connfail — every -1 exit of #47 after its claim releases the slot (state 0 AND tag 0): a RST, and a timeout (M-LEAK).
+fn tcpst_arm_connfail() {
+    var ok = 1;
+    tcpst_drain();
+    tcpst_lo(tcpst_frame(0xEE81, 0xEE80, 0, 0, 0x04, 0, 0));
+    var r = tcp_connect_ex(net_ip, 0xEE81, 0xEE80, 16, 300000);
+    var s1 = tcpst_find_lr(0xEE80, 0xEE81);
+    if (r != 0 - 1 || s1 < 0) { ok = 0; } else {
+        if (tcpst_st(s1) != 0 || load64(tcp_conn_base(s1) + 152) != 0) { ok = 0; }
+    }
+    tcpst_drain();
+    var t0 = sched_clock_us();
+    var r2 = tcp_connect_ex(net_ip, 0xEE83, 0xEE82, 16, 300000);
+    var el = sched_clock_us() - t0;
+    var s2 = tcpst_find_lr(0xEE82, 0xEE83);
+    if (r2 != 0 - 1 || s2 < 0 || el < 300000) { ok = 0; } else {
+        if (tcpst_st(s2) != 0 || load64(tcp_conn_base(s2) + 152) != 0) { ok = 0; }
+    }
+    kprint("tcp: connfail timeout us=", 25); kprint_num(el); kprintln("", 0);
+    tcpst_drain();
+    return tcpst_verdict(ok, "connfail", 8);
+}
+
+# stall — D6 + one-in-flight at entry: a call that finds an earlier segment unACKed waits for it (never sends over it)
+# and returns 0 committed after the progress bound (M-S2).
+fn tcpst_arm_stall() {
+    var ok = 1;
+    var c = tcp_slot_claim(2, 0xEE90, 0xEE91, 0x7F000002, 0x6000, 0x7000, 0, 536, 0, 0x7F000001);
+    if (c < 0) { return tcpst_verdict(0, "stall", 5); }
+    var cb = tcp_conn_base(c);
+    var f = tcp_lock();
+    store64(cb + 88, 8192);
+    tcp_arm_retx(cb, 0x6000, 0x18, "H", 1);
+    store64(cb + 32, 0x6001);
+    tcp_unlock(f);
+    var t0 = sched_clock_us();
+    var r = tcp_send_ex(c, &tcpst_pat, 100, 0, 300000);
+    var el = sched_clock_us() - t0;
+    if (r != 0 || el < 300000 || el > 1000000) { ok = 0; }
+    if (load64(cb + 32) != 0x6001 || load64(cb + 96) != 0x6000) { ok = 0; }
+    kprint("tcp: stall us=", 14); kprint_num(el); kprint(" r=", 3); kprint_num(r); kprintln("", 0);
+    tcpst_rel(c);
+    tcpst_drain();
+    return tcpst_verdict(ok, "stall", 5);
+}
+
+fn tcpst_s6_arms() {
+    tcpst_arm_rebase();
+    tcpst_arm_tickretx();
+    tcpst_arm_ticklo();
+    if (net_ip == 0) { kprintln("tcp: s6 SKIP (net_ip=0)", 23); return 0; }
+    tcpst_arm_wndopen();
+    tcpst_arm_persist();
+    tcpst_arm_partack();
+    tcpst_arm_wndstale();
+    tcpst_arm_ackwake();
+    tcpst_arm_rstwake();
+    tcpst_arm_legacyif();
+    tcpst_arm_finretx();
+    tcpst_arm_finfold();
+    tcpst_arm_finboth();
+    tcpst_arm_orphan();
+    tcpst_arm_connfail();
+    tcpst_arm_stall();
+    return 0;
 }
 #endif
 
@@ -124,35 +1194,31 @@
 # (b) a buffer wrap, asserting byte-exact delivery. Proves the in-order ring
 # that replaced the 1.32.0 overwrite-latest path (which silently truncated
 # any multi-segment stream). Zero network dependency.
+# 1.57.7 (S4): the fake slot is CLAIMED (tcp_slot_claim — the pool buffers, no kmalloc, no hand
+# tcp_conn_count or state store) and RELEASED through tcp_slot_release_locked; every white-box cb write is
+# made under tcp_lock. Arms 5-12 follow (fns above); `tcp: selftest done` is always the LAST line.
 {
-    var cid = tcp_conn_count;
-    var cb = tcp_conn_base(cid);
-    var ring = kmalloc(TCP_RX_RING);
-    var rtx = kmalloc(TCP_RETX_BUF);
-    if (ring == 0 || rtx == 0) {
-        if (ring != 0) { kfree_sized(ring, TCP_RX_RING); }
-        if (rtx != 0) { kfree_sized(rtx, TCP_RETX_BUF); }
+    net_tick_pause();                  # 1.57.7 (S6): no CPU's net_tick drains lo / retransmits under an arm (§2.2.3)
+    var cid = tcp_slot_claim(2, 0xEEEE, 0xEEEE, 0, 0, 0, 0, 536, 0, net_ip);
+    if (cid < 0) {
         kprintln("tcp: ring FAIL", 14);
         kprintln("tcp: retx FAIL", 14);
+        kprintln("tcp: mss FAIL", 13);
+        kprintln("tcp: wnd FAIL", 13);
     } else {
-        tcp_conn_count = tcp_conn_count + 1;
-        store64(cb, 2);                 # ESTABLISHED
-        store64(cb + 8, 0xEEEE); store64(cb + 16, 0xEEEE); store64(cb + 24, 0);
-        store64(cb + 32, 0); store64(cb + 40, 0); store64(cb + 48, ring);
-        store64(cb + 56, 0); store64(cb + 64, 0); store64(cb + 72, 0);
-        store64(cb + 80, 0); store64(cb + 88, 0); store64(cb + 96, 0);
-        store64(cb + 104, 0); store64(cb + 112, 0); store64(cb + 120, 0);
-        store64(cb + 128, 0); store64(cb + 136, rtx);
-
+        var cb = tcp_conn_base(cid);
         var src[64];
         var dbuf[64];
         var ok = 1;
+        var tsf = 0;
 
         # Phase 1 — FIFO order, no wrap: append 20 'A' then 20 'B', drain 40.
         memset(&src, 0x41, 20);
+        tsf = tcp_lock();
         if (tcp_rx_append(cb, &src, 20) != 20) { ok = 0; }
         memset(&src, 0x42, 20);
         if (tcp_rx_append(cb, &src, 20) != 20) { ok = 0; }
+        tcp_unlock(tsf);
         if (tcp_recv(cid, &dbuf, 40) != 40) { ok = 0; }
         if (load8(&dbuf + 0) != 0x41) { ok = 0; }
         if (load8(&dbuf + 19) != 0x41) { ok = 0; }
@@ -161,9 +1227,11 @@
 
         # Phase 2 — wrap: reposition the cursors 8 bytes shy of the ring end,
         # append 32 'C' (8 land at the tail, 24 wrap to the head), drain 32.
-        store64(cb + 64, 2040); store64(cb + 80, 2040);
         memset(&src, 0x43, 32);
+        tsf = tcp_lock();
+        store64(cb + 64, 2040); store64(cb + 80, 2040);
         if (tcp_rx_append(cb, &src, 32) != 32) { ok = 0; }
+        tcp_unlock(tsf);
         if (tcp_recv(cid, &dbuf, 32) != 32) { ok = 0; }
         if (load8(&dbuf + 0) != 0x43) { ok = 0; }
         if (load8(&dbuf + 7) != 0x43) { ok = 0; }    # last byte before wrap
@@ -176,24 +1244,30 @@
         # --- B2 retransmit logic (hermetic) ---
         var ok2 = 1;
         # RTO backoff (fixed base, ×2, capped at ×16).
-        if (tcp_retx_rto(0) != 100) { ok2 = 0; }
-        if (tcp_retx_rto(1) != 200) { ok2 = 0; }
-        if (tcp_retx_rto(4) != 1600) { ok2 = 0; }
-        if (tcp_retx_rto(5) != 1600) { ok2 = 0; }
+        if (tcp_retx_rto(0) != 1000000) { ok2 = 0; }             # 1.57.7 (S6): µs
+        if (tcp_retx_rto(1) != 2000000) { ok2 = 0; }
+        if (tcp_retx_rto(4) != 16000000) { ok2 = 0; }
+        if (tcp_retx_rto(5) != 16000000) { ok2 = 0; }
         # Arm sets the held-segment fields + pins SND.UNA.
+        tsf = tcp_lock();
         tcp_arm_retx(cb, 12345, 0x18, &src, 10);
+        tcp_unlock(tsf);
         if (load64(cb + 96) != 12345) { ok2 = 0; }    # retx_seq
         if (load64(cb + 104) != 10) { ok2 = 0; }       # retx_len
         if (load64(cb + 128) != 0x18) { ok2 = 0; }     # retx_flags armed
         if (load64(cb + 56) != 12345) { ok2 = 0; }     # SND.UNA pinned
         # Force the segment "due" (now - (now-2000) = 2000 ≥ RTO via modular
         # subtraction) and confirm a resend bumps the retry count.
-        store64(cb + 112, timer_ticks - 2000);
+        tsf = tcp_lock();
+        store64(cb + 112, sched_clock_us() - 20000000);
+        tcp_unlock(tsf);
         tcp_retx_tick();
         if (load64(cb + 120) != 1) { ok2 = 0; }        # one resend
         # At the retry cap, the next due tick declares the conn dead + disarms.
+        tsf = tcp_lock();
         store64(cb + 120, TCP_RTO_RETRIES);
-        store64(cb + 112, timer_ticks - 2000);
+        store64(cb + 112, sched_clock_us() - 20000000);
+        tcp_unlock(tsf);
         tcp_retx_tick();
         if (load64(cb) != 0) { ok2 = 0; }              # CLOSED
         if (load64(cb + 128) != 0) { ok2 = 0; }        # disarmed
@@ -229,14 +1303,26 @@
         if (tcp_send_chunk(5000, 1460, 65535) != 1460) { ok4 = 0; }  # MSS-bound
         if (tcp_send_chunk(100, 1460, 30) != 30) { ok4 = 0; }        # window-bound
         if (tcp_send_chunk(100, 1460, 0) != 1) { ok4 = 0; }          # zero-window persist
+        # Release through the discipline: CLOSED, rx ring unbound, the retx hold buffer still the pool's.
+        tsf = tcp_lock();
+        tcp_slot_release_locked(cid);
+        tcp_unlock(tsf);
+        if (load64(cb) != 0 || load64(cb + 48) != 0) { ok4 = 0; }
+        if (load64(cb + 136) != load64(&tcp_pool_retx + cid * 8)) { ok4 = 0; }
         if (ok4 == 1) { kprintln("tcp: wnd PASS", 13); }
         if (ok4 == 0) { kprintln("tcp: wnd FAIL", 13); }
-
-        kfree_sized(ring, TCP_RX_RING);
-        kfree_sized(rtx, TCP_RETX_BUF);
-        store64(cb + 48, 0); store64(cb + 136, 0); store64(cb, 0);
-        tcp_conn_count = tcp_conn_count - 1;
     }
+    tcpst_arm_locks();
+    tcpst_arm_loinplace();
+    tcpst_arm_txslots();
+    tcpst_arm_claim();
+    tcpst_arm_gen();
+    tcpst_arm_syncap();
+    tcpst_arm_eof();
+    tcpst_arm_halfclose();
+    tcpst_s6_arms();
+    net_tick_resume();
+    kprintln("tcp: selftest done", 18);
 }
 #endif
 
@@ -493,49 +1579,8 @@ dhcpopt_selftest();
 }
 #endif
 
-#ifdef PPID_SELFTEST
-# 1.50.7 proc-ppid + kill#16 child-gate self-test (1.50.8 adds the waitpid#4 reap gate; 1.50.10 adds
-# the reap-off-cpu fence). Hermetic: the getter's out-of-range guard, a save/restore roundtrip of
-# proc_get_ppid through a live in-range slot (pid 1 = idle; the scheduler never reads ppid,
-# so the temporary value is invisible to it), BOTH extracted child-gate predicates —
-# proc_may_signal (kill#16) + proc_may_reap (waitpid#4) — across init / self / own-child /
-# stranger callers, and the proc_reap_off_cpu_fence SELF-OWNED fast path. Proves proc_get_ppid is no
-# longer the always-0 stub, both child-only gates are real, and the fence can't self-deadlock. No
-# proc creation/teardown (pid-1 slot save/restored).
-{
-    var ok = 1;
-    # (1) out-of-range pid -> -1 guard (independent of array contents)
-    if (proc_get_ppid(proc_count) != (0 - 1)) { ok = 0; }
-    # (2) real getter roundtrips a synthetic parent for an in-range slot (save + restore)
-    var s1 = load64(&proc_ppid + 1 * 8);
-    store64(&proc_ppid + 1 * 8, 7);                  # pretend pid 1's parent is pid 7
-    if (proc_get_ppid(1) != 7) { ok = 0; }
-    # (3) kill#16 authorization predicate (proc.cyr proc_may_signal)
-    if (proc_may_signal(0, 1) != 1) { ok = 0; }      # init may signal anyone
-    if (proc_may_signal(7, 1) != 1) { ok = 0; }      # parent 7 may signal its child 1
-    if (proc_may_signal(5, 1) != 0) { ok = 0; }      # stranger 5 may NOT signal child-of-7
-    if (proc_may_signal(1, 1) != 1) { ok = 0; }      # self
-    if (proc_may_signal(3, 0) != 0) { ok = 0; }      # non-init may NOT signal init
-    if (proc_may_signal(0, 0) != 1) { ok = 0; }      # init may signal init (itself)
-    # (4) 1.50.8 waitpid#4 reap predicate (proc.cyr proc_may_reap) — no self clause (the
-    # call site rejects target==caller); init reaps anyone, else parent-only.
-    if (proc_may_reap(0, 1) != 1) { ok = 0; }        # init may reap anyone (orphan reaper)
-    if (proc_may_reap(7, 1) != 1) { ok = 0; }        # parent 7 may reap its child 1
-    if (proc_may_reap(5, 1) != 0) { ok = 0; }        # stranger 5 may NOT reap child-of-7
-    store64(&proc_ppid + 1 * 8, s1);                 # restore — no live proc perturbed
-    # (5) 1.50.10 reap-off-cpu fence SELF-OWNED fast path (proc.cyr proc_reap_off_cpu_fence). A proc
-    # that dies via kernel_resume (ring-3 fault / foreground exit) leaves on_cpu pointing at THIS cpu
-    # (no do_context_switch deschedule); the fence MUST clear it + return, never spin (the 1.50.9
-    # box-hang). Save/restore pid 1's on_cpu slot (sched_active is still 0 here, so no live reader).
-    var c1 = load64(&proc_on_cpu + 1 * 8);
-    store64(&proc_on_cpu + 1 * 8, pcpu_cpu());       # pretend pid 1 terminated while running on this cpu
-    proc_reap_off_cpu_fence(1);                       # must RETURN (a foreign owner would spin; self-owned clears)
-    if (on_cpu_get(1) != (0 - 1)) { ok = 0; }         # the self-owned fast path cleared on_cpu
-    store64(&proc_on_cpu + 1 * 8, c1);               # restore — no live proc perturbed
-    if (ok == 1) { kprintln("ppid: child-gate PASS", 21); }
-    if (ok == 0) { kprintln("ppid: child-gate FAIL", 21); }
-}
-#endif
+# (1.57.7 S7: the PPID_SELFTEST block moved into ktest's [lifecycle] section — test_lifecycle, kernel/user/test.cyr
+# T-L2/T-L7 — and the flag was deleted: a hand-run gate is not a gate.)
 
 #ifdef RTC_SELFTEST
 # RTC boot-clock self-test (1.35.5). Hermetic civil_to_unix anchors (shared with
@@ -681,34 +1726,8 @@ ext2_jbd2_crash_selftest();
 }
 #endif
 
-#ifdef FLOCK_SELFTEST
-# flock#59 conflict/release logic (1.45.13). Exercises flock_apply directly with
-# synthetic inodes/pids — the CROSS-PROCESS semantics a single boot can't reach via
-# the syscall (one proc never conflicts with itself): EX is exclusive, SH coexist,
-# EX-vs-SH conflict, UN + release_pid free the slots. Compile-gated:
-# FLOCK_SELFTEST=1 sh scripts/build.sh.
-{
-    var fok = 1;
-    # inode 100: EX by pid 2 acquires; pid 3's EX and SH both conflict with it
-    if (flock_apply(100, 2, 2) != 0) { fok = 0; }
-    if (flock_apply(100, 3, 2) != (0 - 1)) { fok = 0; }
-    if (flock_apply(100, 3, 1) != (0 - 1)) { fok = 0; }
-    if (flock_apply(100, 2, 8) != 0) { fok = 0; }          # pid 2 unlocks
-    if (flock_apply(100, 3, 2) != 0) { fok = 0; }          # now pid 3's EX acquires
-    # inode 200: SH by pid 4 + pid 5 coexist; pid 6's EX conflicts with the holders
-    if (flock_apply(200, 4, 1) != 0) { fok = 0; }
-    if (flock_apply(200, 5, 1) != 0) { fok = 0; }
-    if (flock_apply(200, 6, 2) != (0 - 1)) { fok = 0; }
-    # release-by-pid frees everything (the on-exit sweep), then pid 6's EX acquires
-    flock_release_pid(3);
-    flock_release_pid(4);
-    flock_release_pid(5);
-    if (flock_apply(200, 6, 2) != 0) { fok = 0; }
-    flock_release_pid(6);                                   # leave the table clean
-    if (fok == 1) { kprintln("flock: ALL PASS", 15); }
-    if (fok == 0) { kprintln("flock: FAIL", 11); }
-}
-#endif
+# (1.57.7: the FLOCK_SELFTEST block that lived here is retired — its table asserts are ktest T9 (sched.cyr test_flock),
+# which also covers the 1.57.7 codes: -2 table full, the blocking-conversion drop, the NB-conversion keep.)
 
 #ifdef WINSIZE_SELFTEST
 # winsize#60 console-grid math (1.45.13). Reads the LIVE framebuffer geometry (FB
@@ -1208,20 +2227,19 @@ fn spawn_kernel_selftest() {
     }
     if (ok == 1) { spk("spawnk: pipe freed by its last reference, exactly once OK"); } else { all = 0; }
 
-    # ── (11) #37's restore DROPS a child-made sole pipe reference through pipe_buf_put, exactly once.
-    # The #37 child owns its redirected slot while it runs; if it closes that fd and a pipe of its own
-    # lands there, the restore's overwrite removes that pipe's last reference. Emulated on slot 15: apply
-    # (1 <- a creator pipe), then the slot is made to name a fresh buffer nothing else references.
-    # ⚠ The SMP half of this — the slot overwrite and the scan share ONE fs_lock hold, so a concurrent last
-    # close on another CPU cannot also free the buffer — is not something a single-CPU block can race; it is
-    # argued at exec_redirect_restore and at the lifetime banner in vfs.cyr. This checks the drop itself.
+    # ── (11′) 1.57.7 (S3b): a #37 child's table DROPS a child-made sole pipe reference exactly once. #37 applies its
+    # redirects into the CHILD's private table (spawn_shape_strict -> spawn_fd_shape) and restores nothing; the
+    # child owns its redirected slot while it runs, and if it closes that fd and a pipe of its own lands there, the
+    # table's destruction at the reap (proc_reap_child -> proc_destroy_fd_table(c, 0)) removes that pipe's last
+    # reference. Emulated on slot 15: shape (1 <- a creator pipe), then the slot is made to name a fresh buffer
+    # nothing else references, then the table is destroyed exactly as the reap does it.
     ok = 1;
     if (proc_count > 15) { ok = 0; }
     if (proc_fd_base_get(15) != 0) { ok = 0; }
-    if (ok == 0) { spk("spawnk: VOID -- slot 15 busy for the #37 restore check"); }
+    if (ok == 0) { spk("spawnk: VOID -- slot 15 busy for the #37 child-table check"); }
     if (ok == 1) {
         # asm contract: `cli` — no inputs/outputs, clears RFLAGS.IF: nothing on this CPU allocates or frees
-        # between the restore and the free-list probes that follow it.
+        # between the destroy and the free-list probes that follow it.
         asm { cli; }
         vfs_create_pipe(u + 128);
         var ar = load64(u + 128);
@@ -1229,14 +2247,10 @@ fn spawn_kernel_selftest() {
         var abuf = kpayload(vfs_fd_table() + ar * 32, 2);
         vfs_fd_inherit(15, 0);
         var rtab = proc_fd_base_get(15);
-        var rw0 = load64(rtab + 32);                    # the child's ORIGINAL fd 1 (the console device)
-        var rw1 = load64(rtab + 40);
-        var rw2 = load64(rtab + 48);
-        var rw3 = load64(rtab + 56);
         ksyscall(62, 1, aw, 0);                         # 1 <- aw
-        exec_redirect_apply(0, 15);
+        spawn_fd_shape(15, 0, 0);                       # #37's apply (spawn_shape_strict's private-table branch)
         if (ktag(rtab + 32) != VFS_PIPE) { ok = 0; }
-        if (kpayload(rtab + 32, 2) != abuf) { spk("spawnk: FAIL #37 apply did not repoint fd 1"); ok = 0; }
+        if (kpayload(rtab + 32, 2) != abuf) { spk("spawnk: FAIL #37 shape did not repoint fd 1"); ok = 0; }
         var bbuf = kmalloc(4096);
         if (bbuf == 0) { spk("spawnk: VOID -- kmalloc(4096)"); ok = 0; }
         # the child "closed fd 1 and its own pipe landed there" — a raw overwrite drops only a duplicate of
@@ -1245,26 +2259,16 @@ fn spawn_kernel_selftest() {
         ktag_set(rtab + 32, VFS_PIPE);
         kpayload_set(rtab + 32, 1, 1);
         kpayload_set(rtab + 32, 2, bbuf);
-        exec_redirect_restore(0, 15);
-        if (spawnk_fl_count(bbuf, 4096) != 1) { spk_num("spawnk: FAIL #37 restore freed the child's sole pipe this many times: ", spawnk_fl_count(bbuf, 4096)); ok = 0; }
-        if (spawnk_fl_count(abuf, 4096) != 0) { spk("spawnk: FAIL #37 restore freed the creator's pipe"); ok = 0; }
-        if (load64(rtab + 32) != rw0) { ok = 0; }
-        if (load64(rtab + 40) != rw1) { ok = 0; }
-        if (load64(rtab + 48) != rw2) { ok = 0; }
-        if (load64(rtab + 56) != rw3) { spk("spawnk: FAIL #37 restore did not put fd 1 back"); ok = 0; }
-        if (redir_n_get(0) != 0) { spk("spawnk: FAIL #37 restore left the redirect set armed"); ok = 0; }
-        var rb = 0;
-        while (rb < 16) {
-            if (ktag(&pcpu_redir_backup + rb * 32) != VFS_FREE) { spk("spawnk: FAIL #37 restore left a backup"); ok = 0; }
-            rb = rb + 1;
-        }
-        proc_destroy_fd_table(15, 0);
+        proc_destroy_fd_table(15, 0);                   # what proc_reap_child does to every #37 child
+        if (spawnk_fl_count(bbuf, 4096) != 1) { spk_num("spawnk: FAIL #37 child table freed the child's sole pipe this many times: ", spawnk_fl_count(bbuf, 4096)); ok = 0; }
+        if (spawnk_fl_count(abuf, 4096) != 0) { spk("spawnk: FAIL #37 child table freed the creator's pipe"); ok = 0; }
+        if (redir_n_get(0) != 0) { spk("spawnk: FAIL #37 shape left the redirect set armed"); ok = 0; }
         vfs_close(ar);
         vfs_close(aw);
         if (spawnk_fl_count(abuf, 4096) != 1) { spk("spawnk: FAIL the creator's pipe was not freed exactly once"); ok = 0; }
         asm { sti; }                                    # asm contract: `sti` — no inputs/outputs, sets RFLAGS.IF
     }
-    if (ok == 1) { spk("spawnk: #37 restore drops a child-made sole pipe exactly once OK"); } else { all = 0; }
+    if (ok == 1) { spk("spawnk: #37 child table drops a child-made sole pipe exactly once OK"); } else { all = 0; }
 
     # ── (12) an ORPHAN ZOMBIE's fd table is destroyed when its slot is handed out again, not leaked.
     # proc_alloc_slot reuses such a slot without touching its table; vfs_fd_inherit must sweep it (and the
@@ -1297,9 +2301,10 @@ fn spawn_kernel_selftest() {
     }
     if (ok == 1) { spk("spawnk: orphan zombie's fd table + sole pipe released on slot reuse OK"); } else { all = 0; }
 
-    # ── (13) #43 step (f): a CLEANFD child on the global-table fallback is TORN DOWN (-SPAWN_E_NOMEM), a
-    # legacy one is not. vfs_fd_inherit's kmalloc failure is what produces the fallback in the field; the
-    # allocator has no fault injection, so a really-loaded child's table is destroyed to force it.
+    # ── (13) #43 step (f): a child on the global-table fallback is TORN DOWN (-SPAWN_E_NOMEM) — CLEANFD always, and
+    # since 1.57.7 (operator OQ-7) a LEGACY one too (it used to run unredirected, sharing proc 0's fds concurrently).
+    # vfs_fd_inherit's kmalloc failure is what produces the fallback in the field; the allocator has no fault
+    # injection, so a really-loaded child's table is destroyed to force it.
     ok = 1;
     ksyscall(97, CH_ENDOW, 0 - 1, 0);
     var tc = elf_load_from_file("/bin/spawnx", 11, "/bin/spawnx", 11);
@@ -1317,17 +2322,43 @@ fn spawn_kernel_selftest() {
         if (load64(&proc_ppid + tc * 8) != 0) { ok = 0; }
         if (tc == tpc - 1) { if (proc_count != tpc - 1) { spk("spawnk: FAIL torn-down top slot not collapsed"); ok = 0; } }
         if (redir_n_get(0) != 0) { spk("spawnk: FAIL CLEANFD refusal left the redirect armed"); ok = 0; }
-        # the legacy form on the same fallback runs unredirected: shaped "successfully", NOT torn down
+        # the legacy form on the same fallback: torn down too (1.57.7, OQ-7), no redirect armed
         var lc = elf_load_from_file("/bin/spawnx", 11, "/bin/spawnx", 11);
         if (lc < 1) { spk("spawnk: VOID -- second load"); ok = 0; }
         if (lc >= 1) {
             proc_destroy_fd_table(lc, 0);
-            if (spawn_shape_or_teardown(lc, 0, 0) != 0) { spk("spawnk: FAIL legacy child on the global table refused"); ok = 0; }
-            if (load64(&proc_table + lc * 176 + 8) != 3) { spk("spawnk: FAIL legacy child was torn down"); ok = 0; }
-            proc_reap_child(lc);
+            if (spawn_shape_or_teardown(lc, 0, 0) != 0 - SPAWN_E_NOMEM) { spk("spawnk: FAIL legacy child on the global table not refused"); ok = 0; }
+            if (load64(&proc_table + lc * 176 + 8) != 0) { spk("spawnk: FAIL refused legacy child is not dead"); ok = 0; }
+            if (load64(&proc_table + lc * 176 + 160) != 0x1000) { spk("spawnk: FAIL refused legacy child kept its address space"); ok = 0; }
         }
     }
-    if (ok == 1) { spk("spawnk: CLEANFD child on the global table torn down (-3), legacy kept OK"); } else { all = 0; }
+    if (ok == 1) { spk("spawnk: CLEANFD and legacy children on the global table torn down (-3) OK"); } else { all = 0; }
+
+    # ── (14) 1.57.7 (S3b): execwait#37's STRICT shape refuses a child on the global table — with a redirect armed AND
+    # without one (DEP-1): a scheduled #37 child on the global vfs_table would share proc 0's fds while running
+    # concurrently with kmain. Mirrors (13): the fallback forced by destroying a really-loaded child's table.
+    ok = 1;
+    var sc1 = elf_load_from_file("/bin/spawnx", 11, "/bin/spawnx", 11);
+    if (sc1 < 1) { spk_num("spawnk: VOID -- could not load /bin/spawnx for the strict check, rc=", sc1); ok = 0; }
+    if (sc1 >= 1) {
+        var spc = proc_count;
+        proc_destroy_fd_table(sc1, 0);
+        ksyscall(62, 1, 2, 0);                          # armed: the refusal must clear it
+        var sr1 = spawn_shape_strict(sc1, 0);
+        if (sr1 != 0 - SPAWN_E_NOMEM) { spk_num("spawnk: FAIL strict shape on the global table rc=", sr1); ok = 0; }
+        if (load64(&proc_table + sc1 * 176 + 8) != 0) { spk("spawnk: FAIL strict-refused child is not dead"); ok = 0; }
+        if (load64(&proc_table + sc1 * 176 + 160) != 0x1000) { spk("spawnk: FAIL strict-refused child kept its address space"); ok = 0; }
+        if (sc1 == spc - 1) { if (proc_count != spc - 1) { spk("spawnk: FAIL strict-refused top slot not collapsed"); ok = 0; } }
+        if (redir_n_get(0) != 0) { spk("spawnk: FAIL strict refusal left the redirect armed"); ok = 0; }
+        var sc2 = elf_load_from_file("/bin/spawnx", 11, "/bin/spawnx", 11);
+        if (sc2 < 1) { spk("spawnk: VOID -- second strict load"); ok = 0; }
+        if (sc2 >= 1) {
+            proc_destroy_fd_table(sc2, 0);              # NO redirect armed this time
+            if (spawn_shape_strict(sc2, 0) != 0 - SPAWN_E_NOMEM) { spk("spawnk: FAIL strict shape ran an unredirected child on the global table"); ok = 0; }
+            if (load64(&proc_table + sc2 * 176 + 8) != 0) { spk("spawnk: FAIL second strict-refused child is not dead"); ok = 0; }
+        }
+    }
+    if (ok == 1) { spk("spawnk: #37 strict shape refuses a child on the global table OK"); } else { all = 0; }
 
     ksyscall(62, 0x200, 0, 0);
     ksyscall(97, CH_ENDOW, 0 - 1, 0);

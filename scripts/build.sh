@@ -198,6 +198,7 @@ else
     # in place) for the dead-end audit trail.
     export CYRIUS_ELF64_KERNEL=1
     PREPPED="$ROOT/build/agnos_x86.cyr"
+    PREPPED_DEFS="$ROOT/build/agnos_x86.defs"
     # `#define ELF64_KERNEL` is the *source-side* gate (kernel shim selects
     # 64-bit entry under `#ifdef ELF64_KERNEL`); `CYRIUS_ELF64_KERNEL=1`
     # above is the *cyrius-backend* gate (selects EMITELF64_KERNEL emit
@@ -398,6 +399,9 @@ else
         [ -n "$NET_SELFTEST" ]       && echo '#define NET_SELFTEST'
         [ -n "$LOOPBACK_SELFTEST" ]  && echo '#define LOOPBACK_SELFTEST'
         [ -n "$NET_CSUM_SELFTEST" ]   && echo '#define NET_CSUM_SELFTEST'
+        # TCP_ADDR_SELFTEST=1 — 1.57.7 S5: IF=0 kernel arms for socket ownership (TCP + UDP), the wire martian
+        # filter, the 127/8 + net_ip TCP gate, lo-only listeners and sock_peer. scripts/smoke/sock-owner-smoke.sh.
+        [ -n "$TCP_ADDR_SELFTEST" ]  && echo '#define TCP_ADDR_SELFTEST'
         # HID_RECLAIM_SELFTEST=1 — 1.56.52: prove a HID Transfer Event consumed by one of the xHCI
         # synchronous waiters is handed back to the owning interrupt-IN ring. Fully hermetic: brings
         # its own event ring, transfer ring and doorbell page, so it needs no USB hardware.
@@ -441,11 +445,11 @@ else
         [ -n "$NTP_SELFTEST" ]   && echo '#define NTP_SELFTEST'
         [ -n "$MMAP_SELFTEST" ]  && echo '#define MMAP_SELFTEST'
         [ -n "$MSC_SHORT_INJECT" ] && echo '#define MSC_SHORT_INJECT'
+        [ -n "$MSC_CDB_CANARY" ] && echo '#define MSC_CDB_CANARY'
         [ -n "$MMAP_HIMEM_SELFTEST" ] && echo '#define MMAP_HIMEM_SELFTEST'
         [ -n "$MMAP_HIMEM_E2E_SELFTEST" ] && echo '#define MMAP_HIMEM_E2E_SELFTEST'
         [ -n "$MMAP_HIMUNMAP_SELFTEST" ] && echo '#define MMAP_HIMUNMAP_SELFTEST'
         [ -n "$MMAP_HIMEM_PERPROC_SELFTEST" ] && echo '#define MMAP_HIMEM_PERPROC_SELFTEST'
-        [ -n "$PPID_SELFTEST" ]  && echo '#define PPID_SELFTEST'
         [ -n "$RTC_SELFTEST" ]   && echo '#define RTC_SELFTEST'
         [ -n "$HARDENING_SELFTEST" ] && echo '#define HARDENING_SELFTEST'
         [ -n "$JBD2_LOGDUMP" ]       && echo '#define JBD2_LOGDUMP'
@@ -464,7 +468,7 @@ else
         # KSTACK_SELFTEST too (its probes read the paint), so that flag now costs two define slots.
         { [ -n "$KSTACK_SELFTEST" ] || [ -n "$KSTACK_HW" ]; } && echo '#define KSTACK_HW'
         [ -n "$SCHED_STRESS_SELFTEST" ] && echo '#define SCHED_STRESS_SELFTEST'
-        [ -n "$FLOCK_SELFTEST" ]     && echo '#define FLOCK_SELFTEST'
+        # (FLOCK_SELFTEST retired 1.57.7: its asserts are ktest T9 — sched.cyr test_flock.)
         [ -n "$WINSIZE_SELFTEST" ]   && echo '#define WINSIZE_SELFTEST'
         [ -n "$NBREAD_SELFTEST" ]    && echo '#define NBREAD_SELFTEST'
         [ -n "$FBSCALE_SELFTEST" ]   && echo '#define FBSCALE_SELFTEST'
@@ -781,6 +785,13 @@ else
             exit 1
         fi
         [ -n "$ATOM_INSTR_SELFTEST" ] && echo '#define ATOM_INSTR_SELFTEST'
+        :   # the group's status must not be the last `[ -n ... ] &&` test's (set -e)
+    } > "$PREPPED_DEFS"
+    # ⭐ 1.57.7 (IMG) — the #defines above are collected on their own so the flag-build image guard
+    # below knows whether this build set ANY flag (everything past the two fixed lines is one).
+    BUILD_FLAGS=$(grep -v -x -e '#define ARCH_X86_64' -e '#define ELF64_KERNEL' "$PREPPED_DEFS" | sed 's/^#define //' | tr '\n' ' ' | sed 's/ *$//')
+    {
+        cat "$PREPPED_DEFS"
         # Freestanding kashi font-data core (1.37.5 fold-in). Inlined here
         # rather than via cyrius dep resolution because `cyrius build` looks
         # for cyrius.cyml at cwd and we cd into kernel/ for relative include
@@ -796,6 +807,7 @@ else
         cat "$REKHA_DIR/fonts/face_data.cyr"
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
+    rm -f "$PREPPED_DEFS"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")
     rm -f "$PREPPED"
     SZ=$(wc -c < "$ROOT/build/agnos")
@@ -845,6 +857,53 @@ print('  entry: 0x{:x}'.format(entry))
         echo "ERROR: build/agnos failed multiboot/ELF validation (see WARN above)" >&2
         exit 1
     fi
+
+    # ⭐⭐ 1.57.7 (IMG) — IMAGE-LAYOUT GUARD. check.sh gate 34 measures only the PLAIN image, and the 1.57.7
+    # P0 table found three FLAG builds the smokes boot already past the old bound (RING3_SELFTEST=1 0x375850 —
+    # sweep's ring3-smoke row; EDGE_ABI_SELFTEST=1 0x371260 — sweep's edge-abi-smoke row; EXEC+EXT2_WRITE+RING3
+    # 0x37B288 — exec-smoke's ring-3 variant): every sweep booted a kernel whose BSP boot stack could grow down
+    # into its .rodata, and nothing said so. So EVERY x86_64 build now runs scripts/check/image-layout-check.sh
+    # on the image it just wrote:
+    #   · a build that set ANY flag FAILS when the image is over the bound (non-zero, the gate's output on
+    #     stderr, the image moved to build/agnos.layout-refused) — a smoke then dies at build time, loudly,
+    #     instead of booting a stack-overlapped image. ⭐ (IMG-fix, review B4) it also fails CLOSED when
+    #     python3 is missing: an unmeasured flag image is refused exactly like an over-bound one — the multiboot
+    #     validation's soft skip above is about a header this script can live without checking; this guard
+    #     exists to stop a boot, and a guard that waves the image through when it cannot look is no guard.
+    #   · (IMG-fix, review A5) a PLAIN build is measured too — a plain image built from REWRITTEN sources
+    #     (bench.sh's bench_run_all kernel) or with a non-default KASHI_REF/REKHA_REF face is still "plain" to the
+    #     flag test and used to go unmeasured. Over the bound it prints the gate's FAIL block on stderr as a loud
+    #     WARNING and leaves build/agnos in place, so check.sh gate 34 still builds and SCORES it (the M1 mutation
+    #     record lives there) and CI's explicit `image-layout-check.sh` step (ci.yml, release.yml) fails the push.
+    # ⭐ (IMG-fix, reviews A6/B6) every image that survives gets a provenance record, build/agnos.flags
+    # ("flags=<the #defines beyond ARCH_X86_64/ELF64_KERNEL>", "md5=<the image>"): smoke_require_image
+    # (scripts/smoke/lib/qemu-dwell.sh) refuses to boot a kernel a smoke was not written for — shutdown-smoke
+    # booted doom-smoke's leftover DOOM_SELFTEST image and scored PASS in the IMG run.
+    rm -f "$ROOT/build/agnos.layout-refused" "$ROOT/build/image-layout-flag.log" "$ROOT/build/agnos.flags"
+    if ! command -v python3 >/dev/null 2>&1; then
+        if [ -n "$BUILD_FLAGS" ]; then
+            mv -f "$ROOT/build/agnos" "$ROOT/build/agnos.layout-refused"
+            echo "ERROR: python3 not available — the image-layout guard cannot measure this flag build [$BUILD_FLAGS]; refused (moved to build/agnos.layout-refused), it must not be booted unmeasured" >&2
+            exit 1
+        fi
+        echo "WARNING: python3 not available — the plain image was NOT measured against the BSP boot stack bound (check.sh gate 34 / CI will)" >&2
+    else
+        sh "$ROOT/scripts/check/image-layout-check.sh" "$ROOT/build/agnos" > "$ROOT/build/image-layout-flag.log" 2>&1 && IRC=0 || IRC=$?
+        if [ "$IRC" != "0" ]; then
+            cat "$ROOT/build/image-layout-flag.log" >&2
+            if [ -n "$BUILD_FLAGS" ]; then
+                # Moved aside, not left in place: a caller that ignores this status must find NO kernel
+                # rather than boot this one (the image is kept for inspection).
+                mv -f "$ROOT/build/agnos" "$ROOT/build/agnos.layout-refused"
+                echo "ERROR: flag build [$BUILD_FLAGS] fails the image-layout gate (above) — moved to build/agnos.layout-refused; it must not be booted" >&2
+                exit 1
+            fi
+            echo "WARNING: this PLAIN image fails the image-layout gate (above) — left in build/agnos for check.sh gate 34 to score; do NOT boot or ship it" >&2
+        else
+            echo "  image-layout (${BUILD_FLAGS:-plain}): $(grep -o 'PASS: LOAD end 0x[0-9a-f]* <= 0x[0-9a-f]* — headroom[^;]*' "$ROOT/build/image-layout-flag.log")"
+        fi
+    fi
+    printf 'flags=%s\nmd5=%s\n' "$BUILD_FLAGS" "$(md5sum "$ROOT/build/agnos" | cut -d' ' -f1)" > "$ROOT/build/agnos.flags"
 
     # ELF64 kernel boot — gnoboot maps the kernel, sets RDI=&boot_info,
     # and jmp rax's into the 64-bit entry (kernel/arch/x86_64/mbi.cyr

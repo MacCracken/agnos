@@ -1,9 +1,6 @@
 # 2026-09-24 — USB mass storage: every SCSI command builds its 16-byte CDB in a 2-byte stack buffer
 
-**Status:** 🟡 **OPEN** — an arising repair for 1.57.x (roadmap § 1.57.x, last row). Filed rather than
-fixed in 1.57.6 because it was found during that release's review of an unrelated subsystem (spawn), after
-the release's USB surface was already gated, and the fix wants its own step with the MSC smoke; 1.57.6 does
-not touch `usb/msc.cyr`.
+**Status:** ✅ **RESOLVED 1.57.7 (2026-09-25)** — step MSC: all seven SCSI builders in `usb/msc.cyr` use `var cdb_buf[16]`; `check-array-sizing.sh` rewritten so it sees loop, alias and callee writes into a function-local array. Gates: `scripts/smoke/msc-cdb-smoke.sh` (sweep row; RED `msc-cdb: FAIL sites=7 clobbered=7` on the `[2]` code, GREEN 26/0 on `[16]`, `-smp 1` and `-smp 4`) and `check.sh`'s array-sizing gate (RED on the unfixed tree with exactly the 7 sites, GREEN after). Built, gated, NOT burned. See § Resolution.
 **Filed by:** agnos, from the 1.57.6 spawn fix pass (the same trap it fixed in `pfds[2]`).
 **Checked against:** agnos **1.57.6**, `kernel/arch/x86_64/usb/msc.cyr`, read in the working tree. **By
 inspection only**: no run has shown a failure, and `msc-short-smoke` (sweep row) passes.
@@ -45,3 +42,23 @@ A/B) reaches the enumeration commands and READ(10); WRITE(10) and SYNCHRONIZE CA
 under this compiler, not that it is absent. A discriminating test would read the frame layout from the
 disassembly (or place a canary local beside the buffer) and show it clobbered before the fix and intact
 after.
+
+## Resolution (1.57.7, 2026-09-25)
+
+**What shipped:** `var cdb_buf[16]` at TUR, INQUIRY, READ CAPACITY, REQUEST SENSE, READ(10), WRITE(10) and
+SYNCHRONIZE CACHE, with the banner and comment corrections. The production image kept its size (2,431,480 B at the
+time; 13 bytes differ, all inside the seven functions). An `MSC_CDB_CANARY` build plants a canary above each
+buffer; the smoke reads it back after every command and checks its placement (gap 8..24 at run time, plus a static
+source check). `check-array-sizing.sh` strips comments and strings, walks braces, applies rules 1/1′/2/2′/3/4/4b
+and carries a 23-case control corpus with exact extents; `check.sh` prints its log on failure. `msc-short-smoke`
+runs through `qemu-dwell` and asserts positively; both smokes seed a pattern at LBA 0 (a zero stick made the old
+assertion vacuous).
+
+**What the change broke — checked before archiving:** nothing observed (check 35/35, test 4/4, ktest 107/3, agnsh
+`-smp 1`/`-smp 4`, aarch64 lists identical). Residuals, documented in the gate and the instrument banner, not
+defects: rule 4 is silent on 20 callee extents whose writes follow a parameter-steered guard; one local inserted
+above a `[16]` buffer at a site whose canary sits 8 mod 16 is byte-identical to alignment filler at run time (only
+the static check sees it). Noted, not filed: `msc_read_lba` trusts the xHCI-reported count, not
+`dCSWDataResidue` (a deliberate 1.56.52 choice), reachable only with a malformed CDB.
+
+**Evidence:** `~/.claude/projects/-home-macro-Repos-agnos/handoff-1.57.7/steps/MSC-report.json`, `MSC-fix-report.json`.

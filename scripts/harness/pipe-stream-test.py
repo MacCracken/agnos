@@ -42,7 +42,9 @@ def need(*paths):
 need(GNOBOOT, AGNOS, os.path.join(ROOTFS, "bin/agnsh"))
 
 # ---- a minimal static ELF64 /bin/sleeper: busy-count SLEEP_N, write SLEEPER-DONE, exit(0), spin.
-# Busy-count (NOT sleep_ms#41 — that sets sched_active=0 and would FREEZE the scheduler + agnsh);
+# Busy-count (NOT sleep_ms#41 — before 1.57.7 it held the CPU with preemption off, and the comment said "sets sched_active=0
+# and would FREEZE the scheduler + agnsh", which was never true; since 1.57.7 it blocks only its caller — the busy count
+# stays because this harness measures a RUNNING job);
 # a ring-3 busy loop stays preemptible so agnsh time-slices alongside it.
 def build_sleeper(path):
     MSG = b"SLEEPER-DONE\n"

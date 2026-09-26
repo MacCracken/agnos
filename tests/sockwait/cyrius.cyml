@@ -1,0 +1,17 @@
+[package]
+name = "sockw"
+version = "0.1.0"
+description = "agnos 1.57.7 (S6) ring-3 exerciser — sock_connect#47, sock_send#48 and icmp_echo#55/#100 block ONLY their caller (spinners keep the CPU), #48 is stream-correct (one segment in flight at every entry, D6 committed count), a stalled reader keeps its connection (persist), and the wire/loopback latency. Seeded as /bin/agnsh AND /bin/sockw by scripts/smoke/sock-wait-smoke.sh."
+license = "GPL-3.0-only"
+language = "cyrius"
+# The VALUE must EQUAL the root manifest's pin (scripts/check/toolchain-pin-check.sh enforces it).
+cyrius = "6.6.6"
+
+[build]
+entry = "sockw.cyr"
+output = "build/sockw"
+
+# AGNOS ONLY — build with `cyrius build --agnos sockw.cyr build/sockw`.
+[deps]
+# ⚠ The FULL closure, transitives included (D19): alloc -> atomic, fnptr; string and args -> alloc.
+stdlib = ["syscalls", "string", "alloc", "args", "atomic", "fnptr"]

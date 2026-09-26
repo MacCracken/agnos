@@ -1,0 +1,17 @@
+[package]
+name = "tcpin"
+version = "0.1.0"
+description = "agnos 1.57.7 (S4) ring-3 inbound-TCP exerciser — a passive open served in interrupt context (A1/A2/A2b), sock_recv#49 EOF after the peer's FIN over loopback and the wire (E1/E2), FIN-before-accept half-close (A3), and a cross-CPU loopback mix (X). Seeded as /bin/agnsh AND /bin/tcpin by scripts/smoke/tcp-inbound-smoke.sh."
+license = "GPL-3.0-only"
+language = "cyrius"
+# The VALUE must EQUAL the root manifest's pin (scripts/check/toolchain-pin-check.sh enforces it).
+cyrius = "6.6.6"
+
+[build]
+entry = "tcpin.cyr"
+output = "build/tcpin"
+
+# AGNOS ONLY — build with `cyrius build --agnos tcpin.cyr build/tcpin`.
+[deps]
+# ⚠ The FULL closure, transitives included (D19): alloc -> atomic, fnptr; string and args -> alloc.
+stdlib = ["syscalls", "string", "alloc", "args", "atomic", "fnptr"]

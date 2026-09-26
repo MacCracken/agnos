@@ -263,8 +263,10 @@ fn nvme_disable() {
 # ⚠ KEEP THE BUDGET GENEROUS for the reason stated just above — a false timeout is the
 # same outcome as never having sent the notification.
 # ⚠ The spin backstop STAYS and is now load-bearing, not decorative: klog_uptime_us()
-# returns 0 when the TSC timebase was never calibrated (lapic_calibrate did not run),
-# and that is exactly when a time-based bound cannot be trusted.
+# returns 0 when neither the PM timer nor the PIT measured the timebase (lapic_calibrate_pm
+# and lapic_calibrate both refused), and that is exactly when a time-based bound cannot be
+# trusted. Since 1.57.7 (S1b) the timebase is PM-measured on every PM-timer box, so the 5 s
+# bound below is 5 s of real time even under a host CPU quota.
 fn nvme_shutdown() {
     var cc = 0;
     var t0 = 0;

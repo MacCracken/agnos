@@ -20,6 +20,224 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.7] — 2026-09-25 — the blocking model: every wait blocks only its caller, a parent can end, stop and cap its child, and sockets have owners
+
+The rest of the 1.57.x plan — steps S3c, S3d, S3b, S1b, S4, S5, S6, S7, S8 — plus the MSC repair, the IMG
+boot-stack move and the end-review fixes (ENDFIX). Ten issue files closed. Two syscall numbers minted (`#106`, `#107`). **Built, gated, NOT burned.**
+
+### Breaking (migration inline)
+
+- **`kill`#16 now acts** (S7). Through 1.57.6 every signal only set a pending bit. **9 ends** the target (wait
+  status 265), **19 stops** it (`#99` state 5), **18 continues** it (and still sets bit 18), **0 probes**
+  (authorization only). Any other 1..63 still sets a pending bit with **no default action — SIGTERM included**.
+  `sig | 0x100` = `KILL_TREE`. Any other bit above 7, or a negative sig, → −1. 9/18/19 on kmain, an idle or a
+  kthread → −1. *Migration:* a caller that sent 9 or 19 expecting only a bit must stop doing so. daimon: SIGTERM →
+  grace → `kill(pid, 9 | 0x100)`; pause/resume = `19 | 0x100` / `18 | 0x100`. daimon's `tests/agnos` asserts of the
+  1.57.5 limits ("pause is refused", "no signal ends a process yet") are expected to go red.
+- **Wait status** (`waitpid`#4 both forms, `execwait`#37): exit → `code & 0xFF`; a ring-3 fault → `128 + vector`
+  (#PF = **142**); death by signal → **`0x100 | sig`** (SIGKILL **265**, SIGXCPU **280**). kmain's `run: exit N`
+  keeps `128 + sig` (137). *Migration:* use `WIFEXITED(s) = (s & 0x100) == 0`, `WEXITSTATUS(s) = s & 0xFF`,
+  `WIFSIGNALED(s) = (s & 0x100) != 0`, `WTERMSIG(s) = s & 0xFF` (filed with cyrius; its peer stubs return a
+  constant today).
+- **`proclist`#99 reports more states** (S3c, S7): **4** DYING (transient), **5** STOPPED, **6** BLOCKED in a kernel
+  wait, **7** ZOMBIE — an exited, unreaped child is now LISTED (report-only; the table cell stays 0). The RSS field
+  now includes the high `mmap` arena (S8). *Migration:* a monitor that treats any state other than 1/2/3 as an
+  error must learn 4–7 (chakshu). A record count is now the slots in use, except for an orphan in the instant
+  before its self-reap.
+- **`execwait`#37 is a blocking wait on a scheduled child** (S3b). The child is an ordinary IF=1 process on any
+  CPU. It may yield, fork, spawn, wait, block and nest `#37`, bounded only by the 16-slot table. The caller BLOCKS
+  (`#99` state 6) and every other process keeps running. **−1** also when the child could get only the GLOBAL fd
+  table (the D11 kmalloc fallback) and when the caller cannot block (before the scheduler). Armed `#62` redirects
+  apply to the child's private table with no restore. *Migration:* none for a caller that waits for the exit code.
+  cyrius's `SYS_EXECWAIT` comment ("runs to completion") and agnoshi's `run_agnos.cyr` comments (run-to-completion,
+  IF=0) are stale.
+- **`spawn_path`#43 on the global-fd-table fallback returns −3** (`SPAWN_E_NOMEM`) for EVERY form (S3b, operator
+  OQ-7). Until 1.57.6 a legacy line-form child ran there unredirected, sharing proc 0's fds. *Migration:* treat
+  −3 as back-pressure, as before.
+- **`sleep_ms`#41, `flock`#59, `pause`#14, `sched_yield`#44, the keyboard `read`#5 on fd 0, `snd_write`#66 /
+  `snd_drain`#68, `sock_connect`#47, `sock_send`#48, `icmp_echo`#55 / `icmp_echo_ex`#100 block only their caller**
+  (Changed, below). *Migration:* a caller that relied on a wait holding its CPU spins on `uptime_us`#95; there is
+  no "pace without yielding" call. A contended `flock` without `LOCK_NB` now WAITS (it returned −1 at once).
+- **`sock_send`#48 returns the committed count, possibly 0, after ~8 s with no ACK progress** (D6; S6). The
+  in-flight chunk counts as committed. *Migration:* 0 means "no progress yet" — retry under your own deadline.
+  Write-all loops that treat 0 as fatal abort a live, stalled connection: sandhi `_sandhi_server_plain_write_all`,
+  `sandhi_conn_send_all`, cyrius `_tn_sock_write_all`. Single-shot sends that ignore the count truncate: sandhi
+  `src/server/mod.cyr`, cyrius `lib/ws_server.cyr`. daimon `daimon_write_all` is correct already; its 512 B / 1 ms
+  pacing is obsolete.
+- **`sock_recv`#49 answers −1 (EOF) once the peer's FIN has arrived and every byte before it is read** (S4). It
+  answered 0 forever. *Migration:* none for a caller that reads until −1; a caller that treated −1 as a hard error
+  must treat it as end of stream (#49 is inverted from Linux: 0 = WOULD_BLOCK, −1 = EOF).
+- **TCP and UDP ids are OWNED** by the process incarnation (pid + epoch) that opened them (S5). Every other process
+  gets −1 from `#48`/`#49`/`#50`/`#57`/`#106` and UDP `#53`/`#54`, including fork/spawn children and a recycled pid;
+  the owner check comes before every other check. An inherited tagged socket fd is INERT in a child: cyrius
+  `sys_close` on it no longer sends a FIN on the parent's connection. A connection that dies (RST, retransmit
+  exhaustion) **keeps its id until the owner closes it** (OQ-3). At the owner's exit or fault the kernel sends one
+  FIN and releases every id. *Migration:* close what you open; do not pass conn ids to a child.
+- **`sock_close`#50 from ESTABLISHED/CLOSE_WAIT is graceful** (S6): the FIN is retransmitted until ACKed and the
+  slot becomes KERNEL-HELD — the id is invalid for the caller at once, and a second `#50` on it is −1. No TIME_WAIT.
+  A listener's close sends RST to un-accepted ESTABLISHED/CLOSE_WAIT children and drops SYN_RCVD ones (S4).
+- **`sock_listen`#56 arg1 is `port | class << 32`** (S5): bits 16–31 and 40–63 must be 0, else −1. Every
+  pre-1.57.7 value decodes to class 0 (ANY) byte-for-byte. Class 0 now also admits 127.0.0.0/8.
+- **`udp_send`#52 returns the frame length** accepted (payload + 42; a loopback send returned 0), and −1 when the
+  source port is bound by ANOTHER owner. **`udp_unbind`#54 on an already-free id returns −1** (was 0). `#53` and
+  `#54` are −1 for a listener that is not the caller's.
+- **An ELF whose PT_LOAD segments share a 2 MB page is refused** (S8): `#43` −5, `#3`/`#37` −1. Before, the second
+  mapping overwrote the first's PDE and leaked 2 MB per spawn.
+- **`mmap`#27 never overwrites a present mapping** (S8): a low-arena span that meets a present PDE is abandoned for
+  the high arena; a present high span returns 0. `mmap` also returns 0 past the caller's memory cap.
+- **`uptime_ms`#40 is the calibrated TSC** (S1b; operator OQ-2): `uptime_ms_base` + TSC ms, continuous with
+  ticks × 10 at the calibration instant. It now advances while the BSP runs IF=0 and under a host quota.
+  `timer_ticks` × 10 only on a boot where calibration refused (`#95` = −1). *Migration:* none; a caller that
+  expected `#40` to stop under IF=0 was relying on a defect.
+
+### Added — syscalls and constants (ABI rows, §4.8, §4.9)
+
+- **`sock_peer`#106** `(conn_id) → (peer_ip << 16) | peer_port / −1` (S5): the remote address of a connection the
+  caller owns; `ip = r >> 16`, `port = r & 0xFFFF`; a live peer is always ≥ 0x10000. −1: bad id, not yours,
+  CLOSED, LISTEN. The wire drops 127/8 and our own address as a SOURCE, so `ip >> 24 == 127` or
+  `ip == net_config#61(0)` identifies a local client.
+- **`spawn_limits`#107** `(mem_pages, cpu_ms) → 0 / −1` (S8): one-shot caps for the caller's NEXT child, a
+  PER-PROCESS arm consumed by the next `spawn`#3 / `execwait`#37 / `spawn_path`#43 on every return. Re-arming
+  replaces both fields; `(0, 0)` disarms; a refused call leaves the old arm. `mem_pages` (4 KiB pages,
+  `0 ≤ a1 ≤ 2^36`) is enforced at 2 MB = 512-page granularity: the loader refuses an image of (distinct PT_LOAD
+  pages + 1) × 512 over it, and `mmap` returns 0 past it. `cpu_ms` (`0 ≤ a2 ≤ 2^40`) is stored as ceil(ms/10)
+  ticks; at the cap the child dies by **SIGXCPU (24), wait status 280**. The child's cap is
+  `min(creator's own cap, arm)`, so an arm can only lower it; `fork`#96 copies the caps, never the arm. Not
+  counted: shm#71, `#86` GPU slots, channel rings, pipe buffers, page tables, kernel stacks. Probe support with
+  `#107(0, 0)`.
+- **`SPAWN_E_LIMIT` = 7**: `#43` returns −7 when the image does not fit the effective memory cap; retrying never
+  helps (unlike −3).
+- **`waitpid`#4 `WAIT_BLOCK`** (S3c): `arg1 = 0x100 | pid` (pid 0..15) BLOCKS until that child exits; **`0x1FF`**
+  = any child. No new number (the range answered −1 before, so a caller can probe). −1 at once when the target is
+  not the caller's child or the caller has no children; −2 only when the caller cannot block. Every exit path
+  stores state 0 and then wakes the parent.
+- **`kill`#16 `KILL_TREE` = `0x100`** (S7): the root plus every epoch-validated descendant in one snapshot
+  (child-only authority, descendants-only reach). A tree STOP that had to skip a member returns **−2** (e.g. a
+  `#37` foreground child, which cannot be stopped while its parent waits — operator OQ-8).
+- **`sock_listen`#56 address classes** (S5): class 0 = ANY (net_ip and 127/8), class 1 = LOOPBACK (admits only SYNs
+  addressed to 127.0.0.0/8, the `bind(127.0.0.1)` equivalent). Peer constant `SOCK_LISTEN_LOOPBACK` =
+  `0x100000000`. The flagged form fails closed (−1) on an older kernel.
+- **`flock`#59 −2** = the lock table is full (16 slots; never waits).
+- New docs: `docs/architecture/blocking-waits.md`, `foreground-exec.md`, `net-concurrency.md`,
+  `socket-ownership-and-loopback.md`, `process-lifecycle.md`.
+
+### Changed — the blocking model (Path 2 bites S3.4–S3.9, S3b)
+
+- **S3c** (S3.4–S3.5): the voluntary switch (`int 0xE0` → `do_context_switch`, gate DPL0/IST0), the BLOCKED
+  state (6) and the wq wait/wake primitive; per-process syscall a4; `clac` first in all 15 interrupt stubs; the
+  SYSCALL stub 280 → **174 B** (bite C); `fork`#96 reads the parent's own frame and forces IF=1. `sleep_ms`#41
+  blocks only its caller (≥ `ms` by `#95`, up to one tick longer); `waitpid` `WAIT_BLOCK`; `flock`#59 without
+  `LOCK_NB` waits (no timeout, no FIFO fairness; a blocking SH↔EX conversion drops the old lock first); `pause`#14
+  and `sched_yield`#44 yield or park in the kernel.
+- **S3d** (S3.6–S3.9): keep-current (a RUNNING current stays when only its CPU's idle is READY: a lone spinner
+  gets 100 of 100 ticks); the halt protocol (flag, `mfence`, scan, `sti; hlt`) behind `#44`/`#14` and the idle loops;
+  the **`0xE1` kick IPI** (a 43-byte EOI-only stub, DPL0/IST0) sent by `wq_wake`/`wq_interrupt`/`wq_tick` to a
+  remote pinned waiter (KVM median wake 74 µs vs ~9 ms without). The keyboard read on fd 0 blocks only its caller,
+  one blocking reader per line; `snd_write`#66 / `snd_drain`#68 block. A poll+`#44` loop beside a sleeping child is
+  charged 0 ticks.
+- **S3b** (foreground exec): `execwait`#37 and the kmain launches (kybernet `/bin/agnsh`, the NET dig, the
+  recovery `run`) are ordinary scheduled children; `exec_and_wait` is refused once the scheduler runs, so no ring 3
+  runs IF=0 after `sched_active = 1` (tripwire `fg: IF=0 ring-3 caller …`, denied in every smoke).
+- **S1b**: the LAPIC 100 Hz reload and the klog timebase are measured against the ACPI PM timer (early probe from
+  the `boot_info` RSDP, before `apic_init`); the PIT is the PM-less fallback. At a 25 % host quota (TCG) the
+  reload reads 10000220 vs 10000236 unthrottled and the klog timebase 3193 within 1 %; the old polled-PIT method
+  read 36252819 (3.6×) and refused the timebase. `uptime_ms`#40 on the TSC (Breaking, above). `sleep_ms`'s
+  legacy loop (unblockable callers only) waits for a deadline in `#40`.
+- **S4** (net SMP): lock chain `tcp_tab < net_tx < lo_q` (UDP a sibling leaf) with IRQ-saving wrappers; the TX
+  lock at all 7 frame builds; a boot-time TCP conn pool (no heap in the passive open); `tcp_slot_claim_locked` the
+  only 0→nonzero transition with a per-slot generation; **SYN_RCVD capped at 4, one slot reserved for non-passive
+  claims**; the `-smp 4` net variants are GATED.
+- **S6**: every TCP deadline on `sched_clock_us`; `net_tick()` on every CPU's tick (try-lock); the RX demux wakes
+  the waiter; persist (cap 4) — a zero-window peer that keeps answering is never declared dead; ICMP per-pid reply
+  slots, RTT at 1 ms resolution (10 ms when `#95` is −1); `#100`'s bound is never early. Measured wake latency
+  (virtio, SLIRP): idle RTT median 544 µs (-smp 1) / 1381 µs (-smp 4); beside a busy spinner 9929 / 9981 µs,
+  just under one tick (operator OQ-5: measure only).
+- **S7**: one death chain for exit#0, the fault kill and SIGKILL (reap-before-publish; an orphan reaps itself);
+  kill/stop at the tick for a ring-3 runner, at syscall exit, or at once for a kernel wait; a killed `#37` waiter
+  also kills its foreground child; the klug ring under a lock.
+- **IMG** (operator OQ-1 = C): **the BSP boot stack top moved `0x380000` → `0x3A0000`; the image bound
+  `0x370000` → `0x390000`** (guard gap `[0x3A0000, 0x3B0000)`). The plain image changed by one byte (the shim
+  immediate). `kmain` checks at boot that the UEFI map describes `[0x390000, 0x3C0000)` as free RAM
+  (`boot: BSP stack span 0x390000-0x3C0000 is free RAM in the UEFI map OK`, or a denied violation line).
+  `image-layout-check.sh` also decodes the three shim immediates and the `.text` `mov rsp`, and `build.sh` runs it
+  after every x86_64 build (a failing flag build is refused and moved to `build/agnos.layout-refused`; CI runs it
+  too). Measured peak BSP boot-stack depth: 2,088–2,328 B to the agnsh prompt, 5,288 B through doom.
+
+### Fixed
+
+- **USB MSC: all seven SCSI CDBs were built in a 2-byte stack buffer** (MSC) — every command wrote 14 bytes past
+  its frame slot. `var cdb_buf[16]` at all seven sites; the production image size is unchanged (13 bytes differ,
+  inside the seven functions).
+- **Every ring-3 `#GP` froze the box** (found by S3c): the `#GP` stub's diagnostics dereferenced the faulting
+  saved RSP, a user-stack address → SMAP `#PF` at CPL0 → canary halt. Guarded by CPL.
+- **A key pressed and released inside one IF=0 stretch was lost** (found by S3d): every keyboard TRB DMA'd into one
+  shared report buffer, so `abc` read `bc`. Each TRB has its own 16-byte report slot.
+- **Inbound TCP: a SYN drained in interrupt context was dropped** (S4), so ring-3 servers rarely accepted. 1.57.6
+  measured: A2 served 0/12, A2B 1/12 (2.9 s); 1.57.7: 12/12 fast.
+- **virtio-net: two back-to-back frames overwrote each other** (S4) — one TX buffer per descriptor now. **Every
+  full-MSS TCP segment was dropped on virtio** (found by S6): `virtio_net_send` bounded the frame at 1500 (the MTU)
+  instead of 1514; a wire `#48` of more than 1446 bytes could never complete.
+- **ENDFIX:** (S5-R1) the TCP demux ignored the local address, so two connections from one port to 127.0.0.2 and
+  127.0.0.3 collided and the second hung for 8 s — `tcp_find_conn` now matches the local address (0 = wildcard);
+  (S6-R1) closing a connection with a data segment still unACKed discarded the data, so the peer got neither the
+  bytes nor EOF — the FIN is folded into the held segment; (S7-R1) a recycled parent slot looked alive for a
+  window after its claim, so an orphan could publish itself as an unreapable zombie — the epoch bump and the
+  `death_done` scrub now run inside the claim's `proctab` hold.
+- **An orphan zombie's address space leaked at slot reuse** (S7; 1.57.6 released only its fd table): orphans reap
+  themselves. The pre-S3b kernel lost 10.5 MB per orphan in the recovery sequence at -smp 4.
+- The `RING3_SELFTEST` flag build was un-buildable mid-cycle (found and fixed by S8).
+- **S6: a pre-scheduler ring-3 net wait that outlasted its busy spins hung forever** (found by `doom-smoke`, which had no sweep row;
+  bisected to S6): S6 removed the preempt-held `sti` window from `#47`/`#48`/`#55`/`#100`, and `net_legacy_step`
+  keeps a pre-scheduler caller's IF=0, so once its busy spins ran out the `hlt` could never wake. DOOM_SELFTEST's
+  `/bin/doom` dials setu at 127.0.0.1:7700, nobody answers, and it hung in `#47` before its first frame (screendump
+  3 colours, still 3 after 40 s). The four arms reopen the window for `sched_active != 1` only
+  (`net_sys_window_open`/`_close`, net_tcp.cyr); doom renders again (240 colours).
+
+### Added — gates, flags, harness
+
+- Sweep rows: `grep -c '^run_gate "' scripts/sweep.sh` = **51** (50 at the full sweep; `doom-smoke` added after it). New rows: `msc-cdb-smoke`, `wait-ring3-smoke`,
+  `wait-kbd-smoke`, `fg-smoke`, `lifecycle-smoke`, `tcp-inbound-smoke`, `sock-owner-smoke`, `sock-wait-smoke`,
+  `tcp-smoke`, `loopback-smoke`, `tcp-listen-smoke`, `icmp-smoke`, `fault-kill-smoke`, `nbread-smoke`,
+  `thread-smoke`, `doom-smoke`; `fork`, `ring3`, `kstack`, `thread` and `tsc` now boot `-smp 1` and `-smp 4` in one row, and
+  every `-smp 4` variant is GATED. Ring-3 test programs: `tests/waits` (waitx), `tests/fg`, `tests/tcpin`,
+  `tests/sock`, `tests/sockwait`, `tests/lifecycle` (lifex, 65 phases). `ktest` passed 365 at S8 (107 at 1.57.6; the
+  same 3 environmental `[initrd]` failures).
+- `check-array-sizing.sh` rewritten (rules 1/1′/2/2′/3/4/4b over a stripped source; a 23-case control corpus with
+  exact extents).
+- `qemu-dwell.sh` classifies every attempt as booted / died / VOID; a kernel that got control and died before its
+  banner FAILS and is never retried; each VOID attempt's log is kept. `sweep.sh` keeps every attempt's log and has
+  a `SWEEP_ONLY` row filter. `build/agnos.flags` records the build's flags; `smoke_require_image` refuses a wrong
+  image. `SMOKE_INVARIANT_DENY` gained the new latched lines (wq, fg, idle, net lock, lifecycle, limits).
+- `FLOCK_SELFTEST` and `PPID_SELFTEST` retired into `ktest`. The three GPU shader selftests (`SHADER_BATCH`,
+  `SHADER_COHERE`, `SHADER_RECT`) compile only into their own flag builds (−16,792 B of the plain image).
+
+### Closeout
+
+- `build/agnos` **2,497,912 B** (1.57.6: 2,431,480 B; +66,432 B); the size gates weigh `size − face` =
+  **2,087,092 B** against the 2 MiB grant (10,060 B headroom); LOAD end **`0x371c18`**, 123,880 B under gate 34's
+  **`0x390000`**. Flag builds: `TCP_SELFTEST` `0x37c540`, `TEST` `0x37da78`. aarch64 still does not compile:
+  32 undefined functions (`exec_preempt_set` went with its caller), 17 undefined variables, no new names.
+- **Gates on the final tree** (2026-09-25): `check.sh` **34/35** — the one red is the `syscall ABI` gate, BY DESIGN (it names `#106` and `#107` only) · `test.sh` **4/4** · `ktest.sh` TOTAL **367 passed, 3 failed** (370 checks, floor 64; the three are the environmental `[initrd]` checks) · `agnsh-smoke` PASS at `-smp 1` and `-smp 4` · `sweep.sh` **49/50** on the 50-row table, 0 VOID after retries — its one FAIL is the `baseline check.sh` row, which carries the same by-design ABI red (9 firmware-VOID attempts were classified and retried inside their rows; none reached a verdict); the `doom-smoke` row (51st) was added afterwards with the S6 fix above and run standalone (`SWEEP_ONLY`): PASS — the 51-row table has not had a full sweep · aarch64: 32 undefined functions, 17 undefined variables at 47 sites, no new names against the 1.57.6 baseline.
+- **ABI gate red BY DESIGN**: `syscall ABI (kernel/doc/cyrius agree)` names `#106` and `#107` absent from cyrius
+  (the 1.56.55 precedent; CI does not run this gate). Filed with cyrius as
+  `docs/development/issues/2026-09-25-agnos-sock-peer-spawn-limits-wait-block-kill-tree-peer.md` (there).
+- **Issues:** ten closed and archived (msc-cdb, sleep-ms, flock, inbound-tcp-syn, sock-recv-eof,
+  socket-ids-no-owner, tcp-server-loopback-only, sock-send-and-connect, parent-cannot-end-stop-continue,
+  no-per-process-resource-limits). Open for 1.57.8: `2026-09-25-cross-cpu-poll-and-yield-loops-are-tick-bound`
+  (S3d's park made a cross-CPU poll+`#44` round one tick: `yield_peer` -smp 4 9.9 ms vs 531 µs), plus new filings
+  for the DMA identity-VA remainder, the `nvme_io_poll_n` CID desync, the HID mouse shared report buffer and the
+  KVM + virtio-net console slowness.
+- **Built, gated, NOT burned.** Iron-only risk classes QEMU cannot show: the voluntary switch through `int 0xE0`,
+  the `clac`-first stubs and the `#GP`-stub CPL guard (S3c); the `0xE1` kick IPI and the idle-step/park Dekker
+  protocol, the per-TRB HID report slots (S3d); agnsh's first CPL3 entry through `sched_leave_old` and the SYSCALL
+  MSR state on it (CMOS 0x20/0x21, S3b); the early ACPI reads under AMI page tables and the PM-measured reload on a
+  Zen LAPIC (CMOS 0x83; expected `acpi: early pm timer port 808 (boot_info RSDP)`, reload ~830,000, klog within
+  1 %, S1b); the r8169 direct-map conversion (no RTL8168 model in QEMU, S4); tick-path death in the timer ISR,
+  the B1 park, the self-reap CR3 hand-back and the ISR display hand-back (S7); the BSP boot-stack window
+  `[0x390000, 0x3A0000)`, live from the shim's first instruction before anything reserves it (IMG — the kernel
+  reports the UEFI map's verdict at boot). The 1.57.6 Path 2 burn is still owed. An iron burn is the operator's
+  call.
+
 ## [1.57.6] — 2026-09-24 — per-process kernel stacks (Path 2, bites S3.1–S3.3), a `spawn_path` that says why, and a clock a throttled host cannot stop
 
 Three of the nine steps planned for the 1.57.x line: S1 (`uptime_us`#95 on the ACPI PM timer), S2 (`spawn_path`#43 flags, codes and per-process arms), and Path 2 bites S3.1–S3.3. The other steps are roadmap § 1.57.x. **Built, gated, NOT burned.**

@@ -1,0 +1,134 @@
+# fgcommon.cyr — helpers shared by fgx (the driver) and fgc (every child role). agnos 1.57.7, step S3b.
+# Raw `syscall(N, a1, a2, a3, a4)` throughout (the explicit 5-arg form: a3/a4 are never garbage).
+# ⚠ Module-scope `var X[N]` is N u64 = 8N BYTES; function-local `var x[N]` is N BYTES.
+
+var fg_line[64];        # 512 B: #43 / #37 command lines
+var fg_pl[128];         # 1024 B: proclist#99 (16 x 64-byte records)
+var fg_si[16];          # 128 B: sysinfo#35 (the 40-byte head)
+
+fn fg_out(s) { syscall(1, 1, s, strlen(s), 0); return 0; }
+fn fg_num(n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { fg_out("-"); n = 0 - n; }
+    if (n == 0) { fg_out("0"); return 0; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; syscall(1, 1, &b + i, 1, 0); }
+    return 0;
+}
+fn fg_kv(k, v) { fg_out(" "); fg_out(k); fg_out("="); fg_num(v); return 0; }
+
+fn fg_eq(a, b) {
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
+    var i = 0;
+    while (1) {
+        var ca = load8(a + i);
+        if (ca != load8(b + i)) { return 0; }
+        if (ca == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn fg_atoi(s) {
+    var v = 0;
+    var i = 0;
+    var neg = 0;
+    if (s == 0) { return 0 - 1; }
+    if (load8(s) == 45) { neg = 1; i = 1; }
+    while (load8(s + i) >= 48) {
+        if (load8(s + i) > 57) { break; }
+        v = v * 10 + (load8(s + i) - 48);
+        i = i + 1;
+    }
+    if (neg == 1) { return 0 - v; }
+    return v;
+}
+# Copy s (no NUL) to dst + off; return the new offset.
+fn fg_cat(dst, off, s) {
+    var l = strlen(s);
+    var i = 0;
+    while (i < l) { store8(dst + off + i, load8(s + i)); i = i + 1; }
+    return off + l;
+}
+fn fg_catnum(dst, off, n) {
+    var b[24];
+    var i = 0;
+    if (n < 0) { store8(dst + off, 45); off = off + 1; n = 0 - n; }
+    if (n == 0) { store8(dst + off, 48); return off + 1; }
+    while (n > 0) { store8(&b + i, 48 + (n % 10)); n = n / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; store8(dst + off, load8(&b + i)); off = off + 1; }
+    return off;
+}
+
+fn fg_us() { return syscall(95, 0, 0, 0, 0); }                   # uptime_us#95 (-1 = TSC refused)
+fn fg_sleep(ms) { return syscall(41, ms, 0, 0, 0); }             # sleep_ms#41
+fn fg_yield() { syscall(44, 0, 0, 0, 0); return 0; }             # sched_yield#44
+fn fg_getpid() { return syscall(2, 0, 0, 0, 0); }
+fn fg_close(fd) { return syscall(6, fd, 0, 0, 0); }
+fn fg_pipe(fds) { return syscall(25, fds, 0, 0, 0); }            # fds: [0] read end, [8] write end
+fn fg_62(src, dst) { return syscall(62, src, dst, 0, 0); }       # exec_redirect: the NEXT child's src <- dst
+fn fg_wait(pid) { return syscall(4, 0x100 | pid, 0, 0, 0); }     # waitpid WAIT_BLOCK (1.57.7)
+fn fg_poll(pid) { return syscall(4, pid, 0, 0, 0); }             # the non-blocking poll (-2 = alive)
+
+# The register-only busy loop (no syscalls): the SAME code in the driver's calibration and in the `loop` role, so
+# an iteration count calibrated in one runs the same time in the other.
+fn fg_spinloop(n) {
+    var i = 0;
+    while (i < n) { i = i + 1; }
+    return i;
+}
+# Spin until #95 >= t_end, polling the clock only every 2^16 iterations (a pure ring-3 burn, no syscall storm).
+fn fg_burnto(t_end) {
+    var i = 0;
+    while (1) {
+        i = i + 1;
+        if ((i & 0xFFFF) == 0) { if (fg_us() >= t_end) { break; } }
+    }
+    return 0;
+}
+
+# #99 field of `pid`: which 8 = state, 16 = ppid, 56 = cpu ticks (low 32 bits). -1 when pid is not listed.
+fn fg_proc(pid, which) {
+    var n = syscall(99, &fg_pl, 16, 0, 0);
+    var i = 0;
+    while (i < n) {
+        var r = &fg_pl + i * 64;
+        if (load64(r) == pid) {
+            if (which == 56) { return load64(r + 56) & 0xFFFFFFFF; }
+            return load64(r + which);
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+fn fg_ticks(pid) { return fg_proc(pid, 56); }
+fn fg_state(pid) { return fg_proc(pid, 8); }
+fn fg_sysinfo(off) {
+    if (syscall(35, &fg_si, 40, 0, 0) != 0) { return 0 - 1; }
+    return load64(&fg_si + off);
+}
+
+# Build "/bin/fgc <role>[ <a>[ <b>]]" into fg_line (NUL-terminated); -1 args are omitted. Returns the length.
+fn fg_mk(role, a, b) {
+    var o = fg_cat(&fg_line, 0, "/bin/fgc ");
+    o = fg_cat(&fg_line, o, role);
+    if (a != (0 - 1)) { store8(&fg_line + o, 32); o = fg_catnum(&fg_line, o + 1, a); }
+    if (b != (0 - 1)) { store8(&fg_line + o, 32); o = fg_catnum(&fg_line, o + 1, b); }
+    store8(&fg_line + o, 0);
+    return o;
+}
+fn fg_spawn(role, a, b) { var l = fg_mk(role, a, b); return syscall(43, &fg_line, l, 0, 0); }   # spawn_path#43
+fn fg_ew(role, a, b) { var l = fg_mk(role, a, b); return syscall(37, &fg_line, l, 0, 0); }      # execwait#37
+# #43 that backs off on -2 (SPAWN_E_NOPROC, the table is full) for at most `ms`: 5 ms sleeps between tries.
+fn fg_spawn_retry(role, a, b, ms) {
+    var t0 = fg_us();
+    while (1) {
+        var p = fg_spawn(role, a, b);
+        if (p >= 0) { return p; }
+        if (p != (0 - 2)) { return p; }
+        if (fg_us() - t0 > ms * 1000) { return p; }
+        fg_sleep(5);
+    }
+    return 0 - 1;
+}

@@ -60,12 +60,21 @@ mcopy -i "$ESP"@@1048576 "$AGNOS" ::boot/agnos
 cp "$OVMF_VARS" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 
 echo "=== AGNOS 1.44.x preemptive ring-3 smoke ==="
-LOG="$LOGS/ring3.log"
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
-# 1.57.6 (S3): SMOKE_SMP=N boots with -smp N (default 1 = unchanged); see smoke_accel in qemu-dwell.sh.
-SMOKE_SMP="${SMOKE_SMP:-1}"
-ACCEL="$(smoke_accel "$SMOKE_SMP")"
-echo "accel: $ACCEL (-smp $SMOKE_SMP)"
+# ⭐ 1.57.7 (S3d, S3.9): BOTH SMP BY DEFAULT — one invocation boots -smp 1 THEN -smp 4 (keep-current, the #44 park and
+# the idle step change what `ring3: yield OK` measures on both), each banner-gated (qemu_dwell_kernel +
+# qemu_assert_booted: a boot with no "AGNOS kernel v" is VOID, never scored), each with its own PASS/FAIL lines.
+# SMOKE_SMP=N set explicitly keeps ONE boot at -smp N (1.57.6 behaviour). Exit 0 only when every boot passed,
+# 1 on any FAIL, 2 when a boot was VOID (and nothing failed).
+SMPS="${SMOKE_SMP:-1 4}"
+rc=0; np=0; nf=0; nvoid=0
+pass_() { echo "PASS: [smp$SMP] $1"; np=$((np+1)); }
+fail_() { echo "FAIL: [smp$SMP] $1"; nf=$((nf+1)); rc=1; }
+for SMP in $SMPS; do
+LOG="$LOGS/ring3-smp$SMP.log"
+ACCEL="$(smoke_accel "$SMP")"
+echo ""
+echo "--- boot -smp $SMP  accel: $ACCEL ---"
 # ⛔⛔ 1.56.55 — 40 s WAS TOO SHORT AND THE TAIL OF THE SELFTEST FELL OFF THE END. RING3_SELFTEST
 # runs ~10 sub-tests, and the last three markers (`ring3: yield OK`, `ring3: gate held`, `ring3: done`)
 # landed after the dwell expired, so the smoke reported them "not found". That read as two defects that
@@ -82,16 +91,14 @@ echo "accel: $ACCEL (-smp $SMOKE_SMP)"
 # header documents. Retries are banner-gated, so a kernel that boots and then fails gets no second try.
 qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-120}" "$WORK/vars.fd" "$OVMF_VARS" \
     qemu-system-x86_64 \
-    -machine q35 -m 512M $ACCEL -smp "$SMOKE_SMP" \
+    -machine q35 -m 512M $ACCEL -smp "$SMP" \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$ESP,format=raw,if=none,id=esp0" -device "nvme,drive=esp0,serial=AGNOS-SMOKE" \
     -serial stdio -display none -no-reboot
+if ! qemu_assert_booted "$LOG"; then echo "VOID: [smp$SMP] the kernel never ran (not scored)"; nvoid=$((nvoid+1)); continue; fi
 
-echo "--- serial (ring3 lines) ---"; strings "$LOG" | grep -E "ring3:|wx:|elf:" | sed 's/^/  /'
-rc=0; np=0; nf=0
-pass_() { echo "PASS: $1"; np=$((np+1)); }
-fail_() { echo "FAIL: $1"; nf=$((nf+1)); rc=1; }
+echo "--- serial (ring3 lines, -smp $SMP) ---"; strings "$LOG" | grep -E "ring3:|wx:|elf:" | sed 's/^/  /'
 # 1.57.2 W^X refusal gate — BOTH halves: the refused marker must be present AND the loaded marker absent.
 if strings "$LOG" | grep -q "wx: RWX segment refused"; then pass_ "elf_load REFUSED a PT_LOAD flagged R|W|X (W^X closed, 1.57.2)"; else fail_ "'wx: RWX segment refused' not found — the W^X refusal in elf.cyr is gone, or ring3_wx_check no longer runs"; fi
 if strings "$LOG" | grep -q "wx: RWX segment LOADED"; then fail_ "'wx: RWX segment LOADED' present — elf_load MAPPED an R|W|X segment (W^X refusal regressed)"; fi
@@ -105,6 +112,9 @@ if strings "$LOG" | grep -q "ring3: nonlifo signal clear OK"; then pass_ "a recy
 # ⛔ 1.57.6 (S3-fix): the kernel's latched invariant lines (SMOKE_INVARIANT_DENY, qemu-dwell.sh) change no exit code.
 if strings "$LOG" | grep -qE "$SMOKE_INVARIANT_DENY"; then fail_ "a latched kernel invariant line fired: $(strings "$LOG" | grep -E "$SMOKE_INVARIANT_DENY" | head -3 | tr '\n' ' ')"; else pass_ "no latched kernel invariant line (non-ready pick, out-of-band asserts, kstack_check_entry, #DF)"; fi
 if strings "$LOG" | grep -q "ring3: yield OK"; then pass_ "sched_yield #44 — the yielder resumed at the post-SYSCALL RIP with rax=0 AND donated its slice (non-yielder counter >> 10x yielder)"; else fail_ "'ring3: yield OK' not found — yield round-trip broke or the slice was not donated (see 'ring3: Y= A=' line)"; fi
+done
 echo ""
-echo "=== ring3-smoke: $np passed, $nf failed ==="
-exit $rc
+echo "=== ring3-smoke: $np passed, $nf failed, $nvoid void (smp: $SMPS) ==="
+if [ "$rc" -ne 0 ]; then exit 1; fi
+if [ "$nvoid" -ne 0 ]; then exit 2; fi
+exit 0

@@ -73,6 +73,176 @@ fn pit_ch0_read() {
     return (hi << 8) | lo;
 }
 
+# ⭐ 1.57.7 (S1b) — THE LAPIC 100 Hz RELOAD AND THE KLOG TIMEBASE MEASURED AGAINST THE ACPI PM TIMER.
+# lapic_calibrate (below) counts PIT ch0 wraps by POLLING: a vCPU descheduled for more than 10 ms misses a
+# wrap, the window spans k > 8 periods but is divided by 8, and under a host CPU quota BOTH the reload
+# (every timer_ticks deadline, uptime_ms#40) and klog_tsc_per_us came out k/8 too high (S1 measured 2.25x
+# at 50%, 2.75x at 25%). The PM timer needs no interrupt delivery and no polling cadence: a throttle
+# lengthens a window, and the window measures its own length. main.cyr learns the port BEFORE apic_init
+# (acpi_pm_early_probe, boot_info RSDP only) and hands it to lapic_reload_100hz; lapic_calibrate is now
+# only the PM-less fallback.
+# ⛔ PARSE ORDER: apic.cyr is parsed long before acpi.cyr and main.cyr, and forward VARIABLE references do
+# not resolve (boot_data.cyr). So the port is a PARAMETER, and the code below READS only its own globals
+# and boot_data.cyr's (klog_tsc_per_us, tsc_cal_agree). It may CALL anything (tsc_pm_read, tsc_pm_alive,
+# tsc_cal_median_agree in main.cyr).
+var lapic_reload_src    = 0;   # 0 = the 10000000 literal (rate unknown); 1 = ACPI PM timer (a TRUE 100 Hz); 2 = the polled PIT window (a host quota can inflate it)
+var lapic_cal_port      = 0;   # the PM port the reload was measured on (0 = the PM path did not produce the reload)
+var lapic_cal_try_port  = 0;   # the port handed to lapic_reload_100hz (0 = none), set unconditionally
+var lapic_cal_dead      = 0;   # 1 = that port did not count (tsc_pm_alive refused it)
+var lapic_cal_smp_t     = 0;   # lapic_pm_sample: rdtsc midpoint of the tightest bracket
+var lapic_cal_smp_w     = 0;   # lapic_pm_sample: that bracket's width in cycles
+var lapic_cal_smp_c     = 0;   # lapic_pm_sample: the LAPIC current count read inside it
+var lapic_cal_win_bad   = 0;   # the last window's endpoints were too uncertain
+var lapic_cal_win_tcpms = 0;   # the last window's TSC cycles per MILLIsecond
+var lapic_cal_seen      = 0;   # windows that completed, whatever their LAPIC count
+var lapic_cal_valid     = 0;   # completed windows with a valid LAPIC count (they seed lo/hi)
+var lapic_cal_ok        = 0;   # usable windows
+var lapic_cal_agree     = 0;   # usable windows that agree with the reload median (0.5%)
+var lapic_cal_tagree    = 0;   # usable windows that agree with the TSC-rate median (0.5%)
+var lapic_cal_lo        = 0;   # lowest valid reload
+var lapic_cal_hi        = 0;   # highest valid reload
+
+# One BRACKETED sample: {ta = rdtsc; p = PM; c = LAPIC current count; tb = rdtsc}, 4 tries back to back,
+# keeping the tightest (the tsc_pm_sample shape plus one MMIO read). Both reads sit inside the bracket,
+# so their skew is bounded by its width. Returns p; midpoint/width/count go to lapic_cal_smp_t/_w/_c.
+# No asm: rdtsc, inl (tsc_pm_read) and apic_read carry their own contracts.
+fn lapic_pm_sample(port) {
+    var ls_bw = 0x7FFFFFFFFFFFFFFF;
+    var ls_bt = 0;
+    var ls_bp = 0;
+    var ls_bc = 0;
+    var ls_i = 0;
+    while (ls_i < 4) {
+        var ls_a = rdtsc();
+        var ls_p = tsc_pm_read(port);
+        var ls_c = apic_read(0x390);
+        var ls_b = rdtsc();
+        var ls_w = ls_b - ls_a;
+        if (ls_w >= 0) {
+            if (ls_w < ls_bw) {
+                ls_bw = ls_w;
+                ls_bt = ls_a + ls_w / 2;
+                ls_bp = ls_p;
+                ls_bc = ls_c;
+            }
+        }
+        ls_i = ls_i + 1;
+    }
+    lapic_cal_smp_t = ls_bt;
+    lapic_cal_smp_w = ls_bw;
+    lapic_cal_smp_c = ls_bc;
+    return ls_bp;
+}
+
+# One ~10 ms window (35795 PM counts). Returns 0 when the reference stopped (aborts the tier), 0 - 1 when
+# the window completed with no valid LAPIC count, else the reload (LAPIC div-1 counts per 10 ms), > 0.
+# Also leaves the window's TSC cycles per MILLIsecond in lapic_cal_win_tcpms and its uncertainty flag in
+# lapic_cal_win_bad. The masked one-shot is re-armed from 0xFFFFFFFF for EVERY window.
+fn lapic_pm_window(port) {
+    lapic_cal_win_bad = 0;
+    lapic_cal_win_tcpms = 0;
+    apic_write(0x380, 0xFFFFFFFF);
+    var lw_p0 = lapic_pm_sample(port);
+    var lw_t0 = lapic_cal_smp_t;
+    var lw_w0 = lapic_cal_smp_w;
+    var lw_c0 = lapic_cal_smp_c;
+    var lw_go = 1;
+    while (lw_go == 1) {
+        if (((tsc_pm_read(port) - lw_p0) & 0xFFFFFF) >= 35795) {
+            lw_go = 0;
+        } else {
+            if ((rdtsc() - lw_t0) > 0x800000000) { return 0; }   # ~2^35 cycles and no 10 ms of PM: it stopped
+        }
+    }
+    var lw_p1 = lapic_pm_sample(port);
+    var lw_t1 = lapic_cal_smp_t;
+    var lw_w1 = lapic_cal_smp_w;
+    var lw_c1 = lapic_cal_smp_c;
+    var lw_dpm = (lw_p1 - lw_p0) & 0xFFFFFF;
+    var lw_dt = lw_t1 - lw_t0;
+    var lw_dc = lw_c0 - lw_c1;          # the LAPIC counts DOWN
+    if (lw_dpm == 0) { return 0; }
+    if (lw_dt <= 0) { return 0; }
+    if (lw_dt > 0x10000000000) { return 0; }   # i64 guard for the products below
+    if (lw_c1 == 0) { return 0 - 1; }          # the one-shot expired inside the window
+    if (lw_dc <= 0) { return 0 - 1; }
+    if (lw_w0 > lw_dt) { lapic_cal_win_bad = 1; }
+    if (lw_w1 > lw_dt) { lapic_cal_win_bad = 1; }
+    if (lapic_cal_win_bad == 0) {
+        if ((lw_w0 + lw_w1) * 200 > lw_dt) { lapic_cal_win_bad = 1; }   # endpoints worse than 0.5%
+    }
+    if (lapic_cal_win_bad == 0) {
+        if (lw_dpm > 0x800000) { lapic_cal_win_bad = 1; }   # more than half the 24-bit wrap: ambiguous
+    }
+    lapic_cal_win_tcpms = lw_dt * 3579545 / (lw_dpm * 1000);   # < 2^62
+    var lw_rl = lw_dc * 3579545 / (lw_dpm * 100);              # counts per 10 ms; < 2^54
+    if (lw_rl <= 0) { return 0 - 1; }
+    return lw_rl;
+}
+
+# The PM-timer tier: the median of 5 usable windows (at most 8 tries), 3 of which must agree with it
+# within 0.5% — for the reload AND for the TSC rate of the same windows. Returns the median reload, or
+# 0 = refused. ⛔ BOTH OR NEITHER: klog_tsc_per_us is written only on success, so a refused tier leaves the
+# PIT fallback to measure both, and a log timebase never pairs with a reload from another reference.
+fn lapic_calibrate_pm(port) {
+    var lc_r[64];   # ⛔ FUNCTION-LOCAL: 64 BYTES = 8 u64 slots lc_r[0..7]. want <= 5, so the index is <= 4.
+    var lc_t[64];   # ⛔ FUNCTION-LOCAL: 64 BYTES = 8 u64 slots, same bound.
+    lapic_cal_seen = 0;
+    lapic_cal_valid = 0;
+    lapic_cal_ok = 0;
+    lapic_cal_agree = 0;
+    lapic_cal_tagree = 0;
+    lapic_cal_lo = 0;
+    lapic_cal_hi = 0;
+    apic_write(0x3E0, 0x0B);           # divide config = divide-by-1 (same domain apic_timer_init uses)
+    apic_write(0x320, 0x10000);        # LVT timer: bit16 mask=1, one-shot — no IRQ
+    var lc_want = 5;
+    var lc_n = 0;
+    var lc_tries = 0;
+    while (lc_tries < 8) {
+        if (lc_n >= lc_want) { break; }
+        var lc_w = lapic_pm_window(port);
+        lc_tries = lc_tries + 1;
+        if (lc_w == 0) { break; }
+        lapic_cal_seen = lapic_cal_seen + 1;
+        if (lc_w > 0) {
+            lapic_cal_valid = lapic_cal_valid + 1;
+            if (lapic_cal_valid == 1) {
+                lapic_cal_lo = lc_w;
+                lapic_cal_hi = lc_w;
+            }
+            if (lc_w < lapic_cal_lo) { lapic_cal_lo = lc_w; }
+            if (lc_w > lapic_cal_hi) { lapic_cal_hi = lc_w; }
+            var lc_use = 0;
+            if (lapic_cal_win_bad == 0) {
+                if (lc_w >= 100000) {
+                    if (lc_w <= 200000000) {
+                        if (lapic_cal_win_tcpms >= 100000) {
+                            if (lapic_cal_win_tcpms <= 10000000) { lc_use = 1; }
+                        }
+                    }
+                }
+            }
+            if (lc_use == 1) {
+                store64(&lc_r + lc_n * 8, lc_w);
+                store64(&lc_t + lc_n * 8, lapic_cal_win_tcpms);
+                lc_n = lc_n + 1;
+            }
+        }
+    }
+    lapic_cal_ok = lc_n;
+    if (lc_n < 3) { return 0; }
+    var lc_mr = tsc_cal_median_agree(&lc_r, lc_n, 200);
+    lapic_cal_agree = tsc_cal_agree;
+    var lc_mt = tsc_cal_median_agree(&lc_t, lc_n, 200);
+    lapic_cal_tagree = tsc_cal_agree;
+    if (lc_mr == 0) { return 0; }
+    if (lc_mt == 0) { return 0; }
+    klog_tsc_per_us = lc_mt / 1000;
+    return lc_mr;
+}
+
+# The PM-LESS FALLBACK (since 1.57.7 S1b; the PM timer is the reference when the early probe found one).
 # Calibrate the LAPIC timer's divide-by-1 input frequency at boot against PIT
 # channel 0, returning the periodic reload count for a TRUE 100 Hz. Runs ONCE,
 # AFTER apic_init() (LAPIC mapped) and BEFORE apic_timer_init()+pic_mask_pit()
@@ -103,20 +273,19 @@ fn lapic_calibrate() {
     }
 
     var start_lapic = apic_read(0x390);          # LAPIC current-count at the aligned start
-    # ⭐ 1.56.58 — THE KERNEL LOG TIMEBASE RIDES THIS WINDOW FOR FREE. The loop below already measures
+    # ⭐ 1.56.58 — ON A PM-LESS BOX THE KERNEL LOG TIMEBASE RIDES THIS WINDOW FOR FREE. The loop below already measures
     # a known wall interval (8 ch0 periods) against a free-running PIT, needs NO interrupts, and runs
     # near the top of main.cyr's boot body. Two rdtsc reads convert it into cycles-per-microsecond
     # ~4,400 statements before `tsc_calibrate()` (main.cyr, the call right after the boot body's `sti`)
     # produces the same number — which matters because a timer_ticks-derived clock reads 0 until that
     # `sti`, i.e. for essentially the whole boot log, and `timer_ticks` additionally FREEZES inside a
     # foreground `run` (ring 3 executes IF=0).
-    # ⚠ 1.57.6 — THIS WINDOW IS POLLED, SO A HOST CPU QUOTA CAN INFLATE IT. The loop below counts ch0
-    # wraps by polling; a vCPU descheduled for longer than one 10 ms period misses a wrap, and then
-    # BOTH the LAPIC reload (the 100 Hz tick, so uptime_ms#40) and klog_tsc_per_us come out high by
-    # the same factor. tsc_calibrate no longer depends on either when the FADT advertises an ACPI PM
-    # timer (its reference since 1.57.6). This window itself is still polled HERE; ⚠ S1b — the
-    # 1.57.6 follow-up step (operator decision 2026-09-23) — fixes it by measuring the LAPIC reload and
-    # klog_tsc_per_us against the PM timer, and rewrites this note when it lands.
+    # ⚠ THIS WINDOW IS POLLED, SO A HOST CPU QUOTA CAN INFLATE IT. The loop below counts ch0 wraps by
+    # polling; a vCPU descheduled for longer than one 10 ms period misses a wrap, and then BOTH the
+    # LAPIC reload (the 100 Hz tick, so uptime_ms#40) and klog_tsc_per_us come out high by the same
+    # factor. Since 1.57.7 (S1b) this runs ONLY when lapic_calibrate_pm (above) could not: no PM timer
+    # found by the early probe, a port that does not count, or a refused PM tier — lapic_reload_src 2
+    # records it, and the boot log says so (lapic_reload_report).
     # ⚠ Writes klog_tsc_per_us, NOT tsc_per_us — see the note in arch/x86_64/boot_data.cyr for why
     # those must stay distinct (uptime_us#95`s meaning, and hda/gpu`s documented pre-calibration
     # fallback both depend on tsc_per_us staying 0 until main.cyr).
@@ -157,30 +326,100 @@ fn lapic_calibrate() {
 }
 
 # Calibrated 100Hz reload with a safe fallback. Called INLINE from main.cyr's boot
-# sequence — apic_timer_init(32, lapic_reload_100hz()) — so it runs in PARSE_PROG
+# sequence — apic_timer_init(32, lapic_reload_100hz(ep_port)) — so it runs in PARSE_PROG
 # order (after apic_init, PIT still live), NOT as a module-scope `var x = call()`
 # (that would run during gvar-init, before apic_init — the doom-argv gvar-init trap).
 # `r` is function-local, so no gvar-init concern. On a bad/absent measure calibrate
 # returns 0 -> fall back to the QEMU-proven 10000000 literal (never bricks boot).
 #
-# 1.57.6: lapic_reload_measured records WHICH of the two it returned. tsc_calibrate's fallback tier
-# (live ticks, main.cyr) derives cycles-per-microsecond from "one tick = 10 ms", which is true only
-# when the reload was measured against the PIT; on the 10000000-literal fallback the tick rate is a
-# guess, and a divisor built on it would be silently wrong, so that tier refuses to run.
-# ⚠ 1 does NOT prove a true 100 Hz: lapic_calibrate's polled window can be inflated by a host CPU
-# quota (see the note above its loop), and then the tick is uniformly slow — uniform enough to pass
-# the tick tier's lost-tick test. Every QEMU x86 machine, and every ACPI PC with a fixed-hardware PM
-# timer, takes the PM-timer tier instead and never reads this flag.
-var lapic_reload_measured = 0;   # 1 = the LAPIC 100 Hz reload came from the PIT window, 0 = the 10000000 literal fallback
+# 1.57.6: lapic_reload_measured records WHETHER the reload was measured. tsc_calibrate's fallback tier
+# (live ticks, main.cyr) derives cycles-per-microsecond from "one tick = 10 ms", which is a guess on
+# the 10000000-literal fallback, so that tier refuses to run there.
+# 1.57.7 (S1b): pm_port (the early probe's port, 0 = none) is tried FIRST — lapic_calibrate_pm, a TRUE
+# 100 Hz (lapic_reload_src 1). A dead port or a refused PM tier falls back to the polled PIT window
+# (src 2), and that to the literal (src 0). ⚠ lapic_reload_measured == 1 still does NOT prove 100 Hz
+# (the PIT window can be inflated by a host CPU quota); only lapic_reload_src == 1 does.
+var lapic_reload_measured = 0;   # 1 = the reload was MEASURED (PM timer or PIT, see lapic_reload_src), 0 = the 10000000 literal
 
-fn lapic_reload_100hz() {
-    var r = lapic_calibrate();
-    if (r == 0) {
+fn lapic_reload_100hz(pm_port) {
+    lapic_reload_src = 0;
+    lapic_cal_port = 0;
+    lapic_cal_dead = 0;
+    lapic_cal_try_port = pm_port;
+    lapic_cal_seen = 0;
+    lapic_cal_valid = 0;
+    lapic_cal_ok = 0;
+    var lr_r = 0;
+    if (pm_port != 0) {
+        if (tsc_pm_alive(pm_port) == 1) {
+            lr_r = lapic_calibrate_pm(pm_port);
+            if (lr_r != 0) {
+                lapic_reload_src = 1;
+                lapic_cal_port = pm_port;
+            }
+        } else {
+            lapic_cal_dead = 1;
+        }
+    }
+    if (lr_r == 0) {
+        lr_r = lapic_calibrate();             # the PIT method, UNCHANGED: the PM-less fallback
+        if (lr_r != 0) { lapic_reload_src = 2; }
+    }
+    if (lr_r == 0) {
         lapic_reload_measured = 0;
         return 10000000;
     }
     lapic_reload_measured = 1;
-    return r;
+    return lr_r;
+}
+
+# The boot log's account of WHICH reference measured the tick (main.cyr, right after `LAPIC: reload=`).
+# A refused PM tier prints what it measured, so the bound it crossed is in the log. Reads only apic.cyr
+# globals. Always ends with exactly one source line (tsc-smoke T2 matches the src-1 form).
+fn lapic_reload_report() {
+    if (lapic_cal_dead == 1) {
+        kprint("lapic: acpi pm timer at port ", 29); kprint_hex(lapic_cal_try_port);
+        kprintln(" does not count -- the tick is measured against the PIT", 55);
+    } else {
+        if (lapic_cal_try_port != 0) {
+            if (lapic_reload_src != 1) {
+                if (lapic_cal_seen == 0) {
+                    kprintln("lapic: acpi pm timer REFUSED -- no window completed; the reference stopped", 74);
+                } else {
+                    if (lapic_cal_valid == 0) {
+                        kprint("lapic: acpi pm timer REFUSED -- ", 32); kprint_num(lapic_cal_seen);
+                        kprintln(" windows completed, none with a valid LAPIC count", 49);
+                    } else {
+                        kprint("lapic: acpi pm timer REFUSED -- ", 32); kprint_num(lapic_cal_ok);
+                        kprint(" of ", 4); kprint_num(lapic_cal_seen);
+                        kprint(" windows usable; reload measured ", 33); kprint_num(lapic_cal_lo);
+                        kprint("..", 2); kprint_num(lapic_cal_hi);
+                        kprintln("", 0);
+                        if (lapic_cal_ok >= 3) {
+                            if (lapic_cal_agree < 3) {
+                                kprint("lapic:   only ", 14); kprint_num(lapic_cal_agree);
+                                kprintln(" of them agree with their median reload", 39);
+                            } else {
+                                kprintln("lapic:   the reload agreed but the tsc rate of the same windows did not", 71);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (lapic_reload_src == 1) {
+        kprint("lapic: 100 Hz reload measured against the acpi pm timer (", 57); kprint_num(lapic_cal_agree);
+        kprint(" of ", 4); kprint_num(lapic_cal_ok);
+        kprintln(" windows agree)", 15);
+    }
+    if (lapic_reload_src == 2) {
+        kprintln("lapic: 100 Hz reload measured against the PIT (polled -- a host CPU quota can inflate it)", 89);
+    }
+    if (lapic_reload_src == 0) {
+        kprintln("lapic: 100 Hz reload NOT measured -- the 10000000 literal (tick rate unknown)", 77);
+    }
+    return 0;
 }
 
 # 1.46.x SMP sub-bite 7 (#1): the LAPIC timer reload count the BSP configured (captured in
@@ -409,10 +648,25 @@ fn tlb_shootdown_handler() {
 
 # Build the vector-0xF0 stub — timer_isr_build's shape, minus the callee-saved block (this handler
 # never context-switches, so only the caller-saved set the ABI lets it clobber must be preserved).
+# 1.57.7 (S3d): the body is isr_caller_saved_build below, SHARED with the 0xE1 reschedule-kick stub
+# (sched.cyr resched_kick_isr_build) — one copy of the byte sequence, byte-identical output.
 fn tlb_isr_build() {
-    var p = &tlb_isr;
-    var handler_addr = &tlb_shootdown_handler;
+    isr_caller_saved_build(&tlb_isr, &tlb_shootdown_handler);
+    return 0;
+}
+
+# The caller-saved ISR stub shape, 43 bytes, into `p`: clac; push the nine caller-saved GPRs; mov rax, handler;
+# call rax; pop them; iretq (bytes 41-42). Used by the TLB-shootdown stub (0xF0) and, since 1.57.7, the reschedule
+# kick (0xE1). REGISTER CONTRACT of the stub: clac clears RFLAGS.AC (hardware does not on delivery — see below); the
+# nine caller-saved GPRs are preserved around the call; the callee-saved ones are the handler's to keep (it is a
+# cyrius function); rax carries the handler address into the call.
+fn isr_caller_saved_build(p, handler_addr) {
     var off = 0;
+    # 1.57.7 (S3.4) — clac FIRST: no inputs/outputs; clears RFLAGS.AC. Hardware does not clear AC on interrupt
+    # delivery, so without it this ISR body would run with SMAP OFF whenever it lands on ring 3 that set AC with
+    # popf, or inside a syscall after the entry stub's stac. The saved RFLAGS keeps the interrupted AC; iretq
+    # restores it. (kstack-smoke's "isr clac" phase checks every gate's first three bytes.)
+    store8(p + off, 0x0F); store8(p + off + 1, 0x01); store8(p + off + 2, 0xCA); off = off + 3;   # clac
     store8(p + off, 0x50); off = off + 1;                                   # push rax
     store8(p + off, 0x51); off = off + 1;                                   # push rcx
     store8(p + off, 0x52); off = off + 1;                                   # push rdx

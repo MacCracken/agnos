@@ -1,6 +1,6 @@
 # 2026-09-23 — `sock_send`#48 and `sock_connect`#47 hold the CPU while they wait: a send over 2 KB to a local process never finishes
 
-**Status:** 🟡 **OPEN** — fixed by step **S6** (`sock_connect`#47 / `sock_send`#48 — and `icmp_echo`#55/#100 — block only their caller on the Path 2 wait primitive, woken by the RX demux; one segment in flight; after ~8 s without ACK progress `#48` returns the committed count). Needs S3c/S3d/S3b, S4 and S5 first. Not in 1.57.6. The Path 2 foundation this step builds on — per-process syscall kernel stacks, the deferred `on_cpu` release, preempt-disabling spinlocks, region-7 guard pages (bites S3.1–S3.3) — landed in **1.57.6**; see `docs/development/planning/blocking-syscall-concurrency.md` § Path 2 plan and the roadmap's 1.57.x table.
+**Status:** ✅ **RESOLVED 1.57.7 (2026-09-25)** — step S6: `sock_connect`#47, `sock_send`#48 and `icmp_echo`#55 / `icmp_echo_ex`#100 block only their caller, woken by the RX demux; one segment in flight at every `#48` entry; after ~8 s with no ACK progress `#48` returns the committed count (possibly 0, D6). Gate: `scripts/smoke/sock-wait-smoke.sh` (sweep row, 70/0; N1–N10: share ≥ 800 ‰, SEND-OK 16 KB, STALL D6, DIAL-DEADLINE; `-smp 1` TCG and `-smp 4` KVM) and 15 new `TCP_SELFTEST` arms. Built, gated, NOT burned. See § Resolution.
 **Filed by:** daimon (the AGNOS agent orchestrator). Its HTTP API answers clients on the same
 machine, and it calls MCP servers there.
 **Checked against:** agnos **1.57.5**: the `#47` and `#48` arms in `kernel/core/syscall.cyr` (`:10629`,
@@ -82,3 +82,22 @@ daimon 2.4.3 writes 512 bytes at a time with a 1 ms yield between pieces (severa
 scheduler), and yields between the reads it relays. Its test client does the same at 20 ms. That
 narrows the window. It cannot close it, because nothing tells a sender the receiver's free space
 before `#48` commits. The ask above stands, with this as its measurement.
+
+## Resolution (1.57.7, 2026-09-25)
+
+**What shipped:** answers to the asks — A1 block only the caller; A2 D6 (the committed count) instead of a short
+return on a zero window; A3 ring size unchanged; A4 a send of more than 2 KB to a local reader completes; A5 a
+stalled reader is bounded; A6 a dead-host connect ends at its ~8 s deadline, measured once from entry. Also: every
+TCP deadline on `sched_clock_us`, `net_tick()` on every CPU's tick, persist (a zero-window peer that keeps answering
+is never declared dead), graceful close (FIN retransmitted, kernel-held FIN_WAIT/LAST_ACK slot, FIN_WAIT_2 8 s,
+orphan reclaim), ICMP per-pid reply slots at 1 ms resolution. The pre-S6 kernel never got past N2.
+
+**What the change broke — checked before archiving:** consumers that ignore `#48`'s count truncate (sandhi
+`src/server/mod.cyr` single-shot sends, cyrius `lib/ws_server.cyr`) and write-all loops that treat 0 as fatal abort
+a stalled connection (sandhi `_sandhi_server_plain_write_all`, `sandhi_conn_send_all`, cyrius `_tn_sock_write_all`)
+— in the cyrius filing and the release notes. A wake beside a busy spinner takes about one tick (median 9929 µs
+`-smp 1`, 9981 µs `-smp 4`; idle 544 / 1381 µs; operator OQ-5: measure only). Found on the way and fixed: every
+full-MSS segment over virtio was dropped (1500 vs 1514 bound). Found in the end review and fixed (ENDFIX S6-R1): a
+close with data still unACKed discarded it.
+
+**Evidence:** `~/.claude/projects/-home-macro-Repos-agnos/handoff-1.57.7/steps/S6-report.json`, `ENDFIX-report.json`.

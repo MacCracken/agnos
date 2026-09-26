@@ -47,6 +47,13 @@ var timer_ticks = 0;
 # [[reference_cyrius_module_scope_var_expr_init_zero]]
 var tsc_per_us = 0;    # measured cycles per microsecond; 0 = no calibrated clock -- PERMANENT once ring 3 has run (tsc_calibrate + its one pre-userland retry, main.cyr)
 var tsc_base   = 0;    # rdtsc at the end of calibration; #95 reports microseconds since
+# 1.57.7 (S1b B5): uptime_ms#40 = uptime_ms_base + (rdtsc - tsc_base) / (tsc_per_us * 1000) once calibrated.
+# uptime_ms_base is timer_ticks * 10 at the calibration instant, so #40 is continuous with the tick clock it
+# read before (tsc_calibrate publishes base-ms, then base-TSC, then the rate). Same parse-order note.
+var uptime_ms_base = 0;
+# tsc_cal_median_agree's agreement count. Read by apic.cyr's lapic_calibrate_pm, which is parsed long
+# before main.cyr (forward variable references do not resolve), so it lives here (moved 1.57.7 S1b).
+var tsc_cal_agree = 0;
 
 # ⭐ THE KERNEL LOG TIMEBASE (1.56.58) — DELIBERATELY SEPARATE FROM tsc_per_us/tsc_base ABOVE, AND
 # THE SEPARATION IS THE WHOLE POINT. Three things forced it:
@@ -62,7 +69,7 @@ var tsc_base   = 0;    # rdtsc at the end of calibration; #95 reports microsecon
 # and look correct. Captured as an explicit STATEMENT at the top of core/main.cyr.
 # [[reference_cyrius_module_scope_var_expr_init_zero]]
 var klog_tsc_boot   = 0;   # rdtsc at the first statement of the boot body; log t=0
-var klog_tsc_per_us = 0;   # cycles per microsecond, measured in lapic_calibrate`s existing PIT window
+var klog_tsc_per_us = 0;   # cycles per microsecond, measured at boot against the ACPI PM timer (apic.cyr lapic_calibrate_pm), or the polled PIT window on a PM-less box
 var timer_isr[64];
 var nic_rx_isr[64];  # NIC RX MSI-X ISR machine code (~62 bytes) — 1.51.5
 var xhci_rx_isr[64]; # xHCI RX (USB-HID) MSI-X ISR machine code (~62 bytes) — 1.53.7
@@ -78,13 +85,17 @@ var pf_hw_cr3 = 0;
 var pf_hw_cr2 = 0;
 var tlb_isr[64];
 var nm_isr[64];    # #NM (vector 7) FP-context-switch ISR machine code — 1.53.x B3 (timer_isr shape)
+var resched_isr[64];   # vector 0xE0 voluntary-switch ISR machine code (clac + the timer_isr shape, 66 B) — 1.57.7 (Path 2, S3.4)
+var resched_kick_isr[8];   # vector 0xE1 reschedule-KICK ISR machine code: clac + tlb_isr's caller-saved shape, 43 B FIXED (64 B = 8 u64) — 1.57.7 (S3.8)
 var kb_buf[256];
 var kb_head = 0;
 var kb_tail = 0;
 # 1.44.x non-blocking cooked-line read (kbd_read_nonblock): a kernel partial-line accumulator
 # that persists ACROSS poll calls — each call drains what's in kb_buf (cook+echo into here) and
 # returns -2/WOULD_BLOCK until Enter completes a line. [512] = 4096 B (8N), covers agnsh's 4095
-# read. Single-reader-only (single-core invariant, [[project_multithreading_future_arc]]): a
-# second concurrent reader would interleave into this one accumulator — the SMP arc must unwind.
+# read. ⭐ 1.57.7 (S3.7) OWNERSHIP, not a single-core invariant: this accumulator belongs to the NB reader, which OWNS
+# the cooked line (keyboard.cyr kbd_line_owner) whenever nbline_pos > 0 (invariant NB-OWN), so no second reader can
+# drain into it or split its line; a blocking reader waits for the line, and a dying owner's partial line is dropped
+# (kbd_line_release_pid). docs/architecture/blocking-waits.md "keyboard line ownership".
 var nbline_buf[512];
 var nbline_pos = 0;

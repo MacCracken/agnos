@@ -9,9 +9,10 @@
 # What each row costs:
 #   getpid   #2  — the bare stub + dispatcher (the floor)
 #   pipe     #1+#5 — an 8-byte write then an 8-byte read on a pipe: two trips plus the fs/vfs lock path
-#   yield_idle  #44 with no other process ready: the only other READY proc is the CPU's idle, so each
-#                yield hands the CPU to the idle until the next 10 ms tick (a tick-bound number — what a
-#                lone yielder pays today; S3.6 keep-current changes it)
+#   yield_idle  #44 with no other process ready: since 1.57.7 (S3.6) keep-current keeps the yielder and #44
+#                PARKS the CPU for one hlt (a designated preempt point, not charged), so each yield costs
+#                about ONE INTERRUPT PERIOD (~10 ms at 100 Hz). A ~µs reading means the park is gone and a
+#                poll+yield loop spins its core (mutation M-D2); before 1.57.7 it was the idle round trip
 #   yield_peer  #44 against a second copy of this program spawned by spawn_path#43 that also yields in a
 #                loop: at -smp 1 each yield is a direct process-to-process switch, so ns_per is two
 #                switches (there and back). At -smp 4 the peer may run on another CPU and the number is

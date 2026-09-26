@@ -1,6 +1,6 @@
 # 2026-09-23 — `flock`#59 never waits, and nothing above it spins: contended locks proceed unlocked
 
-**Status:** 🟡 **OPEN** — fixed by step **S3c** (Path 2 bite S3.5: a contended `flock`#59 without `LOCK_NB` blocks in-kernel; `LOCK_NB` keeps -1; new -2 = lock table full; a blocking conversion drops the caller's old lock first). In 1.57.6 `#59` is still non-blocking only. The Path 2 foundation this step builds on — per-process syscall kernel stacks, the deferred `on_cpu` release, preempt-disabling spinlocks, region-7 guard pages (bites S3.1–S3.3) — landed in **1.57.6**; see `docs/development/planning/blocking-syscall-concurrency.md` § Path 2 plan and the roadmap's 1.57.x table.
+**Status:** ✅ **RESOLVED 1.57.7 (2026-09-25)** — steps S3c (+ S3b-F2 for `execwait`#37 children): a contended `flock`#59 without `LOCK_NB` blocks only its caller until the lock is free; `LOCK_NB` keeps −1; **−2 = lock table full**; a blocking SH↔EX conversion drops the old lock first. Gates: `scripts/smoke/wait-ring3-smoke.sh` (waitx P5a–P5d, P7, P13 flipped) and `ktest` T7/T9/T9b. Built, gated, NOT burned. See § Resolution.
 **Filed by:** patra (the sovereign database), during its 1.15.0 cut. patra takes a whole-file
 `flock` around every statement: `LOCK_EX` for writes, `LOCK_SH` for reads.
 **Checked against:** agnos **1.57.5**: the `#59` arm in `kernel/core/syscall.cyr` (at line 10950)
@@ -65,3 +65,20 @@ Nothing in code. It does not work around kernel lock semantics. patra 1.15.0 doc
 the *Platforms* section of `docs/development/roadmap.md`, the footguns in `state.md`, and
 `SECURITY.md`'s deployment table all point here. Until this lands, a patra database written by more
 than one agnos process is not safe.
+
+## Resolution (1.57.7, 2026-09-25)
+
+**What shipped:** the flock table under `flock_lock` (order fs < flock < sched); every release (unlock, close,
+exit, fault kill) wakes the inode's waiters; no timeout and no FIFO fairness (waiters race). Ask 1 (wait without
+`LOCK_NB`) adopted; ask 2 (a ring-3 spin in `xflock`) superseded — no spin is needed. `FLOCK_SELFTEST` retired
+into `ktest`. ABI row 59.
+
+**What the change broke — checked before archiving:** the owner is the PID, not the open-file description (agnos
+has no OFD layer; a fork child gets copies of the fd entries). A fork child that locks through an inherited fd
+while its parent holds the lock therefore waits, and deadlocks if the parent then `WAIT_BLOCK`s on it. Documented
+in ABI row 59 and `docs/architecture/blocking-waits.md`; per-OFD semantics are a roadmap row (they need an fd-table
+redesign). Found in the fix pass and fixed: a waiter retired by `wq_arm` under `flock_lock` now leaves through
+`wq_exit_if_retired()` instead of returning to a dead process (T9b). patra's flock caveat can be removed on
+≥ 1.57.7.
+
+**Evidence:** `~/.claude/projects/-home-macro-Repos-agnos/handoff-1.57.7/steps/S3c-report.json`, `S3c-fix-report.json`, `S3b-report.json`.

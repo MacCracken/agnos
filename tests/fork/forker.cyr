@@ -24,12 +24,41 @@ fn _emit_num(n) {
     return 0;
 }
 
+# ⭐ 1.57.7 (Path 2, S3.4) — the live RFLAGS of this ring-3 context. A forked child is ALWAYS an IF=1 scheduled
+# process (sys_fork forces IF in the child's RFLAGS), even when its parent runs IF=0 — the foreground-parent arm
+# (FORK_SELFTEST's `run /bin/forker`, an exec_and_wait child) is the one that tells the two apart.
+# REGISTER CONTRACT: pushfq; pop rax; mov [rbp-8], rax — in: none; out: rf (the sole local, at [rbp-8] because a
+# function containing asm is not regalloc'd) = RFLAGS; clobbers rax.
+fn _rflags() {
+    var rf = 0;
+    asm {
+        0x9C;                       # pushfq
+        0x58;                       # pop rax
+        0x48; 0x89; 0x45; 0xF8;     # mov [rbp-8], rax (rf)
+    }
+    return rf;
+}
+
+# ⭐ 1.57.7 (Path 2, S3.4) — this helper's own RSP. Called from main at the same call depth before and after the
+# fork, it must read the SAME value in the child: the child resumes on the parent's user RSP (the syscall frame's
+# [ktop-8], SCF_URSP). A child resumed on any other stack pointer — the stub bite C mutation M-B7 hands fork the
+# frame's user RBP instead — survives here only by luck, because main keeps its locals in registers.
+# REGISTER CONTRACT: mov [rbp-8], rsp — in: none; out: sp (the sole local, [rbp-8]) = RSP; clobbers nothing.
+fn _rsp() {
+    var sp = 0;
+    asm {
+        0x48; 0x89; 0x65; 0xF8;     # mov [rbp-8], rsp (sp)
+    }
+    return sp;
+}
+
 fn main(): i64 {
     sys_write(1, "FORKER-ALIVE\n", 13);
 
     # A value on the parent's stack BEFORE the fork. Both sides must see it — the child because its
     # address space is a COPY, the parent because forking must not disturb it.
     var witness = 0x5A5A;
+    var pre_sp = _rsp();                # 1.57.7: the child must resume on THIS stack pointer (see _rsp)
 
     var r = syscall(96, 0, 0, 0);
 
@@ -39,11 +68,14 @@ fn main(): i64 {
         # proc_table row saved at the last PREEMPTION rather than at the fork) this line is not where
         # it would appear.
         sys_write(1, "FORK-CHILD\n", 11);
+        if (_rsp() != pre_sp) { sys_write(1, "FORK-CHILD-RSP-WRONG\n", 21); syscall(SYS_EXIT, 12); }
         if (witness != 0x5A5A) { sys_write(1, "FORK-CHILD-STACK-WRONG\n", 23); syscall(SYS_EXIT, 3); }
         # ⚠ Write through the witness to prove the copy is PRIVATE. The parent checks its own after.
         witness = 0x1111;
         if (witness != 0x1111) { sys_write(1, "FORK-CHILD-WRITE-WRONG\n", 23); syscall(SYS_EXIT, 4); }
         sys_write(1, "FORK-CHILD-OK\n", 14);
+        if ((_rflags() & 0x200) != 0) { sys_write(1, "FORKER-CHILD-IF=1\n", 18); }
+        else { sys_write(1, "FORKER-CHILD-IF=0\n", 18); }
         # ⛔ 11, NOT 7 — AND THE COLLISION IT AVOIDS IS A REAL ONE. When the child's exit code shared
         # a value with one of the PARENT-path returns (FORK-WAIT-NO-CHILDREN returned 7), a kernel bug
         # that gave the CHILD a non-zero fork return went undetected: the child fell through to the
@@ -70,6 +102,9 @@ fn main(): i64 {
     var spins = 0;
     while (code == 0 - 2) {
         code = syscall(4, 0 - 1, 0, 0);
+        # 1.57.7: YIELD between polls, so the child runs even under a parent that holds its CPU IF=0 (the
+        # foreground arm: an exec_and_wait child is never preempted, but sched_yield#44 switches it out).
+        if (code == 0 - 2) { syscall(44, 0, 0, 0); }
         spins = spins + 1;
         if (spins > 100000) { sys_write(1, "FORK-WAIT-TIMEOUT\n", 18); return 6; }
     }
@@ -138,6 +173,7 @@ fn main(): i64 {
         spins2 = spins2 + 1;
         if (spins2 > 200000) { sys_write(1, "FORK-MULTI-TIMEOUT\n", 19); return 32; }
         c2 = syscall(4, 0 - 1, 0, 0);
+        if (c2 == 0 - 2) { syscall(44, 0, 0, 0); }   # 1.57.7: yield between polls (see phase 1)
         if (c2 == 0 - 1) { sys_write(1, "FORK-MULTI-EARLY-NOCHILD reaped=", 32); _emit_num(reaped); sys_write(1, "FORK-MULTI-EARLY-NOCHILD spins=", 31); _emit_num(spins2); return 33; }
         known = 0;
         if (c2 == 0 - 2) { known = 1; }

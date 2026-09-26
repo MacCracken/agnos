@@ -1,10 +1,12 @@
 # Spawn arms, child fd tables and pipe-buffer lifetime — invariants
 
-> **Last Updated**: 2026-09-24 (1.57.6 — first written for the spawn repairs)
+> **Last Updated**: 2026-09-25 (1.57.7 S3b — `#37` applies into the child's private table with no restore (strict
+> shape); the `#37` redirect backup and `exec_redirect_apply/_restore` are gone; legacy `#43` on the global table is
+> refused. [`foreground-exec.md`](foreground-exec.md)) · 2026-09-24 (1.57.6 — first written for the spawn repairs)
 >
 > Code: the per-process arms in [`kernel/core/proc.cyr`](../../kernel/core/proc.cyr) (`proc_redir_*`,
-> `proc_endow_*`, `spawn_arms_*`, the reset in `proc_alloc_slot`) · `spawn_path_sys`, `spawn_fd_shape`, `spawn_shape_or_teardown`,
-> `exec_redirect_apply/_restore`, `chan_place_into_child`, the `#3` / `#37` / `#43` / `#62` / `#97` arms in
+> `proc_endow_*`, `spawn_arms_*`, the reset in `proc_alloc_slot`) · `spawn_path_sys`, `spawn_load_child`, `spawn_fd_shape`, `spawn_shape_or_teardown`,
+> `spawn_shape_strict` (1.57.7), `chan_place_into_child`, the `#3` / `#37` / `#43` / `#62` / `#97` arms in
 > [`kernel/core/syscall.cyr`](../../kernel/core/syscall.cyr) · `pipe_buf_referenced` / `pipe_buf_put`,
 > `vfs_fd_inherit`, `proc_destroy_fd_table`, `vfs_close_inner` in [`kernel/core/vfs.cyr`](../../kernel/core/vfs.cyr)
 > · the loader's codes and NUL-separated argv in [`kernel/core/elf.cyr`](../../kernel/core/elf.cyr) · the dead-`old`
@@ -36,6 +38,11 @@ Rules since 1.57.6:
 - Placement re-checks that the spawner **still owns** the endpoint and that `chan_epoch` is unchanged, so a
   closed-and-re-minted endpoint can never follow the arm into the child. `CH_CLOSE` of the armed endpoint
   disarms; `CH_ENDOW(-1)` and `#62 REDIR_CLEAR` disarm explicitly.
+- **The limits arm (1.57.7, S8)** — `spawn_limits`#107 (memory pages, CPU ticks) — is per-process like the others
+  (indexed by the arming pid, no lock), but it is consumed at ONE site, `syscall_handler`'s exit, after **every**
+  `#3` / `#37` / `#43` return; the others are cleared by the #43/#37 exits and the endowment by #3. It is reset
+  (not consumed) at slot recycle, at the bootstrap and in the death chain, and `fork`#96 never copies it. See
+  [process-lifecycle.md § Resource limits](process-lifecycle.md#resource-limits).
 - A redirect whose src is the fd the endowment was placed on is skipped (the endowment wins); `REDIR_ADD`
   and the `CH_ENDOW` fd picker keep the two apart in either arm order.
 
@@ -47,8 +54,9 @@ slot, **never `vfs_close`**: a close runs side effects on the SHARED object — 
 connection for a `VFS_SOCK`, a flush + pool release of the parent's `VFS_SEC_WFILE` — and the child never
 owned those. The same holds for every slot a redirect overwrites.
 
-`vfs_fd_inherit` first **destroys** any private table an orphan zombie left in the slot (the orphan is
-dead and nobody will reap it, so nothing else ever would), then clears the child's base **before** its
+`vfs_fd_inherit` first **destroys** any private table an orphan zombie left in the slot — ⭐ since 1.57.7 (S7) a
+FALLBACK that should never find one: an orphan frees its own fd table and address space at its own death
+(`proc_reap_orphan`, [`process-lifecycle.md`](process-lifecycle.md)) and a dying parent reaps its zombies first — then clears the child's base **before** its
 kmalloc, so a failure falls back to the global table (which `chan_place_into_child` and `spawn_fd_shape`
 detect and refuse), never to a dead stranger's table. A CLEANFD child that cannot get a private table is torn
 down unrun (`-SPAWN_E_NOMEM`, `spawn_shape_or_teardown`); a legacy one runs unredirected, as before.
@@ -56,7 +64,8 @@ down unrun (`-SPAWN_E_NOMEM`, `spawn_shape_or_teardown`); a legacy one runs unre
 ## Invariant 3 — a pipe buffer lives until the LAST reference anywhere
 
 A pipe's 4 KB buffer is freed when no fd slot in **any** table — the global `vfs_table`, every
-`proc_fd_base` table (dead-but-unreaped ones included), or a `#37` redirect backup — still names it. It is
+`proc_fd_base` table (dead-but-unreaped ones included) — still names it (the `#37` redirect backup that also
+counted until 1.57.7 is gone: `#37` applies into the child's table and restores nothing). It is
 decided by a scan (`pipe_buf_referenced`), not a counter, because references are copied at inherit, at every
 redirect apply and by fork, and a counter needs every copy site to remember.
 
@@ -70,11 +79,11 @@ pipes entirely, so a reaped child's references were simply dropped.
 Rules:
 - A path that can drop a **possibly-sole** reference clears the slot **and** scans in **one**
   `fs_spin_lock` hold, bracketed by `preempt_disable` (proc 0 is preemptible and the lock neither disables
-  preemption nor nests): `vfs_close_inner`, `proc_destroy_fd_table` (for **both** `do_flush` values) and
-  `exec_redirect_restore`. The slot is cleared **before** the scan, or the scan counts the reference being
+  preemption nor nests): `vfs_close_inner` and `proc_destroy_fd_table` (for **both** `do_flush` values) — the only two since 1.57.7;
+  a `#37` child's table is destroyed at its reap under the same one-hold rule. The slot is cleared **before** the scan, or the scan counts the reference being
   dropped.
 - "Clear it lock-free, then lock and re-check" is **not** equivalent. The first 1.57.6 build did that in
-  `exec_redirect_restore`: a `#37` child that handed a pipe to a still-running `#43` grandchild had its slot
+  `exec_redirect_restore` (deleted in 1.57.7): a `#37` child that handed a pipe to a still-running `#43` grandchild had its slot
   overwritten while the lock was free, the grandchild's last close on another CPU then scanned, found nothing
   and freed, and the restore's late `pipe_buf_put` found nothing too and freed **again** — a double push on the
   4096 slab free list, so two later `kmalloc(4096)`s alias. One hold makes the two droppers serialize so that
@@ -84,9 +93,10 @@ Rules:
   is the caller, inside that spawn). A kernel creator on the shared global table is the one soft spot — a
   kthread closing the same global fd at that instant can turn the raw drop into a leak, never a free.
 - `pipe_writers_open` (EOF) still skips dead tables — that rule is for EOF, the opposite of this one.
-- An orphan zombie's slot (its parent died unreaping) is handed out again by `proc_alloc_slot` with its fd
-  table still attached; `vfs_fd_inherit` destroys that table (sweeping its pipe references) before the new
-  child gets its own, so the orphan's pipe buffers are released rather than leaked.
+- An orphan's fd table and address space are freed at its OWN death since 1.57.7 (S7: `proc_death_finish` →
+  `proc_reap_orphan`); `vfs_fd_inherit`'s destroy of a table left in a reused slot stays as the fallback (it should
+  never find one — the reuse tripwire `proc: orphan zombie recycled unreaped` fires if an orphan slot still holding
+  an address space is ever handed out).
 
 ## Invariant 4 — a CPU must leave a dead process's CR3 before the reap fence opens
 

@@ -73,6 +73,14 @@ jobs:
           # check.sh already names. It stays local, where its comment and its history live.
           echo "  (size ceiling is check.sh gate 32's, deliberately not enforced here — see above)" 
 
+      - name: Kernel image vs BSP boot stack (image-layout-check.sh)
+        # ⭐ 1.57.7 (IMG-fix, review A5). NOT the size ceiling's case (above): gate 32's 2 MiB is a BUDGET;
+        # this bound is a CORRECTNESS fact — past LOAD end 0x390000 the BSP boot stack (top 0x3A0000, live from
+        # the shim's first instruction) grows down into the image's .rodata with no fault. build.sh only WARNS
+        # for a plain image (so check.sh gate 34 can score it locally) and CI does not run check.sh, so without
+        # this step an over-bound kernel would build green here and ship. Needs only python3 + the tree.
+        run: sh scripts/check/image-layout-check.sh build/agnos
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:

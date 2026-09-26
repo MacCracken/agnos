@@ -88,6 +88,8 @@ Measured, from the surveys. A design that violates one of these is not a candida
 - The two shipped answers to "must wait" are **(a)** return WOULD_BLOCK and let ring 3 poll
   (`waitpid #4`, `sock_recv #49`, `sock_accept #57`, `flock #59`) or **(b)** `preempt_disable(); sti;
   hlt`-spin (`sleep_ms #41`, `sock_connect #47`, `sock_send #48`, `snd_write #66`).
+  (1.57.7 update: `sleep_ms #41`, `waitpid #4` (WAIT_BLOCK) and `flock #59` now BLOCK only their caller in the
+  kernel's wait/wake primitive — docs/architecture/blocking-waits.md; the others follow in later Path 2 steps.)
   ⛔ **(b) is exactly what made TCP toxic for a display protocol** — it starves the peer it is waiting
   on. All three designs independently refused (b). A design whose wait answer is (b) recreates the
   failure it exists to fix.
@@ -396,8 +398,10 @@ to revoke.
 
 ### 9.4 The wakeup — **the batch IS the poll**
 
-No blocking in v1, and the reason is the **stack, not a policy**: each CPU has one shared SYSCALL kernel
-stack, so N blocked waiters need N disjoint kernel stacks. Both escape hatches are refused — the
+No blocking in v1, and the reason was the **stack, not a policy**: each CPU had one shared SYSCALL kernel
+stack, so N blocked waiters needed N disjoint kernel stacks. *(1.57.7: that reason is gone — per-process kernel stacks
+since 1.57.6 and a real BLOCKED state since 1.57.7, [`../../architecture/blocking-waits.md`](../../architecture/blocking-waits.md).
+A blocking channel read now needs only its producer's wake and a consumer survey — its own design item; v1 stays a poll.)* Both escape hatches are refused — the
 `preempt_disable; sti; hlt` spin is the poison that made TCP toxic, and a kernel-side tail-call into
 `#44`'s abandon-frame path is illegal because `chan_*` arms run inside `ksyscall` with stale captures.
 
@@ -409,7 +413,10 @@ rotation; one in the common case.
 
 ⛔ **`sched_yield #44` is a silent successful no-op under any of four guards**, two enterable without the
 caller knowing — and a foreground `run` is IF=0 and gets the no-op, degrading to a 10 ms busy poll. The
-honest claim is *"one cheap syscall per poll"*, never *"then a real yield."*
+honest claim is *"one cheap syscall per poll"*, never *"then a real yield."* (1.57.7: `#44` is now an in-kernel
+yield — the voluntary switch — that PARKS the CPU for one interrupt when nothing else is READY (S3d), so a poll+yield
+loop no longer spins a core; its only remaining no-op cases are before the scheduler, preempt held, a borrowed CR3,
+and until S3b the child of an in-flight `execwait`#37 — which is exactly the foreground `run` above.)
 
 ⛔ **The 30-second stall is a cyrius STDLIB defect, not a kernel one** (`sock_recv #49` already answers
 immediately three ways). This design must **not** be justified on that number.

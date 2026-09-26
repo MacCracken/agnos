@@ -155,6 +155,14 @@ fi
 # QEMU, so bench (like every smoke test) boots via gnoboot + OVMF below.
 KASHI_DIR="$KASHI_DIR" REKHA_DIR="$REKHA_DIR" sh "$ROOT/scripts/build.sh" >&2
 cp "$ROOT/build/agnos" "$ROOT/build/agnos_bench"
+# ⭐ 1.57.7 (IMG-fix, review A5/A6): this image is "plain" to build.sh's flag test (no #define) but is built from
+# REWRITTEN sources and is booted below, so (1) it must pass the image-layout gate here — build.sh only WARNS for
+# a plain over-bound image — and (2) build/agnos is re-marked as the bench kernel it is, so a production smoke's
+# smoke_require_image refuses it instead of booting bench_run_all as if it were the shipped kernel.
+if ! sh "$ROOT/scripts/check/image-layout-check.sh" "$ROOT/build/agnos_bench" >&2; then
+    echo "ERROR: the bench kernel fails the image-layout gate (above) — not booting it" >&2; exit 1
+fi
+printf 'flags=BENCH\nmd5=%s\n' "$(md5sum "$ROOT/build/agnos" | cut -d' ' -f1)" > "$ROOT/build/agnos.flags"
 
 # Sources restored — undo the trap so a later non-build failure doesn't try to
 # restore already-restored files.

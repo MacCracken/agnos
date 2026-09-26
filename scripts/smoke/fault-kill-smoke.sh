@@ -3,7 +3,10 @@
 # (CPL3) CPU fault KILLS the faulting process and returns to the kernel/shell, instead
 # of painting the 1.45.16 fault-canary bar and HALTING the box.
 #
-# Build first:  FAULT_SELFTEST=1 EXT2_WRITE_SELFTEST=1 ./scripts/build.sh
+# Builds its own kernel (1.57.7 HAR): FAULT_SELFTEST=1 EXT2_WRITE_SELFTEST=1 scripts/build.sh, refuses to boot
+#   anything else (smoke_require_image), and leaves a PLAIN production build/agnos behind on every exit. Until
+#   1.57.7 it booted whatever build/agnos was on disk and, after a plain build, reported "FAIL: faulter never
+#   dispatched (FAULT_SELFTEST build?)" — a wrong-kernel run scored as a kernel red (S7). Gated by sweep.sh since 1.57.7.
 #   The FAULT_SELFTEST kernel (main.cyr fault_disk_selftest) hand-builds a minimal static
 #   ELF64 whose entry reads an unmapped 5 GB address (movabs rdi,0x140000000; mov rax,[rdi])
 #   → a ring-3 #PF, writes it to /bin/faulter, and `run`s it via exec_and_wait.
@@ -29,7 +32,17 @@ done
 GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"
 AGNOS="$ROOT/build/agnos"
 [ -f "$GNOBOOT" ] || { echo "ERROR: gnoboot not built at $GNOBOOT"; exit 1; }
-[ -f "$AGNOS" ]   || { echo "ERROR: agnos not built — run FAULT_SELFTEST=1 EXT2_WRITE_SELFTEST=1 ./scripts/build.sh"; exit 1; }
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # qemu_dwell_kernel, qemu_assert_booted, smoke_require_image
+echo "Building FAULT_SELFTEST + EXT2_WRITE_SELFTEST kernel..."
+if ! env FAULT_SELFTEST=1 EXT2_WRITE_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/fault-kill-smoke-build.log 2>&1; then
+    echo "  BUILD-FAIL (see /tmp/fault-kill-smoke-build.log)"; tail -5 /tmp/fault-kill-smoke-build.log
+    sh "$ROOT/scripts/build.sh" >/dev/null 2>&1 || true
+    exit 1
+fi
+# Leave a PLAIN production build behind on every exit from here on (the disk image below carries the flag kernel).
+fault_restore_plain() { sh "$ROOT/scripts/build.sh" >/dev/null 2>&1 || echo "  WARN: could not restore the plain build (sh scripts/build.sh)"; }
+trap fault_restore_plain EXIT
+smoke_require_image "$AGNOS" "FAULT_SELFTEST EXT2_WRITE_SELFTEST"
 
 WORK="$ROOT/build/fault-smoke"; rm -rf "$WORK"; mkdir -p "$WORK"
 IMG="$WORK/agnos-fault.img"
@@ -49,7 +62,6 @@ mkfs.ext2 -F -q -L AGNOS-FAULT -b 4096 -m 0 -O "$EXT2_SMOKE_FEATURES" -d "$SEED"
 
 LOG="$WORK/fault.log"
 echo "Booting FAULT_SELFTEST kernel (ring-3 #PF → expect kill + survive)..."
-. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
 QEMU_DWELL_VOID="${QEMU_DWELL_VOID:-gnoboot: fail @ EBS|BootManagerMenuApp|Please select boot device}"
 export QEMU_DWELL_VOID
 qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" "$WORK/vars.fd" "$OVMF_VARS_SRC" \

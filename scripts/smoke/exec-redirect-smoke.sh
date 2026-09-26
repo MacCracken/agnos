@@ -1,23 +1,18 @@
 #!/bin/sh
-# exec-redirect-smoke.sh — validates the fd-redirect output-capture feature
-# (exec_redirect#62 + the execwait#37 hook, 1.46.x). Builds the
-# EXEC_REDIRECT_SELFTEST kernel and boots it via the agnsh-smoke NVMe harness;
-# the boot-time selftest creates a pipe, arms a redirect of fd 20 -> the pipe
-# write end, applies it, writes "HI" to fd 20 (which must route to the pipe, not
-# the console), restores, then reads the pipe's read end and asserts "HI" —
-# proving a redirected fd's writes land in the dst backend (the same
-# exec_redirect_apply/restore the #37 child run uses). Leaves the tree at a
-# plain production kernel.
+# exec-redirect-smoke.sh — validates the fd-redirect output-capture feature (exec_redirect#62). Builds the
+# EXEC_REDIRECT_SELFTEST kernel and boots it via the agnsh-smoke NVMe harness. The boot-time selftest drives the
+# redirect the way execwait#37 applies it since 1.57.7 (S3b): into a SCRATCH CHILD's private fd table (the child
+# inherits a copy, the shape rewrites the copy, the "child" writes as itself, then its table is destroyed — as the
+# reap does; nothing is ever restored). Four markers: `redir: capture OK` (fd 20 -> a pipe write end, "HI"
+# captured), `redir: stdin-pipe OK` (the child's fd 0 <- a pipe read end; read#5 reaches pipe_read, not the
+# keyboard), `redir: multi capture OK` ((20 <- w) then REDIR_ADD (21 <- 20), the `2>&1` shape, both captured in
+# order) and `redir: parent table untouched OK` (the parent's — the global table's — slots 0/20/21 byte-identical
+# and its fd base unchanged). Leaves the tree at a plain production kernel.
 #
 # 1.56.39 also covers the spawn_path#43 arm (spawn_fd_shape since 1.57.6): a redirect aimed
 # at the GLOBAL vfs_table must be REFUSED with the table untouched, and one aimed at a
 # child holding its own private table must rewrite that copy while the global stays
-# byte-identical.
-#
-# 1.57.6 — the arm is per-PROCESS and holds up to 4 pairs: the selftest also arms (20 <- w) then
-# REDIR_ADD (21 <- 20) — the `2>&1` shape — and requires BOTH captured, in order, and BOTH slots
-# restored byte-identical (`redir: multi capture OK`). The #43 arm is spawn_fd_shape now (the CLEANFD
-# half of it is SPAWN_SELFTEST's, scripts/smoke/spawn-smoke.sh). A boot with no kernel banner is VOID.
+# byte-identical. A boot with no kernel banner is VOID.
 #
 # Issue: docs/development/issues/2026-06-15-cyrius-stdlib-missing-syscalls.md
 #        group 1 "the high-value one" (fd-redirect for capturing subprocess helpers).
@@ -30,7 +25,8 @@ echo "Building EXEC_REDIRECT_SELFTEST kernel..."
 EXEC_REDIRECT_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/dev/null 2>&1
 
 echo "Booting (via the agnsh-smoke NVMe harness)..."
-sh "$ROOT/scripts/smoke/agnsh-smoke.sh" >/dev/null 2>&1 || true
+# AGNSH_SMOKE_FLAGS (1.57.7 IMG-fix): agnsh-smoke refuses any image but the one it is told to expect.
+AGNSH_SMOKE_FLAGS=EXEC_REDIRECT_SELFTEST sh "$ROOT/scripts/smoke/agnsh-smoke.sh" >/dev/null 2>&1 || true
 
 LOG="$ROOT/build/agnsh-smoke-logs/agnsh.log"
 rc=0
@@ -58,11 +54,20 @@ else
     rc=1
 fi
 
-# 1.57.6 — two pairs, the 2>&1 shape, applied in order and restored byte-identical in reverse.
+# 1.57.6 — two pairs, the 2>&1 shape, applied in order (into the child's copy since 1.57.7).
 if strings "$LOG" 2>/dev/null | grep -q "redir: multi capture OK"; then
-    echo "  PASS: two armed pairs (20 <- w, ADD 21 <- 20) both captured, both slots restored byte-identical"
+    echo "  PASS: two armed pairs (20 <- w, ADD 21 <- 20) both captured, in order"
 else
-    echo "  FAIL: multi-pair apply/restore did not pass"
+    echo "  FAIL: multi-pair capture did not pass"
+    strings "$LOG" 2>/dev/null | grep -i "redir:" || echo "  (no redir line)"
+    rc=1
+fi
+
+# 1.57.7 (S3b) — the parent's table was never touched: #37 applies into the child's copy and restores nothing.
+if strings "$LOG" 2>/dev/null | grep -q "redir: parent table untouched OK"; then
+    echo "  PASS: the parent's (global) table slots 0/20/21 and its fd base are byte-identical afterwards"
+else
+    echo "  FAIL: the parent's table changed (or the check never ran)"
     strings "$LOG" 2>/dev/null | grep -i "redir:" || echo "  (no redir line)"
     rc=1
 fi

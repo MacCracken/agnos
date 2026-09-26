@@ -57,28 +57,41 @@ mcopy -i "$IMG"@@1048576 "$AGNOS" ::boot/agnos
 mkfs.ext2 -F -q -L AGNOS-FPEX -b 4096 -m 0 -O "$EXT2_FEATURES" -d "$SEED" -E offset=$PART_OFFSET "$IMG" $PART_BLOCKS
 
 echo "[3/4] Booting gnoboot+OVMF+NVMe, running /bin/fpex..."
-cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"; : > "$SLOG"
 KVM_ARGS=""; [ -e /dev/kvm ] && KVM_ARGS="-enable-kvm -cpu host"; [ -z "$KVM_ARGS" ] && KVM_ARGS="-cpu max"
 HARD=60; [ -e /dev/kvm ] || HARD=120
-. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # qemu_assert_booted
-qemu-system-x86_64 -machine q35 -m 512M $KVM_ARGS \
-    -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
-    -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
-    -drive "file=$IMG,format=raw,if=none,id=disk0" -device "nvme,drive=disk0,serial=AGNOS-FPEX" \
-    -serial "file:$SLOG" -display none -no-reboot &
-QPID=$!; trap 'kill $QPID 2>/dev/null' EXIT
-i=0
-while [ $i -lt $HARD ]; do
-    sleep 1; i=$((i+1))
-    if grep -aq "exec: fpex returned" "$SLOG" 2>/dev/null; then sleep 1; break; fi
-    kill -0 $QPID 2>/dev/null || break
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # qemu_attempt_verdict / qemu_assert_booted
+# ⛔ 1.57.7 (IMG-fix, D15/B3 class) — BANNER-CLASSIFIED RETRY. This smoke booted ONCE, so the ~1-in-4 firmware
+# hand-off flake (`gnoboot: fail @ EBS`, the kernel never ran) failed its sweep row outright: the IMG-fix sweep lost
+# this row on two EBS VOIDs in a row (logs/IMG-fix/sweep-logs). Now a VOID attempt is retried (QEMU_TRIES, default
+# 6) with its log kept as <log>.attemptN, a kernel that died before its banner FAILS at once (qemu_attempt_verdict),
+# and a run with no banner in any attempt is VOID (exit 2), never scored.
+_try=1
+while :; do
+    cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"; : > "$SLOG"
+    qemu-system-x86_64 -machine q35 -m 512M $KVM_ARGS \
+        -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
+        -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
+        -drive "file=$IMG,format=raw,if=none,id=disk0" -device "nvme,drive=disk0,serial=AGNOS-FPEX" \
+        -serial "file:$SLOG" -display none -no-reboot &
+    QPID=$!; trap 'kill $QPID 2>/dev/null' EXIT
+    i=0
+    while [ $i -lt $HARD ]; do
+        sleep 1; i=$((i+1))
+        if grep -aq "exec: fpex returned" "$SLOG" 2>/dev/null; then sleep 1; break; fi
+        # a failed hand-off is terminal — stop waiting now; the classification below decides
+        if ! grep -aq "AGNOS kernel v" "$SLOG" 2>/dev/null && grep -aqE "gnoboot: fail @|BootManagerMenuApp|BdsDxe: failed to load" "$SLOG" 2>/dev/null; then break; fi
+        kill -0 $QPID 2>/dev/null || break
+    done
+    kill $QPID 2>/dev/null; trap - EXIT; wait $QPID 2>/dev/null; sync
+    qemu_attempt_verdict "$SLOG" "$_try" && break
+    [ "$_try" -ge "${QEMU_TRIES:-6}" ] && break
+    _try=$((_try + 1))
 done
-kill $QPID 2>/dev/null; trap - EXIT; wait $QPID 2>/dev/null; sync
 # ⛔ DID THE KERNEL RUN AT ALL? Placed AFTER the wait loop, not after the launch — this smoke
 # backgrounds QEMU, so checking straight after the `&` would read an empty log every time.
 # Without this an OVMF hand-off failure makes every assertion below evaluate against that
 # empty log: this gate printed "fpex never dispatched" from a kernel that never executed.
-qemu_assert_booted "$SLOG" || exit 1
+qemu_assert_booted "$SLOG" || { echo "fp-ring3-smoke: VOID"; exit 2; }
 
 echo "[4/4] Checks..."
 echo "  --- fpex serial lines ---"

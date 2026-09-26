@@ -16,6 +16,7 @@
 # ⚠ The UDP arm matters specifically because the agnos TX path hardcodes checksum 0 ("not computed",
 # RFC 768), so the non-zero verification branch is never exercised by agnos's own traffic.
 set -u
+. "$(cd "$(dirname "$0")" && pwd)/lib/qemu-dwell.sh"   # qemu_attempt_verdict (1.57.7 IMG-fix)
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT" || exit 1
 GNOBOOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}/build/BOOTX64.EFI"
@@ -52,8 +53,10 @@ while [ "$a" -le 3 ]; do
         -drive "file=$IMG,format=raw,if=none,id=d0" -device "nvme,drive=d0,serial=AGNOS-CSUM" \
         -serial stdio -display none -no-reboot 2>/dev/null | tr -d '\0' > "$LOG"
     rm -rf "$W"
-    grep -q 'AGNOS kernel v' "$LOG" && break
-    echo "  (firmware never handed off — retry $a/3)"
+    # 1.57.7 (IMG-fix, A2): classified, not banner-only — a pre-banner kernel death FAILS (exit 1); a VOID keeps
+    # its log as $LOG.attemptN and says why (scripts/smoke/lib/qemu-dwell.sh qemu_attempt_verdict).
+    qemu_attempt_verdict "$LOG" "$a" && break
+    echo "  (retry $a/3)"
     a=$((a+1))
 done
 if ! grep -q 'AGNOS kernel v' "$LOG"; then

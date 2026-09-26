@@ -42,7 +42,9 @@ def need(*paths):
 need(GNOBOOT, AGNOS, os.path.join(ROOTFS, "bin/agnsh"))
 
 # ---- a minimal static ELF64 /bin/sleeper: busy-count SLEEP_N, write SLEEPER-DONE, exit(0), spin.
-# Busy-count (NOT sleep_ms#41 — that sets sched_active=0 and would FREEZE the scheduler + agnsh);
+# Busy-count (NOT sleep_ms#41 — before 1.57.7 it held the CPU with preemption off, and the comment said "sets sched_active=0
+# and would FREEZE the scheduler + agnsh", which was never true; since 1.57.7 it blocks only its caller — the busy count
+# stays because this harness measures a RUNNING job);
 # a ring-3 busy loop stays preemptible so agnsh time-slices alongside it.
 def build_sleeper(path):
     MSG = b"SLEEPER-DONE\n"
@@ -215,10 +217,13 @@ try:
     p("bg job ran to completion (SLEEPER-DONE):", sleeper_ran)
     p("agnsh reaped the bg job ([1] Done):", reaped)
     # ⛔ 1.57.6 (S3-fix): the kernel's LATCHED invariant lines (scripts/smoke/lib/qemu-dwell.sh SMOKE_INVARIANT_DENY —
-    # keep the two patterns identical) print once to klug + COM1 and change nothing else, so this harness scored PASS
+    # loaded below through _invdeny.py since 1.57.7, never copied) print once to klug + COM1 and change nothing else, so this harness scored PASS
     # with them firing until it grepped for them.
     import re as _re_inv
-    INV_DENY = r"sched: refused non-ready pick|sched: exec_and_wait entered with|sched: kernel_resume with|syscall: kernel stack is not the caller|PANIC: Double Fault"
+    # 1.57.7 (S3d): loaded from scripts/smoke/lib/qemu-dwell.sh through _invdeny.py — no pasted copy left to drift.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from _invdeny import smoke_invariant_deny
+    INV_DENY = smoke_invariant_deny()
     inv_hits = [ln for ln in ser().splitlines() if _re_inv.search(INV_DENY, ln)]
     inv_ok = not inv_hits
     p("no latched kernel invariant line:", inv_ok, ("" if inv_ok else " -- " + " | ".join(inv_hits[:5])))

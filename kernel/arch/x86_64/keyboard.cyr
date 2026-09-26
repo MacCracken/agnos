@@ -22,6 +22,29 @@
 # stays unlocked: a single consumer owns kb_tail, producers only grow kb_head, so a
 # stale read is benign (the key is seen on the next poll).
 var input_lock = 0;
+# ⭐ 1.57.7 (Path 2, S3.7) — ONE BLOCKING READER PER COOKED LINE. The three cells below are guarded by input_lock
+# (taken after kbd_irq_save, like every kb_buf critical section). The functions that use them — kbd_line_try_take,
+# kbd_line_acquire, kbd_line_release, kbd_line_release_pid — live in core/syscall.cyr (they read WK_KBD_OWNER and
+# call wq_*, which are parsed after this file). docs/architecture/blocking-waits.md "keyboard line ownership".
+#   OWNERS of the global keyboard state (who may write what):
+#     kb_shift / kb_ctrl ........ the line owner (the reader that holds the line resets them at a fresh line)
+#     fb_line_live (fb_console) . the line owner sets it to 1; the CONSOLE clears it on newline/CR
+#     nbline_buf / nbline_pos ... the NB reader (kbd_read_nonblock), which OWNS the line whenever nbline_pos > 0
+#                                 (invariant NB-OWN: a partial NB line is never split between readers)
+#     kb_buf consumers .......... the line owner, the NB reader, and two non-owner-aware readers kept as they are:
+#                                 kbscan#42 (raw scancodes — DOOM owns the keyboard by convention) and the kernel
+#                                 recovery shell's input loop (kmain, emergency only)
+var kbd_line_owner = 0;     # pid + 1 of the process that owns the cooked line; 0 = free
+var kbd_line_ep = 0;        # proc_epoch of that owner (live iff its state >= 1 AND the epoch matches)
+var kbd_line_waiters = 0;   # processes between "saw the line busy" and "woke / cancelled" (a release wakes only if > 0)
+
+# Is anything in kb_buf? NO side effects — unlike kb_has_key, it neither drains the xHCI ring nor services deferred
+# HID work (which may print): it is the post-arm RE-CHECK of the waiting keyboard read (syscall.cyr), which must
+# not do I/O between wq_arm and wq_sleep. A stale answer is benign (the caller loops).
+fn kbd_ring_nonempty() {
+    if (kb_head != kb_tail) { return 1; }
+    return 0;
+}
 fn input_spin_lock() {
     preempt_disable();                                  # 1.57.6 (S3.2): a held plain spinlock is NON-PREEMPTIBLE (see smp.cyr's lock banner)
     var old = 1;

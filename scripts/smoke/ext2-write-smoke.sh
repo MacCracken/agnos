@@ -21,7 +21,7 @@
 # Requires: qemu-system-x86_64, OVMF, parted, mtools, sgdisk, mkfs.ext2,
 #           debugfs, e2fsck, dd, strings. gnoboot at ../gnoboot/build/.
 #
-# Exit 0 if the W1 gate passes; 1 otherwise.
+# Exit 0 if the W1 gate passes; 1 otherwise; 2 = VOID (the kernel never ran in any attempt, or the wrong build).
 
 set -u
 
@@ -104,20 +104,32 @@ echo "  host debugfs baseline: Free blocks = ${BASE_FREE:-?}"
 
 # --- boot the self-test kernel ---
 echo "Booting EXT2_WRITE_SELFTEST kernel (NVMe + GPT partition)..."
-cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/write-selftest.log"
-. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # qemu_assert_booted
-timeout "${QEMU_TIMEOUT:-30}" qemu-system-x86_64 \
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # qemu_dwell_kernel + qemu_assert_booted
+# ⛔⛔ 1.57.7 (IMG-fix, review B3) — THIS ROW WAS FLAKY FOR A KNOWN REASON, AND THE REASON IS FIXED HERE.
+# It booted ONCE under `timeout 30`, so the ~1-in-4 firmware hand-off flake (`gnoboot: fail @ EBS`, the kernel
+# never runs) was scored `exit 1` — a FAIL — and only sweep.sh's single blind retry stood between it and a red
+# sweep. Measured in the IMG run: 4 VOIDs in 8 standalone runs, and the sweep's ext2 WRITE row passed on its
+# retry with the first attempt's log overwritten. Now the boot goes through qemu_dwell_kernel: a VOID attempt
+# is retried (QEMU_TRIES, default 6) with its log kept as $LOG.attemptN, a kernel that died before its banner
+# FAILS at once, and exhausting the retries is a VOID (exit 2), never a FAIL. A retried attempt cannot touch
+# the disk image: a VOID means the kernel never ran. The dwell now ends at the `agnos>` prompt (kybernet's
+# emergency shell: this seed has no /bin/agnsh), which the selftest and its `sync` precede — the old form
+# killed the same idle kernel at 30 s — and QEMU_DWELL_VOID ends a failed hand-off at once instead of
+# sitting at the boot menu for the whole budget.
+QEMU_DWELL_VOID="${QEMU_DWELL_VOID:-gnoboot: fail @|BootManagerMenuApp|Please select boot device}" \
+qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-60}" "$WORK/vars.fd" "$OVMF_VARS_SRC" \
+    qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$IMG,format=raw,if=none,id=disk0" \
     -device "nvme,drive=disk0,serial=AGNOS-WTEST" \
-    -serial stdio -display none -no-reboot 2>/dev/null > "$LOG"
+    -serial stdio -display none -no-reboot
 # ⛔ DID THE KERNEL RUN AT ALL? Without this, an OVMF hand-off failure makes every assertion
 # below evaluate against an empty log and print a wall of failures naming real properties.
-# See qemu_assert_booted in the lib for the measured rate and the log signature.
-qemu_assert_booted "$LOG" || exit 1
+# VOID after every retry -> exit 2 (measured nothing), not 1.
+qemu_assert_booted "$LOG" || { echo "ext2 WRITE smoke (W1-W5): VOID"; exit 2; }
 
 echo ""
 echo "  --- ext2w self-test lines from boot log ---"

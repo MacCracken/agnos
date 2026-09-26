@@ -8,8 +8,14 @@
 # === TCP Stack ===
 # States: 0=CLOSED, 1=SYN_SENT, 2=ESTABLISHED, 3=FIN_WAIT, 4=CLOSE_WAIT,
 #         5=LISTEN, 6=SYN_RCVD  (added 1.32.0 bite A — server-side TCP)
-# Connection table: 8 entries, each 128 bytes (grown 80 → 128 at 1.35.1 B0
-# for TCP hardening — the original 10 slots were full). Offsets 0-72 keep
+# ⭐ 1.57.7 (S6) — STATE 3 IS A KERNEL-HELD FIN SLOT: "our FIN is out" (FIN_WAIT_1/2, or LAST_ACK when meta bit 13
+# TCP_META_PEER_FIN is set). tcp_close_locked enters it from ESTABLISHED/CLOSE_WAIT: the owner is unstamped at once
+# (the caller's id is dead), the rx ring unbound (window 0), the FIN|ACK ARMED and retransmitted by the timer scan.
+# It is released on (FIN ACKed AND the peer's FIN seen), on RST, on FIN retransmit exhaustion, TCP_FINWAIT2_US after
+# the FIN is ACKed, or when a claim needs the slot (orphan reclaim, tcp_alloc_conn_slot). No TIME_WAIT is modelled.
+# Connection table: 8 entries, each TCP_CONN_STRIDE = 176 bytes (the ONLY stride site is tcp_conn_base; grown
+# 80 → 128 at 1.35.1 B0 for TCP hardening, to 152 by the B2/B3 fields, to 176 by the 1.57.7 S5 owner and
+# local-address fields at 152/160/168). Offsets 0-72 keep
 # their 1.32.0 meaning; 56 was the vestigial single-segment `rx_buf_len`
 # (the 1.35.1 B1 in-order ring replaced it) and is repurposed for SND.UNA.
 #   offset 0:   state (8 bytes)
@@ -18,7 +24,8 @@
 #   offset 24:  dst_ip (8 bytes)      - on LISTEN: 0 (wildcard)
 #   offset 32:  seq_num / SND.NXT (8 bytes)  - next seq to send
 #   offset 40:  ack_num / RCV.NXT (8 bytes)  - next seq expected (in-order)
-#   offset 48:  rx_buf — receive RING base ptr (TCP_RX_RING bytes, kmalloc'd)
+#   offset 48:  rx_buf — receive RING base ptr (TCP_RX_RING bytes). 1.57.7: POOL-OWNED (tcp_pool_rx[slot]),
+#               bound by a non-LISTEN claim, UNBOUND (0) by a release, 0 on LISTEN
 #   offset 56:  SND.UNA (8 bytes) — oldest unACKed seq (reserved; B2 retransmit)
 #   offset 64:  rx_write (8 bytes) — cumulative bytes written into the ring
 #   offset 72:  flags (8 bytes) - meta packed in upper bits:
@@ -26,16 +33,28 @@
 #     bit 8:      is_listening (set on LISTEN entries)
 #     bit 9:      passive_open (set on conns spawned from a LISTEN)
 #     bit 10:     accepted (set when tcp_accept returned this conn to caller)
+#     bit 11:     LO_ONLY (1.57.7 S5, LISTEN entries: admit only SYNs addressed to 127/8 — TCP_FLAG_LO_ONLY)
+#     bit 13:     PEER_FIN (1.57.7 S6 — TCP_META_PEER_FIN: the peer's FIN has been consumed; set by 2 -> 4, by the
+#                 state-3 arm and by a close from CLOSE_WAIT; written with byte stores to byte 1)
 #     bits 16-23: parent_listen_id (only meaningful when bit 9 is set)
 #   offset 80:  rx_read (8 bytes) — cumulative bytes drained by tcp_recv
 #   offset 88:  SND.WND (8 bytes) — peer's last-advertised window (reserved; B4)
 #   offset 96:  retx_seq (8 bytes) — seq of the held unACKed segment (B2)
 #   offset 104: retx_len (8 bytes) — payload bytes held (0 for pure SYN/FIN) (B2)
-#   offset 112: retx_tick (8 bytes) — timer_ticks when last (re)sent (B2)
+#   offset 112: retx_us (8 bytes) — sched_clock_us() of the last (re)send (1.57.7 S6; was timer_ticks); in state 3
+#               with nothing armed: the FIN_WAIT_2 entry time. Written only under tcp_tab_lock (tcp_retx_due rebases)
 #   offset 120: retx_count (8 bytes) — retransmit attempts so far (B2)
 #   offset 128: retx_flags (8 bytes) — TCP flags to resend; 0 = disarmed (B2)
-#   offset 136: retx_buf (8 bytes) — held payload ptr (kmalloc TCP_RETX_BUF) (B2)
+#   offset 136: retx_buf (8 bytes) — held payload ptr (TCP_RETX_BUF) (B2). 1.57.7: POOL-OWNED
+#               (tcp_pool_retx[slot]), bound by EVERY claim (LISTEN included), never cleared by a release
 #   offset 144: eff_mss (8 bytes) — effective send MSS = min(ours, peer's) (B3)
+#   offset 152: owner tag (1.57.7 S5) — pid+1 of the owning incarnation; 0 = kernel-owned OR released.
+#               Stamped only inside tcp_slot_claim_locked (a passive child inherits its LISTENER's), zeroed
+#               only by the release tail (tcp_slot_release_locked). See docs/architecture/socket-ownership-and-loopback.md
+#   offset 160: owner epoch (1.57.7 S5) — proc_epoch[tag-1] at stamp time; 0 when the tag is 0
+#   offset 168: local address this conn speaks FROM (1.57.7 S5): active = net_src_for(dst) at the claim,
+#               passive child = the SYN's destination (so a dial to 127.0.0.2 is answered FROM 127.0.0.2),
+#               LISTEN = 0. tcp_send_pkt_seq uses it as the source (0 → net_src_for)
 # Ring occupancy = rx_write - rx_read; free = TCP_RX_RING - occupancy; the
 # advertised window is that free count (B1 — no longer the hardcoded 8192).
 # One-in-flight retransmit (B2): a single unACKed segment is held in retx_buf
@@ -52,14 +71,16 @@ var TCP_STATE_FIN_WAIT = 3;
 var TCP_STATE_CLOSE_WAIT = 4;
 var TCP_STATE_LISTEN = 5;
 var TCP_STATE_SYN_RCVD = 6;
+var TCP_CONN_STRIDE = 176;           # 1.57.7 S5: bytes per conn record (tcp_conn_base is the only user)
 
 # Flag-field metadata bit positions (in the offset-72 u64 field)
 var TCP_FLAG_IS_LISTENING = 0x100;   # bit 8
 var TCP_FLAG_PASSIVE_OPEN = 0x200;   # bit 9
 var TCP_FLAG_ACCEPTED     = 0x400;   # bit 10
+var TCP_FLAG_LO_ONLY      = 0x800;   # bit 11 — LISTEN entries: admit only SYNs addressed to 127/8 (1.57.7 S5)
 # parent_listen_id occupies bits 16-23 — see tcp_meta_set_parent / tcp_meta_get_parent
 
-var tcp_conns[640];  # ≥ 8 connections x 144 bytes (module-global var[N] = N×8 B = 5120 B)
+var tcp_conns[640];  # ≥ 8 connections x 176 bytes = 1408 B (module-global var[N] = N×8 B = 5120 B)
 var tcp_conn_count = 0;
 var tcp_rx_tmpbuf[256];
 # Per-connection receive ring size (B1). 2048 fits the 16-bit window field
@@ -68,31 +89,63 @@ var TCP_RX_RING = 2048;
 # Retransmit (B2): held-segment buffer size (one Ethernet MSS payload), fixed
 # initial RTO in 100 Hz timer ticks (1 s), and the retry cap before giving up.
 var TCP_RETX_BUF = 1460;
-var TCP_RTO_BASE = 100;        # ticks (1 s at the 100 Hz timer)
 var TCP_RTO_RETRIES = 5;       # resends before declaring the conn dead
+# ⭐ 1.57.7 (S6) — EVERY TCP DEADLINE IS ON sched_clock_us() (docs/architecture/kernel-clocks.md). A blocked sender
+# cannot poll, so the retransmit/FIN timers run from net_tick on every CPU's tick; a stamp is µs, never ticks.
+var TCP_RTO_BASE_US  = 1000000;   # 1 s initial RTO (was TCP_RTO_BASE = 100 ticks)
+var TCP_CONNECT_US   = 8000000;   # #47 ceiling, computed ONCE per call from entry (never reset by a wake)
+var TCP_PROGRESS_US  = 8000000;   # D6: #48 returns the committed count after this long with no ACK progress
+var TCP_FINWAIT2_US  = 8000000;   # a held FIN slot whose FIN is ACKed but whose peer never FINs is released after this
+var TCP_PERSIST_CAP  = 4;         # a zero-window peer that keeps ACKing caps the retry count here (never exhausts)
+var TCP_META_PEER_FIN = 0x2000;   # meta bit 13 (byte 1 bit 5): the peer's FIN has been consumed
+var tcp_demux_wake = 0;           # the segment made a waiter's condition true (written under tcp_tab_lock; S6)
 
-# 1.51.3, trimmed 1.51.8 — busy-poll window before falling back to hlt in the TCP
-# connect/send wait loops. ORIGINALLY (1.51.3) this was the load-bearing latency fix:
-# agnos had no NIC RX interrupt, so a bare arch_wait()=hlt only woke on the 100 Hz timer
-# → every TCP round-trip was floored at ~one 10 ms tick regardless of real handshake
-# speed. That root cause is now FIXED by the RX interrupt — virtio-net MSI-X (1.51.5) +
-# r8169 MSI (1.51.6), IRON-PROVEN 1.51.7 on archaemenid (the `r8169: RX MSI LIVE` line +
-# sub-tick `yo` RTTs) — so a blocked hlt now wakes on packet arrival via IDT vector 0x50.
-# The busy-poll is therefore no longer the primary mechanism for the WIRE path.
-#
-# It stays as belt-and-suspenders, TRIMMED 20000 → 512, for two things the RX IRQ does
-# NOT cover: (1) LOOPBACK (127.x / self net_ip) rides the net_lo_drain SOFTWARE queue,
-# which raises NO interrupt — a lo handshake/ACK MUST complete inside the spin window or
-# it tick-paces; 512 is ~50× the ~3-10 net_poll()s a lo phase needs (`spins` resets per
-# handshake + per send-chunk, so 512 is per-phase, not per-connection). (2) it catches a
-# near-instant wire reply in the first few spins without the LAPIC→IDT→ISR round-trip. A
-# wire wait past the window hlt-pauses and the RX IRQ wakes it; a dead/slow peer still
-# recovers via the B2 retransmits without burning the CPU to the deadline (the timer
-# keeps ticking under IF=1, so the ~8 s deadline stays enforced during the spin).
-# Iron-tunable if a future no-IRQ NIC or a CPU-burn concern surfaces.
+# ⭐ 1.57.7 (S6) — the LEGACY step's busy window (was net_wait_backoff's). A caller that CAN block (wq_can_block)
+# never reaches it: #47/#48/#55/#100 and kmain arm a wait on WK_TCP|cid / WK_ICMP|pid and leave the CPU. Only a
+# context that cannot block takes it — pre-scheduler kmain (loopback_selftest, IF=0: exactly the old behaviour, a
+# spin then hlt) or a post-scheduler caller that holds preemption. 512 is ~50x the net_poll()s a loopback phase
+# needs (lo raises no interrupt); past it the step hlts until the next interrupt (RX MSI or the tick).
 var NET_BUSY_SPINS = 512;
-fn net_wait_backoff(spins) {
-    if (spins >= NET_BUSY_SPINS) { arch_wait(); }   # window spent → hlt (RX-IRQ-woken; timer-paced for loopback)
+# Extra net_poll() iterations before a blockable waiter arms its block (S6.7 measured 0 vs 64; 0 kept — see
+# docs/architecture/blocking-waits.md "Network waits").
+var NET_BLOCK_SPINS = 0;
+# The legacy step. IF out == IF in in EVERY branch (M-LEGIF). Pre-scheduler: exactly net_wait_backoff's old body (no
+# sti — nothing may enable interrupts before "Interrupts enabled"). Post-scheduler with IF=0 (a preempt-holding
+# caller): the pre-1.57.7 arm window, re-closed with an explicit cli.
+fn net_legacy_step(spins) {
+    if (spins < NET_BUSY_SPINS) { return 0; }
+    if (sched_active == 1) {
+        if ((dm_read_rflags() & 0x200) == 0) {
+            preempt_disable();
+            asm { 0xFB; }                 # sti — inputs: none; outputs: RFLAGS.IF=1; clobbers: none
+            arch_wait();
+            asm { 0xFA; }                 # cli — inputs: none; outputs: RFLAGS.IF=0 (the caller's IF); clobbers: none
+            preempt_enable();
+            return 0;
+        }
+    }
+    arch_wait();                          # IF=1 caller, or pre-scheduler: hlt until the next interrupt
+    return 0;
+}
+# ⛔ 1.57.7 (S6 regression, doom-smoke) — THE PRE-SCHEDULER SYSCALL WINDOW. net_legacy_step keeps a pre-scheduler
+# caller's IF exactly, which is right for kmain (loopback_selftest runs before "Interrupts enabled"). But a ring-3
+# process exec'd BEFORE the scheduler runs (a foreground `run` from a boot selftest — DOOM_SELFTEST's /bin/doom, whose
+# setu probe dials 127.0.0.1:7700 through #47 and gets no answer) also cannot block, and a syscall enters with IF=0:
+# once its NET_BUSY_SPINS were spent the step's hlt had no interrupt to end it — a hard hang, doom never reached its
+# first frame. The pre-S6 arms opened a preempt-held sti window for every call; S6 deleted all four. #47/#48/#55/#100
+# now reopen it for exactly that caller (sched_active != 1), as sleep_ms#41's legacy loop does, so each hlt ends at
+# the next tick and the ~8 s / ~3 s deadlines expire. Post-scheduler it is never opened: a ring-3 caller blocks on
+# the wq, and a non-blockable IF=0 caller gets net_legacy_step's own window. Returns 1 when opened (pass it to close).
+fn net_sys_window_open() {
+    if (sched_active == 1) { return 0; }
+    preempt_disable();                    # the timer ISR ticks+EOIs but never switches (the sched is not live anyway)
+    asm { 0xFB; }                         # sti — inputs: none; outputs: RFLAGS.IF=1; clobbers: none
+    return 1;
+}
+fn net_sys_window_close(sw_open) {
+    if (sw_open != 1) { return 0; }
+    asm { 0xFA; }                         # cli — inputs: none; outputs: RFLAGS.IF=0 (the syscall's IF); clobbers: none
+    preempt_enable();
     return 0;
 }
 
@@ -108,14 +161,114 @@ var tcp_ephemeral_ctr = 0;
 var TCP_OUR_MSS = 1460;
 var TCP_MSS_DEFAULT = 536;
 
+# ═══ 1.57.7 (S4) — conn-table concurrency (docs/architecture/net-concurrency.md) ═══
+# Every field of every slot, tcp_conn_count, tcp_conn_gen[], tcp_ephemeral_ctr and tcp_demux_touched are
+# tcp_tab_lock's. The ONLY way to take it is tcp_lock()/tcp_unlock(f): kbd_irq_save() FIRST (the demux runs
+# from the timer ISR, the NIC MSI handler and every CPU's syscalls), then the xchg, then the best-effort
+# overlap witness. It is HELD ACROSS frame build + net_tx (chain tcp_tab < net_tx < lo_q < sched) — NOT a
+# leaf. Under it: never net_poll, kmalloc/kfree, kprint or any non-IRQ-saved lock.
+var tcp_pool_rx[8];          # slot i's TCP_RX_RING (2048 B) ring: a kmalloc (direct-map) KVA, never freed
+var tcp_pool_retx[8];        # slot i's TCP_RETX_BUF (1460 B) hold buffer, never freed
+var tcp_pool_ready = 0;
+var tcp_conn_gen[8];         # bumped by every claim, under tcp_tab_lock (N-4: a waiter's "still mine?")
+var TCP_SYNRCVD_MAX = 4;     # D12: at most 4 concurrent SYN_RCVD slots
+var TCP_PASSIVE_RESERVE = 1; # a passive open never takes the last free slot
+var tcp_demux_touched = 0 - 1;   # conn the last demux segment acted on (written under the lock; S6's wake hook)
+var tcp_tab_inside = 0;      # tcp_tab_lock holder count (witness; see net_lk_latch in r8169.cyr)
+var tcp_lo_only_refused = 0; # 1.57.7 S5: SYNs a LO_ONLY listener refused (written under tcp_tab_lock; diagnostic)
+
+fn tcp_lock() {
+    var tl_f = kbd_irq_save();
+    tcp_tab_spin_lock();
+    tcp_tab_inside = tcp_tab_inside + 1;
+    if (tcp_tab_inside != 1) { net_lk_latch(1, "net: lock overlap - two CPUs inside one net lock", 48); }
+    return tl_f;
+}
+fn tcp_unlock(tu_f) {
+    tcp_tab_inside = tcp_tab_inside - 1;
+    tcp_tab_spin_unlock();
+    kbd_irq_restore(tu_f);
+    return 0;
+}
+
 fn tcp_conn_base(conn_id) {
-    return &tcp_conns + conn_id * 152;
+    return &tcp_conns + conn_id * TCP_CONN_STRIDE;
+}
+# 1.57.7 S5 (PLAN E1): the claim generation. Callers hold tcp_lock, or use it as a racy prefilter whose decision
+# is re-made under the lock.
+fn tcp_conn_gen_get(id) { return load64(&tcp_conn_gen + id * 8); }
+
+# ═══ 1.57.7 (S5, D13) — socket ownership. docs/architecture/socket-ownership-and-loopback.md ═══
+fn tcp_caller_tag() { return proc_current_get() + 1; }        # ring-3 identity of the running proc
+
+# 1 when conn `oi_id` is owned by `own` (0 = kernel) AND, for own != 0, by that tag's CURRENT incarnation.
+# Lock-free use is a prefilter only; every decision that is followed by a cb read/store is re-made under tcp_lock.
+fn tcp_owner_is(oi_id, own) {
+    if (oi_id < 0) { return 0; }
+    if (oi_id >= tcp_conn_count) { return 0; }
+    var oi_cb = tcp_conn_base(oi_id);
+    if (load64(oi_cb + 152) != own) { return 0; }
+    if (own == 0) { return 1; }
+    if (own > 16) { return 0; }                                   # proc_epoch has 16 slots
+    if (load64(oi_cb + 160) != proc_epoch_get(own - 1)) { return 0; }
+    return 1;
+}
+# Syscall arms: the CALLER's incarnation. A kernel-owned conn (tag 0) never passes (caller tag >= 1).
+fn tcp_auth(au_id) {
+    if (tcp_owner_is(au_id, tcp_caller_tag()) == 1) { return au_id; }
+    return 0 - 1;
+}
+# VFS_SOCK paths: the `own` to act as, or -1. A kernel-owned conn behind a VFS_SOCK fd is usable by whoever
+# holds the fd — which is why the kernel must close every VFS_SOCK fd it creates (arch doc invariant 2).
+fn tcp_fd_owner(fo_id) {
+    if (tcp_owner_is(fo_id, 0) == 1) { return 0; }
+    var fo_t = tcp_caller_tag();
+    if (tcp_owner_is(fo_id, fo_t) == 1) { return fo_t; }
+    return 0 - 1;
+}
+# D13 snapshot rule: 1 while `sm_id` is still the incarnation captured at op entry. CALLER HOLDS tcp_lock.
+fn tcp_same_locked(sm_id, s_tag, s_ep, s_gen) {
+    if (sm_id < 0) { return 0; }
+    if (sm_id >= tcp_conn_count) { return 0; }
+    var sm_cb = tcp_conn_base(sm_id);
+    if (load64(sm_cb + 152) != s_tag) { return 0; }
+    if (load64(sm_cb + 160) != s_ep) { return 0; }
+    if (tcp_conn_gen_get(sm_id) != s_gen) { return 0; }         # gen is the only recycle witness for tag 0
+    return 1;
+}
+fn tcp_same(ts_id, ts_tag, ts_ep, ts_gen) {
+    var ts_f = tcp_lock();
+    var ts_r = tcp_same_locked(ts_id, ts_tag, ts_ep, ts_gen);
+    tcp_unlock(ts_f);
+    return ts_r;
+}
+# The state of `ss_id` if it is still the snapshot incarnation, else -1. One hold. (S5: replaces tcp_conn_check
+# on owned paths — the tag and epoch are part of "still mine".)
+fn tcp_same_state(ss_id, ss_tag, ss_ep, ss_gen) {
+    var ss_f = tcp_lock();
+    var ss_r = 0 - 1;
+    if (tcp_same_locked(ss_id, ss_tag, ss_ep, ss_gen) == 1) { ss_r = load64(tcp_conn_base(ss_id)); }
+    tcp_unlock(ss_f);
+    return ss_r;
+}
+
+# Q1 (held slots): may the allocator hand this slot out? CALLER HOLDS tcp_lock. THE ONE reuse predicate
+# (allocator, passive-reserve counter; S6's pin clause goes INTO it).
+fn tcp_slot_reusable(sr_cb) {
+    if (load64(sr_cb) != 0) { return 0; }
+    var sr_t = load64(sr_cb + 152);
+    if (sr_t == 0) { return 1; }                                   # kernel-owned or released
+    if ((load64(sr_cb + 72) & 0x600) == 0x200) { return 1; }       # passive child never accepted: no process holds its id
+    if (sr_t > 16) { return 1; }
+    if (load64(sr_cb + 160) != proc_epoch_get(sr_t - 1)) { return 1; }  # holder's incarnation is gone (backstop)
+    return 0;                                                      # an owned dead conn is HELD until its owner closes it or dies
 }
 
 # Receive-ring free space (B1) — TCP_RX_RING minus current occupancy. This is
 # the value advertised as the TCP window, so the peer never sends more than we
 # can hold (replaces the 1.32.0 hardcoded 8192-with-a-248-byte-buffer lie).
 fn tcp_rx_free(cb) {
+    if (load64(cb + 48) == 0) { return 0; }        # 1.57.7 (S6): an unbound ring (a held FIN slot) advertises 0
     var occ = load64(cb + 64) - load64(cb + 80);   # rx_write - rx_read
     var free = TCP_RX_RING - occ;
     if (free < 0) { free = 0; }
@@ -260,7 +413,13 @@ fn tcp_build_header(pkt, src_port, dst_port, seq, ack, flags, window) {
     return 20;
 }
 
-fn tcp_send_pkt(conn_id, flags, data, data_len) {
+# tcp_send_pkt_seq — build + transmit one segment with an EXPLICIT sequence number (1.57.7 S4, critic C1).
+# ⛔ CALLER HOLDS tcp_tab_lock (the frame reads the slot); the frame build and net_tx run inside ONE
+# net_tx_lock hold (chain tcp_tab < net_tx < lo_q). The retransmit passes the held segment's seq here, so NO
+# code writes cb+32 temporarily any more (the old save/restore of SND.NXT around a resend is gone). The only
+# `store64(cb + 32` lines are the claim, tcp_connect's SYN advance, tcp_send's advance and the passive open's.
+fn tcp_send_pkt_seq(conn_id, seq, flags, data, data_len) {
+    if (tcp_tab_inside != 1) { net_lk_latch(4, "net: lock missing - TCP frame built without tcp_tab_lock", 56); }
     var cb = tcp_conn_base(conn_id);
     var dst_ip = load64(cb + 24);
     # 1.49.0 loopback: a loopback dst (127.x / net_ip) rides the software lo_ring
@@ -271,7 +430,6 @@ fn tcp_send_pkt(conn_id, flags, data, data_len) {
     if (nic_ready() == 0 && net_is_loopback(dst_ip) == 0) { return 0 - 1; }
     var src_port = load64(cb + 8);
     var dst_port = load64(cb + 16);
-    var seq = load64(cb + 32);
     var ack = load64(cb + 40);
     # Default broadcast; if the route helper resolves a next-hop MAC for
     # dst_ip, use it instead. Off-LAN destinations (e.g., 1.1.1.1) need the
@@ -281,6 +439,7 @@ fn tcp_send_pkt(conn_id, flags, data, data_len) {
     route_next_hop_mac(dst_ip, &dst_mac);
     var kmac[8];
     nic_mac(&kmac);   # FIX #1
+    var sp_f = net_tx_begin();
     var p = &net_pkt;
     var off = eth_build(p, &dst_mac, &kmac, 0x0800);
     # Build TCP header after IP header space (20 bytes). Advertise the real
@@ -289,6 +448,11 @@ fn tcp_send_pkt(conn_id, flags, data, data_len) {
     var win = tcp_rx_free(cb);
     if (win > 65535) { win = 65535; }
     var tcp_hdr_len = tcp_build_header(p + tcp_off, src_port, dst_port, seq, ack, flags, win);
+    # ⛔ SOURCE COMES FROM THE CONN'S LOCAL ADDRESS (+168, 1.57.7 S5), falling back to THE ROUTE, NOT net_ip:
+    # a passive child answers FROM the address that was dialled (127.0.0.2 → 127.0.0.2), and a loopback
+    # destination takes a loopback source, or the peer's reply is addressed somewhere this conn cannot match.
+    var src_ip = load64(cb + 168);
+    if (src_ip == 0) { src_ip = net_src_for(dst_ip); }
     # SYN / SYN-ACK carry the MSS option (B3): bump the data offset to 6 words
     # (24 bytes) and append the 4-byte option. SYNs never carry data, so the
     # data copy below lands correctly past the option.
@@ -301,16 +465,20 @@ fn tcp_send_pkt(conn_id, flags, data, data_len) {
     # Copy data after the header (+ options)
     memcpy(p + tcp_off + tcp_hdr_len + opt_len, data, data_len);
     var tcp_total = tcp_hdr_len + opt_len + data_len;
-    # Compute TCP checksum
-    # ⛔ SOURCE COMES FROM THE ROUTE, NOT FROM net_ip. A loopback destination takes a loopback
-    # source, or the peer's reply is addressed somewhere this conn cannot match. See net_src_for.
-    var src_ip = net_src_for(dst_ip);
+    # Compute TCP checksum (src_ip chosen above — see net_src_for)
     var cksum = tcp_checksum_compute(src_ip, dst_ip, p + tcp_off, tcp_total);
     store8(p + tcp_off + 16, (cksum >> 8) & 0xFF);
     store8(p + tcp_off + 17, cksum & 0xFF);
     # Build IP header (proto=6 for TCP)
     ip_build(p + off, src_ip, dst_ip, 6, tcp_total);
-    return net_tx(p, off + 20 + tcp_total);          # 1.49.0 loopback bite 2: 127.x/net_ip → lo queue
+    var sp_r = net_tx(p, off + 20 + tcp_total);          # 1.49.0 loopback bite 2: 127.x/net_ip → lo queue
+    net_tx_end(sp_f);
+    return sp_r;
+}
+
+# The SND.NXT form — CALLER HOLDS tcp_tab_lock.
+fn tcp_send_pkt(conn_id, flags, data, data_len) {
+    return tcp_send_pkt_seq(conn_id, load64(tcp_conn_base(conn_id) + 32), flags, data, data_len);
 }
 
 # === TCP retransmit (B2) — one in-flight segment, fixed RTO + ×2 backoff ===
@@ -319,9 +487,11 @@ fn tcp_send_pkt(conn_id, flags, data, data_len) {
 # peer ACKs past it or the retry cap declares the conn dead.
 
 # Arm (or re-arm) the held segment. `seq` = its starting seq; `flags` = the
-# TCP flags to resend with (0x02 SYN / 0x12 SYN-ACK / 0x18 data / 0x11 FIN-ACK);
+# TCP flags to resend with (0x02 SYN / 0x12 SYN-ACK / 0x18 data / 0x11 FIN-ACK / 0x19 data+FIN, ENDFIX);
 # `data`/`data_len` its payload (data_len 0 for flag-only segments). SND.UNA is
 # pinned to `seq` while armed (the oldest unACKed byte).
+# 1.57.7 (S4): CALLER HOLDS tcp_tab_lock — the hold-buffer copy and every retx field are written in the same
+# hold as the transmit and the SND.NXT advance, so a retransmit can never read a torn segment.
 fn tcp_arm_retx(cb, seq, flags, data, data_len) {
     var n = data_len;
     if (n > TCP_RETX_BUF) { n = TCP_RETX_BUF; }
@@ -332,7 +502,7 @@ fn tcp_arm_retx(cb, seq, flags, data, data_len) {
     store64(cb + 56, seq);          # SND.UNA
     store64(cb + 96, seq);          # retx_seq
     store64(cb + 104, n);           # retx_len
-    store64(cb + 112, timer_ticks); # retx_tick (last sent)
+    store64(cb + 112, sched_clock_us());   # retx_us (last sent; 1.57.7 S6: µs, was timer_ticks)
     store64(cb + 120, 0);           # retx_count (fresh)
     store64(cb + 128, flags);       # retx_flags (non-zero = armed)
     return 0;
@@ -343,272 +513,734 @@ fn tcp_disarm_retx(cb) {
     return 0;
 }
 
-# RTO for a retry count: TCP_RTO_BASE doubled per retry, capped at ×16 (RFC
-# 6298 backoff; fixed base, RTT estimation deferred — audit § 4).
+# RTO for a retry count, in µs: TCP_RTO_BASE_US doubled per retry, capped at ×16 (RFC 6298 backoff; fixed base,
+# RTT estimation deferred — audit § 4).
 fn tcp_retx_rto(count) {
     var shift = count;
     if (shift > 4) { shift = 4; }
-    return TCP_RTO_BASE << shift;
+    return TCP_RTO_BASE_US << shift;
 }
 
-# Per-poll retransmit driver (called from net_poll). Resends each armed conn's
-# held segment when its RTO has elapsed, doubling the RTO; after TCP_RTO_RETRIES
-# resends with no ACK, the conn is declared dead (→ CLOSED).
-fn tcp_retx_tick() {
-    for (var i = 0; i < tcp_conn_count; i = i + 1) {
-        var cb = tcp_conn_base(i);
-        var rflags = load64(cb + 128);
-        if (rflags == 0) { continue; }                       # not armed
-        var count = load64(cb + 120);
-        if ((timer_ticks - load64(cb + 112)) < tcp_retx_rto(count)) { continue; }
-        if (count >= TCP_RTO_RETRIES) {
-            store64(cb, 0);          # exhausted → CLOSED
-            tcp_disarm_retx(cb);
-            continue;
-        }
-        # Resend from retx_seq (temporarily restore it as SND.NXT for the build).
-        var saved_nxt = load64(cb + 32);
-        store64(cb + 32, load64(cb + 96));
-        tcp_send_pkt(i, rflags, load64(cb + 136), load64(cb + 104));
-        store64(cb + 32, saved_nxt);
-        store64(cb + 112, timer_ticks);
-        store64(cb + 120, count + 1);
+# Is the held segment due? CALLER HOLDS tcp_tab_lock. ⚠ THE REBASE RULE: tsc_calibrate re-points tsc_base, so
+# sched_clock_us() can step BACKWARD once (timer_ticks*10000 -> ~0); a stamp from before the step would look like
+# the future and never be due. A stamp in the future is reset to now and is not due this time (M-REBASE).
+fn tcp_retx_due(cb, now) {
+    var rd_t = load64(cb + 112);
+    if (now < rd_t) { store64(cb + 112, now); return 0; }
+    if ((now - rd_t) >= tcp_retx_rto(load64(cb + 120))) { return 1; }
+    return 0;
+}
+
+# ⭐ 1.57.7 (S6) — THE WAKES. A waiter blocks on WK_TCP|cid (tcp_block); every event that can make its predicate true
+# stores the condition UNDER tcp_tab_lock and wakes AFTER the unlock (the S3c lost-wakeup proof).
+fn tcp_wake(tw_c) { wq_wake(WK_TCP | tw_c); return 0; }
+fn tcp_wake_mask(wm_m) {
+    var wm_i = 0;
+    while (wm_i < 8) {
+        if (((wm_m >> wm_i) & 1) == 1) { tcp_wake(wm_i); }
+        wm_i = wm_i + 1;
     }
+    return 0;
+}
+
+# Lock-free pre-scan (benign races: a miss is caught on the next poll or tick): 1 when any slot has a segment armed
+# or is a held FIN slot (state 3, whose FIN_WAIT_2 timeout the scan also runs).
+fn tcp_timer_any() {
+    var ta_i = 0;
+    while (ta_i < tcp_conn_count) {
+        var ta_cb = tcp_conn_base(ta_i);
+        if (load64(ta_cb + 128) != 0) { return 1; }
+        if (load64(ta_cb) == 3) { return 1; }
+        ta_i = ta_i + 1;
+    }
+    return 0;
+}
+
+# The timer scan. CALLER HOLDS tcp_tab_lock. Resends each armed conn's held segment when its RTO has elapsed
+# (doubling the RTO); after TCP_RTO_RETRIES resends with no ACK the conn is declared dead: DISARM FIRST, then CLOSED,
+# with NO unbind (critic C5: its queued bytes stay readable; Q1 keeps an owned dead conn's tag). A held FIN slot
+# whose FIN was ACKed is released TCP_FINWAIT2_US after that ACK. Returns the mask of conns whose waiters to wake
+# (retransmit exhaustion — #47/#48 abort).
+fn tcp_timer_scan_locked(ts_now) {
+    var ts_mask = 0;
+    var ts_i = 0;
+    while (ts_i < tcp_conn_count) {
+        var ts_cb = tcp_conn_base(ts_i);
+        var ts_rf = load64(ts_cb + 128);
+        if (ts_rf != 0) {
+            if (tcp_retx_due(ts_cb, ts_now) == 1) {
+                var ts_cnt = load64(ts_cb + 120);
+                if (ts_cnt >= TCP_RTO_RETRIES) {
+                    tcp_disarm_retx(ts_cb);               # exhausted -> disarm FIRST,
+                    store64(ts_cb, 0);                    # then CLOSED (no unbind — C5)
+                    ts_mask = ts_mask | (1 << ts_i);
+                } else {
+                    # Resend the held segment at ITS seq (critic C1: no temporary write of SND.NXT).
+                    tcp_send_pkt_seq(ts_i, load64(ts_cb + 96), ts_rf, load64(ts_cb + 136), load64(ts_cb + 104));
+                    store64(ts_cb + 112, ts_now);
+                    store64(ts_cb + 120, ts_cnt + 1);
+                }
+            }
+        } elif (load64(ts_cb) == 3) {                     # FIN ACKed, the peer's FIN not seen (FIN_WAIT_2)
+            var ts_fw = load64(ts_cb + 112);
+            if (ts_now < ts_fw) {
+                store64(ts_cb + 112, ts_now);             # rebase (see tcp_retx_due)
+            } elif ((ts_now - ts_fw) >= TCP_FINWAIT2_US) {
+                tcp_slot_release_locked(ts_i);            # the one release tail (kernel-held: tag 0, nobody waits)
+            }
+        }
+        ts_i = ts_i + 1;
+    }
+    return ts_mask;
+}
+
+# The retransmit driver: net_poll (every caller's own poll) and net_tick (every CPU's timer tick — what retransmits
+# for a sender that is BLOCKED). 1.57.7 (S4): safe from ANY context (the scan runs under the IRQ-saved
+# tcp_tab_lock); the lock-free pre-scan skips the lock when nothing is armed or held. The wakes follow the unlock.
+fn tcp_retx_tick() {
+    if (tcp_timer_any() == 0) { return 0; }
+    var rt_f = tcp_lock();
+    var rt_m = tcp_timer_scan_locked(sched_clock_us());
+    tcp_unlock(rt_f);
+    if (rt_m != 0) { tcp_wake_mask(rt_m); }
     return 0;
 }
 
 # Allocate a connection slot (1.45.2): reuse a CLOSED slot (state 0) below the
 # high-water mark, else extend the mark (cap 8). Returns conn_id or -1 (table
-# full). Used by BOTH tcp_connect (client) and net_handle_tcp's passive-open
-# (server) — mirrors proc_alloc_slot's non-LIFO reuse (1.44.12). Before this,
-# tcp_connect/passive-open only ever incremented tcp_conn_count and tcp_close
-# never reclaimed, so after 8 connect/accept-then-close cycles every later
-# connection failed forever (the slot-exhaustion bug a ring-3 TLS/ark-fetch or
-# agora/telnet consumer would hit). Reclaim is alias-safe: tcp_find_conn skips
-# state==0 slots, a reused slot is re-initialised with a fresh 4-tuple, and
-# tcp_close NULLs the per-conn buffers + disarms the retx before marking CLOSED
-# (no double-free, no stray retransmit from a reclaimed slot).
+# full). ⛔ 1.57.7 (S4): CALL ONLY FROM tcp_slot_claim_locked — the claim is the only 0→nonzero
+# transition and this scan-and-extend is safe only under tcp_tab_lock. The literal 8 is the pool size
+# (tcp_pool_init) and the TCP_PASSIVE_RESERVE arithmetic (tcp_free_slots_locked).
+# 1.57.7 (S5, Q1): reuse means tcp_slot_reusable, not merely state 0 — an owned dead conn is HELD.
+# 1.57.7 (S6): ORPHAN RECLAIM — when nothing is reusable and the table is at 8, a held FIN slot (state 3, tag 0:
+# kernel-held, nobody's id) is released through the one release tail and handed out. A held FIN slot therefore
+# never blocks a new connection or listener (M-ORPHAN).
 fn tcp_alloc_conn_slot() {
     for (var i = 0; i < tcp_conn_count; i = i + 1) {
-        if (load64(tcp_conn_base(i)) == 0) { return i; }
+        if (tcp_slot_reusable(tcp_conn_base(i)) == 1) { return i; }
     }
-    if (tcp_conn_count >= 8) { return 0 - 1; }
-    var id = tcp_conn_count;
-    tcp_conn_count = tcp_conn_count + 1;
-    return id;
-}
-
-fn tcp_connect(dst_ip, dst_port, src_port) {
-    var conn_id = tcp_alloc_conn_slot();
-    if (conn_id < 0) { return 0 - 1; }
-    var cb = tcp_conn_base(conn_id);
-    # Allocate per-connection receive RING (S5: prevent shared-buffer corruption)
-    var rx_buf = kmalloc(TCP_RX_RING);
-    if (rx_buf == 0) { store64(cb, 0); return 0 - 1; }      # leave slot CLOSED/reclaimable
-    # Retransmit hold buffer (B2).
-    var retx_buf = kmalloc(TCP_RETX_BUF);
-    if (retx_buf == 0) { kfree_sized(rx_buf, TCP_RX_RING); store64(cb, 0); return 0 - 1; }
-    # 1.45.6 audit fix: seed the ISN from RDRAND, XOR a timer-LCG as the
-    # fallback if RDRAND returns 0. The old timer_ticks-only LCG was predictable
-    # (timer_ticks is ring-3-observable via uptime#40) → off-path TCP sequence
-    # prediction / data injection. RDRAND makes the ISN unguessable.
-    var isn = (rdrand_u64() ^ (timer_ticks * 64017 + 1)) & 0xFFFFFFFF;
-    store64(cb, 1);             # state = SYN_SENT
-    store64(cb + 8, src_port);
-    store64(cb + 16, dst_port);
-    store64(cb + 24, dst_ip);
-    store64(cb + 32, isn);      # SND.NXT (initial seq)
-    store64(cb + 40, 0);        # RCV.NXT (set when SYN-ACK arrives)
-    store64(cb + 48, rx_buf);   # receive ring base
-    store64(cb + 56, isn);      # SND.UNA = isn
-    store64(cb + 64, 0);        # rx_write
-    store64(cb + 72, 0);        # flags
-    store64(cb + 80, 0);        # rx_read
-    store64(cb + 88, 0);        # SND.WND (peer window; learned on SYN-ACK)
-    store64(cb + 96, 0);        # retx_seq
-    store64(cb + 104, 0);       # retx_len
-    store64(cb + 112, 0);       # retx_tick
-    store64(cb + 120, 0);       # retx_count
-    store64(cb + 128, 0);       # retx_flags (disarmed)
-    store64(cb + 136, retx_buf);
-    store64(cb + 144, TCP_MSS_DEFAULT);   # eff_mss (refined when SYN-ACK's MSS arrives)
-    # Send SYN (flags = 0x02) and arm its retransmit.
-    tcp_send_pkt(conn_id, 0x02, 0, 0);
-    tcp_arm_retx(cb, isn, 0x02, 0, 0);
-    # Advance SND.NXT by 1 (SYN consumes a sequence number); SND.UNA stays at
-    # isn until the SYN is ACKed.
-    store64(cb + 32, (isn + 1) & 0xFFFFFFFF);
-    # Wait for SYN-ACK. Poll on a timer deadline (not a fixed iteration count)
-    # so the B2 retransmits (1 s, 2 s, …) have time to recover a lost SYN.
-    var deadline = timer_ticks + 800;   # ~8 s ceiling (retransmit budget)
-    var spins = 0;
-    while (timer_ticks < deadline) {
-        net_poll();
-        var state = load64(cb);
-        if (state == 2) { return conn_id; }
-        if (state == 0) { return 0 - 1; }
-        net_wait_backoff(spins);        # busy-poll the window, then hlt-pace
-        spins = spins + 1;
+    if (tcp_conn_count < 8) {
+        var id = tcp_conn_count;
+        tcp_conn_count = tcp_conn_count + 1;
+        return id;
     }
-    # Timeout
-    store64(cb, 0);
+    for (var oi = 0; oi < tcp_conn_count; oi = oi + 1) {
+        if (tcp_slot_orphan(tcp_conn_base(oi)) == 1) {
+            tcp_slot_release_locked(oi);
+            return oi;
+        }
+    }
     return 0 - 1;
 }
+# A held FIN slot nobody owns (1.57.7 S6). CALLER HOLDS tcp_tab_lock.
+fn tcp_slot_orphan(so_cb) {
+    if (load64(so_cb) != 3) { return 0; }
+    if (load64(so_cb + 152) != 0) { return 0; }
+    return 1;
+}
 
-fn tcp_send(conn_id, data, len) {
-    if (conn_id < 0) { return 0 - 1; }
-    if (conn_id >= tcp_conn_count) { return 0 - 1; }
-    var cb = tcp_conn_base(conn_id);
-    if (load64(cb) != 2) { return 0 - 1; }
-    # B3: segment into ≤ effective-MSS chunks. One in flight (B2): send a chunk,
-    # arm its retransmit, then wait (bounded) for its ACK before the next — so
-    # exactly one segment is held, and a loss is recovered by the B2 timer.
-    var mss = load64(cb + 144);
-    if (mss < 1) { mss = TCP_MSS_DEFAULT; }
-    var sent = 0;
-    while (sent < len) {
-        # B3 MSS + B4 peer-window cap (zero window → 1-byte persist probe).
-        var chunk = tcp_send_chunk(len - sent, mss, load64(cb + 88));
-        var seq = load64(cb + 32);
-        tcp_send_pkt(conn_id, 0x18, data + sent, chunk);   # PSH+ACK
-        store64(cb + 32, (seq + chunk) & 0xFFFFFFFF);
-        tcp_arm_retx(cb, seq, 0x18, data + sent, chunk);
-        sent = sent + chunk;
-        var deadline = timer_ticks + 800;       # ~8 s ceiling per chunk
-        var spins = 0;
-        while (timer_ticks < deadline) {
-            net_poll();
-            if (load64(cb + 128) == 0) { break; }   # retx disarmed = ACKed
-            if (load64(cb) != 2) { break; }         # conn left ESTABLISHED
-            net_wait_backoff(spins);                # busy-poll the window, then hlt-pace
-            spins = spins + 1;
+# Free slots (REUSABLE ones below the high-water mark + never-used ones above it; 1.57.7 S5: a held owned dead
+# conn is not free; 1.57.7 S6: an orphan FIN slot IS — the claim reclaims it). The SAME predicates as the claim,
+# so the passive reserve stays true (M-FREECOUNT). CALLER HOLDS tcp_tab_lock.
+fn tcp_free_slots_locked() {
+    var fs_n = 8 - tcp_conn_count;
+    for (var fsi = 0; fsi < tcp_conn_count; fsi = fsi + 1) {
+        if (tcp_slot_reusable(tcp_conn_base(fsi)) == 1) { fs_n = fs_n + 1; }
+        if (tcp_slot_orphan(tcp_conn_base(fsi)) == 1) { fs_n = fs_n + 1; }
+    }
+    return fs_n;
+}
+
+# ⭐ tcp_slot_claim_locked — THE ONLY 0→nonzero STATE TRANSITION (1.57.7 S4, D12). CALLER HOLDS tcp_tab_lock
+# (the demux passive open, tcp_connect, anything inside net_handle_tcp_locked / tcp_close_locked). Every field
+# is initialised, the pool buffers bound (cb+48 = the rx ring for a non-LISTEN claim, 0 for LISTEN; cb+136 =
+# the retx hold buffer for EVERY claim, LISTEN included — critic C4), the generation bumped, and the state
+# published LAST. Refusals: pool not ready; a duplicate LISTEN port (atomic with the claim); a passive child
+# (state 6) whose parent is no longer the LISTEN on this port (critic C7(a)), or that would make a 5th
+# SYN_RCVD (TCP_SYNRCVD_MAX), or that would take the last free slot (TCP_PASSIVE_RESERVE). Returns the id or -1.
+# 1.57.7 (S5, D13): `cl_own` (0 = kernel, else pid+1) and `cl_lip` (the local address, +168). The owner tag and
+# epoch are STAMPED HERE, under the lock, before the state publish; a passive child (state 6) ignores cl_own and
+# INHERITS ITS LISTENER's tag+epoch (read in this same hold — never the interrupted process's), and is refused
+# when the listener is LO_ONLY and the SYN was not addressed to 127/8 (the ONE lo-only check). A state-1 claim
+# refuses a live duplicate 4-tuple (tcp_find_conn is first-match: a second SYN_SENT would capture the victim's
+# segments). ENDFIX (S5-R1): "duplicate" includes the local address (tcp_lip_match), the same key as the demux.
+fn tcp_slot_claim_locked(cl_state, cl_lport, cl_rport, cl_rip, cl_snd, cl_rcv, cl_meta, cl_mss, cl_own, cl_lip) {
+    var cl_r = 0 - 1;
+    if (tcp_pool_ready == 1) {
+        var cl_ok = 1;
+        var cl_tag = 0;
+        var cl_ep = 0;
+        if (cl_state == 5) {
+            if (tcp_find_listen(cl_lport) >= 0) { cl_ok = 0; }            # dup LISTEN, atomic with the claim
         }
-        if (load64(cb) != 2) { return sent; }       # closed/reset mid-send
+        if (cl_state == 6) {
+            var cl_par = (cl_meta >> 16) & 0xFF;
+            if (cl_par >= tcp_conn_count) {
+                cl_ok = 0;
+            } elif (load64(tcp_conn_base(cl_par)) != 5) {
+                cl_ok = 0;                                                  # C7(a): parent gone
+            } elif (load64(tcp_conn_base(cl_par) + 8) != cl_lport) {
+                cl_ok = 0;                                                  # C7(a): parent re-used for another port
+            }
+            if (cl_ok == 1) {
+                var cl_pb = tcp_conn_base(cl_par);
+                if ((load64(cl_pb + 72) & TCP_FLAG_LO_ONLY) != 0) {
+                    if (((cl_lip >> 24) & 0xFF) != 127) {
+                        cl_ok = 0;                                          # LO_ONLY listener, SYN not to 127/8
+                        tcp_lo_only_refused = tcp_lo_only_refused + 1;
+                    }
+                }
+                cl_tag = load64(cl_pb + 152);                               # inherit the LISTENER's stamp
+                cl_ep = load64(cl_pb + 160);
+            }
+        } else {
+            if (cl_own < 0 || cl_own > 16) {
+                cl_ok = 0;
+            } elif (cl_own != 0) {
+                cl_tag = cl_own;
+                cl_ep = proc_epoch_get(cl_own - 1);
+            }
+        }
+        if (cl_state == 1) {
+            for (var cld = 0; cld < tcp_conn_count; cld = cld + 1) {
+                var cldb = tcp_conn_base(cld);
+                if (load64(cldb) != 0 && load64(cldb + 8) == cl_lport && load64(cldb + 16) == cl_rport && load64(cldb + 24) == cl_rip && tcp_lip_match(load64(cldb + 168), cl_lip) == 1) {
+                    if (tcp_slot_orphan(cldb) == 1) {
+                        tcp_slot_release_locked(cld);                       # S6: a held FIN slot is superseded
+                    } else {
+                        cl_ok = 0;                                          # live duplicate 4-tuple
+                    }
+                }
+            }
+        }
+        if (cl_state == 6) {
+            var cl_syn = 0;
+            for (var cli = 0; cli < tcp_conn_count; cli = cli + 1) {
+                if (load64(tcp_conn_base(cli)) == 6) { cl_syn = cl_syn + 1; }
+            }
+            if (cl_syn >= TCP_SYNRCVD_MAX) { cl_ok = 0; }                   # D12 SYN cap
+            if (tcp_free_slots_locked() <= TCP_PASSIVE_RESERVE) { cl_ok = 0; }   # never the last free slot
+        }
+        if (cl_ok == 1) {
+            var cl_id = tcp_alloc_conn_slot();
+            if (cl_id >= 0) {
+                var clb = tcp_conn_base(cl_id);
+                store64(clb + 8, cl_lport);
+                store64(clb + 16, cl_rport);
+                store64(clb + 24, cl_rip);
+                store64(clb + 32, cl_snd);
+                store64(clb + 40, cl_rcv);
+                if (cl_state == 5) { store64(clb + 48, 0); }
+                else { store64(clb + 48, load64(&tcp_pool_rx + cl_id * 8)); }
+                store64(clb + 56, cl_snd);
+                store64(clb + 64, 0);
+                store64(clb + 72, cl_meta);
+                store64(clb + 80, 0);
+                store64(clb + 88, 0);
+                store64(clb + 96, 0);
+                store64(clb + 104, 0);
+                store64(clb + 112, 0);
+                store64(clb + 120, 0);
+                store64(clb + 128, 0);
+                store64(clb + 136, load64(&tcp_pool_retx + cl_id * 8));   # ALWAYS (C4)
+                store64(clb + 144, cl_mss);
+                store64(clb + 152, cl_tag);                                 # owner stamp (S5), before the publish
+                store64(clb + 160, cl_ep);
+                store64(clb + 168, cl_lip);
+                store64(&tcp_conn_gen + cl_id * 8, load64(&tcp_conn_gen + cl_id * 8) + 1);
+                store64(clb, cl_state);                                     # PUBLISH LAST
+                cl_r = cl_id;
+            }
+        }
     }
-    return sent;
+    return cl_r;
 }
 
-fn tcp_recv(conn_id, buf, maxlen) {
-    if (conn_id < 0) { return 0; }
-    if (conn_id >= tcp_conn_count) { return 0; }
-    # Poll for packets
-    net_poll();
-    var cb = tcp_conn_base(conn_id);
-    var rx_buf = load64(cb + 48);
-    if (rx_buf == 0) { return 0; }
-    # B1 ring drain (FIFO): available = rx_write - rx_read.
-    var rxw = load64(cb + 64);
-    var rxr = load64(cb + 80);
-    var avail = rxw - rxr;
-    if (avail <= 0) { return 0; }
-    var take = avail;
-    if (take > maxlen) { take = maxlen; }
-    var rpos = rxr & (TCP_RX_RING - 1);
-    var first = TCP_RX_RING - rpos;        # contiguous bytes to end of ring
-    if (first > take) { first = take; }
-    net_copy_buf(buf, rx_buf + rpos, first);
-    if (take > first) {
-        net_copy_buf(buf + first, rx_buf, take - first);
-    }
-    store64(cb + 80, rxr + take);          # advance rx_read
-    # Draining freed ring space → send a window-update ACK so a peer that
-    # stalled on a small/zero window resumes (keeps large streams flowing).
-    if (load64(cb) == 2) { tcp_send_pkt(conn_id, 0x10, 0, 0); }
-    return take;
+# The locking claim — ONLY for callers that hold NO net lock (inside the demux it would spin, at IF=0, on a
+# lock its own CPU holds: a hard hang). Use tcp_slot_claim_locked there.
+fn tcp_slot_claim(cl_state, cl_lport, cl_rport, cl_rip, cl_snd, cl_rcv, cl_meta, cl_mss, cl_own, cl_lip) {
+    var sc_f = tcp_lock();
+    var sc_r = tcp_slot_claim_locked(cl_state, cl_lport, cl_rport, cl_rip, cl_snd, cl_rcv, cl_meta, cl_mss, cl_own, cl_lip);
+    tcp_unlock(sc_f);
+    return sc_r;
 }
 
-# Ring-3 recv helper (1.45.1): 1 if conn_id names a fully CLOSED/reset
-# connection (state 0). Lets sock_recv#49 distinguish a peer-closed socket
-# (EOF → return -1) from a momentarily-empty receive ring (WOULD_BLOCK →
-# return 0). A live/closing conn (states 1-5) or an out-of-range id reports 0
-# (not dead) — the syscall wrapper bounds-checks the id separately.
-fn tcp_conn_dead(conn_id) {
-    if (conn_id < 0) { return 0; }
-    if (conn_id >= tcp_conn_count) { return 0; }
-    var cb = tcp_conn_base(conn_id);
-    if (load64(cb) == 0) { return 1; }
+# Release discipline (1.57.7 S4): disarm, unbind the rx ring, CLOSED LAST, nothing after. cb+136 stays bound to
+# the pool (it is never 0 on a claimed slot). CALLER HOLDS tcp_tab_lock.
+# ⭐ THE ONE RELEASE TAIL (1.57.7 S5): it also UNSTAMPS the owner (+152/+160 = 0). The RST sites and retransmit
+# exhaustion do NOT come here — they publish CLOSED with the tag intact, which is what makes an owned dead conn
+# HELD (Q1) with its queued bytes readable until the owner's #50 or death.
+fn tcp_slot_release_locked(id) {
+    var rl_cb = tcp_conn_base(id);
+    store64(rl_cb + 128, 0);
+    store64(rl_cb + 48, 0);
+    store64(rl_cb + 152, 0);
+    store64(rl_cb + 160, 0);
+    store64(rl_cb, 0);
     return 0;
 }
 
+# Release a slot a non-demux path BELIEVES is still its own: only if it is still in `rel_state` AND its
+# generation is still `rel_gen` (N-4: an interrupt-time passive open may have recycled it). Returns 1/0.
+fn tcp_slot_release_if(id, rel_state, rel_gen) {
+    var ri_r = 0;
+    if (id >= 0 && id < 8) {
+        var ri_f = tcp_lock();
+        if (id < tcp_conn_count) {
+            if (load64(tcp_conn_base(id)) == rel_state) {
+                if (load64(&tcp_conn_gen + id * 8) == rel_gen) {
+                    tcp_slot_release_locked(id);
+                    ri_r = 1;
+                }
+            }
+        }
+        tcp_unlock(ri_f);
+    }
+    return ri_r;
+}
+
+# ⭐ tcp_conn_check(id, g0) — the ONE way a waiter learns "still mine, and which state" (1.57.7 S4, N-4): -1 if
+# id is out of range or the slot was re-claimed since the caller's snapshot g0 (a stranger's conn now);
+# otherwise the state 0..6. Both reads happen in ONE tcp_tab_lock hold, so no memory-order argument is needed.
+fn tcp_conn_check(id, g0) {
+    var cc_r = 0 - 1;
+    if (id >= 0 && id < 8) {
+        var cc_f = tcp_lock();
+        if (id < tcp_conn_count) {
+            if (load64(&tcp_conn_gen + id * 8) == g0) { cc_r = load64(tcp_conn_base(id)); }
+        }
+        tcp_unlock(cc_f);
+    }
+    return cc_r;
+}
+
+# ⭐ tcp_pool_init — the per-slot buffers, kmalloc'd ONCE at boot (1.57.7 S4, D12). Slot i owns tcp_pool_rx[i]
+# (TCP_RX_RING) and tcp_pool_retx[i] (TCP_RETX_BUF) for the life of the kernel; a claim binds them, a release
+# unbinds the ring, nothing frees them — so no TCP path (the ISR passive open included) allocates or frees.
+# The KVAs are kmalloc's direct-map addresses, valid under every CR3. Idempotent; all-or-nothing (-1 leaves
+# tcp_pool_ready 0 and every claim refused). main.cyr calls it after heap_init + the direct map, before any
+# TCP user. After 1.57.7 kmalloc/kfree_sized appear in this file ONLY here (a review grep).
+fn tcp_pool_init() {
+    if (tcp_pool_ready == 1) { return 0; }
+    var pi_ok = 1;
+    for (var pi = 0; pi < 8; pi = pi + 1) {
+        var pi_rx = kmalloc(TCP_RX_RING);
+        var pi_tx = kmalloc(TCP_RETX_BUF);
+        store64(&tcp_pool_rx + pi * 8, pi_rx);
+        store64(&tcp_pool_retx + pi * 8, pi_tx);
+        if (pi_rx == 0 || pi_tx == 0) { pi_ok = 0; }
+    }
+    if (pi_ok == 0) {
+        for (var pj = 0; pj < 8; pj = pj + 1) {
+            var pj_rx = load64(&tcp_pool_rx + pj * 8);
+            var pj_tx = load64(&tcp_pool_retx + pj * 8);
+            if (pj_rx != 0) { kfree_sized(pj_rx, TCP_RX_RING); }
+            if (pj_tx != 0) { kfree_sized(pj_tx, TCP_RETX_BUF); }
+            store64(&tcp_pool_rx + pj * 8, 0);
+            store64(&tcp_pool_retx + pj * 8, 0);
+        }
+        return 0 - 1;
+    }
+    tcp_pool_ready = 1;
+    return 0;
+}
+
+# 1.57.7 (S4, N-7) — the #47 auto-assigned source port, bumped under tcp_tab_lock: two concurrent auto-port
+# connects on two CPUs got the SAME port from the old unlocked RMW (colliding 4-tuples; tcp_find_conn is
+# first-match). (ctr + timer_ticks) keeps the 1.51.4 per-connect uniqueness.
+fn tcp_ephemeral_next() {
+    var en_f = tcp_lock();
+    var en_p = 49152 + ((tcp_ephemeral_ctr + timer_ticks) & 0x3FFF);
+    tcp_ephemeral_ctr = tcp_ephemeral_ctr + 1;
+    tcp_unlock(en_f);
+    return en_p;
+}
+
+# ═══ 1.57.7 (S6) — THE BLOCKING WAIT (docs/architecture/blocking-waits.md § Network waits) ═══
+# tcp_block: arm WK_TCP|cid with deadline `dl` -> re-check the predicate -> sleep | cancel, with IF=0 across the
+# whole sequence (kmain callers run IF=1: the one kbd_irq_save brackets it, R1). Returns 0 = re-evaluate under the
+# lock, 1 = lifecycle ABORT (S7: wq_signal_point), 2 = this context cannot block (take net_legacy_step).
+# ⚠ Entered with NO lock held (R2); nothing per-CPU is kept across it (R4) — cid, the snapshot and the deadline are
+# locals on the caller's per-process kernel stack. Mode 1 = #47 (SYN_SENT), mode 2 = #48 (a segment in flight).
+fn tcp_block(bk_cid, bk_mode, bk_tag, bk_ep, bk_gen, bk_dl) {
+    var bk_f = kbd_irq_save();
+    var bk_a = wq_arm(WK_TCP | bk_cid, bk_dl);
+    if (bk_a == 2) { kbd_irq_restore(bk_f); return 2; }
+    if (bk_a == 1) {
+        kbd_irq_restore(bk_f);
+        if (wq_signal_point() == 1) { return 1; }
+        return 0;
+    }
+    if (tcp_wait_done(bk_cid, bk_mode, bk_tag, bk_ep, bk_gen) == 1) { wq_cancel(); kbd_irq_restore(bk_f); return 0; }
+    if (sched_clock_us() >= bk_dl) { wq_cancel(); kbd_irq_restore(bk_f); return 0; }
+    var bk_r = wq_sleep();
+    kbd_irq_restore(bk_f);
+    if (bk_r == WR_SIGNAL) {
+        if (wq_signal_point() == 1) { return 1; }
+    }
+    return 0;
+}
+# The predicate, as lock-free plain loads (a racy PREFILTER: the waker stores the condition under tcp_tab_lock and
+# wakes after the unlock; the authoritative re-check is the caller's, under tcp_lock, after the wake). tcp_same_locked
+# only READS, so it is legal here without the lock (PLAN E1). 1 = stop waiting.
+fn tcp_wait_done(wd_cid, wd_mode, wd_tag, wd_ep, wd_gen) {
+    if (tcp_same_locked(wd_cid, wd_tag, wd_ep, wd_gen) == 0) { return 1; }
+    var wd_cb = tcp_conn_base(wd_cid);
+    var wd_st = load64(wd_cb);
+    if (wd_mode == 1) {
+        if (wd_st != 1) { return 1; }
+        return 0;
+    }
+    if (wd_st != 2 && wd_st != 4) { return 1; }
+    if (load64(wd_cb + 128) == 0) { return 1; }
+    return 0;
+}
+
+# 1.45.6 audit fix: the ISN is seeded from RDRAND, XOR a timer-LCG as the fallback if RDRAND returns 0
+# (timer_ticks alone is ring-3-observable via uptime#40 → off-path sequence prediction).
+# 1.57.7 (S4): claim + arm + SYN + SND.NXT advance in ONE tcp_tab_lock hold. 1.57.7 (S5): owned — `own` (pid+1,
+# 0 = kernel) is stamped by the claim; the local address is the route source for the destination; a live duplicate
+# 4-tuple is refused by the claim (-1). 1.57.7 (S6): the (tag, epoch, gen) snapshot is written to `snap` (24 bytes:
+# +0 tag, +8 epoch, +16 gen) in the same hold.
+fn tcp_connect_start(cs_dst, cs_dport, cs_sport, cs_own, cs_snap) {
+    var cs_isn = (rdrand_u64() ^ (timer_ticks * 64017 + 1)) & 0xFFFFFFFF;
+    var cs_f = tcp_lock();
+    var cs_id = tcp_slot_claim_locked(1, cs_sport, cs_dport, cs_dst, cs_isn, 0, 0, TCP_MSS_DEFAULT, cs_own, net_src_for(cs_dst));
+    if (cs_id >= 0) {
+        var cs_cb = tcp_conn_base(cs_id);
+        store64(cs_snap, load64(cs_cb + 152));
+        store64(cs_snap + 8, load64(cs_cb + 160));
+        store64(cs_snap + 16, tcp_conn_gen_get(cs_id));
+        tcp_arm_retx(cs_cb, cs_isn, 0x02, 0, 0);
+        tcp_send_pkt_seq(cs_id, cs_isn, 0x02, 0, 0);
+        store64(cs_cb + 32, (cs_isn + 1) & 0xFFFFFFFF);   # the SYN consumes one sequence number
+    }
+    tcp_unlock(cs_f);
+    return cs_id;
+}
+# ⭐ sock_connect#47's body (1.57.7 S6). The deadline is computed ONCE, here, from entry, and never recomputed by a
+# wake (M-S3). An auto port (sport <= 0 or > 65535) takes tcp_ephemeral_next (S4, under the lock) and, when it
+# collides with a live 4-tuple (S5's refusal), tries the next one (8 tries).
+fn tcp_connect_ex(ce_dst, ce_dport, ce_sport, ce_own, ce_budget) {
+    var ce_snap[24];                                    # function-local: 24 BYTES (+0 tag, +8 epoch, +16 gen)
+    var ce_dl = wq_deadline_after_us(ce_budget);
+    var ce_auto = 0;
+    if (ce_sport <= 0 || ce_sport > 65535) { ce_auto = 1; }
+    var ce_tries = 0;
+    var ce_id = 0 - 1;
+    while (ce_tries < 8) {
+        var ce_sp = ce_sport;
+        if (ce_auto == 1) { ce_sp = tcp_ephemeral_next(); }
+        ce_id = tcp_connect_start(ce_dst, ce_dport, ce_sp, ce_own, &ce_snap);
+        if (ce_id >= 0) { break; }
+        if (ce_auto == 0) { break; }
+        ce_tries = ce_tries + 1;
+    }
+    if (ce_id < 0) { return 0 - 1; }
+    return tcp_connect_wait(ce_id, load64(&ce_snap), load64(&ce_snap + 8), load64(&ce_snap + 16), ce_dl);
+}
+# Wait for the handshake. EVERY decision is made in one tcp_tab_lock hold against the (tag, epoch, gen) snapshot
+# (N-4 + D13: a slot that died and was re-claimed is never returned, released or touched). State 4 counts as
+# connected (N-8). The state is checked BEFORE the deadline in the same hold (an ESTABLISHED conn at the deadline is
+# returned). ⛔ HELD-SLOT TRAP (Q1): EVERY -1 exit after a successful claim releases the slot itself (a RST'd or
+# exhausted owned SYN_SENT is HELD in state 0 otherwise) — the close body releases states 0 and 1 (M-LEAK).
+fn tcp_connect_wait(cw_id, cw_tag, cw_ep, cw_gen, cw_dl) {
+    var cw_blk = wq_can_block();
+    var cw_spins = 0;
+    while (1) {
+        net_poll();
+        var cw_f = tcp_lock();
+        if (tcp_same_locked(cw_id, cw_tag, cw_ep, cw_gen) == 0) { tcp_unlock(cw_f); return 0 - 1; }   # not ours: never touch it
+        var cw_st = load64(tcp_conn_base(cw_id));
+        if (cw_st == 2 || cw_st == 4) { tcp_unlock(cw_f); return cw_id; }
+        if (cw_st != 1) { tcp_close_locked(cw_id); tcp_unlock(cw_f); return 0 - 1; }                  # RST / exhaustion
+        if (sched_clock_us() >= cw_dl) { tcp_close_locked(cw_id); tcp_unlock(cw_f); return 0 - 1; }   # timeout
+        tcp_unlock(cw_f);
+        if (cw_spins < NET_BLOCK_SPINS) {
+            cw_spins = cw_spins + 1;
+        } elif (cw_blk == 1) {
+            var cw_r = tcp_block(cw_id, 1, cw_tag, cw_ep, cw_gen, cw_dl);
+            if (cw_r == 1) {                                                      # lifecycle ABORT (S7)
+                var cw_g = tcp_lock();
+                if (tcp_same_locked(cw_id, cw_tag, cw_ep, cw_gen) == 1) { tcp_close_locked(cw_id); }
+                tcp_unlock(cw_g);
+                return 0 - 1;
+            }
+            if (cw_r == 2) { cw_blk = 0; }
+        } else {
+            net_legacy_step(cw_spins);
+            cw_spins = cw_spins + 1;
+        }
+    }
+    return 0 - 1;
+}
+fn tcp_connect_owned(dst_ip, dst_port, src_port, ct_own) { return tcp_connect_ex(dst_ip, dst_port, src_port, ct_own, TCP_CONNECT_US); }
+fn tcp_connect(dst_ip, dst_port, src_port) { return tcp_connect_owned(dst_ip, dst_port, src_port, 0); }   # in-kernel
+
+# ⭐ sock_send#48's body (1.57.7 S6). STREAM-CORRECT: ONE segment in flight at EVERY entry — a call that finds an
+# earlier call's segment still unACKed waits for it first (M-S2), and the next chunk is never sent over an unACKed
+# one; each chunk is armed, sent FROM THE HELD KERNEL COPY and SND.NXT advanced in ONE tcp_tab_lock hold (S4: the
+# only read of `data`, a range that passed is_user_range in this syscall). CLOSE_WAIT is a sending state (D12(ii)).
+# BLOCKS only the caller (tcp_block on WK_TCP|id) and returns: `len` when every byte is ACKed; the COMMITTED count
+# (the in-flight chunk included, possibly 0) after `prog_us` with no ACK progress (D6); the committed count when
+# the conn dies or stops being the snapshot incarnation after something was committed, else -1; the committed
+# count on a lifecycle ABORT (the segment stays armed; the death chain closes the conn).
+fn tcp_send_ex(se_id, se_data, se_len, se_own, se_prog) {
+    if (tcp_owner_is(se_id, se_own) == 0) { return 0 - 1; }
+    var se_cb = tcp_conn_base(se_id);
+    var se_f = tcp_lock();
+    var se_ok = tcp_owner_is(se_id, se_own);
+    var se_tag = load64(se_cb + 152);
+    var se_ep = load64(se_cb + 160);
+    var se_gen = tcp_conn_gen_get(se_id);
+    var se_st = load64(se_cb);
+    var se_last = load64(se_cb + 56);
+    var se_mss = load64(se_cb + 144);
+    tcp_unlock(se_f);
+    if (se_ok == 0) { return 0 - 1; }
+    if (se_st != 2 && se_st != 4) { return 0 - 1; }
+    if (se_mss < 1) { se_mss = TCP_MSS_DEFAULT; }
+    if (se_mss > TCP_RETX_BUF) { se_mss = TCP_RETX_BUF; }
+    var se_blk = wq_can_block();
+    var se_sent = 0;
+    var se_spins = 0;
+    var se_pdl = wq_deadline_after_us(se_prog);
+    while (1) {
+        var se_g = tcp_lock();
+        var se_s = load64(se_cb);
+        if (tcp_same_locked(se_id, se_tag, se_ep, se_gen) == 0 || (se_s != 2 && se_s != 4)) {
+            tcp_unlock(se_g);
+            if (se_sent > 0) { return se_sent; }
+            return 0 - 1;
+        }
+        var se_una = load64(se_cb + 56);
+        if (se_una != se_last) {                                   # ACK progress (a partial ACK included): D6 clock
+            se_last = se_una;
+            se_pdl = wq_deadline_after_us(se_prog);
+        }
+        if (load64(se_cb + 128) != 0) {                            # a segment in flight — ours or an EARLIER call's
+            tcp_unlock(se_g);
+            if (sched_clock_us() >= se_pdl) { return se_sent; }    # D6: the committed count, possibly 0
+            net_poll();                                            # the ACK may be queued (loopback: our own drain)
+            if (load64(se_cb + 128) == 0) { continue; }            # racy prefilter; re-decided under the lock
+            if (se_spins < NET_BLOCK_SPINS) {
+                se_spins = se_spins + 1;
+            } elif (se_blk == 1) {
+                var se_r = tcp_block(se_id, 2, se_tag, se_ep, se_gen, se_pdl);
+                if (se_r == 1) { return se_sent; }                 # lifecycle ABORT (S7)
+                if (se_r == 2) { se_blk = 0; }
+            } else {
+                net_legacy_step(se_spins);
+                se_spins = se_spins + 1;
+            }
+            continue;
+        }
+        if (se_sent >= se_len) { tcp_unlock(se_g); return se_sent; }   # all committed AND the last segment ACKed
+        # B3 MSS + B4 peer-window cap (zero window → 1-byte persist probe).
+        var se_chunk = tcp_send_chunk(se_len - se_sent, se_mss, load64(se_cb + 88));
+        if (se_chunk > TCP_RETX_BUF) { se_chunk = TCP_RETX_BUF; }
+        var se_seq = load64(se_cb + 32);
+        tcp_arm_retx(se_cb, se_seq, 0x18, se_data + se_sent, se_chunk);           # copies into the pool hold buffer
+        tcp_send_pkt_seq(se_id, se_seq, 0x18, load64(se_cb + 136), se_chunk);     # PSH+ACK, sent FROM the held copy
+        store64(se_cb + 32, (se_seq + se_chunk) & 0xFFFFFFFF);
+        se_last = load64(se_cb + 56);
+        tcp_unlock(se_g);
+        se_sent = se_sent + se_chunk;
+        se_pdl = wq_deadline_after_us(se_prog);
+        se_spins = 0;
+    }
+    return se_sent;
+}
+fn tcp_send_own(conn_id, data, len, sd_own) { return tcp_send_ex(conn_id, data, len, sd_own, TCP_PROGRESS_US); }
+fn tcp_send(conn_id, data, len) { return tcp_send_own(conn_id, data, len, 0); }   # in-kernel callers (own 0)
+
+# 1.57.7 (S4): net_poll FIRST (outside the lock), then the ring drain, the rx_read store, the copy to `buf` and
+# the window ACK (state 2 only) in ONE tcp_tab_lock hold. `buf` is a kernel buffer or a user range #49/read#5
+# validated with is_user_range in this syscall (mapped; nothing can unmap it mid-copy).
+# 1.57.7 (S5): owned. Returns n > 0 bytes, 0 would-block, -1 EOF (decided in the SAME hold as the drain, so a
+# recycled slot's state never leaks), -2 not / no longer `rv_own`'s. The lock-free owner prefilter runs BEFORE
+# net_poll; the authoritative check is inside the hold.
+fn tcp_recv_own(conn_id, buf, maxlen, rv_own) {
+    if (tcp_owner_is(conn_id, rv_own) == 0) { return 0 - 2; }
+    # Poll for packets
+    net_poll();
+    var cb = tcp_conn_base(conn_id);
+    var tr_f = tcp_lock();
+    var take = 0;
+    var rx_buf = 0;
+    if (tcp_owner_is(conn_id, rv_own) == 0) { take = 0 - 2; } else { rx_buf = load64(cb + 48); }
+    if (rx_buf != 0) {
+        # B1 ring drain (FIFO): available = rx_write - rx_read.
+        var rxw = load64(cb + 64);
+        var rxr = load64(cb + 80);
+        var avail = rxw - rxr;
+        if (avail > 0) {
+            take = avail;
+            if (take > maxlen) { take = maxlen; }
+            var rpos = rxr & (TCP_RX_RING - 1);
+            var first = TCP_RX_RING - rpos;        # contiguous bytes to end of ring
+            if (first > take) { first = take; }
+            net_copy_buf(buf, rx_buf + rpos, first);
+            if (take > first) {
+                net_copy_buf(buf + first, rx_buf, take - first);
+            }
+            store64(cb + 80, rxr + take);          # advance rx_read
+            # Draining freed ring space → send a window-update ACK so a peer that
+            # stalled on a small/zero window resumes (keeps large streams flowing).
+            if (load64(cb) == 2) { tcp_send_pkt(conn_id, 0x10, 0, 0); }
+        }
+    }
+    if (take == 0) {
+        if (tcp_conn_eof_locked(conn_id) == 1) { take = 0 - 1; }     # EOF: dead, or CLOSE_WAIT drained
+    }
+    tcp_unlock(tr_f);
+    return take;
+}
+# In-kernel callers (own 0): keep the 1.57.6 0 / >0 contract (EOF and not-ours both read as 0).
+fn tcp_recv(conn_id, buf, maxlen) {
+    var trk = tcp_recv_own(conn_id, buf, maxlen, 0);
+    if (trk < 0) { return 0; }
+    return trk;
+}
+
+# ⭐ EOF (1.57.7 S4, issue 2026-09-23-sock-recv-never-reports-eof-after-peer-fin). tcp_conn_eof_locked: 1 if the
+# conn is dead (state 0), or the peer's FIN has been received (CLOSE_WAIT) and every byte before it has been
+# read (empty ring); otherwise 0. Data always drains before EOF. No state lies past CLOSE_WAIT here, because
+# tcp_close releases in the same hold. (The old lock-free ordering argument — state read before the ring
+# counters, the demux publishing rx_write before CLOSE_WAIT — is no longer load-bearing: the lock orders it.)
+# Replaces the old state-0-only "dead" test, which made a peer-closed stream answer #49 with 0 forever.
+fn tcp_conn_eof_locked(id) {
+    var el_cb = tcp_conn_base(id);
+    var el_st = load64(el_cb);
+    var el_avail = load64(el_cb + 64) - load64(el_cb + 80);
+    if (el_st == 0) { return 1; }
+    if (el_st == 3) { return 1; }                  # 1.57.7 (S6): a held FIN slot — our side is closed
+    if (el_st == 4 && el_avail <= 0) { return 1; }
+    return 0;
+}
+
+fn tcp_conn_eof(id) {
+    if (id < 0) { return 0; }
+    if (id >= tcp_conn_count) { return 0; }
+    var ce_f = tcp_lock();
+    var ce_r = tcp_conn_eof_locked(id);
+    tcp_unlock(ce_f);
+    return ce_r;
+}
+
 # 1.49.5 (socket-as-VFS-fd, epoll) — readiness probe for a VFS_SOCK fd: 1 if the conn has buffered RX
-# data to read OR is dead (so read returns EOF), else 0. net_poll FIRST so freshly-arrived bytes show.
-# epoll_wait consults this for a VFS_SOCK watch; matches tcp_recv's ring math (rx_write-rx_read @ cb+64/+80).
+# data to read OR reads as EOF (tcp_conn_eof_locked — dead, or CLOSE_WAIT with an empty ring), else 0.
+# net_poll FIRST so freshly-arrived bytes show; the test itself is one tcp_tab_lock hold.
 fn tcp_readable(conn_id) {
     if (conn_id < 0) { return 0; }
     if (conn_id >= tcp_conn_count) { return 0; }
     net_poll();
     var cb = tcp_conn_base(conn_id);
-    if (load64(cb + 64) - load64(cb + 80) > 0) { return 1; }   # rx ring has bytes
-    if (load64(cb) == 0) { return 1; }                          # conn dead -> readable (EOF)
+    var rd_f = tcp_lock();
+    var rd_r = 0;
+    if (load64(cb + 64) - load64(cb + 80) > 0) { rd_r = 1; }   # rx ring has bytes
+    if (tcp_conn_eof_locked(conn_id) == 1) { rd_r = 1; }        # EOF -> readable
+    tcp_unlock(rd_f);
+    return rd_r;
+}
+
+# tcp_close_locked (1.57.7 S4) — CALLER HOLDS tcp_tab_lock. A LISTEN close reaps its un-accepted children
+# ATOMICALLY with its own release (critic C7(b): no new listener can alias them): children in ESTABLISHED or
+# CLOSE_WAIT get a RST|ACK so the peer does not hang (Q4, as Linux does), SYN_RCVD ones are dropped, then ONE
+# release, CLOSED last (critic C2).
+# ⭐ 1.57.7 (S6) — GRACEFUL CLOSE: from ESTABLISHED or CLOSE_WAIT the slot becomes a KERNEL-HELD FIN SLOT (state 3):
+# the owner is unstamped FIRST (the caller's id is dead at once; a second #50 is -1), the rx ring unbound (window
+# 0; cb+136 stays bound, C4), the FIN|ACK ARMED and sent from under this hold, SND.NXT advanced. The timer scan
+# retransmits it; the state-3 demux arm and the scan release it (see the header). From CLOSE_WAIT it is LAST_ACK
+# (TCP_META_PEER_FIN already set by the 2 -> 4 FIN; set here too). Every other state (0, 1, 6, 3) releases at once.
+# Idempotent on a CLOSED slot.
+fn tcp_close_locked(id) {
+    var cl_cb = tcp_conn_base(id);
+    var cl_st = load64(cl_cb);
+    if (cl_st == 2 || cl_st == 4) {
+        store64(cl_cb + 152, 0);                           # unstamp FIRST: the slot is kernel-held from here
+        store64(cl_cb + 160, 0);
+        store64(cl_cb + 48, 0);                            # unbind the rx ring (tcp_rx_append / tcp_recv test 0)
+        if (cl_st == 4) { store8(cl_cb + 73, load8(cl_cb + 73) | 0x20); }   # TCP_META_PEER_FIN (bit 13): LAST_ACK
+        var cl_seq = load64(cl_cb + 32);
+        if (load64(cl_cb + 128) == 0x18) {
+            # ⛔ 1.57.7 ENDFIX (S6-R1): A DATA SEGMENT IS STILL HELD (#48's D6 return with the chunk in flight, a
+            # lifecycle ABORT, a kill blocked in #48). FOLD the FIN into it (0x19): retx_seq, retx_len, SND.UNA and the
+            # retry state are KEPT, so the unACKed bytes are still resent and the FIN rides at their end (seq ==
+            # SND.NXT). Re-arming a flag-only FIN here moved SND.UNA past bytes nobody ACKed: they were never resent,
+            # the peer's RCV.NXT stayed below the FIN, and the peer never saw the data or EOF. The ACK-covers block
+            # counts the FIN's phantom byte (rflags & 0x01) and the partial-ACK trim accepts 0x19.
+            store64(cl_cb + 128, 0x19);
+            tcp_send_pkt_seq(id, load64(cl_cb + 96), 0x19, load64(cl_cb + 136), load64(cl_cb + 104));
+        } else {
+            tcp_arm_retx(cl_cb, cl_seq, 0x11, 0, 0);       # FIN|ACK, flag-only (one phantom byte)
+            tcp_send_pkt_seq(id, cl_seq, 0x11, 0, 0);      # under tcp_tab_lock (S4 chain); honours +168
+        }
+        store64(cl_cb + 32, (cl_seq + 1) & 0xFFFFFFFF);
+        store64(cl_cb, 3);                                 # our FIN is out
+        return 0;
+    }
+    if (cl_st == 5) {
+        for (var lci = 0; lci < tcp_conn_count; lci = lci + 1) {
+            if (lci == id) { continue; }
+            var lcc = tcp_conn_base(lci);
+            var lcm = load64(lcc + 72);
+            var lcs = load64(lcc);
+            if (lcs == 0) { continue; }
+            if ((lcm & 0x200) == 0) { continue; }          # not a passive-open
+            if ((lcm & 0x400) != 0) { continue; }          # already accepted — owned by the app
+            if (((lcm >> 16) & 0xFF) != id) { continue; }  # not parented here
+            if (lcs == 2 || lcs == 4) { tcp_send_pkt_seq(lci, load64(lcc + 32), 0x14, 0, 0); }   # RST|ACK
+            tcp_slot_release_locked(lci);
+        }
+    }
+    tcp_slot_release_locked(id);
     return 0;
 }
 
-fn tcp_close(conn_id) {
-    if (conn_id < 0) { return 0 - 1; }
-    if (conn_id >= tcp_conn_count) { return 0 - 1; }
-    var cb = tcp_conn_base(conn_id);
-    var state = load64(cb);
-    # 1.45.6 audit fix (LISTEN-slot reuse aliasing): closing a LISTEN socket must
-    # reap its PENDING un-accepted children (passive-opens parented at this slot
-    # that were never accept()ed). Without this, the 1.45.5 reclaim could hand
-    # this slot to a NEW tcp_listen, and tcp_accept on the new listener would scan
-    # up the old, still-ESTABLISHED-but-unaccepted child (it carries this slot's
-    # index in parent_listen_id, flags bits 16-23) and return it — aliasing a
-    # connection from the previous listener into the new one. Already-accepted
-    # children (bit 10 set) are skipped: the app owns them, and tcp_accept skips
-    # accepted conns anyway, so they can't alias.
-    if (state == 5) {
-        for (var lci = 0; lci < tcp_conn_count; lci = lci + 1) {
-            if (lci == conn_id) { continue; }
-            var lcc = tcp_conn_base(lci);
-            var lcm = load64(lcc + 72);
-            if ((lcm & 0x200) == 0) { continue; }          # not a passive-open
-            if ((lcm & 0x400) != 0) { continue; }          # already accepted — owned by the app
-            if (((lcm >> 16) & 0xFF) != conn_id) { continue; }  # not parented here
-            var lcr = load64(lcc + 48);
-            if (lcr != 0) { kfree_sized(lcr, TCP_RX_RING); store64(lcc + 48, 0); }
-            var lct = load64(lcc + 136);
-            if (lct != 0) { kfree_sized(lct, TCP_RETX_BUF); store64(lcc + 136, 0); }
-            store64(lcc, 0);            # CLOSED (reclaimable)
-            store64(lcc + 128, 0);     # disarm retx
+# ⭐ THE ONLY release path for a live conn by id (1.57.7 S5): #50, VFS close, the kernel wrapper and death all
+# come here. The owner check and S4's close (reap + RST / FIN from 2|4 / the one release tail) share one hold.
+# -1 when `co_own` does not own it (a double close by the owner: the tag was cleared by the first).
+fn tcp_close_own(co_id, co_own) {
+    if (co_id < 0) { return 0 - 1; }
+    if (co_id >= tcp_conn_count) { return 0 - 1; }
+    var co_r = 0 - 1;
+    var co_f = tcp_lock();
+    if (tcp_owner_is(co_id, co_own) == 1) {
+        tcp_close_locked(co_id);
+        co_r = 0;
+    }
+    tcp_unlock(co_f);
+    if (co_r == 0) { tcp_wake(co_id); }             # 1.57.7 (S6): after the unlock — a waiter re-evaluates
+    return co_r;
+}
+fn tcp_close(c_id) { return tcp_close_own(c_id, 0); }   # in-kernel callers; a NO-OP (-1) on an owned conn
+
+# Both death sites (and S7's proc_death_release). Heap-free, IRQ-safe; per-slot holds; LISTENs first so their
+# reap RSTs unaccepted children, then every other slot the incarnation owns, in ANY state (held state-0 slots
+# included — D13's "skip state 0" is amended by Q5: the kfree UAF it guarded is gone with S4's pool, and under
+# Q1 an owned state-0 slot is HELD and must be released here). Idempotent.
+fn tcp_release_pid(rp_pid) {
+    if (rp_pid < 0) { return 0; }
+    if (rp_pid >= 16) { return 0; }
+    var rp_own = rp_pid + 1;
+    var rp_pass = 0;
+    while (rp_pass < 2) {
+        var rp_i = 0;
+        while (rp_i < tcp_conn_count) {
+            var rp_f = tcp_lock();
+            var rp_w = 0;
+            if (tcp_owner_is(rp_i, rp_own) == 1) {                    # tag AND epoch, under the lock
+                var rp_isl = 0;
+                if (load64(tcp_conn_base(rp_i)) == 5) { rp_isl = 1; }
+                if (rp_pass == 1 || rp_isl == 1) { tcp_close_locked(rp_i); rp_w = 1; }
+            }
+            tcp_unlock(rp_f);
+            if (rp_w == 1) { tcp_wake(rp_i); }                        # 1.57.7 (S6): after the unlock
+            rp_i = rp_i + 1;
         }
+        rp_pass = rp_pass + 1;
     }
-    if (state == 2) {
-        # Send FIN+ACK (flags = 0x11), advance SND.NXT, arm the FIN retransmit
-        # (flag-only — retx_len 0, so it never dereferences the held buffer).
-        var seq = load64(cb + 32);
-        tcp_send_pkt(conn_id, 0x11, 0, 0);
-        store64(cb, 3);  # FIN_WAIT
-        store64(cb + 32, (seq + 1) & 0xFFFFFFFF);
-        tcp_arm_retx(cb, seq, 0x11, 0, 0);
-    }
-    if (state == 4) {
-        # CLOSE_WAIT: send FIN+ACK
-        tcp_send_pkt(conn_id, 0x11, 0, 0);
-        store64(cb, 0);  # CLOSED
-    }
-    # Free per-connection buffers (receive ring + retransmit hold). The FIN
-    # retransmit above is flag-only, so freeing the hold buffer here is safe.
-    var rx_buf = load64(cb + 48);
-    if (rx_buf != 0) {
-        kfree_sized(rx_buf, TCP_RX_RING);
-        store64(cb + 48, 0);
-    }
-    var retx_buf = load64(cb + 136);
-    if (retx_buf != 0) {
-        kfree_sized(retx_buf, TCP_RETX_BUF);
-        store64(cb + 136, 0);
-    }
-    # 1.45.2: force the slot CLOSED + disarm any armed retx so it is IMMEDIATELY
-    # reclaimable by tcp_alloc_conn_slot (its per-conn buffers are freed above).
-    # The FIN was sent once by the state branch above (best-effort — this stack
-    # does not implement graceful FIN_WAIT/TIME_WAIT, and a FIN_WAIT slot whose
-    # rx ring is already freed could not receive anyway). Without this, the
-    # 8-slot table leaks one slot per connect/close cycle and the ring-3
-    # consumer exhausts it after 8 connections. Idempotent on a re-close
-    # (state already 0, buffers already NULL).
-    store64(cb, 0);                 # state = CLOSED (reclaimable)
-    store64(cb + 128, 0);           # disarm retx (no FIN resend from a reused slot)
     return 0;
 }
 
@@ -616,7 +1248,7 @@ fn tcp_close(conn_id) {
 
 fn tcp_find_listen(listen_port) {
     # Scan conn table for state == LISTEN entries with src_port matching the
-    # given local-listening-port. Returns conn_id or -1.
+    # given local-listening-port. Returns conn_id or -1. CALLER HOLDS tcp_tab_lock (1.57.7).
     for (var i = 0; i < tcp_conn_count; i = i + 1) {
         var cb = tcp_conn_base(i);
         if (load64(cb) == 5) {
@@ -628,68 +1260,97 @@ fn tcp_find_listen(listen_port) {
     return 0 - 1;
 }
 
-fn tcp_listen(port) {
-    # Refuse duplicate-bind: already-listening on this port → return -1.
-    if (tcp_find_listen(port) >= 0) { return 0 - 1; }
-    # 1.45.5: allocate via the reclaim helper (1.45.2) so a listen/close churn
-    # reuses freed slots instead of leaking the 8-slot table (was tcp_conn_count++).
-    var conn_id = tcp_alloc_conn_slot();
-    if (conn_id < 0) { return 0 - 1; }
-    var cb = tcp_conn_base(conn_id);
-    store64(cb, 5);             # state = LISTEN
-    store64(cb + 8, port);      # src_port = listening port
-    store64(cb + 16, 0);        # dst_port = wildcard
-    store64(cb + 24, 0);        # dst_ip = wildcard
-    store64(cb + 32, 0);        # seq_num unused on LISTEN
-    store64(cb + 40, 0);        # ack_num unused on LISTEN
-    store64(cb + 48, 0);        # rx_buf unused on LISTEN
-    store64(cb + 56, 0);        # SND.UNA unused
-    store64(cb + 64, 0);        # rx_write unused
-    store64(cb + 72, 0x100);    # flags = TCP_FLAG_IS_LISTENING
-    store64(cb + 80, 0);        # rx_read unused
-    store64(cb + 88, 0);        # SND.WND unused
-    store64(cb + 96, 0);        # retx_seq unused
-    store64(cb + 104, 0);       # retx_len unused
-    store64(cb + 112, 0);       # retx_tick unused
-    store64(cb + 120, 0);       # retx_count unused
-    store64(cb + 128, 0);       # retx_flags unused (LISTEN never retransmits)
-    store64(cb + 136, 0);       # retx_buf unused
-    store64(cb + 144, 0);       # eff_mss unused (set per-conn on passive open)
-    return conn_id;
+# 1.57.7 (S4): the duplicate-port check is INSIDE the claim, atomic with it (no two LISTEN slots on one port
+# across CPUs, whatever the class). meta 0x100 = TCP_FLAG_IS_LISTENING. 1.57.7 (S5): owned by `ln_own`;
+# class 1 = LOOPBACK (TCP_FLAG_LO_ONLY: only SYNs addressed to 127/8, which the wire can never deliver), class
+# 0 = ANY (net_ip AND 127/8).
+fn tcp_listen_owned(ln_port, ln_own, ln_class) {
+    var ln_m = 0x100;
+    if (ln_class == 1) { ln_m = ln_m | TCP_FLAG_LO_ONLY; }
+    return tcp_slot_claim(5, ln_port, 0, 0, 0, 0, ln_m, 0, ln_own, 0);
+}
+fn tcp_listen(port) { return tcp_listen_owned(port, 0, 0); }   # in-kernel callers
+
+# #56's arg1 (1.57.7 S5, pure): port bits 0-15 (1..65535) | class << 32 (bits 32-39: 0 = ANY, 1 = LOOPBACK);
+# bits 16-31 and 40-63 MUST be 0. Returns (class << 16) | port, or -1.
+fn sock_listen_decode(sd_a) {
+    if (sd_a <= 0) { return 0 - 1; }
+    if ((sd_a & 0xFFFF) == 0) { return 0 - 1; }
+    if (((sd_a >> 16) & 0xFFFF) != 0) { return 0 - 1; }
+    if ((sd_a >> 40) != 0) { return 0 - 1; }
+    var sd_c = (sd_a >> 32) & 0xFF;
+    if (sd_c > 1) { return 0 - 1; }
+    return (sd_c << 16) | (sd_a & 0xFFFF);
 }
 
-fn tcp_bind(port, ip) {
-    # v1: bind+listen merged. ip arg unused (we listen on net_ip always).
-    # When a separate bind-without-listen consumer surfaces, split this.
-    return tcp_listen(port);
+# sock_peer#106 (1.57.7 S5): (peer_ip << 16) | peer_port — one packed value, no torn pair; a live peer is >= 0x10000.
+fn tcp_peer_pack(ip, port) { return ((ip & 0xFFFFFFFF) << 16) | (port & 0xFFFF); }
+fn tcp_peer_raw(pr_cb) {                              # no auth (selftest use); CLOSED / LISTEN -> -1
+    var pr_st = load64(pr_cb);
+    if (pr_st == 0 || pr_st == 5) { return 0 - 1; }
+    return tcp_peer_pack(load64(pr_cb + 24), load64(pr_cb + 16));
+}
+fn tcp_peer_own(pe_id, pe_own) {
+    if (pe_id < 0) { return 0 - 1; }
+    if (pe_id >= tcp_conn_count) { return 0 - 1; }
+    var pe_f = tcp_lock();
+    var pe_r = 0 - 1;
+    if (tcp_owner_is(pe_id, pe_own) == 1) { pe_r = tcp_peer_raw(tcp_conn_base(pe_id)); }
+    tcp_unlock(pe_f);
+    return pe_r;
 }
 
-fn tcp_accept(listen_id) {
-    # Non-blocking accept: scan for ESTABLISHED conns whose parent_listen_id
-    # matches and which haven't been accepted yet. Returns conn_id or -1.
+# Non-blocking accept: an un-accepted passive child of listen_id in ESTABLISHED **or CLOSE_WAIT** (1.57.7
+# D12(ii): a peer that sent its request and FIN before we accepted is kept, not reaped — its data and then
+# EOF are delivered by #49). Marks it accepted with a BYTE write (hardening (b): bit 10 = byte 1 bit 2), under
+# tcp_tab_lock. Returns conn_id or -1. 1.57.7 (S5): the listener must be `ac_own`'s, and a child is returned
+# only if it carries the LISTENER's stamp (tag + epoch) — the accepted conn is owned by the listener's owner.
+fn tcp_accept_own(listen_id, ac_own) {
     if (listen_id < 0) { return 0 - 1; }
     if (listen_id >= tcp_conn_count) { return 0 - 1; }
+    var ta_f = tcp_lock();
+    var ta_r = 0 - 1;
     var lcb = tcp_conn_base(listen_id);
-    if (load64(lcb) != 5) { return 0 - 1; }  # not a LISTEN
-    for (var i = 0; i < tcp_conn_count; i = i + 1) {
-        if (i == listen_id) { continue; }
-        var cb = tcp_conn_base(i);
-        if (load64(cb) != 2) { continue; }   # not ESTABLISHED
-        var meta = load64(cb + 72);
-        # passive_open (bit 9) set AND not yet accepted (bit 10 clear)?
-        if ((meta & 0x200) == 0) { continue; }
-        if ((meta & 0x400) != 0) { continue; }
-        # parent_listen_id (bits 16-23) match?
-        var parent = (meta >> 16) & 0xFF;
-        if (parent != listen_id) { continue; }
-        # Mark accepted and return.
-        store64(cb + 72, meta | 0x400);
-        return i;
+    var ac_ok = tcp_owner_is(listen_id, ac_own);
+    if (ac_ok == 1 && load64(lcb) == 5) {
+        for (var i = 0; i < tcp_conn_count; i = i + 1) {
+            if (ta_r >= 0) { break; }
+            if (i == listen_id) { continue; }
+            var cb = tcp_conn_base(i);
+            var ta_st = load64(cb);
+            if (ta_st != 2 && ta_st != 4) { continue; }   # not ESTABLISHED / CLOSE_WAIT
+            var meta = load64(cb + 72);
+            # passive_open (bit 9) set AND not yet accepted (bit 10 clear)?
+            if ((meta & 0x200) == 0) { continue; }
+            if ((meta & 0x400) != 0) { continue; }
+            # parent_listen_id (bits 16-23) match?
+            var parent = (meta >> 16) & 0xFF;
+            if (parent != listen_id) { continue; }
+            if (load64(cb + 152) != load64(lcb + 152)) { continue; }   # S5: the child carries the listener's stamp
+            if (load64(cb + 160) != load64(lcb + 160)) { continue; }
+            store8(cb + 73, load8(cb + 73) | 0x04);        # accepted (bit 10)
+            ta_r = i;
+        }
     }
-    return 0 - 1;
+    tcp_unlock(ta_f);
+    return ta_r;
 }
+fn tcp_accept(listen_id) { return tcp_accept_own(listen_id, 0); }   # in-kernel callers
 
-fn tcp_find_conn(src_port, dst_port, src_ip) {
+# Does a slot's local address (+168) admit the segment's destination? 0 on either side is a wildcard (a slot claimed
+# with no route source, or a lookup that does not name the local address — the selftest finders).
+fn tcp_lip_match(lm_slot, lm_dst) {
+    if (lm_slot == 0) { return 1; }
+    if (lm_dst == 0) { return 1; }
+    if (lm_slot == lm_dst) { return 1; }
+    return 0;
+}
+# ⛔ 1.57.7 ENDFIX (S5-R1): THE LOOKUP KEYS ON THE LOCAL ADDRESS TOO. All of 127/8 is ours, so (127.0.0.1:P ->
+# 127.0.0.2:X) and (127.0.0.1:P -> 127.0.0.3:X) are two connections whose server children share (lport, rport, rip)
+# and differ ONLY in +168. The 3-key form first-matched the first child: the second SYN never reached the passive
+# open (its connect timed out, -1), and the SYN was fed to the unrelated conn's demux arm.
+fn tcp_find_conn(src_port, dst_port, src_ip, dst_ip) {
+    # CALLER HOLDS tcp_tab_lock (1.57.7).
     for (var i = 0; i < tcp_conn_count; i = i + 1) {
         var cb = tcp_conn_base(i);
         var state = load64(cb);
@@ -697,13 +1358,31 @@ fn tcp_find_conn(src_port, dst_port, src_ip) {
             if (load64(cb + 8) == dst_port) {
                 if (load64(cb + 16) == src_port) {
                     if (load64(cb + 24) == src_ip) {
-                        return i;
+                        if (tcp_lip_match(load64(cb + 168), dst_ip) == 1) { return i; }
                     }
                 }
             }
         }
     }
     return 0 - 1;
+}
+
+# net_handle_tcp — the demux entry (1.57.7 S4): a SINGLE-EXIT wrapper that runs the whole segment under
+# tcp_tab_lock (IRQ-saved; reachable from the timer ISR drain, the NIC MSI handler and every CPU's net_poll).
+# tcp_demux_touched names the conn the segment acted on (S6's wake hook snapshots it before the unlock).
+# 1.57.7 (S6): the WAKE HOOK. tcp_demux_wake is cleared before the handler and set by every event that can make a
+# waiter's predicate true (docs/architecture/blocking-waits.md § Network waits has the table); both it and
+# tcp_demux_touched are read BEFORE the unlock and the wake follows the unlock (the condition is always stored first).
+fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip, dst_ip) {
+    var nht_f = tcp_lock();
+    tcp_demux_touched = 0 - 1;
+    tcp_demux_wake = 0;
+    var nht_r = net_handle_tcp_locked(pkt, ip_off, ip_payload_len, src_ip, dst_ip);
+    var nht_t = tcp_demux_touched;
+    var nht_w = tcp_demux_wake;
+    tcp_unlock(nht_f);
+    if (nht_w == 1 && nht_t >= 0) { tcp_wake(nht_t); }
+    return nht_r;
 }
 
 # ⛔⛔ 1.56.52 — THE STACK CANARY WAS REMOVED FROM THIS FUNCTION, DELIBERATELY, AND THAT IS THE FIX.
@@ -722,7 +1401,7 @@ fn tcp_find_conn(src_port, dst_port, src_ip) {
 # ⇒ Removed rather than completed. Adding it to all 23 exits would spend real work making a mechanism
 # with nothing to detect look thorough. If a local buffer is ever added here, add the canary WITH it,
 # on every exit, and say in a comment what it guards.
-fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip, dst_ip) {
+fn net_handle_tcp_locked(pkt, ip_off, ip_payload_len, src_ip, dst_ip) {
     if (ip_payload_len < 20) { return 0; }
     # ⛔⛔ 1.56.52 — THE SAME AMPLIFIER THE ICMP ARM CLOSES, AND THE TCP SIDE IS WORSE. This function
     # matched only on (src_port, dst_port, src_ip) and tcp_find_listen(dst_port); the IPv4 DESTINATION
@@ -733,8 +1412,17 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip, dst_ip) {
     # ⚠ Unicast only, deliberately narrower than net_handle_udp`s `ours`: that one must admit broadcast
     # because DHCP OFFER/ACK arrive at 255.255.255.255 while net_ip is still 0. TCP has no such case —
     # there is no broadcast TCP. The loopback selftest handshakes to net_ip, which this admits.
-    if (net_ip == 0) { return 0; }
-    if (dst_ip != net_ip) { return 0; }
+    # (1.57.7: this function is net_handle_tcp_locked — its caller holds tcp_tab_lock.)
+    # ⭐ 1.57.7 (S5): the gate admits 127/8 AND net_ip. 127/8 is admitted ONLY because net_wire_frame (the
+    # single wire entry) drops every wire frame with a 127/8 source or destination, so a 127/8 destination here
+    # can only have come from this host's loopback queue. Broadcast and every other address stay refused (the
+    # 1.56.52 amplifier fix stands). A NIC-less box (net_ip 0) now has loopback TCP.
+    var dg_ok = 0;
+    if (((dst_ip >> 24) & 0xFF) == 127) { dg_ok = 1; }
+    if (net_ip != 0) {
+        if (dst_ip == net_ip) { dg_ok = 1; }
+    }
+    if (dg_ok == 0) { return 0; }
     var tcp = pkt + ip_off;
     var src_port = (load8(tcp) << 8) | load8(tcp + 1);
     var dst_port = (load8(tcp + 2) << 8) | load8(tcp + 3);
@@ -746,7 +1434,7 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip, dst_ip) {
     if (tcp_hdr_len < 20) { return 0; }
     if (tcp_hdr_len > ip_payload_len) { return 0; }
     var flags = load8(tcp + 13);
-    var conn_id = tcp_find_conn(src_port, dst_port, src_ip);
+    var conn_id = tcp_find_conn(src_port, dst_port, src_ip, dst_ip);
     if (conn_id < 0) {
         # No active conn. Try the passive-open path: incoming SYN to a
         # LISTEN entry spawns a new SYN_RCVD conn. (1.32.0 bite A.)
@@ -756,65 +1444,42 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip, dst_ip) {
         if ((flags & 0x10) != 0) { return 0; }
         var listen_id = tcp_find_listen(dst_port);
         if (listen_id < 0) { return 0; }
-        # ⛔⛔ 1.56.51 — NO PASSIVE OPEN FROM INTERRUPT CONTEXT. The two kmallocs below take
-        # heap_spin_lock, and this function is reachable from the timer ISR and the NIC MSI handler
-        # via net_rx_drain -> net_demux_frame. A tick landing on a CPU already inside the heap
-        # critical section would spin on a lock its OWN CPU holds — a hard hang, remotely triggerable
-        # by anyone able to raise the SYN rate against a listening port.
-        # ⚠ DROPPING THE SYN IS CORRECT TCP, not a degradation: the peer retransmits, and the retry
-        # is picked up by net_poll() from syscall context (a server in an accept loop polls) or by a
-        # later tick that does not collide with the heap. Established-connection data delivery is
-        # untouched — only the ALLOCATING path declines.
-        if (net_in_isr != 0) { return 0; }
-        # Allocate a new conn slot for the incoming peer (1.45.2: reclaim-aware,
-        # shared with tcp_connect — passive opens no longer leak slots either).
-        var new_id = tcp_alloc_conn_slot();
-        if (new_id < 0) { return 0; }
-        var ncb = tcp_conn_base(new_id);
-        # Per-connection receive ring + retransmit hold (matches tcp_connect).
-        var rx_buf = kmalloc(TCP_RX_RING);
-        if (rx_buf == 0) { store64(ncb, 0); return 0; }       # leave slot CLOSED/reclaimable
-        var retx_buf = kmalloc(TCP_RETX_BUF);
-        if (retx_buf == 0) { kfree_sized(rx_buf, TCP_RX_RING); store64(ncb, 0); return 0; }
+        # ⭐ 1.57.7 (S4) — SERVED IN INTERRUPT CONTEXT BY CONSTRUCTION: no heap (the pool buffers were
+        # kmalloc'd at boot and the claim binds them), and the claim is IRQ-saved and locked (we hold
+        # tcp_tab_lock here, so it is the _locked form). Dropping the SYN in the ISR (1.56.51's refusal) was
+        # never correct TCP here, because the peer's retransmit met the same drain (issue 2026-09-23).
+        # A refused claim (table full, the SYN_RCVD cap of 4, or the passive reserve) drops the SYN and the
+        # peer retransmits.
         # ISN — RDRAND-seeded (XOR timer-LCG fallback), 1.45.6 audit fix: same
         # unguessable-ISN treatment as tcp_connect (server side matters more —
         # an off-path attacker injecting into a server conn is the worse case).
-        var isn = (rdrand_u64() ^ (timer_ticks * 64017 + 1)) & 0xFFFFFFFF;
-        store64(ncb, 6);                       # state = SYN_RCVD
-        store64(ncb + 8, dst_port);            # our src_port = listener's port
-        store64(ncb + 16, src_port);           # peer's port
-        store64(ncb + 24, src_ip);             # peer's IP
-        store64(ncb + 32, isn);                # SND.NXT (our initial seq)
-        store64(ncb + 40, (seq + 1) & 0xFFFFFFFF);  # RCV.NXT = their SYN+1
-        store64(ncb + 48, rx_buf);             # receive ring base
-        store64(ncb + 56, isn);                # SND.UNA = isn
-        store64(ncb + 64, 0);                  # rx_write
-        # meta: passive_open + parent_listen_id<<16
-        var meta = 0x200 | ((listen_id & 0xFF) << 16);
-        store64(ncb + 72, meta);
-        store64(ncb + 80, 0);                  # rx_read
-        store64(ncb + 88, 0);                  # SND.WND (learned on the ACK)
-        store64(ncb + 96, 0);                  # retx_seq
-        store64(ncb + 104, 0);                 # retx_len
-        store64(ncb + 112, 0);                 # retx_tick
-        store64(ncb + 120, 0);                 # retx_count
-        store64(ncb + 128, 0);                 # retx_flags (disarmed)
-        store64(ncb + 136, retx_buf);
+        var po_isn = (rdrand_u64() ^ (timer_ticks * 64017 + 1)) & 0xFFFFFFFF;
+        var po_meta = 0x200 | ((listen_id & 0xFF) << 16);     # passive_open + parent_listen_id<<16
         # B3: effective send MSS from the peer's SYN MSS option (clamped to ours).
-        store64(ncb + 144, tcp_eff_mss(tcp_parse_mss(tcp, tcp_hdr_len)));
-        # Send SYN+ACK (0x12), advance SND.NXT, arm its retransmit.
-        tcp_send_pkt(new_id, 0x12, 0, 0);
-        tcp_arm_retx(ncb, isn, 0x12, 0, 0);
-        store64(ncb + 32, (isn + 1) & 0xFFFFFFFF);
+        # 1.57.7 (S5): own 0 is ignored for state 6 (the child inherits its listener's stamp inside the claim);
+        # the local address is the SYN's destination, so the SYN-ACK comes FROM the address that was dialled.
+        var new_id = tcp_slot_claim_locked(6, dst_port, src_port, src_ip, po_isn, (seq + 1) & 0xFFFFFFFF, po_meta, tcp_eff_mss(tcp_parse_mss(tcp, tcp_hdr_len)), 0, dst_ip);
+        if (new_id < 0) { return 0; }
+        var ncb = tcp_conn_base(new_id);
+        # Arm the SYN+ACK's retransmit, send it, advance SND.NXT — one hold.
+        tcp_arm_retx(ncb, po_isn, 0x12, 0, 0);
+        tcp_send_pkt_seq(new_id, po_isn, 0x12, 0, 0);
+        store64(ncb + 32, (po_isn + 1) & 0xFFFFFFFF);
+        tcp_demux_touched = new_id;
         return 1;
     }
     var cb = tcp_conn_base(conn_id);
     var state = load64(cb);
     var data_len = ip_payload_len - tcp_hdr_len;
-    # B4: capture the peer's advertised window from every inbound segment (the
-    # window field is always valid — incl. the SYN-ACK, so it's set before our
-    # first send). tcp_send honors this as the usable send window.
-    store64(cb + 88, (load8(tcp + 14) << 8) | load8(tcp + 15));
+    tcp_demux_touched = conn_id;
+    # B4: the peer's advertised window. 1.57.7 (S6) STALE-WINDOW GUARD (D21, M-WSTALE): stored only from a segment
+    # that carries ACK and whose ack is not older than SND.UNA — a reordered old ACK, or a segment without ACK, no
+    # longer overwrites a newer window (a SYN-ACK / the handshake ACK acks ISN+1 >= SND.UNA = ISN, so they store).
+    var old_wnd = load64(cb + 88);
+    var seg_wnd = (load8(tcp + 14) << 8) | load8(tcp + 15);
+    if ((flags & 0x10) != 0) {
+        if (((ack - load64(cb + 56)) & 0xFFFFFFFF) < 0x40000000) { store64(cb + 88, seg_wnd); }
+    }
     # B2: an inbound ACK that covers our held (oldest unACKed) segment advances
     # SND.UNA and disarms the retransmit. seqlen counts the SYN/FIN phantom byte.
     # The `< 0x40000000` guard rejects wrapped dup-acks (ack <= retx_seq).
@@ -826,12 +1491,51 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip, dst_ip) {
             if ((rflags & 0x02) != 0) { seqlen = seqlen + 1; }
             if ((rflags & 0x01) != 0) { seqlen = seqlen + 1; }
             var diff = (ack - rseq) & 0xFFFFFFFF;
-            if (diff >= seqlen) {
-                if (diff < 0x40000000) {
+            if (diff < 0x40000000) {
+                if (diff >= seqlen) {
                     store64(cb + 56, ack);   # SND.UNA = ack
                     tcp_disarm_retx(cb);
+                    tcp_demux_wake = 1;      # 1.57.7 (S6): #48 progress / #47's SYN ACKed (M-S1)
+                    if (state == 3) { store64(cb + 112, sched_clock_us()); }   # our FIN ACKed: FIN_WAIT_2 entry
+                } elif (diff > 0 && (rflags == 0x18 || rflags == 0x19)) {
+                    # (ENDFIX S6-R1: 0x19 is a data segment with the FIN folded in by tcp_close_locked; diff < seqlen
+                    # there means diff <= retx_len, so the trim leaves the unACKed tail — possibly empty — plus the FIN.)
+                    # ⭐ 1.57.7 (S6) PARTIAL-ACK TRIM (D21, M-TRIM): the receiver took the first `diff` bytes of the
+                    # held segment (an agnos receiver accepts only seq == RCV.NXT, and the window cap can make it
+                    # take part), so resending from retx_seq would sit below its RCV.NXT forever. Drop the ACKed
+                    # prefix: a FORWARD byte loop (dst < src — the overlap is safe only in this direction).
+                    var pt_len = load64(cb + 104);
+                    var pt_b = load64(cb + 136);
+                    var pt_k = 0;
+                    while (pt_k < pt_len - diff) {
+                        store8(pt_b + pt_k, load8(pt_b + diff + pt_k));
+                        pt_k = pt_k + 1;
+                    }
+                    store64(cb + 96, ack);
+                    store64(cb + 104, pt_len - diff);
+                    store64(cb + 56, ack);
+                    store64(cb + 120, 0);
+                    tcp_demux_wake = 1;      # progress: the sender's D6 clock restarts
                 }
             }
+            # ⭐ 1.57.7 (S6) PERSIST CAP (D21, M-S7): a peer that ACKs our held DATA segment without covering it while
+            # advertising window 0 is ALIVE — cap the retry count so the probes back off to the 16 s ceiling and never
+            # exhaust (Linux persist semantics). A dead peer sends no ACK and exhausts as before.
+            if (load64(cb + 128) == 0x18 && seg_wnd == 0) {
+                if (state == 2 || state == 4) {
+                    if (load64(cb + 120) > TCP_PERSIST_CAP) { store64(cb + 120, TCP_PERSIST_CAP); }
+                }
+            }
+        }
+    }
+    # ⭐ 1.57.7 (S6) WINDOW-OPEN TRIGGER (M-S4): the held segment was sent into a zero window (and dropped); the peer
+    # just proved it is alive and has room — make the segment DUE NOW (count 0) and wake the sender, whose net_poll
+    # (or the next net_tick) resends it. One round trip per refill instead of one RTO.
+    if (state == 2 || state == 4) {
+        if (load64(cb + 128) != 0 && old_wnd == 0 && load64(cb + 88) > 0) {
+            store64(cb + 120, 0);
+            store64(cb + 112, sched_clock_us() - tcp_retx_rto(0));
+            tcp_demux_wake = 1;
         }
     }
     # SYN_SENT: expect SYN-ACK (flags & 0x12 == 0x12)
@@ -844,6 +1548,7 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip, dst_ip) {
             }
             store64(cb + 40, (seq + 1) & 0xFFFFFFFF);   # mask: TCP seq wraps at 2^32 (arc-close hardening pass 2)
             store64(cb, 2);  # ESTABLISHED
+            tcp_demux_wake = 1;                          # 1.57.7 (S6): #47
             # B3: learn the peer's MSS from the SYN-ACK option (clamp to ours).
             store64(cb + 144, tcp_eff_mss(tcp_parse_mss(tcp, tcp_hdr_len)));
             # Send ACK (flags = 0x10)
@@ -851,8 +1556,10 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip, dst_ip) {
             return 1;
         }
         if ((flags & 0x04) != 0) {
-            # RST received
+            # RST received — disarm FIRST, then CLOSED (C11; no unbind, C5)
+            tcp_disarm_retx(cb);
             store64(cb, 0);  # CLOSED
+            tcp_demux_wake = 1;                          # 1.57.7 (S6): #47 aborts at once (M-RSTWAKE)
             return 1;
         }
     }
@@ -861,7 +1568,18 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip, dst_ip) {
     # (1.32.0 bite A — passive-open handshake completion.)
     if (state == 6) {
         if ((flags & 0x04) != 0) {
+            tcp_disarm_retx(cb);   # C11: disarm before CLOSED
             store64(cb, 0);  # RST -> CLOSED
+            tcp_demux_wake = 1;
+            return 1;
+        }
+        # 1.57.7 (S4) hardening (a): a RETRANSMITTED SYN (our SYN-ACK was lost) matches this conn's 4-tuple.
+        # Re-send the SYN-ACK at the held ISN (critic C1: tcp_send_pkt_seq, SND.NXT untouched) — never treat
+        # it as data or as the handshake ACK.
+        if ((flags & 0x02) != 0 && (flags & 0x10) == 0) {
+            if (load64(cb + 128) != 0 && ((seq + 1) & 0xFFFFFFFF) == load64(cb + 40)) {
+                tcp_send_pkt_seq(conn_id, load64(cb + 96), 0x12, 0, 0);
+            }
             return 1;
         }
         if ((flags & 0x10) != 0) {
@@ -881,7 +1599,9 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip, dst_ip) {
     # ESTABLISHED: handle data, ACK, FIN, RST
     if (state == 2) {
         if ((flags & 0x04) != 0) {
+            tcp_disarm_retx(cb);   # C11: disarm before CLOSED
             store64(cb, 0);  # RST -> CLOSED
+            tcp_demux_wake = 1;                          # 1.57.7 (S6): #48 aborts
             return 1;
         }
         # B1 in-order receive ring. RCV.NXT (cb+40) is the next byte we expect;
@@ -907,56 +1627,66 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip, dst_ip) {
             var rcv = load64(cb + 40);
             if (((seq + data_len) & 0xFFFFFFFF) == rcv) {
                 store64(cb + 40, (rcv + 1) & 0xFFFFFFFF);
-                # SLOT-LEAK FIX (1.45.11): if the peer closes a passive-open conn
-                # we NEVER accepted, no application is waiting for it. tcp_accept
-                # returns only ESTABLISHED (state 2) conns, and a CLOSE_WAIT conn
-                # arms no retransmit — so tcp_retx_tick (which only reaps conns
-                # with an armed retx) would never reap it, and the 8-slot table
-                # leaks one slot per abandoned-before-accept conn until the
-                # listener wedges permanently. Found burn-free by the docker
-                # net-sweep concurrency dimension: a >8-way burst whose clients
-                # time out (FIN) before the single-threaded serve loop accepts
-                # them. Reap it now — ACK + our FIN, free the per-conn buffers,
-                # mark CLOSED (immediately reclaimable by tcp_alloc_conn_slot).
-                var fmeta = load64(cb + 72);
-                var f_reaped = 0;
-                if ((fmeta & 0x200) != 0) {            # passive-open
-                    if ((fmeta & 0x400) == 0) {        # never accept()ed
-                        tcp_send_pkt(conn_id, 0x11, 0, 0);   # FIN+ACK — we close too
-                        var frx = load64(cb + 48);
-                        if (frx != 0) { kfree_sized(frx, TCP_RX_RING); store64(cb + 48, 0); }
-                        var ftx = load64(cb + 136);
-                        if (ftx != 0) { kfree_sized(ftx, TCP_RETX_BUF); store64(cb + 136, 0); }
-                        store64(cb, 0);                # CLOSED (reclaimable)
-                        store64(cb + 128, 0);          # disarm retx
-                        f_reaped = 1;
-                    }
-                }
-                if (f_reaped == 1) { return 1; }
+                # 1.57.7 (S4, D12(ii)) — A FIN THAT ARRIVES BEFORE ACCEPT KEEPS THE CHILD. The 1.45.11 reap
+                # existed because nothing reclaimed an un-accepted CLOSE_WAIT child; since 1.57.7 it is
+                # delivered by #57 (tcp_accept returns 2|4), bounded by the passive reserve, and reaped with its
+                # listener (tcp_close_locked). A client that sends its request and FIN at once
+                # (HTTP/1.0, shutdown(SHUT_WR)) gets served instead of reset.
                 tcp_send_pkt(conn_id, 0x10, 0, 0);   # ACK the FIN
-                store64(cb, 4);  # CLOSE_WAIT (an accepted conn — the app will close it)
+                store8(cb + 73, load8(cb + 73) | 0x20);   # 1.57.7 (S6): TCP_META_PEER_FIN (bit 13)
+                store64(cb, 4);  # CLOSE_WAIT — the app reads the queued data, then #49 answers EOF
+                tcp_demux_wake = 1;
             }
         }
         # Preserve upper-bit metadata (is_listening/passive_open/accepted/
         # parent_listen_id at bits 8-23); only the low byte tracks received
         # TCP flags. (1.32.0 bite A — was a flat store before LISTEN landed.)
-        var old_meta = load64(cb + 72) & 0xFFFFFFFFFFFFFF00;
-        store64(cb + 72, old_meta | (flags & 0xFF));
+        # 1.57.7 (S4) hardening (b): a BYTE write, so the meta bits 8-23 are never read-modify-written here.
+        store8(cb + 72, flags & 0xFF);
         return 1;
     }
-    # FIN_WAIT: expect ACK or FIN-ACK
-    if (state == 3) {
+    # 1.57.7 (S4, N-5) — CLOSE_WAIT had NO demux arm: a RST was ignored and a retransmitted FIN never re-ACKed.
+    # (ACKs of data we send in CLOSE_WAIT are handled by the B2 block above, which runs for every state.)
+    if (state == 4) {
         if ((flags & 0x04) != 0) {
+            tcp_disarm_retx(cb);
             store64(cb, 0);  # RST -> CLOSED
+            tcp_demux_wake = 1;
             return 1;
         }
-        if ((flags & 0x01) != 0) {
-            store64(cb + 40, (seq + 1) & 0xFFFFFFFF);   # mask: TCP seq wraps at 2^32 (arc-close hardening pass 2)
-            tcp_send_pkt(conn_id, 0x10, 0, 0);
-            store64(cb, 0);  # CLOSED
+        if ((flags & 0x01) != 0 && ((seq + data_len + 1) & 0xFFFFFFFF) == load64(cb + 40)) {
+            tcp_send_pkt(conn_id, 0x10, 0, 0);   # re-ACK a re-sent FIN
         }
-        if ((flags & 0x10) != 0) {
-            store64(cb, 0);  # ACK of FIN -> CLOSED
+        return 1;
+    }
+    # ⭐ 1.57.7 (S6) — THE HELD FIN SLOT (state 3: FIN_WAIT_1/2, or LAST_ACK with PEER_FIN). Kernel-owned (tag 0):
+    # nobody reads it, so in-order data is consumed and DISCARDED (RCV.NXT advances, ACKed); the peer's in-order FIN
+    # sets PEER_FIN and is ACKed (a re-sent one is re-ACKed). Released on RST, and once our FIN is ACKed (the
+    # ACK-covers block above disarmed it) AND the peer's FIN has been seen. Releasing on any ACK (the 1.57.6 shape)
+    # would leave a both-sides close's second FIN un-ACKed forever (M-FW2). No wake: nobody waits on a held slot.
+    if (state == 3) {
+        if ((flags & 0x04) != 0) {
+            tcp_slot_release_locked(conn_id);
+            return 1;
+        }
+        var f3_ack = 0;
+        var f3_rcv = load64(cb + 40);
+        if (data_len > 0) {
+            if (seq == f3_rcv) { f3_rcv = (f3_rcv + data_len) & 0xFFFFFFFF; store64(cb + 40, f3_rcv); }
+            f3_ack = 1;
+        }
+        if ((flags & 0x01) != 0) {
+            if (((seq + data_len) & 0xFFFFFFFF) == f3_rcv) {
+                store64(cb + 40, (f3_rcv + 1) & 0xFFFFFFFF);
+                store8(cb + 73, load8(cb + 73) | 0x20);  # TCP_META_PEER_FIN
+                f3_ack = 1;
+            } elif (((seq + data_len + 1) & 0xFFFFFFFF) == f3_rcv) {
+                f3_ack = 1;                              # a re-sent FIN (our ACK was lost): re-ACK it
+            }
+        }
+        if (f3_ack == 1) { tcp_send_pkt(conn_id, 0x10, 0, 0); }
+        if (load64(cb + 128) == 0 && (load64(cb + 72) & TCP_META_PEER_FIN) != 0) {
+            tcp_slot_release_locked(conn_id);            # our FIN ACKed AND the peer's FIN seen
         }
         return 1;
     }
@@ -974,3 +1704,490 @@ fn tcp_state_name(state, buf) {
     net_copy_buf(buf, "?", 1);
     return 1;
 }
+
+#ifdef TCP_ADDR_SELFTEST
+# ═══ 1.57.7 (S5) TCP_ADDR_SELFTEST — IF=0 kernel arms for socket ownership, the wire martian filter, the TCP
+# destination gate, lo-only listeners, sock_peer and UDP ownership (scripts/smoke/sock-owner-smoke.sh boot A).
+# Runs pre-scheduler at IF=0 with the static SLIRP net_ip. ⛔ NEVER net_poll / tcp_connect / udp_recv_from / a
+# timer wait here: timer_ticks does not advance at IF=0. Loopback frames are delivered with net_lo_drain; test
+# SYNs are LOOPBACK-sourced (127.0.0.9 / net_ip) so every provoked SYN-ACK lands in the lo queue (the one
+# wire-bound reply is A5c's legit one). Owners: X = pid 15 (tag 16, epoch E), Y = pid 13 (tag 14, epoch EY),
+# stranger = pid 14. Synthetic non-zero epochs so an unstamped (0) epoch can never pass. Order is binding.
+# ⚠ MODULE SCOPE: `var x[N]` here is N u64 (tcpaddr_frame = 128 B holds the 54-byte frame).
+var tcpaddr_frame[16];
+var tcpaddr_ubuf[8];
+var tcpaddr_ok = 1;
+var tcpaddr_ipo = 0;
+var tcpaddr_pto = 0;
+var ta_E = 0x5A5A;
+var ta_EY = 0x3C3C;
+var ta_LA = 0;
+var ta_KA = 0;
+var ta_k = 0;
+var ta_cur = 0;
+
+fn ta_res(tr_u, tr_id, tr_n, tr_pass, tr_v) {
+    if (tr_u == 1) { kprint("udpown: ", 8); } else { kprint("tcpaddr: ", 9); }
+    kprint(tr_id, tr_n);
+    if (tr_pass == 1) { kprintln(" OK", 3); return 1; }
+    tcpaddr_ok = 0;
+    kprint(" FAIL v=", 8);
+    kprint_hex(tr_v);
+    kprintln("", 0);
+    return 0;
+}
+fn ta_put16(p, v) { store8(p, (v >> 8) & 0xFF); store8(p + 1, v & 0xFF); return 0; }
+fn ta_put32(p, v) { ta_put16(p, (v >> 16) & 0xFFFF); ta_put16(p + 2, v & 0xFFFF); return 0; }
+# eth(0x0800) + IPv4 (0x45, total 40, TTL 64, proto 6) + a 20-byte TCP header (window 0x0400); checksums per
+# S4-C13 (fields zeroed, then the IP header sum and the TCP pseudo-header sum). Returns 54.
+fn tcpaddr_frame_build(fb_src, fb_dst, fb_sp, fb_dp, fb_seq, fb_ack, fb_fl) {
+    var fb = &tcpaddr_frame;
+    var fbi = 0;
+    while (fbi < 128) { store8(fb + fbi, 0); fbi = fbi + 1; }
+    store8(fb + 12, 0x08);
+    store8(fb + 14, 0x45);
+    store8(fb + 17, 40);
+    store8(fb + 22, 64);
+    store8(fb + 23, 6);
+    ta_put32(fb + 26, fb_src);
+    ta_put32(fb + 30, fb_dst);
+    ta_put16(fb + 34, fb_sp);
+    ta_put16(fb + 36, fb_dp);
+    ta_put32(fb + 38, fb_seq);
+    ta_put32(fb + 42, fb_ack);
+    store8(fb + 46, 0x50);
+    store8(fb + 47, fb_fl);
+    store8(fb + 48, 0x04);
+    ta_put16(fb + 24, ip_checksum(fb + 14, 20));
+    ta_put16(fb + 50, tcp_checksum_compute(fb_src, fb_dst, fb + 34, 20));
+    return 54;
+}
+# A pure SYN (seq 1000). wire 1 = through net_wire_frame (the NIC entry), 0 = straight into the demux (lo).
+fn ta_syn(sy_src, sy_dst, sy_sp, sy_dp, sy_wire) {
+    tcpaddr_frame_build(sy_src, sy_dst, sy_sp, sy_dp, 1000, 0, 0x02);
+    if (sy_wire == 1) { return net_wire_frame(&tcpaddr_frame, 54); }
+    return net_demux_frame(&tcpaddr_frame, 54);
+}
+fn ta_find(tf_s, tf_d, tf_ip) {
+    var tf_f = tcp_lock();
+    var tf_r = tcp_find_conn(tf_s, tf_d, tf_ip, 0);
+    tcp_unlock(tf_f);
+    return tf_r;
+}
+# The full 5-tuple, by a direct scan (independent of the demux's own lookup — what A6d tests).
+fn ta_find4(f4_s, f4_d, f4_ip, f4_lip) {
+    var f4_f = tcp_lock();
+    var f4_r = 0 - 1;
+    for (var f4_i = 0; f4_i < tcp_conn_count; f4_i = f4_i + 1) {
+        var f4_cb = tcp_conn_base(f4_i);
+        if (load64(f4_cb) != 0 && load64(f4_cb + 8) == f4_d && load64(f4_cb + 16) == f4_s && load64(f4_cb + 24) == f4_ip && load64(f4_cb + 168) == f4_lip) { f4_r = f4_i; }
+    }
+    tcp_unlock(f4_f);
+    return f4_r;
+}
+fn ta_ld(tl_id, tl_off) { return load64(tcp_conn_base(tl_id) + tl_off); }
+fn ta_st(ts_id, ts_off, ts_v) {           # a store under the lock (test surgery on a slot)
+    var tsf = tcp_lock();
+    store64(tcp_conn_base(ts_id) + ts_off, ts_v);
+    tcp_unlock(tsf);
+    return 0;
+}
+fn ta_reusable(tu_id) {
+    var tuf = tcp_lock();
+    var tur = tcp_slot_reusable(tcp_conn_base(tu_id));
+    tcp_unlock(tuf);
+    return tur;
+}
+fn ta_has_tag(tg_t) {                      # 1 when any TCP slot carries owner tag tg_t
+    var tgr = 0;
+    for (var tgi = 0; tgi < tcp_conn_count; tgi = tgi + 1) {
+        if (ta_ld(tgi, 152) == tg_t) { tgr = 1; }
+    }
+    return tgr;
+}
+
+fn ta_b1() {
+    # O0 — owner stamp on a LISTEN; a kernel LISTEN is tag 0.
+    ta_LA = tcp_listen_owned(7172, 16, 0);
+    ta_KA = tcp_listen(7173);
+    var o0 = 0;
+    if (ta_LA >= 0 && ta_KA >= 0) {
+        if (ta_ld(ta_LA, 152) == 16 && ta_ld(ta_LA, 160) == ta_E && ta_ld(ta_LA, 168) == 0 && ta_ld(ta_KA, 152) == 0) { o0 = 1; }
+    }
+    ta_res(0, "O0", 2, o0, ta_LA);
+    # A6 — a passive child inherits the LISTENER's stamp; its local address is the SYN's destination.
+    ta_syn(net_ip, net_ip, 5001, 7172, 0);
+    ta_k = ta_find(5001, 7172, net_ip);
+    var a6 = 0;
+    if (ta_k >= 0) {
+        if (ta_ld(ta_k, 0) == 6 && ta_ld(ta_k, 152) == 16 && ta_ld(ta_k, 160) == ta_E && ta_ld(ta_k, 168) == net_ip) { a6 = 1; }
+    }
+    ta_res(0, "A6", 2, a6, ta_k);
+    net_lo_drain();
+    # A9 — tcp_auth: the owner's current incarnation only.
+    var a9 = 1;
+    proc_current_set(15);
+    if (tcp_auth(ta_k) != ta_k) { a9 = 0; }
+    if (tcp_auth(ta_LA) != ta_LA) { a9 = 0; }
+    if (tcp_auth(ta_KA) != 0 - 1) { a9 = 0; }
+    store64(&proc_epoch + 15 * 8, ta_E + 1);
+    if (tcp_auth(ta_k) != 0 - 1) { a9 = 0; }
+    store64(&proc_epoch + 15 * 8, ta_E);
+    proc_current_set(14);
+    if (tcp_auth(ta_k) != 0 - 1) { a9 = 0; }
+    proc_current_set(ta_cur);
+    ta_res(0, "A9", 2, a9, 0);
+    # A12 — Q1: an owned dead conn is HELD; an unaccepted passive child is not.
+    var c = tcp_slot_claim(1, 40100, 7999, 0x0A000202, 1, 0, 0, 536, 14, net_ip);
+    var a12 = 0;
+    if (c >= 0) {
+        ta_st(c, 0, 0);
+        if (ta_reusable(c) == 0) { a12 = 1; }
+        ta_st(ta_k, 0, 0);
+        if (ta_reusable(ta_k) != 1) { a12 = 0; }
+        ta_st(ta_k, 0, 6);
+    }
+    ta_res(0, "A12", 3, a12, c);
+    # A12b — the passive-reserve counter counts only reusable slots (c is state 0 but not free).
+    var a12f = tcp_lock();
+    var a12fr = tcp_free_slots_locked();
+    var a12re = 8 - tcp_conn_count;
+    var a12nv = 8 - tcp_conn_count;
+    for (var a12i = 0; a12i < tcp_conn_count; a12i = a12i + 1) {
+        if (tcp_slot_reusable(tcp_conn_base(a12i)) == 1) { a12re = a12re + 1; }
+        if (load64(tcp_conn_base(a12i)) == 0) { a12nv = a12nv + 1; }
+    }
+    tcp_unlock(a12f);
+    var a12b = 0;
+    if (c >= 0 && a12fr == a12re && a12fr == a12nv - 1) { a12b = 1; }
+    ta_res(0, "A12b", 4, a12b, a12fr);
+    # A15 — tcp_slot_release_if by gen, and the release tail unstamps.
+    var a15 = 0;
+    if (c >= 0) {
+        var a15g = tcp_conn_gen_get(c);
+        if (tcp_slot_release_if(c, 0, a15g + 1) == 0 && ta_ld(c, 152) == 14) {
+            if (tcp_slot_release_if(c, 0, a15g) == 1) {
+                if (ta_ld(c, 0) == 0 && ta_ld(c, 152) == 0 && ta_ld(c, 160) == 0 && ta_reusable(c) == 1) { a15 = 1; }
+            }
+        }
+    }
+    ta_res(0, "A15", 3, a15, c);
+    # A13 — a live duplicate 4-tuple is refused (state 1).
+    var d1 = tcp_slot_claim(1, 40101, 7998, 0x0A000202, 1, 0, 0, 536, 14, net_ip);
+    var d2 = tcp_slot_claim(1, 40101, 7998, 0x0A000202, 1, 0, 0, 536, 14, net_ip);
+    var a13 = 0;
+    if (d1 >= 0 && d2 == 0 - 1) {
+        if (tcp_close_own(d1, 14) == 0) { a13 = 1; }
+    }
+    ta_res(0, "A13", 3, a13, d2);
+    # A14 — the gen is part of the snapshot, alone (tag + epoch equal), on an owned and a tag-0 conn.
+    var e = tcp_slot_claim(1, 40102, 7997, 0x0A000202, 1, 0, 0, 536, 14, net_ip);
+    var z = tcp_slot_claim(1, 40103, 7996, 0x0A000202, 1, 0, 0, 536, 0, net_ip);
+    var a14 = 0;
+    if (e >= 0 && z >= 0) {
+        a14 = 1;
+        var a14g = tcp_conn_gen_get(e);
+        var a14gz = tcp_conn_gen_get(z);
+        if (tcp_same(e, 14, ta_EY, a14g) != 1) { a14 = 0; }
+        var a14f = tcp_lock();
+        store64(&tcp_conn_gen + e * 8, a14g + 1);
+        if (tcp_same_locked(e, 14, ta_EY, a14g) != 0) { a14 = 0; }
+        store64(&tcp_conn_gen + e * 8, a14g);
+        store64(&tcp_conn_gen + z * 8, a14gz + 1);
+        if (tcp_same_locked(z, 0, 0, a14gz) != 0) { a14 = 0; }
+        store64(&tcp_conn_gen + z * 8, a14gz);
+        tcp_unlock(a14f);
+        if (tcp_same(z, 0, 0, a14gz) != 1) { a14 = 0; }
+        tcp_close_own(e, 14);
+        if (tcp_same(e, 14, ta_EY, a14g) != 0) { a14 = 0; }
+        tcp_close(z);
+    }
+    ta_res(0, "A14", 3, a14, e);
+    # A7a — tcp_release_pid is epoch-aware: a stale-epoch stamp is not this incarnation's.
+    var a7a = 0;
+    if (ta_ld(ta_LA, 0) == 5 && ta_ld(ta_LA, 152) == 16 && ta_ld(ta_k, 0) == 6 && ta_ld(ta_k, 152) == 16) {
+        ta_st(ta_LA, 160, ta_E + 1);
+        ta_st(ta_k, 160, ta_E + 1);
+        tcp_release_pid(15);
+        if (ta_ld(ta_LA, 0) == 5 && ta_ld(ta_LA, 152) == 16 && ta_ld(ta_k, 0) == 6 && ta_ld(ta_k, 152) == 16) { a7a = 1; }
+        ta_st(ta_LA, 160, ta_E);
+        ta_st(ta_k, 160, ta_E);
+    }
+    ta_res(0, "A7a", 3, a7a, 0);
+    # A7c — closing an owned LISTEN reaps its unaccepted child = RELEASED (not held).
+    var lr = tcp_listen_owned(7174, 16, 0);
+    ta_syn(net_ip, net_ip, 5009, 7174, 0);
+    var r = ta_find(5009, 7174, net_ip);
+    var a7c = 0;
+    if (lr >= 0 && r >= 0) {
+        if (tcp_close_own(lr, 16) == 0) {
+            if (ta_ld(r, 0) == 0 && ta_ld(r, 152) == 0 && ta_ld(lr, 0) == 0) { a7c = 1; }
+        }
+    }
+    ta_res(0, "A7c", 3, a7c, r);
+    net_lo_drain();
+    # A7b — death: X's LISTEN + child released and unstamped (pool buffer kept); Y's HELD state-0 slot released.
+    var h = tcp_slot_claim(1, 40104, 7995, 0x0A000202, 1, 0, 0, 536, 14, net_ip);
+    var a7b = 0;
+    if (h >= 0) {
+        ta_st(h, 0, 0);
+        tcp_release_pid(15);
+        tcp_release_pid(13);
+        a7b = 1;
+        if (ta_ld(ta_LA, 0) != 0 || ta_ld(ta_LA, 152) != 0 || ta_ld(ta_LA, 160) != 0 || ta_ld(ta_LA, 48) != 0) { a7b = 0; }
+        if (ta_ld(ta_k, 0) != 0 || ta_ld(ta_k, 152) != 0 || ta_ld(ta_k, 160) != 0 || ta_ld(ta_k, 48) != 0) { a7b = 0; }
+        if (ta_ld(ta_LA, 136) != load64(&tcp_pool_retx + ta_LA * 8)) { a7b = 0; }
+        if (ta_ld(ta_k, 136) != load64(&tcp_pool_retx + ta_k * 8)) { a7b = 0; }
+        if (ta_ld(h, 152) != 0 || ta_reusable(h) != 1) { a7b = 0; }
+        if (ta_has_tag(14) == 1 || ta_has_tag(16) == 1) { a7b = 0; }
+    }
+    ta_res(0, "A7b", 3, a7b, h);
+    return 0;
+}
+
+fn ta_b2() {
+    # A1 — a wire SYN to 127/8 is a martian (dropped at net_wire_frame, counted).
+    var lo = tcp_listen_owned(7170, 16, 1);
+    var any = tcp_listen(7171);
+    var m0 = net_drop_martian;
+    ta_syn(0x0A000202, 0x7F000001, 5001, 7170, 1);
+    var a1 = 0;
+    if (lo >= 0 && any >= 0 && net_drop_martian == m0 + 1 && ta_find(5001, 7170, 0x0A000202) < 0) { a1 = 1; }
+    ta_res(0, "A1", 2, a1, net_drop_martian - m0);
+    # A2 — a LOOPBACK listener admits a SYN addressed to 127/8; the child speaks from 127.0.0.1.
+    ta_syn(0x7F000009, 0x7F000001, 5001, 7170, 0);
+    var mm = ta_find(5001, 7170, 0x7F000009);
+    var a2 = 0;
+    if (mm >= 0) {
+        if (ta_ld(mm, 0) == 6 && ta_ld(mm, 168) == 0x7F000001 && ta_ld(mm, 152) == 16) { a2 = 1; }
+    }
+    ta_res(0, "A2", 2, a2, mm);
+    net_lo_drain();
+    # A6c — a dial to 127.0.0.2 is answered FROM 127.0.0.2 (the newest lo frame is the SYN-ACK).
+    var a6lc = lo_count;
+    ta_syn(0x7F000009, 0x7F000002, 5007, 7170, 0);
+    var a6ch = ta_find(5007, 7170, 0x7F000009);
+    var a6c = 0;
+    if (a6ch >= 0 && ta_ld(a6ch, 168) == 0x7F000002 && lo_count == a6lc + 1) {
+        var a6fr = &lo_ring + ((lo_tail - 1) & 7) * 1536;
+        if (load8(a6fr + 26) == 127 && load8(a6fr + 27) == 0 && load8(a6fr + 28) == 0 && load8(a6fr + 29) == 2) { a6c = 1; }
+    }
+    ta_res(0, "A6c", 3, a6c, a6ch);
+    net_lo_drain();
+    # A6d — (1.57.7 ENDFIX, S5-R1) the SAME (source port, dest port, source ip) dialled at a SECOND 127/8 address is
+    # a new connection: the demux keys on the local address (+168) too, so the SYN to 127.0.0.3 opens its own child
+    # that answers from 127.0.0.3, instead of first-matching the A6c child (which it must not touch).
+    var a6dm = 0;
+    if (a6ch >= 0) { a6dm = ta_ld(a6ch, 72); }
+    ta_syn(0x7F000009, 0x7F000003, 5007, 7170, 0);
+    var a6dd = ta_find4(5007, 7170, 0x7F000009, 0x7F000003);
+    var a6d = 0;
+    if (a6ch >= 0 && a6dd >= 0 && a6dd != a6ch) {
+        if (ta_ld(a6dd, 0) == 6 && ta_ld(a6ch, 0) == 6 && ta_ld(a6ch, 72) == a6dm) { a6d = 1; }
+    }
+    ta_res(0, "A6d", 3, a6d, a6dd);
+    net_lo_drain();
+    # A3a — a LOOPBACK listener refuses a SYN addressed to net_ip (bind(127.0.0.1) semantics), in the claim.
+    var lr0 = tcp_lo_only_refused;
+    ta_syn(net_ip, net_ip, 5002, 7170, 0);
+    var a3a = 0;
+    if (ta_find(5002, 7170, net_ip) < 0 && tcp_lo_only_refused == lr0 + 1) { a3a = 1; }
+    ta_res(0, "A3a", 3, a3a, tcp_lo_only_refused - lr0);
+    # A3b — the same bytes to an ANY listener are admitted from lo.
+    ta_syn(net_ip, net_ip, 5003, 7171, 0);
+    var a3bc = ta_find(5003, 7171, net_ip);
+    var a3b = 0;
+    if (a3bc >= 0) { a3b = 1; tcp_close(a3bc); }
+    ta_res(0, "A3b", 3, a3b, a3bc);
+    net_lo_drain();
+    # A4 — a broadcast destination is not a martian, and the TCP destination gate refuses it.
+    var m4 = net_drop_martian;
+    ta_syn(0x0A000202, 0xFFFFFFFF, 5004, 7171, 1);
+    var a4 = 0;
+    if (net_drop_martian == m4 && ta_find(5004, 7171, 0x0A000202) < 0) { a4 = 1; }
+    ta_res(0, "A4", 2, a4, net_drop_martian - m4);
+    # A5a / A5b / A5d — wire sources 127/8, our own address, >= 224: martians, no child.
+    var m5 = net_drop_martian;
+    ta_syn(0x7F000001, net_ip, 5005, 7171, 1);
+    var a5a = 0;
+    if (net_drop_martian == m5 + 1 && ta_find(5005, 7171, 0x7F000001) < 0) { a5a = 1; }
+    ta_res(0, "A5a", 3, a5a, net_drop_martian - m5);
+    ta_syn(net_ip, net_ip, 5006, 7171, 1);
+    var a5b = 0;
+    if (net_drop_martian == m5 + 2 && ta_find(5006, 7171, net_ip) < 0) { a5b = 1; }
+    ta_res(0, "A5b", 3, a5b, net_drop_martian - m5);
+    ta_syn(0xFFFFFFFF, net_ip, 5008, 7171, 1);
+    var a5d = 0;
+    if (net_drop_martian == m5 + 3 && ta_find(5008, 7171, 0xFFFFFFFF) < 0) { a5d = 1; }
+    ta_res(0, "A5d", 3, a5d, net_drop_martian - m5);
+    # A5c — a legit wire SYN to net_ip still gets through (the filter does not eat real traffic).
+    var m5c = net_drop_martian;
+    ta_syn(0x0A000202, net_ip, 5011, 7171, 1);
+    var a5cc = ta_find(5011, 7171, 0x0A000202);
+    var a5c = 0;
+    if (a5cc >= 0 && net_drop_martian == m5c) { a5c = 1; tcp_close(a5cc); }
+    ta_res(0, "A5c", 3, a5c, a5cc);
+    # A2z — cleanup: closing LO reaps its children (m, the A6c child).
+    var a2z = 0;
+    if (tcp_close_own(lo, 16) == 0) {
+        if (mm >= 0 && ta_ld(mm, 0) == 0 && a6ch >= 0 && ta_ld(a6ch, 0) == 0) { a2z = 1; }
+    }
+    tcp_close(any);
+    net_lo_drain();
+    ta_res(0, "A2z", 3, a2z, lo);
+    return 0;
+}
+
+fn ta_b3() {
+    # A10 — a non-owner's VFS_SOCK fd over an owned conn is inert (read/write -1, close = no-op release).
+    var lv = tcp_listen_owned(7177, 16, 0);
+    ta_syn(net_ip, net_ip, 5013, 7177, 0);
+    var v = ta_find(5013, 7177, net_ip);
+    var a10 = 0;
+    if (lv >= 0 && v >= 0) {
+        a10 = 1;
+        proc_current_set(14);
+        var sfd = vfs_create_sock(v);
+        if (sfd < 0) { a10 = 0; }
+        if (vfs_read(sfd, &tcpaddr_ubuf, 8) != 0 - 1) { a10 = 0; }
+        if (vfs_write(sfd, "Z", 1) != 0 - 1) { a10 = 0; }
+        if (tcp_fd_owner(v) != 0 - 1) { a10 = 0; }
+        vfs_close(sfd);
+        if (ta_ld(v, 0) != 6 || ta_ld(v, 152) != 16) { a10 = 0; }
+        proc_current_set(15);
+        if (tcp_fd_owner(v) != 16) { a10 = 0; }
+        if (tcp_fd_owner(ta_KA) != 0) { a10 = 0; }
+        proc_current_set(ta_cur);
+    }
+    ta_res(0, "A10", 3, a10, v);
+    net_lo_drain();
+    # A16 — accept returns only a child that carries the listener's stamp.
+    var a16 = 0;
+    if (lv >= 0 && v >= 0) {
+        tcpaddr_frame_build(net_ip, net_ip, 5013, 7177, 1001, (ta_ld(v, 56) + 1) & 0xFFFFFFFF, 0x10);
+        net_demux_frame(&tcpaddr_frame, 54);
+        if (ta_ld(v, 0) == 2) {
+            ta_st(v, 152, 14);
+            if (tcp_accept_own(lv, 16) == 0 - 1) {
+                ta_st(v, 152, 16);
+                if (tcp_accept_own(lv, 16) == v) { a16 = 1; }
+            }
+            ta_st(v, 152, 16);
+        }
+        tcp_close_own(lv, 16);
+        tcp_close_own(v, 16);
+    }
+    ta_res(0, "A16", 3, a16, ta_ld(v, 0));
+    net_lo_drain();
+    return 0;
+}
+
+fn ta_b4() {
+    # A8 — sock_peer's encoding and its owner check.
+    var lp = tcp_listen_owned(7176, 16, 1);
+    ta_syn(0x7F000009, 0x7F000001, 5012, 7176, 0);
+    var p = ta_find(5012, 7176, 0x7F000009);
+    var a8 = 0;
+    if (lp >= 0 && p >= 0) {
+        var a8w = (0x7F000009 << 16) | 5012;
+        if (tcp_peer_raw(tcp_conn_base(p)) == a8w && tcp_peer_pack(0x7F000009, 5012) == a8w) {
+            if (tcp_peer_raw(tcp_conn_base(lp)) == 0 - 1 && tcp_peer_own(p, 16) == a8w && tcp_peer_own(p, 14) == 0 - 1) { a8 = 1; }
+        }
+        tcp_close_own(lp, 16);
+    }
+    ta_res(0, "A8", 2, a8, p);
+    net_lo_drain();
+    return 0;
+}
+
+fn ta_b5() {
+    # U1 — UDP owner stamp + udp_auth (incarnation-aware; a kernel port never passes).
+    var u = udp_bind_owned(7190, 16);
+    var kb = udp_bind(7192);
+    var u1 = 0;
+    if (u >= 0 && kb >= 0) {
+        u1 = 1;
+        if (load64(udp_listener_base(u) + 48) != 16 || load64(udp_listener_base(u) + 56) != ta_E) { u1 = 0; }
+        proc_current_set(15);
+        if (udp_auth(u) != u) { u1 = 0; }
+        if (udp_auth(kb) != 0 - 1) { u1 = 0; }
+        store64(&proc_epoch + 15 * 8, ta_E + 1);
+        if (udp_auth(u) != 0 - 1) { u1 = 0; }
+        store64(&proc_epoch + 15 * 8, ta_E);
+        proc_current_set(14);
+        if (udp_auth(u) != 0 - 1) { u1 = 0; }
+        proc_current_set(ta_cur);
+    }
+    ta_res(1, "U1", 2, u1, u);
+    # U2 — a loopback udp_send returns the frame length (payload + 42); only the owner can take the datagram.
+    var u2 = 0;
+    var u2r = udp_send(0x7F000001, 7195, 7190, "UDPK", 4);
+    net_lo_drain();
+    if (u >= 0) {
+        tcpaddr_ipo = 0;
+        tcpaddr_pto = 0;
+        var u2f = udp_begin();
+        var u2n = udp_take_own(u, &tcpaddr_ubuf, 64, &tcpaddr_ipo, &tcpaddr_pto, 16);
+        var u2x = udp_take_own(u, &tcpaddr_ubuf, 64, 0, 0, 0);
+        udp_end(u2f);
+        if (u2r == 46 && u2n == 4 && u2x == 0 - 2 && tcpaddr_ipo == 0x7F000001 && tcpaddr_pto == 7195) {
+            var u2b = &tcpaddr_ubuf;
+            if (load8(u2b) == 85 && load8(u2b + 1) == 68 && load8(u2b + 2) == 80 && load8(u2b + 3) == 75) { u2 = 1; }
+        }
+    }
+    ta_res(1, "U2", 2, u2, u2r);
+    # U3 — #52's source-port rule.
+    var u3 = 0;
+    if (udp_sport_ok(7190, 14) == 0 && udp_sport_ok(7190, 16) == 1 && udp_sport_ok(7191, 14) == 1 && udp_sport_ok(7192, 16) == 0) { u3 = 1; }
+    ta_res(1, "U3", 2, u3, 0);
+    # U4 — udp_release_pid: the listener is released (pool buffer kept), the kernel's is untouched.
+    var u4 = 0;
+    if (u >= 0 && kb >= 0) {
+        udp_release_pid(15);
+        var u4b = udp_listener_base(u);
+        if (load64(u4b) == 0 && load64(u4b + 48) == 0 && load64(u4b + 16) == load64(&udp_pool_buf + u * 8) && load64(udp_listener_base(kb)) == 1) {
+            var u4r = udp_bind(7190);
+            if (u4r >= 0) {
+                udp_unbind(u4r);
+                if (udp_unbind(kb) == 0) { u4 = 1; }
+            }
+        }
+    }
+    ta_res(1, "U4", 2, u4, u);
+    return 0;
+}
+
+fn tcp_addr_selftest() {
+    if (net_ip == 0) {
+        kprintln("tcpaddr: PRE FAIL (net_ip 0)", 28);
+        kprintln("tcpaddr: DONE", 13);
+        return 0;
+    }
+    ta_cur = proc_current_get();
+    var sv13 = load64(&proc_epoch + 13 * 8);
+    var sv15 = load64(&proc_epoch + 15 * 8);
+    store64(&proc_epoch + 15 * 8, ta_E);
+    store64(&proc_epoch + 13 * 8, ta_EY);
+    net_lo_drain();
+    ta_b1();
+    ta_b2();
+    ta_b3();
+    ta_b4();
+    ta_b5();
+    # Z — nothing owned by X or Y is left, TCP or UDP.
+    tcp_close(ta_KA);
+    net_lo_drain();
+    var zz = 1;
+    if (ta_has_tag(14) == 1 || ta_has_tag(16) == 1) { zz = 0; }
+    for (var zi = 0; zi < udp_listener_count; zi = zi + 1) {
+        if (load64(udp_listener_base(zi) + 48) == 16) { zz = 0; }
+    }
+    ta_res(0, "Z", 1, zz, 0);
+    if (tcpaddr_ok == 1) { kprintln("tcpaddr: ALL OK", 15); }
+    store64(&proc_epoch + 13 * 8, sv13);
+    store64(&proc_epoch + 15 * 8, sv15);
+    proc_current_set(ta_cur);
+    kprintln("tcpaddr: DONE", 13);
+    return 0;
+}
+#endif

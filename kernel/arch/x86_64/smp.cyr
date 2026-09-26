@@ -164,8 +164,8 @@ fn proctab_spin_unlock() {
 # FIXED-GLOBAL xchg spinlock (byte-copy of heap_spin_lock/heap_spin_unlock above with the
 # global renamed — NO parameter, so the asm [rbp-N] offsets are the proven-correct
 # old@[rbp-0x08]/addr@[rbp-0x10]; a parameterized variant DEADLOCKED kmalloc, smp.cyr:38-46).
-# sched_lock serializes do_context_switch + sys_sched_yield (the pick+save+state-flips+on_cpu
-# fence). The protected section does NO FS/alloc/console/nvme/ahci I/O and NEVER calls
+# sched_lock serializes do_context_switch (both switch paths since 1.57.7: the timer's and the voluntary
+# int-0xE0 one) and the wait/wake state flips (sched.cyr wq_*). The protected section does NO FS/alloc/console/nvme/ahci I/O and NEVER calls
 # proc_alloc_slot/proc_create/kthread_create (which take proctab_lock) — and acquires NOTHING.
 # ⭐ 1.57.6 (Path 2, S3.1): sched_lock is the INNERMOST LEAF, taken only with IF=0 (this block used to call
 # it "OUTERMOST/non-leaf", which was true only because nothing ever nested it). Any subsystem lock may be
@@ -176,12 +176,10 @@ fn proctab_spin_unlock() {
 # store in the switch tail (sched.cyr sched_frame_iretq), after RSP has left old's kernel stack and after
 # cr3_load(new). on_cpu == -1 ⇔ no CPU is on that proc's stack and none has its CR3; every reader that
 # sees a stale non-(-1) value (sched_next's skip, the reap fence, proc_alloc_slot's reuse scan) only waits.
-# RE-ENTRY SAFETY (load-bearing): both holders run IF=0. do_context_switch runs from the
-# timer ISR (IF=0, the ISR gate clears IF). sys_sched_yield runs IF=0 because SFMASK MSR
-# 0xC0000084 = 0x40700 INCLUDES IF (0x200) so SYSCALL entry clears it (syscall_hw.cyr:179) —
-# the L336 IF=1 guard reads the CALLER's captured user RFLAGS, not the live kernel IF. So no
-# same-CPU timer can land inside a held sched_lock and re-acquire it (INV-5). If SFMASK ever
-# narrows to not mask IF, sys_sched_yield needs cli/sti around the lock.
+# RE-ENTRY SAFETY (load-bearing): every holder runs IF=0. do_context_switch runs from the
+# timer ISR or resched_isr (both interrupt gates clear IF); the wq_* entries assert IF=0 (syscalls by SFMASK
+# 0x40700, kmain/ktest callers bracket with kbd_irq_save), and the ISR-reachable wakers (wq_wake/wq_interrupt)
+# save IF themselves. So no same-CPU interrupt can land inside a held sched_lock and re-acquire it (INV-5).
 # INERT single-core: the xchg always wins uncontended → byte-identical boot (INV-10).
 var sched_lock = 0;
 # 1.46.x SMP sub-bite 6b (INERT until smp_wake_enabled=1 at sub-bite 7):
@@ -236,7 +234,7 @@ fn sched_spin_unlock() {
 # Replaces the non-atomic `net_poll_busy` flag (net_ingress.cyr). net_rx_drain is the single consumer
 # of the ONE shared r8169 RX ring (net_rx_pkt / r8169_rx_idx) + the RX dispatch tables (arp_cache /
 # net_udp_buf / tcp_conns). Pre-STEP-2 it had two callers, BOTH on the BSP — the timer ISR (pic.cyr,
-# pcpu_cpu()==0-gated) and a ring-3 tool's net_poll() in its IF=1 sleep_ms window — so the plain flag
+# pcpu_cpu()==0-gated) and a ring-3 tool's net_poll() in its IF=1 preempt-held sti window (sleep_ms#41's pre-1.57.7 body) — so the plain flag
 # fully serialized them (a same-CPU timer landing mid-drain saw busy=1 → no-op). Under smp_sched_aps=1
 # a BACKGROUND net program on an AP can call a net syscall → net_poll() → net_rx_drain CONCURRENTLY
 # with the BSP ISR drain: the non-atomic flag's check-then-set RMW races across CPUs → both drain the
@@ -247,20 +245,12 @@ fn sched_spin_unlock() {
 # if the BSP timer ISR fires while net_rx_lock is held (by THIS CPU's interrupted net_poll, or ANOTHER
 # CPU's drain), the ISR's net_rx_drain just fails the trylock and returns 0 (skips) — exactly the old
 # flag's "timer tick mid-drain is a no-op", now correct cross-CPU. A spinlock here WOULD self-deadlock
-# (a same-CPU held lock can never be released by the spinning ISR). LEAF lock: the RX dispatch path
-# (net_handle_arp/icmp/udp/tcp) touches only static arrays — no kmalloc/pmm — so net_rx_lock nests
-# under nothing (acquires no other lock). FIXED-GLOBAL (no param): old@[rbp-0x08]/addr@[rbp-0x10],
-# the proven-correct frame (smp.cyr:38-46). INERT single-core: xchg uncontended → byte-identical.
-# RESIDUAL (deferred, NOT reachable in the foreground-net model): two net-state accesses remain outside
-# this lock — (1) the TX side (nic_send/tcp_send/tcp_connect mutating tcp_conns/arp_cache from a net
-# syscall), and (2) the RX CONSUMER-READ side (1.46.8 pre-burn review #3): net_recv_udp/tcp_recv call
-# net_poll() — which acquires AND RELEASES net_rx_lock around the drain — then read the shared net_udp_buf
-# / tcp_conns rx-ring AFTER the release, so a concurrent ISR/AP drain could overwrite the buffer between
-# the drain and the read. Closing both needs short-held fine-grained conn-table locking that never spans
-# the blocking 8 s tcp_connect poll (holding net_rx_lock across it would STARVE the BSP RX drain) and
-# never self-deadlocks the RX-dispatch→ACK-send path (or has net_poll copy the payload out under the lock).
-# Both are only reachable once a net program runs on an AP (a background net tool); the current net stack
-# runs foreground on the BSP (all net state BSP-serial). Tracked for a follow-on.
+# (a same-CPU held lock can never be released by the spinning ISR). The RX dispatch takes the net chain
+# (tcp_tab < net_tx < lo_q) and udp_lock, all IRQ-saved; it never allocates, never prints, and never takes
+# a lock that is not IRQ-safe on its own CPU (1.57.7 S4). FIXED-GLOBAL (no param): old@[rbp-0x08]/
+# addr@[rbp-0x10], the proven-correct frame (smp.cyr:38-46). INERT single-core: xchg uncontended.
+# 1.57.7 (S6): the ICMP request state (icmp_seq, the per-pid reply slots, the counters) is icmp_lock's (below).
+# Every other net structure is covered by the net chain or udp_lock (docs/architecture/net-concurrency.md).
 var net_rx_lock = 0;
 fn net_rx_trylock() {
     var old = 1;
@@ -285,6 +275,251 @@ fn net_rx_unlock() {
     return 0;
 }
 
+# ═══ 1.57.7 (S7) — ATOMIC SIGNAL BITS + THE KLUG LOCK (docs/architecture/process-lifecycle.md) ═══
+# atomic_or64 / atomic_and64: a `lock`-prefixed RMW on one u64. Every proc_signals update goes through them (kill#16's
+# pending bits, SIGCONT's bit 18, SIGCHLD at death, proc_send_signal) and signalfd's read clears with atomic_and64 —
+# a plain load/store there erased any bit another CPU set between the load and the store (D-4).
+# Asm-bearing => not regalloc'd: addr @ [rbp-0x08], v @ [rbp-0x10] (objdump-checked, S7 report).
+# REGISTER CONTRACT (both): in — addr, v from their slots; out — memory only; clobbers rax, rcx, flags.
+fn atomic_or64(addr, v) {
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x8B; 0x4D; 0xF0;      # mov rcx, [rbp-0x10] (v)
+        0xF0; 0x48; 0x09; 0x08;      # lock or [rax], rcx
+    }
+    return 0;
+}
+fn atomic_and64(addr, v) {
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x8B; 0x4D; 0xF0;      # mov rcx, [rbp-0x10] (v)
+        0xF0; 0x48; 0x21; 0x08;      # lock and [rax], rcx
+    }
+    return 0;
+}
+# klug_lock_word: serializes every append to the klug ring (klug.cyr klug_lock_acquire / klug_lock_release). A LEAF
+# below everything (nothing is acquired under it), IRQ-saved by its caller, BOUNDED (a fault inside a copy re-enters
+# klug from the fault path on the same CPU — an unbounded spin would turn the post-mortem into a silent hang), never
+# taken under sched_lock by the lifecycle code. klug_trylock / klug_unlock are byte-copies of net_rx_trylock /
+# net_rx_unlock WITHOUT their preempt calls (the holder is IF=0 for a ~100-byte copy; nothing can switch it out).
+# Slots (objdump-checked): trylock old @ [rbp-0x08], addr @ [rbp-0x10]; unlock addr @ [rbp-0x08].
+# REGISTER CONTRACT: trylock — in addr; out old (xchg) into [rbp-0x08]; clobbers rax, rcx. unlock — in addr;
+# clobbers rax, rcx.
+var klug_lock_word = 0;
+fn klug_trylock() {
+    var old = 1;
+    var addr = &klug_lock_word;
+    asm {
+        0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+        0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+        0x48; 0x87; 0x08;                            # xchg [rax], rcx  (atomic: rcx<-old, [addr]<-1)
+        0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+    }
+    return old;                                       # 0 = we acquired; 1 = already held
+}
+fn klug_unlock() {
+    var addr = &klug_lock_word;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;            # xor rcx, rcx
+        0x48; 0x87; 0x08;            # xchg [rax], rcx
+    }
+    return 0;
+}
+
+# ═══ 1.57.7 (S4) — THE NET LOCK CHAIN (docs/architecture/net-concurrency.md) ═══
+# Four IRQ-saved spinlocks + one try-lock, each a byte-copy of heap_spin_lock / net_rx_trylock with only the
+# global renamed (NO parameter, so the asm slots stay addr@[rbp-0x10] / old@[rbp-0x08] — objdump-checked).
+# ⛔ NEVER CALL THESE DIRECTLY: every caller goes through the wrapper (tcp_lock/tcp_unlock in net_tcp.cyr,
+# net_tx_begin/end, lo_q_begin/end, udp_begin/end in net.cyr), which does kbd_irq_save() FIRST and then the
+# xchg — the holder always runs IF=0, so an ISR can never spin on a lock its own CPU holds — and which carries
+# the best-effort overlap witness (`net: lock overlap`, a SMOKE_INVARIANT_DENY line).
+#   tcp_tab_lock  every field of every tcp_conns[] slot, tcp_conn_count, tcp_conn_gen[], tcp_ephemeral_ctr,
+#                 tcp_demux_touched. HELD ACROSS FRAME BUILD + net_tx (it is NOT a leaf).
+#   net_tx_lock   net_pkt, everything inside nic_send (virtio TX slots/idx, r8169 tx idx, the net_tx_* counters),
+#                 arp_cache_* / arp_pending_ip writes.
+#   lo_q_lock     lo_ring, lo_lens, lo_head, lo_tail, lo_count, lo_dropped.
+#   udp_lock      udp_listeners[] fields, net_udp_buf / net_udp_buf_len (sibling leaf at the lo_q rank).
+#   lo_drain_lock TRY: the single consumer of the lo queue, held across the in-place demux.
+var tcp_tab_lock = 0;
+var net_tx_lock = 0;
+var lo_q_lock = 0;
+var udp_lock = 0;
+var lo_drain_lock = 0;
+fn tcp_tab_spin_lock() {
+    preempt_disable();                                  # 1.57.6 (S3.2) shape: a held plain spinlock is NON-PREEMPTIBLE
+    var old = 1;
+    while (old == 1) {
+        var addr = &tcp_tab_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn tcp_tab_spin_unlock() {
+    var addr = &tcp_tab_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    preempt_enable();                                   # pairs the preempt_disable in the lock
+    return 0;
+}
+fn net_tx_spin_lock() {
+    preempt_disable();                                  # 1.57.6 (S3.2) shape: a held plain spinlock is NON-PREEMPTIBLE
+    var old = 1;
+    while (old == 1) {
+        var addr = &net_tx_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn net_tx_spin_unlock() {
+    var addr = &net_tx_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    preempt_enable();                                   # pairs the preempt_disable in the lock
+    return 0;
+}
+fn lo_q_spin_lock() {
+    preempt_disable();                                  # 1.57.6 (S3.2) shape: a held plain spinlock is NON-PREEMPTIBLE
+    var old = 1;
+    while (old == 1) {
+        var addr = &lo_q_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn lo_q_spin_unlock() {
+    var addr = &lo_q_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    preempt_enable();                                   # pairs the preempt_disable in the lock
+    return 0;
+}
+fn udp_spin_lock() {
+    preempt_disable();                                  # 1.57.6 (S3.2) shape: a held plain spinlock is NON-PREEMPTIBLE
+    var old = 1;
+    while (old == 1) {
+        var addr = &udp_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn udp_spin_unlock() {
+    var addr = &udp_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    preempt_enable();                                   # pairs the preempt_disable in the lock
+    return 0;
+}
+fn lo_drain_trylock() {
+    var old = 1;
+    var addr = &lo_drain_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+        0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+        0x48; 0x87; 0x08;                            # xchg [rax], rcx  (atomic: rcx<-old, [addr]<-1)
+        0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+    }
+    if (old == 0) { preempt_disable(); }              # only a WON try-lock is a held lock
+    return old;                                       # 0 = we acquired; 1 = already held (skip)
+}
+fn lo_drain_unlock() {
+    var addr = &lo_drain_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    preempt_enable();                                   # pairs the preempt_disable in the won try-lock
+    return 0;
+}
+
+# ═══ 1.57.7 (S6) — net_tick_lock (TRY) and icmp_lock (IRQ-saved sibling leaf) ═══
+# Byte-copies of net_rx_trylock/unlock and heap_spin_lock/unlock with only the global renamed (NO parameter: the asm
+# slots stay addr@[rbp-0x10] / old@[rbp-0x08] — objdump-checked like S3/S4). net_tick_lock serializes net_tick's body
+# across CPUs (a busy tick skips; only net_tick_pause spins on it, from kmain holding nothing). icmp_lock guards the
+# per-pid echo reply slots and the ICMP counters; it is taken ONLY through icmp_begin/icmp_end (net_icmp.cyr:
+# kbd_irq_save FIRST), never while a net chain lock is held, nothing is taken under it, and wq_wake runs after it.
+var net_tick_lock = 0;
+var icmp_lock = 0;
+fn net_tick_trylock() {
+    var old = 1;
+    var addr = &net_tick_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+        0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+        0x48; 0x87; 0x08;                            # xchg [rax], rcx  (atomic: rcx<-old, [addr]<-1)
+        0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+    }
+    if (old == 0) { preempt_disable(); }              # only a WON try-lock is a held lock
+    return old;                                       # 0 = we acquired; 1 = already held (skip)
+}
+fn net_tick_unlock() {
+    var addr = &net_tick_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    preempt_enable();                                   # pairs the preempt_disable in the won try-lock
+    return 0;
+}
+fn icmp_spin_lock() {
+    preempt_disable();                                  # 1.57.6 (S3.2) shape: a held plain spinlock is NON-PREEMPTIBLE
+    var old = 1;
+    while (old == 1) {
+        var addr = &icmp_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn icmp_spin_unlock() {
+    var addr = &icmp_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    preempt_enable();                                   # pairs the preempt_disable in the lock
+    return 0;
+}
+
 # === 1.46.x SMP sub-bite 5 PHASE 1 — pure non-ISR coarse subsystem locks ===
 # FOUR more FIXED-GLOBAL xchg spinlocks (each a byte-copy of pmm_spin_lock /
 # pmm_spin_unlock with the lock global renamed — NO parameter, so the asm [rbp-N]
@@ -292,15 +527,49 @@ fn net_rx_unlock() {
 # NON-ISR (a 4-subsystem locking-map grep proved no timer/net_rx_drain/xHCI-hid_poll/
 # fault handler touches any of these), so they are PLAIN spinlocks (NO cli/sti) and
 # INERT single-core (the xchg always wins uncontended → byte-identical boot).
+# ⭐ 1.57.7 (S7) — THE ONE EXCEPTION TO "NON-ISR" (INV-L2, docs/architecture/process-lifecycle.md): the lifecycle TICK
+# path (sched.cyr proc_tick_lifecycle, from timer_handler) runs the whole death chain — proctab, fs (via
+# proc_destroy_fd_table), heap, pmm (proc_free_address_space), flock, the chan/snd/shm locks, console when a callee
+# kprints — but ONLY for a CPL3-interrupted frame (its `(frame+128 & 3) == 3` early return is load-bearing). A CPU
+# interrupted in ring 3 holds no kernel lock, so no same-CPU holder of any of these can exist; another CPU's hold is
+# ordinary contention. fault_kill_current runs the same chain from a CPL3 exception on the same argument. The same
+# exception covers the "no ISR calls kprint" rule below; the display hand-back's disk spill + kprint are deferred to
+# the next syscall exit (gpu_release_pid_isr / klug_spill_owed). klug_lock_word (above) is a LEAF below everything.
 #
 # GLOBAL LOCK ORDER (acquire low->high, never backwards) — rewritten 1.57.6 (Path 2, S3.2):
 #   fs_lock < vfs_lock < proctab_lock < console_lock < {nvme_lock, ahci_lock, vblk_lock, msc_lock} < heap_lock < pmm_lock
 #   (the four backend locks are SIBLING LEAVES at one rank — never take two at once; nothing does)
+#   ⚠ console_lock IS TAKEN UNDER THE FOUR BACKEND LEAVES by their diagnostic kprints (e.g. under msc_lock:
+#   msc_read_lba's short-phase report, msc_scsi_exec's Reset Recovery lines, msc_bbb_exec's CBW/data/CSW timeout
+#   and CSW signature/tag lines, reached from msc_blk_read/write/flush/read_sectors; msc_request_sense is NOT
+#   one — it runs only from boot enumeration, unlocked) — the one sanctioned backwards pair, deadlock-free
+#   because a console_lock holder (kprint/kprintln -> serial_*, fb_*, klug_append: port I/O + plain memory) never
+#   acquires a backend lock. Keep it that way: nothing under console_lock may reach a block backend. (1.57.7 MSC)
+#   fs_lock < flock_lock < sched_lock (1.57.7, Path 2 S3.5): the flock table's lock; the releases take it under fs_lock
+#   (vfs_close) and wake waiters under it (wq_wake -> sched_lock); never held across a wait, never in an ISR body —
+#   except the lifecycle tick path on a CPL3 frame (INV-L2, 1.57.7 S7). proctab_lock < sched_lock is also the death
+#   chain's final hold (proc_death_finish: proctab OUTER, sched INNER).
 #   mmap_lock < pmm_lock (sys_mmap's cursor, then the 2 MB allocator). tlb_shoot_lock takes nothing under
-#   it (IPIs + an ack wait). input_lock is IRQ-saved (kbd_irq_save first) and takes nothing under it.
-#   net_rx_lock and hid_poll_lock are TRY-locks: they never spin, so they sit outside the order (a failed
-#   try simply means another context is draining). sched_lock is the INNERMOST LEAF: taken only with IF=0,
-#   any lock above may be held while taking it, nothing is taken under it (see its banner).
+#   it (IPIs + an ack wait). input_lock is IRQ-saved (kbd_irq_save first) and takes nothing under it. The keyboard
+#   line waits arm OUTSIDE input_lock (1.57.7, S3.7) — keep it that way: wq_arm may divert into sched_exit_tail,
+#   which must never run holding a spinlock (and a wake under input_lock would nest sched_lock under it).
+#   heap_lock < pmm_lock < tcp_tab_lock < net_tx_lock < lo_q_lock < sched_lock (1.57.7 S4, the NET CHAIN): all four
+#   net spinlocks are IRQ-SAVED (taken only through wrappers that kbd_irq_save() first — they are reachable from the
+#   BSP timer ISR drain, the NIC MSI handler and every CPU's syscalls). tcp_tab_lock is HELD ACROSS frame build +
+#   net_tx (it is not a leaf); udp_lock sits at the lo_q rank as a SIBLING LEAF, never held with another net lock.
+#   UNDER ANY NET LOCK, NEVER: net_poll/net_rx_drain/net_lo_drain (a nested demux re-takes tcp_tab_lock on the same
+#   CPU at IF=0 — a hard hang), heap/pmm/console/fs/vfs/proctab or any non-IRQ-saved lock, kmalloc/kfree, kprint.
+#   Diagnostics use the lock-free latch (klug_append + serial_println, net_lk_latch). sched_lock MAY be taken under
+#   any of them. User memory under a net lock: only a range that passed is_user_range in the same syscall (no
+#   unmapper can shrink a live address space). Worst-case hold: tcp_tab_lock across 8 frame builds (retx tick,
+#   a LISTEN close's RSTs) or one 2 KB ring copy (tcp_recv).
+#   net_rx_lock, hid_poll_lock and lo_drain_lock are TRY-locks: they never spin, so they sit outside the order (a
+#   failed try simply means another context is draining; a drain holds one across a demux that takes the chain).
+#   net_tick_lock (1.57.7 S6) is a TRY-lock too: net_tick's body holds it across tcp_retx_tick + net_lo_drain; only
+#   net_tick_pause spins on it, from kmain holding nothing. icmp_lock (1.57.7 S6) is an IRQ-SAVED SIBLING LEAF at the
+#   udp rank: never held with a net chain lock, nothing taken under it, wq_wake after its release.
+#   sched_lock is the INNERMOST LEAF: taken only with IF=0, any lock above may be held while taking it, nothing is
+#   taken under it (see its banner).
 # ⭐⭐ 1.57.6 (Path 2, S3.2) — EVERY PLAIN SPINLOCK DISABLES PREEMPTION FOR ITS HOLD. Each *_spin_lock
 # below calls preempt_disable() as its first statement and each *_spin_unlock calls preempt_enable() as its
 # last; a try-lock disables only when it wins. WHY: these are PLAIN spinlocks (no cli), and until now
@@ -381,6 +650,39 @@ fn fs_spin_unlock() {
         0x48; 0x87; 0x08;              # xchg [rax], rcx
     }
     preempt_enable();                                   # 1.57.6 (S3.2): pairs the preempt_disable in the lock
+    return 0;
+}
+# ⭐ 1.57.7 (Path 2, S3.5) — flock_lock: the advisory-lock table (vfs.cyr flock_*). fs_lock < flock_lock < sched_lock:
+# the releases run under fs_lock (vfs_close), and wq_wake (sched_lock) is taken under flock_lock. NEVER held across
+# wq_sleep (the #59 arm drops it first) and never taken in an interrupt body (the lifecycle step's tick-path death
+# chain is the one exception, on a CPL3-interrupted frame only — INV-L2, landed 1.57.7 S7). A byte-for-byte copy of fs_spin_lock /
+# fs_spin_unlock with the global renamed: preempt_disable() first / preempt_enable() last, and the hand-asm slots
+# are the proven ones — lock: `old` at [rbp-0x08], `addr` at [rbp-0x10]; unlock: `addr` at [rbp-0x08]
+# (objdump-checked, S3c report). REGISTER CONTRACT (both asm blocks): in — addr from its slot; out — lock: old
+# from the xchg into [rbp-0x08]; clobbers rax, rcx.
+var flock_lock = 0;
+fn flock_spin_lock() {
+    preempt_disable();                                  # a held plain spinlock is NON-PREEMPTIBLE (see the lock banner)
+    var old = 1;
+    while (old == 1) {
+        var addr = &flock_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn flock_spin_unlock() {
+    var addr = &flock_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    preempt_enable();                                   # pairs the preempt_disable in the lock
     return 0;
 }
 fn console_spin_lock() {
@@ -618,7 +920,12 @@ fn ap_entry() {
     #   Sum(per-process tick deltas) / (pooled per-core band delta), exploiting that the two
     # counters are halt-asymmetric in opposite directions. AP idle time injected into the NUMERATOR
     # makes that ratio wrong, so this line is load-bearing for a consumer that ships today.
-    while (1 == 1) { arch_wait(); }
+    # ⭐ 1.57.7 (Path 2, S3.8): the IDLE STEP (sched.cyr sched_idle_step), not a bare arch_wait loop. It keeps the chakshu
+    # property above (cpu_in_halt is set around its only hlt) and adds the scan: after any interrupt (a wake, a 0xE1
+    # kick) this AP takes READY work at once instead of re-halting until its next tick. STEP-1 (smp_sched_aps == 0):
+    # sched_idx_pickable refuses everything but this AP's own idle, so the scan finds nothing and the step just halts.
+    # (smp.cyr -> sched.cyr is a forward CALL: it resolves.)
+    while (1 == 1) { sched_idle_step(); }
     return 0;
 }
 
@@ -808,7 +1115,7 @@ fn smp_wait_ticks(n) {
     # was tried and did exactly that: ring3/thread smokes hung at their first arch_wait.)
     var t0 = timer_ticks;
     # 1.57.1 — sti ONCE, then arch_wait() per iteration. This is a genuine timed block, the same
-    # class as sleep_ms#41, so its halts must be excluded from per-process CPU time too. Hoisting
+    # class as the legacy preempt-held sti window (sleep_ms#41's pre-1.57.7 body), so its halts must be excluded from per-process CPU time too. Hoisting
     # the sti preserves this function's documented contract of ENTERING and EXITING with IF=1
     # (a trailing cli was tried once and hung every smoke at its first arch_wait); the timer ISR
     # returns via iretq, which restores IF=1, so one sti covers every iteration.

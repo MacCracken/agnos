@@ -15,12 +15,14 @@
 # verb — SLIRP has no NTP server, so it's a manual / iron check, not gated here.
 #
 # Requires: qemu-system-x86_64, OVMF firmware, mtools, parted, gnoboot built.
-# Exit 0 if the gate passes; 1 otherwise.
+# Exit 0 if every gate passes; 1 otherwise; 2 = VOID (the firmware never handed off in QEMU_TRIES attempts —
+# the kernel never ran; 1.57.7 HAR).
 
 set -u
 
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"     # qemu_dwell_kernel, qemu_assert_booted, SMOKE_INVARIANT_DENY
 GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
 
 OVMF_CODE_CANDIDATES="
@@ -58,7 +60,7 @@ AGNOS="$ROOT/build/agnos"
 [ -f "$GNOBOOT" ] || { echo "ERROR: gnoboot not built at $GNOBOOT" >&2; exit 1; }
 [ -f "$AGNOS" ]   || { echo "ERROR: agnos kernel not built at $AGNOS" >&2; exit 1; }
 
-if ! strings "$AGNOS" | grep -q "ntp: parse PASS"; then
+if ! strings "$AGNOS" | grep -qa "ntp: parse PASS"; then
     echo "ERROR: kernel was not built with NTP_SELFTEST=1" >&2
     echo "       rebuild: NTP_SELFTEST=1 sh scripts/build.sh" >&2
     exit 1
@@ -93,12 +95,16 @@ echo "  OVMF code: $OVMF_CODE"
 echo "  log dir:   $LOGS"
 echo ""
 
-QEMU_TIMEOUT="${QEMU_TIMEOUT:-30}"
+QEMU_TIMEOUT="${QEMU_TIMEOUT:-90}"
 LOG="$LOGS/ntp.log"
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"
 chmod +w "$WORK/vars.fd"
 
-timeout "$QEMU_TIMEOUT" qemu-system-x86_64 \
+# 1.57.7 (HAR): banner-gated retry (qemu_dwell_kernel) — a firmware hand-off that never happened is retried
+# and, if it never happens, scored VOID (exit 2) instead of a wall of FAILs against an empty log. The dwell ends
+# on `ntp: parse ` (the selftest's last line), so the budget below is a ceiling, not a wait.
+qemu_dwell_kernel "$LOG" "ntp: parse " "$QEMU_TIMEOUT" "$WORK/vars.fd" "$OVMF_VARS_SRC" \
+    qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
@@ -106,20 +112,32 @@ timeout "$QEMU_TIMEOUT" qemu-system-x86_64 \
     -device "nvme,drive=esp0,serial=AGNOS-SMOKE" \
     -netdev "user,id=u1" \
     -device "virtio-net-pci,netdev=u1" \
-    -serial stdio -display none -no-reboot 2>/dev/null > "$LOG"
-
-echo "--- serial log (NTP lines) ---"
-grep -E "ntp:" "$LOG" || echo "(no ntp lines captured)"
-echo "------------------------------"
-
-if grep -q "ntp: parse PASS" "$LOG"; then
-    echo "PASS: hermetic SNTP parse (NTP→Unix epoch + UTC breakdown)"
+    -serial stdio -display none -no-reboot
+if ! qemu_assert_booted "$LOG"; then
     echo ""
-    echo "=== ntp-smoke: 1 passed, 0 failed ==="
-    exit 0
+    echo "=== ntp-smoke: VOID (the kernel never executed) ==="
+    exit 2
 fi
 
-echo "FAIL: 'ntp: parse PASS' not found — SNTP parse/epoch regression"
+echo "--- serial log (NTP lines) ---"
+grep -aE "ntp:" "$LOG" || echo "(no ntp lines captured)"
+echo "------------------------------"
+
+pass=0
+fail=0
+if grep -qa "ntp: parse PASS" "$LOG"; then
+    echo "PASS: hermetic SNTP parse (NTP→Unix epoch + UTC breakdown)"; pass=$((pass + 1))
+else
+    echo "FAIL: 'ntp: parse PASS' not found — SNTP parse/epoch regression"; fail=$((fail + 1))
+fi
+# 1.57.7 (HAR): the shared latched-invariant deny (qemu-dwell.sh SMOKE_INVARIANT_DENY).
+if grep -qaE "$SMOKE_INVARIANT_DENY" "$LOG"; then
+    echo "FAIL: a latched kernel invariant fired:"; grep -aE "$SMOKE_INVARIANT_DENY" "$LOG" | head -3 | sed 's/^/        /'
+    fail=$((fail + 1))
+else
+    echo "PASS: no latched kernel invariant"; pass=$((pass + 1))
+fi
 echo ""
-echo "=== ntp-smoke: 0 passed, 1 failed ==="
+echo "=== ntp-smoke: $pass passed, $fail failed ==="
+[ "$fail" -eq 0 ] && exit 0
 exit 1

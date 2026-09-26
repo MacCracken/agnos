@@ -1,0 +1,17 @@
+[package]
+name = "lifecycle"
+version = "0.1.0"
+description = "agnos 1.57.7 process lifecycle (S7) ring-3 exerciser — kill#16 ends (9), stops (19) and continues (18) a child and, with KILL_TREE (0x100), its descendants, through the claim / tick / B1 / wait boundaries; the wait status (265 / 142 / code & 0xFF); #99 states 5 and 7; orphans reap themselves. lifex is seeded as /bin/agnsh and spinner as /bin/spinner by scripts/smoke/lifecycle-smoke.sh."
+license = "GPL-3.0-only"
+language = "cyrius"
+# The VALUE must EQUAL the root manifest's pin (scripts/check/toolchain-pin-check.sh enforces it).
+cyrius = "6.6.6"
+
+[build]
+entry = "lifex.cyr"
+output = "build/lifex"
+
+# AGNOS ONLY — build with `cyrius build --agnos lifex.cyr build/lifex` and `cyrius build --agnos spinner.cyr build/spinner`.
+[deps]
+# ⚠ The FULL closure, transitives included (D19): alloc -> atomic, fnptr; string and args -> alloc.
+stdlib = ["syscalls", "string", "alloc", "args", "atomic", "fnptr"]

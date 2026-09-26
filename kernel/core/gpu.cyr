@@ -8448,6 +8448,9 @@ fn gpu_shader_blend_pk_test() {
 
 # gpu_s12_frame — composite the mock frame once. batched=1 puts all six ops in ONE submission.
 # The op mix is the plan's: translucent window chrome (x3) + an AA-text run + a gradient titlebar.
+# 1.57.7 (S8, image budget): compiled only into the SHADER_BATCH build — its only caller is main.cyr's #ifdef SHADER_BATCH block, so a
+# plain image shipped it as dead code (check.sh's weighed binary-size grant). Code unchanged.
+#ifdef SHADER_BATCH
 fn gpu_s12_frame(batched, src_mc, mask_mc, bmp_mc) {
     var done_phys = gpu_arena_phys + GPU_BLEND_DONE_SUBOFF;
     var done_mc   = gpu_arena_mc   + GPU_BLEND_DONE_SUBOFF;
@@ -8568,6 +8571,7 @@ fn gpu_shader_batch_test() {
     kprintln("gpu: batched frame pixel-identical to op-by-op (6 ops, 1 submission)", 68);
     return 1;
 }
+#endif
 
 # gpu_edge_cov — RUNG 9b's worker. Rasterise n_edges screen-space edges into an 8bpp coverage mask.
 # ⛔ Rung 9a ships this as a refusal, not a stub that returns 1: gpu_edge_arm() gates it out one layer
@@ -8777,6 +8781,9 @@ fn gpu_blend_alpha_surface(src_mc, w, h, dx, dy, alpha) {
 # CPU readback happens IMMEDIATELY after the done marker retires (the marker rides a WRITE_DATA through the
 # CP, not through GL2, so its arrival says nothing about the shader's stores).
 
+# 1.57.7 (S8, image budget): compiled only into the SHADER_COHERE build — its only caller is main.cyr's #ifdef SHADER_COHERE block, so a
+# plain image shipped it as dead code (check.sh's weighed binary-size grant). Code unchanged.
+#ifdef SHADER_COHERE
 fn gpu_s3_tile(i) { return GPU_COHERE_TILE_SUBOFF + i * GPU_COHERE_STRIDE; }
 
 # gpu_cohere_run — THE ONLY place gpu_cohere_wb / gpu_cohere_inv are ever written. Sets them, runs one
@@ -9027,6 +9034,7 @@ fn gpu_shader_cohere_test() {
     kprintln("gpu: shader coherence characterised (see the S3-A..D table)", 59);
     return 1;
 }
+#endif
 
 # gpu_shader_rect_test — S3: alpha-blend a real rect INTO THE SCANOUT BACK BUFFER over a 2-D grid, verify
 # every pixel against the CPU reference, then PRESENT it so the result is visible.
@@ -9046,6 +9054,9 @@ fn gpu_shader_cohere_test() {
 # dst is blended IN PLACE, so the original dst cannot be re-read for checking — the reference recomputes it
 # from the same rule that painted it. That is stronger than re-reading, not weaker: it checks the pixel
 # against what was INTENDED rather than against whatever is now in memory.
+# 1.57.7 (S8, image budget): compiled only into the SHADER_RECT build — its only caller is main.cyr's #ifdef SHADER_RECT block, so a
+# plain image shipped it as dead code (check.sh's weighed binary-size grant). Code unchanged.
+#ifdef SHADER_RECT
 fn gpu_shader_rect_test() {
     if (gpu_present == 0) { return 0; }
     if (gpu_blend_ok != 1) { kprintln("gpu: skipping rect blend (blend math unproven)", 46); return 0; }
@@ -9217,6 +9228,7 @@ fn gpu_shader_rect_test() {
     kprintln("gpu: shader rect blend online (256x64 grid, bit-correct, presented)", 67);
     return 1;
 }
+#endif
 
 # gpu_cp_dma_fill_rect — hardware RECT FILL: write the 32-bit `val` across `row_bytes` on each of `rows`
 # rows, `dst_stride` apart (one CP-DMA constant-fill per row). The rect peer of gpu_cp_dma_fill, which only
@@ -13823,4 +13835,14 @@ fn gpu_release_pid(pid) {
     # `fault_kill_current` (syscall.cyr:543) both come through here. The crash case gets it free.
     klug_spill_covered_console();
     return r;
+}
+# ⭐ 1.57.7 (S7, D-34) — THE ISR VARIANT, for a process the lifecycle TICK path kills (timer ISR, CPL3 frame — INV-L2).
+# Ownership is dropped AT ONCE (bounded vblank waits, as the fault path already does) so it can never leak to a recycled
+# pid; the disk spill and its kprint are DEFERRED to the next B1 of any process (klug_spill_owed, klug.cyr) — an ext2
+# write and a console print have no business in an interrupt body.
+fn gpu_release_pid_isr(pid) {
+    if (gpu_scanout_pid != pid) { return 0; }
+    var ri_r = gpu_display_restore_console();
+    klug_spill_owed = 1;
+    return ri_r;
 }

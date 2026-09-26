@@ -179,7 +179,9 @@ projection.
   elf_load_from_file / spawn), the same source `vfs_fd_inherit` uses — reset to 0 in
   `proc_alloc_slot`. Authorization extracted into a testable `proc_may_signal(caller, target)`.
   Guardrail: signal-ownership only, deliberately **not** grown into pgid/sid.
-  `PPID_SELFTEST` → `ppid: child-gate PASS`.
+  ktest `[lifecycle]` section (T-L2 / T-L7 — the retired `PPID_SELFTEST` assertions, 1.57.7 S7). Guardrail since
+  1.57.7 (D4): child-only AUTHORITY; descendants-only REACH via KILL_TREE; still no process-group / session reach;
+  the parent is an incarnation (`proc_ppid_epoch`).
 - **A background (`&`) proc fault HALTED THE BOX.** A CPL3 fault routes to `fault_kill_current`,
   which `kernel_resume()`s to the shell for the **foreground** exec child — but a background proc's
   `#PF`/`#GP`/`#UD` fell through to the IDT stub's canary-bar **halt**. One bg service's ring-3

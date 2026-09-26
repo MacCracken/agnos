@@ -79,7 +79,8 @@ if not cypeer:
 #
 # ⛔⛔ 1.56.55 — AND THE STUB DID GAIN ONE, AND NOBODY ADDED IT, SO THIS GATE WENT BLIND ON `fork`.
 # `#96 fork` dispatches from arch/x86_64/syscall_hw.cyr (`if (sc_num == 96) { return sys_fork(...); }`)
-# for the same reason #44 and #14 do — the child's resume context lives in pcpu_sc_entry_regs, valid
+# for the same reason #44 and #14 do — the child's resume context lives in the caller's own syscall frame
+# (sc_frame_get / SCF_*, since 1.57.7; the per-CPU pcpu_sc_entry_regs capture before that), valid
 # only on a path reached from the ring-3 entry stub. It has NO arm in kernel/core/syscall.cyr, which
 # is the only file scanned below, so the kernel number set silently excluded 96. The ABI doc had no
 # `| 96 |` row and cyrius had no SYS_FORK either — so all THREE sources agreed by MUTUAL ABSENCE and
