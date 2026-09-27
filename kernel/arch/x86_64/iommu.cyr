@@ -1,45 +1,99 @@
 # === Intel VT-d IOMMU (DMA Remapping) ===
-# Restricts DMA so PCI devices can only access explicitly permitted memory regions.
-# Requires ACPI DMAR table (parsed by acpi.cyr) to locate IOMMU hardware.
+# Restricts DMA so a PCI device can reach only memory a driver GRANTED. Needs an ACPI DMAR table: acpi.cyr's
+# acpi_parse_dmar picks the remapping unit (the only DRHD, or the INCLUDE_PCI_ALL one) and collects the RMRRs.
 #
-# VT-d register layout (MMIO, base from DMAR DRHD):
-#   0x00: VER (version)              0x08: CAP (capability)
-#   0x10: ECAP (extended capability) 0x18: GCMD (global command)
-#   0x1C: GSTS (global status)       0x20: RTADDR (root table address)
-#   0x24: CCMD (context command)     0x28: FSTS (fault status)
-#   0x38: FECTL (fault event ctl)    0x58: IQH (invalidation queue head)
-#   0x60: IQT (invalidation queue tail)
+# ⭐ 1.57.10 (VTD) — THIS FILE RUNS NOW. Until 1.57.10 no boot had ever turned translation on, not even in QEMU: q35 +
+# `-device intel-iommu` publishes a DMAR, and iommu_init returned -1 at its first step (the old iommu_map_mmio refused
+# PDPT[3]'s 1 GB page, which is pt_init's normal layout, so "IOMMU: init failed" was the only line any boot ever printed).
+# scripts/smoke/vtd-smoke.sh now boots it with translation ON — q35 + intel-iommu with caching-mode on and off, 3- and
+# 4-level tables, a controller behind a root port — and requires xHCI / NVMe / virtio / AHCI / HDA DMA to keep working
+# with zero DMAR faults. docs/architecture/dma-cpu-pointers.md § "VT-d: the grant model" is the model; the prior art is
+# Linux drivers/iommu/intel (iommu.c, cache.c, dmar.c), FreeBSD sys/x86/iommu and the VT-d spec Rev 5.20.
 #
-# Translation structure hierarchy:
-#   Root Table (4KB, 256 entries for buses 0-255)
-#     -> Context Table (4KB, 256 entries for devfn 0-255)
-#       -> IO Page Table (4KB, 512 entries per level, like CPU page tables)
+# VT-d registers (MMIO at iommu_base; spec §11.4, Linux intel/iommu.h DMAR_*_REG):
+#   0x00 VER   0x08 CAP   0x10 ECAP   0x18 GCMD (WRITE-ONLY: reads 0)   0x1C GSTS   0x20 RTADDR   0x28 CCMD
+#   0x34 FSTS  0x38 FECTL 0x64 PMEN   0x80 IQH  0x88 IQT  0x90 IQA
+#   ECAP.IRO*16 = IVA, +8 = IOTLB (register-based invalidation); CAP.FRO*16 = the fault-recording registers, 16 B each.
+#   (⛔ until 1.57.10 this banner put CCMD at 0x24, FSTS at 0x28 and IQH/IQT at 0x58/0x60. The code used 0x28 for CCMD.)
+#
+# Translation structures (legacy mode): root table (4 KB = 256 x 16 B, one entry per BUS) -> context table (4 KB =
+# 256 x 16 B, one entry per DEVFN) -> the domain's second-level (SL) table, `iommu_levels` deep (3 = 39-bit, 4 = 48-bit
+# AGAW), EPT-format entries (R bit 0, W bit 1, PS bit 7), 2 MB leaves.
+# ⛔ Until 1.57.10 the context entry said AW=1 and a comment called that "30-bit AGAW, 2-level" — but AW=1 IS 39-bit /
+# 3-level (spec §9.3; 000b, the old 2-level, is Reserved since Rev 2.5 and QEMU rejects it), while the SLPTPTR named ONE
+# PD-shaped table of 2 MB leaves. Every DMA would have walked that table as a PML3 of 1 GB "pages" with reserved bits set.
+#
+# ⭐ THE GRANT MODEL (docs/architecture/dma-cpu-pointers.md). ONE domain, DID 1 (DID 0 is reserved when CAP.CM is set,
+# spec §9.3), that EVERY device shares, IOVA == phys: a device may DMA into a 2 MB region only if a driver called
+# iommu_register_dma(phys) for a page in it, it is the first 16 MB (the kernel image with its .bss DMA buffers), or it
+# is a firmware RMRR. 2 MB granularity: a grant opens the rest of its region too. Every devfn on every bus pci_scan
+# populated points at the domain, so requester-ID aliasing (a PCIe-to-PCI bridge, a phantom function) cannot miss.
+#   - BEFORE iommu_init a grant is RECORDED in iommu_pend[] and REPLAYED into the tables before TE. ⛔ Until 1.57.10 it
+#     was a no-op: xhci_rings_init, xhci_ctx, hid and msc all grant before iommu_init runs (main.cyr brings the keyboard
+#     up first), so with translation on every xHCI ring outside the first 16 MB would have faulted (issue 2026-09-26).
+#   - AFTER TE the leaf is written and then invalidated as the hardware requires (iommu_after_new_leaf).
+#   - After an init that did not enable translation (or no DMAR at all): a no-op, as before.
+#
+# CR3 AUDIT (1.57.9, extended 1.57.10): the tables are written through their direct-map KVA (dma_kva), never phys, so a
+# grant is correct under ANY CR3 — which matters now: after TE a grant can come from a syscall (msc's lazily allocated data
+# page, hda's stream buffers) under a process's CR3, or from the xHCI event path on an AP. iommu_base is the identity VA of
+# the register block in PDPT[3], which vmm_remap_uc_2mb shatters at boot, before any process exists, and every
+# per-process PDPT copies. The grant path holds iommu_lock (smp.cyr, IRQ-saved) across the table edit + invalidation.
 
-var iommu_base = 0;       # MMIO base address (virtual = physical, identity-mapped)
-var iommu_active = 0;
-# ⛔ 1.57.9 (CPUVA) — every table is held TWICE, the Linux intel-iommu way (iommu->root_entry is a KVA,
-# virt_to_phys() only at the register): *_phys goes ONLY into what the hardware walks — RTADDR, the root
-# entry's context-table pointer, the context entry's ASR — and *_kva (dma_kva, the direct map) is the only
-# address the CPU memsets, loads or stores. Until 1.57.9 the CPU wrote these pmm pages at phys == VA.
-# CR3 AUDIT (1.57.9): every writer in this file runs at boot on the kernel CR3 0x1000, before any per-proc
-# CR3 or AP exists — iommu_init (main.cyr, the acpi_iommu_base block) and, through it, iommu_map_mmio,
-# iommu_set_context and iommu_allow_dma_2mb; iommu_register_dma from xhci_rings_init (BEFORE iommu_init,
-# so iommu_active == 0 and it is a no-op) and from r8169_init_rx/tx (after it). So the identity writes were
-# safe BY CALL-SITE PLACEMENT, not by construction; the KVA makes a later runtime caller (a hot-plugged
-# device's iommu_register_dma under a process's CR3) safe too. A BOOTCR3_KEEP_GNOBOOT_CR3 build gets
-# phys == VA from dma_kva under gnoboot's CR3, as before.
-var iommu_root_phys = 0;  # root entry table (bus 0..255) — physical, for RTADDR
-var iommu_root_kva = 0;   #   ... its direct-map CPU pointer
-var iommu_ctx_phys = 0;   # context entry table for bus 0 — physical, for root entry [0]
-var iommu_ctx_kva = 0;    #   ... its direct-map CPU pointer
-var iommu_l2_phys = 0;    # level-2 IO page table (like a PD) — physical, for the context ASR
-var iommu_l2_kva = 0;     #   ... its direct-map CPU pointer
-# ECAP.C (Extended Capability bit 0, "Coherency"): 1 = the remapping hardware snoops the CPU caches when it
-# walks these tables; 0 = it reads memory, so every table write must be clflushed out first (Linux
-# __iommu_flush_cache). Read before the first table write; 0 (the safe answer) until then.
+var iommu_base = 0;        # MMIO base of the remapping unit (identity VA — vmm_remap_uc_2mb maps its 2 MB chunk UC)
+var iommu_active = 0;      # 1 once GSTS.TES confirmed translation ON (ext2.cyr keeps its direct-to-caller DMA off then)
+var iommu_init_ran = 0;    # 1 once iommu_init ran (success or not): closes the pre-init grant log
+var iommu_ver = 0;         # VER (major 7:4, minor 3:0)
+var iommu_cap = 0;         # CAP
+var iommu_ecap = 0;        # ECAP
+var iommu_cm = 0;          # CAP.CM (bit 7): the unit may cache NOT-PRESENT entries -> every new grant needs an invalidation
+var iommu_rwbf = 0;        # CAP.RWBF (bit 4): a write-buffer flush is needed where no invalidation is
+var iommu_levels = 0;      # SL table depth: 4 (48-bit AGAW) if SAGAW offers it, else 3 (39-bit), else 5 (57-bit)
+var iommu_sp2m = 0;        # CAP.SLLPS bit 0 (CAP bit 34): 2 MB SL leaves; 0 = a 4 KB-leaf table per granted 2 MB
+var iommu_iova_top = 0;    # exclusive bound on a grantable address: min(2^(12 + 9 * levels), 2^MGAW)
+var iommu_iotlb_off = 0;   # ECAP.IRO * 16: the IVA register; the IOTLB register is at +8
+var iommu_drain = 0;       # IOTLB DR (bit 49) / DW (bit 48), set when CAP.DRD (55) / CAP.DWD (54) say they are honoured
+var iommu_fro = 0;         # CAP.FRO * 16: the first fault-recording register
+var iommu_nfr = 0;         # CAP.NFR + 1: how many there are
+var IOMMU_DID = 1;         # the one domain id (0 is reserved under CM)
+
+# ⛔ 1.57.9 (CPUVA) — every table is held TWICE, the Linux intel-iommu way (iommu->root_entry is a KVA, virt_to_phys()
+# only at the register): *_phys goes ONLY into what the hardware walks — RTADDR, a root entry's context-table pointer, a
+# context entry's SLPTPTR, an SL non-leaf entry — and *_kva (dma_kva, the direct map) is the only address the CPU memsets,
+# loads or stores. Lower-level tables are reached by dma_kva(entry & mask), Linux phys_to_virt(dma_pte_addr(pte)).
+var iommu_root_phys = 0;   # root table (bus 0..255) — physical, for RTADDR
+var iommu_root_kva = 0;    #   ... its direct-map CPU pointer
+var iommu_top_phys = 0;    # the domain's top SL table (level iommu_levels) — physical, for every context entry's SLPTPTR
+var iommu_top_kva = 0;     #   ... its direct-map CPU pointer
+var iommu_ctx_buses = 0;   # context tables installed (one per bus pci_scan found a function on)
+# ECAP.C (Extended Capability bit 0, "Coherency"): 1 = the remapping hardware snoops the CPU caches when it walks these
+# tables; 0 = it reads memory, so every table write must be clflushed out first (Linux __iommu_flush_cache). Read before
+# the first table write; 0 (the safe answer) until then. QEMU reports 0, so the smoke runs the clflush path.
 var iommu_coherent = 0;
 
-# VT-d register read/write (32-bit MMIO)
+# The pre-init grant log (issue 2026-09-26): the 2 MB-aligned base of every region granted before iommu_init, dedup'd.
+# A boot records a handful (xHCI's DCBAA / scratchpad / command + event rings / ERST, each slot's contexts and EP rings,
+# the HID and MSC buffers — pmm_alloc hands them out top-down, so they share few 2 MB regions). A grant that does not
+# fit is counted in iommu_pend_lost and iommu_init then REFUSES to enable translation: a lost grant is a certain fault.
+var iommu_pend[64];        # module scope = 64 x u64
+var iommu_pend_n = 0;
+var iommu_pend_lost = 0;
+
+# What the grant path did — printed by iommu_init (the enable line) and iommu_boot_report (the late check line).
+var iommu_n_leaf = 0;      # 2 MB SL leaves written (every grant that was new, default + RMRR + replay + late)
+var iommu_n_replayed = 0;  # pre-init log entries replayed into the tables at iommu_init
+var iommu_n_rmrr = 0;      # 2 MB leaves written for firmware RMRRs
+var iommu_n_late = 0;      # new leaves written AFTER translation was on
+var iommu_n_psi = 0;       # page-selective IOTLB invalidations issued for those (CM = 1)
+var iommu_n_dsi = 0;       # domain-selective fallbacks (CM = 1 without PSI, or MAMV < 9)
+var iommu_n_wbf = 0;       # write-buffer flushes for those (CM = 0, RWBF = 1)
+var iommu_n_inv_fail = 0;  # an invalidation / flush that timed out or reported granularity 0
+var iommu_n_refused = 0;   # grants refused: past the table, no memory for a table, or the pre-init log full
+var iommu_refused_said = 0;
+var iommu_n_faults = 0;    # fault records drained by iommu_fault_scan
+
+# VT-d register read/write. ⚠ iommu_write64 is ONE 8-byte store: QEMU runs a CCMD / IOTLB command only on the 8-byte
+# write or on the write of the HIGH dword, and the spec starts it on "the uppermost byte" (ICC / IVT live in bit 63).
 fn iommu_read32(off) {
     return load32(iommu_base + off);
 }
@@ -58,8 +112,22 @@ fn iommu_write64(off, val) {
     return 0;
 }
 
-# Wait for a global status bit to be set/clear
-fn iommu_wait_status(bit, val) {
+# The grant lock (smp.cyr iommu_spin_lock, a byte-copy of heap_spin_lock): IRQs off FIRST, so an ISR on this CPU can never
+# spin on a lock this CPU holds. Nothing prints under it.
+fn iommu_lock() {
+    var il_f = kbd_irq_save();
+    iommu_spin_lock();
+    return il_f;
+}
+
+fn iommu_unlock(iu_f) {
+    iommu_spin_unlock();
+    kbd_irq_restore(iu_f);
+    return 0;
+}
+
+# Wait for GSTS bit `bit` to read `val` (1 = set, 0 = clear). 0 on success, -1 on timeout.
+fn iommu_wait_gsts(bit, val) {
     var timeout = 0;
     while (timeout < 1000000) {
         var gsts = iommu_read32(0x1C);
@@ -70,101 +138,70 @@ fn iommu_wait_status(bit, val) {
         }
         timeout = timeout + 1;
     }
-    return 0 - 1;  # Timeout
+    return 0 - 1;
 }
 
-# Map the IOMMU MMIO registers into kernel address space.
-# Follows the same pattern as apic_init() — allocate a PD for the high address.
-fn iommu_map_mmio(phys_base) {
-    # IOMMU registers are typically at a high physical address (e.g., 0xFED90000).
-    # We need to map the 2MB region containing this address.
-    var pdpt_idx = (phys_base >> 30) & 0x1FF;
-    var pd_idx = (phys_base >> 21) & 0x1FF;
+# VT-d §11.4.4.1: GCMD is WRITE-ONLY (reads 0 — spec, and QEMU's vtd_define_long_wo) and every write is a whole command:
+# the persistent enables (TE 31, QIE 26, IRE 25, CFI 23) must be re-sent each time and the one-shot bits (SRTP 30, SFL 29,
+# WBF 27, SIRTP 24) must not be. The spec's recipe: Status = GSTS & 96FFFFFFh, Command = Status | bit (or & ~bit), then
+# wait for GSTS. ⛔ Until 1.57.10 this file wrote `iommu_read32(0x18) | bit` — a read of the write-only register, i.e. 0 —
+# which drops every persistent enable the unit already had (QEMU compares the write against GSTS: a TE write without IRE
+# turns interrupt remapping off). Linux keeps a software copy seeded from GSTS; this reads GSTS each time instead.
+fn iommu_gcmd_status() {
+    return iommu_read32(0x1C) & 0x96FFFFFF;
+}
 
-    # Check if PDPT entry exists for this region
-    var pdpte = load64(0x2000 + pdpt_idx * 8);
-    # ⛔⛔ 1.56.52 — A PRESENT PDPT ENTRY MAY BE A 1 GB PAGE, NOT A POINTER TO A PD. This tested only
-    # the present bit and then took `pdpte & 0xFFFFFFFFF000` as a page-directory address. pt_init
-    # installs PDPT[3] as a 1 GB PAGE — `store64(0x2000 + 3 * 8, 0xC0000000 | 0x83)`, PS set — and
-    # IOMMU register blocks live at exactly that index (0xFED90000 >> 30 == 3), so this is the COMMON
-    # case, not a corner. The old code would have taken 0xC0000000 as a PD base and executed
-    # `store64(0xC0000000 + pd_idx * 8, ...)`: a wild supervisor write into the 3-4 GB window, which
-    # on a real box is device MMIO.
-    # ⚠ REFUSE rather than shatter. vmm_remap_uc_2mb already knows how to split a PS=1 1 GB entry,
-    # but this whole file has NEVER EXECUTED — it needs a DMAR table, i.e. an Intel VT-d machine, and
-    # archaemenid is AMD (AMD-Vi, no DMAR), while `grep -rn iommu scripts/ tests/` finds nothing. A
-    # refusal is verifiable by inspection and leaves the machine in the state it already ships in
-    # (translation never enabled); a shatter here would be new untested page-table surgery on a path
-    # no test can reach.
-    if ((pdpte & 0x80) != 0) { return 0 - 1; }   # 1 GB page — not a PD; refuse, never write through it
-    # ⛔ 1.57.9 (CPUVA) — walk to the PD by phys_to_virt of the entry (Linux pmd_page_vaddr = __va(pmd &
-    # PTE_PFN_MASK)), never by treating the entry's phys as a pointer. The PDPT itself (0x2000) is in the
-    # kernel image, identity in every CR3; the PD under it is a pmm page (or an image page) — reach it
-    # through the direct map, and put only its PHYS into the PDPT entry the MMU walks.
-    var pd_kva = 0;
-    if ((pdpte & 1) != 0) {
-        pd_kva = dma_kva(pdpte & 0xFFFFFFFFF000);
-    } else {
-        # Allocate a new PD for this PDPT entry
-        var pd_phys = pmm_alloc();
-        if (pd_phys == 0) { return 0 - 1; }
-        pd_kva = dma_kva(pd_phys);
-        if (dma_kva_ok(pd_kva) == 0) { return 0 - 1; }
-        memset(pd_kva, 0, 4096);
-        store64(0x2000 + pdpt_idx * 8, pd_phys | 0x03);
+# Register-based invalidation (spec §6.5.1; Linux __iommu_flush_context / __iommu_flush_iotlb, FreeBSD dmar_inv_ctx_glob
+# / dmar_inv_iotlb_glob). One 64-bit store each, then poll the busy bit (ICC / IVT, bit 63) clear, then check the ACTUAL
+# granularity the unit reports: 0 means it did NOT perform the request (the spec's answer to every register invalidation at
+# VER major >= 6, which iommu_init already refuses; Linux prints "Flush IOTLB failed" for IAIG == 0). 0 ok, -1 failed.
+fn iommu_inv_context_global() {
+    iommu_write64(0x28, (1 << 63) | (1 << 61));             # CCMD: ICC | CIRG = 01 (global)
+    var t = 0;
+    while (t < 1000000) {
+        var v = iommu_read64(0x28);
+        if ((v & (1 << 63)) == 0) {
+            if (((v >> 59) & 3) == 0) { return 0 - 1; }      # CAIG (60:59) = 0: not performed
+            return 0;
+        }
+        t = t + 1;
     }
-
-    # Map the 2MB region containing the IOMMU registers
-    var phys_2mb = phys_base & 0xFFFFFFFFFFE00000;
-    store64(pd_kva + pd_idx * 8, phys_2mb | 0x83);  # Present + Writable + 2MB
-
-    # Flush TLB
-    asm { mov rax, cr3; }
-    asm { mov cr3, rax; }
-
-    return 0;
+    return 0 - 1;
 }
 
-# Build a single IO page table entry allowing DMA to a 4KB-aligned physical region.
-# For simplicity with 2MB pages: we use "large page" entries (bit 7) in the
-# second-level page table, similar to CPU huge pages.
-# VT-d second-level entry format (2MB): phys_addr | 0x83 (Read+Write+SuperPage)
-
-# Allow DMA to a 2MB-aligned physical region
-#
-# ⛔⛔ 1.56.52 — REFUSE >= 1 GB RATHER THAN ALIASING ONTO AN EXISTING GRANT. There is exactly ONE
-# second-level table (a single 4 KB page = 512 entries x 2 MB = 1 GB), and the context entry hardcodes
-# AGAW=1 / 30-bit (`store64(ctx_entry + 8, 0x0101)`), so the table genuinely spans 1 GB and no more.
-# The index was `(phys >> 21) & 0x1FF`, and that mask made any address at or above 1 GB WRAP onto an
-# existing index and OVERWRITE it — with no present-bit test and no error returned. Two silent
-# consequences at once: the earlier grant at that index is destroyed, and the caller does not get the
-# grant it asked for, because translation is identity (Translation Type = 0) so the device DMAs at
-# IOVA == phys while the table now maps (phys mod 1 GB).
-# ⚠ REACHABLE: `iommu_register_dma(phys)` forwards an arbitrary caller address with only an
-# `iommu_active == 0` early-out, and its callers hand it PMM-allocated buffers.
-# ⚠ Latent on archaemenid (AMD — `iommu_init` returns -1 with no DMAR, so `iommu_active` stays 0) and
-# live on any Intel VT-d box. That is a reason to fix it blind, not a reason to leave it: nothing on
-# this bench can produce the failure, so it would surface first on somebody else`s hardware.
-# ⭐ A REFUSAL, matching the pattern this file`s other two 1.56.52 fixes chose. Silently mapping the
-# wrong thing is worse than telling the caller no.
-fn iommu_allow_dma_2mb(phys) {
-    if (iommu_l2_kva == 0) { return 0 - 1; }
-    if (phys < 0) { return 0 - 1; }
-    if (phys >= 0x40000000) { return 0 - 1; }   # past the single 1 GB second-level table
-    var idx = (phys >> 21) & 0x1FF;
-    var phys_2mb = phys & 0xFFFFFFFFFFE00000;
-    # Second-level PDE: Read(0x01) + Write(0x02) + SuperPage(0x80) = 0x83
-    store64(iommu_l2_kva + idx * 8, phys_2mb | 0x83);
-    iommu_flush_cache(iommu_l2_kva + idx * 8, 8);
-    return 0;
+# kind: 1 = global, 2 = domain-selective (DID 1), 3 = page-selective (iova 2^am x 4 KB, naturally aligned; IH = 0 so the
+# unit also drops any cached NON-leaf entry that maps the range — a table the grant just linked in included).
+fn iommu_inv_iotlb(kind, iova, am) {
+    var cmd = (1 << 63) | (kind << 60) | iommu_drain;       # IVT | IIRG | DR/DW
+    if (kind != 1) { cmd = cmd | (IOMMU_DID << 32); }
+    if (kind == 3) { iommu_write64(iommu_iotlb_off, (iova & 0xFFFFFFFFFFFFF000) | am); }   # IVA: ADDR | IH = 0 | AM
+    iommu_write64(iommu_iotlb_off + 8, cmd);
+    var t = 0;
+    while (t < 1000000) {
+        var v = iommu_read64(iommu_iotlb_off + 8);
+        if ((v & (1 << 63)) == 0) {
+            if (((v >> 57) & 3) == 0) { return 0 - 1; }      # IAIG (58:57) = 0: not performed
+            return 0;
+        }
+        t = t + 1;
+    }
+    return 0 - 1;
 }
 
-# 1.57.9 — Linux __iommu_flush_cache: on remapping hardware that does NOT snoop (ECAP.C == 0) its table
-# walk reads memory, so a table store still sitting dirty in a CPU cache is invisible to it. Write back
-# every cache line of [kva, kva + len) — clflush(addr) is io.cyr's documented single-line helper — then
-# mfence so the write-backs are globally visible before the caller's next register write (RTADDR, the
-# SRTP/TE command, an invalidation). A no-op on coherent hardware. Until 1.57.9 nothing here flushed and
-# ECAP.C was never read: on a non-coherent VT-d unit, SRTP/TE latched tables the hardware saw as stale.
+# Spec §6.8 / Linux iommu_flush_write_buffer: only on RWBF hardware, which may hold a table write in the chipset write
+# buffer where the remapping walk cannot see it. WBF is one-shot and WBFS CLEARS when the flush is done (FreeBSD's
+# dmar_flush_write_bufs waits for it to SET — inverted polarity, not copied). 1 flushed, 0 not needed, -1 timeout.
+fn iommu_flush_write_buffer() {
+    if (iommu_rwbf == 0) { return 0; }
+    iommu_write32(0x18, iommu_gcmd_status() | (1 << 27));   # GCMD.WBF
+    if (iommu_wait_gsts(1 << 27, 0) != 0) { return 0 - 1; }
+    return 1;
+}
+
+# 1.57.9 — Linux __iommu_flush_cache: on remapping hardware that does NOT snoop (ECAP.C == 0) its table walk reads memory,
+# so a table store still sitting dirty in a CPU cache is invisible to it. Write back every cache line of [kva, kva + len)
+# — clflush(addr) is io.cyr's documented single-line helper — then mfence so the write-backs are globally visible before
+# the caller's next register write (RTADDR, SRTP/TE, an invalidation) or the next device access. No-op when ECAP.C == 1.
 fn iommu_flush_cache(kva, len) {
     if (iommu_coherent != 0) { return 0; }
     var a = kva & (0 - 64);
@@ -177,179 +214,616 @@ fn iommu_flush_cache(kva, len) {
     return 0;
 }
 
-# Set up context entry for a PCI device (bus:slot:func) pointing to our IO page tables.
-# Context entry: 128 bits (two 64-bit words).
-#   Lo: Present(1) + FPD(1) + Translation Type(2) + reserved + ASR(address space root)
-#   Hi: Address Width(3) + Avail(4) + reserved + Domain ID(16)
-fn iommu_set_context(bus, slot, func) {
-    if (iommu_ctx_kva == 0) { return 0 - 1; }
-    if (bus != 0) { return 0 - 1; }  # Only bus 0 supported for now
-    var devfn = (slot << 3) | func;
-    var ctx_entry = iommu_ctx_kva + devfn * 16;   # the CPU's pointer; the hardware finds it via iommu_ctx_phys
-
-    # Lo: Present=1, Translation Type=0 (full translation), ASR = IO page table
-    # The ASR points to the second-level PML4-equivalent. For a 3-level walk
-    # (39-bit AGAW), ASR points to a "PML4" which has a single entry pointing
-    # to our level-2 table (the "PD" level).
-    # We use a 2-level walk (30-bit, AGAW=1) for simplicity with 2MB pages.
-    # Lo = ASR | Present(1)
-    # ASR is the 4KB-aligned PHYSICAL address of the second-level page table root (the hardware walks it).
-    var asr = iommu_l2_phys;
-    store64(ctx_entry, (asr & 0xFFFFFFFFF000) | 0x01);
-
-    # Hi: Address Width = 1 (30-bit AGAW, 2-level page table), Domain ID = 1
-    # Bits [2:0] = Address Width (1 = 30-bit), Bits [23:8] = Domain ID
-    store64(ctx_entry + 8, 0x0101);  # AW=1, DomainID=1
-    iommu_flush_cache(ctx_entry, 16);
-
-    return 0;
+# A zeroed, flushed table page. Returns its PHYS (0 = no memory); the caller reaches it through dma_kva(phys).
+fn iommu_table_new() {
+    var tp = pmm_alloc();
+    if (tp == 0) { return 0; }
+    var tn_kva = dma_kva(tp);
+    if (dma_kva_ok(tn_kva) == 0) { pmm_free(tp); return 0; }
+    memset(tn_kva, 0, 4096);
+    iommu_flush_cache(tn_kva, 4096);
+    return tp;
 }
 
-fn iommu_init() {
-    iommu_active = 0;
-    if (acpi_iommu_base == 0) { return 0 - 1; }
-
-    # Map IOMMU MMIO registers
-    iommu_base = acpi_iommu_base;
-    if (iommu_map_mmio(iommu_base) != 0) { return 0 - 1; }
-
-    # Read version
-    var ver = iommu_read32(0x00);
-    if (ver == 0) { return 0 - 1; }
-    if (ver == 0xFFFFFFFF) { return 0 - 1; }
-
-    # Read capabilities
-    var cap = iommu_read64(0x08);
-    # 1.57.9 — ECAP.C (bit 0) BEFORE the first table write: it decides whether iommu_flush_cache must
-    # clflush the tables out of the CPU caches for the hardware walk to see them.
-    iommu_coherent = iommu_read64(0x10) & 1;
-
-    # 1.57.9 (CPUVA) — each table: pmm_alloc gives the PHYS (kept for the hardware), dma_kva the CPU's
-    # pointer (memset/store go through it only), and the boot assert refuses a KVA outside the direct map.
-    # Allocate root entry table (4KB, 256 entries x 16 bytes)
-    iommu_root_phys = pmm_alloc();
-    if (iommu_root_phys == 0) { return 0 - 1; }
-    iommu_root_kva = dma_kva(iommu_root_phys);
-    if (dma_kva_ok(iommu_root_kva) == 0) { return 0 - 1; }
-    memset(iommu_root_kva, 0, 4096);
-
-    # Allocate context entry table for bus 0 (4KB, 256 entries x 16 bytes)
-    iommu_ctx_phys = pmm_alloc();
-    if (iommu_ctx_phys == 0) { return 0 - 1; }
-    iommu_ctx_kva = dma_kva(iommu_ctx_phys);
-    if (dma_kva_ok(iommu_ctx_kva) == 0) { return 0 - 1; }
-    memset(iommu_ctx_kva, 0, 4096);
-
-    # Root entry [0] (bus 0): Present + PHYSICAL pointer to the context table
-    store64(iommu_root_kva, (iommu_ctx_phys & 0xFFFFFFFFF000) | 0x01);
-    store64(iommu_root_kva + 8, 0);
-
-    # Allocate second-level IO page table (like a PD for 2MB pages)
-    iommu_l2_phys = pmm_alloc();
-    if (iommu_l2_phys == 0) { return 0 - 1; }
-    iommu_l2_kva = dma_kva(iommu_l2_phys);
-    if (dma_kva_ok(iommu_l2_kva) == 0) { return 0 - 1; }
-    memset(iommu_l2_kva, 0, 4096);
-
-    # By default, allow DMA to the first 16MB (kernel identity-mapped region).
-    # This covers all static VirtIO DMA buffers in kernel BSS.
-    for (var i = 0; i < 8; i = i + 1) {
-        iommu_allow_dma_2mb(i * 0x200000);
+# Map the 2 MB region holding `pa` to itself (IOVA == phys) in the shared domain. The caller holds iommu_lock, or is
+# iommu_init before any grant can reach the tables. 1 = a new leaf, 0 = already granted, -1 = refused (past the table's
+# reach or MGAW, or no memory for a table). Intermediate tables are created on demand — the walk Linux pfn_to_dma_pte does —
+# and linked only AFTER they are zeroed and flushed, so the hardware can never walk a half-built table.
+# ⛔ 1.56.52 refused phys >= 1 GB because the old table was ONE page (512 x 2 MB) and its index mask wrapped a high address
+# onto an existing grant. The walked table has no such wrap: every level's index comes from its own address bits.
+fn iommu_map_2mb(pa) {
+    if (iommu_top_kva == 0) { return 0 - 1; }
+    if (pa < 0) { return 0 - 1; }
+    if (pa >= iommu_iova_top) { return 0 - 1; }
+    var chunk = pa & 0xFFFFFFFFFFE00000;
+    var tk = iommu_top_kva;                                  # CPU pointer of the table being walked (the direct map)
+    var lvl = iommu_levels;
+    while (lvl > 2) {
+        var slot = tk + ((chunk >> (12 + 9 * (lvl - 1))) & 0x1FF) * 8;
+        var e = load64(slot);
+        if ((e & 3) == 0) {
+            var np = iommu_table_new();
+            if (np == 0) { return 0 - 1; }
+            e = np | 3;                                      # non-leaf: R | W (a walk needs the rights at every level)
+            store64(slot, e);
+            iommu_flush_cache(slot, 8);
+        }
+        tk = dma_kva(e & 0x000FFFFFFFFFF000);
+        lvl = lvl - 1;
     }
-
-    # Set context entries for known PCI devices.
-    # ⛔⛔ 1.56.52 — ROOT ENTRIES AND CONTEXTS EXIST FOR BUS 0 ONLY, SO ENABLING TRANSLATION ON A
-    # MACHINE WITH ANY DEVICE BEHIND A BRIDGE WOULD KILL ITS DMA. Exactly one root entry is written
-    # (bus 0); entries 1..255 stay not-present. This loop passed a hardcoded bus 0 AND func 0, taking
-    # only the slot from pci_devs and ignoring the real bus/func that pci_record already stored in
-    # pci_busfunc — which also made iommu_set_context's own `if (bus != 0) return -1` guard VACUOUS,
-    # since its only caller could never pass anything else. A device at 01:00.0 (the ordinary layout
-    # for NVMe behind a root port) therefore got a context written for bus 0 devfn 0 — the host
-    # bridge — while its real context, under bus 1's root entry, was never touched. The moment
-    # GCMD.TE goes up, every NVMe DMA is rejected with no root entry and the box hangs on a command
-    # that never completes, one line after printing "IOMMU: VT-d enabled".
-    # ⚠ FIX = REFUSE TO ENABLE, not build per-bus tables. Per-bus context tables are the right end
-    # state, but this file has NEVER RUN (it needs a DMAR table, i.e. Intel VT-d; archaemenid is AMD,
-    # and no smoke or test references it), so that rework would be unverifiable here. Refusing is
-    # checkable by inspection and leaves the machine exactly as it ships today — translation off.
-    # ⚠ func is now taken from pci_busfunc, so multi-function devices stop aliasing onto func 0.
-    var offbus = 0;
-    for (var i = 0; i < pci_count; i = i + 1) {
-        var slot = PciDev_slot(&pci_devs + i * 32);
-        var bf = load64(&pci_busfunc + i * 8);
-        var dbus = (bf >> 8) & 0xFF;
-        var dfunc = bf & 0x07;
-        if (dbus != 0) { offbus = offbus + 1; }
-        else { iommu_set_context(0, slot, dfunc); }
+    var leaf_slot = tk + ((chunk >> 21) & 0x1FF) * 8;
+    if ((load64(leaf_slot) & 3) != 0) { return 0; }          # already granted (a 2 MB leaf, or a 4 KB table of one)
+    var leaf = chunk | 0x83;                                 # R | W | PS: a 2 MB page (bits 20:12 zero — it is aligned)
+    if (iommu_sp2m == 0) {
+        var pt = iommu_table_new();                          # no 2 MB leaves on this unit: 512 x 4 KB instead
+        if (pt == 0) { return 0 - 1; }
+        var pt_kva = dma_kva(pt);
+        for (var j = 0; j < 512; j = j + 1) {
+            store64(pt_kva + j * 8, (chunk + j * 4096) | 3);
+        }
+        iommu_flush_cache(pt_kva, 4096);
+        leaf = pt | 3;
     }
-    if (offbus > 0) {
-        kprint("iommu: ", 7);
-        kprint_num(offbus);
-        kprintln(" device(s) off bus 0 - refusing to enable translation", 53);
+    store64(leaf_slot, leaf);
+    iommu_flush_cache(leaf_slot, 8);
+    iommu_n_leaf = iommu_n_leaf + 1;
+    return 1;
+}
+
+# Record a grant made before iommu_init (caller holds iommu_lock). 1 recorded, 0 already recorded, -1 log full.
+fn iommu_pend_add(pa) {
+    if (pa < 0) { return 0 - 1; }
+    var chunk = pa & 0xFFFFFFFFFFE00000;
+    for (var i = 0; i < iommu_pend_n; i = i + 1) {
+        if (load64(&iommu_pend + i * 8) == chunk) { return 0; }
+    }
+    if (iommu_pend_n >= 64) {
+        iommu_pend_lost = iommu_pend_lost + 1;
         return 0 - 1;
     }
+    store64(&iommu_pend + iommu_pend_n * 8, chunk);
+    iommu_pend_n = iommu_pend_n + 1;
+    return 1;
+}
 
-    # 1.57.9 — every table write above reaches memory before the hardware is pointed at the tables
-    # (whole pages: the memsets touched all of them). No-op when ECAP.C == 1.
-    iommu_flush_cache(iommu_root_kva, 4096);
-    iommu_flush_cache(iommu_ctx_kva, 4096);
-    iommu_flush_cache(iommu_l2_kva, 4096);
-
-    # Program root table address register — the PHYS; the only place the root table's address leaves the CPU
-    iommu_write64(0x20, iommu_root_phys & 0xFFFFFFFFF000);
-
-    # Set root table type in GCMD and flush
-    # GCMD: bit 30 = SRTP (Set Root Table Pointer)
-    iommu_write32(0x18, iommu_read32(0x18) | (1 << 30));
-    iommu_wait_status(1 << 30, 1);  # Wait for RTPS (Root Table Pointer Status)
-
-    # Invalidate context cache (global)
-    # CCMD: bit 63 = ICC (Invalidate Context Cache), bits [62:61] = 01 (global)
-    iommu_write64(0x28, (1 << 63) | (1 << 61));
-    var timeout = 0;
-    while (timeout < 1000000) {
-        if ((iommu_read64(0x28) & (1 << 63)) == 0) { break; }
-        timeout = timeout + 1;
+# After a NEW leaf is written while translation is ON (caller holds iommu_lock) — the not-present -> present rule of spec
+# §6.1 / §6.8, as Linux applies it (cache.c cache_tag_flush_range_np; v6.1 __mapping_notify_one: "It's a non-present to
+# present mapping. Only flush if caching mode and second level.") and FreeBSD's dmar_map_buf:
+#   CM = 1 (the unit may have CACHED the not-present entry — QEMU caching-mode=on, any vIOMMU a hypervisor shadows):
+#          invalidate the 2 MB range page-selectively (AM = 9, 2^9 x 4 KB), or the whole domain when the unit has no PSI or
+#          its MAMV cannot express 9 — Linux's and FreeBSD's fallback;
+#   CM = 0 with RWBF: flush the write buffer; CM = 0 otherwise: nothing (hardware never caches a not-present entry).
+# ⛔ Until 1.57.10 nothing followed a runtime grant (issue 2026-09-26): on a CM=1 unit a device could keep faulting on a
+# region it had just been granted. ⚠ QEMU cannot show that failure — it never caches a failed translation — so the gate is
+# the n_psi / n_dsi counters against QEMU's own trace of the IOTLB register (scripts/smoke/vtd-smoke.sh).
+fn iommu_after_new_leaf(pa) {
+    if (iommu_cm != 0) {
+        var r = 0;
+        if (((iommu_cap >> 39) & 1) != 0 && ((iommu_cap >> 48) & 0x3F) >= 9) {
+            r = iommu_inv_iotlb(3, pa & 0xFFFFFFFFFFE00000, 9);
+            iommu_n_psi = iommu_n_psi + 1;
+        } else {
+            r = iommu_inv_iotlb(2, 0, 0);
+            iommu_n_dsi = iommu_n_dsi + 1;
+        }
+        if (r != 0) { iommu_n_inv_fail = iommu_n_inv_fail + 1; }
+        return 0;
     }
+    var w = iommu_flush_write_buffer();
+    if (w > 0) { iommu_n_wbf = iommu_n_wbf + 1; }
+    if (w < 0) { iommu_n_inv_fail = iommu_n_inv_fail + 1; }
+    return 0;
+}
 
-    # Invalidate IOTLB (global)
-    # ECAP tells us the IOTLB register offset
-    var ecap = iommu_read64(0x10);
-    var iro = ((ecap >> 8) & 0x3FF) * 16;  # IOTLB Register Offset
-    if (iro != 0) {
-        # IOTLB invalidate register at iro+8: bit 63 = IVT, bits [62:60] = 001 (global)
-        # ⛔⛔ 1.56.51 FIX — iommu_base WAS ADDED TWICE. iommu_write64/iommu_read64 are
-        # `store64(iommu_base + off, ...)` / `load64(iommu_base + off)`: they take a BARE REGISTER
-        # OFFSET and add the base themselves, which is how every other call site in this file uses
-        # them (0x28, 0x10, 0x18). These two passed `iommu_base + iro + 8`, so the effective address
-        # was `iommu_base * 2 + iro + 8` — with a typical DMAR base of 0xFED90000 that is a 64-bit
-        # store near 0x1FDB2xxxx, roughly 8.5 GB up and outside the single page iommu_map_mmio()
-        # actually mapped. A wild store, and a wild load in the poll below it.
-        # ⚠ AND THE CONSEQUENCE IS NOT ONLY THE STORE: the global IOTLB invalidate therefore never
-        # reached the hardware, so translation was enabled ~20 lines below with a STALE IOTLB. Both
-        # halves are latent on this box (AMD Zen, iommu_active stays 0) and live on Intel VT-d.
-        iommu_write64(iro + 8, (1 << 63) | (1 << 60));
-        timeout = 0;
-        while (timeout < 1000000) {
-            if ((iommu_read64(iro + 8) & (1 << 63)) == 0) { break; }
-            timeout = timeout + 1;
+# Grant a device DMA to the 2 MB region holding `phys` (identity). The one entry point every driver calls, at allocation.
+# Before iommu_init: recorded for the replay. Translation on: mapped + invalidated now. Otherwise: nothing to do.
+# Returns 0 always (the callers' contract since S10); a refusal is counted and said once.
+fn iommu_register_dma(phys) {
+    var f = iommu_lock();
+    var r = 0;
+    if (iommu_init_ran == 0) {
+        r = iommu_pend_add(phys);
+    } else {
+        if (iommu_active != 0) {
+            r = iommu_map_2mb(phys);
+            if (r == 1) {
+                iommu_n_late = iommu_n_late + 1;
+                iommu_after_new_leaf(phys);
+            }
         }
     }
-
-    # Enable translation: GCMD bit 31 = TE (Translation Enable)
-    iommu_write32(0x18, iommu_read32(0x18) | (1 << 31));
-    iommu_wait_status(1 << 31, 1);  # Wait for TES (Translation Enable Status)
-
-    iommu_active = 1;
+    if (r < 0) { iommu_n_refused = iommu_n_refused + 1; }
+    iommu_unlock(f);
+    if (r < 0) {
+        if (iommu_refused_said == 0) {
+            iommu_refused_said = 1;
+            # Once, and LOCK-FREE (klug + COM1 directly, the net_lk_latch shape): a grant can come from interrupt context,
+            # where kprint's console lock may be held by the very code the interrupt stopped.
+            klug_append("iommu: DMA grant REFUSED - a device DMA there will fault (refused= in the boot DMA check)", 89);
+            klug_putc(10);
+            serial_print("iommu: DMA grant REFUSED for phys ", 34);
+            kfmt_hex0x(phys);
+            serial_println(" - a device DMA there will fault", 32);
+        }
+    }
     return 0;
 }
 
-# Register a DMA region for a specific PCI slot (for dynamically allocated buffers)
-fn iommu_register_dma(phys) {
+# Point every devfn of `bus` at the shared domain (Linux domain_context_mapping_one, one context per device; here all 256,
+# so a DMA alias of any device on the bus — a PCIe-to-PCI bridge's secondary-bus requester id, a phantom function — hits
+# the same grants). Only before TE (iommu_init): no context changes afterwards, so the CM context flush is never needed.
+# 1 = installed, 0 = the bus already has one, -1 = no memory.
+# ⛔ 1.56.52 made iommu_init REFUSE a machine with any device off bus 0, because only bus 0's root entry existed — and
+# then every real box refused (NVMe behind a root port is the ordinary layout). Per-bus tables are that "right end
+# state" it named; vtd-smoke puts the xHCI behind a pcie-root-port to exercise one.
+fn iommu_bus_context(bus) {
+    if (bus < 0) { return 0 - 1; }
+    if (bus > 255) { return 0 - 1; }
+    var re = iommu_root_kva + bus * 16;
+    if ((load64(re) & 1) != 0) { return 0; }
+    var cp = iommu_table_new();
+    if (cp == 0) { return 0 - 1; }
+    var cx_kva = dma_kva(cp);
+    var lo = (iommu_top_phys & 0x000FFFFFFFFFF000) | 1;      # SLPTPTR | P; FPD = 0 (faults recorded); TT = 00 (translate)
+    var hi = (iommu_levels - 2) | (IOMMU_DID << 8);          # AW: 1 = 39-bit 3-level, 2 = 48-bit 4-level, 3 = 57-bit 5-level
+    for (var d = 0; d < 256; d = d + 1) {
+        store64(cx_kva + d * 16 + 8, hi);
+        store64(cx_kva + d * 16, lo);
+    }
+    iommu_flush_cache(cx_kva, 4096);
+    store64(re + 8, 0);
+    store64(re, (cp & 0x000FFFFFFFFFF000) | 1);              # CTP | P
+    iommu_flush_cache(re, 16);
+    iommu_ctx_buses = iommu_ctx_buses + 1;
+    return 1;
+}
+
+# Drain the fault-recording registers (Linux dmar_fault, FreeBSD dmar_fault_intr): each record's F bit (127) is
+# write-1-to-clear; FSTS.PFO (overflow — more faults than records) is too. `say` = print up to four records. Returns how
+# many were pending (an overflow counts as one more). Reads only registers that no other path writes.
+fn iommu_fault_scan(say) {
+    if (iommu_base == 0) { return 0; }
+    if (iommu_fro == 0) { return 0; }
+    var n = 0;
+    for (var i = 0; i < iommu_nfr; i = i + 1) {
+        var fr = iommu_fro + i * 16;
+        var hi = iommu_read32(fr + 12);
+        if ((hi & 0x80000000) != 0) {
+            n = n + 1;
+            if (say != 0) {
+                if (n <= 4) {
+                    var sid = iommu_read32(fr + 8) & 0xFFFF;
+                    kprint("iommu: FAULT dev ", 17);
+                    kprint_byte((sid >> 8) & 0xFF);
+                    kprint(":", 1);
+                    kprint_byte((sid >> 3) & 0x1F);
+                    kprint(".", 1);
+                    kprint_num(sid & 7);
+                    kprint(" addr 0x", 8);
+                    kprint_hex(iommu_read64(fr) & 0xFFFFFFFFFFFFF000);
+                    kprint(" reason 0x", 10);
+                    kprint_byte(hi & 0xFF);
+                    if (((hi >> 30) & 1) != 0) { kprintln(" (read)", 7); } else { kprintln(" (write)", 8); }
+                }
+            }
+            iommu_write32(fr + 12, 0x80000000);
+        }
+    }
+    var fsts = iommu_read32(0x34);
+    if ((fsts & 1) != 0) {
+        n = n + 1;
+        if (say != 0) { kprintln("iommu: FAULT overflow (FSTS.PFO) - more faults than fault records", 65); }
+    }
+    iommu_write32(0x34, 0x03);                               # FSTS: W1C PFO (and PPF, as Linux writes it)
+    return n;
+}
+
+# Close the pre-init log without enabling translation (no DMAR, or an init that refused): later grants are no-ops.
+fn iommu_close_log() {
+    var f = iommu_lock();
+    iommu_init_ran = 1;
+    iommu_unlock(f);
+    return 0;
+}
+
+# Every refusal site prints its own reason first (a literal kprintln, so scripts/check/kprint-len-check.sh counts it).
+fn iommu_fail() {
+    iommu_close_log();
+    return 0 - 1;
+}
+
+# Linux iommu_disable_protect_mem_regions, after TE: only where CAP.PLMR / CAP.PHMR exist and firmware left PMEN.EPM set
+# (a TXT launch). Clear EPM, wait PRS clear. 1 disabled, 0 nothing to do, -1 timeout.
+fn iommu_disable_pmr() {
+    if (((iommu_cap >> 5) & 3) == 0) { return 0; }
+    var pm = iommu_read32(0x64);
+    if ((pm & 0x80000000) == 0) { return 0; }
+    iommu_write32(0x64, pm & 0x7FFFFFFF);
+    var t = 0;
+    while (t < 1000000) {
+        if ((iommu_read32(0x64) & 1) == 0) { return 1; }
+        t = t + 1;
+    }
+    return 0 - 1;
+}
+
+# Bring the unit up with translation ON. Order (Linux init_dmars + iommu_set_root_entry + iommu_enable_translation; spec
+# §6.6): quiesce what firmware left on, build the tables (default 16 MB, RMRRs, the per-bus contexts), point RTADDR at
+# them, SRTP, global context-cache then global IOTLB invalidation, write-buffer flush, then — under iommu_lock, so no
+# grant can slip between the two — replay the pre-init log and set TE. Every wait is checked; any failure leaves
+# translation OFF (the state every boot before 1.57.10 was in) and says why. 0 = translation on, -1 = not.
+fn iommu_init() {
+    iommu_active = 0;
+    if (acpi_iommu_base == 0) {
+        iommu_close_log();
+        return 0 - 1;
+    }
+    iommu_base = acpi_iommu_base;
+    # The register block (0x230 bytes on QEMU, a page on iron) sits in the 2 MB chunk shared with the IOAPIC and HPET
+    # (0xFEC00000-0xFEDFFFFF) under PDPT[3], which pt_init installs as a 1 GB PAGE. vmm_remap_uc_2mb is the path every
+    # other MMIO driver maps through (xhci, nvme, ahci, amd_iommu_disable): it shatters PDPT[3] once (idempotently) and marks
+    # the chunk UC; at boot, before any process exists, so every per-process PDPT copies the result.
+    # ⛔ Until 1.57.10 iommu_map_mmio REFUSED exactly this PDPT[3] 1 GB page (1.56.52: "refuse rather than shatter" on a
+    # path no test could reach) — which is why no boot ever got past this line.
+    if (vmm_remap_uc_2mb(iommu_base) == 0) { kprintln("iommu: translation NOT enabled - could not map the register block UC", 68); return iommu_fail(); }
+    iommu_ver = iommu_read32(0x00);
+    if (iommu_ver == 0) { kprintln("iommu: translation NOT enabled - VER reads 0", 44); return iommu_fail(); }
+    if (iommu_ver == 0xFFFFFFFF) { kprintln("iommu: translation NOT enabled - VER reads all-ones", 51); return iommu_fail(); }
+    # Spec §6.5.1 / CCMD / IOTLB_REG: register-based invalidation is deprecated, and at VER major >= 6 every such request is
+    # an incorrect one — that hardware needs queued invalidation, which this file does not implement (see the issue).
+    if (((iommu_ver >> 4) & 0xF) >= 6) { kprintln("iommu: translation NOT enabled - VER >= 6.0 needs queued invalidation", 69); return iommu_fail(); }
+    iommu_cap = iommu_read64(0x08);
+    iommu_ecap = iommu_read64(0x10);
+    # 1.57.9 — ECAP.C BEFORE the first table write: it decides whether iommu_flush_cache must clflush.
+    iommu_coherent = iommu_ecap & 1;
+    iommu_cm = (iommu_cap >> 7) & 1;
+    iommu_rwbf = (iommu_cap >> 4) & 1;
+    iommu_sp2m = (iommu_cap >> 34) & 1;
+    var sagaw = (iommu_cap >> 8) & 0x1F;
+    iommu_levels = 0;
+    if ((sagaw & 8) != 0) { iommu_levels = 5; }
+    if ((sagaw & 2) != 0) { iommu_levels = 3; }
+    if ((sagaw & 4) != 0) { iommu_levels = 4; }
+    if (iommu_levels == 0) { kprintln("iommu: translation NOT enabled - SAGAW offers no 3/4/5-level table", 66); return iommu_fail(); }
+    var aw = 12 + 9 * iommu_levels;
+    var mgaw = ((iommu_cap >> 16) & 0x3F) + 1;
+    if (mgaw < aw) { aw = mgaw; }
+    if (aw > 57) { aw = 57; }
+    iommu_iova_top = 1 << aw;
+    iommu_iotlb_off = ((iommu_ecap >> 8) & 0x3FF) * 16;
+    if (iommu_iotlb_off == 0) { kprintln("iommu: translation NOT enabled - ECAP.IRO is 0 (no IOTLB register)", 66); return iommu_fail(); }
+    iommu_drain = 0;
+    if (((iommu_cap >> 55) & 1) != 0) { iommu_drain = iommu_drain | (1 << 49); }
+    if (((iommu_cap >> 54) & 1) != 0) { iommu_drain = iommu_drain | (1 << 48); }
+    iommu_fro = ((iommu_cap >> 24) & 0x3FF) * 16;
+    iommu_nfr = ((iommu_cap >> 40) & 0xFF) + 1;
+
+    # What firmware (or a previous kernel) left on. Linux turns a pre-enabled TE off outside kdump; queued invalidation must
+    # be off for the register interface used here (QEMU drops a register command while QIE is set and leaves ICC / IVT
+    # set). Interrupt remapping, if on, is carried along untouched by iommu_gcmd_status's persistent bits.
+    var gs = iommu_read32(0x1C);
+    if ((gs & (1 << 31)) != 0) {
+        iommu_write32(0x18, iommu_gcmd_status() & 0x7FFFFFFF);          # TE off
+        if (iommu_wait_gsts(1 << 31, 0) != 0) { kprintln("iommu: translation NOT enabled - firmware left TE on and it would not clear", 75); return iommu_fail(); }
+    }
+    if ((gs & (1 << 26)) != 0) {
+        iommu_write32(0x18, iommu_gcmd_status() & 0xFBFFFFFF);          # QIE off
+        if (iommu_wait_gsts(1 << 26, 0) != 0) { kprintln("iommu: translation NOT enabled - firmware left QI on and it would not clear", 75); return iommu_fail(); }
+    }
+
+    # 1.57.9 (CPUVA) — each table: pmm_alloc gives the PHYS (for the hardware), dma_kva the CPU's pointer (memset/store go
+    # through it only), and iommu_table_new's dma_kva_ok refuses a KVA outside the direct map.
+    iommu_root_phys = iommu_table_new();
+    if (iommu_root_phys == 0) { kprintln("iommu: translation NOT enabled - no memory for the root table", 61); return iommu_fail(); }
+    iommu_root_kva = dma_kva(iommu_root_phys);
+    iommu_top_phys = iommu_table_new();
+    if (iommu_top_phys == 0) { kprintln("iommu: translation NOT enabled - no memory for the top SL table", 63); return iommu_fail(); }
+    iommu_top_kva = dma_kva(iommu_top_phys);
+
+    # The default grant: the first 16 MB — the kernel image (< 4 MB) with its .bss DMA buffers (vblk_dma_buf, vnet_rx_buf,
+    # AHCI's .bss callers), the boot stacks and the region-7 kstack pool; pmm pages that land there are covered too.
+    for (var i = 0; i < 8; i = i + 1) {
+        if (iommu_map_2mb(i * 0x200000) < 0) { kprintln("iommu: translation NOT enabled - no memory for the default 16 MB grant", 70); return iommu_fail(); }
+    }
+    # Firmware RMRRs (spec §8.4: memory a device may DMA to before and after the OS takes over — USB legacy emulation, an
+    # integrated GPU's stolen memory, a BMC): identity-granted before TE, as Linux IOMMU_RESV_DIRECT and FreeBSD
+    # domain_init_rmrr do. acpi_parse_dmar keeps segment-0 ranges of at most 1 GB. QEMU publishes none (static gate).
+    for (var ri = 0; ri < acpi_dmar_rmrr_n; ri = ri + 1) {
+        var ra = load64(&acpi_dmar_rmrr + ri * 16) & 0xFFFFFFFFFFE00000;
+        var rl = load64(&acpi_dmar_rmrr + ri * 16 + 8);
+        while (ra <= rl) {
+            var rm = iommu_map_2mb(ra);
+            if (rm < 0) { kprintln("iommu: translation NOT enabled - an RMRR could not be granted", 61); return iommu_fail(); }
+            if (rm == 1) { iommu_n_rmrr = iommu_n_rmrr + 1; }
+            ra = ra + 0x200000;
+        }
+    }
+    # Context tables: every bus pci_scan found a function on (the 256-bus sweep, so bridges' secondary buses included).
+    for (var k = 0; k < pci_count; k = k + 1) {
+        var cbus = (load64(&pci_busfunc + k * 8) >> 8) & 0xFF;
+        if (iommu_bus_context(cbus) < 0) { kprintln("iommu: translation NOT enabled - no memory for a context table", 62); return iommu_fail(); }
+    }
+    iommu_flush_cache(iommu_root_kva, 4096);                 # every entry was flushed at its store; the page once more
+
+    # Point the unit at the tables (legacy mode: RTADDR bits 11:10 = 00), latch with SRTP, then — spec §6.6, Linux
+    # iommu_set_root_entry — a global context-cache and a global IOTLB invalidation (QEMU sets ESRTPS, which makes them
+    # redundant there; iron without it needs them), and a write-buffer flush on RWBF hardware.
+    iommu_write64(0x20, iommu_root_phys & 0x000FFFFFFFFFF000);
+    iommu_write32(0x18, iommu_gcmd_status() | (1 << 30));   # GCMD.SRTP (one-shot)
+    if (iommu_wait_gsts(1 << 30, 1) != 0) { kprintln("iommu: translation NOT enabled - root table pointer not latched (RTPS)", 70); return iommu_fail(); }
+    if (iommu_inv_context_global() != 0) { kprintln("iommu: translation NOT enabled - global context-cache invalidation failed", 73); return iommu_fail(); }
+    if (iommu_inv_iotlb(1, 0, 0) != 0) { kprintln("iommu: translation NOT enabled - global IOTLB invalidation failed", 65); return iommu_fail(); }
+    if (iommu_flush_write_buffer() < 0) { kprintln("iommu: translation NOT enabled - write-buffer flush timed out", 61); return iommu_fail(); }
+    iommu_fault_scan(0);                                      # stale records from before this kernel: drop them quietly
+
+    # Replay + TE, atomically with respect to every other granter: a grant from an ISR (or, later, an AP) either lands in
+    # the log before this reads it, or finds iommu_init_ran = 1 and takes the live path after TE. The replayed leaves need
+    # no invalidation — translation is still off and the caches were just invalidated globally.
+    var f = iommu_lock();
+    var bad = 0;
+    for (var p = 0; p < iommu_pend_n; p = p + 1) {
+        if (iommu_map_2mb(load64(&iommu_pend + p * 8)) < 0) { bad = bad + 1; }
+        iommu_n_replayed = iommu_n_replayed + 1;
+    }
+    iommu_init_ran = 1;
+    var te = 0;
+    if (bad == 0) {
+        if (iommu_pend_lost == 0) {
+            iommu_write32(0x18, iommu_gcmd_status() | (1 << 31));   # GCMD.TE
+            if (iommu_wait_gsts(1 << 31, 1) == 0) {
+                te = 1;
+                iommu_active = 1;
+            } else {
+                iommu_write32(0x18, iommu_gcmd_status() & 0x7FFFFFFF);   # never leave a half-enabled unit behind
+            }
+        }
+    }
+    iommu_unlock(f);
+    if (bad != 0) { kprintln("iommu: translation NOT enabled - a pre-init grant could not be replayed", 71); return iommu_fail(); }
+    if (iommu_pend_lost != 0) { kprintln("iommu: translation NOT enabled - the pre-init grant log overflowed (grants lost)", 80); return iommu_fail(); }
+    if (te == 0) { kprintln("iommu: translation NOT enabled - translation enable not latched (TES)", 69); return iommu_fail(); }
+    iommu_disable_pmr();
+
+    kprint("IOMMU: VT-d unit 0x", 19);
+    kprint_hex(iommu_base);
+    kprint(" ver ", 5);
+    kprint_num((iommu_ver >> 4) & 0xF);
+    kprint(".", 1);
+    kprint_num(iommu_ver & 0xF);
+    kprint(" levels=", 8);
+    kprint_num(iommu_levels);
+    kprint(" cm=", 4);
+    kprint_num(iommu_cm);
+    kprint(" rwbf=", 6);
+    kprint_num(iommu_rwbf);
+    kprint(" coherent=", 10);
+    kprint_num(iommu_coherent);
+    kprint(" sp2m=", 6);
+    kprint_num(iommu_sp2m);
+    kprint(" buses=", 7);
+    kprint_num(iommu_ctx_buses);
+    kprint(" rmrr=", 6);
+    kprint_num(iommu_n_rmrr);
+    kprint(" replayed=", 10);
+    kprint_num(iommu_n_replayed);
+    kprint(" iotlb=0x", 9);
+    kprint_hex(iommu_iotlb_off + 8);
+    kprintln("", 0);
+    return 0;
+}
+
+# The late check (main.cyr, after every boot-time DMA user — xHCI/HID/MSC, NVMe, virtio, AHCI, HDA, the mounts, DHCP): any
+# DMA a grant missed has been recorded in the unit's fault registers by now. One line, faults first; silent when VT-d is
+# off. Returns the faults drained.
+fn iommu_boot_report() {
     if (iommu_active == 0) { return 0; }
-    iommu_allow_dma_2mb(phys);
-    return 0;
+    var nf = iommu_fault_scan(1);
+    iommu_n_faults = iommu_n_faults + nf;
+    kprint("IOMMU: boot DMA check - faults=", 31);
+    kprint_num(iommu_n_faults);
+    kprint(" leaves=", 8);
+    kprint_num(iommu_n_leaf);
+    kprint(" late=", 6);
+    kprint_num(iommu_n_late);
+    kprint(" psi=", 5);
+    kprint_num(iommu_n_psi);
+    kprint(" dsi=", 5);
+    kprint_num(iommu_n_dsi);
+    kprint(" wbf=", 5);
+    kprint_num(iommu_n_wbf);
+    kprint(" inv_fail=", 10);
+    kprint_num(iommu_n_inv_fail);
+    kprint(" refused=", 9);
+    kprint_num(iommu_n_refused);
+    kprintln("", 0);
+    return nf;
 }
+
+
+#ifdef VTD_SELFTEST
+# ⭐ 1.57.10 (VTD) — TEST-ONLY: does translation ENFORCE, and does a grant made AFTER TE work? (scripts/smoke/vtd-smoke.sh)
+# A QEMU boot never makes a post-TE grant that needs a NEW leaf on its own (measured, 1.57.10: late=0) — pmm_alloc hands
+# pages out top-down, so every driver after iommu_init lands in the 2 MB region the replayed xHCI grants already opened,
+# and the boot's one pmm_alloc_2mb user (HDA's PCM ring) gets a low region inside the default 16 MB — so without this the
+# runtime path (iommu_after_new_leaf, the CM invalidation) would never run in a gate. (A long-running box does reach it.)
+# On an NVMe controller (BSP, late in boot, after every boot DMA user and before iommu_boot_report):
+#   A. BLOCKED — a fresh 2 MB region nothing has granted, filled 0xA5; IDENTIFY CONTROLLER is told to DMA its 4 KB there.
+#      The command must FAIL, the page must still be all 0xA5, and the unit must have RECORDED the fault: source = the
+#      NVMe's bus:dev.fn, address = the page, a write. That is the proof the domain is really enforced (not a pass-through).
+#   B. GRANT after TE — iommu_register_dma(region): exactly ONE new leaf (late +1), and exactly the invalidation the unit
+#      needs (CM=1: one PSI — or DSI without PSI; CM=0: none, a write-buffer flush only on RWBF hardware).
+#   C. ALLOWED — the same IDENTIFY into the now-granted page must succeed and equal, byte for byte, the IDENTIFY data read
+#      into the always-granted page the driver uses (nvme_ident_phys). No fault may be recorded.
+# ⚠ QEMU never caches a failed translation, so C passes on QEMU even with the CM invalidation deleted: B's count, and the
+# smoke's check of QEMU's own trace of the IVA / IOTLB registers, are what catch that mutant.
+fn vtdst_granted(pa) {
+    var tk = iommu_top_kva;
+    var lvl = iommu_levels;
+    while (lvl > 2) {
+        var e = load64(tk + ((pa >> (12 + 9 * (lvl - 1))) & 0x1FF) * 8);
+        if ((e & 3) == 0) { return 0; }
+        tk = dma_kva(e & 0x000FFFFFFFFFF000);
+        lvl = lvl - 1;
+    }
+    if ((load64(tk + ((pa >> 21) & 0x1FF) * 8) & 3) == 0) { return 0; }
+    return 1;
+}
+
+fn vtd_selftest() {
+    kprintln("vtdst: start", 12);
+    if (iommu_active == 0) {
+        kprintln("vtdst: SKIP translation is off", 30);
+        kprintln("vtdst: done", 11);
+        return 0;
+    }
+    if (nvme_admin_ready == 0) {
+        kprintln("vtdst: SKIP no NVMe admin queue", 31);
+        kprintln("vtdst: done", 11);
+        return 0;
+    }
+    var reg = pmm_alloc_2mb_run(1);
+    if (reg == 0) {
+        kprintln("vtdst: SKIP no free 2 MB region", 31);
+        kprintln("vtdst: done", 11);
+        return 0;
+    }
+    var bad = 0;
+    if (vtdst_granted(reg) != 0) {
+        kprintln("vtdst: FAIL the test region is already granted - the blocked arm would prove nothing", 84);
+        bad = bad + 1;
+    }
+    var sbf = load64(&pci_busfunc + nvme_pci_idx * 8);
+    var nsid = (((sbf >> 8) & 0xFF) << 8) | (PciDev_slot(&pci_devs + nvme_pci_idx * 32) << 3) | (sbf & 7);
+    var rg_kva = dma_kva(reg);
+    memset(rg_kva, 0xA5, 4096);
+    iommu_fault_scan(0);                                      # start from an empty fault log
+
+    # A. blocked
+    var s1 = nvme_admin_poll(nvme_admin_submit(0x06, 0, reg, 0x01, 0));
+    var dirty = 0;
+    for (var i = 0; i < 4096; i = i + 1) {
+        if (load8(rg_kva + i) != 0xA5) { dirty = dirty + 1; }
+    }
+    var fsid = 0 - 1;
+    var faddr = 0;
+    var fwhy = 0;
+    var fread = 0;
+    for (var fi = 0; fi < iommu_nfr; fi = fi + 1) {
+        var fhi = iommu_read32(iommu_fro + fi * 16 + 12);
+        if ((fhi & 0x80000000) != 0) {
+            if (fsid < 0) {
+                fsid = iommu_read32(iommu_fro + fi * 16 + 8) & 0xFFFF;
+                faddr = iommu_read64(iommu_fro + fi * 16) & 0xFFFFFFFFFFFFF000;
+                fwhy = fhi & 0xFF;
+                fread = (fhi >> 30) & 1;
+            }
+        }
+    }
+    var nf1 = iommu_fault_scan(0);
+    kprint("vtdst: blocked status=0x", 24);
+    kprint_hex(s1);
+    kprint(" dirty=", 7);
+    kprint_num(dirty);
+    kprint(" faults=", 8);
+    kprint_num(nf1);
+    kprint(" sid=0x", 7);
+    kprint_hex(fsid);
+    kprint(" nvme=0x", 8);
+    kprint_hex(nsid);
+    kprint(" addr=0x", 8);
+    kprint_hex(faddr);
+    kprint(" reason=0x", 10);
+    kprint_hex(fwhy);
+    kprint(" read=", 6);
+    kprint_num(fread);
+    kprintln("", 0);
+    # ⚠ The command's STATUS is reported, not required: QEMU's NVMe completes an IDENTIFY whose data write the IOMMU
+    # rejected with status 0 (measured, 1.57.10). The proof of enforcement is the page (untouched) and the unit's own
+    # fault record (this device, this page, a write).
+    var aok = 0;
+    if (dirty == 0) {
+        if (nf1 >= 1) {
+            if (fsid == nsid) {
+                if (faddr == reg) {
+                    if (fread == 0) { aok = 1; }
+                }
+            }
+        }
+    }
+    if (aok == 1) { kprintln("vtdst: blocked PASS", 19); } else { kprintln("vtdst: blocked FAIL", 19); bad = bad + 1; }
+
+    # B. grant after TE
+    var l0 = iommu_n_late;
+    var p0 = iommu_n_psi;
+    var d0 = iommu_n_dsi;
+    var w0 = iommu_n_wbf;
+    iommu_register_dma(reg);
+    var dl = iommu_n_late - l0;
+    var dp = iommu_n_psi - p0;
+    var dd = iommu_n_dsi - d0;
+    var dw = iommu_n_wbf - w0;
+    kprint("vtdst: grant after TE new_leaf=", 31);
+    kprint_num(dl);
+    kprint(" psi=+", 6);
+    kprint_num(dp);
+    kprint(" dsi=+", 6);
+    kprint_num(dd);
+    kprint(" wbf=+", 6);
+    kprint_num(dw);
+    kprint(" cm=", 4);
+    kprint_num(iommu_cm);
+    kprint(" rwbf=", 6);
+    kprint_num(iommu_rwbf);
+    kprintln("", 0);
+    var bok = 0;
+    if (dl == 1) {
+        if (vtdst_granted(reg) == 1) {
+            if (iommu_cm != 0) {
+                if (dp + dd == 1) { bok = 1; }
+            } else {
+                if (dp + dd == 0) {
+                    if (dw == iommu_rwbf) { bok = 1; }
+                }
+            }
+        }
+    }
+    if (bok == 1) { kprintln("vtdst: grant PASS", 17); } else { kprintln("vtdst: grant FAIL", 17); bad = bad + 1; }
+
+    # C. allowed, byte-exact against the driver's own (always-granted) IDENTIFY page
+    var s2 = nvme_admin_poll(nvme_admin_submit(0x06, 0, nvme_ident_phys, 0x01, 0));
+    var s3 = nvme_admin_poll(nvme_admin_submit(0x06, 0, reg, 0x01, 0));
+    var diff = 0;
+    for (var j = 0; j < 512; j = j + 1) {
+        if (load64(rg_kva + j * 8) != load64(nvme_ident_kva + j * 8)) { diff = diff + 1; }
+    }
+    var nf2 = iommu_fault_scan(1);
+    kprint("vtdst: allowed status=0x", 24);
+    kprint_hex(s3);
+    kprint(" ref_status=0x", 14);
+    kprint_hex(s2);
+    kprint(" diff_qwords=", 13);
+    kprint_num(diff);
+    kprint(" vid=0x", 7);
+    kprint_hex(load16(rg_kva));
+    kprint(" faults=", 8);
+    kprint_num(nf2);
+    kprintln("", 0);
+    var cok = 0;
+    if (s2 == 0) {
+        if (s3 == 0) {
+            if (diff == 0) {
+                if (nf2 == 0) {
+                    if (load16(rg_kva) == nvme_ctrl_vid) { cok = 1; }
+                }
+            }
+        }
+    }
+    if (cok == 1) { kprintln("vtdst: allowed PASS", 19); } else { kprintln("vtdst: allowed FAIL", 19); bad = bad + 1; }
+    if (bad == 0) { kprintln("vtdst: PASS", 11); } else { kprintln("vtdst: FAIL", 11); }
+    kprintln("vtdst: done", 11);
+    return bad;
+}
+#endif
 
 # === AMD-Vi IOMMU Disable — Repair (GG), 2026-05-17 ===
 #

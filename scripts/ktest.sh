@@ -10,6 +10,14 @@
 # (`gnoboot: fail @ EBS`, no "AGNOS kernel v" line) printed "ERROR: test output not found (kernel may have
 # crashed …)" and exited 1 — indistinguishable from a kernel that died; S3c's M-E3/M-E5 runs hit exactly that.
 # The serial log is kept at build/ktest-logs/ktest.log (and each VOID attempt as ktest.log.attemptN).
+# ⭐ 1.57.10 (HAR2 — issue 2026-09-26-harness-backlog-after-1-57-9, item 1): THIS SCRIPT LEAVES A PLAIN build/agnos.
+# It used to leave its TEST kernel there, and the next plain-kernel smoke was REFUSED by smoke_require_image
+# ("built with [TEST]", measured by SMOKES3 at 1.57.9: agnsh-smoke straight after ktest). The TEST kernel is now
+# booted from its COPY build/agnos_ktest, and the tree is rebuilt PLAIN right after that copy, before the boot
+# (the blk-write/msc-cdb pattern). An EXIT trap does the same on every other way out once the TEST build has
+# started: a failed build, ^C, TERM. The order in that trap matters. boot_finish.cyr is restored FIRST,
+# because a plain build of the REWRITTEN source calls sh_cmd_test() with no TEST define and refuses to link.
+# The plain build's output is build/ktest-logs/build-plain.log.
 #
 # History (why this is a rewrite, not the original): pre-1.36.2 this script
 # sed-patched core/main.cyr + user/test_procs.cyr and booted the ELF32 kernel
@@ -51,13 +59,29 @@ BFIN_CYR="$ROOT/kernel/core/boot_finish.cyr"
 # `.ktestbak` + the EXIT/INT/TERM trap below make that class of bug impossible.
 BFIN_BAK="$BFIN_CYR.ktestbak"
 cp "$BFIN_CYR" "$BFIN_BAK"
+KLOGS="$ROOT/build/ktest-logs"
+rm -rf "$KLOGS"; mkdir -p "$KLOGS"
 
 # Restore boot_finish.cyr no matter how we exit (build error, QEMU failure,
 # parse failure, ^C). Set BEFORE the sed so any failure path restores.
 restore_sources() {
     [ -f "$BFIN_BAK" ] && mv -f "$BFIN_BAK" "$BFIN_CYR"
 }
-trap restore_sources EXIT INT TERM
+# 1.57.10 (HAR2): once the TEST build has started, build/agnos is left PLAIN (see the header). A no-op
+# before that point, and after the explicit restore below (KTEST_BUILT goes back to 0).
+KTEST_BUILT=0
+restore_plain() {
+    [ "$KTEST_BUILT" = 1 ] || return 0
+    KTEST_BUILT=0
+    echo "Restoring a PLAIN build/agnos (the TEST kernel boots from build/agnos_ktest)..." >&2
+    sh "$ROOT/scripts/build.sh" > "$KLOGS/build-plain.log" 2>&1 \
+        || echo "WARN: could not restore the plain build/agnos — run: sh scripts/build.sh (log: $KLOGS/build-plain.log)" >&2
+}
+# Sources FIRST: a plain build of the rewritten boot_finish.cyr would call sh_cmd_test() without TEST.
+ktest_exit() { restore_sources; restore_plain; }
+trap ktest_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Guard the call-site rewrite: if the launch site ever moves or is renamed (as it
 # did at the 1.36.2 split), the sed would silently no-op and sh_cmd_test() would
@@ -114,13 +138,16 @@ grep -q 'sh_cmd_test(); power_stop_final();' "$BFIN_CYR" || {
 # the SAME ELF64 path the real kernel does — the legacy `qemu -kernel` ELF32
 # entry hangs in apic_init under modern QEMU, so ktest (like bench + every
 # smoke) boots via gnoboot + OVMF below.
+KTEST_BUILT=1
 TEST=1 sh "$ROOT/scripts/build.sh" >&2
 cp "$ROOT/build/agnos" "$ROOT/build/agnos_ktest"
 
-# Sources restored — undo the trap so a later failure doesn't try to restore
-# already-restored files.
+# Sources restored, then build/agnos rebuilt PLAIN before the boot (the boot uses the copy). Both are then
+# done, so the traps are cleared: a later exit has nothing left to restore.
 restore_sources
+restore_plain
 trap - EXIT INT TERM
+sed -n 's/^flags=/  build\/agnos restored: flags=/p' "$ROOT/build/agnos.flags" 2>/dev/null | sed 's/flags=$/flags= (plain)/'
 
 echo "Booting test kernel via gnoboot + OVMF (${QEMU_TIMEOUT:-90}s dwell per attempt, banner-gated retry)..."
 # gnoboot is the only ELF64 entry path (QEMU rejects the ELF64 kernel on its
@@ -168,8 +195,6 @@ cp "$OVMF_VARS_SRC" "$KWORK/vars.fd"; chmod +w "$KWORK/vars.fd"
 # Prefer KVM when available; fall back to -cpu max (TCG). KTEST_KVM=0 forces TCG.
 KTEST_ACCEL="-cpu max"
 if [ -r /dev/kvm ] && [ "${KTEST_KVM:-1}" = "1" ]; then KTEST_ACCEL="-enable-kvm -cpu host"; fi
-KLOGS="$ROOT/build/ktest-logs"
-rm -rf "$KLOGS"; mkdir -p "$KLOGS"
 KLOG="$KLOGS/ktest.log"
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # qemu_dwell_kernel, qemu_assert_booted
 # End a failed firmware hand-off early (it is terminal, not slow); the retry itself stays banner-gated.

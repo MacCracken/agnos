@@ -2,7 +2,7 @@
 # sock-wait-smoke — agnos 1.57.7 step S6, ring-3 end-to-end on a PLAIN kernel (D19): tests/sockwait seeded as
 # /bin/agnsh (the driver) and /bin/sockw (every child role), plus a host sink on 127.0.0.1:HP (reached as 10.0.2.2).
 #
-# Issue: docs/development/issues/2026-09-23-sock-send-and-connect-hold-the-cpu.md — sock_connect#47, sock_send#48,
+# Issue: docs/development/issues/archived/2026-09-23-sock-send-and-connect-hold-the-cpu.md — sock_connect#47, sock_send#48,
 # icmp_echo#55/#100 held the CPU (preempt disabled) for up to ~8 s; now they block ONLY their caller.
 #
 # Phases (tests/sockwait/sockw.cyr has the detail; LO = 127.0.0.1, IP = net_ip):

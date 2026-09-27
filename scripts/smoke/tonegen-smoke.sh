@@ -170,7 +170,7 @@ PY
     # gap ... (continuous across 180/180 10ms windows)" · "tonegen-smoke: PASS", exit 0. A 1000 Hz
     # capture — right path, wrong rate, i.e. a sample-rate regression — scored green the same way.
     # ⭐ WHY IT IS SAFE TO SCORE IT NOW, when it was examined and left a WARN at 1.56.58 (the sweep's
-    # one declined finding — docs/development/issues/2026-09-02-vacuous-gates-sweep.md:15): all a WARN
+    # one declined finding — docs/development/issues/archived/2026-09-02-vacuous-gates-sweep.md:15): all a WARN
     # can buy is protection from a false red on an untrustworthy measurement, and the floor added at
     # the bottom of this block in that SAME cut already refuses the verdict when the tone was not
     # located or fewer than $WN windows were read — which is every case in which this number is not

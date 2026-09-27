@@ -364,3 +364,41 @@ smoke_require_image() {
     fi
     return 0
 }
+
+# smoke_stage_rootfs <tree root> (1.57.10 HAR2 — issue 2026-09-26-harness-backlog-after-1-57-9, item 7).
+# Stages the agnos-fs tree <root>/build/rootfs WHEN IT IS ABSENT, using its own recipe:
+#   · scripts/burn/stage-agnsh.sh  -> bin/agnsh
+#   · scripts/burn/stage-tools.sh  -> the tools, kriya's verb links (bin/touch, grep, echo ...), /etc/ssl/cert.pem
+# Both run WITHOUT --build: they stage what the sibling repos' build dirs already hold. stage-tools.sh's own
+# doctrine is that a sibling is never compiled here under a toolchain pin it did not declare (its in-tree
+# tests/* rows still build when absent, as they always have).
+# ⛔ WHY: a tree without a staged rootfs failed the shutdown row in BOTH sweep modes (`build/rootfs/bin/agnsh
+# missing`). Every agnos-wt-* worktree starts that way, and PSWEEP's first serial sweep scored 55/57 on it.
+# Prior art (handoff-1.57.10/steps/HAR2-prior-art.md): make/Bazel build a missing prerequisite with the rule
+# that produces it. Nothing is copied from another tree: a clone or a sweep copy has no "main tree" to copy
+# from, and a copy carries no record of what it holds.
+# A PRESENT rootfs is never touched, so a hand-curated staging survives. (1.57.10's main tree keeps an older
+# aethersafha than ../aethersafha/build holds; no sweep row reads it.)
+# Returns 0 when bin/agnsh and bin/touch exist afterwards, 1 otherwise. The recipe output goes to
+# <root>/build/stage-rootfs.log. A row that needs a tool one of the recipes could not stage names it itself.
+smoke_stage_rootfs() {
+    _ss_root="$1"; _ss_fs="$_ss_root/build/rootfs"; _ss_log="$_ss_root/build/stage-rootfs.log"
+    [ -f "$_ss_fs/bin/agnsh" ] && [ -e "$_ss_fs/bin/touch" ] && return 0
+    mkdir -p "$_ss_root/build"; : > "$_ss_log"
+    if [ ! -f "$_ss_fs/bin/agnsh" ]; then
+        echo "  rootfs: build/rootfs/bin/agnsh is absent — staging it (scripts/burn/stage-agnsh.sh, no --build)"
+        sh "$_ss_root/scripts/burn/stage-agnsh.sh" >> "$_ss_log" 2>&1 \
+            || echo "  rootfs: stage-agnsh.sh exited non-zero (log $_ss_log)"
+    fi
+    if [ ! -e "$_ss_fs/bin/touch" ]; then
+        echo "  rootfs: build/rootfs/bin/touch (kriya) is absent — staging the tools (scripts/burn/stage-tools.sh, no --build)"
+        sh "$_ss_root/scripts/burn/stage-tools.sh" >> "$_ss_log" 2>&1 \
+            || echo "  rootfs: stage-tools.sh reported a row it could not stage (log $_ss_log)"
+    fi
+    if [ -f "$_ss_fs/bin/agnsh" ] && [ -e "$_ss_fs/bin/touch" ]; then
+        echo "  rootfs: staged — $(ls "$_ss_fs/bin" | wc -l | tr -d ' ') entries in build/rootfs/bin (log $_ss_log)"
+        return 0
+    fi
+    echo "  rootfs: STAGING FAILED — build/rootfs still lacks bin/agnsh or bin/touch (log $_ss_log)"
+    return 1
+}

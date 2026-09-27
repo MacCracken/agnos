@@ -24,7 +24,7 @@
 # ⚠ EVERY initializer below is a PLAIN LITERAL. A module-scope `var` with a COMPUTED initializer silently
 # reads 0 in this kernel (EMIT_GVAR_INITS runs after PARSE_PROG, and PARSE_PROG is the whole boot) — the
 # defect that made H4's first run a 4/4 false pass. Do NOT tidy any of these into expressions.
-# See docs/development/issues/2026-07-23-kernel-expression-gvar-initialisers-never-run.md
+# See docs/development/issues/archived/2026-07-23-kernel-expression-gvar-initialisers-never-run.md
 var modeset_latch_blocked = 0;   # 1 = this boot may NOT attempt a modeset
 var modeset_latch_ino     = 0;   # inode of the pre-allocated latch file; 0 = unusable
 var modeset_armed         = 0;   # THE GATE. 1297040453 once armed this boot; anything else blocks

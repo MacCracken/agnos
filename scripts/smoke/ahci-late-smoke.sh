@@ -1,6 +1,6 @@
 #!/bin/bash
 # ahci-late-smoke.sh — AHCI timed-out-command fault injection (AHCI_SELFTEST=1), 1.57.9.
-# Issue: docs/development/issues/2026-09-25-ahci-timeout-abandons-an-in-flight-command.md
+# Issue: docs/development/issues/archived/2026-09-25-ahci-timeout-abandons-an-in-flight-command.md
 #
 # ahci_late_selftest (core/ahci.cyr) forces a TIMED-OUT command — a READ polled with a ZERO budget, so the poll gives
 # up before looking while the command is still running — and then checks, on a fresh 16 MB SATA scratch disk (the arms
@@ -12,6 +12,12 @@
 #   "ahcist: shift PASS"  after a late read, 16 reads of known LBAs byte-exact and a FLUSH succeed (slot 0 / CT reuse).
 #   "ahcist: tfes PASS"   a read past capacity fails with a PxIS error, and the next read succeeds exact with the port
 #                         idle. RED on the pre-1.57.9 poll (stale PxTFD.ERR failed the next command).
+#   "ahcist: bounce PASS" (1.57.10, issue 2026-09-26-ahci-puts-the-caller-buffer-in-the-prdt) ahci_blk_read into a
+#                         kmalloc block, ahci_blk_read_sectors(16) into an unaligned direct-map buffer and ahci_blk_write
+#                         x8 from one (bounce-kmalloc / -sectors / -write: CPU buffers OUTSIDE the identity window), each
+#                         checked against the phys reference primitives, plus a .bss control (bounce-bss). RED on the
+#                         pre-1.57.10 block layer, which put the caller's pointer in the PRDT: err=0 bad>0 (the bytes
+#                         went to an unassigned "phys"), bounce-bss still PASS.
 #   "ahcist: lost PASS"   an engine that will not stop: COMRESET, GHC.HR, every port offline, the next I/O fails at
 #                         once and B is not written after the return.
 # plus "ahci: port N timeout - recovered" (the §6.2.2.1 recovery ran) and no "hba-reset-stuck" line.
@@ -104,10 +110,16 @@ for SMP in ${AHCI_SMP:-1 4}; do
     check "ahcist: reuse PASS"   "a timed-out read's buffer is not written after the issue path returns"         "late DMA landed in the caller's reused buffer"
     check "ahcist: shift PASS"   "after a timed-out read, 16 reads exact + FLUSH: slot 0 / CT reused cleanly"   "slot 0 / CT reuse after a timeout"
     check "ahcist: tfes PASS"    "a PxIS error recovers the port; the next read is exact with the port idle"    "an error wedged the port / stale PxTFD.ERR"
+    check "ahcist: bounce-kmalloc PASS" "ahci_blk_read into a kmalloc block (direct-map VA) returns the sector"  "err=1: the transfer failed or was refused; err=0 bad>0: the bytes went elsewhere (a CPU pointer in the PRDT)"
+    check "ahcist: bounce-sectors PASS" "ahci_blk_read_sectors(16) into an unaligned direct-map buffer (2 bounce chunks)" "err=1: the transfer failed or was refused; err=0 bad>0: the bytes went elsewhere (a CPU pointer in the PRDT)"
+    check "ahcist: bounce-write PASS"   "ahci_blk_write x8 from an unaligned direct-map buffer lands on the disk"  "err=1: the transfer failed or was refused; err=0 bad>0: the bytes went elsewhere (a CPU pointer in the PRDT)"
+    check "ahcist: bounce-bss PASS"     "control: .bss buffers (identity VA == phys) still round-trip"            "the disk/port is broken, not the buffer class"
+    check "ahcist: bounce PASS"  "the ahci_blk_* layer never hands a CPU pointer to the HBA (all four rows)"      "bounce arm"
     check "ahcist: lost PASS"    "an engine that will not stop: GHC.HR, ports offline, next I/O fails fast"     "lost-command escalation"
     check "timeout - recovered"  "the §6.2.2.1 recovery ran on a timed-out command"                              "no recovery line"
     check "ahcist: done"         "the selftest ran to its last line"                                             "the selftest did not finish"
-    deny "ahcist: [a-z]+ FAIL|ahcist: SKIP|ahcist: inject FAIL" "an arm printed FAIL or SKIP" "no arm printed FAIL or SKIP"
+    # 1.57.10: [a-z-]+ so a hyphenated bounce-* row's FAIL is denied too ([a-z]+ stopped at the hyphen).
+    deny "ahcist: [a-z-]+ FAIL|ahcist: SKIP|ahcist: inject FAIL" "an arm printed FAIL or SKIP" "no arm printed FAIL or SKIP"
     deny "hba-reset-stuck"       "GHC.HR did not clear" "no stuck HBA reset"
     deny "$SMOKE_INVARIANT_DENY" "a latched kernel invariant fired" "no latched invariant"
 done

@@ -40,7 +40,7 @@
 #   kill      a child blocks reading an empty pipe (its own inherited write end keeps it live: it would wait
 #             forever); #99 shows it BLOCKED (state 6); kill(9) ends it and WAIT_BLOCK returns 265 within 50 ms
 #             (S7 boundary D: the kill interrupts the wait; the backstop alone would take up to 100 ms).
-#   ── 1.57.9 (PIPEW): THE BLOCKING PIPE WRITE (docs/development/issues/2026-09-25-pipe-writes-do-not-block.md) ──
+#   ── 1.57.9 (PIPEW): THE BLOCKING PIPE WRITE (docs/development/issues/archived/2026-09-25-pipe-writes-do-not-block.md) ──
 #   pipe-bulk ONE blocking write#1 (a4 = 0) of 64 KB into a pipe whose child reader takes 700 B per read and sleeps
 #             2 ms per 8 KB (tick-granular), checking every byte and reporting its time ASLEEP on a result pipe.
 #             GATE: the write returns 65536 within the reader's time asleep + 30 ms (each refill waits for pipe_read's

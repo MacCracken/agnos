@@ -64,5 +64,5 @@ The **symlink syscall** the ark v2 item (a) needed is fully proven on agnos, ind
 ## Related
 
 - [[project_ark_v2_sovereignty_path]] · [[project_cyrius_pinlag_large_agnos_binary_miscompile]] (prior large-binary issue — that one was a cyrius miscompile, size-gated < 1 MB, fixed by pin ≥ 6.1.37; ark is built on 6.3.9, so this is a *different*, kernel-side, stack-exhaustion failure).
-- `docs/development/issues/2026-06-29-cyrius-agnos-sys-symlink-peer.md` (the now-RESOLVED symlink peer).
+- `docs/development/issues/archived/2026-06-29-cyrius-agnos-sys-symlink-peer.md` (the now-RESOLVED symlink peer).
 - 1.51.x roadmap row (sovereign-package-manager kernel surface).

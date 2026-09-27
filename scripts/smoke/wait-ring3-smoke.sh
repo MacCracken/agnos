@@ -5,8 +5,8 @@
 #   LOCK_NB (-2 = the lock table is full; a blocking conversion drops the old lock) · sched_yield#44 donates ·
 #   an execwait#37 child blocks like any process (P13 `ew37`, flipped by S3b-F2 from S3c's interim contract).
 #
-# Issues: docs/development/issues/2026-09-23-sleep-ms-holds-the-cpu.md,
-#         docs/development/issues/2026-09-23-flock-never-waits-and-no-caller-spins.md.
+# Issues: docs/development/issues/archived/2026-09-23-sleep-ms-holds-the-cpu.md,
+#         docs/development/issues/archived/2026-09-23-flock-never-waits-and-no-caller-spins.md.
 #
 # tests/waits/waitx.cyr is seeded as /bin/agnsh (the driver — kybernet runs it IF=1 time-sliced, so its #43
 # children really run concurrently) AND /bin/waitx (every child role), with /wx/mode (the phase list), /wx/lock,

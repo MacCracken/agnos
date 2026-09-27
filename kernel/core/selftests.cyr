@@ -2383,7 +2383,9 @@ spawn_kernel_selftest();
 # transfer must be byte-exact and the verb must return the vendor id read before the switch. RED on a driver that still
 # dereferences a pmm page's phys: its SQE/descriptor/CORB entry goes into the shadow, the device never sees it.
 # DESTRUCTIVE: writes sectors 64..95 on virtio/AHCI and nsze/2.. on NVMe — QEMU scratch disks only.
-# Buffers are .bss (kernel image: identity == phys, mapped in every CR3), so they serve AHCI's buf-is-DMA-address API too.
+# Buffers are .bss (kernel image: identity == phys, mapped in every CR3). Until 1.57.10 that was also what let them pass
+# through AHCI's block layer, which put `buf` itself in the PRDT; it bounces now, so the ahci arm also checks that the
+# bounce page is copied through the direct map (ahci_bb_kva), never its identity VA.
 # 1.57.9 (CPUVA) adds the CPU-only pmm buffers — fb_console's shadow (arm 6, "dmash: fb") and, in a RAMDISK_ENABLE
 # build, the ramdisk (arm 5) — checked ACROSS the switch, plus "dmash: window": the 0xA5 region must be untouched after
 # every arm (a CPU store through an identity VA is exactly a store into the ring-3 process's page).
@@ -2482,7 +2484,7 @@ fn dsh_verdict(name, nlen, arm) {
     return 0;
 }
 # ─── 1.57.9 (CPUVA) — the CPU-only pmm buffers: fb_console's shadow and the ramdisk ─────────────────────────────
-# (docs/development/issues/2026-09-25-cpu-only-pmm-buffers-still-use-identity-vas.md). Neither is DMA, so the
+# (docs/development/issues/archived/2026-09-25-cpu-only-pmm-buffers-still-use-identity-vas.md). Neither is DMA, so the
 # arms above cannot see them: a device never reads them, and a store-then-load of the SAME identity VA under the
 # shadow CR3 reads back what it wrote (both hit the one 0xA5 region), which is why these arms cross the CR3
 # switch. Every check below reads, on the kernel CR3, what was written under the shadow (or the reverse).

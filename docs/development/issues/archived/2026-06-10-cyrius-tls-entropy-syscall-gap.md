@@ -9,7 +9,7 @@
 > **Filed**: 2026-06-10 (cyrius deep-dive review, v6.1.31)
 > **Severity**: HIGH — keys/nonces with no real entropy on the agnos userspace
 > target. Not boot-blocking; bites the moment any crypto/TLS runs in ring 3 on agnos.
-> **Cross-ref**: cyrius `docs/development/issues/2026-06-10-entropy-failweak-paths.md`
+> **Cross-ref**: cyrius `cyrius/docs/development/issues/2026-06-10-entropy-failweak-paths.md`
 > (CVE-19) + `docs/audit/2026-06-10-deep-dive-review.md`.
 
 ## Summary

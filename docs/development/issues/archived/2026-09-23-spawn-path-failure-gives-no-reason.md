@@ -81,4 +81,4 @@ is part of roadmap step S7.
 spawn/#37 harnesses). The 1.57.5 control reads −1 for every kind. The "argc<=8" comment is fixed.
 
 **Consumer notes:** daimon can map −2/−3 to capacity and −4/−5 to precise errors. cyrius peer constants are
-filed in cyrius `docs/development/issues/2026-09-24-agnos-spawn-flags-redirect-ops-and-uptime-us-peer.md`.
+filed in cyrius `cyrius/docs/development/issues/2026-09-24-agnos-spawn-flags-redirect-ops-and-uptime-us-peer.md`.

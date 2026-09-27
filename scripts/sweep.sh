@@ -7,11 +7,36 @@
 # production build at the end.
 #
 # Usage:  sh scripts/sweep.sh                     # 4 workers (1.57.9) — see the PARALLEL block below
-#         SWEEP_JOBS=1 sh scripts/sweep.sh        # the serial sweep, exactly as before 1.57.9
+#         SWEEP_JOBS=1 sh scripts/sweep.sh        # the serial sweep (no worker copies), as before 1.57.9
 #         SWEEP_ONLY='<ERE>' sh scripts/sweep.sh  # only the matching rows (exit 3 = clean, never a verdict)
+#         SWEEP_KNOWN_RED='<ERE>' sh scripts/sweep.sh  # mark the matching rows KNOWN RED for this run (see KNOWN RED)
 #         SWEEP_ROW_TIMEOUT=<s> (parallel row ceiling, default 1500) · SWEEP_EXCLUSIVE=0 (pool the exclusive rows)
 # Exit 0 iff every gate passes (1 otherwise; 2 = bad SWEEP_JOBS; 130/143 = interrupted). Per-smoke logs under
 # build/<smoke>-logs/ (serial) or build/sweep-logs/w<K>/<smoke>-logs/ (parallel: copied back from worker K).
+# Every attempt's own log is build/sweep-logs/<NN>-<label>.attempt<K>.log, written there directly.
+#
+# The table row: run_gate "<label>" "<build env>" "<smoke script [args] | CHECK>" ["<group>"] ["<known red>" ["<sig>"]]
+#   · <build env> goes to scripts/build.sh, never to the smoke. The smoke column may carry ARGUMENTS
+#     (1.57.10: `fg-smoke.sh --default`), word-split, no quoting.
+#   · <group>: see GROUPS below.
+#   · ⭐ KNOWN RED (1.57.10, operator ruling 2026-09-26; issue 2026-09-26-harness-backlog-after-1-57-9). A
+#     non-empty 5th argument is the REASON the row is red by design, or red on a filed bug. SWEEP_KNOWN_RED=<ERE
+#     over labels> marks rows for one run without editing the table, for example a row red on a sibling repo's
+#     filed bug. A known-red row that fails the known way gets ONE attempt: no second gate_exec attempt and no
+#     serial retry. It STAYS RED. It is scored FAIL in the summary and the exit code, labelled
+#     `KNOWN RED: <reason>`, and counted on its own summary line. The mark changes the WASTE, never the verdict
+#     (1.57.9: pipeline-smoke's serial retry of a filed agnoshi bug burned ~16 min of timeouts).
+#     The optional 6th argument is the failure SIGNATURE, an ERE. The mark applies only when the attempt's log
+#     has at least one `FAIL:` line and EVERY `FAIL:` line matches it (pytest xfail `raises=`). Any other failure
+#     is a NEW red and gets the normal attempts and retry, so a second red gate inside a known-red check.sh row
+#     cannot hide behind the first. With no signature, any failure counts as the known one.
+#     A marked row that PASSES is scored PASS with a "the mark is STALE, remove it" note (XPASS, non-strict).
+#     Prior art: pytest-rerunfailures --rerun-except, pytest xfail(raises=, strict=), Bazel flaky /
+#     tags=["manual"] (which HIDES the row: the departure), kselftest KSFT_XFAIL (counted as a pass: the other
+#     departure). See handoff-1.57.10/steps/HAR2-prior-art.md.
+# The rows that read the staged agnos-fs (shutdown, pipeline) need build/rootfs. Since 1.57.10 an ABSENT rootfs
+# is staged once, in this tree, before the table: stage-agnsh.sh + stage-tools.sh, no --build
+# (smoke_stage_rootfs, scripts/smoke/lib/qemu-dwell.sh). A present one is used as it stands.
 #
 # This is the automated half of the last-two-arcs verification; the MANUAL
 # (on-iron) half is the rubric in
@@ -40,6 +65,12 @@ cd "$ROOT"
 #     window), `naad` (the one row that writes a sibling repo's build dir), `waits` (two rows that build
 #     tests/waits), and `exclusive` — a row whose oracle is a ratio against wall time runs ALONE, serially, in the
 #     main tree after the parallel phase (Bazel `exclusive`; SWEEP_EXCLUSIVE=0 pools them instead).
+#     ⭐ SWEEP_EXCLUSIVE=1 STAYS THE DEFAULT (1.57.10, issue 2026-09-26-harness-backlog-after-1-57-9 item 9: the
+#     operator ruling "keep it ON by default"). The reason: tsc's tick-period / calibration-agreement ratios (1-3%,
+#     2%) and kvm-net-boot's <= 500 ms pre-console window are measured against wall time. Beside N other QEMUs they
+#     measure the HOST's load, not the kernel. Pooled, a slow host fails them in parallel, and the serial retry then
+#     turns that into a routine "passed on serial retry" that proved nothing the first time. The price is the
+#     measured +114 s tail at 1.57.9 (73 s + 41 s). SWEEP_EXCLUSIVE=0 remains the knob for a quiet box.
 #     The CHECK row (check.sh needs .git) runs in the MAIN tree, concurrently with the workers, which never
 #     touch the main build/.
 #   · RESULTS THROUGH FILES: a worker is another process, so run_gate's pass/fail/results globals cannot be
@@ -49,10 +80,12 @@ cd "$ROOT"
 #   · SERIAL RETRY, NEVER SILENT: a row that fails in the parallel phase is re-run ONCE through gate_exec in the
 #     main tree after it (its own two attempts included) and, if it passes there, is scored
 #     `PASS  <label>  (passed on serial retry; parallel log: …)`; the count is printed even when it is 0.
+#     A KNOWN RED that failed the known way is NOT retried (1.57.10; see KNOWN RED above).
 #   · CEILING + CLEANUP: each parallel row runs under `timeout ${SWEEP_ROW_TIMEOUT:-1500}` (expiry = FAIL, named).
 #     Workers run in their own sessions (setsid); on exit, INT or TERM every process in those sessions — QEMU
 #     under a smoke's own `timeout`, which leaves the process group but not the session — is TERMed, then KILLed,
-#     worker logs are copied back to build/sweep-logs/w<K>/, and the copies are removed.
+#     worker logs are copied back to build/sweep-logs/w<K>/, and the copies are removed. The copy-back skips
+#     build/rootfs/ (1.57.10): it is a staged INPUT, and its verify-*.png screendump landed in every w<K>/.
 #   · FENCED RUNS (1.57.9 ENDFIX PSWEEP-R1): a controller killed WITHOUT its traps (SIGKILL/OOM) no longer leaks — the
 #     queue is run-scoped (build/sweep-queue.<pid>), each worker's lifeline (sweep_lifeline) ends its session when the
 #     controller is gone, and every run starts by reaping a dead run's queue and copies (sweep_reap_stale).
@@ -62,22 +95,41 @@ case "$SWEEP_JOBS" in ''|*[!0-9]*|0) echo "sweep.sh: SWEEP_JOBS must be a positi
 SWEEP_ROW_TIMEOUT="${SWEEP_ROW_TIMEOUT:-1500}"
 SWEEP_EXCLUSIVE="${SWEEP_EXCLUSIVE:-1}"
 
-# gate_exec "<label>" "<build env>" "<smoke script | CHECK>" "<log slug>"
+# sweep_known_red_matches <attempt log> "<signature ERE>" -> 0 when the log's failure is the KNOWN one (1.57.10).
+# No signature: any failure. With one: at least one `FAIL:` line and EVERY `FAIL:` line matching it (pytest xfail
+# `raises=`: a failure of another kind is a regular failure). A log with no FAIL: line at all (a timeout, a harness
+# ERROR) never matches a signature, so it gets the normal attempts and retry.
+sweep_known_red_matches() {
+    [ -n "$2" ] || return 0
+    kr_fails=$(grep -E 'FAIL:' "$1" 2>/dev/null)
+    [ -n "$kr_fails" ] || return 1
+    printf '%s\n' "$kr_fails" | grep -vqE -- "$2" && return 1
+    return 0
+}
+
+# gate_exec "<label>" "<build env>" "<smoke script [args] | CHECK>" "<log slug>" ["<known red>"] ["<signature>"]
 # Runs ONE row in $ROOT (the tree this copy of the script lives in) and prints its section. Returns 0 = PASS,
-# 1 = FAIL, 2 = the row's BUILD failed. This is run_gate's body from before 1.57.9, unchanged except that the
-# scratch log is $ROOT/build/sweep-gate.log: the old fixed /tmp/sweep-gate.log collided between workers (and
-# between two trees sweeping at once — HARNESS-BACKLOG, SMOKES3). Each attempt is still kept under $SWEEP_LOGS.
+# 1 = FAIL, 2 = the row's BUILD failed, 3 = FAIL, a KNOWN RED failing the known way (1.57.10; one attempt, never
+# retried). This is run_gate's body from before 1.57.9. ⭐ 1.57.10 (HAR2, issue 2026-09-26-harness-backlog-after-1-57-9
+# item 3): each attempt is written STRAIGHT to its kept log, $SWEEP_LOGS/<slug>.attempt<K>.log. First there was a
+# fixed /tmp/sweep-gate.log, which collided between two trees sweeping at once. Then (1.57.9) a per-tree scratch
+# build/sweep-gate.log that was copied there. Now there is no scratch file to share at all.
 # Each smoke runs ONCE per attempt (captured to a log); a single retry covers
 # transient host-load / QEMU-timing flakes (a real failure fails both attempts).
 gate_exec() {
-    g_label="$1"; g_env="$2"; g_smoke="$3"; g_slug="$4"
-    mkdir -p "$ROOT/build"
-    GATE_LOG="$ROOT/build/sweep-gate.log"
+    g_label="$1"; g_env="$2"; g_smoke="$3"; g_slug="$4"; g_known="${5:-}"; g_ksig="${6:-}"
+    mkdir -p "$ROOT/build" "$SWEEP_LOGS"
     printf '\n=== %s ===\n' "$g_label"
-    ok=0
+    ok=0; g_matched=0   # g_*: gate_exec shares the global namespace with run_gate (its `known`)
     if [ "$g_smoke" = "CHECK" ]; then
-        if sh "$ROOT/scripts/check.sh" > "$GATE_LOG" 2>&1; then ok=1; tail -1 "$GATE_LOG"; else tail -3 "$GATE_LOG"; fi
-        cp "$GATE_LOG" "$SWEEP_LOGS/$g_slug.attempt1.log"
+        GATE_LOG="$SWEEP_LOGS/$g_slug.attempt1.log"
+        if sh "$ROOT/scripts/check.sh" > "$GATE_LOG" 2>&1; then ok=1; tail -1 "$GATE_LOG"
+        else
+            tail -3 "$GATE_LOG"
+            # 1.57.10: name the red gates (a known-red CHECK row is judged on exactly these lines).
+            grep -E '^  FAIL: ' "$GATE_LOG" | sed 's/^/  /' || true
+            [ -n "$g_known" ] && sweep_known_red_matches "$GATE_LOG" "$g_ksig" && g_matched=1
+        fi
     else
         # ⛔ MEASURED 2026-08-28 (1.56.51): A FAILED BUILD USED TO BE PRINTED AND THEN IGNORED.
         # The old form was `… || { echo "  BUILD FAILED"; }` — the `||` consumed the status, `ok`
@@ -91,12 +143,17 @@ gate_exec() {
             echo "  BUILD FAILED ($g_env) — gate not run"
             return 2
         fi
+        # 1.57.10: the smoke column may carry arguments (`fg-smoke.sh --default`) — word-split, the script first.
+        # shellcheck disable=SC2086
+        set -- $g_smoke
+        g_script="$1"; shift
         for attempt in 1 2; do
             # ⚠ smokes live in scripts/smoke/ since the 1.56.22 split. The gate table below still
             # names them bare (that is the readable form), so resolve here rather than editing 30
             # table rows — and fall back to the old flat location so a not-yet-moved smoke still runs.
-            SMOKE_PATH="$ROOT/scripts/smoke/$g_smoke"
-            [ -f "$SMOKE_PATH" ] || SMOKE_PATH="$ROOT/scripts/$g_smoke"
+            SMOKE_PATH="$ROOT/scripts/smoke/$g_script"
+            [ -f "$SMOKE_PATH" ] || SMOKE_PATH="$ROOT/scripts/$g_script"
+            GATE_LOG="$SWEEP_LOGS/$g_slug.attempt$attempt.log"
             # ⛔⛔ MEASURED 2026-08-28 (1.56.51): THE OLD DETECTOR RECORDED TOTAL FAILURE AS PASS.
             # It was `grep -qiE "smoke.*PASS|smoke \(.*\): PASS"`. The `-i` makes the literal PASS
             # match the substring "pass" inside the word "passed" — so a smoke whose FAILURE verdict
@@ -114,13 +171,14 @@ gate_exec() {
             # exit 1`). The status is now primary. The log grep is kept only as a SECOND, narrow
             # assertion against the exact trap above — a smoke that exits 0 while printing
             # "N passed, M failed" with M>0 is itself broken, and must not be scored a pass.
-            sh "$SMOKE_PATH" > "$GATE_LOG" 2>&1 && smoke_rc=0 || smoke_rc=$?
-            cp "$GATE_LOG" "$SWEEP_LOGS/$g_slug.attempt$attempt.log"
+            sh "$SMOKE_PATH" "$@" > "$GATE_LOG" 2>&1 && smoke_rc=0 || smoke_rc=$?
             if [ "$smoke_rc" = 0 ] \
                && ! grep -qE 'passed, [1-9][0-9]* failed' "$GATE_LOG"; then
                 ok=1; break
             fi
-            echo "  (attempt $attempt: rc=$smoke_rc — log kept: $SWEEP_LOGS/$g_slug.attempt$attempt.log)"
+            echo "  (attempt $attempt: rc=$smoke_rc — log kept: $GATE_LOG)"
+            # 1.57.10 KNOWN RED: failing the known way ends the row here — no second attempt (see the header).
+            if [ -n "$g_known" ] && sweep_known_red_matches "$GATE_LOG" "$g_ksig"; then g_matched=1; break; fi
         done
         # ⛔ MEASURED 2026-08-29 (1.56.52): THIS FILTER HID THE ONE LINE THAT LOCALISES A FAILURE.
         # It was `grep -iE "PASS:|FAIL:|smoke:"`, and several smokes report a LAUNCH failure with a
@@ -136,6 +194,16 @@ gate_exec() {
         grep -iE "PASS:|FAIL:|smoke:|ERROR|SKIP|VOID|handed off" "$GATE_LOG" | sed 's/^/  /' || true
         [ "$ok" = 1 ] && [ "${attempt:-1}" = 2 ] && echo "  (passed on retry — transient host-load timing)"
     fi
+    if [ -n "$g_known" ]; then
+        if [ "$ok" = 1 ]; then
+            echo "  NOTE: marked KNOWN RED ($g_known) but it PASSED — the mark is STALE; remove it"
+        elif [ "$g_matched" = 1 ]; then
+            echo "  KNOWN RED ($g_known) — failed the known way: one attempt, no retry; still scored FAIL"
+            return 3
+        else
+            echo "  known-red mark ($g_known) did NOT match this failure${g_ksig:+ (signature: $g_ksig)} — a NEW red: normal attempts and retry"
+        fi
+    fi
     [ "$ok" = 1 ] && return 0
     return 1
 }
@@ -146,8 +214,9 @@ gate_exec() {
 #   --row <n>       run row n (its record is $SWEEP_Q/<n>.row: label, build env, smoke, slug) and exit gate_exec's code
 #   --worker <K>    K = main: the rows in $SWEEP_Q/main.list; K = 1..N: claim groups from $SWEEP_Q/order until none left
 # ---------------------------------------------------------------------------------------------------------------
-sweep_read_row() {  # $1 = n  ->  r_label r_env r_smoke r_slug
-    { IFS= read -r r_label; IFS= read -r r_env; IFS= read -r r_smoke; IFS= read -r r_slug; } < "$SWEEP_Q/$1.row"
+sweep_read_row() {  # $1 = n  ->  r_label r_env r_smoke r_slug r_known r_ksig
+    { IFS= read -r r_label; IFS= read -r r_env; IFS= read -r r_smoke; IFS= read -r r_slug
+      IFS= read -r r_known; IFS= read -r r_ksig; } < "$SWEEP_Q/$1.row"
 }
 
 sweep_run_row() {   # $1 = n — one row under the row ceiling, in this tree; leaves <n>.out and <n>.res
@@ -161,7 +230,7 @@ sweep_run_row() {   # $1 = n — one row under the row ceiling, in this tree; le
     timeout -k 30 "$SWEEP_ROW_TIMEOUT" sh "$ROOT/scripts/sweep.sh" --row "$rr_n" \
         > "$SWEEP_Q/$rr_n.out" 2>&1 < /dev/null && rr_rc=0 || rr_rc=$?
     case "$rr_rc" in
-        0|1|2) ;;
+        0|1|2|3) ;;
         124|137)
             echo "  ROW TIMEOUT: killed after ${SWEEP_ROW_TIMEOUT}s (SWEEP_ROW_TIMEOUT) — scored FAIL" >> "$SWEEP_Q/$rr_n.out"
             # `timeout` killed its own process group; a smoke's inner `timeout` (and the QEMU under it) sits in a
@@ -175,13 +244,13 @@ sweep_run_row() {   # $1 = n — one row under the row ceiling, in this tree; le
     rr_dur=$(( $(date +%s) - rr_t0 ))
     printf '%s\t%s\t%s\n' "$rr_rc" "$rr_dur" "$SWEEP_WORKER" > "$SWEEP_Q/$rr_n.res.tmp"
     mv -f "$SWEEP_Q/$rr_n.res.tmp" "$SWEEP_Q/$rr_n.res"
-    case "$rr_rc" in 0) rr_v=PASS;; 2) rr_v="FAIL (build)";; *) rr_v=FAIL;; esac
+    case "$rr_rc" in 0) rr_v=PASS;; 2) rr_v="FAIL (build)";; 3) rr_v="KNOWN RED";; *) rr_v=FAIL;; esac
     printf '  [%-4s] %3ss  %-12s row %2s  %s\n' "$SWEEP_WORKER" "$rr_dur" "$rr_v" "$rr_n" "$r_label"
 }
 
 if [ "${1:-}" = "--row" ]; then
     sweep_read_row "$2"
-    gate_exec "$r_label" "$r_env" "$r_smoke" "$r_slug"
+    gate_exec "$r_label" "$r_env" "$r_smoke" "$r_slug" "$r_known" "$r_ksig"
     exit $?
 fi
 # ⭐ 1.57.9 ENDFIX (end review PSWEEP-R1) — A WORKER DIES WITH ITS CONTROLLER. The controller's traps (EXIT/INT/TERM)
@@ -237,7 +306,7 @@ if [ "${1:-}" = "--worker" ]; then
     exit 0
 fi
 
-pass=0; fail=0; results=""
+pass=0; fail=0; results=""; known_reds=0; stale_marks=0
 # ⭐ 1.57.7 (IMG-fix, review B3) — EVERY ATTEMPT'S LOG IS KEPT. Both attempts used to go to the one
 # /tmp/sweep-gate.log, so a row that "passed on retry" had its first failure overwritten and nobody could say
 # whether it was a firmware VOID or a real failure (the IMG sweep's ext2 WRITE row was exactly that). Now each
@@ -259,6 +328,9 @@ gate_n=0; skipped=0
 # exact harness. A filtered run is never a sweep verdict: it ends "SWEEP_ONLY … NOT A SWEEP VERDICT" and exits 3
 # when nothing failed (1 when something did), so it cannot be mistaken for ARC SWEEP: PASS.
 SWEEP_ONLY="${SWEEP_ONLY:-}"
+# SWEEP_KNOWN_RED=<ERE> (1.57.10): the run-time KNOWN RED mark (see the header). Any failure of a matching row counts
+# as the known one; a row's own table mark (5th/6th run_gate argument) takes precedence.
+SWEEP_KNOWN_RED="${SWEEP_KNOWN_RED:-}"
 
 # ⭐ 1.57.9 ENDFIX (end review PSWEEP-R1) — FENCE EVERY RUN. (1) The queue is RUN-SCOPED, build/sweep-queue.<pid> (xfstests
 # tmp=/tmp/$$, Bazel TEST_TMPDIR): a worker of a dead run can never mkdir a claim in, read the rows of, or write a
@@ -299,16 +371,38 @@ if [ "$SWEEP_JOBS" -gt 1 ]; then
     export SWEEP_Q SWEEP_ROW_TIMEOUT SWEEP_MAIN_PID
 fi
 
-# run_gate "<label>" "<build env>" "<smoke script | CHECK>" ["<group key>"]
+# sweep_tally <rc | retry-pass> "<label>" "<known red reason>" ["<PASS note>"] — one row into the summary, both modes.
+# rc 3 (a KNOWN RED that failed the known way) is a FAIL like any other, labelled and counted on its own line; a
+# marked row that PASSED is a PASS with a stale-mark note (1.57.10).
+sweep_tally() {
+    t_rc="$1"; t_label="$2"; t_known="$3"; t_note="${4:-}"
+    case "$t_rc" in
+        0|retry-pass)
+            pass=$((pass+1))
+            if [ -n "$t_known" ]; then
+                stale_marks=$((stale_marks+1)); t_note="$t_note  (KNOWN-RED MARK IS STALE, it passed; remove it: $t_known)"
+            fi
+            results="$results\n  PASS  $t_label$t_note" ;;
+        2)  fail=$((fail+1)); results="$results\n  FAIL  $t_label (build)" ;;
+        3)  fail=$((fail+1)); known_reds=$((known_reds+1))
+            results="$results\n  FAIL  $t_label  (KNOWN RED: $t_known; one attempt, not retried)" ;;
+        *)  fail=$((fail+1)); results="$results\n  FAIL  $t_label" ;;
+    esac
+}
+
+# run_gate "<label>" "<build env>" "<smoke script [args] | CHECK>" ["<group key>"] ["<known red reason>" ["<sig ERE>"]]
 # SWEEP_JOBS=1: runs the row now (gate_exec) and tallies it. SWEEP_JOBS>1: records the row for the parallel
 # dispatch below (the number and slug are fixed here, in table order). The group key is ignored serially.
 run_gate() {
-    label="$1"; buildenv="$2"; smoke="$3"; group="${4:-}"
+    label="$1"; buildenv="$2"; smoke="$3"; group="${4:-}"; known="${5:-}"; ksig="${6:-}"
     if [ -n "$SWEEP_ONLY" ] && ! printf '%s' "$label" | grep -qE -- "$SWEEP_ONLY"; then skipped=$((skipped+1)); return; fi
+    if [ -z "$known" ] && [ -n "$SWEEP_KNOWN_RED" ] && printf '%s' "$label" | grep -qE -- "$SWEEP_KNOWN_RED"; then
+        known="marked for this run by SWEEP_KNOWN_RED"; ksig=""
+    fi
     gate_n=$((gate_n+1))
     gate_slug=$(printf '%02d-%s' "$gate_n" "$label" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)
     if [ "$SWEEP_JOBS" -gt 1 ]; then
-        printf '%s\n%s\n%s\n%s\n' "$label" "$buildenv" "$smoke" "$gate_slug" > "$SWEEP_Q/$gate_n.row"
+        printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$label" "$buildenv" "$smoke" "$gate_slug" "$known" "$ksig" > "$SWEEP_Q/$gate_n.row"
         if [ "$smoke" = "CHECK" ]; then
             echo "$gate_n" >> "$SWEEP_Q/main.list"
         elif [ "$group" = "exclusive" ] && [ "$SWEEP_EXCLUSIVE" != 0 ]; then
@@ -322,11 +416,9 @@ run_gate() {
         return
     fi
     g_t0=$(date +%s)
-    gate_exec "$label" "$buildenv" "$smoke" "$gate_slug" && g_rc=0 || g_rc=$?
+    gate_exec "$label" "$buildenv" "$smoke" "$gate_slug" "$known" "$ksig" && g_rc=0 || g_rc=$?
     printf '%s\t%s\n' "$(( $(date +%s) - g_t0 ))" "$label" >> "$SWEEP_LOGS/durations.tsv"   # the joblog (dispatch order)
-    if [ "$g_rc" = 0 ]; then pass=$((pass+1)); results="$results\n  PASS  $label";
-    elif [ "$g_rc" = 2 ]; then fail=$((fail+1)); results="$results\n  FAIL  $label (build)";
-    else fail=$((fail+1)); results="$results\n  FAIL  $label"; fi
+    sweep_tally "$g_rc" "$label" "$known"
 }
 
 SWEEP_T0=$(date +%s)
@@ -336,7 +428,18 @@ echo "=========================================="
 
 # --- Baseline (plain production build): build + tests + version + size ---
 sh "$ROOT/scripts/build.sh" >/dev/null 2>&1
-run_gate "baseline check.sh (build/test/version/size)" "" "CHECK"
+# ⭐ 1.57.10 (HAR2, issue 2026-09-26-harness-backlog-after-1-57-9 item 7): STAGE build/rootfs WHEN ABSENT. This runs
+# once, in this tree, before the table, so the worker copies (which rsync build/rootfs) carry it too. Until
+# 1.57.10 a tree with no staged rootfs failed the shutdown row in both modes. smoke_stage_rootfs runs the recipe
+# (stage-agnsh.sh + stage-tools.sh, never --build) and leaves a present rootfs as it stands.
+( . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"; smoke_stage_rootfs "$ROOT" ) \
+    || echo "  ⚠ build/rootfs could not be staged (build/stage-rootfs.log) — the rows that read it will name what is missing"
+# ⭐ 1.57.10 — KNOWN RED BY DESIGN: the syscall ABI gate stays red until the cyrius SysNrAgnos peer carries the kernel's
+# newest numbers (#106-#108 at 1.57.10). The signature is that gate's two FAIL lines, and nothing else: any OTHER red
+# gate inside check.sh is a new failure and gets the normal treatment.
+run_gate "baseline check.sh (build/test/version/size)" "" "CHECK" "" \
+    "by design: the syscall ABI gate is red until cyrius's SysNrAgnos peer carries the kernel's newest numbers" \
+    'syscall ABI \(kernel/doc/cyrius agree\)|syscall\(s\) the kernel implements are absent from cyrius'
 
 # --- 1.39.x VFS generic-write lift: FAT + exFAT read & write verb smokes ---
 run_gate "1.39.x FAT read (cat/ls reach FAT)"       "FATFS_SELFTEST=1"                         "fat-smoke.sh"
@@ -473,6 +576,17 @@ run_gate "1.39.x exFAT write (+ subdir)"             "EXFAT_WRITE_SELFTEST=1"   
 
 # --- ext2/jbd2 write regression bar (the iron-validated path must stay green) ---
 run_gate "ext2 WRITE regression (W1-W5)"             "EXT2_WRITE_SELFTEST=1"                    "ext2-write-smoke.sh"
+# ⭐ 1.57.10 (HAR2, issue 2026-09-26-harness-backlog-after-1-57-9 item 4) — TWO SMOKES THAT WERE HONEST AND UNLISTED.
+# 1.57.9 (SMOKES3) gave both a banner-gated retry and exit 0/1/2. Until then a firmware VOID read as a kernel red
+# ("blkwr never dispatched", "did NOT reach shell (regression!)"). They were still run only by hand.
+# · ext2-smoke: five arms on the PLAIN kernel — baseline (virtio-blk probed, no ext2 match), AHCI whole-disk, NVMe
+#   GPT partition, combined (probe order: NVMe wins), ext4 64BIT partition (desc_size=64). run_gate builds plain.
+run_gate "1.31.6/1.31.7 ext2/ext4 multi-backend probe + GPT partition mount + 64BIT (5 arms, plain kernel)" "" "ext2-smoke.sh"
+# · blk-write-smoke: the ring-3 raw block WRITE path and its capability gate — an unarmed blk_write#78 / RW-open is
+#   REFUSED, an armed write to the disk's unallocated tail reads back byte-identical (/bin/blkwr exit 96), and the
+#   arm does not survive process exit (/bin/blkleak). It builds its own BLK_WRITE_SELFTEST kernel, boots a COPY,
+#   and leaves a plain build, so this row's build env is empty. "run: exit 83/84" = the gate is BROKEN (security).
+run_gate "1.53.10 ring-3 block write path + capability gate (unarmed #78 refused, armed write reads back, exit disarms)" "" "blk-write-smoke.sh"
 
 # --- 1.41.3 FS syscalls through ksyscall(), on-disk effects checked by host debugfs + e2fsck ---
 # ⛔ FS_SYSCALL_SELFTEST shipped at 1.41.3 with NO RUNNER while docs/development/build.md said "gated by
@@ -516,7 +630,16 @@ run_gate "1.57.6 per-process kernel stacks, CPL0 switch windows, lock holders, g
 # process: ticks, siblings, yield, nesting, fault, redirect, env, FP, migration) and kmain's `run` is a scheduled
 # child (recovery mode: tickself, fault, an orphan writer, spawn storms, free RAM). PLAIN kernel, tests/fg seeded as
 # /bin/agnsh; -smp 1 then -smp 4, both gated; the default mode also checks agnsh-exit-with-a-live-bg-job + dumpe2fs.
-run_gate "1.57.7 foreground exec on Path 2 (#37 blocks, kmain run) -smp 1+4 + recovery" "" "fg-smoke.sh"
+# ⭐ 1.57.10 (HAR2, issue 2026-09-26-harness-backlog-after-1-57-9 item 8): SPLIT BY MODE, AND THE RECOVERY MODE BY CPU
+# COUNT. As one row fg-smoke ran ~830 s and set the parallel sweep's wall clock by itself (~22 min at 1.57.9). The
+# halves are NOT equal. In the 1.57.9 logs both default boots together end ~20-25 kernel-seconds after the banner,
+# while EACH recovery boot runs ~376 s (15 `run`s at ~21 s apiece). A default|recovery split alone would leave a
+# ~750 s pole. The recovery rows therefore run one CPU count each (`--smp`, 1.57.10). The smoke has always taken
+# --default / --recovery. Every row builds the plain kernel and tests/fg itself, so the rows share nothing but
+# the source tree and land on different workers.
+run_gate "1.57.7 foreground exec on Path 2, default mode (#37 blocks; fgx as /bin/agnsh, agnsh exit + dumpe2fs) -smp 1+4" "" "fg-smoke.sh --default"
+run_gate "1.57.7 foreground exec on Path 2, recovery mode (kmain run: tickself/fault/orphan writer/storms/free RAM) -smp 1" "" "fg-smoke.sh --recovery --smp 1"
+run_gate "1.57.7 foreground exec on Path 2, recovery mode (kmain run: tickself/fault/orphan writer/storms/free RAM) -smp 4" "" "fg-smoke.sh --recovery --smp 4"
 
 # 1.57.7 (Path 2, S3c) — the in-kernel blocking waits FROM RING 3 (tests/waits/waitx.cyr seeded as /bin/agnsh on a
 # PLAIN kernel; -smp 1 then -smp 4, both gated): sleep_ms#41 blocks only its caller (spinners get the CPU, a child
@@ -531,12 +654,21 @@ run_gate "1.57.8 NVMe late completion: no CQ shift, no buffer reuse, lost -> con
 # 1.57.9 — issue 2026-09-25-ahci-timeout-abandons-an-in-flight-command: a timed-out AHCI command is recovered (§6.2.2.1:
 # ST=0, wait CR=0) before its buffer / slot 0 / CT is reused, a PxIS error does not wedge the port, and an engine that
 # will not stop ends in GHC.HR with every port offline. (The NVMe admin half rides nvme-late-smoke's `admin` arm.)
-run_gate "1.57.9 AHCI timed-out command: recovered before reuse, TFES recovers, lost -> HBA reset + offline (-smp 1 + -smp 4)" "AHCI_SELFTEST=1" "ahci-late-smoke.sh"
+# 1.57.10 — issue 2026-09-26-ahci-puts-the-caller-buffer-in-the-prdt: the same boot runs the `bounce` arm (ahci_blk_*
+# with kmalloc / unaligned direct-map buffers and a .bss control: no caller pointer ever reaches a PRDT).
+run_gate "1.57.9 AHCI timed-out command: recovered before reuse, TFES recovers, lost -> HBA reset + offline; 1.57.10 blk bounce (-smp 1 + -smp 4)" "AHCI_SELFTEST=1" "ahci-late-smoke.sh"
 # 1.57.8 — issue 2026-09-25-dma-cpu-pointers-still-use-identity-vas: virtio-blk / NVMe / AHCI / HDA reach their pmm DMA
 # pages through the DIRECT MAP, so block I/O and HDA verbs stay byte-exact under a CR3 whose identity window is shadowed.
 # 1.57.9 (CPUVA) — issue 2026-09-25-cpu-only-pmm-buffers-still-use-identity-vas: + fb_console's shadow and the ramdisk
 # (hence RAMDISK_ENABLE in this row's build), and the 0xA5 window must be untouched after every arm; iommu.cyr is static.
 run_gate "1.57.8/1.57.9 DMA + CPU-only pmm pointers: block/HDA/fb shadow/ramdisk under a shadowed identity window (-smp 1 + -smp 4)" "DMA_SHADOW_SELFTEST=1 RAMDISK_ENABLE=1" "dma-shadow-smoke.sh"
+# 1.57.10 (VTD) — issue 2026-09-26-vt-d-xhci-never-granted-and-iommu-never-booted: iommu.cyr BOOTS with DMA translation
+# ON (q35 + intel-iommu, intremap=off): -smp 1 caching-mode=on aw-bits=39 (3-level, CM=1) and -smp 4 caching-mode=off
+# aw-bits=48 (4-level, the xHCI behind a pcie-root-port). The xHCI/HID/MSC grants made before iommu_init are replayed,
+# a grant after TE gets exactly the invalidation CM needs (VTD_SELFTEST, cross-checked on QEMU's own IVA/IOTLB register
+# trace), and xHCI (typed agnsh lines + a USB stick) / NVMe / virtio-blk / virtio-net / AHCI / HDA DMA all work with zero
+# faults. The smoke builds its VTD_SELFTEST kernel itself and leaves the tree plain (the xhci-shadow-smoke shape).
+run_gate "1.57.10 VT-d translation ON: pre-init grants replayed, CM invalidation, xHCI/NVMe/virtio/AHCI/HDA DMA through the IOMMU (-smp 1 + -smp 4)" "" "vtd-smoke.sh"
 # 1.57.7 (Path 2, S3d) — the KEYBOARD read blocks only its caller and ONE reader owns each cooked line (a second
 # blocking reader waits for the line; the NB prompt poll answers -2 without draining while another live process owns
 # it, and keeps the line while its partial line is live). waitx in mode `kbd` as /bin/agnsh, keys typed over HMP by
@@ -638,13 +770,16 @@ if [ "$SWEEP_JOBS" -gt 1 ]; then
            NAAD_ROOT="${NAAD_ROOT:-$ROOT/../naad}" DOOM_ROOT="${DOOM_ROOT:-$ROOT/../cyrius-doom}"
 
     # Copy a worker's logs (never its disk images) back under build/sweep-logs/w<K>/, then delete the copy.
+    # 1.57.10 (HAR2, item 6): never build/rootfs/ — it is the staged INPUT every copy was given, not a row's output,
+    # and its verify-*.png screendump used to land in every w<K>/rootfs/ (the *.png include below is for smokes'
+    # own screendumps).
     sweep_reap_copies() {
         k=1
         while [ "$k" -le "$SWEEP_JOBS_USED" ]; do
             c="$SWEEP_COPY_BASE.w$k"
             if [ -d "$c" ]; then
                 if [ -d "$c/build" ]; then
-                    rsync -a --prune-empty-dirs --exclude=/sweep-tmp/ --include='*/' --include='*.log*' --include='*.txt' --include='*.out' \
+                    rsync -a --prune-empty-dirs --exclude=/sweep-tmp/ --exclude=/rootfs/ --include='*/' --include='*.log*' --include='*.txt' --include='*.out' \
                         --include='*.png' --include='*.ppm' --exclude='*' "$c/build/" "$SWEEP_LOGS/w$k/" 2>/dev/null || true
                 fi
                 rm -rf "$c"
@@ -744,10 +879,10 @@ if [ "$SWEEP_JOBS" -gt 1 ]; then
     # Bazel `exclusive`: the wall-time-ratio rows, alone and serially, in the main tree — as SWEEP_JOBS=1 runs them.
     for n in $(cat "$SWEEP_Q/exclusive.list"); do
         sweep_read_row "$n"; x_t0=$(date +%s)
-        gate_exec "$r_label" "$r_env" "$r_smoke" "$r_slug" > "$SWEEP_Q/$n.out" 2>&1 && x_rc=0 || x_rc=$?
+        gate_exec "$r_label" "$r_env" "$r_smoke" "$r_slug" "$r_known" "$r_ksig" > "$SWEEP_Q/$n.out" 2>&1 && x_rc=0 || x_rc=$?
         x_dur=$(( $(date +%s) - x_t0 ))
         printf '%s\t%s\t%s\n' "$x_rc" "$x_dur" "excl" > "$SWEEP_Q/$n.res"
-        case "$x_rc" in 0) x_v=PASS;; 2) x_v="FAIL (build)";; *) x_v=FAIL;; esac
+        case "$x_rc" in 0) x_v=PASS;; 2) x_v="FAIL (build)";; 3) x_v="KNOWN RED";; *) x_v=FAIL;; esac
         printf '  [%-4s] %3ss  %-12s row %2s  %s\n' "excl" "$x_dur" "$x_v" "$n" "$r_label"
     done
 
@@ -771,7 +906,8 @@ if [ "$SWEEP_JOBS" -gt 1 ]; then
         echo "$p_rc" > "$SWEEP_Q/$n.final"
         # pytest-rerunfailures / Bazel FLAKY: every row that failed IN PARALLEL gets ONE serial re-run below.
         # An exclusive row already ran serially — its verdict is the serial verdict, as with SWEEP_JOBS=1.
-        [ "$p_rc" != 0 ] && [ "$p_w" != "excl" ] && echo "$n" >> "$SWEEP_Q/failed"
+        # A KNOWN RED that failed the known way (rc 3) is never re-run (1.57.10; --rerun-except).
+        [ "$p_rc" != 0 ] && [ "$p_rc" != 3 ] && [ "$p_w" != "excl" ] && echo "$n" >> "$SWEEP_Q/failed"
         n=$((n+1))
     done
 
@@ -780,7 +916,7 @@ if [ "$SWEEP_JOBS" -gt 1 ]; then
         echo "--- serial retry (main tree, one at a time) of the $(wc -l < "$SWEEP_Q/failed" | tr -d ' ') row(s) that failed in parallel ---"
         for n in $(cat "$SWEEP_Q/failed"); do
             sweep_read_row "$n"
-            gate_exec "$r_label" "$r_env" "$r_smoke" "$r_slug.serial-retry" && s_rc=0 || s_rc=$?
+            gate_exec "$r_label" "$r_env" "$r_smoke" "$r_slug.serial-retry" "$r_known" "$r_ksig" && s_rc=0 || s_rc=$?
             if [ "$s_rc" = 0 ]; then echo "retry-pass" > "$SWEEP_Q/$n.final"; else echo "$s_rc" > "$SWEEP_Q/$n.final"; fi
         done
     fi
@@ -788,13 +924,12 @@ if [ "$SWEEP_JOBS" -gt 1 ]; then
     n=1
     while [ "$n" -le "$gate_n" ]; do
         sweep_read_row "$n"; f_rc=$(cat "$SWEEP_Q/$n.final")
-        case "$f_rc" in
-            0)          pass=$((pass+1)); results="$results\n  PASS  $r_label" ;;
-            retry-pass) pass=$((pass+1)); retry_passes=$((retry_passes+1))
-                        results="$results\n  PASS  $r_label  (passed on serial retry; parallel log: $SWEEP_LOGS/$r_slug.parallel.log)" ;;
-            2)          fail=$((fail+1)); results="$results\n  FAIL  $r_label (build)" ;;
-            *)          fail=$((fail+1)); results="$results\n  FAIL  $r_label" ;;
-        esac
+        if [ "$f_rc" = retry-pass ]; then
+            retry_passes=$((retry_passes+1))
+            sweep_tally "$f_rc" "$r_label" "$r_known" "  (passed on serial retry; parallel log: $SWEEP_LOGS/$r_slug.parallel.log)"
+        else
+            sweep_tally "$f_rc" "$r_label" "$r_known"
+        fi
         n=$((n+1))
     done
 fi
@@ -808,6 +943,9 @@ echo "  build/agnos: $(stat -c%s "$ROOT/build/agnos" 2>/dev/null || wc -c < "$RO
 echo ""
 echo "=========================================="
 printf ' SWEEP RESULTS  (%d passed, %d failed)%b\n' "$pass" "$fail" "$results"
+# 1.57.10: both lines always print (like serial-retry passes) — a known red is still red, and is never silent.
+echo "  known red (failed the known way; one attempt, never retried; counted in 'failed'): $known_reds"
+echo "  stale known-red marks (a marked row PASSED — remove the mark): $stale_marks"
 if [ "$SWEEP_JOBS" -gt 1 ]; then
     echo "  serial-retry passes: $retry_passes (rows that failed in parallel and passed when re-run alone)"
     SWEEP_T1=$(date +%s)

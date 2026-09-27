@@ -1,8 +1,8 @@
 # sockown — the RING-3 half of agnos 1.57.7 step S5 (socket ownership, held slots, the loopback-only listen
 # class, 127/8 + net_ip admission, sock_peer#106, UDP ownership).
 #
-# Issues: docs/development/issues/2026-09-23-socket-ids-have-no-owner.md,
-#         docs/development/issues/2026-09-23-tcp-server-cannot-be-loopback-only.md.
+# Issues: docs/development/issues/archived/2026-09-23-socket-ids-have-no-owner.md,
+#         docs/development/issues/archived/2026-09-23-tcp-server-cannot-be-loopback-only.md.
 #
 # Seeded as /bin/agnsh on a PLAIN kernel (D19) by scripts/smoke/sock-owner-smoke.sh, which maps the markers
 # below. Raw `syscall(N, a1, a2, a3, a4)` with explicit zeros; #52 passes the length as a4. Every poll loop is

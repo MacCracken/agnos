@@ -4,7 +4,7 @@
 **Date**: 2026-06-18
 **Priority**: **HIGH — closed-beta Phase-1 gate.** This is the one remaining piece between "the AGNOS kernel can `accept()`" and "an AGNOS *service binary* can `accept()`." The 2026-06-14 beta rescope makes the founder **Docker AGNOS service-sweep at the server base** (agora / descent / sandhi / web accepting connections) the closed-beta opening gate (Late June / Early July 2026). Until this peer lands, no Cyrius service compiled `--agnos` can host a socket, regardless of kernel readiness.
 **From**: agnos 1.45.10 (kernel) vs cyrius 6.2.21 (`lib/net.cyr`).
-**Supersedes the "not wanted yet" framing** in `docs/development/issues/2026-06-15-cyrius-stdlib-missing-syscalls.md` (filed at cyrius 6.2.7, AGNOS surface 45–55): inbound-TCP server is now wanted — it is the closed-beta gate — and the kernel surface it was gated on has since landed (#56/#57 at 1.45.5/.6).
+**Supersedes the "not wanted yet" framing** in `docs/development/issues/archived/2026-06-15-cyrius-stdlib-missing-syscalls.md` (filed at cyrius 6.2.7, AGNOS surface 45–55): inbound-TCP server is now wanted — it is the closed-beta gate — and the kernel surface it was gated on has since landed (#56/#57 at 1.45.5/.6).
 **Related**: `kernel/core/syscall.cyr` (#56/#57 dispatch), `kernel/core/net_tcp.cyr` (`tcp_listen`/`tcp_accept`), `docs/development/syscall-additions.md`, `docs/development/agnos-userland-abi.md`. cyrius: `lib/net.cyr` (the fail-loud server shims), `lib/tls_native_conn.cyr`.
 
 ## What changed since the 6.2.7 completeness pass

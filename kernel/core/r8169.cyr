@@ -1063,6 +1063,7 @@ fn r8169_dump_stats() {
     if (r8169_stats_initialized == 0) {
         r8169_stats_phys = pmm_alloc();
         if (r8169_stats_phys == 0) { return 0 - 1; }
+        iommu_register_dma(r8169_stats_phys);   # 1.57.10 (VTD): the chip DMAs its tally counters here
         r8169_stats_initialized = 1;
     }
 

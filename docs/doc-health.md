@@ -6,8 +6,25 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-09-26 (**1.57.9 — a quiet `#44` + `sched_yield_to`#108, blocking pipe writes, AHCI recovery, CPU-only buffers and MSC on the direct map, the parallel sweep, the weighed-size tripwire; six issue files closed, three filed; see the 1.57.9 block**).
+> **Last refresh**: 2026-09-26 (**1.57.10 — VT-d translation runs for the first time, AHCI bounces its buffer, the harness backlog cleared (gate 36, known-red rows); three issue files closed, one filed; see the 1.57.10 block**).
 >
+>
+>
+> ### 1.57.10 (2026-09-26) — three issues; three parallel steps, each from a prior-art note
+>
+> ✅ **`CHANGELOG.md` 1.57.10** — Changed (AHCI bounce; VT-d grant replay + CM invalidation + the seven iommu.cyr fixes; the
+> harness backlog), Added (check.sh gate 36, known-red sweep rows, `VTD_SELFTEST` / vtd-smoke, the AHCI `bounce` arm), Closeout
+> (2,522,456 B; LOAD end `0x377bf8`), each change with its prior-art citation.
+>
+> ✅ **`state.md`**, **`roadmap.md`** (section "After 1.57.10": queued invalidation, the grant-model follow-ons, the 21 s recovery
+> `run`, doc-health's pointers), **`CLAUDE.md`** (36 gates, gate 36 described, 64 sweep rows, known-red row 1).
+>
+> ✅ **Issues** — three archived with rewritten Status headers and Resolution blocks; `2026-09-26-vt-d-queued-invalidation` filed
+> by the VTD step. Sibling: aethersafha `2026-09-26-agnos-build-fails-kavach-o-nofollow`. agnoshi 2.0.3 / kriya 1.7.1 closed
+> 1.57.9's sibling filings.
+>
+> ⚠ **This ledger is excluded from gate 36** until its five old pointers (lines naming cyrius issues without `cyrius/`, and two
+> archived agnos issues) are rewritten.
 >
 > ### 1.57.9 (2026-09-26) — six issues + two operator asks; every step began with a prior-art note
 >

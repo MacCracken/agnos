@@ -795,7 +795,7 @@ cat "$OUT"
 if [ "$rc" -eq 1 ] && ! { grep -q '^  scanned ' "$OUT" && grep -q ' LOCAL var ' "$OUT"; }; then rc=5; fi
 if [ "$rc" -eq 0 ]; then echo "  PASS: no function-local var X[N] overruns"; exit 0; fi
 # ⚠ A VACUOUS OR BROKEN RUN IS NOT A CLEAN RUN, AND MUST NOT BORROW THE OVERRUN WORDING. check.sh logs
-# this script to /tmp/check-array-sizing.log and prints the log on failure (1.57.7 — until then it
+# this script to build/check-logs/check-array-sizing.log (a fixed /tmp path until 1.57.10) and prints the log on failure (1.57.7 — until then it
 # invoked it as `>/dev/null 2>&1`, so a red run showed no site lines). The floors, the control corpus
 # and the structure check still fail CLOSED (rc 2/3/4 -> exit 1), because a warning scrolls past.
 case "$rc" in

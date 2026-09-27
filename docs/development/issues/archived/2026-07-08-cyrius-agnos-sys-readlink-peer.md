@@ -7,7 +7,7 @@ consumer (hapi) already calls #70 via a *locally-defined* number (`AGNOS_SYS_REA
 6.4.x peer), and mirshi emulates the syscall — so the round-trip works today. The peer makes the
 call native (`sys_readlink(...)`) for hapi and any future `--agnos` consumer once they re-sync
 their vendored `lib/`. **The cyrius-side request is filed IN the cyrius repo at
-`docs/development/issues/2026-07-08-agnos-sys-readlink-peer.md`** (cyrius house format) — the cyrius
+`cyrius/docs/development/issues/2026-07-08-agnos-sys-readlink-peer.md`** (cyrius house format) — the cyrius
 language agent picks it up there; this agnos-side copy is the mirror.
 **Date**: 2026-07-08
 **Priority**: **Low — ABI-completeness.** The kernel + the sole consumer + the mirshi supervisor

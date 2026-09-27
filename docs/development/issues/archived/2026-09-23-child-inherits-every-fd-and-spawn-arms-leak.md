@@ -92,4 +92,4 @@ step; it predated this work.
 SPAWN_F_ARGV | SPAWN_F_CLEANFD, env, envlen)`, close the write ends, read to EOF; on an error path between
 arming and spawning `#62(0x200, 0)` + `CH_ENDOW(-1)`. agnoshi should `REDIR_CLEAR` on error paths after
 `#62`. cyrius wrappers are filed in cyrius
-`docs/development/issues/2026-09-24-agnos-spawn-flags-redirect-ops-and-uptime-us-peer.md`.
+`cyrius/docs/development/issues/2026-09-24-agnos-spawn-flags-redirect-ops-and-uptime-us-peer.md`.

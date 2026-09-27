@@ -2,8 +2,8 @@
 # sock-owner-smoke — agnos 1.57.7 step S5: socket ownership (TCP + UDP), held dead-connection slots, the
 # loopback-only listen class, 127/8 + net_ip TCP admission, the wire martian filter and sock_peer#106.
 #
-# Issues: docs/development/issues/2026-09-23-socket-ids-have-no-owner.md,
-#         docs/development/issues/2026-09-23-tcp-server-cannot-be-loopback-only.md.
+# Issues: docs/development/issues/archived/2026-09-23-socket-ids-have-no-owner.md,
+#         docs/development/issues/archived/2026-09-23-tcp-server-cannot-be-loopback-only.md.
 # Design: docs/architecture/socket-ownership-and-loopback.md.
 #
 #   static  net_rx_drain's body calls net_wire_frame(&net_rx_pkt ...) exactly once and net_demux_frame never

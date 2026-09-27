@@ -657,7 +657,7 @@ fn elf_load_from_file_body(path, namelen, argv_src, argv_len) {
     # not this one. It also printed nothing at all for its value while the other fields on the same
     # line printed fine, so it was untrustworthy on top of being aimed wrong.
     # Next probe + the four instrument defects that preceded it:
-    #   docs/development/issues/2026-08-02-large-image-ptload-pde-absent-smp.md
+    #   docs/development/issues/archived/2026-08-02-large-image-ptload-pde-absent-smp.md
 
     # 1.40.7: build the SysV process init stack so the program gets argc/argv.
     # The stack page maps stack_base -> stack_phys 1:1 (both 2 MB-aligned), so we

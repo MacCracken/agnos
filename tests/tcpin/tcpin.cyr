@@ -1,7 +1,7 @@
 # tcpin — the RING-3 half of agnos 1.57.7 step S4 (inbound TCP in interrupt context + #49 EOF + half-close).
 #
-# Issues: docs/development/issues/2026-09-23-inbound-tcp-syn-dropped-by-isr-drain.md,
-#         docs/development/issues/2026-09-23-sock-recv-never-reports-eof-after-peer-fin.md.
+# Issues: docs/development/issues/archived/2026-09-23-inbound-tcp-syn-dropped-by-isr-drain.md,
+#         docs/development/issues/archived/2026-09-23-sock-recv-never-reports-eof-after-peer-fin.md.
 #
 # Seeded as /bin/agnsh (the orchestrator, launched by kybernet on a PLAIN kernel — D19) AND /bin/tcpin (the X
 # phase's children, selected by argv). The host half is scripts/smoke/tcp-inbound-smoke.sh's helper, keyed on the

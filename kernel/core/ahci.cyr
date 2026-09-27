@@ -354,9 +354,9 @@ var ahci_ports_inited_count = 0;
 var AHCI_TIMEOUT_SPINS = 1000000;
 
 # ⛔ 1.57.9 — A COMMAND THAT TIMES OUT IS NOT OVER UNTIL THE PORT'S ENGINE IS PROVEN STOPPED.
-# (docs/development/issues/2026-09-25-ahci-timeout-abandons-an-in-flight-command.md; docs/architecture/ahci-command-recovery.md)
+# (docs/development/issues/archived/2026-09-25-ahci-timeout-abandons-an-in-flight-command.md; docs/architecture/ahci-command-recovery.md)
 # Until 1.57.9 each command poll was an ITERATION count (1M MMIO spins, FLUSH 30M) and on a stuck PxCI or a PxTFD.ERR it
-# returned 0 with ST=1 and PxCI still set. The PRDT points at the CALLER's buffer, so the device could DMA into memory
+# returned 0 with ST=1 and PxCI still set. The PRDT held the CALLER's buffer (to 1.57.10), so the device could DMA into memory
 # the caller had already reused, and the next command rewrote slot 0's header and the CT under a command the HBA still
 # owned. After a TFES the HBA halts with CI set, so every later issue failed ahci_port_wait_idle for the rest of the boot.
 # Now: (1) the budgets are WALL TIME on klog_uptime_us() (a spin backstop of budget*64 while the TSC is uncalibrated,
@@ -562,6 +562,11 @@ fn ahci_port_init(port) {
     var fis_phys = pmm_alloc();
     if (cl_phys == 0) { return 0; }
     if (fis_phys == 0) { return 0; }
+    # ⛔ 1.57.10 (VTD) — GRANT EVERY PAGE THE HBA DMAs (iommu.cyr; a no-op when VT-d is off). AHCI granted nothing until
+    # 1.57.10, so with translation on the command-list fetch of the first IDENTIFY faulted. Every pmm_alloc below that the
+    # HBA reads or writes (command table, IDENTIFY page, demo / selftest data pages) is granted at its allocation too.
+    iommu_register_dma(cl_phys);
+    iommu_register_dma(fis_phys);
 
     # g. Zero both pages. Single-byte stores in a loop — slow but
     #    used only once per port at init.
@@ -1020,6 +1025,7 @@ fn ahci_identify_device_inner(port) {
     if (ct_phys == 0) {
         ct_phys = pmm_alloc();
         if (ct_phys == 0) { return 0; }
+        iommu_register_dma(ct_phys);        # 1.57.10 (VTD): the HBA fetches the command table (FIS + PRDT)
         store64(&ahci_port_ct_phys + port * 8, ct_phys);
     }
     var ct_kva = dma_kva(ct_phys);
@@ -1027,6 +1033,7 @@ fn ahci_identify_device_inner(port) {
     if (id_phys == 0) {
         id_phys = pmm_alloc();
         if (id_phys == 0) { return 0; }
+        iommu_register_dma(id_phys);        # 1.57.10 (VTD): IDENTIFY DEVICE data lands here
         store64(&ahci_port_id_phys + port * 8, id_phys);
     }
     var id_kva = dma_kva(id_phys);
@@ -1224,21 +1231,35 @@ fn ahci_issue_rw(port, opcode, lba, count, data_phys, is_write) {
     return ahci_issue_rw_n(port, opcode, lba, count, data_phys, is_write, AHCI_IO_BUDGET_US);
 }
 fn ahci_issue_rw_inner(port, opcode, lba, count, data_phys, is_write, budget_us) {
+    if (ahci_rw_ok(port, count) == 0) { return 0; }
+    if (ahci_port_ready(port) == 0) { return 0; }
+    return ahci_rw_go(port, opcode, lba, count, data_phys, is_write, budget_us);
+}
+
+# 1.57.10: the argument / port-state check and the build+run are split out of ahci_issue_rw_inner so that the block
+# layer's bounce path (ahci_bounce_rw_inner) can settle (ahci_port_ready) BETWEEN them, before it copies into its page,
+# and still settle exactly once per command. 1 = a data command of `count` sectors may be built on `port`.
+fn ahci_rw_ok(port, count) {
     if (ahci_present == 0) { return 0; }
     if (port < 0) { return 0; }
     if (port >= AHCI_MAX_PORTS) { return 0; }
     if (load8(&ahci_port_inited + port) != 1) { return 0; }
     if (count <= 0) { return 0; }
     if (count > 128) { return 0; }      # cap per-cmd at 64 KB (128 sectors)
+    return 1;
+}
 
-    if (ahci_port_ready(port) == 0) { return 0; }
-
+# Build slot 0 (the FIS, ONE PRDT entry, the header) and see it through. The caller holds ahci_lock and has run
+# ahci_rw_ok + ahci_port_ready. `data_phys` is the PHYSICAL address (the PRDT DBA value) of count*512 contiguous bytes
+# the caller owns, never a CPU pointer (1.57.10: the banner above ahci_blk_read).
+fn ahci_rw_go(port, opcode, lba, count, data_phys, is_write, budget_us) {
     var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
     var cl_kva   = load64(&ahci_port_cl_kva + port * 8);
     var ct_phys  = load64(&ahci_port_ct_phys + port * 8);
     if (ct_phys == 0) {
         ct_phys = pmm_alloc();
         if (ct_phys == 0) { return 0; }
+        iommu_register_dma(ct_phys);        # 1.57.10 (VTD): the HBA fetches the command table (FIS + PRDT)
         store64(&ahci_port_ct_phys + port * 8, ct_phys);
     }
     var ct_kva = dma_kva(ct_phys);
@@ -1276,14 +1297,19 @@ fn ahci_issue_rw_inner(port, opcode, lba, count, data_phys, is_write, budget_us)
     return ahci_run_slot0(port, port_off, budget_us);
 }
 
-# --- Public READ / WRITE primitives ----------------------------------
+# --- Public READ / WRITE primitives (PHYS-taking) --------------------
+#
+# ⚠ 1.57.10: `data_phys` goes straight into PRDT DBA, so it is the PHYSICAL address of count*512 contiguous bytes the
+# caller owns: a pmm page (ahci_read_demo, ahci_write_demo, AHCI_SELFTEST), as nvme_read_lba and msc_read_lba take. A
+# CPU pointer (.bss, kmalloc, direct map, stack) is never legal here; ahci_blk_* bounce those (the banner above
+# ahci_blk_read). Until 1.57.10 this parameter was named `buf`, and the block layer passed CPU pointers through it.
 
-fn ahci_read_lba(port, lba, count, buf) {
-    return ahci_issue_rw(port, 0x25, lba, count, buf, 0);
+fn ahci_read_lba(port, lba, count, data_phys) {
+    return ahci_issue_rw(port, 0x25, lba, count, data_phys, 0);
 }
 
-fn ahci_write_lba(port, lba, count, buf) {
-    return ahci_issue_rw(port, 0x35, lba, count, buf, 1);
+fn ahci_write_lba(port, lba, count, data_phys) {
+    return ahci_issue_rw(port, 0x35, lba, count, data_phys, 1);
 }
 
 # --- Issue a non-data ATA command (no PRDT) --------------------------
@@ -1322,6 +1348,7 @@ fn ahci_issue_nodata_inner(port, opcode) {
     if (ct_phys == 0) {
         ct_phys = pmm_alloc();
         if (ct_phys == 0) { return 0; }
+        iommu_register_dma(ct_phys);        # 1.57.10 (VTD): the HBA fetches the command table (FIS + PRDT)
         store64(&ahci_port_ct_phys + port * 8, ct_phys);
     }
     var ct_kva = dma_kva(ct_phys);
@@ -1382,6 +1409,7 @@ fn ahci_read_demo() {
     if (ahci_demo_buf == 0) {
         ahci_demo_buf = pmm_alloc();
         if (ahci_demo_buf == 0) { return 0; }
+        iommu_register_dma(ahci_demo_buf);  # 1.57.10 (VTD): the demo sector's DMA page
     }
     var dk = dma_kva(ahci_demo_buf);       # 1.57.8 (DMA1): CPU pointer = direct map; the phys goes to the PRDT
 
@@ -1420,10 +1448,12 @@ fn ahci_write_demo() {
     if (ahci_demo_buf == 0) {
         ahci_demo_buf = pmm_alloc();
         if (ahci_demo_buf == 0) { return 0; }
+        iommu_register_dma(ahci_demo_buf);  # 1.57.10 (VTD): the demo sector's DMA page
     }
     if (ahci_demo_buf2 == 0) {
         ahci_demo_buf2 = pmm_alloc();
         if (ahci_demo_buf2 == 0) { return 0; }
+        iommu_register_dma(ahci_demo_buf2); # 1.57.10 (VTD)
     }
     var dk = dma_kva(ahci_demo_buf);
     var dk2 = dma_kva(ahci_demo_buf2);
@@ -1480,16 +1510,89 @@ fn ahci_write_demo() {
 #endif
 
 # --- Block-layer dispatch wrappers (single + multi-sector) -----------
+#
+# ⛔⛔ 1.57.10 — THE CALLER'S `buf` IS A CPU POINTER AND NEVER GOES INTO A PRDT. Until this cut all three entry points
+# handed `buf` to ahci_read_lba / ahci_write_lba, which stored it as the PRDT's DBA: the HBA took a VIRTUAL address as a
+# PHYSICAL one. It worked only because every in-tree caller passed a `.bss` buffer or the BSP's boot stack (identity
+# mapped, VA == phys). A kmalloc or direct-map pointer (DIRECTMAP_BASE + phys, 0x2_0000_0000+) aimed the DMA at
+# 8 GB + phys: above RAM under QEMU, someone else's memory on a box with more than 8 GB. (Issue 2026-09-26-ahci-puts-
+# the-caller-buffer-in-the-prdt, the class msc_blk_* closed in 1.57.9. Prior art: Linux ata_sg_setup -> dma_map_sg ->
+# ahci_fill_sg writes one PRD per BUS address, with swiotlb bouncing what a device cannot reach; FreeBSD
+# ahci_dmasetprd fills the PRDs from busdma segments, bounce pages included.)
+# Now the only address ahci_blk_* ever puts in a PRDT is the block port's BOUNCE PAGE: ahci_bb_phys, a pmm page the
+# driver owns, iommu-registered and allocated once by ahci_register_block_dev. The CPU copies through its direct-map
+# alias ahci_bb_kva (dma_kva). One ahci_lock hold per command of at most 8 sectors (ahci_bounce_rw):
+#   · SETTLE FIRST: ahci_port_ready (the 1.57.9 recovery) runs before the page is touched. An offline port fails there,
+#     before any copy, and a port that is not idle is recovered (§6.2.2.1) first. After ahci_hba_escalate's
+#     "hba-reset-stuck" (DMA not proven stopped) every port is offline, so such a late DMA can land only in this page,
+#     never in a caller's buffer.
+#   · COPY IN: a WRITE copies the data. A READ copies the caller's own bytes in too (swiotlb_tbl_map_single's pre-fill
+#     for DMA_FROM_DEVICE), so a "successful" short DMA leaves the caller's bytes, never a previous transfer's: the page
+#     is shared by every block I/O. There is no portable byte count to check instead: PRDBC is not updated by some HBAs
+#     (FreeBSD AHCI_Q_NOCOUNT, Marvell 88SE61xx), and libahci never reads it.
+#   · COPY OUT: a READ copies the page to `buf` only if the command COMPLETED (ahci_run_slot0 == 1: PxCI clear, no PxIS
+#     error). A failed or timed-out command never writes the caller's buffer.
+# ⚠ ahci_read_lba / ahci_write_lba stay PHYS-taking primitives (the demos and AHCI_SELFTEST pass their own pmm pages,
+# as nvme_read_lba / msc_read_lba do). The `*_lba` layer is where a phys is legal; `ahci_blk_*` is where a CPU pointer is.
+# Gate: the AHCI_SELFTEST `bounce` arm (scripts/smoke/ahci-late-smoke.sh: kmalloc and unaligned direct-map buffers,
+# plus a .bss control). docs/architecture/dma-cpu-pointers.md.
+var AHCI_BB_SECTORS = 8;      # the bounce page holds 8 x 512 B sectors: one page per bounced command
+var ahci_bb_phys = 0;         # the bounce page's PHYS: only the PRDT's DBA and iommu_register_dma see it
+var ahci_bb_kva  = 0;         # ... its CPU pointer (dma_kva, the direct map): every copy goes through this
+
+# Allocate the block port's bounce page once: ahci_register_block_dev (boot, BSP), before ahci_blk_port is set, so no
+# ahci_blk_* call can run without it. 1 = ready. A page whose alias is not inside the installed direct map is refused
+# (dma_kva_ok, the 1.57.9 stored-pointer assert).
+fn ahci_bounce_init() {
+    if (ahci_bb_kva != 0) { return 1; }
+    var bp = pmm_alloc();
+    if (bp == 0) { return 0; }
+    var bk = dma_kva(bp);
+    if (dma_kva_ok(bk) == 0) { pmm_free(bp); return 0; }
+    iommu_register_dma(bp);
+    memset(bk, 0, 4096);
+    ahci_bb_phys = bp;
+    ahci_bb_kva = bk;
+    return 1;
+}
+
+# One bounced READ/WRITE DMA EXT of `count` <= 8 sectors between the CPU buffer `buf` and LBA `lba`. The lock wrapper
+# has ahci_issue_rw_n's shape: recovery events are printed after unlock. 1 = done, 0 = failed (a failed read leaves
+# `buf` untouched).
+fn ahci_bounce_rw(port, lba, count, buf, is_write) {
+    ahci_spin_lock();
+    ahci_note = 0;
+    var r = ahci_bounce_rw_inner(port, lba, count, buf, is_write);
+    var note = ahci_note;
+    ahci_note = 0;
+    ahci_last_note = note;
+    ahci_spin_unlock();
+    ahci_print_note(port, note);
+    return r;
+}
+fn ahci_bounce_rw_inner(port, lba, count, buf, is_write) {
+    if (ahci_rw_ok(port, count) == 0) { return 0; }
+    if (count > AHCI_BB_SECTORS) { return 0; }      # never DMA past the one page
+    if (ahci_bb_kva == 0) { return 0; }
+    if (ahci_port_ready(port) == 0) { return 0; }   # settle BEFORE the page is touched
+    var bytes = count * 512;
+    memcpy(ahci_bb_kva, buf, bytes);                # WRITE: the data. READ: the pre-fill
+    var opcode = 0x25;                              # READ DMA EXT
+    if (is_write == 1) { opcode = 0x35; }           # WRITE DMA EXT
+    if (ahci_rw_go(port, opcode, lba, count, ahci_bb_phys, is_write, AHCI_IO_BUDGET_US) == 0) { return 0; }
+    if (is_write == 0) { memcpy(buf, ahci_bb_kva, bytes); }   # only after a completed command
+    return 1;
+}
 
 fn ahci_blk_read(sector, buf) {
     if (ahci_blk_port < 0) { return 0 - 1; }
-    if (ahci_read_lba(ahci_blk_port, sector, 1, buf) == 1) { return 0; }
+    if (ahci_bounce_rw(ahci_blk_port, sector, 1, buf, 0) == 1) { return 0; }
     return 0 - 1;
 }
 
 fn ahci_blk_write(sector, buf) {
     if (ahci_blk_port < 0) { return 0 - 1; }
-    if (ahci_write_lba(ahci_blk_port, sector, 1, buf) == 1) { return 0; }
+    if (ahci_bounce_rw(ahci_blk_port, sector, 1, buf, 1) == 1) { return 0; }
     return 0 - 1;
 }
 
@@ -1500,15 +1603,20 @@ fn ahci_blk_flush() {
     return 0 - 1;
 }
 
+# Multi-sector read into a CPU buffer, one bounce page (8 sectors) per command (1.57.10; the banner above
+# ahci_blk_read). It used to chunk 128 sectors straight into `buf + done*512`, taking the caller's pointer as 64 KB of
+# contiguous PHYSICAL memory. A 4 KB ext2 block or a <= 4 KB FAT/exFAT run is still ONE command; a longer read now takes
+# ceil(count/8) commands instead of ceil(count/128).
+# ⚠ One ahci_lock hold per chunk, not across the loop: each chunk is a whole command plus its copy-out and shares no
+# state with the next, so another CPU's command may run between two chunks (the pre-1.57.10 loop did the same).
 fn ahci_blk_read_sectors(start, count, buf) {
     if (ahci_blk_port < 0) { return 0 - 1; }
     if (count <= 0) { return 0 - 1; }
-    # Single-PRDT cap is 128 sectors per call; chunk larger requests.
     var done = 0;
     while (done < count) {
         var chunk = count - done;
-        if (chunk > 128) { chunk = 128; }
-        if (ahci_read_lba(ahci_blk_port, start + done, chunk, buf + done * 512) == 0) {
+        if (chunk > AHCI_BB_SECTORS) { chunk = AHCI_BB_SECTORS; }
+        if (ahci_bounce_rw(ahci_blk_port, start + done, chunk, buf + done * 512, 0) == 0) {
             return 0 - 1;
         }
         done = done + chunk;
@@ -1541,6 +1649,13 @@ fn ahci_register_block_dev() {
     # Refresh capacity from a per-port IDENTIFY (Phase 3 cached only
     # the last-called port's data; re-run for the registration port).
     if (ahci_identify_device(port) == 0) { return 0; }
+
+    # 1.57.10: the block layer's bounce page, the only DMA address ahci_blk_* ever uses. No page, no block device:
+    # ahci_blk_port >= 0 means the bounce exists (ahci_bounce_rw_inner refuses without one all the same).
+    if (ahci_bounce_init() == 0) {
+        kprintln("ahci: no bounce page - block device not registered", 50);
+        return 0;
+    }
 
     ahci_blk_port = port;
 
@@ -1585,6 +1700,9 @@ fn ahci_register_block_dev() {
 #   shift  one late read, then 16 reads of known LBAs byte-exact and a FLUSH: slot 0 and the CT are reused cleanly.
 #   tfes   a read past capacity fails with a PxIS error; the next read succeeds byte-exact with the port idle (no
 #          not-idle recovery). RED on the pre-1.57.9 poll, which read the stale PxTFD.ERR and failed the next command.
+#   bounce (1.57.10) ahci_blk_read / _read_sectors / _write with CPU buffers OUTSIDE the identity window (kmalloc and
+#          unaligned direct-map) and a .bss control, each checked against the phys reference primitives. RED on the
+#          pre-1.57.10 block layer, which put the caller's pointer in the PRDT (see ahst_bounce).
 #   lost   ahci_test_stuck makes the engine "refuse" to stop: COMRESET, then GHC.HR, every port offline. B is not
 #          written after the return, the next I/O fails at once, GHC.HR has cleared and the port's ST/CR are clear.
 #          This leaves AHCI OFF for the rest of the boot; the smoke stops at "ahcist: done".
@@ -1647,6 +1765,108 @@ fn ahst_verdict(name, nlen, ok, a, b) {
     return 0;
 }
 
+# ─── bounce (1.57.10): the ahci_blk_* layer never hands a CPU pointer to the HBA ───
+# (issue 2026-09-26-ahci-puts-the-caller-buffer-in-the-prdt; the msc-cdb-smoke [bounce] shape.) Four rows, each ONE
+# direction of ONE entry point, checked against the phys-taking reference primitives (ahci_read_lba / ahci_write_lba on
+# a pmm page, correct before and after the fix), on LBAs base+32 .. base+56:
+#   bounce-kmalloc  ahci_blk_read into a kmalloc(512) block (a direct-map VA, 0x2_0000_0000+)
+#   bounce-sectors  ahci_blk_read_sectors(16) into a direct-map buffer at +100 bytes (unaligned; two bounce chunks)
+#   bounce-write    ahci_blk_write x8 from a direct-map buffer at +36 bytes, read back by the reference primitive
+#   bounce-bss      CONTROL: ahci_blk_write + ahci_blk_read on .bss buffers (identity VA == phys). GREEN on the old
+#                   code too, so a RED in the other three rows comes from the BUFFER CLASS, not the disk or the port.
+# Every destination starts as the pattern's complement, so "the device moved nothing" mismatches every byte. A row
+# PASSes only on err=0 AND bad=0 and prints "bad=<bytes> aux=<err>"; "ahcist: bounce" sums them (aux = rows passed).
+# Expected RED on the pre-1.57.10 code: QEMU (-m 512M) takes a direct-map VA as an unassigned phys, so the command
+# "succeeds" and the bytes go nowhere (err=0, bad>0), as MSC's 1.57.9 M1 did.
+var ahst_bss_w[64];            # MODULE scope: 64 u64 = 512 bytes, bounce-bss's .bss source
+var ahst_bss_r[64];            # bounce-bss's .bss destination
+fn ahst_pbyte(lba, i) { return (lba * 31 + i * 7 + 0x5A) & 0xFF; }
+# Fill n bytes at p with the pattern of consecutive 512 B sectors from `lba`; inv=1 writes its complement.
+fn ahst_pfill(p, lba, n, inv) {
+    for (var i = 0; i < n; i = i + 1) {
+        var v = ahst_pbyte(lba + (i >> 9), i & 511);
+        if (inv == 1) { v = v ^ 0xFF; }
+        store8(p + i, v);
+    }
+    return 0;
+}
+# The bytes of n at p that differ from the pattern of consecutive sectors from `lba`.
+fn ahst_pbad(p, lba, n) {
+    var nb = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        if (load8(p + i) != ahst_pbyte(lba + (i >> 9), i & 511)) { nb = nb + 1; }
+    }
+    return nb;
+}
+# One bounce row's verdict line; 1 = PASS.
+fn ahst_brow(name, nlen, err, bad) {
+    var ok = 0;
+    if (err == 0) { if (bad == 0) { ok = 1; } }
+    ahst_verdict(name, nlen, ok, bad, err);
+    return ok;
+}
+fn ahst_bounce(port, base) {
+    var bb = base + 32;
+    var rp = pmm_alloc();                   # reference DMA page: its PHYS goes to the phys primitives
+    var run = pmm_alloc_2mb();              # 2 MB direct-map run: contiguous CPU VAs for two rows (never DMAed)
+    var km = kmalloc(512);
+    if (rp == 0 || run == 0 || km == 0) { kprintln("ahcist: bounce FAIL no memory for the buffers", 45); return 0; }
+    var rk = dma_kva(rp);                   # CPU pointers: the direct map (1.57.8 DMA1)
+    var runk = dma_kva(run);
+    # Reference WRITE of bb .. bb+15 through the phys primitive: two 8-sector commands from the one page.
+    var rerr = 0;
+    ahst_pfill(rk, bb, 4096, 0);
+    if (ahci_write_lba(port, bb, 8, rp) == 0) { rerr = 1; }
+    ahst_pfill(rk, bb + 8, 4096, 0);
+    if (ahci_write_lba(port, bb + 8, 8, rp) == 0) { rerr = 1; }
+    if (rerr != 0) { kprintln("ahcist: bounce FAIL the reference writes failed", 47); }
+    var passed = 0;
+    var tbad = 0;
+    # kmalloc: one sector into a kmalloc block.
+    ahst_pfill(km, bb + 3, 512, 1);
+    var ae = 0;
+    if (ahci_blk_read(bb + 3, km) != 0) { ae = 1; }
+    var ab = ahst_pbad(km, bb + 3, 512);
+    passed = passed + ahst_brow("bounce-kmalloc", 14, ae, ab);
+    tbad = tbad + ab;
+    # sectors: sixteen sectors (two bounce chunks) into an unaligned direct-map buffer.
+    var sdst = runk + 65536 + 100;
+    ahst_pfill(sdst, bb, 8192, 1);
+    var se = 0;
+    if (ahci_blk_read_sectors(bb, 16, sdst) != 0) { se = 1; }
+    var sb = ahst_pbad(sdst, bb, 8192);
+    passed = passed + ahst_brow("bounce-sectors", 14, se, sb);
+    tbad = tbad + sb;
+    # write: eight single-sector writes from an unaligned direct-map buffer, read back by the reference primitive.
+    var wsrc = runk + 131072 + 36;
+    ahst_pfill(wsrc, bb + 16, 4096, 0);
+    var we = 0;
+    for (var ws = 0; ws < 8; ws = ws + 1) {
+        if (ahci_blk_write(bb + 16 + ws, wsrc + ws * 512) != 0) { we = 1; }
+    }
+    ahst_pfill(rk, bb + 16, 4096, 1);
+    if (ahci_read_lba(port, bb + 16, 8, rp) == 0) { we = 1; }
+    var wb = ahst_pbad(rk, bb + 16, 4096);
+    passed = passed + ahst_brow("bounce-write", 12, we, wb);
+    tbad = tbad + wb;
+    # bss: the control. A .bss source and destination (identity VA == phys) worked before the fix too.
+    ahst_pfill(&ahst_bss_w, bb + 24, 512, 0);
+    ahst_pfill(&ahst_bss_r, bb + 24, 512, 1);
+    var de = 0;
+    if (ahci_blk_write(bb + 24, &ahst_bss_w) != 0) { de = 1; }
+    if (ahci_blk_read(bb + 24, &ahst_bss_r) != 0) { de = 1; }
+    var db = ahst_pbad(&ahst_bss_r, bb + 24, 512);
+    passed = passed + ahst_brow("bounce-bss", 10, de, db);
+    tbad = tbad + db;
+    kfree_sized(km, 512);
+    pmm_free_2mb(run);
+    pmm_free(rp);
+    var bok = 0;
+    if (rerr == 0) { if (passed == 4) { bok = 1; } }
+    ahst_verdict("bounce", 6, bok, tbad, passed);
+    return bok;
+}
+
 fn ahci_late_selftest() {
     if (ahci_blk_port < 0) { kprintln("ahcist: SKIP no AHCI port", 25); kprintln("ahcist: done", 12); return 0; }
     var port = ahci_blk_port;
@@ -1659,6 +1879,9 @@ fn ahci_late_selftest() {
     if (pa == 0) { kprintln("ahcist: SKIP no memory", 22); kprintln("ahcist: done", 12); return 0; }
     if (pb == 0) { kprintln("ahcist: SKIP no memory", 22); kprintln("ahcist: done", 12); return 0; }
     if (pc == 0) { kprintln("ahcist: SKIP no memory", 22); kprintln("ahcist: done", 12); return 0; }
+    iommu_register_dma(pa);                 # 1.57.10 (VTD): the three PRDT pages the HBA DMAs
+    iommu_register_dma(pb);
+    iommu_register_dma(pc);
     var ka = dma_kva(pa);                   # CPU pointers: the direct map (1.57.8 DMA1)
     var kb = dma_kva(pb);
     var kc = dma_kva(pc);
@@ -1717,6 +1940,9 @@ fn ahci_late_selftest() {
     var tok = 0;
     if (te == 0) { if ((tnote & AHCI_N_ERROR) != 0) { if (tg == 1) { if (tgn == 0) { if (tbad == 0) { tok = 1; } } } } }
     ahst_verdict("tfes", 4, tok, tbad + 1 - tg, tnote * 256 + tgn);
+
+    # bounce (1.57.10): before `lost`, which takes every port offline.
+    ahst_bounce(port, base);
 
     # lost
     ahst_prime(port, base + 7, pc);

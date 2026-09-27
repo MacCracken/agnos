@@ -56,4 +56,4 @@ refused flagged spawn leaves no stale argv mode for the next `#37`.
 **Consumer notes:** daimon can pass `--agent-name` with spaces through the argv form. agnoshi's
 `run_agnos.cyr` comment "#37 has no such cap" is now wrong — lines over 16 words fail (split them or use the
 argv form). cyrius peer constants/wrapper (`SPAWN_F_ARGV`, `sys_spawn_argv`) are filed in cyrius
-`docs/development/issues/2026-09-24-agnos-spawn-flags-redirect-ops-and-uptime-us-peer.md`.
+`cyrius/docs/development/issues/2026-09-24-agnos-spawn-flags-redirect-ops-and-uptime-us-peer.md`.

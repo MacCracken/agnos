@@ -241,6 +241,13 @@ fn vnet_negotiate_features() {
         drv_lo = drv_lo | 0x20;  # VIRTIO_NET_F_MAC
     }
 
+    # ⭐ 1.57.10 (VTD) — VIRTIO_F_ACCESS_PLATFORM (bit 33 → feat_hi bit 1) whenever offered, as virtio_blk.cyr does and for
+    # the same reason (its header): the device then DMAs through the platform IOMMU (QEMU `iommu_platform=on`), QEMU refuses
+    # FEATURES_OK when it is declined, and every ring / TX page below is granted into iommu.cyr's identity domain.
+    if ((feat_hi & 2) != 0) {
+        drv_hi = drv_hi | 2;
+    }
+
     store32(vnet_common_cfg + VNET_DRV_FEAT_SEL, 0);
     store32(vnet_common_cfg + VNET_DRV_FEAT, drv_lo);
     store32(vnet_common_cfg + VNET_DRV_FEAT_SEL, 1);
@@ -288,6 +295,11 @@ fn vnet_setup_queue(q_idx, qsize_out, desc_out, avail_out, used_out, notify_out)
     if (p1 == 0) { return 0 - 1; }
     if (p2 == 0) { return 0 - 1; }
     if (p3 == 0) { return 0 - 1; }
+    # 1.57.10 (VTD) — grant the ring pages to the device (iommu.cyr; a no-op when VT-d is off). Never granted until 1.57.10:
+    # with translation on, the device's first descriptor fetch faulted. (vnet_rx_buf is .bss, inside the default 16 MB.)
+    iommu_register_dma(p1);
+    iommu_register_dma(p2);
+    iommu_register_dma(p3);
 
     # 1.57.7 (S4, N-6): the rings are addressed by the CPU through the DIRECT MAP (dma_kva); the device
     # gets phys. The three identity `vmm_map(pN, pN, 0x83)` lines that stood here are gone (the heap.cyr
@@ -434,6 +446,7 @@ fn virtio_net_init() {
     while (vts < vnet_tx_slots) {
         var vtp = pmm_alloc();
         if (vtp == 0) { return 0 - 1; }
+        iommu_register_dma(vtp);            # 1.57.10 (VTD): the device reads its TX frames from here
         store64(&vnet_tx_bufs + vts * 8, vtp);
         store64(&vnet_tx_bufs + (vts + 1) * 8, vtp + 2048);
         vts = vts + 2;

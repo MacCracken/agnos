@@ -19,7 +19,7 @@ stay out-of-scope by the cooperative-single-CR3 design as recommended below. Val
 `EXEC_REDIRECT_SELFTEST` + `scripts/smoke/exec-redirect-smoke.sh` (`redir: capture OK`).
 **Date**: 2026-06-15
 **From**: cyrius 6.2.7 (the stdlib agnos-completeness pass that resolved sandhi's
-filed cascade — see cyrius `docs/development/issues/2026-06-15-cyrius-thread-agnos-clone-dispatch.md`).
+filed cascade — see cyrius `cyrius/docs/development/issues/2026-06-15-cyrius-thread-agnos-clone-dispatch.md`).
 **AGNOS surface at filing**: 1.45.9 — syscalls 0–42 (frozen base + 1.43.x graphics/
 timing/input) + the 1.45.x net/entropy/clock band 45–55.
 **Affects (if any added)**: `kernel/core/syscall.cyr`, `docs/development/agnos-userland-abi.md`,

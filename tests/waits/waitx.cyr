@@ -1,7 +1,7 @@
 # waitx — the RING-3 half of agnos 1.57.7's in-kernel blocking waits (Path 2, step S3c).
 #
-# Issues: docs/development/issues/2026-09-23-sleep-ms-holds-the-cpu.md,
-#         docs/development/issues/2026-09-23-flock-never-waits-and-no-caller-spins.md.
+# Issues: docs/development/issues/archived/2026-09-23-sleep-ms-holds-the-cpu.md,
+#         docs/development/issues/archived/2026-09-23-flock-never-waits-and-no-caller-spins.md.
 #
 # ⛔ WHY RING 3, AND WHY AS /bin/agnsh ON A PLAIN KERNEL (D19). Every property here is about OTHER processes
 # running while one waits: spinners that must get the CPU while the driver sleeps, a child that must run during

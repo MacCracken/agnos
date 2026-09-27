@@ -21,9 +21,10 @@
 #   STATIC  the same grep (now also memset/memcpy, and digits in the name: `iommu_l2_phys` slipped the old class)
 #           over iommu.cyr / ramdisk.cyr / fb_console.cyr too; every `*_kva =` assignment in iommu.cyr / ramdisk.cyr
 #           goes through dma_kva / pmm_kva_for_access; and main.cyr calls fb_shadow_init AFTER
-#           pmm_bitmap_use_directmap (the direct map is live only from there). iommu.cyr has no boot arm — every
-#           writer runs at boot on the kernel CR3 (its CR3 audit banner) and no QEMU config here publishes a DMAR —
-#           so the static half is its gate.
+#           pmm_bitmap_use_directmap (the direct map is live only from there). iommu.cyr has no boot arm HERE — no
+#           QEMU config here publishes a DMAR — so the static half is the gate on its table pointers. (1.57.10: since
+#           then scripts/smoke/vtd-smoke.sh boots it with translation ON, and a grant made after TE may run under a
+#           process's CR3 — which is exactly why every table write must go through a *_kva.)
 #   BOOT    "dmash: fb PASS"      fb_putc paints a '#' in a unique ink under the shadow; back on the kernel CR3 the
 #                                 fb_shadow cell must equal the FB cell and hold the ink, and the 0xA5 region untouched.
 #           "dmash: ramdisk PASS" (RAMDISK_ENABLE) a sector written on the kernel CR3 reads back under the shadow, and
@@ -152,7 +153,7 @@ for SMP in ${DSH_SMP:-1 4}; do
     check "dmash: virtio PASS"   "virtio-blk: 1 + 8 sectors + FLUSH byte-exact under the shadow"   "virtio-blk rings reached by identity VA"
     check "dmash: nvme PASS"     "NVMe: 1 + 8 sectors + FLUSH byte-exact under the shadow"          "NVMe SQ/CQ/scratch reached by identity VA"
     check "dmash: nvme-prp PASS" "NVMe: 24-sector PRP-list transfer byte-exact under the shadow"    "NVMe PRP list written by identity VA"
-    check "dmash: ahci PASS"     "AHCI: 1 + 8 sectors + FLUSH byte-exact under the shadow"          "AHCI CL/CT reached by identity VA"
+    check "dmash: ahci PASS"     "AHCI: 1 + 8 sectors + FLUSH byte-exact under the shadow"          "AHCI CL/CT or the blk bounce page (1.57.10) reached by identity VA"
     check "dmash: hda PASS"      "HDA: CORB/RIRB verb round-trip under the shadow"                  "CORB/RIRB reached by identity VA"
     check "dmash: fb PASS"       "fb_console shadow: glyph lands in fb_shadow, not the identity window" "fb_shadow reached by identity VA"
     check "dmash: ramdisk PASS"  "ramdisk: sectors cross the CR3 switch byte-exact"                "ramdisk pages reached by identity VA"

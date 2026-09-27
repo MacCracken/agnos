@@ -7,7 +7,11 @@ var acpi_rsdt_addr = 0;
 var acpi_xsdt_addr = 0;
 var acpi_dmar_addr = 0;
 var acpi_dmar_len = 0;
-var acpi_iommu_base = 0;  # Physical address of first DRHD register set
+var acpi_iommu_base = 0;  # Physical address of the remapping unit iommu.cyr drives (acpi_parse_dmar's choice), 0 = none
+var acpi_dmar_drhds = 0;  # 1.57.10 (VTD): DRHD units the DMAR lists on segment 0
+var acpi_dmar_rmrr[16];   # 1.57.10: up to 8 segment-0 RMRRs as (base, limit) pairs — module scope, 16 x u64
+var acpi_dmar_rmrr_n = 0;
+var acpi_dmar_rmrr_skipped = 0;   # RMRRs not kept: another segment, malformed, larger than 1 GB, or past the 8
 var acpi_rsdp_via_bootinfo = 0;  # 1 if RSDP came from gnoboot boot_info, not legacy scan
 
 # === Firmware-pointer access (direct-map aware) — hardening, 2026-06-29 ===
@@ -133,14 +137,33 @@ fn acpi_xsdt_find(xsdt, sig0, sig1, sig2, sig3) {
     return 0;
 }
 
-# Parse DMAR table to find first DRHD (DMA Remapping Hardware Unit Definition)
+# Parse the DMAR table: pick the remapping unit iommu.cyr drives and collect the RMRRs (VT-d spec §8).
 # DMAR structure: signature(4) length(4) revision(1) checksum(1) oem(6) ...
 #   offset 36: host_address_width(1) flags(1) reserved(10)
 #   offset 48: remapping structures (variable-length entries)
-# DRHD entry: type(2)=0 length(2) flags(1) reserved(1) segment(2) register_base(8)
+# DRHD entry: type(2)=0 length(2) flags(1) reserved(1) segment(2) register_base(8) device-scope[]
+# RMRR entry: type(2)=1 length(2) reserved(2) segment(2) base(8) limit(8, the LAST byte) device-scope[]
+#
+# ⭐ 1.57.10 (VTD) — WHICH UNIT. iommu.cyr drives ONE unit with ONE domain. Until 1.57.10 this returned the FIRST DRHD —
+# and on Intel client platforms the first is the integrated GPU's dedicated unit (spec §8.3: an INCLUDE_PCI_ALL DRHD must
+# be the LAST of its segment), so translation would have gone on for the IGD alone, killing its scanout DMA and leaving
+# every other device untranslated. Now:
+#   exactly one segment-0 DRHD            -> that unit, whatever its flags (QEMU q35's is SCOPED: flags 0, every root-bus
+#                                            device listed — it has no INCLUDE_PCI_ALL);
+#   several, one of them INCLUDE_PCI_ALL  -> the catch-all; the scoped units (the IGD's) stay OFF, Linux's
+#                                            intel_iommu=igfx_off outcome;
+#   several, none INCLUDE_PCI_ALL         -> 0: VT-d stays off (one unit cannot stand in for scoped ones).
+# RMRR (spec §8.4): memory a device may DMA to before and after the OS takes over — iommu_init identity-grants each one before
+# TE (Linux IOMMU_RESV_DIRECT, FreeBSD domain_init_rmrr). Kept: segment 0, 4 KB-aligned base, base <= limit, <= 1 GB,
+# at most 8 (FreeBSD notes "buggy BIOSes put anything into the start and end fields"). QEMU publishes none.
 fn acpi_parse_dmar(dmar) {
+    acpi_dmar_drhds = 0;
+    acpi_dmar_rmrr_n = 0;
+    acpi_dmar_rmrr_skipped = 0;
     var dmar_len = acpi_load32(dmar + 4);
     if (dmar_len < 48) { return 0; }
+    var first_unit = 0;
+    var catchall = 0;
     var offset = 48;
     while (offset + 4 <= dmar_len) {
         var entry_type = acpi_load16(dmar + offset);
@@ -155,17 +178,51 @@ fn acpi_parse_dmar(dmar) {
         if (offset + entry_len > dmar_len) { break; }      # entry runs past the table
         if (entry_type == 0) {
             # DRHD: DMA Remapping Hardware Unit Definition
-            # offset+4: flags(1), offset+5: reserved(1), offset+6: segment(2)
+            # offset+4: flags(1) (bit 0 = INCLUDE_PCI_ALL), offset+5: reserved(1), offset+6: segment(2)
             # offset+8: register_base_address(8)
             if (entry_len < 16) { break; }                 # too short to carry a register base
+            var dflags = acpi_load8(dmar + offset + 4);
+            var dseg = acpi_load16(dmar + offset + 6);
             var reg_base = acpi_load64(dmar + offset + 8);
-            if (reg_base != 0) {
-                return reg_base;
+            if (dseg == 0) {
+                if (reg_base != 0) {
+                    acpi_dmar_drhds = acpi_dmar_drhds + 1;
+                    if (first_unit == 0) { first_unit = reg_base; }
+                    if ((dflags & 1) != 0) {
+                        if (catchall == 0) { catchall = reg_base; }
+                    }
+                }
             }
+        }
+        if (entry_type == 1) {
+            var rkeep = 0;
+            if (entry_len >= 24) {
+                var rseg = acpi_load16(dmar + offset + 6);
+                var rbase = acpi_load64(dmar + offset + 8);
+                var rlim = acpi_load64(dmar + offset + 16);
+                if (rseg == 0) {
+                    if (rbase >= 0) {
+                        if ((rbase & 0xFFF) == 0) {
+                            if (rlim >= rbase) {
+                                if (rlim - rbase < 0x40000000) {
+                                    if (acpi_dmar_rmrr_n < 8) { rkeep = 1; }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (rkeep == 1) {
+                    store64(&acpi_dmar_rmrr + acpi_dmar_rmrr_n * 16, rbase);
+                    store64(&acpi_dmar_rmrr + acpi_dmar_rmrr_n * 16 + 8, rlim);
+                    acpi_dmar_rmrr_n = acpi_dmar_rmrr_n + 1;
+                }
+            }
+            if (rkeep == 0) { acpi_dmar_rmrr_skipped = acpi_dmar_rmrr_skipped + 1; }
         }
         offset = offset + entry_len;
     }
-    return 0;
+    if (acpi_dmar_drhds == 1) { return first_unit; }
+    return catchall;
 }
 
 # === FADT (FACP) — the power-management table ================================
@@ -576,6 +633,9 @@ fn acpi_init() {
     acpi_xsdt_addr = 0;
     acpi_dmar_addr = 0;
     acpi_iommu_base = 0;
+    acpi_dmar_drhds = 0;         # 1.57.10: no DMAR must mean no units / RMRRs, not a previous parse's
+    acpi_dmar_rmrr_n = 0;
+    acpi_dmar_rmrr_skipped = 0;
     acpi_rsdp_via_bootinfo = 0;
     acpi_pm_tmr_port = 0;       # 1.57.6: no RSDP / no FADT must mean no PM timer, not a stale one
     acpi_pm_tmr_ext = 0;

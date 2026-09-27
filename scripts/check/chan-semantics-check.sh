@@ -36,15 +36,20 @@ command -v cyrius >/dev/null 2>&1 || {
     exit 1
 }
 
-cyrius build chantest.cyr build/chantest > /tmp/chan-semantics-build.log 2>&1 || {
+# 1.57.10 (HAR2): the build and run logs are per TREE (check.sh's CHECK_LOGS), not fixed /tmp names.
+# PASSED below is READ BACK out of the run log, so a second tree running check.sh at the same time could
+# otherwise hand this gate that tree's chantest output.
+LOGD="${CHECK_LOGS:-$ROOT/build/check-logs}"
+mkdir -p "$LOGD"
+cyrius build chantest.cyr build/chantest > "$LOGD/chan-semantics-build.log" 2>&1 || {
     echo "  FAIL: chantest did not build"
-    tail -12 /tmp/chan-semantics-build.log
+    tail -12 "$LOGD/chan-semantics-build.log"
     exit 1
 }
 
 rc=0
-./build/chantest > /tmp/chan-semantics-run.log 2>&1 || rc=$?
-cat /tmp/chan-semantics-run.log
+./build/chantest > "$LOGD/chan-semantics-run.log" 2>&1 || rc=$?
+cat "$LOGD/chan-semantics-run.log"
 [ "$rc" = "0" ] || exit "$rc"
 
 # ⚠ VACUITY FLOOR ON THE ASSERTION COUNT — the same shape as the SKIP above, one level down.
@@ -62,7 +67,7 @@ cat /tmp/chan-semantics-run.log
 # framing assertions in the RECORD family alone, so a run reporting fewer than 6 passes cannot have
 # executed even the first family. The suite runs 18 today, so the floor has 12 of headroom and does
 # NOT need bumping when assertions are added; it is a floor under emptiness, not a pinned total.
-PASSED=$(grep -oE 'passed +[0-9]+' /tmp/chan-semantics-run.log | grep -oE '[0-9]+' | head -1)
+PASSED=$(grep -oE 'passed +[0-9]+' "$LOGD/chan-semantics-run.log" | grep -oE '[0-9]+' | head -1)
 case "$PASSED" in
     ''|*[!0-9]*)
         echo "  FAIL: could not read the assertion count out of chantest's output — the parse above"

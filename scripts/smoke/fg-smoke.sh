@@ -21,21 +21,30 @@
 # never reused under kmain's unread status) · memfree (M1): M0 - M1 <= 6 orphans x (6 MiB + 64 KiB). Whole `ow\n` lines (the
 # orphan writer) are deleted from the serial text before every match. DENIES PANIC and SMOKE_INVARIANT_DENY.
 #
-# Every boot is banner-gated (no "AGNOS kernel v" = VOID, never scored). Env: FG_SMP (default "1 4"),
-# FG_MODE (default "default recovery"; `--recovery` = recovery only, `--default` = default only), QEMU_TIMEOUT
-# (default-mode dwell, default 150). Exit: 0 every check PASS · 1 any FAIL · 2 VOID. Leaves a PLAIN build/agnos.
+# Every boot is banner-gated (no "AGNOS kernel v" = VOID, never scored). Env: FG_SMP (default "1 4"; also the
+# `--smp "<counts>"` argument, 1.57.10), FG_MODE (default "default recovery"; `--recovery` = recovery only,
+# `--default` = default only), QEMU_TIMEOUT (default-mode dwell, default 150). Exit: 0 every check PASS · 1 any
+# FAIL · 2 VOID. Leaves a PLAIN build/agnos. sweep.sh runs it as THREE rows (1.57.10): --default, and
+# --recovery --smp 1 / --smp 4.
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
 . "$ROOT/scripts/smoke/lib/ring3-seed.sh"
 
 MODES="${FG_MODE:-default recovery}"
-case "${1:-}" in
-    --recovery) MODES="recovery" ;;
-    --default)  MODES="default" ;;
-    "") ;;
-    *) echo "usage: $0 [--default|--recovery]"; exit 1 ;;
-esac
+# 1.57.10 (HAR2): `--smp "<counts>"` is FG_SMP as an argument. sweep.sh's table passes smoke ARGUMENTS, never env,
+# and the recovery mode is the long pole: ~6 min per boot, against ~1 min for BOTH default boots together. So the
+# sweep runs it as one row per CPU count.
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --recovery) MODES="recovery" ;;
+        --default)  MODES="default" ;;
+        --smp)      [ $# -ge 2 ] || { echo "usage: $0 [--default|--recovery] [--smp \"<cpu counts>\"]"; exit 1; }
+                    FG_SMP="$2"; shift ;;
+        *) echo "usage: $0 [--default|--recovery] [--smp \"<cpu counts>\"]"; exit 1 ;;
+    esac
+    shift
+done
 
 echo "=== fg smoke (foreground exec on Path 2: #37 blocks, kmain run) — modes: $MODES ==="
 ring3_seed_init || exit 1

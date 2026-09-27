@@ -2,8 +2,8 @@
 # tcp-inbound-smoke — agnos 1.57.7 step S4, ring-3 end-to-end on a PLAIN kernel (D19): tests/tcpin seeded as
 # /bin/agnsh (the orchestrator) and /bin/tcpin (the X phase's children), plus a host helper keyed on its markers.
 #
-# Issues: docs/development/issues/2026-09-23-inbound-tcp-syn-dropped-by-isr-drain.md (A1, A2, A2b, X),
-#         docs/development/issues/2026-09-23-sock-recv-never-reports-eof-after-peer-fin.md (E1, E2, A3).
+# Issues: docs/development/issues/archived/2026-09-23-inbound-tcp-syn-dropped-by-isr-drain.md (A1, A2, A2b, X),
+#         docs/development/issues/archived/2026-09-23-sock-recv-never-reports-eof-after-peer-fin.md (E1, E2, A3).
 #
 # Phases (tests/tcpin/tcpin.cyr has the detail):
 #   E1  EOF over loopback (the FIN demuxed in syscall context)          TCPIN-EOF-LO-OK

@@ -594,6 +594,10 @@ if (acpi_rsdp_addr != 0) {
         kprint_num(acpi_dmar_addr);
         kprint(" IOMMU base=", 12);
         kprint_num(acpi_iommu_base);
+        kprint(" units=", 7);               # 1.57.10 (VTD): segment-0 DRHDs, and the RMRRs iommu_init will identity-grant
+        kprint_num(acpi_dmar_drhds);
+        kprint(" rmrr=", 6);
+        kprint_num(acpi_dmar_rmrr_n);
         kprintln("", 0);
     }
     # Shutdown arc bite 2 — read-only power-management facts (reset register, PM1
@@ -711,11 +715,22 @@ if (hid_kbd_slot_id != 0) {
 }
 
 # Initialize IOMMU if DMAR table found (S10: restrict DMA)
+# ⭐ 1.57.10 (VTD) — CALLED ON EVERY BOOT, DMAR OR NOT: iommu_init is what closes the pre-init grant log. Everything above
+# (xhci_rings_init, the slot contexts, the HID and MSC buffers) granted its DMA pages BEFORE this line; those grants are
+# recorded and replayed into the tables before translation goes on — until 1.57.10 they were silently dropped, so with
+# VT-d on every xHCI ring outside the first 16 MB would have faulted (issue 2026-09-26). Every driver below grants after
+# translation is on, through the live path. No DMAR (AMD, most QEMU runs): the log closes and nothing prints.
+var iommu_rc = iommu_init();
 if (acpi_iommu_base != 0) {
-    if (iommu_init() == 0) {
+    if (iommu_rc == 0) {
         kprintln("IOMMU: VT-d enabled, DMA restricted", 35);
     } else {
         kprintln("IOMMU: init failed", 18);
+    }
+}
+if (acpi_dmar_addr != 0) {
+    if (acpi_iommu_base == 0) {
+        kprintln("IOMMU: the DMAR has no unit iommu.cyr can drive (a single DRHD, or an INCLUDE_PCI_ALL one) - VT-d left off", 106);
     }
 }
 
@@ -730,7 +745,10 @@ if (r8169_probe() == 1) {
     r8169_init_tx();
 }
 
-if (pci_find(0x1AF4, 0x1000) >= 0) {
+# ⛔ 1.57.10 (VTD) — 0x1041 TOO. virtio_net_init has taken a pure-modern (non-transitional) device since 1.32.2, but this
+# gate only ever looked for the transitional 0x1000, so a `disable-legacy=on` virtio-net was never initialised at all. A
+# device behind VT-d needs exactly that form: QEMU refuses `iommu_platform=on` on a transitional device.
+if ((pci_find(0x1AF4, 0x1041) >= 0) | (pci_find(0x1AF4, 0x1000) >= 0)) {
     if (virtio_net_init() == 0) {
         kprint("VirtIO-net: MAC=", 16);
         for (var mi = 0; mi < 6; mi = mi + 1) {
@@ -8411,6 +8429,18 @@ if (vnet_active != 0 || nic_ready() != 0) {
         }
     }
 }
+
+# ⭐ 1.57.10 (VTD) — THE DMA-REMAPPING CHECK. Every boot-time DMA user has run by now under translation — the xHCI / HID /
+# MSC grants replayed at iommu_init, NVMe / virtio / AHCI / HDA granted after it, the mounts, DHCP over virtio-net — so a
+# DMA any grant missed is sitting in the unit's fault registers: drain them into one line (faults first). Silent when
+# VT-d is off. scripts/smoke/vtd-smoke.sh requires faults=0 here.
+# VTD_SELFTEST (test-only, iommu.cyr vtd_selftest): an ungranted page is BLOCKED with the fault recorded, a grant made
+# after TE takes exactly the invalidation the unit needs, and the granted page then works — just before the check, so
+# the check still covers every boot DMA user (the selftest drains the one fault it causes on purpose).
+#ifdef VTD_SELFTEST
+vtd_selftest();
+#endif
+iommu_boot_report();
 
 #ifdef MODESET_LATCH_SELFTEST
 # H2 — the arm-once latch, exercised with a SYNTHETIC risky step.

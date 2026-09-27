@@ -78,7 +78,7 @@ fn rdtsc() {
 # core/kprint.cyr is included at agnos.cyr:57, OUTSIDE both #ifdef ARCH_X86_64 blocks (10-27 and
 # 76-131), so it compiles on aarch64 too — while klog_tsc_boot / klog_tsc_per_us and rdtsc are
 # x86-only. Referencing them from kprint.cyr directly is exactly the cross-arch leak class already
-# filed at docs/development/issues/2026-08-28-p1-audit-sweep-backlog.md. The seam is the one
+# filed at docs/development/issues/archived/2026-08-28-p1-audit-sweep-backlog.md. The seam is the one
 # proc.cyr already uses for its x86 page-walk helpers: a real definition here, a no-op twin in
 # arch/aarch64/stubs.cyr.
 #

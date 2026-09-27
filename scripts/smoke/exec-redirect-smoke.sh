@@ -14,7 +14,7 @@
 # child holding its own private table must rewrite that copy while the global stays
 # byte-identical. A boot with no kernel banner is VOID.
 #
-# Issue: docs/development/issues/2026-06-15-cyrius-stdlib-missing-syscalls.md
+# Issue: docs/development/issues/archived/2026-06-15-cyrius-stdlib-missing-syscalls.md
 #        group 1 "the high-value one" (fd-redirect for capturing subprocess helpers).
 set -e
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.

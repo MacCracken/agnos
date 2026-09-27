@@ -4007,7 +4007,7 @@ fn edge_abi_selftest() {
     # a real question about op 0x09 too, which this bound was copied from, and op 0x09 is SHIPPED AND
     # BURNED. Changing the frame is an ABI-semantics change to a burned op and wants an operator
     # ruling, so it is filed rather than taken here:
-    #   docs/development/issues/2026-08-30-tri-corner-bound-coordinate-frame.md
+    #   docs/development/issues/archived/2026-08-30-tri-corner-bound-coordinate-frame.md
     # This case is the guard that keeps the question honest: if anyone changes either bound, a
     # non-origin batch that starts being refused fails HERE and names itself.
     store32(vb +  8, 64 * 65536);   store32(vb + 20, 64 * 65536);

@@ -19,10 +19,16 @@
 #            Cap-list presence is the gate, not the device ID.
 #
 # Features accepted: VIRTIO_F_VERSION_1 (32) MANDATORY + VIRTIO_BLK_F_RO (5)
-# opportunistic. All others (FLUSH, BLK_SIZE, TOPOLOGY, MQ, DISCARD,
-# WRITE_ZEROES, INDIRECT_DESC, RING_EVENT_IDX, RING_PACKED, ACCESS_PLATFORM,
+# and VIRTIO_BLK_F_FLUSH (9) opportunistic, + VIRTIO_F_ACCESS_PLATFORM (33)
+# whenever offered (1.57.10, below). All others (BLK_SIZE, TOPOLOGY, MQ,
+# DISCARD, WRITE_ZEROES, INDIRECT_DESC, RING_EVENT_IDX, RING_PACKED,
 # NOTIFICATION_DATA, IN_ORDER, ORDER_PLATFORM, NOTIF_CONFIG_DATA, RING_RESET,
 # SR_IOV) deliberately unack'd — see prior-art doc § 5.4.
+# ⭐ 1.57.10 (VTD) — ACCESS_PLATFORM IS ACCEPTED NOW, overturning the prior-art doc's "no IOMMU plumbing exists" with the
+# reason it asked for: VT-d translation now runs (iommu.cyr), a device offering ACCESS_PLATFORM DMAs through the platform
+# IOMMU (QEMU `iommu_platform=on`), the virtio spec says a driver SHOULD accept it, and QEMU REFUSES FEATURES_OK when it
+# is declined (virtio_validate_features). Linux keeps it in vring_transport_features. The address the device is handed
+# stays the phys: iommu.cyr's domain is identity, and the rings are GRANTED to it (vblk_setup_queue_0).
 #
 # Polled-only — no MSI-X plumbing. AGNOS has no generic vector-dispatch
 # surface; OpenBSD's `virtio_pci_poll_intr` explicitly confirms polled
@@ -263,6 +269,12 @@ fn vblk_negotiate_features() {
         vblk_flush_supported = 1;
     }
 
+    # 1.57.10 (VTD) — VIRTIO_F_ACCESS_PLATFORM (bit 33 → feat_hi bit 1) whenever offered: the device's DMA then goes through
+    # the platform IOMMU, whose (identity) domain the rings are granted into — see the header.
+    if ((feat_hi & 2) != 0) {
+        drv_hi = drv_hi | 2;
+    }
+
     # Write back accepted features (low half then high half)
     store32(vblk_common_cfg + VBLK_DRV_FEAT_SEL, 0);
     store32(vblk_common_cfg + VBLK_DRV_FEAT, drv_lo);
@@ -328,6 +340,13 @@ fn vblk_setup_queue_0() {
     if (vmm_is_mapped(p1) == 0) { vmm_map(p1, p1, 0x83); }
     if (vmm_is_mapped(p2) == 0) { vmm_map(p2, p2, 0x83); }
     if (vmm_is_mapped(p3) == 0) { vmm_map(p3, p3, 0x83); }
+
+    # 1.57.10 (VTD) — GRANT THE THREE RING PAGES to the device (iommu.cyr; a no-op when VT-d is off). Until 1.57.10 they were
+    # never granted — pmm_alloc draws them top-down, far above the default 16 MB grant — so with translation on the device's
+    # first descriptor fetch faulted. (vblk_dma_buf / vblk_req_hdr are .bss, inside that default grant.)
+    iommu_register_dma(p1);
+    iommu_register_dma(p2);
+    iommu_register_dma(p3);
 
     vblk_desc  = dma_kva(p1);    # 1.57.8 (DMA1): CPU pointers = direct map; p1..p3 (phys) only below
     vblk_avail = dma_kva(p2);

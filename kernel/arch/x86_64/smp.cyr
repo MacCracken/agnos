@@ -611,9 +611,10 @@ fn icmp_spin_unlock() {
 #    NOT call each other (each calls nvme_read_lba/nvme_write_lba/nvme_rw_internal,
 #    none locked). nvme_blk_read_sectors (UNWRAPPED) calls the wrapped leaves
 #    sequentially — no nest.
-#  * ahci_lock: locked at ahci_issue_rw/ahci_issue_nodata/ahci_identify_device.
-#    ahci_issue_rw/nodata do not call each other or identify; ahci_blk_read/write
-#    (unwrapped) call ahci_issue_rw once — no nest.
+#  * ahci_lock: locked at ahci_issue_rw_n/ahci_issue_nodata/ahci_identify_device and (1.57.10)
+#    ahci_bounce_rw. None of the four calls another. ahci_blk_read/write (unwrapped) call
+#    ahci_bounce_rw once, ahci_blk_read_sectors once per <= 8-sector chunk in sequence, and
+#    ahci_read_lba/write_lba call ahci_issue_rw -> ahci_issue_rw_n once — no nest.
 var fs_lock = 0;
 var console_lock = 0;
 var nvme_lock = 0;
@@ -840,6 +841,40 @@ fn msc_spin_unlock() {
         0x48; 0x87; 0x08;              # xchg [rax], rcx
     }
     preempt_enable();                                   # 1.57.6 (S3.2): pairs the preempt_disable in the lock
+    return 0;
+}
+
+# ═══ 1.57.10 (VTD) — iommu_lock: the VT-d grant path (arch/x86_64/iommu.cyr) ═══
+# A byte-copy of heap_spin_lock/unlock with only the global renamed (NO parameter, so the asm slots stay addr@[rbp-0x10] /
+# old@[rbp-0x08], exactly as every lock pair above). ⛔ NEVER CALL THESE DIRECTLY: iommu.cyr's iommu_lock()/iommu_unlock()
+# wrappers do kbd_irq_save() FIRST, so the holder always runs IF=0 and an interrupt on this CPU can never spin on a lock
+# this CPU holds (a grant must be safe from any context: boot, a syscall — msc's lazily-allocated data page — or an ISR). It guards the
+# pre-init grant log, every second-level table edit and the register-based invalidation that follows one (CCMD/IOTLB and
+# GCMD.WBF are single-command registers: two CPUs interleaving on them corrupt both commands). LOCK ORDER: iommu_lock <
+# pmm_lock — a grant may pmm_alloc an intermediate table (pmm is the leaf). Nothing else is taken under it, and no kprint.
+var iommu_lock_word = 0;
+fn iommu_spin_lock() {
+    preempt_disable();                                  # 1.57.6 (S3.2) shape: a held plain spinlock is NON-PREEMPTIBLE
+    var old = 1;
+    while (old == 1) {
+        var addr = &iommu_lock_word;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn iommu_spin_unlock() {
+    var addr = &iommu_lock_word;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    preempt_enable();                                   # pairs the preempt_disable in the lock
     return 0;
 }
 

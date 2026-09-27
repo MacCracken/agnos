@@ -39,7 +39,7 @@ the call native (`sys_shm_create(...)` etc.) and, crucially, **canonical**: toda
 consumer that wants a shared buffer must hardcode the raw numbers `71..74`, so the primitive
 does NOT trickle out to programs the way a named wrapper does. The peer is where the numbers
 get documented + reused. **The canonical cyrius-side request belongs IN the cyrius repo** at
-`docs/development/issues/2026-07-09-agnos-sys-shm-peers.md` (cyrius house format) — the cyrius
+`cyrius/docs/development/issues/2026-07-09-agnos-sys-shm-peers.md` (cyrius house format) — the cyrius
 language agent picks it up there; this agnos-side copy is the mirror (mirrors the
 `sys_readlink`#70 precedent, `2026-07-08-cyrius-agnos-sys-readlink-peer.md`).
 **Date**: 2026-07-09

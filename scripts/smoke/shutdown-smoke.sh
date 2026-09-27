@@ -32,7 +32,8 @@
 # vacuous again.
 #
 # Requires: qemu-system-x86_64, OVMF, parted, mtools, sgdisk, mkfs.ext2, e2fsck,
-#           dumpe2fs. Stage first: scripts/burn/stage-agnsh.sh --build + stage-tools.sh.
+#           dumpe2fs, and a staged build/rootfs. Since 1.57.10 an ABSENT rootfs is staged automatically
+#           (stage-agnsh.sh + stage-tools.sh, no --build). Re-stage from source with --build.
 set -e
 
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
@@ -94,6 +95,10 @@ EXT2_SMOKE_FEATURES="${EXT2_SMOKE_FEATURES:-^resize_inode,^dir_index,^metadata_c
 # (core/boot_finish.cyr:11-13), and this script's own recovery-shell arm already drives that REPL
 # by sendkey. Do not restore the claim.
 ROOTFS="$ROOT/build/rootfs"
+# 1.57.10 (HAR2): a tree with no staged rootfs is staged here instead of failing (smoke_stage_rootfs, qemu-dwell.sh:
+# stage-agnsh.sh + stage-tools.sh without --build). The sweep stages it once before its table; this covers a
+# standalone run. A rootfs that is already present is used as it stands.
+smoke_stage_rootfs "$ROOT" || true
 [ -f "$ROOTFS/bin/agnsh" ] || { echo "ERROR: $ROOTFS/bin/agnsh missing — run scripts/burn/stage-agnsh.sh --build"; exit 1; }
 [ -e "$ROOTFS/bin/touch" ] || { echo "ERROR: $ROOTFS/bin/touch missing — run scripts/burn/stage-tools.sh --build"; exit 1; }
 SEED="$WORK/seed"; mkdir -p "$SEED/bin"

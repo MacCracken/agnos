@@ -23,6 +23,16 @@ set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 pass=0
 fail=0
+# ⭐ 1.57.10 (HAR2) — PER-TREE LOGS. Every gate log below lived at a FIXED /tmp path until 1.57.10
+# (/tmp/syscall-abi-check.log, /tmp/check-arity-build.log, …). Two trees running check.sh at once — the
+# multi-worktree release tracks do exactly that — overwrote each other. Some of those files are not just
+# printed on failure; a VERDICT is read back out of them. The arity gate counts the lines of its build log,
+# and chan-semantics and host-gpu-oracles parse their run logs. One tree could score the other tree's
+# output. The logs now go to this tree's build/check-logs, and those two sub-gates write theirs there too
+# (Bazel TEST_TMPDIR, xfstests per-run results dirs). Issue 2026-09-26-harness-backlog-after-1-57-9, item 3.
+CHECK_LOGS="${CHECK_LOGS:-$ROOT/build/check-logs}"
+mkdir -p "$CHECK_LOGS"
+export CHECK_LOGS
 
 check() {
     if [ "$2" = "0" ]; then
@@ -52,9 +62,9 @@ echo ""
 # It runs FIRST because a broken toolchain precondition should report as TOOLING, not as a downstream
 # red gate — the same reason host-gpu-oracles.sh runs mabda-resolve.sh before its loop.
 echo "--- Toolchain ---"
-sh "$ROOT/scripts/check/toolchain-pin-check.sh" > /tmp/toolchain-pin-check.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/toolchain-pin-check.sh" > "$CHECK_LOGS/toolchain-pin-check.log" 2>&1 && rc=0 || rc=$?
 check "all cyrius.cyml pins match the root pin" $rc
-[ "$rc" = "0" ] || cat /tmp/toolchain-pin-check.log
+[ "$rc" = "0" ] || cat "$CHECK_LOGS/toolchain-pin-check.log"
 echo ""
 
 # Regenerated files must not be tracked. Grouped with the toolchain gate because it shares that gate's
@@ -68,9 +78,9 @@ echo ""
 # two of those dirs matching NO installed snapshot, missing v6.4.51's signal_ignore. See the script
 # header. ⚠ Mutation-tested in all four failure paths (tracked file, missing ignore rule, and both
 # vacuity floors); a negative assertion that has never been forced red is not a gate.
-sh "$ROOT/scripts/check/vendored-artifact-check.sh" > /tmp/vendored-artifact-check.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/vendored-artifact-check.sh" > "$CHECK_LOGS/vendored-artifact-check.log" 2>&1 && rc=0 || rc=$?
 check "no regenerated files tracked under tests/*/{lib,build}" $rc
-[ "$rc" = "0" ] || cat /tmp/vendored-artifact-check.log
+[ "$rc" = "0" ] || cat "$CHECK_LOGS/vendored-artifact-check.log"
 echo ""
 
 # Build
@@ -87,9 +97,9 @@ check "x86_64 build" $rc
 # be actionable.
 echo ""
 echo "--- Source Hygiene ---"
-sh "$ROOT/scripts/check/kprint-len-check.sh" > /tmp/kprint-len-check.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/kprint-len-check.sh" > "$CHECK_LOGS/kprint-len-check.log" 2>&1 && rc=0 || rc=$?
 check "kprint literal lengths" $rc
-[ "$rc" = "0" ] || cat /tmp/kprint-len-check.log
+[ "$rc" = "0" ] || cat "$CHECK_LOGS/kprint-len-check.log"
 
 # ⭐ 1.56.60 — FORMAT. scripts/check/fmt-check.sh HAS EXISTED ALL ALONG AND check.sh NEVER RAN IT.
 # .github/workflows/ci.yml:156-211 runs the equivalent `cyrius fmt <f> --check` sweep, so format
@@ -103,17 +113,28 @@ check "kprint literal lengths" $rc
 # ⚠ Formatting is TOOLCHAIN-VERSION-DEPENDENT. This gate is only meaningful when the active cyrius
 # matches the `cyrius` pin in cyrius.cyml; toolchain-pin-check.sh above is what holds that true.
 # Fix a failure with: sh scripts/check/fmt-fix.sh
-sh "$ROOT/scripts/check/fmt-check.sh" > /tmp/fmt-check.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/fmt-check.sh" > "$CHECK_LOGS/fmt-check.log" 2>&1 && rc=0 || rc=$?
 check "kernel source formatting" $rc
-[ "$rc" = "0" ] || cat /tmp/fmt-check.log
+[ "$rc" = "0" ] || cat "$CHECK_LOGS/fmt-check.log"
 
 # ⭐ 1.57.5 — PREPROCESSOR BALANCE. main.cyr carried a depth-0 `#endif` (the tail of a removed
 # `#ifdef TSC_SELFTEST` block) that cycc drops WITHOUT A DIAGNOSTIC on 6.6.4-6.6.6, found only because
 # the 6.6.6 pin audit built a preprocessor model and had to special-case the line. An upstream
 # "unbalanced #endif" refusal would stop the whole kernel build there. Pure text walk — never builds.
-sh "$ROOT/scripts/check/pp-balance-check.sh" > /tmp/pp-balance-check.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/pp-balance-check.sh" > "$CHECK_LOGS/pp-balance-check.log" 2>&1 && rc=0 || rc=$?
 check "preprocessor directives balanced (kernel/)" $rc
-[ "$rc" = "0" ] || cat /tmp/pp-balance-check.log
+[ "$rc" = "0" ] || cat "$CHECK_LOGS/pp-balance-check.log"
+
+# ⭐ 1.57.10 (HAR2) — GATE 36: ISSUE POINTERS RESOLVE. An issue is closed by moving its file into
+# docs/development/issues/archived/, and the pointers stayed behind. At 1.57.10, 30 comments in scripts/,
+# tests/ and kernel/ (plus 12 lines in archived issue docs) named files that no longer existed.
+# Prior art: Linux tools/docs/documentation-file-ref-check (`make refcheckdocs`). This is a pure text walk
+# over git's file list and never builds. It prints MOVED -> <archived path> for an archived target. A
+# pointer into another repo is written `<repo>/docs/development/issues/…` and is not checked. The ledger
+# exclusion, the floors and the mutation record are in the script header.
+sh "$ROOT/scripts/check/issue-pointer-check.sh" > "$CHECK_LOGS/issue-pointer-check.log" 2>&1 && rc=0 || rc=$?
+check "docs/development/issues pointers resolve (scripts/ tests/ kernel/ docs/)" $rc
+[ "$rc" = "0" ] || cat "$CHECK_LOGS/issue-pointer-check.log"
 
 # Syscall ABI three-way consistency: kernel dispatch == ABI doc == the cyrius SysNrAgnos peer.
 # agnos redefines the syscall numbers (exit is #0, not Linux's 60), so a wrong number COMPILES CLEAN
@@ -124,9 +145,9 @@ check "preprocessor directives balanced (kernel/)" $rc
 # could be "verified" against the other. Those gaps accumulated over ~15 minor versions because
 # nothing diffed them. Same argument as the kprint gate: a hand-maintained table nothing compares
 # will drift, and the drift is invisible until it is a runtime fault in someone else's repo.
-sh "$ROOT/scripts/check/syscall-abi-check.sh" > /tmp/syscall-abi-check.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/syscall-abi-check.sh" > "$CHECK_LOGS/syscall-abi-check.log" 2>&1 && rc=0 || rc=$?
 check "syscall ABI (kernel/doc/cyrius agree)" $rc
-[ "$rc" = "0" ] || cat /tmp/syscall-abi-check.log
+[ "$rc" = "0" ] || cat "$CHECK_LOGS/syscall-abi-check.log"
 
 # Channel-band (#97) semantic proof — host-side, no QEMU, milliseconds. Bite 3 of the local-IPC
 # migration: it executes the RECORD/BATCH/LIVENESS contract from planning/ipc.md §9 against Linux
@@ -134,9 +155,9 @@ check "syscall ABI (kernel/doc/cyrius agree)" $rc
 # measured against rather than serving as its own specification (§9.8: every claim in that design is
 # currently "read-only static analysis"). Negative control: building it over SOCK_STREAM instead fails
 # exactly the 6 framing assertions and passes the rest — the proof discriminates the property it names.
-sh "$ROOT/scripts/check/chan-semantics-check.sh" > /tmp/chan-semantics.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/chan-semantics-check.sh" > "$CHECK_LOGS/chan-semantics.log" 2>&1 && rc=0 || rc=$?
 check "channel-band semantics (host socketpair proof)" $rc
-[ "$rc" = "0" ] || cat /tmp/chan-semantics.log
+[ "$rc" = "0" ] || cat "$CHECK_LOGS/chan-semantics.log"
 
 # GPU arena slot overlap. Every *_SUBOFF is a byte offset into the ONE compute arena, and two
 # subsystems owning the same bytes is a silent corruption — VM_CONTEXT0 is disabled, so there are no
@@ -148,9 +169,9 @@ check "channel-band semantics (host socketpair proof)" $rc
 # live one — the batched-frame snapshot at 0xC0000 spans 0x20000 bytes to 0xE0000, and the rung-9
 # per-edge prep table was allocated at 0xD0000, wholly inside it, and shipped. Different values, so
 # `uniq -d` saw nothing. Now extent-aware; see scripts/check/check-arena.sh. Detail prints on failure.
-sh "$ROOT/scripts/check/check-arena.sh" > /tmp/check-arena.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/check-arena.sh" > "$CHECK_LOGS/check-arena.log" 2>&1 && rc=0 || rc=$?
 check "gpu arena slots unaliased (extent-aware)" $rc
-[ "$rc" = "0" ] || cat /tmp/check-arena.log
+[ "$rc" = "0" ] || cat "$CHECK_LOGS/check-arena.log"
 
 # GPU CARVEOUT top-level regions. check-arena.sh gates the *_SUBOFF slots INSIDE the 2 MB arena; the
 # regions THEMSELVES — console FB, pan, back buffers, PSP TMR, arena, shm, RT — had no gate at all.
@@ -160,25 +181,25 @@ check "gpu arena slots unaliased (extent-aware)" $rc
 # ⚠ Added with 1.56.44's shm relocation (0xA0000000 -> 0x90000000, 256 -> 512 MB), which is exactly the
 # class of change it guards. Mutation-tested three ways: an overlapping region, a slot that is not a
 # 2 MB multiple, and a slot count that outruns its region — each fails.
-sh "$ROOT/scripts/check/check-carveout.sh" > /tmp/check-carveout.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/check-carveout.sh" > "$CHECK_LOGS/check-carveout.log" 2>&1 && rc=0 || rc=$?
 check "gpu carveout regions disjoint + shm table fits" $rc
-[ "$rc" = "0" ] || cat /tmp/check-carveout.log
+[ "$rc" = "0" ] || cat "$CHECK_LOGS/check-carveout.log"
 # 1.56.52 — the SysV init-stack pointer array vs the argc/envc caps. Those caps live in two functions
 # that never see each other, so nothing in the kernel held the combined invariant and the array was
 # silently too small from the moment argc was raised 8 -> 16. The runtime guard added alongside this
 # is unreachable under the shipped caps by construction, so a static re-derivation is the only form
 # that can actually fail. Mutation-tested: restoring the old ELF_INIT_STR reports slots=31 vs top
 # index 35, which is exactly the overflow.
-sh "$ROOT/scripts/check/check-initstack.sh" > /tmp/check-initstack.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/check-initstack.sh" > "$CHECK_LOGS/check-initstack.log" 2>&1 && rc=0 || rc=$?
 check "init-stack pointer array holds argc+envc" $rc
-[ "$rc" = "0" ] || cat /tmp/check-initstack.log
+[ "$rc" = "0" ] || cat "$CHECK_LOGS/check-initstack.log"
 # The Cyrius var X[N] units trap: function-local is N BYTES, module-scope is N x u64. Cost the
 # rung-10 burn its exit code (a 40-byte stack smash that left every printed number correct).
 # 1.57.7: logged and printed on failure — until then this discarded the output, so a red run showed no site
 # lines (the gate's own header documented the discard as its only channel being the exit code).
-sh "$ROOT/scripts/check/check-array-sizing.sh" > /tmp/check-array-sizing.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/check-array-sizing.sh" > "$CHECK_LOGS/check-array-sizing.log" 2>&1 && rc=0 || rc=$?
 check "no function-local array overruns" $rc
-[ "$rc" = "0" ] || cat /tmp/check-array-sizing.log
+[ "$rc" = "0" ] || cat "$CHECK_LOGS/check-array-sizing.log"
 
 # ⛔ THE RELEASE GATE THAT NEVER BOOTED A KERNEL. release.yml gates every release on a job it calls
 # "CI Gate (must pass before release)", but under workflow_call the called workflow sees the CALLER's
@@ -186,9 +207,9 @@ check "no function-local array overruns" $rc
 # This property is untestable from a developer machine (no way to dispatch a tag-triggered reusable
 # workflow locally), so a static re-read is the only form that can fail. Mutation-tested both ways:
 # reverting a guard reports the job by name, and breaking the parser FAILS rather than passing green.
-sh "$ROOT/scripts/check/check-ci-release-gate.sh" > /tmp/check-ci-gate.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/check-ci-release-gate.sh" > "$CHECK_LOGS/check-ci-gate.log" 2>&1 && rc=0 || rc=$?
 check "self-hosted CI jobs run on release tags" $rc
-[ "$rc" = "0" ] || cat /tmp/check-ci-gate.log
+[ "$rc" = "0" ] || cat "$CHECK_LOGS/check-ci-gate.log"
 
 # Module-scope symbol collisions between a tests/gpu oracle and a shared layer it includes. SIBLING of
 # check-array-sizing.sh, DIFFERENT scope: that one inspects function-LOCAL arrays, this one cross-file
@@ -199,9 +220,9 @@ check "self-hosted CI jobs run on release tags" $rc
 # `var`, even at conflicting array sizes (measured, cycc 6.5.20). When edgeasm.cyr and asmlib.cyr both
 # declared the layer, 46 symbols collided, cycc reported 33 and built OK, and host-gpu-oracles.sh
 # discards build output on success -- so all 46 were invisible in practice.
-sh "$ROOT/scripts/check/check-dup-symbols.sh" >/tmp/check-dup.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/check-dup-symbols.sh" >"$CHECK_LOGS/check-dup.log" 2>&1 && rc=0 || rc=$?
 check "no duplicate module-scope symbols in tests/gpu" $rc
-[ "$rc" = "0" ] || cat /tmp/check-dup.log
+[ "$rc" = "0" ] || cat "$CHECK_LOGS/check-dup.log"
 
 # An UNBURNED shader has no iron-proven hex to check against, so it is assembled twice — once by
 # llvm-mc from its .s, once by mabda's encoder from its emit list — and the dword streams must match.
@@ -212,9 +233,9 @@ check "no duplicate module-scope symbols in tests/gpu" $rc
 # now asserts is the PARTITION: every emit list is gated exactly once, by this script or by shaderasm.
 # ⚠ The label says so. An empty cross-assembly loop reporting "shaders encode identically" would be the
 # fourth vacuous gate this arc has found, and the label is half of how one gets noticed.
-sh "$ROOT/scripts/check/shader-crossasm.sh" >/tmp/check-crossasm.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/shader-crossasm.sh" >"$CHECK_LOGS/check-crossasm.log" 2>&1 && rc=0 || rc=$?
 check "every shader emit list is gated exactly once (crossasm or shaderasm)" $rc
-[ "$rc" = "0" ] || cat /tmp/check-crossasm.log
+[ "$rc" = "0" ] || cat "$CHECK_LOGS/check-crossasm.log"
 
 # Shader blobs vs their sources. Each shipped shader is a store32 table in gpu.cyr that is supposed
 # to be exactly what the assembler produced from kernel/shaders/*.s -- and until 1.56.19 nothing
@@ -235,7 +256,7 @@ BLOBVAC=""
 # Verified by corrupting one committed dword before adding it here: check.sh stayed fully green.
 for sb in edge_setup edge_cov tri_rgba tex_rgba tex_list tex_list_cm tex_bilin blend_alpha; do
     BLOBN=$((BLOBN + 1))
-    sh "$ROOT/scripts/check/shader-blob.sh" check "$ROOT/kernel/shaders/$sb.s" "$sb" >/tmp/shader-blob-$sb.log 2>&1 \
+    sh "$ROOT/scripts/check/shader-blob.sh" check "$ROOT/kernel/shaders/$sb.s" "$sb" >"$CHECK_LOGS/shader-blob-$sb.log" 2>&1 \
         || BLOBDRIFT="$BLOBDRIFT$sb "
 done
 # ⚠ VACUITY FLOOR, 2026-09-02. The verdict below is `test -z "$BLOBDRIFT"` over a variable that
@@ -258,21 +279,21 @@ BLOBTOTAL=$(ls "$ROOT"/kernel/shaders/*.s 2>/dev/null | grep -c . || true)
 [ -z "$BLOBVAC" ] && [ -z "$BLOBDRIFT" ] && rc=0 || rc=$?
 check "shader blobs match their .s sources ($BLOBN of $BLOBTOTAL committed .s checked)" $rc
 [ -z "$BLOBVAC" ] || echo "    VACUOUS: $BLOBVAC"
-[ -z "$BLOBDRIFT" ] || { for sb in $BLOBDRIFT; do cat /tmp/shader-blob-$sb.log; done; }
+[ -z "$BLOBDRIFT" ] || { for sb in $BLOBDRIFT; do cat "$CHECK_LOGS/shader-blob-$sb.log"; done; }
 
 # tex_list.s is tex_rgba.s's proven body under a new prologue. A copy is only as good as the proof
 # that it IS one: this gate fails the build the moment the two bodies diverge by a single character.
-sh "$ROOT/scripts/check/texl-body-identity.sh" >/tmp/texl-body.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/texl-body-identity.sh" >"$CHECK_LOGS/texl-body.log" 2>&1 && rc=0 || rc=$?
 check "rung 14's shader carries rung 13's body verbatim" $rc
-[ $rc -eq 0 ] || cat /tmp/texl-body.log
+[ $rc -eq 0 ] || cat "$CHECK_LOGS/texl-body.log"
 
 # tex_list_cm.s is tex_list.s with the lane axis transposed, DERIVED by this script rather than
 # hand-copied. ⚠ It cannot reuse the gate above: that one asserts the differing dwords form a
 # contiguous prefix (true when the only difference is a prologue), and 14b differs in TWO runs by
 # construction — the prologue AND a declared 4-instruction address window inside the body region.
-python3 "$ROOT/scripts/check/texl-cm-derive.py" check >/tmp/texl-cm.log 2>&1 && rc=0 || rc=$?
+python3 "$ROOT/scripts/check/texl-cm-derive.py" check >"$CHECK_LOGS/texl-cm.log" 2>&1 && rc=0 || rc=$?
 check "rung 14b's col-major shader is the declared derivation" $rc
-[ $rc -eq 0 ] || cat /tmp/texl-cm.log
+[ $rc -eq 0 ] || cat "$CHECK_LOGS/texl-cm.log"
 
 # tex_bilin.s (rung 15) shares rung 13's code at BOTH ENDS and diverges in the middle, so it needs
 # its own gate rather than the rung-14 one: that gate assumes the shared region is a single
@@ -280,16 +301,16 @@ check "rung 14b's col-major shader is the declared derivation" $rc
 # head's only dword differences are branch OFFSETS. ⚠ Mutation-tested four ways; the fourth
 # (an edit BEFORE the head marker, outside both source spans) is caught by the dword stage ALONE,
 # which is what earns that stage its place.
-sh "$ROOT/scripts/check/texbi-body-identity.sh" >/tmp/texbi-body.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/texbi-body-identity.sh" >"$CHECK_LOGS/texbi-body.log" 2>&1 && rc=0 || rc=$?
 check "rung 15's shader carries rung 13's head and tail verbatim" $rc
-[ $rc -eq 0 ] || cat /tmp/texbi-body.log
+[ $rc -eq 0 ] || cat "$CHECK_LOGS/texbi-body.log"
 
 # rtaudit.cyr mirrors nine constants out of gpu_regs.cyr because a host test cannot include a kernel
 # module. ⛔ A mirror nobody diffs is ATOM_DRY: move GPU_RT_REGION_OFF and the host proof keeps
 # certifying the OLD placement, green, forever. Mutation-tested (perturb one mirrored value -> DRIFT).
-sh "$ROOT/scripts/check/rt-region-derive.sh" >/tmp/rt-region.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/rt-region-derive.sh" >"$CHECK_LOGS/rt-region.log" 2>&1 && rc=0 || rc=$?
 check "rung 6's host proof mirrors the kernel's region constants" $rc
-[ $rc -eq 0 ] || cat /tmp/rt-region.log
+[ $rc -eq 0 ] || cat "$CHECK_LOGS/rt-region.log"
 
 # ⛔ THE KERNARG CONTRACT, WHICH COST A BURN. gpu_blend_cov_run puts n_tri in s4 and the framebuffer
 # pitch in s5; tri_depth.s read them swapped. It assembled clean, matched its committed blob byte for
@@ -297,19 +318,19 @@ check "rung 6's host proof mirrors the kernel's region constants" $rc
 # the resulting frame was DETERMINISTIC and ORDER-INDEPENDENT, so the rung's own oracle passed too.
 # Also gates the loop-carried registers against rung 13's v19 clobber. Both checks mutation-tested.
 # The same kernarg contract for rung 18's kernel, gated BEFORE its first burn rather than after one.
-sh "$ROOT/scripts/check/triper-contract.sh" >/tmp/triper-contract.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/triper-contract.sh" >"$CHECK_LOGS/triper-contract.log" 2>&1 && rc=0 || rc=$?
 check "tri_persp.s kernarg contract + loop-carried registers" $rc
-[ $rc -eq 0 ] || cat /tmp/triper-contract.log
+[ $rc -eq 0 ] || cat "$CHECK_LOGS/triper-contract.log"
 
-sh "$ROOT/scripts/check/tridepth-contract.sh" >/tmp/tridepth-contract.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/tridepth-contract.sh" >"$CHECK_LOGS/tridepth-contract.log" 2>&1 && rc=0 || rc=$?
 check "tri_depth.s kernarg contract + loop-carried registers" $rc
-[ $rc -eq 0 ] || cat /tmp/tridepth-contract.log
+[ $rc -eq 0 ] || cat "$CHECK_LOGS/tridepth-contract.log"
 
 # The host oracle for the op 0x0C grid mapping. ⚠ Until now NOTHING ran tests/gpu/*.cyr — they were
 # scanned and cited but never executed, so a red oracle stayed invisible until someone remembered it.
-sh "$ROOT/scripts/check/host-gpu-oracles.sh" >/tmp/host-gpu.log 2>&1 && rc=0 || rc=$?
+sh "$ROOT/scripts/check/host-gpu-oracles.sh" >"$CHECK_LOGS/host-gpu.log" 2>&1 && rc=0 || rc=$?
 check "host GPU oracles (0x0C grid, r15 bilinear, r6 region, r17 depth order)" $rc
-[ $rc -eq 0 ] || cat /tmp/host-gpu.log
+[ $rc -eq 0 ] || cat "$CHECK_LOGS/host-gpu.log"
 
 # Call arity. cycc WARNS on an argument-count mismatch and builds anyway, so a wrong call ships green.
 # Wired in 2026-07-22 after the 1.56.x audit found gpu_blend_cov_run declared with 12 parameters and
@@ -339,7 +360,7 @@ check "host GPU oracles (0x0C grid, r15 bilinear, r6 region, r17 depth order)" $
 # ⚠ NOT resolved by reusing the "x86_64 build" gate's rc from further up this file. That gate is a
 # separate invocation and its own comment does not promise to stay one; this gate must be able to
 # fail on its own producer, in its own run, without a positional dependency on a gate above it.
-ARITY_LOG=/tmp/check-arity-build.log
+ARITY_LOG="$CHECK_LOGS/check-arity-build.log"
 sh "$ROOT/scripts/build.sh" > "$ARITY_LOG" 2>&1 && ARITY_BUILD_RC=0 || ARITY_BUILD_RC=$?
 ARITY=$(grep -E "expects [0-9]+ arguments, got [0-9]+" "$ARITY_LOG" || true)
 ARITY_LINES=$(grep -c . "$ARITY_LOG" || true)
@@ -529,10 +550,10 @@ check "binary size (weighed-size tripwire: ${SZOUT%%
 # literals in place after the wake. docs/development/issues/archived/2026-09-13-ap-stacks-inside-kernel-rodata.md.
 # Same vacuity guard as the size gate: a fossil binary describes a different tree. Mutation-tested
 # (p_memsz past the bound -> FAIL; a shim immediate off BSP_BOOT_TOP -> FAIL; see the script header).
-[ -z "$SZWHY" ] && sh "$ROOT/scripts/check/image-layout-check.sh" "$ROOT/build/agnos" > /tmp/image-layout-check.log 2>&1 && rc=0 || rc=$?
+[ -z "$SZWHY" ] && sh "$ROOT/scripts/check/image-layout-check.sh" "$ROOT/build/agnos" > "$CHECK_LOGS/image-layout-check.log" 2>&1 && rc=0 || rc=$?
 check "kernel image vs BSP boot stack (LOAD end <= 0x390000)" $rc
 [ -z "$SZWHY" ] || echo "    VACUOUS: $SZWHY"
-[ "$rc" = "0" ] || cat /tmp/image-layout-check.log
+[ "$rc" = "0" ] || cat "$CHECK_LOGS/image-layout-check.log"
 
 echo ""
 echo "=========================="

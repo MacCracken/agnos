@@ -20,6 +20,70 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.10] — 2026-09-26 — AHCI bounces its buffer, VT-d translation runs for the first time, and the harness backlog is cleared
+
+The three 2026-09-26 issues. Three parallel steps (AHCI2, VTD, HAR2), each started from a prior-art note (agnosticos
+`prior-art/`, vidya, other kernels), merged by the lead. No syscall number minted. Three issue files closed. The two sibling
+filings of 1.57.9 were fixed upstream: agnoshi 2.0.3 closes its pipeline read end (`pipeline-smoke` is green again) and kriya
+1.7.1 bounds `k_write` by time; the rootfs is restaged from both. **Built, gated, NOT burned.**
+
+### Changed
+
+- **AHCI bounces the caller's buffer** (AHCI2). `ahci_blk_read` / `_write` / `_read_sectors` go through one driver-owned pmm
+  page (`ahci_bb_phys` / `ahci_bb_kva`, iommu-granted, allocated when the block device registers — no page, no registration);
+  only its physical address reaches the PRDT. One `ahci_lock` hold per ≤ 8-sector command: settle (1.57.9's `ahci_port_ready`)
+  → copy in (WRITE data; READ pre-filled with the caller's bytes, swiotlb's rule) → run → copy out only if the command
+  completed. `ahci_issue_rw_inner` is split into `ahci_rw_ok` + `ahci_port_ready` + `ahci_rw_go`. Cost: reads over 8 sectors
+  issue one command per 8 sectors (was 128); ext2 4 KB blocks are unchanged. Prior art: agnosticos
+  `prior-art/ahci-iron-burn-audit.md`, Linux libata `ata_sg_setup` / `dma_map_sg` + swiotlb, FreeBSD `busdma` bounce pages.
+- **VT-d translation now turns on** (VTD). `iommu.cyr` had never enabled translation on any boot — the QEMU q35 +
+  `intel-iommu` boot printed `IOMMU: init failed`. Grants made before `iommu_init` (xHCI rings and contexts, HID, MSC) are
+  recorded in `iommu_pend[]` (64 de-duplicated 2 MB regions) and replayed into the tables before TE, under a new IRQ-saved
+  `iommu_lock` held across the TE write; a grant that does not fit refuses translation. A grant after TE that writes a new
+  leaf gets exactly the invalidation the unit needs: Caching Mode → page-selective IOTLB (AM 9), domain-selective without PSI;
+  CM = 0 → a write-buffer flush on RWBF hardware, else nothing. Fixed on the way: the register block is mapped through
+  `vmm_remap_uc_2mb` (the old mapping always failed), a page-table depth that did not match the context entry, GCMD written
+  as `GSTS & 0x96FFFFFF | bit`, unchecked status waits, bus-0-only context tables, the DRHD choice (the only unit, or the
+  INCLUDE_PCI_ALL one), RMRR identity grants, fault draining and reporting. virtio-blk, virtio-net and AHCI now grant their DMA
+  pages (they never had), and the virtio drivers accept `VIRTIO_F_ACCESS_PLATFORM`. A unit with VER major ≥ 6 is refused
+  (queued invalidation is not implemented — filed). Prior art: Linux `drivers/iommu/intel/iommu.c`
+  (`cache_tag_flush_range_np`, `__mapping_notify_one`), FreeBSD `dmar_map_buf`, the VT-d spec §6.1 / §6.5 / §6.8.
+  `docs/architecture/dma-cpu-pointers.md` § "VT-d: the grant model".
+- **The harness backlog** (HAR2): `ktest.sh` boots its TEST kernel from a copy and always leaves a PLAIN `build/agnos` (an
+  EXIT trap covers every other exit); check.sh and every sweep attempt log per tree (`build/check-logs`, `$SWEEP_LOGS`) instead
+  of ~30 fixed `/tmp` files; `console-line-smoke` names the flags when it refuses a kernel; the parallel sweep's copy-back skips
+  `build/rootfs`; a tree with no staged `build/rootfs` gets it staged once (sweep) or by `shutdown-smoke` standalone;
+  `fg-smoke` is three rows (default; recovery `-smp 1`; recovery `-smp 4`) — the sweep's longest row went from 830 s to
+  393 s; the `exclusive` group stays on, with its reason in the header. Prior art: kselftest, pytest-xdist / rerunfailures,
+  Bazel `flaky` / tags, Linux `documentation-file-ref-check`.
+
+### Added
+
+- **check.sh gate 36: `issue-pointer-check.sh`** — every `docs/development/issues/…` pointer in `scripts/`, `tests/`,
+  `kernel/` and `docs/` must resolve (pure text; pointers into other repos are skipped; a moved file prints its new path).
+  30 dangling pointers in scripts/tests/kernel and 12 in archived issue docs were fixed.
+- **Known-red rows in the sweep**: a table flag (5th `run_gate` argument = the reason) or `SWEEP_KNOWN_RED='<ERE>'`. A known-red
+  row that fails the known way gets ONE attempt and no serial retry, and is still shown red; any other failure inside it is a
+  new red. Row 1 (`baseline check.sh`, the by-design ABI gate) is marked.
+- `VTD_SELFTEST` + `scripts/smoke/vtd-smoke.sh` / `scripts/harness/vtd-iommu-test.py` (q35 + `-device intel-iommu,intremap=off`:
+  `-smp 1` caching-mode=on / 3-level, `-smp 4` caching-mode=off / 4-level with the xHCI behind a root port; typed agnsh lines over
+  the xHCI keyboard, USB-stick and SATA LBA 0 byte-exact, agnsh from NVMe, exFAT from virtio-blk, DHCP over virtio-net, HDA LPIB,
+  `faults=0`, an ungranted page proven BLOCKED, and QEMU's own trace cross-checked). The `AHCI_SELFTEST` `bounce` arm. New sweep
+  rows: `vtd`, `ext2`, `blk-write`, and fg split in three.
+
+### Closeout
+
+- `build/agnos` **2,522,456 B** (+14,728 B over 1.57.9's 2,507,728 B; VT-d is most of it). LOAD end **`0x377bf8`**, 99,336 B under
+  gate 34's `0x390000`.
+- **Gates on the final tree:** `check.sh` **35/36** (sole FAIL = the by-design `syscall ABI` gate: `#106`/`#107`/`#108` absent from cyrius) · `test.sh` (x86) **4/4** · `ktest` **367/370** (the 3 known `[initrd]` checks; `build/agnos` left plain) · gate 36: 56 issue pointers resolve · `sweep.sh` (PARALLEL, 4 workers, **1,509 s** wall clock) **63/64**: the one red is row 1 `baseline check.sh`, KNOWN RED for the same ABI gate (one attempt, not retried); `ipc-wait-smoke` passed on its own internal retry (host-load timing); `pipeline-smoke` green on agnoshi 2.0.3.
+- **ABI gate red BY DESIGN:** `#106`, `#107`, `#108` absent from cyrius (filed there).
+- **Issues:** three closed and archived (ahci-puts-the-caller-buffer-in-the-prdt, vt-d-xhci-never-granted-and-iommu-never-booted,
+  harness-backlog-after-1-57-9). Filed: `2026-09-26-vt-d-queued-invalidation` (VER ≥ 6 units). Sibling filing:
+  aethersafha `2026-09-26-agnos-build-fails-kavach-o-nofollow` (its `--agnos` build fails; the rootfs keeps the 2026-09-08 binary).
+- **Built, gated, NOT burned.** Iron-only risk classes: VT-d on a real unit (RMRRs, several DRHDs, 4 KB leaves, RWBF — QEMU has
+  none of them), the AHCI bounce page on a real HBA, and everything 1.57.6 – 1.57.9 already listed.
+
+
 ## [1.57.9] — 2026-09-26 — a quiet `sched_yield` and a directed one, pipe writes that block, AHCI that recovers, and a sweep that runs in parallel
 
 The six 2026-09-25 issues, plus two operator asks: run the local sweep in parallel, and treat the weighed-size gate as a

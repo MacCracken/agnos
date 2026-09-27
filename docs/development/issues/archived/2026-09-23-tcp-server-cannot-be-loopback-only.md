@@ -58,7 +58,7 @@ address dialled, and `net_wire_frame` is the only wire entry (martian filter); g
 end review found the demux ignoring the local address (two SYN_SENTs from one port to 127.0.0.2 and 127.0.0.3
 collided) — fixed in ENDFIX (S5-R1). **Consumer side still open:** cyrius's server adapter must pass
 `port | SOCK_LISTEN_LOOPBACK` for a 127/8 bind and fail closed on an older kernel, and a `sys_getpeername` over
-`#106` is asked for — both in cyrius `docs/development/issues/2026-09-25-agnos-sock-peer-spawn-limits-wait-block-kill-tree-peer.md`.
+`#106` is asked for — both in cyrius `cyrius/docs/development/issues/2026-09-25-agnos-sock-peer-spawn-limits-wait-block-kill-tree-peer.md`.
 daimon can drop its `http.listen.not_loopback` warning on ≥ 1.57.7 with that cyrius.
 
 **Evidence:** `~/.claude/projects/-home-macro-Repos-agnos/handoff-1.57.7/steps/S5-report.json`, `ENDFIX-report.json`.

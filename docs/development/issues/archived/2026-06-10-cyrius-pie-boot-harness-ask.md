@@ -6,7 +6,7 @@
 > Option A); not MVP-gating (data-only KASLR shipped v1.28.0).
 > **Cross-ref**: `proposals/2026-05-11-kaslr-scope.md` (Option A), this repo's
 > `docs/audit/2026-04-13-security-audit.md` S7; cyrius
-> `docs/development/issues/2026-06-10-roadmap-drift-and-stale-docs.md` (RM-03,
+> `cyrius/docs/development/issues/2026-06-10-roadmap-drift-and-stale-docs.md` (RM-03,
 > the AGNOS-kernel goal's tracking home) + `proposals/2026-05-11-pie-support.md`.
 
 ## Summary

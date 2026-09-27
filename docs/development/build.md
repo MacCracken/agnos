@@ -53,9 +53,10 @@ The architecture + ELF64 flags are mandatory and set by the script automatically
 | **`MSC_CDB_CANARY`** | source-side (prepended, env-driven) | **off** | 1.57.7 test instrument for the 16-byte SCSI CDB buffers: each of msc.cyr's seven CDB builders gets an address-taken `cdb_canary` immediately before `cdb_buf` (the slot a too-small buffer overflows into), and `msc_cdb_canary_run` (main.cyr, BSP, before the APs) drives all seven against the stick and prints `msc-cdb: PASS sites=7 clobbered=0`, plus a WRITE(10)+SYNC+READ(10) round-trip at LBA 100 as its control — so it WRITES, like `MSC_RW_DEMO`: QEMU scratch sticks only. About +3.3 KB. Used by `scripts/smoke/msc-cdb-smoke.sh` (RED `clobbered=7` on the old `[2]` code, GREEN on `[16]`), which also asserts the instrument is absent from the plain build. Never combined with another flag (6 of 16 `#define`s). Test-only; never production |
 | **`MSC_BOUNCE_SELFTEST`** | source-side (prepended, env-driven) | **off** | 1.57.9 test instrument for the USB Mass Storage block-layer bounce (issue 2026-09-25-msc-puts-the-caller-buffer-in-a-data-trb): `msc_bounce_selftest` (`msc.cyr`, called from `main.cyr` after the MSC demos, BSP, before the APs) drives `msc_blk_read` into a **kmalloc** block, `msc_blk_read_sectors(16)` into an unaligned **direct-map** buffer (two bounce chunks) and `msc_blk_write` x8 from an unaligned direct-map buffer, each checked against the phys-taking reference `msc_read_lba`/`msc_write_lba`, plus a **.bss control** row (identity VA == phys, green on the old code too). Prints `msc-bounce: <row> PASS` or `FAIL err=<0/1> bad=<bytes>`, then `msc-bounce: PASS rows=4` and `msc-bounce: done`. **WRITES** sectors 200..224, like `MSC_RW_DEMO`: QEMU scratch sticks only. Built together with `MSC_RW_DEMO` (7 of 16 `#define`s). Used by `scripts/smoke/msc-cdb-smoke.sh` boot P at `-smp 1` and `-smp 4`. RED on the pre-fix `msc_blk_*` (the caller pointer in the TRB): `A err=0 bad=512`, `B err=0 bad=8192`, `C err=0 bad=4080`, D PASS. The smoke also asserts that the plain build does not contain it. Test-only; never production |
 | **`NVME_SELFTEST`** | source-side (prepended, env-driven) | **off** | 1.57.8 NVMe **late-completion** fault injection (`core/nvme.cyr` `nvme_late_selftest`, called from `main.cyr` right after NVMe bring-up, pre-scheduler): a read polled with a ZERO budget makes its completion LATE, then `nvmest: shift` (16 reads of stamped LBAs exact + no CQ entry left over — RED on the pre-1.57.8 poll: wrong data, `CID mismatch`, the CQ one behind), `nvmest: reuse` (a late read into the bounce scratch, then a write through the same scratch reads back intact — RED without the pre-copy `nvme_io_settle`), `nvmest: admin` (1.57.9: two admin IDENTIFYs polled out of order — the stray is discarded by CID, one `nvme: admin stray CID` line, no admin CQE left over; RED on the pre-1.57.9 admin poll, which returned the first CQE), `nvmest: lost` (a completion that never comes: the I/O fails, `CSTS.RDY=0`, `nvme_io_ready=0`); terminal line `nvmest: done`. **DESTRUCTIVE** (writes 8 LBAs at `nsze/2`) and it **leaves NVMe disabled** for the rest of the boot: QEMU scratch disks only. Gated by `scripts/sweep.sh` → `scripts/smoke/nvme-late-smoke.sh` (-smp 1 + -smp 4; the disk is throttled to 100 IOPS so the late DMA really is late). Test-only; never production |
-| **`AHCI_SELFTEST`** | source-side (prepended, env-driven) | **off** | 1.57.9 AHCI **timed-out-command** fault injection (`core/ahci.cyr` `ahci_late_selftest`, called from `main.cyr` right after `ahci_register_block_dev`, pre-scheduler): a READ issued through `ahci_issue_rw_n` with a ZERO poll budget is still running when the poll gives up, so the §6.2.2.1 recovery (`ahci_port_recover`) must stop the port's engine before the issue path returns. `ahcist: reuse` (8x: the caller stamps the timed-out read's page at once; 50 ms later the stamp is intact — RED on the pre-1.57.9 abandon, which returned with PxCI set and let the DMA land on the stamp), `ahcist: shift` (16 reads of stamped LBAs + a FLUSH exact after a timed-out read), `ahcist: tfes` (a read past capacity fails with a PxIS error and the next read is exact with the port idle — RED on the stale-`PxTFD.ERR` poll), `ahcist: lost` (`ahci_test_stuck` makes the engine report it will not stop: COMRESET, GHC.HR, every port offline, the next I/O fails at once); terminal line `ahcist: done`. **DESTRUCTIVE** (writes sectors at capacity/2 of the SATA disk) and it **leaves AHCI offline** for the rest of the boot: QEMU scratch disks only. Gated by `scripts/sweep.sh` → `scripts/smoke/ahci-late-smoke.sh` (-smp 1 + -smp 4; the SATA disk is throttled to 100 IOPS and the selftest fills the throttle bucket before each injection, so the timed-out read really is late). See docs/architecture/ahci-command-recovery.md. Test-only; never production |
+| **`AHCI_SELFTEST`** | source-side (prepended, env-driven) | **off** | 1.57.9 AHCI **timed-out-command** fault injection (`core/ahci.cyr` `ahci_late_selftest`, called from `main.cyr` right after `ahci_register_block_dev`, pre-scheduler): a READ issued through `ahci_issue_rw_n` with a ZERO poll budget is still running when the poll gives up, so the §6.2.2.1 recovery (`ahci_port_recover`) must stop the port's engine before the issue path returns. `ahcist: reuse` (8x: the caller stamps the timed-out read's page at once; 50 ms later the stamp is intact — RED on the pre-1.57.9 abandon, which returned with PxCI set and let the DMA land on the stamp), `ahcist: shift` (16 reads of stamped LBAs + a FLUSH exact after a timed-out read), `ahcist: tfes` (a read past capacity fails with a PxIS error and the next read is exact with the port idle — RED on the stale-`PxTFD.ERR` poll), `ahcist: bounce` (1.57.10: `ahci_blk_read` into a kmalloc block, `ahci_blk_read_sectors(16)` into an unaligned direct-map buffer and `ahci_blk_write` x8 from one, each checked against the phys reference primitives, plus a `.bss` control: rows `bounce-kmalloc`/`-sectors`/`-write`/`-bss` — RED on the pre-1.57.10 block layer, which put the caller's pointer in the PRDT: `bad=512`/`8192`/`4080`, `bss` PASS), `ahcist: lost` (`ahci_test_stuck` makes the engine report it will not stop: COMRESET, GHC.HR, every port offline, the next I/O fails at once); terminal line `ahcist: done`. **DESTRUCTIVE** (writes sectors at capacity/2 of the SATA disk) and it **leaves AHCI offline** for the rest of the boot: QEMU scratch disks only. Gated by `scripts/sweep.sh` → `scripts/smoke/ahci-late-smoke.sh` (-smp 1 + -smp 4; the SATA disk is throttled to 100 IOPS and the selftest fills the throttle bucket before each injection, so the timed-out read really is late). See docs/architecture/ahci-command-recovery.md. Test-only; never production |
 | **`DMA_SHADOW_SELFTEST`** | source-side (prepended, env-driven) | **off** | 1.57.8 DMA CPU-pointer gate (`core/selftests.cyr` `dma_shadow_selftest`, after init): builds a CR3 whose PD[2..127] — the whole pmm identity window [4 MB, 256 MB) — all map ONE 2 MB region of 0xA5 (what a ring-3 PT_LOAD over that window does), then, IF=0 under it, runs single-sector + 8-sector + FLUSH on virtio-blk, NVMe and AHCI, NVMe's 24-sector PRP-list path and two HDA verbs. `dmash: shadow PASS` is the self-check (the identity VA of a pmm page reads the shadow, its direct-map alias the real page); `dmash: virtio/nvme/nvme-prp/ahci/hda PASS` each RED on a driver that still dereferences a pmm page's phys; 1.57.9 (CPUVA) adds the CPU-only pmm buffers, checked ACROSS the CR3 switch: `dmash: fb PASS` (fb_putc paints a glyph in a unique ink under the shadow; back on the kernel CR3 the `fb_shadow` cell must equal the FB cell), `dmash: ramdisk PASS` (needs `RAMDISK_ENABLE`: a sector written on the kernel CR3 reads back under the shadow and vice versa), and `dmash: window PASS dirty=0` (no arm stored through an identity VA — the 0xA5 region is untouched). terminal line `dmash: done`. **DESTRUCTIVE** (virtio/AHCI sectors 64..95, NVMe from `nsze/2`): QEMU scratch disks only. Gated by `scripts/sweep.sh` (built `DMA_SHADOW_SELFTEST=1 RAMDISK_ENABLE=1`; the smoke refuses any other flag set) → `scripts/smoke/dma-shadow-smoke.sh` (static `*_phys`-dereference grep over the four drivers + iommu/ramdisk/fb_console, the `*_kva`-from-the-direct-map grep, the fb_shadow_init-after-the-switch grep; -smp 1 + -smp 4). See docs/architecture/dma-cpu-pointers.md. Test-only; never production |
 | **`XHCI_SHADOW_SELFTEST`** | source-side (prepended, env-driven) | **off** | 1.57.8 test for the DMA-pointer class (issue 2026-09-25-dma-cpu-pointers-still-use-identity-vas, xHCI half): `xhci_shadow_selftest` (msc.cyr; main.cyr after the MSC read demo, BSP, before the APs) builds a fresh address space whose whole pool window PD[2..127] maps ONE 2 MB junk region, and under it — interrupts off, nothing printed — drives a No-Op command, an EP0 GET_DESCRIPTOR, an MSC READ(10) of LBA 0 and a keyboard TRB arm + report fold; back on CR3 0x1000 it requires each result byte-exact and the junk region untouched, printing `xshadow: PASS`. Needs a usb-kbd AND a usb-storage stick seeded `MSCLBA0!` (else `xshadow: VOID`). Read-only on the stick. Used by `scripts/smoke/xhci-shadow-smoke.sh` (-smp 1 + 4), which also asserts the instrument is absent from the plain build. Test-only; never production |
+| **`VTD_SELFTEST`** | source-side (prepended, env-driven) | **off** | 1.57.10 VT-d gate (`arch/x86_64/iommu.cyr` `vtd_selftest`; main.cyr just before `iommu_boot_report`, after DHCP): with translation ON, on an NVMe controller — **blocked**: IDENTIFY CONTROLLER aimed at a fresh 2 MB region nothing granted must leave the page untouched and the unit must RECORD the fault against the NVMe's bus:dev.fn at that page (a write); **grant**: `iommu_register_dma` after TE must write exactly one new leaf and take exactly the invalidation Caching Mode needs (CM=1: one PSI, or DSI without PSI; CM=0: none, a WBF only on RWBF hardware); **allowed**: the same IDENTIFY into the granted page must succeed byte-identical to the driver's own IDENTIFY page, no fault. Lines `vtdst: blocked / grant / allowed PASS`, `vtdst: PASS`, terminal `vtdst: done` (`vtdst: SKIP` when translation is off or there is no NVMe). Causes ONE deliberate DMAR fault and drains it itself. Used by `scripts/smoke/vtd-smoke.sh` (sweep row; the smoke builds this flag itself, boots q35 + `-device intel-iommu,intremap=off` at -smp 1 caching-mode=on aw-bits=39 and -smp 4 caching-mode=off aw-bits=48, and asserts the instrument is absent from the plain build). See docs/architecture/dma-cpu-pointers.md § "VT-d: the grant model". Test-only; never production |
 | **`HID_MOUSE_DEFER_SELFTEST`** | source-side (prepended, env-driven) | **off** | 1.57.8 gate for issue 2026-09-25-hid-mouse-reports-share-one-buffer: `hid_mouse_defer_selftest` (hid.cyr; main.cyr after the MSC read demo, BSP, before the APs, MSI-X armed) drains once, then masks interrupts and holds `hid_poll_lock`, prints `hidmdf: window open`, waits (<= 30 s) for four posted mouse Transfer Events, runs ONE `hid_poll` and requires dx 5, dy 7, the left press seen and the button released, printing `hidmdf: PASS`. Needs a usb-mouse (else `hidmdf: VOID`) and a harness that injects `mouse_move 5 0`, `mouse_move 0 7`, `mouse_button 1`, `mouse_button 0` over the QEMU monitor. Used by `scripts/smoke/hid-mouse-deferred-smoke.sh` (-smp 1 + 4), which also asserts the instrument is absent from the plain build. Test-only; never production |
 | **`RAMDISK_ENABLE`** | source-side (prepended, env-driven) | **off** | Compiles in the RAM-disk block backend (`kernel/core/ramdisk.cyr`). At boot, preallocates 64 pages (256 KB) from `pmm_alloc` — reached only through their direct-map pointers since 1.57.9 (`ramdisk_page_kva[]`; the block path runs under the caller's CR3) — and registers as the lowest-priority block backend — takes the slot only when no other backend (NVMe / AHCI / USB-MS / VirtIO) holds it. Useful as a development substrate for filesystem work without iron and as a regression target for the block-dispatch policy. Default-off because the 256 KB allocation eats ~18% of archaemenid's post-boot pmm budget (~354 free pages); production boots stay lean. To resize, edit `RAMDISK_NPAGES_DEFAULT` in `ramdisk.cyr` (capped at 128 = 512 KB by `RAMDISK_NPAGES_MAX` until the pmm budget audit reports >1024 free pages post-boot). Multi-source convergent design (OpenBSD `rd.c` MINIROOTSIZE pattern + NetBSD `md.c` MD_KMEM_ALLOCATED preallocation) — see `agnosticos/docs/development/prior-art/ramdisk-virtio-modern-prior-art.md` § 3 |
 | **`NET_VERBOSE`** | source-side (prepended, env-driven) | **off** | Compiles in boot net diagnostics: the 1.1.1.1:80 outbound-TCP smoke + the r8169 silicon tally readback. Gated out of production at 1.32.8 once the r8169 unicast-RX arc reached CONNECTED — the per-burn diagnostics it accreted are developmental noise, not validation signal |
@@ -212,7 +213,7 @@ footer — needs a baseline check.sh does not keep; out of 1.57.x scope.
 
 | Script | Purpose | Reads gated output? |
 |---|---|---|
-| `scripts/ktest.sh` | Runs the dedicated **shell-command** test suite under QEMU. Builds a separate `build/agnos_ktest` binary with `-D TEST` (which gates `include "user/test.cyr"` in `agnos.cyr`) and greps output for `PASS:` / `FAIL:` / `TOTAL:` lines from the assertion framework. **Different from the `KTEST` flag** described above — `TEST` enables the shell-side `test` command (assertion framework), `KTEST` enables boot-time inline tests | No (uses its own `TEST` gate) |
+| `scripts/ktest.sh` | Runs the dedicated **shell-command** test suite under QEMU. Builds a separate `build/agnos_ktest` binary with `-D TEST` (which gates `include "user/test.cyr"` in `agnos.cyr`), rebuilds a **plain** `build/agnos` before booting that copy (1.57.10, and on every exit path), and greps output for `PASS:` / `FAIL:` / `TOTAL:` lines from the assertion framework. **Different from the `KTEST` flag** described above — `TEST` enables the shell-side `test` command (assertion framework), `KTEST` enables boot-time inline tests | No (uses its own `TEST` gate) |
 | `scripts/test.sh` | Cyrius `check.sh` style structural gate — checks kernel source compiles cleanly for both archs | No |
 | `agnosticos/scripts/qemu-fb-smoke.sh` | End-to-end QEMU boot test via gnoboot + OVMF. Default `EXPECT="AGNOS shell"` matches the unconditional kybernet banner — runs cleanly on the default lean build | No |
 | `gnoboot/tests/ovmf_smoke.sh` | gnoboot-side smoke; matches the `"gnoboot v<VERSION>"` banner | No |
@@ -223,22 +224,57 @@ None of the smoke harnesses depend on `KTEST` or `XHCI_VERBOSE` output being pre
 
 ## Arc sweep (`scripts/sweep.sh`)
 
-The release sweep: the baseline `check.sh` plus every registered QEMU smoke (one row per smoke, 57 rows at 1.57.8),
-each against the compile-gated kernel it needs. Since **1.57.9** the rows run **in parallel**.
+The release sweep: the baseline `check.sh` plus every registered QEMU smoke, one row per smoke, each against the
+compile-gated kernel it needs. There were 59 rows at 1.57.9 and 63 at 1.57.10, which added ext2 and blk-write and
+split fg into three rows: default, recovery -smp 1 and recovery -smp 4. Each recovery boot is ~6 min, and both
+default boots together take ~1 min. Since **1.57.9** the rows run **in parallel**.
 
 ```sh
 sh scripts/sweep.sh                         # 4 workers (SWEEP_JOBS default)
 SWEEP_JOBS=8 sh scripts/sweep.sh            # more workers (each boots its own QEMU; mind RAM and other load)
-SWEEP_JOBS=1 sh scripts/sweep.sh            # the serial sweep, byte-for-byte the pre-1.57.9 output
+SWEEP_JOBS=1 sh scripts/sweep.sh            # the serial sweep (no worker copies)
 SWEEP_ONLY='tcp|MSC' sh scripts/sweep.sh    # only rows whose label matches the ERE (either mode); exit 3 = clean
+SWEEP_KNOWN_RED='pipeline' sh scripts/sweep.sh   # these rows are known red for this run: one attempt, no retry
 ```
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `SWEEP_JOBS` | `4` | Worker copies. `1` = serial (the parallel code never runs). Not a positive integer: exit 2. |
 | `SWEEP_ONLY` | — | ERE over row labels; a filtered run is never a verdict (exit 3 clean / 1 failed). |
+| `SWEEP_KNOWN_RED` | — | ERE over row labels (1.57.10). The matching rows are **known red** for this run. See "Known red" below. |
 | `SWEEP_ROW_TIMEOUT` | `1500` | Parallel-phase ceiling per row in seconds (both attempts and the row's build). Expiry is a named FAIL (`ROW TIMEOUT`), then the row gets its serial retry. |
-| `SWEEP_EXCLUSIVE` | `1` | `0` pools the `exclusive` rows with the rest instead of running them alone afterwards. |
+| `SWEEP_EXCLUSIVE` | `1` | `0` pools the `exclusive` rows with the rest instead of running them alone afterwards. **On by default by operator ruling (1.57.10).** The two rows' oracles are ratios against wall time, so pooled they measure the host. The cost is about 114 s of tail. |
+
+**A table row** is `run_gate "<label>" "<build env>" "<smoke [args] | CHECK>" ["<group>"] ["<known red>" ["<signature>"]]`
+(1.57.10):
+
+- `<build env>` goes to `scripts/build.sh`, never to the smoke.
+- The smoke column may carry **arguments**, word-split, for example `fg-smoke.sh --recovery --smp 4`.
+
+**Known red** (1.57.10, operator ruling). A row can be marked red by design (5th argument = the reason), or red on
+a filed bug, for one run (`SWEEP_KNOWN_RED`).
+
+- When it fails the known way it gets **one attempt**: neither `gate_exec`'s second attempt nor the parallel sweep's
+  serial retry.
+- It **stays red**. It is `FAIL` in the summary and the exit code, labelled `(KNOWN RED: <reason>; one attempt, not
+  retried)`, and counted on its own `known red …: N` line. 1.57.9's pipeline-smoke retry of a filed agnoshi bug
+  cost ~16 min.
+- The optional 6th argument is a **signature**, an ERE. The mark holds only when the attempt's log has a `FAIL:`
+  line and every `FAIL:` line matches it (pytest `xfail(raises=)`). Any other failure is a new red and gets the
+  normal attempts and retry.
+- Row 1, `check.sh`, carries the mark with the syscall-ABI gate's two FAIL lines as its signature. A second red
+  gate there is therefore never hidden behind the by-design one.
+- A marked row that passes is a `PASS` with a stale-mark note. `stale known-red marks: N` is printed so the mark
+  gets removed.
+- Prior art and departures: `handoff-1.57.10/steps/HAR2-prior-art.md`. It follows pytest-rerunfailures
+  `--rerun-except` and xfail. It departs from `KSFT_XFAIL`/TAP `TODO`, which count as a pass, and from Bazel
+  `manual`, which hides the target.
+
+**The staged agnos-fs.** The shutdown and pipeline rows seed from `build/rootfs`. Since 1.57.10 the sweep stages
+it **when absent** (`smoke_stage_rootfs` in `scripts/smoke/lib/qemu-dwell.sh`, which runs `stage-agnsh.sh` +
+`stage-tools.sh` without `--build`). This happens once, in the main tree, before the table, so the worker copies
+carry it. `shutdown-smoke.sh` does the same when run standalone. A present rootfs is never re-staged: re-stage by
+hand, with `--build` to rebuild the siblings first. The recipe's output is in `build/stage-rootfs.log`.
 
 How a parallel run works (prior art: GNU make `-j`/`-O`, GNU parallel `--keep-order`/`{%}`/`--joblog`,
 pytest-xdist `loadgroup`, pytest-rerunfailures, Bazel `exclusive`/`flaky`, CTest `RESOURCE_LOCK`, kselftest timeouts):
@@ -248,7 +284,8 @@ pytest-xdist `loadgroup`, pytest-rerunfailures, Bazel `exclusive`/`flaky`, CTest
    into `../.<tree>.sweep.<pid>.w<K>`: the **current** tree, uncommitted and untracked files included, with its own
    `build/`. The one exception is `build/rootfs/`, the staged agnos-fs from `scripts/burn/stage-agnsh.sh` and
    `stage-tools.sh`, which is copied over: it is the only `build/` input a row reads (shutdown-smoke seeds from it). A
-   tree without it fails that row in both modes. Stage it once per tree. The copies are **siblings** of the tree, so every smoke's `${X_ROOT:-$ROOT/../x}` default (gnoboot,
+   tree without it used to fail that row in both modes; since 1.57.10 the sweep stages it when absent (above). It is
+   never copied BACK: the log copy-back excludes `build/rootfs/`. The copies are **siblings** of the tree, so every smoke's `${X_ROOT:-$ROOT/../x}` default (gnoboot,
    agnoshi, kashi, rekha, naad, cyrius-doom) resolves unchanged; the absolute paths are exported too. About 18 MB each.
 3. **Placement.** The `check.sh` row runs in the **main** tree, concurrently with the workers (it needs `.git`; no
    worker touches the main `build/`). Every other row belongs to a **group**, the optional 4th `run_gate` argument
@@ -264,16 +301,17 @@ pytest-xdist `loadgroup`, pytest-rerunfailures, Bazel `exclusive`/`flaky`, CTest
      run alone, serially, in the main tree **after** the parallel phase, exactly as `SWEEP_JOBS=1` runs them.
 4. **Results.** Each row leaves its section text and `rc / seconds / worker`. The main process prints the sections in
    **row order**, each followed by `[ran on w<K>, <s>s]` and kept as `build/sweep-logs/<NN>-<label>.parallel.log`.
-   Attempt logs keep their names (`<NN>-<label>.attempt<K>.log`). Each worker's `build/` logs (`*.log*`, `*.txt`,
+   Attempt logs keep their names (`<NN>-<label>.attempt<K>.log`) and are written there directly (1.57.10). Each worker's `build/` logs (`*.log*`, `*.txt`,
    `*.out`, screendumps; never disk images) are copied to `build/sweep-logs/w<K>/` before the copy is deleted, and
    paths in the sections are rewritten to point there. Progress prints one line per finished row.
 5. **Serial retry, never silent.** A row that FAILS in the parallel phase (build failures included) is re-run once,
    alone, in the main tree, with its usual two attempts, and logged as `<slug>.serial-retry.attempt<K>.log`. If it
    passes, it scores `PASS  <label>  (passed on serial retry; parallel log: …)`. The summary always prints
    `serial-retry passes: N`, even when N is 0. A row that fails again is a FAIL. The `exclusive` rows are not
-   retried, because they already ran serially.
+   retried, because they already ran serially, and neither is a **known red** that failed the known way (1.57.10).
 6. **Summary and exit** are unchanged: `SWEEP RESULTS (P passed, F failed)` in row order, `ARC SWEEP: PASS|FAIL`,
    exit 0/1, and `SWEEP_ONLY` exits 3 when clean. A parallel run adds the `serial-retry passes` and `wall clock` lines.
+   Both modes print `known red …: N` and `stale known-red marks …: N` (1.57.10), even when they are 0.
 7. **Cleanup.** Workers are started with `setsid`. On exit, Ctrl-C (exit 130) or TERM (143), every process in their
    sessions gets TERM, then KILL after 10 s. The session is what reaches QEMU: a smoke's own `timeout` moves it out
    of the process group, but not out of the session. The logs are then copied back, the copies are deleted, and an
@@ -298,8 +336,12 @@ pytest-xdist `loadgroup`, pytest-rerunfailures, Bazel `exclusive`/`flaky`, CTest
 row (Bazel `TEST_TMPDIR`). Several smokes `mktemp -d` an 8–130 MB disk image. Under `/tmp`, a tmpfs with a per-user
 quota that every agent on the box shares, a parallel msc-cdb row died on `dd: Disk quota exceeded` (measured
 1.57.9). A killed row also leaked its image there, because four smokes create it with no EXIT trap.
-The per-attempt scratch log moved from the fixed `/tmp/sweep-gate.log` (which collided between workers, and between
-two trees sweeping at once) to `<tree>/build/sweep-gate.log`, in both modes.
+The per-attempt log started at a fixed `/tmp/sweep-gate.log`, which collided between workers and between two trees
+sweeping at once. 1.57.9 moved it to a per-tree `<tree>/build/sweep-gate.log` scratch file. Since 1.57.10 each
+attempt is written straight to `build/sweep-logs/<NN>-<label>.attempt<K>.log`, so there is no scratch file. check.sh's
+gate logs moved the same way at 1.57.10, from about 30 fixed `/tmp/*.log` paths to `build/check-logs/`
+(`CHECK_LOGS`). Some of them are read back for a verdict: the arity line count, chan-semantics' `PASSED`, and the
+host-gpu line counts.
 ⚠ Timing: parallelism overlaps the sweep's dead air (QEMU dwell, firmware hand-off) rather than removing it, so the
 wall clock is bounded by the heaviest group plus the exclusive tail. Leave CPU/RAM for N concurrent QEMUs (≤ 1 GB each).
 

@@ -5,7 +5,7 @@
 **Original status:** ✅ **Built** 2026-08-28 (agnos 1.56.50), and **exercised against a booted kernel**.
 **Repo owning the design:** agnos (this file).
 **Cross-repo:** filed in **both** repos — cyrius peer is
-`docs/development/issues/2026-08-28-cyrius-syscall-101-readdir-at-wrapper.md` (cyrius 6.5.36).
+`cyrius/docs/development/issues/2026-08-28-cyrius-syscall-101-readdir-at-wrapper.md` (cyrius 6.5.36).
 **Severity:** Medium — `#81` silently truncated, which reads as a filesystem fault.
 **Precedent:** identical in shape to `#100 icmp_echo_ex` (a separate number rather than widening an
 existing one) and `#99 proclist`.

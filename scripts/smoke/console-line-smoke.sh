@@ -25,10 +25,27 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # absent-only test the sweep built a kernel and then scored an image made from a DIFFERENT one.
 # Measured live at 1.57.1: build/agnos was 09-08, the image 09-07 02:09 — a fossil inside release
 # evidence, which is the exact shape the harness-staleness issue was filed about.
+# ⭐ 1.57.10 (HAR2 — issue 2026-09-26-harness-backlog-after-1-57-9, item 5): SAY WHY THE REFRESH FAILED. Run
+# standalone after a FLAG build (e.g. ap-stack-smoke's SMP_STACK_SELFTEST rebuild), the refresh ran agnsh-smoke.sh,
+# which correctly REFUSED the flagged kernel, and this wrapper printed only "could not build the agnsh image". The
+# cause sat behind `>/dev/null`. Two changes:
+# (1) The provenance check runs HERE, first. This gate is about the PLAIN production kernel. A fresh image is
+#     build/agnos itself: agnsh-smoke copies build/agnos into it, and a newer build/agnos forces a refresh. So a
+#     flagged build/agnos is refused up front with the flags and the fix named (smoke_require_image). The refusal
+#     also no longer runs agnsh-smoke, whose first act is to delete the old image.
+# (2) The refresh is logged to build/console-line-logs/agnsh-image.log. A failure prints its REFUSED / ERROR /
+#     VOID lines and the log path.
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # smoke_require_image
+echo "console-line: kernel provenance (this gate boots the PLAIN production kernel):"
+smoke_require_image "$ROOT/build/agnos" ""
 if [ ! -f "$ROOT/build/agnsh-smoke/agnos-agnsh.img" ] || [ "$ROOT/build/agnos" -nt "$ROOT/build/agnsh-smoke/agnos-agnsh.img" ]; then
     echo "console-line: building the agnsh image first (absent or older than build/agnos)..."
-    if ! sh "$ROOT/scripts/smoke/agnsh-smoke.sh" >/dev/null 2>&1; then
-        echo "console-line: FAILED -- could not build the agnsh image"
+    CL_LOGS="$ROOT/build/console-line-logs"; mkdir -p "$CL_LOGS"
+    sh "$ROOT/scripts/smoke/agnsh-smoke.sh" > "$CL_LOGS/agnsh-image.log" 2>&1 && img_rc=0 || img_rc=$?
+    if [ "$img_rc" != 0 ]; then
+        echo "console-line: FAILED -- could not build the agnsh image (agnsh-smoke.sh exited $img_rc; log $CL_LOGS/agnsh-image.log):"
+        grep -E "REFUSED|ERROR|VOID|FAIL" "$CL_LOGS/agnsh-image.log" | head -8 | sed 's/^/    /'
+        [ "$img_rc" = 2 ] && echo "    (exit 2 = the firmware never handed off in agnsh-smoke's tries — a VOID, re-run; not a kernel verdict)"
         exit 1
     fi
 fi

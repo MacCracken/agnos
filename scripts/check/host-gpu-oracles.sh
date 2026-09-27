@@ -133,6 +133,11 @@ set -u
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 GPU="$ROOT/tests/gpu"
+# 1.57.10 (HAR2): each oracle's output is kept per TREE (check.sh's CHECK_LOGS), not at a fixed
+# /tmp/host-gpu-<t>.log. The floors below COUNT those lines, so a second tree running check.sh at the
+# same time could otherwise be scored on this tree's output, or the reverse.
+LOGD="${CHECK_LOGS:-$ROOT/build/check-logs}"
+mkdir -p "$LOGD"
 
 command -v cyrius >/dev/null 2>&1 || { echo "host-gpu-oracles: cyrius not on PATH"; exit 2; }
 
@@ -215,7 +220,7 @@ rc=0
 #   one" AND IT WAS NOT: no issue named it, so the claim itself was the only record, and a claim that
 #   something is tracked is worse than silence — it stops the next reader from filing it. It is now
 #   genuinely tracked, under the tests/*/ vacuity surface in
-#   docs/development/issues/2026-09-02-vacuous-gates-sweep.md.
+#   docs/development/issues/archived/2026-09-02-vacuous-gates-sweep.md.
 #   ⭐ 1.57.1 — ALL EIGHTEEN NOW CARRY AN IN-ORACLE FLOOR. This surface is swept.
 #   Every floor was falsified by mutation, and in EVERY case the pre-floor mutant still cleared the
 #   external floor below at full healthy line count — so the holes were real, not theoretical.
@@ -239,7 +244,7 @@ rc=0
 #   texgate 33, rtaudit 13, depthgate 30, depthmodel 38, depthdiv 19, perspbits 27, perspdiv 32,
 #   perspgate 18, perspmodel 30, moderaster 66, edgeasm 30, asmagree 78, shaderasm 7, shaderexec 14,
 #   pm4lint 20. Re-measure after a run with:
-#       for f in /tmp/host-gpu-*.log; do printf '%s %s\n' "$f" "$(LC_ALL=C grep -ac . "$f")"; done
+#       for f in build/check-logs/host-gpu-*.log; do printf '%s %s\n' "$f" "$(LC_ALL=C grep -ac . "$f")"; done
 #   A floor that trips after a prose edit is reporting that the measurement is stale: RE-MEASURE and
 #   raise it in the same edit. Deleting the number to make the gate quiet puts the hole back.
 #   ⚠ shaderasm's floor is 6 against a healthy 7, not the two-thirds 4, because its output is the
@@ -270,9 +275,9 @@ for spec in texlist:16 bigate:7 bimodel:10 texgate:22 rtaudit:8 depthgate:20 dep
         echo "$out" | tail -20
         exit 1
     }
-    "$GPU/build/$t" > "/tmp/host-gpu-$t.log" 2>&1
+    "$GPU/build/$t" > "$LOGD/host-gpu-$t.log" 2>&1
     got=$?
-    lines=$(LC_ALL=C grep -ac . "/tmp/host-gpu-$t.log" 2>/dev/null || true)
+    lines=$(LC_ALL=C grep -ac . "$LOGD/host-gpu-$t.log" 2>/dev/null || true)
     lines=${lines:-0}
     # Anything that is not a plain integer scores ZERO and fails the floor. A count this loop cannot
     # read is not evidence that the oracle was busy, and `[ "$x" -lt 7 ]` on a non-number exits
@@ -280,14 +285,14 @@ for spec in texlist:16 bigate:7 bimodel:10 texgate:22 rtaudit:8 depthgate:20 dep
     case "$lines" in *[!0-9]*) lines=0 ;; esac
     if [ "$got" -ne 95 ]; then
         echo "host-gpu-oracles: FAIL -- $t exited $got, want 95"
-        tail -30 "/tmp/host-gpu-$t.log"
+        tail -30 "$LOGD/host-gpu-$t.log"
         rc=1
     elif [ "$lines" -lt "$floor" ]; then
         echo "host-gpu-oracles: FAIL -- $t exited 95 over $lines line(s) of output, floor $floor"
         echo "    VACUOUS: $t reports success by finding no failures, and it printed too little to"
         echo "    have looked for any. A gutted oracle exits 95 exactly as a clean one does; the"
         echo "    output volume is the only part of that claim this runner can weigh."
-        tail -30 "/tmp/host-gpu-$t.log"
+        tail -30 "$LOGD/host-gpu-$t.log"
         rc=1
     else
         echo "host-gpu-oracles: PASS -- $t exit 95, $lines line(s) of evidence (floor $floor)"

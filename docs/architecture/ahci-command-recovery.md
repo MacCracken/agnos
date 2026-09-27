@@ -1,9 +1,12 @@
 # AHCI command recovery: a timed-out command ends only when the engine is proven stopped (1.57.9)
 
-`kernel/core/ahci.cyr` issues every command through slot 0 of the port's command list. The three issue paths
-(`ahci_issue_rw_inner`, `ahci_issue_nodata_inner`, `ahci_identify_device_inner`) share slot 0's header, the per-port
-command table (CT) and its PRDT. The PRDT's DBA is the **caller's** buffer: ext2 pages, the `blk_*` scratch, the
-IDENTIFY page. There is no bounce page. All of this runs under the whole-HBA `ahci_lock`, a preempt-disabled spinlock.
+`kernel/core/ahci.cyr` issues every command through slot 0 of the port's command list. The issue paths
+(`ahci_issue_rw_inner`, `ahci_issue_nodata_inner`, `ahci_identify_device_inner`, and since 1.57.10 the block layer's
+`ahci_bounce_rw_inner`, which shares the R/W build-and-run `ahci_rw_go`) share slot 0's header, the per-port command
+table (CT) and its PRDT. Until 1.57.10 the PRDT's DBA was the **caller's** buffer (ext2 pages, the `blk_*` scratch).
+Now the block layer puts only its bounce page there (`ahci_bb_phys`, see `dma-cpu-pointers.md`), the phys primitives
+`ahci_read_lba`/`_write_lba` (demos, selftest) pass their own pmm pages, and IDENTIFY uses the per-port ID page. All of
+this runs under the whole-HBA `ahci_lock`, a preempt-disabled spinlock.
 The HBA is polled and PxIE is never written. Three invariants keep a slow or failing SATA device from corrupting
 memory. Each one comes from a measured failure (issue `2026-09-25-ahci-timeout-abandons-an-in-flight-command`).
 
@@ -47,21 +50,23 @@ command. `AHCI_SELFTEST` `tfes` goes RED with the old `PxTFD.ERR` check (M3). It
 If `CR` does not clear, recovery escalates in steps, least intrusive first (§10.4). It sends a COMRESET and stops the
 engine again. If `CR` still does not clear, it sets `GHC.HR` (`ahci_hba_reset_quiet`), which resets every port, so
 every port is marked `ahci_port_dead`. A port is also marked dead if the link does not return after a COMRESET or the
-engine will not restart. `ahci_port_ready` runs at the top of all three issue paths and checks the flag first, so a
-dead port never touches slot 0, the CT or a buffer again. Later AHCI I/O fails fast with -1.
+engine will not restart. `ahci_port_ready` runs at the top of every issue path and checks the flag first, so a
+dead port never touches slot 0, the CT or a buffer again. Later AHCI I/O fails fast with -1. The block layer's bounce
+path (1.57.10) runs it BEFORE it copies into its page, so an offline port's bounce page is never written or read again.
 
 This flag is the only "late" record. NVMe cannot cancel one command from the host, so 1.57.8 records a timed-out
 command as late and reaps it later (`nvme-io-completion.md`). AHCI can cancel one, and it does so synchronously.
 
 ⚠ Residual: if `GHC.HR` itself never clears, the HBA's DMA is not proven stopped. The event is printed as
-`hba-reset-stuck (DMA not proven stopped)` and the ports stay offline. Nothing further contains it. NVMe carries the
-same residual when `nvme_disable` times out.
+`hba-reset-stuck (DMA not proven stopped)` and the ports stay offline. Nothing further stops it, but since 1.57.10 a
+block command's late DMA can land only in driver-owned pages (the bounce page, CT, CL, FIS), never in a caller's
+buffer. NVMe carries the same residual when `nvme_disable` times out.
 
 ## Printing
 
 Recovery runs under `ahci_lock`, so it never calls kprint. Events are collected in `ahci_note`. The lock wrappers
-(`ahci_issue_rw_n`, `ahci_issue_nodata`, `ahci_identify_device`) copy the notes into `ahci_last_note` and print them
-after unlock, for example `ahci: port 0 timeout - recovered` or
+(`ahci_issue_rw_n`, `ahci_issue_nodata`, `ahci_identify_device`, and since 1.57.10 `ahci_bounce_rw`) copy the notes
+into `ahci_last_note` and print them after unlock, for example `ahci: port 0 timeout - recovered` or
 `ahci: port 0 timeout comreset hba-reset - port offline`. The word `recovered` is printed only when
 `ahci_port_recover` actually brought the port back.
 
@@ -70,7 +75,9 @@ after unlock, for example `ahci: port 0 timeout - recovered` or
 `AHCI_SELFTEST` → `scripts/smoke/ahci-late-smoke.sh` (see the build.md row). The SATA disk is throttled to 100 IOPS,
 and the selftest fills QEMU's throttle bucket before each injection. That keeps the timed-out read running roughly
 10 ms past the return. Without the throttle, QEMU can finish the read before the caller stamps the buffer, and the
-test could not tell the fix from the abandon (the lesson from 1.57.8's nvme-late smoke).
+test could not tell the fix from the abandon (the lesson from 1.57.8's nvme-late smoke). Since 1.57.10 the same smoke
+also runs the `bounce` arm (block-layer I/O with kmalloc / direct-map / `.bss` buffers, `dma-cpu-pointers.md`) before
+`lost` takes the ports offline.
 
 ## NVMe admin (same cut)
 

@@ -1815,7 +1815,7 @@ fn gpu_find() {
 #
 # Twelve more of these live across fatfs / exfat / ext2 / ahci / hda / gpu — several of them cache-tag
 # sentinels where 0 is a VALID value, so the tag can false-hit on the first access of a boot. Filed as
-# docs/development/issues/2026-07-23-kernel-expression-gvar-initialisers-never-run.md; only the ones the
+# docs/development/issues/archived/2026-07-23-kernel-expression-gvar-initialisers-never-run.md; only the ones the
 # display path depends on are corrected here, because changing a sentinel changes behaviour and each one
 # needs its own reasoning.
 fn gpu_sentinels_init() {

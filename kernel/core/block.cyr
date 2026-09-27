@@ -336,8 +336,9 @@ fn blk_read_sectors(start, count, buf) {
 # ext2_read_block routes a whole FS block (<= 8 sectors) through this on
 # ext2_backend so the read lands on the FS's actual backend (not blk_active)
 # AND — on NVMe — collapses to a single multi-LBA command (8 single-LBA
-# round-trips per 4 KB block → 1). AHCI already issued one command per <=128
-# sectors; this brings NVMe to parity. Same registered-bit gate as blk_read_on.
+# round-trips per 4 KB block → 1). AHCI issues one command per <= 8 sectors
+# (one bounce page since 1.57.10; <= 128 before), so a 4 KB block is one
+# command there too. Same registered-bit gate as blk_read_on.
 fn blk_read_sectors_on(tag, start, count, buf) {
     if ((blk_registered & (1 << tag)) == 0) { return 0 - 1; }
     # 1.56.60 — capture instead of returning inline, so the transfer can be counted on success.

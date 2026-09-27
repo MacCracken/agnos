@@ -348,7 +348,7 @@ else
         # through cr3 -> PML4[0] -> PDPT[0] -> PD immediately after elf_load_from_file maps it, and
         # records the result to the klug ring. It answers the one question no fault address can:
         # did the PDE write LAND (and get undone later), or did it never land? For the -smp 4
-        # large-image #PF, agnos docs/development/issues/2026-08-02-large-image-ptload-pde-absent-smp.md.
+        # large-image #PF, agnos docs/development/issues/archived/2026-08-02-large-image-ptload-pde-absent-smp.md.
         # ⚠ It probes elf_load_from_file (the #43 spawn_path path) ONLY — NOT elf_load's in-memory
         # #3 path, which an earlier attempt probed by mistake.
         # ⚠ VALIDATE BEFORE TRUSTING: run at -smp 1 (which passes) and confirm every page reports
@@ -465,6 +465,10 @@ else
         # XHCI_SHADOW_SELFTEST=1 — 1.57.8: the xHCI command / EP0 / MSC bulk / HID paths under a CR3 whose whole pool
         # window is shadowed by junk (msc.cyr xhci_shadow_selftest; scripts/smoke/xhci-shadow-smoke.sh). Test-only.
         [ -n "$XHCI_SHADOW_SELFTEST" ] && echo '#define XHCI_SHADOW_SELFTEST'
+        # VTD_SELFTEST=1 — 1.57.10: under VT-d translation, an ungranted page is BLOCKED (fault recorded), a grant made after
+        # TE gets exactly the invalidation Caching Mode needs, and the page then works (iommu.cyr vtd_selftest; NVMe
+        # IDENTIFY as the DMA engine; scripts/smoke/vtd-smoke.sh). Test-only.
+        [ -n "$VTD_SELFTEST" ] && echo '#define VTD_SELFTEST'
         # HID_MOUSE_DEFER_SELFTEST=1 — 1.57.8: mouse reports completing while the drain is held (IF=0 + hid_poll_lock)
         # must all fold in ONE drain (hid.cyr hid_mouse_defer_selftest; scripts/smoke/hid-mouse-deferred-smoke.sh).
         [ -n "$HID_MOUSE_DEFER_SELFTEST" ] && echo '#define HID_MOUSE_DEFER_SELFTEST'

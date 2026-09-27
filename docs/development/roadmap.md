@@ -3,7 +3,7 @@
 <!-- TOOLING ANCHOR: scripts/version-bump.sh seds ONLY the version numbers in `> **Current**: vX.Y.Z`
      and `Built with cyrius X.Y.Z`. Delete either anchor and that sed becomes a silent no-op. -->
 
-> **Current**: v1.57.9 — live state (kernel head, cyrius pin, active burn, sweeps, sizes) lives in [`state.md`](state.md).
+> **Current**: v1.57.10 — live state (kernel head, cyrius pin, active burn, sweeps, sizes) lives in [`state.md`](state.md).
 
 Forward-only. Shipped work is not narrated here: history is [`../../CHANGELOG.md`](../../CHANGELOG.md), live state is [`state.md`](state.md), the normative syscall contract is [`agnos-userland-abi.md`](agnos-userland-abi.md). **All GPU/display/HDMI work is one open release (1.56.x) and lives entirely in [`planning/gpu.md`](planning/gpu.md)** — plan, register facts, falsified record, remaining ladder. Do not re-narrate it here and do not open a second GPU doc. Ship milestones (beta/GA/maturity arc) live in the agnosticos roadmap. Language roadmap: `../../../cyrius/docs/development/roadmap.md`.
 
@@ -98,15 +98,16 @@ both needing a boot **with the mouse attached** — the 2026-08-11 burn ran with
 Not a burn question: whether `BENCHMARKS.md` and `bench-history.csv` are git-tracked (`git ls-files`).
 
 
-## After 1.57.9 — carried rows (the six 2026-09-25 issues SHIPPED in 1.57.9; CHANGELOG carries them)
+## After 1.57.10 — carried rows (the three 2026-09-26 issues SHIPPED in 1.57.10; CHANGELOG carries them)
 
 Standing rules (operator 2026-09-23): fix what the repair finds rather than filing it; every new smoke gets a `sweep.sh` row; `-smp 4` variants are GATED. The 1.57.7 operator answers that place these rows are in the operator's `handoff-1.57.7/steps/OPERATOR-ANSWERS.md`.
 
 | Item | Why it is needed | Target | Blocked on |
 |---|---|---|---|
-| **AHCI puts the caller's buffer in the PRDT** | The class 1.57.9 fixed in MSC: `ahci_issue_rw_inner` stores the caller's `buf` as the PRDT DBA; safe only because callers pass `.bss`. Bounce through a driver page (issue `2026-09-26-ahci-puts-the-caller-buffer-in-the-prdt`). | 1.57.x | — |
-| **VT-d: xHCI never granted; no smoke boots `iommu.cyr`** | `iommu_register_dma` runs from `xhci_rings_init` before `iommu_init` (a no-op); a grant after TE issues no invalidation; `-device intel-iommu` smoke needed (issue `2026-09-26-vt-d-xhci-never-granted-and-iommu-never-booted`). | 1.57.x | — |
-| **Harness backlog after 1.57.9** | ktest leaves a TEST kernel; 53 dangling issue-path comments (+ a resolving check); per-tree `/tmp/sweep-gate.log`; blk-write/ext2 sweep rows; split `fg-smoke` (it bounds the parallel sweep at ~22 min); the parallel sweep's `exclusive` group ruling (issue `2026-09-26-harness-backlog-after-1-57-9`). | 1.57.x | — |
+| **VT-d queued invalidation** | A unit with VER major ≥ 6 treats register-based invalidation as an error, so 1.57.10 refuses it and translation stays off (issue `2026-09-26-vt-d-queued-invalidation`). | 1.57.x | — |
+| **VT-d grant model follow-ons** | 2 MB-granular grants that are never revoked (a neighbour's grant can mask a driver's missing one; a freed page stays device-reachable), and no DMAR fault interrupt (faults are drained only at the boot check). | unslotted | — |
+| **Recovery shell `run` costs ~21 s of kernel time per command** | Even `run /bin/fgc exit 7`, under TCG and KVM alike; it makes the fg recovery rows the sweep's longest (~390 s). Not investigated. | 1.57.x | — |
+| **`docs/doc-health.md` pointers** | Five old pointers (three cyrius issues without `cyrius/`, two archived agnos issues) keep the ledger excluded from gate 36; rewrite them and drop the exclusion. | next doc refresh | — |
 | **`pmm_alloc_2mb_run`'s 256 MB ceiling** | Since 1.57.9 both callers (fb shadow, kfont) use the direct map, so the ceiling has no reason left; lifting it moves them into `sys_mmap`'s top-of-RAM 2 MB pool. | unslotted | operator call |
 | **Reparenting on parent death** (operator OQ-9) | A live child whose parent dies is not re-parented: it self-reaps at exit (S7) and only init may signal it, so a supervisor that dies loses its grandchildren. Decide init-adoption vs a subreaper, then wire `#4`/`#16`/`#99` to it. | carried (slotted 1.57.8, not taken) | — |
 | **fb console full-surface blit** | Not a defect: after 1.57.8's UC fix, ~87 % of a KVM console's time is the 16 MB shadow→fb blit (~94 MB/s WC, ~0.19 s per 2048×2048 scroll); `lifecycle-smoke` `-smp 4` takes 287 s on KVM vs 148 s on TCG. A dirty-row blit or `rep movsq`. | unslotted | — |
@@ -114,7 +115,7 @@ Standing rules (operator 2026-09-23): fix what the repair finds rather than fili
 | **Per-OFD `flock`** | The lock owner is the PID (agnos has no open-file-description layer), so a fork child locking through an inherited fd waits on its parent — and deadlocks if the parent `WAIT_BLOCK`s on it. Documented in ABI row 59. | unslotted | an OFD layer (fd-table redesign) |
 | **Foreground keyboard owner + SIGTTIN** (operator OQ-10) | 1.57.7 ships per-LINE keyboard ownership (one blocking reader per line). Job control wants one foreground owner per terminal and a stop for background readers. | later (after 1.57.8) | — |
 | **Retire the out-of-band exec path** (operator OQ-11) | `exec_and_wait` / the `kernel_resume` gates still run the pre-scheduler boot selftests IF=0; since 1.57.7 S3b refuses them once `sched_active = 1`. Move the remaining callers to scheduled children and delete the path. | 1.58 | — |
-| **Iron burn of Path 2 + 1.57.8 + 1.57.9 (1.57.6 – 1.57.9)** | Built, gated, NOT burned. Iron-only classes: the `int 0xE0`/`0xE1` paths and clac stubs, the idle park, agnsh's first CPL3 entry (CMOS 0x20/0x21), early ACPI under AMI page tables (CMOS 0x83), r8169 direct-map, tick-path death, the BSP boot-stack window `[0x390000, 0x3A0000)` (boot line reports the UEFI map's verdict); 1.57.8: xHCI/HID/MSC, NVMe, AHCI and HDA CORB/RIRB through the direct map, the NVMe wall-time budget + settle, the mouse per-TRB slots (the carried mouse deferred-flush item), the `#44` kick on a Zen LAPIC, MMIO-only `pci_bar_64`. Lists in CHANGELOG 1.57.7 and 1.57.8 § Closeout. 1.57.9: AHCI port recovery (stop / COMRESET / HBA reset) on a real HBA, the MSC bounce page, the `#108` `0xE1` kick, fb_shadow + VT-d tables through the direct map. | next burn (operator's call) | a burn (archaemenid) |
+| **Iron burn of Path 2 + 1.57.8 – 1.57.10 (1.57.6 – 1.57.10)** | Built, gated, NOT burned. Iron-only classes: the `int 0xE0`/`0xE1` paths and clac stubs, the idle park, agnsh's first CPL3 entry (CMOS 0x20/0x21), early ACPI under AMI page tables (CMOS 0x83), r8169 direct-map, tick-path death, the BSP boot-stack window `[0x390000, 0x3A0000)` (boot line reports the UEFI map's verdict); 1.57.8: xHCI/HID/MSC, NVMe, AHCI and HDA CORB/RIRB through the direct map, the NVMe wall-time budget + settle, the mouse per-TRB slots (the carried mouse deferred-flush item), the `#44` kick on a Zen LAPIC, MMIO-only `pci_bar_64`. Lists in CHANGELOG 1.57.7 and 1.57.8 § Closeout. 1.57.9: AHCI port recovery (stop / COMRESET / HBA reset) on a real HBA, the MSC bounce page, the `#108` `0xE1` kick, fb_shadow + VT-d tables through the direct map. 1.57.10: VT-d translation on a real unit (RMRRs, several DRHDs, 4 KB leaves, RWBF), the AHCI bounce page. | next burn (operator's call) | a burn (archaemenid) |
 
 ## Residual of the cyrius 6.6.6 move (shipped 1.57.5 — the move itself is CHANGELOG history)
 

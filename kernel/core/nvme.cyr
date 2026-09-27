@@ -1394,6 +1394,7 @@ fn nvme_late_selftest() {
     # finds its own. RED on the pre-1.57.9 admin poll: it returned whatever came first ("CID mismatch") and left the
     # second's CQE behind for the next poll.
     var aph = pmm_alloc();                  # a fresh 4 KB page for the IDENTIFY data (PRP value = phys)
+    iommu_register_dma(aph);                # 1.57.10 (VTD): the controller writes it
     var ac1 = nvme_admin_submit(0x06, 0, aph, 0x01, 0);
     var ac2 = nvme_admin_submit(0x06, 0, aph, 0x01, 0);
     var ast2 = nvme_admin_poll(ac2);
