@@ -56,7 +56,7 @@ MODE = os.environ.get("AE_CLIENTS_MODE", "bg")   # "fg" | "bg" | "both" (both = 
 # scripts/check/toolchain-pin-check.sh puts on its manifest count, for the same reason.
 # ⚠ EXIT 2, NOT 1. "You spelled the mode wrong" is not evidence about the kernel, and scoring it as a
 # test FAIL would be a false red out of a run that tested nothing. 2 is this family's INCONCLUSIVE
-# code (puka-child-stdout-test.py's header; launcher-panel-test.py:86) and it is non-zero, because
+# code (puka-child-stdout-test.py's header; launcher-panel-test.py's header) and it is non-zero, because
 # "we could not test it" and "it works" must never be the same colour — console-line-smoke.sh:15-17.
 MODES = ("fg", "bg", "both", "desktop", "armed")
 if MODE not in MODES:

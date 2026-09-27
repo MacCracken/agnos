@@ -126,7 +126,7 @@ try:
     mark = len(ser())
     p("compositor up:", "aethersafha:" in ser())
 
-    # ⚠ PROBE FIRST: does ANY key reach the compositor in this harness? F3 logs on EVERY press
+    # ⚠ PROBE FIRST: does ANY key reach the compositor in this harness? Ctrl+F3 logs on EVERY press
     # (not first-sight only), so it is the cheap oracle for key delivery. A sequence test that never
     # delivered a key produces a meaningless negative — which is exactly what the first run did.
     kmark = len(ser())

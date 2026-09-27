@@ -141,11 +141,12 @@ try:
     # ⭐ EXERCISE THE LAUNCHER FIRST, THEN CLOSE IT. The operator's burn paired F2 with theme
     # cycling, and a launcher that registers no damage leaves the frame partially copied — so the
     # pairing is worth reproducing.
-    # ⛔⛔ BUT IT MUST BE CLOSED BEFORE F3, AND THIS HARNESS ORIGINALLY WAS NOT. `lnch_key` SWALLOWS
-    # every key it does not itself use (launcher.cyr:119) — deliberately, because a modal chooser
-    # that leaks keys types into the window behind it. So with the panel up, F3 never reaches the
-    # theme handler: four bursts of eight delivered ZERO switches and the run went INCONCLUSIVE
-    # every time. That is a harness that never performed its experiment, not a compositor defect.
+    # ⛔⛔ BUT IT MUST BE CLOSED BEFORE Ctrl+F3, AND THIS HARNESS ORIGINALLY WAS NOT. `lnch_key`
+    # SWALLOWS every key it does not itself use (launcher.cyr:192) — deliberately, because a modal
+    # chooser that leaks keys types into the window behind it. So with the panel up, Ctrl+F3 never
+    # reaches the theme handler: four bursts of eight delivered ZERO switches and the run went
+    # INCONCLUSIVE every time. That is a harness that never performed its experiment, not a
+    # compositor defect.
     # Esc is the launcher's own close key (`HID_ESC` -> LNCH_K_CONSUMED, `lnch_open = 0`).
     if os.environ.get("LNCH", "1") == "1":
         for _ in range(8):

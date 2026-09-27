@@ -13,15 +13,15 @@
 # same way, so neither distinguishes the fix from the bug. This one leaves crab running on a live
 # desktop and asks it to answer a keystroke AFTER the resize. ⛔ Silence is not liveness; an ANSWER is.
 #
-# ⛔ THE PATH THAT WORKS IS THE F2 LAUNCHER, AND TWO OTHERS ARE ALREADY RULED OUT (crab handoff):
+# ⛔ THE PATH THAT WORKS IS THE Ctrl+F2 LAUNCHER, AND TWO OTHERS ARE ALREADY RULED OUT (crab handoff):
 #   · typing `crab &` at agnsh — the compositor OWNS the console once running, so the line never
 #     reaches the shell; and crab cannot start from a shell anyway, because it needs `AGNOS_CHAN`,
 #     which only the compositor sets when it mints and endows a channel.
 #   · `AE_CLIENTS_MODE=desktop` — that is launcher mode with no `--clients`: it spawns NOTHING.
 # ⭐ The launcher registry is `/bin/puka` at index 0 and `/bin/crab` at index 1
 # (aethersafha `src/main.cyr`: two `lnch_register` calls), and `lnch_openp` resets the selection to 0.
-# ⇒ **F2, then DOWN, then Enter** is what starts crab specifically. A harness that skipped the DOWN
-# would launch puka and score whatever puka did.
+# ⇒ **Ctrl+F2, then DOWN, then Enter** is what starts crab specifically. A harness that skipped
+# the DOWN would launch puka and score whatever puka did.
 #
 # ⭐ IT HAS BEEN PROVEN TO GO RED, and the two arms are distinguishable — which matters here because
 # under QEMU the honest outcome is a REFUSAL, not an adoption, so "did not resize" is ambiguous
@@ -152,7 +152,7 @@ try:
 
     # ⚠ PROBE KEY DELIVERY BEFORE ANYTHING THAT CARRIES MEANING. QEMU drops keys that land between the
     # compositor's once-per-frame HID drains, so a sequence that delivered nothing would produce a
-    # meaningless negative. F3 logs on every press, so it is the cheap oracle. Bursts beat patience.
+    # meaningless negative. Ctrl+F3 logs on every press, so it is the cheap oracle. Bursts beat patience.
     # ⚠ RETRY THE PROBE ITSELF. Measured across runs: F3 x8 @0.7 s delivered 3 switches once and
     # **0** the next, on the same image — the compositor drains HID once per FRAME and a burst that
     # lands between drains is simply gone. Aborting on the first empty probe throws away a good boot
@@ -172,9 +172,9 @@ try:
         except Exception: pass
         qemu.terminate(); sys.exit(2)
 
-    # ⭐ LAUNCH CRAB SPECIFICALLY: F2 opens the launcher with the selection reset to index 0 (puka),
-    # DOWN moves to index 1 (crab), Enter spawns it. ⚠ RETRY — a fixed burst sometimes never reaches
-    # Enter, and a run with no crab cannot exercise a resize at all.
+    # ⭐ LAUNCH CRAB SPECIFICALLY: Ctrl+F2 opens the launcher with the selection reset to index 0
+    # (puka), DOWN moves to index 1 (crab), Enter spawns it. ⚠ RETRY — a fixed burst sometimes never
+    # reaches Enter, and a run with no crab cannot exercise a resize at all.
     # ⛔⛔ ONE ENTER, ONE DOWN, EACH HELD — AND THE OUTCOME READ (2026-09-13, from crab-pointer-test).
     # This used to send DOWN x6 and Enter x8 as bursts. Since crab 0.7.6 its Enter on a file SPAWNS it,
     # and crab starts in /bin whose first row is `aethersafha`: every Enter past the one the launcher

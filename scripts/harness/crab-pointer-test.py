@@ -148,7 +148,7 @@ try:
     time.sleep(18.0)
     p("compositor up:", "aethersafha:" in ser())
 
-    # key-delivery probe — F3 logs on every press (see crab-resize-test.py for the measurements)
+    # key-delivery probe — Ctrl+F3 logs on every press (see crab-resize-test.py for the measurements)
     themed = 0
     for probe in range(4):
         kmark = len(ser())
@@ -164,7 +164,7 @@ try:
         except Exception: pass
         qemu.terminate(); sys.exit(2)
 
-    # F2 -> DOWN -> Enter launches /bin/crab (index 1; puka is index 0).
+    # Ctrl+F2 -> DOWN -> Enter launches /bin/crab (index 1; puka is index 0).
     # ⛔⛔ ONE ENTER, ONE DOWN, EACH HELD — AND THE OUTCOME READ, NOT ASSUMED. Three lessons from the
     # first two runs of this harness:
     #   · crab-resize-test's Enter x8 burst: the launcher eats the first Enter that arrives and every

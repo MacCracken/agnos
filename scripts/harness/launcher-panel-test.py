@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-# launcher-panel-test.py — F2 OPENS THE APPLICATION LAUNCHER ON THE PANEL, and Enter starts a client.
+# launcher-panel-test.py — Ctrl+F2 OPENS THE APPLICATION LAUNCHER ON THE PANEL.
 #
 # ⛔⛔ WHY A FRAMEBUFFER ORACLE. aethersafha's own suites gate the launcher's pure half (registry,
 # selection, key semantics, geometry — 44 assertions) and its compositing (a pixel proof through
-# `render_desktop`). Neither can see the seam this file tests: that a REAL F2 keystroke, arriving over
-# the real HID path on the real kernel, reaches `lnch_openp()` and puts the panel on the real screen.
-# A compositor log line saying "launcher opened" would prove only that a branch ran.
+# `render_desktop`). Neither can see the seam this file tests: that a REAL Ctrl+F2 chord, arriving
+# over the real HID path on the real kernel, reaches `lnch_openp()` and puts the panel on the real
+# screen. A compositor log line saying "launcher opened" would prove only that a branch ran.
 #
 # ⭐ THE ASSERTION IS BEFORE/AFTER PIXELS IN THE PANEL'S OWN RECT — no OCR, no font. The launcher paints
 # a 2 px accent seal across the top of its panel, at coordinates the compositor computes from the screen
@@ -18,27 +18,50 @@
 #     5. the panel rect must CHANGE, and carry a horizontal run of one uniform colour where the
 #        accent seal goes
 #
-# ⚠ WHAT THIS DOES NOT PROVE: that the right APP launches. Enter -> spawn is exercised separately by
-# the client-count check below, which is weaker (it asks whether a client appeared at all).
+# ⚠ WHAT THIS DOES NOT PROVE: that Enter launches the selected app. Nothing here sends Enter; this
+# header promised a "client-count check below" that no version of the file ever ran. Enter -> spawn is
+# gated by the crab-*-test.py harnesses (open -> DOWN -> Enter, scored on crab's own `presented`
+# line) and by puka-resize-test.py.
+#
+# ⛔ THE COMPOSITOR UNDER TEST IS AE_BIN (default ../aethersafha/build/aethersafha_agnos), staged into
+# an image this harness builds from build/agnos + build/rootfs, as its siblings do. Until agnos 1.57.10
+# it booted a copy of puka-terminal-test.py's image, carrying whatever kernel and compositor that run
+# had baked in — measured 2026-09-27: a kernel that differed from build/agnos, and the 2026-09-08
+# aethersafha from build/rootfs. Since aethersafha 0.16.26 that is worse than stale: every older
+# compositor matched F2 without reading Ctrl, so an old binary opens on `ctrl-f2` as well and passes
+# here without the chord contract ever being tested.
 #
 # Exit 0 = the panel appeared. 1 = it did not. 2 = the run could not be set up.
 import os, socket, subprocess, sys, time
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-WORK = os.path.join(ROOT, "build/launcher-panel")
-SRC  = os.path.join(ROOT, "build/puka-term")          # reuse the image the puka harness builds
-IMG  = os.path.join(WORK, "agnos-launcher.img")
-SER  = os.path.join(WORK, "serial.log")
-MON  = "/tmp/agnos-launcher.sock"
+ROOT   = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOTFS = os.path.join(ROOT, "build/rootfs")
+WORK   = os.path.join(ROOT, "build/launcher-panel")
+SEED   = os.path.join(WORK, "seed")
+IMG    = os.path.join(WORK, "agnos-launcher.img")
+SER    = os.path.join(WORK, "serial.log")
+MON    = "/tmp/agnos-launcher.sock"
+AGNOS  = os.path.join(ROOT, "build/agnos")
 SHOT_BEFORE = os.path.join(WORK, "before.ppm")
 SHOT_AFTER  = os.path.join(WORK, "after.ppm")
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _freshness import refuse_stale_kernel
+refuse_stale_kernel(ROOT)
+GNOBOOT = os.path.join(ROOT, "../gnoboot/build/BOOTX64.EFI")
+AE_BIN  = os.environ.get("AE_BIN", os.path.join(ROOT, "../aethersafha/build/aethersafha_agnos"))
+DISK_MB, PART_OFFSET, PART_BLOCKS = 512, 34603008, 122880
+EXT2_FEATURES = "^resize_inode,^dir_index,^ext_attr,^huge_file,^64bit,^metadata_csum"
 
 # Mirrored from aethersafha/src/launcher.cyr. ⚠ If the panel's geometry changes there, this must change
 # with it — the failure is a loud "no accent run found", not a silent pass.
 LNCH_W, LNCH_PAD, LNCH_ROW_H = 260, 10, 22
-N_APPS = 2                                            # puka + crab are registered at boot
+# puka + crab are registered at boot. ⚠ aethersafha 0.16.26 adds a third row, thoth, only when
+# /bin/thoth exists; build/rootfs stages none, and an image that did would need 3 here.
+N_APPS = 2
 
 def p(*a): print(*a, flush=True)
+def sh(c): subprocess.run(c, shell=True, check=True)
 
 def panel_rect(sw, sh):
     ph = LNCH_PAD * 2 + N_APPS * LNCH_ROW_H
@@ -79,24 +102,37 @@ def longest_uniform_run(w, data, x, y, rw):
         best = max(best, cur)
     return best
 
-os.makedirs(WORK, exist_ok=True)
-# ⛔ 1.57.1 — RE-COPY WHEN THE BASE IMAGE IS NEWER, not only when ours is absent. This copied once
-# and never again, so after the first run the image was a PERMANENT fossil — measured 21 days behind
-# build/agnos. The old condition also gated on SRC/agnos-launcher.img, a path this harness never
-# creates or reads, so the clause could only ever be true by accident; dropped.
-src_img = os.path.join(SRC, "agnos-puka-term.img")
-_need_copy = not os.path.exists(IMG)
-if not _need_copy and os.path.exists(src_img):
-    _need_copy = os.path.getmtime(src_img) > os.path.getmtime(IMG)
-if _need_copy:
-    if not os.path.exists(src_img):
-        p(f"SKIP: no base image at {src_img} — run puka-terminal-test.py first"); sys.exit(2)
-    subprocess.run(["cp", src_img, IMG], check=True)
-    subprocess.run(["cp", os.path.join(SRC, "vars.fd"), os.path.join(WORK, "vars.fd")], check=False)
+for need in (AGNOS, GNOBOOT, ROOTFS, AE_BIN):
+    if not os.path.exists(need):
+        p(f"SKIP: missing {need}"); sys.exit(2)
 for c in ("/usr/share/edk2/x64/OVMF_CODE.4m.fd", "/usr/share/OVMF/OVMF_CODE.fd"):
     if os.path.exists(c): OVMF = c; break
 else:
     p("SKIP: no OVMF firmware"); sys.exit(2)
+for c in ("/usr/share/edk2/x64/OVMF_VARS.4m.fd", "/usr/share/OVMF/OVMF_VARS.fd"):
+    if os.path.exists(c): OVMF_VARS = c; break
+else:
+    p("SKIP: no OVMF vars template"); sys.exit(2)
+
+# ⚠ A failed build step is exit 2 (not set up), never 1: 1 is this file's "the panel did not appear".
+try:
+    subprocess.run(["rm", "-rf", WORK], check=True); os.makedirs(WORK)
+    subprocess.run(["cp", "-a", ROOTFS, SEED], check=True)
+    subprocess.run(["cp", AE_BIN, os.path.join(SEED, "bin", "aethersafha")], check=True)
+    subprocess.run(["chmod", "+x", os.path.join(SEED, "bin", "aethersafha")], check=True)
+    p("seed: /bin/aethersafha <-", AE_BIN, f"({os.path.getsize(AE_BIN)} bytes)")
+    sh(f"dd if=/dev/zero of={IMG} bs=1M count={DISK_MB} status=none")
+    sh(f"parted -s {IMG} mklabel gpt mkpart ESP fat32 1MiB 33MiB set 1 esp on mkpart agnos-fs ext2 33MiB 100%")
+    sh(f"sgdisk -t 2:8300 {IMG} >/dev/null")
+    sh(f"mformat -i {IMG}@@1048576 -F")
+    sh(f"mmd -i {IMG}@@1048576 ::EFI ::EFI/BOOT ::boot")
+    sh(f"mcopy -i {IMG}@@1048576 {GNOBOOT} ::EFI/BOOT/BOOTX64.EFI")
+    sh(f"mcopy -i {IMG}@@1048576 {AGNOS} ::boot/agnos")
+    sh(f"mkfs.ext2 -F -q -L AGNOS-LNCH -b 4096 -m 0 -O {EXT2_FEATURES} -d {SEED} -E offset={PART_OFFSET} {IMG} {PART_BLOCKS}")
+    subprocess.run(["cp", OVMF_VARS, os.path.join(WORK, "vars.fd")], check=True)
+    subprocess.run(["chmod", "+w", os.path.join(WORK, "vars.fd")], check=True)
+except (subprocess.CalledProcessError, OSError) as e:
+    p(f"SKIP: could not build the image — {e}"); sys.exit(2)
 
 open(SER, "w").close()
 for f in (SHOT_BEFORE, SHOT_AFTER, MON):

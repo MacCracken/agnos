@@ -300,12 +300,12 @@ try:
         typ("aethersafha\n", settle=1.0)
         # ⛔⛔ NOTHING IS PRE-LOADED ANY MORE, AND THIS HARNESS DID NOT KNOW THAT. Bare `aethersafha`
         # only auto-spawns clients under `--clients` (`ae_probe == 1`); since the launcher landed the
-        # desktop comes up EMPTY and says so ("launcher ready -- F2 lists the apps, nothing
-        # pre-loaded"). The first run of this test typed into a desktop with no client at all and the
-        # compositor said exactly that: "TAB ignored -- fewer than two windows".
+        # desktop comes up EMPTY ("launcher ready -- Ctrl+F2 lists the apps"). The first run of this
+        # test typed into a desktop with no client at all and the compositor said exactly that: "TAB
+        # ignored -- fewer than two windows".
         # ⛔ `--clients` is NOT the fix: it terminates the moment both clients connect, so there is no
         # desktop left to type into. ⇒ Drive the LAUNCHER, which is the path a person actually uses:
-        # F2 opens it, `/bin/puka` is registered FIRST so it is already selected, Enter launches it.
+        # Ctrl+F2 opens it, `/bin/puka` is registered FIRST so it is already selected, Enter launches it.
         _boot_hold = int(os.environ.get("PUKA_KEY_HOLD_MS", "500"))
         time.sleep(4.0)
         for _k in ("ctrl-f2", "ret"):

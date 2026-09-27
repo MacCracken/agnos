@@ -159,9 +159,9 @@ try:
         except Exception: pass
         qemu.terminate(); sys.exit(2)
 
-    # F2 -> DOWN -> Enter launches /bin/crab (index 1; puka is index 0). ⛔ ONE Enter and ONE DOWN,
-    # each held, and the OUTCOME read rather than assumed — an Enter burst reaches crab as ITS Enter
-    # and Opens the selected row, which in /bin spawns a SECOND compositor. See crab-pointer-test.
+    # Ctrl+F2 -> DOWN -> Enter launches /bin/crab (index 1; puka is index 0). ⛔ ONE Enter and ONE
+    # DOWN, each held, and the OUTCOME read rather than assumed — an Enter burst reaches crab as ITS
+    # Enter and Opens the selected row, which in /bin spawns a SECOND compositor. See crab-pointer-test.
     launched = False
     probes = 0
     for attempt in range(10):
