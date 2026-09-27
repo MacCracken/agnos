@@ -13,7 +13,7 @@
 #
 #     1. boot, run `aethersafha` with NO --clients (launcher mode: nothing pre-loaded)
 #     2. screendump -> BEFORE
-#     3. sendkey f2
+#     3. sendkey ctrl-f2
 #     4. screendump -> AFTER
 #     5. the panel rect must CHANGE, and carry a horizontal run of one uniform colour where the
 #        accent seal goes
@@ -161,7 +161,7 @@ try:
     # produced the *"puka didn't register key commands"* report. Repeating makes arrival a certainty
     # rather than a race; the launcher is idempotent under repeat (re-opening resets the selection).
     for _ in range(6):
-        s.sendall(b"sendkey f2\n"); time.sleep(1.2); drain()
+        s.sendall(b"sendkey ctrl-f2\n"); time.sleep(1.2); drain()
     time.sleep(2.0)
     s.sendall((f"screendump {SHOT_AFTER}\n").encode()); time.sleep(3.0); drain()
     opened = "launcher opened" in ser()[mark:]
@@ -177,19 +177,19 @@ try:
     # ⛔ NON-VACUITY: the compositor must have SAID it opened. Without this the pixel test can pass on a
     # frame that changed for any other reason (a cursor move, a repaint) and we would call it a launcher.
     if not opened:
-        p("INCONCLUSIVE: the compositor never logged 'launcher opened' — F2 did not reach it")
+        p("INCONCLUSIVE: the compositor never logged 'launcher opened' — Ctrl+F2 did not reach it")
         sys.exit(2)
 
     before_rect = rect_bytes(bw, bd, px, py, pw, ph)
     after_rect  = rect_bytes(aw, ad, px, py, pw, ph)
     if before_rect == after_rect:
-        p("FAIL: the panel rect is pixel-identical before and after F2 — nothing was drawn"); rc = 1
+        p("FAIL: the panel rect is pixel-identical before and after Ctrl+F2 — nothing was drawn"); rc = 1
     else:
         # The accent seal is 2 px of ONE colour across the panel's full width.
         run = longest_uniform_run(aw, ad, px, py, pw)
         p(f"longest uniform run on the seal row: {run} px (panel width {pw})")
         if run >= pw - 4:
-            p("PASS: F2 put the launcher panel on the framebuffer (accent seal spans the panel)")
+            p("PASS: Ctrl+F2 put the launcher panel on the framebuffer (accent seal spans the panel)")
             rc = 0
         else:
             p("FAIL: the rect changed but no full-width accent seal was found — is that the panel?")

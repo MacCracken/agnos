@@ -161,10 +161,10 @@ try:
     for probe in range(4):
         kmark = len(ser())
         for _ in range(10):
-            key("f3", 0.5)
+            key("ctrl-f3", 0.5)
         time.sleep(2.0)
         themed = ser()[kmark:].count("theme switched")
-        p(f"key-delivery probe {probe+1}: F3 x10 ->", themed, "theme switches")
+        p(f"key-delivery probe {probe+1}: Ctrl+F3 x10 ->", themed, "theme switches")
         if themed > 0: break
     if themed == 0:
         p("INCONCLUSIVE: no key reached the compositor in 4 probes — nothing below can be trusted")
@@ -188,10 +188,10 @@ try:
     for attempt in range(10):
         lmark = len(ser())
         for _ in range(6):
-            key("f2 400", 0.8)
+            key("ctrl-f2 400", 0.8)
             if "launcher opened" in ser()[lmark:]: break
         if "launcher opened" not in ser()[lmark:]:
-            p(f"  launch attempt {attempt+1}: F2 never opened the launcher — retrying"); continue
+            p(f"  launch attempt {attempt+1}: Ctrl+F2 never opened the launcher — retrying"); continue
         dmark = len(ser())
         key("down 400", 0.8)                    # index 0 (puka) -> index 1 (crab); ONE, held
         key("ret 400", 0.8)

@@ -149,7 +149,7 @@ try:
     # Esc is the launcher's own close key (`HID_ESC` -> LNCH_K_CONSUMED, `lnch_open = 0`).
     if os.environ.get("LNCH", "1") == "1":
         for _ in range(8):
-            s.sendall(b"sendkey f2\n"); time.sleep(0.7); drain()
+            s.sendall(b"sendkey ctrl-f2\n"); time.sleep(0.7); drain()
         time.sleep(2.0)
         p("launcher open:", "launcher opened" in ser()[mark:])
         for _ in range(6):
@@ -165,11 +165,11 @@ try:
     nsw = 0; kmark = len(ser())
     for attempt in range(4):
         for _ in range(8):
-            s.sendall(b"sendkey f3\n"); time.sleep(0.7); drain()
+            s.sendall(b"sendkey ctrl-f3\n"); time.sleep(0.7); drain()
         time.sleep(2.0)
         nsw = ser()[kmark:].count("theme switched")
         if nsw > 0: break
-        p(f"  f3 burst {attempt + 1} delivered nothing — retrying")
+        p(f"  ctrl-f3 burst {attempt + 1} delivered nothing — retrying")
     mon(f"screendump {SHOT_B}", 3.0)
     after = read_ppm(SHOT_B)
     p("theme switches observed:", nsw)

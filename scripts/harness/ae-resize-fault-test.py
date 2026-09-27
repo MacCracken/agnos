@@ -138,10 +138,10 @@ try:
     # drains HID once per FRAME, so a key that lands between drains is gone; repetition beats patience.
     NPROBE = 8
     for _ in range(NPROBE):
-        s.sendall(b"sendkey f3\n"); time.sleep(0.7); drain()
+        s.sendall(b"sendkey ctrl-f3\n"); time.sleep(0.7); drain()
     time.sleep(1.5)
     themed = ser()[kmark:].count("theme switched")
-    p(f"key-delivery probe: F3 x{NPROBE} ->", themed, "theme switches   (expect", NPROBE, "fixed /", NPROBE*2, "doubling)")
+    p(f"key-delivery probe: Ctrl+F3 x{NPROBE} ->", themed, "theme switches   (expect", NPROBE, "fixed /", NPROBE*2, "doubling)")
     # ⛔ AND NOW IT REALLY ABORTS. This said the word ABORT and then fell straight through to the
     # F6/F5 sequence and the verdict, so a run in which ZERO keys reached the compositor still
     # printed "NOT REPRODUCED: the compositor survived the sequence" and exited 0 — a pass issued
@@ -165,7 +165,7 @@ try:
     spawned = False
     for attempt in range(4):
         for _ in range(10):
-            s.sendall(b"sendkey f2\n"); time.sleep(0.6); drain()
+            s.sendall(b"sendkey ctrl-f2\n"); time.sleep(0.6); drain()
         time.sleep(1.0)
         for _ in range(10):
             s.sendall(b"sendkey ret\n"); time.sleep(0.6); drain()

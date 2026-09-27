@@ -308,7 +308,7 @@ try:
         # F2 opens it, `/bin/puka` is registered FIRST so it is already selected, Enter launches it.
         _boot_hold = int(os.environ.get("PUKA_KEY_HOLD_MS", "500"))
         time.sleep(4.0)
-        for _k in ("f2", "ret"):
+        for _k in ("ctrl-f2", "ret"):
             s.sendall((f"sendkey {_k} {_boot_hold}\n").encode())
             time.sleep(_boot_hold / 1000.0 + 1.5); drain()
         for _w in range(24):

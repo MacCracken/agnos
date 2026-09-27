@@ -129,7 +129,7 @@ try:
     spawned = False
     for attempt in range(4):
         for _ in range(10):
-            s.sendall(b"sendkey f2\n"); time.sleep(0.6); drain()
+            s.sendall(b"sendkey ctrl-f2\n"); time.sleep(0.6); drain()
         time.sleep(1.0)
         for _ in range(10):
             s.sendall(b"sendkey ret\n"); time.sleep(0.6); drain()
