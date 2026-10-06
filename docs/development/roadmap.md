@@ -158,3 +158,18 @@ is this repo's to adopt when it pins ≥ 6.6.17. Nothing here gates a cyrius rel
   fork / execve / waitpid shapes the agnos peer does not provide. Building on agnos remains
   `cycc < prog.cyr > prog`. (A working CLI is a cyrius backlog item: a port of cbt's process layer onto
   `lib/process_agnos.cyr`.)
+
+## Recorded by cyrius 6.6.19 (2026-10-06) — for the next cyrius pin move
+
+⛔ **Needs cyrius >= 6.6.19 — do not bump the pin until 6.6.19 is tagged and out.** Docs-only note from the cyrius
+6.6.19 lanes; each item is this repo's to adopt when it pins ≥ 6.6.19. Nothing here gates a cyrius release.
+
+- **A non-destructive readiness probe would let cyrius drop its readiness stash.** agnos has no probe that leaves
+  data in place (`sock_accept#57` and `sock_recv#49` both consume; `epoll#21` never sees a conn), so cyrius
+  6.6.19 (A2) built `async_await_readable_ms` over a STASH in its socket adapter (`lib/syscalls_x86_64_agnos.cyr`):
+  `_agnos_fd_ready` pre-accepts a listener's pending conn or peeks one byte of a conn, handed back by the next
+  accept / read, polled with a `sleep_ms#41` 1→32 ms backoff. A blocking epoll over VFS_SOCK, or #57 returning a
+  VFS_SOCK fd, would let the peer drop it. No new syscall number and no kernel change were needed for 6.6.19.
+- **Please boot-test sandhi's cooperative server (`run_async`) on agnos** once pinned ≥ 6.6.19 — the stash is
+  verified only under cyrius's PTRACE_SYSEMU fake kernel (`agnos_peer_fake_kernel.sh` axis 8), never on a booted
+  agnos.
