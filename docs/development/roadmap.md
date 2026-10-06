@@ -141,3 +141,20 @@ Standing rules (operator 2026-09-23): fix what the repair finds rather than fili
 *Built with cyrius 6.6.6 · `VERSION` is the single source of truth for the kernel version; the Current line
 is maintained by `scripts/version-bump.sh`. At each arc close: delete the arc's forward-facing rows, let the
 CHANGELOG carry the history, and keep this file under ~120 lines. Per-cut prose does not belong here.*
+
+## Recorded by cyrius 6.6.17 (2026-10-05) — for the next cyrius pin move
+
+⛔ **Nothing to do until cyrius 6.6.17 is tagged and out.** Docs-only note from the cyrius 6.6.17 lanes; each item
+is this repo's to adopt when it pins ≥ 6.6.17. Nothing here gates a cyrius release.
+
+- **The BSD socket names are portable wrappers on agnos now** (information). cyrius 6.6.17 (its l6) defines
+  `sys_socket` / `sys_bind` / `sys_listen` / `sys_connect` / `sys_accept4` in `lib/syscalls_x86_64_agnos.cyr`,
+  built on the tagged-fd adapter over sock_connect#47 / sock_listen#56 / sock_accept#57 / sock_peer#106 at the
+  Linux-common arity. No new syscall number is used or requested (the ABI doc parity gate still reads 108/108);
+  a shape agnos cannot express (UDP, IPv6, AF_UNIX, SOCK_NONBLOCK) declines -38; `sys_bind` keeps CVE-48's
+  address rule; `sys_accept4` is non-blocking (#57's semantics: -11 when nothing is pending). The ABI §O5
+  mis-dispatch inventory can note that the BSD names are now safe on agnos.
+- **The `cyrius` CLI compiles for agnos but answers `version` / `help` only** — its verbs run cycc through
+  fork / execve / waitpid shapes the agnos peer does not provide. Building on agnos remains
+  `cycc < prog.cyr > prog`. (A working CLI is a cyrius backlog item: a port of cbt's process layer onto
+  `lib/process_agnos.cyr`.)
