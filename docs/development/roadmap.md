@@ -173,3 +173,17 @@ is this repo's to adopt when it pins ≥ 6.6.17. Nothing here gates a cyrius rel
 - **Please boot-test sandhi's cooperative server (`run_async`) on agnos** once pinned ≥ 6.6.19 — the stash is
   verified only under cyrius's PTRACE_SYSEMU fake kernel (`agnos_peer_fake_kernel.sh` axis 8), never on a booted
   agnos.
+
+## Recorded by cyrius 6.7.6 (2026-10-08) — for the next cyrius pin move
+
+⛔ Needs cyrius >= 6.7.6 — nothing to do until cyrius 6.7.6 is tagged; then at your pin bump:
+
+- **`test.cyml` does not replace the 21 `tests/<dir>/cyrius.cyml`.** 6.7.6 adds a per-directory `test.cyml`
+  — a directory's own `[test]` (`stdlib`, `modules`, `defines`, `timeout`, `[test.embed]`), appended to the
+  levels above it, with no pin and no dependencies — and it reaches only the test scope (`cyrius test` /
+  `bench` / `fuzz` compiles). `tests/audio/` … `tests/waits/` hold program build manifests (`[package]`,
+  `[build]`, `[deps]`, each pinned `cyrius = "6.6.6"`), which a `test.cyml` would refuse by name. Keep them.
+- **If test-only stdlib should stay out of production builds**, `[test] stdlib = [...]` and
+  `[deps.NAME] scope = "test"` exist from 6.7.6: resolved and locked by every resolve, prepended to test /
+  bench / fuzz compiles only. The root `[deps] stdlib` is `[]` today, so nothing needs to move.
+- Reference: the cyrius guide's *Tests: `[test]`, `scope = "test"`, `test.cyml` (6.7.6)*.
