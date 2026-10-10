@@ -1,4 +1,4 @@
-# agnos.cyr — AGNOS kernel v1.57.10
+# agnos.cyr — AGNOS kernel v1.57.11
 # Boot: gnoboot + OVMF (QEMU) or install-usb.sh (iron) — see scripts/smoke/agnsh-smoke.sh.
 # ⛔ 1.56.51: this line read `qemu-system-x86_64 -kernel build/agnos …` and had been wrong since
 # the kernel became ELF64/multiboot2 under Path C. An ELF64 image has no PVH note, so QEMU's
@@ -114,6 +114,8 @@ include "core/net_tcp.cyr"       # TCP stack — split out at 1.36.0; must stay 
 include "core/fatfs.cyr"
 include "core/exfat.cyr"
 include "core/ext2.cyr"
+include "core/zfs_codec.cyr"     # 1.57.11 — ZFS checksums + decompression (fletcher, SHA-2, lz4/lzjb/zle/inflate, the ZAP hash)
+include "core/zfs.cyr"           # 1.57.11 — read-only ZFS (labels -> MOS -> DSL grafts -> ZPL); after vfs/block/gpt, which it calls
 include "core/modeset_latch.cyr" # H2 arm-once modeset latch — after ext2 (its surface) and block (its flush)
 include "core/power.cyr"         # orderly shutdown — after the FS/block layers it flushes, before syscall.cyr
 include "core/syscall.cyr"

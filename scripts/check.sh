@@ -332,6 +332,16 @@ sh "$ROOT/scripts/check/host-gpu-oracles.sh" >"$CHECK_LOGS/host-gpu.log" 2>&1 &&
 check "host GPU oracles (0x0C grid, r15 bilinear, r6 region, r17 depth order)" $rc
 [ $rc -eq 0 ] || cat "$CHECK_LOGS/host-gpu.log"
 
+# ⭐ 1.57.11 — GATE 37: THE ZFS CODEC ORACLE. kernel/core/zfs_codec.cyr (fletcher2/4, SHA-256, SHA-512/256,
+# lz4, lzjb, zle, inflate, the ZAP hash) is the layer every ZFS block passes through, and its failures are
+# silent by nature (a wrong checksum word order reads as "corrupt pool", a decoder off by one reads as a
+# plausible file). scripts/check/host-zfs-oracles.sh regenerates the vectors (hashlib / zlib / the lz4 CLI /
+# Python ports of lzjb + zle), REBUILDS tests/zfscodec and runs every case against PROT_NONE guard pages;
+# mutation-proven at 1.57.11 (see its header). Tooling missing (no lz4 CLI) exits 2 and scores red here too.
+sh "$ROOT/scripts/check/host-zfs-oracles.sh" >"$CHECK_LOGS/host-zfs.log" 2>&1 && rc=0 || rc=$?
+check "host ZFS codec oracle (checksums, lz4/lzjb/zle/inflate, ZAP hash)" $rc
+[ $rc -eq 0 ] || cat "$CHECK_LOGS/host-zfs.log"
+
 # Call arity. cycc WARNS on an argument-count mismatch and builds anyway, so a wrong call ships green.
 # Wired in 2026-07-22 after the 1.56.x audit found gpu_blend_cov_run declared with 12 parameters and
 # called with 11 at BOTH coverage sites — including gpu_cov_surface. (⚠ That worker was described here as
@@ -503,7 +513,7 @@ fi
 # ⭐⭐ 1.57.9 (SIZEGATE) — THE GRANT IS RE-DERIVED FROM THE LAYOUT WALL, AND IT LIVES IN ONE PLACE NOW:
 # scripts/check/weighed-size-check.sh (read its header for the arithmetic and the prior art). Operator
 # ruling: this row "is NOT A HARD LIMIT — it can be expanded"; the hard limit is gate 34 below (LOAD end
-# <= 0x390000). History of what it replaced: 2 MiB (2,097,152) raised 2026-07-26 as "deliberate
+# <= 0x3D0000 since 1.57.11; 0x390000 before). History of what it replaced: 2 MiB (2,097,152) raised 2026-07-26 as "deliberate
 # temporary headroom — a grant, not a measurement, and it expires"; at 1.57.2 the embedded face was
 # weighed out rather than raised over (SZK = SZ - rekha_face_default_len(), read live from the face
 # module the build cat'd in). At 1.57.8 that grant sat 4,700 B above the weighed image while gate 34 still
@@ -537,8 +547,10 @@ check "binary size (weighed-size tripwire: ${SZOUT%%
 # and that no gate had ever measured; the arc's own fit check bounded the wrong address (0x400000).
 # 1.57.2 tolerated the overlap through this gate (dead rekha chunk bytes, single reader chain);
 # 1.57.3 RELOCATED the AP stacks into region 7 (direct-map VAs, gdt.cyr tss_get_cpu_stack's map),
-# so the tolerated-overlap branch is gone and the gate is one number: LOAD end <= 0x390000, the BSP
-# boot stack's 64 KB budget below its top 0x3A0000 — the image's only remaining region-1 neighbour.
+# so the tolerated-overlap branch is gone and the gate is one number: LOAD end <= 0x3D0000, the BSP
+# boot stack's 64 KB budget below its top 0x3E0000 — the image's only remaining region-1 neighbour.
+# ⭐ 1.57.11: the stack moved UP again, 0x3A0000 -> 0x3E0000 (bound 0x390000 -> 0x3D0000, RSP0 window
+# [0x3F0000, 0x400000)) for the read-only ZFS module's ~100 KB — operator ruling: allow the growth.
 # ⭐ 1.57.7 (IMG): the stack moved UP 0x380000 -> 0x3A0000 (still region 1; [0x3A0000, 0x3B0000) is an
 # unused guard gap below the BSP TSS.RSP0 window) and the bound with it, 0x370000 -> 0x390000 — the
 # plan's image estimates had 4 B of margin and three flag builds the sweep boots were already past
@@ -551,7 +563,7 @@ check "binary size (weighed-size tripwire: ${SZOUT%%
 # Same vacuity guard as the size gate: a fossil binary describes a different tree. Mutation-tested
 # (p_memsz past the bound -> FAIL; a shim immediate off BSP_BOOT_TOP -> FAIL; see the script header).
 [ -z "$SZWHY" ] && sh "$ROOT/scripts/check/image-layout-check.sh" "$ROOT/build/agnos" > "$CHECK_LOGS/image-layout-check.log" 2>&1 && rc=0 || rc=$?
-check "kernel image vs BSP boot stack (LOAD end <= 0x390000)" $rc
+check "kernel image vs BSP boot stack (LOAD end <= 0x3D0000)" $rc
 [ -z "$SZWHY" ] || echo "    VACUOUS: $SZWHY"
 [ "$rc" = "0" ] || cat "$CHECK_LOGS/image-layout-check.log"
 

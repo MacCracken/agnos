@@ -282,15 +282,22 @@ grows. AP idles are registered on their AP boot stacks and take no kthread slot;
 their initial RSP is the stack `ap_entry` is running on. A `BOOTCR3_KEEP_GNOBOOT_CR3` build keeps the 4 KB `.bss` kthread pool and gets no guard pages (its kmain
 context has no direct map); no smoke covers that build.
 
-## Region 1 — the BSP's two fixed stacks (1.57.7)
+## Region 1 — the BSP's two fixed stacks (1.57.11)
 
 | Phys = VA (identity, PD[1]) | Use |
 |---|---|
-| `[0x100000, LOAD end)` | the kernel image (LOAD end `0x361898` at 1.57.7's first cut) |
-| `[LOAD end, 0x390000)` | image headroom — `scripts/check/image-layout-check.sh` (check.sh gate 34; `scripts/build.sh` after every x86_64 build, fatal for a flag build; CI after its plain build) fails any image past `0x390000` |
-| `[0x390000, 0x3A0000)` | BSP boot stack, 64 KB, grows down from `0x3A0000` (`boot_shim.cyr`: the legacy `mov esp` / `mov rsp` and the ELF64 `mov rsp`; kmain = proc 0 runs and is switched out on it) |
-| `[0x3A0000, 0x3B0000)` | UNUSED guard gap — nothing in the tree references it; keep it empty |
-| `[0x3B0000, 0x3C0000)` | BSP TSS.RSP0 (`gdt.cyr` `tss_kernel_stack`; the fallback for an unassigned `proc_rsp0`) |
+| `[0x100000, LOAD end)` | the kernel image (LOAD end `0x38fd68` at 1.57.11, with the ZFS reader) |
+| `[LOAD end, 0x3D0000)` | image headroom — `scripts/check/image-layout-check.sh` (check.sh gate 34; `scripts/build.sh` after every x86_64 build, fatal for a flag build; CI after its plain build) fails any image past `0x3D0000` |
+| `[0x3D0000, 0x3E0000)` | BSP boot stack, 64 KB, grows down from `0x3E0000` (`boot_shim.cyr`: the legacy `mov esp` / `mov rsp` and the ELF64 `mov rsp`; kmain = proc 0 runs and is switched out on it) |
+| `[0x3E0000, 0x3F0000)` | UNUSED guard gap — nothing in the tree references it; keep it empty |
+| `[0x3F0000, 0x400000)` | BSP TSS.RSP0 (`gdt.cyr` `tss_kernel_stack` = `0x400000`, the top of region 1; the fallback for an unassigned `proc_rsp0`) |
+
+⭐ **1.57.11 moved all three up 256 KB** (top `0x3A0000` → `0x3E0000`, bound `0x390000` → `0x3D0000`, RSP0
+`0x3C0000` → `0x400000`): the read-only ZFS module added ~100 KB and the plain image ended 2,504 B past the old
+bound; operator ruling — allow the growth (a heavy refactor/rewrite is planned). `[0x3C0000, 0x400000)` was
+audited first: every reference was a stale comment (the old syscall kstacks left region 1 at 1.46.x/1.51.x).
+⛔ **Region 1 is now full above the image** — the next growth past `0x3D0000` needs the BSP stacks somewhere
+else, not a bigger number. The rest of this section's numbers describe the 1.57.7 layout (shifted, not changed).
 
 The boot stack was `[0x370000, 0x380000)` from 1.57.3 through 1.57.6; the IMG step moved it up 128 KB because the
 1.57.7 plan's image estimates left 4 B of headroom and three flag builds the sweep boots were already past

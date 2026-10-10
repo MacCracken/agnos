@@ -96,7 +96,7 @@ fn boot_info_capture_rdi(): i64 {
 # firmware put BOOTX64.EFI. So the stack window's safety rests on the FIRMWARE leaving it free — on OVMF
 # it is conventional RAM, as the old [0x370000, 0x380000) window was, but on iron nothing had ever
 # looked. This makes it observable: every UEFI descriptor intersecting [BSP_BOOT_TOP - 64 KB,
-# BSP TSS.RSP0 top) = [0x390000, 0x3C0000) — boot stack, guard gap, RSP0 window — must be a type that is
+# BSP TSS.RSP0 top) = [0x3D0000, 0x400000) (1.57.11; [0x390000, 0x3C0000) before) — boot stack, guard gap, RSP0 window — must be a type that is
 # free once ExitBootServices returns (3 BootServicesCode, 4 BootServicesData, 7 Conventional), the
 # descriptors must cover the whole span (a hole is not RAM), and the map buffer itself must lie outside
 # it. Anything else (a loader blob, gnoboot's image, runtime/ACPI/reserved/MMIO) is a region the kernel
@@ -110,8 +110,8 @@ var bootstack_win_rc = 0;
 var bootstack_win_type = 0;
 var bootstack_win_start = 0;
 fn bootstack_window_check(bi): i64 {
-    var bsw_lo = 0x390000;    # BSP boot stack bottom = BSP_BOOT_TOP - 64 KB (image-layout-check.sh CEIL)
-    var bsw_hi = 0x3C0000;    # BSP TSS.RSP0 top (gdt.cyr tss_kernel_stack; image-layout-check.sh BSP_RSP0_TOP)
+    var bsw_lo = 0x3D0000;    # BSP boot stack bottom = BSP_BOOT_TOP - 64 KB (image-layout-check.sh CEIL)
+    var bsw_hi = 0x400000;    # BSP TSS.RSP0 top (gdt.cyr tss_kernel_stack; image-layout-check.sh BSP_RSP0_TOP)
     if (bi == 0) { return 0 - 1; }
     var mm = load64(bi + 0x28);
     var count = load32(bi + 0x30);

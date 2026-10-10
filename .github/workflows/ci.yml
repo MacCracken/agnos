@@ -76,7 +76,7 @@ jobs:
 
       - name: Kernel image vs BSP boot stack (image-layout-check.sh)
         # ⭐ 1.57.7 (IMG-fix, review A5). NOT the size ceiling's case (above): the weighed-size row's grant (scripts/check/weighed-size-check.sh) is a BUDGET;
-        # this bound is a CORRECTNESS fact — past LOAD end 0x390000 the BSP boot stack (top 0x3A0000, live from
+        # this bound is a CORRECTNESS fact — past LOAD end 0x3D0000 the BSP boot stack (top 0x3E0000 since 1.57.11, live from
         # the shim's first instruction) grows down into the image's .rodata with no fault. build.sh only WARNS
         # for a plain image (so check.sh gate 34 can score it locally) and CI does not run check.sh, so without
         # this step an over-bound kernel would build green here and ship. Needs only python3 + the tree.

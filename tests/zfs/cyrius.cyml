@@ -1,0 +1,16 @@
+[package]
+name = "zfsx"
+version = "0.1.0"
+description = "agnos ring-3 exerciser for the read-only ZFS mount (1.57.11) — open/read/lseek/close, stat/lstat/readlink, getdents, readdir_at, statfs and mountlist over /mnt/zfs, plus every write verb refused; the binary itself is staged INTO the pool and exec'd from it. Exits 95 iff the whole contract holds."
+license = "GPL-3.0-only"
+language = "cyrius"
+cyrius = "6.6.6"
+
+[build]
+src = "zfsx.cyr"
+output = "build/zfsx"
+
+# Raw syscall numbers on purpose (the tests/mountlist + tests/readdir rule): this is the ABI exerciser, so it
+# talks to the kernel's arms, not to a stdlib wrapper's idea of them.
+[deps]
+stdlib = ["syscalls"]

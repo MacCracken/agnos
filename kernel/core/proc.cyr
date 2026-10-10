@@ -644,7 +644,7 @@ fn proc_on_cpu_init() { var i = 0; while (i < 16) { store64(&proc_on_cpu + i * 8
 # 1.46.1 (per-process kernel stacks): each proc's own TSS.RSP0 — the kernel stack
 # the CPU switches to on a CPL3->CPL0 interrupt. Foundation for IF=1 preemptive
 # agnsh (LIVE since 1.44.14, exec_preempt=1): a preempted ring-3 proc takes its
-# timer tick on ITS OWN stack instead of the shared 0x3C0000, so two procs never
+# timer tick on ITS OWN stack instead of the shared BSP RSP0 window, so two procs never
 # grow down one interrupt stack. RSP0 is consumed on a CPL3->CPL0 preemption. (Until
 # 1.57.6 the deep syscall path stayed on a SHARED per-CPU syscall kstack and only this
 # shallow interrupt stack was per-proc; since Path 2 step S3.3 the syscalls run here too —
@@ -659,7 +659,7 @@ fn proc_on_cpu_init() { var i = 0; while (i < 16) { store64(&proc_on_cpu + i * 8
 # per-proc CR3, vmm.cyr pmm_setup_directmap) is at 8 GB+, far above ANY user VA (segments
 # <=256 MB, mmap/stack <=~1 GB), and is NEVER overridden by a user segment, so RSP0 is
 # always reachable. The phys stays reserved in region 7; only the VA the CPU loads moves up.
-var proc_rsp0[16];      # per-pid TSS.RSP0 top (0 = unassigned -> 0x3C0000 fallback)
+var proc_rsp0[16];      # per-pid TSS.RSP0 top (0 = unassigned -> 0x400000 fallback)
 var KSTACK_POOL_BASE = 0xE00000;   # region 7 PHYS base (14 MB) — RSP0 = DIRECTMAP_BASE + this
 var KSTACK_SLOT = 0x10000;         # 64 KB per proc; the lowest 4 KB is a not-present GUARD page (vmm.cyr)
 # ⭐ 1.57.6 (Path 2, S3.3): this slot is THE process's kernel stack now — its SYSCALLs run here as well as its
@@ -1072,14 +1072,14 @@ fn proc_alloc_slot() {
     while (_oc < 4) { if (load64(&fpu_owner + _oc * 8) == idx) { store64(&fpu_owner + _oc * 8, 0 - 1); } _oc = _oc + 1; }
     return idx;
 }
-# 1.46.1: the per-proc TSS.RSP0 top for `pid`, or the legacy shared stack (0x3C0000
+# 1.46.1: the per-proc TSS.RSP0 top for `pid`, or the legacy shared stack (0x400000 since 1.57.11
 # = tss_kernel_stack, gdt.cyr) for an unassigned slot — e.g. hand-registered kmain/
 # idle that bypass proc_alloc_slot. Called by do_context_switch (kstack_install) /
 # exec_and_wait before a ring-3 entry. The 0-fallback keeps an uninitialized slot
 # from setting RSP0=0 (a triple fault on the next CPL3->CPL0 interrupt).
 fn proc_rsp0_top(pid) {
     var r = load64(&proc_rsp0 + pid * 8);
-    if (r == 0) { return 0x3C0000; }
+    if (r == 0) { return 0x400000; }
     return r;
 }
 fn proc_create(entry) {

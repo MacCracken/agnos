@@ -1,0 +1,1032 @@
+# zfs_codec.cyr — the checksum + decompression primitives of the read-only ZFS driver.
+#
+# kernel/core/zfs.cyr (the driver proper) calls these; this file knows nothing about pools, vdevs or
+# block pointers. Every function here is a pure transform over caller-supplied buffers.
+#
+# ⭐ PROVEN ON THE HOST, NOT ONLY IN THE KERNEL. tests/zfscodec/ includes THIS FILE VERBATIM (plus
+# kernel/klib/kstring.cyr) and scores every entry point against reference vectors that
+# scripts/check/zfs-codec-vectors.py derives from independent producers — hashlib for SHA-2, zlib for
+# deflate, the lz4 CLI for LZ4, and Python ports of the OpenZFS compressors for LZJB and ZLE. The
+# oracle runs each decoder with its input butted against a PROT_NONE guard page and its output
+# butted against another, at both ends, so an out-of-bounds read or write is a SIGSEGV and a red
+# gate rather than silent corruption. Runner: scripts/check/host-zfs-oracles.sh.
+#
+# ⛔ DISK DATA IS HOSTILE. Every decoder below:
+#   • reads only [src, src + slen) and writes only [dst, dst + dlen);
+#   • does all bounds arithmetic on OFFSETS (si/di against slen/dlen), never on raw pointer
+#     compares — `<` is a SIGNED compare in Cyrius, and an offset is small and non-negative where an
+#     address need not be;
+#   • terminates: every loop either consumes input or produces bounded output;
+#   • returns -1 on malformed input and never panics.
+#   src and dst must not overlap (no in-place decompression).
+#
+# ⚠ KERNEL-MODE GLOBALS: a module-scope initializer must be an integer constant, so the one table
+# (SHA-512's K, a rodata literal) is bound at run time by zfs_codec_init(). Each SHA entry point
+# calls it lazily, so the driver may call it once at mount time or not at all; calling it again is
+# harmless. Everything else is built per call into the scratch below.
+#
+# ⚠ MODULE-SCOPE FOOTPRINT (BSS lives inside the kernel image's LOAD segment, against gate 34's wall):
+#   zfs_sha_w 128 + zfs_sha_h 64 + zfs_sha_pad 128 + zfs_shs_h 64 + zfs_shs_buf 64
+#   + zfs_inf_lens 320 + zfs_inf_lcnt 32 + zfs_inf_lsym 576 + zfs_inf_dcnt 32 + zfs_inf_dsym 64
+#   + 10 scalars 80  = 1,552 bytes, plus the 640-byte SHA-512 K table as a rodata literal.
+#   Deliberately NO table for: the CRC-64 (the ZAP hash runs it bitwise — names are short),
+#   SHA-256's K (it is the top half of SHA-512's: both are the fractional bits of the cube roots of
+#   the same primes, FIPS 180-4 §4.2.2/§4.2.3), the deflate length/distance bases (closed form),
+#   the code-length permutation (packed into two immediates), and no Huffman fast-lookup table.
+#   A module-scope bare `var X[N]` is N u64 SLOTS (8N bytes) — every array below says its size.
+
+var zfs_codec_ready  = 0;     # 1 once zfs_codec_init() has built the tables
+# Bytes produced by the most recent successful lz4 / lzjb / zle / gzip decode (0 after a failure).
+# The contract's decoders return only 0 / -1 and lz4 / gzip accept output SHORTER than dlen; current
+# OpenZFS (lz4_zfs.c, gzip.c) additionally REQUIRES lz4 and gzip blocks to expand to exactly d_len,
+# and a caller wanting that exactness compares this against dlen. (lzjb and zle are exact anyway.)
+var zfs_codec_outlen = 0;
+
+# --- SHA-2 state ----------------------------------------------------------------------------------
+# Address of the SHA-512 K[0..79] table (rodata, set by zfs_codec_init); SHA-256 K[t] = K512[t] >> 32.
+var zfs_k512p = 0;
+var zfs_sha_w[16];            # 128 B — rolling message-schedule window, W[t & 15]
+var zfs_sha_h[8];             #  64 B — chaining state H0..H7
+var zfs_sha_pad[16];          # 128 B — one padding block (SHA-256 uses the first 64 B)
+
+# --- inflate state (single-threaded: the driver holds its filesystem lock) ------------------------
+var zfs_inf_in     = 0;       # source base
+var zfs_inf_inlen  = 0;       # source length
+var zfs_inf_pos    = 0;       # next unread source byte (offset)
+var zfs_inf_bb     = 0;       # bit buffer, LSB = next bit
+var zfs_inf_bc     = 0;       # bits held in zfs_inf_bb — ALWAYS 0..7 between calls (see _bits)
+var zfs_inf_lens[40];         # 320 B — code lengths as bytes: lit/len [0, hlit) then dist [hlit, hlit+hdist)
+var zfs_inf_lcnt[4];          #  32 B — lit/len code count per bit length 0..15 (u16)
+var zfs_inf_lsym[72];         # 576 B — lit/len symbols in canonical order (u16, 288 max)
+var zfs_inf_dcnt[4];          #  32 B — distance (or code-length) code count per length (u16)
+var zfs_inf_dsym[8];          #  64 B — distance symbols (u16, 32 max) / the 19 code-length symbols
+
+fn zfs_codec_init() {
+    if (zfs_codec_ready == 1) { return 0; }
+    # FIPS 180-4 §4.2.3: the first 64 bits of the fractional parts of the cube roots of the first 80
+    # primes, as 80 little-endian u64 (640 bytes). Generated from an exact integer cube root, not
+    # transcribed from a listing. A string literal INSIDE a fn is a rodata address the kernel can
+    # use (only module-scope initializers are restricted to integer constants), so the table costs
+    # 640 bytes of rodata and no BSS — 80 store64-of-immediate statements cost ~3.3 KB of code.
+    # A corrupted table cannot make a bad block verify: every SHA checksum would MISMATCH (fail
+    # closed), and the host oracle pins all 80 words through its SHA-2 vectors.
+    zfs_k512p = "\x22\xae\x28\xd7\x98\x2f\x8a\x42\xcd\x65\xef\x23\x91\x44\x37\x71\x2f\x3b\x4d\xec\xcf\xfb\xc0\xb5\xbc\xdb\x89\x81\xa5\xdb\xb5\xe9\x38\xb5\x48\xf3\x5b\xc2\x56\x39\x19\xd0\x05\xb6\xf1\x11\xf1\x59\x9b\x4f\x19\xaf\xa4\x82\x3f\x92\x18\x81\x6d\xda\xd5\x5e\x1c\xab\x42\x02\x03\xa3\x98\xaa\x07\xd8\xbe\x6f\x70\x45\x01\x5b\x83\x12\x8c\xb2\xe4\x4e\xbe\x85\x31\x24\xe2\xb4\xff\xd5\xc3\x7d\x0c\x55\x6f\x89\x7b\xf2\x74\x5d\xbe\x72\xb1\x96\x16\x3b\xfe\xb1\xde\x80\x35\x12\xc7\x25\xa7\x06\xdc\x9b\x94\x26\x69\xcf\x74\xf1\x9b\xc1\xd2\x4a\xf1\x9e\xc1\x69\x9b\xe4\xe3\x25\x4f\x38\x86\x47\xbe\xef\xb5\xd5\x8c\x8b\xc6\x9d\xc1\x0f\x65\x9c\xac\x77\xcc\xa1\x0c\x24\x75\x02\x2b\x59\x6f\x2c\xe9\x2d\x83\xe4\xa6\x6e\xaa\x84\x74\x4a\xd4\xfb\x41\xbd\xdc\xa9\xb0\x5c\xb5\x53\x11\x83\xda\x88\xf9\x76\xab\xdf\x66\xee\x52\x51\x3e\x98\x10\x32\xb4\x2d\x6d\xc6\x31\xa8\x3f\x21\xfb\x98\xc8\x27\x03\xb0\xe4\x0e\xef\xbe\xc7\x7f\x59\xbf\xc2\x8f\xa8\x3d\xf3\x0b\xe0\xc6\x25\xa7\x0a\x93\x47\x91\xa7\xd5\x6f\x82\x03\xe0\x51\x63\xca\x06\x70\x6e\x0e\x0a\x67\x29\x29\x14\xfc\x2f\xd2\x46\x85\x0a\xb7\x27\x26\xc9\x26\x5c\x38\x21\x1b\x2e\xed\x2a\xc4\x5a\xfc\x6d\x2c\x4d\xdf\xb3\x95\x9d\x13\x0d\x38\x53\xde\x63\xaf\x8b\x54\x73\x0a\x65\xa8\xb2\x77\x3c\xbb\x0a\x6a\x76\xe6\xae\xed\x47\x2e\xc9\xc2\x81\x3b\x35\x82\x14\x85\x2c\x72\x92\x64\x03\xf1\x4c\xa1\xe8\xbf\xa2\x01\x30\x42\xbc\x4b\x66\x1a\xa8\x91\x97\xf8\xd0\x70\x8b\x4b\xc2\x30\xbe\x54\x06\xa3\x51\x6c\xc7\x18\x52\xef\xd6\x19\xe8\x92\xd1\x10\xa9\x65\x55\x24\x06\x99\xd6\x2a\x20\x71\x57\x85\x35\x0e\xf4\xb8\xd1\xbb\x32\x70\xa0\x6a\x10\xc8\xd0\xd2\xb8\x16\xc1\xa4\x19\x53\xab\x41\x51\x08\x6c\x37\x1e\x99\xeb\x8e\xdf\x4c\x77\x48\x27\xa8\x48\x9b\xe1\xb5\xbc\xb0\x34\x63\x5a\xc9\xc5\xb3\x0c\x1c\x39\xcb\x8a\x41\xe3\x4a\xaa\xd8\x4e\x73\xe3\x63\x77\x4f\xca\x9c\x5b\xa3\xb8\xb2\xd6\xf3\x6f\x2e\x68\xfc\xb2\xef\x5d\xee\x82\x8f\x74\x60\x2f\x17\x43\x6f\x63\xa5\x78\x72\xab\xf0\xa1\x14\x78\xc8\x84\xec\x39\x64\x1a\x08\x02\xc7\x8c\x28\x1e\x63\x23\xfa\xff\xbe\x90\xe9\xbd\x82\xde\xeb\x6c\x50\xa4\x15\x79\xc6\xb2\xf7\xa3\xf9\xbe\x2b\x53\x72\xe3\xf2\x78\x71\xc6\x9c\x61\x26\xea\xce\x3e\x27\xca\x07\xc2\xc0\x21\xc7\xb8\x86\xd1\x1e\xeb\xe0\xcd\xd6\x7d\xda\xea\x78\xd1\x6e\xee\x7f\x4f\x7d\xf5\xba\x6f\x17\x72\xaa\x67\xf0\x06\xa6\x98\xc8\xa2\xc5\x7d\x63\x0a\xae\x0d\xf9\xbe\x04\x98\x3f\x11\x1b\x47\x1c\x13\x35\x0b\x71\x1b\x84\x7d\x04\x23\xf5\x77\xdb\x28\x93\x24\xc7\x40\x7b\xab\xca\x32\xbc\xbe\xc9\x15\x0a\xbe\x9e\x3c\x4c\x0d\x10\x9c\xc4\x67\x1d\x43\xb6\x42\x3e\xcb\xbe\xd4\xc5\x4c\x2a\x7e\x65\xfc\x9c\x29\x7f\x59\xec\xfa\xd6\x3a\xab\x6f\xcb\x5f\x17\x58\x47\x4a\x8c\x19\x44\x6c";
+    zfs_codec_ready = 1;
+    return 0;
+}
+
+# Reverse the byte order of a u64 (on-disk big-endian <-> the CPU's little-endian).
+fn zfs_cx_bswap64(x) {
+    x = ((x & 0x00FF00FF00FF00FF) << 8) | ((x >> 8) & 0x00FF00FF00FF00FF);
+    x = ((x & 0x0000FFFF0000FFFF) << 16) | ((x >> 16) & 0x0000FFFF0000FFFF);
+    return (x << 32) | (x >> 32);
+}
+
+# =================================================================================================
+# SHA-256 (FIPS 180-4 §6.2)
+# =================================================================================================
+#
+# 32-bit lanes in 64-bit registers. A word is kept CLEAN (high 32 bits zero) wherever it is rotated;
+# sums may carry garbage above bit 31 because only the low 32 bits of a sum depend on the low 32
+# bits of its operands, and every value that is rotated later is masked when it is assigned.
+# ROTR32(x, n) for a clean x is bits [n, n+32) of y = x | (x << 32): Σ0 = (y>>2 ^ y>>13 ^ y>>22),
+# one widening and three shifts instead of three two-shift rotations.
+#
+# Compresses the 64-byte block at p into the 8-word state at hp (one-shot or streaming context).
+fn zfs_cx_sha256_block(p, hp) {
+    var w  = &zfs_sha_w;
+    var k  = zfs_k512p;
+    var a = load64(hp);
+    var b = load64(hp + 8);
+    var c = load64(hp + 16);
+    var d = load64(hp + 24);
+    var e = load64(hp + 32);
+    var f = load64(hp + 40);
+    var g = load64(hp + 48);
+    var h = load64(hp + 56);
+    var t = 0;
+    var x = 0;
+    var y = 0;
+    var wt = 0;
+    var t1 = 0;
+    var t2 = 0;
+    while (t < 64) {
+        if (t < 16) {
+            x = load32(p + t * 4);    # message word t, big-endian on the wire
+            wt = ((x & 0xFF) << 24) | ((x & 0xFF00) << 8) | ((x >> 8) & 0xFF00) | (x >> 24);
+        } else {
+            x = load64(w + ((t - 15) & 15) * 8);
+            y = x | (x << 32);
+            t1 = (y >> 7) ^ (y >> 18) ^ (x >> 3);                       # σ0(W[t-15])
+            x = load64(w + ((t - 2) & 15) * 8);
+            y = x | (x << 32);
+            t2 = (y >> 17) ^ (y >> 19) ^ (x >> 10);                     # σ1(W[t-2])
+            wt = (load64(w + (t & 15) * 8) + t1 + load64(w + ((t - 7) & 15) * 8) + t2) & 0xFFFFFFFF;
+        }
+        store64(w + (t & 15) * 8, wt);
+        y = e | (e << 32);
+        t1 = h + ((y >> 6) ^ (y >> 11) ^ (y >> 25)) + (g ^ (e & (f ^ g))) + (load64(k + t * 8) >> 32) + wt;
+        y = a | (a << 32);
+        t2 = ((y >> 2) ^ (y >> 13) ^ (y >> 22)) + ((a & b) | (c & (a | b)));
+        h = g;
+        g = f;
+        f = e;
+        e = (d + t1) & 0xFFFFFFFF;
+        d = c;
+        c = b;
+        b = a;
+        a = (t1 + t2) & 0xFFFFFFFF;
+        t = t + 1;
+    }
+    store64(hp,      (load64(hp)      + a) & 0xFFFFFFFF);
+    store64(hp + 8,  (load64(hp + 8)  + b) & 0xFFFFFFFF);
+    store64(hp + 16, (load64(hp + 16) + c) & 0xFFFFFFFF);
+    store64(hp + 24, (load64(hp + 24) + d) & 0xFFFFFFFF);
+    store64(hp + 32, (load64(hp + 32) + e) & 0xFFFFFFFF);
+    store64(hp + 40, (load64(hp + 40) + f) & 0xFFFFFFFF);
+    store64(hp + 48, (load64(hp + 48) + g) & 0xFFFFFFFF);
+    store64(hp + 56, (load64(hp + 56) + h) & 0xFFFFFFFF);
+    return 0;
+}
+
+# zfs_sha256_words(buf, len, out) — SHA-256 of `len` bytes at `buf`; writes 4 u64 at `out` in ZFS
+# checksum-word order: out[i] = (H[2i] << 32) | H[2i+1], i.e. the big-endian u64 of digest bytes
+# [8i, 8i+8). That is host-independent (OpenZFS sha2_zfs.c stores BE_64 of each digest word).
+# Returns 0, or -1 for a negative len.
+fn zfs_sha256_words(buf, len, out) {
+    if (zfs_codec_ready == 0) { zfs_codec_init(); }
+    if (len < 0) { return 0 - 1; }
+    var hp = &zfs_sha_h;
+    zfs_cx_sha256_iv(hp);
+    var off = 0;
+    while (len - off >= 64) {
+        zfs_cx_sha256_block(buf + off, hp);
+        off = off + 64;
+    }
+    var r = len - off;                 # 0..63 tail bytes
+    memcpy(&zfs_sha_pad, buf + off, r);
+    zfs_cx_sha256_final(hp, &zfs_sha_pad, r, len, out);
+    return 0;
+}
+
+fn zfs_cx_sha256_iv(hp) {
+    store64(hp,      0x6A09E667);    # FIPS 180-4 §5.3.3
+    store64(hp + 8,  0xBB67AE85);
+    store64(hp + 16, 0x3C6EF372);
+    store64(hp + 24, 0xA54FF53A);
+    store64(hp + 32, 0x510E527F);
+    store64(hp + 40, 0x9B05688C);
+    store64(hp + 48, 0x1F83D9AB);
+    store64(hp + 56, 0x5BE0CD19);
+    return 0;
+}
+
+# Pad and finish: pad holds the r (0..63) unprocessed tail bytes of a `total`-byte message.
+fn zfs_cx_sha256_final(hp, pad, r, total, out) {
+    memset(pad + r, 0, 64 - r);
+    store8(pad + r, 0x80);
+    if (r >= 56) {                     # no room for the 64-bit length: it goes in a second block
+        zfs_cx_sha256_block(pad, hp);
+        memset(pad, 0, 64);
+    }
+    store64(pad + 56, zfs_cx_bswap64(total << 3));
+    zfs_cx_sha256_block(pad, hp);
+    var i = 0;
+    while (i < 4) {
+        store64(out + i * 8, (load64(hp + i * 16) << 32) | load64(hp + i * 16 + 8));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# --- streaming SHA-256: zfs_sha256_begin(); zfs_sha256_update(buf, len) ...; zfs_sha256_end(out) ---
+#
+# For hashing a multi-MB file in pieces of any size. ONE stream at a time (module-scope state).
+# ⚠ The stream has its OWN state (zfs_shs_*), separate from the one-shot zfs_sha256_words /
+# zfs_sha512_256_words, so the driver may verify block checksums WHILE a file stream is open — the
+# natural shape of "read a file block by block, check each block, hash the content". Sharing one
+# state would make that interleaving corrupt the stream silently; the oracle interleaves on purpose.
+var zfs_shs_h[8];             #  64 B — streaming chaining state
+var zfs_shs_buf[8];           #  64 B — partial block carried between updates
+var zfs_shs_fill = 0;         # bytes held in zfs_shs_buf (0..63)
+var zfs_shs_total = 0;        # message bytes so far
+
+fn zfs_sha256_begin() {
+    if (zfs_codec_ready == 0) { zfs_codec_init(); }
+    zfs_cx_sha256_iv(&zfs_shs_h);
+    zfs_shs_fill = 0;
+    zfs_shs_total = 0;
+    return 0;
+}
+
+# Returns 0, or -1 for a negative len (the stream is unchanged). Like every SHA entry point it
+# binds the K table itself, so a missing begin() is a wrong digest, never a NULL table walk.
+fn zfs_sha256_update(buf, len) {
+    if (zfs_codec_ready == 0) { zfs_codec_init(); }
+    if (len < 0) { return 0 - 1; }
+    var hp = &zfs_shs_h;
+    var pb = &zfs_shs_buf;
+    var fill = zfs_shs_fill;
+    var i = 0;
+    zfs_shs_total = zfs_shs_total + len;
+    if (fill > 0) {
+        var take = 64 - fill;
+        if (take > len) { take = len; }
+        memcpy(pb + fill, buf, take);
+        fill = fill + take;
+        i = take;
+        if (fill == 64) {
+            zfs_cx_sha256_block(pb, hp);
+            fill = 0;
+        }
+    }
+    while (len - i >= 64) {
+        zfs_cx_sha256_block(buf + i, hp);
+        i = i + 64;
+    }
+    if (i < len) {                      # only reached with fill == 0
+        memcpy(pb, buf + i, len - i);
+        fill = len - i;
+    }
+    zfs_shs_fill = fill;
+    return 0;
+}
+
+# Writes the same 4 ZFS-order words as zfs_sha256_words. The stream must be begun again after.
+fn zfs_sha256_end(out) {
+    if (zfs_codec_ready == 0) { zfs_codec_init(); }
+    zfs_cx_sha256_final(&zfs_shs_h, &zfs_shs_buf, zfs_shs_fill, zfs_shs_total, out);
+    zfs_shs_fill = 0;
+    return 0;
+}
+
+# =================================================================================================
+# SHA-512/256 (FIPS 180-4 §6.4 with the §5.3.6.2 IV) — OpenZFS's "sha512" checksum
+# =================================================================================================
+fn zfs_cx_sha512_block(p) {
+    var w  = &zfs_sha_w;
+    var k  = zfs_k512p;
+    var hp = &zfs_sha_h;
+    var a = load64(hp);
+    var b = load64(hp + 8);
+    var c = load64(hp + 16);
+    var d = load64(hp + 24);
+    var e = load64(hp + 32);
+    var f = load64(hp + 40);
+    var g = load64(hp + 48);
+    var h = load64(hp + 56);
+    var t = 0;
+    var x = 0;
+    var wt = 0;
+    var t1 = 0;
+    var t2 = 0;
+    while (t < 80) {
+        if (t < 16) {
+            wt = zfs_cx_bswap64(load64(p + t * 8));
+        } else {
+            x = load64(w + ((t - 15) & 15) * 8);
+            t1 = ((x >> 1) | (x << 63)) ^ ((x >> 8) | (x << 56)) ^ (x >> 7);        # σ0
+            x = load64(w + ((t - 2) & 15) * 8);
+            t2 = ((x >> 19) | (x << 45)) ^ ((x >> 61) | (x << 3)) ^ (x >> 6);       # σ1
+            wt = load64(w + (t & 15) * 8) + t1 + load64(w + ((t - 7) & 15) * 8) + t2;
+        }
+        store64(w + (t & 15) * 8, wt);
+        t1 = h + (((e >> 14) | (e << 50)) ^ ((e >> 18) | (e << 46)) ^ ((e >> 41) | (e << 23)))
+        + (g ^ (e & (f ^ g))) + load64(k + t * 8) + wt;
+        t2 = (((a >> 28) | (a << 36)) ^ ((a >> 34) | (a << 30)) ^ ((a >> 39) | (a << 25)))
+        + ((a & b) | (c & (a | b)));
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+        t = t + 1;
+    }
+    store64(hp,      load64(hp)      + a);
+    store64(hp + 8,  load64(hp + 8)  + b);
+    store64(hp + 16, load64(hp + 16) + c);
+    store64(hp + 24, load64(hp + 24) + d);
+    store64(hp + 32, load64(hp + 32) + e);
+    store64(hp + 40, load64(hp + 40) + f);
+    store64(hp + 48, load64(hp + 48) + g);
+    store64(hp + 56, load64(hp + 56) + h);
+    return 0;
+}
+
+# Shared body: leaves the final state in zfs_sha_h. Returns 0, or -1 for a negative len.
+fn zfs_cx_sha512_256(buf, len) {
+    if (zfs_codec_ready == 0) { zfs_codec_init(); }
+    if (len < 0) { return 0 - 1; }
+    var hp = &zfs_sha_h;
+    store64(hp,      0x22312194FC2BF72C);    # FIPS 180-4 §5.3.6.2
+    store64(hp + 8,  0x9F555FA3C84C64C2);
+    store64(hp + 16, 0x2393B86B6F53B151);
+    store64(hp + 24, 0x963877195940EABD);
+    store64(hp + 32, 0x96283EE2A88EFFE3);
+    store64(hp + 40, 0xBE5E1E2553863992);
+    store64(hp + 48, 0x2B0199FC2C85B8AA);
+    store64(hp + 56, 0x0EB72DDC81C52CA2);
+    var off = 0;
+    while (len - off >= 128) {
+        zfs_cx_sha512_block(buf + off);
+        off = off + 128;
+    }
+    var r = len - off;                 # 0..127 tail bytes
+    var pad = &zfs_sha_pad;
+    memset(pad, 0, 128);
+    memcpy(pad, buf + off, r);
+    store8(pad + r, 0x80);
+    if (r >= 112) {                    # no room for the 128-bit length: it goes in a second block
+        zfs_cx_sha512_block(pad);
+        memset(pad, 0, 128);
+    }
+    store64(pad + 112, zfs_cx_bswap64(len >> 61));   # high 64 bits of the 128-bit bit count
+    store64(pad + 120, zfs_cx_bswap64(len << 3));
+    zfs_cx_sha512_block(pad);
+    return 0;
+}
+
+# zfs_sha512_256_words(buf, len, out) — SHA-512/256; out[i] = H[i], the first four 64-bit state
+# words (the big-endian u64 of digest bytes [8i, 8i+8)). Returns 0 / -1 (negative len).
+# ⚠ THIS IS THE WORD ORDER OF A BIG-ENDIAN-WRITTEN POOL. OpenZFS's native sha512 checksum Encode64s
+# the digest straight INTO zc_word[], so a pool written by a little-endian host stores
+# zc_word[i] = bswap64(H[i]) — that is zfs_sha512_256_le_words() below.
+fn zfs_sha512_256_words(buf, len, out) {
+    if (zfs_cx_sha512_256(buf, len) != 0) { return 0 - 1; }
+    var hp = &zfs_sha_h;
+    store64(out,      load64(hp));
+    store64(out + 8,  load64(hp + 8));
+    store64(out + 16, load64(hp + 16));
+    store64(out + 24, load64(hp + 24));
+    return 0;
+}
+
+# zfs_sha512_256_le_words(buf, len, out) — SHA-512/256 in the word order a LITTLE-ENDIAN host's
+# OpenZFS writes into blk_cksum: out[i] = bswap64(H[i]) = the little-endian u64 of digest bytes
+# [8i, 8i+8) (abd_checksum_sha512_native: SHA2Final(zcp, ...) stores the digest bytes in place).
+fn zfs_sha512_256_le_words(buf, len, out) {
+    if (zfs_cx_sha512_256(buf, len) != 0) { return 0 - 1; }
+    var hp = &zfs_sha_h;
+    store64(out,      zfs_cx_bswap64(load64(hp)));
+    store64(out + 8,  zfs_cx_bswap64(load64(hp + 8)));
+    store64(out + 16, zfs_cx_bswap64(load64(hp + 16)));
+    store64(out + 24, zfs_cx_bswap64(load64(hp + 24)));
+    return 0;
+}
+
+# =================================================================================================
+# Fletcher (OpenZFS zfs_fletcher.c, the scalar "native" forms — sums wrap mod 2^64)
+# =================================================================================================
+
+# zfs_fletcher4(buf, len, out) — per little-endian u32 w: a += w; b += a; c += b; d += c.
+# out = a, b, c, d. Returns 0, or -1 if len is negative or not a multiple of 4.
+# Two words per load64: the bottom half is the earlier word on a little-endian bus.
+fn zfs_fletcher4(buf, len, out) {
+    if (len < 0) { return 0 - 1; }
+    if ((len & 3) != 0) { return 0 - 1; }
+    var a = 0;
+    var b = 0;
+    var c = 0;
+    var d = 0;
+    var x = 0;
+    var i = 0;
+    var n8 = len - (len & 7);
+    while (i < n8) {
+        x = load64(buf + i);
+        a = a + (x & 0xFFFFFFFF);
+        b = b + a;
+        c = c + b;
+        d = d + c;
+        a = a + (x >> 32);
+        b = b + a;
+        c = c + b;
+        d = d + c;
+        i = i + 8;
+    }
+    if (i < len) {
+        a = a + load32(buf + i);
+        b = b + a;
+        c = c + b;
+        d = d + c;
+    }
+    store64(out, a);
+    store64(out + 8, b);
+    store64(out + 16, c);
+    store64(out + 24, d);
+    return 0;
+}
+
+# zfs_fletcher2(buf, len, out) — per pair of little-endian u64 (w0, w1): a0 += w0; a1 += w1;
+# b0 += a0; b1 += a1. out = a0, a1, b0, b1. Returns 0, or -1 if len is negative or not a multiple
+# of 16.
+fn zfs_fletcher2(buf, len, out) {
+    if (len < 0) { return 0 - 1; }
+    if ((len & 15) != 0) { return 0 - 1; }
+    var a0 = 0;
+    var a1 = 0;
+    var b0 = 0;
+    var b1 = 0;
+    var i = 0;
+    while (i < len) {
+        a0 = a0 + load64(buf + i);
+        a1 = a1 + load64(buf + i + 8);
+        b0 = b0 + a0;
+        b1 = b1 + a1;
+        i = i + 16;
+    }
+    store64(out, a0);
+    store64(out + 8, a1);
+    store64(out + 16, b0);
+    store64(out + 24, b1);
+    return 0;
+}
+
+# =================================================================================================
+# LZ77 back-reference copy (shared by lz4 and inflate)
+# =================================================================================================
+#
+# Copy n bytes to d from d - off, where the regions may OVERLAP (off < n): the output is periodic
+# with period off, which is what an overlapping match means. The caller has checked off >= 1,
+# off <= (bytes already in the output) and n <= (room left), so every read is of a byte already
+# written and every write is inside the output.
+# For off < 8 the first `step` bytes (the smallest multiple of off that is >= 8) are copied one at
+# a time; after that byte i equals byte i - step by periodicity and the 8-byte source window
+# [d+i-step, d+i-step+8) ends at or before d+i, so word copies read only finished bytes.
+fn zfs_cx_lz_match(d, off, n) {
+    var i = 0;
+    var step = off;
+    if (off < 8) {
+        step = off * ((off + 7) / off);
+        var lim = step;
+        if (lim > n) { lim = n; }
+        while (i < lim) {
+            store8(d + i, load8(d + i - off));
+            i = i + 1;
+        }
+    }
+    while (i + 8 <= n) {
+        store64(d + i, load64(d + i - step));
+        i = i + 8;
+    }
+    while (i < n) {
+        store8(d + i, load8(d + i - step));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# =================================================================================================
+# LZ4 (OpenZFS lz4_zfs.c framing around a raw LZ4 block)
+# =================================================================================================
+#
+# zfs_lz4_decompress(src, slen, dst, dlen) — src[0..4) is the big-endian u32 length `bufsiz` of the
+# raw LZ4 block at src + 4; require bufsiz + 4 <= slen. Decode it into dst, capacity dlen
+# (LZ4_uncompress_unknownOutputSize: the block need not fill dst; bytes past the decoded length are
+# left as they were). Returns 0, or -1 on any malformed or overflowing input; zfs_codec_outlen
+# holds the decoded length.
+#
+# Block format (lz4 Block_format.md): sequences of
+#   token (literal-length nibble | match-length nibble), [length bytes], literals,
+#   offset (LE u16, 1..65535, back into the output), [match-length bytes]   — match length + 4.
+# A nibble of 15 continues in following bytes, each added, until one is not 255.
+# The LAST sequence is literals only and ends exactly at the end of the block. A block that ends
+# after a match, or whose offset reaches before the start of dst, or is 0, is refused.
+# ⚠ The reference decoder also refuses blocks that break the compressor's end-of-block parsing
+# margins (last match >= 12 bytes before the end, last 5 bytes literal). Those exist so ITS wild
+# 8/16/32-byte copies stay in bounds; this decoder copies exactly, so it does not need them and
+# accepts such a block. Every block the reference accepts decodes identically here.
+fn zfs_lz4_decompress(src, slen, dst, dlen) {
+    zfs_codec_outlen = 0;
+    if (slen < 4) { return 0 - 1; }
+    if (dlen < 0) { return 0 - 1; }
+    var bufsiz = (load8(src) << 24) | (load8(src + 1) << 16) | (load8(src + 2) << 8) | load8(src + 3);
+    if (bufsiz + 4 > slen) { return 0 - 1; }
+    if (bufsiz == 0) { return 0 - 1; }
+    var ip = src + 4;
+    var si = 0;
+    var di = 0;
+    var token = 0;
+    var n = 0;
+    var s = 0;
+    var off = 0;
+    while (si < bufsiz) {
+        token = load8(ip + si);
+        si = si + 1;
+        n = token >> 4;                                  # literal length
+        if (n == 15) {
+            s = 255;
+            while (s == 255) {
+                if (si >= bufsiz) { return 0 - 1; }
+                s = load8(ip + si);
+                si = si + 1;
+                n = n + s;
+            }
+        }
+        if (n > bufsiz - si) { return 0 - 1; }           # literals run past the block
+        if (n > dlen - di) { return 0 - 1; }             # ... or past the output
+        memcpy(dst + di, ip + si, n);
+        si = si + n;
+        di = di + n;
+        if (si == bufsiz) {                              # the literals-only last sequence
+            zfs_codec_outlen = di;
+            return 0;
+        }
+        if (bufsiz - si < 2) { return 0 - 1; }
+        off = load8(ip + si) | (load8(ip + si + 1) << 8);
+        si = si + 2;
+        if (off == 0) { return 0 - 1; }
+        if (off > di) { return 0 - 1; }                  # reaches before the start of dst
+        n = token & 15;                                  # match length - 4
+        if (n == 15) {
+            s = 255;
+            while (s == 255) {
+                if (si >= bufsiz) { return 0 - 1; }
+                s = load8(ip + si);
+                si = si + 1;
+                n = n + s;
+            }
+        }
+        n = n + 4;
+        if (n > dlen - di) { return 0 - 1; }
+        zfs_cx_lz_match(dst + di, off, n);
+        di = di + n;
+    }
+    return 0 - 1;                                        # ended after a match, not on literals
+}
+
+# =================================================================================================
+# LZJB (OpenZFS lzjb.c)
+# =================================================================================================
+#
+# zfs_lzjb_decompress(src, slen, dst, dlen) — fills exactly dlen bytes. A copy-map byte governs the
+# next 8 items, LSB first: a 0 bit is one literal byte, a 1 bit is a 2-byte back-reference
+#   mlen = (b0 >> 2) + 3 (3..66), offset = ((b0 << 8) | b1) & 0x3FF,
+# copied byte by byte (it may overlap) and truncated at dlen. Returns 0, or -1 if the input runs
+# out before dlen bytes are produced or an offset reaches before the start of dst.
+# ⚠ The reference (which ignores s_len entirely) also accepts offset 0, copying the byte under the
+# cursor onto itself; lzjb_compress never emits it (it requires cpy != src), so it is refused
+# here rather than let the output depend on whatever dst held before.
+fn zfs_lzjb_decompress(src, slen, dst, dlen) {
+    zfs_codec_outlen = 0;
+    if (slen < 0) { return 0 - 1; }
+    if (dlen < 0) { return 0 - 1; }
+    var si = 0;
+    var di = 0;
+    var copymap = 0;
+    var copymask = 128;
+    var b0 = 0;
+    var mlen = 0;
+    var off = 0;
+    var cp = 0;
+    while (di < dlen) {
+        copymask = copymask << 1;
+        if (copymask == 256) {
+            if (si >= slen) { return 0 - 1; }
+            copymask = 1;
+            copymap = load8(src + si);
+            si = si + 1;
+        }
+        if ((copymap & copymask) != 0) {
+            if (slen - si < 2) { return 0 - 1; }
+            b0 = load8(src + si);
+            mlen = (b0 >> 2) + 3;
+            off = ((b0 << 8) | load8(src + si + 1)) & 0x3FF;
+            si = si + 2;
+            if (off == 0) { return 0 - 1; }
+            if (off > di) { return 0 - 1; }
+            if (mlen > dlen - di) { mlen = dlen - di; }
+            cp = dst + di - off;
+            var j = 0;
+            while (j < mlen) {
+                store8(dst + di + j, load8(cp + j));
+                j = j + 1;
+            }
+            di = di + mlen;
+        } else {
+            if (si >= slen) { return 0 - 1; }
+            store8(dst + di, load8(src + si));
+            si = si + 1;
+            di = di + 1;
+        }
+    }
+    zfs_codec_outlen = di;
+    return 0;
+}
+
+# =================================================================================================
+# ZLE — zero-length encoding (OpenZFS zle.c; ZIO_COMPRESS_ZLE uses n = 64)
+# =================================================================================================
+#
+# zfs_zle_decompress(src, slen, dst, dlen, n) — each run starts with a byte L; len = L + 1.
+# len <= n: len literal bytes follow. len > n: (len - n) zero bytes, nothing follows.
+# Returns 0 iff the output is EXACTLY dlen bytes when the input ends or fills; -1 if a run would
+# overflow the input or output, or the input ends short of dlen. (Input beyond a full dst is
+# ignored, as in the reference.)
+fn zfs_zle_decompress(src, slen, dst, dlen, n) {
+    zfs_codec_outlen = 0;
+    if (slen < 0) { return 0 - 1; }
+    if (dlen < 0) { return 0 - 1; }
+    var si = 0;
+    var di = 0;
+    var len = 0;
+    while (si < slen) {
+        if (di >= dlen) { break; }
+        len = 1 + load8(src + si);
+        si = si + 1;
+        if (len <= n) {
+            if (len > slen - si) { return 0 - 1; }
+            if (len > dlen - di) { return 0 - 1; }
+            memcpy(dst + di, src + si, len);
+            si = si + len;
+            di = di + len;
+        } else {
+            len = len - n;
+            if (len > dlen - di) { return 0 - 1; }
+            memset(dst + di, 0, len);
+            di = di + len;
+        }
+    }
+    if (di != dlen) { return 0 - 1; }
+    zfs_codec_outlen = di;
+    return 0;
+}
+
+# =================================================================================================
+# gzip = ZLIB stream (RFC 1950) around DEFLATE (RFC 1951) — inflate from the RFCs
+# =================================================================================================
+#
+# Huffman decoding is canonical and bit-serial (the RFC 1951 §3.2.2 construction): per bit length,
+# `count` codes starting at `first`; a code is matched at the first length where it falls below
+# first + count. No lookup table — gzip is a rare ZFS codec and a table costs image bytes.
+
+# Read n (0..16) bits, LSB first. Returns the value, or -1 if the input is exhausted.
+# Refills ONE BYTE AT A TIME and only while short, so at most 7 bits are buffered on return — the
+# invariant that makes "drop the buffer" the same as "skip to the next byte boundary".
+fn zfs_cx_inf_bits(n) {
+    var bb = zfs_inf_bb;
+    var bc = zfs_inf_bc;
+    while (bc < n) {
+        if (zfs_inf_pos >= zfs_inf_inlen) { return 0 - 1; }
+        bb = bb | (load8(zfs_inf_in + zfs_inf_pos) << bc);
+        zfs_inf_pos = zfs_inf_pos + 1;
+        bc = bc + 8;
+    }
+    zfs_inf_bb = bb >> n;
+    zfs_inf_bc = bc - n;
+    return bb & ((1 << n) - 1);
+}
+
+# Decode one symbol with the canonical code (cnt = u16 count per length, sym = u16 symbols in
+# canonical order). Returns the symbol, or -1 (input exhausted, or no code of <= 15 bits matches).
+fn zfs_cx_inf_decode(cnt, sym) {
+    var code = 0;
+    var first = 0;
+    var index = 0;
+    var len = 1;
+    var count = 0;
+    var bb = zfs_inf_bb;
+    var bc = zfs_inf_bc;
+    while (len <= 15) {
+        if (bc == 0) {
+            if (zfs_inf_pos >= zfs_inf_inlen) { return 0 - 1; }
+            bb = load8(zfs_inf_in + zfs_inf_pos);
+            zfs_inf_pos = zfs_inf_pos + 1;
+            bc = 8;
+        }
+        code = code | (bb & 1);
+        bb = bb >> 1;
+        bc = bc - 1;
+        count = load16(cnt + len * 2);
+        if (code - count < first) {
+            zfs_inf_bb = bb;
+            zfs_inf_bc = bc;
+            return load16(sym + (index + code - first) * 2);
+        }
+        index = index + count;
+        first = (first + count) << 1;
+        code = code << 1;
+        len = len + 1;
+    }
+    return 0 - 1;
+}
+
+# Build the canonical tables for n code lengths (bytes at lens). Returns 0 for a complete code,
+# > 0 for an incomplete one, < 0 for an over-subscribed one (always invalid).
+fn zfs_cx_inf_build(cnt, sym, lens, n) {
+    var offs[32];                    # 32 B — 16 u16 first-index per length
+    var i = 0;
+    while (i < 16) {
+        store16(cnt + i * 2, 0);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n) {
+        var l = load8(lens + i);
+        store16(cnt + l * 2, load16(cnt + l * 2) + 1);
+        i = i + 1;
+    }
+    if (load16(cnt) == n) { return 0; }          # no codes at all: complete, but nothing decodes
+    var left = 1;
+    i = 1;
+    while (i < 16) {
+        left = (left << 1) - load16(cnt + i * 2);
+        if (left < 0) { return left; }
+        i = i + 1;
+    }
+    store16(&offs + 2, 0);
+    i = 1;
+    while (i < 15) {
+        store16(&offs + (i + 1) * 2, load16(&offs + i * 2) + load16(cnt + i * 2));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n) {
+        var l2 = load8(lens + i);
+        if (l2 != 0) {
+            var o = load16(&offs + l2 * 2);
+            store16(sym + o * 2, i);
+            store16(&offs + l2 * 2, o + 1);
+        }
+        i = i + 1;
+    }
+    return left;
+}
+
+# RFC 1951 §3.2.7: the order code-length code lengths arrive in —
+# 16 17 18 0 8 7 9 6 10 5 11 4 12 3 13 2 14 1 15 — packed 5 bits each into two immediates.
+fn zfs_cx_inf_clorder(i) {
+    if (i < 12) { return (0x22CAA324E804A30 >> (i * 5)) & 31; }   # entries 0..11
+    return (0x3C2E1346C >> ((i - 12) * 5)) & 31;                    # entries 12..18
+}
+
+# Decode one block's literal/length + distance symbols until end-of-block. Returns 0 / -1.
+fn zfs_cx_inf_codes(out, cap) {
+    var lcnt = &zfs_inf_lcnt;
+    var lsym = &zfs_inf_lsym;
+    var dcnt = &zfs_inf_dcnt;
+    var dsym = &zfs_inf_dsym;
+    var op = zfs_codec_outlen;
+    var sym = 0;
+    var len = 0;
+    var dist = 0;
+    var eb = 0;
+    var v = 0;
+    while (1) {
+        sym = zfs_cx_inf_decode(lcnt, lsym);
+        if (sym < 0) { return 0 - 1; }
+        if (sym < 256) {
+            if (op >= cap) { return 0 - 1; }
+            store8(out + op, sym);
+            op = op + 1;
+        } elif (sym == 256) {
+            zfs_codec_outlen = op;
+            return 0;
+        } else {
+            sym = sym - 257;
+            if (sym >= 29) { return 0 - 1; }                     # 286, 287: never valid
+            if (sym < 8) {
+                len = sym + 3;
+                eb = 0;
+            } elif (sym == 28) {
+                len = 258;
+                eb = 0;
+            } else {
+                eb = (sym >> 2) - 1;
+                len = ((4 + (sym & 3)) << eb) + 3;
+            }
+            v = zfs_cx_inf_bits(eb);
+            if (v < 0) { return 0 - 1; }
+            len = len + v;
+            sym = zfs_cx_inf_decode(dcnt, dsym);
+            if (sym < 0) { return 0 - 1; }
+            if (sym >= 30) { return 0 - 1; }                     # 30, 31: never valid
+            if (sym < 4) {
+                dist = sym + 1;
+                eb = 0;
+            } else {
+                eb = (sym >> 1) - 1;
+                dist = ((2 + (sym & 1)) << eb) + 1;
+            }
+            v = zfs_cx_inf_bits(eb);
+            if (v < 0) { return 0 - 1; }
+            dist = dist + v;
+            if (dist > op) { return 0 - 1; }                     # too far back
+            if (len > cap - op) { return 0 - 1; }
+            zfs_cx_lz_match(out + op, dist, len);
+            op = op + len;
+        }
+    }
+    return 0 - 1;
+}
+
+# zfs_gzip_decompress(src, slen, dst, dlen) — inflate the ZLIB stream at src into dst (capacity
+# dlen). Verifies the RFC 1950 header (CM = 8, CINFO <= 7, FCHECK, no FDICT) and the Adler-32
+# trailer. Returns 0 on success (zfs_codec_outlen = inflated length; bytes after the trailer, such
+# as ZFS's sector padding, are ignored as zlib's uncompress() ignores them), -1 on any malformed
+# stream or output that does not fit in dlen.
+fn zfs_gzip_decompress(src, slen, dst, dlen) {
+    zfs_codec_outlen = 0;
+    if (slen < 2) { return 0 - 1; }
+    if (dlen < 0) { return 0 - 1; }
+    var cmf = load8(src);
+    var flg = load8(src + 1);
+    if ((cmf & 15) != 8) { return 0 - 1; }
+    if ((cmf >> 4) > 7) { return 0 - 1; }
+    if ((((cmf << 8) | flg) % 31) != 0) { return 0 - 1; }
+    if ((flg & 0x20) != 0) { return 0 - 1; }
+    zfs_inf_in = src;
+    zfs_inf_inlen = slen;
+    zfs_inf_pos = 2;
+    zfs_inf_bb = 0;
+    zfs_inf_bc = 0;
+    var lens = &zfs_inf_lens;
+    var last = 0;
+    var btype = 0;
+    var i = 0;
+    var err = 0;
+    while (last == 0) {
+        last = zfs_cx_inf_bits(1);
+        btype = zfs_cx_inf_bits(2);
+        if (last < 0) { return zfs_cx_inf_fail(); }
+        if (btype < 0) { return zfs_cx_inf_fail(); }
+        if (btype == 0) {
+            # stored: skip to the byte boundary (bc < 8 is the whole partial byte), LEN, ~LEN, bytes
+            zfs_inf_bb = 0;
+            zfs_inf_bc = 0;
+            if (zfs_inf_inlen - zfs_inf_pos < 4) { return zfs_cx_inf_fail(); }
+            var blen = load8(src + zfs_inf_pos) | (load8(src + zfs_inf_pos + 1) << 8);
+            var nlen = load8(src + zfs_inf_pos + 2) | (load8(src + zfs_inf_pos + 3) << 8);
+            zfs_inf_pos = zfs_inf_pos + 4;
+            if (blen != (nlen ^ 0xFFFF)) { return zfs_cx_inf_fail(); }
+            if (blen > zfs_inf_inlen - zfs_inf_pos) { return zfs_cx_inf_fail(); }
+            if (blen > dlen - zfs_codec_outlen) { return zfs_cx_inf_fail(); }
+            memcpy(dst + zfs_codec_outlen, src + zfs_inf_pos, blen);
+            zfs_inf_pos = zfs_inf_pos + blen;
+            zfs_codec_outlen = zfs_codec_outlen + blen;
+        } elif (btype == 1) {
+            # fixed Huffman (RFC 1951 §3.2.6)
+            i = 0;
+            while (i < 144) { store8(lens + i, 8); i = i + 1; }
+            while (i < 256) { store8(lens + i, 9); i = i + 1; }
+            while (i < 280) { store8(lens + i, 7); i = i + 1; }
+            while (i < 288) { store8(lens + i, 8); i = i + 1; }
+            zfs_cx_inf_build(&zfs_inf_lcnt, &zfs_inf_lsym, lens, 288);
+            i = 0;
+            while (i < 30) { store8(lens + 288 + i, 5); i = i + 1; }
+            zfs_cx_inf_build(&zfs_inf_dcnt, &zfs_inf_dsym, lens + 288, 30);
+            if (zfs_cx_inf_codes(dst, dlen) != 0) { return zfs_cx_inf_fail(); }
+        } elif (btype == 2) {
+            if (zfs_cx_inf_dynamic() != 0) { return zfs_cx_inf_fail(); }
+            if (zfs_cx_inf_codes(dst, dlen) != 0) { return zfs_cx_inf_fail(); }
+        } else {
+            return zfs_cx_inf_fail();                            # type 3 is reserved
+        }
+    }
+    # Adler-32 trailer, big-endian, at the next byte boundary.
+    zfs_inf_bb = 0;
+    zfs_inf_bc = 0;
+    if (zfs_inf_inlen - zfs_inf_pos < 4) { return zfs_cx_inf_fail(); }
+    var p = src + zfs_inf_pos;
+    var want = (load8(p) << 24) | (load8(p + 1) << 16) | (load8(p + 2) << 8) | load8(p + 3);
+    if (zfs_cx_adler32(dst, zfs_codec_outlen) != want) { return zfs_cx_inf_fail(); }
+    return 0;
+}
+
+fn zfs_cx_inf_fail() {
+    zfs_codec_outlen = 0;
+    return 0 - 1;
+}
+
+# Read a dynamic block's code-length code, then the lit/len and distance code lengths, and build
+# both tables (RFC 1951 §3.2.7). Returns 0 / -1.
+fn zfs_cx_inf_dynamic() {
+    var lens = &zfs_inf_lens;
+    var hlit = zfs_cx_inf_bits(5);
+    var hdist = zfs_cx_inf_bits(5);
+    var hclen = zfs_cx_inf_bits(4);
+    if (hlit < 0) { return 0 - 1; }
+    if (hdist < 0) { return 0 - 1; }
+    if (hclen < 0) { return 0 - 1; }
+    hlit = hlit + 257;
+    hdist = hdist + 1;
+    hclen = hclen + 4;
+    if (hlit > 286) { return 0 - 1; }
+    if (hdist > 30) { return 0 - 1; }
+    var i = 0;
+    while (i < 19) { store8(lens + i, 0); i = i + 1; }
+    i = 0;
+    var v = 0;
+    while (i < hclen) {
+        v = zfs_cx_inf_bits(3);
+        if (v < 0) { return 0 - 1; }
+        store8(lens + zfs_cx_inf_clorder(i), v);
+        i = i + 1;
+    }
+    # the code-length code must be complete; it borrows the distance tables
+    if (zfs_cx_inf_build(&zfs_inf_dcnt, &zfs_inf_dsym, lens, 19) != 0) { return 0 - 1; }
+    var total = hlit + hdist;
+    var idx = 0;
+    var sym = 0;
+    var rep = 0;
+    var l = 0;
+    while (idx < total) {
+        sym = zfs_cx_inf_decode(&zfs_inf_dcnt, &zfs_inf_dsym);
+        if (sym < 0) { return 0 - 1; }
+        if (sym < 16) {
+            store8(lens + idx, sym);
+            idx = idx + 1;
+        } else {
+            l = 0;
+            if (sym == 16) {
+                if (idx == 0) { return 0 - 1; }                  # nothing to repeat
+                l = load8(lens + idx - 1);
+                rep = zfs_cx_inf_bits(2);
+                if (rep < 0) { return 0 - 1; }
+                rep = rep + 3;
+            } elif (sym == 17) {
+                rep = zfs_cx_inf_bits(3);
+                if (rep < 0) { return 0 - 1; }
+                rep = rep + 3;
+            } else {
+                rep = zfs_cx_inf_bits(7);
+                if (rep < 0) { return 0 - 1; }
+                rep = rep + 11;
+            }
+            if (rep > total - idx) { return 0 - 1; }
+            while (rep > 0) {
+                store8(lens + idx, l);
+                idx = idx + 1;
+                rep = rep - 1;
+            }
+        }
+    }
+    if (load8(lens + 256) == 0) { return 0 - 1; }                # no end-of-block code
+    # incomplete codes are allowed only as a single code of length 1 (zlib's rule)
+    var left = zfs_cx_inf_build(&zfs_inf_lcnt, &zfs_inf_lsym, lens, hlit);
+    if (left < 0) { return 0 - 1; }
+    if (left > 0) {
+        if (hlit != load16(&zfs_inf_lcnt) + load16(&zfs_inf_lcnt + 2)) { return 0 - 1; }
+    }
+    left = zfs_cx_inf_build(&zfs_inf_dcnt, &zfs_inf_dsym, lens + hlit, hdist);
+    if (left < 0) { return 0 - 1; }
+    if (left > 0) {
+        if (hdist != load16(&zfs_inf_dcnt) + load16(&zfs_inf_dcnt + 2)) { return 0 - 1; }
+    }
+    return 0;
+}
+
+# Adler-32 (RFC 1950 §8.2). Sums are reduced every 64 KiB, far below any i64 overflow.
+fn zfs_cx_adler32(p, n) {
+    var a = 1;
+    var b = 0;
+    var i = 0;
+    var lim = 0;
+    while (i < n) {
+        lim = i + 65536;
+        if (lim > n) { lim = n; }
+        while (i < lim) {
+            a = a + load8(p + i);
+            b = b + a;
+            i = i + 1;
+        }
+        a = a % 65521;
+        b = b % 65521;
+    }
+    return (b << 16) | a;
+}
+
+# =================================================================================================
+# ZAP name hash (OpenZFS zap_hash / FreeBSD zfssubr.c)
+# =================================================================================================
+#
+# zfs_zap_hash_bits(salt, name, namelen, bits) — crc = salt; per name byte c:
+#   crc = (crc >> 8) ^ T[(crc ^ c) & 0xFF], T the reflected CRC-64 table of 0xC96C5795D7870F42;
+# then keep only the top `bits` bits (zap_hashbits(): 28, or 48 with ZAP_FLAG_HASH64).
+# `namelen` EXCLUDES the terminating NUL. Computed bitwise: XORing c into the low byte and then
+# shifting eight times is the table step exactly (the CRC update is GF(2)-linear, and the first
+# eight shifts see only the low byte as their feedback bit) — and needs no 2 KB table.
+fn zfs_zap_hash_bits(salt, name, namelen, bits) {
+    var crc = salt;
+    var poly = 0xC96C5795D7870F42;
+    var i = 0;
+    while (i < namelen) {
+        crc = crc ^ load8(name + i);
+        var j = 0;
+        while (j < 8) {
+            crc = (crc >> 1) ^ ((0 - (crc & 1)) & poly);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    if (bits <= 0) { return 0; }
+    if (bits >= 64) { return crc; }
+    return crc & ~((1 << (64 - bits)) - 1);
+}
+
+# zfs_zap_hash(salt, name, namelen) — the ordinary 28-bit ZAP hash.
+fn zfs_zap_hash(salt, name, namelen) {
+    return zfs_zap_hash_bits(salt, name, namelen, 28);
+}

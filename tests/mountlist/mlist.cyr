@@ -28,9 +28,9 @@ fn ml_main(): i64 {
         var rec = &buf + i * 80;
         var be  = load64(rec + 0);
         var pl  = load64(rec + 8);
-        # FS_NONE(0) is never emitted; FS_EXT2/FAT/EXFAT are 1..3.
+        # FS_NONE(0) is never emitted; FS_EXT2/FAT/EXFAT/ZFS are 1..4 (FS_ZFS = 4 since 1.57.11).
         if (be < 1) { return 82; }
-        if (be > 3) { return 83; }
+        if (be > 4) { return 83; }
         if (pl < 1) { return 84; }
         if (pl > 64) { return 85; }
         # ⛔ THE PREFIX MUST BE NUL-PADDED PAST ITS LENGTH. A slot may hold a longer prefix from a

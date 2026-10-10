@@ -1,5 +1,17 @@
 #!/bin/sh
-# image-layout-check.sh — the kernel image vs the BSP boot stack: LOAD end <= 0x390000 (0x370000 until 1.57.7).
+# image-layout-check.sh — the kernel image vs the BSP boot stack: LOAD end <= 0x3D0000 (0x390000 until 1.57.11,
+# 0x370000 until 1.57.7).
+#
+# ⭐⭐ 1.57.11 — THE STACK MOVED UP AGAIN, 0x3A0000 -> 0x3E0000, THE BOUND 0x390000 -> 0x3D0000, the RSP0 window
+# [0x3B0000, 0x3C0000) -> [0x3F0000, 0x400000) (the top of region 1). The read-only ZFS module (core/zfs.cyr +
+# zfs_codec.cyr) added ~100 KB and put the plain image 2,504 B past 0x390000 (LOAD end 0x3909c8); operator ruling
+# 2026-10-09: allow the growth (a heavy refactor/rewrite is planned), move the stack. [0x3C0000, 0x400000) was
+# audited first: every reference in the tree was a stale comment — the 0x3D0000/0x3F0000 syscall kstacks left
+# region 1 for region 7 at 1.46.x/1.51.x. The region-1 map is now:
+#     [0x3D0000, 0x3E0000)  BSP boot stack — 64 KB budget, grows down from 0x3E0000
+#     [0x3E0000, 0x3F0000)  UNUSED 64 KB guard gap
+#     [0x3F0000, 0x400000)  BSP TSS.RSP0 window (gdt.cyr tss_kernel_stack = 0x400000)
+# The 1.57.7 notes below describe the move before this one; their numbers are history.
 #
 # ⛔⛔ WHY THIS EXISTS (2026-09-13, 1.57.2 -> 1.57.3). Every fixed kernel stack in PMM region 1 was placed
 # by reading the image end off a build and choosing a number above it, and nothing re-checked those
@@ -43,7 +55,7 @@
 # reserved the old [0x370000, 0x380000). On OVMF the whole span is free RAM (a gdbstub paint of phys
 # [0x370000, 0x3C0000) before OVMF's first instruction survives the firmware untouched outside the stack's own
 # writes). On IRON it is now OBSERVABLE: kmain checks the UEFI map it was handed (mbi.cyr
-# bootstack_window_check) and prints either "boot: BSP stack span 0x390000-0x3C0000 is free RAM in the UEFI map
+# bootstack_window_check) and prints either "boot: BSP stack span 0x3D0000-0x400000 (1.57.11; 0x390000-0x3C0000 before) is free RAM in the UEFI map
 # OK" or the denied "boot: BSP stack window not free RAM in the UEFI map - type 0x.. at 0x.." (SMOKE_INVARIANT_DENY;
 # agnsh-smoke requires the OK line). Built, gated, NOT burned.
 # ⚠ A LOAD end below the bound is necessary, not sufficient: the boot stack's DEPTH is not measured by any
@@ -58,7 +70,7 @@
 #
 # WHAT IT ASSERTS:
 #   (1) from `build/agnos` (the ELF64 the bootloader loads): LOAD end (p_vaddr + p_memsz of the single
-#       PT_LOAD) <= BSP_BOOT_TOP - 64 KB = 0x390000. memsz is filesz + a 64 KB zero-fill, and it counts.
+#       PT_LOAD) <= BSP_BOOT_TOP - 64 KB = 0x3D0000 (0x390000 until 1.57.11). memsz is filesz + a 64 KB zero-fill, and it counts.
 #       Above the bound the boot path walks into the image on QEMU AND iron: hard FAIL, no exception, do
 #       not raise the number without MOVING the stack (and this gate's BSP_BOOT_TOP with it): the BSP boot
 #       stack cannot leave region 1. ⚠ WHY IT CANNOT (corrected at the 1.57.3 review — this header first
@@ -137,9 +149,9 @@ python3 - "$AGNOS" "$SHIM" "$KDIR" <<'EOF'
 import re, struct, sys
 agnos, shim, kdir = sys.argv[1], sys.argv[2], sys.argv[3]
 d = open(agnos, 'rb').read()
-BSP_BOOT_TOP = 0x3A0000                 # boot_shim.cyr legacy steps 1 + 12, ELF64 step 1 (grows down); 0x380000 until 1.57.7
-CEIL = BSP_BOOT_TOP - 0x10000           # 0x390000: the BSP boot stack keeps the per-CPU 64 KB budget
-BSP_RSP0_TOP = 0x3C0000                 # gdt.cyr tss_kernel_stack; window [0x3B0000, 0x3C0000)
+BSP_BOOT_TOP = 0x3E0000                 # boot_shim.cyr legacy steps 1 + 12, ELF64 step 1 (grows down); 0x3A0000 until 1.57.11, 0x380000 until 1.57.7
+CEIL = BSP_BOOT_TOP - 0x10000           # 0x3D0000: the BSP boot stack keeps the per-CPU 64 KB budget
+BSP_RSP0_TOP = 0x400000                 # gdt.cyr tss_kernel_stack; window [0x3F0000, 0x400000) (0x3C0000 until 1.57.11)
 RSP0_BOT = BSP_RSP0_TOP - 0x10000
 # The constants themselves must describe a legal layout: the stack in region 1, not inside the RSP0 window.
 assert 0x200000 < CEIL < BSP_BOOT_TOP <= RSP0_BOT < BSP_RSP0_TOP <= 0x400000, "image-layout-check: constants inconsistent"

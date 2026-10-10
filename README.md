@@ -60,8 +60,8 @@ Common:
   -> PCI bus; networking: VirtIO-Net + r8169 NIC, IP / ARP / UDP / TCP, DHCP client
   -> storage: NVMe, AHCI/SATA, USB Mass Storage, RAM-disk, VirtIO-blk —
        5-backend block layer (multi-backend probe) + GPT partition parse
-  -> filesystems: ext2/ext4 (read + write + extent allocation + JBD2 journaling)
-       and FAT12/16/32 + exFAT (read + write)
+  -> filesystems: ext2/ext4 (read + write + extent allocation + JBD2 journaling),
+       FAT12/16/32 + exFAT (read + write), and ZFS (read-only, 1.57.11)
   -> console-font: kashi 1.0.0 freestanding glyph core (vendored via [deps.kashi])
   -> Native xHCI + USB-HID-boot keyboard driver (Phase 1-5)
   -> SMP infrastructure (APIC, IPI, trampoline, per-CPU stacks)
@@ -118,6 +118,7 @@ Common:
 | ext2 / ext4 | **Read + write + extent allocation + JBD2 journaling**. Read: superblock / BGDT / inode, indirect tree + ext4 extents, 64BIT, dir walk + path resolution. Write: create / write / unlink / mkdir / rmdir / rename / ln / symlink / truncate, metadata_csum, `e2fsck -fn`-clean. Extent alloc (1.37.x): depth-0 → depth-1 grow → multi-leaf → depth-2 grow (the full on-demand grow ladder). JBD2 (1.38.x): journal-SB probe, log reader, replay-on-mount, in-memory transaction lifecycle, write path (3-barrier sync-checkpoint), `put_inode` integration. Iron-validated through 1.37.3 on real NVMe NAND (persist + extent-grow across reboot). |
 | JBD2 journaling | New at 1.38.x: when a tx is active, metadata writes route through `ext2_jbd2_log_metadata` → descriptor + data + commit block in the journal log → FLUSH-CACHE barriers between each stage → checkpoint to the FS → SB-clean. Dirty journal at mount triggers replay. Sync-checkpoint model: every commit immediately checkpoints + cleans (no log fill). `jbd2-crash-smoke.sh` validates SIGKILL-at-varied-points → e2fsck-clean on next boot. |
 | FAT12/16/32 | **Read + write**: partition-aware multi-backend mount, FAT-chain traversal, create / content / delete / truncate, LFN, subdirectory paths (1.39.9); `fsck.fat -n`-clean. **Content-write now reaches the syscall ABI** (`VFS_SEC_WFILE` write-fd, 1.41.7) — a userland program can write a FAT volume, not just the in-kernel shell. |
+| ZFS | **Read-only (1.57.11; write is 1.57.12).** OpenZFS pools on any block device: vdev labels + uberblock ring, the `features_for_read` gate, DSL datasets grafted at their mountpoints under `/mnt/zfs` (the `zpool import -R` view), micro/fat ZAP, large dnodes, gang + embedded blocks, SA / pre-SA znodes; fletcher2/4, SHA-256, SHA-512/256; lz4, lzjb, zle, gzip. Disk/file and mirror vdevs. Gated against pools built by real OpenZFS (a FreeBSD 15.1 guest). See ABI §3.6. |
 | exFAT | **Read + write**: allocation bitmap + typed dir-set (SetChecksum / NameHash) + up-case table (Unicode names) + directory growth + subdirectory paths (1.39.9); `fsck.exfat -n`-clean. Content-write reaches the syscall ABI via `VFS_SEC_WFILE` (1.41.7). |
 | FS write safety | ESP-write guard — FAT/exFAT writes refused on the boot ESP partition (firmware territory); data writes go to MSFT-Basic partitions / USB sticks |
 | Console font | **kashi 1.0.0** (vendored at 1.37.5): freestanding VGA 8x16 + CGA 8x8 glyph cores; `fb_console.cyr` consumes via `kashi_glyph_ptr`. The stdlib-using kashi library face (PSF1/PSF2 import, runtime registry) lives in `kashi/src/lib.cyr` and never reaches the kernel. |

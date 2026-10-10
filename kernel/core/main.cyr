@@ -85,7 +85,7 @@ kprintln("", 0);
 # line is what an iron burn's klug/fb transcript shows for the one risk QEMU cannot exercise. Statements,
 # not a `var x = f()` initialiser: a module-scope expression initialiser never runs in kmode.
 bootstack_win_rc = bootstack_window_check(load64(&boot_info_ptr));
-if (bootstack_win_rc == 0) { kprintln("boot: BSP stack span 0x390000-0x3C0000 is free RAM in the UEFI map OK", 69); }
+if (bootstack_win_rc == 0) { kprintln("boot: BSP stack span 0x3D0000-0x400000 is free RAM in the UEFI map OK", 69); }
 if (bootstack_win_rc == 1) {
     kprint("boot: BSP stack window not free RAM in the UEFI map - type 0x", 61);
     kprint_hex(bootstack_win_type);
@@ -1062,6 +1062,13 @@ fatfs_init();
 # on no-exFAT; prints its own "exfat: mounted .." on success. Read only in
 # this bite. See agnosticos/docs/development/exfat-prior-art.md.
 exfat_init();
+
+# Read-only ZFS (1.57.11) — probes every backend (whole disk, then each non-ESP GPT partition of blk_active) for a
+# vdev label, imports the first pool it can read and grafts its datasets the way `zpool import -o readonly=on -R`
+# would. Silent without a label; prints "zfs: pool <name> ..." + one "zfs: mount" line per dataset on success.
+# AFTER cr3_load(0x1000): its 6 MiB reader area is reached through the direct map (the kfont_init rule).
+# See core/zfs.cyr and agnosticos/docs/development/prior-art/zfs-prior-art.md.
+zfs_init();
 
 # Mount-point namespace (1.40.13). Build the {prefix->backend} routing table
 # now that ext2/fat/exfat have each set their *_active flags: ext2 at "/",
@@ -2173,6 +2180,11 @@ if (fatfs_active == 1) {
 # by mkfs.exfat — an independent oracle for the multi-cluster chain-read
 # path. If a file WAS seeded (EXFAT_SEED_FILE on the image), also read it
 # back. exfat-smoke.sh.
+#ifdef ZFS_SELFTEST
+# 1.57.11 — the ZFS oracle walk (core/zfs.cyr zfs_selftest): every grafted directory / symlink / file, each file
+# SHA-256'd through the read#5 path; scripts/smoke/zfs-smoke.sh diffs it against FreeBSD's manifest of the image.
+zfs_selftest();
+#endif
 #ifdef EXFAT_SELFTEST
 if (exfat_active == 1) {
     var ex_lc = exfat_ls();

@@ -247,6 +247,10 @@ else
     #                     the upcase table back over its FAT chain to
     #                     reproduce its TableChecksum (independent oracle,
     #                     no file seeding). Gated by scripts/smoke/exfat-smoke.sh.
+    #   ZFS_SELFTEST=1 — boot-time read-only ZFS walk (1.57.11): every directory,
+    #                     symlink and regular file of the grafted pool, each file
+    #                     SHA-256'd through the read#5 path; diffed against the
+    #                     OpenZFS manifest by scripts/smoke/zfs-smoke.sh.
     #   EXFAT_WRITE_SELFTEST=1 — boot-time exFAT write self-test (1.34.1
     #                     bite 3): create a file by writing its dir-set
     #                     (0x85/0xC0/0xC1 + SetChecksum + NameHash). Gated
@@ -452,6 +456,7 @@ else
         [ -n "$FATFS_WRITE_SELFTEST" ] && echo '#define FATFS_WRITE_SELFTEST'
         [ -n "$EXFAT_SELFTEST" ] && echo '#define EXFAT_SELFTEST'
         [ -n "$EXFAT_WRITE_SELFTEST" ] && echo '#define EXFAT_WRITE_SELFTEST'
+        [ -n "$ZFS_SELFTEST" ] && echo '#define ZFS_SELFTEST'
         [ -n "$FAT_ALLOW_ESP_WRITE" ] && echo '#define FAT_ALLOW_ESP_WRITE'
         [ -n "$DNS_SELFTEST" ]   && echo '#define DNS_SELFTEST'
         [ -n "$ICMP_SELFTEST" ]  && echo '#define ICMP_SELFTEST'

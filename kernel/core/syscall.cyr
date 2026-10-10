@@ -9617,6 +9617,16 @@ fn ksyscall(num, arg1, arg2, arg3) {
             if ((arg3 & 0x3) != 0) { return vfs_sec_wfile_open(be7, roff, rlen); }
             return vfs_open_on(be7, roff, rlen);
         }
+        if (be7 == FS_ZFS) {
+            # 1.57.11 — read-only ZFS (core/zfs.cyr): a VFS_ZFS_FILE fd (streams any size, lseek#58 works) or, with
+            # AO_DIRECTORY, a VFS_ZFS_DIR fd for getdents#29. Any write / create / truncate flag answers -1: nothing
+            # on a ZFS pool is writable until the write path (1.57.12). Never falls through to initrd.
+            var zr7 = zfs_reloff(op_path, op_len);
+            fs_spin_lock();
+            var zfd7 = zfs_open(op_path + zr7, op_len - zr7, arg3);
+            fs_spin_unlock();
+            return zfd7;
+        }
         # bare-name / unmounted fallback (legacy initrd)
         return initrd_open(arg1, arg2);
     }
@@ -9933,6 +9943,15 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg3 < 1) { stack_canary_check(canary); return 0 - 1; }
         if (is_user_range(arg2, arg3) == 0) { stack_canary_check(canary); return 0 - 1; }
         var gbase = vfs_fd_table() + arg1 * 32;
+        if (ktag(gbase) == VFS_ZFS_DIR) {
+            # 1.57.11 — a ZFS directory fd: "." and ".." first, then the ZAP, then any graft mountpoint the parent
+            # dataset holds no directory for (zfs_dir_next). The cursor lives in payload[0].
+            fs_spin_lock();
+            var zgn = zfs_getdents(gbase, arg2, arg3);
+            fs_spin_unlock();
+            stack_canary_check(canary);
+            return zgn;
+        }
         if (ktag(gbase) != VFS_EXT2_DIR) { stack_canary_check(canary); return 0 - 1; }
         var gn = ext2_getdents(kpayload(gbase, 2), kpayload(gbase, 0), arg2, arg3);
         if (gn >= 0) { kpayload_set(gbase, 0, ext2_gd_next); }
@@ -10035,6 +10054,14 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # 1.57.2 — /fonts prefix intercept (core/kfont.cyr), before the mount table; same shape as open#7.
         if (kfont_path_index(arg1, arg2) >= 0) { var kr33 = kfont_stat(arg1, arg2, arg3); stack_canary_check(canary); return kr33; }
         var be33 = vfs_resolve_mount(arg1, arg2);
+        if (be33 == FS_ZFS) {                                       # 1.57.11 — read-only ZFS
+            var zr33 = zfs_reloff(arg1, arg2);
+            fs_spin_lock();
+            var zs33 = zfs_stat(arg1 + zr33, arg2 - zr33, 1, arg3);
+            fs_spin_unlock();
+            stack_canary_check(canary);
+            return zs33;
+        }
         if (be33 != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
         # 1.46.x SMP sub-bite 5: ext2_path_lookup + ext2_fill_stat use the shared ext2 scratch.
         fs_spin_lock();
@@ -10091,7 +10118,16 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var a4rl = ksyscall_a4_get();
         if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
         if (is_user_range(arg3, a4rl) == 0) { stack_canary_check(canary); return 0 - 1; }
-        if (vfs_resolve_mount(arg1, arg2) != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
+        var be70 = vfs_resolve_mount(arg1, arg2);
+        if (be70 == FS_ZFS) {                                       # 1.57.11 — a ZFS symlink's text (SA, spill or data)
+            var zr70 = zfs_reloff(arg1, arg2);
+            fs_spin_lock();
+            var zl70 = zfs_readlink(arg1 + zr70, arg2 - zr70, arg3, a4rl);
+            fs_spin_unlock();
+            stack_canary_check(canary);
+            return zl70;
+        }
+        if (be70 != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
         # 1.46.x SMP sub-bite 5: ext2_path_lookup_ex + ext2_readlink use the shared ext2 scratch.
         fs_spin_lock();
         var rlino = ext2_path_lookup_ex(arg1, arg2, 0);   # NO-FOLLOW the final component
@@ -10317,12 +10353,24 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 79) { stack_canary_check(canary); return blk_info_sys(arg1, arg2); }                          # blk_info(h, out) -> 0
     if (num == 80) { stack_canary_check(canary); return blk_close_sys(arg1); }                               # blk_close(h) -> 0
     # directory listing (#81) — ring-3 readdir over the ext2 root; fills 64-byte {name,type} records.
-    if (num == 81) { stack_canary_check(canary); return ext2_readdir_sys(arg1, arg2, arg3); }                # readdir(path, buf, max) -> count
+    if (num == 81) {                                                                                         # readdir(path, buf, max) -> count
+        var zrd81 = zfs_readdir_sys(arg1, arg2, arg3, 0);           # 1.57.11 — a path on the ZFS mount; -99 = not ZFS
+        stack_canary_check(canary);
+        if (zrd81 != 0 - 99) { return zrd81; }
+        return ext2_readdir_sys(arg1, arg2, arg3);
+    }
     # ⭐ resumable directory listing (#101, 1.56.50) — #81 with a cursor, so a directory larger than
     # the caller's buffer can be read in batches instead of silently truncated at `max`.
     # ⛔ A SEPARATE NUMBER, NOT A 4th ARG ON #81. Existing callers pass three; the 4th register would
     # hold garbage, and this argument is a POINTER the kernel writes through.
-    if (num == 101) { stack_canary_check(canary); return ext2_readdir_at_sys(arg1, arg2, arg3, ksyscall_a4_get()); }  # readdir_at(path, buf, max, &cursor) -> count
+    if (num == 101) {                                                                                        # readdir_at(path, buf, max, &cursor) -> count
+        # 1.57.11 — on the ZFS mount the cursor is OPAQUE (0 starts, -1 exhausted, anything else is what the last
+        # call returned): a ZAP has no byte offsets, so ext2's "byte offset into the directory file" does not exist.
+        var zrd101 = zfs_readdir_sys(arg1, arg2, arg3, ksyscall_a4_get());
+        stack_canary_check(canary);
+        if (zrd101 != 0 - 99) { return zrd101; }
+        return ext2_readdir_at_sys(arg1, arg2, arg3, ksyscall_a4_get());
+    }
     if (num == 102) {
         # lstat(path=arg1, pathlen=arg2, statbuf=arg3) — `stat`(#33) that does NOT follow a final
         # symlink. Same 48-byte struct, same failure shape; the ONLY difference is follow_last=0.
@@ -10358,6 +10406,14 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # symlink, so lstat and stat answer identically for it; before the mount table, as in #33.
         if (kfont_path_index(arg1, arg2) >= 0) { var kr102 = kfont_stat(arg1, arg2, arg3); stack_canary_check(canary); return kr102; }
         var be102 = vfs_resolve_mount(arg1, arg2);
+        if (be102 == FS_ZFS) {                                      # 1.57.11 — ZFS has real symlinks: follow none at the end
+            var zr102 = zfs_reloff(arg1, arg2);
+            fs_spin_lock();
+            var zs102 = zfs_stat(arg1 + zr102, arg2 - zr102, 0, arg3);
+            fs_spin_unlock();
+            stack_canary_check(canary);
+            return zs102;
+        }
         # ⚠ FAT/exFAT cannot represent a symlink, so lstat there would be identical to stat — but #33
         # already returns -1 for them, and quietly succeeding here would be a surface #33 does not have.
         if (be102 != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
@@ -10420,6 +10476,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
             var xroff = arg1 + vfs_mnt_reloff;
             var xrlen = arg2 - vfs_mnt_reloff;
             if (exfat_statfs_path_ok(xroff, xrlen) == 1) { fsr = exfat_fill_statfs(arg3); }
+        }
+        if (be103 == FS_ZFS) {                                      # 1.57.11 — the path must resolve, as on every backend
+            var zr103 = zfs_reloff(arg1, arg2);
+            if (zfs_resolve(arg1 + zr103, arg2 - zr103, 1) >= 0) { fsr = zfs_fill_statfs(arg3); }
         }
         fs_spin_unlock();
         stack_canary_check(canary);
@@ -11754,7 +11814,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg3 < 0) { stack_canary_check(canary); return 0 - 1; }
         if (arg3 > 2) { stack_canary_check(canary); return 0 - 1; }
         var lk_base = vfs_fd_table() + arg1 * 32;
-        if (ktag(lk_base) != VFS_EXT2_FILE) { stack_canary_check(canary); return 0 - 1; }
+        # 1.57.11 — a VFS_ZFS_FILE carries the same pos/size payload, so it seeks the same way (read-only: no write
+        # past the end can follow).
+        if (ktag(lk_base) != VFS_EXT2_FILE && ktag(lk_base) != VFS_ZFS_FILE) { stack_canary_check(canary); return 0 - 1; }
         var lk_new = arg2;                                          # SEEK_SET (whence 0)
         if (arg3 == 1) { lk_new = kpayload(lk_base, 0) + arg2; }    # SEEK_CUR
         if (arg3 == 2) { lk_new = kpayload(lk_base, 1) + arg2; }    # SEEK_END

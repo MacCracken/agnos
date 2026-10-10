@@ -434,17 +434,19 @@ sh "$ROOT/scripts/build.sh" >/dev/null 2>&1
 # (stage-agnsh.sh + stage-tools.sh, never --build) and leaves a present rootfs as it stands.
 ( . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"; smoke_stage_rootfs "$ROOT" ) \
     || echo "  ⚠ build/rootfs could not be staged (build/stage-rootfs.log) — the rows that read it will name what is missing"
-# ⭐ 1.57.10 — KNOWN RED BY DESIGN: the syscall ABI gate stays red until the cyrius SysNrAgnos peer carries the kernel's
-# newest numbers (#106-#108 at 1.57.10). The signature is that gate's two FAIL lines, and nothing else: any OTHER red
-# gate inside check.sh is a new failure and gets the normal treatment.
-run_gate "baseline check.sh (build/test/version/size)" "" "CHECK" "" \
-    "by design: the syscall ABI gate is red until cyrius's SysNrAgnos peer carries the kernel's newest numbers" \
-    'syscall ABI \(kernel/doc/cyrius agree\)|syscall\(s\) the kernel implements are absent from cyrius'
+# 1.57.11: the KNOWN RED mark this row carried at 1.57.10 (the syscall ABI gate, red until cyrius's SysNrAgnos peer
+# carried #106-#108) is gone — the peer landed (cyrius 6.7.6 lib/syscalls_x86_64_agnos.cyr) and the 1.57.11 sweep
+# flagged the mark stale. Any red inside check.sh is now a real red.
+run_gate "baseline check.sh (build/test/version/size)" "" "CHECK"
 
 # --- 1.39.x VFS generic-write lift: FAT + exFAT read & write verb smokes ---
 run_gate "1.39.x FAT read (cat/ls reach FAT)"       "FATFS_SELFTEST=1"                         "fat-smoke.sh"
 run_gate "1.39.x FAT write (touch/echo/rm/mkdir/mv + subdir)" "FATFS_WRITE_SELFTEST=1 FAT_ALLOW_ESP_WRITE=1" "fat-write-smoke.sh"
 run_gate "1.39.x exFAT read"                         "EXFAT_SELFTEST=1"                         "exfat-smoke.sh"
+# ⭐ 1.57.11 — read-only ZFS. Both rows need the OpenZFS fixture (scripts/tool/zfs-fixture.sh — a FreeBSD 15.1 guest
+# under KVM builds the pools once; cached in ~/.cache/agnos/zfs-fixtures, keyed on the recipe + the zfsx payload).
+run_gate "1.57.11 ZFS read: seven OpenZFS-built pools, every file SHA-256 vs the manifest (+ raidz refused)" "ZFS_SELFTEST=1" "zfs-smoke.sh"
+run_gate "1.57.11 ZFS ring 3: zfsx exec'd from the pool (open/read/lseek/stat/getdents/readdir_at/statfs/mountlist; writes refused)" "" "zfs-ring3-smoke.sh"
 # 1.57.2 — the ONLY gate that presents a MULTI-NODE FAT chain cycle (A -> B -> A, both in range):
 # fat-smoke / exfat-smoke prove GOOD chains read, and nothing else in the tree ever hands the kernel
 # a chain that never ends. One kernel carries both selftests and one disk carries both cycles (a
@@ -506,8 +508,8 @@ run_gate "1.57.2 kernel-embedded face (/fonts/default.ttf, rekha)" ""           
 # ap_entry) against [DIRECTMAP_BASE + 0xFC0000, +0x40000) and re-hashes the rekha chunk literals IN
 # PLACE after the wake (the load-bearing oracle — a stack anywhere in the image scribbles there on every
 # tick, invisible to every -smp 1 gate). Mutation-proven: the old placement trips both. Builds its own
-# kernel, so it needs no buildenv here; the image-side bound (LOAD end <= 0x390000 since 1.57.7 moved the
-# BSP boot stack top 0x380000 -> 0x3A0000; 0x370000 before) is check.sh gate 34 for the plain image and
+# kernel, so it needs no buildenv here; the image-side bound (LOAD end <= 0x3D0000 since 1.57.11 moved the
+# BSP boot stack top 0x3A0000 -> 0x3E0000; 0x390000 from 1.57.7, 0x370000 before) is check.sh gate 34 for the plain image and
 # scripts/build.sh's flag-build guard for every buildenv row here (an over-bound flag image is a BUILD FAILED).
 run_gate "1.57.3 AP stacks in region 7 (-smp 4, rodata intact after wake)" ""                     "ap-stack-smoke.sh"
 # 1.57.6 — the microsecond clock ring 3 uses (uptime_us#95). tsc-smoke existed since 1.56.18 and NO row ran

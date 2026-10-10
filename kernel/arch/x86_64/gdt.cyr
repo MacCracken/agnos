@@ -42,7 +42,7 @@ fn gdt_init() {
 # === Per-CPU TSS (Task State Segment) ===
 # 4 TSS structures, 104 bytes each (RSP0 at offset 4, IOPB at offset 100).
 # Each CPU gets its own TSS with its own RSP0 (kernel stack).
-#   CPU 0 (BSP): RSP0 = 0x3C0000  (was 0x200000 — relocated, see note below)
+#   CPU 0 (BSP): RSP0 = 0x400000  (0x3C0000 until 1.57.11; 0x200000 before 1.44.x — see note below)
 #   CPU 1:       RSP0 = DIRECTMAP_BASE + 0xFE0000   (1.57.3 — region 7 via the direct map;
 #   CPU 2:       RSP0 = DIRECTMAP_BASE + 0xFF0000    was 0x320000/0x330000/0x340000 in region 1,
 #   CPU 3:       RSP0 = DIRECTMAP_BASE + 0x1000000   see the resolution note below)
@@ -62,14 +62,16 @@ var tss_array[416];  # 4 CPUs x 104 bytes each
 # VAs (0x3D0000/0x3F0000, region-7 direct-map since 1.51.x), and in PD[1] (mirrored
 # identity-supervisor-writable into every per-proc CR3) — the reserved-region-1 placement the
 # syscall kstack used to share. Since 1.57.3 it is the image's ONLY region-1 neighbour besides
-# the BSP boot stack (top 0x3A0000 since 1.57.7, boot_shim.cyr): the invariant is LOAD end <=
-# 0x390000 (that stack's 64 KB budget), enforced by scripts/check/image-layout-check.sh (check.sh
-# gate 34; scripts/build.sh on every flag build). REGION-1 MAP above the image (1.57.7):
-#   [LOAD end, 0x390000)   image headroom (190,312 B at 1.57.7's first cut)
-#   [0x390000, 0x3A0000)   BSP boot stack, 64 KB, grows down from 0x3A0000 (0x380000 until 1.57.7 —
-#                          moved up by the IMG step to give the image 128 KB; the plan had 4 B spare)
-#   [0x3A0000, 0x3B0000)   UNUSED guard gap — nothing references it; keep it empty
-#   [0x3B0000, 0x3C0000)   BSP TSS.RSP0 (this line's 0x3C0000 top)
+# the BSP boot stack (top 0x3E0000 since 1.57.11, boot_shim.cyr): the invariant is LOAD end <=
+# 0x3D0000 (that stack's 64 KB budget), enforced by scripts/check/image-layout-check.sh (check.sh
+# gate 34; scripts/build.sh on every flag build). REGION-1 MAP above the image (1.57.11):
+#   [LOAD end, 0x3D0000)   image headroom
+#   [0x3D0000, 0x3E0000)   BSP boot stack, 64 KB, grows down from 0x3E0000 (0x3A0000 1.57.7-1.57.10,
+#                          0x380000 before — each move up was for image growth; 1.57.11's for the ZFS reader)
+#   [0x3E0000, 0x3F0000)   UNUSED guard gap — nothing references it; keep it empty
+#   [0x3F0000, 0x400000)   BSP TSS.RSP0 (this line's 0x400000 top = the top of region 1; 0x3C0000 until 1.57.11)
+# ⚠ 1.57.11: everything [0x3C0000, 0x400000) was audited before the move — every reference was a stale
+# comment (the 0x3D0000/0x3F0000 syscall kstacks left region 1 for region 7 at 1.46.x/1.51.x).
 # ⭐ 1.57.3 — THE AP STACKS LEFT REGION 1 FOR REGION 7 (resolution of
 # docs/development/issues/archived/2026-09-13-ap-stacks-inside-kernel-rodata.md). WHAT MOVED: the CPU 1-3
 # boot stack (smp.cyr trampoline) AND TSS.RSP0 (tss_get_cpu_stack below — the same window, as
@@ -94,7 +96,7 @@ var tss_array[416];  # 4 CPUs x 104 bytes each
 # is live), so it takes the same rule: DIRECTMAP_BASE + phys, which every per-proc CR3 mirrors
 # (PDPT[8..511]) and no segment ever overrides. The trampoline computes the identical VA
 # (`add eax, 0xFD0000` then `add rax, DIRECTMAP_BASE`), so boot stack and RSP0 stay one window.
-# The BSP is untouched: its RSP0 stays at 0x3C0000 and its boot stack (top 0x3A0000 since 1.57.7) stays in
+# The BSP is untouched: its RSP0 stays at 0x400000 and its boot stack (top 0x3E0000 since 1.57.11) stays in
 # region 1, because that stack is LIVE FROM THE SHIM'S FIRST INSTRUCTION under gnoboot's CR3 —
 # UEFI's identity map — before any kernel page table exists: the direct map (the only VA this rule
 # allows for a region-7 stack) is built by pmm_setup_directmap and becomes live at cr3_load(0x1000)
@@ -105,10 +107,10 @@ var tss_array[416];  # 4 CPUs x 104 bytes each
 # own path: its hand-built page tables map only 0-4 MB — boot_shim.cyr step 4 — but the production
 # ELF64 shim builds no page tables at all, so "0-4 MB" is NOT the reason there.)
 # Region 7's map is at IST1 below (1.57.6: rewritten for Path 2's per-process kernel stacks).
-var tss_kernel_stack = 0x3C0000;
+var tss_kernel_stack = 0x400000;
 
 fn tss_get_cpu_stack(cpu_id) {
-    if (cpu_id == 0) { return 0x3C0000; }   # BSP — relocated out of live .bss (see tss_kernel_stack note)
+    if (cpu_id == 0) { return 0x400000; }   # BSP — relocated out of live .bss (see tss_kernel_stack note)
     return DIRECTMAP_BASE + 0xFD0000 + cpu_id * 0x10000;   # 1.57.3 — region-7 window via the direct map; the SAME VA the trampoline set as this AP's boot stack, so boot stack and RSP0 remain one window
 }
 
@@ -155,7 +157,7 @@ fn tss_init_cpu(cpu_id) {
     #                       future NMI / #MC IST, the natural next per-CPU stack.
     #   0xFC0000-0x1000000  AP boot/TSS stacks — tops 0xFD0000 + cpu*0x10000 for cpu 1-3
     #                       (tss_get_cpu_stack + smp.cyr's trampoline); slot 0 [0xFC0000, 0xFD0000)
-    #                       is UNUSED — the BSP keeps its region-1 stacks (0x3A0000 / 0x3C0000).
+    #                       is UNUSED — the BSP keeps its region-1 stacks (0x3E0000 / 0x400000).
     # 2 MB = 32 x 64 KB = 16 + 4 + 4 + 4 + 4. One 256 KB range is free again; beyond it, a new stack needs
     # a new reserved region and its own map, not a squeeze into this one.
     store64(tss_addr + 36, DIRECTMAP_BASE + 0xF50000 + cpu_id * 0x10000);   # 0x24 = IST1

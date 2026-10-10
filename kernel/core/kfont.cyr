@@ -21,7 +21,7 @@
 # names — -1 for both, so nothing here answers as a directory.
 #
 # ⛔ NOT A MOUNT, ON PURPOSE. vfs_mount_init / FsBackend are untouched and /fonts never appears
-# in mountlist#104: tests/mountlist/mlist.cyr:33 refuses backend ids > 3, and crab's VOLUMES
+# in mountlist#104 (it lists real volumes: ext2/FAT/exFAT, and ZFS = 4 since 1.57.11), and crab's VOLUMES
 # sidebar consumes that table with a capacity bar per row — a font namespace is not a volume,
 # and giving it a backend id would put a phantom disk in every client's sidebar. It is a PREFIX
 # INTERCEPT in the syscall arms instead: open#7 / stat#33 / lstat#102 ask kfont_path_index()
