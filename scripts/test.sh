@@ -173,8 +173,8 @@ exit(0)
     # copy then carried its own number and subtraction "in lockstep" with check.sh — and had drifted: its
     # unreadable-face path set FACE=0 and passed only because the raw size exceeded the grant. The number,
     # the face subtraction and the derivation now live ONLY in scripts/check/weighed-size-check.sh (read
-    # its header): GRANT 0x220000 = 2,228,224 B, placed above the weighed size at which the plain image
-    # hits the image-layout wall (LOAD end 0x390000, 2,210,972 B at 1.57.8), so the layout gate binds
+    # its header): GRANT 0x260000 = 2,490,368 B (0x220000 until 1.57.11), placed above the weighed size at which the plain image
+    # hits the image-layout wall (LOAD end 0x3D0000, 2,473,116 B since 1.57.11; 0x390000 / 2,210,972 B before), so the layout gate binds
     # first; the helper fails closed on an unreadable face and on a wall that has risen to the grant.
     # Operator ruling: this row "is NOT A HARD LIMIT — it can be expanded" — but only by re-deriving it.
     # ⛔ 1.57.9 ENDFIX SG-1: for GROWTH it is REPORT-ONLY (GRANT > WALL, so a weight at the grant is past the

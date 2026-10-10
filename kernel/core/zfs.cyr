@@ -1,0 +1,2013 @@
+# === ZFS (read-only) — agnos 1.57.11 ===
+# Reads OpenZFS pools: vdev labels -> best uberblock -> MOS -> DSL -> every dataset that would mount is grafted
+# under the mount point the way `zpool import -o readonly=on -R /mnt/zfs <pool>` + `zfs mount -a` shows it ->
+# ZPL directories, files and symlinks. NOTHING IS EVER WRITTEN: write is 1.57.12 (operator ruling 2026-10-09).
+# Every layout, every source and every place this departs from the reference readers (FreeBSD's loader, GRUB/
+# U-Boot) is in agnosticos/docs/development/prior-art/zfs-prior-art.md — the § numbers below point there.
+# Checksums + decompression are core/zfs_codec.cyr (host-proven: scripts/check/host-zfs-oracles.sh).
+#
+# ⛔ NO LARGE .bss. The kernel image has ~97 KB under the 0x390000 wall (scripts/check/image-layout-check.sh),
+# and .bss is inside the LOAD segment. Every buffer here lives in one 6 MiB direct-mapped area (zfs_mem,
+# layout ZfsR) that is allocated only once a probe has found a ZFS label — a box without ZFS pays nothing.
+# ⛔ ONE WALKER AT A TIME. Every entry point is reached under fs_spin_lock (the vfs.cyr / syscall.cyr arms take
+# it), which is what makes the module scratch below safe — the FAT/exFAT/ext2 rule.
+# ⚠ Scope (§ 10): single-device pools (a disk/file top-level vdev, or any one side of a mirror); little-endian;
+# raidz/dRAID/indirect and >1 top-level vdev are refused at import; zstd / skein / edonr / blake3 / encrypted
+# blocks fail their read by name; the ZIL is not replayed (the last committed txg is what you see).
+
+enum ZfsK {
+    ZK_LABEL     = 0x40000;              # one vdev label, 256 KiB (§ 1)
+    ZK_NVOFF     = 0x4000;               # the XDR nvlist at label +16 KiB
+    ZK_NVSIZE    = 0x1C000;              # 112 KiB, incl. the 40-byte eck at its end
+    ZK_UBOFF     = 0x20000;              # the uberblock ring at label +128 KiB
+    ZK_UBRING    = 0x20000;              # 128 KiB
+    ZK_DATA0     = 0x400000;             # VDEV_LABEL_START_SIZE: DVA offset 0 is device byte 4 MiB (§ 1)
+    ZK_ECKMAGIC  = 0x0210DA7AB10C7A11;   # zio_eck_t.zec_magic
+    ZK_UBMAGIC   = 0x00BAB10C;
+    ZK_UBMAGIC_X = 0x0CB1BA0000000000;   # the same, written by a big-endian host
+    ZK_ZAPMAGIC  = 0x2F52AB2AB;
+    ZK_LEAFMAGIC = 0x2AB1EAF;
+    ZK_SAMAGIC   = 0x2F505A;
+    ZK_RAWMAX    = 0x100000;             # psize window (ZR_RAW)
+    ZK_DATAMAX   = 0x100000;             # data-block lsize window (ZR_DATA)
+    ZK_METAMAX   = 0x20000;              # metadata-block lsize window (one cache slot)
+    ZK_MASK48    = 0xFFFFFFFFFFFF;       # object numbers are 48 bits (DN_MAX_OBJECT_SHIFT)
+    ZK_MAXDS     = 32;                   # dataset slots
+    ZK_MAXGR     = 64;                   # graft + virtual-dir entries
+    ZK_XPHASE    = 0x1000000000000000;   # directory cursor: extras (grafts / virtual dirs) phase
+}
+
+enum ZfsR {
+    ZR_RAW  = 0x000000;    # 1 MiB  raw (compressed) block bytes
+    ZR_DATA = 0x100000;    # 1 MiB  the last decompressed DATA block (key: slot 16 of ZR_MCK)
+    ZR_MC   = 0x200000;    # 2 MiB  metadata cache, 16 x 128 KiB (keys: slots 0..15 of ZR_MCK)
+    ZR_LBL  = 0x400000;    # 128 KiB the chosen label nvlist
+    ZR_UB   = 0x420000;    # 1 KiB  the chosen uberblock
+    ZR_GANG = 0x421000;    # 2 x 64 KiB gang headers (nesting depth 0, 1)
+    ZR_ZERO = 0x441000;    # 128 KiB of zeros — never written after init (holes in metadata)
+    ZR_DN   = 0x461000;    # 6 x 16 KiB dnode slots (a full large dnode)
+    ZR_OS   = 0x479000;    # 4 KiB  objset_phys read buffer
+    ZR_MOS  = 0x47A000;    # 1 KiB  the MOS meta-dnode
+    ZR_NAME = 0x47A400;    # 1 KiB  zfs_it_name (ZAP iteration), NUL-terminated
+    ZR_POOL = 0x47A800;    # 512 B  pool name
+    ZR_LAY  = 0x47AA00;    # 1 KiB  the cached SA layout, u16 x 512
+    ZR_MCK  = 0x47B000;    # 17 x 160 B cache keys: [0,128) BP, +128 lsize, +136 age, +144 valid
+    ZR_DS   = 0x47C000;    # 32 x 1 KiB dataset slots (layout: zfs_ds_open)
+    ZR_GR   = 0x484000;    # 64 x 512 B graft / virtual-dir entries (layout: zfs_gr_add)
+    ZR_P0   = 0x48C000;    # 4 KiB  resolver: remaining path
+    ZR_P1   = 0x48D000;    # 4 KiB  resolver: splice scratch
+    ZR_PC   = 0x48E000;    # 4 KiB  resolver: canonical path so far
+    ZR_STK  = 0x48F000;    # 2 KiB  resolver: ref stack (128) + canonical-length stack (128)
+    ZR_DSL  = 0x490000;    # 16 depths x 2 KiB DSL-walk dnodes (dsl_dir + its ZAP)
+    ZR_MP   = 0x498000;    # 16 depths x 256 B effective mountpoints
+    ZR_DNM  = 0x499000;    # 16 depths x 256 B dataset full names
+    ZR_CNM  = 0x49A000;    # 16 depths x 256 B child-dir names
+    ZR_WALK = 0x49B000;    # 4 KiB  selftest walker path
+    ZR_WBUF = 0x4A0000;    # 64 KiB selftest read buffer
+    ZR_BNC  = 0x4B0000;    # 4 KiB  bounce for an unaligned device read
+    ZR_END  = 0x4B1000;
+}
+
+enum ZfsWhy {
+    ZW_IO = 1; ZW_CKSUM = 2; ZW_CKALG = 3; ZW_ZSTD = 4; ZW_COMP = 5; ZW_BIG = 6; ZW_CRYPT = 7; ZW_BIGEND = 8;
+    ZW_VDEV = 9; ZW_GANG = 10; ZW_EMB = 11; ZW_CORRUPT = 12; ZW_NOTFS = 13; ZW_RECV = 14; ZW_FULL = 15;
+}
+
+var zfs_active = 0;
+var zfs_backend = 0;           # BLK_* tag the pool was found on
+var zfs_part_lba = 0;          # partition base LBA (0 = whole disk)
+var zfs_dev_bytes = 0;         # device size in bytes, rounded down to 256 KiB (0 = unknown: front labels only)
+var zfs_lbsz = 512;            # that backend's LBA size
+var zfs_mem = 0;               # direct-map VA of the 6 MiB area (0 = never allocated)
+var zfs_mem_phys = 0;
+var zfs_ashift = 9;
+var zfs_top_id = 0;            # top-level vdev id — every DVA we can read names it
+var zfs_leaf_guid = 0;
+var zfs_txg = 0;
+var zfs_asize = 0;             # top-level allocatable size (statfs)
+var zfs_used = 0;              # root dsl_dir dd_used_bytes (statfs)
+var zfs_bootfs = 0;            # pool_props bootfs dataset object (grafted even when canmount=noauto)
+var zfs_nds = 0;               # dataset slots used
+var zfs_ngr = 0;               # graft + virtual-dir entries used
+var zfs_mc_tick = 0;
+var zfs_gang_depth = 0;
+var zfs_why = 0;               # ZfsWhy of the last failure — printed by whoever gives up
+var zfs_why_arg = 0;
+var zfs_nv_n = 0;              # nelem of the last zfs_nv_find hit
+var zfs_nv_ok = 0;
+var zfs_q_name = 0;            # ZAP query (zfs_zap_lookup -> leaf helpers): name, length, case-fold,
+var zfs_q_nlen = 0;            # output integer size, capacity (integers), output buffer
+var zfs_q_ci = 0;
+var zfs_q_isz = 0;
+var zfs_q_maxn = 0;
+var zfs_q_out = 0;
+var zfs_it_nlen = 0;           # ZAP iteration result: name length (name at ZR_NAME), first value bytes,
+var zfs_it_val = 0;            # value int length
+var zfs_it_vil = 0;
+var zfs_lay_ds = 0;            # cached SA layout key: dataset slot + 1, layout number
+var zfs_lay_num = 0;
+var zfs_lay_n = 0;
+var zfs_res_type = 0;          # zfs_resolve result: 1 file, 2 dir, 3 symlink, 0 other
+var zfs_de_type = 0;           # zfs_dir_next result type (same codes), inode
+var zfs_de_ino = 0;
+
+# --- small helpers -------------------------------------------------------------------------------------------------
+fn zfs_be32(p) { return (load8(p) << 24) | (load8(p + 1) << 16) | (load8(p + 2) << 8) | load8(p + 3); }
+fn zfs_be64(p) { return (zfs_be32(p) << 32) | zfs_be32(p + 4); }
+fn zfs_shr(x, n) { if (n >= 64) { return 0; } return x >> n; }
+fn zfs_log2(v) { var s = 0; while (s < 63 && (1 << s) < v) { s = s + 1; } return s; }
+fn zfs_ds(i) { return zfs_mem + ZR_DS + i * 1024; }
+fn zfs_dnslot(i) { return zfs_mem + ZR_DN + i * 0x4000; }
+fn zfs_bonus(dn) { return dn + 64 + load8(dn + 3) * 128; }
+# Literal compare: n/l against the NUL-terminated literal s (its length taken at run time — no hand counts).
+fn zfs_is(n, l, s) { if (strlen(s) != l) { return 0; } return memeq(n, s, l); }
+fn zfs_up(c) { if (c >= 97 && c <= 122) { return c - 32; } return c; }
+fn zfs_ceq(a, b, ci) { if (a == b) { return 1; } if (ci != 0) { if (zfs_up(a) == zfs_up(b)) { return 1; } } return 0; }
+
+# The reason for zfs_why, as a NUL-terminated literal (callers take strlen — no hand-counted lengths); the two
+# reasons that name a number (checksum / compression id) are followed by zfs_why_arg.
+fn zfs_why_msg() {
+    var w = zfs_why;
+    if (w == ZW_IO) { return "device read failed"; }
+    if (w == ZW_CKSUM) { return "checksum mismatch on every copy"; }
+    if (w == ZW_CKALG) { return "unsupported checksum algorithm "; }
+    if (w == ZW_ZSTD) { return "zstd block unsupported"; }
+    if (w == ZW_COMP) { return "bad or unsupported compression "; }
+    if (w == ZW_BIG) { return "block larger than the read window"; }
+    if (w == ZW_CRYPT) { return "encrypted (no keys)"; }
+    if (w == ZW_BIGEND) { return "big-endian pool unsupported"; }
+    if (w == ZW_VDEV) { return "block on another top-level vdev"; }
+    if (w == ZW_GANG) { return "bad gang block"; }
+    if (w == ZW_EMB) { return "unsupported embedded block type"; }
+    if (w == ZW_NOTFS) { return "not a filesystem"; }
+    if (w == ZW_RECV) { return "incomplete receive"; }
+    if (w == ZW_FULL) { return "too many datasets"; }
+    return "corrupt structure";
+}
+fn zfs_why_print() {
+    var m = zfs_why_msg();
+    kprint(m, strlen(m));
+    if (zfs_why == ZW_CKALG || zfs_why == ZW_COMP) { kprint_num(zfs_why_arg); }
+    kprintln("", 0);
+    return 0;
+}
+
+# --- device I/O ----------------------------------------------------------------------------------------------------
+# Read [off, off+len) of the pool device (partition-relative bytes) into dst. 0 / -1.
+fn zfs_rd(off, len, dst) {
+    if (len <= 0 || off < 0) { return 0 - 1; }
+    if (zfs_dev_bytes > 0) { if (off + len > zfs_dev_bytes) { return 0 - 1; } }
+    var lb = zfs_lbsz;
+    if ((off % lb) == 0 && (len % lb) == 0) {
+        var lba = zfs_part_lba + off / lb;
+        var n = len / lb;
+        var per = 4096 / lb;                     # one <= 4 KiB command at a time (NVMe's single-command size)
+        var i = 0;
+        while (i < n) {
+            var c = n - i;
+            if (c > per) { c = per; }
+            if (blk_read_sectors_on(zfs_backend, lba + i, c, dst + i * lb) != 0) { return 0 - 1; }
+            i = i + c;
+        }
+        return 0;
+    }
+    # ⚠ Unaligned only on a 4Kn device carrying an ashift-9 pool: bounce one LBA at a time.
+    var bnc = zfs_mem + ZR_BNC;
+    var done = 0;
+    while (done < len) {
+        var o = off + done;
+        var s = o / lb;
+        var so = o - s * lb;
+        var c2 = lb - so;
+        if (c2 > len - done) { c2 = len - done; }
+        if (blk_read_sectors_on(zfs_backend, zfs_part_lba + s, 1, bnc) != 0) { return 0 - 1; }
+        memcpy(dst + done, bnc + so, c2);
+        done = done + c2;
+    }
+    return 0;
+}
+
+# --- XDR nvlist (§ 1.2) --------------------------------------------------------------------------------------------
+# Value address of the pair named key (a NUL-terminated literal) of type typ in the nvlist whose FIRST PAIR is at
+# p, bounded by end; 0 when absent. zfs_nv_n = the pair's nelem.
+fn zfs_nv_find(p, end, key, typ) {
+    var kl = strlen(key);
+    var guard = 0;
+    while (p + 8 <= end && guard < 4096) {
+        var es = zfs_be32(p);
+        if (es == 0) { return 0; }
+        if (es < 20 || p + es > end) { return 0; }
+        var nl = zfs_be32(p + 8);
+        var np = (nl + 3) & (0 - 4);
+        if (nl > es || 20 + np > es) { return 0; }
+        if (nl == kl && zfs_be32(p + 12 + np) == typ && memeq(p + 12, key, kl) == 1) {
+            zfs_nv_n = zfs_be32(p + 16 + np);
+            return p + 20 + np;
+        }
+        p = p + es;
+        guard = guard + 1;
+    }
+    return 0;
+}
+fn zfs_nv_u64(p, end, key) {
+    var v = zfs_nv_find(p, end, key, 8);
+    zfs_nv_ok = 0;
+    if (v == 0 || v + 8 > end) { return 0; }
+    zfs_nv_ok = 1;
+    return zfs_be64(v);
+}
+# Address just past an embedded nvlist (v = its version word); 0 on overrun.
+fn zfs_nv_skip(v, end) {
+    var p = v + 8;
+    var guard = 0;
+    while (p + 8 <= end && guard < 4096) {
+        var es = zfs_be32(p);
+        if (es == 0) { return p + 8; }
+        if (es < 20 || p + es > end) { return 0; }
+        p = p + es;
+        guard = guard + 1;
+    }
+    return 0;
+}
+
+# --- the feature gate (§ 9) ----------------------------------------------------------------------------------------
+# 1 = understood; 2 = import, but refuse the blocks/datasets that use it by name; 0 = refuse the pool.
+fn zfs_feat_class(n, l) {
+    if (zfs_is(n, l, "org.illumos:lz4_compress") == 1) { return 1; }
+    if (zfs_is(n, l, "com.delphix:hole_birth") == 1) { return 1; }
+    if (zfs_is(n, l, "com.delphix:extensible_dataset") == 1) { return 1; }
+    if (zfs_is(n, l, "com.delphix:embedded_data") == 1) { return 1; }
+    if (zfs_is(n, l, "org.open-zfs:large_blocks") == 1) { return 1; }
+    if (zfs_is(n, l, "org.zfsonlinux:large_dnode") == 1) { return 1; }
+    if (zfs_is(n, l, "org.illumos:sha512") == 1) { return 1; }
+    if (zfs_is(n, l, "com.klarasystems:dynamic_gang_header") == 1) { return 1; }
+    if (zfs_is(n, l, "com.klarasystems:vdev_zaps_v2") == 1) { return 1; }
+    if (zfs_is(n, l, "com.joyent:multi_vdev_crash_dump") == 1) { return 1; }
+    if (zfs_is(n, l, "com.datto:bookmark_v2") == 1) { return 1; }
+    if (zfs_is(n, l, "com.delphix:bookmark_written") == 1) { return 1; }
+    if (zfs_is(n, l, "com.delphix:redaction_bookmarks") == 1) { return 1; }
+    if (zfs_is(n, l, "com.delphix:head_errlog") == 1) { return 1; }
+    if (zfs_is(n, l, "org.zfsonlinux:longname") == 1) { return 1; }
+    if (zfs_is(n, l, "com.datto:encryption") == 1) { return 2; }
+    if (zfs_is(n, l, "org.freebsd:zstd_compress") == 1) { return 2; }
+    if (zfs_is(n, l, "org.illumos:skein") == 1) { return 2; }
+    if (zfs_is(n, l, "org.illumos:edonr") == 1) { return 2; }
+    if (zfs_is(n, l, "org.openzfs:blake3") == 1) { return 2; }
+    if (zfs_is(n, l, "com.delphix:redacted_datasets") == 1) { return 2; }
+    return 0;
+}
+fn zfs_feat_refuse(n, l) {
+    kprint("zfs: pool needs feature ", 24);
+    kprint(n, l);
+    kprintln(" - not supported, pool refused", 30);
+    return 0 - 1;
+}
+
+# --- labels and the uberblock (§ 1) --------------------------------------------------------------------------------
+fn zfs_label_off(l) {
+    if (l < 2) { return l * ZK_LABEL; }
+    return zfs_dev_bytes - (4 - l) * ZK_LABEL;
+}
+# Embedded-checksum verify (§ 1.1): SHA-256 of the whole block with the eck words replaced by the verifier.
+fn zfs_eck_ok(buf, len, v0, v1, v2) {
+    var e = buf + len - 40;
+    if (load64(e) != ZK_ECKMAGIC) { return 0; }
+    var sv[32];
+    var got[32];
+    memcpy(&sv, e + 8, 32);
+    store64(e + 8, v0);
+    store64(e + 16, v1);
+    store64(e + 24, v2);
+    store64(e + 32, 0);
+    zfs_sha256_words(buf, len, &got);
+    memcpy(e + 8, &sv, 32);
+    return memeq(&got, &sv, 32);
+}
+# Every label's nvlist that verifies; keep the highest txg's in ZR_LBL. 0 / -1.
+fn zfs_label_load() {
+    var tmp = zfs_mem + ZR_RAW;
+    var nl = 4;
+    if (zfs_dev_bytes == 0) { nl = 2; }
+    var best = 0 - 1;
+    var bt = 0;
+    var l = 0;
+    while (l < nl) {
+        var off = zfs_label_off(l) + ZK_NVOFF;
+        if (zfs_rd(off, ZK_NVSIZE, tmp) == 0) {
+            if (zfs_eck_ok(tmp, ZK_NVSIZE, off, 0, 0) == 1 && load8(tmp) == 1 && zfs_be32(tmp + 4) == 0) {
+                var t = zfs_nv_u64(tmp + 12, tmp + ZK_NVSIZE - 40, "txg");
+                if (zfs_nv_ok == 1 && (best < 0 || t > bt)) {
+                    best = l;
+                    bt = t;
+                    memcpy(zfs_mem + ZR_LBL, tmp, ZK_NVSIZE);
+                }
+            }
+        }
+        l = l + 1;
+    }
+    if (best < 0) { kprintln("zfs: no label verifies", 22); return 0 - 1; }
+    return 0;
+}
+
+# Our leaf must sit under a disk/file top level, or under mirror-like nodes only. 1 found, 0 not here, -1 refused.
+fn zfs_vtree(p, end, depth) {
+    if (depth > 4) { return 0 - 1; }
+    var ty = zfs_nv_find(p, end, "type", 9);
+    if (ty == 0) { return 0 - 1; }
+    var tl = zfs_be32(ty);
+    var ts = ty + 4;
+    if (zfs_is(ts, tl, "disk") == 1 || zfs_is(ts, tl, "file") == 1) {
+        if (zfs_nv_u64(p, end, "guid") == zfs_leaf_guid) { return 1; }
+        return 0;
+    }
+    if (zfs_is(ts, tl, "mirror") == 0 && zfs_is(ts, tl, "replacing") == 0 && zfs_is(ts, tl, "spare") == 0) {
+        kprint("zfs: vdev type ", 15);
+        kprint(ts, tl);
+        kprintln(" unsupported (single-device or mirror pools only)", 49);
+        return 0 - 1;
+    }
+    var ch = zfs_nv_find(p, end, "children", 20);
+    if (ch == 0) { return 0; }
+    var n = zfs_nv_n;
+    var i = 0;
+    while (i < n) {
+        if (ch == 0) { return 0 - 1; }
+        var r = zfs_vtree(ch + 8, end, depth + 1);
+        if (r != 0) { return r; }
+        ch = zfs_nv_skip(ch, end);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Validate the chosen label's config (§ 1.2, § 9). 0 / -1.
+fn zfs_config() {
+    var p = zfs_mem + ZR_LBL + 12;
+    var end = zfs_mem + ZR_LBL + ZK_NVSIZE - 40;
+    var ver = zfs_nv_u64(p, end, "version");
+    if (zfs_nv_ok == 0 || ver < 1 || (ver > 28 && ver != 5000)) { kprintln("zfs: unsupported pool version", 29); return 0 - 1; }
+    if (zfs_nv_u64(p, end, "state") == 2) { kprintln("zfs: pool is destroyed", 22); return 0 - 1; }
+    var nm = zfs_nv_find(p, end, "name", 9);
+    if (nm == 0) { return 0 - 1; }
+    var nml = zfs_be32(nm);
+    if (nml < 1 || nml > 255) { return 0 - 1; }
+    memcpy(zfs_mem + ZR_POOL, nm + 4, nml);
+    store8(zfs_mem + ZR_POOL + nml, 0);
+    zfs_leaf_guid = zfs_nv_u64(p, end, "guid");
+    var nch = zfs_nv_u64(p, end, "vdev_children");
+    if (zfs_nv_ok == 1 && nch != 1) {
+        kprint("zfs: pool has ", 14);
+        kprint_num(nch);
+        kprintln(" top-level vdevs - single-vdev pools only", 41);
+        return 0 - 1;
+    }
+    var vt = zfs_nv_find(p, end, "vdev_tree", 19);
+    if (vt == 0) { return 0 - 1; }
+    var vp = vt + 8;
+    zfs_ashift = zfs_nv_u64(vp, end, "ashift");
+    if (zfs_nv_ok == 0 || zfs_ashift < 9 || zfs_ashift > 16) { kprintln("zfs: bad ashift", 15); return 0 - 1; }
+    zfs_top_id = zfs_nv_u64(vp, end, "id");
+    zfs_asize = zfs_nv_u64(vp, end, "asize");
+    if (zfs_vtree(vp, end, 0) != 1) { kprintln("zfs: this device is not a readable leaf of the pool", 51); return 0 - 1; }
+    var ff = zfs_nv_find(p, end, "features_for_read", 19);
+    if (ff != 0) {
+        var q = ff + 8;
+        var guard = 0;
+        while (q + 8 <= end && guard < 256) {
+            var es = zfs_be32(q);
+            if (es == 0) { guard = 256; }
+            else {
+                if (es < 20 || q + es > end) { return 0 - 1; }
+                var fl = zfs_be32(q + 8);
+                if (fl > es) { return 0 - 1; }
+                if (zfs_feat_class(q + 12, fl) == 0) { return zfs_feat_refuse(q + 12, fl); }
+                q = q + es;
+                guard = guard + 1;
+            }
+        }
+    }
+    return 0;
+}
+
+# The best uberblock of all labels (§ 1.3): max (txg, timestamp, MMP seq) over slots that verify. 0 / -1.
+fn zfs_ub_load() {
+    var sh = zfs_ashift;
+    if (sh < 10) { sh = 10; }
+    if (sh > 13) { sh = 13; }
+    var ss = 1 << sh;
+    var ns = ZK_UBRING / ss;
+    var ring = zfs_mem + ZR_RAW;
+    var ub = zfs_mem + ZR_UB;
+    var have = 0;
+    var bigend = 0;
+    var btx = 0;
+    var bts = 0;
+    var bsq = 0;
+    var nl = 4;
+    if (zfs_dev_bytes == 0) { nl = 2; }
+    var l = 0;
+    while (l < nl) {
+        var off = zfs_label_off(l) + ZK_UBOFF;
+        if (zfs_rd(off, ZK_UBRING, ring) == 0) {
+            var i = 0;
+            while (i < ns) {
+                var s = ring + i * ss;
+                var mg = load64(s);
+                if (mg == ZK_UBMAGIC_X) { bigend = 1; }
+                if (mg == ZK_UBMAGIC && zfs_eck_ok(s, ss, off + i * ss, 0, 0) == 1) {
+                    var ver = load64(s + 8);
+                    if ((ver >= 1 && ver <= 28) || ver == 5000) {
+                        var tx = load64(s + 16);
+                        var ts = load64(s + 32);
+                        var sq = 0;
+                        if (load64(s + 176) == 0xA11CEA11 && (load64(s + 192) & 2) != 0) { sq = (load64(s + 192) >> 32) & 0xFFFF; }
+                        var better = 0;
+                        if (have == 0 || tx > btx) { better = 1; }
+                        elif (tx == btx) { if (ts > bts || (ts == bts && sq > bsq)) { better = 1; } }
+                        if (better == 1) {
+                            memcpy(ub, s, 256);
+                            have = 1;
+                            btx = tx;
+                            bts = ts;
+                            bsq = sq;
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        l = l + 1;
+    }
+    if (have == 0) {
+        if (bigend == 1) { kprintln("zfs: big-endian pool unsupported", 32); }
+        else { kprintln("zfs: no uberblock verifies", 26); }
+        return 0 - 1;
+    }
+    zfs_txg = btx;
+    return 0;
+}
+
+# --- block pointers (§ 2-4) ----------------------------------------------------------------------------------------
+fn zfs_bp_hole(bp) {
+    if (((load64(bp + 48) >> 39) & 1) == 1) { return 0; }
+    if (load64(bp) == 0 && load64(bp + 8) == 0) { return 1; }
+    return 0;
+}
+fn zfs_bp_lsize(bp) {
+    var pr = load64(bp + 48);
+    if (((pr >> 39) & 1) == 1) { return (pr & 0x1FFFFFF) + 1; }
+    return ((pr & 0xFFFF) + 1) << 9;
+}
+
+fn zfs_decomp(comp, src, slen, dst, dlen) {
+    var r = 0 - 1;
+    if (comp == 2) {
+        if (src != dst) { memcpy(dst, src, dlen); }
+        return 0;
+    }
+    if (comp == 15) { r = zfs_lz4_decompress(src, slen, dst, dlen); if (r == 0 && zfs_codec_outlen != dlen) { r = 0 - 1; } }
+    elif (comp == 3) { r = zfs_lzjb_decompress(src, slen, dst, dlen); }
+    elif (comp == 14) { r = zfs_zle_decompress(src, slen, dst, dlen, 64); }
+    elif (comp >= 5 && comp <= 13) { r = zfs_gzip_decompress(src, slen, dst, dlen); if (r == 0 && zfs_codec_outlen != dlen) { r = 0 - 1; } }
+    elif (comp == 16) { zfs_why = ZW_ZSTD; return 0 - 1; }
+    if (r != 0) { zfs_why = ZW_COMP; zfs_why_arg = comp; return 0 - 1; }
+    return 0;
+}
+
+# Checksum of a block's PHYSICAL bytes against the BP (§ 3). 1 = verified.
+fn zfs_ck_ok(bp, pr, buf, len) {
+    var ck = (pr >> 40) & 0xFF;
+    if (ck == 2) { return 1; }
+    var got[32];
+    if (ck == 7) { if (zfs_fletcher4(buf, len, &got) != 0) { zfs_why = ZW_CKSUM; return 0; } }
+    elif (ck == 6) { if (zfs_fletcher2(buf, len, &got) != 0) { zfs_why = ZW_CKSUM; return 0; } }
+    elif (ck == 8) { zfs_sha256_words(buf, len, &got); }
+    elif (ck == 11) { zfs_sha512_256_le_words(buf, len, &got); }    # native SHA-512 stores the DIGEST BYTES (sha2_zfs.c), unlike SHA-256's BE words
+    else { zfs_why = ZW_CKALG; zfs_why_arg = ck; return 0; }
+    if (memeq(&got, bp + 96, 32) == 1) { return 1; }
+    zfs_why = ZW_CKSUM;
+    return 0;
+}
+
+# Embedded data (§ 2): the payload is the LE bytes of words 0-5, 7-9, 11-15.
+fn zfs_emb_read(bp, pr, dst, cap) {
+    if (((pr >> 40) & 0xFF) != 0) { zfs_why = ZW_EMB; return 0 - 1; }
+    var psz = ((pr >> 25) & 0x7F) + 1;
+    var lsz = (pr & 0x1FFFFFF) + 1;
+    if (lsz > cap || psz > 112) { zfs_why = ZW_BIG; return 0 - 1; }
+    var pl[112];
+    memcpy(&pl, bp, 48);
+    memcpy(&pl + 48, bp + 56, 24);
+    memcpy(&pl + 72, bp + 88, 40);
+    return zfs_decomp((pr >> 32) & 0x7F, &pl, psz, dst, lsz);
+}
+
+# A gang block (§ 2): read + verify the header, then concatenate the children's physical bytes into raw.
+fn zfs_gang_read(bp, w0, off, raw, psz) {
+    if (zfs_gang_depth >= 2) { zfs_why = ZW_GANG; return 0 - 1; }
+    var hdr = zfs_mem + ZR_GANG + zfs_gang_depth * 0x10000;
+    var pb = load64(bp + 72);
+    if (pb == 0) { pb = load64(bp + 80); }
+    var gs = 1 << zfs_ashift;
+    var ok = 0;
+    while (ok == 0) {
+        if (zfs_rd(off + ZK_DATA0, gs, hdr) == 0) {
+            if (zfs_eck_ok(hdr, gs, w0 >> 32, off, pb) == 1) { ok = 1; }
+        }
+        if (ok == 0) {
+            if (gs == 512) { zfs_why = ZW_GANG; return 0 - 1; }
+            gs = 512;                            # a legacy 512 B header (FreeBSD zio_read_gang's fallback)
+        }
+    }
+    zfs_gang_depth = zfs_gang_depth + 1;
+    var n = (gs - 40) / 128;
+    var pos = 0;
+    var i = 0;
+    var rc = 0;
+    while (i < n && rc == 0) {
+        var c = hdr + i * 128;
+        i = i + 1;
+        if (zfs_bp_hole(c) == 0) {
+            var cp = load64(c + 48);
+            var cps = (((cp >> 16) & 0xFFFF) + 1) << 9;
+            # children carry raw physical bytes: compressed or embedded children would need ZR_RAW, which the
+            # parent is still filling
+            if (((cp >> 32) & 0x7F) != 2 || ((cp >> 39) & 1) == 1 || pos + cps > psz) { zfs_why = ZW_GANG; rc = 0 - 1; }
+            else {
+                rc = zfs_bp_read(c, raw + pos, psz - pos);
+                pos = pos + cps;
+            }
+        }
+    }
+    zfs_gang_depth = zfs_gang_depth - 1;
+    return rc;
+}
+
+# Read the block bp into dst (room for cap bytes): holes, embedded, gang, ditto copies, checksum, decompression.
+# 0 / -1 (zfs_why says why).
+fn zfs_bp_read(bp, dst, cap) {
+    var pr = load64(bp + 48);
+    if (((pr >> 39) & 1) == 1) { return zfs_emb_read(bp, pr, dst, cap); }
+    var lsz = ((pr & 0xFFFF) + 1) << 9;
+    if (load64(bp) == 0 && load64(bp + 8) == 0) {
+        if (lsz > cap) { lsz = cap; }
+        memset(dst, 0, lsz);
+        return 0;
+    }
+    if ((pr >> 63) == 0) { zfs_why = ZW_BIGEND; return 0 - 1; }
+    if (((pr >> 61) & 1) == 1) { zfs_why = ZW_CRYPT; return 0 - 1; }
+    var psz = (((pr >> 16) & 0xFFFF) + 1) << 9;
+    var comp = (pr >> 32) & 0x7F;
+    if (lsz > cap || psz > ZK_RAWMAX) { zfs_why = ZW_BIG; return 0 - 1; }
+    var raw = dst;
+    if (comp != 2) { raw = zfs_mem + ZR_RAW; }
+    elif (psz > cap) { zfs_why = ZW_BIG; return 0 - 1; }
+    var ok = 0;
+    var d = 0;
+    while (d < 3 && ok == 0) {
+        var w0 = load64(bp + d * 16);
+        var w1 = load64(bp + d * 16 + 8);
+        d = d + 1;
+        if (w0 != 0 || w1 != 0) {
+            if ((w0 >> 32) != zfs_top_id) { zfs_why = ZW_VDEV; }
+            else {
+                var off = (w1 & 0x7FFFFFFFFFFFFFFF) << 9;
+                var rc = 0;
+                if ((w1 >> 63) == 1) { rc = zfs_gang_read(bp, w0, off, raw, psz); }
+                else {
+                    rc = zfs_rd(off + ZK_DATA0, psz, raw);
+                    if (rc != 0) { zfs_why = ZW_IO; }
+                }
+                if (rc == 0) { ok = zfs_ck_ok(bp, pr, raw, psz); }
+            }
+        }
+    }
+    if (ok == 0) { return 0 - 1; }
+    return zfs_decomp(comp, raw, psz, dst, lsz);
+}
+
+# --- the block cache -----------------------------------------------------------------------------------------------
+# Slots 0..15: metadata (<= 128 KiB, ZR_MC); slot 16: the last data block (<= 1 MiB, ZR_DATA). Keyed by the
+# block's identity — DVA0 + logical birth (the ARC's key) — or, for an embedded BP, its whole 128 bytes.
+fn zfs_key_eq(k, bp) {
+    if (load64(k + 144) == 0) { return 0; }
+    if (((load64(bp + 48) >> 39) & 1) == 1) { return memeq(k, bp, 128); }
+    if (load64(k) == load64(bp) && load64(k + 8) == load64(bp + 8) && load64(k + 80) == load64(bp + 80)) {
+        if (load64(k + 48) == load64(bp + 48)) { return 1; }
+    }
+    return 0;
+}
+fn zfs_cache_fill(slot, buf, cap, bp) {
+    var k = zfs_mem + ZR_MCK + slot * 160;
+    store64(k + 144, 0);
+    if (zfs_bp_read(bp, buf, cap) != 0) { return 0; }
+    memcpy(k, bp, 128);
+    store64(k + 128, zfs_bp_lsize(bp));
+    store64(k + 136, zfs_mc_tick);
+    store64(k + 144, 1);
+    return buf;
+}
+fn zfs_mc_get(bp) {
+    if (zfs_bp_hole(bp) == 1) { return zfs_mem + ZR_ZERO; }
+    zfs_mc_tick = zfs_mc_tick + 1;
+    var keys = zfs_mem + ZR_MCK;
+    var victim = 0;
+    var vage = 0 - 1;
+    var i = 0;
+    while (i < 16) {
+        var k = keys + i * 160;
+        if (zfs_key_eq(k, bp) == 1) {
+            store64(k + 136, zfs_mc_tick);
+            return zfs_mem + ZR_MC + i * 0x20000;
+        }
+        var a = 0;
+        if (load64(k + 144) == 1) { a = load64(k + 136); }
+        if (vage < 0 || a < vage) { vage = a; victim = i; }
+        i = i + 1;
+    }
+    return zfs_cache_fill(victim, zfs_mem + ZR_MC + victim * 0x20000, ZK_METAMAX, bp);
+}
+fn zfs_db_get(bp) {
+    var k = zfs_mem + ZR_MCK + 16 * 160;
+    if (zfs_key_eq(k, bp) == 1) { return zfs_mem + ZR_DATA; }
+    return zfs_cache_fill(16, zfs_mem + ZR_DATA, ZK_DATAMAX, bp);
+}
+
+# --- dnodes (§ 5) --------------------------------------------------------------------------------------------------
+# Block `blkid` of the object whose dnode is at dn. meta = 1 -> a metadata block (cache; a hole reads as the zero
+# area); meta = 0 -> a data block (ZR_DATA; a hole returns 1). 0 on error.
+fn zfs_obj_blk(dn, blkid, meta) {
+    var nl = load8(dn + 2);
+    var epbs = load8(dn + 1) - 7;
+    var nbp = load8(dn + 3);
+    if (nl < 1 || nl > 9 || nbp < 1 || nbp > 3 || epbs < 2 || epbs > 17) { zfs_why = ZW_CORRUPT; return 0; }
+    if (blkid < 0 || blkid > load64(dn + 16)) {
+        if (meta == 1) { return zfs_mem + ZR_ZERO; }
+        return 1;
+    }
+    var top = zfs_shr(blkid, epbs * (nl - 1));
+    if (top >= nbp) { zfs_why = ZW_CORRUPT; return 0; }
+    var bp[128];
+    memcpy(&bp, dn + 64 + top * 128, 128);
+    var lv = nl - 1;
+    while (lv > 0) {
+        if (zfs_bp_hole(&bp) == 1) {
+            if (meta == 1) { return zfs_mem + ZR_ZERO; }
+            return 1;
+        }
+        var ib = zfs_mc_get(&bp);
+        if (ib == 0) { return 0; }
+        lv = lv - 1;
+        var idx = zfs_shr(blkid, epbs * lv) & ((1 << epbs) - 1);
+        memcpy(&bp, ib + idx * 128, 128);
+    }
+    if (meta == 1) { return zfs_mc_get(&bp); }
+    if (zfs_bp_hole(&bp) == 1) { return 1; }
+    return zfs_db_get(&bp);
+}
+
+# Dnode `obj` of the object set whose meta-dnode is at mdn, copied whole (1 + dn_extra_slots slots) into out.
+# 0 / -1 error / -2 a free slot.
+fn zfs_dnode(mdn, obj, out) {
+    var bsz = load16(mdn + 8) << 9;
+    if (bsz < 512 || obj < 0 || obj > ZK_MASK48) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+    var off = obj * 512;
+    var bid = off / bsz;
+    var bo = off - bid * bsz;
+    var b = zfs_obj_blk(mdn, bid, 1);
+    if (b == 0) { return 0 - 1; }
+    memcpy(out, b + bo, 512);
+    if (load8(out) == 0) { return 0 - 2; }
+    var ex = load8(out + 12);
+    if (ex > 0) {
+        var tot = (ex + 1) * 512;
+        if (bo + tot > bsz) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+        memcpy(out + 512, b + bo + 512, tot - 512);
+    }
+    if (64 + load8(out + 3) * 128 + load16(out + 10) > (ex + 1) * 512) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+    return 0;
+}
+
+# --- ZAP (§ 6) -----------------------------------------------------------------------------------------------------
+fn zfs_zbt(ty) {
+    if ((ty >> 63) == 0) { return 0 - 1; }
+    if ((ty & 0x7FFFFFFFFFFFFFFF) > 3) { return 0 - 1; }
+    return ty & 3;                               # 0 leaf, 1 fat header, 3 micro
+}
+fn zfs_leaf_geom(bsz) {
+    return zfs_log2(bsz) - 5;                    # ZAP_LEAF_HASH_SHIFT
+}
+# Compare the leaf entry e's name with the query (§ 6: name bytes incl. the NUL, 21 per array chunk).
+fn zfs_leaf_name_eq(ch, nch, e) {
+    if (load16(e + 6) != zfs_q_nlen + 1) { return 0; }
+    var c = load16(e + 4);
+    var i = 0;
+    while (i < zfs_q_nlen) {
+        if (c >= nch) { return 0; }
+        var a = ch + c * 24;
+        if (load8(a) != 251) { return 0; }
+        var k = 0;
+        while (k < 21 && i < zfs_q_nlen) {
+            if (zfs_ceq(load8(a + 1 + k), load8(zfs_q_name + i), zfs_q_ci) == 0) { return 0; }
+            k = k + 1;
+            i = i + 1;
+        }
+        c = load16(a + 22);
+    }
+    return 1;
+}
+# Copy entry e's value (big-endian integers of le_value_intlen bytes) to the query output. Integer count / -1.
+fn zfs_leaf_value(ch, nch, e) {
+    var il = load8(e + 1);
+    var vn = load16(e + 10);
+    if (il != 1 && il != 2 && il != 4 && il != 8) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+    if (il > zfs_q_isz) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+    var n = vn;
+    if (n > zfs_q_maxn) { n = zfs_q_maxn; }
+    var c = load16(e + 8);
+    var a = 0;
+    var k = 21;
+    var i = 0;
+    while (i < n) {
+        var v = 0;
+        var j = 0;
+        while (j < il) {
+            if (k == 21) {
+                if (c >= nch) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+                a = ch + c * 24;
+                if (load8(a) != 251) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+                c = load16(a + 22);
+                k = 0;
+            }
+            v = (v << 8) | load8(a + 1 + k);
+            k = k + 1;
+            j = j + 1;
+        }
+        var o = zfs_q_out + i * zfs_q_isz;
+        if (zfs_q_isz == 1) { store8(o, v); }
+        elif (zfs_q_isz == 2) { store16(o, v); }
+        elif (zfs_q_isz == 4) { store32(o, v); }
+        else { store64(o, v); }
+        i = i + 1;
+    }
+    return n;
+}
+# Hashed lookup inside one fat-ZAP leaf.
+fn zfs_leaf_lookup(lf, bsz, h) {
+    if (zfs_zbt(load64(lf)) != 0 || load32(lf + 24) != ZK_LEAFMAGIC) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+    var plen = load16(lf + 32);
+    if (plen > 0) { if (load64(lf + 16) != zfs_shr(h, 64 - plen)) { zfs_why = ZW_CORRUPT; return 0 - 1; } }
+    var hs = zfs_leaf_geom(bsz);
+    var nent = 1 << hs;
+    var ch = lf + 48 + nent * 2;
+    var nch = (bsz - 2 * nent) / 24 - 2;
+    var c = load16(lf + 48 + (zfs_shr(h, 64 - hs - plen) & (nent - 1)) * 2);
+    var guard = 0;
+    while (c != 0xFFFF && guard < nch) {
+        if (c >= nch) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+        var e = ch + c * 24;
+        if (load8(e) != 252) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+        if (load64(e + 16) == h) { if (zfs_leaf_name_eq(ch, nch, e) == 1) { return zfs_leaf_value(ch, nch, e); } }
+        c = load16(e + 2);
+        guard = guard + 1;
+    }
+    return 0 - 2;
+}
+
+# Next entry of the ZAP at dn from *cur (0 = start; micro: entry index; fat: blk << 20 | chunk). The name goes to
+# ZR_NAME (NUL-terminated, zfs_it_nlen bytes; > 1023 truncated), the first <= 8 value bytes (big-endian) to
+# zfs_it_val. 1 = an entry, 0 = end, -1 = error. Fat ZAPs: every block 1 .. zap_freeblk-1 that is a valid leaf
+# (§ 6 / § 10 — FreeBSD's "leaves are blocks 1..num_leafs" breaks once the pointer table leaves block 0).
+fn zfs_zap_next(dn, cur) {
+    var b0 = zfs_obj_blk(dn, 0, 1);
+    if (b0 == 0) { return 0 - 1; }
+    var bsz = load16(dn + 8) << 9;
+    var t = zfs_zbt(load64(b0));
+    var c = load64(cur);
+    var nm = zfs_mem + ZR_NAME;
+    if (t == 3) {
+        var n = bsz / 64 - 1;
+        while (c < n) {
+            var e = b0 + 64 + c * 64;
+            c = c + 1;
+            if (load8(e + 14) != 0) {
+                var l = 0;
+                while (l < 49 && load8(e + 14 + l) != 0) { store8(nm + l, load8(e + 14 + l)); l = l + 1; }
+                store8(nm + l, 0);
+                zfs_it_nlen = l;
+                zfs_it_val = load64(e);
+                zfs_it_vil = 8;
+                store64(cur, c);
+                return 1;
+            }
+        }
+        store64(cur, c);
+        return 0;
+    }
+    if (t != 1 || load64(b0 + 8) != ZK_ZAPMAGIC) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+    var free = load64(b0 + 56);
+    var hs = zfs_leaf_geom(bsz);
+    var nent = 1 << hs;
+    var nch = (bsz - 2 * nent) / 24 - 2;
+    var blk = c >> 20;
+    var ci = c & 0xFFFFF;
+    if (blk < 1) { blk = 1; ci = 0; }
+    while (blk < free) {
+        var lf = zfs_obj_blk(dn, blk, 1);
+        if (lf == 0) { return 0 - 1; }
+        if (zfs_zbt(load64(lf)) == 0 && load32(lf + 24) == ZK_LEAFMAGIC) {
+            var ch = lf + 48 + nent * 2;
+            while (ci < nch) {
+                var en = ch + ci * 24;
+                ci = ci + 1;
+                if (load8(en) == 252) {
+                    # name
+                    var nn = load16(en + 6);
+                    var cc = load16(en + 4);
+                    var i = 0;
+                    var ok = 1;
+                    while (i < nn && ok == 1) {
+                        if (cc >= nch) { ok = 0; }
+                        else {
+                            var a = ch + cc * 24;
+                            var k = 0;
+                            while (k < 21 && i < nn) {
+                                if (i < 1023) { store8(nm + i, load8(a + 1 + k)); }
+                                k = k + 1;
+                                i = i + 1;
+                            }
+                            cc = load16(a + 22);
+                        }
+                    }
+                    if (ok == 0) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+                    var ln = nn - 1;                       # without the NUL
+                    if (ln < 0) { ln = 0; }
+                    if (ln > 1023) { store8(nm + 1023, 0); } else { store8(nm + ln, 0); }
+                    zfs_it_nlen = ln;
+                    # value: the first <= 8 bytes, big-endian
+                    var il = load8(en + 1);
+                    var vb = il * load16(en + 10);
+                    if (vb > 8) { vb = 8; }
+                    var vc = load16(en + 8);
+                    var v = 0;
+                    if (vb > 0 && vc < nch) {
+                        var va = ch + vc * 24;
+                        var j = 0;
+                        while (j < vb) { v = (v << 8) | load8(va + 1 + j); j = j + 1; }
+                    }
+                    zfs_it_val = v;
+                    zfs_it_vil = il;
+                    store64(cur, (blk << 20) | ci);
+                    return 1;
+                }
+            }
+        }
+        blk = blk + 1;
+        ci = 0;
+    }
+    store64(cur, blk << 20);
+    return 0;
+}
+
+# Look name (nlen bytes, no NUL) up in the ZAP at dn; write at most maxn integers of isz bytes (little-endian) to
+# out. Integer count, -2 absent, -1 error. A ZAP with normalization flags hashes the NORMALIZED name, so a
+# byte-exact name cannot be hashed there: those are scanned, with ASCII case folding (§ 6).
+fn zfs_zap_lookup(dn, name, nlen, isz, maxn, out) {
+    var b0 = zfs_obj_blk(dn, 0, 1);
+    if (b0 == 0) { return 0 - 1; }
+    var bsz = load16(dn + 8) << 9;
+    var t = zfs_zbt(load64(b0));
+    if (t == 3) {
+        if (isz != 8 || maxn < 1) { return 0 - 1; }
+        if (nlen >= 50) { return 0 - 2; }
+        var ci = 0;
+        if (load64(b0 + 16) != 0) { ci = 1; }
+        var n = bsz / 64 - 1;
+        var e = b0 + 64;
+        var i = 0;
+        while (i < n) {
+            if (load8(e + 14) != 0 && load8(e + 14 + nlen) == 0) {
+                var j = 0;
+                var m = 1;
+                while (j < nlen && m == 1) { m = zfs_ceq(load8(e + 14 + j), load8(name + j), ci); j = j + 1; }
+                if (m == 1) { store64(out, load64(e)); return 1; }
+            }
+            e = e + 64;
+            i = i + 1;
+        }
+        return 0 - 2;
+    }
+    if (t != 1 || load64(b0 + 8) != ZK_ZAPMAGIC) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+    zfs_q_name = name;
+    zfs_q_nlen = nlen;
+    zfs_q_isz = isz;
+    zfs_q_maxn = maxn;
+    zfs_q_out = out;
+    zfs_q_ci = 0;
+    if (load64(b0 + 88) != 0) {
+        zfs_q_ci = 1;
+        var cur = 0;
+        var r = 1;
+        while (r == 1) {
+            r = zfs_zap_next(dn, &cur);
+            if (r == 1 && zfs_it_nlen == nlen) {
+                var jj = 0;
+                var mm = 1;
+                while (jj < nlen && mm == 1) { mm = zfs_ceq(load8(zfs_mem + ZR_NAME + jj), load8(name + jj), 1); jj = jj + 1; }
+                if (mm == 1) {
+                    # re-find it hashed-free inside its leaf: the cursor names the block, rescan that leaf by name
+                    var lf = zfs_obj_blk(dn, cur >> 20, 1);
+                    if (lf == 0) { return 0 - 1; }
+                    var hs = zfs_leaf_geom(bsz);
+                    var nent = 1 << hs;
+                    var ch = lf + 48 + nent * 2;
+                    var nch = (bsz - 2 * nent) / 24 - 2;
+                    var ci2 = (cur & 0xFFFFF) - 1;
+                    if (ci2 < 0 || ci2 >= nch) { return 0 - 1; }
+                    return zfs_leaf_value(ch, nch, ch + ci2 * 24);
+                }
+            }
+        }
+        if (r < 0) { return 0 - 1; }
+        return 0 - 2;
+    }
+    var bits = 28;
+    if ((load64(b0 + 96) & 1) != 0) { bits = 48; }
+    var h = zfs_zap_hash_bits(load64(b0 + 80), name, nlen, bits);
+    var zblk = load64(b0 + 16);
+    var znb = load64(b0 + 24);
+    var zsh = load64(b0 + 32);
+    var idx = 0;
+    if (zsh > 0) { idx = zfs_shr(h, 64 - zsh); }
+    var lb = 0;
+    if (znb == 0) {
+        var hal = bsz / 16;                      # the embedded pointer table: block 0's second half
+        if (idx >= hal) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+        lb = load64(b0 + (hal + idx) * 8);
+    } else {
+        var per = bsz / 8;
+        var tb = zfs_obj_blk(dn, zblk + idx / per, 1);
+        if (tb == 0) { return 0 - 1; }
+        lb = load64(tb + (idx % per) * 8);
+    }
+    var lf2 = zfs_obj_blk(dn, lb, 1);
+    if (lf2 == 0) { return 0 - 1; }
+    return zfs_leaf_lookup(lf2, bsz, h);
+}
+fn zfs_zap_u64(dn, name, out) {
+    return zfs_zap_lookup(dn, name, strlen(name), 8, 1, out);
+}
+
+# --- DSL: datasets, properties, grafts (§ 7) -----------------------------------------------------------------------
+# String property pname of the dsl_dir whose props ZAP is MOS object pz (scratch dnode zdn): the local value, else
+# pname$recvd. Copied NUL-terminated into out (cap bytes). Length, or -2 when unset.
+fn zfs_prop_str(pz, pname, out, cap, zdn) {
+    if (zfs_dnode(zfs_mem + ZR_MOS, pz, zdn) != 0) { return 0 - 2; }
+    var r = zfs_zap_lookup(zdn, pname, strlen(pname), 1, cap - 1, out);
+    if (r < 0) {
+        var nb = zfs_mem + ZR_NAME;
+        var pl = strlen(pname);
+        memcpy(nb, pname, pl);
+        memcpy(nb + pl, "$recvd", 6);
+        r = zfs_zap_lookup(zdn, nb, pl + 6, 1, cap - 1, out);
+    }
+    if (r < 0) { return 0 - 2; }
+    while (r > 0 && load8(out + r - 1) == 0) { r = r - 1; }
+    store8(out + r, 0);
+    return r;
+}
+fn zfs_prop_u64(pz, pname, dflt, zdn) {
+    if (zfs_dnode(zfs_mem + ZR_MOS, pz, zdn) != 0) { return dflt; }
+    var v = 0;
+    if (zfs_zap_u64(zdn, pname, &v) == 1) { return v; }
+    var nb = zfs_mem + ZR_NAME;
+    var pl = strlen(pname);
+    memcpy(nb, pname, pl);
+    memcpy(nb + pl, "$recvd", 6);
+    if (zfs_zap_lookup(zdn, nb, pl + 6, 8, 1, &v) == 1) { return v; }
+    return dflt;
+}
+
+# Open dataset object dsobj into slot ds: its object set, master node, and (ZPL >= 5) the SA registry. 0 / -1.
+# Slot layout: +0 meta-dnode · +512 ROOT · +520 1 = SA-based · +528 LAYOUTS object · +536 case-folded lookups ·
+# +544 MODE +552 SIZE +560 MTIME +568 LINKS +576 SYMLINK attribute numbers (-1 = unregistered) · +584 u16[128]
+# registered length + 1 per attribute number · +840 dataset object · +848 name length · +856 name.
+fn zfs_ds_open(ds, dsobj) {
+    var dn = zfs_dnslot(0);
+    if (zfs_dnode(zfs_mem + ZR_MOS, dsobj, dn) != 0) { return 0 - 1; }
+    var bon = zfs_bonus(dn);
+    if ((load64(bon + 120) & 1) != 0) { zfs_why = ZW_RECV; return 0 - 1; }
+    var bp[128];
+    memcpy(&bp, bon + 128, 128);
+    if (((load64(&bp + 48) >> 61) & 1) == 1) { zfs_why = ZW_CRYPT; return 0 - 1; }
+    var os = zfs_mem + ZR_OS;
+    if (zfs_bp_read(&bp, os, 4096) != 0) { return 0 - 1; }
+    if (load64(os + 704) != 2) { zfs_why = ZW_NOTFS; return 0 - 1; }
+    memcpy(ds, os, 512);
+    store64(ds + 840, dsobj);
+    var mn = zfs_dnslot(1);
+    if (zfs_dnode(ds, 1, mn) != 0) { return 0 - 1; }
+    var v = 0;
+    if (zfs_zap_u64(mn, "ROOT", &v) != 1) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+    store64(ds + 512, v);
+    var ci = 0;
+    v = 0;
+    if (zfs_zap_u64(mn, "normalization", &v) == 1 && v != 0) { ci = 1; }
+    v = 0;
+    if (zfs_zap_u64(mn, "casesensitivity", &v) == 1 && v != 0) { ci = 1; }
+    store64(ds + 536, ci);
+    store64(ds + 520, 0);
+    var k = 0;
+    while (k < 5) { store64(ds + 544 + k * 8, 0 - 1); k = k + 1; }
+    memset(ds + 584, 0, 256);
+    var sa = 0;
+    if (zfs_zap_u64(mn, "SA_ATTRS", &sa) != 1) { return 0; }        # ZPL <= 4: znode_phys_t bonuses
+    var sm = zfs_dnslot(2);
+    if (zfs_dnode(ds, sa, sm) != 0) { return 0 - 1; }
+    var reg = 0;
+    var lay = 0;
+    if (zfs_zap_u64(sm, "REGISTRY", &reg) != 1 || zfs_zap_u64(sm, "LAYOUTS", &lay) != 1) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+    store64(ds + 528, lay);
+    if (zfs_dnode(ds, reg, sm) != 0) { return 0 - 1; }
+    var cur = 0;
+    var r = zfs_zap_next(sm, &cur);
+    while (r == 1) {
+        var num = zfs_it_val & 0xFFFF;
+        var len = (zfs_it_val >> 24) & 0xFFFF;
+        if (num < 128) { store16(ds + 584 + num * 2, len + 1); }
+        var nm = zfs_mem + ZR_NAME;
+        var nl = zfs_it_nlen;
+        if (zfs_is(nm, nl, "ZPL_MODE") == 1) { store64(ds + 544, num); }
+        if (zfs_is(nm, nl, "ZPL_SIZE") == 1) { store64(ds + 552, num); }
+        if (zfs_is(nm, nl, "ZPL_MTIME") == 1) { store64(ds + 560, num); }
+        if (zfs_is(nm, nl, "ZPL_LINKS") == 1) { store64(ds + 568, num); }
+        if (zfs_is(nm, nl, "ZPL_SYMLINK") == 1) { store64(ds + 576, num); }
+        r = zfs_zap_next(sm, &cur);
+    }
+    if (r < 0 || load64(ds + 544) < 0 || load64(ds + 552) < 0) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+    store64(ds + 520, 1);
+    return 0;
+}
+
+# Graft / virtual-dir entries (ZR_GR, 512 B each): +0 kind (1 dataset graft, 2 virtual dir) · +8 own ref ·
+# +16 parent ref · +24 path length (0 = the namespace root) · +32 offset of the last component · +40 path.
+# A ref is ((dataset slot + 1) << 48) | object for a ZPL object, or the entry index for a virtual dir.
+fn zfs_gr(i) { return zfs_mem + ZR_GR + i * 512; }
+fn zfs_gr_find(p, l) {
+    var i = 0;
+    while (i < zfs_ngr) {
+        var e = zfs_gr(i);
+        if (load64(e + 24) == l && memeq(e + 40, p, l) == 1) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+fn zfs_gr_add(kind, ref, p, l) {
+    if (zfs_ngr >= ZK_MAXGR || l > 460) { return 0 - 1; }
+    var e = zfs_gr(zfs_ngr);
+    store64(e, kind);
+    store64(e + 8, ref);
+    if (kind == 2) { store64(e + 8, zfs_ngr); }
+    store64(e + 16, 0 - 1);
+    store64(e + 24, l);
+    var lo = l;
+    while (lo > 0 && load8(p + lo - 1) != 47) { lo = lo - 1; }
+    store64(e + 32, lo);
+    memcpy(e + 40, p, l);
+    zfs_ngr = zfs_ngr + 1;
+    return zfs_ngr - 1;
+}
+
+# Graft dataset dsobj at the mountpoint mp (ml bytes, absolute): "/" -> the namespace root "", trailing '/' gone.
+fn zfs_graft(dsobj, mp, ml, dsname, dnl) {
+    while (ml > 1 && load8(mp + ml - 1) == 47) { ml = ml - 1; }
+    if (ml == 1) { ml = 0; }
+    if (zfs_gr_find(mp, ml) >= 0) { return 0; }  # first claimant of a path wins
+    if (zfs_nds >= ZK_MAXDS) { kprintln("zfs: more than 32 datasets - the rest are not grafted", 53); return 0 - 1; }
+    var ds = zfs_ds(zfs_nds);
+    if (zfs_ds_open(ds, dsobj) != 0) {
+        kprint("zfs: dataset ", 13);
+        kprint(dsname, dnl);
+        kprint(" not grafted: ", 14);
+        zfs_why_print();
+        return 0 - 1;
+    }
+    var nl = dnl;
+    if (nl > 160) { nl = 160; }
+    store64(ds + 848, nl);
+    memcpy(ds + 856, dsname, nl);
+    if (zfs_gr_add(1, ((zfs_nds + 1) << 48) | load64(ds + 512), mp, ml) < 0) { return 0 - 1; }
+    zfs_nds = zfs_nds + 1;
+    kprint("zfs: mount ", 11);
+    if (ml == 0) { kprint("/", 1); } else { kprint(mp, ml); }
+    kprint(" ", 1);
+    kprintln(dsname, dnl);
+    return 0;
+}
+
+# Walk dsl_dir dobj (MOS object): its effective mountpoint (§ 7: local, $recvd, else inherited), its graft, then
+# its children. pmp/pml = the parent's effective mountpoint, nm/nl = this dir's name, dnm/dnl = parent's full name.
+fn zfs_dsl_walk(dobj, depth, pmp, pml, nm, nl, pnm, pnl) {
+    if (depth >= 16) { return 0; }
+    var dn = zfs_mem + ZR_DSL + depth * 2048;
+    var zdn = dn + 1024;
+    if (zfs_dnode(zfs_mem + ZR_MOS, dobj, dn) != 0) { return 0 - 1; }
+    var bon = zfs_bonus(dn);
+    var head = load64(bon + 8);
+    var cz = load64(bon + 32);
+    var pz = load64(bon + 80);
+    if (depth == 0) { zfs_used = load64(bon + 40); }
+    # full dataset name
+    var dnm = zfs_mem + ZR_DNM + depth * 256;
+    var dl = 0;
+    if (depth == 0) { dl = strlen(zfs_mem + ZR_POOL); memcpy(dnm, zfs_mem + ZR_POOL, dl); }
+    else {
+        if (pnl + 1 + nl > 255) { return 0; }
+        memcpy(dnm, pnm, pnl);
+        store8(dnm + pnl, 47);
+        memcpy(dnm + pnl + 1, nm, nl);
+        dl = pnl + 1 + nl;
+    }
+    # effective mountpoint
+    var mp = zfs_mem + ZR_MP + depth * 256;
+    var ml = 0 - 2;
+    if (pz != 0) { ml = zfs_prop_str(pz, "mountpoint", mp, 256, zdn); }
+    if (ml < 0) {
+        if (depth == 0) {
+            var pl = strlen(zfs_mem + ZR_POOL);
+            store8(mp, 47);
+            memcpy(mp + 1, zfs_mem + ZR_POOL, pl);
+            ml = pl + 1;
+        } elif (pml < 1 || load8(pmp) != 47) {
+            memcpy(mp, pmp, pml);                # none / legacy inherit verbatim
+            ml = pml;
+        } else {
+            var bl = pml;
+            if (bl == 1) { bl = 0; }             # parent "/" -> "/name"
+            if (bl + 1 + nl > 255) { return 0; }
+            memcpy(mp, pmp, bl);
+            store8(mp + bl, 47);
+            memcpy(mp + bl + 1, nm, nl);
+            ml = bl + 1 + nl;
+        }
+    }
+    var cm = 1;
+    if (pz != 0) { cm = zfs_prop_u64(pz, "canmount", 1, zdn); }
+    if (head != 0 && ml > 0 && load8(mp) == 47) {
+        if (cm == 1 || (cm == 2 && head == zfs_bootfs)) { zfs_graft(head, mp, ml, dnm, dl); }
+    }
+    if (cz == 0) { return 0; }
+    if (zfs_dnode(zfs_mem + ZR_MOS, cz, zdn) != 0) { return 0; }
+    var cn = zfs_mem + ZR_CNM + depth * 256;
+    var cur = 0;
+    var r = zfs_zap_next(zdn, &cur);
+    while (r == 1) {
+        var cl = zfs_it_nlen;
+        var cobj = zfs_it_val;
+        var c0 = load8(zfs_mem + ZR_NAME);
+        if (cl > 0 && cl < 256 && c0 != 36 && c0 != 37) {          # skip $MOS/$FREE/$ORIGIN and %recv
+            memcpy(cn, zfs_mem + ZR_NAME, cl);
+            zfs_dsl_walk(cobj, depth + 1, mp, ml, cn, cl, dnm, dl);
+            if (zfs_dnode(zfs_mem + ZR_MOS, cz, zdn) != 0) { return 0; }   # the recursion reused the cache
+        }
+        r = zfs_zap_next(zdn, &cur);
+    }
+    return 0;
+}
+
+# --- ZPL attributes (§ 8) ------------------------------------------------------------------------------------------
+fn zfs_sa_layout(di, ds, lay) {
+    if (lay == 0) { lay = 1; }                   # FreeBSD zfs_sa_lookup: layout 0 reads as 1
+    if (zfs_lay_ds == di + 1 && zfs_lay_num == lay) { return 0; }
+    zfs_lay_ds = 0;
+    var ld = zfs_dnslot(5);
+    if (zfs_dnode(ds, load64(ds + 528), ld) != 0) { return 0 - 1; }
+    var nb[24];
+    var nl = fmt_int_buf(lay, &nb);
+    var n = zfs_zap_lookup(ld, &nb, nl, 2, 512, zfs_mem + ZR_LAY);
+    if (n < 0) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+    zfs_lay_n = n;
+    zfs_lay_num = lay;
+    zfs_lay_ds = di + 1;
+    return 0;
+}
+# Attribute num in one SA buffer (bonus or spill). Length / -2 absent / -1 error.
+fn zfs_sa_find(di, ds, buf, blen, num, out, cap) {
+    if (blen < 8 || load32(buf) != ZK_SAMAGIC) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+    var li = load16(buf + 4);
+    var hs = ((li >> 10) & 0x3F) * 8;
+    if (hs < 8 || hs > blen) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+    if (zfs_sa_layout(di, ds, li & 0x3FF) != 0) { return 0 - 1; }
+    var off = hs;
+    var vi = 0;
+    var i = 0;
+    while (i < zfs_lay_n) {
+        var a = load16(zfs_mem + ZR_LAY + i * 2);
+        var ln = 0;
+        if (a < 128) { ln = load16(ds + 584 + a * 2); }
+        if (ln == 0) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+        ln = ln - 1;
+        if (ln == 0) {
+            if (6 + vi * 2 + 2 > hs) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+            ln = load16(buf + 6 + vi * 2);
+            vi = vi + 1;
+        }
+        if (off + ln > blen) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+        if (a == num) {
+            var c = ln;
+            if (c > cap) { c = cap; }
+            memcpy(out, buf + off, c);
+            return ln;
+        }
+        off = (off + ln + 7) & (0 - 8);
+        i = i + 1;
+    }
+    return 0 - 2;
+}
+# Attribute num of the SA dnode dn: the bonus, then the spill block (FreeBSD zfs_dnode_sa_lookup).
+fn zfs_sa_attr(di, dn, num, out, cap) {
+    if (num < 0) { return 0 - 2; }
+    var ds = zfs_ds(di);
+    if (load8(dn + 4) != 44) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+    var r = zfs_sa_find(di, ds, zfs_bonus(dn), load16(dn + 10), num, out, cap);
+    if (r != 0 - 2) { return r; }
+    if ((load8(dn + 7) & 4) == 0) { return 0 - 2; }
+    var sp[128];
+    memcpy(&sp, dn + (load8(dn + 12) + 1) * 512 - 128, 128);
+    var sb = zfs_mc_get(&sp);
+    if (sb == 0) { return 0 - 1; }
+    var sl = zfs_bp_lsize(&sp);
+    if (sl > ZK_METAMAX) { sl = ZK_METAMAX; }
+    return zfs_sa_find(di, ds, sb, sl, num, out, cap);
+}
+# MODE (0), SIZE (1), MTIME seconds (2), LINKS (3) of object dn in dataset slot di. -1 on error.
+fn zfs_attr(di, dn, which) {
+    var ds = zfs_ds(di);
+    if (load64(ds + 520) == 1) {
+        var v[16];
+        var r = zfs_sa_attr(di, dn, load64(ds + 544 + which * 8), &v, 16);
+        if (r < 8) {
+            if (r == 0 - 2 && which >= 2) { return 0; }          # an old object without MTIME/LINKS
+            return 0 - 1;
+        }
+        return load64(&v);
+    }
+    if (load8(dn + 4) != 17 || load16(dn + 10) < 264) { zfs_why = ZW_CORRUPT; return 0 - 1; }
+    var b = zfs_bonus(dn);
+    if (which == 0) { return load64(b + 72); }
+    if (which == 1) { return load64(b + 80); }
+    if (which == 2) { return load64(b + 16); }
+    return load64(b + 96);
+}
+
+# --- reading objects -----------------------------------------------------------------------------------------------
+fn zfs_ref_di(ref) { return (ref >> 48) - 1; }
+fn zfs_ref_dn(ref, out) {
+    var di = zfs_ref_di(ref);
+    if (di < 0 || di >= zfs_nds) { return 0 - 1; }
+    return zfs_dnode(zfs_ds(di), ref & ZK_MASK48, out);
+}
+# Read n bytes of object ref's data at off into dst. Bytes read / -1. (Holes and the tail past dn_maxblkid read
+# as zeros; the caller bounds n by the file size.)
+fn zfs_read_ref(ref, off, dst, n) {
+    var dn = zfs_dnslot(3);
+    if (zfs_ref_dn(ref, dn) != 0) { return 0 - 1; }
+    var bsz = load16(dn + 8) << 9;
+    if (bsz < 512) { return 0 - 1; }
+    var done = 0;
+    while (done < n) {
+        var o = off + done;
+        var bid = o / bsz;
+        var bo = o - bid * bsz;
+        var ch = bsz - bo;
+        if (ch > n - done) { ch = n - done; }
+        var blk = zfs_obj_blk(dn, bid, 0);
+        if (blk == 0) {
+            if (done > 0) { return done; }
+            return 0 - 1;
+        }
+        if (blk == 1) { memset(dst + done, 0, ch); }
+        else { memcpy(dst + done, blk + bo, ch); }
+        done = done + ch;
+    }
+    return done;
+}
+# The text of symlink ref into out (cap bytes). Length / -1.
+fn zfs_readlink_ref(ref, out, cap) {
+    var di = zfs_ref_di(ref);
+    var dn = zfs_dnslot(4);
+    if (zfs_ref_dn(ref, dn) != 0) { return 0 - 1; }
+    var mode = zfs_attr(di, dn, 0);
+    if ((mode & 0xF000) != 0xA000) { return 0 - 1; }
+    var sz = zfs_attr(di, dn, 1);
+    if (sz < 0 || sz > cap) { return 0 - 1; }
+    if (load64(zfs_ds(di) + 520) == 1) {
+        var r = zfs_sa_attr(di, dn, load64(zfs_ds(di) + 576), out, cap);
+        if (r >= 0) { return r; }
+        if (r != 0 - 2) { return 0 - 1; }
+    } elif (264 + sz <= load16(dn + 10)) {
+        memcpy(out, zfs_bonus(dn) + 264, sz);
+        return sz;
+    }
+    return zfs_read_ref(ref, 0, out, sz);
+}
+
+# --- the namespace: grafts, virtual dirs, path resolution ----------------------------------------------------------
+fn zfs_root_ref() {
+    var g = zfs_gr_find(0, 0);
+    if (g < 0) { return 0 - 2; }
+    return load64(zfs_gr(g) + 8);
+}
+# Look name up in directory ref (a dataset directory). The dirent (type << 60 | object) / -2 / -1.
+fn zfs_dir_lookup(ref, name, nl) {
+    var dn = zfs_dnslot(4);
+    if (zfs_ref_dn(ref, dn) != 0) { return 0 - 1; }
+    var di = zfs_ref_di(ref);
+    var v = 0;
+    var r = zfs_zap_lookup(dn, name, nl, 8, 1, &v);           # case folding follows the ZAP's own normflags
+    if (r == 1) { return v; }
+    if (r == 0 - 2) { return 0 - 2; }
+    return 0 - 1;
+}
+fn zfs_dt_type(dt) {
+    if (dt == 8) { return 1; }
+    if (dt == 4) { return 2; }
+    if (dt == 10) { return 3; }
+    return 0;
+}
+# Resolve path (len bytes, relative to the ZFS namespace root; "" and "/" are the root) to a ref. follow = follow a
+# symlink in the LAST component. Symlink targets resolve inside this namespace — an absolute one from its root (the
+# altroot view). zfs_res_type = 1 file / 2 dir / 3 symlink / 0 other. Returns the ref (>= 0) or -2 not found,
+# -20 not a directory, -40 symlink loop, -36 too long, -1 error.
+fn zfs_resolve(path, len, follow) {
+    if (len < 0 || len > 1023) { return 0 - 36; }
+    var a = zfs_mem + ZR_P0;
+    var b = zfs_mem + ZR_P1;
+    var c = zfs_mem + ZR_PC;
+    var rs = zfs_mem + ZR_STK;                   # ref per canonical depth
+    var ls = zfs_mem + ZR_STK + 1024;            # canonical length per depth
+    memcpy(a, path, len);
+    var al = len;
+    var ap = 0;
+    var dep = 0;
+    var cl = 0;
+    var cur = zfs_root_ref();
+    if (cur < 0) { return 0 - 2; }
+    store64(rs, cur);
+    store64(ls, 0);
+    var ty = 2;
+    var links = 0;
+    while (1 == 1) {
+        while (ap < al && load8(a + ap) == 47) { ap = ap + 1; }
+        if (ap >= al) { zfs_res_type = ty; return cur; }
+        var s = ap;
+        while (ap < al && load8(a + ap) != 47) { ap = ap + 1; }
+        var nl = ap - s;
+        var q = ap;
+        while (q < al && load8(a + q) == 47) { q = q + 1; }
+        var last = 0;
+        if (q >= al) { last = 1; }
+        if (ty != 2) { return 0 - 20; }
+        if (nl == 1 && load8(a + s) == 46) { continue; }
+        if (nl == 2 && load8(a + s) == 46 && load8(a + s + 1) == 46) {
+            if (dep > 0) { dep = dep - 1; }
+            cur = load64(rs + dep * 8);
+            cl = load64(ls + dep * 8);
+            ty = 2;
+            continue;
+        }
+        if (nl > 255 || cl + 1 + nl > 1023 || dep >= 127) { return 0 - 36; }
+        store8(c + cl, 47);
+        memcpy(c + cl + 1, a + s, nl);
+        var ncl = cl + 1 + nl;
+        var g = zfs_gr_find(c, ncl);
+        var nxt = 0 - 2;
+        var nty = 2;
+        if (g >= 0 && load64(zfs_gr(g)) == 1) { nxt = load64(zfs_gr(g) + 8); }
+        elif (zfs_ref_di(cur) >= 0) {
+            # ⚠ a dirent is type << 60 | object, so a file's or symlink's is NEGATIVE as an i64 — only the
+            # two sentinels (-1, -2: type 15, which no ZPL writes) are not entries.
+            var de = zfs_dir_lookup(cur, a + s, nl);
+            if (de == 0 - 1) { return 0 - 1; }
+            if (de != 0 - 2) {
+                nxt = ((zfs_ref_di(cur) + 1) << 48) | (de & ZK_MASK48);
+                nty = zfs_dt_type((de >> 60) & 0xF);
+            } elif (g >= 0) { nxt = load64(zfs_gr(g) + 8); }
+        } elif (g >= 0) { nxt = load64(zfs_gr(g) + 8); }
+        if (nxt == 0 - 2) { return 0 - 2; }
+        if (nty == 3 && (last == 0 || follow == 1)) {
+            links = links + 1;
+            if (links > 16) { return 0 - 40; }
+            var tl = zfs_readlink_ref(nxt, b, 1023);
+            if (tl < 0) { return 0 - 1; }
+            var rl = al - ap;
+            if (tl + 1 + rl > 1023) { return 0 - 36; }
+            store8(b + tl, 47);
+            memcpy(b + tl + 1, a + ap, rl);
+            var tmp = a;
+            a = b;
+            b = tmp;
+            al = tl + 1 + rl;
+            ap = 0;
+            if (tl > 0 && load8(a) == 47) {
+                dep = 0;
+                cur = load64(rs);
+                cl = 0;
+            }
+            ty = 2;
+            continue;
+        }
+        dep = dep + 1;
+        cl = ncl;
+        cur = nxt;
+        ty = nty;
+        store64(rs + dep * 8, cur);
+        store64(ls + dep * 8, cl);
+    }
+    return 0 - 1;
+}
+
+# Next entry of directory ref from *cur. Cursor: 0 ".", 1 "..", 2 + zap cursor, then ZK_XPHASE + entry index for
+# grafts / virtual dirs whose parent is this directory and that the directory does not itself hold (a mountpoint
+# the parent filesystem never got a directory for). dots = 0 skips "." and "..". The name is at ZR_NAME
+# (zfs_it_nlen), the type in zfs_de_type, the object in zfs_de_ino. 1 / 0 end / -1 error. Names > 255 bytes (the
+# longname feature) are skipped: the VFS caps a name at 255.
+fn zfs_dir_next(ref, cur, dots) {
+    var nm = zfs_mem + ZR_NAME;
+    while (1 == 1) {
+        var c = load64(cur);
+        if (c < 2) {
+            if (dots == 0) { store64(cur, 2); continue; }
+            store8(nm, 46);
+            store8(nm + 1, 46);
+            store8(nm + c + 1, 0);
+            zfs_it_nlen = c + 1;
+            zfs_de_type = 2;
+            zfs_de_ino = 0;
+            store64(cur, c + 1);
+            return 1;
+        }
+        if (c < ZK_XPHASE) {
+            if (zfs_ref_di(ref) < 0) { store64(cur, ZK_XPHASE); continue; }
+            var dn = zfs_dnslot(4);
+            if (zfs_ref_dn(ref, dn) != 0) { return 0 - 1; }
+            var zc = c - 2;
+            var r = zfs_zap_next(dn, &zc);
+            if (r < 0) { return 0 - 1; }
+            if (r == 0) { store64(cur, ZK_XPHASE); continue; }
+            store64(cur, zc + 2);
+            if (zfs_it_nlen <= 255) {
+                zfs_de_type = zfs_dt_type((zfs_it_val >> 60) & 0xF);
+                zfs_de_ino = zfs_it_val & ZK_MASK48;
+                return 1;
+            }
+            continue;
+        }
+        var i = c - ZK_XPHASE;
+        while (i < zfs_ngr) {
+            var e = zfs_gr(i);
+            i = i + 1;
+            if (load64(e + 16) == ref) {
+                var lo = load64(e + 32);
+                var l = load64(e + 24) - lo;
+                var have = 0 - 2;
+                if (zfs_ref_di(ref) >= 0) { have = zfs_dir_lookup(ref, e + 40 + lo, l); }
+                if (have == 0 - 2 && l > 0 && l < 256) {
+                    memcpy(nm, e + 40 + lo, l);
+                    store8(nm + l, 0);
+                    zfs_it_nlen = l;
+                    zfs_de_type = 2;
+                    zfs_de_ino = 0;
+                    store64(cur, ZK_XPHASE + i);
+                    return 1;
+                }
+            }
+        }
+        store64(cur, ZK_XPHASE + i);
+        return 0;
+    }
+    return 0;
+}
+
+# --- mount ---------------------------------------------------------------------------------------------------------
+# Every strict ancestor of a graft that is not itself a graft becomes a virtual dir (§ 11); then each entry learns
+# its parent's ref by resolving its parent path (a real directory when the parent dataset has one).
+fn zfs_build_namespace() {
+    var n = zfs_ngr;
+    var i = 0;
+    while (i < n) {
+        var e = zfs_gr(i);
+        var l = load64(e + 24);
+        var k = 0;
+        while (k < l) {
+            if (k == 0 || load8(e + 40 + k) == 47) {
+                if (zfs_gr_find(e + 40, k) < 0) { zfs_gr_add(2, 0, e + 40, k); }
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    if (zfs_gr_find(0, 0) < 0) { zfs_gr_add(2, 0, 0, 0); }
+    i = 0;
+    while (i < zfs_ngr) {
+        var e2 = zfs_gr(i);
+        var l2 = load64(e2 + 24);
+        if (l2 > 0) {
+            var pl = load64(e2 + 32) - 1;
+            if (pl < 0) { pl = 0; }
+            var pr = zfs_resolve(e2 + 40, pl, 1);
+            if (pr >= 0 && zfs_res_type == 2) { store64(e2 + 16, pr); }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# MOS, feature gate, DSL walk. 0 / -1.
+fn zfs_mount_pool() {
+    var os = zfs_mem + ZR_OS;
+    var bp[128];
+    memcpy(&bp, zfs_mem + ZR_UB + 40, 128);
+    if (zfs_bp_read(&bp, os, 4096) != 0 || load64(os + 704) != 1) {
+        kprint("zfs: MOS unreadable: ", 21);
+        zfs_why_print();
+        return 0 - 1;
+    }
+    memcpy(zfs_mem + ZR_MOS, os, 512);
+    var od = zfs_dnslot(0);
+    if (zfs_dnode(zfs_mem + ZR_MOS, 1, od) != 0) { kprintln("zfs: no MOS object directory", 28); return 0 - 1; }
+    var v = 0;
+    if (zfs_zap_u64(od, "features_for_read", &v) == 1) {
+        var fd = zfs_dnslot(1);
+        if (zfs_dnode(zfs_mem + ZR_MOS, v, fd) != 0) { return 0 - 1; }
+        var cur = 0;
+        var r = zfs_zap_next(fd, &cur);
+        while (r == 1) {
+            if (zfs_it_val != 0) {
+                if (zfs_feat_class(zfs_mem + ZR_NAME, zfs_it_nlen) == 0) { return zfs_feat_refuse(zfs_mem + ZR_NAME, zfs_it_nlen); }
+            }
+            r = zfs_zap_next(fd, &cur);
+        }
+        if (r < 0) { kprintln("zfs: feature table unreadable", 29); return 0 - 1; }
+    }
+    var rootdir = 0;
+    if (zfs_zap_u64(od, "root_dataset", &rootdir) != 1) { kprintln("zfs: no root dataset", 20); return 0 - 1; }
+    var pp = 0;
+    if (zfs_zap_u64(od, "pool_props", &pp) == 1) {
+        var pd = zfs_dnslot(1);
+        if (zfs_dnode(zfs_mem + ZR_MOS, pp, pd) == 0) {
+            var bf = 0;
+            if (zfs_zap_u64(pd, "bootfs", &bf) == 1) { zfs_bootfs = bf; }
+        }
+    }
+    zfs_dsl_walk(rootdir, 0, 0, 0, 0, 0, 0, 0);
+    zfs_build_namespace();
+    return 0;
+}
+
+# Cheap signature first (§ 1: the nvlist header at +16 KiB), then the full mount. 1 mounted / 0 not ZFS or refused.
+fn zfs_try(tag, lba, bytes, sec) {
+    zfs_backend = tag;
+    zfs_part_lba = lba;
+    zfs_lbsz = blk_lba_bytes_for(tag);
+    if (zfs_lbsz < 512 || zfs_lbsz > 4096) { return 0; }
+    zfs_dev_bytes = bytes & (0 - ZK_LABEL);
+    if (bytes > 0 && zfs_dev_bytes < 0x4000000) { return 0; }   # SPA_MINDEVSIZE 64 MiB
+    if (blk_read_sectors_on(tag, lba + ZK_NVOFF / zfs_lbsz, 1, sec) != 0) { return 0; }
+    if (load8(sec) != 1 || load8(sec + 2) != 0 || load8(sec + 3) != 0) { return 0; }
+    if (zfs_be32(sec + 4) != 0 || zfs_be32(sec + 8) != 1) { return 0; }
+    if (zfs_mem == 0) {
+        zfs_mem_phys = pmm_alloc_2mb_run(3);
+        if (zfs_mem_phys == 0) { kprintln("zfs: no 6 MiB for the reader - pool not mounted", 47); return 0; }
+        zfs_mem = pmm_kva_for_access(zfs_mem_phys);
+    }
+    memset(zfs_mem + ZR_LBL, 0, ZR_END - ZR_LBL);
+    zfs_codec_init();
+    zfs_nds = 0;
+    zfs_ngr = 0;
+    zfs_lay_ds = 0;
+    zfs_bootfs = 0;
+    if (zfs_label_load() != 0) { return 0; }
+    if (zfs_config() != 0) { return 0; }
+    if (zfs_ub_load() != 0) { return 0; }
+    if (zfs_mount_pool() != 0) { return 0; }
+    return 1;
+}
+
+# Probe every registered backend (whole disk, then each non-ESP GPT partition of blk_active). First pool wins.
+fn zfs_init() {
+    var sec = kmalloc(4096);
+    if (sec == 0) { return 0 - 1; }
+    var cand[5];
+    store8(&cand + 0, BLK_NVME);
+    store8(&cand + 1, BLK_AHCI);
+    store8(&cand + 2, BLK_USB_MS);
+    store8(&cand + 3, BLK_VIRTIO);
+    store8(&cand + 4, BLK_RAMDISK);
+    var found = 0;
+    var ci = 0;
+    while (ci < 5 && found == 0) {
+        var tag = load8(&cand + ci);
+        ci = ci + 1;
+        if (blk_is_registered(tag) == 1) {
+            var cap = 0;
+            if (tag == blk_active) { cap = blk_capacity * blk_lba_bytes_for(tag); }
+            # A whole-disk pool (FreeBSD `zpool create` on a raw device) has no partition table; on a GPT disk byte
+            # 16 KiB is inside the partition-entry array and the pool, if any, is in a partition below.
+            if (gpt_present == 0 || tag != blk_active) {
+                if (zfs_try(tag, 0, cap, sec) == 1) { found = 1; }
+            }
+            if (found == 0 && gpt_present == 1 && tag == blk_active) {
+                var pi = 0;
+                while (pi < gpt_partition_count && found == 0) {
+                    if (gpt_partition_info(pi) == 1) {
+                        var esp = 0;
+                        if (gpt_q_type_lo == GPT_TYPE_ESP_LO && gpt_q_type_hi == GPT_TYPE_ESP_HI) { esp = 1; }
+                        if (esp == 0) {
+                            if (zfs_try(tag, gpt_q_first_lba, gpt_q_sectors * blk_lba_bytes_for(tag), sec) == 1) { found = 1; }
+                        }
+                    }
+                    pi = pi + 1;
+                }
+            }
+        }
+    }
+    kfree_sized(sec, 4096);
+    if (found == 0) {
+        if (zfs_mem_phys != 0) {
+            pmm_free_2mb(zfs_mem_phys);
+            pmm_free_2mb(zfs_mem_phys + 0x200000);
+            pmm_free_2mb(zfs_mem_phys + 0x400000);
+            zfs_mem_phys = 0;
+            zfs_mem = 0;
+        }
+        return 0 - 1;
+    }
+    zfs_active = 1;
+    kprint("zfs: pool ", 10);
+    kprint(zfs_mem + ZR_POOL, strlen(zfs_mem + ZR_POOL));
+    kprint(" txg ", 5);
+    kprint_num(zfs_txg);
+    kprint(" backend=", 9);
+    kprint_num(zfs_backend);
+    if (zfs_part_lba > 0) { kprint(" partition_lba=", 15); kprint_num(zfs_part_lba); }
+    else { kprint(" whole-disk", 11); }
+    kprint(" ashift=", 8);
+    kprint_num(zfs_ashift);
+    kprint(" datasets=", 10);
+    kprint_num(zfs_nds);
+    kprintln(" read-only", 10);
+    return 0;
+}
+
+# --- VFS-facing entries (all called under fs_spin_lock) ------------------------------------------------------------
+# Where the ZFS-relative part of an absolute path routed to FS_ZFS starts. Computed from the path, NOT read from
+# vfs_mnt_reloff: that is one global every CPU's vfs_resolve_mount writes, and the mount table it derives from is
+# immutable after boot (vfs_mount_init), so the answer is a pure function of the path.
+fn zfs_reloff(path, len) {
+    if (len >= 8 && memeq(path, "/mnt/zfs", 8) == 1) {
+        if (len == 8 || load8(path + 8) == 47) { return 8; }
+    }
+    return 0;
+}
+# readdir#81 / readdir_at#101 for a path on the ZFS mount; -99 = "not ZFS, let the ext2 arm answer". Validation is
+# ext2_readdir_sys's: a NUL-terminated user path (<= 255 B), is_user_array for the records, the 8-byte cursor.
+fn zfs_readdir_sys(path, buf, maxn, curp) {
+    if (zfs_active == 0) { return 0 - 99; }
+    if (is_user_range(path, 256) == 0) { return 0 - 99; }
+    var pl = 0;
+    while (pl < 255 && load8(path + pl) != 0) { pl = pl + 1; }
+    if (vfs_resolve_mount(path, pl) != FS_ZFS) { return 0 - 99; }
+    if (maxn <= 0) { return 0; }
+    if (is_user_array(buf, maxn, 64) == 0) { return 0 - 1; }
+    if (curp != 0) { if (is_user_range(curp, 8) == 0) { return 0 - 1; } }
+    var r = zfs_reloff(path, pl);
+    fs_spin_lock();
+    var n = zfs_readdir_at(path + r, pl - r, buf, maxn, curp);
+    fs_spin_unlock();
+    return n;
+}
+# The 48-byte agnos stat (ABI § 4.1) of ref into sb. 0 / -1.
+fn zfs_stat_ref(ref, sb) {
+    var di = zfs_ref_di(ref);
+    if (di < 0) {
+        store64(sb, 0x41ED);
+        store64(sb + 8, 2);
+        store64(sb + 16, 0);
+        store64(sb + 24, 0);
+        store64(sb + 32, 0);
+        store64(sb + 40, 0);
+        return 0;
+    }
+    var dn = zfs_dnslot(4);
+    if (zfs_ref_dn(ref, dn) != 0) { return 0 - 1; }
+    var mode = zfs_attr(di, dn, 0);
+    var size = zfs_attr(di, dn, 1);
+    if (mode < 0 || size < 0) { return 0 - 1; }
+    var mt = zfs_attr(di, dn, 2);
+    var nl = zfs_attr(di, dn, 3);
+    if (mt < 0) { mt = 0; }
+    if (nl < 0) { nl = 1; }
+    var used = load64(dn + 24);
+    if ((load8(dn + 7) & 1) == 0) { used = used << 9; }      # DNODE_FLAG_USED_BYTES clear: dn_used counts sectors
+    store64(sb, mode & 0xFFFF);
+    store64(sb + 8, nl);
+    store64(sb + 16, size);
+    store64(sb + 24, ref & ZK_MASK48);
+    store64(sb + 32, used >> 9);
+    store64(sb + 40, mt);
+    return 0;
+}
+fn zfs_stat(path, len, follow, sb) {
+    var r = zfs_resolve(path, len, follow);
+    if (r < 0) { return 0 - 1; }
+    return zfs_stat_ref(r, sb);
+}
+fn zfs_readlink(path, len, buf, cap) {
+    var r = zfs_resolve(path, len, 0);
+    if (r < 0 || zfs_res_type != 3) { return 0 - 1; }
+    return zfs_readlink_ref(r, buf, cap);
+}
+# open#7 on the ZFS mount. Read-only by construction: any write, create or truncate flag is -1. AO_DIRECTORY ->
+# a VFS_ZFS_DIR fd (getdents#29); a regular file -> a VFS_ZFS_FILE fd that streams any size and seeks.
+fn zfs_open(path, len, flags) {
+    if ((flags & 0x303) != 0) { return 0 - 1; }
+    var follow = 1;
+    if ((flags & 0x1000) != 0) { follow = 0; }
+    var r = zfs_resolve(path, len, follow);
+    if (r < 0) { return 0 - 1; }
+    var t = zfs_res_type;
+    var fd = 0 - 1;
+    var base = 0;
+    if ((flags & 0x800) != 0) {
+        if (t != 2) { return 0 - 1; }
+        fd = vfs_alloc();
+        if (fd < 0) { return 0 - 1; }
+        base = vfs_fd_table() + fd * 32;
+        ktag_set(base, VFS_ZFS_DIR);
+        kpayload_set(base, 0, 0);
+        kpayload_set(base, 1, 0);
+        kpayload_set(base, 2, r);
+        return fd;
+    }
+    if (t != 1) { return 0 - 1; }
+    var dn = zfs_dnslot(4);
+    if (zfs_ref_dn(r, dn) != 0) { return 0 - 1; }
+    var size = zfs_attr(zfs_ref_di(r), dn, 1);
+    if (size < 0) { return 0 - 1; }
+    fd = vfs_alloc();
+    if (fd < 0) { return 0 - 1; }
+    base = vfs_fd_table() + fd * 32;
+    ktag_set(base, VFS_ZFS_FILE);
+    kpayload_set(base, 0, 0);
+    kpayload_set(base, 1, size);
+    kpayload_set(base, 2, r);
+    return fd;
+}
+# read#5 of a VFS_ZFS_FILE fd. Bytes / 0 at EOF / -1.
+fn zfs_fd_read(base, buf, count) {
+    var pos = kpayload(base, 0);
+    var size = kpayload(base, 1);
+    if (pos >= size) { return 0; }
+    var n = size - pos;
+    if (count < n) { n = count; }
+    var r = zfs_read_ref(kpayload(base, 2), pos, buf, n);
+    if (r > 0) { kpayload_set(base, 0, pos + r); }
+    return r;
+}
+# getdents#29 of a VFS_ZFS_DIR fd: ABI § 4.2 records ("." and ".." first). Bytes / 0 at end / -1.
+fn zfs_getdents(base, ubuf, size) {
+    var ref = kpayload(base, 2);
+    var cur = kpayload(base, 0);
+    var written = 0;
+    while (1 == 1) {
+        var prev = cur;
+        var r = zfs_dir_next(ref, &cur, 1);
+        if (r < 0) {
+            if (written > 0) { kpayload_set(base, 0, prev); return written; }
+            return 0 - 1;
+        }
+        if (r == 0) { kpayload_set(base, 0, cur); return written; }
+        var nl = zfs_it_nlen;
+        var rl = (8 + nl + 7) & (0 - 8);
+        if (written + rl > size) {
+            kpayload_set(base, 0, prev);
+            if (written == 0) { return 0 - 1; }
+            return written;
+        }
+        var rec = ubuf + written;
+        store16(rec, rl);
+        store8(rec + 2, zfs_de_type);
+        store8(rec + 3, nl);
+        store32(rec + 4, zfs_de_ino & 0xFFFFFFFF);
+        memcpy(rec + 8, zfs_mem + ZR_NAME, nl);
+        var k = 8 + nl;
+        while (k < rl) { store8(rec + k, 0); k = k + 1; }
+        written = written + rl;
+    }
+    return written;
+}
+# readdir#81 / readdir_at#101 records: 64 bytes, name NUL-terminated (<= 62 bytes), byte 63 = 1 for a directory.
+# "." and ".." are not listed. The cursor is opaque: 0 starts, -1 = exhausted. Count / -2 not found / -4 not a dir.
+fn zfs_readdir_at(path, plen, buf, maxn, curp) {
+    var r = zfs_resolve(path, plen, 1);
+    if (r < 0) { return 0 - 2; }
+    if (zfs_res_type != 2) { return 0 - 4; }
+    var cur = 2;
+    if (curp != 0) {
+        cur = load64(curp);
+        if (cur < 0) { return 0; }
+        if (cur < 2) { cur = 2; }
+    }
+    var n = 0;
+    while (n < maxn) {
+        var prev = cur;
+        var x = zfs_dir_next(r, &cur, 0);
+        if (x < 0) {
+            if (curp != 0) { store64(curp, prev); }
+            return n;
+        }
+        if (x == 0) {
+            if (curp != 0) { store64(curp, 0 - 1); }
+            return n;
+        }
+        var rec = buf + n * 64;
+        var nl = zfs_it_nlen;
+        if (nl > 62) { nl = 62; }
+        memcpy(rec, zfs_mem + ZR_NAME, nl);
+        store8(rec + nl, 0);
+        var t = 0;
+        if (zfs_de_type == 2) { t = 1; }
+        store8(rec + 63, t);
+        n = n + 1;
+    }
+    if (curp != 0) { store64(curp, cur); }
+    return n;
+}
+# statfs#103 (ABI § 4.7): blocks of 2^ashift; total = the top-level vdev's allocatable size; free = total minus
+# the root dsl_dir's used bytes (dataset-accounted, so pool metadata outside $MOS is not counted); available =
+# free minus the 1/32 slop OpenZFS reserves (spa_slop_shift = 5).
+fn zfs_fill_statfs(buf) {
+    var bs = 1 << zfs_ashift;
+    var tot = zfs_asize >> zfs_ashift;
+    var used = (zfs_used + bs - 1) >> zfs_ashift;
+    var fre = tot - used;
+    if (fre < 0) { fre = 0; }
+    var avl = fre - (tot >> 5);
+    if (avl < 0) { avl = 0; }
+    store64(buf, bs);
+    store64(buf + 8, tot);
+    store64(buf + 16, fre);
+    store64(buf + 24, avl);
+    return 0;
+}
+# exec-from-ZFS (vfs_read_file*/vfs_file_size): a regular file's size, or an offset read by path. -1 on anything else.
+fn zfs_file_size(path, len) {
+    var r = zfs_resolve(path, len, 1);
+    if (r < 0 || zfs_res_type != 1) { return 0 - 1; }
+    var dn = zfs_dnslot(4);
+    if (zfs_ref_dn(r, dn) != 0) { return 0 - 1; }
+    return zfs_attr(zfs_ref_di(r), dn, 1);
+}
+fn zfs_read_path_at(path, len, off, dst, n) {
+    var sz = zfs_file_size(path, len);
+    if (sz < 0 || off < 0) { return 0 - 1; }
+    if (off >= sz) { return 0; }
+    if (n > sz - off) { n = sz - off; }
+    return zfs_read_ref(zfs_resolve(path, len, 1), off, dst, n);
+}
+
+#ifdef ZFS_SELFTEST
+# ⭐ The oracle walk: every directory, symlink and regular file of the grafted namespace, each file read in full
+# through the same path a read#5 takes and SHA-256'd. scripts/smoke/zfs-smoke.sh diffs these lines against the
+# manifest FreeBSD's OpenZFS wrote for the same image (scripts/tool/zfs-fixture.sh). Output, one per object:
+#   zfs-walk: D <path> | L <path> <target> | F <path> <size> <sha256> | F <path> <size> ERR <why>
+# ⚠ Per-object lines go to the SERIAL PORT ONLY (zfs_w_* below): a kprint scrolls the framebuffer console, which
+# costs ~0.2 s a line under KVM (the 16 MB shadow blit, roadmap "fb console full-surface blit") and made the
+# 3,000-entry directory a ten-minute walk. The smoke reads serial; begin/done stay on kprint for the console.
+fn zfs_w(buf, len) { serial_print(buf, len); return 0; }
+fn zfs_wln(buf, len) { serial_println(buf, len); return 0; }
+fn zfs_wnum(n) { var nb[24]; var l = fmt_int_buf(n, &nb); serial_print(&nb, l); return 0; }
+fn zfs_wwhy() {
+    var m = zfs_why_msg();
+    zfs_w(m, strlen(m));
+    if (zfs_why == ZW_CKALG || zfs_why == ZW_COMP) { zfs_wnum(zfs_why_arg); }
+    zfs_wln("", 0);
+    return 0;
+}
+var zfs_w_files = 0;
+var zfs_w_dirs = 0;
+var zfs_w_links = 0;
+var zfs_w_errs = 0;
+fn zfs_walk_hex64(v) {
+    var hx[16];
+    var i = 0;
+    while (i < 16) {
+        var d = (v >> ((15 - i) * 4)) & 0xF;
+        if (d < 10) { store8(&hx + i, 48 + d); } else { store8(&hx + i, 87 + d); }
+        i = i + 1;
+    }
+    zfs_w(&hx, 16);
+    return 0;
+}
+fn zfs_walk_file(pb, pl, ref) {
+    var dn = zfs_dnslot(4);
+    if (zfs_ref_dn(ref, dn) != 0) { return 0 - 1; }
+    var size = zfs_attr(zfs_ref_di(ref), dn, 1);
+    zfs_w("zfs-walk: F ", 12);
+    zfs_w(pb, pl);
+    zfs_w(" ", 1);
+    zfs_wnum(size);
+    zfs_sha256_begin();
+    var off = 0;
+    var bad = 0;
+    while (off < size && bad == 0) {
+        var n = size - off;
+        if (n > 0x10000) { n = 0x10000; }
+        var r = zfs_read_ref(ref, off, zfs_mem + ZR_WBUF, n);
+        if (r <= 0) { bad = 1; }
+        else {
+            zfs_sha256_update(zfs_mem + ZR_WBUF, r);
+            off = off + r;
+        }
+    }
+    if (bad == 1 || size < 0) {
+        zfs_w(" ERR ", 5);
+        zfs_wwhy();
+        zfs_w_errs = zfs_w_errs + 1;
+        return 0;
+    }
+    var h[32];
+    zfs_sha256_end(&h);
+    zfs_w(" ", 1);
+    var i = 0;
+    while (i < 4) { zfs_walk_hex64(load64(&h + i * 8)); i = i + 1; }
+    zfs_wln("", 0);
+    zfs_w_files = zfs_w_files + 1;
+    return 0;
+}
+fn zfs_walk_dir(pb, pl, ref, depth) {
+    if (depth > 24) { return 0; }
+    var cur = 0;
+    var r = zfs_dir_next(ref, &cur, 0);
+    while (r == 1) {
+        var nl = zfs_it_nlen;
+        if (pl + 1 + nl < 4000) {
+            store8(pb + pl, 47);
+            memcpy(pb + pl + 1, zfs_mem + ZR_NAME, nl);
+            var cl = pl + 1 + nl;
+            var cr = zfs_resolve(pb, cl, 0);
+            var t = zfs_res_type;
+            if (cr < 0) {
+                zfs_w("zfs-walk: ? ", 12);
+                zfs_w(pb, cl);
+                zfs_wln(" unresolvable", 13);
+                zfs_w_errs = zfs_w_errs + 1;
+            } elif (t == 2) {
+                zfs_w("zfs-walk: D ", 12);
+                zfs_wln(pb, cl);
+                zfs_w_dirs = zfs_w_dirs + 1;
+                zfs_walk_dir(pb, cl, cr, depth + 1);
+            } elif (t == 3) {
+                var tb = zfs_mem + ZR_WBUF;
+                var tl = zfs_readlink_ref(cr, tb, 4095);
+                zfs_w("zfs-walk: L ", 12);
+                zfs_w(pb, cl);
+                zfs_w(" ", 1);
+                if (tl >= 0) { zfs_wln(tb, tl); } else { zfs_wln("ERR", 3); zfs_w_errs = zfs_w_errs + 1; }
+                zfs_w_links = zfs_w_links + 1;
+            } elif (t == 1) {
+                zfs_walk_file(pb, cl, cr);
+            }
+        }
+        r = zfs_dir_next(ref, &cur, 0);
+    }
+    if (r < 0) {
+        zfs_w("zfs-walk: ? ", 12);
+        zfs_w(pb, pl);
+        zfs_w(" listing failed: ", 17);
+        zfs_wwhy();
+        zfs_w_errs = zfs_w_errs + 1;
+    }
+    return 0;
+}
+fn zfs_selftest() {
+    if (zfs_active == 0) { kprintln("zfs-walk: no pool", 17); return 0; }
+    fs_spin_lock();
+    var pb = zfs_mem + ZR_WALK;
+    var root = zfs_root_ref();
+    kprintln("zfs-walk: begin", 15);
+    if (root >= 0) { zfs_walk_dir(pb, 0, root, 0); }
+    kprint("zfs-walk: done files=", 21);
+    kprint_num(zfs_w_files);
+    kprint(" dirs=", 6);
+    kprint_num(zfs_w_dirs);
+    kprint(" links=", 7);
+    kprint_num(zfs_w_links);
+    kprint(" errors=", 8);
+    kprint_num(zfs_w_errs);
+    kprintln("", 0);
+    fs_spin_unlock();
+    return 0;
+}
+#endif

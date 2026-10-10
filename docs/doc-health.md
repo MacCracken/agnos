@@ -6,9 +6,32 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-09-26 (**1.57.10 — VT-d translation runs for the first time, AHCI bounces its buffer, the harness backlog cleared (gate 36, known-red rows); three issue files closed, one filed; see the 1.57.10 block**).
+> **Last refresh**: 2026-10-09 (**1.57.11 — read-only ZFS; the BSP stacks moved up 256 KB**; see the 1.57.11 block below). Previous: 2026-09-26 (**1.57.10 — VT-d translation runs for the first time, AHCI bounces its buffer, the harness backlog cleared (gate 36, known-red rows); three issue files closed, one filed; see the 1.57.10 block**).
 >
 >
+>
+> ### 1.57.11 (2026-10-09) — read-only ZFS (operator: read now, write 1.57.12)
+>
+> ✅ **`CHANGELOG.md` 1.57.11** — Added (read-only ZFS, the `/mnt/zfs` syscall surface, the OpenZFS fixture oracle, the
+> three gates), Changed (the BSP stack move; `mountlist` backend 4; the aarch64 ZFS stubs; sweep row 1's stale known-red
+> mark removed), Closeout (2,621,208 B; LOAD end `0x38fdb8`; `check.sh` 37/37, `sweep.sh` 66/66).
+>
+> ✅ **`CLAUDE.md`** closeout step 1 — 37 gates (gate 37 described), 66 sweep rows, no known-red row; gate 34's bound and
+> the weighed-size grant re-stated (`0x3D0000`, `0x260000`).
+>
+> ✅ **NEW: `architecture/zfs-read-only.md`** — single walker, the 6 MiB area, the block-cache identity key, checksum word
+> order, the graft namespace, the refusals, and what the 1.57.12 write path must change first.
+>
+> ✅ **`agnos-userland-abi.md`** — NEW §3.6 (the ZFS mount contract on existing rows); `#104` backend 4; `#101`'s cursor is
+> opaque on ZFS; §3.5's `mountlist` note no longer claims ids > 3 are refused.
+>
+> ✅ **Region-1 layout, every site**: `CLAUDE.md` (the image-wall note), `architecture/kernel-stacks-and-preemption.md`
+> (Region 1 table), `build.md`, `state.md`, `roadmap.md` (new "ZFS" section; rekha / dead-code / iron-burn rows), the
+> gate and smoke comments (`check.sh`, `sweep.sh`, `test.sh`, `ci.yml`, `release.yml`, `agnsh-smoke.sh`, `qemu-dwell.sh`).
+> ⚠ `architecture/kernel-font-namespace.md` still narrates the 1.57.7 layout as history — accurate for its time, not updated.
+>
+> ✅ **agnosticos `prior-art/zfs-prior-art.md`** (NEW, + its README row). Sibling: crab
+> `2026-10-09-mountlist-backend-4-zfs-shows-unknown` (cosmetic: the VOLUMES label for backend 4).
 >
 > ### 1.57.10 (2026-09-26) — three issues; three parallel steps, each from a prior-art note
 >

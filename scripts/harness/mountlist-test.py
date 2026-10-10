@@ -146,7 +146,7 @@ try:
         80: "#104 returned < 1 mount — every boot mounts at least \"/\"",
         81: "#104 returned MORE records than the buffer was sized for",
         82: "a record carried backend id 0 (FS_NONE) — never emitted by a correct arm",
-        83: "a record carried a backend id above FS_EXFAT(3)",
+        83: "a record carried a backend id above FS_ZFS(4)",
         84: "a record carried prefixlen < 1",
         85: "a record carried prefixlen > 64 — it would not fit the slot",
         86: "a prefix was NOT NUL-padded past its length — ring 3 can read a stale tail byte",

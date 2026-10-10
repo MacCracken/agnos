@@ -281,7 +281,7 @@ qemu_assert_booted() {
 #   syscall: kernel stack is not the caller  kstack_check_entry: a switch path missed kstack_install
 #   PANIC: Double Fault                      exc_df_report: the #DF stub (a kernel stack is gone)
 #   boot: BSP stack window not free RAM      (1.57.7 IMG-fix) mbi.cyr bootstack_window_check: the UEFI map calls part
-#                                            of [0x390000, 0x3C0000) something other than free RAM
+#                                            of [0x3D0000, 0x400000) (1.57.11) something other than free RAM
 #   wq: wait primitive entered ...           (1.57.7 S3c) sched.cyr wq_assert_if0: arm/cancel/sleep reached with IF=1
 #   wq: arm from a non-running ...           wq_arm on a proc that is not RUNNING (state != 2, != 0)
 #   wq: current is not running ...           wq_can_block: current's on_cpu is not this CPU (INV-RUN)

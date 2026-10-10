@@ -36,6 +36,8 @@ enum VfsType {
     #   [1]=channel epoch AT CLAIM, [2]=cached mode. ⛔ Every op re-derives authority from these three
     #   against the kernel-side tables — the fd is a CLAIM, not a capability, so an inherited copy is
     #   inert by construction rather than by anyone remembering to close it. See planning/ipc.md §9.3.
+    VFS_ZFS_FILE  = 12;  # 1.57.11 read-only ZFS file: payload[0]=pos, [1]=size, [2]=ref (zfs.cyr: dataset slot+1 << 48 | object)
+    VFS_ZFS_DIR   = 13;  # 1.57.11 ZFS directory (getdents): payload[0]=cursor (zfs_dir_next), [2]=ref
 }
 
 # 1.41.7 — FAT/exFAT write-back fd. The secondary-FS backends write WHOLE files
@@ -407,6 +409,7 @@ enum FsBackend {
     FS_EXT2  = 1;
     FS_FAT   = 2;
     FS_EXFAT = 3;
+    FS_ZFS   = 4;    # 1.57.11 — read-only ZFS (core/zfs.cyr); mountlist#104 reports it as backend 4
 }
 
 # Up to 8 mounts. Module-global `var X[N]` = N×u64, so these are 8 u64 slots
@@ -452,6 +455,12 @@ fn vfs_mount_init() {
     # harmless redundant aliases — both slots route to the same backend.)
     if (fatfs_active != 0)  { vfs_mount_add("/mnt/fat", 8, FS_FAT); }
     if (exfat_active != 0)  { vfs_mount_add("/mnt/exfat", 10, FS_EXFAT); }
+    # 1.57.11 — ZFS is read-only, so it takes "/" only when nothing else can (no ext2, no FAT/exFAT): a root that
+    # refuses every write would break `touch`/`cmd > file` on a box that has a writable filesystem to offer.
+    if (zfs_active != 0) {
+        if (vfs_mnt_count == 0) { vfs_mount_add("/", 1, FS_ZFS); }
+        vfs_mount_add("/mnt/zfs", 8, FS_ZFS);
+    }
     return 0;
 }
 
@@ -669,6 +678,10 @@ fn vfs_read_file_inner(path, namelen, dst, cap) {
     if (dst == 0)   { return 0 - 1; }
     if (cap <= 0)   { return 0 - 1; }
     if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
+    # 1.57.11 — a path under the ZFS mount reads from ZFS (exec-from-ZFS); everything else keeps its old route.
+    if (vfs_resolve_mount(path, namelen) == FS_ZFS) {
+        return zfs_read_path_at(path + zfs_reloff(path, namelen), namelen - zfs_reloff(path, namelen), 0, dst, cap);
+    }
     # ext2 (primary FS): resolve path -> inode, regular-file only, read fully.
     if (ext2_active != 0) {
         var ino = ext2_path_lookup(path, namelen);
@@ -737,6 +750,9 @@ fn vfs_read_file_at_inner(path, namelen, offset, dst, len) {
     if (len <= 0)    { return 0 - 1; }
     if (offset < 0)  { return 0 - 1; }
     if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
+    if (vfs_resolve_mount(path, namelen) == FS_ZFS) {          # 1.57.11 — exec-from-ZFS (elf_load_from_file)
+        return zfs_read_path_at(path + zfs_reloff(path, namelen), namelen - zfs_reloff(path, namelen), offset, dst, len);
+    }
     if (ext2_active != 0) {
         var ino = ext2_path_lookup(path, namelen);
         if (ino > 0) {
@@ -767,6 +783,9 @@ fn vfs_file_size(path, namelen) {
 }
 fn vfs_file_size_inner(path, namelen) {
     if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
+    if (vfs_resolve_mount(path, namelen) == FS_ZFS) {          # 1.57.11 — exec-from-ZFS
+        return zfs_file_size(path + zfs_reloff(path, namelen), namelen - zfs_reloff(path, namelen));
+    }
     if (ext2_active != 0) {
         var ino = ext2_path_lookup(path, namelen);
         if (ino > 0) {
@@ -1054,6 +1073,14 @@ fn vfs_read(fd_idx, buf, count) {
         if (n > 0) { kpayload_set(base, 0, pos + n); }
         fs_spin_unlock();
         return n;
+    }
+    if (ftype == VFS_ZFS_FILE) {
+        # 1.57.11 — read-only ZFS: zfs_fd_read streams any size (blocks through the zfs.cyr cache), advances
+        # payload[0]. fs_lock for the same reason as the ext2 arm: the ZFS module scratch is shared.
+        fs_spin_lock();
+        var zn = zfs_fd_read(base, buf, count);
+        fs_spin_unlock();
+        return zn;
     }
     return 0 - 1;
 }

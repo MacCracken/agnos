@@ -1,0 +1,18 @@
+[package]
+name = "zfscodec"
+version = "0.1.0"
+description = "HOST oracle for kernel/core/zfs_codec.cyr — the ZFS driver's SHA-256 (one-shot and streaming), SHA-512/256, fletcher2/4, ZAP hash and lz4/lzjb/zle/gzip decoders, scored against vectors from hashlib, zlib, the lz4 CLI and ports of the OpenZFS compressors (scripts/check/zfs-codec-vectors.py), with every buffer butted against PROT_NONE guard pages. Exits 95 iff every case passes."
+license = "GPL-3.0-only"
+language = "cyrius"
+# Tracks the ROOT pin (scripts/check/toolchain-pin-check.sh compares the strings): this binary
+# compiles the kernel's own codec source, so it must be built by the compiler the kernel is.
+cyrius = "6.6.6"
+
+[build]
+src = "zfscodec.cyr"
+output = "build/zfscodec"
+
+# syscalls -> SYS_WRITE / SYS_EXIT, plus raw mmap (9) and mprotect (10) for the guard pages. Nothing
+# else: the codec under test may call only kernel/klib/kstring.cyr, which this program includes.
+[deps]
+stdlib = ["syscalls"]

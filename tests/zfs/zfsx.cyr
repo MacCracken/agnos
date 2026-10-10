@@ -1,0 +1,141 @@
+# zfsx — ring-3 exerciser for the read-only ZFS mount (agnos 1.57.11).
+#
+# ⭐ IT RUNS FROM ZFS. scripts/tool/zfs-fixture.sh stages this binary into the pool's `agnostank/payload`
+# dataset, and scripts/harness/zfs-ring3-test.py types `/mnt/zfs/agnostank/payload/zfsx` at agnsh — so the
+# spawn#43 that starts it already read the ELF through vfs_file_size + vfs_read_file_at on FS_ZFS. A run that
+# reports any exit code at all has proven exec-from-ZFS.
+# The fixture's contract (scripts/tool/zfs-fixture.sh recipe 1, pool `agnostank`, mounted at /agnostank):
+# hello.txt = "hello from zfs\n" with a hard link hello-link.txt, sym-short -> hello.txt, dir3000/f0000..f2999,
+# big.bin (6 MiB). ⚠ THE EXIT CODE IS THE RESULT: 95 = every clause held; 60..91 name the first one that broke
+# (scripts/harness/zfs-ring3-test.py carries the table).
+
+# ⚠ The large buffers live at MODULE scope (8 B per element): an agnos exec gets ~12 KB of usable init stack
+# (roadmap TRUE), so a 64 KiB local would fault before the first syscall.
+var zx_gd[512];       # 4 KiB getdents buffer
+var zx_page[512];     # 4 KiB = 64 readdir_at records
+var zx_big[8192];     # 64 KiB read buffer
+
+fn zx_len(s) { var n = 0; while (load8(s + n) != 0) { n = n + 1; } return n; }
+fn zx_eq(a, b, n) { var i = 0; while (i < n) { if (load8(a + i) != load8(b + i)) { return 0; } i = i + 1; } return 1; }
+fn zx_open(p, fl) { return syscall(7, p, zx_len(p), fl, 0); }
+
+fn zx_main(): i64 {
+    var hp = "/mnt/zfs/agnostank/hello.txt";
+    var buf[64];
+    # ---- open / read / EOF ----
+    var fd = zx_open(hp, 0);
+    if (fd < 0) { return 60; }
+    var n = syscall(5, fd, &buf, 64);
+    if (n != 15 || zx_eq(&buf, "hello from zfs\n", 15) == 0) { return 61; }
+    if (syscall(5, fd, &buf, 64) != 0) { return 62; }
+    # ---- lseek#58 on a VFS_ZFS_FILE ----
+    if (syscall(58, fd, 6, 0) != 6) { return 63; }
+    if (syscall(5, fd, &buf, 4) != 4 || zx_eq(&buf, "from", 4) == 0) { return 64; }
+    if (syscall(58, fd, 0, 2) != 15) { return 65; }
+    # ---- a ZFS fd is not writable ----
+    if (syscall(1, fd, "x", 1) >= 0) { return 88; }
+    syscall(6, fd);
+    # ---- stat#33 / lstat#102 / readlink#70 ----
+    var st[48];
+    if (syscall(33, hp, zx_len(hp), &st) != 0) { return 66; }
+    if ((load64(&st) & 0xF000) != 0x8000) { return 67; }
+    if (load64(&st + 16) != 15) { return 68; }
+    if (load64(&st + 8) != 2) { return 69; }                 # hello.txt + hello-link.txt
+    var sp = "/mnt/zfs/agnostank/sym-short";
+    if (syscall(102, sp, zx_len(sp), &st) != 0 || (load64(&st) & 0xF000) != 0xA000) { return 70; }
+    if (syscall(33, sp, zx_len(sp), &st) != 0 || load64(&st + 16) != 15) { return 71; }
+    var ln = syscall(70, sp, zx_len(sp), &buf, 64);
+    if (ln != 9 || zx_eq(&buf, "hello.txt", 9) == 0) { return 72; }
+    var miss = "/mnt/zfs/agnostank/no-such-file";
+    if (syscall(33, miss, zx_len(miss), &st) == 0) { return 89; }
+    # ---- getdents#29 on an AO_DIRECTORY fd: ".", "..", then 3000 names ----
+    var dp = "/mnt/zfs/agnostank/dir3000";
+    var dfd = zx_open(dp, 0x800);
+    if (dfd < 0) { return 73; }
+    var total = 0;
+    var first = 1;
+    var g = syscall(29, dfd, &zx_gd, 4096);
+    while (g > 0) {
+        var o = 0;
+        while (o < g) {
+            var rl = load16(&zx_gd + o);
+            if (rl < 8) { return 74; }
+            if (first == 1) {
+                if (load8(&zx_gd + o + 3) != 1 || load8(&zx_gd + o + 8) != 46) { return 75; }   # "." first
+                first = 0;
+            }
+            total = total + 1;
+            o = o + rl;
+        }
+        g = syscall(29, dfd, &zx_gd, 4096);
+    }
+    syscall(6, dfd);
+    if (total != 3002) { return 74; }
+    # ---- readdir_at#101: 64 at a time, every f0000..f2999 exactly once, cursor ends at -1 ----
+    var seen[384];                                           # 3072 bits
+    var k = 0;
+    while (k < 384) { store8(&seen + k, 0); k = k + 1; }
+    var cur[8];
+    store64(&cur, 0);
+    var cnt = 0;
+    var guard = 0;
+    while (load64(&cur) != (0 - 1) && guard < 200) {
+        var r = syscall(101, dp, &zx_page, 64, &cur);
+        if (r < 0) { return 76; }
+        var i = 0;
+        while (i < r) {
+            var rec = &zx_page + i * 64;
+            if (load8(rec) != 102 || load8(rec + 5) != 0 || load8(rec + 63) != 0) { return 90; }   # "fNNNN", a file
+            var v = (load8(rec + 1) - 48) * 1000 + (load8(rec + 2) - 48) * 100 + (load8(rec + 3) - 48) * 10 + (load8(rec + 4) - 48);
+            if (v < 0 || v >= 3000) { return 90; }
+            var bit = 1 << (v & 7);
+            if ((load8(&seen + (v >> 3)) & bit) != 0) { return 90; }   # a name listed twice
+            store8(&seen + (v >> 3), load8(&seen + (v >> 3)) | bit);
+            cnt = cnt + 1;
+            i = i + 1;
+        }
+        guard = guard + 1;
+    }
+    if (cnt != 3000) { return 76; }
+    if (load64(&cur) != (0 - 1)) { return 77; }
+    # ---- statfs#103 ----
+    var sf[32];
+    var rp = "/mnt/zfs/agnostank";
+    if (syscall(103, rp, zx_len(rp), &sf) != 0) { return 78; }
+    if (load64(&sf) != 4096) { return 79; }                  # ashift=12
+    if (load64(&sf + 8) <= 0 || load64(&sf + 16) > load64(&sf + 8) || load64(&sf + 24) > load64(&sf + 16)) { return 80; }
+    # ---- every write verb is refused on a read-only pool ----
+    var np = "/mnt/zfs/agnostank/new-file";
+    if (zx_open(np, 0x100) >= 0) { return 81; }              # AO_CREAT
+    if (zx_open(hp, 0x1) >= 0) { return 82; }                # AO_WRONLY
+    if (syscall(9, np, zx_len(np)) == 0) { return 83; }      # mkdir
+    if (syscall(30, hp, zx_len(hp)) == 0) { return 84; }     # unlink
+    if (syscall(31, hp, zx_len(hp), np, zx_len(np)) == 0) { return 85; }   # rename
+    # ---- mountlist#104 reports the pool as backend 4 at /mnt/zfs ----
+    var ml[640];
+    var mn = syscall(104, &ml, 8);
+    var saw = 0;
+    var j = 0;
+    while (j < mn) {
+        var mr = &ml + j * 80;
+        if (load64(mr) == 4 && load64(mr + 8) == 8 && zx_eq(mr + 16, "/mnt/zfs", 8) == 1) { saw = 1; }
+        j = j + 1;
+    }
+    if (saw == 0) { return 86; }
+    # ---- a multi-block file streams to exactly its size (6 MiB through 64 KiB reads) ----
+    var bp = "/mnt/zfs/agnostank/big.bin";
+    if (syscall(33, bp, zx_len(bp), &st) != 0) { return 87; }
+    var want = load64(&st + 16);
+    var bfd = zx_open(bp, 0);
+    if (bfd < 0) { return 87; }
+    var got = 0;
+    var rr = syscall(5, bfd, &zx_big, 65536);
+    while (rr > 0) { got = got + rr; rr = syscall(5, bfd, &zx_big, 65536); }
+    syscall(6, bfd);
+    if (rr < 0 || got != want || want != 6291456) { return 87; }
+    return 95;
+}
+
+fn main(): i64 { return zx_main(); }
+fn _entry(): i64 { var rc = main(); syscall(SYS_EXIT, rc); return 0; }
+_entry();

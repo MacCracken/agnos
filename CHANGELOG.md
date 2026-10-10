@@ -20,6 +20,82 @@ A removed syscall number, struct offset or measured value is a fact deletion. Nu
 ---
 
 
+## [1.57.11] — 2026-10-09 — read-only ZFS, and the BSP stacks move up to make room
+
+The roadmap's top item. Operator rulings 2026-10-09: **read in 1.57.11, write in 1.57.12**; zstd file data is
+refused this cut (a follow-on); the ~100 KB the reader adds is allowed to grow the image (a heavy refactor is
+planned), so the BSP boot stack moved up instead of trimming. Grounded in agnosticos
+`docs/development/prior-art/zfs-prior-art.md` (OpenZFS headers, the FreeBSD loader, GRUB/U-Boot, FreeBSD `makefs`).
+No syscall number minted. **Built, gated, NOT burned.**
+
+### Added
+
+- **Read-only ZFS** (`kernel/core/zfs.cyr`, `kernel/core/zfs_codec.cyr`; ABI §3.6;
+  `docs/architecture/zfs-read-only.md`). The kernel probes every registered block device (whole disk, then each
+  non-ESP GPT partition of the active one) for a vdev label, imports the first pool it can read and mounts it as
+  `FsBackend` **`FS_ZFS = 4`** at **`/mnt/zfs`** (at `/` only when no ext2/FAT/exFAT took it). Labels (4 × 256 KiB,
+  XDR nvlist, embedded SHA-256), the best uberblock (txg, timestamp, MMP seq), the MOS, the `features_for_read`
+  gate (label + MOS), DSL datasets with `mountpoint` / `canmount` inheritance grafted the way
+  `zpool import -o readonly=on -R` + `zfs mount -a` shows them (plus `bootfs`), micro and fat ZAPs (hashed lookup;
+  enumeration over every leaf block below `zap_freeblk`), dnodes incl. large dnodes, indirect trees, holes,
+  embedded and gang block pointers, ditto copies, system attributes (registry + layouts + spill) and pre-SA
+  znodes, symlinks (SA, spill, bonus, data). Checksums fletcher2/4, SHA-256, SHA-512/256; compression lz4, lzjb,
+  zle, gzip-1…9. Disk/file and mirror top-level vdevs (any one side of a mirror reads alone); little-endian pools.
+  Memory: a 6 MiB direct-mapped area allocated only when a label is found (no `.bss` growth beyond the codec's
+  1,552 B). Every entry runs under `fs_spin_lock`.
+- **Syscalls on `/mnt/zfs`** (no new numbers): `open`#7 (streaming `VFS_ZFS_FILE` fd, any size; `AO_DIRECTORY` →
+  `VFS_ZFS_DIR`; any write/create/truncate flag → -1), `read`#5, `lseek`#58, `close`#6, `getdents`#29 (`.`/`..`
+  first), `readdir`#81 / `readdir_at`#101 (the cursor is opaque on ZFS), `stat`#33, `lstat`#102, `readlink`#70,
+  `statfs`#103, `mountlist`#104 (backend **4**), and exec from ZFS (`spawn_path`#43 / `execwait`#37 through
+  `vfs_file_size` / `vfs_read_file_at`). Every write verb answers -1.
+- **Refused by name**, never silently: an unknown or layout-changing read feature (`device_removal`, `draid`,
+  `raidz_expansion`, …), more than one top-level vdev, raidz / dRAID / indirect, big-endian, destroyed pools
+  (`zfs: …`); datasets that are encrypted, mid-receive, or whose metadata uses skein / edonr / blake3
+  (`zfs: dataset <name> not grafted: <why>`); zstd, skein, edonr, blake3 and redacted blocks (`read` → -1). The ZIL
+  is not replayed.
+- **The OpenZFS oracle** — `scripts/tool/zfs-fixture.sh` (+ `zfs-fixture-guest.sh`): a FreeBSD 15.1 guest under
+  KVM builds nine pool images with real OpenZFS (and one with `makefs -t zfs`) and writes the manifest of what a
+  read-only import shows (`D`/`F size sha256`/`L target`/`M dataset`) plus `zdb` dumps; cached under
+  `~/.cache/agnos/zfs-fixtures`, keyed on the recipe and the payload.
+- **Gates.** `scripts/smoke/zfs-smoke.sh` (sweep row, `ZFS_SELFTEST=1`): seven lanes — main (ashift 12, every
+  default feature, gzip/lzjb/zle/off/1 MiB records, sha256/sha512, forced gang blocks, embedded blocks, large
+  dnodes + spill, ZPL 4, a 3,000-entry fat ZAP, custom/legacy/canmount=off mountpoints, the refusals), ashift 9,
+  pool v28, each mirror side alone, `makefs`, raidz (refused) — each walk diffed EXACTLY against the manifest
+  by `scripts/smoke/lib/zfs-manifest-diff.py`; the only tolerated differences are the refusals the pool's own
+  properties explain. `scripts/smoke/zfs-ring3-smoke.sh` + `scripts/harness/zfs-ring3-test.py` +
+  `tests/zfs/zfsx.cyr` (sweep row, plain kernel): agnsh runs `/mnt/zfs/agnostank/payload/zfsx` FROM the pool;
+  exit 95. `scripts/check/host-zfs-oracles.sh` (check.sh **gate 37**) + `tests/zfscodec`: 249 host cases against
+  hashlib / zlib / the lz4 CLI / Python ports of lzjb and zle, under PROT_NONE guard pages; 31 of 32 mutations red
+  (the survivor is unobservable). `ZFS_SELFTEST` build flag (`build.sh`, `build.md`).
+
+### Changed
+
+- **The BSP stacks moved up 256 KB**: boot stack top `0x3A0000` → **`0x3E0000`**, the image bound (check.sh gate 34)
+  `0x390000` → **`0x3D0000`**, guard gap `[0x3E0000, 0x3F0000)`, BSP TSS.RSP0 window `[0x3B0000, 0x3C0000)` →
+  **`[0x3F0000, 0x400000)`** (`tss_kernel_stack` / `tss_get_cpu_stack(0)` / the `proc_rsp0_top` fallback =
+  `0x400000`). `[0x3C0000, 0x400000)` was audited first: every reference was a stale comment. The runtime check
+  now reads `boot: BSP stack span 0x3D0000-0x400000 is free RAM in the UEFI map OK`. The weighed-size grant was
+  re-derived with the wall: `0x220000` → `0x260000`. Region 1 has no room left above the image.
+- `mountlist`#104 backend ids are 1..4; `tests/mountlist/mlist.cyr` accepts 4.
+- `arch/aarch64/stubs.cyr`: `zfs_active` / `zfs_fd_read` (shared `vfs.cyr` reaches them; `core/zfs.cyr` is x86-only
+  like ext2/exFAT) — the aarch64 compile debt stays at 32 functions / 17 variables with no new name.
+- `scripts/sweep.sh` row 1 (`baseline check.sh`) is no longer marked KNOWN RED: cyrius 6.7.6's `SysNrAgnos` peer
+  carries `#106`–`#108`, the `syscall ABI` gate is green, and the sweep flagged the mark stale.
+
+### Closeout
+
+- `build/agnos` **2,621,208 B** (+98,752 B over 1.57.10's 2,522,456 B; the ZFS reader + codec are almost all of it).
+  LOAD end **`0x38fdb8`** — **262,728 B** under gate 34's new `0x3D0000`, and only 584 B under the old `0x390000`
+  (the reader was 2,504 B over it when the move was ruled; the serial-only walk output won the bytes back, not a margin).
+- **Gates on the final tree:** `check.sh` **37/37** (the `syscall ABI` gate green for the first time since 1.57.7;
+  gate 37: 249 host codec cases) · `test.sh` (x86) **4/4** · `sweep.sh` (PARALLEL, 4 workers, **2,061 s** wall clock)
+  **66/66**, both new ZFS rows green; three rows passed on the serial retry — `hid-mouse-deferred` and `pipeline`
+  VOIDed in the parallel phase because their worker copy's QEMU monitor socket path exceeded the 108-byte
+  `sun_path` limit (deep worktree path; environmental), and `shutdown` · aarch64: 32 undefined functions / 17
+  undefined variables, no new name.
+- **Not burned** to hardware this cut.
+
+
 ## [1.57.10] — 2026-09-26 — AHCI bounces its buffer, VT-d translation runs for the first time, and the harness backlog is cleared
 
 The three 2026-09-26 issues. Three parallel steps (AHCI2, VTD, HAR2), each started from a prior-art note (agnosticos

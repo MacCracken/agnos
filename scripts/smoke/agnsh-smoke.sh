@@ -133,8 +133,8 @@ fi
 # ⭐ 1.57.7 (IMG-fix, A3): the BSP boot stack's span must be free RAM in the UEFI map the firmware handed over
 # (mbi.cyr bootstack_window_check). The violation line is denied below; the OK line is REQUIRED here, so a kernel
 # that stops running the check (or never reaches it) cannot pass by printing nothing.
-if strings "$LOG" | grep -q "boot: BSP stack span 0x390000-0x3C0000 is free RAM in the UEFI map OK"; then
-    echo "  PASS: BSP boot-stack span [0x390000, 0x3C0000) is free RAM in the UEFI map"
+if strings "$LOG" | grep -q "boot: BSP stack span 0x3D0000-0x400000 is free RAM in the UEFI map OK"; then
+    echo "  PASS: BSP boot-stack span [0x3D0000, 0x400000) is free RAM in the UEFI map"
 else
     echo "  FAIL: no 'boot: BSP stack span ... free RAM ... OK' line — the window check did not pass (or did not run)"; rc=1
 fi

@@ -305,3 +305,9 @@ fn klug_trylock() { return 0; }
 fn klug_unlock() { return 0; }
 fn atomic_or64(addr, v) { store64(addr, load64(addr) | v); return 0; }
 fn atomic_and64(addr, v) { store64(addr, load64(addr) & v); return 0; }
+
+# 1.57.11 — read-only ZFS (core/zfs.cyr) lives inside #ifdef ARCH_X86_64 like ext2/exFAT, but shared vfs.cyr reaches
+# two of its names: zfs_active (the mount table) and zfs_fd_read (the read arm). This port never imports a pool:
+# never active, and a ZFS fd cannot exist, so the read arm refuses.
+var zfs_active = 0;
+fn zfs_fd_read(slot, buf, count) { return 0 - 1; }
