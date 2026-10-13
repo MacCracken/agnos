@@ -59,9 +59,31 @@ they end at B1 or a wait interrupt. `/bin/agnsh` is unstoppable (kmain waits on 
   0x23 latches `lifecycle: claimed a kernel continuation` (denied by every smoke).
 - **INV-L2 — the lifecycle tick path acts only on a CPL3-interrupted frame.** A CPU interrupted in ring 3 holds no
   kernel lock, so the death chain may take, from the timer ISR, locks the `smp.cyr` banner otherwise calls non-ISR
-  (proctab, fs, heap, pmm, flock, chan/snd/shm, console if a callee kprints). The display hand-back runs in the ISR
+  (proctab, flock, chan/snd/shm, console if a callee kprints, and pmm through one release — `shm_release_pid` →
+  `shm_free` → `pmm_free_2mb` for a pmm-backed shm slot, a short bitmap hold). The display hand-back runs in the ISR
   (`gpu_release_pid_isr` drops ownership at once) but its disk spill + kprint are deferred to the next B1
   (`klug_spill_owed`). TLB shootdowns there are IF=0 with a bounded ack wait (the fault path's shape).
+  ⭐ **1.57.13 (design k.132 (3)): the tick path takes NO `fs_lock` and NO heap lock, and reaps nothing** (pmm only
+  through the shm release above — a callee walk of every tick-path release, 1.57.13 review). An orphan's reap and the
+  reap of each zombie child the dying process leaves free fd tables under `fs_lock` and address spaces under heap/pmm,
+  and `fs_lock` is held for whole ZFS commits (up to seconds); the ISR used to SPIN on it with the timer vector in
+  service (that CPU took no tick until the commit ended). Now a tick death publishes each such pid DYING (4) in its
+  final hold and sets its bit in `proc_orphan_owed`; the reap runs in PROCESS context — `proc_orphan_owed_run` from
+  the next B1 of any process (`proc_b1`) or the next idle step of any CPU (`sched_idle_step`, entered at IF=1) — as the
+  same remote reap a claimer runs (the fd table, the off-CPU fence, the address space, the publish), then its
+  `orphan … reaped` line and the pipe class wake. The drain **takes `fs_lock` with `fs_spin_trylock` or does nothing**
+  (a later B1 / idle step retries): no B1 and no idle CPU ever waits out someone else's commit for it. It runs
+  **non-preemptibly from the claim to the last publish** — the claim clears the bits, so a drain switched out midway
+  (the idle is switchable at preempt 0) would strand the claimed pids. While the reap is owed, a DYING slot whose
+  death is done (`lc_done`) is NOT a pipe end (`pipe_ends_open`): EOF / EPIPE stay visible, as for a state-0 zombie.
+  Nor is it LIVE to any other liveness test (the 1.57.13 merge; `proc.cyr` `lc_dying_done`, one definition): the
+  console's line owner and `console_mode`#110 holder (`kbd_line_owner_live_locked`, `kbd_mode_now`) and SIGWINCH's
+  watchers (`console_winch_post`). Its per-pid releases — the line, the mode, sockets, shm — already ran at the tick
+  (`proc_death_release` runs in the ISR; only the reap is owed); the helper is the backstop a missed clear relies on.
+  The ZFS commit a tick death owes (`zfs_wp_owed_run`) takes `fs_lock` the same way. Prior art: Linux runs `do_exit`
+  in process context on the way back to user mode and drops a dead task's mm in the next task's `finish_task_switch`
+  (the idle task included); FreeBSD exits from `ast()`. Gate: `kstack-smoke`'s `kstack: tick orphan OK` (-smp 4),
+  which also checks the pipe ends and both runners' refusal of a held `fs_lock`.
 - **Every transition INTO 5 re-checks the pending kill and the parent's liveness under the lock** and refuses when
   set / gone (a process about to die is never parked; a stopped process whose parent is gone would have no
   authority left that could continue it — D-33). A dying parent continues its stopped children.
@@ -84,7 +106,11 @@ reaps its zombies; the final scan-and-publish is ONE hold of `proctab_lock` (out
 child dying concurrently either is in the scan or sees `proc_death_done[parent] == 1` / state 0 and is an orphan
 (D-32). A zombie for a live parent (or kmain's fg child) publishes state 0 + SIGCHLD + `wq_wake(WK_CHILD|pp)`; an
 ORPHAN publishes 4, frees its own fd table and address space (`proc_reap_orphan` — self: `cr3_load(0x1000)` first,
-never the reap fence's self-owned path), then publishes dead AND reaped in one proctab hold. The reuse tripwire in
+never the reap fence's self-owned path), then publishes dead AND reaped in one proctab hold. ⭐ 1.57.13: a TICK death
+(`via=tick`) does neither reap in the ISR — its zombies become DYING (4) in the final hold instead of being reaped
+before it, and its own orphan reap is skipped; both are owed (`proc_orphan_owed`, INV-L2 above) and reaped remotely
+by the next syscall exit or idle step. A zombie reaped that way prints an `orphan … reaped` line (it is one: its
+parent is dying and nobody will read its status). The reuse tripwire in
 `proc_slot_reusable` (`proc: orphan zombie recycled unreaped`, denied) fires if an orphan slot with a live address
 space is ever handed out again — the D-29 leak (≈ 6 MB per orphan) this closes. kmain's own children (ppid 0) are
 never orphans: kmain reaps them through `fgwait`.
@@ -113,8 +139,11 @@ boundary. exit#0 and fault deaths emit no line.
 
 - A stopped keyboard reader KEEPS the keyboard line until SIGCONT or death (a stopped reader keeps its terminal).
 - A kill of a READY target whose `on_cpu` is still set is pending, not claimed, and dies ≤ one slice later.
-- The tick-path death runs the whole chain (and any orphan self-reap) in the timer ISR on the dying process's
-  RSP0 stack before EOI; its residency was not measured in 1.57.7 (lean mode).
+- The tick-path death runs the chain in the timer ISR on the dying process's RSP0 stack before EOI; its residency
+  was not measured in 1.57.7 (lean mode). Since 1.57.13 the reaps (orphan, zombie children) are owed to process
+  context, so an owed slot stays DYING until the next syscall exit or idle step of any CPU that wins `fs_lock` by
+  trylock — while every CPU runs ring-3 code that never syscalls, an owed orphan's memory and its slot wait (no waiter
+  needs them: nobody reads an orphan's status, and its pipe ends stopped counting at its final hold).
 - A post-scheduler ppid-0 child that kmain does not fg-wait leaks as before (none exists in production).
 - New iron-only surfaces (built and gated, NOT burned): the tick-path death, the B1 park (`int 0xE0` from the
   syscall exit), the self-reap's CR3 hand-back, the ISR display hand-back.

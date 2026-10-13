@@ -235,8 +235,10 @@ Only an array first touched after `room_init`, CPU-only (never a DMA address), a
    ~1.7 MB free; `room_init` halts by name past 2 MB.
 
 `aarch64`: `room.cyr` is in `agnos.cyr`'s x86_64 block only; the shared files' pointers (`klug_buf`, `sec_wfile_buf`)
-stay their poison there and klug stays in its early ring. The aarch64 build does not link today (32 undefined
-functions, 17 undefined variables — unchanged by the room); an aarch64 `room_init` belongs to the 1.6x port.
+stay their poison there and klug stays in its early ring. The aarch64 build did not link when the room landed (32
+undefined functions, 17 undefined variables — unchanged by the room); it compiles and links since 1.57.13
+(`arch/aarch64/stubs.cyr`), still with no `room_init` — nothing boots it — so the poison note stands. An aarch64
+`room_init` belongs to the 1.6x port.
 
 ## What the room changed elsewhere: ext2's direct DMA
 

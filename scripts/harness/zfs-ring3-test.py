@@ -39,13 +39,14 @@ import os, re, socket, subprocess, sys, time
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _freshness import refuse_stale_kernel
+from _qsock import qsock
 refuse_stale_kernel(ROOT)
 
 ROOTFS = os.path.join(ROOT, "build/rootfs")
 WORK = os.path.join(ROOT, "build/zfs-ring3")
 IMG = os.path.join(WORK, "agnos-zfs.img")
 SER = os.path.join(WORK, "serial.log")
-MON = os.path.join(WORK, "mon.sock")
+MON = qsock(os.path.join(WORK, "mon.sock"))  # 1.57.13: short + per-tree (_qsock.py)
 AGNOS = os.path.join(ROOT, "build/agnos")
 GNOBOOT = os.path.join(os.environ.get("GNOBOOT_ROOT", os.path.join(ROOT, "../gnoboot")), "build/BOOTX64.EFI")
 EXT2_FEATURES = "^resize_inode,^dir_index,^ext_attr,^huge_file,^64bit,^metadata_csum"

@@ -16,6 +16,8 @@
 #   K4 one line each — two `kbdblk` children: `one` and `two` go to different children, whole (mutation M-F4)
 #   K5 NB keeps a partial line — the driver's NB accumulator holds `ab` (-3) while a child waits for the LINE; `c\n`
 #              completes the DRIVER's `abc\n`; then `d\n` reaches the child (mutation M-F6)
+#   K6 (1.57.13) no keys — this PRODUCTION kernel refuses console_mode#110's TTY_SELFTEST geometry bits (0x100/0x200/
+#              0x400) as unknown (-1) and the mode stays 0: tty-smoke boots only the TTY_SELFTEST image
 # Per-line latency (last key sent -> line seen on the serial log) is REPORTED, not gated.
 # Boots -smp 1, then -smp 4 (KVM when /dev/kvm is writable, else multi-threaded TCG — printed). Each boot is
 # banner-gated: a boot whose log never shows "AGNOS kernel v" is VOID (retried up to 6x, never scored).
@@ -29,6 +31,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _freshness import refuse_stale_kernel, refuse_stale, exerciser_sources
 from _invdeny import smoke_invariant_deny
+from _qsock import qsock
 
 AGNOS = os.path.join(ROOT, "build/agnos")
 WAITX_DIR = os.path.join(ROOT, "tests/waits")
@@ -41,7 +44,7 @@ INV_DENY = smoke_invariant_deny()
 WORK = os.path.join(ROOT, "build/wait-kbd")
 SEED = os.path.join(WORK, "seed")
 IMG = os.path.join(WORK, "K.img")
-MON = "/tmp/agnos-wait-kbd.sock"
+MON = qsock(os.path.join(WORK, "mon.sock"))  # 1.57.13: short + per-tree (_qsock.py)
 EXT2_FEATURES = os.environ.get("EXT2_SMOKE_FEATURES", "^resize_inode,^dir_index,^metadata_csum,^64bit,^uninit_bg")
 TRIES = int(os.environ.get("QEMU_TRIES", "6"))
 VOID_RE = re.compile(r"gnoboot: fail @|BootManagerMenuApp|Please select boot device")
@@ -228,7 +231,7 @@ for smp in [int(x) for x in os.environ.get("WAITKBD_SMP", "1 4").split()]:
     def child_lines(tag):
         return re.findall(r"WXK-CHILD " + re.escape(tag) + r" (\S+)", t)
     p(f"  -- -smp {smp} verdicts --")
-    for k in ("k0", "k1", "k2", "k3", "k4", "k5"):
+    for k in ("k0", "k1", "k2", "k3", "k4", "k5", "k6"):
         if re.search(r"WXK-OK " + k + r"\b", t): ok(f"[smp{smp}] {k}: the driver's own check")
         else: bad(f"[smp{smp}] {k}: the driver's own check (no WXK-OK {k})")
     if got0: ok(f"[smp{smp}] K0 a blocking read returned the warm-up line")

@@ -12,8 +12,13 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
-DOOM_ROOT="${DOOM_ROOT:-$ROOT/../cyrius-doom}"
+# ⭐ 1.57.13 — SIBLINGS: an explicit <NAME>_ROOT wins, else ${SIBLINGS_ROOT:-$ROOT/..}/<repo> — the rule
+# scripts/burn/stage-tools.sh and scripts/check/syscall-abi-check.sh already follow. From a worktree $ROOT/.. is
+# .claude/worktrees/, which holds no sibling: the 1.57.12 sweep's run set SIBLINGS_ROOT and this smoke, reading only
+# its own variable, failed in 7 s ("not built" / "not found").
+SIBLINGS="${SIBLINGS_ROOT:-$ROOT/..}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-$SIBLINGS/gnoboot}"
+DOOM_ROOT="${DOOM_ROOT:-$SIBLINGS/cyrius-doom}"
 
 OVMF_CODE=""; for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
 OVMF_VARS_SRC=""; for c in /usr/share/edk2/x64/OVMF_VARS.4m.fd /usr/share/edk2/x64/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd; do [ -f "$c" ] && { OVMF_VARS_SRC="$c"; break; }; done
@@ -39,8 +44,10 @@ if [ -n "${DOOM_DIRECTMAP:-}" ]; then
 else
     echo "[1/4] Building DOOM_SELFTEST kernel..."
 fi
-if ! env DOOM_SELFTEST=1 DOOM_DIRECTMAP="${DOOM_DIRECTMAP:-}" sh "$ROOT/scripts/build.sh" >/tmp/doom-smoke-build.log 2>&1; then
-    echo "  BUILD-FAIL (see /tmp/doom-smoke-build.log)"; tail -5 /tmp/doom-smoke-build.log; exit 1
+# 1.57.13: the build log is the TREE's (it was /tmp/doom-smoke-build.log — one file for every tree and worker copy).
+mkdir -p "$ROOT/build"; DOOM_BLOG="$ROOT/build/doom-smoke-build.log"
+if ! env DOOM_SELFTEST=1 DOOM_DIRECTMAP="${DOOM_DIRECTMAP:-}" sh "$ROOT/scripts/build.sh" >"$DOOM_BLOG" 2>&1; then
+    echo "  BUILD-FAIL (see $DOOM_BLOG)"; tail -5 "$DOOM_BLOG"; exit 1
 fi
 echo "  build/agnos $(stat -c %s "$AGNOS") B"
 # ⭐ 1.57.7 (IMG-fix, reviews A6/B6): LEAVE A PLAIN PRODUCTION BUILD BEHIND on every exit from here on, as
@@ -54,6 +61,8 @@ trap doom_restore_plain EXIT
 WORK="$ROOT/build/doom-smoke"; LOGS="$ROOT/build/doom-smoke-logs"
 rm -rf "$WORK" "$LOGS"; mkdir -p "$WORK" "$LOGS"
 IMG="$WORK/agnos-doom.img"
+# 1.57.13: QEMU's UNIX sockets live on a SHORT path (smoke_qsock, qemu-dwell.sh — the 108-byte sun_path limit).
+VNC_SOCK=$(smoke_qsock "$WORK/vnc.sock"); MON_SOCK=$(smoke_qsock "$WORK/mon.sock")
 PART_OFFSET=$(( 33 * 1048576 ))
 PART_BYTES=$(( 200 * 1048576 ))
 PART_BLOCKS=$(( PART_BYTES / 4096 ))
@@ -93,15 +102,15 @@ dtry=1
 while :; do
     cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
     : > "$SLOG"
-    rm -f "$WORK/vnc.sock" "$WORK/mon.sock"
+    rm -f "$VNC_SOCK" "$MON_SOCK"
     qemu-system-x86_64 \
         -machine q35 -m 512M -cpu max \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
         -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
         -drive "file=$IMG,format=raw,if=none,id=disk0" \
         -device "nvme,drive=disk0,serial=AGNOS-DOOM" \
-        -vnc "unix:$WORK/vnc.sock" \
-        -monitor "unix:$WORK/mon.sock,server,nowait" \
+        -vnc "unix:$VNC_SOCK" \
+        -monitor "unix:$MON_SOCK,server,nowait" \
         -serial "file:$SLOG" -no-reboot &
     QPID=$!
     trap 'kill $QPID 2>/dev/null; doom_restore_plain' EXIT
@@ -139,7 +148,7 @@ sleep "${DOOM_RENDER_WAIT:-10}"
 
 echo "[4/4] Screendump + checks..."
 PPM="$WORK/doom.ppm"
-python3 - "$WORK/mon.sock" "$PPM" <<'PY'
+python3 - "$MON_SOCK" "$PPM" <<'PY'
 import socket, sys, time
 sock, out = sys.argv[1], sys.argv[2]
 s = socket.socket(socket.AF_UNIX); s.connect(sock); time.sleep(0.4)

@@ -12,7 +12,7 @@
 #
 # VT-d registers (MMIO at iommu_base; spec §11.4, Linux intel/iommu.h DMAR_*_REG):
 #   0x00 VER   0x08 CAP   0x10 ECAP   0x18 GCMD (WRITE-ONLY: reads 0)   0x1C GSTS   0x20 RTADDR   0x28 CCMD
-#   0x34 FSTS  0x38 FECTL 0x64 PMEN   0x80 IQH  0x88 IQT  0x90 IQA
+#   0x34 FSTS  0x38 FECTL 0x64 PMEN   0x80 IQH  0x88 IQT  0x90 IQA   0x9C ICS   0xB0 IQER
 #   ECAP.IRO*16 = IVA, +8 = IOTLB (register-based invalidation); CAP.FRO*16 = the fault-recording registers, 16 B each.
 #   (⛔ until 1.57.10 this banner put CCMD at 0x24, FSTS at 0x28 and IQH/IQT at 0x58/0x60. The code used 0x28 for CCMD.)
 #
@@ -33,12 +33,27 @@
 #     up first), so with translation on every xHCI ring outside the first 16 MB would have faulted (issue 2026-09-26).
 #   - AFTER TE the leaf is written and then invalidated as the hardware requires (iommu_after_new_leaf).
 #   - After an init that did not enable translation (or no DMAR at all): a no-op, as before.
+#   - NEVER the unit's own memory (1.57.13, the VTD review): its tables and queue pages live in own 2 MB chunks that
+#     iommu_map_2mb and iommu_register_dma refuse (iommu_own) — no device can reach what the unit reads untranslated.
 #
 # CR3 AUDIT (1.57.9, extended 1.57.10): the tables are written through their direct-map KVA (dma_kva), never phys, so a
 # grant is correct under ANY CR3 — which matters now: after TE a grant can come from a syscall (msc's lazily allocated data
 # page, hda's stream buffers) under a process's CR3, or from the xHCI event path on an AP. iommu_base is the identity VA of
 # the register block in PDPT[3], which vmm_remap_uc_2mb shatters at boot, before any process exists, and every
 # per-process PDPT copies. The grant path holds iommu_lock (smp.cyr, IRQ-saved) across the table edit + invalidation.
+#
+# ⭐ 1.57.13 (QI) — QUEUED INVALIDATION (issue 2026-09-26-vt-d-queued-invalidation; spec §6.5.2). Whenever ECAP.QI is set,
+# every context-cache and IOTLB invalidation goes through the invalidation queue, the Linux way (intel/dmar.c
+# dmar_enable_qi / __dmar_enable_qi / qi_submit_sync / qi_check_fault, iommu.c qi_flush_context / qi_flush_iotlb), with
+# FreeBSD sys/x86/iommu/intel_qi.c as the second reference (its IQH-based room check and its sequence-numbered status
+# word): ONE 4 KB queue page (256 x 128-bit descriptors: IQA.QS = 0, DW = 0), GCMD.QIE with a GSTS.QIES wait, every
+# invalidation followed by an invalidation-wait descriptor whose Status Write lands in a status page, and FSTS's IQE / ITE
+# / ICE checked on every poll. The register interface stays as the FALLBACK (no ECAP.QI, no memory for the queue, or a
+# VTD_REGISTER_INV test build), CAIG / IAIG checks included; at VER major >= 6 it is refused, because there every
+# register invalidation is an incorrect one (spec §6.5.1). Until 1.57.13 such a unit was refused outright.
+# ⚠ Linux uses QI under Caching Mode too; FreeBSD's dmar_init_qi forces the register interface when CAP.CM is set. This
+# file follows Linux (the issue's ruling): vtd-smoke's CM=1 boot runs the queue, including the post-TE page-selective
+# invalidation.
 
 var iommu_base = 0;        # MMIO base of the remapping unit (identity VA — vmm_remap_uc_2mb maps its 2 MB chunk UC)
 var iommu_active = 0;      # 1 once GSTS.TES confirmed translation ON (ext2.cyr keeps its direct-to-caller DMA off then)
@@ -66,6 +81,21 @@ var iommu_root_kva = 0;    #   ... its direct-map CPU pointer
 var iommu_top_phys = 0;    # the domain's top SL table (level iommu_levels) — physical, for every context entry's SLPTPTR
 var iommu_top_kva = 0;     #   ... its direct-map CPU pointer
 var iommu_ctx_buses = 0;   # context tables installed (one per bus pci_scan found a function on)
+# ⛔ 1.57.13 (the VTD review) — THE UNIT'S OWN MEMORY IS NEVER GRANTED. The root, context and SL tables and the queue and
+# status pages live in whole 2 MB "own chunks" that no grant can open. Until 1.57.13 each was a pmm_alloc page, and
+# pmm_alloc hands pages out top-down — into the very 2 MB region the replayed xHCI grant had opened read/write, in the one
+# domain EVERY device shares. Measured (vtd-smoke boot A): RTADDR 0xffe1000, queue 0xffe3000, status 0xffe2000, all under
+# the leaf 0xfe00083 virtio-net translated through. A device could rewrite the SL tables (the whole grant model, since
+# 1.57.10), write the status word early (an invalidation "done" before it ran), or forge a wait descriptor whose Status
+# Address the unit then writes UNTRANSLATED. iommu_table_new now carves pages from an own chunk (iommu_own_grow takes one:
+# a whole free 2 MB region no grant can ever cover), and iommu_map_2mb / iommu_register_dma refuse a chunk. Linux and
+# FreeBSD need no such rule — a per-device domain maps only what the DMA API handed out — but a 2 MB identity grant opens
+# its whole region, so here the unit's memory must own whole regions.
+var iommu_own[8];          # module scope = 8 x u64: the own chunks' 2 MB-aligned bases
+var iommu_own_n = 0;       # chunks taken: the first at iommu_init, another only when the newest is used up
+var iommu_own_used = 0;    # pages carved from the newest chunk (0..512)
+var iommu_own_pages = 0;   # pages carved in all (the own-structures line)
+var iommu_own_rej[8];      # module scope = 8 x u64: candidates one take refused, held so the search moves past them
 # ECAP.C (Extended Capability bit 0, "Coherency"): 1 = the remapping hardware snoops the CPU caches when it walks these
 # tables; 0 = it reads memory, so every table write must be clflushed out first (Linux __iommu_flush_cache). Read before
 # the first table write; 0 (the safe answer) until then. QEMU reports 0, so the smoke runs the clflush path.
@@ -91,6 +121,44 @@ var iommu_n_inv_fail = 0;  # an invalidation / flush that timed out or reported 
 var iommu_n_refused = 0;   # grants refused: past the table, no memory for a table, or the pre-init log full
 var iommu_refused_said = 0;
 var iommu_n_faults = 0;    # fault records drained by iommu_fault_scan
+
+# 1.57.13 (QI) — the invalidation queue (see the banner). Every field is touched only under iommu_lock, or by iommu_init
+# before any grant can reach the tables (the register interface's rule).
+var iommu_qi = 0;          # 1 = every invalidation goes through the queue (GSTS.QIES latched); 0 = the register interface
+var iommu_qi_phys = 0;     # the queue page (256 x 16 B descriptors) — physical, for IQA only
+var iommu_qi_kva = 0;      #   ... its direct-map CPU pointer: every descriptor store goes through it
+var iommu_qi_st_phys = 0;  # the status page: a wait descriptor's Status Address (the u32 at +0) — physical, descriptor only
+var iommu_qi_st_kva = 0;   #   ... its direct-map CPU pointer: the poll reads it
+var iommu_qi_tail = 0;     # the software tail: the next slot to fill (0..255); IQT = tail << 4
+var iommu_qi_seq = 0;      # the last Status Data issued (FreeBSD inv_waitd_seq): only THIS wait's write can match a poll
+var iommu_qi_drain = 0;    # IOTLB descriptor DR (bit 7) / DW (bit 6), from CAP.DRD / CAP.DWD (Linux qi_flush_iotlb)
+var iommu_qi_dead = 0;     # 1 = a submission could be neither completed nor recovered: nothing more is submitted
+var iommu_qi_why = 0;      # its first reason: 1 wait timed out, 2 QIES clear, 3 IQE unrecoverable, 4 ITE, 5 no room
+var iommu_n_qi = 0;        # submissions completed (each = its descriptor + one wait, or a bare wait)
+var iommu_n_iqe = 0;       # Invalidation Queue Errors seen (FSTS.IQE)
+var iommu_n_ite = 0;       # Invalidation Time-out Errors seen (FSTS.ITE — device-TLB only; this kernel issues none)
+var iommu_n_ice = 0;       # Invalidation Completion Errors seen (FSTS.ICE — device-TLB only)
+# 1.57.13 (the VTD review) — a wait that outlasts the bound STALLS the queue instead of killing it: Linux qi_submit_sync and
+# FreeBSD wait without a bound, a hypervisor's vIOMMU can be preempted, a DR/DW drain can queue behind heavy DMA. The
+# stalled submission stays the in-flight record below; the NEXT submission first gives it one more full bound
+# (iommu_qi_settle), and only a wait still incomplete then is DEAD.
+var iommu_qi_bound = 1000000;  # polls per bound (the bound every wait in this file uses); vtdst_qi_stall shortens it once
+var iommu_qi_cur_first = 0;    # the in-flight submission: its first slot,
+var iommu_qi_cur_wi = 0;       #   its wait's slot,
+var iommu_qi_cur_seq = 0;      #   its wait's Status Data,
+var iommu_qi_cur_iqe = 0;      #   1 once an IQE was recovered in it (a second one is not recoverable)
+var iommu_qi_stalled = 0;      # 1 = the in-flight wait outlasted a bound (its caller was told NOT performed)
+var iommu_n_stall = 0;         # waits that outlasted a bound
+var iommu_qi_told = 0;         # what the grant path has said lock-free, once each: bit 0 STALLED, bit 1 DEAD
+var iommu_qi_hold = 0;         # TEST-ONLY (vtdst_qi_stall): 1 = submit does not write IQT, so its wait cannot complete
+# VTD_REGISTER_INV (TEST-ONLY, scripts/smoke/vtd-smoke.sh boot AR): never enable the queue, so the register interface — the
+# fallback a unit without ECAP.QI gets — is booted on QEMU, whose unit always offers QI. Production prefers the queue.
+#ifdef VTD_REGISTER_INV
+var iommu_qi_forbid = 1;
+#endif
+#ifndef VTD_REGISTER_INV
+var iommu_qi_forbid = 0;
+#endif
 
 # VT-d register read/write. ⚠ iommu_write64 is ONE 8-byte store: QEMU runs a CCMD / IOTLB command only on the 8-byte
 # write or on the write of the HIGH dword, and the spec starts it on "the uppermost byte" (ICC / IVT live in bit 63).
@@ -214,15 +282,364 @@ fn iommu_flush_cache(kva, len) {
     return 0;
 }
 
-# A zeroed, flushed table page. Returns its PHYS (0 = no memory); the caller reaches it through dma_kva(phys).
+# Is `pa` inside one of the unit's own chunks (1.57.13)? Such an address is never grantable.
+fn iommu_is_own(pa) {
+    var oc = pa & 0xFFFFFFFFFFE00000;
+    for (var i = 0; i < iommu_own_n; i = i + 1) {
+        if (load64(&iommu_own + i * 8) == oc) { return 1; }
+    }
+    return 0;
+}
+
+# Is the 2 MB region holding `pa` granted? iommu_map_2mb's walk, read-only. 0 before the tables exist, and past the
+# table's reach (iommu_map_2mb refuses that).
+fn iommu_granted(pa) {
+    if (iommu_top_kva == 0) { return 0; }
+    if (pa < 0) { return 0; }
+    if (pa >= iommu_iova_top) { return 0; }
+    var tk = iommu_top_kva;
+    var lvl = iommu_levels;
+    while (lvl > 2) {
+        var e = load64(tk + ((pa >> (12 + 9 * (lvl - 1))) & 0x1FF) * 8);
+        if ((e & 3) == 0) { return 0; }
+        tk = dma_kva(e & 0x000FFFFFFFFFF000);
+        lvl = lvl - 1;
+    }
+    if ((load64(tk + ((pa >> 21) & 0x1FF) * 8) & 3) == 0) { return 0; }
+    return 1;
+}
+
+# May the 2 MB region at `c` hold the unit's own structures? Only if no grant can EVER cover it: outside the default
+# 16 MB, not a pre-init grant waiting for the replay, in no RMRR's range, not granted already (a grant is never revoked),
+# and inside the direct map (the CPU reaches every own page through dma_kva).
+fn iommu_own_fits(c) {
+    if (c < 0x1000000) { return 0; }
+    for (var i = 0; i < iommu_pend_n; i = i + 1) {
+        if (load64(&iommu_pend + i * 8) == c) { return 0; }
+    }
+    for (var ri = 0; ri < acpi_dmar_rmrr_n; ri = ri + 1) {
+        var ra = load64(&acpi_dmar_rmrr + ri * 16) & 0xFFFFFFFFFFE00000;
+        var rl = load64(&acpi_dmar_rmrr + ri * 16 + 8);
+        if (c >= ra) {
+            if (c <= rl) { return 0; }
+        }
+    }
+    if (iommu_granted(c) != 0) { return 0; }
+    var ck = dma_kva(c);
+    if (dma_kva_ok(ck) == 0) { return 0; }
+    if (dma_kva_ok(ck + 0x1FF000) == 0) { return 0; }
+    return 1;
+}
+
+# Take one more own chunk: a whole free 2 MB region (pmm_alloc_2mb_run_under over the live bitmap, top-down — away from the
+# low regions sys_mmap's pmm_alloc_2mb scans first, as room_init's fallback). A candidate that does not fit is held while
+# the search moves on (freeing it at once would hand it straight back), then freed. Under iommu_lock at runtime (lock order
+# iommu < pmm), or in iommu_init. 1 = taken, 0 = none: the table allocation that needed it fails, which its caller reports.
+fn iommu_own_grow() {
+    if (iommu_own_n >= 8) { return 0; }
+    var got = 0;
+    var nrej = 0;
+    while (nrej < 8) {
+        var c = pmm_alloc_2mb_run_under(1, pmm_2mb_top_region);
+        if (c == 0) { break; }
+        if (iommu_own_fits(c) != 0) {
+            got = c;
+            break;
+        }
+        store64(&iommu_own_rej + nrej * 8, c);
+        nrej = nrej + 1;
+    }
+    for (var i = 0; i < nrej; i = i + 1) { pmm_free_2mb(load64(&iommu_own_rej + i * 8)); }
+    if (got == 0) { return 0; }
+    store64(&iommu_own + iommu_own_n * 8, got);
+    iommu_own_n = iommu_own_n + 1;
+    iommu_own_used = 0;
+    return 1;
+}
+
+# A zeroed, flushed page for one of the unit's own structures, carved from the newest own chunk (another is taken when it
+# is used up — one chunk is 512 pages: the root, a context table per bus, the SL tables and the two queue pages). Returns
+# its PHYS (0 = no memory); the caller reaches it through dma_kva(phys). Own pages are never returned to pmm.
 fn iommu_table_new() {
-    var tp = pmm_alloc();
-    if (tp == 0) { return 0; }
+    if (iommu_own_n == 0 || iommu_own_used >= 512) {
+        if (iommu_own_grow() == 0) { return 0; }
+    }
+    var tp = load64(&iommu_own + (iommu_own_n - 1) * 8) + iommu_own_used * 4096;
+    iommu_own_used = iommu_own_used + 1;
+    iommu_own_pages = iommu_own_pages + 1;
     var tn_kva = dma_kva(tp);
-    if (dma_kva_ok(tn_kva) == 0) { pmm_free(tp); return 0; }
     memset(tn_kva, 0, 4096);
     iommu_flush_cache(tn_kva, 4096);
     return tp;
+}
+
+# === Queued invalidation (1.57.13; spec §6.5.2) ===
+# The queue page and the status page are read and written by the REMAPPING UNIT ITSELF, never through translation (IQA and
+# a wait's Status Address are physical; QEMU fetches and writes them through address_space_memory). So, like the root /
+# context / SL tables, they must lie where no DEVICE can reach them: both are own-chunk pages (iommu_table_new), and no
+# grant can open an own chunk. ⛔ This comment first said "neither is granted" while both were pmm_alloc pages inside the
+# 2 MB region the replayed xHCI grant had opened (the VTD review; see iommu_own). Both are held twice
+# (docs/architecture/dma-cpu-pointers.md): the phys goes only into IQA and the wait descriptor's Status Address; every
+# descriptor store and every status poll goes through the dma_kva pointer, correct under any CR3 (a grant after TE can
+# submit from a syscall or from an AP). Neither is clflushed: Linux qi_submit_sync and FreeBSD dmar_qi_emit store
+# descriptors with plain writes (ECAP.C describes the translation-structure walk, not the queue fetch); the mfence before
+# the IQT write orders them ahead of the hand-over, the job Linux's writel barrier does.
+
+# Store one 128-bit descriptor into queue slot `slot` (the high qword first; the unit fetches nothing before IQT moves).
+fn iommu_qi_put(slot, lo, hi) {
+    var qd = iommu_qi_kva + (slot & 0xFF) * 16;
+    store64(qd + 8, hi);
+    store64(qd, lo);
+    return 0;
+}
+
+# Free slots between the software tail and the unit's own head (FreeBSD dmar_qi_ensure reads IQH the same way). One slot
+# always stays empty, so head == tail means EMPTY.
+fn iommu_qi_room() {
+    var qh = (iommu_read32(0x80) >> 4) & 0xFF;
+    return (qh - iommu_qi_tail - 1) & 0xFF;
+}
+
+# The queue can no longer be trusted: a head that stopped never moves again, and register-based invalidation is not
+# allowed while QIE is set, so nothing is submitted from here on and every later invalidation counts as failed (fail
+# closed: translation stays as it is; a grant made after this may fault, which the boot DMA check reports). Returns -1.
+fn iommu_qi_die(why) {
+    if (iommu_qi_dead == 0) { iommu_qi_why = why; }
+    iommu_qi_dead = 1;
+    return 0 - 1;
+}
+
+# Linux qi_check_fault, for one submission whose descriptors are slots [first, wi], the wait at wi. FSTS:
+#   IQE (bit 4) — the unit stopped AT the descriptor IQH names (it was malformed) and fetches nothing until IQE is clear.
+#        If that slot is one of ours BEFORE the wait: overwrite it with a copy of the wait (Linux's recovery — the re-fetch
+#        finds a well-formed descriptor whose status write is ours, and nothing behind it is skipped), clear IQE (W1C), and
+#        write IQT again, unchanged: a no-op on hardware, which resumes on the clear, and the only thing that restarts
+#        QEMU's fetch (its FSTS handler does not — "FIXME: when IQE is Clear, should we try to fetch"). Returns 1:
+#        recovered, but that descriptor was NOT performed (a SECOND IQE in the same submission means the recovery did not
+#        take: the caller declares the queue dead). An IQE at the wait itself, or outside this submission: -3.
+#   ITE (bit 6) — a device-TLB invalidation timed out and every pending wait was aborted. This kernel issues no device-TLB
+#        invalidation (no ATS), so it is not ours to retry: clear it (W1C) and fail, -4.
+#   ICE (bit 5) — an invalidation completion error (a device-TLB ITag): clear it (W1C) and keep waiting, as Linux does, 0.
+fn iommu_qi_fault(first, wi) {
+    var fs = iommu_read32(0x34);
+    if ((fs & 0x70) == 0) { return 0; }
+    if ((fs & 0x10) != 0) {
+        iommu_n_iqe = iommu_n_iqe + 1;
+        var qh = (iommu_read32(0x80) >> 4) & 0xFF;
+        if (((qh - first) & 0xFF) >= ((wi - first) & 0xFF)) { return 0 - 3; }
+        var ws = iommu_qi_kva + wi * 16;
+        iommu_qi_put(qh, load64(ws), load64(ws + 8));
+        arch_mfence();
+        iommu_write32(0x34, 0x10);                           # FSTS.IQE (W1C)
+        iommu_write32(0x88, iommu_qi_tail << 4);             # IQT, unchanged: resume the fetch
+        return 1;
+    }
+    if ((fs & 0x40) != 0) {
+        iommu_n_ite = iommu_n_ite + 1;
+        iommu_write32(0x34, 0x40);                           # FSTS.ITE (W1C)
+        return 0 - 4;
+    }
+    iommu_n_ice = iommu_n_ice + 1;
+    iommu_write32(0x34, 0x20);                               # FSTS.ICE (W1C)
+    return 0;
+}
+
+# Poll the in-flight submission (iommu_qi_cur_*) for up to one bound, iommu_qi_fault on every turn (Linux qi_submit_sync's
+# loop). drained = 1 also requires IQH == IQT (a stall settling: nothing may be left queued behind it). 0 = its wait wrote
+# its status; 1 = it did, but an IQE was recovered in it (that descriptor was NOT performed); -1 = the queue died here;
+# -2 = the bound ran out.
+fn iommu_qi_wait(drained) {
+    var t = 0;
+    while (t < iommu_qi_bound) {
+        if (load32(iommu_qi_st_kva) == iommu_qi_cur_seq) {
+            var done = 1;
+            if (drained != 0) {
+                if (iommu_read32(0x80) != iommu_read32(0x88)) { done = 0; }
+            }
+            if (done != 0) { return iommu_qi_cur_iqe; }
+        }
+        var r = iommu_qi_fault(iommu_qi_cur_first, iommu_qi_cur_wi);
+        if (r == 1) {
+            if (iommu_qi_cur_iqe != 0) {                     # a SECOND IQE in one submission: the recovery did not take
+                iommu_qi_die(3);
+                return 0 - 1;
+            }
+            iommu_qi_cur_iqe = 1;
+        }
+        if (r < 0) {
+            iommu_qi_die(0 - r);
+            return 0 - 1;
+        }
+        t = t + 1;
+    }
+    return 0 - 2;
+}
+
+# A STALLED submission gets ONE more full bound — its status word must carry its sequence and the queue be drained — before
+# anything else is queued behind it. 0 = it completed late (the stall is over); -1 = the queue is dead: "the wait descriptor
+# never completed (timeout)" now means two full bounds, with the caller's own work done in between.
+fn iommu_qi_settle() {
+    var sr = iommu_qi_wait(1);
+    if (sr == 0 - 2) { return iommu_qi_die(1); }
+    if (sr < 0) { return 0 - 1; }
+    iommu_qi_stalled = 0;
+    return 0;
+}
+
+# Linux qi_submit_sync: `n` descriptors (0 or 1: lo / hi), then an invalidation-wait descriptor — type 5 | SW (Status
+# Write, bit 5), Status Data = a fresh sequence number in bits 63:32, Status Address = the status page — the tail moved
+# ONCE, then the status word polled with iommu_qi_fault on every turn. Synchronous, under iommu_lock (or in iommu_init
+# before any grant can reach the tables), so one submission is in flight at a time and the sequence number alone tells
+# this wait's write from any older one (FreeBSD's inv_waitd_seq). IF is never set: QEMU asserts SW and IF are not both
+# set, and a polled wait needs no interrupt. A stall left by the previous submission is settled first. 0 = performed.
+# -1 = NOT performed (the caller counts it): the queue is dead; the previous stall did not settle in a second bound (DEAD);
+# GSTS.QIES is clear (posting into a queue the unit does not fetch waits forever — QIE not set before submit); no room
+# (the head never moved); an IQE (recovered or not); an ITE; or this wait did not write its status within the bound
+# (1 M polls) — then the queue is STALLED, not dead (1.57.13, the VTD review: until then that was the timeout death, and a
+# slow but working unit lost the queue for the rest of the boot).
+fn iommu_qi_submit(lo, hi, n) {
+    if (iommu_qi_dead != 0) { return 0 - 1; }
+    if (iommu_qi_stalled != 0) {
+        if (iommu_qi_settle() != 0) { return 0 - 1; }
+    }
+    if ((iommu_read32(0x1C) & (1 << 26)) == 0) { return iommu_qi_die(2); }
+    var spin = 0;
+    while (iommu_qi_room() < n + 1) {
+        spin = spin + 1;
+        if (spin > 1000000) { return iommu_qi_die(5); }
+    }
+    var first = iommu_qi_tail;
+    if (n != 0) { iommu_qi_put(first, lo, hi); }
+    var wi = (first + n) & 0xFF;
+    iommu_qi_seq = (iommu_qi_seq + 1) & 0x7FFFFFFF;
+    if (iommu_qi_seq == 0) { iommu_qi_seq = 1; }
+    iommu_qi_put(wi, (iommu_qi_seq << 32) | (1 << 5) | 5, iommu_qi_st_phys);
+    iommu_qi_tail = (wi + 1) & 0xFF;
+    iommu_qi_cur_first = first;
+    iommu_qi_cur_wi = wi;
+    iommu_qi_cur_seq = iommu_qi_seq;
+    iommu_qi_cur_iqe = 0;
+    arch_mfence();
+    if (iommu_qi_hold == 0) { iommu_write32(0x88, iommu_qi_tail << 4); }   # IQT: hand the descriptors to the unit
+    var w = iommu_qi_wait(0);
+    if (w == 0) {
+        iommu_n_qi = iommu_n_qi + 1;
+        return 0;
+    }
+    if (w == 0 - 2) {
+        iommu_qi_stalled = 1;
+        iommu_n_stall = iommu_n_stall + 1;
+    }
+    return 0 - 1;
+}
+
+# Linux dmar_disable_qi (FreeBSD dmar_disable_qi): turn off a queue firmware or a previous kernel left on. First give the
+# unit the chance to finish what is queued (IQH == IQT, bounded) — the spec forbids disabling with requests pending, and
+# QEMU refuses it ("improper state when disable QI") and leaves QIES set. ⛔ Until 1.57.13 iommu_init cleared QIE without
+# that wait. 0 = off, -1 = QIES would not clear.
+fn iommu_qi_disable() {
+    var dq = 0;
+    while (dq < 1000000) {
+        if (iommu_read32(0x80) == iommu_read32(0x88)) { break; }
+        dq = dq + 1;
+    }
+    iommu_write32(0x18, iommu_gcmd_status() & 0xFBFFFFFF);  # GCMD.QIE off
+    return iommu_wait_gsts(1 << 26, 0);
+}
+
+# Linux dmar_enable_qi + __dmar_enable_qi, FreeBSD dmar_init_qi: the queue page and the status page (zeroed, so the status
+# word matches no sequence number), stale IQE / ICE / ITE cleared first (Linux intel_iommu_init_qi clears old faults),
+# IQT = 0 BEFORE IQA (Linux: "write zero to the tail reg"), IQA = base | DW = 0 (128-bit descriptors: scalable mode is not
+# used) | QS = 0 (one page, 256 descriptors), then GCMD.QIE and the GSTS.QIES wait. 1 = the queue is on; 0 = no memory
+# for it (the register interface stays — Linux falls back when dmar_enable_qi fails); -1 = QIES never latched.
+fn iommu_qi_enable() {
+    var qp = iommu_table_new();
+    if (qp == 0) { return 0; }
+    var sp = iommu_table_new();
+    if (sp == 0) { return 0; }                               # (qp stays carved: own-chunk pages are never returned)
+    iommu_qi_phys = qp;
+    iommu_qi_kva = dma_kva(qp);
+    iommu_qi_st_phys = sp;
+    iommu_qi_st_kva = dma_kva(sp);
+    iommu_qi_tail = 0;
+    iommu_qi_seq = 0;
+    iommu_qi_dead = 0;
+    iommu_write32(0x34, 0x70);                               # FSTS: W1C a stale ITE / ICE / IQE
+    iommu_write32(0x88, 0);                                  # IQT = 0
+    iommu_write64(0x90, qp & 0x000FFFFFFFFFF000);            # IQA: base | DW = 0 | QS = 0
+    iommu_write32(0x18, iommu_gcmd_status() | (1 << 26));   # GCMD.QIE
+    if (iommu_wait_gsts(1 << 26, 1) != 0) { return 0 - 1; }
+    iommu_qi = 1;
+    return 1;
+}
+
+# Why the queue died, that it is stalled, or that an IQE was recovered — one line, never under iommu_lock. LOCK-FREE (klug +
+# COM1 directly, the shape of iommu_register_dma's REFUSED line) for every caller: iommu_init's refusals, the boot DMA
+# check, and since 1.57.13's VTD review the grant path, which can run in interrupt context where kprint's console lock may
+# be held by the very code the interrupt stopped. ⛔ Until then only the first two said it, so a queue that stalled or
+# died on a grant AFTER the one-shot boot DMA check was never reported at all.
+fn iommu_qi_tell() {
+    if (iommu_qi == 0) { return 0; }
+    if (iommu_qi_dead == 0) {
+        if (iommu_qi_stalled != 0) {
+            klug_append("iommu: queued invalidation STALLED - a wait outlasted the bound; the next submission settles it", 95);
+            klug_putc(10);
+            serial_println("iommu: queued invalidation STALLED - a wait outlasted the bound; the next submission settles it", 95);
+            return 0;
+        }
+        if (iommu_n_iqe != 0) {
+            klug_append("iommu: queued invalidation - IQE recovered: a malformed descriptor was NOT performed", 84);
+            klug_putc(10);
+            serial_println("iommu: queued invalidation - IQE recovered: a malformed descriptor was NOT performed", 84);
+        }
+        return 0;
+    }
+    if (iommu_qi_why == 1) {
+        klug_append("iommu: queued invalidation DEAD - the wait descriptor never completed (timeout)", 79);
+        klug_putc(10);
+        serial_println("iommu: queued invalidation DEAD - the wait descriptor never completed (timeout)", 79);
+    }
+    if (iommu_qi_why == 2) {
+        klug_append("iommu: queued invalidation DEAD - GSTS.QIES clear at submit: QIE was never set", 78);
+        klug_putc(10);
+        serial_println("iommu: queued invalidation DEAD - GSTS.QIES clear at submit: QIE was never set", 78);
+    }
+    if (iommu_qi_why == 3) {
+        klug_append("iommu: queued invalidation DEAD - an IQE that could not be recovered", 68);
+        klug_putc(10);
+        serial_println("iommu: queued invalidation DEAD - an IQE that could not be recovered", 68);
+    }
+    if (iommu_qi_why == 4) {
+        klug_append("iommu: queued invalidation DEAD - an ITE (device-TLB invalidation time-out)", 75);
+        klug_putc(10);
+        serial_println("iommu: queued invalidation DEAD - an ITE (device-TLB invalidation time-out)", 75);
+    }
+    if (iommu_qi_why == 5) {
+        klug_append("iommu: queued invalidation DEAD - no room: the queue head never moved", 69);
+        klug_putc(10);
+        serial_println("iommu: queued invalidation DEAD - no room: the queue head never moved", 69);
+    }
+    return 0;
+}
+
+# The invalidations iommu_init and the grant path need, through whichever interface is in use. 0 performed, -1 not.
+# Linux qi_flush_context (QI_CC_TYPE | QI_CC_GRAN(global)) / __iommu_flush_context.
+fn iommu_flush_context_global() {
+    if (iommu_qi != 0) { return iommu_qi_submit((1 << 4) | 1, 0, 1); }      # type 1, G (5:4) = 01 global
+    return iommu_inv_context_global();
+}
+
+# Linux qi_flush_iotlb / __iommu_flush_iotlb. kind as iommu_inv_iotlb: 1 global, 2 domain (DID 1), 3 page-selective (iova,
+# 2^am x 4 KB, IH = 0).
+fn iommu_flush_iotlb(kind, iova, am) {
+    if (iommu_qi != 0) {
+        var lo = 2 | (kind << 4) | iommu_qi_drain;           # type 2, G (5:4), DR (7) / DW (6)
+        if (kind != 1) { lo = lo | (IOMMU_DID << 16); }      # DID (31:16)
+        var hi = 0;
+        if (kind == 3) { hi = (iova & 0xFFFFFFFFFFFFF000) | am; }   # ADDR (63:12) | IH (6) = 0 | AM (5:0)
+        return iommu_qi_submit(lo, hi, 1);
+    }
+    return iommu_inv_iotlb(kind, iova, am);
 }
 
 # Map the 2 MB region holding `pa` to itself (IOVA == phys) in the shared domain. The caller holds iommu_lock, or is
@@ -234,6 +651,7 @@ fn iommu_table_new() {
 fn iommu_map_2mb(pa) {
     if (iommu_top_kva == 0) { return 0 - 1; }
     if (pa < 0) { return 0 - 1; }
+    if (iommu_is_own(pa) != 0) { return 0 - 1; }             # the unit's own chunk (1.57.13): never grantable
     if (pa >= iommu_iova_top) { return 0 - 1; }
     var chunk = pa & 0xFFFFFFFFFFE00000;
     var tk = iommu_top_kva;                                  # CPU pointer of the table being walked (the direct map)
@@ -295,15 +713,16 @@ fn iommu_pend_add(pa) {
 #   CM = 0 with RWBF: flush the write buffer; CM = 0 otherwise: nothing (hardware never caches a not-present entry).
 # ⛔ Until 1.57.10 nothing followed a runtime grant (issue 2026-09-26): on a CM=1 unit a device could keep faulting on a
 # region it had just been granted. ⚠ QEMU cannot show that failure — it never caches a failed translation — so the gate is
-# the n_psi / n_dsi counters against QEMU's own trace of the IOTLB register (scripts/smoke/vtd-smoke.sh).
+# the n_psi / n_dsi counters against QEMU's own trace (scripts/smoke/vtd-smoke.sh): of the IOTLB register on the register
+# interface, of the IOTLB descriptor (vtd_inv_desc_iotlb_pages) on the queue (1.57.13).
 fn iommu_after_new_leaf(pa) {
     if (iommu_cm != 0) {
         var r = 0;
         if (((iommu_cap >> 39) & 1) != 0 && ((iommu_cap >> 48) & 0x3F) >= 9) {
-            r = iommu_inv_iotlb(3, pa & 0xFFFFFFFFFFE00000, 9);
+            r = iommu_flush_iotlb(3, pa & 0xFFFFFFFFFFE00000, 9);
             iommu_n_psi = iommu_n_psi + 1;
         } else {
-            r = iommu_inv_iotlb(2, 0, 0);
+            r = iommu_flush_iotlb(2, 0, 0);
             iommu_n_dsi = iommu_n_dsi + 1;
         }
         if (r != 0) { iommu_n_inv_fail = iommu_n_inv_fail + 1; }
@@ -317,23 +736,45 @@ fn iommu_after_new_leaf(pa) {
 
 # Grant a device DMA to the 2 MB region holding `phys` (identity). The one entry point every driver calls, at allocation.
 # Before iommu_init: recorded for the replay. Translation on: mapped + invalidated now. Otherwise: nothing to do.
-# Returns 0 always (the callers' contract since S10); a refusal is counted and said once.
+# Returns 0 always (the callers' contract since S10); a refusal is counted and said once. An address inside the unit's own
+# chunk is refused whenever it comes (1.57.13; iommu_map_2mb refuses it too). After the lock is dropped, a queue that has
+# STALLED or DIED since the last grant is said once each (1.57.13, the VTD review: the boot DMA check is one-shot, and this
+# is the path that submits after it) — decided under the lock, said lock-free.
 fn iommu_register_dma(phys) {
     var f = iommu_lock();
     var r = 0;
-    if (iommu_init_ran == 0) {
-        r = iommu_pend_add(phys);
+    if (iommu_is_own(phys) != 0) {
+        r = 0 - 1;
     } else {
-        if (iommu_active != 0) {
-            r = iommu_map_2mb(phys);
-            if (r == 1) {
-                iommu_n_late = iommu_n_late + 1;
-                iommu_after_new_leaf(phys);
+        if (iommu_init_ran == 0) {
+            r = iommu_pend_add(phys);
+        } else {
+            if (iommu_active != 0) {
+                r = iommu_map_2mb(phys);
+                if (r == 1) {
+                    iommu_n_late = iommu_n_late + 1;
+                    iommu_after_new_leaf(phys);
+                }
             }
         }
     }
     if (r < 0) { iommu_n_refused = iommu_n_refused + 1; }
+    var tell = 0;
+    if (iommu_qi_dead != 0) {
+        if ((iommu_qi_told & 2) == 0) {
+            iommu_qi_told = iommu_qi_told | 2;
+            tell = 1;
+        }
+    } else {
+        if (iommu_qi_stalled != 0) {
+            if ((iommu_qi_told & 1) == 0) {
+                iommu_qi_told = iommu_qi_told | 1;
+                tell = 1;
+            }
+        }
+    }
     iommu_unlock(f);
+    if (tell != 0) { iommu_qi_tell(); }
     if (r < 0) {
         if (iommu_refused_said == 0) {
             iommu_refused_said = 1;
@@ -469,9 +910,8 @@ fn iommu_init() {
     iommu_ver = iommu_read32(0x00);
     if (iommu_ver == 0) { kprintln("iommu: translation NOT enabled - VER reads 0", 44); return iommu_fail(); }
     if (iommu_ver == 0xFFFFFFFF) { kprintln("iommu: translation NOT enabled - VER reads all-ones", 51); return iommu_fail(); }
-    # Spec §6.5.1 / CCMD / IOTLB_REG: register-based invalidation is deprecated, and at VER major >= 6 every such request is
-    # an incorrect one — that hardware needs queued invalidation, which this file does not implement (see the issue).
-    if (((iommu_ver >> 4) & 0xF) >= 6) { kprintln("iommu: translation NOT enabled - VER >= 6.0 needs queued invalidation", 69); return iommu_fail(); }
+    # ⭐ 1.57.13 (QI) — VER major >= 6 is no longer refused here: it is refused below only when the queue is NOT in use (the
+    # register interface is an incorrect request at that version, spec §6.5.1). Until 1.57.13 every such unit was refused.
     iommu_cap = iommu_read64(0x08);
     iommu_ecap = iommu_read64(0x10);
     # 1.57.9 — ECAP.C BEFORE the first table write: it decides whether iommu_flush_cache must clflush.
@@ -490,25 +930,51 @@ fn iommu_init() {
     if (mgaw < aw) { aw = mgaw; }
     if (aw > 57) { aw = 57; }
     iommu_iova_top = 1 << aw;
-    iommu_iotlb_off = ((iommu_ecap >> 8) & 0x3FF) * 16;
-    if (iommu_iotlb_off == 0) { kprintln("iommu: translation NOT enabled - ECAP.IRO is 0 (no IOTLB register)", 66); return iommu_fail(); }
+    iommu_iotlb_off = ((iommu_ecap >> 8) & 0x3FF) * 16;     # needed by the register interface only (refused below if 0)
     iommu_drain = 0;
     if (((iommu_cap >> 55) & 1) != 0) { iommu_drain = iommu_drain | (1 << 49); }
     if (((iommu_cap >> 54) & 1) != 0) { iommu_drain = iommu_drain | (1 << 48); }
+    iommu_qi_drain = 0;                                      # the same two capabilities, in the IOTLB descriptor's bits
+    if (((iommu_cap >> 55) & 1) != 0) { iommu_qi_drain = iommu_qi_drain | (1 << 7); }
+    if (((iommu_cap >> 54) & 1) != 0) { iommu_qi_drain = iommu_qi_drain | (1 << 6); }
     iommu_fro = ((iommu_cap >> 24) & 0x3FF) * 16;
     iommu_nfr = ((iommu_cap >> 40) & 0xFF) + 1;
 
-    # What firmware (or a previous kernel) left on. Linux turns a pre-enabled TE off outside kdump; queued invalidation must
-    # be off for the register interface used here (QEMU drops a register command while QIE is set and leaves ICC / IVT
-    # set). Interrupt remapping, if on, is carried along untouched by iommu_gcmd_status's persistent bits.
+    # What firmware (or a previous kernel) left on. Linux turns a pre-enabled TE off outside kdump; a queue left on is turned
+    # off too (Linux intel_iommu_init_qi -> dmar_disable_qi, "start from the sane iommu hardware state"): this kernel's queue
+    # gets its own IQA below, which may only be programmed while QIE is clear — and the register fallback must not run with
+    # QIE set (QEMU drops a register command then and leaves ICC / IVT set). Interrupt remapping, if on, is carried along
+    # untouched by iommu_gcmd_status's persistent bits.
     var gs = iommu_read32(0x1C);
     if ((gs & (1 << 31)) != 0) {
         iommu_write32(0x18, iommu_gcmd_status() & 0x7FFFFFFF);          # TE off
         if (iommu_wait_gsts(1 << 31, 0) != 0) { kprintln("iommu: translation NOT enabled - firmware left TE on and it would not clear", 75); return iommu_fail(); }
     }
     if ((gs & (1 << 26)) != 0) {
-        iommu_write32(0x18, iommu_gcmd_status() & 0xFBFFFFFF);          # QIE off
-        if (iommu_wait_gsts(1 << 26, 0) != 0) { kprintln("iommu: translation NOT enabled - firmware left QI on and it would not clear", 75); return iommu_fail(); }
+        if (iommu_qi_disable() != 0) { kprintln("iommu: translation NOT enabled - firmware left QI on and it would not clear", 75); return iommu_fail(); }
+    }
+
+    # ⛔ 1.57.13 (the VTD review) — the own chunk, BEFORE the first of the unit's own structures is made (the queue below):
+    # every one of them is carved from it, and no grant can open it (iommu_own).
+    if (iommu_own_n == 0) {
+        if (iommu_own_grow() == 0) { kprintln("iommu: translation NOT enabled - no free 2 MB region for the unit's own tables", 78); return iommu_fail(); }
+    }
+
+    # ⭐ 1.57.13 (QI) — pick the invalidation interface BEFORE the first invalidation (Linux init_dmars ->
+    # intel_iommu_init_qi runs ahead of iommu_set_root_entry, so the root-entry flushes below already use the queue).
+    iommu_qi = 0;
+    if ((iommu_ecap & 2) != 0) {                             # ECAP.QI (bit 1)
+        if (iommu_qi_forbid == 0) {
+            if (iommu_qi_enable() < 0) { kprintln("iommu: translation NOT enabled - queued invalidation not latched (GSTS.QIES)", 76); return iommu_fail(); }
+        } else {
+            kprintln("iommu: queued invalidation OFF - forced by VTD_REGISTER_INV (test build): register interface", 92);
+        }
+    }
+    if (iommu_qi == 0) {
+        # The register interface — no ECAP.QI, no memory for the queue, or the test knob. Spec §6.5.1: at VER major >= 6 every
+        # register invalidation is an incorrect request; and the IOTLB register must exist.
+        if (((iommu_ver >> 4) & 0xF) >= 6) { kprintln("iommu: translation NOT enabled - VER >= 6.0 and queued invalidation is not in use", 81); return iommu_fail(); }
+        if (iommu_iotlb_off == 0) { kprintln("iommu: translation NOT enabled - ECAP.IRO is 0 (no IOTLB register)", 66); return iommu_fail(); }
     }
 
     # 1.57.9 (CPUVA) — each table: pmm_alloc gives the PHYS (for the hardware), dma_kva the CPU's pointer (memset/store go
@@ -547,12 +1013,31 @@ fn iommu_init() {
 
     # Point the unit at the tables (legacy mode: RTADDR bits 11:10 = 00), latch with SRTP, then — spec §6.6, Linux
     # iommu_set_root_entry — a global context-cache and a global IOTLB invalidation (QEMU sets ESRTPS, which makes them
-    # redundant there; iron without it needs them), and a write-buffer flush on RWBF hardware.
+    # redundant there; iron without it needs them), and a write-buffer flush on RWBF hardware. 1.57.13: the two
+    # invalidations go through the queue when it is on (iommu_flush_*), the register interface otherwise.
     iommu_write64(0x20, iommu_root_phys & 0x000FFFFFFFFFF000);
     iommu_write32(0x18, iommu_gcmd_status() | (1 << 30));   # GCMD.SRTP (one-shot)
     if (iommu_wait_gsts(1 << 30, 1) != 0) { kprintln("iommu: translation NOT enabled - root table pointer not latched (RTPS)", 70); return iommu_fail(); }
-    if (iommu_inv_context_global() != 0) { kprintln("iommu: translation NOT enabled - global context-cache invalidation failed", 73); return iommu_fail(); }
-    if (iommu_inv_iotlb(1, 0, 0) != 0) { kprintln("iommu: translation NOT enabled - global IOTLB invalidation failed", 65); return iommu_fail(); }
+    # 1.57.13 (the VTD review): a flush whose wait STALLED is issued once more — that submission first settles the stall
+    # (a second full bound), so a slow unit is refused only when a wait outlasts two bounds (the queue is then DEAD).
+    var icx = iommu_flush_context_global();
+    if (icx != 0) {
+        if (iommu_qi_stalled != 0) { icx = iommu_flush_context_global(); }
+    }
+    if (icx != 0) {
+        iommu_qi_tell();
+        kprintln("iommu: translation NOT enabled - global context-cache invalidation failed", 73);
+        return iommu_fail();
+    }
+    var itl = iommu_flush_iotlb(1, 0, 0);
+    if (itl != 0) {
+        if (iommu_qi_stalled != 0) { itl = iommu_flush_iotlb(1, 0, 0); }
+    }
+    if (itl != 0) {
+        iommu_qi_tell();
+        kprintln("iommu: translation NOT enabled - global IOTLB invalidation failed", 65);
+        return iommu_fail();
+    }
     if (iommu_flush_write_buffer() < 0) { kprintln("iommu: translation NOT enabled - write-buffer flush timed out", 61); return iommu_fail(); }
     iommu_fault_scan(0);                                      # stale records from before this kernel: drop them quietly
 
@@ -608,7 +1093,23 @@ fn iommu_init() {
     kprint_num(iommu_n_replayed);
     kprint(" iotlb=0x", 9);
     kprint_hex(iommu_iotlb_off + 8);
-    kprintln("", 0);
+    if (iommu_qi != 0) { kprintln(" inv=queued", 11); } else { kprintln(" inv=register", 13); }
+    if (iommu_qi != 0) {
+        kprint("IOMMU: queued invalidation - queue 0x", 37);
+        kprint_hex(iommu_qi_phys);
+        kprint(" status 0x", 10);
+        kprint_hex(iommu_qi_st_phys);
+        kprint(" submitted=", 11);
+        kprint_num(iommu_n_qi);
+        kprintln("", 0);
+    }
+    kprint("IOMMU: own structures - chunk 0x", 32);
+    kprint_hex(load64(&iommu_own));
+    kprint(" chunks=", 8);
+    kprint_num(iommu_own_n);
+    kprint(" pages=", 7);
+    kprint_num(iommu_own_pages);
+    kprintln(" - never granted", 16);
     return 0;
 }
 
@@ -635,7 +1136,18 @@ fn iommu_boot_report() {
     kprint_num(iommu_n_inv_fail);
     kprint(" refused=", 9);
     kprint_num(iommu_n_refused);
+    kprint(" qi=", 4);                                       # 1.57.13: queue submissions completed, and FSTS's queue errors
+    kprint_num(iommu_n_qi);
+    kprint(" iqe=", 5);
+    kprint_num(iommu_n_iqe);
+    kprint(" ite=", 5);
+    kprint_num(iommu_n_ite);
+    kprint(" ice=", 5);
+    kprint_num(iommu_n_ice);
+    kprint(" stall=", 7);                                    # 1.57.13 (the VTD review): waits that outlasted a bound
+    kprint_num(iommu_n_stall);
     kprintln("", 0);
+    if (iommu_qi_dead != 0 || iommu_qi_stalled != 0) { iommu_qi_tell(); }
     return nf;
 }
 
@@ -654,18 +1166,279 @@ fn iommu_boot_report() {
 #      needs (CM=1: one PSI — or DSI without PSI; CM=0: none, a write-buffer flush only on RWBF hardware).
 #   C. ALLOWED — the same IDENTIFY into the now-granted page must succeed and equal, byte for byte, the IDENTIFY data read
 #      into the always-granted page the driver uses (nvme_ident_phys). No fault may be recorded.
+#   D. (1.57.13, the queue only) QI RECOVERY — vtdst_qi_recovery below.
+#   E. (1.57.13, the VTD review) OWN STRUCTURES — vtdst_own below: no device can reach the unit's own memory.
+#   F. (1.57.13, the VTD review, the queue only) QI STALL — vtdst_qi_stall below: a slow wait stalls the queue, never kills it.
 # ⚠ QEMU never caches a failed translation, so C passes on QEMU even with the CM invalidation deleted: B's count, and the
-# smoke's check of QEMU's own trace of the IVA / IOTLB registers, are what catch that mutant.
-fn vtdst_granted(pa) {
-    var tk = iommu_top_kva;
-    var lvl = iommu_levels;
-    while (lvl > 2) {
-        var e = load64(tk + ((pa >> (12 + 9 * (lvl - 1))) & 0x1FF) * 8);
-        if ((e & 3) == 0) { return 0; }
-        tk = dma_kva(e & 0x000FFFFFFFFFF000);
-        lvl = lvl - 1;
+# smoke's check of QEMU's own trace (the IVA / IOTLB registers, or the queue's IOTLB descriptors), catch that mutant.
+fn vtdst_granted(pa) { return iommu_granted(pa); }
+
+# D. QI RECOVERY (1.57.13; only when the queue is in use). A malformed descriptor — type 0, which no VT-d revision defines —
+# must raise IQE and take Linux's qi_check_fault recovery: that submission reports NOT performed, exactly one IQE is
+# counted, the queue is NOT declared dead, and it keeps working — a bare wait submitted behind it completes, IQH == IQT
+# (drained) and FSTS's IQE / ICE / ITE are clear. On QEMU the malformed descriptor is one "invalid inv desc: hi=0, lo=0
+# (unknown type)" error on stderr, which the harness requires. Returns 0 pass, 1 fail.
+fn vtdst_qi_recovery() {
+    if (iommu_qi == 0) {
+        kprintln("vtdst: qi recovery SKIP the register interface is in use", 56);
+        return 0;
     }
-    if ((load64(tk + ((pa >> 21) & 0x1FF) * 8) & 3) == 0) { return 0; }
+    var e0 = iommu_n_iqe;
+    var q0 = iommu_n_qi;
+    var qf = iommu_lock();
+    var r1 = iommu_qi_submit(0, 0, 1);
+    var r2 = iommu_qi_submit(0, 0, 0);
+    var qh = iommu_read32(0x80);
+    var qt = iommu_read32(0x88);
+    var qfs = iommu_read32(0x34);
+    iommu_unlock(qf);
+    var np = 0;
+    if (r1 < 0) { np = 1; }
+    var wok = 0;
+    if (r2 == 0) { wok = 1; }
+    kprint("vtdst: qi recovery not_performed=", 33);
+    kprint_num(np);
+    kprint(" iqe=+", 6);
+    kprint_num(iommu_n_iqe - e0);
+    kprint(" wait_ok=", 9);
+    kprint_num(wok);
+    kprint(" qi=+", 5);
+    kprint_num(iommu_n_qi - q0);
+    kprint(" iqh=0x", 7);
+    kprint_hex(qh);
+    kprint(" iqt=0x", 7);
+    kprint_hex(qt);
+    kprint(" fsts=0x", 8);
+    kprint_hex(qfs);
+    kprint(" dead=", 6);
+    kprint_num(iommu_qi_dead);
+    kprintln("", 0);
+    var ok = 0;
+    if (np == 1) {
+        if (iommu_n_iqe - e0 == 1) {
+            if (wok == 1) {
+                if (iommu_n_qi - q0 == 1) {
+                    if (qh == qt) {
+                        if ((qfs & 0x70) == 0) {
+                            if (iommu_qi_dead == 0) { ok = 1; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (ok == 1) { kprintln("vtdst: qi recovery PASS", 23); return 0; }
+    kprintln("vtdst: qi recovery FAIL", 23);
+    return 1;
+}
+
+# E. OWN STRUCTURES (1.57.13, the VTD review). Every structure the unit reads or writes untranslated — the root table, each
+# bus's context table, every SL table reached from the top (a 4 KB-leaf table included), the queue and status pages — must
+# lie in an own chunk; every context entry must point at the one top table; and no grant may open a chunk: each is not
+# granted, iommu_map_2mb REFUSES it (no leaf written) and iommu_register_dma REFUSES it — refused +1, the one deliberate
+# refusal of a VTD_SELFTEST boot (as arm A makes the one deliberate fault; the harness requires exactly that one, at an own
+# address). RED on the pre-review kernel, whose tables were pmm_alloc pages inside the replayed xHCI grant. 0 pass, 1 fail.
+var vtdst_wk[8];           # the SL walk's stack: per level, the table being walked (its dma_kva) ...
+var vtdst_wi[8];           #   ... and the next index in it
+var vtdst_own_tables = 0;  # SL tables found below the top
+
+# Walk every SL table below the top, without recursion. Returns how many lie OUTSIDE the own chunks.
+fn vtdst_sl_walk() {
+    var bad = 0;
+    var top = iommu_levels;
+    var lvl = top;
+    store64(&vtdst_wk + lvl * 8, iommu_top_kva);
+    store64(&vtdst_wi + lvl * 8, 0);
+    while (lvl <= top) {
+        var i = load64(&vtdst_wi + lvl * 8);
+        if (i >= 512) {
+            lvl = lvl + 1;
+        } else {
+            store64(&vtdst_wi + lvl * 8, i + 1);
+            var e = load64(load64(&vtdst_wk + lvl * 8) + i * 8);
+            if ((e & 3) != 0) {
+                var sub = 1;
+                if (lvl == 2) {
+                    if ((e & 0x80) != 0) { sub = 0; }        # a 2 MB leaf, not a table
+                }
+                if (sub != 0) {
+                    var tp = e & 0x000FFFFFFFFFF000;
+                    vtdst_own_tables = vtdst_own_tables + 1;
+                    if (iommu_is_own(tp) == 0) { bad = bad + 1; }
+                    if (lvl > 2) {
+                        lvl = lvl - 1;
+                        store64(&vtdst_wk + lvl * 8, dma_kva(tp));
+                        store64(&vtdst_wi + lvl * 8, 0);
+                    }
+                }
+            }
+        }
+    }
+    return bad;
+}
+
+fn vtdst_own() {
+    var outside = 0;
+    if (iommu_is_own(iommu_root_phys) == 0) { outside = outside + 1; }
+    if (iommu_is_own(iommu_top_phys) == 0) { outside = outside + 1; }
+    if (iommu_qi != 0) {
+        if (iommu_is_own(iommu_qi_phys) == 0) { outside = outside + 1; }
+        if (iommu_is_own(iommu_qi_st_phys) == 0) { outside = outside + 1; }
+    }
+    var nctx = 0;
+    var badptr = 0;
+    for (var b = 0; b < 256; b = b + 1) {
+        var rte = load64(iommu_root_kva + b * 16);
+        if ((rte & 1) != 0) {
+            nctx = nctx + 1;
+            var ctp = rte & 0x000FFFFFFFFFF000;
+            if (iommu_is_own(ctp) == 0) { outside = outside + 1; }
+            var cx = dma_kva(ctp);
+            for (var d = 0; d < 256; d = d + 1) {
+                var ce = load64(cx + d * 16);
+                if ((ce & 1) != 0) {
+                    if ((ce & 0x000FFFFFFFFFF000) != iommu_top_phys) { badptr = badptr + 1; }
+                }
+            }
+        }
+    }
+    vtdst_own_tables = 0;
+    outside = outside + vtdst_sl_walk();
+    var c0 = load64(&iommu_own);
+    var granted = 0;
+    var mapped = 0;
+    var of = iommu_lock();
+    for (var k = 0; k < iommu_own_n; k = k + 1) {
+        var ck = load64(&iommu_own + k * 8);
+        if (iommu_granted(ck) != 0) { granted = granted + 1; }
+        if (iommu_map_2mb(ck + 0x1000) >= 0) { mapped = mapped + 1; }   # must be REFUSED (-1): never a leaf, never "already"
+        if (iommu_granted(ck) != 0) { granted = granted + 1; }
+    }
+    iommu_unlock(of);
+    var rf0 = iommu_n_refused;
+    iommu_register_dma(c0 + 0x1000);                         # the driver entry point: the one deliberate refusal
+    var rfd = iommu_n_refused - rf0;
+    if (iommu_granted(c0) != 0) { granted = granted + 1; }
+    kprint("vtdst: own structures chunk=0x", 30);
+    kprint_hex(c0);
+    kprint(" chunks=", 8);
+    kprint_num(iommu_own_n);
+    kprint(" pages=", 7);
+    kprint_num(iommu_own_pages);
+    kprint(" ctx=", 5);
+    kprint_num(nctx);
+    kprint(" sl_tables=", 11);
+    kprint_num(vtdst_own_tables);
+    kprint(" outside=", 9);
+    kprint_num(outside);
+    kprint(" badptr=", 8);
+    kprint_num(badptr);
+    kprint(" granted=", 9);
+    kprint_num(granted);
+    kprint(" mapped=", 8);
+    kprint_num(mapped);
+    kprint(" refused=+", 10);
+    kprint_num(rfd);
+    kprintln("", 0);
+    var ok = 0;
+    if (iommu_own_n >= 1) {
+        if (outside == 0) {
+            if (badptr == 0) {
+                if (nctx == iommu_ctx_buses) {
+                    if (granted == 0) {
+                        if (mapped == 0) {
+                            if (rfd == 1) { ok = 1; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (ok == 1) { kprintln("vtdst: own structures PASS", 26); return 0; }
+    kprintln("vtdst: own structures FAIL", 26);
+    return 1;
+}
+
+# F. QI STALL (1.57.13, the VTD review; the queue only). A wait the unit is never handed (iommu_qi_hold: IQT not written)
+# must outlast a short bound and leave the queue STALLED — that submission NOT performed, the queue NOT dead. Then the unit
+# is handed it late (the IQT write a slow unit would have acted on long ago): the next submission must settle the stall
+# (the late status write seen, IQH == IQT), complete its own wait, and leave the queue drained, FSTS clear, not dead.
+# RED on the pre-review kernel, which declared the queue DEAD at the first timeout and never looked again. Last, one grant
+# of an already-granted page: when the queue is healthy the grant path says nothing (with the late hand-over deleted, the
+# second bound runs out and THIS grant says `DEAD` lock-free, before the boot DMA check). 0 pass, 1 fail.
+fn vtdst_qi_stall(sreg) {
+    if (iommu_qi == 0) {
+        kprintln("vtdst: qi stall SKIP the register interface is in use", 53);
+        return 0;
+    }
+    var q0 = iommu_n_qi;
+    var s0 = iommu_n_stall;
+    var b0 = iommu_qi_bound;
+    var sf = iommu_lock();
+    iommu_qi_hold = 1;                                        # the unit is not handed this wait: it cannot complete
+    iommu_qi_bound = 4096;                                    # (a short bound: this one is meant to run out)
+    var r1 = iommu_qi_submit(0, 0, 0);
+    iommu_qi_bound = b0;
+    iommu_qi_hold = 0;
+    var st1 = iommu_qi_stalled;
+    var dd1 = iommu_qi_dead;
+    iommu_write32(0x88, iommu_qi_tail << 4);                  # ... and is handed it late: a slow unit, still working
+    var r2 = iommu_qi_submit(0, 0, 0);                        # settles the stall first, then its own wait
+    var st2 = iommu_qi_stalled;
+    var qh = iommu_read32(0x80);
+    var qt = iommu_read32(0x88);
+    var qfs = iommu_read32(0x34);
+    iommu_unlock(sf);
+    iommu_register_dma(sreg);
+    var np = 0;
+    if (r1 < 0) { np = 1; }
+    var lok = 0;
+    if (r2 == 0) { lok = 1; }
+    kprint("vtdst: qi stall not_performed=", 30);
+    kprint_num(np);
+    kprint(" stalled=", 9);
+    kprint_num(st1);
+    kprint(" dead=", 6);
+    kprint_num(dd1);
+    kprint(" then late_ok=", 14);
+    kprint_num(lok);
+    kprint(" stalled=", 9);
+    kprint_num(st2);
+    kprint(" stall=+", 8);
+    kprint_num(iommu_n_stall - s0);
+    kprint(" qi=+", 5);
+    kprint_num(iommu_n_qi - q0);
+    kprint(" iqh=0x", 7);
+    kprint_hex(qh);
+    kprint(" iqt=0x", 7);
+    kprint_hex(qt);
+    kprint(" fsts=0x", 8);
+    kprint_hex(qfs);
+    kprint(" dead=", 6);
+    kprint_num(iommu_qi_dead);
+    kprintln("", 0);
+    var ok = 0;
+    if (np == 1) {
+        if (st1 == 1) {
+            if (dd1 == 0) {
+                if (lok == 1) {
+                    if (st2 == 0) {
+                        if (iommu_n_stall - s0 == 1) {
+                            if (iommu_n_qi - q0 == 1) {
+                                if (qh == qt) {
+                                    if ((qfs & 0x70) == 0) {
+                                        if (iommu_qi_dead == 0) { ok = 1; }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (ok == 1) { kprintln("vtdst: qi stall PASS", 20); return 0; }
+    kprintln("vtdst: qi stall FAIL", 20);
     return 1;
 }
 
@@ -819,6 +1592,13 @@ fn vtd_selftest() {
         }
     }
     if (cok == 1) { kprintln("vtdst: allowed PASS", 19); } else { kprintln("vtdst: allowed FAIL", 19); bad = bad + 1; }
+
+    # D. queued-invalidation recovery (1.57.13)
+    bad = bad + vtdst_qi_recovery();
+    # E. the unit's own structures, out of every device's reach (1.57.13, the VTD review)
+    bad = bad + vtdst_own();
+    # F. a slow wait stalls the queue and settles; it does not kill it (1.57.13, the VTD review)
+    bad = bad + vtdst_qi_stall(reg);
     if (bad == 0) { kprintln("vtdst: PASS", 11); } else { kprintln("vtdst: FAIL", 11); }
     kprintln("vtdst: done", 11);
     return bad;

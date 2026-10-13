@@ -1,6 +1,32 @@
 # 2026-10-12 — Ring 3 cannot change the console line discipline: no echo-off for a password prompt, no input flush
 
-**Status:** 🟡 **OPEN** — filed from darshana **1.3.0**, whose AGNOS `tty_echo_off` and `tty_flush_input` return -1 for want of it.
+**Status:** ✅ **RESOLVED in agnos 1.57.13** — `console_mode#110(set, clear)` → the previous flags / -1 (a new
+number, as the roadmap rule requires). **`CM_NOECHO` (1)** is a mode: the three console line readers (the CPU-holding
+read, the waiting read, the NB accumulator — on fd 0 or any console fd) store and edit as before but echo nothing — no
+printable byte, no `BS SP BS`, and no newline (Linux `n_tty` with ECHO and ECHONL clear — darshana's `tty_echo_off`
+clears both and kybernet's `_prompt_password` writes its own `"\n"`); the hidden Enter still ends the operator's
+framebuffer line (`fb_line_end`). **`CM_FLUSH` (2)** is an action (`set` only): it pulls the xHCI ring in, then empties
+`kb_buf` and the NB partial line (`tcflush(TCIFLUSH)`; NOECHO|FLUSH in one call is `TCSETSF`), holding the line for the
+flush only. Unknown bits → -1. **The mode is the CONSOLE's, held by its setter** (`syscall.cyr` above `kbd_mode_now`):
+it applies to whoever reads (the setter's child included — `sudo`'s shape), never takes, keeps or waits for the line,
+and dies with its holder (`kbd_line_release_pid`, from `proc_death_release` — every death path, a death at the timer
+tick included: that runs `proc_death_release` in the ISR, and only the orphan / zombie reap is owed to a process
+context; a stale-epoch holder, and since the 1.57.13 merge a DYING one whose death is done — `lc_dying_done`, gated by
+`kstack-smoke`'s `tick orphan` phase — counts as no mode), so a program that dies with echo off never leaves the console dark for anyone after it (prior
+art: Linux `n_tty` keeps ECHO in the tty and Plan 9 `rawon` in the console; Plan 9 `consctl` reverts when its holder
+closes it, while Linux termios ECHO outlives its setter). **Evidence:** `scripts/smoke/tty-smoke.sh` T1–T5 and T9–T11
+(`-smp 1` + `-smp 4`), the echo read off COM1 with a positive control and the framebuffer by screendump; ktest T8g;
+wait-kbd K6 (a production kernel refuses the TTY_SELFTEST knob bits); mutations M-TTY1 (echo not suppressed), M-TTY2
+(mode not cleared at the holder's death), M-TTY6 (the first cut's line-holding mode), M-TTY8 (no `fb_line_end`) each
+red. **What it broke, and what the review found:** the first cut tied the mode to EXCLUSIVE line ownership ("MODE-OWN"
+— a set mode kept the line owned until cleared, cited as "POSIX job control's shape"). It is not POSIX's shape (a
+background `tcsetattr` is stopped by SIGTTOU, it does not take the terminal), and it let any process — a background job
+included — seize the console from the shell for its whole life (agnsh's NB poll -2 forever, no Ctrl-C), and deadlocked
+a holder's child that read the console. It also left the framebuffer line live after a hidden Enter (a ghost prompt
+replayed under every later print), and the review found a read of console fd 1/2 hung the CPU (a pre-existing IF=0
+hlt in `serial_dev_read`, made discoverable by `fd_kind`#111) and that FLUSH's new `kb_tail` store could make a
+racing consumer step `kb_tail` past `kb_head` (255 old scancodes replayed). All four were fixed in the same cut,
+before release. Raw (per-key) mode remains out of scope, as this issue left it.
 **Checked against:** agnos **1.57.11** — `kernel/core/syscall.cyr`, the fd-0 line readers (the block comment at ~1117 and
 the three echo sites: the CPU-holding read ~1443, the waiting read, and the non-blocking accumulator ~1538), and
 `docs/development/agnos-userland-abi.md` (O1; the syscall table).

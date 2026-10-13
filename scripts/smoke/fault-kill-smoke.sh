@@ -22,7 +22,9 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
+# 1.57.13 review: siblings as doom/naad resolve them — <NAME>_ROOT, else ${SIBLINGS_ROOT:-$ROOT/..}/<repo> (a worktree holds no sibling).
+SIBLINGS="${SIBLINGS_ROOT:-$ROOT/..}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-$SIBLINGS/gnoboot}"
 OVMF_CODE=""; for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
 OVMF_VARS_SRC=""; for c in /usr/share/edk2/x64/OVMF_VARS.4m.fd /usr/share/edk2/x64/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd; do [ -f "$c" ] && { OVMF_VARS_SRC="$c"; break; }; done
 [ -z "$OVMF_CODE" ] || [ -z "$OVMF_VARS_SRC" ] && { echo "ERROR: OVMF not found"; exit 1; }
@@ -34,8 +36,9 @@ AGNOS="$ROOT/build/agnos"
 [ -f "$GNOBOOT" ] || { echo "ERROR: gnoboot not built at $GNOBOOT"; exit 1; }
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # qemu_dwell_kernel, qemu_assert_booted, smoke_require_image
 echo "Building FAULT_SELFTEST + EXT2_WRITE_SELFTEST kernel..."
-if ! env FAULT_SELFTEST=1 EXT2_WRITE_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/fault-kill-smoke-build.log 2>&1; then
-    echo "  BUILD-FAIL (see /tmp/fault-kill-smoke-build.log)"; tail -5 /tmp/fault-kill-smoke-build.log
+mkdir -p "$ROOT/build"   # 1.57.13 review: the build logs are the TREE's (they were fixed /tmp names, shared by every tree)
+if ! env FAULT_SELFTEST=1 EXT2_WRITE_SELFTEST=1 sh "$ROOT/scripts/build.sh" >"$ROOT/build/fault-kill-smoke-build.log" 2>&1; then
+    echo "  BUILD-FAIL (see $ROOT/build/fault-kill-smoke-build.log)"; tail -5 "$ROOT/build/fault-kill-smoke-build.log"
     sh "$ROOT/scripts/build.sh" >/dev/null 2>&1 || true
     exit 1
 fi

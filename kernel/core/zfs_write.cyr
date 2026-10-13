@@ -5901,15 +5901,18 @@ fn zfs_release_pid(pid, isr) {
     return 0;
 }
 # The owed commit, at the next B1 of any process (sched.cyr proc_b1): syscall context, no lock held. 0.
+# ⛔ 1.57.13 (review of k.135): it TAKES fs_lock with fs_spin_trylock or does nothing — zfs_wp_owed stays 1 and the next
+# B1 retries (proc_b1_check enters B1 while it is set). It used to fs_spin_lock unconditionally, so while any commit held
+# the lock EVERY syscall exit on every CPU waited it out at IF=0 (SFMASK) — the k.132 (3) symptom on unrelated syscalls,
+# and the very tick death that owed this commit also owes its orphan reap (syscall.cyr proc_orphan_owed_run), which
+# refuses to wait. The owed commit itself still runs here, under the won lock, as before.
 fn zfs_wp_owed_run() {
-    preempt_disable();
-    fs_spin_lock();
+    if (fs_spin_trylock() != 0) { return 0; }   # held: never wait (a won try raises preempt; fs_spin_unlock drops it)
     if (zfs_wp_owed == 1) {
         zfs_wp_owed = 0;
         zfs_wp_flush_why("exit");
     }
     fs_spin_unlock();
-    preempt_enable();
     return 0;
 }
 

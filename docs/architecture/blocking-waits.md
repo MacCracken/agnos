@@ -460,6 +460,29 @@ wait-kbd K5; M-F6). Two readers are NOT owner-aware and stay so: `kbscan`#42 (ra
 by convention) and the kernel recovery shell's input loop (kmain, emergency only). **Refused contexts**
 (pre-scheduler, preempt-held kernel callers) keep `kbd_read_blocking_held` — the pre-1.57.7
 CPU-holding read, which takes the line when it is free and otherwise proceeds UNOWNED (the legacy interleave).
+**The console's MODE (1.57.13, `console_mode`#110)**: one `input_lock` cell, `kbd_line_mode` (syscall.cyr), plus the
+process that last SET a bit — its HOLDER (`kbd_mode_holder` pid + 1, `kbd_mode_ep`). `CM_NOECHO` makes the three
+readers skip every echo (`kbd_echo` — printable bytes, `BS SP BS`, the newline) for WHOEVER reads while the holder
+lives (`kbd_mode_now`: state ≥ 1 and the recorded epoch, else no mode). The mode is the CONSOLE's, never the line's: it
+does not take, keep or wait for the line, so NB-OWN and the acquire above are untouched by it (Linux `n_tty` ECHO,
+Plan 9 `rawon`). It dies with its holder: `kbd_line_release_pid` (every death path, via `proc_death_release`) zeroes it
+when the dying pid is the holder, and the epoch test makes a holder whose death path was missed count as no mode — a
+process that dies with echo off cannot leave the console dark (Plan 9 `consctl`, not Linux termios). A hidden Enter
+still ends the operator's framebuffer line (`fb_line_end`; the echoed LF used to be the only thing that did, so a
+hidden line behind a no-newline prompt left a ghost prompt replayed under every later print — tty-smoke T11, a
+screendump). `CM_FLUSH` takes the line for the flush only with `kbd_line_acquire` (a refused context:
+`kbd_line_try_take`, -1 when busy) — it waits only for a reader mid-line — runs `kb_has_key` (pulls the xHCI ring in)
+BEFORE `input_lock`, then `kbd_ring_flush_locked` (keyboard.cyr: `kb_tail = kb_head`) and `nbline_pos = 0` in one hold,
+and gives the line back. That makes FLUSH a second, non-consumer `kb_tail` writer: `kb_read_scancode` re-checks
+`kb_head != kb_tail` UNDER `input_lock` and answers 0 (no key) on an empty ring, since every consumer tests
+`kb_has_key` in an earlier hold (ktest T8g). Gates: `tty-smoke.sh` T2-T5 and T9 (M-TTY1, M-TTY2, M-TTY6), ktest T8g.
+⛔ The first 1.57.13 cut (never released) made a set mode KEEP the line owned until cleared ("MODE-OWN"): any process,
+a background job included, could seize the console from the shell for its whole life (agnsh's NB poll -2 forever, no
+Ctrl-C to kill it), and a holder's child that read the console waited forever — the review's finding, gated by T9.
+**Every console fd reads the cooked line (1.57.13):** read#5 routes ANY fd that is the console device (fd 0, 1, 2, a
+dup — `fd_is_console`) to these readers, and on x86 `serial_dev_read` (devs.cyr) is itself `kbd_read_blocking`. Until
+1.57.13 only fd 0 was routed: a read of console fd 1/2 reached `serial_dev_read`'s raw loop — not owner- or mode-aware,
+no echo, and with no key pending an `arch_wait` hlt in syscall context at IF=0 that never woke (tty-smoke T10, M-TTY7).
 **HID report slots (a defect the wait-kbd gate found):** every keyboard transfer TRB used to DMA into ONE report
 buffer, so two reports completed before the drain kept only the last — a key pressed and released inside one IF=0
 stretch was lost (`abc` read `bc`). Each TRB now has its own 16-byte slot and the drain folds the slot the event's TRB
@@ -495,21 +518,28 @@ code at p+168 is authoritative).
 
 ## Network waits (1.57.7 S6)
 
-`sock_connect`#47 (`tcp_connect_ex`), `sock_send`#48 (`tcp_send_ex`) and `icmp_echo`#55 / `icmp_echo_ex`#100
-(`icmp_ping_us`) are canonical waits: `tcp_block(cid, mode, tag, ep, gen, dl)` on `WK_TCP|cid`, `icmp_block(pid, seq,
+`sock_connect`#47 (`tcp_connect_ex`), `sock_send`#48 (`tcp_send_ex`) / `sock_send_dl`#109 (`tcp_send_dl`, 1.57.13) and `icmp_echo`#55 / `icmp_echo_ex`#100
+(`icmp_ping_us`) are canonical waits: `tcp_block(cid, mode, tag, ep, gen, dl, una)` on `WK_TCP|cid`, `icmp_block(pid, seq,
 dl)` on `WK_ICMP|pid`; a context that cannot block takes `net_legacy_step` (pre-scheduler: the old spin then hlt;
 post-scheduler IF=0: `sti; hlt; cli` under preempt — IF out == IF in). ⛔ A **pre-scheduler SYSCALL** (a
-boot-selftest foreground `run`, entered IF=0) is neither: its hlt would have no interrupt to end it, so the four arms
+boot-selftest foreground `run`, entered IF=0) is neither: its hlt would have no interrupt to end it, so the arms
 reopen the old preempt-held `sti` window for it (`net_sys_window_open`/`_close`, net_tcp.cyr — `sched_active != 1`
 only). S6 shipped without it and DOOM_SELFTEST's `/bin/doom` hung forever in #47 dialling setu's unanswered
 loopback:7700 (doom-smoke 3 colours; now a sweep row). Wakes (condition stored under the net lock,
 `wq_wake` after the unlock): an ACK that covers or partially covers the held segment, SYN_SENT → ESTABLISHED, every RST,
 ESTABLISHED → CLOSE_WAIT, a window-opening ACK, retransmit exhaustion (timer-scan mask), `tcp_close_own` /
 `tcp_release_pid`, a matched echo reply. **Deadlines are computed once** (#47's ~8 s from entry; #48's D6 progress clock
-restarts only on ACK progress; #100's bound) and are absolute locals on the blocked frame. **ABORT** (`wq_signal_point`
-== 1): #47 closes its slot (under `tcp_same_locked`) and returns -1; #48 returns the committed count with its segment
+restarts only on ACK progress; #109's caller ceiling is computed once from entry, never re-armed by progress, and clamps
+every D6 deadline — `tcp_send_cap_clamp`, Linux SO_SNDTIMEO's one budget per call; #100's bound) and are absolute
+locals on the blocked frame. **ABORT** (`wq_signal_point`
+== 1): #47 closes its slot (under `tcp_same_locked`) and returns -1; #48 / #109 return the committed count with its segment
 still armed; #55/#100 clear their slot and return -1. **The own-poll effect:** a loopback ACK or echo reply is usually
 consumed inside the waiter's OWN `net_poll` before it arms (lo raises no interrupt), which is why the wake arms
 (`tcp: ackwake`, `tcp: rstwake`, `icmp: wake`) block directly in `tcp_block`/`icmp_block` with the frame pre-queued and
-let `net_tick` deliver it. Busy wake latency is tick-bound (a waiter woken while its CPU runs a spinner waits for that
+let `net_tick` deliver it. ⭐ **A partial ACK is a wake condition too, so the post-arm re-check must see it**
+(1.57.13): mode 2 passes the SND.UNA the sender last decided on (`una`) and `tcp_wait_done` stops on any change, and
+`tcp_send_ex`'s post-poll prefilter re-decides on it. Before, a partial ACK consumed ahead of the arm — by the sender's
+own `net_poll` (the effect above) or by a drain racing the arm — left the sender asleep to the OLD D6 deadline, and
+the loop top restarted D6 from there: up to 2 × `TCP_PROGRESS_US` (16 s) with no progress after the partial ACK
+(`tcp: d6part`; `tcp: dlpart` holds #109's clamp at that site). Busy wake latency is tick-bound (a waiter woken while its CPU runs a spinner waits for that
 CPU's next tick): measured, not changed (OQ-5; sock-wait-smoke N8 `busy_rtt64_med_us`).

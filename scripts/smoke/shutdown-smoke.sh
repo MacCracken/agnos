@@ -38,7 +38,9 @@ set -e
 
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
+# 1.57.13 review: siblings as doom/naad resolve them — <NAME>_ROOT, else ${SIBLINGS_ROOT:-$ROOT/..}/<repo> (a worktree holds no sibling).
+SIBLINGS="${SIBLINGS_ROOT:-$ROOT/..}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-$SIBLINGS/gnoboot}"
 
 OVMF_CODE_CANDIDATES="
     /usr/share/edk2/x64/OVMF_CODE.4m.fd
@@ -76,7 +78,7 @@ rm -rf "$WORK" "$LOGS"; mkdir -p "$WORK" "$LOGS"
 
 IMG="$WORK/agnos-shutdown.img"
 LOG="$LOGS/serial.log"
-MON="$WORK/mon.sock"
+MON=$(smoke_qsock "$WORK/mon.sock")   # 1.57.13: short socket path (smoke_qsock, qemu-dwell.sh: sun_path is 108 bytes)
 PART_OFFSET=$(( 33 * 1048576 ))
 PART_BYTES=$(( 67 * 1048576 ))
 PART_BLOCKS=$(( PART_BYTES / 4096 ))

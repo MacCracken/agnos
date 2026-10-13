@@ -813,11 +813,20 @@ fn proc_death_finish(pid, sig, via) {
         # One scan: my zombies (to reap before I publish), and every child's pending stop dropped / STOPPED child
         # continued — repeated each pass, so the final hold's scan is the one that counts.
         fz_zm = 0;
+        var fz_ow = 0;                                                    # 1.57.13: the teardowns this TICK death owes (below)
         var fz_c = 0;
         while (fz_c < proc_count) {
             if (proc_is_child_of(fz_c, pid) == 1) {
                 var fz_s = lc_st(fz_c);
-                if (fz_s == 0) { fz_zm = fz_zm | (1 << fz_c); }
+                # ⭐ 1.57.13 (design k.132 (3)): from the timer ISR a zombie is NOT reaped here — its reap frees an fd table
+                # under fs_lock, which another CPU may hold for a whole ZFS commit, and this CPU would spin on it IF=0 with
+                # the timer vector in service. In THIS hold it becomes DYING (4: not reusable, invisible to waitpid, a kill
+                # of it a no-op) and its reap is OWED, exactly as an orphan's (proc_orphan_owed): its parent is dying and
+                # nobody will read its status. Every other death path reaps it here, as before (D-31).
+                if (fz_s == 0) {
+                    if (via == VIA_TICK) { lc_st_set(fz_c, 4); fz_ow = fz_ow | (1 << fz_c); }
+                    else { fz_zm = fz_zm | (1 << fz_c); }
+                }
                 if (fz_s == 5) { lc_st_set(fz_c, 1); fz_kick = fz_kick | (1 << fz_c); }
                 lc_sp_set(fz_c, 0);
             }
@@ -832,8 +841,11 @@ fn proc_death_finish(pid, sig, via) {
                 atomic_or64(&proc_signals + fz_pp * 8, 1 << 17);          # SIGCHLD, only to a parent validated in THIS hold
             } else {
                 lc_st_set(pid, 4);                                        # DYING while it reaps itself
+                if (via == VIA_TICK) { fz_ow = fz_ow | (1 << pid); }      # 1.57.13: ... or while a process context reaps it
             }
         }
+        # Published under proctab_lock, the lock proc_orphan_owed_run claims the mask under: one claimer per bit.
+        if (fz_ow != 0) { atomic_or64(&proc_orphan_owed, fz_ow); }
         sched_spin_unlock();
         proctab_spin_unlock();
         kbd_irq_restore(fz_f);
@@ -858,8 +870,12 @@ fn proc_death_finish(pid, sig, via) {
     if (fz_orphan == 0) {
         wq_wake(WK_CHILD | fz_pp);                 # after state 0 (INV-FG-3); a spurious wake of a recycled slot is harmless
     } else {
-        proc_reap_orphan(pid);
-        lifecycle_trace(LT_ORPHAN, pid, 0, 0);
+        # 1.57.13 (k.132 (3)): a TICK death's orphan teardown is owed (set in the hold above) — the timer ISR takes no
+        # fs_lock, heap or pmm lock for it; proc_orphan_owed_run reaps it from the next syscall exit or idle step.
+        if (via != VIA_TICK) {
+            proc_reap_orphan(pid);
+            lifecycle_trace(LT_ORPHAN, pid, 0, 0);
+        }
     }
     # 1.57.8: its write ends stopped counting (pipe_writers_open skips state 0; an orphan's table is gone) — every
     # blocked pipe reader re-checks for EOF. A CLASS wake: the table that named the pipes may already be freed.
@@ -875,8 +891,14 @@ fn proc_death_finish(pid, sig, via) {
 # on_cpu). REMOTE (a claimed target): on_cpu is already -1 — the fence is a formality. The state stays 4 until the
 # publish, so neither the reuse scan nor waitpid sees a half-reaped slot, and a concurrent kill/stop of it is a no-op.
 fn proc_reap_orphan(pid) {
-    var ro_me = proc_current_get();
     proc_destroy_fd_table(pid, 0);                        # same flush mode as proc_reap_child
+    proc_reap_orphan_space(pid);
+    return 0;
+}
+# The rest of an orphan's reap, after its fd table is gone: CR3 detach, the off-CPU fence (REMOTE), the address space,
+# the publish. Split out (1.57.13) so the owed drain can free the fd tables under the fs_lock it won by trylock.
+fn proc_reap_orphan_space(pid) {
+    var ro_me = proc_current_get();
     var ro_cr3 = proc_get_cr3(pid);
     proc_set_cr3(pid, 0x1000);
     if (pid == ro_me) { cr3_load(0x1000); }               # SELF: leave my own tables first (INV-11: no other CPU has them)
@@ -889,6 +911,68 @@ fn proc_reap_orphan(pid) {
     if (pid != ro_me) { if (pid == proc_count - 1) { proc_count = proc_count - 1; } }   # never collapse the slot I stand on
     proctab_spin_unlock();
     return 0;
+}
+# ⭐ 1.57.13 (design k.132 (3)) — THE OWED ORPHAN REAP. A process killed at the TIMER TICK (proc_tick_lifecycle, INV-L2)
+# dies inside the ISR: IF=0, the timer vector in service until the EOI. Its own releases (proc_death_release) take only
+# short leaf locks there, but its orphan reap — and the reap of every zombie child it leaves — frees fd tables under
+# fs_lock (proc_destroy_fd_table: the pipe sweep, a ZFS fd's commit) and address spaces under heap/pmm, and fs_lock is
+# held by a ZFS commit for up to seconds (k.126). Until 1.57.13 the ISR SPUN on it: that CPU took no tick for the
+# whole commit. Now the tick death publishes each such pid DYING (state 4: not reusable, invisible to waitpid, a kill of
+# it a no-op) and sets its bit here, under proctab_lock in the death's final hold; the reap runs in PROCESS context —
+# the next syscall exit of any process (proc_b1, beside the klug spill and the ZFS commit the same tick death owes,
+# D-34) or the next idle step of any CPU (sched_idle_step) — exactly the remote reap a claimer's kill runs (VIA_CLAIM:
+# proc_reap_orphan's off-CPU fence, then the fd table, the address space, the publish). Prior art: Linux never tears a
+# task down in hard-IRQ context — a kill sets TIF_SIGPENDING and the task runs do_exit in process context on its way
+# back to user mode (exit_to_user_mode_loop), and the dead task's mm and stack are dropped by whatever task the CPU runs
+# next (finish_task_switch -> mmdrop / put_task_stack, the idle task included); FreeBSD posts the signal and the thread
+# exits from ast() on its return to user mode. Neither sleeps nor spins on a filesystem lock in an interrupt handler.
+# ⛔ THE DRAIN NEVER WAITS FOR fs_lock: it TAKES it with fs_spin_trylock (smp.cyr — the check and the take are one xchg)
+# or it does nothing and a later B1 / idle step retries. So no syscall's return and no idle CPU inherits a commit's
+# latency from it. Until the 1.57.13 review it LOOKED at fs_lock and took it later inside proc_destroy_fd_table, and a
+# commit that started in between was waited out — at IF=0 in a B1 (SFMASK). What it does wait for: proctab / heap /
+# pmm (short leaf holds) and the off-CPU fence (the killing CPU's switch tail, a few instructions), and — inside the
+# fd-table step it owns — the commit of a pending txg one of the REAPED process's own ZFS fds names (zfs_wp_close: the
+# reap's own work, as on every other reap path, never someone else's commit).
+# ⛔ AND IT IS NON-PREEMPTIBLE FROM THE CLAIM TO THE LAST PUBLISH (review fix): the claim clears the bits, so no other
+# B1 / idle step will take these pids over. The idle runs this at preempt 0 and do_context_switch switches it out
+# whenever READY work exists for its CPU — a pinned idle resumes only when that CPU has nothing else to run — so a
+# preemptible drain could leave a claimed pid DYING with its fd table gone and its address space and slot unfreed for
+# as long as its CPU stayed busy (unbounded behind a spinner). The fence spin it may do under the bracket is bounded by
+# another CPU's switch tail.
+# Claimed under fs_lock (won) + proctab_lock (IRQ-saved: the tick death's final hold takes it too). Returns the number
+# reaped. Lock order: fs < proctab (the claim), then fs alone for the fd tables, then proctab < heap < pmm per pid.
+var proc_orphan_owed = 0;    # (1 << pid) per tick death whose orphan / zombie reap is owed to a process context
+fn proc_orphan_owed_run() {
+    if (proc_orphan_owed == 0) { return 0; }
+    preempt_disable();                                # the claim and every reap: one non-preemptible stretch (above)
+    if (fs_spin_trylock() != 0) { preempt_enable(); return 0; }   # held (a commit, any fs op): never wait — retried
+    var ow_f = kbd_irq_save();
+    proctab_spin_lock();
+    var ow_m = proc_orphan_owed;
+    atomic_and64(&proc_orphan_owed, 0 - 1 - ow_m);    # claim exactly what was read (~ow_m); a bit set since stays owed
+    proctab_spin_unlock();
+    kbd_irq_restore(ow_f);
+    var ow_q = 0;
+    while (ow_q < 16) {
+        if (((ow_m >> ow_q) & 1) == 1) { proc_destroy_fd_table_held(ow_q, 0); }   # same flush mode as proc_reap_orphan
+        ow_q = ow_q + 1;
+    }
+    fs_spin_unlock();
+    var ow_n = 0;
+    ow_q = 0;
+    while (ow_q < 16) {
+        if (((ow_m >> ow_q) & 1) == 1) {
+            proc_reap_orphan_space(ow_q);             # REMOTE: the fence waits out the killing CPU's switch tail
+            lifecycle_trace(LT_ORPHAN, ow_q, 0, 0);
+            ow_n = ow_n + 1;
+        }
+        ow_q = ow_q + 1;
+    }
+    # The reaped tables stopped naming their pipes: every blocked pipe reader / writer re-checks (proc_death_finish's
+    # class wake ran while these tables still stood; pipe_ends_open has skipped them since their final hold).
+    if (ow_n != 0) { wq_wake_m(WK_PIPE, 0xFF00000000000000); }
+    preempt_enable();
+    return ow_n;
 }
 # The SELF death path (exit#0; B1 with a kill pending). Never returns.
 fn proc_exit_current(code, sig) {
@@ -1147,16 +1231,95 @@ fn fault_kill_current(vector) {
 
 var kbd_reclaim_pending = 0;   # a claim reclaimed a dead owner's line (said once, after the unlock)
 var kbd_reclaim_said = 0;
+# ⭐ 1.57.13 — console_mode#110 (issue archived/2026-10-12-console-line-discipline-has-no-ring3-control). THE CONSOLE'S
+# MODE: one input_lock cell (kbd_line_mode) plus the process that set it — its HOLDER (pid + 1 and epoch). The mode is a
+# property of the CONSOLE, not of the line: it applies to WHOEVER reads the cooked line — the holder, the holder's child
+# (`sudo`'s shape: the parent turns echo off, the child reads the password), or any other reader — exactly as ECHO
+# lives in the tty under Linux n_tty and `rawon` in the console under Plan 9 cons(3). It never takes, keeps or waits
+# for the line: line ownership (NB-OWN, the blocking reader's acquire) is untouched by it.
+# ⛔ 1.57.13 review: the first cut tied the mode to EXCLUSIVE LINE OWNERSHIP (a set mode kept the line owned until it
+# was cleared). That let ANY process — a background `prog &` among them — seize the console from the foreground shell
+# for as long as it lived: agnsh's NB prompt poll answered -2 forever, its blocking read waited, and with no Ctrl-C the
+# operator could not type the `kill` that would end it; and a child of a NOECHO holder that read the console waited for
+# the line forever while its parent sat in waitpid. Neither Plan 9 nor POSIX gives a mode holder exclusive input.
+# ⭐ THE MODE DIES WITH ITS HOLDER: kbd_line_release_pid (proc_death_release — every death path) clears it when the dying
+# process is the holder, and kbd_mode_now treats a dead holder (state < 1, a stale epoch, a collapsed slot, DYING with
+# its death done) as NO mode, so a death path that missed the clear can never leave the console mute. ⭐ A holder killed
+# at the TIMER TICK loses its mode AT THE TICK, not at its reap: the tick death runs proc_death_release in the ISR
+# (proc_tick_lifecycle -> proc_death), and only the orphan / zombie REAP is owed to a process context since 1.57.13
+# (proc_orphan_owed_run) — so the slot can sit DYING for as long as fs_lock is busy, which is why kbd_mode_now and
+# kbd_line_owner_live_locked read DYING-and-done as dead (proc.cyr lc_dying_done; kstack-smoke `tick orphan`).
+# A program that dies with echo off leaves the console echoing: the failure Linux termios HAS (ECHO outlives its setter — the `stty sane` problem) and Plan 9's
+# consctl does not (`rawon` reverts when /dev/consctl is closed, exit included). The holder is the LAST process to set
+# a mode bit; any process may clear it (Linux: any process holding the tty may tcsetattr). The bits, frozen in
+# agnos-userland-abi.md § 3.2 (#110):
+#   CM_NOECHO 1 — a MODE: the console line readers (waiting, held and NB) store and edit exactly as before — backspace
+#                 still erases — but echo NOTHING: no printable byte, no BS SP BS, no newline. Linux n_tty with ECHO
+#                 and ECHONL clear (darshana's tty_echo_off clears both; kybernet's _prompt_password writes its own
+#                 "\n" after the read, so an echoed LF would print a blank line). The hidden Enter still ENDS the
+#                 operator's framebuffer line (kbd_echo -> fb_line_end).
+#   CM_FLUSH  2 — an ACTION, `set` only, never stored or returned: discard kb_buf's typeahead (after pulling the xHCI
+#                 ring in, so a key already reported is discarded too) and the NB reader's partial line. Linux
+#                 tcflush(TCIFLUSH); NOECHO|FLUSH in one call is TCSETSF, which is what tty_echo_off issues. It takes
+#                 the LINE for the flush only (console_mode_sys) and gives it straight back.
+# CM_TEST (0x700): a TTY_SELFTEST build's geometry knob (tty_test_knob); a production kernel refuses it as unknown.
+enum ConsoleMode {
+    CM_NOECHO   = 1;
+    CM_FLUSH    = 2;
+    CM_SET_OK   = 3;           # the bits `set` may carry
+    CM_CLEAR_OK = 1;           # the bits `clear` may carry (FLUSH is no mode: nothing to clear)
+    CM_T_SAME   = 0x100;       # TTY_SELFTEST: fb_set_geom to the SAME geometry (the grid must not change: silent)
+    CM_T_SHRINK = 0x200;       # TTY_SELFTEST: halve the width (the grid changes: SIGWINCH to the watchers)
+    CM_T_RESTORE = 0x400;      # TTY_SELFTEST: put back the override the last SHRINK saved (changes again)
+    CM_TEST     = 0x700;
+}
+var kbd_line_mode = 0;         # (input_lock) the console's console_mode#110 flags; in force only while its holder lives
+var kbd_mode_holder = 0;       # (input_lock) pid + 1 of the process that last SET a mode bit; 0 = none
+var kbd_mode_ep = 0;           # (input_lock) proc_epoch of that holder
 
-# Caller holds input_lock. 1 = kbd_line_owner names a LIVE process (state >= 1 and the recorded epoch), 0 = free or
-# dead. proc_get_state is -1 for a collapsed slot (p >= proc_count); proc_epoch_get has no bounds check, so p < 16
-# is tested first.
+# The console's EFFECTIVE mode: kbd_line_mode while its holder is LIVE (state >= 1 — a STOPPED holder still holds, as
+# under Linux — not DYING with its death done, and the recorded epoch), else 0. proc_get_state is -1 for a collapsed slot; proc_epoch_get has no
+# bounds check, so the holder is tested < 16 first. Under input_lock in console_mode_sys; unlocked in the echo gate.
+fn kbd_mode_now() {
+    var mn_m = kbd_line_mode;
+    if (mn_m == 0) { return 0; }
+    var mn_h = kbd_mode_holder;
+    if (mn_h <= 0) { return 0; }
+    var mn_p = mn_h - 1;
+    if (mn_p >= 16) { return 0; }
+    if (proc_get_state(mn_p) < 1) { return 0; }
+    if (lc_dying_done(mn_p) == 1) { return 0; }      # 1.57.13 merge: a tick-killed holder waits DYING for its owed reap
+    if (proc_epoch_get(mn_p) != kbd_mode_ep) { return 0; }
+    return mn_m;
+}
+# The echo gate of the console line readers: 1 while the console's mode has CM_NOECHO, whoever reads. Unlocked reads
+# are enough: the holder sets the mode before its read and clears it after, so the cells are settled while a hidden
+# line is typed; a set or clear racing a reader's keystroke decides that one byte either way, as under Linux.
+fn kbd_echo_suppressed() {
+    if ((kbd_mode_now() & CM_NOECHO) == 0) { return 0; }
+    return 1;
+}
+# ⛔ A HIDDEN Enter must still END the operator's framebuffer line (1.57.13 review). The echoed LF was the only thing
+# that cleared fb_line_live (fb_console.cyr fb_line_note), so after a hidden line typed behind a prompt with no newline
+# — the password shape this mode exists for — every later kprint (every ring-3 write(1/2) included) erased the row and
+# replayed the stale prompt: a ghost prompt following the cursor, at the per-print cost the fb_line_live gate exists
+# to prevent. fb_line_end ends the line without drawing.
+fn kbd_echo(ch) {
+    if (kbd_echo_suppressed() == 0) { kputc(ch); return 0; }
+    if (ch == 10) { fb_line_end(); }
+    return 0;
+}
+
+# Caller holds input_lock. 1 = kbd_line_owner names a LIVE process (state >= 1, not DYING with its death done —
+# lc_dying_done, 1.57.13 — and the recorded epoch), 0 = free or dead. proc_get_state is -1 for a collapsed slot
+# (p >= proc_count); proc_epoch_get has no bounds check, so p < 16 is tested first.
 fn kbd_line_owner_live_locked() {
     var lo_o = kbd_line_owner;
     if (lo_o <= 0) { return 0; }
     var lo_p = lo_o - 1;
     if (lo_p >= 16) { return 0; }
     if (proc_get_state(lo_p) < 1) { return 0; }
+    if (lc_dying_done(lo_p) == 1) { return 0; }      # 1.57.13 merge: DYING with its death done (an owed reap) is dead
     if (proc_epoch_get(lo_p) != kbd_line_ep) { return 0; }
     return 1;
 }
@@ -1263,7 +1426,7 @@ fn kbd_line_acquire(me, dl) {
 
 # Give the line back. A no-op unless `me` owns it AND no NB partial line is live (NB-OWN: while nbline_pos > 0 the NB
 # reader's hold wins over any release by the same pid — mutation M-F6). Wakes the owner waiters (after the unlock)
-# only when it really released and someone is waiting.
+# only when it really released and someone is waiting. (console_mode#110's mode never holds the line: see its banner.)
 fn kbd_line_release(me) {
     if (me < 0) { return 0; }
     if (me >= 16) { return 0; }
@@ -1281,7 +1444,8 @@ fn kbd_line_release(me) {
 }
 
 # Death release (exit#0, fault_kill_current; S7's chain later): a dying owner gives the line back and its partial NB
-# line dies with it. Same wake rule.
+# line dies with it. A dying console_mode#110 HOLDER takes its mode with it (1.57.13 — the next reader echoes), whether
+# or not it owns the line: the mode is the console's, the holder only decides how long it lasts. Same wake rule.
 fn kbd_line_release_pid(pid) {
     if (pid < 0) { return 0; }
     if (pid >= 16) { return 0; }
@@ -1289,6 +1453,7 @@ fn kbd_line_release_pid(pid) {
     input_spin_lock();
     var kp_rel = 0;
     if (kbd_line_owner == pid + 1) { kbd_line_owner = 0; nbline_pos = 0; kp_rel = 1; }
+    if (kbd_mode_holder == pid + 1) { kbd_line_mode = 0; kbd_mode_holder = 0; kbd_mode_ep = 0; }
     var kp_w = kbd_line_waiters;
     input_spin_unlock();
     if (kp_rel == 1) { if (kp_w != 0) { wq_wake(WK_KBD_OWNER); } }
@@ -1349,23 +1514,24 @@ fn kbd_read_line_waiting(buf, count) {
         var lw_sc = kb_read_scancode();
         var lw_ch = scancode_to_ascii(lw_sc);
         if (lw_ch == 10) {                 # Enter: terminate the line. Echo newline, store it as the terminator.
-            kputc(10);
+            kbd_echo(10);
             store8(buf + lw_n, 10);
             lw_n = lw_n + 1;
             return lw_n;
         }
         if (lw_ch == 4) {                  # Ctrl-D: EOF at line start (0), else the bytes typed so far, no LF
+            fb_line_end();                 # 1.57.13: no LF is drawn, so end the operator's fb line here (kbd_echo)
             return lw_n;
         }
         if (lw_ch == 8) {                  # Backspace: erase one cell + drop one byte (BS SP BS)
             if (lw_n > 0) {
                 lw_n = lw_n - 1;
-                kputc(8); kputc(32); kputc(8);
+                kbd_echo(8); kbd_echo(32); kbd_echo(8);
             }
         } elif (lw_ch > 31) {              # Printable: store + echo
             store8(buf + lw_n, lw_ch);
             lw_n = lw_n + 1;
-            kputc(lw_ch);
+            kbd_echo(lw_ch);
         }
         # lw_ch == 0 (modifier/release) or another control: consumed in order, never stored.
     }
@@ -1420,7 +1586,7 @@ fn kbd_read_blocking_held(buf, count) {
         var sc = kb_read_scancode();
         var ch = scancode_to_ascii(sc);
         if (ch == 10) {                 # Enter: terminate the line. Echo newline,
-            kputc(10);                  # store it as the terminator, return.
+            kbd_echo(10);                  # store it as the terminator, return.
             store8(buf + n, 10);
             n = n + 1;
             kbd_irq_disable();
@@ -1434,7 +1600,9 @@ fn kbd_read_blocking_held(buf, count) {
             # what lets a stdin filter (anuenue, cat) terminate; without it a
             # filter loops forever (no pipes, no other EOF). Mid-line (n>0) it
             # delivers the bytes typed so far WITHOUT a terminating LF, so a
-            # second Ctrl-D at the fresh line start then yields EOF. Not echoed.
+            # second Ctrl-D at the fresh line start then yields EOF. Not echoed —
+            # so nothing drawn ends the operator's fb line: end it here (1.57.13, kbd_echo).
+            fb_line_end();
             kbd_irq_disable();
             preempt_enable();
             if (kh_took == 1) { kbd_line_release(kh_me); }
@@ -1443,12 +1611,12 @@ fn kbd_read_blocking_held(buf, count) {
         if (ch == 8) {                  # Backspace: erase one cell + drop one byte
             if (n > 0) {                # (BS SP BS), mirrors shell.cyr:797.
                 n = n - 1;
-                kputc(8); kputc(32); kputc(8);
+                kbd_echo(8); kbd_echo(32); kbd_echo(8);
             }
         } elif (ch > 31) {              # Printable: store + echo (shell.cyr:800-805)
             store8(buf + n, ch);
             n = n + 1;
-            kputc(ch);
+            kbd_echo(ch);
         }
         # ch == 0 (modifier/release) or other control (<32, non-LF/BS): consumed
         # in-window, never stored — so the whole make/break stream is drained here
@@ -1485,7 +1653,7 @@ fn kbd_read_nonblock(buf, count) {
     # (never mid-line — a shift HELD across a poll boundary must survive into the next drain).
     # ⛔⛔ THE LINE IS LIVE FROM THE MOMENT SOMEONE IS READING IT, NOT FROM THE FIRST ECHO — and getting
     # that wrong shipped a fix that did nothing on iron. `fb_line_live` used to be set beside the echo
-    # `kputc(ch)` below. But the one-shot that actually corrupts the prompt, `hid: first keyboard report
+    # echo `kbd_echo(ch)` below. But the one-shot that actually corrupts the prompt, `hid: first keyboard report
     # dispatched`, fires when the first REPORT arrives — strictly BEFORE that key is cooked and echoed —
     # so the flag was still 0 at print time and the save-erase-replay never ran. Measured on the 1.56.45
     # burn: `[ASSIST] > hid: first keyboard report dispatched...` with the typed word on the next row,
@@ -1504,7 +1672,7 @@ fn kbd_read_nonblock(buf, count) {
             var sc = kb_read_scancode();
             var ch = scancode_to_ascii(sc);
             if (ch == 10) {                          # Enter: flush the accumulated line + LF
-                kputc(10);
+                kbd_echo(10);
                 # 1.44.21 HARDENING: clamp the flush to THIS call's validated buffer. nbline_buf +
                 # nbline_pos PERSIST across poll calls, but `buf` is range-checked only for THIS
                 # call's `count` (read#5: is_user_range(arg2, arg3)). A ring-3 caller can accumulate
@@ -1523,6 +1691,7 @@ fn kbd_read_nonblock(buf, count) {
                 nbline_pos = 0;
                 draining = 0;
             } elif (ch == 4) {                       # Ctrl-D: canonical EOF (mirror kbd_read_blocking)
+                fb_line_end();                       # 1.57.13: no LF drawn — end the operator's fb line (kbd_echo)
                 if (nbline_pos == 0) { ret = 0; }    # at line start -> EOF (return 0)
                 else {                                # mid-line -> deliver typed bytes, no LF
                     # 1.44.21 HARDENING: clamp to THIS call's validated count (no LF on this path,
@@ -1538,14 +1707,14 @@ fn kbd_read_nonblock(buf, count) {
             } elif (ch == 8) {                       # Backspace: drop one accumulated byte + erase cell
                 if (nbline_pos > 0) {
                     nbline_pos = nbline_pos - 1;
-                    kputc(8); kputc(32); kputc(8);
+                    kbd_echo(8); kbd_echo(32); kbd_echo(8);
                 }
             } elif (ch > 31) {                       # Printable: accumulate + echo (cap: leave room for LF)
                 if (nbline_pos + 1 < count) {
                     if (nbline_pos < 4095) {         # nbline_buf capacity (512 u64 = 4096 B)
                         store8(&nbline_buf + nbline_pos, ch);
                         nbline_pos = nbline_pos + 1;
-                        kputc(ch);
+                        kbd_echo(ch);
                     }
                 }
             }
@@ -1565,6 +1734,163 @@ fn kbd_read_nonblock(buf, count) {
     }
     kbd_line_release(nb_me);       # NB-OWN: a no-op while nbline_pos > 0 (the partial line keeps the line)
     return ret;
+}
+
+# ═══════════════ console_mode#110 (1.57.13) — the console's mode (banner above kbd_mode_now) and the FLUSH action ═══════════════
+# Returns the console's PREVIOUS flags — its effective mode, 0 once the holder is dead — or -1. `set` must lie in
+# CM_SET_OK and `clear` in CM_CLEAR_OK — an unknown bit is refused before anything changes, so a newer program asking an
+# older kernel for a mode it lacks hears -1 rather than a silent no-op (darshana's rule: a 0 must never claim a hidden
+# password that is shown). new = (old & ~clear) | (set & CM_NOECHO); setting NOECHO makes the caller the HOLDER (the
+# mode dies with it), and a result of 0 leaves no holder.
+#   NOECHO, a clear and a query (0, 0) never take, keep or wait for the line: the mode is the console's, and it applies
+#              to whoever reads next. (The first 1.57.13 cut made `set` take the line and keep it while a mode was set
+#              — exclusive input for the holder; see the banner for why that was wrong.)
+#   FLUSH      takes the LINE for the flush only: free, already the caller's, or a dead owner's at once; another LIVE
+#              reader mid-line is WAITED FOR (kbd_line_acquire, WK_KBD_OWNER — bounded by that reader's line, never by a
+#              mode), since flushing its half-typed line would be taking its keys; then the line is given straight back.
+#              A context that may not block flushes only a free line (-1 otherwise); an S7 signal aborting the wait
+#              answers -1 with nothing changed (the mode bits of the same call included).
+# FLUSH pulls the xHCI ring into kb_buf first (kb_has_key: hid_poll + the deferred HID work, which may print — so it
+# runs before input_lock), then empties kb_buf and the NB partial line in one hold.
+fn console_mode_sys(set, clear) {
+    if ((set & CM_TEST) != 0) { return tty_test_knob(set); }
+    if ((set & (0 - 1 - CM_SET_OK)) != 0) { return 0 - 1; }
+    if ((clear & (0 - 1 - CM_CLEAR_OK)) != 0) { return 0 - 1; }
+    var cm_me = proc_current_get();
+    if (cm_me < 0) { return 0 - 1; }
+    if (cm_me >= 16) { return 0 - 1; }
+    var cm_fl = 0;
+    if ((set & CM_FLUSH) != 0) {
+        var cm_a = 0 - 3;
+        if (wq_can_block() == 1) { cm_a = kbd_line_acquire(cm_me, 0); }
+        if (cm_a == (0 - 3)) {
+            cm_a = 0 - 1;
+            if (kbd_line_try_take(cm_me) == 1) { cm_a = 0; }
+        }
+        if (cm_a != 0) { return 0 - 1; }             # -1: an S7 signal aborted the wait, or a refused context found it busy
+        kb_has_key();
+        cm_fl = 1;
+    }
+    var cm_f = kbd_irq_save();
+    input_spin_lock();
+    var cm_prev = kbd_mode_now();
+    var cm_new = (cm_prev & (0 - 1 - clear)) | (set & CM_NOECHO);
+    kbd_line_mode = cm_new;
+    if (cm_new == 0) {
+        kbd_mode_holder = 0;
+        kbd_mode_ep = 0;
+    } elif ((set & CM_NOECHO) != 0) {
+        kbd_mode_holder = cm_me + 1;
+        kbd_mode_ep = proc_epoch_get(cm_me);
+    }
+    if (cm_fl == 1) {
+        kbd_ring_flush_locked();
+        nbline_pos = 0;
+    }
+    input_spin_unlock();
+    kbd_irq_restore(cm_f);
+    if (cm_fl == 1) { kbd_line_release(cm_me); }
+    return cm_prev;
+}
+
+#ifdef TTY_SELFTEST
+# console_mode#110's GEOMETRY KNOB — a TTY_SELFTEST build ONLY (scripts/harness/tty-test.py drives it through
+# tests/waits/waitx mode `tty`). No live modeset is reachable under QEMU: mdo_native needs AMD DCN silicon and
+# gpu_scanout_matchgeom reads its HUBP viewport. So the knob drives the SAME fb_set_geom every real geometry move goes
+# through, and posts SIGWINCH on its answer exactly as a modeset does (after the move; the knob draws no console of its
+# own to settle first, unlike mdo_native / gpu_scanout_matchgeom). One op bit, nothing else:
+#   CM_T_SAME    — fb_set_geom(fb_width, fb_height, fb_pitch): the grid is unchanged, nothing may be posted
+#   CM_T_SHRINK  — save the override cells, then halve the width (cols halve): the watchers get bit 28
+#   CM_T_RESTORE — put back what the last SHRINK saved (the grid changes back: bit 28 again)
+# Returns winsize#60's packed value after the op, or -1. Only the WIDTH moves (pitch and height kept), so the console
+# keeps drawing inside the real surface whatever a concurrent kprint reads mid-store.
+var tty_t_w = 0;
+var tty_t_h = 0;
+var tty_t_p = 0;
+fn tty_test_knob(set) {
+    if (set == CM_T_SAME) {
+        if (fb_set_geom(fb_width(), fb_height(), fb_pitch()) == 1) { console_winch_post(); }
+        return fb_winsize();
+    }
+    if (set == CM_T_SHRINK) {
+        tty_t_w = fb_geom_w;
+        tty_t_h = fb_geom_h;
+        tty_t_p = fb_geom_pitch;
+        if (fb_set_geom(fb_width() / 2, fb_height(), fb_pitch()) == 1) { console_winch_post(); }
+        return fb_winsize();
+    }
+    if (set == CM_T_RESTORE) {
+        if (fb_set_geom(tty_t_w, tty_t_h, tty_t_p) == 1) { console_winch_post(); }
+        return fb_winsize();
+    }
+    return 0 - 1;
+}
+#endif
+#ifndef TTY_SELFTEST
+fn tty_test_knob(set) { return 0 - 1; }              # a production kernel: the knob's bits are unknown bits
+#endif
+
+# ═══════════════ fd_kind#111 (1.57.13) — what the caller's fd IS (issue archived/2026-10-12-no-way-to-ask-what-an-fd-is) ═══════════════
+# stat#33 and lstat#102 take a PATH; nothing took an fd, so darshana's tty_isatty could only ask whether the console
+# was up (winsize#60), and `prog > file` / `prog | other` got terminal escapes. This is fstat's S_IFMT and isatty(3)'s
+# question in one register: POSIX classifies an fd by st_mode & S_IFMT (S_IFCHR / S_IFREG / S_IFDIR / S_IFIFO /
+# S_IFSOCK) and glibc's isatty is "does TCGETS succeed". agnos keeps its OWN small enum rather than S_IFMT because it
+# has kinds POSIX folds together — a #97 channel endpoint (the PTY band a terminal emulator hands its child; the
+# caller decides whether that is a terminal) and the three event fds, which Linux reports as anonymous inodes. Read
+# from the caller's own table (an 8-byte tag), like chan_fd_endpoint; no lock, no pointer, no blocking.
+#   1 CONSOLE  the console character device (VFS_DEVICE 0): the cooked keyboard line on read#5 — from ANY such fd since
+#              1.57.13 (fd 0, 1, 2, a dup), owner-aware and console_mode#110-aware — and the console on write
+#   2 FILE     a regular file on any backend: initrd (MEMFILE), ext2, FAT/exFAT write-back, ZFS
+#   3 DIR      a directory fd (getdents): ext2, ZFS
+#   4 PIPE     either end of a pipe#25
+#   5 CHAN     a #97 channel endpoint
+#   6 SOCKET   a kernel socket fd (VFS_SOCK, 1.49.4)
+#   7 SIGNALFD · 8 EPOLL · 9 TIMERFD
+#   10 DEVICE  another character device (none is registered today)
+#  -1          a closed fd, fd < 0 or >= 32 — and the cyrius stdlib's TAGGED socket handle (AGNOS_SOCK_TAG | slot),
+#              which is a userland adapter over conn ids, not a kernel fd: the adapter itself knows it is a socket.
+enum FdKind {
+    FDK_CONSOLE  = 1;
+    FDK_FILE     = 2;
+    FDK_DIR      = 3;
+    FDK_PIPE     = 4;
+    FDK_CHAN     = 5;
+    FDK_SOCKET   = 6;
+    FDK_SIGNALFD = 7;
+    FDK_EPOLL    = 8;
+    FDK_TIMERFD  = 9;
+    FDK_DEVICE   = 10;
+}
+# 1 when the caller's `fd` is the console character device (VFS_DEVICE 0), else 0 — read#5's cooked-line route and
+# fd_kind#111's FDK_CONSOLE are the same question, so they ask it here.
+fn fd_is_console(fd) {
+    if (fd < 0) { return 0; }
+    if (fd >= 32) { return 0; }
+    var fc_b = vfs_fd_table() + fd * 32;
+    if (ktag(fc_b) != VFS_DEVICE) { return 0; }
+    if (kpayload(fc_b, 2) != 0) { return 0; }
+    return 1;
+}
+fn fd_kind_sys(fd) {
+    if (fd < 0) { return 0 - 1; }
+    if (fd >= 32) { return 0 - 1; }
+    if (fd_is_console(fd) == 1) { return FDK_CONSOLE; }
+    var fk_b = vfs_fd_table() + fd * 32;
+    var fk_t = ktag(fk_b);
+    if (fk_t == VFS_DEVICE) { return FDK_DEVICE; }
+    if (fk_t == VFS_MEMFILE) { return FDK_FILE; }
+    if (fk_t == VFS_EXT2_FILE) { return FDK_FILE; }
+    if (fk_t == VFS_SEC_WFILE) { return FDK_FILE; }
+    if (fk_t == VFS_ZFS_FILE) { return FDK_FILE; }
+    if (fk_t == VFS_EXT2_DIR) { return FDK_DIR; }
+    if (fk_t == VFS_ZFS_DIR) { return FDK_DIR; }
+    if (fk_t == VFS_PIPE) { return FDK_PIPE; }
+    if (fk_t == VFS_CHAN) { return FDK_CHAN; }
+    if (fk_t == VFS_SOCK) { return FDK_SOCKET; }
+    if (fk_t == VFS_SIGNALFD) { return FDK_SIGNALFD; }
+    if (fk_t == VFS_EPOLL) { return FDK_EPOLL; }
+    if (fk_t == VFS_TIMERFD) { return FDK_TIMERFD; }
+    return 0 - 1;                                    # VFS_FREE (a closed fd) or a tag this table does not know
 }
 
 # System hostname — read-only identity for uname(34).nodename. Seeded to
@@ -7409,7 +7735,10 @@ fn mdo_native() {
     # ── Success on the ENVELOPE. Move the console to the geometry that is now live. ────────────────────
     # fb_set_geom directly, NOT gpu_scanout_matchgeom: that helper early-returns once fb_geom_active() is 1,
     # which it has been since the boot-time 800x600 match, so calling it here would silently do nothing.
-    fb_set_geom(t_w, t_h, t_pitch * 4);
+    # ⛔ 1.57.13: SIGWINCH is posted AFTER the clear and every line this path prints (at its return), never inside
+    # fb_set_geom — a watcher on another CPU that redrew on the signal before fb_console_clear ran would have its redraw
+    # wiped (review finding).
+    var md_winch = fb_set_geom(t_w, t_h, t_pitch * 4);
     fb_console_clear();
     kprint("modeset: NATIVE OK -- pipe scanning ", 36); kprint_num(t_w); kprint("x", 1); kprint_num(t_h);
     kprint(" pitch ", 7); kprint_num(t_pitch); kprintln(" px, scaler in BYPASS", 21);
@@ -7418,6 +7747,7 @@ fn mdo_native() {
     }
     kprintln("modeset: EYE-CHECK THE PANEL. The frame counter free-runs off the PLL and", 73);
     kprintln("modeset: advances on a black screen too -- it proves the envelope, not the picture.", 83);
+    if (md_winch == 1) { console_winch_post(); }    # the console is settled: a watcher's redraw now stays up
     return 0;
 }
 
@@ -9538,16 +9868,20 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # background jobs at the prompt. a4==0 keeps the efficient blocking read (the default,
         # used when agnsh has no live bg jobs). The syscall entry stub resets ksyscall_a4 per
         # ring-3 entry (syscall_hw.cyr), so a stale a4 can't mis-route a later blocking read.
-        if (arg1 == 0) {
-            # fd 0 is the keyboard ONLY while it is still the console device. A pipe
-            # redirect (exec_redirect#62) copies the pipe read-end's vfs_table entry
-            # over vfs_table[0] (tag VFS_PIPE), so a REDIRECTED stdin must fall through
-            # to vfs_read -> pipe_read — the `cmd2` side of `cmd1 | cmd2`. The a4
-            # non-blocking cooked-line read is keyboard-only; a piped fd 0 ignores it.
-            if (ktag(vfs_fd_table()) == VFS_DEVICE) {
-                if (ksyscall_a4_get() != 0) { return kbd_read_nonblock(arg2, arg3); }
-                return kbd_read_blocking(arg2, arg3);
-            }
+        # fd 0 is the keyboard ONLY while it is still the console device. A pipe
+        # redirect (exec_redirect#62) copies the pipe read-end's vfs_table entry
+        # over vfs_table[0] (tag VFS_PIPE), so a REDIRECTED stdin must fall through
+        # to vfs_read -> pipe_read — the `cmd2` side of `cmd1 | cmd2`. The a4
+        # non-blocking cooked-line read is keyboard-only; a piped fd 0 ignores it.
+        # ⛔ 1.57.13: EVERY fd that IS the console device reads the cooked line — fd 0, and fd 1 / fd 2 / a dup too
+        # (fd_is_console). Only fd 0 did: a read on console fd 2 (a pager's or a y/n prompt's key read while stdin is a
+        # pipe — the shape fd_kind#111 makes discoverable) fell to vfs_read -> serial_dev_read, which ignored the line's
+        # owner and console_mode#110 (a fourth reader draining a NOECHO reader's keys), echoed nothing, and with no key
+        # pending executed hlt in syscall context at IF=0 — the CPU never woke (the whole box at -smp 1; measured by the
+        # 1.57.13 review: HLT=1, RFLAGS 0x46).
+        if (fd_is_console(arg1) == 1) {
+            if (ksyscall_a4_get() != 0) { return kbd_read_nonblock(arg2, arg3); }
+            return kbd_read_blocking(arg2, arg3);
         }
         # ⭐ ipc BITE 9 — an ordinary read(2) reaches a CHANNEL fd (rd5_once). ⭐ 1.57.8: a pipe or channel read that
         # would answer -2 (WOULD_BLOCK) BLOCKS its caller when a4 == 0 (rd5_wait — a real wq wait, woken by the writer /
@@ -10698,6 +11032,31 @@ fn ksyscall(num, arg1, arg2, arg3) {
         stack_canary_check(canary);
         return yt_r;
     }
+    if (num == 109) {
+        # sock_send_dl(conn_id=arg1, buf=arg2, len=arg3, timeout_us=a4) — sock_send#48 with a CALLER CEILING (1.57.13,
+        # issue archived/2026-10-02-sock-send-ignores-the-caller-deadline.md: a cyrius TLS write overshot its deadline by
+        # up to #48's ~8 s D6 window). timeout_us bounds THIS call's waiting, measured ONCE from entry and never reset by
+        # ACK progress (Linux SO_SNDTIMEO: one budget across the call's waits; #47's ceiling); when it fires the call
+        # returns the COMMITTED count, possibly 0 (SO_SNDTIMEO returns the partial count; agnos says 0 = "no progress
+        # yet" where Linux says EAGAIN — D6). A chunk that goes out without a wait still goes. 0 = exactly #48 (the D6
+        # window only); < 0 = no wait at all; D6 still applies under it, so a stalled peer returns at
+        # min(timeout_us, ~8 s). Never early; expires at the first tick at or after it. tcp_send_dl (net_tcp.cyr) has
+        # the rule and its prior art. Same validation, ownership and copy as #48: tcp_auth FIRST (-1 for a conn that is
+        # not the caller's, kernel-owned included, even for len <= 0), is_user_range, the copy AC=1 from the syscall
+        # entry STAC on this process's own stack and CR3 (also after a wake); tcp_send_ex re-checks under the lock. A
+        # NEW NUMBER, not an a4 on #48: a4 is a stale register in every shipped 3-argument #48 caller (the #100 rule).
+        if (tcp_auth(arg1) < 0) { stack_canary_check(canary); return 0 - 1; }
+        if (arg3 <= 0) { stack_canary_check(canary); return 0; }
+        if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg2, arg3) == 0) { stack_canary_check(canary); return 0 - 1; }
+        var sd_dl = ksyscall_a4_get();       # a4 = this process's proc_sc_a4 slot, read once at entry
+        fb_dbg_beacon(4);                    # the #48 stage marker (TCP send)
+        var sd_w = net_sys_window_open();   # pre-scheduler callers only (net_tcp.cyr)
+        var sd_n = tcp_send_dl(arg1, arg2, arg3, tcp_caller_tag(), sd_dl);
+        net_sys_window_close(sd_w);
+        stack_canary_check(canary);
+        return sd_n;
+    }
     # GPU compute dispatch (#82) — the ring-3 dispatch seam (#82) ring-3 seam: run the proven 8x8 integer matmul on the caller's
     # A,B (64 i32 each) and write C=A*B to c_uva. The path mabda/tentib consume for GPU inference. -> 0 ok / <0 err.
     if (num == 82) { stack_canary_check(canary); return gpu_dispatch_sys(arg1, arg2, arg3); }                # gpu_dispatch(a, b, c)
@@ -11333,7 +11692,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var ks_n = 0;
         while (ks_n < arg2) {
             if (kb_has_key() == 0) { stack_canary_check(canary); return ks_n; }
-            store8(arg1 + ks_n, kb_read_scancode());
+            var ks_sc = kb_read_scancode();
+            if (ks_sc == 0) { stack_canary_check(canary); return ks_n; }   # 1.57.13: emptied since kb_has_key (a FLUSH / another consumer)
+            store8(arg1 + ks_n, ks_sc);
             ks_n = ks_n + 1;
         }
         stack_canary_check(canary);
@@ -11658,7 +12019,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 48) {
         # sock_send(conn_id=arg1, buf=arg2, len=arg3) — send len bytes from the
-        # user buffer over an ESTABLISHED or CLOSE_WAIT conn. a4 unused.
+        # user buffer over an ESTABLISHED or CLOSE_WAIT conn. a4 never read: a caller-chosen ceiling is #109
+        # sock_send_dl (1.57.13), a new number because a4 is a stale register in every shipped 3-argument caller.
         # ⭐ 1.57.7 (S6): BLOCKS ONLY THE CALLER (tcp_send_ex waits on WK_TCP|id for each segment's ACK) and is
         # STREAM-CORRECT: one segment in flight at every entry — a call that finds an earlier segment still unACKed
         # waits for it first, and each segment is sent from the kernel's held copy. Returns `len` when every byte is
@@ -11983,6 +12345,21 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var ws_packed = fb_winsize();
         stack_canary_check(canary);
         return ws_packed;
+    }
+    if (num == 110) {
+        # console_mode(set=arg1, clear=arg2) -> previous flags / -1 — 1.57.13. The console's NOECHO mode (whoever reads;
+        # dies with the process that set it) and the FLUSH action (console_mode_sys above). A NEW NUMBER, not an arm widened: a3/a4
+        # never read. Kept beside winsize#60 — the console's other ring-3 knob.
+        var cm_r = console_mode_sys(arg1, arg2);
+        stack_canary_check(canary);
+        return cm_r;
+    }
+    if (num == 111) {
+        # fd_kind(fd=arg1) -> FDK_* (>= 1) / -1 — 1.57.13. What the caller's fd IS (fd_kind_sys above): the fd-based
+        # question stat#33 / lstat#102 cannot answer. a2..a4 never read.
+        var fk_r = fd_kind_sys(arg1);
+        stack_canary_check(canary);
+        return fk_r;
     }
     if (num == 61) {
         # net_config(field=arg1) — return a kernel network-config datum in rax, or

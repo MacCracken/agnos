@@ -23,8 +23,13 @@
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
-DOOM_ROOT="${DOOM_ROOT:-$ROOT/../cyrius-doom}"
+# ⭐ 1.57.13 — SIBLINGS: an explicit <NAME>_ROOT wins, else ${SIBLINGS_ROOT:-$ROOT/..}/<repo> — the rule
+# scripts/burn/stage-tools.sh and scripts/check/syscall-abi-check.sh already follow. From a worktree $ROOT/.. is
+# .claude/worktrees/, which holds no sibling: the 1.57.12 sweep's run set SIBLINGS_ROOT and this smoke, reading only
+# its own variable, failed in 7 s ("not built" / "not found").
+SIBLINGS="${SIBLINGS_ROOT:-$ROOT/..}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-$SIBLINGS/gnoboot}"
+DOOM_ROOT="${DOOM_ROOT:-$SIBLINGS/cyrius-doom}"
 
 OVMF_CODE=""; for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
 OVMF_VARS_SRC=""; for c in /usr/share/edk2/x64/OVMF_VARS.4m.fd /usr/share/edk2/x64/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd; do [ -f "$c" ] && { OVMF_VARS_SRC="$c"; break; }; done
@@ -42,8 +47,10 @@ WAD="$DOOM_ROOT/wad/DOOM1.WAD"
 [ -f "$WAD" ]     || { echo "ERROR: DOOM1.WAD not found at $WAD"; exit 1; }
 
 echo "[1/4] Building DOOM_AUDIO_SELFTEST kernel..."
-if ! env DOOM_AUDIO_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/doom-audio-build.log 2>&1; then
-    echo "  BUILD-FAIL (see /tmp/doom-audio-build.log)"; tail -5 /tmp/doom-audio-build.log; exit 1
+# 1.57.13: the build log is the TREE's (it was /tmp/doom-audio-build.log — one file for every tree and worker copy).
+mkdir -p "$ROOT/build"; DA_BLOG="$ROOT/build/doom-audio-build.log"
+if ! env DOOM_AUDIO_SELFTEST=1 sh "$ROOT/scripts/build.sh" >"$DA_BLOG" 2>&1; then
+    echo "  BUILD-FAIL (see $DA_BLOG)"; tail -5 "$DA_BLOG"; exit 1
 fi
 echo "  build/agnos $(stat -c %s "$AGNOS") B"
 

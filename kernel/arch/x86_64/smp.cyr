@@ -528,9 +528,13 @@ fn icmp_spin_unlock() {
 # fault handler touches any of these), so they are PLAIN spinlocks (NO cli/sti) and
 # INERT single-core (the xchg always wins uncontended → byte-identical boot).
 # ⭐ 1.57.7 (S7) — THE ONE EXCEPTION TO "NON-ISR" (INV-L2, docs/architecture/process-lifecycle.md): the lifecycle TICK
-# path (sched.cyr proc_tick_lifecycle, from timer_handler) runs the whole death chain — proctab, fs (via
-# proc_destroy_fd_table), heap, pmm (proc_free_address_space), flock, the chan/snd/shm locks, console when a callee
-# kprints — but ONLY for a CPL3-interrupted frame (its `(frame+128 & 3) == 3` early return is load-bearing). A CPU
+# path (sched.cyr proc_tick_lifecycle, from timer_handler) runs the death chain — proctab, flock, the chan/snd/shm
+# locks, console when a callee kprints, and pmm_lock through ONE release (shm_release_pid -> shm_free -> pmm_free_2mb, a
+# short bitmap hold for a pmm-backed shm slot) — but ONLY for a CPL3-interrupted frame. (Since 1.57.13 NO fs_lock and no
+# reap in the ISR: an orphan's reap and a zombie child's reap — proc_destroy_fd_table under fs_lock, and the address
+# space's heap / pmm frees — are OWED to the next syscall exit or idle step, syscall.cyr proc_orphan_owed_run, because
+# fs_lock is held for whole ZFS commits and the ISR spun on it; design k.132 (3). No heap lock either: a callee walk of
+# every tick-path release found none — 1.57.13 review.) The CPL3 test (its `(frame+128 & 3) == 3` early return) is load-bearing. A CPU
 # interrupted in ring 3 holds no kernel lock, so no same-CPU holder of any of these can exist; another CPU's hold is
 # ordinary contention. fault_kill_current runs the same chain from a CPL3 exception on the same argument. The same
 # exception covers the "no ISR calls kprint" rule below; the display hand-back's disk spill + kprint are deferred to
@@ -652,6 +656,26 @@ fn fs_spin_unlock() {
     }
     preempt_enable();                                   # 1.57.6 (S3.2): pairs the preempt_disable in the lock
     return 0;
+}
+# ⭐ 1.57.13 (review of k.135) — fs_spin_trylock: the CHECK AND THE TAKE IN ONE xchg, for the two owed runners (syscall.cyr
+# proc_orphan_owed_run, zfs_write.cyr zfs_wp_owed_run). Each used to look at fs_lock and take it later (or take it
+# unconditionally), so a ZFS commit that started in between — or was already running — was waited out, at IF=0 inside a
+# syscall's B1: the k.132 (3) symptom (a CPU taking no tick for a whole commit) on an unrelated syscall's return. A
+# byte-copy of net_rx_trylock with only the global renamed (the same TRY semantics: returns the OLD value — 0 = ACQUIRED,
+# with preempt raised exactly as fs_spin_lock raises it, released by fs_spin_unlock; 1 = held -> nothing taken, nothing
+# raised, the caller retries later). Slots as net_rx_trylock's: old @ [rbp-0x08], addr @ [rbp-0x10] (objdump-checked).
+# REGISTER CONTRACT: in — addr from its slot; out — old (the xchg'd value) into [rbp-0x08]; clobbers rax, rcx.
+fn fs_spin_trylock() {
+    var old = 1;
+    var addr = &fs_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+        0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+        0x48; 0x87; 0x08;                            # xchg [rax], rcx  (atomic: rcx<-old, [addr]<-1)
+        0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+    }
+    if (old == 0) { preempt_disable(); }              # only a WON try is a held lock (fs_spin_unlock pairs it)
+    return old;                                       # 0 = acquired; 1 = already held (skip, retry later)
 }
 # ⭐ 1.57.7 (Path 2, S3.5) — flock_lock: the advisory-lock table (vfs.cyr flock_*). fs_lock < flock_lock < sched_lock:
 # the releases run under fs_lock (vfs_close), and wq_wake (sched_lock) is taken under flock_lock. NEVER held across

@@ -110,7 +110,7 @@ demand paging or CoW, so it cannot vanish mid-copy (`tcp_recv`'s copy-out and `t
   the loopback drain. A blocked sender cannot poll, so this is what resends for it. `net_tick_lock` is a TRY lock:
   one CPU runs the body at a time, a busy tick skips. **`net_tick_pause()/resume()`** is the selftest exclusion: after
   pause returns no body runs on any CPU (a `kbd_irq_save` bracket masks only its own CPU); TCP_SELFTEST runs inside it.
-- **Waits** (blocking-waits.md § Network waits): #47/#48 block on `WK_TCP|cid`, #55/#100 on `WK_ICMP|pid`. The demux
+- **Waits** (blocking-waits.md § Network waits): #47/#48/#109 block on `WK_TCP|cid`, #55/#100 on `WK_ICMP|pid`. The demux
   sets `tcp_demux_wake` under `tcp_tab_lock`; `net_handle_tcp` wakes after the unlock.
 - **`icmp_lock`** is an IRQ-saved SIBLING LEAF (udp rank): the per-pid reply slots and the ICMP counters. Never held
   with a chain lock; the echo reply's `net_tx` hold ends before the counter update.

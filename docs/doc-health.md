@@ -6,9 +6,120 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-10-13 (**1.57.12 B12 gates — every flag build re-weighed, the § i.4 mutation table, the full sweep 71/71, k.134; the closeout tallies filled**; see the first 1.57.12 block below). Before that: 2026-10-13 (**1.57.12 closeout docs — B12: the ZFS write path written up for release; `architecture/zfs-read-only.md` → `architecture/zfs.md`**). Before that: 2026-10-13 (**the ZFS writer's B10 (log hygiene) and B11 (policy B, the deferral window, the crash cut), built in two parallel tracks, reviewed and merged**). Before that: 2026-10-12 (**the B8 / B9 / ROOM merge**). Before that: 2026-10-12 (**the B7 review: five findings fixed, and k.70, the free_bpobj budget its coverage found**). Before that: 2026-10-11 (**ZFS write bite B7 (unlink / rmdir / rename / link) and k.68, the space map histograms its gate found**). Previous: 2026-10-09 (**1.57.11 — read-only ZFS; the BSP stacks moved up 256 KB**). Before that: 2026-09-26 (**1.57.10 — VT-d translation runs for the first time, AHCI bounces its buffer, the harness backlog cleared (gate 36, known-red rows); three issue files closed, one filed; see the 1.57.10 block**).
+> **Last refresh**: 2026-10-13 (**1.57.13 closeout — the full sweep 72/73 (row 1 KNOWN RED by design), check.sh 38/39, test.sh --all 8/8; the release tallies filled**; see the 1.57.13 block below). Before that: 2026-10-13 (**1.57.13 — the five repair tracks merged and read together; the ABI bookkeeping for #109–#111; state / roadmap / CLAUDE.md / build.md reconciled**). Before that: 2026-10-13 (**1.57.13 track a64**). Before that: 2026-10-13 (**1.57.12 B12 gates — every flag build re-weighed, the § i.4 mutation table, the full sweep 71/71, k.134; the closeout tallies filled**; see the first 1.57.12 block below). Before that: 2026-10-13 (**1.57.12 closeout docs — B12: the ZFS write path written up for release; `architecture/zfs-read-only.md` → `architecture/zfs.md`**). Before that: 2026-10-13 (**the ZFS writer's B10 (log hygiene) and B11 (policy B, the deferral window, the crash cut), built in two parallel tracks, reviewed and merged**). Before that: 2026-10-12 (**the B8 / B9 / ROOM merge**). Before that: 2026-10-12 (**the B7 review: five findings fixed, and k.70, the free_bpobj budget its coverage found**). Before that: 2026-10-11 (**ZFS write bite B7 (unlink / rmdir / rename / link) and k.68, the space map histograms its gate found**). Previous: 2026-10-09 (**1.57.11 — read-only ZFS; the BSP stacks moved up 256 KB**). Before that: 2026-09-26 (**1.57.10 — VT-d translation runs for the first time, AHCI bounces its buffer, the harness backlog cleared (gate 36, known-red rows); three issue files closed, one filed; see the 1.57.10 block**).
 >
 >
+>
+> ### 1.57.13 (2026-10-13) — the repair sweep: five tracks (a64, carry, VTD, sock, tty), merged
+>
+> #### the closeout (release phase): the tallies from a real run
+>
+> ✅ **`CHANGELOG.md` [1.57.13] § Closeout** — a new bullet for the release phase: the full `sweep.sh` **72/73** (4 workers,
+> 5,110 s; row 1 `baseline check.sh` KNOWN RED by design on the ABI gate alone; 0 serial retries, no row re-run; 23
+> firmware VOIDs (`gnoboot: fail @ EBS`) relaunched inside 16 rows, named; the ZFS write row 4,957 s). It also records
+> `check.sh` 38/39 and `test.sh --all` 8/8 run after the sweep, plain and the binding flag build re-measured unchanged
+> (307,480 / 165,448 B), the ktest-smoke and agnsh-smoke boot checkpoints, and the version verify. The Open bullet's
+> inbound-TCP A3 note now says the failure did not recur in the release sweep either. ✅ **`CLAUDE.md`** closeout step 1:
+> the sweep tally is 1.57.13's 72/73 (1.57.12's 71/71 kept as history). ✅ **`development/state.md`**: the Last-refresh
+> line, the Kernel-head row's tallies (test / sweep), and the flag-build clause (re-measured at the closeout). The file
+> stays at 120 lines. No other doc changed; no kernel or script change at the closeout.
+>
+> #### the merge (the tracks read together)
+>
+> ✅ **`development/roadmap.md`** — the allocation line: 0–111, next free #112, the ABI gate red BY DESIGN with the three
+> cyrius filings (`cyrius/docs/development/issues/2026-10-13-agnos-sys-{sock-send-dl-109,console-mode-110,fd-kind-111}-peer.md`);
+> the "VT-d queued invalidation" row SHIPPED (it was the VTD track's "left to the merge"). The aarch64 and `tcsetattr` rows
+> came from the a64 / tty tracks. ✅ **`development/state.md`** — Kernel head (1.57.13 repairs; 1.57.12 as previous head),
+> `build/agnos` on disk + every flag build re-weighed at the merge, the carried-rows bullet, **0 open issues** (five
+> archived). ✅ **`CLAUDE.md`** closeout step 1 — `check.sh` **38/39** (the ABI gate red by design), 73 sweep rows and
+> what 1.57.13 added, the KNOWN RED mark on row 1 again. ✅ **`development/build.md`** — the row count (73) and row 1's
+> KNOWN RED history. ✅ **`CHANGELOG.md` [1.57.13]** — one section: the intro, the tracks' Added / Changed / Fixed
+> combined (their two image lines folded into § Closeout), § Fixed — the merge, § Closeout. ✅ Scripts: `sweep.sh` row 1
+> KNOWN RED (reason + the ABI gate's FAIL-line signature); `harness/tty-test.py` through `_qsock` / `SIBLINGS_ROOT`;
+> `harness/agnsh-type-test.py`'s stale `agnoshi 1.` marker (a regex now). Also `agnos-userland-abi.md` rows #109–#111 and the
+> archived `sock_send` issue point at the filed cyrius peers. ✅ **`architecture/process-lifecycle.md`** — a DYING-done slot is
+> live to no liveness test (`lc_dying_done`); the archived console-mode issue's Status — the tick death clears the mode.
+> Kernel: `proc.cyr` `lc_dying_done` (+ its users in `syscall.cyr`, `sched.cyr`, `vfs.cyr`), `main.cyr`'s `tick orphan`
+> phase (the mode / line checks). The tracks' own "left to the merge" / "open" notes below are closed by this block,
+> except the cyrius under-count filing (a64) and the peers themselves, which are cyrius's.
+>
+> #### track tty: `console_mode`#110, `fd_kind`#111, SIGWINCH (the track wrote no doc-health block; recorded here)
+>
+> ✅ **`agnos-userland-abi.md`** §3.2 — NEW rows `#110 console_mode` (NOECHO a mode, FLUSH an action, the console's mode
+> dying with its holder, the review's decoupling from line ownership) and `#111 fd_kind` (the kind enum; `!= -1` is the
+> support probe); `#5` (every console fd reads the cooked line); `#18` / § 4.9 (SIGWINCH to bit-28 signalfd watchers
+> only, an inherited signalfd makes a watcher, the real `pause` rationale). ✅ **`architecture/blocking-waits.md`** — the
+> keyboard section's mode paragraph. ✅ **`development/roadmap.md`** — the `tcsetattr`/`ioctl` row SHIPPED 1.57.13.
+> ✅ Issues `2026-10-12-console-line-discipline-has-no-ring3-control`, `-no-way-to-ask-what-an-fd-is`,
+> `-console-grid-changes-without-sigwinch` → `issues/archived/` (Status rewritten first, what each broke).
+> ✅ `CHANGELOG.md` [1.57.13] Added / Changed / Fixed. ✅ Scripts: NEW `smoke/tty-smoke.sh` + `harness/tty-test.py`,
+> `harness/wait-kbd-test.py` (K6), `build.sh` (`TTY_SELFTEST`), `sweep.sh` (its row).
+>
+> #### track a64: the aarch64 compile debt cleared, and the gate that does not trust the compiler
+>
+> ✅ **`CLAUDE.md`** — Quick Start: the aarch64 paragraph is the durable rule only (the compiler's OK is not "every call
+> resolved"; run `build.sh --aarch64` after adding a shared name; compiles is not boots) — its counts and history moved to
+> `state.md` / CHANGELOG (Core rule; it had also mixed the 1.57.2 SITE count into "17–46 variables"); the Verify line,
+> "39-gate", closeout step 1's `check.sh` **39/39** and the 39th gate described.
+> ✅ **`state.md`** — the Kernel-head row's aarch64 clause (it still said "debt unchanged (32 fns / 17 vars)" under the
+> 1.57.13 head); the aarch64 bullet: compiles + links, the count history with sites vs variables separated, the placeholder
+> gate, the x86 physical-layout addresses beside the x86 machine code. (The `32 fns / 17 vars` in this file's 1.57.7 block is that
+> release's record — left as history.)
+> ✅ **`roadmap.md`** — the aarch64 row: CLEARED, the gate WIRED (was "proposal, not wired"), the x86 physical-layout item
+> added to the 1.6x starting list, the count history corrected; the 6.6.16 aarch64 row marked cleared; the OPEN intro.
+> ✅ **`architecture/kernel-image-room.md`** + **`proposals/2026-10-09-zfs-write.md`** k.74 (h) — "does not link today"
+> annotated: it links since 1.57.13, still no `room_init`, so the poison note stands.
+> ✅ **`CHANGELOG.md` [1.57.13]** — Changed: `placeholder-check.sh` (wired: build.sh, test.sh, check.sh gate 39,
+> release.yml) and the `test.sh` fourth check (its fail-open first version); `release.yml` `compiled`. Fixed: the compile
+> debt (72 fns + 17 vars), the cycc under-count, the `proc_slot_release_unborn` stub, the duplicate `sched_active`.
+> ✅ **`development/build.md`** — the placeholder gate (after every build; the refused-image paths) and its build outputs.
+> ✅ Scripts: NEW `scripts/check/placeholder-check.sh`; `build.sh` (x86 compile stderr captured + replayed; the gate after
+> every build), `test.sh`, `check.sh` (gate 39), `.github/workflows/release.yml`. Kernel: `arch/aarch64/stubs.cyr` only
+> (+ a comment in `core/room.cyr`); x86_64 images byte-identical to the seed.
+> ⚠ Open: the cyrius under-count filing is owed (`cyrius/docs/development/issues/`); the merge must re-run
+> `build.sh --aarch64` after other tracks add shared names (the build now refuses a hole by itself).
+>
+> #### repair sweep, the 1.57.12 carry-overs (track `carry`)
+>
+> ✅ **`architecture/process-lifecycle.md`** — INV-L2 (the tick path takes no `fs_lock`, no heap lock and reaps
+> nothing — pmm only through `shm_free`'s 2 MB release; the owed reaps, their two drain points, the trylock, the
+> non-preemptible drain, the DYING pipe-end skip, the gate), the D-31 paragraph (a tick death's zombies become DYING and
+> are owed), Limits.
+> ✅ **`proposals/2026-10-09-zfs-write.md`** — k.135 (k.132 (3) closed; the doom / naad / `sun_path` harness repairs).
+> ✅ **`development/roadmap.md`** — the sync-thread row loses its tick-orphan half (fixed 1.57.13).
+> ✅ **`development/build.md`** — worker copies: the sibling roots default through `SIBLINGS_ROOT`, the `sun_path` rule
+> (`smoke_qsock` / `_qsock.py`); the `naad` group key no longer marks a sibling write.
+> ✅ **`CHANGELOG.md`** — 1.57.13 Added / Changed / Fixed for this track.
+>
+> #### repair sweep, track VTD: VT-d queued invalidation
+>
+> ✅ **`architecture/dma-cpu-pointers.md`** § "VT-d: the grant model" — the Bring-up bullet (the drained QIE-off), a NEW
+> Invalidation bullet (the queue whenever ECAP.QI is set, its two pages under this doc's rule, IQE / ITE / ICE, the dead
+> state, the register fallback, VER ≥ 6 only on the register path), the Reporting lines, and the gate's queue / AR half
+> with the measured RED mutants. ✅ **`build.md`** — `VTD_SELFTEST` (arm D, boot AR), NEW `VTD_REGISTER_INV` row.
+> ✅ **`CHANGELOG.md` 1.57.13** — Added / Changed / Fixed. ✅ **Issue `2026-09-26-vt-d-queued-invalidation`** — Status
+> rewritten (RESOLVED 1.57.13, the evidence, what it broke), archived. ⚠ **Left to the 1.57.13 merge**: `roadmap.md`'s
+> "VT-d queued invalidation" Active row, `state.md`'s open-issue count and its "after 1.57.10" carried list.
+> ✅ **The track's review** (same cut): `dma-cpu-pointers.md` gains the "own memory is never granted" bullet, the STALLED
+> state and lock-free telling in the Invalidation bullet, the own-structures / ` stall=` report lines and the four-boot
+> gate with its measured RED; its old "Neither is GRANTED" line is corrected. The archived issue's Status header, its
+> Decisions paragraph (the same wrong claim) and a NEW § Review follow-up; `build.md` (arms E / F, boot BR); CHANGELOG.
+>
+> #### repair sweep, track sock: `sock_send_dl`#109 (a caller ceiling on `#48`)
+>
+> ✅ **`agnos-userland-abi.md` §3.2** — NEW row `#109 sock_send_dl` (the ceiling's rule, `0` = `#48`, `< 0` = no wait,
+> why a ceiling and not a per-progress bound, the probe, the pending cyrius peer); row `#48` points at it. The "next
+> free number" line (`roadmap.md` :14) is NOT touched here — the merge moves it with the cyrius peer issue;
+> `syscall-additions.md` records no mints (its 0–42 surface is historical). ✅ **`architecture/blocking-waits.md`** § Network waits — `#109` among the canonical waits, its
+> ceiling in "Deadlines are computed once", the ABORT line; "the four arms" → "the arms". ✅
+> **`architecture/net-concurrency.md`** — `#47/#48/#109` block on `WK_TCP|cid`. ✅
+> **`architecture/socket-ownership-and-loopback.md`** — `#109` among the owned arms (its gate named). ✅ Issue
+> `2026-10-02-sock-send-ignores-the-caller-deadline.md` → `issues/archived/` (Status rewritten first: resolution,
+> version, evidence, what the change was checked against). ✅ `CHANGELOG.md` [1.57.13] Added (three entries) + Fixed
+> (#48's D6 after a partial ACK consumed before the wait arms). ✅ **`blocking-waits.md`** (review fix) — `tcp_block`
+> takes `una`; a partial ACK is a wake condition the post-arm re-check sees (`tcp: d6part`, `tcp: dlpart`). ✅ Scripts:
+> NEW `smoke/sock-send-dl-smoke.sh`, `sweep.sh` (its row); `smoke/tcp-smoke.sh` (+ dlpart, d6part). ⚠ Open: the cyrius peer (`SYS_SOCK_SEND_DL`) — the ABI gate
+> reads kernel 109 against cyrius 108 until it lands.
 >
 > ### 1.57.12 (2026-10-13) — B12, the closeout gates: the tallies filled
 >

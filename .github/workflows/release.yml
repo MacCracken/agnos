@@ -115,6 +115,14 @@ jobs:
         #   instead of leaving the release to infer it from whether a file happened to appear. And
         #   a build that exits 0 without producing a plausible kernel is now a HARD failure, because
         #   that is a broken build script, not an unfinished port.
+        # ⭐ 1.57.13 — THE BUILD SUCCEEDS NOW, AND "COMPILES" IS NOT "SHIPS". The compile debt was cleared
+        #   (arch/aarch64/stubs.cyr), so this step stopped failing — and its old success arm would have
+        #   published agnos-aarch64 with the release: a kernel that has never booted and still carries x86
+        #   machine code from shared files (pmm.cyr's xchg locks: it would trap at the first page
+        #   allocation). Operator ruling 2026-09-21: full aarch64 support is the 1.6x arc. A successful
+        #   compile now records `compiled` and stages nothing; `built` (= publish) is kept for when a boot
+        #   gate exists — the build-vs-boot split kernelci keeps, and Debian's release-architecture rule (an
+        #   architecture ships when it meets release criteria, not when it builds).
         run: |
           set -o pipefail
           if sh scripts/build.sh --aarch64 2>&1 | tee aarch64-build.log; then
@@ -122,17 +130,24 @@ jobs:
               echo "FAIL: --aarch64 exited 0 but produced no build/agnos-aarch64"
               echo "      That is a build-script defect, not 'not yet portable'."
               exit 1; }
-            cp build/agnos-aarch64 agnos-aarch64
-            SZ=$(wc -c < agnos-aarch64)
+            SZ=$(wc -c < build/agnos-aarch64)
             [ "$SZ" -ge 50000 ] || {
-              echo "FAIL: agnos-aarch64 is $SZ bytes — too small to be a kernel (floor 50000)"
+              echo "FAIL: build/agnos-aarch64 is $SZ bytes — too small to be a kernel (floor 50000)"
               exit 1; }
-            echo "aarch64=built" >> "$GITHUB_OUTPUT"
-            echo "agnos-aarch64: $SZ bytes"
+            # build.sh ran scripts/check/placeholder-check.sh on the image and exits 1 over a hole, so reaching
+            # here means 0 unresolved-call placeholders — its PASS line is required, not assumed (a build.sh
+            # that lost the gate must not record `compiled`).
+            grep -q '^  placeholders: PASS: aarch64: 0 unresolved-call placeholders' aarch64-build.log || {
+              echo "FAIL: build.sh --aarch64 exited 0 without its placeholder gate's PASS line"
+              echo "      (scripts/check/placeholder-check.sh) — a build-script defect: 'compiled' would be unproven."
+              exit 1; }
+            echo "aarch64=compiled" >> "$GITHUB_OUTPUT"
+            echo "agnos-aarch64: $SZ bytes — compile test PASS (0 unresolved-call placeholders); NOT published (never booted; the port is the 1.6x arc)"
           else
             echo "aarch64=absent" >> "$GITHUB_OUTPUT"
-            echo "NOTE: the aarch64 cross-build FAILED — stderr is in the log above, not discarded."
-            echo "      This release ships x86_64 only. See CLAUDE.md § Quick Start (aarch64 is RED)."
+            echo "NOTE: the aarch64 cross-build FAILED or was REFUSED by its placeholder gate — the log above says which."
+            echo "      aarch64 compiles since 1.57.13, so this is a REGRESSION of a green compile: run"
+            echo "      sh scripts/build.sh --aarch64 (or sh scripts/test.sh --aarch64). This release ships x86_64 only."
           fi
 
       - name: Run tests
@@ -202,6 +217,10 @@ jobs:
               [ -f agnos-aarch64 ] && {
                 echo "FAIL: compile test recorded aarch64=absent but agnos-aarch64 exists"; exit 1; }
               echo "(no agnos-aarch64 in this release — the compile test recorded 'absent')" ;;
+            compiled)
+              [ -f agnos-aarch64 ] && {
+                echo "FAIL: compile test recorded aarch64=compiled (compile-only, never shipped) but agnos-aarch64 is staged"; exit 1; }
+              echo "(no agnos-aarch64 in this release — it compiles but has never booted; the port is the 1.6x arc)" ;;
             *)
               echo "FAIL: no aarch64 verdict was recorded (read: '$AARCH64')."
               echo "      The compile-test step did not report, so nothing here knows what to ship."
@@ -243,6 +262,8 @@ jobs:
               fi ;;
             absent)
               echo "  (skip)  agnos-aarch64 — compile test recorded 'absent'" ;;
+            compiled)
+              echo "  (skip)  agnos-aarch64 — compiles, never booted: not published (the 1.6x port)" ;;
             *)
               # ⚠ An UNSET verdict is not 'absent'. It means the compile-test step above did not
               # report at all, which is the state the whole workflow was permanently in before
@@ -328,6 +349,8 @@ jobs:
               fi ;;
             absent)
               echo "  (skip)  agnos-aarch64 — the aarch64 compile test failed; this release is x86_64 only" ;;
+            compiled)
+              echo "  (skip)  agnos-aarch64 — the aarch64 compile test passed, but no aarch64 kernel has booted; this release is x86_64 only" ;;
             *)
               echo "FAIL: build job recorded no aarch64 verdict (read: '$AARCH64')"
               rc=1 ;;

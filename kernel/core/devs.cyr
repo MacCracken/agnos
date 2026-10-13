@@ -32,6 +32,14 @@ fn dev_write(dev_idx, buf, count) {
     return 0 - 1;
 }
 
+#ifdef ARCH_X86_64
+# ⛔ 1.57.13: on x86 the console device reads through the OWNER-AWARE cooked line reader (core/syscall.cyr
+# kbd_read_blocking: line ownership, console_mode#110's echo mode, a real wq wait or the IF=1 held step), never the
+# loop below. read#5 already routes every console fd there itself (fd_is_console); this keeps any other vfs_read of the
+# device off that loop too, whose `arch_wait` in syscall context is a hlt at IF=0 — the CPU never woke (1.57.13 review).
+fn serial_dev_read(buf, count) { return kbd_read_blocking(buf, count); }
+#endif
+#ifndef ARCH_X86_64
 fn serial_dev_read(buf, count) {
     var n = 0;
     while (n < count) {
@@ -50,6 +58,7 @@ fn serial_dev_read(buf, count) {
     }
     return n;
 }
+#endif
 
 # Ring-3 stdout/stderr (fd 1/2) and the recovery shell route here. Mirror to
 # BOTH serial and the framebuffer via kprint — same as every kernel kprintln.

@@ -62,8 +62,8 @@ cd "$ROOT"
 #     (xdist loadgroup). Keyless rows are singleton groups. Workers PULL the next group with an atomic
 #     `mkdir claim.<group>`, longest-first by the previous run's build/sweep-logs/durations.tsv.
 #     Keys: `hostport` (two rows that pick a host port by bind(0) and release it before QEMU binds — a TOCTOU
-#     window), `naad` (the one row that writes a sibling repo's build dir), `waits` (two rows that build
-#     tests/waits), and `exclusive` — a row whose oracle is a ratio against wall time runs ALONE, serially, in the
+#     window), `naad` (the one row that writes a sibling repo's build dir), `waits` (three rows that build
+#     tests/waits: wait-ring3, wait-kbd, tty since 1.57.13), and `exclusive` — a row whose oracle is a ratio against wall time runs ALONE, serially, in the
 #     main tree after the parallel phase (Bazel `exclusive`; SWEEP_EXCLUSIVE=0 pools them instead).
 #     ⭐ SWEEP_EXCLUSIVE=1 STAYS THE DEFAULT (1.57.10, issue 2026-09-26-harness-backlog-after-1-57-9 item 9: the
 #     operator ruling "keep it ON by default"). The reason: tsc's tick-period / calibration-agreement ratios (1-3%,
@@ -439,6 +439,15 @@ run_gate() {
     sweep_tally "$g_rc" "$label" "$known"
 }
 
+# Absolute sibling roots for every row and the baseline build, in BOTH modes (the copies' `$ROOT/../x` defaults would resolve to the same place).
+# ⭐ 1.57.13: each defaults through SIBLINGS_ROOT (else $ROOT/..), the rule stage-tools.sh / syscall-abi-check.sh
+# follow — from a worktree $ROOT/.. holds no sibling, and 1.57.12's run set SIBLINGS_ROOT alone, so the doom and naad
+# rows (whose roots this block derived from $ROOT/..) failed in seconds. Exported before the serial path too, so a
+# serial run with only SIBLINGS_ROOT set reaches gnoboot / agnoshi / kashi / rekha the same way.
+SWEEP_SIBS="${SIBLINGS_ROOT:-$ROOT/..}"
+export GNOBOOT_ROOT="${GNOBOOT_ROOT:-$SWEEP_SIBS/gnoboot}" AGNOSHI_ROOT="${AGNOSHI_ROOT:-$SWEEP_SIBS/agnoshi}" \
+       KASHI_DIR="${KASHI_DIR:-$SWEEP_SIBS/kashi}" REKHA_DIR="${REKHA_DIR:-$SWEEP_SIBS/rekha}" \
+       NAAD_ROOT="${NAAD_ROOT:-$SWEEP_SIBS/naad}" DOOM_ROOT="${DOOM_ROOT:-$SWEEP_SIBS/cyrius-doom}"
 SWEEP_T0=$(date +%s)
 echo "=========================================="
 echo " AGNOS arc sweep — 1.39.x VFS + 1.40.x exec"
@@ -453,9 +462,18 @@ sh "$ROOT/scripts/build.sh" >/dev/null 2>&1
 ( . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"; smoke_stage_rootfs "$ROOT" ) \
     || echo "  ⚠ build/rootfs could not be staged (build/stage-rootfs.log) — the rows that read it will name what is missing"
 # 1.57.11: the KNOWN RED mark this row carried at 1.57.10 (the syscall ABI gate, red until cyrius's SysNrAgnos peer
-# carried #106-#108) is gone — the peer landed (cyrius 6.7.6 lib/syscalls_x86_64_agnos.cyr) and the 1.57.11 sweep
-# flagged the mark stale. Any red inside check.sh is now a real red.
-run_gate "baseline check.sh (build/test/version/size)" "" "CHECK"
+# carried #106-#108) was dropped — the peer landed (cyrius 6.7.6 lib/syscalls_x86_64_agnos.cyr) and the 1.57.11 sweep
+# flagged the mark stale.
+# ⭐ 1.57.13 — KNOWN RED BY DESIGN AGAIN, the 1.57.10 shape: the kernel mints #109 sock_send_dl, #110 console_mode and
+# #111 fd_kind, and the ABI gate reads "kernel 111 · abi-doc 111 · cyrius 108" until cyrius's SysNrAgnos peer carries
+# them — filed there: cyrius/docs/development/issues/2026-10-13-agnos-sys-sock-send-dl-109-peer.md,
+# cyrius/docs/development/issues/2026-10-13-agnos-sys-console-mode-110-peer.md and
+# cyrius/docs/development/issues/2026-10-13-agnos-sys-fd-kind-111-peer.md. The signature is that gate's two FAIL lines
+# and nothing else: any OTHER red gate inside check.sh is a new failure and gets the normal treatment. When the peer
+# lands the sweep prints "the mark is STALE" — drop it then, as 1.57.11 did.
+run_gate "baseline check.sh (build/test/version/size)" "" "CHECK" "" \
+    "by design: the syscall ABI gate is red until cyrius's SysNrAgnos peer carries #109-#111 (filed in cyrius 2026-10-13)" \
+    'syscall ABI \(kernel/doc/cyrius agree\)|syscall\(s\) the kernel implements are absent from cyrius'
 # ⭐ 1.57.12 — THE KTEST BOOT SELF-TESTS AND THE IN-KERNEL SUITE. scripts/ktest.sh had no row anywhere (sweep, check.sh,
 # test.sh, CI), so the KTEST self-tests the 1.57.12 rebuild made runnable again (syscall, context switch, VFS/initrd,
 # userland exec), the NVMe round-trips that must write outside the GPT and put it back, and ktest.sh's scoring of all
@@ -609,6 +627,11 @@ run_gate "1.57.7 tcp_listen accept-one (TCP_LISTEN_SMOKE)" "TCP_LISTEN_SMOKE=1" 
 run_gate "1.57.7 inbound TCP in interrupt context (+ #49 EOF, half-close; -smp 1 msix/vectors0 + -smp 4)" "" "tcp-inbound-smoke.sh" "hostport"
 run_gate "1.57.7 socket ownership (TCP+UDP), loopback-only listen, 127/8, sock_peer#106 (kernel arms + ring 3 -smp 1/4)" "" "sock-owner-smoke.sh"
 run_gate "1.57.7 sock/icmp waits block only the caller (ring 3; -smp 1 + -smp 4)" "" "sock-wait-smoke.sh"
+# 1.57.13 — sock_send_dl#109, a caller ceiling on #48 (issue archived/2026-10-02-sock-send-ignores-the-caller-deadline.md):
+# tests/sockwait mode "t" on a PLAIN kernel — a local zero window, a trickling reader (the ceiling is measured once from
+# entry), a foreign conn id, and a host peer that stops reading. ~1 min per boot; no group (the host port is bound by
+# the smoke's own peer with SO_REUSEADDR, as sock-wait's sink is).
+run_gate "1.57.13 sock_send_dl#109 caller ceiling (local zero window + trickle + foreign id + a host peer that stops reading; -smp 1 + -smp 4)" "" "sock-send-dl-smoke.sh"
 run_gate "ICMP echo (hermetic slots + wake; -smp 1 + -smp 4)" "ICMP_SELFTEST=1" "icmp-smoke.sh"
 # 1.57.7 — ADDED AFTER S6 BROKE IT UNSEEN. doom-smoke had no row, so S6 (the net waits) shipped with /bin/doom hung
 # forever in #47: its setu probe dials 127.0.0.1:7700, nobody answers, and a PRE-SCHEDULER caller (DOOM_SELFTEST
@@ -725,13 +748,29 @@ run_gate "1.57.8/1.57.9 DMA + CPU-only pmm pointers: block/HDA/fb shadow/ramdisk
 # a grant after TE gets exactly the invalidation CM needs (VTD_SELFTEST, cross-checked on QEMU's own IVA/IOTLB register
 # trace), and xHCI (typed agnsh lines + a USB stick) / NVMe / virtio-blk / virtio-net / AHCI / HDA DMA all work with zero
 # faults. The smoke builds its VTD_SELFTEST kernel itself and leaves the tree plain (the xhci-shadow-smoke shape).
-run_gate "1.57.10 VT-d translation ON: pre-init grants replayed, CM invalidation, xHCI/NVMe/virtio/AHCI/HDA DMA through the IOMMU (-smp 1 + -smp 4)" "" "vtd-smoke.sh"
+# 1.57.13 (QI) — issue 2026-09-26-vt-d-queued-invalidation: those two boots run QUEUED invalidation (QEMU's vtd_inv_qi_* /
+# vtd_inv_desc* trace is the oracle; selftest arm D recovers a malformed descriptor's IQE), and a third boot (AR, a
+# VTD_SELFTEST=1 VTD_REGISTER_INV=1 kernel the smoke also builds) runs the register fallback on the CM=1 machine; since the
+# 1.57.13 review a fourth (BR) runs it on B's CM=0 -smp 4 machine, arm E proves the unit's own tables and queue pages lie
+# in a 2 MB chunk no grant can open, and arm F that a slow wait stalls the queue and settles instead of killing it.
+run_gate "1.57.10/1.57.13 VT-d translation ON: pre-init grants replayed, CM invalidation (queued + register), xHCI/NVMe/virtio/AHCI/HDA DMA through the IOMMU (-smp 1 + -smp 4)" "" "vtd-smoke.sh"
 # 1.57.7 (Path 2, S3d) — the KEYBOARD read blocks only its caller and ONE reader owns each cooked line (a second
 # blocking reader waits for the line; the NB prompt poll answers -2 without draining while another live process owns
 # it, and keeps the line while its partial line is live). waitx in mode `kbd` as /bin/agnsh, keys typed over HMP by
 # scripts/harness/wait-kbd-test.py (wrapped by the smoke), -smp 1 then -smp 4, both gated. It also carries the
 # per-TRB HID report slots' gate (a key pressed AND released inside one IF=0 gap used to be lost: `abc` read `bc`).
 run_gate "1.57.7 keyboard line ownership (blocking + NB readers; -smp 1 + 4)" "" "wait-kbd-smoke.sh" "waits"
+# 1.57.13 — THE CONSOLE FROM RING 3 (issues archived/2026-10-12-console-line-discipline-has-no-ring3-control,
+# -no-way-to-ask-what-an-fd-is, -console-grid-changes-without-sigwinch): console_mode#110 NOECHO hides a line on the
+# waiting AND the NB reader whoever reads (the harness reads the ECHO off COM1, with a positive control), the mode is
+# the console's — a holder's child reads hidden, a holder that never reads keeps nobody waiting — and dies with its
+# holder (exit and kill), FLUSH discards typeahead and the NB partial line, NOECHO|FLUSH is TCSETSF; fd_kind#111 on
+# the console, a file, a memfile, a directory, pipe ends, a closed fd, the event fds and invalid fds; SIGWINCH (28)
+# reaches ONLY a bit-28 signalfd watcher when the grid really changes (SAME silent, SHRINK and RESTORE one each)
+# through the TTY_SELFTEST geometry knob (no live modeset under QEMU); a blocking read of console fd 2; the
+# framebuffer ghost prompt by HMP screendump. waitx in mode `tty` as /bin/agnsh, keys typed by
+# scripts/harness/tty-test.py, -smp 1 then -smp 4, both gated. Group `waits`: it builds tests/waits.
+run_gate "1.57.13 console mode #110 (NOECHO/FLUSH, dies with its holder) + fd_kind #111 + SIGWINCH to watchers only + console fd 2 read + fb ghost prompt (-smp 1 + 4)" "TTY_SELFTEST=1" "tty-smoke.sh" "waits"
 # 1.57.8 — BLOCKING pipe and channel reads (read#5 a4 = 0 waits; a4 != 0 keeps -2) (issue
 # 2026-09-25-cross-cpu-poll-and-yield-loops-are-tick-bound) and 1.57.9 — the DIRECTED yield sched_yield_to#108 with a
 # quiet #44 (issue 2026-09-25-any-two-sched-yield-loops-kick-each-other): tests/ipcw as /bin/agnsh on a PLAIN kernel,
@@ -786,7 +825,8 @@ run_gate "1.53.x FP-#NM (lazy save/restore serviced)" "FP_NM_SELFTEST=1" "fp-nm-
 # --- 1.53.x FP/SIMD B4: real cyrius f64 runs in ring 3 (exec /bin/fpex from disk → run: exit 84) ---
 run_gate "1.53.x FP-ring3 (real f64 in ring 3)" "FP_RING3_SELFTEST=1" "fp-ring3-smoke.sh"
 run_gate "1.53.x FP-ctxsw (two-proc XMM preservation)" "FP_CTXSW_SELFTEST=1" "fp-ctxsw-smoke.sh"
-# Group `naad` (1.57.9 PSWEEP): the only row that writes a SIBLING repo's build dir (../naad/build/naadex).
+# Group `naad` (1.57.9 PSWEEP): this row wrote a SIBLING repo's build dir (../naad/build/naadex) until 1.57.13; it now
+# builds naadex from a copy in its own tree's build/ and only reads the sibling. The group key is kept (harmless).
 run_gate "1.53.x naad-ring3 (real DSP library f64 in ring 3, arc end-proof)" "NAAD_RING3_SELFTEST=1" "naad-ring3-smoke.sh" "naad"
 
 # --- 1.56.45 the console's live line: an async log must not alter what the operator is typing ---
@@ -821,10 +861,7 @@ if [ "$SWEEP_JOBS" -gt 1 ]; then
     SWEEP_MAIN_SID=$(ps -o sid= -p $$ | tr -d ' ')
     SWEEP_COPY_BASE="$(dirname "$ROOT")/.$(basename "$ROOT").sweep.$$"
     SWEEP_JOBS_USED=0; SWEEP_PIDS=""; SWEEP_CLEANED=0
-    # Absolute sibling roots for the copies (their `$ROOT/../x` defaults resolve to the same place anyway).
-    export GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}" AGNOSHI_ROOT="${AGNOSHI_ROOT:-$ROOT/../agnoshi}" \
-           KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}" REKHA_DIR="${REKHA_DIR:-$ROOT/../rekha}" \
-           NAAD_ROOT="${NAAD_ROOT:-$ROOT/../naad}" DOOM_ROOT="${DOOM_ROOT:-$ROOT/../cyrius-doom}"
+    # (The absolute sibling roots every copy uses are exported above, for both modes.)
 
     # Copy a worker's logs (never its disk images) back under build/sweep-logs/w<K>/, then delete the copy.
     # 1.57.10 (HAR2, item 6): never build/rootfs/ — it is the staged INPUT every copy was given, not a row's output,

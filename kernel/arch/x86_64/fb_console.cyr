@@ -449,10 +449,21 @@ fn fb_set_scanout_base(b) {
 var fb_geom_w     = 0;
 var fb_geom_h     = 0;
 var fb_geom_pitch = 0;   # BYTES per scanline (= surface pitch-px * bytes-per-pixel)
+# ⭐ 1.57.13 — THE ONE PLACE THE CONSOLE GRID CHANGES, SO THE ONE PLACE THAT DECIDES WHETHER SIGWINCH IS DUE. Every
+# geometry move goes through here (mdo_native's live modeset, gpu_scanout_matchgeom's early AND late match, the
+# TTY_SELFTEST knob), and winsize#60's (cols, rows) is derived from these three cells plus fb_scale (itself a function
+# of the height). The grid is compared before and after: 1 = it REALLY changed, 0 = it did not (Linux tty_do_resize),
+# so the matcher's idempotent second call and a same-grid modeset stay silent.
+# ⛔ It RETURNS the verdict and never posts: the CALLER posts (sched.cyr console_winch_post — to signalfd watchers of
+# bit 28, nobody else) once its console is settled. Posted from here, before mdo_native's fb_console_clear and
+# matchgeom's clear + klug replay, a watcher on another CPU could redraw on the signal and have the redraw wiped by the
+# clear that followed (1.57.13 review).
 fn fb_set_geom(w, h, pitch_bytes) {
+    var sg_before = fb_winsize();
     fb_geom_w = w;
     fb_geom_h = h;
     fb_geom_pitch = pitch_bytes;
+    if (fb_winsize() != sg_before) { return 1; }
     return 0;
 }
 # fb_geom_active — 1 once the geometry has been matched to the real surface (lets the matcher run idempotently
@@ -1074,7 +1085,8 @@ var fb_line_buf[64];        # module scope => 64 x u64 = 512 BYTES, addressed wi
 var fb_line_n = 0;          # bytes drawn on the current row since the last newline / CR
 var fb_line_hold = 0;       # 1 = do not capture: we are printing out-of-band, or replaying
 # ⛔⛔ 1 = THE OPERATOR IS MID-LINE. Set by the two line-read echo sites in `core/syscall.cyr`, cleared
-# the moment a newline is drawn. **Erase-and-replay happens ONLY when this is 1**, and that gate is not
+# the moment a newline is drawn — or, when the reader ends the line without drawing one (a hidden Enter, a Ctrl-D),
+# by fb_line_end (1.57.13). **Erase-and-replay happens ONLY when this is 1**, and that gate is not
 # an optimisation — without it the fix is a severe REGRESSION, caught by the sweep on its first run:
 #   `kprint_num` calls `kprint`, so a kernel line like "  PASS: n of m" is assembled from ~4 separate
 #   kprint calls. Erasing and replaying on each one turns an O(len) line into O(calls x len) glyph
@@ -1083,6 +1095,21 @@ var fb_line_hold = 0;       # 1 = do not capture: we are printing out-of-band, o
 # ⇒ A kernel line under construction is a CONTINUATION, not an interruption. Only a line the OPERATOR
 # is typing can be interrupted, and only the line-read loops know that is happening.
 var fb_line_live = 0;
+
+# A line READER ended the operator's line WITHOUT drawing a newline: a hidden Enter under console_mode#110 NOECHO
+# (syscall.cyr kbd_echo) or a Ctrl-D (EOF, or a mid-line delivery — never echoed). fb_line_note below is the only other
+# place `live` drops, and it needs a DRAWN LF/CR, so without this the line stayed live: every later kprint (every
+# ring-3 write(1/2) included) erased the row and replayed the prompt captured before the hidden line — a ghost prompt
+# following the cursor, at the per-print cost the `live` gate exists to prevent (1.57.13 review).
+# ⚠ Clears ONLY `live`, never fb_line_n: the count still describes what is ON THE ROW (the prompt is still drawn there,
+# the cursor after it), so a second reader on the same row re-arms `live` and replays exactly the truth, and the
+# program's own "\n" resets the count the ordinary way. Under the console lock, like kputc's capture.
+fn fb_line_end(): i64 {
+    console_spin_lock();
+    fb_line_live = 0;
+    console_spin_unlock();
+    return 0;
+}
 
 # Record one drawn byte. Mirrors exactly what `fb_putc` does to the cursor below.
 fn fb_line_note(ch): i64 {

@@ -140,6 +140,19 @@ translation on, QEMU's included (issue 2026-09-26-vt-d-xhci-never-granted-and-io
   demand. Every devfn on every bus pci_scan populated points at it, so requester-ID aliasing cannot miss. A device may DMA
   into a 2 MB region only if it is the first 16 MB (the kernel image and its `.bss` DMA buffers), a firmware RMRR, or a
   region a driver GRANTED — 2 MB granularity, so a grant opens its region's other pages too.
+- **The unit's OWN memory is never granted (1.57.13, the VTD review).** Everything the remapping unit reads or writes
+  untranslated — the root table, each bus's context table, every SL table, the invalidation queue and its status page — is
+  carved (`iommu_table_new`) from an *own chunk*: a whole free 2 MB region `iommu_own_grow` takes
+  (`pmm_alloc_2mb_run_under`, top-down over the live bitmap) only if no grant can ever cover it — above the default 16 MB,
+  no pre-init grant pending for it, in no RMRR, not granted already. `iommu_map_2mb` and `iommu_register_dma` refuse an
+  own-chunk address. The first chunk is taken in `iommu_init` before any structure is made; another (up to 8) only when
+  the newest is used up. ⛔ Until 1.57.13 these were `pmm_alloc` pages, and `pmm_alloc` hands pages out top-down — into
+  the very 2 MB region the replayed xHCI grant had opened read/write in the domain every device shares. Measured on
+  vtd-smoke boot A: RTADDR `0xffe1000`, queue `0xffe3000`, status `0xffe2000`, all under the leaf `0xfe00083` that
+  virtio-net translated through. A device could rewrite the SL tables (the whole grant model, exposed since 1.57.10),
+  write the status word early (an invalidation "finished" before it ran), or forge a wait descriptor whose Status Address
+  the unit then writes untranslated. Linux and FreeBSD need no such rule (a per-device domain maps only what the DMA API
+  handed out); a 2 MB identity grant opens its whole region, so here the unit's memory must own whole regions.
 - **The rule for drivers:** every pmm page a device reads or writes is granted at allocation — `iommu_register_dma(phys)`,
   beside the `dma_kva(phys)` that gives the CPU its pointer. The device keeps getting the phys (the domain is identity).
   A `.bss` buffer inside the kernel image needs no grant. 1.57.10 added the grants virtio-blk, virtio-net and AHCI had
@@ -154,15 +167,40 @@ translation on, QEMU's included (issue 2026-09-26-vt-d-xhci-never-granted-and-io
   flush on RWBF hardware, otherwise nothing (Linux `cache_tag_flush_range_np`, FreeBSD `dmar_map_buf`, spec §6.1 / §6.8).
   Grants are never revoked, so no present→changed invalidation exists. `iommu_lock` (smp.cyr, IRQ-saved) covers the log,
   every table edit and the single-command invalidation registers; lock order iommu < pmm; nothing prints under it.
-- **Bring-up** (`iommu_init`): turn off any TE / QIE firmware left on; tables (default 16 MB, RMRRs, per-bus contexts);
-  RTADDR, SRTP, global context-cache then global IOTLB invalidation (register-based, CAIG / IAIG checked), write-buffer
-  flush; replay + TE; PMRs off. GCMD is always written as `GSTS & 0x96FFFFFF | bit` (it is write-only). Any failure prints
-  `iommu: translation NOT enabled - <reason>` and leaves translation off. VER major ≥ 6 is refused: register-based
-  invalidation is an error there and queued invalidation is not implemented (issue 2026-09-26-vt-d-queued-invalidation).
-- **Reporting:** `IOMMU: VT-d unit … levels= cm= … buses= rmrr= replayed= iotlb=` at enable, and — after every boot DMA user
-  (main.cyr, after DHCP) — `IOMMU: boot DMA check - faults=N leaves= late= psi= dsi= wbf= inv_fail= refused=`, draining the
-  unit's fault-recording registers (each fault printed as `iommu: FAULT dev bb:dd.f addr … reason …`). ext2's direct-to-
-  caller DMA path stays off while `iommu_active` is set.
+- **Bring-up** (`iommu_init`): turn off any TE / QIE firmware left on (a queue is drained to IQH == IQT first, Linux
+  `dmar_disable_qi`); pick the invalidation interface (below); tables (default 16 MB, RMRRs, per-bus contexts); RTADDR,
+  SRTP, global context-cache then global IOTLB invalidation, write-buffer flush; replay + TE; PMRs off. GCMD is always
+  written as `GSTS & 0x96FFFFFF | bit` (it is write-only). Any failure prints `iommu: translation NOT enabled - <reason>`
+  and leaves translation off.
+- **Invalidation (1.57.13): the QUEUE whenever ECAP.QI is set**, the register interface as the fallback — the Linux way
+  (`dmar.c` `dmar_enable_qi` / `qi_submit_sync` / `qi_check_fault`, `iommu.c` `qi_flush_context` / `qi_flush_iotlb`),
+  FreeBSD `intel_qi.c` the second reference. One 4 KB queue page (256 × 128-bit descriptors) and one status page, both
+  own-chunk pages (the bullet above) held twice by this document's rule: the phys goes only into IQA and the wait
+  descriptor's Status Address, and every descriptor store and status poll uses `dma_kva`. The remapping unit fetches the
+  queue and writes the status word itself, untranslated (as it walks the tables), which is exactly why no device may
+  reach them: neither is in any granted region. (⛔ This bullet first said "Neither is GRANTED" while both sat inside the
+  replayed xHCI grant's region — the review's finding above.) Neither is clflushed (Linux and FreeBSD store descriptors
+  with plain writes; an mfence orders them before the IQT write). Each invalidation is followed by a wait
+  descriptor (type 5 | SW, Status Data = a fresh sequence number, FreeBSD's `inv_waitd_seq`) and the status word is
+  polled under `iommu_lock` with FSTS checked every turn: IQE → the wait is copied over the bad descriptor, IQE cleared,
+  IQT rewritten (QEMU restarts only on an IQT write), and that invalidation is reported NOT performed. A wait that
+  outlasts the bound (1 M polls) leaves the queue STALLED, not dead (1.57.13, the VTD review — Linux `qi_submit_sync` and
+  FreeBSD wait without a bound, and a preempted vIOMMU or a DR/DW drain behind heavy DMA is slow, not broken): that call
+  is reported NOT performed, and the next submission first gives the stalled wait one more full bound (its sequence in
+  the status word and IQH == IQT; `iommu_init` re-issues a stalled init flush once, which does that). ITE / an
+  unrecoverable IQE / QIES clear at submit / no room / a stall that does not settle in its second bound → the queue is
+  DEAD (`iommu: queued invalidation DEAD - <reason>`) and every later invalidation counts as `inv_fail` (register
+  invalidation is not allowed while QIE is set). Those lines (and `… STALLED - …`) are printed lock-free (klug + COM1, the
+  REFUSED line's shape) by `iommu_init`'s refusals, by the boot DMA check, and by the grant path once each — a queue that
+  stalls or dies on a grant after the one-shot boot check is still said. The register interface (CAIG / IAIG checked) runs only without ECAP.QI, without memory
+  for the queue, or in a `VTD_REGISTER_INV` test build; at VER major ≥ 6 it is refused (an incorrect request there, spec
+  §6.5.1). Linux uses the queue under Caching Mode too; FreeBSD's `dmar_init_qi` does not — this file follows Linux.
+- **Reporting:** `IOMMU: VT-d unit … levels= cm= … buses= rmrr= replayed= iotlb= inv=queued|register` at enable, then
+  `IOMMU: queued invalidation - queue 0x… status 0x… submitted=N` on the queue, then
+  `IOMMU: own structures - chunk 0x… chunks=N pages=N - never granted`, and — after every boot DMA user (main.cyr,
+  after DHCP) — `IOMMU: boot DMA check - faults=N leaves= late= psi= dsi= wbf= inv_fail= refused= qi= iqe= ite= ice= stall=`,
+  draining the unit's fault-recording registers (each fault printed as `iommu: FAULT dev bb:dd.f addr … reason …`). ext2's
+  direct-to-caller DMA path stays off while `iommu_active` is set.
 
 **The gate:** `scripts/smoke/vtd-smoke.sh` → `scripts/harness/vtd-iommu-test.py` (sweep row) boots a `VTD_SELFTEST`
 kernel on q35 + `-device intel-iommu,intremap=off` twice: -smp 1 with caching-mode=on, aw-bits=39 (3-level, CM=1), and
@@ -174,6 +212,36 @@ needs; QEMU's own trace must show every device's DMA translated (`vtd_iotlb_page
 the selftest's, GCMD written exactly SRTP then TE, and the IVA / IOTLB registers written exactly as CM dictates. ⚠ QEMU
 never caches a failed translation, so a missing CM invalidation is invisible to its devices — the register trace is the
 check that catches it.
+
+**Since 1.57.13 those two boots run the QUEUE** and a third, AR (the -smp 1 CM=1 machine, a `VTD_SELFTEST=1
+VTD_REGISTER_INV=1` kernel), runs the register interface with the checks above. On the queue the oracle is QEMU's
+descriptor trace: `vtd_inv_qi_setup` names the kernel's queue page (256 entries), IQA was written with it, the processed
+invalidation descriptors are exactly the global context-cache, the global IOTLB and (CM=1) one page-selective IOTLB of
+the selftest page, every `vtd_inv_desc_wait_sw` writes the kernel's status page with the sequence issued, no CCMD / IVA /
+IOTLB register is written while QIE is set, and GCMD is QIE, SRTP|QIE, TE|QIE. Selftest arm D (`vtdst: qi recovery`)
+submits a type-0 descriptor: IQE must be raised and recovered (NOT performed, one IQE, not dead), a bare wait behind it
+must complete, IQH == IQT and FSTS clear; QEMU's stderr must carry exactly that one "invalid inv desc". Measured RED
+(1.57.13): the IQT write removed → `DEAD - the wait descriptor never completed (timeout)` + init refused; a reserved bit
+in the context-cache descriptor → `IQE recovered … NOT performed` + init refused; GCMD.QIE never set →
+`DEAD - GSTS.QIES clear at submit`; the recovery's wait copy removed → arm D FAIL (`iqe=+2`, `DEAD - an IQE that could not
+be recovered`); the post-TE page-selective descriptor deleted → the selftest still PASSES (QEMU caches no failure) and the
+trace check of the processed descriptors is what fails. ITE / ICE are untestable on QEMU (it never sets them).
+
+**Since the 1.57.13 review, four boots:** BR (B's machine — -smp 4 under KVM, CM=0, 4-level, the root port) runs the
+register kernel too, so the fallback is booted in that form and the CM=0 "global flush ONLY" register check is reached
+again (with A and B on the queue it had become dead code). The kernel names its own chunk and QEMU's trace must show
+RTADDR, IQA and every wait's status write inside it and in no 2 MB region a device translated through, and no
+`vtd_iotlb_page_update` into or through it. Selftest arm E (`vtdst: own structures`) checks in the kernel that the root,
+every context table and every SL table reached from the top (and the queue pages) are own-chunk pages, that every
+context entry points at the one top table, that no chunk is granted, and that `iommu_map_2mb` and `iommu_register_dma`
+refuse one — the latter the boot's ONE deliberate refused grant, which the harness requires at an own address. Arm F
+(`vtdst: qi stall`, the queue only) holds one wait back from the unit (`iommu_qi_hold`, a short `iommu_qi_bound`): the
+queue must STALL, not die; handed over late, the next submission must settle it, complete, and leave IQH == IQT and FSTS
+clear. Measured RED (boot A): `iommu_table_new` back on `pmm_alloc` → arm E `outside=6`, RTADDR `0xffe1000` / IQA
+`0xffe3000` inside the region `0xfe00000` virtio-net translated through; the timeout death restored → arm F
+`stalled=0 dead=1`; `iommu_map_2mb`'s own-chunk refusal removed → arm E `mapped=1 granted=2`; the late hand-over removed
+→ the settle's second bound runs out, `DEAD - the wait descriptor never completed (timeout)`, said lock-free by arm F's
+grant before the boot DMA check.
 
 ## Status (1.57.10)
 

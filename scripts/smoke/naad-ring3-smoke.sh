@@ -12,12 +12,17 @@
 #        THE gate), "exec: naadex returned" (no hang/crash), and no #PF/#GP/#UD/PANIC.
 #
 # Requires: qemu-system-x86_64, OVMF, parted, mtools, sgdisk, mkfs.ext2, + cyrius; the naad
-# repo checked out at ../naad (with deps resolved — build/naad-agnos should already exist).
+# repo at $NAAD_ROOT, else $SIBLINGS_ROOT/naad (default ../naad), with deps resolved (its lib/ is copied; the repo is only read).
 set -u
 # ⚠ TWO levels up: this script lives in scripts/<group>/ since the 1.56.22 split.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
-NAAD_ROOT="${NAAD_ROOT:-$ROOT/../naad}"
+# ⭐ 1.57.13 — SIBLINGS: an explicit <NAME>_ROOT wins, else ${SIBLINGS_ROOT:-$ROOT/..}/<repo> — the rule
+# scripts/burn/stage-tools.sh and scripts/check/syscall-abi-check.sh already follow. From a worktree $ROOT/.. is
+# .claude/worktrees/, which holds no sibling: the 1.57.12 sweep's run set SIBLINGS_ROOT and this smoke, reading only
+# its own variable, failed in 7 s ("not built" / "not found").
+SIBLINGS="${SIBLINGS_ROOT:-$ROOT/..}"
+GNOBOOT_ROOT="${GNOBOOT_ROOT:-$SIBLINGS/gnoboot}"
+NAAD_ROOT="${NAAD_ROOT:-$SIBLINGS/naad}"
 
 OVMF_CODE=""; for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
 OVMF_VARS_SRC=""; for c in /usr/share/edk2/x64/OVMF_VARS.4m.fd /usr/share/edk2/x64/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd; do [ -f "$c" ] && { OVMF_VARS_SRC="$c"; break; }; done
@@ -27,16 +32,27 @@ for tool in qemu-system-x86_64 parted mformat mmd mcopy sgdisk mkfs.ext2 dd stri
 done
 [ -d "$NAAD_ROOT" ] || { echo "ERROR: naad repo not found at $NAAD_ROOT (set NAAD_ROOT=)"; exit 1; }
 
-echo "[1/4] Building naadex (--agnos, from the naad repo) + the NAAD_RING3_SELFTEST kernel..."
-( cd "$NAAD_ROOT" && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius build naadex.cyr build/naadex --agnos ) >/tmp/naadex-build.log 2>&1 \
-    || { echo "  BUILD-FAIL (naadex)"; tail -8 /tmp/naadex-build.log; exit 1; }
-if ! env NAAD_RING3_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/naadex-kbuild.log 2>&1; then
-    echo "  BUILD-FAIL (kernel, see /tmp/naadex-kbuild.log)"; tail -5 /tmp/naadex-kbuild.log; exit 1
+# ⛔ 1.57.13 — NEVER WRITE INTO THE SIBLING. naadex used to be built INSIDE $NAAD_ROOT (`cd $NAAD_ROOT && cyrius build
+# ... build/naadex`), so every run wrote build/naadex — and whatever `cyrius build` resolves (lib/, cyrius.lock) —
+# into the naad repo, and the sweep's `naad` group existed only to serialise that write. The 1.57.12 sweep agent had
+# to copy naad to scratch by hand. Now the sources it reads (cyrius.cyml, VERSION, naadex.cyr, src/, lib/, dist/,
+# cyrius.lock — never .git or rust-old/) are copied to this tree's build/naad-ring3-src/ and naadex is built there; the
+# logs are the tree's (they were fixed /tmp paths shared by every tree).
+NBUILD="$ROOT/build/naad-ring3-src"; NLOG="$ROOT/build/naad-ring3-logs"
+rm -rf "$NBUILD" "$NLOG"; mkdir -p "$NBUILD" "$NLOG"
+for _n in cyrius.cyml VERSION naadex.cyr cyrius.lock src lib dist; do
+    [ -e "$NAAD_ROOT/$_n" ] && cp -a "$NAAD_ROOT/$_n" "$NBUILD/"
+done
+echo "[1/4] Building naadex (--agnos, from a copy of the naad sources in build/naad-ring3-src) + the NAAD_RING3_SELFTEST kernel..."
+( cd "$NBUILD" && mkdir -p build && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius build naadex.cyr build/naadex --agnos ) >"$NLOG/naadex-build.log" 2>&1 \
+    || { echo "  BUILD-FAIL (naadex, see $NLOG/naadex-build.log)"; tail -8 "$NLOG/naadex-build.log"; exit 1; }
+if ! env NAAD_RING3_SELFTEST=1 sh "$ROOT/scripts/build.sh" >"$NLOG/kbuild.log" 2>&1; then
+    echo "  BUILD-FAIL (kernel, see $NLOG/kbuild.log)"; tail -5 "$NLOG/kbuild.log"; exit 1
 fi
 
 GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"
 AGNOS="$ROOT/build/agnos"
-NAADEX="$NAAD_ROOT/build/naadex"
+NAADEX="$NBUILD/build/naadex"
 [ -f "$GNOBOOT" ] || { echo "ERROR: gnoboot not built at $GNOBOOT"; exit 1; }
 [ -f "$NAADEX" ]  || { echo "ERROR: naadex not built at $NAADEX"; exit 1; }
 echo "  build/agnos $(stat -c %s "$AGNOS") B   /bin/naadex $(stat -c %s "$NAADEX") B"

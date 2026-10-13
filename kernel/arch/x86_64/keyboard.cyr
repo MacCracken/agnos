@@ -19,8 +19,11 @@
 # via idle_owner) — so kb_isr never contends cross-CPU under the current single-IRQ1
 # routing. (If IRQ1 is ever redirected to an AP, kb_isr must take input_lock too —
 # that means emitting the xchg inline in its hand-asm stub.) The kb_has_key compare
-# stays unlocked: a single consumer owns kb_tail, producers only grow kb_head, so a
-# stale read is benign (the key is seen on the next poll).
+# stays unlocked: producers only grow kb_head, so a stale "empty" is benign (the key is seen on the next poll) — and a
+# stale "non-empty" is benign too, because kb_read_scancode RE-CHECKS under input_lock and answers 0 when the ring
+# emptied in between. ⚠ kb_tail is NOT single-writer: every consumer (the line owner, the NB reader, kbscan#42, the
+# recovery shell, an unowned held read) and console_mode#110 FLUSH (kbd_ring_flush_locked, 1.57.13) all write it,
+# always under input_lock.
 var input_lock = 0;
 # ⭐ 1.57.7 (Path 2, S3.7) — ONE BLOCKING READER PER COOKED LINE. The three cells below are guarded by input_lock
 # (taken after kbd_irq_save, like every kb_buf critical section). The functions that use them — kbd_line_try_take,
@@ -28,7 +31,8 @@ var input_lock = 0;
 # call wq_*, which are parsed after this file). docs/architecture/blocking-waits.md "keyboard line ownership".
 #   OWNERS of the global keyboard state (who may write what):
 #     kb_shift / kb_ctrl ........ the line owner (the reader that holds the line resets them at a fresh line)
-#     fb_line_live (fb_console) . the line owner sets it to 1; the CONSOLE clears it on newline/CR
+#     fb_line_live (fb_console) . the line owner sets it to 1; the CONSOLE clears it on newline/CR, and the reader at a
+#                                 line end that draws none (fb_line_end: a NOECHO Enter, a Ctrl-D — 1.57.13)
 #     nbline_buf / nbline_pos ... the NB reader (kbd_read_nonblock), which OWNS the line whenever nbline_pos > 0
 #                                 (invariant NB-OWN: a partial NB line is never split between readers)
 #     kb_buf consumers .......... the line owner, the NB reader, and two non-owner-aware readers kept as they are:
@@ -37,12 +41,27 @@ var input_lock = 0;
 var kbd_line_owner = 0;     # pid + 1 of the process that owns the cooked line; 0 = free
 var kbd_line_ep = 0;        # proc_epoch of that owner (live iff its state >= 1 AND the epoch matches)
 var kbd_line_waiters = 0;   # processes between "saw the line busy" and "woke / cancelled" (a release wakes only if > 0)
+# ⭐ 1.57.13 — the console's MODE (console_mode#110 NOECHO) is a fourth input_lock cell, kbd_line_mode, kept in
+# core/syscall.cyr beside its readers, with its HOLDER (kbd_mode_holder/kbd_mode_ep): the mode is the CONSOLE's, applies
+# to whoever reads the line, never holds the line, and dies with its holder. FLUSH empties kb_buf through
+# kbd_ring_flush_locked below, holding the line for the flush only.
 
 # Is anything in kb_buf? NO side effects — unlike kb_has_key, it neither drains the xHCI ring nor services deferred
 # HID work (which may print): it is the post-arm RE-CHECK of the waiting keyboard read (syscall.cyr), which must
 # not do I/O between wq_arm and wq_sleep. A stale answer is benign (the caller loops).
 fn kbd_ring_nonempty() {
     if (kb_head != kb_tail) { return 1; }
+    return 0;
+}
+# console_mode#110 CM_FLUSH (1.57.13): discard every key queued in kb_buf — Linux tcflush(TCIFLUSH) on the console.
+# Caller holds input_lock (after kbd_irq_save). The consumer index jumps to the producer's head in one store: a
+# producer appending on another CPU right after lands past the new tail — a key typed AFTER the flush, kept, as it
+# should be. ⚠ A SECOND tail writer that is not a consumer: a consumer that saw the ring non-empty (kb_has_key, its own
+# hold) and reaches kb_read_scancode after this store finds it empty there and takes nothing (the under-lock re-check
+# — without it that reader stepped kb_tail past kb_head and the ring replayed 255 old scancodes). A discarded modifier make/break cannot strand: every reader resets kb_shift/kb_ctrl at a fresh line, and
+# a flush leaves the line fresh (the caller zeroes nbline_pos in the same hold).
+fn kbd_ring_flush_locked() {
+    kb_tail = kb_head;
     return 0;
 }
 fn input_spin_lock() {
@@ -138,10 +157,20 @@ fn kb_has_key() {
 fn kb_read_scancode() {
     # input_lock: serialize the kb_tail RMW vs a producer (kb_isr/hid_kb_push) on
     # another CPU; cli-first excludes the same-CPU IRQ1 producer (see input_lock hdr).
+    # ⛔ 1.57.13: EMPTY IS RE-CHECKED UNDER THE LOCK and answers 0 (Set-1 0x00 is no key; every cooked reader already
+    # consumes a 0 as a modifier/release, kbscan#42 stops on it). Every caller tests kb_has_key() and THEN calls this —
+    # two holds — and kb_tail has two writers besides this one: another consumer (kbscan#42, the recovery shell, an
+    # unowned held read) and console_mode#110 FLUSH (kbd_ring_flush_locked). Unchecked, a flush landing between the
+    # test and this lock let the reader take the stale slot kb_buf[head] and step kb_tail PAST kb_head — after which
+    # the ring read as 255 queued keys: the last 255 scancodes replayed into the next reader, a NOECHO-hidden password
+    # and old Enters (whole command lines) among them (1.57.13 review).
     var f = kbd_irq_save();
     input_spin_lock();
-    var sc = load8(&kb_buf + kb_tail);
-    kb_tail = (kb_tail + 1) & 0xFF;
+    var sc = 0;
+    if (kb_tail != kb_head) {
+        sc = load8(&kb_buf + kb_tail);
+        kb_tail = (kb_tail + 1) & 0xFF;
+    }
     input_spin_unlock();
     kbd_irq_restore(f);
     return sc;

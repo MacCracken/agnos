@@ -198,7 +198,7 @@ if [ "$ARCH" = "aarch64" ]; then
     # A months-old kernel that looks exactly like a fresh one is the failure mode burn-prep.sh
     # already refuses to allow for x86_64 ("absence is the only reliable failure mode"); the
     # cross-compile had no such discipline.
-    rm -f "$ROOT/build/agnos-aarch64"
+    rm -f "$ROOT/build/agnos-aarch64" "$ROOT/build/agnos-aarch64.placeholder-refused"
     # 1.57.2 — rekha's face_data.cyr rides the aarch64 prep too: core/kfont.cyr sits in the
     # UNCONDITIONAL core block of agnos.cyr (next to vfs/devs), so its rekha_face_default_* calls
     # exist on every arch. kashi is NOT cat'd here because its only consumer (fb_console.cyr) is
@@ -209,6 +209,22 @@ if [ "$ARCH" = "aarch64" ]; then
     chmod +x "$ROOT/build/agnos-aarch64"
     SZ=$(wc -c < "$ROOT/build/agnos-aarch64")
     echo "  -> build/agnos-aarch64 ($SZ bytes)"
+    # ⛔ 1.57.13 — "OK" FROM THE COMPILER IS NOT "EVERY CALL RESOLVED" (scripts/check/placeholder-check.sh header).
+    # cycc_aarch64 drops an undefined function from its refusal when the name's first reference sits in a dead fn,
+    # says nothing, and emits every call to it as `udf #0`: this build printed OK over 103 of them before the 1.57.13
+    # stubs. So the image is scanned here, every build, and a holed one is REFUSED — moved to
+    # build/agnos-aarch64.placeholder-refused, exit 1 — exactly as image-layout-check.sh refuses an x86 flag image.
+    # release.yml's compile test runs this script, so it cannot record `compiled` over a hole. FAIL-CLOSED: an image
+    # the scan cannot read (no python3, no section table) is refused too — nothing boots this image, but its
+    # "compiles" is a claim release.yml and test.sh --aarch64 publish.
+    sh "$ROOT/scripts/check/placeholder-check.sh" "$ROOT/build/agnos-aarch64" > "$ROOT/build/placeholder-aarch64.log" 2>&1 && PRC=0 || PRC=$?
+    if [ "$PRC" != "0" ]; then
+        cat "$ROOT/build/placeholder-aarch64.log" >&2
+        mv -f "$ROOT/build/agnos-aarch64" "$ROOT/build/agnos-aarch64.placeholder-refused"
+        echo "ERROR: build/agnos-aarch64 fails the unresolved-call placeholder gate (above, rc $PRC) — moved to build/agnos-aarch64.placeholder-refused" >&2
+        exit 1
+    fi
+    echo "  placeholders: $(head -n 1 "$ROOT/build/placeholder-aarch64.log")"
     echo "Boot: qemu-system-aarch64 -M virt -cpu cortex-a57 -kernel build/agnos-aarch64 -serial stdio -display none"
 else
     echo "Building AGNOS kernel [x86_64]..."
@@ -528,6 +544,10 @@ else
         # TE gets exactly the invalidation Caching Mode needs, and the page then works (iommu.cyr vtd_selftest; NVMe
         # IDENTIFY as the DMA engine; scripts/smoke/vtd-smoke.sh). Test-only.
         [ -n "$VTD_SELFTEST" ] && echo '#define VTD_SELFTEST'
+        # VTD_REGISTER_INV=1 — 1.57.13: never enable VT-d queued invalidation, so the REGISTER interface (the fallback a unit
+        # without ECAP.QI gets) is booted on QEMU, whose unit always offers QI (iommu.cyr iommu_qi_forbid;
+        # scripts/smoke/vtd-smoke.sh boot AR). Test-only.
+        [ -n "$VTD_REGISTER_INV" ] && echo '#define VTD_REGISTER_INV'
         # HID_MOUSE_DEFER_SELFTEST=1 — 1.57.8: mouse reports completing while the drain is held (IF=0 + hid_poll_lock)
         # must all fold in ONE drain (hid.cyr hid_mouse_defer_selftest; scripts/smoke/hid-mouse-deferred-smoke.sh).
         [ -n "$HID_MOUSE_DEFER_SELFTEST" ] && echo '#define HID_MOUSE_DEFER_SELFTEST'
@@ -556,6 +576,10 @@ else
         # (FLOCK_SELFTEST retired 1.57.7: its asserts are ktest T9 — sched.cyr test_flock.)
         [ -n "$WINSIZE_SELFTEST" ]   && echo '#define WINSIZE_SELFTEST'
         [ -n "$NBREAD_SELFTEST" ]    && echo '#define NBREAD_SELFTEST'
+        # TTY_SELFTEST=1 — 1.57.13: console_mode#110's geometry knob (CM_T_SAME / CM_T_SHRINK / CM_T_RESTORE drive the
+        # real fb_set_geom, so SIGWINCH's post path runs under QEMU, where no live modeset is reachable). A production
+        # kernel refuses the knob's bits as unknown. Driven by scripts/smoke/tty-smoke.sh (tests/waits/waitx mode tty).
+        [ -n "$TTY_SELFTEST" ]       && echo '#define TTY_SELFTEST'
         [ -n "$FBSCALE_SELFTEST" ]   && echo '#define FBSCALE_SELFTEST'
         # HDA_TONE=1 — B4 first-tone: hda_stream_arm fills the PCM ring with a
         # ~375 Hz triangle instead of silence. Gated so production boots stay
@@ -893,7 +917,14 @@ else
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     rm -f "$PREPPED_DEFS"
-    (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")
+    # 1.57.13: the compiler's stderr is captured (and replayed to stderr, unchanged) so the placeholder gate below can
+    # read its `warning: undefined function` lines — the only place an x86 hole is NAMED. Same status as before: a
+    # failed compile exits this script with the compiler's code, the prepped source left for inspection.
+    CC_STDERR="$ROOT/build/agnos.compile-stderr.log"
+    rm -f "$CC_STDERR" "$ROOT/build/agnos.placeholder-refused"
+    (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos") 2> "$CC_STDERR" && CCRC=0 || CCRC=$?
+    cat "$CC_STDERR" >&2
+    [ "$CCRC" = "0" ] || exit "$CCRC"
     rm -f "$PREPPED"
     SZ=$(wc -c < "$ROOT/build/agnos")
     echo "  -> build/agnos ($SZ bytes)"
@@ -978,6 +1009,24 @@ print('  entry: 0x{:x}'.format(entry))
     # "layout=pass|over-bound|unmeasured"): smoke_require_image (scripts/smoke/lib/qemu-dwell.sh) refuses to boot a
     # kernel a smoke was not written for — shutdown-smoke booted doom-smoke's leftover DOOM_SELFTEST image and scored
     # PASS in the IMG run — and, since that review, one whose layout verdict is not `pass`.
+    # ⛔ 1.57.13 — THE UNRESOLVED-CALL PLACEHOLDER GATE (scripts/check/placeholder-check.sh). cycc warns
+    # `undefined function 'NAME'` and does NOT refuse when the name's first reference sits in a dead fn, emitting every
+    # call to it as `ud2; ud2; nop` — a kernel that says OK and traps where the call was. 0 in every x86_64 image
+    # measured 2026-10-13; the aarch64 build carried 103 (the arm above). Every x86_64 build — plain or flag — that
+    # carries one, or whose compile log names an undefined function, is REFUSED: moved to build/agnos.placeholder-refused,
+    # exit 1 (a placeholder is a trap, not a bound: no warn-only arm). When python3 is missing the layout block below
+    # already refuses a flag build and records a plain one `layout=unmeasured`, which smoke_require_image refuses.
+    if command -v python3 >/dev/null 2>&1; then
+        sh "$ROOT/scripts/check/placeholder-check.sh" "$ROOT/build/agnos" "$CC_STDERR" > "$ROOT/build/placeholder-x86.log" 2>&1 && PRC=0 || PRC=$?
+        if [ "$PRC" != "0" ]; then
+            cat "$ROOT/build/placeholder-x86.log" >&2
+            mv -f "$ROOT/build/agnos" "$ROOT/build/agnos.placeholder-refused"
+            rm -f "$ROOT/build/agnos.flags"
+            echo "ERROR: build [${BUILD_FLAGS:-plain}] fails the unresolved-call placeholder gate (above, rc $PRC) — moved to build/agnos.placeholder-refused; it must not be booted" >&2
+            exit 1
+        fi
+        echo "  placeholders (${BUILD_FLAGS:-plain}): $(head -n 1 "$ROOT/build/placeholder-x86.log")"
+    fi
     rm -f "$ROOT/build/agnos.layout-refused" "$ROOT/build/image-layout-flag.log" "$ROOT/build/agnos.flags"
     LAYOUT=pass
     if ! command -v python3 >/dev/null 2>&1; then

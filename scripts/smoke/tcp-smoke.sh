@@ -5,8 +5,16 @@
 # tcp: halfclose (issue 2026-09-23-sock-recv-never-reports-eof-after-peer-fin, D12(ii)), plus the 1.57.7 S6 arms
 # (issue 2026-09-23-sock-send-and-connect-hold-the-cpu): rebase, tickretx, ticklo (net_tick), wndopen, persist,
 # partack, wndstale (send-side correctness), ackwake, rstwake (the WK_TCP wakes), legacyif, finretx, finfold, finboth,
-# orphan (graceful close), connfail (#47's release), stall (D6 + one in flight). Every arm prints PASS or FAIL;
+# orphan (graceful close), connfail (#47's release), stall (D6 + one in flight), and the 1.57.13 dlpart (sock_send_dl
+# #109: a partial ACK followed by a stall still returns at the caller ceiling — tcp_send_ex's D6 site 2, which no
+# ring-3 peer reaches: an agnos or SLIRP receiver never takes part of a segment) and d6part (a partial ACK consumed
+# before the wait arms — the sender's own poll, or a drain racing the arm — restarts D6 from the partial ACK; it used
+# to sleep to the OLD deadline and restart D6 there, up to 2 x TCP_PROGRESS_US). Every arm prints PASS or FAIL;
 # `tcp: selftest done` is the LAST line of the block and the dwell marker.
+# NEGATIVE (1.57.13, red, source restored byte-identical): tcp_send_ex's ACK-progress site re-arming D6 without
+# tcp_send_cap_clamp (`se_pdl = wq_deadline_after_us(se_prog);`) -> dlpart returns after ~8 s -> `tcp: dlpart FAIL`;
+# tcp_wait_done and tcp_send_ex's post-poll prefilter without their SND.UNA clause (the pre-1.57.13 code) -> d6part's
+# stale-snapshot block sleeps its 2 s and its #48 call returns at ~1.2 s (2 x its 600 ms D6) -> `tcp: d6part FAIL`.
 # 1.57.7 (S6): two boots — -smp 1 (TCG) and a GATED -smp 4 (smoke_accel: KVM when writable, else tcg,thread=multi);
 # dwell 120 s (the arms block on real deadlines). TCP_SMP overrides the list (default "1 4").
 #
@@ -116,6 +124,8 @@ for SMP in ${TCP_SMP:-1 4}; do
     check "tcp: orphan PASS"      "S6: an orphan FIN slot is reclaimed; the free count matches the claim"            "M-ORPHAN / M-FREECOUNT"
     check "tcp: connfail PASS"    "S6: every -1 exit of #47 releases its slot (RST and timeout)"                     "M-LEAK"
     check "tcp: stall PASS"       "S6: D6 + one segment in flight at entry"                                          "M-S2"
+    check "tcp: dlpart PASS"      "1.57.13 #109: a partial ACK then a stall returns a 300 ms ceiling in [300 ms, 1.5 s] (D6 site 2 clamped)" "#109 site 2"
+    check "tcp: d6part PASS"      "1.57.13: a partial ACK consumed before the wait arms restarts D6 from the partial ACK (not the old deadline)" "D6 partial-ACK wake"
     check "tcp: selftest done"    "the block ran to its last line"                                                     "the selftest block did not finish"
     deny "tcp: [a-z0-9]+ FAIL|net: [a-z-]+ FAIL|SKIP" "an arm printed FAIL or SKIP" "no arm printed FAIL or SKIP"
     deny "$SMOKE_INVARIANT_DENY" "a latched kernel invariant fired" "no latched invariant (incl. net: lock overlap/missing)"

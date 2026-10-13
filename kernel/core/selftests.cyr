@@ -883,7 +883,7 @@ fn tcpst_arm_ackwake() {
     var sf = kbd_irq_save();
     net_tick_resume();
     var t0 = sched_clock_us();
-    var r = tcp_block(c, 2, 0, 0, g, t0 + 2000000);
+    var r = tcp_block(c, 2, 0, 0, g, t0 + 2000000, 0x1000);
     var el = sched_clock_us() - t0;
     net_tick_pause();
     kbd_irq_restore(sf);
@@ -909,7 +909,7 @@ fn tcpst_arm_rstwake() {
     var sf = kbd_irq_save();
     net_tick_resume();
     var t0 = sched_clock_us();
-    var r = tcp_block(c, 1, 0, 0, g, t0 + 2000000);
+    var r = tcp_block(c, 1, 0, 0, g, t0 + 2000000, 0);
     var el = sched_clock_us() - t0;
     net_tick_pause();
     kbd_irq_restore(sf);
@@ -1156,7 +1156,7 @@ fn tcpst_arm_stall() {
     store64(cb + 32, 0x6001);
     tcp_unlock(f);
     var t0 = sched_clock_us();
-    var r = tcp_send_ex(c, &tcpst_pat, 100, 0, 300000);
+    var r = tcp_send_ex(c, &tcpst_pat, 100, 0, 300000, 0);
     var el = sched_clock_us() - t0;
     if (r != 0 || el < 300000 || el > 1000000) { ok = 0; }
     if (load64(cb + 32) != 0x6001 || load64(cb + 96) != 0x6000) { ok = 0; }
@@ -1164,6 +1164,102 @@ fn tcpst_arm_stall() {
     tcpst_rel(c);
     tcpst_drain();
     return tcpst_verdict(ok, "stall", 5);
+}
+
+# dlpart — 1.57.13 #109, D6 SITE 2 (tcp_send_ex's ACK-progress clamp): a PARTIAL ACK that advances SND.UNA while the
+# call's own segment stays in flight re-arms D6 UNDER the caller ceiling, so a peer that ACKs 40 of the 100 bytes and
+# then stalls returns a 300 ms tcp_send_dl (the #109 body) with the committed 100 in [300 ms, 1.5 s] — never one D6
+# window (8 s) after the partial ACK. Here because no agnos or SLIRP receiver takes part of a segment (the sender caps
+# every chunk at the advertised window, and a reader's window only opens), so the ring-3 sock-send-dl smoke cannot
+# reach the site. The partial ACK is PRE-QUEUED in lo (net_tick is paused for the whole block): the call commits its
+# segment at 0x1000, and its own net_poll delivers the ACK, ahead of the call's looped segment (dropped: nothing
+# listens on 0xEE93). NEGATIVE (1.57.13): site 2 without tcp_send_cap_clamp -> ~8 s -> FAIL.
+fn tcpst_arm_dlpart() {
+    var ok = 1;
+    var c = tcpst_fake(0xEE92, 0xEE93, 0);
+    if (c < 0) { return tcpst_verdict(0, "dlpart", 6); }
+    var cb = tcp_conn_base(c);
+    var i = 0;
+    while (i < 100) { store8(&tcpst_pat + i, (i * 7 + 3) & 0xFF); i = i + 1; }
+    var f = tcp_lock();
+    store64(cb + 88, 8192);                                           # the 100 bytes go out as ONE segment
+    tcp_unlock(f);
+    tcpst_drain();
+    tcpst_lo(tcpst_frame(0xEE93, 0xEE92, 0x2000, 0x1028, 0x10, 0, 0));   # the peer's partial ACK: 40 of the 100
+    var t0 = sched_clock_us();
+    var r = tcp_send_dl(c, &tcpst_pat, 100, 0, 300000);
+    var el = sched_clock_us() - t0;
+    f = tcp_lock();
+    var dp_una = load64(cb + 56);
+    var dp_len = load64(cb + 104);
+    var dp_arm = load64(cb + 128);
+    var dp_nxt = load64(cb + 32);
+    tcp_unlock(f);
+    if (r != 100 || el < 300000 || el > 1500000) { ok = 0; }
+    if (dp_una != 0x1028 || dp_len != 60 || dp_arm != 0x18 || dp_nxt != 0x1064) { ok = 0; }   # site 2 was on the path
+    kprint("tcp: dlpart us=", 15); kprint_num(el); kprint(" r=", 3); kprint_num(r);
+    kprint(" una=", 5); kprint_num(dp_una); kprint(" held=", 6); kprint_num(dp_len); kprintln("", 0);
+    tcpst_rel(c);
+    tcpst_drain();
+    return tcpst_verdict(ok, "dlpart", 6);
+}
+
+# d6part — 1.57.13: a PARTIAL ACK restarts #48's D6 clock FROM THE PARTIAL ACK, even when it is consumed before the
+# wait arms. (a) tcp_block mode 2 with a stale SND.UNA snapshot returns at once — tcp_wait_done's post-arm re-check
+# sees the progress (the lost-wakeup closure for a partial ACK another CPU's drain delivers between the poll and the
+# arm) — while a current snapshot still sleeps to its deadline. (b) tcp_send_ex (#48's body: a 600 ms D6, no ceiling)
+# whose OWN net_poll consumes a pre-queued partial ACK right after the commit, then a stall: back in [600 ms, 1 s].
+# Before the fix the sender slept to the OLD deadline and restarted D6 there: ~1.2 s here, 16 s at TCP_PROGRESS_US.
+# NEGATIVE (1.57.13): tcp_wait_done without the SND.UNA clause and tcp_send_ex's prefilter without it -> (a) sleeps
+# the 2 s, (b) ~1.2 s -> FAIL.
+fn tcpst_arm_d6part() {
+    var ok = 1;
+    var i = 0;
+    while (i < 100) { store8(&tcpst_pat + i, (i * 7 + 3) & 0xFF); i = i + 1; }
+    var c = tcpst_fake(0xEE94, 0xEE95, 0);
+    if (c < 0) { return tcpst_verdict(0, "d6part", 6); }
+    var cb = tcp_conn_base(c);
+    var f = tcp_lock();
+    store64(cb + 88, 8192);
+    tcp_arm_retx(cb, 0x1000, 0x18, &tcpst_pat, 100);
+    store64(cb + 32, 0x1064);
+    var g = tcp_conn_gen_get(c);
+    tcp_unlock(f);
+    tcpst_inject(tcpst_frame(0xEE95, 0xEE94, 0x2000, 0x1028, 0x10, 0, 0));   # partial ACK: SND.UNA 0x1000 -> 0x1028
+    var t0 = sched_clock_us();
+    var ra = tcp_block(c, 2, 0, 0, g, t0 + 2000000, 0x1000);                 # (a) the caller decided on 0x1000
+    var ela = sched_clock_us() - t0;
+    t0 = sched_clock_us();
+    var rc = tcp_block(c, 2, 0, 0, g, t0 + 200000, 0x1028);                  # control: no progress since -> sleeps
+    var elc = sched_clock_us() - t0;
+    if (ra != 0 || ela >= 100000 || load64(cb + 56) != 0x1028) { ok = 0; }
+    if (rc != 0 || elc < 200000 || elc > 1000000) { ok = 0; }
+    tcpst_rel(c);
+    var c2 = tcpst_fake(0xEE96, 0xEE97, 0);
+    var rb = 0 - 1;
+    var elb = 0;
+    var d6_una = 0;
+    if (c2 < 0) { ok = 0; } else {
+        var cb2 = tcp_conn_base(c2);
+        f = tcp_lock();
+        store64(cb2 + 88, 8192);
+        tcp_unlock(f);
+        tcpst_drain();
+        tcpst_lo(tcpst_frame(0xEE97, 0xEE96, 0x2000, 0x1028, 0x10, 0, 0));   # (b) delivered by the call's own poll
+        t0 = sched_clock_us();
+        rb = tcp_send_ex(c2, &tcpst_pat, 100, 0, 600000, 0);
+        elb = sched_clock_us() - t0;
+        f = tcp_lock();
+        d6_una = load64(cb2 + 56);
+        tcp_unlock(f);
+        if (rb != 100 || elb < 600000 || elb > 1000000 || d6_una != 0x1028) { ok = 0; }
+        tcpst_rel(c2);
+    }
+    kprint("tcp: d6part a_us=", 17); kprint_num(ela); kprint(" ctl_us=", 8); kprint_num(elc);
+    kprint(" b_us=", 6); kprint_num(elb); kprint(" r=", 3); kprint_num(rb); kprint(" una=", 5); kprint_num(d6_una);
+    kprintln("", 0);
+    tcpst_drain();
+    return tcpst_verdict(ok, "d6part", 6);
 }
 
 fn tcpst_s6_arms() {
@@ -1184,6 +1280,8 @@ fn tcpst_s6_arms() {
     tcpst_arm_orphan();
     tcpst_arm_connfail();
     tcpst_arm_stall();
+    tcpst_arm_dlpart();
+    tcpst_arm_d6part();
     return 0;
 }
 #endif

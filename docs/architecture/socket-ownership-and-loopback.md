@@ -2,7 +2,8 @@
 
 Closes `docs/development/issues/archived/2026-09-23-socket-ids-have-no-owner.md` (TCP and UDP) and
 `archived/2026-09-23-tcp-server-cannot-be-loopback-only.md` (gaps 2 and 3; gap 1 kernel-side — usable once the cyrius adapter
-passes `SOCK_LISTEN_LOOPBACK`). Code: `kernel/core/net_tcp.cyr`, `net.cyr`, `net_ingress.cyr`, the #47–#57 / #106
+passes `SOCK_LISTEN_LOOPBACK`). Code: `kernel/core/net_tcp.cyr`, `net.cyr`, `net_ingress.cyr`, the #47–#57 / #106 / #109
+(1.57.13 `sock_send_dl`: #48's checks, `tcp_auth` first; its foreign-id refusal is gated by `sock-send-dl-smoke.sh` N12)
 arms in `syscall.cyr`, the VFS_SOCK paths in `vfs.cyr`. Gate: `scripts/smoke/sock-owner-smoke.sh`. Locking is
 S4's ([`net-concurrency.md`](net-concurrency.md)); S5 adds no lock.
 

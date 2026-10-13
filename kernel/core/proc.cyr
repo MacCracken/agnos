@@ -200,6 +200,7 @@ var SIG_CHLD = 17;
 var SIG_CONT = 18;
 var SIG_STOP = 19;
 var SIG_XCPU = 24;                # S8
+var SIG_WINCH = 28;               # 1.57.13: the console grid changed — posted ONLY to signalfd watchers (sched.cyr console_winch_post)
 var KILL_TREE = 0x100;            # kill#16 arg2 bit 8 (D4)
 var WSTAT_SIGNALED = 0x100;       # wait status of a death by signal = 0x100 | sig (D2)
 var PROC_ZOMBIE_REPORT = 7;       # #99 report-only state (an exited, unreaped child)
@@ -233,6 +234,17 @@ fn lc_sp_set(t, v) { store64(&proc_stop_pending + t * 8, v); return 0; }
 fn lc_pp(t) { return load64(&proc_ppid + t * 8); }
 fn lc_pep(t) { return load64(&proc_ppid_epoch + t * 8); }
 fn lc_done(t) { return load64(&proc_death_done + t * 8); }
+# 1.57.13 (merge of the carry and tty tracks) — 1 when slot t is DYING (4) with its death DONE: since 1.57.13 a TICK
+# death leaves its own slot and its zombie children there until a process context reaps them (syscall.cyr
+# proc_orphan_owed_run), for as long as fs_lock stays busy. Such a slot is dead to every liveness test that is not the
+# reaper's own — pipe_ends_open (vfs.cyr), the console's line owner and console_mode#110 holder (syscall.cyr
+# kbd_line_owner_live_locked / kbd_mode_now), SIGWINCH's watchers (sched.cyr console_winch_post). A 4 still mid-death
+# (a CLAIMED target, done 0) is not: it keeps counting, as before.
+fn lc_dying_done(t) {
+    if (lc_st(t) != 4) { return 0; }
+    if (lc_done(t) != 1) { return 0; }
+    return 1;
+}
 
 # ═══════════════ 1.57.7 (Path 2, S3.4) — THE WAIT CELLS AND THE PER-PROCESS 4TH SYSCALL ARGUMENT ═══════════════
 # Parallel pid-indexed arrays (the 176 B struct stride is frozen), scrubbed in proc_alloc_slot. HERE, in shared
