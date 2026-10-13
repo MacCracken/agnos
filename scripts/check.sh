@@ -125,6 +125,13 @@ sh "$ROOT/scripts/check/pp-balance-check.sh" > "$CHECK_LOGS/pp-balance-check.log
 check "preprocessor directives balanced (kernel/)" $rc
 [ "$rc" = "0" ] || cat "$CHECK_LOGS/pp-balance-check.log"
 
+# ⭐ 1.57.12 — GATE 38: BRACE BALANCE. cycc 6.6.6 accepts a stray top-level `}` without a diagnostic and silently
+# drops every declaration after it (filed in cyrius 2026-10-11); in the kernel that surfaced as 62 "undefined
+# variable" errors in other files and cost the ZFS writer's B4 a bisect. Pure text walk — never builds.
+sh "$ROOT/scripts/check/brace-balance-check.sh" > "$CHECK_LOGS/brace-balance-check.log" 2>&1 && rc=0 || rc=$?
+check "braces balanced (kernel/)" $rc
+[ "$rc" = "0" ] || cat "$CHECK_LOGS/brace-balance-check.log"
+
 # ⭐ 1.57.10 (HAR2) — GATE 36: ISSUE POINTERS RESOLVE. An issue is closed by moving its file into
 # docs/development/issues/archived/, and the pointers stayed behind. At 1.57.10, 30 comments in scripts/,
 # tests/ and kernel/ (plus 12 lines in archived issue docs) named files that no longer existed.
@@ -338,8 +345,10 @@ check "host GPU oracles (0x0C grid, r15 bilinear, r6 region, r17 depth order)" $
 # plausible file). scripts/check/host-zfs-oracles.sh regenerates the vectors (hashlib / zlib / the lz4 CLI /
 # Python ports of lzjb + zle), REBUILDS tests/zfscodec and runs every case against PROT_NONE guard pages;
 # mutation-proven at 1.57.11 (see its header). Tooling missing (no lz4 CLI) exits 2 and scores red here too.
+# 1.57.12 B3a: + the WRITER's encoders (ZLE compress, the BP checksum dispatch, core/zfs_wenc.cyr's BP words /
+# holes / ZLE decision / space-map entries), scored against OpenZFS-written bytes too; mutation-proven again.
 sh "$ROOT/scripts/check/host-zfs-oracles.sh" >"$CHECK_LOGS/host-zfs.log" 2>&1 && rc=0 || rc=$?
-check "host ZFS codec oracle (checksums, lz4/lzjb/zle/inflate, ZAP hash)" $rc
+check "host ZFS codec oracle (checksums, lz4/lzjb/zle/inflate, ZAP hash, writer encoders)" $rc
 [ $rc -eq 0 ] || cat "$CHECK_LOGS/host-zfs.log"
 
 # Call arity. cycc WARNS on an argument-count mismatch and builds anyway, so a wrong call ships green.
@@ -513,12 +522,13 @@ fi
 # ⭐⭐ 1.57.9 (SIZEGATE) — THE GRANT IS RE-DERIVED FROM THE LAYOUT WALL, AND IT LIVES IN ONE PLACE NOW:
 # scripts/check/weighed-size-check.sh (read its header for the arithmetic and the prior art). Operator
 # ruling: this row "is NOT A HARD LIMIT — it can be expanded"; the hard limit is gate 34 below (LOAD end
-# <= 0x3D0000 since 1.57.11; 0x390000 before). History of what it replaced: 2 MiB (2,097,152) raised 2026-07-26 as "deliberate
+# <= 0x400000 since 1.57.12, the top of region 1; 0x3D0000 at 1.57.11, 0x390000 before). History of what it replaced: 2 MiB (2,097,152) raised 2026-07-26 as "deliberate
 # temporary headroom — a grant, not a measurement, and it expires"; at 1.57.2 the embedded face was
 # weighed out rather than raised over (SZK = SZ - rekha_face_default_len(), read live from the face
 # module the build cat'd in). At 1.57.8 that grant sat 4,700 B above the weighed image while gate 34 still
-# had 118,520 B — the taste number bound first. GRANT is now 0x220000 = 2,228,224 B, 17,252 B ABOVE the
-# weighed size at which the plain image hits the wall (2,210,972 B), so gate 34 fires first by
+# had 118,520 B — the taste number bound first. GRANT was then 0x220000 = 2,228,224 B (0x290000 = 2,686,976 B
+# since the 1.57.12 wall), 17,252 B ABOVE the weighed size at which the plain image hits the wall (2,210,972 B
+# then; 2,669,724 B at 1.57.12), so gate 34 fires first by
 # construction, and the helper FAILS this row if a live re-derivation of that wall (CEIL parsed from
 # image-layout-check.sh, zero-fill and trailer from the ELF, FACE from rekha) ever reaches the grant —
 # the inversion cannot return silently. ⛔ 1.57.9 ENDFIX SG-1: for GROWTH this row is therefore REPORT-ONLY —
@@ -540,6 +550,12 @@ check "binary size (weighed-size tripwire: ${SZOUT%%
 [ -z "$SZWHY" ] || echo "    VACUOUS: $SZWHY"
 [ "$rc" = "0" ] || [ -n "$SZWHY" ] || echo "$SZOUT" | sed -n '2,$s/^/    /p'
 
+# ⭐⭐ 1.57.12 — the kernel image vs the TOP OF REGION 1 (scripts/check/image-layout-check.sh): LOAD end <=
+# 0x400000. The BSP stacks LEFT region 1 — the boot stack is a 64 KB array in the image's own .bss
+# (boot_shim.cyr bsp_boot_stack, loaded through one statement + an asm block the gate decodes from the image),
+# the BSP's TSS.RSP0 is region-7 slot 0 through the direct map (gdt.cyr) — so region 1 holds only the image
+# and the bound is the last one this layout allows (VA 0x400000 is ring-3 code in every process). Operator
+# ruling: make room for the ZFS write path. The history below is the fixed-window era.
 # 1.57.2 -> 1.57.3 — the kernel image vs the BSP boot stack (scripts/check/image-layout-check.sh).
 # The 1.57.2 face's +410 KB of .rodata carried the LOAD end from ~0x2FA2xx to 0x35E770, across the
 # AP1-3 boot/TSS stack window [0x310000, 0x340000) — a placement class this tree has paid for twice
@@ -561,10 +577,25 @@ check "binary size (weighed-size tripwire: ${SZOUT%%
 # -smp 4; a sweep.sh gate) samples each AP's RSP against the region-7 window and re-hashes the chunk
 # literals in place after the wake. docs/development/issues/archived/2026-09-13-ap-stacks-inside-kernel-rodata.md.
 # Same vacuity guard as the size gate: a fossil binary describes a different tree. Mutation-tested
-# (p_memsz past the bound -> FAIL; a shim immediate off BSP_BOOT_TOP -> FAIL; see the script header).
-[ -z "$SZWHY" ] && sh "$ROOT/scripts/check/image-layout-check.sh" "$ROOT/build/agnos" > "$CHECK_LOGS/image-layout-check.log" 2>&1 && rc=0 || rc=$?
-check "kernel image vs BSP boot stack (LOAD end <= 0x3D0000)" $rc
-[ -z "$SZWHY" ] || echo "    VACUOUS: $SZWHY"
+# (p_memsz past the bound -> FAIL; the shim's stack load changed shape, a fixed region-1 stack immediate, a
+# BSP case back in tss_get_cpu_stack -> FAIL; see the script header's 1.57.12 record).
+# ⭐ 1.57.12 (the second ROOM review): build.sh REFUSES a plain image that fails a layout CONTRACT — anything but the
+# bound itself, e.g. (10)'s leftover `&NAME` — and moves it to build/agnos.layout-refused (exit 1), so this run has no
+# build/agnos and the fossil guard above goes VACUOUS. When the arity build's own log shows that refusal, this row scores
+# the REFUSED image instead, so it still prints the gate's FAIL block (always red: a refused image never passes here).
+ILC_REFUSED=""
+if [ -n "$SZWHY" ] && [ ! -f "$ROOT/build/agnos" ] && [ -f "$ROOT/build/agnos.layout-refused" ] \
+    && grep -q "moved to build/agnos.layout-refused" "$ARITY_LOG"; then
+    ILC_REFUSED="build.sh refused this run's plain image (a layout contract FAIL) — the gate's verdict on build/agnos.layout-refused:"
+fi
+if [ -n "$ILC_REFUSED" ]; then
+    sh "$ROOT/scripts/check/image-layout-check.sh" "$ROOT/build/agnos.layout-refused" > "$CHECK_LOGS/image-layout-check.log" 2>&1 || true
+    rc=1
+else
+    [ -z "$SZWHY" ] && sh "$ROOT/scripts/check/image-layout-check.sh" "$ROOT/build/agnos" > "$CHECK_LOGS/image-layout-check.log" 2>&1 && rc=0 || rc=$?
+fi
+check "kernel image vs region-1 top (LOAD end <= 0x400000)" $rc
+if [ -n "$ILC_REFUSED" ]; then echo "    REFUSED: $ILC_REFUSED"; else [ -z "$SZWHY" ] || echo "    VACUOUS: $SZWHY"; fi
 [ "$rc" = "0" ] || cat "$CHECK_LOGS/image-layout-check.log"
 
 echo ""

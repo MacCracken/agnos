@@ -1,4 +1,4 @@
-# agnos.cyr — AGNOS kernel v1.57.11
+# agnos.cyr — AGNOS kernel v1.57.12
 # Boot: gnoboot + OVMF (QEMU) or install-usb.sh (iron) — see scripts/smoke/agnsh-smoke.sh.
 # ⛔ 1.56.51: this line read `qemu-system-x86_64 -kernel build/agnos …` and had been wrong since
 # the kernel became ELF64/multiboot2 under Path C. An ELF64 image has no PVH note, so QEMU's
@@ -114,19 +114,33 @@ include "core/net_tcp.cyr"       # TCP stack — split out at 1.36.0; must stay 
 include "core/fatfs.cyr"
 include "core/exfat.cyr"
 include "core/ext2.cyr"
-include "core/zfs_codec.cyr"     # 1.57.11 — ZFS checksums + decompression (fletcher, SHA-2, lz4/lzjb/zle/inflate, the ZAP hash)
+include "core/zfs_codec.cyr"     # 1.57.11 — ZFS checksums + decompression (fletcher, SHA-2, lz4/lzjb/zle/inflate, the ZAP hash); 1.57.12 + the ZLE compressor
+include "core/zfs_wenc.cyr"      # 1.57.12 — the ZFS writer's pure encoders (BP words, holes, the ZLE decision, space-map entries); host-proven with the codec
 include "core/zfs.cyr"           # 1.57.11 — read-only ZFS (labels -> MOS -> DSL grafts -> ZPL); after vfs/block/gpt, which it calls
+include "core/zfs_write.cyr"     # 1.57.12 — the ZFS writer (B1-B3: the write gate, the allocator state load, the commit of a txg); after zfs.cyr, whose helpers it uses
 include "core/modeset_latch.cyr" # H2 arm-once modeset latch — after ext2 (its surface) and block (its flush)
 include "core/power.cyr"         # orderly shutdown — after the FS/block layers it flushes, before syscall.cyr
 include "core/syscall.cyr"
+include "core/room.cyr"          # 1.57.12 — the image's ROOM: one boot-time carve-out (room_init, main.cyr) that holds large module arrays outside the image; after every file whose array it moves (it takes their pointers' addresses)
 include "core/bench.cyr"         # 3-tier rdtsc benchmarks (build-time entry; inert unless scripts/bench.sh rewrites boot_finish.cyr to call bench_run_all)
 include "user/test_procs.cyr"
-# Boot shim must be the first top-level statement emitted: it transitions
-# the CPU from multiboot1's 32-bit protected mode to long mode, so 64-bit
-# gvar initializers (`var x = 0xDEAD;`) must run AFTER it. cyrius v5.7.19
-# enforces this via kmode==1 emit order (PARSE_PROG before EMIT_GVAR_INITS);
-# regression locked in by cyrius check.sh gate 4ab. See
+# Boot shim must be the first top-level STATEMENT emitted: it installs the BSP
+# boot stack, and gnoboot jumps here with an undefined one (`mov rdi, rax;
+# jmp rax`) and RDI = &boot_info. cyrius v5.7.19 put kmode's PARSE_PROG (the
+# top-level statements, in include order) ahead of EMIT_GVAR_INITS — for the
+# deleted multiboot1 path, which entered in 32-bit mode where a gvar-init
+# `mov rcx, imm64` #GPs; regression locked in by cyrius check.sh gate 4ab, see
 # docs/development/proposals/2026-04-27-cc5-kernel-boot-shim-regression.md.
+# In kmode EMIT_GVAR_INITS lands after the boot body, which never returns, so it
+# never runs (literal initialisers are const-folded into the image; expression
+# ones never execute — main.cyr's klog_tsc_boot note).
+# ⚠ BUT THE SHIM IS NOT THE FIRST CODE (corrected 1.57.12): cycc emits the
+# top-level ENUM initialisations before PARSE_PROG in every mode, so ~200
+# constant stores into .bss (`mov eax, imm32` / `movabs rcx, &x` /
+# `mov [rcx], rax`) run ahead of the shim, on gnoboot's stack. Safe only while
+# they stay stack-free and leave RDI alone — scripts/check/image-layout-check.sh
+# (8) walks the image from the entry jmp to the shim's first byte and fails the
+# build on anything else.
 include "arch/x86_64/boot_shim.cyr"
 include "core/main.cyr"          # boot-init sequence
 include "core/selftests.cyr"     # compile-gated boot self-tests (1.36.2 split) — after init, before launch

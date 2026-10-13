@@ -1481,6 +1481,8 @@ fn msc_test_unit_ready(slot_id, lun) {
 #                                for optical via SCSI MMC)
 #   +84   u8   inquiry_done    (1 after a successful INQUIRY)
 #   +85   u8   capacity_done   (1 after a successful READ CAPACITY)
+#   +86   u8   no_sync_cache   (1 once SYNCHRONIZE CACHE drew ILLEGAL REQUEST / INVALID COMMAND OPERATION CODE —
+#                               msc_blk_flush then answers 0 without a command; 1.57.12)
 #   +96   8B   vendor          (INQUIRY response bytes 8..15, ASCII)
 #   +104  16B  product         (INQUIRY response bytes 16..31, ASCII)
 #   +120  4B   revision        (INQUIRY response bytes 32..35, ASCII)
@@ -1669,7 +1671,13 @@ fn msc_read_capacity(slot_id, lun) {
 # Returns 1 on success (sense data decoded + printed), 0 if REQUEST
 # SENSE itself failed (transport still wedged). Prints:
 #   msc: slot N sense key=K ASC=A ASCQ=Q [label]
+# The decode also lands in msc_sense_key / _asc / _ascq (key 255 = no sense read) for a caller that acts on it
+# (msc_blk_flush, 1.57.12).
+var msc_sense_key = 255;
+var msc_sense_asc = 0;
+var msc_sense_ascq = 0;
 fn msc_request_sense(slot_id, lun) {
+    msc_sense_key = 255;
     var row = msc_row_addr(slot_id);
     if (load8(row + 68) == 0) { return 0; }        # endpoints not ready
 
@@ -1701,6 +1709,9 @@ fn msc_request_sense(slot_id, lun) {
     var key  = load8(dk + 2) & 0x0F;
     var asc  = load8(dk + 12);
     var ascq = load8(dk + 13);
+    msc_sense_key = key;
+    msc_sense_asc = asc;
+    msc_sense_ascq = ascq;
 
     kprint("msc: slot ", 10);
     kprint_num(slot_id);
@@ -1980,12 +1991,18 @@ fn msc_blk_write(sector, buf) {
 # SCSI SYNCHRONIZE CACHE(10) (SBC-3 §5.20, opcode 0x35) — commit the
 # device's volatile write cache. No data phase (dCBWDataTransferLength=0);
 # all-zero operands (LBA 0, blocks 0) = flush the whole device, IMMED=0 so
-# the good CSW means the flush is done. A cacheless stick may answer CHECK
-# CONDITION / INVALID OPCODE — msc_scsi_exec surfaces that as failure (-1),
-# benign (nothing to flush). 1.33.5 fsync barrier (flush-cache-prior-art.md
+# the good CSW means the flush is done. 1.33.5 fsync barrier (flush-cache-prior-art.md
 # § 2.3). cdb_buf[16]: a CBW carries a 16-byte CDB field and the zero loop below writes all 16. (This line
 # used to call the [2] allocation 'proven'. It was a 14-byte overrun at every site; see the banner above
 # msc_test_unit_ready.)
+# ⛔ 1.57.12 — A CACHELESS STICK ANSWERS CHECK CONDITION, AND THAT IS SUCCESS. This comment called it "benign
+# (nothing to flush)" since 1.33.5 while the code returned -1 for it, so every caller that checks the result
+# (modeset_latch, and the ZFS commit, which fails the txg on a flush error) failed on such a device. The rule is
+# flush-cache-prior-art.md § "Accept" and Linux's drivers/scsi/sd.c sd_sync_cache (ASC 0x20, invalid command: "this is
+# no error here"); OpenZFS treats a flush ENOTSUP as success and stops flushing that vdev (zio.c:4978-4987,
+# vdev_nowritecache). So: on a failed command with the transport intact (CSW status 1), REQUEST SENSE; ILLEGAL
+# REQUEST (5) + INVALID COMMAND OPERATION CODE (ASC 0x20) means the device has no SYNCHRONIZE CACHE — row +86 records
+# it, and this flush and every later one answers 0 without a command. Any other failure is still -1.
 fn msc_blk_flush() {
     if (msc_first_slot == 0) { return 0 - 1; }
     var row = msc_row_addr(msc_first_slot);
@@ -2002,7 +2019,15 @@ fn msc_blk_flush() {
     msc_cdb_canary_note(&cdb_canary, cdb_p, 6);   # site 6 = flush
     #endif
     msc_spin_lock();
+    if (load8(row + 86) == 1) { msc_spin_unlock(); return 0; }
     var fe = msc_scsi_exec(msc_first_slot, 0, cdb_p, 10, 0, 0, 0, 1);
+    if (fe == 0 && load8(row + 69) == 0) {
+        if (msc_request_sense(msc_first_slot, 0) == 1 && msc_sense_key == 5 && msc_sense_asc == 0x20) {
+            store8(row + 86, 1);
+            fe = 1;
+            kprintln("msc: SYNCHRONIZE CACHE unsupported - no write cache, flushes are no-ops", 71);
+        }
+    }
     msc_spin_unlock();
     if (fe == 0) { return 0 - 1; }
     return 0;
@@ -2099,7 +2124,7 @@ fn msc_register_block_dev() {
         kprint_num(blk_bytes);
         kprintln("B; NVMe primary)", 16);
         # Bite (G) — see block.cyr blk_mark_registered comment.
-        blk_mark_registered(BLK_USB_MS);
+        blk_mark_registered(BLK_USB_MS, blk_bytes);   # 1.57.12: with its LBA size (validated above)
         return 0;
     }
     if (blk_active == BLK_AHCI) {
@@ -2111,7 +2136,7 @@ fn msc_register_block_dev() {
         kprint_num(blk_bytes);
         kprintln("B; AHCI primary)", 16);
         # Bite (G) — see block.cyr blk_mark_registered comment.
-        blk_mark_registered(BLK_USB_MS);
+        blk_mark_registered(BLK_USB_MS, blk_bytes);   # 1.57.12: with its LBA size (validated above)
         return 0;
     }
     if (blk_register_usb_ms(sectors, blk_bytes) == 0) {
@@ -2168,17 +2193,35 @@ fn msc_read_demo() {
 
 #ifdef MSC_RW_DEMO
 # WRITE(10) demo — gated, same safety posture as AHCI_RW_DEMO. Writes
-# a "MSC-OK!\0" sentinel to LBA 100, reads it back, byte-compares.
-# Default off in production iron builds: LBA 100 on a USB stick may
-# sit inside a filesystem; sentinel writes there are recoverable but
-# not the right default posture. Enable for QEMU smoke or known-
-# scratch USB devices via `MSC_RW_DEMO=1 ./scripts/build.sh`.
+# a "MSC-OK!\0" sentinel, reads it back, byte-compares, then writes the
+# original sector back and verifies it (1.57.12 — it was LBA 100, never
+# put back: on an MBR stick that is the post-MBR gap a GRUB core.img
+# lives in). The LBA: one outside the GPT and every partition on a GPT
+# stick (gpt_scratch_lbas_on), LBA 100 on a stick with no GPT, none at all
+# on a GPT stick with no such LBA. Default off in production iron builds.
+# Enable for QEMU smoke or known-scratch USB devices via
+# `MSC_RW_DEMO=1 ./scripts/build.sh`.
 fn msc_write_demo() {
     if (msc_first_slot == 0) { return 0; }
     var row = msc_row_addr(msc_first_slot);
     if (load8(row + 85) == 0) { return 0; }
     var blk_bytes = load32(row + 80);
     if (blk_bytes != 512) { return 0; }
+    var lba = 100;
+    var mw = gpt_scratch_lbas_on(BLK_USB_MS, 1);
+    if (mw == (0 - 1)) {
+        kprintln("msc: demo write skipped -- no LBA outside the stick's GPT and partitions", 72);
+        return 0;
+    }
+    if (mw >= 0) { lba = mw; }
+    var sbuf = pmm_alloc();
+    if (sbuf == 0) { return 0; }
+    if (vmm_is_mapped(sbuf) == 0) { vmm_map(sbuf, sbuf, 0x83); }
+    iommu_register_dma(sbuf);
+    if (msc_read_lba(msc_first_slot, 0, lba, 1, sbuf) == 0) {
+        kprintln("msc: READ(10) of the demo LBA failed -- demo write skipped", 58);
+        return 0;
+    }
     var wbuf = pmm_alloc();
     if (wbuf == 0) { return 0; }
     if (vmm_is_mapped(wbuf) == 0) { vmm_map(wbuf, wbuf, 0x83); }
@@ -2188,29 +2231,37 @@ fn msc_write_demo() {
     var j = 0;
     var wk = dma_kva(wbuf);          # 1.57.8: CPU access through the direct map; wbuf/rbuf (phys) go in TRBs
     while (j < 8) { store8(wk + j, load8(sentinel + j)); j = j + 1; }
-    if (msc_write_lba(msc_first_slot, 0, 100, 1, wbuf) == 0) {
-        kprintln("msc: WRITE(10) LBA100 failed", 28);
-        return 0;
-    }
     var rbuf = pmm_alloc();
     if (rbuf == 0) { return 0; }
     if (vmm_is_mapped(rbuf) == 0) { vmm_map(rbuf, rbuf, 0x83); }
     iommu_register_dma(rbuf);
     xhci_zero_page(rbuf);
-    if (msc_read_lba(msc_first_slot, 0, 100, 1, rbuf) == 0) {
-        kprintln("msc: READ(10) LBA100 readback failed", 36);
-        return 0;
+    var ok = 1;
+    if (msc_write_lba(msc_first_slot, 0, lba, 1, wbuf) == 0) {
+        kprint("msc: WRITE(10) LBA", 18); kprint_num(lba); kprintln(" failed", 7);
+        ok = 0;
     }
-    var k = 0;
-    while (k < 8) {
-        if (load8(dma_kva(rbuf) + k) != load8(wk + k)) {
-            kprintln("msc: LBA100 write-then-read round-trip MISMATCH", 47);
-            return 0;
+    if (ok == 1) {
+        if (msc_read_lba(msc_first_slot, 0, lba, 1, rbuf) == 0) {
+            kprint("msc: READ(10) LBA", 17); kprint_num(lba); kprintln(" readback failed", 16);
+            ok = 0;
         }
-        k = k + 1;
     }
-    kprintln("msc: LBA100 write-then-read round-trip PASS", 43);
-    return 1;
+    if (ok == 1) { if (memeq(dma_kva(rbuf), wk, 8) == 0) { ok = 0; } }
+    # Put the original back and verify it (1.57.12), whatever the round-trip did.
+    var rs_ok = msc_write_lba(msc_first_slot, 0, lba, 1, sbuf);
+    if (rs_ok != 0) { rs_ok = msc_read_lba(msc_first_slot, 0, lba, 1, rbuf); }
+    if (rs_ok != 0) { if (memeq(dma_kva(rbuf), dma_kva(sbuf), 512) == 0) { rs_ok = 0; } }
+    if (rs_ok == 0) {
+        kprint("msc: demo restore of LBA ", 25); kprint_num(lba);
+        kprintln(" FAILED -- the stick keeps the sentinel", 39);
+        ok = 0;
+    }
+    kprint("msc: LBA", 8);
+    kprint_num(lba);
+    if (ok == 1) { kprintln(" write-then-read round-trip PASS (original restored)", 52); }
+    else { kprintln(" write-then-read round-trip FAIL", 32); }
+    return ok;
 }
 #endif
 

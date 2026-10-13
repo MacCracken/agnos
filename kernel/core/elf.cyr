@@ -14,8 +14,8 @@
 # overwrite the phdrs CPU A is still parsing (TOCTOU on the segment bounds). Per-CPU: 512 u64 (4 KB) per
 # CPU × 4; cpu c at byte c*4096. pcpu_cpu() cpu_count<2 fast path = single-core byte-identical.
 # R4/R6 (1.57.7): never add a wq_* call inside this buffer's live span (per-CPU scratch — docs/architecture/blocking-waits.md R4).
-var pcpu_elf_hdr_buf[2048];
-fn elf_hdr_buf_base() { return &pcpu_elf_hdr_buf + pcpu_cpu() * 4096; }
+var pcpu_elf_hdr_buf = 0xFFFFA00800000000;   # ROOM slot 8 (1.57.12, core/room.cyr) — 4 x 4 KB; its poison until room_init
+fn elf_hdr_buf_base() { return pcpu_elf_hdr_buf + pcpu_cpu() * 4096; }
 
 var ELF_STACK_SIZE = 0x200000;      # the mapped stack page — also the string-region ceiling
 var ELF_INIT_BLOCK = 0x1FF000;      # SysV control block: [argc][argv..][NULL][envp..][NULL][auxv]

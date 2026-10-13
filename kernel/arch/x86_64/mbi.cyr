@@ -5,8 +5,8 @@
 # struct** (magic `0x41474E4F = 'AGNO'`, layout in
 # agnosticos/docs/development/path-c-sovereign-uefi.md § Handoff).
 # The ELF64 boot shim (boot_shim.cyr `#ifdef ELF64_KERNEL` branch)
-# preserves RDI through its entire entry asm block (stack setup +
-# UART init touch RSP/RBP/RAX/RDX, not RDI). Immediately after the
+# preserves RDI through its entry (stack setup + UART init touch
+# RAX/RCX/RSP/RBP/RDX — RCX since 1.57.12's .bss stack load — not RDI). Immediately after the
 # shim, a top-level call to `boot_info_capture_rdi()` captures that
 # register into the kernel global `boot_info_ptr` (declared in
 # boot_data.cyr).
@@ -87,32 +87,31 @@ fn boot_info_capture_rdi(): i64 {
     return 0;
 }
 
-# ⭐ 1.57.7 (IMG-fix, review A3/B2) — IS REGION 1'S STACK SPAN FREE RAM IN THE MAP gnoboot HANDED OVER?
-# The BSP boot stack is live from the shim's FIRST instruction, before the kernel owns any memory, and
-# nothing reserves its window before that first push: pmm_init's 0-4 MB reservation is the kernel's own
-# bookkeeping, made long after. gnoboot pins only the kernel image (ET_EXEC AllocateAddress); it ALSO
-# allocates the /initramfs and /cmdline blobs with AllocateAnyPages (EfiLoaderData), and boot_info plus
-# the memory-map buffer are globals inside gnoboot's own image (EfiLoaderCode), loaded wherever the
-# firmware put BOOTX64.EFI. So the stack window's safety rests on the FIRMWARE leaving it free — on OVMF
-# it is conventional RAM, as the old [0x370000, 0x380000) window was, but on iron nothing had ever
-# looked. This makes it observable: every UEFI descriptor intersecting [BSP_BOOT_TOP - 64 KB,
-# BSP TSS.RSP0 top) = [0x3D0000, 0x400000) (1.57.11; [0x390000, 0x3C0000) before) — boot stack, guard gap, RSP0 window — must be a type that is
-# free once ExitBootServices returns (3 BootServicesCode, 4 BootServicesData, 7 Conventional), the
-# descriptors must cover the whole span (a hole is not RAM), and the map buffer itself must lie outside
-# it. Anything else (a loader blob, gnoboot's image, runtime/ACPI/reserved/MMIO) is a region the kernel
-# has been writing its stack over since the first push. It cannot be repaired here (the stack is already
-# in use); it is REPORTED, once, and the smokes deny the line (SMOKE_INVARIANT_DENY).
-# ⚠ bsw_lo / bsw_hi are read by scripts/check/image-layout-check.sh and must equal its CEIL and
-# BSP_RSP0_TOP — move them with the stack.
-# Returns 0 = the span is free RAM, 1 = it is not (bootstack_win_type / _start name the first offender;
-# type 0xFFFF = a hole or the map buffer itself), -1 = no usable map (nothing checked).
-var bootstack_win_rc = 0;
-var bootstack_win_type = 0;
-var bootstack_win_start = 0;
-fn bootstack_window_check(bi): i64 {
-    var bsw_lo = 0x3D0000;    # BSP boot stack bottom = BSP_BOOT_TOP - 64 KB (image-layout-check.sh CEIL)
-    var bsw_hi = 0x400000;    # BSP TSS.RSP0 top (gdt.cyr tss_kernel_stack; image-layout-check.sh BSP_RSP0_TOP)
+# ⭐ 1.57.12 — WHAT THE UEFI MAP gnoboot HANDED OVER SAYS ABOUT A PHYSICAL SPAN. Replaces 1.57.7's
+# bootstack_window_check (IMG-fix, review A3/B2), which asked one question about one fixed span — was
+# region 1's BSP stack window [0x3D0000, 0x400000) ([0x390000, 0x3C0000) at 1.57.7-1.57.10) free RAM? —
+# because the boot stack was live there from the shim's first push and nothing reserved it. 1.57.12
+# vacated that window (the boot stack is the image's .bss array bsp_boot_stack, the BSP's RSP0 is
+# region-7 slot 0), so main.cyr asks two questions of this one function:
+#   mode 1 — PINNED BY THE LOADER: every descriptor meeting [lo, hi) is EfiLoaderCode (type 1), the type
+#     gnoboot allocates the kernel image as (one AllocatePages(AllocateAddress) at 0x100000 sized from
+#     p_memsz; it zeroes every [p_filesz, p_memsz) gap). Asked of the image span, which holds the boot stack.
+#   mode 0 — FREE RAM ONCE ExitBootServices RETURNS: types 3 (BootServicesCode), 4 (BootServicesData) and
+#     7 (Conventional). Asked of region 7 [0xE00000, 0x1000000), the home of EVERY kernel stack —
+#     per-process, kthread, IST1, and the per-CPU RSP0 slots (the BSP's included). pmm_init keeps the
+#     kernel's own allocator out of it, but only the firmware decides whether it was RAM to begin with,
+#     and nothing looked before 1.57.12.
+# In both modes the descriptors must COVER the span (a hole is not RAM) and the map buffer itself must lie
+# outside it. Returns 0 = OK, 1 = not (uefi_span_type / uefi_span_start name the first offender; type
+# 0xFFFF = a hole, or the map buffer inside the span), -1 = no usable map (nothing checked). It repairs
+# nothing (both spans are in use by the time it runs); it REPORTS, once, and the smokes deny the violation
+# lines (SMOKE_INVARIANT_DENY). On iron this is the one part of the layout QEMU cannot exercise.
+# ⚠ main.cyr's region-7 bounds and OK line are read by scripts/check/image-layout-check.sh (its region-7 map).
+var uefi_span_type = 0;
+var uefi_span_start = 0;
+fn uefi_span_check(bi, lo, hi, mode): i64 {
     if (bi == 0) { return 0 - 1; }
+    if (hi <= lo) { return 0 - 1; }
     var mm = load64(bi + 0x28);
     var count = load32(bi + 0x30);
     var entsize = load32(bi + 0x34);
@@ -120,10 +119,10 @@ fn bootstack_window_check(bi): i64 {
     if (count == 0) { return 0 - 1; }
     if (entsize < 40) { return 0 - 1; }       # EFI_MEMORY_DESCRIPTOR is >= 40 bytes (as pmm_probe_memmap)
     if (count > 4096) { return 0 - 1; }       # a garbage count: pmm_probe_memmap's hazard, not walked here
-    if (mm < bsw_hi) {
-        if (mm + count * entsize > bsw_lo) {
-            bootstack_win_type = 0xFFFF;
-            bootstack_win_start = mm;
+    if (mm < hi) {
+        if (mm + count * entsize > lo) {
+            uefi_span_type = 0xFFFF;
+            uefi_span_start = mm;
             return 1;
         }
     }
@@ -134,31 +133,69 @@ fn bootstack_window_check(bi): i64 {
         var etype = load32(e);
         var pstart = load64(e + 8);
         var pend = pstart + load64(e + 24) * 4096;
-        if (pend > bsw_lo) {
-            if (pstart < bsw_hi) {
+        if (pend > lo) {
+            if (pstart < hi) {
                 var ok = 0;
-                if (etype == 7) { ok = 1; }
-                if (etype == 3) { ok = 1; }
-                if (etype == 4) { ok = 1; }
+                if (mode == 0) {
+                    if (etype == 7) { ok = 1; }
+                    if (etype == 3) { ok = 1; }
+                    if (etype == 4) { ok = 1; }
+                }
+                if (mode == 1) {
+                    if (etype == 1) { ok = 1; }
+                }
                 if (ok == 0) {
-                    bootstack_win_type = etype;
-                    bootstack_win_start = pstart;
+                    uefi_span_type = etype;
+                    uefi_span_start = pstart;
                     return 1;
                 }
                 var a = pstart;
-                if (a < bsw_lo) { a = bsw_lo; }
+                if (a < lo) { a = lo; }
                 var b = pend;
-                if (b > bsw_hi) { b = bsw_hi; }
+                if (b > hi) { b = hi; }
                 covered = covered + (b - a);
             }
         }
         i = i + 1;
     }
-    if (covered < bsw_hi - bsw_lo) {
-        bootstack_win_type = 0xFFFF;
-        bootstack_win_start = bsw_lo;
+    if (covered < hi - lo) {
+        uefi_span_type = 0xFFFF;
+        uefi_span_start = lo;
         return 1;
     }
     return 0;
+}
+
+# ⭐ 1.57.12 — the kernel image's span [0x100000, LOAD end), read from the ELF header the loader put at the
+# image base: the image is ONE flat PT_LOAD, file offset 0 -> VA = phys 0x100000 (image-layout-check.sh
+# asserts that shape at build time), so its header is the image's first bytes. LOAD end = p_vaddr + p_memsz,
+# the whole range gnoboot allocated (memsz includes .bss and cycc's zero-fill). Returns 0 when the header is
+# not the one expected, and the caller then checks nothing.
+fn kernel_image_end(): i64 {
+    var kb = 0x100000;
+    if ((load32(kb) & 0xFFFFFFFF) != 0x464C457F) { return 0; }   # "\x7FELF"
+    var phoff = load64(kb + 0x20);
+    var phentsize = load16(kb + 0x36) & 0xFFFF;
+    var phnum = load16(kb + 0x38) & 0xFFFF;
+    if (phoff > 0x1000) { return 0; }
+    if (phentsize < 56) { return 0; }
+    if (phnum > 16) { return 0; }
+    var i = 0;
+    while (i < phnum) {
+        var ph = kb + phoff + i * phentsize;
+        if ((load32(ph) & 0xFFFFFFFF) == 1) {                    # PT_LOAD
+            if (load64(ph + 0x10) != kb) { return 0; }           # p_vaddr: the flat image starts at its header
+            return kb + load64(ph + 0x28);                       # + p_memsz
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# 1.57.12 — an address inside the CALLER's stack: this function's own local, one frame below it. main.cyr
+# uses it to show that kmain is running on bsp_boot_stack (top-level `var`s are globals, so it needs a frame).
+fn bsp_rsp_sample(): i64 {
+    var brs = 0;
+    return &brs;
 }
 #endif

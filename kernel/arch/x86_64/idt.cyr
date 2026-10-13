@@ -149,6 +149,28 @@ fn exc_df_report(frame, cr2) {
     return 0;
 }
 
+# ⭐ 1.57.12 (ROOM) — A CPL0 #PF SAYS SO ON COM1 TOO. Until here a kernel-mode page fault stamped CMOS 0x54-0x66 and
+# the framebuffer bar, and halted with NOTHING on serial: the same silent wedge the #DF report above ended for #DF. The
+# ROOM carve-out (core/room.cyr) needs the line: a moved array used before room_init dereferences its POISON pointer
+# (upper half, PML4[0x140], unmapped under every CR3) and must fail BY NAME — room_pf_say decodes the slot from CR2.
+# Called by the vector-14 stub (below) only when the fault is at CPL0: a CPL3 #PF took fault_kill_current, which never
+# returns. Runs on the faulting stack (#PF has no IST: the CPU just pushed the frame there, so it is live), IF=0,
+# under the faulting CR3 — kernel text, .rodata and COM1 port I/O are reachable under every CR3 this kernel builds.
+# LOCK-FREE: serial_putc only, never kprint (the faulting CPU may hold the console or klug lock). Returns; the stub
+# then paints the bar and halts, exactly as before.
+# frame = the #PF frame: [0] error code · [8] RIP · [16] CS · [24] RFLAGS · [32] RSP · [40] SS. cr2 = the faulting VA.
+fn exc_pf_report(frame, cr2) {
+    serial_print("PANIC: kernel page fault (#PF at CPL0) rip=", 43);
+    exc_serial_hex(load64(frame + 8));
+    serial_print(" cr2=", 5);
+    exc_serial_hex(cr2);
+    serial_print(" err=", 5);
+    exc_serial_hex(load64(frame));
+    serial_println(" -- halting", 11);
+    room_pf_say(cr2);
+    return 0;
+}
+
 fn exc_handlers_init() {
     var base = &exc_stub;
     var nvec = 9;   # 1.56.18: +v=0 (#DE) — was 8; 1.53.x B3 added v=19 (#XM)
@@ -626,6 +648,34 @@ fn exc_handlers_init() {
             store8(stub + tail + 20, 0xFF); store8(stub + tail + 21, 0xD0);
             tail = tail + 22;
         }
+        # ⭐ 1.57.12 (ROOM): #PF (v == 14) calls exc_pf_report (above) the same way — 22 bytes, emitted AFTER the CPL3
+        # kill block, whose `jne +24` lands exactly here for a CPL0 fault (a CPL3 fault never comes back). The stub has
+        # done no push/pop, so rsp IS the #PF frame. REGISTER CONTRACT: in — rsp = the #PF frame; out — rdi = frame,
+        # rsi = CR2 (the SysV args); clobbers rax and every caller-saved register (the frame is abandoned: the canary
+        # below halts). The `and rsp, ~15` is the #DF block's: the call's alignment then never depends on the frame.
+        if (v == 14) {
+            var pfr = &exc_pf_report;
+            # mov rdi, rsp                  48 89 E7   (arg1: the #PF frame)
+            store8(stub + tail + 0, 0x48); store8(stub + tail + 1, 0x89); store8(stub + tail + 2, 0xE7);
+            # mov rsi, cr2                  0F 20 D6   (arg2: CR2)
+            store8(stub + tail + 3, 0x0F); store8(stub + tail + 4, 0x20); store8(stub + tail + 5, 0xD6);
+            # and rsp, ~15                  48 83 E4 F0   (16-align the call)
+            store8(stub + tail + 6, 0x48); store8(stub + tail + 7, 0x83);
+            store8(stub + tail + 8, 0xE4); store8(stub + tail + 9, 0xF0);
+            # mov rax, imm64(&exc_pf_report)  48 B8 <addr64 LE>
+            store8(stub + tail + 10, 0x48); store8(stub + tail + 11, 0xB8);
+            store8(stub + tail + 12, pfr & 0xFF);
+            store8(stub + tail + 13, (pfr >> 8) & 0xFF);
+            store8(stub + tail + 14, (pfr >> 16) & 0xFF);
+            store8(stub + tail + 15, (pfr >> 24) & 0xFF);
+            store8(stub + tail + 16, (pfr >> 32) & 0xFF);
+            store8(stub + tail + 17, (pfr >> 40) & 0xFF);
+            store8(stub + tail + 18, (pfr >> 48) & 0xFF);
+            store8(stub + tail + 19, (pfr >> 56) & 0xFF);
+            # call rax                      FF D0
+            store8(stub + tail + 20, 0xFF); store8(stub + tail + 21, 0xD0);
+            tail = tail + 22;
+        }
         # 1.45.16 fault canary — paint a wide FB bar before halting so a CAUGHT CPU
         # exception is visible ON THE FRAMEBUFFER (photo-readable), not only in CMOS
         # 0x54/0x55. The CMOS stamp(s) above are written FIRST, so even if this FB
@@ -679,7 +729,7 @@ fn exc_handlers_init() {
         off = off + 3 + tail + 35;
     }
     # ⚠ 1.57.6 (S3-fix): nine stubs share exc_stub[160] = 1280 B (boot_data.cyr) and nothing ever checked the sum
-    # (1154 B before the #DF call, 1176 B with it; 1210 B with the 1.57.7 clac + the #GP CPL guard). Too late to prevent — the stores above already ran — but loud.
+    # (1154 B before the #DF call, 1176 B with it; 1210 B with the 1.57.7 clac + the #GP CPL guard; 1232 B with the 1.57.12 #PF report call). Too late to prevent — the stores above already ran — but loud.
     if (off > 1280) { serial_println("exc: STUB OVERFLOWED exc_stub (1280 B) -- the fault stubs overran their buffer", 78); }
     return 0;
 }

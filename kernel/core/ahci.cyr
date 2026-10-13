@@ -895,6 +895,7 @@ fn ahci_poll_slot0(port_off, budget_us) {
     var psp = 0;
     while (ahci_expired(pt0, psp, budget_us) == 0) {
         psp = psp + 1;
+        kirqw_point();                   # 1.57.12 B11: an interrupt window when the ZFS commit on this CPU opted in (io.cyr)
         var pci = ahci_mmio_read32(port_off + AHCI_P_CI);
         if ((ahci_mmio_read32(port_off + AHCI_P_IS) & AHCI_IS_ERR) != 0) { return 0; }
         if ((pci & 0x01) == 0) { return 1; }
@@ -1383,13 +1384,16 @@ fn ahci_issue_nodata_inner(port, opcode) {
 #                         (mirrors `nvme_rw_demo`'s read half). Safe on
 #                         any drive: no writes, no side effects.
 #   - ahci_write_demo() — compile-gated behind `AHCI_RW_DEMO`. Sentinel
-#                         write to LBA 5 + read-back verify. DEFAULT OFF
+#                         write + read-back verify, the LBA saved first
+#                         and written back after (verified). DEFAULT OFF
 #                         in production; enable via `AHCI_RW_DEMO=1
 #                         ./scripts/build.sh` for QEMU smoke or scratch
-#                         drives. LBA 5 of a GPT disk sits inside the
-#                         partition-entry array — landing a sentinel
-#                         there is recoverable but not the right default
-#                         posture.
+#                         drives. 1.57.12: on a GPT disk the LBA is one
+#                         outside the GPT and every partition
+#                         (gpt_scratch_lbas_on), and main.cyr runs this
+#                         after ahci_register_block_dev for that pick;
+#                         it was LBA 5 — GPT entries 12-15 — and was
+#                         never put back.
 #
 # Single port only (lowest-numbered initialized).
 
@@ -1435,6 +1439,23 @@ fn ahci_read_demo() {
 }
 
 #ifdef AHCI_RW_DEMO
+var ahci_demo_save = 0;     # 1.57.12: the PHYS page the demo LBA's original 512 bytes are saved in
+
+# Put the demo LBA back from ahci_demo_save, re-read it into ahci_demo_buf and compare: 1 = the disk holds the
+# original again, 0 = it does not (a FAIL line names the LBA). nvme_ktest_restore's pattern.
+fn ahci_demo_restore(port, lba) {
+    var ar_ok = ahci_write_lba(port, lba, 1, ahci_demo_save);
+    if (ar_ok == 1) { ar_ok = ahci_read_lba(port, lba, 1, ahci_demo_buf); }
+    if (ar_ok == 1) { if (memeq(dma_kva(ahci_demo_buf), dma_kva(ahci_demo_save), 512) == 0) { ar_ok = 0; } }
+    if (ar_ok != 1) {
+        kprint("ahci: demo restore of LBA ", 26);
+        kprint_num(lba);
+        kprintln(" FAILED -- the disk keeps the sentinel", 38);
+        return 0;
+    }
+    return 1;
+}
+
 fn ahci_write_demo() {
     if (ahci_present == 0) { return 0; }
     var port = 0;
@@ -1455,10 +1476,33 @@ fn ahci_write_demo() {
         if (ahci_demo_buf2 == 0) { return 0; }
         iommu_register_dma(ahci_demo_buf2); # 1.57.10 (VTD)
     }
+    if (ahci_demo_save == 0) {
+        ahci_demo_save = pmm_alloc();
+        if (ahci_demo_save == 0) { return 0; }
+        iommu_register_dma(ahci_demo_save); # 1.57.10 (VTD)
+    }
     var dk = dma_kva(ahci_demo_buf);
     var dk2 = dma_kva(ahci_demo_buf2);
 
-    # 1. Sentinel at LBA 5: "AHCI-OK!" (8 bytes), rest zero.
+    # 0. The LBA (1.57.12): outside the GPT and every partition on a GPT disk; LBA 5 on a disk with none; nothing at
+    # all on a GPT disk with no such LBA. Saved before the sentinel goes down.
+    var lba = 5;
+    var aw = gpt_scratch_lbas_on(BLK_AHCI, 1);
+    if (aw == (0 - 1)) {
+        kprintln("ahci: demo write skipped -- no LBA outside the disk's GPT and partitions", 72);
+        return 0;
+    }
+    if (aw >= 0) { lba = aw; }
+    if (ahci_read_lba(port, lba, 1, ahci_demo_save) == 0) {
+        kprint("ahci: port ", 11);
+        kprint_num(port);
+        kprint(" LBA", 4);
+        kprint_num(lba);
+        kprintln(" save read FAILED -- demo write skipped", 39);
+        return 0;
+    }
+
+    # 1. Sentinel: "AHCI-OK!" (8 bytes), rest zero.
     var i = 0;
     while (i < 512) { store8(dk2 + i, 0); i = i + 1; }
     store8(dk2 + 0, 65);    # A
@@ -1470,20 +1514,26 @@ fn ahci_write_demo() {
     store8(dk2 + 6, 75);    # K
     store8(dk2 + 7, 33);    # !
 
-    if (ahci_write_lba(port, 5, 1, ahci_demo_buf2) == 0) {
+    if (ahci_write_lba(port, lba, 1, ahci_demo_buf2) == 0) {
         kprint("ahci: port ", 11);
         kprint_num(port);
-        kprintln(" LBA5 write FAILED", 18);
+        kprint(" LBA", 4);
+        kprint_num(lba);
+        kprintln(" write FAILED", 13);
+        ahci_demo_restore(port, lba);
         return 0;
     }
 
     # 2. Read back into a fresh buffer.
     i = 0;
     while (i < 512) { store8(dk + i, 0); i = i + 1; }
-    if (ahci_read_lba(port, 5, 1, ahci_demo_buf) == 0) {
+    if (ahci_read_lba(port, lba, 1, ahci_demo_buf) == 0) {
         kprint("ahci: port ", 11);
         kprint_num(port);
-        kprintln(" LBA5 read-back FAILED", 22);
+        kprint(" LBA", 4);
+        kprint_num(lba);
+        kprintln(" read-back FAILED", 17);
+        ahci_demo_restore(port, lba);
         return 0;
     }
 
@@ -1498,12 +1548,17 @@ fn ahci_write_demo() {
     if (load8(dk + 6) != 75) { ok = 0; }
     if (load8(dk + 7) != 33) { ok = 0; }
 
+    # 4. Put the original back, verified (1.57.12: the sentinel used to stay on the disk).
+    if (ahci_demo_restore(port, lba) == 0) { ok = 0; }
+
     kprint("ahci: port ", 11);
     kprint_num(port);
+    kprint(" LBA", 4);
+    kprint_num(lba);
     if (ok == 1) {
-        kprintln(" LBA5 write-then-read round-trip PASS", 37);
+        kprintln(" write-then-read round-trip PASS (original restored)", 52);
     } else {
-        kprintln(" LBA5 write-then-read round-trip FAIL", 37);
+        kprintln(" write-then-read round-trip FAIL", 32);
     }
     return ok;
 }
@@ -1670,7 +1725,7 @@ fn ahci_register_block_dev() {
         # even though it's not blk_active. Filesystem-layer probes
         # (ext2 multi-backend mount) iterate on blk_registered, not
         # blk_active.
-        blk_mark_registered(BLK_AHCI);
+        blk_mark_registered(BLK_AHCI, 512);   # 1.57.12: with its LBA size (the driver is 512 B-only, as below)
         # CMOS kcp = 0x50 (AHCI block-layer registration done, secondary path).
         asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x50; 0xE6; 0x71; }
         return 1;

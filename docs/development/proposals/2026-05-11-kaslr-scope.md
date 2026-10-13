@@ -93,3 +93,20 @@ Estimated diff: 100–200 lines across `pmm.cyr`, `heap.cyr`, `io.cyr`, `boot_sh
 - [ ] Approve the `MEMORY_ISOLATION_TEST` seeded-reproducibility hatch.
 
 Promote this proposal to an ADR if approved — it carries enough "why not the other thing" content to be worth durable capture.
+
+## Addendum (1.57.12) — what reviving full-binary relocation must re-derive
+
+Option A shipped at 1.47.4 (gnoboot slides an ET_DYN kernel to `0x2000000 + k·0x200000` via RDRAND and passes the base
+at `boot_info + 0x70`; `scripts/smoke/kaslr-smoke.sh`, not a sweep row), but a `CYRIUS_PIE=1` build is refused today by
+`build.sh`'s entry-point check (`WARN: bad entry point (got 0xa8, expected 0x1000a8)` — measured by the 1.57.12 review
+on the 1.57.11 tree too), so the kernel that ships is ET_EXEC at `0x100000`. The 1.57.12 BSP-stack move
+(`docs/architecture/kernel-stacks-and-preemption.md` § Region 1) leans on that fixed base in three places; a revived
+PIE kernel must re-derive each:
+
+1. **The boot stack's CR3 coverage.** `bsp_boot_stack` is image `.bss`, so it slides with the image into
+   `[32 MB, 254 MB)` — PD[16..126], which a user PT_LOAD in `[0x400000, 0x10000000)` overrides in its own CR3. kmain is
+   switched out on this stack under per-process CR3s, so it must stay mapped there (PD[0..1] guaranteed that).
+2. **Gate 34's decode** (`scripts/check/image-layout-check.sh` (2) and (8)) expects `movabs` immediates; a PIE build
+   emits `lea rax, [rip+…]` / `lea rcx, [rip+…]` / `mov [rcx], rax` for `bsp_boot_stack_lo = &bsp_boot_stack;`.
+3. **`mbi.cyr` `kernel_image_end`** reads the ELF header at the fixed `0x100000`, so a slid kernel prints the
+   `boot: BSP boot stack unchecked` line (not in `SMOKE_INVARIANT_DENY`) — read the base from `boot_info + 0x70`.

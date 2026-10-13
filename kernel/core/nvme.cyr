@@ -360,6 +360,7 @@ var nvme_ctrl_mdts  = 0;   # Max data transfer (raw — bytes = 1 << (MDTS + 12 
 # IDENTIFY NAMESPACE (NSID=1) cached fields
 var nvme_ns1_nsze     = 0;   # Logical block count
 var nvme_ns1_lba_bytes = 0;  # Bytes per LBA (typically 512 or 4096)
+var nvme_ns1_wp = 0;         # 1 = NSATTR bit 0: the namespace is write protected (1.57.12; blk_readonly_on)
 
 # Admin doorbell addresses. NVMe 1.4 §3.1.31:
 #   SQ y Tail DB at MMIO + 0x1000 + (2*y) * (4 << DSTRD)
@@ -635,6 +636,7 @@ fn nvme_identify_ns(nsid) {
 
     nvme_ns1_nsze      = nsze;
     nvme_ns1_lba_bytes = lba_bytes;
+    nvme_ns1_wp        = load8(nvme_ident_kva + 99) & 1;   # NSATTR (byte 99) bit 0: write protected
 
     kprint("nvme: ns", 8);
     kprint_num(nsid);
@@ -837,6 +839,7 @@ fn nvme_io_poll_n(expected_cid, budget_us) {
             if (spins >= budget_us * 64) { break; }
         }
         spins = spins + 1;
+        kirqw_point();                   # 1.57.12 B11: an interrupt window when the ZFS commit on this CPU opted in (io.cyr)
         var dw3 = load32(nvme_iocq_kva + nvme_iocq_head * NVME_CQE_SIZE + 12);
         if (((dw3 >> 16) & 0x01) == nvme_iocq_phase) {
             nvme_iocq_head = nvme_iocq_head + 1;
@@ -1015,22 +1018,42 @@ fn nvme_write_sectors(lba, count, buf) {
 #     first 8 bytes of whatever the namespace holds. Safe on any disk
 #     including real iron's partitioned NVMe SSD — pure read, no LBA
 #     side effect.
-#   - **`#ifdef KTEST`**: LBA 5 single-LBA write-then-read + LBA 20-27
-#     multi-LBA write-then-read. **DESTRUCTIVE** — overwrites those
-#     LBAs with test patterns. Iron archaemenid's NVMe SSD has GPT
-#     metadata in LBAs 1-33 (LBA 1 = primary GPT header, LBAs 2-33 =
-#     partition entries); writing test patterns there would corrupt
-#     the partition table. KTEST-gated so the default iron build is
-#     read-only against the disk; QEMU validation builds with
-#     `KTEST=1` and keeps the write-receipt path live (target there
-#     is a fresh `nvme0.img` where the LBAs hold zeros to start, no
-#     destruction). Same gate idiom as the boot-time self-tests in
-#     `kernel/core/main.cyr` (1.31.0 cycle-open pattern).
+#   - **`#ifdef KTEST`** (nvme_ktest_rw, 1.57.12 — main.cyr calls it
+#     right after nvme_register_block_dev): a single-LBA write-then-read
+#     + a multi-LBA (one page of LBAs) write-then-read. These WRITE the
+#     disk. KTEST-gated so the default build is read-only against the
+#     disk; since 1.57.12 each round-trip also SAVES the LBAs it is
+#     about to overwrite and writes them back afterwards, verified
+#     (nvme_ktest_restore), and on a GPT disk the LBAs are a window
+#     OUTSIDE the GPT and every partition (gpt_scratch_lbas_on) — they
+#     were LBA 5 and LBAs 20.., inside the primary entry array (LBAs
+#     2-33 at 512 B), on every GPT disk the QEMU harnesses boot. Until
+#     1.57.12 the comment here said the target was "a fresh nvme0.img
+#     where the LBAs hold zeros", which stopped being true when the
+#     harnesses moved to gnoboot GPT disks: every KTEST boot printed 33
+#     garbage partitions. Same gate idiom as the boot-time self-tests
+#     in `kernel/core/main.cyr` (1.31.0 cycle-open pattern).
 #
 # PRP2 and PRP-list paths are coded but not boot-demo'd. Removed in
 # a later cycle once block_dev dispatch wraps the R/W path and these
 # become dead demonstration code; for now they're the only direct
 # Phase 4 receipt.
+#ifdef KTEST
+# Put `count` LBAs from `lba` back from the PHYS page `save` (its CPU pointer `save_kva`), then re-read them through
+# the scratch page and compare `bytes` (= count x the LBA size, <= 4096): 1 = the disk holds the original bytes again,
+# 0 = it does not (a FAIL line names the LBA). nvme_rw_demo's KTEST round-trips call it after each write.
+fn nvme_ktest_restore(lba, count, save, save_kva, bytes) {
+    var kr_ok = nvme_write_sectors(lba, count, save);
+    if (kr_ok == 1) { kr_ok = nvme_read_sectors(lba, count, nvme_read_scratch); }
+    if (kr_ok == 1) { if (memeq(nvme_scratch_kva, save_kva, bytes) == 0) { kr_ok = 0; } }
+    if (kr_ok == 0) {
+        kprint("nvme: KTEST restore of LBA ", 27);
+        kprint_num(lba);
+        kprintln(" FAILED -- the disk keeps the test pattern", 42);
+    }
+    return kr_ok;
+}
+#endif
 fn nvme_rw_demo() {
     if (nvme_io_ready == 0) { return 0; }
 
@@ -1045,8 +1068,51 @@ fn nvme_rw_demo() {
     # CMOS kcp = 0x45 (first NVMe read completed — Phase 3 carry-forward)
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x45; 0xE6; 0x71; }
 
-    #ifdef KTEST
-    # --- 2. LBA 5 write-then-read round-trip (DESTRUCTIVE, gated) ---
+    return 1;
+}
+
+#ifdef KTEST
+# ⛔ 1.57.12 — THE ROUND-TRIPS PUT BACK WHAT THEY OVERWRITE, AND ON A GPT DISK THEY WRITE OUTSIDE THE GPT. They wrote
+# LBA 5 and LBAs 20.., which on a 512 B-LBA GPT disk are INSIDE the partition-entry array (LBAs 2-33, 4 entries of
+# 128 B per LBA: LBA 5 = entries 12-15, LBAs 20-27 = entries 72-103), and ran BEFORE gpt_init, so every KTEST boot from
+# an NVMe GPT disk — scripts/ktest.sh boots one — read "partitions (34 active / 128 reserved)" with arr-CRC-BAD: the
+# ESP plus 33 garbage entries ([12] = "CYRIUS!!", [72..103] = the ramp). Each test now reads the original LBAs into a
+# page of its own first, and afterwards writes them back and re-reads them through the scratch page
+# (nvme_ktest_restore): a restore that does not verify prints a FAIL line. And the LBAs are a window
+# gpt_scratch_lbas_on picks after the primary entry array and outside every partition (gpt.cyr), so a crash between
+# a write and its restore leaves the GPT and the filesystems intact; this runs after nvme_register_block_dev because
+# that pick reads the disk through the block layer. A disk with no GPT keeps LBA 5 and LBAs 20.. (saved, restored);
+# a GPT disk with no such window skips the writes, by name.
+# The multi-LBA count is ONE PAGE of LBAs (8 at 512 B, 1 at 4 KB): the fixed 8 asked a 4K-LBA namespace for 32 KB of
+# DMA through the one 4 KB scratch page.
+fn nvme_ktest_rw() {
+    if (nvme_io_ready == 0) { return 0; }
+    var nv_lb = nvme_ns1_lba_bytes;
+    if (nv_lb < 512) { kprintln("nvme: KTEST write round-trips skipped -- LBA size outside [512, 4096]", 69); return 1; }
+    if (nv_lb > 4096) { kprintln("nvme: KTEST write round-trips skipped -- LBA size outside [512, 4096]", 69); return 1; }
+    var nv_n = 4096 / nv_lb;                 # LBAs in one 4 KB page
+    var nv_l1 = 5;                           # a disk with no GPT: the historical LBAs (saved and restored)
+    var nv_l2 = 20;
+    var nv_w = gpt_scratch_lbas_on(BLK_NVME, 1 + nv_n);
+    if (nv_w == (0 - 1)) {
+        kprintln("nvme: KTEST write round-trips skipped -- no LBAs outside the disk's GPT and partitions", 86);
+        return 1;
+    }
+    kprint("nvme: KTEST round-trip LBAs ", 28);
+    if (nv_w >= 0) { nv_l1 = nv_w; nv_l2 = nv_w + 1; }
+    kprint_num(nv_l1);
+    kprint(" and ", 5);
+    kprint_num(nv_l2);
+    kprint("..", 2);
+    kprint_num(nv_l2 + nv_n - 1);
+    if (nv_w >= 0) { kprintln(" (outside the GPT and every partition)", 38); }
+    else { kprintln(" (no GPT on LBA 1)", 18); }
+    var nv_save = pmm_alloc();               # PHYS — PRP values only; nv_save_kva is its CPU pointer
+    if (nv_save == 0) { kprintln("nvme: KTEST write round-trips skipped -- no page to save the LBAs in", 68); return 1; }
+    var nv_save_kva = dma_kva(nv_save);
+
+    # --- 2. single-LBA write-then-read round-trip at nv_l1 (saved first, restored after) ---
+    if (nvme_read_lba(nv_l1, nv_save) == 0) { pmm_free(nv_save); return 0; }
     nvme_zero_page(nvme_read_scratch);
     # Pattern "CYRIUS!!" = bytes 67, 89, 82, 73, 85, 83, 33, 33.
     store8(nvme_scratch_kva + 0, 67);
@@ -1057,9 +1123,9 @@ fn nvme_rw_demo() {
     store8(nvme_scratch_kva + 5, 83);
     store8(nvme_scratch_kva + 6, 33);
     store8(nvme_scratch_kva + 7, 33);
-    if (nvme_write_lba(5, nvme_read_scratch) == 0) { return 0; }
+    if (nvme_write_lba(nv_l1, nvme_read_scratch) == 0) { nvme_ktest_restore(nv_l1, 1, nv_save, nv_save_kva, nv_lb); pmm_free(nv_save); return 0; }
     nvme_zero_page(nvme_read_scratch);
-    if (nvme_read_lba(5, nvme_read_scratch) == 0) { return 0; }
+    if (nvme_read_lba(nv_l1, nvme_read_scratch) == 0) { nvme_ktest_restore(nv_l1, 1, nv_save, nv_save_kva, nv_lb); pmm_free(nv_save); return 0; }
     var single_ok = 1;
     if (load8(nvme_scratch_kva + 0) != 67) { single_ok = 0; }
     if (load8(nvme_scratch_kva + 1) != 89) { single_ok = 0; }
@@ -1069,41 +1135,51 @@ fn nvme_rw_demo() {
     if (load8(nvme_scratch_kva + 5) != 83) { single_ok = 0; }
     if (load8(nvme_scratch_kva + 6) != 33) { single_ok = 0; }
     if (load8(nvme_scratch_kva + 7) != 33) { single_ok = 0; }
+    if (nvme_ktest_restore(nv_l1, 1, nv_save, nv_save_kva, nv_lb) == 0) { single_ok = 0; }
+    kprint("nvme: LBA", 9);
+    kprint_num(nv_l1);
     if (single_ok == 1) {
-        kprintln("nvme: LBA5 single-LBA write-then-read PASS", 42);
+        kprintln(" single-LBA write-then-read PASS (original restored)", 52);
         # CMOS kcp = 0x46 (single-LBA write round-trip)
+        # asm contract: no inputs/outputs; clobbers al only (outb 0x70 <- 0x50, outb 0x71 <- 0x46).
         asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x46; 0xE6; 0x71; }
     }
     if (single_ok == 0) {
-        kprintln("nvme: LBA5 single-LBA write-then-read FAIL", 42);
+        kprintln(" single-LBA write-then-read FAIL", 32);
     }
 
-    # --- 3. LBA 20-27 multi-LBA (DESTRUCTIVE, gated) ---
+    # --- 3. multi-LBA at nv_l2.., one page of LBAs (saved first, restored after) ---
+    if (nvme_read_sectors(nv_l2, nv_n, nv_save) == 0) { pmm_free(nv_save); return 0; }
     # Fill the 4 KB scratch with a ramp: byte[i] = i & 0xFF.
     for (var j = 0; j < 4096; j = j + 1) {
         store8(nvme_scratch_kva + j, j & 0xFF);
     }
-    if (nvme_write_sectors(20, 8, nvme_read_scratch) == 0) { return 0; }
+    if (nvme_write_sectors(nv_l2, nv_n, nvme_read_scratch) == 0) { nvme_ktest_restore(nv_l2, nv_n, nv_save, nv_save_kva, 4096); pmm_free(nv_save); return 0; }
     nvme_zero_page(nvme_read_scratch);
-    if (nvme_read_sectors(20, 8, nvme_read_scratch) == 0) { return 0; }
+    if (nvme_read_sectors(nv_l2, nv_n, nvme_read_scratch) == 0) { nvme_ktest_restore(nv_l2, nv_n, nv_save, nv_save_kva, 4096); pmm_free(nv_save); return 0; }
     var multi_ok = 1;
     for (var k = 0; k < 4096; k = k + 1) {
         if (load8(nvme_scratch_kva + k) != (k & 0xFF)) {
             multi_ok = 0;
         }
     }
+    if (nvme_ktest_restore(nv_l2, nv_n, nv_save, nv_save_kva, 4096) == 0) { multi_ok = 0; }
+    pmm_free(nv_save);
+    kprint("nvme: LBA", 9);
+    kprint_num(nv_l2);
+    kprint(" multi-LBA(", 11);
+    kprint_num(nv_n);
     if (multi_ok == 1) {
-        kprintln("nvme: LBA20-27 multi-LBA(8) round-trip PASS", 43);
-        # CMOS kcp = 0x47 (multi-LBA round-trip)
+        kprintln(") round-trip PASS (original restored)", 37);
+        # CMOS kcp = 0x47 (multi-LBA round-trip). Contract as above (0x71 <- 0x47).
         asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x47; 0xE6; 0x71; }
     }
     if (multi_ok == 0) {
-        kprintln("nvme: LBA20-27 multi-LBA(8) round-trip FAIL", 43);
+        kprintln(") round-trip FAIL", 17);
     }
-    #endif
-
     return 1;
 }
+#endif
 
 # --- Phase 5: block_dev dispatch wrappers ---
 #
@@ -1278,7 +1354,8 @@ fn nvme_blk_write_sectors(start, count, buf) {
 # the production-bound backend.
 fn nvme_register_block_dev() {
     if (nvme_io_ready == 0) { return 0; }
-    blk_register_nvme(nvme_ns1_nsze, nvme_ns1_lba_bytes);
+    # 1.57.12: a refusal (blk_lba_bytes_ok, which prints why) is not a registration — this printed "registered" anyway.
+    if (blk_register_nvme(nvme_ns1_nsze, nvme_ns1_lba_bytes) != 0) { return 0; }
     kprint("nvme: registered as block_dev (", 31);
     kprint_num(nvme_ns1_nsze);
     kprint(" LBAs x ", 8);

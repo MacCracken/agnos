@@ -267,6 +267,10 @@ fn exfat_chain_overrun(steps) {
 # candidate, 0 otherwise.
 fn exfat_probe_backend(tag, part_lba) {
     if (blk_is_registered(tag) == 0) { return 0; }
+    # ⛔ 1.57.12 — 512 B-LBA backends only, checked before the first read: exfat_blk_read moves one device LBA into a
+    # 512 B buffer (exfat_boot_buf / _dir_buf / _fat_buf are `var X[64]`), so on a 4096 B-LBA backend this probe wrote
+    # 3,584 bytes past exfat_boot_buf at every boot (fatfs_probe_backend has the same note).
+    if (blk_lba_bytes_for(tag) != 512) { return 0; }
     exfat_backend = tag;
     exfat_partition_first_lba = part_lba;
     exfat_fat_buf_sec = 0 - 1;                       # invalidate FAT cache
@@ -346,7 +350,7 @@ fn exfat_init() {
         if (gpt_present == 1) {
             if (tag == blk_active) {
                 for (var pi = 0; pi < gpt_partition_count; pi = pi + 1) {
-                    if (gpt_partition_info(pi) != 1) { continue; }
+                    if (gpt_used_info(pi) != 1) { continue; }   # 1.57.12: the pi-th USED entry (gpt.cyr gpt_used_dir)
                     var is_cand = 0;
                     var is_esp = 0;
                     if (gpt_q_type_lo == GPT_TYPE_ESP_LO) {
@@ -506,7 +510,7 @@ fn exfat_ascii_up(c) {
 # to themselves (identity)"; any other entry E at code-unit index i means
 # upcase(i) = E. Capped at 8 KB (the standard mkfs table is 5836 B); a larger
 # table falls back to ASCII upcase. § 2.
-var exfat_upcase_buf[1024];                            # 8 KB
+var exfat_upcase_buf = 0xFFFFA00B00000000;             # 8 KB — ROOM slot 11 (1.57.12, core/room.cyr); its poison until room_init
 var exfat_upcase_loaded = 0;
 
 # Load the up-case table into exfat_upcase_buf via its FAT chain. Called at
@@ -534,7 +538,7 @@ fn exfat_load_upcase() {
                 var chunk = 512;
                 if (remaining < chunk) { chunk = remaining; }
                 var i = 0;
-                while (i < chunk) { store8(&exfat_upcase_buf + off + i, load8(&exfat_data_buf + i)); i = i + 1; }
+                while (i < chunk) { store8(exfat_upcase_buf + off + i, load8(&exfat_data_buf + i)); i = i + 1; }
                 off = off + chunk;
                 remaining = remaining - chunk;
                 s = s + 1;
@@ -561,11 +565,11 @@ fn exfat_upcase(v) {
     var p = 0;                                          # byte offset into the table
     var len = exfat_upcase_length;
     while (p + 1 < len) {
-        var e = load8(&exfat_upcase_buf + p) | (load8(&exfat_upcase_buf + p + 1) << 8);
+        var e = load8(exfat_upcase_buf + p) | (load8(exfat_upcase_buf + p + 1) << 8);
         p = p + 2;
         if (e == 0xFFFF) {
             if (p + 1 >= len) { return v; }
-            var n = load8(&exfat_upcase_buf + p) | (load8(&exfat_upcase_buf + p + 1) << 8);
+            var n = load8(exfat_upcase_buf + p) | (load8(exfat_upcase_buf + p + 1) << 8);
             p = p + 2;
             if (v >= i) { if (v < i + n) { return v; } }   # identity run covers v
             i = i + n;

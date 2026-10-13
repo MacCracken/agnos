@@ -1,4 +1,4 @@
-# zfsx — ring-3 exerciser for the read-only ZFS mount (agnos 1.57.11).
+# zfsx — ring-3 exerciser for the ZFS mount (agnos 1.57.11 read-only; 1.57.12 B5 writes).
 #
 # ⭐ IT RUNS FROM ZFS. scripts/tool/zfs-fixture.sh stages this binary into the pool's `agnostank/payload`
 # dataset, and scripts/harness/zfs-ring3-test.py types `/mnt/zfs/agnostank/payload/zfsx` at agnsh — so the
@@ -6,18 +6,96 @@
 # reports any exit code at all has proven exec-from-ZFS.
 # The fixture's contract (scripts/tool/zfs-fixture.sh recipe 1, pool `agnostank`, mounted at /agnostank):
 # hello.txt = "hello from zfs\n" with a hard link hello-link.txt, sym-short -> hello.txt, dir3000/f0000..f2999,
-# big.bin (6 MiB). ⚠ THE EXIT CODE IS THE RESULT: 95 = every clause held; 60..91 name the first one that broke
-# (scripts/harness/zfs-ring3-test.py carries the table).
+# big.bin (6 MiB). ⚠ THE EXIT CODE IS THE RESULT: 95 = every clause held; 60..91 and 100..161 name the first one that
+# broke (scripts/harness/zfs-ring3-test.py carries the table).
+# 1.57.12 B5 (design § a.4, § i.1): the pool is read-write now, but agnostank/zpl4 is not (ZPL 4 — the ROOT dataset, which
+# has agnostank@snap1, was not either until B9): the write verbs are refused THERE (81-85, 111, 112), and on a read-only
+# fd (88). The
+# writes (100-110) go to agnostank/custom (mounted at /somewhere/else) — custom.txt, written, extended, written past its
+# end (a hole), read back, AO_TRUNC'd and written again: FIVE txgs (policy A: one per write#1 and per truncating open),
+# with bytes from agnos-gen-1 (zx_gen — scripts/smoke/lib/zfs-expect.py's generator), so the harness predicts the file
+# exactly and OpenZFS verifies the pool after the run (lane main@ring3). 1.57.12 B6 (114-130): then it CREATES there —
+# mkdir b6, AO_CREAT | AO_EXCL b6/new.txt + 100 bytes, symlink#63 b6/sym -> new.txt (agnostank/custom holds the symlink
+# layout since fixture RECIPE 5; lstat / readlink / stat through it), AO_CREAT | AO_TRUNC b6/t.txt + 10 (a new name: not
+# truncated) — six more txgs, stat / getdents of what it made, and the refusals: an existing name, AO_EXCL, a symlink
+# whose target holds a NUL byte, one on the read-only root, a relative AO_CREAT path of 266 bytes (B6 review: it was
+# truncated to 254 and created). Every refused ZFS verb logs `zfs: <verb> refused (<why>)` — the harness holds the run
+# to that list, in order. 1.57.12 B8 (124, 126, 128, 148-149): what B6 refused there now SUCCEEDS — a symlink in
+# coff/kid (no symlink layout: a NEW SA layout, the LAYOUTS add) and a 50-byte name in b6 (its microzap UPGRADED to a fat
+# ZAP, so every later op in b6 — B7's links, renames, unlinks — works on a fat ZAP); getdents of the fat b6; a 255-byte
+# name (13 name chunks) created, stat'ed and unlinked, and the 50-byte one unlinked — five more txgs.
+# 1.57.12 B7 (131-145): then it REMOVES and RENAMES there — link#32 b6/new.txt -> new-link.txt (nlink 2), rename#31 b6/t.txt
+# -> t2.txt, the second name across directories (-> custom-hl.txt) and unlink#30 of it (nlink 1 again: new.txt keeps the
+# stale PARENT design § k.15 names, OpenZFS's own state), a directory made, moved across (b6/d -> b7d) and rmdir#10'd, the
+# symlink b6/sym unlinked, an fd across the unlink of t2.txt and the create (b6/r.txt) that may take its number back —
+# read / write / SEEK_END -1 each time (D11) — ten more txgs; and the refusals: unlink of a directory, rmdir of a
+# non-empty one and of a file, rename and link across datasets, a directory under itself, link of a directory, link and
+# rmdir on the read-only root, rmdir of a mount point; (B7 review, 146-147) a NEW name holding a NUL byte — rename#31 to
+# "new.txt\0x" (its chunk's C string would be new.txt's own) and link#32 to "\0lnk" (a chunk that reads as free).
+# 1.57.12 B9 (150-155 — its own track's 148-153, renumbered past B8's 148-149 at the merge): then it writes in the
+# SNAPSHOTTED ROOT, agnostank (@snap1) — every block its ops kill there is the snapshot's, so it goes to the root's
+# deadlist and is never freed: an RMW of tiny.bin, rand-1m.bin AO_TRUNC'd and written (eight records and their L1),
+# hello.txt's EMBEDDED block rewritten and read back under hello-link.txt, unlink of deep/a/b/c/d/e/leaf.txt, the
+# emptied e moved to deep/e9, mkdir deep/z9 + a new file of 20 bytes — nine txgs.
+# 1.57.12 B11 (156-161): POLICY B — a write is coalesced per fd and durable at close / sync#12 / exit (design § b.2 D1 (b)).
+# On agnostank/custom: b11.bin created and 8 x 64 KiB written through ONE fd — one txg, at its close — and read back;
+# 2,000 bytes written through fd A and read through fd B before A is closed (commit-before-observe: B sees them, 157);
+# an extend through A seen by stat#33 (158); a write through a third fd committed by sync#12 (159, which answers 0);
+# b11big.bin, 2 MiB through one fd whose CLOSE commits it — the per-CPU tick counters of sysinfo#35 read around that
+# close and printed (`zfsx: b11 close ticks ...`: a CPU that held interrupts off for the commit missed its ticks — the
+# harness reports them, design k.126 (B11)); and b11exit.bin, written and NEVER CLOSED: the exit's fd-table teardown
+# commits it (160 is the clause before it; the pool is the proof). Nine txgs.
 
 # ⚠ The large buffers live at MODULE scope (8 B per element): an agnos exec gets ~12 KB of usable init stack
 # (roadmap TRUE), so a 64 KiB local would fault before the first syscall.
 var zx_gd[512];       # 4 KiB getdents buffer
 var zx_page[512];     # 4 KiB = 64 readdir_at records
 var zx_big[8192];     # 64 KiB read buffer
+var zx_wb[256];       # 2 KiB write buffer (agnos-gen-1 bytes)
+var zx_wc[256];       # 2 KiB read-back buffer
 
 fn zx_len(s) { var n = 0; while (load8(s + n) != 0) { n = n + 1; } return n; }
+# Print s (NUL-terminated) and then v in decimal (v >= 0) to fd 1. 0.
+fn zx_putn(s, v) {
+    syscall(1, 1, s, zx_len(s));
+    var d[24];
+    var i = 23;
+    store8(&d + i, 0);
+    if (v == 0) {
+        i = i - 1;
+        store8(&d + i, 48);
+    }
+    while (v > 0) {
+        i = i - 1;
+        store8(&d + i, 48 + v % 10);
+        v = v / 10;
+    }
+    syscall(1, 1, &d + i, 23 - i);
+    return 0;
+}
 fn zx_eq(a, b, n) { var i = 0; while (i < n) { if (load8(a + i) != load8(b + i)) { return 0; } i = i + 1; } return 1; }
+fn zx_zero(a, n) { var i = 0; while (i < n) { if (load8(a + i) != 0) { return 0; } i = i + 1; } return 1; }
 fn zx_open(p, fl) { return syscall(7, p, zx_len(p), fl, 0); }
+# agnos-gen-1 (scripts/smoke/lib/zfs-expect.py `gen`; the kernel's zfs_wenc.cyr zfs_gen_fill): bytes [off, off + n) of the
+# stream of seed s — FNV-1a-64 of s, splitmix64's (x >> 3)-th word, its little-endian byte x & 7.
+fn zx_word(h, i) {
+    var z = h + (i + 1) * 0x9E3779B97F4A7C15;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB;
+    return z ^ (z >> 31);
+}
+fn zx_gen(s, off, dst, n) {
+    var h = 0xCBF29CE484222325;
+    var i = 0;
+    while (load8(s + i) != 0) { h = (h ^ load8(s + i)) * 0x100000001B3; i = i + 1; }
+    var k = 0;
+    while (k < n) {
+        var x = off + k;
+        store8(dst + k, (zx_word(h, x >> 3) >> ((x & 7) * 8)) & 0xFF);
+        k = k + 1;
+    }
+    return 0;
+}
 
 fn zx_main(): i64 {
     var hp = "/mnt/zfs/agnostank/hello.txt";
@@ -32,7 +110,7 @@ fn zx_main(): i64 {
     if (syscall(58, fd, 6, 0) != 6) { return 63; }
     if (syscall(5, fd, &buf, 4) != 4 || zx_eq(&buf, "from", 4) == 0) { return 64; }
     if (syscall(58, fd, 0, 2) != 15) { return 65; }
-    # ---- a ZFS fd is not writable ----
+    # ---- a read-only fd is not writable (the root itself is writable since B9) ----
     if (syscall(1, fd, "x", 1) >= 0) { return 88; }
     syscall(6, fd);
     # ---- stat#33 / lstat#102 / readlink#70 ----
@@ -104,13 +182,14 @@ fn zx_main(): i64 {
     if (syscall(103, rp, zx_len(rp), &sf) != 0) { return 78; }
     if (load64(&sf) != 4096) { return 79; }                  # ashift=12
     if (load64(&sf + 8) <= 0 || load64(&sf + 16) > load64(&sf + 8) || load64(&sf + 24) > load64(&sf + 16)) { return 80; }
-    # ---- every write verb is refused on a read-only pool ----
-    var np = "/mnt/zfs/agnostank/new-file";
+    # ---- every write verb is refused on a READ-ONLY DATASET (agnostank/zpl4: ZPL 4 — the root was until B9) ----
+    var np = "/mnt/zfs/agnostank/zpl4/new-file";
+    var op4 = "/mnt/zfs/agnostank/zpl4/old.txt";
     if (zx_open(np, 0x100) >= 0) { return 81; }              # AO_CREAT
-    if (zx_open(hp, 0x1) >= 0) { return 82; }                # AO_WRONLY
+    if (zx_open(op4, 0x1) >= 0) { return 82; }               # AO_WRONLY
     if (syscall(9, np, zx_len(np)) == 0) { return 83; }      # mkdir
-    if (syscall(30, hp, zx_len(hp)) == 0) { return 84; }     # unlink
-    if (syscall(31, hp, zx_len(hp), np, zx_len(np)) == 0) { return 85; }   # rename
+    if (syscall(30, op4, zx_len(op4)) == 0) { return 84; }   # unlink
+    if (syscall(31, op4, zx_len(op4), np, zx_len(np)) == 0) { return 85; }   # rename
     # ---- mountlist#104 reports the pool as backend 4 at /mnt/zfs ----
     var ml[640];
     var mn = syscall(104, &ml, 8);
@@ -133,6 +212,323 @@ fn zx_main(): i64 {
     while (rr > 0) { got = got + rr; rr = syscall(5, bfd, &zx_big, 65536); }
     syscall(6, bfd);
     if (rr < 0 || got != want || want != 6291456) { return 87; }
+    # ---- 1.57.12 B5: writes on a WRITABLE dataset (agnostank/custom at /somewhere/else) — one txg each ----
+    var cp = "/mnt/zfs/somewhere/else/custom.txt";
+    var wfd = zx_open(cp, 2);                                # AO_RDWR
+    if (wfd < 0) { return 100; }
+    zx_gen("zfsx/w1", 0, &zx_wb, 40);
+    if (syscall(1, wfd, &zx_wb, 40) != 40) { return 101; }   # over the 18 bytes it held, and past them
+    if (syscall(58, wfd, 0, 2) != 40) { return 102; }        # SEEK_END: the size from the SA, after the extend
+    if (syscall(58, wfd, 0, 0) != 0) { return 103; }
+    if (syscall(5, wfd, &zx_wc, 64) != 40 || zx_eq(&zx_wc, &zx_wb, 40) == 0) { return 103; }
+    zx_gen("zfsx/w2", 40, &zx_wb, 1000);
+    if (syscall(1, wfd, &zx_wb, 1000) != 1000) { return 104; }   # at the position the read left: 40
+    if (syscall(58, wfd, 0, 2) != 1040) { return 104; }
+    if (syscall(58, wfd, 300000, 0) != 300000) { return 105; }  # past the end: a hole up to it
+    zx_gen("zfsx/w3", 300000, &zx_wb, 100);
+    if (syscall(1, wfd, &zx_wb, 100) != 100) { return 105; }
+    if (syscall(58, wfd, 0, 2) != 300100) { return 105; }
+    if (syscall(58, wfd, 200000, 0) != 200000) { return 106; }
+    if (syscall(5, wfd, &zx_big, 4096) != 4096 || zx_zero(&zx_big, 4096) == 0) { return 106; }   # the hole
+    if (syscall(58, wfd, 1000, 0) != 1000) { return 106; }
+    zx_gen("zfsx/w2", 1000, &zx_wb, 40);
+    if (syscall(5, wfd, &zx_wc, 40) != 40 || zx_eq(&zx_wc, &zx_wb, 40) == 0) { return 106; }
+    if (syscall(58, wfd, 300000, 0) != 300000) { return 106; }
+    zx_gen("zfsx/w3", 300000, &zx_wb, 100);
+    if (syscall(5, wfd, &zx_wc, 200) != 100 || zx_eq(&zx_wc, &zx_wb, 100) == 0) { return 106; }
+    syscall(6, wfd);
+    if (syscall(33, cp, zx_len(cp), &st) != 0 || load64(&st + 16) != 300100) { return 107; }
+    var tfd = zx_open(cp, 0x201);                            # AO_WRONLY | AO_TRUNC: its own txg
+    if (tfd < 0) { return 108; }
+    if (syscall(58, tfd, 0, 2) != 0) { return 108; }
+    zx_gen("zfsx/w4", 0, &zx_wb, 10);
+    if (syscall(1, tfd, &zx_wb, 10) != 10) { return 109; }
+    syscall(6, tfd);
+    if (syscall(33, cp, zx_len(cp), &st) != 0 || load64(&st + 16) != 10) { return 109; }
+    var rfd = zx_open(cp, 0);                                # a read-only fd on a writable dataset
+    if (rfd < 0) { return 110; }
+    if (syscall(1, rfd, "x", 1) >= 0) { return 110; }
+    if (syscall(5, rfd, &zx_wc, 64) != 10 || zx_eq(&zx_wc, &zx_wb, 10) == 0) { return 110; }
+    syscall(6, rfd);
+    if (zx_open("/mnt/zfs/agnostank/zpl4/old.txt", 2) >= 0) { return 111; }   # ZPL 4: a read-only dataset
+    if (zx_open("/mnt/zfs/agnostank/zpl4/old-rand.bin", 0x201) >= 0) { return 112; }   # AO_TRUNC on ZPL 4
+    var zfd = zx_open("/mnt/zfs/agnostank/zstd/text-1m.txt", 2);
+    if (zfd < 0) { return 113; }
+    if (syscall(1, zfd, "x", 1) >= 0) { return 113; }        # a partial overwrite of a zstd block: refused
+    syscall(6, zfd);
+    # ---- 1.57.12 B6: create / mkdir / symlink on the writable agnostank/custom — one txg each ----
+    var dd = "/mnt/zfs/somewhere/else/b6";
+    if (syscall(9, dd, zx_len(dd)) != 0) { return 114; }     # mkdir#9: a 512-byte microzap directory
+    if (syscall(9, dd, zx_len(dd)) == 0) { return 115; }     # mkdir of a name that exists: -1
+    var nf = "/mnt/zfs/somewhere/else/b6/new.txt";
+    var cfd = zx_open(nf, 0x2102);                           # AO_CREAT | AO_EXCL | AO_RDWR: created, writable
+    if (cfd < 0) { return 116; }
+    zx_gen("zfsx/c1", 0, &zx_wb, 100);
+    if (syscall(1, cfd, &zx_wb, 100) != 100) { return 117; }
+    syscall(6, cfd);
+    if (zx_open(nf, 0x2102) >= 0) { return 118; }            # AO_EXCL on the name just made: -1
+    var efd = zx_open(nf, 0x100);                            # AO_CREAT on an existing file opens it
+    if (efd < 0) { return 119; }
+    if (syscall(5, efd, &zx_wc, 200) != 100 || zx_eq(&zx_wc, &zx_wb, 100) == 0) { return 119; }
+    syscall(6, efd);
+    if (syscall(33, nf, zx_len(nf), &st) != 0 || load64(&st) != 0x81A4 || load64(&st + 8) != 1 || load64(&st + 16) != 100) { return 120; }
+    if (syscall(33, dd, zx_len(dd), &st) != 0 || load64(&st) != 0x41ED || load64(&st + 8) != 2 || load64(&st + 16) != 3) { return 121; }
+    # B6 review (finding 7): symlink#63 SUCCEEDS from ring 3 — agnostank/custom holds the symlink SA layout since fixture
+    # RECIPE 5 (one FreeBSD symlink, custom-link) — and is read back three ways
+    var sl = "/mnt/zfs/somewhere/else/b6/sym";
+    if (syscall(63, "new.txt", 7, sl, zx_len(sl)) != 0) { return 122; }
+    if (syscall(102, sl, zx_len(sl), &st) != 0 || load64(&st) != 0xA1ED || load64(&st + 8) != 1 || load64(&st + 16) != 7) { return 127; }
+    if (syscall(70, sl, zx_len(sl), &buf, 64) != 7 || zx_eq(&buf, "new.txt", 7) == 0) { return 127; }
+    if (syscall(33, sl, zx_len(sl), &st) != 0 || load64(&st + 16) != 100) { return 127; }   # followed: new.txt
+    var ksl = "/mnt/zfs/agnostank/coff/kid/b6sym";
+    if (syscall(63, "kid.txt", 7, ksl, zx_len(ksl)) != 0) { return 128; }   # (B8) coff/kid had no symlink layout: a LAYOUTS add
+    if (syscall(70, ksl, zx_len(ksl), &buf, 64) != 7 || zx_eq(&buf, "kid.txt", 7) == 0) { return 128; }
+    var zsl = "/mnt/zfs/somewhere/else/b6/nul";
+    var nt[8];
+    var ni = 0;
+    while (ni < 7) { store8(&nt + ni, load8("new.txt" + ni)); ni = ni + 1; }
+    store8(&nt + 3, 0);                                      # "new\0txt"
+    if (syscall(63, &nt, 7, zsl, zx_len(zsl)) == 0) { return 129; }  # a target holding a NUL byte
+    var rsl = "/mnt/zfs/agnostank/zpl4/b6sym";
+    if (syscall(63, "old.txt", 7, rsl, zx_len(rsl)) == 0) { return 123; }   # a read-only dataset (ZPL 4)
+    var lng = "/mnt/zfs/somewhere/else/b6/a-name-of-fifty-bytes-past-the-microzap-limit-nnnn";
+    var lfd = zx_open(lng, 0x102);                           # (B8) a 50-byte name: b6's microzap UPGRADED to a fat ZAP
+    if (lfd < 0) { return 124; }
+    syscall(6, lfd);
+    if (syscall(33, lng, zx_len(lng), &st) != 0 || load64(&st) != 0x81A4) { return 124; }
+    # B6 review (finding 6): a RELATIVE name of 255+ bytes is refused — open#7 copied 254 of them and created the
+    # TRUNCATED name. 26 + 100 x "./" + 40 = 266 bytes; its first 254 end in a 28-byte name that must not appear.
+    var rel = &zx_wc;
+    var rl = 0;
+    var rp0 = "mnt/zfs/somewhere/else/b6/";
+    while (rl < 26) { store8(rel + rl, load8(rp0 + rl)); rl = rl + 1; }
+    while (rl < 226) { store8(rel + rl, 46); store8(rel + rl + 1, 47); rl = rl + 2; }
+    var rp1 = "relative-path-past-254-bytes-xxxxxxxxxxx";
+    var r1 = 0;
+    while (r1 < 40) { store8(rel + rl, load8(rp1 + r1)); rl = rl + 1; r1 = r1 + 1; }
+    store8(rel + rl, 0);
+    if (syscall(7, rel, rl, 0x102, 0) >= 0) { return 130; }
+    var tr = "/mnt/zfs/somewhere/else/b6/relative-path-past-254-bytes";   # what the 254-byte copy named
+    if (syscall(33, tr, zx_len(tr), &st) == 0) { return 130; }
+    var tf = "/mnt/zfs/somewhere/else/b6/t.txt";
+    var nfd = zx_open(tf, 0x301);                            # AO_CREAT | AO_TRUNC | AO_WRONLY, a NEW name: not truncated
+    if (nfd < 0) { return 125; }
+    if (syscall(1, nfd, &zx_wb, 10) != 10) { return 125; }
+    syscall(6, nfd);
+    var gfd = zx_open(dd, 0x800);
+    if (gfd < 0) { return 126; }
+    var gn = 0;
+    var gg = syscall(29, gfd, &zx_gd, 4096);
+    while (gg > 0) {
+        var go = 0;
+        while (go < gg) {
+            var grl = load16(&zx_gd + go);
+            if (grl < 8) { return 126; }
+            gn = gn + 1;
+            go = go + grl;
+        }
+        gg = syscall(29, gfd, &zx_gd, 4096);
+    }
+    syscall(6, gfd);
+    if (gn != 6) { return 126; }                             # ".", "..", new.txt, sym, the 50-byte name, t.txt — a fat ZAP's
+    # ---- 1.57.12 B8: a 255-byte name in the fat b6 (13 name chunks) — created, stat'ed, unlinked; then the 50-byte one ----
+    var l255 = &zx_wc;
+    var lp = 0;
+    var lpre = "/mnt/zfs/somewhere/else/b6/";
+    while (lp < 27) { store8(l255 + lp, load8(lpre + lp)); lp = lp + 1; }
+    while (lp < 27 + 255) { store8(l255 + lp, 90); lp = lp + 1; }
+    store8(l255 + lp, 0);
+    var l5fd = zx_open(l255, 0x2102);
+    if (l5fd < 0) { return 148; }
+    syscall(6, l5fd);
+    if (syscall(33, l255, lp, &st) != 0 || load64(&st) != 0x81A4) { return 148; }
+    if (syscall(30, l255, lp) != 0 || syscall(33, l255, lp, &st) == 0) { return 149; }
+    if (syscall(30, lng, zx_len(lng)) != 0 || syscall(33, lng, zx_len(lng), &st) == 0) { return 149; }
+    # ---- 1.57.12 B7: link / rename / unlink / rmdir on agnostank/custom — one txg each ----
+    var ln1 = "/mnt/zfs/somewhere/else/b6/new-link.txt";
+    if (syscall(32, nf, zx_len(nf), ln1, zx_len(ln1)) != 0) { return 131; }   # link#32: a second name
+    if (syscall(33, nf, zx_len(nf), &st) != 0 || load64(&st + 8) != 2) { return 131; }
+    var t2 = "/mnt/zfs/somewhere/else/b6/t2.txt";
+    if (syscall(31, tf, zx_len(tf), t2, zx_len(t2)) != 0) { return 132; }     # rename#31 in one directory
+    if (syscall(33, t2, zx_len(t2), &st) != 0 || load64(&st + 16) != 10 || syscall(33, tf, zx_len(tf), &st) == 0) { return 132; }
+    var hl = "/mnt/zfs/somewhere/else/custom-hl.txt";
+    if (syscall(31, ln1, zx_len(ln1), hl, zx_len(hl)) != 0) { return 133; }   # across directories (a hard link's name)
+    if (syscall(30, hl, zx_len(hl)) != 0) { return 134; }    # unlink#30 of one of two names: the object stays
+    if (syscall(33, nf, zx_len(nf), &st) != 0 || load64(&st + 8) != 1 || load64(&st + 16) != 100) { return 134; }
+    var d1 = "/mnt/zfs/somewhere/else/b6/d";
+    var d2 = "/mnt/zfs/somewhere/else/b7d";
+    if (syscall(9, d1, zx_len(d1)) != 0 || syscall(31, d1, zx_len(d1), d2, zx_len(d2)) != 0) { return 135; }   # a directory moves
+    if (syscall(33, d2, zx_len(d2), &st) != 0 || load64(&st) != 0x41ED || syscall(33, d1, zx_len(d1), &st) == 0) { return 135; }
+    if (syscall(10, d2, zx_len(d2)) != 0 || syscall(33, d2, zx_len(d2), &st) == 0) { return 136; }   # rmdir#10
+    if (syscall(30, sl, zx_len(sl)) != 0 || syscall(102, sl, zx_len(sl), &st) == 0) { return 137; }   # a symlink
+    # D11 (design § k.41 / k.50): an fd across its object's unlink — and across the create that may reuse its number
+    var ofd = zx_open(t2, 2);
+    if (ofd < 0 || syscall(33, t2, zx_len(t2), &st) != 0) { return 138; }
+    if (syscall(30, t2, zx_len(t2)) != 0) { return 138; }
+    if (syscall(5, ofd, &zx_wc, 16) >= 0 || syscall(1, ofd, "x", 1) >= 0 || syscall(58, ofd, 0, 2) >= 0) { return 138; }
+    var rf = "/mnt/zfs/somewhere/else/b6/r.txt";
+    var nfd2 = zx_open(rf, 0x2102);
+    if (nfd2 < 0) { return 139; }
+    syscall(6, nfd2);
+    if (syscall(5, ofd, &zx_wc, 16) >= 0 || syscall(1, ofd, "x", 1) >= 0 || syscall(58, ofd, 0, 2) >= 0) { return 139; }
+    syscall(6, ofd);
+    if (syscall(33, rf, zx_len(rf), &st) != 0 || load64(&st + 8) != 1) { return 139; }
+    # every removal verb refused where it must be
+    if (syscall(30, dd, zx_len(dd)) == 0) { return 140; }    # unlink of a directory (EPERM: rmdir)
+    if (syscall(10, dd, zx_len(dd)) == 0) { return 140; }    # rmdir of a non-empty directory (ENOTEMPTY)
+    if (syscall(10, nf, zx_len(nf)) == 0) { return 140; }    # rmdir of a file (ENOTDIR)
+    var kx = "/mnt/zfs/agnostank/coff/kid/moved.txt";
+    if (syscall(31, cp, zx_len(cp), kx, zx_len(kx)) == 0) { return 141; }   # rename across datasets (EXDEV)
+    if (syscall(32, cp, zx_len(cp), kx, zx_len(kx)) == 0) { return 141; }   # link across datasets (EXDEV)
+    var sub = "/mnt/zfs/somewhere/else/b6/sub";
+    if (syscall(31, dd, zx_len(dd), sub, zx_len(sub)) == 0) { return 142; }  # a directory under itself (EINVAL)
+    var dl = "/mnt/zfs/somewhere/else/b6-link";
+    if (syscall(32, dd, zx_len(dd), dl, zx_len(dl)) == 0) { return 142; }    # link of a directory (EPERM)
+    var rlk = "/mnt/zfs/agnostank/zpl4/old-l2.txt";
+    if (syscall(32, op4, zx_len(op4), rlk, zx_len(rlk)) == 0) { return 143; }  # link on a read-only dataset (ZPL 4)
+    var rdp = "/mnt/zfs/agnostank/zpl4/olddir";
+    if (syscall(10, rdp, zx_len(rdp)) == 0) { return 143; }   # rmdir there
+    var mnt = "/mnt/zfs/somewhere/else";
+    if (syscall(10, mnt, zx_len(mnt)) == 0) { return 144; }   # a mount point
+    # B7 review (finding 1): a NEW name holding a NUL byte. rename#31 b6/r.txt -> "b6/new.txt\0x": absent to the lookup
+    # (a micro entry matches only its own length), but the chunk would keep the C string "new.txt" beside new.txt's own,
+    # one hash | cd — OpenZFS's mzap_open VERIFYs on the pair. link#32 b6/new.txt -> "b6/\0lnk": a chunk whose name
+    # starts with NUL reads as FREE (the new name lost, the parent's SIZE counting a ghost).
+    var nb = &zx_wc;
+    var nbl = zx_len(nf);
+    var nk = 0;
+    while (nk < nbl) { store8(nb + nk, load8(nf + nk)); nk = nk + 1; }
+    store8(nb + nbl, 0);
+    store8(nb + nbl + 1, 120);                               # "/mnt/zfs/somewhere/else/b6/new.txt\0x"
+    if (syscall(31, rf, zx_len(rf), nb, nbl + 2) == 0) { return 146; }
+    var lb = &zx_wb;
+    var lbl = zx_len(dd);
+    nk = 0;
+    while (nk < lbl) { store8(lb + nk, load8(dd + nk)); nk = nk + 1; }
+    store8(lb + lbl, 47);
+    store8(lb + lbl + 1, 0);
+    store8(lb + lbl + 2, 108);
+    store8(lb + lbl + 3, 110);
+    store8(lb + lbl + 4, 107);                               # "/mnt/zfs/somewhere/else/b6/\0lnk"
+    if (syscall(32, nf, zx_len(nf), lb, lbl + 5) == 0) { return 147; }
+    var g2 = zx_open(dd, 0x800);
+    if (g2 < 0) { return 145; }
+    var gm = 0;
+    var gq = syscall(29, g2, &zx_gd, 4096);
+    while (gq > 0) {
+        var gw = 0;
+        while (gw < gq) {
+            var gl = load16(&zx_gd + gw);
+            if (gl < 8) { return 145; }
+            gm = gm + 1;
+            gw = gw + gl;
+        }
+        gq = syscall(29, g2, &zx_gd, 4096);
+    }
+    syscall(6, g2);
+    if (gm != 4) { return 145; }                             # ".", "..", new.txt, r.txt
+    # ---- 1.57.12 B9: writes in the SNAPSHOTTED root — agnostank@snap1 owns every block these kill, so each kill goes
+    # to the root's DEADLIST, never freed — one txg each ----
+    var tb = "/mnt/zfs/agnostank/tiny.bin";
+    var tfd9 = zx_open(tb, 2);                               # AO_RDWR on the root: writable since B9
+    if (tfd9 < 0) { return 150; }
+    zx_gen("zfsx/b9t", 25, &zx_wb, 50);
+    if (syscall(58, tfd9, 25, 0) != 25 || syscall(1, tfd9, &zx_wb, 50) != 50) { return 150; }   # an RMW of its one block
+    if (syscall(58, tfd9, 0, 0) != 0 || syscall(5, tfd9, &zx_wc, 200) != 100 || zx_eq(&zx_wc + 25, &zx_wb, 50) == 0) { return 150; }
+    syscall(6, tfd9);
+    var r1m = "/mnt/zfs/agnostank/rand-1m.bin";
+    var rfd9 = zx_open(r1m, 0x201);                          # AO_WRONLY | AO_TRUNC: eight 128 KiB records + their L1
+    if (rfd9 < 0) { return 151; }
+    zx_gen("zfsx/b9r", 0, &zx_wb, 10);
+    if (syscall(1, rfd9, &zx_wb, 10) != 10) { return 151; }
+    syscall(6, rfd9);
+    if (syscall(33, r1m, zx_len(r1m), &st) != 0 || load64(&st + 16) != 10) { return 151; }
+    var hfd9 = zx_open(hp, 2);                               # hello.txt's one block is EMBEDDED: deadlisted all the same
+    if (hfd9 < 0) { return 152; }
+    zx_gen("zfsx/b9h", 0, &zx_wb, 5);
+    if (syscall(1, hfd9, &zx_wb, 5) != 5) { return 152; }
+    syscall(6, hfd9);
+    var hl9 = "/mnt/zfs/agnostank/hello-link.txt";
+    var lfd9 = zx_open(hl9, 0);                              # the same object under its other name
+    if (lfd9 < 0 || syscall(5, lfd9, &zx_wc, 64) != 15 || zx_eq(&zx_wc, &zx_wb, 5) == 0 || zx_eq(&zx_wc + 5, " from zfs\n", 10) == 0) { return 152; }
+    syscall(6, lfd9);
+    var lf9 = "/mnt/zfs/agnostank/deep/a/b/c/d/e/leaf.txt";
+    if (syscall(30, lf9, zx_len(lf9)) != 0 || syscall(33, lf9, zx_len(lf9), &st) == 0) { return 153; }   # unlink
+    var de9 = "/mnt/zfs/agnostank/deep/a/b/c/d/e";
+    var ne9 = "/mnt/zfs/agnostank/deep/e9";
+    if (syscall(31, de9, zx_len(de9), ne9, zx_len(ne9)) != 0 || syscall(33, ne9, zx_len(ne9), &st) != 0 || load64(&st) != 0x41ED) { return 154; }
+    if (syscall(33, de9, zx_len(de9), &st) == 0) { return 154; }
+    var z9 = "/mnt/zfs/agnostank/deep/z9";
+    if (syscall(9, z9, zx_len(z9)) != 0) { return 155; }     # mkdir under the root's (snapshotted) deep/
+    var zf9 = "/mnt/zfs/agnostank/deep/z9/f.txt";
+    var cfd9 = zx_open(zf9, 0x2102);
+    if (cfd9 < 0) { return 155; }
+    zx_gen("zfsx/b9f", 0, &zx_wb, 20);
+    if (syscall(1, cfd9, &zx_wb, 20) != 20) { return 155; }
+    syscall(6, cfd9);
+    if (syscall(33, zf9, zx_len(zf9), &st) != 0 || load64(&st + 16) != 20) { return 155; }
+    # ---- 1.57.12 B11: POLICY B — coalesced per fd, durable at close / sync / exit ----
+    var cpb = "/mnt/zfs/somewhere/else/b11.bin";
+    var c11 = zx_open(cpb, 0x2102);                          # AO_CREAT | AO_EXCL | AO_RDWR: its own txg
+    if (c11 < 0) { return 156; }
+    var k11 = 0;
+    while (k11 < 8) {                                        # a cp: 8 x 64 KiB through one fd — ONE txg, at close
+        zx_gen("zfsx/b11", k11 * 65536, &zx_big, 65536);
+        if (syscall(1, c11, &zx_big, 65536) != 65536) { return 156; }
+        k11 = k11 + 1;
+    }
+    if (syscall(6, c11) != 0) { return 156; }
+    var r11 = zx_open(cpb, 0);
+    if (r11 < 0 || syscall(58, r11, 458752, 0) != 458752 || syscall(5, r11, &zx_big, 65536) != 65536) { return 156; }
+    zx_gen("zfsx/b11", 458752, &zx_wc, 2048);
+    if (zx_eq(&zx_big, &zx_wc, 2048) == 0) { return 156; }
+    syscall(6, r11);
+    var a11 = zx_open(cpb, 2);                               # fd A writes, fd B reads — before A is closed
+    var b11 = zx_open(cpb, 0);
+    if (a11 < 0 || b11 < 0) { return 157; }
+    zx_gen("zfsx/b11o", 1000, &zx_wb, 2000);
+    if (syscall(58, a11, 1000, 0) != 1000 || syscall(1, a11, &zx_wb, 2000) != 2000) { return 157; }
+    if (syscall(58, b11, 1000, 0) != 1000 || syscall(5, b11, &zx_wc, 2000) != 2000 || zx_eq(&zx_wc, &zx_wb, 2000) == 0) { return 157; }
+    zx_gen("zfsx/b11e", 524288, &zx_wb, 100);
+    if (syscall(58, a11, 524288, 0) != 524288 || syscall(1, a11, &zx_wb, 100) != 100) { return 158; }
+    if (syscall(33, cpb, zx_len(cpb), &st) != 0 || load64(&st + 16) != 524388) { return 158; }   # stat sees the extend
+    syscall(6, a11);
+    syscall(6, b11);
+    var s11 = zx_open(cpb, 1);
+    zx_gen("zfsx/b11s", 600000, &zx_wb, 50);
+    if (s11 < 0 || syscall(58, s11, 600000, 0) != 600000 || syscall(1, s11, &zx_wb, 50) != 50) { return 159; }
+    if (syscall(12) != 0) { return 159; }                    # sync#12: the pending write committed
+    syscall(6, s11);
+    if (syscall(33, cpb, zx_len(cpb), &st) != 0 || load64(&st + 16) != 600050) { return 159; }
+    # the interrupt-latency probe (design k.126 (B11)): 2 MiB through one fd, the per-CPU ticks read around its close
+    var gb = "/mnt/zfs/somewhere/else/b11big.bin";
+    var g11 = zx_open(gb, 0x2102);
+    if (g11 < 0) { return 160; }
+    k11 = 0;
+    while (k11 < 32) {
+        zx_gen("zfsx/b11big", k11 * 65536, &zx_big, 65536);
+        if (syscall(1, g11, &zx_big, 65536) != 65536) { return 160; }
+        k11 = k11 + 1;
+    }
+    var si0[104];
+    var si1[104];
+    if (syscall(35, &si0, 104) != 0) { return 160; }
+    if (syscall(6, g11) != 0) { return 160; }
+    if (syscall(35, &si1, 104) != 0) { return 160; }
+    syscall(1, 1, "zfsx: b11 close ticks", 21);
+    var c = 0;
+    while (c < 4) {
+        var dt = load64(&si1 + 40 + c * 16) + load64(&si1 + 48 + c * 16) - load64(&si0 + 40 + c * 16) - load64(&si0 + 48 + c * 16);
+        zx_putn(" cpu", c);
+        zx_putn("=", dt);
+        c = c + 1;
+    }
+    syscall(1, 1, "\n", 1);
+    # b11exit.bin: written, never closed — the exit's teardown commits it
+    var x11 = zx_open("/mnt/zfs/somewhere/else/b11exit.bin", 0x2102);
+    if (x11 < 0) { return 161; }
+    zx_gen("zfsx/b11x", 0, &zx_wb, 1000);
+    if (syscall(1, x11, &zx_wb, 1000) != 1000) { return 161; }
     return 95;
 }
 

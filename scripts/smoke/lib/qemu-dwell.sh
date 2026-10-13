@@ -280,8 +280,18 @@ qemu_assert_booted() {
 #   sched: kernel_resume with ...            sched_assert_oob (preempt_count != 0)
 #   syscall: kernel stack is not the caller  kstack_check_entry: a switch path missed kstack_install
 #   PANIC: Double Fault                      exc_df_report: the #DF stub (a kernel stack is gone)
-#   boot: BSP stack window not free RAM      (1.57.7 IMG-fix) mbi.cyr bootstack_window_check: the UEFI map calls part
-#                                            of [0x3D0000, 0x400000) (1.57.11) something other than free RAM
+#   boot: BSP boot stack not loader-pinned   (1.57.12) main.cyr + mbi.cyr uefi_span_check: the UEFI map calls part of
+#                                            the kernel image span (which holds bsp_boot_stack) something other than
+#                                            EfiLoaderCode
+#   boot: BSP not on its boot stack          (1.57.12) main.cyr: kmain's frame is outside bsp_boot_stack, or the shim's
+#                                            `bsp_boot_stack_lo = &bsp_boot_stack;` never ran
+#   boot: region 7 not free RAM              (1.57.12) main.cyr + uefi_span_check: part of [0xE00000, 0x1000000) — every
+#                                            kernel stack — is not free RAM in the UEFI map. (These three replace
+#                                            1.57.7-1.57.11's "boot: BSP stack window not free RAM", the region-1
+#                                            window check 1.57.12 retired with the window.)
+#   PANIC: BSP boot stack red zone           (1.57.12) proc.cyr bsp_stack_redzone_check: a context left the BSP boot
+#                                            stack with its lowest 8 KB (the canary red zone) overwritten — kmain went
+#                                            deeper than 56 KB, the .bss below the array may be corrupt (halts)
 #   wq: wait primitive entered ...           (1.57.7 S3c) sched.cyr wq_assert_if0: arm/cancel/sleep reached with IF=1
 #   wq: arm from a non-running ...           wq_arm on a proc that is not RUNNING (state != 2, != 0)
 #   wq: current is not running ...           wq_can_block: current's on_cpu is not this CPU (INV-RUN)
@@ -302,12 +312,17 @@ qemu_assert_booted() {
 #                                            its lock (net_tx_lock / tcp_tab_lock) — best-effort witnesses
 #   vmm: UC remap of the kernel low 4 MB     (1.57.8 KVMCON) vmm_remap_uc_2mb refused a phys < 4 MB (an I/O port base
 #                                            passed as a BAR: the kernel's own code would have run uncached)
+#   PANIC: kernel page fault                 (1.57.12) idt.cyr exc_pf_report: a CPL0 #PF (halts) — until 1.57.12 it
+#                                            stamped CMOS and halted with nothing on COM1
+#   PANIC: room                              (1.57.12) core/room.cyr: the boot carve-out failed (no 2 MB region, not in
+#                                            the direct map, a pointer not its poison), or a moved array was used
+#                                            before room_init (decoded from CR2 by room_pf_say) — halts
 # ⚠ NOT denied (a test requires it): "execwait: first scheduled child" (S3b's #37 witness — fg-smoke, run37-smp4);
 #   "virtio-net: TX ring full - frame dropped" (S4: a diagnostic latch, a burst
 #   may legitimately fill the ring); "wq: first cross-CPU resume from a kernel wait" (klug-only witness, waitx P8);
 #   "kbd: line owner reclaimed from a dead process" (klug-only, S3d; S7's KBDNEXT asserts its absence in its phase).
 # kstack-smoke denies this whole pattern too (1.57.7; it carried its own shorter list until then).
-SMOKE_INVARIANT_DENY="sched: refused non-ready pick|sched: exec_and_wait entered with|sched: kernel_resume with|syscall: kernel stack is not the caller|PANIC: Double Fault|boot: BSP stack window not free RAM|wq: wait primitive entered|wq: arm from a non-running|wq: current is not running|wq: sleep resumed in a non-running|PANIC: wq|sched: resched gate misconfigured|IDLE REFUSED A READY PICK|exec: exec_and_wait is boot-only|fg: IF=0 ring-3 caller|fg: kernel_run_child cannot block|fg: execwait cannot block|fg: execwait wait ended abnormally|net: lock overlap|net: lock missing|proc: orphan zombie recycled|lifecycle: park refused|lifecycle: signal point with preempt held|lifecycle: claimed a kernel continuation|vmm: UC remap of the kernel low 4 MB"
+SMOKE_INVARIANT_DENY="sched: refused non-ready pick|sched: exec_and_wait entered with|sched: kernel_resume with|syscall: kernel stack is not the caller|PANIC: Double Fault|PANIC: BSP boot stack red zone|boot: BSP boot stack not loader-pinned|boot: BSP not on its boot stack|boot: region 7 not free RAM|wq: wait primitive entered|wq: arm from a non-running|wq: current is not running|wq: sleep resumed in a non-running|PANIC: wq|sched: resched gate misconfigured|IDLE REFUSED A READY PICK|exec: exec_and_wait is boot-only|fg: IF=0 ring-3 caller|fg: kernel_run_child cannot block|fg: execwait cannot block|fg: execwait wait ended abnormally|net: lock overlap|net: lock missing|proc: orphan zombie recycled|lifecycle: park refused|lifecycle: signal point with preempt held|lifecycle: claimed a kernel continuation|vmm: UC remap of the kernel low 4 MB|PANIC: kernel page fault|PANIC: room"
 
 # smoke_accel <smp> — the QEMU accelerator + CPU model for a boot at `-smp <smp>` (1.57.6, agnos S3).
 #
@@ -338,6 +353,10 @@ smoke_accel() {
 # and "md5=<the image's md5>"; bench.sh marks its rewritten-source image flags=BENCH). This refuses (exit 1) when the
 # record is missing, when the image changed after build.sh wrote it (a copy from elsewhere), or when the flags differ
 # from <expected flags> ("" = the plain production build). The refusal names the fix.
+# ⭐ 1.57.12 (the second ROOM review): the record also carries build.sh's image-layout verdict, "layout=pass" |
+# "over-bound" | "unmeasured", and anything but `pass` (a missing line included) is refused. build.sh refuses a plain
+# image that fails a layout CONTRACT outright (moved to agnos.layout-refused); this is the second half — the plain image
+# it leaves in place over the region-1 bound (for check.sh gate 34 to score) or unmeasured (no python3) is not booted.
 smoke_require_image() {
     _sr_img="$1"; _sr_want="$2"; _sr_meta="$1.flags"
     if [ ! -f "$_sr_meta" ]; then
@@ -349,6 +368,11 @@ smoke_require_image() {
     _sr_now=$(md5sum "$_sr_img" 2>/dev/null | cut -d' ' -f1)
     if [ -z "$_sr_md5" ] || [ "$_sr_md5" != "$_sr_now" ]; then
         echo "  REFUSED: $_sr_img is not the image scripts/build.sh recorded (md5 $_sr_now, record says ${_sr_md5:-none}) — rebuild it"
+        exit 1
+    fi
+    _sr_layout=$(sed -n 's/^layout=//p' "$_sr_meta" | head -1)
+    if [ "$_sr_layout" != "pass" ]; then
+        echo "  REFUSED: $_sr_img's image-layout verdict is '${_sr_layout:-none}', not 'pass' (build.sh's record, $_sr_meta) — an over-bound or unmeasured image must not be booted; see build.sh's image-layout output"
         exit 1
     fi
     # compared as SETS (build.sh writes them in #define order, a caller names them in any order)

@@ -1126,8 +1126,8 @@ fn smp_build_trampoline() {
     # imul eax, eax, 0x10000
     store8(p+off, 0x69); store8(p+off+1, 0xC0); store32(p+off+2, 0x10000); off = off + 6;
     # add eax, 0xFD0000 (05 imm32) — eax = 0xFD0000 + id*0x10000 = the PHYS top of this AP's 64 KB
-    # region-7 window: 0xFE0000 / 0xFF0000 / 0x1000000 for ids 1-3 (id 0 would be 0xFD0000, the
-    # never-used BSP slot — the BSP keeps its region-1 stacks and never runs this code). The 32-bit
+    # region-7 window: 0xFE0000 / 0xFF0000 / 0x1000000 for ids 1-3 (id 0 would be 0xFD0000, the BSP's
+    # slot — since 1.57.12 its TSS.RSP0 window, never a boot stack: the BSP boots on bsp_boot_stack). The 32-bit
     # `imul`/`add` ZERO-EXTEND into rax, so the 64-bit add below is exact. clobbers: eax/rax, flags.
     store8(p+off, 0x05); store32(p+off+1, 0xFD0000); off = off + 5;
     # ⛔ 1.57.3 — rebase onto the DIRECT-MAP alias (DIRECTMAP_BASE + phys), NEVER the identity VA:

@@ -150,6 +150,11 @@ fn fatfs_parse_bpb() {
 # Returns 1 on a valid FAT mount candidate, 0 otherwise.
 fn fatfs_probe_backend(tag, part_lba) {
     if (blk_is_registered(tag) == 0) { return 0; }
+    # ⛔ 1.57.12 — A 512 B-SECTOR READER, SO A 512 B-LBA BACKEND ONLY, CHECKED BEFORE THE FIRST READ. fat_blk_read moves
+    # one device LBA into a 512 B buffer (fatfs_boot_buf / _dir_buf / _fat_buf / _data_buf are `var X[64]`): on a 4096 B-LBA
+    # backend (an NVMe 4Kn namespace, a 4Kn USB stick — blk_lba_bytes_ok admits both) this probe wrote 3,584 bytes past
+    # fatfs_boot_buf at every boot, whole-disk and per partition, before fatfs_parse_bpb could refuse the BPB.
+    if (blk_lba_bytes_for(tag) != 512) { return 0; }
     fat_backend = tag;
     fat_partition_first_lba = part_lba;
     fatfs_fat_buf_sector = 0 - 1;                    # invalidate FAT-sector cache
@@ -198,7 +203,7 @@ fn fatfs_init() {
                 var esp_lba = 0;
                 var esp_seen = 0;
                 for (var pi = 0; pi < gpt_partition_count; pi = pi + 1) {
-                    if (gpt_partition_info(pi) != 1) { continue; }
+                    if (gpt_used_info(pi) != 1) { continue; }   # 1.57.12: the pi-th USED entry (gpt.cyr gpt_used_dir)
                     var is_esp = 0;
                     var is_msft = 0;
                     if (gpt_q_type_lo == GPT_TYPE_ESP_LO) {

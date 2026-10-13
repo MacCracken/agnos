@@ -16,7 +16,11 @@
 #     either (no key loaded), so nothing changes in the tree;
 #   · a file in a dataset whose `compression` is zstd* may read as "ERR zstd block unsupported" — with the
 #     manifest's SIZE (stat still works: metadata is lz4) — and at least one such ERR must occur when the pool
-#     has zstd data, or the refusal is untested.
+#     has zstd data, or the refusal is untested;
+#   · a VOLUME (zvol) must be refused ("not grafted: not a filesystem") — it has no ZPL to mount, and the manifest
+#     shows none of it. Told from the summary, where `zfs get` prints `-` for a volume's `mountpoint` and `version`
+#     (ZPL-only properties; a filesystem always has both). 1.57.12: the fixture's `wr` pool (RECIPE 3) carries one,
+#     and this script first read `wr` in scripts/smoke/zfs-write-smoke.sh — which it failed as unexplained.
 # Anything else — a missing file, a wrong hash, an extra name, a refusal the properties do not explain — FAILS.
 # Exit 0 PASS, 1 FAIL, 2 the inputs were unusable (no walk, no manifest).
 import re, sys
@@ -58,6 +62,8 @@ def main():
     refused_ck = {ds: CK_ID[p.get('checksum', '')] for ds, p in props.items() if p.get('checksum', '') in CK_ID}
     encrypted = {ds for ds, p in props.items() if p.get('encryption', 'off') not in ('off', '-', '')}
     zstd = {ds for ds, p in props.items() if p.get('compression', '').startswith('zstd')}
+    volumes = {ds for ds, p in props.items()                       # (a bookmark, pool#name, prints `-` for both too)
+               if '#' not in ds and p.get('mountpoint') == '-' and p.get('version') == '-'}
 
     # ---- the manifest ----
     mD, mF, mL, mM = set(), {}, {}, {}
@@ -125,8 +131,11 @@ def main():
             # an encrypted dataset that would mount (canmount=on) must be refused by name
             if props[ds].get('canmount', 'on') == 'on' and props[ds].get('mountpoint', '') not in ('none', 'legacy'):
                 fails.append("encrypted dataset %s not refused as encrypted (kernel: %r)" % (ds, kRef.get(ds)))
+    for ds in volumes:
+        if kRef.get(ds) != 'not a filesystem':
+            fails.append("volume %s should be refused with 'not a filesystem', kernel said %r" % (ds, kRef.get(ds)))
     for ds, why in kRef.items():
-        if ds not in refused_ck and ds not in encrypted:
+        if ds not in refused_ck and ds not in encrypted and ds not in volumes:
             fails.append("kernel refused dataset %s (%s) — nothing in its properties explains that" % (ds, why))
 
     cut = [mM[ds] for ds in refused_ck if ds in mM]

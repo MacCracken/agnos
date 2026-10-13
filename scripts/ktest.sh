@@ -10,6 +10,13 @@
 # (`gnoboot: fail @ EBS`, no "AGNOS kernel v" line) printed "ERROR: test output not found (kernel may have
 # crashed …)" and exited 1 — indistinguishable from a kernel that died; S3c's M-E3/M-E5 runs hit exactly that.
 # The serial log is kept at build/ktest-logs/ktest.log (and each VOID attempt as ktest.log.attemptN).
+# ⭐ 1.57.12 — A KTEST BUILD'S BOOT SELF-TESTS ARE SCORED. `KTEST=1 sh scripts/ktest.sh` boots a kernel that runs the
+# core/main.cyr KTEST self-tests (syscall, context switch, VFS/initrd, userland exec, the NVMe write round-trips) BEFORE
+# the in-kernel suite, and this script scored only the suite's TOTAL line: a self-test that printed FAIL — or never ran
+# — still ended in "RESULT: ALL TESTS PASSED". When build/agnos.flags says KTEST, every line in KTEST_REQUIRE (below)
+# must be in the log and none of KTEST_DENY. Every build must also show the boot disk's GPT intact (KTEST_GPT_LINE).
+# Env: KTEST=1 (that build) · KTEST_SMP (default 1; the -smp count — above 1 the boot takes smoke_accel's accelerator,
+# KVM or multi-threaded TCG, and prints it) · QEMU_TIMEOUT (default 90) · KTEST_KVM=0 (force TCG at -smp 1).
 # ⭐ 1.57.10 (HAR2 — issue 2026-09-26-harness-backlog-after-1-57-9, item 1): THIS SCRIPT LEAVES A PLAIN build/agnos.
 # It used to leave its TEST kernel there, and the next plain-kernel smoke was REFUSED by smoke_require_image
 # ("built with [TEST]", measured by SMOKES3 at 1.57.9: agnsh-smoke straight after ktest). The TEST kernel is now
@@ -48,9 +55,11 @@ echo "Building AGNOS with test suite..."
 # (main.cyr no longer holds `kybernet();`). sh_cmd_test() (user/test.cyr) runs
 # the in-kernel PMM/heap/VFS/proc/syscall/kstdlib/initrd checks and prints the
 # `=== AGNOS Kernel Test Suite ===` / `TOTAL:` / `ALL TESTS PASSED` markers
-# parsed below. All seven checks are self-contained (the test initrd is built
-# unconditionally at boot in main.cyr), so no userland is execed and no rootfs
-# is needed.
+# parsed below. No userland is execed and no rootfs is needed. ⚠ The test
+# initrd is built ONLY by a KTEST build (main.cyr's KTEST VFS/initrd block, at
+# 0x6000), so a plain run fails the three [initrd] checks that need it (370
+# executed, 367 passed); `KTEST=1 sh scripts/ktest.sh` passes them and executes
+# two more inside test_initrd's open branch (372, all passed at 1.57.12).
 BFIN_CYR="$ROOT/kernel/core/boot_finish.cyr"
 # `.ktestbak` (not `.bak`): a plain `.bak` suffix collides with the committed
 # `*.cyr.bak` cruft the kernel tree carries — and historically THIS script
@@ -70,11 +79,17 @@ restore_sources() {
 # 1.57.10 (HAR2): once the TEST build has started, build/agnos is left PLAIN (see the header). A no-op
 # before that point, and after the explicit restore below (KTEST_BUILT goes back to 0).
 KTEST_BUILT=0
+# ⭐ 1.57.12: the restore build runs with EVERY build.sh flag variable unset — the names inside `[ -n "$NAME" ]` on
+# build.sh's `#define` lines — so it is plain even when the caller exported a flag. `KTEST=1 sh scripts/ktest.sh` (how
+# the KTEST boot self-tests run) used to leave build/agnos built with flags=KTEST: the restore inherited the caller's
+# KTEST=1, and smoke_require_image refuses that image in every plain smoke run after it.
+KTEST_FLAG_VARS=$(grep '#define' "$ROOT/scripts/build.sh" | grep -o '\[ -n "\$[A-Z0-9_]*" \]' | sed 's/.*\$\([A-Z0-9_]*\).*/\1/' | sort -u)
 restore_plain() {
     [ "$KTEST_BUILT" = 1 ] || return 0
     KTEST_BUILT=0
     echo "Restoring a PLAIN build/agnos (the TEST kernel boots from build/agnos_ktest)..." >&2
-    sh "$ROOT/scripts/build.sh" > "$KLOGS/build-plain.log" 2>&1 \
+    ( for v in $KTEST_FLAG_VARS; do unset "$v"; done
+      sh "$ROOT/scripts/build.sh" ) > "$KLOGS/build-plain.log" 2>&1 \
         || echo "WARN: could not restore the plain build/agnos — run: sh scripts/build.sh (log: $KLOGS/build-plain.log)" >&2
 }
 # Sources FIRST: a plain build of the rewritten boot_finish.cyr would call sh_cmd_test() without TEST.
@@ -141,6 +156,8 @@ grep -q 'sh_cmd_test(); power_stop_final();' "$BFIN_CYR" || {
 KTEST_BUILT=1
 TEST=1 sh "$ROOT/scripts/build.sh" >&2
 cp "$ROOT/build/agnos" "$ROOT/build/agnos_ktest"
+# 1.57.12: what the TEST kernel was built with, read before restore_plain rewrites build/agnos.flags.
+KTEST_BUILD_FLAGS=$(sed -n 's/^flags=//p' "$ROOT/build/agnos.flags" 2>/dev/null | head -1)
 
 # Sources restored, then build/agnos rebuilt PLAIN before the boot (the boot uses the copy). Both are then
 # done, so the traps are cleared: a later exit has nothing left to restore.
@@ -149,7 +166,9 @@ restore_plain
 trap - EXIT INT TERM
 sed -n 's/^flags=/  build\/agnos restored: flags=/p' "$ROOT/build/agnos.flags" 2>/dev/null | sed 's/flags=$/flags= (plain)/'
 
-echo "Booting test kernel via gnoboot + OVMF (${QEMU_TIMEOUT:-90}s dwell per attempt, banner-gated retry)..."
+KTEST_SMP="${KTEST_SMP:-1}"
+case "$KTEST_SMP" in ''|*[!0-9]*|0) echo "ERROR: KTEST_SMP='$KTEST_SMP' is not a CPU count" >&2; rm -f "$ROOT/build/agnos_ktest"; exit 1 ;; esac
+echo "Booting test kernel via gnoboot + OVMF (-smp $KTEST_SMP, ${QEMU_TIMEOUT:-90}s dwell per attempt, banner-gated retry)..."
 # gnoboot is the only ELF64 entry path (QEMU rejects the ELF64 kernel on its
 # Linux `-kernel` protocol — no PVH note). Build a minimal GPT/ESP image with
 # gnoboot + /boot/agnos; the kernel reaches core/boot_finish.cyr, runs
@@ -190,30 +209,49 @@ mformat -i "$IMG"@@1048576 -F
 mmd -i "$IMG"@@1048576 ::EFI ::EFI/BOOT ::boot
 mcopy -i "$IMG"@@1048576 "$GNOBOOT" ::EFI/BOOT/BOOTX64.EFI
 mcopy -i "$IMG"@@1048576 "$ROOT/build/agnos_ktest" ::boot/agnos
+# ⭐ 1.57.12: the disk's first MiB — the primary GPT (protective MBR, header, entry array: LBAs 0-33) and the gap up to
+# the ESP at LBA 2048 — is copied out before the boot and compared after it (build/ktest-logs/gpt-before.bin /
+# gpt-after.bin). A KTEST build's NVMe round-trips wrote LBA 5 and LBAs 20-27 — inside the entry array — and until
+# 1.57.12 never put them back, so every KTEST boot read 33 garbage partitions off this disk; they now write a window in
+# that gap (gpt_scratch_lbas_on: LBAs 34-42 here) and put it back. Nothing a ktest boot runs may leave LBAs 0-2047
+# changed: a change fails the run. (LBAs 0-33 only, until the window moved into the gap.)
+KTEST_CMP_LBAS=2048
+dd if="$IMG" of="$KLOGS/gpt-before.bin" bs=512 count=$KTEST_CMP_LBAS status=none
 cp "$OVMF_VARS_SRC" "$KWORK/vars.fd"; chmod +w "$KWORK/vars.fd"
 
 # Prefer KVM when available; fall back to -cpu max (TCG). KTEST_KVM=0 forces TCG.
+KLOG="$KLOGS/ktest.log"
+. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # qemu_dwell_kernel, qemu_assert_booted, smoke_accel
 KTEST_ACCEL="-cpu max"
 if [ -r /dev/kvm ] && [ "${KTEST_KVM:-1}" = "1" ]; then KTEST_ACCEL="-enable-kvm -cpu host"; fi
-KLOG="$KLOGS/ktest.log"
-. "$ROOT/scripts/smoke/lib/qemu-dwell.sh"   # qemu_dwell_kernel, qemu_assert_booted
+# 1.57.12: more than one CPU takes smoke_accel's choice (KVM, else MULTI-threaded TCG — single-threaded TCG runs the
+# vCPUs one at a time and proves nothing about parallelism; qemu-dwell.sh has the why).
+if [ "$KTEST_SMP" -gt 1 ]; then KTEST_ACCEL=$(smoke_accel "$KTEST_SMP"); fi
+echo "  accel: $KTEST_ACCEL  (-smp $KTEST_SMP)"
 # End a failed firmware hand-off early (it is terminal, not slow); the retry itself stays banner-gated.
 QEMU_DWELL_VOID="${QEMU_DWELL_VOID:-gnoboot: fail @ EBS|BootManagerMenuApp|Please select boot device}"
 export QEMU_DWELL_VOID
 # Marker `TOTAL:` — the suite's last reporter line (qemu_dwell lets the line finish before the kill).
 qemu_dwell_kernel "$KLOG" "TOTAL:" "${QEMU_TIMEOUT:-90}" "$KWORK/vars.fd" "$OVMF_VARS_SRC" \
     qemu-system-x86_64 \
-    -machine q35 -m 512M $KTEST_ACCEL \
+    -machine q35 -m 512M -smp "$KTEST_SMP" $KTEST_ACCEL \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$KWORK/vars.fd" \
     -drive "file=$IMG,format=raw,if=none,id=disk0" \
     -device "nvme,drive=disk0,serial=AGNOS-KTEST" \
     -serial stdio -display none -no-reboot
+dd if="$IMG" of="$KLOGS/gpt-after.bin" bs=512 count=$KTEST_CMP_LBAS status=none
 rm -rf "$KWORK"
 rm -f "$ROOT/build/agnos_ktest"
 if ! qemu_assert_booted "$KLOG"; then
     echo "RESULT: VOID — the test kernel never executed (log: $KLOG)"
     exit 2
+fi
+KGPT_BAD=0
+if ! cmp -s "$KLOGS/gpt-before.bin" "$KLOGS/gpt-after.bin"; then
+    KGPT_BAD=1
+    echo "ERROR: the test kernel changed the disk's primary GPT or the gap before the ESP (LBAs 0-$((KTEST_CMP_LBAS - 1))) — first differing bytes:" >&2
+    cmp -l "$KLOGS/gpt-before.bin" "$KLOGS/gpt-after.bin" 2>/dev/null | head -5 | awk '{ printf "         LBA %d +%d: %s -> %s (octal)\n", int(($1 - 1) / 512), ($1 - 1) % 512, $2, $3 }' >&2
 fi
 OUTPUT=$(tr -d '\0' < "$KLOG")
 
@@ -270,7 +308,7 @@ fi
 # ⚠ FLOOR DERIVATION, FROM RECORDED RUNS — do not round it to a nicer number without redoing this.
 # Every executed tally this tree has on record: 103 (97 passed / 6 failed, 1.56.51 — the header note
 # above), 109 (103/6, mid-1.56.52 CHANGELOG), 110 (107/3, end of 1.56.52 — state.md and CHANGELOG;
-# the three reds are the environmental [initrd] checks gnoboot cannot satisfy, not regressions —
+# the three reds are the [initrd] checks — the test initrd exists only in a KTEST build, see above —
 # i.e. THE HEALTHY TREE EXITS 1 HERE TODAY). `grep -c test_assert
 # kernel/user/test.cyr` counts 117 call sites across the seven bodies, the two largest being kstdlib
 # (30) and vfs (23) — measured 2026-09-02. 64 sits far enough below the 103-110 band that adding or
@@ -289,8 +327,77 @@ if [ "$EXECUTED" -lt "$KTEST_MIN_CHECKS" ]; then
     exit 1
 fi
 
+# ⭐ 1.57.12 — THE KTEST BOOT SELF-TESTS (header). Each REQUIRE row is "name|ERE" — the line the self-test prints
+# when it passed (core/main.cyr, core/nvme.cyr: grep the quoted text); each DENY ERE is a line one prints when it
+# failed. The pass lines are required rather than the FAIL lines merely denied because a self-test that stops early,
+# or is compiled out, prints neither. KTEST_GPT_LINE is required in every build: the disk ktest.sh makes holds one
+# ESP entry and both CRCs verify, so anything else is the kernel misreading or damaging it.
+KTEST_GPT_LINE='gpt: present, first=34 last=[0-9]+ parts=1/128 hdr-CRC-OK arr-CRC-OK'
+KTEST_REQUIRE='syscall write|Syscall write works!
+hw syscall|HW syscall test: HW-OK
+context switch|ctxsw: A=[0-9]+ B=[0-9]+ of [0-9]+ rounds, waited [0-9]+ hlts -- both threads ran and retired OK
+vfs write|VFS write: OK
+initrd mount|Initrd: 2 files
+initrd hello.txt|initrd hello.txt: Hello, AGNOS!
+initrd test|initrd test: PASS
+vfs memfile|VFS memfile read: HELLO
+userland exit code|Exit code: 42
+userland exec|Userland exec complete
+nvme window|nvme: KTEST round-trip LBAs [0-9]+ and [0-9]+\.\.[0-9]+ \(outside the GPT and every partition\)
+nvme single-LBA|nvme: LBA[0-9]+ single-LBA write-then-read PASS \(original restored\)
+nvme multi-LBA|nvme: LBA[0-9]+ multi-LBA\([0-9]+\) round-trip PASS \(original restored\)'
+KTEST_DENY='hlts -- FAIL|Userland exec FAIL|write-then-read FAIL|round-trip FAIL|KTEST restore of LBA [0-9]+ FAILED|KTEST write round-trips skipped|nvme: (read|write)(_sectors)? LBA [0-9]+ .*failed'
+KBOOT_BAD=0
+if ! printf '%s\n' "$OUTPUT" | grep -qE "$KTEST_GPT_LINE"; then
+    KBOOT_BAD=$((KBOOT_BAD + 1))
+    echo "ERROR: no intact-GPT summary line (/$KTEST_GPT_LINE/) — the kernel misread or damaged the boot disk's GPT:" >&2
+    printf '%s\n' "$OUTPUT" | grep -E "gpt: " | head -3 | sed 's/^/         /' >&2
+fi
+case " $KTEST_BUILD_FLAGS " in
+    *" KTEST "*)
+        KREQ_N=0; KREQ_OK=0
+        while IFS='|' read -r kname kre; do
+            [ -n "$kname" ] || continue
+            KREQ_N=$((KREQ_N + 1))
+            if printf '%s\n' "$OUTPUT" | grep -qE -- "$kre"; then KREQ_OK=$((KREQ_OK + 1))
+            else KBOOT_BAD=$((KBOOT_BAD + 1)); echo "ERROR: KTEST boot self-test '$kname' did not pass — no line /$kre/" >&2; fi
+        done <<KREQ
+$KTEST_REQUIRE
+KREQ
+        # The NVMe window must be the gap this disk HAS between its entry array and its ESP: LBAs 34..2047 (parted's
+        # layout above). A window inside the GPT would pass every line above — the restore hides it — until the boot
+        # that crashes between a write and its restore.
+        KWIN=$(printf '%s\n' "$OUTPUT" | sed -n 's/.*nvme: KTEST round-trip LBAs \([0-9]*\) and [0-9]*\.\.\([0-9]*\) .*/\1 \2/p' | head -1)
+        if [ -n "$KWIN" ]; then
+            set -- $KWIN
+            if [ "$1" -lt 34 ] || [ "$2" -gt 2047 ]; then
+                KBOOT_BAD=$((KBOOT_BAD + 1))
+                echo "ERROR: the NVMe round-trip window LBAs $1..$2 is not inside the gap LBAs 34..2047 (GPT array end .. ESP)" >&2
+            fi
+        fi
+        KDENY_HITS=$(printf '%s\n' "$OUTPUT" | grep -E -- "$KTEST_DENY" || true)
+        if [ -n "$KDENY_HITS" ]; then
+            KBOOT_BAD=$((KBOOT_BAD + 1))
+            echo "ERROR: KTEST boot self-test FAIL line(s):" >&2
+            printf '%s\n' "$KDENY_HITS" | head -5 | sed 's/^/         /' >&2
+        fi
+        echo "KTEST boot self-tests: $KREQ_OK/$KREQ_N pass lines present, $(printf '%s' "$KDENY_HITS" | grep -c . || true) FAIL line(s)"
+        ;;
+esac
+
+if [ "$KGPT_BAD" = 1 ]; then
+    echo "RESULT: FAILED — $EXECUTED checks executed ($PASSED passed, $FAILURES failed), but the kernel changed the boot disk's GPT (see the ERROR above; build/ktest-logs/gpt-*.bin)"
+    exit 1
+fi
+if [ "$KBOOT_BAD" -gt 0 ]; then
+    echo "RESULT: FAILED — $EXECUTED checks executed ($PASSED passed, $FAILURES failed), but $KBOOT_BAD boot check(s) failed (the ERROR lines above)"
+    exit 1
+fi
 if [ "$FAILURES" = "0" ]; then
-    echo "RESULT: ALL TESTS PASSED — $EXECUTED checks executed (floor $KTEST_MIN_CHECKS), 0 failed"
+    case " $KTEST_BUILD_FLAGS " in
+        *" KTEST "*) echo "RESULT: ALL TESTS PASSED — $EXECUTED checks executed (floor $KTEST_MIN_CHECKS), 0 failed; $KREQ_N KTEST boot self-tests passed" ;;
+        *)           echo "RESULT: ALL TESTS PASSED — $EXECUTED checks executed (floor $KTEST_MIN_CHECKS), 0 failed" ;;
+    esac
     exit 0
 else
     echo "RESULT: $FAILURES TESTS FAILED — $EXECUTED checks executed (floor $KTEST_MIN_CHECKS), $PASSED passed"

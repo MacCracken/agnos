@@ -37,6 +37,18 @@
 # its own pre-timekeeping lines; do not "fix" it by moving this into a file aarch64 also compiles.
 klog_tsc_boot = rdtsc();
 
+# 1.57.12 (review fix) — arm the BSP boot stack's RED ZONE: the lowest 8 KB of bsp_boot_stack (boot_shim.cyr, image
+# .bss, no guard page) gets the canary that sched_leave_old / sched_assert_oob re-read every time a context leaves
+# this stack (proc.cyr has the why; a no-op twin on aarch64). As early as main.cyr allows — nothing ahead of it
+# runs more than a few calls deep, 56 KB above the zone.
+bsp_stack_redzone_arm();
+
+#ifdef KSTACK_HW
+# 1.57.12 — paint the BSP boot stack above its red zone, below this frame, so kstack_hw_scan can report its
+# high-water mark (proc.cyr).
+bsp_stack_paint();
+#endif
+
 vmm_remap_wc_range(fb_fb_phys(), fb_size_or_fallback());
 
 # Populate the 8x8 font in BSS so fb_putc renders glyphs once shell()
@@ -79,21 +91,62 @@ kprint_hex(pmm_memmap_top);
 kprintln("", 0);
 
 #ifdef ELF64_KERNEL
-# ⭐ 1.57.7 (IMG-fix, review A3/B2) — the BSP boot stack has been live since the shim's first push; say
-# whether the UEFI map gnoboot handed over calls its span free RAM (mbi.cyr bootstack_window_check has
-# the why). The violation line is in SMOKE_INVARIANT_DENY (scripts/smoke/lib/qemu-dwell.sh), and the OK
-# line is what an iron burn's klug/fb transcript shows for the one risk QEMU cannot exercise. Statements,
-# not a `var x = f()` initialiser: a module-scope expression initialiser never runs in kmode.
-bootstack_win_rc = bootstack_window_check(load64(&boot_info_ptr));
-if (bootstack_win_rc == 0) { kprintln("boot: BSP stack span 0x3D0000-0x400000 is free RAM in the UEFI map OK", 69); }
-if (bootstack_win_rc == 1) {
-    kprint("boot: BSP stack window not free RAM in the UEFI map - type 0x", 61);
-    kprint_hex(bootstack_win_type);
+# ⭐ 1.57.12 — THE TWO FACTS THE BSP-STACK MOVE RESTS ON, read against the UEFI map gnoboot handed over
+# (mbi.cyr uefi_span_check has the why). They replace 1.57.7's region-1 window check (`boot: BSP stack span
+# 0x3D0000-0x400000 is free RAM in the UEFI map OK`), whose window 1.57.12 vacated:
+#   (1) kmain is running on bsp_boot_stack — the shim's `bsp_boot_stack_lo = &bsp_boot_stack;` ran and a
+#       frame of this code lies inside the array — and the kernel image span holding it is EfiLoaderCode:
+#       pinned by gnoboot's AllocateAddress, so nothing else owns those pages, on QEMU or on iron;
+#   (2) region 7 [0xE00000, 0x1000000) — every kernel stack, the BSP's RSP0 slot (gdt.cyr) included — is free
+#       RAM once ExitBootServices returns.
+# The violation lines are in SMOKE_INVARIANT_DENY (scripts/smoke/lib/qemu-dwell.sh), agnsh-smoke requires both
+# OK lines, and scripts/check/image-layout-check.sh checks the region-7 bounds and OK line here against its
+# map. On iron they are what the burn's klug/fb transcript shows for the one part of the layout QEMU cannot
+# exercise. Statements, not `var x = f()` initialisers: a module-scope expression initialiser never runs in kmode.
+var bsp_stack_rc = 0;
+var bsp_stack_rsp = 0;
+var kimage_end = 0;
+var region7_rc = 0;
+bsp_stack_rsp = bsp_rsp_sample();
+kimage_end = kernel_image_end();
+bsp_stack_rc = 0 - 2;
+if (kimage_end != 0) { bsp_stack_rc = uefi_span_check(load64(&boot_info_ptr), 0x100000, kimage_end, 1); }
+if (bsp_boot_stack_lo != &bsp_boot_stack) { bsp_stack_rc = 2; }
+if (bsp_stack_rsp < &bsp_boot_stack) { bsp_stack_rc = 2; }
+if (bsp_stack_rsp >= &bsp_boot_stack + 0x10000) { bsp_stack_rc = 2; }
+if (bsp_stack_rc == 0) {
+    kprint("boot: BSP boot stack [0x", 24);
+    kprint_hex(&bsp_boot_stack);
+    kprint(", 0x", 4);
+    kprint_hex(&bsp_boot_stack + 0x10000);
+    kprintln(") inside the loader-pinned image (EfiLoaderCode) OK", 51);
+}
+if (bsp_stack_rc == 1) {
+    kprint("boot: BSP boot stack not loader-pinned - type 0x", 48);
+    kprint_hex(uefi_span_type);
     kprint(" at 0x", 6);
-    kprint_hex(bootstack_win_start);
+    kprint_hex(uefi_span_start);
     kprintln("", 0);
 }
-if (bootstack_win_rc < 0) { kprintln("boot: BSP stack window unchecked - no usable UEFI map", 53); }
+if (bsp_stack_rc == 2) {
+    kprint("boot: BSP not on its boot stack - rsp 0x", 40);
+    kprint_hex(bsp_stack_rsp);
+    kprint(" lo 0x", 6);
+    kprint_hex(bsp_boot_stack_lo);
+    kprintln("", 0);
+}
+if (bsp_stack_rc == 0 - 1) { kprintln("boot: BSP boot stack unchecked - no usable UEFI map", 51); }
+if (bsp_stack_rc == 0 - 2) { kprintln("boot: BSP boot stack unchecked - no ELF header at 0x100000", 58); }
+region7_rc = uefi_span_check(load64(&boot_info_ptr), 0xE00000, 0x1000000, 0);
+if (region7_rc == 0) { kprintln("boot: region 7 [0xE00000, 0x1000000) is free RAM in the UEFI map OK", 67); }
+if (region7_rc == 1) {
+    kprint("boot: region 7 not free RAM in the UEFI map - type 0x", 53);
+    kprint_hex(uefi_span_type);
+    kprint(" at 0x", 6);
+    kprint_hex(uefi_span_start);
+    kprintln("", 0);
+}
+if (region7_rc < 0) { kprintln("boot: region 7 unchecked - no usable UEFI map", 45); }
 #endif
 
 # Per-stage CMOS stamps survive hangs and are decoded by
@@ -111,6 +164,12 @@ kprintln("GDT loaded", 10);
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x81; 0xE6; 0x71; }   # CP 0x81: pre-tss
 tss_init();
 kprintln("TSS loaded (ring 3 ready)", 25);
+#ifdef SMP_STACK_SELFTEST
+# 1.57.12 — what tss_init stored as the BSP's TSS.RSP0, captured before any kstack_install can replace it;
+# smp_stack_selftest prints it (`smpstk: bsp rsp0=0x...`) and ap-stack-smoke.sh asserts region-7 slot 0's top.
+var smpstk_bsp_rsp0 = 0;
+smpstk_bsp_rsp0 = load64(&tss_array + 4);
+#endif
 # 1.56.52 — prove the I/O-map base landed in the field the CPU actually reads. See tss_iopb_selftest.
 if (tss_iopb_selftest(0) == 1) { kprintln("tss: I/O map base at 0x66 OK - no ring-3 port access", 52); }
 else { kprintln("tss: IOPB BASE MISPLACED - RING 3 HAS PORT I/O", 46); }
@@ -498,6 +557,22 @@ kfont_init();
 # between the old slot and here went straight to the FB and is picked up by the one-time sync.
 fb_shadow_init();
 
+# ⭐ 1.57.12 (ROOM) — the image's ROOM: ONE 2 MB pmm region that holds the large module arrays that left the image's
+# .bss (core/room.cyr; docs/architecture/kernel-image-room.md) — Linux's setup_log_buf / memblock, FreeBSD's msgbufp.
+# HERE: after the direct map is live in kmain's context (cr3_load(0x1000) + pmm_bitmap_use_directmap — the kfont_init
+# rule), AFTER fb_shadow_init, and before anything touches a moved array (pci_scan, the filesystems and the first
+# syscall all come far later; nothing between this call and fb_shadow_init's touches one).
+# ⚠ AFTER fb_shadow_init, not before it (the ROOM review, 2026-10-12): pmm_alloc_2mb_run hands out the top-most free
+# run below 256 MB. The console shadow needs n CONTIGUOUS regions (16 MB on QEMU's 2048x2048 frame), the room needs
+# one: taken first, the room could split the only free run of n on fragmented iron and send the console to direct
+# paint (the WC read-back on every scroll) behind one "fb: shadow alloc failed" line. Taken second, it costs the room
+# nothing. image-layout-check.sh (10) holds the order.
+# Outside the #ifndef on purpose: a BOOTCR3_KEEP_GNOBOOT_CR3 build needs the moved arrays too and gets a phys == VA
+# room (dma_kva returns phys there), which a per-process CR3 maps only while none of that process's PT_LOADs
+# covers the room's PD slot — NOT the parity the image gave these arrays (kernel-image-room.md § The KEEP_GNOBOOT build).
+# It also moves the klug log ring out of its 8 KB early ring. Halts by name on failure.
+room_init();
+
 # 1.50.10 hardening — guard the 1.50.9 bitmap-VA-shadow fix on EVERY boot (cheap; mirrors the always-on
 # directmap probe). When the bitmap migrated (RAM > 256 MB) it MUST now be reached via the direct-map
 # (>= DIRECTMAP_BASE), never its identity VA (which a per-proc CR3 shadows at PD[2]=0x400000). Reading it
@@ -548,6 +623,8 @@ kprintln("Heap initialized", 16);
 # above (pmm test / vmm_alloc_at / heap_init) differ on real Zen, so it sometimes
 # relocated to 0x400000 (a user VA the per-process CR3 overrides) → the syscall
 # path faulted on iron (the 1.40.x ring-3 reset). See syscall_kstack_reserve.
+# (HISTORY: that kstack left region 1 for region 7 at 1.46.x/1.51.x, and has been per-process since 1.57.6;
+# nothing lives at 0x3F0000 — since 1.57.12 region 1 holds only the kernel image, up to 0x400000.)
 syscall_kstack_reserve();
 
 # === CMOS kernel checkpoint 10 (heap up — kmalloc usable) ===
@@ -838,9 +915,10 @@ if (nvme_admin_init() == 1) {
     # NVMe Phase 4 — adds the write path + multi-LBA + PRP2 + PRP list
     # (coded; PRP2/list not boot-demo'd until block_dev callers in
     # Phase 5 ask for larger transfers). The R/W demo here exercises
-    # three round-trips: LBA 0 read (Phase 3 carry-forward, kcp 0x45),
-    # LBA 5 single-LBA write-then-read (kcp 0x46), LBA 20-27 multi-LBA
-    # (8 LBAs = one page, PRP1-only path, kcp 0x47). PASS/FAIL prints
+    # an LBA 0 read (Phase 3 carry-forward, kcp 0x45); a KTEST build
+    # adds a single-LBA write-then-read (kcp 0x46) and a one-page
+    # multi-LBA one (8 LBAs at 512 B, PRP1-only path, kcp 0x47), after
+    # the registration below (nvme_ktest_rw). PASS/FAIL prints
     # to serial; mismatches don't halt — the visual receipt is the
     # post-mortem signal.
     if (nvme_io_queue_init() == 1) {
@@ -850,6 +928,12 @@ if (nvme_admin_init() == 1) {
         # NVMe is the production-bound block backend; virtio is the
         # QEMU-only fallback. CMOS kcp 0x48 stamps on success.
         nvme_register_block_dev();
+        # 1.57.12: the KTEST write round-trips, after the registration — they pick their LBAs outside the GPT through
+        # the block layer (nvme.cyr nvme_ktest_rw, gpt.cyr gpt_scratch_lbas_on). They ran inside nvme_rw_demo, at LBAs
+        # 5 and 20.. of the GPT entry array.
+        #ifdef KTEST
+        nvme_ktest_rw();
+        #endif
     }
 }
 # 1.57.8 — NVMe late-completion fault injection (core/nvme.cyr nvme_late_selftest; scripts/smoke/nvme-late-smoke.sh).
@@ -980,17 +1064,18 @@ if (ahci_probe() == 1) {
         # LBA48 capacity. First exercise of the CL+FIS path; CMOS kcp
         # 0x4F stamps on first successful IDENTIFY.
         ahci_identify_all();
-        # AHCI Phase 4 — boot-time R/W round-trip demo on the first
-        # initialized port (mirrors nvme_rw_demo). Then register with
-        # the block layer; policy is "don't override NVMe" so on a
-        # box with both, AHCI registers as secondary visibility only
-        # (blk_active stays BLK_NVME). CMOS kcp 0x50 stamps on
-        # registration.
+        # AHCI Phase 4 — boot-time read demo on the first initialized
+        # port (mirrors nvme_rw_demo). Then register with the block
+        # layer; policy is "don't override NVMe" so on a box with both,
+        # AHCI registers as secondary visibility only (blk_active stays
+        # BLK_NVME). CMOS kcp 0x50 stamps on registration.
         ahci_read_demo();
+        ahci_register_block_dev();
+        # The AHCI_RW_DEMO write round-trip runs after the registration since 1.57.12: it picks its LBA outside the
+        # disk's GPT through the block layer (gpt_scratch_lbas_on) and puts the original back (ahci.cyr).
         #ifdef AHCI_RW_DEMO
         ahci_write_demo();
         #endif
-        ahci_register_block_dev();
         # 1.57.9 — AHCI timed-out-command fault injection (core/ahci.cyr ahci_late_selftest; scripts/smoke/ahci-late-smoke.sh).
         # Its last arm takes every AHCI port offline on purpose; the smoke stops at its done line.
         #ifdef AHCI_SELFTEST
@@ -1031,12 +1116,15 @@ hid_mouse_defer_selftest();
 #endif
 
 if (gpt_init() == 1) {
-    # Phase 2 — dump the full partition table at boot so iron + QEMU
-    # bring-up runs see the same surface as the `parts` shell command
-    # without needing keyboard injection. Costs one extra 16 KB of disk
-    # reads (4 chunks × 4 KB scratch). Negligible vs the value of having
-    # the table visible on every boot during the storage arc.
-    gpt_print_all_partitions();
+    # Phase 2 — dump the partition table at boot so iron + QEMU bring-up runs see the same surface as the `parts`
+    # shell command without needing keyboard injection.
+    # ⛔ 1.57.12 (review) — BOUNDED: the first GPT_BOOT_LIST_MAX (16) used entries, then one "... and N more" line.
+    # Every console line is a framebuffer paint, and since the walk covers up to 1 MiB of array (8,192 entries of
+    # 128 B) a table of 4,096 used entries printed 4,096 lines here. Measured (TCG -smp 1, a 4,096-entry disk): the
+    # framebuffer console painted that backlog for 149 s (~36 ms a line), kybernet started at 155 s; bounded, 11 s.
+    # The cost now: at most 18 lines, and re-reading the array's chunks up to the 16th used entry (one 4 KB chunk on
+    # a standard 128 x 128 B table). The `parts` verb still lists every entry.
+    gpt_print_partitions_max(GPT_BOOT_LIST_MAX);
 }
 vfs_init();
 kprintln("VFS initialized", 15);
@@ -2172,6 +2260,17 @@ if (fatfs_active == 1) {
 }
 #endif
 
+#ifdef ZFS_WRITE_OPS
+# 1.57.12 — the ZFS writer's op list (core/zfs_write.cyr zfs_wtest; B2: the uberblock-only commit), BEFORE the walk
+# below, so the walk reads back what it wrote; scripts/smoke/zfs-write-smoke.sh has OpenZFS judge the pools.
+zfs_wtest();
+#endif
+#ifdef ZFS_SELFTEST
+# 1.57.11 — the ZFS oracle walk (core/zfs.cyr zfs_selftest): every grafted directory / symlink / file, each file
+# SHA-256'd through the read#5 path; scripts/smoke/zfs-smoke.sh diffs it against FreeBSD's manifest of the image.
+zfs_selftest();
+#endif
+
 # exFAT read self-test (1.34.1 bite 2, compile-gated via EXFAT_SELFTEST).
 # Gates the read substrate against an EMPTY mkfs.exfat volume — no file
 # seeding, no root needed (exfat has no mtools-equivalent): (1) mount +
@@ -2180,11 +2279,6 @@ if (fatfs_active == 1) {
 # by mkfs.exfat — an independent oracle for the multi-cluster chain-read
 # path. If a file WAS seeded (EXFAT_SEED_FILE on the image), also read it
 # back. exfat-smoke.sh.
-#ifdef ZFS_SELFTEST
-# 1.57.11 — the ZFS oracle walk (core/zfs.cyr zfs_selftest): every grafted directory / symlink / file, each file
-# SHA-256'd through the read#5 path; scripts/smoke/zfs-smoke.sh diffs it against FreeBSD's manifest of the image.
-zfs_selftest();
-#endif
 #ifdef EXFAT_SELFTEST
 if (exfat_active == 1) {
     var ex_lc = exfat_ls();
@@ -4886,10 +4980,12 @@ kprintln("", 0);
 
 ksyscall(1, 0, "Syscall write works!\n", 21);
 
-ksyscall(0, 42, 0, 0);
-kprint("Exit code: ", 11);
-kprint_num(sys_exit_code);
-kprintln("", 0);
+# ⛔ 1.57.12 — NO exit#0 FROM kmain. This block called `ksyscall(0, 42, 0, 0)` and printed sys_exit_code, from the days
+# when exit#0 recorded the code and returned. exit#0 is the death chain (proc_exit_current -> proc_death ->
+# sched_exit_tail, syscall.cyr: "EXIT MUST NOT RETURN") and never returns: on kmain, before the scheduler runs,
+# sched_exit_tail's `sti; hlt` loop parked the boot for good, so every KTEST boot stopped right after "Syscall write
+# works!" (`KTEST=1 sh scripts/ktest.sh` never reached its TOTAL). exit#0 is exercised where a process may die: the
+# Userland Exec Test below runs a ring-3 child that exits 42 and reads the code back through kmain's wait.
 
 # Hardware SYSCALL test (from kernel mode — same privilege, tests the plumbing).
 # test_hw_syscall() prints intermediate detail to serial; one bare digit (the
@@ -4901,45 +4997,11 @@ test_hw_syscall();
 kprintln("", 0);
 #endif
 
-#ifdef KTEST
-# === Context Switch Test ===
-# Create two test processes with dedicated stacks.
-# Process stacks at 0x800000 + pid * 0x10000, 64KB apart.
-# Stack grows down, so stack_top is base + size.
-kprintln("Creating test processes...", 26);
-
-proc_count = 0;
-proc_current_set(0);
-
-# Process 0: kernel idle (the code running right now)
-var kern_pid = proc_create(0);
-proc_set_state(0, 2);  # running
-
-# Process 1: test_proc_a
-var stack_a = 0x800000 + 1 * 0x10000;
-if (vmm_is_mapped(stack_a) == 0) { vmm_alloc_at(stack_a); }
-var pa = proc_create_full(&test_proc_a, stack_a + 0x4000);
-kprint("Process A (pid=", 15);
-kprint_num(pa);
-kprintln(") created", 9);
-
-# Process 2: test_proc_b
-var stack_b = 0x800000 + 2 * 0x10000;
-if (vmm_is_mapped(stack_b) == 0) { vmm_alloc_at(stack_b); }
-var pb = proc_create_full(&test_proc_b, stack_b + 0x4000);
-kprint("Process B (pid=", 15);
-kprint_num(pb);
-kprintln(") created", 9);
-
-kprint("Processes: ", 11);
-kprint_num(proc_count);
-kprint(" total, ", 8);
-kprint_num(proc_count_by_state(1));
-kprintln(" ready", 6);
-
-# === CMOS kernel checkpoint 14 (test procs created) ===
-asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0E; 0xE6; 0x71; }
-#endif
+# === Context Switch Test === — 1.57.12: the two test processes are KERNEL THREADS created on the live scheduler
+# (search "KTEST Context Switch + Scheduler Test"), not here. This block made them on hand-placed stacks at 0x810000/0x820000
+# (region 4, memory the PMM hands to anyone), before the bootstrap that resets the proc table, with bodies that
+# returned into garbage, and it compiled the production bootstrap OUT of KTEST builds to keep them — so the scheduler
+# armed with no idle, no on_cpu fences and no kmain pin.
 
 # Enable interrupts and activate scheduler
 asm { sti; }
@@ -6017,8 +6079,8 @@ var smp_wake_enabled = 1;
 kprintln("Activating scheduler...", 23);
 
 # 1.40.10 — register the kernel main thread + an idle thread as real procs
-# before activating preemption (production path; KTEST builds set up their own
-# proc_a/proc_b above). The exec-from-disk selftest leaves dead exec procs in
+# before activating preemption (every build — KTEST too since 1.57.12, whose context-switch
+# threads are created at the end of the bootstrap). The exec-from-disk selftest leaves dead exec procs in
 # slots 0..N with proc_current_get() on the last one; without a valid runnable proc
 # the first timer tick after sched_active=1 (the DHCP DISCOVER hlt-wait on iron)
 # fell back to a dead exec proc, cr3_load'd its stale per-process CR3 and
@@ -6071,8 +6133,8 @@ fn thread_selftest_verify() {
     preempt_enable();
     if (thr_counter_a == snap_a) { kprintln("thr: gate held", 14); }
     else { kprintln("thr: gate LEAK", 14); }
-    proc_set_state(thr_pid_a, 0);                 # retire the test threads (skip-on-dead)
-    proc_set_state(thr_pid_b, 0);
+    kthread_retire(thr_pid_a);                    # retire the test threads (skip-on-dead) — under sched_lock (proc.cyr)
+    kthread_retire(thr_pid_b);
     kprintln("thr: done", 9);
     return 0;
 }
@@ -6217,7 +6279,8 @@ fn sched_stress_verify() {
 #
 # 1.44.6 dissolved the supposed "shared-kstack wall": syscall handlers run IF=0 (SFMASK
 # clears IF on SYSCALL entry) and the few sti-window syscalls are preempt-gated (1.44.1),
-# so NO syscall is ever preempted mid-handler — the shared syscall kstack (0x3F0000) is
+# so NO syscall is ever preempted mid-handler — the shared syscall kstack (0x3F0000 then; region 7 since
+# 1.51.x, per-process since 1.57.6) is
 # serial, and no per-proc kernel stack is needed.
 #
 # The payload is RAW machine code in a byte array, NOT a Cyrius fn: a compiled fn's
@@ -6235,7 +6298,7 @@ fn ring3_payload_fill() {
     # counter — proving a PREEMPTIBLE ring-3 proc can syscall safely. The handler runs
     # IF=0 (SFMASK clears IF on SYSCALL entry) so it is never preempted mid-syscall, and
     # the few sti-window syscalls are preempt-gated (1.44.1) — so the shared syscall
-    # kstack (0x3F0000) stays serial, no per-proc kstack needed. The body re-loads the
+    # kstack (0x3F0000 then — history) stays serial, no per-proc kstack needed. The body re-loads the
     # counter addr each iteration because the syscall clobbers rax/rcx/r11 (rbx is
     # reloaded too, so it does not depend on the handler preserving callee-saved regs):
     #   mov eax,2 ; syscall ; movabs rbx,0x2000000 ; inc qword [rbx] ; jmp -22
@@ -7711,7 +7774,7 @@ fn kst_rmw_thread_b() {
 }
 fn kst_phase_rmw() {
     if (cpu_count < 2) { kprintln("kstack: preempt rmw n/a (1 cpu)", 31); return 0; }
-    var rm_free0 = KTHREAD_MAX - kthread_next;
+    var rm_free0 = kthread_free_count();
     kst_rmw_run = 1;
     store64(&kst_rmw_pid, kthread_create(&kst_rmw_thread_a));
     store64(&kst_rmw_pid + 8, kthread_create(&kst_rmw_thread_b));
@@ -7735,8 +7798,12 @@ fn kst_phase_rmw() {
         }
         asm { 0xF3; 0x90; }                            # pause (no GPR touched)
     }
-    proc_set_state(load64(&kst_rmw_pid), 0);            # retired (a kthread's stack is the pool's: never reaped)
-    proc_set_state(load64(&kst_rmw_pid + 8), 0);
+    # Retired (a kthread's stack is the pool's: never reaped). ⛔ 1.57.12 (review): through kthread_retire, under
+    # sched_lock — these two are unpinned and may be current on an AP right now, and a bare proc_set_state(pid, 0) could
+    # land inside that AP's do_context_switch revive of a running `old` (its state loads, then the store of 1) and be
+    # lost: the thread would run on and its pool slot would never be free again.
+    kthread_retire(load64(&kst_rmw_pid));
+    kthread_retire(load64(&kst_rmw_pid + 8));
     kprint("kstack: preempt rmw iters=", 26); kprint_num(load64(&kst_rmw_iter) + load64(&kst_rmw_iter + 8));
     kprint(" seen0_mask=", 12); kprint_num(rm_seen);
     kprint(" cpus=", 6); kprint_num(rm_ncpu);
@@ -7885,7 +7952,9 @@ fn fpctxsw_selftest_verify() {
 }
 #endif
 
-#ifndef KTEST
+# 1.57.12: this bootstrap runs in KTEST builds too — it was `#ifndef KTEST` (KTEST kept its own hand-made proc table
+# from the old Context Switch Test, so a KTEST scheduler armed with no idle, no on_cpu fences and no kmain pin). The
+# KTEST context-switch threads are created by the KTEST Scheduler Test, after `sched_active = 1` (see there).
 proc_count = 0;
 proc_current_set(0);
 proc_create(0);                 # proc 0 = kernel main (running now; context saved on first switch-away)
@@ -7914,8 +7983,9 @@ idle_owner_set(sched_idle_pid_get(), 0);
 # the BSP-idle + foreground-proc steals; idle_owner is the per-proc CPU-pin. MUST be after
 # proc_on_cpu_init() (which zeroes idle_owner). Inert single-core (sched_idx_pickable io==0==pcpu_cpu()).
 # ⭐ 1.57.7 (S3b): kmain no longer parks a continuation in exec_ctx for its launches — it BLOCKS in kernel_run_child
-# (state 6) and is woken by the child's death. It stays BSP-pinned because its stack IS the BSP boot stack in region
-# 1 (live under gnoboot's CR3 from the shim's first instruction): it must never be resumed on another CPU (D22).
+# (state 6) and is woken by the child's death. It stays BSP-pinned because its stack IS the BSP boot stack (image
+# .bss since 1.57.12, region 1 before; live under gnoboot's CR3 from the shim's first instruction): it must never be
+# resumed on another CPU (D22).
 idle_owner_set(0, 0);
 # ⭐ 1.57.6 (Path 2, S3.1) — INV-RUN FOR kmain: the proc current on a CPU is state 2 with on_cpu == that CPU.
 # proc_on_cpu_init() above reset kmain's on_cpu to -1 right after proc_set_state(0, 2) made it running, so
@@ -7939,8 +8009,6 @@ fpctxsw_selftest_setup();
 # 1.57.6 (Path 2, S3.3): the kernel-stack probes, W and the not-ready fallback child, before the scheduler arms.
 kstack_selftest_setup();
 #endif
-#endif
-
 # 1.46.x sub-bite 7 (H6 fix 2026-06-24): wake APs HERE — AFTER the proc-table
 # bootstrap (proc_count / proc 0 / idle created, proc_on_cpu_init done) and BEFORE
 # sched_active=1. So each AP registers its idle kthread into the STABLE proc table
@@ -7960,7 +8028,7 @@ if (smp_wake_enabled != 0) {
 # scripts/smoke/ap-stack-smoke.sh (-smp 4). Runs HERE — after smp_start_aps has waited on every
 # pcpu_ap_ready, and before sched_active=1 so smp_wait_ticks is still valid — plus a further 5 ticks
 # so the woken APs (LAPIC timer armed + sti in ap_entry) have taken IF=1 timer frames on their stacks.
-# Three oracles:
+# Three oracles (plus (0), 1.57.12: the BSP's TSS.RSP0 as tss_init stored it — see the function):
 #   (1) WHERE each BOOT stack is: pcpu_ap_rsp[n], sampled in ap_entry right after tss_init_cpu
 #       (smp.cyr), must lie inside the region-7 AP window [DIRECTMAP_BASE + 0xFC0000, DIRECTMAP_BASE +
 #       0x1000000) — the DIRECT-MAP alias, never the identity VA (gdt.cyr tss_get_cpu_stack carries the
@@ -7985,8 +8053,8 @@ if (smp_wake_enabled != 0) {
 # wakes — and the served face is the verified direct-map copy. This reader exists to PROVE the stacks
 # are not on the literals any more; it is not a second consumer of the face and must not become one.
 # ⚠ smp_stack_selftest is also the reason the image gate (scripts/check/image-layout-check.sh) can
-# stay about the IMAGE alone: it gates LOAD end <= 0x390000 (the BSP boot stack's budget; 0x370000
-# until 1.57.7 moved that stack's top 0x380000 -> 0x3A0000) and knows
+# stay about the IMAGE alone: it gates LOAD end <= 0x400000 (the top of region 1, since 1.57.12 moved the
+# BSP stacks out of it; 0x3D0000 at 1.57.11, 0x390000 at 1.57.7-1.57.10, 0x370000 before) and knows
 # nothing about where an AP stack IS. Static greps of the trampoline's hex are brittle; this is not.
 # Mutation-proven at 1.57.3 (ap-stack-smoke.sh header): (a) the trampoline back on `add eax, 0x310000`
 # without the direct-map add + tss_get_cpu_stack back on 0x300000 + cpu*0x10000 + 0x10000 trips
@@ -7995,6 +8063,15 @@ if (smp_wake_enabled != 0) {
 # kybernet up — which is why oracle (1b) exists. The restored tree prints the six OKs and `intact`.
 fn smp_stack_selftest() {
     smp_wait_ticks(5);
+    # (0) 1.57.12 — the BSP's TSS.RSP0 as tss_init stored it (captured right after tss_init, main.cyr's top):
+    # region-7 slot 0's top through the direct map, the one formula tss_get_cpu_stack now has for every CPU.
+    # Until 1.57.12 it was the fixed region-1 window top 0x400000, which no runtime oracle ever read.
+    kprint("smpstk: bsp rsp0=0x", 19); kprint_hex(smpstk_bsp_rsp0); kprintln("", 0);
+    if (smpstk_bsp_rsp0 == DIRECTMAP_BASE + 0xFD0000) {
+        kprintln("smpstk: bsp rsp0 at region-7 slot 0 top OK", 42);
+    } else {
+        kprintln("smpstk: bsp rsp0 NOT region-7 slot 0", 36);
+    }
     var n = 1;
     while (n < 4) {
         if ((ap_online_mask & (1 << n)) != 0) {
@@ -8198,34 +8275,70 @@ sched_stress_verify();
 #endif
 
 #ifdef KTEST
-# Kernel idle loop: halts, wakes on timer, scheduler switches to A or B
-# After enough ticks, deactivate and report
-var idle_count = 0;
-while (idle_count < 50) {
+# === KTEST Context Switch + Scheduler Test (1.57.12 rebuild) === two kernel threads from the kthread pool (region-7
+# slots with a guard page each, the boot CR3, IF=1), created READY on the LIVE scheduler here — after every other boot
+# self-test has retired its kthreads (THREAD_SELFTEST, KSTACK_SELFTEST's preempt-rmw pair), so kthread_create can hand
+# their pool slots out again; created in the bootstrap, the two of them plus a THREAD_SELFTEST or KSTACK_SELFTEST pair
+# overran the 4-slot pool. Each makes KTEST_CS_ITERS bounded hlt rounds — every hlt lets the timer switch it out —
+# then retires itself (user/test_procs.cyr). kmain hlts and waits — bounded, 500 ticks — until both have made their
+# rounds, retired, and LEFT their CPUs (on_cpu == -1: only then is a pool slot free for the next kthread, the TEST
+# suite's flock T9b). The scheduler STAYS ON: this used to wait 50 hlts and then set `sched_active = 0`, switching
+# scheduling off for the rest of the boot (the APs, sh_cmd_test, kybernet) in a kernel where every blocking wait and
+# every kmain launch needs it.
+# Both are created BEFORE anything is printed: a console line takes ~190 ms (the framebuffer), and at -smp 4 an AP ran
+# all of A's rounds inside the one line printed between the two creates — B then took A's recycled pid and the two
+# threads never ran side by side.
+ktest_pid_a = ktest_kthread_create(&test_proc_a);
+ktest_pid_b = ktest_kthread_create(&test_proc_b);
+kprintln("Creating test processes...", 26);
+kprint("Process A (pid=", 15);
+kprint_num(ktest_pid_a);
+kprintln(") created", 9);
+kprint("Process B (pid=", 15);
+kprint_num(ktest_pid_b);
+kprintln(") created", 9);
+kprint("Processes: ", 11);
+kprint_num(proc_count);
+kprint(" total, ", 8);
+kprint_num(proc_count_by_state(1));
+kprintln(" ready", 6);
+# === CMOS kernel checkpoint 14 (test procs created) ===
+# asm contract: no inputs/outputs; clobbers al only (outb 0x70 <- 0x50, outb 0x71 <- 0x0E).
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0E; 0xE6; 0x71; }
+var ktw = 0;
+var ktest_both = 0;                  # both threads exist (kthread_create returns -1 when the pool is full)
+if (ktest_pid_a > 0) { if (ktest_pid_b > 0) { ktest_both = 1; } }
+while (ktw < 500) {
+    if (ktest_both == 1) { if (ktest_kthread_gone(ktest_pid_a) == 1) { if (ktest_kthread_gone(ktest_pid_b) == 1) { break; } } }
     arch_wait();
-    if (idle_count == 0) {
-        # CMOS CP 0x12: first hlt returned — timer ISR + first context-switch round-trip OK
+    if (ktw == 0) {
+        # CMOS CP 0x12: first hlt returned — timer ISR + first context-switch round-trip OK.
+        # asm contract: no inputs/outputs; clobbers al only (outb 0x70 <- 0x50, outb 0x71 <- 0x12).
         asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x12; 0xE6; 0x71; }
     }
-    if (idle_count == 9) {
-        # CMOS CP 0x13: 10 hlts done — matches QEMU's known-good count under gnoboot
-        asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x13; 0xE6; 0x71; }
-    }
-    if (idle_count == 24) {
-        # CMOS CP 0x14: 25 hlts done — between QEMU known-good and loop end
-        asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x14; 0xE6; 0x71; }
-    }
-    idle_count = idle_count + 1;
+    ktw = ktw + 1;
 }
-
-# Deactivate scheduler, report results
-sched_active = 0;
-# CMOS CP 0x11: post-scheduler idle loop completed
+# CMOS CP 0x11: the scheduler test's wait ended. Contract as above (0x71 <- 0x11).
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x11; 0xE6; 0x71; }
 kprintln("", 0);
 kprint("Scheduler test done. Timer ticks: ", 34);
 kprint_num(timer_ticks);
 kprintln("", 0);
+kprint("ctxsw: A=", 9);
+kprint_num(ktest_cs_a);
+kprint(" B=", 3);
+kprint_num(ktest_cs_b);
+kprint(" of ", 4);
+kprint_num(KTEST_CS_ITERS);
+kprint(" rounds, waited ", 16);
+kprint_num(ktw);
+kprint(" hlts", 5);
+var ktest_cs_ok = 0;
+if (ktest_both == 1 && ktest_cs_a == KTEST_CS_ITERS && ktest_cs_b == KTEST_CS_ITERS) {
+    if (ktest_kthread_gone(ktest_pid_a) == 1 && ktest_kthread_gone(ktest_pid_b) == 1) { ktest_cs_ok = 1; }
+}
+if (ktest_cs_ok == 1) { kprintln(" -- both threads ran and retired OK", 35); }
+else { kprintln(" -- FAIL", 8); }
 #endif
 
 #ifdef KTEST
@@ -8275,23 +8388,30 @@ asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x12; 0xE6; 0x71; }
 # the way UEFI's did. Mem-iso correctness is post-closed-beta work.
 
 #ifdef KTEST
-# === Userland Exec Test ===
-# Spawn user_test_proc as a proper isolated process with its own address space
+# === Userland Exec Test (1.57.12 rebuild) === user_test_proc (user/test_procs.cyr) copied into its own address
+# space and RUN as kmain's scheduled ring-3 child: ten write#1 calls ("UUUUUUUUUU"), then exit#0 with code 42 — the
+# exit test the Syscall Test can no longer make on kmain itself. kernel_exec_foreground (ring3.cyr) sets the ring-3
+# selectors, BSP-pins it, publishes it READY, blocks kmain until it is dead, reaps it and returns the raw code. This
+# used to spawn the child READY with ring-0 selectors and never run it — any tick could have iretq'd its user code at
+# CPL0 — and printed "Userland exec complete" regardless.
 kprintln("Userland exec test...", 21);
-var exec_pid = spawn_user_proc(&user_test_proc);
+var exec_pid = spawn_user_proc_claim(&user_test_proc);   # CLAIMING (3): kernel_exec_foreground publishes it
 kprint("Spawned pid=", 12);
 kprint_num(exec_pid);
 kprintln("", 0);
-
 if (exec_pid >= 0) {
-    var ep = &proc_table + exec_pid * 176;
-    var exec_entry = load64(ep + 24);
-    var exec_rsp = load64(ep + 16);
-    var exec_cr3 = load64(ep + 160);
-    # skipped
-    kprintln("Userland exec complete", 22);
+    var exec_code = kernel_exec_foreground(exec_pid, 0);
+    kprintln("", 0);
+    kprint("Exit code: ", 11);
+    kprint_num(exec_code);
+    kprintln("", 0);
+    if (exec_code == 42) { kprintln("Userland exec complete", 22); }
+    else { kprintln("Userland exec FAIL -- the child did not exit 42", 47); }
+} else {
+    kprintln("Userland exec FAIL -- spawn refused", 35);
 }
-# CMOS CP 0x14: post-userland-exec test (spawn done, exec_and_wait still bypassed)
+# CMOS CP 0x14: post-userland-exec test (the child ran and was reaped).
+# asm contract: no inputs/outputs; clobbers al only (outb 0x70 <- 0x50, outb 0x71 <- 0x14).
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x14; 0xE6; 0x71; }
 #endif
 

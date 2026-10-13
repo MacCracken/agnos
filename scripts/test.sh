@@ -15,8 +15,31 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # the kernel that was tested. All three now default 1.0.6, matching ../kashi/VERSION.
 # ⚠ Keep them in step and re-verify against kashi's own VERSION at every cut. This has now
 # re-diverged twice; it is a recurring failure, not an incident.
+# ⭐ 1.57.12 — a fallback clone is a CACHE of the pinned tag, and a cache has to match its key. From a
+# .claude/worktrees/<x> checkout, $ROOT/../kashi is not the dev sibling but the clone an earlier build left
+# behind: one sat at kashi 1.0.3 from July to 2026-10-09 while the pin moved to 1.0.10 and then 1.1.0 —
+# harmless only while font_data.cyr stayed byte-identical, which 1.1.0 ends. A SHALLOW, CLEAN clone whose
+# VERSION is not the pin is moved to the pinned tag IN PLACE (fetch + checkout — never rm -rf, see the rekha
+# note); a dirty one is refused; a full checkout (the dev sibling) is used as is, with a note.
+# ⚠ build.sh, test.sh and bench.sh carry this function verbatim — move them together.
+dep_pin_sync() { # <name> <dir> <ref>
+    _dv=$(cat "$2/VERSION" 2>/dev/null)
+    if [ -z "$_dv" ] || [ "$_dv" = "$3" ]; then return 0; fi
+    if [ "$(git -C "$2" rev-parse --is-shallow-repository 2>/dev/null)" != "true" ]; then
+        echo "  note: $1 at $2 is $_dv (a full checkout, used as is); the pin is $3" >&2
+        return 0
+    fi
+    if [ -n "$(git -C "$2" status --porcelain 2>/dev/null)" ]; then
+        echo "ERROR: the $1 fallback clone at $2 is $_dv WITH LOCAL CHANGES; the pin is $3 — refusing to touch it." >&2
+        exit 1
+    fi
+    echo "  the $1 fallback clone at $2 is $_dv, the pin is $3 — moving it to the tag..." >&2
+    git -C "$2" fetch --quiet --depth 1 origin tag "$3" >&2 \
+        && git -C "$2" -c advice.detachedHead=false checkout --quiet "$3" >&2 \
+        || { echo "ERROR: could not move the $1 fallback clone at $2 to $3" >&2; exit 1; }
+}
 KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
-KASHI_REF="${KASHI_REF:-1.0.10}"
+KASHI_REF="${KASHI_REF:-1.1.0}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
     # ⛔ Refuse to delete a git checkout (2026-09-13) — see the rekha block in scripts/build.sh.
     if [ -d "$KASHI_DIR/.git" ]; then
@@ -32,6 +55,7 @@ if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
         exit 1
     }
 fi
+dep_pin_sync kashi "$KASHI_DIR" "$KASHI_REF"
 # rekha sibling/fetch handling (1.57.2) — same contract as kashi above and as scripts/build.sh
 # (see the comment there). REKHA_REF MUST match build.sh's and bench.sh's default: the kashi
 # triple's drift history above is the warning, and a face verified by the smoke but built from a
@@ -54,6 +78,7 @@ if [ ! -f "$REKHA_DIR/fonts/face_data.cyr" ]; then
         exit 1
     }
 fi
+dep_pin_sync rekha "$REKHA_DIR" "$REKHA_REF"
 # The aarch64 cross-compiler's existence gates test_aarch64; the cyrius wrapper invokes it
 # internally — we never call it directly.
 # ⛔⛔ MEASURED 2026-08-28 (1.56.51): THIS PROBED A BINARY THAT HAS NOT EXISTED SINCE cyrius v6.1.0.
@@ -173,8 +198,8 @@ exit(0)
     # copy then carried its own number and subtraction "in lockstep" with check.sh — and had drifted: its
     # unreadable-face path set FACE=0 and passed only because the raw size exceeded the grant. The number,
     # the face subtraction and the derivation now live ONLY in scripts/check/weighed-size-check.sh (read
-    # its header): GRANT 0x260000 = 2,490,368 B (0x220000 until 1.57.11), placed above the weighed size at which the plain image
-    # hits the image-layout wall (LOAD end 0x3D0000, 2,473,116 B since 1.57.11; 0x390000 / 2,210,972 B before), so the layout gate binds
+    # its header): GRANT 0x290000 = 2,686,976 B (0x260000 at 1.57.11, 0x220000 before), placed above the weighed size at which the plain image
+    # hits the image-layout wall (LOAD end 0x400000, 2,669,724 B since 1.57.12; 0x3D0000 / 2,473,116 B at 1.57.11; 0x390000 / 2,210,972 B before), so the layout gate binds
     # first; the helper fails closed on an unreadable face and on a wall that has risen to the grant.
     # Operator ruling: this row "is NOT A HARD LIMIT — it can be expanded" — but only by re-deriving it.
     # ⛔ 1.57.9 ENDFIX SG-1: for GROWTH it is REPORT-ONLY (GRANT > WALL, so a weight at the grant is past the

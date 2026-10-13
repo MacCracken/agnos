@@ -659,7 +659,7 @@ fn proc_on_cpu_init() { var i = 0; while (i < 16) { store64(&proc_on_cpu + i * 8
 # per-proc CR3, vmm.cyr pmm_setup_directmap) is at 8 GB+, far above ANY user VA (segments
 # <=256 MB, mmap/stack <=~1 GB), and is NEVER overridden by a user segment, so RSP0 is
 # always reachable. The phys stays reserved in region 7; only the VA the CPU loads moves up.
-var proc_rsp0[16];      # per-pid TSS.RSP0 top (0 = unassigned -> 0x400000 fallback)
+var proc_rsp0[16];      # per-pid TSS.RSP0 top (0 = unassigned -> tss_get_cpu_stack(0), the BSP's region-7 slot; 0x400000 until 1.57.12)
 var KSTACK_POOL_BASE = 0xE00000;   # region 7 PHYS base (14 MB) — RSP0 = DIRECTMAP_BASE + this
 var KSTACK_SLOT = 0x10000;         # 64 KB per proc; the lowest 4 KB is a not-present GUARD page (vmm.cyr)
 # ⭐ 1.57.6 (Path 2, S3.3): this slot is THE process's kernel stack now — its SYSCALLs run here as well as its
@@ -675,6 +675,75 @@ var KSTACK_SLOT = 0x10000;         # 64 KB per proc; the lowest 4 KB is a not-pr
 #   kstack-hw: max=0x... of 0xf000 usable, slot=N name=<the slot's process name>
 # so any workload (spawn-smoke, exec-smoke, agnsh-smoke, ...) run on a KSTACK_HW kernel reports its deepest
 # syscall + interrupt nest against the 60 KB budget. Lock-free (serial only), because a reap can run anywhere.
+#
+# ⭐ 1.57.12 (review fix) — THE BSP BOOT STACK'S RED ZONE. bsp_boot_stack (boot_shim.cyr) is 64 KB of the image's
+# .bss and has NO guard page: the image is mapped RW through 2 MB identity pages (a not-present page would mean
+# splitting PD[1], i.e. the kernel's own text, into 4 KB pages). So an overflow would write the .bss global declared
+# just before the array, SILENTLY — in the 1.57.12 plain build that is blk_rw_armed / BLK_RW_ARM_MAGIC /
+# blk_rw_arm_pid (syscall.cyr: the raw-disk-write gate tests `blk_rw_armed == 0`, so garbage there ARMS it), then
+# the 4 KB blk_sc_bounce DMA bounce buffer; and WHICH global it is changes with unrelated edits (whatever is declared
+# last ahead of boot_shim.cyr's include in agnos.cyr). Linux's init_stack is an image symbol with no guard page too,
+# and carries STACK_END_MAGIC (0x57AC6E9D) at end_of_stack(), which schedule_debug() re-reads on every schedule()
+# ("corrupted stack end detected inside scheduler" -> panic). This is that canary, widened to a whole RED ZONE:
+#   · the lowest BSP_REDZONE = 8 KB of the array holds 0x57AC6E9D57AC6E9D (STACK_END_MAGIC doubled to a qword),
+#     written by bsp_stack_redzone_arm (main.cyr, right after klog_tsc_boot — the shim and the module top level
+#     ahead of it run a few calls deep) and never used by a correct kernel: 56 KB usable above it, against
+#     measured peaks of 2-5.3 KB (CHANGELOG 1.57.12). KSTACK_HW's paint and scan start above it.
+#   · bsp_stack_redzone_check(sp, tag) re-reads ALL of it whenever a context LEAVES the boot stack (sp inside the
+#     array — no pid assumption): sched_leave_old on every real switch (tag 1: kmain switched out by a tick or its
+#     own BLOCK/YIELD) and sched_assert_oob on the boot-only out-of-band ring-3 entry (tag 2 exec_and_wait, 3
+#     kernel_resume). One non-magic qword = the stack went deeper than 56 KB, so the .bss below may already be
+#     corrupt: PANIC (klug + COM1, lock-free — nothing here holds a spinlock, do_context_switch refuses to switch
+#     a preempt-disabled context) and halt this CPU, as stack_canary_check (syscall.cyr) does. It is DETECTION at
+#     the next switch, not prevention: at -smp 4 the APs keep running until then. SMOKE_INVARIANT_DENY has the line.
+#   · 8 KB, not 4 KB like a region-7 guard page: a frame LARGER than the red zone could straddle it without writing
+#     to it (a local buffer fills upward from its base, below the floor, and the frame's return address sits above
+#     the zone). scripts/check/image-layout-check.sh (7) requires every frame in .text (`push rbp; mov rbp, rsp;
+#     sub rsp, imm32`) to be smaller than this BSP_REDZONE, and (9) every frame <= 0xC00 (the region-7 guard page less
+#     a 1 KB margin) — ksyscall's 2,176 B is the largest since sh_exec's 5,152 B went (1.57.12) — so a descent
+#     through the zone always pushes a return address inside it.
+# A KEEP_GNOBOOT build arms and checks it too (identity .bss). aarch64 compiles the no-op twins (no bsp_boot_stack).
+#ifdef ELF64_KERNEL
+var BSP_REDZONE = 0x2000;          # the lowest 8 KB of bsp_boot_stack (image-layout-check.sh (7) reads this line)
+var bsp_redzone_armed = 0;
+fn bsp_stack_redzone_arm() {
+    var rza_a = &bsp_boot_stack;
+    var rza_e = rza_a + BSP_REDZONE;
+    while (rza_a < rza_e) {
+        store64(rza_a, 0x57AC6E9D57AC6E9D);
+        rza_a = rza_a + 8;
+    }
+    bsp_redzone_armed = 1;
+    return 0;
+}
+fn bsp_stack_redzone_check(sp, tag) {
+    if (bsp_redzone_armed == 0) { return 0; }
+    var rzc_lo = &bsp_boot_stack;
+    if (sp < rzc_lo) { return 0; }
+    if (sp >= rzc_lo + 0x10000) { return 0; }      # not leaving the boot stack: nothing to check
+    var rzc_a = rzc_lo;
+    var rzc_e = rzc_lo + BSP_REDZONE;
+    while (rzc_a < rzc_e) {
+        if (load64(rzc_a) != 0x57AC6E9D57AC6E9D) {
+            klug_append("PANIC: BSP boot stack red zone overwritten -- halting", 53); klug_putc(10);
+            serial_print("PANIC: BSP boot stack red zone overwritten at ", 46);
+            exc_serial_hex(rzc_a);
+            serial_print(" (depth ", 8);
+            exc_serial_hex(rzc_lo + 0x10000 - rzc_a);
+            serial_print(" of 0x10000, check ", 19);
+            exc_serial_hex(tag);
+            serial_println(") -- halting", 12);
+            arch_halt();
+        }
+        rzc_a = rzc_a + 8;
+    }
+    return 0;
+}
+#endif
+#ifndef ELF64_KERNEL
+fn bsp_stack_redzone_arm() { return 0; }
+fn bsp_stack_redzone_check(sp, tag) { return 0; }
+#endif
 #ifdef KSTACK_HW
 var kstack_painted[16];      # 1 = the slot was painted at its last hand-out (only painted slots are scanned)
 var kstack_hw_max = 0;
@@ -699,7 +768,48 @@ fn kstack_hw_of(idx) {
     }
     return 0;
 }
+# ⭐ 1.57.12 — THE BSP BOOT STACK TOO. It left region 1 for the image's .bss (boot_shim.cyr bsp_boot_stack),
+# where it has no guard page, so its depth is measured here alongside the region-7 slots: bsp_stack_paint
+# (main.cyr, under KSTACK_HW, right after the red zone is armed) paints [&bsp_boot_stack + BSP_REDZONE, its own
+# frame - 1 KB) with 0x6B — never the red zone (bsp_stack_redzone_arm, above) — and every kstack_hw_scan scans it,
+# printing one COM1 line whenever its high-water mark grows (the depth is measured from the top; 0xe000 = the
+# 56 KB above the red zone):
+#   kstack-hw: bsp boot stack max=0x... of 0xe000 usable
+# Same LOWER-bound caveat as the slots, and frames that came and went below the paint limit before the paint
+# are not seen (the shim and the module top-level code ahead of main.cyr run a few calls deep). The top
+# is the shim's: (&bsp_boot_stack + 0x10000) & ~0xF. Paint works in a KEEP_GNOBOOT build too (identity .bss).
+var bsp_stack_painted = 0;
+var bsp_stack_hw_max = 0;
+fn bsp_stack_paint() {
+    var bsp_here = 0;
+    var bsp_lim = &bsp_here - 1024;              # keep clear of this frame and memset's own
+    var bsp_lo = &bsp_boot_stack + BSP_REDZONE;  # above the red zone (bsp_stack_redzone_arm owns its bytes)
+    if (bsp_lim > bsp_lo) { memset(bsp_lo, 0x6B, bsp_lim - bsp_lo); }
+    bsp_stack_painted = 1;
+    return 0;
+}
+fn bsp_stack_hw_of() {
+    var bht = (&bsp_boot_stack + 0x10000) & (0 - 16);
+    var bha = &bsp_boot_stack + BSP_REDZONE;
+    while (bha < bht) {
+        if (load64(bha) != 0x6B6B6B6B6B6B6B6B) { return bht - bha; }
+        bha = bha + 8;
+    }
+    return 0;
+}
+fn bsp_stack_hw_scan() {
+    if (bsp_stack_painted == 0) { return 0; }
+    var bhs_d = bsp_stack_hw_of();
+    if (bhs_d <= bsp_stack_hw_max) { return 0; }
+    bsp_stack_hw_max = bhs_d;
+    serial_print("kstack-hw: bsp boot stack max=", 30);
+    exc_serial_hex(bhs_d);
+    serial_print(" of 0xe000 usable", 17);
+    serial_putc(13); serial_putc(10);
+    return 0;
+}
 fn kstack_hw_scan() {
+    bsp_stack_hw_scan();                         # 1.57.12: the BSP boot stack first (it has its own max)
     var khs_i = 0;
     var khs_best = 0;
     var khs_slot = 0;
@@ -1072,14 +1182,20 @@ fn proc_alloc_slot() {
     while (_oc < 4) { if (load64(&fpu_owner + _oc * 8) == idx) { store64(&fpu_owner + _oc * 8, 0 - 1); } _oc = _oc + 1; }
     return idx;
 }
-# 1.46.1: the per-proc TSS.RSP0 top for `pid`, or the legacy shared stack (0x400000 since 1.57.11
-# = tss_kernel_stack, gdt.cyr) for an unassigned slot — e.g. hand-registered kmain/
-# idle that bypass proc_alloc_slot. Called by do_context_switch (kstack_install) /
-# exec_and_wait before a ring-3 entry. The 0-fallback keeps an uninitialized slot
-# from setting RSP0=0 (a triple fault on the next CPL3->CPL0 interrupt).
+# 1.46.1: the per-proc TSS.RSP0 top for `pid`, or the BSP's own RSP0 slot for an unassigned one — e.g. a
+# hand-registered kmain/idle that bypassed proc_alloc_slot. Called by do_context_switch (kstack_install) /
+# exec_and_wait before a ring-3 entry. The 0-fallback keeps an uninitialized slot from setting RSP0=0 (a
+# triple fault on the next CPL3->CPL0 interrupt).
+# ⭐ 1.57.12: the fallback is tss_get_cpu_stack(0) — region-7 slot 0 through the direct map, the BSP's RSP0
+# window (gdt.cyr) — where it was the fixed region-1 window top 0x400000 (= the deleted tss_kernel_stack;
+# 0x3C0000 until 1.57.11). ⛔ It must be cpu 0's slot SPECIFICALLY, never the calling CPU's
+# (tss_get_cpu_stack(pcpu_cpu())): slots 1-3 are the AP boot stacks, on which each AP's idle runs, so a
+# CPL3->CPL0 entry through that fallback would push onto live frames (the 1.44.x RSP0-in-.bss failure,
+# gdt.cyr). Slot 0 holds no live frames: kmain runs on bsp_boot_stack (boot_shim.cyr), not here.
+# scripts/check/image-layout-check.sh asserts this exact fallback.
 fn proc_rsp0_top(pid) {
     var r = load64(&proc_rsp0 + pid * 8);
-    if (r == 0) { return 0x400000; }
+    if (r == 0) { return tss_get_cpu_stack(0); }
     return r;
 }
 fn proc_create(entry) {
@@ -1233,7 +1349,9 @@ fn proc_create_user(entry, stack_top) {
 # generalizes the hand-rolled idle proc (main.cyr proc 1) into a real spawn API.
 # Stacks come from a static pool so the create path takes no PMM/heap allocation
 # (scheduler-path-safe). `entry` is a `fn(): i64` that loops forever — a kthread
-# does not return; it is retired via proc_set_state(pid, 0). Returns pid / -1.
+# does not return. Returns pid / -1. 1.57.12: it retires ITSELF (state 0 on its own CPU, then sched_exit_tail —
+# test_proc_a/b, t9b_thread) or is retired by another context through kthread_retire (under sched_lock), never by a
+# bare proc_set_state(pid, 0) from another CPU (see kthread_retire).
 # ⭐ 1.57.6 (Path 2, S3.3) — THE STACKS ARE 64 KB REGION-7 SLOTS WITH A GUARD PAGE, NOT 4 KB OF .bss. The
 # range [0xF00000, 0xF40000) held the per-CPU primary SYSCALL stacks until syscalls moved onto per-process
 # stacks; it is the kthread pool now (gdt.cyr's region-7 map). The BSP idle runs every switch path (the
@@ -1245,7 +1363,73 @@ fn proc_create_user(entry, stack_top) {
 # kfont_init exclusion), and they get no guard pages either.
 var KTHREAD_MAX = 4;
 var KTHREAD_STACK_POOL = 0xF00000;     # region 7 PHYS base of the pool: 4 x 64 KB slots
-var kthread_next = 0;
+# ⭐ 1.57.12 — A DEAD KTHREAD'S POOL SLOT IS HANDED OUT AGAIN. kthread_create used to bump a `kthread_next` cursor and
+# never move it back, so the four slots were four kthreads per BOOT: the BSP idle plus KTEST's two context-switch
+# threads plus the TEST suite's flock T9b thread filled it, and adding THREAD_SELFTEST or KSTACK_SELFTEST (two each)
+# made kthread_create return -1 although every one of those threads had retired long before. Each slot now records
+# the kthread on it as an INCARNATION (pid + 1, then proc_epoch[pid] — 0 = never handed out), and kthread_slot_free
+# says when its stack is free again:
+#   · the pid was recycled (epoch moved, or the slot is past proc_count after the bootstrap reset): proc_alloc_slot
+#     reuses a dead slot only once on_cpu == -1 (proc_slot_reusable), so the kthread had left its stack by then;
+#   · or it is dead (state 0) AND on_cpu == -1. on_cpu(old) = -1 is written only by sched_frame_iretq, after the CPU
+#     has left old's stack (INV-11), so a kthread that retired itself (state 0 on its own CPU, then sched_exit_tail)
+#     or was retired by another context through kthread_retire still owns its stack until its CPU switches away —
+#     `on_cpu != -1` keeps it. ⚠ That reading needs state 0 to be FINAL, which holds only for those two retire paths
+#     (review, 1.57.12): a bare proc_set_state(pid, 0) from another CPU can be overwritten by a switch path's revive
+#     (kthread_retire says how), and a reader that saw the 0 and then the switch-away's -1 would hand out the stack of
+#     a thread that is READY again. kthread_slot_free also reads the two cells as ONE snapshot under sched_lock, so a
+#     revive is seen as the state 1 it leaves behind, never as a 0 followed by a -1.
+# ⚠ kthread_create is NOT reentrant (the slot pick and the record are two steps): its callers are kmain's boot
+# bootstrap, kmain's boot self-tests and the TEST suite on kmain — never an AP (an AP idle runs on its own boot stack:
+# ap_idle_create -> proc_create_kclaim). The slot is recorded BEFORE the thread is published READY, so a thread that
+# runs and retires at once can never be seen with a stale record.
+var kthread_slot_pid[4];               # module scope = KTHREAD_MAX u64: pid + 1 of pool slot n's kthread; 0 = never used
+var kthread_slot_epoch[4];             # proc_epoch[pid] when that kthread took slot n
+fn kthread_slot_free(n) {
+    var ks_p = load64(&kthread_slot_pid + n * 8);
+    if (ks_p == 0) { return 1; }                                                   # never handed out
+    ks_p = ks_p - 1;
+    if (ks_p >= proc_count) { return 1; }                                          # the bootstrap reset the table
+    if (proc_epoch_get(ks_p) != load64(&kthread_slot_epoch + n * 8)) { return 1; } # pid recycled: it left long ago
+    # state + on_cpu as one snapshot: the switch paths change a proc's state under sched_lock (above). The lock is the
+    # innermost leaf and taken with IF=0 (smp.cyr); nothing is acquired or printed under it here.
+    var ks_f = kbd_irq_save();
+    sched_spin_lock();
+    var ks_st = load64(&proc_table + ks_p * 176 + 8);
+    var ks_oc = on_cpu_get(ks_p);
+    sched_spin_unlock();
+    kbd_irq_restore(ks_f);
+    if (ks_st != 0) { return 0; }                                                  # alive (ready / running / claiming)
+    if (ks_oc != (0 - 1)) { return 0; }                                            # dead, a CPU still leaving its stack
+    return 1;
+}
+# ⛔ 1.57.12 (review) — RETIRE A KTHREAD FROM ANOTHER CONTEXT UNDER sched_lock. kmain's self-tests retired their
+# kthreads with a bare proc_set_state(pid, 0), and a kthread may be current on another CPU at that moment
+# (KSTACK_SELFTEST's rmw pair are unpinned). That CPU's do_context_switch revives a running `old` to READY under
+# sched_lock in three steps — load the state (!= 0), load it again (< 4), store 1 — and an unlocked store of 0 landing
+# between them is overwritten: the retire is lost, the thread runs on, and its pool slot is never free again (or,
+# with an unlocked kthread_slot_free read of the 0 and then of the switch-away's on_cpu = -1, handed out while the
+# thread is READY on it). Under the lock the store is ordered against every switch path: a running thread is switched
+# away at its next tick and never revived (do_context_switch revives only states 1..3), a ready one is never picked
+# (sched_next takes only state 1). A kthread that retires ITSELF needs none of this: the switch paths write a RUNNING
+# proc's state only on its own CPU, between its instructions. 0 = retired, -1 = no such pid.
+fn kthread_retire(pid) {
+    if (pid < 0) { return 0 - 1; }
+    if (pid >= proc_count) { return 0 - 1; }
+    var kr_f = kbd_irq_save();
+    sched_spin_lock();
+    store64(&proc_table + pid * 176 + 8, 0);
+    sched_spin_unlock();
+    kbd_irq_restore(kr_f);
+    return 0;
+}
+# Free pool slots right now (KSTACK_SELFTEST's preempt-rmw phase prints it).
+fn kthread_free_count() {
+    var kf_n = 0;
+    var kf_c = 0;
+    while (kf_n < KTHREAD_MAX) { if (kthread_slot_free(kf_n) == 1) { kf_c = kf_c + 1; } kf_n = kf_n + 1; }
+    return kf_c;
+}
 #ifdef BOOTCR3_KEEP_GNOBOOT_CR3
 var KTHREAD_STACK_U64 = 512;           # 4 KB per kthread kernel stack (the pre-1.57.6 pool)
 var kthread_stacks[2048];              # KTHREAD_MAX x KTHREAD_STACK_U64 (= 16 KB)
@@ -1255,11 +1439,20 @@ fn kthread_stack_top(n) { return &kthread_stacks + (n + 1) * KTHREAD_STACK_U64 *
 fn kthread_stack_top(n) { return DIRECTMAP_BASE + KTHREAD_STACK_POOL + (n + 1) * 0x10000; }
 #endif
 fn kthread_create(entry) {
-    if (kthread_next >= KTHREAD_MAX) { return 0 - 1; }
-    # Stacks grow down: top = the top of this kthread's slot.
-    var stack_top = kthread_stack_top(kthread_next);
-    kthread_next = kthread_next + 1;
-    return proc_create_full(entry, stack_top);   # CR3 0x1000, IF=1, state=ready
+    var kc_n = 0;
+    while (kc_n < KTHREAD_MAX) {
+        if (kthread_slot_free(kc_n) == 1) { break; }
+        kc_n = kc_n + 1;
+    }
+    if (kc_n >= KTHREAD_MAX) { return 0 - 1; }
+    # Stacks grow down: top = the top of this kthread's slot. proc_create_full's two steps, with the slot recorded
+    # between them: CLAIMING (invisible to sched_next), record, then READY (CR3 0x1000, IF=1).
+    var kc_pid = proc_create_kclaim(entry, kthread_stack_top(kc_n));
+    if (kc_pid < 0) { return 0 - 1; }
+    store64(&kthread_slot_pid + kc_n * 8, kc_pid + 1);
+    store64(&kthread_slot_epoch + kc_n * 8, proc_epoch_get(kc_pid));
+    store64(&proc_table + kc_pid * 176 + 8, 1);   # state: 1=ready — published LAST
+    return kc_pid;
 }
 
 # Set a process's CR3 (page table root)
@@ -1458,7 +1651,7 @@ fn proc_create_address_space() {
     # Copy kernel PD entries [0..127] from kernel PD at 0x3000 — covers
     # 0 GB through 256 MB (0x10000000), the kernel/identity half of the
     # per-process PD where the kernel text/data/heap and the SYSCALL kstack
-    # (0x3F0000) live. These MUST stay identity-mapped: the syscall handler
+    # (0x3F0000 then; region 7 via the direct map since 1.51.x) live. These MUST stay identity-mapped: the syscall handler
     # and kstack run under THIS per-process CR3 and need a faithful phys==VA
     # map. Entry 511 is reserved as the user-CR3 stash slot (see
     # store64(new_pd + 511 * 8, new_pml4) below — proc_get_user_cr3 reads it

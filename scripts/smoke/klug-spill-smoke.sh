@@ -67,10 +67,16 @@ mcopy -i "$IMG"@@1048576 "$AGNOS" ::boot/agnos
 mkfs.ext2 -F -q -L AGNOS-KLUG -b 4096 -m 0 -O "$FEATURES" -d "$SEED" -E offset=$PART_OFFSET "$IMG" $PART_BLOCKS
 
 echo "Booting KLUG_SPILL_SELFTEST kernel (NVMe + GPT partition)..."
-cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/klug-spill.log"
 . "$ROOT/scripts/smoke/lib/qemu-dwell.sh"
-qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
+# ⭐ 1.57.12 (ROOM review) — qemu_dwell_kernel, not the bare qemu_dwell this smoke used since 1.56.10. A firmware VOID
+# (`gnoboot: fail @ EBS` -> the OVMF boot menu) used to sit out the whole budget and then fail every assertion below
+# against a log the kernel never wrote: the review's linear run needed THREE launches by hand. Now a VOID attempt is
+# retried with a fresh vars.fd (banner-gated, QEMU_TRIES; its log kept as $LOG.attemptN), a kernel that died before
+# its banner FAILS at once, and exhausting the retries is VOID (exit 2), never a FAIL. A retried attempt cannot have
+# touched the disk image: a VOID means the kernel never ran. Since 1.57.12 this smoke is two sweep rows.
+QEMU_DWELL_VOID="${QEMU_DWELL_VOID:-gnoboot: fail @|BootManagerMenuApp|Please select boot device}" \
+qemu_dwell_kernel "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" "$WORK/vars.fd" "$OVMF_VARS_SRC" \
     qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
@@ -78,6 +84,7 @@ qemu_dwell "$LOG" "agnos>" "${QEMU_TIMEOUT:-40}" \
     -drive "file=$IMG,format=raw,if=none,id=disk0" \
     -device "nvme,drive=disk0,serial=AGNOS-KLUG" \
     -serial stdio -display none -no-reboot
+qemu_assert_booted "$LOG" || { echo "=== klug-spill-smoke: VOID (the kernel never ran) ==="; exit 2; }
 
 echo "--- klug lines ---"
 grep -aE "klug:" "$LOG" | head -5
@@ -143,11 +150,13 @@ elif [ "${REPORTED:-0}" -gt 0 ] && [ "${SPILL_BYTES:-0}" -ge "${REPORTED:-1}" ];
     # require EVERY line to. That is self-calibrating (no hardcoded pre-UART head count), it compares
     # ~80 lines instead of 1, and it is format-agnostic — no anchor, so a prefix change cannot silently
     # empty it. The corpus size is asserted and PRINTED so a run that compares nothing says so.
-    cmp=0; miss=0; started=0
+    cmp=0; miss=0; started=0; moved=0; pre_cmp=0
     while IFS= read -r l; do
         [ "${#l}" -lt 8 ] && continue
+        case "$l" in *"klug: log ring moved to the room carve-out"*) moved=1;; esac
         if grep -aqF "$l" "$LOG"; then
             started=1; cmp=$((cmp+1))
+            [ "$moved" = 0 ] && pre_cmp=$((pre_cmp+1))
         elif [ "$started" = 1 ]; then
             cmp=$((cmp+1)); miss=$((miss+1))
         fi
@@ -163,6 +172,16 @@ elif [ "${REPORTED:-0}" -gt 0 ] && [ "${SPILL_BYTES:-0}" -ge "${REPORTED:-1}" ];
     fi
     chk "$r" "spill and serial agree on every line once the UART is up ($cmp compared, independent oracle)" \
             "$why"
+    # ⭐ 1.57.12 (ROOM) — THE MOVED BYTES, BY NAME. The ring's head is now the 8 KB EARLY ring that
+    # klug_move_to_room copied into the room carve-out (core/room.cyr, klug.cyr): every line before the move's own
+    # line was written to klug_early and read back here from klug_buf's room slot. The comparison above already
+    # covers them; this makes that coverage a stated, counted property instead of a side effect — the move line must
+    # be in the spill (the ring on disk is the room ring) and at least 10 serial-matched lines must precede it (the
+    # copied early bytes, compared byte for byte by line). A move that dropped, reordered or double-copied the early
+    # ring fails the line above or this one.
+    if [ "$moved" = 1 ] && [ "$pre_cmp" -ge 10 ]; then r=1; else r=0; fi
+    chk "$r" "the early ring moved into the room intact ($pre_cmp line(s) before the move line match serial)" \
+            "the early ring is not in the spill as moved (move line seen=$moved, $pre_cmp matched line(s) before it, need >= 10)"
 else
     echo "FAIL: nothing to compare — spill absent or shorter than reported"; fail=$((fail+1))
 fi

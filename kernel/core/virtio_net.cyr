@@ -145,8 +145,8 @@ fn dma_kva_ok(dko_kva) {
 # Cap-list scan (identical shape to vblk_scan_caps in virtio_blk.cyr)
 # ---------------------------------------------------------------------
 fn vnet_scan_caps(idx) {
-    var slot = PciDev_slot(&pci_devs + idx * 32);
-    var bf = load64(&pci_busfunc + idx * 8);
+    var slot = PciDev_slot(pci_devs + idx * 32);
+    var bf = load64(pci_busfunc + idx * 8);
     var bus  = (bf >> 8) & 0xFF;
     var func = bf & 0x07;
 
@@ -367,8 +367,8 @@ fn vnet_rx_prime() {
 # UC-remapped, 1.50.x). Returns 0, or -1 if the device advertises no MSI-X cap
 # (caller then relies on the timer-tick drain + the 1.51.3 busy-poll).
 fn vnet_msix_enable_rx(idx) {
-    var slot = PciDev_slot(&pci_devs + idx * 32);
-    var bf = load64(&pci_busfunc + idx * 8);
+    var slot = PciDev_slot(pci_devs + idx * 32);
+    var bf = load64(pci_busfunc + idx * 8);
     var bus  = (bf >> 8) & 0xFF;
     var func = bf & 0x07;
     var msix_off = pci_find_cap(idx, 0x11);
@@ -414,7 +414,7 @@ fn virtio_net_init() {
     if (idx < 0) { idx = pci_find(0x1AF4, 0x1000); }
     if (idx < 0) { return 0 - 1; }
 
-    pci_enable_bus_master(PciDev_slot(&pci_devs + idx * 32));
+    pci_enable_bus_master(PciDev_slot(pci_devs + idx * 32));
 
     if (vnet_scan_caps(idx) < 0) { return 0 - 1; }
 

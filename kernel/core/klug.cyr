@@ -59,9 +59,25 @@
 # program's output — which is why (a) has to MOVE the write into the kernel rather
 # than filter it, and why there is no cheap third option hiding here.
 
-var klug_buf[8192];        # 64 KB (8192 * 8)
-var klug_head = 0;         # next write offset, 0..65535
-var klug_count = 0;        # total bytes captured, saturates at 65536 (wrap flag)
+# ⭐ 1.57.12 (ROOM) — THE 64 KB RING LEFT THE IMAGE; AN 8 KB EARLY RING TAKES THE BOOT LOG UNTIL IT IS UP. The note above
+# ("costs its full size in the kernel image") was true until here: the ring is ROOM slot 2 (core/room.cyr,
+# docs/architecture/kernel-image-room.md), a 64 KB page run of the boot carve-out reached through the direct map, and
+# `klug_buf` is its POINTER — the poison until room_init. Linux's shape exactly (kernel/printk/printk.c): a static
+# __log_buf takes the log from the first printk, and setup_log_buf() later moves it into a memblock allocation, copying
+# what is there under the log lock with IRQs off. Here the early ring is `klug_early`, 8 KB in the image, written
+# LINEARLY (never wrapped) while klug_early_mode is 1; klug_move_to_room copies it to the head of the room ring and
+# clears the mode, and from then on every reader and writer uses the 64 KB geometry this file always had. Measured: a
+# QEMU boot has written 1,573 B by then (plain, -m 512M). An IRON boot's pre-move log is UNMEASURED — the move's line
+# reports the count, and the first iron burn reads it (ZFS write spec § k.74 (g)). A byte that does not fit the early
+# ring is COUNTED (klug_early_lost) and the move reports it as "B LOST" — never silent; agnsh-smoke fails on a loss.
+# ⚠ Readers (dump, spill, the klug syscall, lifecycle_trace) all run after room_init; before it `klug_buf` is the
+# poison, so a reader moved earlier faults BY NAME ("PANIC: room: klug_buf used before the carve-out").
+var klug_early[1024];      # 8 KB (1024 * 8): the boot log until room_init — linear, never wrapped
+var klug_early_mode = 1;   # 1 until klug_move_to_room; every writer tests it
+var klug_early_lost = 0;   # bytes that did not fit the early ring (reported by klug_move_to_room)
+var klug_buf = 0xFFFFA00200000000;   # ROOM slot 2 — the 64 KB ring (core/room.cyr); its poison until room_init
+var klug_head = 0;         # next write offset, 0..65535 (early: 0..8192, linear)
+var klug_count = 0;        # total bytes captured, saturates at 65536 (wrap flag); early: == klug_head
 
 # ⭐ 1.57.7 (S7) — THE KLUG LOCK. Every append is serialized by klug_lock_word (smp.cyr): until now two CPUs appending
 # at once interleaved BYTES (klug_head is a plain RMW), so a lifecycle trace line — the smoke's oracle — could be torn
@@ -95,7 +111,17 @@ fn klug_lock_release(tok) {
 # safely from the earliest boot, before any console backend is up.
 # _raw: the caller holds klug_lock (or is the boot path before any second CPU exists).
 fn klug_putc_raw(ch) {
-    store8(&klug_buf + klug_head, ch & 0xFF);
+    if (klug_early_mode != 0) {
+        if (klug_head < 8192) {
+            store8(&klug_early + klug_head, ch & 0xFF);
+            klug_head = klug_head + 1;
+            klug_count = klug_head;
+        } else {
+            klug_early_lost = klug_early_lost + 1;
+        }
+        return 0;
+    }
+    store8(klug_buf + klug_head, ch & 0xFF);
     klug_head = (klug_head + 1) & 0xFFFF;
     if (klug_count < 65536) { klug_count = klug_count + 1; }
     return 0;
@@ -110,8 +136,12 @@ fn klug_putc(ch) {
 # Append a (buf, len) run.
 fn klug_append_raw(buf, len) {
     var i = 0;
+    if (klug_early_mode != 0) {
+        while (i < len) { klug_putc_raw(load8(buf + i)); i = i + 1; }
+        return 0;
+    }
     while (i < len) {
-        store8(&klug_buf + klug_head, load8(buf + i));
+        store8(klug_buf + klug_head, load8(buf + i));
         klug_head = (klug_head + 1) & 0xFFFF;
         if (klug_count < 65536) { klug_count = klug_count + 1; }
         i = i + 1;
@@ -122,6 +152,31 @@ fn klug_append(buf, len) {
     var ka_t = klug_lock_acquire();
     klug_append_raw(buf, len);
     klug_lock_release(ka_t);
+    return 0;
+}
+
+# ⭐ 1.57.12 (ROOM) — move the log into its room slot: Linux's setup_log_buf. Called ONCE, by room_init (core/room.cyr),
+# after klug_buf points at the slot and the slot is zeroed. Under klug_lock with IRQs off (klug_lock_acquire saves
+# RFLAGS) — a timer ISR that prints cannot interleave — the early ring's bytes go to the head of the room ring in order,
+# head and count carry over, and the mode flips; the report prints after the flip, so it lands in the room ring.
+fn klug_move_to_room() {
+    var km_t = klug_lock_acquire();
+    var km_n = klug_head;
+    var km_i = 0;
+    while (km_i < km_n) { store8(klug_buf + km_i, load8(&klug_early + km_i)); km_i = km_i + 1; }
+    klug_head = km_n;
+    klug_count = km_n;
+    klug_early_mode = 0;
+    klug_lock_release(km_t);
+    kprint("klug: log ring moved to the room carve-out (65536 B); the early ring held ", 74);
+    kprint_num(km_n);
+    kprint(" of 8192 B", 10);
+    if (klug_early_lost != 0) {
+        kprint(" -- ", 4);
+        kprint_num(klug_early_lost);
+        kprint(" B LOST (the early ring was full)", 33);
+    }
+    kprintln("", 0);
     return 0;
 }
 
@@ -176,7 +231,7 @@ fn klug_err(buf, len)  { kprint("[E] ", 4); kprintln(buf, len); return 0; }
 fn klug_replay_fb() {
     var n = klug_head;
     if (klug_count >= 65536) { n = 65536; }     # wrapped — best-effort, whole ring
-    fb_print(&klug_buf, n);
+    fb_print(klug_buf, n);
     return 0;
 }
 
@@ -185,8 +240,8 @@ fn klug_dump() {
     serial_print(begin, 16); fb_print(begin, 16);
     var n = klug_head;
     if (klug_count >= 65536) { n = 65536; }     # wrapped — emit the whole ring (best-effort)
-    serial_print(&klug_buf, n);
-    fb_print(&klug_buf, n);
+    serial_print(klug_buf, n);
+    fb_print(klug_buf, n);
     var endm = "\nKLUG-DUMP-END\n";
     serial_print(endm, 15); fb_print(endm, 15);
     return 0;
@@ -211,6 +266,11 @@ fn klug_dump() {
 #
 # ⚠ vfs_create_on / vfs_write_on are NOT usable here — they dispatch FAT/exFAT only and return -1 for ext2
 # (vfs.cyr:502-514). agnos-fs is ext2, so this goes straight at the ext2 layer.
+#
+# ⚠ 1.57.12 (ROOM) — ext2_write_at, NOT ext2_write_at_dma (which this file called from 1.56.51). klug_buf lives in the
+# room, CPU-only memory by rule (core/room.cyr): it is never a DMA address, so the spill does not opt into ext2's direct
+# path — and from the room it never passed that path's identity bound anyway (a direct-map VA). Every spill byte goes
+# through ext2's single-block bounce (ext2_block_buf): 16 block writes for the 64 KB ring.
 
 var klug_spill_ino = 0;        # inode of the pre-allocated spill file (0 = not prepared)
 
@@ -230,7 +290,7 @@ fn klug_spill_prepare() {
     if (ino <= 0) { kprintln("klug: spill file unavailable", 28); return 0; }
     # Allocate every block now, while the console is alive and a failure is readable. The content written
     # here is the ring as it stands at mount (mostly zeros this early) and is fully overwritten by a spill.
-    if (ext2_write_at_dma(ino, 0, &klug_buf, 65536) <= 0) {
+    if (ext2_write_at(ino, 0, klug_buf, 65536) <= 0) {
         kprintln("klug: spill preallocation failed", 32);
         return 0;
     }
@@ -250,14 +310,14 @@ fn klug_spill() {
     var n = 0;
     if (klug_count >= 65536) {
         var tail = 65536 - klug_head;                                  # oldest run: head -> end
-        if (ext2_write_at_dma(klug_spill_ino, 0, &klug_buf + klug_head, tail) <= 0) { return 0; }
+        if (ext2_write_at(klug_spill_ino, 0, klug_buf + klug_head, tail) <= 0) { return 0; }
         n = tail;
         if (klug_head > 0) {
-            if (ext2_write_at_dma(klug_spill_ino, tail, &klug_buf, klug_head) > 0) { n = n + klug_head; }
+            if (ext2_write_at(klug_spill_ino, tail, klug_buf, klug_head) > 0) { n = n + klug_head; }
         }
     }
     if (klug_count < 65536) {
-        if (ext2_write_at_dma(klug_spill_ino, 0, &klug_buf, klug_head) <= 0) { return 0; }
+        if (ext2_write_at(klug_spill_ino, 0, klug_buf, klug_head) <= 0) { return 0; }
         n = klug_head;
     }
     return n;

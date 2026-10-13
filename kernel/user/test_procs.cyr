@@ -1,44 +1,80 @@
-# === Test Processes ===
-# Simple loop functions for context switch testing.
-# Each prints its ID to serial, then halts until next timer tick.
-# Why busy-loops: the function MUST NOT return — its `ret` would pop an
-# uninitialized stack word and jump to garbage. Iron-boot Attempt 12
-# (2026-05-14) triple-faulted on iter 0 of the scheduler loop with the
-# previous `if (0 == 1) { ... } return 0;` shape. See
-# docs/development/iron-nuc-zen-log.md § Attempt 12 for the trace.
-# Coupled file: scripts/bench.sh inverts `while (1 == 1)` → `if (0 == 1)`
-# for bench builds so the scheduler doesn't keep these alive past
-# arch_halt. bench.sh guards on a match-count of exactly 2 — if you
-# add/remove a test_proc here, update bench.sh's guard accordingly.
+# === Test Processes (KTEST boot self-tests, core/main.cyr) ===
+# ⭐ 1.57.12 — REBUILT ON THE CURRENT PROCESS MODEL. These bodies were left over from the pre-1.44 scheduler and
+# could no longer run: test_proc_a/b were `if (0 == 1) { ... } return 0;` no-ops that RETURNED (a fresh stack has
+# no return address, so the `ret` jumped into garbage — iron Attempt 12, docs/development/iron-nuc-zen-log.md), on
+# stacks main.cyr hand-placed in region 4; user_test_proc wrote from a kernel .rodata pointer (write#1 refuses it:
+# is_user_range) and was spawned READY with ring-0 selectors and never run. Now:
+#   test_proc_a / test_proc_b — KERNEL THREADS (ktest_kthread_create below, from main.cyr's KTEST Scheduler Test on
+#     the live scheduler — after the other boot self-tests retired theirs, so the 4-slot kthread pool has room): each
+#     makes KTEST_CS_ITERS rounds of print + hlt (every hlt lets the timer switch it out; the next round runs only
+#     when the scheduler switches it back in), then retires — state 0, then sched_exit_tail, the dead-current exit
+#     (sched.cyr) a dead kthread leaves by; it never returns. main.cyr's Scheduler Test reads the counters.
+#   user_test_proc — copied into its own address space (spawn_user_proc_claim) and RUN in ring 3 as kmain's child
+#     (kernel_exec_foreground): ten write#1 calls from its own user stack, then exit#0 with code 42.
+# Coupled file: scripts/bench.sh requires ZERO always-true while-loop lines here (it greps for the literal): a
+# busy-looping test proc would keep the scheduler alive past bench's arch_halt. bench builds do not define KTEST,
+# so none of these is created there; the bounded loops below keep the guard's contract anyway.
+var KTEST_CS_ITERS = 10;   # hlt rounds each context-switch thread makes before it retires
+var ktest_cs_a = 0;        # rounds test_proc_a completed
+var ktest_cs_b = 0;        # rounds test_proc_b completed
+var ktest_pid_a = 0;       # the threads' pids, set by main.cyr's Scheduler Test (kthread_create: -1 = not created)
+var ktest_pid_b = 0;       # (literal initialisers only: an expression one never runs in a kernel build)
+
+#ifdef KTEST
+# A kthread for the Scheduler Test. kthread_create hands out a retired kthread's pool slot only once that kthread has
+# LEFT its CPU (on_cpu == -1, proc.cyr kthread_slot_free); one a self-test retired a moment ago may still be on an AP
+# until that AP's next tick, so a refusal is retried for up to 20 ticks (the scheduler is live here) before -1.
+fn ktest_kthread_create(entry) {
+    var kk_pid = kthread_create(entry);
+    var kk_w = 0;
+    while (kk_pid < 0 && kk_w < 20) {
+        arch_wait();
+        kk_pid = kthread_create(entry);
+        kk_w = kk_w + 1;
+    }
+    return kk_pid;
+}
+# 1 = the kthread `pid` retired (state 0) and left its CPU (on_cpu == -1, the switch tail's release); 0 otherwise.
+fn ktest_kthread_gone(pid) {
+    if (pid < 0) { return 0; }
+    if (proc_get_state(pid) != 0) { return 0; }
+    if (on_cpu_get(pid) != (0 - 1)) { return 0; }
+    return 1;
+}
+#endif
 
 fn test_proc_a() {
     # CMOS CP 0x20: context switch into test_proc_a succeeded (pre-loop reached).
+    # asm contract: no inputs/outputs; clobbers al only (outb 0x70 <- 0x50, outb 0x71 <- 0x20).
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x20; 0xE6; 0x71; }
-    var iter = 0;
-    if (0 == 1) {
+    while (ktest_cs_a < KTEST_CS_ITERS) {
         serial_print("A", 1);
-        if (iter == 0) {
-            # CMOS CP 0x21: first serial_print in proc context returned.
+        if (ktest_cs_a == 0) {
+            # CMOS CP 0x21: first serial_print in thread context returned. Contract as above (0x71 <- 0x21).
             asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x21; 0xE6; 0x71; }
         }
         arch_wait();
-        if (iter == 0) {
-            # CMOS CP 0x22: first arch_wait round-trip (hlt → timer ISR → resume).
+        if (ktest_cs_a == 0) {
+            # CMOS CP 0x22: first arch_wait round-trip (hlt -> timer ISR -> resume). Contract as above (0x71 <- 0x22).
             asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x22; 0xE6; 0x71; }
         }
-        iter = iter + 1;
+        ktest_cs_a = ktest_cs_a + 1;
     }
+    proc_set_state(proc_current_get(), 0);   # retire (sss_worker's kthread exit: a dead kthread slot is state 0)
+    sched_exit_tail();                       # never returns: leaves this CPU and is never revived
     return 0;
 }
 
 fn test_proc_b() {
-    # CMOS CP 0x23: sched_next rotated from test_proc_a → test_proc_b
-    # (proves the round-robin is alive between user procs).
+    # CMOS CP 0x23: the scheduler switched into test_proc_b too (both threads are alive). Contract as test_proc_a's.
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x23; 0xE6; 0x71; }
-    if (0 == 1) {
+    while (ktest_cs_b < KTEST_CS_ITERS) {
         serial_print("B", 1);
         arch_wait();
+        ktest_cs_b = ktest_cs_b + 1;
     }
+    proc_set_state(proc_current_get(), 0);
+    sched_exit_tail();
     return 0;
 }
 
@@ -51,25 +87,33 @@ fn test_hw_syscall() {
     return 0;
 }
 
-# User-mode test process. Runs in ring 3.
-# Uses the SYSCALL instruction to communicate with the kernel.
-# Prints "U" repeatedly via syscall write, then exits.
+# User-mode test process. Runs in ring 3 at VA 0x400000 (spawn_user_proc_claim copies this function's first 4 KB
+# there), so it must stay position-independent: no calls, no kernel addresses. Ten write#1 calls of the one byte 'U'
+# held in `msg` ON ITS OWN USER STACK, then exit#0 with code 42 (the Userland Exec Test checks the code).
+# ⚠ This function contains asm, so cyrius does not register-allocate it: `msg` is the first local, at [rbp-8], and
+# `count` at [rbp-16].
 fn user_test_proc() {
-    # Ring 3. write(1, fd=0, buf, len)
-    var msg = "U";
+    var msg = 85;                    # 'U' — its address is [rbp-8], a user-stack address write#1 accepts
     var count = 0;
     while (count < 10) {
-        # rax=1(write), rdi=0(fd serial), rsi=msg, rdx=1(len)
+        # write(fd=0, buf=&msg, len=1). REGISTER CONTRACT: in — rbp (the frame); out — rax = the syscall result
+        # (unused); clobbers rax, rdi, rsi, rdx, and rcx/r11 (SYSCALL). No callee-saved register or rsp is touched.
         asm {
-            0x48; 0xC7; 0xC0; 0x01; 0x00; 0x00; 0x00;
-            0x48; 0x31; 0xFF;
-            0x48; 0x8B; 0x75; 0xF8;
-            0x48; 0xC7; 0xC2; 0x01; 0x00; 0x00; 0x00;
-            0x0F; 0x05;
+            0x48; 0xC7; 0xC0; 0x01; 0x00; 0x00; 0x00;   # mov rax, 1          (write#1)
+            0x48; 0x31; 0xFF;                           # xor rdi, rdi        (fd 0, the inherited console)
+            0x48; 0x8D; 0x75; 0xF8;                     # lea rsi, [rbp-8]    (&msg, on the user stack)
+            0x48; 0xC7; 0xC2; 0x01; 0x00; 0x00; 0x00;   # mov rdx, 1          (len)
+            0x0F; 0x05;                                 # syscall
         }
         count = count + 1;
     }
-    asm { 0x48; 0x31; 0xC0; 0x48; 0x31; 0xFF; 0x0F; 0x05; }
+    # exit(42). REGISTER CONTRACT: no inputs; clobbers rax, rdi, rcx, r11; does not return (exit#0 is the death chain).
+    asm {
+        0x48; 0x31; 0xC0;                               # xor rax, rax        (exit#0)
+        0xBF; 0x2A; 0x00; 0x00; 0x00;                   # mov edi, 42         (the exit code the test checks)
+        0x0F; 0x05;                                     # syscall
+    }
+    # Unreachable: a `jmp $` (EB FE) so a returning exit could never run off the end of the copied page. No registers.
     asm { 0xEB; 0xFE; }
     return 0;
 }

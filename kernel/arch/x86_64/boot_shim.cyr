@@ -1,189 +1,20 @@
-# === Boot shim — entry point for both multiboot1 (ELF32) and
-# === multiboot2 (ELF64) paths ===
+# === Boot shim — the kernel entry point (ELF64, Path C: gnoboot hands off here) ===
 #
-# Path is selected by the build-time macro `ELF64_KERNEL` (set by
-# scripts/build.sh when CYRIUS_ELF64_KERNEL=1). The two paths live
-# side-by-side under #ifndef/#ifdef so the legacy ELF32 multiboot1
-# build stays bit-identical (verified by step 4a sanity check on
-# 2026-05-13: cyrius 5.11.43 build of agnos sha256-matched the
-# 5.11.29 build). See agnosticos/docs/development/path-a-elf64-multiboot2.md.
-
-#ifndef ELF64_KERNEL
-# === 32-bit boot shim (ELF32 multiboot1, legacy path) ===
+# Guarded by the build-time macro `ELF64_KERNEL`, which every kernel builder defines: scripts/build.sh
+# and scripts/test.sh prepend `#define ELF64_KERNEL` (with CYRIUS_ELF64_KERNEL=1, the backend half), and
+# bench.sh / ktest.sh build through build.sh. mbi.cyr's boot_info_capture_rdi sits under the same guard.
 #
-# Multiboot1 hands control here in 32-bit protected mode (paging off,
-# A20 enabled, flat 0–4 GB CS/DS, GDT undefined, ESI = mb info, EAX
-# = 0x2BADB002). This block transitions the CPU all the way to 64-bit
-# long mode and falls through into the kernel's 64-bit code.
-#
-# Per cc5 v5.7.19's kmode==1 emit-order invariant, this top-level asm
-# block is the FIRST thing emitted after the entry-point JMP — see
-# kernel/agnos.cyr include site comment + the proposal in
-# docs/development/proposals/2026-04-27-cc5-kernel-boot-shim-regression.md.
-#
-# Sequence:
-#   1. Set up 32-bit stack at 0x3E0000 (NOT 0x200000 — the >2 MB kernel's
-#      .rodata sits just below 0x200000; see step 12. 0x3A0000 until 1.57.11, 0x380000 until 1.57.7).
-#   2. Init COM1 UART (0x3F8) so the kernel can print before paging.
-#   3. Zero 12 KB of page tables at 0x1000–0x4000.
-#   4. Build PML4 / PDPT / PD entries identity-mapping 0x0–0x400000
-#      (4 MB) with 2 MB huge pages.
-#   5. Enable PAE in CR4 unconditionally; CPUID-gate SMEP / SMAP — v1.29.0
-#      ORed all three bits blindly and triple-faulted on any CPU that
-#      didn't advertise SMEP (pre-Ivy Bridge) or SMAP (pre-Broadwell).
-#      On UEFI iron without exception handlers and without a visible
-#      console (no serial cable, VGA 0xB8000 not mapped), the failure
-#      surfaced as a silent reset right after GRUB's multiboot handoff.
-#      QEMU `-cpu max` advertises both bits, so QEMU keeps booting
-#      cleanly; `qemu64` still lacks them and now skips them rather
-#      than triple-faulting at the OR.
-#   6. Load CR3 with PML4 base.
-#   7. Set LME + NXE in IA32_EFER (MSR 0xC0000080).
-#   8. Set PG + PE in CR0 → paging on, now in 32-bit compatibility submode.
-#   9. Build a 24-byte GDT at 0x4000 (null + 64-bit CS + DS).
-#   10. Far-jump through the 64-bit CS to switch to true long mode.
-#   11. Reload DS/ES/SS with 0x10 (64-bit data selector).
-#   12. Set up 64-bit stack at 0x3E0000, fall through to kernel code.
-
-asm {
-    # 1. 32-bit stack at 0x3E0000 (see the 64-bit step 12 below for why NOT
-    #    0x200000 — the kernel image crossed 2 MB and its .rodata now sits
-    #    immediately below 0x200000, so a downward-growing stack there stomps
-    #    string literals — and why 0x3E0000, not the 0x3A0000 of 1.57.7-1.57.10 or the 0x380000 of 1.57.3-1.57.6).
-    #    ⚠ All three boot-stack immediates in this file (this one, step 12, and
-    #    the ELF64 step 1) must equal BSP_BOOT_TOP in
-    #    scripts/check/image-layout-check.sh, which decodes them and fails on any
-    #    mismatch (this legacy one is not in the ELF64 image, so only that
-    #    source check can see it drift).
-    0xBC; 0x00; 0x00; 0x3E; 0x00;                          # mov esp, 0x3E0000
-
-    # 2. COM1 UART init (port 0x3F8)
-    0xBA; 0xF9; 0x03; 0x00; 0x00; 0xB0; 0x00; 0xEE;        # mov edx, 0x3F9; mov al, 0; out dx, al   ; IER  = 0 (mask all UART IRQs)
-    0xBA; 0xFB; 0x03; 0x00; 0x00; 0xB0; 0x80; 0xEE;        # mov edx, 0x3FB; mov al, 0x80; out dx, al; LCR  = DLAB=1 (unlock divisor regs)
-    0xBA; 0xF8; 0x03; 0x00; 0x00; 0xB0; 0x01; 0xEE;        # mov edx, 0x3F8; mov al, 1; out dx, al   ; DLL  = 1     (115200 baud, low byte)
-    0xBA; 0xF9; 0x03; 0x00; 0x00; 0xB0; 0x00; 0xEE;        # mov edx, 0x3F9; mov al, 0; out dx, al   ; DLM  = 0     (115200 baud, high byte)
-    0xBA; 0xFB; 0x03; 0x00; 0x00; 0xB0; 0x03; 0xEE;        # mov edx, 0x3FB; mov al, 3; out dx, al   ; LCR  = 8N1, DLAB=0
-    0xBA; 0xFA; 0x03; 0x00; 0x00; 0xB0; 0xC7; 0xEE;        # mov edx, 0x3FA; mov al, 0xC7; out dx, al; FCR  = enable+clear FIFOs, 14-byte trigger
-    0xBA; 0xFC; 0x03; 0x00; 0x00; 0xB0; 0x0B; 0xEE;        # mov edx, 0x3FC; mov al, 0x0B; out dx, al; MCR  = DTR | RTS | OUT2 (route IRQ)
-
-    # 3. Zero page-table area: 3072 dwords (12 KB) at 0x1000
-    0xBF; 0x00; 0x10; 0x00; 0x00; 0xB9; 0x00; 0x0C; 0x00; 0x00;  # mov edi, 0x1000; mov ecx, 0xC00
-    0x31; 0xC0; 0xFC; 0xF3; 0xAB;                          # xor eax, eax; cld; rep stosd
-
-    # 4. Identity map 0x0–0x400000 with 2 MB huge pages
-    0xC7; 0x05; 0x00; 0x10; 0x00; 0x00; 0x03; 0x20; 0x00; 0x00;  # mov [0x1000], 0x2003       ; PML4[0] -> PDPT @ 0x2000 | P|RW
-    0xC7; 0x05; 0x00; 0x20; 0x00; 0x00; 0x03; 0x30; 0x00; 0x00;  # mov [0x2000], 0x3003       ; PDPT[0] -> PD   @ 0x3000 | P|RW
-    0xC7; 0x05; 0x00; 0x30; 0x00; 0x00; 0x83; 0x00; 0x00; 0x00;  # mov [0x3000], 0x83         ; PD[0]   = 2 MB @ 0x000000 | P|RW|PS
-    0xC7; 0x05; 0x08; 0x30; 0x00; 0x00; 0x83; 0x00; 0x20; 0x00;  # mov [0x3008], 0x200083     ; PD[1]   = 2 MB @ 0x200000 | P|RW|PS
-
-    # 5. CR4: enable PAE (bit 5) always; CPUID-gate SMEP (bit 20) + SMAP
-    #    (bit 21). CPUID leaf 7 sub-leaf 0 returns SMEP at EBX[7] and SMAP
-    #    at EBX[20]. We build the new CR4 value in EBX so EAX is free to
-    #    hold the CPUID feature bits across the test/jz sequences.
-    0x0F; 0x20; 0xE3;                                      # mov  ebx, cr4
-    0x81; 0xCB; 0x20; 0x00; 0x00; 0x00;                    # or   ebx, 0x20         ; PAE
-    0x53;                                                  # push ebx                ; save working CR4
-    0xB8; 0x07; 0x00; 0x00; 0x00;                          # mov  eax, 7
-    0x31; 0xC9;                                            # xor  ecx, ecx
-    0x0F; 0xA2;                                            # cpuid                   ; EBX = feature bits
-    0x89; 0xD8;                                            # mov  eax, ebx           ; stash features in eax
-    0x5B;                                                  # pop  ebx                ; restore working CR4
-    0xA9; 0x80; 0x00; 0x00; 0x00;                          # test eax, 0x80          ; SMEP supported?
-    0x74; 0x06;                                            # jz   +6                 ; skip OR if not
-    0x81; 0xCB; 0x00; 0x00; 0x10; 0x00;                    # or   ebx, 0x100000      ; CR4.SMEP
-    0xA9; 0x00; 0x00; 0x10; 0x00;                          # test eax, 0x100000      ; SMAP supported?
-    0x74; 0x06;                                            # jz   +6                 ; skip OR if not
-    0x81; 0xCB; 0x00; 0x00; 0x20; 0x00;                    # or   ebx, 0x200000      ; CR4.SMAP
-    0x0F; 0x22; 0xE3;                                      # mov  cr4, ebx
-
-    # 6. CR3 = PML4 base (0x1000)
-    0xB8; 0x00; 0x10; 0x00; 0x00;                          # mov eax, 0x1000
-    0x0F; 0x22; 0xD8;                                      # mov cr3, eax
-
-    # 7. IA32_EFER (MSR 0xC0000080): set LME (bit 8) + NXE (bit 11)
-    0xB9; 0x80; 0x00; 0x00; 0xC0; 0x0F; 0x32;              # mov ecx, 0xC0000080; rdmsr
-    0x0D; 0x00; 0x09; 0x00; 0x00; 0x0F; 0x30;              # or  eax, 0x900; wrmsr
-
-    # 8. CR0: enable PG (bit 31) + PE (bit 0) — paging on, compat submode
-    0x0F; 0x20; 0xC0;                                      # mov eax, cr0
-    0x0D; 0x01; 0x00; 0x00; 0x80;                          # or  eax, 0x80000001
-    0x0F; 0x22; 0xC0;                                      # mov cr0, eax
-
-    # 9. Build minimal GDT at 0x4000: null + 64-bit CS (0x08) + data DS (0x10)
-    0xBF; 0x00; 0x40; 0x00; 0x00;                          # mov edi, 0x4000
-    0x31; 0xC0; 0x89; 0x07; 0x89; 0x47; 0x04;              # xor eax, eax; mov [edi], eax; mov [edi+4], eax  ; null descriptor
-    0xC7; 0x47; 0x08; 0xFF; 0xFF; 0x00; 0x00;              # mov [edi+8],  0x0000FFFF                          ; CS desc lo: limit=0xFFFF
-    0xC7; 0x47; 0x0C; 0x00; 0x9A; 0xAF; 0x00;              # mov [edi+12], 0x00AF9A00                          ; CS desc hi: type=code, L=1, P=1, S=1
-    0xC7; 0x47; 0x10; 0xFF; 0xFF; 0x00; 0x00;              # mov [edi+16], 0x0000FFFF                          ; DS desc lo: limit=0xFFFF
-    0xC7; 0x47; 0x14; 0x00; 0x92; 0xCF; 0x00;              # mov [edi+20], 0x00CF9200                          ; DS desc hi: type=data, P=1, S=1
-    0x66; 0xC7; 0x47; 0x20; 0x17; 0x00;                    # mov word [edi+32], 23                             ; GDTR limit (3 entries * 8 - 1)
-    0xC7; 0x47; 0x22; 0x00; 0x40; 0x00; 0x00;              # mov dword [edi+34], 0x4000                        ; GDTR base
-
-    # 10. Load GDTR and far-jump to 64-bit CS — flushes the pipeline into long mode
-    0x0F; 0x01; 0x57; 0x20;                                # lgdt [edi+32]
-    # Build the m16:32 far-jump operand on the stack: [target_offset, selector=8].
-    # The call+pop pattern computes the absolute address of the post-jump label.
-    0xE8; 0x00; 0x00; 0x00; 0x00;                          # call $+5            ; push next-instr addr
-    0x58;                                                  # pop  eax            ; eax = ret addr
-    0x83; 0xC0; 0x15;                                      # add  eax, 0x15      ; eax = post-jump label
-    0x50;                                                  # push eax            ; stack: [eax (offset)]
-    0x6A; 0x08;                                            # push 8              ; stack: [8 (selector), eax]
-    0x89; 0x04; 0x24;                                      # mov  [esp], eax     ; stack: [eax, eax] (placeholder)
-    0xC7; 0x44; 0x24; 0x04; 0x08; 0x00; 0x00; 0x00;        # mov  dword [esp+4], 8 ; stack: [eax (offset), 8 (selector)]
-    0xFF; 0x2C; 0x24;                                      # jmp  far [esp]      ; → 64-bit CS, long mode active
-
-    # 11. Reload data segments with 0x10 (DS selector)
-    0x66; 0xB8; 0x10; 0x00;                                # mov ax, 0x10
-    0x8E; 0xD8;                                            # mov ds, ax
-    0x8E; 0xC0;                                            # mov es, ax
-    0x8E; 0xD0;                                            # mov ss, ax
-
-    # 12. 64-bit stack at 0x3E0000; mov rbp, rsp so callees see a stable frame.
-    #     NOT 0x200000: the kernel image grew past 2 MB, so .rodata (string
-    #     literals) now lives at ~0x1faee8-0x1fff4c, immediately below 0x200000.
-    #     A stack based at 0x200000 grows DOWN straight into those literals and
-    #     silently corrupts them (caught via a gdb watchpoint: `push` at rsp=
-    #     0x1ffbf8 overwrote "exfatu: upcase-checksum OK"). 0x3E0000 sits in the
-    #     PMM-reserved region 1 (0x200000-0x400000), above the image top
-    #     (~0x210000 when this stack was first moved; 0x361898 at 1.57.7), and below
-    #     the BSP TSS.RSP0 window (bottom 0x3F0000, top 0x400000, gdt.cyr) — clear of
-    #     both. ⭐ 1.57.11: the top moved 0x3A0000 -> 0x3E0000 (bound 0x390000 -> 0x3D0000) for the read-only
-    #     ZFS module (~+100 KB; operator ruling 2026-10-09: allow the growth until the planned rewrite).
-    #     ⭐ 1.57.7 (IMG): the top moved 0x380000 -> 0x3A0000 to give the image
-    #     128 KB more room (the 1.57.7 plan needed ~59 KB against 59,240 B of
-    #     headroom, and three flag builds the smokes boot — RING3_SELFTEST,
-    #     EDGE_ABI_SELFTEST, EXEC+EXT2_WRITE+RING3 — were ALREADY past 0x370000).
-    #     Region-1 map above the image: [0x3D0000, 0x3E0000) this stack's 64 KB
-    #     budget; [0x3E0000, 0x3F0000) an UNUSED 64 KB guard gap nothing references;
-    #     [0x3F0000, 0x400000) the BSP TSS.RSP0 window (the top of region 1). NOTHING reserves the window
-    #     before this push: pmm_init's 0-4 MB reservation comes long after, and gnoboot
-    #     pins only the kernel image (AllocateAddress) — its /initramfs and /cmdline
-    #     blobs are AllocateAnyPages, and boot_info + the memory map live in gnoboot's
-    #     own image wherever the firmware put it. The window is free because the
-    #     FIRMWARE left it free (OVMF: conventional RAM, as the old window was); kmain
-    #     checks that against the UEFI map (mbi.cyr bootstack_window_check, 1.57.7
-    #     IMG-fix) and says so on COM1/klug/fb. ⭐ 1.57.3: this stack is the
-    #     image's ONLY region-1 neighbour. The AP boot/TSS stacks that used to sit
-    #     at 0x310000-0x340000 (inside .rodata since the 1.57.2 embedded face) moved
-    #     to region 7 (gdt.cyr tss_get_cpu_stack, smp.cyr's trampoline); the BSP
-    #     stack stays HERE because it is live from the shim's first instruction,
-    #     before any kernel page table exists — the direct map (the only VA the
-    #     gdt.cyr ⛔ rule allows for a region-7 stack) is built by pmm_setup_directmap and live only from cr3_load(0x1000) in
-    #     main.cyr, region 7's identity VA is forbidden by that rule (kmain is
-    #     proc 0, switched out on this stack under per-proc CR3s), and region 1
-    #     (PD[1]) is the window every CR3 from power-on onward maps. On THIS legacy
-    #     multiboot1 path there is a second reason too: these page tables map only
-    #     0-4 MB (step 4 above) and region 7 is 14-16 MB — but that is not the
-    #     reason on the production ELF64 path below, which builds no page tables
-    #     and runs on UEFI's identity map. So the invariant
-    #     is LOAD end <= 0x3D0000 (this stack's 64 KB budget; 0x390000 until 1.57.11, 0x370000 until 1.57.7),
-    #     enforced by scripts/check/image-layout-check.sh (check.sh gate 34 on the
-    #     plain build, scripts/build.sh on every flag build) — it hard-fails above
-    #     that and prints the headroom. Nothing else in region 1 can meet the image.
-    0x48; 0xBC; 0x00; 0x00; 0x3E; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x3E0000
-    0x48; 0x89; 0xE5;                                      # mov rbp, rsp
-}
-#endif
+# ⭐ 1.57.12 — THE LEGACY ELF32 MULTIBOOT1 SHIM IS DELETED. It lived above this block under
+# `#ifndef ELF64_KERNEL` (32-bit protected-mode entry, its own 0-4 MB page tables at 0x1000-0x4000, a
+# 24-byte GDT at 0x4000, a far jump to long mode) and could not be built: no builder leaves ELF64_KERNEL
+# undefined, and QEMU's `-kernel` loader refuses the ELF64 image outright (no PVH note — CLAUDE.md). It
+# also carried two of the three fixed region-1 boot-stack immediates (`mov esp, 0x3E0000` at its step 1,
+# `mov rsp, 0x3E0000` at its step 12). With the BSP boot stack now a .bss symbol (below), those two
+# would have been the one place a fixed region-1 stack could come back unnoticed, so the dead path went
+# with the move rather than being kept under a gate exemption. Its text is in git history (1.57.11 and
+# earlier); the Path A background is agnosticos/docs/development/path-a-elf64-multiboot2.md. Its
+# "step 12" note (the 0x200000 boot stack that grew into .rodata and overwrote "exfatu: upcase-checksum
+# OK", found by a gdb watchpoint) is the first entry in the history at step 1 below.
 
 #ifdef ELF64_KERNEL
 # === 64-bit boot shim (ELF64 + sovereign-struct entry, Path C) ===
@@ -202,11 +33,11 @@ asm {
 # entirely; gnoboot is the only thing between UEFI firmware and us.
 #
 # Sequence (minimal — just what's needed before kernel main can run):
-#   1. Install our 64-bit stack at 0x3E0000 (this line said 0x200000 until
-#      1.57.7 — two relocations stale; step 1 below is the truth). Done first because the
-#      `boot_info_capture_rdi()` call after this asm block uses the
-#      stack (call pushes return addr).
-#   2. Init COM1 UART (port I/O — verbatim from legacy step 2).
+#   1. Install our 64-bit stack: the 16-byte-aligned top of `bsp_boot_stack`, a 64 KB array in the
+#      kernel image's own .bss (1.57.12 — a fixed region-1 window until then: top 0x3E0000 at 1.57.11,
+#      0x3A0000 at 1.57.7-1.57.10, 0x380000 at 1.57.3-1.57.6, 0x200000 before). Done first because the
+#      `boot_info_capture_rdi()` call after it uses the stack (call pushes the return address).
+#   2. Init COM1 UART (port I/O; the sequence the deleted legacy shim's step 2 used, unchanged).
 #
 # Deliberately NOT done in this shim (let kernel-side init handle it):
 #   - GDT install — `gdt_init()` in core/main.cyr (called via top-level
@@ -222,11 +53,58 @@ asm {
 #   - Page tables — UEFI's identity map is fine
 #   - CR0/CR3/CR4/EFER — UEFI configured them; kernel re-tunes later
 #
-# RDI is preserved through this minimal shim: stack-setup touches
-# RSP/RBP, UART init touches RDX/RAX (low byte). RDI intact for the
-# boot_info_capture_rdi() call that follows. (RDI is a SysV scratch
-# register, but `boot_info_capture_rdi()` takes no args, so cyrius
-# doesn't clobber it at the call site.)
+# RDI is preserved through this minimal shim: the stack setup touches RAX/RCX (the
+# `bsp_boot_stack_lo = &bsp_boot_stack;` statement below: movabs rax / movabs rcx / mov [rcx], rax),
+# RFLAGS and RSP/RBP; the UART init touches RDX/AL. RDI intact for the boot_info_capture_rdi() call
+# that follows. (RDI is a SysV scratch register, but `boot_info_capture_rdi()` takes no args, so
+# cyrius doesn't clobber it at the call site.)
+#
+# ⭐⭐ 1.57.12 — THE BSP BOOT STACK IS AN IMAGE SYMBOL, NOT A FIXED WINDOW. `bsp_boot_stack` is 64 KB of
+# the kernel's own .bss (a module-scope `var x[N]` is N u64, so N = 8192). Raw bytes cannot name a
+# symbol and a top-level assignment can, so the shim loads the array's address through the one
+# statement between its first two asm blocks, and the second block turns it into the stack top.
+# WHY IT LEFT REGION 1 (operator ruling: make room for the 1.57.12 ZFS write path):
+#   · Until 1.57.12 the stack was a fixed window above the image — top 0x3E0000, then a 64 KB guard gap,
+#     then the BSP TSS.RSP0 window [0x3F0000, 0x400000) — and the image had to end at 0x3D0000. Every
+#     image growth re-picked the number (top 0x200000 -> 0x380000 -> 0x3A0000 at 1.57.7 -> 0x3E0000 at
+#     1.57.11): "a number above the image end of the day", the class gdt.cyr's AP-stack note counts three
+#     failures of (the first one HERE: the 0x200000 stack grew down into .rodata and overwrote "exfatu:
+#     upcase-checksum OK", found only by a gdb watchpoint). A symbol in the image moves WITH the image.
+#   · gnoboot pins the whole image (one AllocatePages(AllocateAddress, EfiLoaderCode) sized from p_memsz)
+#     and zeroes every [p_filesz, p_memsz) gap, so .bss is loader-owned and writable from instruction one,
+#     on QEMU and on iron. The old window was safe only because the FIRMWARE left it free, which kmain
+#     could report but never ensure. kmain now reports the stronger fact — `boot: BSP boot stack [lo, hi)
+#     inside the loader-pinned image (EfiLoaderCode) OK` (main.cyr, mbi.cyr uefi_span_check); the
+#     violation lines are in SMOKE_INVARIANT_DENY.
+#   · It stays mapped under every CR3 kmain will run under: kmain is proc 0 and is switched out on this
+#     stack under per-process CR3s, which all mirror PD[0..1] (proc_create_address_space), and no user
+#     segment can override PD[1] (the ELF loaders refuse anything below 0x400000).
+#   · Prior art: Linux x86_64 head_64.S `leaq __top_init_kernel_stack(%rip), %rsp` (init_stack inside
+#     .data via INIT_TASK_DATA, vmlinux.lds.S); FreeBSD amd64 locore.S `movq $bootstack,%rsp` (.bss);
+#     seL4 x86_64 head.S boot_stack_top (.phys.bss), then kernel_stack_alloc (.bss, src/kernel/stack.c);
+#     vidya boot_and_startup: "Allocate a static boot stack in the kernel's .bss section (e.g., 64KB)".
+# ⚠ COST — NO GUARD PAGE, SO A RED ZONE. The stack is inside the image's RW 2 MB identity mapping, so an
+#   overflow would write the .bss global declared just before it, silently: in the 1.57.12 plain build that is
+#   syscall.cyr's blk_rw_armed (48 B below the array; the raw-disk-write gate tests `blk_rw_armed == 0`, so
+#   garbage ARMS it), BLK_RW_ARM_MAGIC, blk_rw_arm_pid, then the 4 KB blk_sc_bounce DMA bounce buffer — and the
+#   neighbour changes with unrelated edits (it is whatever agnos.cyr's includes declare last before this file).
+#   So the lowest 8 KB of the array is a RED ZONE (proc.cyr bsp_stack_redzone_arm / _check): main.cyr fills it
+#   with a canary (Linux's STACK_END_MAGIC, doubled to a qword), and every exit from this stack — sched_leave_old
+#   (each switch-out of kmain) and sched_assert_oob (the boot-only exec_and_wait / kernel_resume) — re-reads all
+#   of it and PANICs + halts on one changed qword. 56 KB stay usable; scripts/check/image-layout-check.sh (7)
+#   keeps every frame smaller than the zone, so a descent cannot step over it. A KSTACK_HW=1 build paints the
+#   usable part and prints `kstack-hw: bsp boot stack max=0x... of 0xe000 usable` as it grows (proc.cyr);
+#   measured peaks are in the 1.57.12 CHANGELOG entry, a few KB. A real guard page needs kmain moved onto a
+#   region-7 slot once the direct map exists (FreeBSD's two-stack shape) — possible later, with this stack as its
+#   early one; a not-present page HERE would mean splitting the kernel text's PD[1] into 4 KB pages.
+# ⛔ THE STATEMENT AND THE BYTES ARE ONE UNIT. scripts/check/image-layout-check.sh (check.sh gate 34, and
+#   build.sh after every x86_64 build) requires exactly one `48 B8 imm64` (movabs rax, &bsp_boot_stack),
+#   `48 B9 imm64` (movabs rcx, &bsp_boot_stack_lo), `48 89 01` (mov [rcx], rax), `48 05 00 00 01 00`,
+#   `48 83 E0 F0`, `48 89 C4`, `48 89 E5` in .text right after the CP1 stamp, with [imm64, imm64 + 0x10000)
+#   inside .bss and the add immediate = 8 x this array's length. If cycc ever emits anything between the
+#   statement and the second asm block, RAX is no longer the address and the build is refused.
+var bsp_boot_stack[8192];   # 64 KB = 8192 u64; initial RSP = (&bsp_boot_stack + 0x10000) & ~0xF
+var bsp_boot_stack_lo = 0;  # = &bsp_boot_stack once the shim has run (the statement below); main.cyr checks it
 asm {
     # === Persistent CMOS boot-log checkpoint 1 (kernel entered) ===
     # Attempt 7 (visual canary) returned an ambiguous null-result. Single-
@@ -259,36 +137,26 @@ asm {
     # row of the kernel framebuffer log. The slot it occupied — CMOS[0x50]
     # = 2 ("past canary") — is gone too. Existing CP labels >= 3 are kept
     # at their current numeric values so read-boot-log keeps reading.)
+}
 
-    # 1. 64-bit stack at 0x3E0000 (NOT 0x200000 — see the legacy path's step 12
-    #    note: the >2 MB kernel image's .rodata sits just below 0x200000, so a
-    #    stack there grows down into the string literals. 0x3E0000 is in the
-    #    PMM-reserved region 1, above the image, below the BSP TSS.RSP0 window
-    #    [0x3F0000, 0x400000) (gdt.cyr tss_kernel_stack) — NOT "below the 0x3F0000
-    #    syscall kstack", which this note said until 1.57.3: the syscall kstacks
-    #    left region 1 for region-7 direct-map VAs (0xF10000 + cpu*0x10000,
-    #    syscall_hw.cyr) at 1.46.x/1.51.x, and nothing lives at 0x3F0000 now).
-    #    ⚠ This shim builds NO page tables (UEFI's identity map carries the boot);
-    #    the stack stays in region 1 because it is live from the first instruction
-    #    here, before the direct map — the only VA allowed for a region-7 stack —
-    #    exists, and region 1 is mapped by every CR3 from power-on onward (the
-    #    step-12 note above spells this out; its "0-4 MB" reason is legacy-only).
-    #    ⭐ 1.57.3: this is the image's ONLY region-1 neighbour — the AP stacks moved
-    #    to region 7 (gdt.cyr tss_get_cpu_stack) — so the one invariant is LOAD end
-    #    <= this stack's top - 64 KB, hard-failed by scripts/check/image-layout-check.sh.
-    #    ⭐ 1.57.11: top 0x3A0000 -> 0x3E0000, bound 0x390000 -> 0x3D0000, guard gap
-    #    [0x3E0000, 0x3F0000), TSS.RSP0 window [0x3F0000, 0x400000) — the ZFS module's growth.
-    #    ⭐ 1.57.7 (IMG): top 0x380000 -> 0x3A0000, bound 0x370000 -> 0x390000,
-    #    [0x3A0000, 0x3B0000) left as an unused guard gap below the TSS.RSP0 window.
-    #    The gate also decodes this immediate (source AND built image) against its
-    #    BSP_BOOT_TOP. See the step-12 note above.
-    0x48; 0xBC; 0x00; 0x00; 0x3E; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x3E0000
+# 1. 64-bit stack: the top of bsp_boot_stack (1.57.12 — the why is at its declaration above). The
+#    statement compiles to `movabs rax, &bsp_boot_stack; movabs rcx, &bsp_boot_stack_lo; mov [rcx], rax`:
+#    no stack use, RDI untouched, and the address left in RAX for the block below.
+bsp_boot_stack_lo = &bsp_boot_stack;
+asm {
+    # REGISTER CONTRACT — in: RAX = &bsp_boot_stack (the statement above). out: RSP = RBP = the
+    # 16-byte-aligned top (RAX + 0x10000) & ~0xF, inside the array. clobbers: RAX, RFLAGS (add/and);
+    # the statement above clobbered RCX. preserves: RDI (gnoboot's &boot_info) and every other GPR.
+    # The add immediate is the array's size in bytes (8 x 8192); image-layout-check.sh decodes it.
+    0x48; 0x05; 0x00; 0x00; 0x01; 0x00;                    # add rax, 0x10000
+    0x48; 0x83; 0xE0; 0xF0;                                # and rax, -16
+    0x48; 0x89; 0xC4;                                      # mov rsp, rax
     0x48; 0x89; 0xE5;                                      # mov rbp, rsp
 
     # === Checkpoint 3 (past stack setup) ===
     0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x03; 0xE6; 0x71;        # CMOS[0x50] = 3
 
-    # 2. COM1 UART init (port 0x3F8) — verbatim from legacy step 2
+    # 2. COM1 UART init (port 0x3F8) — the deleted legacy shim's step-2 sequence, unchanged
     0xBA; 0xF9; 0x03; 0x00; 0x00; 0xB0; 0x00; 0xEE;        # IER  = 0
     0xBA; 0xFB; 0x03; 0x00; 0x00; 0xB0; 0x80; 0xEE;        # LCR  = DLAB=1
     0xBA; 0xF8; 0x03; 0x00; 0x00; 0xB0; 0x01; 0xEE;        # DLL  = 1 (115200, low)
@@ -311,7 +179,7 @@ boot_info_capture_rdi();
 
 # === CR4: CPUID-gated SMEP (bit 20) + SMAP (bit 21) enable, then CP 5 ===
 #
-# The legacy ELF32 multiboot1 shim (above, lines 70-88) enables these on
+# The legacy ELF32 multiboot1 shim (deleted at 1.57.12) enabled these on
 # the way into long mode. The Path C handoff comes from gnoboot with PAE
 # already on and SMEP/SMAP untouched — UEFI leaves both at 0 on
 # archaemenid (Attempt 18 dump CMOS[0x54] = 0x00 confirmed). The comment

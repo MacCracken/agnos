@@ -82,6 +82,8 @@ cd "$ROOT"
 #     `PASS  <label>  (passed on serial retry; parallel log: …)`; the count is printed even when it is 0.
 #     A KNOWN RED that failed the known way is NOT retried (1.57.10; see KNOWN RED above).
 #   · CEILING + CLEANUP: each parallel row runs under `timeout ${SWEEP_ROW_TIMEOUT:-1500}` (expiry = FAIL, named).
+#     ⭐ 1.57.12 (B12, ZFS write design k.134): a smoke that needs longer DECLARES it in its own header,
+#     `# sweep-row-timeout: <s>`, and its row runs under max(SWEEP_ROW_TIMEOUT, <s>) (sweep_row_ceiling).
 #     Workers run in their own sessions (setsid); on exit, INT or TERM every process in those sessions — QEMU
 #     under a smoke's own `timeout`, which leaves the process group but not the session — is TERMed, then KILLed,
 #     worker logs are copied back to build/sweep-logs/w<K>/, and the copies are removed. The copy-back skips
@@ -219,20 +221,36 @@ sweep_read_row() {  # $1 = n  ->  r_label r_env r_smoke r_slug r_known r_ksig
       IFS= read -r r_known; IFS= read -r r_ksig; } < "$SWEEP_Q/$1.row"
 }
 
+# ⭐ 1.57.12 (B12, ZFS write design k.134) — A SMOKE MAY DECLARE ITS OWN ROW CEILING. The ZFS write row runs ~81 min
+# (measured alone at the B10/B11 merge: fourteen-odd boots and two FreeBSD verify guests), and every row shared the one
+# 1500 s ceiling, so the documented full sweep killed it at 25 min, scored it FAIL and re-ran it serially after the
+# parallel phase — a guaranteed red plus ~80 min of tail, from the harness, on a green kernel. Prior art: kselftest's
+# per-collection `settings` file, whose `timeout=` overrides the runner's default (tools/testing/selftests/kselftest/
+# runner.sh); Bazel's per-target `timeout = "long"`. Here the smoke's header carries `# sweep-row-timeout: <s>` and the
+# row runs under max(SWEEP_ROW_TIMEOUT, <s>): a declaration only RAISES the ceiling, so SWEEP_ROW_TIMEOUT stays the
+# knob for a slow box. $1 = the row's smoke column; prints the ceiling in seconds. A CHECK row has no smoke file.
+sweep_row_ceiling() {
+    rc_c="$SWEEP_ROW_TIMEOUT"
+    rc_d=$(sed -n 's/^# sweep-row-timeout: *\([0-9][0-9]*\).*/\1/p' "$ROOT/scripts/smoke/${1%% *}" 2>/dev/null | head -1)
+    [ -n "$rc_d" ] && [ "$rc_d" -gt "$rc_c" ] && rc_c="$rc_d"
+    echo "$rc_c"
+}
+
 sweep_run_row() {   # $1 = n — one row under the row ceiling, in this tree; leaves <n>.out and <n>.res
     rr_n="$1"; rr_t0=$(date +%s)
     sweep_read_row "$rr_n"
+    rr_ceil=$(sweep_row_ceiling "$r_smoke")
     # Bazel TEST_TMPDIR / xfstests tmp=: a row's mktemp dirs (several smokes put 8-130 MB disk images there) live in
     # THIS tree's build/sweep-tmp, emptied after every row. Measured 1.57.9: under /tmp — a tmpfs with a per-user
     # quota, shared with every agent on the box — a parallel msc-cdb row died on `dd: Disk quota exceeded`, and a
     # killed row (ceiling, Ctrl-C) leaked its 129 MB image there, because four smokes create it with no EXIT trap.
     TMPDIR="$ROOT/build/sweep-tmp"; export TMPDIR; mkdir -p "$TMPDIR"
-    timeout -k 30 "$SWEEP_ROW_TIMEOUT" sh "$ROOT/scripts/sweep.sh" --row "$rr_n" \
+    timeout -k 30 "$rr_ceil" sh "$ROOT/scripts/sweep.sh" --row "$rr_n" \
         > "$SWEEP_Q/$rr_n.out" 2>&1 < /dev/null && rr_rc=0 || rr_rc=$?
     case "$rr_rc" in
         0|1|2|3) ;;
         124|137)
-            echo "  ROW TIMEOUT: killed after ${SWEEP_ROW_TIMEOUT}s (SWEEP_ROW_TIMEOUT) — scored FAIL" >> "$SWEEP_Q/$rr_n.out"
+            echo "  ROW TIMEOUT: killed after ${rr_ceil}s (SWEEP_ROW_TIMEOUT, or the smoke's # sweep-row-timeout) — scored FAIL" >> "$SWEEP_Q/$rr_n.out"
             # `timeout` killed its own process group; a smoke's inner `timeout` (and the QEMU under it) sits in a
             # group of its own. Everything a row starts has this tree's build/ or smoke dir on its command line;
             # this worker and the row runner (scripts/sweep.sh) do not.
@@ -438,14 +456,42 @@ sh "$ROOT/scripts/build.sh" >/dev/null 2>&1
 # carried #106-#108) is gone — the peer landed (cyrius 6.7.6 lib/syscalls_x86_64_agnos.cyr) and the 1.57.11 sweep
 # flagged the mark stale. Any red inside check.sh is now a real red.
 run_gate "baseline check.sh (build/test/version/size)" "" "CHECK"
+# ⭐ 1.57.12 — THE KTEST BOOT SELF-TESTS AND THE IN-KERNEL SUITE. scripts/ktest.sh had no row anywhere (sweep, check.sh,
+# test.sh, CI), so the KTEST self-tests the 1.57.12 rebuild made runnable again (syscall, context switch, VFS/initrd,
+# userland exec), the NVMe round-trips that must write outside the GPT and put it back, and ktest.sh's scoring of all
+# of it ran only by hand. ktest-smoke runs `KTEST=1 sh scripts/ktest.sh` at -smp 1 and -smp 4 (~30 s each plus two
+# builds; it builds its own TEST kernel and leaves a plain one). The plain ktest is not a row: it exits 1 by design.
+run_gate "1.57.12 ktest: KTEST boot self-tests (syscall/ctxsw/VFS/initrd/userland exec/NVMe round-trips outside the GPT) + the in-kernel suite (-smp 1 + 4)" "" "ktest-smoke.sh"
 
 # --- 1.39.x VFS generic-write lift: FAT + exFAT read & write verb smokes ---
 run_gate "1.39.x FAT read (cat/ls reach FAT)"       "FATFS_SELFTEST=1"                         "fat-smoke.sh"
 run_gate "1.39.x FAT write (touch/echo/rm/mkdir/mv + subdir)" "FATFS_WRITE_SELFTEST=1 FAT_ALLOW_ESP_WRITE=1" "fat-write-smoke.sh"
 run_gate "1.39.x exFAT read"                         "EXFAT_SELFTEST=1"                         "exfat-smoke.sh"
+# 1.57.12 — gpt.cyr in units of the device's LBA, over the whole entry array, entry sizes 128 x 2^n only: a 4096 B-LBA
+# NVMe GPT written by sfdisk, 64 x 512 B entries on 4Kn, 128 x 256 B entries (a 32 KB array) and a 384 B table that
+# must be refused. RED on the 1.57.11 walkers in every lane (the smoke header has what each printed). Plus the second
+# review's lanes (M1-M3): a damaged primary recovered from the backup, a 2 MiB array walked truncated, 4096 used
+# entries with a bounded boot dump. And D1 / D2: an ext2 in slot [100] of a one-entry table that must mount (the probes
+# walked used-entry COUNTS as slot indices), and a primary whose AlternateLBA is garbage recovered from the device's
+# LAST LBA. Plain kernel; nine boots, ~130 s.
+run_gate "1.57.12 GPT geometry: 4Kn, 512/256 B entries, 384 B refused, backup recovery, >1 MiB, 4096 used, sparse, bad AlternateLBA" "" "gpt-geometry-smoke.sh"
 # ⭐ 1.57.11 — read-only ZFS. Both rows need the OpenZFS fixture (scripts/tool/zfs-fixture.sh — a FreeBSD 15.1 guest
 # under KVM builds the pools once; cached in ~/.cache/agnos/zfs-fixtures, keyed on the recipe + the zfsx payload).
-run_gate "1.57.11 ZFS read: seven OpenZFS-built pools, every file SHA-256 vs the manifest (+ raidz refused)" "ZFS_SELFTEST=1" "zfs-smoke.sh"
+# 1.57.12 B1: the same row also gates the write gate — every lane's verdict lines, G1 (the pool partition byte-identical
+# after the boot) and, on rw lanes, the state dump vs a host replay (scripts/smoke/lib/zfs-wms-check.py).
+run_gate "1.57.11/1.57.12 ZFS read + write gate: seven OpenZFS-built pools, every file SHA-256 vs the manifest (+ raidz refused), verdict lines, G1, metaslab replay" "ZFS_SELFTEST=1 ZFS_WRITE_SELFTEST=1" "zfs-smoke.sh"
+# 1.57.12 B2 — the first ZFS WRITE: the ZFS_WRITE_OPS op list (one uberblock-only commit) on three rw OpenZFS pools,
+# each judged by the host audit (only slot (T0+1) % N changed, in all four labels, valid ecks; nothing outside the
+# partition) and then by OpenZFS itself in ONE FreeBSD guest (zfs-fixture.sh --verify: zdb, import, scrub, round trip,
+# destroy); v28 + mirror-a + makefs must refuse it and stay byte-identical, raidz-0 mounts nothing. B2 review: + ashift9
+# with a torn T0+1 uberblock, on a grown partition, on AHCI and on usb-storage (each byte-identical to the NVMe lane),
+# and on a read-only drive (the commit's error path). B3b: the list is the uberblock-only commit + three NULL txgs
+# (log space map, refcount, log ZAP, U[], $MOS accounting, the MOS COWed to a new rootbp; an in-kernel read-back after
+# each), + the near-full pool held at one bitmap slot for eight of them and an upgraded-pool forge (U[] 0, two rounds):
+# fourteen boots, five pools verified by OpenZFS incl. rewinds onto agnos's own txgs. B3b review: + the slop-overlap
+# forge (units allocated AND deferred: zfs-damage.py pre-defer) on the upgraded pool and on a second one-slot full
+# pool — fifteen boots, six pools verified. Needs KVM; ~13.3 min measured at B3b.
+run_gate "1.57.12 ZFS write: the op list on eight OpenZFS-built rw pools (creates, file data, removals/renames, fat ZAPs, snapshotted datasets, log hygiene, policy B; + torn-slot / grown-partition / AHCI / USB variants, write-error path, four crash-cut lanes), host audits h1-h9 + OpenZFS verify (zdb/rewinds/import/scrub/round trip/destroy); v28 + mirror + makefs refused, raidz no pool, byte-identical" "ZFS_SELFTEST=1 ZFS_WRITE_SELFTEST=1 ZFS_WRITE_OPS=1" "zfs-write-smoke.sh"
 run_gate "1.57.11 ZFS ring 3: zfsx exec'd from the pool (open/read/lseek/stat/getdents/readdir_at/statfs/mountlist; writes refused)" "" "zfs-ring3-smoke.sh"
 # 1.57.2 — the ONLY gate that presents a MULTI-NODE FAT chain cycle (A -> B -> A, both in range):
 # fat-smoke / exfat-smoke prove GOOD chains read, and nothing else in the tree ever hands the kernel
@@ -508,8 +554,9 @@ run_gate "1.57.2 kernel-embedded face (/fonts/default.ttf, rekha)" ""           
 # ap_entry) against [DIRECTMAP_BASE + 0xFC0000, +0x40000) and re-hashes the rekha chunk literals IN
 # PLACE after the wake (the load-bearing oracle — a stack anywhere in the image scribbles there on every
 # tick, invisible to every -smp 1 gate). Mutation-proven: the old placement trips both. Builds its own
-# kernel, so it needs no buildenv here; the image-side bound (LOAD end <= 0x3D0000 since 1.57.11 moved the
-# BSP boot stack top 0x3A0000 -> 0x3E0000; 0x390000 from 1.57.7, 0x370000 before) is check.sh gate 34 for the plain image and
+# kernel, so it needs no buildenv here; the image-side bound (LOAD end <= 0x400000, the top of region 1, since 1.57.12 moved
+# the BSP stacks out of it — the boot stack into the image's .bss, the BSP's RSP0 into region-7 slot 0, which this row's
+# `smpstk: bsp rsp0` line checks; 0x3D0000 at 1.57.11, 0x390000 from 1.57.7, 0x370000 before) is check.sh gate 34 for the plain image and
 # scripts/build.sh's flag-build guard for every buildenv row here (an over-bound flag image is a BUILD FAILED).
 run_gate "1.57.3 AP stacks in region 7 (-smp 4, rodata intact after wake)" ""                     "ap-stack-smoke.sh"
 # 1.57.6 — the microsecond clock ring 3 uses (uptime_us#95). tsc-smoke existed since 1.56.18 and NO row ran
@@ -578,6 +625,14 @@ run_gate "1.39.x exFAT write (+ subdir)"             "EXFAT_WRITE_SELFTEST=1"   
 
 # --- ext2/jbd2 write regression bar (the iron-validated path must stay green) ---
 run_gate "ext2 WRITE regression (W1-W5)"             "EXT2_WRITE_SELFTEST=1"                    "ext2-write-smoke.sh"
+# ⭐ 1.57.12 (ROOM review) — klug-spill-smoke had NO ROW since it shipped (1.56.10, H1), and since 1.57.12 it is the one
+# gate that reads the klug ring BYTE FOR BYTE after the ROOM moved it: the kernel spills the ring to /klug.txt on an
+# ext2 NVMe partition, the host reads it back with debugfs and compares it with the serial capture — the 8 KB early
+# ring's lines copied into the room carve-out included (named and counted since the room) — then e2fsck. The second
+# row is the wrapped branch (KLUG_SPILL_WRAPTEST): the ring is forced to wrap and the spill must be chronological. The
+# ROOM step's 30-row evidence did not include it; the review ran both by hand. VOID-retrying since the same review.
+run_gate "1.56.10/1.57.12 klug spill: the log ring (early ring moved into the room) on ext2, byte-compared with serial" "KLUG_SPILL_SELFTEST=1" "klug-spill-smoke.sh"
+run_gate "1.56.10 klug spill, wrapped ring: two-run spill is chronological (KLUG_SPILL_WRAPTEST)" "KLUG_SPILL_SELFTEST=1 KLUG_SPILL_WRAPTEST=1" "klug-spill-smoke.sh"
 # ⭐ 1.57.10 (HAR2, issue 2026-09-26-harness-backlog-after-1-57-9 item 4) — TWO SMOKES THAT WERE HONEST AND UNLISTED.
 # 1.57.9 (SMOKES3) gave both a banner-gated retry and exit 0/1/2. Until then a firmware VOID read as a kernel red
 # ("blkwr never dispatched", "did NOT reach shell (regression!)"). They were still run only by hand.
@@ -840,7 +895,7 @@ if [ "$SWEEP_JOBS" -gt 1 ]; then
     SWEEP_JOBS_USED=$SWEEP_JOBS; [ "$n_groups" -lt "$SWEEP_JOBS_USED" ] && SWEEP_JOBS_USED=$n_groups
     echo ""
     echo "parallel sweep: $gate_n rows — $n_groups pooled groups over $SWEEP_JOBS_USED worker copies (SWEEP_JOBS=$SWEEP_JOBS),"
-    echo "  $n_main in the main tree alongside them, $n_excl exclusive after them (serially, main tree); row ceiling ${SWEEP_ROW_TIMEOUT}s"
+    echo "  $n_main in the main tree alongside them, $n_excl exclusive after them (serially, main tree); row ceiling ${SWEEP_ROW_TIMEOUT}s (raised per smoke by # sweep-row-timeout)"
     [ -s "$SWEEP_PREV_DUR" ] && echo "  dispatch order: longest-first from the previous run's durations" \
                              || echo "  dispatch order: table order (no previous build/sweep-logs/durations.tsv)"
     SETSID=""; command -v setsid >/dev/null 2>&1 && SETSID="setsid" \
